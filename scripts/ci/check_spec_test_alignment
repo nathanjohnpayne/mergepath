@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SPECS_DIR="$REPO_ROOT/specs"
+TESTS_DIR="$REPO_ROOT/tests"
+FAILED=0
+
+if [[ ! -d "$SPECS_DIR" ]]; then
+  echo "check_spec_test_alignment: SKIP (no specs/ directory)"
+  exit 0
+fi
+
+while IFS= read -r -d '' spec; do
+  spec_name="$(basename "$spec" .md)"
+  if [[ "$spec_name" == "example_spec" ]]; then
+    continue
+  fi
+
+  if ! find "$TESTS_DIR" -type f \( -name "${spec_name}*" -o -name "*${spec_name}*.test.*" \) 2>/dev/null | grep -q .; then
+    echo "WARN: Spec file has no corresponding test file: $(basename "$spec")"
+    FAILED=1
+  fi
+done < <(find "$SPECS_DIR" -name "*.md" -print0 2>/dev/null)
+
+if [[ $FAILED -eq 1 ]]; then
+  echo "check_spec_test_alignment: FAILED — one or more spec files lack corresponding tests"
+  echo "Add test files to tests/ or document exceptions in AGENTS.md"
+  exit 1
+fi
+
+echo "check_spec_test_alignment: PASS"
+exit 0

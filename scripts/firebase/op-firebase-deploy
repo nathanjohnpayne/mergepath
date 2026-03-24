@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Non-interactive Firebase deploy via service account impersonation.
+#
+# Resolves a source credential from GOOGLE_APPLICATION_CREDENTIALS, a 1Password
+# ADC item, or the local ADC file; generates a temporary
+# impersonated_service_account credential from it; sets
+# GOOGLE_APPLICATION_CREDENTIALS; and runs firebase deploy.
+#
+# First-time setup for a new project:
+#   op-firebase-setup [project-id]
+#
+# Usage:
+#   op-firebase-deploy              # auto-detect project from .firebaserc
+#   op-firebase-deploy my-project   # explicit project ID
+#   op-firebase-deploy --only hosting
+#   op-firebase-deploy my-project --only functions
+
+SA_NAME="${FIREBASE_DEPLOY_SA_NAME:-firebase-deployer}"
+DEFAULT_ADC_FILE="${HOME}/.config/gcloud/application_default_credentials.json"
+DEFAULT_ADC_OP_URI="${FIREBASE_SOURCE_CREDENTIAL_OP_URI:-${GCP_ADC_OP_URI:-op://Private/GCP ADC/credential}}"
+SOURCE_CRED_FILE=""
+SOURCE_CRED_TMPFILE=""
+
+PROJECT=""
+EXTRA_ARGS=()
+EXPECT_VALUE=false
+
+for arg in "$@"; do
+  if $EXPECT_VALUE; then
+    EXTRA_ARGS+=("$arg")
+    EXPECT_VALUE=false
+  elif [[ "$arg" == --only || "$arg" == --except || "$arg" == --message ]]; then
+    EXTRA_ARGS+=("$arg")
+    EXPECT_VALUE=true
+  elif [[ "$arg" == --* ]]; then
+    EXTRA_ARGS+=("$arg")
+  elif [[ -z "$PROJECT" ]]; then
+    PROJECT="$arg"
+  else
+    EXTRA_ARGS+=("$arg")
+  fi
+done
+
+if [[ -z "$PROJECT" ]]; then
+  if [[ -f .firebaserc ]]; then
+    PROJECT="$(python3 -c "import json; print(json.load(open('.firebaserc'))['projects']['default'])")"
+  else
+    echo "Error: No project specified and no .firebaserc found." >&2
+    echo "Usage: op-firebase-deploy [project-id] [--only hosting|functions|...]" >&2
+    exit 1
+  fi
+fi
+
+cleanup_source_cred() {
+  if [[ -n "${SOURCE_CRED_TMPFILE}" && -f "${SOURCE_CRED_TMPFILE}" ]]; then
+    rm -f "${SOURCE_CRED_TMPFILE}"
+  fi
+}
+
+materialize_op_source_cred() {
+  local op_uri="${1:-}"
+  local tmpfile=""
+
+  if [[ -z "$op_uri" ]] || ! command -v op >/dev/null 2>&1; then
+    return 1
+  fi
+
+  umask 077
+  tmpfile="$(mktemp "${TMPDIR:-/tmp}/gcp-adc-XXXXXX")"
+
+  # Timeout after 5s — op read hangs if biometric auth (Touch ID) can't prompt
+  op read "$op_uri" >"$tmpfile" 2>/dev/null &
+  local op_pid=$!
+  local op_ok=false
+  local i=0
+  while [[ $i -lt 50 ]]; do
+    if ! kill -0 "$op_pid" 2>/dev/null; then
+      wait "$op_pid" && op_ok=true
+      break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if ! $op_ok; then
+    kill "$op_pid" 2>/dev/null
+    sleep 0.2
+    kill -9 "$op_pid" 2>/dev/null
+    wait "$op_pid" 2>/dev/null || true
+  fi
+
+  if $op_ok && [[ -s "$tmpfile" ]]; then
+    SOURCE_CRED_TMPFILE="$tmpfile"
+    printf '%s\n' "$tmpfile"
+    return 0
+  fi
+
+  rm -f "$tmpfile"
+  return 1
+}
+
+resolve_source_cred_file() {
+  local explicit_file="${GOOGLE_APPLICATION_CREDENTIALS:-}"
+  local resolved=""
+
+  if [[ -n "$explicit_file" && -f "$explicit_file" ]]; then
+    SOURCE_CRED_FILE="$explicit_file"
+    return 0
+  fi
+
+  resolved="$(materialize_op_source_cred "$DEFAULT_ADC_OP_URI" || true)"
+  if [[ -n "$resolved" ]]; then
+    SOURCE_CRED_FILE="$resolved"
+    SOURCE_CRED_TMPFILE="$resolved"
+    return 0
+  fi
+
+  if [[ -f "$DEFAULT_ADC_FILE" ]]; then
+    SOURCE_CRED_FILE="$DEFAULT_ADC_FILE"
+    return 0
+  fi
+
+  return 1
+}
+
+source_cred_is_usable() {
+  local source_file="${1:-}"
+
+  if [[ -z "$source_file" || ! -f "$source_file" ]]; then
+    return 1
+  fi
+
+  # Test the credential by calling the OAuth2 token endpoint directly.
+  # Avoids gcloud, which can hang when the user account's RAPT is expired
+  # or when any interactive re-auth prompt would be triggered.
+  python3 - "$source_file" <<'PY'
+import json, pathlib, sys, urllib.request, urllib.parse
+
+cred = json.loads(pathlib.Path(sys.argv[1]).read_text())
+
+# Unwrap impersonated_service_account to get the underlying authorized_user
+while cred.get("type") == "impersonated_service_account" and "source_credentials" in cred:
+    cred = cred["source_credentials"]
+
+if cred.get("type") == "service_account":
+    # Service account JSON keys are self-contained; assume usable if present
+    sys.exit(0)
+
+refresh_token = cred.get("refresh_token", "")
+client_id = cred.get("client_id", "")
+client_secret = cred.get("client_secret", "")
+
+if not all([refresh_token, client_id, client_secret]):
+    sys.exit(1)
+
+data = urllib.parse.urlencode({
+    "client_id": client_id,
+    "client_secret": client_secret,
+    "refresh_token": refresh_token,
+    "grant_type": "refresh_token",
+}).encode()
+try:
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
+    urllib.request.urlopen(req, timeout=10)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+umask 077
+ADC_TMPFILE="$(mktemp "${TMPDIR:-/tmp}/gcp-impersonated-XXXXXX")"
+trap 'cleanup_source_cred; rm -f "$ADC_TMPFILE"' EXIT
+
+SA_EMAIL="${FIREBASE_DEPLOY_SA_EMAIL:-${SA_NAME}@${PROJECT}.iam.gserviceaccount.com}"
+
+if ! resolve_source_cred_file; then
+  echo "Error: No GCP source credential found." >&2
+  echo "Set GOOGLE_APPLICATION_CREDENTIALS, unlock 1Password item $DEFAULT_ADC_OP_URI, or create $DEFAULT_ADC_FILE." >&2
+  exit 1
+fi
+
+if ! source_cred_is_usable "$SOURCE_CRED_FILE"; then
+  if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && "$SOURCE_CRED_FILE" == "${GOOGLE_APPLICATION_CREDENTIALS}" ]]; then
+    echo "Error: GOOGLE_APPLICATION_CREDENTIALS points to an unusable credential file: $SOURCE_CRED_FILE" >&2
+    exit 1
+  fi
+
+  cleanup_source_cred
+  SOURCE_CRED_FILE=""
+  SOURCE_CRED_TMPFILE=""
+
+  if [[ -f "$DEFAULT_ADC_FILE" ]]; then
+    SOURCE_CRED_FILE="$DEFAULT_ADC_FILE"
+  fi
+
+  if ! source_cred_is_usable "$SOURCE_CRED_FILE"; then
+    echo "Error: No usable GCP source credential found." >&2
+    echo "Refresh the shared 1Password GCP ADC item or provide a working GOOGLE_APPLICATION_CREDENTIALS file." >&2
+    exit 1
+  fi
+fi
+
+python3 - <<'PY' "$SOURCE_CRED_FILE" "$ADC_TMPFILE" "$SA_EMAIL" "$PROJECT"
+import json
+import pathlib
+import sys
+
+source_path = pathlib.Path(sys.argv[1])
+out_path = pathlib.Path(sys.argv[2])
+service_account = sys.argv[3]
+project = sys.argv[4]
+
+source = json.loads(source_path.read_text())
+while source.get("type") == "impersonated_service_account" and "source_credentials" in source:
+    source = source["source_credentials"]
+
+source["quota_project_id"] = project
+
+config = {
+    "type": "impersonated_service_account",
+    "service_account_impersonation_url": (
+        "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/"
+        f"{service_account}:generateAccessToken"
+    ),
+    "source_credentials": source,
+}
+
+out_path.write_text(json.dumps(config))
+PY
+
+export GOOGLE_APPLICATION_CREDENTIALS="$ADC_TMPFILE"
+export GOOGLE_CLOUD_PROJECT="$PROJECT"
+export GCLOUD_PROJECT="$PROJECT"
+export CLOUDSDK_BILLING_QUOTA_PROJECT="$PROJECT"
+
+# Disable telemetry/update checks that can hang in non-interactive sessions
+export CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true
+export CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true
+
+firebase deploy --project "$PROJECT" --non-interactive ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}

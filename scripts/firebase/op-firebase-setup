@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Set up keyless Firebase deploy auth for any project.
+# Creates a deployer service account, grants deploy roles, grants the current
+# principal permission to impersonate it, and creates a dedicated gcloud config
+# with explicit quota attribution for the target project.
+#
+# Usage:
+#   op-firebase-setup                    # auto-detect project from .firebaserc
+#   op-firebase-setup my-project-id      # explicit project ID
+
+SA_NAME="firebase-deployer"
+MEMBER_EMAIL="${FIREBASE_IMPERSONATION_MEMBER:-}"
+ROLES=(
+  roles/firebase.admin
+  roles/cloudfunctions.admin
+  roles/iam.serviceAccountUser
+  roles/artifactregistry.writer
+  roles/run.admin
+)
+
+PROJECT=""
+if [[ "${1:-}" != "" ]]; then
+  PROJECT="$1"
+elif [[ -f .firebaserc ]]; then
+  PROJECT="$(python3 -c "import json; print(json.load(open('.firebaserc'))['projects']['default'])")"
+else
+  echo "Error: No project specified and no .firebaserc found." >&2
+  echo "Usage: op-firebase-setup [project-id]" >&2
+  exit 1
+fi
+
+SA_EMAIL="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
+CONFIG_NAME="${PROJECT}"
+
+if [[ -z "${MEMBER_EMAIL}" ]]; then
+  MEMBER_EMAIL="$(gcloud config get-value account 2>/dev/null || true)"
+fi
+
+if [[ -z "${MEMBER_EMAIL}" ]]; then
+  echo "Error: Could not determine the member to grant impersonation rights to." >&2
+  echo "Set FIREBASE_IMPERSONATION_MEMBER=email@example.com and rerun." >&2
+  exit 1
+fi
+
+echo ""
+echo "Project:           $PROJECT"
+echo "Service account:   $SA_EMAIL"
+echo "Impersonation via: user:${MEMBER_EMAIL}"
+echo "gcloud config:     $CONFIG_NAME"
+echo ""
+
+# 1. Enable IAMCredentials API for impersonation
+echo "Enabling IAM Credentials API..."
+gcloud services enable iamcredentials.googleapis.com --project="$PROJECT" >/dev/null
+echo "IAM Credentials API enabled."
+
+# 2. Create service account (skip if exists)
+if gcloud iam service-accounts describe "$SA_EMAIL" --project="$PROJECT" &>/dev/null; then
+  echo "Service account already exists, skipping creation."
+else
+  echo "Creating service account..."
+  gcloud iam service-accounts create "$SA_NAME" \
+    --display-name="Firebase Deployer" \
+    --project="$PROJECT"
+  echo "Service account created."
+fi
+
+# 3. Grant project roles to the deployer
+echo "Granting IAM roles..."
+for ROLE in "${ROLES[@]}"; do
+  gcloud projects add-iam-policy-binding "$PROJECT" \
+    --member="serviceAccount:$SA_EMAIL" \
+    --role="$ROLE" --quiet --no-user-output-enabled 2>/dev/null
+done
+echo "Roles granted: ${ROLES[*]}"
+
+# 4. Grant the current principal permission to impersonate the deployer
+echo "Granting Service Account Token Creator to user:${MEMBER_EMAIL}..."
+gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
+  --member="user:${MEMBER_EMAIL}" \
+  --role="roles/iam.serviceAccountTokenCreator" \
+  --project="$PROJECT"
+echo "Impersonation binding granted."
+
+# 5. Create or update a dedicated gcloud config for the project
+if gcloud config configurations describe "$CONFIG_NAME" >/dev/null 2>&1; then
+  echo "Updating existing gcloud configuration..."
+else
+  echo "Creating gcloud configuration..."
+  gcloud config configurations create "$CONFIG_NAME" --no-activate >/dev/null
+fi
+gcloud config set core/project "$PROJECT" --configuration="$CONFIG_NAME" >/dev/null
+gcloud config set core/account "$MEMBER_EMAIL" --configuration="$CONFIG_NAME" >/dev/null
+gcloud config set auth/impersonate_service_account "$SA_EMAIL" --configuration="$CONFIG_NAME" >/dev/null
+gcloud config set billing/quota_project "$PROJECT" --configuration="$CONFIG_NAME" >/dev/null
+echo "Configured gcloud impersonation and quota attribution for $CONFIG_NAME."
+
+echo ""
+echo "Setup complete."
+echo ""
+echo "Next steps:"
+echo "  gcloud config configurations activate $CONFIG_NAME"
+echo "  op-firebase-deploy      # keyless deploy via impersonation"
+echo ""

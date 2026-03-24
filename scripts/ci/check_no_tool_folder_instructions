@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TOOL_FOLDERS=(".claude" ".cursor" ".vscode")
+FAILED=0
+
+for folder in "${TOOL_FOLDERS[@]}"; do
+  folder_path="$REPO_ROOT/$folder"
+  if [[ ! -d "$folder_path" ]]; then
+    continue
+  fi
+
+  while IFS= read -r -d '' filepath; do
+    filename="$(basename "$filepath")"
+    relpath="${filepath#$REPO_ROOT/}"
+
+    if [[ "$relpath" == .claude/worktrees/* ]]; then
+      continue
+    fi
+
+    if [[ "$filename" == *.md || "$filename" == *.txt ]]; then
+      echo "FAIL: Instruction file found in tool folder: $relpath"
+      FAILED=1
+    fi
+  done < <(find "$folder_path" -type f \( -name "*.md" -o -name "*.txt" \) -print0)
+done
+
+if [[ $FAILED -eq 1 ]]; then
+  echo "check_no_tool_folder_instructions: FAIL"
+  exit 1
+fi
+
+echo "check_no_tool_folder_instructions: PASS"
+exit 0

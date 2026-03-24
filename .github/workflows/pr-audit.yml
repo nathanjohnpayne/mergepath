@@ -1,0 +1,186 @@
+name: Weekly PR Audit
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 9:00 UTC
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: read
+
+jobs:
+  audit:
+    name: Audit Merged PRs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Audit merged PRs for review policy compliance
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          script: |
+            const since = new Date();
+            since.setDate(since.getDate() - 7);
+            const sinceISO = since.toISOString();
+            const today = new Date().toISOString().split('T')[0];
+
+            const botAccounts = [
+              'nathanpayne-claude',
+              'nathanpayne-codex',
+              'nathanpayne-cursor',
+            ];
+
+            // Get merged PRs from the past 7 days
+            const prs = await github.paginate(
+              github.rest.pulls.list,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'closed',
+                sort: 'updated',
+                direction: 'desc',
+                per_page: 100,
+              }
+            );
+
+            const mergedPRs = prs.filter(
+              pr => pr.merged_at && new Date(pr.merged_at) >= since
+            );
+
+            const violations = [];
+
+            for (const pr of mergedPRs) {
+              const prViolations = [];
+
+              // Check 1: Missing Self-Review section
+              if (!pr.body || !pr.body.match(/^## Self-Review/m)) {
+                prViolations.push('Missing `## Self-Review` section');
+              }
+
+              // Check 2: Had needs-external-review label — verify approval
+              const hadExternalLabel = pr.labels.some(
+                l => l.name === 'needs-external-review'
+              );
+
+              if (hadExternalLabel) {
+                const reviews = await github.rest.pulls.listReviews({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                });
+
+                const approvals = reviews.data.filter(
+                  r => r.state === 'APPROVED'
+                );
+
+                // For external-review PRs by bots, need 2 approvals from other bots or human
+                const isBotPR = botAccounts.includes(pr.user.login);
+                if (isBotPR && approvals.length < 2) {
+                  prViolations.push(
+                    'External-review PR merged with fewer than 2 approvals'
+                  );
+                }
+
+                // Check for human approval on non-bot PRs
+                if (!isBotPR) {
+                  const humanApprovals = approvals.filter(
+                    r => !botAccounts.includes(r.user.login)
+                  );
+                  if (humanApprovals.length === 0) {
+                    prViolations.push(
+                      'Had `needs-external-review` label but no human approval'
+                    );
+                  }
+                }
+              }
+
+              // Check 3: Self-approval (author approved their own PR)
+              if (botAccounts.includes(pr.user.login)) {
+                const reviews = await github.rest.pulls.listReviews({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                });
+
+                const selfApproval = reviews.data.some(
+                  r => r.user.login === pr.user.login && r.state === 'APPROVED'
+                );
+
+                if (selfApproval) {
+                  prViolations.push('Self-approval detected (author approved own PR)');
+                }
+              }
+
+              // Check 4: Had needs-human-review label — verify Nathan approved
+              const hadHumanLabel = pr.labels.some(
+                l => l.name === 'needs-human-review'
+              );
+
+              if (hadHumanLabel) {
+                const reviews = await github.rest.pulls.listReviews({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                });
+
+                const nathanApproved = reviews.data.some(
+                  r => r.user.login === 'nathanjohnpayne' && r.state === 'APPROVED'
+                );
+
+                if (!nathanApproved) {
+                  prViolations.push(
+                    'Had `needs-human-review` label but @nathanjohnpayne did not approve'
+                  );
+                }
+              }
+
+              // Check 5: Had policy-violation label — should not have been merged
+              const hadPolicyViolation = pr.labels.some(
+                l => l.name === 'policy-violation'
+              );
+
+              if (hadPolicyViolation) {
+                prViolations.push(
+                  'Merged with `policy-violation` label still present'
+                );
+              }
+
+              if (prViolations.length > 0) {
+                violations.push({
+                  number: pr.number,
+                  title: pr.title,
+                  author: pr.user.login,
+                  issues: prViolations,
+                });
+              }
+            }
+
+            if (violations.length > 0) {
+              let body = `## PR Review Policy Violations\n\n`;
+              body += `**Audit period:** ${sinceISO.split('T')[0]} to ${today}\n`;
+              body += `**Violations found:** ${violations.length}\n\n`;
+              body += `### Details\n\n`;
+
+              for (const v of violations) {
+                body += `- **#${v.number}** — ${v.title} (by ${v.author})\n`;
+                for (const issue of v.issues) {
+                  body += `  - ${issue}\n`;
+                }
+              }
+
+              body += `\n---\n\n`;
+              body += `Per policy, these PRs must be retroactively reviewed by a human within one business day.\n\n`;
+              body += `cc @nathanjohnpayne`;
+
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Weekly PR Audit — ${today}`,
+                body: body,
+                labels: ['audit'],
+              });
+
+              console.log(`Created audit issue with ${violations.length} violations.`);
+            } else {
+              console.log('No policy violations found for the past 7 days.');
+            }

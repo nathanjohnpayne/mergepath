@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FORBIDDEN_DIRS=("vendor" "node_modules/.cache/custom")
+ALLOWED_DIRS=(".claude" ".cursor" ".github" ".git" ".vscode" "dist" "docs" "functions" "plans" "rules" "scripts" "specs" "src" "tests")
+FAILED=0
+
+for dir in "${FORBIDDEN_DIRS[@]}"; do
+  if [[ -d "$REPO_ROOT/$dir" ]]; then
+    echo "FAIL: Forbidden top-level directory exists: $dir"
+    FAILED=1
+  fi
+done
+
+while IFS= read -r -d '' dirpath; do
+  dirname="$(basename "$dirpath")"
+  if [[ ! " ${ALLOWED_DIRS[*]} " =~ " ${dirname} " ]]; then
+    echo "WARN: Unexpected top-level directory: $dirname (document it in AGENTS.md or plans/ if intentional)"
+  fi
+done < <(find "$REPO_ROOT" -maxdepth 1 -mindepth 1 -type d -not -name ".*" -print0)
+
+if [[ $FAILED -eq 1 ]]; then
+  echo "check_no_forbidden_top_level_dirs: FAIL"
+  exit 1
+fi
+
+echo "check_no_forbidden_top_level_dirs: PASS"
+exit 0

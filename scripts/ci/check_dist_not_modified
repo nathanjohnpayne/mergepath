@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+if ! git -C "$REPO_ROOT" rev-parse HEAD~1 >/dev/null 2>&1; then
+  echo "check_dist_not_modified: SKIP (not enough commits to compare)"
+  exit 0
+fi
+
+MODIFIED=$(git -C "$REPO_ROOT" diff --name-only --diff-filter=M HEAD~1 HEAD -- dist/ 2>/dev/null)
+
+if [[ -n "$MODIFIED" ]]; then
+  echo "FAIL: dist/ files were directly modified (regenerate through the build system instead):"
+  echo "$MODIFIED"
+  echo "check_dist_not_modified: FAIL"
+  exit 1
+fi
+
+echo "check_dist_not_modified: PASS"
+exit 0

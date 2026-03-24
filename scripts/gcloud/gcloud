@@ -1,0 +1,421 @@
+#!/bin/sh
+
+set -eu
+
+SCRIPT_PATH="$0"
+TOKEN_FILE="${HOME}/.config/gcloud/adc-access-token"
+DEFAULT_ADC_FILE="${HOME}/.config/gcloud/application_default_credentials.json"
+DEFAULT_ADC_OP_URI="${GCP_ADC_OP_URI:-op://Private/GCP ADC/credential}"
+SOURCE_CRED_FILE=""
+SOURCE_CRED_TMPFILE=""
+
+resolve_real_gcloud() {
+  if [ -n "${GCLOUD_REAL_BIN:-}" ] && [ -x "${GCLOUD_REAL_BIN}" ]; then
+    printf '%s\n' "${GCLOUD_REAL_BIN}"
+    return 0
+  fi
+
+  for candidate in \
+    /opt/homebrew/bin/gcloud \
+    /usr/local/bin/gcloud \
+    /usr/bin/gcloud \
+    "${HOME}/google-cloud-sdk/bin/gcloud"
+  do
+    if [ -x "${candidate}" ] && [ "${candidate}" != "${SCRIPT_PATH}" ]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+REAL_GCLOUD="$(resolve_real_gcloud || true)"
+
+cleanup_source_cred() {
+  if [ -n "${SOURCE_CRED_TMPFILE}" ] && [ -f "${SOURCE_CRED_TMPFILE}" ]; then
+    rm -f "${SOURCE_CRED_TMPFILE}"
+  fi
+}
+
+materialize_op_source_cred() {
+  op_uri="${1-}"
+  tmpfile=""
+
+  if [ -z "${op_uri}" ] || ! command -v op >/dev/null 2>&1; then
+    return 1
+  fi
+
+  tmpfile="$(mktemp "${TMPDIR:-/tmp}/gcp-adc-XXXXXX")"
+  umask 077
+
+  # Timeout after 5s — op read hangs if biometric auth (Touch ID) can't prompt
+  op read "${op_uri}" > "${tmpfile}" 2>/dev/null &
+  op_pid=$!
+  op_ok=false
+  i=0
+  while [ "$i" -lt 50 ]; do
+    if ! kill -0 "$op_pid" 2>/dev/null; then
+      wait "$op_pid" && op_ok=true
+      break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if ! $op_ok; then
+    kill "$op_pid" 2>/dev/null
+    sleep 0.2
+    kill -9 "$op_pid" 2>/dev/null
+    wait "$op_pid" 2>/dev/null || true
+  fi
+
+  if $op_ok && [ -s "${tmpfile}" ]; then
+    SOURCE_CRED_TMPFILE="${tmpfile}"
+    printf '%s\n' "${tmpfile}"
+    return 0
+  fi
+
+  rm -f "${tmpfile}"
+  return 1
+}
+
+resolve_source_cred_file() {
+  source_cred_file="${GOOGLE_APPLICATION_CREDENTIALS:-}"
+
+  if [ -n "${source_cred_file}" ] && [ -f "${source_cred_file}" ]; then
+    SOURCE_CRED_FILE="${source_cred_file}"
+    return 0
+  fi
+
+  SOURCE_CRED_FILE="$(materialize_op_source_cred "${DEFAULT_ADC_OP_URI}" || true)"
+  if [ -n "${SOURCE_CRED_FILE}" ]; then
+    SOURCE_CRED_TMPFILE="${SOURCE_CRED_FILE}"
+    return 0
+  fi
+
+  if [ -f "${DEFAULT_ADC_FILE}" ]; then
+    SOURCE_CRED_FILE="${DEFAULT_ADC_FILE}"
+    return 0
+  fi
+
+  return 1
+}
+
+try_token_from_source() {
+  source_cred_file="${1-}"
+
+  if [ -z "${source_cred_file}" ] || [ ! -f "${source_cred_file}" ]; then
+    return 1
+  fi
+
+  # Refresh the token via the OAuth2 endpoint directly.
+  # Avoids the real gcloud, which can hang when the user account's RAPT
+  # (re-auth policy token) is expired and gcloud tries to launch a browser.
+  python3 - "${source_cred_file}" <<'PY'
+import json, pathlib, sys, urllib.request, urllib.parse
+
+cred = json.loads(pathlib.Path(sys.argv[1]).read_text())
+
+while cred.get("type") == "impersonated_service_account" and "source_credentials" in cred:
+    cred = cred["source_credentials"]
+
+if cred.get("type") == "service_account":
+    # For service account keys, fall back to gcloud (they don't use refresh tokens)
+    sys.exit(1)
+
+refresh_token = cred.get("refresh_token", "")
+client_id = cred.get("client_id", "")
+client_secret = cred.get("client_secret", "")
+
+if not all([refresh_token, client_id, client_secret]):
+    sys.exit(1)
+
+data = urllib.parse.urlencode({
+    "client_id": client_id,
+    "client_secret": client_secret,
+    "refresh_token": refresh_token,
+    "grant_type": "refresh_token",
+}).encode()
+try:
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
+    resp = urllib.request.urlopen(req, timeout=10)
+    token = json.loads(resp.read()).get("access_token", "")
+    if token:
+        print(token)
+    else:
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+normalize_project_value() {
+  value="${1-}"
+  fallback="${2-}"
+
+  if [ -z "${value}" ] || [ "${value}" = "(unset)" ]; then
+    return 1
+  fi
+
+  if [ "${value}" = "CURRENT_PROJECT" ]; then
+    if [ -n "${fallback}" ] && [ "${fallback}" != "(unset)" ] && [ "${fallback}" != "CURRENT_PROJECT" ]; then
+      printf '%s\n' "${fallback}"
+      return 0
+    fi
+
+    return 1
+  fi
+
+  printf '%s\n' "${value}"
+  return 0
+}
+
+read_config_value() {
+  config_name="${1-}"
+  property="${2-}"
+
+  if [ -n "${config_name}" ]; then
+    env GCLOUD_BYPASS_ADC_WRAPPER=1 CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true "${REAL_GCLOUD}" --configuration="${config_name}" config get-value "${property}" 2>/dev/null || true
+    return 0
+  fi
+
+  env GCLOUD_BYPASS_ADC_WRAPPER=1 CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true "${REAL_GCLOUD}" config get-value "${property}" 2>/dev/null || true
+}
+
+find_repo_project() {
+  search_dir="${PWD}"
+  candidate=""
+  repo_project=""
+
+  while [ -n "${search_dir}" ] && [ "${search_dir}" != "/" ]; do
+    candidate="${search_dir}/.firebaserc"
+
+    if [ -f "${candidate}" ]; then
+      repo_project="$(python3 - "${candidate}" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    print("")
+else:
+    print(data.get("projects", {}).get("default", ""))
+PY
+)"
+
+      if [ -n "${repo_project}" ]; then
+        printf '%s\n' "${repo_project}"
+        return 0
+      fi
+    fi
+
+    search_dir="$(dirname "${search_dir}")"
+  done
+
+  return 1
+}
+
+resolve_billing_project() {
+  billing_project=""
+  project=""
+  config_name="${CLOUDSDK_ACTIVE_CONFIG_NAME:-}"
+  config_name_explicit="0"
+  explicit_config_billing_project=""
+  explicit_config_project=""
+  active_config_billing_project=""
+  active_config_project=""
+  repo_project=""
+  resolved=""
+  expect_billing_project="0"
+  expect_project="0"
+  expect_config_name="0"
+
+  if [ -n "${config_name}" ]; then
+    config_name_explicit="1"
+  fi
+
+  for arg in "$@"; do
+    if [ "${expect_billing_project}" = "1" ]; then
+      billing_project="${arg}"
+      expect_billing_project="0"
+      continue
+    fi
+
+    if [ "${expect_project}" = "1" ]; then
+      project="${arg}"
+      expect_project="0"
+      continue
+    fi
+
+    if [ "${expect_config_name}" = "1" ]; then
+      config_name="${arg}"
+      config_name_explicit="1"
+      expect_config_name="0"
+      continue
+    fi
+
+    case "${arg}" in
+      --billing-project)
+        expect_billing_project="1"
+        ;;
+      --billing-project=*)
+        billing_project="${arg#*=}"
+        ;;
+      --project)
+        expect_project="1"
+        ;;
+      --project=*)
+        project="${arg#*=}"
+        ;;
+      --configuration)
+        expect_config_name="1"
+        ;;
+      --configuration=*)
+        config_name="${arg#*=}"
+        config_name_explicit="1"
+        ;;
+    esac
+  done
+
+  if [ "${config_name_explicit}" = "1" ]; then
+    explicit_config_project="$(read_config_value "${config_name}" core/project)"
+    explicit_config_billing_project="$(read_config_value "${config_name}" billing/quota_project)"
+  fi
+
+  active_config_project="$(read_config_value "" core/project)"
+  active_config_billing_project="$(read_config_value "" billing/quota_project)"
+  repo_project="$(find_repo_project || true)"
+
+  resolved="$(normalize_project_value "${billing_project}" "${project}" || true)"
+  if [ -n "${resolved}" ]; then
+    printf '%s\n' "${resolved}"
+    return 0
+  fi
+
+  resolved="$(normalize_project_value "${billing_project}" "${explicit_config_project}" || true)"
+  if [ -n "${resolved}" ]; then
+    printf '%s\n' "${resolved}"
+    return 0
+  fi
+
+  resolved="$(normalize_project_value "${project}" "" || true)"
+  if [ -n "${resolved}" ]; then
+    printf '%s\n' "${resolved}"
+    return 0
+  fi
+
+  if [ "${config_name_explicit}" = "1" ]; then
+    resolved="$(normalize_project_value "${explicit_config_billing_project}" "${explicit_config_project}" || true)"
+    if [ -n "${resolved}" ]; then
+      printf '%s\n' "${resolved}"
+      return 0
+    fi
+
+    resolved="$(normalize_project_value "${explicit_config_project}" "" || true)"
+    if [ -n "${resolved}" ]; then
+      printf '%s\n' "${resolved}"
+      return 0
+    fi
+  fi
+
+  resolved="$(normalize_project_value "${repo_project}" "" || true)"
+  if [ -n "${resolved}" ]; then
+    printf '%s\n' "${resolved}"
+    return 0
+  fi
+
+  resolved="$(normalize_project_value "${active_config_billing_project}" "${active_config_project}" || true)"
+  if [ -n "${resolved}" ]; then
+    printf '%s\n' "${resolved}"
+    return 0
+  fi
+
+  resolved="$(normalize_project_value "${active_config_project}" "" || true)"
+  if [ -n "${resolved}" ]; then
+    printf '%s\n' "${resolved}"
+    return 0
+  fi
+
+  return 1
+}
+
+if [ -z "${REAL_GCLOUD}" ] || [ ! -x "${REAL_GCLOUD}" ]; then
+  echo "Error: could not find the real gcloud binary. Set GCLOUD_REAL_BIN first." >&2
+  exit 1
+fi
+
+if [ "${GCLOUD_BYPASS_ADC_WRAPPER:-}" = "1" ]; then
+  exec "${REAL_GCLOUD}" "$@"
+fi
+
+first="${1-}"
+second="${2-}"
+third="${3-}"
+
+if [ "${first}" = "init" ] || \
+   { [ "${first}" = "auth" ] && [ "${second}" = "login" ]; } || \
+   { [ "${first}" = "auth" ] && [ "${second}" = "revoke" ]; } || \
+   { [ "${first}" = "auth" ] && [ "${second}" = "application-default" ] && [ "${third}" = "login" ]; } || \
+   { [ "${first}" = "auth" ] && [ "${second}" = "application-default" ] && [ "${third}" = "revoke" ]; } || \
+   { [ "${first}" = "auth" ] && [ "${second}" = "application-default" ] && [ "${third}" = "set-quota-project" ]; }
+then
+  exec "${REAL_GCLOUD}" "$@"
+fi
+
+for arg in "$@"; do
+  case "${arg}" in
+    --access-token-file|--access-token-file=*)
+      exec "${REAL_GCLOUD}" "$@"
+      ;;
+  esac
+done
+
+if ! resolve_source_cred_file; then
+  echo "Error: No GCP source credential found. Set GOOGLE_APPLICATION_CREDENTIALS, unlock 1Password item ${DEFAULT_ADC_OP_URI}, or create ${DEFAULT_ADC_FILE}." >&2
+  exit 1
+fi
+
+token="$(try_token_from_source "${SOURCE_CRED_FILE}" || true)"
+if [ -z "${token}" ]; then
+  explicit_source_cred="${GOOGLE_APPLICATION_CREDENTIALS:-}"
+
+  if [ -n "${explicit_source_cred}" ] && [ -f "${explicit_source_cred}" ]; then
+    cleanup_source_cred
+    echo "Error: GOOGLE_APPLICATION_CREDENTIALS points to an unusable credential file: ${explicit_source_cred}" >&2
+    exit 1
+  fi
+
+  cleanup_source_cred
+  SOURCE_CRED_FILE=""
+  SOURCE_CRED_TMPFILE=""
+
+  if [ -f "${DEFAULT_ADC_FILE}" ]; then
+    SOURCE_CRED_FILE="${DEFAULT_ADC_FILE}"
+    token="$(try_token_from_source "${SOURCE_CRED_FILE}" || true)"
+  fi
+fi
+
+if [ -z "${token}" ]; then
+  exec "${REAL_GCLOUD}" "$@"
+fi
+
+billing_project="$(resolve_billing_project "$@" || true)"
+cleanup_source_cred
+
+umask 077
+printf '%s' "${token}" > "${TOKEN_FILE}"
+
+if [ "${first}" = "auth" ] && [ "${second}" = "application-default" ] && [ "${third}" = "print-access-token" ]; then
+  printf '%s\n' "${token}"
+  exit 0
+fi
+
+if [ -n "${billing_project}" ]; then
+  exec env GCLOUD_BYPASS_ADC_WRAPPER=1 CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true "${REAL_GCLOUD}" --access-token-file="${TOKEN_FILE}" --billing-project="${billing_project}" "$@"
+fi
+
+exec env GCLOUD_BYPASS_ADC_WRAPPER=1 CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true "${REAL_GCLOUD}" --access-token-file="${TOKEN_FILE}" "$@"

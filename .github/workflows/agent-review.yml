@@ -1,0 +1,319 @@
+name: Agent Review Pipeline
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, labeled]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Job 1: Auto-label PRs that need external review
+  # ──────────────────────────────────────────────
+  triage:
+    if: >
+      github.event_name == 'pull_request' &&
+      (github.event.action == 'opened' || github.event.action == 'ready_for_review')
+    runs-on: ubuntu-latest
+    outputs:
+      needs_external: ${{ steps.check.outputs.needs_external }}
+    steps:
+      - name: Evaluate PR size and file paths
+        id: check
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+              }
+            );
+
+            const totalChanges = files.reduce(
+              (sum, f) => sum + f.additions + f.deletions, 0
+            );
+
+            const infraPatterns = [
+              /^\.github\//, /Dockerfile/, /docker-compose/,
+              /^Makefile/, /^scripts\//,
+              /package-lock\.json$/, /yarn\.lock$/, /pnpm-lock\.yaml$/,
+              /requirements.*\.txt$/, /Gemfile\.lock$/,
+            ];
+
+            const authPatterns = [
+              /auth/i, /permission/i, /security/i,
+              /token/i, /credential/i, /\.env/,
+            ];
+
+            const touchesInfra = files.some(f =>
+              infraPatterns.some(p => p.test(f.filename))
+            );
+            const touchesAuth = files.some(f =>
+              authPatterns.some(p => p.test(f.filename))
+            );
+
+            const needsExternal = totalChanges >= 300 || touchesInfra || touchesAuth;
+
+            if (needsExternal) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: ['needs-external-review'],
+              });
+            }
+
+            core.setOutput('needs_external', needsExternal.toString());
+
+  # ──────────────────────────────────────────────
+  # Job 2: Assign reviewer(s)
+  # ──────────────────────────────────────────────
+  assign:
+    needs: [triage]
+    if: >
+      always() &&
+      github.event_name == 'pull_request' &&
+      (github.event.action == 'opened' || github.event.action == 'ready_for_review' || github.event.action == 'labeled')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assign cross-agent reviewer(s)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          script: |
+            const author = context.payload.pull_request.user.login;
+
+            const botAccounts = [
+              'nathanpayne-claude',
+              'nathanpayne-codex',
+              'nathanpayne-cursor',
+            ];
+
+            if (!botAccounts.includes(author)) {
+              console.log(`Author ${author} is not a bot; skipping.`);
+              return;
+            }
+
+            const primaryMap = {
+              'nathanpayne-claude': 'nathanpayne-codex',
+              'nathanpayne-codex': 'nathanpayne-cursor',
+              'nathanpayne-cursor': 'nathanpayne-claude',
+            };
+
+            const labels = context.payload.pull_request.labels.map(l => l.name);
+            const needsExternal = labels.includes('needs-external-review');
+
+            const primary = primaryMap[author];
+            const reviewers = [primary];
+
+            if (needsExternal) {
+              const secondary = botAccounts.find(b => b !== author && b !== primary);
+              reviewers.push(secondary);
+              console.log(`External review: assigning ${reviewers.join(', ')}`);
+            } else {
+              console.log(`Standard review: assigning ${primary}`);
+            }
+
+            // Check who is already requested to avoid duplicates
+            const { data: existingReviewers } = await github.rest.pulls.listRequestedReviewers({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+            const alreadyRequested = existingReviewers.users.map(u => u.login);
+            const newReviewers = reviewers.filter(r => !alreadyRequested.includes(r));
+
+            if (newReviewers.length > 0) {
+              await github.rest.pulls.requestReviewers({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                reviewers: newReviewers,
+              });
+            }
+
+  # ──────────────────────────────────────────────
+  # Job 3: Trigger subagent to perform the review
+  # ──────────────────────────────────────────────
+  invoke-reviewer:
+    needs: [assign]
+    if: >
+      always() &&
+      github.event_name == 'pull_request' &&
+      (github.event.action == 'opened' || github.event.action == 'ready_for_review')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - agent: claude
+            username: nathanpayne-claude
+          - agent: codex
+            username: nathanpayne-codex
+          - agent: cursor
+            username: nathanpayne-cursor
+    steps:
+      - name: Check if this agent is assigned
+        id: check-assigned
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          script: |
+            const { data: reviewers } = await github.rest.pulls.listRequestedReviewers({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+            const assigned = reviewers.users.some(
+              u => u.login === '${{ matrix.username }}'
+            );
+            core.setOutput('assigned', assigned.toString());
+
+      # ── Claude: headless CLI ──
+      - name: Checkout repo
+        if: steps.check-assigned.outputs.assigned == 'true' && matrix.agent == 'claude'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Install Claude Code
+        if: steps.check-assigned.outputs.assigned == 'true' && matrix.agent == 'claude'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Invoke Claude Code
+        if: steps.check-assigned.outputs.assigned == 'true' && matrix.agent == 'claude'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.CLAUDE_PAT }}
+        run: |
+          claude -p "Review PR #${{ github.event.pull_request.number }} on ${{ github.repository }}. \
+            Read the diff, check for correctness, security issues, style violations, and test coverage. \
+            Post your review via the GitHub API using the GITHUB_TOKEN env var. \
+            Authenticate as nathanpayne-claude. \
+            If the PR has a review guidance document at reviews/pr-${{ github.event.pull_request.number }}-guidance.md, read it first." \
+            --allowedTools "Bash,Read,Glob,Grep,WebFetch"
+
+      # ── Codex: OpenAI Codex CLI ──
+      - name: Checkout repo for Codex
+        if: steps.check-assigned.outputs.assigned == 'true' && matrix.agent == 'codex'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Invoke Codex
+        if: steps.check-assigned.outputs.assigned == 'true' && matrix.agent == 'codex'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.CODEX_PAT }}
+        run: |
+          # TODO: Replace with actual Codex CLI invocation once available
+          # codex --approval-mode full-auto -q "Review PR #${{ github.event.pull_request.number }}..."
+          echo "Codex headless review invocation — pending CLI availability"
+
+      # ── Cursor: no headless mode yet ──
+      - name: Notify for manual Cursor review
+        if: steps.check-assigned.outputs.assigned == 'true' && matrix.agent == 'cursor'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: '**@nathanpayne-cursor** has been assigned to review this PR. Cursor does not support headless invocation — please open this PR in Cursor to perform the review manually.',
+            });
+
+  # ──────────────────────────────────────────────
+  # Job 4: Detect agent disagreement → escalate
+  # ──────────────────────────────────────────────
+  detect-disagreement:
+    if: github.event_name == 'pull_request_review'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for conflicting reviews
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          script: |
+            const botAccounts = [
+              'nathanpayne-claude',
+              'nathanpayne-codex',
+              'nathanpayne-cursor',
+            ];
+
+            const reviews = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+
+            const latestByBot = {};
+            for (const review of reviews.data) {
+              if (botAccounts.includes(review.user.login)) {
+                latestByBot[review.user.login] = review.state;
+              }
+            }
+
+            const states = Object.values(latestByBot);
+            const hasApproval = states.includes('APPROVED');
+            const hasChangesRequested = states.includes('CHANGES_REQUESTED');
+
+            if (hasApproval && hasChangesRequested) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['needs-human-review'],
+              });
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: '**Agent disagreement detected.** One reviewer approved and another requested changes. Escalating to @nathanjohnpayne for human review.',
+              });
+            }
+
+  # ──────────────────────────────────────────────
+  # Job 5: Block self-approval
+  # ──────────────────────────────────────────────
+  block-self-approval:
+    if: >
+      github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dismiss if reviewer is PR author
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          script: |
+            const prAuthor = context.payload.pull_request.user.login;
+            const reviewer = context.payload.review.user.login;
+
+            if (prAuthor === reviewer) {
+              await github.rest.pulls.dismissReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                review_id: context.payload.review.id,
+                message: 'Self-approval is not permitted. This review has been dismissed automatically.',
+              });
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['policy-violation'],
+              });
+
+              core.setFailed('Self-approval detected and dismissed.');
+            }

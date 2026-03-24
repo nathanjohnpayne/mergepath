@@ -1,0 +1,128 @@
+name: PR Review Policy
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, labeled, unlabeled]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  self-review-check:
+    name: Self-Review Required
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for Self-Review section
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if echo "$PR_BODY" | grep -qE '^## Self-Review'; then
+            echo "✅ Self-Review section found."
+          else
+            echo "❌ PR description must contain a '## Self-Review' section."
+            echo "Please add a structured self-review to your PR description."
+            exit 1
+          fi
+
+  label-gate:
+    name: Label Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Block merge if blocking labels present
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const blockingLabels = [
+              'needs-external-review',
+              'needs-human-review',
+              'policy-violation',
+            ];
+            const prLabels = context.payload.pull_request.labels.map(l => l.name);
+            const blockers = prLabels.filter(l => blockingLabels.includes(l));
+
+            if (blockers.length > 0) {
+              core.setFailed(
+                `Merge blocked by label(s): ${blockers.join(', ')}`
+              );
+            }
+
+  external-review-labeling:
+    name: External Review Check
+    if: github.event.action != 'labeled' && github.event.action != 'unlabeled'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for external review triggers
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          NEEDS_REVIEW=false
+          REASONS=""
+
+          BASE_SHA=${{ github.event.pull_request.base.sha }}
+          HEAD_SHA=${{ github.event.pull_request.head.sha }}
+
+          LINES_CHANGED=$(git diff --stat "$BASE_SHA"..."$HEAD_SHA" -- \
+            ':!*.lock' ':!*lock.json' ':!*.min.js' ':!*.min.css' \
+            ':!*.generated.*' ':!*.g.dart' ':!*.freezed.dart' \
+            | tail -1 | awk '{print $4+$6}')
+          LINES_CHANGED=${LINES_CHANGED:-0}
+
+          if [ "$LINES_CHANGED" -gt 300 ]; then
+            NEEDS_REVIEW=true
+            REASONS="$REASONS- Over 300 non-generated lines changed ($LINES_CHANGED)%0A"
+          fi
+
+          SENSITIVE_FILES=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA" | grep -E \
+            '(^\.github/|/ci/|/auth/|/security/|^package\.json$|^package-lock\.json$|^requirements\.txt$|^Cargo\.toml$|^go\.mod$|^go\.sum$|^Gemfile$|^Gemfile\.lock$|^pubspec\.yaml$|^pubspec\.lock$)' \
+            || true)
+
+          if [ -n "$SENSITIVE_FILES" ]; then
+            NEEDS_REVIEW=true
+            FILE_LIST=$(echo "$SENSITIVE_FILES" | sed 's/^/  - /' | tr '\n' ',' | sed 's/,/%0A/g')
+            REASONS="${REASONS}- Sensitive files modified:%0A${FILE_LIST}"
+          fi
+
+          echo "needs_review=$NEEDS_REVIEW" >> "$GITHUB_OUTPUT"
+          echo "reasons=$REASONS" >> "$GITHUB_OUTPUT"
+
+      - name: Apply label and comment
+        if: steps.check.outputs.needs_review == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REASONS: ${{ steps.check.outputs.reasons }}
+        run: |
+          # Check if label already applied to avoid duplicate comments
+          EXISTING=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name' | grep '^needs-external-review$' || true)
+          if [ -n "$EXISTING" ]; then
+            echo "Label already applied, skipping."
+            exit 0
+          fi
+
+          gh pr edit "$PR_NUMBER" --add-label "needs-external-review" \
+            --repo "${{ github.repository }}"
+
+          # Format reasons for comment (convert %0A back to newlines)
+          FORMATTED_REASONS=$(echo "$REASONS" | sed 's/%0A/\n/g')
+
+          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$(cat <<EOF
+          ⚠️ **External Review Required**
+
+          This PR has been labeled \`needs-external-review\` because it meets one or more external review triggers:
+
+          $FORMATTED_REASONS
+
+          **A human reviewer must review this PR and remove the \`needs-external-review\` label before it can be merged.**
+
+          > This is an automated check per the repository's code review policy.
+          EOF
+          )"

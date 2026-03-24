@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CANONICAL_TOPICS=(
+  "Deploy Auth"
+  "Credential"
+  "Firebase"
+  "Environment"
+  "Branch Naming"
+  "Commit Message"
+  "Pull Request"
+)
+
+for folder in .claude .cursor .vscode; do
+  folder_path="$REPO_ROOT/$folder"
+  if [[ ! -d "$folder_path" ]]; then
+    continue
+  fi
+
+  while IFS= read -r -d '' filepath; do
+    relpath="${filepath#$REPO_ROOT/}"
+    if [[ "$relpath" == .claude/worktrees/* ]]; then
+      continue
+    fi
+
+    for topic in "${CANONICAL_TOPICS[@]}"; do
+      if grep -qi "$topic" "$filepath" 2>/dev/null; then
+        echo "WARN: '$topic' documented in tool folder file: $relpath (canonical location: root docs)"
+      fi
+    done
+  done < <(find "$folder_path" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.mdc" \) -print0 2>/dev/null)
+done
+
+echo "check_duplicate_docs: PASS"
+exit 0

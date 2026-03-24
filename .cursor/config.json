@@ -1,0 +1,8 @@
+{
+  "rules": [
+    "Read AGENTS.md before taking any action in this repository.",
+    "Load binding constraints from rules/repo_rules.md.",
+    "Do not add instructions to this folder. Instructions belong in AGENTS.md or rules/.",
+    "Refer to ai_agent_tooling_standard.md for full structural reference."
+  ]
+}
