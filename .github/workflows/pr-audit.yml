@@ -8,27 +8,40 @@ on:
 permissions:
   issues: write
   pull-requests: read
+  contents: read
 
 jobs:
   audit:
     name: Audit Merged PRs
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Audit merged PRs for review policy compliance
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
+            const fs = require('fs');
+            const yaml = require('js-yaml');
+
+            // Read reviewer accounts from review-policy.yml
+            let reviewerAccounts;
+            let authorIdentity;
+            try {
+              const config = yaml.load(fs.readFileSync('.github/review-policy.yml', 'utf8'));
+              reviewerAccounts = config.available_reviewers || [];
+              authorIdentity = config.author_identity || 'nathanjohnpayne';
+            } catch (e) {
+              console.log('WARNING: Could not read review-policy.yml, using defaults');
+              reviewerAccounts = ['nathanpayne-claude', 'nathanpayne-codex', 'nathanpayne-cursor'];
+              authorIdentity = 'nathanjohnpayne';
+            }
+
             const since = new Date();
             since.setDate(since.getDate() - 7);
             const sinceISO = since.toISOString();
             const today = new Date().toISOString().split('T')[0];
-
-            const botAccounts = [
-              'nathanpayne-claude',
-              'nathanpayne-codex',
-              'nathanpayne-cursor',
-            ];
 
             // Get merged PRs from the past 7 days
             const prs = await github.paginate(
@@ -57,7 +70,7 @@ jobs:
                 prViolations.push('Missing `## Self-Review` section');
               }
 
-              // Check 2: Had needs-external-review label — verify approval
+              // Check 2: Had needs-external-review label — verify approval from a reviewer identity
               const hadExternalLabel = pr.labels.some(
                 l => l.name === 'needs-external-review'
               );
@@ -73,42 +86,35 @@ jobs:
                   r => r.state === 'APPROVED'
                 );
 
-                // For external-review PRs by bots, need 2 approvals from other bots or human
-                const isBotPR = botAccounts.includes(pr.user.login);
-                if (isBotPR && approvals.length < 2) {
-                  prViolations.push(
-                    'External-review PR merged with fewer than 2 approvals'
+                // Per REVIEW_POLICY.md: PRs authored by authorIdentity need
+                // at least one reviewer identity approval for internal review,
+                // plus external review coordination via the human.
+                const isAuthorPR = pr.user.login === authorIdentity;
+                if (isAuthorPR) {
+                  const reviewerApprovals = approvals.filter(
+                    r => reviewerAccounts.includes(r.user.login) || r.user.login === 'nathanjohnpayne'
                   );
-                }
-
-                // Check for human approval on non-bot PRs
-                if (!isBotPR) {
-                  const humanApprovals = approvals.filter(
-                    r => !botAccounts.includes(r.user.login)
-                  );
-                  if (humanApprovals.length === 0) {
+                  if (reviewerApprovals.length === 0) {
                     prViolations.push(
-                      'Had `needs-external-review` label but no human approval'
+                      'External-review PR merged with no reviewer approval'
                     );
                   }
                 }
               }
 
               // Check 3: Self-approval (author approved their own PR)
-              if (botAccounts.includes(pr.user.login)) {
-                const reviews = await github.rest.pulls.listReviews({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: pr.number,
-                });
+              const reviews = await github.rest.pulls.listReviews({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+              });
 
-                const selfApproval = reviews.data.some(
-                  r => r.user.login === pr.user.login && r.state === 'APPROVED'
-                );
+              const selfApproval = reviews.data.some(
+                r => r.user.login === pr.user.login && r.state === 'APPROVED'
+              );
 
-                if (selfApproval) {
-                  prViolations.push('Self-approval detected (author approved own PR)');
-                }
+              if (selfApproval) {
+                prViolations.push('Self-approval detected (author approved own PR)');
               }
 
               // Check 4: Had needs-human-review label — verify Nathan approved
@@ -117,12 +123,6 @@ jobs:
               );
 
               if (hadHumanLabel) {
-                const reviews = await github.rest.pulls.listReviews({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: pr.number,
-                });
-
                 const nathanApproved = reviews.data.some(
                   r => r.user.login === 'nathanjohnpayne' && r.state === 'APPROVED'
                 );
@@ -169,7 +169,7 @@ jobs:
               }
 
               body += `\n---\n\n`;
-              body += `Per policy, these PRs must be retroactively reviewed by a human within one business day.\n\n`;
+              body += `Per REVIEW_POLICY.md, these PRs must be retroactively reviewed by a human within one business day.\n\n`;
               body += `cc @nathanjohnpayne`;
 
               await github.rest.issues.create({

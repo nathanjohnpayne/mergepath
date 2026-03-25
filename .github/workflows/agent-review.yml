@@ -8,9 +8,53 @@ on:
 
 jobs:
   # ──────────────────────────────────────────────
-  # Job 1: Auto-label PRs that need external review
+  # Job 1: Read review-policy.yml configuration
+  # ──────────────────────────────────────────────
+  load-config:
+    if: >
+      github.event_name == 'pull_request' &&
+      (github.event.action == 'opened' || github.event.action == 'ready_for_review')
+    runs-on: ubuntu-latest
+    outputs:
+      threshold: ${{ steps.config.outputs.threshold }}
+      paths: ${{ steps.config.outputs.paths }}
+      reviewers: ${{ steps.config.outputs.reviewers }}
+      author_identity: ${{ steps.config.outputs.author_identity }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse review-policy.yml
+        id: config
+        run: |
+          CONFIG=".github/review-policy.yml"
+          if [ ! -f "$CONFIG" ]; then
+            echo "ERROR: $CONFIG not found"
+            exit 1
+          fi
+
+          THRESHOLD=$(grep 'external_review_threshold:' "$CONFIG" | awk '{print $2}')
+          echo "threshold=$THRESHOLD" >> "$GITHUB_OUTPUT"
+
+          # Extract external_review_paths as JSON array
+          PATHS=$(awk '/^external_review_paths:/,/^[^ ]/' "$CONFIG" \
+            | grep '^ *-' | sed 's/^ *- *"//' | sed 's/"$//' \
+            | jq -R -s 'split("\n") | map(select(length > 0))')
+          echo "paths=$PATHS" >> "$GITHUB_OUTPUT"
+
+          # Extract available_reviewers as JSON array
+          REVIEWERS=$(awk '/^available_reviewers:/,/^[^ ]/' "$CONFIG" \
+            | grep '^ *-' | sed 's/^ *- *//' \
+            | jq -R -s 'split("\n") | map(select(length > 0))')
+          echo "reviewers=$REVIEWERS" >> "$GITHUB_OUTPUT"
+
+          AUTHOR=$(grep 'author_identity:' "$CONFIG" | awk '{print $2}')
+          echo "author_identity=${AUTHOR:-nathanjohnpayne}" >> "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────────
+  # Job 2: Auto-label PRs that need external review
   # ──────────────────────────────────────────────
   triage:
+    needs: [load-config]
     if: >
       github.event_name == 'pull_request' &&
       (github.event.action == 'opened' || github.event.action == 'ready_for_review')
@@ -18,13 +62,18 @@ jobs:
     outputs:
       needs_external: ${{ steps.check.outputs.needs_external }}
     steps:
-      - name: Evaluate PR size and file paths
+      - name: Evaluate PR against review-policy.yml
         id: check
         uses: actions/github-script@v7
+        env:
+          THRESHOLD: ${{ needs.load-config.outputs.threshold }}
+          PROTECTED_PATHS: ${{ needs.load-config.outputs.paths }}
         with:
           github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
             const pr = context.payload.pull_request;
+            const threshold = parseInt(process.env.THRESHOLD, 10);
+            const protectedPaths = JSON.parse(process.env.PROTECTED_PATHS);
 
             const files = await github.paginate(
               github.rest.pulls.listFiles,
@@ -39,26 +88,22 @@ jobs:
               (sum, f) => sum + f.additions + f.deletions, 0
             );
 
-            const infraPatterns = [
-              /^\.github\//, /Dockerfile/, /docker-compose/,
-              /^Makefile/, /^scripts\//,
-              /package-lock\.json$/, /yarn\.lock$/, /pnpm-lock\.yaml$/,
-              /requirements.*\.txt$/, /Gemfile\.lock$/,
-            ];
+            // Convert glob patterns to regex for matching
+            function globToRegex(pattern) {
+              let re = pattern
+                .replace(/\./g, '\\.')
+                .replace(/\*\*/g, '___GLOBSTAR___')
+                .replace(/\*/g, '[^/]*')
+                .replace(/___GLOBSTAR___/g, '.*');
+              return new RegExp('^' + re + '$');
+            }
 
-            const authPatterns = [
-              /auth/i, /permission/i, /security/i,
-              /token/i, /credential/i, /\.env/,
-            ];
-
-            const touchesInfra = files.some(f =>
-              infraPatterns.some(p => p.test(f.filename))
-            );
-            const touchesAuth = files.some(f =>
-              authPatterns.some(p => p.test(f.filename))
+            const touchesProtected = files.some(f =>
+              protectedPaths.some(p => globToRegex(p).test(f.filename))
             );
 
-            const needsExternal = totalChanges >= 300 || touchesInfra || touchesAuth;
+            // Use >= to match REVIEW_POLICY.md definition
+            const needsExternal = totalChanges >= threshold || touchesProtected;
 
             if (needsExternal) {
               await github.rest.issues.addLabels({
@@ -72,74 +117,63 @@ jobs:
             core.setOutput('needs_external', needsExternal.toString());
 
   # ──────────────────────────────────────────────
-  # Job 2: Assign reviewer(s)
+  # Job 3: Assign reviewer (internal self-peer review)
   # ──────────────────────────────────────────────
   assign:
-    needs: [triage]
+    needs: [load-config, triage]
     if: >
       always() &&
       github.event_name == 'pull_request' &&
       (github.event.action == 'opened' || github.event.action == 'ready_for_review' || github.event.action == 'labeled')
     runs-on: ubuntu-latest
     steps:
-      - name: Assign cross-agent reviewer(s)
+      - name: Assign reviewer identity
         uses: actions/github-script@v7
+        env:
+          AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}
+          REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
         with:
           github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
             const author = context.payload.pull_request.user.login;
+            const authorIdentity = process.env.AUTHOR_IDENTITY || 'nathanjohnpayne';
+            const reviewers = JSON.parse(process.env.REVIEWERS_JSON || '[]');
 
-            const botAccounts = [
-              'nathanpayne-claude',
-              'nathanpayne-codex',
-              'nathanpayne-cursor',
-            ];
-
-            if (!botAccounts.includes(author)) {
-              console.log(`Author ${author} is not a bot; skipping.`);
+            // Under the new policy, all PRs are authored by the author identity.
+            // The reviewing agent's identity is assigned for internal self-peer review.
+            if (author !== authorIdentity) {
+              console.log(`Author ${author} is not ${authorIdentity}; skipping auto-assignment.`);
               return;
             }
 
-            const primaryMap = {
-              'nathanpayne-claude': 'nathanpayne-codex',
-              'nathanpayne-codex': 'nathanpayne-cursor',
-              'nathanpayne-cursor': 'nathanpayne-claude',
-            };
-
-            const labels = context.payload.pull_request.labels.map(l => l.name);
-            const needsExternal = labels.includes('needs-external-review');
-
-            const primary = primaryMap[author];
-            const reviewers = [primary];
-
-            if (needsExternal) {
-              const secondary = botAccounts.find(b => b !== author && b !== primary);
-              reviewers.push(secondary);
-              console.log(`External review: assigning ${reviewers.join(', ')}`);
-            } else {
-              console.log(`Standard review: assigning ${primary}`);
+            if (reviewers.length === 0) {
+              console.log('No reviewers configured in review-policy.yml');
+              return;
             }
 
-            // Check who is already requested to avoid duplicates
+            // Assign the first available reviewer identity for internal review.
+            // The agent performing the review will use its own reviewer identity.
+            const reviewer = reviewers[0];
+
             const { data: existingReviewers } = await github.rest.pulls.listRequestedReviewers({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: context.payload.pull_request.number,
             });
             const alreadyRequested = existingReviewers.users.map(u => u.login);
-            const newReviewers = reviewers.filter(r => !alreadyRequested.includes(r));
 
-            if (newReviewers.length > 0) {
+            if (!alreadyRequested.includes(reviewer)) {
               await github.rest.pulls.requestReviewers({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: context.payload.pull_request.number,
-                reviewers: newReviewers,
+                reviewers: [reviewer],
               });
+              console.log(`Assigned ${reviewer} for internal review.`);
             }
 
   # ──────────────────────────────────────────────
-  # Job 3: Trigger subagent to perform the review
+  # Job 4: Trigger subagent to perform the review
   # ──────────────────────────────────────────────
   invoke-reviewer:
     needs: [assign]
@@ -193,10 +227,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.CLAUDE_PAT }}
         run: |
           claude -p "Review PR #${{ github.event.pull_request.number }} on ${{ github.repository }}. \
+            Read REVIEW_POLICY.md for the review workflow. \
             Read the diff, check for correctness, security issues, style violations, and test coverage. \
             Post your review via the GitHub API using the GITHUB_TOKEN env var. \
-            Authenticate as nathanpayne-claude. \
-            If the PR has a review guidance document at reviews/pr-${{ github.event.pull_request.number }}-guidance.md, read it first." \
+            Authenticate as nathanpayne-claude." \
             --allowedTools "Bash,Read,Glob,Grep,WebFetch"
 
       # ── Codex: OpenAI Codex CLI ──
@@ -214,7 +248,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.CODEX_PAT }}
         run: |
           # TODO: Replace with actual Codex CLI invocation once available
-          # codex --approval-mode full-auto -q "Review PR #${{ github.event.pull_request.number }}..."
           echo "Codex headless review invocation — pending CLI availability"
 
       # ── Cursor: no headless mode yet ──
@@ -232,22 +265,29 @@ jobs:
             });
 
   # ──────────────────────────────────────────────
-  # Job 4: Detect agent disagreement → escalate
+  # Job 5: Detect agent disagreement → escalate
   # ──────────────────────────────────────────────
   detect-disagreement:
     if: github.event_name == 'pull_request_review'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Check for conflicting reviews
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
-            const botAccounts = [
-              'nathanpayne-claude',
-              'nathanpayne-codex',
-              'nathanpayne-cursor',
-            ];
+            const fs = require('fs');
+            const yaml = require('js-yaml');
+
+            let reviewerAccounts;
+            try {
+              const config = yaml.load(fs.readFileSync('.github/review-policy.yml', 'utf8'));
+              reviewerAccounts = config.available_reviewers || [];
+            } catch (e) {
+              reviewerAccounts = ['nathanpayne-claude', 'nathanpayne-codex', 'nathanpayne-cursor'];
+            }
 
             const reviews = await github.rest.pulls.listReviews({
               owner: context.repo.owner,
@@ -255,14 +295,14 @@ jobs:
               pull_number: context.payload.pull_request.number,
             });
 
-            const latestByBot = {};
+            const latestByReviewer = {};
             for (const review of reviews.data) {
-              if (botAccounts.includes(review.user.login)) {
-                latestByBot[review.user.login] = review.state;
+              if (reviewerAccounts.includes(review.user.login)) {
+                latestByReviewer[review.user.login] = review.state;
               }
             }
 
-            const states = Object.values(latestByBot);
+            const states = Object.values(latestByReviewer);
             const hasApproval = states.includes('APPROVED');
             const hasChangesRequested = states.includes('CHANGES_REQUESTED');
 
@@ -278,12 +318,12 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.payload.pull_request.number,
-                body: '**Agent disagreement detected.** One reviewer approved and another requested changes. Escalating to @nathanjohnpayne for human review.',
+                body: '**Agent disagreement detected.** One reviewer approved and another requested changes. Escalating to @nathanjohnpayne for human tiebreaker per REVIEW_POLICY.md.',
               });
             }
 
   # ──────────────────────────────────────────────
-  # Job 5: Block self-approval
+  # Job 6: Block self-approval
   # ──────────────────────────────────────────────
   block-self-approval:
     if: >

@@ -19,10 +19,10 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           if echo "$PR_BODY" | grep -qE '^## Self-Review'; then
-            echo "✅ Self-Review section found."
+            echo "Self-Review section found."
           else
-            echo "❌ PR description must contain a '## Self-Review' section."
-            echo "Please add a structured self-review to your PR description."
+            echo "PR description must contain a '## Self-Review' section."
+            echo "Required items: correctness, regression risk, style/conventions, test coverage, security/dependency hygiene."
             exit 1
           fi
 
@@ -44,7 +44,8 @@ jobs:
 
             if (blockers.length > 0) {
               core.setFailed(
-                `Merge blocked by label(s): ${blockers.join(', ')}`
+                `Merge blocked by label(s): ${blockers.join(', ')}. ` +
+                `Per REVIEW_POLICY.md, the human is the tiebreaker and resolves blocking labels.`
               );
             }
 
@@ -58,37 +59,61 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check for external review triggers
+      - name: Check for external review triggers from review-policy.yml
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
+          CONFIG=".github/review-policy.yml"
           NEEDS_REVIEW=false
           REASONS=""
+
+          if [ ! -f "$CONFIG" ]; then
+            echo "WARNING: $CONFIG not found, skipping external review check"
+            echo "needs_review=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Read threshold from review-policy.yml
+          THRESHOLD=$(grep 'external_review_threshold:' "$CONFIG" | awk '{print $2}')
+          THRESHOLD=${THRESHOLD:-300}
 
           BASE_SHA=${{ github.event.pull_request.base.sha }}
           HEAD_SHA=${{ github.event.pull_request.head.sha }}
 
+          # Count lines changed (additions + deletions), excluding lockfiles and generated files
           LINES_CHANGED=$(git diff --stat "$BASE_SHA"..."$HEAD_SHA" -- \
             ':!*.lock' ':!*lock.json' ':!*.min.js' ':!*.min.css' \
             ':!*.generated.*' ':!*.g.dart' ':!*.freezed.dart' \
             | tail -1 | awk '{print $4+$6}')
           LINES_CHANGED=${LINES_CHANGED:-0}
 
-          if [ "$LINES_CHANGED" -gt 300 ]; then
+          # Use >= to match REVIEW_POLICY.md: "Total lines changed >= external_review_threshold"
+          if [ "$LINES_CHANGED" -ge "$THRESHOLD" ]; then
             NEEDS_REVIEW=true
-            REASONS="$REASONS- Over 300 non-generated lines changed ($LINES_CHANGED)%0A"
+            REASONS="$REASONS- ${LINES_CHANGED} lines changed (threshold: ${THRESHOLD})%0A"
           fi
 
-          SENSITIVE_FILES=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA" | grep -E \
-            '(^\.github/|/ci/|/auth/|/security/|^package\.json$|^package-lock\.json$|^requirements\.txt$|^Cargo\.toml$|^go\.mod$|^go\.sum$|^Gemfile$|^Gemfile\.lock$|^pubspec\.yaml$|^pubspec\.lock$)' \
-            || true)
+          # Read protected paths from review-policy.yml and check against diff
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA")
+          PATHS=$(awk '/^external_review_paths:/,/^[^ ]/' "$CONFIG" \
+            | grep '^ *-' | sed 's/^ *- *"//' | sed 's/"$//')
 
-          if [ -n "$SENSITIVE_FILES" ]; then
+          MATCHED_FILES=""
+          for pattern in $PATHS; do
+            # Convert glob to grep-compatible pattern
+            REGEX=$(echo "$pattern" | sed 's/\*\*/.*/g' | sed 's/\*\//[^\/]*\//g' | sed 's/\*/[^\/]*/g')
+            MATCHES=$(echo "$CHANGED_FILES" | grep -E "$REGEX" || true)
+            if [ -n "$MATCHES" ]; then
+              MATCHED_FILES="$MATCHED_FILES$MATCHES"$'\n'
+            fi
+          done
+
+          if [ -n "$MATCHED_FILES" ]; then
             NEEDS_REVIEW=true
-            FILE_LIST=$(echo "$SENSITIVE_FILES" | sed 's/^/  - /' | tr '\n' ',' | sed 's/,/%0A/g')
-            REASONS="${REASONS}- Sensitive files modified:%0A${FILE_LIST}"
+            FILE_LIST=$(echo "$MATCHED_FILES" | sort -u | sed 's/^/  - /' | tr '\n' ',' | sed 's/,/%0A/g')
+            REASONS="${REASONS}- Protected paths modified:%0A${FILE_LIST}"
           fi
 
           echo "needs_review=$NEEDS_REVIEW" >> "$GITHUB_OUTPUT"
@@ -111,18 +136,17 @@ jobs:
           gh pr edit "$PR_NUMBER" --add-label "needs-external-review" \
             --repo "${{ github.repository }}"
 
-          # Format reasons for comment (convert %0A back to newlines)
           FORMATTED_REASONS=$(echo "$REASONS" | sed 's/%0A/\n/g')
 
           gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$(cat <<EOF
-          ⚠️ **External Review Required**
+**External Review Required**
 
-          This PR has been labeled \`needs-external-review\` because it meets one or more external review triggers:
+This PR has been labeled \`needs-external-review\` based on .github/review-policy.yml:
 
-          $FORMATTED_REASONS
+$FORMATTED_REASONS
 
-          **A human reviewer must review this PR and remove the \`needs-external-review\` label before it can be merged.**
+Per REVIEW_POLICY.md, the authoring agent must post a handoff message and alert the human. The human will coordinate external review by a different agent.
 
-          > This is an automated check per the repository's code review policy.
-          EOF
+> Automated check per .github/review-policy.yml
+EOF
           )"
