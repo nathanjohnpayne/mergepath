@@ -38,7 +38,7 @@ To add a new agent, register a GitHub account following the pattern `nathanpayne
 
 1. The agent creates a feature branch from the target branch (e.g., `main`).
 2. The agent writes code as `nathanjohnpayne`, following all project-level rules (linting, testing, conventions).
-3. The agent files a PR from the feature branch to the target branch under `nathanjohnpayne`.
+3. The agent files a PR from the feature branch to the target branch under `nathanjohnpayne`. The PR description must include an `Authoring-Agent:` line identifying which agent wrote the code (e.g., `Authoring-Agent: claude`). This is required because all PRs share the `nathanjohnpayne` author identity, and the workflow uses this line to assign the correct reviewer identity for internal self-peer review.
 
 ### Phase 2: Internal Review (Self-Peer Review)
 
@@ -50,6 +50,8 @@ To add a new agent, register a GitHub account following the pattern `nathanpayne
 **All review rounds are captured as GitHub PR comments and commits.** The back-and-forth should read like two developers collaborating.
 
 ### Phase 3: External Review Threshold Check
+
+> **Note on automation timing:** CI workflows may apply the `needs-external-review` label automatically when a PR is opened or updated, as an early advisory based on line count and protected paths. This label blocks merge immediately. The agent's responsibility is to post the handoff message and alert the human after internal review passes—the label itself may already be present.
 
 8. After internal review passes, the agent evaluates whether the PR meets the external review threshold (see [Review Policy Configuration](#review-policy-configuration)).
 9. If the threshold is **not** met, the agent merges the PR as `nathanjohnpayne`. Done.
@@ -156,10 +158,12 @@ If the internal reviewer and external reviewer disagree on whether code is ready
 
 Each repository contains a `.github/review-policy.yml` file that governs review behavior. This file is read by the agent at the start of every review cycle.
 
-```yaml
-# .github/review-policy.yml
+The following is an **illustrative example with default values**. Each repository's actual `.github/review-policy.yml` may have different `external_review_paths` customized to its directory structure. Always read the repo's actual file, not this example.
 
-# Lines changed (additions + deletions) that trigger external review.
+```yaml
+# .github/review-policy.yml (example defaults — actual config may differ)
+
+# Lines changed (additions + deletions, excluding generated/lockfiles) that trigger external review.
 # Set to 0 to require external review on every PR.
 # Set to a very high number to effectively disable.
 external_review_threshold: 300
@@ -188,10 +192,10 @@ default_external_reviewer: nathanpayne-codex
 
 A PR requires external review if **either** condition is true:
 
-1. Total lines changed (additions + deletions) ≥ `external_review_threshold`
+1. Total non-generated lines changed (additions + deletions) ≥ `external_review_threshold`. Lockfiles (`*.lock`, `*lock.json`), minified files (`*.min.js`, `*.min.css`), and generated files (`*.generated.*`) are excluded from the count.
 2. Any file in the PR diff matches a pattern in `external_review_paths`
 
-The agent evaluates this after internal review passes, before merging.
+The agent evaluates this after internal review passes, before merging. CI workflows may also evaluate and label earlier as an advisory (see Phase 3 note above).
 
 ## Git Identity Switching
 

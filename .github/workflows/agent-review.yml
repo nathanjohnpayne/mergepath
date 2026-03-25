@@ -84,7 +84,16 @@ jobs:
               }
             );
 
-            const totalChanges = files.reduce(
+            // Exclude lockfiles, minified, and generated files from line count
+            // to match REVIEW_POLICY.md threshold definition
+            const excludePatterns = [
+              /\.lock$/, /lock\.json$/, /\.min\.js$/, /\.min\.css$/,
+              /\.generated\./, /\.g\.dart$/, /\.freezed\.dart$/,
+            ];
+            const countedFiles = files.filter(
+              f => !excludePatterns.some(p => p.test(f.filename))
+            );
+            const totalChanges = countedFiles.reduce(
               (sum, f) => sum + f.additions + f.deletions, 0
             );
 
@@ -127,7 +136,7 @@ jobs:
       (github.event.action == 'opened' || github.event.action == 'ready_for_review' || github.event.action == 'labeled')
     runs-on: ubuntu-latest
     steps:
-      - name: Assign reviewer identity
+      - name: Assign reviewer identity based on Authoring-Agent
         uses: actions/github-script@v7
         env:
           AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}
@@ -135,12 +144,12 @@ jobs:
         with:
           github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
-            const author = context.payload.pull_request.user.login;
+            const pr = context.payload.pull_request;
+            const author = pr.user.login;
             const authorIdentity = process.env.AUTHOR_IDENTITY || 'nathanjohnpayne';
             const reviewers = JSON.parse(process.env.REVIEWERS_JSON || '[]');
 
             // Under the new policy, all PRs are authored by the author identity.
-            // The reviewing agent's identity is assigned for internal self-peer review.
             if (author !== authorIdentity) {
               console.log(`Author ${author} is not ${authorIdentity}; skipping auto-assignment.`);
               return;
@@ -151,14 +160,34 @@ jobs:
               return;
             }
 
-            // Assign the first available reviewer identity for internal review.
-            // The agent performing the review will use its own reviewer identity.
-            const reviewer = reviewers[0];
+            // Read the Authoring-Agent line from the PR body to determine which
+            // agent wrote the code. Per REVIEW_POLICY.md, the same agent reviews
+            // under its own reviewer identity (e.g., claude → nathanpayne-claude).
+            const body = pr.body || '';
+            const agentMatch = body.match(/^Authoring-Agent:\s*(\w+)/mi);
+            let reviewer;
+
+            if (agentMatch) {
+              const agentName = agentMatch[1].toLowerCase();
+              const matchingReviewer = reviewers.find(
+                r => r.endsWith(`-${agentName}`)
+              );
+              if (matchingReviewer) {
+                reviewer = matchingReviewer;
+                console.log(`Authoring-Agent: ${agentName} → assigning ${reviewer}`);
+              } else {
+                console.log(`Authoring-Agent: ${agentName} has no matching reviewer identity, using first available.`);
+                reviewer = reviewers[0];
+              }
+            } else {
+              console.log('No Authoring-Agent line found in PR body; assigning first available reviewer.');
+              reviewer = reviewers[0];
+            }
 
             const { data: existingReviewers } = await github.rest.pulls.listRequestedReviewers({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: context.payload.pull_request.number,
+              pull_number: pr.number,
             });
             const alreadyRequested = existingReviewers.users.map(u => u.login);
 
@@ -166,10 +195,10 @@ jobs:
               await github.rest.pulls.requestReviewers({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                pull_number: context.payload.pull_request.number,
+                pull_number: pr.number,
                 reviewers: [reviewer],
               });
-              console.log(`Assigned ${reviewer} for internal review.`);
+              console.log(`Assigned ${reviewer} for internal self-peer review.`);
             }
 
   # ──────────────────────────────────────────────
@@ -331,15 +360,38 @@ jobs:
       github.event.review.state == 'approved'
     runs-on: ubuntu-latest
     steps:
-      - name: Dismiss if reviewer is PR author
+      - name: Dismiss self-approval from reviewer bot accounts
+        uses: actions/checkout@v4
+
+      - name: Check and dismiss
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
+            const fs = require('fs');
+            const yaml = require('js-yaml');
+
             const prAuthor = context.payload.pull_request.user.login;
             const reviewer = context.payload.review.user.login;
 
-            if (prAuthor === reviewer) {
+            // Only block self-approval from reviewer bot accounts.
+            // The human (nathanjohnpayne) IS the PR author under the shared
+            // identity model, but must be allowed to approve for tiebreaker
+            // and human-escalated reviews per REVIEW_POLICY.md.
+            let reviewerAccounts;
+            try {
+              const config = yaml.load(fs.readFileSync('.github/review-policy.yml', 'utf8'));
+              reviewerAccounts = config.available_reviewers || [];
+            } catch (e) {
+              reviewerAccounts = ['nathanpayne-claude', 'nathanpayne-codex', 'nathanpayne-cursor'];
+            }
+
+            // A reviewer bot account cannot approve a PR it authored.
+            // Since all PRs are authored by nathanjohnpayne, this only fires
+            // if a bot account somehow ends up as the PR author (shouldn't
+            // happen under the policy, but guard against it).
+            const isReviewerBot = reviewerAccounts.includes(reviewer);
+            if (prAuthor === reviewer && isReviewerBot) {
               await github.rest.pulls.dismissReview({
                 owner: context.repo.owner,
                 repo: context.repo.repo,

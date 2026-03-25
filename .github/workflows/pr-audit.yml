@@ -86,52 +86,55 @@ jobs:
                   r => r.state === 'APPROVED'
                 );
 
-                // Per REVIEW_POLICY.md: PRs authored by authorIdentity need
-                // at least one reviewer identity approval for internal review,
-                // plus external review coordination via the human.
-                const isAuthorPR = pr.user.login === authorIdentity;
-                if (isAuthorPR) {
-                  const reviewerApprovals = approvals.filter(
-                    r => reviewerAccounts.includes(r.user.login) || r.user.login === 'nathanjohnpayne'
+                // Per REVIEW_POLICY.md: external-review PRs need at least one
+                // approval from a reviewer identity (nathanpayne-{agent}).
+                // nathanjohnpayne is the PR author, so their approval does not
+                // count toward the reviewer approval requirement.
+                const reviewerApprovals = approvals.filter(
+                  r => reviewerAccounts.includes(r.user.login)
+                );
+                if (reviewerApprovals.length === 0) {
+                  prViolations.push(
+                    'External-review PR merged with no reviewer identity approval'
                   );
-                  if (reviewerApprovals.length === 0) {
-                    prViolations.push(
-                      'External-review PR merged with no reviewer approval'
-                    );
-                  }
                 }
               }
 
-              // Check 3: Self-approval (author approved their own PR)
+              // Check 3: Self-approval from bot accounts
+              // Under the shared identity model, all PRs are authored by
+              // authorIdentity (nathanjohnpayne). The human IS that identity,
+              // so nathanjohnpayne approving is legitimate (human tiebreaker).
+              // Only flag if a reviewer bot account approved its own PR.
               const reviews = await github.rest.pulls.listReviews({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: pr.number,
               });
 
-              const selfApproval = reviews.data.some(
-                r => r.user.login === pr.user.login && r.state === 'APPROVED'
+              const botSelfApproval = reviews.data.some(
+                r => r.user.login === pr.user.login &&
+                     r.state === 'APPROVED' &&
+                     reviewerAccounts.includes(r.user.login)
               );
 
-              if (selfApproval) {
-                prViolations.push('Self-approval detected (author approved own PR)');
+              if (botSelfApproval) {
+                prViolations.push('Bot self-approval detected (reviewer account approved its own PR)');
               }
 
-              // Check 4: Had needs-human-review label — verify Nathan approved
+              // Check 4: Had needs-human-review label — verify it was removed before merge.
+              // Under the shared identity model, nathanjohnpayne is the PR author
+              // and cannot self-approve via the GitHub review API. The human
+              // resolves escalation by removing the label (which unblocks the
+              // label-gate check). If the label is still present at merge time,
+              // it means the label gate was bypassed.
               const hadHumanLabel = pr.labels.some(
                 l => l.name === 'needs-human-review'
               );
 
               if (hadHumanLabel) {
-                const nathanApproved = reviews.data.some(
-                  r => r.user.login === 'nathanjohnpayne' && r.state === 'APPROVED'
+                prViolations.push(
+                  'Merged with `needs-human-review` label still present — human resolution was bypassed'
                 );
-
-                if (!nathanApproved) {
-                  prViolations.push(
-                    'Had `needs-human-review` label but @nathanjohnpayne did not approve'
-                  );
-                }
               }
 
               // Check 5: Had policy-violation label — should not have been merged
