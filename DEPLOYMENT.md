@@ -319,7 +319,7 @@ Or use Firebase Console → Hosting → Release History → Roll back.
 
 ## CI/CD Integration
 
-No CI/CD pipeline is currently configured. Deploys are manual via `op-firebase-deploy`.
+Deploys are manual via `op-firebase-deploy`. CI workflows (repo linting, review policy enforcement) run on push/PR via GitHub Actions — see `.github/workflows/`.
 
 When connecting CI, prefer Workload Identity Federation or another `external_account` credential as the source credential. If CI already exposes `GOOGLE_APPLICATION_CREDENTIALS` pointing at an `external_account` file, `op-firebase-deploy` can reuse it to impersonate the deployer service account and attribute quota to the target project. Do **not** store service account keys or Firebase CI tokens as long-lived secrets.
 
