@@ -106,23 +106,28 @@ Alternatively, use `gh` CLI or the invite URL directly: `https://github.com/{own
 
 Go to the new repo → Settings → Secrets and variables → Actions → New repository secret. Add:
 
-| Secret name | Value |
-|---|---|
-| `CLAUDE_PAT` | Fine-grained PAT for `nathanpayne-claude` (from 1Password: `GitHub PAT (pr-review-claude)`) |
-| `CODEX_PAT` | Fine-grained PAT for `nathanpayne-codex` (from 1Password: `GitHub PAT (pr-review-codex)`) |
-| `CURSOR_PAT` | Fine-grained PAT for `nathanpayne-cursor` (from 1Password: `GitHub PAT (pr-review-cursor)`) |
-| `REVIEWER_ASSIGNMENT_TOKEN` | PAT for `nathanjohnpayne` (from 1Password: `GitHub PAT (pr-review-nathanjohnpayne)`) |
-| `ANTHROPIC_API_KEY` | Anthropic API key for Claude Code headless review |
-| `OPENAI_API_KEY` | OpenAI API key for Codex headless review |
+| Secret name | Value | PAT type |
+|---|---|---|
+| `CLAUDE_PAT` | Classic PAT for `nathanpayne-claude` with `repo` scope | **Classic** (not fine-grained) |
+| `CODEX_PAT` | Classic PAT for `nathanpayne-codex` with `repo` scope | **Classic** (not fine-grained) |
+| `CURSOR_PAT` | Classic PAT for `nathanpayne-cursor` with `repo` scope | **Classic** (not fine-grained) |
+| `REVIEWER_ASSIGNMENT_TOKEN` | PAT for `nathanjohnpayne` | Fine-grained OK (owns repo) |
+| `ANTHROPIC_API_KEY` | Anthropic API key for Claude Code headless review | — |
+| `OPENAI_API_KEY` | OpenAI API key for Codex headless review | — |
 
-Or use the CLI (faster):
+**Why classic PATs?** Machine users are collaborators, not repo owners. Fine-grained
+PATs on personal (non-org) GitHub accounts only cover repos the account *owns*.
+The "All repositories" scope means all owned repos (zero for collaborators), and
+"Only select repositories" does not list collaborator repos.
+
+Or use the CLI (faster). Use 1Password item IDs to avoid shell issues with parentheses:
 
 ```bash
-# From 1Password references — replace with actual values
-gh secret set CLAUDE_PAT --repo {owner}/{repo} --body "$(op read 'op://Private/GitHub PAT (pr-review-claude)/token')"
-gh secret set CODEX_PAT --repo {owner}/{repo} --body "$(op read 'op://Private/GitHub PAT (pr-review-codex)/token')"
-gh secret set CURSOR_PAT --repo {owner}/{repo} --body "$(op read 'op://Private/GitHub PAT (pr-review-cursor)/token')"
-gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo} --body "$(op read 'op://Private/GitHub PAT (pr-review-nathanjohnpayne)/token')"
+# Use exact 1Password item IDs (avoids shell issues with parentheses in item titles):
+gh secret set CLAUDE_PAT --repo {owner}/{repo} --body "$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')"
+gh secret set CURSOR_PAT --repo {owner}/{repo} --body "$(op read 'op://Private/bslrih4spwxgookzfy6zedz5g4/token')"
+gh secret set CODEX_PAT --repo {owner}/{repo} --body "$(op read 'op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token')"
+gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo} --body "$(op read 'op://Private/sm5kopwk6t6p3xmu2igesndzhe/token')"
 gh secret set ANTHROPIC_API_KEY --repo {owner}/{repo} --body "$(op read 'op://Private/Anthropic API Key/credential')"
 gh secret set OPENAI_API_KEY --repo {owner}/{repo} --body "$(op read 'op://Private/OpenAI API Key/credential')"
 ```
@@ -164,6 +169,17 @@ EOF
 
 **Note:** Branch protection requires the repo to be public, or requires GitHub Pro/Team for private repos.
 
+**Known issue:** The `Self-Review Required` and `Label Gate` status checks are
+configured as required but may never report if the CI workflows that post them
+(`pr-review-policy.yml`) fail silently due to misconfigured repository secrets.
+This blocks all merges. Workarounds:
+- Fix the CI secrets so status checks report, **or**
+- Use the GitHub web UI "Merge without waiting for requirements" bypass checkbox
+
+The `--admin` flag on `gh pr merge` does **not** bypass required status checks —
+it only bypasses review requirements. The break-glass hook (`BREAK_GLASS_ADMIN=1`)
+only bypasses the Claude Code PreToolUse guard, not GitHub's branch protection API.
+
 ### 5. Create required labels
 
 The workflows expect these labels to exist. Create them if they don't:
@@ -202,12 +218,35 @@ gh label list --repo "$REPO" --search "needs-human-review"
 gh label list --repo "$REPO" --search "policy-violation"
 ```
 
+### Token type: classic PATs required
+
+Machine user reviewer identities (nathanpayne-claude, etc.) are **collaborators**,
+not repo owners. GitHub fine-grained PATs on personal accounts only cover repos
+owned by the token account — they cannot access collaborator repos. The "All
+repositories" scope in fine-grained PATs means all repos the account *owns* (zero
+for collaborators), not repos they collaborate on.
+
+**Use classic PATs with `repo` scope for all reviewer identities.** This is stored
+in 1Password with the field name `token` (not `credential` or `password`).
+
+1Password item IDs (all classic PATs with `ghp_` prefix, field `token`, vault `Private`):
+
+| Reviewer Identity | 1Password Item ID | `op read` command |
+|---|---|---|
+| `nathanpayne-claude` | `pvbq24vl2h6gl7yjclxy2hbote` | `op read "op://Private/pvbq24vl2h6gl7yjclxy2hbote/token"` |
+| `nathanpayne-cursor` | `bslrih4spwxgookzfy6zedz5g4` | `op read "op://Private/bslrih4spwxgookzfy6zedz5g4/token"` |
+| `nathanpayne-codex` | `o6ekjxjjl5gq6rmcneomrjahpu` | `op read "op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token"` |
+| `nathanjohnpayne` | `sm5kopwk6t6p3xmu2igesndzhe` | `op read "op://Private/sm5kopwk6t6p3xmu2igesndzhe/token"` |
+
+Use the item ID (not the item title) to avoid shell issues with parentheses in
+1Password item names like `GitHub PAT (pr-review-claude)`.
+
 ### Token rotation (as needed)
 
 The current PATs are set to never expire. If you ever need to rotate them:
 
-1. Generate new fine-grained PATs for each machine user account
-2. Update the tokens in 1Password
+1. Generate new **classic** PATs with `repo` scope for each machine user account
+2. Update the tokens in 1Password (field name: `token`)
 3. Update `CLAUDE_PAT`, `CODEX_PAT`, `CURSOR_PAT` secrets on every repo
 4. Revoke the old tokens
 5. Verify agent access still works

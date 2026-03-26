@@ -217,15 +217,44 @@ git config user.name "nathanpayne-claude"
 git config user.email "claude@nathanpayne-claude.example"
 ```
 
-Authentication for posting PR reviews under the reviewer identity requires a personal access token or GitHub App token for that account, configured in the agent's environment.
+Authentication for posting PR reviews under the reviewer identity requires a personal access token for that account.
+
+### PAT requirements for reviewer identities
+
+Reviewer accounts are **collaborators** on repos owned by `nathanjohnpayne`. This
+constrains the PAT type:
+
+- **Classic PATs with `repo` scope** — required for collaborator accounts. Fine-grained
+  PATs on personal (non-org) GitHub accounts only cover repos the account *owns*.
+  The "All repositories" scope means all owned repos (zero for collaborators), and
+  "Only select repositories" does not list collaborator repos.
+- Store each PAT in 1Password as `GitHub PAT (pr-review-{agent})` with a concealed
+  field named `token`.
+- Access via item ID to avoid shell escaping issues with parentheses in the title:
+  `op read "op://Private/<item-uuid>/token"`
+
+### CLI usage for posting reviews
+
+```bash
+# Look up the 1Password item ID
+op item list --vault Private | grep "pr-review-claude"
+
+# Post a review as the reviewer identity
+REVIEWER_TOKEN=$(op read "op://Private/<item-id>/token")
+GH_TOKEN="$REVIEWER_TOKEN" gh pr review <PR#> --approve --body "Review comment"
+```
 
 ## Adding a New Agent
 
 1. Create a GitHub account: `nathanpayne-{agent}`
-2. Generate a personal access token with `repo` scope for the new account.
-3. Add the identity to `available_reviewers` in each relevant repo's `.github/review-policy.yml`.
-4. Configure the new agent's environment with both the `nathanjohnpayne` author credentials and the `nathanpayne-{agent}` reviewer credentials.
-5. The new agent follows the same workflow described above.
+2. Add it as a collaborator with Write access on each relevant repo.
+3. Accept the invitation (browser or classic PAT — fine-grained PATs cannot accept invites).
+4. Generate a **classic** PAT with `repo` scope for the new account.
+5. Store the PAT in 1Password as `GitHub PAT (pr-review-{agent})`, field name `token`.
+6. Add the identity to `available_reviewers` in each relevant repo's `.github/review-policy.yml`.
+7. Add the PAT as a repository secret (e.g., `{AGENT}_PAT`) for CI workflows.
+8. Configure the new agent's environment with both the `nathanjohnpayne` author credentials and the `nathanpayne-{agent}` reviewer credentials.
+9. The new agent follows the same workflow described above.
 
 ## Template Usage
 
