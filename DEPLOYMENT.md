@@ -516,7 +516,7 @@ For Claude Code cloud scheduled tasks:
    export GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json
    ```
 
-Each project's SA key is stored in the 1Password **Firebase** vault with the naming convention `{project-id} — Firebase Deployer SA Key`. See `specs/firebase-sa-setup.md` for the full per-project reference table.
+Each project's SA key is stored in the 1Password **Firebase** vault with the naming convention `{project-id} — Firebase Deployer SA Key`.
 
 ## Secrets Management
 
