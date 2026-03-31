@@ -5,7 +5,7 @@ set -eu
 SCRIPT_PATH="$0"
 TOKEN_FILE="${HOME}/.config/gcloud/adc-access-token"
 DEFAULT_ADC_FILE="${HOME}/.config/gcloud/application_default_credentials.json"
-DEFAULT_ADC_OP_URI="${GCP_ADC_OP_URI:-op://Private/GCP ADC/credential}"
+DEFAULT_ADC_OP_URI="${GCP_ADC_OP_URI:-op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential}"
 SOURCE_CRED_FILE=""
 SOURCE_CRED_TMPFILE=""
 
