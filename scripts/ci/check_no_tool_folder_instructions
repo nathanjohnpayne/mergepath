@@ -1,29 +1,82 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# check_no_tool_folder_instructions
+#
+# Bans files in tool folders (.cursor/, .claude/, .vscode/) that contain
+# repo-specific behavioral rules — i.e., content that duplicates or belongs
+# in docs/agents/, DEPLOYMENT.md, REVIEW_POLICY.md, or rules/.
+#
+# Allowed:
+#   - .mdc files (Cursor rule files) with reference-style pointers
+#   - .plan.md files (Cursor plan artifacts)
+#   - .claude/worktrees/* (worktree checkouts)
+#   - JSON/YAML config files
+#
+# Flagged:
+#   - .md or .txt files (except plan artifacts)
+#   - .mdc files containing behavioral-rule topic keywords
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TOOL_FOLDERS=(".claude" ".cursor" ".vscode")
 FAILED=0
 
+# Topic keywords that indicate behavioral rules (case-insensitive)
+BEHAVIORAL_TOPICS=(
+  "must not"
+  "do not modify"
+  "forbidden"
+  "never commit"
+  "always run"
+  "before merging"
+  "after merging"
+  "code modification"
+  "deploy procedure"
+  "deploy process"
+  "testing requirement"
+  "review policy"
+  "review workflow"
+)
+
+check_behavioral_content() {
+  local filepath="$1"
+  for topic in "${BEHAVIORAL_TOPICS[@]}"; do
+    if grep -qi "$topic" "$filepath" 2>/dev/null; then
+      return 0  # Found behavioral content
+    fi
+  done
+  return 1  # No behavioral content found
+}
+
 for folder in "${TOOL_FOLDERS[@]}"; do
   folder_path="$REPO_ROOT/$folder"
-  if [[ ! -d "$folder_path" ]]; then
-    continue
-  fi
+  [[ ! -d "$folder_path" ]] && continue
 
   while IFS= read -r -d '' filepath; do
     filename="$(basename "$filepath")"
     relpath="${filepath#$REPO_ROOT/}"
 
-    if [[ "$relpath" == .claude/worktrees/* ]]; then
+    # Skip worktree checkouts
+    [[ "$relpath" == .claude/worktrees/* ]] && continue
+
+    # Skip Cursor plan artifacts
+    [[ "$relpath" == .cursor/plans/*.plan.md ]] && continue
+    [[ "$relpath" == .cursor/plans/*.md ]] && continue
+
+    # .md and .txt files are always flagged (not plan artifacts, not worktrees)
+    if [[ "$filename" == *.md || "$filename" == *.txt ]]; then
+      echo "FAIL: Instruction file in tool folder: $relpath"
+      FAILED=1
       continue
     fi
 
-    if [[ "$filename" == *.md || "$filename" == *.txt ]]; then
-      echo "FAIL: Instruction file found in tool folder: $relpath"
-      FAILED=1
+    # .mdc files: check content for behavioral rules
+    if [[ "$filename" == *.mdc ]]; then
+      if check_behavioral_content "$filepath"; then
+        echo "WARN: Cursor rule file may contain behavioral rules: $relpath (consider migrating to docs/agents/)"
+      fi
     fi
-  done < <(find "$folder_path" -type f \( -name "*.md" -o -name "*.txt" \) -print0)
+  done < <(find "$folder_path" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.mdc" \) -print0 2>/dev/null)
 done
 
 if [[ $FAILED -eq 1 ]]; then

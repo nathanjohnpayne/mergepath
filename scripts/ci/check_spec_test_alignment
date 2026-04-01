@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# check_spec_test_alignment
+#
+# Verifies every spec in specs/ has a corresponding test. Matching order:
+#   1. spec_id frontmatter → spec_test_map in .repo-template.yml
+#   2. spec_id frontmatter → filename search against test_globs
+#   3. Filename convention → filename search against test_globs
+#
+# Specs with "tested: false" in YAML frontmatter are skipped (must include reason:).
+# Reads test_globs and spec_test_map from .repo-template.yml if present.
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SPECS_DIR="$REPO_ROOT/specs"
-TESTS_DIR="$REPO_ROOT/tests"
+CONFIG="$REPO_ROOT/.repo-template.yml"
 FAILED=0
 
 if [[ ! -d "$SPECS_DIR" ]]; then
@@ -11,21 +21,226 @@ if [[ ! -d "$SPECS_DIR" ]]; then
   exit 0
 fi
 
+# Parse .repo-template.yml using Python (no pyyaml needed — simple line parsing)
+read_config() {
+  python3 - "$CONFIG" "$1" <<'PY' 2>/dev/null || true
+import sys, re
+
+config_path, key = sys.argv[1], sys.argv[2]
+try:
+    lines = open(config_path).readlines()
+except FileNotFoundError:
+    sys.exit(0)
+
+# Simple YAML parser for our flat/list/map config
+in_key = False
+indent = 0
+values = []
+
+for line in lines:
+    stripped = line.rstrip()
+    if stripped == f"{key}:" or stripped.startswith(f"{key}: "):
+        if ": " in stripped:
+            # Single-value: key: value
+            val = stripped.split(": ", 1)[1].strip().strip('"').strip("'")
+            if val.startswith("[") and val.endswith("]"):
+                for item in val.strip("[]").split(","):
+                    item = item.strip().strip('"').strip("'")
+                    if item:
+                        values.append(item)
+            else:
+                values.append(val)
+            break
+        in_key = True
+        indent = 0
+        continue
+    if in_key:
+        match = re.match(r'^(\s+)', line)
+        line_indent = len(match.group(1)) if match else 0
+        if line_indent == 0 and stripped and not stripped.startswith("#"):
+            break
+        if indent == 0 and line_indent > 0:
+            indent = line_indent
+        if stripped.startswith("- "):
+            val = stripped.lstrip("- ").strip().strip('"').strip("'")
+            values.append(val)
+        elif ": " in stripped or stripped.endswith(":"):
+            # Map entry — print key:value
+            parts = stripped.strip().split(":", 1)
+            k = parts[0].strip().strip('"').strip("'")
+            v = parts[1].strip().strip('"').strip("'") if len(parts) > 1 and parts[1].strip() else ""
+            if v:
+                values.append(f"{k}={v}")
+            else:
+                values.append(f"{k}=")
+
+for v in values:
+    print(v)
+PY
+}
+
+# Read spec_test_map entries (format: "spec_id=test_path" or "spec_id=" for list start)
+read_spec_test_map() {
+  python3 - "$CONFIG" <<'PY' 2>/dev/null || true
+import sys, re
+
+try:
+    lines = open(sys.argv[1]).readlines()
+except FileNotFoundError:
+    sys.exit(0)
+
+in_map = False
+current_key = ""
+indent = 0
+map_indent = 0
+
+for line in lines:
+    stripped = line.rstrip()
+    match = re.match(r'^(\s*)', line)
+    line_indent = len(match.group(1)) if match else 0
+
+    if stripped == "spec_test_map:":
+        in_map = True
+        map_indent = 0
+        continue
+
+    if in_map:
+        if line_indent == 0 and stripped and not stripped.startswith("#"):
+            break
+        if map_indent == 0 and line_indent > 0:
+            map_indent = line_indent
+
+        if stripped.startswith("- "):
+            # List item under current key
+            val = stripped.lstrip("- ").strip().strip('"').strip("'")
+            print(f"{current_key}={val}")
+        elif ": " in stripped and not stripped.strip().startswith("-"):
+            parts = stripped.strip().split(":", 1)
+            k = parts[0].strip().strip('"').strip("'")
+            v = parts[1].strip().strip('"').strip("'") if parts[1].strip() else ""
+            current_key = k
+            if v:
+                print(f"{k}={v}")
+        elif stripped.endswith(":") and not stripped.strip().startswith("-"):
+            current_key = stripped.strip().rstrip(":").strip('"').strip("'")
+PY
+}
+
+# Build test_globs array
+TEST_GLOBS=()
+while IFS= read -r glob; do
+  [[ -n "$glob" ]] && TEST_GLOBS+=("$glob")
+done < <(read_config "test_globs")
+
+# Default if none configured
+if [[ ${#TEST_GLOBS[@]} -eq 0 ]]; then
+  TEST_GLOBS=("tests/**/*.test.*")
+fi
+
+# Build spec_test_map associative array
+declare -A SPEC_MAP
+while IFS= read -r entry; do
+  [[ -z "$entry" ]] && continue
+  key="${entry%%=*}"
+  val="${entry#*=}"
+  if [[ -n "${SPEC_MAP[$key]+x}" ]]; then
+    SPEC_MAP[$key]="${SPEC_MAP[$key]}|$val"
+  else
+    SPEC_MAP[$key]="$val"
+  fi
+done < <(read_spec_test_map)
+
+# Extract spec_id from YAML frontmatter
+extract_frontmatter() {
+  local file="$1" key="$2"
+  python3 - "$file" "$key" <<'PY' 2>/dev/null || true
+import sys, re
+file_path, key = sys.argv[1], sys.argv[2]
+lines = open(file_path).readlines()
+if not lines or lines[0].strip() != "---":
+    sys.exit(0)
+for i, line in enumerate(lines[1:], 1):
+    if line.strip() == "---":
+        break
+    if line.strip().startswith(f"{key}:"):
+        val = line.strip().split(":", 1)[1].strip().strip('"').strip("'")
+        if val.lower() in ("true", "yes"):
+            print("true")
+        elif val.lower() in ("false", "no"):
+            print("false")
+        else:
+            print(val)
+        break
+PY
+}
+
+# Check if a test exists via glob patterns
+find_test_by_globs() {
+  local name="$1"
+  for glob_pattern in "${TEST_GLOBS[@]}"; do
+    local base_dir="${glob_pattern%%/**}"
+    if find "$REPO_ROOT" -path "$REPO_ROOT/$base_dir" -prune -type d -print0 2>/dev/null | grep -qz .; then
+      if find "$REPO_ROOT/$base_dir" -type f \( -name "${name}*" -o -name "*${name}*.test.*" -o -name "*${name}*.spec.*" \) 2>/dev/null | grep -q .; then
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
 while IFS= read -r -d '' spec; do
-  spec_name="$(basename "$spec" .md)"
-  if [[ "$spec_name" == "example_spec" ]]; then
+  spec_basename="$(basename "$spec" .md)"
+  if [[ "$spec_basename" == "example_spec" ]]; then
     continue
   fi
 
-  if ! find "$TESTS_DIR" -type f \( -name "${spec_name}*" -o -name "*${spec_name}*.test.*" \) 2>/dev/null | grep -q .; then
-    echo "WARN: Spec file has no corresponding test file: $(basename "$spec")"
-    FAILED=1
+  # Check tested: false exemption
+  tested_val="$(extract_frontmatter "$spec" "tested")"
+  if [[ "$tested_val" == "false" ]]; then
+    reason="$(extract_frontmatter "$spec" "reason")"
+    if [[ -n "$reason" ]]; then
+      echo "SKIP: $spec_basename (tested: false — $reason)"
+      continue
+    else
+      echo "WARN: $spec_basename has tested: false but no reason: field"
+      FAILED=1
+      continue
+    fi
   fi
+
+  # Extract spec_id
+  spec_id="$(extract_frontmatter "$spec" "spec_id")"
+  [[ -z "$spec_id" ]] && spec_id="$spec_basename"
+
+  # 1. Check spec_test_map
+  if [[ -n "${SPEC_MAP[$spec_id]+x}" ]]; then
+    IFS='|' read -ra mapped_tests <<< "${SPEC_MAP[$spec_id]}"
+    all_exist=true
+    for test_path in "${mapped_tests[@]}"; do
+      if [[ ! -f "$REPO_ROOT/$test_path" ]]; then
+        echo "WARN: Mapped test not found for $spec_id: $test_path"
+        all_exist=false
+      fi
+    done
+    if $all_exist; then
+      continue
+    fi
+    FAILED=1
+    continue
+  fi
+
+  # 2. Search test_globs by spec_id / filename
+  if find_test_by_globs "$spec_id" || find_test_by_globs "$spec_basename"; then
+    continue
+  fi
+
+  echo "WARN: Spec file has no corresponding test: $(basename "$spec") (spec_id: $spec_id)"
+  FAILED=1
 done < <(find "$SPECS_DIR" -name "*.md" -print0 2>/dev/null)
 
 if [[ $FAILED -eq 1 ]]; then
-  echo "check_spec_test_alignment: FAILED — one or more spec files lack corresponding tests"
-  echo "Add test files to tests/ or document exceptions in AGENTS.md"
+  echo "check_spec_test_alignment: FAILED"
+  echo "Add tests, map specs in .repo-template.yml spec_test_map, or mark specs tested: false with reason:"
   exit 1
 fi
 

@@ -1,11 +1,61 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# check_no_forbidden_top_level_dirs
+#
+# Hard-fails on forbidden dirs (vendor, node_modules/.cache/custom).
+# Warns on undeclared tracked dirs not in the standard layout.
+# Reads extra_top_level_dirs and generated_dirs from .repo-template.yml.
+# Only checks tracked (non-gitignored) dirs.
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CONFIG="$REPO_ROOT/.repo-template.yml"
 FORBIDDEN_DIRS=("vendor" "node_modules/.cache/custom")
-ALLOWED_DIRS=(".claude" ".cursor" ".github" ".git" ".vscode" "dist" "docs" "functions" "plans" "rules" "scripts" "specs" "src" "tests")
+ALLOWED_DIRS=(".claude" ".cursor" ".github" ".git" ".vscode" "dist" "docs" "functions" "plans" "rules" "scripts" "specs" "src" "tests" "out")
 FAILED=0
 
+# Read list values from .repo-template.yml
+read_list() {
+  local key="$1"
+  python3 - "$CONFIG" "$key" <<'PY' 2>/dev/null || true
+import sys, re
+config_path, key = sys.argv[1], sys.argv[2]
+try:
+    lines = open(config_path).readlines()
+except FileNotFoundError:
+    sys.exit(0)
+in_key = False
+for line in lines:
+    stripped = line.rstrip()
+    if stripped == f"{key}:" or stripped.startswith(f"{key}: "):
+        if ": " in stripped:
+            val = stripped.split(": ", 1)[1].strip()
+            if val.startswith("[") and val.endswith("]"):
+                for item in val.strip("[]").split(","):
+                    item = item.strip().strip('"').strip("'")
+                    if item:
+                        print(item)
+            break
+        in_key = True
+        continue
+    if in_key:
+        if not line.startswith(" ") and stripped and not stripped.startswith("#"):
+            break
+        if stripped.startswith("- "):
+            print(stripped.lstrip("- ").strip().strip('"').strip("'"))
+PY
+}
+
+# Add extra_top_level_dirs and generated_dirs to allowed list
+while IFS= read -r dir; do
+  [[ -n "$dir" ]] && ALLOWED_DIRS+=("$dir")
+done < <(read_list "extra_top_level_dirs")
+
+while IFS= read -r dir; do
+  [[ -n "$dir" ]] && ALLOWED_DIRS+=("$dir")
+done < <(read_list "generated_dirs")
+
+# Check forbidden dirs
 for dir in "${FORBIDDEN_DIRS[@]}"; do
   if [[ -d "$REPO_ROOT/$dir" ]]; then
     echo "FAIL: Forbidden top-level directory exists: $dir"
@@ -13,12 +63,22 @@ for dir in "${FORBIDDEN_DIRS[@]}"; do
   fi
 done
 
+# Check tracked (non-gitignored) top-level dirs
 while IFS= read -r -d '' dirpath; do
   dirname="$(basename "$dirpath")"
-  if [[ ! " ${ALLOWED_DIRS[*]} " =~ " ${dirname} " ]]; then
-    echo "WARN: Unexpected top-level directory: $dirname (document it in AGENTS.md or plans/ if intentional)"
+
+  # Skip hidden dirs (already in ALLOWED_DIRS as dotted names)
+  [[ "$dirname" == .* ]] && continue
+
+  # Skip gitignored dirs
+  if git -C "$REPO_ROOT" check-ignore -q "$dirpath" 2>/dev/null; then
+    continue
   fi
-done < <(find "$REPO_ROOT" -maxdepth 1 -mindepth 1 -type d -not -name ".*" -print0)
+
+  if [[ ! " ${ALLOWED_DIRS[*]} " =~ " ${dirname} " ]]; then
+    echo "WARN: Unexpected top-level directory: $dirname (add to extra_top_level_dirs in .repo-template.yml)"
+  fi
+done < <(find "$REPO_ROOT" -maxdepth 1 -mindepth 1 -type d -print0)
 
 if [[ $FAILED -eq 1 ]]; then
   echo "check_no_forbidden_top_level_dirs: FAIL"

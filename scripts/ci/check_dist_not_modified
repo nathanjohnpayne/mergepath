@@ -1,18 +1,69 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# check_dist_not_modified
+#
+# Verifies generated output dirs were not directly edited.
+# Reads generated_dirs from .repo-template.yml (default: ["dist"]).
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CONFIG="$REPO_ROOT/.repo-template.yml"
 
 if ! git -C "$REPO_ROOT" rev-parse HEAD~1 >/dev/null 2>&1; then
   echo "check_dist_not_modified: SKIP (not enough commits to compare)"
   exit 0
 fi
 
-MODIFIED=$(git -C "$REPO_ROOT" diff --name-only --diff-filter=M HEAD~1 HEAD -- dist/ 2>/dev/null)
+# Read generated_dirs from config
+GENERATED_DIRS=()
+while IFS= read -r dir; do
+  [[ -n "$dir" ]] && GENERATED_DIRS+=("$dir")
+done < <(
+  python3 - "$CONFIG" "generated_dirs" <<'PY' 2>/dev/null || true
+import sys
+config_path, key = sys.argv[1], sys.argv[2]
+try:
+    lines = open(config_path).readlines()
+except FileNotFoundError:
+    sys.exit(0)
+in_key = False
+for line in lines:
+    stripped = line.rstrip()
+    if stripped == f"{key}:" or stripped.startswith(f"{key}: "):
+        if ": " in stripped:
+            val = stripped.split(": ", 1)[1].strip()
+            if val.startswith("[") and val.endswith("]"):
+                for item in val.strip("[]").split(","):
+                    item = item.strip().strip('"').strip("'")
+                    if item:
+                        print(item)
+            break
+        in_key = True
+        continue
+    if in_key:
+        if not line.startswith(" ") and stripped and not stripped.startswith("#"):
+            break
+        if stripped.startswith("- "):
+            print(stripped.lstrip("- ").strip().strip('"').strip("'"))
+PY
+)
 
-if [[ -n "$MODIFIED" ]]; then
-  echo "FAIL: dist/ files were directly modified (regenerate through the build system instead):"
-  echo "$MODIFIED"
+# Default to dist/ if nothing configured
+if [[ ${#GENERATED_DIRS[@]} -eq 0 ]]; then
+  GENERATED_DIRS=("dist")
+fi
+
+FAILED=0
+for dir in "${GENERATED_DIRS[@]}"; do
+  MODIFIED=$(git -C "$REPO_ROOT" diff --name-only --diff-filter=M HEAD~1 HEAD -- "$dir/" 2>/dev/null)
+  if [[ -n "$MODIFIED" ]]; then
+    echo "FAIL: $dir/ files were directly modified (regenerate through the build system instead):"
+    echo "$MODIFIED"
+    FAILED=1
+  fi
+done
+
+if [[ $FAILED -eq 1 ]]; then
   echo "check_dist_not_modified: FAIL"
   exit 1
 fi

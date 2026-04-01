@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# check_duplicate_docs
+#
+# Checks for duplicated behavioral-rule content between canonical docs
+# (root files, docs/agents/) and tool folders (.cursor/, .claude/, .vscode/).
+#
+# Currently warning-only (does not block merge). Promotion to hard fail
+# is deferred until all repos have migrated tool-folder content.
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Topics that should live in canonical docs, not tool folders
 CANONICAL_TOPICS=(
   "Deploy Auth"
   "Credential"
@@ -10,27 +20,39 @@ CANONICAL_TOPICS=(
   "Branch Naming"
   "Commit Message"
   "Pull Request"
+  "Code Review"
+  "Testing Requirement"
+  "Code Modification"
+  "Deployment Process"
+  "Service Account"
 )
+
+WARNINGS=0
 
 for folder in .claude .cursor .vscode; do
   folder_path="$REPO_ROOT/$folder"
-  if [[ ! -d "$folder_path" ]]; then
-    continue
-  fi
+  [[ ! -d "$folder_path" ]] && continue
 
   while IFS= read -r -d '' filepath; do
     relpath="${filepath#$REPO_ROOT/}"
-    if [[ "$relpath" == .claude/worktrees/* ]]; then
-      continue
-    fi
+
+    # Skip worktrees and plan artifacts
+    [[ "$relpath" == .claude/worktrees/* ]] && continue
+    [[ "$relpath" == .cursor/plans/* ]] && continue
 
     for topic in "${CANONICAL_TOPICS[@]}"; do
       if grep -qi "$topic" "$filepath" 2>/dev/null; then
-        echo "WARN: '$topic' documented in tool folder file: $relpath (canonical location: root docs)"
+        echo "WARN: '$topic' found in tool folder file: $relpath (canonical location: root docs or docs/agents/)"
+        WARNINGS=$((WARNINGS + 1))
       fi
     done
-  done < <(find "$folder_path" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.mdc" \) -print0 2>/dev/null)
+  done < <(find "$folder_path" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.mdc" -o -name "*.json" \) -print0 2>/dev/null)
 done
 
-echo "check_duplicate_docs: PASS"
+if [[ $WARNINGS -gt 0 ]]; then
+  echo "check_duplicate_docs: PASS (with $WARNINGS warnings — consider migrating content to canonical docs)"
+else
+  echo "check_duplicate_docs: PASS"
+fi
+
 exit 0
