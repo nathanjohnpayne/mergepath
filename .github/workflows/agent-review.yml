@@ -327,10 +327,14 @@ jobs:
               pull_number: context.payload.pull_request.number,
             });
 
+            // Track each reviewer's last opinionated state (APPROVED or CHANGES_REQUESTED).
+            // Ignore COMMENTED reviews — they don't change a reviewer's effective position.
             const latestByReviewer = {};
             for (const review of reviews.data) {
               if (reviewerAccounts.includes(review.user.login)) {
-                latestByReviewer[review.user.login] = review.state;
+                if (review.state === 'APPROVED' || review.state === 'CHANGES_REQUESTED') {
+                  latestByReviewer[review.user.login] = review.state;
+                }
               }
             }
 
@@ -338,20 +342,51 @@ jobs:
             const hasApproval = states.includes('APPROVED');
             const hasChangesRequested = states.includes('CHANGES_REQUESTED');
 
-            if (hasApproval && hasChangesRequested) {
-              await github.rest.issues.addLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                labels: ['needs-human-review'],
-              });
+            // Check if the label is currently applied
+            const labels = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+            const hasLabel = labels.data.some(l => l.name === 'needs-human-review');
 
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                body: '**Agent disagreement detected.** One reviewer approved and another requested changes. Escalating to @nathanjohnpayne for human tiebreaker per REVIEW_POLICY.md.',
-              });
+            if (hasApproval && hasChangesRequested) {
+              // Disagreement exists — apply label if not already present
+              if (!hasLabel) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  labels: ['needs-human-review'],
+                });
+
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  body: '**Agent disagreement detected.** One reviewer approved and another requested changes. Escalating to @nathanjohnpayne for human tiebreaker per REVIEW_POLICY.md.',
+                });
+              }
+            } else if (hasLabel && !hasChangesRequested) {
+              // Disagreement resolved — all reviewers who previously requested
+              // changes have since approved. Remove the label automatically.
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  name: 'needs-human-review',
+                });
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  body: '**Agent disagreement resolved.** All reviewers now agree. Removing `needs-human-review` label.',
+                });
+              } catch (e) {
+                // Label may already be removed — ignore 404
+                if (e.status !== 404) throw e;
+              }
             }
 
   # ──────────────────────────────────────────────
