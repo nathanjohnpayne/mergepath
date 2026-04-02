@@ -10,6 +10,8 @@ If any of these files are missing, flag the gap before proceeding.
 
 # Code Review — Mandatory Checklist
 
+Never push directly to `main`. All changes must go through a pull request.
+
 Every PR you open must follow this workflow. No exceptions unless the human
 explicitly authorizes a break-glass override in chat.
 

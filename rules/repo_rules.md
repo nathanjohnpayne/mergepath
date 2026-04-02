@@ -19,6 +19,10 @@ flag the conflict before proceeding.
 
 ## Forbidden Patterns
 
+- Never push directly to `main`. All changes must go through a
+  pull request—even single-line fixes and documentation updates.
+  The only exception is if the human explicitly authorizes a
+  direct push in chat as a break-glass override.
 - Instructions must not be duplicated between root files and
   tool folders.
 - `dist/` must not be edited manually. Regenerate through the
