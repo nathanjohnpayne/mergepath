@@ -254,6 +254,8 @@ REVIEWER_TOKEN=$(op read "op://Private/<item-id>/token")
 GH_TOKEN="$REVIEWER_TOKEN" gh pr review <PR#> --approve --body "Review comment"
 ```
 
+> **If `op read` fails with a sign-in or biometric error here**, follow the pause-and-prompt procedure in `docs/agents/operating-rules.md` under "1Password CLI authentication failures." Do not hardcode tokens, skip review, or retry in a loop.
+
 ### PAT requirements for reviewer identities
 
 Reviewer accounts are **collaborators** on repos owned by `nathanjohnpayne`. This constrains the PAT type:

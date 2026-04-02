@@ -13,3 +13,4 @@ If the project uses Firebase or Google Cloud, prefer the canonical
   `external_account` source credential
 - Do not introduce long-lived service account keys into repo docs,
   scripts, or secret stores unless a project explicitly requires them
+- If an `op` command fails with a sign-in or biometric error during deploy, follow the pause-and-prompt procedure in [operating-rules.md](operating-rules.md#1password-cli-authentication-failures). Do not retry or work around the failure without the human present.
