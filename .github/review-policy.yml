@@ -55,3 +55,24 @@ default_external_reviewer: nathanpayne-codex
 # All agents commit code under this single shared identity.
 # Do not change this unless the repo owner account changes.
 author_identity: nathanjohnpayne
+
+# ---------------------------------------------------------------------------
+# CodeRabbit (Automated External Review — Phase 2.5)
+# ---------------------------------------------------------------------------
+# When enabled, CodeRabbit provides automated code review on every PR as an
+# independent second reviewer (Phase 2.5). This runs after internal self-peer
+# review and before the threshold check for agent handoff.
+#
+# CodeRabbit is typically enabled for public repositories (free plan) and
+# disabled for private ones. The template ships with enabled: false; set to
+# true when deploying to a public repo.
+#
+# CodeRabbit review is advisory — it does not block merge via CI. The agent
+# is required to read and address substantive CodeRabbit findings before
+# proceeding past Phase 2.5.
+#
+# To reverse: set enabled: false, delete .coderabbit.yml, uninstall the
+# CodeRabbit GitHub App. All agent instructions use conditional language
+# and will skip Phase 2.5 automatically.
+coderabbit:
+  enabled: false

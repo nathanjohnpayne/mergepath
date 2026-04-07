@@ -84,6 +84,22 @@ GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
 
 **All review rounds are captured as GitHub PR comments and commits.** The back-and-forth should read like two developers collaborating.
 
+### Phase 2.5: Automated External Review (CodeRabbit)
+
+> **Applies only to repos with `coderabbit.enabled: true` in `.github/review-policy.yml`.** Skip this phase for repos where CodeRabbit is not enabled.
+
+After internal review passes (Phase 2), CodeRabbit provides an independent automated review:
+
+1. CodeRabbit automatically posts a review when the PR is opened or updated. No manual trigger is needed.
+2. The agent reads CodeRabbit's review comments after internal review is complete.
+3. The agent addresses substantive CodeRabbit findings — fixing issues or posting a reply explaining why a finding is not applicable.
+4. The agent is not required to resolve every CodeRabbit comment. Use judgment: fix genuine issues, dismiss false positives with a brief explanation.
+5. CodeRabbit review is advisory. It does not block merge via CI and does not submit a "Changes Requested" review state.
+
+**CodeRabbit runs on ALL PRs** in enabled repos, regardless of size or whether the external review threshold is met. It provides a consistent automated second opinion on every change.
+
+The agent proceeds to Phase 3 (Threshold Check) after addressing CodeRabbit comments, even if some remain open. CodeRabbit is an additional review layer, not a replacement for the existing threshold-based external agent handoff.
+
 ### Phase 3: External Review Threshold Check
 
 > **Note on automation timing:** CI workflows may apply the `needs-external-review` label automatically when a PR is opened or updated, as an early advisory based on line count and protected paths. This label blocks merge immediately. The agent's responsibility is to post the handoff message and alert the human after internal review passes—the label itself may already be present.
@@ -118,6 +134,14 @@ GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
   │  Reviews PR → posts comments                             │
   │  Agent switches to nathanjohnpayne → fixes               │
   │  ↻ Repeat until approved                                 │
+  └──────────────────────────┬──────────────────────────────┘
+                             │
+                             ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │  PHASE 2.5: CODERABBIT REVIEW (if enabled)               │
+  │  CodeRabbit auto-posts review on PR                      │
+  │  Agent reads findings, addresses substantive issues      │
+  │  Advisory only — does not block merge                    │
   └──────────────────────────┬──────────────────────────────┘
                              │
                              ▼
@@ -378,3 +402,14 @@ This policy and the accompanying `review-policy.yml` should be included in every
 2. Copy this document into the repo as `REVIEW_POLICY.md` (or the location specified by your project template).
 3. Adjust `external_review_threshold`, `external_review_paths`, and `default_external_reviewer` to fit the project.
 4. Ensure all agent environments have credentials configured for the repo.
+5. If the repo is public and using CodeRabbit, set `coderabbit.enabled: true` in `.github/review-policy.yml` and install the CodeRabbit GitHub App on the repo.
+6. The `.coderabbit.yml` file at the repo root ships with the template and requires no per-repo customization for default behavior.
+
+### CodeRabbit Removal
+
+To reverse the CodeRabbit integration (e.g., if the trial ends):
+
+1. Uninstall the CodeRabbit GitHub App from the `nathanjohnpayne` GitHub account.
+2. In each repo where CodeRabbit was enabled: set `coderabbit.enabled: false` in `.github/review-policy.yml` and delete `.coderabbit.yml`.
+3. No documentation changes are needed — all agent instructions use conditional language (`"if coderabbit.enabled: true"`) and will skip Phase 2.5 automatically.
+4. Optionally remove `.coderabbit.yml` from the template if CodeRabbit will not be used for future repos.

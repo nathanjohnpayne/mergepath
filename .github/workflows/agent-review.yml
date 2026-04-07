@@ -1,3 +1,6 @@
+# Note: CodeRabbit (Phase 2.5) is handled by the CodeRabbit GitHub App
+# and does not require a CI workflow step. It runs automatically when
+# installed on the repo. See .github/review-policy.yml for enablement.
 name: Agent Review Pipeline
 
 on:

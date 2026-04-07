@@ -21,3 +21,7 @@ Before opening or updating a pull request, perform a structured self-review and 
 - Never remove `needs-external-review` or `needs-human-review` labels.
 - When external review is required, post a handoff message as described in REVIEW_POLICY.md.
 - See REVIEW_POLICY.md for the complete workflow, handoff format, and post-merge issue rules.
+
+## CodeRabbit Review
+
+If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`, CodeRabbit provides automated review on every PR (Phase 2.5). Read and address CodeRabbit comments after internal review passes. CodeRabbit is advisory — it does not block merge.

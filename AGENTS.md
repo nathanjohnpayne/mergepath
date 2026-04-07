@@ -28,11 +28,12 @@ This repository uses a multi-identity AI agent code review system. The full poli
 2. Switch to your reviewer identity (e.g., nathanpayne-claude). Review the PR. Post comments.
 3. Switch back to nathanjohnpayne. Address each comment. Push fix commits.
 4. Repeat steps 2–3 until the reviewer identity approves with no outstanding issues.
-5. Check .github/review-policy.yml for the external review threshold. If the PR meets the threshold (lines changed >= external_review_threshold OR files match external_review_paths), post a handoff message (see REVIEW_POLICY.md for format) and alert the human.
-6. If external review is not required, merge as nathanjohnpayne.
-7. If external review is required, wait for the human to relay external reviewer feedback. Resolve all issues through back-and-forth until the external reviewer approves.
-8. If the external reviewer flags observations or risks while approving, create a GitHub Issue for each one assigned to nathanjohnpayne with labels "post-review" and "observation" or "risk" before merging.
-9. Merge as nathanjohnpayne.
+5. If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`, read CodeRabbit's automated review comments and address substantive findings before proceeding. CodeRabbit review is advisory and does not block merge.
+6. Check .github/review-policy.yml for the external review threshold. If the PR meets the threshold (lines changed >= external_review_threshold OR files match external_review_paths), post a handoff message (see REVIEW_POLICY.md for format) and alert the human.
+7. If external review is not required, merge as nathanjohnpayne.
+8. If external review is required, wait for the human to relay external reviewer feedback. Resolve all issues through back-and-forth until the external reviewer approves.
+9. If the external reviewer flags observations or risks while approving, create a GitHub Issue for each one assigned to nathanjohnpayne with labels "post-review" and "observation" or "risk" before merging.
+10. Merge as nathanjohnpayne.
 
 ### Disagreements
 

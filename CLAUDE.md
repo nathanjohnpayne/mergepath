@@ -31,6 +31,10 @@ explicitly authorizes a break-glass override in chat.
 5. Review the PR. Post comments on any issues found.
 6. Switch back to nathanjohnpayne. Address each comment. Push fix commits.
 7. Repeat steps 4–6 until the reviewer identity approves.
+7.5. If `.github/review-policy.yml` has `coderabbit.enabled: true`, read
+     CodeRabbit's review comments and address substantive findings. Fix real
+     issues; dismiss false positives with a brief reply. CodeRabbit is advisory
+     and does not block merge.
 
 ## Before merging
 
