@@ -375,9 +375,10 @@ jobs:
                   body: '**Agent disagreement detected.** One reviewer approved and another requested changes. Escalating to @nathanjohnpayne for human tiebreaker per REVIEW_POLICY.md.',
                 });
               }
-            } else if (hasLabel && !hasChangesRequested) {
-              // Disagreement resolved — all reviewers who previously requested
-              // changes have since approved. Remove the label automatically.
+            } else if (hasLabel && !(hasApproval && hasChangesRequested)) {
+              // Disagreement resolved — reviewers are no longer in a mixed state
+              // (either all approved, all requesting changes, or only one opinion
+              // remains). Remove the label automatically.
               try {
                 await github.rest.issues.removeLabel({
                   owner: context.repo.owner,
@@ -389,7 +390,7 @@ jobs:
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: context.payload.pull_request.number,
-                  body: '**Agent disagreement resolved.** All reviewers now agree. Removing `needs-human-review` label.',
+                  body: '**Agent disagreement resolved.** Reviewers are no longer in a mixed state. Removing `needs-human-review` label.',
                 });
               } catch (e) {
                 // Label may already be removed — ignore 404
