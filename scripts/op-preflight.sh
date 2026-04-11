@@ -25,6 +25,7 @@
 #   # gcloud/firebase use GOOGLE_APPLICATION_CREDENTIALS automatically
 
 set -eo pipefail
+umask 077  # Restrict file permissions before any mktemp calls
 
 # ── PAT lookup table ──────────────────────────────────────────────────
 # Must match REVIEW_POLICY.md § PAT lookup table.
@@ -120,7 +121,7 @@ if [[ "$MODE" == "review" || "$MODE" == "all" ]]; then
   # op inject resolves all op:// references in a single process — one
   # biometric prompt covers both reads.
   tpl_file="$(mktemp "${TMPDIR:-/tmp}/op-preflight-tpl-XXXXXX")"
-  trap 'rm -f "$tpl_file"' EXIT
+  trap 'rm -f "$tpl_file" "${adc_tmpfile:-}"' EXIT
 
   cat > "$tpl_file" <<TPL
 REVIEWER_PAT={{ op://Private/${reviewer_item}/token }}
@@ -143,8 +144,8 @@ TPL
     exit 1
   fi
 
-  EXPORTS+=("export OP_PREFLIGHT_REVIEWER_PAT='${reviewer_pat}'")
-  EXPORTS+=("export OP_PREFLIGHT_AUTHOR_PAT='${author_pat}'")
+  EXPORTS+=("export OP_PREFLIGHT_REVIEWER_PAT=$(printf '%q' "$reviewer_pat")")
+  EXPORTS+=("export OP_PREFLIGHT_AUTHOR_PAT=$(printf '%q' "$author_pat")")
   SUMMARY+=("Reviewer PAT ($AGENT): loaded")
   SUMMARY+=("Author PAT: loaded")
 fi
@@ -153,11 +154,10 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
   echo "# Preflight: reading GCP ADC (reuses session)..." >&2
 
   adc_tmpfile="$(mktemp "${TMPDIR:-/tmp}/op-preflight-adc-XXXXXX")"
-  umask 077
 
   if op read "$DEFAULT_ADC_OP_URI" > "$adc_tmpfile" 2>/dev/null && [[ -s "$adc_tmpfile" ]]; then
-    EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS='${adc_tmpfile}'")
-    EXPORTS+=("export OP_PREFLIGHT_ADC_TMPFILE='${adc_tmpfile}'")
+    EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$adc_tmpfile")")
+    EXPORTS+=("export OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$adc_tmpfile")")
     SUMMARY+=("GCP ADC: loaded -> $adc_tmpfile")
   else
     rm -f "$adc_tmpfile"
@@ -188,7 +188,7 @@ fi
 
 # ── Output ────────────────────────────────────────────────────────────
 EXPORTS+=("export OP_PREFLIGHT_DONE=1")
-EXPORTS+=("export OP_PREFLIGHT_AGENT='${AGENT}'")
+EXPORTS+=("export OP_PREFLIGHT_AGENT=$(printf '%q' "$AGENT")")
 
 # Print export statements to stdout (caller evals them)
 for exp in "${EXPORTS[@]}"; do
