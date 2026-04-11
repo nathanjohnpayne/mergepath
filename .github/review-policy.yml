@@ -71,6 +71,15 @@ author_identity: nathanjohnpayne
 # is required to read and address substantive CodeRabbit findings before
 # proceeding past Phase 2.5.
 #
+# When enabled, the agent MUST:
+#   1. Wait for CodeRabbit to post before proceeding (up to 3 min; ask
+#      the human if it hasn't appeared).
+#   2. Read BOTH API endpoints:
+#      - gh api repos/{owner}/{repo}/issues/{pr}/comments  (PR-level summary)
+#      - gh api repos/{owner}/{repo}/pulls/{pr}/comments    (inline diff comments)
+#   3. Grep inline comments for "Potential issue" or "⚠️" — every flagged
+#      finding must be explicitly addressed (fixed or dismissed with reasoning).
+#
 # To reverse: set enabled: false, delete .coderabbit.yml, uninstall the
 # CodeRabbit GitHub App. All agent instructions use conditional language
 # and will skip Phase 2.5 automatically.

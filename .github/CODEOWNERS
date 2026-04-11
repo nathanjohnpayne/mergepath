@@ -1,0 +1,7 @@
+# Default owner for everything
+* @nathanjohnpayne
+
+# Protected paths — always require review
+.github/ @nathanjohnpayne
+**/*secret* @nathanjohnpayne
+**/*credential* @nathanjohnpayne

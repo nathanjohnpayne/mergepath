@@ -15,6 +15,15 @@ Never push directly to `main`. All changes must go through a pull request.
 Every PR you open must follow this workflow. No exceptions unless the human
 explicitly authorizes a break-glass override in chat.
 
+## Session start (run once)
+
+0. Run credential preflight to front-load all biometric prompts:
+   `eval "$(scripts/op-preflight.sh --agent claude --mode all)"`
+   This caches PATs and deploy credentials. All subsequent steps use
+   `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` (reviewer) or
+   `GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"` (author) instead of `op read`.
+   If preflight was not run, fall back to inline `op read` (original pattern).
+
 ## Before opening a PR
 
 1. Include `Authoring-Agent: claude` (or cursor/codex) in the PR description.
@@ -26,15 +35,19 @@ explicitly authorizes a break-glass override in chat.
 ## After opening the PR
 
 4. Switch to your reviewer identity (e.g., nathanpayne-claude).
-   Use `GH_TOKEN="$(op read 'op://Private/<item-id>/token')"` to authenticate
-   API calls. See REVIEW_POLICY.md § PAT lookup table for your agent's item ID.
+   If preflight was run: `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` (no biometric).
+   Otherwise: `GH_TOKEN="$(op read 'op://Private/<item-id>/token')"`.
+   See REVIEW_POLICY.md § PAT lookup table for your agent's item ID.
 5. Review the PR. Post comments on any issues found.
 6. Switch back to nathanjohnpayne. Address each comment. Push fix commits.
 7. Repeat steps 4–6 until the reviewer identity approves.
-7.5. If `.github/review-policy.yml` has `coderabbit.enabled: true`, read
-     CodeRabbit's review comments and address substantive findings. Fix real
-     issues; dismiss false positives with a brief reply. CodeRabbit is advisory
-     and does not block merge.
+7.5. If `.github/review-policy.yml` has `coderabbit.enabled: true`:
+     a. Wait for CodeRabbit to post (up to 3 min; ask human if delayed).
+     b. Read PR-level comments: `gh api repos/{owner}/{repo}/issues/{pr}/comments`
+     c. Read inline diff comments: `gh api repos/{owner}/{repo}/pulls/{pr}/comments`
+     d. Grep inline comments for `Potential issue` or `⚠️` — address each one.
+     e. Fix real issues; dismiss false positives with a brief reply.
+     CodeRabbit is advisory and does not block merge.
 
 ## Before merging
 

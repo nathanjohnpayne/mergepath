@@ -37,14 +37,19 @@ Then follow this procedure:
 1. **Stop immediately.** Do not retry the command, do not attempt
    workarounds (manual token entry, environment variable overrides,
    fallback credential paths, or skipping the credential step).
-2. **Prompt the human with context.** State what you were trying to do
-   and what credential you needed. Example:
-   > "1Password is timing out. Could you let me know when you are back
-   > to provide a biometric response? I need the reviewer PAT to
-   > approve PR #142."
-3. **Wait for the human to confirm** they are present and ready before
-   retrying the `op` command.
-4. After confirmation, retry **once**. If it fails again, report the
+2. **Check if preflight was run.** If `OP_PREFLIGHT_DONE` is not set,
+   suggest running the preflight script:
+   > "1Password auth failed. Would you like to run credential preflight
+   > to cache all credentials at once?
+   > `eval \"$(scripts/op-preflight.sh --agent claude --mode all)\"`"
+3. **If preflight was already run** but credentials expired (rare —
+   only after 1Password locks or the 12-hour hard limit), prompt
+   the human and suggest re-running preflight:
+   > "Preflight credentials appear to have expired. Could you re-run
+   > preflight when you're back? I need to resume the review."
+4. **Wait for the human to confirm** they are present and ready before
+   re-running preflight (not individual `op read` commands).
+5. After confirmation, re-run preflight. If it fails again, report the
    full error output and wait — do not loop.
 
 This rule applies only to 1Password CLI sign-in and authentication

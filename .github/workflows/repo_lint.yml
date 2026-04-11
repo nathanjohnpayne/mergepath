@@ -2,11 +2,14 @@ name: repo-lint
 
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: make_ci_scripts_executable
         run: chmod +x scripts/ci/*
@@ -40,4 +43,15 @@ jobs:
             echo "ERROR: REVIEW_POLICY.md is missing"
             MISSING=1
           fi
+          exit $MISSING
+
+      - name: check_governance_files
+        run: |
+          MISSING=0
+          for file in SECURITY.md .github/CODEOWNERS .github/dependabot.yml; do
+            if [ ! -f "$file" ]; then
+              echo "ERROR: $file is missing"
+              MISSING=1
+            fi
+          done
           exit $MISSING

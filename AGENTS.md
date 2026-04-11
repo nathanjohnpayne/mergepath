@@ -24,11 +24,20 @@ This repository uses a multi-identity AI agent code review system. The full poli
 
 ### Workflow Summary
 
+0. Run credential preflight at the start of every PR session:
+   `eval "$(scripts/op-preflight.sh --agent {your-agent} --mode all)"`
+   This triggers biometric prompts once and caches all credentials for the session.
+   Use `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` for reviewer commands and
+   `GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"` for author commands.
 1. Author code as nathanjohnpayne. File a PR.
 2. Switch to your reviewer identity (e.g., nathanpayne-claude). Review the PR. Post comments.
 3. Switch back to nathanjohnpayne. Address each comment. Push fix commits.
 4. Repeat steps 2–3 until the reviewer identity approves with no outstanding issues.
-5. If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`, read CodeRabbit's automated review comments and address substantive findings before proceeding. CodeRabbit review is advisory and does not block merge.
+5. If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`:
+   a. **Wait** for CodeRabbit to post its review (up to 3 minutes; ask the human if it hasn't appeared).
+   b. **Read both endpoints:** PR-level comments (`gh api repos/{owner}/{repo}/issues/{pr}/comments`) and inline diff comments (`gh api repos/{owner}/{repo}/pulls/{pr}/comments`).
+   c. **Grep inline comments** for `Potential issue` or `⚠️` — these must each be explicitly addressed (fixed or dismissed with reasoning).
+   d. Address other substantive findings. CodeRabbit review is advisory and does not block merge.
 6. Check .github/review-policy.yml for the external review threshold. If the PR meets the threshold (lines changed >= external_review_threshold OR files match external_review_paths), post a handoff message (see REVIEW_POLICY.md for format) and alert the human.
 7. If external review is not required, merge as nathanjohnpayne.
 8. If external review is required, wait for the human to relay external reviewer feedback. Resolve all issues through back-and-forth until the external reviewer approves.
