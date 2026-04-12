@@ -116,3 +116,27 @@ If the round-trip is lossy, the reviewer must flag the information loss
 as a design risk and require either:
 - An explicit justification for why the loss is acceptable, or
 - A plan to eliminate the intermediate format
+
+## Worktree lifecycle
+
+Worktrees created for a task must be removed immediately after the corresponding
+branch is merged or deleted from the remote. Never leave a worktree checked out
+for a branch that is `[gone]` on the remote.
+
+**After merging a PR whose branch had a worktree:**
+
+```bash
+git worktree remove --force .claude/worktrees/<name>
+git worktree prune
+```
+
+**To find stale worktrees:**
+
+```bash
+git worktree list   # all worktrees and their branches
+git branch -vv      # [gone] next to branches whose remote was deleted
+```
+
+If a worktree directory exists but `git worktree list` no longer shows it
+(orphaned after `--force` removal), run `git worktree prune` to clean up
+the git metadata, then `rm -rf` the leftover directory.
