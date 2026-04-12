@@ -471,6 +471,48 @@ jobs:
       !contains(github.event.pull_request.labels.*.name, 'needs-human-review')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check if CodeRabbit is enabled
+        id: cr
+        run: |
+          CONFIG=".github/review-policy.yml"
+          if grep -qE '^\s*enabled:\s*true' <(awk '/^coderabbit:/,/^[^ ]/' "$CONFIG"); then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait for CodeRabbit review
+        if: steps.cr.outputs.enabled == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const maxWaitMs = 5 * 60 * 1000; // 5 minutes
+            const pollMs = 30 * 1000;         // 30 seconds
+            const start = Date.now();
+
+            while (Date.now() - start < maxWaitMs) {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+              });
+              const hasCR = comments.some(
+                c => c.user.login === 'coderabbitai[bot]' &&
+                     !c.body.includes('Currently processing')
+              );
+              if (hasCR) {
+                core.info('CodeRabbit review found — proceeding to merge.');
+                return;
+              }
+              core.info(`Waiting for CodeRabbit... (${Math.round((Date.now() - start) / 1000)}s)`);
+              await new Promise(r => setTimeout(r, pollMs));
+            }
+            core.warning('CodeRabbit did not post within 5 minutes — proceeding to merge.');
+
       - name: Enable auto-merge
         run: gh pr merge --squash --auto "$PR_URL" || gh pr merge --squash "$PR_URL" || true
         env:
