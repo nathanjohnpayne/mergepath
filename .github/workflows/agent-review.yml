@@ -10,7 +10,7 @@ on:
     types: [submitted]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
   issues: write
 
@@ -459,3 +459,20 @@ jobs:
 
               core.setFailed('Self-approval detected and dismissed.');
             }
+
+  # ──────────────────────────────────────────────
+  # Job 7: Auto-merge on approval (if no external review required)
+  # ──────────────────────────────────────────────
+  auto-merge-on-approval:
+    if: >
+      github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'approved' &&
+      !contains(github.event.pull_request.labels.*.name, 'needs-external-review') &&
+      !contains(github.event.pull_request.labels.*.name, 'needs-human-review')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge
+        run: gh pr merge --squash --auto "$PR_URL" || gh pr merge --squash "$PR_URL" || true
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
