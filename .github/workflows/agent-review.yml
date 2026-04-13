@@ -477,7 +477,7 @@ jobs:
         id: cr
         run: |
           CONFIG=".github/review-policy.yml"
-          if grep -qE '^\s*enabled:\s*true' <(awk '/^coderabbit:/,/^[^ ]/' "$CONFIG"); then
+          if sed -n '/^coderabbit:/,$ p' "$CONFIG" | grep -qE '^\s*enabled:\s*true'; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
