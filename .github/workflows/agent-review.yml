@@ -558,6 +558,46 @@ jobs:
             }
             core.warning('CodeRabbit did not post within 5 minutes — proceeding to merge.');
 
+      - name: Re-verify blocking labels right before merge
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+        run: |
+          # Guard against the TOCTOU race between the trigger-time label
+          # snapshot and the actual merge. The job's top-level `if:` expression
+          # evaluates labels from the `pull_request_review` event payload at
+          # the moment GitHub Actions dispatched the event. Two things can
+          # make that snapshot stale by the time we reach the merge step:
+          #
+          #   1. Eventual consistency. If a label is applied milliseconds
+          #      before the review event fires, the event payload can still
+          #      be generated without the label attached. Observed on PR #60
+          #      (2026-04-14), where the `needs-external-review` label was
+          #      applied 2 seconds before the review event but the job's
+          #      `if:` check evaluated to true anyway, merging the PR before
+          #      any external review could happen. See #61.
+          #
+          #   2. The "Wait for CodeRabbit review" step above can sleep for
+          #      up to 5 minutes on a coderabbit-enabled repo. During that
+          #      window, an agent can legitimately apply a blocking label
+          #      (e.g., a human spotting something after approval) and the
+          #      job would still merge because the `if:` already evaluated.
+          #
+          # Re-fetch the authoritative label state from the GitHub API
+          # immediately before merging. Abort if any blocking label is now
+          # present. Also check `policy-violation`, which is applied by the
+          # block-self-approval job earlier in this same workflow run (and
+          # again, the `if:` at job start wouldn't have seen it).
+          LABELS=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '[.labels[].name] | join(",")')
+          echo "Labels at merge time: [$LABELS]"
+          case ",$LABELS," in
+            *,needs-external-review,*|*,needs-human-review,*|*,policy-violation,*)
+              echo "::error::Blocking label present at merge time: $LABELS. Aborting auto-merge."
+              exit 1
+              ;;
+          esac
+          echo "No blocking labels present — proceeding to merge."
+
       - name: Enable auto-merge
         run: gh pr merge --squash --auto "$PR_URL" || gh pr merge --squash "$PR_URL" || true
         env:
