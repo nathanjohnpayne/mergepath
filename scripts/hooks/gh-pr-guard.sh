@@ -85,21 +85,63 @@ if echo "$COMMAND" | grep -qE '^\s*gh\s+pr\s+merge'; then
   # Non-admin merge sub-guard: if the target PR has
   # `needs-external-review`, require CODEX_CLEARED=1.
   #
-  # Extract the PR number as the first positional argument following
-  # the literal token `merge`. Flags in any order are tolerated; the
-  # PR number is the first bare integer after `merge`. If no PR
-  # number is present, the PR is inferred from the current branch by
-  # `gh pr view` with no positional argument.
-  PR_NUM=""
+  # Extract the PR selector as the first positional argument
+  # following the literal token `merge`. `gh pr merge` accepts
+  # `<number> | <url> | <branch>` per the gh CLI grammar, so the
+  # selector can be any of:
+  #
+  #   - A bare integer:      gh pr merge 65
+  #   - A full PR URL:       gh pr merge https://github.com/foo/bar/pull/65
+  #   - A branch name:       gh pr merge feat/my-branch
+  #
+  # Walk the tokens after `merge` looking for the first non-flag
+  # token, skipping value-taking flags and their values so a
+  # command like `gh pr merge --body "text" 65` correctly captures
+  # `65` as the selector rather than `"text"`. Inline-value forms
+  # (`--body=text`, `-b=text`) are handled as single tokens and are
+  # filtered by the `-*` prefix test.
+  #
+  # If no selector is present (i.e., `gh pr merge` with only flags
+  # or no arguments at all), the hook falls back to `gh pr view`
+  # with no positional argument so gh resolves the PR from the
+  # current branch, matching gh's own default behavior.
+  #
+  # Value-taking flags handled here mirror the `gh pr merge --help`
+  # flag list as of the gh CLI version shipped at the time this
+  # hook was written. Additions to gh's grammar may require updates
+  # here; boolean flags (--squash, --merge, --rebase, --admin,
+  # --auto, --delete-branch, --disable-auto) do NOT need entries.
+  PR_SELECTOR=""
   FOUND_MERGE=0
+  SKIP_NEXT=0
   # shellcheck disable=SC2206  # deliberate word-splitting on the command
   TOKENS=( $COMMAND )
   for tok in "${TOKENS[@]}"; do
+    if [[ "$SKIP_NEXT" -eq 1 ]]; then
+      SKIP_NEXT=0
+      continue
+    fi
     if [[ "$FOUND_MERGE" -eq 1 ]]; then
-      if [[ "$tok" != -* ]] && [[ "$tok" =~ ^[0-9]+$ ]]; then
-        PR_NUM="$tok"
-        break
+      # Value-taking flags consume the next token. gh pr merge takes
+      # --body / --body-file / --subject / --author-email /
+      # --match-head-commit / --repo (and their short aliases).
+      case "$tok" in
+        --body|-b|--body-file|-F|--subject|-t|--author-email|-A|--match-head-commit|--repo|-R)
+          SKIP_NEXT=1
+          continue
+          ;;
+      esac
+      # Inline-value flags like --body=text already have the value
+      # embedded; skip them as ordinary flags via the -* test below.
+      if [[ "$tok" == -* ]]; then
+        continue
       fi
+      # First non-flag token after `merge` is the selector. Pass
+      # it through unmodified — gh pr view accepts the same
+      # <number> | <url> | <branch> grammar that gh pr merge does,
+      # so we don't need to parse the URL or validate the form.
+      PR_SELECTOR="$tok"
+      break
     fi
     if [[ "$tok" == "merge" ]]; then
       FOUND_MERGE=1
@@ -107,18 +149,19 @@ if echo "$COMMAND" | grep -qE '^\s*gh\s+pr\s+merge'; then
   done
 
   # Also extract an explicit --repo flag if present so the label
-  # lookup is unambiguous.
+  # lookup is unambiguous. Handles both `--repo foo/bar` and
+  # `--repo=foo/bar` forms.
   REPO_ARG=""
   if echo "$COMMAND" | grep -qE '(^|\s)--repo(\s|=)'; then
     REPO_ARG=$(echo "$COMMAND" | sed -nE 's/.*--repo[= ]([^ ]+).*/\1/p')
   fi
 
   # Fetch labels. `gh pr view` with no positional argument resolves
-  # the PR from the current branch, matching gh's own default
-  # behavior when `gh pr merge` has no number.
+  # the PR from the current branch; with a positional argument it
+  # accepts number / URL / branch forms identically to gh pr merge.
   GH_ARGS=(pr view --json labels --jq '[.labels[].name] | join(",")')
-  if [[ -n "$PR_NUM" ]]; then
-    GH_ARGS=(pr view "$PR_NUM" --json labels --jq '[.labels[].name] | join(",")')
+  if [[ -n "$PR_SELECTOR" ]]; then
+    GH_ARGS=(pr view "$PR_SELECTOR" --json labels --jq '[.labels[].name] | join(",")')
   fi
   if [[ -n "$REPO_ARG" ]]; then
     GH_ARGS+=(--repo "$REPO_ARG")
