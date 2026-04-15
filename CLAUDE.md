@@ -60,8 +60,11 @@ explicitly authorizes a break-glass override in chat.
    See REVIEW_POLICY.md § Phase 4 for the canonical procedure. Short form:
 
    **Phase 4a — Automated (preferred).** Applies when
-   `codex.enabled: true` in `.github/review-policy.yml` AND
-   `scripts/codex-review-request.sh` exists on disk:
+   `codex.enabled: true` in `.github/review-policy.yml` AND **both**
+   `scripts/codex-review-request.sh` AND `scripts/codex-review-check.sh`
+   exist on disk. If only one script is present (a partial rollout),
+   fall back to Phase 4b instead of entering 4a and stalling at the
+   merge-gate step:
 
    a. Run `scripts/codex-review-request.sh <PR#>`. It posts `@codex review`
       (or skips the trigger if Codex already auto-reviewed on open) and
@@ -86,8 +89,8 @@ explicitly authorizes a break-glass override in chat.
       `gh pr merge --squash --delete-branch`.
 
    **Phase 4b — Manual CLI fallback.** Applies when Phase 4a is
-   unavailable (`codex.enabled: false`, scripts not yet present, or 4a
-   fell back via exit code 4):
+   unavailable (`codex.enabled: false`, either helper script missing,
+   or 4a fell back via exit code 4):
 
    a. Post the handoff message per REVIEW_POLICY.md § Handoff Message
       Format as a PR comment.
