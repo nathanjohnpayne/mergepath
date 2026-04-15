@@ -59,12 +59,24 @@ explicitly authorizes a break-glass override in chat.
 9. If the PR meets the threshold, it enters Phase 4 external review.
    See REVIEW_POLICY.md § Phase 4 for the canonical procedure. Short form:
 
-   **Phase 4a — Automated (preferred).** Applies when
-   `codex.enabled: true` in `.github/review-policy.yml` AND **both**
-   `scripts/codex-review-request.sh` AND `scripts/codex-review-check.sh`
-   exist on disk. If only one script is present (a partial rollout),
-   fall back to Phase 4b instead of entering 4a and stalling at the
-   merge-gate step:
+   **Phase 4a — Automated (preferred).** Applies when ALL of the
+   following are true:
+
+   - `codex.enabled: true` in `.github/review-policy.yml`
+   - BOTH `scripts/codex-review-request.sh` AND
+     `scripts/codex-review-check.sh` exist on disk
+   - The **ChatGPT Codex Connector GitHub App is installed on this
+     repository** with Code Review enabled at
+     [chatgpt.com/codex/cloud/settings/code-review](https://chatgpt.com/codex/cloud/settings/code-review).
+     Verify with `gh api repos/{owner}/{repo}/installation` or by
+     checking that a recent PR in this repo received an auto-review
+     from `chatgpt-codex-connector[bot]`. If the App is not installed,
+     any `@codex review` trigger will sit unanswered until it times out,
+     wasting a round-trip.
+
+   If any of the three conditions is false (partial rollout, Codex
+   not enabled, App not installed, either helper script missing), fall
+   back to Phase 4b directly rather than entering 4a and stalling:
 
    a. Run `scripts/codex-review-request.sh <PR#>`. It posts `@codex review`
       (or skips the trigger if Codex already auto-reviewed on open) and
@@ -73,8 +85,10 @@ explicitly authorizes a break-glass override in chat.
       fixing the code and pushing a new commit, OR posting a reply on the
       finding thread with a clear rebuttal. Increment the round counter.
    c. Re-run `scripts/codex-review-request.sh` for the next round. Loop
-      until Codex clears (COMMENTED review with no unaddressed P0/P1 on
-      current HEAD, OR 👍 reaction on the PR issue).
+      until Codex clears: a `COMMENTED` review with no unaddressed
+      **P0/P1** findings on the current HEAD (P2 and P3 findings do NOT
+      block clearance — address them at the agent's judgment), OR a
+      👍 reaction on the PR issue.
    d. On exit code `4` (FALLBACK_REQUIRED, timeout), stop 4a and drop to
       Phase 4b below.
    e. On disagreement (repeat-after-rebuttal) or runaway (round counter
