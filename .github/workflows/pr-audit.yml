@@ -28,18 +28,39 @@ jobs:
             const fs = require('fs');
             const yaml = require('js-yaml');
 
-            // Read reviewer accounts from review-policy.yml
+            // Read reviewer accounts and the Codex bot login from
+            // review-policy.yml. The Codex bot login is read from
+            // codex.bot_login (added in #31) so that the OpenAI
+            // Codex GitHub app's reviews count as satisfying the
+            // external-review requirement, in addition to the
+            // nathanpayne-* CLI reviewer identities. See #26 for
+            // the bot identity decision and #36 for the audit-side
+            // allow-list change.
             let reviewerAccounts;
             let authorIdentity;
+            let codexBotLogin;
             try {
               const config = yaml.load(fs.readFileSync('.github/review-policy.yml', 'utf8'));
               reviewerAccounts = config.available_reviewers || [];
               authorIdentity = config.author_identity || 'nathanjohnpayne';
+              codexBotLogin = (config.codex && config.codex.bot_login) || 'chatgpt-codex-connector[bot]';
             } catch (e) {
               console.log('WARNING: Could not read review-policy.yml, using defaults');
               reviewerAccounts = ['nathanpayne-claude', 'nathanpayne-codex', 'nathanpayne-cursor'];
               authorIdentity = 'nathanjohnpayne';
+              codexBotLogin = 'chatgpt-codex-connector[bot]';
             }
+
+            // The Codex bot's review-state semantics differ from
+            // CLI reviewer identities, so the external-review check
+            // below treats them on separate code paths rather than
+            // unioning them into a single allow-list. See the
+            // Check 2 block for the full rationale; the short
+            // version is that CLI identities still require
+            // state === 'APPROVED' but the Codex bot can clear
+            // with any review state because the GitHub app never
+            // emits APPROVED — only COMMENTED with a 👍 reaction
+            // or no findings (see #29 for observational evidence).
 
             const since = new Date();
             since.setDate(since.getDate() - 7);
@@ -67,38 +88,96 @@ jobs:
 
             for (const pr of mergedPRs) {
               const prViolations = [];
+              const isDependabot = pr.user.login === 'dependabot[bot]';
+
+              // Fetch all reviews for this PR once, up front. Both
+              // Check 2 (external-review approval) and Check 3 (bot
+              // self-approval) consume them, and an earlier version
+              // of this script fetched twice. CodeRabbit caught the
+              // duplicate on PR #68.
+              const reviewsResp = await github.rest.pulls.listReviews({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+              });
+              const reviews = reviewsResp.data;
 
               // Check 1: Missing Self-Review section
-              if (!pr.body || !pr.body.match(/^## Self-Review/m)) {
-                prViolations.push('Missing `## Self-Review` section');
+              //
+              // Skip for Dependabot PRs. Dependabot doesn't author a
+              // body with the Self-Review template, and the
+              // pre-merge gate in pr-review-policy.yml already
+              // skips Dependabot via `if: github.actor != 'dependabot[bot]'`
+              // (line 14). The audit was previously flagging every
+              // Dependabot PR as a false positive — see #20.
+              if (!isDependabot) {
+                if (!pr.body || !pr.body.match(/^## Self-Review/m)) {
+                  prViolations.push('Missing `## Self-Review` section');
+                }
               }
 
-              // Check 2: Had needs-external-review label — verify approval from a reviewer identity
+              // Check 2: Had needs-external-review label — verify approval
+              //
+              // Also runs unconditionally for Dependabot PRs (see #20):
+              // even patch/minor bumps must have ONE reviewer-identity
+              // approval before merge. The existing
+              // .github/workflows/dependabot-auto-merge.yml posts
+              // `gh pr review --approve` via REVIEWER_ASSIGNMENT_TOKEN
+              // before enabling auto-merge, so well-behaved auto-merge
+              // PRs satisfy this naturally. Only Dependabot PRs that
+              // were merged manually WITHOUT any reviewer-identity
+              // approval will be flagged — which is the real gap.
               const hadExternalLabel = pr.labels.some(
                 l => l.name === 'needs-external-review'
               );
+              const dependabotNeedsApproval = isDependabot;
 
-              if (hadExternalLabel) {
-                const reviews = await github.rest.pulls.listReviews({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: pr.number,
-                });
-
-                const approvals = reviews.data.filter(
-                  r => r.state === 'APPROVED'
+              if (hadExternalLabel || dependabotNeedsApproval) {
+                // For the external-review path we accept either:
+                //   - an APPROVED review from a CLI reviewer identity
+                //     (nathanpayne-claude / nathanpayne-codex / etc.), OR
+                //   - ANY review from the Codex GitHub app bot,
+                //     regardless of state, because the Codex app
+                //     never emits APPROVED — only COMMENTED with a
+                //     👍 reaction or no findings (see #29 for the
+                //     observational evidence).
+                //
+                // The state-agnostic exception is intentionally
+                // SCOPED to the Codex bot only. CLI reviewer
+                // identities still require state === 'APPROVED'
+                // because a non-opinionated COMMENTED review from
+                // a CLI reviewer is not a clearance signal under
+                // policy. nathanpayne-codex caught this on PR #68
+                // round 1 — earlier draft accepted any review from
+                // any external approver, which would have let a
+                // Phase 4b fallback PR with only a COMMENTED CLI
+                // review pass the audit.
+                const cliApprovedReviews = reviews.filter(
+                  r => r.state === 'APPROVED' &&
+                       reviewerAccounts.includes(r.user.login)
                 );
 
-                // Per REVIEW_POLICY.md: external-review PRs need at least one
-                // approval from a reviewer identity (nathanpayne-{agent}).
-                // nathanjohnpayne is the PR author, so their approval does not
-                // count toward the reviewer approval requirement.
-                const reviewerApprovals = approvals.filter(
-                  r => reviewerAccounts.includes(r.user.login)
+                const codexBotReviews = reviews.filter(
+                  r => r.user.login === codexBotLogin
                 );
-                if (reviewerApprovals.length === 0) {
+
+                if (hadExternalLabel &&
+                    cliApprovedReviews.length === 0 &&
+                    codexBotReviews.length === 0) {
                   prViolations.push(
-                    'External-review PR merged with no reviewer identity approval'
+                    'External-review PR merged with no APPROVED review from a CLI reviewer identity and no review from the Codex bot'
+                  );
+                }
+
+                // Dependabot PRs use a strictly narrower rule: only
+                // an APPROVED review from a CLI reviewer identity
+                // counts. Codex doesn't review Dependabot PRs in
+                // the Phase 4a flow, so this is just defensive
+                // against future weirdness — and reuses the
+                // cliApprovedReviews array computed above.
+                if (dependabotNeedsApproval && cliApprovedReviews.length === 0) {
+                  prViolations.push(
+                    'Dependabot PR merged with no reviewer identity approval (auto-merge approval missing or removed)'
                   );
                 }
               }
@@ -108,13 +187,9 @@ jobs:
               // authorIdentity (nathanjohnpayne). The human IS that identity,
               // so nathanjohnpayne approving is legitimate (human tiebreaker).
               // Only flag if a reviewer bot account approved its own PR.
-              const reviews = await github.rest.pulls.listReviews({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: pr.number,
-              });
-
-              const botSelfApproval = reviews.data.some(
+              // Reuses the `reviews` array fetched at the top of this
+              // PR's iteration.
+              const botSelfApproval = reviews.some(
                 r => r.user.login === pr.user.login &&
                      r.state === 'APPROVED' &&
                      reviewerAccounts.includes(r.user.login)
