@@ -1,5 +1,20 @@
 name: Weekly PR Audit
 
+# Cron-driven retroactive check that the previous week's merged PRs
+# satisfied the review policy. Five checks per merged PR:
+#
+#   1. Self-Review section present in PR body (Dependabot exempted)
+#   2. external-review-labeled PRs have either an APPROVED CLI
+#      reviewer review OR a review from the Codex GitHub app bot;
+#      Dependabot PRs require an APPROVED CLI reviewer review
+#   3. No bot self-approval (reviewer identity approving its own PR)
+#   4. needs-human-review label not still present at merge time
+#   5. policy-violation label not still present at merge time
+#
+# Violations are aggregated into a single audit issue per run.
+# See REVIEW_POLICY.md, .github/review-policy.yml, and #36 for
+# the canonical policy and the most recent semantics changes.
+
 on:
   schedule:
     - cron: '0 9 * * 1'  # Every Monday at 9:00 UTC
