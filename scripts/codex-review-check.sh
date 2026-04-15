@@ -192,31 +192,62 @@ HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.commi
   || die 3 "failed to fetch commit date for $HEAD_SHA: $HEAD_COMMITTER_DATE"
 
 # HEAD_PUSHED_AT: the timestamp to use as the "when did this commit
-# become current on the PR" anchor for reaction freshness. committer
+# become current on THIS PR" anchor for reaction freshness. Committer
 # date is commit metadata and can be ARBITRARILY OLD if someone force-
 # pushes a previously-authored commit — a stale Codex 👍 from a prior
-# HEAD could then still satisfy `reaction.created_at >= committer_date`
-# even though the reaction predates the current HEAD's existence on
-# this PR. See #64 Codex P1 finding ("Anchor reaction freshness to PR
-# head update time").
+# HEAD would then satisfy `reaction.created_at >= committer_date` even
+# though the reaction predates the current HEAD's existence on this
+# PR. See #64 Codex P1 finding ("Anchor reaction freshness to PR head
+# update time") and #65 follow-up findings.
 #
-# The best proxy available from the API: the earliest check-run start
-# time on the current HEAD. A CheckRun is created only AFTER a commit
-# exists on a PR and GitHub dispatches a workflow for it, so this time
-# is strictly after the commit became the PR's HEAD. If the repo has
-# no CI at all (no check-runs exist), fall back to committer date —
-# there's no force-push concern in that case because there's also no
-# stale CI signal to worry about.
-HEAD_CHECK_RUNS_MIN=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-  --jq '[.check_runs[].started_at] | min // ""' 2>/dev/null || echo "")
-if [ -n "$HEAD_CHECK_RUNS_MIN" ] && [ "$HEAD_CHECK_RUNS_MIN" != "null" ]; then
-  HEAD_PUSHED_AT="$HEAD_CHECK_RUNS_MIN"
+# Earlier iterations tried `repos/{repo}/commits/{sha}/check-runs` as
+# the anchor source, but that endpoint is COMMIT-scoped, not PR-scoped:
+# if the same SHA ran in an earlier context (a different branch, a
+# previous PR, a direct push to main), the earliest check-run's
+# started_at comes from THAT context and is much earlier than when
+# the commit became the current PR's HEAD. nathanpayne-codex caught
+# this on PR #65 round 1 — thanks.
+#
+# New approach: use the PR's TIMELINE events, which are strictly
+# PR-scoped. Algorithm:
+#
+#   1. Start with HEAD_COMMITTER_DATE as the base. It's correct for
+#      the common case (normal push, or force-push of a new commit
+#      authored at or after the push time). It's also strictly earlier
+#      than any CI-dispatch anchor, so a valid Codex 👍 posted in the
+#      gap between push and CI start is NOT filtered out (#65 round 1
+#      finding 3: "started_at is later than the actual head update").
+#
+#   2. If there's a `head_ref_force_pushed` event on this PR with
+#      `created_at > HEAD_COMMITTER_DATE`, override the base. This
+#      catches the force-push-with-old-commit case where committer
+#      date is arbitrarily old. `max()` across all force-push events
+#      picks the most recent force-push, which is the one that
+#      established the CURRENT head state.
+#
+#   3. fetch_api_array fails closed with exit 3 on API error — no
+#      silent fallback to the weaker anchor. If the timeline endpoint
+#      is unreachable, we fail, consistent with the rest of the
+#      script's fetch logic.
+HEAD_PUSHED_AT="$HEAD_COMMITTER_DATE"
+
+TIMELINE_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline")
+
+LATEST_FORCE_PUSH_TIME=$(echo "$TIMELINE_JSON" | jq -r '
+  [ .[] | select(.event == "head_ref_force_pushed") | .created_at ]
+  | max // ""
+')
+
+if [ -n "$LATEST_FORCE_PUSH_TIME" ] && [[ "$LATEST_FORCE_PUSH_TIME" > "$HEAD_PUSHED_AT" ]]; then
+  HEAD_PUSHED_AT="$LATEST_FORCE_PUSH_TIME"
+  ANCHOR_SOURCE="head_ref_force_pushed @ $LATEST_FORCE_PUSH_TIME"
 else
-  HEAD_PUSHED_AT="$HEAD_COMMITTER_DATE"
+  ANCHOR_SOURCE="HEAD committer date"
 fi
 
 log "HEAD = $HEAD_SHA    author = $PR_AUTHOR"
-log "committer_date = $HEAD_COMMITTER_DATE    pushed_at_proxy = $HEAD_PUSHED_AT"
+log "committer_date = $HEAD_COMMITTER_DATE"
+log "anchor = $HEAD_PUSHED_AT (source: $ANCHOR_SOURCE)"
 
 # --- preflight: blocking labels --------------------------------------------
 #
