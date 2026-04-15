@@ -69,6 +69,30 @@
 #     hook avoids bash 4+ features (no `mapfile`, no `[[ =~ ]]` in
 #     places where `[[ == ]]` works, etc.).
 #
+# Inline environment assignments:
+#
+#   The bash form `VAR=value command args` sets VAR in the spawned
+#   command's environment but NOT in the hook process. The PreToolUse
+#   hook fires before bash executes the command, so it can't read
+#   inline-prefixed env vars from its own ${VAR} expansion. The
+#   documented happy paths use exactly this form:
+#
+#     CODEX_CLEARED=1 gh pr merge 65 --squash --delete-branch
+#     BREAK_GLASS_ADMIN=1 gh pr merge --admin 65 ...
+#
+#   So the hook must parse env assignments out of the command string
+#   before the `gh` token and treat them as if they were exported.
+#   nathanpayne-codex caught the bypass on PR #66 round 4: with the
+#   round-3 hook, both forms hit the early `^\s*gh(\s|$)` matcher,
+#   missed it, and exited 0 before any guard ran.
+#
+#   Round 4 fix: the early matcher now allows leading prefix material
+#   before `gh`, and the top-level token walk captures CODEX_CLEARED
+#   and BREAK_GLASS_ADMIN from the pre-gh tokens into INLINE_ vars.
+#   The merge guard then uses these as fallbacks if the hook's own
+#   environment doesn't have the corresponding variable set via
+#   `export`.
+#
 # Limitations (documented as known gaps):
 #
 #   - Backslash escapes inside double-quoted strings (`"with
@@ -84,14 +108,26 @@
 #     If gh adds new value-taking globals, the hook needs an
 #     update; misclassifying them as boolean would let the next
 #     token leak through as the subcommand.
+#
+#   - Other env vars in the inline prefix (anything other than
+#     CODEX_CLEARED and BREAK_GLASS_ADMIN) are skipped without
+#     interpretation. This is fine because no other env var is
+#     consulted by hook policy decisions.
 
 set -euo pipefail
 
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
-# Quick exit if not a gh command at all.
-if ! echo "$COMMAND" | grep -qE '^\s*gh(\s|$)'; then
+# Quick exit if there's no `gh` token in the command at all. This
+# uses a whitespace-bounded match rather than `^\s*gh` so that
+# leading prefix material (env assignments, `eval`, `time`, `sudo`,
+# compound separators like `;` followed by a space) doesn't bypass
+# the hook entirely. False positives where `gh` appears in the
+# middle of an unrelated command are caught downstream by the token
+# walk, which exits 0 if no `gh pr (create|merge)` subcommand is
+# present.
+if ! echo "$COMMAND" | grep -qE '(^|\s)gh(\s|$)'; then
   exit 0
 fi
 
@@ -122,11 +158,21 @@ done <<<"$TOKENS_OUTPUT"
 
 # --- detect the pr subcommand, capturing any global -R/--repo ---
 #
-# Walk tokens from `gh` looking for `pr`. Tokens between `gh` and
-# `pr` are global flags. The only global value-taking flag we
-# explicitly handle is `-R/--repo`; everything else starting with
-# `-` is assumed boolean and skipped. Once `pr` is found, the very
-# next token is the subcommand (`create`, `merge`, `view`, etc.).
+# Walk tokens from `gh` looking for `pr`. Tokens BEFORE `gh` are
+# checked for inline env assignments (CODEX_CLEARED=, BREAK_GLASS_ADMIN=)
+# so the documented `CODEX_CLEARED=1 gh pr merge ...` form works
+# even though the inline assignment doesn't escape into the hook
+# process environment. Other pre-gh tokens (env vars we don't
+# care about, `eval`, `time`, `sudo`, etc.) are skipped without
+# interpretation.
+#
+# Tokens between `gh` and `pr` are global flags. The only global
+# value-taking flag we explicitly handle is `-R/--repo`; everything
+# else starting with `-` is assumed boolean and skipped. Once `pr`
+# is found, the very next token is the subcommand (`create`,
+# `merge`, `view`, etc.).
+INLINE_CODEX_CLEARED=""
+INLINE_BREAK_GLASS_ADMIN=""
 GLOBAL_REPO=""
 PR_SUBCOMMAND=""
 SAW_GH=0
@@ -139,6 +185,15 @@ for tok in "${TOKENS[@]}"; do
     continue
   fi
   if [ "$SAW_GH" -eq 0 ]; then
+    # Pre-gh region: capture inline env assignments we care about.
+    case "$tok" in
+      CODEX_CLEARED=*)
+        INLINE_CODEX_CLEARED="${tok#CODEX_CLEARED=}"
+        ;;
+      BREAK_GLASS_ADMIN=*)
+        INLINE_BREAK_GLASS_ADMIN="${tok#BREAK_GLASS_ADMIN=}"
+        ;;
+    esac
     if [ "$tok" = "gh" ]; then
       SAW_GH=1
     fi
@@ -181,6 +236,12 @@ for tok in "${TOKENS[@]}"; do
   break
 done
 
+# Effective env values: hook process env wins (set via `export`),
+# inline-prefix value falls back. Both forms are documented; both
+# must work.
+EFFECTIVE_CODEX_CLEARED="${CODEX_CLEARED:-${INLINE_CODEX_CLEARED:-}}"
+EFFECTIVE_BREAK_GLASS_ADMIN="${BREAK_GLASS_ADMIN:-${INLINE_BREAK_GLASS_ADMIN:-}}"
+
 # Not a pr create/merge command? Allow.
 if [ "$PR_SUBCOMMAND" != "create" ] && [ "$PR_SUBCOMMAND" != "merge" ]; then
   exit 0
@@ -221,12 +282,12 @@ fi
 # `--admin` because the position doesn't matter and the token walk
 # below would also catch it; substring is simpler.
 if echo "$COMMAND" | grep -q '\-\-admin'; then
-  if [ "${BREAK_GLASS_ADMIN:-}" = "1" ]; then
+  if [ "$EFFECTIVE_BREAK_GLASS_ADMIN" = "1" ]; then
     echo "BREAK-GLASS: --admin merge authorized by human." >&2
     exit 0
   fi
   echo "BLOCKED: --admin merge requires explicit human authorization." >&2
-  echo "Ask the human to confirm break-glass, then retry with BREAK_GLASS_ADMIN=1." >&2
+  echo "Ask the human to confirm break-glass, then retry with BREAK_GLASS_ADMIN=1 (export or inline prefix)." >&2
   exit 2
 fi
 
@@ -319,10 +380,10 @@ fi
 
 case ",$LABELS," in
   *,needs-external-review,*)
-    if [ "${CODEX_CLEARED:-}" != "1" ]; then
+    if [ "$EFFECTIVE_CODEX_CLEARED" != "1" ]; then
       echo "BLOCKED: PR carries 'needs-external-review' and CODEX_CLEARED is not set." >&2
       echo "  Phase 4a merge gate: run 'scripts/codex-review-check.sh <PR#>' first." >&2
-      echo "  When it exits 0, retry this merge with CODEX_CLEARED=1 prefixed." >&2
+      echo "  When it exits 0, retry this merge with CODEX_CLEARED=1 (export or inline prefix)." >&2
       echo "  See REVIEW_POLICY.md § Phase 4a for the full flow." >&2
       exit 2
     fi
