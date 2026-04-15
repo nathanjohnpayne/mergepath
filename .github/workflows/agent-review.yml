@@ -477,7 +477,17 @@ jobs:
         id: cr
         run: |
           CONFIG=".github/review-policy.yml"
-          if sed -n '/^coderabbit:/,$ p' "$CONFIG" | grep -qE '^\s*enabled:\s*true'; then
+          # Parse only the `coderabbit:` block — stop at the next top-level key.
+          # The previous `sed -n '/^coderabbit:/,$ p'` was scope-unsafe: it
+          # captured everything from `coderabbit:` to EOF, so a later top-level
+          # block with `enabled: true` (e.g., the `codex:` block added in #31)
+          # produced a false positive and triggered the CodeRabbit wait loop.
+          if awk '
+            /^coderabbit:/ {in_block=1; next}
+            in_block && /^[^[:space:]]/ {in_block=0}
+            in_block && /^[[:space:]]*enabled:[[:space:]]*true([[:space:]]*#.*)?$/ {found=1}
+            END {exit found ? 0 : 1}
+          ' "$CONFIG"; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
