@@ -14,6 +14,14 @@ Read these files in order before taking any action:
 3. Relevant `specs/` files — intended behavior
 4. `.ai_context.md` — supplemental system context
 
+## Code Review Policy
+
+Every change in this repository goes through the policy in `REVIEW_POLICY.md`,
+including a self-peer review by the authoring agent's reviewer identity and,
+for changes that cross the threshold or touch protected paths, automated
+external review via the OpenAI Codex GitHub app (Phase 4a) or a manual CLI
+fallback (Phase 4b).
+
 ## Key Files
 
 | File | Purpose |
