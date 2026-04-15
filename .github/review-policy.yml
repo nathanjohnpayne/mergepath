@@ -85,3 +85,74 @@ author_identity: nathanjohnpayne
 # and will skip Phase 2.5 automatically.
 coderabbit:
   enabled: false
+
+# ---------------------------------------------------------------------------
+# Codex (Automated External Review — Phase 4a)
+# ---------------------------------------------------------------------------
+# When enabled, the OpenAI Codex GitHub App provides automated external review
+# on PRs carrying the `needs-external-review` label. The agent posts
+# `@codex review` as a PR comment; Codex responds with a standard GitHub code
+# review as `chatgpt-codex-connector[bot]`.
+#
+# This replaces the human-shuttled Phase 4 external review on the happy path.
+# On timeout, disagreement, or runaway, the flow falls back to the manual
+# CLI path described in REVIEW_POLICY.md § Phase 4b.
+#
+# Prerequisite: the ChatGPT Codex Connector GitHub App must be installed on
+# the repository with Code Review enabled at
+# https://chatgpt.com/codex/cloud/settings/code-review.
+#
+# The agent MUST:
+#   1. Run `scripts/codex-review-request.sh <PR#>` to post the trigger
+#      comment and poll for the Codex review.
+#   2. Parse the returned JSON. Address each P0/P1 finding with a fix OR
+#      a reply explaining why the finding does not apply.
+#   3. Repeat up to `max_review_rounds`. On runaway (round > max), escalate
+#      to the human per REVIEW_POLICY.md § Disagreements and Tiebreaking.
+#   4. On timeout (silence within `review_timeout_seconds`), the script
+#      exits with code 4 (FALLBACK_REQUIRED). The agent then falls back
+#      to the manual handoff in REVIEW_POLICY.md § Phase 4b, targeting
+#      `cli_login` below.
+#   5. Before merging, run `scripts/codex-review-check.sh <PR#>` to verify
+#      the merge gate. All of the following must hold:
+#        a) required CI checks are green
+#        b) an approving review from a registered reviewer identity
+#           (`available_reviewers`) is present on the PR
+#        c) Codex has signaled clearance on the current HEAD in one of two
+#           forms — NEVER an `APPROVED` review state, because the Codex
+#           GitHub App does not post `APPROVED` reviews:
+#            - a `COMMENTED` review from `chatgpt-codex-connector[bot]`
+#              on or after the latest commit, with no unaddressed P0/P1
+#              inline findings on the `/pulls/{pr}/comments` endpoint, OR
+#            - a 👍 / `+1` reaction from `chatgpt-codex-connector[bot]`
+#              on the PR issue, posted after the latest commit
+#      See #29 for the observational evidence behind this behavior.
+codex:
+  enabled: true
+
+  # GitHub login of the Codex GitHub App bot. Reviews posted by this login
+  # satisfy the external-review requirement in `.github/workflows/pr-audit.yml`.
+  # Do not change unless OpenAI renames the app. Confirmed via GitHub API
+  # metadata; see issue #26 for the audit trail.
+  bot_login: "chatgpt-codex-connector[bot]"
+
+  # Fallback CLI reviewer identity used when the Codex App path times out.
+  # This identity posts reviews manually via the Codex CLI as a human-driven
+  # Phase 4b handoff. Must be a member of `available_reviewers` above.
+  cli_login: nathanpayne-codex
+
+  # Maximum number of `@codex review` rounds before escalating as runaway.
+  # The 3rd round trips the guard. Normal termination is either approval,
+  # disagreement (repeat-after-rebuttal), or timeout → Phase 4b fallback.
+  max_review_rounds: 2
+
+  # Poll timeout per round, in seconds, for `codex-review-request.sh`.
+  # If Codex has not posted a review within this window, treat as timeout
+  # and exit with code 4. Silence is NEVER treated as implicit approval;
+  # see issue #27 for the explicit-review-required decision.
+  review_timeout_seconds: 600
+
+  # When true, `codex-review-check.sh` requires all required CI checks to
+  # report green before allowing merge. Strongly recommended; do not disable
+  # without explicit human authorization.
+  require_ci_green: true
