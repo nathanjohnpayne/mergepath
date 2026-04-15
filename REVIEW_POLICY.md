@@ -143,7 +143,7 @@ Before moving past Phase 2.5, confirm all of the following:
 
 8. After internal review passes, the agent evaluates whether the PR meets the external review threshold (see [Review Policy Configuration](#review-policy-configuration)).
 9. If the threshold is **not** met, the agent merges the PR as `nathanjohnpayne`. Done.
-10. If the threshold **is** met, the agent posts a **handoff message** (see [Handoff Message Format](#handoff-message-format)) as a PR comment and alerts the human.
+10. If the threshold **is** met, the agent proceeds to [Phase 4: External Review](#phase-4-external-review). Phase 4 itself routes the PR to Phase 4a (automated, via the Codex GitHub App) or Phase 4b (manual handoff) based on `codex.enabled` in `.github/review-policy.yml` and on whether 4a's automated loop converges. The agent does NOT post a handoff message directly from this step — Phase 4b posts its own handoff message if and when the fallback path is taken.
 
 ### Phase 4: External Review
 
@@ -180,7 +180,7 @@ An agent proceeds to 4a first. If 4a escalates or is disabled, the agent falls b
      - **Clearance (happy path).** Codex posts a review with no unaddressed P0/P1 inline findings on the current HEAD, OR reacts 👍 on or after the current HEAD commit. Proceed to step 16a.
      - **Disagreement (escalate).** Codex re-flags the same finding after the agent posted a rebuttal. This is "repeat-after-rebuttal." See [Disagreements and Tiebreaking](#disagreements-and-tiebreaking).
      - **Runaway (escalate).** The round counter exceeds `codex.max_review_rounds` (default: 2). The 3rd round trips this guard. See [Disagreements and Tiebreaking](#disagreements-and-tiebreaking).
-     - **Second consecutive timeout (fall back).** Two rounds in a row exit with code 4. The agent falls back to Phase 4b.
+     - **Timeout (fall back).** `codex-review-request.sh` exits with code `4` (`FALLBACK_REQUIRED`) for the current round. The agent falls back to Phase 4b. There is no "second timeout" escalation — a single timeout already routes to human mediation via the 4b handoff.
 
 16a. Before merging, the agent runs `scripts/codex-review-check.sh <PR#>` to verify the merge gate. All of the following must be true:
 
@@ -339,27 +339,28 @@ When the internal reviewer and external reviewer disagree on whether code is rea
 
 ### Concrete detection signals (Phase 4a)
 
-In Phase 4a, the agent escalates to the human when any one of the following fires:
+In Phase 4a, the agent escalates to the human when either of the following fires:
 
 1. **Repeat-after-rebuttal.** The agent posted a reply to a Codex inline finding explaining why the finding does not apply. Codex's next review re-flags the same or substantively-equivalent finding. The agent treats this as a disagreement: Codex is not convinced by the rebuttal, and the agent stops trying to change Codex's mind autonomously. Continuing the loop past this point is rude to the reviewer and wastes API calls.
 
 2. **Runaway rounds.** The round counter exceeds `codex.max_review_rounds` (default: 2). The 3rd `@codex review` request trips this guard. This catches cases where Codex keeps finding new, distinct issues on each pass without the review converging. Even if each individual finding is valid, three rounds of novel issues is a signal that the PR scope is too broad and a human should weigh in.
 
-3. **Second consecutive timeout.** `codex-review-request.sh` exits with code `2` (timeout) on two consecutive rounds of the same PR. A single timeout is not a disagreement — it triggers a graceful fallback to Phase 4b per step 15a above. Two timeouts in a row indicates the Codex path is broken beyond the normal retry and warrants human attention rather than another silent fallback.
+**Timeout is NOT a disagreement signal.** A Codex response timeout (`codex-review-request.sh` exit code `4` = `FALLBACK_REQUIRED`) routes the PR directly to Phase 4b per step 15a above. It is a fallback trigger, not a tiebreaker trigger. Phase 4b itself mediates via the human through the manual handoff, so there is nothing for the disagreement detector to add on top.
 
 Phase 4b escalation (the traditional cross-agent CLI flow) uses the human's judgment directly — there is no automated detection loop to fire, so this subsection does not apply there.
 
 ### Escalation procedure
 
-When any of the three signals above fires, the agent:
+When either of the two signals above fires, the agent:
 
 1. **Stops the automated loop immediately.** Does NOT push more commits, does NOT re-run `@codex review`, does NOT run the merge gate, does NOT merge.
 2. **Posts a comment on the PR** summarizing:
    - Which signal fired and what triggered it
    - Both positions (the agent's and Codex's) in plain language, with links to the specific review rounds and the rebuttal replies
    - The current round counter and a link to the `scripts/codex-review-request.sh` output from the terminating round
-3. **If the trigger was a second consecutive timeout**, also posts the handoff message per [Handoff Message Format](#handoff-message-format), since the forward path is Phase 4b rather than human resolution in place.
-4. **Alerts the human via chat** and waits for an explicit decision before taking any further action on the PR.
+3. **Alerts the human via chat** and waits for an explicit decision before taking any further action on the PR.
+
+Note that timeout does NOT go through this escalation procedure. On a timeout (exit code `4` from `codex-review-request.sh`), the agent posts the handoff message per [Handoff Message Format](#handoff-message-format) and routes to Phase 4b directly from step 15a — no in-place tiebreaker.
 
 The human resolves by one of:
 
