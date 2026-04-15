@@ -65,17 +65,30 @@ explicitly authorizes a break-glass override in chat.
    - `codex.enabled: true` in `.github/review-policy.yml`
    - BOTH `scripts/codex-review-request.sh` AND
      `scripts/codex-review-check.sh` exist on disk
-   - The **ChatGPT Codex Connector GitHub App is installed on this
-     repository** with Code Review enabled at
-     [chatgpt.com/codex/cloud/settings/code-review](https://chatgpt.com/codex/cloud/settings/code-review).
-     Verify with `gh api repos/{owner}/{repo}/installation` or by
-     checking that a recent PR in this repo received an auto-review
-     from `chatgpt-codex-connector[bot]`. If the App is not installed,
-     any `@codex review` trigger will sit unanswered until it times out,
-     wasting a round-trip.
+   - The **ChatGPT Codex Connector GitHub App is review-ready on this
+     repository**. "Review-ready" is strictly stronger than
+     "installed": the App must be installed, Code Review must be
+     enabled at
+     [chatgpt.com/codex/cloud/settings/code-review](https://chatgpt.com/codex/cloud/settings/code-review),
+     AND a Codex environment must be configured at
+     [chatgpt.com/codex/cloud/settings/environments](https://chatgpt.com/codex/cloud/settings/environments).
+     Without the environment, Codex may post a "create an environment
+     for this repo" comment instead of a review, even though the App
+     is present (observed on PR #62 on 2026-04-14). Treat the App as
+     not review-ready until all three pieces are in place.
 
-   If any of the three conditions is false (partial rollout, Codex
-   not enabled, App not installed, either helper script missing), fall
+     **Verification from an agent identity.** The only reliable check
+     is observational: has a recent PR in this repo received an
+     auto-review from `chatgpt-codex-connector[bot]` within the last
+     few hours? If yes, the App is review-ready. If no, check the
+     two settings pages above manually, or test with a small throwaway
+     PR before routing real work through Phase 4a. **Do NOT use
+     `gh api repos/{owner}/{repo}/installation`** as a check — that
+     endpoint requires a GitHub App JWT and returns `401 "A JSON web
+     token could not be decoded"` for normal user/reviewer PATs.
+
+   If any of these conditions is false (Codex not enabled, either
+   helper script missing, or the Codex App is not review-ready), fall
    back to Phase 4b directly rather than entering 4a and stalling:
 
    a. Run `scripts/codex-review-request.sh <PR#>`. It posts `@codex review`
@@ -104,7 +117,7 @@ explicitly authorizes a break-glass override in chat.
 
    **Phase 4b — Manual CLI fallback.** Applies when Phase 4a is
    unavailable (`codex.enabled: false`, either helper script missing,
-   or 4a fell back via exit code 4):
+   Codex App not review-ready, or 4a fell back via exit code 4):
 
    a. Post the handoff message per REVIEW_POLICY.md § Handoff Message
       Format as a PR comment.
