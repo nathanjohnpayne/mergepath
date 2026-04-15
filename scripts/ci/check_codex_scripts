@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# check_codex_scripts
+#
+# Verifies that the Phase 4a Codex helper scripts are present and
+# executable. Both are required for `CLAUDE.md` step 8 Phase 4a to
+# be able to run, and both are referenced by the gh-pr-guard.sh hook
+# and REVIEW_POLICY.md § Phase 4a. Missing either script breaks the
+# automated external-review flow and silently drops callers to the
+# Phase 4b manual CLI fallback.
+#
+# Enforces the `rules/repo_rules.md` § CI Enforcement entry for
+# these scripts. See issue #38 and Project #2 for the broader
+# context.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+REQUIRED_SCRIPTS=(
+  "scripts/codex-review-request.sh"
+  "scripts/codex-review-check.sh"
+)
+
+FAILED=0
+
+for rel in "${REQUIRED_SCRIPTS[@]}"; do
+  full="$REPO_ROOT/$rel"
+  if [[ ! -f "$full" ]]; then
+    echo "FAIL: Missing required Codex helper script: $rel"
+    FAILED=1
+    continue
+  fi
+  if [[ ! -x "$full" ]]; then
+    echo "FAIL: Codex helper script is not executable: $rel"
+    echo "      Fix with: chmod +x $rel"
+    FAILED=1
+  fi
+done
+
+if [[ $FAILED -eq 1 ]]; then
+  echo "check_codex_scripts: FAIL"
+  exit 1
+fi
+
+echo "check_codex_scripts: PASS"
+exit 0
