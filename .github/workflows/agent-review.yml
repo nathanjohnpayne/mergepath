@@ -54,12 +54,18 @@ jobs:
           # protected-paths check never fired, and draft→ready PRs touching
           # `.github/**` / `src/auth/**` / etc. merged without the
           # `needs-external-review` label on every agent-review run. See #54.
+          # `jq -c` (compact) is required here: multi-line JSON cannot be
+          # written via the `key=value` GITHUB_OUTPUT format. Before #54
+          # fixed the awk extractor, PATHS was always an empty array `[]`
+          # (single-line) so this latent bug was hidden; the first PR that
+          # exercised the pipeline after #55 merged (PR #58 / #30) blew up
+          # on load-config with "Invalid format '  \"src/auth/**\",'".
           PATHS=$(awk '
             /^external_review_paths:/ {in_block=1; next}
             in_block && /^[^[:space:]#]/ {in_block=0}
             in_block && /^ *-/ {print}
           ' "$CONFIG" | sed 's/^ *- *"//' | sed 's/"$//' \
-            | jq -R -s 'split("\n") | map(select(length > 0))')
+            | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "paths=$PATHS" >> "$GITHUB_OUTPUT"
 
           # Extract available_reviewers as JSON array using the same
@@ -67,12 +73,13 @@ jobs:
           # fix, REVIEWERS was always an empty JSON array, which silently
           # broke the assign step's reviewer lookup and left PRs with no
           # assigned reviewer identity.
+          # `jq -c` for the same GITHUB_OUTPUT reason as PATHS above.
           REVIEWERS=$(awk '
             /^available_reviewers:/ {in_block=1; next}
             in_block && /^[^[:space:]#]/ {in_block=0}
             in_block && /^ *-/ {print}
           ' "$CONFIG" | sed 's/^ *- *//' \
-            | jq -R -s 'split("\n") | map(select(length > 0))')
+            | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "reviewers=$REVIEWERS" >> "$GITHUB_OUTPUT"
 
           AUTHOR=$(grep 'author_identity:' "$CONFIG" | awk '{print $2}')
