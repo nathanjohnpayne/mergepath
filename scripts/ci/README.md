@@ -13,6 +13,7 @@ Local scripts:
 - `check_dist_not_modified`
 - `check_spec_test_alignment`
 - `check_duplicate_docs`
+- `check_codex_scripts` — verifies `scripts/codex-review-request.sh` and `scripts/codex-review-check.sh` exist and are executable (Phase 4a helper-script presence check)
 
 Inline in `repo_lint.yml` (no local script):
 
