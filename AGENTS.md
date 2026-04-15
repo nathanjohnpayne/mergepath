@@ -38,15 +38,18 @@ This repository uses a multi-identity AI agent code review system. The full poli
    b. **Read both endpoints:** PR-level comments (`gh api repos/{owner}/{repo}/issues/{pr}/comments`) and inline diff comments (`gh api repos/{owner}/{repo}/pulls/{pr}/comments`).
    c. **Grep inline comments** for `Potential issue` or `⚠️` — these must each be explicitly addressed (fixed or dismissed with reasoning).
    d. Address other substantive findings. CodeRabbit review is advisory and does not block merge.
-6. Check .github/review-policy.yml for the external review threshold. If the PR meets the threshold (lines changed >= external_review_threshold OR files match external_review_paths), post a handoff message (see REVIEW_POLICY.md for format) and alert the human.
-7. If external review is not required, merge as nathanjohnpayne.
-8. If external review is required, wait for the human to relay external reviewer feedback. Resolve all issues through back-and-forth until the external reviewer approves.
-9. If the external reviewer flags observations or risks while approving, create a GitHub Issue for each one assigned to nathanjohnpayne with labels "post-review" and "observation" or "risk" before merging.
-10. Merge as nathanjohnpayne.
+6. Check .github/review-policy.yml for the external review threshold. If the PR does NOT meet it (lines changed < external_review_threshold AND no file matches external_review_paths), merge as nathanjohnpayne. Done.
+7. If the PR meets the threshold, proceed to Phase 4 (see REVIEW_POLICY.md § Phase 4). Phase 4 has two legs:
+   - **Phase 4a — Automated (preferred)** when `codex.enabled: true` AND both `scripts/codex-review-request.sh` AND `scripts/codex-review-check.sh` exist on disk. Drive the Codex GitHub App review loop: post `@codex review` via the request script, address P0/P1 findings (fix code or rebuttal reply), loop up to `codex.max_review_rounds`. On clearance (COMMENTED review with no unaddressed findings OR 👍 reaction from `chatgpt-codex-connector[bot]` on the current HEAD), run `scripts/codex-review-check.sh` to verify the merge gate and merge. On exit code 4 (timeout), drop to Phase 4b. On repeat-after-rebuttal or round > `max_review_rounds`, escalate per § Disagreements below. If either helper script is missing (partial rollout), fall back to Phase 4b directly rather than entering 4a.
+   - **Phase 4b — Manual CLI fallback** when 4a is unavailable or 4a fell back. Post the handoff message (see REVIEW_POLICY.md § Handoff Message Format) and wait for an external reviewer identity (e.g., nathanpayne-codex) to post an `APPROVED` review via a separate agent CLI session. Address feedback via back-and-forth.
+8. If the external reviewer flags observations or risks while approving, create a GitHub Issue for each one assigned to nathanjohnpayne with labels "post-review" and "observation" or "risk" before merging.
+9. Merge as nathanjohnpayne.
 
 ### Disagreements
 
-If the internal reviewer and external reviewer disagree, the human is the tiebreaker. Surface both positions clearly and wait.
+If the internal reviewer and external reviewer disagree on whether code is ready to merge, the human is the tiebreaker. Surface both positions clearly and wait.
+
+In Phase 4a specifically, the agent escalates automatically on either of two signals: **repeat-after-rebuttal** (Codex re-flags a finding after the agent posted a rebuttal reply) or **runaway rounds** (round counter exceeds `codex.max_review_rounds`, default 2). On escalation, the agent stops the loop, posts a comment on the PR summarizing both positions with links to the review rounds, alerts the human, and does not merge. Timeout (exit code `4` from `codex-review-request.sh`) is NOT a disagreement — it falls back to Phase 4b directly. Full detail in REVIEW_POLICY.md § Disagreements and Tiebreaking.
 
 ### Adding a New Agent
 

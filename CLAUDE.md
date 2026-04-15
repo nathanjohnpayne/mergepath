@@ -52,10 +52,57 @@ explicitly authorizes a break-glass override in chat.
 ## Before merging
 
 8. Check `.github/review-policy.yml` for the external review threshold.
-   If the PR meets the threshold (lines changed ≥ threshold OR files match
-   external_review_paths), post the handoff message and alert the human.
-   Do NOT merge — wait for external review.
-9. If external review is not required, merge as nathanjohnpayne.
+   If the PR does NOT meet it (lines changed < `external_review_threshold`
+   AND no file matches `external_review_paths`), merge as nathanjohnpayne.
+   Done.
+
+9. If the PR meets the threshold, it enters Phase 4 external review.
+   See REVIEW_POLICY.md § Phase 4 for the canonical procedure. Short form:
+
+   **Phase 4a — Automated (preferred).** Applies when
+   `codex.enabled: true` in `.github/review-policy.yml` AND **both**
+   `scripts/codex-review-request.sh` AND `scripts/codex-review-check.sh`
+   exist on disk. If only one script is present (a partial rollout),
+   fall back to Phase 4b instead of entering 4a and stalling at the
+   merge-gate step:
+
+   a. Run `scripts/codex-review-request.sh <PR#>`. It posts `@codex review`
+      (or skips the trigger if Codex already auto-reviewed on open) and
+      polls for a response from `chatgpt-codex-connector[bot]`.
+   b. Parse the JSON output. Address each P0/P1 inline finding by either
+      fixing the code and pushing a new commit, OR posting a reply on the
+      finding thread with a clear rebuttal. Increment the round counter.
+   c. Re-run `scripts/codex-review-request.sh` for the next round. Loop
+      until Codex clears (COMMENTED review with no unaddressed P0/P1 on
+      current HEAD, OR 👍 reaction on the PR issue).
+   d. On exit code `4` (FALLBACK_REQUIRED, timeout), stop 4a and drop to
+      Phase 4b below.
+   e. On disagreement (repeat-after-rebuttal) or runaway (round counter
+      exceeds `codex.max_review_rounds`), escalate per REVIEW_POLICY.md
+      § Disagreements and Tiebreaking: stop the loop, post a summary
+      comment on the PR with both positions, alert the human, do NOT merge.
+   f. On clearance, run `scripts/codex-review-check.sh <PR#>` to verify
+      the merge gate (CI green + internal reviewer approved + Codex
+      cleared on current HEAD). The merge gate does NOT require an
+      `APPROVED` review state from the Codex bot — the app never emits
+      one. If the gate passes, merge as nathanjohnpayne with
+      `gh pr merge --squash --delete-branch`.
+
+   **Phase 4b — Manual CLI fallback.** Applies when Phase 4a is
+   unavailable (`codex.enabled: false`, either helper script missing,
+   or 4a fell back via exit code 4):
+
+   a. Post the handoff message per REVIEW_POLICY.md § Handoff Message
+      Format as a PR comment.
+   b. Alert the human via chat. The human takes the handoff to a
+      different agent CLI session (typically `nathanpayne-codex`), which
+      posts an external review.
+   c. Address feedback via the usual nathanjohnpayne commit loop.
+   d. Wait for the external reviewer identity to post an `APPROVED` review.
+   e. If the external reviewer flags observations or risks, file the
+      post-merge GitHub Issues per step 11 below.
+   f. Merge as nathanjohnpayne.
+
 10. Never use `--admin` to merge unless the human explicitly authorizes it
     in chat as a break-glass exception. The hook will block it otherwise.
 
