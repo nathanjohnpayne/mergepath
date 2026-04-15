@@ -158,82 +158,161 @@ done <<<"$TOKENS_OUTPUT"
 
 # --- detect the pr subcommand, capturing any global -R/--repo ---
 #
-# Walk tokens from `gh` looking for `pr`. Tokens BEFORE `gh` are
-# checked for inline env assignments (CODEX_CLEARED=, BREAK_GLASS_ADMIN=)
-# so the documented `CODEX_CLEARED=1 gh pr merge ...` form works
-# even though the inline assignment doesn't escape into the hook
-# process environment. Other pre-gh tokens (env vars we don't
-# care about, `eval`, `time`, `sudo`, etc.) are skipped without
-# interpretation.
+# Walk tokens to find `gh` IN COMMAND POSITION, then identify the
+# subcommand and any global -R/--repo. The pre-gh walk runs as a
+# small state machine so we don't blindly skip ANY pre-gh token —
+# round 5 had that bug, and nathanpayne-codex caught that
+# `echo gh pr merge 66` and `printf %s gh pr merge 66` were treated
+# as real merges.
 #
-# Tokens between `gh` and `pr` are global flags. The only global
-# value-taking flag we explicitly handle is `-R/--repo`; everything
-# else starting with `-` is assumed boolean and skipped. Once `pr`
-# is found, the very next token is the subcommand (`create`,
-# `merge`, `view`, etc.).
+# State machine:
+#
+#   AT_COMMAND_POSITION (initial state):
+#     The next token is either the command name or a continuation
+#     that keeps us in command position. Allowed continuations:
+#       - env assignments         VAR=value
+#       - prefix commands         sudo, eval, time, nohup, env,
+#                                 command, exec, nice, ionice
+#       - flags of those prefixes -X
+#       - compound separators     ;  &&  ||  |  &  (
+#       - gh                      → transition to phase 2
+#     Any other token is treated as the START of a non-gh command,
+#     and we transition to IN_UNRELATED_ARGS to skip its arguments.
+#
+#   IN_UNRELATED_ARGS:
+#     We're walking the arguments of a non-gh command. Skip
+#     everything until we hit a compound separator, at which point
+#     we're back in command position. End-of-input without finding
+#     gh in command position falls through to the post-walk check
+#     and exits 0.
+#
+# Tokens BEFORE `gh` (in either state) that match an env assignment
+# pattern are also captured into INLINE_CODEX_CLEARED /
+# INLINE_BREAK_GLASS_ADMIN, even when in IN_UNRELATED_ARGS — the
+# inline-env-prefix support from round 5 should keep working
+# regardless of whether the env assignment turns out to be for a
+# gh command or some other command. (Capturing for non-gh commands
+# is harmless: the EFFECTIVE_* values are only consulted by the
+# create/merge guards, which only run when SAW_GH=1.)
+#
+# Tokens BETWEEN `gh` and `pr` are global gh flags. The only global
+# value-taking flag we explicitly handle is -R/--repo; everything
+# else starting with - is assumed boolean and skipped.
 INLINE_CODEX_CLEARED=""
 INLINE_BREAK_GLASS_ADMIN=""
 GLOBAL_REPO=""
 PR_SUBCOMMAND=""
 SAW_GH=0
 SAW_PR=0
-SKIP_GLOBAL_AS=""  # "" | "repo"
+SKIP_GLOBAL_AS=""        # "" | "repo"
+AT_COMMAND_POSITION=1    # 1 = at command position, 0 = walking unrelated-command args
 for tok in "${TOKENS[@]}"; do
-  if [ "$SKIP_GLOBAL_AS" = "repo" ]; then
-    GLOBAL_REPO="$tok"
-    SKIP_GLOBAL_AS=""
-    continue
-  fi
-  if [ "$SAW_GH" -eq 0 ]; then
-    # Pre-gh region: capture inline env assignments we care about.
-    case "$tok" in
-      CODEX_CLEARED=*)
-        INLINE_CODEX_CLEARED="${tok#CODEX_CLEARED=}"
-        ;;
-      BREAK_GLASS_ADMIN=*)
-        INLINE_BREAK_GLASS_ADMIN="${tok#BREAK_GLASS_ADMIN=}"
-        ;;
-    esac
-    if [ "$tok" = "gh" ]; then
-      SAW_GH=1
+  # --- phase 2: walking after gh, looking for pr + subcommand ---
+  if [ "$SAW_GH" -eq 1 ]; then
+    if [ "$SKIP_GLOBAL_AS" = "repo" ]; then
+      GLOBAL_REPO="$tok"
+      SKIP_GLOBAL_AS=""
+      continue
     fi
+    if [ "$SAW_PR" -eq 0 ]; then
+      case "$tok" in
+        pr)
+          SAW_PR=1
+          continue
+          ;;
+        -R|--repo)
+          SKIP_GLOBAL_AS="repo"
+          continue
+          ;;
+        -R=*)
+          GLOBAL_REPO="${tok#-R=}"
+          continue
+          ;;
+        --repo=*)
+          GLOBAL_REPO="${tok#--repo=}"
+          continue
+          ;;
+        -*)
+          # Unknown global flag — assume boolean (--help,
+          # --version, etc.) and skip. See "Limitations" in the
+          # header for the caveat about future value-taking
+          # globals.
+          continue
+          ;;
+        *)
+          # Non-flag, non-pr token before `pr`. Either gh aliases
+          # are in play (out of scope) or the command isn't a `gh
+          # pr` invocation. Allow.
+          exit 0
+          ;;
+      esac
+    fi
+    # SAW_PR=1 — this token IS the pr subcommand.
+    PR_SUBCOMMAND="$tok"
+    break
+  fi
+
+  # --- phase 1: walking pre-gh, looking for gh in command position ---
+
+  # Capture inline env assignments regardless of state. Doing it
+  # here means a `CODEX_CLEARED=1 sudo gh pr merge 65` or even
+  # `cat foo; CODEX_CLEARED=1 gh pr merge 65` form still picks up
+  # the inline value when gh is eventually found.
+  case "$tok" in
+    CODEX_CLEARED=*)
+      INLINE_CODEX_CLEARED="${tok#CODEX_CLEARED=}"
+      ;;
+    BREAK_GLASS_ADMIN=*)
+      INLINE_BREAK_GLASS_ADMIN="${tok#BREAK_GLASS_ADMIN=}"
+      ;;
+  esac
+
+  # Compound separators always reset us to command position,
+  # whether we were in command position or skipping unrelated
+  # args. Only standalone `&&` / `||` / `;` / `|` / `&` / `(`
+  # tokens count — separators glommed onto adjacent words by
+  # missing whitespace (e.g. `foo;`) are NOT detected, which is
+  # an acceptable limitation for the agent flow.
+  case "$tok" in
+    "&&"|"||"|";"|"|"|"&"|"("|")")
+      AT_COMMAND_POSITION=1
+      continue
+      ;;
+  esac
+
+  if [ "$AT_COMMAND_POSITION" -eq 0 ]; then
+    # Skipping arguments of an unrelated command. Stay until a
+    # separator resets us above.
     continue
   fi
-  if [ "$SAW_PR" -eq 0 ]; then
-    case "$tok" in
-      pr)
-        SAW_PR=1
-        continue
-        ;;
-      -R|--repo)
-        SKIP_GLOBAL_AS="repo"
-        continue
-        ;;
-      -R=*)
-        GLOBAL_REPO="${tok#-R=}"
-        continue
-        ;;
-      --repo=*)
-        GLOBAL_REPO="${tok#--repo=}"
-        continue
-        ;;
-      -*)
-        # Unknown global flag — assume boolean (--help, --version,
-        # etc.) and skip. See "Limitations" in the header for the
-        # caveat about future value-taking globals.
-        continue
-        ;;
-      *)
-        # Non-flag, non-pr token before `pr`. Either gh aliases
-        # are in play (out of scope) or the command isn't a `gh
-        # pr` invocation. Allow.
-        exit 0
-        ;;
-    esac
-  fi
-  # SAW_PR=1 — this token IS the pr subcommand.
-  PR_SUBCOMMAND="$tok"
-  break
+
+  case "$tok" in
+    [A-Za-z_]*=*)
+      # Env assignment. Stay in command position.
+      continue
+      ;;
+    sudo|eval|time|nohup|env|command|exec|nice|ionice)
+      # Known prefix command. Stay in command position so the
+      # next non-flag token is still treated as the command.
+      continue
+      ;;
+    -*)
+      # Flag of a prefix command (e.g. `sudo -E`, `time -f ...`).
+      # Stay in command position.
+      continue
+      ;;
+    gh)
+      SAW_GH=1
+      continue
+      ;;
+    *)
+      # An unrelated command (echo, printf, cat, find, etc.).
+      # gh-as-an-argument should NOT trigger the hook;
+      # transition to skip mode and walk past the args.
+      AT_COMMAND_POSITION=0
+      continue
+      ;;
+  esac
 done
 
 # Effective env values: hook process env wins (set via `export`),
