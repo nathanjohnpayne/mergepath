@@ -133,39 +133,113 @@ fi
 
 # --- tokenize the command with shell-quote awareness ---
 #
-# xargs honors POSIX single and double quoting. `gh pr merge
+# Use python3 shlex.split which honors POSIX single and double
+# quoting AND handles multi-line quoted strings. `gh pr merge
 # --body "hello world" 65` tokenizes correctly to (gh, pr, merge,
-# --body, hello world, 65) instead of being naively split into
-# (gh, pr, merge, --body, "hello, world", 65).
+# --body, hello world, 65), and `gh pr create --body "Authoring-
+# Agent: claude\n## Self-Review\nok"` (with literal newlines in
+# the body) also tokenizes correctly because shlex.split treats
+# newlines inside quotes as literal characters, not as token
+# separators.
 #
-# IMPORTANT: pass `printf '%s\n'` as the explicit command. The
-# default `xargs` command is `echo`, and `echo` treats tokens
-# beginning with `-` (specifically `-n`, `-e`, `-E`) as ITS OWN
-# flags rather than printing them. That means a naive `xargs -n 1`
-# silently drops `-n` from the token stream, which broke the
-# pre-gh walk for inputs like `nice -n 5 gh pr merge 65` (the
-# `-n` was missing entirely, so the walk treated `5` as the
-# next command and switched to in_unrelated_args mode, missing
-# the real `gh` command). Using `printf '%s\n'` instead of the
-# implicit echo preserves every token literally.
+# Earlier versions used `xargs -n 1` (with the implicit `echo`
+# command), which:
+#   - Silently drops -n / -e / -E (echo's own flags). Codex caught
+#     this on PR #66 round 6 and the workaround was `xargs -n 1
+#     printf '%s\n'`.
+#   - Treats embedded newlines as token separators, breaking
+#     valid `gh pr create --body "...multiline..."` invocations.
+#     Codex caught this on nathanpaynedotcom propagation PR #180
+#     round 4. xargs has no flag to disable this behavior; the
+#     fix is to switch tokenizers entirely.
+#
+# python3 is available on macOS 12+ by default and on every Linux
+# distro the agent flow runs on. Python startup cost is ~50ms per
+# invocation; acceptable for a hook that already does an API call.
 #
 # Fails CLOSED on tokenization error (unmatched quote, bad escape).
 # An agent should fix the malformed command and retry.
-TOKENS_OUTPUT=""
-if ! TOKENS_OUTPUT=$(printf '%s' "$COMMAND" | xargs -n 1 printf '%s\n' 2>&1); then
+#
+# python3 emits tokens NUL-delimited so bash's read -d '' can
+# preserve embedded newlines. The output goes via a tempfile
+# rather than $(...) command substitution because bash command
+# substitution silently strips NUL bytes from its capture buffer,
+# which would re-jam all tokens together. Earlier versions used
+# newline-delimited output via print(tok), which silently SPLIT
+# any token containing a literal newline (e.g., the body of a
+# `gh pr create --body "Authoring-Agent: claude\n## Self-Review
+# \nok"`) into multiple bash tokens. Codex caught the bash-side
+# split on nathanpaynedotcom propagation PR #180 round 5.
+TMP_TOKENS=$(mktemp)
+TMP_TOKENS_ERR=$(mktemp)
+trap 'rm -f "$TMP_TOKENS" "$TMP_TOKENS_ERR"' EXIT
+# The python preprocessor first converts UNQUOTED newlines into `;`
+# command separators (so that multi-command inputs like
+# `echo ok\ngh pr merge 123 --admin` are split into two commands)
+# while preserving QUOTED newlines as literal characters in the
+# token (so that `gh pr create --body "line1\nline2"` keeps the
+# body as one token). Codex caught the unquoted-newline collapse
+# on swipewatch propagation PR #33 round 6 — privilege escalation
+# via newline-separated prefix command was the same shape as the
+# round-5 echo-prefix env spoof, just on a different separator.
+if ! printf '%s' "$COMMAND" | python3 -c '
+import sys, shlex
+
+def normalize_unquoted_newlines(cmd):
+    """Replace newlines OUTSIDE of single/double quotes with `; `.
+    Preserves newlines inside quoted strings as literal characters."""
+    out = []
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(cmd):
+        c = cmd[i]
+        # Handle backslash-escaped char in double quotes / unquoted
+        if c == "\\" and not in_single and i + 1 < len(cmd):
+            out.append(c)
+            out.append(cmd[i + 1])
+            i += 2
+            continue
+        # chr(39) is a single quote; using chr() avoids embedding a
+        # literal single quote inside the bash heredoc (which would
+        # break the python3 -c '...' surrounding quote).
+        if c == chr(39) and not in_double:
+            in_single = not in_single
+        elif c == chr(34) and not in_single:
+            in_double = not in_double
+        elif c == "\n" and not in_single and not in_double:
+            # Pad with spaces on BOTH sides so shlex parses the
+            # `;` as its own token rather than gluing it to the
+            # preceding word (e.g. "ok;" instead of "ok" + ";").
+            out.append(" ; ")
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+try:
+    cmd = sys.stdin.read()
+    cmd = normalize_unquoted_newlines(cmd)
+    for tok in shlex.split(cmd):
+        sys.stdout.buffer.write(tok.encode("utf-8", errors="replace") + b"\x00")
+except ValueError as e:
+    print(f"shlex error: {e}", file=sys.stderr)
+    sys.exit(1)
+' > "$TMP_TOKENS" 2> "$TMP_TOKENS_ERR"; then
   echo "BLOCKED: gh-pr-guard could not tokenize the gh command (malformed shell quoting)." >&2
   echo "  command: $COMMAND" >&2
-  echo "  xargs error: $TOKENS_OUTPUT" >&2
+  echo "  shlex error: $(cat "$TMP_TOKENS_ERR")" >&2
   echo "  Fix the quoting and retry, or use BREAK_GLASS_ADMIN=1 + --admin." >&2
   exit 2
 fi
-# Portable read loop in lieu of bash 4+ `mapfile`. Empty lines
-# preserved so legitimate empty arg values like `--body ""` are
-# consumed correctly by downstream SKIP_NEXT_AS logic.
+# Read NUL-delimited tokens from the tempfile. `read -d ''` means
+# "read until NUL". Each iteration appends one whole token,
+# preserving any embedded newlines.
 TOKENS=()
-while IFS= read -r line; do
-  TOKENS+=("$line")
-done <<<"$TOKENS_OUTPUT"
+while IFS= read -r -d '' tok; do
+  TOKENS+=("$tok")
+done < "$TMP_TOKENS"
 
 # --- detect the pr subcommand, capturing any global -R/--repo ---
 #
@@ -213,13 +287,16 @@ INLINE_CODEX_CLEARED=""
 INLINE_BREAK_GLASS_ADMIN=""
 GLOBAL_REPO=""
 PR_SUBCOMMAND=""
+PR_SUBCOMMAND_INDEX=-1    # index in TOKENS where the gh pr subcommand was found
 SAW_GH=0
 SAW_PR=0
 SKIP_GLOBAL_AS=""        # "" | "repo"
 AT_COMMAND_POSITION=1    # 1 = at command position, 0 = walking unrelated-command args
+SEGMENT_HAS_COMMAND=0    # 1 = this segment has seen a non-assignment command (echo, cat, etc.)
 SKIP_PREFIX_VALUE=0      # 1 = next token is the value of a prefix-command flag
 CURRENT_PREFIX=""        # name of the most recently seen prefix command (sudo/time/etc.)
-for tok in "${TOKENS[@]}"; do
+for i in "${!TOKENS[@]}"; do
+  tok="${TOKENS[$i]}"
   # --- phase 2: walking after gh, looking for pr + subcommand ---
   if [ "$SAW_GH" -eq 1 ]; then
     if [ "$SKIP_GLOBAL_AS" = "repo" ]; then
@@ -262,6 +339,7 @@ for tok in "${TOKENS[@]}"; do
     fi
     # SAW_PR=1 — this token IS the pr subcommand.
     PR_SUBCOMMAND="$tok"
+    PR_SUBCOMMAND_INDEX=$i
     break
   fi
 
@@ -276,32 +354,66 @@ for tok in "${TOKENS[@]}"; do
     continue
   fi
 
-  # Capture inline env assignments regardless of state. Doing it
-  # here means a `CODEX_CLEARED=1 sudo gh pr merge 65` or even
-  # `cat foo; CODEX_CLEARED=1 gh pr merge 65` form still picks up
-  # the inline value when gh is eventually found.
-  case "$tok" in
-    CODEX_CLEARED=*)
-      INLINE_CODEX_CLEARED="${tok#CODEX_CLEARED=}"
-      ;;
-    BREAK_GLASS_ADMIN=*)
-      INLINE_BREAK_GLASS_ADMIN="${tok#BREAK_GLASS_ADMIN=}"
-      ;;
-  esac
-
   # Compound separators always reset us to command position,
   # whether we were in command position or skipping unrelated
   # args. Only standalone `&&` / `||` / `;` / `|` / `&` / `(`
   # tokens count — separators glommed onto adjacent words by
   # missing whitespace (e.g. `foo;`) are NOT detected, which is
   # an acceptable limitation for the agent flow.
+  #
+  # IMPORTANT: separator handling MUST run before the env-assignment
+  # capture below. Otherwise `echo CODEX_CLEARED=1 ; gh pr merge 65`
+  # would capture the literal `CODEX_CLEARED=1` arg of `echo` as a
+  # spoofed inline env var even though it never actually gets exported
+  # to the gh process. nathanpayne-codex caught this on swipewatch
+  # propagation PR #33 round 5 — privilege escalation potential.
   case "$tok" in
     "&&"|"||"|";"|"|"|"&"|"("|")")
       AT_COMMAND_POSITION=1
       CURRENT_PREFIX=""
+      # Clear inline env vars ONLY when the segment that just ended
+      # contained a non-assignment command. That means the assignment
+      # was a PREFIX scoped to that command, not a standalone
+      # assignment that persists in the shell:
+      #
+      #   BREAK_GLASS_ADMIN=1 echo ok ; gh pr merge --admin 65
+      #     → segment had `echo` (SEGMENT_HAS_COMMAND=1)
+      #     → assignment was prefix to echo → CLEAR at `;`
+      #
+      #   CODEX_CLEARED=1 && gh pr merge 76 --squash
+      #     → segment was ONLY the assignment (SEGMENT_HAS_COMMAND=0)
+      #     → standalone assignment → DON'T clear at `&&`
+      #
+      # nathanpayne-codex caught the over-clearing on template PR #76
+      # round 1 — `CODEX_CLEARED=1 && gh pr merge` was being cleared
+      # even though the assignment was standalone.
+      if [ "$SEGMENT_HAS_COMMAND" -eq 1 ]; then
+        INLINE_CODEX_CLEARED=""
+        INLINE_BREAK_GLASS_ADMIN=""
+      fi
+      SEGMENT_HAS_COMMAND=0
       continue
       ;;
   esac
+
+  # Capture inline env assignments ONLY when AT_COMMAND_POSITION=1.
+  # Tokens in IN_UNRELATED_ARGS are arguments to an unrelated
+  # command (e.g., `echo BREAK_GLASS_ADMIN=1 ; gh pr merge --admin
+  # 65`) and do NOT export to the spawned gh process — capturing
+  # them would let an agent spoof guard variables by prefixing the
+  # command with an echo. Only assignments that are themselves in
+  # command position (e.g., `CODEX_CLEARED=1 gh pr merge 65` or
+  # `CODEX_CLEARED=1 sudo gh pr merge 65`) count.
+  if [ "$AT_COMMAND_POSITION" -eq 1 ]; then
+    case "$tok" in
+      CODEX_CLEARED=*)
+        INLINE_CODEX_CLEARED="${tok#CODEX_CLEARED=}"
+        ;;
+      BREAK_GLASS_ADMIN=*)
+        INLINE_BREAK_GLASS_ADMIN="${tok#BREAK_GLASS_ADMIN=}"
+        ;;
+    esac
+  fi
 
   if [ "$AT_COMMAND_POSITION" -eq 0 ]; then
     # Skipping arguments of an unrelated command. Stay until a
@@ -373,7 +485,10 @@ for tok in "${TOKENS[@]}"; do
       # An unrelated command (echo, printf, cat, find, etc.).
       # gh-as-an-argument should NOT trigger the hook;
       # transition to skip mode and walk past the args.
+      # Mark the segment as having a real command so that
+      # separator-clearing of inline env vars fires correctly.
       AT_COMMAND_POSITION=0
+      SEGMENT_HAS_COMMAND=1
       continue
       ;;
   esac
@@ -419,7 +534,8 @@ fi
 
 # --- gh pr merge ---
 #
-# (PR_SUBCOMMAND must be "merge" by this point.)
+# (PR_SUBCOMMAND must be "merge" and PR_SUBCOMMAND_INDEX must point
+# to the actual `merge` subcommand token in TOKENS by this point.)
 #
 # Walk tokens AFTER the literal `merge` subcommand token to extract:
 #   - PR_SELECTOR (first non-flag positional)
@@ -435,15 +551,28 @@ fi
 # quoted flag value (e.g., `--subject "--admin follow-up"`).
 # nathanpayne-codex caught that on PR #66 round 6.
 #
+# An even earlier version of this walk used a separate `FOUND_MERGE`
+# scan that latched onto the FIRST `merge` token anywhere in the
+# command, not specifically the gh-context one. With chained inputs
+# like `echo merge ; gh pr merge 65`, the walk would latch onto the
+# echo arg and then capture `;` as the selector. Codex caught that
+# on the swipewatch propagation PR #33; the fix is to use the
+# PR_SUBCOMMAND_INDEX captured during phase 1 as the starting point
+# of the merge walk, eliminating the FOUND_MERGE state entirely.
+#
 # `gh pr merge` accepts the selector as <number> | <url> | <branch>;
 # we don't parse or validate the form, just pass it through to
 # `gh pr view` which accepts the same grammar.
 PR_SELECTOR=""
 REPO_ARG=""
 ADMIN_REQUESTED=0
-FOUND_MERGE=0
 SKIP_NEXT_AS=""  # "" | "skip" | "repo"
-for tok in "${TOKENS[@]}"; do
+merge_walk_start=$((PR_SUBCOMMAND_INDEX + 1))
+for j in "${!TOKENS[@]}"; do
+  if [ "$j" -lt "$merge_walk_start" ]; then
+    continue
+  fi
+  tok="${TOKENS[$j]}"
   if [ "$SKIP_NEXT_AS" = "skip" ]; then
     SKIP_NEXT_AS=""
     continue
@@ -453,44 +582,38 @@ for tok in "${TOKENS[@]}"; do
     SKIP_NEXT_AS=""
     continue
   fi
-  if [ "$FOUND_MERGE" -eq 1 ]; then
-    case "$tok" in
-      --admin)
-        ADMIN_REQUESTED=1
-        continue
-        ;;
-      --repo|-R)
-        SKIP_NEXT_AS="repo"
-        continue
-        ;;
-      --repo=*)
-        REPO_ARG="${tok#--repo=}"
-        continue
-        ;;
-      -R=*)
-        REPO_ARG="${tok#-R=}"
-        continue
-        ;;
-      --body|-b|--body-file|-F|--subject|-t|--author-email|-A|--match-head-commit)
-        SKIP_NEXT_AS="skip"
-        continue
-        ;;
-    esac
-    case "$tok" in
-      -*)
-        continue
-        ;;
-    esac
-    # First non-flag token after `merge` is the selector. Don't
-    # break — keep walking so a `--repo`/`-R` flag or `--admin`
-    # flag appearing AFTER the selector still gets captured.
-    if [ -z "$PR_SELECTOR" ]; then
-      PR_SELECTOR="$tok"
-    fi
-    continue
-  fi
-  if [ "$tok" = "merge" ]; then
-    FOUND_MERGE=1
+  case "$tok" in
+    --admin)
+      ADMIN_REQUESTED=1
+      continue
+      ;;
+    --repo|-R)
+      SKIP_NEXT_AS="repo"
+      continue
+      ;;
+    --repo=*)
+      REPO_ARG="${tok#--repo=}"
+      continue
+      ;;
+    -R=*)
+      REPO_ARG="${tok#-R=}"
+      continue
+      ;;
+    --body|-b|--body-file|-F|--subject|-t|--author-email|-A|--match-head-commit)
+      SKIP_NEXT_AS="skip"
+      continue
+      ;;
+  esac
+  case "$tok" in
+    -*)
+      continue
+      ;;
+  esac
+  # First non-flag token after the gh-context `merge` is the
+  # selector. Don't break — keep walking so a `--repo`/`-R` flag or
+  # `--admin` flag appearing AFTER the selector still gets captured.
+  if [ -z "$PR_SELECTOR" ]; then
+    PR_SELECTOR="$tok"
   fi
 done
 

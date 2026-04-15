@@ -287,29 +287,48 @@ scan_codex_state() {
   reactions=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions")
 
   # Latest review from the Codex bot on the current HEAD commit, if any.
-  # Codex always uses COMMENTED state regardless of findings.
+  # Codex always uses COMMENTED state regardless of findings. We also
+  # capture the review id so the findings filter can scope to THIS
+  # review only and not pick up stale findings from an earlier review
+  # round on the same HEAD.
   review=$(echo "$reviews" | jq --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
     [.[] | select(.user.login == $bot) | select(.commit_id == $sha)]
     | sort_by(.submitted_at) | last
     | if . == null then null
-      else { state, submitted_at, commit_id, body }
+      else { id, state, submitted_at, commit_id, body }
       end
   ')
 
-  # Inline findings from the bot on the current HEAD commit, with P0-P3
-  # priority extracted from the ![P{0-3} Badge] markdown shortcode.
-  findings=$(echo "$comments" | jq --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
-    [ .[]
-      | select(.user.login == $bot)
-      | select((.original_commit_id == $sha) or (.commit_id == $sha))
-      | { path, line, comment_id: .id, body,
-          priority: (
-            (.body | capture("!\\[P(?<n>[0-3]) Badge\\]")? // {n: null}) | .n
-            | if . == null then "P?" else "P" + . end
-          )
-        }
-    ]
-  ')
+  # Get the LATEST Codex review id so findings are scoped to that
+  # round only. nathanpayne-codex caught (swipewatch propagation
+  # PR #33 round 2) that filtering by SHA alone keeps old P0/P1
+  # comments from earlier reviews on the same HEAD forever — same
+  # bug class as PR #65 round 1's gate (c) findings filter on
+  # codex-review-check.sh.
+  latest_review_id=$(echo "$review" | jq -r 'if . == null then "" else .id end')
+
+  # Inline findings from the bot on the current HEAD commit, scoped
+  # to the LATEST review round (via pull_request_review_id), with
+  # P0-P3 priority extracted from the ![P{0-3} Badge] markdown
+  # shortcode. If there's no current review, findings is empty.
+  if [ -n "$latest_review_id" ] && [ "$latest_review_id" != "null" ]; then
+    findings=$(echo "$comments" | jq \
+      --arg bot "$BOT_LOGIN" \
+      --argjson review_id "$latest_review_id" '
+      [ .[]
+        | select(.user.login == $bot)
+        | select(.pull_request_review_id == $review_id)
+        | { path, line, comment_id: .id, body,
+            priority: (
+              (.body | capture("!\\[P(?<n>[0-3]) Badge\\]")? // {n: null}) | .n
+              | if . == null then "P?" else "P" + . end
+            )
+          }
+      ]
+    ')
+  else
+    findings='[]'
+  fi
 
   # Most recent +1 reaction from the bot on the issue with created_at
   # strictly >= REACTION_THRESHOLD. Threshold = max(HEAD_PUSHED_AT,
@@ -337,10 +356,62 @@ scan_codex_state() {
   '
 }
 
-# Returns 0 iff the scan produced a review or reaction (signal received).
+# Returns 0 iff the scan produced ANY signal (review or reaction).
+# Used by the poll loop, which stops as soon as Codex has produced
+# any response — even a review with P0/P1 findings counts because
+# the caller will then process the findings and decide what to do.
 has_signal() {
   local scan=$1
   [ "$(echo "$scan" | jq -r '.review != null or .reaction != null')" = "true" ]
+}
+
+# Returns 0 iff the scan produced a signal that should be treated as
+# CLEARED (no further @codex review trigger needed). Cleared means
+# EITHER:
+#   - any +1 reaction on the PR issue (the no-findings happy path), OR
+#   - a review on HEAD with zero P0/P1 inline findings (the
+#     reviewed-and-clean path)
+#
+# A review with P0/P1 findings does NOT count as cleared — the caller
+# may have replied to the findings with a rebuttal and want Codex to
+# re-evaluate. Earlier versions of this function used has_signal in
+# the pre-flight, which caused the rebuttal-without-commit path to
+# stall: re-running the script saw the existing P1-bearing review
+# and skipped the trigger, so Codex was never asked to reconsider.
+# Codex caught this on swipewatch propagation PR #33 — same shape as
+# the manual `@codex review` workaround I had to use on template PR
+# #73 during dry-run C.
+has_cleared_signal() {
+  local scan=$1
+  # Latest-signal-wins: when both a reaction and a review exist on
+  # HEAD, the more recent one is authoritative. Otherwise an older
+  # 👍 from a prior round can mask a later P1-bearing review and
+  # skip a needed retrigger. nathanpayne-codex caught this on
+  # nathanpaynedotcom propagation PR #180 round 2 — same shape as
+  # PR #65 round 1's gate (c) latest-state rule on
+  # codex-review-check.sh.
+  #
+  # Cleared iff EITHER:
+  #   - reaction exists AND (review is null OR reaction is newer
+  #     than review), OR
+  #   - review exists AND review is newer than (or only signal vs)
+  #     reaction AND review has zero P0/P1 findings (the findings
+  #     array is already scoped to the latest review's id by the
+  #     pull_request_review_id filter in scan_codex_state)
+  [ "$(echo "$scan" | jq -r '
+    def review_time: if .review == null then "" else .review.submitted_at end;
+    def reaction_time: if .reaction == null then "" else .reaction.created_at end;
+    def review_clean: ([.findings[] | select(.priority == "P0" or .priority == "P1")] | length) == 0;
+
+    if .reaction == null and .review == null then "false"
+    elif .reaction != null and .review == null then "true"
+    elif .reaction == null and .review != null then
+      (review_clean | tostring)
+    elif (reaction_time > review_time) then "true"
+    else
+      (review_clean | tostring)
+    end
+  ')" = "true" ]
 }
 
 # --- pre-flight: is Codex already working on HEAD? --------------------------
@@ -351,9 +422,10 @@ if ! INITIAL_SCAN=$(scan_codex_state); then
 fi
 
 TRIGGER_POSTED=false
+TRIGGER_POST_TIME=""
 
-if has_signal "$INITIAL_SCAN"; then
-  log "Codex has already responded on HEAD — skipping trigger comment"
+if has_cleared_signal "$INITIAL_SCAN"; then
+  log "Codex has already cleared on HEAD (reaction or no-P0/P1 review) — skipping trigger comment"
 else
   log "posting '@codex review' trigger comment"
   # Capture stderr (and stdout) into a diagnostic variable so a failure
@@ -364,6 +436,39 @@ else
   POST_OUTPUT=$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
     || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
   TRIGGER_POSTED=true
+  # Capture the post time so the poll loop can ignore stale signals
+  # that were already on HEAD before the trigger fired. Without this,
+  # `has_signal "$INITIAL_SCAN"` would return true on the very first
+  # iteration of the poll loop and the script would exit with the
+  # stale review/reaction without waiting for Codex's actual response
+  # to the new trigger. Codex caught this on swipewatch propagation
+  # PR #33 round 2 — same shape as the round-1 has_cleared_signal
+  # bug, just on the post-trigger side.
+  #
+  # Use GitHub's authoritative timestamp from the just-posted comment
+  # (extracted from the URL gh returns) rather than local wall-clock.
+  # Local wall-clock can be ahead of or behind GitHub by a few seconds
+  # due to NTP skew, and the strict `>` comparison would misclassify
+  # a real Codex response as pre-trigger. Falls back to local wall-
+  # clock minus a 60-second buffer if the comment ID can't be
+  # extracted (e.g., gh output format change). Codex caught the
+  # wall-clock issue on nathanpaynedotcom propagation PR #180 round 4.
+  TRIGGER_COMMENT_ID=$(echo "$POST_OUTPUT" | grep -oE 'issuecomment-[0-9]+' | head -1 | sed 's/issuecomment-//')
+  if [ -n "$TRIGGER_COMMENT_ID" ]; then
+    TRIGGER_POST_TIME=$(gh api "repos/$REPO/issues/comments/$TRIGGER_COMMENT_ID" --jq '.created_at' 2>/dev/null || true)
+  fi
+  if [ -z "$TRIGGER_POST_TIME" ]; then
+    # Fallback: local wall-clock minus a 60-second buffer for
+    # clock skew tolerance.
+    EPOCH_NOW=$(date +%s)
+    EPOCH_BUFFER=$((EPOCH_NOW - 60))
+    if TRIGGER_POST_TIME=$(date -u -r "$EPOCH_BUFFER" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null); then
+      :
+    else
+      TRIGGER_POST_TIME=$(date -u -d "@$EPOCH_BUFFER" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+        || die 3 "could not compute fallback TRIGGER_POST_TIME")
+    fi
+  fi
 fi
 
 # --- poll loop --------------------------------------------------------------
@@ -372,10 +477,44 @@ START_TS=$(date +%s)
 DEADLINE=$((START_TS + TIMEOUT_SECONDS))
 ELAPSED=0
 
-FINAL_SCAN=$INITIAL_SCAN
+# Returns 0 iff the scan has a signal that is at least as recent
+# as TRIGGER_POST_TIME (>=, not >). Used by the poll loop only
+# when TRIGGER_POSTED=1 so we don't short-circuit on stale signals.
+#
+# Uses >= rather than > because GitHub timestamps are second-
+# precision and a legitimate Codex response in the same second as
+# the trigger comment post would otherwise be classified as stale
+# forever, forcing the script to time out to Phase 4b unnecessarily.
+# nathanpayne-codex caught the >-vs->= bug on swipewatch propagation
+# PR #33 round 4 and the related wall-clock-vs-GitHub-time bug on
+# nathanpaynedotcom propagation PR #180 round 4.
+has_post_trigger_signal() {
+  local scan=$1
+  [ "$(echo "$scan" | jq -r --arg after "$TRIGGER_POST_TIME" '
+    ((.review != null and .review.submitted_at >= $after)
+     or (.reaction != null and .reaction.created_at >= $after))
+  ')" = "true" ]
+}
+
+if [ "$TRIGGER_POSTED" = "true" ]; then
+  # We just posted a trigger. The INITIAL_SCAN data is now stale by
+  # definition — Codex will respond with something new. Skip the
+  # initial has_signal check; force the loop to actually poll.
+  FINAL_SCAN='{"review":null,"findings":[],"reaction":null}'
+else
+  FINAL_SCAN=$INITIAL_SCAN
+fi
 
 while :; do
-  if has_signal "$FINAL_SCAN"; then
+  # If we just triggered a fresh review, only break on a signal
+  # strictly newer than the trigger. Otherwise (no trigger sent),
+  # any existing signal is fine — that's the cleared-on-arrival path.
+  if [ "$TRIGGER_POSTED" = "true" ]; then
+    if has_post_trigger_signal "$FINAL_SCAN"; then
+      log "Codex signal received after ${ELAPSED}s (post-trigger)"
+      break
+    fi
+  elif has_signal "$FINAL_SCAN"; then
     log "Codex signal received after ${ELAPSED}s"
     break
   fi
@@ -423,8 +562,18 @@ jq -n \
   }
 '
 
-# Exit 0 if a signal arrived; exit 4 (FALLBACK_REQUIRED) if we timed out.
-if has_signal "$FINAL_SCAN"; then
+# Exit 0 if a signal arrived; exit 4 (FALLBACK_REQUIRED) if we timed
+# out. When TRIGGER_POSTED=true, "a signal arrived" means a signal
+# strictly newer than the trigger post — the existing pre-trigger
+# signal doesn't count, otherwise the script would exit 0 with stale
+# findings the moment we time out polling for the new review.
+if [ "$TRIGGER_POSTED" = "true" ]; then
+  if has_post_trigger_signal "$FINAL_SCAN"; then
+    exit 0
+  else
+    exit 4
+  fi
+elif has_signal "$FINAL_SCAN"; then
   exit 0
 else
   exit 4

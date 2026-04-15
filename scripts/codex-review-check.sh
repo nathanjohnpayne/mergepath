@@ -134,6 +134,16 @@ if ! [[ "$REACTION_FRESHNESS_SECONDS" =~ ^[0-9]+$ ]]; then
   exit 3
 fi
 
+# Honor codex.require_ci_green. When true (default), gate (a) runs
+# and any non-passing required check blocks merge. When false, gate
+# (a) is skipped — useful for emergency or manual flows where CI
+# is intentionally bypassed. Codex caught the missing wire-up on
+# the nathanpaynedotcom propagation PR #180 (the field was read by
+# the policy parser and documented in the codex: block but never
+# actually consulted by this script).
+REQUIRE_CI_GREEN=$(codex_field require_ci_green)
+REQUIRE_CI_GREEN=${REQUIRE_CI_GREEN:-true}
+
 # Read the available_reviewers list (one per line). Same state-machine
 # awk pattern, but collecting list items rather than matching a scalar.
 # Outputs one reviewer login per line to stdout. Handles both quoted
@@ -328,6 +338,10 @@ esac
 
 # --- gate (a): CI checks green ---------------------------------------------
 
+if [ "$REQUIRE_CI_GREEN" != "true" ]; then
+  log "gate (a): SKIPPED (codex.require_ci_green=$REQUIRE_CI_GREEN)"
+else
+
 log "gate (a): checking CI state"
 
 # Use the structured statusCheckRollup instead of `gh pr checks` so we can
@@ -358,7 +372,49 @@ ROLLUP_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json statusCheckRollup 2>
 #
 # Normalize both into {label, workflow, result}, then accept only
 # SUCCESS / SKIPPED / NEUTRAL as non-blocking.
-BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq '
+# Determine which checks are REQUIRED via branch protection. Without
+# this filter, gate (a) blocks on any non-passing check in the
+# rollup including optional / informational ones that branch
+# protection wouldn't actually require for merge. nathanpayne-codex
+# caught the over-strict behavior on swipewatch propagation PR #33
+# round 4.
+#
+# The base branch is read from PR_JSON. If branch protection isn't
+# configured (or returns empty), fall back to the prior behavior
+# (consider all checks). If branch protection IS configured, only
+# checks listed in required_status_checks.contexts AND/OR
+# required_status_checks.checks[].context block the gate.
+BASE_BRANCH=$(echo "$PR_JSON" | jq -r '.base.ref')
+REQUIRED_CHECK_NAMES=$(gh api "repos/$REPO/branches/$BASE_BRANCH/protection/required_status_checks" 2>/dev/null \
+  | jq -r '[.contexts[]?, .checks[]?.context] | unique | .[]' 2>/dev/null \
+  || true)
+
+if [ -z "$REQUIRED_CHECK_NAMES" ]; then
+  # No required-check list available. This can happen because:
+  #   - The branch has no branch protection rules at all, OR
+  #   - The token lacks Administration:read scope (which the
+  #     required_status_checks endpoint requires).
+  #
+  # Earlier versions treated "no list" as "all checks required",
+  # which caused over-strict blocking when the token lacked perms
+  # and optional/flaky checks happened to be failing. Codex caught
+  # this on swipewatch propagation PR #33 round 8.
+  #
+  # New behavior: log a warning and SKIP the required-check filter
+  # entirely, letting gate (a) pass. The rationale is that if
+  # branch protection isn't configured or the token can't read it,
+  # the BRANCH PROTECTION ITSELF doesn't enforce required checks,
+  # so gate (a) shouldn't either.
+  log "gate (a): WARNING — could not determine required checks from branch protection for $BASE_BRANCH (no rules configured or token lacks Administration:read scope). Skipping required-check filter — all checks treated as passing this gate."
+  # Skip gate (a) entirely for this case
+  ROLLUP_JSON='{"statusCheckRollup":[]}'
+  REQUIRED_JSON='[]'
+else
+  # Build a jq array of required check names
+  REQUIRED_JSON=$(echo "$REQUIRED_CHECK_NAMES" | jq -R . | jq -s .)
+fi
+
+BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq --argjson required_names "${REQUIRED_JSON:-[]}" '
   [.statusCheckRollup[]
     | {
         label: (.name // .context // "?"),
@@ -373,6 +429,14 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq '
     | select(
         (.workflow != "PR Review Policy") or
         (.label != "Label Gate")
+      )
+    # When branch protection lists required checks, only those
+    # checks block the gate. When the list is empty (no branch
+    # protection configured or query failed), fall back to the
+    # prior behavior of treating all checks as required.
+    | select(
+        ($required_names | length) == 0
+        or ($required_names | index(.label)) != null
       )
     # A check passes the gate iff its result is SUCCESS, SKIPPED, or
     # NEUTRAL. Everything else — FAILURE, CANCELLED, TIMED_OUT,
@@ -396,6 +460,8 @@ if [ "$BAD_COUNT" -gt 0 ]; then
 fi
 
 log "gate (a): CI is green (Label Gate failure, if present, is expected during Phase 4a)"
+
+fi  # end REQUIRE_CI_GREEN
 
 # --- gate (b): reviewer identity approval ----------------------------------
 
@@ -471,10 +537,20 @@ COMMENTS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline 
 # P2/P3 don't block clearance per REVIEW_POLICY.md § Phase 4a step 15a.
 # If there's no Codex review on HEAD, UNADDRESSED_P01 is [] — the
 # reaction path is then the only way gate (c) can clear.
+#
+# Filter MUST include user.login == BOT_LOGIN. Review-thread replies
+# (e.g., a human quoting a P1 badge from a Codex finding while
+# debugging) share the same pull_request_review_id as the original
+# Codex comments, so a quote-only reply containing `![P1 Badge]`
+# would otherwise be misclassified as an unaddressed Codex finding
+# and incorrectly block merge. nathanpayne-codex caught this on
+# nathanpaynedotcom propagation PR #180 round 3.
 if [ -n "$CODEX_REVIEW_ID" ] && [ "$CODEX_REVIEW_ID" != "null" ]; then
   UNADDRESSED_P01=$(echo "$COMMENTS_JSON" | jq \
+    --arg bot "$BOT_LOGIN" \
     --argjson review_id "$CODEX_REVIEW_ID" '
     [ .[]
+      | select(.user.login == $bot)
       | select(.pull_request_review_id == $review_id)
       | select(.body | test("!\\[P[01] Badge\\]"))
       | { path, line, comment_id: .id }
