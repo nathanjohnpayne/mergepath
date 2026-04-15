@@ -25,9 +25,21 @@
 #   1. Reads codex.review_timeout_seconds and codex.bot_login from
 #      .github/review-policy.yml (defaults: 600 / chatgpt-codex-connector[bot]).
 #   2. Fetches the PR's current HEAD commit SHA and committer date. Any
-#      Codex review/reaction is only considered "current" if it is
-#      anchored on this commit (reviews) or created after its committer
-#      date (reactions).
+#      Codex review is only considered "current" if it is anchored on
+#      this commit (commit_id == HEAD_SHA). Any Codex +1 reaction is
+#      only considered "current" if created_at >= REACTION_THRESHOLD,
+#      where REACTION_THRESHOLD = max(HEAD_PUSHED_AT, freshness floor):
+#        - HEAD_PUSHED_AT is HEAD_COMMITTER_DATE advanced past any
+#          `head_ref_force_pushed` event on this PR's timeline, which
+#          is strictly PR-scoped. This closes the force-push-with-
+#          old-commit false-clear path.
+#        - freshness floor = NOW minus
+#          `codex.reaction_freshness_window_seconds` (default 1800).
+#          This closes the ordinary-push-with-old-committer-date
+#          false-clear path by ensuring a stale 👍 from a prior HEAD
+#          ages out of the window.
+#      See codex-review-check.sh for the iteration history behind this
+#      design and the residual hole it does NOT fully close.
 #   3. Scans existing reviews, inline comments, and issue reactions for
 #      a Codex signal already present on the current HEAD. If found,
 #      skips the trigger comment and goes straight to emitting JSON —
@@ -160,6 +172,13 @@ fi
 BOT_LOGIN=$(codex_field bot_login)
 BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
 
+REACTION_FRESHNESS_SECONDS=$(codex_field reaction_freshness_window_seconds)
+REACTION_FRESHNESS_SECONDS=${REACTION_FRESHNESS_SECONDS:-1800}
+if ! [[ "$REACTION_FRESHNESS_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: codex.reaction_freshness_window_seconds must be an integer; got '$REACTION_FRESHNESS_SECONDS'" >&2
+  exit 3
+fi
+
 POLL_INTERVAL_SECONDS=15
 
 # --- logging helpers --------------------------------------------------------
@@ -207,7 +226,50 @@ fi
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
   || die 3 "failed to fetch commit date for $HEAD_SHA: $HEAD_COMMITTER_DATE"
 
+# HEAD_PUSHED_AT + REACTION_THRESHOLD: mirrors codex-review-check.sh so
+# that the pre-flight scan below does NOT treat a stale 👍 from a prior
+# HEAD as a current signal (which would cause the trigger comment to be
+# skipped and the caller to re-run gate (c) against the same stale
+# reaction). See codex-review-check.sh for the full rationale; the short
+# version: committer date is unreliable for force-push-of-old-commit
+# and ordinary-push-of-old-committer-date. Layer 1 advances the anchor
+# via `head_ref_force_pushed` events from the PR-scoped timeline; Layer
+# 2 bounds residual exposure with a freshness floor.
+HEAD_PUSHED_AT="$HEAD_COMMITTER_DATE"
+ANCHOR_SOURCE="HEAD committer date"
+
+TIMELINE_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline")
+
+LATEST_FORCE_PUSH_TIME=$(echo "$TIMELINE_JSON" | jq -r '
+  [ .[] | select(.event == "head_ref_force_pushed") | .created_at ]
+  | max // ""
+')
+
+if [ -n "$LATEST_FORCE_PUSH_TIME" ] && [[ "$LATEST_FORCE_PUSH_TIME" > "$HEAD_PUSHED_AT" ]]; then
+  HEAD_PUSHED_AT="$LATEST_FORCE_PUSH_TIME"
+  ANCHOR_SOURCE="head_ref_force_pushed @ $LATEST_FORCE_PUSH_TIME"
+fi
+
+EPOCH_NOW=$(date +%s)
+EPOCH_FLOOR=$((EPOCH_NOW - REACTION_FRESHNESS_SECONDS))
+if REACTION_FLOOR_ISO=$(date -u -r "$EPOCH_FLOOR" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null); then
+  :
+else
+  REACTION_FLOOR_ISO=$(date -u -d "@$EPOCH_FLOOR" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) \
+    || die 3 "could not compute reaction freshness floor from epoch $EPOCH_FLOOR"
+fi
+
+if [[ "$REACTION_FLOOR_ISO" > "$HEAD_PUSHED_AT" ]]; then
+  REACTION_THRESHOLD="$REACTION_FLOOR_ISO"
+  REACTION_THRESHOLD_SOURCE="freshness floor (NOW - ${REACTION_FRESHNESS_SECONDS}s)"
+else
+  REACTION_THRESHOLD="$HEAD_PUSHED_AT"
+  REACTION_THRESHOLD_SOURCE="HEAD pushed-at anchor ($ANCHOR_SOURCE)"
+fi
+
 log "HEAD = $HEAD_SHA committed at $HEAD_COMMITTER_DATE"
+log "anchor = $HEAD_PUSHED_AT (source: $ANCHOR_SOURCE)"
+log "reaction_threshold = $REACTION_THRESHOLD (source: $REACTION_THRESHOLD_SOURCE)"
 log "bot_login = $BOT_LOGIN    timeout = ${TIMEOUT_SECONDS}s"
 
 # --- Codex signal scan ------------------------------------------------------
@@ -250,8 +312,15 @@ scan_codex_state() {
   ')
 
   # Most recent +1 reaction from the bot on the issue with created_at
-  # strictly >= the HEAD committer date.
-  reaction=$(echo "$reactions" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_COMMITTER_DATE" '
+  # strictly >= REACTION_THRESHOLD. Threshold = max(HEAD_PUSHED_AT,
+  # freshness floor). See the anchor computation above and
+  # codex-review-check.sh for the full rationale. Without the
+  # freshness floor, a stale 👍 from a prior HEAD (where the new HEAD
+  # is a normal push with an old committer date) would read as a
+  # "current" signal here and cause the pre-flight scan to skip the
+  # trigger comment, leaving the caller to re-evaluate gate (c)
+  # against the same stale reaction.
+  reaction=$(echo "$reactions" | jq --arg bot "$BOT_LOGIN" --arg after "$REACTION_THRESHOLD" '
     [.[]
       | select(.user.login == $bot)
       | select(.content == "+1")

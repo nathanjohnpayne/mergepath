@@ -156,3 +156,36 @@ codex:
   # report green before allowing merge. Strongly recommended; do not disable
   # without explicit human authorization.
   require_ci_green: true
+
+  # Maximum age, in seconds, of a `+1` / 👍 reaction from the Codex bot that
+  # can clear gate (c) in codex-review-check.sh and be treated as a current
+  # signal by the pre-flight scan in codex-review-request.sh.
+  #
+  # Background: GitHub's REST and GraphQL APIs do not expose a per-PR push
+  # timestamp for ordinary (non-force) pushes. The timeline endpoint has a
+  # `committed` event for each commit, but its `created_at` field is null
+  # (verified against PR #63 on 2026-04-15). For force-push, the
+  # `head_ref_force_pushed` event provides a tight per-PR arrival time;
+  # for ordinary push, the best anchor we can derive is the commit's
+  # committer date, which is commit metadata and can be arbitrarily old
+  # (cherry-pick, rebase with `--committer-date-is-author-date`, or any
+  # commit amended from a previously-authored SHA).
+  #
+  # Consequence: without a freshness constraint, a stale 👍 reaction from
+  # a prior HEAD would pass `reaction.created_at >= HEAD_COMMITTER_DATE`
+  # when the new HEAD's committer date is older than the prior 👍 — a
+  # false clear.
+  #
+  # Mitigation: require the 👍 reaction to be created within this many
+  # seconds of the scan time. A stale 👍 from a prior HEAD is filtered
+  # out once it ages past the window, closing the exposure in practice.
+  # The window must be long enough for a typical Phase 4a cycle (push →
+  # `@codex review` trigger → Codex response → gate check) to complete
+  # without forcing a re-trigger, and short enough that cross-cycle
+  # staleness is caught.
+  #
+  # Default 1800 seconds (30 min) is conservative for the agent flow;
+  # typical cycles complete in 1–5 minutes. Applies to both
+  # codex-review-check.sh gate (c) and codex-review-request.sh pre-flight
+  # and poll scans.
+  reaction_freshness_window_seconds: 1800

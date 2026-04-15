@@ -127,6 +127,13 @@ codex_field() {
 BOT_LOGIN=$(codex_field bot_login)
 BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
 
+REACTION_FRESHNESS_SECONDS=$(codex_field reaction_freshness_window_seconds)
+REACTION_FRESHNESS_SECONDS=${REACTION_FRESHNESS_SECONDS:-1800}
+if ! [[ "$REACTION_FRESHNESS_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: codex.reaction_freshness_window_seconds must be an integer; got '$REACTION_FRESHNESS_SECONDS'" >&2
+  exit 3
+fi
+
 # Read the available_reviewers list (one per line). Same state-machine
 # awk pattern, but collecting list items rather than matching a scalar.
 # Outputs one reviewer login per line to stdout. Handles both quoted
@@ -198,37 +205,61 @@ HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.commi
 # HEAD would then satisfy `reaction.created_at >= committer_date` even
 # though the reaction predates the current HEAD's existence on this
 # PR. See #64 Codex P1 finding ("Anchor reaction freshness to PR head
-# update time") and #65 follow-up findings.
+# update time") and the #65 round-1/2/3 follow-up findings.
 #
-# Earlier iterations tried `repos/{repo}/commits/{sha}/check-runs` as
-# the anchor source, but that endpoint is COMMIT-scoped, not PR-scoped:
-# if the same SHA ran in an earlier context (a different branch, a
-# previous PR, a direct push to main), the earliest check-run's
-# started_at comes from THAT context and is much earlier than when
-# the commit became the current PR's HEAD. nathanpayne-codex caught
-# this on PR #65 round 1 — thanks.
+# Iteration history and why the obvious fixes don't work:
 #
-# New approach: use the PR's TIMELINE events, which are strictly
-# PR-scoped. Algorithm:
+#   Round 1 tried `repos/{repo}/commits/{sha}/check-runs`. Rejected:
+#   that endpoint is COMMIT-scoped, not PR-scoped — if the same SHA
+#   ran in an earlier context (different branch, previous PR, direct
+#   push to main), the earliest check-run's started_at comes from
+#   THAT context and leaks across PRs.
 #
-#   1. Start with HEAD_COMMITTER_DATE as the base. It's correct for
-#      the common case (normal push, or force-push of a new commit
-#      authored at or after the push time). It's also strictly earlier
-#      than any CI-dispatch anchor, so a valid Codex 👍 posted in the
-#      gap between push and CI start is NOT filtered out (#65 round 1
-#      finding 3: "started_at is later than the actual head update").
+#   Round 2 tried `repos/{repo}/issues/{pr}/timeline` with a
+#   `head_ref_force_pushed` event selector. Better: that endpoint is
+#   strictly PR-scoped. BUT it only covers force-push. For ORDINARY
+#   push / fast-forward to a descendant commit, the timeline emits a
+#   `committed` event whose `created_at` is `null` — verified against
+#   PR #63's raw timeline payload on 2026-04-15. There is no per-PR
+#   push timestamp for non-force pushes in the GitHub API.
 #
-#   2. If there's a `head_ref_force_pushed` event on this PR with
-#      `created_at > HEAD_COMMITTER_DATE`, override the base. This
-#      catches the force-push-with-old-commit case where committer
-#      date is arbitrarily old. `max()` across all force-push events
-#      picks the most recent force-push, which is the one that
-#      established the CURRENT head state.
+# The ordinary-push hole:
 #
-#   3. fetch_api_array fails closed with exit 3 on API error — no
-#      silent fallback to the weaker anchor. If the timeline endpoint
-#      is unreachable, we fail, consistent with the rest of the
-#      script's fetch logic.
+#   Scenario — PR HEAD is at commit A, Codex reacts 👍 on the PR at
+#   time T1, then the PR is advanced via ordinary push (fast-forward)
+#   to descendant commit B whose committer date is OLDER than T1
+#   (e.g., cherry-pick of a pre-existing SHA, or a commit authored
+#   weeks ago and just now pushed). The stale 👍 from HEAD A would
+#   pass `reaction.created_at >= HEAD_COMMITTER_DATE` on HEAD B and
+#   false-clear gate (c) because the anchor can only be advanced by a
+#   signal we don't have access to.
+#
+# Two-layer mitigation applied below:
+#
+#   Layer 1 — per-PR push anchor via force-push events. For the cases
+#   where a per-PR push time IS observable (force-push), use it.
+#   Start with HEAD_COMMITTER_DATE as the base (correct for the
+#   common case where committer date ≈ push time), then override to
+#   `head_ref_force_pushed.created_at` if later. This closes the
+#   force-push-of-old-commit variant identified in the #64 review.
+#
+#   Layer 2 — reaction freshness floor. Bound the exposure window of
+#   the residual ordinary-push-old-committer-date hole by requiring a
+#   👍 reaction to be within `codex.reaction_freshness_window_seconds`
+#   of the gate-check time. A stale 👍 from a prior HEAD that outlives
+#   the window is automatically filtered out, regardless of how old
+#   the new HEAD's committer date is. Default 1800s (30 min) is
+#   generous for the typical Phase 4a cycle (1–5 min push → clearance)
+#   while catching cross-cycle stale 👍s. See review-policy.yml
+#   `codex.reaction_freshness_window_seconds` for the full rationale.
+#
+# Residual hole: if the stale 👍 is within the freshness window AND
+# the new HEAD was pushed via ordinary push AND the new HEAD has an
+# old committer date, a false clear is still mechanically possible.
+# That combination is narrow — it requires a rebased/cherry-picked
+# old commit pushed within the freshness window after a prior-HEAD
+# 👍. Closing it fully would require a per-PR push timestamp that
+# GitHub does not currently expose.
 HEAD_PUSHED_AT="$HEAD_COMMITTER_DATE"
 
 TIMELINE_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/timeline" "PR timeline")
@@ -245,9 +276,34 @@ else
   ANCHOR_SOURCE="HEAD committer date"
 fi
 
+# Compute freshness floor = NOW - reaction_freshness_window_seconds.
+# ISO 8601 UTC so it sorts lexicographically against reaction
+# created_at values. Cross-platform epoch→ISO conversion: try BSD
+# `date -r` first (macOS), fall back to GNU `date -d @...` (Linux).
+EPOCH_NOW=$(date +%s)
+EPOCH_FLOOR=$((EPOCH_NOW - REACTION_FRESHNESS_SECONDS))
+if REACTION_FLOOR_ISO=$(date -u -r "$EPOCH_FLOOR" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null); then
+  :
+else
+  REACTION_FLOOR_ISO=$(date -u -d "@$EPOCH_FLOOR" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) \
+    || die 3 "could not compute reaction freshness floor from epoch $EPOCH_FLOOR"
+fi
+
+# Effective threshold a 👍 reaction must satisfy = max(HEAD_PUSHED_AT,
+# REACTION_FLOOR_ISO). Both are ISO 8601 UTC; lexicographic comparison
+# is chronological.
+if [[ "$REACTION_FLOOR_ISO" > "$HEAD_PUSHED_AT" ]]; then
+  REACTION_THRESHOLD="$REACTION_FLOOR_ISO"
+  REACTION_THRESHOLD_SOURCE="freshness floor (NOW - ${REACTION_FRESHNESS_SECONDS}s = $REACTION_FLOOR_ISO)"
+else
+  REACTION_THRESHOLD="$HEAD_PUSHED_AT"
+  REACTION_THRESHOLD_SOURCE="HEAD pushed-at anchor ($HEAD_PUSHED_AT, source: $ANCHOR_SOURCE)"
+fi
+
 log "HEAD = $HEAD_SHA    author = $PR_AUTHOR"
 log "committer_date = $HEAD_COMMITTER_DATE"
 log "anchor = $HEAD_PUSHED_AT (source: $ANCHOR_SOURCE)"
+log "reaction_threshold = $REACTION_THRESHOLD (source: $REACTION_THRESHOLD_SOURCE)"
 
 # --- preflight: blocking labels --------------------------------------------
 #
@@ -430,13 +486,16 @@ fi
 
 UNADDRESSED_COUNT=$(echo "$UNADDRESSED_P01" | jq 'length')
 
-# Latest +1 reaction on the PR issue from the Codex bot, filtered to
-# reactions dated on or after HEAD_PUSHED_AT (see the anchor fetch
-# earlier in the script for the force-push rationale).
+# Latest +1 reaction on the PR issue from the Codex bot, filtered by
+# REACTION_THRESHOLD. REACTION_THRESHOLD = max(HEAD_PUSHED_AT,
+# freshness_floor), where the freshness floor is NOW minus
+# reaction_freshness_window_seconds. See the anchor computation
+# earlier in the script for why both bounds are required and the
+# residual hole the freshness floor mitigates.
 REACTIONS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions")
 
 LATEST_THUMBS_UP_TIME=$(echo "$REACTIONS_JSON" | jq -r \
-  --arg bot "$BOT_LOGIN" --arg after "$HEAD_PUSHED_AT" '
+  --arg bot "$BOT_LOGIN" --arg after "$REACTION_THRESHOLD" '
   [ .[]
     | select(.user.login == $bot)
     | select(.content == "+1")
@@ -487,7 +546,7 @@ if [ -n "$LATEST_THUMBS_UP_TIME" ] && [ -n "$CODEX_REVIEW_TIME" ]; then
 elif [ -n "$LATEST_THUMBS_UP_TIME" ]; then
   # Only a qualifying reaction, no review on HEAD.
   CLEARED=true
-  CLEARANCE_REASON="👍 reaction from $BOT_LOGIN @ $LATEST_THUMBS_UP_TIME (on or after HEAD push time $HEAD_PUSHED_AT)"
+  CLEARANCE_REASON="👍 reaction from $BOT_LOGIN @ $LATEST_THUMBS_UP_TIME (on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)"
 elif [ -n "$CODEX_REVIEW_TIME" ]; then
   # Only a review on HEAD, no qualifying reaction.
   if [ "$UNADDRESSED_COUNT" -eq 0 ]; then
@@ -498,7 +557,7 @@ fi
 
 if [ "$CLEARED" != "true" ]; then
   if [ -z "$LATEST_THUMBS_UP_TIME" ] && [ -z "$CODEX_REVIEW_TIME" ]; then
-    fail_gate "Codex has not cleared current HEAD (no review on $HEAD_SHA and no +1 reaction from $BOT_LOGIN since HEAD push time $HEAD_PUSHED_AT)"
+    fail_gate "Codex has not cleared current HEAD (no review on $HEAD_SHA and no +1 reaction from $BOT_LOGIN on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)"
   else
     PATHS=$(echo "$UNADDRESSED_P01" | jq -r '[.[] | "\(.path):\(.line)"] | join(", ")')
     fail_gate "latest Codex signal is a review on HEAD with $UNADDRESSED_COUNT unaddressed P0/P1 finding(s): $PATHS"
