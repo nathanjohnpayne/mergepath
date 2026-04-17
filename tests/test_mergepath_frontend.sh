@@ -82,7 +82,7 @@ required = [
     'compileGlob', 'matchGlob', 'simulate', 'normalizePR',
     'validatePath', 'copyText', 'openModal', 'closeModal',
     'renderChips', 'renderPRs', 'renderYaml', 'applyPreset',
-    'announce',
+    'announce', 'initSyncScroll',
 ]
 missing = [name for name in required if name not in body]
 if missing:

@@ -25,6 +25,10 @@ repo. Product name **Mergepath**.
   exposes.
 - Changing any knob updates stats, flows, and YAML without a full
   reload.
+- The control rail and workspace are their own scroll containers and
+  scroll in sync: scrolling one advances the other proportionally so
+  a long PR list and a short control stack stay aligned without the
+  shorter pane getting stranded.
 - The page carries an HTML comment injection marker
   `<!-- MERGEPATH_INJECT -->` that `scripts/policy-sim.sh` rewrites
   to `<script>window.__PRS = [...]</script>`. The legacy marker
