@@ -172,32 +172,37 @@
     border: 1px solid var(--line);
   }
 
-  /* Layout */
+  /* Layout
+   *
+   * Both columns are their own scroll containers so the rail and the
+   * workspace can sync (see initSyncScroll in the script). The layout
+   * grid owns the height; each column fills it and scrolls internally.
+   * Page-level scroll is intentionally disabled below the hero so the
+   * two panes move in lockstep rather than fighting each other. */
   .layout {
     display: grid;
     grid-template-columns: minmax(320px, 380px) minmax(0, 1fr);
     gap: 18px;
     margin-top: 18px;
+    height: calc(100vh - 140px);
+    min-height: 480px;
   }
 
-  .rail {
+  .rail, .workspace {
     display: grid;
     gap: 16px;
     align-content: start;
-    position: sticky;
-    top: 18px;
-    max-height: calc(100vh - 40px);
-    overflow: auto;
+    overflow-y: auto;
     padding-right: 4px;
+    /* Firefox */
+    scrollbar-width: thin;
+    scrollbar-color: var(--line) transparent;
   }
-  .rail::-webkit-scrollbar { width: 6px; }
-  .rail::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
-
-  .workspace {
-    display: grid;
-    gap: 18px;
-    align-content: start;
-  }
+  .workspace { gap: 18px; }
+  .rail::-webkit-scrollbar,
+  .workspace::-webkit-scrollbar { width: 6px; }
+  .rail::-webkit-scrollbar-thumb,
+  .workspace::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
 
   .panel {
     padding: 22px 24px;
@@ -1436,9 +1441,41 @@
   });
 
   // ---------------------------------------------------------------------
+  // Sync scroll between the rail and the workspace
+  //
+  // Columns have independent heights (reviewers list + automation ≠ a
+  // 30-PR routing log), so pixel-for-pixel sync would either overshoot
+  // or leave the shorter pane stuck. Mirror by ratio instead:
+  // scrollTop / (scrollHeight - clientHeight) maps to [0,1] on the
+  // source and we rescale to the target's own range. A re-entry flag
+  // prevents the mirrored assignment from re-firing the opposite
+  // handler into an infinite loop.
+  // ---------------------------------------------------------------------
+  function initSyncScroll() {
+    const rail = document.querySelector('.rail');
+    const workspace = document.querySelector('.workspace');
+    if (!rail || !workspace) return;
+    let syncing = false;
+    function mirror(source, target) {
+      return () => {
+        if (syncing) return;
+        const sMax = source.scrollHeight - source.clientHeight;
+        const tMax = target.scrollHeight - target.clientHeight;
+        if (sMax <= 0 || tMax <= 0) return;
+        syncing = true;
+        target.scrollTop = (source.scrollTop / sMax) * tMax;
+        requestAnimationFrame(() => { syncing = false; });
+      };
+    }
+    rail.addEventListener('scroll', mirror(rail, workspace), { passive: true });
+    workspace.addEventListener('scroll', mirror(workspace, rail), { passive: true });
+  }
+
+  // ---------------------------------------------------------------------
   // Go
   // ---------------------------------------------------------------------
   renderAll();
+  initSyncScroll();
 </script>
 </body>
 </html>
