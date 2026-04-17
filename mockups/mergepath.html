@@ -1,0 +1,1434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mergepath</title>
+<!-- Live-data injection marker. scripts/policy-sim.sh replaces this with
+     <script>window.__PRS = [...]</script>. Do not remove. -->
+<!-- MERGEPATH_INJECT -->
+<!-- RUBRIC_INJECT -->
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f4efe5;
+    --page-deep: #ece3d3;
+    --panel: rgba(255, 252, 246, 0.88);
+    --panel-strong: #fffdf9;
+    --ink: #1b2426;
+    --muted: #5d655f;
+    --soft: #7c8077;
+    --line: rgba(67, 79, 77, 0.16);
+    --line-strong: rgba(43, 68, 63, 0.26);
+    --accent: #1f6257;
+    --accent-soft: rgba(31, 98, 87, 0.12);
+    --accent-warm: #b77730;
+    --accent-warm-soft: rgba(183, 119, 48, 0.14);
+    --p1: #4a5568;
+    --p2: #2c5282;
+    --p25: #6b46c1;
+    --p3: #a16207;
+    --p4a: #1f7a57;
+    --p4b: #9d4e38;
+    --merge: #1b2426;
+    --shadow: 0 20px 50px rgba(36, 43, 45, 0.08);
+    --radius-xl: 24px;
+    --radius-lg: 16px;
+    --radius-md: 12px;
+    --radius-sm: 8px;
+    --sans: "Avenir Next", -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Helvetica, Arial, sans-serif;
+    --mono: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    background:
+      radial-gradient(circle at top left, rgba(255, 255, 255, 0.7), transparent 34%),
+      radial-gradient(circle at 85% 12%, rgba(31, 98, 87, 0.08), transparent 28%),
+      linear-gradient(180deg, var(--page) 0%, var(--page-deep) 100%);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body::before, body::after {
+    content: "";
+    position: fixed;
+    width: 42vw;
+    height: 42vw;
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 0;
+    filter: blur(8px);
+  }
+  body::before {
+    top: -18vw; right: -10vw;
+    background: radial-gradient(circle, rgba(31, 98, 87, 0.08), transparent 68%);
+  }
+  body::after {
+    bottom: -22vw; left: -10vw;
+    background: radial-gradient(circle, rgba(183, 119, 48, 0.09), transparent 70%);
+  }
+
+  button, input, select { font: inherit; }
+  button { cursor: pointer; }
+  .mono { font-family: var(--mono); }
+
+  .shell {
+    position: relative;
+    z-index: 1;
+    width: min(1380px, calc(100vw - 32px));
+    margin: 20px auto 30px;
+  }
+
+  /* Hero */
+  .hero {
+    display: flex;
+    justify-content: space-between;
+    gap: 24px;
+    padding: 28px 32px;
+    border: 1px solid rgba(255, 255, 255, 0.7);
+    border-radius: 28px;
+    background:
+      linear-gradient(135deg, rgba(255, 252, 247, 0.94), rgba(251, 245, 235, 0.8)),
+      rgba(255, 255, 255, 0.68);
+    box-shadow: var(--shadow);
+    backdrop-filter: blur(18px);
+  }
+  .eyebrow {
+    margin: 0 0 8px;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .hero h1 {
+    margin: 0;
+    font-size: clamp(1.75rem, 2.6vw, 2.25rem);
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    font-weight: 600;
+    max-width: 680px;
+  }
+  .hero .lede {
+    max-width: 680px;
+    margin: 12px 0 0;
+    color: var(--muted);
+    font-size: 14px;
+  }
+  .hero-meta {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+    min-width: 200px;
+    color: var(--soft);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .pull-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    border-radius: 999px;
+    border: 1px solid var(--line-strong);
+    background: rgba(255, 255, 255, 0.85);
+    color: var(--ink);
+    font-size: 13px;
+    font-weight: 500;
+    transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
+    text-transform: none;
+    letter-spacing: normal;
+  }
+  .pull-btn:hover {
+    background: #fff;
+    border-color: var(--accent);
+    color: var(--accent);
+    transform: translateY(-1px);
+  }
+  .pull-btn .icon { font-size: 14px; line-height: 1; }
+  .live-pill {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: #fff;
+  }
+  .live-pill.synthetic {
+    background: rgba(255, 255, 255, 0.85);
+    color: var(--soft);
+    border: 1px solid var(--line);
+  }
+
+  /* Layout */
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(320px, 380px) minmax(0, 1fr);
+    gap: 18px;
+    margin-top: 18px;
+  }
+
+  .rail {
+    display: grid;
+    gap: 16px;
+    align-content: start;
+    position: sticky;
+    top: 18px;
+    max-height: calc(100vh - 40px);
+    overflow: auto;
+    padding-right: 4px;
+  }
+  .rail::-webkit-scrollbar { width: 6px; }
+  .rail::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
+
+  .workspace {
+    display: grid;
+    gap: 18px;
+    align-content: start;
+  }
+
+  .panel {
+    padding: 22px 24px;
+    border-radius: var(--radius-xl);
+    background: var(--panel);
+    border: 1px solid rgba(255, 255, 255, 0.7);
+    box-shadow: var(--shadow);
+    backdrop-filter: blur(14px);
+  }
+
+  .panel h2 {
+    margin: 0 0 4px;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 700;
+  }
+  .panel h2 + .help {
+    margin: 0 0 14px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  /* Threshold slider */
+  .slider-row {
+    display: grid;
+    grid-template-columns: 1fr 86px;
+    gap: 12px;
+    align-items: center;
+    margin-top: 4px;
+  }
+  .slider-row .val {
+    text-align: right;
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 12px;
+    color: var(--ink);
+  }
+  input[type=range] {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 6px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--accent) 0%, rgba(31, 98, 87, 0.2) 100%);
+    outline: none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--panel-strong);
+    border: 3px solid var(--accent);
+    box-shadow: 0 4px 10px rgba(31, 98, 87, 0.2);
+    cursor: pointer;
+  }
+
+  /* Path chips */
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 4px 5px 12px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    border: 1px solid rgba(31, 98, 87, 0.18);
+    color: var(--accent);
+    font-size: 12px;
+    font-family: var(--mono);
+  }
+  .chip button {
+    width: 20px; height: 20px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: rgba(31, 98, 87, 0.12);
+    color: var(--accent);
+    font-size: 13px;
+    line-height: 1;
+  }
+  .chip button:hover { background: rgba(31, 98, 87, 0.22); }
+  .add-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .add-row input {
+    min-height: 38px;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.9);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .add-row input:focus {
+    outline: none;
+    border-color: rgba(31, 98, 87, 0.55);
+    box-shadow: 0 0 0 4px rgba(31, 98, 87, 0.12);
+  }
+  .add-row button {
+    padding: 0 14px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--line-strong);
+    background: rgba(255, 255, 255, 0.82);
+    color: var(--ink);
+    font-size: 12px;
+  }
+  .add-row button:hover { background: #fff; border-color: var(--accent); color: var(--accent); }
+
+  /* Switch rows */
+  .switch-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    padding: 14px 0;
+    border-top: 1px solid var(--line);
+  }
+  .switch-row:first-of-type { border-top: 0; padding-top: 4px; }
+  .switch-copy strong {
+    display: block;
+    color: var(--ink);
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .switch-copy span {
+    display: block;
+    margin-top: 2px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .switch {
+    position: relative;
+    display: inline-flex;
+    width: 44px;
+    height: 26px;
+    flex-shrink: 0;
+  }
+  .switch input {
+    position: absolute;
+    inset: 0;
+    margin: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+  .switch span.track {
+    width: 100%;
+    height: 100%;
+    border-radius: 999px;
+    background: rgba(69, 85, 95, 0.2);
+    transition: background 160ms ease;
+  }
+  .switch span.track::after {
+    content: "";
+    position: absolute;
+    top: 3px; left: 3px;
+    width: 20px; height: 20px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+    transition: transform 160ms ease;
+  }
+  .switch input:checked + span.track {
+    background: var(--accent);
+  }
+  .switch input:checked + span.track::after {
+    transform: translateX(18px);
+  }
+
+  .nested {
+    margin: 10px 0 0;
+    padding: 10px 0 0;
+    border-top: 1px dashed var(--line);
+    display: none;
+  }
+  .nested.shown { display: block; }
+  .nested .slider-row { margin-top: 0; }
+  .nested .hint { color: var(--soft); font-size: 11px; margin-top: 6px; }
+
+  /* Reviewers */
+  .reviewer {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 0;
+    border-top: 1px solid var(--line);
+  }
+  .reviewer:first-of-type { border-top: 0; }
+  .reviewer input[type=checkbox] { accent-color: var(--accent); width: 14px; height: 14px; }
+  .reviewer .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .reviewer .name { font-family: var(--mono); font-size: 12px; }
+  .reviewer .role { color: var(--soft); font-size: 11px; margin-left: auto; }
+
+  /* Presets */
+  .presets {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-top: 4px;
+  }
+  .presets button {
+    padding: 9px 0;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--line-strong);
+    background: rgba(255, 255, 255, 0.82);
+    color: var(--ink);
+    font-size: 12px;
+    font-weight: 500;
+    transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
+  }
+  .presets button:hover {
+    background: #fff;
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* Stats */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+  }
+  .stat {
+    padding: 14px 16px;
+    border-radius: var(--radius-lg);
+    background: rgba(255, 255, 255, 0.7);
+    border: 1px solid var(--line);
+  }
+  .stat .n {
+    font-size: 24px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+  }
+  .stat .lbl {
+    font-size: 10px;
+    color: var(--soft);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-top: 4px;
+  }
+
+  /* PR cards */
+  .pr {
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--line);
+  }
+  .pr:last-child { border-bottom: 0; }
+  .pr-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+    margin-bottom: 4px;
+  }
+  .pr-id {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--soft);
+  }
+  .pr-title { font-weight: 500; color: var(--ink); }
+  .pr-sub {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--soft);
+  }
+  .pr-meta {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    margin: 6px 0 10px;
+  }
+  .pr-meta .path { color: var(--accent); }
+  .pr-meta .path.protected::after { content: " ●"; color: var(--accent-warm); }
+
+  .flow {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .pill {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    color: #fff;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+  .pill.p1 { background: var(--p1); }
+  .pill.p2 { background: var(--p2); }
+  .pill.p25 { background: var(--p25); }
+  .pill.p3 { background: var(--p3); }
+  .pill.p4a { background: var(--p4a); }
+  .pill.p4b { background: var(--p4b); }
+  .pill.merge { background: var(--merge); }
+  .arrow { color: var(--soft); font-size: 11px; }
+
+  .section-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 14px;
+  }
+  .section-head h2 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+  }
+  .section-head .hint { font-size: 12px; color: var(--muted); }
+
+  .pr-panel { padding: 0; overflow: hidden; }
+  .pr-panel .section-head { padding: 20px 24px 10px; margin-bottom: 0; }
+
+  /* YAML */
+  .yaml-wrap {
+    padding: 0;
+    overflow: hidden;
+  }
+  .yaml-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--line);
+  }
+  .yaml-head .ttl {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--soft);
+    letter-spacing: 0.04em;
+  }
+  .yaml-head button {
+    padding: 6px 14px;
+    border-radius: 999px;
+    border: 1px solid var(--line-strong);
+    background: rgba(255, 255, 255, 0.82);
+    color: var(--ink);
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .yaml-head button:hover { background: #fff; border-color: var(--accent); color: var(--accent); }
+  pre.yaml {
+    margin: 0;
+    padding: 18px 22px;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.65;
+    color: var(--ink);
+    background: rgba(255, 252, 246, 0.4);
+    overflow-x: auto;
+  }
+  pre.yaml .k { color: var(--p2); }
+  pre.yaml .v { color: var(--p4a); }
+  pre.yaml .c { color: var(--soft); }
+  pre.yaml .s { color: var(--accent-warm); }
+
+  /* Modal */
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(27, 36, 38, 0.4);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    backdrop-filter: blur(4px);
+  }
+  .modal-backdrop.shown { display: flex; }
+  .modal {
+    background: var(--panel-strong);
+    border: 1px solid rgba(255, 255, 255, 0.7);
+    border-radius: var(--radius-xl);
+    width: 560px;
+    max-width: calc(100vw - 48px);
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.2);
+    overflow: hidden;
+  }
+  .modal h3 {
+    margin: 0;
+    padding: 22px 24px 4px;
+    font-size: 16px;
+    font-weight: 600;
+  }
+  .modal .m-body {
+    padding: 8px 24px 6px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .modal .m-body p { margin: 8px 0; }
+  .modal .m-body ol.m-steps {
+    margin: 14px 0 4px;
+    padding-left: 22px;
+  }
+  .modal .m-body ol.m-steps li {
+    margin: 10px 0;
+    color: var(--ink);
+    font-size: 13px;
+  }
+  .modal .m-body ol.m-steps li strong { font-weight: 600; }
+  .modal .m-body ol.m-steps .live-pill {
+    display: inline-block;
+    background: var(--accent);
+    color: #fff;
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    padding: 2px 8px;
+    border-radius: 999px;
+    vertical-align: baseline;
+  }
+  .modal .m-body code {
+    font-family: var(--mono);
+    font-size: 12px;
+    background: var(--accent-soft);
+    padding: 1px 6px;
+    border-radius: 4px;
+    color: var(--accent);
+  }
+  .modal pre.cmd {
+    margin: 12px 0 0;
+    padding: 12px 14px;
+    background: #1b2426;
+    color: #f4efe5;
+    border-radius: var(--radius-md);
+    font-family: var(--mono);
+    font-size: 12.5px;
+    overflow-x: auto;
+    position: relative;
+  }
+  .modal pre.cmd .prompt { color: #7c8077; user-select: none; margin-right: 8px; }
+  .modal pre.cmd .copy {
+    position: absolute;
+    top: 8px; right: 8px;
+    font-size: 11px;
+    padding: 3px 10px;
+    background: rgba(255, 255, 255, 0.08);
+    color: #f4efe5;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .modal pre.cmd .copy:hover { background: rgba(255, 255, 255, 0.18); }
+  .modal .hint {
+    font-size: 12px;
+    color: var(--soft);
+    padding: 16px 24px 0;
+  }
+  .modal .hint code {
+    background: transparent;
+    color: var(--accent);
+    padding: 0;
+  }
+  .modal .m-actions {
+    padding: 16px 24px 18px;
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    border-top: 1px solid var(--line);
+    background: rgba(244, 239, 229, 0.4);
+    margin-top: 16px;
+  }
+  .modal .m-actions button {
+    font-size: 12px;
+    padding: 8px 16px;
+    border-radius: 999px;
+    border: 1px solid var(--line-strong);
+    background: rgba(255, 255, 255, 0.82);
+    color: var(--ink);
+    font-weight: 500;
+  }
+  .modal .m-actions button.primary {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+  .modal .m-actions button:hover { background: #fff; border-color: var(--accent); color: var(--accent); }
+  .modal .m-actions button.primary:hover {
+    background: #165045;
+    color: #fff;
+    border-color: #165045;
+  }
+
+  footer {
+    margin-top: 20px;
+    padding: 0 8px;
+    font-size: 11px;
+    color: var(--soft);
+    display: flex;
+    justify-content: space-between;
+  }
+
+  /* Visually hidden — available to screen readers only. */
+  .sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .empty-state {
+    padding: 48px 24px;
+    text-align: center;
+    color: var(--soft);
+    font-style: italic;
+  }
+
+  /* Focus visibility */
+  button:focus-visible,
+  input:focus-visible,
+  [role="dialog"] button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  @media (max-width: 960px) {
+    .layout { grid-template-columns: 1fr; }
+    .rail { position: static; max-height: none; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .hero { flex-direction: column; }
+    .hero-meta { align-items: flex-start; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      transition-duration: 0.001ms !important;
+      animation-duration: 0.001ms !important;
+    }
+    .button:hover, .pull-btn:hover { transform: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <section class="hero">
+    <div>
+      <p class="eyebrow">Mergepath</p>
+      <h1>Tune your review policy and see how every PR would route.</h1>
+      <p class="lede">Adjust the threshold, protected paths, and automation toggles. Mergepath replays your recent PRs against the policy so you can feel the shape of the change before committing the YAML.</p>
+    </div>
+    <div class="hero-meta">
+      <button id="refreshBtn" class="pull-btn" type="button"
+              aria-haspopup="dialog" aria-controls="refreshModal"
+              title="Use the gh CLI to replay your repo's real merged PRs">
+        <span class="icon" aria-hidden="true">↻</span> Pull live PRs
+      </button>
+      <span id="livePill" class="live-pill synthetic">synthetic</span>
+      <span>ai_agent_repo_template · mockup</span>
+    </div>
+  </section>
+
+  <div class="layout">
+
+    <aside class="rail">
+
+      <div class="panel">
+        <h2>Gate Rules</h2>
+        <p class="help">What pushes a PR to external review.</p>
+
+        <div style="margin-top: 14px;">
+          <div class="switch-copy" style="margin-bottom: 6px;">
+            <strong>External review threshold</strong>
+            <span>Lines changed at or above this value escalate to Phase 4.</span>
+          </div>
+          <div class="slider-row">
+            <input type="range" id="threshold" min="50" max="1000" step="10" value="300" />
+            <span class="val"><span id="thresholdVal">300</span> lines</span>
+          </div>
+        </div>
+
+        <div style="margin-top: 18px;">
+          <div class="switch-copy" style="margin-bottom: 2px;">
+            <strong>Protected paths</strong>
+            <span>Any match forces Phase 4 regardless of size.</span>
+          </div>
+          <div class="chips" id="pathChips"></div>
+          <div class="add-row">
+            <label for="pathInput" class="sr-only">Add protected path glob</label>
+            <input type="text" id="pathInput" placeholder="e.g. src/auth/**"
+                   autocomplete="off" spellcheck="false" maxlength="200" />
+            <button id="pathAdd" type="button">Add</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Automation</h2>
+        <p class="help">External review bots that participate in Phase 2.5 and Phase 4.</p>
+
+        <div class="switch-row">
+          <div class="switch-copy">
+            <strong>CodeRabbit</strong>
+            <span>Advisory auto-review on PR open.</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" data-toggle="coderabbit" checked />
+            <span class="track"></span>
+          </label>
+        </div>
+
+        <div class="switch-row">
+          <div class="switch-copy">
+            <strong>Codex GitHub App</strong>
+            <span>Phase 4a automated external review.</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" data-toggle="codex" checked />
+            <span class="track"></span>
+          </label>
+        </div>
+        <div class="nested shown" id="codexNested">
+          <div class="slider-row">
+            <input type="range" id="codexRounds" min="1" max="5" step="1" value="2" />
+            <span class="val">max <span id="codexRoundsVal">2</span> rounds</span>
+          </div>
+          <p class="hint">Beyond this, Mergepath stops the loop and pings a human.</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Reviewers</h2>
+        <p class="help">Identities eligible to serve as internal reviewer.</p>
+        <label class="reviewer">
+          <input type="checkbox" data-reviewer="claude" checked />
+          <span class="dot" style="background: #d97757;"></span>
+          <span class="name">nathanpayne-claude</span>
+          <span class="role">author: claude</span>
+        </label>
+        <label class="reviewer">
+          <input type="checkbox" data-reviewer="cursor" checked />
+          <span class="dot" style="background: #4a5568;"></span>
+          <span class="name">nathanpayne-cursor</span>
+          <span class="role">author: cursor</span>
+        </label>
+        <label class="reviewer">
+          <input type="checkbox" data-reviewer="codex" checked />
+          <span class="dot" style="background: #10a37f;"></span>
+          <span class="name">nathanpayne-codex</span>
+          <span class="role">author: codex</span>
+        </label>
+      </div>
+
+      <div class="panel">
+        <h2>Presets</h2>
+        <p class="help">Opinionated starting points. Adjust from there.</p>
+        <div class="presets">
+          <button type="button" data-preset="strict">Strict</button>
+          <button type="button" data-preset="standard">Standard</button>
+          <button type="button" data-preset="loose">Loose</button>
+        </div>
+      </div>
+
+    </aside>
+
+    <section class="workspace">
+
+      <div class="stats" id="stats"></div>
+
+      <div class="panel pr-panel">
+        <div class="section-head">
+          <h2 id="simTitle">Routing simulation</h2>
+          <span class="hint" id="simHint">How each recent PR would route under the current policy.</span>
+        </div>
+        <div id="prList"></div>
+      </div>
+
+      <div class="panel yaml-wrap">
+        <div class="yaml-head">
+          <span class="ttl">.github/review-policy.yml</span>
+          <button id="copyYaml">Copy YAML</button>
+        </div>
+        <pre class="yaml" id="yaml"></pre>
+      </div>
+
+    </section>
+
+  </div>
+
+  <footer>
+    <span>Mergepath · static mockup · no network, no auth</span>
+    <span class="mono">v0.2</span>
+  </footer>
+</div>
+
+<div id="live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
+<div class="modal-backdrop" id="refreshModal" aria-hidden="true">
+  <div class="modal" role="dialog" aria-modal="true" tabindex="-1"
+       aria-labelledby="refreshTitle" aria-describedby="refreshDesc">
+    <h3 id="refreshTitle">Replay your real PRs</h3>
+    <div class="m-body" id="refreshDesc">
+      <p>This page is static HTML&mdash;it can't shell out to <code>gh</code> from the browser. A tiny helper script does it for you: it lists your repo's recent merged PRs, bakes the data into a copy of this file, and opens the copy in a new tab.</p>
+      <ol class="m-steps">
+        <li><strong>Open a terminal</strong> at your repo root (the folder with <code>.github/review-policy.yml</code>).</li>
+        <li><strong>Run the helper.</strong> Default pulls the last 20 merged PRs:
+          <pre class="cmd"><button class="copy" data-copy-target="cmd1">Copy</button><span class="prompt">$</span><span id="cmd1">./scripts/policy-sim.sh</span></pre>
+          Or pass a custom limit (any positive integer):
+          <pre class="cmd"><button class="copy" data-copy-target="cmd2">Copy</button><span class="prompt">$</span><span id="cmd2">./scripts/policy-sim.sh 50</span></pre>
+        </li>
+        <li><strong>A new browser tab opens</strong> with the same dashboard, but the <span class="live-pill" aria-hidden="true">live</span> badge will be lit and the routing simulation will replay your real merged PRs under the current policy.</li>
+      </ol>
+    </div>
+    <div class="hint">
+      Needs <code>gh</code>, <code>jq</code>, and <code>python3</code> on <code>PATH</code>. <code>gh</code> must be authenticated (<code>gh auth status</code>). Nothing is written back to your repo&mdash;the baked copy lives in a temp file.
+    </div>
+    <div class="m-actions">
+      <button id="closeModal" type="button">Close</button>
+      <button class="primary" id="copyAndClose" type="button">Copy command &amp; close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  'use strict';
+
+  // ---------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------
+  const DEFAULTS = {
+    threshold: 300,
+    protectedPaths: ['src/auth/**', 'src/payments/**', '.github/**', 'credentials/**'],
+    coderabbit: true,
+    codex: true,
+    codexRounds: 2,
+    reviewers: { claude: true, cursor: true, codex: true },
+  };
+
+  const PRESETS = {
+    strict:   { threshold: 100, coderabbit: true,  codex: true,  codexRounds: 3 },
+    standard: { threshold: 300, coderabbit: true,  codex: true,  codexRounds: 2 },
+    loose:    { threshold: 800, coderabbit: false, codex: false, codexRounds: 1 },
+  };
+
+  const LIMITS = {
+    pathMaxLen: 200,
+    pathMaxCount: 25,
+    // Allow POSIX-ish paths + glob wildcards. Rejects <>, quotes, control chars.
+    pathAllowed: /^[A-Za-z0-9_.\-/*?[\]{}:@+,!~$^=]+$/,
+  };
+
+  const state = structuredClone
+    ? structuredClone(DEFAULTS)
+    : JSON.parse(JSON.stringify(DEFAULTS));
+
+  // ---------------------------------------------------------------------
+  // Sample data + live data detection
+  // ---------------------------------------------------------------------
+  const SYNTHETIC_PRS = [
+    { id: '#142', title: 'Fix footer copyright year',            author: 'claude', lines: 2,   paths: ['src/components/Footer.tsx'] },
+    { id: '#141', title: 'Rotate Stripe webhook secret',         author: 'codex',  lines: 15,  paths: ['src/payments/webhook.ts', 'credentials/stripe.yml'] },
+    { id: '#140', title: 'Add dark mode toggle',                 author: 'cursor', lines: 183, paths: ['src/components/Layout.tsx', 'src/hooks/useTheme.ts'] },
+    { id: '#139', title: 'Refactor billing module',              author: 'claude', lines: 421, paths: ['src/payments/billing.ts', 'src/payments/invoice.ts'], forcedRounds: 2 },
+    { id: '#138', title: 'Migrate users table (email_verified)', author: 'codex',  lines: 287, paths: ['db/migrations/20260414_users_verified.sql', 'src/auth/User.ts'] },
+    { id: '#137', title: 'Cache pnpm store in CI',               author: 'cursor', lines: 42,  paths: ['.github/workflows/ci.yml'] },
+    { id: '#136', title: 'Replace lodash with native methods',   author: 'claude', lines: 624, paths: ['src/utils/collection.ts', 'src/utils/object.ts'], forcedRounds: 2 },
+    { id: '#135', title: 'Add blog index redirect',              author: 'cursor', lines: 8,   paths: ['src/pages/blog/index.tsx'] },
+  ];
+
+  function normalizePR(raw) {
+    // Accept the shape that scripts/policy-sim.sh produces, tolerate partials.
+    if (!raw || typeof raw !== 'object') return null;
+    return {
+      id: String(raw.id || '#?'),
+      title: String(raw.title || '(untitled)'),
+      author: String(raw.author || 'unknown'),
+      lines: Number.isFinite(+raw.lines) ? +raw.lines : 0,
+      paths: Array.isArray(raw.paths) ? raw.paths.filter(p => typeof p === 'string') : [],
+      forcedRounds: Number.isFinite(+raw.forcedRounds) ? +raw.forcedRounds : undefined,
+    };
+  }
+
+  const isLive = Array.isArray(window.__PRS) && window.__PRS.length > 0;
+  const samplePRs = (isLive ? window.__PRS : SYNTHETIC_PRS)
+    .map(normalizePR)
+    .filter(Boolean);
+
+  // ---------------------------------------------------------------------
+  // DOM helpers
+  // ---------------------------------------------------------------------
+  const $ = (id) => document.getElementById(id);
+  const announce = (msg) => { const el = $('live'); if (el) el.textContent = msg; };
+
+  function el(tag, attrs, children) {
+    const node = document.createElement(tag);
+    if (attrs) {
+      for (const [k, v] of Object.entries(attrs)) {
+        if (k === 'class') node.className = v;
+        else if (k === 'text') node.textContent = v;
+        else if (k === 'title') node.title = v;
+        else if (k.startsWith('data-') || k.startsWith('aria-') || k === 'role') node.setAttribute(k, v);
+        else if (k === 'type') node.type = v;
+        else node[k] = v;
+      }
+    }
+    if (children) {
+      for (const c of children) {
+        if (c == null) continue;
+        node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+      }
+    }
+    return node;
+  }
+
+  // ---------------------------------------------------------------------
+  // Glob matching — cached, safe against regex-breaking characters
+  // ---------------------------------------------------------------------
+  const globCache = new Map();
+  function compileGlob(pattern) {
+    if (globCache.has(pattern)) return globCache.get(pattern);
+    try {
+      const re = '^' + pattern
+        .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+        .replace(/\*\*/g, '::DS::')
+        .replace(/\*/g, '[^/]*')
+        .replace(/::DS::/g, '.*')
+        .replace(/\?/g, '.') + '$';
+      const compiled = new RegExp(re);
+      globCache.set(pattern, compiled);
+      return compiled;
+    } catch (e) {
+      globCache.set(pattern, null);
+      return null;
+    }
+  }
+  function matchGlob(path, pattern) {
+    const re = compileGlob(pattern);
+    return re ? re.test(path) : false;
+  }
+
+  // ---------------------------------------------------------------------
+  // Routing simulation
+  // ---------------------------------------------------------------------
+  function simulate(pr) {
+    const phases = [
+      { key: 'p1', label: 'Phase 1', note: 'Author' },
+      { key: 'p2', label: 'Phase 2', note: 'Internal review' },
+    ];
+    if (state.coderabbit) phases.push({ key: 'p25', label: 'Phase 2.5', note: 'CodeRabbit' });
+
+    const overThreshold = pr.lines >= state.threshold;
+    const protectedHit = pr.paths.some(p => state.protectedPaths.some(pat => matchGlob(p, pat)));
+    const gated = overThreshold || protectedHit;
+
+    if (gated) {
+      phases.push({ key: 'p3', label: 'Phase 3', note: 'Threshold gate' });
+      if (state.codex) {
+        const rounds = Math.max(1, Math.min(pr.forcedRounds || 1, state.codexRounds));
+        phases.push({ key: 'p4a', label: 'Phase 4a', note: 'Codex · ' + rounds + ' round' + (rounds === 1 ? '' : 's') });
+      } else {
+        phases.push({ key: 'p4b', label: 'Phase 4b', note: 'Manual handoff' });
+      }
+    }
+
+    phases.push({ key: 'merge', label: 'Merged', note: '' });
+    return { phases, gated, overThreshold, protectedHit };
+  }
+
+  // ---------------------------------------------------------------------
+  // Rendering (all XSS-safe — DOM nodes, never innerHTML for data)
+  // ---------------------------------------------------------------------
+  function renderChips() {
+    const wrap = $('pathChips');
+    wrap.textContent = '';
+    state.protectedPaths.forEach((p, i) => {
+      const chip = el('span', { class: 'chip' }, [p + ' ']);
+      const btn = el('button', {
+        type: 'button',
+        'data-rm': String(i),
+        'aria-label': 'Remove protected path ' + p,
+        text: '×',
+      });
+      chip.appendChild(btn);
+      wrap.appendChild(chip);
+    });
+  }
+
+  function renderPRs() {
+    const list = $('prList');
+    list.textContent = '';
+
+    if (samplePRs.length === 0) {
+      list.appendChild(el('div', { class: 'empty-state', text: 'No PRs to simulate. Pull live PRs or edit the synthetic set.' }));
+      $('stats').textContent = '';
+      return;
+    }
+
+    const stats = { merged: 0, gated: 0, codexTouched: 0, handoff: 0 };
+
+    samplePRs.forEach(pr => {
+      const s = simulate(pr);
+      if (s.phases.some(p => p.key === 'merge')) stats.merged++;
+      if (s.gated) stats.gated++;
+      if (s.phases.some(p => p.key === 'p4a')) stats.codexTouched++;
+      if (s.phases.some(p => p.key === 'p4b')) stats.handoff++;
+
+      const pathNodes = pr.paths.map(p => {
+        const protectedHit = state.protectedPaths.some(pat => matchGlob(p, pat));
+        return el('span', { class: 'path' + (protectedHit ? ' protected' : ''), text: p });
+      });
+      const pathWrap = el('div', { class: 'pr-meta' });
+      pathNodes.forEach((n, i) => {
+        pathWrap.appendChild(n);
+        if (i < pathNodes.length - 1) pathWrap.appendChild(document.createTextNode('  '));
+      });
+
+      const flow = el('div', { class: 'flow', role: 'list', 'aria-label': 'Routing for ' + pr.id });
+      s.phases.forEach((ph, i) => {
+        if (i > 0) flow.appendChild(el('span', { class: 'arrow', 'aria-hidden': 'true', text: '→' }));
+        flow.appendChild(el('span', {
+          class: 'pill ' + ph.key,
+          role: 'listitem',
+          title: ph.note,
+          text: ph.label,
+        }));
+      });
+
+      const head = el('div', { class: 'pr-head' }, [
+        el('div', null, [
+          el('span', { class: 'pr-id', text: pr.id }),
+          ' ',
+          el('span', { class: 'pr-title', text: pr.title }),
+        ]),
+        el('div', { class: 'pr-sub', text: pr.lines + ' lines · @' + pr.author }),
+      ]);
+
+      list.appendChild(el('div', { class: 'pr' }, [head, pathWrap, flow]));
+    });
+
+    const statsEl = $('stats');
+    statsEl.textContent = '';
+    [
+      [stats.merged, 'of ' + samplePRs.length + ' merge'],
+      [stats.gated, 'hit phase-4 gate'],
+      [stats.codexTouched, 'routed to codex'],
+      [stats.handoff, 'manual handoff'],
+    ].forEach(([n, lbl]) => {
+      statsEl.appendChild(el('div', { class: 'stat' }, [
+        el('div', { class: 'n', text: String(n) }),
+        el('div', { class: 'lbl', text: lbl }),
+      ]));
+    });
+  }
+
+  function renderYaml() {
+    // Build both the plain text (for copy) and the highlighted DOM.
+    const yaml = $('yaml');
+    yaml.textContent = '';
+    const add = (cls, text) => yaml.appendChild(el('span', { class: cls, text }));
+    const nl = () => yaml.appendChild(document.createTextNode('\n'));
+
+    add('c', '# .github/review-policy.yml'); nl();
+    add('k', 'external_review_threshold'); yaml.appendChild(document.createTextNode(': '));
+    add('v', String(state.threshold)); nl();
+    add('k', 'external_review_paths'); yaml.appendChild(document.createTextNode(':')); nl();
+    state.protectedPaths.forEach(p => {
+      yaml.appendChild(document.createTextNode('  - '));
+      add('s', '"' + p + '"');
+      nl();
+    });
+    add('k', 'coderabbit'); yaml.appendChild(document.createTextNode(':')); nl();
+    yaml.appendChild(document.createTextNode('  '));
+    add('k', 'enabled'); yaml.appendChild(document.createTextNode(': '));
+    add('v', String(state.coderabbit)); nl();
+    add('k', 'codex'); yaml.appendChild(document.createTextNode(':')); nl();
+    yaml.appendChild(document.createTextNode('  '));
+    add('k', 'enabled'); yaml.appendChild(document.createTextNode(': '));
+    add('v', String(state.codex)); nl();
+    if (state.codex) {
+      yaml.appendChild(document.createTextNode('  '));
+      add('k', 'max_review_rounds'); yaml.appendChild(document.createTextNode(': '));
+      add('v', String(state.codexRounds)); nl();
+    }
+    add('k', 'available_reviewers'); yaml.appendChild(document.createTextNode(':')); nl();
+    Object.entries(state.reviewers).forEach(([k, v]) => {
+      if (v) {
+        yaml.appendChild(document.createTextNode('  - '));
+        add('s', k);
+        nl();
+      }
+    });
+  }
+
+  function renderAll() {
+    renderChips();
+    renderPRs();
+    renderYaml();
+  }
+
+  // ---------------------------------------------------------------------
+  // Header pill + sim hint
+  // ---------------------------------------------------------------------
+  {
+    const pill = $('livePill');
+    const hint = $('simHint');
+    const n = samplePRs.length;
+    if (isLive) {
+      pill.textContent = 'live · ' + n;
+      pill.classList.remove('synthetic');
+      pill.setAttribute('aria-label', 'Live data, ' + n + ' pull requests');
+      hint.textContent = 'Replaying last ' + n + ' merged PRs from your repo.';
+    } else {
+      pill.textContent = 'synthetic · ' + n;
+      pill.setAttribute('aria-label', 'Synthetic sample data, ' + n + ' pull requests');
+      hint.textContent = n > 0
+        ? 'Replaying a synthetic set. Pull live PRs to use your repo.'
+        : 'No PRs loaded. Pull live PRs to populate.';
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Event wiring
+  // ---------------------------------------------------------------------
+  $('threshold').addEventListener('input', e => {
+    state.threshold = +e.target.value;
+    $('thresholdVal').textContent = state.threshold;
+    renderAll();
+  });
+
+  $('codexRounds').addEventListener('input', e => {
+    state.codexRounds = +e.target.value;
+    $('codexRoundsVal').textContent = state.codexRounds;
+    renderAll();
+  });
+
+  function validatePath(raw) {
+    const v = (raw || '').trim();
+    if (!v) return { ok: false, reason: 'Path is empty.' };
+    if (v.length > LIMITS.pathMaxLen) return { ok: false, reason: 'Path is too long (max ' + LIMITS.pathMaxLen + ' chars).' };
+    if (!LIMITS.pathAllowed.test(v)) return { ok: false, reason: 'Path contains disallowed characters.' };
+    if (state.protectedPaths.includes(v)) return { ok: false, reason: 'Path is already in the list.' };
+    if (state.protectedPaths.length >= LIMITS.pathMaxCount) return { ok: false, reason: 'Max ' + LIMITS.pathMaxCount + ' protected paths.' };
+    return { ok: true, value: v };
+  }
+
+  function addPath() {
+    const inp = $('pathInput');
+    const res = validatePath(inp.value);
+    if (!res.ok) {
+      announce(res.reason);
+      inp.focus();
+      inp.select();
+      return;
+    }
+    state.protectedPaths.push(res.value);
+    inp.value = '';
+    renderAll();
+    announce('Added protected path ' + res.value + '.');
+  }
+
+  $('pathAdd').addEventListener('click', addPath);
+  $('pathInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); addPath(); }
+  });
+
+  $('pathChips').addEventListener('click', e => {
+    const btn = e.target.closest('[data-rm]');
+    if (!btn) return;
+    const i = +btn.dataset.rm;
+    if (!Number.isInteger(i) || i < 0 || i >= state.protectedPaths.length) return;
+    const removed = state.protectedPaths.splice(i, 1)[0];
+    renderAll();
+    announce('Removed ' + removed + '.');
+  });
+
+  document.querySelectorAll('[data-toggle]').forEach(t => {
+    t.addEventListener('change', () => {
+      const key = t.dataset.toggle;
+      state[key] = t.checked;
+      if (key === 'codex') {
+        $('codexNested').classList.toggle('shown', state.codex);
+      }
+      renderAll();
+    });
+  });
+
+  document.querySelectorAll('[data-reviewer]').forEach(c => {
+    c.addEventListener('change', () => {
+      state.reviewers[c.dataset.reviewer] = c.checked;
+      renderAll();
+    });
+  });
+
+  function applyPreset(name) {
+    const p = PRESETS[name];
+    if (!p) return;
+    Object.assign(state, p);
+    $('threshold').value = state.threshold;
+    $('thresholdVal').textContent = state.threshold;
+    $('codexRounds').value = state.codexRounds;
+    $('codexRoundsVal').textContent = state.codexRounds;
+    document.querySelector('[data-toggle="coderabbit"]').checked = state.coderabbit;
+    document.querySelector('[data-toggle="codex"]').checked = state.codex;
+    $('codexNested').classList.toggle('shown', state.codex);
+    renderAll();
+    announce('Applied ' + name + ' preset.');
+  }
+  document.querySelectorAll('[data-preset]').forEach(b => {
+    b.addEventListener('click', () => applyPreset(b.dataset.preset));
+  });
+
+  // ---------------------------------------------------------------------
+  // Clipboard with fallback
+  // ---------------------------------------------------------------------
+  async function copyText(text) {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (e) { /* fall through */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return !!ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function yamlPlainText() {
+    // Walk yaml children to reconstruct the source without tags.
+    return $('yaml').innerText;
+  }
+
+  async function flashCopied(btn, okLabel = 'Copied', failLabel = 'Copy failed') {
+    if (!btn) return;
+    const prev = btn.textContent;
+    btn.textContent = okLabel;
+    setTimeout(() => { btn.textContent = prev; }, 1200);
+    return failLabel; // unused; for symmetry
+  }
+
+  $('copyYaml').addEventListener('click', async () => {
+    const btn = $('copyYaml');
+    const ok = await copyText(yamlPlainText());
+    btn.textContent = ok ? 'Copied' : 'Copy failed';
+    announce(ok ? 'YAML copied to clipboard.' : 'Copy failed. Select the YAML manually.');
+    setTimeout(() => { btn.textContent = 'Copy YAML'; }, 1400);
+  });
+
+  // ---------------------------------------------------------------------
+  // Modal with focus trap
+  // ---------------------------------------------------------------------
+  const modal = $('refreshModal');
+  const modalDialog = modal.querySelector('.modal');
+  let lastFocused = null;
+
+  function focusables() {
+    return Array.from(modalDialog.querySelectorAll(
+      'button, [href], input, select, [tabindex]:not([tabindex="-1"])'
+    )).filter(el => !el.disabled && el.offsetParent !== null);
+  }
+
+  function openModal() {
+    lastFocused = document.activeElement;
+    modal.classList.add('shown');
+    modal.setAttribute('aria-hidden', 'false');
+    const f = focusables();
+    (f[0] || modalDialog).focus({ preventScroll: true });
+  }
+  function closeModal() {
+    modal.classList.remove('shown');
+    modal.setAttribute('aria-hidden', 'true');
+    if (lastFocused && typeof lastFocused.focus === 'function') {
+      lastFocused.focus({ preventScroll: true });
+    }
+  }
+
+  $('refreshBtn').addEventListener('click', openModal);
+  $('closeModal').addEventListener('click', closeModal);
+  modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+
+  document.addEventListener('keydown', e => {
+    if (!modal.classList.contains('shown')) return;
+    if (e.key === 'Escape') { e.preventDefault(); closeModal(); return; }
+    if (e.key === 'Tab') {
+      const f = focusables();
+      if (f.length === 0) return;
+      const first = f[0], last = f[f.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  });
+
+  // Copy buttons inside the modal — delegated.
+  modalDialog.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-copy-target]');
+    if (!btn) return;
+    const src = $(btn.dataset.copyTarget);
+    if (!src) return;
+    const ok = await copyText(src.textContent);
+    btn.textContent = ok ? 'Copied' : 'Copy failed';
+    announce(ok ? 'Command copied.' : 'Copy failed. Select the command manually.');
+    setTimeout(() => { btn.textContent = 'Copy'; }, 1400);
+  });
+
+  $('copyAndClose').addEventListener('click', async () => {
+    const ok = await copyText('./scripts/policy-sim.sh');
+    announce(ok ? 'Command copied to clipboard.' : 'Copy failed.');
+    closeModal();
+  });
+
+  // ---------------------------------------------------------------------
+  // Go
+  // ---------------------------------------------------------------------
+  renderAll();
+</script>
+</body>
+</html>

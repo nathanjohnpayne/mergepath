@@ -30,6 +30,8 @@ fallback (Phase 4b).
 | `DEPLOYMENT.md` | Build and deployment |
 | `CONTRIBUTING.md` | Development workflow |
 | `.ai_context.md` | High-level system context |
+| `mockups/mergepath.html` | Mergepath dashboard — tune the review policy and replay recent PRs against the draft |
+| `scripts/policy-sim.sh` | Bakes real `gh` PR data into a temp copy of the Mergepath dashboard for local replay |
 | `ai_agent_tooling_standard.md` | Full repository standard (reference) |
 
 ## Firebase Auth Template
@@ -53,6 +55,7 @@ See `DEPLOYMENT.md` for the full bootstrap and deploy flow.
 | `rules/` | Binding repository constraints |
 | `specs/` | Intended system behavior |
 | `plans/` | Execution and migration plans |
+| `mockups/` | Static prototypes and interactive policy/playground mockups |
 | `tests/` | Automated validation |
 | `src/` | Application code |
 | `functions/` | Backend handlers |
