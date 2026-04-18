@@ -1,0 +1,22 @@
+# Fixture — exercises the workflow shell-parser scripts.
+# Mirrors the real .github/review-policy.yml schema closely
+# enough to catch regressions in parse_policy_list.sh and
+# match_protected_paths.sh. See scripts/ci/check_workflow_parsers
+# and mergepath#57.
+external_review_threshold: 300
+
+external_review_paths:
+  - "src/auth/**"
+  - "src/payments/**"
+  - "**/*secret*"
+  - "**/*credential*"
+  - ".github/**"
+
+# Inline comments inside a block should not break the parser.
+available_reviewers:
+  - nathanpayne-claude
+  # A commented-out entry between list items — still parsable.
+  - nathanpayne-cursor
+  - nathanpayne-codex
+
+author_identity: nathanjohnpayne

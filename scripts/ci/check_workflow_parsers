@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Unit-level coverage for the two shell scripts the workflows
+# call to parse `.github/review-policy.yml` and match changed
+# files against protected-path globs:
+#   - scripts/workflow/parse_policy_list.sh
+#   - scripts/workflow/match_protected_paths.sh
+#
+# Covers the failure modes that escaped to prod in #54 / PR #55
+# (documented in mergepath#57):
+#
+#   bug 1: YAML parse failure (awk range self-termination)
+#   bug 2: external_review_paths silently empty
+#   bug 3: glob-to-regex double-transform mismatched nested paths
+#
+# Runs from the repo root. Invoked by .github/workflows/repo_lint.yml.
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+FIXTURE="scripts/ci/fixtures/workflow-parsers/review-policy.sample.yml"
+PARSE="scripts/workflow/parse_policy_list.sh"
+MATCH="scripts/workflow/match_protected_paths.sh"
+
+for f in "$FIXTURE" "$PARSE" "$MATCH"; do
+  if [ ! -f "$f" ]; then
+    echo "check_workflow_parsers: missing required file: $f" >&2
+    exit 1
+  fi
+done
+
+pass=0
+fail=0
+
+assert_eq() {
+  local desc="$1" expected="$2" actual="$3"
+  if [ "$expected" = "$actual" ]; then
+    pass=$((pass + 1))
+    echo "  PASS: $desc"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: $desc" >&2
+    echo "    expected:" >&2
+    printf '      %s\n' $expected >&2
+    echo "    actual:" >&2
+    printf '      %s\n' $actual >&2
+  fi
+}
+
+echo "parse_policy_list.sh tests"
+
+# Covers bug 2: the range-based parser silently produced an empty
+# list for external_review_paths. If that regresses, this fails.
+got=$(bash "$PARSE" "$FIXTURE" external_review_paths)
+want='src/auth/**
+src/payments/**
+**/*secret*
+**/*credential*
+.github/**'
+assert_eq "extracts external_review_paths (5 entries, quotes stripped)" "$want" "$got"
+
+got=$(bash "$PARSE" "$FIXTURE" available_reviewers)
+want='nathanpayne-claude
+nathanpayne-cursor
+nathanpayne-codex'
+assert_eq "extracts available_reviewers (3 entries, no quotes to strip)" "$want" "$got"
+
+got=$(bash "$PARSE" "$FIXTURE" nonexistent_key || true)
+assert_eq "returns empty for missing key" "" "$got"
+
+got=$(bash "$PARSE" "$FIXTURE" external_review_paths | wc -l | tr -d ' ')
+assert_eq "line count matches entry count" "5" "$got"
+
+echo
+echo "match_protected_paths.sh tests"
+
+# Covers bug 3: the glob-to-regex double-transform silently failed
+# to match nested paths under `.github/**`.
+got=$(printf '%s\n' ".github/workflows/foo.yml" | bash "$MATCH" ".github/**")
+assert_eq "nested .github/** matches .github/workflows/foo.yml" ".github/workflows/foo.yml" "$got"
+
+got=$(printf '%s\n' "src/auth/login.ts" | bash "$MATCH" "src/auth/**")
+assert_eq "src/auth/** matches src/auth/login.ts" "src/auth/login.ts" "$got"
+
+got=$(printf '%s\n' "config/secret.env" | bash "$MATCH" "**/*secret*")
+assert_eq "**/*secret* matches config/secret.env" "config/secret.env" "$got"
+
+got=$(printf '%s\n' "src/payments/billing/invoice.ts" | bash "$MATCH" "src/payments/**")
+assert_eq "src/payments/** matches deeply nested path" "src/payments/billing/invoice.ts" "$got"
+
+got=$(printf '%s\n' "README.md" | bash "$MATCH" ".github/**" "src/auth/**" "**/*secret*")
+assert_eq "README.md matches no protected pattern" "" "$got"
+
+got=$(printf '%s\n' "src/main.ts" | bash "$MATCH" "src/auth/**" "src/payments/**")
+assert_eq "src/main.ts does not match src/auth/** or src/payments/**" "" "$got"
+
+# End-to-end: feed the parse script's output to the match script.
+# Simulates what the workflow does on a real PR diff. We avoid
+# `readarray` / `mapfile` so this runs under macOS's default
+# /bin/bash 3.2 as well as modern bash 4+.
+PATTERNS=()
+while IFS= read -r line; do
+  [ -n "$line" ] && PATTERNS+=("$line")
+done < <(bash "$PARSE" "$FIXTURE" external_review_paths)
+got=$(printf '%s\n' \
+    "README.md" \
+    ".github/workflows/agent-review.yml" \
+    "src/auth/login.ts" \
+    "src/main.ts" \
+    "config/credentials.json" \
+  | bash "$MATCH" "${PATTERNS[@]}" | sort)
+want='.github/workflows/agent-review.yml
+config/credentials.json
+src/auth/login.ts'
+assert_eq "end-to-end: parse output piped into matcher" "$want" "$got"
+
+echo
+if [ "$fail" -gt 0 ]; then
+  echo "check_workflow_parsers: $fail FAIL / $pass PASS" >&2
+  exit 1
+fi
+echo "check_workflow_parsers: PASS ($pass tests)"

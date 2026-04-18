@@ -48,6 +48,9 @@ jobs:
       - name: check_codex_scripts
         run: ./scripts/ci/check_codex_scripts
 
+      - name: check_workflow_parsers
+        run: ./scripts/ci/check_workflow_parsers
+
       - name: check_governance_files
         run: |
           MISSING=0

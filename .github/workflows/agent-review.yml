@@ -60,42 +60,25 @@ jobs:
           THRESHOLD=$(grep 'external_review_threshold:' "$CONFIG" | awk '{print $2}')
           echo "threshold=$THRESHOLD" >> "$GITHUB_OUTPUT"
 
-          # Extract external_review_paths as JSON array.
-          # Uses a state-machine awk parser that stops at the next top-level
-          # key (excluding comments/blanks). The previous range-based parser
-          # `awk '/^external_review_paths:/,/^[^ ]/'` was broken: awk's range
-          # start line also matched the end pattern (header starts with a
-          # non-space character), so it only ever output the header line
-          # itself, the list entries were silently dropped, and PATHS was
-          # always an empty JSON array. This meant the triage job's
-          # protected-paths check never fired, and draft→ready PRs touching
-          # `.github/**` / `src/auth/**` / etc. merged without the
-          # `needs-external-review` label on every agent-review run. See #54.
-          # `jq -c` (compact) is required here: multi-line JSON cannot be
-          # written via the `key=value` GITHUB_OUTPUT format. Before #54
-          # fixed the awk extractor, PATHS was always an empty array `[]`
-          # (single-line) so this latent bug was hidden; the first PR that
-          # exercised the pipeline after #55 merged (PR #58 / #30) blew up
-          # on load-config with "Invalid format '  \"src/auth/**\",'".
-          PATHS=$(awk '
-            /^external_review_paths:/ {in_block=1; next}
-            in_block && /^[^[:space:]#]/ {in_block=0}
-            in_block && /^ *-/ {print}
-          ' "$CONFIG" | sed 's/^ *- *"//' | sed 's/"$//' \
+          # Extract external_review_paths as a JSON array. Delegates to
+          # scripts/workflow/parse_policy_list.sh (unit-tested by
+          # scripts/ci/check_workflow_parsers — see #57). History: the
+          # earlier inline `awk '/^key:/,/^[^ ]/'` range parser silently
+          # dropped all list entries because the range-start pattern
+          # also matched the range-end condition; see #54.
+          #
+          # `jq -c` (compact) is required here: multi-line JSON cannot
+          # be written via the `key=value` GITHUB_OUTPUT format. Before
+          # #54 fixed the awk extractor, PATHS was always `[]` (single-
+          # line) so this latent bug was hidden; PR #58 / #30 tripped it.
+          PATHS=$(bash scripts/workflow/parse_policy_list.sh "$CONFIG" external_review_paths \
             | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "paths=$PATHS" >> "$GITHUB_OUTPUT"
 
-          # Extract available_reviewers as JSON array using the same
-          # state-machine parser for the same reason (see #54). Before this
-          # fix, REVIEWERS was always an empty JSON array, which silently
-          # broke the assign step's reviewer lookup and left PRs with no
-          # assigned reviewer identity.
-          # `jq -c` for the same GITHUB_OUTPUT reason as PATHS above.
-          REVIEWERS=$(awk '
-            /^available_reviewers:/ {in_block=1; next}
-            in_block && /^[^[:space:]#]/ {in_block=0}
-            in_block && /^ *-/ {print}
-          ' "$CONFIG" | sed 's/^ *- *//' \
+          # Extract available_reviewers as a JSON array via the same
+          # extracted parser. Before #54 this was always `[]`, which
+          # silently broke the assign step's reviewer lookup.
+          REVIEWERS=$(bash scripts/workflow/parse_policy_list.sh "$CONFIG" available_reviewers \
             | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "reviewers=$REVIEWERS" >> "$GITHUB_OUTPUT"
 
