@@ -73,8 +73,23 @@ EOF
 fi
 
 # Guard 2: must not be behind origin/main
+# Fail closed on fetch failure — stale origin/main metadata would
+# silently defeat the freshness check and re-open the exact class
+# of failure #77 closes.
 if ! git fetch --quiet origin main 2>/dev/null; then
-  echo "warning: git fetch failed; cannot verify branch freshness" >&2
+  if [[ "$FORCE" == "true" ]]; then
+    echo "⚠️  --force: git fetch failed; skipping freshness verification" >&2
+  else
+    cat >&2 <<EOF
+Refusing to deploy: 'git fetch origin main' failed, so freshness
+against origin/main cannot be verified.
+
+Network down? Try again once connectivity is restored.
+
+To override (break-glass only): scripts/deploy.sh --force
+EOF
+    exit 1
+  fi
 fi
 
 if git rev-parse --verify --quiet origin/main >/dev/null; then
@@ -101,8 +116,11 @@ if [[ "$BUILD_SKIP" == "true" ]]; then
 else
   BUILD_CMD="${BUILD_CMD:-npm run build}"
   echo ">> Building: $BUILD_CMD"
-  # shellcheck disable=SC2086
-  eval $BUILD_CMD
+  # Use `bash -c --` so BUILD_CMD is parsed as a shell command string
+  # in a controlled subshell rather than `eval`'d in the current
+  # shell. Cheap defense against environment injection from whatever
+  # source populated BUILD_CMD.
+  bash -c -- "$BUILD_CMD"
 fi
 
 # Step 2: Deploy
@@ -118,7 +136,10 @@ else
   echo ">> Purging Cloudflare cache"
   # The Cloudflare purge endpoint returns 200 on success with a JSON body.
   # We only care about HTTP status here.
-  purge_http_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+  purge_http_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    --connect-timeout 5 \
+    --max-time 30 \
+    -X POST \
     "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
     -H "Authorization: Bearer ${CF_API_TOKEN}" \
     -H "Content-Type: application/json" \
