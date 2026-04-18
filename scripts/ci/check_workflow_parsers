@@ -41,10 +41,17 @@ assert_eq() {
   else
     fail=$((fail + 1))
     echo "  FAIL: $desc" >&2
+    # Quote the values when printing so patterns like `**/*secret*`
+    # don't glob-expand in the failure output and mislead whoever
+    # is debugging the regression.
     echo "    expected:" >&2
-    printf '      %s\n' $expected >&2
+    while IFS= read -r line; do
+      printf '      %s\n' "$line" >&2
+    done <<< "$expected"
     echo "    actual:" >&2
-    printf '      %s\n' $actual >&2
+    while IFS= read -r line; do
+      printf '      %s\n' "$line" >&2
+    done <<< "$actual"
   fi
 }
 
@@ -71,6 +78,14 @@ assert_eq "returns empty for missing key" "" "$got"
 
 got=$(bash "$PARSE" "$FIXTURE" external_review_paths | wc -l | tr -d ' ')
 assert_eq "line count matches entry count" "5" "$got"
+
+# Inline-comment stripping: fixture has `- "src/payments/**"  # payments
+# code is sensitive`. The extracted pattern must be the bare glob, not
+# the glob with a trailing `# comment`, else the matcher silently breaks.
+got=$(bash "$PARSE" "$FIXTURE" external_review_paths | grep -c 'payments')
+assert_eq "inline comment stripped from payments entry" "1" "$got"
+got=$(bash "$PARSE" "$FIXTURE" external_review_paths | grep 'payments' | head -1)
+assert_eq "payments entry is clean glob, no trailing comment" "src/payments/**" "$got"
 
 echo
 echo "match_protected_paths.sh tests"

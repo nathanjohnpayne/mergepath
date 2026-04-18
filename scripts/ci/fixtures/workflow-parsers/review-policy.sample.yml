@@ -7,7 +7,7 @@ external_review_threshold: 300
 
 external_review_paths:
   - "src/auth/**"
-  - "src/payments/**"
+  - "src/payments/**"  # payments code is sensitive
   - "**/*secret*"
   - "**/*credential*"
   - ".github/**"

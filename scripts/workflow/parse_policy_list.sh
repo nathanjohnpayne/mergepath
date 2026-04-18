@@ -44,10 +44,23 @@ awk -v key="$KEY" '
   # ends the block — this is how we detect the next top-level key.
   in_block && /^[^[:space:]#]/ { in_block = 0 }
   # Inside the block, list items are indented lines starting with
-  # a `-`. Blank lines and comment-only lines inside the block
-  # are ignored.
-  in_block && /^ *-/ { print }
-' "$CONFIG" \
-  | sed 's/^ *- *//' \
-  | sed 's/^"//' \
-  | sed 's/"$//'
+  # a `-`. Blank lines and comment-only lines inside the block are
+  # ignored. Inline comments (e.g. `- ".github/**"  # note`) and
+  # surrounding quotes are stripped here so the downstream matcher
+  # receives clean glob patterns.
+  in_block && /^ *-/ {
+    line = $0
+    sub(/^ *- */, "", line)
+    if (line ~ /^"/) {
+      # Quoted entry: strip the leading `"`, then the closing `"`
+      # plus any trailing whitespace and inline comment.
+      sub(/^"/, "", line)
+      sub(/"[[:space:]]*(#.*)?$/, "", line)
+    } else {
+      # Unquoted entry: strip only the trailing whitespace + comment.
+      sub(/[[:space:]]+#.*$/, "", line)
+    }
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+    print line
+  }
+' "$CONFIG"
