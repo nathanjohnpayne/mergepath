@@ -528,13 +528,26 @@
   }
   .section-head .hint { font-size: 12px; color: var(--muted); }
 
-  .pr-panel { padding: 0; overflow: hidden; }
+  .pr-panel {
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100vh - 260px);
+  }
   .pr-panel .section-head { padding: 20px 24px 10px; margin-bottom: 0; }
+  .pr-panel #prList {
+    overflow-y: auto;
+    min-height: 0;
+  }
 
   /* YAML */
   .yaml-wrap {
     padding: 0;
     overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100vh - 260px);
   }
   .yaml-head {
     display: flex;
@@ -567,7 +580,9 @@
     line-height: 1.65;
     color: var(--ink);
     background: rgba(255, 252, 246, 0.4);
-    overflow-x: auto;
+    overflow: auto;
+    min-height: 0;
+    flex: 1;
   }
   pre.yaml .k { color: var(--p2); }
   pre.yaml .v { color: var(--p4a); }
