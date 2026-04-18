@@ -4,8 +4,7 @@
 
 Please do **not** open a public issue for security vulnerabilities.
 
-Instead, use [GitHub's private vulnerability reporting](https://github.com/nathanjohnpayne/ai_agent_repo_template/security/advisories/new) or email security concerns directly. <!-- NOTE: slug updates to `mergepath` after the Phase 2 GitHub rename (#86); GitHub auto-redirects in the meantime. -->
-
+Instead, use [GitHub's private vulnerability reporting](https://github.com/nathanjohnpayne/mergepath/security/advisories/new) or email security concerns directly.
 
 ## Scope
 
