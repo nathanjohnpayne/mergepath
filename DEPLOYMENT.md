@@ -426,19 +426,47 @@ Build output goes to `dist/`. Never edit `dist/` directly.
 
 ## Deployment Steps
 
-All deploys use `op-firebase-deploy` for non-interactive service account impersonation. Never run `firebase deploy` directly.
+The canonical deploy entry point is **`scripts/deploy.sh`**. It wraps `op-firebase-deploy` with two safety guards and the Cloudflare cache purge step so a single `scripts/deploy.sh` (or `npm run deploy`) is the complete, safe deploy surface.
 
 ```bash
-# Full deploy
-op-firebase-deploy
+# Full deploy (build + deploy + cache purge)
+scripts/deploy.sh
 
-# Specific targets
+# Scope the deploy to a single Firebase target
+scripts/deploy.sh -- --only hosting
+scripts/deploy.sh -- --only firestore:rules
+
+# Skip the build step (assume dist/ is already current)
+scripts/deploy.sh --skip-build
+
+# Skip the Cloudflare purge (no CF env vars set, or purge separately)
+scripts/deploy.sh --skip-cf-purge
+
+# Break-glass: bypass the main-only / must-be-current-with-origin guards
+scripts/deploy.sh --force
+```
+
+The guards (see [mergepath#77](https://github.com/nathanjohnpayne/mergepath/issues/77) for the incident that motivated them):
+
+1. **Current branch must be `main`.** Deploys should ship the reviewed, merged state of the project, not a worktree's in-progress branch.
+2. **Local `main` must not be behind `origin/main`.** After `git fetch`, `git rev-list --count HEAD..origin/main` must be 0. Otherwise the deploy refuses.
+
+Both guards can be bypassed with `--force` for break-glass scenarios. Never use `--force` during routine deploys.
+
+Cloudflare cache purge runs when `CF_API_TOKEN` and `CF_ZONE_ID` are set in the environment (typical source: `op read 'op://...'`). Without both variables the purge step no-ops with a clear log line.
+
+**Do not run `op-firebase-deploy` or `firebase deploy` directly for routine deploys.** They skip the branch + freshness guards and the cache purge. Direct invocation is reserved for debugging or one-off flows where the deploy surface is known.
+
+Under the hood, `scripts/deploy.sh` delegates to `op-firebase-deploy` with any arguments after `--`:
+
+```bash
+op-firebase-deploy              # full deploy
 op-firebase-deploy --only hosting
 op-firebase-deploy --only firestore:rules
 op-firebase-deploy --only functions
 ```
 
-The script:
+`op-firebase-deploy`:
 1. Auto-detects the Firebase project from `.firebaserc`
 2. Reads source credentials in order: `GOOGLE_APPLICATION_CREDENTIALS`, then the project SA key from `op://Firebase/{project-id} — Firebase Deployer SA Key`, then `op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential`, then `~/.config/gcloud/application_default_credentials.json`
 3. If the source credential is a `service_account` key matching the target `firebase-deployer@{project-id}.iam.gserviceaccount.com`, uses it directly (no impersonation wrapper needed — faster, no `serviceAccountTokenCreator` required)
