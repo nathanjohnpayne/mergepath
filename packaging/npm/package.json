@@ -1,0 +1,20 @@
+{
+  "name": "mergepath",
+  "version": "0.0.0",
+  "description": "Name reservation for the Mergepath umbrella project. No runtime code. See https://github.com/nathanjohnpayne/mergepath.",
+  "keywords": ["mergepath", "placeholder"],
+  "homepage": "https://github.com/nathanjohnpayne/mergepath",
+  "bugs": {
+    "url": "https://github.com/nathanjohnpayne/mergepath/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nathanjohnpayne/mergepath.git"
+  },
+  "author": "Nathan Payne (https://nathanpayne.com)",
+  "license": "UNLICENSED",
+  "files": [
+    "README.md"
+  ],
+  "private": false
+}
