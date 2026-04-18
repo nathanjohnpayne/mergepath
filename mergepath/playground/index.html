@@ -960,7 +960,7 @@
     pathAllowed: /^[A-Za-z0-9_.\-/*?[\]{}:@+,!~$^=]+$/,
   };
 
-  const state = structuredClone
+  const state = typeof structuredClone === 'function'
     ? structuredClone(DEFAULTS)
     : JSON.parse(JSON.stringify(DEFAULTS));
 
@@ -1194,7 +1194,7 @@
       add('k', 'max_review_rounds'); yaml.appendChild(document.createTextNode(': '));
       add('v', String(state.codexRounds)); nl();
     }
-    add('k', 'available_reviewers'); yaml.appendChild(document.createTextNode(':')); nl();
+    add('k', 'available_reviewers');
     // The UI tracks reviewers by short alias; the real policy file lists full
     // GitHub logins (nathanpayne-<alias>). Emit the login form so the preview
     // YAML is a legal drop-in for .github/review-policy.yml.
@@ -1203,13 +1203,19 @@
       cursor: 'nathanpayne-cursor',
       codex:  'nathanpayne-codex',
     };
-    Object.entries(state.reviewers).forEach(([k, v]) => {
-      if (v) {
+    const checked = Object.entries(state.reviewers).filter(([, v]) => v);
+    if (checked.length === 0) {
+      // Bare `available_reviewers:` parses as null; emit an explicit empty
+      // flow-style list so the YAML round-trips as [].
+      yaml.appendChild(document.createTextNode(': ')); add('v', '[]'); nl();
+    } else {
+      yaml.appendChild(document.createTextNode(':')); nl();
+      checked.forEach(([k]) => {
         yaml.appendChild(document.createTextNode('  - '));
         add('s', reviewerLogins[k] || k);
         nl();
-      }
-    });
+      });
+    }
   }
 
   function renderAll() {

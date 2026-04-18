@@ -134,7 +134,7 @@ jobs:
 
           if [ -n "$MATCHED_FILES" ]; then
             NEEDS_REVIEW=true
-            FILE_LIST=$(echo "$MATCHED_FILES" | sort -u | sed 's/^/  - /' | tr '\n' ',' | sed 's/,/%0A/g')
+            FILE_LIST=$(echo "$MATCHED_FILES" | sort -u | grep -v '^$' | sed 's/^/  - /' | tr '\n' ',' | sed 's/,/%0A/g')
             REASONS="${REASONS}- Protected paths modified:%0A${FILE_LIST}"
           fi
 
