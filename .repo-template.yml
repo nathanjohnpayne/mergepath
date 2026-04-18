@@ -22,4 +22,4 @@ test_globs:
 # in this repo. Silences `check_no_forbidden_top_level_dirs` warnings.
 # Uses inline-array form because the parser in that script only
 # recognizes `key: [a, b]`, not indented list items.
-extra_top_level_dirs: [mergepath]
+extra_top_level_dirs: [mergepath, packaging]

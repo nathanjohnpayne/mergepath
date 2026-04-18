@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mergepath"
+version = "0.0.0"
+description = "Name reservation for the Mergepath umbrella project. No runtime code."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Proprietary" }
+authors = [
+  { name = "Nathan Payne", email = "anthropic@nathanpayne.com" },
+]
+keywords = ["mergepath", "placeholder"]
+classifiers = [
+  "Development Status :: 1 - Planning",
+  "License :: Other/Proprietary License",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/nathanjohnpayne/mergepath"
+Issues = "https://github.com/nathanjohnpayne/mergepath/issues"
+Source = "https://github.com/nathanjohnpayne/mergepath"
+
+[tool.setuptools]
+packages = []
