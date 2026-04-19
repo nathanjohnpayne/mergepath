@@ -327,30 +327,33 @@ emit_from_session_file() (
     fi
   fi
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
-    # Partial-cache allowance: if the caller asked for `--mode all`
-    # and the prior run captured PATs but could not read ADC (e.g.
-    # 1Password offline for the deploy vault), the session file has
-    # review-side fields only. Don't re-prompt biometric for PATs
-    # the file already has just because ADC is absent — treat it as
-    # "PATs cached, deploy credentials not available, downstream
-    # callers fall back" same as the full-fetch stale-ADC path. A
-    # literal `--mode deploy` still requires an ADC.
+    # Both `--mode deploy` and `--mode all` require a usable ADC from
+    # the cache to take the fast path. If the session file's ADC field
+    # is missing or the materialized file is unreadable, return 2 to
+    # trigger a full refresh.
     #
-    # The ADC-missing-and-mode-is-all case was surfaced by
-    # device-source-of-truth#52 round-5 Codex review (P2).
+    # An earlier iteration of this code treated missing-ADC on
+    # `--mode all` as a partial hit (emit PATs, skip ADC) to spare
+    # biometric re-prompts when 1Password had been offline during the
+    # original fetch. That violated the `all` contract: a later
+    # `--mode all` on a review-only cache would silently never load
+    # deploy credentials until TTL expiry, breaking deploy flows in
+    # the same session. `all` means "everything"; honor it. See
+    # friends-and-family-billing#227 round-3 Codex P1 — Codex's
+    # earlier P2 (round 1) asking for the partial-hit shape was a
+    # reversal it itself caught once I shipped it.
     if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] || [[ ! -s "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
-      if [[ "$MODE" == "deploy" ]]; then
-        exit 2
-      fi
-      # MODE=all with no ADC → emit PATs, skip ADC, continue.
-    elif ! adc_is_usable "${GOOGLE_APPLICATION_CREDENTIALS}"; then
-      # File exists but refresh token is rejected. Same behavior:
-      # warn, skip the export, let downstream fall back.
+      exit 2
+    fi
+    if ! adc_is_usable "${GOOGLE_APPLICATION_CREDENTIALS}"; then
+      # File exists but refresh token is rejected. Warn and skip the
+      # export so downstream deploy callers can fall back to local
+      # firebase-login / ADC. OP_PREFLIGHT_DONE stays 1 and PATs are
+      # still emitted below, because preflight itself succeeded —
+      # only the ADC-specific path is degraded, which matches what
+      # the user will see when they run `gcloud auth ...` manually.
       log_stale_adc_guidance
       unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
-      if [[ "$MODE" == "deploy" ]]; then
-        exit 2
-      fi
     fi
   fi
 
