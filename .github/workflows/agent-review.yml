@@ -543,33 +543,48 @@ jobs:
 
       - name: Wait for CodeRabbit review
         if: steps.cr.outputs.enabled == 'true'
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
-          script: |
-            const prNumber = context.payload.pull_request.number;
-            const maxWaitMs = 5 * 60 * 1000; // 5 minutes
-            const pollMs = 30 * 1000;         // 30 seconds
-            const start = Date.now();
-
-            while (Date.now() - start < maxWaitMs) {
-              const { data: comments } = await github.rest.issues.listComments({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-              });
-              const hasCR = comments.some(
-                c => c.user.login === 'coderabbitai[bot]' &&
-                     !c.body.includes('Currently processing')
-              );
-              if (hasCR) {
-                core.info('CodeRabbit review found — proceeding to merge.');
-                return;
-              }
-              core.info(`Waiting for CodeRabbit... (${Math.round((Date.now() - start) / 1000)}s)`);
-              await new Promise(r => setTimeout(r, pollMs));
-            }
-            core.warning('CodeRabbit did not post within 5 minutes — proceeding to merge.');
+        env:
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Delegate to scripts/coderabbit-wait.sh so auto-merge honors the
+          # same semantics the agent-driven flow uses: HEAD-anchored
+          # freshness (#136 — do not merge on a stale review from a prior
+          # HEAD), rate-limit retry (#138 — CodeRabbit does not auto-retry
+          # after its published window elapses), and the coderabbit.*
+          # knobs in .github/review-policy.yml. Exit-code translation:
+          #   0 — cleared on current HEAD, no high-severity markers.
+          #   2 — cleared but findings present (Potential issue / ⚠️).
+          #       Merge path proceeds; findings are advisory.
+          #   3 — API / infra error. Surface via set-failed.
+          #   4 — max_wait_seconds grace window elapsed without a review.
+          #       CodeRabbit is advisory; log a warning and proceed.
+          #   5 — rate-limit retry budget exhausted. Do NOT merge —
+          #       block and let the human intervene.
+          set +e
+          bash scripts/coderabbit-wait.sh "$PR_NUMBER" "$REPO"
+          rc=$?
+          set -e
+          case "$rc" in
+            0)
+              echo "CodeRabbit cleared on current HEAD — proceeding to merge."
+              ;;
+            2)
+              echo "::warning::CodeRabbit review has Potential issue / ⚠️ findings. Auto-merge proceeds (findings are advisory); address in a follow-up PR."
+              ;;
+            4)
+              echo "::warning::CodeRabbit grace window elapsed without a review. CodeRabbit is advisory — proceeding to merge."
+              ;;
+            5)
+              echo "::error::CodeRabbit rate-limit retry budget exhausted. Blocking auto-merge; human must re-trigger or merge manually."
+              exit 1
+              ;;
+            *)
+              echo "::error::coderabbit-wait.sh failed with exit code $rc. Blocking auto-merge."
+              exit 1
+              ;;
+          esac
 
       - name: Re-verify blocking labels right before merge
         env:

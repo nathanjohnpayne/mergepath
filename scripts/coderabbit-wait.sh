@@ -277,29 +277,39 @@ classify_comment() {
   echo "review"
 }
 
-# Scan both comment endpoints for the latest CodeRabbit comment on or
-# after HEAD_ANCHOR (max of HEAD committer date and latest force-push
-# timeline event). Emits JSON to stdout. Empty object {} if nothing
-# qualifying yet.
+# Scan the PR-level `issues/{pr}/comments` endpoint for the latest
+# CodeRabbit comment on or after HEAD_ANCHOR. Emits JSON to stdout.
+# Empty object {} if nothing qualifying yet.
+#
+# Only the issues endpoint is the terminal-state source. CodeRabbit's
+# PR-level summary/status comments (walkthrough, "No actionable
+# comments generated", rate-limit WARNING, in-progress markers) all
+# land here. Inline `pulls/{pr}/comments` are per-line findings that
+# CodeRabbit can emit BEFORE the PR-level summary lands during a
+# single review cycle — treating an inline comment as terminal state
+# could cause a "cleared"/"findings" exit while the bot is still
+# writing more findings or still mid-walkthrough. See #140 round-3
+# Codex finding (P1, line 285). Inline findings are instead scanned
+# separately by count_potential_issues() only after this function
+# reports a PR-level terminal state.
 scan_latest_comment() {
-  local issue_comments pulls_comments combined latest
+  local issue_comments latest
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
-  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
 
-  combined=$(jq -s --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
-    ( (.[0] // []) | map(. + {endpoint: "issues"}) ) +
-    ( (.[1] // []) | map(. + {endpoint: "pulls"}) )
-    | map(select(.user.login == $bot))
-    | map(select(.created_at >= $after))
+  latest=$(echo "$issue_comments" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
+    [ .[]
+      | select(.user.login == $bot)
+      | select(.created_at >= $after)
+    ]
     | sort_by(.created_at)
-  ' <(echo "$issue_comments") <(echo "$pulls_comments"))
+    | last // null
+  ')
 
-  latest=$(echo "$combined" | jq 'last // null')
   if [ "$latest" = "null" ]; then
     echo '{}'
     return
   fi
-  echo "$latest" | jq '{id, created_at, endpoint, body}'
+  echo "$latest" | jq '{id, created_at, endpoint: "issues", body}'
 }
 
 # Count "Potential issue" / ⚠️ markers in the pulls inline comment list
@@ -318,8 +328,16 @@ count_potential_issues() {
 }
 
 post_retry_trigger() {
-  local body='@coderabbitai, try again.'
-  log "posting retry trigger comment to PR #$PR_NUMBER"
+  # Strip the `[bot]` suffix that GitHub REST uses for App logins —
+  # @-mentions address the user-facing handle (`@coderabbitai`), not
+  # the API login (`coderabbitai[bot]`). Using the configured
+  # BOT_LOGIN here instead of a hardcoded string means a repo that
+  # overrides `coderabbit.bot_login` (e.g., to point at a fork or a
+  # differently-named review bot) gets consistent polling and
+  # triggering identities. See #140 round-3 Codex finding (P2, line 320).
+  local mention="@${BOT_LOGIN%\[bot\]}"
+  local body="${mention}, try again."
+  log "posting retry trigger comment to PR #$PR_NUMBER as $mention"
   gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
     -f body="$body" >/dev/null 2>&1 \
     || die 3 "failed to post retry trigger comment"
