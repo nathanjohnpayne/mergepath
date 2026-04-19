@@ -556,8 +556,16 @@ jobs:
           # knobs in .github/review-policy.yml. Exit-code translation:
           #   0 — cleared on current HEAD, no high-severity markers.
           #   2 — cleared but findings present (Potential issue / ⚠️).
-          #       Merge path proceeds; findings are advisory.
-          #   3 — API / infra error. Surface via set-failed.
+          #       Blocks auto-merge per REVIEW_POLICY.md § Phase 2.5,
+          #       which requires every Potential issue / ⚠️ finding to
+          #       be explicitly addressed (fixed or dismissed with
+          #       reasoning) before moving on. The agent-driven flow
+          #       does that in-session; the auto-merge workflow has
+          #       no way to address a finding, so it stops here and
+          #       lets the author push a fix (or post a dismissal
+          #       reply). A new approving review after the fix
+          #       re-triggers this job.
+          #   3 — API / infra error. Block and surface.
           #   4 — max_wait_seconds grace window elapsed without a review.
           #       CodeRabbit is advisory; log a warning and proceed.
           #   5 — rate-limit retry budget exhausted. Do NOT merge —
@@ -571,7 +579,8 @@ jobs:
               echo "CodeRabbit cleared on current HEAD — proceeding to merge."
               ;;
             2)
-              echo "::warning::CodeRabbit review has Potential issue / ⚠️ findings. Auto-merge proceeds (findings are advisory); address in a follow-up PR."
+              echo "::error::CodeRabbit flagged Potential issue / ⚠️ findings on the current HEAD. Per REVIEW_POLICY.md § Phase 2.5, each must be explicitly addressed (fixed or dismissed with reasoning) before merge. Blocking auto-merge; address the findings and request a new approval to re-trigger."
+              exit 1
               ;;
             4)
               echo "::warning::CodeRabbit grace window elapsed without a review. CodeRabbit is advisory — proceeding to merge."

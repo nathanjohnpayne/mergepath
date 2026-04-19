@@ -382,23 +382,34 @@ emit_json_and_exit() {
   exit "$exit_code"
 }
 
-# Sleep for up to `requested` seconds, but time out and emit JSON if the
-# sleep would push total elapsed past MAX_WAIT_SECONDS. Without this
-# guard, fixed 15s polling sleeps can overshoot the configured budget
-# (caller sees `waited_seconds > max_wait_seconds` in the JSON, which is
-# surprising from a knob named "max"). See #140 round-3 CodeRabbit
-# finding (Potential issue, Major, line 380).
+# Sleep for up to `requested` seconds, clamped to the remaining
+# max_wait_seconds budget. Without this guard, fixed 15s polling
+# sleeps could overshoot the configured budget (caller sees
+# `waited_seconds > max_wait_seconds`). An earlier version of this
+# helper exited early whenever `requested >= remaining` to avoid the
+# overshoot — but that shortens the effective budget by up to one
+# poll interval (iterations at elapsed 286..299 exit immediately
+# for a 300s budget, missing a review that lands right before the
+# deadline). The right shape: sleep min(requested, remaining), then
+# let the next iteration's top-of-loop check hit the exact-elapsed
+# timeout. See #140 round-3 CodeRabbit finding (Major, line 380)
+# and #140 round-4 Codex finding (P2, line 391).
 sleep_or_timeout() {
   local requested=$1
-  local now elapsed remaining
+  local now elapsed remaining actual
   now=$(date +%s)
   elapsed=$((now - START_EPOCH))
   remaining=$((MAX_WAIT_SECONDS - elapsed))
-  if [ "$remaining" -le 0 ] || [ "$requested" -ge "$remaining" ]; then
-    log "remaining budget (${remaining}s) is below next sleep (${requested}s) — timing out"
+  if [ "$remaining" -le 0 ]; then
+    log "budget exhausted (remaining=${remaining}s) — timing out"
     emit_json_and_exit "timeout" 4 "null" 0
   fi
-  sleep "$requested"
+  actual=$requested
+  if [ "$actual" -gt "$remaining" ]; then
+    actual=$remaining
+    log "clamping sleep from ${requested}s to remaining budget ${remaining}s"
+  fi
+  sleep "$actual"
 }
 
 while :; do
