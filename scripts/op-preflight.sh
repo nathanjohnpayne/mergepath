@@ -211,12 +211,21 @@ emit_from_session_file() {
   # shellcheck disable=SC1090
   . "$SESSION_FILE"
 
-  # If deploy is in scope, verify the ADC file still exists on disk —
-  # the session file's path pointer is only useful if the file it
-  # names is readable. If ADC is missing, do NOT emit GOOGLE_APPLICATION_CREDENTIALS;
-  # let the caller fall through to a refresh path manually. Signal with
-  # a non-zero exit so the caller knows to --refresh.
+  # Validate the session file actually contains the credentials the
+  # CURRENT invocation's --mode is asking for. A stale cross-mode cache
+  # (e.g. a prior `--mode deploy` run wrote only ADC fields, and this
+  # run is `--mode review`) would otherwise hit the fast path and emit
+  # no PAT exports — downstream `gh` review commands then run
+  # unauthenticated. Return non-zero to trigger the refresh path in
+  # each case. See #141 round-1 Codex finding (P1, line 223).
+  if [[ "$MODE" == "review" || "$MODE" == "all" ]]; then
+    if [[ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]] || [[ -z "${OP_PREFLIGHT_AUTHOR_PAT:-}" ]]; then
+      return 2
+    fi
+  fi
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
+    # Both the cached-path pointer must be set AND the file it names
+    # must still be readable (non-empty).
     if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] || [[ ! -s "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
       return 2
     fi
