@@ -34,7 +34,7 @@ This repository uses a multi-identity AI agent code review system. The full poli
 3. Switch back to nathanjohnpayne. Address each comment. Push fix commits.
 4. Repeat steps 2–3 until the reviewer identity approves with no outstanding issues.
 5. If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`:
-   a. **Wait** for CodeRabbit to post its review (up to 3 minutes; ask the human if it hasn't appeared).
+   a. **Wait** for CodeRabbit to post its review on the current HEAD. Prefer `scripts/coderabbit-wait.sh <PR#>` over an ad-hoc poll — it anchors "cleared" on the HEAD committer date (closing the race that let auto-merge fire pre-CodeRabbit; see #136) and handles CodeRabbit's non-auto-retrying rate-limit state by parsing the published window and posting `@coderabbitai, try again.` itself (see #138). Exit codes: `0` cleared, `2` findings, `4` grace-window timeout (advisory — log and skip), `5` rate-limit stalled (alert the human, do not proceed).
    b. **Read both endpoints:** PR-level comments (`gh api repos/{owner}/{repo}/issues/{pr}/comments`) and inline diff comments (`gh api repos/{owner}/{repo}/pulls/{pr}/comments`).
    c. **Grep inline comments** for `Potential issue` or `⚠️` — these must each be explicitly addressed (fixed or dismissed with reasoning).
    d. Address other substantive findings. CodeRabbit review is advisory and does not block merge.

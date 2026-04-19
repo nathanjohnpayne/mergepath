@@ -51,7 +51,13 @@ explicitly authorizes a break-glass override in chat.
 6. Switch back to nathanjohnpayne. Address each comment. Push fix commits.
 7. Repeat steps 4–6 until the reviewer identity approves.
 7.5. If `.github/review-policy.yml` has `coderabbit.enabled: true`:
-     a. Wait for CodeRabbit to post (up to 3 min; ask human if delayed).
+     a. Wait for CodeRabbit to post on the current HEAD. Prefer
+        `scripts/coderabbit-wait.sh <PR#>` over an ad-hoc poll — it
+        anchors on HEAD committer date (closes the auto-merge race
+        in #136) and handles CodeRabbit's non-auto-retrying rate-limit
+        state (#138). Exit codes: 0 cleared, 2 findings, 4 grace-window
+        timeout (log + skip, CodeRabbit is advisory), 5 rate-limit
+        stalled (alert human, do not proceed).
      b. Read PR-level comments: `gh api repos/{owner}/{repo}/issues/{pr}/comments`
      c. Read inline diff comments: `gh api repos/{owner}/{repo}/pulls/{pr}/comments`
      d. Grep inline comments for `Potential issue` or `⚠️` — address each one.

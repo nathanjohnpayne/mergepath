@@ -595,3 +595,28 @@ If deploy impersonation breaks because IAM bindings or project configuration dri
 ```bash
 op-firebase-setup {project-id}
 ```
+
+### Firebase CLI "Authentication Error: credentials are no longer valid" (daily reauth)
+
+`op-firebase-deploy` (and `scripts/deploy.sh` by extension) occasionally fails
+mid-deploy with:
+
+```
+Authentication Error: Your credentials are no longer valid. Please run firebase login --reauth
+```
+
+The 1Password source-credential chain is still healthy when this fires —
+`gcloud auth application-default print-access-token` against the materialized
+ADC still mints a valid token. The failure is inside firebase CLI, which
+ignores `GOOGLE_APPLICATION_CREDENTIALS` in some hosting-deploy code paths
+and falls back to the user-login cache at
+`~/.config/configstore/firebase-tools.json`. That cache's access token
+expires roughly daily and is not refreshed by the 1Password flow.
+
+**Workaround:** run `firebase login --reauth` once, then re-run the exact
+same `scripts/deploy.sh` (or `op-firebase-deploy`) command. It will succeed
+on the next attempt. See nathanjohnpayne/mergepath#137 for the open
+investigation and the longer-term fix under consideration
+(detect stale configstore in `op-firebase-deploy` and print a clear message
+instead of the current cryptic "Assertion failed: resolving hosting target"
+trailer).

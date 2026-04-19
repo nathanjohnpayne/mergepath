@@ -86,6 +86,29 @@ author_identity: nathanjohnpayne
 coderabbit:
   enabled: true
 
+  # GitHub login of the CodeRabbit bot. Comments by this login are what
+  # `scripts/coderabbit-wait.sh` filters on when classifying PR activity.
+  bot_login: "coderabbitai[bot]"
+
+  # Maximum total seconds `scripts/coderabbit-wait.sh` will poll before
+  # timing out. Used by Phase 2.5 grace window + any downstream auto-merge
+  # workflow that wants to block merge until CodeRabbit has reviewed the
+  # current HEAD. The default of 300s (5 min) accommodates CodeRabbit's
+  # typical ~2–3 min review latency plus a short buffer. Raise it for
+  # repos where CodeRabbit consistently runs long; lower it if the
+  # auto-merge workflow would rather proceed than wait. See
+  # nathanjohnpayne/mergepath#136 for the race-with-auto-merge case.
+  max_wait_seconds: 300
+
+  # Maximum number of times `scripts/coderabbit-wait.sh` will parse a
+  # "Rate limit exceeded" comment, sleep the published window + 30s
+  # buffer, and post `@coderabbitai, try again.` to re-trigger.
+  # CodeRabbit does not auto-retry after its rate-limit window elapses;
+  # the wait helper does. Set to 0 to disable retries entirely (the
+  # caller will see exit code 5 / rate_limit_stalled on the first
+  # rate-limit comment). See nathanjohnpayne/mergepath#138.
+  max_rate_limit_retries: 2
+
 # ---------------------------------------------------------------------------
 # Codex (Automated External Review — Phase 4a)
 # ---------------------------------------------------------------------------

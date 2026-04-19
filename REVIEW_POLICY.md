@@ -114,7 +114,7 @@ If any `op` command fails mid-session (rare — only if 1Password locks or the 1
 
 After internal review passes (Phase 2), CodeRabbit provides an independent automated review:
 
-1. **Wait for CodeRabbit.** CodeRabbit automatically posts a review when the PR is opened or updated. The agent must wait for CodeRabbit to finish before proceeding. If CodeRabbit has not posted after 3 minutes, ask the human whether to continue waiting or skip.
+1. **Wait for CodeRabbit.** CodeRabbit automatically posts a review when the PR is opened or updated. Prefer `scripts/coderabbit-wait.sh <PR#>` over an ad-hoc poll loop — the script anchors its "cleared" signal on the current HEAD committer date, so it will not treat a stale review from a prior HEAD as current; it also handles CodeRabbit's rate-limit state, which the platform does NOT auto-retry (see nathanjohnpayne/mergepath#138). On exit code `0` CodeRabbit has cleared with no high-severity markers; on `2` it has findings to address; on `4` the `coderabbit.max_wait_seconds` grace window elapsed (the agent may log a warning and proceed since CodeRabbit is advisory); on `5` the rate-limit retry budget was exhausted (alert the human rather than proceed). If CodeRabbit has not posted after the grace window, ask the human whether to continue waiting or skip.
 2. **Read both API endpoints.** CodeRabbit posts two types of comments that must both be checked:
    - **PR-level summary:** `gh api repos/{owner}/{repo}/issues/{pr_number}/comments` — contains the high-level walkthrough and summary.
    - **Inline review comments on the diff:** `gh api repos/{owner}/{repo}/pulls/{pr_number}/comments` — contains line-by-line findings anchored to specific code.
@@ -131,7 +131,8 @@ The agent proceeds to Phase 3 (Threshold Check) after addressing CodeRabbit comm
 
 Before moving past Phase 2.5, confirm all of the following:
 
-- [ ] CodeRabbit has posted its review (waited up to 3 minutes, or human approved skip)
+- [ ] CodeRabbit has posted its review on the current HEAD (use `scripts/coderabbit-wait.sh <PR#>` — exit `0` or `2`; `4` is a grace-window timeout that may be logged and skipped since CodeRabbit is advisory)
+- [ ] If `scripts/coderabbit-wait.sh` exited `5` (rate-limit stalled), the human has been alerted rather than the agent proceeding
 - [ ] Read PR-level comments via `issues/{pr}/comments` endpoint
 - [ ] Read inline diff comments via `pulls/{pr}/comments` endpoint
 - [ ] Grepped inline comments for `Potential issue` and `⚠️` — all flagged findings addressed
@@ -414,6 +415,9 @@ author_identity: nathanjohnpayne
 # To fully disable CodeRabbit, uninstall the GitHub App AND set this flag.
 coderabbit:
   enabled: false
+  bot_login: "coderabbitai[bot]"
+  max_wait_seconds: 300          # grace window for scripts/coderabbit-wait.sh
+  max_rate_limit_retries: 2      # retries after CodeRabbit posts "Rate limit exceeded"
 
 # Codex (Phase 4a automated external review) — see Phase 4a above.
 # Same semantics note as coderabbit: this flag governs agent behavior,
