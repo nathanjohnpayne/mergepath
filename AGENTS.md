@@ -24,11 +24,17 @@ This repository uses a multi-identity AI agent code review system. The full poli
 
 ### Workflow Summary
 
-0. Run credential preflight at the start of every PR session:
+0. Run credential preflight at the start of every PR session (and safely
+   at the top of every subsequent tool call — re-running within the TTL
+   returns cached values without a new biometric prompt):
    `eval "$(scripts/op-preflight.sh --agent {your-agent} --mode all)"`
-   This triggers biometric prompts once and caches all credentials for the session.
+   This triggers biometric prompts once and writes a chmod-600 session
+   file at `$XDG_CACHE_HOME/mergepath/op-preflight-<agent>.env` so fresh
+   subshells can reuse the credentials (see REVIEW_POLICY.md § Phase 0).
    Use `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` for reviewer commands and
    `GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"` for author commands.
+   Run `scripts/op-preflight.sh --agent {your-agent} --purge` (or
+   `--purge-all`) at end of session to delete the cached PATs.
 1. Author code as nathanjohnpayne. File a PR.
 2. Switch to your reviewer identity (e.g., nathanpayne-claude). Review the PR. Post comments.
 3. Switch back to nathanjohnpayne. Address each comment. Push fix commits.

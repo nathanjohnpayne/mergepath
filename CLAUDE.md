@@ -19,10 +19,17 @@ explicitly authorizes a break-glass override in chat.
 
 0. Run credential preflight to front-load all biometric prompts:
    `eval "$(scripts/op-preflight.sh --agent claude --mode all)"`
-   This caches PATs and deploy credentials. All subsequent steps use
-   `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` (reviewer) or
+   This caches PATs and deploy credentials in a chmod-600 session file
+   at `$XDG_CACHE_HOME/mergepath/op-preflight-claude.env` (default
+   `$HOME/.cache/mergepath/`). Safe to re-run at the top of every tool
+   call — within the TTL (4h default, override via
+   `OP_PREFLIGHT_TTL_SECONDS`) the script reads the session file and
+   emits the same exports without a new biometric prompt. All subsequent
+   steps use `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` (reviewer) or
    `GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"` (author) instead of `op read`.
-   If preflight was not run, fall back to inline `op read` (original pattern).
+   Run `scripts/op-preflight.sh --agent claude --purge` at end of
+   session to wipe the cache. If preflight was not run (or failed), fall
+   back to inline `op read` (original pattern).
 
 ## Before opening a PR
 
