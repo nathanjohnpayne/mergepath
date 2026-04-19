@@ -393,8 +393,19 @@ warm_ssh_keys() {
 
 # ── Fast path: reuse session file when fresh ──────────────────────────
 if ! $REFRESH && session_is_fresh; then
-  cached_exports=$(emit_from_session_file)
-  rc=$?
+  # Use if-condition to capture exit code without tripping `set -e`.
+  # Bare `cached_exports=$(emit_from_session_file); rc=$?` would be
+  # sensitive to errexit — a non-zero exit inside `$(...)` aborts the
+  # outer script before `rc=$?` runs, so the intended refresh-fallback
+  # path below never executes (reproducible: populate a review-only
+  # cache, invoke --mode deploy; old code exits 2 with zero exports,
+  # new code falls through to the full fetch). See the propagation-
+  # round Codex review across all 6 consumer PRs.
+  if cached_exports=$(emit_from_session_file); then
+    rc=0
+  else
+    rc=$?
+  fi
   if [[ "$rc" == "0" ]]; then
     echo "$cached_exports"
     age=$(( $(date +%s) - $(grep '^OP_PREFLIGHT_CREATED_AT_EPOCH=' "$SESSION_FILE" | cut -d= -f2- | tr -d "'\"") ))
