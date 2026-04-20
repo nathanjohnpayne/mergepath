@@ -396,15 +396,23 @@ GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
 
 ### Token rotation (as needed)
 
-The current PATs are set to never expire. If you ever need to rotate them:
+The current PATs are set to never expire. If you ever need to rotate
+a reviewer identity PAT (`nathanpayne-claude`, `nathanpayne-codex`,
+`nathanpayne-cursor`):
 
-1. Generate new **classic** PATs with `repo` scope for each machine user account
-2. Update the tokens in 1Password (field name: `token`)
-3. Update `CLAUDE_PAT`, `CODEX_PAT`, `CURSOR_PAT` secrets on every repo
-4. Revoke the old tokens
-5. Verify agent access still works
+1. Generate a new **classic** PAT with `repo` scope for the machine user account
+2. Update the `token` field on the corresponding 1Password item
+3. Revoke the old token in GitHub
+4. Verify agent access still works: `GH_TOKEN="$(op read 'op://Private/<item-id>/token')" gh api user`
 
-The `REVIEWER_ASSIGNMENT_TOKEN` (Nathan's PAT) follows the same rotation process.
+Note: reviewer identity PATs are NOT stored as repo CI secrets. They are
+read from 1Password per-session by the authoring agent for the in-session
+identity switch, so rotation does not require updating any repo secrets.
+
+The `REVIEWER_ASSIGNMENT_TOKEN` repo secret (Nathan's PAT used by the
+Agent Review Pipeline workflow) follows a similar process but also
+needs a `gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo}`
+call on every repo after rotating the 1Password item.
 
 ---
 
