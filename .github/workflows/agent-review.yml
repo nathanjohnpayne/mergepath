@@ -236,100 +236,19 @@ jobs:
               console.log(`Assigned ${reviewer} for internal self-peer review.`);
             }
 
-  # ──────────────────────────────────────────────
-  # Job 4: Trigger subagent to perform the review
-  # ──────────────────────────────────────────────
-  invoke-reviewer:
-    needs: [assign]
-    if: >
-      always() &&
-      github.event_name == 'pull_request' &&
-      (github.event.action == 'opened' || github.event.action == 'ready_for_review')
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - agent: claude
-            username: nathanpayne-claude
-          - agent: codex
-            username: nathanpayne-codex
-          - agent: cursor
-            username: nathanpayne-cursor
-    steps:
-      - name: Check if this agent is assigned
-        id: check-assigned
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
-          script: |
-            const { data: reviewers } = await github.rest.pulls.listRequestedReviewers({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.payload.pull_request.number,
-            });
-            const assigned = reviewers.users.some(
-              u => u.login === '${{ matrix.username }}'
-            );
-            core.setOutput('assigned', assigned.toString());
-
-      # ── Claude: headless CLI ──
-      - name: Checkout repo
-        if: steps.check-assigned.outputs.assigned == 'true' && matrix.agent == 'claude'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
-
-      - name: Install Claude Code
-        if: steps.check-assigned.outputs.assigned == 'true' && matrix.agent == 'claude'
-        run: npm install -g @anthropic-ai/claude-code
-
-      - name: Invoke Claude Code
-        if: steps.check-assigned.outputs.assigned == 'true' && matrix.agent == 'claude'
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.CLAUDE_PAT }}
-        run: |
-          claude -p "Review PR #${{ github.event.pull_request.number }} on ${{ github.repository }}. \
-            Read REVIEW_POLICY.md for the review workflow. \
-            Read the diff, check for correctness, security issues, style violations, and test coverage. \
-            Post your review via the GitHub API using the GITHUB_TOKEN env var. \
-            Authenticate as nathanpayne-claude." \
-            --allowedTools "Bash,Read,Glob,Grep,WebFetch"
-
-      # ── Codex: OpenAI Codex CLI ──
-      - name: Checkout repo for Codex
-        if: steps.check-assigned.outputs.assigned == 'true' && matrix.agent == 'codex'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
-
-      - name: Invoke Codex
-        if: steps.check-assigned.outputs.assigned == 'true' && matrix.agent == 'codex'
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.CODEX_PAT }}
-        run: |
-          # TODO: Replace with actual Codex CLI invocation once available
-          echo "Codex headless review invocation — pending CLI availability"
-
-      # ── Cursor: no headless mode yet ──
-      - name: Notify for manual Cursor review
-        if: steps.check-assigned.outputs.assigned == 'true' && matrix.agent == 'cursor'
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body: '**@nathanpayne-cursor** has been assigned to review this PR. Cursor does not support headless invocation — please open this PR in Cursor to perform the review manually.',
-            });
+  # Note: no CI-side invoke-reviewer job exists. Phase 2 internal
+  # self-peer review is performed by the authoring agent in its own
+  # session — the agent switches its identity to its reviewer account
+  # (e.g., nathanpayne-claude) via a PAT from 1Password and posts the
+  # review with that PAT. See REVIEW_POLICY.md § Phase 2 and CLAUDE.md
+  # "After opening the PR" steps 4–7. A headless Claude/Codex CLI
+  # invocation in CI is intentionally NOT used: it (a) bypasses the
+  # in-session tool context the agent already has, (b) adds a stale
+  # API-key failure surface unrelated to the PR, and (c) duplicates
+  # work the agent is already doing as part of the PR loop.
 
   # ──────────────────────────────────────────────
-  # Job 5: Detect agent disagreement → escalate
+  # Job 4: Detect agent disagreement → escalate
   # ──────────────────────────────────────────────
   detect-disagreement:
     if: github.event_name == 'pull_request_review'
@@ -426,7 +345,7 @@ jobs:
             }
 
   # ──────────────────────────────────────────────
-  # Job 6: Block self-approval
+  # Job 5: Block self-approval
   # ──────────────────────────────────────────────
   block-self-approval:
     if: >
@@ -488,7 +407,7 @@ jobs:
             }
 
   # ──────────────────────────────────────────────
-  # Job 7: Auto-merge on approval (if no external review required)
+  # Job 6: Auto-merge on approval (if no external review required)
   # ──────────────────────────────────────────────
   # Must `needs:` on detect-disagreement and block-self-approval to force
   # those sibling jobs to COMPLETE before this one starts. Both siblings
