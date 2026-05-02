@@ -18,6 +18,22 @@ jobs:
     runs-on: ubuntu-latest
     if: github.actor == 'dependabot[bot]'
     steps:
+      # Check out the BASE ref (the target branch's tip), NOT the PR
+      # HEAD. This workflow runs under pull_request_target which has
+      # write permissions and access to secrets — checking out PR-author-
+      # controlled code (HEAD) and reading config from it would be a
+      # privilege escalation surface. We only need the BASE's
+      # .github/review-policy.yml for the available_reviewers
+      # validation in the next step. github.event.pull_request.base.sha
+      # is the merge target's tip at the moment the PR opened.
+      # codex r2 on PR #179 caught the missing checkout.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          # Don't persist the checkout token — we use REVIEWER_ASSIGNMENT_TOKEN
+          # for the gh calls below, not the default GITHUB_TOKEN.
+          persist-credentials: false
+
       - name: Fetch Dependabot metadata
         id: metadata
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
@@ -27,8 +43,104 @@ jobs:
           steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
           steps.metadata.outputs.update-type == 'version-update:semver-minor'
         run: |
+          set -euo pipefail
+
+          # Verify GH_TOKEN is set and resolves to a reviewer identity.
+          # The 2026-04-27 weekly PR audit caught 17 of 21 violations
+          # across 6 repos where Dependabot PRs merged without a
+          # reviewer-identity approval recorded — root cause was either
+          # an empty REVIEWER_ASSIGNMENT_TOKEN secret (the approve call
+          # silently no-op'd while the merge proceeded) or the token
+          # resolving to nathanjohnpayne, which GitHub rejects with
+          # "can't approve own pull request". Both modes left the PR
+          # merged with no approval audit trail.
+          # Closes nathanjohnpayne/mergepath#160 from the template side.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::GH_TOKEN is empty. REVIEWER_ASSIGNMENT_TOKEN secret is not set in this repo."
+            echo "::error::Add a reviewer-identity PAT to repo Settings → Secrets and variables → Actions → REVIEWER_ASSIGNMENT_TOKEN."
+            exit 1
+          fi
+
+          ACTING_AS=$(gh api user --jq .login 2>/dev/null || true)
+          if [ -z "$ACTING_AS" ]; then
+            echo "::error::gh api user returned empty — REVIEWER_ASSIGNMENT_TOKEN may be invalid, expired, or lacks the user scope."
+            exit 1
+          fi
+          echo "::notice::Approving $PR_URL as $ACTING_AS"
+
+          if [ "$ACTING_AS" = "nathanjohnpayne" ]; then
+            echo "::error::REVIEWER_ASSIGNMENT_TOKEN resolves to nathanjohnpayne (the author identity)."
+            echo "::error::GitHub blocks self-approval, so the approve call would silently fail and the merge would proceed without an approval recorded."
+            echo "::error::Replace the secret with a reviewer-identity PAT (nathanpayne-claude / -cursor / -codex)."
+            exit 1
+          fi
+
+          # Validate ACTING_AS against available_reviewers in
+          # .github/review-policy.yml. Codex r1 (Phase 4b) on PR #179:
+          # without this check, any non-author write-collaborator
+          # token (e.g., a contractor's PAT, github-actions[bot]) could
+          # approve+merge and the workflow would exit 0 — but the next
+          # weekly audit would still flag the PR as "not approved by a
+          # known reviewer identity," same audit trail problem #160 set
+          # out to fix.
+          POLICY=".github/review-policy.yml"
+          if [ ! -f "$POLICY" ]; then
+            echo "::error::$POLICY not found — cannot validate $ACTING_AS against available_reviewers."
+            exit 1
+          fi
+          # Same awk extractor used by scripts/codex-review-check.sh
+          # (in-block list parser; sed strips list-marker + optional
+          # quotes). Outputs one reviewer login per line.
+          ALLOWED=$(awk '
+            /^available_reviewers:/ {in_block=1; next}
+            in_block && /^[^[:space:]#]/ {in_block=0}
+            in_block && /^ *-/ {print}
+          ' "$POLICY" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')
+          if [ -z "$ALLOWED" ]; then
+            echo "::error::$POLICY has no available_reviewers list. Add reviewer identities under available_reviewers: before this workflow can approve."
+            exit 1
+          fi
+          if ! printf '%s\n' "$ALLOWED" | grep -Fxq "$ACTING_AS"; then
+            echo "::error::REVIEWER_ASSIGNMENT_TOKEN resolves to '$ACTING_AS', which is NOT in $POLICY available_reviewers:"
+            printf '%s\n' "$ALLOWED" | sed 's/^/::error::  - /'
+            echo "::error::Even if this identity has write access to the repo, an approval from it would fail the next weekly audit ('approval not from a recognized reviewer identity')."
+            echo "::error::Replace the secret with a PAT for one of the listed reviewers."
+            exit 1
+          fi
+
+          # Approve. set -e ensures we abort on failure rather than
+          # continuing to the merge step with no approval on record.
           gh pr review --approve "$PR_URL"
-          gh pr merge --squash --auto "$PR_URL" || gh pr merge --squash "$PR_URL" || true
+
+          # Try GitHub-side auto-merge first (fires when required
+          # checks pass). Fall back to an immediate squash ONLY when
+          # the failure cause is "auto-merge unavailable" — i.e., the
+          # repo doesn't have branch protection / auto-merge enabled
+          # in settings. Other failures (network, permissions, race,
+          # invalid token) propagate so the audit sees them.
+          #
+          # CodeRabbit on PR #179 caught that the prior bare-`||`
+          # fallback would silently retry on ANY failure mode,
+          # including transient errors that should bubble up. gh CLI
+          # returns exit 1 for all merge failures without a
+          # distinguishing exit code, so we pattern-match stderr for
+          # the documented auto-merge-unavailable GraphQL messages.
+          set +e
+          AUTO_STDERR=$(gh pr merge --squash --auto "$PR_URL" 2>&1 1>/dev/null)
+          AUTO_RC=$?
+          set -e
+          if [ "$AUTO_RC" -eq 0 ]; then
+            echo "$AUTO_STDERR"
+            exit 0
+          fi
+          echo "$AUTO_STDERR" >&2
+          if echo "$AUTO_STDERR" | grep -qiE 'auto[- ]?merge is not available|not in the correct state to enable auto[- ]?merge|auto[- ]?merge.*disabled|enablePullRequestAutoMerge'; then
+            echo "::notice::--auto unavailable on this repo (likely no branch protection); falling back to immediate squash."
+            gh pr merge --squash "$PR_URL"
+          else
+            echo "::error::gh pr merge --auto failed for a non-auto-merge-unavailable reason. See stderr above. Not falling back to immediate squash; surface to audit."
+            exit "$AUTO_RC"
+          fi
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}

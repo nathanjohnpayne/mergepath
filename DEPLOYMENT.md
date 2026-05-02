@@ -236,21 +236,35 @@ Go to the new repo → Settings → Secrets and variables → Actions → New re
 
 | Secret name | Value | PAT type |
 |---|---|---|
-| `REVIEWER_ASSIGNMENT_TOKEN` | PAT for `nathanjohnpayne` | Fine-grained OK (owns repo) |
+| `REVIEWER_ASSIGNMENT_TOKEN` | PAT for a **reviewer identity** (e.g., `nathanpayne-claude`) — NOT `nathanjohnpayne` | Classic with `repo` scope (collaborator account) |
+
+The `dependabot-auto-merge.yml` workflow uses this secret to approve and merge Dependabot bumps. It MUST be a reviewer-identity PAT (`nathanpayne-claude` / `-cursor` / `-codex`), not `nathanjohnpayne` — GitHub rejects self-approval, and the workflow's preflight guards now hard-fail if the token resolves to the author identity OR to any login not in `.github/review-policy.yml` `available_reviewers`. See nathanjohnpayne/mergepath#179 for the audit-trail rationale.
 
 Or use the CLI (faster):
 
 ```bash
-gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo} --body "$(op read 'op://Private/sm5kopwk6t6p3xmu2igesndzhe/token')"
+# Substitute the 1Password item ID for whichever reviewer identity
+# you choose to use as the CI approver (claude / cursor / codex).
+# The full lookup table is in REVIEW_POLICY.md § PAT lookup table.
+gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo} --body "$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')"   # nathanpayne-claude
 ```
 
-**Reviewer identity PATs (`nathanpayne-claude`, `nathanpayne-codex`,
-`nathanpayne-cursor`) are intentionally NOT stored as repo CI secrets.**
-Phase 2 internal self-peer review runs in the agent's own session: the
-agent switches its Git identity to its reviewer account with a PAT
-read directly from 1Password (`op read 'op://Private/<item-id>/token'`)
-and posts the review with that PAT. See REVIEW_POLICY.md § Phase 2 and
-each repo's `CLAUDE.md` / `AGENTS.md` for the identity-switch procedure.
+**`REVIEWER_ASSIGNMENT_TOKEN` is the only reviewer-identity PAT
+stored as a repo CI secret.** It exists specifically because the
+Dependabot auto-merge + Agent Review Pipeline workflows run inside
+GitHub Actions where there's no interactive `op read`. Pick ONE of
+the reviewer identities (claude / cursor / codex) and use its PAT
+for this slot — the workflow validates the resolved identity against
+`available_reviewers` and rejects anything else.
+
+For Phase 2 internal self-peer review (the back-and-forth that
+happens during a review session), the OTHER two reviewer-identity
+PATs are NOT stored as repo CI secrets. Phase 2 runs in the agent's
+own session: the agent switches its Git identity to its reviewer
+account with a PAT read directly from 1Password
+(`op read 'op://Private/<item-id>/token'`) and posts the review with
+that PAT. See REVIEW_POLICY.md § Phase 2 and each repo's `CLAUDE.md`
+/ `AGENTS.md` for the identity-switch procedure.
 
 **Do NOT add `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `CLAUDE_PAT` /
 `CODEX_PAT` / `CURSOR_PAT` as repo secrets.** An earlier iteration of
@@ -425,10 +439,12 @@ Note: reviewer identity PATs are NOT stored as repo CI secrets. They are
 read from 1Password per-session by the authoring agent for the in-session
 identity switch, so rotation does not require updating any repo secrets.
 
-The `REVIEWER_ASSIGNMENT_TOKEN` repo secret (Nathan's PAT used by the
-Agent Review Pipeline workflow) follows a similar process but also
-needs a `gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo}`
-call on every repo after rotating the 1Password item.
+The `REVIEWER_ASSIGNMENT_TOKEN` repo secret (a **reviewer-identity**
+PAT used by the Dependabot auto-merge + Agent Review Pipeline
+workflows; see "Add `REVIEWER_ASSIGNMENT_TOKEN` to repo secrets" above)
+follows a similar process but also needs a `gh secret set
+REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo}` call on every repo
+after rotating the 1Password item.
 
 ---
 
