@@ -68,7 +68,13 @@ PR_NUM=""
 REPO=""
 MODE="list"
 DRY_RUN=false
-BOT_LOGINS_RE='^(coderabbitai\[bot\]|chatgpt-codex-connector\[bot\]|dependabot\[bot\])$'
+# Match both REST and GraphQL bot-login formats. The REST API returns
+# `coderabbitai[bot]`; GraphQL `author{login}` returns `coderabbitai`
+# (un-suffixed user-facing handle). The trailing `(\[bot\])?` accepts
+# either form so the auto-resolve mode works with the GraphQL data
+# this script reads. Caught on PR #180 review when every CR thread
+# was skipped as "human author" — see #182.
+BOT_LOGINS_RE='^(coderabbitai|chatgpt-codex-connector|dependabot)(\[bot\])?$'
 
 while [ $# -gt 0 ]; do
   case "$1" in
