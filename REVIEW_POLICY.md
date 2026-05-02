@@ -130,8 +130,8 @@ Replace `claude` with `cursor` or `codex` depending on which agent is running. T
 | `all` | Everything (recommended) |
 
 After preflight, these environment variables are set:
-- `OP_PREFLIGHT_REVIEWER_PAT` — use with `GH_TOKEN=` for reviewer commands
-- `OP_PREFLIGHT_AUTHOR_PAT` — use with `GH_TOKEN=` for author commands
+- `OP_PREFLIGHT_REVIEWER_PAT` — use with `GH_TOKEN=` for reviewer-identity **read-path** API calls and helper scripts (`coderabbit-wait.sh`, `codex-review-request.sh`, `codex-review-check.sh`). Write paths (`gh pr review` / `create` / `merge` / `edit`) use the active keyring account regardless of `GH_TOKEN` — see [Reviewer PAT Quick Start](#reviewer-pat-quick-start).
+- `OP_PREFLIGHT_AUTHOR_PAT` — use with `GH_TOKEN=` for author-identity read-path API calls. For author-identity writes (PR create / merge / label edit), use the `gh auth switch -u nathanjohnpayne && ... && gh auth switch -u nathanpayne-<agent>` switch-around pattern.
 - `GOOGLE_APPLICATION_CREDENTIALS` — used automatically by gcloud/Firebase scripts
 - `OP_PREFLIGHT_DONE=1` — flag indicating preflight has been run
 

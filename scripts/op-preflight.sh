@@ -55,7 +55,7 @@
 # After eval, downstream usage splits along the gh read/write boundary
 # (see CLAUDE.md § Active-account convention):
 #
-#   # Read-path: GH_TOKEN authenticates and sets the byline.
+#   # Read-path: GH_TOKEN authenticates the request (no byline involved).
 #   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login
 #   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-check.sh <PR#>
 #
