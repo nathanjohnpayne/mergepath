@@ -434,6 +434,19 @@ Agents must never modify the `needs-external-review`, `needs-human-review`, or `
 
 ## Implementation notes for branch protection gates
 
+### Required status checks (per-repo setup)
+
+The workflows shipped under `.github/workflows/` ENFORCE merge gating only when configured as **required status checks** in branch protection. Without that bit, a failed check is advisory and the PR merges anyway. The 2026-04-27 weekly audit caught `matchline#76` and `matchline#93` merging past `needs-human-review` for exactly this reason — `Label Gate` was running and failing, but wasn't in the required-checks list.
+
+Each repo using this template must mark these as required on `main` (Settings → Branches → Branch protection rule):
+
+- **`Label Gate`** — fails when any of `needs-external-review`, `needs-human-review`, or `policy-violation` is on the PR. The hard gate behind the doctrine in [Agent prohibitions](#agent-prohibitions).
+- **`Self-Review Required`** — fails when the PR body lacks a `## Self-Review` section (Dependabot-exempt).
+
+Audit a repo's branch protection with `scripts/audit-branch-protection.sh` (read-only; exits 3 if any canonical check is not required, with a fix recipe). Re-run after every protection change.
+
+### `resolveReviewThread`
+
 The GitHub GraphQL `resolveReviewThread` mutation may be used by agents **only** when both:
 
 - The agent has demonstrably addressed the inline finding (a fix is on the current HEAD, or a rebuttal is posted on the thread), AND
