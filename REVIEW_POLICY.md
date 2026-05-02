@@ -34,9 +34,26 @@ To add a new agent, register a GitHub account following the pattern `nathanpayne
 
 ### Reviewer PAT Quick Start
 
-When posting a PR review as a reviewer identity, always pass a PAT from 1Password
-to `gh` explicitly. Do not rely on the GitHub connector session or on the
-account shown by `gh auth status`.
+`gh` resolves auth differently for read paths vs write paths:
+
+- **Read paths** (`gh api user`, `gh api ...` GETs, `gh pr view`,
+  `gh pr checks`) honor `GH_TOKEN`. Pass it inline per command.
+- **Write paths** (`gh pr review`, `gh pr create`, `gh pr merge`,
+  `gh pr edit`, `gh api -X POST repos/.../pulls/.../reviews`) use the
+  keyring's **active** account regardless of `GH_TOKEN`. The byline is
+  whoever `gh auth status` shows as `Active: true`.
+
+Each agent's working machine has the agent identity as the **active**
+gh account, set once: `gh auth switch -u nathanpayne-<agent>`.
+Reviewer-identity writes then attribute correctly without an env var.
+Author-identity writes (`gh pr create`, `gh pr merge`, `gh pr edit`)
+need a temporary `gh auth switch -u nathanjohnpayne` around them,
+paired with a switch-back. See nathanjohnpayne/mergepath#164 for the
+empirical diagnosis (matchline PRs #181, #182).
+
+PATs are still required for read-path API calls and for the helper
+scripts (`coderabbit-wait.sh`, `codex-review-request.sh`,
+`codex-review-check.sh`) that drive the review pipeline.
 
 #### PAT lookup table
 
@@ -48,24 +65,35 @@ account shown by `gh auth status`.
 | Human | `nathanjohnpayne` | `sm5kopwk6t6p3xmu2igesndzhe` | `op://Private/sm5kopwk6t6p3xmu2igesndzhe/token` |
 
 ```bash
-# Example: verify the Claude reviewer identity before approving a PR
+# Read-path identity check — GH_TOKEN works here.
 GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
   gh api user --jq '.login'
 # expected: nathanpayne-claude
 
-GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
-  gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
+# Write-path: with the agent identity active, GH_TOKEN is irrelevant
+# for the byline. Just run the command.
+gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
+
+# Author-identity write: switch around the call so the byline is the
+# author identity, then switch back so the active state is correct
+# for subsequent reviewer-identity writes.
+gh auth switch -u nathanjohnpayne && \
+  gh pr create --title "..." --body "..." && \
+  gh auth switch -u nathanpayne-claude
 ```
 
 - Use the item ID from the lookup table above for your agent identity. Do not use the 1Password item title.
-- If `gh auth status` still shows `nathanjohnpayne`, that is okay.
-  `GH_TOKEN=...` overrides the ambient login for that command.
+- `gh auth status` should show your **agent identity** as `Active: true`.
+  If it shows `nathanjohnpayne` instead, reviewer-identity writes will
+  attribute to nathanjohnpayne (not the reviewer). Fix once with
+  `gh auth switch -u nathanpayne-<agent>`. The `op-preflight.sh` script
+  warns when active ≠ expected.
 - If `op whoami` says you are not signed in, still run the `op read ...`
   command in an interactive TTY. That is what triggers the 1Password biometric
   prompt on local machines.
-- If GitHub returns `Review Can not approve your own pull request`, the wrong
-  reviewer identity is still being used. Check the lookup table and verify you
-  are using your agent's item ID, not the author identity's.
+- If GitHub returns `Review Can not approve your own pull request`, you are
+  the active account on a PR you authored. Switch to a different agent's
+  reviewer identity (or skip self-approve per the no-self-approve rule).
 
 ## Workflow
 

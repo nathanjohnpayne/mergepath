@@ -295,6 +295,32 @@ log_stale_adc_guidance() {
 # incomplete codex session file look valid and causing gh to run as
 # the wrong identity. See round-5 Codex finding on the propagation
 # PRs for the multi-agent repro.
+# Active-account check (warn-only). gh's write paths use the keyring's
+# active account regardless of GH_TOKEN. Each agent's machine should
+# have its agent identity (nathanpayne-<agent>) as the active gh
+# account so reviewer-identity writes (gh pr review --comment) attribute
+# correctly without a switch. Author-identity writes (gh pr create /
+# merge / edit) still need a temporary `gh auth switch -u nathanjohnpayne`
+# around them. See nathanjohnpayne/mergepath#164 for the empirical
+# diagnosis (matchline PRs #181, #182 — wrong-byline reviews when active
+# was nathanjohnpayne instead of the agent identity).
+warn_active_account_mismatch() {
+  local expected="nathanpayne-${AGENT}"
+  command -v gh >/dev/null 2>&1 || return 0
+  local actual
+  actual=$(gh auth status 2>/dev/null | awk '
+    /Active account: true/ {found=1; next}
+    /account / && found { print $NF; found=0; exit }
+  ' | head -1)
+  [[ -z "$actual" ]] && actual=$(gh api user --jq .login 2>/dev/null || echo "")
+  if [[ -n "$actual" ]] && [[ "$actual" != "$expected" ]]; then
+    echo "# WARNING: gh active account is '$actual' (expected '$expected')." >&2
+    echo "#   Reviewer-identity writes (gh pr review) will mis-attribute." >&2
+    echo "#   Fix once: gh auth switch -u $expected" >&2
+    echo "#   See CLAUDE.md § Active-account convention for the full pattern." >&2
+  fi
+}
+
 emit_from_session_file() (
   # Subshell: the (  ... ) above means unset/source/return here do
   # not escape back to the caller. We still "return" rc codes via
@@ -427,6 +453,7 @@ if ! $REFRESH && session_is_fresh; then
       echo "#   $line" >&2
     done
     echo "# Run with --refresh to force a new biometric fetch." >&2
+    warn_active_account_mismatch
     echo "# ──────────────────────────────────────────────────────────" >&2
     exit 0
   fi
@@ -553,5 +580,6 @@ for line in "${SUMMARY[@]}"; do
 done
 echo "# Session file: $SESSION_FILE (TTL ${TTL_SECONDS}s)" >&2
 echo "# OP_PREFLIGHT_DONE=1" >&2
+warn_active_account_mismatch
 echo "# Human can step away." >&2
 echo "# ──────────────────────────────────────────────────────" >&2

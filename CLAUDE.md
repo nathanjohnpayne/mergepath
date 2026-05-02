@@ -15,6 +15,43 @@ Never push directly to `main`. All changes must go through a pull request.
 Every PR you open must follow this workflow. No exceptions unless the human
 explicitly authorizes a break-glass override in chat.
 
+## Active-account convention
+
+`gh` resolves auth differently for read paths vs write paths:
+
+- **Read paths** (`gh api user`, `gh api ...` GETs, `gh pr view`, `gh pr
+  checks`) honor `GH_TOKEN` correctly. Set the env var per command and
+  the request runs as whichever PAT you supply.
+- **Write paths** that create reviews / comments / PRs / merges /
+  label edits (`gh pr review`, `gh pr create`, `gh pr merge`,
+  `gh pr edit`, `gh api -X POST repos/.../pulls/.../reviews`) use the
+  keyring's **active** account regardless of `GH_TOKEN`. The byline is
+  whoever `gh auth status` shows as `Active: true` when the call lands.
+
+Each agent's working machine has the agent identity as the **active**
+gh account, set once per machine: `gh auth switch -u nathanpayne-claude`
+(substitute your agent identity). Both `nathanjohnpayne` (author) and
+`nathanpayne-<agent>` (reviewer) must already be in the keyring (one-
+time `gh auth login` per identity per machine). With this convention:
+
+- Reviewer-identity writes (`gh pr review --comment` from your agent
+  identity) just work — no `GH_TOKEN` switch, no `gh auth switch`.
+- Author-identity writes (`gh pr create`, `gh pr merge`, `gh pr edit`
+  for label changes) need a temporary switch-around so the byline is
+  the author identity, paired with a switch-back so the active state
+  never lingers wrong:
+
+  ```bash
+  gh auth switch -u nathanjohnpayne && \
+    gh pr merge <PR#> --squash --delete-branch && \
+    gh auth switch -u nathanpayne-claude
+  ```
+
+`git commit` does NOT go through gh auth — it uses the local git
+config (`user.name` / `user.email` set to the human author identity),
+so commits keep attributing to nathanjohnpayne even when the gh
+keyring active is your agent identity. No switch needed for commits.
+
 ## Session start (run once)
 
 0. Run credential preflight to front-load all biometric prompts:
@@ -50,12 +87,13 @@ explicitly authorizes a break-glass override in chat.
 
 ## After opening the PR
 
-4. Switch to your reviewer identity (e.g., nathanpayne-claude).
-   If preflight was run: `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` (no biometric).
-   Otherwise: `GH_TOKEN="$(op read 'op://Private/<item-id>/token')"`.
-   See REVIEW_POLICY.md § PAT lookup table for your agent's item ID.
-5. Review the PR. Post comments on any issues found.
-6. Switch back to nathanjohnpayne. Address each comment. Push fix commits.
+4. Review the PR under your reviewer identity. With your agent identity
+   active per the convention above, just run:
+   `gh pr review <PR#> --repo owner/repo --comment --body "..."`.
+   The review is correctly attributed to the agent reviewer identity.
+5. Post comments on any issues found.
+6. Address each comment via fix commits (commits use git config, no
+   gh auth involved — byline stays nathanjohnpayne).
 7. Repeat steps 4–6 until the reviewer identity approves.
 7.5. If `.github/review-policy.yml` has `coderabbit.enabled: true`:
      a. Wait for CodeRabbit to post on the current HEAD. Prefer
@@ -134,8 +172,11 @@ explicitly authorizes a break-glass override in chat.
       the merge gate (CI green + internal reviewer approved + Codex
       cleared on current HEAD). The merge gate does NOT require an
       `APPROVED` review state from the Codex bot — the app never emits
-      one. If the gate passes, merge as nathanjohnpayne with
-      `gh pr merge --squash --delete-branch`.
+      one. If the gate passes, merge as nathanjohnpayne with the
+      switch-around per the active-account convention:
+      `gh auth switch -u nathanjohnpayne && \
+       gh pr merge <PR#> --squash --delete-branch && \
+       gh auth switch -u nathanpayne-claude`
 
    **Phase 4b — Manual CLI fallback.** Applies when Phase 4a is
    unavailable (`codex.enabled: false`, either helper script missing,
@@ -150,7 +191,9 @@ explicitly authorizes a break-glass override in chat.
    d. Wait for the external reviewer identity to post an `APPROVED` review.
    e. If the external reviewer flags observations or risks, file the
       post-merge GitHub Issues per step 11 below.
-   f. Merge as nathanjohnpayne.
+   f. Merge as nathanjohnpayne via the switch-around per the
+      active-account convention (`gh auth switch -u nathanjohnpayne &&
+      gh pr merge ... && gh auth switch -u nathanpayne-claude`).
 
 10. Never use `--admin` to merge unless the human explicitly authorizes it
     in chat as a break-glass exception. The hook will block it otherwise.
