@@ -53,9 +53,17 @@
 #   TTL anchor:  OP_PREFLIGHT_CREATED_AT_EPOCH (embedded in file, not mtime)
 #
 # After eval, downstream scripts and agent commands use the exported env
-# vars instead of calling op directly:
-#   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh pr review ...
-#   GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"   gh pr merge ...
+# vars for READ-path operations and helper scripts. WRITE-path operations
+# (`gh pr review`, `gh pr create`, `gh pr merge`, `gh pr edit`) use the
+# keyring's active account regardless of GH_TOKEN — see
+# CLAUDE.md § Active-account convention. Examples:
+#   # Read paths honor GH_TOKEN:
+#   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login
+#   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/coderabbit-wait.sh <PR#>
+#   # Write paths use active keyring (this script warns if active != expected):
+#   gh pr review <PR#> --comment --body "..."   # active = nathanpayne-<agent>
+#   gh auth switch -u nathanjohnpayne && gh pr merge <PR#> ... && \
+#     gh auth switch -u nathanpayne-<agent>     # author write
 #   # gcloud/firebase use GOOGLE_APPLICATION_CREDENTIALS automatically
 
 set -eo pipefail
@@ -312,19 +320,25 @@ warn_active_account_mismatch() {
   command -v gh >/dev/null 2>&1 || return 0
   local expected="nathanpayne-${AGENT}"
   local actual=""
-  # Capture in a way that cannot abort the parent script under
-  # `set -eo pipefail` if `gh auth status` fails (no login, network
-  # blip) or if the awk pipeline returns no match. Codex P1 on PR
-  # #171: bare `actual=$(... | awk ... | head -1)` propagates the
-  # failure and terminates the whole script. Wrap in a subshell with
-  # pipefail disabled and `|| true` to neutralize both failure modes.
-  actual=$( ( set +o pipefail; gh auth status 2>/dev/null | awk '
-    /Active account: true/ {found=1; next}
-    /account / && found { print $NF; found=0; exit }
-  ' | head -1 ) || true )
-  if [[ -z "$actual" ]]; then
-    actual=$(gh api user --jq .login 2>/dev/null || true)
-  fi
+  # Use `gh config get -h github.com user` to read the active keyring
+  # account. This is the GH_TOKEN-immune signal:
+  #
+  #   - `gh auth status` honors GH_TOKEN — when GH_TOKEN is set, gh
+  #     reports the GH_TOKEN entry as Active: true and flips the
+  #     keyring entry to Active: false, even though writes still use
+  #     the keyring active. Codex CHANGES_REQUESTED on #171 reproduced
+  #     this masking: GH_TOKEN=<codex PAT> + keyring active=claude
+  #     made `gh auth status` parsers report codex as active, masking
+  #     the mismatch the warn function exists to surface.
+  #
+  #   - `gh config get -h github.com user` reads the keyring's stored
+  #     active username directly from ~/.config/gh/hosts.yml. It does
+  #     NOT honor GH_TOKEN. Verified: returns `nathanpayne-claude`
+  #     unchanged with and without GH_TOKEN set.
+  #
+  # Wrap in `|| true` so a `gh config` failure (corrupt hosts.yml,
+  # no gh login) cannot abort the parent under `set -eo pipefail`.
+  actual=$(gh config get -h github.com user 2>/dev/null || true)
   if [[ -n "$actual" ]] && [[ "$actual" != "$expected" ]]; then
     echo "# WARNING: gh active account is '$actual' (expected '$expected')." >&2
     echo "#   Reviewer-identity writes (gh pr review) will mis-attribute." >&2
