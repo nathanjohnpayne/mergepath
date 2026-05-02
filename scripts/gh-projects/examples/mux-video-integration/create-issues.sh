@@ -22,6 +22,32 @@ export REPO="nathanjohnpayne/nathanpaynedotcom"
 export OWNER="nathanjohnpayne"
 export PROJECT=5
 
+# Safety gate (CodeRabbit on PR #180): this script writes to LIVE
+# project coordinates. Re-running creates duplicate issues #210+ and
+# spams the project board. Require explicit confirmation that the
+# operator knows they're hitting prod.
+#
+# Override:
+#   GHP_CONFIRM_LIVE=I_AM_REPOPULATING_PROJECT_5 ./create-issues.sh
+#
+# To repurpose this driver against a different project, change REPO/OWNER/
+# PROJECT above (and the override token) before running. This file is
+# the canonical worked example — copy it to your own examples/<initiative>/
+# directory before adapting, don't edit in place.
+if [[ "${GHP_CONFIRM_LIVE:-}" != "I_AM_REPOPULATING_PROJECT_5" ]]; then
+  echo "Refusing to run: this driver writes to live project coordinates"
+  echo "($REPO project #$PROJECT). Re-running creates duplicate issues."
+  echo ""
+  echo "If you're adapting this as a template for a different initiative,"
+  echo "COPY THE FILE to scripts/gh-projects/examples/<your-initiative>/"
+  echo "and edit REPO/OWNER/PROJECT plus this safety gate's override token"
+  echo "before running."
+  echo ""
+  echo "If you genuinely intend to repopulate $REPO project #$PROJECT,"
+  echo "set GHP_CONFIRM_LIVE=I_AM_REPOPULATING_PROJECT_5 and re-run."
+  exit 1
+fi
+
 # shellcheck source=../../lib.sh
 source "$SCRIPT_DIR/../../lib.sh"
 

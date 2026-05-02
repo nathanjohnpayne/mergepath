@@ -19,6 +19,13 @@ STATUS_NAME="${2:?status name required}"
 : "${REPO:?REPO must be set (owner/repo)}"
 : "${OWNER:?OWNER must be set}"
 : "${PROJECT:?PROJECT must be set}"
+: "${GH_TOKEN:?GH_TOKEN must be set to a PAT with project scope (this script mutates project items)}"
+
+# Required tooling: gh and python3 (used for parsing gh's JSON output below).
+# CodeRabbit on PR #180 caught the missing python3 check — fail fast with a
+# clear error rather than letting the python3 invocation crash mid-pipeline.
+command -v gh      >/dev/null 2>&1 || { echo "Error: gh CLI not on PATH (install via 'brew install gh')." >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "Error: python3 not on PATH (this script uses python3 to parse gh's JSON output; install python3 via your package manager)." >&2; exit 1; }
 
 export STATUS_NAME
 

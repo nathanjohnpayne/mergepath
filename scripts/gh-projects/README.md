@@ -13,12 +13,12 @@ The MUX Video Integration initiative ([Project #5](https://github.com/users/nath
 ## Prerequisites
 
 - `gh` installed (via Homebrew on this machine).
-- A PAT in 1Password with `repo` + `project` scopes. The `nathanjohnpayne` author PAT (item `sm5kopwk6t6p3xmu2igesndzhe`) works.
+- A PAT with `repo` + `project` scopes. Use the author PAT or a reviewer-identity PAT — see [REVIEW_POLICY.md § PAT lookup table](../../REVIEW_POLICY.md#pat-lookup-table) for the 1Password item IDs (the table is the canonical source; don't re-list IDs here to avoid drift).
 - Run [scripts/op-preflight.sh](../op-preflight.sh) once per session to cache credentials.
 - The target Project v2 board must have a `Status` single-select field (the default template does). `move-item.sh` discovers the field by that exact name.
 
 ```bash
-# Session setup
+# Session setup — preflight populates OP_PREFLIGHT_AUTHOR_PAT in env.
 eval "$(scripts/op-preflight.sh --agent claude --mode all)"
 export GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"
 ```

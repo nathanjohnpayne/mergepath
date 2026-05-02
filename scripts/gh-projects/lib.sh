@@ -23,6 +23,7 @@ set -euo pipefail
 : "${REPO:?REPO must be set (owner/repo)}"
 : "${OWNER:?OWNER must be set}"
 : "${PROJECT:?PROJECT must be set (v2 number)}"
+: "${GH_TOKEN:?GH_TOKEN must be set to a PAT with repo + project scopes (CodeRabbit on PR #180: every helper here makes mutations on GitHub; failing fast at source-time is better than letting gh fall through to ambient auth and posting under the wrong identity)}"
 
 GHP_TMPDIR="${GHP_TMPDIR:-$(mktemp -d)}"
 export GHP_TMPDIR
