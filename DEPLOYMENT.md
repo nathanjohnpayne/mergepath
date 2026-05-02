@@ -194,15 +194,21 @@ When prompted:
 
 This creates `firebase.json` and `.firebaserc`. Commit both.
 
-### 4. Set up keyless deploy impersonation
+### 4. Set up the deployer service account
 
 ```bash
 op-firebase-setup {project-id}
 ```
 
-See [First-Time Setup](#first-time-setup) for details. After this, deploys use short-lived impersonated credentials instead of stored keys.
+See [First-Time Setup](#first-time-setup) for details. This creates the `firebase-deployer` service account, grants the necessary deploy roles, and configures impersonation as a fallback path.
 
-If `op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential` does not exist yet, seed it once by running `gcloud auth application-default login`, then copy `~/.config/gcloud/application_default_credentials.json` into the 1Password item `Private/GCP ADC`, field `credential`. After that, the normal maintainer flow returns to 1Password-backed, non-browser auth.
+### 5. Provision the Firebase-vault SA key (preferred default)
+
+After `op-firebase-setup` runs, follow [§ Secrets Management → Provisioning the Firebase-vault SA key](#provisioning-the-firebase-vault-sa-key) to materialize the SA key into the 1Password Firebase vault. This is the **preferred default** credential for routine deploys (interactive + CI) per #154 — it avoids the recurring `firebase login --reauth` friction (#137) caused by RAPT/refresh-token expiry on the shared 1Password ADC.
+
+Impersonation remains as a fallback path; it kicks in when the project SA key isn't provisioned yet.
+
+If `op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential` does not exist yet, seed it once by running `gcloud auth application-default login`, then copy `~/.config/gcloud/application_default_credentials.json` into the 1Password item `Private/GCP ADC`, field `credential`. The shared ADC is rank-4 fallback in the `op-firebase-deploy` resolver.
 
 ---
 

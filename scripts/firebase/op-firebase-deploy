@@ -166,7 +166,16 @@ resolve_source_cred_file() {
   fi
 
   # 1. Genuinely user-supplied GOOGLE_APPLICATION_CREDENTIALS
-  if [[ -n "$explicit_file" && -f "$explicit_file" && "$is_preflight_injected" -eq 0 ]]; then
+  if [[ -n "$explicit_file" && "$is_preflight_injected" -eq 0 ]]; then
+    if [[ ! -f "$explicit_file" ]]; then
+      # User explicitly set GOOGLE_APPLICATION_CREDENTIALS to a path
+      # that doesn't exist. Fail fast — silently falling through to
+      # other sources would deploy with a different identity/project
+      # than the caller asked for. Codex r1 Phase 4b on PR #181.
+      echo "Error: GOOGLE_APPLICATION_CREDENTIALS points to a missing file: $explicit_file" >&2
+      echo "Either fix the path or unset GOOGLE_APPLICATION_CREDENTIALS to fall through to the project SA key / preflight ADC / shared ADC chain." >&2
+      exit 1
+    fi
     SOURCE_CRED_FILE="$explicit_file"
     SOURCE_CRED_DESCRIPTION="explicit GOOGLE_APPLICATION_CREDENTIALS ($explicit_file)"
     return 0
