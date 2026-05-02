@@ -45,6 +45,14 @@
 #                             file does NOT extend its effective lifetime.
 #   OP_PREFLIGHT_CACHE_DIR    Override cache dir (default
 #                             $XDG_CACHE_HOME/mergepath or $HOME/.cache/mergepath).
+#   OP_PREFLIGHT_SSH_WARM_TTL_SECONDS
+#                             Override SSH-warm freshness window (default
+#                             1800s = 30 min). Independent of the PAT
+#                             cache TTL because the 1Password SSH agent
+#                             has its own session lifetime, typically
+#                             shorter than 4h. Skipping re-warm within
+#                             this window prevents a biometric prompt on
+#                             every cache-hit invocation. See #163.
 #
 # Session file:
 #   Path:        $cache_dir/op-preflight-<agent>.env
@@ -146,7 +154,7 @@ done
 if $PURGE_ALL; then
   if [[ -d "$CACHE_DIR" ]]; then
     echo "# Purging all session files under $CACHE_DIR" >&2
-    find "$CACHE_DIR" -maxdepth 1 -type f \( -name 'op-preflight-*.env' -o -name 'op-preflight-*-adc.json' \) -print -delete >&2
+    find "$CACHE_DIR" -maxdepth 1 -type f \( -name 'op-preflight-*.env' -o -name 'op-preflight-*-adc.json' -o -name 'op-preflight-*.ssh-warmed' \) -print -delete >&2
   fi
   exit 0
 fi
@@ -170,11 +178,13 @@ fi
 # ── Cache paths (deterministic per agent) ─────────────────────────────
 SESSION_FILE="$CACHE_DIR/op-preflight-$AGENT.env"
 ADC_TMPFILE="$CACHE_DIR/op-preflight-$AGENT-adc.json"
+SSH_WARM_MARKER="$CACHE_DIR/op-preflight-$AGENT.ssh-warmed"
+SSH_WARM_TTL_SECONDS="${OP_PREFLIGHT_SSH_WARM_TTL_SECONDS:-1800}"  # 30 min default; #163
 
 # ── Purge mode ────────────────────────────────────────────────────────
 if $PURGE; then
-  rm -f "$SESSION_FILE" "$ADC_TMPFILE"
-  echo "# Purged session file + ADC tempfile for agent=$AGENT" >&2
+  rm -f "$SESSION_FILE" "$ADC_TMPFILE" "$SSH_WARM_MARKER"
+  echo "# Purged session file + ADC tempfile + SSH-warm marker for agent=$AGENT" >&2
   exit 0
 fi
 
@@ -449,7 +459,34 @@ emit_from_session_file() (
 # means subsequent git/gh SSH operations can still block on auth even
 # after preflight reports success (friends-and-family-billing#227
 # round-5 Codex P2). Output goes to stderr so it's not eval'd.
+#
+# SSH-warm freshness (#163): the 1Password SSH agent has its OWN
+# session TTL — independent of the chmod-600 PAT cache. Re-warming
+# on every cache-hit invocation re-prompts biometric whenever the
+# 1Password agent's own session has expired (typically much shorter
+# than the 4h PAT TTL). Track an SSH-warm marker file and skip the
+# warm if it's recent enough. The marker's age is the only thing
+# that matters here — if the 1Password agent expires inside our
+# SSH_WARM_TTL window, the next git push/pull still triggers
+# biometric, but at least preflight itself doesn't multiply that.
+ssh_warm_is_fresh() {
+  [[ -f "$SSH_WARM_MARKER" ]] || return 1
+  local mtime now age
+  mtime=$(stat -f %m "$SSH_WARM_MARKER" 2>/dev/null || stat -c %Y "$SSH_WARM_MARKER" 2>/dev/null || echo 0)
+  now=$(date +%s)
+  age=$((now - mtime))
+  [[ "$age" -lt "$SSH_WARM_TTL_SECONDS" ]]
+}
+
 warm_ssh_keys() {
+  if ssh_warm_is_fresh; then
+    local mtime now age
+    mtime=$(stat -f %m "$SSH_WARM_MARKER" 2>/dev/null || stat -c %Y "$SSH_WARM_MARKER" 2>/dev/null || echo 0)
+    now=$(date +%s); age=$((now - mtime))
+    echo "# Preflight: SSH keys recently warmed (${age}s ago / TTL ${SSH_WARM_TTL_SECONDS}s) — skipping" >&2
+    SUMMARY+=("SSH keys: cached (${age}s ago)")
+    return 0
+  fi
   echo "# Preflight: warming SSH keys..." >&2
   if ssh -T "git@${SSH_AUTHOR_HOST}" 2>&1 | grep -qi "successfully authenticated"; then
     SUMMARY+=("SSH key ($SSH_AUTHOR_HOST): authorized")
@@ -463,7 +500,20 @@ warm_ssh_keys() {
   else
     SUMMARY+=("SSH key ($reviewer_host): warming attempted")
   fi
+  # Touch the marker AFTER both warms attempted. If either warm failed
+  # (network blip, key not in agent) we still set the marker — the next
+  # git op will surface the underlying problem rather than masking it
+  # with a re-warm cycle. Marker-touch failures are non-fatal.
+  touch "$SSH_WARM_MARKER" 2>/dev/null || true
+  chmod 600 "$SSH_WARM_MARKER" 2>/dev/null || true
 }
+
+# ── Refresh forces both PAT cache + SSH-warm marker invalidation ─────
+# (--refresh is the "I want a brand-new biometric burst" knob; honor
+# it for SSH too, otherwise the warm would skip via the marker.)
+if $REFRESH; then
+  rm -f "$SSH_WARM_MARKER"
+fi
 
 # ── Fast path: reuse session file when fresh ──────────────────────────
 if ! $REFRESH && session_is_fresh; then
