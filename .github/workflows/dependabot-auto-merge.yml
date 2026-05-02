@@ -64,13 +64,34 @@ jobs:
           gh pr review --approve "$PR_URL"
 
           # Try GitHub-side auto-merge first (fires when required
-          # checks pass). Falls back to immediate squash if --auto is
-          # rejected (typically: no branch protection on main, so
-          # GitHub doesn't accept --auto). Either path is fine — both
-          # land the merge — but the trailing `|| true` is gone: a
-          # hard failure here means the PR didn't merge, which the
-          # audit needs to see rather than silently succeeding.
-          gh pr merge --squash --auto "$PR_URL" || gh pr merge --squash "$PR_URL"
+          # checks pass). Fall back to an immediate squash ONLY when
+          # the failure cause is "auto-merge unavailable" — i.e., the
+          # repo doesn't have branch protection / auto-merge enabled
+          # in settings. Other failures (network, permissions, race,
+          # invalid token) propagate so the audit sees them.
+          #
+          # CodeRabbit on PR #179 caught that the prior bare-`||`
+          # fallback would silently retry on ANY failure mode,
+          # including transient errors that should bubble up. gh CLI
+          # returns exit 1 for all merge failures without a
+          # distinguishing exit code, so we pattern-match stderr for
+          # the documented auto-merge-unavailable GraphQL messages.
+          set +e
+          AUTO_STDERR=$(gh pr merge --squash --auto "$PR_URL" 2>&1 1>/dev/null)
+          AUTO_RC=$?
+          set -e
+          if [ "$AUTO_RC" -eq 0 ]; then
+            echo "$AUTO_STDERR"
+            exit 0
+          fi
+          echo "$AUTO_STDERR" >&2
+          if echo "$AUTO_STDERR" | grep -qiE 'auto[- ]?merge is not available|not in the correct state to enable auto[- ]?merge|auto[- ]?merge.*disabled|enablePullRequestAutoMerge'; then
+            echo "::notice::--auto unavailable on this repo (likely no branch protection); falling back to immediate squash."
+            gh pr merge --squash "$PR_URL"
+          else
+            echo "::error::gh pr merge --auto failed for a non-auto-merge-unavailable reason. See stderr above. Not falling back to immediate squash; surface to audit."
+            exit "$AUTO_RC"
+          fi
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
