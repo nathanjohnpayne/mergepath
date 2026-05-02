@@ -139,7 +139,7 @@ echo "policy_field (top-level scalar) tests — for phase_4b_default (#185)"
 # update. Documented inline rather than sourced from the script because
 # sourcing codex-review-check.sh runs its full top-level logic.
 policy_field_awk='
-  $1 == field":" {
+  /^[^[:space:]]/ && $1 == field":" {
     sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
     gsub(/^"/, "", $0)
     gsub(/"[[:space:]]*(#.*)?$/, "", $0)
@@ -170,6 +170,19 @@ assert_eq "policy_field reads field amid other top-level fields" "fallback-only"
 # Fixture: field with double quotes (matches the parser's quote-stripping).
 got=$(printf '%s\n' 'phase_4b_default: "complex-changes"' | awk -v field="phase_4b_default" "$policy_field_awk")
 assert_eq "policy_field strips surrounding quotes" "complex-changes" "$got"
+
+# Regression: nested same-named key under a parent block must NOT match
+# (Codex P2 on PR #189 — top-level lookup should be anchored to the
+# document root, not match indented occurrences of the same field name).
+nested=$(printf 'codex:\n  phase_4b_default: should-not-match\nphase_4b_default: complex-changes\n')
+got=$(echo "$nested" | awk -v field="phase_4b_default" "$policy_field_awk")
+assert_eq "policy_field ignores nested same-named keys; reads only top-level" "complex-changes" "$got"
+
+# Regression: nested key with NO top-level twin must return empty
+# (the parser shouldn't fall through to the indented match).
+nested_only=$(printf 'codex:\n  phase_4b_default: nested-only\n')
+got=$(echo "$nested_only" | awk -v field="phase_4b_default" "$policy_field_awk")
+assert_eq "policy_field returns empty when only a nested same-named key exists" "" "$got"
 
 # Fixture: real mergepath review-policy.yml has the field set; verify
 # end-to-end against the actual file so a typo in the schema-doc

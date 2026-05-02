@@ -278,11 +278,13 @@ Phase 4b is documented above as a fallback (4a unavailable / escalates / times o
 
 The `phase_4b_default` field in `.github/review-policy.yml` controls when 4b fires proactively:
 
-| Value | Behavior |
-|-------|----------|
+| Value | Behavior (intended; full wiring lands in #186 + #187) |
+|-------|---------|
 | `fallback-only` | Current behavior. 4b only on 4a unavailability/escalation/timeout. |
 | `complex-changes` | Run `scripts/phase-4b-classifier.sh` AFTER 4a clears; if any trigger matches, post the 4b handoff before merging. |
 | `always` | Skip the classifier; post the 4b handoff for every external-review-threshold PR. |
+
+**Implementation status (this commit ships only the policy/parser piece):** the `phase_4b_default` field is parsed and validated by `scripts/codex-review-check.sh` (it exports `PHASE_4B_DEFAULT` for downstream consumers), but the runtime branching that ACTS on the field — running the classifier after 4a clears and posting a proactive 4b handoff — lands in [#187](https://github.com/nathanjohnpayne/mergepath/issues/187) (CLAUDE.md / AGENTS.md operating-instruction update). The classifier itself ships in [#186](https://github.com/nathanjohnpayne/mergepath/issues/186). Until both merge, setting `phase_4b_default: complex-changes` or `: always` is a no-op behaviorally — the parser accepts it, but the existing 4a→merge flow runs unchanged. This is intentional per the parent #158's three-PR ship sequence.
 
 **Default for new repos:** `complex-changes` (the empirically validated middle ground). **Default for existing repos** that haven't added the field: `fallback-only` (no behavior change without explicit opt-in — see [Migration for existing consumers](#migration-for-existing-consumers) below).
 

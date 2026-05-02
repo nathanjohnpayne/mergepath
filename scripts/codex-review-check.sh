@@ -128,11 +128,15 @@ codex_field() {
 # but without the in-block check — used for fields like `phase_4b_default`
 # (#185) that live at the document root rather than inside `codex:` /
 # `coderabbit:`. Outputs the value or empty on miss.
+#
+# Anchored to start-of-line (no leading whitespace) so a same-named
+# nested key under e.g. `codex:` doesn't accidentally match. Codex P2
+# on PR #189 caught the unanchored-match scope-bleed risk.
 policy_field() {
   local field=$1
   [ -f "$CONFIG" ] || return 0
   awk -v field="$field" '
-    $1 == field":" {
+    /^[^[:space:]]/ && $1 == field":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
       gsub(/^"/, "", $0)
       gsub(/"[[:space:]]*(#.*)?$/, "", $0)
