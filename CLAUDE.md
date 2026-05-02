@@ -26,7 +26,11 @@ explicitly authorizes a break-glass override in chat.
   label edits (`gh pr review`, `gh pr create`, `gh pr merge`,
   `gh pr edit`, `gh api -X POST repos/.../pulls/.../reviews`) use the
   keyring's **active** account regardless of `GH_TOKEN`. The byline is
-  whoever `gh auth status` shows as `Active: true` when the call lands.
+  whoever owns the active keyring entry — read it with `gh config get
+  -h github.com user`, NOT `gh auth status`. (`gh auth status` is
+  GH_TOKEN-poisonable: when GH_TOKEN is set, it reports the GH_TOKEN
+  entry as Active and the keyring entry as inactive, even though
+  writes still attribute to the keyring.)
 
 Each agent's working machine has the agent identity as the **active**
 gh account, set once per machine: `gh auth switch -u nathanpayne-claude`
@@ -61,9 +65,12 @@ keyring active is your agent identity. No switch needed for commits.
    `$HOME/.cache/mergepath/`). Safe to re-run at the top of every tool
    call — within the TTL (4h default, override via
    `OP_PREFLIGHT_TTL_SECONDS`) the script reads the session file and
-   emits the same exports without a new biometric prompt. All subsequent
-   steps use `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` (reviewer) or
-   `GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"` (author) instead of `op read`.
+   emits the same exports without a new biometric prompt. Read-path
+   API calls and helper scripts use
+   `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` (or `…AUTHOR_PAT`) instead
+   of `op read`. Write paths (`gh pr review` / `create` / `merge` /
+   `edit`) use the active keyring account regardless of `GH_TOKEN`
+   per the Active-account convention above.
    Run `scripts/op-preflight.sh --agent claude --purge` at end of
    session to wipe the cache. If preflight was not run (or failed), fall
    back to inline `op read` (original pattern).

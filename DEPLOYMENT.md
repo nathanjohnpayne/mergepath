@@ -371,28 +371,44 @@ Use the item ID (not the item title) to avoid shell issues with parentheses in
 
 ### Reviewer PAT quick check
 
-Before asking a reviewer identity to approve a PR, verify the token with
-`gh api user` and then reuse the same explicit `GH_TOKEN` override for
-`gh pr review`:
+`gh` resolves auth differently for read paths vs write paths — the
+canonical convention is in `REVIEW_POLICY.md` § Reviewer PAT Quick Start
+and `CLAUDE.md` § Active-account convention. Short form:
+
+- **Read paths** (`gh api user`, GETs, `gh pr view`) honor `GH_TOKEN`.
+- **Write paths** (`gh pr review`, `gh pr create`, `gh pr merge`,
+  `gh pr edit`, `gh api -X POST`) use the keyring's **active**
+  account regardless of `GH_TOKEN`. Set the active account once per
+  machine: `gh auth switch -u nathanpayne-<agent>`.
 
 ```bash
-# Example: verify the Claude reviewer identity before approving a PR
+# Read-path identity check — GH_TOKEN works here.
 GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
   gh api user --jq '.login'
 # expected: nathanpayne-claude
 
-GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
-  gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
+# Write-path: with the agent identity active, GH_TOKEN is irrelevant
+# for the byline. Just run the command.
+gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
+
+# Author-identity write: switch around the call. Substitute your
+# agent identity (claude / cursor / codex) for the switch-back.
+gh auth switch -u nathanjohnpayne && \
+  gh pr merge <PR#> --squash --delete-branch && \
+  gh auth switch -u nathanpayne-<agent>
 ```
 
 - Use the item ID from the table above for your agent identity. Do not use the 1Password item title.
-- If `gh auth status` still shows `nathanjohnpayne`, that is okay.
-  `GH_TOKEN=...` overrides the ambient login for that command.
+- Verify the keyring active account with `gh config get -h github.com user`
+  (NOT `gh auth status` — that command honors GH_TOKEN and
+  mis-reports when GH_TOKEN is set). Fix once with
+  `gh auth switch -u nathanpayne-<agent>`. The `op-preflight.sh`
+  script warns when active ≠ expected.
 - On local interactive machines, the `op read` command itself may trigger the
   1Password biometric prompt even if `op whoami` says you are not signed in.
-- `Review Can not approve your own pull request` means the wrong GitHub
-  identity is still being used. Check the table above and verify you are using
-  your agent's item ID, not the author identity's.
+- `Review Can not approve your own pull request` means you are the active
+  account on a PR you authored. Switch to a different agent's reviewer
+  identity (or skip self-approve per the no-self-approve rule).
 
 ### Token rotation (as needed)
 

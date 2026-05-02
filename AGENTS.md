@@ -31,13 +31,21 @@ This repository uses a multi-identity AI agent code review system. The full poli
    This triggers biometric prompts once and writes a chmod-600 session
    file at `$XDG_CACHE_HOME/mergepath/op-preflight-<agent>.env` so fresh
    subshells can reuse the credentials (see REVIEW_POLICY.md § Phase 0).
-   Use `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` for reviewer commands and
-   `GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT"` for author commands.
+   `gh` resolves auth differently for read vs write paths: read paths
+   (`gh api user`, GETs, helper scripts) honor `GH_TOKEN`; write paths
+   (`gh pr review`, `gh pr create`, `gh pr merge`, `gh pr edit`) use
+   the keyring's **active** account. Set the active account once per
+   machine: `gh auth switch -u nathanpayne-{your-agent}`. Then use
+   `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` (or `$OP_PREFLIGHT_AUTHOR_PAT`)
+   only for read-path API calls and helper scripts. For author-identity
+   writes (PR create/merge/label edits), wrap the call in a temporary
+   `gh auth switch -u nathanjohnpayne && ... && gh auth switch -u nathanpayne-{your-agent}`.
+   See REVIEW_POLICY.md § Reviewer PAT Quick Start for the full convention.
    Run `scripts/op-preflight.sh --agent {your-agent} --purge` (or
    `--purge-all`) at end of session to delete the cached PATs.
 1. Author code as nathanjohnpayne. File a PR.
-2. Switch to your reviewer identity (e.g., nathanpayne-claude). Review the PR. Post comments.
-3. Switch back to nathanjohnpayne. Address each comment. Push fix commits.
+2. Review the PR under your reviewer identity. With your agent identity active per the convention above, just run `gh pr review <PR#> --comment --body "..."` — the byline is your reviewer identity. Post comments.
+3. Address each comment via fix commits (commits use git config, no gh auth involved — byline stays nathanjohnpayne).
 4. Repeat steps 2–3 until the reviewer identity approves with no outstanding issues.
 5. If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`:
    a. **Wait** for CodeRabbit to post its review on the current HEAD. Prefer `scripts/coderabbit-wait.sh <PR#>` over an ad-hoc poll — it anchors "cleared" on the HEAD committer date (closing the race that let auto-merge fire pre-CodeRabbit; see #136) and handles CodeRabbit's non-auto-retrying rate-limit state by parsing the published window and posting `@coderabbitai, try again.` itself (see #138). Exit codes: `0` cleared, `2` findings, `4` grace-window timeout (advisory — log and skip), `5` rate-limit stalled (alert the human, do not proceed).

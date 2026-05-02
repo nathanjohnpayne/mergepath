@@ -41,7 +41,11 @@ To add a new agent, register a GitHub account following the pattern `nathanpayne
 - **Write paths** (`gh pr review`, `gh pr create`, `gh pr merge`,
   `gh pr edit`, `gh api -X POST repos/.../pulls/.../reviews`) use the
   keyring's **active** account regardless of `GH_TOKEN`. The byline is
-  whoever `gh auth status` shows as `Active: true`.
+  whoever owns the active keyring entry — read it with `gh config get
+  -h github.com user`, NOT `gh auth status` (the latter is
+  GH_TOKEN-poisonable: with GH_TOKEN set it reports the GH_TOKEN entry
+  as Active and the keyring entry as inactive, masking real
+  mismatches).
 
 Each agent's working machine has the agent identity as the **active**
 gh account, set once: `gh auth switch -u nathanpayne-<agent>`.
@@ -51,9 +55,19 @@ need a temporary `gh auth switch -u nathanjohnpayne` around them,
 paired with a switch-back. See nathanjohnpayne/mergepath#164 for the
 empirical diagnosis (matchline PRs #181, #182).
 
-PATs are still required for read-path API calls and for the helper
-scripts (`coderabbit-wait.sh`, `codex-review-request.sh`,
-`codex-review-check.sh`) that drive the review pipeline.
+PATs are still required for the helper scripts (`coderabbit-wait.sh`,
+`codex-review-request.sh`, `codex-review-check.sh`) that drive the
+review pipeline. Of these, `codex-review-check.sh` is purely
+read-path; `coderabbit-wait.sh` and `codex-review-request.sh` BOTH
+post comments on the PR (a retry trigger and an `@codex review`
+trigger respectively, via `gh pr comment` or `gh api`). The PAT in
+`GH_TOKEN` authenticates the API call, but the **byline of the
+posted comment** is the keyring's active account — so the
+active-account convention applies to these helpers too. Set the
+active account once per machine (`gh auth switch -u nathanpayne-<agent>`)
+and the comments attribute correctly. The trigger-comment bodies are
+identity-agnostic, so a wrong byline isn't load-bearing — but
+matters for audit-trail consistency.
 
 #### PAT lookup table
 
@@ -83,11 +97,13 @@ gh auth switch -u nathanjohnpayne && \
 ```
 
 - Use the item ID from the lookup table above for your agent identity. Do not use the 1Password item title.
-- `gh auth status` should show your **agent identity** as `Active: true`.
-  If it shows `nathanjohnpayne` instead, reviewer-identity writes will
-  attribute to nathanjohnpayne (not the reviewer). Fix once with
-  `gh auth switch -u nathanpayne-<agent>`. The `op-preflight.sh` script
-  warns when active ≠ expected.
+- Verify the keyring active account with `gh config get -h github.com user`
+  (NOT `gh auth status` — that command honors GH_TOKEN and will
+  mis-report when GH_TOKEN is set). The result should be your agent
+  identity (`nathanpayne-<agent>`). If it shows `nathanjohnpayne`
+  instead, reviewer-identity writes will attribute to nathanjohnpayne
+  (not the reviewer). Fix once with `gh auth switch -u nathanpayne-<agent>`.
+  The `op-preflight.sh` script warns when active ≠ expected.
 - If `op whoami` says you are not signed in, still run the `op read ...`
   command in an interactive TTY. That is what triggers the 1Password biometric
   prompt on local machines.
@@ -114,8 +130,8 @@ Replace `claude` with `cursor` or `codex` depending on which agent is running. T
 | `all` | Everything (recommended) |
 
 After preflight, these environment variables are set:
-- `OP_PREFLIGHT_REVIEWER_PAT` — use with `GH_TOKEN=` for reviewer commands
-- `OP_PREFLIGHT_AUTHOR_PAT` — use with `GH_TOKEN=` for author commands
+- `OP_PREFLIGHT_REVIEWER_PAT` — use with `GH_TOKEN=` for reviewer-identity **read-path** API calls and helper scripts (`coderabbit-wait.sh`, `codex-review-request.sh`, `codex-review-check.sh`). Write paths (`gh pr review` / `create` / `merge` / `edit`) use the active keyring account regardless of `GH_TOKEN` — see [Reviewer PAT Quick Start](#reviewer-pat-quick-start).
+- `OP_PREFLIGHT_AUTHOR_PAT` — use with `GH_TOKEN=` for author-identity read-path API calls. For author-identity writes (PR create / merge / label edit), use the `gh auth switch -u nathanjohnpayne && ... && gh auth switch -u nathanpayne-<agent>` switch-around pattern.
 - `GOOGLE_APPLICATION_CREDENTIALS` — used automatically by gcloud/Firebase scripts
 - `OP_PREFLIGHT_DONE=1` — flag indicating preflight has been run
 
@@ -545,39 +561,60 @@ git remote set-url origin git@github.com:nathanjohnpayne/repo-name.git
 
 ### GitHub API authentication (gh CLI)
 
-For posting PR reviews and comments under a reviewer identity, use `gh` with an
-explicit PAT from 1Password. Do not rely on the GitHub connector session or on
-the ambient `gh` login. Refer to the [PAT lookup table](#pat-lookup-table) for
-your agent's 1Password item ID.
+`gh` resolves auth differently for read paths vs write paths — the
+canonical convention is documented in [Reviewer PAT Quick Start](#reviewer-pat-quick-start).
+Short form:
+
+- **Read paths** (`gh api user`, GETs, `gh pr view`, `gh pr checks`)
+  honor `GH_TOKEN`. Pass it inline per command.
+- **Write paths** (`gh pr review`, `gh pr create`, `gh pr merge`,
+  `gh pr edit`, `gh api -X POST`) use the keyring's **active** account
+  regardless of `GH_TOKEN`. The active account is set once per machine
+  via `gh auth switch -u nathanpayne-<agent>`; `op-preflight.sh` warns
+  if active ≠ expected.
 
 ```bash
-# ── Preferred: use preflight-cached PATs (no biometric prompts) ──
+# ── Read-path: GH_TOKEN works ──
 
-# As reviewer (after running op-preflight.sh):
+# Verify which identity a PAT resolves to (read path):
 GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq '.login'
 # expected: nathanpayne-claude
 
-GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" \
-  gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
+# Read-only helper:
+GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-check.sh <PR#>
 
-# As author (merge, address comments, etc.):
-GH_TOKEN="$OP_PREFLIGHT_AUTHOR_PAT" gh pr merge <PR#> --merge
+# Helpers that may also POST a trigger comment — GH_TOKEN authenticates
+# the API call, but the comment byline is the active keyring account.
+# Set active = nathanpayne-<agent> once per machine; then byline is correct.
+GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/coderabbit-wait.sh <PR#>
+GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-request.sh <PR#>
 
-# ── Fallback: inline op read (triggers biometric if session expired) ──
+# ── Write-path: active keyring is the byline; GH_TOKEN is ignored ──
 
-GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
-  gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
+# Reviewer-identity write (your agent identity is active by default):
+gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
+
+# Author-identity write: temporary switch-around so the byline is
+# nathanjohnpayne, paired with switch-back so active state never lingers
+# wrong for subsequent reviewer-identity writes:
+gh auth switch -u nathanjohnpayne && \
+  gh pr merge <PR#> --squash --delete-branch && \
+  gh auth switch -u nathanpayne-<agent>
 ```
 
 - Use the item ID from the [PAT lookup table](#pat-lookup-table) for your agent identity. Do not use the 1Password item title.
-- If `gh auth status` shows `nathanjohnpayne`, that is fine.
-  `GH_TOKEN=...` overrides the ambient login for that command.
+- Verify the keyring active account with `gh config get -h github.com user`
+  (NOT `gh auth status` — that command honors GH_TOKEN and
+  mis-reports when GH_TOKEN is set). Fix once with
+  `gh auth switch -u nathanpayne-<agent>`. The `op-preflight.sh`
+  script warns when active ≠ expected.
 - If `op whoami` says you are not signed in, still run the `op read ...`
   command in an interactive TTY. That is what triggers the 1Password biometric
   prompt on local machines.
-- If GitHub returns `Review Can not approve your own pull request`, the wrong
-  reviewer identity is still being used. Check the [PAT lookup table](#pat-lookup-table)
-  and verify you are using your agent's item ID, not the author identity's.
+- If GitHub returns `Review Can not approve your own pull request`, you
+  are the active account on a PR you authored. Switch to a different
+  agent's reviewer identity (or skip self-approve per the no-self-approve
+  rule).
 
 > **If `op read` fails with a sign-in or biometric error here**, follow the pause-and-prompt procedure in `docs/agents/operating-rules.md` under "1Password CLI authentication failures." Do not hardcode tokens, skip review, or retry in a loop.
 
