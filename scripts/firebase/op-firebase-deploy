@@ -130,12 +130,45 @@ materialize_firebase_vault_sa_key() {
 }
 
 resolve_source_cred_file() {
+  # Precedence (#154 — codified policy decision):
+  #
+  #   1. Genuinely user-supplied GOOGLE_APPLICATION_CREDENTIALS
+  #   2. Project-specific SA key from 1Password Firebase vault
+  #   3. Preflight-injected GOOGLE_APPLICATION_CREDENTIALS
+  #      (op-preflight.sh's ADC tempfile)
+  #   4. Shared ADC from 1Password Private vault
+  #   5. Local ADC file on disk
+  #
+  # Step 1 differs from steps 3-5 by deliberately ranking the
+  # genuinely-explicit override above the project SA key — if a human
+  # set GOOGLE_APPLICATION_CREDENTIALS in the shell themselves
+  # (debugging, one-off flow, alternate project), they meant it.
+  #
+  # Step 3 is a NEW behavior change (was step 1 in the prior
+  # implementation): when GOOGLE_APPLICATION_CREDENTIALS came from
+  # op-preflight.sh's --mode deploy, the ADC is the shared 1Password
+  # ADC item (which suffers from refresh-token RAPT expiry — see
+  # mergepath#137). Falling through to the project SA key first means
+  # routine deploys use the more-stable credential without the
+  # daily-reauth churn.
+  #
+  # The marker that distinguishes (1) from (3): the OP_PREFLIGHT_ADC_TMPFILE
+  # env var. Preflight sets it to the same path as
+  # GOOGLE_APPLICATION_CREDENTIALS when it injects an ADC; if the two
+  # match, the GOOGLE_APPLICATION_CREDENTIALS is preflight-injected,
+  # not user-set.
   local explicit_file="${GOOGLE_APPLICATION_CREDENTIALS:-}"
+  local preflight_tmpfile="${OP_PREFLIGHT_ADC_TMPFILE:-}"
   local resolved=""
+  local is_preflight_injected=0
+  if [[ -n "$explicit_file" && -n "$preflight_tmpfile" && "$explicit_file" == "$preflight_tmpfile" ]]; then
+    is_preflight_injected=1
+  fi
 
-  # 1. Explicit GOOGLE_APPLICATION_CREDENTIALS
-  if [[ -n "$explicit_file" && -f "$explicit_file" ]]; then
+  # 1. Genuinely user-supplied GOOGLE_APPLICATION_CREDENTIALS
+  if [[ -n "$explicit_file" && -f "$explicit_file" && "$is_preflight_injected" -eq 0 ]]; then
     SOURCE_CRED_FILE="$explicit_file"
+    SOURCE_CRED_DESCRIPTION="explicit GOOGLE_APPLICATION_CREDENTIALS ($explicit_file)"
     return 0
   fi
 
@@ -144,20 +177,34 @@ resolve_source_cred_file() {
   if [[ -n "$resolved" ]]; then
     SOURCE_CRED_FILE="$resolved"
     SOURCE_CRED_TMPFILE="$resolved"
+    SOURCE_CRED_DESCRIPTION="project Firebase-vault SA key ($PROJECT — Firebase Deployer SA Key)"
     return 0
   fi
 
-  # 3. Shared ADC from 1Password Private vault
+  # 3. Preflight-injected GOOGLE_APPLICATION_CREDENTIALS — used when
+  #    no project SA key exists. The shared ADC's RAPT-expiry surface
+  #    (#137) is the cost of this fallback; consumers wanting stable
+  #    deploys should provision the project SA key per DEPLOYMENT.md.
+  if [[ -n "$explicit_file" && -f "$explicit_file" && "$is_preflight_injected" -eq 1 ]]; then
+    SOURCE_CRED_FILE="$explicit_file"
+    SOURCE_CRED_DESCRIPTION="preflight-injected ADC (shared 1Password ADC; subject to RAPT expiry — see #137)"
+    return 0
+  fi
+
+  # 4. Shared ADC from 1Password Private vault (no preflight, but the
+  #    item is reachable directly).
   resolved="$(materialize_op_source_cred "$DEFAULT_ADC_OP_URI" || true)"
   if [[ -n "$resolved" ]]; then
     SOURCE_CRED_FILE="$resolved"
     SOURCE_CRED_TMPFILE="$resolved"
+    SOURCE_CRED_DESCRIPTION="shared 1Password ADC ($DEFAULT_ADC_OP_URI)"
     return 0
   fi
 
-  # 4. Local ADC file on disk
+  # 5. Local ADC file on disk
   if [[ -f "$DEFAULT_ADC_FILE" ]]; then
     SOURCE_CRED_FILE="$DEFAULT_ADC_FILE"
+    SOURCE_CRED_DESCRIPTION="local ADC file ($DEFAULT_ADC_FILE; subject to RAPT expiry — see #137)"
     return 0
   fi
 
@@ -219,6 +266,11 @@ if ! resolve_source_cred_file; then
   echo "Set GOOGLE_APPLICATION_CREDENTIALS, unlock 1Password item $DEFAULT_ADC_OP_URI, or create $DEFAULT_ADC_FILE." >&2
   exit 1
 fi
+
+# Log which credential source was selected (#137 + #154 — debugging
+# deploy auth was previously opaque). Goes to stderr so deploy
+# stdout/stderr stays clean for log-grepping by the caller.
+echo "[op-firebase-deploy] source credential: ${SOURCE_CRED_DESCRIPTION:-unknown}" >&2
 
 if ! source_cred_is_usable "$SOURCE_CRED_FILE"; then
   if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && "$SOURCE_CRED_FILE" == "${GOOGLE_APPLICATION_CREDENTIALS}" ]]; then
