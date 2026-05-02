@@ -89,11 +89,27 @@ done
 
 [ -z "$PR_NUM" ] && usage
 
+# PR_NUM must be a positive integer (no leading zeros, no other chars).
+if ! [[ "$PR_NUM" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid PR number: '$PR_NUM' (must be a positive integer)" >&2
+  exit 1
+fi
+
 if [ -z "$REPO" ]; then
   REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
     echo "Could not resolve repo. Pass --repo owner/name." >&2
     exit 2
   }
+fi
+
+# --repo value validation. Codex r1 on PR #172 caught the missing
+# check. Must be `owner/name` where each side is GitHub-legal:
+# alphanumerics, hyphens, dots, underscores; no leading dash; ≤39
+# chars per GitHub's username rules but we only enforce the syntactic
+# shape — gh will reject genuinely-invalid combinations downstream.
+if ! [[ "$REPO" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "Invalid --repo value: '$REPO' (expected owner/name)" >&2
+  exit 1
 fi
 
 OWNER="${REPO%/*}"
@@ -211,13 +227,25 @@ while IFS= read -r thread; do
     continue
   fi
 
-  # Current-HEAD check (Codex P2 on PR #172). The advertised contract
-  # is "resolve only when the latest comment is on the current HEAD"
-  # — a thread anchored to an older commit means the agent's most
-  # recent push hasn't been re-reviewed by the bot, so resolving it
-  # would force-clear an unaddressed finding. Skip with a clear note.
-  if [ -n "$COMMIT_OID" ] && [ "$COMMIT_OID" != "$HEAD_OID" ]; then
-    echo "  SKIP (stale: latest comment on ${COMMIT_OID:0:7}, HEAD is ${HEAD_OID:0:7}): [$AUTHOR] $PATH_"
+  # Current-HEAD check. The advertised contract is "resolve only when
+  # the latest comment is on the current HEAD" — a thread anchored to
+  # an older commit (or with no commit linkage at all) means the
+  # agent's most recent push hasn't been re-reviewed by the bot, so
+  # resolving it would force-clear an unaddressed finding.
+  #
+  # Codex r1 on PR #172 caught that the previous check
+  # `if [ -n "$COMMIT_OID" ] && [ "$COMMIT_OID" != "$HEAD_OID" ]`
+  # treated EMPTY commit_oid as "matches HEAD" → bot threads with no
+  # commit linkage in the GraphQL response would be force-resolved
+  # silently. The safe default is the opposite: missing oid is
+  # treated as stale.
+  if [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ] || [ "$COMMIT_OID" != "$HEAD_OID" ]; then
+    if [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ]; then
+      reason="no commit linkage"
+    else
+      reason="latest comment on ${COMMIT_OID:0:7}, HEAD is ${HEAD_OID:0:7}"
+    fi
+    echo "  SKIP (stale: $reason): [$AUTHOR] $PATH_"
     echo "    Push a fix commit (or rebuttal reply) to re-trigger the bot, then retry."
     SKIPPED_STALE=$((SKIPPED_STALE + 1))
     continue
@@ -247,8 +275,19 @@ done < <(printf '%s\n' "$UNRESOLVED")
 echo ""
 if $DRY_RUN; then
   echo "(dry-run; no threads modified)"
+  # Even in dry-run, surface that the PR is still blocked: callers can
+  # use exit code to gate auto-merge.
+  if [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ]; then exit 3; fi
   exit 0
 fi
 echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Failed: $FAILED_COUNT"
+# Codex r1 on PR #172: previously this exited 0 even with stale or
+# human-authored threads remaining — callers would treat it as "all
+# clear" and proceed to merge into a still-BLOCKED PR. Exit codes:
+#   2 = mutation failure (transient: gh/network)
+#   3 = unresolved threads remain (human or stale-bot) — PR still
+#       conversation-resolution-blocked; address and retry
+#   0 = no unresolved threads on current HEAD
 [ "$FAILED_COUNT" -gt 0 ] && exit 2
+[ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] && exit 3
 exit 0

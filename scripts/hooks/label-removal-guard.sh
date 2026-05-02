@@ -142,6 +142,23 @@ EXPANSION_RE='[$`]'
 walk_start=$((edit_index + 1))
 SKIP_AS=""  # "" | "label-flag-value"
 
+# Codex r1 on PR #172 caught: gh accepts `--remove-label A,B` as a
+# comma-separated list, but the regex above only matches the entire
+# token. So `--remove-label needs-external-review,foo` would slip
+# past — the joined value doesn't match `^needs-external-review$`,
+# but bash splits and removes both labels. Check each comma-split
+# segment instead of the whole value.
+check_label_value() {
+  local raw="$1"
+  if [[ "$raw" =~ $EXPANSION_RE ]]; then block_expansion "$raw"; fi
+  local IFS=','
+  for sub in $raw; do
+    sub="${sub# }"; sub="${sub% }"   # trim incidental whitespace
+    [[ -z "$sub" ]] && continue
+    if [[ "$sub" =~ $PROHIBITED_RE ]]; then block_prohibited "$sub"; fi
+  done
+}
+
 block_prohibited() {
   local label="$1"
   cat <<EOF >&2
@@ -187,8 +204,7 @@ for j in "${!TOKENS[@]}"; do
   tok="${TOKENS[$j]}"
   if [ "$SKIP_AS" = "label-flag-value" ]; then
     SKIP_AS=""
-    if [[ "$tok" =~ $PROHIBITED_RE ]]; then block_prohibited "$tok"; fi
-    if [[ "$tok" =~ $EXPANSION_RE ]]; then block_expansion "$tok"; fi
+    check_label_value "$tok"
     continue
   fi
   case "$tok" in
@@ -197,9 +213,7 @@ for j in "${!TOKENS[@]}"; do
       continue
       ;;
     --remove-label=*|--add-label=*)
-      val="${tok#*=}"
-      if [[ "$val" =~ $PROHIBITED_RE ]]; then block_prohibited "$val"; fi
-      if [[ "$val" =~ $EXPANSION_RE ]]; then block_expansion "$val"; fi
+      check_label_value "${tok#*=}"
       continue
       ;;
   esac
