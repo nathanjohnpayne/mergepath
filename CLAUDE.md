@@ -71,6 +71,31 @@ explicitly authorizes a break-glass override in chat.
      e. Fix real issues; dismiss false positives with a brief reply.
      CodeRabbit is advisory and does not block merge.
 
+7.6. Resolve all open review threads on the current HEAD:
+
+     ```bash
+     scripts/resolve-pr-threads.sh <PR#>                       # list unresolved
+     scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots   # resolve bots
+     ```
+
+     Branch protection on `main` typically requires
+     `required_conversation_resolution: true`, which means **every
+     review thread must be resolved before merge** — including
+     CodeRabbit `🧹 Nitpick` / `🔵 Trivial` comments that don't block
+     merge in CodeRabbit's own model. Without this step,
+     `mergeStateStatus` stays `BLOCKED` even when all required CI
+     checks are green and Codex has cleared. The blocker is invisible
+     in `gh pr checks` output — only the GitHub UI surfaces it.
+
+     For each unresolved bot-authored thread where you have already
+     addressed the finding (fix on this HEAD, or rebuttal posted),
+     `--auto-resolve-bots` clears it via the GraphQL
+     `resolveReviewThread` mutation. Per
+     `REVIEW_POLICY.md § Implementation notes for branch protection
+     gates`, this is a clean-up mechanism, NOT a policy override —
+     human-authored threads must be resolved via the GitHub UI or by
+     asking the human; the helper refuses to touch them.
+
 ## Before merging
 
 8. Check `.github/review-policy.yml` for the external review threshold.
@@ -154,6 +179,20 @@ explicitly authorizes a break-glass override in chat.
 
 10. Never use `--admin` to merge unless the human explicitly authorizes it
     in chat as a break-glass exception. The hook will block it otherwise.
+
+10.5. Before merging, verify `mergeStateStatus === "CLEAN"` (not
+     `BLOCKED` or `UNSTABLE`). `BLOCKED` with an empty
+     `gh pr checks` failure list almost always means an unresolved
+     review thread — re-run step 7.6.
+
+10.6. Never use `gh pr edit ... --remove-label` (or `--add-label`) for
+     `needs-external-review`, `needs-human-review`, or
+     `policy-violation`. These are human-action labels; the
+     `scripts/hooks/label-removal-guard.sh` PreToolUse hook blocks
+     such calls regardless of chat authorization. To request removal,
+     run: `scripts/request-label-removal.sh <PR#> <label>` — the
+     human clears it from any device and auto-merge fires
+     immediately. See REVIEW_POLICY.md § Agent prohibitions.
 
 ## After merging
 
