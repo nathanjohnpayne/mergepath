@@ -18,6 +18,22 @@ jobs:
     runs-on: ubuntu-latest
     if: github.actor == 'dependabot[bot]'
     steps:
+      # Check out the BASE ref (the target branch's tip), NOT the PR
+      # HEAD. This workflow runs under pull_request_target which has
+      # write permissions and access to secrets — checking out PR-author-
+      # controlled code (HEAD) and reading config from it would be a
+      # privilege escalation surface. We only need the BASE's
+      # .github/review-policy.yml for the available_reviewers
+      # validation in the next step. github.event.pull_request.base.sha
+      # is the merge target's tip at the moment the PR opened.
+      # codex r2 on PR #179 caught the missing checkout.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          # Don't persist the checkout token — we use REVIEWER_ASSIGNMENT_TOKEN
+          # for the gh calls below, not the default GITHUB_TOKEN.
+          persist-credentials: false
+
       - name: Fetch Dependabot metadata
         id: metadata
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
