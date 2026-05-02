@@ -236,6 +236,9 @@ Typical contents:
 - `scripts/ci/` — CI enforcement checks (see below)
 - `scripts/build/` — build and compile helpers
 - `scripts/migrate/` — data or structure migration utilities
+- `scripts/gh-projects/` — multi-phase GitHub Projects v2 driver kit
+  (parent + native sub-issue tree, body-file placeholders, swimlane
+  helpers). Standard tooling for tracking phased initiatives.
 
 Agents should not modify files in `scripts/ci/` without explicit
 instruction, as those scripts enforce this standard.
