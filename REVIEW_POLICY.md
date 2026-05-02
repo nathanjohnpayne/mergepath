@@ -408,6 +408,19 @@ The human resolves by one of:
 
 The agent never resolves a fired escalation signal on its own.
 
+## Agent prohibitions
+
+Agents must never modify the `needs-external-review`, `needs-human-review`, or `policy-violation` labels on any PR — these are human-action labels. The `scripts/hooks/label-removal-guard.sh` PreToolUse hook enforces this at the mechanism layer; chat authorization does not bypass it. To request a label removal, run `scripts/request-label-removal.sh <PR#> <label>` — this posts a structured ask on the PR and (if `MERGEPATH_NOTIFY_IMESSAGE_TO` is set) pings the human via iMessage. The human clears the label from any device; auto-merge fires immediately.
+
+## Implementation notes for branch protection gates
+
+The GitHub GraphQL `resolveReviewThread` mutation may be used by agents **only** when both:
+
+- The agent has demonstrably addressed the inline finding (a fix is on the current HEAD, or a rebuttal is posted on the thread), AND
+- The bot author of the thread has not auto-resolved within a reasonable window.
+
+It is a clean-up mechanism for the `required_conversation_resolution: true` branch-protection gate, NOT a policy override. It does not authorize removing blocking labels, bypassing required reviews, or merging past unaddressed findings. **If the thread author is a human (not a bot), agents must not call this mutation regardless of state.**
+
 ## Review Policy Configuration
 
 Each repository contains a `.github/review-policy.yml` file that governs review behavior. This file is read by the agent at the start of every review cycle.
