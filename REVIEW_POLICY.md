@@ -239,10 +239,14 @@ An agent proceeds to 4a first. If 4a escalates, times out, or is disabled, the a
 16a. Before merging, the agent runs `scripts/codex-review-check.sh <PR#>` to verify the merge gate. All of the following must be true:
 
      - `gh pr checks` reports all required CI checks green
-     - A reviewer identity from `available_reviewers` has posted an `APPROVED` review (Phase 2 internal self-peer review)
-     - Codex has signaled clearance on the current HEAD via one of the two forms in step 12a
+     - **Gate (b)** — one of:
+       - **Branch 1 (cross-agent):** a reviewer identity from `available_reviewers` has posted an `APPROVED` review (Phase 2 internal self-peer review by a DIFFERENT agent than the author)
+       - **Branch 2 (same-agent fallback, #170):** the PR's `Authoring-Agent:` matches an entry in `available_reviewers` AND `chatgpt-codex-connector[bot]` has a fresh 👍 reaction on the PR issue (timestamped at-or-after the same `REACTION_THRESHOLD` gate (c) uses). This is the normal path for single-agent sessions where the no-self-approve rule prohibits the author's reviewer identity from approving — Codex's external review is the cross-agent signal that substitutes for an APPROVED state.
+     - **Gate (c)** — Codex has signaled clearance on the current HEAD via one of the two forms in step 12a
 
      **The merge gate must never require an `APPROVED` review state from `chatgpt-codex-connector[bot]` — the app does not emit that state.** This point is load-bearing; a merge gate that looks for Codex APPROVED will never be satisfied and the Phase 4a happy path will be unreachable.
+
+     **No-self-approve rule + branch 2 interaction:** the rule "agents do not `--approve` a PR they authored under their own reviewer identity" remains in effect. Branch 2 is what makes the rule operational — without it, same-agent PRs would deadlock on gate (b) with no escape short of human override. With branch 2, the agent posts a `--comment` review under its reviewer identity (per the rule), and the Codex 👍 carries the cross-check weight.
 
 17a. On a passing merge gate, `nathanjohnpayne` merges the PR with `gh pr merge <n> --squash --delete-branch`. Never `--admin` unless the human explicitly authorizes a break-glass override in chat.
 

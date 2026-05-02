@@ -201,8 +201,21 @@ PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) || die 3 "failed to fetch 
 
 HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
 PR_AUTHOR=$(echo "$PR_JSON" | jq -r '.user.login')
+PR_BODY=$(echo "$PR_JSON" | jq -r '.body // ""')
 if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
   die 3 "could not determine HEAD sha for PR #$PR_NUMBER"
+fi
+
+# Extract the Authoring-Agent line and resolve it to the matching reviewer
+# identity (e.g., `Authoring-Agent: claude` → `nathanpayne-claude`). Used
+# by gate (b) branch 2 (#170) to detect the same-agent author/reviewer
+# case where Codex's 👍 reaction can substitute for an APPROVED review.
+AUTHORING_AGENT=$(echo "$PR_BODY" | grep -i -m1 -E '^Authoring-Agent:' | sed -E 's/^[Aa]uthoring-[Aa]gent:[[:space:]]*([A-Za-z0-9_-]+).*/\1/' | tr '[:upper:]' '[:lower:]')
+SAME_AGENT_REVIEWER=""
+if [ -n "$AUTHORING_AGENT" ]; then
+  # Match against available_reviewers via suffix (e.g., "claude" matches
+  # "nathanpayne-claude"). Empty if no match.
+  SAME_AGENT_REVIEWER=$(echo "$REVIEWERS" | awk -v agent="-$AUTHORING_AGENT" '$0 ~ agent"$" { print; exit }')
 fi
 
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
@@ -504,10 +517,52 @@ APPROVING_REVIEWER=$(echo "$REVIEWS_JSON" | jq -r \
 ')
 
 if [ -z "$APPROVING_REVIEWER" ]; then
-  fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED review (COMMENTED reviews are ignored; later CHANGES_REQUESTED/DISMISSED overrides earlier APPROVED)"
-fi
+  # Branch 2 (#170): same-agent author/reviewer fallback. The
+  # no-self-approve rule prohibits the agent that authored the PR from
+  # also approving under its own reviewer identity, which leaves
+  # same-agent PRs unable to clear gate (b) by branch 1 unless a second
+  # agent (cursor / codex CLI) reviews independently. In a single-agent
+  # session that's friction with no policy benefit — Codex's external
+  # review IS the cross-agent signal. Accept a fresh Codex 👍 reaction
+  # on the PR issue as a substitute for branch 1, BUT ONLY when the
+  # PR's Authoring-Agent matches an entry in available_reviewers
+  # (otherwise this would weaken gate (b) for cross-agent PRs that
+  # genuinely need a reviewer-identity APPROVED).
+  #
+  # Freshness: same REACTION_THRESHOLD that gate (c) uses, computed
+  # earlier in the script. Reaction must be at-or-after the threshold,
+  # which is max(HEAD_PUSHED_AT, NOW - reaction_freshness_window).
+  #
+  # If a cross-agent reviewer COULD review (e.g., another agent is in
+  # available_reviewers with no opinionated state on this PR), that's
+  # still permitted — branch 2 is opt-in via the matching Authoring-
+  # Agent header. If you want strict cross-agent enforcement, omit the
+  # Authoring-Agent line; gate (b) then falls back to branch 1 only.
+  if [ -n "$SAME_AGENT_REVIEWER" ]; then
+    log "gate (b): no reviewer-identity APPROVED, but same-agent author/reviewer detected (Authoring-Agent: $AUTHORING_AGENT → $SAME_AGENT_REVIEWER); checking for Codex 👍 fallback per #170"
+    REACTIONS_FOR_GATE_B=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions")
+    GATE_B_THUMBS_UP=$(echo "$REACTIONS_FOR_GATE_B" | jq -r \
+      --arg bot "$BOT_LOGIN" --arg after "$REACTION_THRESHOLD" '
+      [ .[]
+        | select(.user.login == $bot)
+        | select(.content == "+1")
+        | select(.created_at >= $after)
+        | .created_at
+      ]
+      | max // ""
+    ')
+    if [ -n "$GATE_B_THUMBS_UP" ]; then
+      log "gate (b): same-agent + Codex 👍 @ $GATE_B_THUMBS_UP (≥ threshold $REACTION_THRESHOLD) — branch 2 cleared"
+      APPROVING_REVIEWER="(branch 2: same-agent + Codex 👍)"
+    fi
+  fi
 
-log "gate (b): latest-state APPROVED by $APPROVING_REVIEWER"
+  if [ -z "$APPROVING_REVIEWER" ]; then
+    fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED review, and same-agent + Codex 👍 fallback (branch 2) did not apply (Authoring-Agent: ${AUTHORING_AGENT:-not set}; matched reviewer: ${SAME_AGENT_REVIEWER:-none}; threshold: $REACTION_THRESHOLD)"
+  fi
+else
+  log "gate (b): latest-state APPROVED by $APPROVING_REVIEWER"
+fi
 
 # --- gate (c): Codex cleared on current HEAD -------------------------------
 
