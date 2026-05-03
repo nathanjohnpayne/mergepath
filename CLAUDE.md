@@ -152,7 +152,8 @@ keyring active is your agent identity. No switch needed for commits.
      truncate and mask threads):
 
      ```bash
-     gh api graphql -f query='
+     # Read-path: pin to preflight reviewer PAT per the auth split.
+     GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api graphql -f query='
        query {
          repository(owner: "OWNER", name: "REPO") {
            pullRequest(number: PR_NUM) {

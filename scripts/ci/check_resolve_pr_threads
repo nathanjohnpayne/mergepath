@@ -126,9 +126,9 @@ out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
 rc=$?
 set -e
 
-if [ "$rc" = "2" ] && echo "$out" | grep -q "GraphQL undercount detected"; then
+if [ "$rc" = "2" ] && echo "$out" | grep -q "GraphQL count mismatch"; then
   pass=$((pass + 1))
-  echo "  PASS: totalCount > returned → exit 2 with undercount error"
+  echo "  PASS: totalCount > returned → exit 2 with count-mismatch error"
 else
   fail=$((fail + 1))
   echo "  FAIL: undercount should exit 2 (rc=$rc)" >&2
@@ -218,6 +218,52 @@ if [ "$rc" = "3" ] && echo "$out" | grep -q "Unresolved threads on test/repo#999
 else
   fail=$((fail + 1))
   echo "  FAIL: null isResolved should be treated as unresolved (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ── Test 4b: totalCount cross-validation also fails on over-count
+# CR Major on PR #194 r2 — a duplicate-page / cursor-reset regression
+# in the pagination loop would produce returned > totalCount; the
+# equality check must fail on that case too, not just under-count.
+echo
+echo "resolve-pr-threads.sh totalCount over-count detection (CR Major on #194)"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        # totalCount=1 but 2 nodes returned (simulated duplicate page).
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T1","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}},
+  {"id":"T1","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}}
+]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "abc123def"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" = "2" ] && echo "$out" | grep -q "GraphQL count mismatch"; then
+  pass=$((pass + 1))
+  echo "  PASS: returned > totalCount → exit 2 with count-mismatch error"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: over-count should exit 2 (rc=$rc)" >&2
   echo "$out" | sed 's/^/      /' >&2
 fi
 

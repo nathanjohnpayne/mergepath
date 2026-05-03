@@ -220,14 +220,20 @@ QUERY='
   }
 '
 while :; do
+  # Read-path: pin to preflight reviewer PAT per the auth split
+  # documented in the repo's machine-level CLAUDE.md. Falls through
+  # to the active keyring account only when preflight wasn't run
+  # (env var unset / empty).
   if [ -z "$CURSOR" ]; then
-    PAGE=$(gh api graphql -f query="$QUERY" \
+    PAGE=$(GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" \
+      gh api graphql -f query="$QUERY" \
       -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" -F cursor=null 2>&1) || {
       echo "GraphQL query failed: $PAGE" >&2
       exit 2
     }
   else
-    PAGE=$(gh api graphql -f query="$QUERY" \
+    PAGE=$(GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" \
+      gh api graphql -f query="$QUERY" \
       -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" -f cursor="$CURSOR" 2>&1) || {
       echo "GraphQL query failed: $PAGE" >&2
       exit 2
@@ -241,17 +247,20 @@ while :; do
   CURSOR=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor' <<<"$PAGE")
 done
 
-# totalCount cross-validation — undercount detection.
+# totalCount cross-validation — fail on ANY mismatch (under OR over).
+# Equality check, not `< totalCount`: an over-count would indicate a
+# duplicate-page / cursor-reset regression in the pagination loop and
+# is just as bad as an undercount. CR Major on PR #194 r2.
 RETURNED_COUNT=$(jq -r 'length' <<<"$THREADS_JSON")
-if [ "$RETURNED_COUNT" -lt "$TOTAL_COUNT" ]; then
+if [ "$RETURNED_COUNT" != "$TOTAL_COUNT" ]; then
   cat >&2 <<EOF
-ERROR: GraphQL undercount detected on $REPO#$PR_NUM.
+ERROR: GraphQL count mismatch on $REPO#$PR_NUM.
        reviewThreads.totalCount = $TOTAL_COUNT, but the paginated query
-       returned $RETURNED_COUNT nodes. This is the eventual-consistency /
-       cache-shape failure mode that masked unresolved threads on
-       PR #189 (May 2026 — see scripts/resolve-pr-threads.sh header).
-       Do NOT trust the "no unresolved threads" output below; fall back
-       to the manual GraphQL escape hatch in CLAUDE.md § 7.6.
+       returned $RETURNED_COUNT nodes. Either undercount (cursor-typing
+       bug per #192) or overcount (duplicate-page / cursor-reset
+       regression). Do NOT trust the "no unresolved threads" output
+       below; fall back to the manual GraphQL escape hatch in
+       CLAUDE.md § 7.6.
 EOF
   exit 2
 fi
