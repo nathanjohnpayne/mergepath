@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# check_resolve_pr_threads — regression tests for scripts/resolve-pr-threads.sh
+#
+# Closes the test gap that let PR #189's silent-undercount bug ship
+# (cursor passed as `-f cursor=null` → string "null" → API silently
+# returned wrong thread set). See #192 for the post-mortem.
+#
+# Tests stub `gh` via PATH-prepend so they exercise the script's
+# argument construction and exit-code paths without live API calls.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT="$ROOT/scripts/resolve-pr-threads.sh"
+
+pass=0
+fail=0
+
+# ── Test 1: cursor-null typing
+# The script must send `-F cursor=null` (typed null) on the first
+# call, NOT `-f cursor=null` (string "null"). The stub captures
+# the gh argv to a side file so we can inspect what was actually sent.
+echo "resolve-pr-threads.sh cursor-null typing test (#192 regression)"
+
+SCRATCH=$(mktemp -d)
+trap 'rm -rf "$SCRATCH"' EXIT
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+# Capture all argv to a file the test harness reads. Then return a
+# minimal valid GraphQL response so the script doesn't bail.
+echo "$@" >> "$GH_ARGV_LOG"
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        # Match how the script's GraphQL response is shaped: empty
+        # threads list with totalCount=0 → script reports "no
+        # unresolved threads" and exits 0.
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        # HEAD oid fetch
+        echo "abc123def"
+        exit 0
+        ;;
+    esac
+    ;;
+  repo)
+    # `gh repo view --json nameWithOwner` fallback
+    printf '{"nameWithOwner":"test/repo"}\n'
+    exit 0
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+GH_ARGV_LOG="$SCRATCH/gh-argv.log"
+: > "$GH_ARGV_LOG"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+# The first GraphQL call (cursor=null path) must use `-F cursor=null`
+# not `-f cursor=null`. Grep the captured argv for the typed flag.
+if grep -qE -- '-F cursor=null' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: first call uses -F cursor=null (typed null)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: expected -F cursor=null in first GraphQL call argv" >&2
+  echo "      argv log:" >&2
+  sed 's/^/        /' "$GH_ARGV_LOG" >&2
+fi
+
+# Negative assertion: must NOT use `-f cursor=null` (string "null")
+# anywhere — the prior bug.
+if grep -qE -- '-f cursor=null' "$GH_ARGV_LOG"; then
+  fail=$((fail + 1))
+  echo "  FAIL: regression — -f cursor=null (string 'null') was sent" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: no -f cursor=null anywhere in argv (regression closed)"
+fi
+
+# ── Test 2: totalCount cross-validation catches undercount
+echo
+echo "resolve-pr-threads.sh totalCount cross-validation test"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        # Simulate the bug condition: totalCount=3 but only 2 nodes
+        # returned. Script must exit 2 with the undercount-detected
+        # error (not silently report "no unresolved threads").
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":3,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T1","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z","commit":{"oid":"abc"}}]}},
+  {"id":"T2","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"b","body":"y","createdAt":"2026-01-01T00:00:00Z","commit":{"oid":"abc"}}]}}
+]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "abc123def"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" = "2" ] && echo "$out" | grep -q "GraphQL undercount detected"; then
+  pass=$((pass + 1))
+  echo "  PASS: totalCount > returned → exit 2 with undercount error"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: undercount should exit 2 (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ── Test 3: equal totalCount and returned → no undercount error
+echo
+echo "resolve-pr-threads.sh equal-count happy-path test"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T1","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z","commit":{"oid":"abc"}}]}},
+  {"id":"T2","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"b","body":"y","createdAt":"2026-01-01T00:00:00Z","commit":{"oid":"abc"}}]}}
+]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "abc123def"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" = "0" ] && echo "$out" | grep -q "No unresolved threads"; then
+  pass=$((pass + 1))
+  echo "  PASS: totalCount == returned (all resolved) → exit 0 + clean message"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: equal counts + all resolved should exit 0 (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ── Test 4: defensive isResolved != true catches null
+echo
+echo "resolve-pr-threads.sh defensive isResolved-null test"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        # isResolved is null on one thread — defensive `!= true`
+        # filter must treat it as unresolved and surface it.
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T1","isResolved":null,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z","commit":{"oid":"abc"}}]}}
+]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "abc123def"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+# In list mode (default), unresolved threads exit 3 with the listing.
+if [ "$rc" = "3" ] && echo "$out" | grep -q "Unresolved threads on test/repo#99999"; then
+  pass=$((pass + 1))
+  echo "  PASS: null isResolved treated as unresolved (defensive)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: null isResolved should be treated as unresolved (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+echo
+if [ "$fail" -eq 0 ]; then
+  echo "check_resolve_pr_threads: PASS ($pass tests)"
+  exit 0
+else
+  echo "check_resolve_pr_threads: FAIL ($fail of $((pass + fail)) tests)" >&2
+  exit 1
+fi

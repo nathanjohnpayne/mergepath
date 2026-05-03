@@ -139,62 +139,126 @@ HEAD_OID=$(gh api "repos/$OWNER/$NAME/pulls/$PR_NUM" --jq .head.sha 2>/dev/null)
   exit 2
 }
 
-# Fetch all review threads with isResolved state, author, and the
-# LATEST comment's commit_id (so --auto-resolve-bots can verify
-# current-HEAD membership). Use GraphQL because reviewThreads aren't
-# exposed via REST. Paginate through reviewThreads — Codex P2 on PR
-# #172 caught that the prior `first: 100` could undercount on PRs
-# with many threads. Ditto comments: fetch `last: 1` to anchor the
-# resolved-against-HEAD check on the most recent comment per thread.
+# Fetch all review threads with isResolved state. Three design
+# choices, all load-bearing:
+#
+# 1. `-F cursor=null` (typed) on the first call, NOT `-f cursor=null`
+#    (string). The prior code used `-f cursor=null` which sent the
+#    literal STRING "null" as the cursor; GitHub's GraphQL endpoint
+#    interpreted that as a real cursor and silently returned the
+#    wrong thread set. This was the actual root cause of the
+#    PR #189 undercount (May 2026 — initially misdiagnosed as
+#    eventual consistency; #192 has the post-mortem). The cursor-
+#    state branching below sends GraphQL null on the first call,
+#    then a real cursor string on subsequent pages.
+#
+# 2. `comments(first: 50)` — fetch up to 50 comments per thread
+#    instead of `comments(last: 1)`. PR review threads almost never
+#    exceed 50 comments; fetching them all lets us pick first
+#    (original author/body/path) AND last (HEAD anchor commit_oid)
+#    deterministically from one response.
+#
+# 3. `totalCount` cross-validation — after assembling THREADS_JSON,
+#    compare the returned node count against the API's reported
+#    totalCount. If they disagree the script reports on stderr +
+#    exits 2 rather than the silent "no unresolved threads" output
+#    that bit PR #189. Belt-and-suspenders: even with the cursor fix
+#    above, a future API quirk could re-introduce undercount; the
+#    cross-check catches it.
+#
+# Codex P2 on PR #172 caught that the prior `first: 100` (no pager)
+# could undercount on PRs with many threads — paginating with
+# `first: 50` + cursor preserves that fix.
 THREADS_JSON='[]'
-CURSOR="null"
-while :; do
-  PAGE=$(gh api graphql -f query='
-    query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
-      repository(owner: $owner, name: $repo) {
-        pullRequest(number: $pr) {
-          reviewThreads(first: 50, after: $cursor) {
-            pageInfo { hasNextPage endCursor }
-            nodes {
-              id
-              isResolved
-              isOutdated
-              comments(last: 1) {
-                nodes {
-                  author { login }
-                  path
-                  body
-                  createdAt
-                  commit { oid }
-                }
+TOTAL_COUNT=0
+# CURSOR sentinel "" means "first call — send GraphQL null". A string
+# value "null" is NOT the same: passing it via `-f cursor=null` sends
+# the literal string "null" which GitHub interprets as a real cursor
+# and silently returns the wrong thread set. Always use `-F` (typed)
+# for null on first call; switch to `-f` (string) once we have a real
+# cursor. This was the actual root cause of the PR #189 undercount —
+# not eventual consistency.
+CURSOR=""
+QUERY='
+  query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $pr) {
+        reviewThreads(first: 50, after: $cursor) {
+          totalCount
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            id
+            isResolved
+            isOutdated
+            comments(first: 50) {
+              nodes {
+                author { login }
+                path
+                body
+                createdAt
+                commit { oid }
               }
             }
           }
         }
       }
     }
-  ' -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" -f cursor="$CURSOR" 2>&1) || {
-    echo "GraphQL query failed: $PAGE" >&2
-    exit 2
   }
+'
+while :; do
+  if [ -z "$CURSOR" ]; then
+    PAGE=$(gh api graphql -f query="$QUERY" \
+      -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" -F cursor=null 2>&1) || {
+      echo "GraphQL query failed: $PAGE" >&2
+      exit 2
+    }
+  else
+    PAGE=$(gh api graphql -f query="$QUERY" \
+      -F owner="$OWNER" -F repo="$NAME" -F pr="$PR_NUM" -f cursor="$CURSOR" 2>&1) || {
+      echo "GraphQL query failed: $PAGE" >&2
+      exit 2
+    }
+  fi
   THREADS_JSON=$(jq -c --argjson acc "$THREADS_JSON" \
     '$acc + .data.repository.pullRequest.reviewThreads.nodes' <<<"$PAGE")
+  TOTAL_COUNT=$(jq -r '.data.repository.pullRequest.reviewThreads.totalCount' <<<"$PAGE")
   HAS_NEXT=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' <<<"$PAGE")
   [ "$HAS_NEXT" = "true" ] || break
   CURSOR=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor' <<<"$PAGE")
 done
 
+# totalCount cross-validation — undercount detection.
+RETURNED_COUNT=$(jq -r 'length' <<<"$THREADS_JSON")
+if [ "$RETURNED_COUNT" -lt "$TOTAL_COUNT" ]; then
+  cat >&2 <<EOF
+ERROR: GraphQL undercount detected on $REPO#$PR_NUM.
+       reviewThreads.totalCount = $TOTAL_COUNT, but the paginated query
+       returned $RETURNED_COUNT nodes. This is the eventual-consistency /
+       cache-shape failure mode that masked unresolved threads on
+       PR #189 (May 2026 — see scripts/resolve-pr-threads.sh header).
+       Do NOT trust the "no unresolved threads" output below; fall back
+       to the manual GraphQL escape hatch in CLAUDE.md § 7.6.
+EOF
+  exit 2
+fi
+
 UNRESOLVED=$(echo "$THREADS_JSON" | jq -c '
   .[]
-  | select(.isResolved == false)
+  # `!= true` instead of `== false` so a null/missing isResolved
+  # field is treated as unresolved (defensive — prefer to surface
+  # noise over silently skip).
+  | select(.isResolved != true)
   | {
       id: .id,
       outdated: .isOutdated,
-      author: (.comments.nodes[-1].author.login // "unknown"),
-      path: (.comments.nodes[-1].path // "(no path)"),
-      created: (.comments.nodes[-1].createdAt // ""),
+      # First comment = original review (what the human/agent needs
+      # to recognize the thread). Last comment = HEAD-anchor target
+      # (where the bot is now expected to re-review).
+      author: (.comments.nodes[0].author.login // "unknown"),
+      path: (.comments.nodes[0].path // "(no path)"),
+      created: (.comments.nodes[0].createdAt // ""),
       commit_oid: (.comments.nodes[-1].commit.oid // ""),
-      excerpt: ((.comments.nodes[-1].body // "") | .[0:160])
+      excerpt: ((.comments.nodes[0].body // "") | .[0:160])
     }
 ')
 

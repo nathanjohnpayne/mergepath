@@ -141,6 +141,44 @@ keyring active is your agent identity. No switch needed for commits.
      human-authored threads must be resolved via the GitHub UI or by
      asking the human; the helper refuses to touch them.
 
+     **Escape hatch — if the script reports clean but merge fails.**
+     If `scripts/resolve-pr-threads.sh` exits 0 ("no unresolved
+     threads") AND the merge attempt errors with `GraphQL: All
+     comments must be resolved. (mergePullRequest)`, the script
+     undercount detector either didn't fire or the threads endpoint
+     is briefly inconsistent. Drop to the manual GraphQL query:
+
+     ```bash
+     gh api graphql -f query='
+       query {
+         repository(owner: "OWNER", name: "REPO") {
+           pullRequest(number: PR_NUM) {
+             reviewThreads(first: 100) {
+               nodes {
+                 id
+                 isResolved
+                 comments(first: 1) {
+                   nodes { author { login } path body }
+                 }
+               }
+             }
+           }
+         }
+       }' --jq '.data.repository.pullRequest.reviewThreads.nodes
+                 | map(select(.isResolved != true))'
+     ```
+
+     For each unresolved bot-authored thread where the finding is
+     addressed on the current HEAD, resolve via:
+
+     ```bash
+     gh api graphql -f query='mutation { resolveReviewThread(input:
+       {threadId: "THREAD_ID"}) { thread { isResolved } } }'
+     ```
+
+     Same agent-prohibitions apply: do not resolve human-authored
+     threads via this path either. See #192 for the bug history.
+
 ## Before merging
 
 8. Check `.github/review-policy.yml` for the external review threshold.
