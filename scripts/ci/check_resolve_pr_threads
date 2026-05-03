@@ -102,10 +102,11 @@ case "$1" in
         # Simulate the bug condition: totalCount=3 but only 2 nodes
         # returned. Script must exit 2 with the undercount-detected
         # error (not silently report "no unresolved threads").
+        # Stub uses the new commentsFirst/commentsLast alias shape.
         cat <<'JSON'
 {"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":3,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
-  {"id":"T1","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z","commit":{"oid":"abc"}}]}},
-  {"id":"T2","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"b","body":"y","createdAt":"2026-01-01T00:00:00Z","commit":{"oid":"abc"}}]}}
+  {"id":"T1","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}},
+  {"id":"T2","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"b","body":"y","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}}
 ]}}}}}
 JSON
         exit 0
@@ -146,8 +147,8 @@ case "$1" in
       graphql)
         cat <<'JSON'
 {"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
-  {"id":"T1","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z","commit":{"oid":"abc"}}]}},
-  {"id":"T2","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"b","body":"y","createdAt":"2026-01-01T00:00:00Z","commit":{"oid":"abc"}}]}}
+  {"id":"T1","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}},
+  {"id":"T2","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"b","body":"y","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}}
 ]}}}}}
 JSON
         exit 0
@@ -190,7 +191,7 @@ case "$1" in
         # filter must treat it as unresolved and surface it.
         cat <<'JSON'
 {"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
-  {"id":"T1","isResolved":null,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z","commit":{"oid":"abc"}}]}}
+  {"id":"T1","isResolved":null,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}}
 ]}}}}}
 JSON
         exit 0
@@ -217,6 +218,63 @@ if [ "$rc" = "3" ] && echo "$out" | grep -q "Unresolved threads on test/repo#999
 else
   fail=$((fail + 1))
   echo "  FAIL: null isResolved should be treated as unresolved (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ── Test 5: HEAD-anchor uses commentsLast (codex P2 #194 regression)
+# A thread where commentsFirst points at an old commit and commentsLast
+# points at the truly-latest one. The script must surface the
+# commentsLast oid as the thread's commit_oid for the HEAD-anchor
+# check, NOT commentsFirst's. Prior shape (`comments(first: 50)` +
+# `[-1]`) would silently return the wrong oid for >50-comment threads.
+echo
+echo "resolve-pr-threads.sh HEAD-anchor uses commentsLast (codex P2 on #194)"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        # commentsFirst.commit.oid would be "OLDOID" (anchored to
+        # original review commit), commentsLast.commit.oid is "NEWOID"
+        # (truly-latest comment from a much later push). The script
+        # must read commit_oid from commentsLast.
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T1","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"src/foo.ts","body":"original review","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"NEWOIDcurrent"}}]}}
+]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "NEWOIDcurrent"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo --auto-resolve-bots --dry-run 2>&1)
+rc=$?
+set -e
+
+# With --dry-run --auto-resolve-bots, the script reports "would resolve"
+# only when commit_oid matches HEAD_OID. If it correctly picked
+# commentsLast's "NEWOIDcurrent" (matching HEAD_OID), the output
+# includes "would resolve". If it picked commentsFirst's commit (which
+# we don't even populate here), it would skip-as-stale.
+if echo "$out" | grep -qE "WOULD RESOLVE|would-resolve: [1-9]"; then
+  pass=$((pass + 1))
+  echo "  PASS: HEAD anchor read from commentsLast (current-HEAD bot thread is auto-resolvable)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: expected would-resolve output (rc=$rc)" >&2
   echo "$out" | sed 's/^/      /' >&2
 fi
 

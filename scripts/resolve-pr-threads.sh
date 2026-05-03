@@ -152,11 +152,15 @@ HEAD_OID=$(gh api "repos/$OWNER/$NAME/pulls/$PR_NUM" --jq .head.sha 2>/dev/null)
 #    state branching below sends GraphQL null on the first call,
 #    then a real cursor string on subsequent pages.
 #
-# 2. `comments(first: 50)` — fetch up to 50 comments per thread
-#    instead of `comments(last: 1)`. PR review threads almost never
-#    exceed 50 comments; fetching them all lets us pick first
-#    (original author/body/path) AND last (HEAD anchor commit_oid)
-#    deterministically from one response.
+# 2. Two GraphQL aliases — `commentsFirst: comments(first: 1)` for
+#    the original review's author/path/body (what the user/agent
+#    needs to recognize the thread) AND `commentsLast: comments(last:
+#    1)` for the HEAD-anchor commit_oid (the truly-latest comment).
+#    Earlier draft used `comments(first: 50)` and indexed `[-1]` for
+#    the last comment, but Codex P2 on PR #194 caught that >50-comment
+#    threads (rare but possible — bot churn over a long-lived PR)
+#    would misclassify HEAD anchor. The dual-alias shape is
+#    deterministic for any thread depth.
 #
 # 3. `totalCount` cross-validation — after assembling THREADS_JSON,
 #    compare the returned node count against the API's reported
@@ -190,12 +194,22 @@ QUERY='
             id
             isResolved
             isOutdated
-            comments(first: 50) {
+            # `commentsFirst` for the original review (excerpt + author).
+            # `commentsLast` for the HEAD-anchor commit_oid — `last: 1`
+            # guarantees the truly-latest comment regardless of thread
+            # depth. Codex P2 on PR #194 caught that `first: 50` would
+            # misclassify HEAD anchor on threads with >50 comments
+            # (rare but possible — bot churn).
+            commentsFirst: comments(first: 1) {
               nodes {
                 author { login }
                 path
                 body
                 createdAt
+              }
+            }
+            commentsLast: comments(last: 1) {
+              nodes {
                 commit { oid }
               }
             }
@@ -251,14 +265,13 @@ UNRESOLVED=$(echo "$THREADS_JSON" | jq -c '
   | {
       id: .id,
       outdated: .isOutdated,
-      # First comment = original review (what the human/agent needs
-      # to recognize the thread). Last comment = HEAD-anchor target
-      # (where the bot is now expected to re-review).
-      author: (.comments.nodes[0].author.login // "unknown"),
-      path: (.comments.nodes[0].path // "(no path)"),
-      created: (.comments.nodes[0].createdAt // ""),
-      commit_oid: (.comments.nodes[-1].commit.oid // ""),
-      excerpt: ((.comments.nodes[0].body // "") | .[0:160])
+      # commentsFirst = original review (excerpt + author for display).
+      # commentsLast = guaranteed-latest comment (HEAD anchor commit_oid).
+      author: (.commentsFirst.nodes[0].author.login // "unknown"),
+      path: (.commentsFirst.nodes[0].path // "(no path)"),
+      created: (.commentsFirst.nodes[0].createdAt // ""),
+      commit_oid: (.commentsLast.nodes[0].commit.oid // ""),
+      excerpt: ((.commentsFirst.nodes[0].body // "") | .[0:160])
     }
 ')
 
