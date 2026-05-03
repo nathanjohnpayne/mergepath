@@ -146,7 +146,10 @@ keyring active is your agent identity. No switch needed for commits.
      threads") AND the merge attempt errors with `GraphQL: All
      comments must be resolved. (mergePullRequest)`, the script
      undercount detector either didn't fire or the threads endpoint
-     is briefly inconsistent. Drop to the manual GraphQL query:
+     is briefly inconsistent. Drop to the manual GraphQL query
+     (note the `totalCount` check — the API caps at 100 nodes per
+     page; without the assert, a >100-thread PR would silently
+     truncate and mask threads):
 
      ```bash
      gh api graphql -f query='
@@ -154,6 +157,8 @@ keyring active is your agent identity. No switch needed for commits.
          repository(owner: "OWNER", name: "REPO") {
            pullRequest(number: PR_NUM) {
              reviewThreads(first: 100) {
+               totalCount
+               pageInfo { hasNextPage endCursor }
                nodes {
                  id
                  isResolved
@@ -164,8 +169,14 @@ keyring active is your agent identity. No switch needed for commits.
              }
            }
          }
-       }' --jq '.data.repository.pullRequest.reviewThreads.nodes
-                 | map(select(.isResolved != true))'
+       }' --jq '
+         if .data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage
+         then "ERROR: PR has >100 review threads; paginate with after:$endCursor"
+              | halt_error(2)
+         else .data.repository.pullRequest.reviewThreads.nodes
+              | map(select(.isResolved != true))
+         end
+       '
      ```
 
      For each unresolved bot-authored thread where the finding is
