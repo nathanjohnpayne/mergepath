@@ -272,6 +272,56 @@ Phase 4b is invoked when Phase 4a escalates to disagreement or runaway, times ou
 
 19b. `nathanjohnpayne` merges the PR. Done.
 
+### Phase 4b Triggers
+
+Phase 4b is documented above as a fallback (4a unavailable / escalates / times out). Per empirical evidence from matchline (#158: 9 PRs of the same author through both 4a and 4b — 4b caught 6+ real bugs on state-machine + concurrency + transactional changes that 4a cleared past), Phase 4b ALSO has high catch-rate value as a **first-class proactive gate** on a specific class of PR — not just as a fallback.
+
+The `phase_4b_default` field in `.github/review-policy.yml` controls when 4b fires proactively:
+
+| Value | Behavior (intended; full wiring lands in #186 + #187) |
+|-------|---------|
+| `fallback-only` | Current behavior. 4b only on 4a unavailability/escalation/timeout. |
+| `complex-changes` | Run `scripts/phase-4b-classifier.sh` AFTER 4a clears; if any trigger matches, post the 4b handoff before merging. |
+| `always` | Skip the classifier; post the 4b handoff for every external-review-threshold PR. |
+
+**Implementation status (this commit ships only the policy/parser piece):** the `phase_4b_default` field is parsed and validated by `scripts/codex-review-check.sh` (it exports `PHASE_4B_DEFAULT` for downstream consumers), but the runtime branching that ACTS on the field — running the classifier after 4a clears and posting a proactive 4b handoff — lands in [#187](https://github.com/nathanjohnpayne/mergepath/issues/187) (CLAUDE.md / AGENTS.md operating-instruction update). The classifier itself ships in [#186](https://github.com/nathanjohnpayne/mergepath/issues/186). Until both merge, setting `phase_4b_default: complex-changes` or `: always` is a no-op behaviorally — the parser accepts it, but the existing 4a→merge flow runs unchanged. This is intentional per the parent #158's three-PR ship sequence.
+
+**Default for new repos:** `complex-changes` (the empirically validated middle ground). **Default for existing repos** that haven't added the field: `fallback-only` (no behavior change without explicit opt-in — see [Migration for existing consumers](#migration-for-existing-consumers) below).
+
+The five trigger classes the `complex-changes` mode keys on:
+
+1. **State-machine changes.** PRs introducing or modifying discriminated-union or finite-state-machine types driving UI or service behavior.
+   - **Detection:** diff includes new/modified types matching `type \w+ = \| \{ kind: "..."` or similar tagged-union patterns; OR PR body explicitly says "state machine."
+   - **Why it matters:** the bug is rarely in any single hunk — it's in the state-transition composition. Local-context LLM reviewers (4a) consistently miss this; cross-context CLI review (4b) consistently catches it.
+
+2. **Concurrency / transactional code.** PRs touching `runTransaction`, `Promise.all`, optimistic updates, subscription handling, or compare-and-set patterns.
+   - **Detection:** diff includes `runTransaction` / `setSnapshot` / `applyOptimistic` / `CAS` / `compare-and-set` keywords; OR modifies `**/transactions/`, `**/concurrency/` paths.
+   - **Why it matters:** invariant violations across concurrent operations (e.g., owner-uid re-check inside a tx after a tombstone-then-recreate race) require reasoning across pieces that look fine individually.
+
+3. **Prompt design or LLM contract changes.** PRs adding/modifying few-shot examples, system prompts, structured-output schemas, or grounding rules.
+   - **Detection:** paths matching `**/prompts/**`, `**/.v[0-9]+.md`, or LLM-tool-call schema files.
+   - **Why it matters:** few-shot drift (e.g., disjunctive→conjunctive operator changes in an example) is invisible to a diff reviewer that doesn't understand the prompt as a system.
+
+4. **Cross-cutting refactors.** PRs that change a contract used by ≥3 callers OR touch both the type layer and the service layer in the same diff.
+   - **Detection:** changed-files spread across ≥3 distinct top-level dirs OR include both `src/types/` AND `src/services/` (or the consumer repo's analogous layer pair).
+   - **Why it matters:** type/runtime split bugs surface when the type updates and runtime updates aren't in sync — same diff doesn't guarantee same semantics.
+
+5. **Validation / invariant-enforcement code.** PRs changing anything pinning a product invariant (e.g., zero-fabrication checks, owner-uid validation, approval-state derivation).
+   - **Detection:** paths matching `**/validation/**`, `**/security/**`, or `**/policies/**`; OR PR body explicit "invariant" mention.
+   - **Why it matters:** weakening an invariant doesn't trigger any obvious red flag in a per-hunk review — the test of correctness is whether the invariant still holds across the full system, which a cross-context reviewer is better positioned to evaluate.
+
+For PRs that match NONE of these classes, the classifier exits with `recommendation: fallback-only` and the standard 4a path is sufficient. The taxonomy is meant as a checklist, not a perfect predictor — agents should err on the side of invoking 4b when the heuristics are ambiguous.
+
+### Cycle-time budget
+
+Phase 4b adds latency. The human-mediated handoff typically adds 30 minutes to a few hours per PR — acceptable for high-risk changes (where a missed bug costs more than the latency) and corrosive for trivial ones (where the latency dwarfs the change). The taxonomy keeps that latency targeted at the changes that actually benefit. Repos with a high rate of state-machine or concurrency changes get more value from `complex-changes`; repos that mostly do data plumbing and pure-helper PRs get less and can stay on `fallback-only`.
+
+The classifier (`scripts/phase-4b-classifier.sh`) is the implementation; CLAUDE.md step 8.5 (or equivalent) is the operating instruction that consults the classifier; this section is the doctrinal taxonomy that drives both.
+
+### Migration for existing consumers
+
+When you pull this template change into an existing repo, the new `phase_4b_default` field is **optional**. Repos that do not add the field default to `fallback-only` — current behavior, no change. Opt in to the new proactive-trigger flow by adding `phase_4b_default: complex-changes` to your repo's `.github/review-policy.yml`. New repos created from the template inherit `complex-changes` as the default per the template's own `.github/review-policy.yml`.
+
 ### Flow Diagram
 
 ```

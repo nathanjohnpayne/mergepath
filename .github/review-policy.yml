@@ -233,3 +233,34 @@ codex:
   # codex-review-check.sh gate (c) and codex-review-request.sh pre-flight
   # and poll scans.
   reaction_freshness_window_seconds: 1800
+
+# ---------------------------------------------------------------------------
+# Phase 4b proactive triggers (#158)
+# ---------------------------------------------------------------------------
+# Controls when Phase 4b (manual CLI fallback) fires as a FIRST-CLASS gate,
+# in addition to its existing fallback role on 4a unavailability/timeout/
+# escalation. Empirical evidence in #158: 4b's bug-catch rate is roughly
+# proportional to interaction-complexity of the change — state machines,
+# concurrency, transactional code, and prompt design consistently surfaced
+# real bugs that 4a cleared past. Pure-data and pure-helper PRs got nothing
+# past 4a.
+#
+# Options:
+#   fallback-only — current behavior. 4b only on 4a unavailability /
+#                   escalation / timeout. Use when 4b's latency cost
+#                   outweighs its catch-rate value (low-risk repo, mostly
+#                   data-plumbing PRs, etc.).
+#   complex-changes — run scripts/phase-4b-classifier.sh AFTER 4a clears
+#                     but BEFORE merging. If any of the five trigger
+#                     classes (REVIEW_POLICY.md § Phase 4b Triggers)
+#                     matches, post the 4b handoff before merge. New repos
+#                     created from this template default here.
+#   always — skip the classifier; post the 4b handoff for every
+#            external-review-threshold PR. Highest confidence, slowest
+#            cycle time. Use when every threshold-PR genuinely needs
+#            cross-agent review (e.g., security-sensitive repo).
+#
+# Existing repos without this field default to `fallback-only` per
+# scripts/codex-review-check.sh's parser — no behavior change without
+# explicit opt-in. See REVIEW_POLICY.md § Migration for existing consumers.
+phase_4b_default: complex-changes

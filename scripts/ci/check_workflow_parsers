@@ -131,6 +131,75 @@ src/auth/login.ts'
 assert_eq "end-to-end: parse output piped into matcher" "$want" "$got"
 
 echo
+echo "policy_field (top-level scalar) tests — for phase_4b_default (#185)"
+
+# Inline copy of the same awk policy_field uses inside
+# scripts/codex-review-check.sh. Keeping the test in lockstep with the
+# parser shape — if the parser changes, this awk literal needs the same
+# update. Documented inline rather than sourced from the script because
+# sourcing codex-review-check.sh runs its full top-level logic.
+policy_field_awk='
+  /^[^[:space:]]/ && $1 == field":" {
+    sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+    gsub(/^"/, "", $0)
+    gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+    gsub(/[[:space:]]*#.*$/, "", $0)
+    sub(/[[:space:]]+$/, "", $0)
+    print
+    exit
+  }
+'
+
+# Fixture: field present at top level, no comments.
+got=$(printf '%s\n' "phase_4b_default: complex-changes" | awk -v field="phase_4b_default" "$policy_field_awk")
+assert_eq "policy_field reads phase_4b_default (bare value)" "complex-changes" "$got"
+
+# Fixture: field with a trailing inline comment.
+got=$(printf '%s\n' "phase_4b_default: always   # opt in to strict mode" | awk -v field="phase_4b_default" "$policy_field_awk")
+assert_eq "policy_field strips trailing inline comment" "always" "$got"
+
+# Fixture: field missing entirely (existing-consumer migration path).
+got=$(printf 'codex:\n  enabled: true\n' | awk -v field="phase_4b_default" "$policy_field_awk")
+assert_eq "policy_field returns empty when field absent (default falls to fallback-only)" "" "$got"
+
+# Fixture: field at top level surrounded by other top-level fields.
+mixed=$(printf 'external_review_threshold: 300\nphase_4b_default: fallback-only\ncoderabbit:\n  enabled: false\n')
+got=$(echo "$mixed" | awk -v field="phase_4b_default" "$policy_field_awk")
+assert_eq "policy_field reads field amid other top-level fields" "fallback-only" "$got"
+
+# Fixture: field with double quotes (matches the parser's quote-stripping).
+got=$(printf '%s\n' 'phase_4b_default: "complex-changes"' | awk -v field="phase_4b_default" "$policy_field_awk")
+assert_eq "policy_field strips surrounding quotes" "complex-changes" "$got"
+
+# Regression: nested same-named key under a parent block must NOT match
+# (Codex P2 on PR #189 — top-level lookup should be anchored to the
+# document root, not match indented occurrences of the same field name).
+nested=$(printf 'codex:\n  phase_4b_default: should-not-match\nphase_4b_default: complex-changes\n')
+got=$(echo "$nested" | awk -v field="phase_4b_default" "$policy_field_awk")
+assert_eq "policy_field ignores nested same-named keys; reads only top-level" "complex-changes" "$got"
+
+# Regression: nested key with NO top-level twin must return empty
+# (the parser shouldn't fall through to the indented match).
+nested_only=$(printf 'codex:\n  phase_4b_default: nested-only\n')
+got=$(echo "$nested_only" | awk -v field="phase_4b_default" "$policy_field_awk")
+assert_eq "policy_field returns empty when only a nested same-named key exists" "" "$got"
+
+# Fixture: real mergepath review-policy.yml has the field set; verify
+# end-to-end against the actual file so a typo in the schema-doc
+# example doesn't pass the unit fixtures while breaking the real read.
+got=$(awk -v field="phase_4b_default" "$policy_field_awk" "$ROOT/.github/review-policy.yml")
+case "$got" in
+  fallback-only|complex-changes|always)
+    pass=$((pass + 1))
+    echo "  PASS: real .github/review-policy.yml has a valid phase_4b_default value ('$got')"
+    ;;
+  *)
+    fail=$((fail + 1))
+    echo "  FAIL: real .github/review-policy.yml phase_4b_default is missing or invalid (got '$got'; expected one of fallback-only / complex-changes / always)"
+    ;;
+esac
+
+echo
 if [ "$fail" -gt 0 ]; then
   echo "check_workflow_parsers: $fail FAIL / $pass PASS" >&2
   exit 1
