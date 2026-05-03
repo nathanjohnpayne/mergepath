@@ -230,8 +230,18 @@ keyring active is your agent identity. No switch needed for commits.
       the merge gate (CI green + internal reviewer approved + Codex
       cleared on current HEAD). The merge gate does NOT require an
       `APPROVED` review state from the Codex bot — the app never emits
-      one. If the gate passes, merge as nathanjohnpayne with the
-      switch-around per the active-account convention:
+      one.
+   g. **Phase 4b checkpoint (do not skip).** Before the merge call,
+      apply step 8.5: if `phase_4b_default` is `complex-changes`, run
+      `scripts/phase-4b-classifier.sh <PR#>` and act on its exit code
+      (1 → post 4b handoff and wait for external CLI review, then
+      come back here; 0 → proceed to merge; 2 → stop and investigate;
+      3 → fix the invocation). If `phase_4b_default` is `always`, post
+      the 4b handoff unconditionally. If `fallback-only`, skip
+      directly to merge.
+   h. With the gate passing AND the 4b checkpoint cleared, merge as
+      nathanjohnpayne with the switch-around per the active-account
+      convention:
       `gh auth switch -u nathanjohnpayne && \
        gh pr merge <PR#> --squash --delete-branch && \
        gh auth switch -u nathanpayne-claude`
