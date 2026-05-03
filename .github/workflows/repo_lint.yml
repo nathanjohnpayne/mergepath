@@ -51,6 +51,12 @@ jobs:
       - name: check_workflow_parsers
         run: ./scripts/ci/check_workflow_parsers
 
+      - name: check_phase_4b_classifier
+        run: ./scripts/ci/check_phase_4b_classifier
+
+      - name: check_resolve_pr_threads
+        run: ./scripts/ci/check_resolve_pr_threads
+
       - name: check_governance_files
         run: |
           MISSING=0

@@ -141,6 +141,56 @@ keyring active is your agent identity. No switch needed for commits.
      human-authored threads must be resolved via the GitHub UI or by
      asking the human; the helper refuses to touch them.
 
+     **Escape hatch — if the script reports clean but merge fails.**
+     If `scripts/resolve-pr-threads.sh` exits 0 ("no unresolved
+     threads") AND the merge attempt errors with `GraphQL: All
+     comments must be resolved. (mergePullRequest)`, the script
+     undercount detector either didn't fire or the threads endpoint
+     is briefly inconsistent. Drop to the manual GraphQL query
+     (note the `totalCount` check — the API caps at 100 nodes per
+     page; without the assert, a >100-thread PR would silently
+     truncate and mask threads):
+
+     ```bash
+     # Read-path: pin to preflight reviewer PAT per the auth split.
+     GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api graphql -f query='
+       query {
+         repository(owner: "OWNER", name: "REPO") {
+           pullRequest(number: PR_NUM) {
+             reviewThreads(first: 100) {
+               totalCount
+               pageInfo { hasNextPage endCursor }
+               nodes {
+                 id
+                 isResolved
+                 comments(first: 1) {
+                   nodes { author { login } path body }
+                 }
+               }
+             }
+           }
+         }
+       }' --jq '
+         if .data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage
+         then "ERROR: PR has >100 review threads; paginate with after:$endCursor"
+              | halt_error(2)
+         else .data.repository.pullRequest.reviewThreads.nodes
+              | map(select(.isResolved != true))
+         end
+       '
+     ```
+
+     For each unresolved bot-authored thread where the finding is
+     addressed on the current HEAD, resolve via:
+
+     ```bash
+     gh api graphql -f query='mutation { resolveReviewThread(input:
+       {threadId: "THREAD_ID"}) { thread { isResolved } } }'
+     ```
+
+     Same agent-prohibitions apply: do not resolve human-authored
+     threads via this path either. See #192 for the bug history.
+
 ## Before merging
 
 8. Check `.github/review-policy.yml` for the external review threshold.
