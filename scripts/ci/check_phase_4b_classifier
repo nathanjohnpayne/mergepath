@@ -186,16 +186,33 @@ echo "phase-4b-classifier.sh PR-body fetch failure tests (codex r1 Phase 4b on #
 # Regression: when gh PR body fetch fails (network, missing PR, auth),
 # the classifier must hard-fail with exit 2 — NOT silently fall through
 # to PR_BODY="" and run trigger detectors with body-only signals
-# missing. Stub `gh` via PATH-prepended fake that exits non-zero on the
-# `gh api repos/.../pulls/{n}` call.
+# missing. The stub is *selective*: it succeeds for the /files endpoint
+# (so the script reaches the body fetch) and fails ONLY on the bare
+# pulls/{n} endpoint. CR Major on PR #190 r1 reproduced the prior
+# stub's flaw — failing on every call meant the script aborted at the
+# /files fetch and never exercised the body-fetch guard the test was
+# meant to cover.
 SCRATCH_GH=$(mktemp -d)
 cat > "$SCRATCH_GH/gh" <<'GH_STUB'
 #!/usr/bin/env bash
-# Fake gh that fails on the PR-body fetch. The classifier calls
-# `gh api repos/$REPO/pulls/$PR_NUM --jq '.body // ""'` for the body;
-# return non-zero so the classifier's || guard fires.
-echo "Error: stubbed gh failure" >&2
-exit 1
+# Selective fake gh. Endpoint dispatch on the joined argv. The /files
+# endpoint succeeds with a single-file array (so the classifier proceeds
+# to the body fetch); the bare pulls/{n} endpoint exits non-zero so the
+# classifier's || guard fires on the body fetch specifically.
+case " $* " in
+  *" repos/"*"/pulls/"*"/files "*|*" repos/"*"/pulls/"*"/files")
+    printf '%s\n' '[{"filename":"src/foo.ts","patch":"+const x = 1;\n"}]'
+    exit 0
+    ;;
+  *" repos/"*"/pulls/"*)
+    echo "Error: stubbed gh PR-body fetch failure" >&2
+    exit 1
+    ;;
+  *)
+    echo "Error: unstubbed gh call: $*" >&2
+    exit 1
+    ;;
+esac
 GH_STUB
 chmod +x "$SCRATCH_GH/gh"
 
@@ -211,12 +228,16 @@ set +e
 out=$(cd "$SCRATCH_GH" && PATH="$SCRATCH_GH:$PATH" GH_TOKEN=stub-token bash "$ROOT/$CLASSIFIER" 99999 --repo nathanjohnpayne/mergepath 2>&1)
 rc=$?
 set -e
-if [ "$rc" = "2" ] && echo "$out" | grep -qE "failed to (fetch PR (files|body)|flatten gh)"; then
+# Tightened assertion: must specifically be the BODY-fetch error, not
+# the files-fetch or flatten error. If the script aborts earlier, the
+# body-fetch guard isn't being exercised and codex r1's required
+# coverage isn't met.
+if [ "$rc" = "2" ] && echo "$out" | grep -q "failed to fetch PR body"; then
   pass=$((pass + 1))
-  echo "  PASS: PR fetch failure → exit 2 with explicit error (no silent body-mask)"
+  echo "  PASS: PR body-fetch failure → exit 2 with body-specific error (no silent mask)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: PR fetch failure should exit 2 with clear error (rc=$rc)" >&2
+  echo "  FAIL: PR body-fetch failure should exit 2 with body-specific error (rc=$rc)" >&2
   echo "$out" | sed 's/^/      /' >&2
 fi
 rm -rf "$SCRATCH_GH"

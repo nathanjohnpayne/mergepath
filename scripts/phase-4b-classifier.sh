@@ -198,6 +198,15 @@ else
   FILES_JSON=$(echo "$FILES_JSON" | jq -s 'add // []' 2>/dev/null) || {
     echo "Error: failed to flatten gh pulls/files paginated response" >&2; exit 2
   }
+  # Mirror the fixture-path shape guard: after flatten, the live API
+  # response must be a JSON array. Anything else (a string error blob
+  # gh somehow snuck through, an object, null) is a contract violation
+  # — exit 2 instead of letting jq's downstream `.[]` produce confusing
+  # failures. CR Major on PR #190 r1.
+  if ! echo "$FILES_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    echo "Error: live API changed-files payload must be an array (got non-array after flatten)" >&2
+    exit 2
+  fi
   # PR body fetch failure must NOT silently mask body-only triggers
   # (state-machine via "state machine" body mention, invariant via
   # "invariant" body mention). Hard-fail with exit 2 instead of
@@ -249,8 +258,11 @@ detect_state_machine_changes() {
 
 detect_concurrency() {
   local matched_keywords matched_paths
-  matched_keywords=$(echo "$PATCH_TEXT" | grep -Eo 'runTransaction|setSnapshot|applyOptimistic|compare-and-set|Promise\.all|writeBatch' | sort -u | head -3)
-  matched_paths=$(echo "$FILE_PATHS" | grep -E '(^|/)(transactions?|concurrency)/' | head -3)
+  # `|| true` on each grep — under `set -euo pipefail` an empty-match
+  # grep exits 1, which propagates through pipefail and aborts the
+  # script before the no-match branch is taken. CR Major on PR #190 r1.
+  matched_keywords=$({ echo "$PATCH_TEXT" | grep -Eo 'runTransaction|setSnapshot|applyOptimistic|compare-and-set|Promise\.all|writeBatch' || true; } | sort -u | head -3)
+  matched_paths=$({ echo "$FILE_PATHS" | grep -E '(^|/)(transactions?|concurrency)/' || true; } | head -3)
   if [ -n "$matched_keywords" ] || [ -n "$matched_paths" ]; then
     local frag="concurrency/transactional pattern detected"
     [ -n "$matched_keywords" ] && frag="$frag (keywords: $(echo "$matched_keywords" | tr '\n' ',' | sed 's/,$//'))"
@@ -263,7 +275,7 @@ detect_concurrency() {
 
 detect_prompt_design() {
   local matched
-  matched=$(echo "$FILE_PATHS" | grep -E '(^|/)prompts/|\.v[0-9]+\.md$|prompts/.*\.json$' | head -3)
+  matched=$({ echo "$FILE_PATHS" | grep -E '(^|/)prompts/|\.v[0-9]+\.md$|prompts/.*\.json$' || true; } | head -3)
   if [ -n "$matched" ]; then
     printf 'prompt design / LLM contract change in: %s' "$(echo "$matched" | tr '\n' ',' | sed 's/,$//')"
     return 0
@@ -298,7 +310,7 @@ detect_cross_cutting_refactor() {
 
 detect_invariant_enforcement() {
   local matched_paths matched_body
-  matched_paths=$(echo "$FILE_PATHS" | grep -E '(^|/)(validation|security|policies)/' | head -3)
+  matched_paths=$({ echo "$FILE_PATHS" | grep -E '(^|/)(validation|security|policies)/' || true; } | head -3)
   matched_body=""
   if echo "$PR_BODY" | grep -qiE '\binvariant\b'; then
     matched_body="PR body mentions invariant"
