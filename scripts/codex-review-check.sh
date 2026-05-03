@@ -124,6 +124,46 @@ codex_field() {
   ' "$CONFIG"
 }
 
+# Read a top-level (block-less) scalar field. Same shape as codex_field
+# but without the in-block check — used for fields like `phase_4b_default`
+# (#185) that live at the document root rather than inside `codex:` /
+# `coderabbit:`. Outputs the value or empty on miss.
+#
+# Anchored to start-of-line (no leading whitespace) so a same-named
+# nested key under e.g. `codex:` doesn't accidentally match. Codex P2
+# on PR #189 caught the unanchored-match scope-bleed risk.
+policy_field() {
+  local field=$1
+  [ -f "$CONFIG" ] || return 0
+  awk -v field="$field" '
+    /^[^[:space:]]/ && $1 == field":" {
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+      gsub(/^"/, "", $0)
+      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print
+      exit
+    }
+  ' "$CONFIG"
+}
+
+# phase_4b_default — controls when Phase 4b fires proactively. Validated
+# against the three known values; reject unknowns with a clear error
+# pointing at REVIEW_POLICY.md § Phase 4b Triggers. Missing field defaults
+# to "fallback-only" (existing-consumer migration semantics per #188).
+PHASE_4B_DEFAULT=$(policy_field phase_4b_default)
+PHASE_4B_DEFAULT=${PHASE_4B_DEFAULT:-fallback-only}
+case "$PHASE_4B_DEFAULT" in
+  fallback-only|complex-changes|always) ;;
+  *)
+    echo "ERROR: phase_4b_default must be one of: fallback-only, complex-changes, always — got '$PHASE_4B_DEFAULT'" >&2
+    echo "       See REVIEW_POLICY.md § Phase 4b Triggers." >&2
+    exit 3
+    ;;
+esac
+export PHASE_4B_DEFAULT
+
 BOT_LOGIN=$(codex_field bot_login)
 BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
 
