@@ -148,6 +148,36 @@ keyring active is your agent identity. No switch needed for commits.
    AND no file matches `external_review_paths`), merge as nathanjohnpayne.
    Done.
 
+8.5. Read `phase_4b_default` from `.github/review-policy.yml` (the
+     parser is in `scripts/codex-review-check.sh`; it exports
+     `PHASE_4B_DEFAULT` for downstream consumers). Three modes drive
+     whether Phase 4b proactive triggers fire on the current PR. The
+     taxonomy that the classifier evaluates is in REVIEW_POLICY.md
+     § Phase 4b Triggers.
+
+     - `fallback-only` (default for repos without the field): proceed
+       to Phase 4a as today. Phase 4b only fires on 4a unavailability,
+       timeout (exit code 4 from `codex-review-request.sh`), or
+       escalation.
+     - `complex-changes` (default for new repos including mergepath):
+       run `scripts/phase-4b-classifier.sh <PR#>` AFTER Phase 4a
+       clears but BEFORE merging. The classifier exits 0 (no 4b
+       needed → merge), 1 (invoke-4b recommended → post the Phase 4b
+       handoff per REVIEW_POLICY.md § Handoff Message Format and wait
+       for the external CLI review), 2 (config/API error → stop and
+       investigate), or 3 (bad args → fix the invocation).
+     - `always`: skip the classifier; post the Phase 4b handoff
+       unconditionally for any over-threshold PR.
+
+     The classifier's recommendation is advisory but its exit code is
+     load-bearing — agents should respect it rather than judging the
+     diff themselves. Address P0/P1 findings from the resulting 4b
+     review the same way as 4a findings (fix or rebut). On 4b
+     clearance (the external reviewer identity posts an `APPROVED`
+     review on the current HEAD with no unaddressed P0/P1 — same
+     concrete criterion as the Phase 4b manual fallback below), merge
+     as nathanjohnpayne.
+
 9. If the PR meets the threshold, it enters Phase 4 external review.
    See REVIEW_POLICY.md § Phase 4 for the canonical procedure. Short form:
 
@@ -204,8 +234,21 @@ keyring active is your agent identity. No switch needed for commits.
       the merge gate (CI green + internal reviewer approved + Codex
       cleared on current HEAD). The merge gate does NOT require an
       `APPROVED` review state from the Codex bot — the app never emits
-      one. If the gate passes, merge as nathanjohnpayne with the
-      switch-around per the active-account convention:
+      one.
+   g. **Phase 4b checkpoint (do not skip).** Before the merge call,
+      apply step 8.5: if `phase_4b_default` is `complex-changes`, run
+      `scripts/phase-4b-classifier.sh <PR#>` and act on its exit code
+      (1 → post 4b handoff and wait for the external reviewer identity
+      to post an `APPROVED` review on the current HEAD with no
+      unaddressed P0/P1, then come back here; 0 → proceed to merge;
+      2 → stop and investigate; 3 → fix the invocation). If
+      `phase_4b_default` is `always`, post the 4b handoff
+      unconditionally and wait for the same external `APPROVED`
+      condition before coming back to merge. If `fallback-only`, skip
+      directly to merge.
+   h. With the gate passing AND the 4b checkpoint cleared, merge as
+      nathanjohnpayne with the switch-around per the active-account
+      convention:
       `gh auth switch -u nathanjohnpayne && \
        gh pr merge <PR#> --squash --delete-branch && \
        gh auth switch -u nathanpayne-claude`
