@@ -30,14 +30,24 @@
 # Per PR, the script:
 #   1. Resolves owner/repo + PR number
 #   2. Asserts the PR is OPEN and MERGEABLE
-#   3. Lists what's blocking (for the operator's audit trail)
-#   4. Runs `scripts/gh-as-author.sh -- gh pr merge <n> --repo
+#   3. Confirms the block is the CODEOWNERS deadlock and nothing else:
+#      mergeStateStatus must be BLOCKED or CLEAN (not UNSTABLE/BEHIND/
+#      DIRTY/DRAFT/UNKNOWN), and every status check must be green. This
+#      keeps the --admin escape hatch scoped to the review/conversation
+#      deadlock it exists for — it will NOT force-merge failing or
+#      pending CI.
+#   4. Resolves bot-authored review threads on the current HEAD via
+#      scripts/resolve-pr-threads.sh (HEAD-freshness guarded; human
+#      threads are never touched), so required_conversation_resolution
+#      doesn't block the merge.
+#   5. Runs `scripts/gh-as-author.sh -- gh pr merge <n> --repo
 #      <owner/repo> --squash --delete-branch --admin`
-#   5. Verifies the merge landed by re-reading the PR's state
+#   6. Verifies the merge landed by re-reading the PR's state
 #
 # Exit codes:
 #   0  every PR merged successfully
-#   1  at least one PR failed to merge (others may have succeeded)
+#   1  at least one PR failed to merge or was refused (others may have
+#      succeeded)
 #   2  usage / argument error
 #   3  preflight error (op-preflight cache missing, gh not on PATH, etc.)
 
@@ -75,11 +85,25 @@ if [ -x "$PREFLIGHT" ]; then
   eval "$("$PREFLIGHT" --agent claude --check 2>/dev/null)" || true
 fi
 
+# Read-path gh wrapper. Prefer the preflight reviewer PAT when present,
+# otherwise fall back to the ambient GH_TOKEN / keyring. Never export an
+# empty GH_TOKEN — an empty value still takes precedence over stored
+# credentials and breaks auth when the preflight cache is absent.
+gh_ro() {
+  if [ -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]; then
+    GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh "$@"
+  else
+    gh "$@"
+  fi
+}
+
 # Resolve current-repo for bare <num> refs.
 CURRENT_REPO=""
 resolve_current_repo() {
   if [ -n "$CURRENT_REPO" ]; then return 0; fi
-  if ! CURRENT_REPO=$(gh repo view --json owner,name --jq '.owner.login + "/" + .name' 2>/dev/null); then
+  # Resolve from $REPO_ROOT, not the caller's CWD, so a bare <num> ref
+  # always targets this repo even when the script is invoked elsewhere.
+  if ! CURRENT_REPO=$( (cd "$REPO_ROOT" && gh_ro repo view --json owner,name --jq '.owner.login + "/" + .name') 2>/dev/null); then
     echo "admin-merge: bare <num> ref passed but current dir is not a gh-resolvable repo" >&2
     exit 3
   fi
@@ -104,6 +128,9 @@ if [ ! -x "$GH_AS_AUTHOR" ]; then
   exit 3
 fi
 
+# Canonical thread-resolution helper (HEAD-freshness guarded, bot-only).
+RESOLVE_THREADS="$SCRIPT_DIR/resolve-pr-threads.sh"
+
 OVERALL_RC=0
 
 for ref in "$@"; do
@@ -115,7 +142,7 @@ for ref in "$@"; do
   printf 'PR: %s#%s\n' "$repo" "$num"
   printf '========================================\n'
 
-  state=$(GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-}" gh pr view "$num" --repo "$repo" \
+  state=$(gh_ro pr view "$num" --repo "$repo" \
     --json state,mergeable,mergeStateStatus,title \
     --jq '.state + "|" + (.mergeable // "") + "|" + (.mergeStateStatus // "") + "|" + .title' 2>&1) || {
     printf '  ✗ could not read PR state: %s\n' "$state"
@@ -141,39 +168,69 @@ for ref in "$@"; do
     continue
   fi
 
-  # Auto-resolve bot-authored threads before the merge. Branch
-  # protection with `required_conversation_resolution: true` fails
-  # the merge even with --admin if any review thread is unresolved.
-  # The first round of this script missed this and hit the
-  # `GraphQL: All comments must be resolved` error; doing it up-
-  # front saves a retry. Only bot-authored threads are auto-
-  # resolved (per the same rule scripts/resolve-pr-threads.sh
-  # follows) — human-authored threads stay open for human review.
-  unresolved=$(GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-}" gh api graphql -f query="
-    query { repository(owner: \"${repo%%/*}\", name: \"${repo##*/}\") {
-      pullRequest(number: $num) { reviewThreads(first: 100) {
-        nodes { id isResolved comments(first:1){nodes{author{login}}} }
-      }}}}" --jq '
-        .data.repository.pullRequest.reviewThreads.nodes
-        | map(select(.isResolved != true))
-        | map(select(.comments.nodes[0].author.login | endswith("[bot]") or
-                     . == "coderabbitai" or . == "chatgpt-codex-connector"))
-        | map(.id)[]
-      ' 2>/dev/null || echo "")
-  if [ -n "$unresolved" ]; then
-    n_unresolved=$(printf '%s\n' "$unresolved" | grep -c .)
-    printf '  ⤷ resolving %d bot-authored thread(s) before merge\n' "$n_unresolved"
-    while IFS= read -r tid; do
-      [ -z "$tid" ] && continue
-      GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-}" gh api graphql -f query="
-        mutation { resolveReviewThread(input: {threadId: \"$tid\"}) { thread { isResolved } } }
-      " >/dev/null 2>&1 || printf '    · warning: could not resolve thread %s\n' "$tid"
-    done <<< "$unresolved"
+  # Gate 1 — scope to the CODEOWNERS deadlock. `mergeable` only reports
+  # merge-conflict status; it does NOT mean checks/reviews are satisfied.
+  # The only states this break-glass helper should ever --admin-merge are
+  # BLOCKED (the expected deadlock: required approving review missing
+  # because the sole CODEOWNER is the author) and CLEAN (admin not even
+  # needed). Anything else (UNSTABLE, BEHIND, DIRTY, DRAFT, UNKNOWN) means
+  # a different blocker is in play — refuse rather than force past it.
+  case "$pr_msstatus" in
+    BLOCKED|CLEAN) : ;;
+    *)
+      printf '  ✗ mergeStateStatus=%s is not a CODEOWNERS-deadlock state — refusing --admin merge\n' "$pr_msstatus"
+      OVERALL_RC=1
+      continue
+      ;;
+  esac
+
+  # Gate 2 — BLOCKED also covers failing/pending REQUIRED checks, which
+  # mergeStateStatus alone can't distinguish from a review-only block.
+  # This helper's precondition is "all CI checks pass", so refuse if any
+  # status check is failing or still running.
+  not_green=$(gh_ro pr view "$num" --repo "$repo" --json statusCheckRollup --jq '
+    [ .statusCheckRollup[]?
+      | select(
+          (.__typename == "CheckRun" and (
+             (.status != "COMPLETED")
+             or ((.conclusion // "" | ascii_downcase) as $c
+                 | (($c == "success") or ($c == "skipped") or ($c == "neutral")) | not)
+          ))
+          or
+          (.__typename == "StatusContext" and ((.state // "" | ascii_downcase) != "success"))
+        )
+      | (.name // .context // "check") ]
+    | join(", ")' 2>&1) || not_green="__error__"
+  if [ "$not_green" = "__error__" ]; then
+    printf '  ✗ could not read check status — refusing --admin merge\n'
+    OVERALL_RC=1
+    continue
+  fi
+  if [ -n "$not_green" ]; then
+    printf '  ✗ checks not green (%s) — refusing --admin merge\n' "$not_green"
+    OVERALL_RC=1
+    continue
+  fi
+
+  # Resolve bot-authored review threads on the current HEAD before the
+  # merge: branch protection's required_conversation_resolution fails the
+  # merge (even with --admin) while any thread is unresolved. Delegate to
+  # the canonical helper, which enforces the current-HEAD freshness guard
+  # and only touches bot threads (never human-authored ones). The prior
+  # inline GraphQL reimplementation here did neither.
+  if [ -x "$RESOLVE_THREADS" ]; then
+    rt_rc=0
+    "$RESOLVE_THREADS" "$num" --repo "$repo" --auto-resolve-bots || rt_rc=$?
+    if [ "$rt_rc" -ne 0 ]; then
+      printf '  · note: resolve-pr-threads exited %d; any remaining (e.g. human-authored) thread will block the merge below\n' "$rt_rc"
+    fi
+  else
+    printf '  · warning: %s missing; skipping pre-merge thread resolution\n' "$RESOLVE_THREADS"
   fi
 
   printf '  ⤷ merging with --admin (CODEOWNERS-author deadlock)\n'
   if "$GH_AS_AUTHOR" -- gh pr merge "$num" --repo "$repo" --squash --delete-branch --admin; then
-    new_state=$(GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-}" gh pr view "$num" --repo "$repo" \
+    new_state=$(gh_ro pr view "$num" --repo "$repo" \
       --json state,mergeCommit --jq '.state + " " + (.mergeCommit.oid // "")[0:7]' 2>&1)
     printf '  ✓ merged: %s\n' "$new_state"
   else
