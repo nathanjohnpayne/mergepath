@@ -32,10 +32,16 @@
 #   2. Asserts the PR is OPEN and MERGEABLE
 #   3. Confirms the block is the CODEOWNERS deadlock and nothing else:
 #      mergeStateStatus must be BLOCKED or CLEAN (not UNSTABLE/BEHIND/
-#      DIRTY/DRAFT/UNKNOWN), and every status check must be green. This
-#      keeps the --admin escape hatch scoped to the review/conversation
-#      deadlock it exists for — it will NOT force-merge failing or
-#      pending CI.
+#      DIRTY/DRAFT/UNKNOWN), every status check must be green, AND a
+#      present APPROVED review must exist with no outstanding
+#      CHANGES_REQUESTED. The approval requirement is what distinguishes
+#      the CODEOWNERS self-author deadlock (an approval exists, it just
+#      can't satisfy the CODEOWNERS rule) from a genuinely unreviewed PR
+#      — without it, --admin would merge unreviewed code. This keeps the
+#      escape hatch scoped to the review/conversation deadlock it exists
+#      for; it will NOT force-merge failing/pending CI or unreviewed code.
+#      (Note: in the real deadlock reviewDecision is REVIEW_REQUIRED, so
+#      this checks for a present APPROVED review, not reviewDecision.)
 #   4. Resolves bot-authored review threads on the current HEAD via
 #      scripts/resolve-pr-threads.sh (HEAD-freshness guarded; human
 #      threads are never touched), so required_conversation_resolution
@@ -208,6 +214,34 @@ for ref in "$@"; do
   fi
   if [ -n "$not_green" ]; then
     printf '  ✗ checks not green (%s) — refusing --admin merge\n' "$not_green"
+    OVERALL_RC=1
+    continue
+  fi
+
+  # Gate 3 — require a present approving review. mergeStateStatus=BLOCKED
+  # also matches a genuinely-unreviewed PR (no approvals at all), not just
+  # the CODEOWNERS self-author deadlock. This helper's premise is that an
+  # APPROVED review exists and merely can't satisfy the CODEOWNERS rule;
+  # --admin-merging without one would bypass review entirely. reviewDecision
+  # is REVIEW_REQUIRED in the real deadlock (the approval isn't from a
+  # CODEOWNER), so check the latest review state per author instead: at
+  # least one APPROVED, and none with CHANGES_REQUESTED outstanding.
+  review_states=$(gh_ro pr view "$num" --repo "$repo" --json reviews --jq '
+    .reviews
+    | group_by(.author.login)
+    | map(max_by(.submittedAt) | .state)' 2>&1) || review_states="__error__"
+  if [ "$review_states" = "__error__" ]; then
+    printf '  ✗ could not read review state — refusing --admin merge\n'
+    OVERALL_RC=1
+    continue
+  fi
+  if printf '%s' "$review_states" | grep -q '"CHANGES_REQUESTED"'; then
+    printf '  ✗ a reviewer has CHANGES_REQUESTED outstanding — refusing --admin merge\n'
+    OVERALL_RC=1
+    continue
+  fi
+  if ! printf '%s' "$review_states" | grep -q '"APPROVED"'; then
+    printf '  ✗ no APPROVED review present — refusing --admin merge (this helper clears the CODEOWNERS deadlock, not the review requirement itself)\n'
     OVERALL_RC=1
     continue
   fi
