@@ -44,10 +44,16 @@
 #      this checks for a present APPROVED review, not reviewDecision.)
 #   4. Resolves bot-authored review threads on the current HEAD via
 #      scripts/resolve-pr-threads.sh (HEAD-freshness guarded; human
-#      threads are never touched), so required_conversation_resolution
-#      doesn't block the merge.
+#      threads are never touched). FAILS CLOSED: if resolution errors,
+#      or if ANY review thread remains unresolved afterward, it refuses
+#      the merge — because --admin would otherwise bypass
+#      required_conversation_resolution and merge past an unaddressed
+#      (e.g. human-authored) thread.
 #   5. Runs `scripts/gh-as-author.sh -- gh pr merge <n> --repo
-#      <owner/repo> --squash --delete-branch --admin`
+#      <owner/repo> --squash --delete-branch --admin --match-head-commit
+#      <validated-sha>`. The --match-head-commit pin guarantees the
+#      commit that passed steps 2-4 is the one merged (closes the
+#      gate-then-merge race if a new commit lands in between).
 #   6. Verifies the merge landed by re-reading the PR's state
 #
 # Exit codes:
@@ -149,8 +155,8 @@ for ref in "$@"; do
   printf '========================================\n'
 
   state=$(gh_ro pr view "$num" --repo "$repo" \
-    --json state,mergeable,mergeStateStatus,title \
-    --jq '.state + "|" + (.mergeable // "") + "|" + (.mergeStateStatus // "") + "|" + .title' 2>&1) || {
+    --json state,mergeable,mergeStateStatus,headRefOid,title \
+    --jq '.state + "|" + (.mergeable // "") + "|" + (.mergeStateStatus // "") + "|" + (.headRefOid // "") + "|" + .title' 2>&1) || {
     printf '  ✗ could not read PR state: %s\n' "$state"
     OVERALL_RC=1
     continue
@@ -158,7 +164,8 @@ for ref in "$@"; do
   pr_state=$(printf '%s\n' "$state" | cut -d'|' -f1)
   pr_mergeable=$(printf '%s\n' "$state" | cut -d'|' -f2)
   pr_msstatus=$(printf '%s\n' "$state" | cut -d'|' -f3)
-  pr_title=$(printf '%s\n' "$state" | cut -d'|' -f4-)
+  pr_head=$(printf '%s\n' "$state" | cut -d'|' -f4)
+  pr_title=$(printf '%s\n' "$state" | cut -d'|' -f5-)
   printf '  title:           %s\n' "$pr_title"
   printf '  state:           %s\n' "$pr_state"
   printf '  mergeable:       %s\n' "$pr_mergeable"
@@ -246,24 +253,61 @@ for ref in "$@"; do
     continue
   fi
 
-  # Resolve bot-authored review threads on the current HEAD before the
-  # merge: branch protection's required_conversation_resolution fails the
-  # merge (even with --admin) while any thread is unresolved. Delegate to
-  # the canonical helper, which enforces the current-HEAD freshness guard
-  # and only touches bot threads (never human-authored ones). The prior
-  # inline GraphQL reimplementation here did neither.
-  if [ -x "$RESOLVE_THREADS" ]; then
-    rt_rc=0
-    "$RESOLVE_THREADS" "$num" --repo "$repo" --auto-resolve-bots || rt_rc=$?
-    if [ "$rt_rc" -ne 0 ]; then
-      printf '  · note: resolve-pr-threads exited %d; any remaining (e.g. human-authored) thread will block the merge below\n' "$rt_rc"
-    fi
-  else
-    printf '  · warning: %s missing; skipping pre-merge thread resolution\n' "$RESOLVE_THREADS"
+  # Resolve bot-authored review threads on the current HEAD via the
+  # canonical helper (current-HEAD freshness guarded; bot threads only).
+  # FAIL CLOSED on any failure: --admin bypasses
+  # required_conversation_resolution, so we must not fall through to the
+  # merge if resolution didn't complete cleanly.
+  if [ ! -x "$RESOLVE_THREADS" ]; then
+    printf '  ✗ %s missing — refusing --admin merge (cannot verify thread resolution)\n' "$RESOLVE_THREADS"
+    OVERALL_RC=1
+    continue
+  fi
+  rt_rc=0
+  "$RESOLVE_THREADS" "$num" --repo "$repo" --auto-resolve-bots || rt_rc=$?
+  if [ "$rt_rc" -ne 0 ]; then
+    printf '  ✗ thread resolution exited %d — refusing --admin merge (fail closed)\n' "$rt_rc"
+    OVERALL_RC=1
+    continue
   fi
 
-  printf '  ⤷ merging with --admin (CODEOWNERS-author deadlock)\n'
-  if "$GH_AS_AUTHOR" -- gh pr merge "$num" --repo "$repo" --squash --delete-branch --admin; then
+  # Gate 4 — verify NO unresolved threads remain. --admin would merge past
+  # the conversation-resolution gate, so any thread the bot-resolver did
+  # not (or must not) clear — human-authored threads above all — has to
+  # block the merge instead. Refuse on >100 threads (page cap) or read
+  # error rather than risk an undercount. (PR #340: codex P1)
+  unresolved_remaining=$(gh_ro api graphql -f query="
+    query { repository(owner: \"${repo%%/*}\", name: \"${repo##*/}\") {
+      pullRequest(number: $num) { reviewThreads(first: 100) {
+        pageInfo { hasNextPage }
+        nodes { isResolved }
+      }}}}" --jq '
+        if .data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage
+        then "PAGINATE"
+        else ([ .data.repository.pullRequest.reviewThreads.nodes[]
+                | select(.isResolved != true) ] | length | tostring)
+        end' 2>&1) || unresolved_remaining="__error__"
+  if [ "$unresolved_remaining" = "__error__" ] || [ "$unresolved_remaining" = "PAGINATE" ]; then
+    printf '  ✗ could not confirm all threads resolved (%s) — refusing --admin merge\n' "$unresolved_remaining"
+    OVERALL_RC=1
+    continue
+  fi
+  if [ "$unresolved_remaining" -gt 0 ] 2>/dev/null; then
+    printf '  ✗ %s unresolved review thread(s) remain — refusing --admin merge (a human must resolve them)\n' "$unresolved_remaining"
+    OVERALL_RC=1
+    continue
+  fi
+
+  # Pin the merge to the exact HEAD the gates above validated. Without
+  # --match-head-commit, a push/force-push landing between gate evaluation
+  # and the merge could merge an unvalidated commit. (PR #340: codex P1)
+  if [ -z "$pr_head" ]; then
+    printf '  ✗ could not determine validated HEAD SHA — refusing --admin merge\n'
+    OVERALL_RC=1
+    continue
+  fi
+  printf '  ⤷ merging with --admin (CODEOWNERS-author deadlock), pinned to %s\n' "${pr_head:0:7}"
+  if "$GH_AS_AUTHOR" -- gh pr merge "$num" --repo "$repo" --squash --delete-branch --admin --match-head-commit "$pr_head"; then
     new_state=$(gh_ro pr view "$num" --repo "$repo" \
       --json state,mergeCommit --jq '.state + " " + (.mergeCommit.oid // "")[0:7]' 2>&1)
     printf '  ✓ merged: %s\n' "$new_state"
