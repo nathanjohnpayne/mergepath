@@ -57,10 +57,9 @@ on:
 permissions:
   pull-requests: write
   contents: read
-  checks: read
   # codex-review-check.sh drills statusCheckRollup →
   # checkSuite.workflowRun, which needs `actions: read` in addition
-  # to `checks: read`. Without it the GraphQL fails with `Resource
+  # to the `checks` scope. Without it the GraphQL fails with `Resource
   # not accessible by integration` and the gate evaluation aborts
   # with rc=3, leaving `needs-external-review` stuck on every
   # consumer PR after Codex approves. Surfaced on
@@ -73,7 +72,13 @@ permissions:
   # (failed label read, failed label removal, codex-review-check.sh
   # rc=3, contract-drift rc). Without a visible check-run, flake
   # recurrences are invisible unless someone happens to look at the
-  # workflow run log.
+  # workflow run log. `write` supersets `read`, so this single entry
+  # also covers codex-review-check.sh's check-reading need — do NOT
+  # re-add a separate `checks: read` key: a duplicate `checks:` map
+  # key is a startup-failure-level workflow file error (#324 shipped
+  # exactly that regression; the parser rejected the file and every
+  # trigger produced a zero-job failed run, so the label never
+  # auto-cleared).
   checks: write
 
 jobs:
