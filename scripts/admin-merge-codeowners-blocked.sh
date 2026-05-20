@@ -53,9 +53,12 @@
 #      required_conversation_resolution and merge past an unaddressed
 #      (e.g. human-authored) thread.
 #   5. Runs `scripts/gh-as-author.sh -- gh pr merge <n> --repo
-#      <owner/repo> --squash --delete-branch --admin --match-head-commit
-#      <validated-sha>`. The --match-head-commit pin guarantees the
-#      commit that passed steps 2-4 is the one merged (closes the
+#      <owner/repo> --squash --delete-branch [--admin] --match-head-commit
+#      <validated-sha>`. --admin is added ONLY when mergeStateStatus is
+#      BLOCKED (the deadlock); a CLEAN PR is merged WITHOUT --admin so
+#      merge-queue / branch-protection paths still apply (--admin would be
+#      gratuitous and bypass them). The --match-head-commit pin guarantees
+#      the commit that passed steps 2-4 is the one merged (closes the
 #      gate-then-merge race if a new commit lands in between).
 #   6. Verifies the merge landed by re-reading the PR's state
 #
@@ -186,11 +189,13 @@ for ref in "$@"; do
 
   # Gate 1 — scope to the CODEOWNERS deadlock. `mergeable` only reports
   # merge-conflict status; it does NOT mean checks/reviews are satisfied.
-  # The only states this break-glass helper should ever --admin-merge are
-  # BLOCKED (the expected deadlock: required approving review missing
-  # because the sole CODEOWNER is the author) and CLEAN (admin not even
-  # needed). Anything else (UNSTABLE, BEHIND, DIRTY, DRAFT, UNKNOWN) means
-  # a different blocker is in play — refuse rather than force past it.
+  # The only states this helper operates on are BLOCKED (the expected
+  # deadlock: required approving review missing because the sole CODEOWNER
+  # is the author → merged with --admin at the merge step) and CLEAN
+  # (already mergeable → merged WITHOUT --admin so merge-queue/branch
+  # protections still apply; see the merge step). Anything else (UNSTABLE,
+  # BEHIND, DIRTY, DRAFT, UNKNOWN) means a different blocker is in play —
+  # refuse rather than force past it.
   case "$pr_msstatus" in
     BLOCKED|CLEAN) : ;;
     *)
@@ -361,8 +366,19 @@ for ref in "$@"; do
     OVERALL_RC=1
     continue
   fi
-  printf '  ⤷ merging with --admin (CODEOWNERS-author deadlock), pinned to %s\n' "${pr_head:0:7}"
-  if "$GH_AS_AUTHOR" -- gh pr merge "$num" --repo "$repo" --squash --delete-branch --admin --match-head-commit "$pr_head"; then
+  # Use --admin ONLY for the BLOCKED deadlock. A CLEAN PR is already
+  # normally mergeable, so --admin would be gratuitous and would bypass
+  # merge-queue / branch-protection paths on repos that have them. Merge
+  # CLEAN PRs normally so those protections still apply; reserve the
+  # break-glass --admin for the deadlock it exists for. (PR #340: codex P1)
+  admin_flag=()
+  if [ "$pr_msstatus" = "BLOCKED" ]; then
+    admin_flag=(--admin)
+    printf '  ⤷ merging with --admin (CODEOWNERS-author deadlock), pinned to %s\n' "${pr_head:0:7}"
+  else
+    printf '  ⤷ merging without --admin (mergeStateStatus=CLEAN — not a deadlock; merge-queue/branch protections still apply), pinned to %s\n' "${pr_head:0:7}"
+  fi
+  if "$GH_AS_AUTHOR" -- gh pr merge "$num" --repo "$repo" --squash --delete-branch ${admin_flag[@]+"${admin_flag[@]}"} --match-head-commit "$pr_head"; then
     new_state=$(gh_ro pr view "$num" --repo "$repo" \
       --json state,mergeCommit --jq '.state + " " + (.mergeCommit.oid // "")[0:7]' 2>&1)
     printf '  ✓ merged: %s\n' "$new_state"
