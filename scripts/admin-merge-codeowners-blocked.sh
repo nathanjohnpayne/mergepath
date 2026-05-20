@@ -228,24 +228,56 @@ for ref in "$@"; do
     continue
   fi
 
-  # Gate 3 — require a QUALIFYING approving review. mergeStateStatus=BLOCKED
-  # also matches a genuinely-unreviewed PR, and --admin bypasses branch
-  # protection, so a bare "APPROVED" state is not enough: a self-review or
-  # an approval from a non-collaborator (in repos that allow public
-  # reviews) would otherwise let unreviewed code merge. Require, from the
+  # Gate 3 — require a QUALIFYING approving review ON THE VALIDATED HEAD.
+  # mergeStateStatus=BLOCKED also matches a genuinely-unreviewed PR, and
+  # --admin bypasses branch protection, so a bare "APPROVED" state is not
+  # enough: a self-review, an approval from a non-collaborator (in repos
+  # that allow public reviews), or a STALE approval on an older commit
+  # would otherwise let unreviewed code merge. Require, from the
   # latest-per-author reviews: no outstanding CHANGES_REQUESTED, and at
   # least one APPROVED review from a collaborator with write/admin
-  # permission who is NOT the PR author. reviewDecision is REVIEW_REQUIRED
-  # in the real deadlock (the approval isn't from a CODEOWNER), so we
-  # evaluate the reviews directly. (PR #340: codex P1)
-  pr_meta=$(gh_ro pr view "$num" --repo "$repo" --json author,reviews --jq '
-    [ .reviews | group_by(.author.login)[] | max_by(.submittedAt) ] as $latest
-    | (.author.login)
-      + "\t" + ([ $latest[] | select(.state=="CHANGES_REQUESTED") ] | length | tostring)
-      + "\t" + ([ $latest[] | select(.state=="APPROVED") | .author.login ] | unique | join(","))' 2>&1) \
-    || pr_meta="__error__"
-  if [ "$pr_meta" = "__error__" ]; then
+  # permission who is NOT the PR author AND whose approval is on the
+  # validated HEAD (pr_head). On repos that do not dismiss stale reviews
+  # on push, an old APPROVED can remain the author's latest while newer
+  # commits go unreviewed; pinning to pr_head closes that bypass.
+  # `gh pr view --json reviews` omits the per-review commit, so query
+  # GraphQL for `commit.oid`. reviewDecision is REVIEW_REQUIRED in the
+  # real deadlock (the approval isn't from a CODEOWNER), so we evaluate
+  # the reviews directly. (PR #340: codex P1 ×2)
+  reviews_json=$(gh_ro api graphql \
+    -f query='query($owner:String!,$name:String!,$num:Int!){
+      repository(owner:$owner,name:$name){
+        pullRequest(number:$num){
+          author{login}
+          reviews(first:100){
+            pageInfo{ hasNextPage }
+            nodes { author{login} state submittedAt commit{oid} }
+          }
+        }
+      }
+    }' -f owner="${repo%%/*}" -f name="${repo##*/}" -F num="$num" 2>&1) \
+    || reviews_json="__error__"
+  if [ "$reviews_json" = "__error__" ]; then
     printf '  ✗ could not read review state — refusing --admin merge\n'
+    OVERALL_RC=1
+    continue
+  fi
+  # Pinning the qualifying approval to pr_head needs the per-review commit,
+  # so pipe to jq with --arg (gh's --jq does not expose jq variables).
+  # Refuse on >100 reviews (page cap) rather than risk an undercount that
+  # masks a CHANGES_REQUESTED or counts a stale approval. (mirrors Gate 4)
+  pr_meta=$(printf '%s' "$reviews_json" | jq -r --arg head "$pr_head" '
+    .data.repository.pullRequest as $pr
+    | if $pr.reviews.pageInfo.hasNextPage then "PAGINATE"
+      else
+        [ $pr.reviews.nodes | group_by(.author.login)[] | max_by(.submittedAt) ] as $latest
+        | ($pr.author.login)
+          + "\t" + ([ $latest[] | select(.state=="CHANGES_REQUESTED") ] | length | tostring)
+          + "\t" + ([ $latest[] | select(.state=="APPROVED" and .commit.oid==$head) | .author.login ] | unique | join(","))
+      end' 2>&1) \
+    || pr_meta="__error__"
+  if [ "$pr_meta" = "__error__" ] || [ "$pr_meta" = "PAGINATE" ]; then
+    printf '  ✗ could not confirm review state (%s) — refusing --admin merge\n' "$pr_meta"
     OVERALL_RC=1
     continue
   fi
@@ -270,7 +302,7 @@ for ref in "$@"; do
     done
   fi
   if [ -z "$qualified_approver" ]; then
-    printf '  ✗ no qualifying approval — refusing --admin merge (need an APPROVED review from a write/admin collaborator other than the author)\n'
+    printf '  ✗ no qualifying approval on HEAD %s — refusing --admin merge (need an APPROVED review on the validated HEAD from a write/admin collaborator other than the author)\n' "${pr_head:0:7}"
     OVERALL_RC=1
     continue
   fi
