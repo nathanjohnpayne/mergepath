@@ -193,13 +193,22 @@ perm_block=$(
 )
 # `actions: read` added in #310 — codex-review-check.sh's GraphQL
 # drill into statusCheckRollup.checkSuite.workflowRun requires it
-# in addition to `checks: read`. See the inline rationale comment
-# next to the new permission in auto-clear-blocking-labels.yml.
+# in addition to the `checks` scope. See the inline rationale comment
+# next to the permission in auto-clear-blocking-labels.yml.
 # `checks: write` added in #324 — the "Surface infra failure as
 # check-run" step posts a failed check-run when this workflow hits
 # an infrastructure error, so flake recurrences are visible on the
-# PR's checks tab without grepping workflow logs.
-expected_perms=$'actions: read\nchecks: read\nchecks: write\ncontents: read\npull-requests: write'
+# PR's checks tab without grepping workflow logs. It is the SINGLE
+# `checks` entry: `write` supersets `read`, so a separate
+# `checks: read` must NOT coexist with it. #324 shipped exactly that
+# duplicate `checks:` map key; this text-based assertion happily
+# matched both lines and stayed green, while GitHub's workflow parser
+# rejected the duplicate-key file and every trigger produced a
+# zero-job startup failure (the label never auto-cleared). The
+# expected set below now codifies the single-key shape so re-adding
+# `checks: read` fails this check instead of silently breaking the
+# workflow at runtime.
+expected_perms=$'actions: read\nchecks: write\ncontents: read\npull-requests: write'
 if [ "$perm_block" = "$expected_perms" ]; then
   pass=$((pass + 1))
   echo "  PASS: workflow permissions exactly match the least-privilege set"
