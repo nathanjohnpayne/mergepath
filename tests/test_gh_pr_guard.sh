@@ -527,39 +527,31 @@ out=$(run_hook 'gh issue close 7' "nathanjohnpayne" "0" 2>&1)
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
-  pass "issue close: allowed (only 'issue comment' and 'issue create' are guarded)"
+  pass "issue close: allowed (only 'issue comment' is guarded; issue create is not)"
 else
   fail "issue close: exit $rc, expected 0; output: $out"
 fi
 
 # ---------------------------------------------------------------------------
-# Test 23a: gh issue create with AUTHOR identity → blocked (#317).
-# Closes the mergepath#315 misattribution gap: a nathanpayne-claude
-# agent session filed an issue, but the keyring had drifted to
-# nathanpayne-codex from the prior Phase 4b CLI run, and the issue
-# landed under the wrong byline. The hook should now catch this:
-# any keyring active = the AUTHOR identity (nathanjohnpayne) is
-# blocked because issue creation should attribute to a REVIEWER
-# (agent) identity.
+# Test 23a: gh issue create with AUTHOR identity → ALLOWED.
+# The #317 byline guard on issue creation was reverted: filing issues
+# under the author identity (nathanjohnpayne) is an intended, long-
+# standing workflow, so `gh issue create` is no longer gated by this
+# hook under any identity.
 # ---------------------------------------------------------------------------
 set +e
 out=$(run_hook 'gh issue create --title "Bug report" --body "saw the thing"' "nathanjohnpayne" "0" 2>&1)
 rc=$?
 set -e
-if [ "$rc" -ne 2 ]; then
-  fail "issue create + author identity: exit $rc, expected 2; output: $out"
-elif ! echo "$out" | grep -qi "gh issue create"; then
-  fail "issue create + author identity: diagnostic missing 'gh issue create'; output: $out"
-elif ! echo "$out" | grep -qi "mergepath#315"; then
-  fail "issue create + author identity: diagnostic missing #315 reference; output: $out"
+if [ "$rc" -eq 0 ]; then
+  pass "issue create + author identity: allowed (#317 byline guard reverted)"
 else
-  pass "issue create + author identity: blocked with #317 diagnostic"
+  fail "issue create + author identity: exit $rc, expected 0; output: $out"
 fi
 
 # ---------------------------------------------------------------------------
-# Test 23b: gh issue create with REVIEWER identity → allowed (#317).
-# The happy path: the keyring is the agent's reviewer identity, the
-# issue posts under that byline, no block.
+# Test 23b: gh issue create with REVIEWER identity → allowed.
+# Filing under an agent identity remains valid too.
 # ---------------------------------------------------------------------------
 set +e
 out=$(run_hook 'gh issue create --title "Bug report" --body "saw the thing"' "nathanpayne-claude" "0" 2>&1)
@@ -572,26 +564,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 23c: gh issue create with bypass set → allowed even under
-# AUTHOR identity (test/CI escape hatch parity with the other
-# reviewer-byline checks).
-# ---------------------------------------------------------------------------
-set +e
-out=$(run_hook 'gh issue create --title "Bug" --body "..."' "nathanjohnpayne" "1" 2>&1)
-rc=$?
-set -e
-if [ "$rc" -eq 0 ]; then
-  pass "issue create + author identity + bypass: allowed (escape hatch)"
-else
-  fail "issue create + bypass: exit $rc, expected 0; output: $out"
-fi
-
-# ---------------------------------------------------------------------------
 # Test 23d: gh issue create must NOT fall through to the pr-create
 # branch's body checks. `gh pr create` requires Authoring-Agent: and
 # ## Self-Review in the body; `gh issue create` has neither convention.
-# Regression: PR_SUBCOMMAND=="create" alone is insufficient to decide
-# the branch — the IS_ISSUE_CREATE flag must route correctly.
+# Regression: PR_SUBCOMMAND=="create" alone must not route issue
+# creation into the pr-create body requirements.
 # ---------------------------------------------------------------------------
 set +e
 out=$(run_hook 'gh issue create --title "Bug" --body "no Authoring-Agent line here"' "nathanpayne-claude" "0" 2>&1)

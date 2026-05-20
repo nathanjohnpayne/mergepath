@@ -281,7 +281,7 @@ affect the byline for that row; the byline follows `GH_TOKEN`.
 | `gh pr review --approve` (over-threshold, same agent) | **BLOCKED** by `scripts/hooks/gh-pr-guard.sh` per § No-self-approve scoping (#284) | n/a |
 | `gh pr review --approve` (over-threshold, cross-agent) | `nathanpayne-<other-agent>`; the cross-agent reviewer identity per Phase 4 | reviewer PAT |
 | `gh pr view` (read) | any (does not write) | any read-capable PAT |
-| `gh issue create` | `nathanpayne-<agent>` (agent files the issue, e.g. post-merge follow-ups per AGENTS.md step 11) | reviewer PAT |
+| `gh issue create` | any — **not hook-gated** (#317 byline guard reverted); issues may be filed under the author identity (`nathanjohnpayne`) or an agent identity, e.g. post-merge follow-ups per AGENTS.md step 11 | author or reviewer PAT |
 | `gh issue comment` | `nathanpayne-<agent>`; blocked when active is `nathanjohnpayne` (#284) | reviewer PAT |
 | `gh issue close` | any (out of #284 scope — not yet hook-gated) | any |
 | `gh api GET ...` | irrelevant (read-only) | any read-capable PAT |
