@@ -42,6 +42,12 @@ else
   pass "--help omits removed --sync mode"
 fi
 
+if grep -q "^set -euo pipefail$" "$SCRIPT"; then
+  pass "script enables full shell strict mode"
+else
+  fail "script should use set -euo pipefail"
+fi
+
 # --sync is a removed legacy path and must fail before touching 1Password.
 set +e
 sync_out="$("$SCRIPT" --sync 2>&1)"
@@ -51,6 +57,16 @@ if [[ "$sync_ec" -eq 2 ]] && grep -q "was removed" <<<"$sync_out"; then
   pass "--sync exits 2 with removal diagnostic"
 else
   fail "--sync should exit 2 with removal diagnostic; rc=$sync_ec out=$sync_out"
+fi
+
+set +e
+unknown_out="$("$SCRIPT" --not-a-real-flag 2>&1)"
+unknown_ec=$?
+set -e
+if [[ "$unknown_ec" -eq 1 ]] && grep -q "unknown option: --not-a-real-flag" <<<"$unknown_out"; then
+  pass "unknown flags exit 1 with diagnostic"
+else
+  fail "unknown flags should exit 1 with diagnostic; rc=$unknown_ec out=$unknown_out"
 fi
 
 # An empty config should point maintainers at INJECT_FILES only.

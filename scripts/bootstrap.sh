@@ -25,7 +25,7 @@
 #   - Use `op inject` only when generating a gitignored file is required
 #   - Do not use Secure Note notesPlain whole-file bootstrap storage
 # ──────────────────────────────────────────────────────────────
-set -eo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -50,6 +50,11 @@ for arg in "$@"; do
       echo "  --dry-run   Show what would be done without writing"
       echo "  --force     Overwrite existing files during restore"
       exit 0
+      ;;
+    *)
+      echo "Error: unknown option: $arg" >&2
+      echo "Usage: $0 [--dry-run] [--force]" >&2
+      exit 1
       ;;
   esac
 done
