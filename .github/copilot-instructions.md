@@ -18,7 +18,7 @@ Before opening or updating a pull request, perform a structured self-review and 
 - Review under your agent's reviewer identity (e.g., `nathanpayne-claude`).
 - Only `nathanjohnpayne` merges to the target branch.
 - Never approve your own PR. Self-approvals are automatically dismissed.
-- Never remove `needs-external-review` or `needs-human-review` labels.
+- Never remove `needs-external-review`, `needs-human-review`, `policy-violation`, or `human-hold` labels. Agents may add `human-hold` to freeze a PR.
 - When external review is required, post a handoff message as described in REVIEW_POLICY.md.
 - See REVIEW_POLICY.md for the complete workflow, handoff format, and post-merge issue rules.
 

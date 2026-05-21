@@ -2,16 +2,18 @@
 # label-removal-guard.sh — PreToolUse hook for Claude Code.
 #
 # Blocks `gh pr edit ... --remove-label <label>` calls (and the
-# add-label inverse for the same labels) for the human-action labels
+# add-label inverse for most of those labels) for the human-action labels
 # defined in REVIEW_POLICY.md § Agent prohibitions:
 #
 #   - needs-external-review
 #   - needs-human-review
 #   - policy-violation
+#   - human-hold (remove-blocked, add-allowed)
 #
 # Rationale: agents must never remove these labels, even when a human
 # authorizes it in chat. One-time chat authorization does not extrapolate
-# into standing permission. The sanctioned path is
+# into standing permission. `human-hold` is the lone asymmetric label:
+# adding a hold is fail-safe, but removing one is human-only. The sanctioned path is
 # `scripts/request-label-removal.sh <PR#> <label>`, which posts a
 # templated ask + optional iMessage ping, after which the human clears
 # the label from any device.
@@ -128,8 +130,9 @@ except ValueError:
   # gh-pr-guard.sh's tokenization failure path. (CodeRabbit Major, #271.)
   echo "BLOCKED: label-removal-guard could not tokenize the gh command (malformed shell quoting)." >&2
   echo "  The command matched the 'gh pr edit' screen but cannot be parsed to verify it" >&2
-  echo "  does not remove a human-action label (needs-external-review / needs-human-review /" >&2
-  echo "  policy-violation). Fix the quoting and retry." >&2
+  echo "  does not modify a protected human-action label (needs-external-review /" >&2
+  echo "  needs-human-review / policy-violation) or remove human-hold. Fix the" >&2
+  echo "  quoting and retry." >&2
   exit 2
 fi
 
@@ -165,12 +168,14 @@ done
 [ "$saw_edit" -eq 1 ] || exit 0
 
 # Scan tokens AFTER `edit` for --remove-label or --add-label values.
-# Both forms are blocked: removing a label bypasses human gating;
-# adding one (e.g. spuriously re-applying policy-violation) is also a
-# human action.
+# For needs-external-review / needs-human-review / policy-violation,
+# both forms are blocked: removing a label bypasses human gating; adding
+# one spuriously creates a human-action state. `human-hold` is different:
+# agents may add it because adding a hold is fail-safe, but removal is
+# human-only.
 #
 # Two block triggers:
-#   1. Literal value matches the prohibited set.
+#   1. Literal value matches a prohibited set for that flag.
 #   2. Value undergoes shell expansion (contains $, backtick, or starts
 #      with $') — Codex P1 on PR #172. The hook receives the literal
 #      command string before bash expands variables, so a value like
@@ -180,10 +185,12 @@ done
 #      label. Block any expansion-bearing value with a message
 #      directing the agent to use a literal label name (so the hook
 #      can see what's being modified) or scripts/request-label-removal.sh.
-PROHIBITED_RE='^(needs-external-review|needs-human-review|policy-violation)$'
+ADD_REMOVE_BLOCKED_RE='^(needs-external-review|needs-human-review|policy-violation)$'
+REMOVE_ONLY_BLOCKED_RE='^(human-hold)$'
 EXPANSION_RE='[$`]'
 walk_start=$((edit_index + 1))
 SKIP_AS=""  # "" | "label-flag-value"
+SKIP_ACTION=""  # "" | "add" | "remove"
 
 # Codex r1 on PR #172 caught: gh accepts `--remove-label A,B` as a
 # comma-separated list, but the regex above only matches the entire
@@ -192,13 +199,18 @@ SKIP_AS=""  # "" | "label-flag-value"
 # but bash splits and removes both labels. Check each comma-split
 # segment instead of the whole value.
 check_label_value() {
+  local action="$1"
+  shift
   local raw="$1"
   if [[ "$raw" =~ $EXPANSION_RE ]]; then block_expansion "$raw"; fi
   local IFS=','
   for sub in $raw; do
-    sub="${sub# }"; sub="${sub% }"   # trim incidental whitespace
+    sub="$(printf '%s' "$sub" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     [[ -z "$sub" ]] && continue
-    if [[ "$sub" =~ $PROHIBITED_RE ]]; then block_prohibited "$sub"; fi
+    if [[ "$sub" =~ $ADD_REMOVE_BLOCKED_RE ]]; then block_prohibited "$sub"; fi
+    if [ "$action" = "remove" ] && [[ "$sub" =~ $REMOVE_ONLY_BLOCKED_RE ]]; then
+      block_remove_only "$sub"
+    fi
   done
 }
 
@@ -224,14 +236,31 @@ EOF
   exit 2
 }
 
+block_remove_only() {
+  local label="$1"
+  cat <<EOF >&2
+BLOCKED: agents must not remove the '$label' label on PRs.
+
+Per REVIEW_POLICY.md § Agent prohibitions, '$label' is a human-remove-only
+hard hold. Agents may add it to freeze a PR, but only the human may release it.
+
+When the PR is ready to release:
+  scripts/request-label-removal.sh <PR#> $label
+
+That helper posts a templated ask on the PR (and optionally iMessages
+the human). The human clears the label from any device.
+EOF
+  exit 2
+}
+
 block_expansion() {
   local val="$1"
   cat <<EOF >&2
 BLOCKED: --add-label / --remove-label value '$val' contains shell
 expansion (\$, backtick, or \$'…' quoting). The hook can't see what
 this expands to until bash runs the command — so it cannot verify the
-label isn't one of the prohibited set (needs-external-review,
-needs-human-review, policy-violation).
+label isn't one of the prohibited labels (needs-external-review,
+needs-human-review, policy-violation), or a human-hold removal.
 
 Use a literal label name so the guard can verify it, OR — if you
 intended to remove a prohibited label — run:
@@ -247,16 +276,27 @@ for j in "${!TOKENS[@]}"; do
   tok="${TOKENS[$j]}"
   if [ "$SKIP_AS" = "label-flag-value" ]; then
     SKIP_AS=""
-    check_label_value "$tok"
+    check_label_value "$SKIP_ACTION" "$tok"
+    SKIP_ACTION=""
     continue
   fi
   case "$tok" in
-    --remove-label|--add-label)
+    --remove-label)
       SKIP_AS="label-flag-value"
+      SKIP_ACTION="remove"
       continue
       ;;
-    --remove-label=*|--add-label=*)
-      check_label_value "${tok#*=}"
+    --add-label)
+      SKIP_AS="label-flag-value"
+      SKIP_ACTION="add"
+      continue
+      ;;
+    --remove-label=*)
+      check_label_value "remove" "${tok#*=}"
+      continue
+      ;;
+    --add-label=*)
+      check_label_value "add" "${tok#*=}"
       continue
       ;;
   esac

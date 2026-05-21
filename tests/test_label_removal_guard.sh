@@ -4,7 +4,7 @@
 # Unit tests for scripts/hooks/label-removal-guard.sh — the PreToolUse
 # hook that blocks `gh pr edit --remove-label / --add-label` for the
 # human-action labels (needs-external-review, needs-human-review,
-# policy-violation).
+# policy-violation) and the asymmetric human-hold label.
 #
 # Coverage focus is the consolidated `gh ... pr edit` detection plus
 # the `-R` / `--repo` interspersed-argument cases (#287). Earlier
@@ -90,6 +90,10 @@ assert_blocked "baseline: --remove-label policy-violation (bare)" \
   "gh pr edit 1 --remove-label policy-violation"
 assert_blocked "baseline: --add-label policy-violation (bare)" \
   "gh pr edit 1 --add-label policy-violation"
+assert_blocked "baseline: --remove-label human-hold (bare)" \
+  "gh pr edit 1 --remove-label human-hold"
+assert_allowed "baseline: --add-label human-hold (bare)" \
+  "gh pr edit 1 --add-label human-hold"
 
 # ─── -R / --repo interspersed BEFORE `pr edit` ──────────────────────
 # gh accepts a global -R/--repo before the subcommand. The simplified
@@ -117,6 +121,8 @@ assert_blocked "post-edit -R + --remove-label= form" \
   "gh pr edit 1 -R owner/repo --remove-label=needs-external-review"
 assert_blocked "pre-edit --repo + --remove-label= form" \
   "gh --repo owner/repo pr edit 1 --remove-label=policy-violation"
+assert_blocked "pre-edit --repo + --remove-label=human-hold form" \
+  "gh --repo owner/repo pr edit 1 --remove-label=human-hold"
 
 # ─── -R / --repo with comma-separated label list ────────────────────
 # Per the existing comma-split logic, each segment is checked. A
@@ -126,6 +132,14 @@ assert_blocked "comma-list with prohibited segment, -R after edit" \
   "gh pr edit 1 -R owner/repo --remove-label foo,needs-external-review,bar"
 assert_blocked "comma-list with prohibited segment, --repo before pr" \
   "gh --repo owner/repo pr edit 1 --remove-label foo,policy-violation"
+assert_blocked "comma-list with human-hold removal segment" \
+  "gh pr edit 1 --remove-label foo,human-hold,bar"
+padded_human_hold_remove=$'gh pr edit 1 --remove-label "foo,\t human-hold \t,bar"'
+assert_blocked "comma-list with whitespace-padded human-hold removal segment" \
+  "$padded_human_hold_remove"
+padded_policy_add=$'gh pr edit 1 --add-label "foo,\t policy-violation \t,bar"'
+assert_blocked "comma-list with whitespace-padded policy-violation add segment" \
+  "$padded_policy_add"
 
 # ─── Allow paths: -R / --repo present, non-prohibited label ─────────
 # The simplified pattern must not over-block — `gh pr edit` with a
@@ -139,6 +153,8 @@ assert_allowed "allow: --repo after edit, unrelated remove" \
   "gh pr edit 1 --repo owner/repo --remove-label some-unrelated-label"
 assert_allowed "allow: --add-label needs-foo (not in prohibited set)" \
   "gh pr edit 1 --add-label needs-foo"
+assert_allowed "allow: --add-label=human-hold (hard hold is agent-addable)" \
+  "gh pr edit 1 --add-label=human-hold"
 
 # ─── Allow paths: non-edit subcommands with -R / --repo ─────────────
 # `gh pr view`, `gh pr create` etc. must never be blocked by this

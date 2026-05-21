@@ -9,9 +9,9 @@
 #      push to main on a greenfield remote — the `gh-pr-guard.sh`
 #      "never push to main" hook does NOT apply because there's no
 #      `main` to protect yet.
-#   2. Seed the 10 canonical labels (needs-external-review,
-#      needs-human-review, policy-violation, human-action,
-#      agent-action, phase-0..4). Eliminates the first-PR
+#   2. Seed the 11 canonical labels (needs-external-review,
+#      needs-human-review, policy-violation, human-hold,
+#      human-action, agent-action, phase-0..4). Eliminates the first-PR
 #      "label not found" friction.
 #   3. Invite reviewer-identity collaborators (claude / cursor /
 #      codex per BOOTSTRAP_INPUT_REVIEWERS). Each invite is async;
@@ -54,6 +54,7 @@ BOOTSTRAP_LABELS=(
   "needs-external-review:bf0606:External review required before merge"
   "needs-human-review:7057ff:Awaiting human triage or decision"
   "policy-violation:b60205:Blocked by review-policy.yml violation"
+  "human-hold:000000:Hard merge freeze - human-remove-only; supersedes all gates"
   "human-action:0e8a16:Requires human attention"
   "agent-action:1d76db:Agent task — not blocked on human"
   "phase-0:c5def5:Phase 0: foundations"

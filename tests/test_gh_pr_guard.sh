@@ -4,8 +4,8 @@
 # Unit tests for scripts/hooks/gh-pr-guard.sh — covers the #241
 # identity-check on `gh pr create`, the #170/#171 mergeStateStatus
 # guard on `gh pr merge`, and a regression net for the existing
-# Authoring-Agent / Self-Review body checks + needs-external-review
-# label check so the newer checks are additive (don't break old
+# Authoring-Agent / Self-Review body checks + needs-external-review /
+# human-hold label checks so the newer checks are additive (don't break old
 # behavior).
 #
 # The hook reads tool_input.command from a JSON envelope on stdin
@@ -409,6 +409,23 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 15b: human-hold blocks even when all agent-side bypass variables are
+# present. This label is human-remove-only and supersedes CODEX_CLEARED,
+# BREAK_GLASS_ADMIN, and BREAK_GLASS_MERGE_STATE.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'CODEX_CLEARED=1 BREAK_GLASS_ADMIN=1 BREAK_GLASS_MERGE_STATE=1 gh pr merge 123 --admin --squash' "nathanjohnpayne" "0" "DIRTY" "human-hold" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "merge + human-hold + bypass envs: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -qi "human-hold"; then
+  fail "merge + human-hold: diagnostic missing label reference; output: $out"
+else
+  pass "merge + human-hold: hard hold blocks every agent-side bypass"
+fi
+
+# ---------------------------------------------------------------------------
 # Test 16: a label literally NAMED `team,needs-external-review` (commas
 # are legal in GitHub label names) must NOT false-match the real
 # `needs-external-review` gate. Regression net for the CSV-join
@@ -423,6 +440,18 @@ if [ "$rc" -eq 0 ]; then
   pass "label 'team,needs-external-review' does NOT false-match the needs-external-review gate"
 else
   fail "comma-in-label false-match: exit $rc, expected 0 (the label is not literally 'needs-external-review'); output: $out"
+fi
+
+# Same exact-match rule for human-hold: a comma in another label's
+# literal name must not trip the hard-hold gate.
+set +e
+out=$(run_hook 'gh pr merge 123 --squash' "nathanjohnpayne" "0" "CLEAN" "team,human-hold" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "label 'team,human-hold' does NOT false-match the human-hold gate"
+else
+  fail "comma-in-human-hold-label false-match: exit $rc, expected 0; output: $out"
 fi
 
 # ===========================================================================

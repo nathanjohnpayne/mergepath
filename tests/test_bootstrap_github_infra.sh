@@ -10,7 +10,7 @@
 #
 #   1. `gh repo create` is invoked with the right flags (visibility,
 #      description, source, --push).
-#   2. All 10 canonical labels are seeded with --force (idempotency).
+#   2. All 11 canonical labels are seeded with --force (idempotency).
 #   3. Reviewer invitations land via `gh api -X PUT` to the right
 #      collaborator endpoint for each agent in BOOTSTRAP_INPUT_REVIEWERS.
 #   4. REVIEWER_ASSIGNMENT_TOKEN provisioning uses the inline-PAT
@@ -181,8 +181,8 @@ grep -q "^gh repo create nathanjohnpayne/test-repo --private --description a tes
   && pass "gh repo create invoked with --private + --source + --push" \
   || fail "gh repo create flags wrong; log: $(grep '^gh repo create' "$SHIM_LOG")"
 
-# --- assertion 2: all 10 labels seeded with --force ---
-expected_labels=(needs-external-review needs-human-review policy-violation human-action agent-action phase-0 phase-1 phase-2 phase-3 phase-4)
+# --- assertion 2: all 11 labels seeded with --force ---
+expected_labels=(needs-external-review needs-human-review policy-violation human-hold human-action agent-action phase-0 phase-1 phase-2 phase-3 phase-4)
 seeded=0
 for label in "${expected_labels[@]}"; do
   if grep -qE "^gh label create $label .* --force\$" "$SHIM_LOG"; then
@@ -191,9 +191,9 @@ for label in "${expected_labels[@]}"; do
     fail "label '$label' not seeded with --force; log: $(grep "label create $label" "$SHIM_LOG")"
   fi
 done
-[ "$seeded" -eq 10 ] \
-  && pass "all 10 canonical labels seeded with --force" \
-  || fail "expected 10 labels, got $seeded"
+[ "$seeded" -eq 11 ] \
+  && pass "all 11 canonical labels seeded with --force" \
+  || fail "expected 11 labels, got $seeded"
 
 # --- assertion 3: reviewer collaborator invites ---
 for agent in claude cursor codex; do

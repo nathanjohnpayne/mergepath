@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # gh-pr-guard.sh — PreToolUse hook for Claude Code
 #
-# Gates four operations:
+# Gates five operations:
 #   1. gh pr create — blocks unless (a) the keyring's active gh
 #      account is the AUTHOR identity (nathanjohnpayne by default;
 #      override via GH_PR_GUARD_EXPECTED_AUTHOR), AND (b) the command
@@ -24,7 +24,11 @@
 #      blocks). Originated downstream (matchline #170/#171) and is
 #      unified into the canonical hook here so propagation no longer
 #      clobbers the feature — see the propagation-wave retro.
-#   4. gh pr merge (non-admin) — blocks when the target PR carries
+#   4. gh pr merge (any flavor) — blocks when the target PR carries
+#      `human-hold`, with no CODEX_CLEARED / BREAK_GLASS_* bypass.
+#      This is the human-controlled hard freeze: agents may add the
+#      label, but only the human releases it.
+#   5. gh pr merge (non-admin) — blocks when the target PR carries
 #      the `needs-external-review` label unless CODEX_CLEARED=1
 #      (agent must have just run scripts/codex-review-check.sh
 #      successfully). This enforces REVIEW_POLICY.md § Phase 4a
@@ -1125,6 +1129,17 @@ fi
 # gate further down — never re-join it into a delimited string.
 MERGE_STATE=$(printf '%s\n' "$GH_OUTPUT" | sed -n '1p')
 LABELS=$(printf '%s\n' "$GH_OUTPUT" | sed -n '2,$p')
+
+# `human-hold` is a human-controlled hard freeze. Check it before
+# mergeStateStatus, --admin, or needs-external-review handling so no
+# agent-side bypass variable can release the hold. The only release
+# path is the human removing the label.
+if printf '%s\n' "$LABELS" | grep -Fxq "human-hold"; then
+  echo "BLOCKED: PR carries 'human-hold'." >&2
+  echo "  This is a human-remove-only hard hold and supersedes all merge gates." >&2
+  echo "  Ask the human to remove the label before merging; no agent bypass is available." >&2
+  exit 2
+fi
 
 # mergeStateStatus check (#171 layer 2). API enum (full set per
 # GitHub GraphQL `MergeStateStatus`):

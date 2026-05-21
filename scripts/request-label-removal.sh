@@ -2,8 +2,9 @@
 # request-label-removal.sh — post a structured label-removal ask on a PR.
 #
 # Background: REVIEW_POLICY.md prohibits agents from removing the
-# `needs-external-review`, `needs-human-review`, and `policy-violation`
-# labels — even when authorized in chat. Label removal is a human action.
+# `needs-external-review`, `needs-human-review`, `policy-violation`, and
+# `human-hold` labels — even when authorized in chat. Label removal is a
+# human action.
 # This helper turns the prohibition into a one-command ask: the agent
 # posts a templated PR comment and (optionally) pings the human via
 # iMessage so they can clear the label without opening a chat window.
@@ -16,8 +17,8 @@
 # (#197 — catches the 👍-after-last-push case). Use this script for
 # `needs-external-review` only when neither the event-driven path
 # nor the sweep has fired in a reasonable window — typically rare.
-# For `needs-human-review` and `policy-violation`, this script is
-# the only path; both remain manual-only by design.
+# For `needs-human-review`, `policy-violation`, and `human-hold`, this
+# script is the only path; all three remain manual-only by design.
 #
 # Usage:
 #   scripts/request-label-removal.sh <PR#> <label>
@@ -32,6 +33,8 @@
 #   scripts/request-label-removal.sh 182 needs-external-review
 #   scripts/request-label-removal.sh 182 needs-human-review \
 #     --reason "Codex cleared r3; CI green; only blocker is this label"
+#   scripts/request-label-removal.sh 182 human-hold \
+#     --reason "Morning 4b review approved the current HEAD"
 #   MERGEPATH_NOTIFY_IMESSAGE_TO="+15551234567" \
 #     scripts/request-label-removal.sh 182 needs-external-review
 #
@@ -54,7 +57,7 @@ if [ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ] && [ -r "$__REQUEST_LABEL_DIR/lib/pre
   auto_source_preflight
 fi
 
-ALLOWED_LABELS=(needs-external-review needs-human-review policy-violation)
+ALLOWED_LABELS=(needs-external-review needs-human-review policy-violation human-hold)
 
 # Escape a string for embedding inside an AppleScript double-quoted
 # literal. See the inline call site below for the full rationale on
@@ -82,7 +85,7 @@ usage() {
   cat <<'EOF' >&2
 Usage: scripts/request-label-removal.sh <PR#> <label> [--reason <text>] [--repo owner/name]
 
-Allowed labels: needs-external-review | needs-human-review | policy-violation
+Allowed labels: needs-external-review | needs-human-review | policy-violation | human-hold
 
 Posts a templated PR comment asking the human to remove the label.
 Sends an iMessage to MERGEPATH_NOTIFY_IMESSAGE_TO if set.
@@ -119,7 +122,7 @@ for ok in "${ALLOWED_LABELS[@]}"; do
   if [ "$LABEL" = "$ok" ]; then allowed=1; break; fi
 done
 if [ "$allowed" -ne 1 ]; then
-  echo "Refusing: '$LABEL' is not a human-action label." >&2
+  echo "Refusing: '$LABEL' is not a protected human-action label." >&2
   echo "Allowed: ${ALLOWED_LABELS[*]}" >&2
   echo "If this label is genuinely a no-op blocker, just remove it directly." >&2
   exit 1
@@ -184,7 +187,7 @@ Per [REVIEW_POLICY.md § Agent prohibitions](https://github.com/nathanjohnpayne/
 - GitHub UI: Labels sidebar → click \`x\` on \`$LABEL\`
 - CLI: \`gh pr edit $PR_NUM --remove-label $LABEL${REPO_HINT_FOR_BODY}\`
 
-Auto-merge will fire as soon as the label is gone.${REASON_BLOCK}${AUTOCLEAR_NOTE}
+The PR can proceed as soon as the label is gone and the normal merge gates are green.${REASON_BLOCK}${AUTOCLEAR_NOTE}
 
 — posted by \`scripts/request-label-removal.sh\`"
 

@@ -9,8 +9,8 @@ name: Auto-clear blocking labels
 # `gh pr edit <N> --remove-label needs-external-review` after agents
 # have done all the actual review work.
 #
-# Scope: ONLY removes `needs-external-review`. `needs-human-review`
-# and `policy-violation` remain manual-only by design (see
+# Scope: ONLY removes `needs-external-review`. `needs-human-review`,
+# `policy-violation`, and `human-hold` remain manual-only by design (see
 # REVIEW_POLICY.md § Agent prohibitions). The doctrine carve-out for
 # this workflow ships in #196.
 

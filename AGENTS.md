@@ -21,6 +21,7 @@ This repository uses a multi-identity AI agent code review system. The full poli
 - Each agent reviews code under its own reviewer identity (e.g., nathanpayne-claude, nathanpayne-cursor, nathanpayne-codex).
 - An agent never reviews code under the same identity that authored it.
 - Only nathanjohnpayne merges to the target branch.
+- Agents may add `human-hold` to freeze a PR, but must never remove it. The label is human-remove-only and supersedes all merge paths.
 
 ### Workflow Summary
 

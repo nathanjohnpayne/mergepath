@@ -436,7 +436,8 @@ jobs:
       github.event_name == 'pull_request_review' &&
       github.event.review.state == 'approved' &&
       !contains(github.event.pull_request.labels.*.name, 'needs-external-review') &&
-      !contains(github.event.pull_request.labels.*.name, 'needs-human-review')
+      !contains(github.event.pull_request.labels.*.name, 'needs-human-review') &&
+      !contains(github.event.pull_request.labels.*.name, 'human-hold')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -553,14 +554,14 @@ jobs:
           # present. Also check `policy-violation`, which is applied by the
           # block-self-approval job earlier in this same workflow run (and
           # again, the `if:` at job start wouldn't have seen it).
-          LABELS=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '[.labels[].name] | join(",")')
-          echo "Labels at merge time: [$LABELS]"
-          case ",$LABELS," in
-            *,needs-external-review,*|*,needs-human-review,*|*,policy-violation,*)
-              echo "::error::Blocking label present at merge time: $LABELS. Aborting auto-merge."
+          LABELS=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name')
+          printf 'Labels at merge time:\n%s\n' "$LABELS"
+          for blocking_label in needs-external-review needs-human-review policy-violation human-hold; do
+            if printf '%s\n' "$LABELS" | grep -Fxq "$blocking_label"; then
+              echo "::error::Blocking label present at merge time: $blocking_label. Aborting auto-merge."
               exit 1
-              ;;
-          esac
+            fi
+          done
           echo "No blocking labels present — proceeding to merge."
 
       - name: Enable auto-merge

@@ -3,7 +3,8 @@
 # the canonical required status checks shipped by mergepath.
 #
 # Background: pr-review-policy.yml's `Label Gate` job FAILS when a blocking
-# label (`needs-human-review`, `policy-violation`, `needs-external-review`)
+# label (`needs-human-review`, `policy-violation`, `needs-external-review`,
+# `human-hold`)
 # is on the PR. But that failure only blocks merge if the workflow is
 # configured as a REQUIRED status check in branch protection. Without the
 # protection bit, the failed check is advisory and PRs merge anyway. This
@@ -346,7 +347,8 @@ echo ""
 echo "Without these as required, the corresponding workflows fire on PRs but"
 echo "their failures are advisory — PRs merge despite the failed check."
 echo "Specifically: 'Label Gate' enforces the prohibition on merging while"
-echo "'needs-human-review' / 'policy-violation' / 'needs-external-review' is"
+echo "'needs-human-review' / 'policy-violation' / 'needs-external-review' /"
+echo "'human-hold' is"
 echo "present (see nathanjohnpayne/mergepath#161)."
 echo ""
 echo "Fix: Settings → Branches → Branch protection rule for '$BRANCH'"

@@ -1,7 +1,7 @@
 name: Weekly PR Audit
 
 # Cron-driven retroactive check that the previous week's merged PRs
-# satisfied the review policy. Five checks per merged PR:
+# satisfied the review policy. Six checks per merged PR:
 #
 #   1. Self-Review section present in PR body (Dependabot exempted)
 #   2. external-review-labeled PRs have either an APPROVED CLI
@@ -10,6 +10,7 @@ name: Weekly PR Audit
 #   3. No bot self-approval (reviewer identity approving its own PR)
 #   4. needs-human-review label not still present at merge time
 #   5. policy-violation label not still present at merge time
+#   6. human-hold label not still present at merge time
 #
 # Violations are aggregated into a single audit issue per run.
 # See REVIEW_POLICY.md, .github/review-policy.yml, and #36 for
@@ -115,6 +116,36 @@ jobs:
 
             const violations = [];
 
+            async function labelWasPresentAtMerge(pr, labelName) {
+              const events = await github.paginate(
+                github.rest.issues.listEvents,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  per_page: 100,
+                }
+              );
+              const mergedAt = new Date(pr.merged_at).getTime();
+              let present = false;
+              for (const event of events.sort(
+                (a, b) => new Date(a.created_at) - new Date(b.created_at)
+              )) {
+                if (new Date(event.created_at).getTime() > mergedAt) {
+                  continue;
+                }
+                if (!event.label || event.label.name !== labelName) {
+                  continue;
+                }
+                if (event.event === 'labeled') {
+                  present = true;
+                } else if (event.event === 'unlabeled') {
+                  present = false;
+                }
+              }
+              return present;
+            }
+
             for (const pr of mergedPRs) {
               const prViolations = [];
               const isDependabot = pr.user.login === 'dependabot[bot]';
@@ -152,9 +183,10 @@ jobs:
               // Skip for Dependabot PRs. Dependabot doesn't author a
               // body with the Self-Review template, and the
               // pre-merge gate in pr-review-policy.yml already
-              // skips Dependabot via `if: github.actor != 'dependabot[bot]'`
-              // (line 14). The audit was previously flagging every
-              // Dependabot PR as a false positive — see #20.
+              // skips Dependabot via the pull request author login
+              // (not github.actor, which can drift on reruns). The
+              // audit was previously flagging every Dependabot PR as
+              // a false positive — see #20.
               if (!isDependabot) {
                 if (!pr.body || !pr.body.match(/^## Self-Review/m)) {
                   prViolations.push('Missing `## Self-Review` section');
@@ -439,8 +471,9 @@ jobs:
               // resolves escalation by removing the label (which unblocks the
               // label-gate check). If the label is still present at merge time,
               // it means the label gate was bypassed.
-              const hadHumanLabel = pr.labels.some(
-                l => l.name === 'needs-human-review'
+              const hadHumanLabel = await labelWasPresentAtMerge(
+                pr,
+                'needs-human-review'
               );
 
               if (hadHumanLabel) {
@@ -450,13 +483,26 @@ jobs:
               }
 
               // Check 5: Had policy-violation label — should not have been merged
-              const hadPolicyViolation = pr.labels.some(
-                l => l.name === 'policy-violation'
+              const hadPolicyViolation = await labelWasPresentAtMerge(
+                pr,
+                'policy-violation'
               );
 
               if (hadPolicyViolation) {
                 prViolations.push(
                   'Merged with `policy-violation` label still present'
+                );
+              }
+
+              // Check 6: Had human-hold label — should not have been merged.
+              const hadHumanHold = await labelWasPresentAtMerge(
+                pr,
+                'human-hold'
+              );
+
+              if (hadHumanHold) {
+                prViolations.push(
+                  'Merged with `human-hold` label still present — human hard hold was bypassed'
                 );
               }
 
