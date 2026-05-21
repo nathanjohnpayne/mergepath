@@ -71,6 +71,12 @@
 #                             "# preflight: cache hit, no biometric
 #                             burned" message replaces it. Refresh
 #                             notices and warnings are unaffected. #282
+#   OP_SERVICE_ACCOUNT_TOKEN  Explicit CI/headless lane. When set,
+#                             review mode reads ONLY the scoped reviewer
+#                             PAT through the 1Password CLI service-
+#                             account auth path. Author PAT, deploy
+#                             secrets, SSH warming, and gh keyring
+#                             repair stay out of scope.
 #
 # Session file:
 #   Path:        $cache_dir/op-preflight-<agent>.env
@@ -217,6 +223,11 @@ if ! [[ "$TTL_SECONDS" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+SERVICE_ACCOUNT_TOKEN_MODE=false
+if [[ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]]; then
+  SERVICE_ACCOUNT_TOKEN_MODE=true
+fi
+
 # ── Cache paths (deterministic per agent) ─────────────────────────────
 SESSION_FILE="$CACHE_DIR/op-preflight-$AGENT.env"
 ADC_TMPFILE="$CACHE_DIR/op-preflight-$AGENT-adc.json"
@@ -237,8 +248,9 @@ if [[ ! "$SSH_WARM_TTL_SECONDS" =~ ^[0-9]+$ ]]; then
 fi
 
 # ── Biometric trigger log (#282) ──────────────────────────────────────
-# Append a one-line record every time we trigger a fresh op fetch (i.e.
-# every time `op inject` or `op read` is invoked for cache population).
+# Append a one-line record every time the interactive lane triggers a
+# fresh op fetch (i.e. every time `op inject` or deploy `op read` is
+# invoked for cache population).
 # Format: `<ISO8601> agent=<agent> mode=<mode> reason=<reason>` so a
 # session audit can correlate biometric prompts against agent behavior.
 # Always-on (independent of OP_PREFLIGHT_QUIET) — the file is local-only
@@ -262,6 +274,11 @@ if $PURGE; then
   rm -f "$SESSION_FILE" "$ADC_TMPFILE" "$SSH_WARM_MARKER"
   echo "# Purged session file + ADC tempfile + SSH-warm marker for agent=$AGENT" >&2
   exit 0
+fi
+
+if $SERVICE_ACCOUNT_TOKEN_MODE && [[ "$MODE" != "review" ]]; then
+  echo "Error: OP_SERVICE_ACCOUNT_TOKEN mode is scoped to reviewer PAT reads only; mode '$MODE' is out of scope." >&2
+  exit 2
 fi
 
 # ── Dry run ───────────────────────────────────────────────────────────
@@ -292,9 +309,16 @@ if $DRY_RUN; then
   fi
   echo "#" >&2
   if [[ "$MODE" == "review" || "$MODE" == "all" ]]; then
-    echo "# Would read: reviewer PAT ($(reviewer_pat_item_for "$AGENT"))" >&2
-    echo "# Would read: author PAT ($AUTHOR_PAT_ITEM)" >&2
-    if ! $SKIP_SSH; then
+    if $SERVICE_ACCOUNT_TOKEN_MODE; then
+      echo "# Would read: reviewer PAT ($(reviewer_pat_item_for "$AGENT")) via OP_SERVICE_ACCOUNT_TOKEN" >&2
+      echo "# Would skip: author PAT (out of token-mode scope)" >&2
+      echo "# Would skip: SSH warming (out of token-mode scope)" >&2
+      echo "# Would skip: gh keyring repair (out of token-mode scope)" >&2
+    else
+      echo "# Would read: reviewer PAT ($(reviewer_pat_item_for "$AGENT"))" >&2
+      echo "# Would read: author PAT ($AUTHOR_PAT_ITEM)" >&2
+    fi
+    if ! $SKIP_SSH && ! $SERVICE_ACCOUNT_TOKEN_MODE; then
       echo "# Would warm SSH: $SSH_AUTHOR_HOST (author key)" >&2
       echo "# Would warm SSH: $(ssh_host_for "$AGENT") (reviewer key)" >&2
     fi
@@ -322,6 +346,11 @@ session_is_fresh() {
   now=$(date +%s)
   age=$((now - created_at))
   [[ "$age" -lt "$TTL_SECONDS" ]]
+}
+
+session_is_token_mode() {
+  [[ -f "$SESSION_FILE" ]] || return 1
+  grep -q '^OP_PREFLIGHT_TOKEN_MODE=1$' "$SESSION_FILE" 2>/dev/null
 }
 
 # Validate that a materialized ADC file still mints a token. Mirrors the
@@ -516,6 +545,7 @@ emit_from_session_file() (
   unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
   unset CF_API_TOKEN
   unset OP_PREFLIGHT_DONE OP_PREFLIGHT_AGENT OP_PREFLIGHT_MODE
+  unset OP_PREFLIGHT_TOKEN_MODE
   unset OP_PREFLIGHT_CREATED_AT_EPOCH OP_PREFLIGHT_TTL_SECONDS
 
   # Source the session file and re-emit only the vars we own, so a
@@ -536,8 +566,17 @@ emit_from_session_file() (
   # unauthenticated. Return non-zero to trigger the refresh path in
   # each case. See #141 round-1 Codex finding (P1, line 223).
   if [[ "$MODE" == "review" || "$MODE" == "all" ]]; then
-    if [[ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]] || [[ -z "${OP_PREFLIGHT_AUTHOR_PAT:-}" ]]; then
+    if $SERVICE_ACCOUNT_TOKEN_MODE && [[ "${OP_PREFLIGHT_TOKEN_MODE:-0}" != "1" ]]; then
       exit 2
+    fi
+    if [[ "${OP_PREFLIGHT_TOKEN_MODE:-0}" == "1" ]]; then
+      if [[ "$MODE" == "all" ]] || [[ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]]; then
+        exit 2
+      fi
+    else
+      if [[ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]] || [[ -z "${OP_PREFLIGHT_AUTHOR_PAT:-}" ]]; then
+        exit 2
+      fi
     fi
   fi
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
@@ -584,6 +623,8 @@ emit_from_session_file() (
     printf 'export OP_PREFLIGHT_REVIEWER_PAT=%q\n' "$OP_PREFLIGHT_REVIEWER_PAT"
   [[ -n "${OP_PREFLIGHT_AUTHOR_PAT:-}" ]] && \
     printf 'export OP_PREFLIGHT_AUTHOR_PAT=%q\n' "$OP_PREFLIGHT_AUTHOR_PAT"
+  [[ "${OP_PREFLIGHT_TOKEN_MODE:-0}" == "1" ]] && \
+    printf 'export OP_PREFLIGHT_TOKEN_MODE=1\n'
   [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] && \
     printf 'export GOOGLE_APPLICATION_CREDENTIALS=%q\n' "$GOOGLE_APPLICATION_CREDENTIALS"
   [[ -n "${OP_PREFLIGHT_ADC_TMPFILE:-}" ]] && \
@@ -734,12 +775,19 @@ if ! $REFRESH && session_is_fresh; then
     else
       age=$now
     fi
+    CACHE_TOKEN_MODE=false
+    if session_is_token_mode; then
+      CACHE_TOKEN_MODE=true
+    fi
     # Warm SSH keys on the cache-hit path too. The cached PATs are
     # worthless for git push/pull if SSH auth isn't also primed, and
     # the prior implementation skipped this step entirely on cache
     # hit — a repro surfaced on the consumer-repo propagation PRs.
     SUMMARY=()
-    if [[ "$MODE" == "review" || "$MODE" == "all" ]] && ! $SKIP_SSH; then
+    if $CACHE_TOKEN_MODE; then
+      SUMMARY+=("Service-account token cache: reviewer PAT only; SSH/keyring skipped")
+    fi
+    if [[ "$MODE" == "review" || "$MODE" == "all" ]] && ! $SKIP_SSH && ! $CACHE_TOKEN_MODE; then
       warm_ssh_keys
     fi
     if [[ "${OP_PREFLIGHT_QUIET:-0}" == "1" ]]; then
@@ -748,7 +796,9 @@ if ! $REFRESH && session_is_fresh; then
       # Refresh notices and warnings remain unaffected; only this
       # routine cache-hit block collapses.
       echo "# preflight: cache hit, no biometric burned" >&2
-      warn_active_account_mismatch
+      if ! $CACHE_TOKEN_MODE; then
+        warn_active_account_mismatch
+      fi
     else
       echo "" >&2
       echo "# ── Preflight cached hit (age ${age}s / TTL ${TTL_SECONDS}s) ──" >&2
@@ -757,7 +807,9 @@ if ! $REFRESH && session_is_fresh; then
         echo "#   $line" >&2
       done
       echo "# Run with --refresh to force a new biometric fetch." >&2
-      warn_active_account_mismatch
+      if ! $CACHE_TOKEN_MODE; then
+        warn_active_account_mismatch
+      fi
       echo "# ──────────────────────────────────────────────────────────" >&2
     fi
     exit 0
@@ -801,40 +853,54 @@ SUMMARY=()
 if [[ "$MODE" == "review" || "$MODE" == "all" ]]; then
   reviewer_item="$(reviewer_pat_item_for "$AGENT")"
 
-  # Build an op inject template for both PATs. op inject resolves all
-  # op:// references in a single process — one biometric prompt covers
-  # both reads.
-  tpl_file="$(mktemp "${TMPDIR:-/tmp}/op-preflight-tpl-XXXXXX")"
-  trap 'rm -f "$tpl_file"' EXIT
+  if $SERVICE_ACCOUNT_TOKEN_MODE; then
+    echo "# Preflight: reading reviewer PAT via OP_SERVICE_ACCOUNT_TOKEN..." >&2
+    if ! reviewer_pat="$(op read "op://Private/${reviewer_item}/token" 2>/dev/null)" || [[ -z "$reviewer_pat" ]]; then
+      echo "Error: failed to read reviewer PAT for $AGENT via OP_SERVICE_ACCOUNT_TOKEN." >&2
+      exit 1
+    fi
+    EXPORTS+=("export OP_PREFLIGHT_REVIEWER_PAT=$(printf '%q' "$reviewer_pat")")
+    EXPORTS+=("export OP_PREFLIGHT_TOKEN_MODE=1")
+    SESSION_LINES+=("OP_PREFLIGHT_TOKEN_MODE=1")
+    SESSION_LINES+=("OP_PREFLIGHT_REVIEWER_PAT=$(printf '%q' "$reviewer_pat")")
+    SUMMARY+=("Reviewer PAT ($AGENT): loaded via service account token")
+    SUMMARY+=("Author PAT: skipped (service account token mode)")
+  else
+    # Build an op inject template for both PATs. op inject resolves all
+    # op:// references in a single process — one biometric prompt covers
+    # both reads.
+    tpl_file="$(mktemp "${TMPDIR:-/tmp}/op-preflight-tpl-XXXXXX")"
+    trap 'rm -f "$tpl_file"' EXIT
 
-  cat > "$tpl_file" <<TPL
+    cat > "$tpl_file" <<TPL
 REVIEWER_PAT={{ op://Private/${reviewer_item}/token }}
 AUTHOR_PAT={{ op://Private/${AUTHOR_PAT_ITEM}/token }}
 TPL
 
-  echo "# Preflight: reading PATs (one biometric prompt)..." >&2
-  log_biometric_trigger "$BIOMETRIC_REASON"
-  resolved="$(op inject -i "$tpl_file")"
-  rm -f "$tpl_file"
+    echo "# Preflight: reading PATs (one biometric prompt)..." >&2
+    log_biometric_trigger "$BIOMETRIC_REASON"
+    resolved="$(op inject -i "$tpl_file")"
+    rm -f "$tpl_file"
 
-  reviewer_pat="$(echo "$resolved" | grep '^REVIEWER_PAT=' | cut -d= -f2-)"
-  author_pat="$(echo "$resolved" | grep '^AUTHOR_PAT=' | cut -d= -f2-)"
+    reviewer_pat="$(echo "$resolved" | grep '^REVIEWER_PAT=' | cut -d= -f2-)"
+    author_pat="$(echo "$resolved" | grep '^AUTHOR_PAT=' | cut -d= -f2-)"
 
-  if [[ -z "$reviewer_pat" ]]; then
-    echo "Error: failed to read reviewer PAT for $AGENT." >&2
-    exit 1
+    if [[ -z "$reviewer_pat" ]]; then
+      echo "Error: failed to read reviewer PAT for $AGENT." >&2
+      exit 1
+    fi
+    if [[ -z "$author_pat" ]]; then
+      echo "Error: failed to read author PAT." >&2
+      exit 1
+    fi
+
+    EXPORTS+=("export OP_PREFLIGHT_REVIEWER_PAT=$(printf '%q' "$reviewer_pat")")
+    EXPORTS+=("export OP_PREFLIGHT_AUTHOR_PAT=$(printf '%q' "$author_pat")")
+    SESSION_LINES+=("OP_PREFLIGHT_REVIEWER_PAT=$(printf '%q' "$reviewer_pat")")
+    SESSION_LINES+=("OP_PREFLIGHT_AUTHOR_PAT=$(printf '%q' "$author_pat")")
+    SUMMARY+=("Reviewer PAT ($AGENT): loaded")
+    SUMMARY+=("Author PAT: loaded")
   fi
-  if [[ -z "$author_pat" ]]; then
-    echo "Error: failed to read author PAT." >&2
-    exit 1
-  fi
-
-  EXPORTS+=("export OP_PREFLIGHT_REVIEWER_PAT=$(printf '%q' "$reviewer_pat")")
-  EXPORTS+=("export OP_PREFLIGHT_AUTHOR_PAT=$(printf '%q' "$author_pat")")
-  SESSION_LINES+=("OP_PREFLIGHT_REVIEWER_PAT=$(printf '%q' "$reviewer_pat")")
-  SESSION_LINES+=("OP_PREFLIGHT_AUTHOR_PAT=$(printf '%q' "$author_pat")")
-  SUMMARY+=("Reviewer PAT ($AGENT): loaded")
-  SUMMARY+=("Author PAT: loaded")
 fi
 
 if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
@@ -886,8 +952,10 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
 fi
 
 # ── Phase 2: SSH key warming ──────────────────────────────────────────
-if [[ "$MODE" == "review" || "$MODE" == "all" ]] && ! $SKIP_SSH; then
+if [[ "$MODE" == "review" || "$MODE" == "all" ]] && ! $SKIP_SSH && ! $SERVICE_ACCOUNT_TOKEN_MODE; then
   warm_ssh_keys
+elif $SERVICE_ACCOUNT_TOKEN_MODE; then
+  SUMMARY+=("SSH/keyring: skipped (service account token mode)")
 fi
 
 # ── Persist session file ──────────────────────────────────────────────
@@ -926,6 +994,8 @@ for line in "${SUMMARY[@]}"; do
 done
 echo "# Session file: $SESSION_FILE (TTL ${TTL_SECONDS}s)" >&2
 echo "# OP_PREFLIGHT_DONE=1" >&2
-warn_active_account_mismatch
+if ! $SERVICE_ACCOUNT_TOKEN_MODE; then
+  warn_active_account_mismatch
+fi
 echo "# Human can step away." >&2
 echo "# ──────────────────────────────────────────────────────" >&2
