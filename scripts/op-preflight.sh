@@ -354,20 +354,21 @@ session_is_token_mode() {
 }
 
 scrub_op_error() {
-  local file="${1:-}" raw token
+  local file="${1:-}" raw token redacted
   [[ -n "$file" && -f "$file" ]] || return 0
-  raw="$(tr '\n' ' ' < "$file" | cut -c1-500 || true)"
+  raw="$(tr '\n' ' ' < "$file" || true)"
   token="${OP_SERVICE_ACCOUNT_TOKEN:-}"
   if [[ -n "$raw" && -n "$token" ]]; then
-    awk -v s="$raw" -v token="$token" 'BEGIN {
+    redacted="$(awk -v s="$raw" -v token="$token" 'BEGIN {
       while ((i = index(s, token)) > 0) {
         s = substr(s, 1, i - 1) "[redacted]" substr(s, i + length(token))
       }
       print s
-    }'
+    }')"
   else
-    printf '%s\n' "$raw"
+    redacted="$raw"
   fi
+  printf '%s\n' "${redacted:0:500}"
 }
 
 # Validate that a materialized ADC file still mints a token. Mirrors the

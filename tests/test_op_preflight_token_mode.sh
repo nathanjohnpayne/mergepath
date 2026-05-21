@@ -48,6 +48,11 @@ case "\${1:-}" in
       echo "FATAL: OP_SERVICE_ACCOUNT_TOKEN missing" >&2
       exit 65
     fi
+    if [[ "\${OP_STUB_FAIL_READ:-0}" == "long" ]]; then
+      long_prefix="\$(printf '%0495d' 0 | tr '0' A)"
+      echo "\${long_prefix}\${OP_SERVICE_ACCOUNT_TOKEN}" >&2
+      exit 72
+    fi
     if [[ "\${OP_STUB_FAIL_READ:-0}" == "1" ]]; then
       echo "expired service token: \${OP_SERVICE_ACCOUNT_TOKEN}" >&2
       exit 71
@@ -418,6 +423,22 @@ test_token_mode_op_error_scrubbed() {
     fail "test_token_mode_op_error_scrubbed: service account token leaked in diagnostics"
     return
   fi
+
+  reset_logs
+  rc=0
+  PATH="$STUB_DIR:$PATH" \
+    OP_PREFLIGHT_CACHE_DIR="$WORKDIR/op-long-error-cache" \
+    OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_STUB_FAIL_READ=long \
+    "$SCRIPT" --agent codex --mode review >"$WORKDIR/op-long-error.out" 2>"$WORKDIR/op-long-error.err" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    fail "test_token_mode_op_error_scrubbed: long failed op read unexpectedly succeeded"
+    return
+  fi
+  if grep -q "${SERVICE_TOKEN:0:5}" "$WORKDIR/op-long-error.err" "$WORKDIR/op-long-error.out"; then
+    fail "test_token_mode_op_error_scrubbed: token fragment leaked after truncation"
+    return
+  fi
   pass "test_token_mode_op_error_scrubbed: failed op read reports scrubbed diagnostic"
 }
 
@@ -480,6 +501,7 @@ test_token_mode_helper_scope() {
     OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
     "$SCRIPT" --agent codex --mode review >"$WORKDIR/helper-fill.out" 2>"$WORKDIR/helper-fill.err"
 
+  local rc=0
   (
     export OP_PREFLIGHT_CACHE_DIR="$cache_dir"
     export MERGEPATH_AGENT=codex
@@ -499,8 +521,7 @@ test_token_mode_helper_scope() {
       echo "author scope unexpectedly loaded from token-mode cache" >&2
       exit 1
     fi
-  ) >"$WORKDIR/helper-scope.out" 2>"$WORKDIR/helper-scope.err"
-  local rc=$?
+  ) >"$WORKDIR/helper-scope.out" 2>"$WORKDIR/helper-scope.err" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     fail "test_token_mode_helper_scope: rc=$rc stderr=$(cat "$WORKDIR/helper-scope.err")"
     return
