@@ -43,7 +43,11 @@ descriptive model when advising repos:
   `.github/workflows/onepassword-headless-proof.yml` reads a dedicated
   canary via `OP_SERVICE_ACCOUNT_TOKEN`, compares a SHA-256 digest
   without printing the value, and exercises `scripts/op-preflight.sh`
-  token mode in a throwaway cache. Dispatch it after provisioning or
+  token mode against an explicit `OP_PREFLIGHT_REVIEWER_PAT_REF` in a
+  service-account-accessible proof vault. The setup helper also
+  requires a shared-vault negative-scope sentinel
+  (`OP_PREFLIGHT_NEGATIVE_SCOPE_REF` / `--negative-scope-ref`) unless
+  that check is explicitly skipped. Dispatch it after provisioning or
   rotating the service-account token.
 - Existing Mergepath scripts: shelling out to `op read`, `op run`, or
   `op inject` remains acceptable. Do not introduce a language-SDK

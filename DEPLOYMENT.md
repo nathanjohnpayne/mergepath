@@ -781,13 +781,27 @@ without exposing raw values in logs. Before dispatching it, configure:
 - `OP_SERVICE_ACCOUNT_TOKEN` as an encrypted GitHub Actions secret.
   Scope the service account to the approved reviewer PAT items and
   the dedicated canary item only.
+- `OP_PREFLIGHT_REVIEWER_PAT_REF` as a GitHub Actions variable
+  containing the `op://` reference for the reviewer PAT field in the
+  service-account-accessible proof vault. Do not point token mode at a
+  built-in `Private`/`Personal` vault; 1Password service accounts
+  cannot access those vaults.
 - `OP_PREFLIGHT_CANARY_REF` as a GitHub Actions variable containing a
   non-sensitive `op://` reference to the proof canary field.
 - `OP_PREFLIGHT_CANARY_SHA256` as an encrypted GitHub Actions secret
   containing the SHA-256 digest of the canary value.
 
+When using `scripts/onepassword-headless-proof-setup.sh`, also pass
+`OP_PREFLIGHT_NEGATIVE_SCOPE_REF` or `--negative-scope-ref` pointing to
+an `op://` sentinel in a shared vault outside the service account's
+approved scope. Do not use `Private`/`Personal` for this sentinel; the
+point is to detect accidental access to another service-account-capable
+vault. The setup helper first confirms the local 1Password account can
+read the sentinel, then confirms the service account cannot.
+
 The workflow installs the 1Password CLI, reads the canary, compares
-only its digest, then runs:
+only its digest, verifies the reviewer PAT resolves to
+`nathanpayne-codex`, then runs:
 
 ```bash
 eval "$(scripts/op-preflight.sh --agent codex --mode review)"
