@@ -353,6 +353,23 @@ session_is_token_mode() {
   grep -q '^OP_PREFLIGHT_TOKEN_MODE=1$' "$SESSION_FILE" 2>/dev/null
 }
 
+scrub_op_error() {
+  local file="${1:-}" raw token
+  [[ -n "$file" && -f "$file" ]] || return 0
+  raw="$(tr '\n' ' ' < "$file" | cut -c1-500 || true)"
+  token="${OP_SERVICE_ACCOUNT_TOKEN:-}"
+  if [[ -n "$raw" && -n "$token" ]]; then
+    awk -v s="$raw" -v token="$token" 'BEGIN {
+      while ((i = index(s, token)) > 0) {
+        s = substr(s, 1, i - 1) "[redacted]" substr(s, i + length(token))
+      }
+      print s
+    }'
+  else
+    printf '%s\n' "$raw"
+  fi
+}
+
 # Validate that a materialized ADC file still mints a token. Mirrors the
 # source_cred_is_usable check in scripts/firebase/op-firebase-deploy so a
 # stale 1Password ADC item (refresh_token expired by Google) gets caught
@@ -567,6 +584,9 @@ emit_from_session_file() (
   # each case. See #141 round-1 Codex finding (P1, line 223).
   if [[ "$MODE" == "review" || "$MODE" == "all" ]]; then
     if $SERVICE_ACCOUNT_TOKEN_MODE && [[ "${OP_PREFLIGHT_TOKEN_MODE:-0}" != "1" ]]; then
+      exit 2
+    fi
+    if ! $SERVICE_ACCOUNT_TOKEN_MODE && [[ "${OP_PREFLIGHT_TOKEN_MODE:-0}" == "1" ]]; then
       exit 2
     fi
     if [[ "${OP_PREFLIGHT_TOKEN_MODE:-0}" == "1" ]]; then
@@ -855,10 +875,24 @@ if [[ "$MODE" == "review" || "$MODE" == "all" ]]; then
 
   if $SERVICE_ACCOUNT_TOKEN_MODE; then
     echo "# Preflight: reading reviewer PAT via OP_SERVICE_ACCOUNT_TOKEN..." >&2
-    if ! reviewer_pat="$(op read "op://Private/${reviewer_item}/token" 2>/dev/null)" || [[ -z "$reviewer_pat" ]]; then
+    op_err_file="$(mktemp "${TMPDIR:-/tmp}/op-preflight-read-err-XXXXXX")"
+    reviewer_pat=""
+    op_read_rc=0
+    if reviewer_pat="$(op read "op://Private/${reviewer_item}/token" 2>"$op_err_file")"; then
+      op_read_rc=0
+    else
+      op_read_rc=$?
+    fi
+    if [[ "$op_read_rc" -ne 0 || -z "$reviewer_pat" ]]; then
+      op_error="$(scrub_op_error "$op_err_file")"
+      rm -f "$op_err_file"
       echo "Error: failed to read reviewer PAT for $AGENT via OP_SERVICE_ACCOUNT_TOKEN." >&2
+      if [[ -n "$op_error" ]]; then
+        echo "1Password CLI: $op_error" >&2
+      fi
       exit 1
     fi
+    rm -f "$op_err_file"
     EXPORTS+=("export OP_PREFLIGHT_REVIEWER_PAT=$(printf '%q' "$reviewer_pat")")
     EXPORTS+=("export OP_PREFLIGHT_TOKEN_MODE=1")
     SESSION_LINES+=("OP_PREFLIGHT_TOKEN_MODE=1")

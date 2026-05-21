@@ -42,12 +42,16 @@ cat > "$STUB_DIR/op" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "\$*" >> "$OP_LOG"
-if [[ -z "\${OP_SERVICE_ACCOUNT_TOKEN:-}" ]]; then
-  echo "FATAL: OP_SERVICE_ACCOUNT_TOKEN missing" >&2
-  exit 65
-fi
 case "\${1:-}" in
   read)
+    if [[ -z "\${OP_SERVICE_ACCOUNT_TOKEN:-}" ]]; then
+      echo "FATAL: OP_SERVICE_ACCOUNT_TOKEN missing" >&2
+      exit 65
+    fi
+    if [[ "\${OP_STUB_FAIL_READ:-0}" == "1" ]]; then
+      echo "expired service token: \${OP_SERVICE_ACCOUNT_TOKEN}" >&2
+      exit 71
+    fi
     case "\${2:-}" in
       op://Private/pvbq24vl2h6gl7yjclxy2hbote/token) printf '%s\n' "reviewer-pat-claude" ;;
       op://Private/bslrih4spwxgookzfy6zedz5g4/token) printf '%s\n' "reviewer-pat-cursor" ;;
@@ -67,8 +71,12 @@ case "\${1:-}" in
     esac
     ;;
   inject)
-    echo "FATAL: token mode invoked op inject" >&2
-    exit 69
+    if [[ -n "\${OP_SERVICE_ACCOUNT_TOKEN:-}" ]]; then
+      echo "FATAL: token mode invoked op inject" >&2
+      exit 69
+    fi
+    printf '%s\n' "REVIEWER_PAT=interactive-reviewer"
+    printf '%s\n' "AUTHOR_PAT=interactive-author"
     ;;
   *)
     echo "FATAL: unexpected op command: \$*" >&2
@@ -89,6 +97,10 @@ chmod +x "$STUB_DIR/ssh"
 cat > "$STUB_DIR/gh" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$GH_LOG"
+if [[ "\${1:-}" == "config" && "\${2:-}" == "get" && "\${3:-}" == "-h" && "\${4:-}" == "github.com" && "\${5:-}" == "user" ]]; then
+  printf '%s\n' "nathanpayne-codex"
+  exit 0
+fi
 echo "FATAL: token mode invoked gh with args: \$*" >&2
 exit 97
 EOF
@@ -124,6 +136,24 @@ OP_PREFLIGHT_MODE=review
 OP_PREFLIGHT_DONE=1
 OP_PREFLIGHT_REVIEWER_PAT=interactive-reviewer
 OP_PREFLIGHT_AUTHOR_PAT=interactive-author
+EOF
+  chmod 600 "$dir/op-preflight-$agent.env"
+}
+
+make_token_cache() {
+  local dir="$1" agent="$2" reviewer_pat="${3:-reviewer-pat-codex}"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  local epoch
+  epoch=$(date +%s)
+  cat > "$dir/op-preflight-$agent.env" <<EOF
+OP_PREFLIGHT_CREATED_AT_EPOCH=$epoch
+OP_PREFLIGHT_TTL_SECONDS=14400
+OP_PREFLIGHT_AGENT=$agent
+OP_PREFLIGHT_MODE=review
+OP_PREFLIGHT_DONE=1
+OP_PREFLIGHT_TOKEN_MODE=1
+OP_PREFLIGHT_REVIEWER_PAT=$reviewer_pat
 EOF
   chmod 600 "$dir/op-preflight-$agent.env"
 }
@@ -218,6 +248,7 @@ test_token_mode_cache_and_check() {
   local rc=0
   PATH="$STUB_DIR:$PATH" \
     OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
     "$SCRIPT" --agent codex --mode review >"$WORKDIR/cache-hit.out" 2>"$WORKDIR/cache-hit.err" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     fail "test_token_mode_cache_and_check: cache hit expected rc=0, got rc=$rc; stderr=$(cat "$WORKDIR/cache-hit.err")"
@@ -236,6 +267,7 @@ test_token_mode_cache_and_check() {
   rc=0
   PATH="$STUB_DIR:$PATH" \
     OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
     "$SCRIPT" --agent codex --check >"$WORKDIR/check.out" 2>"$WORKDIR/check.err" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     fail "test_token_mode_cache_and_check: --check expected rc=0, got rc=$rc; stderr=$(cat "$WORKDIR/check.err")"
@@ -309,7 +341,88 @@ test_token_mode_replaces_interactive_cache() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 4: unknown agents and out-of-scope modes fail before op is invoked.
+# Test 4: interactive mode does not reuse a token-mode cache.
+# ---------------------------------------------------------------------------
+test_interactive_mode_replaces_token_cache() {
+  local cache_dir="$WORKDIR/token-cache"
+  make_token_cache "$cache_dir" codex "token-cache-reviewer"
+  reset_logs
+  local rc=0
+  PATH="$STUB_DIR:$PATH" \
+    OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    "$SCRIPT" --agent codex --mode review --skip-ssh >"$WORKDIR/token-refresh.out" 2>"$WORKDIR/token-refresh.err" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    fail "test_interactive_mode_replaces_token_cache: expected refresh rc=0, got rc=$rc; stderr=$(cat "$WORKDIR/token-refresh.err")"
+    return
+  fi
+  if ! grep -q "export OP_PREFLIGHT_REVIEWER_PAT=interactive-reviewer" "$WORKDIR/token-refresh.out"; then
+    fail "test_interactive_mode_replaces_token_cache: did not emit interactive reviewer PAT"
+    return
+  fi
+  if ! grep -q "export OP_PREFLIGHT_AUTHOR_PAT=interactive-author" "$WORKDIR/token-refresh.out"; then
+    fail "test_interactive_mode_replaces_token_cache: did not emit interactive author PAT"
+    return
+  fi
+  if grep -q "OP_PREFLIGHT_TOKEN_MODE\\|token-cache-reviewer" "$WORKDIR/token-refresh.out" "$cache_dir/op-preflight-codex.env"; then
+    fail "test_interactive_mode_replaces_token_cache: reused token cache or retained token marker"
+    return
+  fi
+  if ! grep -q "inject" "$OP_LOG"; then
+    fail "test_interactive_mode_replaces_token_cache: interactive refresh did not call op inject"
+    return
+  fi
+  if [[ -s "$SSH_LOG" ]]; then
+    fail "test_interactive_mode_replaces_token_cache: --skip-ssh path invoked ssh"
+    return
+  fi
+
+  local check_cache="$WORKDIR/token-check-cache"
+  make_token_cache "$check_cache" codex "token-check-reviewer"
+  reset_logs
+  rc=0
+  PATH="$STUB_DIR:$PATH" \
+    OP_PREFLIGHT_CACHE_DIR="$check_cache" \
+    "$SCRIPT" --agent codex --check >"$WORKDIR/token-check.out" 2>"$WORKDIR/token-check.err" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    fail "test_interactive_mode_replaces_token_cache: --check accepted token cache under interactive env"
+    return
+  fi
+  if [[ -s "$OP_LOG" || -s "$SSH_LOG" || -s "$GH_LOG" ]]; then
+    fail "test_interactive_mode_replaces_token_cache: --check invoked op/ssh/gh"
+    return
+  fi
+  pass "test_interactive_mode_replaces_token_cache: interactive env replaces token-mode cache"
+}
+
+# ---------------------------------------------------------------------------
+# Test 5: token read failures expose scrubbed op stderr.
+# ---------------------------------------------------------------------------
+test_token_mode_op_error_scrubbed() {
+  reset_logs
+  local cache_dir="$WORKDIR/op-error-cache"
+  local rc=0
+  PATH="$STUB_DIR:$PATH" \
+    OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_STUB_FAIL_READ=1 \
+    "$SCRIPT" --agent codex --mode review >"$WORKDIR/op-error.out" 2>"$WORKDIR/op-error.err" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    fail "test_token_mode_op_error_scrubbed: failed op read unexpectedly succeeded"
+    return
+  fi
+  if ! grep -q "expired service token" "$WORKDIR/op-error.err"; then
+    fail "test_token_mode_op_error_scrubbed: stderr missing op failure reason"
+    return
+  fi
+  if grep -q "$SERVICE_TOKEN" "$WORKDIR/op-error.err" "$WORKDIR/op-error.out"; then
+    fail "test_token_mode_op_error_scrubbed: service account token leaked in diagnostics"
+    return
+  fi
+  pass "test_token_mode_op_error_scrubbed: failed op read reports scrubbed diagnostic"
+}
+
+# ---------------------------------------------------------------------------
+# Test 6: unknown agents and out-of-scope modes fail before op is invoked.
 # ---------------------------------------------------------------------------
 test_token_mode_fail_closed_scope() {
   reset_logs
@@ -356,7 +469,7 @@ test_token_mode_fail_closed_scope() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 5: helper auto-source accepts reviewer scope but not author scope.
+# Test 7: helper auto-source accepts reviewer scope but not author scope.
 # ---------------------------------------------------------------------------
 test_token_mode_helper_scope() {
   local cache_dir="$WORKDIR/helper-cache"
@@ -398,6 +511,8 @@ test_token_mode_helper_scope() {
 test_token_mode_agents
 test_token_mode_cache_and_check
 test_token_mode_replaces_interactive_cache
+test_interactive_mode_replaces_token_cache
+test_token_mode_op_error_scrubbed
 test_token_mode_fail_closed_scope
 test_token_mode_helper_scope
 
