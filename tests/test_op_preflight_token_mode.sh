@@ -58,9 +58,9 @@ case "\${1:-}" in
       exit 71
     fi
     case "\${2:-}" in
-      op://Private/pvbq24vl2h6gl7yjclxy2hbote/token) printf '%s\n' "reviewer-pat-claude" ;;
-      op://Private/bslrih4spwxgookzfy6zedz5g4/token) printf '%s\n' "reviewer-pat-cursor" ;;
-      op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token) printf '%s\n' "reviewer-pat-codex" ;;
+      op://Mergepath\ CI\ Headless/nathanpayne-claude\ reviewer\ PAT/token) printf '%s\n' "reviewer-pat-claude" ;;
+      op://Mergepath\ CI\ Headless/nathanpayne-cursor\ reviewer\ PAT/token) printf '%s\n' "reviewer-pat-cursor" ;;
+      op://Mergepath\ CI\ Headless/nathanpayne-codex\ reviewer\ PAT/token) printf '%s\n' "reviewer-pat-codex" ;;
       op://Private/sm5kopwk6t6p3xmu2igesndzhe/token)
         echo "FATAL: token mode attempted author PAT read" >&2
         exit 66
@@ -117,6 +117,15 @@ reset_logs() {
   : > "$GH_LOG"
 }
 
+headless_reviewer_ref_for() {
+  case "$1" in
+    claude) printf '%s\n' "op://Mergepath CI Headless/nathanpayne-claude reviewer PAT/token" ;;
+    cursor) printf '%s\n' "op://Mergepath CI Headless/nathanpayne-cursor reviewer PAT/token" ;;
+    codex) printf '%s\n' "op://Mergepath CI Headless/nathanpayne-codex reviewer PAT/token" ;;
+    *) return 1 ;;
+  esac
+}
+
 mode_for_file() {
   local mode
   mode="$(stat -c %a "$1" 2>/dev/null || true)"
@@ -146,11 +155,14 @@ EOF
 }
 
 make_token_cache() {
-  local dir="$1" agent="$2" reviewer_pat="${3:-reviewer-pat-codex}"
+  local dir="$1" agent="$2" reviewer_pat="${3:-reviewer-pat-codex}" source_ref="${4:-op://Mergepath CI Headless/nathanpayne-codex reviewer PAT/token}"
   mkdir -p "$dir"
   chmod 700 "$dir"
   local epoch
   epoch=$(date +%s)
+  local escaped_reviewer_pat escaped_source_ref
+  printf -v escaped_reviewer_pat '%q' "$reviewer_pat"
+  printf -v escaped_source_ref '%q' "$source_ref"
   cat > "$dir/op-preflight-$agent.env" <<EOF
 OP_PREFLIGHT_CREATED_AT_EPOCH=$epoch
 OP_PREFLIGHT_TTL_SECONDS=14400
@@ -158,7 +170,8 @@ OP_PREFLIGHT_AGENT=$agent
 OP_PREFLIGHT_MODE=review
 OP_PREFLIGHT_DONE=1
 OP_PREFLIGHT_TOKEN_MODE=1
-OP_PREFLIGHT_REVIEWER_PAT=$reviewer_pat
+OP_PREFLIGHT_REVIEWER_PAT_SOURCE_REF=$escaped_source_ref
+OP_PREFLIGHT_REVIEWER_PAT=$escaped_reviewer_pat
 EOF
   chmod 600 "$dir/op-preflight-$agent.env"
 }
@@ -190,6 +203,7 @@ test_token_mode_agents() {
     PATH="$STUB_DIR:$PATH" \
       OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
       OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+      OP_PREFLIGHT_REVIEWER_PAT_REF="$(headless_reviewer_ref_for "$agent")" \
       "$SCRIPT" --agent "$agent" --mode review >"$out" 2>"$err" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
       fail "test_token_mode_agents($agent): expected rc=0, got rc=$rc; stderr=$(cat "$err")"
@@ -238,7 +252,163 @@ test_token_mode_agents() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 2: token-mode cache hits and --check do not invoke op/ssh/gh.
+# Test 2: token mode honors an explicit service-account-accessible reviewer
+# PAT reference.
+# ---------------------------------------------------------------------------
+test_token_mode_reviewer_ref_override() {
+  local cache_dir="$WORKDIR/ref-override-cache"
+  mkdir -p "$cache_dir"
+  reset_logs
+  local rc=0
+  PATH="$STUB_DIR:$PATH" \
+    OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_PREFLIGHT_REVIEWER_PAT_REF="op://Mergepath CI Headless/nathanpayne-codex reviewer PAT/token" \
+    "$SCRIPT" --agent codex --mode review >"$WORKDIR/ref-override.out" 2>"$WORKDIR/ref-override.err" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    fail "test_token_mode_reviewer_ref_override: expected rc=0, got rc=$rc; stderr=$(cat "$WORKDIR/ref-override.err")"
+    return
+  fi
+  if ! grep -q "export OP_PREFLIGHT_REVIEWER_PAT=reviewer-pat-codex" "$WORKDIR/ref-override.out"; then
+    fail "test_token_mode_reviewer_ref_override: did not emit reviewer PAT from override ref"
+    return
+  fi
+  if ! grep -q "op://Mergepath CI Headless/nathanpayne-codex reviewer PAT/token" "$OP_LOG"; then
+    fail "test_token_mode_reviewer_ref_override: op did not read override ref"
+    return
+  fi
+  if grep -q "op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token" "$OP_LOG"; then
+    fail "test_token_mode_reviewer_ref_override: fallback Private ref was read despite override"
+    return
+  fi
+  if ! grep -q "^OP_PREFLIGHT_REVIEWER_PAT_SOURCE_REF=op://Mergepath\\\\\\ CI\\\\\\ Headless/nathanpayne-codex\\\\\\ reviewer\\\\\\ PAT/token$" "$cache_dir/op-preflight-codex.env"; then
+    fail "test_token_mode_reviewer_ref_override: session did not record reviewer PAT source ref"
+    return
+  fi
+
+  reset_logs
+  rc=0
+  PATH="$STUB_DIR:$PATH" \
+    OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    "$SCRIPT" --agent codex --check >"$WORKDIR/ref-change-check.out" 2>"$WORKDIR/ref-change-check.err" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    fail "test_token_mode_reviewer_ref_override: --check accepted cache after reviewer ref changed"
+    return
+  fi
+  if [[ -s "$OP_LOG" || -s "$SSH_LOG" || -s "$GH_LOG" ]]; then
+    fail "test_token_mode_reviewer_ref_override: --check invoked op/ssh/gh while rejecting changed ref cache"
+    return
+  fi
+
+  reset_logs
+  rc=0
+  PATH="$STUB_DIR:$PATH" \
+    OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+    OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    "$SCRIPT" --agent codex --mode review >"$WORKDIR/ref-change-refresh.out" 2>"$WORKDIR/ref-change-refresh.err" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    fail "test_token_mode_reviewer_ref_override: missing reviewer ref unexpectedly succeeded"
+    return
+  fi
+  if ! grep -q "OP_PREFLIGHT_REVIEWER_PAT_REF is required" "$WORKDIR/ref-change-refresh.err"; then
+    fail "test_token_mode_reviewer_ref_override: missing reviewer ref diagnostic missing"
+    return
+  fi
+  if [[ -s "$OP_LOG" ]]; then
+    fail "test_token_mode_reviewer_ref_override: missing reviewer ref invoked op"
+    return
+  fi
+
+  local helper_space_cache="$WORKDIR/ref-helper-space-cache"
+  make_token_cache "$helper_space_cache" codex "reviewer-pat-from-space-ref" "op://Mergepath CI Headless/nathanpayne-codex reviewer PAT/token"
+  reset_logs
+  rc=0
+  PATH="$STUB_DIR:$PATH" \
+    OP_PREFLIGHT_CACHE_DIR="$helper_space_cache" \
+    OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_PREFLIGHT_REVIEWER_PAT_REF="op://Mergepath CI Headless/nathanpayne-codex reviewer PAT/token" \
+    "$SCRIPT" --agent codex --check >"$WORKDIR/ref-helper-space-check.out" 2>"$WORKDIR/ref-helper-space-check.err" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    fail "test_token_mode_reviewer_ref_override: helper cache with space ref expected --check rc=0, got rc=$rc; stderr=$(cat "$WORKDIR/ref-helper-space-check.err")"
+    return
+  fi
+  if ! grep -q "export OP_PREFLIGHT_REVIEWER_PAT=reviewer-pat-from-space-ref" "$WORKDIR/ref-helper-space-check.out"; then
+    fail "test_token_mode_reviewer_ref_override: helper cache with space ref did not emit reviewer PAT"
+    return
+  fi
+  if [[ -s "$OP_LOG" || -s "$SSH_LOG" || -s "$GH_LOG" ]]; then
+    fail "test_token_mode_reviewer_ref_override: helper cache with space ref --check invoked op/ssh/gh"
+    return
+  fi
+
+  reset_logs
+  rc=0
+  PATH="$STUB_DIR:$PATH" \
+    OP_PREFLIGHT_CACHE_DIR="$WORKDIR/ref-invalid-cache" \
+    OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_PREFLIGHT_REVIEWER_PAT_REF="not-a-secret-reference" \
+    "$SCRIPT" --agent codex --mode review >"$WORKDIR/ref-invalid.out" 2>"$WORKDIR/ref-invalid.err" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    fail "test_token_mode_reviewer_ref_override: invalid ref unexpectedly succeeded"
+    return
+  fi
+  if ! grep -q "OP_PREFLIGHT_REVIEWER_PAT_REF must be an op:// secret reference" "$WORKDIR/ref-invalid.err"; then
+    fail "test_token_mode_reviewer_ref_override: invalid ref diagnostic missing"
+    return
+  fi
+  if [[ -s "$OP_LOG" ]]; then
+    fail "test_token_mode_reviewer_ref_override: invalid ref invoked op"
+    return
+  fi
+
+  reset_logs
+  rc=0
+  PATH="$STUB_DIR:$PATH" \
+    OP_PREFLIGHT_CACHE_DIR="$WORKDIR/ref-non-field-cache" \
+    OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_PREFLIGHT_REVIEWER_PAT_REF="op://Vault/Item" \
+    "$SCRIPT" --agent codex --mode review >"$WORKDIR/ref-non-field.out" 2>"$WORKDIR/ref-non-field.err" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    fail "test_token_mode_reviewer_ref_override: non-field ref unexpectedly succeeded"
+    return
+  fi
+  if ! grep -q "OP_PREFLIGHT_REVIEWER_PAT_REF must be an op:// secret reference" "$WORKDIR/ref-non-field.err"; then
+    fail "test_token_mode_reviewer_ref_override: non-field ref diagnostic missing"
+    return
+  fi
+  if [[ -s "$OP_LOG" ]]; then
+    fail "test_token_mode_reviewer_ref_override: non-field ref invoked op"
+    return
+  fi
+
+  local blocked_ref
+  for blocked_ref in "op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token" "op://Personal/nathanpayne-codex reviewer PAT/token"; do
+    reset_logs
+    rc=0
+    PATH="$STUB_DIR:$PATH" \
+      OP_PREFLIGHT_CACHE_DIR="$WORKDIR/ref-blocked-cache" \
+      OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+      OP_PREFLIGHT_REVIEWER_PAT_REF="$blocked_ref" \
+      "$SCRIPT" --agent codex --mode review >"$WORKDIR/ref-blocked.out" 2>"$WORKDIR/ref-blocked.err" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      fail "test_token_mode_reviewer_ref_override: blocked ref '$blocked_ref' unexpectedly succeeded"
+      return
+    fi
+    if ! grep -q "cannot point to Private or Personal vaults" "$WORKDIR/ref-blocked.err"; then
+      fail "test_token_mode_reviewer_ref_override: blocked ref diagnostic missing for $blocked_ref"
+      return
+    fi
+    if [[ -s "$OP_LOG" ]]; then
+      fail "test_token_mode_reviewer_ref_override: blocked ref invoked op for $blocked_ref"
+      return
+    fi
+  done
+  pass "test_token_mode_reviewer_ref_override: explicit reviewer PAT ref is honored and validated"
+}
+
+# ---------------------------------------------------------------------------
+# Test 3: token-mode cache hits and --check do not invoke op/ssh/gh.
 # ---------------------------------------------------------------------------
 test_token_mode_cache_and_check() {
   local cache_dir="$WORKDIR/cache-hit"
@@ -247,6 +417,7 @@ test_token_mode_cache_and_check() {
   PATH="$STUB_DIR:$PATH" \
     OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
     OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_PREFLIGHT_REVIEWER_PAT_REF="$(headless_reviewer_ref_for codex)" \
     "$SCRIPT" --agent codex --mode review >"$WORKDIR/cache-fill.out" 2>"$WORKDIR/cache-fill.err"
 
   reset_logs
@@ -254,6 +425,7 @@ test_token_mode_cache_and_check() {
   PATH="$STUB_DIR:$PATH" \
     OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
     OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_PREFLIGHT_REVIEWER_PAT_REF="$(headless_reviewer_ref_for codex)" \
     "$SCRIPT" --agent codex --mode review >"$WORKDIR/cache-hit.out" 2>"$WORKDIR/cache-hit.err" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     fail "test_token_mode_cache_and_check: cache hit expected rc=0, got rc=$rc; stderr=$(cat "$WORKDIR/cache-hit.err")"
@@ -273,6 +445,7 @@ test_token_mode_cache_and_check() {
   PATH="$STUB_DIR:$PATH" \
     OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
     OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_PREFLIGHT_REVIEWER_PAT_REF="$(headless_reviewer_ref_for codex)" \
     "$SCRIPT" --agent codex --check >"$WORKDIR/check.out" 2>"$WORKDIR/check.err" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     fail "test_token_mode_cache_and_check: --check expected rc=0, got rc=$rc; stderr=$(cat "$WORKDIR/check.err")"
@@ -294,7 +467,7 @@ test_token_mode_cache_and_check() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 3: OP_SERVICE_ACCOUNT_TOKEN does not reuse an interactive cache.
+# Test 4: OP_SERVICE_ACCOUNT_TOKEN does not reuse an interactive cache.
 # ---------------------------------------------------------------------------
 test_token_mode_replaces_interactive_cache() {
   local cache_dir="$WORKDIR/interactive-cache"
@@ -304,6 +477,7 @@ test_token_mode_replaces_interactive_cache() {
   PATH="$STUB_DIR:$PATH" \
     OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
     OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_PREFLIGHT_REVIEWER_PAT_REF="$(headless_reviewer_ref_for codex)" \
     "$SCRIPT" --agent codex --mode review >"$WORKDIR/interactive-refresh.out" 2>"$WORKDIR/interactive-refresh.err" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     fail "test_token_mode_replaces_interactive_cache: expected refresh rc=0, got rc=$rc; stderr=$(cat "$WORKDIR/interactive-refresh.err")"
@@ -333,6 +507,7 @@ test_token_mode_replaces_interactive_cache() {
   PATH="$STUB_DIR:$PATH" \
     OP_PREFLIGHT_CACHE_DIR="$check_cache" \
     OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_PREFLIGHT_REVIEWER_PAT_REF="$(headless_reviewer_ref_for codex)" \
     "$SCRIPT" --agent codex --check >"$WORKDIR/interactive-check.out" 2>"$WORKDIR/interactive-check.err" || rc=$?
   if [[ "$rc" -eq 0 ]]; then
     fail "test_token_mode_replaces_interactive_cache: --check accepted interactive cache under token env"
@@ -346,7 +521,7 @@ test_token_mode_replaces_interactive_cache() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 4: interactive mode does not reuse a token-mode cache.
+# Test 5: interactive mode does not reuse a token-mode cache.
 # ---------------------------------------------------------------------------
 test_interactive_mode_replaces_token_cache() {
   local cache_dir="$WORKDIR/token-cache"
@@ -400,7 +575,7 @@ test_interactive_mode_replaces_token_cache() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 5: token read failures expose scrubbed op stderr.
+# Test 6: token read failures expose scrubbed op stderr.
 # ---------------------------------------------------------------------------
 test_token_mode_op_error_scrubbed() {
   reset_logs
@@ -409,6 +584,7 @@ test_token_mode_op_error_scrubbed() {
   PATH="$STUB_DIR:$PATH" \
     OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
     OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_PREFLIGHT_REVIEWER_PAT_REF="$(headless_reviewer_ref_for codex)" \
     OP_STUB_FAIL_READ=1 \
     "$SCRIPT" --agent codex --mode review >"$WORKDIR/op-error.out" 2>"$WORKDIR/op-error.err" || rc=$?
   if [[ "$rc" -eq 0 ]]; then
@@ -429,6 +605,7 @@ test_token_mode_op_error_scrubbed() {
   PATH="$STUB_DIR:$PATH" \
     OP_PREFLIGHT_CACHE_DIR="$WORKDIR/op-long-error-cache" \
     OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_PREFLIGHT_REVIEWER_PAT_REF="$(headless_reviewer_ref_for codex)" \
     OP_STUB_FAIL_READ=long \
     "$SCRIPT" --agent codex --mode review >"$WORKDIR/op-long-error.out" 2>"$WORKDIR/op-long-error.err" || rc=$?
   if [[ "$rc" -eq 0 ]]; then
@@ -443,7 +620,7 @@ test_token_mode_op_error_scrubbed() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 6: unknown agents and out-of-scope modes fail before op is invoked.
+# Test 7: unknown agents and out-of-scope modes fail before op is invoked.
 # ---------------------------------------------------------------------------
 test_token_mode_fail_closed_scope() {
   reset_logs
@@ -490,7 +667,7 @@ test_token_mode_fail_closed_scope() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 7: helper auto-source accepts reviewer scope but not author scope.
+# Test 8: helper auto-source accepts reviewer scope but not author scope.
 # ---------------------------------------------------------------------------
 test_token_mode_helper_scope() {
   local cache_dir="$WORKDIR/helper-cache"
@@ -499,6 +676,7 @@ test_token_mode_helper_scope() {
   PATH="$STUB_DIR:$PATH" \
     OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
     OP_SERVICE_ACCOUNT_TOKEN="$SERVICE_TOKEN" \
+    OP_PREFLIGHT_REVIEWER_PAT_REF="$(headless_reviewer_ref_for codex)" \
     "$SCRIPT" --agent codex --mode review >"$WORKDIR/helper-fill.out" 2>"$WORKDIR/helper-fill.err"
 
   local rc=0
@@ -530,6 +708,7 @@ test_token_mode_helper_scope() {
 }
 
 test_token_mode_agents
+test_token_mode_reviewer_ref_override
 test_token_mode_cache_and_check
 test_token_mode_replaces_interactive_cache
 test_interactive_mode_replaces_token_cache

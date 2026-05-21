@@ -161,6 +161,9 @@ jobs:
       - name: check_op_preflight_contract
         run: ./scripts/ci/check_op_preflight_contract
 
+      - name: check_onepassword_headless_proof_workflow
+        run: ./scripts/ci/check_onepassword_headless_proof_workflow
+
       - name: check_eslint_config_present
         run: ./scripts/ci/check_eslint_config_present
 

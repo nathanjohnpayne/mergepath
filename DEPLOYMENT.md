@@ -750,7 +750,7 @@ Compatibility matrix:
 | 1Password local `.env` validation hook | Not listed in the hook support matrix | Supported | Supported | Supported | Supported | No |
 | `op run --environment` / secret references | Works if shell-capable | Works if shell-capable | Works if shell-capable | Works if shell-capable | Works if shell-capable | Works with scoped service account |
 | Service-account token | Headless only; explicit opt-in | Headless only; explicit opt-in | Headless only; explicit opt-in | Headless only; explicit opt-in | Headless only; explicit opt-in | Preferred non-interactive path |
-| Mergepath `op-preflight.sh` review mode | Configured | Configured | Configured | Not configured | Not configured | Planned only after token-mode work |
+| Mergepath `op-preflight.sh` review mode | Configured | Configured | Configured | Not configured | Not configured | Configured for `claude` / `cursor` / `codex` when `OP_SERVICE_ACCOUNT_TOKEN` is set |
 
 Operational guardrails:
 
@@ -763,6 +763,56 @@ Operational guardrails:
   truly requires a materialized config file.
 - Secure Note `notesPlain` whole-file bootstrap has been retired. Use
   `.env.tpl` plus `op inject` when a generated file is required.
+
+#### Headless `op-preflight` proof workflow
+
+`scripts/op-preflight.sh` has an explicit CI/headless lane for review
+credentials. When `OP_SERVICE_ACCOUNT_TOKEN` is present, review mode
+uses the 1Password CLI service-account path instead of biometric
+desktop approval, writes only `OP_PREFLIGHT_REVIEWER_PAT`, marks the
+cache with `OP_PREFLIGHT_TOKEN_MODE=1`, and skips SSH warming plus
+GitHub keyring repair. This mode is not an implicit fallback for local
+attended agents.
+
+The manual workflow
+`.github/workflows/onepassword-headless-proof.yml` proves the lane
+without exposing raw values in logs. Before dispatching it, configure:
+
+- `OP_SERVICE_ACCOUNT_TOKEN` as an encrypted GitHub Actions secret.
+  Scope the service account to the approved reviewer PAT items and
+  the dedicated canary item only.
+- `OP_PREFLIGHT_REVIEWER_PAT_REF` as a GitHub Actions variable
+  containing the `op://` reference for the reviewer PAT field in the
+  service-account-accessible proof vault. Do not point token mode at a
+  built-in `Private`/`Personal` vault; 1Password service accounts
+  cannot access those vaults.
+- `OP_PREFLIGHT_CANARY_REF` as a GitHub Actions variable containing a
+  non-sensitive `op://` reference to the proof canary field.
+- `OP_PREFLIGHT_CANARY_SHA256` as an encrypted GitHub Actions secret
+  containing the SHA-256 digest of the canary value.
+
+When using `scripts/onepassword-headless-proof-setup.sh`, also pass
+`OP_PREFLIGHT_NEGATIVE_SCOPE_REF` or `--negative-scope-ref` pointing to
+an `op://` sentinel in a shared vault outside the service account's
+approved scope. Do not use `Private`/`Personal` for this sentinel; the
+point is to detect accidental access to another service-account-capable
+vault. The setup helper first confirms the local 1Password account can
+read the sentinel, then confirms the service account cannot.
+
+The workflow installs the 1Password CLI, reads the canary, compares
+only its digest, verifies the reviewer PAT resolves to
+`nathanpayne-codex`, then runs:
+
+```bash
+eval "$(scripts/op-preflight.sh --agent codex --mode review)"
+export OP_PREFLIGHT_QUIET=1
+eval "$(scripts/op-preflight.sh --agent codex --check)"
+```
+
+The workflow is `workflow_dispatch` only. Run it after provisioning or
+rotating the service-account token; do not enable it as an automatic
+PR or push workflow unless the proof secrets are intentionally
+available to that event class.
 
 ### Provisioning the Firebase-vault SA key
 
