@@ -2,14 +2,17 @@
 
 ## Status
 
-Proposed for human ratification in
-[#357](https://github.com/nathanjohnpayne/mergepath/issues/357).
+Accepted — ratified by the repository owner (nathanjohnpayne) on
+2026-05-21 via [#357](https://github.com/nathanjohnpayne/mergepath/issues/357),
+adopted on merge of [#369](https://github.com/nathanjohnpayne/mergepath/pull/369).
 
-This ADR integrates the ratified sub-decisions from
+This ADR consolidates the ratified sub-decisions from
 [#355](https://github.com/nathanjohnpayne/mergepath/issues/355) and
-[#356](https://github.com/nathanjohnpayne/mergepath/issues/356), but
-the consolidated record itself still needs explicit human sign-off
-before it should be treated as accepted.
+[#356](https://github.com/nathanjohnpayne/mergepath/issues/356). Every lane
+below is implemented and cross-agent reviewed: op-preflight token mode
+(#353 / #365), the CI service-account proof workflow (#354 / #368),
+reviewer-ref support with identity + negative-scope verification (#372),
+and the `human-hold` merge freeze (#367 / #370).
 
 ## Date
 
@@ -79,7 +82,12 @@ do not assume one particular AI client.
    the #355/#346 path, the approved shape is read-only access to the
    reviewer PAT items plus a canary proof item. Exclude the author
    PAT, GCP ADC, Cloudflare token, deploy keys, and unrelated runtime
-   secrets unless a separate ticket approves the expansion.
+   secrets unless a separate ticket approves the expansion. As built
+   (#372): reviewer PAT items live in a dedicated service-account-
+   accessible vault (never `Private`/`Personal`), referenced via
+   `OP_PREFLIGHT_REVIEWER_PAT_REF`, and the CI proof verifies the
+   reviewer PAT's GitHub identity and that the service account cannot
+   read an out-of-scope shared-vault sentinel.
 
 ## Compatibility Matrix
 
