@@ -18,6 +18,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 TESTS=(
   "tests/test_op_preflight_check.sh"
+  "tests/test_op_preflight_token_mode.sh"
   "tests/test_helper_autosource.sh"
 )
 
