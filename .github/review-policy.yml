@@ -15,7 +15,12 @@
 #
 # Set to 0 to require external review on every PR.
 # Set to a very high number (e.g., 999999) to effectively disable.
-external_review_threshold: 300
+#
+# TEMP (1P audit arc — revert via #360): forced to 0 so EVERY PR enters
+# the external-review lane and gets `needs-external-review`, blocking the
+# under-threshold auto-merge that landed #358 without a 4b review (#359).
+# Restore to 300 when the arc completes.
+external_review_threshold: 0
 
 # ---------------------------------------------------------------------------
 # Protected Paths
@@ -249,7 +254,12 @@ coderabbit:
 #      See #29 for the observational evidence behind the Codex bot
 #      behavior, and #218 for the Phase 4b substitute path.
 codex:
-  enabled: true
+  # TEMP (1P audit arc — revert via #360): disabled so the Codex 4a
+  # auto-pass cannot clear the merge gate; with this off, the ONLY way to
+  # clear `needs-external-review` is a human/CLI Phase 4b APPROVED on the
+  # current HEAD (allow_phase_4b_substitute below). Restore to true when
+  # the arc completes.
+  enabled: false
 
   # GitHub login of the Codex GitHub App bot. Reviews posted by this login
   # satisfy the external-review requirement in `.github/workflows/pr-audit.yml`.
@@ -384,7 +394,11 @@ codex:
 # Existing repos without this field default to `fallback-only` per
 # scripts/codex-review-check.sh's parser — no behavior change without
 # explicit opt-in. See REVIEW_POLICY.md § Migration for existing consumers.
-phase_4b_default: complex-changes
+# TEMP (1P audit arc — revert via #360): forced to `always` so every
+# threshold PR requires the Phase 4b handoff (a human/CLI APPROVED),
+# not just classifier-selected ones. Restore to `complex-changes` when
+# the arc completes.
+phase_4b_default: always
 
 # ---------------------------------------------------------------------------
 # Auto-clear blocking labels (#195/#197)
