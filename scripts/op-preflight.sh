@@ -77,6 +77,12 @@
 #                             account auth path. Author PAT, deploy
 #                             secrets, SSH warming, and gh keyring
 #                             repair stay out of scope.
+#   OP_PREFLIGHT_REVIEWER_PAT_REF
+#                             Required op://vault/item/field reference for
+#                             the reviewer PAT in service-account token
+#                             mode. Must point to a service-account-
+#                             accessible vault; Private/Personal vaults
+#                             are rejected before op read.
 #
 # Session file:
 #   Path:        $cache_dir/op-preflight-<agent>.env
@@ -117,6 +123,26 @@ reviewer_pat_item_for() {
     cursor) echo "bslrih4spwxgookzfy6zedz5g4" ;;
     codex)  echo "o6ekjxjjl5gq6rmcneomrjahpu" ;;
     *)      return 1 ;;
+  esac
+}
+
+reviewer_pat_ref_for() {
+  local item
+  item="$(reviewer_pat_item_for "$1")" || return 1
+  printf '%s\n' "${OP_PREFLIGHT_REVIEWER_PAT_REF:-op://Private/${item}/token}"
+}
+
+is_op_secret_ref() {
+  case "$1" in
+    op://*/*/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_private_or_personal_ref() {
+  case "$1" in
+    op://Private/*|op://Personal/*) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -310,7 +336,11 @@ if $DRY_RUN; then
   echo "#" >&2
   if [[ "$MODE" == "review" || "$MODE" == "all" ]]; then
     if $SERVICE_ACCOUNT_TOKEN_MODE; then
-      echo "# Would read: reviewer PAT ($(reviewer_pat_item_for "$AGENT")) via OP_SERVICE_ACCOUNT_TOKEN" >&2
+      if [[ -n "${OP_PREFLIGHT_REVIEWER_PAT_REF:-}" ]]; then
+        echo "# Would read: reviewer PAT ($(reviewer_pat_ref_for "$AGENT")) via OP_SERVICE_ACCOUNT_TOKEN" >&2
+      else
+        echo "# Would require: OP_PREFLIGHT_REVIEWER_PAT_REF (service-account-accessible op://vault/item/field)" >&2
+      fi
       echo "# Would skip: author PAT (out of token-mode scope)" >&2
       echo "# Would skip: SSH warming (out of token-mode scope)" >&2
       echo "# Would skip: gh keyring repair (out of token-mode scope)" >&2
@@ -563,7 +593,7 @@ emit_from_session_file() (
   unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
   unset CF_API_TOKEN
   unset OP_PREFLIGHT_DONE OP_PREFLIGHT_AGENT OP_PREFLIGHT_MODE
-  unset OP_PREFLIGHT_TOKEN_MODE
+  unset OP_PREFLIGHT_TOKEN_MODE OP_PREFLIGHT_REVIEWER_PAT_SOURCE_REF
   unset OP_PREFLIGHT_CREATED_AT_EPOCH OP_PREFLIGHT_TTL_SECONDS
 
   # Source the session file and re-emit only the vars we own, so a
@@ -591,6 +621,13 @@ emit_from_session_file() (
       exit 2
     fi
     if [[ "${OP_PREFLIGHT_TOKEN_MODE:-0}" == "1" ]]; then
+      [[ -n "${OP_PREFLIGHT_REVIEWER_PAT_REF:-}" ]] || exit 2
+      desired_reviewer_ref="$(reviewer_pat_ref_for "$AGENT" 2>/dev/null || true)"
+      is_op_secret_ref "$desired_reviewer_ref" || exit 2
+      is_private_or_personal_ref "$desired_reviewer_ref" && exit 2
+      if [[ "${OP_PREFLIGHT_REVIEWER_PAT_SOURCE_REF:-}" != "$desired_reviewer_ref" ]]; then
+        exit 2
+      fi
       if [[ "$MODE" == "all" ]] || [[ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]]; then
         exit 2
       fi
@@ -875,11 +912,25 @@ if [[ "$MODE" == "review" || "$MODE" == "all" ]]; then
   reviewer_item="$(reviewer_pat_item_for "$AGENT")"
 
   if $SERVICE_ACCOUNT_TOKEN_MODE; then
+    if [[ -z "${OP_PREFLIGHT_REVIEWER_PAT_REF:-}" ]]; then
+      echo "Error: OP_PREFLIGHT_REVIEWER_PAT_REF is required in OP_SERVICE_ACCOUNT_TOKEN mode." >&2
+      echo "       Use a service-account-accessible op://vault/item/field reference; Private/Personal vaults are out of scope." >&2
+      exit 1
+    fi
+    reviewer_ref="$(reviewer_pat_ref_for "$AGENT")"
+    if ! is_op_secret_ref "$reviewer_ref"; then
+      echo "Error: OP_PREFLIGHT_REVIEWER_PAT_REF must be an op:// secret reference." >&2
+      exit 1
+    fi
+    if is_private_or_personal_ref "$reviewer_ref"; then
+      echo "Error: OP_PREFLIGHT_REVIEWER_PAT_REF cannot point to Private or Personal vaults in OP_SERVICE_ACCOUNT_TOKEN mode." >&2
+      exit 1
+    fi
     echo "# Preflight: reading reviewer PAT via OP_SERVICE_ACCOUNT_TOKEN..." >&2
     op_err_file="$(mktemp "${TMPDIR:-/tmp}/op-preflight-read-err-XXXXXX")"
     reviewer_pat=""
     op_read_rc=0
-    if reviewer_pat="$(op read "op://Private/${reviewer_item}/token" 2>"$op_err_file")"; then
+    if reviewer_pat="$(op read "$reviewer_ref" 2>"$op_err_file")"; then
       op_read_rc=0
     else
       op_read_rc=$?
@@ -897,6 +948,7 @@ if [[ "$MODE" == "review" || "$MODE" == "all" ]]; then
     EXPORTS+=("export OP_PREFLIGHT_REVIEWER_PAT=$(printf '%q' "$reviewer_pat")")
     EXPORTS+=("export OP_PREFLIGHT_TOKEN_MODE=1")
     SESSION_LINES+=("OP_PREFLIGHT_TOKEN_MODE=1")
+    SESSION_LINES+=("OP_PREFLIGHT_REVIEWER_PAT_SOURCE_REF=$(printf '%q' "$reviewer_ref")")
     SESSION_LINES+=("OP_PREFLIGHT_REVIEWER_PAT=$(printf '%q' "$reviewer_pat")")
     SUMMARY+=("Reviewer PAT ($AGENT): loaded via service account token")
     SUMMARY+=("Author PAT: skipped (service account token mode)")
