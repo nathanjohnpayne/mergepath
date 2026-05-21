@@ -130,8 +130,9 @@ repos=$(awk '/<!-- bootstrap-loop-list-start -->/,/<!-- bootstrap-loop-list-end 
 cd ~/Documents/GitHub
 for repo in $repos; do
   cd "$repo"
-  # Push any local config changes to 1Password
-  ./scripts/bootstrap.sh --sync
+  # Do not edit generated env files as the source of truth. If secret
+  # values changed, update the referenced 1Password item fields directly.
+  # If the shape changed, commit the matching .env.tpl update.
   # Ensure all code changes are committed and pushed
   git status
   cd ..
@@ -154,16 +155,16 @@ for repo in $repos; do
 done
 ```
 
-The `--force` flag overwrites existing `.env.local` files with freshly resolved
-values from 1Password. This ensures you pick up any secrets that were updated
-on the temporary machine via `--sync`.
+The `--force` flag overwrites existing generated env files with freshly
+resolved values from 1Password. This ensures you pick up any secret values
+that were updated directly in 1Password.
 
 ### Conflict resolution
 
-If both machines modified the same 1Password item:
-- 1Password keeps the latest write (last-writer-wins)
-- The `.env.tpl` templates are in git, so structural changes merge normally
-- For true conflicts, compare with `op item get <id>` and resolve manually
+If two machines need different template structure, resolve it like normal
+source code: commit the `.env.tpl` change on one branch and merge/rebase.
+Secret values themselves should be edited directly in 1Password, not synced
+from generated local files.
 
 ---
 
@@ -760,9 +761,8 @@ Operational guardrails:
   to move across developers, stages, or agents.
 - Use `.env.tpl` plus `op inject` only when the application or tool
   truly requires a materialized config file.
-- Treat legacy Secure Note `notesPlain` bootstrap as a compatibility
-  path pending the #344/#350/#351/#352 migration, not as the target
-  model for new repos.
+- Secure Note `notesPlain` whole-file bootstrap has been retired. Use
+  `.env.tpl` plus `op inject` when a generated file is required.
 
 ### Provisioning the Firebase-vault SA key
 

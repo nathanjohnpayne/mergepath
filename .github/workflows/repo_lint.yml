@@ -48,6 +48,11 @@ jobs:
       # wizards stay reproducible and a regression in any sub-wizard
       # is caught in CI before it ships to consumer repos. Wired in
       # #269 after the inventory of unwired scripts/ci/check_*.
+      - name: check_bootstrap_sh
+        # Runtime-secret bootstrap helper: restore-only op inject path
+        # and retired Secure Note / notesPlain sync path.
+        run: ./scripts/ci/check_bootstrap_sh
+
       - name: check_bootstrap_wizard
         # Sub-A: top-level bootstrap wizard scaffolding + flow.
         run: ./scripts/ci/check_bootstrap_wizard
