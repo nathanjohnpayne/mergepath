@@ -81,7 +81,7 @@ cd ~/Documents/GitHub
 for repo in $repos; do
   git clone "https://github.com/nathanjohnpayne/$repo.git" 2>/dev/null || (cd "$repo" && git pull)
   cd "$repo"
-  ./scripts/bootstrap.sh    # restores .env.local from 1Password via op inject
+  ./scripts/bootstrap.sh    # restores generated config from 1Password templates
   cd ..
 done
 ```
@@ -90,6 +90,12 @@ The bootstrap script for each repo:
 - Resolves `op://` references in `.env.tpl` → writes `.env.local` (via `op inject`)
 - Runs `npm install`
 - Runs `npm run build` (if applicable)
+
+For new runtime application secrets, prefer the current 1Password
+Environments model described in [Runtime 1Password secrets and AI
+agents](#runtime-1password-secrets-and-ai-agents). Keep
+`.env.tpl`/`op inject` for repos that still need a generated,
+gitignored file on disk.
 
 ### 5. Verify
 
@@ -696,8 +702,67 @@ Each project's SA key is stored in the 1Password **Firebase** vault with the nam
 
 - No API keys or secrets should be committed to the repository.
 - **Deploy auth uses the project Firebase-vault SA key as the default credential** (#154 — codified after recurring `firebase login --reauth` friction from #137 traced to RAPT/refresh-token expiry on the shared 1Password ADC). The SA key lives in the 1Password Firebase vault — it's not stored on disk except as a tempfile during a single deploy invocation, and never committed to a repo. Impersonated credentials remain available for cases where the SA key isn't provisioned, but the policy default is to provision the key per-project per § Provisioning the Firebase-vault SA key below.
-- Runtime secrets can still use `op://Private/<item>/<field>` references in committed template files and `op inject` into gitignored runtime files when a repo actually needs 1Password-managed application secrets.
+- Runtime application secrets should use the two-lane 1Password model below. Prefer 1Password Environments for project/stage variable sets, use secret references and `op inject` when a repo genuinely needs generated files, and reserve service-account tokens for explicitly scoped headless workflows.
 - Never commit resolved secret output, service-account JSON, or ADC credentials.
+
+### Runtime 1Password secrets and AI agents
+
+Reconciled against 1Password Environments / MCP Server for Codex docs
+as of 2026-05-21. This section is descriptive; adoption decisions for
+the new access model live in the 1Password audit ADR workstream
+(#347/#355/#356/#357).
+
+Reference docs:
+[1Password Environments](https://www.1password.dev/environments),
+[MCP Server for Codex](https://www.1password.dev/environments/mcp-codex-server),
+[local `.env` validation hook](https://www.1password.dev/environments/agent-hook-validate),
+and [`op run` secret loading](https://www.1password.dev/cli/secrets-environment-variables).
+
+Mergepath uses a portable core with per-client adapters:
+
+- **Portable core:** 1Password Environments, `op://` secret
+  references, `op run --environment <environment_id> -- <command>`,
+  `op inject` for generated config files, and scoped service-account
+  tokens for non-interactive runners. These primitives are useful to
+  any shell-capable agent or CI system.
+- **Attended Codex:** the 1Password Environments MCP Server for Codex
+  is the documented adapter for Codex. It lets Codex create and manage
+  Environments, list variable names, and run applications with runtime
+  injection while 1Password keeps raw secret values out of the model
+  context and off disk.
+- **Other attended agents:** Claude Code, Cursor, GitHub Copilot, and
+  Windsurf can use the 1Password local `.env` validation hook when a
+  repo relies on mounted 1Password Environment files.
+- **CI/headless:** use a scoped 1Password service account or
+  pre-materialized CI secret only after a ticket explicitly approves
+  the scope. Do not hand `OP_SERVICE_ACCOUNT_TOKEN` to local attended
+  agents as a convenience fallback.
+- **Existing shell scripts:** keep `op read`, `op run`, and
+  `op inject` shell-outs for repo automation. There is no current
+  requirement to migrate these scripts to a language SDK.
+
+Compatibility matrix:
+
+| Capability | Codex | Claude Code | Cursor | GitHub Copilot | Windsurf | CI/headless |
+|---|---|---|---|---|---|---|
+| 1Password Environments MCP Server | Officially documented for Codex | Not documented here | Not documented here | Not documented here | Not documented here | No |
+| 1Password local `.env` validation hook | Not listed in the hook support matrix | Supported | Supported | Supported | Supported | No |
+| `op run --environment` / secret references | Works if shell-capable | Works if shell-capable | Works if shell-capable | Works if shell-capable | Works if shell-capable | Works with scoped service account |
+| Service-account token | Headless only; explicit opt-in | Headless only; explicit opt-in | Headless only; explicit opt-in | Headless only; explicit opt-in | Headless only; explicit opt-in | Preferred non-interactive path |
+| Mergepath `op-preflight.sh` review mode | Configured | Configured | Configured | Not configured | Not configured | Planned only after token-mode work |
+
+Operational guardrails:
+
+- Never ask a human to paste raw secrets into an agent chat or issue.
+- Never print resolved secret values in logs, PR bodies, or review
+  comments.
+- Use 1Password Environments for sets of runtime variables that need
+  to move across developers, stages, or agents.
+- Use `.env.tpl` plus `op inject` only when the application or tool
+  truly requires a materialized config file.
+- Treat legacy Secure Note `notesPlain` bootstrap as a compatibility
+  path pending the #344/#350/#351/#352 migration, not as the target
+  model for new repos.
 
 ### Provisioning the Firebase-vault SA key
 
