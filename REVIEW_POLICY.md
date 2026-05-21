@@ -274,7 +274,7 @@ affect the byline for that row; the byline follows `GH_TOKEN`.
 | `gh pr create` | `nathanjohnpayne` (use `scripts/gh-as-author.sh`) | any author-readable PAT |
 | `gh pr merge` (squash/rebase) | `nathanjohnpayne` (use `scripts/gh-as-author.sh`) | any author-readable PAT |
 | `gh pr edit` (general — title/body) | `nathanjohnpayne` (use `scripts/gh-as-author.sh`) | any author-readable PAT |
-| `gh pr edit --remove-label <protected>` | **BLOCKED** by `scripts/hooks/label-removal-guard.sh` for `needs-external-review` / `needs-human-review` / `policy-violation`; use `scripts/request-label-removal.sh` | n/a |
+| `gh pr edit --remove-label <protected>` | **BLOCKED** by `scripts/hooks/label-removal-guard.sh` for `needs-external-review` / `needs-human-review` / `policy-violation` / `human-hold`; use `scripts/request-label-removal.sh` | n/a |
 | `gh pr comment` | `nathanpayne-<agent>` (agent identity); blocked when active is `nathanjohnpayne` per `scripts/hooks/gh-pr-guard.sh` (#284) | reviewer PAT (`$OP_PREFLIGHT_REVIEWER_PAT`) |
 | `gh pr review --comment` | `nathanpayne-<agent>`; blocked when active is `nathanjohnpayne` (#284) | reviewer PAT |
 | `gh pr review --approve` (under-threshold) | `nathanpayne-<agent>`; allowed when PR's `Authoring-Agent:` matches the agent (the intended path) | reviewer PAT |
@@ -776,7 +776,7 @@ The agent never resolves a fired escalation signal on its own.
 
 ## Agent prohibitions
 
-Agents must never modify the `needs-external-review`, `needs-human-review`, or `policy-violation` labels on any PR — these are human-action labels. The `scripts/hooks/label-removal-guard.sh` PreToolUse hook enforces this at the mechanism layer; chat authorization does not bypass it. To request a label removal, run `scripts/request-label-removal.sh <PR#> <label>` — this posts a structured ask on the PR and (if `MERGEPATH_NOTIFY_IMESSAGE_TO` is set) pings the human via iMessage. The human clears the label from any device; auto-merge fires immediately.
+Agents must never modify the `needs-external-review`, `needs-human-review`, or `policy-violation` labels on any PR — these are human-action labels. Agents may add `human-hold` to freeze a PR, but must never remove it; `human-hold` is a human-remove-only hard hold that supersedes every merge gate, including Codex clearance, reviewer approvals, Dependabot auto-merge, and break-glass agent merge variables. The `scripts/hooks/label-removal-guard.sh` PreToolUse hook enforces this at the mechanism layer; chat authorization does not bypass it. To request a label removal, run `scripts/request-label-removal.sh <PR#> <label>` — this posts a structured ask on the PR and (if `MERGEPATH_NOTIFY_IMESSAGE_TO` is set) pings the human via iMessage. The human clears the label from any device; the PR can proceed once the normal merge gates are green.
 
 **Sanctioned automation exceptions.** Two — and only two — automated paths may remove `needs-external-review`. Both are GitHub Actions workflows (not interactive agent sessions); both are reconciling a label the policy automation itself is responsible for, which is categorically different from an agent clearing a human-action label.
 
@@ -784,7 +784,7 @@ Agents must never modify the `needs-external-review`, `needs-human-review`, or `
 
 2. **`pr-review-policy.yml`'s External Review Check** (the propagation-PR review lane, [#264](https://github.com/nathanjohnpayne/mergepath/issues/264) / [#268](https://github.com/nathanjohnpayne/mergepath/issues/268)) removes the label when a PR is verified to be a faithful propagation mirror — see [§ Phase 3.5](#phase-35-propagation-pr-review-lane). It does not consult the merge gate; it acts on the orthogonal fact that the PR's content was already reviewed upstream, established by `scripts/workflow/verify-propagation-pr.sh`'s byte-comparison against `mergepath@<sha>`. Same `github-actions[bot]` byline; same not-an-agent-override rationale.
 
-These exceptions apply ONLY to those two workflows. An interactive agent session (claude / cursor / codex) calling `gh pr edit --remove-label` for any of the three blocking labels remains forbidden — the `scripts/hooks/label-removal-guard.sh` PreToolUse hook enforces this independently. The hook intentionally only fires for `Bash` tool calls from agent sessions; a workflow's `gh` call inside a GitHub Actions runner does not pass through that surface, so the hook does not (and should not) block CI workflows. `needs-human-review` and `policy-violation` remain manual-only by design.
+These exceptions apply ONLY to those two workflows. An interactive agent session (claude / cursor / codex) calling `gh pr edit --remove-label` for any of the four protected labels remains forbidden — the `scripts/hooks/label-removal-guard.sh` PreToolUse hook enforces this independently. The hook intentionally only fires for `Bash` tool calls from agent sessions; a workflow's `gh` call inside a GitHub Actions runner does not pass through that surface, so the hook does not (and should not) block CI workflows. `needs-human-review`, `policy-violation`, and `human-hold` remain manual-only by design.
 
 **Disabling the scheduled sweep.** The 15-minute cron is opt-out via `auto_clear_labels.scheduled_sweep_enabled: false` in `.github/review-policy.yml`. Default is `true`. Set to `false` if your repo has high PR volume and the event-driven path is reliably fast enough that the cron becomes pure noise — but expect occasional stuck `needs-external-review` labels on the 👍-after-last-push case (which the sweep would otherwise catch). The event-driven path remains active regardless of this setting.
 
@@ -796,7 +796,7 @@ The workflows shipped under `.github/workflows/` ENFORCE merge gating only when 
 
 Each repo using this template must mark these as required on `main` (Settings → Branches → Branch protection rule):
 
-- **`Label Gate`** — fails when any of `needs-external-review`, `needs-human-review`, or `policy-violation` is on the PR. The hard gate behind the doctrine in [Agent prohibitions](#agent-prohibitions).
+- **`Label Gate`** — fails when any of `needs-external-review`, `needs-human-review`, `policy-violation`, or `human-hold` is on the PR. The hard gate behind the doctrine in [Agent prohibitions](#agent-prohibitions).
 - **`Self-Review Required`** — fails when the PR body lacks a `## Self-Review` section (Dependabot-exempt).
 
 Audit a repo's branch protection with `scripts/audit-branch-protection.sh` (read-only; exits 3 if any canonical check is not required, with a fix recipe). Re-run after every protection change.

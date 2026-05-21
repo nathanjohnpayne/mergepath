@@ -16,7 +16,7 @@ permissions:
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
-    if: github.actor == 'dependabot[bot]'
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
     steps:
       # Check out the BASE ref (the target branch's tip), NOT the PR
       # HEAD. This workflow runs under pull_request_target which has
@@ -67,6 +67,23 @@ jobs:
             exit 1
           fi
           echo "::notice::Approving $PR_URL as $ACTING_AS (PR author: $PR_AUTHOR)"
+
+          has_human_hold() {
+            local labels
+            if ! labels=$(gh pr view "$PR_URL" --json labels --jq '.labels[].name'); then
+              echo "::error::Failed to read labels for $PR_URL while checking human-hold."
+              exit 1
+            fi
+            printf '%s\n' "$labels" | grep -Fxq human-hold
+          }
+
+          # `human-hold` is a human-remove-only hard freeze. Re-read
+          # labels at runtime so a hold added while this job is queued
+          # or waiting cannot be bypassed by the trigger-time payload.
+          if has_human_hold; then
+            echo "::notice::PR carries human-hold; skipping Dependabot auto-merge until the human removes the label."
+            exit 0
+          fi
 
           # Self-approval guard. The real condition is "the reviewer
           # token resolves to the PR's own author" — GitHub blocks
@@ -136,6 +153,10 @@ jobs:
           # returns exit 1 for all merge failures without a
           # distinguishing exit code, so we pattern-match stderr for
           # the documented auto-merge-unavailable GraphQL messages.
+          if has_human_hold; then
+            echo "::notice::PR carries human-hold immediately before --auto; skipping Dependabot auto-merge until the human removes the label."
+            exit 0
+          fi
           set +e
           AUTO_STDERR=$(gh pr merge --squash --auto "$PR_URL" 2>&1 1>/dev/null)
           AUTO_RC=$?
@@ -147,6 +168,10 @@ jobs:
           echo "$AUTO_STDERR" >&2
           if echo "$AUTO_STDERR" | grep -qiE 'auto[- ]?merge is not available|not in the correct state to enable auto[- ]?merge|auto[- ]?merge.*disabled|enablePullRequestAutoMerge'; then
             echo "::notice::--auto unavailable on this repo (likely no branch protection); falling back to immediate squash."
+            if has_human_hold; then
+              echo "::notice::PR carries human-hold immediately before fallback squash; skipping Dependabot auto-merge until the human removes the label."
+              exit 0
+            fi
             gh pr merge --squash "$PR_URL"
           else
             echo "::error::gh pr merge --auto failed for a non-auto-merge-unavailable reason. See stderr above. Not falling back to immediate squash; surface to audit."

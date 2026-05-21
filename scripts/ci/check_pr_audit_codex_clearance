@@ -168,6 +168,28 @@ else
   echo "  FAIL: $WORKFLOW must call pulls.listReviews via github.paginate with per_page:100 (PR #255 P2)" >&2
 fi
 
+# Structural assertion: merge-time label checks must be derived from
+# issue label events, not from pr.labels. `pr.labels` is current state
+# at audit time, so a blocking label present during merge but removed
+# afterward would be missed.
+if grep -qF 'async function labelWasPresentAtMerge' "$WORKFLOW" && \
+   grep -qF 'github.rest.issues.listEvents,' "$WORKFLOW" && \
+   grep -qF "await labelWasPresentAtMerge(" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW reconstructs blocking-label state from issue events at merge time"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must reconstruct blocking-label state from issue events at merge time" >&2
+fi
+
+if grep -qF "l => l.name === 'human-hold'" "$WORKFLOW"; then
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW still checks human-hold via current pr.labels" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW no longer checks human-hold via current pr.labels"
+fi
+
 echo
 if [ "$fail" -gt 0 ]; then
   echo "check_pr_audit_codex_clearance: $fail FAIL / $pass PASS" >&2

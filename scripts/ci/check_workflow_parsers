@@ -317,6 +317,93 @@ else
 fi
 
 echo
+echo "agent-review.yml blocking-label exact-match regression (#370)"
+
+# The pre-merge recheck must treat GitHub labels as an array of exact
+# names. A CSV join plus `case "*,human-hold,*"` false-matches a legal
+# label literally named `team,human-hold`, which can block unrelated PRs.
+workflow_label_query=$(grep -F -- "--jq '.labels[].name'" ".github/workflows/agent-review.yml" || true)
+if [ -n "$workflow_label_query" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: agent-review pre-merge recheck reads labels one per line"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: agent-review pre-merge recheck must read labels one per line with --jq '.labels[].name'" >&2
+fi
+
+legacy_csv_join=$(grep -F -- "--jq '[.labels[].name] | join(\",\")'" ".github/workflows/agent-review.yml" || true)
+if [ -z "$legacy_csv_join" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: agent-review pre-merge recheck does not collapse labels into CSV"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: agent-review pre-merge recheck still collapses labels into CSV" >&2
+  echo "$legacy_csv_join" | sed 's/^/    /' >&2
+fi
+
+exact_label_match=$(grep -F 'grep -Fxq "$blocking_label"' ".github/workflows/agent-review.yml" || true)
+if [ -n "$exact_label_match" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: agent-review pre-merge recheck uses fixed-string whole-line label matching"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: agent-review pre-merge recheck must use grep -Fxq for exact label names" >&2
+fi
+
+echo
+echo "dependabot-auto-merge.yml PR-author gate regression (#370)"
+
+dependabot_workflow=".github/workflows/dependabot-auto-merge.yml"
+if grep -Fq "github.event.pull_request.user.login == 'dependabot[bot]'" "$dependabot_workflow"; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge gates on pull_request.user.login"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must gate on github.event.pull_request.user.login" >&2
+fi
+
+if grep -Fq "github.actor == 'dependabot[bot]'" "$dependabot_workflow"; then
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge still gates on github.actor" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge does not gate on github.actor"
+fi
+
+if grep -Fq "!contains(github.event.pull_request.labels.*.name, 'human-hold')" "$dependabot_workflow"; then
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must not skip the whole job on trigger-time human-hold state" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge leaves human-hold enforcement to the runtime re-read"
+fi
+
+if grep -Fq "has_human_hold()" "$dependabot_workflow"; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge centralizes human-hold runtime checks"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must define a reusable has_human_hold runtime check" >&2
+fi
+
+if grep -Fq 'if ! labels=$(gh pr view "$PR_URL" --json labels --jq' "$dependabot_workflow"; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot human-hold lookup fails closed on label-read errors"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot human-hold lookup must fail closed when gh pr view cannot read labels" >&2
+fi
+
+hold_recheck_count=$(grep -Fc "if has_human_hold; then" "$dependabot_workflow" || true)
+if [ "$hold_recheck_count" -ge 3 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge checks human-hold before queued work and both merge paths"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must check human-hold before queued work, --auto, and fallback squash (got $hold_recheck_count checks)" >&2
+fi
+
+echo
 if [ "$fail" -gt 0 ]; then
   echo "check_workflow_parsers: $fail FAIL / $pass PASS" >&2
   exit 1

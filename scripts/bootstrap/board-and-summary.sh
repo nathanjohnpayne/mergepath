@@ -416,7 +416,7 @@ bootstrap::_print_summary() {
         ;;
       github-infra)
         if [ "$in_state" = "1" ]; then
-          done_lines="$done_lines  [done] GitHub repo created ($visibility) + 10 labels + reviewer invites + secrets
+          done_lines="$done_lines  [done] GitHub repo created ($visibility) + 11 labels + reviewer invites + secrets
 "
         else
           skipped_lines="$skipped_lines  [skip] GitHub repo + labels + invites + secrets (not in state file)

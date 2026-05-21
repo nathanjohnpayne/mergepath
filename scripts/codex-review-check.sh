@@ -500,20 +500,26 @@ log "reaction_threshold = $REACTION_THRESHOLD (source: $REACTION_THRESHOLD_SOURC
 # agent-review.yml when two reviewers have opposing opinionated states —
 # a human must resolve it. `policy-violation` is applied by
 # block-self-approval when a reviewer bot tries to approve its own PR.
-# Both block merge categorically and are not resolvable by Phase 4a flow.
+# `human-hold` is a manual hard freeze. All three block merge
+# categorically and are not resolvable by Phase 4a flow.
 #
 # Note: `needs-external-review` is NOT a blocking label from this script's
 # perspective — it's the signal that this script should run, not a block.
 # Gate (c) resolves whether the external review is actually complete.
-PR_LABELS=$(echo "$PR_JSON" | jq -r '[.labels[].name] | join(",")')
-case ",$PR_LABELS," in
-  *,needs-human-review,*)
-    fail_gate "blocking label 'needs-human-review' present — human disagreement resolution required"
-    ;;
-  *,policy-violation,*)
-    fail_gate "blocking label 'policy-violation' present — policy violation must be resolved"
-    ;;
-esac
+pr_has_label() {
+  local label="$1"
+  echo "$PR_JSON" | jq -e --arg label "$label" 'any(.labels[].name; . == $label)' >/dev/null
+}
+
+if pr_has_label "needs-human-review"; then
+  fail_gate "blocking label 'needs-human-review' present — human disagreement resolution required"
+fi
+if pr_has_label "policy-violation"; then
+  fail_gate "blocking label 'policy-violation' present — policy violation must be resolved"
+fi
+if pr_has_label "human-hold"; then
+  fail_gate "blocking label 'human-hold' present — human hard hold must be released"
+fi
 
 # --- gate (a): CI checks green ---------------------------------------------
 
@@ -527,8 +533,8 @@ log "gate (a): checking CI state"
 # filter out checks that are EXPECTED to be failing during Phase 4a flow:
 #
 #   - "Label Gate" (from the "PR Review Policy" workflow) fails by design
-#     whenever `needs-external-review`, `needs-human-review`, or
-#     `policy-violation` is present on the PR. During Phase 4a, the first
+#     whenever `needs-external-review`, `needs-human-review`,
+#     `policy-violation`, or `human-hold` is present on the PR. During Phase 4a, the first
 #     of those labels is always set by pr-review-policy.yml, so Label Gate
 #     will fail. It's the enforcement mechanism for "don't merge until
 #     external review clears" — NOT a code-quality signal. We verify
@@ -610,7 +616,7 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq --argjson required_names "${REQUIRED_JSON:
     # Filter out the known "expected to fail during Phase 4a" check.
     # Label Gate lives in the "PR Review Policy" workflow and fails by
     # design whenever needs-external-review / needs-human-review /
-    # policy-violation is set. That enforcement is what Phase 4a is
+    # policy-violation / human-hold is set. That enforcement is what Phase 4a is
     # trying to unblock; we verify clearance separately in gate (c).
     | select(
         (.workflow != "PR Review Policy") or

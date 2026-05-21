@@ -444,12 +444,14 @@ keyring active is your agent identity. No switch needed for commits.
 
 10.6. Never use `gh pr edit ... --remove-label` (or `--add-label`) for
      `needs-external-review`, `needs-human-review`, or
-     `policy-violation`. These are human-action labels; the
+     `policy-violation`. Agents may add `human-hold` to freeze a PR,
+     but must never remove it. These are human-action labels; the
      `scripts/hooks/label-removal-guard.sh` PreToolUse hook blocks
-     such calls regardless of chat authorization. To request removal,
-     run: `scripts/request-label-removal.sh <PR#> <label>` — the
-     human clears it from any device and auto-merge fires
-     immediately. See REVIEW_POLICY.md § Agent prohibitions.
+     prohibited calls regardless of chat authorization. To request
+     removal, run: `scripts/request-label-removal.sh <PR#> <label>` —
+     the human clears it from any device and the PR can proceed once
+     the normal merge gates are green. See REVIEW_POLICY.md § Agent
+     prohibitions.
 
      - For `needs-external-review` specifically, the auto-clear workflow
        (`.github/workflows/auto-clear-blocking-labels.yml`, #191/#195)
@@ -463,8 +465,10 @@ keyring active is your agent identity. No switch needed for commits.
      - `request-label-removal.sh` is the fallback when no triggering
        event arrived AND the sweep hasn't yet fired (or the gate is
        genuinely not yet met).
-     - `needs-human-review` and `policy-violation` remain manual-only
-       by design.
+     - `needs-human-review`, `policy-violation`, and `human-hold`
+       remain manual-only by design. `human-hold` supersedes every
+       merge path, including Codex clearance, reviewer approvals,
+       Dependabot auto-merge, and break-glass agent merge variables.
 
 ## After merging
 

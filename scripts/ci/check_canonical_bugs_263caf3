@@ -581,6 +581,88 @@ else
 fi
 
 echo
+echo "Bug 3 regression: codex-review-check.sh exact blocking-label match"
+
+# Inline-literal pattern: this is the jq predicate used by
+# scripts/codex-review-check.sh's blocking-label preflight. It must
+# match exact label names, not substrings inside a CSV serialization.
+CODEX_LABEL_FILTER='any(.labels[].name; . == $label)'
+
+run_label_filter() {
+  # Args: $1 = PR JSON, $2 = label to test.
+  echo "$1" | jq -e --arg label "$2" "$CODEX_LABEL_FILTER" >/dev/null
+}
+
+LABELS_EXACT='{"labels":[{"name":"human-hold"}]}'
+LABELS_COMMA='{"labels":[{"name":"team,human-hold"}]}'
+LABELS_OTHER='{"labels":[{"name":"needs-human-review"},{"name":"policy-violation"}]}'
+LABELS_EMPTY='{"labels":[]}'
+
+set +e
+run_label_filter "$LABELS_EXACT" "human-hold"
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: exact human-hold label matches"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: exact human-hold label did not match" >&2
+fi
+
+set +e
+run_label_filter "$LABELS_COMMA" "human-hold"
+rc=$?
+set -e
+if [ "$rc" != "0" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: label 'team,human-hold' does NOT false-match human-hold"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: comma-containing label false-matched human-hold" >&2
+fi
+
+set +e
+run_label_filter "$LABELS_OTHER" "policy-violation"
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: exact policy-violation label matches"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: exact policy-violation label did not match" >&2
+fi
+
+set +e
+run_label_filter "$LABELS_EMPTY" "human-hold"
+rc=$?
+set -e
+if [ "$rc" != "0" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: empty labels do not match human-hold"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: empty labels unexpectedly matched human-hold" >&2
+fi
+
+if grep -Fq '[.labels[].name] | join(",")' "$CODEX_CHECK_SCRIPT"; then
+  fail=$((fail + 1))
+  echo "  FAIL: codex-review-check.sh still serializes labels as CSV before matching" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: codex-review-check.sh no longer serializes labels as CSV before matching"
+fi
+
+if grep -Fq 'any(.labels[].name; . == $label)' "$CODEX_CHECK_SCRIPT"; then
+  pass=$((pass + 1))
+  echo "  PASS: codex-review-check.sh uses the exact-name jq predicate"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: codex-review-check.sh is missing the exact-name jq predicate" >&2
+fi
+
+echo
 total=$((pass + fail))
 if [ "$fail" -gt 0 ]; then
   echo "check_canonical_bugs_263caf3: FAIL ($fail/$total failed)"
