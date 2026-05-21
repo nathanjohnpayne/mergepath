@@ -21,10 +21,12 @@
 #   4. Installs npm dependencies and runs the build.
 #
 # Best practices (from https://developer.1password.com/llms.txt):
-#   - Prefer .env.tpl with op:// references over Secure Note storage
-#   - Use `op run --env-file` for dev servers instead of writing .env
+#   - Prefer 1Password Environments for runtime variable sets
+#   - Use `op run --environment <env_id> -- <command>` for runtime use
+#   - Use mounted Environment .env files when the tool requires dotenv
 #   - Never pass secrets as CLI arguments (use stdin or --template)
-#   - Use `op inject` to resolve op:// references in template files
+#   - Use `op inject` only when generating a gitignored file is required
+#   - Treat Secure Note notesPlain storage as legacy compatibility
 # ──────────────────────────────────────────────────────────────
 set -eo pipefail
 

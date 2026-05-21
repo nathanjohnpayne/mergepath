@@ -144,6 +144,17 @@ Implementation: `scripts/bootstrap/github-infra.sh`.
 5. Prompt for and provision optional LLM secrets (`ANTHROPIC_API_KEY`,
    `OPENAI_API_KEY`) with skip option.
 
+For runtime application secrets in newly bootstrapped repos, prefer
+1Password Environments over new Secure Note / `notesPlain` bootstrap
+entries. The shared model is: use Environments and `op run` for
+runtime variable sets, use the 1Password MCP Server only for attended
+Codex Environment workflows, use the 1Password local `.env` validation
+hook for supported non-Codex agents that read mounted Environment
+files, and use `.env.tpl` + `op inject` only when the repo truly needs
+a generated config file on disk. Adoption decisions for these adapters
+belong to the 1Password audit ADR workstream; this runbook records the
+current compatibility guidance.
+
 All write-path `gh` calls run under the author identity
 (`nathanjohnpayne`) via a stage-scope `gh auth switch` wrap. The
 prior active account is captured at stage entry and restored at every

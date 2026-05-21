@@ -19,6 +19,33 @@ If the project uses Firebase or Google Cloud, prefer the canonical
   for a deploy session.
 - If an `op` command fails with a sign-in or biometric error during deploy, follow the pause-and-prompt procedure in [operating-rules.md](operating-rules.md#1password-cli-authentication-failures). Do not retry or work around the failure without the human present.
 
+## Runtime 1Password secrets for agents
+
+As of the 2026-05-21 reconciliation against 1Password Environments
+and the 1Password Environments MCP Server for Codex docs, use this
+descriptive model when advising repos:
+
+- Portable core: 1Password Environments, secret references,
+  `op run --environment <environment_id> -- <command>`, `op inject`
+  for generated config files, and scoped service-account tokens for
+  CI/headless work.
+- Codex: use the official 1Password Environments MCP Server for Codex
+  where available; it is Codex-specific today and should not be
+  described as a universal agent adapter.
+- Claude Code, Cursor, GitHub Copilot, and Windsurf: use the
+  1Password local `.env` validation hook when the repo uses mounted
+  1Password Environment files.
+- CI/headless: use service-account tokens only when an approved ticket
+  has scoped the token, vault/Environment access, rotation, and log
+  masking. Do not use service-account tokens as a convenience fallback
+  for attended local agents.
+- Existing Mergepath scripts: shelling out to `op read`, `op run`, or
+  `op inject` remains acceptable. Do not introduce a language-SDK
+  migration unless a separate design decision calls for it.
+
+Never ask a human to paste raw secrets into chat or issue comments, and
+never print resolved secret values in logs.
+
 ## Credential source debugging
 
 When `op-firebase-deploy` runs, it prints a single line on stderr identifying which step in the [Deploy credential precedence](../../DEPLOYMENT.md#deploy-credential-precedence-canonical) won:
