@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# scripts/ci/check_bootstrap_sh — CI entry point for scripts/bootstrap.sh tests.
+#
+# Wraps tests/test_bootstrap_sh.sh so the repo_lint workflow catches
+# regressions in the legacy per-repo config restore helper.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_bootstrap_sh.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_bootstrap_sh: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"

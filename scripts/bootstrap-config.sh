@@ -1,12 +1,14 @@
-# bootstrap-config.sh — Repo-specific 1Password item mappings
+# bootstrap-config.sh — Repo-specific 1Password template mappings
 #
-# Each entry: "1password_item_id:relative_file_path"
-# The item's notesPlain field stores the file contents.
+# Each entry: "template_path:output_path"
+# Templates contain op:// references resolved by `op inject`.
+# Templates are committed to git; generated output files are gitignored.
 #
-# To add a new file:
-#   1. Store it: op item create --category="Secure Note" --title="<Repo> Local Config (<filename>)" --vault=Private --tags=bootstrap "notesPlain=$(cat <file>)"
-#   2. Copy the item ID and add an entry below.
+# Example:
+#   1. Create .env.tpl with op:// references.
+#   2. Add ".env.tpl:.env.local" below.
+#   3. Run ./scripts/bootstrap.sh --force.
 
-BOOTSTRAP_FILES=(
-  # "item_id:.env.local"
+INJECT_FILES=(
+  # ".env.tpl:.env.local"
 )
