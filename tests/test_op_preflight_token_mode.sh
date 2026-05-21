@@ -101,7 +101,13 @@ reset_logs() {
 }
 
 mode_for_file() {
-  stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"
+  local mode
+  mode="$(stat -c %a "$1" 2>/dev/null || true)"
+  if [[ -n "$mode" ]]; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  stat -f %Lp "$1"
 }
 
 make_interactive_cache() {
