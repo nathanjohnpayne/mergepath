@@ -556,6 +556,26 @@ count_potential_issues_for_sha() {
   '
 }
 
+status_context_fast_path_blocked_by_comment() {
+  local latest class comment_id comment_created
+  latest=$(scan_latest_comment)
+  if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
+    return 1
+  fi
+
+  class=$(classify_comment "$(echo "$latest" | jq -r '.body')")
+  case "$class" in
+    rate_limit|in_progress)
+      comment_id=$(echo "$latest" | jq -r '.id')
+      comment_created=$(echo "$latest" | jq -r '.created_at')
+      log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class created=$comment_created still requires the comment-driven state machine"
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
 post_retry_trigger() {
   # Strip the `[bot]` suffix that GitHub REST uses for App logins —
   # @-mentions address the user-facing handle (`@coderabbitai`), not
@@ -727,8 +747,10 @@ if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
   INITIAL_CTX=$(check_status_context)
   log "initial CodeRabbit StatusContext = $INITIAL_CTX on $HEAD_SHA"
   if [ "$INITIAL_CTX" = "success" ]; then
-    log "StatusContext success — entering fast-path verdict (scans inline findings before clearance)"
-    emit_status_context_verdict "$INITIAL_CTX"
+    if ! status_context_fast_path_blocked_by_comment; then
+      log "StatusContext success — entering fast-path verdict (scans inline findings before clearance)"
+      emit_status_context_verdict "$INITIAL_CTX"
+    fi
   fi
 fi
 
@@ -747,8 +769,10 @@ while :; do
   if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
     LOOP_CTX=$(check_status_context)
     if [ "$LOOP_CTX" = "success" ]; then
-      log "CodeRabbit StatusContext flipped to success mid-loop on $HEAD_SHA — entering fast-path verdict"
-      emit_status_context_verdict "$LOOP_CTX"
+      if ! status_context_fast_path_blocked_by_comment; then
+        log "CodeRabbit StatusContext flipped to success mid-loop on $HEAD_SHA — entering fast-path verdict"
+        emit_status_context_verdict "$LOOP_CTX"
+      fi
     fi
   fi
 
@@ -793,17 +817,17 @@ while :; do
       SLEEP_FOR=$((WINDOW_SECONDS + RATE_LIMIT_BUFFER_SECONDS))
       # Clamp against remaining budget — if the published rate-limit
       # window exceeds max_wait_seconds anyway, there's no point
-      # burning through the entire sleep only to time out on the next
-      # iteration. Time out immediately instead so the caller sees a
-      # prompt, well-formed timeout rather than a stalled process.
-      # See #140 round-2 Codex finding (P2, line 392).
+      # burning through the entire sleep. Surface it as the same hard
+      # rate-limit stalled state callers already treat as non-advisory
+      # instead of a generic timeout that auto-merge may skip past.
+      # See #140 round-2 Codex finding (P2, line 392), then #386.
       NOW_EPOCH=$(date +%s)
       ELAPSED=$((NOW_EPOCH - START_EPOCH))
       REMAINING=$((MAX_WAIT_SECONDS - ELAPSED))
       if [ "$SLEEP_FOR" -ge "$REMAINING" ]; then
-        log "rate-limit window (${SLEEP_FOR}s) exceeds remaining budget (${REMAINING}s) — timing out"
+        log "rate-limit window (${SLEEP_FOR}s) exceeds remaining budget (${REMAINING}s) — stalling"
         RATE_LIMIT_REVIEW=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
-        emit_json_and_exit "timeout" 4 "$RATE_LIMIT_REVIEW" 0
+        emit_json_and_exit "rate_limit_stalled" 5 "$RATE_LIMIT_REVIEW" 0
       fi
       log "rate-limited; sleeping ${SLEEP_FOR}s (window=${WINDOW_SECONDS}s + ${RATE_LIMIT_BUFFER_SECONDS}s buffer)"
       sleep "$SLEEP_FOR"
