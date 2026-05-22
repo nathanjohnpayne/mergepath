@@ -234,9 +234,11 @@ jobs:
               //      the sync script's branch-naming convention
               //      (`mergepath-sync/<short-sha>`) and never used for
               //      hand-authored work.
-              //   4. PR title matches `(mergepath@[0-9a-f]{7,40})` — the
-              //      canonical title format the sync script emits,
-              //      identifying the upstream commit.
+              //   4. PR title contains `mergepath@[0-9a-f]{7,40}` — the
+              //      canonical title marker the sync script emits,
+              //      identifying the upstream commit. Per-commit sync PRs
+              //      use `(mergepath@<sha>)`; `--sync-all` PRs use
+              //      `to mergepath@<sha>`.
               //
               // Hand-creating all four signals at once is possible but is
               // an explicit, traceable action that would surface during
@@ -250,7 +252,7 @@ jobs:
                 pr.head && pr.head.ref &&
                 pr.head.ref.startsWith('mergepath-sync/');
               const hasMergepathMarker =
-                /\(mergepath@[0-9a-f]{7,40}\)/.test(pr.title || '');
+                /\bmergepath@[0-9a-f]{7,40}\b/.test(pr.title || '');
               const isMergepathSyncPR =
                 isTrustedSyncAuthor &&
                 isSameRepoHead &&

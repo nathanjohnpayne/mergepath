@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# check_pr_audit_sync_exemption — regression coverage for the
+# propagation-PR exemption in .github/workflows/pr-audit.yml.
+#
+# Issue #374 Pattern C: sync-all PRs use titles like
+# "sync: bulk reconcile to mergepath@b12e7d7" while the audit used to
+# require the parenthesized per-commit form "(mergepath@b12e7d7)".
+# The title marker is corroborating only; the trusted author,
+# same-repo head, and mergepath-sync/* branch guards remain required.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+WORKFLOW=".github/workflows/pr-audit.yml"
+
+if [ ! -e "$WORKFLOW" ]; then
+  echo "check_pr_audit_sync_exemption: missing $WORKFLOW" >&2
+  exit 1
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "check_pr_audit_sync_exemption: SKIP — node not on PATH" >&2
+  exit 0
+fi
+
+RUNNER=$(cat <<'NODE_EOF'
+const authorIdentity = 'nathanjohnpayne';
+const context = { repo: { owner: 'nathanjohnpayne', repo: 'matchline' } };
+
+function isMergepathSyncPR(pr) {
+  const isTrustedSyncAuthor =
+    pr.user && pr.user.login === authorIdentity;
+  const isSameRepoHead =
+    pr.head && pr.head.repo &&
+    pr.head.repo.full_name === `${context.repo.owner}/${context.repo.repo}`;
+  const hasSyncBranchName =
+    pr.head && pr.head.ref &&
+    pr.head.ref.startsWith('mergepath-sync/');
+  const hasMergepathMarker =
+    /\bmergepath@[0-9a-f]{7,40}\b/.test(pr.title || '');
+  return Boolean(
+    isTrustedSyncAuthor &&
+    isSameRepoHead &&
+    hasSyncBranchName &&
+    hasMergepathMarker
+  );
+}
+
+function pr({ title, author = authorIdentity, headRef = 'mergepath-sync/sync-all-b12e7d7', headRepo = 'nathanjohnpayne/matchline' }) {
+  return {
+    title,
+    user: { login: author },
+    head: {
+      ref: headRef,
+      repo: { full_name: headRepo },
+    },
+  };
+}
+
+const cases = [
+  {
+    name: 'sync-all title without parentheses is exempt when all provenance guards match',
+    expected: true,
+    pr: pr({ title: 'sync: bulk reconcile to mergepath@b12e7d7' }),
+  },
+  {
+    name: 'per-commit parenthesized title remains exempt',
+    expected: true,
+    pr: pr({ title: 'sync: update helper (mergepath@b12e7d7)', headRef: 'mergepath-sync/b12e7d7' }),
+  },
+  {
+    name: 'ordinary branch mentioning mergepath marker is not exempt',
+    expected: false,
+    pr: pr({ title: 'docs: mention mergepath@b12e7d7 in notes', headRef: 'feature/mentions-mergepath' }),
+  },
+  {
+    name: 'wrong author with sync branch and marker is not exempt',
+    expected: false,
+    pr: pr({ title: 'sync: bulk reconcile to mergepath@b12e7d7', author: 'nathanpayne-codex' }),
+  },
+  {
+    name: 'fork head with sync branch and marker is not exempt',
+    expected: false,
+    pr: pr({ title: 'sync: bulk reconcile to mergepath@b12e7d7', headRepo: 'somebody/matchline' }),
+  },
+  {
+    name: 'sync branch without mergepath marker is not exempt',
+    expected: false,
+    pr: pr({ title: 'sync: bulk reconcile latest templates' }),
+  },
+];
+
+let failures = 0;
+for (const tc of cases) {
+  const actual = isMergepathSyncPR(tc.pr);
+  if (actual === tc.expected) {
+    console.log(`  PASS: ${tc.name}`);
+  } else {
+    failures += 1;
+    console.error(`  FAIL: ${tc.name} (expected=${tc.expected}, actual=${actual})`);
+  }
+}
+
+process.exit(failures === 0 ? 0 : 1);
+NODE_EOF
+)
+
+pass=0
+fail=0
+
+if node -e "$RUNNER"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+fi
+
+if grep -qF '\bmergepath@[0-9a-f]{7,40}\b' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW accepts mergepath@<sha> title markers with or without parentheses"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must use the relaxed mergepath@<sha> title marker regex" >&2
+fi
+
+if grep -qF '\(mergepath@[0-9a-f]{7,40}\)' "$WORKFLOW"; then
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW still carries the old parenthesis-required marker regex" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW no longer requires parentheses around mergepath@<sha>"
+fi
+
+echo
+if [ "$fail" -gt 0 ]; then
+  echo "check_pr_audit_sync_exemption: $fail FAIL / $pass PASS" >&2
+  exit 1
+fi
+echo "check_pr_audit_sync_exemption: PASS ($pass test groups)"
