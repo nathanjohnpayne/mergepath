@@ -713,10 +713,14 @@ emit_from_session_file() (
     if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] || [[ ! -s "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
       exit 2
     fi
-    if [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" && "${GOOGLE_APPLICATION_CREDENTIALS}" == "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE}" ]]; then
+    if [[ "${OP_PREFLIGHT_CHECK_MODE:-0}" != "1" && -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" && "${GOOGLE_APPLICATION_CREDENTIALS}" == "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE}" ]]; then
       current_firebase_project="$(detect_firebase_project 2>/dev/null || true)"
       if [[ -z "$current_firebase_project" || "$current_firebase_project" != "${OP_PREFLIGHT_FIREBASE_PROJECT:-}" ]]; then
         echo "# WARNING: cached Firebase project SA key is for '${OP_PREFLIGHT_FIREBASE_PROJECT:-unknown}', but current project is '${current_firebase_project:-none}'; refreshing deploy credentials." >&2
+        exit 2
+      fi
+      if ! firebase_sa_matches_project "${GOOGLE_APPLICATION_CREDENTIALS}" "$current_firebase_project"; then
+        echo "# WARNING: cached Firebase project SA key file does not match current project '$current_firebase_project'; refreshing deploy credentials." >&2
         exit 2
       fi
     fi
