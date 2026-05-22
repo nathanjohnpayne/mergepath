@@ -769,6 +769,81 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 23e: compound commands with leading allowed gh issue subcommands
+# followed by a guarded merge are blocked before the leading allow-exit
+# can bypass the merge guard (#348). Covers the known issue allow-exit
+# family: close / view / list / edit.
+# ---------------------------------------------------------------------------
+for leading_issue_subcommand in close view list edit; do
+  case "$leading_issue_subcommand" in
+    list) leading_issue_cmd="gh issue list" ;;
+    *) leading_issue_cmd="gh issue $leading_issue_subcommand 7" ;;
+  esac
+  set +e
+  out=$(run_hook "$leading_issue_cmd && gh pr merge --admin 123" "nathanjohnpayne" "0" "CLEAN" "" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -ne 2 ]; then
+    fail "compound issue-$leading_issue_subcommand then merge: exit $rc, expected 2; output: $out"
+  elif ! echo "$out" | grep -qi "#348"; then
+    fail "compound issue-$leading_issue_subcommand then merge: diagnostic missing #348; output: $out"
+  elif ! echo "$out" | grep -qi "gh pr merge"; then
+    fail "compound issue-$leading_issue_subcommand then merge: diagnostic missing guarded merge label; output: $out"
+  else
+    pass "compound issue-$leading_issue_subcommand then merge: blocked by #348 fail-closed guard"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# Test 23f: compound command with a leading allowed gh pr view followed by
+# a guarded merge is also blocked. This covers the PR allow-exit shape,
+# not just the issue allow-exit shape (#348).
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh pr view 7 && gh pr merge 123 --squash' "nathanjohnpayne" "0" "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "compound pr-view then merge: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -qi "#348"; then
+  fail "compound pr-view then merge: diagnostic missing #348; output: $out"
+else
+  pass "compound pr-view then merge: blocked by #348 fail-closed guard"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 23g: gh issue create remains allowed as a single command, but a
+# compound issue-create followed by a guarded merge is blocked. This keeps
+# the intended issue-create workflow while closing the chained bypass.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh issue create --title "Bug" --body "filed" && gh pr merge --admin 123' "nathanjohnpayne" "0" "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "compound issue-create then merge: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -qi "#348"; then
+  fail "compound issue-create then merge: diagnostic missing #348; output: $out"
+else
+  pass "compound issue-create then merge: issue-create stays allowed only as a single gh command"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 23h: multiple gh invocations are allowed when none is a guarded
+# write. The #348 fail-closed rule is scoped to compounds that contain
+# pr create/merge/comment/review or issue comment.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh issue close 7 && gh issue view 7' "nathanjohnpayne" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "compound unguarded issue commands: allowed"
+else
+  fail "compound unguarded issue commands: exit $rc, expected 0; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
 # Test 24: gh pr review --approve self-approve on over-threshold PR
 # (Authoring-Agent: claude + active=nathanpayne-claude + size > threshold)
 # → blocked. Uses a synthetic body that names claude as the authoring
