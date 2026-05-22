@@ -39,7 +39,11 @@ gh account, set once per machine: `gh auth switch -u nathanpayne-claude`
 time `gh auth login` per identity per machine). With this convention:
 
 - Reviewer-identity writes (`gh pr review --comment` from your agent
-  identity) just work — no `GH_TOKEN` switch, no `gh auth switch`.
+  identity) require active keyring = that reviewer identity AND the
+  hook's expected reviewer resolving to that identity. The hook checks
+  `GH_PR_GUARD_EXPECTED_REVIEWER`, then `MERGEPATH_AGENT`, then the
+  `claude` default. If either is uncertain, use
+  `scripts/gh-as-reviewer.sh`.
 - Author-identity writes (`gh pr create`, `gh pr merge`, `gh pr edit`
   for label changes) **MUST** use `scripts/gh-as-author.sh` — a single
   bash process that switches to the author identity, runs the wrapped
@@ -92,8 +96,12 @@ keyring active is your agent identity. No switch needed for commits.
    # Read-path API call (uses cached PAT, no biometric):
    GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login
 
-   # Write-path API call (gh keyring active = nathanpayne-<agent>):
+   # Reviewer write path. Use gh-as-reviewer.sh when the hook env
+   # may not identify the expected reviewer via
+   # GH_PR_GUARD_EXPECTED_REVIEWER or MERGEPATH_AGENT.
    gh pr review <PR#> --comment --body "..."
+   GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> \
+     scripts/gh-as-reviewer.sh -- gh pr review <PR#> --comment --body "..."
 
    # Author write (temporary switch via the gh-as-author.sh wrapper):
    scripts/gh-as-author.sh -- gh pr create ...
@@ -136,9 +144,12 @@ keyring active is your agent identity. No switch needed for commits.
 ## After opening the PR
 
 4. Review the PR under your reviewer identity. With your agent identity
-   active per the convention above, just run:
-   `gh pr review <PR#> --repo owner/repo --comment --body "..."`.
-   The review is correctly attributed to the agent reviewer identity.
+   active and the hook's expected reviewer resolving to that same
+   identity via `GH_PR_GUARD_EXPECTED_REVIEWER` or `MERGEPATH_AGENT`,
+   `gh pr review <PR#> --repo owner/repo --comment --body "..."`
+   attributes correctly. If the hook environment is uncertain, wrap
+   the call with
+   `GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- gh pr review ...`.
 5. Post comments on any issues found.
 6. Address each comment via fix commits (commits use git config, no
    gh auth involved — byline stays nathanjohnpayne).
