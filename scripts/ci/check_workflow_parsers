@@ -520,6 +520,61 @@ else
   echo "  PASS: Dependabot auto-merge does not gate on github.actor"
 fi
 
+echo
+echo "dependabot-auto-merge.yml reviewer-token fail-closed regression (#374 Pattern A)"
+
+if grep -Fq 'if [ -z "${GH_TOKEN:-}" ]; then' "$dependabot_workflow" &&
+   awk '
+     /GH_TOKEN is empty\. REVIEWER_ASSIGNMENT_TOKEN secret is not set/ {saw_error=NR}
+     saw_error && /exit 1/ {found=1}
+     END {exit found ? 0 : 1}
+   ' "$dependabot_workflow"; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge exits when REVIEWER_ASSIGNMENT_TOKEN is empty"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN/GH_TOKEN is empty" >&2
+fi
+
+if grep -Fq 'ACTING_AS=$(gh api user --jq .login' "$dependabot_workflow" &&
+   awk '
+     /gh api user returned empty/ {saw_error=NR}
+     saw_error && /exit 1/ {found=1}
+     END {exit found ? 0 : 1}
+   ' "$dependabot_workflow"; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge exits when REVIEWER_ASSIGNMENT_TOKEN cannot resolve an identity"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN cannot resolve an identity" >&2
+fi
+
+if grep -Fq 'if [ "$ACTING_AS" = "$PR_AUTHOR" ]; then' "$dependabot_workflow" &&
+   awk '
+     /GitHub blocks self-approval/ {saw_error=NR}
+     saw_error && /exit 1/ {found=1}
+     END {exit found ? 0 : 1}
+   ' "$dependabot_workflow"; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge exits when the reviewer token resolves to the PR author"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN resolves to the PR author" >&2
+fi
+
+if grep -Fq 'grep -Fxq "$ACTING_AS"' "$dependabot_workflow" &&
+   awk '
+     /NOT in \$POLICY available_reviewers/ {saw_error=NR}
+     saw_error && /exit 1/ {found=1}
+     END {exit found ? 0 : 1}
+   ' "$dependabot_workflow"; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge exits when the reviewer token is not allowlisted"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN is not in available_reviewers" >&2
+fi
+
 if grep -Fq "!contains(github.event.pull_request.labels.*.name, 'human-hold')" "$dependabot_workflow"; then
   fail=$((fail + 1))
   echo "  FAIL: Dependabot auto-merge must not skip the whole job on trigger-time human-hold state" >&2
