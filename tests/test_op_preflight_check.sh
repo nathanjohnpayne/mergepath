@@ -330,6 +330,111 @@ EOF
   pass "test_check_deploy_no_python3_probe: --check --mode deploy emits ADC without python3 probe"
 }
 
+# ---------------------------------------------------------------------------
+# test_deploy_mode_prefers_firebase_sa_over_gcp_adc (#154/#211): in a
+# Firebase repo, --mode deploy should cache the project Firebase-vault
+# SA key first and must not probe the stale shared GCP ADC item when
+# that key is available.
+# ---------------------------------------------------------------------------
+test_deploy_mode_prefers_firebase_sa_over_gcp_adc() {
+  local case_dir="$WORKDIR/firebase-sa-preflight"
+  local cache_dir="$case_dir/cache"
+  local bin_dir="$case_dir/bin"
+  local project="merge-path-test"
+  local op_log="$case_dir/op.log"
+  mkdir -p "$case_dir" "$cache_dir" "$bin_dir"
+
+  cat > "$case_dir/.firebaserc" <<JSON
+{ "projects": { "default": "$project" } }
+JSON
+
+  cat > "$bin_dir/op" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$op_log"
+case "\${1:-}" in
+  document)
+    shift
+    if [ "\${1:-}" != "get" ]; then
+      exit 1
+    fi
+    shift
+    out_path=""
+    while [ \$# -gt 0 ]; do
+      if [ "\${1:-}" = "--out-file" ]; then
+        shift
+        out_path="\${1:-}"
+      fi
+      shift || true
+    done
+    if [ -z "\$out_path" ]; then
+      exit 1
+    fi
+    cat > "\$out_path" <<'JSON'
+{
+  "type": "service_account",
+  "project_id": "merge-path-test",
+  "private_key_id": "fake-key-id",
+  "private_key": "REDACTED_TEST_FIXTURE_NOT_A_REAL_KEY",
+  "client_email": "firebase-deployer@merge-path-test.iam.gserviceaccount.com",
+  "client_id": "0",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token"
+}
+JSON
+    exit 0
+    ;;
+  read)
+    if [ "\${2:-}" = "op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential" ]; then
+      echo "FATAL: deploy preflight read stale shared GCP ADC despite Firebase SA key" >&2
+      exit 88
+    fi
+    # Cloudflare token is optional; return empty/unavailable.
+    exit 1
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$bin_dir/op"
+
+  local out err rc=0
+  (
+    cd "$case_dir"
+    PATH="$bin_dir:$STUB_DIR:$PATH" \
+      OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+      "$SCRIPT" --mode deploy >"$case_dir/out" 2>"$case_dir/err"
+  ) || rc=$?
+  out="$(cat "$case_dir/out")"
+  err="$(cat "$case_dir/err")"
+
+  if [ "$rc" -ne 0 ]; then
+    fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: rc=$rc; stderr=$err"
+    return
+  fi
+  if ! echo "$out" | grep -q "export OP_PREFLIGHT_FIREBASE_SA_TMPFILE="; then
+    fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: missing Firebase SA marker export; out=$out"
+    return
+  fi
+  if ! echo "$out" | grep -q "export OP_PREFLIGHT_FIREBASE_PROJECT=$project"; then
+    fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: missing Firebase project export; out=$out"
+    return
+  fi
+  if echo "$out" | grep -q "OP_PREFLIGHT_ADC_TMPFILE"; then
+    fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: should not export shared ADC marker; out=$out"
+    return
+  fi
+  if grep -q "c2v6emkwppjzjjaq2bdqk3wnlm" "$op_log"; then
+    fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: op read touched shared GCP ADC; log=$(cat "$op_log")"
+    return
+  fi
+  if ! echo "$err" | grep -q "Firebase SA key ($project): loaded"; then
+    fail "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: summary missing Firebase SA loaded line; stderr=$err"
+    return
+  fi
+  pass "test_deploy_mode_prefers_firebase_sa_over_gcp_adc: Firebase SA cached before shared ADC"
+}
+
 test_check_fresh_cache
 test_check_missing_cache
 test_check_stale_cache
@@ -338,6 +443,7 @@ test_status_alias
 test_quiet_mode
 test_default_mode_is_review
 test_check_deploy_no_python3_probe
+test_deploy_mode_prefers_firebase_sa_over_gcp_adc
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
