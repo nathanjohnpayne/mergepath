@@ -162,6 +162,26 @@ run_hook_review() {
     bash "$HOOK" <<<"$payload"
 }
 
+run_hook_agent_context() {
+  local cmd="$1"
+  local stub_user="${2:-nathanpayne-claude}"
+  local agent="${3:-}"
+  local expected_reviewer="${4:-}"
+  local skip_id="${5:-0}"
+  local merge_state="${6:-CLEAN}"
+  local labels="${7:-}"
+  local payload
+  payload=$(jq -n --arg c "$cmd" '{tool_input: {command: $c}}')
+  PATH="$STUB_DIR:$PATH" \
+  STUB_ACTIVE_USER="$stub_user" \
+  STUB_MERGE_STATE="$merge_state" \
+  STUB_LABELS="$labels" \
+  MERGEPATH_AGENT="$agent" \
+  GH_PR_GUARD_EXPECTED_REVIEWER="$expected_reviewer" \
+  BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK="$skip_id" \
+    bash "$HOOK" <<<"$payload"
+}
+
 # ---------------------------------------------------------------------------
 # Test 1: gh pr create with correct identity + required body → exit 0
 # ---------------------------------------------------------------------------
@@ -526,6 +546,57 @@ if [ "$rc" -eq 0 ]; then
   pass "pr comment + expected-reviewer override: codex active allowed when expected=codex"
 else
   fail "pr comment + expected-reviewer override: exit $rc, expected 0; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 18c2: MERGEPATH_AGENT fallback — codex is valid when the
+# operating agent is codex even if GH_PR_GUARD_EXPECTED_REVIEWER is
+# unset/empty. This keeps the hook aligned with identity-check.sh
+# --expect-reviewer.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook_agent_context 'gh pr comment 123 --body "ping"' "nathanpayne-codex" "codex" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "pr comment + MERGEPATH_AGENT fallback: codex active allowed when agent=codex"
+else
+  fail "pr comment + MERGEPATH_AGENT fallback: exit $rc, expected 0; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 18c3: explicit expected-reviewer override wins over
+# MERGEPATH_AGENT. This preserves harness-controlled review sessions
+# where the expected reviewer is intentionally pinned.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook_agent_context 'gh pr comment 123 --body "ping"' "nathanpayne-codex" "codex" "nathanpayne-claude" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "pr comment + explicit override precedence: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -q "GH_PR_GUARD_EXPECTED_REVIEWER"; then
+  fail "pr comment + explicit override precedence: diagnostic missing override source; output: $out"
+else
+  pass "pr comment + explicit override precedence: expected-reviewer override beats MERGEPATH_AGENT"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 18c4: MERGEPATH_AGENT fallback blocks a different active
+# reviewer identity, and the diagnostic names the derived reviewer.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook_agent_context 'gh pr comment 123 --body "ping"' "nathanpayne-claude" "cursor" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "pr comment + MERGEPATH_AGENT mismatch: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -q "nathanpayne-cursor"; then
+  fail "pr comment + MERGEPATH_AGENT mismatch: diagnostic missing derived cursor reviewer; output: $out"
+elif ! echo "$out" | grep -q "MERGEPATH_AGENT"; then
+  fail "pr comment + MERGEPATH_AGENT mismatch: diagnostic missing MERGEPATH_AGENT source; output: $out"
+else
+  pass "pr comment + MERGEPATH_AGENT mismatch: blocks wrong active reviewer"
 fi
 
 # ---------------------------------------------------------------------------

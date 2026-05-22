@@ -40,8 +40,10 @@ time `gh auth login` per identity per machine). With this convention:
 
 - Reviewer-identity writes (`gh pr review --comment` from your agent
   identity) require active keyring = that reviewer identity AND the
-  hook environment's `GH_PR_GUARD_EXPECTED_REVIEWER` matching that
-  identity. If either is uncertain, use `scripts/gh-as-reviewer.sh`.
+  hook's expected reviewer resolving to that identity. The hook checks
+  `GH_PR_GUARD_EXPECTED_REVIEWER`, then `MERGEPATH_AGENT`, then the
+  `claude` default. If either is uncertain, use
+  `scripts/gh-as-reviewer.sh`.
 - Author-identity writes (`gh pr create`, `gh pr merge`, `gh pr edit`
   for label changes) **MUST** use `scripts/gh-as-author.sh` — a single
   bash process that switches to the author identity, runs the wrapped
@@ -95,7 +97,8 @@ keyring active is your agent identity. No switch needed for commits.
    GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login
 
    # Reviewer write path. Use gh-as-reviewer.sh when the hook env
-   # may not have GH_PR_GUARD_EXPECTED_REVIEWER=nathanpayne-<agent>.
+   # may not identify the expected reviewer via
+   # GH_PR_GUARD_EXPECTED_REVIEWER or MERGEPATH_AGENT.
    gh pr review <PR#> --comment --body "..."
    GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> \
      scripts/gh-as-reviewer.sh -- gh pr review <PR#> --comment --body "..."
@@ -141,7 +144,8 @@ keyring active is your agent identity. No switch needed for commits.
 ## After opening the PR
 
 4. Review the PR under your reviewer identity. With your agent identity
-   active and `GH_PR_GUARD_EXPECTED_REVIEWER` set to that same identity,
+   active and the hook's expected reviewer resolving to that same
+   identity via `GH_PR_GUARD_EXPECTED_REVIEWER` or `MERGEPATH_AGENT`,
    `gh pr review <PR#> --repo owner/repo --comment --body "..."`
    attributes correctly. If the hook environment is uncertain, wrap
    the call with

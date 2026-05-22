@@ -47,8 +47,9 @@
 #     - gh issue comment <issue#> --body "..."
 #
 #   For all three, the keyring's active account must exactly match the
-#   operating agent's REVIEWER identity (nathanpayne-<agent>, default
-#   nathanpayne-claude; override via GH_PR_GUARD_EXPECTED_REVIEWER).
+#   operating agent's REVIEWER identity. The expected reviewer resolves
+#   as: explicit GH_PR_GUARD_EXPECTED_REVIEWER override, else
+#   nathanpayne-$MERGEPATH_AGENT, else nathanpayne-claude.
 #   Posting these as the AUTHOR identity (nathanjohnpayne), or as the
 #   wrong reviewer identity after cross-session keyring drift, breaks
 #   the audit-trail convention REVIEW_POLICY.md depends on — reviewer
@@ -650,7 +651,18 @@ fi
 # The `gh pr review --approve` self-approve sub-guard runs after this
 # block — only if we made it past the basic byline check does the
 # self-approve question even arise.
-EXPECTED_REVIEWER="${GH_PR_GUARD_EXPECTED_REVIEWER:-nathanpayne-claude}"
+if [ -n "${GH_PR_GUARD_EXPECTED_REVIEWER:-}" ]; then
+  EXPECTED_REVIEWER="$GH_PR_GUARD_EXPECTED_REVIEWER"
+  EXPECTED_REVIEWER_SOURCE="GH_PR_GUARD_EXPECTED_REVIEWER"
+else
+  EXPECTED_REVIEWER_AGENT="${MERGEPATH_AGENT:-claude}"
+  EXPECTED_REVIEWER="nathanpayne-$EXPECTED_REVIEWER_AGENT"
+  if [ -n "${MERGEPATH_AGENT:-}" ]; then
+    EXPECTED_REVIEWER_SOURCE="MERGEPATH_AGENT"
+  else
+    EXPECTED_REVIEWER_SOURCE="default"
+  fi
+fi
 if [ "$PR_SUBCOMMAND" = "comment" ] || [ "$PR_SUBCOMMAND" = "review" ] || [ "$IS_ISSUE_COMMENT" -eq 1 ]; then
   if [ "${BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
     ACTIVE_GH_USER=$(gh config get -h github.com user 2>/dev/null || echo "")
@@ -676,11 +688,11 @@ if [ "$PR_SUBCOMMAND" = "comment" ] || [ "$PR_SUBCOMMAND" = "review" ] || [ "$IS
       echo "BLOCKED: $cmd_label is about to run under active account '$ACTIVE_GH_USER' ($active_role)." >&2
       echo "" >&2
       echo "  Reviewer-byline commands (pr comment / pr review / issue comment)" >&2
-      echo "  must attribute to the operating agent's REVIEWER identity ('$EXPECTED_REVIEWER' for this hook invocation)." >&2
+      echo "  must attribute to the operating agent's REVIEWER identity ('$EXPECTED_REVIEWER' for this hook invocation, from $EXPECTED_REVIEWER_SOURCE)." >&2
       echo "  Posting as '$ACTIVE_GH_USER' breaks the audit-trail convention REVIEW_POLICY.md depends on." >&2
       echo "" >&2
       echo "  Fix once: gh auth switch -u $EXPECTED_REVIEWER" >&2
-      echo "  Or set GH_PR_GUARD_EXPECTED_REVIEWER=$ACTIVE_GH_USER only if that is this agent's true reviewer identity." >&2
+      echo "  Or set MERGEPATH_AGENT=<agent> / GH_PR_GUARD_EXPECTED_REVIEWER=$ACTIVE_GH_USER only if that is this agent's true reviewer identity." >&2
       echo "  Or wrap the single call: scripts/gh-as-reviewer.sh -- $cmd_label ..." >&2
       echo "  See REVIEW_POLICY.md § Operation-to-Identity Matrix." >&2
       exit 2
