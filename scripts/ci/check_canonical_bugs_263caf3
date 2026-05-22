@@ -42,7 +42,9 @@
 #          comment was a newer rate-limit notice. The helper returned
 #          cleared even though CodeRabbit explicitly had not reviewed
 #          the PR. The inverse matters too: an old rate-limit comment
-#          must not suppress a newer terminal SUCCESS status.
+#          must not suppress a newer terminal SUCCESS status. CodeRabbit
+#          edits its summary comment in place, so the regression uses
+#          updated_at/freshness rather than created_at alone.
 #
 # This check exercises the jq filter literals in isolation against
 # in-memory fixtures so a future edit can't silently regress either
@@ -1148,14 +1150,17 @@ case "$1" in
 JSON
           ;;
         repos/nathanjohnpayne/mergepath/issues/12345/comments)
-          comment_created_at="${STUB_COMMENT_CREATED_AT:-2999-01-01T00:00:00Z}"
+          comment_created_at="${STUB_COMMENT_CREATED_AT:-2998-01-01T00:00:00Z}"
+          comment_updated_at="${STUB_COMMENT_UPDATED_AT:-2999-01-01T00:00:00Z}"
+          comment_body_suffix="${STUB_COMMENT_BODY_SUFFIX- Reviewing files that changed from base and headsha.}"
           cat <<JSON
 [
   {
     "id": 6101,
     "created_at": "$comment_created_at",
+    "updated_at": "$comment_updated_at",
     "user": {"login": "coderabbitai[bot]"},
-    "body": "> [!WARNING]\n> ## Rate limit exceeded\n>\n> Please wait **10 minutes** before requesting another review."
+    "body": "> [!WARNING]\n> ## Rate limit exceeded\n>\n> Please wait **10 minutes** before requesting another review.$comment_body_suffix"
   }
 ]
 JSON
@@ -1241,8 +1246,10 @@ out=$(
     PATH="$SCRATCH:$PATH" \
     GH_TOKEN=fixture-token \
     CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
-    STUB_COMMENT_CREATED_AT="2999-01-01T00:00:00Z" \
+    STUB_COMMENT_CREATED_AT="2998-01-01T00:00:00Z" \
+    STUB_COMMENT_UPDATED_AT="2999-01-01T00:00:00Z" \
     STUB_STATUS_CREATED_AT="2999-01-01T00:00:01Z" \
+    STUB_COMMENT_BODY_SUFFIX="" \
     "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
 )
 rc=$?
@@ -1251,7 +1258,7 @@ if [ "$rc" = "0" ] &&
    echo "$out" | grep -q '"status": "cleared"' &&
    echo "$out" | grep -q "is older than status_created"; then
   pass=$((pass + 1))
-  echo "  PASS: newer StatusContext success clears despite an older rate-limit comment"
+  echo "  PASS: newer StatusContext success clears despite an older non-HEAD rate-limit comment"
 else
   fail=$((fail + 1))
   echo "  FAIL: stale rate-limit comment incorrectly suppressed a newer StatusContext success (rc=$rc)" >&2

@@ -427,7 +427,9 @@ classify_comment() {
 }
 
 # Scan the PR-level `issues/{pr}/comments` endpoint for the latest
-# CodeRabbit comment on or after HEAD_ANCHOR. Emits JSON to stdout.
+# CodeRabbit comment on or after HEAD_ANCHOR. CodeRabbit edits its
+# summary comment in place, so freshness is max(created_at, updated_at)
+# rather than created_at alone. Emits JSON to stdout.
 # Empty object {} if nothing qualifying yet.
 #
 # Only the issues endpoint is the terminal-state source. CodeRabbit's
@@ -448,9 +450,10 @@ scan_latest_comment() {
   latest=$(echo "$issue_comments" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
     [ .[]
       | select(.user.login == $bot)
-      | select(.created_at >= $after)
+      | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
+      | select(.fresh_at >= $after)
     ]
-    | sort_by(.created_at)
+    | sort_by(.fresh_at)
     | last // null
   ')
 
@@ -458,7 +461,7 @@ scan_latest_comment() {
     echo '{}'
     return
   fi
-  echo "$latest" | jq '{id, created_at, endpoint: "issues", body}'
+  echo "$latest" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}'
 }
 
 # Count unaddressed "Potential issue" / ⚠️ markers in the pulls inline
@@ -579,7 +582,7 @@ iso_on_or_after() {
 
 status_context_fast_path_blocked_by_comment() {
   local status_created_at=$1
-  local latest class comment_id comment_created
+  local latest class comment_id comment_fresh_at comment_body
   latest=$(scan_latest_comment)
   if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
     return 1
@@ -589,12 +592,17 @@ status_context_fast_path_blocked_by_comment() {
   case "$class" in
     rate_limit|in_progress)
       comment_id=$(echo "$latest" | jq -r '.id')
-      comment_created=$(echo "$latest" | jq -r '.created_at')
-      if iso_on_or_after "$comment_created" "$status_created_at"; then
-        log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class created=$comment_created is not older than status_created=$status_created_at"
+      comment_fresh_at=$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at')
+      comment_body=$(echo "$latest" | jq -r '.body')
+      if printf '%s' "$comment_body" | grep -Fq "$HEAD_SHA"; then
+        log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class explicitly references current HEAD $HEAD_SHA"
         return 0
       fi
-      log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class created=$comment_created is older than status_created=$status_created_at"
+      if iso_on_or_after "$comment_fresh_at" "$status_created_at"; then
+        log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class fresh_at=$comment_fresh_at is not older than status_created=$status_created_at"
+        return 0
+      fi
+      log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class fresh_at=$comment_fresh_at is older than status_created=$status_created_at"
       return 1
       ;;
   esac
@@ -818,9 +826,10 @@ while :; do
   COMMENT_BODY=$(echo "$LATEST" | jq -r '.body')
   COMMENT_ENDPOINT=$(echo "$LATEST" | jq -r '.endpoint')
   COMMENT_CREATED=$(echo "$LATEST" | jq -r '.created_at')
+  COMMENT_FRESH_AT=$(echo "$LATEST" | jq -r '.fresh_at // .updated_at // .created_at')
 
   CLASS=$(classify_comment "$COMMENT_BODY")
-  log "latest CodeRabbit comment id=$COMMENT_ID endpoint=$COMMENT_ENDPOINT class=$CLASS created=$COMMENT_CREATED"
+  log "latest CodeRabbit comment id=$COMMENT_ID endpoint=$COMMENT_ENDPOINT class=$CLASS created=$COMMENT_CREATED fresh_at=$COMMENT_FRESH_AT"
 
   case "$CLASS" in
     rate_limit)
