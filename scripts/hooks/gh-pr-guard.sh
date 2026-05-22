@@ -737,29 +737,13 @@ for i in "${!TOKENS[@]}"; do
       # Per-prefix value-flag map. nathanpayne-codex caught the
       # original bug (sudo -u, time -f, nice -n) on PR #66
       # round 6; the per-prefix scoping prevents the obvious
-      # over-fix from breaking `time -p`.
-      case "$CURRENT_PREFIX:$tok" in
-        sudo:-u|sudo:-g|sudo:-U|sudo:-h|sudo:-p|sudo:-r|sudo:-s|sudo:-t|sudo:-c|sudo:-D)
-          SKIP_PREFIX_VALUE=1
-          continue
-          ;;
-        time:-f|time:-o)
-          SKIP_PREFIX_VALUE=1
-          continue
-          ;;
-        nice:-n)
-          SKIP_PREFIX_VALUE=1
-          continue
-          ;;
-        ionice:-c|ionice:-n|ionice:-p)
-          SKIP_PREFIX_VALUE=1
-          continue
-          ;;
-        env:-u|env:-S)
-          SKIP_PREFIX_VALUE=1
-          continue
-          ;;
-      esac
+      # over-fix from breaking `time -p`. Keep this shared with
+      # the #348 compound pre-scan so both walks classify prefixes
+      # identically.
+      if prefix_flag_takes_value "$CURRENT_PREFIX" "$tok"; then
+        SKIP_PREFIX_VALUE=1
+        continue
+      fi
       # Otherwise: boolean flag of the current prefix (or a flag
       # of an unknown prefix, which we conservatively assume is
       # boolean to avoid eating `gh`). Stay in command position.
