@@ -555,6 +555,135 @@ EOF
   pass "test_deploy_mode_refreshes_unusable_cached_firebase_sa: unusable cached SA forces refresh"
 }
 
+# ---------------------------------------------------------------------------
+# test_deploy_mode_refreshes_mismatched_cached_firebase_sa (#154/#211):
+# a project-A Firebase SA cache must not be re-exported in project B
+# within the preflight TTL.
+# ---------------------------------------------------------------------------
+test_deploy_mode_refreshes_mismatched_cached_firebase_sa() {
+  local case_dir="$WORKDIR/firebase-sa-project-mismatch"
+  local cache_dir="$case_dir/cache"
+  local bin_dir="$case_dir/bin"
+  local cached_project="project-a"
+  local current_project="project-b"
+  local shared_adc_uri="op://Private/test-shared-adc-mismatch/credential"
+  local op_log="$case_dir/op.log"
+  local cached_sa_file="$case_dir/project-a-sa.json"
+  mkdir -p "$case_dir" "$cache_dir" "$bin_dir"
+
+  cat > "$case_dir/.firebaserc" <<JSON
+{ "projects": { "default": "$current_project" } }
+JSON
+  cat > "$cached_sa_file" <<JSON
+{
+  "type": "service_account",
+  "project_id": "$cached_project",
+  "private_key_id": "fake-key-id",
+  "private_key": "REDACTED_TEST_FIXTURE_NOT_A_REAL_KEY",
+  "client_email": "firebase-deployer@${cached_project}.iam.gserviceaccount.com",
+  "client_id": "0",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token"
+}
+JSON
+
+  local epoch
+  epoch=$(date +%s)
+  cat > "$cache_dir/op-preflight-.env" <<EOF
+OP_PREFLIGHT_CREATED_AT_EPOCH=$epoch
+OP_PREFLIGHT_TTL_SECONDS=14400
+OP_PREFLIGHT_AGENT=''
+OP_PREFLIGHT_MODE=deploy
+OP_PREFLIGHT_DONE=1
+GOOGLE_APPLICATION_CREDENTIALS=$cached_sa_file
+OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$cached_sa_file
+OP_PREFLIGHT_FIREBASE_PROJECT=$cached_project
+EOF
+  chmod 600 "$cache_dir/op-preflight-.env"
+
+  cat > "$bin_dir/op" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$op_log"
+case "\${1:-}" in
+  document)
+    shift
+    if [ "\${1:-}" != "get" ]; then
+      exit 1
+    fi
+    shift
+    out_path=""
+    while [ \$# -gt 0 ]; do
+      if [ "\${1:-}" = "--out-file" ]; then
+        shift
+        out_path="\${1:-}"
+      fi
+      shift || true
+    done
+    if [ -z "\$out_path" ]; then
+      exit 1
+    fi
+    cat > "\$out_path" <<'JSON'
+{
+  "type": "service_account",
+  "project_id": "project-b",
+  "private_key_id": "fake-key-id",
+  "private_key": "REDACTED_TEST_FIXTURE_NOT_A_REAL_KEY",
+  "client_email": "firebase-deployer@project-b.iam.gserviceaccount.com",
+  "client_id": "0",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token"
+}
+JSON
+    exit 0
+    ;;
+  read)
+    if [ "\${2:-}" = "$shared_adc_uri" ]; then
+      echo "FATAL: project mismatch should re-read current Firebase SA before shared GCP ADC" >&2
+      exit 88
+    fi
+    exit 1
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$bin_dir/op"
+
+  local out err rc=0
+  (
+    cd "$case_dir"
+    PATH="$bin_dir:$STUB_DIR:$PATH" \
+      OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+      GCP_ADC_OP_URI="$shared_adc_uri" \
+      "$SCRIPT" --mode deploy >"$case_dir/out" 2>"$case_dir/err"
+  ) || rc=$?
+  out="$(cat "$case_dir/out")"
+  err="$(cat "$case_dir/err")"
+
+  if [ "$rc" -ne 0 ]; then
+    fail "test_deploy_mode_refreshes_mismatched_cached_firebase_sa: rc=$rc; stderr=$err"
+    return
+  fi
+  if ! echo "$err" | grep -q "cached Firebase project SA key is for '$cached_project', but current project is '$current_project'"; then
+    fail "test_deploy_mode_refreshes_mismatched_cached_firebase_sa: missing project mismatch warning; stderr=$err"
+    return
+  fi
+  if ! grep -q "document get" "$op_log"; then
+    fail "test_deploy_mode_refreshes_mismatched_cached_firebase_sa: refresh did not re-read current Firebase SA; log=$(cat "$op_log")"
+    return
+  fi
+  if grep -qF "$shared_adc_uri" "$op_log"; then
+    fail "test_deploy_mode_refreshes_mismatched_cached_firebase_sa: refresh touched shared GCP ADC; log=$(cat "$op_log")"
+    return
+  fi
+  if ! echo "$out" | grep -q "export OP_PREFLIGHT_FIREBASE_PROJECT=$current_project"; then
+    fail "test_deploy_mode_refreshes_mismatched_cached_firebase_sa: missing refreshed current-project export; out=$out"
+    return
+  fi
+  pass "test_deploy_mode_refreshes_mismatched_cached_firebase_sa: project mismatch forces refresh"
+}
+
 test_check_fresh_cache
 test_check_missing_cache
 test_check_stale_cache
@@ -565,6 +694,7 @@ test_default_mode_is_review
 test_check_deploy_no_python3_probe
 test_deploy_mode_prefers_firebase_sa_over_gcp_adc
 test_deploy_mode_refreshes_unusable_cached_firebase_sa
+test_deploy_mode_refreshes_mismatched_cached_firebase_sa
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
