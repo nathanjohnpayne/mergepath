@@ -37,6 +37,15 @@
 #          the helper still returned exit 2 from the status-context
 #          fast-path and stalled otherwise mergeable PRs.
 #
+#   Bug 6: scripts/coderabbit-wait.sh trusted a SUCCESS CodeRabbit
+#          StatusContext even when the current-head PR-level CodeRabbit
+#          comment was a newer rate-limit notice. The helper returned
+#          cleared even though CodeRabbit explicitly had not reviewed
+#          the PR. The inverse matters too: an old rate-limit comment
+#          must not suppress a newer terminal SUCCESS status. CodeRabbit
+#          edits its summary comment in place, so the regression uses
+#          updated_at/freshness rather than created_at alone.
+#
 # This check exercises the jq filter literals in isolation against
 # in-memory fixtures so a future edit can't silently regress either
 # guard. Inline-literal pattern matches check_workflow_parsers /
@@ -1109,6 +1118,268 @@ if [ "$review_count" = "1" ] && [ "$sha_count" = "1" ]; then
 else
   fail=$((fail + 1))
   echo "  FAIL: mixed fixture count incorrect (review=$review_count sha=$sha_count)" >&2
+fi
+
+echo
+echo "Bug 6 regression: coderabbit-wait does not fast-clear rate-limit notices"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "$1" in
+  api)
+    shift
+    if [ "${1:-}" = "--paginate" ]; then
+      shift
+      case "${1:-}" in
+        repos/nathanjohnpayne/mergepath/issues/12345/timeline)
+          printf '[]\n'
+          ;;
+        repos/nathanjohnpayne/mergepath/commits/headsha/statuses)
+          status_created_at="${STUB_STATUS_CREATED_AT:-2999-01-01T00:00:00Z}"
+          cat <<JSON
+[
+  {
+    "context": "CodeRabbit",
+    "state": "success",
+    "created_at": "$status_created_at",
+    "creator": {"login": "coderabbitai[bot]"}
+  }
+]
+JSON
+          ;;
+        repos/nathanjohnpayne/mergepath/issues/12345/comments)
+          if [ "${STUB_ISSUE_COMMENTS_EMPTY:-0}" = "1" ]; then
+            printf '[]\n'
+            exit 0
+          fi
+          comment_created_at="${STUB_COMMENT_CREATED_AT:-2998-01-01T00:00:00Z}"
+          comment_updated_at="${STUB_COMMENT_UPDATED_AT:-2999-01-01T00:00:00Z}"
+          comment_body_suffix="${STUB_COMMENT_BODY_SUFFIX- Reviewing files that changed from base and headsha.}"
+          cat <<JSON
+[
+  {
+    "id": 6101,
+    "created_at": "$comment_created_at",
+    "updated_at": "$comment_updated_at",
+    "user": {"login": "coderabbitai[bot]"},
+    "body": "> [!WARNING]\n> ## Rate limit exceeded\n>\n> Please wait **10 minutes** before requesting another review.$comment_body_suffix"
+  }
+]
+JSON
+          ;;
+        repos/nathanjohnpayne/mergepath/pulls/12345/comments)
+          if [ "${STUB_INLINE_POTENTIAL:-0}" = "1" ]; then
+            inline_created_at="${STUB_INLINE_CREATED_AT:-2999-01-01T00:00:00Z}"
+            cat <<JSON
+[
+  {
+    "id": 7201,
+    "created_at": "$inline_created_at",
+    "updated_at": "$inline_created_at",
+    "commit_id": "headsha",
+    "in_reply_to_id": null,
+    "user": {"login": "coderabbitai[bot]"},
+    "body": "_⚠️ Potential issue_\\n\\nFresh inline finding."
+  }
+]
+JSON
+          else
+            printf '[]\n'
+          fi
+          ;;
+        repos/nathanjohnpayne/mergepath/pulls/12345/reviews)
+          printf '[]\n'
+          ;;
+        *)
+          printf 'unexpected paginated endpoint: %s\n' "${1:-}" >&2
+          exit 9
+          ;;
+      esac
+      exit 0
+    fi
+
+    case "${1:-}" in
+      repos/nathanjohnpayne/mergepath/pulls/12345)
+        cat <<'JSON'
+{"head":{"sha":"headsha"}}
+JSON
+        ;;
+      repos/nathanjohnpayne/mergepath/commits/headsha)
+        if [ "${2:-}" = "--jq" ]; then
+          printf '2999-01-01T00:00:00Z\n'
+        else
+          cat <<'JSON'
+{"commit":{"committer":{"date":"2999-01-01T00:00:00Z"}}}
+JSON
+        fi
+        ;;
+      *)
+        printf 'unexpected endpoint: %s\n' "${1:-}" >&2
+        exit 9
+        ;;
+    esac
+    ;;
+  *)
+    printf 'unexpected gh command: %s\n' "$1" >&2
+    exit 9
+    ;;
+esac
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+CODERABBIT_FASTPATH_ROOT="$SCRATCH/coderabbit-fastpath-root"
+mkdir -p "$CODERABBIT_FASTPATH_ROOT/.github"
+cat > "$CODERABBIT_FASTPATH_ROOT/.github/review-policy.yml" <<'YAML'
+coderabbit:
+  bot_login: "coderabbitai[bot]"
+  max_wait_seconds: 300
+  max_rate_limit_retries: 2
+  wallclock_freshness_window_seconds: 1800
+  trust_status_context_for_clearance: true
+YAML
+
+set +e
+out=$(
+  cd "$CODERABBIT_FASTPATH_ROOT" &&
+    PATH="$SCRATCH:$PATH" \
+    GH_TOKEN=fixture-token \
+    CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+    "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" = "5" ] &&
+   echo "$out" | grep -q '"status": "rate_limit_stalled"' &&
+   echo "$out" | grep -q "StatusContext success ignored"; then
+  pass=$((pass + 1))
+  echo "  PASS: StatusContext success does not clear a current-head rate-limit comment"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: StatusContext success incorrectly cleared or masked a rate-limit comment (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+set +e
+out=$(
+  cd "$CODERABBIT_FASTPATH_ROOT" &&
+    PATH="$SCRATCH:$PATH" \
+    GH_TOKEN=fixture-token \
+    CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+    STUB_COMMENT_CREATED_AT="2998-01-01T00:00:00Z" \
+    STUB_COMMENT_UPDATED_AT="2999-01-01T00:00:00Z" \
+    STUB_STATUS_CREATED_AT="2999-01-01T00:00:01Z" \
+    STUB_COMMENT_BODY_SUFFIX="" \
+    "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" = "0" ] &&
+   echo "$out" | grep -q '"status": "cleared"' &&
+   echo "$out" | grep -q "does not reference current HEAD headsha"; then
+  pass=$((pass + 1))
+  echo "  PASS: StatusContext success clears despite an unscoped non-HEAD rate-limit comment"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: unscoped non-HEAD rate-limit comment incorrectly suppressed StatusContext success (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+set +e
+out=$(
+  cd "$CODERABBIT_FASTPATH_ROOT" &&
+    PATH="$SCRATCH:$PATH" \
+    GH_TOKEN=fixture-token \
+    CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+    STUB_COMMENT_CREATED_AT="2998-01-01T00:00:00Z" \
+    STUB_COMMENT_UPDATED_AT="2999-01-01T00:00:02Z" \
+    STUB_STATUS_CREATED_AT="2999-01-01T00:00:01Z" \
+    STUB_COMMENT_BODY_SUFFIX="" \
+    "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" = "0" ] &&
+   echo "$out" | grep -q '"status": "cleared"' &&
+   echo "$out" | grep -q "does not reference current HEAD headsha"; then
+  pass=$((pass + 1))
+  echo "  PASS: newer unscoped non-HEAD rate-limit comment does not suppress StatusContext success"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: fresh unscoped non-HEAD rate-limit comment incorrectly suppressed StatusContext success (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+set +e
+out=$(
+  cd "$CODERABBIT_FASTPATH_ROOT" &&
+    PATH="$SCRATCH:$PATH" \
+    GH_TOKEN=fixture-token \
+    CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+    STUB_COMMENT_CREATED_AT="2998-01-01T00:00:00Z" \
+    STUB_COMMENT_UPDATED_AT="2999-01-01T00:00:00Z" \
+    STUB_STATUS_CREATED_AT="2999-01-01T00:00:01Z" \
+    "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" = "0" ] &&
+   echo "$out" | grep -q '"status": "cleared"' &&
+   echo "$out" | grep -q "references current HEAD headsha but fresh_at=2999-01-01T00:00:00Z is older than status_created=2999-01-01T00:00:01Z"; then
+  pass=$((pass + 1))
+  echo "  PASS: newer StatusContext success clears despite an older current-head rate-limit comment"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale current-head rate-limit comment incorrectly suppressed a newer StatusContext success (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+set +e
+out=$(
+  cd "$CODERABBIT_FASTPATH_ROOT" &&
+    PATH="$SCRATCH:$PATH" \
+    GH_TOKEN=fixture-token \
+    CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+    STUB_ISSUE_COMMENTS_EMPTY=1 \
+    STUB_INLINE_POTENTIAL=1 \
+    STUB_INLINE_CREATED_AT="2998-12-31T23:59:59Z" \
+    "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" = "0" ] &&
+   echo "$out" | grep -q '"status": "cleared"'; then
+  pass=$((pass + 1))
+  echo "  PASS: StatusContext fast path ignores pre-head inline findings remapped to HEAD"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale pre-head inline finding incorrectly blocked StatusContext fast path (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+set +e
+out=$(
+  cd "$CODERABBIT_FASTPATH_ROOT" &&
+    PATH="$SCRATCH:$PATH" \
+    GH_TOKEN=fixture-token \
+    CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+    STUB_ISSUE_COMMENTS_EMPTY=1 \
+    STUB_INLINE_POTENTIAL=1 \
+    STUB_INLINE_CREATED_AT="2999-01-01T00:00:01Z" \
+    "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" = "2" ] &&
+   echo "$out" | grep -q '"status": "findings"' &&
+   echo "$out" | grep -q '"potential_issue_count": 1'; then
+  pass=$((pass + 1))
+  echo "  PASS: StatusContext fast path still reports fresh current-head inline findings"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: fresh current-head inline finding was not reported (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
 fi
 
 echo

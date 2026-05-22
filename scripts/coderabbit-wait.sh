@@ -248,10 +248,12 @@ fetch_api_array() {
 }
 
 # Fetch the CodeRabbit `StatusContext` check on the current HEAD SHA.
-# Emits one of: success | failure | pending | error | missing
-# on stdout. `missing` covers both the no-statuses-yet case and any
-# transient API hiccup (network, 5xx, etc.) — caller treats it as
-# "fall through to the existing comment-driven path."
+# Emits compact JSON with:
+#   { "state": "success|failure|pending|error|missing", "created_at": "..." }
+#
+# `missing` covers both the no-statuses-yet case and any transient API
+# hiccup (network, 5xx, etc.) — caller treats it as "fall through to
+# the existing comment-driven path."
 #
 # Two defensive guards (CodeRabbit ⚠️ Critical on PR #224 round 1):
 #
@@ -272,8 +274,8 @@ fetch_api_array() {
 # `/commits/{sha}/status` rolls up state but omits per-status creator
 # fields, which would defeat guard 1. Confirmed empirically — see
 # PR #224 round 2.
-check_status_context() {
-  local resp state
+check_status_context_record() {
+  local resp
   # Pagination (CodeRabbit ⚠️ Minor @ line 267 on PR #224 round 2):
   # `/commits/{ref}/statuses` defaults to per_page=30 and returns
   # statuses in reverse chronological order. Without `--paginate`, a
@@ -284,23 +286,26 @@ check_status_context() {
   # the context+creator filter runs.
   resp=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/statuses" 2>/dev/null \
     | jq -s 'add // []' 2>/dev/null) || {
-    echo "missing"
+    jq -nc '{state: "missing", created_at: ""}'
     return
   }
-  state=$(echo "$resp" | jq -r --arg bot "$BOT_LOGIN" '
+  echo "$resp" | jq -c --arg bot "$BOT_LOGIN" '
     [ .[]?
       | select(.context == "CodeRabbit")
       | select((.creator.login // "") == $bot)
     ]
     | sort_by(.created_at)
     | last
-    | .state // ""
-  ')
-  if [ -z "$state" ]; then
-    echo "missing"
-    return
-  fi
-  echo "$state"
+    | if . == null then
+        {state: "missing", created_at: ""}
+      else
+        {state: (.state // "missing"), created_at: (.created_at // "")}
+      end
+  '
+}
+
+check_status_context() {
+  check_status_context_record | jq -r '.state'
 }
 
 # --- fetch PR metadata ------------------------------------------------------
@@ -358,6 +363,7 @@ if [ -n "$LATEST_FORCE_PUSH_TIME" ] && [[ "$LATEST_FORCE_PUSH_TIME" > "$HEAD_ANC
   HEAD_ANCHOR="$LATEST_FORCE_PUSH_TIME"
   ANCHOR_SOURCE="head_ref_force_pushed @ $LATEST_FORCE_PUSH_TIME"
 fi
+HEAD_IDENTITY_ANCHOR="$HEAD_ANCHOR"
 
 # Layer 2 — wallclock freshness floor.
 EPOCH_NOW=$(date +%s)
@@ -422,7 +428,9 @@ classify_comment() {
 }
 
 # Scan the PR-level `issues/{pr}/comments` endpoint for the latest
-# CodeRabbit comment on or after HEAD_ANCHOR. Emits JSON to stdout.
+# CodeRabbit comment on or after HEAD_ANCHOR. CodeRabbit edits its
+# summary comment in place, so freshness is max(created_at, updated_at)
+# rather than created_at alone. Emits JSON to stdout.
 # Empty object {} if nothing qualifying yet.
 #
 # Only the issues endpoint is the terminal-state source. CodeRabbit's
@@ -443,9 +451,10 @@ scan_latest_comment() {
   latest=$(echo "$issue_comments" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
     [ .[]
       | select(.user.login == $bot)
-      | select(.created_at >= $after)
+      | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
+      | select(.fresh_at >= $after)
     ]
-    | sort_by(.created_at)
+    | sort_by(.fresh_at)
     | last // null
   ')
 
@@ -453,7 +462,7 @@ scan_latest_comment() {
     echo '{}'
     return
   fi
-  echo "$latest" | jq '{id, created_at, endpoint: "issues", body}'
+  echo "$latest" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}'
 }
 
 # Count unaddressed "Potential issue" / ⚠️ markers in the pulls inline
@@ -508,22 +517,29 @@ count_potential_issues() {
   '
 }
 
-# SHA-scoped variant of count_potential_issues, used by the
-# StatusContext fast-path. Counts CodeRabbit inline findings whose
-# `commit_id` (the SHA GitHub considers the comment currently anchored
-# to, after rebases / new commits) equals the given SHA — independent
-# of HEAD_ANCHOR's wallclock floor.
+# SHA-scoped variant of count_potential_issues, used by the StatusContext
+# fast-path. Counts CodeRabbit inline findings whose `commit_id` (the SHA
+# GitHub considers the comment currently anchored to, after rebases / new
+# commits) equals the given SHA and whose creation time is not older than
+# HEAD_IDENTITY_ANCHOR.
 #
 # Why this is needed (codex CHANGES_REQUESTED on PR #224 round 2 +
 # CodeRabbit ⚠️ Major @ line 581): the freshness-anchored count_potential_
-# issues filters reviews with `submitted_at >= HEAD_ANCHOR`. Once the
-# same unchanged HEAD sits longer than `coderabbit.wallclock_freshness_
-# window_seconds` (default 1800s / 30 min), HEAD_ANCHOR advances past
-# the prior CodeRabbit review's submitted_at, latest_review_id becomes
-# null, and the helper returns 0 — false-clearing the fast-path even
-# while the same SHA still has unresolved Potential issue/⚠️ inline
-# findings. The fast-path is the only caller that has authoritative
-# per-SHA scope (from the StatusContext check) and should leverage it.
+# issues filters reviews with `submitted_at >= HEAD_ANCHOR`. Once the same
+# unchanged HEAD sits longer than `coderabbit.wallclock_freshness_window_
+# seconds` (default 1800s / 30 min), HEAD_ANCHOR advances past the prior
+# CodeRabbit review's submitted_at, latest_review_id becomes null, and the
+# helper returns 0 — false-clearing the fast-path even while the same SHA
+# still has unresolved Potential issue/⚠️ inline findings. The fast-path is
+# the only caller that has authoritative per-SHA scope (from the StatusContext
+# check) and should leverage it.
+#
+# Why still keep a non-wallclock freshness floor: GitHub can preserve or
+# remap inline review comments across a rebase/force-push so an old comment
+# appears to have `commit_id == HEAD_SHA`. HEAD_IDENTITY_ANCHOR is captured
+# before the moving wallclock floor is applied, so stale pre-head inline
+# comments are ignored without losing genuine old-but-still-current findings
+# on an unchanged head.
 #
 # Filter shape: root inline review comments where the bot author posted
 # a comment whose `commit_id == HEAD_SHA` (i.e., GitHub still considers
@@ -539,7 +555,8 @@ count_potential_issues_for_sha() {
   pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
   echo "$pulls_comments" | jq \
     --arg bot "$BOT_LOGIN" \
-    --arg sha "$sha" '
+    --arg sha "$sha" \
+    --arg after "$HEAD_IDENTITY_ANCHOR" '
     [ .[]
       | select(.user.login == $bot)
       | select(.in_reply_to_id != null)
@@ -549,11 +566,58 @@ count_potential_issues_for_sha() {
     | [ .[]
       | select(.user.login == $bot)
       | select(.commit_id == $sha)
+      | select((.created_at // "") >= $after)
       | select(.in_reply_to_id == null)
       | select((.body // "") | test("Potential issue|⚠️"; "i"))
       | select(.id as $id | ($addressed_root_ids | index($id)) == null)
     ] | length
   '
+}
+
+iso_on_or_after() {
+  local lhs=$1 rhs=$2 rc
+  if [ -z "$lhs" ] || [ "$lhs" = "null" ] || [ -z "$rhs" ] || [ "$rhs" = "null" ]; then
+    return 0
+  fi
+
+  jq -en --arg lhs "$lhs" --arg rhs "$rhs" \
+    '($lhs | fromdateiso8601) >= ($rhs | fromdateiso8601)' >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+status_context_fast_path_blocked_by_comment() {
+  local status_created_at=$1
+  local latest class comment_id comment_fresh_at comment_body
+  latest=$(scan_latest_comment)
+  if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
+    return 1
+  fi
+
+  class=$(classify_comment "$(echo "$latest" | jq -r '.body')")
+  case "$class" in
+    rate_limit|in_progress)
+      comment_id=$(echo "$latest" | jq -r '.id')
+      comment_fresh_at=$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at')
+      comment_body=$(echo "$latest" | jq -r '.body')
+      if printf '%s' "$comment_body" | grep -Fq "$HEAD_SHA"; then
+        if iso_on_or_after "$comment_fresh_at" "$status_created_at"; then
+          log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class explicitly references current HEAD $HEAD_SHA and fresh_at=$comment_fresh_at is not older than status_created=$status_created_at"
+          return 0
+        fi
+        log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class explicitly references current HEAD $HEAD_SHA but fresh_at=$comment_fresh_at is older than status_created=$status_created_at"
+        return 1
+      fi
+      log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class does not reference current HEAD $HEAD_SHA"
+      return 1
+      ;;
+  esac
+
+  return 1
 }
 
 post_retry_trigger() {
@@ -724,11 +788,15 @@ emit_status_context_verdict() {
 # poll burned the full 300s budget on every clean fix-up push because
 # CodeRabbit doesn't re-narrate when there's nothing new to flag.
 if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
-  INITIAL_CTX=$(check_status_context)
+  INITIAL_CTX_RECORD=$(check_status_context_record)
+  INITIAL_CTX=$(echo "$INITIAL_CTX_RECORD" | jq -r '.state')
+  INITIAL_CTX_CREATED=$(echo "$INITIAL_CTX_RECORD" | jq -r '.created_at')
   log "initial CodeRabbit StatusContext = $INITIAL_CTX on $HEAD_SHA"
   if [ "$INITIAL_CTX" = "success" ]; then
-    log "StatusContext success — entering fast-path verdict (scans inline findings before clearance)"
-    emit_status_context_verdict "$INITIAL_CTX"
+    if ! status_context_fast_path_blocked_by_comment "$INITIAL_CTX_CREATED"; then
+      log "StatusContext success — entering fast-path verdict (scans inline findings before clearance)"
+      emit_status_context_verdict "$INITIAL_CTX"
+    fi
   fi
 fi
 
@@ -745,10 +813,14 @@ while :; do
   # API call than `scan_latest_comment` so it's worth doing first each
   # iteration; falls through to the comment scan if not success/failure.
   if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
-    LOOP_CTX=$(check_status_context)
+    LOOP_CTX_RECORD=$(check_status_context_record)
+    LOOP_CTX=$(echo "$LOOP_CTX_RECORD" | jq -r '.state')
+    LOOP_CTX_CREATED=$(echo "$LOOP_CTX_RECORD" | jq -r '.created_at')
     if [ "$LOOP_CTX" = "success" ]; then
-      log "CodeRabbit StatusContext flipped to success mid-loop on $HEAD_SHA — entering fast-path verdict"
-      emit_status_context_verdict "$LOOP_CTX"
+      if ! status_context_fast_path_blocked_by_comment "$LOOP_CTX_CREATED"; then
+        log "CodeRabbit StatusContext flipped to success mid-loop on $HEAD_SHA — entering fast-path verdict"
+        emit_status_context_verdict "$LOOP_CTX"
+      fi
     fi
   fi
 
@@ -764,9 +836,10 @@ while :; do
   COMMENT_BODY=$(echo "$LATEST" | jq -r '.body')
   COMMENT_ENDPOINT=$(echo "$LATEST" | jq -r '.endpoint')
   COMMENT_CREATED=$(echo "$LATEST" | jq -r '.created_at')
+  COMMENT_FRESH_AT=$(echo "$LATEST" | jq -r '.fresh_at // .updated_at // .created_at')
 
   CLASS=$(classify_comment "$COMMENT_BODY")
-  log "latest CodeRabbit comment id=$COMMENT_ID endpoint=$COMMENT_ENDPOINT class=$CLASS created=$COMMENT_CREATED"
+  log "latest CodeRabbit comment id=$COMMENT_ID endpoint=$COMMENT_ENDPOINT class=$CLASS created=$COMMENT_CREATED fresh_at=$COMMENT_FRESH_AT"
 
   case "$CLASS" in
     rate_limit)
@@ -793,17 +866,17 @@ while :; do
       SLEEP_FOR=$((WINDOW_SECONDS + RATE_LIMIT_BUFFER_SECONDS))
       # Clamp against remaining budget — if the published rate-limit
       # window exceeds max_wait_seconds anyway, there's no point
-      # burning through the entire sleep only to time out on the next
-      # iteration. Time out immediately instead so the caller sees a
-      # prompt, well-formed timeout rather than a stalled process.
-      # See #140 round-2 Codex finding (P2, line 392).
+      # burning through the entire sleep. Surface it as the same hard
+      # rate-limit stalled state callers already treat as non-advisory
+      # instead of a generic timeout that auto-merge may skip past.
+      # See #140 round-2 Codex finding (P2, line 392), then #386.
       NOW_EPOCH=$(date +%s)
       ELAPSED=$((NOW_EPOCH - START_EPOCH))
       REMAINING=$((MAX_WAIT_SECONDS - ELAPSED))
       if [ "$SLEEP_FOR" -ge "$REMAINING" ]; then
-        log "rate-limit window (${SLEEP_FOR}s) exceeds remaining budget (${REMAINING}s) — timing out"
+        log "rate-limit window (${SLEEP_FOR}s) exceeds remaining budget (${REMAINING}s) — stalling"
         RATE_LIMIT_REVIEW=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
-        emit_json_and_exit "timeout" 4 "$RATE_LIMIT_REVIEW" 0
+        emit_json_and_exit "rate_limit_stalled" 5 "$RATE_LIMIT_REVIEW" 0
       fi
       log "rate-limited; sleeping ${SLEEP_FOR}s (window=${WINDOW_SECONDS}s + ${RATE_LIMIT_BUFFER_SECONDS}s buffer)"
       sleep "$SLEEP_FOR"
