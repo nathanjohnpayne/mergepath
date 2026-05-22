@@ -178,6 +178,9 @@ jobs:
       - name: check_pr_audit_codex_clearance
         run: ./scripts/ci/check_pr_audit_codex_clearance
 
+      - name: check_pr_audit_sync_exemption
+        run: ./scripts/ci/check_pr_audit_sync_exemption
+
       - name: check_sweep_unresolved_feedback
         run: ./scripts/ci/check_sweep_unresolved_feedback
 
