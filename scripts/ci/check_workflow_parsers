@@ -58,6 +58,9 @@ assert_eq() {
 workflow_guard_block_contains_exit() {
   local file="$1" guard="$2" required="$3"
   awk -v guard="$guard" -v required="$required" '
+    /^[[:space:]]*#/ {
+      next
+    }
     index($0, guard) {
       in_block = 1
       saw_guard = 1
@@ -65,7 +68,7 @@ workflow_guard_block_contains_exit() {
     in_block && index($0, required) {
       saw_required = 1
     }
-    in_block && /exit 1/ {
+    in_block && /^[[:space:]]*exit[[:space:]]+1([[:space:]]|$)/ {
       saw_exit = 1
     }
     in_block && /^[[:space:]]*fi[[:space:]]*$/ {
@@ -581,7 +584,7 @@ fi
 
 if workflow_guard_block_contains_exit \
   "$dependabot_workflow" \
-  'if ! printf' \
+  "if ! printf '%s\\\\n' \"\$ALLOWED\" | grep -Fxq \"\$ACTING_AS\"; then" \
   'NOT in $POLICY available_reviewers'; then
   pass=$((pass + 1))
   echo "  PASS: Dependabot auto-merge exits when the reviewer token is not allowlisted"
