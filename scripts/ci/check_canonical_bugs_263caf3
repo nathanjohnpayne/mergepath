@@ -30,6 +30,13 @@
 #          approve through the merge gate. The fix excludes BOTH
 #          `$author` AND `$same_agent_reviewer`.
 #
+#   Bug 5: scripts/coderabbit-wait.sh counted CodeRabbit Potential
+#          issue comments as active even after CodeRabbit replied to
+#          the same inline thread with its `review_comment_addressed`
+#          marker. The review-thread state was already resolved, but
+#          the helper still returned exit 2 from the status-context
+#          fast-path and stalled otherwise mergeable PRs.
+#
 # This check exercises the jq filter literals in isolation against
 # in-memory fixtures so a future edit can't silently regress either
 # guard. Inline-literal pattern matches check_workflow_parsers /
@@ -42,8 +49,9 @@ cd "$ROOT"
 
 LABEL_REMOVAL_SCRIPT="scripts/request-label-removal.sh"
 CODEX_CHECK_SCRIPT="scripts/codex-review-check.sh"
+CODERABBIT_WAIT_SCRIPT="scripts/coderabbit-wait.sh"
 
-for f in "$LABEL_REMOVAL_SCRIPT" "$CODEX_CHECK_SCRIPT"; do
+for f in "$LABEL_REMOVAL_SCRIPT" "$CODEX_CHECK_SCRIPT" "$CODERABBIT_WAIT_SCRIPT"; do
   if [ ! -f "$f" ]; then
     echo "check_canonical_bugs_263caf3: FAIL — missing $f"
     exit 1
@@ -923,6 +931,184 @@ else
   fail=$((fail + 1))
   echo "  FAIL: actual codex-review-check rejected enabled-Codex bot clearance (rc=$rc)" >&2
   echo "$out" | sed 's/^/    /' >&2
+fi
+
+# ── Bug 5 regression: CodeRabbit addressed marker clears finding ─────
+#
+# Keep these jq filters in lockstep with scripts/coderabbit-wait.sh's
+# count_potential_issues() and count_potential_issues_for_sha(). The
+# helper should hold on root Potential issue / ⚠️ comments unless
+# CodeRabbit itself has replied to that root with the hidden addressed
+# marker. Agent replies alone — even if they claim a fix — are not a
+# clearance signal.
+
+echo
+echo "Bug 5 regression: coderabbit-wait ignores CodeRabbit-addressed findings"
+
+COUNT_CODERABBIT_BY_REVIEW_JQ='
+  [ .[]
+    | select(.user.login == $bot)
+    | select(.in_reply_to_id != null)
+    | select((.body // "") | test("review_comment_addressed"; "i"))
+    | .in_reply_to_id
+  ] as $addressed_root_ids
+  | [ .[]
+    | select(.user.login == $bot)
+    | select(.pull_request_review_id == $review_id)
+    | select(.in_reply_to_id == null)
+    | select((.body // "") | test("Potential issue|⚠️"; "i"))
+    | select(.id as $id | ($addressed_root_ids | index($id)) == null)
+  ] | length
+'
+
+COUNT_CODERABBIT_BY_SHA_JQ='
+  [ .[]
+    | select(.user.login == $bot)
+    | select(.in_reply_to_id != null)
+    | select((.body // "") | test("review_comment_addressed"; "i"))
+    | .in_reply_to_id
+  ] as $addressed_root_ids
+  | [ .[]
+    | select(.user.login == $bot)
+    | select(.commit_id == $sha)
+    | select(.in_reply_to_id == null)
+    | select((.body // "") | test("Potential issue|⚠️"; "i"))
+    | select(.id as $id | ($addressed_root_ids | index($id)) == null)
+  ] | length
+'
+
+coderabbit_count_by_review() {
+  local review_id=$1
+  jq --arg bot "coderabbitai[bot]" --argjson review_id "$review_id" \
+    "$COUNT_CODERABBIT_BY_REVIEW_JQ"
+}
+
+coderabbit_count_by_sha() {
+  local sha=$1
+  jq --arg bot "coderabbitai[bot]" --arg sha "$sha" \
+    "$COUNT_CODERABBIT_BY_SHA_JQ"
+}
+
+coderabbit_addressed_fixture='[
+  {
+    "id": 101,
+    "user": {"login": "coderabbitai[bot]"},
+    "pull_request_review_id": 9001,
+    "commit_id": "abc123",
+    "body": "_⚠️ Potential issue_\n\nThis should be counted until addressed."
+  },
+  {
+    "id": 102,
+    "user": {"login": "nathanpayne-codex"},
+    "in_reply_to_id": 101,
+    "commit_id": "abc123",
+    "body": "Fixed in the latest commit."
+  },
+  {
+    "id": 103,
+    "user": {"login": "coderabbitai[bot]"},
+    "in_reply_to_id": 101,
+    "commit_id": "abc123",
+    "body": "Confirmed.\n<!-- <review_comment_addressed> -->"
+  }
+]'
+
+review_count=$(echo "$coderabbit_addressed_fixture" | coderabbit_count_by_review 9001)
+sha_count=$(echo "$coderabbit_addressed_fixture" | coderabbit_count_by_sha abc123)
+if [ "$review_count" = "0" ] && [ "$sha_count" = "0" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: CodeRabbit addressed marker clears review- and SHA-scoped counts"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: addressed CodeRabbit finding still counted (review=$review_count sha=$sha_count)" >&2
+fi
+
+coderabbit_agent_reply_only_fixture='[
+  {
+    "id": 201,
+    "user": {"login": "coderabbitai[bot]"},
+    "pull_request_review_id": 9002,
+    "commit_id": "def456",
+    "body": "_⚠️ Potential issue_\n\nThis should still be counted."
+  },
+  {
+    "id": 202,
+    "user": {"login": "nathanpayne-codex"},
+    "in_reply_to_id": 201,
+    "commit_id": "def456",
+    "body": "Fixed in the latest commit."
+  }
+]'
+
+review_count=$(echo "$coderabbit_agent_reply_only_fixture" | coderabbit_count_by_review 9002)
+sha_count=$(echo "$coderabbit_agent_reply_only_fixture" | coderabbit_count_by_sha def456)
+if [ "$review_count" = "1" ] && [ "$sha_count" = "1" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: agent reply alone does not clear CodeRabbit Potential issue"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: agent reply unexpectedly cleared finding (review=$review_count sha=$sha_count)" >&2
+fi
+
+coderabbit_spoofed_marker_fixture='[
+  {
+    "id": 301,
+    "user": {"login": "coderabbitai[bot]"},
+    "pull_request_review_id": 9003,
+    "commit_id": "fed789",
+    "body": "_⚠️ Potential issue_\n\nThis should still be counted."
+  },
+  {
+    "id": 302,
+    "user": {"login": "nathanpayne-codex"},
+    "in_reply_to_id": 301,
+    "commit_id": "fed789",
+    "body": "<!-- <review_comment_addressed> -->"
+  }
+]'
+
+review_count=$(echo "$coderabbit_spoofed_marker_fixture" | coderabbit_count_by_review 9003)
+sha_count=$(echo "$coderabbit_spoofed_marker_fixture" | coderabbit_count_by_sha fed789)
+if [ "$review_count" = "1" ] && [ "$sha_count" = "1" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: non-CodeRabbit addressed marker spoof does not clear finding"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: non-CodeRabbit marker unexpectedly cleared finding (review=$review_count sha=$sha_count)" >&2
+fi
+
+coderabbit_mixed_fixture='[
+  {
+    "id": 401,
+    "user": {"login": "coderabbitai[bot]"},
+    "pull_request_review_id": 9004,
+    "commit_id": "beef00",
+    "body": "_⚠️ Potential issue_\n\nAddressed root."
+  },
+  {
+    "id": 402,
+    "user": {"login": "coderabbitai[bot]"},
+    "in_reply_to_id": 401,
+    "commit_id": "beef00",
+    "body": "<!-- <review_comment_addressed> -->"
+  },
+  {
+    "id": 403,
+    "user": {"login": "coderabbitai[bot]"},
+    "pull_request_review_id": 9004,
+    "commit_id": "beef00",
+    "body": "_⚠️ Potential issue_\n\nStill open root."
+  }
+]'
+
+review_count=$(echo "$coderabbit_mixed_fixture" | coderabbit_count_by_review 9004)
+sha_count=$(echo "$coderabbit_mixed_fixture" | coderabbit_count_by_sha beef00)
+if [ "$review_count" = "1" ] && [ "$sha_count" = "1" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: mixed addressed/unaddressed findings count only the open root"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: mixed fixture count incorrect (review=$review_count sha=$sha_count)" >&2
 fi
 
 echo
