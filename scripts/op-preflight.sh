@@ -289,6 +289,31 @@ if not isinstance(project, str) or not project:
 print(project)
 PY
 }
+
+json_string_field_no_python() {
+  local file="${1:-}" field="${2:-}"
+  [[ -n "$file" && -f "$file" && -n "$field" ]] || return 1
+  tr '\n' ' ' < "$file" \
+    | sed -nE "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\\1/p" \
+    | head -n 1
+}
+
+detect_firebase_project_no_python() {
+  if [[ -n "${OP_PREFLIGHT_FIREBASE_PROJECT_ID:-}" ]]; then
+    printf '%s\n' "$OP_PREFLIGHT_FIREBASE_PROJECT_ID"
+    return 0
+  fi
+  json_string_field_no_python ".firebaserc" "default"
+}
+
+firebase_sa_matches_project_no_python() {
+  local file="${1:-}" project="${2:-}" client_email expected
+  [[ -n "$file" && -f "$file" && -s "$file" && -n "$project" ]] || return 1
+  client_email="$(json_string_field_no_python "$file" "client_email" || true)"
+  expected="${SA_NAME}@${project}.iam.gserviceaccount.com"
+  [[ "$client_email" == "$expected" ]]
+}
+
 # Validate the override is a non-negative integer before any arithmetic
 # context (`[[ "$age" -lt "$SSH_WARM_TTL_SECONDS" ]]` later in the
 # script). A non-numeric override (`OP_PREFLIGHT_SSH_WARM_TTL_SECONDS=foo`)
@@ -713,13 +738,23 @@ emit_from_session_file() (
     if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] || [[ ! -s "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
       exit 2
     fi
-    if [[ "${OP_PREFLIGHT_CHECK_MODE:-0}" != "1" && -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" && "${GOOGLE_APPLICATION_CREDENTIALS}" == "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE}" ]]; then
-      current_firebase_project="$(detect_firebase_project 2>/dev/null || true)"
+    if [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" && "${GOOGLE_APPLICATION_CREDENTIALS}" == "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE}" ]]; then
+      if [[ "${OP_PREFLIGHT_CHECK_MODE:-0}" == "1" ]]; then
+        current_firebase_project="$(detect_firebase_project_no_python 2>/dev/null || true)"
+        firebase_sa_matches_project_check() {
+          firebase_sa_matches_project_no_python "${GOOGLE_APPLICATION_CREDENTIALS}" "$current_firebase_project"
+        }
+      else
+        current_firebase_project="$(detect_firebase_project 2>/dev/null || true)"
+        firebase_sa_matches_project_check() {
+          firebase_sa_matches_project "${GOOGLE_APPLICATION_CREDENTIALS}" "$current_firebase_project"
+        }
+      fi
       if [[ -z "$current_firebase_project" || "$current_firebase_project" != "${OP_PREFLIGHT_FIREBASE_PROJECT:-}" ]]; then
         echo "# WARNING: cached Firebase project SA key is for '${OP_PREFLIGHT_FIREBASE_PROJECT:-unknown}', but current project is '${current_firebase_project:-none}'; refreshing deploy credentials." >&2
         exit 2
       fi
-      if ! firebase_sa_matches_project "${GOOGLE_APPLICATION_CREDENTIALS}" "$current_firebase_project"; then
+      if ! firebase_sa_matches_project_check; then
         echo "# WARNING: cached Firebase project SA key file does not match current project '$current_firebase_project'; refreshing deploy credentials." >&2
         exit 2
       fi
@@ -1089,6 +1124,7 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
     # prompt. Overwrite in place — chmod 600 before writing secret content.
     touch "$FIREBASE_SA_TMPFILE"
     chmod 600 "$FIREBASE_SA_TMPFILE"
+    : > "$FIREBASE_SA_TMPFILE"
 
     # For --mode deploy (no review credentials loaded), this is the first
     # op call of the run — log it. For --mode all, the Phase 1 op inject

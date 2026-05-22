@@ -403,6 +403,76 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# test_check_deploy_firebase_sa_project_mismatch_fails_closed:
+# --check is probe-free, but it must still refuse a Firebase SA cache
+# whose project marker/file no longer match the checkout.
+# ---------------------------------------------------------------------------
+test_check_deploy_firebase_sa_project_mismatch_fails_closed() {
+  local case_dir="$WORKDIR/deploy-firebase-check-mismatch"
+  local cache_dir="$case_dir/cache"
+  local py_stub="$case_dir/stub-bin-py"
+  local cached_project="project-a"
+  local current_project="project-b"
+  local sa_file="$case_dir/firebase-sa.json"
+  mkdir -p "$case_dir" "$cache_dir" "$py_stub"
+
+  cat > "$case_dir/.firebaserc" <<JSON
+{ "projects": { "default": "$current_project" } }
+JSON
+  cat > "$sa_file" <<JSON
+{
+  "type": "service_account",
+  "project_id": "$cached_project",
+  "client_email": "firebase-deployer@${cached_project}.iam.gserviceaccount.com"
+}
+JSON
+
+  local epoch
+  epoch=$(date +%s)
+  cat > "$cache_dir/op-preflight-claude.env" <<EOF
+OP_PREFLIGHT_CREATED_AT_EPOCH=$epoch
+OP_PREFLIGHT_TTL_SECONDS=14400
+OP_PREFLIGHT_AGENT=claude
+OP_PREFLIGHT_MODE=deploy
+OP_PREFLIGHT_DONE=1
+GOOGLE_APPLICATION_CREDENTIALS=$sa_file
+OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$sa_file
+OP_PREFLIGHT_FIREBASE_PROJECT=$cached_project
+EOF
+  chmod 600 "$cache_dir/op-preflight-claude.env"
+
+  cat > "$py_stub/python3" <<'EOF'
+#!/usr/bin/env bash
+echo "FATAL: --check --mode deploy invoked python3 with args: $*" >&2
+exit 97
+EOF
+  chmod +x "$py_stub/python3"
+
+  local out rc=0
+  (
+    cd "$case_dir"
+    OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+      PATH="$py_stub:$STUB_DIR:$PATH" \
+      "$SCRIPT" --agent claude --mode deploy --check 2>&1
+  ) >"$case_dir/out" || rc=$?
+  out="$(cat "$case_dir/out")"
+
+  if [ "$rc" -eq 0 ]; then
+    fail "test_check_deploy_firebase_sa_project_mismatch_fails_closed: --check should fail closed; out=$out"
+    return
+  fi
+  if echo "$out" | grep -q "invoked python3"; then
+    fail "test_check_deploy_firebase_sa_project_mismatch_fails_closed: --check invoked python3; out=$out"
+    return
+  fi
+  if ! echo "$out" | grep -q "cached Firebase project SA key is for '$cached_project', but current project is '$current_project'"; then
+    fail "test_check_deploy_firebase_sa_project_mismatch_fails_closed: missing mismatch warning; out=$out"
+    return
+  fi
+  pass "test_check_deploy_firebase_sa_project_mismatch_fails_closed: --check fails closed on project drift"
+}
+
+# ---------------------------------------------------------------------------
 # test_deploy_mode_prefers_firebase_sa_over_gcp_adc (#154/#211): in a
 # Firebase repo, --mode deploy should cache the project Firebase-vault
 # SA key first and must not probe the stale shared GCP ADC item when
@@ -770,8 +840,8 @@ test_deploy_mode_refreshes_cached_firebase_sa_file_mismatch() {
   local wrong_project="project-a"
   local shared_adc_uri="op://Private/test-shared-adc-file-mismatch/credential"
   local op_log="$case_dir/op.log"
-  local cached_sa_file="$case_dir/firebase-sa.json"
   mkdir -p "$case_dir" "$cache_dir" "$bin_dir"
+  local cached_sa_file="$cache_dir/op-preflight--firebase-sa.json"
 
   cat > "$case_dir/.firebaserc" <<JSON
 { "projects": { "default": "$current_project" } }
@@ -823,6 +893,10 @@ case "\${1:-}" in
     done
     if [ -z "\$out_path" ]; then
       exit 1
+    fi
+    if [ -s "\$out_path" ]; then
+      echo "FATAL: op document get destination was not truncated before fetch" >&2
+      exit 77
     fi
     cat > "\$out_path" <<'JSON'
 {
@@ -895,6 +969,7 @@ test_quiet_mode
 test_default_mode_is_review
 test_check_deploy_no_python3_probe
 test_check_deploy_firebase_sa_no_python3_probe
+test_check_deploy_firebase_sa_project_mismatch_fails_closed
 test_deploy_mode_prefers_firebase_sa_over_gcp_adc
 test_deploy_mode_refreshes_unusable_cached_firebase_sa
 test_deploy_mode_refreshes_mismatched_cached_firebase_sa
