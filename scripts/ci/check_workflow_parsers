@@ -351,6 +351,77 @@ else
 fi
 
 echo
+echo "agent-review.yml author-token auto-merge regression (#359)"
+
+agent_review_workflow=".github/workflows/agent-review.yml"
+if grep -Fq "secrets.AUTHOR_MERGE_TOKEN" "$agent_review_workflow"; then
+  pass=$((pass + 1))
+  echo "  PASS: agent-review auto-merge references AUTHOR_MERGE_TOKEN"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: agent-review auto-merge must use an author-owned AUTHOR_MERGE_TOKEN, not the reviewer assignment token" >&2
+fi
+
+if grep -Fq "AUTHOR_MERGE_TOKEN resolves to" "$agent_review_workflow"; then
+  pass=$((pass + 1))
+  echo "  PASS: agent-review verifies AUTHOR_MERGE_TOKEN identity before merge"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: agent-review must verify AUTHOR_MERGE_TOKEN resolves to author_identity before merge" >&2
+fi
+
+author_identity_awk='
+  /^[^[:space:]]/ && $1 == "author_identity:" {
+    sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+    gsub(/^"/, "", $0)
+    gsub(/^\047/, "", $0)
+    gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+    gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
+    gsub(/[[:space:]]*#.*$/, "", $0)
+    sub(/[[:space:]]+$/, "", $0)
+    print
+    exit
+  }
+'
+got=$(printf '%s\n' "author_identity: nathanjohnpayne" | awk "$author_identity_awk")
+assert_eq "author_identity parser reads bare value" "nathanjohnpayne" "$got"
+
+got=$(printf '%s\n' 'author_identity: "nathanjohnpayne"' | awk "$author_identity_awk")
+assert_eq "author_identity parser strips double quotes" "nathanjohnpayne" "$got"
+
+got=$(printf '%s\n' "author_identity: 'nathanjohnpayne'" | awk "$author_identity_awk")
+assert_eq "author_identity parser strips single quotes" "nathanjohnpayne" "$got"
+
+enable_auto_merge_block=$(awk '
+  /- name: Enable auto-merge/ {in_block=1}
+  in_block && /- name:/ && $0 !~ /- name: Enable auto-merge/ {exit}
+  in_block {print}
+' "$agent_review_workflow")
+if printf '%s\n' "$enable_auto_merge_block" | grep -Fq 'GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}'; then
+  pass=$((pass + 1))
+  echo "  PASS: Enable auto-merge step runs under AUTHOR_MERGE_TOKEN"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Enable auto-merge step must set GH_TOKEN from AUTHOR_MERGE_TOKEN" >&2
+fi
+
+if printf '%s\n' "$enable_auto_merge_block" | grep -Fq 'REVIEWER_ASSIGNMENT_TOKEN'; then
+  fail=$((fail + 1))
+  echo "  FAIL: Enable auto-merge step still references REVIEWER_ASSIGNMENT_TOKEN" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: Enable auto-merge step does not use REVIEWER_ASSIGNMENT_TOKEN"
+fi
+
+if printf '%s\n' "$enable_auto_merge_block" | grep -Fq '|| true'; then
+  fail=$((fail + 1))
+  echo "  FAIL: Enable auto-merge step must not swallow merge failures with '|| true'" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: Enable auto-merge step does not swallow merge failures with '|| true'"
+fi
+
+echo
 echo "dependabot-auto-merge.yml PR-author gate regression (#370)"
 
 dependabot_workflow=".github/workflows/dependabot-auto-merge.yml"

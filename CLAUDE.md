@@ -415,6 +415,11 @@ keyring active is your agent identity. No switch needed for commits.
       scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch
       ```
 
+      The non-Dependabot `auto-merge-on-approval` workflow is only a
+      convenience when `AUTHOR_MERGE_TOKEN` is configured and verified
+      as `nathanjohnpayne`. Without that author-owned secret, auto-merge
+      is disabled and this manual author-merge step is the expected path.
+
    **Phase 4b — Manual CLI fallback.** Applies when Phase 4a is
    unavailable (`codex.enabled: false`, either helper script missing,
    Codex App not review-ready, or 4a fell back via exit code 4):
@@ -433,6 +438,9 @@ keyring active is your agent identity. No switch needed for commits.
    f. Merge as nathanjohnpayne via `scripts/gh-as-author.sh` per the
       active-account convention above (HARD RULE per #241):
       `scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch`.
+      Reviewer-identity tokens must not be used for automatic PR merges;
+      an optional `AUTHOR_MERGE_TOKEN` may enable auto-merge only after
+      the workflow verifies it resolves to `nathanjohnpayne`.
 
 10. Never use `--admin` to merge unless the human explicitly authorizes it
     in chat as a break-glass exception. The hook will block it otherwise.

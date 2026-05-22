@@ -442,7 +442,46 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Check author merge token
+        id: author_merge_token
+        env:
+          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::AUTHOR_MERGE_TOKEN is not configured; automatic PR merge is disabled. Merge manually as the author identity."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          expected_author=$(awk '
+            /^[^[:space:]]/ && $1 == "author_identity:" {
+              sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+              gsub(/^"/, "", $0)
+              gsub(/^\047/, "", $0)
+              gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+              gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
+              gsub(/[[:space:]]*#.*$/, "", $0)
+              sub(/[[:space:]]+$/, "", $0)
+              print
+              exit
+            }
+          ' .github/review-policy.yml)
+          expected_author="${expected_author:-nathanjohnpayne}"
+
+          if ! actual_author=$(gh api user --jq .login); then
+            echo "::error::AUTHOR_MERGE_TOKEN could not authenticate to GitHub. Refusing automatic merge."
+            exit 1
+          fi
+          if [ "$actual_author" != "$expected_author" ]; then
+            echo "::error::AUTHOR_MERGE_TOKEN resolves to '$actual_author', expected '$expected_author'. Refusing automatic merge."
+            exit 1
+          fi
+
+          echo "Automatic merge token verified for author identity: $actual_author"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
       - name: Check if CodeRabbit is enabled
+        if: steps.author_merge_token.outputs.enabled == 'true'
         id: cr
         run: |
           CONFIG=".github/review-policy.yml"
@@ -471,7 +510,7 @@ jobs:
           fi
 
       - name: Wait for CodeRabbit review
-        if: steps.cr.outputs.enabled == 'true'
+        if: steps.author_merge_token.outputs.enabled == 'true' && steps.cr.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -525,9 +564,10 @@ jobs:
           esac
 
       - name: Re-verify blocking labels right before merge
+        if: steps.author_merge_token.outputs.enabled == 'true'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
         run: |
           # Guard against the TOCTOU race between the trigger-time label
           # snapshot and the actual merge. The job's top-level `if:` expression
@@ -565,7 +605,8 @@ jobs:
           echo "No blocking labels present — proceeding to merge."
 
       - name: Enable auto-merge
-        run: gh pr merge --squash --auto "$PR_URL" || gh pr merge --squash "$PR_URL" || true
+        if: steps.author_merge_token.outputs.enabled == 'true'
+        run: gh pr merge --squash --auto "$PR_URL" || gh pr merge --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
