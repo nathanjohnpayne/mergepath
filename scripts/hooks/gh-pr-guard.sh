@@ -425,6 +425,19 @@ guarded_gh_invocation_label() {
       esac
     fi
 
+    case "$tok" in
+      -R|--repo)
+        skip_global_as="repo"
+        continue
+        ;;
+      -R=*|--repo=*)
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+    esac
+
     case "$parent:$tok" in
       pr:create|pr:merge|pr:comment|pr:review)
         printf 'gh pr %s\n' "$tok"
@@ -551,8 +564,9 @@ fi
 # is harmless: the EFFECTIVE_* values are only consulted by the
 # create/merge guards, which only run when SAW_GH=1.)
 #
-# Tokens BETWEEN `gh` and `pr` are global gh flags. The only global
-# value-taking flag we explicitly handle is -R/--repo; everything
+# Tokens BETWEEN `gh` and `pr` (and parent-level tokens between
+# `pr`/`issue` and the subcommand) may contain inherited gh flags. The
+# only value-taking flag we explicitly handle is -R/--repo; everything
 # else starting with - is assumed boolean and skipped.
 INLINE_CODEX_CLEARED=""
 INLINE_BREAK_GLASS_ADMIN=""
@@ -617,6 +631,26 @@ for i in "${!TOKENS[@]}"; do
           ;;
       esac
     fi
+    # SAW_PR=1 OR SAW_ISSUE=1 — parent-level gh flags may still
+    # appear before the subcommand, e.g. `gh pr -R owner/repo merge`.
+    case "$tok" in
+      -R|--repo)
+        SKIP_GLOBAL_AS="repo"
+        continue
+        ;;
+      -R=*)
+        GLOBAL_REPO="${tok#-R=}"
+        continue
+        ;;
+      --repo=*)
+        GLOBAL_REPO="${tok#--repo=}"
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+    esac
+
     # SAW_PR=1 OR SAW_ISSUE=1 — this token IS the subcommand.
     PR_SUBCOMMAND="$tok"
     PR_SUBCOMMAND_INDEX=$i

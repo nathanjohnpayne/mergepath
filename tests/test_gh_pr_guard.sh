@@ -282,6 +282,18 @@ else
   fail "gh pr merge: exit $rc, expected 0 (identity check should be create-only); output: $out"
 fi
 
+# Parent-level -R/--repo between `pr` and `merge` is valid gh syntax
+# and must still route into the merge guard.
+set +e
+out=$(run_hook 'gh pr -R nathanjohnpayne/mergepath merge 123 --squash --delete-branch' "nathanjohnpayne" "0" "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "gh pr -R <repo> merge: parent-level repo flag still routes to merge guard"
+else
+  fail "gh pr -R <repo> merge: exit $rc, expected 0; output: $out"
+fi
+
 # ---------------------------------------------------------------------------
 # Test 7: Non-gh command — hook should allow with exit 0 regardless of
 # active identity.
@@ -809,6 +821,18 @@ elif ! echo "$out" | grep -qi "#348"; then
   fail "compound pr-view then merge: diagnostic missing #348; output: $out"
 else
   pass "compound pr-view then merge: blocked by #348 fail-closed guard"
+fi
+
+set +e
+out=$(run_hook 'gh issue close 7 && gh pr -R nathanjohnpayne/mergepath merge --admin 123' "nathanjohnpayne" "0" "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "compound issue-close then parent-repo merge: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -qi "#348"; then
+  fail "compound issue-close then parent-repo merge: diagnostic missing #348; output: $out"
+else
+  pass "compound issue-close then parent-repo merge: parent-level -R does not bypass #348 guard"
 fi
 
 # `|&` is Bash's stdout+stderr pipe separator. It must split command
