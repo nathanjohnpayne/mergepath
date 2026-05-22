@@ -55,6 +55,35 @@ assert_eq() {
   fi
 }
 
+workflow_guard_block_contains_exit() {
+  local file="$1" guard="$2" required="$3"
+  WORKFLOW_GUARD="$guard" WORKFLOW_REQUIRED="$required" awk '
+    BEGIN {
+      guard = ENVIRON["WORKFLOW_GUARD"]
+      required = ENVIRON["WORKFLOW_REQUIRED"]
+    }
+    /^[[:space:]]*#/ {
+      next
+    }
+    index($0, guard) {
+      in_block = 1
+      saw_guard = 1
+    }
+    in_block && index($0, required) {
+      saw_required = 1
+    }
+    in_block && /^[[:space:]]*exit[[:space:]]+1([[:space:]]|$)/ {
+      saw_exit = 1
+    }
+    in_block && /^[[:space:]]*fi[[:space:]]*$/ {
+      exit
+    }
+    END {
+      exit (saw_guard && saw_required && saw_exit) ? 0 : 1
+    }
+  ' "$file"
+}
+
 # Classify a phase_4b_default value read from review-policy.yml.
 # Echoes "valid" or "invalid".
 #
@@ -518,6 +547,54 @@ if grep -Fq "github.actor == 'dependabot[bot]'" "$dependabot_workflow"; then
 else
   pass=$((pass + 1))
   echo "  PASS: Dependabot auto-merge does not gate on github.actor"
+fi
+
+echo
+echo "dependabot-auto-merge.yml reviewer-token fail-closed regression (#374 Pattern A)"
+
+if workflow_guard_block_contains_exit \
+  "$dependabot_workflow" \
+  'if [ -z "${GH_TOKEN:-}" ]; then' \
+  'GH_TOKEN is empty. REVIEWER_ASSIGNMENT_TOKEN secret is not set'; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge exits when REVIEWER_ASSIGNMENT_TOKEN is empty"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN/GH_TOKEN is empty" >&2
+fi
+
+if grep -Fq 'ACTING_AS=$(gh api user --jq .login' "$dependabot_workflow" &&
+   workflow_guard_block_contains_exit \
+     "$dependabot_workflow" \
+     'if [ -z "$ACTING_AS" ]; then' \
+     'gh api user returned empty'; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge exits when REVIEWER_ASSIGNMENT_TOKEN cannot resolve an identity"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN cannot resolve an identity" >&2
+fi
+
+if workflow_guard_block_contains_exit \
+  "$dependabot_workflow" \
+  'if [ "$ACTING_AS" = "$PR_AUTHOR" ]; then' \
+  'GitHub blocks self-approval'; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge exits when the reviewer token resolves to the PR author"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN resolves to the PR author" >&2
+fi
+
+if workflow_guard_block_contains_exit \
+  "$dependabot_workflow" \
+  "if ! printf '%s\\n' \"\$ALLOWED\" | grep -Fxq \"\$ACTING_AS\"; then" \
+  'NOT in $POLICY available_reviewers'; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge exits when the reviewer token is not allowlisted"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must fail closed when REVIEWER_ASSIGNMENT_TOKEN is not in available_reviewers" >&2
 fi
 
 if grep -Fq "!contains(github.event.pull_request.labels.*.name, 'human-hold')" "$dependabot_workflow"; then
