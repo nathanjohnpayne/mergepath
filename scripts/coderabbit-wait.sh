@@ -248,10 +248,12 @@ fetch_api_array() {
 }
 
 # Fetch the CodeRabbit `StatusContext` check on the current HEAD SHA.
-# Emits one of: success | failure | pending | error | missing
-# on stdout. `missing` covers both the no-statuses-yet case and any
-# transient API hiccup (network, 5xx, etc.) — caller treats it as
-# "fall through to the existing comment-driven path."
+# Emits compact JSON with:
+#   { "state": "success|failure|pending|error|missing", "created_at": "..." }
+#
+# `missing` covers both the no-statuses-yet case and any transient API
+# hiccup (network, 5xx, etc.) — caller treats it as "fall through to
+# the existing comment-driven path."
 #
 # Two defensive guards (CodeRabbit ⚠️ Critical on PR #224 round 1):
 #
@@ -272,8 +274,8 @@ fetch_api_array() {
 # `/commits/{sha}/status` rolls up state but omits per-status creator
 # fields, which would defeat guard 1. Confirmed empirically — see
 # PR #224 round 2.
-check_status_context() {
-  local resp state
+check_status_context_record() {
+  local resp
   # Pagination (CodeRabbit ⚠️ Minor @ line 267 on PR #224 round 2):
   # `/commits/{ref}/statuses` defaults to per_page=30 and returns
   # statuses in reverse chronological order. Without `--paginate`, a
@@ -284,23 +286,26 @@ check_status_context() {
   # the context+creator filter runs.
   resp=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/statuses" 2>/dev/null \
     | jq -s 'add // []' 2>/dev/null) || {
-    echo "missing"
+    jq -nc '{state: "missing", created_at: ""}'
     return
   }
-  state=$(echo "$resp" | jq -r --arg bot "$BOT_LOGIN" '
+  echo "$resp" | jq -c --arg bot "$BOT_LOGIN" '
     [ .[]?
       | select(.context == "CodeRabbit")
       | select((.creator.login // "") == $bot)
     ]
     | sort_by(.created_at)
     | last
-    | .state // ""
-  ')
-  if [ -z "$state" ]; then
-    echo "missing"
-    return
-  fi
-  echo "$state"
+    | if . == null then
+        {state: "missing", created_at: ""}
+      else
+        {state: (.state // "missing"), created_at: (.created_at // "")}
+      end
+  '
+}
+
+check_status_context() {
+  check_status_context_record | jq -r '.state'
 }
 
 # --- fetch PR metadata ------------------------------------------------------
@@ -556,7 +561,24 @@ count_potential_issues_for_sha() {
   '
 }
 
+iso_on_or_after() {
+  local lhs=$1 rhs=$2 rc
+  if [ -z "$lhs" ] || [ "$lhs" = "null" ] || [ -z "$rhs" ] || [ "$rhs" = "null" ]; then
+    return 0
+  fi
+
+  jq -en --arg lhs "$lhs" --arg rhs "$rhs" \
+    '($lhs | fromdateiso8601) >= ($rhs | fromdateiso8601)' >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 status_context_fast_path_blocked_by_comment() {
+  local status_created_at=$1
   local latest class comment_id comment_created
   latest=$(scan_latest_comment)
   if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
@@ -568,8 +590,12 @@ status_context_fast_path_blocked_by_comment() {
     rate_limit|in_progress)
       comment_id=$(echo "$latest" | jq -r '.id')
       comment_created=$(echo "$latest" | jq -r '.created_at')
-      log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class created=$comment_created still requires the comment-driven state machine"
-      return 0
+      if iso_on_or_after "$comment_created" "$status_created_at"; then
+        log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class created=$comment_created is not older than status_created=$status_created_at"
+        return 0
+      fi
+      log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class created=$comment_created is older than status_created=$status_created_at"
+      return 1
       ;;
   esac
 
@@ -744,10 +770,12 @@ emit_status_context_verdict() {
 # poll burned the full 300s budget on every clean fix-up push because
 # CodeRabbit doesn't re-narrate when there's nothing new to flag.
 if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
-  INITIAL_CTX=$(check_status_context)
+  INITIAL_CTX_RECORD=$(check_status_context_record)
+  INITIAL_CTX=$(echo "$INITIAL_CTX_RECORD" | jq -r '.state')
+  INITIAL_CTX_CREATED=$(echo "$INITIAL_CTX_RECORD" | jq -r '.created_at')
   log "initial CodeRabbit StatusContext = $INITIAL_CTX on $HEAD_SHA"
   if [ "$INITIAL_CTX" = "success" ]; then
-    if ! status_context_fast_path_blocked_by_comment; then
+    if ! status_context_fast_path_blocked_by_comment "$INITIAL_CTX_CREATED"; then
       log "StatusContext success — entering fast-path verdict (scans inline findings before clearance)"
       emit_status_context_verdict "$INITIAL_CTX"
     fi
@@ -767,9 +795,11 @@ while :; do
   # API call than `scan_latest_comment` so it's worth doing first each
   # iteration; falls through to the comment scan if not success/failure.
   if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
-    LOOP_CTX=$(check_status_context)
+    LOOP_CTX_RECORD=$(check_status_context_record)
+    LOOP_CTX=$(echo "$LOOP_CTX_RECORD" | jq -r '.state')
+    LOOP_CTX_CREATED=$(echo "$LOOP_CTX_RECORD" | jq -r '.created_at')
     if [ "$LOOP_CTX" = "success" ]; then
-      if ! status_context_fast_path_blocked_by_comment; then
+      if ! status_context_fast_path_blocked_by_comment "$LOOP_CTX_CREATED"; then
         log "CodeRabbit StatusContext flipped to success mid-loop on $HEAD_SHA — entering fast-path verdict"
         emit_status_context_verdict "$LOOP_CTX"
       fi

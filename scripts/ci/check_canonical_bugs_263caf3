@@ -39,8 +39,10 @@
 #
 #   Bug 6: scripts/coderabbit-wait.sh trusted a SUCCESS CodeRabbit
 #          StatusContext even when the current-head PR-level CodeRabbit
-#          comment was a rate-limit notice. The helper returned cleared
-#          even though CodeRabbit explicitly had not reviewed the PR.
+#          comment was a newer rate-limit notice. The helper returned
+#          cleared even though CodeRabbit explicitly had not reviewed
+#          the PR. The inverse matters too: an old rate-limit comment
+#          must not suppress a newer terminal SUCCESS status.
 #
 # This check exercises the jq filter literals in isolation against
 # in-memory fixtures so a future edit can't silently regress either
@@ -1133,23 +1135,25 @@ case "$1" in
           printf '[]\n'
           ;;
         repos/nathanjohnpayne/mergepath/commits/headsha/statuses)
-          cat <<'JSON'
+          status_created_at="${STUB_STATUS_CREATED_AT:-2999-01-01T00:00:00Z}"
+          cat <<JSON
 [
   {
     "context": "CodeRabbit",
     "state": "success",
-    "created_at": "2999-01-01T00:00:00Z",
+    "created_at": "$status_created_at",
     "creator": {"login": "coderabbitai[bot]"}
   }
 ]
 JSON
           ;;
         repos/nathanjohnpayne/mergepath/issues/12345/comments)
-          cat <<'JSON'
+          comment_created_at="${STUB_COMMENT_CREATED_AT:-2999-01-01T00:00:00Z}"
+          cat <<JSON
 [
   {
     "id": 6101,
-    "created_at": "2999-01-01T00:00:00Z",
+    "created_at": "$comment_created_at",
     "user": {"login": "coderabbitai[bot]"},
     "body": "> [!WARNING]\n> ## Rate limit exceeded\n>\n> Please wait **10 minutes** before requesting another review."
   }
@@ -1228,6 +1232,29 @@ if [ "$rc" = "5" ] &&
 else
   fail=$((fail + 1))
   echo "  FAIL: StatusContext success incorrectly cleared or masked a rate-limit comment (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+set +e
+out=$(
+  cd "$CODERABBIT_FASTPATH_ROOT" &&
+    PATH="$SCRATCH:$PATH" \
+    GH_TOKEN=fixture-token \
+    CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+    STUB_COMMENT_CREATED_AT="2999-01-01T00:00:00Z" \
+    STUB_STATUS_CREATED_AT="2999-01-01T00:00:01Z" \
+    "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" = "0" ] &&
+   echo "$out" | grep -q '"status": "cleared"' &&
+   echo "$out" | grep -q "is older than status_created"; then
+  pass=$((pass + 1))
+  echo "  PASS: newer StatusContext success clears despite an older rate-limit comment"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale rate-limit comment incorrectly suppressed a newer StatusContext success (rc=$rc)" >&2
   echo "$out" | sed 's/^/    /' >&2
 fi
 
