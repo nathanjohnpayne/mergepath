@@ -612,11 +612,7 @@ status_context_fast_path_blocked_by_comment() {
         log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class explicitly references current HEAD $HEAD_SHA but fresh_at=$comment_fresh_at is older than status_created=$status_created_at"
         return 1
       fi
-      if iso_on_or_after "$comment_fresh_at" "$status_created_at"; then
-        log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class fresh_at=$comment_fresh_at is not older than status_created=$status_created_at"
-        return 0
-      fi
-      log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class fresh_at=$comment_fresh_at is older than status_created=$status_created_at"
+      log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class does not reference current HEAD $HEAD_SHA"
       return 1
       ;;
   esac

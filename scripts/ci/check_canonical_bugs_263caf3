@@ -1277,12 +1277,37 @@ rc=$?
 set -e
 if [ "$rc" = "0" ] &&
    echo "$out" | grep -q '"status": "cleared"' &&
-   echo "$out" | grep -q "is older than status_created"; then
+   echo "$out" | grep -q "does not reference current HEAD headsha"; then
   pass=$((pass + 1))
-  echo "  PASS: newer StatusContext success clears despite an older non-HEAD rate-limit comment"
+  echo "  PASS: StatusContext success clears despite an unscoped non-HEAD rate-limit comment"
 else
   fail=$((fail + 1))
-  echo "  FAIL: stale rate-limit comment incorrectly suppressed a newer StatusContext success (rc=$rc)" >&2
+  echo "  FAIL: unscoped non-HEAD rate-limit comment incorrectly suppressed StatusContext success (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+set +e
+out=$(
+  cd "$CODERABBIT_FASTPATH_ROOT" &&
+    PATH="$SCRATCH:$PATH" \
+    GH_TOKEN=fixture-token \
+    CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+    STUB_COMMENT_CREATED_AT="2998-01-01T00:00:00Z" \
+    STUB_COMMENT_UPDATED_AT="2999-01-01T00:00:02Z" \
+    STUB_STATUS_CREATED_AT="2999-01-01T00:00:01Z" \
+    STUB_COMMENT_BODY_SUFFIX="" \
+    "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" = "0" ] &&
+   echo "$out" | grep -q '"status": "cleared"' &&
+   echo "$out" | grep -q "does not reference current HEAD headsha"; then
+  pass=$((pass + 1))
+  echo "  PASS: newer unscoped non-HEAD rate-limit comment does not suppress StatusContext success"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: fresh unscoped non-HEAD rate-limit comment incorrectly suppressed StatusContext success (rc=$rc)" >&2
   echo "$out" | sed 's/^/    /' >&2
 fi
 
