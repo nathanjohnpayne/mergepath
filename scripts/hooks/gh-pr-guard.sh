@@ -141,6 +141,13 @@
 #
 # Design notes:
 #
+#   - Compound Bash tool calls that contain multiple command-position
+#     `gh` invocations now fail closed when any invocation is a
+#     guarded write (pr create/merge/comment/review or issue
+#     comment). This is deliberately conservative: split multi-step
+#     GitHub work into separate Bash tool calls so each write gets
+#     the same single-command guard path (#348).
+#
 #   - The CODEX_CLEARED check is a hook-layer defense-in-depth.
 #     The authoritative merge gate is scripts/codex-review-check.sh;
 #     the hook only verifies the agent claims to have run it. An
@@ -335,6 +342,189 @@ while IFS= read -r -d '' tok; do
   TOKENS+=("$tok")
 done < "$TMP_TOKENS"
 
+# #348 defense: the main parser below intentionally identifies one
+# `gh` invocation and then routes it through the existing per-command
+# policy. That was enough for single commands, but a compound shell
+# input could put an allow-listed `gh` first and a guarded write second
+# (`gh issue close 1 && gh pr merge --admin 2`). The first command hit
+# an allow-exit and the second write never reached the guard. Keep the
+# per-command parser unchanged for normal commands, but fail closed when
+# one Bash tool call contains multiple command-position gh invocations
+# and any of them is a guarded write.
+is_guard_separator() {
+  case "$1" in
+    "&&"|"||"|";"|"|"|"|&"|"&"|"("|")")
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+prefix_flag_takes_value() {
+  case "$1:$2" in
+    sudo:-u|sudo:-g|sudo:-U|sudo:-h|sudo:-p|sudo:-r|sudo:-s|sudo:-t|sudo:-c|sudo:-D)
+      return 0
+      ;;
+    time:-f|time:-o)
+      return 0
+      ;;
+    nice:-n)
+      return 0
+      ;;
+    ionice:-c|ionice:-n|ionice:-p)
+      return 0
+      ;;
+    env:-u|env:-S)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+guarded_gh_invocation_label() {
+  local gh_index="$1"
+  local parent=""
+  local skip_global_as=""
+  local k
+  local tok
+
+  for k in "${!TOKENS[@]}"; do
+    if [ "$k" -le "$gh_index" ]; then
+      continue
+    fi
+
+    tok="${TOKENS[$k]}"
+    if is_guard_separator "$tok"; then
+      return 1
+    fi
+
+    if [ "$skip_global_as" = "repo" ]; then
+      skip_global_as=""
+      continue
+    fi
+
+    if [ -z "$parent" ]; then
+      case "$tok" in
+        pr|issue)
+          parent="$tok"
+          continue
+          ;;
+        -R|--repo)
+          skip_global_as="repo"
+          continue
+          ;;
+        -R=*|--repo=*)
+          continue
+          ;;
+        -*)
+          continue
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+    fi
+
+    case "$tok" in
+      -R|--repo)
+        skip_global_as="repo"
+        continue
+        ;;
+      -R=*|--repo=*)
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+    esac
+
+    case "$parent:$tok" in
+      pr:create|pr:merge|pr:comment|pr:review)
+        printf 'gh pr %s\n' "$tok"
+        return 0
+        ;;
+      issue:comment)
+        printf 'gh issue comment\n'
+        return 0
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+COMPOUND_GH_COUNT=0
+COMPOUND_GUARDED_COUNT=0
+COMPOUND_GUARDED_EXAMPLES=""
+SCAN_AT_COMMAND_POSITION=1
+SCAN_SKIP_PREFIX_VALUE=0
+SCAN_CURRENT_PREFIX=""
+for i in "${!TOKENS[@]}"; do
+  tok="${TOKENS[$i]}"
+
+  if is_guard_separator "$tok"; then
+    SCAN_AT_COMMAND_POSITION=1
+    SCAN_SKIP_PREFIX_VALUE=0
+    SCAN_CURRENT_PREFIX=""
+    continue
+  fi
+
+  if [ "$SCAN_SKIP_PREFIX_VALUE" -eq 1 ]; then
+    SCAN_SKIP_PREFIX_VALUE=0
+    continue
+  fi
+
+  if [ "$SCAN_AT_COMMAND_POSITION" -eq 0 ]; then
+    continue
+  fi
+
+  case "$tok" in
+    [A-Za-z_]*=*)
+      continue
+      ;;
+    sudo|eval|time|nohup|env|command|exec|nice|ionice)
+      SCAN_CURRENT_PREFIX="$tok"
+      continue
+      ;;
+    -*)
+      if prefix_flag_takes_value "$SCAN_CURRENT_PREFIX" "$tok"; then
+        SCAN_SKIP_PREFIX_VALUE=1
+      fi
+      continue
+      ;;
+    gh)
+      COMPOUND_GH_COUNT=$((COMPOUND_GH_COUNT + 1))
+      if guarded_label=$(guarded_gh_invocation_label "$i"); then
+        COMPOUND_GUARDED_COUNT=$((COMPOUND_GUARDED_COUNT + 1))
+        if [ -z "$COMPOUND_GUARDED_EXAMPLES" ]; then
+          COMPOUND_GUARDED_EXAMPLES="$guarded_label"
+        elif ! printf '%s\n' "$COMPOUND_GUARDED_EXAMPLES" | grep -Fxq "$guarded_label"; then
+          COMPOUND_GUARDED_EXAMPLES="${COMPOUND_GUARDED_EXAMPLES}
+$guarded_label"
+        fi
+      fi
+      SCAN_AT_COMMAND_POSITION=0
+      continue
+      ;;
+    *)
+      SCAN_AT_COMMAND_POSITION=0
+      continue
+      ;;
+  esac
+done
+
+if [ "$COMPOUND_GH_COUNT" -gt 1 ] && [ "$COMPOUND_GUARDED_COUNT" -gt 0 ]; then
+  echo "BLOCKED: compound gh command contains a guarded write (#348)." >&2
+  echo "  Detected $COMPOUND_GH_COUNT command-position gh invocations in one Bash call." >&2
+  echo "  Guarded write(s) present:" >&2
+  printf '%s\n' "$COMPOUND_GUARDED_EXAMPLES" | sed 's/^/    - /' >&2
+  echo "  Split this into separate Bash tool calls so gh-pr-guard can evaluate each gh write independently." >&2
+  exit 2
+fi
+
 # --- detect the pr subcommand, capturing any global -R/--repo ---
 #
 # Walk tokens to find `gh` IN COMMAND POSITION, then identify the
@@ -353,7 +543,7 @@ done < "$TMP_TOKENS"
 #       - prefix commands         sudo, eval, time, nohup, env,
 #                                 command, exec, nice, ionice
 #       - flags of those prefixes -X
-#       - compound separators     ;  &&  ||  |  &  (
+#       - compound separators     ;  &&  ||  |  |&  &  (
 #       - gh                      → transition to phase 2
 #     Any other token is treated as the START of a non-gh command,
 #     and we transition to IN_UNRELATED_ARGS to skip its arguments.
@@ -374,8 +564,9 @@ done < "$TMP_TOKENS"
 # is harmless: the EFFECTIVE_* values are only consulted by the
 # create/merge guards, which only run when SAW_GH=1.)
 #
-# Tokens BETWEEN `gh` and `pr` are global gh flags. The only global
-# value-taking flag we explicitly handle is -R/--repo; everything
+# Tokens BETWEEN `gh` and `pr` (and parent-level tokens between
+# `pr`/`issue` and the subcommand) may contain inherited gh flags. The
+# only value-taking flag we explicitly handle is -R/--repo; everything
 # else starting with - is assumed boolean and skipped.
 INLINE_CODEX_CLEARED=""
 INLINE_BREAK_GLASS_ADMIN=""
@@ -440,6 +631,26 @@ for i in "${!TOKENS[@]}"; do
           ;;
       esac
     fi
+    # SAW_PR=1 OR SAW_ISSUE=1 — parent-level gh flags may still
+    # appear before the subcommand, e.g. `gh pr -R owner/repo merge`.
+    case "$tok" in
+      -R|--repo)
+        SKIP_GLOBAL_AS="repo"
+        continue
+        ;;
+      -R=*)
+        GLOBAL_REPO="${tok#-R=}"
+        continue
+        ;;
+      --repo=*)
+        GLOBAL_REPO="${tok#--repo=}"
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+    esac
+
     # SAW_PR=1 OR SAW_ISSUE=1 — this token IS the subcommand.
     PR_SUBCOMMAND="$tok"
     PR_SUBCOMMAND_INDEX=$i
@@ -471,7 +682,7 @@ for i in "${!TOKENS[@]}"; do
   # to the gh process. nathanpayne-codex caught this on swipewatch
   # propagation PR #33 round 5 — privilege escalation potential.
   case "$tok" in
-    "&&"|"||"|";"|"|"|"&"|"("|")")
+    "&&"|"||"|";"|"|"|"|&"|"&"|"("|")")
       AT_COMMAND_POSITION=1
       CURRENT_PREFIX=""
       # Clear inline env vars ONLY when the segment that just ended
@@ -560,29 +771,13 @@ for i in "${!TOKENS[@]}"; do
       # Per-prefix value-flag map. nathanpayne-codex caught the
       # original bug (sudo -u, time -f, nice -n) on PR #66
       # round 6; the per-prefix scoping prevents the obvious
-      # over-fix from breaking `time -p`.
-      case "$CURRENT_PREFIX:$tok" in
-        sudo:-u|sudo:-g|sudo:-U|sudo:-h|sudo:-p|sudo:-r|sudo:-s|sudo:-t|sudo:-c|sudo:-D)
-          SKIP_PREFIX_VALUE=1
-          continue
-          ;;
-        time:-f|time:-o)
-          SKIP_PREFIX_VALUE=1
-          continue
-          ;;
-        nice:-n)
-          SKIP_PREFIX_VALUE=1
-          continue
-          ;;
-        ionice:-c|ionice:-n|ionice:-p)
-          SKIP_PREFIX_VALUE=1
-          continue
-          ;;
-        env:-u|env:-S)
-          SKIP_PREFIX_VALUE=1
-          continue
-          ;;
-      esac
+      # over-fix from breaking `time -p`. Keep this shared with
+      # the #348 compound pre-scan so both walks classify prefixes
+      # identically.
+      if prefix_flag_takes_value "$CURRENT_PREFIX" "$tok"; then
+        SKIP_PREFIX_VALUE=1
+        continue
+      fi
       # Otherwise: boolean flag of the current prefix (or a flag
       # of an unknown prefix, which we conservatively assume is
       # boolean to avoid eating `gh`). Stay in command position.
