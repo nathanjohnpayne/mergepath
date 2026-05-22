@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# scripts/codex-review-check.sh — Phase 4a merge gate
+# scripts/codex-review-check.sh — Phase 4 external-review merge gate
 #
-# Verifies that a pull request is ready to merge under the Phase 4a
-# automated external review flow. Read-only. Never merges, labels, or
-# comments on the PR.
+# Verifies that a pull request is ready to merge under the Phase 4
+# external-review flow. Read-only. Never merges, labels, or comments
+# on the PR.
 #
 # Usage:
 #   scripts/codex-review-check.sh <PR_NUMBER> [REPO]
@@ -25,8 +25,9 @@
 #       nathanpayne-cursor, nathanpayne-codex) is present on the PR,
 #       from an account != the PR author.
 #
-#   (c) Codex (or a Phase 4b substitute reviewer) has cleared on or
-#       after the current HEAD commit via one of three signals:
+#   (c) Codex (when codex.enabled=true) or a Phase 4b substitute
+#       reviewer has cleared on or after the current HEAD commit via
+#       one of three signals:
 #
 #         - A COMMENTED review from the Codex bot on the current HEAD
 #           with NO unaddressed P0/P1 inline findings, OR
@@ -50,6 +51,9 @@
 #       App never emits APPROVED — it uses COMMENTED with inline
 #       findings, or no review at all when it reacts 👍. See #29 for
 #       live observational evidence from the PR #53 bootstrap.
+#       When codex.enabled=false, this script ignores Codex bot
+#       reviews/reactions entirely and gate (c) can clear only through
+#       the Phase 4b substitute branch when enabled.
 #
 # "Unaddressed" heuristic for v1:
 #   A P0/P1 finding is considered unaddressed if it exists on the
@@ -159,8 +163,8 @@ codex_field() {
     in_block && /^[^[:space:]#]/ {in_block=0}
     in_block && $1 == field":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^"/, "", $0)
-      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      gsub(/^["\047]/, "", $0)
+      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
       gsub(/[[:space:]]*#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)
       print
@@ -183,8 +187,8 @@ policy_field() {
   awk -v field="$field" '
     /^[^[:space:]]/ && $1 == field":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^"/, "", $0)
-      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      gsub(/^["\047]/, "", $0)
+      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
       gsub(/[[:space:]]*#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)
       print
@@ -211,6 +215,16 @@ export PHASE_4B_DEFAULT
 
 BOT_LOGIN=$(codex_field bot_login)
 BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
+
+CODEX_ENABLED=$(codex_field enabled)
+CODEX_ENABLED=${CODEX_ENABLED:-true}
+case "$CODEX_ENABLED" in
+  true|false) ;;
+  *)
+    echo "ERROR: codex.enabled must be true|false; got '$CODEX_ENABLED'" >&2
+    exit 3
+    ;;
+esac
 
 REACTION_FRESHNESS_SECONDS=$(codex_field reaction_freshness_window_seconds)
 REACTION_FRESHNESS_SECONDS=${REACTION_FRESHNESS_SECONDS:-1800}
@@ -728,12 +742,12 @@ if [ -z "$APPROVING_REVIEWER" ]; then
   # rule.) Same-agent PRs at Phase 4 would otherwise be unable to clear
   # gate (b) by branch 1 unless a second agent (cursor / codex CLI)
   # reviews independently. In a single-agent session that's friction
-  # with no policy benefit — Codex's external review IS the cross-agent
-  # signal. Accept a fresh Codex 👍 reaction on the PR issue as a
-  # substitute for branch 1, BUT ONLY when the PR's Authoring-Agent
-  # matches an entry in available_reviewers (otherwise this would
-  # weaken gate (b) for cross-agent PRs that
-  # genuinely need a reviewer-identity APPROVED).
+  # with no policy benefit when Codex is enabled — Codex's external
+  # review IS the cross-agent signal. Accept a fresh Codex 👍 reaction
+  # on the PR issue as a substitute for branch 1, BUT ONLY when
+  # codex.enabled=true AND the PR's Authoring-Agent matches an entry in
+  # available_reviewers (otherwise this would weaken gate (b) for
+  # cross-agent PRs that genuinely need a reviewer-identity APPROVED).
   #
   # Freshness: same REACTION_THRESHOLD that gate (c) uses, computed
   # earlier in the script. Reaction must be at-or-after the threshold,
@@ -744,7 +758,9 @@ if [ -z "$APPROVING_REVIEWER" ]; then
   # still permitted — branch 2 is opt-in via the matching Authoring-
   # Agent header. If you want strict cross-agent enforcement, omit the
   # Authoring-Agent line; gate (b) then falls back to branch 1 only.
-  if [ -n "$SAME_AGENT_REVIEWER" ]; then
+  if [ -n "$SAME_AGENT_REVIEWER" ] && [ "$CODEX_ENABLED" != "true" ]; then
+    log "gate (b): same-agent Codex 👍 fallback unavailable because codex.enabled=false"
+  elif [ -n "$SAME_AGENT_REVIEWER" ]; then
     log "gate (b): no reviewer-identity APPROVED, but same-agent author/reviewer detected (Authoring-Agent: $AUTHORING_AGENT → $SAME_AGENT_REVIEWER); checking for Codex 👍 fallback per #170"
     REACTIONS_FOR_GATE_B=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions")
     GATE_B_THUMBS_UP=$(echo "$REACTIONS_FOR_GATE_B" | jq -r \
@@ -764,15 +780,28 @@ if [ -z "$APPROVING_REVIEWER" ]; then
   fi
 
   if [ -z "$APPROVING_REVIEWER" ]; then
-    fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED review, and same-agent + Codex 👍 fallback (branch 2) did not apply (Authoring-Agent: ${AUTHORING_AGENT:-not set}; matched reviewer: ${SAME_AGENT_REVIEWER:-none}; threshold: $REACTION_THRESHOLD)"
+    fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED review, and same-agent + Codex 👍 fallback (branch 2) did not apply (codex.enabled=$CODEX_ENABLED; Authoring-Agent: ${AUTHORING_AGENT:-not set}; matched reviewer: ${SAME_AGENT_REVIEWER:-none}; threshold: $REACTION_THRESHOLD)"
   fi
 else
   log "gate (b): latest-state APPROVED by $APPROVING_REVIEWER"
 fi
 
-# --- gate (c): Codex cleared on current HEAD -------------------------------
+# --- gate (c): Codex / Phase 4b cleared on current HEAD --------------------
 
-log "gate (c): checking Codex clearance on $HEAD_SHA"
+log "gate (c): checking external clearance on $HEAD_SHA (codex.enabled=$CODEX_ENABLED)"
+
+CLEARED=false
+CLEARANCE_REASON=""
+CODEX_REVIEW='null'
+CODEX_REVIEW_ID=""
+COMMENTS_JSON='[]'
+UNADDRESSED_P01='[]'
+UNADDRESSED_COUNT=0
+REACTIONS_JSON='[]'
+LATEST_THUMBS_UP_TIME=""
+CODEX_REVIEW_TIME=""
+
+if [ "$CODEX_ENABLED" = "true" ]; then
 
 # Latest Codex review on the current HEAD commit (if any). Codex always
 # uses COMMENTED state regardless of findings — do NOT filter on state.
@@ -865,9 +894,6 @@ CODEX_REVIEW_TIME=$(echo "$CODEX_REVIEW" | jq -r 'if . == null then "" else .sub
 # pull_request_review_id to scope findings (addressed in round 1's
 # finding 2), so an older review's stale comments are never counted.
 
-CLEARED=false
-CLEARANCE_REASON=""
-
 if [ -n "$LATEST_THUMBS_UP_TIME" ] && [ -n "$CODEX_REVIEW_TIME" ]; then
   # Both signals present on HEAD — compare timestamps. ISO 8601 sorts
   # chronologically under lexicographic string comparison.
@@ -890,6 +916,10 @@ elif [ -n "$CODEX_REVIEW_TIME" ]; then
     CLEARED=true
     CLEARANCE_REASON="COMMENTED review from $BOT_LOGIN @ $CODEX_REVIEW_TIME on $HEAD_SHA with no unaddressed P0/P1 findings"
   fi
+fi
+
+else
+  log "gate (c): codex.enabled=false — ignoring Codex bot review/reaction signals; requiring Phase 4b substitute clearance when allowed"
 fi
 
 # Phase 4b substitute (#218): if Codex hasn't cleared via 👍 or a
@@ -979,7 +1009,13 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
 fi
 
 if [ "$CLEARED" != "true" ]; then
-  if [ -z "$LATEST_THUMBS_UP_TIME" ] && [ -z "$CODEX_REVIEW_TIME" ]; then
+  if [ "$CODEX_ENABLED" != "true" ]; then
+    if [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
+      fail_gate "codex.enabled=false and no Phase 4b substitute APPROVED on $HEAD_SHA from a non-author identity in available_reviewers"
+    else
+      fail_gate "codex.enabled=false and codex.allow_phase_4b_substitute=false, so no gate (c) clearance path is available"
+    fi
+  elif [ -z "$LATEST_THUMBS_UP_TIME" ] && [ -z "$CODEX_REVIEW_TIME" ]; then
     if [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
       fail_gate "Codex has not cleared current HEAD and no Phase 4b substitute APPROVED on $HEAD_SHA from a non-author identity in available_reviewers (no review on HEAD, no +1 reaction from $BOT_LOGIN on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)"
     else
@@ -995,5 +1031,5 @@ log "gate (c): cleared — $CLEARANCE_REASON"
 
 # --- all gates pass ---------------------------------------------------------
 
-log "all merge gates pass — PR $REPO#$PR_NUMBER is mergeable under Phase 4a"
+log "all merge gates pass — PR $REPO#$PR_NUMBER is mergeable under Phase 4 external review"
 exit 0

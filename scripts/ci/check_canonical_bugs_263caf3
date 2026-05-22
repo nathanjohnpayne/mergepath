@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # check_canonical_bugs_263caf3
 #
-# Regression coverage for two canonical-surface bugs found by
+# Regression coverage for canonical-surface bugs found by
 # nathanpayne-codex while doing the Phase 4b external reviews on
 # the 263caf3 propagation wave (matchline#232, nathanpaynedotcom#368,
 # overridebroadway#59, device-source-of-truth#86,
 # friends-and-family-billing#270, device-platform-reporting#80,
-# swipewatch#51, tadlockpsychiatry#54). Both are upstream canonical
+# swipewatch#51, tadlockpsychiatry#54), plus follow-up regressions in
+# the same review-policy/gate surface. These are upstream canonical
 # defects that affect every consumer, not consumer-local drift.
 #
 #   Bug 1: scripts/request-label-removal.sh aborted under `set -e`
@@ -660,6 +661,268 @@ if grep -Fq 'any(.labels[].name; . == $label)' "$CODEX_CHECK_SCRIPT"; then
 else
   fail=$((fail + 1))
   echo "  FAIL: codex-review-check.sh is missing the exact-name jq predicate" >&2
+fi
+
+echo
+echo "Bug 4 regression: codex.enabled=false ignores Codex bot clearance (#362)"
+
+# #362: codex-review-check.sh used to read Codex bot reviews and 👍
+# reactions even when `.github/review-policy.yml` had `codex.enabled:
+# false`. In that posture Phase 4a is unavailable, so gate (c) must
+# clear ONLY through the Phase 4b substitute branch.
+
+run_gate_c_enabled_model() {
+  # Args:
+  #   $1 = codex_enabled (true|false)
+  #   $2 = latest_thumbs_up_time
+  #   $3 = codex_review_time
+  #   $4 = unaddressed_p01_count
+  #   $5 = allow_phase_4b_substitute (true|false)
+  #   $6 = phase_4b_time
+  local codex_enabled="$1"
+  local latest_thumbs_up_time="$2"
+  local codex_review_time="$3"
+  local unaddressed_count="$4"
+  local allow_phase_4b="$5"
+  local phase_4b_time="$6"
+  local cleared=false
+  local latest_codex_signal_time=""
+
+  if [ "$codex_enabled" = "true" ]; then
+    if [ -n "$latest_thumbs_up_time" ] && [ -n "$codex_review_time" ]; then
+      if [[ "$latest_thumbs_up_time" > "$codex_review_time" ]]; then
+        cleared=true
+      elif [ "$unaddressed_count" -eq 0 ]; then
+        cleared=true
+      fi
+    elif [ -n "$latest_thumbs_up_time" ]; then
+      cleared=true
+    elif [ -n "$codex_review_time" ] && [ "$unaddressed_count" -eq 0 ]; then
+      cleared=true
+    fi
+
+    latest_codex_signal_time="$latest_thumbs_up_time"
+    if [ -n "$codex_review_time" ] && { [ -z "$latest_codex_signal_time" ] || [[ "$codex_review_time" > "$latest_codex_signal_time" ]]; }; then
+      latest_codex_signal_time="$codex_review_time"
+    fi
+  fi
+
+  if [ "$cleared" != "true" ] && [ "$allow_phase_4b" = "true" ] && [ -n "$phase_4b_time" ]; then
+    if [ -z "$latest_codex_signal_time" ] || [[ "$phase_4b_time" > "$latest_codex_signal_time" ]]; then
+      cleared=true
+    fi
+  fi
+
+  printf '%s\n' "$cleared"
+}
+
+got=$(run_gate_c_enabled_model false "2026-05-21T12:00:00Z" "" 0 true "")
+if [ "$got" = "false" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: codex.enabled=false + bot 👍 alone does not clear gate (c)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: codex.enabled=false still let bot 👍 clear gate (c)" >&2
+fi
+
+got=$(run_gate_c_enabled_model false "" "2026-05-21T12:00:00Z" 0 true "")
+if [ "$got" = "false" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: codex.enabled=false + clean Codex COMMENTED review alone does not clear gate (c)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: codex.enabled=false still let a Codex COMMENTED review clear gate (c)" >&2
+fi
+
+got=$(run_gate_c_enabled_model false "2026-05-21T12:00:00Z" "" 0 true "2026-05-21T11:00:00Z")
+if [ "$got" = "true" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: codex.enabled=false + Phase 4b APPROVED clears even when an ignored bot signal is newer"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: codex.enabled=false did not accept Phase 4b substitute clearance" >&2
+fi
+
+got=$(run_gate_c_enabled_model true "2026-05-21T12:00:00Z" "" 0 true "")
+if [ "$got" = "true" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: codex.enabled=true still accepts bot 👍 clearance"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: codex.enabled=true stopped accepting bot 👍 clearance" >&2
+fi
+
+if grep -Fq 'CODEX_ENABLED=$(codex_field enabled)' "$CODEX_CHECK_SCRIPT" && \
+   grep -Fq 'codex.enabled=false — ignoring Codex bot review/reaction signals' "$CODEX_CHECK_SCRIPT" && \
+   grep -Fq 'same-agent Codex 👍 fallback unavailable because codex.enabled=false' "$CODEX_CHECK_SCRIPT"; then
+  pass=$((pass + 1))
+  echo "  PASS: production script parses codex.enabled and disables both Codex clearance paths"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: production script is missing the codex.enabled enforcement hooks" >&2
+fi
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+
+scenario="${CODEX_ENABLED_FIXTURE:-}"
+
+reviews_json() {
+  case "$scenario" in
+    disabled_bot_only|enabled_bot)
+      cat <<'JSON'
+[
+  {"user":{"login":"nathanpayne-claude"},"state":"APPROVED","commit_id":"oldsha","submitted_at":"2026-05-21T11:00:00Z"}
+]
+JSON
+      ;;
+    disabled_4b)
+      cat <<'JSON'
+[
+  {"user":{"login":"nathanpayne-claude"},"state":"APPROVED","commit_id":"headsha","submitted_at":"2026-05-21T11:00:00Z"}
+]
+JSON
+      ;;
+    *)
+      printf '[]\n'
+      ;;
+  esac
+}
+
+reactions_json() {
+  case "$scenario" in
+    disabled_bot_only|disabled_4b|enabled_bot)
+      reaction_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      printf '[{"user":{"login":"chatgpt-codex-connector[bot]"},"content":"+1","created_at":"%s"}]\n' "$reaction_time"
+      ;;
+    *)
+      printf '[]\n'
+      ;;
+  esac
+}
+
+case "$1" in
+  api)
+    shift
+    if [ "${1:-}" = "--paginate" ]; then
+      shift
+      case "${1:-}" in
+        repos/nathanjohnpayne/mergepath/issues/99999/timeline) printf '[]\n' ;;
+        repos/nathanjohnpayne/mergepath/pulls/99999/reviews) reviews_json ;;
+        repos/nathanjohnpayne/mergepath/pulls/99999/comments) printf '[]\n' ;;
+        repos/nathanjohnpayne/mergepath/issues/99999/reactions) reactions_json ;;
+        *) printf 'unexpected paginated endpoint: %s\n' "${1:-}" >&2; exit 9 ;;
+      esac
+      exit 0
+    fi
+
+    case "${1:-}" in
+      repos/nathanjohnpayne/mergepath/pulls/99999)
+        cat <<'JSON'
+{"head":{"sha":"headsha"},"user":{"login":"nathanjohnpayne"},"body":"Authoring-Agent: codex","base":{"ref":"main"},"labels":[]}
+JSON
+        ;;
+      repos/nathanjohnpayne/mergepath/commits/headsha)
+        if [ "${2:-}" = "--jq" ]; then
+          printf '2026-05-21T11:30:00Z\n'
+        else
+          printf '{"commit":{"committer":{"date":"2026-05-21T11:30:00Z"}}}\n'
+        fi
+        ;;
+      repos/nathanjohnpayne/mergepath/branches/main/protection/required_status_checks)
+        exit 1
+        ;;
+      *) printf 'unexpected endpoint: %s\n' "${1:-}" >&2; exit 9 ;;
+    esac
+    ;;
+  pr)
+    shift
+    case "${1:-}" in
+      view)
+        printf '{"statusCheckRollup":[]}\n'
+        ;;
+      *) printf 'unexpected pr command: %s\n' "${1:-}" >&2; exit 9 ;;
+    esac
+    ;;
+  repo)
+    shift
+    case "${1:-}" in
+      view) printf 'nathanjohnpayne/mergepath\n' ;;
+      *) printf 'unexpected repo command: %s\n' "${1:-}" >&2; exit 9 ;;
+    esac
+    ;;
+  *) printf 'unexpected gh command: %s\n' "${1:-}" >&2; exit 9 ;;
+esac
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+CODEX_FIXTURE_ROOT="$SCRATCH/codex-enabled-root"
+mkdir -p "$CODEX_FIXTURE_ROOT/.github"
+
+write_codex_enabled_policy() {
+  cat > "$CODEX_FIXTURE_ROOT/.github/review-policy.yml" <<EOF_POLICY
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-cursor
+  - nathanpayne-codex
+codex:
+  enabled: $1
+  bot_login: "chatgpt-codex-connector[bot]"
+  require_ci_green: true
+  allow_phase_4b_substitute: true
+EOF_POLICY
+}
+
+run_codex_check_fixture() {
+  # Args: $1 = codex.enabled value, $2 = CODEX_ENABLED_FIXTURE scenario.
+  write_codex_enabled_policy "$1"
+  (
+    cd "$CODEX_FIXTURE_ROOT"
+    PATH="$SCRATCH:$PATH" \
+      GH_TOKEN=fixture-token \
+      CODEX_ENABLED_FIXTURE="$2" \
+      "$ROOT/$CODEX_CHECK_SCRIPT" 99999 nathanjohnpayne/mergepath
+  )
+}
+
+set +e
+out=$(run_codex_check_fixture false disabled_bot_only 2>&1)
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "codex.enabled=false and no Phase 4b substitute APPROVED"; then
+  pass=$((pass + 1))
+  echo "  PASS: actual codex-review-check blocks disabled Codex despite fresh bot 👍"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: actual codex-review-check did not block disabled Codex bot-only clearance (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+set +e
+out=$(run_codex_check_fixture false disabled_4b 2>&1)
+rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "Phase 4b substitute"; then
+  pass=$((pass + 1))
+  echo "  PASS: actual codex-review-check accepts Phase 4b substitute when Codex is disabled"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: actual codex-review-check rejected disabled-Codex Phase 4b substitute (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+set +e
+out=$(run_codex_check_fixture true enabled_bot 2>&1)
+rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "👍 reaction"; then
+  pass=$((pass + 1))
+  echo "  PASS: actual codex-review-check still accepts bot 👍 when Codex is enabled"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: actual codex-review-check rejected enabled-Codex bot clearance (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
 fi
 
 echo

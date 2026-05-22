@@ -114,12 +114,14 @@ jobs:
         run: ./scripts/ci/check_daily_feedback_rollup
 
       - name: check_canonical_bugs_263caf3
-        # Regression coverage for two nathanpayne-codex Phase 4b
-        # findings on the 263caf3 propagation wave:
+        # Regression coverage for nathanpayne-codex findings on the
+        # 263caf3 propagation wave and follow-up review-policy bugs:
         #   - request-label-removal.sh set -e abort in no-`--repo` path
         #   - codex-review-check.sh self-approval hole via
         #     same-agent reviewer identity bypassing the author
         #     exclusion in gate (b) + gate (c) Phase 4b substitute
+        #   - codex-review-check.sh treating Codex bot signals as
+        #     live clearance even when codex.enabled=false (#362)
         run: ./scripts/ci/check_canonical_bugs_263caf3
 
       - name: check_workflow_parsers
