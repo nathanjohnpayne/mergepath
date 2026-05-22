@@ -74,6 +74,13 @@ classify_phase_4b() {
   esac
 }
 
+classify_boolean() {
+  case "$1" in
+    ""|true|false) echo "valid" ;;
+    *) echo "invalid" ;;
+  esac
+}
+
 echo "parse_policy_list.sh tests"
 
 # Covers bug 2: the range-based parser silently produced an empty
@@ -224,6 +231,74 @@ fi
 rm -f "$manifest_fixture" "$manifest_notype"
 
 echo
+echo "codex_field (codex block scalar) tests — for codex.enabled (#362)"
+
+real_policy="$ROOT/.github/review-policy.yml"
+
+# Inline copy of the same awk codex_field uses inside
+# scripts/codex-review-check.sh. Keeping the test in lockstep with the
+# parser shape — if the parser changes, this awk literal needs the same
+# update. Documented inline rather than sourced from the script because
+# sourcing codex-review-check.sh runs its full top-level logic.
+codex_field_awk='
+  /^codex:/ {in_block=1; next}
+  in_block && /^[^[:space:]#]/ {in_block=0}
+  in_block && $1 == field":" {
+    sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+    gsub(/^["\047]/, "", $0)
+    gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
+    gsub(/[[:space:]]*#.*$/, "", $0)
+    sub(/[[:space:]]+$/, "", $0)
+    print
+    exit
+  }
+'
+
+got=$(printf 'codex:\n  enabled: false\n' | awk -v field="enabled" "$codex_field_awk")
+assert_eq "codex_field reads codex.enabled=false" "false" "$got"
+
+got=$(printf 'codex:\n  enabled: true   # Codex app lane on\n' | awk -v field="enabled" "$codex_field_awk")
+assert_eq "codex_field strips trailing comments from codex.enabled" "true" "$got"
+
+got=$(printf 'enabled: false\ncodex:\n  enabled: true\n' | awk -v field="enabled" "$codex_field_awk")
+assert_eq "codex_field ignores same-named top-level field" "true" "$got"
+
+got=$(printf 'codex:\n  enabled: "false"\n' | awk -v field="enabled" "$codex_field_awk")
+assert_eq "codex_field strips double quotes" "false" "$got"
+
+got=$(printf "%s\n" "codex:" "  enabled: 'false'" | awk -v field="enabled" "$codex_field_awk")
+assert_eq "codex_field strips single quotes" "false" "$got"
+
+got=$(printf 'coderabbit:\n  enabled: false\n' | awk -v field="enabled" "$codex_field_awk")
+assert_eq "codex_field returns empty when codex block missing" "" "$got"
+
+real_has_codex_enabled=0
+if awk '
+  /^codex:/ {in_block=1; next}
+  in_block && /^[^[:space:]#]/ {in_block=0}
+  in_block && $1 == "enabled:" {found=1}
+  END {exit found ? 0 : 1}
+' "$real_policy"; then
+  real_has_codex_enabled=1
+fi
+
+got=$(awk -v field="enabled" "$codex_field_awk" "$real_policy")
+if [ -z "$got" ] && [ "$real_has_codex_enabled" -eq 1 ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: real .github/review-policy.yml contains codex.enabled, but codex_field returned empty" >&2
+elif [ "$(classify_boolean "$got")" = "valid" ]; then
+  pass=$((pass + 1))
+  if [ -z "$got" ]; then
+    echo "  PASS: real .github/review-policy.yml has no codex.enabled (valid — defaults to true)"
+  else
+    echo "  PASS: real .github/review-policy.yml has a valid codex.enabled value ('$got')"
+  fi
+else
+  fail=$((fail + 1))
+  echo "  FAIL: real .github/review-policy.yml codex.enabled is set to an unrecognized value (got '$got'; expected true / false, or absent for the true default)" >&2
+fi
+
+echo
 echo "policy_field (top-level scalar) tests — for phase_4b_default (#185)"
 
 # Inline copy of the same awk policy_field uses inside
@@ -234,8 +309,8 @@ echo "policy_field (top-level scalar) tests — for phase_4b_default (#185)"
 policy_field_awk='
   /^[^[:space:]]/ && $1 == field":" {
     sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-    gsub(/^"/, "", $0)
-    gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+    gsub(/^["\047]/, "", $0)
+    gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
     gsub(/[[:space:]]*#.*$/, "", $0)
     sub(/[[:space:]]+$/, "", $0)
     print
@@ -263,6 +338,10 @@ assert_eq "policy_field reads field amid other top-level fields" "fallback-only"
 # Fixture: field with double quotes (matches the parser's quote-stripping).
 got=$(printf '%s\n' 'phase_4b_default: "complex-changes"' | awk -v field="phase_4b_default" "$policy_field_awk")
 assert_eq "policy_field strips surrounding quotes" "complex-changes" "$got"
+
+# Fixture: field with single quotes (same quote-stripping path).
+got=$(printf "%s\n" "phase_4b_default: 'complex-changes'" | awk -v field="phase_4b_default" "$policy_field_awk")
+assert_eq "policy_field strips single quotes" "complex-changes" "$got"
 
 # Regression: nested same-named key under a parent block must NOT match
 # (Codex P2 on PR #189 — top-level lookup should be anchored to the
