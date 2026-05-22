@@ -1,4 +1,9 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(scripts/gh-as-author.sh -- gh pr merge *)"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
