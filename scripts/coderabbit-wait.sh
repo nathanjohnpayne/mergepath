@@ -595,8 +595,12 @@ status_context_fast_path_blocked_by_comment() {
       comment_fresh_at=$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at')
       comment_body=$(echo "$latest" | jq -r '.body')
       if printf '%s' "$comment_body" | grep -Fq "$HEAD_SHA"; then
-        log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class explicitly references current HEAD $HEAD_SHA"
-        return 0
+        if iso_on_or_after "$comment_fresh_at" "$status_created_at"; then
+          log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class explicitly references current HEAD $HEAD_SHA and fresh_at=$comment_fresh_at is not older than status_created=$status_created_at"
+          return 0
+        fi
+        log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class explicitly references current HEAD $HEAD_SHA but fresh_at=$comment_fresh_at is older than status_created=$status_created_at"
+        return 1
       fi
       if iso_on_or_after "$comment_fresh_at" "$status_created_at"; then
         log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class fresh_at=$comment_fresh_at is not older than status_created=$status_created_at"
