@@ -811,6 +811,21 @@ else
   pass "compound pr-view then merge: blocked by #348 fail-closed guard"
 fi
 
+# `|&` is Bash's stdout+stderr pipe separator. It must split command
+# position the same way `|` does, or a leading allowed gh command can
+# still hide a guarded write in the second segment.
+set +e
+out=$(run_hook 'gh issue close 7 |& gh pr merge --admin 123' "nathanjohnpayne" "0" "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "compound issue-close pipe-err then merge: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -qi "#348"; then
+  fail "compound issue-close pipe-err then merge: diagnostic missing #348; output: $out"
+else
+  pass "compound issue-close pipe-err then merge: |& separator is blocked by #348 guard"
+fi
+
 # ---------------------------------------------------------------------------
 # Test 23g: gh issue create remains allowed as a single command, but a
 # compound issue-create followed by a guarded merge is blocked. This keeps

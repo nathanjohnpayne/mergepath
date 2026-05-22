@@ -353,7 +353,7 @@ done < "$TMP_TOKENS"
 # and any of them is a guarded write.
 is_guard_separator() {
   case "$1" in
-    "&&"|"||"|";"|"|"|"&"|"("|")")
+    "&&"|"||"|";"|"|"|"|&"|"&"|"("|")")
       return 0
       ;;
   esac
@@ -530,7 +530,7 @@ fi
 #       - prefix commands         sudo, eval, time, nohup, env,
 #                                 command, exec, nice, ionice
 #       - flags of those prefixes -X
-#       - compound separators     ;  &&  ||  |  &  (
+#       - compound separators     ;  &&  ||  |  |&  &  (
 #       - gh                      → transition to phase 2
 #     Any other token is treated as the START of a non-gh command,
 #     and we transition to IN_UNRELATED_ARGS to skip its arguments.
@@ -648,7 +648,7 @@ for i in "${!TOKENS[@]}"; do
   # to the gh process. nathanpayne-codex caught this on swipewatch
   # propagation PR #33 round 5 — privilege escalation potential.
   case "$tok" in
-    "&&"|"||"|";"|"|"|"&"|"("|")")
+    "&&"|"||"|";"|"|"|"|&"|"&"|"("|")")
       AT_COMMAND_POSITION=1
       CURRENT_PREFIX=""
       # Clear inline env vars ONLY when the segment that just ended
