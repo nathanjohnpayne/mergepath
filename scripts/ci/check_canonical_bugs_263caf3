@@ -1150,6 +1150,10 @@ case "$1" in
 JSON
           ;;
         repos/nathanjohnpayne/mergepath/issues/12345/comments)
+          if [ "${STUB_ISSUE_COMMENTS_EMPTY:-0}" = "1" ]; then
+            printf '[]\n'
+            exit 0
+          fi
           comment_created_at="${STUB_COMMENT_CREATED_AT:-2998-01-01T00:00:00Z}"
           comment_updated_at="${STUB_COMMENT_UPDATED_AT:-2999-01-01T00:00:00Z}"
           comment_body_suffix="${STUB_COMMENT_BODY_SUFFIX- Reviewing files that changed from base and headsha.}"
@@ -1166,7 +1170,24 @@ JSON
 JSON
           ;;
         repos/nathanjohnpayne/mergepath/pulls/12345/comments)
-          printf '[]\n'
+          if [ "${STUB_INLINE_POTENTIAL:-0}" = "1" ]; then
+            inline_created_at="${STUB_INLINE_CREATED_AT:-2999-01-01T00:00:00Z}"
+            cat <<JSON
+[
+  {
+    "id": 7201,
+    "created_at": "$inline_created_at",
+    "updated_at": "$inline_created_at",
+    "commit_id": "headsha",
+    "in_reply_to_id": null,
+    "user": {"login": "coderabbitai[bot]"},
+    "body": "_⚠️ Potential issue_\\n\\nFresh inline finding."
+  }
+]
+JSON
+          else
+            printf '[]\n'
+          fi
           ;;
         repos/nathanjohnpayne/mergepath/pulls/12345/reviews)
           printf '[]\n'
@@ -1286,6 +1307,53 @@ if [ "$rc" = "0" ] &&
 else
   fail=$((fail + 1))
   echo "  FAIL: stale current-head rate-limit comment incorrectly suppressed a newer StatusContext success (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+set +e
+out=$(
+  cd "$CODERABBIT_FASTPATH_ROOT" &&
+    PATH="$SCRATCH:$PATH" \
+    GH_TOKEN=fixture-token \
+    CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+    STUB_ISSUE_COMMENTS_EMPTY=1 \
+    STUB_INLINE_POTENTIAL=1 \
+    STUB_INLINE_CREATED_AT="2998-12-31T23:59:59Z" \
+    "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" = "0" ] &&
+   echo "$out" | grep -q '"status": "cleared"'; then
+  pass=$((pass + 1))
+  echo "  PASS: StatusContext fast path ignores pre-head inline findings remapped to HEAD"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale pre-head inline finding incorrectly blocked StatusContext fast path (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+set +e
+out=$(
+  cd "$CODERABBIT_FASTPATH_ROOT" &&
+    PATH="$SCRATCH:$PATH" \
+    GH_TOKEN=fixture-token \
+    CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+    STUB_ISSUE_COMMENTS_EMPTY=1 \
+    STUB_INLINE_POTENTIAL=1 \
+    STUB_INLINE_CREATED_AT="2999-01-01T00:00:01Z" \
+    "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" = "2" ] &&
+   echo "$out" | grep -q '"status": "findings"' &&
+   echo "$out" | grep -q '"potential_issue_count": 1'; then
+  pass=$((pass + 1))
+  echo "  PASS: StatusContext fast path still reports fresh current-head inline findings"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: fresh current-head inline finding was not reported (rc=$rc)" >&2
   echo "$out" | sed 's/^/    /' >&2
 fi
 

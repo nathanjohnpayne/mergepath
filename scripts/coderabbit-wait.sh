@@ -363,6 +363,7 @@ if [ -n "$LATEST_FORCE_PUSH_TIME" ] && [[ "$LATEST_FORCE_PUSH_TIME" > "$HEAD_ANC
   HEAD_ANCHOR="$LATEST_FORCE_PUSH_TIME"
   ANCHOR_SOURCE="head_ref_force_pushed @ $LATEST_FORCE_PUSH_TIME"
 fi
+HEAD_IDENTITY_ANCHOR="$HEAD_ANCHOR"
 
 # Layer 2 — wallclock freshness floor.
 EPOCH_NOW=$(date +%s)
@@ -516,22 +517,29 @@ count_potential_issues() {
   '
 }
 
-# SHA-scoped variant of count_potential_issues, used by the
-# StatusContext fast-path. Counts CodeRabbit inline findings whose
-# `commit_id` (the SHA GitHub considers the comment currently anchored
-# to, after rebases / new commits) equals the given SHA — independent
-# of HEAD_ANCHOR's wallclock floor.
+# SHA-scoped variant of count_potential_issues, used by the StatusContext
+# fast-path. Counts CodeRabbit inline findings whose `commit_id` (the SHA
+# GitHub considers the comment currently anchored to, after rebases / new
+# commits) equals the given SHA and whose creation time is not older than
+# HEAD_IDENTITY_ANCHOR.
 #
 # Why this is needed (codex CHANGES_REQUESTED on PR #224 round 2 +
 # CodeRabbit ⚠️ Major @ line 581): the freshness-anchored count_potential_
-# issues filters reviews with `submitted_at >= HEAD_ANCHOR`. Once the
-# same unchanged HEAD sits longer than `coderabbit.wallclock_freshness_
-# window_seconds` (default 1800s / 30 min), HEAD_ANCHOR advances past
-# the prior CodeRabbit review's submitted_at, latest_review_id becomes
-# null, and the helper returns 0 — false-clearing the fast-path even
-# while the same SHA still has unresolved Potential issue/⚠️ inline
-# findings. The fast-path is the only caller that has authoritative
-# per-SHA scope (from the StatusContext check) and should leverage it.
+# issues filters reviews with `submitted_at >= HEAD_ANCHOR`. Once the same
+# unchanged HEAD sits longer than `coderabbit.wallclock_freshness_window_
+# seconds` (default 1800s / 30 min), HEAD_ANCHOR advances past the prior
+# CodeRabbit review's submitted_at, latest_review_id becomes null, and the
+# helper returns 0 — false-clearing the fast-path even while the same SHA
+# still has unresolved Potential issue/⚠️ inline findings. The fast-path is
+# the only caller that has authoritative per-SHA scope (from the StatusContext
+# check) and should leverage it.
+#
+# Why still keep a non-wallclock freshness floor: GitHub can preserve or
+# remap inline review comments across a rebase/force-push so an old comment
+# appears to have `commit_id == HEAD_SHA`. HEAD_IDENTITY_ANCHOR is captured
+# before the moving wallclock floor is applied, so stale pre-head inline
+# comments are ignored without losing genuine old-but-still-current findings
+# on an unchanged head.
 #
 # Filter shape: root inline review comments where the bot author posted
 # a comment whose `commit_id == HEAD_SHA` (i.e., GitHub still considers
@@ -547,7 +555,8 @@ count_potential_issues_for_sha() {
   pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
   echo "$pulls_comments" | jq \
     --arg bot "$BOT_LOGIN" \
-    --arg sha "$sha" '
+    --arg sha "$sha" \
+    --arg after "$HEAD_IDENTITY_ANCHOR" '
     [ .[]
       | select(.user.login == $bot)
       | select(.in_reply_to_id != null)
@@ -557,6 +566,7 @@ count_potential_issues_for_sha() {
     | [ .[]
       | select(.user.login == $bot)
       | select(.commit_id == $sha)
+      | select((.created_at // "") >= $after)
       | select(.in_reply_to_id == null)
       | select((.body // "") | test("Potential issue|⚠️"; "i"))
       | select(.id as $id | ($addressed_root_ids | index($id)) == null)
