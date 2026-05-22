@@ -122,12 +122,14 @@ run_hook() {
   local skip_id="${3:-0}"
   local merge_state="${4:-CLEAN}"
   local labels="${5:-}"
+  local expected_reviewer="${6:-nathanpayne-claude}"
   local payload
   payload=$(jq -n --arg c "$cmd" '{tool_input: {command: $c}}')
   PATH="$STUB_DIR:$PATH" \
   STUB_ACTIVE_USER="$stub_user" \
   STUB_MERGE_STATE="$merge_state" \
   STUB_LABELS="$labels" \
+  GH_PR_GUARD_EXPECTED_REVIEWER="$expected_reviewer" \
   BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK="$skip_id" \
     bash "$HOOK" <<<"$payload"
 }
@@ -145,6 +147,7 @@ run_hook_review() {
   local deletions="${6:-0}"
   local pr_head="${7:-feature/some-branch}"
   local pr_author="${8:-nathanjohnpayne}"
+  local expected_reviewer="${9:-nathanpayne-claude}"
   local payload
   payload=$(jq -n --arg c "$cmd" '{tool_input: {command: $c}}')
   PATH="$STUB_DIR:$PATH" \
@@ -154,6 +157,7 @@ run_hook_review() {
   STUB_PR_DELETIONS="$deletions" \
   STUB_PR_HEAD="$pr_head" \
   STUB_PR_AUTHOR="$pr_author" \
+  GH_PR_GUARD_EXPECTED_REVIEWER="$expected_reviewer" \
   BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK="$skip_id" \
     bash "$HOOK" <<<"$payload"
 }
@@ -491,6 +495,56 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 18b: gh pr comment with the WRONG reviewer identity active →
+# blocked. This closes #363: cross-agent keyring drift (claude session
+# with active=nathanpayne-codex) must not silently post under the wrong
+# reviewer byline.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh pr comment 123 --body "ping"' "nathanpayne-codex" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "pr comment + wrong reviewer identity: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -qi "not the expected reviewer identity"; then
+  fail "pr comment + wrong reviewer identity: diagnostic missing expected-reviewer mismatch; output: $out"
+elif ! echo "$out" | grep -q "gh-as-reviewer.sh"; then
+  fail "pr comment + wrong reviewer identity: diagnostic missing gh-as-reviewer.sh remediation; output: $out"
+else
+  pass "pr comment + wrong reviewer identity: blocked with reviewer mismatch diagnostic"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 18c: GH_PR_GUARD_EXPECTED_REVIEWER override — codex is valid
+# when the operating agent is codex and the hook env says so.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh pr comment 123 --body "ping"' "nathanpayne-codex" "0" "CLEAN" "" "nathanpayne-codex" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "pr comment + expected-reviewer override: codex active allowed when expected=codex"
+else
+  fail "pr comment + expected-reviewer override: exit $rc, expected 0; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 18d: wrapped reviewer writes are allowed by the tokenizer. The
+# hook sees scripts/gh-as-reviewer.sh in command position and the gh
+# command only as an argument; the wrapper is responsible for switching
+# and verifying the identity internally.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'scripts/gh-as-reviewer.sh -- gh pr comment 123 --body "ping"' "nathanpayne-codex" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "wrapped pr comment via gh-as-reviewer.sh: allowed"
+else
+  fail "wrapped pr comment via gh-as-reviewer.sh: exit $rc, expected 0; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
 # Test 19: gh pr review --comment with AUTHOR identity → blocked.
 # ---------------------------------------------------------------------------
 set +e
@@ -519,6 +573,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 20b: gh pr review --comment with the wrong reviewer identity
+# active → blocked. Same #363 drift guard as pr comment, but on review.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh pr review 123 --comment --body "review"' "nathanpayne-codex" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "pr review --comment + wrong reviewer identity: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -qi "not the expected reviewer identity"; then
+  fail "pr review --comment + wrong reviewer identity: diagnostic missing expected-reviewer mismatch; output: $out"
+else
+  pass "pr review --comment + wrong reviewer identity: blocked"
+fi
+
+# ---------------------------------------------------------------------------
 # Test 21: gh issue comment with AUTHOR identity → blocked.
 # ---------------------------------------------------------------------------
 set +e
@@ -544,6 +614,22 @@ if [ "$rc" -eq 0 ]; then
   pass "issue comment + reviewer identity: allowed"
 else
   fail "issue comment + reviewer identity: exit $rc, expected 0; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 22b: gh issue comment with the wrong reviewer identity active →
+# blocked.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_hook 'gh issue comment 7 --body "thanks"' "nathanpayne-codex" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "issue comment + wrong reviewer identity: exit $rc, expected 2; output: $out"
+elif ! echo "$out" | grep -qi "not the expected reviewer identity"; then
+  fail "issue comment + wrong reviewer identity: diagnostic missing expected-reviewer mismatch; output: $out"
+else
+  pass "issue comment + wrong reviewer identity: blocked"
 fi
 
 # ---------------------------------------------------------------------------
@@ -640,7 +726,7 @@ fi
 # ---------------------------------------------------------------------------
 set +e
 out=$(run_hook_review 'gh pr review 123 --approve --body "lgtm"' "nathanpayne-codex" "0" \
-  "Authoring-Agent: claude" "5000" "0" 2>&1)
+  "Authoring-Agent: claude" "5000" "0" "feature/some-branch" "nathanjohnpayne" "nathanpayne-codex" 2>&1)
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then

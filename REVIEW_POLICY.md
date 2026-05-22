@@ -98,8 +98,12 @@ GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq '.login'
 # expected: nathanpayne-<agent>
 
 # Write-path: with the agent identity active, GH_TOKEN is irrelevant
-# for the byline. Just run the command.
+# for the byline. Bare reviewer writes also require the hook env
+# GH_PR_GUARD_EXPECTED_REVIEWER=nathanpayne-<agent>; otherwise use
+# gh-as-reviewer.sh to switch/verify in one process.
 gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
+GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> \
+  scripts/gh-as-reviewer.sh -- gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
 
 # Author-identity write: MUST use scripts/gh-as-author.sh, which
 # switches + runs + restores inside ONE bash process via trap EXIT.
@@ -258,6 +262,16 @@ running:
   (`gh auth switch -u <login>`), wrapped via `scripts/gh-as-author.sh`
   or `scripts/gh-as-reviewer.sh` for safety.
 
+  Reviewer-byline commands (`gh pr comment`, `gh pr review`, and
+  `gh issue comment`) are hook-guarded against cross-agent keyring
+  drift: `scripts/hooks/gh-pr-guard.sh` requires the active keyring
+  account to exactly match `GH_PR_GUARD_EXPECTED_REVIEWER` (default
+  `nathanpayne-claude`; set by the agent harness to
+  `nathanpayne-<agent>`). If the harness cannot set that environment,
+  use `scripts/gh-as-reviewer.sh -- gh ...`; the wrapper switches and
+  verifies the reviewer identity internally and avoids the bare-write
+  guard path.
+
 - **PAT-attributed writes.** `gh api graphql` mutations (the most
   common is `resolveReviewThread`) attribute their byline to the
   identity that owns the **PAT in `GH_TOKEN`**, NOT the keyring's
@@ -275,14 +289,14 @@ affect the byline for that row; the byline follows `GH_TOKEN`.
 | `gh pr merge` (squash/rebase) | `nathanjohnpayne` (use `scripts/gh-as-author.sh`) | any author-readable PAT |
 | `gh pr edit` (general — title/body) | `nathanjohnpayne` (use `scripts/gh-as-author.sh`) | any author-readable PAT |
 | `gh pr edit --remove-label <protected>` | **BLOCKED** by `scripts/hooks/label-removal-guard.sh` for `needs-external-review` / `needs-human-review` / `policy-violation` / `human-hold`; use `scripts/request-label-removal.sh` | n/a |
-| `gh pr comment` | `nathanpayne-<agent>` (agent identity); blocked when active is `nathanjohnpayne` per `scripts/hooks/gh-pr-guard.sh` (#284) | reviewer PAT (`$OP_PREFLIGHT_REVIEWER_PAT`) |
-| `gh pr review --comment` | `nathanpayne-<agent>`; blocked when active is `nathanjohnpayne` (#284) | reviewer PAT |
+| `gh pr comment` | `nathanpayne-<agent>` (agent identity); blocked unless active exactly matches `GH_PR_GUARD_EXPECTED_REVIEWER` per `scripts/hooks/gh-pr-guard.sh` (#284/#363) | reviewer PAT (`$OP_PREFLIGHT_REVIEWER_PAT`) |
+| `gh pr review --comment` | `nathanpayne-<agent>`; blocked unless active exactly matches `GH_PR_GUARD_EXPECTED_REVIEWER` (#284/#363) | reviewer PAT |
 | `gh pr review --approve` (under-threshold) | `nathanpayne-<agent>`; allowed when PR's `Authoring-Agent:` matches the agent (the intended path) | reviewer PAT |
 | `gh pr review --approve` (over-threshold, same agent) | **BLOCKED** by `scripts/hooks/gh-pr-guard.sh` per § No-self-approve scoping (#284) | n/a |
 | `gh pr review --approve` (over-threshold, cross-agent) | `nathanpayne-<other-agent>`; the cross-agent reviewer identity per Phase 4 | reviewer PAT |
 | `gh pr view` (read) | any (does not write) | any read-capable PAT |
 | `gh issue create` | any — **not hook-gated** (#317 byline guard reverted); issues may be filed under the author identity (`nathanjohnpayne`) or an agent identity, e.g. post-merge follow-ups per AGENTS.md step 11 | author or reviewer PAT |
-| `gh issue comment` | `nathanpayne-<agent>`; blocked when active is `nathanjohnpayne` (#284) | reviewer PAT |
+| `gh issue comment` | `nathanpayne-<agent>`; blocked unless active exactly matches `GH_PR_GUARD_EXPECTED_REVIEWER` (#284/#363) | reviewer PAT |
 | `gh issue close` | any (out of #284 scope — not yet hook-gated) | any |
 | `gh api GET ...` | irrelevant (read-only) | any read-capable PAT |
 | `gh api -X POST repos/.../issues/<N>/comments` | keyring-active byline (same as `gh pr comment`) | reviewer PAT for auth |
@@ -982,8 +996,12 @@ GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-request.sh <PR#>
 
 # ── Write-path: active keyring is the byline; GH_TOKEN is ignored ──
 
-# Reviewer-identity write (your agent identity is active by default):
+# Reviewer-identity write. Bare form requires active keyring AND
+# GH_PR_GUARD_EXPECTED_REVIEWER to match this agent; wrapper form is
+# safer when the hook environment is uncertain:
 gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
+GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> \
+  scripts/gh-as-reviewer.sh -- gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
 
 # Author-identity write: MUST use scripts/gh-as-author.sh, which
 # switches + runs + restores inside ONE bash process via trap EXIT.

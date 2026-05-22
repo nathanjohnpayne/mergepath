@@ -40,8 +40,12 @@ This repository uses a multi-identity AI agent code review system. The full poli
    # Read-path API call (uses cached PAT, no biometric):
    GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login
 
-   # Write-path API call (gh keyring active = nathanpayne-{your-agent}):
+   # Reviewer write path. The hook environment should set
+   # GH_PR_GUARD_EXPECTED_REVIEWER=nathanpayne-{your-agent}; when in
+   # doubt, use gh-as-reviewer.sh so the wrapper switches/verifies.
    gh pr review <PR#> --comment --body "..."
+   GH_AS_REVIEWER_IDENTITY=nathanpayne-{your-agent} \
+     scripts/gh-as-reviewer.sh -- gh pr review <PR#> --comment --body "..."
 
    # Author write (temporary switch via the gh-as-author.sh wrapper):
    scripts/gh-as-author.sh -- gh pr create ...
@@ -59,21 +63,25 @@ This repository uses a multi-identity AI agent code review system. The full poli
    Set the gh keyring active account once per machine: `gh auth switch
    -u nathanpayne-{your-agent}`. Then read-path commands use
    `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"`; write paths use the
-   keyring active. For author-identity writes (PR create/merge/label
-   edits), MUST wrap the call in `scripts/gh-as-author.sh -- gh pr
-   create ...` — a single bash process that switches, runs, and
-   switches back via `trap EXIT`. Splitting the sequence across two
-   Bash tool calls lands the PR under the wrong identity (#241). The
-   `gh-pr-guard.sh` PreToolUse hook now blocks `gh pr create` when
-   the keyring's active is not `nathanjohnpayne`. See REVIEW_POLICY.md
-   § Reviewer PAT Quick Start for the full convention and § Recovery:
-   PR created under the wrong identity for what to do if a PR already
-   landed under the wrong account.
+   keyring active. Bare reviewer-byline writes (`gh pr comment`,
+   `gh pr review`, `gh issue comment`) are blocked unless the active
+   keyring account exactly matches `GH_PR_GUARD_EXPECTED_REVIEWER`;
+   use `scripts/gh-as-reviewer.sh` when the harness env is uncertain.
+   For author-identity writes (PR create/merge/label edits), MUST
+   wrap the call in `scripts/gh-as-author.sh -- gh pr create ...` — a
+   single bash process that switches, runs, and switches back via
+   `trap EXIT`. Splitting the sequence across two Bash tool calls
+   lands the PR under the wrong identity (#241). The `gh-pr-guard.sh`
+   PreToolUse hook now blocks `gh pr create` when the keyring's active
+   is not `nathanjohnpayne`. See REVIEW_POLICY.md § Reviewer PAT Quick
+   Start for the full convention and § Recovery: PR created under the
+   wrong identity for what to do if a PR already landed under the
+   wrong account.
 
    Run `scripts/op-preflight.sh --agent {your-agent} --purge` (or
    `--purge-all`) at end of session to delete the cached PATs.
 1. Author code as nathanjohnpayne. File a PR.
-2. Review the PR under your reviewer identity. With your agent identity active per the convention above, just run `gh pr review <PR#> --comment --body "..."` — the byline is your reviewer identity. Post comments.
+2. Review the PR under your reviewer identity. With your agent identity active and `GH_PR_GUARD_EXPECTED_REVIEWER` set to that same identity, bare `gh pr review <PR#> --comment --body "..."` attributes correctly. If the hook environment is uncertain, wrap the call with `GH_AS_REVIEWER_IDENTITY=nathanpayne-{your-agent} scripts/gh-as-reviewer.sh -- gh pr review ...`. Post comments.
 3. Address each comment via fix commits (commits use git config, no gh auth involved — byline stays nathanjohnpayne).
 4. Repeat steps 2–3 until the reviewer identity approves with no outstanding issues. The mechanism: for under-threshold PRs (step 6), `gh pr review --approve` from your reviewer identity is the intended path — it satisfies branch protection without bouncing a small PR to an external agent. For above-threshold PRs (step 7), post `gh pr review --comment` only; Phase 4 carries the cross-agent gate. See REVIEW_POLICY.md § No-self-approve scoping.
 5. If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`:
