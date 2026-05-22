@@ -456,15 +456,21 @@ scan_latest_comment() {
   echo "$latest" | jq '{id, created_at, endpoint: "issues", body}'
 }
 
-# Count "Potential issue" / ⚠️ markers in the pulls inline comment list,
-# scoped to the LATEST CodeRabbit review on the current HEAD. The
-# naive "all bot comments after HEAD_ANCHOR" shape would keep stale
-# findings from an earlier review round (same HEAD, pre-retry) in the
-# count forever, so a PR could stay permanently in the `findings`
-# state even after the next review comes back clean. Mirror the
-# latest-review-scoping pattern codex-review-request.sh uses via
-# `pull_request_review_id`. See propagation-round Codex finding
-# (P1) on device-platform-reporting#51.
+# Count unaddressed "Potential issue" / ⚠️ markers in the pulls inline
+# comment list, scoped to the LATEST CodeRabbit review on the current
+# HEAD. The naive "all bot comments after HEAD_ANCHOR" shape would keep
+# stale findings from an earlier review round (same HEAD, pre-retry) in
+# the count forever, so a PR could stay permanently in the `findings`
+# state even after the next review comes back clean. Mirror the latest-
+# review-scoping pattern codex-review-request.sh uses via
+# `pull_request_review_id`. See propagation-round Codex finding (P1)
+# on device-platform-reporting#51.
+#
+# CodeRabbit may later reply to a finding thread with its hidden
+# `review_comment_addressed` marker after an agent fixes/rebuts the
+# finding. Treat that bot-authored marker as authoritative for this
+# helper's advisory gate; ordinary human/agent replies do not clear a
+# finding by themselves.
 count_potential_issues() {
   local reviews pulls_comments latest_review_id
   reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
@@ -488,8 +494,16 @@ count_potential_issues() {
     --argjson review_id "$latest_review_id" '
     [ .[]
       | select(.user.login == $bot)
+      | select(.in_reply_to_id != null)
+      | select((.body // "") | test("review_comment_addressed"; "i"))
+      | .in_reply_to_id
+    ] as $addressed_root_ids
+    | [ .[]
+      | select(.user.login == $bot)
       | select(.pull_request_review_id == $review_id)
+      | select(.in_reply_to_id == null)
       | select((.body // "") | test("Potential issue|⚠️"; "i"))
+      | select(.id as $id | ($addressed_root_ids | index($id)) == null)
     ] | length
   '
 }
@@ -511,14 +525,14 @@ count_potential_issues() {
 # findings. The fast-path is the only caller that has authoritative
 # per-SHA scope (from the StatusContext check) and should leverage it.
 #
-# Filter shape: inline review comments where the bot author posted a
-# comment whose `commit_id == HEAD_SHA` (i.e., GitHub still considers
+# Filter shape: root inline review comments where the bot author posted
+# a comment whose `commit_id == HEAD_SHA` (i.e., GitHub still considers
 # it applicable to HEAD after any rebases) and whose body contains a
-# `Potential issue` / `⚠️` marker. Resolved-thread state is NOT
-# consulted — same scope as count_potential_issues — so an addressed-
-# but-not-resolved finding will still count. That's the conservative
-# interpretation: "if there's any current-HEAD finding I haven't
-# explicitly resolved, hold the gate."
+# `Potential issue` / `⚠️` marker, excluding roots CodeRabbit itself
+# later marked with `review_comment_addressed`. Resolved-thread state is
+# not consulted directly; the explicit bot marker is the narrow signal
+# that a current-head finding has been addressed without relying on
+# GitHub conversation-resolution state.
 count_potential_issues_for_sha() {
   local sha=$1
   local pulls_comments
@@ -528,8 +542,16 @@ count_potential_issues_for_sha() {
     --arg sha "$sha" '
     [ .[]
       | select(.user.login == $bot)
+      | select(.in_reply_to_id != null)
+      | select((.body // "") | test("review_comment_addressed"; "i"))
+      | .in_reply_to_id
+    ] as $addressed_root_ids
+    | [ .[]
+      | select(.user.login == $bot)
       | select(.commit_id == $sha)
+      | select(.in_reply_to_id == null)
       | select((.body // "") | test("Potential issue|⚠️"; "i"))
+      | select(.id as $id | ($addressed_root_ids | index($id)) == null)
     ] | length
   '
 }
