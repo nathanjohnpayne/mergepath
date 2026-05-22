@@ -97,7 +97,7 @@ echo "enumerate: scanning closed PRs since $SINCE (lookback=${LOOKBACK_DAYS}d)" 
 classify_severity() {
   # arg 1: body text (already trimmed)
   local body_head
-  body_head=$(printf '%s' "$1" | head -c 400)
+  body_head=${1:0:400}
   case "$body_head" in
     *[Pp]0*|*Critical*|*CRITICAL*) echo "P0"; return ;;
     *[Pp]1*|*Major*|*MAJOR*|*"Potential issue"*|*"⚠️"*) echo "P1"; return ;;
@@ -213,8 +213,11 @@ emit_findings_for_repo() {
       thread_url=$(printf '%s' "$line" | jq -r '.thread_url')
 
       # body_excerpt: first 200 chars, single-line, trimmed.
-      local body_excerpt
-      body_excerpt=$(printf '%s' "$body" | tr '\n\r\t' '   ' | head -c 200)
+      local body_excerpt single_line_body
+      single_line_body=${body//$'\n'/ }
+      single_line_body=${single_line_body//$'\r'/ }
+      single_line_body=${single_line_body//$'\t'/ }
+      body_excerpt=${single_line_body:0:200}
 
       local severity
       severity=$(classify_severity "$body")

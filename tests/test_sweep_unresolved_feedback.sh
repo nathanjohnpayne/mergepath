@@ -278,6 +278,74 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 1b: long bodies do not trip pipefail via early-closing pipelines.
+# ---------------------------------------------------------------------------
+LONG_BODY=$'Potential issue: first line\n\t'
+LONG_BODY="${LONG_BODY}$(printf '%0300d' 0 | tr '0' A)"
+
+cat >"$STUB_FIXTURES/pr-list-owner_long.json" <<'JSON'
+[
+  {"number": 9, "title": "Long review body", "url": "https://github.com/owner/long/pull/9"}
+]
+JSON
+
+jq -n --arg body "$LONG_BODY" '{
+  data: {
+    repository: {
+      pullRequest: {
+        reviewThreads: {
+          totalCount: 1,
+          pageInfo: {hasNextPage: false, endCursor: null},
+          nodes: [
+            {
+              id: "PRT_long_9_a",
+              isResolved: false,
+              isOutdated: false,
+              comments: {nodes: [{
+                author: {login: "coderabbitai[bot]"},
+                body: $body,
+                url: "https://github.com/owner/long/pull/9#discussion_r9001"
+              }]}
+            }
+          ]
+        }
+      }
+    }
+  }
+}' >"$STUB_FIXTURES/threads-owner_long_9.json"
+
+LONG_TARGETS="$WORKDIR/targets-long.txt"
+printf '%s\n' "owner/long" >"$LONG_TARGETS"
+LONG_NDJSON="$WORKDIR/findings-long.ndjson"
+
+set +e
+PATH="$STUB_DIR:$PATH" \
+GH_TOKEN="dummy-pat" \
+STUB_FIXTURES="$STUB_FIXTURES" \
+GH_CALLS_LOG="$GH_CALLS_LOG" \
+SWEEP_OUTPUT="$LONG_NDJSON" \
+  "$ENUMERATE" "$LONG_TARGETS" 2>"$WORKDIR/enum-long.stderr"
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] && [ "$(wc -l < "$LONG_NDJSON" | tr -d ' ')" = "1" ]; then
+  pass "enumerate: long body does not fail under pipefail"
+else
+  fail "enumerate: long body exited $rc or emitted wrong count"
+  cat "$WORKDIR/enum-long.stderr" >&2
+fi
+
+if jq -e '(.body_excerpt | length) == 200
+          and ((.body_excerpt | contains("\n")) | not)
+          and ((.body_excerpt | contains("\r")) | not)
+          and ((.body_excerpt | contains("\t")) | not)' "$LONG_NDJSON" >/dev/null; then
+  pass "enumerate: long body_excerpt is capped and single-line"
+else
+  fail "enumerate: long body_excerpt not capped/single-line"
+  cat "$LONG_NDJSON" >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Test 2: render.sh produces a body with expected markers + counts.
 # ---------------------------------------------------------------------------
 BODY_OUT="$WORKDIR/body.md"
