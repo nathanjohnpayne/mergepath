@@ -498,6 +498,14 @@ An agent proceeds to 4a first. If 4a escalates, times out, or is disabled, the a
 
 17a. On a passing merge gate, `nathanjohnpayne` merges the PR with `gh pr merge <n> --squash --delete-branch`. Never `--admin` unless the human explicitly authorizes a break-glass override in chat.
 
+The non-Dependabot `auto-merge-on-approval` workflow is opt-in only:
+it may call `gh pr merge` only when the repo has an
+`AUTHOR_MERGE_TOKEN` Actions secret and that token resolves to
+`author_identity` (normally `nathanjohnpayne`). If the secret is
+absent, the workflow stops after validation and leaves manual author
+merge as the default. Reviewer tokens such as
+`REVIEWER_ASSIGNMENT_TOKEN` must not be used for PR merges.
+
 #### Phase 4b: Manual CLI Fallback (Human Handoff)
 
 Phase 4b is invoked when Phase 4a escalates to disagreement or runaway, times out (single timeout, exit code `4` from `codex-review-request.sh`), or when `codex.enabled: false` in the repo. It preserves the cross-agent review flow that existed before the Codex GitHub App integration and provides a human-mediated escape hatch.
@@ -785,6 +793,13 @@ Agents must never modify the `needs-external-review`, `needs-human-review`, or `
 2. **`pr-review-policy.yml`'s External Review Check** (the propagation-PR review lane, [#264](https://github.com/nathanjohnpayne/mergepath/issues/264) / [#268](https://github.com/nathanjohnpayne/mergepath/issues/268)) removes the label when a PR is verified to be a faithful propagation mirror — see [§ Phase 3.5](#phase-35-propagation-pr-review-lane). It does not consult the merge gate; it acts on the orthogonal fact that the PR's content was already reviewed upstream, established by `scripts/workflow/verify-propagation-pr.sh`'s byte-comparison against `mergepath@<sha>`. Same `github-actions[bot]` byline; same not-an-agent-override rationale.
 
 These exceptions apply ONLY to those two workflows. An interactive agent session (claude / cursor / codex) calling `gh pr edit --remove-label` for any of the four protected labels remains forbidden — the `scripts/hooks/label-removal-guard.sh` PreToolUse hook enforces this independently. The hook intentionally only fires for `Bash` tool calls from agent sessions; a workflow's `gh` call inside a GitHub Actions runner does not pass through that surface, so the hook does not (and should not) block CI workflows. `needs-human-review`, `policy-violation`, and `human-hold` remain manual-only by design.
+
+**Automated merge identity.** Non-Dependabot automatic PR merge is not a
+sanctioned reviewer-identity exception. If enabled, it must use an
+author-owned `AUTHOR_MERGE_TOKEN` Actions secret and verify the token
+resolves to `author_identity` immediately before the merge path. Repos
+without that secret keep the normal manual merge flow under
+`scripts/gh-as-author.sh`.
 
 **Disabling the scheduled sweep.** The 15-minute cron is opt-out via `auto_clear_labels.scheduled_sweep_enabled: false` in `.github/review-policy.yml`. Default is `true`. Set to `false` if your repo has high PR volume and the event-driven path is reliably fast enough that the cron becomes pure noise — but expect occasional stuck `needs-external-review` labels on the 👍-after-last-push case (which the sweep would otherwise catch). The event-driven path remains active regardless of this setting.
 

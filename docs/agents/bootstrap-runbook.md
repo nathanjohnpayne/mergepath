@@ -144,6 +144,12 @@ Implementation: `scripts/bootstrap/github-infra.sh`.
 5. Prompt for and provision optional LLM secrets (`ANTHROPIC_API_KEY`,
    `OPENAI_API_KEY`) with skip option.
 
+The wizard does not provision `AUTHOR_MERGE_TOKEN` by default. Without
+that author-owned Actions secret, non-Dependabot auto-merge stays
+disabled and PRs are merged manually as `nathanjohnpayne`; if a repo
+opts into automatic PR merge, the workflow verifies the token resolves
+to the configured `author_identity` before calling `gh pr merge`.
+
 For runtime application secrets in newly bootstrapped repos, do not add
 Secure Note / `notesPlain` bootstrap entries. The shared model is: use
 Environments and `op run` for runtime variable sets, use the 1Password
@@ -399,6 +405,9 @@ And on GitHub:
 - 11 canonical labels.
 - Reviewer-identity collaborators invited.
 - `REVIEWER_ASSIGNMENT_TOKEN` repo secret set.
+- `AUTHOR_MERGE_TOKEN` intentionally unset by default; automatic
+  non-Dependabot PR merge remains disabled until a human provisions an
+  author-owned token.
 - (When Firebase is enabled) per-project deployer SA keys minted +
   workflows wired.
 - Project v2 board (#N) with Status single-select field configured.
