@@ -133,9 +133,10 @@ resolve_source_cred_file() {
   # Precedence (#154 — codified policy decision):
   #
   #   1. Genuinely user-supplied GOOGLE_APPLICATION_CREDENTIALS
-  #   2. Project-specific SA key from 1Password Firebase vault
+  #   2. Project-specific SA key from 1Password Firebase vault,
+  #      including op-preflight.sh's cached Firebase SA tempfile
   #   3. Preflight-injected GOOGLE_APPLICATION_CREDENTIALS
-  #      (op-preflight.sh's ADC tempfile)
+  #      (op-preflight.sh's shared ADC tempfile)
   #   4. Shared ADC from 1Password Private vault
   #   5. Local ADC file on disk
   #
@@ -144,29 +145,39 @@ resolve_source_cred_file() {
   # set GOOGLE_APPLICATION_CREDENTIALS in the shell themselves
   # (debugging, one-off flow, alternate project), they meant it.
   #
-  # Step 3 is a NEW behavior change (was step 1 in the prior
-  # implementation): when GOOGLE_APPLICATION_CREDENTIALS came from
-  # op-preflight.sh's --mode deploy, the ADC is the shared 1Password
-  # ADC item (which suffers from refresh-token RAPT expiry — see
-  # mergepath#137). Falling through to the project SA key first means
-  # routine deploys use the more-stable credential without the
-  # daily-reauth churn.
+  # Step 3 is a behavior change from the original implementation:
+  # when GOOGLE_APPLICATION_CREDENTIALS came from op-preflight.sh's
+  # --mode deploy, the ADC is the shared 1Password ADC item (which
+  # suffers from refresh-token RAPT expiry — see mergepath#137).
+  # Falling through to the project SA key first means routine deploys
+  # use the more-stable credential without the daily-reauth churn.
   #
-  # The marker that distinguishes (1) from (3): the OP_PREFLIGHT_ADC_TMPFILE
-  # env var. Preflight sets it to the same path as
-  # GOOGLE_APPLICATION_CREDENTIALS when it injects an ADC; if the two
-  # match, the GOOGLE_APPLICATION_CREDENTIALS is preflight-injected,
-  # not user-set.
+  # The markers that distinguish (1) from preflight-managed files:
+  # OP_PREFLIGHT_FIREBASE_SA_TMPFILE and OP_PREFLIGHT_ADC_TMPFILE.
+  # Preflight sets one of those to the same path as
+  # GOOGLE_APPLICATION_CREDENTIALS when it injects deploy credentials;
+  # if they match, the GOOGLE_APPLICATION_CREDENTIALS is preflight-
+  # managed, not user-set.
   local explicit_file="${GOOGLE_APPLICATION_CREDENTIALS:-}"
   local preflight_tmpfile="${OP_PREFLIGHT_ADC_TMPFILE:-}"
+  local preflight_firebase_sa_tmpfile="${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}"
+  local preflight_firebase_project="${OP_PREFLIGHT_FIREBASE_PROJECT:-}"
   local resolved=""
   local is_preflight_injected=0
+  local is_preflight_firebase_sa=0
   if [[ -n "$explicit_file" && -n "$preflight_tmpfile" && "$explicit_file" == "$preflight_tmpfile" ]]; then
     is_preflight_injected=1
   fi
+  if [[ -n "$explicit_file" && -n "$preflight_firebase_sa_tmpfile" && "$explicit_file" == "$preflight_firebase_sa_tmpfile" ]]; then
+    if [[ "$preflight_firebase_project" == "$PROJECT" ]]; then
+      is_preflight_firebase_sa=1
+    else
+      echo "[op-firebase-deploy] ignoring preflight-cached Firebase SA for project ${preflight_firebase_project:-unknown}; target project is $PROJECT" >&2
+    fi
+  fi
 
   # 1. Genuinely user-supplied GOOGLE_APPLICATION_CREDENTIALS
-  if [[ -n "$explicit_file" && "$is_preflight_injected" -eq 0 ]]; then
+  if [[ -n "$explicit_file" && "$is_preflight_injected" -eq 0 && "$is_preflight_firebase_sa" -eq 0 && "$explicit_file" != "$preflight_firebase_sa_tmpfile" ]]; then
     if [[ ! -f "$explicit_file" ]]; then
       # User explicitly set GOOGLE_APPLICATION_CREDENTIALS to a path
       # that doesn't exist. Fail fast — silently falling through to
@@ -182,6 +193,12 @@ resolve_source_cred_file() {
   fi
 
   # 2. Project-specific SA key from 1Password Firebase vault
+  if [[ "$is_preflight_firebase_sa" -eq 1 && -f "$explicit_file" ]]; then
+    SOURCE_CRED_FILE="$explicit_file"
+    SOURCE_CRED_DESCRIPTION="preflight-cached project Firebase-vault SA key ($PROJECT — Firebase Deployer SA Key)"
+    return 0
+  fi
+
   resolved="$(materialize_firebase_vault_sa_key "$PROJECT" || true)"
   if [[ -n "$resolved" ]]; then
     SOURCE_CRED_FILE="$resolved"
@@ -289,12 +306,16 @@ if ! source_cred_is_usable "$SOURCE_CRED_FILE"; then
   # one (fall through to lower ranks). Codex P2 on PR #181 caught that
   # the prior unconditional equality check exited 1 even when the env
   # var was preflight's, masking ranks 4-5 fallbacks (shared op ADC,
-  # local ADC) that were specifically designated for this case.
+  # local ADC) that were specifically designated for this case. The
+  # same rule now applies to preflight's cached Firebase SA key: it is
+  # managed by preflight, not a human override.
   if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && "$SOURCE_CRED_FILE" == "${GOOGLE_APPLICATION_CREDENTIALS}" ]]; then
     if [[ -n "${OP_PREFLIGHT_ADC_TMPFILE:-}" && "$SOURCE_CRED_FILE" == "${OP_PREFLIGHT_ADC_TMPFILE}" ]]; then
       # Preflight-injected and unusable — log and continue down the
       # fallback chain. Don't treat as explicit override.
       echo "[op-firebase-deploy] preflight-injected ADC ($SOURCE_CRED_FILE) is unusable; falling through to shared op ADC + local ADC" >&2
+    elif [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" && "$SOURCE_CRED_FILE" == "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE}" ]]; then
+      echo "[op-firebase-deploy] preflight-cached Firebase SA key ($SOURCE_CRED_FILE) is unusable; re-reading project SA key before lower fallbacks" >&2
     else
       echo "Error: GOOGLE_APPLICATION_CREDENTIALS points to an unusable credential file: $SOURCE_CRED_FILE" >&2
       exit 1
@@ -305,13 +326,28 @@ if ! source_cred_is_usable "$SOURCE_CRED_FILE"; then
   SOURCE_CRED_FILE=""
   SOURCE_CRED_TMPFILE=""
 
-  # Rank 4 fallback: shared op ADC (in case the preflight tempfile is
-  # stale but a fresh op read of the same item works).
-  resolved="$(materialize_op_source_cred "$DEFAULT_ADC_OP_URI" || true)"
-  if [[ -n "$resolved" ]]; then
+  # Rank 2 retry: if the preflight-cached Firebase SA tempfile was
+  # stale/corrupt, re-read the project item before dropping to the
+  # RAPT-prone shared ADC fallbacks.
+  resolved="$(materialize_firebase_vault_sa_key "$PROJECT" || true)"
+  if [[ -n "$resolved" ]] && source_cred_is_usable "$resolved"; then
     SOURCE_CRED_FILE="$resolved"
     SOURCE_CRED_TMPFILE="$resolved"
-    SOURCE_CRED_DESCRIPTION="shared 1Password ADC ($DEFAULT_ADC_OP_URI; rank 4 fallback after rank-3 unusable)"
+    SOURCE_CRED_DESCRIPTION="project Firebase-vault SA key ($PROJECT — Firebase Deployer SA Key; fallback after cached SA unusable)"
+  fi
+
+  # Rank 4 fallback: shared op ADC (in case the preflight tempfile is
+  # stale but a fresh op read of the same item works).
+  if ! source_cred_is_usable "$SOURCE_CRED_FILE"; then
+    cleanup_source_cred
+    SOURCE_CRED_FILE=""
+    SOURCE_CRED_TMPFILE=""
+    resolved="$(materialize_op_source_cred "$DEFAULT_ADC_OP_URI" || true)"
+    if [[ -n "$resolved" ]]; then
+      SOURCE_CRED_FILE="$resolved"
+      SOURCE_CRED_TMPFILE="$resolved"
+      SOURCE_CRED_DESCRIPTION="shared 1Password ADC ($DEFAULT_ADC_OP_URI; rank 4 fallback after preflight credential unusable)"
+    fi
   fi
 
   # Rank 5 fallback: local ADC file on disk.

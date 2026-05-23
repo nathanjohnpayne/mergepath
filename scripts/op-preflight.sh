@@ -34,7 +34,8 @@
 #
 # Modes:
 #   review  — reviewer PAT + author PAT + SSH key warming (DEFAULT)
-#   deploy  — GCP ADC credential + Cloudflare cache-purge token
+#   deploy  — Firebase project SA key (when .firebaserc is present),
+#             else GCP ADC credential + Cloudflare cache-purge token
 #   all     — everything
 #
 # Flags:
@@ -170,6 +171,10 @@ TTL_SECONDS="${OP_PREFLIGHT_TTL_SECONDS:-$DEFAULT_TTL_SECONDS}"
 # ── GCP ADC ───────────────────────────────────────────────────────────
 DEFAULT_ADC_OP_URI="${GCP_ADC_OP_URI:-op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential}"
 
+# ── Firebase deploy SA key ────────────────────────────────────────────
+SA_NAME="${FIREBASE_DEPLOY_SA_NAME:-firebase-deployer}"
+FIREBASE_SA_VAULT="${FIREBASE_SA_VAULT:-Firebase}"
+
 # ── Cloudflare Cache Purge token (#167) ───────────────────────────────
 # Shared API token with Purge:Edit permission across all domains. Wired
 # into preflight so scripts/deploy.sh's existing CF purge step
@@ -228,7 +233,7 @@ fi
 if $PURGE_ALL; then
   if [[ -d "$CACHE_DIR" ]]; then
     echo "# Purging all session files under $CACHE_DIR" >&2
-    find "$CACHE_DIR" -maxdepth 1 -type f \( -name 'op-preflight-*.env' -o -name 'op-preflight-*-adc.json' -o -name 'op-preflight-*.ssh-warmed' \) -print -delete >&2
+    find "$CACHE_DIR" -maxdepth 1 -type f \( -name 'op-preflight-*.env' -o -name 'op-preflight-*-adc.json' -o -name 'op-preflight-*-firebase-sa.json' -o -name 'op-preflight-*.ssh-warmed' \) -print -delete >&2
   fi
   exit 0
 fi
@@ -257,10 +262,90 @@ fi
 # ── Cache paths (deterministic per agent) ─────────────────────────────
 SESSION_FILE="$CACHE_DIR/op-preflight-$AGENT.env"
 ADC_TMPFILE="$CACHE_DIR/op-preflight-$AGENT-adc.json"
+FIREBASE_SA_TMPFILE="$CACHE_DIR/op-preflight-$AGENT-firebase-sa.json"
 SSH_WARM_MARKER="$CACHE_DIR/op-preflight-$AGENT.ssh-warmed"
 BIOMETRIC_LOG="$CACHE_DIR/biometric-log"  # #282: append a one-line
                                           # record on each fresh fetch.
 SSH_WARM_TTL_SECONDS="${OP_PREFLIGHT_SSH_WARM_TTL_SECONDS:-1800}"  # 30 min default; #163
+
+detect_firebase_project() {
+  if [[ -n "${OP_PREFLIGHT_FIREBASE_PROJECT_ID:-}" ]]; then
+    printf '%s\n' "$OP_PREFLIGHT_FIREBASE_PROJECT_ID"
+    return 0
+  fi
+  [[ -f .firebaserc ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    project = json.loads(pathlib.Path(".firebaserc").read_text())["projects"]["default"]
+except Exception:
+    sys.exit(1)
+if not isinstance(project, str) or not project:
+    sys.exit(1)
+print(project)
+PY
+}
+
+json_string_field_no_python() {
+  local file="${1:-}" field="${2:-}"
+  [[ -n "$file" && -f "$file" && -n "$field" ]] || return 1
+  awk -v field="$field" '
+    { text = text $0 " " }
+    END {
+      pattern = "\"" field "\"[[:space:]]*:[[:space:]]*\"[^\"]+\""
+      if (!match(text, pattern)) {
+        exit 1
+      }
+      matched = substr(text, RSTART, RLENGTH)
+      if (split(matched, parts, "\"") < 4) {
+        exit 1
+      }
+      print parts[4]
+    }
+  ' "$file"
+}
+
+firebaserc_default_project_no_python() {
+  [[ -f .firebaserc ]] || return 1
+  awk '
+    { text = text $0 " " }
+    END {
+      if (!match(text, /"projects"[[:space:]]*:[[:space:]]*\{[^}]*\}/)) {
+        exit 1
+      }
+      projects = substr(text, RSTART, RLENGTH)
+      if (!match(projects, /"default"[[:space:]]*:[[:space:]]*"[^"]+"/)) {
+        exit 1
+      }
+      matched = substr(projects, RSTART, RLENGTH)
+      if (split(matched, parts, "\"") < 4) {
+        exit 1
+      }
+      print parts[4]
+    }
+  ' .firebaserc
+}
+
+detect_firebase_project_no_python() {
+  if [[ -n "${OP_PREFLIGHT_FIREBASE_PROJECT_ID:-}" ]]; then
+    printf '%s\n' "$OP_PREFLIGHT_FIREBASE_PROJECT_ID"
+    return 0
+  fi
+  firebaserc_default_project_no_python
+}
+
+firebase_sa_matches_project_no_python() {
+  local file="${1:-}" project="${2:-}" client_email expected
+  [[ -n "$file" && -f "$file" && -s "$file" && -n "$project" ]] || return 1
+  client_email="$(json_string_field_no_python "$file" "client_email" || true)"
+  expected="${SA_NAME}@${project}.iam.gserviceaccount.com"
+  [[ "$client_email" == "$expected" ]]
+}
+
 # Validate the override is a non-negative integer before any arithmetic
 # context (`[[ "$age" -lt "$SSH_WARM_TTL_SECONDS" ]]` later in the
 # script). A non-numeric override (`OP_PREFLIGHT_SSH_WARM_TTL_SECONDS=foo`)
@@ -297,8 +382,8 @@ log_biometric_trigger() {
 
 # ── Purge mode ────────────────────────────────────────────────────────
 if $PURGE; then
-  rm -f "$SESSION_FILE" "$ADC_TMPFILE" "$SSH_WARM_MARKER"
-  echo "# Purged session file + ADC tempfile + SSH-warm marker for agent=$AGENT" >&2
+  rm -f "$SESSION_FILE" "$ADC_TMPFILE" "$FIREBASE_SA_TMPFILE" "$SSH_WARM_MARKER"
+  echo "# Purged session file + ADC tempfile + Firebase SA tempfile + SSH-warm marker for agent=$AGENT" >&2
   exit 0
 fi
 
@@ -313,6 +398,7 @@ if $DRY_RUN; then
   echo "#" >&2
   echo "# Session file:   $SESSION_FILE" >&2
   echo "# ADC tempfile:   $ADC_TMPFILE" >&2
+  echo "# Firebase SA tempfile: $FIREBASE_SA_TMPFILE" >&2
   echo "# TTL seconds:    $TTL_SECONDS" >&2
   if [[ -f "$SESSION_FILE" ]]; then
     # `|| true` so a missing epoch key doesn't take down dry-run under
@@ -354,7 +440,12 @@ if $DRY_RUN; then
     fi
   fi
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
-    echo "# Would read: GCP ADC ($DEFAULT_ADC_OP_URI)" >&2
+    if firebase_project="$(detect_firebase_project 2>/dev/null || true)" && [[ -n "$firebase_project" ]]; then
+      echo "# Would read: Firebase project SA key (${firebase_project} — Firebase Deployer SA Key in vault ${FIREBASE_SA_VAULT})" >&2
+      echo "# Would fall back to: GCP ADC ($DEFAULT_ADC_OP_URI)" >&2
+    else
+      echo "# Would read: GCP ADC ($DEFAULT_ADC_OP_URI)" >&2
+    fi
     echo "# Would read: Cloudflare cache-purge token ($DEFAULT_CF_TOKEN_OP_URI)" >&2
   fi
   exit 0
@@ -454,6 +545,28 @@ try:
     urllib.request.urlopen(req, timeout=10)
 except Exception:
     sys.exit(1)
+PY
+}
+
+firebase_sa_matches_project() {
+  local file="${1:-}" project="${2:-}"
+  [[ -n "$file" && -f "$file" && -s "$file" && -n "$project" ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$file" "$project" "$SA_NAME" <<'PY'
+import json
+import pathlib
+import sys
+
+path, project, sa_name = sys.argv[1:4]
+expected = f"{sa_name}@{project}.iam.gserviceaccount.com"
+try:
+    cred = json.loads(pathlib.Path(path).read_text())
+except Exception:
+    sys.exit(1)
+
+if cred.get("type") == "service_account" and cred.get("client_email") == expected:
+    sys.exit(0)
+sys.exit(1)
 PY
 }
 
@@ -591,6 +704,7 @@ emit_from_session_file() (
   # stdout+exit; parent stays clean.
   unset OP_PREFLIGHT_REVIEWER_PAT OP_PREFLIGHT_AUTHOR_PAT
   unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
+  unset OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT
   unset CF_API_TOKEN
   unset OP_PREFLIGHT_DONE OP_PREFLIGHT_AGENT OP_PREFLIGHT_MODE
   unset OP_PREFLIGHT_TOKEN_MODE OP_PREFLIGHT_REVIEWER_PAT_SOURCE_REF
@@ -638,10 +752,10 @@ emit_from_session_file() (
     fi
   fi
   if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
-    # Both `--mode deploy` and `--mode all` require a usable ADC from
-    # the cache to take the fast path. If the session file's ADC field
-    # is missing or the materialized file is unreadable, return 2 to
-    # trigger a full refresh.
+    # Both `--mode deploy` and `--mode all` require a usable deploy
+    # credential from the cache to take the fast path. If the session
+    # file's credential field is missing or the materialized file is
+    # unreadable, return 2 to trigger a full refresh.
     #
     # An earlier iteration of this code treated missing-ADC on
     # `--mode all` as a partial hit (emit PATs, skip ADC) to spare
@@ -656,6 +770,27 @@ emit_from_session_file() (
     if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] || [[ ! -s "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
       exit 2
     fi
+    if [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" && "${GOOGLE_APPLICATION_CREDENTIALS}" == "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE}" ]]; then
+      if [[ "${OP_PREFLIGHT_CHECK_MODE:-0}" == "1" ]]; then
+        current_firebase_project="$(detect_firebase_project_no_python 2>/dev/null || true)"
+        firebase_sa_matches_project_check() {
+          firebase_sa_matches_project_no_python "${GOOGLE_APPLICATION_CREDENTIALS}" "$current_firebase_project"
+        }
+      else
+        current_firebase_project="$(detect_firebase_project 2>/dev/null || true)"
+        firebase_sa_matches_project_check() {
+          firebase_sa_matches_project "${GOOGLE_APPLICATION_CREDENTIALS}" "$current_firebase_project"
+        }
+      fi
+      if [[ -z "$current_firebase_project" || "$current_firebase_project" != "${OP_PREFLIGHT_FIREBASE_PROJECT:-}" ]]; then
+        echo "# WARNING: cached Firebase project SA key is for '${OP_PREFLIGHT_FIREBASE_PROJECT:-unknown}', but current project is '${current_firebase_project:-none}'; refreshing deploy credentials." >&2
+        exit 2
+      fi
+      if ! firebase_sa_matches_project_check; then
+        echo "# WARNING: cached Firebase project SA key file does not match current project '$current_firebase_project'; refreshing deploy credentials." >&2
+        exit 2
+      fi
+    fi
     # --check is the "no external probes" contract — never invoke op,
     # ssh, OR python3. The `adc_is_usable` probe spawns python3 to
     # validate the OAuth2 refresh token, which fires a network call.
@@ -666,14 +801,21 @@ emit_from_session_file() (
     # `--check --mode deploy` still spawned python3.)
     if [[ "${OP_PREFLIGHT_CHECK_MODE:-0}" != "1" ]] && \
        ! adc_is_usable "${GOOGLE_APPLICATION_CREDENTIALS}"; then
-      # File exists but refresh token is rejected. Warn and skip the
-      # export so downstream deploy callers can fall back to local
-      # firebase-login / ADC. OP_PREFLIGHT_DONE stays 1 and PATs are
-      # still emitted below, because preflight itself succeeded —
-      # only the ADC-specific path is degraded, which matches what
-      # the user will see when they run `gcloud auth ...` manually.
-      log_stale_adc_guidance
-      unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
+      # File exists but the credential is unusable. Warn and skip the
+      # export so downstream deploy callers can fall back through their
+      # own resolver. OP_PREFLIGHT_DONE stays 1 and PATs are still
+      # emitted below, because preflight itself succeeded — only the
+      # deploy-credential path is degraded.
+      if [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" && "${GOOGLE_APPLICATION_CREDENTIALS}" == "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE}" ]]; then
+        echo "# WARNING: cached Firebase project SA key is unusable; refreshing deploy credentials." >&2
+        unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
+        unset OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT
+        exit 2
+      else
+        log_stale_adc_guidance
+        unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
+        unset OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT
+      fi
     fi
   fi
 
@@ -687,6 +829,10 @@ emit_from_session_file() (
     printf 'export GOOGLE_APPLICATION_CREDENTIALS=%q\n' "$GOOGLE_APPLICATION_CREDENTIALS"
   [[ -n "${OP_PREFLIGHT_ADC_TMPFILE:-}" ]] && \
     printf 'export OP_PREFLIGHT_ADC_TMPFILE=%q\n' "$OP_PREFLIGHT_ADC_TMPFILE"
+  [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" ]] && \
+    printf 'export OP_PREFLIGHT_FIREBASE_SA_TMPFILE=%q\n' "$OP_PREFLIGHT_FIREBASE_SA_TMPFILE"
+  [[ -n "${OP_PREFLIGHT_FIREBASE_PROJECT:-}" ]] && \
+    printf 'export OP_PREFLIGHT_FIREBASE_PROJECT=%q\n' "$OP_PREFLIGHT_FIREBASE_PROJECT"
   [[ -n "${CF_API_TOKEN:-}" ]] && \
     printf 'export CF_API_TOKEN=%q\n' "$CF_API_TOKEN"
   printf 'export OP_PREFLIGHT_DONE=1\n'
@@ -906,6 +1052,14 @@ fi
 EXPORTS=()
 SESSION_LINES=()
 SUMMARY=()
+DEPLOY_BIOMETRIC_LOGGED=false
+
+log_deploy_biometric_once() {
+  if [[ "$MODE" == "deploy" && "$DEPLOY_BIOMETRIC_LOGGED" == "false" ]]; then
+    log_biometric_trigger "$BIOMETRIC_REASON"
+    DEPLOY_BIOMETRIC_LOGGED=true
+  fi
+}
 
 # ── Phase 1: CLI credentials (one biometric prompt + session reuse) ───
 if [[ "$MODE" == "review" || "$MODE" == "all" ]]; then
@@ -991,36 +1145,71 @@ TPL
 fi
 
 if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
-  echo "# Preflight: reading GCP ADC (reuses session)..." >&2
+  firebase_project="$(detect_firebase_project 2>/dev/null || true)"
+  firebase_sa_loaded=false
 
-  # Deterministic path so subsequent invocations find the same file.
-  # Overwrite in place — chmod 600 before writing secret content.
-  touch "$ADC_TMPFILE"
-  chmod 600 "$ADC_TMPFILE"
+  if [[ -n "$firebase_project" ]]; then
+    echo "# Preflight: reading Firebase project SA key for $firebase_project..." >&2
 
-  # For --mode deploy (no review credentials loaded), this is the first
-  # op call of the run — log it. For --mode all, the Phase 1 op inject
-  # above already logged a single line covering the whole biometric
-  # burst, so no second log entry is needed here.
-  if [[ "$MODE" == "deploy" ]]; then
-    log_biometric_trigger "$BIOMETRIC_REASON"
-  fi
-  if op read "$DEFAULT_ADC_OP_URI" > "$ADC_TMPFILE" 2>/dev/null && [[ -s "$ADC_TMPFILE" ]]; then
-    if adc_is_usable "$ADC_TMPFILE"; then
-      EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
-      EXPORTS+=("export OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
-      SESSION_LINES+=("GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
-      SESSION_LINES+=("OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
-      SUMMARY+=("GCP ADC: loaded -> $ADC_TMPFILE")
+    # Deterministic path so subsequent invocations and op-firebase-deploy
+    # can reuse the same cached project SA key without a second biometric
+    # prompt. Overwrite in place — chmod 600 before writing secret content.
+    touch "$FIREBASE_SA_TMPFILE"
+    chmod 600 "$FIREBASE_SA_TMPFILE"
+    : > "$FIREBASE_SA_TMPFILE"
+
+    # For --mode deploy (no review credentials loaded), this is the first
+    # op call of the run — log it. For --mode all, the Phase 1 op inject
+    # above already logged a single line covering the whole biometric
+    # burst, so no second log entry is needed here.
+    log_deploy_biometric_once
+    if op document get "${firebase_project} — Firebase Deployer SA Key" \
+         --vault "$FIREBASE_SA_VAULT" \
+         --out-file "$FIREBASE_SA_TMPFILE" \
+         --force >/dev/null 2>&1 \
+       && firebase_sa_matches_project "$FIREBASE_SA_TMPFILE" "$firebase_project"; then
+      EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$FIREBASE_SA_TMPFILE")")
+      EXPORTS+=("export OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$(printf '%q' "$FIREBASE_SA_TMPFILE")")
+      EXPORTS+=("export OP_PREFLIGHT_FIREBASE_PROJECT=$(printf '%q' "$firebase_project")")
+      SESSION_LINES+=("GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$FIREBASE_SA_TMPFILE")")
+      SESSION_LINES+=("OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$(printf '%q' "$FIREBASE_SA_TMPFILE")")
+      SESSION_LINES+=("OP_PREFLIGHT_FIREBASE_PROJECT=$(printf '%q' "$firebase_project")")
+      SUMMARY+=("Firebase SA key ($firebase_project): loaded -> $FIREBASE_SA_TMPFILE")
+      firebase_sa_loaded=true
     else
-      rm -f "$ADC_TMPFILE"
-      log_stale_adc_guidance
-      SUMMARY+=("GCP ADC: STALE (refresh_token rejected — see warning above)")
+      rm -f "$FIREBASE_SA_TMPFILE"
+      SUMMARY+=("Firebase SA key ($firebase_project): SKIPPED (not found or did not match ${SA_NAME}@${firebase_project}.iam.gserviceaccount.com)")
     fi
   else
-    rm -f "$ADC_TMPFILE"
-    echo "# Warning: could not read GCP ADC. Deploy credentials not cached." >&2
-    SUMMARY+=("GCP ADC: SKIPPED (not available)")
+    SUMMARY+=("Firebase SA key: SKIPPED (no .firebaserc default project detected)")
+  fi
+
+  if [[ "$firebase_sa_loaded" != "true" ]]; then
+    echo "# Preflight: reading GCP ADC (reuses session)..." >&2
+
+    # Deterministic path so subsequent invocations find the same file.
+    # Overwrite in place — chmod 600 before writing secret content.
+    touch "$ADC_TMPFILE"
+    chmod 600 "$ADC_TMPFILE"
+
+    log_deploy_biometric_once
+    if op read "$DEFAULT_ADC_OP_URI" > "$ADC_TMPFILE" 2>/dev/null && [[ -s "$ADC_TMPFILE" ]]; then
+      if adc_is_usable "$ADC_TMPFILE"; then
+        EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
+        EXPORTS+=("export OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
+        SESSION_LINES+=("GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
+        SESSION_LINES+=("OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
+        SUMMARY+=("GCP ADC: loaded -> $ADC_TMPFILE")
+      else
+        rm -f "$ADC_TMPFILE"
+        log_stale_adc_guidance
+        SUMMARY+=("GCP ADC: STALE (refresh_token rejected — see warning above)")
+      fi
+    else
+      rm -f "$ADC_TMPFILE"
+      echo "# Warning: could not read GCP ADC. Deploy credentials not cached." >&2
+      SUMMARY+=("GCP ADC: SKIPPED (not available)")
+    fi
   fi
 
   # Cloudflare cache-purge token (#167). Optional — if 1Password is

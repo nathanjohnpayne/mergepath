@@ -32,12 +32,18 @@
 #        log: "source credential: explicit GOOGLE_APPLICATION_CREDENTIALS ..."
 #   1. project SA key present → rank 2 wins
 #        log: "source credential: project Firebase-vault SA key ..."
-#   2. project SA absent + preflight ADC present → rank 3 wins
+#   2. preflight-cached project SA key present → rank 2 wins without
+#      re-reading 1Password
+#        log: "source credential: preflight-cached project Firebase-vault SA key ..."
+#   3. preflight-cached project SA key for a different project is
+#      ignored, then current project SA key wins
+#        log: "source credential: project Firebase-vault SA key ..."
+#   4. project SA absent + preflight ADC present → rank 3 wins
 #        log: "source credential: preflight-injected ADC ..."
-#   3. project SA absent + preflight absent + shared op ADC reachable
+#   5. project SA absent + preflight absent + shared op ADC reachable
 #      → rank 4 wins
 #        log: "source credential: shared 1Password ADC ..."
-#   4. all op sources absent + local ADC file present → rank 5 wins
+#   6. all op sources absent + local ADC file present → rank 5 wins
 #        log: "source credential: local ADC file ..."
 #
 # Not covered (deliberate): the usability-fallback walk (rank-N
@@ -463,7 +469,102 @@ run_case \
   provision_project_sa
 
 # ----------------------------------------------------------------------
-# Case 2 — project SA absent, preflight ADC present (rank 3 wins)
+# Case 2 — preflight-cached project SA key present (rank 2 wins
+#          without re-reading 1Password)
+# ----------------------------------------------------------------------
+provision_preflight_cached_project_sa() {
+  local case_dir="$1" bin_dir="$2" tmp_dir="$3" home_dir="$4" project="$5"
+
+  local preflight_sa_path="$tmp_dir/preflight-firebase-sa.json"
+  write_fake_sa_key "$preflight_sa_path" \
+    "firebase-deployer@${project}.iam.gserviceaccount.com"
+
+  # Any op call means the cached preflight SA marker was not honored.
+  cat >"$bin_dir/op" <<'STUB'
+#!/usr/bin/env bash
+echo "FATAL: op should not be called when preflight-cached Firebase SA is valid: $*" >&2
+exit 99
+STUB
+  chmod +x "$bin_dir/op"
+
+  cat >"$case_dir/case-env.sh" <<ENV
+export GOOGLE_APPLICATION_CREDENTIALS="$preflight_sa_path"
+export OP_PREFLIGHT_FIREBASE_SA_TMPFILE="$preflight_sa_path"
+export OP_PREFLIGHT_FIREBASE_PROJECT="$project"
+unset OP_PREFLIGHT_ADC_TMPFILE
+ENV
+}
+
+run_case_with_env \
+  "case2_preflight_cached_project_sa" \
+  "source credential: preflight-cached project Firebase-vault SA key" \
+  "merge-path-test" \
+  provision_preflight_cached_project_sa
+
+# ----------------------------------------------------------------------
+# Case 3 — preflight-cached project SA key for a different project is
+#          ignored, then current project SA key wins
+# ----------------------------------------------------------------------
+provision_mismatched_preflight_cached_project_sa() {
+  local case_dir="$1" bin_dir="$2" tmp_dir="$3" home_dir="$4" project="$5"
+
+  local preflight_sa_path="$tmp_dir/preflight-other-project-sa.json"
+  write_fake_sa_key "$preflight_sa_path" \
+    "firebase-deployer@other-project.iam.gserviceaccount.com"
+
+  local sa_payload_dir="$case_dir/op-payloads"
+  mkdir -p "$sa_payload_dir"
+  write_fake_sa_key "$sa_payload_dir/project-sa.json" \
+    "firebase-deployer@${project}.iam.gserviceaccount.com"
+
+  cat >"$bin_dir/op" <<STUB
+#!/usr/bin/env bash
+case "\$1" in
+  document)
+    shift
+    if [ "\$1" = "get" ]; then
+      shift
+      out_path=""
+      while [ \$# -gt 0 ]; do
+        if [ "\$1" = "--out-file" ]; then
+          shift; out_path="\$1"
+        fi
+        shift || true
+      done
+      if [ -n "\$out_path" ]; then
+        cp "$sa_payload_dir/project-sa.json" "\$out_path"
+        exit 0
+      fi
+      exit 1
+    fi
+    exit 1
+    ;;
+  read)
+    exit 1
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+STUB
+  chmod +x "$bin_dir/op"
+
+  cat >"$case_dir/case-env.sh" <<ENV
+export GOOGLE_APPLICATION_CREDENTIALS="$preflight_sa_path"
+export OP_PREFLIGHT_FIREBASE_SA_TMPFILE="$preflight_sa_path"
+export OP_PREFLIGHT_FIREBASE_PROJECT="other-project"
+unset OP_PREFLIGHT_ADC_TMPFILE
+ENV
+}
+
+run_case_with_env \
+  "case3_mismatched_preflight_cached_project_sa" \
+  "source credential: project Firebase-vault SA key" \
+  "merge-path-test" \
+  provision_mismatched_preflight_cached_project_sa
+
+# ----------------------------------------------------------------------
+# Case 4 — project SA absent, preflight ADC present (rank 3 wins)
 # ----------------------------------------------------------------------
 provision_preflight_adc() {
   local case_dir="$1" bin_dir="$2" tmp_dir="$3" home_dir="$4" project="$5"
@@ -498,13 +599,13 @@ ENV
 }
 
 run_case_with_env \
-  "case2_preflight_adc_present" \
+  "case4_preflight_adc_present" \
   "source credential: preflight-injected ADC" \
   "merge-path-test" \
   provision_preflight_adc
 
 # ----------------------------------------------------------------------
-# Case 3 — project SA absent, preflight absent, shared 1Password ADC
+# Case 5 — project SA absent, preflight absent, shared 1Password ADC
 # reachable (rank 4 wins)
 # ----------------------------------------------------------------------
 provision_shared_op_adc() {
@@ -539,13 +640,13 @@ STUB
 }
 
 run_case \
-  "case3_shared_op_adc_present" \
+  "case5_shared_op_adc_present" \
   "source credential: shared 1Password ADC" \
   "merge-path-test" \
   provision_shared_op_adc
 
 # ----------------------------------------------------------------------
-# Case 4 — all op sources absent, local ADC file present (rank 5 wins)
+# Case 6 — all op sources absent, local ADC file present (rank 5 wins)
 # ----------------------------------------------------------------------
 provision_local_adc() {
   local case_dir="$1" bin_dir="$2" tmp_dir="$3" home_dir="$4" project="$5"
@@ -564,7 +665,7 @@ STUB
 }
 
 run_case \
-  "case4_local_adc_present" \
+  "case6_local_adc_present" \
   "source credential: local ADC file" \
   "merge-path-test" \
   provision_local_adc

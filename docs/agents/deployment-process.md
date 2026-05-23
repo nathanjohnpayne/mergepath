@@ -13,10 +13,18 @@ If the project uses Firebase or Google Cloud, prefer the canonical
   scripts, or secret stores unless a project explicitly requires them. The Firebase-vault SA key in 1Password is the supported on-account form; on-disk deploy keys are not.
 - If credential preflight was run at session start with deploy creds
   loaded (`scripts/op-preflight.sh --mode deploy` or `--mode all`),
-  deploy credentials are already cached. No additional biometric
-  prompt is needed for deployment. The default `--mode review` does
-  NOT load deploy credentials (#282); pass `--mode deploy` explicitly
-  for a deploy session.
+  deploy credentials are already cached. In a Firebase repo with a
+  `.firebaserc` default project, deploy preflight caches the project
+  Firebase-vault SA key first and only falls back to the shared GCP ADC
+  when that key is absent. No additional biometric prompt is needed for
+  deployment. The default `--mode review` does NOT load deploy
+  credentials (#282); pass `--mode deploy` explicitly for a deploy
+  session.
+- Deploy preflight exports the selected deploy credential through
+  `GOOGLE_APPLICATION_CREDENTIALS`. If the next operation is broad
+  non-deploy `gcloud` work rather than Firebase deploy, use review
+  preflight only or unset `GOOGLE_APPLICATION_CREDENTIALS` so the
+  `scripts/gcloud/gcloud` wrapper can resolve its normal ADC chain.
 - If an `op` command fails with a sign-in or biometric error during deploy, follow the pause-and-prompt procedure in [operating-rules.md](operating-rules.md#1password-cli-authentication-failures). Do not retry or work around the failure without the human present.
 
 ## Runtime 1Password secrets for agents
@@ -68,7 +76,8 @@ If the source is unexpected, the diagnosis order is usually:
 
 1. **Source = `local-adc`** when `project-sa-key` was expected → the 1Password item `op://Firebase/{project-id} — Firebase Deployer SA Key` likely doesn't exist or `op` CLI auth is stale. Verify with `op item get "{project-id} — Firebase Deployer SA Key" --vault Firebase --reveal`. If the item is missing, follow `DEPLOYMENT.md` § Provisioning the Firebase-vault SA key. If `op item get` errors with a sign-in failure, run `op signin` and retry.
 2. **Source = `human-override`** unexpectedly → a `GOOGLE_APPLICATION_CREDENTIALS` env var is set in the shell that wasn't materialized by preflight. Check with `env | grep GOOGLE_APPLICATION_CREDENTIALS` and unset it (`unset GOOGLE_APPLICATION_CREDENTIALS`) for routine deploys.
-3. **Source = `preflight-adc`** when `project-sa-key` was expected → same as case 1 (no SA key item), but preflight has run and provided the shared ADC fallback. The deploy will work but is subject to the shared ADC's RAPT-expiry surface. Provision the per-project SA key for stable deploys.
-4. **Deploy succeeds but logs an `ADC quota project` warning** → expected when the underlying credential was originally stamped for another project. `op-firebase-deploy` overrides `quota_project_id` to the target project for actual deploy commands, so the warning is cosmetic.
+3. **Source = `preflight-cached project Firebase-vault SA key`** → expected when `op-preflight.sh --mode deploy|all` ran in this Firebase repo before the deploy. The cached key is still the project Firebase-vault SA key; preflight just materialized it ahead of time so `op-firebase-deploy` does not need another 1Password read.
+4. **Source = `preflight-adc`** when `project-sa-key` was expected → same as case 1 (no SA key item or preflight could not detect the Firebase project), but preflight has run and provided the shared ADC fallback. The deploy will work only while that ADC is fresh and is subject to the shared ADC's RAPT-expiry surface. Provision the per-project SA key for stable deploys.
+5. **Deploy succeeds but logs an `ADC quota project` warning** → expected when the underlying credential was originally stamped for another project. `op-firebase-deploy` overrides `quota_project_id` to the target project for actual deploy commands, so the warning is cosmetic.
 
 If the rotation procedure is needed, follow `DEPLOYMENT.md` § [Rotating a Firebase deploy SA key](../../DEPLOYMENT.md#rotating-a-firebase-deploy-sa-key). Rotation is human-only and not automated by any agent or workflow.

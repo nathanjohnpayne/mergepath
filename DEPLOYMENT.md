@@ -181,9 +181,9 @@ from generated local files.
 
 For `scripts/deploy.sh` and the underlying `op-firebase-deploy`, the source-credential resolution order is:
 
-1. **Genuine human-supplied override** — `GOOGLE_APPLICATION_CREDENTIALS` set by the human OUTSIDE preflight (no `OP_PREFLIGHT_ADC_TMPFILE` marker, or its value differs from the marker). Wins. Used for one-off debugging, alternate-account deploys, or CI runners that materialize their own credential.
-2. **Project Firebase-vault SA key** — `op://Firebase/{project-id} — Firebase Deployer SA Key`, when present. **The standard day-to-day credential, both interactive and CI.** Stable (no `firebase login --reauth` churn from RAPT/refresh-token expiry on the shared ADC; see [#137](https://github.com/nathanjohnpayne/mergepath/issues/137)), parity between local and CI flows, no dependence on Firebase CLI local-login state.
-3. **Preflight-injected `GOOGLE_APPLICATION_CREDENTIALS`** — when no project SA key is provisioned, `scripts/op-preflight.sh --mode deploy` (or `--mode all`) materializes the shared 1Password ADC into a tempfile and exports its path. Subject to the same RAPT-expiry surface as the shared ADC.
+1. **Genuine human-supplied override** — `GOOGLE_APPLICATION_CREDENTIALS` set by the human OUTSIDE preflight (no `OP_PREFLIGHT_FIREBASE_SA_TMPFILE` or `OP_PREFLIGHT_ADC_TMPFILE` marker matching the same path). Wins. Used for one-off debugging, alternate-account deploys, or CI runners that materialize their own credential.
+2. **Project Firebase-vault SA key** — `op://Firebase/{project-id} — Firebase Deployer SA Key`, when present. **The standard day-to-day credential, both interactive and CI.** Stable (no `firebase login --reauth` churn from RAPT/refresh-token expiry on the shared ADC; see [#137](https://github.com/nathanjohnpayne/mergepath/issues/137)), parity between local and CI flows, no dependence on Firebase CLI local-login state. In a repo with a `.firebaserc` default project, `scripts/op-preflight.sh --mode deploy` (or `--mode all`) now caches this key first and exports `OP_PREFLIGHT_FIREBASE_SA_TMPFILE` / `OP_PREFLIGHT_FIREBASE_PROJECT`, so the deploy wrapper does not spend time probing the stale shared ADC before using the durable project key.
+3. **Preflight-injected shared ADC** — when no project SA key is provisioned or detectable, `scripts/op-preflight.sh --mode deploy` (or `--mode all`) materializes the shared 1Password ADC into a tempfile and exports its path as `OP_PREFLIGHT_ADC_TMPFILE`. Subject to the same RAPT-expiry surface as the shared ADC.
 4. **Shared 1Password ADC read directly** — `op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential`, read by the script when neither preflight nor an SA key are available. Same RAPT-expiry surface.
 5. **Local ADC file** — `~/.config/gcloud/application_default_credentials.json` from a prior `gcloud auth application-default login`. Last resort.
 
@@ -582,6 +582,10 @@ DEPLOY_ALLOW_DIRTY=1 scripts/deploy.sh
 When the override is used, the script logs the dirty paths to stderr under a `⚠️  DEPLOY_ALLOW_DIRTY=1` banner so the deviation is visible in the deploy transcript. Never use `--force` or `DEPLOY_ALLOW_DIRTY=1` during routine deploys.
 
 Cloudflare cache purge runs when `CF_API_TOKEN` and `CF_ZONE_ID` are set in the environment. `CF_API_TOKEN` is sourced automatically by `scripts/op-preflight.sh --mode deploy` (or `--mode all`) from the shared "All Domains — Cache Purge API token" 1Password item — no `op read` needed in your shell. `CF_ZONE_ID` is per-repo; each downstream consumer sets its own zone ID (e.g., in the repo's bootstrap or as a hardcoded value in its `scripts/deploy.sh` wrapper) since one CF token covers all domains but each domain has its own zone. Without both variables the purge step no-ops with a clear log line.
+
+Deploy preflight in a Firebase repo reads credentials in the same stable order as `op-firebase-deploy`: first the project Firebase-vault SA key identified by `.firebaserc`, then the shared GCP ADC only if the project key is absent or invalid. This keeps attended deploy sessions from repeatedly hitting the human authorized-user ADC path that expires under Google Workspace reauth/RAPT policy.
+
+Because deploy preflight exports the selected credential through `GOOGLE_APPLICATION_CREDENTIALS`, ordinary `gcloud` commands in that same shell may also see the project SA key. For broad, non-deploy `gcloud` work, use review preflight only or unset `GOOGLE_APPLICATION_CREDENTIALS` and let the `scripts/gcloud/gcloud` wrapper resolve its normal ADC chain.
 
 **Do not run `op-firebase-deploy` or `firebase deploy` directly for routine deploys.** They skip the branch + freshness guards and the cache purge. Direct invocation is reserved for debugging or one-off flows where the deploy surface is known.
 
@@ -988,12 +992,15 @@ Google, `op-firebase-deploy` will refuse the credential with:
 Error: GOOGLE_APPLICATION_CREDENTIALS points to an unusable credential file: /var/folders/.../op-preflight-adc-*
 ```
 
-Starting with the #137 fix, `op-preflight.sh` now validates the
-materialized ADC against the OAuth2 `/token` endpoint before exporting
-`GOOGLE_APPLICATION_CREDENTIALS`. When the credential is stale,
-preflight prints an actionable warning and skips the export — downstream
-callers (`op-firebase-deploy`, `gcloud` wrappers) then fall back to the
-local firebase-login / ADC path that the reauth has just refreshed.
+Starting with the #137 fix, `op-preflight.sh` validates the materialized
+ADC against the OAuth2 `/token` endpoint before exporting
+`GOOGLE_APPLICATION_CREDENTIALS`. In Firebase repos, deploy preflight
+tries the project Firebase-vault SA key before this shared ADC path, so
+a provisioned project key avoids the RAPT-prone credential entirely.
+When the shared ADC is still needed and is stale, preflight prints an
+actionable warning and skips the export — downstream callers
+(`op-firebase-deploy`, `gcloud` wrappers) then fall back to the next
+available credential.
 
 **Fix permanently** by refreshing the 1Password item:
 
@@ -1008,11 +1015,22 @@ op document edit 'GCP ADC' --vault=Private \
 After that, the next preflight run will materialize a usable credential
 and the `GOOGLE_APPLICATION_CREDENTIALS` export resumes normally.
 
+For routine Firebase deploys, the preferred permanent fix is to
+provision or rotate the project Firebase-vault SA key instead of
+depending on the shared human ADC. The shared ADC remains a fallback for
+projects that have not provisioned the key and for non-Firebase `gcloud`
+operations.
+
 ## Changelog
 
 **2026-05-15: Deploy credential precedence updated.** Project Firebase-vault SA keys
 are now the default for `op-firebase-deploy`. See #154 / #211 for implementation
 history; live consumer verification on matchline pending (#211 close-out).
+
+**2026-05-22: Deploy preflight caches the project SA key first.** In Firebase repos,
+`op-preflight.sh --mode deploy|all` now materializes the project Firebase-vault SA
+key before trying the shared GCP ADC. This removes the routine stale-ADC/RAPT probe
+from attended deploy sessions when the durable project key exists.
 
 **2026-05-15: `op-firebase-setup --provision-sa-key` flag added.** The setup script
 now optionally mints the deployer SA key and uploads it to
