@@ -968,7 +968,7 @@ daily `firebase login --reauth` loop.
 
 If an older helper is still installed, deploys can fail mid-deploy with:
 
-```
+```text
 Authentication Error: Your credentials are no longer valid. Please run firebase login --reauth
 ```
 
