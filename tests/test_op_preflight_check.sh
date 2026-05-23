@@ -344,7 +344,10 @@ test_check_deploy_firebase_sa_no_python3_probe() {
   mkdir -p "$case_dir" "$cache_dir" "$py_stub"
 
   cat > "$case_dir/.firebaserc" <<JSON
-{ "projects": { "default": "$project" } }
+{
+  "projects": { "default": "$project" },
+  "hosting": { "default": "wrong-project" }
+}
 JSON
   cat > "$sa_file" <<JSON
 {

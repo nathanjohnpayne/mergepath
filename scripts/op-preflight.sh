@@ -293,9 +293,41 @@ PY
 json_string_field_no_python() {
   local file="${1:-}" field="${2:-}"
   [[ -n "$file" && -f "$file" && -n "$field" ]] || return 1
-  tr '\n' ' ' < "$file" \
-    | sed -nE "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\\1/p" \
-    | head -n 1
+  awk -v field="$field" '
+    { text = text $0 " " }
+    END {
+      pattern = "\"" field "\"[[:space:]]*:[[:space:]]*\"[^\"]+\""
+      if (!match(text, pattern)) {
+        exit 1
+      }
+      matched = substr(text, RSTART, RLENGTH)
+      if (split(matched, parts, "\"") < 4) {
+        exit 1
+      }
+      print parts[4]
+    }
+  ' "$file"
+}
+
+firebaserc_default_project_no_python() {
+  [[ -f .firebaserc ]] || return 1
+  awk '
+    { text = text $0 " " }
+    END {
+      if (!match(text, /"projects"[[:space:]]*:[[:space:]]*\{[^}]*\}/)) {
+        exit 1
+      }
+      projects = substr(text, RSTART, RLENGTH)
+      if (!match(projects, /"default"[[:space:]]*:[[:space:]]*"[^"]+"/)) {
+        exit 1
+      }
+      matched = substr(projects, RSTART, RLENGTH)
+      if (split(matched, parts, "\"") < 4) {
+        exit 1
+      }
+      print parts[4]
+    }
+  ' .firebaserc
 }
 
 detect_firebase_project_no_python() {
@@ -303,7 +335,7 @@ detect_firebase_project_no_python() {
     printf '%s\n' "$OP_PREFLIGHT_FIREBASE_PROJECT_ID"
     return 0
   fi
-  json_string_field_no_python ".firebaserc" "default"
+  firebaserc_default_project_no_python
 }
 
 firebase_sa_matches_project_no_python() {
