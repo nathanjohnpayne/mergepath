@@ -22,6 +22,7 @@ DEFAULT_ADC_FILE="${HOME}/.config/gcloud/application_default_credentials.json"
 DEFAULT_ADC_OP_URI="${FIREBASE_SOURCE_CREDENTIAL_OP_URI:-${GCP_ADC_OP_URI:-op://Private/GCP ADC/credential}}"
 SOURCE_CRED_FILE=""
 SOURCE_CRED_TMPFILE=""
+FIREBASE_CONFIG_TMPDIR=""
 
 PROJECT=""
 EXTRA_ARGS=()
@@ -56,6 +57,12 @@ fi
 cleanup_source_cred() {
   if [[ -n "${SOURCE_CRED_TMPFILE}" && -f "${SOURCE_CRED_TMPFILE}" ]]; then
     rm -f "${SOURCE_CRED_TMPFILE}"
+  fi
+}
+
+cleanup_firebase_config() {
+  if [[ -n "${FIREBASE_CONFIG_TMPDIR}" && -d "${FIREBASE_CONFIG_TMPDIR}" ]]; then
+    rm -rf "${FIREBASE_CONFIG_TMPDIR}"
   fi
 }
 
@@ -283,7 +290,8 @@ PY
 
 umask 077
 ADC_TMPFILE="$(mktemp "${TMPDIR:-/tmp}/gcp-impersonated-XXXXXX")"
-trap 'cleanup_source_cred; rm -f "$ADC_TMPFILE"' EXIT
+FIREBASE_CONFIG_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/firebase-configstore-XXXXXX")"
+trap 'cleanup_source_cred; rm -f "$ADC_TMPFILE"; cleanup_firebase_config' EXIT
 
 SA_EMAIL="${FIREBASE_DEPLOY_SA_EMAIL:-${SA_NAME}@${PROJECT}.iam.gserviceaccount.com}"
 
@@ -411,4 +419,8 @@ export CLOUDSDK_BILLING_QUOTA_PROJECT="$PROJECT"
 export CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true
 export CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true
 
-firebase deploy --project "$PROJECT" --non-interactive ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+# Firebase CLI checks its configstore user token before Application Default
+# Credentials. Run with an isolated configstore so stale `firebase login`
+# state cannot override the service account key we just materialized.
+XDG_CONFIG_HOME="$FIREBASE_CONFIG_TMPDIR" \
+  firebase deploy --project "$PROJECT" --non-interactive ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}

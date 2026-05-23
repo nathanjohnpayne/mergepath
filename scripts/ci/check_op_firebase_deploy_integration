@@ -62,6 +62,8 @@
 #   (b) every tempfile the script wrote under our scratch TMPDIR is
 #       cleaned up after the process exits (no leaked SA key / ADC
 #       material on disk)
+#   (c) the Firebase CLI subprocess receives an isolated configstore
+#       so stale `firebase login` state cannot override ADC
 #
 # NOTE on resolver coverage: The brief for #211 named a fourth case
 # "firebase-login-state" as the last-resort fallback. The script as
@@ -158,6 +160,7 @@ JSON
   cat >"$bin_dir/firebase" <<'STUB'
 #!/usr/bin/env bash
 echo "[stub-firebase] called with: $*" >&2
+echo "[stub-firebase] XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-}" >&2
 exit 0
 STUB
   chmod +x "$bin_dir/firebase"
@@ -194,6 +197,7 @@ STUB
     env -i \
       PATH="$bin_dir:$PYTHON3_DIR:/usr/bin:/bin:/usr/sbin:/sbin" \
       HOME="$home_dir" \
+      XDG_CONFIG_HOME="$home_dir/.config" \
       TMPDIR="$tmp_dir" \
       "$DEPLOY_SCRIPT" \
       >"$stdout_log" 2>"$stderr_log"
@@ -216,6 +220,13 @@ STUB
     check_passed=false
   fi
 
+  if ! grep -qE '^\[stub-firebase\] XDG_CONFIG_HOME=.*/firebase-configstore-[^[:space:]]+$' "$stderr_log"; then
+    echo "  FAIL: $case_name — firebase subprocess did not receive isolated XDG_CONFIG_HOME"
+    echo "    actual stderr:"
+    sed 's/^/      /' "$stderr_log" >&2 || true
+    check_passed=false
+  fi
+
   # Tempfile cleanup verification: every file we expected the script
   # to create under $tmp_dir must be gone after exit.
   local lingering
@@ -223,6 +234,13 @@ STUB
   if [ -n "$lingering" ]; then
     echo "  FAIL: $case_name — tempfiles leaked under $tmp_dir:"
     echo "$lingering" | sed 's/^/      /' >&2
+    check_passed=false
+  fi
+  local lingering_config
+  lingering_config="$(find "$tmp_dir" -type d -name 'firebase-configstore-*' 2>/dev/null | sort || true)"
+  if [ -n "$lingering_config" ]; then
+    echo "  FAIL: $case_name — firebase configstore tempdir leaked under $tmp_dir:"
+    echo "$lingering_config" | sed 's/^/      /' >&2
     check_passed=false
   fi
 
@@ -256,6 +274,7 @@ JSON
   cat >"$bin_dir/firebase" <<'STUB'
 #!/usr/bin/env bash
 echo "[stub-firebase] called with: $*" >&2
+echo "[stub-firebase] XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-}" >&2
 exit 0
 STUB
   chmod +x "$bin_dir/firebase"
@@ -291,6 +310,7 @@ RUNNER
     env -i \
       PATH="$bin_dir:$PYTHON3_DIR:/usr/bin:/bin:/usr/sbin:/sbin" \
       HOME="$home_dir" \
+      XDG_CONFIG_HOME="$home_dir/.config" \
       TMPDIR="$tmp_dir" \
       "$case_dir/runner.sh" \
       >"$stdout_log" 2>"$stderr_log"
@@ -313,6 +333,13 @@ RUNNER
     check_passed=false
   fi
 
+  if ! grep -qE '^\[stub-firebase\] XDG_CONFIG_HOME=.*/firebase-configstore-[^[:space:]]+$' "$stderr_log"; then
+    echo "  FAIL: $case_name — firebase subprocess did not receive isolated XDG_CONFIG_HOME"
+    echo "    actual stderr:"
+    sed 's/^/      /' "$stderr_log" >&2 || true
+    check_passed=false
+  fi
+
   # Tempfile cleanup: the script-written tempfiles (gcp-impersonated-*,
   # firebase-sa-*, gcp-adc-*) must be gone. Note that for cases that
   # pre-provision their own credentials (preflight ADC, explicit GAC),
@@ -323,6 +350,13 @@ RUNNER
   if [ -n "$lingering" ]; then
     echo "  FAIL: $case_name — tempfiles leaked under $tmp_dir:"
     echo "$lingering" | sed 's/^/      /' >&2
+    check_passed=false
+  fi
+  local lingering_config
+  lingering_config="$(find "$tmp_dir" -type d -name 'firebase-configstore-*' 2>/dev/null | sort || true)"
+  if [ -n "$lingering_config" ]; then
+    echo "  FAIL: $case_name — firebase configstore tempdir leaked under $tmp_dir:"
+    echo "$lingering_config" | sed 's/^/      /' >&2
     check_passed=false
   fi
 
