@@ -603,8 +603,10 @@ op-firebase-deploy --only functions
 2. Reads source credentials per [Deploy credential precedence (canonical)](#deploy-credential-precedence-canonical) above. Logs the selected source on stderr (`[op-firebase-deploy] source credential: ...`) so deploy auth debugging is no longer opaque.
 3. If the source credential is a `service_account` key matching the target `firebase-deployer@{project-id}.iam.gserviceaccount.com`, uses it directly (no impersonation wrapper needed — faster, no `serviceAccountTokenCreator` required).
 4. Otherwise, unwraps nested impersonated credentials if needed, stamps the target project into `quota_project_id`, and writes a temporary `impersonated_service_account` credential file.
-5. Runs `firebase deploy --non-interactive`.
-6. Cleans up the temp credentials on exit.
+5. Runs `firebase deploy --non-interactive` with an isolated Firebase CLI
+   configstore, so stale `firebase login` user tokens cannot override the
+   selected Application Default Credential.
+6. Cleans up the temp credentials and Firebase CLI configstore on exit.
 
 No browser prompt is needed for routine use once a valid credential exists in the resolution chain and the 1Password CLI is unlocked.
 
@@ -958,28 +960,27 @@ op-firebase-setup {project-id}
 
 ### Firebase CLI "Authentication Error: credentials are no longer valid" (daily reauth)
 
-`op-firebase-deploy` (and `scripts/deploy.sh` by extension) occasionally fails
-mid-deploy with:
+Current `op-firebase-deploy` isolates Firebase CLI's configstore for the
+deploy subprocess, so stale `firebase login` user tokens should no longer
+override the selected 1Password-backed Application Default Credential. This
+keeps routine deploys on the project Firebase-vault SA key and avoids the
+daily `firebase login --reauth` loop.
+
+If an older helper is still installed, deploys can fail mid-deploy with:
 
 ```
 Authentication Error: Your credentials are no longer valid. Please run firebase login --reauth
 ```
 
-The 1Password source-credential chain is still healthy when this fires —
-`gcloud auth application-default print-access-token` against the materialized
-ADC still mints a valid token. The failure is inside firebase CLI, which
-ignores `GOOGLE_APPLICATION_CREDENTIALS` in some hosting-deploy code paths
-and falls back to the user-login cache at
-`~/.config/configstore/firebase-tools.json`. That cache's access token
-expires roughly daily and is not refreshed by the 1Password flow.
+The 1Password source-credential chain may still be healthy when this fires.
+The failure is inside Firebase CLI, which checks cached user-login state at
+`~/.config/configstore/firebase-tools.json` before using ADC. That cache's
+access token expires roughly daily and is not refreshed by the 1Password flow.
 
-**Workaround:** run `firebase login --reauth` once, then re-run the exact
-same `scripts/deploy.sh` (or `op-firebase-deploy`) command. It will succeed
-on the next attempt. See nathanjohnpayne/mergepath#137 for the open
-investigation and the longer-term fix under consideration
-(detect stale configstore in `op-firebase-deploy` and print a clear message
-instead of the current cryptic "Assertion failed: resolving hosting target"
-trailer).
+**Fix:** install the current `op-firebase-deploy` helper and re-run the same
+`scripts/deploy.sh` (or `op-firebase-deploy`) command. The expected source log
+is the project Firebase-vault SA key, and the command should complete without
+prompting for `firebase login --reauth`.
 
 ### 1Password ADC item refresh token expired (#137 failure mode B)
 
