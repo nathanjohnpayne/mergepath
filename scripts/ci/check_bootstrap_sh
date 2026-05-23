@@ -10,6 +10,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_bootstrap_sh.sh"
 
 if [ ! -f "$TEST_SCRIPT" ]; then
+  if [ ! -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
+    echo "check_bootstrap_sh: SKIP (consumer checkout: tests/test_bootstrap_sh.sh + .mergepath-sync.yml both absent)"
+    exit 0
+  fi
   echo "check_bootstrap_sh: ERROR (missing $TEST_SCRIPT)" >&2
   exit 1
 fi
