@@ -630,6 +630,19 @@ else
   echo "  FAIL: Dependabot auto-merge must check human-hold before queued work, --auto, and fallback squash (got $hold_recheck_count checks)" >&2
 fi
 
+echo "Workflow js-yaml install tests"
+for workflow in .github/workflows/agent-review.yml .github/workflows/pr-audit.yml; do
+  install_count=$(grep -Ec 'run: npm install .*js-yaml' "$workflow" || true)
+  safe_install_count=$(grep -Ec 'run: npm install .*--no-save .*--ignore-scripts .*--legacy-peer-deps .*js-yaml' "$workflow" || true)
+  if [ "$install_count" -gt 0 ] && [ "$install_count" = "$safe_install_count" ]; then
+    pass=$((pass + 1))
+    echo "  PASS: $workflow installs js-yaml without mutating package metadata or resolving peer deps"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: $workflow must install js-yaml with --no-save --ignore-scripts --legacy-peer-deps (safe=$safe_install_count total=$install_count)" >&2
+  fi
+done
+
 echo
 if [ "$fail" -gt 0 ]; then
   echo "check_workflow_parsers: $fail FAIL / $pass PASS" >&2
