@@ -24,19 +24,17 @@
 #                        kit allow-extras semantics, and a distinct
 #                        branch-name scheme (mergepath-sync/sync-all-<sha>)
 #                        so it doesn't collide with per-commit branches.
-#                        Templated paths are still deferred (Layer 5).
+#                        Templated paths are rendered per consumer facts
+#                        when the substitution lib is present (Layer 5).
 #
 #   future:
 #     --from-pr <N>      Resolve PR N's merge commit and propagate
 #                        (Layer 4).
-#     templated paths    Three-way merge for review-policy.yml; substitution
-#                        rules for AGENTS.md / CLAUDE.md (Layer 5, shared
-#                        with bootstrap-new-repo.sh #156).
 #
 # The manifest at .mergepath-sync.yml declares which paths are canonical
 # (byte-identical) or kit (directory mirror with allow-extras), and which
-# consumers opt in. Templated paths are reserved for Layer 5 and rejected
-# until the substitution lib lands.
+# consumers opt in. Templated paths render from a mergepath-side source to a
+# consumer-side dest using each consumer's manifest facts.
 #
 # Usage:
 #   scripts/sync-to-downstream.sh --audit [--repos r1,r2] [--paths glob]
@@ -65,8 +63,8 @@
 #                        <commit-ish>. Honors the same sync-mode flags
 #                        below (--dry-run, --repos, --paths/--files,
 #                        --no-pr, --skip-existing/--recreate-existing,
-#                        --verbose). Templated paths are still deferred
-#                        (Layer 5).
+#                        --verbose). Templated paths are rendered per
+#                        consumer facts when opted in.
 #   --dry-run            Sync / sync-all mode only. Print the per-consumer
 #                        plan (branch name, files) without cloning,
 #                        committing, pushing, or creating PRs. For
@@ -160,6 +158,14 @@
 #                           branch. Cached clones are refreshed via
 #                           `git fetch && git reset --hard origin/HEAD`
 #                           before each audit (suppress with --no-refresh).
+#   MERGEPATH_AGENT         Agent name to stamp into live propagation PR
+#                           metadata (default: claude).
+#   MERGEPATH_SYNC_AUTHORING_AGENT
+#                           Explicit override for Authoring-Agent metadata.
+#                           Wins over MERGEPATH_AGENT.
+#   MERGEPATH_SYNC_COAUTHOR_TRAILER
+#                           Explicit `Co-Authored-By: Name <email>` trailer.
+#                           Required for agents without a built-in trailer.
 #
 # Prerequisites:
 #   yq (mikefarah/yq, v4+)  brew install yq
@@ -213,6 +219,51 @@ usage() {
       }
     }
   ' "${BASH_SOURCE[0]}"
+}
+
+# --- live PR metadata -------------------------------------------------------
+
+sync_authoring_agent() {
+  local agent="${MERGEPATH_SYNC_AUTHORING_AGENT:-${MERGEPATH_AGENT:-claude}}"
+  agent=$(printf '%s' "$agent" | tr '[:upper:]' '[:lower:]')
+  if [[ ! "$agent" =~ ^[a-z][a-z0-9_-]*$ ]]; then
+    err "invalid sync authoring agent '$agent'"
+    err "       Set MERGEPATH_AGENT=<claude|codex|cursor> or MERGEPATH_SYNC_AUTHORING_AGENT=<agent>."
+    return 1
+  fi
+  printf '%s\n' "$agent"
+}
+
+sync_coauthor_trailer() {
+  local authoring_agent=$1
+  if [ -n "${MERGEPATH_SYNC_COAUTHOR_TRAILER:-}" ]; then
+    case "$MERGEPATH_SYNC_COAUTHOR_TRAILER" in
+      "Co-Authored-By: "*"<"*"@"*">") ;;
+      *)
+        err "invalid MERGEPATH_SYNC_COAUTHOR_TRAILER; expected 'Co-Authored-By: Name <email>'"
+        return 1
+        ;;
+    esac
+    printf '%s\n' "$MERGEPATH_SYNC_COAUTHOR_TRAILER"
+    return 0
+  fi
+
+  case "$authoring_agent" in
+    claude)
+      printf '%s\n' "Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+      ;;
+    codex)
+      printf '%s\n' "Co-Authored-By: OpenAI Codex <noreply@openai.com>"
+      ;;
+    cursor)
+      printf '%s\n' "Co-Authored-By: Cursor <noreply@cursor.com>"
+      ;;
+    *)
+      err "no built-in coauthor trailer for Authoring-Agent '$authoring_agent'"
+      err "       Set MERGEPATH_SYNC_COAUTHOR_TRAILER='Co-Authored-By: Name <email>' to run with this agent."
+      return 1
+      ;;
+  esac
 }
 
 # --- prerequisite check -----------------------------------------------------
@@ -645,6 +696,12 @@ emit_status_line() {
   printf "  %s %-50s %s\n" "$sym" "$mp_path" "$detail"
 }
 
+emit_skip_line() {
+  local mp_path=$1
+  local reason=$2
+  printf "  ↷ %-50s skipped per .sync-overrides.yml: %s\n" "$mp_path" "$reason"
+}
+
 # Filter helpers — return 0 (truthy) if the entry passes the filter,
 # 1 otherwise. FILTER_REPOS / FILTER_PATHS are global vars set from CLI.
 in_repo_filter() {
@@ -704,6 +761,10 @@ run_audit() {
         continue
       fi
     fi
+    local consumer_overrides=""
+    if [ -f "$consumer_root/$OVERRIDES_PATH" ]; then
+      consumer_overrides="$consumer_root/$OVERRIDES_PATH"
+    fi
 
     # Walk the manifest's paths. yq emits TSV: path<TAB>type<TAB>consumers_csv
     # where consumers_csv is "all" or a comma-joined list. Per-path
@@ -739,6 +800,15 @@ run_audit() {
         if [[ "$re" != *",$consumer_name,"* ]]; then
           continue
         fi
+      fi
+
+      local consumer_path_for_override="$mp_path"
+      if [ "$mp_type" = "templated" ]; then
+        consumer_path_for_override="$mp_dest"
+      fi
+      if override_should_skip_path "$consumer_overrides" "$consumer_path_for_override"; then
+        emit_skip_line "$consumer_path_for_override" "$OVERRIDE_SKIP_REASON"
+        continue
       fi
 
       case "$mp_type" in
@@ -1171,6 +1241,9 @@ sync_open_pr() {
   # this is deferred to the moment-before-push and not done upfront.
   local recreate_existing_pr_num=${9:-}
   local short_sha=${sha:0:7}
+  local authoring_agent coauthor_trailer
+  authoring_agent=$(sync_authoring_agent) || return 1
+  coauthor_trailer=$(sync_coauthor_trailer "$authoring_agent") || return 1
 
   # Portable mktemp: `-t TEMPLATE` semantics differ between BSD (macOS)
   # and GNU coreutils. macOS treats TEMPLATE as a literal prefix and
@@ -1380,7 +1453,7 @@ Source: https://github.com/nathanjohnpayne/mergepath/commit/${sha}
 Files:
 ${target_lines}
 ${deferred_note}
-Authoring-Agent: claude
+Authoring-Agent: ${authoring_agent}
 
 ## Self-Review
 - Correctness: mirrors mergepath@${short_sha} verbatim per .mergepath-sync.yml
@@ -1389,7 +1462,7 @@ Authoring-Agent: claude
 - Test coverage: relies on the consumer repo CI
 - Security: no new attack surface
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+${coauthor_trailer}
 EOF
 )"; then
     err "$consumer_name: git commit failed"
@@ -1498,7 +1571,7 @@ ${commit_subject}
 
 https://github.com/nathanjohnpayne/mergepath/commit/${sha}
 
-Authoring-Agent: claude
+Authoring-Agent: ${authoring_agent}
 
 ## Self-Review
 - Correctness: mirrors mergepath@${short_sha} verbatim per the upstream manifest. The change has already been reviewed in the upstream Mergepath PR.
@@ -1543,7 +1616,7 @@ EOF
 #   $4 branch            sync-all branch name (mergepath-sync/sync-all-<sha>)
 #   $5 canonical_targets newline-separated canonical paths
 #   $6 kit_targets       newline-separated kit paths (dir mirrors)
-#   $7 templated_list    comma-joined templated paths (deferred; display only)
+#   $7 templated_list    comma-joined templated paths to render
 #   $8 recreate_existing_pr_num  optional; close+delete just before push
 #
 # Returns 0 on success, non-zero on failure (caller increments
@@ -1558,6 +1631,9 @@ sync_all_open_pr() {
   local templated_list=$7     # comma-joined, display only
   local recreate_existing_pr_num=${8:-}
   local short_sha=${sha:0:7}
+  local authoring_agent coauthor_trailer
+  authoring_agent=$(sync_authoring_agent) || return 1
+  coauthor_trailer=$(sync_coauthor_trailer "$authoring_agent") || return 1
 
   local tmp_root=${TMPDIR:-/tmp}
   local workspace
@@ -1813,7 +1889,7 @@ ${kit_lines}
 Templated paths rendered (per-consumer facts applied):
 ${templated_lines}
 ${override_note}
-Authoring-Agent: claude
+Authoring-Agent: ${authoring_agent}
 
 ## Self-Review
 - Correctness: mirrors mergepath@${short_sha} HEAD state verbatim per .mergepath-sync.yml; .sync-overrides.yml honored per-consumer
@@ -1822,7 +1898,7 @@ Authoring-Agent: claude
 - Test coverage: relies on the consumer repo CI
 - Security: no new attack surface
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+${coauthor_trailer}
 EOF
 )"; then
     err "$consumer_name: git commit failed"
@@ -1898,7 +1974,7 @@ ${kit_lines}
 ## Templated paths rendered (per-consumer facts applied)
 ${templated_lines}
 ${override_note}
-Authoring-Agent: claude
+Authoring-Agent: ${authoring_agent}
 
 ## Self-Review
 - Correctness: mirrors mergepath@${short_sha} HEAD state verbatim per the manifest. Each path was already reviewed in its upstream PR.
@@ -1996,8 +2072,10 @@ sync_all_one_consumer() {
       fi
     fi
 
-    # Partition canonical + kit targets into synced vs. override-skipped.
-    local plan_canonical="" plan_kit="" plan_skipped=""
+    # Partition canonical + kit + templated targets into synced vs.
+    # override-skipped. Templated overrides are keyed on the consumer
+    # destination path, matching materialize_templated_targets.
+    local plan_canonical="" plan_kit="" plan_templated_list="" plan_skipped=""
     local p
     while IFS= read -r p; do
       [ -z "$p" ] && continue
@@ -2015,6 +2093,23 @@ sync_all_one_consumer() {
       fi
       plan_kit+="$p"$'\n'
     done <<< "$kit_targets"
+    while IFS= read -r p; do
+      [ -z "$p" ] && continue
+      local tpl_dest
+      tpl_dest=$(MERGEPATH_TPL_PATH="$p" yq -r '
+        env(MERGEPATH_TPL_PATH) as $p
+        | .paths[] | select(.path == $p) | (.dest // .path)
+      ' "$manifest")
+      if [ -n "$local_overrides" ] && override_should_skip_path "$local_overrides" "$tpl_dest"; then
+        plan_skipped+="      - $tpl_dest (templated, SKIPPED per .sync-overrides.yml: $OVERRIDE_SKIP_REASON)"$'\n'
+        continue
+      fi
+      if [ -z "$plan_templated_list" ]; then
+        plan_templated_list="$p"
+      else
+        plan_templated_list+=",$p"
+      fi
+    done <<< "$templated_targets"
 
     # Count non-empty lines. `grep -c .` exits 1 when there are zero
     # matches, which under `|| echo 0` would append a SECOND "0" and
@@ -2033,17 +2128,17 @@ sync_all_one_consumer() {
     fi
 
     # Zero-target guard — mirror sync_all_open_pr's live behavior. When
-    # the consumer's .sync-overrides.yml filters out every canonical +
-    # kit path, the live path skips the consumer without opening a PR;
-    # the dry-run plan must report it as skipped too, or it overstates
-    # the planned PR count.
-    if [ "$canonical_count" -eq 0 ] && [ "$kit_count" -eq 0 ]; then
+    # the consumer's .sync-overrides.yml filters out every canonical,
+    # kit, and templated path, the live path skips the consumer without
+    # opening a PR; the dry-run plan must report it as skipped too, or
+    # it overstates the planned PR count.
+    if [ "$canonical_count" -eq 0 ] && [ "$kit_count" -eq 0 ] && [ -z "$plan_templated_list" ]; then
       if [ -n "$plan_skipped" ]; then
-        printf "  ⊘ %s — all canonical+kit targets skipped per .sync-overrides.yml\n" \
+        printf "  ⊘ %s — all effective sync targets skipped per .sync-overrides.yml\n" \
           "$consumer_name"
         printf '%s' "$plan_skipped"
       else
-        printf "  ⊘ %s — no canonical+kit targets\n" "$consumer_name"
+        printf "  ⊘ %s — no canonical+kit/templated targets\n" "$consumer_name"
       fi
       SYNC_SKIPPED=$((SYNC_SKIPPED + 1))
       return 0
@@ -2066,8 +2161,8 @@ sync_all_one_consumer() {
     if [ -n "$plan_skipped" ]; then
       printf '%s' "$plan_skipped"
     fi
-    if [ -n "$templated_list" ]; then
-      printf "      (templated, rendered per consumer facts: %s)\n" "$templated_list"
+    if [ -n "$plan_templated_list" ]; then
+      printf "      (templated, rendered per consumer facts: %s)\n" "$plan_templated_list"
     fi
     SYNC_PR_OPENED=$((SYNC_PR_OPENED + 1))
     return 0

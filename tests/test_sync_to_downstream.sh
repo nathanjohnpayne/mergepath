@@ -153,6 +153,50 @@ filtered=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
 echo "$filtered" | grep -q "scripts/keep-in-sync.sh" \
   && fail "--paths filter should have excluded scripts/keep-in-sync.sh"
 
+# Audit honors .sync-overrides.yml on templated dest paths (#336).
+audit_override_workdir="$WORKDIR/audit-overrides"
+AO_MP="$audit_override_workdir/mergepath"
+AO_SIBLINGS="$audit_override_workdir/siblings"
+mkdir -p "$AO_MP/examples" "$AO_MP/scripts/sync" "$AO_MP/scripts/lib" "$AO_SIBLINGS/alpha" "$AO_SIBLINGS/beta"
+cp "$ROOT/scripts/sync/apply-overrides.sh" "$AO_MP/scripts/sync/apply-overrides.sh"
+cp "$ROOT/scripts/lib/manifest-fact-helpers.sh" "$AO_MP/scripts/lib/manifest-fact-helpers.sh"
+cp "$ROOT/scripts/lib/template-substitution.sh" "$AO_MP/scripts/lib/template-substitution.sh"
+cat >"$AO_MP/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - {name: alpha, repo: x/alpha}
+  - {name: beta,  repo: x/beta}
+paths:
+  - path: examples/eslint.config.cjs.js
+    source: examples/eslint.config.cjs.js
+    dest: eslint.config.js
+    type: templated
+    consumers: all
+YAML
+echo "module.exports = ['canonical'];" >"$AO_MP/examples/eslint.config.cjs.js"
+git init -q "$AO_MP"
+echo "module.exports = ['local'];" >"$AO_SIBLINGS/alpha/eslint.config.js"
+cat >"$AO_SIBLINGS/alpha/.sync-overrides.yml" <<'YAML'
+skip_paths:
+  - path: eslint.config.js
+    reason: alpha keeps a local eslint override
+YAML
+git init -q "$AO_SIBLINGS/alpha"
+echo "module.exports = ['local'];" >"$AO_SIBLINGS/beta/eslint.config.js"
+git init -q "$AO_SIBLINGS/beta"
+
+set +e
+audit_override_out=$(MERGEPATH_ROOT_OVERRIDE="$AO_MP" MERGEPATH_SIBLINGS_DIR="$AO_SIBLINGS" \
+  "$SCRIPT" --audit --no-clone 2>&1)
+audit_override_rc=$?
+set -e
+[ "$audit_override_rc" -eq 1 ] \
+  || fail "audit override fixture should still exit 1 because beta drifts; got $audit_override_rc ($audit_override_out)"
+echo "$audit_override_out" | grep -q "↷ eslint.config.js.*skipped per .sync-overrides.yml" \
+  || fail "audit should report alpha templated dest as override-skipped; output: $audit_override_out"
+[ "$(echo "$audit_override_out" | grep -c "✗ eslint.config.js")" -eq 1 ] \
+  || fail "audit should flag only beta's un-overridden templated drift; output: $audit_override_out"
+
 # ---------------------------------------------------------------------------
 # Missing-arg validation (CodeRabbit P-Minor on PR #215). Without the
 # guard, --repos / --paths with no value crashes under set -u.
@@ -417,6 +461,158 @@ if [ -n "$current_actor" ]; then
     && fail "actor override should bypass the guard; got: $override_out"
 fi
 
+# Agent-aware sync metadata (#392). Exercise the live path with a local
+# bare remote and a stub `gh` so commit + PR bodies are inspected.
+metadata_workdir="$WORKDIR/metadata"
+META_MP="$metadata_workdir/mergepath"
+META_FAKE_BIN="$metadata_workdir/bin"
+META_CAPTURE="$metadata_workdir/capture"
+mkdir -p "$META_MP/scripts/sync" "$META_MP/scripts/lib" "$META_MP/scripts" \
+         "$META_MP/.github" "$META_FAKE_BIN" "$META_CAPTURE"
+cp "$ROOT/scripts/sync/apply-overrides.sh" "$META_MP/scripts/sync/apply-overrides.sh"
+cp "$ROOT/scripts/lib/manifest-fact-helpers.sh" "$META_MP/scripts/lib/manifest-fact-helpers.sh"
+cat >"$META_MP/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - {name: alpha, repo: example/alpha}
+paths:
+  - {path: scripts/the-script.sh, type: canonical, consumers: all}
+YAML
+cat >"$META_MP/.github/review-policy.yml" <<'YAML'
+author_identity: nathanjohnpayne
+YAML
+echo "v1" >"$META_MP/scripts/the-script.sh"
+git -C "$META_MP" init -q
+git -C "$META_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$META_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m initial
+echo "v2" >"$META_MP/scripts/the-script.sh"
+git -C "$META_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$META_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "metadata bump"
+meta_sha=$(git -C "$META_MP" rev-parse HEAD)
+meta_branch="mergepath-sync/${meta_sha:0:7}"
+
+cat >"$META_FAKE_BIN/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-} ${2:-}" in
+  "config get")
+    printf '%s\n' "nathanjohnpayne"
+    ;;
+  "api "*)
+    # Existing-PR probe: no prior propagation PR.
+    exit 0
+    ;;
+  "repo clone")
+    dest=${4:?missing clone destination}
+    git clone -q "$MERGEPATH_TEST_REMOTE_ALPHA" "$dest"
+    git -C "$dest" config user.email t@t
+    git -C "$dest" config user.name t
+    git -C "$dest" config commit.gpgsign false
+    ;;
+  "pr create")
+    title=""
+    body=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --title) title=$2; shift 2 ;;
+        --body) body=$2; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf '%s\n' "$title" >"$MERGEPATH_TEST_CAPTURE_DIR/pr-title-${MERGEPATH_TEST_RUN}.txt"
+    printf '%s\n' "$body" >"$MERGEPATH_TEST_CAPTURE_DIR/pr-body-${MERGEPATH_TEST_RUN}.md"
+    printf 'https://github.com/example/alpha/pull/%s\n' "$MERGEPATH_TEST_RUN"
+    ;;
+  *)
+    echo "unexpected fake gh invocation: $*" >&2
+    exit 9
+    ;;
+esac
+SH
+chmod +x "$META_FAKE_BIN/gh"
+
+setup_metadata_remote() {
+  local remote=$1
+  local seed=$2
+  git init --bare -q "$remote"
+  git -C "$remote" symbolic-ref HEAD refs/heads/main
+  mkdir -p "$seed"
+  git init -q "$seed"
+  git -C "$seed" checkout -q -b main
+  echo "consumer" >"$seed/README.md"
+  git -C "$seed" -c user.email=t@t -c user.name=t add -A
+  git -C "$seed" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m initial
+  git -C "$seed" remote add origin "$remote"
+  git -C "$seed" push -q origin main
+}
+
+metadata_run_and_assert() {
+  local run_id=$1
+  local expected_agent=$2
+  local expected_trailer=$3
+  shift 3
+  local remote="$metadata_workdir/${run_id}.git"
+  local seed="$metadata_workdir/${run_id}-seed"
+  setup_metadata_remote "$remote" "$seed"
+  local out
+  set +e
+  out=$(env \
+    PATH="$META_FAKE_BIN:$PATH" \
+    MERGEPATH_ROOT_OVERRIDE="$META_MP" \
+    MERGEPATH_TEST_REMOTE_ALPHA="$remote" \
+    MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" \
+    MERGEPATH_TEST_RUN="$run_id" \
+    MERGEPATH_SYNC_ACTOR_OVERRIDE=nathanjohnpayne \
+    "$@" \
+    "$SCRIPT" "$meta_sha" --repos alpha 2>&1)
+  local rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "metadata sync $run_id failed with exit $rc; output: $out"
+  local commit_body pr_body
+  commit_body=$(git --git-dir="$remote" log -1 --format=%B "refs/heads/$meta_branch")
+  pr_body=$(cat "$META_CAPTURE/pr-body-${run_id}.md")
+  echo "$commit_body" | grep -q "Authoring-Agent: ${expected_agent}" \
+    || fail "metadata sync $run_id commit body missing Authoring-Agent: ${expected_agent}; body: $commit_body"
+  echo "$pr_body" | grep -q "Authoring-Agent: ${expected_agent}" \
+    || fail "metadata sync $run_id PR body missing Authoring-Agent: ${expected_agent}; body: $pr_body"
+  echo "$commit_body" | grep -qF "$expected_trailer" \
+    || fail "metadata sync $run_id commit body missing trailer '$expected_trailer'; body: $commit_body"
+}
+
+metadata_run_and_assert \
+  "claude" \
+  "claude" \
+  "Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+
+metadata_run_and_assert \
+  "codex" \
+  "codex" \
+  "Co-Authored-By: OpenAI Codex <noreply@openai.com>" \
+  MERGEPATH_AGENT=codex
+
+metadata_run_and_assert \
+  "cursor" \
+  "cursor" \
+  "Co-Authored-By: Cursor <noreply@cursor.com>" \
+  MERGEPATH_AGENT=cursor \
+
+set +e
+metadata_unknown_out=$(env \
+  PATH="$META_FAKE_BIN:$PATH" \
+  MERGEPATH_ROOT_OVERRIDE="$META_MP" \
+  MERGEPATH_TEST_REMOTE_ALPHA="$metadata_workdir/unused.git" \
+  MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" \
+  MERGEPATH_TEST_RUN="unknown-missing-trailer" \
+  MERGEPATH_SYNC_ACTOR_OVERRIDE=nathanjohnpayne \
+  MERGEPATH_SYNC_AUTHORING_AGENT=other \
+  "$SCRIPT" "$meta_sha" --repos alpha 2>&1)
+metadata_unknown_rc=$?
+set -e
+[ "$metadata_unknown_rc" -ne 0 ] \
+  || fail "unknown authoring agent without MERGEPATH_SYNC_COAUTHOR_TRAILER should fail closed"
+echo "$metadata_unknown_out" | grep -q "no built-in coauthor trailer" \
+  || fail "unknown authoring agent should explain missing trailer; got: $metadata_unknown_out"
+
 # ---------------------------------------------------------------------------
 # Mode-mirror correctness (cursor CHANGES_REQUESTED on PR #217).
 # Live copy should NOT only add +x; it must also CLEAR +x when the
@@ -650,11 +846,13 @@ consumers:
   - {name: beta,  repo: example/beta}
   - {name: gamma, repo: example/gamma}
   - {name: delta, repo: example/delta}
+  - {name: epsilon, repo: example/epsilon}
+  - {name: zeta, repo: example/zeta}
 paths:
   - {path: scripts/hooks/the-hook.sh,  type: canonical, consumers: all}
   - {path: scripts/coderabbit-wait.sh, type: canonical, consumers: all}
   - {path: scripts/ci/,                type: kit,       consumers: all}
-  - {path: AGENTS.md,                  type: templated, consumers: all}
+  - {path: AGENTS.md,                  type: templated, consumers: [alpha, beta, gamma, epsilon, zeta]}
 YAML
 echo "hook-v9"      >"$SA_MP/scripts/hooks/the-hook.sh"
 echo "wait-v9"      >"$SA_MP/scripts/coderabbit-wait.sh"
@@ -675,11 +873,13 @@ sa_short=${sa_head:0:7}
 # Sibling consumers on disk so the dry-run override probe (which reads
 # the LOCAL consumer worktree's .sync-overrides.yml) has something to
 # read. alpha + beta carry no overrides; gamma registers a skip.
-mkdir -p "$SA_SIBLINGS/alpha" "$SA_SIBLINGS/beta" "$SA_SIBLINGS/gamma" "$SA_SIBLINGS/delta"
+mkdir -p "$SA_SIBLINGS/alpha" "$SA_SIBLINGS/beta" "$SA_SIBLINGS/gamma" "$SA_SIBLINGS/delta" "$SA_SIBLINGS/epsilon" "$SA_SIBLINGS/zeta"
 git init -q "$SA_SIBLINGS/alpha"
 git init -q "$SA_SIBLINGS/beta"
 git init -q "$SA_SIBLINGS/gamma"
 git init -q "$SA_SIBLINGS/delta"
+git init -q "$SA_SIBLINGS/epsilon"
+git init -q "$SA_SIBLINGS/zeta"
 cat >"$SA_SIBLINGS/gamma/.sync-overrides.yml" <<'YAML'
 skip_paths:
   - path: scripts/coderabbit-wait.sh
@@ -697,22 +897,48 @@ skip_paths:
   - path: scripts/ci/
     reason: delta maintains a bespoke CI kit
 YAML
+# epsilon overrides every canonical + kit path too, but it still has a
+# templated target. Dry-run must mirror live mode and plan that PR
+# rather than treating the consumer as zero-target.
+cat >"$SA_SIBLINGS/epsilon/.sync-overrides.yml" <<'YAML'
+skip_paths:
+  - path: scripts/hooks/the-hook.sh
+    reason: epsilon vendors its own hook
+  - path: scripts/coderabbit-wait.sh
+    reason: epsilon vendors its own coderabbit-wait wrapper
+  - path: scripts/ci/
+    reason: epsilon maintains a bespoke CI kit
+YAML
+# zeta overrides every canonical + kit path and its templated dest, so
+# dry-run should skip it exactly like live mode would after rendering
+# nothing.
+cat >"$SA_SIBLINGS/zeta/.sync-overrides.yml" <<'YAML'
+skip_paths:
+  - path: scripts/hooks/the-hook.sh
+    reason: zeta vendors its own hook
+  - path: scripts/coderabbit-wait.sh
+    reason: zeta vendors its own coderabbit-wait wrapper
+  - path: scripts/ci/
+    reason: zeta maintains a bespoke CI kit
+  - path: AGENTS.md
+    reason: zeta owns its agent instructions locally
+YAML
 
 # 1) --sync-all --dry-run lists ALL canonical + kit paths for EVERY
-#    consumer (not just changed-at-a-commit ones). All 3 consumers
+#    consumer (not just changed-at-a-commit ones). All 4 planned consumers
 #    appear; both canonical paths + the kit path are planned.
 sa_out=$(MERGEPATH_ROOT_OVERRIDE="$SA_MP" MERGEPATH_SIBLINGS_DIR="$SA_SIBLINGS" \
   "$SCRIPT" --sync-all --dry-run 2>&1)
-[[ "$(echo "$sa_out" | grep -c 'would open PR')" -eq 3 ]] \
-  || fail "--sync-all --dry-run should plan one PR per consumer (3); got: $sa_out"
+[[ "$(echo "$sa_out" | grep -c 'would open PR')" -eq 4 ]] \
+  || fail "--sync-all --dry-run should plan one PR per non-zero-target consumer (4); got: $sa_out"
 echo "$sa_out" | grep -q "scripts/hooks/the-hook.sh (canonical)" \
   || fail "--sync-all plan missing canonical path scripts/hooks/the-hook.sh"
 echo "$sa_out" | grep -q "scripts/coderabbit-wait.sh (canonical)" \
   || fail "--sync-all plan missing canonical path scripts/coderabbit-wait.sh"
 echo "$sa_out" | grep -q "scripts/ci/ (kit, allow-extras)" \
   || fail "--sync-all plan missing kit path scripts/ci/"
-echo "$sa_out" | grep -q "deferred — templated" \
-  || fail "--sync-all plan should note templated paths as deferred"
+echo "$sa_out" | grep -q "templated, rendered per consumer facts" \
+  || fail "--sync-all plan should note templated paths are rendered per consumer facts"
 
 # 2) --sync-all honors .sync-overrides.yml. gamma registered a skip of
 #    scripts/coderabbit-wait.sh — that path MUST be absent from gamma's
@@ -740,21 +966,53 @@ echo "$alpha_block" | grep -q "+ scripts/coderabbit-wait.sh (canonical)" \
 echo "$alpha_block" | grep -q "SKIPPED per .sync-overrides.yml" \
   && fail "--sync-all marked a path skipped for alpha, which has no overrides; alpha block: $alpha_block"
 
-# 2b) Zero-target guard: delta overrides EVERY canonical + kit path, so
-#     the dry-run plan MUST report it as skipped (⊘) rather than as a
+# 2b) Zero-target guard: delta overrides EVERY canonical + kit path and
+#     has no templated target, so the dry-run plan MUST report it as
+#     skipped (⊘) rather than as a
 #     planned PR. A "would open PR" line for delta would overstate the
 #     planned PR count vs. live behavior (sync_all_open_pr skips a
 #     fully-overridden consumer without opening a PR).
-echo "$sa_out" | grep -q "⊘ delta — all canonical+kit targets skipped per .sync-overrides.yml" \
+echo "$sa_out" | grep -q "⊘ delta — all effective sync targets skipped per .sync-overrides.yml" \
   || fail "--sync-all dry-run should report fully-overridden delta as skipped; got: $sa_out"
 echo "$sa_out" | grep -qE "⤷ delta — would open PR" \
   && fail "--sync-all dry-run planned a PR for fully-overridden delta; should be skipped; got: $sa_out"
 # delta's overridden paths must still be surfaced as SKIPPED lines.
 echo "$sa_out" | grep -q "scripts/hooks/the-hook.sh (SKIPPED per .sync-overrides.yml" \
   || fail "--sync-all dry-run should surface delta's override-skipped paths; got: $sa_out"
-# The "would open PR" count is still 3 — delta is skipped, not planned.
-[[ "$(echo "$sa_out" | grep -c 'would open PR')" -eq 3 ]] \
-  || fail "--sync-all dry-run should still plan exactly 3 PRs (delta skipped); got: $sa_out"
+# The "would open PR" count is still 4 — delta is skipped, not planned.
+[[ "$(echo "$sa_out" | grep -c 'would open PR')" -eq 4 ]] \
+  || fail "--sync-all dry-run should still plan exactly 4 PRs (delta skipped); got: $sa_out"
+
+# 2c) Templated-only guard: epsilon also overrides every canonical +
+#     kit path, but it still has a templated target. Live mode opens a
+#     PR in that case, so dry-run must not take the zero-target skip.
+epsilon_block=$(echo "$sa_out" | awk '
+  /^epsilon \(/ { in_block=1; next }
+  /^[a-z].* \(/ && in_block { exit }
+  in_block { print }
+')
+echo "$epsilon_block" | grep -q "would open PR" \
+  || fail "--sync-all dry-run should plan a PR for templated-only epsilon; epsilon block: $epsilon_block"
+echo "$epsilon_block" | grep -q "0 canonical + 0 kit path(s)" \
+  || fail "--sync-all dry-run should show epsilon as templated-only; epsilon block: $epsilon_block"
+echo "$epsilon_block" | grep -q "templated, rendered per consumer facts: AGENTS.md" \
+  || fail "--sync-all dry-run should list epsilon's templated render; epsilon block: $epsilon_block"
+echo "$epsilon_block" | grep -q "scripts/hooks/the-hook.sh (SKIPPED per .sync-overrides.yml" \
+  || fail "--sync-all dry-run should still surface epsilon override-skipped paths; epsilon block: $epsilon_block"
+
+# 2d) Templated override guard: zeta's templated dest is also skipped,
+#     so a pre-override templated_list must not force a planned PR.
+zeta_block=$(echo "$sa_out" | awk '
+  /^zeta \(/ { in_block=1; next }
+  /^[a-z].* \(/ && in_block { exit }
+  in_block { print }
+')
+echo "$zeta_block" | grep -q "all effective sync targets skipped per .sync-overrides.yml" \
+  || fail "--sync-all dry-run should skip zeta when templated dest is overridden; zeta block: $zeta_block"
+echo "$zeta_block" | grep -q "AGENTS.md (templated, SKIPPED per .sync-overrides.yml" \
+  || fail "--sync-all dry-run should surface zeta's templated override; zeta block: $zeta_block"
+echo "$zeta_block" | grep -q "would open PR" \
+  && fail "--sync-all dry-run planned a PR for zeta despite all targets being overridden; zeta block: $zeta_block"
 
 # 3) --sync-all + --audit → exit 2 (mutex).
 set +e
