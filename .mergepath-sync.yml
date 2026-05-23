@@ -377,9 +377,12 @@ paths:
     consumers: all
   # Pairs with scripts/op-preflight.sh + scripts/lib/preflight-helpers.sh
   # + scripts/ci/check_op_preflight_contract. The check wrapper requires
-  # both test files; same coupling pattern as the gh-as-author and
-  # codex-p1-gate suites above. See #282.
+  # all three test files; same coupling pattern as the gh-as-author and
+  # codex-p1-gate suites above. See #282/#374.
   - path: tests/test_op_preflight_check.sh
+    type: canonical
+    consumers: all
+  - path: tests/test_op_preflight_token_mode.sh
     type: canonical
     consumers: all
   - path: tests/test_helper_autosource.sh

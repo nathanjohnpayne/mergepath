@@ -475,7 +475,7 @@ run_case \
 provision_preflight_cached_project_sa() {
   local case_dir="$1" bin_dir="$2" tmp_dir="$3" home_dir="$4" project="$5"
 
-  local preflight_sa_path="$tmp_dir/preflight-firebase-sa.json"
+  local preflight_sa_path="$tmp_dir/preflight-cached-project-sa.json"
   write_fake_sa_key "$preflight_sa_path" \
     "firebase-deployer@${project}.iam.gserviceaccount.com"
 
