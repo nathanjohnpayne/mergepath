@@ -127,6 +127,13 @@ DEDUPE_WINDOW_DAYS="${ROLLUP_DEDUPE_WINDOW_DAYS:-14}"
 # label scopes). The 14-day window already bounds expected volume;
 # this is belt-and-suspenders.
 MAX_PRIOR_ROLLUPS_PER_LABEL="${ROLLUP_MAX_PRIOR_ROLLUPS_PER_LABEL:-50}"
+# Body-size bound (#400). GitHub caps issue/comment bodies at 65536
+# bytes — the same cap that broke the weekly sweep (#397). Cap the
+# visible checklist to the N highest-severity findings; the remainder
+# re-surface on the next rollup as the visible ones get triaged. Paired
+# with the --body-file switch below (avoids the lower ARG_MAX ceiling
+# that --body hits first on a large body).
+ROLLUP_MAX_VISIBLE="${ROLLUP_MAX_VISIBLE:-60}"
 
 # Compute the window. Default: yesterday 00:00:00Z → today 00:00:00Z UTC.
 # BSD date (macOS) and GNU date have divergent flag syntax — try GNU first.
@@ -529,8 +536,12 @@ PRE_DEDUP_POLISH=$(wc -l < "$POLISH_NDJSON" | tr -d ' ')
 # out explicitly but is the natural read.)
 
 TRIAGED_IDS_FILE=$(mktemp "${TMPDIR:-/tmp}/rollup-triaged-XXXXXX.ids")
-# Extend the EXIT trap to clean this up too.
-trap 'rm -f "$SUBSTANTIVE_NDJSON" "$POLISH_NDJSON" "$TRIAGED_IDS_FILE"' EXIT
+# Rendered-body scratch file (#400): post_or_append writes the body here
+# and passes --body-file, instead of --body "$body" (which hits ARG_MAX
+# before the GitHub 65536 cap on a large body).
+BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/rollup-body-XXXXXX.md")
+# Extend the EXIT trap to clean these up too.
+trap 'rm -f "$SUBSTANTIVE_NDJSON" "$POLISH_NDJSON" "$TRIAGED_IDS_FILE" "$BODY_FILE"' EXIT
 
 # Compute the dedupe-window cutoff. We pass it to `gh issue list` as
 # `closed:>=YYYY-MM-DD` so the search server-side filters out stale
@@ -742,10 +753,28 @@ Triage markers (set on the checkbox below):
 
 INTRO
 
-  # Group by PR. NDJSON is naturally per-thread; awk gives us a
-  # quick group-by without re-parsing.
-  jq -s -r '
-    group_by(.pr_number)[] |
+  # Body-size bound (#400): show only the N highest-severity findings
+  # inline (GitHub caps bodies at 65536 bytes — the #397 failure mode).
+  # We sort all findings by severity (P0 first), take the top N, then
+  # group THOSE by PR for display. Truncated items are NOT lost: they
+  # carry no triage signal so the dedupe pass keeps re-surfacing them on
+  # subsequent rollups until they enter the visible set and get triaged.
+  # The visible-line format is byte-identical to before, so
+  # unchecked_count_on()'s `- [ ]` grep and the mp-id dedupe parsers in
+  # daily-feedback-rollup-helpers.sh still match.
+  local total
+  total=$(wc -l < "$f" | tr -d ' ')
+
+  jq -s -r --argjson max "$ROLLUP_MAX_VISIBLE" '
+    def sevrank:
+      (.severity // "Unknown") as $s |
+      if   $s == "P0"      then 0 elif $s == "P1"      then 1
+      elif $s == "P2"      then 2 elif $s == "Major"   then 3
+      elif $s == "Minor"   then 4 elif $s == "P3"      then 5
+      elif $s == "Nitpick" then 6 elif $s == "Trivial" then 7
+      else 8 end;
+    ( sort_by(sevrank * 1000000 + ((.pr_number | tonumber?) // 0)) | .[0:$max] )
+    | group_by(.pr_number)[] |
     "## " + .[0].repo + "#" + .[0].pr_number +
       " (merged " + (.[0].pr_merged_at // "n/a") + ", " +
       (.[0].pr_title | tostring) + ")\n" +
@@ -756,6 +785,11 @@ INTRO
       " <!-- mp-id:" + .item_id + " -->"
     ) | join("\n"))
   ' "$f"
+
+  if [ "$total" -gt "$ROLLUP_MAX_VISIBLE" ]; then
+    printf '\n> **+%s more finding(s) not shown** — showing the %s highest-severity of %s. The remainder re-surface on the next rollup as the shown items get triaged.\n' \
+      "$((total - ROLLUP_MAX_VISIBLE))" "$ROLLUP_MAX_VISIBLE" "$total"
+  fi
 
   cat <<FOOTER
 
@@ -878,8 +912,9 @@ post_or_append() {
   # `--dry-run` stays a pure read.
   ensure_label "$label" "$track"
 
-  local body
-  body=$(render_rollup_body "$ndjson_file" "$track")
+  # Render to a file and post via --body-file (#400): --body "$body"
+  # caps out at ARG_MAX on a large rollup, below GitHub's 65536 limit.
+  render_rollup_body "$ndjson_file" "$track" > "$BODY_FILE"
 
   local existing=""
   # No `|| true` here: most_recent_open_rollup now fails-closed (exit 2)
@@ -892,14 +927,13 @@ post_or_append() {
     unchecked=$(unchecked_count_on "$existing")
     if [ "$unchecked" -ge "$throttle" ]; then
       echo "daily-feedback-rollup: $track — appending to existing #$existing ($unchecked unchecked ≥ throttle $throttle)" >&2
-      # shellcheck disable=SC2016
-      gh issue comment "$existing" --repo "$REPO" --body "$body" >&2
+      gh issue comment "$existing" --repo "$REPO" --body-file "$BODY_FILE" >&2
       return 0
     fi
   fi
 
   echo "daily-feedback-rollup: $track — creating new issue '$title'" >&2
-  gh issue create --repo "$REPO" --title "$title" --label "$label" --body "$body"
+  gh issue create --repo "$REPO" --title "$title" --label "$label" --body-file "$BODY_FILE"
 }
 
 post_or_append "$SUBSTANTIVE_NDJSON" "substantive" "$SUBSTANTIVE_LABEL" \

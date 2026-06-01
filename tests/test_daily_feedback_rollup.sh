@@ -351,6 +351,66 @@ assert_all_ids "$body_all2" "ddd444aaaaaa" "closed-host: duplicate mp-ids de-dup
 assert_all_ids "no markers here at all" "" "closed-host: no markers → empty"
 
 # ---------------------------------------------------------------------
+# render_rollup_body body-size bound (#400). Extract the real function
+# from the script (reads actual source — no drift) and exercise it with
+# a large synthetic NDJSON. Assert the rendered body stays under
+# GitHub's 65536-byte cap, the visible checklist is capped, the "+N more"
+# footer fires, P0s survive (severity-major), and the line format still
+# matches unchecked_count_on()'s `- [ ]` grep.
+# ---------------------------------------------------------------------
+SCRIPT="$ROOT/scripts/daily-feedback-rollup.sh"
+eval "$(sed -n '/^render_rollup_body()/,/^}/p' "$SCRIPT")"
+
+DATE_STAMP="2026-06-01"; ROLLUP_MAX_VISIBLE=60
+SINCE="2026-05-31T00:00:00Z"; UNTIL="2026-06-01T00:00:00Z"; pr_count=4
+COUNT_FIX=0; COUNT_REPLY=0; COUNT_STALE=0; COUNT_TAGGED_SKIP=0
+COUNT_TAGGED_SURFACE=0; COUNT_DEFERRED_UNTAGGED=200; COUNT_DEDUP_SKIPPED=0
+DEDUPE_WINDOW_DAYS=14; DEDUP_CUTOFF="2026-05-18"
+
+BIG_RB="$(mktemp "${TMPDIR:-/tmp}/rb-big-XXXXXX.ndjson")"
+RB_OUT="$(mktemp "${TMPDIR:-/tmp}/rb-out-XXXXXX.md")"
+rbi=0
+while [ "$rbi" -lt 200 ]; do
+  rbsev=$(printf 'P0 P1 P2 Major Minor' | tr ' ' '\n' | sed -n "$(((rbi % 5) + 1))p")
+  jq -nc --arg repo "owner/repo$((rbi % 4))" --arg pr "$(( (rbi % 4) + 100 ))" \
+    --arg tp "scripts/file$rbi.sh" --arg tl "$rbi" --arg sev "$rbsev" \
+    --arg id "$(printf 'abc%09x' "$rbi")" \
+    '{repo:$repo, pr_number:$pr, pr_title:("PR "+$pr), pr_merged_at:"2026-05-31T12:00:00Z",
+      thread_path:$tp, thread_line:$tl,
+      thread_url:("https://github.com/"+$repo+"/pull/"+$pr+"#discussion_r"+$tl),
+      author:"chatgpt-codex-connector[bot]", severity:$sev, tag_note:"deferred-untagged",
+      body_excerpt:"A representative ~150-char excerpt mirroring real bot feedback so the rendered checklist line reflects realistic per-finding size in the body ok done now yes",
+      item_id:$id}' >> "$BIG_RB"
+  rbi=$((rbi + 1))
+done
+
+render_rollup_body "$BIG_RB" "substantive" > "$RB_OUT"
+RB_BYTES=$(wc -c < "$RB_OUT" | tr -d ' ')
+RB_VISIBLE=$(grep -cE '^[[:space:]]*-[[:space:]]*\[[[:space:]]*\][[:space:]]' "$RB_OUT" || true)
+
+if [ "$RB_BYTES" -le 65536 ]; then
+  pass "render_rollup_body: 200-finding body within 65536-byte cap ($RB_BYTES B)"
+else
+  fail "render_rollup_body: body $RB_BYTES B exceeds 65536 — bound regression"
+fi
+if [ "$RB_VISIBLE" -le 60 ] && [ "$RB_VISIBLE" -gt 0 ]; then
+  pass "render_rollup_body: visible checklist capped ($RB_VISIBLE shown; unchecked_count_on regex matches)"
+else
+  fail "render_rollup_body: visible count $RB_VISIBLE (expected 1..60)"
+fi
+if grep -q 'more finding(s) not shown' "$RB_OUT"; then
+  pass "render_rollup_body: '+N more' footer present on truncation"
+else
+  fail "render_rollup_body: truncation footer missing"
+fi
+if grep -q ' P0 \[' "$RB_OUT"; then
+  pass "render_rollup_body: P0 findings survive into the shown set (severity-major)"
+else
+  fail "render_rollup_body: no P0 in shown set — severity ordering broken"
+fi
+rm -f "$BIG_RB" "$RB_OUT"
+
+# ---------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------
 
