@@ -447,35 +447,39 @@ TRIGGER_POST_TIME=""
 if has_cleared_signal "$INITIAL_SCAN"; then
   log "Codex has already cleared on HEAD (reaction or no-P0/P1 review) — skipping trigger comment"
 else
-  # Identity check (#284): `gh pr comment` is a keyring-byline write
-  # — fail closed BEFORE posting if the keyring drifted from the
-  # agent's reviewer identity. Opt-out via
-  # CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK=1 for test harnesses.
-  #
-  # r3 (#284): fail CLOSED if the helper is missing or non-executable.
-  # The previous shape ANDed the opt-out and `[ -x "$CHECKER" ]` so a
-  # rename / delete / chmod -x silently skipped the gate. Helper
-  # presence is now a hard error inside the opt-out branch.
-  if [ "${CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
-    CHECKER="$(dirname "${BASH_SOURCE[0]}")/identity-check.sh"
-    if [ ! -x "$CHECKER" ]; then
-      echo "ERROR: identity-check helper missing or non-executable: $CHECKER" >&2
-      echo "       Refusing to post '@codex review' without identity verification." >&2
+  # The Codex GitHub App ONLY monitors '@codex review' comments authored
+  # by the repo's AUTHOR/human identity (nathanjohnpayne). A trigger
+  # posted by a reviewer/bot identity (nathanpayne-claude/-codex/-cursor)
+  # is silently ignored: empirically a reviewer-posted trigger sat
+  # unanswered to the full 600s timeout while an author-posted one drew a
+  # Codex review in ~20s (PR #405). `gh pr comment` is a keyring-byline
+  # write, so post it through gh-as-author.sh, which switches the keyring
+  # to nathanjohnpayne for the write (verifying the switch landed) and
+  # restores the prior active account on exit. This SUPERSEDES the #284
+  # `identity-check --expect-reviewer` guard, which fail-closed on the
+  # WRONG identity for this particular write. Opt out via
+  # CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK=1 for test harnesses that
+  # PATH-shim gh (the stub records argv; no real keyring switch).
+  log "posting '@codex review' trigger comment (as author identity nathanjohnpayne)"
+  if [ "${CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK:-0}" = "1" ]; then
+    POST_OUTPUT=$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
+      || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
+  else
+    AS_AUTHOR="$(dirname "${BASH_SOURCE[0]}")/gh-as-author.sh"
+    if [ ! -x "$AS_AUTHOR" ]; then
+      echo "ERROR: gh-as-author.sh helper missing or non-executable: $AS_AUTHOR" >&2
+      echo "       Refusing to post '@codex review' without author-identity attribution" >&2
+      echo "       (Codex ignores reviewer/bot-authored triggers — see comment above)." >&2
       echo "       Restore the helper, or opt out via" >&2
       echo "       CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK=1 (dev only)." >&2
-      die 3 "identity-check helper unavailable"
+      die 3 "gh-as-author.sh helper unavailable"
     fi
-    "$CHECKER" --expect-reviewer \
-      || die 3 "identity-check failed before posting '@codex review'; see stderr above."
+    # Capture stdout+stderr so a failure surfaces the real gh error
+    # (404 / 403 / 422) rather than a bare "failed to post". The comment
+    # URL gh prints on success is still extractable downstream.
+    POST_OUTPUT=$("$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
+      || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
   fi
-  log "posting '@codex review' trigger comment"
-  # Capture stderr (and stdout) into a diagnostic variable so a failure
-  # here surfaces the actual gh error — e.g. "404" from a nonexistent
-  # PR, "403" from a token without comment scope, or "422" from a closed
-  # PR — rather than a bare "failed to post". CodeRabbit non-blocking
-  # note on PR #64.
-  POST_OUTPUT=$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
-    || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
   TRIGGER_POSTED=true
   # Capture the post time so the poll loop can ignore stale signals
   # that were already on HEAD before the trigger fired. Without this,

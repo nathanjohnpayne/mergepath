@@ -85,19 +85,30 @@ if [ "${MERGEPATH_RUN_INTEGRATION:-0}" != "1" ]; then
 fi
 
 # mergepath-specific gate (#398). This is an integration test for
-# mergepath's OWN scripts/firebase/op-firebase-deploy, which is NOT in
-# .mergepath-sync.yml (mergepath-canonical, never propagated). The
-# scripts/ci/ KIT does propagate, so this check ships to consumers — but
-# downstream it would FAIL under MERGEPATH_RUN_INTEGRATION=1 against a
-# consumer's own/stale deploy script (the #398 / Codex P2 on
-# tadlockpsychiatry#68). Gate on the propagation manifest, which exists
-# ONLY in the canonical mergepath repo (consumers are propagation
-# targets and never carry it), so the check SKIPs cleanly downstream
-# while still running — and catching a real regression — in mergepath.
-if [ ! -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
-  echo "check_op_firebase_deploy_integration: SKIPPED — not the canonical mergepath repo (.mergepath-sync.yml absent); this integration check exercises mergepath-only scripts/firebase/op-firebase-deploy."
-  exit 0
+# mergepath's OWN scripts/firebase/op-firebase-deploy, which is NOT
+# propagated (mergepath-canonical). The scripts/ci/ KIT does propagate,
+# so this check ships to consumers — but downstream it would FAIL under
+# MERGEPATH_RUN_INTEGRATION=1 against a consumer's own/stale deploy
+# script (the #398 / Codex P2 on tadlockpsychiatry#68). Identify the
+# canonical repo by its SLUG, not a file marker: a bootstrap-mirrored
+# consumer can transiently carry copied files (Codex P2 on #405), but a
+# consumer/bootstrapped repo is always named after the consumer, never
+# 'mergepath', so the slug can't be spoofed by a copied file. In CI
+# GITHUB_REPOSITORY is authoritative; locally fall back to the origin
+# remote. If neither resolves (no remote / no env) we SKIP — the safe
+# default for a mergepath-only check we can't confirm we're running in.
+REPO_SLUG="${GITHUB_REPOSITORY:-}"
+if [ -z "$REPO_SLUG" ]; then
+  REPO_SLUG=$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null \
+    | sed -E 's#(\.git)?$##; s#.*[:/]##')
 fi
+case "$REPO_SLUG" in
+  mergepath | */mergepath) ;;  # canonical mergepath (or a fork of it) — run
+  *)
+    echo "check_op_firebase_deploy_integration: SKIPPED — repo '${REPO_SLUG:-unknown}' is not canonical mergepath; this integration check exercises mergepath-only scripts/firebase/op-firebase-deploy."
+    exit 0
+    ;;
+esac
 
 DEPLOY_SCRIPT="$REPO_ROOT/scripts/firebase/op-firebase-deploy"
 if [ ! -x "$DEPLOY_SCRIPT" ]; then
