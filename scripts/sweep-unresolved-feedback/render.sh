@@ -104,6 +104,21 @@ _hash() {
 TARGET_REPO="${SWEEP_TARGET_REPO:-nathanjohnpayne/mergepath}"
 TITLE_PREFIX="${SWEEP_ROLLUP_TITLE:-Unresolved reviewer feedback backlog}"
 
+# Body-size bounding knobs (#397). GitHub caps issue/comment bodies at
+# 65536 bytes; a large unresolved-feedback backlog (693 findings on the
+# 2026-06-01 run) blew past it because the old render emitted every
+# finding inline. We now bound the VISIBLE findings to a hard global
+# budget and keep the full set in the workflow's NDJSON artifact + the
+# hidden thread-id marker block (which is itself compacted, below).
+#   MAX_VISIBLE      hard cap on visible finding lines across the whole
+#                    Findings section (and across the delta comment).
+#   EXCERPT_LEN      max chars of body_excerpt per visible line.
+#   PER_REPO_VISIBLE soft per-(severity,repo) cap so one noisy bucket
+#                    cannot consume the whole global budget.
+MAX_VISIBLE="${SWEEP_MAX_VISIBLE:-60}"
+EXCERPT_LEN="${SWEEP_EXCERPT_LEN:-120}"
+PER_REPO_VISIBLE="${SWEEP_PER_REPO_VISIBLE:-8}"
+
 if [ -n "${SWEEP_TODAY:-}" ]; then
   TODAY="$SWEEP_TODAY"
 else
@@ -152,11 +167,89 @@ fi
 CONTENT_HASH=$(_hash < "$SORTED_IDS")
 echo "render: content hash = $CONTENT_HASH" >&2
 
-# Render the body. Sections grouped by repo, ordered by repo name; per
-# repo, items grouped by severity (P0, P1, P2, P3, Unknown).
+# ---------------------------------------------------------------------------
+# Build the bounded "## Findings" section into a file (#397). Ordered
+# severity-major (P0,P1,P2,P3,Unknown) so the most important findings are
+# emitted first and are never the ones truncated; within a severity,
+# repos by descending count. A global visible-line budget (MAX_VISIBLE)
+# bounds the rendered bytes regardless of total finding count N — the
+# complete set always lives in the NDJSON workflow artifact and the
+# hidden thread-id marker block. Built in a file (not a pipe) so the
+# REMAINING/SHOWN_TOTAL counters survive (a piped `while` subshells them
+# away under bash 3.2).
+# ---------------------------------------------------------------------------
+FINDINGS_MD="$WORKDIR/findings.md"
+: > "$FINDINGS_MD"
+if [ "$LINE_COUNT" -gt 0 ]; then
+  # Ordered bucket list: "<sev>\t<count>\t<repo>".
+  BUCKETS="$WORKDIR/buckets.txt"
+  : > "$BUCKETS"
+  for sev in P0 P1 P2 P3 Unknown; do
+    jq -r --arg s "$sev" 'select(.severity == $s) | .repo' "$NDJSON" \
+      | sort | uniq -c | sort -k1,1nr -k2,2 \
+      | while read -r c r; do
+          [ -n "$r" ] && printf '%s\t%s\t%s\n' "$sev" "$c" "$r"
+        done >> "$BUCKETS"
+  done
+
+  {
+    echo "## Findings"
+    echo ""
+    # Headline per-severity totals so the reader sees the full shape even
+    # when individual buckets are truncated.
+    printf 'Severity totals — '
+    sev_first=1
+    for sev in P0 P1 P2 P3 Unknown; do
+      sc=$(jq -r --arg s "$sev" 'select(.severity == $s) | .thread_id' "$NDJSON" | wc -l | tr -d ' ')
+      [ "$sev_first" -eq 1 ] || printf ' · '
+      printf '%s: %s' "$sev" "$sc"
+      sev_first=0
+    done
+    printf '  (showing at most %s items inline; full list in the workflow artifact)\n' "$MAX_VISIBLE"
+    echo ""
+
+    REMAINING="$MAX_VISIBLE"
+    SHOWN_TOTAL=0
+    while IFS="$(printf '\t')" read -r sev bucket_count repo; do
+      [ -z "$repo" ] && continue
+      [ "$REMAINING" -le 0 ] && break
+      show="$bucket_count"
+      [ "$show" -gt "$PER_REPO_VISIBLE" ] && show="$PER_REPO_VISIBLE"
+      [ "$show" -gt "$REMAINING" ] && show="$REMAINING"
+      echo "<details>"
+      echo "<summary>$sev — $repo ($bucket_count, showing $show)</summary>"
+      echo ""
+      # Write to a file then `head` the file — piping `jq | head` would
+      # SIGPIPE jq when head closes early, and `set -o pipefail` + `set -e`
+      # would abort the whole render (the #397-adjacent footgun).
+      jq -r --arg r "$repo" --arg s "$sev" --argjson len "$EXCERPT_LEN" '
+        select(.repo == $r and .severity == $s)
+        | "- [#\(.pr_number) · \((.pr_title // "(no title)")[0:80])](\(.thread_url)) — `\(.author_login)`: \((.body_excerpt // "")[0:$len])"
+      ' "$NDJSON" > "$WORKDIR/bucket-lines.txt"
+      head -n "$show" "$WORKDIR/bucket-lines.txt"
+      if [ "$bucket_count" -gt "$show" ]; then
+        printf -- '- _+%s more in this group — full list in the workflow artifact._\n' "$((bucket_count - show))"
+      fi
+      echo ""
+      echo "</details>"
+      echo ""
+      REMAINING=$((REMAINING - show))
+      SHOWN_TOTAL=$((SHOWN_TOTAL + show))
+    done < "$BUCKETS"
+
+    if [ "$SHOWN_TOTAL" -lt "$LINE_COUNT" ]; then
+      printf '> **+%s more findings not shown above.** Full enumeration (all %s threads, every severity) is in the workflow artifact **sweep-findings-%s** (NDJSON, see #236).\n' \
+        "$((LINE_COUNT - SHOWN_TOTAL))" "$LINE_COUNT" "${GITHUB_RUN_ID:-<run>}"
+      echo ""
+    fi
+  } > "$FINDINGS_MD"
+fi
+
+# Render the body. Per-repo aggregate counts, then the bounded Findings
+# section assembled above.
 BODY="$WORKDIR/body.md"
 {
-  echo "<!-- sweep-unresolved-feedback v1 -->"
+  echo "<!-- sweep-unresolved-feedback v2 -->"
   echo "<!-- content-hash: $CONTENT_HASH -->"
   echo "<!-- last-run: $TODAY -->"
   echo ""
@@ -184,30 +277,7 @@ BODY="$WORKDIR/body.md"
     done
     echo ""
 
-    echo "## Findings"
-    echo ""
-    jq -r '.repo' "$NDJSON" | sort -u | while IFS= read -r repo; do
-      [ -z "$repo" ] && continue
-      echo "### $repo"
-      echo ""
-      for sev in P0 P1 P2 P3 Unknown; do
-        count=$(jq -r --arg r "$repo" --arg s "$sev" '
-          select(.repo == $r and .severity == $s) | .thread_id
-        ' "$NDJSON" | wc -l | tr -d ' ')
-        if [ "$count" -gt 0 ]; then
-          echo "<details>"
-          echo "<summary>$sev ($count)</summary>"
-          echo ""
-          jq -r --arg r "$repo" --arg s "$sev" '
-            select(.repo == $r and .severity == $s)
-            | "- [#\(.pr_number) · \(.pr_title // "(no title)")](\(.thread_url)) — `\(.author_login)`: \(.body_excerpt)"
-          ' "$NDJSON"
-          echo ""
-          echo "</details>"
-          echo ""
-        fi
-      done
-    done
+    cat "$FINDINGS_MD"
   fi
 } > "$BODY"
 
@@ -223,15 +293,33 @@ BODY="$WORKDIR/body.md"
   cat "$BODY"
   echo ""
   echo "<!-- thread-ids-begin -->"
+  # Compact, chunked encoding (#397): ids are space-joined, ~40 per
+  # comment line, instead of one comment per id. This block is the
+  # load-bearing delta/idempotency state and MUST carry the COMPLETE id
+  # set (dropping any reintroduces the #254 regression where every
+  # dropped thread reappears as "new"), but at ~38 B/id the old per-line
+  # form became a second body-size ceiling. The compact form is ~13 B/id
+  # (~3x headroom). The reader below accepts BOTH this and the legacy v1
+  # per-line form, so a body written by the old script stays
+  # delta-diffable on the first v2 run.
   if [ -s "$SORTED_IDS" ]; then
-    while IFS= read -r tid; do
-      [ -z "$tid" ] && continue
-      printf '<!-- %s -->\n' "$tid"
-    done < "$SORTED_IDS"
+    awk 'NF {
+      buf = (buf == "" ? $0 : buf " " $0); c++
+      if (c == 40) { print "<!-- thread-ids-chunk: " buf " -->"; buf = ""; c = 0 }
+    } END { if (buf != "") print "<!-- thread-ids-chunk: " buf " -->" }' "$SORTED_IDS"
   fi
   echo "<!-- thread-ids-end -->"
 } > "$BODY.with-marker"
 mv "$BODY.with-marker" "$BODY"
+
+# Body-size safety net (#397). Bounded Findings + compact marker keep the
+# body well under GitHub's 65536-byte cap for any realistic backlog; warn
+# loudly if a pathological N still approaches it rather than failing
+# opaquely at gh create/edit time.
+BODY_BYTES=$(wc -c < "$BODY" | tr -d ' ')
+if [ "$BODY_BYTES" -gt 65000 ]; then
+  echo "render: WARNING body is ${BODY_BYTES} bytes, approaching GitHub's 65536-byte cap (findings=$LINE_COUNT). Lower SWEEP_MAX_VISIBLE or investigate the marker block." >&2
+fi
 
 # ---------------------------------------------------------------------------
 # Dry-run short-circuit. Print the body and exit. Tests use this.
@@ -286,14 +374,29 @@ if [ -n "$PRIOR_HASH" ] && [ "$PRIOR_HASH" = "$CONTENT_HASH" ]; then
   exit 0
 fi
 
-# Delta detection: extract the prior sorted thread-id list from a
-# hidden marker block in the body (we write it on every update).
+# Delta detection: extract the prior sorted thread-id list from the
+# hidden marker block. Accepts BOTH the v2 compact chunk form
+# (`<!-- thread-ids-chunk: id1 id2 ... -->`) and the legacy v1 per-line
+# form (`<!-- <id> -->`), so a body written by the old script is still
+# delta-diffable on the first v2 run (#397).
 PRIOR_IDS="$WORKDIR/prior-ids.txt"
 printf '%s' "$PRIOR_BODY" | awk '
   /<!-- thread-ids-begin -->/ { capture=1; next }
   /<!-- thread-ids-end -->/   { capture=0 }
-  capture==1                  { print }
-' | sed -E 's/^<!-- //; s/ -->$//' | sort -u > "$PRIOR_IDS" || true
+  capture==1 {
+    line = $0
+    if (line ~ /thread-ids-chunk:/) {
+      sub(/.*thread-ids-chunk:[[:space:]]*/, "", line)
+      sub(/[[:space:]]*-->.*/, "", line)
+      n = split(line, ids, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) if (ids[i] != "") print ids[i]
+    } else {
+      sub(/^<!--[[:space:]]*/, "", line)
+      sub(/[[:space:]]*-->.*/, "", line)
+      if (line != "") print line
+    }
+  }
+' | sort -u > "$PRIOR_IDS" || true
 
 NEW_IDS="$WORKDIR/new-ids.txt"
 comm -23 "$SORTED_IDS" "$PRIOR_IDS" > "$NEW_IDS" 2>/dev/null || true
@@ -328,13 +431,23 @@ if [ "$NEW_COUNT" -gt 0 ]; then
     echo ""
     echo "### New items"
     echo ""
+    # Bound the comment to MAX_VISIBLE lines with truncated excerpts so a
+    # large new-item batch can't exceed GitHub's 65536-byte comment cap
+    # (#397). The full set is always in the workflow artifact.
+    shown=0
     while IFS= read -r tid; do
       [ -z "$tid" ] && continue
-      jq -r --arg t "$tid" '
+      [ "$shown" -ge "$MAX_VISIBLE" ] && break
+      jq -r --arg t "$tid" --argjson len "$EXCERPT_LEN" '
         select(.thread_id == $t)
-        | "- **\(.repo) #\(.pr_number)** · `\(.severity)` · [\(.pr_title // "(no title)")](\(.thread_url)) — `\(.author_login)`: \(.body_excerpt)"
+        | "- **\(.repo) #\(.pr_number)** · `\(.severity)` · [\((.pr_title // "(no title)")[0:80])](\(.thread_url)) — `\(.author_login)`: \((.body_excerpt // "")[0:$len])"
       ' "$NDJSON"
+      shown=$((shown + 1))
     done < "$NEW_IDS"
+    if [ "$NEW_COUNT" -gt "$MAX_VISIBLE" ]; then
+      printf '\n> **+%s more new items not shown above.** Full enumeration is in the workflow artifact **sweep-findings-%s** (NDJSON, see #236).\n' \
+        "$((NEW_COUNT - MAX_VISIBLE))" "${GITHUB_RUN_ID:-<run>}"
+    fi
   } > "$COMMENT"
 
   if ! gh issue comment "$EXISTING_NUMBER" \
