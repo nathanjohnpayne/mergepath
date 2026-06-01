@@ -351,63 +351,115 @@ assert_all_ids "$body_all2" "ddd444aaaaaa" "closed-host: duplicate mp-ids de-dup
 assert_all_ids "no markers here at all" "" "closed-host: no markers → empty"
 
 # ---------------------------------------------------------------------
-# render_rollup_body body-size bound (#400). Extract the real function
-# from the script (reads actual source — no drift) and exercise it with
-# a large synthetic NDJSON. Assert the rendered body stays under
-# GitHub's 65536-byte cap, the visible checklist is capped, the "+N more"
-# footer fires, P0s survive (severity-major), and the line format still
-# matches unchecked_count_on()'s `- [ ]` grep.
+# render_rollup_body NO-SILENT-LOSS (#400 / #401). The daily window is
+# per-day, so a finding not in the issue BODY is lost once the window
+# advances. Extract the real function (reads actual source — no drift)
+# and assert: EVERY finding's mp-id lands in the body (no cap-drop), the
+# dedupe parsers read them all (and read none as triaged), overflow
+# degrades rich->stub to stay under budget, and an unfittable backlog
+# FAILS LOUD (return 2) instead of dropping.
 # ---------------------------------------------------------------------
 SCRIPT="$ROOT/scripts/daily-feedback-rollup.sh"
 eval "$(sed -n '/^render_rollup_body()/,/^}/p' "$SCRIPT")"
+if type render_rollup_body >/dev/null 2>&1; then
+  pass "render_rollup_body: extracted from source (no factored helper broke the slice)"
+else
+  fail "render_rollup_body: sed extraction failed — function undefined"
+fi
 
-DATE_STAMP="2026-06-01"; ROLLUP_MAX_VISIBLE=60
+DATE_STAMP="2026-06-01"; ROLLUP_MAX_VISIBLE=60; ROLLUP_BODY_BUDGET=64000
 SINCE="2026-05-31T00:00:00Z"; UNTIL="2026-06-01T00:00:00Z"; pr_count=4
 COUNT_FIX=0; COUNT_REPLY=0; COUNT_STALE=0; COUNT_TAGGED_SKIP=0
 COUNT_TAGGED_SURFACE=0; COUNT_DEFERRED_UNTAGGED=200; COUNT_DEDUP_SKIPPED=0
 DEDUPE_WINDOW_DAYS=14; DEDUP_CUTOFF="2026-05-18"
 
+gen_findings() {  # $1 = count → NDJSON on stdout
+  local n="$1" i=0 sev
+  while [ "$i" -lt "$n" ]; do
+    sev=$(printf 'P0 P1 P2 Major Minor' | tr ' ' '\n' | sed -n "$(((i % 5) + 1))p")
+    jq -nc --arg repo "owner/repo$((i % 4))" --arg pr "$(( (i % 4) + 100 ))" \
+      --arg tp "scripts/file$i.sh" --arg tl "$i" --arg sev "$sev" \
+      --arg id "$(printf 'abc%09x' "$i")" \
+      '{repo:$repo, pr_number:$pr, pr_title:("PR "+$pr), pr_merged_at:"2026-05-31T12:00:00Z",
+        thread_path:$tp, thread_line:$tl,
+        thread_url:("https://github.com/"+$repo+"/pull/"+$pr+"#discussion_r"+$tl),
+        author:"chatgpt-codex-connector[bot]", severity:$sev, tag_note:"deferred-untagged",
+        body_excerpt:"A representative ~150-char excerpt mirroring real bot feedback so the rendered checklist line reflects realistic per-finding size in the body ok done now yes",
+        item_id:$id}'
+    i=$((i + 1))
+  done
+}
+
 BIG_RB="$(mktemp "${TMPDIR:-/tmp}/rb-big-XXXXXX.ndjson")"
 RB_OUT="$(mktemp "${TMPDIR:-/tmp}/rb-out-XXXXXX.md")"
-rbi=0
-while [ "$rbi" -lt 200 ]; do
-  rbsev=$(printf 'P0 P1 P2 Major Minor' | tr ' ' '\n' | sed -n "$(((rbi % 5) + 1))p")
-  jq -nc --arg repo "owner/repo$((rbi % 4))" --arg pr "$(( (rbi % 4) + 100 ))" \
-    --arg tp "scripts/file$rbi.sh" --arg tl "$rbi" --arg sev "$rbsev" \
-    --arg id "$(printf 'abc%09x' "$rbi")" \
-    '{repo:$repo, pr_number:$pr, pr_title:("PR "+$pr), pr_merged_at:"2026-05-31T12:00:00Z",
-      thread_path:$tp, thread_line:$tl,
-      thread_url:("https://github.com/"+$repo+"/pull/"+$pr+"#discussion_r"+$tl),
-      author:"chatgpt-codex-connector[bot]", severity:$sev, tag_note:"deferred-untagged",
-      body_excerpt:"A representative ~150-char excerpt mirroring real bot feedback so the rendered checklist line reflects realistic per-finding size in the body ok done now yes",
-      item_id:$id}' >> "$BIG_RB"
-  rbi=$((rbi + 1))
-done
+gen_findings 200 > "$BIG_RB"
 
+# --- 1) Rich mode (default budget): no loss + within cap ---
 render_rollup_body "$BIG_RB" "substantive" > "$RB_OUT"
 RB_BYTES=$(wc -c < "$RB_OUT" | tr -d ' ')
-RB_VISIBLE=$(grep -cE '^[[:space:]]*-[[:space:]]*\[[[:space:]]*\][[:space:]]' "$RB_OUT" || true)
+RB_MPIDS=$(grep -oE '<!-- *mp-id:[a-f0-9]+ *-->' "$RB_OUT" | sort -u | wc -l | tr -d ' ')
 
-if [ "$RB_BYTES" -le 65536 ]; then
+if [ "$RB_BYTES" -le 65536 ] && [ "$RB_BYTES" -gt 0 ]; then
   pass "render_rollup_body: 200-finding body within 65536-byte cap ($RB_BYTES B)"
 else
-  fail "render_rollup_body: body $RB_BYTES B exceeds 65536 — bound regression"
+  fail "render_rollup_body: body $RB_BYTES B not in 1..65536"
 fi
-if [ "$RB_VISIBLE" -le 60 ] && [ "$RB_VISIBLE" -gt 0 ]; then
-  pass "render_rollup_body: visible checklist capped ($RB_VISIBLE shown; unchecked_count_on regex matches)"
+if [ "$RB_MPIDS" -eq 200 ]; then
+  pass "render_rollup_body: ALL 200 mp-ids present in body (no silent drop)"
 else
-  fail "render_rollup_body: visible count $RB_VISIBLE (expected 1..60)"
+  fail "render_rollup_body: only $RB_MPIDS/200 mp-ids in body — SILENT LOSS"
 fi
-if grep -q 'more finding(s) not shown' "$RB_OUT"; then
-  pass "render_rollup_body: '+N more' footer present on truncation"
+
+# --- 2) Dedupe round-trip: parsers see all ids; none read as triaged ---
+RB_BODY="$(cat "$RB_OUT")"
+ALL_IDS=$(parse_all_ids_from_body "$RB_BODY" | grep -c . || true)
+TRI_IDS=$(parse_triaged_ids_from_body "$RB_BODY" | grep -c . || true)
+if [ "$ALL_IDS" -eq 200 ]; then
+  pass "render_rollup_body: parse_all_ids_from_body reads all 200 (closed-host dedupe complete)"
 else
-  fail "render_rollup_body: truncation footer missing"
+  fail "render_rollup_body: parse_all_ids_from_body read $ALL_IDS/200"
 fi
+if [ "$TRI_IDS" -eq 0 ]; then
+  pass "render_rollup_body: parse_triaged_ids_from_body reads 0 (overflow not mis-flagged triaged)"
+else
+  fail "render_rollup_body: $TRI_IDS overflow items mis-read as triaged"
+fi
+
+# --- 3) Format/severity/footer invariants ---
 if grep -q ' P0 \[' "$RB_OUT"; then
-  pass "render_rollup_body: P0 findings survive into the shown set (severity-major)"
+  pass "render_rollup_body: P0 findings inline (severity-major)"
 else
-  fail "render_rollup_body: no P0 in shown set — severity ordering broken"
+  fail "render_rollup_body: no P0 inline — severity ordering broken"
 fi
+if grep -q 'full set retained below' "$RB_OUT" && ! grep -q 're-surface on the next rollup' "$RB_OUT"; then
+  pass "render_rollup_body: overflow <details> present; false 're-surface' claim gone"
+else
+  fail "render_rollup_body: overflow summary missing or stale re-surface claim present"
+fi
+
+# --- 4) Stub mode: tighter budget forces mp-id stubs, still no loss ---
+STUB_OUT="$(mktemp "${TMPDIR:-/tmp}/rb-stub-XXXXXX.md")"
+ROLLUP_BODY_BUDGET=30000 render_rollup_body "$BIG_RB" "substantive" > "$STUB_OUT"
+STUB_BYTES=$(wc -c < "$STUB_OUT" | tr -d ' ')
+STUB_MPIDS=$(grep -oE '<!-- *mp-id:[a-f0-9]+ *-->' "$STUB_OUT" | sort -u | wc -l | tr -d ' ')
+if [ "$STUB_BYTES" -le 30000 ] && [ "$STUB_MPIDS" -eq 200 ] && grep -qE '^- \[ \] <!-- mp-id:' "$STUB_OUT"; then
+  pass "render_rollup_body: stub-mode keeps all 200 mp-ids under a 30000B budget ($STUB_BYTES B)"
+else
+  fail "render_rollup_body: stub-mode bytes=$STUB_BYTES mpids=$STUB_MPIDS (want <=30000 and 200)"
+fi
+rm -f "$STUB_OUT"
+
+# --- 5) Fail loud: budget too small even for stubs → return 2, no body ---
+set +e
+( ROLLUP_BODY_BUDGET=1500 render_rollup_body "$BIG_RB" "substantive" >/dev/null 2>&1 )
+rb_rc=$?
+set -e
+if [ "$rb_rc" -eq 2 ]; then
+  pass "render_rollup_body: unfittable backlog fails loud (return 2, no partial post)"
+else
+  fail "render_rollup_body: expected return 2 on unfittable backlog, got $rb_rc"
+fi
+
 rm -f "$BIG_RB" "$RB_OUT"
 
 # ---------------------------------------------------------------------
