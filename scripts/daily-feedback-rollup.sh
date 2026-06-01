@@ -614,16 +614,32 @@ collect_triaged_ids_for_label() {
   n=$(printf '%s' "$merged" | jq 'length')
   local x=0
   while [ "$x" -lt "$n" ]; do
-    local issue_state issue_text
+    local issue_state issue_num issue_body inline_comment_count comment_text issue_text
     issue_state=$(printf '%s' "$merged" | jq -r ".[$x].state")
+    issue_num=$(printf '%s' "$merged" | jq -r ".[$x].number")
+    issue_body=$(printf '%s' "$merged" | jq -r ".[$x].body // \"\"")
+    inline_comment_count=$(printf '%s' "$merged" | jq -r ".[$x].comments // [] | length")
     # Parse the BODY *and* all comment bodies (#402). The throttle path
     # appends today's findings as a COMMENT (append-only, atomic — we keep
     # that rather than a read-modify-write body edit that could clobber a
-    # concurrent run). So mp-ids and triage signals can live in comments;
-    # folding them in here makes the comment-append path dedupe-visible.
-    issue_text=$(printf '%s' "$merged" | jq -r "
-      .[$x] | ((.body // \"\") + \"\n\" + ((.comments // []) | map(.body // \"\") | join(\"\n\")))
-    ")
+    # concurrent run). The inline `comments` list field is page-capped
+    # (~100, #403), so when an issue has any comments we paginate the REST
+    # endpoint to read EVERY one — otherwise a rollup with >100 appended
+    # comments would lose dedupe visibility for the later mp-ids. The
+    # inline count is only a cheap "are there comments?" gate so the
+    # common (0-comment) rollup skips the extra call.
+    comment_text=""
+    if [ "$inline_comment_count" -gt 0 ]; then
+      if ! comment_text=$(gh api --paginate \
+           "repos/$OWNER/$NAME/issues/$issue_num/comments" \
+           --jq '.[].body // empty' 2>/dev/null); then
+        echo "daily-feedback-rollup: WARN dedupe: could not paginate comments for #$issue_num (best-effort, continuing)" >&2
+        DEDUP_FETCH_FAILURES=$((DEDUP_FETCH_FAILURES + 1))
+        comment_text=""
+      fi
+    fi
+    issue_text="${issue_body}
+${comment_text}"
     if [ "$issue_state" = "CLOSED" ] || [ "$issue_state" = "closed" ]; then
       # Closed host → ALL mp-ids on this rollup (body + comments) are
       # implicitly triaged.
