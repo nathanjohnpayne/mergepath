@@ -127,6 +127,20 @@ DEDUPE_WINDOW_DAYS="${ROLLUP_DEDUPE_WINDOW_DAYS:-14}"
 # label scopes). The 14-day window already bounds expected volume;
 # this is belt-and-suspenders.
 MAX_PRIOR_ROLLUPS_PER_LABEL="${ROLLUP_MAX_PRIOR_ROLLUPS_PER_LABEL:-50}"
+# Body-size policy (#400, revised per #401 Phase-4b review). GitHub caps
+# issue/comment bodies at 65536 bytes (the #397 failure mode). The daily
+# job scans ONLY the current per-day window, so a finding not recorded in
+# the issue BODY (the one surface the dedupe pass reads) is lost for good
+# once the window advances — capping-and-dropping would silently lose it.
+# We therefore render EVERY finding into the body: the top-N highest-
+# severity inline with full detail, the rest in a collapsed <details>
+# block (trimmed, then mp-id stubs) so all mp-ids stay dedupe-readable. If
+# even stubs won't fit under ROLLUP_BODY_BUDGET we FAIL LOUD rather than
+# drop. Paired with the --body-file switch (avoids the lower ARG_MAX
+# ceiling that --body hits first).
+ROLLUP_MAX_VISIBLE="${ROLLUP_MAX_VISIBLE:-60}"
+# Whole-body byte budget; headroom under GitHub's hard 65536 cap.
+ROLLUP_BODY_BUDGET="${ROLLUP_BODY_BUDGET:-64000}"
 
 # Compute the window. Default: yesterday 00:00:00Z → today 00:00:00Z UTC.
 # BSD date (macOS) and GNU date have divergent flag syntax — try GNU first.
@@ -529,8 +543,12 @@ PRE_DEDUP_POLISH=$(wc -l < "$POLISH_NDJSON" | tr -d ' ')
 # out explicitly but is the natural read.)
 
 TRIAGED_IDS_FILE=$(mktemp "${TMPDIR:-/tmp}/rollup-triaged-XXXXXX.ids")
-# Extend the EXIT trap to clean this up too.
-trap 'rm -f "$SUBSTANTIVE_NDJSON" "$POLISH_NDJSON" "$TRIAGED_IDS_FILE"' EXIT
+# Rendered-body scratch file (#400): post_or_append writes the body here
+# and passes --body-file, instead of --body "$body" (which hits ARG_MAX
+# before the GitHub 65536 cap on a large body).
+BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/rollup-body-XXXXXX.md")
+# Extend the EXIT trap to clean these up too.
+trap 'rm -f "$SUBSTANTIVE_NDJSON" "$POLISH_NDJSON" "$TRIAGED_IDS_FILE" "$BODY_FILE"' EXIT
 
 # Compute the dedupe-window cutoff. We pass it to `gh issue list` as
 # `closed:>=YYYY-MM-DD` so the search server-side filters out stale
@@ -562,7 +580,7 @@ collect_triaged_ids_for_label() {
        --state all \
        --search "is:issue label:$label closed:>=$DEDUP_CUTOFF" \
        --limit "$MAX_PRIOR_ROLLUPS_PER_LABEL" \
-       --json number,state,body 2>/dev/null); then
+       --json number,state,body,comments 2>/dev/null); then
     echo "daily-feedback-rollup: WARN dedupe: could not list prior '$label' rollups (best-effort, continuing)" >&2
     DEDUP_FETCH_FAILURES=$((DEDUP_FETCH_FAILURES + 1))
     return 0
@@ -577,7 +595,7 @@ collect_triaged_ids_for_label() {
        --label "$label" \
        --state open \
        --limit "$MAX_PRIOR_ROLLUPS_PER_LABEL" \
-       --json number,state,body 2>/dev/null); then
+       --json number,state,body,comments 2>/dev/null); then
     echo "daily-feedback-rollup: WARN dedupe: could not list open '$label' rollups (best-effort, continuing)" >&2
     DEDUP_FETCH_FAILURES=$((DEDUP_FETCH_FAILURES + 1))
     open_json='[]'
@@ -596,15 +614,24 @@ collect_triaged_ids_for_label() {
   n=$(printf '%s' "$merged" | jq 'length')
   local x=0
   while [ "$x" -lt "$n" ]; do
-    local issue_state issue_body
+    local issue_state issue_text
     issue_state=$(printf '%s' "$merged" | jq -r ".[$x].state")
-    issue_body=$(printf '%s' "$merged" | jq -r ".[$x].body // \"\"")
+    # Parse the BODY *and* all comment bodies (#402). The throttle path
+    # appends today's findings as a COMMENT (append-only, atomic — we keep
+    # that rather than a read-modify-write body edit that could clobber a
+    # concurrent run). So mp-ids and triage signals can live in comments;
+    # folding them in here makes the comment-append path dedupe-visible.
+    issue_text=$(printf '%s' "$merged" | jq -r "
+      .[$x] | ((.body // \"\") + \"\n\" + ((.comments // []) | map(.body // \"\") | join(\"\n\")))
+    ")
     if [ "$issue_state" = "CLOSED" ] || [ "$issue_state" = "closed" ]; then
-      # Closed host → ALL mp-ids on this rollup are implicitly triaged.
-      parse_all_ids_from_body "$issue_body" >> "$TRIAGED_IDS_FILE"
+      # Closed host → ALL mp-ids on this rollup (body + comments) are
+      # implicitly triaged.
+      parse_all_ids_from_body "$issue_text" >> "$TRIAGED_IDS_FILE"
     else
-      # Open host → only lines with an explicit triage signal count.
-      parse_triaged_ids_from_body "$issue_body" >> "$TRIAGED_IDS_FILE"
+      # Open host → only lines with an explicit triage signal count,
+      # whether they sit in the body or an appended comment.
+      parse_triaged_ids_from_body "$issue_text" >> "$TRIAGED_IDS_FILE"
     fi
     x=$((x + 1))
   done
@@ -729,7 +756,20 @@ fi
 render_rollup_body() {
   local ndjson_file="$1" track="$2"
   local f="$ndjson_file"
-  cat <<INTRO
+  # Render EVERY finding into the body (#401): top-N highest-severity
+  # inline with full detail, the rest in a collapsed <details> overflow
+  # block. Overflow detail degrades rich -> mp-id stub to fit
+  # ROLLUP_BODY_BUDGET; if even stubs won't fit we return 2 (fail loud,
+  # no partial post) so the caller aborts rather than silently dropping
+  # findings the per-day window will never re-enumerate. All logic stays
+  # INSIDE this function so the test's sed-extraction stays whole.
+  local total
+  total=$(wc -l < "$f" | tr -d ' ')
+
+  local rb
+  rb=$(mktemp -d "${TMPDIR:-/tmp}/rollup-render-XXXXXX")
+
+  cat > "$rb/intro.md" <<INTRO
 Auto-generated rollup of bot review threads that were resolved on
 ${DATE_STAMP} without an associated fix commit or substantive reply.
 Severity scope: ${track} (see § Two-track rollup in #299 for the
@@ -742,22 +782,7 @@ Triage markers (set on the checkbox below):
 
 INTRO
 
-  # Group by PR. NDJSON is naturally per-thread; awk gives us a
-  # quick group-by without re-parsing.
-  jq -s -r '
-    group_by(.pr_number)[] |
-    "## " + .[0].repo + "#" + .[0].pr_number +
-      " (merged " + (.[0].pr_merged_at // "n/a") + ", " +
-      (.[0].pr_title | tostring) + ")\n" +
-    (map(
-      "- [ ] [" + .thread_path + ":" + .thread_line + "](" + .thread_url + ")" +
-      " — `" + .author + "` " + .severity +
-      " [" + .tag_note + "]: \"" + .body_excerpt + "\"" +
-      " <!-- mp-id:" + .item_id + " -->"
-    ) | join("\n"))
-  ' "$f"
-
-  cat <<FOOTER
+  cat > "$rb/footer.md" <<FOOTER
 
 ---
 
@@ -775,9 +800,84 @@ INTRO
   - deferred-untagged (heuristic): ${COUNT_DEFERRED_UNTAGGED}
 - Dedupe pass (#304): ${COUNT_DEDUP_SKIPPED} item(s) previously triaged on prior rollups in the ${DEDUPE_WINDOW_DAYS}-day window (since ${DEDUP_CUTOFF})
 
-Generator: \`scripts/daily-feedback-rollup.sh\` (mergepath#299 v1 + #304 dedupe)
+Generator: \`scripts/daily-feedback-rollup.sh\` (mergepath#299 v1 + #304 dedupe + #401 overflow)
 </details>
 FOOTER
+
+  # Severity-major sort (P0 first), one JSON per line. Top-N render inline
+  # with full detail; the rest are the overflow tail.
+  jq -s -c '
+    def sevrank:
+      (.severity // "Unknown") as $s |
+      if   $s == "P0"      then 0 elif $s == "P1"      then 1
+      elif $s == "P2"      then 2 elif $s == "Major"   then 3
+      elif $s == "Minor"   then 4 elif $s == "P3"      then 5
+      elif $s == "Nitpick" then 6 elif $s == "Trivial" then 7
+      else 8 end;
+    sort_by(sevrank * 1000000 + ((.pr_number | tonumber?) // 0)) | .[]
+  ' "$f" > "$rb/sorted.ndjson"
+  head -n "$ROLLUP_MAX_VISIBLE" "$rb/sorted.ndjson" > "$rb/top.ndjson"
+  tail -n "+$((ROLLUP_MAX_VISIBLE + 1))" "$rb/sorted.ndjson" > "$rb/over.ndjson" 2>/dev/null || : > "$rb/over.ndjson"
+  local overflow_count
+  overflow_count=$(wc -l < "$rb/over.ndjson" | tr -d ' ')
+
+  # Inline top-N (full detail). Byte-identical to the pre-#400 line format
+  # so unchecked_count_on() and the mp-id parsers still match.
+  jq -s -r '
+    group_by(.pr_number)[] |
+    "## " + .[0].repo + "#" + .[0].pr_number +
+      " (merged " + (.[0].pr_merged_at // "n/a") + ", " +
+      (.[0].pr_title | tostring) + ")\n" +
+    (map(
+      "- [ ] [" + .thread_path + ":" + .thread_line + "](" + .thread_url + ")" +
+      " — `" + .author + "` " + .severity +
+      " [" + .tag_note + "]: \"" + .body_excerpt + "\"" +
+      " <!-- mp-id:" + .item_id + " -->"
+    ) | join("\n"))
+  ' "$rb/top.ndjson" > "$rb/inline.md"
+
+  # Overflow renderings (tried rich -> stub until the body fits). Both
+  # keep an OPEN `- [ ]` + the exact `<!-- mp-id:ID -->` marker and carry
+  # NO triage signal: the mp-id sits alone on its bullet line; any `#NUM`
+  # appears only on a `###` header line (rich), never adjacent to a
+  # boundary char, so parse_triaged_ids_from_body never mis-reads it.
+  jq -s -r '
+    group_by(.pr_number)[] |
+    "### " + .[0].repo + "#" + .[0].pr_number + " (merged " + (.[0].pr_merged_at // "n/a") + ")\n" +
+    (map(
+      "- [ ] [" + .thread_path + ":" + .thread_line + "](" + .thread_url + ")" +
+      " — `" + .author + "` " + .severity +
+      " <!-- mp-id:" + .item_id + " -->"
+    ) | join("\n"))
+  ' "$rb/over.ndjson" > "$rb/over-rich.md"
+  jq -r '"- [ ] <!-- mp-id:" + .item_id + " -->"' "$rb/over.ndjson" > "$rb/over-stub.md"
+
+  local mode chosen=""
+  for mode in rich stub; do
+    {
+      cat "$rb/intro.md"
+      cat "$rb/inline.md"
+      if [ "$overflow_count" -gt 0 ]; then
+        printf '\n<details>\n<summary>+%s more finding(s) — full set retained below. NOTE: closing this issue marks ALL of these (including the collapsed overflow) as triaged.</summary>\n\n' "$overflow_count"
+        cat "$rb/over-$mode.md"
+        printf '\n</details>\n'
+      fi
+      cat "$rb/footer.md"
+    } > "$rb/body-$mode.md"
+    if [ "$(wc -c < "$rb/body-$mode.md" | tr -d ' ')" -le "$ROLLUP_BODY_BUDGET" ]; then
+      chosen="$rb/body-$mode.md"
+      break
+    fi
+  done
+
+  if [ -n "$chosen" ]; then
+    cat "$chosen"
+    rm -rf "$rb"
+    return 0
+  fi
+  rm -rf "$rb"
+  echo "daily-feedback-rollup: $track — FATAL: $total findings exceed single-issue capacity (${ROLLUP_BODY_BUDGET}B) even as mp-id stubs; refusing to post a partial rollup that would silently drop findings the per-day window will not re-enumerate. Narrow the window (--since/--until) or split the backlog." >&2
+  return 2
 }
 
 # Self-throttling: count unchecked items on the most recently-opened
@@ -878,8 +978,15 @@ post_or_append() {
   # `--dry-run` stays a pure read.
   ensure_label "$label" "$track"
 
-  local body
-  body=$(render_rollup_body "$ndjson_file" "$track")
+  # Render to a file and post via --body-file (#400): --body "$body"
+  # caps out at ARG_MAX on a large rollup, below GitHub's 65536 limit.
+  # render_rollup_body returns 2 (fail loud, no partial body) if even
+  # mp-id stubs exceed the body budget — abort rather than post a rollup
+  # that silently drops findings the per-day window won't re-enumerate.
+  if ! render_rollup_body "$ndjson_file" "$track" > "$BODY_FILE"; then
+    echo "daily-feedback-rollup: $track — ABORTING: rollup body exceeds the size budget even as stubs (see FATAL above); not posting a partial rollup." >&2
+    exit 2
+  fi
 
   local existing=""
   # No `|| true` here: most_recent_open_rollup now fails-closed (exit 2)
@@ -892,14 +999,13 @@ post_or_append() {
     unchecked=$(unchecked_count_on "$existing")
     if [ "$unchecked" -ge "$throttle" ]; then
       echo "daily-feedback-rollup: $track — appending to existing #$existing ($unchecked unchecked ≥ throttle $throttle)" >&2
-      # shellcheck disable=SC2016
-      gh issue comment "$existing" --repo "$REPO" --body "$body" >&2
+      gh issue comment "$existing" --repo "$REPO" --body-file "$BODY_FILE" >&2
       return 0
     fi
   fi
 
   echo "daily-feedback-rollup: $track — creating new issue '$title'" >&2
-  gh issue create --repo "$REPO" --title "$title" --label "$label" --body "$body"
+  gh issue create --repo "$REPO" --title "$title" --label "$label" --body-file "$BODY_FILE"
 }
 
 post_or_append "$SUBSTANTIVE_NDJSON" "substantive" "$SUBSTANTIVE_LABEL" \
