@@ -84,6 +84,21 @@ if [ "${MERGEPATH_RUN_INTEGRATION:-0}" != "1" ]; then
   exit 0
 fi
 
+# mergepath-specific gate (#398). This is an integration test for
+# mergepath's OWN scripts/firebase/op-firebase-deploy, which is NOT in
+# .mergepath-sync.yml (mergepath-canonical, never propagated). The
+# scripts/ci/ KIT does propagate, so this check ships to consumers — but
+# downstream it would FAIL under MERGEPATH_RUN_INTEGRATION=1 against a
+# consumer's own/stale deploy script (the #398 / Codex P2 on
+# tadlockpsychiatry#68). Gate on the propagation manifest, which exists
+# ONLY in the canonical mergepath repo (consumers are propagation
+# targets and never carry it), so the check SKIPs cleanly downstream
+# while still running — and catching a real regression — in mergepath.
+if [ ! -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
+  echo "check_op_firebase_deploy_integration: SKIPPED — not the canonical mergepath repo (.mergepath-sync.yml absent); this integration check exercises mergepath-only scripts/firebase/op-firebase-deploy."
+  exit 0
+fi
+
 DEPLOY_SCRIPT="$REPO_ROOT/scripts/firebase/op-firebase-deploy"
 if [ ! -x "$DEPLOY_SCRIPT" ]; then
   echo "check_op_firebase_deploy_integration: FAIL — $DEPLOY_SCRIPT not found or not executable" >&2

@@ -38,10 +38,20 @@ jobs:
         id: metadata
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
-      - name: Approve and merge patch/minor updates
+      - name: Approve and merge patch/minor + dev-dependency-group updates
+        # Single patch/minor updates, plus the `dev-dependencies` GROUP
+        # (whatever its highest bump — dev tooling major bumps are
+        # low-risk and still gated by CI-green + the reviewer-identity
+        # approval + the available_reviewers allowlist below). Grouped
+        # dev updates whose highest member is major were previously
+        # skipped here (update-type=major), fell through to a manual
+        # merge with no reviewer approval, and tripped the weekly audit
+        # (#374 Pattern A — matchline#245). Production groups + non-group
+        # major bumps still require manual review.
         if: |
           steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
-          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+          steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
+          steps.metadata.outputs.dependency-group == 'dev-dependencies'
         run: |
           set -euo pipefail
 
