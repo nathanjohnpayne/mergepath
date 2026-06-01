@@ -397,7 +397,7 @@ gen_findings 200 > "$BIG_RB"
 # --- 1) Rich mode (default budget): no loss + within cap ---
 render_rollup_body "$BIG_RB" "substantive" > "$RB_OUT"
 RB_BYTES=$(wc -c < "$RB_OUT" | tr -d ' ')
-RB_MPIDS=$(grep -oE '<!-- *mp-id:[a-f0-9]+ *-->' "$RB_OUT" | sort -u | wc -l | tr -d ' ')
+RB_MPIDS=$(grep -oE '<!-- *mp-id:[a-f0-9]+ *-->' "$RB_OUT" | sort -u | wc -l | tr -d ' ' || true)
 
 if [ "$RB_BYTES" -le 65536 ] && [ "$RB_BYTES" -gt 0 ]; then
   pass "render_rollup_body: 200-finding body within 65536-byte cap ($RB_BYTES B)"
@@ -441,7 +441,7 @@ fi
 STUB_OUT="$(mktemp "${TMPDIR:-/tmp}/rb-stub-XXXXXX.md")"
 ROLLUP_BODY_BUDGET=30000 render_rollup_body "$BIG_RB" "substantive" > "$STUB_OUT"
 STUB_BYTES=$(wc -c < "$STUB_OUT" | tr -d ' ')
-STUB_MPIDS=$(grep -oE '<!-- *mp-id:[a-f0-9]+ *-->' "$STUB_OUT" | sort -u | wc -l | tr -d ' ')
+STUB_MPIDS=$(grep -oE '<!-- *mp-id:[a-f0-9]+ *-->' "$STUB_OUT" | sort -u | wc -l | tr -d ' ' || true)
 if [ "$STUB_BYTES" -le 30000 ] && [ "$STUB_MPIDS" -eq 200 ] && grep -qE '^- \[ \] <!-- mp-id:' "$STUB_OUT"; then
   pass "render_rollup_body: stub-mode keeps all 200 mp-ids under a 30000B budget ($STUB_BYTES B)"
 else
@@ -486,6 +486,22 @@ if [ "$all402" = "aaaaaaaaaaaa bbbbbbbbbbbb cccccccccccc " ]; then
   pass "#402 dedupe: closed-host parse_all reads all body+comment mp-ids"
 else
   fail "#402 dedupe: all set = [$all402] (want all three)"
+fi
+
+# ---------------------------------------------------------------------
+# #403: the dedupe must read EVERY comment via pagination (the inline
+# `gh issue list --json comments` field is page-capped at ~100), else a
+# rollup with >100 appended comments loses dedupe visibility for the
+# later mp-ids. The fetch is gh-integration (the body+comments PARSE
+# contract is covered by the #402 test above); this guards the source
+# is the paginated REST endpoint, not the capped inline field.
+# ---------------------------------------------------------------------
+SCRIPT_SRC="$ROOT/scripts/daily-feedback-rollup.sh"
+if grep -q 'gh api --paginate' "$SCRIPT_SRC" \
+   && grep -qE '/issues/\$issue_num/comments' "$SCRIPT_SRC"; then
+  pass "#403 dedupe: comments read via 'gh api --paginate …/comments' (beyond the ~100 inline cap)"
+else
+  fail "#403 dedupe: paginated comment fetch missing — >100-comment rollups would lose dedupe visibility"
 fi
 
 # ---------------------------------------------------------------------
