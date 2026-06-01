@@ -424,6 +424,7 @@ MARKER_IDS=$(awk '
   /<!-- thread-ids-end -->/   { capture=0 }
   capture==1 {
     line = $0
+    if (line ~ /thread-ids-truncated/) { next }
     if (line ~ /thread-ids-chunk:/) {
       sub(/.*thread-ids-chunk:[[:space:]]*/, "", line)
       sub(/[[:space:]]*-->.*/, "", line)
@@ -652,6 +653,7 @@ BIG_MARKER_IDS=$(awk '
   /<!-- thread-ids-end -->/   { capture=0 }
   capture==1 {
     line = $0
+    if (line ~ /thread-ids-truncated/) { next }
     if (line ~ /thread-ids-chunk:/) {
       sub(/.*thread-ids-chunk:[[:space:]]*/, "", line); sub(/[[:space:]]*-->.*/, "", line)
       n = split(line, a, /[[:space:]]+/); for (i = 1; i <= n; i++) if (a[i] != "") print a[i]
@@ -712,6 +714,30 @@ elif grep -q 'new=1, resolved=1' "$WORKDIR/render-migrate.stderr"; then
 else
   fail "v1→v2 migration: wrong delta counts (legacy reader likely broke)"
   grep 'updating issue' "$WORKDIR/render-migrate.stderr" >&2 || true
+fi
+
+# ---------------------------------------------------------------------------
+# Test 11: marker truncation hard-guard (#399 Codex P2). When the complete
+# marker can't fit under the byte budget, emission stops with a truncated
+# sentinel and the body is still well-formed — the render NEVER posts an
+# over-limit body. Force a tiny SWEEP_MARKER_MAX_BYTES so the path is
+# exercised deterministically (the real budget only truncates at ~4500+ ids).
+# ---------------------------------------------------------------------------
+BODY_TRUNC="$WORKDIR/body-trunc.md"
+set +e
+SWEEP_DRY_RUN=1 SWEEP_TODAY="2026-05-13" GH_TOKEN="dummy" SWEEP_MARKER_MAX_BYTES=80 \
+  "$RENDER" "$OUT_NDJSON" > "$BODY_TRUNC" 2>/dev/null
+rc=$?
+set -e
+TRUNC_BYTES=$(wc -c < "$BODY_TRUNC" | tr -d ' ')
+if [ "$rc" -eq 0 ] \
+   && grep -q '<!-- thread-ids-truncated -->' "$BODY_TRUNC" \
+   && grep -q '<!-- thread-ids-begin -->' "$BODY_TRUNC" \
+   && grep -q '<!-- thread-ids-end -->' "$BODY_TRUNC" \
+   && [ "$TRUNC_BYTES" -le 65536 ]; then
+  pass "render: marker truncation guard fires under a tiny budget, body stays well-formed"
+else
+  fail "render: marker truncation guard did not fire / body malformed (rc=$rc, bytes=$TRUNC_BYTES)"
 fi
 
 # ---------------------------------------------------------------------------

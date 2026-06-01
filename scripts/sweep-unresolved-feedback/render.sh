@@ -289,36 +289,59 @@ BODY="$WORKDIR/body.md"
 # thread as "new" because PRIOR_IDS would parse as empty (see #254
 # Codex P2 finding).
 # ---------------------------------------------------------------------------
+# Marker budget (#397, Codex P2 on #399). The marker is the load-bearing
+# delta state and MUST carry the COMPLETE id set (dropping any reintroduces
+# the #254 regression). It is also the only body term that grows with N
+# once Findings are capped. Rather than merely WARN and still post an
+# over-limit body (which would deterministically fail at gh create/edit —
+# the exact bug this PR fixes), we HARD-bound the marker to the bytes left
+# under the cap after the rendered body, and on the (only at >~4500-id)
+# overflow drop the tail with a `thread-ids-truncated` sentinel. That is a
+# self-healing soft degradation (next run re-reports the dropped ids as
+# "new") instead of a hard crash. SWEEP_MARKER_MAX_BYTES overrides the
+# computed budget (used by tests to exercise the truncation path).
+PRE_MARKER_BYTES=$(wc -c < "$BODY" | tr -d ' ')
+MARKER_MAX_BYTES="${SWEEP_MARKER_MAX_BYTES:-$(( 65000 - PRE_MARKER_BYTES - 200 ))}"
+[ "$MARKER_MAX_BYTES" -lt 0 ] && MARKER_MAX_BYTES=0
+
 {
   cat "$BODY"
   echo ""
   echo "<!-- thread-ids-begin -->"
-  # Compact, chunked encoding (#397): ids are space-joined, ~40 per
-  # comment line, instead of one comment per id. This block is the
-  # load-bearing delta/idempotency state and MUST carry the COMPLETE id
-  # set (dropping any reintroduces the #254 regression where every
-  # dropped thread reappears as "new"), but at ~38 B/id the old per-line
-  # form became a second body-size ceiling. The compact form is ~13 B/id
-  # (~3x headroom). The reader below accepts BOTH this and the legacy v1
-  # per-line form, so a body written by the old script stays
-  # delta-diffable on the first v2 run.
+  # Compact, chunked encoding: ids are space-joined, ~40 per comment line,
+  # instead of one comment per id (~13 B/id vs ~38, ~3x headroom). Emission
+  # stops once MARKER_MAX_BYTES is reached, appending a truncated sentinel.
+  # The reader below accepts this chunk form, the truncated sentinel, AND
+  # the legacy v1 per-line form, so an old body stays delta-diffable.
   if [ -s "$SORTED_IDS" ]; then
-    awk 'NF {
-      buf = (buf == "" ? $0 : buf " " $0); c++
-      if (c == 40) { print "<!-- thread-ids-chunk: " buf " -->"; buf = ""; c = 0 }
-    } END { if (buf != "") print "<!-- thread-ids-chunk: " buf " -->" }' "$SORTED_IDS"
+    awk -v budget="$MARKER_MAX_BYTES" '
+      BEGIN { used = 0; c = 0; buf = ""; trunc = 0 }
+      NF {
+        if (trunc) next
+        cost = length($0) + 1
+        # +45 amortizes the "<!-- thread-ids-chunk:  -->\n" framing per line.
+        if (used + cost + 45 > budget) { trunc = 1; next }
+        buf = (buf == "" ? $0 : buf " " $0); c++; used += cost
+        if (c == 40) { print "<!-- thread-ids-chunk: " buf " -->"; used += 45; buf = ""; c = 0 }
+      }
+      END {
+        if (buf != "") print "<!-- thread-ids-chunk: " buf " -->"
+        if (trunc) print "<!-- thread-ids-truncated -->"
+      }
+    ' "$SORTED_IDS"
   fi
   echo "<!-- thread-ids-end -->"
 } > "$BODY.with-marker"
 mv "$BODY.with-marker" "$BODY"
 
-# Body-size safety net (#397). Bounded Findings + compact marker keep the
-# body well under GitHub's 65536-byte cap for any realistic backlog; warn
-# loudly if a pathological N still approaches it rather than failing
-# opaquely at gh create/edit time.
+# Belt-and-suspenders: the budget guard above keeps the body under the cap
+# for any N, so this should never fire — if it does, it is a real alarm.
 BODY_BYTES=$(wc -c < "$BODY" | tr -d ' ')
-if [ "$BODY_BYTES" -gt 65000 ]; then
-  echo "render: WARNING body is ${BODY_BYTES} bytes, approaching GitHub's 65536-byte cap (findings=$LINE_COUNT). Lower SWEEP_MAX_VISIBLE or investigate the marker block." >&2
+if [ "$BODY_BYTES" -gt 65536 ]; then
+  echo "render: WARNING body is ${BODY_BYTES} bytes, still over GitHub's 65536-byte cap (findings=$LINE_COUNT) despite bounding — investigate before relying on this run." >&2
+fi
+if grep -q '<!-- thread-ids-truncated -->' "$BODY" 2>/dev/null; then
+  echo "render: NOTE thread-id marker truncated to fit the 65536-byte cap (findings=$LINE_COUNT); delta state is partial this run and self-heals next run." >&2
 fi
 
 # ---------------------------------------------------------------------------
@@ -385,6 +408,7 @@ printf '%s' "$PRIOR_BODY" | awk '
   /<!-- thread-ids-end -->/   { capture=0 }
   capture==1 {
     line = $0
+    if (line ~ /thread-ids-truncated/) { next }
     if (line ~ /thread-ids-chunk:/) {
       sub(/.*thread-ids-chunk:[[:space:]]*/, "", line)
       sub(/[[:space:]]*-->.*/, "", line)
