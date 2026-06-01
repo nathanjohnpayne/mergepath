@@ -580,7 +580,7 @@ collect_triaged_ids_for_label() {
        --state all \
        --search "is:issue label:$label closed:>=$DEDUP_CUTOFF" \
        --limit "$MAX_PRIOR_ROLLUPS_PER_LABEL" \
-       --json number,state,body 2>/dev/null); then
+       --json number,state,body,comments 2>/dev/null); then
     echo "daily-feedback-rollup: WARN dedupe: could not list prior '$label' rollups (best-effort, continuing)" >&2
     DEDUP_FETCH_FAILURES=$((DEDUP_FETCH_FAILURES + 1))
     return 0
@@ -595,7 +595,7 @@ collect_triaged_ids_for_label() {
        --label "$label" \
        --state open \
        --limit "$MAX_PRIOR_ROLLUPS_PER_LABEL" \
-       --json number,state,body 2>/dev/null); then
+       --json number,state,body,comments 2>/dev/null); then
     echo "daily-feedback-rollup: WARN dedupe: could not list open '$label' rollups (best-effort, continuing)" >&2
     DEDUP_FETCH_FAILURES=$((DEDUP_FETCH_FAILURES + 1))
     open_json='[]'
@@ -614,15 +614,24 @@ collect_triaged_ids_for_label() {
   n=$(printf '%s' "$merged" | jq 'length')
   local x=0
   while [ "$x" -lt "$n" ]; do
-    local issue_state issue_body
+    local issue_state issue_text
     issue_state=$(printf '%s' "$merged" | jq -r ".[$x].state")
-    issue_body=$(printf '%s' "$merged" | jq -r ".[$x].body // \"\"")
+    # Parse the BODY *and* all comment bodies (#402). The throttle path
+    # appends today's findings as a COMMENT (append-only, atomic — we keep
+    # that rather than a read-modify-write body edit that could clobber a
+    # concurrent run). So mp-ids and triage signals can live in comments;
+    # folding them in here makes the comment-append path dedupe-visible.
+    issue_text=$(printf '%s' "$merged" | jq -r "
+      .[$x] | ((.body // \"\") + \"\n\" + ((.comments // []) | map(.body // \"\") | join(\"\n\")))
+    ")
     if [ "$issue_state" = "CLOSED" ] || [ "$issue_state" = "closed" ]; then
-      # Closed host → ALL mp-ids on this rollup are implicitly triaged.
-      parse_all_ids_from_body "$issue_body" >> "$TRIAGED_IDS_FILE"
+      # Closed host → ALL mp-ids on this rollup (body + comments) are
+      # implicitly triaged.
+      parse_all_ids_from_body "$issue_text" >> "$TRIAGED_IDS_FILE"
     else
-      # Open host → only lines with an explicit triage signal count.
-      parse_triaged_ids_from_body "$issue_body" >> "$TRIAGED_IDS_FILE"
+      # Open host → only lines with an explicit triage signal count,
+      # whether they sit in the body or an appended comment.
+      parse_triaged_ids_from_body "$issue_text" >> "$TRIAGED_IDS_FILE"
     fi
     x=$((x + 1))
   done

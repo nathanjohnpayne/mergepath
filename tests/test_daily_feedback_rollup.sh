@@ -463,6 +463,32 @@ fi
 rm -f "$BIG_RB" "$RB_OUT"
 
 # ---------------------------------------------------------------------
+# #402: the dedupe folds COMMENT bodies in, so the throttle/append path
+# (which posts findings as an append-only comment) is dedupe-visible.
+# Mirror the body+comments concatenation collect_triaged_ids_for_label
+# builds and assert comment-resident mp-ids + triage signals surface.
+# ---------------------------------------------------------------------
+merged402='[{"state":"open",
+  "body":"- [x] body item <!-- mp-id:aaaaaaaaaaaa -->",
+  "comments":[
+    {"body":"## Appended 2026-06-01\n- [x] comment triaged <!-- mp-id:bbbbbbbbbbbb -->"},
+    {"body":"- [ ] comment still open <!-- mp-id:cccccccccccc -->"}
+  ]}]'
+combined402=$(printf '%s' "$merged402" | jq -r '.[0] | ((.body // "") + "\n" + ((.comments // []) | map(.body // "") | join("\n")))')
+tri402=$(parse_triaged_ids_from_body "$combined402" | sort | tr '\n' ' ')
+all402=$(parse_all_ids_from_body "$combined402" | sort | tr '\n' ' ')
+if [ "$tri402" = "aaaaaaaaaaaa bbbbbbbbbbbb " ]; then
+  pass "#402 dedupe: open-host triaged mp-ids surface from BOTH body and comment (not the open one)"
+else
+  fail "#402 dedupe: triaged set = [$tri402] (want 'aaaaaaaaaaaa bbbbbbbbbbbb ')"
+fi
+if [ "$all402" = "aaaaaaaaaaaa bbbbbbbbbbbb cccccccccccc " ]; then
+  pass "#402 dedupe: closed-host parse_all reads all body+comment mp-ids"
+else
+  fail "#402 dedupe: all set = [$all402] (want all three)"
+fi
+
+# ---------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------
 
