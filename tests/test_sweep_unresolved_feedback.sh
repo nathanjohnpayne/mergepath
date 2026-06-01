@@ -362,7 +362,7 @@ if [ "$rc" -ne 0 ]; then
   cat "$WORKDIR/render.stderr" >&2
 fi
 
-grep -q '<!-- sweep-unresolved-feedback v1 -->' "$BODY_OUT" \
+grep -q '<!-- sweep-unresolved-feedback v2 -->' "$BODY_OUT" \
   && pass "render: emitted marker comment" \
   || fail "render: missing marker comment"
 
@@ -386,17 +386,24 @@ grep -q '\*\*owner/alpha\*\* — 3 items' "$BODY_OUT" \
   && pass "render: per-repo count rendered" \
   || fail "render: per-repo count missing"
 
-grep -q '<summary>P1 (1)</summary>' "$BODY_OUT" \
+# Severity-major bounded render (#397): summaries are now
+# "<sev> — <repo> (<bucket_count>, showing <shown>)".
+grep -q '<summary>P1 — owner/alpha (1, showing 1)</summary>' "$BODY_OUT" \
   && pass "render: P1 severity group rendered with count" \
   || fail "render: P1 group missing"
 
-grep -q '<summary>P3 (1)</summary>' "$BODY_OUT" \
+grep -q '<summary>P3 — owner/alpha (1, showing 1)</summary>' "$BODY_OUT" \
   && pass "render: P3 severity group rendered" \
   || fail "render: P3 group missing"
 
-grep -q '<summary>Unknown (1)</summary>' "$BODY_OUT" \
+grep -q '<summary>Unknown — owner/alpha (1, showing 1)</summary>' "$BODY_OUT" \
   && pass "render: Unknown severity group rendered" \
   || fail "render: Unknown group missing"
+
+# Headline per-severity totals line (#397).
+grep -q 'Severity totals — P0: 0 · P1: 1 · P2: 0 · P3: 1 · Unknown: 1' "$BODY_OUT" \
+  && pass "render: severity totals headline rendered" \
+  || fail "render: severity totals headline missing"
 
 # Codex #254 P2: the body must include the thread-ids marker block on
 # BOTH the create path and the edit path, otherwise the first sweep
@@ -411,11 +418,25 @@ grep -q '<!-- thread-ids-end -->' "$BODY_OUT" \
   && pass "render: dry-run body includes thread-ids-end marker" \
   || fail "render: dry-run body missing thread-ids-end marker"
 
+# Marker is now the v2 compact chunk form; parse both forms (#397).
 MARKER_IDS=$(awk '
   /<!-- thread-ids-begin -->/ { capture=1; next }
   /<!-- thread-ids-end -->/   { capture=0 }
-  capture==1                  { print }
-' "$BODY_OUT" | sed -E 's/^<!-- //; s/ -->$//' | sort -u | tr '\n' ' ')
+  capture==1 {
+    line = $0
+    if (line ~ /thread-ids-truncated/) { next }
+    if (line ~ /thread-ids-chunk:/) {
+      sub(/.*thread-ids-chunk:[[:space:]]*/, "", line)
+      sub(/[[:space:]]*-->.*/, "", line)
+      n = split(line, a, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) if (a[i] != "") print a[i]
+    } else {
+      sub(/^<!--[[:space:]]*/, "", line)
+      sub(/[[:space:]]*-->.*/, "", line)
+      if (line != "") print line
+    }
+  }
+' "$BODY_OUT" | sort -u | tr '\n' ' ')
 WANT_MARKER_IDS="PRT_alpha_1_a PRT_alpha_2_a PRT_alpha_2_b "
 if [ "$MARKER_IDS" = "$WANT_MARKER_IDS" ]; then
   pass "render: thread-id marker block contains all current thread_ids"
@@ -588,6 +609,135 @@ else
     || fail "workflow: does not run enumerate.sh"
   grep -q "render.sh" "$WF" && pass "workflow: runs render.sh" \
     || fail "workflow: does not run render.sh"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 9: body-size cap regression (#397). A large backlog must render a
+# body within GitHub's 65536-byte issue cap; the full id set must still
+# survive in the marker block (delta correctness), and the truncation
+# footer must point at the artifact. This is the regression that broke
+# the 2026-05-25 / 2026-06-01 weekly sweeps (693 findings → body too long).
+# ---------------------------------------------------------------------------
+BIG="$WORKDIR/big.ndjson"
+: > "$BIG"
+bi=0
+while [ "$bi" -lt 750 ]; do
+  bsev=$(printf 'P0 P1 P2 P3 Unknown' | tr ' ' '\n' | sed -n "$(((bi % 5) + 1))p")
+  brepo="owner/repo$((bi % 5))"
+  jq -nc --arg tid "PRT_big_$bi" --arg repo "$brepo" --arg sev "$bsev" --argjson pr "$bi" \
+    '{repo:$repo,pr_number:$pr,pr_title:("Finding "+($pr|tostring)),
+      pr_url:("https://github.com/"+$repo+"/pull/"+($pr|tostring)),thread_id:$tid,
+      author_login:"coderabbitai[bot]",
+      body_excerpt:"Potential issue: a representative ~150 char excerpt mirroring what enumerate.sh emits so the rendered per-finding line reflects realistic bloat here ok done now",
+      severity:$sev,
+      thread_url:("https://github.com/"+$repo+"/pull/"+($pr|tostring)+"#discussion_r"+($pr|tostring))}' >> "$BIG"
+  bi=$((bi + 1))
+done
+
+BODY_BIG="$WORKDIR/body-big.md"
+set +e
+SWEEP_DRY_RUN=1 SWEEP_TODAY="2026-05-13" GH_TOKEN="dummy" \
+  "$RENDER" "$BIG" > "$BODY_BIG" 2>/dev/null
+rc=$?
+set -e
+BIG_BYTES=$(wc -c < "$BODY_BIG" | tr -d ' ')
+if [ "$rc" -eq 0 ] && [ "$BIG_BYTES" -gt 0 ] && [ "$BIG_BYTES" -le 65536 ]; then
+  pass "render: 750-finding dry-run body within 65536-byte cap ($BIG_BYTES B)"
+else
+  fail "render: 750-finding body is $BIG_BYTES B (rc=$rc), expected 1..65536 — bounded-render regression"
+fi
+
+# Marker block must still carry the COMPLETE id set (parse both forms).
+BIG_MARKER_IDS=$(awk '
+  /<!-- thread-ids-begin -->/ { capture=1; next }
+  /<!-- thread-ids-end -->/   { capture=0 }
+  capture==1 {
+    line = $0
+    if (line ~ /thread-ids-truncated/) { next }
+    if (line ~ /thread-ids-chunk:/) {
+      sub(/.*thread-ids-chunk:[[:space:]]*/, "", line); sub(/[[:space:]]*-->.*/, "", line)
+      n = split(line, a, /[[:space:]]+/); for (i = 1; i <= n; i++) if (a[i] != "") print a[i]
+    } else {
+      sub(/^<!--[[:space:]]*/, "", line); sub(/[[:space:]]*-->.*/, "", line)
+      if (line != "") print line
+    }
+  }
+' "$BODY_BIG" | sort -u | wc -l | tr -d ' ')
+if [ "$BIG_MARKER_IDS" -eq 750 ]; then
+  pass "render: marker block carries all 750 ids despite bounded findings"
+else
+  fail "render: marker block has $BIG_MARKER_IDS ids, expected 750 — delta state would be lossy"
+fi
+
+# Truncation footer must be present and name the artifact.
+if grep -q 'more findings not shown above' "$BODY_BIG" \
+   && grep -q 'workflow artifact' "$BODY_BIG"; then
+  pass "render: truncation footer present and references the workflow artifact"
+else
+  fail "render: truncation footer missing on a bounded render"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 10: v1 → v2 marker migration (#397). A rollup body written by the
+# OLD per-line (v1) script must stay delta-diffable on the first v2 run —
+# the reader accepts both the legacy per-line and the new chunk form.
+# Drive the edit path with a v1 prior body whose ids differ from current
+# and assert the new/resolved counts are computed from the legacy ids
+# (if the legacy reader failed, PRIOR_IDS would be empty → new=3).
+# ---------------------------------------------------------------------------
+cat >"$STUB_FIXTURES/issue-list.json" <<'JSON'
+[
+  {
+    "number": 4243,
+    "title": "Unresolved reviewer feedback backlog — 2026-05-06",
+    "body": "<!-- sweep-unresolved-feedback v1 -->\n<!-- content-hash: deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef -->\n<!-- last-run: 2026-05-06 -->\n\n# Unresolved reviewer feedback backlog\n\nstale body\n\n<!-- thread-ids-begin -->\n<!-- PRT_alpha_1_a -->\n<!-- PRT_alpha_2_a -->\n<!-- PRT_old_stale -->\n<!-- thread-ids-end -->"
+  }
+]
+JSON
+
+: > "$GH_CALLS_LOG"
+set +e
+PATH="$STUB_DIR:$PATH" \
+GH_TOKEN="dummy-pat" \
+STUB_FIXTURES="$STUB_FIXTURES" \
+GH_CALLS_LOG="$GH_CALLS_LOG" \
+SWEEP_TODAY="2026-05-13" \
+  "$RENDER" "$OUT_NDJSON" >/dev/null 2>"$WORKDIR/render-migrate.stderr"
+rc=$?
+set -e
+
+if [ "$rc" -ne 0 ]; then
+  fail "v1→v2 migration: render exited $rc, expected 0"
+  cat "$WORKDIR/render-migrate.stderr" >&2
+elif grep -q 'new=1, resolved=1' "$WORKDIR/render-migrate.stderr"; then
+  pass "v1→v2 migration: legacy per-line marker parsed (new=1, resolved=1)"
+else
+  fail "v1→v2 migration: wrong delta counts (legacy reader likely broke)"
+  grep 'updating issue' "$WORKDIR/render-migrate.stderr" >&2 || true
+fi
+
+# ---------------------------------------------------------------------------
+# Test 11: marker truncation hard-guard (#399 Codex P2). When the complete
+# marker can't fit under the byte budget, emission stops with a truncated
+# sentinel and the body is still well-formed — the render NEVER posts an
+# over-limit body. Force a tiny SWEEP_MARKER_MAX_BYTES so the path is
+# exercised deterministically (the real budget only truncates at ~4500+ ids).
+# ---------------------------------------------------------------------------
+BODY_TRUNC="$WORKDIR/body-trunc.md"
+set +e
+SWEEP_DRY_RUN=1 SWEEP_TODAY="2026-05-13" GH_TOKEN="dummy" SWEEP_MARKER_MAX_BYTES=80 \
+  "$RENDER" "$OUT_NDJSON" > "$BODY_TRUNC" 2>/dev/null
+rc=$?
+set -e
+TRUNC_BYTES=$(wc -c < "$BODY_TRUNC" | tr -d ' ')
+if [ "$rc" -eq 0 ] \
+   && grep -q '<!-- thread-ids-truncated -->' "$BODY_TRUNC" \
+   && grep -q '<!-- thread-ids-begin -->' "$BODY_TRUNC" \
+   && grep -q '<!-- thread-ids-end -->' "$BODY_TRUNC" \
+   && [ "$TRUNC_BYTES" -le 65536 ]; then
+  pass "render: marker truncation guard fires under a tiny budget, body stays well-formed"
+else
+  fail "render: marker truncation guard did not fire / body malformed (rc=$rc, bytes=$TRUNC_BYTES)"
 fi
 
 # ---------------------------------------------------------------------------
