@@ -105,9 +105,22 @@ check_script_shape() {
 }
 
 check_script_shape "scripts/resolve-pr-threads.sh"     "resolve-pr-threads"
-check_script_shape "scripts/codex-review-request.sh"   "codex-review-request"
 check_script_shape "scripts/request-label-removal.sh"  "request-label-removal"
 check_script_shape "scripts/coderabbit-wait.sh"        "coderabbit-wait"
+
+# codex-review-request.sh moved its '@codex review' trigger-post guard
+# from identity-check (--expect-reviewer) to gh-as-author.sh, so the
+# trigger is authored by nathanjohnpayne — the Codex App only monitors
+# author-authored triggers (#405). It is no longer an identity-check site,
+# but it must still FAIL-CLOSED if its helper is missing, now against
+# gh-as-author.
+CRR="$ROOT/scripts/codex-review-request.sh"
+if grep -q '\[ ! -x "\$AS_AUTHOR" \]' "$CRR" \
+   && grep -q 'gh-as-author.sh helper missing or non-executable' "$CRR"; then
+  pass "codex-review-request: '@codex review' trigger posts via gh-as-author, fail-closed on missing helper"
+else
+  fail "codex-review-request: missing gh-as-author fail-closed guard for the @codex review trigger"
+fi
 
 # -----------------------------------------------------------------------
 # Part B — Behavioral: the gate idiom rejects helper absence.
