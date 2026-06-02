@@ -458,8 +458,15 @@ else
   # restores the prior active account on exit. This SUPERSEDES the #284
   # `identity-check --expect-reviewer` guard, which fail-closed on the
   # WRONG identity for this particular write. Opt out via
-  # CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK=1 for test harnesses that
-  # PATH-shim gh (the stub records argv; no real keyring switch).
+  # CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK=1 in two cases: (1) test
+  # harnesses that PATH-shim gh (the stub records argv; no real keyring
+  # switch), and (2) token-only / CI runners that have no gh keyring to
+  # switch but DO set GH_TOKEN to the author PAT ($OP_PREFLIGHT_AUTHOR_PAT
+  # / nathanjohnpayne). gh-as-author.sh unsets GH_TOKEN and runs
+  # `gh auth switch`, which needs the author identity in the keyring; on a
+  # keyless runner that fails. With the opt-out, the direct `gh pr comment`
+  # below posts under the author byline the Codex App requires (because
+  # GH_TOKEN already resolves to nathanjohnpayne) without the switch.
   log "posting '@codex review' trigger comment (as author identity nathanjohnpayne)"
   if [ "${CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK:-0}" = "1" ]; then
     POST_OUTPUT=$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
@@ -471,7 +478,8 @@ else
       echo "       Refusing to post '@codex review' without author-identity attribution" >&2
       echo "       (Codex ignores reviewer/bot-authored triggers — see comment above)." >&2
       echo "       Restore the helper, or opt out via" >&2
-      echo "       CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK=1 (dev only)." >&2
+      echo "       CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK=1 (dev, or a" >&2
+      echo "       token-only/CI runner with GH_TOKEN=author PAT)." >&2
       die 3 "gh-as-author.sh helper unavailable"
     fi
     # Capture stdout+stderr so a failure surfaces the real gh error
