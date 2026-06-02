@@ -62,12 +62,25 @@ read-path; `coderabbit-wait.sh` and `codex-review-request.sh` BOTH
 post comments on the PR (a retry trigger and an `@codex review`
 trigger respectively, via `gh pr comment` or `gh api`). The PAT in
 `GH_TOKEN` authenticates the API call, but the **byline of the
-posted comment** is the keyring's active account — so the
-active-account convention applies to these helpers too. Set the
-active account once per machine (`gh auth switch -u nathanpayne-<agent>`)
-and the comments attribute correctly. The trigger-comment bodies are
-identity-agnostic, so a wrong byline isn't load-bearing — but
-matters for audit-trail consistency.
+posted comment** is the keyring's active account. The two triggers
+differ in whether that byline is load-bearing:
+
+- **`coderabbit-wait.sh` retry trigger — identity-agnostic.** CodeRabbit
+  re-reviews regardless of who posts the nudge, so the reviewer
+  active-account convention applies (set `gh auth switch -u
+  nathanpayne-<agent>` once per machine; a wrong byline is cosmetic and
+  matters only for audit-trail consistency).
+- **`codex-review-request.sh` `@codex review` trigger — the byline IS
+  load-bearing.** The Codex GitHub App ONLY monitors `@codex review`
+  comments authored by `nathanjohnpayne` (the author/human identity); a
+  trigger posted by a reviewer/bot identity (`nathanpayne-claude`/
+  `-codex`/`-cursor`) is silently ignored and the poll runs to timeout
+  (#405: reviewer-authored drew no response in 600s, author-authored drew
+  a review in ~20s). So `codex-review-request.sh` does **not** follow the
+  reviewer active-account convention for this write — it posts the
+  trigger through `scripts/gh-as-author.sh` (byline = `nathanjohnpayne`).
+  Do **not** "fix" a keyring-drift block by switching the active account
+  to a reviewer identity before running it.
 
 #### PAT lookup table
 
@@ -292,6 +305,7 @@ affect the byline for that row; the byline follows `GH_TOKEN`.
 | `gh pr edit` (general — title/body) | `nathanjohnpayne` (use `scripts/gh-as-author.sh`) | any author-readable PAT |
 | `gh pr edit --remove-label <protected>` | **BLOCKED** by `scripts/hooks/label-removal-guard.sh` for `needs-external-review` / `needs-human-review` / `policy-violation` / `human-hold`; use `scripts/request-label-removal.sh` | n/a |
 | `gh pr comment` | `nathanpayne-<agent>` (agent identity); blocked unless active exactly matches the reviewer resolved from `GH_PR_GUARD_EXPECTED_REVIEWER` or `MERGEPATH_AGENT` per `scripts/hooks/gh-pr-guard.sh` (#284/#363) | reviewer PAT (`$OP_PREFLIGHT_REVIEWER_PAT`) |
+| `gh pr comment "@codex review"` (Codex trigger) | **`nathanjohnpayne`** (use `scripts/gh-as-author.sh`) — EXCEPTION to the reviewer-byline rule above: the Codex App only monitors author-authored triggers (#405), so `codex-review-request.sh` posts it via `gh-as-author.sh` | author or reviewer PAT for auth |
 | `gh pr review --comment` | `nathanpayne-<agent>`; blocked unless active exactly matches the reviewer resolved from `GH_PR_GUARD_EXPECTED_REVIEWER` or `MERGEPATH_AGENT` (#284/#363) | reviewer PAT |
 | `gh pr review --approve` (under-threshold) | `nathanpayne-<agent>`; allowed when PR's `Authoring-Agent:` matches the agent (the intended path) | reviewer PAT |
 | `gh pr review --approve` (over-threshold, same agent) | **BLOCKED** by `scripts/hooks/gh-pr-guard.sh` per § No-self-approve scoping (#284) | n/a |
