@@ -150,6 +150,29 @@ jobs:
           # continuing to the merge step with no approval on record.
           gh pr review --approve "$PR_URL"
 
+          # Major dev-group bumps must NOT merge before CI (mergepath#406).
+          # A semver-MAJOR update only reaches this step via the
+          # `dependency-group == 'dev-dependencies'` arm of the job `if:`
+          # (single bumps set update-type to patch/minor). The safety case
+          # for auto-merging a dev group is explicitly "CI is green" — but
+          # `gh pr merge --auto` merges as soon as the repo's *required*
+          # status checks pass, NOT after arbitrary in-flight CI. In a
+          # consumer where auto-merge is enabled yet CI is not a required
+          # status check, the approval above already satisfies the merge
+          # requirements, so `--auto` would merge the major dev-group BEFORE
+          # CI finishes. The immediate-squash fallback below already guarded
+          # this case; the `--auto` path did not (Codex P2 on #405 → #406).
+          # Skip BOTH merge paths for a major dev-group and leave it
+          # approved-but-unmerged: the approval is on record (the weekly
+          # audit's "no reviewer approval" gate is satisfied), and a human
+          # merges after CI — or `--auto` becomes safe once required CI
+          # checks are configured. Patch/minor fall through to the path below.
+          if [ "$UPDATE_TYPE" != "version-update:semver-patch" ] && \
+             [ "$UPDATE_TYPE" != "version-update:semver-minor" ]; then
+            echo "::notice::update-type='$UPDATE_TYPE' (dependency-group='$DEPENDENCY_GROUP') is a major dev-group bump; leaving it approved-but-unmerged to preserve the CI-green safety case (mergepath#406). Merge after CI, or enable required CI checks + auto-merge."
+            exit 0
+          fi
+
           # Try GitHub-side auto-merge first (fires when required
           # checks pass). Fall back to an immediate squash ONLY when
           # the failure cause is "auto-merge unavailable" — i.e., the
@@ -184,17 +207,16 @@ jobs:
             fi
             # The immediate (no --auto) squash does NOT wait for CI. That's
             # acceptable for single patch/minor bumps (the long-standing
-            # behavior), but the broadened dev-dependencies-group gate
-            # (#374) can route a semver-MAJOR group here — and the safety
-            # case for auto-merging dev groups is explicitly "CI is green".
-            # Merging a major group before CI in a no-branch-protection
-            # repo would break that (Codex P2 on #405). So only
-            # immediate-squash patch/minor; for anything else (a major dev
-            # group) leave the PR APPROVED but unmerged — --auto will merge
-            # it once branch protection/required checks are configured, or a
-            # human merges after CI. The approval is already recorded, so
-            # the weekly audit's "no reviewer approval" gate is satisfied
-            # either way.
+            # behavior). Major dev-groups are already held approved-but-
+            # unmerged by the early guard above (mergepath#406), so they
+            # should never reach this fallback — the `if` below is a
+            # defensive backstop that re-checks update-type in case that
+            # early guard is ever removed, keeping the CI-green safety case
+            # double-guarded. For a major group, leave the PR APPROVED but
+            # unmerged — --auto will merge it once branch protection/required
+            # checks are configured, or a human merges after CI. The approval
+            # is already recorded, so the weekly audit's "no reviewer
+            # approval" gate is satisfied either way.
             if [ "$UPDATE_TYPE" = "version-update:semver-patch" ] || \
                [ "$UPDATE_TYPE" = "version-update:semver-minor" ]; then
               gh pr merge --squash "$PR_URL"
