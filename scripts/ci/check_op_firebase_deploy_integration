@@ -99,8 +99,12 @@ fi
 # default for a mergepath-only check we can't confirm we're running in.
 REPO_SLUG="${GITHUB_REPOSITORY:-}"
 if [ -z "$REPO_SLUG" ]; then
+  # `|| true`: in a worktree with no `origin` remote, `git config --get`
+  # exits 1; under `set -euo pipefail` that would ABORT the assignment
+  # instead of falling through to the empty-slug skip below (Codex P2 on
+  # #405). Swallow it so REPO_SLUG ends up empty → SKIP (the safe default).
   REPO_SLUG=$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null \
-    | sed -E 's#(\.git)?$##; s#.*[:/]##')
+    | sed -E 's#(\.git)?$##; s#.*[:/]##' || true)
 fi
 case "$REPO_SLUG" in
   mergepath | */mergepath) ;;  # canonical mergepath (or a fork of it) — run
