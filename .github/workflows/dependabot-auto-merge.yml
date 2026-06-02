@@ -38,10 +38,20 @@ jobs:
         id: metadata
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
-      - name: Approve and merge patch/minor updates
+      - name: Approve and merge patch/minor + dev-dependency-group updates
+        # Single patch/minor updates, plus the `dev-dependencies` GROUP
+        # (whatever its highest bump — dev tooling major bumps are
+        # low-risk and still gated by CI-green + the reviewer-identity
+        # approval + the available_reviewers allowlist below). Grouped
+        # dev updates whose highest member is major were previously
+        # skipped here (update-type=major), fell through to a manual
+        # merge with no reviewer approval, and tripped the weekly audit
+        # (#374 Pattern A — matchline#245). Production groups + non-group
+        # major bumps still require manual review.
         if: |
           steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
-          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+          steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
+          steps.metadata.outputs.dependency-group == 'dev-dependencies'
         run: |
           set -euo pipefail
 
@@ -172,7 +182,26 @@ jobs:
               echo "::notice::PR carries human-hold immediately before fallback squash; skipping Dependabot auto-merge until the human removes the label."
               exit 0
             fi
-            gh pr merge --squash "$PR_URL"
+            # The immediate (no --auto) squash does NOT wait for CI. That's
+            # acceptable for single patch/minor bumps (the long-standing
+            # behavior), but the broadened dev-dependencies-group gate
+            # (#374) can route a semver-MAJOR group here — and the safety
+            # case for auto-merging dev groups is explicitly "CI is green".
+            # Merging a major group before CI in a no-branch-protection
+            # repo would break that (Codex P2 on #405). So only
+            # immediate-squash patch/minor; for anything else (a major dev
+            # group) leave the PR APPROVED but unmerged — --auto will merge
+            # it once branch protection/required checks are configured, or a
+            # human merges after CI. The approval is already recorded, so
+            # the weekly audit's "no reviewer approval" gate is satisfied
+            # either way.
+            if [ "$UPDATE_TYPE" = "version-update:semver-patch" ] || \
+               [ "$UPDATE_TYPE" = "version-update:semver-minor" ]; then
+              gh pr merge --squash "$PR_URL"
+            else
+              echo "::notice::update-type='$UPDATE_TYPE' (dependency-group='$DEPENDENCY_GROUP') is not patch/minor and --auto is unavailable; leaving the PR approved-but-unmerged to preserve the CI-green safety case. Configure branch protection/auto-merge or merge manually after CI."
+              exit 0
+            fi
           else
             echo "::error::gh pr merge --auto failed for a non-auto-merge-unavailable reason. See stderr above. Not falling back to immediate squash; surface to audit."
             exit "$AUTO_RC"
@@ -185,4 +214,8 @@ jobs:
           # Dependabot PR is never `nathanjohnpayne`). (CodeRabbit
           # Major, #271.)
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          # Dependabot metadata — used by the immediate-squash fallback to
+          # keep major dev-group bumps behind CI (#374 / Codex P2 on #405).
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          DEPENDENCY_GROUP: ${{ steps.metadata.outputs.dependency-group }}
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}

@@ -84,6 +84,35 @@ if [ "${MERGEPATH_RUN_INTEGRATION:-0}" != "1" ]; then
   exit 0
 fi
 
+# mergepath-specific gate (#398). This is an integration test for
+# mergepath's OWN scripts/firebase/op-firebase-deploy, which is NOT
+# propagated (mergepath-canonical). The scripts/ci/ KIT does propagate,
+# so this check ships to consumers — but downstream it would FAIL under
+# MERGEPATH_RUN_INTEGRATION=1 against a consumer's own/stale deploy
+# script (the #398 / Codex P2 on tadlockpsychiatry#68). Identify the
+# canonical repo by its FULL owner/repo SLUG, not a file marker (a
+# bootstrap-mirrored consumer can transiently carry copied files — Codex
+# P2 on #405) and not a bare repo name (a different owner's fork named
+# `*/mergepath` must NOT run this check against its own deploy script —
+# Codex r2 on #405). In CI GITHUB_REPOSITORY is authoritative; locally
+# fall back to the origin remote. If neither resolves (no remote / no
+# env) the slug is empty → SKIP, the safe default for a mergepath-only
+# check we can't confirm we're running in.
+CANONICAL_REPO="${MERGEPATH_CANONICAL_REPO:-nathanjohnpayne/mergepath}"
+REPO_SLUG="${GITHUB_REPOSITORY:-}"
+if [ -z "$REPO_SLUG" ]; then
+  # `|| true`: in a worktree with no `origin` remote, `git config --get`
+  # exits 1; under `set -euo pipefail` that would ABORT the assignment
+  # instead of falling through to the empty-slug skip below (Codex P2 on
+  # #405). Swallow it so REPO_SLUG ends up empty → SKIP (the safe default).
+  REPO_SLUG=$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null \
+    | sed -E 's#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#' || true)
+fi
+if [ "$REPO_SLUG" != "$CANONICAL_REPO" ]; then
+  echo "check_op_firebase_deploy_integration: SKIPPED — repo '${REPO_SLUG:-unknown}' is not the canonical $CANONICAL_REPO; this integration check exercises mergepath-only scripts/firebase/op-firebase-deploy."
+  exit 0
+fi
+
 DEPLOY_SCRIPT="$REPO_ROOT/scripts/firebase/op-firebase-deploy"
 if [ ! -x "$DEPLOY_SCRIPT" ]; then
   echo "check_op_firebase_deploy_integration: FAIL — $DEPLOY_SCRIPT not found or not executable" >&2

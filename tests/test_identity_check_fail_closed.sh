@@ -105,9 +105,33 @@ check_script_shape() {
 }
 
 check_script_shape "scripts/resolve-pr-threads.sh"     "resolve-pr-threads"
-check_script_shape "scripts/codex-review-request.sh"   "codex-review-request"
 check_script_shape "scripts/request-label-removal.sh"  "request-label-removal"
 check_script_shape "scripts/coderabbit-wait.sh"        "coderabbit-wait"
+
+# codex-review-request.sh moved its '@codex review' trigger-post guard
+# from identity-check (--expect-reviewer) to gh-as-author.sh, so the
+# trigger is authored by nathanjohnpayne — the Codex App only monitors
+# author-authored triggers (#405). It is no longer an identity-check site,
+# but it must still FAIL-CLOSED if its helper is missing, now against
+# gh-as-author.
+CRR="$ROOT/scripts/codex-review-request.sh"
+if grep -q '\[ ! -x "\$AS_AUTHOR" \]' "$CRR" \
+   && grep -q 'gh-as-author.sh helper missing or non-executable' "$CRR"; then
+  pass "codex-review-request: gh-as-author helper presence is fail-closed"
+else
+  fail "codex-review-request: missing gh-as-author fail-closed guard for the @codex review trigger"
+fi
+
+# The actual trigger write MUST be wrapped by gh-as-author so the
+# '@codex review' byline is nathanjohnpayne — the load-bearing property
+# the Codex App requires (#405). Assert the real wrapped invocation, not
+# just the guard around it (Codex r2 on #405: a guard can be present
+# while the post still goes out unwrapped).
+if grep -qE '"\$AS_AUTHOR" -- gh pr comment .* --body "@codex review"' "$CRR"; then
+  pass "codex-review-request: '@codex review' trigger posted via \"\$AS_AUTHOR\" -- gh pr comment (author byline)"
+else
+  fail "codex-review-request: '@codex review' trigger is NOT wrapped by gh-as-author — the byline would not be nathanjohnpayne"
+fi
 
 # -----------------------------------------------------------------------
 # Part B — Behavioral: the gate idiom rejects helper absence.
