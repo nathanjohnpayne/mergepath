@@ -344,14 +344,20 @@ Notes on auth-split nuance:
   that closes this drift window (#284).
 
 - **Pre-action identity check.** Every helper that posts a write
-  (`coderabbit-wait.sh`, `codex-review-request.sh`,
-  `resolve-pr-threads.sh`, `request-label-removal.sh`, `gh-as-*.sh`)
-  calls `scripts/identity-check.sh` BEFORE the write. The check is
+  (`coderabbit-wait.sh`, `resolve-pr-threads.sh`,
+  `request-label-removal.sh`, `gh-as-*.sh`) calls
+  `scripts/identity-check.sh` BEFORE the write. The check is
   fail-closed: if the keyring's active account (or `GH_TOKEN`'s
   resolved login, depending on the auth path) doesn't match the
   expected identity, the helper exits with a diagnostic rather than
   landing a misattributed write. See #283 for the in-session
   incidents that motivated the check, and #284 for the implementation.
+  `codex-review-request.sh` is the one exception: its `@codex review`
+  trigger must be authored by `nathanjohnpayne` (not a reviewer
+  identity — #405), so instead of a direct `identity-check.sh` call it
+  posts through `scripts/gh-as-author.sh`, which switches to and
+  verifies the author identity (its own fail-closed gate) before the
+  write.
 
 ## Workflow
 
@@ -1006,10 +1012,16 @@ GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq '.login'
 # Read-only helper:
 GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-check.sh <PR#>
 
-# Helpers that may also POST a trigger comment — GH_TOKEN authenticates
-# the API call, but the comment byline is the active keyring account.
-# Set active = nathanpayne-<agent> once per machine; then byline is correct.
+# coderabbit-wait.sh may POST a retry nudge: GH_TOKEN authenticates the
+# read calls; the nudge byline is the active keyring account and is
+# identity-agnostic (set active = nathanpayne-<agent> for audit tidiness).
 GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/coderabbit-wait.sh <PR#>
+
+# codex-review-request.sh uses the reviewer PAT in GH_TOKEN for its READS
+# (polling), but posts the '@codex review' TRIGGER through gh-as-author.sh
+# so the byline is nathanjohnpayne — the Codex App only monitors
+# author-authored triggers (#405). Do NOT set the active account to a
+# reviewer identity for it; the script handles the author switch itself.
 GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-request.sh <PR#>
 
 # ── Write-path: active keyring is the byline; GH_TOKEN is ignored ──
