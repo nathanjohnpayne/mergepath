@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
 # gh-pr-guard.sh — PreToolUse hook for Claude Code
 #
-# Gates five operations:
-#   1. gh pr create — blocks unless (a) the keyring's active gh
-#      account is the AUTHOR identity (nathanjohnpayne by default;
-#      override via GH_PR_GUARD_EXPECTED_AUTHOR), AND (b) the command
-#      text includes "Authoring-Agent:" and "## Self-Review". The
-#      identity check (#241) prevents the split-invocation footgun
-#      where a `gh auth switch` in one Bash tool call drifts before
-#      the `gh pr create` in a subsequent call, landing the PR under
-#      the wrong account. Canonical fix is to use
-#      scripts/gh-as-author.sh which wraps switch + create + switch-
-#      back in one bash process.
+# Gates core write operations:
+#   1. gh pr create — blocks unless the command is routed through
+#      scripts/gh-as-author.sh and the command text includes
+#      "Authoring-Agent:" and "## Self-Review". The wrapper verifies
+#      an author token before the write and verifies the created PR
+#      author afterward with the same token.
 #   2. gh pr merge --admin — blocks unless BREAK_GLASS_ADMIN=1
 #      (human must explicitly authorize in chat)
 #   3. gh pr merge (any flavor) — blocks when the target PR's
@@ -36,7 +31,7 @@
 #      merge past Label Gate by removing the label without running
 #      the gate check first.
 #
-# Byline-sensitive command coverage (#284):
+# Byline-sensitive command coverage (#284/#411):
 #
 #   Beyond the pr-create / pr-merge gates above, the hook ALSO
 #   guards a class of commands whose byline is identity-load-bearing
@@ -46,15 +41,13 @@
 #     - gh pr review <PR#> --comment / --approve / --request-changes
 #     - gh issue comment <issue#> --body "..."
 #
-#   For all three, the keyring's active account must exactly match the
-#   operating agent's REVIEWER identity. The expected reviewer resolves
-#   as: explicit GH_PR_GUARD_EXPECTED_REVIEWER override, else
-#   nathanpayne-$MERGEPATH_AGENT, else nathanpayne-claude.
-#   Posting these as the AUTHOR identity (nathanjohnpayne), or as the
-#   wrong reviewer identity after cross-session keyring drift, breaks
-#   the audit-trail convention REVIEW_POLICY.md depends on — reviewer
-#   comments must attribute to the reviewer. The check fires before
-#   the keyring write so misattributed comments never land.
+#   All three must be routed through scripts/gh-as-reviewer.sh. The
+#   expected reviewer resolves as: explicit
+#   GH_PR_GUARD_EXPECTED_REVIEWER override, else
+#   nathanpayne-$MERGEPATH_AGENT, else nathanpayne-claude. The hook
+#   validates the wrapper configuration and blocks direct or inline
+#   token forms so the wrapper can verify the effective token before
+#   any comment/review lands.
 #
 #   `gh issue create` is intentionally NOT in this set. It was briefly
 #   guarded (#317, after the mergepath#315 misattribution) but that
@@ -64,9 +57,9 @@
 #   under any identity.
 #
 #   Additionally, `gh pr review --approve` is blocked when the
-#   target PR is OVER-threshold AND the keyring is the agent's own
-#   reviewer identity AND the PR's body contains an `Authoring-Agent:`
-#   line that names the SAME agent. This is the no-self-approve
+#   target PR is OVER-threshold AND the reviewer wrapper identity is the
+#   agent's own reviewer identity AND the PR's body contains an
+#   `Authoring-Agent:` line that names the SAME agent. This is the no-self-approve
 #   policy from REVIEW_POLICY.md § No-self-approve scoping enforced
 #   at the hook layer: a `claude` reviewer must not approve a PR
 #   whose `Authoring-Agent: claude` line means claude wrote it. The
@@ -381,6 +374,32 @@ prefix_flag_takes_value() {
   return 1
 }
 
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$HOOK_DIR/../.." && pwd)"
+CANON_AUTHOR_WRAPPER="$REPO_ROOT/scripts/gh-as-author.sh"
+CANON_REVIEWER_WRAPPER="$REPO_ROOT/scripts/gh-as-reviewer.sh"
+
+is_author_wrapper_token() {
+  [ "$1" = "scripts/gh-as-author.sh" ] || \
+    [ "$1" = "./scripts/gh-as-author.sh" ] || \
+    [ "$1" = "$CANON_AUTHOR_WRAPPER" ]
+}
+
+is_reviewer_wrapper_token() {
+  [ "$1" = "scripts/gh-as-reviewer.sh" ] || \
+    [ "$1" = "./scripts/gh-as-reviewer.sh" ] || \
+    [ "$1" = "$CANON_REVIEWER_WRAPPER" ]
+}
+
+is_any_wrapper_named_token() {
+  case "$1" in
+    */gh-as-author.sh|gh-as-author.sh|*/gh-as-reviewer.sh|gh-as-reviewer.sh)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 guarded_gh_invocation_label() {
   local gh_index="$1"
   local parent=""
@@ -439,7 +458,7 @@ guarded_gh_invocation_label() {
     esac
 
     case "$parent:$tok" in
-      pr:create|pr:merge|pr:comment|pr:review)
+      pr:create|pr:merge|pr:comment|pr:review|pr:edit)
         printf 'gh pr %s\n' "$tok"
         return 0
         ;;
@@ -489,6 +508,15 @@ for i in "${!TOKENS[@]}"; do
       SCAN_CURRENT_PREFIX="$tok"
       continue
       ;;
+    *)
+      if is_author_wrapper_token "$tok" || is_reviewer_wrapper_token "$tok"; then
+        SCAN_CURRENT_PREFIX="$tok"
+        continue
+      fi
+      ;;
+  esac
+
+  case "$tok" in
     -*)
       if prefix_flag_takes_value "$SCAN_CURRENT_PREFIX" "$tok"; then
         SCAN_SKIP_PREFIX_VALUE=1
@@ -571,9 +599,12 @@ fi
 INLINE_CODEX_CLEARED=""
 INLINE_BREAK_GLASS_ADMIN=""
 INLINE_BREAK_GLASS_MERGE_STATE=""
+INLINE_GH_AS_AUTHOR_IDENTITY=""
+INLINE_GH_AS_REVIEWER_IDENTITY=""
 GLOBAL_REPO=""
 PR_SUBCOMMAND=""
 PR_SUBCOMMAND_INDEX=-1    # index in TOKENS where the gh pr subcommand was found
+WRAPPER_KIND=""           # "" | "author" | "reviewer"
 SAW_GH=0
 SAW_PR=0
 SAW_ISSUE=0
@@ -685,6 +716,7 @@ for i in "${!TOKENS[@]}"; do
     "&&"|"||"|";"|"|"|"|&"|"&"|"("|")")
       AT_COMMAND_POSITION=1
       CURRENT_PREFIX=""
+      WRAPPER_KIND=""
       # Clear inline env vars ONLY when the segment that just ended
       # contained a non-assignment command. That means the assignment
       # was a PREFIX scoped to that command, not a standalone
@@ -730,6 +762,12 @@ for i in "${!TOKENS[@]}"; do
       BREAK_GLASS_MERGE_STATE=*)
         INLINE_BREAK_GLASS_MERGE_STATE="${tok#BREAK_GLASS_MERGE_STATE=}"
         ;;
+      GH_AS_AUTHOR_IDENTITY=*)
+        INLINE_GH_AS_AUTHOR_IDENTITY="${tok#GH_AS_AUTHOR_IDENTITY=}"
+        ;;
+      GH_AS_REVIEWER_IDENTITY=*)
+        INLINE_GH_AS_REVIEWER_IDENTITY="${tok#GH_AS_REVIEWER_IDENTITY=}"
+        ;;
     esac
   fi
 
@@ -737,6 +775,24 @@ for i in "${!TOKENS[@]}"; do
     # Skipping arguments of an unrelated command. Stay until a
     # separator resets us above.
     continue
+  fi
+
+  if is_any_wrapper_named_token "$tok"; then
+    if is_author_wrapper_token "$tok"; then
+      WRAPPER_KIND="author"
+      CURRENT_PREFIX="$tok"
+      continue
+    fi
+    if is_reviewer_wrapper_token "$tok"; then
+      WRAPPER_KIND="reviewer"
+      CURRENT_PREFIX="$tok"
+      continue
+    fi
+    echo "BLOCKED: non-canonical GitHub write wrapper path '$tok'." >&2
+    echo "  Use the repository wrapper so token verification is guaranteed:" >&2
+    echo "    scripts/gh-as-author.sh -- gh ..." >&2
+    echo "    scripts/gh-as-reviewer.sh -- gh ..." >&2
+    exit 2
   fi
 
   case "$tok" in
@@ -825,18 +881,119 @@ fi
 if [ "$PR_SUBCOMMAND" != "create" ] && \
    [ "$PR_SUBCOMMAND" != "merge" ] && \
    [ "$PR_SUBCOMMAND" != "comment" ] && \
+   [ "$PR_SUBCOMMAND" != "edit" ] && \
    [ "$PR_SUBCOMMAND" != "review" ] && \
    [ "$IS_ISSUE_COMMENT" -eq 0 ]; then
   exit 0
 fi
 
+cmd_label=""
+case "$PR_SUBCOMMAND" in
+  create)  cmd_label="gh pr create" ;;
+  merge)   cmd_label="gh pr merge" ;;
+  comment) cmd_label="gh pr comment" ;;
+  review)  cmd_label="gh pr review" ;;
+  edit)    cmd_label="gh pr edit" ;;
+esac
+[ "$IS_ISSUE_COMMENT" -eq 1 ] && cmd_label="gh issue comment"
+
+PR_COMMENT_BODY_HAS_CODEX_TRIGGER=0
+if [ "$PR_SUBCOMMAND" = "comment" ] && [ "$IS_ISSUE_COMMENT" -eq 0 ]; then
+  # Only author-wrapper pr comments that actually pass @codex review in
+  # the gh pr comment body are allowed. Looking at the whole shell
+  # command would let an earlier `echo "@codex review"` spoof this gate.
+  comment_walk_start=$((PR_SUBCOMMAND_INDEX + 1))
+  comment_skip_next=""
+  for j in "${!TOKENS[@]}"; do
+    if [ "$j" -lt "$comment_walk_start" ]; then
+      continue
+    fi
+    tok="${TOKENS[$j]}"
+    case "$tok" in
+      "&&"|"||"|";"|"|"|"|&"|"&"|"("|")") break ;;
+    esac
+    if [ -n "$comment_skip_next" ]; then
+      comment_skip_next=""
+      continue
+    fi
+    case "$tok" in
+      --body|-b)
+        next_index=$((j + 1))
+        body_value="${TOKENS[$next_index]:-}"
+        case "$body_value" in
+          *"@codex review"*) PR_COMMENT_BODY_HAS_CODEX_TRIGGER=1 ;;
+        esac
+        comment_skip_next=1
+        ;;
+      --body=*)
+        body_value="${tok#--body=}"
+        case "$body_value" in
+          *"@codex review"*) PR_COMMENT_BODY_HAS_CODEX_TRIGGER=1 ;;
+        esac
+        ;;
+      --body-file|-F)
+        comment_skip_next=1
+        ;;
+    esac
+  done
+fi
+
+if [ -z "$WRAPPER_KIND" ]; then
+  echo "BLOCKED: $cmd_label is a guarded GitHub write and must use a token-verifying wrapper (#411)." >&2
+  echo "" >&2
+  echo "  Direct or inline-token gh writes are not hook-verifiable before shell expansion." >&2
+  echo "  Use the wrapper that verifies the effective token immediately before the write:" >&2
+  echo "" >&2
+  case "$PR_SUBCOMMAND:$IS_ISSUE_COMMENT" in
+    create:*|merge:*|edit:*)
+      echo "    scripts/gh-as-author.sh -- $cmd_label ..." >&2
+      ;;
+    comment:0)
+      echo "    scripts/gh-as-reviewer.sh -- $cmd_label ..." >&2
+      echo "    scripts/gh-as-author.sh -- gh pr comment ... --body '@codex review'   # Codex trigger only" >&2
+      ;;
+    review:*)
+      echo "    scripts/gh-as-reviewer.sh -- $cmd_label ..." >&2
+      ;;
+    *:1)
+      echo "    scripts/gh-as-reviewer.sh -- gh issue comment ..." >&2
+      ;;
+  esac
+  echo "" >&2
+  echo "  See REVIEW_POLICY.md § Operation-to-Identity Matrix." >&2
+  exit 2
+fi
+
+AUTHOR_WRAPPER_ALLOWED=0
+REVIEWER_WRAPPER_ALLOWED=0
+case "$PR_SUBCOMMAND:$IS_ISSUE_COMMENT" in
+  create:*|merge:*|edit:*) AUTHOR_WRAPPER_ALLOWED=1 ;;
+  comment:0)
+    if [ "$PR_COMMENT_BODY_HAS_CODEX_TRIGGER" -eq 1 ]; then
+      AUTHOR_WRAPPER_ALLOWED=1
+    fi
+    REVIEWER_WRAPPER_ALLOWED=1
+    ;;
+  review:*) REVIEWER_WRAPPER_ALLOWED=1 ;;
+  *:1) REVIEWER_WRAPPER_ALLOWED=1 ;;
+esac
+
+if [ "$WRAPPER_KIND" = "author" ] && [ "$AUTHOR_WRAPPER_ALLOWED" -ne 1 ]; then
+  echo "BLOCKED: $cmd_label was routed through gh-as-author.sh, but this write must use a reviewer token." >&2
+  echo "  Use scripts/gh-as-reviewer.sh -- $cmd_label ..." >&2
+  exit 2
+fi
+if [ "$WRAPPER_KIND" = "reviewer" ] && [ "$REVIEWER_WRAPPER_ALLOWED" -ne 1 ]; then
+  echo "BLOCKED: $cmd_label was routed through gh-as-reviewer.sh, but this write must use the author token." >&2
+  echo "  Use scripts/gh-as-author.sh -- $cmd_label ..." >&2
+  exit 2
+fi
+
 # --- byline guard for pr comment / pr review / issue comment ---
 #
-# These three subcommands share a single policy: the keyring's active
-# account must exactly match the operating agent's REVIEWER identity.
-# Posting any of them under nathanjohnpayne OR the wrong reviewer
-# identity mis-attributes the byline in a way that breaks the
-# audit-trail invariant REVIEW_POLICY.md depends on.
+# These three subcommands share a single policy: reviewer writes must be
+# routed through gh-as-reviewer.sh, and that wrapper must be configured
+# for the expected reviewer identity.
 #
 # `gh issue create` is deliberately excluded — it was briefly guarded
 # here (#317, after the mergepath#315 misattribution) but reverted,
@@ -859,37 +1016,16 @@ else
   fi
 fi
 if [ "$PR_SUBCOMMAND" = "comment" ] || [ "$PR_SUBCOMMAND" = "review" ] || [ "$IS_ISSUE_COMMENT" -eq 1 ]; then
-  if [ "${BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
-    ACTIVE_GH_USER=$(gh config get -h github.com user 2>/dev/null || echo "")
-    if [ -z "$ACTIVE_GH_USER" ]; then
-      echo "BLOCKED: gh-pr-guard could not read the active gh account from 'gh config get -h github.com user'." >&2
-      echo "  Either gh is not installed/authenticated, or the keyring config is corrupt." >&2
-      echo "  Run 'gh auth login' for the $EXPECTED_REVIEWER identity, then retry." >&2
-      exit 2
+  if [ "$WRAPPER_KIND" = "reviewer" ]; then
+    WRAPPER_REVIEWER_IDENTITY="${INLINE_GH_AS_REVIEWER_IDENTITY:-${GH_AS_REVIEWER_IDENTITY:-}}"
+    if [ -z "$WRAPPER_REVIEWER_IDENTITY" ] && [ -n "${MERGEPATH_AGENT:-}" ]; then
+      WRAPPER_REVIEWER_IDENTITY="nathanpayne-$MERGEPATH_AGENT"
     fi
-    EXPECTED_AUTHOR_FOR_BLOCK="${GH_PR_GUARD_EXPECTED_AUTHOR:-nathanjohnpayne}"
-    if [ "$ACTIVE_GH_USER" != "$EXPECTED_REVIEWER" ]; then
-      cmd_label=""
-      case "$PR_SUBCOMMAND" in
-        comment) cmd_label="gh pr comment" ;;
-        review)  cmd_label="gh pr review" ;;
-      esac
-      [ "$IS_ISSUE_COMMENT" -eq 1 ] && cmd_label="gh issue comment"
-      if [ "$ACTIVE_GH_USER" = "$EXPECTED_AUTHOR_FOR_BLOCK" ]; then
-        active_role="the AUTHOR identity"
-      else
-        active_role="not the expected reviewer identity"
-      fi
-      echo "BLOCKED: $cmd_label is about to run under active account '$ACTIVE_GH_USER' ($active_role)." >&2
-      echo "" >&2
-      echo "  Reviewer-byline commands (pr comment / pr review / issue comment)" >&2
-      echo "  must attribute to the operating agent's REVIEWER identity ('$EXPECTED_REVIEWER' for this hook invocation, from $EXPECTED_REVIEWER_SOURCE)." >&2
-      echo "  Posting as '$ACTIVE_GH_USER' breaks the audit-trail convention REVIEW_POLICY.md depends on." >&2
-      echo "" >&2
-      echo "  Fix once: gh auth switch -u $EXPECTED_REVIEWER" >&2
-      echo "  Or set MERGEPATH_AGENT=<agent> / GH_PR_GUARD_EXPECTED_REVIEWER=$ACTIVE_GH_USER only if that is this agent's true reviewer identity." >&2
-      echo "  Or wrap the single call: scripts/gh-as-reviewer.sh -- $cmd_label ..." >&2
-      echo "  See REVIEW_POLICY.md § Operation-to-Identity Matrix." >&2
+    WRAPPER_REVIEWER_IDENTITY="${WRAPPER_REVIEWER_IDENTITY:-nathanpayne-claude}"
+    if [ "$WRAPPER_REVIEWER_IDENTITY" != "$EXPECTED_REVIEWER" ]; then
+      echo "BLOCKED: $cmd_label wrapper is configured for '$WRAPPER_REVIEWER_IDENTITY', not expected reviewer '$EXPECTED_REVIEWER'." >&2
+      echo "  Expected reviewer source: $EXPECTED_REVIEWER_SOURCE" >&2
+      echo "  Set GH_AS_REVIEWER_IDENTITY=$EXPECTED_REVIEWER or MERGEPATH_AGENT=<agent> consistently." >&2
       exit 2
     fi
   fi
@@ -901,7 +1037,7 @@ fi
 # them, per REVIEW_POLICY.md § No-self-approve scoping. The hook
 # detects:
 #   - PR_SUBCOMMAND=review with --approve in the args
-#   - active keyring identity = nathanpayne-<agent>
+#   - reviewer wrapper identity = nathanpayne-<agent>
 #   - PR body contains `Authoring-Agent: <agent>` matching the same
 #     agent suffix
 #   - PR is over-threshold (determined from .github/review-policy.yml
@@ -966,20 +1102,13 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
   fi
 
   if [ "$REVIEW_APPROVE" -eq 1 ] && [ "${BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
-    # The keyring read above (in the byline guard) ran a check, but
-    # we need to re-read here in case the byline guard was bypassed.
-    ACTIVE_GH_USER=$(gh config get -h github.com user 2>/dev/null || echo "")
-
-    # Extract the agent suffix from the active identity. We only
-    # apply self-approve detection when the active identity matches
-    # the nathanpayne-<agent> pattern; other identities go through
-    # without this sub-guard.
-    KEYRING_AGENT=""
-    case "$ACTIVE_GH_USER" in
-      nathanpayne-*) KEYRING_AGENT="${ACTIVE_GH_USER#nathanpayne-}" ;;
+    REVIEWER_FOR_APPROVE="${WRAPPER_REVIEWER_IDENTITY:-}"
+    REVIEWER_AGENT=""
+    case "$REVIEWER_FOR_APPROVE" in
+      nathanpayne-*) REVIEWER_AGENT="${REVIEWER_FOR_APPROVE#nathanpayne-}" ;;
     esac
 
-    if [ -n "$KEYRING_AGENT" ]; then
+    if [ -n "$REVIEWER_AGENT" ]; then
       # Fetch PR body + lines-changed + headRefName + author for the
       # self-approve check. headRefName + author drive the propagation-
       # lane bypass (#334): lane PRs (branch starts with
@@ -1042,7 +1171,7 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
 
       PR_AUTHORING_AGENT=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oiE 'Authoring-Agent:[[:space:]]*[A-Za-z0-9_-]+' | head -1 | sed -E 's/Authoring-Agent:[[:space:]]*//I' | tr '[:upper:]' '[:lower:]' || true)
 
-      if [ -n "$PR_AUTHORING_AGENT" ] && [ "$PR_AUTHORING_AGENT" = "$KEYRING_AGENT" ]; then
+      if [ -n "$PR_AUTHORING_AGENT" ] && [ "$PR_AUTHORING_AGENT" = "$REVIEWER_AGENT" ]; then
         # Same-agent author + reviewer. Decide over/under-threshold.
         # Heuristic: parse `external_review_threshold` from
         # .github/review-policy.yml (line count); compute
@@ -1067,7 +1196,7 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
         if [ "$is_over" -eq 1 ]; then
           echo "BLOCKED: self-approve detected on an over-threshold PR." >&2
           echo "" >&2
-          echo "  Active keyring identity: $ACTIVE_GH_USER" >&2
+          echo "  Reviewer wrapper identity: $REVIEWER_FOR_APPROVE" >&2
           echo "  PR Authoring-Agent:      $PR_AUTHORING_AGENT" >&2
           echo "  PR size:                 $total lines changed (threshold: ${threshold:-unknown})" >&2
           echo "" >&2
@@ -1103,58 +1232,6 @@ fi
 # structural ones, and they don't depend on argument positions or
 # global flags.
 if [ "$PR_SUBCOMMAND" = "create" ]; then
-  # Identity check (#241): the keyring's active account must be the
-  # AUTHOR identity (nathanjohnpayne) at the moment of `gh pr create`,
-  # otherwise the PR is authored by whatever identity IS active —
-  # observed concretely on friends-and-family-billing#262 where a
-  # split switch / pr-create across two Bash tool calls landed a PR
-  # under the wrong identity. The canonical fix is to wrap the entire
-  # sequence in `scripts/gh-as-author.sh` so the switch and the create
-  # share one bash process.
-  #
-  # The check uses `gh config get -h github.com user`, NOT `gh auth
-  # status`. The latter is GH_TOKEN-poisonable: when GH_TOKEN is set
-  # it reports the GH_TOKEN entry as Active, but the keyring entry is
-  # still the one that signs writes. `gh config get` reads the
-  # keyring config file directly and is the authoritative read for
-  # "who will this write attribute to".
-  #
-  # Escape hatch: `BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK=1` lets
-  # tests and edge cases bypass this check. The check is additive
-  # defense-in-depth on top of gh-as-author.sh — when an agent runs
-  # `scripts/gh-as-author.sh -- gh pr create ...` correctly, the
-  # wrapper has already switched to the author identity by the time
-  # this hook fires, so the check passes naturally without the
-  # escape. The escape exists for test harnesses that PATH-shim `gh`
-  # and have no real keyring to read.
-  EXPECTED_AUTHOR="${GH_PR_GUARD_EXPECTED_AUTHOR:-nathanjohnpayne}"
-  if [ "${BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
-    ACTIVE_GH_USER=$(gh config get -h github.com user 2>/dev/null || echo "")
-    if [ -z "$ACTIVE_GH_USER" ]; then
-      echo "BLOCKED: gh-pr-guard could not read the active gh account from 'gh config get -h github.com user'." >&2
-      echo "  Either gh is not installed/authenticated, or the keyring config is corrupt." >&2
-      echo "  Run 'gh auth login' for the $EXPECTED_AUTHOR identity, then retry via scripts/gh-as-author.sh." >&2
-      exit 2
-    fi
-    if [ "$ACTIVE_GH_USER" != "$EXPECTED_AUTHOR" ]; then
-      echo "BLOCKED: gh pr create is about to run under active account '$ACTIVE_GH_USER', not the expected author identity '$EXPECTED_AUTHOR'." >&2
-      echo "" >&2
-      echo "  This is the #241 footgun. A PR created right now would be authored by '$ACTIVE_GH_USER'," >&2
-      echo "  which breaks self-approval (Can not approve your own pull request) and inverts the" >&2
-      echo "  Authoring-Agent: fingerprint in the PR body." >&2
-      echo "" >&2
-      echo "  Canonical fix: wrap the call in scripts/gh-as-author.sh, which switches to" >&2
-      echo "  $EXPECTED_AUTHOR, runs gh pr create, then restores the prior active account via" >&2
-      echo "  trap EXIT — all inside one bash process so the switch and the create can't drift apart:" >&2
-      echo "" >&2
-      echo "    scripts/gh-as-author.sh -- gh pr create --title '...' --body '...'" >&2
-      echo "" >&2
-      echo "  See REVIEW_POLICY.md § Recovery: PR created under the wrong identity for the case" >&2
-      echo "  where a PR already landed under the wrong account." >&2
-      exit 2
-    fi
-  fi
-
   MISSING=""
 
   if ! echo "$COMMAND" | grep -qi 'Authoring-Agent:'; then
@@ -1172,6 +1249,13 @@ if [ "$PR_SUBCOMMAND" = "create" ]; then
     exit 2
   fi
 
+  exit 0
+fi
+
+# gh pr edit is a guarded write for attribution, but label-specific
+# edit policy is enforced by label-removal-guard.sh. Once the author
+# wrapper has been verified above, no merge-state checks apply here.
+if [ "$PR_SUBCOMMAND" = "edit" ]; then
   exit 0
 fi
 

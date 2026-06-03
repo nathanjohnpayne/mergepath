@@ -91,23 +91,22 @@
 #   Format:      bash-sourceable KEY='value' lines (printf %q-escaped)
 #   TTL anchor:  OP_PREFLIGHT_CREATED_AT_EPOCH (embedded in file, not mtime)
 #
-# After eval, downstream usage splits along the gh read/write boundary
-# (see CLAUDE.md § Active-account convention):
+# After eval, downstream gh usage is token-first (see REVIEW_POLICY.md
+# § Reviewer PAT Quick Start):
 #
 #   # Read-path: GH_TOKEN authenticates the request (no byline involved).
 #   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login
 #   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-check.sh <PR#>
 #
-#   # Helpers that may also POST a trigger comment — GH_TOKEN authenticates
-#   # the API call, but the comment byline is the active keyring account.
+#   # Helpers use cached PATs so repeated checks do not prompt.
 #   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/coderabbit-wait.sh <PR#>
-#   GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-request.sh <PR#>
+#   scripts/codex-review-request.sh <PR#>  # auto-sources the author token for the trigger
 #
-#   # Write-path: active keyring is the byline; GH_TOKEN is irrelevant.
-#   # This script warns if active != expected.
-#   gh pr review <PR#> --comment --body "..."   # active = nathanpayne-<agent>
-#   gh auth switch -u nathanjohnpayne && gh pr merge <PR#> ... && \
-#     gh auth switch -u nathanpayne-<agent>     # author write
+#   # Write-path: wrappers verify the selected token immediately before
+#   # the command, set process-local GH_TOKEN, and never mutate gh state.
+#   GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> \
+#     scripts/gh-as-reviewer.sh -- gh pr review <PR#> --comment --body "..."
+#   scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch
 #
 #   # gcloud/firebase use GOOGLE_APPLICATION_CREDENTIALS automatically.
 
@@ -606,94 +605,21 @@ log_stale_adc_guidance() {
 # incomplete codex session file look valid and causing gh to run as
 # the wrong identity. See round-5 Codex finding on the propagation
 # PRs for the multi-agent repro.
-# Active-account drift auto-restore (#284, replaces the previous warn-
-# only behavior). gh's write paths use the keyring's active account
-# regardless of GH_TOKEN. Each agent's machine should have its agent
-# identity (nathanpayne-<agent>) as the active gh account so
-# reviewer-identity writes (gh pr review --comment) attribute correctly
-# without a switch. Author-identity writes (gh pr create / merge / edit)
-# still need a temporary `gh auth switch -u nathanjohnpayne` around them.
-# See nathanjohnpayne/mergepath#164 for the empirical diagnosis
-# (matchline PRs #181, #182 — wrong-byline reviews when active was
-# nathanjohnpayne instead of the agent identity).
+# Compatibility shim for the retired active-account repair path.
 #
-# The prior behavior was a stderr warning: "your keyring drifted, here's
-# the fix command, you go run it." In practice agents kept missing the
-# warning and kept landing misattributed writes (#283 in-session
-# incidents documented this concretely). The new behavior is
-# auto-restore: if the keyring drifted, we run the switch ourselves
-# and log a clear stderr line so the operator can see what happened.
-# Idempotent — when the keyring is already correct, the function is a
-# no-op. Fail-soft — a switch failure logs and returns 0 (we don't
-# want preflight itself to abort because of an auth-switch race).
+# #411 flips GitHub attribution to verified process-local tokens. The
+# old preflight behavior repaired the global gh active account with
+# `gh auth switch -u nathanpayne-<agent>` on normal review/check paths.
+# That mutation is exactly what made concurrent agents fight over
+# ~/.config/gh/hosts.yml, so preflight no longer reads or changes the
+# active account. The wrappers verify the effective token immediately
+# before each write instead.
 restore_active_account_or_warn() {
-  # Skip silently when no agent is selected (e.g. deploy-only runs that
-  # don't need a reviewer identity). The check only makes sense when
-  # we know which agent identity SHOULD be active. Codex P2 on PR #171.
-  [[ -z "$AGENT" ]] && return 0
-  command -v gh >/dev/null 2>&1 || return 0
-  local expected="nathanpayne-${AGENT}"
-  local actual=""
-  # Use `gh config get -h github.com user` to read the active keyring
-  # account. This is the GH_TOKEN-immune signal:
-  #
-  #   - `gh auth status` honors GH_TOKEN — when GH_TOKEN is set, gh
-  #     reports the GH_TOKEN entry as Active: true and flips the
-  #     keyring entry to Active: false, even though writes still use
-  #     the keyring active. Codex CHANGES_REQUESTED on #171 reproduced
-  #     this masking: GH_TOKEN=<codex PAT> + keyring active=claude
-  #     made `gh auth status` parsers report codex as active, masking
-  #     the mismatch the warn function exists to surface.
-  #
-  #   - `gh config get -h github.com user` reads the keyring's stored
-  #     active username directly from ~/.config/gh/hosts.yml. It does
-  #     NOT honor GH_TOKEN. Verified: returns `nathanpayne-claude`
-  #     unchanged with and without GH_TOKEN set.
-  #
-  # Wrap in `|| true` so a `gh config` failure (corrupt hosts.yml,
-  # no gh login) cannot abort the parent under `set -eo pipefail`.
-  actual=$(gh config get -h github.com user 2>/dev/null || true)
-  if [[ -z "$actual" ]] || [[ "$actual" == "$expected" ]]; then
-    return 0
-  fi
-
-  echo "# ──────────────────────────────────────────────────────" >&2
-  echo "# Preflight: keyring drift detected — auto-restoring." >&2
-  echo "#   Was:      $actual" >&2
-  echo "#   Restoring: $expected" >&2
-  echo "#   Reason:   gh write paths (pr review/comment/etc.) attribute" >&2
-  echo "#             to the keyring's active account. Letting the drift" >&2
-  echo "#             persist would land the next reviewer write under the" >&2
-  echo "#             wrong byline. See REVIEW_POLICY.md § Operation-to-" >&2
-  echo "#             Identity Matrix and #284." >&2
-  if gh auth switch -u "$expected" >/dev/null 2>&1; then
-    local verify
-    verify=$(gh config get -h github.com user 2>/dev/null || true)
-    if [[ "$verify" == "$expected" ]]; then
-      echo "#   Result:   restored to $expected." >&2
-    else
-      echo "#   Result:   switch returned 0 but active is still '$verify'." >&2
-      echo "#             The switch silently no-op'd (corrupt hosts.yml," >&2
-      echo "#             mock gh, concurrent switch race). Run" >&2
-      echo "#             gh auth switch -u '$expected' manually to recover." >&2
-    fi
-  else
-    echo "#   Result:   gh auth switch -u '$expected' FAILED." >&2
-    echo "#             Is $expected in the keyring? Run 'gh auth login'" >&2
-    echo "#             once for that identity, then re-run preflight." >&2
-  fi
-  echo "# ──────────────────────────────────────────────────────" >&2
-  # Fail-soft: never abort preflight on a switch failure. The next
-  # write that lands under the wrong byline will fail its own
-  # identity-check at the write site (the helper scripts each gate
-  # on identity-check.sh before posting).
   return 0
 }
 
 # Backwards-compat shim: the prior `warn_active_account_mismatch`
-# name is still referenced in some downstream consumers' wrappers.
-# Map it to the new auto-restore function so propagation lands
-# cleanly. Remove this alias once all consumers have re-propagated.
+# name is still referenced in downstream consumers' wrappers.
 warn_active_account_mismatch() {
   restore_active_account_or_warn "$@"
 }

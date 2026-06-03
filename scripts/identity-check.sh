@@ -2,25 +2,17 @@
 # scripts/identity-check.sh — Pre-action identity assertion helper (#284).
 #
 # Asserts that the current execution context has the EXPECTED gh identity
-# at the moment of call. Used as a fail-closed pre-write guard from
-# helper scripts (coderabbit-wait.sh, codex-review-request.sh,
-# resolve-pr-threads.sh, request-label-removal.sh) and the gh-as-*
-# wrappers, so a silent active-account drift never lands a PR write
-# under the wrong byline.
+# at the moment of call. The gh-as-* wrappers use token mode to verify
+# the exact PAT that will sign a guarded write. Legacy helper paths also
+# use the keyring modes below while they remain outside the wrapper
+# contract.
 #
 # Why this exists:
 #
-#   `gh` resolves the byline for write paths from the keyring's ACTIVE
-#   account (read with `gh config get -h github.com user`), not from
-#   GH_TOKEN. A `gh auth switch -u <X>` that silently no-ops (X not in
-#   the keyring; corrupt hosts.yml; race with a parallel switch in
-#   another process) leaves the keyring on the prior identity but
-#   returns rc=0 — the wrapped write then lands under the wrong
-#   account. See #241 / #283 for two concrete in-session incidents.
-#
-#   This helper is the assertion knife: one call before any write
-#   verifies that the caller's expected identity matches reality.
-#   Callers wire it in at the top of each WRITE path.
+#   Guarded writes now use a process-local token selected by a wrapper.
+#   That token must be verified before the write, and token material must
+#   never be printed. The historical keyring checks remain available for
+#   helper scripts that have not moved to wrappers yet.
 #
 # Modes (mutually exclusive; exactly one is required):
 #
@@ -42,10 +34,9 @@
 #
 #   --expect-token-identity <login>
 #     Runs `gh api user --jq .login` with the CURRENT $GH_TOKEN and
-#     asserts the response matches <login>. This is for PAT-authored
-#     writes — specifically `gh api graphql` mutations like
-#     resolveReviewThread, where attribution follows the token, NOT
-#     the keyring. See REVIEW_POLICY.md § Operation-to-Identity Matrix.
+#     asserts the response matches <login>. This is the primary mode for
+#     gh-as-* wrappers and PAT-authored writes such as `gh api graphql`
+#     mutations. See REVIEW_POLICY.md § Operation-to-Identity Matrix.
 #
 # Exit codes:
 #   0  match (proceed)
@@ -62,16 +53,12 @@
 #
 #   `--expect-author` / `--expect-reviewer` / `--expect-external` all
 #   read the KEYRING's active account via `gh config get -h github.com
-#   user`. This is the GH_TOKEN-immune signal — `gh auth status` is
-#   poisonable when GH_TOKEN is set (it reports the GH_TOKEN entry as
-#   Active even though writes still attribute to the keyring), so we
-#   never use it.
+#   user`. These modes exist for legacy helper paths that still need a
+#   GH_TOKEN-immune keyring assertion.
 #
-#   `--expect-token-identity` is the inverse: it asserts the IDENTITY
-#   ATTACHED TO $GH_TOKEN, not the keyring. PAT-attributed writes
-#   (specifically `gh api graphql` mutations) follow GH_TOKEN, not the
-#   keyring. The matrix subsection in REVIEW_POLICY.md walks through
-#   which operations belong to which auth layer.
+#   `--expect-token-identity` asserts the IDENTITY ATTACHED TO
+#   $GH_TOKEN, not the keyring. This is the canonical assertion for
+#   wrapper-selected write tokens.
 #
 # Bash 3.2 portable (macOS default).
 

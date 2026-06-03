@@ -50,6 +50,27 @@ exit 98
 EOF
 chmod +x "$STUB_DIR/ssh"
 
+# Stub `gh` to prove --check never mutates the active account. A
+# config read is harmless; any auth switch is the #411 regression.
+cat > "$STUB_DIR/gh" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  "config get")
+    echo "nathanpayne-cursor"
+    exit 0
+    ;;
+  "auth switch")
+    echo "FATAL: --check invoked gh auth switch with args: $*" >&2
+    exit 97
+    ;;
+  *)
+    echo "FATAL: --check invoked unexpected gh command: $*" >&2
+    exit 96
+    ;;
+esac
+EOF
+chmod +x "$STUB_DIR/gh"
+
 # Helper: synthesize a fresh cache file.
 make_fresh_cache() {
   local dir="$1" agent="$2" reviewer_pat="$3" author_pat="$4"
@@ -119,7 +140,7 @@ test_check_fresh_cache() {
     fail "test_check_fresh_cache: --check invoked op or ssh; stderr=$err"
     return
   fi
-  pass "test_check_fresh_cache: fresh cache emits exports without op/ssh"
+  pass "test_check_fresh_cache: fresh cache emits exports without op/ssh/gh auth switch"
 }
 
 # ---------------------------------------------------------------------------

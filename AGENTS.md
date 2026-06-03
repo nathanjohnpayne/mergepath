@@ -26,8 +26,8 @@ This repository uses a multi-identity AI agent code review system. The full poli
 ### Workflow Summary
 
 0. Run credential preflight at the start of every PR session. The
-   canonical session-loop snippet (read-path GH_TOKEN, write-path
-   active-keyring, author-write wrapper — full details in REVIEW_POLICY.md
+   canonical session-loop snippet (read-path GH_TOKEN, token-verified
+   write wrappers — full details in REVIEW_POLICY.md
    § Phase 0 and § PAT lookup table):
 
    ```bash
@@ -40,50 +40,39 @@ This repository uses a multi-identity AI agent code review system. The full poli
    # Read-path API call (uses cached PAT, no biometric):
    GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login
 
-   # Reviewer write path. The hook derives the expected reviewer from
-   # GH_PR_GUARD_EXPECTED_REVIEWER, then MERGEPATH_AGENT, then claude;
-   # when in doubt, use gh-as-reviewer.sh so the wrapper switches/verifies.
-   gh pr review <PR#> --comment --body "..."
+   # Reviewer write path (the wrapper verifies the reviewer token):
    GH_AS_REVIEWER_IDENTITY=nathanpayne-{your-agent} \
      scripts/gh-as-reviewer.sh -- gh pr review <PR#> --comment --body "..."
 
-   # Author write (temporary switch via the gh-as-author.sh wrapper):
+   # Author write path (the wrapper verifies the author token):
    scripts/gh-as-author.sh -- gh pr create ...
    ```
 
    `--check` (alias `--status`) is the lightweight re-validator: never
    invokes `op`, never warms SSH, exits non-zero on missing/stale
    cache. Set `OP_PREFLIGHT_QUIET=1` to collapse the cache-hit stderr
-   block. The helper scripts (`coderabbit-wait.sh`,
-   `codex-review-request.sh`, `codex-review-check.sh`,
-   `resolve-pr-threads.sh`, `request-label-removal.sh`) auto-source
+   block. It does not read or repair the gh active keyring. The helper
+   scripts (`coderabbit-wait.sh`, `codex-review-request.sh`,
+   `codex-review-check.sh`, `resolve-pr-threads.sh`,
+   `request-label-removal.sh`) auto-source
    the cache when `GH_TOKEN` is unset (#282), so the explicit
    `GH_TOKEN=...` prefix is optional once preflight has run.
 
-   Set the gh keyring active account once per machine: `gh auth switch
-   -u nathanpayne-{your-agent}`. Then read-path commands use
-   `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"`; write paths use the
-   keyring active. Bare reviewer-byline writes (`gh pr comment`,
-   `gh pr review`, `gh issue comment`) are blocked unless the active
-   keyring account exactly matches the expected reviewer resolved from
-   `GH_PR_GUARD_EXPECTED_REVIEWER`, then `MERGEPATH_AGENT`, then the
-   `claude` default; use `scripts/gh-as-reviewer.sh` when the harness
-   env is uncertain.
-   For author-identity writes (PR create/merge/label edits), MUST
-   wrap the call in `scripts/gh-as-author.sh -- gh pr create ...` — a
-   single bash process that switches, runs, and switches back via
-   `trap EXIT`. Splitting the sequence across two Bash tool calls
-   lands the PR under the wrong identity (#241). The `gh-pr-guard.sh`
-   PreToolUse hook now blocks `gh pr create` when the keyring's active
-   is not `nathanjohnpayne`. See REVIEW_POLICY.md § Reviewer PAT Quick
-   Start for the full convention and § Recovery: PR created under the
-   wrong identity for what to do if a PR already landed under the
-   wrong account.
+   Do not use bare guarded writes. The `gh-pr-guard.sh` PreToolUse hook
+   blocks direct or inline-token `gh pr create|merge|review|comment|edit`
+   and `gh issue comment` because the hook cannot verify shell-expanded
+   `GH_TOKEN=...` before execution. Use `scripts/gh-as-author.sh` for
+   author writes (`gh pr create`, `gh pr merge`, `gh pr edit`, and the
+   author-attributed `@codex review` trigger), and
+   `scripts/gh-as-reviewer.sh` for reviewer writes (`gh pr review`,
+   `gh pr comment`, `gh issue comment`). The wrappers verify the
+   effective token with `identity-check.sh --expect-token-identity` and
+   never mutate the machine-global gh active account.
 
    Run `scripts/op-preflight.sh --agent {your-agent} --purge` (or
    `--purge-all`) at end of session to delete the cached PATs.
 1. Author code as nathanjohnpayne. File a PR.
-2. Review the PR under your reviewer identity. With your agent identity active and either `MERGEPATH_AGENT={your-agent}` or `GH_PR_GUARD_EXPECTED_REVIEWER=nathanpayne-{your-agent}` set, bare `gh pr review <PR#> --comment --body "..."` attributes correctly. If the hook environment is uncertain, wrap the call with `GH_AS_REVIEWER_IDENTITY=nathanpayne-{your-agent} scripts/gh-as-reviewer.sh -- gh pr review ...`. Post comments.
+2. Review the PR under your reviewer identity using `GH_AS_REVIEWER_IDENTITY=nathanpayne-{your-agent} scripts/gh-as-reviewer.sh -- gh pr review ...`. Post comments.
 3. Address each comment via fix commits (commits use git config, no gh auth involved — byline stays nathanjohnpayne).
 4. Repeat steps 2–3 until the reviewer identity approves with no outstanding issues. The mechanism: for under-threshold PRs (step 6), `gh pr review --approve` from your reviewer identity is the intended path — it satisfies branch protection without bouncing a small PR to an external agent. For above-threshold PRs (step 7), post `gh pr review --comment` only; Phase 4 carries the cross-agent gate. See REVIEW_POLICY.md § No-self-approve scoping.
 5. If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`:
@@ -92,7 +81,7 @@ This repository uses a multi-identity AI agent code review system. The full poli
    c. **Grep inline comments** for `Potential issue` or `⚠️` — these must each be explicitly addressed (fixed or dismissed with reasoning).
    d. Address other substantive findings. CodeRabbit review is advisory and does not block merge.
 6. Check .github/review-policy.yml for the external review threshold. If the PR does NOT meet it (lines changed < external_review_threshold AND no file matches external_review_paths), merge as nathanjohnpayne. Done.
-7. If the PR meets the threshold, proceed to Phase 4 (see REVIEW_POLICY.md § Phase 4). Before Phase 4a, consult `phase_4b_default` from `.github/review-policy.yml` (parsed and exported as `PHASE_4B_DEFAULT` by `scripts/codex-review-check.sh`). When set to `complex-changes`, run `scripts/phase-4b-classifier.sh <PR#>` between 4a clearance and merge — exit 1 means post the Phase 4b handoff and wait for an external CLI review; exit 0 means merge. Full detail in CLAUDE.md step 8.5 and REVIEW_POLICY.md § Phase 4b Triggers. Phase 4 has two legs:
+7. If the PR meets the threshold, proceed to Phase 4 (see REVIEW_POLICY.md § Phase 4). Before Phase 4a, consult `phase_4b_default` from `.github/review-policy.yml` (parsed and exported as `PHASE_4B_DEFAULT` by `scripts/codex-review-check.sh`). When set to `complex-changes`, run `scripts/phase-4b-classifier.sh <PR#>` between 4a clearance and merge — exit 1 means post the Phase 4b handoff and wait for an external CLI review; exit 0 means merge. Full detail lives in REVIEW_POLICY.md § Phase 4b Triggers. Phase 4 has two legs:
    - **Phase 4a — Automated (preferred)** when ALL of: `codex.enabled: true` in `.github/review-policy.yml`, BOTH `scripts/codex-review-request.sh` AND `scripts/codex-review-check.sh` exist on disk, AND the **ChatGPT Codex Connector GitHub App is review-ready on this repo**. "Review-ready" means installed, Code Review enabled at [chatgpt.com/codex/cloud/settings/code-review](https://chatgpt.com/codex/cloud/settings/code-review), AND a Codex environment configured at [chatgpt.com/codex/cloud/settings/environments](https://chatgpt.com/codex/cloud/settings/environments). Verify only by observation: did a recent PR in this repo receive an auto-review from `chatgpt-codex-connector[bot]`? That is the only reliable check from a reviewer PAT — `gh api repos/{owner}/{repo}/installation` requires a GitHub App JWT and returns 401 for normal tokens. Drive the Codex GitHub App review loop: post `@codex review` via the request script, address **P0/P1** findings (fix code or rebuttal reply — P2/P3 findings do NOT block clearance), loop up to `codex.max_review_rounds`. On clearance (COMMENTED review with no unaddressed P0/P1 findings on the current HEAD, OR 👍 reaction from `chatgpt-codex-connector[bot]`), run `scripts/codex-review-check.sh` to verify the merge gate and merge. On exit code 4 (timeout), drop to Phase 4b. On repeat-after-rebuttal or round > `max_review_rounds`, escalate per § Disagreements below. If any of the conditions is false (Codex App not review-ready, partial script rollout, or Codex disabled in config), fall back to Phase 4b directly rather than entering 4a and stalling.
    - **Phase 4b — Manual CLI fallback** when 4a is unavailable or 4a fell back. When `codex.enabled: false`, `scripts/codex-review-check.sh` ignores Codex bot reviews/reactions and requires this Phase 4b substitute path for gate (c). Post the handoff message (see REVIEW_POLICY.md § Handoff Message Format) as a PR comment, emit the chat-side handoff block per REVIEW_POLICY.md § Handoff Message Format § Chat-side handoff block before alerting the human, and wait for an external reviewer identity (e.g., nathanpayne-codex) to post an `APPROVED` review via a separate agent CLI session. Address feedback via back-and-forth.
 8. If the external reviewer flags observations or risks while approving, create a GitHub Issue for each one assigned to nathanjohnpayne with labels "post-review" and "observation" or "risk" before merging.
