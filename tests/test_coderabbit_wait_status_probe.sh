@@ -335,14 +335,19 @@ test_probe_post_failure_stays_timeout_advisory() {
   dir=$(make_case "probe-post-failure" 1 true 6 2)
   rc=$(run_case "$dir" probe_post_failure)
   count=$(probe_count "$dir")
+  if [ "$rc" != "4" ]; then
+    fail "probe post failure: exit $rc, expected advisory timeout 4; stderr=$(cat "$dir/err.log")"
+    return
+  elif [ ! -s "$dir/out.json" ]; then
+    fail "probe post failure: missing timeout JSON output; stderr=$(cat "$dir/err.log")"
+    return
+  fi
   status=$(jq -r '.status' "$dir/out.json")
   posted=$(jq -r '.status_probe.posted' "$dir/out.json")
   reply_present=$(jq -r '.status_probe.reply_present' "$dir/out.json")
   review=$(jq -r '.review // "null"' "$dir/out.json")
 
-  if [ "$rc" != "4" ]; then
-    fail "probe post failure: exit $rc, expected advisory timeout 4; stderr=$(cat "$dir/err.log")"
-  elif [ "$status" != "timeout" ]; then
+  if [ "$status" != "timeout" ]; then
     fail "probe post failure: status=$status, expected timeout"
   elif [ "$count" != "0" ] || [ "$posted" != "false" ]; then
     fail "probe post failure: probe count=$count posted=$posted, expected no successful probe"
@@ -360,14 +365,19 @@ test_probe_reply_poll_failure_stays_timeout_advisory() {
   dir=$(make_case "probe-reply-poll-failure" 1 true 6 2)
   rc=$(run_case "$dir" reply_poll_failure)
   count=$(probe_count "$dir")
+  if [ "$rc" != "4" ]; then
+    fail "probe reply poll failure: exit $rc, expected advisory timeout 4; stderr=$(cat "$dir/err.log")"
+    return
+  elif [ ! -s "$dir/out.json" ]; then
+    fail "probe reply poll failure: missing timeout JSON output; stderr=$(cat "$dir/err.log")"
+    return
+  fi
   status=$(jq -r '.status' "$dir/out.json")
   posted=$(jq -r '.status_probe.posted' "$dir/out.json")
   reply_present=$(jq -r '.status_probe.reply_present' "$dir/out.json")
   review=$(jq -r '.review // "null"' "$dir/out.json")
 
-  if [ "$rc" != "4" ]; then
-    fail "probe reply poll failure: exit $rc, expected advisory timeout 4; stderr=$(cat "$dir/err.log")"
-  elif [ "$status" != "timeout" ]; then
+  if [ "$status" != "timeout" ]; then
     fail "probe reply poll failure: status=$status, expected timeout"
   elif [ "$count" != "1" ] || [ "$posted" != "true" ]; then
     fail "probe reply poll failure: probe count=$count posted=$posted, expected one successful probe"
