@@ -291,6 +291,20 @@ fetch_api_array() {
     || die 3 "failed to flatten $label pagination output"
 }
 
+fetch_api_array_best_effort() {
+  local endpoint=$1
+  local label=$2
+  local raw
+  raw=$(gh api --paginate "$endpoint" 2>&1) || {
+    log "best-effort fetch failed for $label: $raw"
+    return 1
+  }
+  echo "$raw" | jq -s 'add // []' 2>/dev/null || {
+    log "best-effort fetch failed to flatten $label pagination output"
+    return 1
+  }
+}
+
 # Fetch the CodeRabbit `StatusContext` check on the current HEAD SHA.
 # Emits compact JSON with:
 #   { "state": "success|failure|pending|error|missing", "created_at": "..." }
@@ -497,10 +511,9 @@ classify_comment() {
 # Codex finding (P1, line 285). Inline findings are instead scanned
 # separately by count_potential_issues() only after this function
 # reports a PR-level terminal state.
-scan_latest_comment() {
-  local issue_comments latest
-  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
-
+latest_comment_from_issue_comments() {
+  local issue_comments=$1
+  local latest
   latest=$(echo "$issue_comments" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
     def status_probe_reply:
       ((.body // "") | test("CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits"; "i"));
@@ -519,6 +532,21 @@ scan_latest_comment() {
     return
   fi
   echo "$latest" | jq '{id, created_at, updated_at, fresh_at, endpoint: "issues", body}'
+}
+
+scan_latest_comment() {
+  local issue_comments
+  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
+  latest_comment_from_issue_comments "$issue_comments"
+}
+
+scan_latest_comment_best_effort() {
+  local issue_comments
+  issue_comments=$(fetch_api_array_best_effort "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") || {
+    echo '{}'
+    return 0
+  }
+  latest_comment_from_issue_comments "$issue_comments"
 }
 
 # Count unaddressed "Potential issue" / ⚠️ markers in the pulls inline
@@ -732,15 +760,8 @@ post_retry_trigger() {
 
 find_status_probe_reply() {
   local after=$1
-  local raw issue_comments
-  raw=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>&1) || {
-    log "status probe reply poll failed to fetch issue comments: $raw"
-    return 1
-  }
-  issue_comments=$(echo "$raw" | jq -s 'add // []' 2>/dev/null) || {
-    log "status probe reply poll failed to flatten issue comments pagination output"
-    return 1
-  }
+  local issue_comments
+  issue_comments=$(fetch_api_array_best_effort "repos/$REPO/issues/$PR_NUMBER/comments" "status probe reply issue comments") || return 1
 
   echo "$issue_comments" | jq --arg bot "$BOT_LOGIN" --arg after "$after" '
     def status_probe_reply:
@@ -754,6 +775,31 @@ find_status_probe_reply() {
     | sort_by(.fresh_at)
     | last // null
   '
+}
+
+emit_terminal_review_after_probe_if_present() {
+  local latest class potential_issues review_json
+  latest=$(scan_latest_comment_best_effort)
+  if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
+    return 0
+  fi
+
+  class=$(classify_comment "$(echo "$latest" | jq -r '.body')")
+  case "$class" in
+    review)
+      potential_issues=$(count_potential_issues)
+      review_json=$(echo "$latest" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
+      if [ "$potential_issues" -gt 0 ]; then
+        log "CodeRabbit review landed during status-probe wait with $potential_issues Potential issue/⚠️ marker(s) — emitting findings (exit 2)"
+        emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
+      fi
+      log "CodeRabbit review landed during status-probe wait with no high-severity markers — emitting cleared (exit 0)"
+      emit_json_and_exit "cleared" 0 "$review_json" 0
+      ;;
+    *)
+      log "latest CodeRabbit comment after status-probe wait is class=$class; continuing timeout"
+      ;;
+  esac
 }
 
 status_probe_no_reply_json() {
@@ -865,6 +911,7 @@ emit_timeout() {
   local message=$1
   log "$message"
   run_status_probe_once
+  emit_terminal_review_after_probe_if_present
   emit_json_and_exit "timeout" 4 "null" 0
 }
 

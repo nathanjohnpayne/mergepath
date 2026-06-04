@@ -174,10 +174,40 @@ case "$endpoint" in
     printf '[]\n'
     ;;
   repos/owner/repo/pulls/999/reviews)
-    printf '[]\n'
+    case "$scenario" in
+      review_arrives_during_probe)
+        count=0
+        if [ -f "$state_dir/probe-count" ]; then
+          count=$(cat "$state_dir/probe-count")
+        fi
+        if [ "$count" -gt 0 ] && [ "$(fake_now)" -ge 2000000006 ]; then
+          printf '[{"id":9901,"user":{"login":"%s"},"submitted_at":"%s"}]\n' "$bot" "$reply_time"
+        else
+          printf '[]\n'
+        fi
+        ;;
+      *)
+        printf '[]\n'
+        ;;
+    esac
     ;;
   repos/owner/repo/pulls/999/comments)
-    printf '[]\n'
+    case "$scenario" in
+      review_arrives_during_probe)
+        count=0
+        if [ -f "$state_dir/probe-count" ]; then
+          count=$(cat "$state_dir/probe-count")
+        fi
+        if [ "$count" -gt 0 ] && [ "$(fake_now)" -ge 2000000006 ]; then
+          printf '[{"id":9902,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","commit_id":"head-sha","pull_request_review_id":9901,"in_reply_to_id":null,"body":"_⚠️ Potential issue_ | _🟠 Major_\\n\\nReview arrived during probe wait."}]\n' "$bot" "$reply_time" "$reply_time"
+        else
+          printf '[]\n'
+        fi
+        ;;
+      *)
+        printf '[]\n'
+        ;;
+    esac
     ;;
   repos/owner/repo/issues/999/comments)
     case "$scenario" in
@@ -197,6 +227,17 @@ case "$endpoint" in
         ;;
       rate_limit)
         printf '[{"id":7701,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"Rate limit exceeded. Please wait 10 seconds before requesting another review."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      review_arrives_during_probe)
+        count=0
+        if [ -f "$state_dir/probe-count" ]; then
+          count=$(cat "$state_dir/probe-count")
+        fi
+        if [ "$count" -gt 0 ] && [ "$(fake_now)" -ge 2000000006 ]; then
+          printf '[{"id":8803,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"CodeRabbit review completed. See inline findings."}]\n' "$bot" "$reply_time" "$reply_time"
+        else
+          printf '[]\n'
+        fi
         ;;
       reply_poll_failure)
         count=0
@@ -390,11 +431,42 @@ test_probe_reply_poll_failure_stays_timeout_advisory() {
   fi
 }
 
+test_review_during_probe_wait_emits_findings() {
+  local dir rc count status posted potential review_endpoint
+  dir=$(make_case "review-during-probe-wait" 1 true 6 2)
+  rc=$(run_case "$dir" review_arrives_during_probe)
+  count=$(probe_count "$dir")
+  if [ "$rc" != "2" ]; then
+    fail "review during probe wait: exit $rc, expected findings 2; stderr=$(cat "$dir/err.log")"
+    return
+  elif [ ! -s "$dir/out.json" ]; then
+    fail "review during probe wait: missing findings JSON output; stderr=$(cat "$dir/err.log")"
+    return
+  fi
+  status=$(jq -r '.status' "$dir/out.json")
+  posted=$(jq -r '.status_probe.posted' "$dir/out.json")
+  potential=$(jq -r '.potential_issue_count' "$dir/out.json")
+  review_endpoint=$(jq -r '.review.endpoint' "$dir/out.json")
+
+  if [ "$status" != "findings" ]; then
+    fail "review during probe wait: status=$status, expected findings"
+  elif [ "$count" != "1" ] || [ "$posted" != "true" ]; then
+    fail "review during probe wait: probe count=$count posted=$posted, expected one probe"
+  elif [ "$potential" != "1" ]; then
+    fail "review during probe wait: potential_issue_count=$potential, expected 1"
+  elif [ "$review_endpoint" != "issues" ]; then
+    fail "review during probe wait: review.endpoint=$review_endpoint, expected issues"
+  else
+    pass "real review during status-probe wait emits findings instead of timeout"
+  fi
+}
+
 test_timeout_probe_posts_once_and_surfaces_reply
 test_existing_status_probe_reply_never_clears
 test_rate_limit_stalled_does_not_probe
 test_probe_post_failure_stays_timeout_advisory
 test_probe_reply_poll_failure_stays_timeout_advisory
+test_review_during_probe_wait_emits_findings
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
