@@ -42,5 +42,8 @@ if [[ $FAILED -eq 1 ]]; then
   exit 1
 fi
 
+echo "check_codex_scripts: running codex-review-request ack tests"
+"$REPO_ROOT/tests/test_codex_review_request_ack.sh"
+
 echo "check_codex_scripts: PASS"
 exit 0

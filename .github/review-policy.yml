@@ -273,6 +273,27 @@ codex:
   # see issue #27 for the explicit-review-required decision.
   review_timeout_seconds: 600
 
+  # Short acknowledgment window for `@codex review` trigger comments
+  # (#419). The Codex GitHub integration reacts with 👀 to the comment
+  # that invoked the review; in the REST reactions payload that content
+  # is `eyes`. `codex-review-request.sh` polls the just-posted trigger
+  # comment for this acknowledgment before entering the normal review
+  # wait. 60s is intentionally generous for a short ACK path and avoids
+  # tight duplicate triggers; terminal reviews may still take much
+  # longer and remain governed by `review_timeout_seconds`.
+  #
+  # Eyes is ACKNOWLEDGMENT ONLY. It is never treated as clearance and it
+  # never populates the output JSON's `reaction` field, which remains
+  # reserved for Codex's +1 / 👍 no-findings signal.
+  ack_wait_seconds: 60
+
+  # Maximum number of bounded re-posts when the trigger comment does not
+  # receive the `eyes` acknowledgment. After this cap, the script keeps
+  # the existing default contract: continue the normal review wait and
+  # exit 4 on timeout rather than fast-failing on an acknowledgment
+  # false-negative.
+  max_ack_retries: 1
+
   # When true, `codex-review-check.sh` requires all required CI checks to
   # report green before allowing merge. Strongly recommended; do not disable
   # without explicit human authorization.
