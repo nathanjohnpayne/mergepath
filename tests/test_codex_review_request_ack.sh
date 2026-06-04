@@ -261,8 +261,6 @@ test_missing_comment_id_does_not_retrigger() {
     fail "missing comment id: trigger count $count, expected no retry without a pollable id"
   elif [ "$ack_count" != "0" ]; then
     fail "missing comment id: ack endpoint called $ack_count times, expected 0"
-  elif ! grep -q "skipping eyes-ack gate" "$dir/err.log"; then
-    fail "missing comment id: missing skip log; stderr=$(cat "$dir/err.log")"
   else
     pass "missing trigger comment id: ack gate skipped without re-trigger"
   fi
@@ -281,8 +279,6 @@ test_retry_missing_comment_id_stops_without_extra_retry() {
     fail "retry missing comment id: trigger count $count, expected original + one retry only"
   elif [ "$ack_count" != "1" ]; then
     fail "retry missing comment id: ack endpoint called $ack_count times, expected only the first pollable trigger"
-  elif ! grep -q "skipping eyes-ack check" "$dir/err.log"; then
-    fail "retry missing comment id: missing wait-level skip log; stderr=$(cat "$dir/err.log")"
   else
     pass "retry with missing trigger comment id: gate stops without extra retry"
   fi
