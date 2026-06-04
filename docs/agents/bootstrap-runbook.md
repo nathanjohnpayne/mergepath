@@ -161,9 +161,9 @@ decisions for these adapters belong to the 1Password audit ADR
 workstream; this runbook records the current compatibility guidance.
 
 All write-path `gh` calls run under the author identity
-(`nathanjohnpayne`) via a stage-scope `gh auth switch` wrap. The
-prior active account is captured at stage entry and restored at every
-exit path so the keyring state never leaks past this stage.
+(`nathanjohnpayne`) through token-verifying helpers. Stage B/C/E live
+writes use `scripts/gh-as-author.sh` per command, so the machine-global
+gh account selection is not read or changed for attribution.
 
 **Failure recovery.** Hard failures on `gh repo create` are fatal
 (stage returns non-zero, state file omits the entry). Secret-provision
@@ -246,8 +246,8 @@ Implementation: `scripts/bootstrap/board-and-summary.sh`.
      issues, set spend caps, drive Sprint 0.
 
 The project-board calls are `gh` write paths and run under the same
-author-identity switch-around as stage C. The scaffold writes are
-direct shell redirects (no gh involved) and don't need the wrap.
+token-verified author helper as stage C. The scaffold writes are direct
+shell redirects (no gh involved) and don't need the wrapper.
 
 **Failure recovery.** Project-board failures are fatal (stage returns
 non-zero). Scaffold-write failures are fatal. Summary emission
@@ -375,10 +375,10 @@ edge-case runs:
 | `BOOTSTRAP_SKIP_INVITE_PAUSE=1` | Skip the "press enter once invites are accepted" pause in stage C. |
 | `BOOTSTRAP_SKIP_SECRETS=1` | Skip stage C's secret-provisioning substeps. |
 | `BOOTSTRAP_SKIP_BOARD=1` | Skip stage E's Project v2 board sub-step (summary + scaffolds still run). |
-| `BOOTSTRAP_SKIP_AUTHOR_SWITCH=1` | Skip the `gh auth switch -u <author>` wrap on stage C/E writes. |
+| `BOOTSTRAP_SKIP_AUTHOR_TOKEN=1` | Tests only: skip the author-token wrapper and run the `gh` shim directly. |
 | `BOOTSTRAP_SKIP_STAGES` | Comma-separated stage names to skip entirely (no dispatch, no record). |
 | `BOOTSTRAP_SKIP_CROSS_REPO_LOOP=1` | Skip stage B's "open a PR on mergepath" step. |
-| `BOOTSTRAP_AUTHOR_IDENTITY` | Override the target identity for the switch-around. Default: `nathanjohnpayne`. |
+| `BOOTSTRAP_AUTHOR_IDENTITY` | Override the target identity for author-token verification. Default: `nathanjohnpayne`. |
 | `BOOTSTRAP_AUTHOR_NAME` / `BOOTSTRAP_AUTHOR_EMAIL` | Override the git identity for the initial commit. |
 | `BOOTSTRAP_REVIEWER_PAT_VALUE` | Inline `REVIEWER_ASSIGNMENT_TOKEN` value (tests). |
 | `BOOTSTRAP_REVIEWER_PAT_OP_REF` | Override the 1Password reference for the reviewer PAT. |

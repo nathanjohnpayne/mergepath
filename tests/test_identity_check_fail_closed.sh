@@ -105,8 +105,22 @@ check_script_shape() {
 }
 
 check_script_shape "scripts/resolve-pr-threads.sh"     "resolve-pr-threads"
-check_script_shape "scripts/request-label-removal.sh"  "request-label-removal"
 check_script_shape "scripts/coderabbit-wait.sh"        "coderabbit-wait"
+
+RLR="$ROOT/scripts/request-label-removal.sh"
+if grep -q 'gh-token-resolver helper missing' "$RLR" \
+   && grep -q '\[ ! -x "\$AS_REVIEWER" \]' "$RLR" \
+   && grep -q 'gh-as-reviewer.sh helper missing or non-executable' "$RLR"; then
+  pass "request-label-removal: token resolver + gh-as-reviewer helper presence is fail-closed"
+else
+  fail "request-label-removal: missing fail-closed token resolver / gh-as-reviewer guard"
+fi
+
+if grep -qE '"\$AS_REVIEWER" -- gh pr comment ' "$RLR"; then
+  pass "request-label-removal: label ask posted via \"\$AS_REVIEWER\" -- gh pr comment"
+else
+  fail "request-label-removal: label ask is NOT wrapped by gh-as-reviewer"
+fi
 
 # codex-review-request.sh moved its '@codex review' trigger-post guard
 # from identity-check (--expect-reviewer) to gh-as-author.sh, so the

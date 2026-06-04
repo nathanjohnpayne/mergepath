@@ -2,7 +2,7 @@
 # scripts/gh-as-author.sh
 #
 # Run a `gh` command under a verified AUTHOR token without mutating the
-# machine-global gh active account. The wrapper keeps the historical
+# machine-global gh account selection. The wrapper keeps the historical
 # public API while selecting attribution per command through GH_TOKEN.
 #
 # Usage:

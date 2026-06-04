@@ -386,15 +386,12 @@ preflight() {
     bootstrap::warn "OP_PREFLIGHT_DONE not set — credential preflight may need to run before any gh/op side-effects"
   fi
 
-  # 3. Active gh account is the author identity. Don't auto-switch
-  #    here; surface the mismatch and let the human decide. (Stages B/C
-  #    will switch as needed using the standard switch-around.)
-  if [ "${BOOTSTRAP_SKIP_TOOL_CHECK:-0}" != "1" ] && command -v gh >/dev/null 2>&1; then
-    local active
-    active=$(gh config get -h github.com user 2>/dev/null || echo "")
-    if [ -n "$active" ] && [ "$active" != "$BOOTSTRAP_REPO_OWNER" ]; then
-      bootstrap::warn "active gh account is '$active', not '$BOOTSTRAP_REPO_OWNER'. Stage modules will switch as needed."
-    fi
+  # 3. GitHub author writes are token-verified by the stage helpers.
+  #    There is no machine-global gh account check here; stages B/C/E
+  #    route live gh writes through scripts/gh-as-author.sh.
+  if [ "${BOOTSTRAP_SKIP_TOOL_CHECK:-0}" != "1" ] && ! command -v gh >/dev/null 2>&1; then
+    bootstrap::wizard_err "missing GitHub CLI: gh"
+    violations=$((violations + 1))
   fi
 
   # 4. Target dir is empty (or absent). Refuse to overwrite a populated
@@ -417,12 +414,9 @@ preflight() {
   #    probe in dry-run mode + when tool check is suppressed.
   if [ "$BOOTSTRAP_DRY_RUN" != "1" ] && [ "${BOOTSTRAP_SKIP_TOOL_CHECK:-0}" != "1" ] && command -v gh >/dev/null 2>&1; then
     local full_name="$BOOTSTRAP_REPO_OWNER/${BOOTSTRAP_INPUT_REPO_NAME}"
-    # Use GH_TOKEN explicitly per CLAUDE.md § Active-account convention:
-    # read-path gh calls honor GH_TOKEN, and pinning to the preflight
-    # author/reviewer PAT keeps the call deterministic across machines
-    # where the active keyring account might differ. Fall back to
-    # whatever gh's keyring resolves if no preflight var is present
-    # (developer running wizard locally without preflight).
+    # Use GH_TOKEN explicitly for this read-path probe. Prefer the
+    # author PAT, then reviewer PAT, and finally gh's configured
+    # credential for local developer runs without preflight.
     local _gh_repo_view_rc=0
     GH_TOKEN="${OP_PREFLIGHT_AUTHOR_PAT:-${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}}" \
       gh repo view "$full_name" >/dev/null 2>&1 || _gh_repo_view_rc=$?

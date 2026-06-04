@@ -104,6 +104,10 @@ if [ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ] && [ -r "$__RESOLVE_THREADS_DIR/lib/p
   . "$__RESOLVE_THREADS_DIR/lib/preflight-helpers.sh"
   auto_source_preflight
 fi
+if [ -r "$__RESOLVE_THREADS_DIR/lib/gh-token-resolver.sh" ]; then
+  # shellcheck source=lib/gh-token-resolver.sh
+  . "$__RESOLVE_THREADS_DIR/lib/gh-token-resolver.sh"
+fi
 
 usage() {
   cat <<'EOF' >&2
@@ -422,10 +426,10 @@ if [ "$MODE" = "list" ]; then
   exit 3
 fi
 
-# Identity check (#284 r2): the resolveReviewThread mutation is a
-# graphql write — its byline follows the PAT in GH_TOKEN, NOT the
-# keyring's active account. Verify the PAT resolves to the expected
-# reviewer identity BEFORE entering the per-thread mutation loop.
+# Identity check (#284 r2 / #412): the resolveReviewThread mutation is
+# a GraphQL write, and its byline follows the PAT in GH_TOKEN. Verify
+# that PAT resolves to the expected reviewer identity BEFORE entering
+# the per-thread mutation loop.
 # Opt-out via RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1.
 #
 # nathanpayne-codex Phase 4b r1 on PR #293 caught the prior shape's
@@ -454,7 +458,11 @@ if [ "${RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK:-0}" != "1" ] && ! $DRY_RUN; then
     echo "       RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 (dev only)." >&2
     exit 2
   fi
-  expected_login="nathanpayne-${MERGEPATH_AGENT:-claude}"
+  if command -v gh_default_reviewer_identity >/dev/null 2>&1; then
+    expected_login="$(gh_default_reviewer_identity)"
+  else
+    expected_login="nathanpayne-${MERGEPATH_AGENT:-claude}"
+  fi
   if ! GH_TOKEN="$PAT_GH_TOKEN" "$CHECKER" \
        --expect-token-identity "$expected_login"; then
     echo "ERROR: identity-check failed before any mutation. Refusing to" >&2

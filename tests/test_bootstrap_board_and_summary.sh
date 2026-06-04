@@ -143,6 +143,7 @@ run_wizard() {
   BOOTSTRAP_AUTO_PROMPT=skip \
   BOOTSTRAP_AUTHOR_NAME="test" \
   BOOTSTRAP_AUTHOR_EMAIL="t@t" \
+  BOOTSTRAP_SKIP_AUTHOR_TOKEN=1 \
   BOOTSTRAP_SKIP_INVITE_PAUSE=1 \
   BOOTSTRAP_REVIEWER_PAT_VALUE="fake-test-pat-1234567890" \
   "$SCRIPT" "$@"
@@ -400,6 +401,7 @@ out5=$(PATH="$SHIM_PATH" \
        BOOTSTRAP_AUTO_PROMPT=skip \
        BOOTSTRAP_AUTHOR_NAME="test" \
        BOOTSTRAP_AUTHOR_EMAIL="t@t" \
+       BOOTSTRAP_SKIP_AUTHOR_TOKEN=1 \
        BOOTSTRAP_SKIP_INVITE_PAUSE=1 \
        BOOTSTRAP_REVIEWER_PAT_VALUE="x" \
        BOOTSTRAP_SKIP_STAGES=template-mirror,github-infra,firebase-and-codereview \
@@ -493,6 +495,7 @@ out7=$(PATH="$SHIM_PATH" \
        BOOTSTRAP_AUTO_PROMPT=skip \
        BOOTSTRAP_AUTHOR_NAME="test" \
        BOOTSTRAP_AUTHOR_EMAIL="t@t" \
+       BOOTSTRAP_SKIP_AUTHOR_TOKEN=1 \
        BOOTSTRAP_SKIP_INVITE_PAUSE=1 \
        BOOTSTRAP_REVIEWER_PAT_VALUE="x" \
        BOOTSTRAP_SKIP_STAGES=template-mirror,github-infra,firebase-and-codereview \

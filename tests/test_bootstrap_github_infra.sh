@@ -154,6 +154,7 @@ run_wizard() {
   BOOTSTRAP_AUTO_PROMPT=skip \
   BOOTSTRAP_AUTHOR_NAME="test" \
   BOOTSTRAP_AUTHOR_EMAIL="t@t" \
+  BOOTSTRAP_SKIP_AUTHOR_TOKEN=1 \
   BOOTSTRAP_SKIP_INVITE_PAUSE=1 \
   BOOTSTRAP_REVIEWER_PAT_VALUE="fake-test-pat-1234567890" \
   BOOTSTRAP_SKIP_STAGES=board-and-summary \
@@ -237,37 +238,20 @@ awk '
   && pass "template-mirror recorded before github-infra in state file" \
   || fail "state-file ordering broken"
 
-# --- assertion 7a: author-identity switch-around wraps stage writes
-# (CodeRabbit Major on #239 round 1). The stage must switch to
-# nathanjohnpayne before any writes, run all the writes, and switch
-# back after — exactly once per stage run.
+# --- assertion 7a: author-identity writes do not mutate gh auth state
+# (#412). The live stage routes through token-verifying helpers; this
+# test uses BOOTSTRAP_SKIP_AUTHOR_TOKEN=1 so the gh shim sees the same
+# commands directly, but no `gh auth switch` should ever be invoked.
 # ---------------------------------------------------------------------------
-auth_switches=$(grep -c "^gh auth switch -u" "$SHIM_LOG")
-# Expect TWO switches: one TO nathanjohnpayne, one back to the prior
-# (nathanpayne-claude per the shim's gh config get response).
-[ "$auth_switches" -eq 2 ] \
-  && pass "stage performs exactly 2 auth switches (to author, back to prior)" \
-  || fail "expected 2 auth switches, got $auth_switches; log: $(grep 'auth switch' "$SHIM_LOG")"
-grep -q "^gh auth switch -u nathanjohnpayne\$" "$SHIM_LOG" \
-  && pass "stage switches to nathanjohnpayne for writes" \
-  || fail "no switch to nathanjohnpayne; log: $(grep 'auth switch' "$SHIM_LOG")"
-grep -q "^gh auth switch -u nathanpayne-claude\$" "$SHIM_LOG" \
-  && pass "stage restores prior active gh account after writes" \
-  || fail "no switch back to nathanpayne-claude; log: $(grep 'auth switch' "$SHIM_LOG")"
-# Ordering: switch-to-nathanjohnpayne must come BEFORE any write call,
-# and switch-back must come AFTER. Use awk to pin the line numbers.
-awk '
-  /^gh auth switch -u nathanjohnpayne$/    { saw_to = NR }
-  /^gh repo create /                       { saw_write = NR }
-  /^gh auth switch -u nathanpayne-claude$/ { saw_back = NR }
-  END {
-    if (!saw_to || !saw_write || !saw_back) { print "missing markers"; exit 1 }
-    if (saw_to > saw_write) { print "switch-to must precede writes"; exit 1 }
-    if (saw_write > saw_back) { print "switch-back must follow writes"; exit 1 }
-  }
-' "$SHIM_LOG" \
-  && pass "auth switch-around ordering correct (to → writes → back)" \
-  || fail "auth switch-around ordering wrong"
+auth_switches=$(grep -c "^gh auth switch -u" "$SHIM_LOG" || true)
+[ "$auth_switches" -eq 0 ] \
+  && pass "stage performs zero gh auth switches" \
+  || fail "expected zero auth switches, got $auth_switches; log: $(grep 'auth switch' "$SHIM_LOG")"
+grep -q "^gh repo create " "$SHIM_LOG" \
+  && grep -q "^gh label create " "$SHIM_LOG" \
+  && grep -q "^gh api -X PUT " "$SHIM_LOG" \
+  && pass "stage writes still execute through gh shim under token-test bypass" \
+  || fail "expected stage gh writes missing; log: $SHIM_LOG"
 
 # --- assertion 7: secret skip works with BOOTSTRAP_SKIP_SECRETS=1 ---
 : >"$SHIM_LOG"
@@ -344,10 +328,9 @@ echo "$dry_out" | grep -q "DRY-RUN" \
 # inline `|| set_rc=$?` pattern matching _provision_llm_secrets.
 #
 # Drive the failure via SHIM_EXIT_SECRET=1 + a fake PAT. Even with
-# the failing secret-set, the stage's auth-restore MUST still run
-# (the keyring must end on the prior-active account, not stuck on
-# nathanjohnpayne) — that's the keyring-leak invariant the reviewer
-# called out explicitly.
+# the failing secret-set, the stage must complete without any auth
+# switch call because token-attributed writes do not mutate global gh
+# state.
 # ---------------------------------------------------------------------------
 : >"$SHIM_LOG"
 TARGET5="$WORKDIR/new-repo-secret-fail"
@@ -362,15 +345,13 @@ set -e
 # The stage treats secret failures as warned-but-not-fatal (the
 # REVIEWER_ASSIGNMENT_TOKEN failure is swallowed via `step_rc=0` in
 # the caller), so the wizard SHOULD complete with rc=0. The
-# critical invariant is the keyring restore — verify it ran.
+# critical invariant is that no global auth switch runs.
 [ "$ec" -eq 0 ] \
   && pass "stage completes (rc=0) when secret-set fails (warn-not-fatal)" \
   || fail "stage failed unexpectedly on secret-set failure; rc=$ec, out: $out"
-# Auth-restore MUST have run after the secret-set failure — the
-# keyring-leak invariant nathanpayne-claude flagged.
-grep -q "^gh auth switch -u nathanpayne-claude\$" "$SHIM_LOG" \
-  && pass "auth-restore ran AFTER failing gh secret set (no keyring leak)" \
-  || fail "no auth-restore after secret failure — keyring would be left on nathanjohnpayne; log: $(grep 'auth switch' "$SHIM_LOG")"
+grep -q "^gh auth switch -u" "$SHIM_LOG" \
+  && fail "secret failure path invoked gh auth switch; log: $(grep 'auth switch' "$SHIM_LOG")" \
+  || pass "secret failure path performs zero gh auth switches"
 # The pipeline-rc-capture pattern in scripts/bootstrap/github-infra.sh
 # must use `|| set_rc=$?` on the same line as the pipeline so set -e
 # doesn't kill the function before the rc handler can run.

@@ -18,6 +18,18 @@ gh_resolver_repo_root() {
   printf '%s\n' "$this_dir"
 }
 
+gh_default_reviewer_identity() {
+  if [ -n "${GH_AS_REVIEWER_IDENTITY:-}" ]; then
+    printf '%s\n' "$GH_AS_REVIEWER_IDENTITY"
+  elif [ -n "${MERGEPATH_AGENT:-}" ]; then
+    printf 'nathanpayne-%s\n' "$MERGEPATH_AGENT"
+  elif [ -n "${OP_PREFLIGHT_AGENT:-}" ]; then
+    printf 'nathanpayne-%s\n' "$OP_PREFLIGHT_AGENT"
+  else
+    printf '%s\n' "nathanpayne-claude"
+  fi
+}
+
 gh_resolve_token_for_identity() {
   local expected_login="${1:-}"
   local preferred_var="${2:-}"

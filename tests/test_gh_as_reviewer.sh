@@ -102,6 +102,19 @@ else
 fi
 
 reset_log
+OP_PREFLIGHT_AGENT=codex OP_PREFLIGHT_REVIEWER_PAT="codex-token" \
+  run_wrapper -- gh issue comment 8 --body "thanks" >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "OP_PREFLIGHT_AGENT fallback: rc=$rc"
+elif ! grep -q $'GH_TOKEN=codex-token GITHUB_TOKEN= gh\tissue\tcomment\t8' "$WORKDIR/calls.log"; then
+  fail "OP_PREFLIGHT_AGENT fallback: did not use codex token"
+  cat "$WORKDIR/calls.log" >&2
+else
+  pass "OP_PREFLIGHT_AGENT fallback: resolves nathanpayne-codex"
+fi
+
+reset_log
 GH_AS_REVIEWER_IDENTITY=nathanpayne-codex OP_PREFLIGHT_REVIEWER_PAT="codex-token" \
   run_wrapper -- gh pr comment 123 --body "ping" >/dev/null 2>&1
 rc=$?

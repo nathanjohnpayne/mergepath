@@ -605,14 +605,14 @@ log_stale_adc_guidance() {
 # incomplete codex session file look valid and causing gh to run as
 # the wrong identity. See round-5 Codex finding on the propagation
 # PRs for the multi-agent repro.
-# Compatibility shim for the retired active-account repair path.
+# Compatibility shim for the retired stored-account repair path.
 #
 # #411 flips GitHub attribution to verified process-local tokens. The
-# old preflight behavior repaired the global gh active account with
-# `gh auth switch -u nathanpayne-<agent>` on normal review/check paths.
+# old preflight behavior repaired the global gh account selection on
+# normal review/check paths.
 # That mutation is exactly what made concurrent agents fight over
 # ~/.config/gh/hosts.yml, so preflight no longer reads or changes the
-# active account. The wrappers verify the effective token immediately
+# selected account. The wrappers verify the effective token immediately
 # before each write instead.
 restore_active_account_or_warn() {
   return 0

@@ -36,7 +36,7 @@ To add a new agent, register a GitHub account following the pattern `nathanpayne
 
 For repo work, `GH_TOKEN` is now the per-command attribution source for
 the guarded `gh` writes. Do not rely on the machine-global gh keyring
-active account for author/reviewer bylines.
+selected account for author/reviewer bylines.
 
 - **Read paths** (`gh api user`, `gh api ...` GETs, `gh pr view`,
   `gh pr checks`) honor `GH_TOKEN`. Pass it inline per command.
@@ -46,8 +46,8 @@ active account for author/reviewer bylines.
   `scripts/gh-as-reviewer.sh`. The wrapper resolves the expected token,
   verifies its effective login with `scripts/identity-check.sh
   --expect-token-identity`, and runs exactly the wrapped command with
-  `GH_TOKEN` set and `GITHUB_TOKEN` cleared. The wrappers never run
-  `gh auth switch`.
+  `GH_TOKEN` set and `GITHUB_TOKEN` cleared. The wrappers never change
+  stored gh account selection.
 - **Bare and inline-token guarded writes** fail closed in
   `scripts/hooks/gh-pr-guard.sh`. `GH_TOKEN=... gh pr review ...` is not
   an approved substitute for the wrapper because it does not prove the
@@ -194,7 +194,7 @@ GH_TOKEN="$(gh auth token --user "$acct")" gh api -X POST /user/ssh_signing_keys
 The bot PATs already carry the `admin:ssh_signing_key` scope, so no
 re-auth is required for routine uploads. The `/user/ssh_signing_keys`
 endpoint operates on the authenticated user, so `GH_TOKEN` is honored
-directly — no `scripts/gh-as-author.sh` / `gh auth switch` dance is
+directly — no author wrapper or stored-account selection step is
 needed (unlike core guarded reviewer writes covered by the wrapper
 contract above).
 

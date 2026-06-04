@@ -14,14 +14,9 @@ FILES=()
 while IFS= read -r -d '' file; do
   rel="${file#"$REPO_ROOT"/}"
   case "$rel" in
-    scripts/bootstrap/*) continue ;;                 # #412 long-tail bootstrap sweep
-    scripts/sync-to-downstream.sh) continue ;;       # #412 propagation helper sweep
-    scripts/coderabbit-wait.sh) continue ;;          # #412 secondary helper sweep
-    scripts/request-label-removal.sh) continue ;;    # #412 secondary helper sweep
-    scripts/resolve-pr-threads.sh) continue ;;       # #412 GraphQL helper sweep
+    *.md) continue ;;                                # documentation examples, not executable script flow
     scripts/daily-feedback-rollup.sh) continue ;;    # workflow/reporting surface, #412
     scripts/sweep-unresolved-feedback/*) continue ;; # workflow/reporting surface, #412
-    scripts/gh-projects/lib.sh) continue ;;          # project/sub-issue API helper, #412
     scripts/post-phase-4b-handoff.sh) continue ;;    # GraphQL read helper, #412
     scripts/ci/*) continue ;;                        # tests/checks intentionally stub gh
   esac
@@ -44,8 +39,15 @@ function bare_write(line) {
       line !~ /`[^`]*gh[[:space:]]+(pr|issue|api)[^`]*`/) return 0
   if (line ~ /gh-as-(author|reviewer)\.sh[^;&|]*--[[:space:]]+gh/) return 0
   if (line ~ /\$"?[A-Z_]*AS_(AUTHOR|REVIEWER)"?[[:space:]]+--[[:space:]]+gh/) return 0
+  if (line ~ /(^|[[:space:]])(sync_author_gh|bootstrap::run_author_gh|bootstrap::author_gh|ghp_gh|gh_reviewer|gh_pat)[[:space:]]+/) return 0
   if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+pr[[:space:]]+(-R[[:space:]]+[^[:space:]]+[[:space:]]+|--repo[[:space:]]+[^[:space:]]+[[:space:]]+|--repo=[^[:space:]]+[[:space:]]+)?(create|merge|review|comment|edit)([[:space:]]|$)/) return 1
-  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+issue[[:space:]]+comment([[:space:]]|$)/) return 1
+  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+pr[[:space:]]+close([[:space:]]|$)/) return 1
+  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+issue[[:space:]]+(create|comment|edit|close)([[:space:]]|$)/) return 1
+  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+repo[[:space:]]+(create|delete|edit)([[:space:]]|$)/) return 1
+  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+label[[:space:]]+(create|edit|delete)([[:space:]]|$)/) return 1
+  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+secret[[:space:]]+set([[:space:]]|$)/) return 1
+  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+variable[[:space:]]+set([[:space:]]|$)/) return 1
+  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+project[[:space:]]+(create|edit|field-create|item-add|item-edit)([[:space:]]|$)/) return 1
   if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+api[[:space:]].*(-X[[:space:]]+|--method[[:space:]]+)(POST|PATCH|PUT|DELETE)([[:space:]]|$)/) return 1
   if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+api[[:space:]]+graphql/ && line ~ /(mutation|resolveReviewThread|addPullRequestReviewThreadReply|addComment|updateIssue|closeIssue)/) return 1
   return 0

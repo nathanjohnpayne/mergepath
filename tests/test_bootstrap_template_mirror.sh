@@ -189,6 +189,7 @@ out=$(BOOTSTRAP_MERGEPATH_ROOT="$FAKE_MP" \
       BOOTSTRAP_AUTO_PROMPT=skip \
       BOOTSTRAP_AUTHOR_NAME="test" \
       BOOTSTRAP_AUTHOR_EMAIL="t@t" \
+      BOOTSTRAP_SKIP_AUTHOR_TOKEN=1 \
       BOOTSTRAP_SKIP_STAGES="github-infra,firebase-and-codereview,board-and-summary" \
       "$SCRIPT" my-new-repo \
         --target-dir "$TARGET" \
@@ -643,33 +644,28 @@ awk '
   && pass "_cross_repo_loop_update captures rc from every bootstrap::run call (#233 round 4 P1)" \
   || fail "rc-capture discipline violated in _cross_repo_loop_update"
 
-# --- assertion 16: _cross_repo_loop_update wraps gh pr create with the
-# author-identity switch-around. Codex round 4 P1 caught the missing
-# wrap — without it, the generated mergepath loop PR would be authored
-# by whichever agent identity is currently active, breaking the repo's
-# identity model.
+# --- assertion 16: _cross_repo_loop_update opens the PR through the
+# author-token helper and never calls gh auth switch. Codex round 4 P1
+# caught the missing author attribution; #412 moved the enforcement
+# from keyring switch-around to scripts/gh-as-author.sh.
 # ---------------------------------------------------------------------------
 awk '
   /^bootstrap::_cross_repo_loop_update\(\)/ { in_fn = 1 }
   in_fn && /^}/ { in_fn = 0 }
   in_fn && /BOOTSTRAP_AUTHOR_IDENTITY|nathanjohnpayne/ { saw_author = 1 }
-  in_fn && /gh auth switch -u "\$author_identity"/    { saw_switch = NR }
-  # Match only the actual `gh pr create` COMMAND, not error-message
-  # mentions of it. The command line starts with whitespace then the
-  # bare verb; error messages embed it inside a quoted string.
-  in_fn && /^[[:space:]]*gh pr create / { saw_pr = NR }
-  in_fn && /gh auth switch -u "\$prior_active"/ { saw_restore = NR }
+  in_fn && /bootstrap::run_author_gh / { saw_helper = NR }
+  in_fn && /^[[:space:]]*pr create / { saw_pr = NR }
+  in_fn && /gh auth switch/ { saw_switch = NR }
   END {
     if (!saw_author)  { print "missing author-identity reference in _cross_repo_loop_update"; exit 1 }
-    if (!saw_switch)  { print "missing gh auth switch -u $author_identity in _cross_repo_loop_update"; exit 1 }
-    if (!saw_pr)      { print "missing gh pr create in _cross_repo_loop_update"; exit 1 }
-    if (!saw_restore) { print "missing gh auth switch -u $prior_active (restore) in _cross_repo_loop_update"; exit 1 }
-    if (saw_switch > saw_pr)    { print "auth switch must precede pr create"; exit 1 }
-    if (saw_pr > saw_restore)   { print "auth restore must follow pr create"; exit 1 }
+    if (!saw_helper)  { print "missing bootstrap::run_author_gh in _cross_repo_loop_update"; exit 1 }
+    if (!saw_pr)      { print "missing pr create arguments under bootstrap::run_author_gh"; exit 1 }
+    if (saw_helper > saw_pr) { print "bootstrap::run_author_gh must precede pr create arguments"; exit 1 }
+    if (saw_switch)   { print "gh auth switch must not appear in _cross_repo_loop_update"; exit 1 }
   }
 ' "$ROOT/scripts/bootstrap/template-mirror.sh" \
-  && pass "_cross_repo_loop_update wraps gh pr create with author-identity switch-around" \
-  || fail "author-identity switch-around invariant violated"
+  && pass "_cross_repo_loop_update routes gh pr create through author-token helper" \
+  || fail "author-token helper invariant violated"
 
 # --- summary --------------------------------------------------------------
 echo
