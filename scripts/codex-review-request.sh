@@ -50,8 +50,8 @@
 #      that trigger comment, and re-posts the trigger up to
 #      `max_ack_retries` if no acknowledgment appears. The eyes
 #      acknowledgment is never treated as clearance.
-#   5. Polls every 15 seconds for up to `review_timeout_seconds` for
-#      either:
+#   5. Polls every 15 seconds for up to `review_timeout_seconds`
+#      measured from the latest trigger comment for either:
 #        - a review from the Codex bot on the current HEAD, OR
 #        - a +1 reaction from the Codex bot on the PR issue dated after
 #          the current HEAD committer date.
@@ -468,6 +468,12 @@ has_post_trigger_signal() {
   ')" = "true" ]
 }
 
+reset_review_wait_clock() {
+  START_TS=$(date +%s)
+  DEADLINE=$((START_TS + TIMEOUT_SECONDS))
+  ELAPSED=0
+}
+
 post_codex_trigger() {
   # The Codex GitHub App ONLY monitors '@codex review' comments authored
   # by the repo's AUTHOR/human identity (nathanjohnpayne). A trigger
@@ -528,6 +534,11 @@ post_codex_trigger() {
         || die 3 "could not compute fallback TRIGGER_POST_TIME")
     fi
   fi
+
+  # The review timeout belongs to the latest trigger comment, not to
+  # the first missing-ack attempt. Without this reset, an unacknowledged
+  # trigger can consume part of the retry's normal review window.
+  reset_review_wait_clock
 }
 
 trigger_ack_present() {
@@ -621,9 +632,7 @@ if ! INITIAL_SCAN=$(scan_codex_state); then
   die 3 "initial Codex scan failed"
 fi
 
-START_TS=$(date +%s)
-DEADLINE=$((START_TS + TIMEOUT_SECONDS))
-ELAPSED=0
+reset_review_wait_clock
 TRIGGER_POSTED=false
 TRIGGER_COMMENT_ID=""
 TRIGGER_POST_TIME=""

@@ -138,12 +138,59 @@ esac
 EOF
   chmod +x "$dir/bin/gh"
 
+  cat >"$dir/bin/date" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${CODEX_TEST_FAKE_CLOCK:-0}" != "1" ]; then
+  exec /bin/date "$@"
+fi
+
+state_dir=${CODEX_TEST_STATE_DIR:?}
+clock_file="$state_dir/fake-time"
+if [ ! -f "$clock_file" ]; then
+  printf '2000000000\n' >"$clock_file"
+fi
+
+if [ "$#" -eq 1 ] && [ "$1" = "+%s" ]; then
+  cat "$clock_file"
+  exit 0
+fi
+
+exec /bin/date "$@"
+EOF
+  chmod +x "$dir/bin/date"
+
+  cat >"$dir/bin/sleep" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${CODEX_TEST_FAKE_CLOCK:-0}" != "1" ]; then
+  exec /bin/sleep "$@"
+fi
+
+state_dir=${CODEX_TEST_STATE_DIR:?}
+clock_file="$state_dir/fake-time"
+if [ ! -f "$clock_file" ]; then
+  printf '2000000000\n' >"$clock_file"
+fi
+
+duration=${1:-0}
+case "$duration" in
+  *.*) duration=${duration%%.*} ;;
+esac
+current=$(cat "$clock_file")
+printf '%s\n' $((current + duration)) >"$clock_file"
+EOF
+  chmod +x "$dir/bin/sleep"
+
   printf '%s\n' "$dir"
 }
 
 run_case() {
   local dir=$1
   local scenario=$2
+  local fake_clock=${3:-0}
   local rc=0
 
   (
@@ -151,6 +198,7 @@ run_case() {
     PATH="$dir/bin:$PATH" \
       GH_TOKEN=test-token \
       CODEX_TEST_STATE_DIR="$dir/state" \
+      CODEX_TEST_FAKE_CLOCK="$fake_clock" \
       CODEX_TEST_SCENARIO="$scenario" \
       ./scripts/codex-review-request.sh 999 owner/repo \
       >"$dir/out.json" 2>"$dir/err.log"
@@ -284,6 +332,24 @@ test_retry_missing_comment_id_stops_without_extra_retry() {
   fi
 }
 
+test_retry_resets_review_deadline() {
+  local dir rc count elapsed
+  dir=$(make_case "retry-resets-review-deadline" 5 1 12)
+  rc=$(run_case "$dir" absent 1)
+  count=$(trigger_count "$dir")
+  elapsed=$(jq -r '.rounds_waited_seconds' "$dir/out.json")
+
+  if [ "$rc" != "4" ]; then
+    fail "retry deadline reset: exit $rc, expected 4; stderr=$(cat "$dir/err.log")"
+  elif [ "$count" != "2" ]; then
+    fail "retry deadline reset: trigger count $count, expected original + one retry"
+  elif [ "$elapsed" != "20" ]; then
+    fail "retry deadline reset: rounds_waited_seconds=$elapsed, expected 20 from latest trigger clock"
+  else
+    pass "retry re-post resets review timeout clock"
+  fi
+}
+
 test_ack_wait_window_is_bounded() {
   local dir rc count start end elapsed
   dir=$(make_case "bounded-wait" 1 0 1)
@@ -312,6 +378,7 @@ test_retry_cap_respected
 test_skip_path_posts_no_trigger_or_ack_check
 test_missing_comment_id_does_not_retrigger
 test_retry_missing_comment_id_stops_without_extra_retry
+test_retry_resets_review_deadline
 test_ack_wait_window_is_bounded
 
 echo
