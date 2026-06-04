@@ -47,15 +47,22 @@ set -eo pipefail
 
 # --- preflight auto-source (#282) ------------------------------------------
 # If OP_PREFLIGHT_REVIEWER_PAT is unset and a fresh op-preflight cache
-# exists for this agent, source it. The existing GH_READ_PAT logic
-# below already prefers OP_PREFLIGHT_REVIEWER_PAT over GH_TOKEN, so this
-# block needs only to populate the env var. Silent on no-op paths.
+# exists for this agent, source it. The token resolver below prefers
+# OP_PREFLIGHT_REVIEWER_PAT and falls back to `gh auth token --user`
+# for the expected reviewer identity. Silent on no-op paths.
 __REQUEST_LABEL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ] && [ -r "$__REQUEST_LABEL_DIR/lib/preflight-helpers.sh" ]; then
   # shellcheck source=lib/preflight-helpers.sh
   . "$__REQUEST_LABEL_DIR/lib/preflight-helpers.sh"
   auto_source_preflight
 fi
+if [ ! -r "$__REQUEST_LABEL_DIR/lib/gh-token-resolver.sh" ]; then
+  echo "ERROR: gh-token-resolver helper missing: $__REQUEST_LABEL_DIR/lib/gh-token-resolver.sh" >&2
+  echo "       Refusing to post label-removal ask without reviewer-token verification." >&2
+  exit 2
+fi
+# shellcheck source=lib/gh-token-resolver.sh
+. "$__REQUEST_LABEL_DIR/lib/gh-token-resolver.sh"
 
 ALLOWED_LABELS=(needs-external-review needs-human-review policy-violation human-hold)
 
@@ -147,22 +154,20 @@ fi
 # a non-zero exit from a tested-empty command substitution.
 # (nathanpayne-codex Phase 4b finding on the 263caf3 sync wave.)
 
-# Token policy (CodeRabbit Major, #271/#272):
-#  - The `gh pr view` READ below is pinned to a PAT
-#    (OP_PREFLIGHT_REVIEWER_PAT, falling back to an ambient GH_TOKEN)
-#    rather than relying on the keyring fallback — matches the
-#    gh_pat / read-path convention used across the other scripts.
-#  - The `gh pr comment` WRITE further down is deliberately NOT
-#    pinned. `gh pr comment` is a write path: gh attributes it to
-#    the keyring's ACTIVE account regardless of GH_TOKEN. That is
-#    the desired byline here — the structured ask should be posted
-#    by the agent identity (the agent is the one asking the human),
-#    NOT the author identity. Pinning a token would not change the
-#    byline anyway; leaving it on the keyring is both correct and
-#    explicit-by-this-comment.
-GH_READ_PAT="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}"
+# Token policy (#412):
+#  - The structured ask is posted by the reviewer identity because the
+#    agent is asking the human to clear a human-action label.
+#  - Both the read and the comment write use a token that has been
+#    verified as that reviewer identity. The write itself routes through
+#    gh-as-reviewer.sh; no machine-global gh account is read or changed.
+REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
+if ! gh_resolve_token_for_identity "$REVIEWER_IDENTITY" "OP_PREFLIGHT_REVIEWER_PAT" "request-label-removal"; then
+  echo "request-label-removal: refusing to continue without a verified reviewer token for $REVIEWER_IDENTITY." >&2
+  exit 2
+fi
+REVIEWER_TOKEN="$GH_RESOLVED_TOKEN"
 
-PR_URL=$(GH_TOKEN="$GH_READ_PAT" gh pr view "$PR_NUM" "${REPO_FLAG[@]}" --json url --jq .url 2>/dev/null) || {
+PR_URL=$(GH_TOKEN="$REVIEWER_TOKEN" gh pr view "$PR_NUM" "${REPO_FLAG[@]}" --json url --jq .url 2>/dev/null) || {
   echo "Could not resolve PR #$PR_NUM. Check --repo and gh auth." >&2
   exit 2
 }
@@ -191,32 +196,15 @@ The PR can proceed as soon as the label is gone and the normal merge gates are g
 
 — posted by \`scripts/request-label-removal.sh\`"
 
-# Identity check (#284): the structured ask is a keyring-byline write
-# (per the token policy block above, `gh pr comment` is intentionally
-# unpinned — the byline IS the keyring's active account). Fail closed
-# BEFORE the write if the keyring has drifted from the agent's reviewer
-# identity. Opt-out via REQUEST_LABEL_REMOVAL_SKIP_IDENTITY_CHECK=1.
-#
-# r3 (#284): fail CLOSED if the helper is missing or non-executable.
-# The previous shape ANDed the opt-out and `[ -x "$CHECKER" ]` so a
-# rename / delete / chmod -x silently skipped the gate. Helper
-# presence is now a hard error inside the opt-out branch.
-if [ "${REQUEST_LABEL_REMOVAL_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
-  CHECKER="$(dirname "${BASH_SOURCE[0]}")/identity-check.sh"
-  if [ ! -x "$CHECKER" ]; then
-    echo "ERROR: identity-check helper missing or non-executable: $CHECKER" >&2
-    echo "       Refusing to post label-removal ask without identity verification." >&2
-    echo "       Restore the helper, or opt out via" >&2
-    echo "       REQUEST_LABEL_REMOVAL_SKIP_IDENTITY_CHECK=1 (dev only)." >&2
-    exit 2
-  fi
-  if ! "$CHECKER" --expect-reviewer; then
-    echo "identity-check failed before posting label-removal ask; see stderr above." >&2
-    exit 2
-  fi
+AS_REVIEWER="$__REQUEST_LABEL_DIR/gh-as-reviewer.sh"
+if [ ! -x "$AS_REVIEWER" ]; then
+  echo "ERROR: gh-as-reviewer.sh helper missing or non-executable: $AS_REVIEWER" >&2
+  echo "       Refusing to post label-removal ask without reviewer-token verification." >&2
+  exit 2
 fi
 
-if ! gh pr comment "$PR_NUM" "${REPO_FLAG[@]}" --body "$BODY" >/dev/null; then
+if ! GH_AS_REVIEWER_IDENTITY="$REVIEWER_IDENTITY" OP_PREFLIGHT_REVIEWER_PAT="$REVIEWER_TOKEN" \
+  "$AS_REVIEWER" -- gh pr comment "$PR_NUM" "${REPO_FLAG[@]}" --body "$BODY" >/dev/null; then
   echo "Failed to post comment on PR #$PR_NUM" >&2
   exit 2
 fi

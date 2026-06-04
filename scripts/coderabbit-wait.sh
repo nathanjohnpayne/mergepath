@@ -29,10 +29,10 @@
 #              current repository detected by `gh repo view`.
 #
 # Environment:
-#   GH_TOKEN   Required. GitHub token with pull_requests:write to post the
-#              retry trigger and read comments. In the template flow this
-#              is set to $OP_PREFLIGHT_AUTHOR_PAT after running preflight,
-#              or via inline `op read` per REVIEW_POLICY.md § PAT lookup.
+#   GH_TOKEN   Required unless a fresh op-preflight cache is available.
+#              Must resolve to the reviewer identity for retry-trigger
+#              writes. In the template flow this helper auto-sources
+#              $OP_PREFLIGHT_REVIEWER_PAT after preflight.
 #
 # Behavior:
 #   1. Reads coderabbit.max_wait_seconds (default 300) and
@@ -110,12 +110,14 @@ __CODERABBIT_WAIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -r "$__CODERABBIT_WAIT_DIR/lib/preflight-helpers.sh" ]; then
   # shellcheck source=lib/preflight-helpers.sh
   . "$__CODERABBIT_WAIT_DIR/lib/preflight-helpers.sh"
-  # Author PAT per the original docstring contract — this helper posts
-  # `@coderabbitai, try again.` on rate-limit retries. GH_TOKEN
-  # authenticates the API call; the trigger-comment byline is the
-  # keyring's active account regardless.
-  preflight_require_token author || true
+  preflight_require_token reviewer || true
 fi
+if [ ! -r "$__CODERABBIT_WAIT_DIR/lib/gh-token-resolver.sh" ]; then
+  echo "ERROR: gh-token-resolver helper missing: $__CODERABBIT_WAIT_DIR/lib/gh-token-resolver.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/gh-token-resolver.sh
+. "$__CODERABBIT_WAIT_DIR/lib/gh-token-resolver.sh"
 
 # --- argument parsing -------------------------------------------------------
 
@@ -143,9 +145,16 @@ if [ -z "${GH_TOKEN:-}" ]; then
   echo "ERROR: GH_TOKEN is required. Either:" >&2
   echo "  - Run: eval \"\$(scripts/op-preflight.sh --agent <agent> --mode review)\"" >&2
   echo "    so this helper auto-sources OP_PREFLIGHT_REVIEWER_PAT, OR" >&2
-  echo "  - Set GH_TOKEN inline per REVIEW_POLICY.md § PAT lookup table." >&2
+  echo "  - Set GH_TOKEN to the expected reviewer PAT." >&2
   exit 3
 fi
+
+EXPECTED_REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
+
+gh_reviewer() (
+  unset GITHUB_TOKEN
+  gh "$@"
+)
 
 # --- config readers ---------------------------------------------------------
 
@@ -630,13 +639,10 @@ post_retry_trigger() {
   # triggering identities. See #140 round-3 Codex finding (P2, line 320).
   local mention="@${BOT_LOGIN%\[bot\]}"
   local body="${mention}, try again."
-  # Identity check (#284): the retry trigger is a keyring-byline write
-  # (`gh api -X POST ../comments` attributes to whatever signs the
-  # call; in this helper that's whoever the configured GH_TOKEN
-  # resolves to, but the agent's reviewer identity is the expected
-  # byline). Fail closed BEFORE the write if the keyring has drifted.
-  # Opt-out via CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 (for CI / test
-  # harnesses without a real keyring).
+  # Identity check (#412): the retry trigger is a reviewer-token write.
+  # Fail closed BEFORE the REST mutation if the GH_TOKEN that will sign
+  # the call does not resolve to the expected reviewer identity. Opt-out
+  # via CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 for tests only.
   #
   # r3 (#284): fail CLOSED if the helper is missing or non-executable.
   # The previous shape ANDed the opt-out and `[ -x "$CHECKER" ]` so a
@@ -651,11 +657,11 @@ post_retry_trigger() {
       echo "       CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 (dev only)." >&2
       die 3 "identity-check helper unavailable"
     fi
-    "$checker" --expect-reviewer \
+    GH_TOKEN="$GH_TOKEN" "$checker" --expect-token-identity "$EXPECTED_REVIEWER_IDENTITY" \
       || die 3 "identity-check failed before retry-trigger write; see stderr above."
   fi
   log "posting retry trigger comment to PR #$PR_NUMBER as $mention"
-  gh api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+  gh_reviewer api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
     -f body="$body" >/dev/null 2>&1 \
     || die 3 "failed to post retry trigger comment"
 }

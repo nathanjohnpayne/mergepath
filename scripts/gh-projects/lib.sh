@@ -11,7 +11,7 @@
 #   PROJECT  — Project v2 number (integer)
 #
 # Required auth:
-#   GH_TOKEN must be set to a PAT with `repo` + `project` scopes.
+#   GH_TOKEN must be set to an author PAT with `repo` + `project` scopes.
 #
 # Placeholders in body files:
 #   __PARENT_NUM__ — replaced with the parent issue number
@@ -23,21 +23,40 @@ set -euo pipefail
 : "${REPO:?REPO must be set (owner/repo)}"
 : "${OWNER:?OWNER must be set}"
 : "${PROJECT:?PROJECT must be set (v2 number)}"
-: "${GH_TOKEN:?GH_TOKEN must be set to a PAT with repo + project scopes (CodeRabbit on PR #180: every helper here makes mutations on GitHub; failing fast at source-time is better than letting gh fall through to ambient auth and posting under the wrong identity)}"
+: "${GH_TOKEN:?GH_TOKEN must be set to the author PAT with repo + project scopes (every helper here mutates GitHub; failing fast at source-time is better than letting gh fall through to ambient auth and posting under the wrong identity)}"
+
+GHP_EXPECTED_IDENTITY="${GHP_EXPECTED_IDENTITY:-nathanjohnpayne}"
+GHP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+GHP_CHECKER="$GHP_ROOT/scripts/identity-check.sh"
+if [ "${GHP_SKIP_TOKEN_IDENTITY_CHECK:-0}" != "1" ]; then
+  if [ ! -x "$GHP_CHECKER" ]; then
+    echo "scripts/gh-projects/lib.sh: identity-check helper missing or non-executable: $GHP_CHECKER" >&2
+    return 2 2>/dev/null || exit 2
+  fi
+  if ! GH_TOKEN="$GH_TOKEN" "$GHP_CHECKER" --expect-token-identity "$GHP_EXPECTED_IDENTITY"; then
+    echo "scripts/gh-projects/lib.sh: GH_TOKEN must resolve to $GHP_EXPECTED_IDENTITY for project/issue mutations." >&2
+    return 2 2>/dev/null || exit 2
+  fi
+fi
+
+ghp_gh() (
+  unset GITHUB_TOKEN
+  gh "$@"
+)
 
 GHP_TMPDIR="${GHP_TMPDIR:-$(mktemp -d)}"
 export GHP_TMPDIR
 
 # Add a created issue to the configured project.
 add_to_project() {
-  gh project item-add "$PROJECT" --owner "$OWNER" --url "$1" > /dev/null
+  ghp_gh project item-add "$PROJECT" --owner "$OWNER" --url "$1" > /dev/null
 }
 
 # Link a child issue to its parent via GitHub's native sub-issue API.
 # The parent_num is the integer issue number; child_id is the DB id (integer),
 # not the issue number. Fetch with: gh api repos/$REPO/issues/$num --jq .id
 link_sub_issue() {
-  gh api -X POST "repos/$REPO/issues/$1/sub_issues" -F "sub_issue_id=$2" > /dev/null
+  ghp_gh api -X POST "repos/$REPO/issues/$1/sub_issues" -F "sub_issue_id=$2" > /dev/null
 }
 
 # Substitute placeholders in a body file; write to a unique path under
@@ -90,7 +109,7 @@ prep_body() {
 create_parent() {
   local title="$1" body_file="$2" label="$3"
   local url
-  url=$(gh issue create --repo "$REPO" --title "$title" --body-file "$body_file" --label "$label" | tail -1)
+  url=$(ghp_gh issue create --repo "$REPO" --title "$title" --body-file "$body_file" --label "$label" | tail -1)
   add_to_project "$url"
   echo "$url"
 }
@@ -101,9 +120,9 @@ create_parent() {
 create_child() {
   local title="$1" body_file="$2" label="$3" parent_num="$4"
   local url num id
-  url=$(gh issue create --repo "$REPO" --title "$title" --body-file "$body_file" --label "$label" | tail -1)
+  url=$(ghp_gh issue create --repo "$REPO" --title "$title" --body-file "$body_file" --label "$label" | tail -1)
   num="${url##*/}"
-  id=$(gh api "repos/$REPO/issues/$num" --jq .id)
+  id=$(ghp_gh api "repos/$REPO/issues/$num" --jq .id)
   add_to_project "$url"
   link_sub_issue "$parent_num" "$id"
   echo "$url $num $id"
@@ -112,12 +131,12 @@ create_child() {
 # Set the Project v2 README from a local file.
 # Usage: set_project_readme <file>
 set_project_readme() {
-  gh project edit "$PROJECT" --owner "$OWNER" --readme "$(cat "$1")" > /dev/null
+  ghp_gh project edit "$PROJECT" --owner "$OWNER" --readme "$(cat "$1")" > /dev/null
   echo "Project #$PROJECT README updated from $1"
 }
 
 # Ensure a label exists in the repo (idempotent).
 # Usage: ensure_label <name> <color_hex> <description>
 ensure_label() {
-  gh label create "$1" --color "$2" --description "$3" --repo "$REPO" --force > /dev/null
+  ghp_gh label create "$1" --color "$2" --description "$3" --repo "$REPO" --force > /dev/null
 }

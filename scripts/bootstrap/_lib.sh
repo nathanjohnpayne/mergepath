@@ -8,6 +8,10 @@
 #   bootstrap::err <message>           Log an error to stderr.
 #   bootstrap::stage_banner <name>     Emit "==> Starting stage: <name>".
 #   bootstrap::run <label> <cmd> [...] Execute (or dry-run echo) a side-effect.
+#   bootstrap::author_gh [...]         Run gh through the verified author wrapper
+#                                      unless dry-run/test bypass is active.
+#   bootstrap::run_author_gh <label> [...]  Logged bootstrap::run wrapper around
+#                                      bootstrap::author_gh for gh side-effects.
 #   bootstrap::record_stage <name>     Append a completed stage name to the
 #                                      state file at $BOOTSTRAP_STATE_FILE.
 #   bootstrap::last_completed_stage    Echo the last recorded stage name,
@@ -25,6 +29,10 @@
 #     Every gh/git/op/firebase call from a stage module must go through
 #     it. Dry-run correctness depends on no stage cheating around the
 #     wrapper.
+#   - GitHub write attribution is token-verified per command. Bootstrap
+#     stages never mutate machine-global gh account selection; author
+#     writes route through scripts/gh-as-author.sh or, for stdin-heavy
+#     calls, bootstrap::author_gh.
 #   - Logs are deliberately verbose (full command line, not abbreviated).
 #     The .bootstrap-log transcript is the audit trail.
 #   - Stage modules read the wizard's collected inputs from a shared
@@ -101,6 +109,67 @@ bootstrap::run() {
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $label: $cmd_repr" >>"$BOOTSTRAP_LOG_FILE"
   fi
   "$@"
+}
+
+bootstrap::repo_root() {
+  if [ -n "${BOOTSTRAP_MERGEPATH_ROOT:-}" ]; then
+    printf '%s\n' "$BOOTSTRAP_MERGEPATH_ROOT"
+    return 0
+  fi
+  cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd
+}
+
+bootstrap::author_identity() {
+  printf '%s\n' "${BOOTSTRAP_AUTHOR_IDENTITY:-nathanjohnpayne}"
+}
+
+bootstrap::author_wrapper() {
+  local root
+  root="$(bootstrap::repo_root)"
+  printf '%s/scripts/gh-as-author.sh\n' "$root"
+}
+
+bootstrap::author_gh() {
+  if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ] || [ "${BOOTSTRAP_SKIP_AUTHOR_TOKEN:-0}" = "1" ]; then
+    gh "$@"
+    return $?
+  fi
+
+  local wrapper author_identity
+  wrapper="$(bootstrap::author_wrapper)"
+  author_identity="$(bootstrap::author_identity)"
+  if [ ! -x "$wrapper" ]; then
+    bootstrap::err "author gh wrapper missing or non-executable: $wrapper"
+    bootstrap::err "refusing to run GitHub write without token verification"
+    return 2
+  fi
+
+  GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- gh "$@"
+}
+
+bootstrap::run_author_gh() {
+  local label=$1
+  shift
+  if [ "$#" -eq 0 ]; then
+    bootstrap::err "bootstrap::run_author_gh requires gh arguments after the label"
+    return 64
+  fi
+
+  if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ] || [ "${BOOTSTRAP_SKIP_AUTHOR_TOKEN:-0}" = "1" ]; then
+    bootstrap::run "$label" gh "$@"
+    return $?
+  fi
+
+  local wrapper author_identity
+  wrapper="$(bootstrap::author_wrapper)"
+  author_identity="$(bootstrap::author_identity)"
+  if [ ! -x "$wrapper" ]; then
+    bootstrap::err "author gh wrapper missing or non-executable: $wrapper"
+    bootstrap::err "refusing to run GitHub write without token verification"
+    return 2
+  fi
+
+  bootstrap::run "$label" env GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- gh "$@"
 }
 
 # Append a completed-stage name to the resume state file. Idempotent —

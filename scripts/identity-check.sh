@@ -3,31 +3,31 @@
 #
 # Asserts that the current execution context has the EXPECTED gh identity
 # at the moment of call. The gh-as-* wrappers use token mode to verify
-# the exact PAT that will sign a guarded write. Legacy helper paths also
-# use the keyring modes below while they remain outside the wrapper
-# contract.
+# the exact PAT that will sign a guarded write. Legacy compatibility
+# modes below still inspect gh's stored account selection for callers
+# that have not moved to token mode.
 #
 # Why this exists:
 #
 #   Guarded writes now use a process-local token selected by a wrapper.
 #   That token must be verified before the write, and token material must
 #   never be printed. The historical keyring checks remain available for
-#   helper scripts that have not moved to wrappers yet.
+#   compatibility callers that have not moved to wrappers yet.
 #
 # Modes (mutually exclusive; exactly one is required):
 #
 #   --expect-author
-#     Keyring's active account must be the author identity
+#     gh's stored selected account must be the author identity
 #     (nathanjohnpayne by default; override via
 #     IDENTITY_CHECK_EXPECTED_AUTHOR).
 #
 #   --expect-reviewer
-#     Keyring's active account must be nathanpayne-<MERGEPATH_AGENT>.
+#     gh's stored selected account must be nathanpayne-<MERGEPATH_AGENT>.
 #     MERGEPATH_AGENT is read from the environment; missing/empty
 #     falls back to `claude` with a stderr warning.
 #
 #   --expect-external <agent>
-#     Keyring's active account must be nathanpayne-<agent>. Used in
+#     gh's stored selected account must be nathanpayne-<agent>. Used in
 #     Phase 4b CLI sessions where the cross-agent reviewer (e.g.
 #     `codex` from a `claude` parent session) needs to assert its own
 #     identity before posting the external review.
@@ -52,9 +52,9 @@
 # IDENTITY: keyring vs PAT
 #
 #   `--expect-author` / `--expect-reviewer` / `--expect-external` all
-#   read the KEYRING's active account via `gh config get -h github.com
-#   user`. These modes exist for legacy helper paths that still need a
-#   GH_TOKEN-immune keyring assertion.
+#   read gh's stored selected account via `gh config get -h github.com
+#   user`. These modes exist for legacy compatibility paths that still
+#   need a GH_TOKEN-immune stored-account assertion.
 #
 #   `--expect-token-identity` asserts the IDENTITY ATTACHED TO
 #   $GH_TOKEN, not the keyring. This is the canonical assertion for
@@ -69,9 +69,9 @@ usage() {
 Usage: identity-check.sh <mode>
 
 Modes (exactly one required):
-  --expect-author                   keyring active == author identity (nathanjohnpayne)
-  --expect-reviewer                 keyring active == nathanpayne-$MERGEPATH_AGENT
-  --expect-external <agent>         keyring active == nathanpayne-<agent>
+  --expect-author                   stored gh account == author identity (nathanjohnpayne)
+  --expect-reviewer                 stored gh account == nathanpayne-$MERGEPATH_AGENT
+  --expect-external <agent>         stored gh account == nathanpayne-<agent>
   --expect-token-identity <login>   gh api user .login (under $GH_TOKEN) == <login>
 
 Exit codes: 0 match | 1 bad args | 2 mismatch | 3 read failure (fail-closed).
@@ -186,10 +186,10 @@ if [ "$MODE" = "token" ]; then
     exit 3
   fi
 else
-  # Keyring-attributed write. Read the keyring's active account via
+  # Legacy stored-account check. Read gh's selected account via
   # `gh config get -h github.com user`, NOT `gh auth status` — the
   # latter is GH_TOKEN-poisonable (it reports the GH_TOKEN entry as
-  # Active even though writes still attribute to the keyring).
+  # selected even though legacy callers use the stored account).
   SIGNAL="gh config get -h github.com user"
   ACTUAL=$($SIGNAL 2>/dev/null || true)
   if [ -z "$ACTUAL" ]; then
@@ -211,9 +211,9 @@ fi
 # vs PAT swap).
 case "$MODE" in
   author|reviewer|external)
-    echo "identity-check: BLOCKED active keyring identity is '$ACTUAL', expected '$EXPECTED'." >&2
+    echo "identity-check: BLOCKED stored gh account is '$ACTUAL', expected '$EXPECTED'." >&2
     echo "identity-check:   Signal: $SIGNAL" >&2
-    echo "identity-check:   Remediation: gh auth switch -u $EXPECTED" >&2
+    echo "identity-check:   Remediation: use the token wrapper for guarded writes, or reselect '$EXPECTED' for legacy stored-account callers." >&2
     echo "identity-check:   See REVIEW_POLICY.md § Operation-to-Identity Matrix for the auth split." >&2
     ;;
   token)

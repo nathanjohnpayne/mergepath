@@ -51,7 +51,7 @@ This repository uses a multi-identity AI agent code review system. The full poli
    `--check` (alias `--status`) is the lightweight re-validator: never
    invokes `op`, never warms SSH, exits non-zero on missing/stale
    cache. Set `OP_PREFLIGHT_QUIET=1` to collapse the cache-hit stderr
-   block. It does not read or repair the gh active keyring. The helper
+   block. It does not read or repair gh account selection. The helper
    scripts (`coderabbit-wait.sh`, `codex-review-request.sh`,
    `codex-review-check.sh`, `resolve-pr-threads.sh`,
    `request-label-removal.sh`) auto-source
@@ -67,7 +67,7 @@ This repository uses a multi-identity AI agent code review system. The full poli
    `scripts/gh-as-reviewer.sh` for reviewer writes (`gh pr review`,
    `gh pr comment`, `gh issue comment`). The wrappers verify the
    effective token with `identity-check.sh --expect-token-identity` and
-   never mutate the machine-global gh active account.
+   never mutate machine-global gh account selection.
 
    Run `scripts/op-preflight.sh --agent {your-agent} --purge` (or
    `--purge-all`) at end of session to delete the cached PATs.

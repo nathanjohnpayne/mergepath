@@ -41,6 +41,8 @@
 #   BOOTSTRAP_SKIP_SECRETS=1            skip steps 4+5 (no live PAT lookup)
 #   BOOTSTRAP_REVIEWER_PAT_VALUE=...    supply the PAT inline (path c) for tests
 #   BOOTSTRAP_SKIP_INVITE_PAUSE=1       don't wait for "press enter to continue"
+#   BOOTSTRAP_SKIP_AUTHOR_TOKEN=1       tests only: run gh shim directly instead
+#                                       of the token-verifying author wrapper
 #
 # Side effects via bootstrap::run (so --dry-run is correct).
 
@@ -85,54 +87,20 @@ bootstrap::stage_github_infra() {
   # (same pattern as stage B sub-#233 round 4).
   local step_rc=0
 
-  # ----- author-identity switch-around (stage scope) -----
-  # All write-path gh calls in this stage (repo create, label,
-  # collaborator invite, secret set) must run under the author
-  # identity (default nathanjohnpayne) per CLAUDE.md § Active-account
-  # convention. CodeRabbit Major on #239 round 1 caught the gap:
-  # without the wrap, every write attributed to whatever agent
-  # identity was active, breaking the audit trail.
-  #
-  # One switch-pair covers all of stage C's writes — cheaper +
-  # clearer than wrapping each call. The restore ALWAYS runs (even
-  # on stage failure), via an explicit handler at every return path.
-  #
-  # Skip via BOOTSTRAP_SKIP_AUTHOR_SWITCH=1 (tests). Also skipped in
-  # dry-run since we don't want to side-effect the keyring while
-  # printing a plan.
-  local author_identity="${BOOTSTRAP_AUTHOR_IDENTITY:-nathanjohnpayne}"
-  local prior_active=""
-  if [ "${BOOTSTRAP_SKIP_AUTHOR_SWITCH:-0}" != "1" ] \
-     && [ "${BOOTSTRAP_DRY_RUN:-0}" != "1" ]; then
-    prior_active=$(gh config get -h github.com user 2>/dev/null || echo "")
-    if [ -z "$prior_active" ]; then
-      bootstrap::warn "github-infra: could not determine prior active gh account; writes will run under whatever is currently active"
-    else
-      bootstrap::run "switch active gh account to $author_identity for stage writes" \
-        gh auth switch -u "$author_identity" || step_rc=$?
-      if [ "$step_rc" -ne 0 ]; then
-        bootstrap::err "github-infra: gh auth switch to $author_identity failed (rc=$step_rc); aborting before any writes to preserve the prior active account"
-        return "$step_rc"
-      fi
-    fi
-  fi
-
-  # Helper: run a sub-step and ALWAYS-restore prior_active on stage
-  # exit. Used by every return-on-failure path below so the keyring
-  # state never leaks past this stage.
+  # GitHub writes in this stage are author-attributed. Each call goes
+  # through bootstrap::run_author_gh / bootstrap::author_gh, which uses
+  # scripts/gh-as-author.sh to verify the author token for the single
+  # command. There is no stage-scope keyring mutation and therefore no
+  # restore work to perform on failure paths.
   bootstrap::_restore_active_if_needed() {
-    if [ -n "$prior_active" ]; then
-      bootstrap::run "restore active gh account to $prior_active" \
-        gh auth switch -u "$prior_active" \
-        || bootstrap::warn "github-infra: failed to restore active gh account to $prior_active; manual fix may be needed via 'gh auth switch -u $prior_active'"
-    fi
+    :
   }
 
   # Step 1: create the remote + push the bootstrap commit.
   bootstrap::_create_remote_and_push \
     "$full_repo" "$visibility" "$description" "$target" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
-    bootstrap::err "github-infra: gh repo create / push failed (rc=$step_rc)"
+    bootstrap::err "github-infra: repo create / push failed (rc=$step_rc)"
     bootstrap::_restore_active_if_needed
     return "$step_rc"
   fi
@@ -224,8 +192,8 @@ bootstrap::_create_remote_and_push() {
   # on a greenfield remote. gh-pr-guard.sh's "never push to main"
   # invariant doesn't apply because there's no protected main yet —
   # we're creating it. (The hook only fires on pre-existing repos.)
-  bootstrap::run "create remote + push: gh repo create $full_repo $vis_flag --source=$target --push" \
-    gh repo create "$full_repo" \
+  bootstrap::run_author_gh "create remote + push" \
+    repo create "$full_repo" \
       "$vis_flag" \
       --description "$description" \
       --source="$target" \
@@ -247,8 +215,8 @@ bootstrap::_seed_labels() {
 
     # --force makes the operation idempotent: existing labels get
     # their color/description updated instead of erroring.
-    bootstrap::run "label create: $name" \
-      gh label create "$name" \
+    bootstrap::run_author_gh "label create: $name" \
+      label create "$name" \
         --repo "$full_repo" \
         --color "$color" \
         --description "$desc" \
@@ -284,8 +252,8 @@ bootstrap::_invite_reviewers() {
     [ -z "$agent" ] && continue
     login="nathanpayne-$agent"
 
-    bootstrap::run "invite collaborator: $login (write)" \
-      gh api -X PUT "repos/$full_repo/collaborators/$login" \
+    bootstrap::run_author_gh "invite collaborator: $login (write)" \
+      api -X PUT "repos/$full_repo/collaborators/$login" \
         -f permission=write \
       || {
         # Non-existent agent identity, permission issue, etc. — log
@@ -368,11 +336,11 @@ bootstrap::_provision_reviewer_assignment_token() {
   # would expose the piped-stdin path's command shape (fine) but
   # any future migration of secrets-to-args would leak the value
   # itself. The trade-off is that this call MUST be `-e`-safe so
-  # the stage's auth-restore still runs on failure — hence the
-  # inline `|| set_rc=$?` on the pipeline below.
+  # the stage's explicit error handling still runs on failure — hence
+  # the inline `|| set_rc=$?` on the pipeline below.
   if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
-    bootstrap::run "set REVIEWER_ASSIGNMENT_TOKEN secret (stdin pipe; len=${#pat})" \
-      gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo"
+    bootstrap::run_author_gh "set REVIEWER_ASSIGNMENT_TOKEN secret (stdin pipe; len=${#pat})" \
+      secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo"
     return 0
   fi
   # Capture pipeline rc INLINE via `|| set_rc=$?`. Without the `||`,
@@ -386,9 +354,9 @@ bootstrap::_provision_reviewer_assignment_token() {
   # _provision_llm_secrets pattern + closes the gap nathanpayne-claude
   # caught on #239 round 2.
   local set_rc=0
-  printf '%s' "$pat" | gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo" >&2 || set_rc=$?
+  printf '%s' "$pat" | bootstrap::author_gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo" >&2 || set_rc=$?
   if [ "$set_rc" -ne 0 ]; then
-    bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: gh secret set failed (rc=$set_rc)"
+    bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: secret set failed (rc=$set_rc)"
     return "$set_rc"
   fi
   bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN set on $full_repo (len=${#pat})"
@@ -434,9 +402,9 @@ bootstrap::_provision_llm_secrets() {
     # gh reads from stdin instead of storing literal `-`. Codex P1
     # on #239 round 1 caught the bug for both secret paths.
     local set_rc=0
-    printf '%s' "$value" | gh secret set "$name" --repo "$full_repo" >&2 || set_rc=$?
+    printf '%s' "$value" | bootstrap::author_gh secret set "$name" --repo "$full_repo" >&2 || set_rc=$?
     if [ "$set_rc" -ne 0 ]; then
-      bootstrap::warn "LLM secret $name: gh secret set failed (rc=$set_rc); continuing with remaining secrets"
+      bootstrap::warn "LLM secret $name: secret set failed (rc=$set_rc); continuing with remaining secrets"
       any_fail=1
       continue
     fi

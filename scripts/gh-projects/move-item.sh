@@ -25,7 +25,7 @@ STATUS_NAME="${2:?status name required}"
 : "${REPO:?REPO must be set (owner/repo)}"
 : "${OWNER:?OWNER must be set}"
 : "${PROJECT:?PROJECT must be set}"
-: "${GH_TOKEN:?GH_TOKEN must be set to a PAT with project scope (this script mutates project items)}"
+: "${GH_TOKEN:?GH_TOKEN must be set to the author PAT with project scope (this script mutates project items)}"
 
 # Required tooling: gh and python3 (used for parsing gh's JSON output below).
 # CodeRabbit on PR #180 caught the missing python3 check — fail fast with a
@@ -33,15 +33,34 @@ STATUS_NAME="${2:?status name required}"
 command -v gh      >/dev/null 2>&1 || { echo "Error: gh CLI not on PATH (install via 'brew install gh')." >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "Error: python3 not on PATH (this script uses python3 to parse gh's JSON output; install python3 via your package manager)." >&2; exit 1; }
 
+EXPECTED_IDENTITY="${GHP_EXPECTED_IDENTITY:-nathanjohnpayne}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHECKER="$SCRIPT_DIR/../identity-check.sh"
+if [ "${GHP_SKIP_TOKEN_IDENTITY_CHECK:-0}" != "1" ]; then
+  if [ ! -x "$CHECKER" ]; then
+    echo "Error: identity-check helper missing or non-executable: $CHECKER" >&2
+    exit 2
+  fi
+  if ! GH_TOKEN="$GH_TOKEN" "$CHECKER" --expect-token-identity "$EXPECTED_IDENTITY"; then
+    echo "Error: GH_TOKEN must resolve to $EXPECTED_IDENTITY for project-item mutations." >&2
+    exit 2
+  fi
+fi
+
+ghp_gh() (
+  unset GITHUB_TOKEN
+  gh "$@"
+)
+
 export STATUS_NAME
 
 # Resolve the project's node ID.
-PROJECT_ID=$(gh project view "$PROJECT" --owner "$OWNER" --format json \
+PROJECT_ID=$(ghp_gh project view "$PROJECT" --owner "$OWNER" --format json \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
 
 # Resolve the Status field ID + the option ID for the requested status in a
 # single pass over field-list output.
-read -r STATUS_FIELD_ID OPT_ID <<<"$(gh project field-list "$PROJECT" --owner "$OWNER" --limit 100 --format json | python3 -c "
+read -r STATUS_FIELD_ID OPT_ID <<<"$(ghp_gh project field-list "$PROJECT" --owner "$OWNER" --limit 100 --format json | python3 -c "
 import json, os, sys
 name = os.environ['STATUS_NAME']
 d = json.load(sys.stdin)
@@ -66,7 +85,7 @@ fi
 
 # Resolve the project-level item ID for this issue.
 export ISSUE_URL="https://github.com/$REPO/issues/$ISSUE_NUM"
-ITEM_ID=$(gh project item-list "$PROJECT" --owner "$OWNER" --format json --limit 2000 | python3 -c "
+ITEM_ID=$(ghp_gh project item-list "$PROJECT" --owner "$OWNER" --format json --limit 2000 | python3 -c "
 import json, os, sys
 url = os.environ['ISSUE_URL']
 d = json.load(sys.stdin)
@@ -81,7 +100,7 @@ if [ -z "$ITEM_ID" ]; then
   exit 1
 fi
 
-gh project item-edit \
+ghp_gh project item-edit \
   --id "$ITEM_ID" \
   --project-id "$PROJECT_ID" \
   --field-id "$STATUS_FIELD_ID" \

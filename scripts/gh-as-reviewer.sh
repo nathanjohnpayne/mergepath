@@ -2,7 +2,7 @@
 # scripts/gh-as-reviewer.sh
 #
 # Run a `gh` command under a verified REVIEWER token without mutating
-# the machine-global gh active account.
+# machine-global gh account selection.
 #
 # Usage:
 #   GH_AS_REVIEWER_IDENTITY=nathanpayne-codex \
@@ -12,6 +12,8 @@
 #   GH_AS_REVIEWER_IDENTITY   reviewer login to verify.
 #   MERGEPATH_AGENT           fallback agent name; resolves to
 #                             nathanpayne-$MERGEPATH_AGENT.
+#   OP_PREFLIGHT_AGENT        fallback agent from op-preflight cache when
+#                             MERGEPATH_AGENT is unset.
 #   OP_PREFLIGHT_REVIEWER_PAT preferred cached reviewer token.
 #
 # Bash 3.2 portable.
@@ -22,13 +24,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/gh-token-resolver.sh
 . "$ROOT/scripts/lib/gh-token-resolver.sh"
 
-if [ -n "${GH_AS_REVIEWER_IDENTITY:-}" ]; then
-  REVIEWER="$GH_AS_REVIEWER_IDENTITY"
-elif [ -n "${MERGEPATH_AGENT:-}" ]; then
-  REVIEWER="nathanpayne-$MERGEPATH_AGENT"
-else
-  REVIEWER="nathanpayne-claude"
-fi
+REVIEWER="$(gh_default_reviewer_identity)"
 
 [ "${1:-}" = "--" ] && shift
 

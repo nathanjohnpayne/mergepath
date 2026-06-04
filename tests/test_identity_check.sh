@@ -3,12 +3,12 @@
 #
 # Unit tests for scripts/identity-check.sh — the pre-action identity
 # assertion helper that callers run at the top of every WRITE path to
-# fail-close on active-account drift. See #284.
+# fail-close on identity drift. See #284.
 #
 # Strategy: PATH-shim `gh` with a stub that:
 #   - returns a configurable string for `gh config get -h github.com user`
-#     (the keyring read used by --expect-author / --expect-reviewer /
-#     --expect-external)
+#     (the stored-account read used by --expect-author /
+#     --expect-reviewer / --expect-external)
 #   - returns a configurable string for `gh api user --jq .login` (the
 #     PAT-identity read used by --expect-token-identity)
 #
@@ -62,7 +62,7 @@ run_check() {
 }
 
 # -----------------------------------------------------------------------
-# Test 1: --expect-author with matching active → exit 0
+# Test 1: --expect-author with matching stored account → exit 0
 # -----------------------------------------------------------------------
 set +e
 out=$(STUB_ACTIVE_USER="nathanjohnpayne" run_check --expect-author 2>&1)
@@ -75,7 +75,7 @@ else
 fi
 
 # -----------------------------------------------------------------------
-# Test 2: --expect-author with WRONG active → exit 2 + remediation
+# Test 2: --expect-author with WRONG stored account → exit 2 + remediation
 # -----------------------------------------------------------------------
 set +e
 out=$(STUB_ACTIVE_USER="nathanpayne-claude" run_check --expect-author 2>&1)
@@ -85,7 +85,7 @@ if [ "$rc" -ne 2 ]; then
   fail "--expect-author mismatch: exit $rc, expected 2; output: $out"
 elif ! echo "$out" | grep -qi "expected 'nathanjohnpayne'"; then
   fail "--expect-author mismatch: missing 'expected nathanjohnpayne' in output: $out"
-elif ! echo "$out" | grep -qi "gh auth switch -u nathanjohnpayne"; then
+elif ! echo "$out" | grep -qi "use the token wrapper for guarded writes"; then
   fail "--expect-author mismatch: missing remediation hint; output: $out"
 else
   pass "--expect-author mismatch: exit 2 with remediation"

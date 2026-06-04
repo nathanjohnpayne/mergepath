@@ -32,17 +32,17 @@
 # Env overrides:
 #   BOOTSTRAP_SKIP_BOARD=1            Skip sub-step 1 (project board);
 #                                     summary + scaffolds still run.
-#   BOOTSTRAP_SKIP_AUTHOR_SWITCH=1    Skip the active-account
-#                                     switch-around (tests; also
-#                                     auto-skipped in dry-run).
+#   BOOTSTRAP_SKIP_AUTHOR_TOKEN=1     tests only: run gh shim directly
+#                                     instead of the token-verifying
+#                                     author wrapper.
 #   BOOTSTRAP_AUTHOR_IDENTITY         Override target identity for
-#                                     the switch-around (default
+#                                     author token verification (default
 #                                     nathanjohnpayne).
 #
 # Side effects via bootstrap::run so --dry-run prints instead of executing.
-# Project board calls are gh write paths — wrapped in the stage-scope
-# author-identity switch-around (same pattern as sub-C). Scaffold files
-# are direct shell redirects, no auth wrap needed.
+# Project board calls are gh write paths and use the token-verifying
+# author wrapper per command. Scaffold files are direct shell redirects,
+# no auth wrapper needed.
 
 set -euo pipefail
 
@@ -72,41 +72,12 @@ bootstrap::stage_board_and_summary() {
     skip_board=1
   fi
 
-  # ----- author-identity switch-around (stage scope) -----
-  # Same pattern as sub-C: the gh project write calls must run under
-  # the author identity (default nathanjohnpayne). We switch once at
-  # the top, run all writes, and ALWAYS-restore at every exit path.
-  # Skipped under BOOTSTRAP_SKIP_AUTHOR_SWITCH=1 (tests) and in dry-run
-  # (we don't want to side-effect the keyring while printing a plan).
-  local author_identity="${BOOTSTRAP_AUTHOR_IDENTITY:-nathanjohnpayne}"
-  local prior_active=""
-  local did_switch=0
-  if [ "$skip_board" != "1" ] \
-     && [ "${BOOTSTRAP_SKIP_AUTHOR_SWITCH:-0}" != "1" ] \
-     && [ "${BOOTSTRAP_DRY_RUN:-0}" != "1" ]; then
-    prior_active=$(gh config get -h github.com user 2>/dev/null || echo "")
-    if [ -z "$prior_active" ]; then
-      bootstrap::warn "board-and-summary: could not determine prior active gh account; project writes will run under whatever is currently active"
-    else
-      bootstrap::run "switch active gh account to $author_identity for stage writes" \
-        gh auth switch -u "$author_identity" || step_rc=$?
-      if [ "$step_rc" -ne 0 ]; then
-        bootstrap::err "board-and-summary: gh auth switch to $author_identity failed (rc=$step_rc); aborting before any writes to preserve the prior active account"
-        return "$step_rc"
-      fi
-      did_switch=1
-    fi
-  fi
-
-  # Helper: ALWAYS-restore prior_active on stage exit. Used by every
-  # return-on-failure path below so the keyring never leaks past this
-  # stage.
+  # GitHub writes in this stage are author-attributed per command via
+  # bootstrap::run_author_gh / bootstrap::author_gh. No global auth
+  # state is mutated, so existing failure paths can keep calling this
+  # no-op helper without carrying restore state.
   bootstrap::_bs_restore_active_if_needed() {
-    if [ "$did_switch" = "1" ] && [ -n "$prior_active" ]; then
-      bootstrap::run "restore active gh account to $prior_active" \
-        gh auth switch -u "$prior_active" \
-        || bootstrap::warn "board-and-summary: failed to restore active gh account to $prior_active; manual fix may be needed via 'gh auth switch -u $prior_active'"
-    fi
+    :
   }
 
   # Sub-step 1: project v2 board.
@@ -183,8 +154,8 @@ bootstrap::_provision_project_board() {
       _bs_tmp=$(mktemp "${TMPDIR:-/tmp}/bootstrap-project.XXXXXX")
 
       if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
-        bootstrap::run "create Project v2: $repo_name" \
-          gh project create --owner "$owner" --title "$repo_name" --format json
+        bootstrap::run_author_gh "create Project v2: $repo_name" \
+          project create --owner "$owner" --title "$repo_name" --format json
         # Dry-run: invent a placeholder number so the rest of the stage
         # can print a plan without a real API response.
         pn="<N>"
@@ -194,18 +165,18 @@ bootstrap::_provision_project_board() {
         bootstrap::log "creating Project v2: $repo_name"
         # `bootstrap::run` echoes the command line for the transcript;
         # we still capture stdout via process substitution to grab the
-        # number. Run gh directly here (single command, value-bearing
-        # stdout) but mirror the log line so the audit trail matches
-        # the wrapper.
+        # number. Use bootstrap::author_gh so the value-bearing live
+        # command still verifies the author token without logging token
+        # material.
         if [ -n "${BOOTSTRAP_LOG_FILE:-}" ]; then
           mkdir -p "$(dirname "$BOOTSTRAP_LOG_FILE")"
           echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) create Project v2: gh project create --owner $owner --title $repo_name --format json" \
             >>"$BOOTSTRAP_LOG_FILE"
         fi
         local create_rc=0
-        gh project create --owner "$owner" --title "$repo_name" --format json >"$_bs_tmp" 2>&1 || create_rc=$?
+        bootstrap::author_gh project create --owner "$owner" --title "$repo_name" --format json >"$_bs_tmp" 2>&1 || create_rc=$?
         if [ "$create_rc" -ne 0 ]; then
-          bootstrap::err "gh project create failed (rc=$create_rc): $(cat "$_bs_tmp")"
+          bootstrap::err "project create failed (rc=$create_rc): $(cat "$_bs_tmp")"
           rm -f "$_bs_tmp"
           return "$create_rc"
         fi
@@ -218,7 +189,7 @@ bootstrap::_provision_project_board() {
           pn=$(sed -n 's/.*"number"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' <"$_bs_tmp" | head -1)
         fi
         if [ -z "$pn" ]; then
-          bootstrap::err "gh project create succeeded but could not parse project number from response: $(cat "$_bs_tmp")"
+          bootstrap::err "project create succeeded but could not parse project number from response: $(cat "$_bs_tmp")"
           rm -f "$_bs_tmp"
           return 2
         fi
@@ -231,8 +202,8 @@ bootstrap::_provision_project_board() {
       # gh project field-create; a re-run would error if Status already
       # exists. That's acceptable for now — the new-board path is
       # only meant to run once per repo.
-      bootstrap::run "Status field: Backlog/Ready/In progress/In review/Done" \
-        gh project field-create "$pn" --owner "$owner" \
+      bootstrap::run_author_gh "Status field: Backlog/Ready/In progress/In review/Done" \
+        project field-create "$pn" --owner "$owner" \
           --name Status --data-type SINGLE_SELECT \
           --single-select-options "Backlog,Ready,In progress,In review,Done" \
         || {
@@ -251,8 +222,8 @@ bootstrap::_provision_project_board() {
 TODO: populate from the new repo's PRD / spec.
 
 Generated by scripts/bootstrap-new-repo.sh (#156 sub-E)."
-      bootstrap::run "set board readme" \
-        gh project edit "$pn" --owner "$owner" --readme "$readme_body" \
+      bootstrap::run_author_gh "set board readme" \
+        project edit "$pn" --owner "$owner" --readme "$readme_body" \
         || {
           bootstrap::warn "board-and-summary: project edit --readme failed; configure manually if needed"
         }

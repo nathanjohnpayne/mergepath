@@ -92,6 +92,11 @@ cat > "$SCRATCH/gh" <<'GH_STUB'
 #!/usr/bin/env bash
 # Stub: print a marker proving the script reached gh, then succeed.
 case "$1" in
+  "api")
+    if [ "${2:-}" = "user" ]; then
+      printf 'nathanpayne-claude\n'
+    fi
+    ;;
   "pr")
     case "${2:-}" in
       "view")    printf 'https://github.com/nathanjohnpayne/mergepath/pull/99999\n' ;;
@@ -105,7 +110,7 @@ GH_STUB
 chmod +x "$SCRATCH/gh"
 
 set +e
-out=$(PATH="$SCRATCH:$PATH" REQUEST_LABEL_REMOVAL_SKIP_IDENTITY_CHECK=1 \
+out=$(PATH="$SCRATCH:$PATH" OP_PREFLIGHT_REVIEWER_PAT="fake-reviewer-pat" \
   MERGEPATH_NOTIFY_IMESSAGE_TO="" \
   "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review 2>&1)
 rc=$?
@@ -123,7 +128,7 @@ fi
 # Same, but WITH --repo — sanity-check that the explicit-repo path
 # is also still wired up.
 set +e
-out=$(PATH="$SCRATCH:$PATH" REQUEST_LABEL_REMOVAL_SKIP_IDENTITY_CHECK=1 \
+out=$(PATH="$SCRATCH:$PATH" OP_PREFLIGHT_REVIEWER_PAT="fake-reviewer-pat" \
   MERGEPATH_NOTIFY_IMESSAGE_TO="" \
   "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review --repo nathanjohnpayne/mergepath 2>&1)
 rc=$?
@@ -143,6 +148,11 @@ fi
 cat > "$SCRATCH/gh" <<'GH_STUB'
 #!/usr/bin/env bash
 case "$1" in
+  "api")
+    if [ "${2:-}" = "user" ]; then
+      printf 'nathanpayne-claude\n'
+    fi
+    ;;
   "pr")
     case "${2:-}" in
       "view") printf 'https://github.com/nathanjohnpayne/mergepath/pull/99999\n' ;;
@@ -164,7 +174,7 @@ chmod +x "$SCRATCH/gh"
 # no-repo path
 SCRATCH_BODY_OUT="$SCRATCH/body-norepo.txt" \
   PATH="$SCRATCH:$PATH" \
-  REQUEST_LABEL_REMOVAL_SKIP_IDENTITY_CHECK=1 \
+  OP_PREFLIGHT_REVIEWER_PAT="fake-reviewer-pat" \
   MERGEPATH_NOTIFY_IMESSAGE_TO="" \
   "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review >/dev/null 2>&1 || true
 
@@ -182,7 +192,7 @@ fi
 # with-repo path
 SCRATCH_BODY_OUT="$SCRATCH/body-repo.txt" \
   PATH="$SCRATCH:$PATH" \
-  REQUEST_LABEL_REMOVAL_SKIP_IDENTITY_CHECK=1 \
+  OP_PREFLIGHT_REVIEWER_PAT="fake-reviewer-pat" \
   MERGEPATH_NOTIFY_IMESSAGE_TO="" \
   "$LABEL_REMOVAL_SCRIPT" 99999 needs-external-review --repo nathanjohnpayne/mergepath >/dev/null 2>&1 || true
 

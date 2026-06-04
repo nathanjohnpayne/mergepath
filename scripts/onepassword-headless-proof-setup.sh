@@ -164,8 +164,7 @@ set_actions_secret() {
     log "DRY-RUN: would set Actions secret $name on $REPO"
     return 0
   fi
-  printf '%s' "$value" | scripts/gh-as-author.sh -- \
-    gh secret set "$name" --repo "$REPO" --app actions >/dev/null
+  printf '%s' "$value" | scripts/gh-as-author.sh -- gh secret set "$name" --repo "$REPO" --app actions >/dev/null
   log "Set Actions secret $name on $REPO"
 }
 
@@ -176,8 +175,7 @@ set_actions_variable() {
     log "DRY-RUN: would set Actions variable $name on $REPO"
     return 0
   fi
-  printf '%s' "$value" | scripts/gh-as-author.sh -- \
-    gh variable set "$name" --repo "$REPO" >/dev/null
+  printf '%s' "$value" | scripts/gh-as-author.sh -- gh variable set "$name" --repo "$REPO" >/dev/null
   log "Set Actions variable $name on $REPO"
 }
 

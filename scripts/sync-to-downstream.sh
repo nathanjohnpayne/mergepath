@@ -166,6 +166,11 @@
 #   MERGEPATH_SYNC_COAUTHOR_TRAILER
 #                           Explicit `Co-Authored-By: Name <email>` trailer.
 #                           Required for agents without a built-in trailer.
+#   MERGEPATH_SYNC_ACTOR_OVERRIDE
+#                           Override the expected author login for tests.
+#   MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1
+#                           Tests only: run gh shim directly instead of the
+#                           token-verifying author wrapper.
 #
 # Prerequisites:
 #   yq (mikefarah/yq, v4+)  brew install yq
@@ -201,11 +206,81 @@ MERGEPATH_ROOT="${MERGEPATH_ROOT_OVERRIDE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/
 # shellcheck source=scripts/sync/apply-overrides.sh
 . "$MERGEPATH_ROOT/scripts/sync/apply-overrides.sh"
 
+# Read-path token helper (#412). Do not require a token at startup:
+# audit/dry-run/no-pr callers may be intentionally using ambient gh/git
+# auth. When an op-preflight cache or OP_PREFLIGHT_AUTHOR_PAT is already
+# available, sync_read_gh below can reuse it for gh read probes so a
+# normal live sync does not fail between author-token verification and
+# the wrapped author writes.
+if [ -r "$MERGEPATH_ROOT/scripts/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=scripts/lib/preflight-helpers.sh
+  . "$MERGEPATH_ROOT/scripts/lib/preflight-helpers.sh"
+  auto_source_preflight || true
+fi
+
 # --- logging ----------------------------------------------------------------
 
 log() { echo "[sync-to-downstream] $*" >&2; }
 warn() { echo "[sync-to-downstream] WARN: $*" >&2; }
 err() { echo "[sync-to-downstream] ERROR: $*" >&2; }
+
+sync_author_identity() {
+  local expected
+  expected=$(awk '/^author_identity:/ {sub(/^[^:]+:[[:space:]]*/, ""); gsub(/[[:space:]"#].*$/, ""); print; exit}' \
+    "$MERGEPATH_ROOT/.github/review-policy.yml" 2>/dev/null || echo "")
+  expected=${expected:-nathanjohnpayne}
+  expected=${MERGEPATH_SYNC_ACTOR_OVERRIDE:-$expected}
+  printf '%s\n' "$expected"
+}
+
+sync_author_wrapper() {
+  printf '%s/scripts/gh-as-author.sh\n' "$MERGEPATH_ROOT"
+}
+
+SYNC_AUTHOR_IDENTITY=""
+
+sync_verify_author_token() {
+  if [ "${MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK:-0}" = "1" ]; then
+    warn "MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 — skipping author token verification (tests only)"
+    return 0
+  fi
+
+  local wrapper
+  SYNC_AUTHOR_IDENTITY="$(sync_author_identity)"
+  wrapper="$(sync_author_wrapper)"
+  if [ ! -x "$wrapper" ]; then
+    err "refusing to run live sync — author wrapper missing or non-executable: $wrapper"
+    err "       Restore scripts/gh-as-author.sh so GitHub writes can verify the author token."
+    exit 2
+  fi
+  if ! GH_AS_AUTHOR_IDENTITY="$SYNC_AUTHOR_IDENTITY" "$wrapper" -- gh api user --jq .login >/dev/null 2>&1; then
+    err "refusing to run live sync — could not verify an author token for '$SYNC_AUTHOR_IDENTITY'"
+    err "       Run: eval \"\$(scripts/op-preflight.sh --agent <agent> --mode review)\""
+    err "       Then re-run. (Set MERGEPATH_SYNC_ACTOR_OVERRIDE for tests.)"
+    exit 2
+  fi
+}
+
+sync_author_gh() {
+  if [ "${MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK:-0}" = "1" ]; then
+    gh "$@"
+    return $?
+  fi
+
+  local wrapper
+  if [ -z "$SYNC_AUTHOR_IDENTITY" ]; then
+    SYNC_AUTHOR_IDENTITY="$(sync_author_identity)"
+  fi
+  wrapper="$(sync_author_wrapper)"
+  GH_AS_AUTHOR_IDENTITY="$SYNC_AUTHOR_IDENTITY" "$wrapper" -- gh "$@"
+}
+
+sync_read_gh() (
+  if [ -z "${GH_TOKEN:-}" ] && type preflight_require_token >/dev/null 2>&1; then
+    preflight_require_token author >/dev/null 2>&1 || true
+  fi
+  gh "$@"
+)
 
 usage() {
   # Print everything between the first `# Usage:` line and the next blank
@@ -1053,7 +1128,7 @@ sync_check_existing_pr() {
   local consumer_repo=$1
   local branch=$2
   local prs
-  prs=$(gh api "repos/$consumer_repo/pulls?state=all&head=$(echo "$consumer_repo" | cut -d/ -f1):$branch" \
+  prs=$(sync_read_gh api "repos/$consumer_repo/pulls?state=all&head=$(echo "$consumer_repo" | cut -d/ -f1):$branch" \
     --jq '.[] | "\(.state)\t\(.number)"' 2>/dev/null) || {
     echo "error"
     return 1
@@ -1480,9 +1555,9 @@ EOF
   if [ -n "$recreate_existing_pr_num" ]; then
     printf "  ⤷ %s — closing existing PR #%s for --recreate-existing\n" \
       "$consumer_name" "$recreate_existing_pr_num"
-    if ! gh pr close "$recreate_existing_pr_num" --repo "$consumer_repo" \
+    if ! sync_author_gh pr close "$recreate_existing_pr_num" --repo "$consumer_repo" \
           --comment "Closed by \`scripts/sync-to-downstream.sh --recreate-existing\`. Reopening with a fresh synthesized body on a recreated \`$branch\`." >&2; then
-      err "$consumer_name: gh pr close failed for #$recreate_existing_pr_num"
+      err "$consumer_name: PR close failed for #$recreate_existing_pr_num"
       return 1
     fi
     # Delete the remote branch so the subsequent push is a fresh-
@@ -1499,7 +1574,7 @@ EOF
     printf "  ⤷ %s — deleting remote branch %s for --recreate-existing\n" \
       "$consumer_name" "$branch"
     local _del_response _del_status _del_rc=0
-    _del_response=$(gh api --include -X DELETE "repos/${consumer_repo}/git/refs/heads/${branch}" 2>&1) || _del_rc=$?
+    _del_response=$(sync_author_gh api --include -X DELETE "repos/${consumer_repo}/git/refs/heads/${branch}" 2>&1) || _del_rc=$?
     _del_status=$(printf '%s\n' "$_del_response" | awk '
       /^HTTP\/[0-9.]+[[:space:]]+[0-9]+/ {
         match($0, /[0-9]+/)
@@ -1530,14 +1605,9 @@ EOF
     esac
   fi
 
-  # Push. The active gh keyring account ('gh config get -h github.com user')
-  # is what gh uses for write operations. The author identity is what
-  # commits and PR creation should attribute to. Per the active-account
-  # convention (CLAUDE.md), agents wrap author-identity writes in a
-  # switch-around. Here we let the caller pre-arrange that — sync_open_pr
-  # is invoked under the agent's normal active account, so PR creation
-  # bylines as that account. To get nathanjohnpayne attribution on the
-  # PR (matching the standard policy), the caller must switch first.
+  # Push. Commit authorship is git-config based, and the #410 spike
+  # verified ordinary git push is not part of the gh write-attribution
+  # race. PR creation below is author-attributed through sync_author_gh.
   printf "  ⤷ %s — pushing branch %s\n" "$consumer_name" "$branch"
   if ! git -C "$workspace/repo" push -q -u origin "$branch" 2>&1; then
     err "$consumer_name: git push failed"
@@ -1546,9 +1616,7 @@ EOF
 
   # --no-pr (#199): push the branch but stop here. Useful for staging
   # the propagation across N consumers and inspecting branches before
-  # committing to PR creation. The branch still gets pushed under the
-  # standard active-account convention; only the `gh pr create` step
-  # is skipped.
+  # committing to PR creation.
   if [ "${SYNC_NO_PR:-0}" = "1" ]; then
     printf "  ✓ %s — pushed branch %s (--no-pr; no PR opened)\n" "$consumer_name" "$branch"
     return 0
@@ -1557,7 +1625,7 @@ EOF
   # Open the PR.
   printf "  ⤷ %s — opening PR\n" "$consumer_name"
   local pr_url
-  pr_url=$(gh pr create --repo "$consumer_repo" --base main --head "$branch" \
+  pr_url=$(sync_author_gh pr create --repo "$consumer_repo" --base main --head "$branch" \
     --title "sync: ${commit_subject} (mergepath@${short_sha})" \
     --body "$(cat <<EOF
 Auto-propagated from [mergepath@${short_sha}](https://github.com/nathanjohnpayne/mergepath/commit/${sha}) by \`scripts/sync-to-downstream.sh\` (v${SCRIPT_VERSION}, see [#168](https://github.com/nathanjohnpayne/mergepath/issues/168)).
@@ -1581,7 +1649,7 @@ Authoring-Agent: ${authoring_agent}
 - Security: no new attack surface; the sync script never ran with elevated privileges in this consumer.
 EOF
 )" 2>&1) || {
-    err "$consumer_name: gh pr create failed: $pr_url"
+    err "$consumer_name: PR create failed: $pr_url"
     return 1
   }
   printf "  ✓ %s — opened %s\n" "$consumer_name" "$pr_url"
@@ -1912,15 +1980,15 @@ EOF
   if [ -n "$recreate_existing_pr_num" ]; then
     printf "  ⤷ %s — closing existing PR #%s for --recreate-existing\n" \
       "$consumer_name" "$recreate_existing_pr_num"
-    if ! gh pr close "$recreate_existing_pr_num" --repo "$consumer_repo" \
+    if ! sync_author_gh pr close "$recreate_existing_pr_num" --repo "$consumer_repo" \
           --comment "Closed by \`scripts/sync-to-downstream.sh --sync-all --recreate-existing\`. Reopening with a fresh synthesized body on a recreated \`$branch\`." >&2; then
-      err "$consumer_name: gh pr close failed for #$recreate_existing_pr_num"
+      err "$consumer_name: PR close failed for #$recreate_existing_pr_num"
       return 1
     fi
     printf "  ⤷ %s — deleting remote branch %s for --recreate-existing\n" \
       "$consumer_name" "$branch"
     local _del_response _del_status _del_rc=0
-    _del_response=$(gh api --include -X DELETE "repos/${consumer_repo}/git/refs/heads/${branch}" 2>&1) || _del_rc=$?
+    _del_response=$(sync_author_gh api --include -X DELETE "repos/${consumer_repo}/git/refs/heads/${branch}" 2>&1) || _del_rc=$?
     _del_status=$(printf '%s\n' "$_del_response" | awk '
       /^HTTP\/[0-9.]+[[:space:]]+[0-9]+/ {
         n = split($0, parts, /[^0-9]+/)
@@ -1958,7 +2026,7 @@ EOF
 
   printf "  ⤷ %s — opening PR\n" "$consumer_name"
   local pr_url
-  pr_url=$(gh pr create --repo "$consumer_repo" --base main --head "$branch" \
+  pr_url=$(sync_author_gh pr create --repo "$consumer_repo" --base main --head "$branch" \
     --title "sync: bulk reconcile to mergepath@${short_sha}" \
     --body "$(cat <<EOF
 Bulk sync to [mergepath@${short_sha}](https://github.com/nathanjohnpayne/mergepath/commit/${sha}) — verbatim canonical/kit mirror per \`.mergepath-sync.yml\`.
@@ -1984,7 +2052,7 @@ Authoring-Agent: ${authoring_agent}
 - Security: no new attack surface; \`.sync-overrides.yml\` was honored per-consumer so documented divergences are untouched.
 EOF
 )" 2>&1) || {
-    err "$consumer_name: gh pr create failed: $pr_url"
+    err "$consumer_name: PR create failed: $pr_url"
     return 1
   }
   printf "  ✓ %s — opened %s\n" "$consumer_name" "$pr_url"
@@ -2179,8 +2247,8 @@ sync_all_one_consumer() {
 
 # Run the --sync-all driver: propagate the current HEAD state of every
 # canonical + kit manifest path to every consumer, ignoring the
-# changed-at-a-commit filter. Mirrors run_sync's structure (active-
-# account guard for live mode, per-consumer loop, summary line).
+# changed-at-a-commit filter. Mirrors run_sync's structure (author-token
+# guard for live mode, per-consumer loop, summary line).
 run_sync_all() {
   local dry_run=${1:-0}
   local manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
@@ -2197,22 +2265,13 @@ run_sync_all() {
   }
   local short_sha=${sha:0:7}
 
-  # Active-account guard for LIVE mode — identical to run_sync's guard.
-  # Without it, a live --sync-all under a reviewer-identity keyring
-  # would open downstream PRs under that identity. Skipped in dry-run.
-  if [ "$dry_run" != "1" ]; then
-    local expected_actor active_actor
-    expected_actor=$(awk '/^author_identity:/ {sub(/^[^:]+:[[:space:]]*/, ""); gsub(/[[:space:]"#].*$/, ""); print; exit}' \
-      "$MERGEPATH_ROOT/.github/review-policy.yml" 2>/dev/null || echo "")
-    expected_actor=${expected_actor:-nathanjohnpayne}
-    expected_actor=${MERGEPATH_SYNC_ACTOR_OVERRIDE:-$expected_actor}
-    active_actor=$(gh config get -h github.com user 2>/dev/null || echo "")
-    if [ "$active_actor" != "$expected_actor" ]; then
-      err "refusing to run live sync — active gh account is '$active_actor', expected '$expected_actor'"
-      err "       Switch first: gh auth switch -u $expected_actor"
-      err "       Then re-run. (Set MERGEPATH_SYNC_ACTOR_OVERRIDE for tests.)"
-      exit 2
-    fi
+  # Author-token guard for LIVE PR-writing mode — identical to
+  # run_sync's guard. Without it, a live --sync-all could reach
+  # downstream gh writes without proving the author identity that will
+  # create PRs / close stale PRs / delete remote branches. Skipped in
+  # dry-run and --no-pr, where no gh author writes run.
+  if [ "$dry_run" != "1" ] && [ "${SYNC_NO_PR:-0}" != "1" ]; then
+    sync_verify_author_token
   fi
 
   echo "Sync-all: bulk reconcile to mergepath@${short_sha} (verbatim canonical/kit mirror per .mergepath-sync.yml)"
@@ -2258,33 +2317,17 @@ run_sync() {
     exit 0
   fi
 
-  # Active-account guard for LIVE mode (skipped in --dry-run since
-  # dry-run is meant to be safe to run from any identity). Refuses to
-  # proceed unless the gh keyring's active account matches the
-  # manifest's author_identity. Without this guard, downstream PRs
-  # would be created under whatever reviewer identity happens to be
-  # active, violating the author/reviewer separation in
-  # REVIEW_POLICY.md.
-  #
-  # Read via `gh config get -h github.com user` (NOT `gh auth status`,
-  # which is GH_TOKEN-poisonable per CLAUDE.md "Active-account
-  # convention"). Author identity is read from .github/review-policy.yml's
-  # `author_identity` field; falls back to "nathanjohnpayne" if missing.
-  # Override with MERGEPATH_SYNC_ACTOR_OVERRIDE for tests / break-glass.
-  # cursor's CHANGES_REQUESTED on PR #217 caught the missing guard.
-  if [ "$dry_run" != "1" ]; then
-    local expected_actor active_actor
-    expected_actor=$(awk '/^author_identity:/ {sub(/^[^:]+:[[:space:]]*/, ""); gsub(/[[:space:]"#].*$/, ""); print; exit}' \
-      "$MERGEPATH_ROOT/.github/review-policy.yml" 2>/dev/null || echo "")
-    expected_actor=${expected_actor:-nathanjohnpayne}
-    expected_actor=${MERGEPATH_SYNC_ACTOR_OVERRIDE:-$expected_actor}
-    active_actor=$(gh config get -h github.com user 2>/dev/null || echo "")
-    if [ "$active_actor" != "$expected_actor" ]; then
-      err "refusing to run live sync — active gh account is '$active_actor', expected '$expected_actor'"
-      err "       Switch first: gh auth switch -u $expected_actor"
-      err "       Then re-run. (Set MERGEPATH_SYNC_ACTOR_OVERRIDE for tests.)"
-      exit 2
-    fi
+  # Author-token guard for LIVE PR-writing mode (skipped in --dry-run
+  # and --no-pr since neither mode performs gh author writes). Refuses
+  # to proceed unless scripts/gh-as-author.sh can verify a token for
+  # the manifest's author_identity. Without this guard, downstream PRs
+  # and destructive recreate writes could fail later, or worse, run
+  # without the author/reviewer separation promised by REVIEW_POLICY.md.
+  # Override the expected login with MERGEPATH_SYNC_ACTOR_OVERRIDE for
+  # tests only. cursor's CHANGES_REQUESTED on PR #217 caught the missing
+  # live guard; #412 migrates it from keyring state to token proof.
+  if [ "$dry_run" != "1" ] && [ "${SYNC_NO_PR:-0}" != "1" ]; then
+    sync_verify_author_token
   fi
 
   echo "Sync from mergepath@${short_sha}: ${subject}"

@@ -388,18 +388,49 @@ set -e
 [[ "$unknown_exit" -eq 2 ]] || fail "unknown commit-ish should exit 2; got $unknown_exit"
 
 # ---------------------------------------------------------------------------
-# Live-mode active-account guard (cursor CHANGES_REQUESTED on PR #217).
-# Without the guard, a careless live invocation under a reviewer-identity
-# `gh` keyring would create downstream PRs under that identity, violating
-# the author/reviewer separation. The guard refuses to proceed unless the
-# active gh account matches author_identity. Tested by overriding the
-# expected actor to a value the live `gh config get` will not match.
+# Live-mode author-token guard (cursor CHANGES_REQUESTED on PR #217,
+# migrated in #412). Without the guard, a careless live invocation could
+# reach downstream writes without proving the author identity. The guard
+# refuses to proceed unless the author wrapper can verify a token for
+# author_identity.
 # ---------------------------------------------------------------------------
 guard_workdir="$WORKDIR/guard"
 GUARD_MP="$guard_workdir/mergepath"
 mkdir -p "$GUARD_MP/scripts" "$GUARD_MP/scripts/sync" "$GUARD_MP/scripts/lib" "$GUARD_MP/.github"
 cp "$ROOT/scripts/sync/apply-overrides.sh" "$GUARD_MP/scripts/sync/apply-overrides.sh"
 cp "$ROOT/scripts/lib/manifest-fact-helpers.sh" "$GUARD_MP/scripts/lib/manifest-fact-helpers.sh"
+cp "$ROOT/scripts/lib/preflight-helpers.sh" "$GUARD_MP/scripts/lib/preflight-helpers.sh"
+cat >"$GUARD_MP/scripts/gh-as-author.sh" <<'SH'
+#!/usr/bin/env bash
+echo "stub gh-as-author: refusing $GH_AS_AUTHOR_IDENTITY" >&2
+exit 2
+SH
+chmod +x "$GUARD_MP/scripts/gh-as-author.sh"
+GUARD_FAKE_BIN="$guard_workdir/bin"
+mkdir -p "$GUARD_FAKE_BIN"
+cat >"$GUARD_FAKE_BIN/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-} ${2:-}" in
+  "api "*)
+    if [ -n "${MERGEPATH_EXPECT_READ_GH_TOKEN:-}" ] &&
+       [ "${GH_TOKEN:-}" != "$MERGEPATH_EXPECT_READ_GH_TOKEN" ]; then
+      echo "fake gh api missing expected read token" >&2
+      exit 8
+    fi
+    exit 0
+    ;;
+  "repo clone")
+    echo "fake gh repo clone reached" >&2
+    exit 7
+    ;;
+  *)
+    echo "unexpected fake gh invocation: $*" >&2
+    exit 9
+    ;;
+esac
+SH
+chmod +x "$GUARD_FAKE_BIN/gh"
 cat >"$GUARD_MP/.mergepath-sync.yml" <<'YAML'
 version: 1
 consumers:
@@ -419,47 +450,60 @@ git -C "$GUARD_MP" -c user.email=t@t -c user.name=t add -A
 git -C "$GUARD_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m bump
 guard_sha=$(git -C "$GUARD_MP" rev-parse HEAD)
 
-# Live mode (no --dry-run) with the wrong active account should refuse.
-# We don't have access to consumer repos in tests anyway; the guard
-# fires BEFORE any clone, so the failure is the guard's, not the
+# Live mode (no --dry-run) with an unverified author token should
+# refuse before any clone, so the failure is the guard's, not the
 # clone's.
 set +e
 guard_out=$(MERGEPATH_ROOT_OVERRIDE="$GUARD_MP" "$SCRIPT" "$guard_sha" --repos alpha 2>&1)
 guard_exit=$?
 set -e
 echo "$guard_out" | grep -q "refusing to run live sync" \
-  || fail "active-account guard did not fire; got: $guard_out"
+  || fail "author-token guard did not fire; got: $guard_out"
 echo "$guard_out" | grep -q "definitely-not-a-real-user-9999" \
-  || fail "active-account guard did not name the expected actor"
+  || fail "author-token guard did not name the expected actor"
 [[ "$guard_exit" -ne 0 ]] \
-  || fail "active-account guard should exit non-zero; got $guard_exit"
+  || fail "author-token guard should exit non-zero; got $guard_exit"
 
-# Dry-run with the same wrong active account should still PASS — the
+# Dry-run with the same missing token should still PASS — the
 # guard only applies to live mode.
 set +e
 dr_out=$(MERGEPATH_ROOT_OVERRIDE="$GUARD_MP" "$SCRIPT" "$guard_sha" --dry-run --repos alpha 2>&1)
 dr_exit=$?
 set -e
 [[ "$dr_exit" -eq 0 ]] \
-  || fail "dry-run should not be blocked by active-account guard; got exit $dr_exit, output: $dr_out"
+  || fail "dry-run should not be blocked by author-token guard; got exit $dr_exit, output: $dr_out"
 echo "$dr_out" | grep -q "would open PR" \
   || fail "dry-run should still plan a PR; got: $dr_out"
 
-# MERGEPATH_SYNC_ACTOR_OVERRIDE escape hatch: setting it to the current
-# active actor makes the guard pass. We can't actually run live mode
-# (no real consumer repo), but we can assert the guard accepts the
-# override and the failure mode shifts to "could not clone" rather than
-# "refusing to run live sync."
-current_actor=$(gh config get -h github.com user 2>/dev/null || echo "")
-if [ -n "$current_actor" ]; then
-  set +e
-  override_out=$(MERGEPATH_ROOT_OVERRIDE="$GUARD_MP" \
-    MERGEPATH_SYNC_ACTOR_OVERRIDE="$current_actor" \
-    "$SCRIPT" "$guard_sha" --repos alpha 2>&1)
-  set -e
-  echo "$override_out" | grep -q "refusing to run live sync" \
-    && fail "actor override should bypass the guard; got: $override_out"
-fi
+# Live --no-pr performs git clone/push work but does not create,
+# close, or delete PRs through gh author writes, so it should not
+# require an author token. Make the proof deterministic with a fake
+# gh that allows read probes and fails only once clone is reached.
+set +e
+nopr_out=$(PATH="$GUARD_FAKE_BIN:$PATH" \
+  MERGEPATH_ROOT_OVERRIDE="$GUARD_MP" \
+  MERGEPATH_EXPECT_READ_GH_TOKEN=guard-read-token \
+  OP_PREFLIGHT_AUTHOR_PAT=guard-read-token \
+  "$SCRIPT" "$guard_sha" --repos alpha --no-pr 2>&1)
+nopr_exit=$?
+set -e
+echo "$nopr_out" | grep -q "refusing to run live sync" \
+  && fail "--no-pr should skip the author-token guard; got: $nopr_out"
+echo "$nopr_out" | grep -q "fake gh repo clone reached" \
+  || fail "--no-pr should reach clone after skipping author-token guard; got: $nopr_out"
+[[ "$nopr_exit" -ne 0 ]] \
+  || fail "--no-pr fixture should exit non-zero after fake clone failure; got $nopr_exit"
+
+# Test-only bypass: fixture runs that stub gh directly can opt out of
+# token verification. The failure mode should shift to "could not clone"
+# rather than "refusing to run live sync."
+set +e
+override_out=$(MERGEPATH_ROOT_OVERRIDE="$GUARD_MP" \
+  MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+  "$SCRIPT" "$guard_sha" --repos alpha 2>&1)
+set -e
+echo "$override_out" | grep -q "refusing to run live sync" \
+  && fail "test bypass should skip the author-token guard; got: $override_out"
 
 # Agent-aware sync metadata (#392). Exercise the live path with a local
 # bare remote and a stub `gh` so commit + PR bodies are inspected.
@@ -562,7 +606,7 @@ metadata_run_and_assert() {
     MERGEPATH_TEST_REMOTE_ALPHA="$remote" \
     MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" \
     MERGEPATH_TEST_RUN="$run_id" \
-    MERGEPATH_SYNC_ACTOR_OVERRIDE=nathanjohnpayne \
+    MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
     "$@" \
     "$SCRIPT" "$meta_sha" --repos alpha 2>&1)
   local rc=$?
@@ -603,7 +647,7 @@ metadata_unknown_out=$(env \
   MERGEPATH_TEST_REMOTE_ALPHA="$metadata_workdir/unused.git" \
   MERGEPATH_TEST_CAPTURE_DIR="$META_CAPTURE" \
   MERGEPATH_TEST_RUN="unknown-missing-trailer" \
-  MERGEPATH_SYNC_ACTOR_OVERRIDE=nathanjohnpayne \
+  MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
   MERGEPATH_SYNC_AUTHORING_AGENT=other \
   "$SCRIPT" "$meta_sha" --repos alpha 2>&1)
 metadata_unknown_rc=$?
