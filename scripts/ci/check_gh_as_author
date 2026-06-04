@@ -17,6 +17,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TESTS=(
   "tests/test_gh_as_author.sh"
   "tests/test_gh_as_reviewer.sh"
+  "tests/test_gh_wrapper_parallel.sh"
   "tests/test_gh_pr_guard.sh"
 )
 

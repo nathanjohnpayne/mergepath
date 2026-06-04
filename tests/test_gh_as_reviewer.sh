@@ -1,21 +1,5 @@
 #!/usr/bin/env bash
-# tests/test_gh_as_reviewer.sh
-#
-# Unit tests for scripts/gh-as-reviewer.sh — companion to
-# scripts/gh-as-author.sh. Same trap-EXIT shape, no post-create
-# verification.
-#
-# CodeRabbit round-1 on #245 flagged that `exec "$@"` at the end of
-# the wrapper replaces the bash process before the EXIT trap can
-# fire, leaving the gh keyring stuck on the reviewer identity. The
-# fix (this round) runs the wrapped command in-process and exits
-# with the wrapped command's rc. This test exists primarily to
-# regression-net that change (see CodeRabbit review id 3237851494).
-#
-# Strategy: identical to test_gh_as_author.sh — PATH-shim gh,
-# record each call, assert on the call log + exit code.
-#
-# Bash 3.2 portable.
+# Unit tests for scripts/gh-as-reviewer.sh token-based attribution.
 
 set -euo pipefail
 
@@ -32,215 +16,142 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
-# ---------------------------------------------------------------------------
-# Build a PATH-shim `gh` stub. Same shape as the gh-as-author tests.
-#
-#   GH_CALLS_LOG          path to a file the stub appends each call to
-#   GH_INITIAL_ACTIVE     value `gh config get -h github.com user` returns
-#   GH_SWITCH_RC          exit code for `gh auth switch` (default 0)
-#   GH_PR_REVIEW_RC       exit code for `gh pr review` (default 0)
-#
-# Stub UPDATES the file backing GH_INITIAL_ACTIVE on `gh auth switch
-# -u <user>` so subsequent `gh config get` calls reflect the switch.
-# ---------------------------------------------------------------------------
 STUB_DIR="$WORKDIR/stub-bin"
 mkdir -p "$STUB_DIR"
-ACTIVE_STATE_FILE="$WORKDIR/active-state"
-
 cat >"$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 LOG="${GH_CALLS_LOG:-/dev/null}"
-printf 'gh' >> "$LOG"
+printf 'GH_TOKEN=%s GITHUB_TOKEN=%s gh' "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" >> "$LOG"
 for a in "$@"; do
   printf '\t%s' "$a" >> "$LOG"
 done
 printf '\n' >> "$LOG"
 
-case "$1 $2" in
-  "config get")
-    if [ -f "${ACTIVE_STATE_FILE:-/nonexistent}" ]; then
-      cat "$ACTIVE_STATE_FILE"
-    elif [ -n "${GH_INITIAL_ACTIVE:-}" ]; then
-      echo "$GH_INITIAL_ACTIVE"
-    fi
-    exit 0
-    ;;
-  "auth switch")
-    rc="${GH_SWITCH_RC:-0}"
-    if [ "$rc" -ne 0 ]; then exit "$rc"; fi
-    # #284 silent-no-op flavor: when GH_SWITCH_SILENT_NOOP=1, return 0
-    # without updating the ACTIVE_STATE_FILE. Simulates the observed
-    # adversarial failure mode the post-switch verification catches.
-    if [ "${GH_SWITCH_SILENT_NOOP:-0}" = "1" ]; then
-      exit 0
-    fi
-    shift; shift
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = "-u" ]; then
-        shift
-        echo "$1" > "$ACTIVE_STATE_FILE"
-        exit 0
-      fi
+if [ "${1:-}" = "auth" ] && [ "${2:-}" = "switch" ]; then
+  echo "gh auth switch must not be called" >&2
+  exit 90
+fi
+
+if [ "${1:-}" = "auth" ] && [ "${2:-}" = "token" ]; then
+  user=""
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--user" ]; then
       shift
-    done
-    exit 0
-    ;;
-  "pr review")
-    exit "${GH_PR_REVIEW_RC:-0}"
-    ;;
-  *)
-    exit 0
-    ;;
-esac
+      user="${1:-}"
+      break
+    fi
+    shift
+  done
+  case "$user" in
+    nathanpayne-claude) printf '%s\n' "fallback-claude-token" ;;
+    nathanpayne-codex) printf '%s\n' "fallback-codex-token" ;;
+    *) exit 3 ;;
+  esac
+  exit 0
+fi
+
+if [ "${1:-}" = "api" ] && [ "${2:-}" = "user" ]; then
+  case "${GH_TOKEN:-}" in
+    reviewer-token|fallback-claude-token) printf '%s\n' "nathanpayne-claude" ;;
+    codex-token|fallback-codex-token) printf '%s\n' "nathanpayne-codex" ;;
+    author-token) printf '%s\n' "nathanjohnpayne" ;;
+    *) exit 4 ;;
+  esac
+  exit 0
+fi
+
+exit "${GH_GENERIC_RC:-0}"
 STUB
 chmod +x "$STUB_DIR/gh"
 
-reset_state() {
-  : > "$WORKDIR/calls.log"
-  echo "${GH_INITIAL_ACTIVE:-nathanjohnpayne}" > "$ACTIVE_STATE_FILE"
-}
-
 run_wrapper() {
-  PATH="$STUB_DIR:$PATH" \
-  GH_CALLS_LOG="$WORKDIR/calls.log" \
-  ACTIVE_STATE_FILE="$ACTIVE_STATE_FILE" \
-    "$WRAPPER" "$@"
+  PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$WRAPPER" "$@"
 }
 
-# ---------------------------------------------------------------------------
-# Test 1 (CodeRabbit id 3237851494): EXIT trap fires on the success
-# path. The wrapper must NOT `exec` the wrapped command — that would
-# replace the bash process and skip the trap, leaving the keyring
-# stuck on the reviewer identity. Starting from nathanjohnpayne as
-# the prior active account, after a successful `gh pr review` we
-# expect to see a switch-back to nathanjohnpayne in the call log.
-# ---------------------------------------------------------------------------
-GH_INITIAL_ACTIVE="nathanjohnpayne" \
-reset_state
+reset_log() {
+  : > "$WORKDIR/calls.log"
+}
 
-GH_INITIAL_ACTIVE="nathanjohnpayne" \
+reset_log
+OP_PREFLIGHT_REVIEWER_PAT="reviewer-token" GITHUB_TOKEN="ambient-token" \
   run_wrapper -- gh pr review 123 --comment --body "ok" >/dev/null 2>&1
 rc=$?
 if [ "$rc" -ne 0 ]; then
-  fail "happy path: wrapper exited $rc, expected 0"
+  fail "review happy path: rc=$rc"
+elif grep -q $'gh\tauth\tswitch' "$WORKDIR/calls.log"; then
+  fail "review happy path: called gh auth switch"
+elif ! grep -q $'GH_TOKEN=reviewer-token GITHUB_TOKEN= gh\tpr\treview\t123\t--comment' "$WORKDIR/calls.log"; then
+  fail "review happy path: wrapped command did not run with reviewer token and GITHUB_TOKEN unset"
+  cat "$WORKDIR/calls.log" >&2
 else
-  if grep -qE $'^gh\tauth\tswitch\t-u\tnathanpayne-claude$' "$WORKDIR/calls.log"; then
-    pass "happy path: switched to nathanpayne-claude"
-  else
-    fail "happy path: did NOT switch to nathanpayne-claude"
-    cat "$WORKDIR/calls.log" >&2
-  fi
-  if grep -qE $'^gh\tpr\treview\t123\t' "$WORKDIR/calls.log"; then
-    pass "happy path: ran gh pr review"
-  else
-    fail "happy path: did NOT run gh pr review"
-  fi
-  if grep -qE $'^gh\tauth\tswitch\t-u\tnathanjohnpayne$' "$WORKDIR/calls.log"; then
-    pass "happy path: switched back to nathanjohnpayne (trap EXIT fired — no exec regression)"
-  else
-    fail "happy path: did NOT switch back to nathanjohnpayne — exec \"\$@\" regression?"
-    cat "$WORKDIR/calls.log" >&2
-  fi
+  pass "review happy path: verified reviewer token, no keyring switch"
 fi
 
-# ---------------------------------------------------------------------------
-# Test 2: switch-back happens even when the wrapped command fails.
-# Confirms the trap fires on the non-zero-exit path too.
-# ---------------------------------------------------------------------------
-GH_INITIAL_ACTIVE="nathanjohnpayne" \
-GH_PR_REVIEW_RC=1 \
-reset_state
+reset_log
+MERGEPATH_AGENT=codex OP_PREFLIGHT_REVIEWER_PAT="codex-token" \
+  run_wrapper -- gh issue comment 7 --body "thanks" >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "MERGEPATH_AGENT fallback: rc=$rc"
+elif ! grep -q $'GH_TOKEN=codex-token GITHUB_TOKEN= gh\tissue\tcomment\t7' "$WORKDIR/calls.log"; then
+  fail "MERGEPATH_AGENT fallback: did not use codex token"
+  cat "$WORKDIR/calls.log" >&2
+else
+  pass "MERGEPATH_AGENT fallback: resolves nathanpayne-codex"
+fi
 
+reset_log
+GH_AS_REVIEWER_IDENTITY=nathanpayne-codex OP_PREFLIGHT_REVIEWER_PAT="codex-token" \
+  run_wrapper -- gh pr comment 123 --body "ping" >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "explicit identity: rc=$rc"
+elif ! grep -q $'GH_TOKEN=codex-token GITHUB_TOKEN= gh\tpr\tcomment\t123' "$WORKDIR/calls.log"; then
+  fail "explicit identity: did not use codex token"
+  cat "$WORKDIR/calls.log" >&2
+else
+  pass "explicit identity: GH_AS_REVIEWER_IDENTITY wins"
+fi
+
+reset_log
+unset OP_PREFLIGHT_REVIEWER_PAT
+run_wrapper -- gh pr review 123 --comment --body "ok" >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "fallback token: rc=$rc"
+elif ! grep -q $'GH_TOKEN=fallback-claude-token GITHUB_TOKEN= gh\tpr\treview' "$WORKDIR/calls.log"; then
+  fail "fallback token: did not use gh auth token --user"
+  cat "$WORKDIR/calls.log" >&2
+else
+  pass "fallback token: uses gh auth token --user without switching"
+fi
+
+reset_log
 set +e
-GH_INITIAL_ACTIVE="nathanjohnpayne" \
-GH_PR_REVIEW_RC=1 \
-  run_wrapper -- gh pr review 123 --comment --body "ok" >/dev/null 2>&1
+OP_PREFLIGHT_REVIEWER_PAT="author-token" run_wrapper -- gh pr review 123 --comment --body "ok" >/dev/null 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
-  fail "failure path: wrapper exited 0, expected non-zero"
-elif grep -qE $'^gh\tauth\tswitch\t-u\tnathanjohnpayne$' "$WORKDIR/calls.log"; then
-  pass "failure path: switch-back to nathanjohnpayne happened despite wrapped failure"
-else
-  fail "failure path: switch-back did NOT happen"
+  fail "wrong preferred token: expected non-zero"
+elif grep -q $'gh\tpr\treview' "$WORKDIR/calls.log"; then
+  fail "wrong preferred token: wrapped write ran despite failed verification"
   cat "$WORKDIR/calls.log" >&2
+else
+  pass "wrong preferred token: fails before wrapped write"
 fi
 
-# ---------------------------------------------------------------------------
-# Test 3: empty prior-active fails fast with exit 1, no switch.
-# ---------------------------------------------------------------------------
-GH_INITIAL_ACTIVE="" \
-reset_state
-: > "$ACTIVE_STATE_FILE"
-
+reset_log
 set +e
-PATH="$STUB_DIR:$PATH" \
-GH_CALLS_LOG="$WORKDIR/calls.log" \
-ACTIVE_STATE_FILE="$ACTIVE_STATE_FILE" \
-GH_INITIAL_ACTIVE="" \
-  "$WRAPPER" -- gh pr review 1 --comment --body "x" >/dev/null 2>&1
+run_wrapper -- >/dev/null 2>&1
 rc=$?
 set -e
-if [ "$rc" -ne 1 ]; then
-  fail "empty prior: wrapper exited $rc, expected 1"
-elif grep -qE $'^gh\tauth\tswitch\t' "$WORKDIR/calls.log"; then
-  fail "empty prior: gh auth switch SHOULD NOT have run when prior is empty"
-  cat "$WORKDIR/calls.log" >&2
+if [ "$rc" -eq 1 ]; then
+  pass "empty command: exits 1"
 else
-  pass "empty prior: failed fast without switching"
+  fail "empty command: rc=$rc expected 1"
 fi
 
-# ---------------------------------------------------------------------------
-# Test 4: GH_AS_REVIEWER_IDENTITY env var overrides default.
-# ---------------------------------------------------------------------------
-GH_INITIAL_ACTIVE="nathanjohnpayne" \
-reset_state
-
-GH_INITIAL_ACTIVE="nathanjohnpayne" \
-GH_AS_REVIEWER_IDENTITY="custom-reviewer" \
-  run_wrapper -- gh pr review 1 --comment --body "x" >/dev/null 2>&1
-rc=$?
-if [ "$rc" -ne 0 ]; then
-  fail "custom identity: wrapper exited $rc, expected 0"
-elif ! grep -qE $'^gh\tauth\tswitch\t-u\tcustom-reviewer$' "$WORKDIR/calls.log"; then
-  fail "custom identity: did not switch to custom-reviewer"
-  cat "$WORKDIR/calls.log" >&2
-else
-  pass "custom identity: GH_AS_REVIEWER_IDENTITY override switched to custom-reviewer"
-fi
-
-# ---------------------------------------------------------------------------
-# Test 5 (#284): post-switch verification failure. The stub returns 0
-# from `gh auth switch` WITHOUT updating the active-state file —
-# simulating a silent-no-op switch (corrupt hosts.yml / mocked gh /
-# concurrent-switch race). The wrapper must fail closed before
-# running the wrapped command. Exit code 2 with a clear diagnostic.
-# ---------------------------------------------------------------------------
-GH_INITIAL_ACTIVE="nathanjohnpayne" \
-reset_state
-
-set +e
-stderr_capture=$(
-  GH_INITIAL_ACTIVE="nathanjohnpayne" \
-  GH_SWITCH_SILENT_NOOP=1 \
-    run_wrapper -- gh pr review 1 --comment --body "x" 2>&1 1>/dev/null
-)
-rc=$?
-set -e
-if [ "$rc" -ne 2 ]; then
-  fail "post-switch verify (silent no-op): wrapper exited $rc, expected 2"
-elif ! echo "$stderr_capture" | grep -qi "POST-SWITCH VERIFICATION FAILED"; then
-  fail "post-switch verify (silent no-op): missing 'POST-SWITCH VERIFICATION FAILED' diagnostic; stderr: $stderr_capture"
-elif grep -qE $'^gh\tpr\treview\t' "$WORKDIR/calls.log"; then
-  fail "post-switch verify (silent no-op): wrapped gh pr review SHOULD NOT have run"
-  cat "$WORKDIR/calls.log" >&2
-else
-  pass "post-switch verify (silent no-op): exit 2 BEFORE wrapped command runs"
-fi
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
 echo ""
 echo "test_gh_as_reviewer: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then

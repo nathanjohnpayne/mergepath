@@ -34,53 +34,32 @@ To add a new agent, register a GitHub account following the pattern `nathanpayne
 
 ### Reviewer PAT Quick Start
 
-`gh` resolves auth differently for read paths vs write paths:
+For repo work, `GH_TOKEN` is now the per-command attribution source for
+the guarded `gh` writes. Do not rely on the machine-global gh keyring
+active account for author/reviewer bylines.
 
 - **Read paths** (`gh api user`, `gh api ...` GETs, `gh pr view`,
   `gh pr checks`) honor `GH_TOKEN`. Pass it inline per command.
-- **Write paths** (`gh pr review`, `gh pr create`, `gh pr merge`,
-  `gh pr edit`, `gh api -X POST repos/.../pulls/.../reviews`) use the
-  keyring's **active** account regardless of `GH_TOKEN`. The byline is
-  whoever owns the active keyring entry — read it with `gh config get
-  -h github.com user`, NOT `gh auth status` (the latter is
-  GH_TOKEN-poisonable: with GH_TOKEN set it reports the GH_TOKEN entry
-  as Active and the keyring entry as inactive, masking real
-  mismatches).
+- **Guarded write paths** (`gh pr create`, `gh pr merge`,
+  `gh pr edit`, `gh pr comment`, `gh pr review`, `gh issue comment`)
+  MUST go through `scripts/gh-as-author.sh` or
+  `scripts/gh-as-reviewer.sh`. The wrapper resolves the expected token,
+  verifies its effective login with `scripts/identity-check.sh
+  --expect-token-identity`, and runs exactly the wrapped command with
+  `GH_TOKEN` set and `GITHUB_TOKEN` cleared. The wrappers never run
+  `gh auth switch`.
+- **Bare and inline-token guarded writes** fail closed in
+  `scripts/hooks/gh-pr-guard.sh`. `GH_TOKEN=... gh pr review ...` is not
+  an approved substitute for the wrapper because it does not prove the
+  token belongs to the expected identity.
 
-Each agent's working machine has the agent identity as the **active**
-gh account, set once: `gh auth switch -u nathanpayne-<agent>`.
-Reviewer-identity writes then attribute correctly without an env var.
-Author-identity writes (`gh pr create`, `gh pr merge`, `gh pr edit`)
-need a temporary `gh auth switch -u nathanjohnpayne` around them,
-paired with a switch-back. See nathanjohnpayne/mergepath#164 for the
-empirical diagnosis (matchline PRs #181, #182).
-
-PATs are still required for the helper scripts (`coderabbit-wait.sh`,
-`codex-review-request.sh`, `codex-review-check.sh`) that drive the
-review pipeline. Of these, `codex-review-check.sh` is purely
-read-path; `coderabbit-wait.sh` and `codex-review-request.sh` BOTH
-post comments on the PR (a retry trigger and an `@codex review`
-trigger respectively, via `gh pr comment` or `gh api`). The PAT in
-`GH_TOKEN` authenticates the API call, but the **byline of the
-posted comment** is the keyring's active account. The two triggers
-differ in whether that byline is load-bearing:
-
-- **`coderabbit-wait.sh` retry trigger — identity-agnostic.** CodeRabbit
-  re-reviews regardless of who posts the nudge, so the reviewer
-  active-account convention applies (set `gh auth switch -u
-  nathanpayne-<agent>` once per machine; a wrong byline is cosmetic and
-  matters only for audit-trail consistency).
-- **`codex-review-request.sh` `@codex review` trigger — the byline IS
-  load-bearing.** The Codex GitHub App ONLY monitors `@codex review`
-  comments authored by `nathanjohnpayne` (the author/human identity); a
-  trigger posted by a reviewer/bot identity (`nathanpayne-claude`/
-  `-codex`/`-cursor`) is silently ignored and the poll runs to timeout
-  (#405: reviewer-authored drew no response in 600s, author-authored drew
-  a review in ~20s). So `codex-review-request.sh` does **not** follow the
-  reviewer active-account convention for this write — it posts the
-  trigger through `scripts/gh-as-author.sh` (byline = `nathanjohnpayne`).
-  Do **not** "fix" a keyring-drift block by switching the active account
-  to a reviewer identity before running it.
+`codex-review-request.sh` posts the load-bearing `@codex review`
+trigger through `scripts/gh-as-author.sh`. The Codex GitHub App only
+monitors trigger comments authored by `nathanjohnpayne` (#405), so this
+trigger is an author-identity write even though the polling reads use the
+reviewer PAT. `coderabbit-wait.sh` and other long-tail helpers continue
+to use the cached PATs they load from preflight; the wrapper-mandatory
+contract in this section covers the core guarded `gh` write surface.
 
 #### PAT lookup table
 
@@ -110,27 +89,15 @@ no biometric burned per call:
 GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq '.login'
 # expected: nathanpayne-<agent>
 
-# Write-path: with the agent identity active, GH_TOKEN is irrelevant
-# for the byline. Bare reviewer writes also require the hook's expected
-# reviewer to resolve to nathanpayne-<agent> via
-# GH_PR_GUARD_EXPECTED_REVIEWER or MERGEPATH_AGENT; otherwise use
-# gh-as-reviewer.sh to switch/verify in one process.
-gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
+# Reviewer write path: wrapper resolves and verifies the reviewer token,
+# then runs the command with process-local GH_TOKEN. Set the reviewer
+# explicitly when the driver environment is ambiguous.
 GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> \
   scripts/gh-as-reviewer.sh -- gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
 
-# Author-identity write: MUST use scripts/gh-as-author.sh, which
-# switches + runs + restores inside ONE bash process via trap EXIT.
-# Splitting the switch and the write across two Bash invocations has
-# been observed to land the PR under the wrong identity (#241). The
-# gh-pr-guard.sh PreToolUse hook now enforces this for gh pr create.
+# Author write path: wrapper resolves and verifies the author token. For
+# gh pr create it also reads the created PR author with the same token.
 scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
-
-# Only when gh-as-author.sh is unavailable, the equivalent inline
-# form is acceptable — but it MUST stay inside one bash invocation:
-gh auth switch -u nathanjohnpayne && \
-  gh pr create --title "..." --body "..." && \
-  gh auth switch -u nathanpayne-claude
 ```
 
 ##### Fallback / setup-only: inline `op read`
@@ -149,25 +116,21 @@ GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
 ```
 
 - Use the item ID from the lookup table above for your agent identity. Do not use the 1Password item title.
-- Verify the keyring active account with `gh config get -h github.com user`
-  (NOT `gh auth status` — that command honors GH_TOKEN and will
-  mis-report when GH_TOKEN is set). The result should be your agent
-  identity (`nathanpayne-<agent>`). If it shows `nathanjohnpayne`
-  instead, reviewer-identity writes will attribute to nathanjohnpayne
-  (not the reviewer). Fix once with `gh auth switch -u nathanpayne-<agent>`.
-  The `op-preflight.sh` script warns when active ≠ expected.
+- To verify a cached PAT, use `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login`
+  or let the wrapper perform the same check before the write. Do not use
+  `gh auth status` as an attribution proof; it is affected by env tokens
+  and does not replace the wrapper's effective-login check.
 - If `op whoami` says you are not signed in, still run the `op read ...`
   command in an interactive TTY. That is what triggers the 1Password biometric
   prompt on local machines.
 - If GitHub returns `Review Can not approve your own pull request`, you
-  are the active account on a PR you authored under the SAME GitHub
-  account. Typically the keyring active is `nathanjohnpayne` rather
-  than your reviewer identity — fix with
-  `gh auth switch -u nathanpayne-<agent>`. (`nathanjohnpayne` authoring
-  + `nathanpayne-<agent>` reviewing are distinct GitHub accounts; the
-  approve goes through.) If you intentionally skipped `--approve` under
-  the no-self-approve scoping rule below (Phase 4 / above-threshold
-  PRs), post `--comment` instead and let Phase 4 carry the gate.
+  either the PR author is not `nathanjohnpayne`, the reviewer token
+  resolved to the author identity, or the no-self-approve scoping rule
+  below applies. Confirm with `gh pr view <PR#> --json author` and
+  `GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- gh api user --jq .login`
+  before retrying. If you intentionally skipped `--approve` under the
+  no-self-approve scoping rule below (Phase 4 / above-threshold PRs),
+  post `--comment` instead and let Phase 4 carry the gate.
 
 ### SSH Signing Keys
 
@@ -232,8 +195,8 @@ The bot PATs already carry the `admin:ssh_signing_key` scope, so no
 re-auth is required for routine uploads. The `/user/ssh_signing_keys`
 endpoint operates on the authenticated user, so `GH_TOKEN` is honored
 directly — no `scripts/gh-as-author.sh` / `gh auth switch` dance is
-needed (unlike reviewer-byline writes covered by the active-account
-convention above).
+needed (unlike core guarded reviewer writes covered by the wrapper
+contract above).
 
 **On a new machine.** The key-id column above is per-machine; a second
 machine joining the rotation will have its own ids and should use a
@@ -262,102 +225,51 @@ text below.
 
 ### Operation-to-Identity Matrix
 
-The narrative above (and the rest of this document) talks about
-"reviewer identity" vs "author identity" as if every `gh` write went
-through the same auth layer. It doesn't. `gh` resolves byline
-attribution along two distinct axes depending on which subcommand is
-running:
+The current contract is token-attributed for the guarded core `gh`
+write surface. The #410 spike verified that tested `gh pr` / `gh issue`
+writes attribute to the process-local `GH_TOKEN` when it is set; #411
+makes that the enforced path by requiring wrappers that verify the token
+before the write.
 
-- **Keyring-attributed writes.** Every `gh pr ...` and `gh issue ...`
-  subcommand attributes its byline to the keyring's **active**
-  account (read with `gh config get -h github.com user`). `GH_TOKEN`
-  is ignored for byline purposes on this path; it only authenticates
-  the API call. To change the byline you change the active account
-  (`gh auth switch -u <login>`), wrapped via `scripts/gh-as-author.sh`
-  or `scripts/gh-as-reviewer.sh` for safety.
-
-  Reviewer-byline commands (`gh pr comment`, `gh pr review`, and
-  `gh issue comment`) are hook-guarded against cross-agent keyring
-  drift: `scripts/hooks/gh-pr-guard.sh` requires the active keyring
-  account to exactly match the expected reviewer. The hook resolves
-  that expected reviewer from `GH_PR_GUARD_EXPECTED_REVIEWER`, then
-  `nathanpayne-$MERGEPATH_AGENT`, then `nathanpayne-claude`. If the
-  harness cannot set either environment value, use
-  `scripts/gh-as-reviewer.sh -- gh ...`; the wrapper switches and
-  verifies the reviewer identity internally and avoids the bare-write
-  guard path.
-
-- **PAT-attributed writes.** `gh api graphql` mutations (the most
-  common is `resolveReviewThread`) attribute their byline to the
-  identity that owns the **PAT in `GH_TOKEN`**, NOT the keyring's
-  active account. To change the byline you change `GH_TOKEN`. The
-  keyring's active account is irrelevant on this path.
-
-The matrix below names the canonical operations the codebase uses and
-their required identity on each axis. "(graphql write — PAT-attributed)"
-in the keyring column means the keyring's active account does not
-affect the byline for that row; the byline follows `GH_TOKEN`.
-
-| Operation | Keyring active (`gh config get`) | `GH_TOKEN` PAT (read-path) |
-|-----------|----------------------------------|----------------------------|
-| `gh pr create` | `nathanjohnpayne` (use `scripts/gh-as-author.sh`) | any author-readable PAT |
-| `gh pr merge` (squash/rebase) | `nathanjohnpayne` (use `scripts/gh-as-author.sh`) | any author-readable PAT |
-| `gh pr edit` (general — title/body) | `nathanjohnpayne` (use `scripts/gh-as-author.sh`) | any author-readable PAT |
+| Operation | Required path | Effective identity |
+|-----------|---------------|--------------------|
+| `gh pr create` | `scripts/gh-as-author.sh -- gh pr create ...` | `nathanjohnpayne`; wrapper verifies the author token and then verifies the created PR author with that same token |
+| `gh pr merge` (squash/rebase) | `scripts/gh-as-author.sh -- gh pr merge ...` | `nathanjohnpayne` |
+| `gh pr edit` (general — title/body/labels) | `scripts/gh-as-author.sh -- gh pr edit ...` | `nathanjohnpayne` |
 | `gh pr edit --remove-label <protected>` | **BLOCKED** by `scripts/hooks/label-removal-guard.sh` for `needs-external-review` / `needs-human-review` / `policy-violation` / `human-hold`; use `scripts/request-label-removal.sh` | n/a |
-| `gh pr comment` | `nathanpayne-<agent>` (agent identity); blocked unless active exactly matches the reviewer resolved from `GH_PR_GUARD_EXPECTED_REVIEWER` or `MERGEPATH_AGENT` per `scripts/hooks/gh-pr-guard.sh` (#284/#363) | reviewer PAT (`$OP_PREFLIGHT_REVIEWER_PAT`) |
-| `gh pr comment "@codex review"` (Codex trigger) | **`nathanjohnpayne`** (use `scripts/gh-as-author.sh`) — EXCEPTION to the reviewer-byline rule above: the Codex App only monitors author-authored triggers (#405), so `codex-review-request.sh` posts it via `gh-as-author.sh` | author or reviewer PAT for auth |
-| `gh pr review --comment` | `nathanpayne-<agent>`; blocked unless active exactly matches the reviewer resolved from `GH_PR_GUARD_EXPECTED_REVIEWER` or `MERGEPATH_AGENT` (#284/#363) | reviewer PAT |
-| `gh pr review --approve` (under-threshold) | `nathanpayne-<agent>`; allowed when PR's `Authoring-Agent:` matches the agent (the intended path) | reviewer PAT |
-| `gh pr review --approve` (over-threshold, same agent) | **BLOCKED** by `scripts/hooks/gh-pr-guard.sh` per § No-self-approve scoping (#284) | n/a |
-| `gh pr review --approve` (over-threshold, cross-agent) | `nathanpayne-<other-agent>`; the cross-agent reviewer identity per Phase 4 | reviewer PAT |
-| `gh pr view` (read) | any (does not write) | any read-capable PAT |
-| `gh issue create` | any — **not hook-gated** (#317 byline guard reverted); issues may be filed under the author identity (`nathanjohnpayne`) or an agent identity, e.g. post-merge follow-ups per AGENTS.md step 11 | author or reviewer PAT |
-| `gh issue comment` | `nathanpayne-<agent>`; blocked unless active exactly matches the reviewer resolved from `GH_PR_GUARD_EXPECTED_REVIEWER` or `MERGEPATH_AGENT` (#284/#363) | reviewer PAT |
-| `gh issue close` | any (out of #284 scope — not yet hook-gated) | any |
-| `gh api GET ...` | irrelevant (read-only) | any read-capable PAT |
-| `gh api -X POST repos/.../issues/<N>/comments` | keyring-active byline (same as `gh pr comment`) | reviewer PAT for auth |
-| `gh api -X POST repos/.../pulls/<N>/reviews` | keyring-active byline (same as `gh pr review`) | reviewer PAT for auth |
-| `gh api graphql resolveReviewThread` | (graphql write — PAT-attributed) | reviewer PAT — `GH_TOKEN` IS the byline |
-| `gh workflow run` | n/a (dispatches GHA workflow; no comment byline) | author or reviewer PAT with `workflow` scope |
+| `gh pr comment` | `GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- gh pr comment ...` | reviewer identity verified from the token |
+| `gh pr comment "@codex review"` (Codex trigger) | `scripts/gh-as-author.sh -- gh pr comment ... --body "@codex review"` | `nathanjohnpayne`; `codex-review-request.sh` uses this because the Codex App only monitors author-authored triggers (#405) |
+| `gh pr review --comment` / `--request-changes` | `GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- gh pr review ...` | reviewer identity verified from the token |
+| `gh pr review --approve` (under-threshold) | reviewer wrapper | reviewer identity; allowed when PR's `Authoring-Agent:` matches the agent and Phase 4 does not apply |
+| `gh pr review --approve` (over-threshold, same agent) | **BLOCKED** by `scripts/hooks/gh-pr-guard.sh` per § No-self-approve scoping | n/a |
+| `gh pr review --approve` (over-threshold, cross-agent) | reviewer wrapper for the cross-agent reviewer | `nathanpayne-<other-agent>` per Phase 4 |
+| `gh pr view` (read) | direct read with `GH_TOKEN=<read PAT>` | no write byline |
+| `gh issue create` | not hook-gated (#317 byline guard reverted) | author or reviewer token, depending on the workflow |
+| `gh issue comment` | reviewer wrapper | reviewer identity verified from the token |
+| `gh issue close` | not hook-gated by #411 | token selected by caller |
+| `gh api GET ...` | direct read with `GH_TOKEN=<read PAT>` | no write byline |
+| `gh api graphql resolveReviewThread` | `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"` plus `identity-check.sh --expect-token-identity <reviewer>` before mutation | reviewer token |
+| `gh workflow run` | direct with an author or reviewer PAT that has `workflow` scope | no comment/review byline |
 
-Notes on auth-split nuance:
+Notes on the token-wrapper contract:
 
-- **Why `gh api graphql` is PAT-attributed.** The REST endpoints under
-  `gh pr` / `gh issue` use the `users` byline from the API call's
-  authenticating identity, which `gh` resolves from the keyring's
-  active account on those paths. The graphql endpoints (`POST
-  /graphql` underneath `gh api graphql ...`) authenticate solely via
-  the bearer token in `Authorization: Bearer <token>` — there is no
-  keyring fallback. As a result, the byline of a mutation like
-  `resolveReviewThread` follows whatever PAT signs the call. `scripts/
-  resolve-pr-threads.sh` pins `GH_TOKEN` to `$OP_PREFLIGHT_REVIEWER_PAT`
-  before the mutation, and the pre-action identity check uses
-  `--expect-token-identity` (NOT `--expect-reviewer`) to verify.
+- **Wrapper-mandatory writes.** `scripts/hooks/gh-pr-guard.sh` blocks
+  bare and inline-token forms of the guarded write commands before they
+  can run. Use the author wrapper for author operations and the reviewer
+  wrapper for reviewer comments/reviews. The hook checks command
+  structure, including wrapper spoofing such as a wrapper path in an
+  `echo` before a bare `gh pr create`.
 
-- **Why `gh pr comment` is keyring-attributed even when `GH_TOKEN` is
-  set.** When the keyring has an authenticated entry, `gh` prefers
-  it over `GH_TOKEN` for byline purposes on REST writes. Empirically
-  observed on PRs #181/#182: with `GH_TOKEN` set to the reviewer PAT
-  and the keyring's active account = `nathanjohnpayne`, `gh pr
-  review` posted as `nathanjohnpayne`, not as the reviewer identity
-  the PAT belonged to. See `op-preflight.sh` for the auto-restore
-  that closes this drift window (#284).
+- **Token verification.** `scripts/lib/gh-token-resolver.sh` selects a
+  token from the expected preflight env var or `gh auth token --user
+  <login>`, then verifies it with `scripts/identity-check.sh
+  --expect-token-identity <login>`. No token material is printed. A
+  mismatch exits before the wrapped write starts.
 
-- **Pre-action identity check.** Every helper that posts a write
-  (`coderabbit-wait.sh`, `resolve-pr-threads.sh`,
-  `request-label-removal.sh`, `gh-as-*.sh`) calls
-  `scripts/identity-check.sh` BEFORE the write. The check is
-  fail-closed: if the keyring's active account (or `GH_TOKEN`'s
-  resolved login, depending on the auth path) doesn't match the
-  expected identity, the helper exits with a diagnostic rather than
-  landing a misattributed write. See #283 for the in-session
-  incidents that motivated the check, and #284 for the implementation.
-  `codex-review-request.sh` is the one exception: its `@codex review`
-  trigger must be authored by `nathanjohnpayne` (not a reviewer
-  identity — #405), so instead of a direct `identity-check.sh` call it
-  posts through `scripts/gh-as-author.sh`, which switches to and
-  verifies the author identity (its own fail-closed gate) before the
-  write.
+- **Legacy keyring assertions.** `scripts/identity-check.sh` still has
+  keyring assertion modes for helper paths that have not moved to the
+  wrapper contract yet. Those modes are compatibility checks, not the
+  canonical path for the core guarded `gh` writes listed above.
 
 ## Workflow
 
@@ -393,8 +305,8 @@ Replace `claude` with `cursor` or `codex` depending on which agent is running. T
 | `all` | Everything |
 
 After preflight, these environment variables are set:
-- `OP_PREFLIGHT_REVIEWER_PAT` — use with `GH_TOKEN=` for reviewer-identity **read-path** API calls and helper scripts (`coderabbit-wait.sh`, `codex-review-request.sh`, `codex-review-check.sh`). Write paths (`gh pr review` / `create` / `merge` / `edit`) use the active keyring account regardless of `GH_TOKEN` — see [Reviewer PAT Quick Start](#reviewer-pat-quick-start).
-- `OP_PREFLIGHT_AUTHOR_PAT` — use with `GH_TOKEN=` for author-identity read-path API calls. For author-identity **writes** (PR create / merge / label edit), wrap the call in `scripts/gh-as-author.sh` — the wrapper switches the gh keyring to the author identity, runs the wrapped command, and restores the prior active account via `trap EXIT`, all in a single bash process. This is the canonical pattern (the `gh-pr-guard.sh` PreToolUse hook enforces it for `gh pr create`). The inline `gh auth switch -u nathanjohnpayne && ... && gh auth switch -u nathanpayne-<agent>` switch-around pattern remains acceptable as a fallback only when the wrapper is unavailable, and only when it stays inside one bash invocation — see [Recovery: PR created under the wrong identity](#recovery-pr-created-under-the-wrong-identity) for the #241 failure mode that motivates the wrapper-first rule.
+- `OP_PREFLIGHT_REVIEWER_PAT` — use with `GH_TOKEN=` for reviewer-identity read-path API calls and as the preferred token source for `scripts/gh-as-reviewer.sh`. The wrapper verifies the token's effective login before any reviewer write.
+- `OP_PREFLIGHT_AUTHOR_PAT` — use with `GH_TOKEN=` for author-identity read-path API calls and as the preferred token source for `scripts/gh-as-author.sh`. The wrapper verifies the token before author writes and performs same-token author verification after `gh pr create`.
 - `GOOGLE_APPLICATION_CREDENTIALS` — used automatically by gcloud/Firebase scripts
 - `OP_PREFLIGHT_DONE=1` — flag indicating preflight has been run
 
@@ -498,7 +410,7 @@ An agent proceeds to 4a first. If 4a escalates, times out, or is disabled, the a
 
 11a. The authoring agent runs `scripts/codex-review-request.sh <PR#>` to trigger or await a Codex review. If the Codex App's "Automatic reviews" setting has already caused Codex to review the PR on open (typical latency ~2 minutes for small PRs), the script skips posting `@codex review` and goes straight to polling.
 
-> **The `@codex review` trigger MUST be authored by `nathanjohnpayne`.** The Codex GitHub App only monitors trigger comments from the repo's author/human identity; a trigger posted by a reviewer/bot identity (`nathanpayne-claude`/`-codex`/`-cursor`) is silently ignored and the poll runs to timeout (observed empirically on #405: a reviewer-authored trigger drew no response in 600s, an author-authored one drew a review in ~20s). `codex-review-request.sh` posts the trigger through `gh-as-author.sh` for exactly this reason — do not "fix" a keyring-drift block by switching the active account to a reviewer identity before running it.
+> **The `@codex review` trigger MUST be authored by `nathanjohnpayne`.** The Codex GitHub App only monitors trigger comments from the repo's author/human identity; a trigger posted by a reviewer/bot identity (`nathanpayne-claude`/`-codex`/`-cursor`) is silently ignored and the poll runs to timeout (observed empirically on #405: a reviewer-authored trigger drew no response in 600s, an author-authored one drew a review in ~20s). `codex-review-request.sh` posts the trigger through `gh-as-author.sh` for exactly this reason — do not bypass that wrapper with a reviewer-token write.
 
 12a. `codex-review-request.sh` polls the PR until one of the following:
 
@@ -990,20 +902,19 @@ git remote set-url origin git@github.com:nathanjohnpayne/repo-name.git
 
 ### GitHub API authentication (gh CLI)
 
-`gh` resolves auth differently for read paths vs write paths — the
-canonical convention is documented in [Reviewer PAT Quick Start](#reviewer-pat-quick-start).
-Short form:
+The canonical convention is documented in
+[Reviewer PAT Quick Start](#reviewer-pat-quick-start). Short form:
 
 - **Read paths** (`gh api user`, GETs, `gh pr view`, `gh pr checks`)
-  honor `GH_TOKEN`. Pass it inline per command.
-- **Write paths** (`gh pr review`, `gh pr create`, `gh pr merge`,
-  `gh pr edit`, `gh api -X POST`) use the keyring's **active** account
-  regardless of `GH_TOKEN`. The active account is set once per machine
-  via `gh auth switch -u nathanpayne-<agent>`; `op-preflight.sh` warns
-  if active ≠ expected.
+  use an explicit `GH_TOKEN` for the command.
+- **Core guarded writes** (`gh pr create`, `gh pr merge`,
+  `gh pr edit`, `gh pr comment`, `gh pr review`, `gh issue comment`)
+  use the author/reviewer wrappers. The wrappers select and verify the
+  effective token immediately before the write and do not mutate the gh
+  keyring.
 
 ```bash
-# ── Read-path: GH_TOKEN works ──
+# ── Read-path: explicit GH_TOKEN ──
 
 # Verify which identity a PAT resolves to (read path):
 GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq '.login'
@@ -1012,60 +923,36 @@ GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq '.login'
 # Read-only helper:
 GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-check.sh <PR#>
 
-# coderabbit-wait.sh may POST a retry nudge: GH_TOKEN authenticates the
-# read calls; the nudge byline is the active keyring account and is
-# identity-agnostic (set active = nathanpayne-<agent> for audit tidiness).
+# coderabbit-wait.sh may POST a retry nudge; it uses the cached PATs
+# loaded by preflight.
 GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/coderabbit-wait.sh <PR#>
 
-# codex-review-request.sh uses the reviewer PAT in GH_TOKEN for its READS
-# (polling), but posts the '@codex review' TRIGGER through gh-as-author.sh
-# so the byline is nathanjohnpayne — the Codex App only monitors
-# author-authored triggers (#405). Do NOT set the active account to a
-# reviewer identity for it; the script handles the author switch itself.
+# codex-review-request.sh uses the reviewer PAT for reads, then posts
+# the '@codex review' trigger through gh-as-author.sh so the trigger is
+# authored by nathanjohnpayne (#405).
 GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" scripts/codex-review-request.sh <PR#>
 
-# ── Write-path: active keyring is the byline; GH_TOKEN is ignored ──
+# ── Write-path: wrapper verifies the token, then sets GH_TOKEN ──
 
-# Reviewer-identity write. Bare form requires active keyring AND the
-# hook's expected reviewer (GH_PR_GUARD_EXPECTED_REVIEWER, then
-# MERGEPATH_AGENT, then claude) to match this agent; wrapper form is
-# safer when the hook environment is uncertain:
-gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
 GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> \
   scripts/gh-as-reviewer.sh -- gh pr review <PR#> --repo <owner/repo> --comment --body "Review comment"
 
-# Author-identity write: MUST use scripts/gh-as-author.sh, which
-# switches + runs + restores inside ONE bash process via trap EXIT.
-# Splitting the switch and the write across two Bash invocations has
-# been observed to land the PR under the wrong identity (#241). The
-# gh-pr-guard.sh PreToolUse hook now enforces this.
 scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch
 scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
-
-# Only when gh-as-author.sh is unavailable, the equivalent inline form
-# is acceptable — but it MUST stay inside one bash invocation:
-gh auth switch -u nathanjohnpayne && \
-  gh pr merge <PR#> --squash --delete-branch && \
-  gh auth switch -u nathanpayne-<agent>
 ```
 
 - Use the item ID from the [PAT lookup table](#pat-lookup-table) for your agent identity. Do not use the 1Password item title.
-- Verify the keyring active account with `gh config get -h github.com user`
-  (NOT `gh auth status` — that command honors GH_TOKEN and
-  mis-reports when GH_TOKEN is set). Fix once with
-  `gh auth switch -u nathanpayne-<agent>`. The `op-preflight.sh`
-  script warns when active ≠ expected.
+- Verify token identity with `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login`
+  or by letting the wrapper call `identity-check.sh
+  --expect-token-identity` before the write. Do not use `gh auth
+  status` as an attribution proof.
 - If `op whoami` says you are not signed in, still run the `op read ...`
   command in an interactive TTY. That is what triggers the 1Password biometric
   prompt on local machines.
 - If GitHub returns `Review Can not approve your own pull request`, you
-  are the active account on a PR you authored under the SAME GitHub
-  account. Typically the keyring active is `nathanjohnpayne` rather
-  than your reviewer identity — fix with
-  `gh auth switch -u nathanpayne-<agent>`. If you intentionally skipped
-  `--approve` under the [No-self-approve scoping](#no-self-approve-scoping)
-  rule (Phase 4 / above-threshold PRs), post `--comment` instead and let
-  Phase 4 carry the gate.
+  either the PR author is wrong, the reviewer token resolved to the
+  author identity, or the [No-self-approve scoping](#no-self-approve-scoping)
+  rule applies. Confirm the PR author and token identity before retrying.
 
 > **If `op read` fails with a sign-in or biometric error here**, follow the pause-and-prompt procedure in `docs/agents/operating-rules.md` under "1Password CLI authentication failures." Do not hardcode tokens, skip review, or retry in a loop.
 
@@ -1132,14 +1019,14 @@ done
 
 ## Recovery: PR created under the wrong identity
 
-If `gh pr create` lands a PR under the wrong account — typically because the
-`gh auth switch -u nathanjohnpayne` and the `gh pr create` were split across
-two Bash tool calls and the gh keyring's active state drifted between them —
-the PR is unrecoverable in place: any review attempt under the same account
-that authored the PR returns `Can not approve your own pull request`, and the
-`Authoring-Agent:` fingerprint in the body now disagrees with `author.login`,
-breaking downstream audit. See #241 for the bug history and
-`nathanjohnpayne/friends-and-family-billing#262` for the canonical incident.
+If `gh pr create` lands a PR under the wrong account, the PR is
+unrecoverable in place: any review attempt under the same account that
+authored the PR returns `Can not approve your own pull request`, and the
+`Authoring-Agent:` fingerprint in the body now disagrees with
+`author.login`, breaking downstream audit. See #241 for the historical
+keyring-switch bug and `nathanjohnpayne/friends-and-family-billing#262`
+for the canonical incident. Under the current wrapper contract, the
+equivalent failure is a wrong effective token.
 
 ### Prevention (the primary path)
 
@@ -1149,14 +1036,14 @@ Always wrap author-identity writes in `scripts/gh-as-author.sh`:
 scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
 ```
 
-The wrapper switches to `nathanjohnpayne`, runs the wrapped command, and
-restores the prior active account via `trap EXIT` — all inside one bash
-process so the switch and the write can't drift apart. For `gh pr create`
-specifically, it also runs a post-create `gh pr view --json author`
-verification and exits non-zero (code 5) if `author.login` does not match
-the expected identity. The `gh-pr-guard.sh` PreToolUse hook independently
-blocks `gh pr create` when the keyring's active account is not the author
-identity.
+The wrapper resolves a token for `nathanjohnpayne`, verifies that token
+with `scripts/identity-check.sh --expect-token-identity`, runs the
+wrapped command with process-local `GH_TOKEN`, and never changes the gh
+keyring. For `gh pr create` specifically, it also runs a post-create
+`gh pr view --json author` verification using the same token and exits
+non-zero (code 5) if `author.login` does not match the expected identity.
+The `gh-pr-guard.sh` PreToolUse hook independently blocks bare
+`gh pr create` and inline-token substitutes before they can run.
 
 ### Detection
 
@@ -1169,7 +1056,8 @@ gh pr view <PR#> --repo <owner>/<repo> --json author --jq .author.login
 ```
 
 Expected: `nathanjohnpayne`. If the output is your agent identity (e.g.
-`nathanpayne-claude`), you hit the #241 footgun.
+`nathanpayne-claude`) or another reviewer identity, close and recreate
+the PR from the same branch.
 
 ### Recovery procedure
 
@@ -1184,9 +1072,8 @@ comments. There is no in-place fix: GitHub does not expose an API to change
 gh pr close <PR#> --repo <owner>/<repo> \
   --comment "Wrong author identity (see #241). Recreating from the same branch."
 
-# 2. Recreate from a fresh shell so any stale gh-state shell vars are gone,
-#    and route through gh-as-author.sh so the new PR can't repeat the
-#    failure mode.
+# 2. Recreate from a fresh shell and route through gh-as-author.sh so the
+#    new PR uses a verified author token.
 scripts/gh-as-author.sh -- gh pr create \
   --repo <owner>/<repo> \
   --base main --head <same-branch> \
@@ -1194,17 +1081,14 @@ scripts/gh-as-author.sh -- gh pr create \
   --body "..."
 
 # 3. Verify the new PR landed under the right identity (the wrapper also
-#    does this automatically, but it's worth checking once by hand if you
-#    bypassed the wrapper):
+#    does this automatically):
 gh pr view <NEW_PR#> --repo <owner>/<repo> --json author --jq .author.login
 # expected: nathanjohnpayne
 ```
 
 The fresh shell in step 2 is belt-and-suspenders: any `GH_TOKEN` /
-`GH_HOST` / `GITHUB_TOKEN` env vars exported earlier in the session that
-might have contributed to the drift are cleared by the new process. The
-wrapper script itself does not depend on those env vars, but a fresh shell
-removes ambiguity about which version of the state any helper is reading.
+`GH_HOST` / `GITHUB_TOKEN` env vars exported earlier in the session are
+gone, and the wrapper selects the author token again before the create.
 
 ### What's lost vs. what survives
 

@@ -160,6 +160,9 @@ jobs:
       - name: check_gh_as_author
         run: ./scripts/ci/check_gh_as_author
 
+      - name: check_no_bare_gh_writes
+        run: ./scripts/ci/check_no_bare_gh_writes
+
       - name: check_op_preflight_contract
         run: ./scripts/ci/check_op_preflight_contract
 

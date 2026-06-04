@@ -15,11 +15,9 @@
 #              current repository detected by `gh repo view`.
 #
 # Environment:
-#   GH_TOKEN   Required. GitHub token with pull_requests:write to post the
-#              trigger comment and read reviews/comments/reactions. In the
-#              standard template flow this is set to $OP_PREFLIGHT_AUTHOR_PAT
-#              after running `scripts/op-preflight.sh`, or via inline
-#              `op read` per REVIEW_POLICY.md § PAT lookup table.
+#   GH_TOKEN   Required for the read/polling calls. The load-bearing
+#              trigger comment is posted through gh-as-author.sh, which
+#              verifies and uses the author token for that write.
 #
 # Behavior:
 #   1. Reads codex.review_timeout_seconds and codex.bot_login from
@@ -111,13 +109,9 @@ __CODEX_REQUEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -r "$__CODEX_REQUEST_DIR/lib/preflight-helpers.sh" ]; then
   # shellcheck source=lib/preflight-helpers.sh
   . "$__CODEX_REQUEST_DIR/lib/preflight-helpers.sh"
-  # Author PAT is correct for this helper: codex-review-request.sh
-  # both reads PR state AND posts the `@codex review` trigger comment.
-  # The byline of the trigger comment is the keyring's active account
-  # (write-path), but the GitHub API call itself authenticates with the
-  # PAT in GH_TOKEN. Use the author PAT so the API call is attributed
-  # to the author identity, consistent with the broader nathanjohnpayne
-  # = drives-the-PR convention. See REVIEW_POLICY.md § PAT scope below.
+  # Author PAT is correct for this helper because the one write it may
+  # perform is the `@codex review` trigger, which must be authored by
+  # nathanjohnpayne. The wrapper verifies that token before posting.
   preflight_require_token author || true
 fi
 
@@ -452,42 +446,24 @@ else
   # posted by a reviewer/bot identity (nathanpayne-claude/-codex/-cursor)
   # is silently ignored: empirically a reviewer-posted trigger sat
   # unanswered to the full 600s timeout while an author-posted one drew a
-  # Codex review in ~20s (PR #405). `gh pr comment` is a keyring-byline
-  # write, so post it through gh-as-author.sh, which switches the keyring
-  # to nathanjohnpayne for the write (verifying the switch landed) and
-  # restores the prior active account on exit. This SUPERSEDES the #284
-  # `identity-check --expect-reviewer` guard, which fail-closed on the
-  # WRONG identity for this particular write. Opt out via
-  # CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK=1 in two cases: (1) test
-  # harnesses that PATH-shim gh (the stub records argv; no real keyring
-  # switch), and (2) token-only / CI runners that have no gh keyring to
-  # switch but DO set GH_TOKEN to the author PAT ($OP_PREFLIGHT_AUTHOR_PAT
-  # / nathanjohnpayne). gh-as-author.sh unsets GH_TOKEN and runs
-  # `gh auth switch`, which needs the author identity in the keyring; on a
-  # keyless runner that fails. With the opt-out, the direct `gh pr comment`
-  # below posts under the author byline the Codex App requires (because
-  # GH_TOKEN already resolves to nathanjohnpayne) without the switch.
+  # Codex review in ~20s (PR #405). Post it through gh-as-author.sh,
+  # which verifies an author token and runs the write with process-local
+  # GH_TOKEN. This SUPERSEDES the #284 `identity-check --expect-reviewer`
+  # guard, which fail-closed on the WRONG identity for this particular
+  # write.
   log "posting '@codex review' trigger comment (as author identity nathanjohnpayne)"
-  if [ "${CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK:-0}" = "1" ]; then
-    POST_OUTPUT=$(gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
-      || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
-  else
-    AS_AUTHOR="$(dirname "${BASH_SOURCE[0]}")/gh-as-author.sh"
-    if [ ! -x "$AS_AUTHOR" ]; then
-      echo "ERROR: gh-as-author.sh helper missing or non-executable: $AS_AUTHOR" >&2
-      echo "       Refusing to post '@codex review' without author-identity attribution" >&2
-      echo "       (Codex ignores reviewer/bot-authored triggers — see comment above)." >&2
-      echo "       Restore the helper, or opt out via" >&2
-      echo "       CODEX_REVIEW_REQUEST_SKIP_IDENTITY_CHECK=1 (dev, or a" >&2
-      echo "       token-only/CI runner with GH_TOKEN=author PAT)." >&2
-      die 3 "gh-as-author.sh helper unavailable"
-    fi
-    # Capture stdout+stderr so a failure surfaces the real gh error
-    # (404 / 403 / 422) rather than a bare "failed to post". The comment
-    # URL gh prints on success is still extractable downstream.
-    POST_OUTPUT=$("$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
-      || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
+  AS_AUTHOR="$__CODEX_REQUEST_DIR/gh-as-author.sh"
+  if [ ! -x "$AS_AUTHOR" ]; then
+    echo "ERROR: gh-as-author.sh helper missing or non-executable: $AS_AUTHOR" >&2
+    echo "       Refusing to post '@codex review' without author-token attribution" >&2
+    echo "       (Codex ignores reviewer/bot-authored triggers — see comment above)." >&2
+    die 3 "gh-as-author.sh helper unavailable"
   fi
+  # Capture stdout+stderr so a failure surfaces the real gh error
+  # (404 / 403 / 422) rather than a bare "failed to post". The comment
+  # URL gh prints on success is still extractable downstream.
+  POST_OUTPUT=$("$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
+    || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
   TRIGGER_POSTED=true
   # Capture the post time so the poll loop can ignore stale signals
   # that were already on HEAD before the trigger fired. Without this,

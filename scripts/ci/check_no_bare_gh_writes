@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# check_no_bare_gh_writes
+#
+# Standing guard for #411: interactive agent-driven GitHub writes must
+# use token-verifying wrappers or a documented exemption.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/mergepath-no-bare-gh-writes.XXXXXX")"
+trap 'rm -f "$TMP_OUT"' EXIT
+
+FILES=()
+while IFS= read -r -d '' file; do
+  rel="${file#"$REPO_ROOT"/}"
+  case "$rel" in
+    scripts/bootstrap/*) continue ;;                 # #412 long-tail bootstrap sweep
+    scripts/sync-to-downstream.sh) continue ;;       # #412 propagation helper sweep
+    scripts/coderabbit-wait.sh) continue ;;          # #412 secondary helper sweep
+    scripts/request-label-removal.sh) continue ;;    # #412 secondary helper sweep
+    scripts/resolve-pr-threads.sh) continue ;;       # #412 GraphQL helper sweep
+    scripts/daily-feedback-rollup.sh) continue ;;    # workflow/reporting surface, #412
+    scripts/sweep-unresolved-feedback/*) continue ;; # workflow/reporting surface, #412
+    scripts/gh-projects/lib.sh) continue ;;          # project/sub-issue API helper, #412
+    scripts/post-phase-4b-handoff.sh) continue ;;    # GraphQL read helper, #412
+    scripts/ci/*) continue ;;                        # tests/checks intentionally stub gh
+  esac
+  FILES+=("$file")
+done < <(find "$REPO_ROOT/scripts" -type f -print0 | LC_ALL=C sort -z)
+
+if [ "${#FILES[@]}" -eq 0 ]; then
+  echo "check_no_bare_gh_writes: PASS (no files to scan)"
+  exit 0
+fi
+
+set +e
+awk -v root="$REPO_ROOT/" '
+function bare_write(line) {
+  if (line ~ /^[[:space:]]*($|#)/) return 0
+  if (line ~ /NO_BARE_GH_WRITE_EXEMPT:/) return 0
+  if (line ~ /\\`[^`]*gh[[:space:]]+(pr|issue|api)[^`]*\\`/) return 0
+  if (line ~ /^[[:space:]]*(echo|printf)[[:space:]]/ &&
+      line !~ /\$\([[:space:]]*gh[[:space:]]+(pr|issue|api)[[:space:]]/ &&
+      line !~ /`[^`]*gh[[:space:]]+(pr|issue|api)[^`]*`/) return 0
+  if (line ~ /gh-as-(author|reviewer)\.sh[^;&|]*--[[:space:]]+gh/) return 0
+  if (line ~ /\$"?[A-Z_]*AS_(AUTHOR|REVIEWER)"?[[:space:]]+--[[:space:]]+gh/) return 0
+  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+pr[[:space:]]+(-R[[:space:]]+[^[:space:]]+[[:space:]]+|--repo[[:space:]]+[^[:space:]]+[[:space:]]+|--repo=[^[:space:]]+[[:space:]]+)?(create|merge|review|comment|edit)([[:space:]]|$)/) return 1
+  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+issue[[:space:]]+comment([[:space:]]|$)/) return 1
+  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+api[[:space:]].*(-X[[:space:]]+|--method[[:space:]]+)(POST|PATCH|PUT|DELETE)([[:space:]]|$)/) return 1
+  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+api[[:space:]]+graphql/ && line ~ /(mutation|resolveReviewThread|addPullRequestReviewThreadReply|addComment|updateIssue|closeIssue)/) return 1
+  return 0
+}
+{
+  rel = FILENAME
+  sub("^" root, "", rel)
+  if (bare_write($0)) {
+    print rel ":" FNR ":" $0
+    found = 1
+  }
+}
+END { exit found ? 1 : 0 }
+' "${FILES[@]}" >"$TMP_OUT" 2>/dev/null
+rc=$?
+set -e
+
+if [ "$rc" -ne 0 ]; then
+  echo "check_no_bare_gh_writes: FAIL" >&2
+  echo "Bare guarded gh writes must use scripts/gh-as-author.sh / scripts/gh-as-reviewer.sh or carry NO_BARE_GH_WRITE_EXEMPT with a reason." >&2
+  sed 's/^/  - /' "$TMP_OUT" >&2
+  exit 1
+fi
+
+echo "check_no_bare_gh_writes: PASS"
+exit 0
