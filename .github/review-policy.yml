@@ -141,6 +141,18 @@ coderabbit:
   # nathanjohnpayne/mergepath#136 for the race-with-auto-merge case.
   max_wait_seconds: 300
 
+  # On the timeout path, ask CodeRabbit for a narrative status update
+  # before returning exit 4. This does NOT change the exit-code
+  # contract: timeout remains advisory and callers still decide whether
+  # to proceed. The reply is surfaced in `status_probe` JSON/log output
+  # only; it is never treated as a review or clearance signal.
+  status_probe_enabled: true
+
+  # Extra bounded wait after posting `@coderabbitai, how is the review
+  # going?` on the timeout path. This adds latency only when the normal
+  # `max_wait_seconds` grace window has already elapsed.
+  status_probe_wait_seconds: 60
+
   # Maximum number of times `scripts/coderabbit-wait.sh` will parse a
   # "Rate limit exceeded" comment, sleep the published window + 30s
   # buffer, and post `@coderabbitai, try again.` to re-trigger.

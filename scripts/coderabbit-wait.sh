@@ -50,8 +50,11 @@
 #   5. On review (non-rate-limit, non-in-progress): emit JSON, exit 0.
 #      Also scans inline diff comments for "Potential issue" / "⚠️"
 #      markers and surfaces them in the JSON so callers can decide.
-#   6. If total elapsed > max_wait_seconds: exit 4 (TIMEOUT), emit JSON
-#      with status=timeout.
+#   6. If total elapsed > max_wait_seconds: optionally post
+#      `@coderabbitai, how is the review going?`, wait a short bounded
+#      status-probe window for CodeRabbit's reply, then exit 4
+#      (TIMEOUT) with the reply excerpt surfaced in JSON. The probe is
+#      narration only, never a review / clearance signal.
 #   7. If rate_limit_retries > max_rate_limit_retries: exit 5 (STALLED),
 #      emit JSON with status=rate_limit_stalled.
 #
@@ -71,6 +74,19 @@
 #     },
 #     "potential_issue_count": N,
 #     "rate_limit_retries": N,
+#     "status_probe": {
+#       "enabled": true | false,
+#       "posted": true | false,
+#       "reply_present": true | false,
+#       "reply": null | {
+#         "id": N,
+#         "created_at": "<iso-8601>",
+#         "updated_at": "<iso-8601>",
+#         "fresh_at": "<iso-8601>",
+#         "body_excerpt": "<first 500 chars>"
+#       },
+#       "waited_seconds": N
+#     },
 #     "waited_seconds": N
 #   }
 #
@@ -208,6 +224,7 @@ fi
 BOT_LOGIN=$(coderabbit_field bot_login)
 BOT_LOGIN=${BOT_LOGIN:-"coderabbitai[bot]"}
 POLL_INTERVAL_SECONDS=15
+STATUS_PROBE_POLL_INTERVAL_SECONDS=5
 RATE_LIMIT_BUFFER_SECONDS=30
 
 # CodeRabbit emits two distinct per-SHA signals:
@@ -233,6 +250,23 @@ case "$TRUST_STATUS_CONTEXT" in
     exit 3
     ;;
 esac
+
+STATUS_PROBE_ENABLED=$(coderabbit_field status_probe_enabled)
+STATUS_PROBE_ENABLED=${STATUS_PROBE_ENABLED:-true}
+case "$STATUS_PROBE_ENABLED" in
+  true|false) ;;
+  *)
+    echo "ERROR: coderabbit.status_probe_enabled must be true|false; got '$STATUS_PROBE_ENABLED'" >&2
+    exit 3
+    ;;
+esac
+
+STATUS_PROBE_WAIT_SECONDS=$(coderabbit_field status_probe_wait_seconds)
+STATUS_PROBE_WAIT_SECONDS=${STATUS_PROBE_WAIT_SECONDS:-60}
+if ! [[ "$STATUS_PROBE_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: coderabbit.status_probe_wait_seconds must be an integer; got '$STATUS_PROBE_WAIT_SECONDS'" >&2
+  exit 3
+fi
 
 # --- logging helpers --------------------------------------------------------
 
@@ -391,6 +425,7 @@ fi
 log "HEAD = $HEAD_SHA committed at $HEAD_COMMITTER_DATE"
 log "anchor = $HEAD_ANCHOR (source: $ANCHOR_SOURCE)"
 log "max_wait = ${MAX_WAIT_SECONDS}s   max_rate_limit_retries = $MAX_RATE_LIMIT_RETRIES   freshness_window = ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s"
+log "status_probe_enabled = $STATUS_PROBE_ENABLED   status_probe_wait = ${STATUS_PROBE_WAIT_SECONDS}s"
 
 # --- state machine ----------------------------------------------------------
 
@@ -422,11 +457,19 @@ parse_rate_limit_window() {
 }
 
 # Classify a CodeRabbit comment body. Emits one of:
-#   rate_limit | in_progress | review
+#   rate_limit | in_progress | status_probe | review
 classify_comment() {
   local body=$1
   if echo "$body" | grep -qiE 'rate[- ]limit exceeded'; then
     echo "rate_limit"
+    return
+  fi
+  # CodeRabbit's free-form command replies, including
+  # `@coderabbitai, how is the review going?`, are narration. They
+  # summarize current state and may mention open threads, but they are
+  # not a review on HEAD and must never clear the #136 freshness gate.
+  if echo "$body" | grep -qiE 'CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits'; then
+    echo "status_probe"
     return
   fi
   if echo "$body" | grep -qiE 'review in progress|currently reviewing|commits? under review'; then
@@ -458,10 +501,13 @@ scan_latest_comment() {
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
 
   latest=$(echo "$issue_comments" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
+    def status_probe_reply:
+      ((.body // "") | test("CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits"; "i"));
     [ .[]
       | select(.user.login == $bot)
       | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
       | select(.fresh_at >= $after)
+      | select(status_probe_reply | not)
     ]
     | sort_by(.fresh_at)
     | last // null
@@ -629,6 +675,41 @@ status_context_fast_path_blocked_by_comment() {
   return 1
 }
 
+verify_reviewer_write_identity() {
+  local purpose=$1
+  # Identity check (#412): CodeRabbit helper comments are reviewer-token
+  # writes. Fail closed BEFORE the REST mutation if the GH_TOKEN that
+  # will sign the call does not resolve to the expected reviewer
+  # identity. Opt-out via CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 for
+  # tests only.
+  #
+  # r3 (#284): fail CLOSED if the helper is missing or non-executable.
+  # The previous shape ANDed the opt-out and `[ -x "$CHECKER" ]` so a
+  # rename / delete / chmod -x silently skipped the gate. Helper
+  # presence is now a hard error inside the opt-out branch.
+  if [ "${CODERABBIT_WAIT_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
+    local checker="$(dirname "${BASH_SOURCE[0]}")/identity-check.sh"
+    if [ ! -x "$checker" ]; then
+      echo "ERROR: identity-check helper missing or non-executable: $checker" >&2
+      echo "       Refusing to post $purpose comment without identity verification." >&2
+      echo "       Restore the helper, or opt out via" >&2
+      echo "       CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 (dev only)." >&2
+      die 3 "identity-check helper unavailable"
+    fi
+    GH_TOKEN="$GH_TOKEN" "$checker" --expect-token-identity "$EXPECTED_REVIEWER_IDENTITY" \
+      || die 3 "identity-check failed before $purpose write; see stderr above."
+  fi
+}
+
+post_reviewer_comment() {
+  local purpose=$1
+  local body=$2
+  verify_reviewer_write_identity "$purpose"
+  gh_reviewer api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+    -f body="$body" 2>/dev/null \
+    || die 3 "failed to post $purpose comment"
+}
+
 post_retry_trigger() {
   # Strip the `[bot]` suffix that GitHub REST uses for App logins —
   # @-mentions address the user-facing handle (`@coderabbitai`), not
@@ -639,31 +720,119 @@ post_retry_trigger() {
   # triggering identities. See #140 round-3 Codex finding (P2, line 320).
   local mention="@${BOT_LOGIN%\[bot\]}"
   local body="${mention}, try again."
-  # Identity check (#412): the retry trigger is a reviewer-token write.
-  # Fail closed BEFORE the REST mutation if the GH_TOKEN that will sign
-  # the call does not resolve to the expected reviewer identity. Opt-out
-  # via CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 for tests only.
-  #
-  # r3 (#284): fail CLOSED if the helper is missing or non-executable.
-  # The previous shape ANDed the opt-out and `[ -x "$CHECKER" ]` so a
-  # rename / delete / chmod -x silently skipped the gate. Helper
-  # presence is now a hard error inside the opt-out branch.
-  if [ "${CODERABBIT_WAIT_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
-    local checker="$(dirname "${BASH_SOURCE[0]}")/identity-check.sh"
-    if [ ! -x "$checker" ]; then
-      echo "ERROR: identity-check helper missing or non-executable: $checker" >&2
-      echo "       Refusing to post retry-trigger comment without identity verification." >&2
-      echo "       Restore the helper, or opt out via" >&2
-      echo "       CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 (dev only)." >&2
-      die 3 "identity-check helper unavailable"
-    fi
-    GH_TOKEN="$GH_TOKEN" "$checker" --expect-token-identity "$EXPECTED_REVIEWER_IDENTITY" \
-      || die 3 "identity-check failed before retry-trigger write; see stderr above."
-  fi
   log "posting retry trigger comment to PR #$PR_NUMBER as $mention"
-  gh_reviewer api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
-    -f body="$body" >/dev/null 2>&1 \
-    || die 3 "failed to post retry trigger comment"
+  post_reviewer_comment "retry-trigger" "$body" >/dev/null
+}
+
+find_status_probe_reply() {
+  local after=$1
+  local issue_comments
+  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
+
+  echo "$issue_comments" | jq --arg bot "$BOT_LOGIN" --arg after "$after" '
+    def status_probe_reply:
+      ((.body // "") | test("CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits"; "i"));
+    [ .[]
+      | select(.user.login == $bot)
+      | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
+      | select(.fresh_at >= $after)
+      | select(status_probe_reply)
+    ]
+    | sort_by(.fresh_at)
+    | last // null
+  '
+}
+
+run_status_probe_once() {
+  local mention body posted_json probe_comment_id probe_anchor probe_start probe_deadline
+  local now remaining sleep_for reply waited
+
+  [ "$STATUS_PROBE_RAN" = "false" ] || return 0
+  STATUS_PROBE_RAN=true
+
+  if [ "$STATUS_PROBE_ENABLED" != "true" ]; then
+    log "status probe disabled — timeout JSON will include status_probe.posted=false"
+    STATUS_PROBE_JSON=$(jq -nc '{enabled:false, posted:false, reply_present:false, reply:null, waited_seconds:0}')
+    return 0
+  fi
+
+  mention="@${BOT_LOGIN%\[bot\]}"
+  body="${mention}, how is the review going?"
+  log "posting CodeRabbit status probe before timeout (${STATUS_PROBE_WAIT_SECONDS}s wait budget)"
+  posted_json=$(post_reviewer_comment "status-probe" "$body")
+  probe_comment_id=$(echo "$posted_json" | jq -r '.id // null')
+  probe_anchor=$(echo "$posted_json" | jq -r '.created_at // empty')
+  if [ -z "$probe_anchor" ]; then
+    probe_anchor=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  fi
+
+  probe_start=$(date +%s)
+  probe_deadline=$((probe_start + STATUS_PROBE_WAIT_SECONDS))
+  reply='null'
+
+  while :; do
+    reply=$(find_status_probe_reply "$probe_anchor")
+    if [ "$reply" != "null" ]; then
+      break
+    fi
+
+    now=$(date +%s)
+    if [ "$now" -ge "$probe_deadline" ]; then
+      break
+    fi
+
+    remaining=$((probe_deadline - now))
+    sleep_for=$STATUS_PROBE_POLL_INTERVAL_SECONDS
+    if [ "$remaining" -lt "$sleep_for" ]; then
+      sleep_for=$remaining
+    fi
+    [ "$sleep_for" -gt 0 ] || break
+    sleep "$sleep_for"
+  done
+
+  waited=$(( $(date +%s) - probe_start ))
+  if [ "$reply" != "null" ]; then
+    log "CodeRabbit status probe reply received after ${waited}s: $(echo "$reply" | jq -r '(.body // "")[0:200] | gsub("[\r\n]+"; " ")')"
+    STATUS_PROBE_JSON=$(echo "$reply" | jq \
+      --argjson comment_id "$probe_comment_id" \
+      --argjson waited "$waited" '
+      {
+        enabled: true,
+        posted: true,
+        comment_id: $comment_id,
+        reply_present: true,
+        reply: {
+          id,
+          created_at,
+          updated_at,
+          fresh_at,
+          body_excerpt: ((.body // "")[0:500])
+        },
+        waited_seconds: $waited
+      }
+    ')
+  else
+    log "no CodeRabbit status probe reply within ${STATUS_PROBE_WAIT_SECONDS}s"
+    STATUS_PROBE_JSON=$(jq -nc \
+      --argjson comment_id "$probe_comment_id" \
+      --argjson waited "$waited" '
+      {
+        enabled: true,
+        posted: true,
+        comment_id: $comment_id,
+        reply_present: false,
+        reply: null,
+        waited_seconds: $waited
+      }
+    ')
+  fi
+}
+
+emit_timeout() {
+  local message=$1
+  log "$message"
+  run_status_probe_once
+  emit_json_and_exit "timeout" 4 "null" 0
 }
 
 # --- poll loop --------------------------------------------------------------
@@ -671,6 +840,10 @@ post_retry_trigger() {
 START_EPOCH=$(date +%s)
 RATE_LIMIT_RETRIES=0
 LAST_RATE_LIMIT_COMMENT_ID=""
+STATUS_PROBE_RAN=false
+STATUS_PROBE_JSON=$(jq -nc \
+  --argjson enabled "$([ "$STATUS_PROBE_ENABLED" = "true" ] && echo true || echo false)" \
+  '{enabled:$enabled, posted:false, reply_present:false, reply:null, waited_seconds:0}')
 
 emit_json_and_exit() {
   local status=$1 exit_code=$2 review_json=$3 potential_issues=$4
@@ -688,6 +861,7 @@ emit_json_and_exit() {
     --argjson review "$review_json" \
     --argjson potential_issue_count "$potential_issues" \
     --argjson rate_limit_retries "$RATE_LIMIT_RETRIES" \
+    --argjson status_probe "$STATUS_PROBE_JSON" \
     --argjson waited_seconds "$waited" \
     '{
       pr_number: $pr_number,
@@ -699,6 +873,7 @@ emit_json_and_exit() {
       review: $review,
       potential_issue_count: $potential_issue_count,
       rate_limit_retries: $rate_limit_retries,
+      status_probe: $status_probe,
       waited_seconds: $waited_seconds
     }'
 
@@ -724,8 +899,7 @@ sleep_or_timeout() {
   elapsed=$((now - START_EPOCH))
   remaining=$((MAX_WAIT_SECONDS - elapsed))
   if [ "$remaining" -le 0 ]; then
-    log "budget exhausted (remaining=${remaining}s) — timing out"
-    emit_json_and_exit "timeout" 4 "null" 0
+    emit_timeout "budget exhausted (remaining=${remaining}s) — timing out"
   fi
   actual=$requested
   if [ "$actual" -gt "$remaining" ]; then
@@ -810,8 +984,7 @@ while :; do
   NOW_EPOCH=$(date +%s)
   ELAPSED=$((NOW_EPOCH - START_EPOCH))
   if [ "$ELAPSED" -ge "$MAX_WAIT_SECONDS" ]; then
-    log "max_wait_seconds ($MAX_WAIT_SECONDS) exceeded after ${ELAPSED}s — timing out"
-    emit_json_and_exit "timeout" 4 "null" 0
+    emit_timeout "max_wait_seconds ($MAX_WAIT_SECONDS) exceeded after ${ELAPSED}s — timing out"
   fi
 
   # In-loop fast-path — same intent as the pre-loop check, for the case
@@ -892,6 +1065,11 @@ while :; do
       ;;
     in_progress)
       log "CodeRabbit review in progress; sleeping ${POLL_INTERVAL_SECONDS}s"
+      sleep_or_timeout "$POLL_INTERVAL_SECONDS"
+      continue
+      ;;
+    status_probe)
+      log "CodeRabbit status-probe reply is narration, not clearance; sleeping ${POLL_INTERVAL_SECONDS}s"
       sleep_or_timeout "$POLL_INTERVAL_SECONDS"
       continue
       ;;
