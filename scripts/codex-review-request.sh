@@ -494,7 +494,6 @@ post_codex_trigger() {
   POST_OUTPUT=$("$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
     || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
   TRIGGER_POSTED=true
-  TRIGGER_ATTEMPTS=$((TRIGGER_ATTEMPTS + 1))
 
   # Capture the post time so the poll loop can ignore stale signals
   # that were already on HEAD before the trigger fired. Without this,
@@ -628,7 +627,6 @@ ELAPSED=0
 TRIGGER_POSTED=false
 TRIGGER_COMMENT_ID=""
 TRIGGER_POST_TIME=""
-TRIGGER_ATTEMPTS=0
 
 if has_cleared_signal "$INITIAL_SCAN"; then
   log "Codex has already cleared on HEAD (reaction or no-P0/P1 review) — skipping trigger comment"
