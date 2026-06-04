@@ -551,7 +551,7 @@ wait_for_trigger_ack() {
 
   if [ -z "$TRIGGER_COMMENT_ID" ]; then
     log "trigger comment id unavailable — skipping eyes-ack check and continuing normal poll"
-    return 1
+    return 0
   fi
 
   ack_start=$(date +%s)
