@@ -138,6 +138,10 @@ if [ "$method" = "POST" ]; then
   done
   case "$endpoint" in
     repos/owner/repo/issues/999/comments)
+      if [ "$scenario" = "probe_post_failure" ]; then
+        echo "simulated probe post failure" >&2
+        exit 42
+      fi
       count=0
       if [ -f "$state_dir/probe-count" ]; then
         count=$(cat "$state_dir/probe-count")
@@ -193,6 +197,17 @@ case "$endpoint" in
         ;;
       rate_limit)
         printf '[{"id":7701,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"Rate limit exceeded. Please wait 10 seconds before requesting another review."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      reply_poll_failure)
+        count=0
+        if [ -f "$state_dir/probe-count" ]; then
+          count=$(cat "$state_dir/probe-count")
+        fi
+        if [ "$count" -gt 0 ]; then
+          echo "simulated status-probe reply poll failure" >&2
+          exit 43
+        fi
+        printf '[]\n'
         ;;
       *)
         printf '[]\n'
@@ -315,9 +330,61 @@ test_rate_limit_stalled_does_not_probe() {
   fi
 }
 
+test_probe_post_failure_stays_timeout_advisory() {
+  local dir rc count status posted reply_present review
+  dir=$(make_case "probe-post-failure" 1 true 6 2)
+  rc=$(run_case "$dir" probe_post_failure)
+  count=$(probe_count "$dir")
+  status=$(jq -r '.status' "$dir/out.json")
+  posted=$(jq -r '.status_probe.posted' "$dir/out.json")
+  reply_present=$(jq -r '.status_probe.reply_present' "$dir/out.json")
+  review=$(jq -r '.review // "null"' "$dir/out.json")
+
+  if [ "$rc" != "4" ]; then
+    fail "probe post failure: exit $rc, expected advisory timeout 4; stderr=$(cat "$dir/err.log")"
+  elif [ "$status" != "timeout" ]; then
+    fail "probe post failure: status=$status, expected timeout"
+  elif [ "$count" != "0" ] || [ "$posted" != "false" ]; then
+    fail "probe post failure: probe count=$count posted=$posted, expected no successful probe"
+  elif [ "$reply_present" != "false" ]; then
+    fail "probe post failure: reply_present=$reply_present, expected false"
+  elif [ "$review" != "null" ]; then
+    fail "probe post failure: probe failure was treated as review: $review"
+  else
+    pass "status probe post failure remains advisory timeout"
+  fi
+}
+
+test_probe_reply_poll_failure_stays_timeout_advisory() {
+  local dir rc count status posted reply_present review
+  dir=$(make_case "probe-reply-poll-failure" 1 true 6 2)
+  rc=$(run_case "$dir" reply_poll_failure)
+  count=$(probe_count "$dir")
+  status=$(jq -r '.status' "$dir/out.json")
+  posted=$(jq -r '.status_probe.posted' "$dir/out.json")
+  reply_present=$(jq -r '.status_probe.reply_present' "$dir/out.json")
+  review=$(jq -r '.review // "null"' "$dir/out.json")
+
+  if [ "$rc" != "4" ]; then
+    fail "probe reply poll failure: exit $rc, expected advisory timeout 4; stderr=$(cat "$dir/err.log")"
+  elif [ "$status" != "timeout" ]; then
+    fail "probe reply poll failure: status=$status, expected timeout"
+  elif [ "$count" != "1" ] || [ "$posted" != "true" ]; then
+    fail "probe reply poll failure: probe count=$count posted=$posted, expected one successful probe"
+  elif [ "$reply_present" != "false" ]; then
+    fail "probe reply poll failure: reply_present=$reply_present, expected false"
+  elif [ "$review" != "null" ]; then
+    fail "probe reply poll failure: probe failure was treated as review: $review"
+  else
+    pass "status probe reply poll failure remains advisory timeout"
+  fi
+}
+
 test_timeout_probe_posts_once_and_surfaces_reply
 test_existing_status_probe_reply_never_clears
 test_rate_limit_stalled_does_not_probe
+test_probe_post_failure_stays_timeout_advisory
+test_probe_reply_poll_failure_stays_timeout_advisory
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

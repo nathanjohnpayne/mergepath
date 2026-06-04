@@ -102,8 +102,9 @@
 #       from timeout so callers can alert the human instead of proceeding.
 #
 # Design notes:
-#   - Read-only except for retry-trigger comments. Does not push commits,
-#     does not modify labels, does not merge.
+#   - Read-only except for retry-trigger comments and timeout status-probe
+#     comments. Does not push commits, does not modify labels, does not
+#     merge.
 #   - Idempotent across reruns on the same HEAD. A freshly-landed review
 #     is detected on the next poll regardless of how many times the script
 #     has been run.
@@ -694,20 +695,24 @@ verify_reviewer_write_identity() {
       echo "       Refusing to post $purpose comment without identity verification." >&2
       echo "       Restore the helper, or opt out via" >&2
       echo "       CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 (dev only)." >&2
-      die 3 "identity-check helper unavailable"
+      return 1
     fi
     GH_TOKEN="$GH_TOKEN" "$checker" --expect-token-identity "$EXPECTED_REVIEWER_IDENTITY" \
-      || die 3 "identity-check failed before $purpose write; see stderr above."
+      || return 1
   fi
 }
 
 post_reviewer_comment() {
   local purpose=$1
   local body=$2
-  verify_reviewer_write_identity "$purpose"
-  gh_reviewer api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
-    -f body="$body" 2>/dev/null \
-    || die 3 "failed to post $purpose comment"
+  local raw
+  verify_reviewer_write_identity "$purpose" || return 1
+  raw=$(gh_reviewer api --method POST "repos/$REPO/issues/$PR_NUMBER/comments" \
+    -f body="$body" 2>&1) || {
+    log "failed to post $purpose comment: $raw"
+    return 1
+  }
+  printf '%s\n' "$raw"
 }
 
 post_retry_trigger() {
@@ -721,13 +726,21 @@ post_retry_trigger() {
   local mention="@${BOT_LOGIN%\[bot\]}"
   local body="${mention}, try again."
   log "posting retry trigger comment to PR #$PR_NUMBER as $mention"
-  post_reviewer_comment "retry-trigger" "$body" >/dev/null
+  post_reviewer_comment "retry-trigger" "$body" >/dev/null \
+    || die 3 "failed to post retry-trigger comment"
 }
 
 find_status_probe_reply() {
   local after=$1
-  local issue_comments
-  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
+  local raw issue_comments
+  raw=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>&1) || {
+    log "status probe reply poll failed to fetch issue comments: $raw"
+    return 1
+  }
+  issue_comments=$(echo "$raw" | jq -s 'add // []' 2>/dev/null) || {
+    log "status probe reply poll failed to flatten issue comments pagination output"
+    return 1
+  }
 
   echo "$issue_comments" | jq --arg bot "$BOT_LOGIN" --arg after "$after" '
     def status_probe_reply:
@@ -740,6 +753,24 @@ find_status_probe_reply() {
     ]
     | sort_by(.fresh_at)
     | last // null
+  '
+}
+
+status_probe_no_reply_json() {
+  local posted=$1
+  local comment_id=$2
+  local waited=$3
+  jq -nc \
+    --argjson posted "$posted" \
+    --argjson comment_id "$comment_id" \
+    --argjson waited "$waited" '
+    {
+      enabled: true,
+      posted: $posted,
+      reply_present: false,
+      reply: null,
+      waited_seconds: $waited
+    } + (if $posted then {comment_id: $comment_id} else {} end)
   '
 }
 
@@ -759,9 +790,17 @@ run_status_probe_once() {
   mention="@${BOT_LOGIN%\[bot\]}"
   body="${mention}, how is the review going?"
   log "posting CodeRabbit status probe before timeout (${STATUS_PROBE_WAIT_SECONDS}s wait budget)"
-  posted_json=$(post_reviewer_comment "status-probe" "$body")
-  probe_comment_id=$(echo "$posted_json" | jq -r '.id // null')
-  probe_anchor=$(echo "$posted_json" | jq -r '.created_at // empty')
+  if ! posted_json=$(post_reviewer_comment "status-probe" "$body"); then
+    log "status probe post failed; timeout remains advisory"
+    STATUS_PROBE_JSON=$(status_probe_no_reply_json false null 0)
+    return 0
+  fi
+  probe_comment_id=$(echo "$posted_json" | jq -r '.id // null' 2>/dev/null || echo "null")
+  case "$probe_comment_id" in
+    ""|null) probe_comment_id=null ;;
+    *[!0-9]*) probe_comment_id=null ;;
+  esac
+  probe_anchor=$(echo "$posted_json" | jq -r '.created_at // empty' 2>/dev/null || true)
   if [ -z "$probe_anchor" ]; then
     probe_anchor=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   fi
@@ -771,7 +810,12 @@ run_status_probe_once() {
   reply='null'
 
   while :; do
-    reply=$(find_status_probe_reply "$probe_anchor")
+    if ! reply=$(find_status_probe_reply "$probe_anchor"); then
+      waited=$(( $(date +%s) - probe_start ))
+      log "status probe reply poll failed; timeout remains advisory"
+      STATUS_PROBE_JSON=$(status_probe_no_reply_json true "$probe_comment_id" "$waited")
+      return 0
+    fi
     if [ "$reply" != "null" ]; then
       break
     fi
@@ -813,18 +857,7 @@ run_status_probe_once() {
     ')
   else
     log "no CodeRabbit status probe reply within ${STATUS_PROBE_WAIT_SECONDS}s"
-    STATUS_PROBE_JSON=$(jq -nc \
-      --argjson comment_id "$probe_comment_id" \
-      --argjson waited "$waited" '
-      {
-        enabled: true,
-        posted: true,
-        comment_id: $comment_id,
-        reply_present: false,
-        reply: null,
-        waited_seconds: $waited
-      }
-    ')
+    STATUS_PROBE_JSON=$(status_probe_no_reply_json true "$probe_comment_id" "$waited")
   fi
 }
 
