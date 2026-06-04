@@ -594,6 +594,10 @@ run_trigger_ack_gate() {
   local retries_used=0
 
   [ "$TRIGGER_POSTED" = "true" ] || return 0
+  if [ -z "$TRIGGER_COMMENT_ID" ]; then
+    log "trigger comment id unavailable — skipping eyes-ack gate and continuing normal poll"
+    return 0
+  fi
 
   while :; do
     if wait_for_trigger_ack; then

@@ -60,6 +60,10 @@ printf '%s\n' "$count" >"$state_dir/trigger-count"
 
 comment_id=$((1000 + count))
 printf '%s\n' "$comment_id" >>"$state_dir/trigger-comments"
+if [ "${CODEX_TEST_SCENARIO:-}" = "no_comment_id" ]; then
+  printf 'https://github.com/owner/repo/pull/999#discussion_r%s\n' "$comment_id"
+  exit 0
+fi
 printf 'https://github.com/owner/repo/pull/999#issuecomment-%s\n' "$comment_id"
 EOF
   chmod +x "$dir/scripts/gh-as-author.sh"
@@ -240,6 +244,26 @@ test_skip_path_posts_no_trigger_or_ack_check() {
   fi
 }
 
+test_missing_comment_id_does_not_retrigger() {
+  local dir rc count ack_count
+  dir=$(make_case "missing-comment-id" 0 1)
+  rc=$(run_case "$dir" no_comment_id)
+  count=$(trigger_count "$dir")
+  ack_count=$(ack_endpoint_count "$dir")
+
+  if [ "$rc" != "4" ]; then
+    fail "missing comment id: exit $rc, expected 4; stderr=$(cat "$dir/err.log")"
+  elif [ "$count" != "1" ]; then
+    fail "missing comment id: trigger count $count, expected no retry without a pollable id"
+  elif [ "$ack_count" != "0" ]; then
+    fail "missing comment id: ack endpoint called $ack_count times, expected 0"
+  elif ! grep -q "skipping eyes-ack gate" "$dir/err.log"; then
+    fail "missing comment id: missing skip log; stderr=$(cat "$dir/err.log")"
+  else
+    pass "missing trigger comment id: ack gate skipped without re-trigger"
+  fi
+}
+
 test_ack_wait_window_is_bounded() {
   local dir rc count start end elapsed
   dir=$(make_case "bounded-wait" 1 0 1)
@@ -266,6 +290,7 @@ test_eyes_ack_does_not_retrigger_or_clear
 test_missing_ack_retriggers_once
 test_retry_cap_respected
 test_skip_path_posts_no_trigger_or_ack_check
+test_missing_comment_id_does_not_retrigger
 test_ack_wait_window_is_bounded
 
 echo
