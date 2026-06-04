@@ -20,8 +20,10 @@
 #              verifies and uses the author token for that write.
 #
 # Behavior:
-#   1. Reads codex.review_timeout_seconds and codex.bot_login from
-#      .github/review-policy.yml (defaults: 600 / chatgpt-codex-connector[bot]).
+#   1. Reads codex.review_timeout_seconds, codex.ack_wait_seconds,
+#      codex.max_ack_retries, and codex.bot_login from
+#      .github/review-policy.yml (defaults: 600 / 60 / 1 /
+#      chatgpt-codex-connector[bot]).
 #   2. Fetches the PR's current HEAD commit SHA and committer date. Any
 #      Codex review is only considered "current" if it is anchored on
 #      this commit (commit_id == HEAD_SHA). Any Codex +1 reaction is
@@ -43,12 +45,17 @@
 #      skips the trigger comment and goes straight to emitting JSON —
 #      re-posting `@codex review` when Codex has already responded can
 #      cause double-processing or rate-limit pushback.
-#   4. Otherwise posts `@codex review` as a PR comment and polls every
-#      15 seconds for up to `review_timeout_seconds` for either:
+#   4. Otherwise posts `@codex review` as a PR comment, waits a short
+#      bounded window for Codex's documented `eyes` acknowledgment on
+#      that trigger comment, and re-posts the trigger up to
+#      `max_ack_retries` if no acknowledgment appears. The eyes
+#      acknowledgment is never treated as clearance.
+#   5. Polls every 15 seconds for up to `review_timeout_seconds` for
+#      either:
 #        - a review from the Codex bot on the current HEAD, OR
 #        - a +1 reaction from the Codex bot on the PR issue dated after
 #          the current HEAD committer date.
-#   5. Emits a JSON object to stdout summarizing what Codex produced.
+#   6. Emits a JSON object to stdout summarizing what Codex produced.
 #      The JSON shape is the contract with the caller; do not change
 #      field names without also updating scripts/codex-review-check.sh
 #      and the policy docs (CLAUDE.md, AGENTS.md, REVIEW_POLICY.md).
@@ -98,6 +105,7 @@
 #   - Project #2 — External Review (Phase 4 Review)
 #   - #34 — this script
 #   - #29 — live observations behind the dual-endpoint / reaction polling
+#   - #419 — eyes acknowledgment gate + bounded re-trigger
 #   - REVIEW_POLICY.md § Phase 4a (canonical policy)
 
 set -euo pipefail
@@ -193,7 +201,22 @@ if ! [[ "$REACTION_FRESHNESS_SECONDS" =~ ^[0-9]+$ ]]; then
   exit 3
 fi
 
+ACK_WAIT_SECONDS=$(codex_field ack_wait_seconds)
+ACK_WAIT_SECONDS=${ACK_WAIT_SECONDS:-60}
+if ! [[ "$ACK_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: codex.ack_wait_seconds must be an integer; got '$ACK_WAIT_SECONDS'" >&2
+  exit 3
+fi
+
+MAX_ACK_RETRIES=$(codex_field max_ack_retries)
+MAX_ACK_RETRIES=${MAX_ACK_RETRIES:-1}
+if ! [[ "$MAX_ACK_RETRIES" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: codex.max_ack_retries must be an integer; got '$MAX_ACK_RETRIES'" >&2
+  exit 3
+fi
+
 POLL_INTERVAL_SECONDS=15
+ACK_POLL_INTERVAL_SECONDS=5
 
 # --- logging helpers --------------------------------------------------------
 
@@ -285,6 +308,7 @@ log "HEAD = $HEAD_SHA committed at $HEAD_COMMITTER_DATE"
 log "anchor = $HEAD_PUSHED_AT (source: $ANCHOR_SOURCE)"
 log "reaction_threshold = $REACTION_THRESHOLD (source: $REACTION_THRESHOLD_SOURCE)"
 log "bot_login = $BOT_LOGIN    timeout = ${TIMEOUT_SECONDS}s"
+log "ack_wait = ${ACK_WAIT_SECONDS}s    max_ack_retries = $MAX_ACK_RETRIES"
 
 # --- Codex signal scan ------------------------------------------------------
 
@@ -428,19 +452,23 @@ has_cleared_signal() {
   ')" = "true" ]
 }
 
-# --- pre-flight: is Codex already working on HEAD? --------------------------
+# Returns 0 iff the scan has a terminal Codex signal that is at least
+# as recent as TRIGGER_POST_TIME (>=, not >). Used when a trigger was
+# posted so stale pre-trigger reviews/reactions cannot short-circuit
+# the wait for Codex's response to the new trigger.
+#
+# Uses >= because GitHub timestamps are second-precision and a legitimate
+# Codex response in the same second as the trigger comment post would
+# otherwise be classified as stale forever, forcing a Phase 4b timeout.
+has_post_trigger_signal() {
+  local scan=$1
+  [ "$(echo "$scan" | jq -r --arg after "$TRIGGER_POST_TIME" '
+    ((.review != null and .review.submitted_at >= $after)
+     or (.reaction != null and .reaction.created_at >= $after))
+  ')" = "true" ]
+}
 
-log "checking for existing Codex signal on HEAD"
-if ! INITIAL_SCAN=$(scan_codex_state); then
-  die 3 "initial Codex scan failed"
-fi
-
-TRIGGER_POSTED=false
-TRIGGER_POST_TIME=""
-
-if has_cleared_signal "$INITIAL_SCAN"; then
-  log "Codex has already cleared on HEAD (reaction or no-P0/P1 review) — skipping trigger comment"
-else
+post_codex_trigger() {
   # The Codex GitHub App ONLY monitors '@codex review' comments authored
   # by the repo's AUTHOR/human identity (nathanjohnpayne). A trigger
   # posted by a reviewer/bot identity (nathanpayne-claude/-codex/-cursor)
@@ -459,12 +487,15 @@ else
     echo "       (Codex ignores reviewer/bot-authored triggers — see comment above)." >&2
     die 3 "gh-as-author.sh helper unavailable"
   fi
+
   # Capture stdout+stderr so a failure surfaces the real gh error
   # (404 / 403 / 422) rather than a bare "failed to post". The comment
   # URL gh prints on success is still extractable downstream.
   POST_OUTPUT=$("$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
     || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
   TRIGGER_POSTED=true
+  TRIGGER_ATTEMPTS=$((TRIGGER_ATTEMPTS + 1))
+
   # Capture the post time so the poll loop can ignore stale signals
   # that were already on HEAD before the trigger fired. Without this,
   # `has_signal "$INITIAL_SCAN"` would return true on the very first
@@ -482,7 +513,7 @@ else
   # clock minus a 60-second buffer if the comment ID can't be
   # extracted (e.g., gh output format change). Codex caught the
   # wall-clock issue on nathanpaynedotcom propagation PR #180 round 4.
-  TRIGGER_COMMENT_ID=$(echo "$POST_OUTPUT" | grep -oE 'issuecomment-[0-9]+' | head -1 | sed 's/issuecomment-//')
+  TRIGGER_COMMENT_ID=$(echo "$POST_OUTPUT" | grep -oE 'issuecomment-[0-9]+' | head -1 | sed 's/issuecomment-//' || true)
   if [ -n "$TRIGGER_COMMENT_ID" ]; then
     TRIGGER_POST_TIME=$(gh api "repos/$REPO/issues/comments/$TRIGGER_COMMENT_ID" --jq '.created_at' 2>/dev/null || true)
   fi
@@ -498,41 +529,120 @@ else
         || die 3 "could not compute fallback TRIGGER_POST_TIME")
     fi
   fi
-fi
+}
 
-# --- poll loop --------------------------------------------------------------
+trigger_ack_present() {
+  local reactions
+
+  [ -n "$TRIGGER_COMMENT_ID" ] || return 1
+  reactions=$(fetch_api_array "repos/$REPO/issues/comments/$TRIGGER_COMMENT_ID/reactions" "trigger comment reactions")
+  [ "$(echo "$reactions" | jq -r --arg bot "$BOT_LOGIN" --arg after "$TRIGGER_POST_TIME" '
+    [ .[]
+      | select(.user.login == $bot)
+      | select(.content == "eyes")
+      | select(.created_at >= $after)
+    ]
+    | length > 0
+  ')" = "true" ]
+}
+
+wait_for_trigger_ack() {
+  local ack_start ack_deadline now remaining sleep_for
+
+  if [ -z "$TRIGGER_COMMENT_ID" ]; then
+    log "trigger comment id unavailable — skipping eyes-ack check and continuing normal poll"
+    return 1
+  fi
+
+  ack_start=$(date +%s)
+  ack_deadline=$((ack_start + ACK_WAIT_SECONDS))
+
+  while :; do
+    if trigger_ack_present; then
+      log "Codex eyes acknowledgment received on trigger comment $TRIGGER_COMMENT_ID"
+      return 0
+    fi
+
+    # If a terminal Codex signal arrives before the eyes reaction is
+    # observable via REST, do not re-trigger. The terminal signal wins;
+    # eyes is only an acknowledgment, never a clearance signal.
+    if ! FINAL_SCAN=$(scan_codex_state); then
+      die 3 "eyes-ack Codex scan failed"
+    fi
+    if has_post_trigger_signal "$FINAL_SCAN"; then
+      log "Codex terminal signal arrived during eyes-ack wait — no re-trigger needed"
+      return 0
+    fi
+
+    now=$(date +%s)
+    if [ "$now" -ge "$ack_deadline" ] || [ "$now" -ge "$DEADLINE" ]; then
+      log "no Codex eyes acknowledgment on trigger comment $TRIGGER_COMMENT_ID within ${ACK_WAIT_SECONDS}s"
+      return 1
+    fi
+
+    remaining=$((ack_deadline - now))
+    sleep_for=$ACK_POLL_INTERVAL_SECONDS
+    if [ "$remaining" -lt "$sleep_for" ]; then
+      sleep_for=$remaining
+    fi
+    sleep "$sleep_for"
+    ELAPSED=$(( $(date +%s) - START_TS ))
+  done
+}
+
+run_trigger_ack_gate() {
+  local retries_used=0
+
+  [ "$TRIGGER_POSTED" = "true" ] || return 0
+
+  while :; do
+    if wait_for_trigger_ack; then
+      return 0
+    fi
+
+    if [ "$retries_used" -ge "$MAX_ACK_RETRIES" ]; then
+      log "eyes-ack retry cap reached (${retries_used}/${MAX_ACK_RETRIES}) — continuing normal review poll"
+      return 0
+    fi
+
+    retries_used=$((retries_used + 1))
+    log "re-posting '@codex review' because Codex did not acknowledge the trigger (${retries_used}/${MAX_ACK_RETRIES})"
+    post_codex_trigger
+  done
+}
+
+# --- pre-flight: is Codex already working on HEAD? --------------------------
+
+log "checking for existing Codex signal on HEAD"
+if ! INITIAL_SCAN=$(scan_codex_state); then
+  die 3 "initial Codex scan failed"
+fi
 
 START_TS=$(date +%s)
 DEADLINE=$((START_TS + TIMEOUT_SECONDS))
 ELAPSED=0
+TRIGGER_POSTED=false
+TRIGGER_COMMENT_ID=""
+TRIGGER_POST_TIME=""
+TRIGGER_ATTEMPTS=0
 
-# Returns 0 iff the scan has a signal that is at least as recent
-# as TRIGGER_POST_TIME (>=, not >). Used by the poll loop only
-# when TRIGGER_POSTED=1 so we don't short-circuit on stale signals.
-#
-# Uses >= rather than > because GitHub timestamps are second-
-# precision and a legitimate Codex response in the same second as
-# the trigger comment post would otherwise be classified as stale
-# forever, forcing the script to time out to Phase 4b unnecessarily.
-# nathanpayne-codex caught the >-vs->= bug on swipewatch propagation
-# PR #33 round 4 and the related wall-clock-vs-GitHub-time bug on
-# nathanpaynedotcom propagation PR #180 round 4.
-has_post_trigger_signal() {
-  local scan=$1
-  [ "$(echo "$scan" | jq -r --arg after "$TRIGGER_POST_TIME" '
-    ((.review != null and .review.submitted_at >= $after)
-     or (.reaction != null and .reaction.created_at >= $after))
-  ')" = "true" ]
-}
+if has_cleared_signal "$INITIAL_SCAN"; then
+  log "Codex has already cleared on HEAD (reaction or no-P0/P1 review) — skipping trigger comment"
+else
+  post_codex_trigger
+fi
 
 if [ "$TRIGGER_POSTED" = "true" ]; then
   # We just posted a trigger. The INITIAL_SCAN data is now stale by
   # definition — Codex will respond with something new. Skip the
   # initial has_signal check; force the loop to actually poll.
   FINAL_SCAN='{"review":null,"findings":[],"reaction":null}'
+  run_trigger_ack_gate
 else
   FINAL_SCAN=$INITIAL_SCAN
 fi
+
+# --- poll loop --------------------------------------------------------------
 
 while :; do
   # If we just triggered a fresh review, only break on a signal

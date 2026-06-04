@@ -412,6 +412,16 @@ An agent proceeds to 4a first. If 4a escalates, times out, or is disabled, the a
 
 > **The `@codex review` trigger MUST be authored by `nathanjohnpayne`.** The Codex GitHub App only monitors trigger comments from the repo's author/human identity; a trigger posted by a reviewer/bot identity (`nathanpayne-claude`/`-codex`/`-cursor`) is silently ignored and the poll runs to timeout (observed empirically on #405: a reviewer-authored trigger drew no response in 600s, an author-authored one drew a review in ~20s). `codex-review-request.sh` posts the trigger through `gh-as-author.sh` for exactly this reason — do not bypass that wrapper with a reviewer-token write.
 
+After posting a trigger, `codex-review-request.sh` waits a short,
+bounded window for Codex's documented 👀 acknowledgment on that exact
+trigger comment. In GitHub's REST reactions payload the content value is
+`eyes`. If the acknowledgment is absent, the helper re-posts the exact
+`@codex review` trigger through the same author wrapper up to
+`codex.max_ack_retries`, then continues the normal review wait. The
+acknowledgment is not clearance: only a Codex review on HEAD with no
+unaddressed P0/P1 findings, or a fresh 👍 / `+1` reaction on the PR
+issue, can satisfy the Phase 4a signal.
+
 12a. `codex-review-request.sh` polls the PR until one of the following:
 
      - **Codex posts a review.** Always in `COMMENTED` state — the Codex GitHub App never uses `APPROVED` or `CHANGES_REQUESTED`. Findings appear as **inline comments on the diff** (`/pulls/{pr}/comments` endpoint), not in the top-level review body. Inline findings carry priority markers: `![P0 Badge]`, `![P1 Badge]`, `![P2 Badge]`, or `![P3 Badge]`.
