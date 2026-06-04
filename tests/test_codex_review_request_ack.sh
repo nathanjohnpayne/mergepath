@@ -81,6 +81,14 @@ scenario=${CODEX_TEST_SCENARIO:?}
 bot='chatgpt-codex-connector[bot]'
 now='2026-06-04T00:00:00Z'
 
+comment_time() {
+  case "$1" in
+    1001) printf '2026-06-04T00:00:00Z\n' ;;
+    1002) printf '2026-06-04T00:00:10Z\n' ;;
+    *) printf '%s\n' "$now" ;;
+  esac
+}
+
 if [ "${1:-}" != "api" ]; then
   echo "unexpected gh command: $*" >&2
   exit 99
@@ -104,7 +112,19 @@ case "$endpoint" in
     printf '[]\n'
     ;;
   repos/owner/repo/pulls/999/reviews)
-    printf '[]\n'
+    if [ "$scenario" = "review_after_retry" ]; then
+      count=0
+      if [ -f "$state_dir/trigger-count" ]; then
+        count=$(cat "$state_dir/trigger-count")
+      fi
+      if [ "$count" -ge 2 ]; then
+        printf '[{"id":77,"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-04T00:00:05Z","commit_id":"head-sha","body":"review for original trigger"}]\n' "$bot"
+      else
+        printf '[]\n'
+      fi
+    else
+      printf '[]\n'
+    fi
     ;;
   repos/owner/repo/pulls/999/comments)
     printf '[]\n'
@@ -128,7 +148,8 @@ case "$endpoint" in
     printf '%s\n' "$comment_id" >>"$state_dir/ack-comments"
     ;;
   repos/owner/repo/issues/comments/*)
-    printf '%s\n' "$now"
+    comment_id=${endpoint#repos/owner/repo/issues/comments/}
+    comment_time "$comment_id"
     ;;
   *)
     echo "unexpected gh api endpoint: $endpoint" >&2
@@ -350,6 +371,27 @@ test_retry_resets_review_deadline() {
   fi
 }
 
+test_retry_preserves_original_trigger_response() {
+  local dir rc count review_body review_time
+  dir=$(make_case "retry-preserves-original-response" 0 1)
+  rc=$(run_case "$dir" review_after_retry)
+  count=$(trigger_count "$dir")
+  review_body=$(jq -r '.review.body // "null"' "$dir/out.json")
+  review_time=$(jq -r '.review.submitted_at // "null"' "$dir/out.json")
+
+  if [ "$rc" != "0" ]; then
+    fail "retry preserves original response: exit $rc, expected 0; stderr=$(cat "$dir/err.log")"
+  elif [ "$count" != "2" ]; then
+    fail "retry preserves original response: trigger count $count, expected original + one retry"
+  elif [ "$review_body" != "review for original trigger" ]; then
+    fail "retry preserves original response: review body=$review_body"
+  elif [ "$review_time" != "2026-06-04T00:00:05Z" ]; then
+    fail "retry preserves original response: review time=$review_time"
+  else
+    pass "retry preserves terminal response to original trigger"
+  fi
+}
+
 test_ack_wait_window_is_bounded() {
   local dir rc count start end elapsed
   dir=$(make_case "bounded-wait" 1 0 1)
@@ -379,6 +421,7 @@ test_skip_path_posts_no_trigger_or_ack_check
 test_missing_comment_id_does_not_retrigger
 test_retry_missing_comment_id_stops_without_extra_retry
 test_retry_resets_review_deadline
+test_retry_preserves_original_trigger_response
 test_ack_wait_window_is_bounded
 
 echo

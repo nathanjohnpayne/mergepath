@@ -51,7 +51,8 @@
 #      `max_ack_retries` if no acknowledgment appears. The eyes
 #      acknowledgment is never treated as clearance.
 #   5. Polls every 15 seconds for up to `review_timeout_seconds`
-#      measured from the latest trigger comment for either:
+#      measured from the latest trigger comment, while accepting a
+#      terminal response to any trigger posted in this run, for either:
 #        - a review from the Codex bot on the current HEAD, OR
 #        - a +1 reaction from the Codex bot on the PR issue dated after
 #          the current HEAD committer date.
@@ -453,16 +454,19 @@ has_cleared_signal() {
 }
 
 # Returns 0 iff the scan has a terminal Codex signal that is at least
-# as recent as TRIGGER_POST_TIME (>=, not >). Used when a trigger was
-# posted so stale pre-trigger reviews/reactions cannot short-circuit
-# the wait for Codex's response to the new trigger.
+# as recent as TRIGGER_SIGNAL_THRESHOLD (>=, not >). That threshold is
+# the first trigger timestamp in this script run, while TRIGGER_POST_TIME
+# tracks the latest trigger comment for eyes-ack polling. Keeping them
+# separate lets a late response to the original trigger count even if a
+# retry comment was posted before the response became visible.
 #
 # Uses >= because GitHub timestamps are second-precision and a legitimate
 # Codex response in the same second as the trigger comment post would
 # otherwise be classified as stale forever, forcing a Phase 4b timeout.
 has_post_trigger_signal() {
   local scan=$1
-  [ "$(echo "$scan" | jq -r --arg after "$TRIGGER_POST_TIME" '
+  local after=${TRIGGER_SIGNAL_THRESHOLD:-$TRIGGER_POST_TIME}
+  [ "$(echo "$scan" | jq -r --arg after "$after" '
     ((.review != null and .review.submitted_at >= $after)
      or (.reaction != null and .reaction.created_at >= $after))
   ')" = "true" ]
@@ -533,6 +537,14 @@ post_codex_trigger() {
       TRIGGER_POST_TIME=$(date -u -d "@$EPOCH_BUFFER" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
         || die 3 "could not compute fallback TRIGGER_POST_TIME")
     fi
+  fi
+
+  # Terminal Codex signals should be accepted if they respond to any
+  # trigger posted in this script run. Retries still update
+  # TRIGGER_POST_TIME for eyes-ack polling, but must not advance the
+  # terminal-signal threshold past a valid response to an earlier trigger.
+  if [ -z "$TRIGGER_SIGNAL_THRESHOLD" ]; then
+    TRIGGER_SIGNAL_THRESHOLD="$TRIGGER_POST_TIME"
   fi
 
   # The review timeout belongs to the latest trigger comment, not to
@@ -636,6 +648,7 @@ reset_review_wait_clock
 TRIGGER_POSTED=false
 TRIGGER_COMMENT_ID=""
 TRIGGER_POST_TIME=""
+TRIGGER_SIGNAL_THRESHOLD=""
 
 if has_cleared_signal "$INITIAL_SCAN"; then
   log "Codex has already cleared on HEAD (reaction or no-P0/P1 review) — skipping trigger comment"
@@ -657,8 +670,9 @@ fi
 
 while :; do
   # If we just triggered a fresh review, only break on a signal
-  # strictly newer than the trigger. Otherwise (no trigger sent),
-  # any existing signal is fine — that's the cleared-on-arrival path.
+  # at or after the first trigger in this run. Otherwise (no trigger
+  # sent), any existing signal is fine — that's the cleared-on-arrival
+  # path.
   if [ "$TRIGGER_POSTED" = "true" ]; then
     if has_post_trigger_signal "$FINAL_SCAN"; then
       log "Codex signal received after ${ELAPSED}s (post-trigger)"
@@ -714,8 +728,8 @@ jq -n \
 
 # Exit 0 if a signal arrived; exit 4 (FALLBACK_REQUIRED) if we timed
 # out. When TRIGGER_POSTED=true, "a signal arrived" means a signal
-# strictly newer than the trigger post — the existing pre-trigger
-# signal doesn't count, otherwise the script would exit 0 with stale
+# at or after the first trigger in this run — existing pre-trigger
+# signals do not count, otherwise the script would exit 0 with stale
 # findings the moment we time out polling for the new review.
 if [ "$TRIGGER_POSTED" = "true" ]; then
   if has_post_trigger_signal "$FINAL_SCAN"; then
