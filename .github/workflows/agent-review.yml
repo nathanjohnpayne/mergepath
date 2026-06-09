@@ -46,7 +46,7 @@ jobs:
       reviewers: ${{ steps.config.outputs.reviewers }}
       author_identity: ${{ steps.config.outputs.author_identity }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Parse review-policy.yml
         id: config
@@ -256,7 +256,7 @@ jobs:
     if: github.event_name == 'pull_request_review'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Install js-yaml
         run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml
@@ -363,7 +363,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Dismiss self-approval from reviewer bot accounts
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Install js-yaml
         run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml
@@ -440,7 +440,7 @@ jobs:
       !contains(github.event.pull_request.labels.*.name, 'human-hold')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Check author merge token
         id: author_merge_token
