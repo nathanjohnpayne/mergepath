@@ -253,15 +253,19 @@ assert_rc_contains "author wrapper inline non-author identity blocked on codex t
 assert_rc_contains "stale inline author identity from earlier segment does not block" 0 "" \
   'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex echo ok ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 
-# A standalone assignment (no command in its segment) sets an
-# UNEXPORTED shell variable the wrapper process never receives — the
-# wrapper runs with its default identity, so the hook must not treat
-# it as the wrapper's configuration (Codex P2 on PR #442 r3: in a
-# custom-author repo the carried value would mask the wrapper falling
-# back to its stock default — a wrong-byline hole). Exported variables
-# are still caught via the hook's own environment.
-assert_rc_contains "standalone inline author identity assignment does not reach the wrapper" 0 "" \
+# A standalone assignment (no command in its segment) persists as a
+# shell variable, and IF the name carries the export attribute in the
+# calling shell it ALSO reaches the wrapper (Codex P1 on PR #442 r4).
+# The hook cannot observe the export attribute, so a standalone
+# non-author value must fail closed even though it might be inert.
+assert_rc_contains "standalone non-author identity assignment fails closed" 2 "author identity" \
   'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# ...but a standalone assignment of the EXPECTED author is fine either
+# way (exported: wrapper gets the expected value; unexported: wrapper
+# default is the same value).
+assert_rc_contains "standalone matching author identity assignment allowed" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=nathanjohnpayne ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 
 # The custom-author shape from the r3 finding: standalone assignment of
 # the CUSTOM identity must NOT satisfy the guard — the wrapper would

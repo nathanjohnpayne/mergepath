@@ -601,6 +601,15 @@ INLINE_BREAK_GLASS_ADMIN=""
 INLINE_BREAK_GLASS_MERGE_STATE=""
 INLINE_GH_AS_AUTHOR_IDENTITY=""
 INLINE_GH_AS_REVIEWER_IDENTITY=""
+# Standalone (own-segment) identity assignments persist as shell
+# variables and — when the name already carries the export attribute in
+# the calling shell — ALSO reach later processes. The hook cannot see
+# the export attribute, so these are tracked separately as
+# possibly-effective candidates that the byline guards must validate
+# alongside the environment value (fail closed on the ambiguity).
+# Codex P1 on PR #442 r4.
+STANDALONE_GH_AS_AUTHOR_IDENTITY=""
+STANDALONE_GH_AS_REVIEWER_IDENTITY=""
 GLOBAL_REPO=""
 PR_SUBCOMMAND=""
 PR_SUBCOMMAND_INDEX=-1    # index in TOKENS where the gh pr subcommand was found
@@ -738,18 +747,32 @@ for i in "${!TOKENS[@]}"; do
         INLINE_BREAK_GLASS_ADMIN=""
         INLINE_BREAK_GLASS_MERGE_STATE=""
       fi
-      # Identity assignments NEVER survive a separator — unlike the
-      # break-glass vars above, their consumer is the WRAPPER process
-      # environment, not this hook. A prefix assignment scopes to its
-      # own command's environment, and a standalone assignment sets an
-      # unexported shell variable the wrapper never receives. Carrying
-      # either across a separator mis-models bash both ways: a stale
-      # prefix value falsely blocks later wrapper writes (Codex P2 on
-      # PR #442 r1), and a standalone value makes the hook believe the
-      # wrapper is configured with an identity it never sees — a
-      # wrong-byline hole in custom-author repos (Codex P2 on PR #442
-      # r3). Exported variables are still caught via the hook's own
-      # environment.
+      # Identity assignments: their consumer is the WRAPPER process
+      # environment, not this hook, and what survives a separator
+      # depends on HOW the assignment appeared (Codex P2s/P1 on PR
+      # #442 r1/r3/r4):
+      #   - PREFIX to an earlier command (`VAR=x echo ok ; wrapper`):
+      #     the shell restores the variable after that command —
+      #     provably ineffective for later segments. Drop it, or a
+      #     stale value falsely blocks later wrapper writes (r1).
+      #   - STANDALONE (`VAR=x ; wrapper` / `VAR=x && wrapper`): the
+      #     value persists as a shell variable, and IF the name
+      #     already carries the export attribute in the calling shell
+      #     it also reaches the wrapper (r4). The hook cannot see the
+      #     export attribute, so the value is stashed as a
+      #     possibly-effective candidate that the byline guards
+      #     validate IN ADDITION to the environment/default value —
+      #     fail closed on the ambiguity (this also covers r3, where
+      #     an unexported standalone value would have masked the
+      #     wrapper falling back to its stock default).
+      if [ "$SEGMENT_HAS_COMMAND" -eq 0 ]; then
+        if [ -n "$INLINE_GH_AS_AUTHOR_IDENTITY" ]; then
+          STANDALONE_GH_AS_AUTHOR_IDENTITY="$INLINE_GH_AS_AUTHOR_IDENTITY"
+        fi
+        if [ -n "$INLINE_GH_AS_REVIEWER_IDENTITY" ]; then
+          STANDALONE_GH_AS_REVIEWER_IDENTITY="$INLINE_GH_AS_REVIEWER_IDENTITY"
+        fi
+      fi
       INLINE_GH_AS_AUTHOR_IDENTITY=""
       INLINE_GH_AS_REVIEWER_IDENTITY=""
       SEGMENT_HAS_COMMAND=0
@@ -1025,18 +1048,31 @@ if [ "$WRAPPER_KIND" = "author" ]; then
     EXPECTED_AUTHOR=$(grep -m1 '^author_identity:' ".github/review-policy.yml" | awk '{print $2}' || true)
   fi
   EXPECTED_AUTHOR="${EXPECTED_AUTHOR:-nathanjohnpayne}"
-  WRAPPER_AUTHOR_IDENTITY="${INLINE_GH_AS_AUTHOR_IDENTITY:-${GH_AS_AUTHOR_IDENTITY:-}}"
-  # Unset means the wrapper will use ITS hard default (nathanjohnpayne)
-  # — compare against that, not against EXPECTED_AUTHOR, so a repo
-  # with a custom GH_PR_GUARD_EXPECTED_AUTHOR fails closed when the
-  # wrapper would actually verify the stock default.
-  WRAPPER_AUTHOR_IDENTITY="${WRAPPER_AUTHOR_IDENTITY:-nathanjohnpayne}"
-  if [ "$WRAPPER_AUTHOR_IDENTITY" != "$EXPECTED_AUTHOR" ]; then
-    echo "BLOCKED: $cmd_label wrapper is configured for author identity '$WRAPPER_AUTHOR_IDENTITY', not expected author '$EXPECTED_AUTHOR'." >&2
-    echo "  gh-as-author.sh verifies whatever login GH_AS_AUTHOR_IDENTITY names; a non-author login here lands the write under the wrong byline (#438)." >&2
-    echo "  Unset GH_AS_AUTHOR_IDENTITY (wrapper default: nathanjohnpayne), or set GH_PR_GUARD_EXPECTED_AUTHOR if this repo's author identity genuinely differs." >&2
-    exit 2
+  # Candidate model (Codex P1 on PR #442 r4): a same-segment prefix on
+  # the wrapper command is DEFINITIVE (it reaches the wrapper's
+  # environment regardless of export attribute). Otherwise the wrapper
+  # may see EITHER the hook's environment value / the wrapper's hard
+  # default (nathanjohnpayne) OR a standalone assignment from an
+  # earlier segment (effective only if the name carries the export
+  # attribute, which the hook cannot observe). Every possibly-effective
+  # candidate must match the expected author — fail closed on the
+  # ambiguity.
+  if [ -n "$INLINE_GH_AS_AUTHOR_IDENTITY" ]; then
+    AUTHOR_IDENTITY_CANDIDATES="$INLINE_GH_AS_AUTHOR_IDENTITY"
+  else
+    AUTHOR_IDENTITY_CANDIDATES="${GH_AS_AUTHOR_IDENTITY:-nathanjohnpayne}"
+    if [ -n "$STANDALONE_GH_AS_AUTHOR_IDENTITY" ]; then
+      AUTHOR_IDENTITY_CANDIDATES="$AUTHOR_IDENTITY_CANDIDATES $STANDALONE_GH_AS_AUTHOR_IDENTITY"
+    fi
   fi
+  for WRAPPER_AUTHOR_IDENTITY in $AUTHOR_IDENTITY_CANDIDATES; do
+    if [ "$WRAPPER_AUTHOR_IDENTITY" != "$EXPECTED_AUTHOR" ]; then
+      echo "BLOCKED: $cmd_label wrapper may run under author identity '$WRAPPER_AUTHOR_IDENTITY', not expected author '$EXPECTED_AUTHOR'." >&2
+      echo "  gh-as-author.sh verifies whatever login GH_AS_AUTHOR_IDENTITY names; a non-author login here lands the write under the wrong byline (#438)." >&2
+      echo "  Unset GH_AS_AUTHOR_IDENTITY (wrapper default: nathanjohnpayne) and drop any standalone GH_AS_AUTHOR_IDENTITY=... assignment from the command, or set GH_PR_GUARD_EXPECTED_AUTHOR if this repo's author identity genuinely differs." >&2
+      exit 2
+    fi
+  done
 fi
 
 # --- byline guard for pr comment / pr review / issue comment ---
@@ -1067,17 +1103,30 @@ else
 fi
 if [ "$PR_SUBCOMMAND" = "comment" ] || [ "$PR_SUBCOMMAND" = "review" ] || [ "$IS_ISSUE_COMMENT" -eq 1 ]; then
   if [ "$WRAPPER_KIND" = "reviewer" ]; then
-    WRAPPER_REVIEWER_IDENTITY="${INLINE_GH_AS_REVIEWER_IDENTITY:-${GH_AS_REVIEWER_IDENTITY:-}}"
-    if [ -z "$WRAPPER_REVIEWER_IDENTITY" ] && [ -n "${MERGEPATH_AGENT:-}" ]; then
-      WRAPPER_REVIEWER_IDENTITY="nathanpayne-$MERGEPATH_AGENT"
+    # Same candidate model as the author guard above (Codex P1 on PR
+    # #442 r4): a same-segment prefix is definitive; otherwise both
+    # the env/default resolution AND any standalone assignment from an
+    # earlier segment are possibly effective and must ALL match.
+    if [ -n "$INLINE_GH_AS_REVIEWER_IDENTITY" ]; then
+      REVIEWER_IDENTITY_CANDIDATES="$INLINE_GH_AS_REVIEWER_IDENTITY"
+    else
+      REVIEWER_IDENTITY_CANDIDATES="${GH_AS_REVIEWER_IDENTITY:-}"
+      if [ -z "$REVIEWER_IDENTITY_CANDIDATES" ] && [ -n "${MERGEPATH_AGENT:-}" ]; then
+        REVIEWER_IDENTITY_CANDIDATES="nathanpayne-$MERGEPATH_AGENT"
+      fi
+      REVIEWER_IDENTITY_CANDIDATES="${REVIEWER_IDENTITY_CANDIDATES:-nathanpayne-claude}"
+      if [ -n "$STANDALONE_GH_AS_REVIEWER_IDENTITY" ]; then
+        REVIEWER_IDENTITY_CANDIDATES="$REVIEWER_IDENTITY_CANDIDATES $STANDALONE_GH_AS_REVIEWER_IDENTITY"
+      fi
     fi
-    WRAPPER_REVIEWER_IDENTITY="${WRAPPER_REVIEWER_IDENTITY:-nathanpayne-claude}"
-    if [ "$WRAPPER_REVIEWER_IDENTITY" != "$EXPECTED_REVIEWER" ]; then
-      echo "BLOCKED: $cmd_label wrapper is configured for '$WRAPPER_REVIEWER_IDENTITY', not expected reviewer '$EXPECTED_REVIEWER'." >&2
-      echo "  Expected reviewer source: $EXPECTED_REVIEWER_SOURCE" >&2
-      echo "  Set GH_AS_REVIEWER_IDENTITY=$EXPECTED_REVIEWER or MERGEPATH_AGENT=<agent> consistently." >&2
-      exit 2
-    fi
+    for WRAPPER_REVIEWER_IDENTITY in $REVIEWER_IDENTITY_CANDIDATES; do
+      if [ "$WRAPPER_REVIEWER_IDENTITY" != "$EXPECTED_REVIEWER" ]; then
+        echo "BLOCKED: $cmd_label wrapper may run under '$WRAPPER_REVIEWER_IDENTITY', not expected reviewer '$EXPECTED_REVIEWER'." >&2
+        echo "  Expected reviewer source: $EXPECTED_REVIEWER_SOURCE" >&2
+        echo "  Set GH_AS_REVIEWER_IDENTITY=$EXPECTED_REVIEWER or MERGEPATH_AGENT=<agent> consistently, and drop any standalone GH_AS_REVIEWER_IDENTITY=... assignment from the command." >&2
+        exit 2
+      fi
+    done
   fi
 fi
 
