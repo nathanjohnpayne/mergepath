@@ -268,6 +268,22 @@ if [ "${CODEX_REVIEW_CHECK_SKIP_CI:-}" = "1" ]; then
   REQUIRE_CI_GREEN=false
 fi
 
+# Per-invocation gate-(b) HEAD-pin override (#435, the #427/#428 class one
+# layer deeper). By default gate (b) branch 1 accepts each reviewer's
+# latest-state APPROVED on ANY commit — so a reviewer's approval of an
+# earlier head can survive a later push and clear gate (b) while gate (c)
+# clears via a fresh on-HEAD Codex signal, merging a HEAD the reviewer never
+# approved. When this is "1", gate (b) branch 1 additionally requires the
+# APPROVED to be on the current HEAD (commit_id == HEAD_SHA), matching the
+# gate-(c) Phase-4b-substitute's HEAD pinning. scripts/merge-clearance-gate.sh
+# sets it so its REQUIRED check is fully HEAD-pinned (reviewer + Codex/Phase-4b
+# both on HEAD). Unset (default) preserves the auto-clear path's behavior,
+# where branch-protection dismiss_stale_reviews is the intended control.
+REQUIRE_APPROVAL_ON_HEAD=0
+if [ "${CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD:-}" = "1" ]; then
+  REQUIRE_APPROVAL_ON_HEAD=1
+fi
+
 # Honor codex.allow_phase_4b_substitute. When true (default), gate (c)
 # also accepts an APPROVED review on the current HEAD from an
 # available_reviewers identity != the PR author as a Codex-equivalent
@@ -743,7 +759,9 @@ REVIEWERS_JSON=$(echo "$REVIEWERS" | jq -R . | jq -s .)
 APPROVING_REVIEWER=$(echo "$REVIEWS_JSON" | jq -r \
   --argjson reviewers "$REVIEWERS_JSON" \
   --arg author "$PR_AUTHOR" \
-  --arg same_agent_reviewer "$SAME_AGENT_REVIEWER" '
+  --arg same_agent_reviewer "$SAME_AGENT_REVIEWER" \
+  --arg sha "$HEAD_SHA" \
+  --arg require_head "$REQUIRE_APPROVAL_ON_HEAD" '
     [ .[]
       | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
       | select(.user.login as $u | $reviewers | index($u))
@@ -752,7 +770,13 @@ APPROVING_REVIEWER=$(echo "$REVIEWS_JSON" | jq -r \
     ]
     | group_by(.user.login)
     | map(max_by(.submitted_at))
-    | map(select(.state == "APPROVED"))
+    # Collapse to each reviewer'\''s LATEST opinionated state FIRST, then require
+    # that latest state to be APPROVED — and, when HEAD-pinned (#435), to be on
+    # the current HEAD. Filtering non-HEAD reviews BEFORE this collapse would
+    # discard a later blocking CHANGES_REQUESTED/DISMISSED on an outdated/pending
+    # commit and let a stale earlier APPROVED still clear gate (b). (Codex P1 on
+    # PR #436.)
+    | map(select(.state == "APPROVED" and ($require_head != "1" or .commit_id == $sha)))
     | first
     | if . == null then empty else .user.login end
 ')
