@@ -989,6 +989,34 @@ if [ "$WRAPPER_KIND" = "reviewer" ] && [ "$REVIEWER_WRAPPER_ALLOWED" -ne 1 ]; th
   exit 2
 fi
 
+# --- byline guard for author-wrapper writes (#438) --------------------
+#
+# gh-as-author.sh verifies the token for whatever login
+# GH_AS_AUTHOR_IDENTITY names — its default is nathanjohnpayne, but a
+# shell where the variable is exported (or inline-prefixed) as a
+# different login makes the wrapper verify THAT login's token and run
+# `gh pr merge`/`edit`/`create` under it. Pin the wrapper's effective
+# author identity to the expected author, exactly as the reviewer
+# branch below pins the reviewer identity. Without this,
+# `GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh --
+# gh pr merge ...` re-opens the wrong-byline merge/edit path the
+# wrapper migration closed (the #359 class).
+if [ "$WRAPPER_KIND" = "author" ]; then
+  EXPECTED_AUTHOR="${GH_PR_GUARD_EXPECTED_AUTHOR:-nathanjohnpayne}"
+  WRAPPER_AUTHOR_IDENTITY="${INLINE_GH_AS_AUTHOR_IDENTITY:-${GH_AS_AUTHOR_IDENTITY:-}}"
+  # Unset means the wrapper will use ITS hard default (nathanjohnpayne)
+  # — compare against that, not against EXPECTED_AUTHOR, so a repo
+  # with a custom GH_PR_GUARD_EXPECTED_AUTHOR fails closed when the
+  # wrapper would actually verify the stock default.
+  WRAPPER_AUTHOR_IDENTITY="${WRAPPER_AUTHOR_IDENTITY:-nathanjohnpayne}"
+  if [ "$WRAPPER_AUTHOR_IDENTITY" != "$EXPECTED_AUTHOR" ]; then
+    echo "BLOCKED: $cmd_label wrapper is configured for author identity '$WRAPPER_AUTHOR_IDENTITY', not expected author '$EXPECTED_AUTHOR'." >&2
+    echo "  gh-as-author.sh verifies whatever login GH_AS_AUTHOR_IDENTITY names; a non-author login here lands the write under the wrong byline (#438)." >&2
+    echo "  Unset GH_AS_AUTHOR_IDENTITY (wrapper default: nathanjohnpayne), or set GH_PR_GUARD_EXPECTED_AUTHOR if this repo's author identity genuinely differs." >&2
+    exit 2
+  fi
+fi
+
 # --- byline guard for pr comment / pr review / issue comment ---
 #
 # These three subcommands share a single policy: reviewer writes must be

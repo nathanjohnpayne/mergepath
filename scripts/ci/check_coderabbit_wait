@@ -4,18 +4,25 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TEST="$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh"
+TESTS=(
+  "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh"
+  "$REPO_ROOT/tests/test_coderabbit_wait_identity_derivation.sh"
+)
 
 if [ ! -x "$REPO_ROOT/scripts/coderabbit-wait.sh" ]; then
   echo "check_coderabbit_wait: ERROR scripts/coderabbit-wait.sh missing or not executable" >&2
   exit 1
 fi
 
-if [ ! -x "$TEST" ]; then
-  echo "check_coderabbit_wait: ERROR $TEST missing or not executable" >&2
-  exit 1
-fi
+for TEST in "${TESTS[@]}"; do
+  if [ ! -x "$TEST" ]; then
+    echo "check_coderabbit_wait: ERROR $TEST missing or not executable" >&2
+    exit 1
+  fi
+done
 
 echo "check_coderabbit_wait: running coderabbit-wait status-probe tests"
-"$TEST"
+"${TESTS[0]}"
+echo "check_coderabbit_wait: running coderabbit-wait identity-derivation tests (#438)"
+"${TESTS[1]}"
 echo "check_coderabbit_wait: PASS"

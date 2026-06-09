@@ -230,6 +230,59 @@ cd "$ORIG_DIR"
 assert_rc_contains "compound direct guarded write blocked" 2 "#348" \
   'gh issue close 7 && gh pr merge --admin 123'
 
+# --- author-wrapper identity pin (#438) -------------------------------
+
+assert_rc_contains "author wrapper inline non-author identity blocked" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "author wrapper inline matching author identity allowed" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=nathanjohnpayne scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "author wrapper inline non-author identity blocked on pr create" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-cursor scripts/gh-as-author.sh -- gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "author wrapper inline non-author identity blocked on codex trigger" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh -- gh pr comment 123 --body "@codex review"'
+
+# Exported (non-inline) GH_AS_AUTHOR_IDENTITY must be caught too — the
+# wrapper reads its environment, so the hook must read the same.
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=nathanpayne-codex run_hook 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+  pass "author wrapper exported non-author identity blocked"
+else
+  fail "author wrapper exported non-author identity blocked: rc=$rc; output: $out"
+fi
+
+# Custom expected author: identity must match the override...
+set +e
+out=$(GH_PR_GUARD_EXPECTED_AUTHOR=custom-owner run_hook 'GH_AS_AUTHOR_IDENTITY=custom-owner scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "author wrapper custom expected author with matching identity allowed"
+else
+  fail "author wrapper custom expected author with matching identity allowed: rc=$rc; output: $out"
+fi
+
+# ...and an UNSET identity fails closed under a custom expected author,
+# because the wrapper would verify its stock default (nathanjohnpayne),
+# not the override.
+set +e
+out=$(GH_PR_GUARD_EXPECTED_AUTHOR=custom-owner run_hook 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+  pass "author wrapper unset identity under custom expected author fails closed"
+else
+  fail "author wrapper unset identity under custom expected author fails closed: rc=$rc; output: $out"
+fi
+
 echo ""
 echo "test_gh_pr_guard: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
