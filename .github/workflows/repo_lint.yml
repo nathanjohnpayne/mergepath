@@ -256,6 +256,12 @@ jobs:
         # added by #256 P2.
         run: ./scripts/ci/check_coderabbit_config_tests
 
+      - name: check_coderabbit_wait
+        # Unit tests for coderabbit-wait.sh's timeout status probe.
+        # Verifies exit-4 status probing stays advisory, surfaces the
+        # reply in JSON, and never counts the reply as clearance.
+        run: ./scripts/ci/check_coderabbit_wait
+
       - name: check_mktemp_portability
         # Regression guard for mergepath#286. Hard-fails on any
         # tracked shell file using the BSD-only `mktemp -t <prefix>`
