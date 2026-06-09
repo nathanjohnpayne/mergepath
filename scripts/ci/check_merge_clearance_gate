@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# check_merge_clearance_gate
+#
+# CI wrapper for scripts/merge-clearance-gate.sh — the HEAD-pinned
+# merge-clearance gate (nathanjohnpayne/mergepath#427 + #428).
+#
+# Two concerns:
+#   1. The script and its workflow must exist on disk and be executable
+#      (consistent with check_codex_p1_gate for the P1 gate).
+#   2. The script's class-dispatch + clearance logic must work against
+#      fixture payloads. Delegated to tests/test_merge_clearance_gate.sh,
+#      which PATH-shims `gh` and stubs the codex-review-check.sh delegate.
+#
+# Invoked by .github/workflows/repo_lint.yml alongside the other
+# scripts/ci/check_* scripts.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+SCRIPT="scripts/merge-clearance-gate.sh"
+WORKFLOW=".github/workflows/merge-clearance-gate.yml"
+TEST="tests/test_merge_clearance_gate.sh"
+
+FAILED=0
+
+# Existence + executability checks.
+for rel in "$SCRIPT" "$TEST"; do
+  if [ ! -f "$rel" ]; then
+    echo "FAIL: Missing required file: $rel"
+    FAILED=1
+    continue
+  fi
+  if [ ! -x "$rel" ]; then
+    echo "FAIL: File is not executable: $rel"
+    echo "      Fix with: chmod +x $rel"
+    FAILED=1
+  fi
+done
+
+# Workflow file exists (not executable; YAML is not a shell script).
+if [ ! -f "$WORKFLOW" ]; then
+  echo "FAIL: Missing required workflow: $WORKFLOW"
+  FAILED=1
+fi
+
+# Workflow trigger shape — same posture as check_codex_p1_gate. GitHub
+# Actions does NOT document pull_request_review_thread as a workflow
+# trigger, so the gate combines event-driven triggers with a scheduled
+# sweep that re-posts a check_run per open PR head SHA (the only backstop
+# for the no-event transitions that produced #428: 👍 reaction, UI label
+# resolve, GITHUB_TOKEN-authored relabel).
+if [ -f "$WORKFLOW" ]; then
+  for trigger in pull_request pull_request_review pull_request_review_comment schedule; do
+    if ! grep -qE "^[[:space:]]*${trigger}:" "$WORKFLOW"; then
+      echo "FAIL: $WORKFLOW missing required trigger: $trigger"
+      echo "      The gate must fire on push, review submission, inline-comment, AND on a periodic schedule (no-event safety net)."
+      FAILED=1
+    fi
+  done
+
+  # Forbid the misleading pull_request_review_thread trigger.
+  if grep -qE "^[[:space:]]*pull_request_review_thread:" "$WORKFLOW"; then
+    echo "FAIL: $WORKFLOW lists pull_request_review_thread as a workflow trigger."
+    echo "      That event is a webhook payload for GitHub Apps, NOT a documented Actions workflow trigger."
+    echo "      Use schedule (cron) for the no-event safety net instead. See codex-p1-gate.yml / PR #257."
+    FAILED=1
+  fi
+
+  # Schedule cron must be present in the on: block.
+  if ! awk '
+    /^on:/ {in_on=1; next}
+    in_on && /^[^[:space:]#]/ {in_on=0}
+    in_on && /^[[:space:]]+schedule:/ {in_sched=1; next}
+    in_sched && /^[[:space:]]+- cron:/ {found=1; exit}
+    in_sched && /^[[:space:]]+[a-z]/ {in_sched=0}
+    END {exit (found ? 0 : 1)}
+  ' "$WORKFLOW"; then
+    echo "FAIL: $WORKFLOW schedule: block missing a 'cron:' entry."
+    echo "      The schedule trigger needs a cron expression (e.g. '*/15 * * * *')."
+    FAILED=1
+  fi
+
+  # The required-check display name (job name) must match the name the
+  # scheduled-sweep posts AND the entry in audit-branch-protection.sh's
+  # CANONICAL_REQUIRED_CHECKS. Branch protection keys on the job name, so
+  # a drift here would silently de-wire the gate.
+  if ! grep -qE '^[[:space:]]+name:[[:space:]]*Merge clearance gate[[:space:]]*$' "$WORKFLOW"; then
+    echo "FAIL: $WORKFLOW must define a job named exactly 'Merge clearance gate'"
+    echo "      (the required-check context; must match the sweep CHECK_NAME and audit-branch-protection.sh)."
+    FAILED=1
+  fi
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_merge_clearance_gate: FAIL (pre-flight)"
+  exit 1
+fi
+
+# Run the fixture-driven test suite.
+if ! bash "$TEST"; then
+  echo "check_merge_clearance_gate: FAIL (test suite)"
+  exit 1
+fi
+
+echo "check_merge_clearance_gate: PASS"
+exit 0

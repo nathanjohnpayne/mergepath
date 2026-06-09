@@ -388,6 +388,57 @@ codex:
   p1_gate:
     enabled: true
 
+  # External-review merge-clearance gate (nathanjohnpayne/mergepath#428).
+  #
+  # When enabled, scripts/merge-clearance-gate.sh runs as the required CI
+  # check `Merge Clearance Gate / Merge clearance gate` and BLOCKS a PR
+  # carrying `needs-external-review` from merging unless clearance holds
+  # ON THE CURRENT HEAD — re-using scripts/codex-review-check.sh's
+  # gate (b) reviewer-APPROVED + gate (c) Codex/Phase-4b predicate (CI
+  # checking skipped, since this gate is itself a required check).
+  #
+  # This closes the #428 escape: nathanpaynedotcom#405 merged on a HEAD
+  # with no APPROVED CLI review and no Codex review because clearance was
+  # enforced only through the removable `needs-external-review` label
+  # (Label Gate), which went stale on a new push. The label and
+  # auto-clear-blocking-labels.yml remain the UX layer; the merge-blocking
+  # truth moves to this HEAD-pinned required check, which re-evaluates on
+  # every push and cannot be satisfied by a stale earlier-HEAD clearance.
+  #
+  # Default everywhere except mergepath: false. Same narrow-start posture
+  # as p1_gate above — enabled here first, then propagated.
+  external_review_gate:
+    enabled: true
+
+# ---------------------------------------------------------------------------
+# Dependabot reviewer-approval merge gate (#427)
+# ---------------------------------------------------------------------------
+# When reviewer_gate.enabled is true, scripts/merge-clearance-gate.sh runs
+# as the required CI check `Merge Clearance Gate / Merge clearance gate`
+# and BLOCKS a Dependabot PR from merging unless a reviewer identity in
+# `available_reviewers` (≠ the PR author) has a latest-state APPROVED
+# review whose commit_id == the current HEAD.
+#
+# This closes the #427 escape: matchline#245 (a dev-dependencies group
+# bump) merged with NO reviewer-identity approval on the merge HEAD. The
+# dependabot-auto-merge.yml approval is transient — GitHub dismisses it on
+# a rebase push (Dependabot rebases grouped PRs often), so by the final
+# HEAD there was no approval on record, and a human merged the
+# approved-but-unmerged PR with nothing failing closed. This gate is the
+# HEAD-pinned, merge-time form of pr-audit.yml Check 2's Dependabot path
+# (which previously caught this only a week later, retroactively).
+#
+# Note: an admin "merge without waiting for requirements" can still bypass
+# a required check. Pair this with branch protection `enforce_admins:
+# true` (or audit admin-overridden merges) to close the human-merge path
+# fully. See #427.
+#
+# Default everywhere except mergepath: false. Same narrow-start posture as
+# codex.p1_gate / codex.external_review_gate.
+dependabot:
+  reviewer_gate:
+    enabled: true
+
 # ---------------------------------------------------------------------------
 # Phase 4b proactive triggers (#158)
 # ---------------------------------------------------------------------------

@@ -1,0 +1,276 @@
+name: Merge Clearance Gate
+
+# Enforces nathanjohnpayne/mergepath#427 + #428: a PR's clearance
+# condition must hold ON THE CURRENT HEAD before it can merge. This is
+# the merge-TIME, fail-closed counterpart to the WEEKLY retroactive
+# pr-audit.yml — the two escapes that motivated it (matchline#245 dev-deps
+# bump with no reviewer approval on HEAD; nathanpaynedotcom#405 external
+# PR merged on a HEAD with no APPROVED CLI review and no Codex review)
+# were caught a week late by the audit because no required status check
+# represented clearance on the merge HEAD.
+#
+# Reports the required check `Merge clearance gate` via
+# scripts/merge-clearance-gate.sh. The script exits 1 (gate fails) when:
+#   - a Dependabot PR has no reviewer-identity APPROVED review on HEAD
+#     (dependabot.reviewer_gate.enabled=true), OR
+#   - a needs-external-review PR is not cleared on HEAD by
+#     codex-review-check.sh (codex.external_review_gate.enabled=true).
+# Otherwise it exits 0 (clean pass) — including for normal under-threshold
+# PRs and when the relevant knob is off — so it is safe as a required
+# check on every PR.
+#
+# Gate ON/OFF is controlled per-class in .github/review-policy.yml
+# (dependabot.reviewer_gate.enabled, codex.external_review_gate.enabled).
+# Mergepath sets both true (canonical source). Downstream consumers
+# default to false until the pattern is shaken out here (#235's
+# "start narrow" recommendation, same posture as codex-p1-gate.yml).
+#
+# Re-runs on every push to a PR AND on review-related events, so a
+# dismissed approval (rebase push), a fresh reviewer approval, or a Codex
+# clearance flips the check without manual intervention.
+#
+# Trigger shape note: identical to codex-p1-gate.yml. GitHub Actions does
+# NOT support pull_request_review_thread as a workflow trigger, so we
+# combine event-driven triggers with a scheduled sweep that re-posts a
+# check_run per open PR head SHA — covering the no-event transitions
+# (a 👍 reaction, a UI label resolve, the bot-relabel-doesn't-retrigger
+# case that produced #428). See scripts/ci/check_merge_clearance_gate.
+
+on:
+  pull_request:
+    # labeled/unlabeled included so adding/removing needs-external-review
+    # re-runs the gate immediately, instead of a stale green check riding
+    # until the scheduled sweep (Codex P2 on PR #429). The script treats a
+    # present label as a force-on signal, so the gate must observe label
+    # transitions.
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  # Catches a Codex P0/P1 posted mid-review without a fresh
+  # review-submission event (external-review path).
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+  # Periodic sweep — the only backstop for transitions that fire no
+  # Actions event (👍 reaction, UI label resolve, GITHUB_TOKEN relabel).
+  # 15-min cadence mirrors codex-p1-gate.yml.
+  schedule:
+    - cron: "*/15 * * * *"
+
+# Least-privilege default for the whole workflow: read-only. `checks: write`
+# is granted ONLY to the scheduled-sweep job below (it POSTs check_runs);
+# the event-driven job produces its check natively and needs no write scope
+# (CodeRabbit ⚠️ on PR #429).
+#
+# `issues: read` is required (Codex P2 on PR #429): the gate reads
+# /issues/{pr}/comments for the propagation-lane marker, and the delegated
+# codex-review-check.sh reads /issues/{pr}/reactions for the Codex 👍
+# signal — both are ISSUES-scoped endpoints. On a restricted-default
+# GITHUB_TOKEN (private repos) an omitted scope defaults to `none`, so
+# without this the required check would fail with an infra error (or miss
+# the propagation exemption) even when clearance exists.
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  merge-clearance-gate:
+    name: Merge clearance gate
+    runs-on: ubuntu-latest
+    # Event-driven path. The scheduled sweep below runs the same gate but
+    # on every open PR via the Checks API; gating this job to non-schedule
+    # events avoids paying for an empty no-op run.
+    if: github.event_name != 'schedule'
+    steps:
+      - name: Checkout repo (default branch — trusted gate scripts)
+        # Pin to the default branch, NOT the PR HEAD. This is a REQUIRED
+        # status check: if it ran scripts/merge-clearance-gate.sh (and the
+        # codex-review-check.sh it delegates to) from the PR's own
+        # checkout, a PR could edit those scripts to `exit 0`, satisfy the
+        # required check, and merge past the gate. "Read-only" does NOT
+        # mean "can't be weaponized" — satisfying a required check IS the
+        # weaponization. Same trusted-checkout posture as codex-p1-gate.yml.
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          # The gate only reads via GH_TOKEN; it never does git-authenticated
+          # writes. Don't leave the checkout token in local git config
+          # (CodeRabbit ⚠️ on PR #429).
+          persist-credentials: false
+
+      - name: Resolve PR number
+        id: pr
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_JSON: ${{ toJSON(github.event) }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request|pull_request_review|pull_request_review_comment)
+              pr=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
+              ;;
+            *)
+              echo "Unsupported event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          if [ -z "$pr" ] || [ "$pr" = "null" ]; then
+            echo "Could not resolve PR number from event payload." >&2
+            exit 1
+          fi
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Run scripts/merge-clearance-gate.sh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The script is the source of truth for what blocks merge.
+          # Exit codes:
+          #   0 = clearance satisfied (or gate not applicable / disabled)
+          #   1 = clearance NOT satisfied on HEAD (gate blocks)
+          #   2 = config / usage / infra error (CI failure, not a gate block)
+          set +e
+          scripts/merge-clearance-gate.sh "$PR_NUMBER" "$REPO"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::merge-clearance-gate.sh exited 2 (config/usage/infra error)"
+            exit 1
+          fi
+          exit "$rc"
+
+  scheduled-sweep:
+    name: Merge clearance scheduled sweep
+    # Periodic re-evaluation across every open PR. Required because no
+    # Actions event fires for some clearance transitions (a Codex 👍
+    # reaction, a UI label resolve, a GITHUB_TOKEN-authored relabel —
+    # the exact #428 case). This sweep walks every open PR, runs the same
+    # gate script, and posts a fresh check_run on each PR's head SHA via
+    # the Checks API. Required-check resolution keys on (head_sha, name),
+    # so the new check supersedes the stale one. Idempotent.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    # Only this job needs checks:write — it POSTs a check_run per open PR.
+    # issues:read for the same /issues/{pr}/comments + /issues/{pr}/reactions
+    # reads the event-driven job needs (Codex P2 on PR #429).
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: write
+    steps:
+      - name: Checkout repo (default branch — trusted scripts)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Find open PRs
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # List ALL open PRs. The gate script itself short-circuits to a
+          # clean pass when both per-class knobs are off, so we don't
+          # filter by label/author here. `--limit 500` mirrors
+          # codex-p1-gate.yml's bound.
+          if ! prs_raw=$(gh pr list --repo "$REPO" --state open \
+            --limit 500 --json number --jq '.[].number'); then
+            echo "::error::Failed to list open PRs on $REPO"
+            exit 1
+          fi
+          if [ -z "$prs_raw" ]; then
+            echo "No open PRs on $REPO; sweep is a no-op."
+            echo "prs=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo 'prs<<EOF'
+            printf '%s\n' "$prs_raw"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Re-evaluate gate per PR and post check_run
+        if: steps.find.outputs.prs != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRS: ${{ steps.find.outputs.prs }}
+          REPO: ${{ github.repository }}
+          # Check name MUST match the event-driven job name above so
+          # branch protection's required-check entry resolves either
+          # source as the same gate. GitHub keys required checks on
+          # (head_sha, name); a fresh check_run with the same name
+          # supersedes the stale one.
+          CHECK_NAME: "Merge clearance gate"
+        run: |
+          set -euo pipefail
+          had_infra_error=0
+          while IFS= read -r PR; do
+            [ -z "$PR" ] && continue
+            echo "::group::Sweep PR #$PR"
+
+            head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
+            if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
+              echo "::warning::Could not resolve head SHA for PR #$PR; skipping"
+              echo "::endgroup::"
+              continue
+            fi
+
+            set +e
+            output=$(scripts/merge-clearance-gate.sh "$PR" "$REPO" 2>&1)
+            rc=$?
+            set -e
+            echo "$output"
+
+            # head_sha is resolved here (the guard above `continue`d
+            # otherwise), so EVERY exit — including infra/config (rc 2 or
+            # any non-0/1) — posts a check_run. On an infra error we post a
+            # FAILURE: the sweep runs on the DEFAULT branch, so if we merely
+            # failed the workflow run and `continue`d, branch protection
+            # would still see the PR head's PREVIOUS green `Merge clearance
+            # gate` and the gate would fail OPEN on exactly the no-event
+            # refresh path this sweep exists to cover (Codex P2 on PR #429).
+            # Fail closed: red check on the PR head + a non-zero workflow run.
+            check_title="Merge clearance gate (scheduled re-evaluation)"
+            case "$rc" in
+              0) conclusion="success" ;;
+              1) conclusion="failure" ;;
+              *)
+                echo "::error::merge-clearance-gate.sh rc=$rc on PR #$PR (config/usage/infra error)"
+                had_infra_error=1
+                conclusion="failure"
+                check_title="Merge clearance gate — infra/config error (rc=$rc)"
+                ;;
+            esac
+
+            summary=$(printf '%s\n' "$output" | head -c 60000)
+
+            # Posting the check_run IS the sweep's whole purpose — it's
+            # what supersedes the stale required-check after a no-event
+            # clearance transition (or pins a fail-closed red on infra
+            # error). A failed POST means the sweep did not do its job;
+            # that's an infra error.
+            if ! gh api -X POST "repos/$REPO/check-runs" \
+              -f name="$CHECK_NAME" \
+              -f head_sha="$head_sha" \
+              -f status="completed" \
+              -f conclusion="$conclusion" \
+              -f "output[title]=$check_title" \
+              -f "output[summary]=$summary" \
+              >/dev/null; then
+              echo "::error::Failed to post check_run for PR #$PR — stale required check not refreshed."
+              had_infra_error=1
+            fi
+            echo "::endgroup::"
+          done <<<"$PRS"
+          if [ "$had_infra_error" -ne 0 ]; then
+            echo "::error::Sweep finished with one or more infra errors"
+            exit 1
+          fi

@@ -276,6 +276,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # Embedded in the lane marker so the signal is HEAD-PINNED — a
+          # consumer (merge-clearance-gate.sh's propagation exemption, #429)
+          # can confirm THIS head was verified, not merely that the PR was
+          # once a faithful mirror at an earlier head.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           # Recognized propagation PR (see REVIEW_POLICY.md § Propagation
           # PR review lane): the check step VERIFIED it is a byte-for-byte
@@ -302,16 +307,27 @@ jobs:
             echo "Removed needs-external-review — PR qualifies for the propagation review lane."
           fi
 
-          # Post the lane note once. The HTML marker keeps re-runs
-          # (synchronize events) from re-commenting.
-          MARKER="<!-- propagation-review-lane -->"
+          # Post a HEAD-PINNED, machine-readable lane marker. The marker
+          # embeds the verified head SHA, so a consumer of this signal
+          # (scripts/merge-clearance-gate.sh's propagation exemption, #429)
+          # exempts a head ONLY if the lane verified THAT head — not merely
+          # that the PR was once a faithful mirror at some earlier head.
+          # Posted only by this workflow (github-actions[bot]); a PR author
+          # cannot forge that identity. One marker per distinct verified
+          # head: grep includes the head SHA, so re-runs on the same head
+          # don't re-comment; a faithful re-push to a NEW head posts a fresh
+          # marker; a DIVERGED push never reaches this step (propagation_lane
+          # is false), so no marker is ever posted for an unverified head.
+          # Marker contract is shared with merge-clearance-gate.sh — keep the
+          # `mergepath-propagation-lane verified-head=<sha>` form in sync.
+          MARKER="<!-- mergepath-propagation-lane verified-head=$HEAD_SHA -->"
           ALREADY=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -F "$MARKER" || true)
           if [ -z "$ALREADY" ]; then
             gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body "$(cat <<EOF
           $MARKER
-          **Propagation PR review lane** — verified faithful mirror ✅
+          **Propagation PR review lane** — verified faithful mirror ✅ (head \`$HEAD_SHA\`)
 
-          This PR was checked out against \`mergepath\` at the source commit named in its branch and **verified byte-for-byte**: every changed file is under a \`.mergepath-sync.yml\` path AND matches \`mergepath@<sha>\`'s content (\`scripts/workflow/verify-propagation-pr.sh\`). Its content was already reviewed in the upstream mergepath PR(s). Per REVIEW_POLICY.md § Propagation PR review lane it is **exempt from the Phase 4 external-review requirement**.
+          This PR was checked out against \`mergepath\` at the source commit named in its branch and **verified byte-for-byte at this head**: every changed file is under a \`.mergepath-sync.yml\` path AND matches \`mergepath@<sha>\`'s content (\`scripts/workflow/verify-propagation-pr.sh\`). Its content was already reviewed in the upstream mergepath PR(s). Per REVIEW_POLICY.md § Propagation PR review lane it is **exempt from the Phase 4 external-review requirement**.
 
           It is still subject to: CI green, CodeRabbit advisory review, and an internal reviewer-identity \`APPROVED\` — the standard under-threshold path. Merge as the author once those clear.
 

@@ -242,6 +242,31 @@ fi
 # actually consulted by this script).
 REQUIRE_CI_GREEN=$(codex_field require_ci_green)
 REQUIRE_CI_GREEN=${REQUIRE_CI_GREEN:-true}
+# Validate strictly (consistent with codex.enabled /
+# allow_phase_4b_substitute above) so a config typo can't silently skip
+# gate (a) by being treated as "not true" (CodeRabbit ⚠️ Major on PR #429).
+case "$REQUIRE_CI_GREEN" in
+  true|false) ;;
+  *)
+    echo "ERROR: codex.require_ci_green must be true|false; got '$REQUIRE_CI_GREEN'" >&2
+    exit 3
+    ;;
+esac
+
+# Per-invocation CI-skip override (#427/#428). scripts/merge-clearance-gate.sh
+# delegates the external-review clearance check to THIS script, but it is
+# itself a REQUIRED status check (`Merge clearance gate`). Having gate (a)
+# wait on the full required-check rollup — which now INCLUDES the
+# merge-clearance gate — would deadlock: the gate can never go green
+# because it would be blocking on itself. This override forces gate (a) to
+# skip for the current invocation ONLY; it does not change config or the
+# auto-clear path's behavior, and CI green is still enforced independently
+# by the other required checks in branch protection. Honored only when set
+# to the literal "1" so a stray empty/other value can't silently weaken CI
+# enforcement on the normal path.
+if [ "${CODEX_REVIEW_CHECK_SKIP_CI:-}" = "1" ]; then
+  REQUIRE_CI_GREEN=false
+fi
 
 # Honor codex.allow_phase_4b_substitute. When true (default), gate (c)
 # also accepts an APPROVED review on the current HEAD from an

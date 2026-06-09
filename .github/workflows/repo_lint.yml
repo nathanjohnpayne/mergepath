@@ -154,6 +154,9 @@ jobs:
       - name: check_codex_p1_gate
         run: ./scripts/ci/check_codex_p1_gate
 
+      - name: check_merge_clearance_gate
+        run: ./scripts/ci/check_merge_clearance_gate
+
       - name: check_resolve_pr_threads
         run: ./scripts/ci/check_resolve_pr_threads
 
