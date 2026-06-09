@@ -241,30 +241,43 @@ fetch_api_array() {  # <endpoint> <label>
     || die 2 "failed to flatten $label pagination output"
 }
 
-# Propagation-lane exemption (#429 Codex round-2 P1). Returns 0 (true) iff a
-# PR comment authored by github-actions[bot] carries the propagation-lane
-# marker that .github/workflows/pr-review-policy.yml posts ONLY after
-# mergepath@<sha>'s verify-propagation-pr.sh byte-confirms a faithful mirror.
-# A PR author cannot post as github-actions[bot], so this is a TRUSTED
-# positive signal that the lane already exempted this PR from external
-# review (REVIEW_POLICY.md § Propagation PR review lane). Without this,
-# deriving applicability from threshold/protected-paths would force verified
-# propagation PRs — which are large by design, touch .github/**, AND carry an
-# `Authoring-Agent` stamp (so codex-review-check.sh's same-agent guard
-# disqualifies their normal internal approval) — into Phase 4/Codex
-# clearance, breaking the documented under-threshold/internal-approval lane.
+# Propagation-lane exemption (#429), HEAD-PINNED. Returns 0 (true) iff a PR
+# comment authored by github-actions[bot] carries the propagation-lane marker
+# scoped to the CURRENT head SHA — i.e. `mergepath-propagation-lane
+# verified-head=<HEAD_SHA>`. .github/workflows/pr-review-policy.yml posts that
+# marker ONLY after mergepath@<sha>'s verify-propagation-pr.sh byte-confirms a
+# faithful mirror AT THAT HEAD, and a PR author cannot post as
+# github-actions[bot] — so it is a TRUSTED, head-scoped signal that the lane
+# already exempted THIS head from external review (REVIEW_POLICY.md §
+# Propagation PR review lane).
 #
-# Per-HEAD safety: the lane re-evaluates on every push. If a propagation PR
-# diverges from its mirror, the lane RE-ADDS needs-external-review, which the
-# label-present branch catches first — so a stale marker cannot exempt a
-# diverged PR outside the same ~20s post-push window pr-review-policy.yml
-# itself races in.
+# Why head-pinned (Codex round-3 P1 + nathanpayne-codex CHANGES_REQUESTED on
+# #429): an unscoped "was-ever-a-mirror" marker is posted once and survives a
+# later divergent push. On the synchronize where this gate finishes before
+# pr-review-policy.yml re-adds needs-external-review, an unscoped check would
+# go GREEN on an unverified large/.github PR. Pinning the exemption to the
+# current head SHA closes that race independently of label timing: a diverged
+# (or merely newer-but-not-yet-verified) head has no matching marker, so the
+# gate does NOT exempt it and falls through to threshold/paths derivation.
+# A DIVERGED push never gets a marker at all (the lane's propagation_lane is
+# false → it posts nothing for that head). A faithful re-push is briefly
+# not-yet-exempt (fail-closed) until the lane posts the new head's marker and
+# the next event / scheduled sweep re-evaluates.
+#
+# Without this exemption, deriving applicability from threshold/protected-paths
+# would force verified propagation PRs — large by design, touching .github/**,
+# AND carrying an `Authoring-Agent` stamp (so codex-review-check.sh's
+# same-agent guard disqualifies their normal internal approval) — into Phase
+# 4/Codex clearance, breaking the documented under-threshold lane.
+#
+# Marker contract is shared with pr-review-policy.yml — keep the
+# `mergepath-propagation-lane verified-head=<sha>` form in sync.
 lane_verified() {
   local comments
   comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null) || return 1
-  echo "$comments" | jq -e '
+  echo "$comments" | jq -e --arg head "$HEAD_SHA" '
     any(.[]; (.user.login == "github-actions[bot]")
-             and ((.body // "") | test("<!-- propagation-review-lane -->")))
+             and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))
   ' >/dev/null 2>&1
 }
 
@@ -370,10 +383,11 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ]; then
     REQUIRES_EXTERNAL=true
     REQUIRES_REASON="needs-external-review label present"
   elif lane_verified; then
-    # Verified propagation PR (trusted github-actions[bot] lane marker, label
-    # absent). The lane already exempted it from external review; defer to it
-    # and do NOT re-derive from threshold/paths (#429 Codex round-2 P1).
-    log "verified propagation lane (trusted marker present, label absent) — exempt from external-review derivation; deferring to pr-review-policy.yml lane"
+    # Verified propagation PR: a trusted github-actions[bot] lane marker
+    # scoped to THIS head SHA is present (label absent). The lane already
+    # byte-verified this exact head and exempted it from external review;
+    # defer to it and do NOT re-derive from threshold/paths (#429).
+    log "verified propagation lane (trusted head-pinned marker for $HEAD_SHA, label absent) — exempt from external-review derivation; deferring to pr-review-policy.yml lane"
   else
     # `|| true` so a missing key (grep no-match → pipeline non-zero under
     # pipefail) does NOT abort the script before the `:-300` fallback runs

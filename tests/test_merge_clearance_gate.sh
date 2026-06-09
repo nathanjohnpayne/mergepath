@@ -582,15 +582,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 17 (#429 Codex round-2 P1): verified propagation PR — over-threshold,
-# NO needs-external-review label, but a github-actions[bot] lane marker
-# comment is present → EXEMPT (not applicable), must NOT delegate.
+# Test 17 (#429): verified propagation PR — over-threshold, NO
+# needs-external-review label, with a github-actions[bot] lane marker scoped
+# to the CURRENT head → EXEMPT (not applicable), must NOT delegate.
 # ---------------------------------------------------------------------------
-echo; echo "--- Test 17: verified propagation lane → exempt"
+echo; echo "--- Test 17: verified propagation lane (head-pinned) → exempt"
 SCRATCH=$(make_scratch false true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
 FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":400,"deletions":50}]')
-FIXTURE_COMMENTS=$(make_comments_fixture '[{"user":{"login":"github-actions[bot]"},"body":"<!-- propagation-review-lane -->\nVerified faithful mirror ✅"}]')
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg h "$HEAD_SHA" '
+  [{user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane verified-head=" + $h + " -->\nverified faithful mirror ✅")}]')")
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
       MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
@@ -599,13 +600,39 @@ OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="
 RC=$?
 set -e
 if [ "$RC" = 0 ] && echo "$OUT" | grep -qi "not applicable"; then
-  pass "verified propagation lane → exempt (exit 0, no delegate)"
+  pass "verified propagation lane (current-head marker) → exempt (exit 0, no delegate)"
 else
   fail "expected rc=0 not-applicable (exempt); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 
 # ---------------------------------------------------------------------------
-# Test 18: SPOOFED lane marker — same marker text but authored by a NON-bot
+# Test 17b (#429 Codex round-3 P1 / nathanpayne-codex CHANGES_REQUESTED): a
+# STALE lane marker — bot-authored but scoped to an OLD head — must NOT exempt
+# a diverged current head. This is the head-pinning regression: an unscoped
+# "was-ever-a-mirror" marker would have false-exempted here. Over-threshold +
+# stale marker → still requires external → delegate blocks.
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 17b: STALE bot marker (old head) + diverged head → NOT exempt"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":400,"deletions":50}]')
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg old "$OLD_SHA" '
+  [{user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane verified-head=" + $old + " -->\nverified faithful mirror ✅")}]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+      CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED"; then
+  pass "stale marker (old head) → NOT exempt → delegate blocks → exit 1 (head-pinned)"
+else
+  fail "expected rc=1 BLOCKED (stale marker ignored); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 18: SPOOFED lane marker — current-head marker but authored by a NON-bot
 # login → must NOT exempt (a PR author can't forge github-actions[bot]).
 # Over-threshold + spoofed marker → still requires external → delegate blocks.
 # ---------------------------------------------------------------------------
@@ -613,7 +640,8 @@ echo; echo "--- Test 18: spoofed (non-bot) lane marker → NOT exempt"
 SCRATCH=$(make_scratch false true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
 FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/big.ts","additions":250,"deletions":120}]')
-FIXTURE_COMMENTS=$(make_comments_fixture '[{"user":{"login":"nathanjohnpayne"},"body":"<!-- propagation-review-lane --> nice try"}]')
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg h "$HEAD_SHA" '
+  [{user:{login:"nathanjohnpayne"}, body:("<!-- mergepath-propagation-lane verified-head=" + $h + " --> nice try")}]')")
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
       MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
