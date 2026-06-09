@@ -78,6 +78,27 @@ jobs:
           fi
           echo "::notice::Approving $PR_URL as $ACTING_AS (PR author: $PR_AUTHOR)"
 
+          # Verify AUTHOR_MERGE_TOKEN is set and resolves to an
+          # author-identity login. Same audit-trail risk as the
+          # reviewer-token mode (#160): an empty AUTHOR_MERGE_TOKEN
+          # would silently fall back to gh's default credential
+          # resolution and record the merge under whatever identity
+          # the workflow's GITHUB_TOKEN or implicit creds resolve to.
+          # Hard-fail instead so consumer repos that haven't added
+          # the secret yet get a clear error rather than a wrong
+          # mergedBy attribution.
+          if [ -z "${AUTHOR_MERGE_TOKEN:-}" ]; then
+            echo "::error::AUTHOR_MERGE_TOKEN is empty. AUTHOR_MERGE_TOKEN secret is not set in this repo."
+            echo "::error::Add an author-identity PAT (nathanjohnpayne) to repo Settings → Secrets and variables → Actions → AUTHOR_MERGE_TOKEN."
+            exit 1
+          fi
+          MERGE_AS=$(GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh api user --jq .login 2>/dev/null || true)
+          if [ -z "$MERGE_AS" ]; then
+            echo "::error::gh api user with AUTHOR_MERGE_TOKEN returned empty — AUTHOR_MERGE_TOKEN may be invalid, expired, or lacks the user scope."
+            exit 1
+          fi
+          echo "::notice::Merge will be performed as $MERGE_AS."
+
           has_human_hold() {
             local labels
             if ! labels=$(gh pr view "$PR_URL" --json labels --jq '.labels[].name'); then
@@ -146,6 +167,48 @@ jobs:
             exit 1
           fi
 
+          # Defensive: the author identity (used for the merge) must
+          # not also be a reviewer identity. If AUTHOR_MERGE_TOKEN
+          # resolved into available_reviewers, we'd be re-using a
+          # reviewer-identity PAT — defeating the whole point of the
+          # split and producing the same mergedBy=reviewer attribution
+          # the split is meant to fix.
+          if printf '%s\n' "$ALLOWED" | grep -Fxq "$MERGE_AS"; then
+            echo "::error::AUTHOR_MERGE_TOKEN resolves to '$MERGE_AS', which IS in $POLICY available_reviewers:"
+            printf '%s\n' "$ALLOWED" | sed 's/^/::error::  - /'
+            echo "::error::AUTHOR_MERGE_TOKEN must be a PAT for the documented author identity (nathanjohnpayne), not a reviewer-identity bot account."
+            exit 1
+          fi
+
+          # Codex P2 (#426): excluding reviewer identities is necessary
+          # but not sufficient. Any OTHER write-collaborator/bot token
+          # that is not a reviewer would pass the check above yet still
+          # record mergedBy as a non-author account — the same policy
+          # violation this split is meant to fix. Positively require the
+          # merge identity to equal author_identity, resolved with the
+          # same awk parser agent-review.yml uses (quote/comment-safe,
+          # nathanjohnpayne fallback). REVIEW_POLICY.md: "Only
+          # nathanjohnpayne merges to the target branch."
+          EXPECTED_AUTHOR=$(awk '
+            /^[^[:space:]]/ && $1 == "author_identity:" {
+              sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+              gsub(/^"/, "", $0)
+              gsub(/^\047/, "", $0)
+              gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+              gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
+              gsub(/[[:space:]]*#.*$/, "", $0)
+              sub(/[[:space:]]+$/, "", $0)
+              print
+              exit
+            }
+          ' "$POLICY")
+          EXPECTED_AUTHOR="${EXPECTED_AUTHOR:-nathanjohnpayne}"
+          if [ "$MERGE_AS" != "$EXPECTED_AUTHOR" ]; then
+            echo "::error::AUTHOR_MERGE_TOKEN resolves to '$MERGE_AS', expected author_identity '$EXPECTED_AUTHOR' (REVIEW_POLICY.md: only the author merges to the target branch)."
+            echo "::error::Replace the secret with a PAT for '$EXPECTED_AUTHOR'."
+            exit 1
+          fi
+
           # Approve. set -e ensures we abort on failure rather than
           # continuing to the merge step with no approval on record.
           gh pr review --approve "$PR_URL"
@@ -191,7 +254,7 @@ jobs:
             exit 0
           fi
           set +e
-          AUTO_STDERR=$(gh pr merge --squash --auto "$PR_URL" 2>&1 1>/dev/null)
+          AUTO_STDERR=$(GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash --auto "$PR_URL" 2>&1 1>/dev/null)
           AUTO_RC=$?
           set -e
           if [ "$AUTO_RC" -eq 0 ]; then
@@ -219,7 +282,7 @@ jobs:
             # approval" gate is satisfied either way.
             if [ "$UPDATE_TYPE" = "version-update:semver-patch" ] || \
                [ "$UPDATE_TYPE" = "version-update:semver-minor" ]; then
-              gh pr merge --squash "$PR_URL"
+              GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash "$PR_URL"
             else
               echo "::notice::update-type='$UPDATE_TYPE' (dependency-group='$DEPENDENCY_GROUP') is not patch/minor and --auto is unavailable; leaving the PR approved-but-unmerged to preserve the CI-green safety case. Configure branch protection/auto-merge or merge manually after CI."
               exit 0
@@ -241,3 +304,13 @@ jobs:
           UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
           DEPENDENCY_GROUP: ${{ steps.metadata.outputs.dependency-group }}
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          # Author-identity PAT (nathanjohnpayne) used for the merge
+          # step only. Reviewer-identity --approve must stay on
+          # REVIEWER_ASSIGNMENT_TOKEN above; the merge itself should
+          # record as the author identity per REVIEW_POLICY.md
+          # ("Only nathanjohnpayne merges to the target branch").
+          # When both tokens were the reviewer's, `mergedBy` came
+          # back as the reviewer on every Dependabot merge — the
+          # audit trail was correct for the approval and wrong for
+          # the merge.
+          AUTHOR_MERGE_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}

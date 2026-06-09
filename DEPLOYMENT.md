@@ -305,8 +305,9 @@ Go to the new repo → Settings → Secrets and variables → Actions → New re
 | Secret name | Value | PAT type |
 |---|---|---|
 | `REVIEWER_ASSIGNMENT_TOKEN` | PAT for a **reviewer identity** (e.g., `nathanpayne-claude`) — NOT `nathanjohnpayne` | Classic with `repo` scope (collaborator account) |
+| `AUTHOR_MERGE_TOKEN` | PAT for the **author identity** (`nathanjohnpayne`) — NOT a reviewer identity | Classic with `repo` scope (author account) |
 
-The `dependabot-auto-merge.yml` workflow uses this secret to approve and merge Dependabot bumps. It MUST be a reviewer-identity PAT (`nathanpayne-claude` / `-cursor` / `-codex`), not `nathanjohnpayne` — GitHub rejects self-approval, and the workflow's preflight guards now hard-fail if the token resolves to the author identity OR to any login not in `.github/review-policy.yml` `available_reviewers`. See nathanjohnpayne/mergepath#179 for the audit-trail rationale.
+The `dependabot-auto-merge.yml` workflow uses `REVIEWER_ASSIGNMENT_TOKEN` to post the reviewer-identity `--approve`. It MUST be a reviewer-identity PAT (`nathanpayne-claude` / `-cursor` / `-codex`), not `nathanjohnpayne` — GitHub rejects self-approval, and the workflow's preflight guards hard-fail if the token resolves to the author identity OR to any login not in `.github/review-policy.yml` `available_reviewers`. The `gh pr merge` itself runs under `AUTHOR_MERGE_TOKEN` (see below) so the merge is recorded under `author_identity`. See nathanjohnpayne/mergepath#179 and #426 for the audit-trail rationale.
 
 Or use the CLI (faster):
 
@@ -315,7 +316,16 @@ Or use the CLI (faster):
 # you choose to use as the CI approver (claude / cursor / codex).
 # The full lookup table is in REVIEW_POLICY.md § PAT lookup table.
 gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo} --body "$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')"   # nathanpayne-claude
+gh secret set AUTHOR_MERGE_TOKEN --repo {owner}/{repo} --body "$(op read 'op://Private/sm5kopwk6t6p3xmu2igesndzhe/token')"   # nathanjohnpayne (author identity)
 ```
+
+`AUTHOR_MERGE_TOKEN` is **required** wherever Dependabot auto-merge is
+enabled: as of nathanjohnpayne/mergepath#426 the workflow uses it for the
+`gh pr merge` step (recording `mergedBy` as `author_identity`) and
+hard-fails if it is empty or resolves to anything other than
+`author_identity`. It is the author-identity counterpart to
+`REVIEWER_ASSIGNMENT_TOKEN`, and the Agent Review Pipeline's auto-merge
+step uses it too.
 
 **`REVIEWER_ASSIGNMENT_TOKEN` is the only reviewer-identity PAT
 stored as a repo CI secret.** It exists specifically because the
@@ -512,11 +522,15 @@ read from 1Password per-session by the authoring agent for the in-session
 identity switch, so rotation does not require updating any repo secrets.
 
 The `REVIEWER_ASSIGNMENT_TOKEN` repo secret (a **reviewer-identity**
-PAT used by the Dependabot auto-merge + Agent Review Pipeline
+PAT used by the Dependabot auto-merge approval + Agent Review Pipeline
 workflows; see "Add `REVIEWER_ASSIGNMENT_TOKEN` to repo secrets" above)
 follows a similar process but also needs a `gh secret set
 REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo}` call on every repo
-after rotating the 1Password item.
+after rotating the 1Password item. The `AUTHOR_MERGE_TOKEN` repo secret
+(an **author-identity** PAT used by the Dependabot auto-merge `gh pr
+merge` step + the Agent Review Pipeline auto-merge) follows the same
+process with a `gh secret set AUTHOR_MERGE_TOKEN --repo {owner}/{repo}`
+call after rotating its 1Password item.
 
 ---
 
