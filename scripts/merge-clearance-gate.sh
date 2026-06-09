@@ -104,6 +104,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# --- tool preflight ---------------------------------------------------------
+# Fail with the documented config/usage code (2) if a hard dependency is
+# missing, rather than dying mid-run with an opaque 127 that the workflow
+# would map to a generic CI error (CodeRabbit ⚠️ on PR #429).
+for _tool in gh jq awk; do
+  if ! command -v "$_tool" >/dev/null 2>&1; then
+    echo "ERROR: required tool '$_tool' not found on PATH" >&2
+    exit 2
+  fi
+done
+
 # --- argument parsing -------------------------------------------------------
 
 if [ $# -gt 2 ]; then
@@ -327,7 +338,10 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ]; then
     REQUIRES_EXTERNAL=true
     REQUIRES_REASON="needs-external-review label present"
   else
-    THRESHOLD=$(grep -E '^external_review_threshold:' "$CONFIG" 2>/dev/null | awk '{print $2}')
+    # `|| true` so a missing key (grep no-match → pipeline non-zero under
+    # pipefail) does NOT abort the script before the `:-300` fallback runs
+    # (CodeRabbit ⚠️ on PR #429).
+    THRESHOLD=$(grep -E '^external_review_threshold:' "$CONFIG" 2>/dev/null | awk '{print $2}' || true)
     THRESHOLD=${THRESHOLD:-300}
     if ! [[ "$THRESHOLD" =~ ^[0-9]+$ ]]; then THRESHOLD=300; fi
 
@@ -351,26 +365,51 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ]; then
       # uses (no drift). Resolved relative to this script so they work from a
       # trusted default-branch checkout; they take the config path + read
       # candidate filenames on stdin (no filesystem access to PR content).
-      PARSE="$SCRIPT_DIR/workflow/parse_policy_list.sh"
-      MATCH="$SCRIPT_DIR/workflow/match_protected_paths.sh"
-      if [ -f "$PARSE" ] && [ -f "$MATCH" ]; then
-        PATHS=$(bash "$PARSE" "$CONFIG" external_review_paths 2>/dev/null || true)
-        if [ -n "$PATHS" ]; then
+      # MERGE_CLEARANCE_WORKFLOW_DIR overrides the helper dir (tests only).
+      #
+      # Fail CLOSED on any failure to RUN the matcher (missing helper, parse
+      # error, match error): a protected-path PR must never slip through as
+      # "threshold-only" just because the matcher couldn't run. The helpers
+      # ship with this gate via .mergepath-sync.yml, so their absence means a
+      # broken install — require external review rather than skip it.
+      # (CodeRabbit ⚠️ Major on PR #429.) Note: a SUCCESSFUL parse that
+      # yields no entries (external_review_paths absent/empty) is NOT a
+      # failure — it legitimately means "no protected paths," so the gate
+      # does not fail closed in that case.
+      WF_DIR="${MERGE_CLEARANCE_WORKFLOW_DIR:-$SCRIPT_DIR/workflow}"
+      PARSE="$WF_DIR/parse_policy_list.sh"
+      MATCH="$WF_DIR/match_protected_paths.sh"
+      if [ ! -f "$PARSE" ] || [ ! -f "$MATCH" ]; then
+        REQUIRES_EXTERNAL=true
+        REQUIRES_REASON="protected-paths check unavailable (parser/matcher missing under $WF_DIR) — failing closed"
+      else
+        set +e
+        PATHS=$(bash "$PARSE" "$CONFIG" external_review_paths)
+        parse_rc=$?
+        set -e
+        if [ "$parse_rc" -ne 0 ]; then
+          REQUIRES_EXTERNAL=true
+          REQUIRES_REASON="protected-paths parse failed (rc=$parse_rc) — failing closed"
+        elif [ -n "$PATHS" ]; then
           PATTERNS=()
           while IFS= read -r pline; do
             [ -n "$pline" ] && PATTERNS+=("$pline")
           done <<<"$PATHS"
           if [ "${#PATTERNS[@]}" -gt 0 ]; then
             CHANGED_FILES=$(echo "$FILES_JSON" | jq -r '.[].filename')
-            MATCHED=$(printf '%s\n' "$CHANGED_FILES" | bash "$MATCH" "${PATTERNS[@]}" 2>/dev/null || true)
-            if [ -n "$MATCHED" ]; then
+            set +e
+            MATCHED=$(printf '%s\n' "$CHANGED_FILES" | bash "$MATCH" "${PATTERNS[@]}")
+            match_rc=$?
+            set -e
+            if [ "$match_rc" -ne 0 ]; then
+              REQUIRES_EXTERNAL=true
+              REQUIRES_REASON="protected-paths match failed (rc=$match_rc) — failing closed"
+            elif [ -n "$MATCHED" ]; then
               REQUIRES_EXTERNAL=true
               REQUIRES_REASON="protected paths modified: $(printf '%s' "$MATCHED" | tr '\n' ' ')"
             fi
           fi
         fi
-      else
-        log "WARNING: $PARSE / $MATCH not found — protected-paths derivation skipped (threshold-only)."
       fi
     fi
   fi

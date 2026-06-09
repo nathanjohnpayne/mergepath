@@ -86,9 +86,18 @@ if [ "$1" = "api" ]; then
       cat "${FIXTURE_PR:-/dev/null}"
       exit 0
       ;;
+    *)
+      # Fail (don't silently succeed) on an unhandled endpoint so a future
+      # gate change that calls a new endpoint surfaces as a test failure
+      # rather than a false green (CodeRabbit ⚠️ on PR #429).
+      echo "STUB gh: unhandled api endpoint: $endpoint" >&2
+      exit 1
+      ;;
   esac
 fi
-exit 0
+# Any non-`gh api` invocation is unexpected for this gate.
+echo "STUB gh: unhandled invocation: $*" >&2
+exit 1
 STUB
 chmod +x "$STUB_DIR/gh"
 
@@ -503,6 +512,62 @@ if [ "$RC" = 0 ] && echo "$OUT" | grep -q "PASS"; then
   pass "env-only PR_NUMBER + REPO → exit 0"
 else
   fail "expected rc=0 PASS; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 15 (CodeRabbit ⚠️ #429): external_review_threshold ABSENT from config
+# → defaults to 300 without crashing under set -euo pipefail. A small PR
+# stays "not applicable" (exit 0); the grep|awk no-match must not abort.
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 15: threshold key absent → default 300, no crash"
+SCRATCH=$(mktemp -d "$WORKDIR/scratch.XXXXXX"); mkdir -p "$SCRATCH/.github"
+cat >"$SCRATCH/.github/review-policy.yml" <<EOF
+external_review_paths:
+  - ".github/**"
+available_reviewers:
+  - nathanpayne-claude
+codex:
+  external_review_gate:
+    enabled: true
+dependabot:
+  reviewer_gate:
+    enabled: false
+EOF
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"README.md","additions":10,"deletions":2}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -qi "not applicable"; then
+  pass "threshold absent → default 300 applied, small PR not applicable (no crash)"
+else
+  fail "expected rc=0 not-applicable; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 16 (CodeRabbit ⚠️ Major #429): protected-paths matcher UNAVAILABLE →
+# the gate must FAIL CLOSED (require external review), not skip to
+# threshold-only. Point the helper dir at an empty location; an
+# under-threshold PR must then still delegate (→ delegate blocks → exit 1).
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 16: missing protected-paths helpers → fail closed"
+SCRATCH=$(make_scratch false true)
+EMPTY_WF=$(mktemp -d "$WORKDIR/emptywf.XXXXXX")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"README.md","additions":5,"deletions":1}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" \
+      MERGE_CLEARANCE_WORKFLOW_DIR="$EMPTY_WF" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+      CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED" && echo "$OUT" | grep -qi "failing closed"; then
+  pass "missing matcher → fail closed → external arm applies → delegate blocks → exit 1"
+else
+  fail "expected rc=1 BLOCKED via fail-closed; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 
 # ---------------------------------------------------------------------------

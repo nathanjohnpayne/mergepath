@@ -242,6 +242,16 @@ fi
 # actually consulted by this script).
 REQUIRE_CI_GREEN=$(codex_field require_ci_green)
 REQUIRE_CI_GREEN=${REQUIRE_CI_GREEN:-true}
+# Validate strictly (consistent with codex.enabled /
+# allow_phase_4b_substitute above) so a config typo can't silently skip
+# gate (a) by being treated as "not true" (CodeRabbit ⚠️ Major on PR #429).
+case "$REQUIRE_CI_GREEN" in
+  true|false) ;;
+  *)
+    echo "ERROR: codex.require_ci_green must be true|false; got '$REQUIRE_CI_GREEN'" >&2
+    exit 3
+    ;;
+esac
 
 # Per-invocation CI-skip override (#427/#428). scripts/merge-clearance-gate.sh
 # delegates the external-review clearance check to THIS script, but it is
