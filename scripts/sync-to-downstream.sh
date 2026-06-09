@@ -455,6 +455,15 @@ print_audit_baseline() {
   branch=$(git -C "$consumer_root" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
 
   if path_is_in_cache "$consumer_root"; then
+    # The refresh resets the working tree to origin/HEAD but never
+    # renames the local branch, so after a remote default-branch
+    # rename the local branch label would lie about what the content
+    # tracks. Label the baseline with origin/HEAD's actual target.
+    local origin_default
+    origin_default=$(git -C "$consumer_root" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || echo "")
+    if [ -n "$origin_default" ]; then
+      branch="${origin_default#origin/}"
+    fi
     if [ "${AUDIT_NO_REFRESH:-0}" = "1" ]; then
       echo "  baseline: $branch@$sha (cache clone, NOT refreshed — --no-refresh; may lag origin)"
     else
@@ -540,6 +549,16 @@ refresh_cached_clone() {
   # directory is the script's cache, not the user's worktree.
   if ! git -C "$cache_path" fetch --depth=1 --quiet origin >&2; then
     err "git fetch failed for cached clone $cache_path"
+    return 3
+  fi
+  # `git fetch` does NOT update refs/remotes/origin/HEAD when the
+  # remote's default branch changes (e.g. a main→trunk rename), so a
+  # long-lived cache clone would keep resetting to the STALE old
+  # default while the baseline header claims a refreshed default-branch
+  # comparison (Codex P2 on PR #443). `remote set-head --auto` queries
+  # the remote and re-points origin/HEAD at the current default.
+  if ! git -C "$cache_path" remote set-head origin --auto >/dev/null 2>&1; then
+    err "git remote set-head origin --auto failed for $cache_path"
     return 3
   fi
   if ! git -C "$cache_path" reset --hard --quiet origin/HEAD >&2; then

@@ -336,6 +336,30 @@ set -e
 [[ "$ult_sync_exit" -eq 2 ]] \
   || fail "--use-local-tree in sync mode should exit 2; got $ult_sync_exit"
 
+# Default-branch rename: `git fetch` never moves refs/remotes/origin/HEAD,
+# so the refresh must re-resolve the remote default (`remote set-head
+# --auto`) or a renamed default branch silently audits the stale old one
+# (Codex P2 on PR #443). Rename the origin's default to `trunk` with
+# drifted content; the cached clone (cloned when default was `main`)
+# must follow the rename and report the drift.
+( cd "$live_origin" \
+    && git branch -m main trunk \
+    && git symbolic-ref HEAD refs/heads/trunk \
+    && echo "MUTATED-ON-TRUNK" >scripts/keep-in-sync.sh \
+    && git add -A \
+    && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "drift on renamed default" )
+set +e
+rename_output=$(MERGEPATH_ROOT_OVERRIDE="$MP" \
+  MERGEPATH_SIBLINGS_DIR="$stale_siblings" \
+  MERGEPATH_SYNC_CACHE="$live_cache" \
+  "$SCRIPT" --audit --repos clean-consumer 2>&1)
+rename_exit=$?
+set -e
+[[ "$rename_exit" -eq 1 ]] \
+  || fail "default audit should follow a renamed default branch and report its drift (exit 1); got exit $rename_exit, output: $rename_output"
+echo "$rename_output" | grep -q "baseline: trunk@" \
+  || fail "default audit baseline should show the renamed default branch 'trunk'; got: $rename_output"
+
 # ---------------------------------------------------------------------------
 # Symlink guard on cache refresh (cursor CHANGES_REQUESTED on PR #215).
 # If MERGEPATH_SYNC_CACHE/<consumer> resolves outside the cache dir
