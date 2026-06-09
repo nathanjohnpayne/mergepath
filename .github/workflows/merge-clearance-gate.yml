@@ -250,7 +250,15 @@ jobs:
                 ;;
             esac
 
-            summary=$(printf '%s\n' "$output" | head -c 60000)
+            # Truncate to stay under GitHub's 65535-char summary limit.
+            # Bash slice, NOT `printf | head -c`: under `set -euo pipefail`
+            # a >60KB output makes head close the pipe early, printf takes
+            # SIGPIPE (141), pipefail propagates it, and `summary=$(...)`
+            # aborts the sweep BEFORE the check_run POST — fail-open on the
+            # very no-event path this sweep exists to close (Codex P2 on the
+            # b10671e propagation wave). Slicing is pipefail-safe + char-based
+            # (correct for the char-limit).
+            summary="${output:0:60000}"
 
             # Posting the check_run IS the sweep's whole purpose — it's
             # what supersedes the stale required-check after a no-event
