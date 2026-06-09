@@ -767,13 +767,16 @@ APPROVING_REVIEWER=$(echo "$REVIEWS_JSON" | jq -r \
       | select(.user.login as $u | $reviewers | index($u))
       | select(.user.login != $author)
       | select($same_agent_reviewer == "" or .user.login != $same_agent_reviewer)
-      # HEAD-pin (#435): when required, only reviews ON the current HEAD count,
-      # so a stale earlier-head APPROVED cannot ride a later push to clearance.
-      | select($require_head != "1" or .commit_id == $sha)
     ]
     | group_by(.user.login)
     | map(max_by(.submitted_at))
-    | map(select(.state == "APPROVED"))
+    # Collapse to each reviewer'\''s LATEST opinionated state FIRST, then require
+    # that latest state to be APPROVED — and, when HEAD-pinned (#435), to be on
+    # the current HEAD. Filtering non-HEAD reviews BEFORE this collapse would
+    # discard a later blocking CHANGES_REQUESTED/DISMISSED on an outdated/pending
+    # commit and let a stale earlier APPROVED still clear gate (b). (Codex P1 on
+    # PR #436.)
+    | map(select(.state == "APPROVED" and ($require_head != "1" or .commit_id == $sha)))
     | first
     | if . == null then empty else .user.login end
 ')
