@@ -512,6 +512,24 @@ test_non_author_token_is_not_bridged() {
   fi
 }
 
+test_non_bridge_path_passes_configured_identity() {
+  local dir rc identity
+  dir=$(make_case "custom-author-no-bridge" 0 0)
+  # Custom author_identity, NO bridging (token does not verify) — the
+  # wrapper must still be told the configured login (Codex P2 r5).
+  printf 'author_identity: custom-owner\n' >>"$dir/.github/review-policy.yml"
+  rc=$(run_case "$dir" absent 0 reviewer-pat-456)
+  identity=$(head -1 "$dir/state/author-identity-env" 2>/dev/null || printf '')
+
+  if [ "$(trigger_count "$dir")" -lt 1 ]; then
+    fail "non-bridge identity: no trigger was posted; stderr=$(cat "$dir/err.log")"
+  elif [ "$identity" != "custom-owner" ]; then
+    fail "non-bridge identity: wrapper saw GH_AS_AUTHOR_IDENTITY='$identity', expected 'custom-owner'; stderr=$(cat "$dir/err.log")"
+  else
+    pass "non-bridged invocation passes the configured author_identity (rc=$rc)"
+  fi
+}
+
 test_missing_identity_checker_skips_bridge() {
   local dir rc pat
   dir=$(make_case "no-checker-no-bridge" 0 0)
@@ -539,6 +557,7 @@ test_ack_wait_window_is_bounded
 test_inline_author_pat_bridged_into_wrapper
 test_bridge_passes_configured_author_identity
 test_non_author_token_is_not_bridged
+test_non_bridge_path_passes_configured_identity
 test_missing_identity_checker_skips_bridge
 
 echo

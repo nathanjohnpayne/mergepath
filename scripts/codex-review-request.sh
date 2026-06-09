@@ -547,16 +547,17 @@ post_codex_trigger() {
   # Capture stdout+stderr so a failure surfaces the real gh error
   # (404 / 403 / 422) rather than a bare "failed to post". The comment
   # URL gh prints on success is still extractable downstream.
+  # Pass the configured author identity on BOTH invocation branches:
+  # the wrapper's hard default (nathanjohnpayne) would reject a valid
+  # custom-author token in repos that override author_identity —
+  # bridged-token case (Codex P2 on PR #442 r2) AND warm-preflight /
+  # keyring case (Codex P2 on PR #442 r5). review-policy.yml is the
+  # source of truth this script already reads, so it wins.
   if [ -n "$BRIDGE_AUTHOR_PAT" ]; then
-    # Pass the configured author identity alongside the bridged token:
-    # the token was verified against $AUTHOR_IDENTITY, so the wrapper
-    # must verify the same login — its hard default (nathanjohnpayne)
-    # would reject a valid custom-author token in repos that override
-    # author_identity (Codex P2 on PR #442).
     POST_OUTPUT=$(OP_PREFLIGHT_AUTHOR_PAT="$BRIDGE_AUTHOR_PAT" GH_AS_AUTHOR_IDENTITY="$AUTHOR_IDENTITY" "$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
       || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
   else
-    POST_OUTPUT=$("$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
+    POST_OUTPUT=$(GH_AS_AUTHOR_IDENTITY="$AUTHOR_IDENTITY" "$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
       || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
   fi
   TRIGGER_POSTED=true
