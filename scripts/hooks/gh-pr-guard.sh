@@ -737,6 +737,13 @@ for i in "${!TOKENS[@]}"; do
         INLINE_CODEX_CLEARED=""
         INLINE_BREAK_GLASS_ADMIN=""
         INLINE_BREAK_GLASS_MERGE_STATE=""
+        # Identity assignments scope to their segment the same way —
+        # `GH_AS_AUTHOR_IDENTITY=x echo ok ; gh-as-author.sh ...` runs
+        # the wrapper with its DEFAULT identity, so a stale captured
+        # value must not leak into the byline guards below (Codex P2
+        # on PR #442: false block after unrelated prefixed commands).
+        INLINE_GH_AS_AUTHOR_IDENTITY=""
+        INLINE_GH_AS_REVIEWER_IDENTITY=""
       fi
       SEGMENT_HAS_COMMAND=0
       continue

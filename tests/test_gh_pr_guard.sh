@@ -247,6 +247,17 @@ assert_rc_contains "author wrapper inline non-author identity blocked on pr crea
 assert_rc_contains "author wrapper inline non-author identity blocked on codex trigger" 2 "author identity" \
   'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh -- gh pr comment 123 --body "@codex review"'
 
+# A stale inline assignment scoped to an EARLIER command segment must
+# not leak into the author byline guard — the shell would not pass it
+# to the wrapper (Codex P2 on PR #442).
+assert_rc_contains "stale inline author identity from earlier segment does not block" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex echo ok ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# Standalone assignment (no command in its segment) still counts — it
+# persists in the shell, mirroring the CODEX_CLEARED standalone rule.
+assert_rc_contains "standalone inline author identity assignment still blocks" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
 # Exported (non-inline) GH_AS_AUTHOR_IDENTITY must be caught too — the
 # wrapper reads its environment, so the hook must read the same.
 set +e

@@ -58,9 +58,11 @@ fi
 count=$((count + 1))
 printf '%s\n' "$count" >"$state_dir/trigger-count"
 
-# Record the author-PAT env the wrapper sees, so the #438 inline-token
-# bridging test can assert what (if anything) was bridged in.
+# Record the author-PAT and author-identity env the wrapper sees, so
+# the #438 inline-token bridging tests can assert what (if anything)
+# was bridged in.
 printf '%s\n' "${OP_PREFLIGHT_AUTHOR_PAT:-}" >>"$state_dir/author-pat-env"
+printf '%s\n' "${GH_AS_AUTHOR_IDENTITY:-}" >>"$state_dir/author-identity-env"
 
 comment_id=$((1000 + count))
 printf '%s\n' "$comment_id" >>"$state_dir/trigger-comments"
@@ -464,6 +466,34 @@ test_inline_author_pat_bridged_into_wrapper() {
   fi
 }
 
+test_bridge_passes_configured_author_identity() {
+  local dir rc pat identity
+  dir=$(make_case "custom-author-bridge" 0 0)
+  # Custom author_identity repo (Codex P2 on PR #442): the wrapper must
+  # be told to verify the configured login, not its stock default.
+  printf 'author_identity: custom-owner\n' >>"$dir/.github/review-policy.yml"
+  cat >"$dir/scripts/identity-check.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = "--expect-token-identity" ] || exit 2
+[ "${2:-}" = "custom-owner" ] || exit 1
+[ "${GH_TOKEN:-}" = "author-pat-123" ] || exit 1
+exit 0
+EOF
+  chmod +x "$dir/scripts/identity-check.sh"
+  rc=$(run_case "$dir" absent 0 author-pat-123)
+  pat=$(bridged_pat "$dir")
+  identity=$(head -1 "$dir/state/author-identity-env" 2>/dev/null || printf '')
+
+  if [ "$pat" != "author-pat-123" ]; then
+    fail "custom-author bridge: wrapper saw OP_PREFLIGHT_AUTHOR_PAT='$pat', expected the verified inline token; stderr=$(cat "$dir/err.log")"
+  elif [ "$identity" != "custom-owner" ]; then
+    fail "custom-author bridge: wrapper saw GH_AS_AUTHOR_IDENTITY='$identity', expected 'custom-owner'; stderr=$(cat "$dir/err.log")"
+  else
+    pass "bridge passes the configured author_identity to the wrapper (rc=$rc)"
+  fi
+}
+
 test_non_author_token_is_not_bridged() {
   local dir rc pat
   dir=$(make_case "reviewer-pat-not-bridged" 0 0)
@@ -507,6 +537,7 @@ test_retry_resets_review_deadline
 test_retry_preserves_original_trigger_response
 test_ack_wait_window_is_bounded
 test_inline_author_pat_bridged_into_wrapper
+test_bridge_passes_configured_author_identity
 test_non_author_token_is_not_bridged
 test_missing_identity_checker_skips_bridge
 

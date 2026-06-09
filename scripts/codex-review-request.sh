@@ -548,7 +548,12 @@ post_codex_trigger() {
   # (404 / 403 / 422) rather than a bare "failed to post". The comment
   # URL gh prints on success is still extractable downstream.
   if [ -n "$BRIDGE_AUTHOR_PAT" ]; then
-    POST_OUTPUT=$(OP_PREFLIGHT_AUTHOR_PAT="$BRIDGE_AUTHOR_PAT" "$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
+    # Pass the configured author identity alongside the bridged token:
+    # the token was verified against $AUTHOR_IDENTITY, so the wrapper
+    # must verify the same login — its hard default (nathanjohnpayne)
+    # would reject a valid custom-author token in repos that override
+    # author_identity (Codex P2 on PR #442).
+    POST_OUTPUT=$(OP_PREFLIGHT_AUTHOR_PAT="$BRIDGE_AUTHOR_PAT" GH_AS_AUTHOR_IDENTITY="$AUTHOR_IDENTITY" "$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
       || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
   else
     POST_OUTPUT=$("$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
