@@ -59,16 +59,25 @@
 #     pr-audit.yml Check 2's Dependabot path — a transient approval
 #     dismissed on a rebase push re-blocks on the new HEAD.
 #
-#   External-review PR (carries `needs-external-review`):
+#   External-review PR:
 #     Gated by `codex.external_review_gate.enabled` (default false; true
-#     in mergepath). When enabled, delegates to codex-review-check.sh —
-#     the SAME clearance predicate (gate (b) reviewer APPROVED + gate (c)
-#     Codex / Phase-4b-substitute on HEAD) the auto-clear workflow uses —
-#     so the merge-time gate and the label-clear logic cannot drift. CI
-#     checking (gate (a)) is skipped for this invocation because this
-#     gate is ITSELF a required check; waiting on the full required-check
-#     rollup (which includes this gate) would deadlock. CI green is
-#     enforced independently by the other required checks.
+#     in mergepath). Applicability is DERIVED from the PR's intrinsic
+#     properties — over `external_review_threshold` lines, OR a changed
+#     file matching `external_review_paths`, OR the `needs-external-review`
+#     label present — NOT from the label alone. (Trusting the label would
+#     reopen the #428 stale-label race: after a push, this gate can run
+#     before pr-review-policy.yml re-adds the label, and a label-only check
+#     would false-clear on an uncleared HEAD. #429 Codex P1.) When it
+#     applies, delegates to codex-review-check.sh — the SAME clearance
+#     predicate (gate (b) reviewer APPROVED + gate (c) Codex /
+#     Phase-4b-substitute on HEAD) the auto-clear workflow uses — so the
+#     merge-time gate and the label-clear logic cannot drift. CI checking
+#     (gate (a)) is skipped for this invocation because this gate is ITSELF
+#     a required check; waiting on the full required-check rollup (which
+#     includes this gate) would deadlock. CI green is enforced
+#     independently by the other required checks. Propagation PRs are not
+#     special-cased: they clear via codex-review-check.sh's
+#     internal-reviewer-APPROVED-on-HEAD (Phase-4b-substitute) path.
 #
 #   Any other PR (under-threshold, non-Dependabot, or relevant knob off):
 #     CLEAN PASS (exit 0). The gate is a no-op so it can be a required
@@ -291,35 +300,107 @@ if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
   block "Dependabot PR has no reviewer-identity APPROVED review on the merge HEAD $HEAD_SHA. The dependabot-auto-merge approval is missing or was dismissed on a push; a fresh reviewer-identity approval on this HEAD is required (mergepath#427)."
 fi
 
-if [ "$HAS_EXTERNAL_LABEL" = "true" ]; then
-  if [ "$EXTERNAL_GATE_ENABLED" != "true" ]; then
-    clear_pass "needs-external-review present but codex.external_review_gate.enabled=false (gate disabled)"
+# --- external-review applicability (DERIVED, not label-trusting) -----------
+#
+# #429 Codex P1: keying the external arm on the CURRENT label state would
+# reintroduce the exact stale-label race this gate exists to close. After a
+# push, this gate can run on `synchronize` BEFORE pr-review-policy.yml
+# re-adds `needs-external-review` for the new HEAD; a label-only check would
+# then fall through to "not applicable" and go GREEN on an uncleared HEAD
+# (the #428 escape, reopened). So derive applicability from the PR's
+# INTRINSIC properties — the same line-threshold + protected-paths
+# computation pr-review-policy.yml's External Review Check uses — and treat
+# the label, when present, as an additional force-on signal (a human may
+# add it to a small PR). Config (threshold + paths) is read from the
+# TRUSTED default-branch review-policy.yml; the changed-file set comes from
+# the API (this gate runs on a default-branch checkout with no local PR
+# diff). Propagation PRs are NOT special-cased: they reach clearance via
+# codex-review-check.sh's internal-reviewer-APPROVED-on-HEAD (Phase-4b
+# substitute) path, consistent with the lane's standard "internal
+# reviewer-identity APPROVED required" rule.
+
+if [ "$EXTERNAL_GATE_ENABLED" = "true" ]; then
+  REQUIRES_EXTERNAL=false
+  REQUIRES_REASON=""
+
+  if [ "$HAS_EXTERNAL_LABEL" = "true" ]; then
+    REQUIRES_EXTERNAL=true
+    REQUIRES_REASON="needs-external-review label present"
+  else
+    THRESHOLD=$(grep -E '^external_review_threshold:' "$CONFIG" 2>/dev/null | awk '{print $2}')
+    THRESHOLD=${THRESHOLD:-300}
+    if ! [[ "$THRESHOLD" =~ ^[0-9]+$ ]]; then THRESHOLD=300; fi
+
+    FILES_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/files" "PR files")
+
+    # Sum additions+deletions, excluding the same generated/lockfile
+    # patterns pr-review-policy.yml's git-diff pathspec excludes.
+    LINES_CHANGED=$(echo "$FILES_JSON" | jq '
+      [ .[]
+        | select((.filename
+            | test("(\\.lock$)|(lock\\.json$)|(\\.min\\.js$)|(\\.min\\.css$)|(\\.generated\\.)|(\\.g\\.dart$)|(\\.freezed\\.dart$)")) | not)
+        | ((.additions // 0) + (.deletions // 0)) ]
+      | add // 0')
+    LINES_CHANGED=${LINES_CHANGED:-0}
+
+    if [ "$LINES_CHANGED" -ge "$THRESHOLD" ]; then
+      REQUIRES_EXTERNAL=true
+      REQUIRES_REASON="$LINES_CHANGED lines changed >= threshold $THRESHOLD"
+    else
+      # Protected-paths match, reusing the SAME helpers pr-review-policy.yml
+      # uses (no drift). Resolved relative to this script so they work from a
+      # trusted default-branch checkout; they take the config path + read
+      # candidate filenames on stdin (no filesystem access to PR content).
+      PARSE="$SCRIPT_DIR/workflow/parse_policy_list.sh"
+      MATCH="$SCRIPT_DIR/workflow/match_protected_paths.sh"
+      if [ -f "$PARSE" ] && [ -f "$MATCH" ]; then
+        PATHS=$(bash "$PARSE" "$CONFIG" external_review_paths 2>/dev/null || true)
+        if [ -n "$PATHS" ]; then
+          PATTERNS=()
+          while IFS= read -r pline; do
+            [ -n "$pline" ] && PATTERNS+=("$pline")
+          done <<<"$PATHS"
+          if [ "${#PATTERNS[@]}" -gt 0 ]; then
+            CHANGED_FILES=$(echo "$FILES_JSON" | jq -r '.[].filename')
+            MATCHED=$(printf '%s\n' "$CHANGED_FILES" | bash "$MATCH" "${PATTERNS[@]}" 2>/dev/null || true)
+            if [ -n "$MATCHED" ]; then
+              REQUIRES_EXTERNAL=true
+              REQUIRES_REASON="protected paths modified: $(printf '%s' "$MATCHED" | tr '\n' ' ')"
+            fi
+          fi
+        fi
+      else
+        log "WARNING: $PARSE / $MATCH not found — protected-paths derivation skipped (threshold-only)."
+      fi
+    fi
   fi
 
-  CODEX_CHECK_BIN="${MERGE_CLEARANCE_CODEX_CHECK_BIN:-$SCRIPT_DIR/codex-review-check.sh}"
-  if [ ! -f "$CODEX_CHECK_BIN" ]; then
-    die 2 "codex-review-check.sh not found at $CODEX_CHECK_BIN (required for the external-review path)"
+  if [ "$REQUIRES_EXTERNAL" = "true" ]; then
+    log "external review applies ($REQUIRES_REASON); delegating to codex-review-check.sh (CI gate skipped — this gate is itself a required check)"
+
+    CODEX_CHECK_BIN="${MERGE_CLEARANCE_CODEX_CHECK_BIN:-$SCRIPT_DIR/codex-review-check.sh}"
+    if [ ! -f "$CODEX_CHECK_BIN" ]; then
+      die 2 "codex-review-check.sh not found at $CODEX_CHECK_BIN (required for the external-review path)"
+    fi
+
+    # Delegate to the shared predicate. CODEX_REVIEW_CHECK_SKIP_CI=1 skips
+    # gate (a) for THIS invocation only (avoids the required-check
+    # self-deadlock); gate (b) reviewer-APPROVED + gate (c) Codex/Phase-4b
+    # on HEAD still run. codex-review-check.sh exits: 0 clear, 1 gate fail,
+    # 3 infra. Map 3 → 2 (config/infra error).
+    set +e
+    CODEX_REVIEW_CHECK_SKIP_CI=1 bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO"
+    crc=$?
+    set -e
+    case "$crc" in
+      0) clear_pass "external review cleared on HEAD $HEAD_SHA ($REQUIRES_REASON; reviewer APPROVED + Codex/Phase-4b on HEAD)" ;;
+      1) block "external review is NOT cleared on the merge HEAD $HEAD_SHA ($REQUIRES_REASON; no APPROVED CLI review and/or no Codex clearance on this HEAD). See codex-review-check.sh stderr above (mergepath#428)." ;;
+      *) die 2 "codex-review-check.sh returned rc=$crc (config/infrastructure error) on PR #$PR_NUMBER" ;;
+    esac
   fi
-
-  log "External-review path: delegating to codex-review-check.sh (CI gate skipped — this gate is itself a required check)"
-
-  # Delegate to the shared predicate. CODEX_REVIEW_CHECK_SKIP_CI=1 skips
-  # gate (a) for THIS invocation only (avoids the required-check
-  # self-deadlock); gate (b) reviewer-APPROVED + gate (c) Codex/Phase-4b
-  # on HEAD still run. codex-review-check.sh exits: 0 clear, 1 gate fail,
-  # 3 infra. Map 3 → 2 (config/infra error).
-  set +e
-  CODEX_REVIEW_CHECK_SKIP_CI=1 bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO"
-  crc=$?
-  set -e
-  case "$crc" in
-    0) clear_pass "codex-review-check.sh cleared external-review on HEAD $HEAD_SHA (reviewer APPROVED + Codex/Phase-4b on HEAD)" ;;
-    1) block "codex-review-check.sh reports external review is NOT cleared on the merge HEAD $HEAD_SHA (no APPROVED CLI review and/or no Codex clearance on this HEAD). See its stderr above (mergepath#428)." ;;
-    *) die 2 "codex-review-check.sh returned rc=$crc (config/infrastructure error) on PR #$PR_NUMBER" ;;
-  esac
 fi
 
-# Not a Dependabot PR and not external-review-labeled → gate not
-# applicable. Clean pass so the required check is green on normal
-# under-threshold PRs.
-clear_pass "not a Dependabot or needs-external-review PR — merge-clearance gate not applicable"
+# Not a Dependabot PR, and external review does not apply (under threshold,
+# no protected paths, no label — or the external gate is disabled). Clean
+# pass so the required check is green on normal under-threshold PRs.
+clear_pass "merge-clearance gate not applicable (under threshold, no protected paths, no external-review label; or external gate disabled)"

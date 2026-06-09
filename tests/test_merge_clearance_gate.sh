@@ -78,6 +78,10 @@ if [ "$1" = "api" ]; then
       cat "${FIXTURE_REVIEWS:-/dev/null}"
       exit 0
       ;;
+    repos/*/pulls/*/files)
+      cat "${FIXTURE_FILES:-/dev/null}"
+      exit 0
+      ;;
     repos/*/pulls/*)
       cat "${FIXTURE_PR:-/dev/null}"
       exit 0
@@ -106,6 +110,11 @@ make_scratch() {
   dir=$(mktemp -d "$WORKDIR/scratch.XXXXXX")
   mkdir -p "$dir/.github"
   cat >"$dir/.github/review-policy.yml" <<EOF
+external_review_threshold: 300
+external_review_paths:
+  - ".github/**"
+  - "src/auth/**"
+
 available_reviewers:
   - nathanpayne-claude
   - nathanpayne-cursor
@@ -121,6 +130,13 @@ dependabot:
     enabled: $dependabot_enabled
 EOF
   echo "$dir"
+}
+
+make_files_fixture() {  # <json_array_literal>   e.g. '[{"filename":"x","additions":5,"deletions":0}]'
+  local content=$1
+  local file="$WORKDIR/files.$$.$RANDOM.json"
+  echo "$content" >"$file"
+  echo "$file"
 }
 
 make_pr_fixture() {  # <sha> <author> <labels_json_array>
@@ -356,12 +372,79 @@ fi
 echo; echo "--- Test 11: normal under-threshold PR → not applicable"
 SCRATCH=$(make_scratch true true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"README.md","additions":3,"deletions":1}]')
 set +e
-OUT=$(FIXTURE_PR="$FIXTURE_PR" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
 set -e
 if [ "$RC" = 0 ] && echo "$OUT" | grep -qi "not applicable"; then
   pass "normal PR → exit 0 (not applicable)"
+else
+  fail "expected rc=0 not-applicable; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 11b (#429 Codex P1): NO needs-external-review label, but the PR is
+# intrinsically OVER THRESHOLD. The gate must DERIVE applicability (not
+# trust the label) and delegate — so a delegate that blocks → exit 1. This
+# is the stale-label race regression net: a label-only check would have
+# fallen through to "not applicable" green here.
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 11b: no label + over-threshold → derives applicability (#429)"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/big.ts","additions":250,"deletions":120}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+      CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED" && echo "$OUT" | grep -qi "lines changed"; then
+  pass "no label + over-threshold → external arm derived → delegate blocks → exit 1"
+else
+  fail "expected rc=1 BLOCKED via derived threshold; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 11c: NO label, UNDER threshold, but touches a protected path
+# (.github/**) → external arm applies via paths → delegate blocks → exit 1.
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 11c: no label + protected path → derives applicability"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":4,"deletions":0}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+      CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED" && echo "$OUT" | grep -qi "protected paths"; then
+  pass "no label + protected path → external arm derived → delegate blocks → exit 1"
+else
+  fail "expected rc=1 BLOCKED via protected paths; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 11d: external gate DISABLED + over-threshold no-label → exit 0
+# (knob off short-circuits the whole arm; never reaches the delegate).
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 11d: external gate disabled + over-threshold → not applicable"
+SCRATCH=$(make_scratch false false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/big.ts","additions":250,"deletions":120}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+      CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -qi "not applicable"; then
+  pass "external gate disabled → over-threshold no-label still exit 0"
 else
   fail "expected rc=0 not-applicable; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi

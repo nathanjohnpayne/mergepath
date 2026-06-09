@@ -276,7 +276,9 @@ paths:
   - path: scripts/merge-clearance-gate.sh
     # HEAD-pinned merge-clearance gate (#427/#428). The external-review
     # path delegates to scripts/codex-review-check.sh (with CI checking
-    # skipped via CODEX_REVIEW_CHECK_SKIP_CI=1); without that script in
+    # skipped via CODEX_REVIEW_CHECK_SKIP_CI=1) and DERIVES applicability
+    # from the threshold/protected-paths via scripts/workflow/
+    # {parse_policy_list,match_protected_paths}.sh (#429); without those in
     # the consumer the gate fails-closed on `command not found` for every
     # external-review PR. Same coupling class as codex-p1-gate.yml +
     # codex-p1-gate.sh.
@@ -284,6 +286,7 @@ paths:
     consumers: all
     requires:
       - "scripts/codex-review-check.sh"
+      - "scripts/workflow/"
   - path: scripts/daily-feedback-rollup.sh
     # Cron workhorse invoked by .github/workflows/daily-feedback-rollup.yml.
     # Sources scripts/lib/daily-feedback-rollup-helpers.sh. The
