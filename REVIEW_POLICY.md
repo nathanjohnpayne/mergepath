@@ -342,7 +342,7 @@ If any `op` command fails mid-session (rare — only if 1Password locks or the 1
 
 After internal review passes (Phase 2), CodeRabbit provides an independent automated review:
 
-1. **Wait for CodeRabbit.** CodeRabbit automatically posts a review when the PR is opened or updated. Prefer `scripts/coderabbit-wait.sh <PR#>` over an ad-hoc poll loop — the script anchors its "cleared" signal on the current HEAD committer date, so it will not treat a stale review from a prior HEAD as current; it also handles CodeRabbit's rate-limit state, which the platform does NOT auto-retry (see nathanjohnpayne/mergepath#138). On exit code `0` CodeRabbit has cleared with no high-severity markers; on `2` it has findings to address; on `4` the `coderabbit.max_wait_seconds` grace window elapsed (the agent may log a warning and proceed since CodeRabbit is advisory); on `5` the rate-limit retry budget was exhausted (alert the human rather than proceed). If CodeRabbit has not posted after the grace window, ask the human whether to continue waiting or skip.
+1. **Wait for CodeRabbit.** CodeRabbit automatically posts a review when the PR is opened or updated. Prefer `scripts/coderabbit-wait.sh <PR#>` over an ad-hoc poll loop — the script anchors its "cleared" signal on the current HEAD committer date, so it will not treat a stale review from a prior HEAD as current; it also handles CodeRabbit's rate-limit state, which the platform does NOT auto-retry (see nathanjohnpayne/mergepath#138). On exit code `0` CodeRabbit has cleared with no high-severity markers; on `2` it has findings to address; on `4` the `coderabbit.max_wait_seconds` grace window elapsed (the agent may log a warning and proceed since CodeRabbit is advisory); on `5` the rate-limit retry budget was exhausted (alert the human rather than proceed). If exit `4` occurs and `coderabbit.status_probe_enabled` is true, the helper has posted `@coderabbitai, how is the review going?`, waited the bounded `coderabbit.status_probe_wait_seconds` window, and surfaced CodeRabbit's narrative reply in the output JSON's `status_probe` field. That reply is narration only; it is never counted as a review or clearance signal.
 2. **Read both API endpoints.** CodeRabbit posts two types of comments that must both be checked:
    - **PR-level summary:** `gh api repos/{owner}/{repo}/issues/{pr_number}/comments` — contains the high-level walkthrough and summary.
    - **Inline review comments on the diff:** `gh api repos/{owner}/{repo}/pulls/{pr_number}/comments` — contains line-by-line findings anchored to specific code.
@@ -833,6 +833,8 @@ coderabbit:
   enabled: false
   bot_login: "coderabbitai[bot]"
   max_wait_seconds: 300                    # grace window for scripts/coderabbit-wait.sh
+  status_probe_enabled: true               # ask CodeRabbit for narrative status before exit-4 timeout
+  status_probe_wait_seconds: 60            # bounded extra wait for the status-probe reply
   max_rate_limit_retries: 2                # retries after CodeRabbit posts "Rate limit exceeded"
   wallclock_freshness_window_seconds: 1800 # HEAD_ANCHOR floor; closes cherry-pick false-clear
 

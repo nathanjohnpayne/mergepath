@@ -551,7 +551,7 @@ jobs:
               exit 1
               ;;
             4)
-              echo "::warning::CodeRabbit grace window elapsed without a review. CodeRabbit is advisory — proceeding to merge."
+              echo "::warning::CodeRabbit grace window elapsed without a review. CodeRabbit is advisory — proceeding to merge. Check coderabbit-wait.sh JSON above for status_probe details, if present."
               ;;
             5)
               echo "::error::CodeRabbit rate-limit retry budget exhausted. Blocking auto-merge; human must re-trigger or merge manually."
