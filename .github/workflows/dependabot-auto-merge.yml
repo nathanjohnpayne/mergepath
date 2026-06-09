@@ -180,6 +180,35 @@ jobs:
             exit 1
           fi
 
+          # Codex P2 (#426): excluding reviewer identities is necessary
+          # but not sufficient. Any OTHER write-collaborator/bot token
+          # that is not a reviewer would pass the check above yet still
+          # record mergedBy as a non-author account — the same policy
+          # violation this split is meant to fix. Positively require the
+          # merge identity to equal author_identity, resolved with the
+          # same awk parser agent-review.yml uses (quote/comment-safe,
+          # nathanjohnpayne fallback). REVIEW_POLICY.md: "Only
+          # nathanjohnpayne merges to the target branch."
+          EXPECTED_AUTHOR=$(awk '
+            /^[^[:space:]]/ && $1 == "author_identity:" {
+              sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+              gsub(/^"/, "", $0)
+              gsub(/^\047/, "", $0)
+              gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+              gsub(/\047[[:space:]]*(#.*)?$/, "", $0)
+              gsub(/[[:space:]]*#.*$/, "", $0)
+              sub(/[[:space:]]+$/, "", $0)
+              print
+              exit
+            }
+          ' "$POLICY")
+          EXPECTED_AUTHOR="${EXPECTED_AUTHOR:-nathanjohnpayne}"
+          if [ "$MERGE_AS" != "$EXPECTED_AUTHOR" ]; then
+            echo "::error::AUTHOR_MERGE_TOKEN resolves to '$MERGE_AS', expected author_identity '$EXPECTED_AUTHOR' (REVIEW_POLICY.md: only the author merges to the target branch)."
+            echo "::error::Replace the secret with a PAT for '$EXPECTED_AUTHOR'."
+            exit 1
+          fi
+
           # Approve. set -e ensures we abort on failure rather than
           # continuing to the merge step with no approval on record.
           gh pr review --approve "$PR_URL"
