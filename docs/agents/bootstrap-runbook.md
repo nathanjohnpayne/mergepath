@@ -144,11 +144,17 @@ Implementation: `scripts/bootstrap/github-infra.sh`.
 5. Prompt for and provision optional LLM secrets (`ANTHROPIC_API_KEY`,
    `OPENAI_API_KEY`) with skip option.
 
-The wizard does not provision `AUTHOR_MERGE_TOKEN` by default. Without
-that author-owned Actions secret, non-Dependabot auto-merge stays
-disabled and PRs are merged manually as `nathanjohnpayne`; if a repo
-opts into automatic PR merge, the workflow verifies the token resolves
-to the configured `author_identity` before calling `gh pr merge`.
+The wizard does not provision `AUTHOR_MERGE_TOKEN` by default, but
+`dependabot-auto-merge.yml` **requires it** as of
+nathanjohnpayne/mergepath#426: the Dependabot auto-merge workflow uses
+`AUTHOR_MERGE_TOKEN` for the `gh pr merge` step (so the merge is recorded
+under `author_identity`) and hard-fails if it is unset or resolves to
+anything other than `author_identity`. Provision it on any repo where
+Dependabot auto-merge is enabled. The same secret independently gates
+non-Dependabot auto-merge, which otherwise stays disabled with PRs merged
+manually as `nathanjohnpayne`. In both cases the workflow verifies the
+token resolves to the configured `author_identity` before calling
+`gh pr merge`.
 
 For runtime application secrets in newly bootstrapped repos, do not add
 Secure Note / `notesPlain` bootstrap entries. The shared model is: use
@@ -405,9 +411,11 @@ And on GitHub:
 - 11 canonical labels.
 - Reviewer-identity collaborators invited.
 - `REVIEWER_ASSIGNMENT_TOKEN` repo secret set.
-- `AUTHOR_MERGE_TOKEN` intentionally unset by default; automatic
-  non-Dependabot PR merge remains disabled until a human provisions an
-  author-owned token.
+- `AUTHOR_MERGE_TOKEN` unset by default (the wizard does not provision
+  it). Required wherever Dependabot auto-merge is enabled (#426) —
+  `dependabot-auto-merge.yml` hard-fails without it — and also gates
+  non-Dependabot auto-merge, which stays disabled until a human
+  provisions the author-owned token.
 - (When Firebase is enabled) per-project deployer SA keys minted +
   workflows wired.
 - Project v2 board (#N) with Status single-select field configured.

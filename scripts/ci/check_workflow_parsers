@@ -630,6 +630,54 @@ else
   echo "  FAIL: Dependabot auto-merge must check human-hold before queued work, --auto, and fallback squash (got $hold_recheck_count checks)" >&2
 fi
 
+echo
+echo "dependabot-auto-merge.yml author-token equality regression (#426)"
+
+# Codex P2 on #426: the merge must run under an author-identity token AND
+# that identity must be positively verified to equal author_identity.
+# Excluding reviewer identities is necessary but not sufficient — any
+# other non-reviewer write-collaborator token would otherwise merge and
+# record a non-author mergedBy. Mirrors the agent-review.yml contract
+# above for the Dependabot path.
+if grep -Fq "secrets.AUTHOR_MERGE_TOKEN" "$dependabot_workflow"; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge references AUTHOR_MERGE_TOKEN"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must use an author-owned AUTHOR_MERGE_TOKEN for the merge step" >&2
+fi
+
+if workflow_guard_block_contains_exit \
+  "$dependabot_workflow" \
+  'if [ -z "${AUTHOR_MERGE_TOKEN:-}" ]; then' \
+  'AUTHOR_MERGE_TOKEN is empty'; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge exits when AUTHOR_MERGE_TOKEN is empty"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must fail closed when AUTHOR_MERGE_TOKEN is empty" >&2
+fi
+
+if workflow_guard_block_contains_exit \
+  "$dependabot_workflow" \
+  'if [ "$MERGE_AS" != "$EXPECTED_AUTHOR" ]; then' \
+  'expected author_identity'; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge verifies the merge identity equals author_identity"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must verify MERGE_AS equals author_identity before merging" >&2
+fi
+
+merge_token_count=$(grep -Fc 'GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge' "$dependabot_workflow" || true)
+if [ "$merge_token_count" -ge 2 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge runs both merge paths under AUTHOR_MERGE_TOKEN"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Dependabot auto-merge must run --auto and fallback squash under AUTHOR_MERGE_TOKEN (got $merge_token_count)" >&2
+fi
+
 echo "Workflow js-yaml install tests"
 for workflow in .github/workflows/agent-review.yml .github/workflows/pr-audit.yml; do
   install_count=$(grep -Ec 'run: npm install .*js-yaml' "$workflow" || true)
