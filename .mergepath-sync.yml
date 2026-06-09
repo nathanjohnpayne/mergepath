@@ -242,6 +242,24 @@ paths:
   - path: scripts/lib/gh-retry-helpers.sh
     type: canonical
     consumers: all
+  # Sourced by scripts/gh-as-author.sh + scripts/gh-as-reviewer.sh (and the
+  # other write-path helpers) to resolve a verified token for an identity —
+  # prefers the OP_PREFLIGHT_*_PAT cache, falls back to `gh auth token
+  # --user`. Added by #415/#416 but never propagated; without it every
+  # consumer's gh-as-author/reviewer wrapper aborts at `source ... : No such
+  # file` and check_gh_as_author fails. Surfaced by the b10671e propagation
+  # wave on matchline#269. Same #264 closure class.
+  - path: scripts/lib/gh-token-resolver.sh
+    type: canonical
+    consumers: all
+  # Sourced by scripts/workflow/verify-propagation-pr.sh (propagated kit) and
+  # the sync tooling to read consumer facts from the manifest. Travels with
+  # verify-propagation-pr.sh so a consumer running check_verify_propagation_pr
+  # doesn't abort at `source ... : No such file`. Same #264 closure class as
+  # gh-token-resolver.sh above; both gaps from recent (#415/#416) refactors.
+  - path: scripts/lib/manifest-fact-helpers.sh
+    type: canonical
+    consumers: all
   - path: scripts/coderabbit-wait.sh
     type: canonical
     consumers: all
@@ -315,9 +333,15 @@ paths:
   - path: scripts/gh-as-author.sh
     type: canonical
     consumers: all
+    # Sources scripts/lib/gh-token-resolver.sh at startup; without it the
+    # wrapper aborts under `set -euo pipefail`. Closure-tracked (#264).
+    requires:
+      - "scripts/lib/gh-token-resolver.sh"
   - path: scripts/gh-as-reviewer.sh
     type: canonical
     consumers: all
+    requires:
+      - "scripts/lib/gh-token-resolver.sh"
   # Pre-action identity check (#284) — the assertion helper that every
   # WRITE-path helper script calls at the top to fail-close on
   # active-account drift. Travels with the helper scripts that depend
