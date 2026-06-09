@@ -223,13 +223,15 @@ run_filter() {
   #   $1 = jq filter (gate-b form or gate-c form)
   #   $2 = author login
   #   $3 = same_agent_reviewer login (may be empty)
-  #   $4 = sha (only used by gate-c form; harmless for gate-b)
+  #   $4 = sha (gate-c form, and gate-b HEAD-pin)
   #   $5 = reviews_json
+  #   $6 = require_head ("1" to HEAD-pin gate-b branch 1; default "0")
   echo "$5" | jq -r \
     --argjson reviewers "$REVIEWERS_JSON" \
     --arg author "$2" \
     --arg same_agent_reviewer "$3" \
     --arg sha "$4" \
+    --arg require_head "${6:-0}" \
     "$1"
 }
 
@@ -242,7 +244,7 @@ GATE_B_FILTER='
   ]
   | group_by(.user.login)
   | map(max_by(.submitted_at))
-  | map(select(.state == "APPROVED"))
+  | map(select(.state == "APPROVED" and ($require_head != "1" or .commit_id == $sha)))
   | first
   | if . == null then empty else .user.login end
 '
@@ -364,6 +366,66 @@ if [ -z "$got" ]; then
 else
   fail=$((fail + 1))
   echo "  FAIL: gate (b) used stale APPROVED instead of latest CHANGES_REQUESTED — got '$got'" >&2
+fi
+
+# Case F (#435): cross-agent APPROVED on a STALE commit (not HEAD).
+#   require_head=1 (merge-clearance-gate delegation) → gate (b) rejects it,
+#   so a stale approval can't ride a later push to clearance.
+#   require_head=0 (default / auto-clear path) → accepted, preserving the
+#   existing non-HEAD-pinned behavior.
+REVIEWS_F='[
+  {"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"OLDsha999","submitted_at":"2026-05-15T10:00:00Z"}
+]'
+
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_F" 1)
+if [ -z "$got" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) HEAD-pin rejects stale-commit APPROVED when require_head=1 (#435)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) HEAD-pin accepted stale-commit APPROVED — got '$got'" >&2
+fi
+
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_F" 0)
+if [ "$got" = "nathanpayne-codex" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) default (require_head=0) still accepts stale-commit APPROVED (no regression)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) default path changed behavior — got '$got'" >&2
+fi
+
+# Case G (#435): cross-agent APPROVED ON the current HEAD with require_head=1
+#   → accepted. Confirms HEAD-pin only blocks stale approvals, not fresh ones.
+REVIEWS_G='[
+  {"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-05-15T10:00:00Z"}
+]'
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_G" 1)
+if [ "$got" = "nathanpayne-codex" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) HEAD-pin accepts APPROVED on current HEAD when require_head=1 (#435)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) HEAD-pin rejected fresh on-HEAD APPROVED — got '$got'" >&2
+fi
+
+# Case H (#436 Codex P1): reviewer APPROVED on HEAD, then later
+# CHANGES_REQUESTED on a stale/pending non-HEAD commit. Their LATEST
+# opinionated state is CHANGES_REQUESTED, so gate (b) must REJECT — even with
+# require_head=1. Filtering non-HEAD reviews BEFORE the latest-state collapse
+# (the original buggy fix) would discard the blocking CHANGES_REQUESTED and
+# wrongly clear via the stale on-HEAD APPROVED.
+REVIEWS_H='[
+  {"user":{"login":"nathanpayne-codex"},"state":"APPROVED","commit_id":"abc123","submitted_at":"2026-05-15T10:00:00Z"},
+  {"user":{"login":"nathanpayne-codex"},"state":"CHANGES_REQUESTED","commit_id":"OLDsha999","submitted_at":"2026-05-15T12:00:00Z"}
+]'
+got=$(run_filter "$GATE_B_FILTER" "nathanjohnpayne" "nathanpayne-claude" "$HEAD_SHA" "$REVIEWS_H" 1)
+if [ -z "$got" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: gate (b) HEAD-pin honors a LATER non-HEAD CHANGES_REQUESTED over a stale on-HEAD APPROVED (#436)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: gate (b) discarded the later CHANGES_REQUESTED and cleared via stale APPROVED — got '$got'" >&2
 fi
 
 echo

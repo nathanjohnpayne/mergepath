@@ -475,11 +475,14 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ]; then
 
     # Delegate to the shared predicate. CODEX_REVIEW_CHECK_SKIP_CI=1 skips
     # gate (a) for THIS invocation only (avoids the required-check
-    # self-deadlock); gate (b) reviewer-APPROVED + gate (c) Codex/Phase-4b
-    # on HEAD still run. codex-review-check.sh exits: 0 clear, 1 gate fail,
-    # 3 infra. Map 3 → 2 (config/infra error).
+    # self-deadlock). CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 HEAD-pins
+    # gate (b) so a stale earlier-head reviewer APPROVED can't ride a later
+    # push to clearance (#435) — making this REQUIRED check fully HEAD-pinned
+    # (reviewer + Codex/Phase-4b both on HEAD). codex-review-check.sh exits:
+    # 0 clear, 1 gate fail, 3 infra. Map 3 → 2 (config/infra error).
     set +e
-    CODEX_REVIEW_CHECK_SKIP_CI=1 bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO"
+    CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+      bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO"
     crc=$?
     set -e
     case "$crc" in
