@@ -38,7 +38,12 @@ name: Merge Clearance Gate
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, edited]
+    # labeled/unlabeled included so adding/removing needs-external-review
+    # re-runs the gate immediately, instead of a stale green check riding
+    # until the scheduled sweep (Codex P2 on PR #429). The script treats a
+    # present label as a force-on signal, so the gate must observe label
+    # transitions.
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
   pull_request_review:
     types: [submitted, edited, dismissed]
   # Catches a Codex P0/P1 posted mid-review without a fresh

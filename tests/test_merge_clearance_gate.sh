@@ -82,6 +82,10 @@ if [ "$1" = "api" ]; then
       cat "${FIXTURE_FILES:-/dev/null}"
       exit 0
       ;;
+    repos/*/issues/*/comments)
+      cat "${FIXTURE_COMMENTS:-/dev/null}"
+      exit 0
+      ;;
     repos/*/pulls/*)
       cat "${FIXTURE_PR:-/dev/null}"
       exit 0
@@ -144,6 +148,13 @@ EOF
 make_files_fixture() {  # <json_array_literal>   e.g. '[{"filename":"x","additions":5,"deletions":0}]'
   local content=$1
   local file="$WORKDIR/files.$$.$RANDOM.json"
+  echo "$content" >"$file"
+  echo "$file"
+}
+
+make_comments_fixture() {  # <json_array_literal>  issue comments
+  local content=$1
+  local file="$WORKDIR/comments.$$.$RANDOM.json"
   echo "$content" >"$file"
   echo "$file"
 }
@@ -568,6 +579,52 @@ if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED" && echo "$OUT" | grep -qi "f
   pass "missing matcher → fail closed → external arm applies → delegate blocks → exit 1"
 else
   fail "expected rc=1 BLOCKED via fail-closed; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 17 (#429 Codex round-2 P1): verified propagation PR — over-threshold,
+# NO needs-external-review label, but a github-actions[bot] lane marker
+# comment is present → EXEMPT (not applicable), must NOT delegate.
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 17: verified propagation lane → exempt"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":400,"deletions":50}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[{"user":{"login":"github-actions[bot]"},"body":"<!-- propagation-review-lane -->\nVerified faithful mirror ✅"}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+      CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -qi "not applicable"; then
+  pass "verified propagation lane → exempt (exit 0, no delegate)"
+else
+  fail "expected rc=0 not-applicable (exempt); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 18: SPOOFED lane marker — same marker text but authored by a NON-bot
+# login → must NOT exempt (a PR author can't forge github-actions[bot]).
+# Over-threshold + spoofed marker → still requires external → delegate blocks.
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 18: spoofed (non-bot) lane marker → NOT exempt"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/big.ts","additions":250,"deletions":120}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[{"user":{"login":"nathanjohnpayne"},"body":"<!-- propagation-review-lane --> nice try"}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+      CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "BLOCKED"; then
+  pass "spoofed non-bot marker → NOT exempt → delegate blocks → exit 1"
+else
+  fail "expected rc=1 BLOCKED (spoof ignored); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 
 # ---------------------------------------------------------------------------
