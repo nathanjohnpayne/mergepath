@@ -60,9 +60,18 @@ on:
 # is granted ONLY to the scheduled-sweep job below (it POSTs check_runs);
 # the event-driven job produces its check natively and needs no write scope
 # (CodeRabbit ⚠️ on PR #429).
+#
+# `issues: read` is required (Codex P2 on PR #429): the gate reads
+# /issues/{pr}/comments for the propagation-lane marker, and the delegated
+# codex-review-check.sh reads /issues/{pr}/reactions for the Codex 👍
+# signal — both are ISSUES-scoped endpoints. On a restricted-default
+# GITHUB_TOKEN (private repos) an omitted scope defaults to `none`, so
+# without this the required check would fail with an infra error (or miss
+# the propagation exemption) even when clearance exists.
 permissions:
   contents: read
   pull-requests: read
+  issues: read
 
 jobs:
   merge-clearance-gate:
@@ -146,9 +155,12 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     # Only this job needs checks:write — it POSTs a check_run per open PR.
+    # issues:read for the same /issues/{pr}/comments + /issues/{pr}/reactions
+    # reads the event-driven job needs (Codex P2 on PR #429).
     permissions:
       contents: read
       pull-requests: read
+      issues: read
       checks: write
     steps:
       - name: Checkout repo (default branch — trusted scripts)
