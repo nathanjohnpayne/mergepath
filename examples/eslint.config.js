@@ -185,8 +185,18 @@ export default [
   // Both demotions were hand-added by every TS consumer during the
   // Phase D fanout (#250); folding into the template removes the
   // per-consumer churn.
+  //
+  // `.astro` is in the glob because astro frontmatter (the `---` fence)
+  // is TypeScript, linted by @typescript-eslint via the astro parser —
+  // without it the `^_` convention silently fails on astro consumers
+  // (the rule still fires from the recommended preset, just without
+  // these ignore patterns). Kept in this typescript-gated block, NOT a
+  // separate astro-gated one, so these `@typescript-eslint/*` rule IDs
+  // only render where the plugin is imported — cf. the #327 rule-
+  // without-plugin break. A TS consumer with no `.astro` files matches
+  // none, so the added extension is inert for them.
   {
-    files: ["**/*.{ts,tsx}"],
+    files: ["**/*.{ts,tsx,astro}"],
     rules: {
       "@typescript-eslint/no-unused-vars": ["error", {
         argsIgnorePattern: "^_",
