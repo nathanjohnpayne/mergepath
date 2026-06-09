@@ -253,10 +253,27 @@ assert_rc_contains "author wrapper inline non-author identity blocked on codex t
 assert_rc_contains "stale inline author identity from earlier segment does not block" 0 "" \
   'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex echo ok ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 
-# Standalone assignment (no command in its segment) still counts — it
-# persists in the shell, mirroring the CODEX_CLEARED standalone rule.
-assert_rc_contains "standalone inline author identity assignment still blocks" 2 "author identity" \
+# A standalone assignment (no command in its segment) sets an
+# UNEXPORTED shell variable the wrapper process never receives — the
+# wrapper runs with its default identity, so the hook must not treat
+# it as the wrapper's configuration (Codex P2 on PR #442 r3: in a
+# custom-author repo the carried value would mask the wrapper falling
+# back to its stock default — a wrong-byline hole). Exported variables
+# are still caught via the hook's own environment.
+assert_rc_contains "standalone inline author identity assignment does not reach the wrapper" 0 "" \
   'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# The custom-author shape from the r3 finding: standalone assignment of
+# the CUSTOM identity must NOT satisfy the guard — the wrapper would
+# actually verify its stock default.
+mkdir -p "$WORKDIR/repo-custom-author-standalone/.github"
+cat >"$WORKDIR/repo-custom-author-standalone/.github/review-policy.yml" <<'YML'
+author_identity: custom-owner
+YML
+cd "$WORKDIR/repo-custom-author-standalone"
+assert_rc_contains "standalone custom-identity assignment does not mask the wrapper default" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=custom-owner && scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
 
 # Exported (non-inline) GH_AS_AUTHOR_IDENTITY must be caught too — the
 # wrapper reads its environment, so the hook must read the same.

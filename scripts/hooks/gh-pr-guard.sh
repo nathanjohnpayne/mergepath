@@ -737,14 +737,21 @@ for i in "${!TOKENS[@]}"; do
         INLINE_CODEX_CLEARED=""
         INLINE_BREAK_GLASS_ADMIN=""
         INLINE_BREAK_GLASS_MERGE_STATE=""
-        # Identity assignments scope to their segment the same way —
-        # `GH_AS_AUTHOR_IDENTITY=x echo ok ; gh-as-author.sh ...` runs
-        # the wrapper with its DEFAULT identity, so a stale captured
-        # value must not leak into the byline guards below (Codex P2
-        # on PR #442: false block after unrelated prefixed commands).
-        INLINE_GH_AS_AUTHOR_IDENTITY=""
-        INLINE_GH_AS_REVIEWER_IDENTITY=""
       fi
+      # Identity assignments NEVER survive a separator — unlike the
+      # break-glass vars above, their consumer is the WRAPPER process
+      # environment, not this hook. A prefix assignment scopes to its
+      # own command's environment, and a standalone assignment sets an
+      # unexported shell variable the wrapper never receives. Carrying
+      # either across a separator mis-models bash both ways: a stale
+      # prefix value falsely blocks later wrapper writes (Codex P2 on
+      # PR #442 r1), and a standalone value makes the hook believe the
+      # wrapper is configured with an identity it never sees — a
+      # wrong-byline hole in custom-author repos (Codex P2 on PR #442
+      # r3). Exported variables are still caught via the hook's own
+      # environment.
+      INLINE_GH_AS_AUTHOR_IDENTITY=""
+      INLINE_GH_AS_REVIEWER_IDENTITY=""
       SEGMENT_HAS_COMMAND=0
       continue
       ;;
