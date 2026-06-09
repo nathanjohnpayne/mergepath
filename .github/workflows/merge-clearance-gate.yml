@@ -217,14 +217,24 @@ jobs:
             set -e
             echo "$output"
 
+            # head_sha is resolved here (the guard above `continue`d
+            # otherwise), so EVERY exit — including infra/config (rc 2 or
+            # any non-0/1) — posts a check_run. On an infra error we post a
+            # FAILURE: the sweep runs on the DEFAULT branch, so if we merely
+            # failed the workflow run and `continue`d, branch protection
+            # would still see the PR head's PREVIOUS green `Merge clearance
+            # gate` and the gate would fail OPEN on exactly the no-event
+            # refresh path this sweep exists to cover (Codex P2 on PR #429).
+            # Fail closed: red check on the PR head + a non-zero workflow run.
+            check_title="Merge clearance gate (scheduled re-evaluation)"
             case "$rc" in
               0) conclusion="success" ;;
               1) conclusion="failure" ;;
               *)
                 echo "::error::merge-clearance-gate.sh rc=$rc on PR #$PR (config/usage/infra error)"
                 had_infra_error=1
-                echo "::endgroup::"
-                continue
+                conclusion="failure"
+                check_title="Merge clearance gate — infra/config error (rc=$rc)"
                 ;;
             esac
 
@@ -232,14 +242,15 @@ jobs:
 
             # Posting the check_run IS the sweep's whole purpose — it's
             # what supersedes the stale required-check after a no-event
-            # clearance transition. A failed POST means the sweep did not
-            # do its job; that's an infra error.
+            # clearance transition (or pins a fail-closed red on infra
+            # error). A failed POST means the sweep did not do its job;
+            # that's an infra error.
             if ! gh api -X POST "repos/$REPO/check-runs" \
               -f name="$CHECK_NAME" \
               -f head_sha="$head_sha" \
               -f status="completed" \
               -f conclusion="$conclusion" \
-              -f "output[title]=Merge clearance gate (scheduled re-evaluation)" \
+              -f "output[title]=$check_title" \
               -f "output[summary]=$summary" \
               >/dev/null; then
               echo "::error::Failed to post check_run for PR #$PR — stale required check not refreshed."
