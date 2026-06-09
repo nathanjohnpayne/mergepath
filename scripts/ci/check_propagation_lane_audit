@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# check_propagation_lane_audit
+#
+# CI wrapper for scripts/audit-propagation-lane.sh (#434). Runs the
+# offline --check-files test matrix, which also pins the audit's
+# default-ON marker to the literal actually present in
+# .github/workflows/pr-review-policy.yml — so a lane-code edit that
+# silently breaks the audit's detection fails here instead of at the
+# next weekly drift run.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST="$REPO_ROOT/tests/test_audit_propagation_lane.sh"
+
+if [ ! -f "$REPO_ROOT/scripts/audit-propagation-lane.sh" ]; then
+  echo "check_propagation_lane_audit: ERROR scripts/audit-propagation-lane.sh missing" >&2
+  exit 1
+fi
+
+if [ ! -f "$TEST" ]; then
+  echo "check_propagation_lane_audit: ERROR $TEST missing" >&2
+  exit 1
+fi
+
+echo "check_propagation_lane_audit: running propagation-lane audit tests"
+bash "$TEST"
+echo "check_propagation_lane_audit: PASS"

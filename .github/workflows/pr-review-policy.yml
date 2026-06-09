@@ -101,6 +101,15 @@ jobs:
           #   1. config (enabled / branch_prefix / author_identity) is
           #      read from the BASE commit's review-policy.yml — a PR
           #      cannot self-qualify by editing policy in the PR.
+          #      The lane defaults ON when the propagation_prs block is
+          #      absent (mergepath#434): the enable flag lived only in
+          #      consumer review-policy.yml, which is intentionally NOT
+          #      synced, so no consumer ever had the block and the lane
+          #      was dormant fleet-wide. An explicit `enabled: false`
+          #      remains the opt-out. The default adds no new trust —
+          #      recognition is still gated on the byte-level verify in
+          #      step 3, and a PR cannot grant itself the default
+          #      because it cannot edit its own BASE commit.
           #   2. branch name must start with propagation_prs.branch_prefix
           #      and PR author must be author_identity.
           #   3. the <sha> in the branch name (mergepath-sync/[sync-all-]
@@ -137,7 +146,12 @@ jobs:
             : > "$BASE_POLICY"   # absent on base → lane simply won't match
           fi
           PROP_ENABLED=$(prop_field "$BASE_POLICY" propagation_prs enabled)
+          # Default ON when the key/block is absent (mergepath#434);
+          # explicit `enabled: false` opts out.
+          PROP_ENABLED=${PROP_ENABLED:-true}
           PROP_PREFIX=$(prop_field "$BASE_POLICY" propagation_prs branch_prefix)
+          # Must match SYNC_BRANCH_PREFIX in scripts/sync-to-downstream.sh.
+          PROP_PREFIX=${PROP_PREFIX:-mergepath-sync/}
           AUTHOR_ID=$(grep -m1 '^author_identity:' "$BASE_POLICY" | awk '{print $2}')
           HEAD_REF="${{ github.event.pull_request.head.ref }}"
           PR_AUTHOR="${{ github.event.pull_request.user.login }}"
