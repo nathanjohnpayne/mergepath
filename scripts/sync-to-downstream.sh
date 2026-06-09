@@ -544,25 +544,36 @@ refresh_cached_clone() {
   fi
 
   log "refreshing cached clone at $cache_path"
-  # `origin/HEAD` is set by `gh repo clone`'s underlying `git clone` to
-  # the consumer's default branch. Resetting hard is safe here: this
-  # directory is the script's cache, not the user's worktree.
-  if ! git -C "$cache_path" fetch --depth=1 --quiet origin >&2; then
-    err "git fetch failed for cached clone $cache_path"
+  # A bare `git fetch` is not enough here, for two compounding reasons
+  # (Codex P2s on PR #443 rounds 1–2):
+  #   - `git fetch` never updates refs/remotes/origin/HEAD when the
+  #     remote's default branch changes (e.g. a main→trunk rename), so
+  #     a long-lived cache clone would keep resetting to the STALE old
+  #     default while the baseline header claims a refreshed
+  #     default-branch comparison.
+  #   - cache clones are created with --depth=1, which implies
+  #     --single-branch: the clone's refspec only ever fetches the
+  #     OLD default, so the renamed default's ref would never arrive.
+  # Resolve the remote's CURRENT default via ls-remote --symref, fetch
+  # that branch explicitly, re-point origin/HEAD at it, then reset.
+  local default_ref
+  default_ref=$(git -C "$cache_path" ls-remote --symref origin HEAD 2>/dev/null \
+    | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
+  if [ -z "$default_ref" ]; then
+    err "could not resolve the remote default branch for $cache_path (git ls-remote --symref origin HEAD)"
     return 3
   fi
-  # `git fetch` does NOT update refs/remotes/origin/HEAD when the
-  # remote's default branch changes (e.g. a main→trunk rename), so a
-  # long-lived cache clone would keep resetting to the STALE old
-  # default while the baseline header claims a refreshed default-branch
-  # comparison (Codex P2 on PR #443). `remote set-head --auto` queries
-  # the remote and re-points origin/HEAD at the current default.
-  if ! git -C "$cache_path" remote set-head origin --auto >/dev/null 2>&1; then
-    err "git remote set-head origin --auto failed for $cache_path"
+  if ! git -C "$cache_path" fetch --depth=1 --quiet origin \
+       "+refs/heads/$default_ref:refs/remotes/origin/$default_ref" >&2; then
+    err "git fetch failed for cached clone $cache_path (branch $default_ref)"
     return 3
   fi
-  if ! git -C "$cache_path" reset --hard --quiet origin/HEAD >&2; then
-    err "git reset --hard origin/HEAD failed for $cache_path"
+  if ! git -C "$cache_path" remote set-head origin "$default_ref" >/dev/null 2>&1; then
+    err "git remote set-head origin $default_ref failed for $cache_path"
+    return 3
+  fi
+  if ! git -C "$cache_path" reset --hard --quiet "refs/remotes/origin/$default_ref" >&2; then
+    err "git reset --hard origin/$default_ref failed for $cache_path"
     return 3
   fi
 }

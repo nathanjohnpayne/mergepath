@@ -259,7 +259,11 @@ git init -q -b main "$live_origin"
 
 live_cache="$WORKDIR/live-cache"
 mkdir -p "$live_cache"
-git clone -q "file://$live_origin" "$live_cache/clean-consumer"
+# --depth=1 matches clone_consumer_to_cache and implies --single-branch,
+# which is exactly the shape that broke the renamed-default refresh
+# (Codex P2 on PR #443 r2): the clone's refspec only fetches the old
+# default, so the rename test below exercises the explicit-ref fetch.
+git clone -q --depth=1 "file://$live_origin" "$live_cache/clean-consumer"
 
 stale_siblings="$WORKDIR/stale-siblings"
 mkdir -p "$stale_siblings/clean-consumer/scripts/hooks" "$stale_siblings/clean-consumer/scripts/ci"
