@@ -52,6 +52,13 @@ MANIFEST=".mergepath-sync.yml"
 # the literal.
 LANE_DEFAULT_MARKER='PROP_ENABLED=${PROP_ENABLED:-true}'
 
+# The branch prefix scripts/sync-to-downstream.sh actually uses for the
+# PRs it opens. A consumer whose review-policy.yml overrides
+# propagation_prs.branch_prefix to anything else has a lane that never
+# matches real sync branches — that's a would-not-fire condition, not a
+# healthy lane (Codex P2 on PR #444).
+SYNC_BRANCH_PREFIX='mergepath-sync/'
+
 # Read a 2-space-indented scalar from a named YAML block — same
 # state-machine awk as pr-review-policy.yml's prop_field, so this audit
 # evaluates the exact predicate the lane evaluates.
@@ -74,7 +81,7 @@ prop_field() {  # <file> <block> <key>
 # not.
 lane_status_for_files() {  # <label> <policy-file-or-empty> <workflow-file-or-empty>
   local label=$1 policy=$2 workflow=$3
-  local enabled author_id
+  local enabled author_id prefix
 
   if [ -z "$workflow" ] || [ ! -f "$workflow" ]; then
     echo "  ✗ $label: pr-review-policy.yml ABSENT on the live default branch — lane cannot fire"
@@ -87,13 +94,23 @@ lane_status_for_files() {  # <label> <policy-file-or-empty> <workflow-file-or-em
 
   enabled=""
   author_id=""
+  prefix=""
   if [ -n "$policy" ] && [ -f "$policy" ]; then
     enabled=$(prop_field "$policy" propagation_prs enabled)
+    prefix=$(prop_field "$policy" propagation_prs branch_prefix)
     author_id=$(grep -m1 '^author_identity:' "$policy" | awk '{print $2}' || true)
   fi
 
   if [ "$enabled" = "false" ]; then
     echo "  ⚠ $label: propagation_prs.enabled: false — explicit opt-out; lane will NOT fire (exclude this consumer via --repos if intentional)"
+    return 1
+  fi
+  # An overridden branch_prefix that doesn't match what
+  # sync-to-downstream.sh actually opens means the lane never matches a
+  # real sync PR — report would-not-fire, not healthy (Codex P2 on
+  # PR #444). Absent defaults to the sync prefix, mirroring the lane.
+  if [ -n "$prefix" ] && [ "$prefix" != "$SYNC_BRANCH_PREFIX" ]; then
+    echo "  ✗ $label: propagation_prs.branch_prefix is '$prefix' but sync-to-downstream.sh opens '$SYNC_BRANCH_PREFIX*' branches — lane will never match a real sync PR"
     return 1
   fi
   if [ -z "$author_id" ]; then

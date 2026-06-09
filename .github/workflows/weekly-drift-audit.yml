@@ -185,13 +185,21 @@ jobs:
 
       # Propagation lane regression net (#434): the lane defaults ON in
       # the synced pr-review-policy.yml, but a consumer can still end
-      # up lane-dark (pre-#434 workflow, explicit enabled: false, or
-      # missing author_identity). This audit reads each consumer's LIVE
-      # default branch and fails the run when the lane would not fire —
-      # surfacing the regression weekly instead of at the next sync
-      # wave. Runs after the file-drift audit so both reports land even
-      # when one of them fails; its own rc gates the job at the end.
+      # up lane-dark (pre-#434 workflow, explicit enabled: false,
+      # overridden branch_prefix, or missing author_identity). This
+      # audit reads each consumer's LIVE default branch and fails the
+      # run when the lane would not fire — surfacing the regression
+      # weekly instead of at the next sync wave.
+      #
+      # IMPORTANT: this step only RECORDS its result (lane_rc output).
+      # Failing here would abort the job before the drift tracking
+      # issue is opened/updated below, losing the file-drift visibility
+      # in the same run that found a lane regression (Codex P2 on PR
+      # #444). The "Fail on propagation lane regression" step at the
+      # END of the job turns a recorded non-zero rc into the job
+      # failure once the drift-issue path has completed.
       - name: Propagation lane audit
+        id: lane_audit
         if: steps.audit.outputs.result == 'clean' || steps.audit.outputs.result == 'drift'
         env:
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
@@ -210,17 +218,8 @@ jobs:
             cat lane-audit-output.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          case "${rc}" in
-            0) ;;
-            1)
-              echo "::error::Propagation lane would NOT fire on at least one consumer (see lane audit output). Sync pr-review-policy.yml or investigate the consumer's review-policy.yml."
-              exit 1
-              ;;
-            *)
-              echo "::error::audit-propagation-lane.sh exited ${rc} (fetch/usage error) — infrastructure failure, not lane drift."
-              exit "${rc}"
-              ;;
-          esac
+          echo "lane_rc=${rc}" >> "$GITHUB_OUTPUT"
+          echo "Lane audit exited ${rc} (deferred to the end-of-job gate)"
 
       - name: Write job summary
         # Runs for both clean (result=clean) and drift (result=drift).
@@ -368,3 +367,19 @@ jobs:
             gh issue close "$n" --repo "$REPO" \
               --comment ":white_check_mark: Audit clean as of ${today} (UTC) — all consumers back in sync with mergepath's canonical/kit surface. Closing automatically. See [run](${RUN_URL})."
           done
+
+      # Deferred gate for the lane audit (#434 / Codex P2 on PR #444):
+      # runs LAST so the drift tracking-issue path above always
+      # completes first, then turns a recorded lane regression into the
+      # job failure it deserves.
+      - name: Fail on propagation lane regression
+        if: steps.lane_audit.outputs.lane_rc != '' && steps.lane_audit.outputs.lane_rc != '0'
+        env:
+          LANE_RC: ${{ steps.lane_audit.outputs.lane_rc }}
+        run: |
+          if [ "${LANE_RC}" = "1" ]; then
+            echo "::error::Propagation lane would NOT fire on at least one consumer (see lane audit output above). Sync pr-review-policy.yml or investigate the consumer's review-policy.yml."
+          else
+            echo "::error::audit-propagation-lane.sh exited ${LANE_RC} (fetch/usage error) — infrastructure failure, not lane drift."
+          fi
+          exit "${LANE_RC}"

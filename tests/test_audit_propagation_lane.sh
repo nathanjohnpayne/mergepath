@@ -42,6 +42,10 @@ POLICY_OFF="$WORKDIR/policy-off.yml"          # explicit opt-out
 printf 'propagation_prs:\n  enabled: false\nauthor_identity: nathanjohnpayne\n' >"$POLICY_OFF"
 POLICY_NO_AUTHOR="$WORKDIR/policy-no-author.yml"
 printf 'propagation_prs:\n  enabled: true\n' >"$POLICY_NO_AUTHOR"
+POLICY_ALT_PREFIX="$WORKDIR/policy-alt-prefix.yml"  # prefix that sync never opens
+printf 'propagation_prs:\n  enabled: true\n  branch_prefix: "other-prefix/"\nauthor_identity: nathanjohnpayne\n' >"$POLICY_ALT_PREFIX"
+POLICY_STD_PREFIX="$WORKDIR/policy-std-prefix.yml"  # explicit standard prefix
+printf 'propagation_prs:\n  enabled: true\n  branch_prefix: "mergepath-sync/"\nauthor_identity: nathanjohnpayne\n' >"$POLICY_STD_PREFIX"
 
 run_check() {  # <policy> <workflow> — sets OUT and RC
   set +e
@@ -90,6 +94,20 @@ if [ "$RC" = "1" ]; then
   pass "absent review-policy.yml fails the audit (no author fingerprint)"
 else
   fail "absent review-policy.yml should fail; got rc=$RC, out: $OUT"
+fi
+
+run_check "$POLICY_ALT_PREFIX" "$WF_NEW"
+if [ "$RC" = "1" ] && echo "$OUT" | grep -q "never match a real sync PR"; then
+  pass "overridden branch_prefix that sync never opens fails the audit"
+else
+  fail "non-sync branch_prefix should fail; got rc=$RC, out: $OUT"
+fi
+
+run_check "$POLICY_STD_PREFIX" "$WF_NEW"
+if [ "$RC" = "0" ]; then
+  pass "explicit standard branch_prefix fires the lane"
+else
+  fail "explicit mergepath-sync/ prefix should fire; got rc=$RC, out: $OUT"
 fi
 
 echo ""
