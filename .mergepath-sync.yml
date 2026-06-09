@@ -498,6 +498,9 @@ paths:
 
   # Canonical workflows — review policy + automation surfaces that
   # should be lockstep across all consumers.
+  - path: .github/pull_request_template.md
+    type: canonical
+    consumers: all
   - path: .github/workflows/agent-review.yml
     type: canonical
     consumers: all
@@ -592,6 +595,14 @@ paths:
 
   # Kit directories — Mergepath-canonical files are required;
   # consumer-only additions in the same directory are allowed.
+  - path: .github/ISSUE_TEMPLATE/
+    type: kit
+    consumers: all
+    # Synced issue templates establish the shared Mergepath issue
+    # shape while preserving allow-extras semantics for product-
+    # specific consumer templates. Keep labels to GitHub default
+    # labels (`bug`, `documentation`, `enhancement`) so consumer
+    # repos do not silently drop non-existent front-matter labels.
   - path: scripts/ci/
     type: kit
     consumers: all
