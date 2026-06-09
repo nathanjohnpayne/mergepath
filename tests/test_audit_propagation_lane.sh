@@ -46,6 +46,8 @@ POLICY_ALT_PREFIX="$WORKDIR/policy-alt-prefix.yml"  # prefix that sync never ope
 printf 'propagation_prs:\n  enabled: true\n  branch_prefix: "other-prefix/"\nauthor_identity: nathanjohnpayne\n' >"$POLICY_ALT_PREFIX"
 POLICY_STD_PREFIX="$WORKDIR/policy-std-prefix.yml"  # explicit standard prefix
 printf 'propagation_prs:\n  enabled: true\n  branch_prefix: "mergepath-sync/"\nauthor_identity: nathanjohnpayne\n' >"$POLICY_STD_PREFIX"
+POLICY_WRONG_AUTHOR="$WORKDIR/policy-wrong-author.yml"  # author that sync never uses
+printf 'propagation_prs:\n  enabled: true\nauthor_identity: nathanpayne-claude\n' >"$POLICY_WRONG_AUTHOR"
 
 run_check() {  # <policy> <workflow> — sets OUT and RC
   set +e
@@ -108,6 +110,13 @@ if [ "$RC" = "0" ]; then
   pass "explicit standard branch_prefix fires the lane"
 else
   fail "explicit mergepath-sync/ prefix should fire; got rc=$RC, out: $OUT"
+fi
+
+run_check "$POLICY_WRONG_AUTHOR" "$WF_NEW"
+if [ "$RC" = "1" ] && echo "$OUT" | grep -q "sync PRs are authored by"; then
+  pass "author_identity that is not the sync actor fails the audit"
+else
+  fail "non-sync author_identity should fail; got rc=$RC, out: $OUT"
 fi
 
 echo ""

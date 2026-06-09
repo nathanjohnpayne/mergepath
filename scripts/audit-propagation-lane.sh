@@ -59,6 +59,14 @@ LANE_DEFAULT_MARKER='PROP_ENABLED=${PROP_ENABLED:-true}'
 # healthy lane (Codex P2 on PR #444).
 SYNC_BRANCH_PREFIX='mergepath-sync/'
 
+# The actor scripts/sync-to-downstream.sh creates consumer PRs under.
+# The lane's fingerprint requires PR author == the consumer's
+# author_identity, so a present-but-wrong value (typo, stale identity,
+# stray quoting that survives the same grep/awk extraction the lane
+# uses) means the lane never matches a real sync PR (Codex P2 on
+# PR #444 r3).
+SYNC_AUTHOR_IDENTITY='nathanjohnpayne'
+
 # Read a 2-space-indented scalar from a named YAML block — same
 # state-machine awk as pr-review-policy.yml's prop_field, so this audit
 # evaluates the exact predicate the lane evaluates.
@@ -115,6 +123,10 @@ lane_status_for_files() {  # <label> <policy-file-or-empty> <workflow-file-or-em
   fi
   if [ -z "$author_id" ]; then
     echo "  ✗ $label: review-policy.yml has no author_identity — the lane's PR-author fingerprint cannot match"
+    return 1
+  fi
+  if [ "$author_id" != "$SYNC_AUTHOR_IDENTITY" ]; then
+    echo "  ✗ $label: review-policy.yml author_identity is '$author_id' but sync PRs are authored by '$SYNC_AUTHOR_IDENTITY' — the lane's PR-author fingerprint will never match a real sync PR"
     return 1
   fi
 
