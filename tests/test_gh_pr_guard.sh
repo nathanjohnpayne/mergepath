@@ -270,6 +270,20 @@ else
   fail "author wrapper exported non-author identity blocked: rc=$rc; output: $out"
 fi
 
+# The expected author defaults from review-policy.yml author_identity
+# when GH_PR_GUARD_EXPECTED_AUTHOR is unset (Codex P2 on PR #442 r2) —
+# custom-author repos need no hook-specific variable.
+mkdir -p "$WORKDIR/repo-custom-author/.github"
+cat >"$WORKDIR/repo-custom-author/.github/review-policy.yml" <<'YML'
+author_identity: custom-owner
+YML
+cd "$WORKDIR/repo-custom-author"
+assert_rc_contains "author identity from review-policy.yml allows matching wrapper identity" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=custom-owner scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+assert_rc_contains "author identity from review-policy.yml blocks the stock default" 2 "author identity" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
+
 # Custom expected author: identity must match the override...
 set +e
 out=$(GH_PR_GUARD_EXPECTED_AUTHOR=custom-owner run_hook 'GH_AS_AUTHOR_IDENTITY=custom-owner scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)

@@ -1009,7 +1009,15 @@ fi
 # gh pr merge ...` re-opens the wrong-byline merge/edit path the
 # wrapper migration closed (the #359 class).
 if [ "$WRAPPER_KIND" = "author" ]; then
-  EXPECTED_AUTHOR="${GH_PR_GUARD_EXPECTED_AUTHOR:-nathanjohnpayne}"
+  # Expected-author resolution order: explicit env override, then the
+  # repo's review-policy.yml author_identity (so custom-author repos
+  # need no hook-specific variable — Codex P2 on PR #442 round 2),
+  # then the fleet default.
+  EXPECTED_AUTHOR="${GH_PR_GUARD_EXPECTED_AUTHOR:-}"
+  if [ -z "$EXPECTED_AUTHOR" ] && [ -f ".github/review-policy.yml" ]; then
+    EXPECTED_AUTHOR=$(grep -m1 '^author_identity:' ".github/review-policy.yml" | awk '{print $2}' || true)
+  fi
+  EXPECTED_AUTHOR="${EXPECTED_AUTHOR:-nathanjohnpayne}"
   WRAPPER_AUTHOR_IDENTITY="${INLINE_GH_AS_AUTHOR_IDENTITY:-${GH_AS_AUTHOR_IDENTITY:-}}"
   # Unset means the wrapper will use ITS hard default (nathanjohnpayne)
   # — compare against that, not against EXPECTED_AUTHOR, so a repo
