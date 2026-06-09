@@ -773,6 +773,8 @@ Each repo using this template must mark these as required on `main` (Settings �
 
 - **`Label Gate`** — fails when any of `needs-external-review`, `needs-human-review`, `policy-violation`, or `human-hold` is on the PR. The hard gate behind the doctrine in [Agent prohibitions](#agent-prohibitions).
 - **`Self-Review Required`** — fails when the PR body lacks a `## Self-Review` section (Dependabot-exempt).
+- **`Codex P1 unresolved threads`** — fails when any Codex P1 inline-finding thread on the current HEAD is unresolved (`codex.p1_gate.enabled`, #235). A no-op (always green) when the knob is off, so it is safe to require everywhere.
+- **`Merge clearance gate`** — the HEAD-pinned, merge-time enforcement of clearance (#427/#428). Fails when a Dependabot PR has no reviewer-identity `APPROVED` review on the current HEAD (`dependabot.reviewer_gate.enabled`), or when a `needs-external-review` PR is not cleared on the current HEAD by `scripts/codex-review-check.sh` (`codex.external_review_gate.enabled`). It re-evaluates on every push (and via a scheduled sweep for no-event transitions), so a clearance recorded on an earlier HEAD — or an approval dismissed by a rebase push — cannot ride a new HEAD to merge. This closes the two escapes that previously surfaced only in the weekly retroactive audit: a Dependabot dev-deps bump merged with no approval on HEAD (matchline#245), and an external-review PR merged on a HEAD with no `APPROVED` CLI review and no Codex review (nathanpaynedotcom#405). A no-op (always green) when both knobs are off. **Caveat:** a required check is bypassable by an admin "merge without waiting for requirements"; both escapes were admin merges, so pair this with branch-protection `enforce_admins: true` to fully close the human-merge path.
 
 Audit a repo's branch protection with `scripts/audit-branch-protection.sh` (read-only; exits 3 if any canonical check is not required, with a fix recipe). Re-run after every protection change.
 
@@ -850,6 +852,19 @@ codex:
   review_timeout_seconds: 600                 # per-round poll timeout
   require_ci_green: true                      # merge gate
   allow_phase_4b_substitute: true             # accept Phase 4b APPROVED on HEAD as gate (c) clearance (#218)
+  p1_gate:
+    enabled: true                             # required check `Codex P1 unresolved threads` (#235)
+  external_review_gate:
+    enabled: true                             # required check `Merge clearance gate`, external-review arm (#428)
+
+# Dependabot HEAD-pinned reviewer-approval merge gate (#427).
+# When reviewer_gate.enabled is true, the required check `Merge clearance
+# gate` blocks a Dependabot PR unless a reviewer identity (≠ author) has a
+# latest-state APPROVED review whose commit_id == the current HEAD.
+# Default false everywhere except mergepath (narrow-start, then propagate).
+dependabot:
+  reviewer_gate:
+    enabled: true
 ```
 
 > **Note on `enabled` flags (both `coderabbit` and `codex`).** These flags govern **agent behavior only** — whether the authoring agent waits for the corresponding review in its phase. They do NOT control whether the underlying GitHub App runs. Both apps run based on their own install state on GitHub, independent of what this YAML says. Setting `coderabbit.enabled: false` alone will cause the agent to skip the CodeRabbit phase while the app continues to post reviews silently in the background. Setting `codex.enabled: false` routes the agent to Phase 4b and makes `scripts/codex-review-check.sh` ignore Codex bot reviews/reactions for the merge gate, but the Codex App may still post comments unless it is disabled in ChatGPT/GitHub. To fully disable an integration, uninstall or disable the GitHub App AND set the flag to false.

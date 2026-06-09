@@ -46,6 +46,15 @@ set -eo pipefail
 CANONICAL_REQUIRED_CHECKS=(
   "Label Gate"
   "Self-Review Required"
+  # HEAD-pinned merge gates. Each is a required check whose workflow
+  # ships from mergepath. They are no-ops (always green) when their
+  # per-repo knob in .github/review-policy.yml is off, so requiring them
+  # in branch protection is safe even on consumers that haven't enabled
+  # the gate yet — and it flags consumers whose branch protection doesn't
+  # require them, which is the gap #427/#428 exploited (the gate ran but
+  # was advisory, so escapes were caught only by the weekly audit).
+  "Codex P1 unresolved threads"   # .github/workflows/codex-p1-gate.yml (#235)
+  "Merge clearance gate"          # .github/workflows/merge-clearance-gate.yml (#427/#428)
 )
 
 REPO=""
