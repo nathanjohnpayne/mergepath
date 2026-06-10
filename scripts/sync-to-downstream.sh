@@ -37,7 +37,7 @@
 # consumer-side dest using each consumer's manifest facts.
 #
 # Usage:
-#   scripts/sync-to-downstream.sh --audit [--repos r1,r2] [--paths glob]
+#   scripts/sync-to-downstream.sh --audit [--use-local-tree] [--repos r1,r2] [--paths glob]
 #   scripts/sync-to-downstream.sh <commit-ish> [--dry-run] [--repos r1,r2] [--paths glob]
 #                                 [--no-pr] [--skip-existing|--recreate-existing] [--verbose]
 #   scripts/sync-to-downstream.sh --sync-all [--dry-run] [--repos r1,r2] [--paths glob]
@@ -48,6 +48,12 @@
 # Flags:
 #   --audit              Read-only drift detection. Exit 0 (clean), 1 (drift),
 #                        2 (script/usage error), 3 (consumer fetch error).
+#                        Compares each consumer's LIVE default branch (a
+#                        refreshed cache clone of origin/HEAD) against
+#                        mergepath HEAD, and prints the exact baseline
+#                        ref@sha per consumer so the comparison basis is
+#                        never ambiguous (#439). To audit a local sibling
+#                        working tree instead, see --use-local-tree.
 #   --sync-all           Bulk steady-state reconcile. Propagate the current
 #                        HEAD state of EVERY canonical + kit path in the
 #                        manifest to every consumer, ignoring the
@@ -100,9 +106,24 @@
 #                        hunks (Mergepath parent → commit) to each
 #                        affected target line in the plan, so the human
 #                        sees the change set that would propagate.
+#   --use-local-tree     Audit only: compare against a local sibling
+#                        worktree under MERGEPATH_SIBLINGS_DIR (the
+#                        pre-#439 default), falling back to the cache
+#                        clone when no sibling exists. The sibling's
+#                        working tree is used AS-IS (never fetched or
+#                        reset), so results reflect whatever branch /
+#                        commit / uncommitted edits are checked out —
+#                        the audit warns loudly when that baseline
+#                        differs from origin's default branch. Without
+#                        this flag, --audit always compares against a
+#                        refreshed cache clone of the consumer's live
+#                        default branch (#439: stale siblings made the
+#                        default audit confidently report false drift).
 #   --no-clone           Audit only: don't clone-on-demand; only audit
-#                        consumers with a local sibling worktree under
-#                        MERGEPATH_SIBLINGS_DIR.
+#                        consumers that already have a cache clone
+#                        under MERGEPATH_SYNC_CACHE (or, with
+#                        --use-local-tree, a local sibling worktree
+#                        under MERGEPATH_SIBLINGS_DIR).
 #   --no-refresh         Audit only: don't `git fetch` cached consumer
 #                        clones before comparing. Useful for offline /
 #                        sandboxed audits; may report stale results if
@@ -139,7 +160,9 @@
 #   transitively-required files outside the manifest, etc.).
 #
 # Environment:
-#   MERGEPATH_SIBLINGS_DIR  Default: $HOME/GitHub. If a `.git` entry at
+#   MERGEPATH_SIBLINGS_DIR  Default: $HOME/GitHub. Used by the audit ONLY
+#                           under --use-local-tree (#439). If a `.git`
+#                           entry at
 #                           $MERGEPATH_SIBLINGS_DIR/<consumer-name>/.git
 #                           exists (directory OR file — git worktrees use
 #                           a `.git` file), the audit reads from that
@@ -404,6 +427,66 @@ resolve_consumer_worktree() {
   return 1
 }
 
+# Cache-only resolver for the default audit baseline (#439): never
+# considers sibling worktrees. Returns 0 with the path on stdout if a
+# cache clone exists, 1 otherwise (caller clones on demand).
+resolve_consumer_cache_clone() {
+  local consumer_name=$1
+  local cache_dir=${MERGEPATH_SYNC_CACHE:-$HOME/.cache/mergepath-sync}
+
+  if [ -e "$cache_dir/$consumer_name/.git" ]; then
+    echo "$cache_dir/$consumer_name"
+    return 0
+  fi
+  return 1
+}
+
+# Print the audit comparison baseline for one consumer (#439 Option 3):
+# the exact ref@sha being compared, and which kind of tree it is. For a
+# local sibling tree (only reachable under --use-local-tree), also warn
+# loudly when the tree is on a non-default branch or its HEAD differs
+# from the last-known origin default-branch tip — the two stale-baseline
+# shapes that produced confidently-false fleet-wide drift reports.
+# Non-git fixture trees (tests) print "unknown" and skip the warnings.
+print_audit_baseline() {
+  local consumer_root=$1
+  local sha branch
+  sha=$(git -C "$consumer_root" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+  branch=$(git -C "$consumer_root" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+
+  if path_is_in_cache "$consumer_root"; then
+    # The refresh resets the working tree to origin/HEAD but never
+    # renames the local branch, so after a remote default-branch
+    # rename the local branch label would lie about what the content
+    # tracks. Label the baseline with origin/HEAD's actual target.
+    local origin_default
+    origin_default=$(git -C "$consumer_root" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || echo "")
+    if [ -n "$origin_default" ]; then
+      branch="${origin_default#origin/}"
+    fi
+    if [ "${AUDIT_NO_REFRESH:-0}" = "1" ]; then
+      echo "  baseline: $branch@$sha (cache clone, NOT refreshed — --no-refresh; may lag origin)"
+    else
+      echo "  baseline: $branch@$sha (cache clone, refreshed from origin default branch)"
+    fi
+    return 0
+  fi
+
+  echo "  baseline: $branch@$sha (LOCAL SIBLING TREE at $consumer_root, used as-is — never auto-fetched)"
+
+  # Staleness warnings (best-effort; both probes read only local refs).
+  local default_branch origin_sha
+  default_branch=$(git -C "$consumer_root" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || echo "")
+  default_branch=${default_branch#origin/}
+  if [ -n "$default_branch" ] && [ "$branch" != "unknown" ] && [ "$branch" != "$default_branch" ]; then
+    echo "  ⚠ sibling tree is on '$branch', not the default branch '$default_branch' — drift results reflect that branch, not origin/$default_branch; re-run without --use-local-tree for live state"
+  fi
+  origin_sha=$(git -C "$consumer_root" rev-parse --short "refs/remotes/origin/${default_branch:-HEAD}" 2>/dev/null || echo "")
+  if [ -n "$origin_sha" ] && [ "$sha" != "unknown" ] && [ "$sha" != "$origin_sha" ]; then
+    echo "  ⚠ sibling tree HEAD ($sha) != last-fetched origin/${default_branch:-HEAD} ($origin_sha) — baseline may be stale or ahead; re-run without --use-local-tree for live state"
+  fi
+}
+
 # Lexical prefix check: does $1 live under MERGEPATH_SYNC_CACHE?
 # Trailing slash on the cache root makes the prefix unambiguous so a
 # sibling dir whose name happens to match the cache-dir prefix can't
@@ -461,15 +544,36 @@ refresh_cached_clone() {
   fi
 
   log "refreshing cached clone at $cache_path"
-  # `origin/HEAD` is set by `gh repo clone`'s underlying `git clone` to
-  # the consumer's default branch. Resetting hard is safe here: this
-  # directory is the script's cache, not the user's worktree.
-  if ! git -C "$cache_path" fetch --depth=1 --quiet origin >&2; then
-    err "git fetch failed for cached clone $cache_path"
+  # A bare `git fetch` is not enough here, for two compounding reasons
+  # (Codex P2s on PR #443 rounds 1–2):
+  #   - `git fetch` never updates refs/remotes/origin/HEAD when the
+  #     remote's default branch changes (e.g. a main→trunk rename), so
+  #     a long-lived cache clone would keep resetting to the STALE old
+  #     default while the baseline header claims a refreshed
+  #     default-branch comparison.
+  #   - cache clones are created with --depth=1, which implies
+  #     --single-branch: the clone's refspec only ever fetches the
+  #     OLD default, so the renamed default's ref would never arrive.
+  # Resolve the remote's CURRENT default via ls-remote --symref, fetch
+  # that branch explicitly, re-point origin/HEAD at it, then reset.
+  local default_ref
+  default_ref=$(git -C "$cache_path" ls-remote --symref origin HEAD 2>/dev/null \
+    | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2; exit}')
+  if [ -z "$default_ref" ]; then
+    err "could not resolve the remote default branch for $cache_path (git ls-remote --symref origin HEAD)"
     return 3
   fi
-  if ! git -C "$cache_path" reset --hard --quiet origin/HEAD >&2; then
-    err "git reset --hard origin/HEAD failed for $cache_path"
+  if ! git -C "$cache_path" fetch --depth=1 --quiet origin \
+       "+refs/heads/$default_ref:refs/remotes/origin/$default_ref" >&2; then
+    err "git fetch failed for cached clone $cache_path (branch $default_ref)"
+    return 3
+  fi
+  if ! git -C "$cache_path" remote set-head origin "$default_ref" >/dev/null 2>&1; then
+    err "git remote set-head origin $default_ref failed for $cache_path"
+    return 3
+  fi
+  if ! git -C "$cache_path" reset --hard --quiet "refs/remotes/origin/$default_ref" >&2; then
+    err "git reset --hard origin/$default_ref failed for $cache_path"
     return 3
   fi
 }
@@ -813,16 +917,39 @@ run_audit() {
     echo "$consumer_name ($consumer_repo)"
 
     local consumer_root
-    if ! consumer_root=$(resolve_consumer_worktree "$consumer_name"); then
-      if [ "${AUDIT_NO_CLONE:-0}" = "1" ]; then
-        echo "  ! no local worktree for $consumer_name (set MERGEPATH_SIBLINGS_DIR or drop --no-clone)"
-        AUDIT_FETCH_ERROR=1
-        continue
+    if [ "${AUDIT_USE_LOCAL_TREE:-0}" = "1" ]; then
+      # Legacy baseline (#439 opt-in): sibling worktree first, cache
+      # fallback. The sibling tree is used AS-IS; the baseline header
+      # + staleness warnings below make that basis explicit.
+      if ! consumer_root=$(resolve_consumer_worktree "$consumer_name"); then
+        if [ "${AUDIT_NO_CLONE:-0}" = "1" ]; then
+          echo "  ! no local worktree for $consumer_name (set MERGEPATH_SIBLINGS_DIR or drop --no-clone)"
+          AUDIT_FETCH_ERROR=1
+          continue
+        fi
+        if ! consumer_root=$(clone_consumer_to_cache "$consumer_name" "$consumer_repo"); then
+          echo "  ! could not fetch $consumer_repo"
+          AUDIT_FETCH_ERROR=1
+          continue
+        fi
       fi
-      if ! consumer_root=$(clone_consumer_to_cache "$consumer_name" "$consumer_repo"); then
-        echo "  ! could not fetch $consumer_repo"
-        AUDIT_FETCH_ERROR=1
-        continue
+    else
+      # Default baseline (#439): the consumer's LIVE default branch via
+      # a refreshed cache clone — never the user's sibling working
+      # tree. A stale sibling (feature branch checked out, behind
+      # main) previously made the audit confidently report massive
+      # false drift with no hint the baseline was stale.
+      if ! consumer_root=$(resolve_consumer_cache_clone "$consumer_name"); then
+        if [ "${AUDIT_NO_CLONE:-0}" = "1" ]; then
+          echo "  ! no cached clone for $consumer_name (drop --no-clone, or pass --use-local-tree to audit a local sibling worktree)"
+          AUDIT_FETCH_ERROR=1
+          continue
+        fi
+        if ! consumer_root=$(clone_consumer_to_cache "$consumer_name" "$consumer_repo"); then
+          echo "  ! could not fetch $consumer_repo"
+          AUDIT_FETCH_ERROR=1
+          continue
+        fi
       fi
     fi
     # If we're reading from a cache path (vs. a sibling worktree),
@@ -836,6 +963,7 @@ run_audit() {
         continue
       fi
     fi
+    print_audit_baseline "$consumer_root"
     local consumer_overrides=""
     if [ -f "$consumer_root/$OVERRIDES_PATH" ]; then
       consumer_overrides="$consumer_root/$OVERRIDES_PATH"
@@ -2402,6 +2530,10 @@ while [ $# -gt 0 ]; do
       FILTER_PATHS="$2"
       shift 2
       ;;
+    --use-local-tree)
+      AUDIT_USE_LOCAL_TREE=1
+      shift
+      ;;
     --no-clone)
       AUDIT_NO_CLONE=1
       shift
@@ -2541,6 +2673,10 @@ if [ "$SYNC_NO_PR" = "1" ] && [ "$MODE" = "audit" ]; then
 fi
 if [ "$SYNC_RECREATE_EXISTING" = "1" ] && [ "$MODE" = "audit" ]; then
   err "--recreate-existing is a sync-mode-only flag; remove it from --audit invocations"
+  exit 2
+fi
+if [ "${AUDIT_USE_LOCAL_TREE:-0}" = "1" ] && [ "$MODE" != "audit" ]; then
+  err "--use-local-tree is an audit-mode-only flag; remove it from sync invocations"
   exit 2
 fi
 if [ "$SYNC_VERBOSE" = "1" ] && [ "$MODE" = "audit" ]; then
