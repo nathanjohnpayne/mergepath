@@ -375,6 +375,29 @@ prefix_flag_takes_value() {
 }
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GUARD_REPO_ROOT="$(cd "$HOOK_DIR/../.." && pwd)"
+
+# Locate the governing review-policy.yml without trusting the caller's
+# cwd to BE the repo root (Codex P2 on PR #442 r21): walk upward from
+# the cwd (covers subdirectory invocations and out-of-tree fixture
+# repos), then fall back to the hook's own repo root (the hook is
+# installed at <root>/scripts/hooks/, so script root == project root
+# in production). Echoes the path or nothing.
+guard_policy_file() {
+  local d="$PWD"
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    if [ -f "$d/.github/review-policy.yml" ]; then
+      printf '%s\n' "$d/.github/review-policy.yml"
+      return 0
+    fi
+    d="$(dirname "$d")"
+  done
+  if [ -f "$GUARD_REPO_ROOT/.github/review-policy.yml" ]; then
+    printf '%s\n' "$GUARD_REPO_ROOT/.github/review-policy.yml"
+    return 0
+  fi
+  return 1
+}
 REPO_ROOT="$(cd "$HOOK_DIR/../.." && pwd)"
 CANON_AUTHOR_WRAPPER="$REPO_ROOT/scripts/gh-as-author.sh"
 CANON_REVIEWER_WRAPPER="$REPO_ROOT/scripts/gh-as-reviewer.sh"
@@ -1202,12 +1225,14 @@ if [ "$WRAPPER_KIND" = "author" ]; then
   # need no hook-specific variable — Codex P2 on PR #442 round 2),
   # then the fleet default.
   EXPECTED_AUTHOR="${GH_PR_GUARD_EXPECTED_AUTHOR:-}"
-  if [ -z "$EXPECTED_AUTHOR" ] && [ -f ".github/review-policy.yml" ]; then
+  GUARD_POLICY_FILE="$(guard_policy_file || true)"
+  if [ -z "$EXPECTED_AUTHOR" ] && [ -n "$GUARD_POLICY_FILE" ]; then
     # Strip surrounding double OR single quotes — both are valid YAML
     # scalars (`author_identity: "custom-owner"` / `'custom-owner'`),
     # matching the quote-tolerance of the sibling policy parsers
-    # (Codex P2s on PR #442 r6/r7).
-    EXPECTED_AUTHOR=$(grep -m1 '^author_identity:' ".github/review-policy.yml" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)
+    # (Codex P2s on PR #442 r6/r7). Policy located via upward walk +
+    # script-root fallback per r21.
+    EXPECTED_AUTHOR=$(grep -m1 '^author_identity:' "$GUARD_POLICY_FILE" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)
   fi
   EXPECTED_AUTHOR="${EXPECTED_AUTHOR:-nathanjohnpayne}"
   # Candidate model (Codex P1 on PR #442 r4): a same-segment prefix on
@@ -1451,7 +1476,7 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
         # additions + deletions from the PR JSON; over if sum >= threshold
         # OR threshold can't be determined (fail safe).
         threshold=""
-        policy_path=".github/review-policy.yml"
+        policy_path="$(guard_policy_file || true)"
         if [ -f "$policy_path" ]; then
           threshold=$(grep -oE '^[[:space:]]*external_review_threshold:[[:space:]]*[0-9]+' "$policy_path" | head -1 | grep -oE '[0-9]+$' || true)
         fi

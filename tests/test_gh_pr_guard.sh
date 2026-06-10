@@ -433,6 +433,13 @@ assert_rc_contains "unset builtin identity removal allowed in default repo" 0 ""
 assert_rc_contains "empty inline author override allowed in default repo" 0 "" \
   'GH_AS_AUTHOR_IDENTITY= scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 
+# Subdirectory invocation: the policy is found by upward walk (r21).
+mkdir -p "$WORKDIR/repo-custom-author/subdir"
+cd "$WORKDIR/repo-custom-author/subdir"
+assert_rc_contains "author identity policy found from a subdirectory" 2 "author identity" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
+
 # Quoted author_identity is valid YAML — double AND single quotes must
 # be stripped before comparison (Codex P2s on PR #442 r6/r7).
 mkdir -p "$WORKDIR/repo-quoted-author/.github"
