@@ -305,14 +305,23 @@ assert_rc_contains "author identity from review-policy.yml blocks the stock defa
   'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 cd "$ORIG_DIR"
 
-# Quoted author_identity is valid YAML — quotes must be stripped before
-# comparison (Codex P2 on PR #442 r6).
+# Quoted author_identity is valid YAML — double AND single quotes must
+# be stripped before comparison (Codex P2s on PR #442 r6/r7).
 mkdir -p "$WORKDIR/repo-quoted-author/.github"
 cat >"$WORKDIR/repo-quoted-author/.github/review-policy.yml" <<'YML'
 author_identity: "custom-owner"
 YML
 cd "$WORKDIR/repo-quoted-author"
-assert_rc_contains "quoted author_identity from review-policy.yml allows matching wrapper identity" 0 "" \
+assert_rc_contains "double-quoted author_identity allows matching wrapper identity" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=custom-owner scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
+
+mkdir -p "$WORKDIR/repo-squoted-author/.github"
+cat >"$WORKDIR/repo-squoted-author/.github/review-policy.yml" <<'YML'
+author_identity: 'custom-owner'
+YML
+cd "$WORKDIR/repo-squoted-author"
+assert_rc_contains "single-quoted author_identity allows matching wrapper identity" 0 "" \
   'GH_AS_AUTHOR_IDENTITY=custom-owner scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 cd "$ORIG_DIR"
 
