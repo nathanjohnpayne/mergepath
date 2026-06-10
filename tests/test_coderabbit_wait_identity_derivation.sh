@@ -38,9 +38,9 @@ make_case() {
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 available_reviewers:
-  - nathanpayne-claude
+  - nathanpayne-claude  # default agent
   - 'nathanpayne-cursor'
-  - "nathanpayne-codex"
+  - "nathanpayne-codex" # quoted + inline comment
 
 coderabbit:
   bot_login: "coderabbitai[bot]"
@@ -270,7 +270,23 @@ test_explicit_identity_skips_derivation() {
   fi
 }
 
+test_derives_identity_from_quoted_commented_entry() {
+  local dir rc args
+  dir=$(make_case "derived-codex-quoted-commented")
+  rc=$(run_case "$dir" nathanpayne-codex)
+  args=$(state_file "$dir" identity-args)
+
+  if [ "$args" != "nathanpayne-codex" ]; then
+    fail "quoted+commented entry: identity-check expected args 'nathanpayne-codex', got '$args'; stderr=$(cat "$dir/err.log")"
+  elif ! grep -q "derived expected reviewer identity 'nathanpayne-codex'" "$dir/err.log"; then
+    fail "quoted+commented entry: missing derivation log line; stderr=$(cat "$dir/err.log")"
+  else
+    pass "allow-list entry with quotes AND inline comment is normalized for derivation (rc=$rc)"
+  fi
+}
+
 test_derives_identity_from_allow_listed_token
+test_derives_identity_from_quoted_commented_entry
 test_non_allow_listed_token_fails_closed
 test_explicit_identity_skips_derivation
 
