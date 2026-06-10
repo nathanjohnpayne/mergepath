@@ -279,6 +279,14 @@ assert_rc_contains "exported-via-export-command matching author identity allowed
 assert_rc_contains "exported-via-export-command non-reviewer identity blocked" 2 "expected reviewer" \
   'export GH_AS_REVIEWER_IDENTITY=nathanpayne-codex ; scripts/gh-as-reviewer.sh -- gh pr comment 123 --body "ping"' "CLEAN" ""
 
+# Prefix-assignment BEFORE the export command in the same segment
+# (`VAR=x export VAR`) persists AND exports (Codex P1 on PR #442 r12).
+assert_rc_contains "prefix-then-export non-author identity blocked" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex export GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr comment 123 --body "@codex review"' "CLEAN" ""
+
+assert_rc_contains "prefix-then-export matching author identity allowed" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=nathanjohnpayne export GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
 # The custom-author shape from the r3 finding: standalone assignment of
 # the CUSTOM identity must NOT satisfy the guard — the wrapper would
 # actually verify its stock default.

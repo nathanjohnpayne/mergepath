@@ -842,6 +842,19 @@ for i in "${!TOKENS[@]}"; do
     IN_EXPORT_SEGMENT=1
     SEGMENT_HAS_COMMAND=1
     AT_COMMAND_POSITION=0
+    # A prefix assignment BEFORE the export command in the same
+    # segment (`VAR=x export VAR`) both persists in the shell and is
+    # exported — bash applies the prefix to the declaration builtin
+    # and the bare-name export then marks the variable. Promote any
+    # already-captured inline identity to the definitely-effective
+    # slots, or the separator path would discard it as an ordinary
+    # command prefix (Codex P1 on PR #442 r12 — wrong-byline class).
+    if [ -n "$INLINE_GH_AS_AUTHOR_IDENTITY" ]; then
+      STANDALONE_GH_AS_AUTHOR_IDENTITY="$INLINE_GH_AS_AUTHOR_IDENTITY"
+    fi
+    if [ -n "$INLINE_GH_AS_REVIEWER_IDENTITY" ]; then
+      STANDALONE_GH_AS_REVIEWER_IDENTITY="$INLINE_GH_AS_REVIEWER_IDENTITY"
+    fi
     continue
   fi
 
