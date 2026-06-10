@@ -517,7 +517,9 @@ test_non_bridge_path_passes_configured_identity() {
   dir=$(make_case "custom-author-no-bridge" 0 0)
   # Custom author_identity, NO bridging (token does not verify) — the
   # wrapper must still be told the configured login (Codex P2 r5).
-  printf 'author_identity: custom-owner\n' >>"$dir/.github/review-policy.yml"
+  # Single-quoted on purpose: the parser must strip both YAML quote
+  # styles (Codex P2 r9).
+  printf "author_identity: 'custom-owner'\n" >>"$dir/.github/review-policy.yml"
   rc=$(run_case "$dir" absent 0 reviewer-pat-456)
   identity=$(head -1 "$dir/state/author-identity-env" 2>/dev/null || printf '')
 

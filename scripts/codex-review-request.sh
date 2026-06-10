@@ -194,8 +194,10 @@ policy_top_field() {
   awk -v field="$field" '
     /^[^[:space:]#]/ && $1 == field":" {
       sub(/^[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^"/, "", $0)
-      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      # Both YAML quote styles (Codex P2 on PR #442 r9) — matching the
+      # quote-tolerance of the gh-pr-guard expected-author parser.
+      gsub(/^["\x27]/, "", $0)
+      gsub(/["\x27][[:space:]]*(#.*)?$/, "", $0)
       gsub(/[[:space:]]*#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)
       print
