@@ -873,6 +873,21 @@ for i in "${!TOKENS[@]}"; do
           STANDALONE_GH_AS_REVIEWER_IDENTITY="${tok#GH_AS_REVIEWER_IDENTITY=}"
           STANDALONE_GH_AS_REVIEWER_IDENTITY_SET=1
           ;;
+        GH_AS_AUTHOR_IDENTITY)
+          # Bare name as an `unset` argument: the variable is removed
+          # from the shell AND the child environment — the r15
+          # empty-override semantics, persisting past separators.
+          if [ "${DECLARATION_KIND:-}" = "unset" ]; then
+            STANDALONE_GH_AS_AUTHOR_IDENTITY=""
+            STANDALONE_GH_AS_AUTHOR_IDENTITY_SET=1
+          fi
+          ;;
+        GH_AS_REVIEWER_IDENTITY)
+          if [ "${DECLARATION_KIND:-}" = "unset" ]; then
+            STANDALONE_GH_AS_REVIEWER_IDENTITY=""
+            STANDALONE_GH_AS_REVIEWER_IDENTITY_SET=1
+          fi
+          ;;
       esac
     fi
     # Skipping arguments of an unrelated command. Stay until a
@@ -889,8 +904,9 @@ for i in "${!TOKENS[@]}"; do
   # MISMATCHED values, so the cost of the ambiguity is a false block
   # on a non-exported mismatched declaration, which is the fail-closed
   # direction for a byline guard.
-  case "$tok" in export|declare|typeset|readonly|local) IS_DECLARATION_BUILTIN=1 ;; *) IS_DECLARATION_BUILTIN=0 ;; esac
+  case "$tok" in export|declare|typeset|readonly|local|unset) IS_DECLARATION_BUILTIN=1 ;; *) IS_DECLARATION_BUILTIN=0 ;; esac
   if [ "$IS_DECLARATION_BUILTIN" -eq 1 ]; then
+    DECLARATION_KIND="$tok"
     IN_EXPORT_SEGMENT=1
     SEGMENT_HAS_COMMAND=1
     AT_COMMAND_POSITION=0

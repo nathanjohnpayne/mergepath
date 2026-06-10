@@ -391,6 +391,22 @@ cd "$ORIG_DIR"
 assert_rc_contains "env -u identity unset allowed in default repo" 0 "" \
   'env -u GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 
+# The unset BUILTIN persists past separators (preempted, r17 family).
+cd "$WORKDIR/repo-custom-author-empty"
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'unset GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+  pass "unset builtin identity removal fails closed in custom-author repo"
+else
+  fail "unset builtin identity removal fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+cd "$ORIG_DIR"
+
+assert_rc_contains "unset builtin identity removal allowed in default repo" 0 "" \
+  'unset GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
 # In a DEFAULT repo an empty override is a no-op (wrapper default ==
 # expected) and must not block.
 assert_rc_contains "empty inline author override allowed in default repo" 0 "" \
