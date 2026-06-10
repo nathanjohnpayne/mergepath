@@ -287,6 +287,14 @@ assert_rc_contains "prefix-then-export non-author identity blocked" 2 "author id
 assert_rc_contains "prefix-then-export matching author identity allowed" 0 "" \
   'GH_AS_AUTHOR_IDENTITY=nathanjohnpayne export GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 
+# declare -x is export-equivalent (Codex P1 r12 family, preempted).
+assert_rc_contains "declare -x non-author identity blocked" 2 "author identity" \
+  'declare -x GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# env-prefix on the wrapper command is a definitive same-segment prefix.
+assert_rc_contains "env-prefixed non-author identity blocked" 2 "author identity" \
+  'env GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
 # The custom-author shape from the r3 finding: standalone assignment of
 # the CUSTOM identity must NOT satisfy the guard — the wrapper would
 # actually verify its stock default.

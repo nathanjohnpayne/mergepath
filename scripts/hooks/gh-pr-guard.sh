@@ -835,10 +835,15 @@ for i in "${!TOKENS[@]}"; do
     continue
   fi
 
-  # `export` at command position: its assignment arguments reach all
-  # later processes. Flag the segment so the skip-path above captures
-  # the identity assignments that follow.
-  if [ "$tok" = "export" ]; then
+  # `export` (and its declaration-builtin equivalents `declare` /
+  # `typeset`, whose -x flag exports) at command position: assignment
+  # arguments can reach all later processes. Flag the segment so the
+  # skip-path above captures the identity assignments that follow.
+  # declare/typeset without -x are over-captured on purpose — the
+  # candidate model only blocks MISMATCHED values, so the cost of the
+  # ambiguity is a false block on a non-exported mismatched declare,
+  # which is the fail-closed direction for a byline guard.
+  if [ "$tok" = "export" ] || [ "$tok" = "declare" ] || [ "$tok" = "typeset" ]; then
     IN_EXPORT_SEGMENT=1
     SEGMENT_HAS_COMMAND=1
     AT_COMMAND_POSITION=0
