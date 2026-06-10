@@ -291,6 +291,15 @@ paths:
   - path: scripts/codex-p1-gate.sh
     type: canonical
     consumers: all
+  # Hub-side fleet audit for the propagation lane (#434); consumers
+  # receive it because the scripts/ci kit's check_propagation_lane_audit
+  # hard-requires it (and its offline test) on every lint run.
+  - path: scripts/audit-propagation-lane.sh
+    type: canonical
+    consumers: all
+  - path: tests/test_audit_propagation_lane.sh
+    type: canonical
+    consumers: all
   - path: scripts/merge-clearance-gate.sh
     # HEAD-pinned merge-clearance gate (#427/#428). The external-review
     # path delegates to scripts/codex-review-check.sh (with CI checking
@@ -615,6 +624,8 @@ paths:
       - "tests/test_template_substitution.sh"  # check_template_substitution
       - "tests/test_export_consumer_facts.sh"  # check_export_consumer_facts
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
+      - "tests/test_audit_propagation_lane.sh" # check_propagation_lane_audit
+      - "scripts/audit-propagation-lane.sh"    # check_propagation_lane_audit
       - "scripts/codex-p1-gate.sh"             # check_codex_p1_gate
       - "scripts/merge-clearance-gate.sh"      # check_merge_clearance_gate
       - "scripts/codex-review-request.sh"      # check_codex_scripts
