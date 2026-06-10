@@ -380,10 +380,12 @@ A **propagation PR** — one opened by `scripts/sync-to-downstream.sh` to mirror
 
 The lane closes that mismatch. `.github/workflows/pr-review-policy.yml`'s External Review Check recognizes a propagation PR and **exempts it from the `needs-external-review` label** — and removes the label if a prior run applied it — when **all** of the following hold:
 
-1. `propagation_prs.enabled: true` in `.github/review-policy.yml`.
-2. The PR branch name starts with `propagation_prs.branch_prefix` (must match `SYNC_BRANCH_PREFIX` in `scripts/sync-to-downstream.sh`).
+1. The lane is enabled. **Default: ON** ([#434](https://github.com/nathanjohnpayne/mergepath/issues/434)) — an absent `propagation_prs:` block (or absent `enabled` key) in `.github/review-policy.yml` counts as enabled; an explicit `propagation_prs.enabled: false` opts the repo out. The flag originally required an explicit `enabled: true`, but `review-policy.yml` is intentionally never propagated, so no consumer had the block and the lane was dormant fleet-wide — an enable flag must not live solely in a never-synced file. The default adds no new trust: recognition is still gated on criterion 4's byte-level verification, and a PR cannot grant itself the default because the config is read from the PR's base commit.
+2. The PR branch name starts with `propagation_prs.branch_prefix` (default `mergepath-sync/` when absent; must match `SYNC_BRANCH_PREFIX` in `scripts/sync-to-downstream.sh`).
 3. The PR author is `author_identity` — the propagation actor.
 4. The PR is a **verified byte-for-byte faithful mirror** of `mergepath` at the source commit. This is the load-bearing teeth.
+
+A regression net rides the weekly drift audit: `scripts/audit-propagation-lane.sh` checks every consumer's live default branch for the three lane preconditions a file-drift audit alone can't see together (lane code present in the synced workflow, no unexpected `enabled: false`, `author_identity` present) and fails the `weekly-drift-audit.yml` run when the lane would not fire on a consumer.
 
 Path-confinement alone is **not** sufficient — `.github/workflows/*` *is* propagation surface, so a check that only asked "is every changed file under a manifest path?" would let a `mergepath-sync/**` PR hand-edit a workflow and skip review (Codex P1 on [#268](https://github.com/nathanjohnpayne/mergepath/issues/268)). Criterion 4 is therefore a real content comparison:
 
