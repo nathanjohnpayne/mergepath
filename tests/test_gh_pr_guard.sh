@@ -345,6 +345,31 @@ assert_rc_contains "author identity from review-policy.yml blocks the stock defa
   'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 cd "$ORIG_DIR"
 
+# An EMPTY inline override resets the wrapper to its hardcoded default
+# (Codex P1 on PR #442 r15): in a custom-author repo that is a
+# wrong-byline reset and must fail closed, even when the hook's own
+# environment carries the correct custom identity.
+mkdir -p "$WORKDIR/repo-custom-author-empty/.github"
+cat >"$WORKDIR/repo-custom-author-empty/.github/review-policy.yml" <<'YML'
+author_identity: custom-owner
+YML
+cd "$WORKDIR/repo-custom-author-empty"
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'GH_AS_AUTHOR_IDENTITY= scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+  pass "empty inline author override fails closed in custom-author repo"
+else
+  fail "empty inline author override fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+cd "$ORIG_DIR"
+
+# In a DEFAULT repo an empty override is a no-op (wrapper default ==
+# expected) and must not block.
+assert_rc_contains "empty inline author override allowed in default repo" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY= scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
 # Quoted author_identity is valid YAML — double AND single quotes must
 # be stripped before comparison (Codex P2s on PR #442 r6/r7).
 mkdir -p "$WORKDIR/repo-quoted-author/.github"

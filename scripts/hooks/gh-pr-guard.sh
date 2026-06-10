@@ -610,6 +610,15 @@ INLINE_GH_AS_REVIEWER_IDENTITY=""
 # Codex P1 on PR #442 r4.
 STANDALONE_GH_AS_AUTHOR_IDENTITY=""
 STANDALONE_GH_AS_REVIEWER_IDENTITY=""
+# Set-ness flags: an EMPTY assignment (`GH_AS_AUTHOR_IDENTITY= wrapper`)
+# is NOT absent — it resets the wrapper to its hardcoded default, which
+# in a custom-author repo differs from the expected author (Codex P1 on
+# PR #442 r15). Every capture records both the value and that an
+# assignment happened.
+INLINE_GH_AS_AUTHOR_IDENTITY_SET=0
+INLINE_GH_AS_REVIEWER_IDENTITY_SET=0
+STANDALONE_GH_AS_AUTHOR_IDENTITY_SET=0
+STANDALONE_GH_AS_REVIEWER_IDENTITY_SET=0
 GLOBAL_REPO=""
 PR_SUBCOMMAND=""
 PR_SUBCOMMAND_INDEX=-1    # index in TOKENS where the gh pr subcommand was found
@@ -776,16 +785,20 @@ for i in "${!TOKENS[@]}"; do
         # assignments are standalone-equivalent; assignments that
         # were prefixes TO the eval are over-captured on purpose,
         # the fail-closed direction).
-        if [ -n "$INLINE_GH_AS_AUTHOR_IDENTITY" ]; then
+        if [ "$INLINE_GH_AS_AUTHOR_IDENTITY_SET" -eq 1 ]; then
           STANDALONE_GH_AS_AUTHOR_IDENTITY="$INLINE_GH_AS_AUTHOR_IDENTITY"
+          STANDALONE_GH_AS_AUTHOR_IDENTITY_SET=1
         fi
-        if [ -n "$INLINE_GH_AS_REVIEWER_IDENTITY" ]; then
+        if [ "$INLINE_GH_AS_REVIEWER_IDENTITY_SET" -eq 1 ]; then
           STANDALONE_GH_AS_REVIEWER_IDENTITY="$INLINE_GH_AS_REVIEWER_IDENTITY"
+          STANDALONE_GH_AS_REVIEWER_IDENTITY_SET=1
         fi
       fi
       SEGMENT_HAS_EVAL=0
       INLINE_GH_AS_AUTHOR_IDENTITY=""
       INLINE_GH_AS_REVIEWER_IDENTITY=""
+      INLINE_GH_AS_AUTHOR_IDENTITY_SET=0
+      INLINE_GH_AS_REVIEWER_IDENTITY_SET=0
       SEGMENT_HAS_COMMAND=0
       continue
       ;;
@@ -812,9 +825,11 @@ for i in "${!TOKENS[@]}"; do
         ;;
       GH_AS_AUTHOR_IDENTITY=*)
         INLINE_GH_AS_AUTHOR_IDENTITY="${tok#GH_AS_AUTHOR_IDENTITY=}"
+        INLINE_GH_AS_AUTHOR_IDENTITY_SET=1
         ;;
       GH_AS_REVIEWER_IDENTITY=*)
         INLINE_GH_AS_REVIEWER_IDENTITY="${tok#GH_AS_REVIEWER_IDENTITY=}"
+        INLINE_GH_AS_REVIEWER_IDENTITY_SET=1
         ;;
     esac
   fi
@@ -832,9 +847,11 @@ for i in "${!TOKENS[@]}"; do
       case "$tok" in
         GH_AS_AUTHOR_IDENTITY=*)
           STANDALONE_GH_AS_AUTHOR_IDENTITY="${tok#GH_AS_AUTHOR_IDENTITY=}"
+          STANDALONE_GH_AS_AUTHOR_IDENTITY_SET=1
           ;;
         GH_AS_REVIEWER_IDENTITY=*)
           STANDALONE_GH_AS_REVIEWER_IDENTITY="${tok#GH_AS_REVIEWER_IDENTITY=}"
+          STANDALONE_GH_AS_REVIEWER_IDENTITY_SET=1
           ;;
       esac
     fi
@@ -864,11 +881,13 @@ for i in "${!TOKENS[@]}"; do
     # already-captured inline identity to the definitely-effective
     # slots, or the separator path would discard it as an ordinary
     # command prefix (Codex P1 on PR #442 r12 — wrong-byline class).
-    if [ -n "$INLINE_GH_AS_AUTHOR_IDENTITY" ]; then
+    if [ "$INLINE_GH_AS_AUTHOR_IDENTITY_SET" -eq 1 ]; then
       STANDALONE_GH_AS_AUTHOR_IDENTITY="$INLINE_GH_AS_AUTHOR_IDENTITY"
+      STANDALONE_GH_AS_AUTHOR_IDENTITY_SET=1
     fi
-    if [ -n "$INLINE_GH_AS_REVIEWER_IDENTITY" ]; then
+    if [ "$INLINE_GH_AS_REVIEWER_IDENTITY_SET" -eq 1 ]; then
       STANDALONE_GH_AS_REVIEWER_IDENTITY="$INLINE_GH_AS_REVIEWER_IDENTITY"
+      STANDALONE_GH_AS_REVIEWER_IDENTITY_SET=1
     fi
     continue
   fi
@@ -1130,12 +1149,15 @@ if [ "$WRAPPER_KIND" = "author" ]; then
   # attribute, which the hook cannot observe). Every possibly-effective
   # candidate must match the expected author — fail closed on the
   # ambiguity.
-  if [ -n "$INLINE_GH_AS_AUTHOR_IDENTITY" ]; then
-    AUTHOR_IDENTITY_CANDIDATES="$INLINE_GH_AS_AUTHOR_IDENTITY"
+  if [ "$INLINE_GH_AS_AUTHOR_IDENTITY_SET" -eq 1 ]; then
+    # Same-segment prefix is definitive. An EMPTY override is not
+    # "absent" — it resets the wrapper to its hardcoded default
+    # (Codex P1 on PR #442 r15).
+    AUTHOR_IDENTITY_CANDIDATES="${INLINE_GH_AS_AUTHOR_IDENTITY:-nathanjohnpayne}"
   else
     AUTHOR_IDENTITY_CANDIDATES="${GH_AS_AUTHOR_IDENTITY:-nathanjohnpayne}"
-    if [ -n "$STANDALONE_GH_AS_AUTHOR_IDENTITY" ]; then
-      AUTHOR_IDENTITY_CANDIDATES="$AUTHOR_IDENTITY_CANDIDATES $STANDALONE_GH_AS_AUTHOR_IDENTITY"
+    if [ "$STANDALONE_GH_AS_AUTHOR_IDENTITY_SET" -eq 1 ]; then
+      AUTHOR_IDENTITY_CANDIDATES="$AUTHOR_IDENTITY_CANDIDATES ${STANDALONE_GH_AS_AUTHOR_IDENTITY:-nathanjohnpayne}"
     fi
   fi
   for WRAPPER_AUTHOR_IDENTITY in $AUTHOR_IDENTITY_CANDIDATES; do
@@ -1180,16 +1202,22 @@ if [ "$PR_SUBCOMMAND" = "comment" ] || [ "$PR_SUBCOMMAND" = "review" ] || [ "$IS
     # #442 r4): a same-segment prefix is definitive; otherwise both
     # the env/default resolution AND any standalone assignment from an
     # earlier segment are possibly effective and must ALL match.
-    if [ -n "$INLINE_GH_AS_REVIEWER_IDENTITY" ]; then
-      REVIEWER_IDENTITY_CANDIDATES="$INLINE_GH_AS_REVIEWER_IDENTITY"
+    # The wrapper resolves an EMPTY GH_AS_REVIEWER_IDENTITY through its
+    # env-free chain (MERGEPATH_AGENT, then nathanpayne-claude) — an
+    # empty-set assignment maps to that, not to "absent" (r15).
+    REVIEWER_EMPTY_FALLBACK="nathanpayne-claude"
+    if [ -n "${MERGEPATH_AGENT:-}" ]; then
+      REVIEWER_EMPTY_FALLBACK="nathanpayne-$MERGEPATH_AGENT"
+    fi
+    if [ "$INLINE_GH_AS_REVIEWER_IDENTITY_SET" -eq 1 ]; then
+      REVIEWER_IDENTITY_CANDIDATES="${INLINE_GH_AS_REVIEWER_IDENTITY:-$REVIEWER_EMPTY_FALLBACK}"
     else
       REVIEWER_IDENTITY_CANDIDATES="${GH_AS_REVIEWER_IDENTITY:-}"
-      if [ -z "$REVIEWER_IDENTITY_CANDIDATES" ] && [ -n "${MERGEPATH_AGENT:-}" ]; then
-        REVIEWER_IDENTITY_CANDIDATES="nathanpayne-$MERGEPATH_AGENT"
+      if [ -z "$REVIEWER_IDENTITY_CANDIDATES" ]; then
+        REVIEWER_IDENTITY_CANDIDATES="$REVIEWER_EMPTY_FALLBACK"
       fi
-      REVIEWER_IDENTITY_CANDIDATES="${REVIEWER_IDENTITY_CANDIDATES:-nathanpayne-claude}"
-      if [ -n "$STANDALONE_GH_AS_REVIEWER_IDENTITY" ]; then
-        REVIEWER_IDENTITY_CANDIDATES="$REVIEWER_IDENTITY_CANDIDATES $STANDALONE_GH_AS_REVIEWER_IDENTITY"
+      if [ "$STANDALONE_GH_AS_REVIEWER_IDENTITY_SET" -eq 1 ]; then
+        REVIEWER_IDENTITY_CANDIDATES="$REVIEWER_IDENTITY_CANDIDATES ${STANDALONE_GH_AS_REVIEWER_IDENTITY:-$REVIEWER_EMPTY_FALLBACK}"
       fi
     fi
     for WRAPPER_REVIEWER_IDENTITY in $REVIEWER_IDENTITY_CANDIDATES; do
