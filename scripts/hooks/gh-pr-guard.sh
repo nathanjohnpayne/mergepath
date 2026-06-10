@@ -624,6 +624,8 @@ SKIP_PREFIX_VALUE=0      # 1 = next token is the value of a prefix-command flag
 CURRENT_PREFIX=""        # name of the most recently seen prefix command (sudo/time/etc.)
 IN_EXPORT_SEGMENT=0      # 1 = current segment is an `export` command (its
                          # assignment args reach all later processes)
+SEGMENT_HAS_EVAL=0       # 1 = current segment ran `eval` — an eval'd
+                         # assignment persists like a bare standalone
 for i in "${!TOKENS[@]}"; do
   tok="${TOKENS[$i]}"
   # --- phase 2: walking after gh, looking for pr + subcommand ---
@@ -768,7 +770,12 @@ for i in "${!TOKENS[@]}"; do
       #     fail closed on the ambiguity (this also covers r3, where
       #     an unexported standalone value would have masked the
       #     wrapper falling back to its stock default).
-      if [ "$SEGMENT_HAS_COMMAND" -eq 0 ]; then
+      if [ "$SEGMENT_HAS_COMMAND" -eq 0 ] || [ "${SEGMENT_HAS_EVAL:-0}" -eq 1 ]; then
+        # Bare standalone segment, or an eval segment — in both, a
+        # captured assignment persists past the separator (eval'd
+        # assignments are standalone-equivalent; assignments that
+        # were prefixes TO the eval are over-captured on purpose,
+        # the fail-closed direction).
         if [ -n "$INLINE_GH_AS_AUTHOR_IDENTITY" ]; then
           STANDALONE_GH_AS_AUTHOR_IDENTITY="$INLINE_GH_AS_AUTHOR_IDENTITY"
         fi
@@ -776,6 +783,7 @@ for i in "${!TOKENS[@]}"; do
           STANDALONE_GH_AS_REVIEWER_IDENTITY="$INLINE_GH_AS_REVIEWER_IDENTITY"
         fi
       fi
+      SEGMENT_HAS_EVAL=0
       INLINE_GH_AS_AUTHOR_IDENTITY=""
       INLINE_GH_AS_REVIEWER_IDENTITY=""
       SEGMENT_HAS_COMMAND=0
@@ -895,6 +903,16 @@ for i in "${!TOKENS[@]}"; do
       # tell value-taking flags from boolean ones — short flags
       # like `-p` mean different things to different commands
       # (boolean for time, value-taking for ionice/sudo).
+      #
+      # eval is special: it executes its arguments as a NEW command
+      # line, so an assignment argument (`eval VAR=x`) becomes a
+      # STANDALONE assignment persisting in the shell — unlike an
+      # ordinary prefix the shell restores. The separator path
+      # promotes captured identities from eval segments to the
+      # possibly-effective slots instead of discarding them.
+      if [ "$tok" = "eval" ]; then
+        SEGMENT_HAS_EVAL=1
+      fi
       CURRENT_PREFIX="$tok"
       continue
       ;;

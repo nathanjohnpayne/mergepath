@@ -295,6 +295,11 @@ assert_rc_contains "declare -x non-author identity blocked" 2 "author identity" 
 assert_rc_contains "env-prefixed non-author identity blocked" 2 "author identity" \
   'env GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 
+# eval'd assignments persist like bare standalones (preempted, r14
+# family): possibly-effective, so a mismatch fails closed.
+assert_rc_contains "eval'd non-author identity assignment fails closed" 2 "author identity" \
+  'eval GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
 # readonly -x exports too (Codex P1 on PR #442 r14, hook-verified).
 assert_rc_contains "readonly -x non-author identity blocked" 2 "author identity" \
   'readonly -x GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr create --title "t" --body "Authoring-Agent: claude
