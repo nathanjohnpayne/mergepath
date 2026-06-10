@@ -41,9 +41,14 @@ AUTHOR="${GH_AS_AUTHOR_IDENTITY:-nathanjohnpayne}"
 # review-policy.yml, the resolved AUTHOR must match it; otherwise the
 # write would land under the wrong byline no matter which token
 # verifies.
+# Resolve the policy from the wrapper's own repo root, not the
+# caller's cwd — a subdirectory invocation must still load the pin
+# (Codex P2 on PR #442 r20). $ROOT is computed from BASH_SOURCE at
+# the top of this script; in consumers the wrapper is synced into the
+# repo it writes to, so script root == target repo root.
 WRAPPER_POLICY_AUTHOR=""
-if [ -f ".github/review-policy.yml" ]; then
-  WRAPPER_POLICY_AUTHOR=$(grep -m1 '^author_identity:' ".github/review-policy.yml" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)
+if [ -f "$ROOT/.github/review-policy.yml" ]; then
+  WRAPPER_POLICY_AUTHOR=$(grep -m1 '^author_identity:' "$ROOT/.github/review-policy.yml" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)
 fi
 if [ -n "$WRAPPER_POLICY_AUTHOR" ] && [ "$AUTHOR" != "$WRAPPER_POLICY_AUTHOR" ]; then
   echo "gh-as-author: refusing to run as '$AUTHOR' — this repo's review-policy.yml declares author_identity: $WRAPPER_POLICY_AUTHOR (#438 runtime byline pin)." >&2
