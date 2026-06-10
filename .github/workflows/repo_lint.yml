@@ -138,6 +138,14 @@ jobs:
       - name: check_verify_propagation_pr
         run: ./scripts/ci/check_verify_propagation_pr
 
+      # check_propagation_lane_audit exercises the #434 lane regression
+      # net (scripts/audit-propagation-lane.sh): the lane's per-consumer
+      # preconditions are evaluated offline against fixture file pairs,
+      # and the audit's default-ON marker is pinned to the literal in
+      # pr-review-policy.yml so the two cannot silently diverge.
+      - name: check_propagation_lane_audit
+        run: ./scripts/ci/check_propagation_lane_audit
+
       # check_workflow_verify_propagation_templated exercises the
       # templated-surface arm of verify-propagation-pr.sh (#323) —
       # the re-render + byte-verify path that closes the propagation

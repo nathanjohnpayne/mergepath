@@ -59,6 +59,14 @@ external_review_paths:
 # because the content is not novel. See REVIEW_POLICY.md § Propagation
 # PR review lane.
 #
+# DEFAULT-ON (#434): the lane is enabled when this block (or the
+# `enabled` key) is ABSENT from a repo's review-policy.yml. This file
+# is intentionally not synced, so requiring an explicit `enabled: true`
+# here left the lane dormant on every consumer — the enable flag must
+# not live solely in a never-propagated file. The block below is
+# therefore documentary for mergepath itself; consumers need no edit.
+# `branch_prefix` likewise defaults to "mergepath-sync/" when absent.
+#
 # Set enabled: false to require full external review on sync PRs too
 # (e.g. a security-sensitive consumer that wants every byte re-reviewed
 # on arrival regardless of upstream provenance).

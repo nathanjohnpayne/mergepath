@@ -35,6 +35,9 @@ fallback (Phase 4b).
 | `BRAND.md` | Mergepath umbrella vocabulary (surfaces, reserved names, naming history) |
 | `mergepath/playground/index.html` | Mergepath Playground — tune the review policy and replay recent PRs against the draft |
 | `scripts/policy-sim.sh` | Bakes real `gh` PR data into a temp copy of the Mergepath Playground for local replay |
+| `.mergepath-sync.yml` | Propagation manifest for synced canonical, kit, and templated surfaces |
+| `.github/ISSUE_TEMPLATE/` | Synced issue-template kit; consumers may add product-specific templates |
+| `.github/pull_request_template.md` | Synced canonical pull-request template |
 | `ai_agent_tooling_standard.md` | Full repository standard (reference) |
 
 ## Firebase Auth Template
