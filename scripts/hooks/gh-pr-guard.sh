@@ -637,6 +637,8 @@ SEGMENT_HAS_EVAL=0       # 1 = current segment ran `eval` — an eval'd
                          # assignment persists like a bare standalone
 PENDING_PREFIX_FLAG=""   # "<prefix>:<flag>" whose value the next token is
                          # (lets the consumer recognize `env -u NAME`)
+IDENTITY_ENV_CLEARED_FOR_WRAPPER=0  # 1 = env -i seen: the wrapper sees an
+                         # EMPTY environment (no MERGEPATH_AGENT either)
 for i in "${!TOKENS[@]}"; do
   tok="${TOKENS[$i]}"
   # --- phase 2: walking after gh, looking for pr + subcommand ---
@@ -1017,6 +1019,12 @@ for i in "${!TOKENS[@]}"; do
             INLINE_GH_AS_AUTHOR_IDENTITY_SET=1
             INLINE_GH_AS_REVIEWER_IDENTITY=""
             INLINE_GH_AS_REVIEWER_IDENTITY_SET=1
+            # env -i clears EVERYTHING the wrapper would see —
+            # including MERGEPATH_AGENT — so the reviewer fallback
+            # must be the wrapper's bare hardcoded default, not the
+            # hook environment's agent chain (Codex P1 on PR #442
+            # r19).
+            IDENTITY_ENV_CLEARED_FOR_WRAPPER=1
             continue
             ;;
         esac
@@ -1268,7 +1276,10 @@ if [ "$PR_SUBCOMMAND" = "comment" ] || [ "$PR_SUBCOMMAND" = "review" ] || [ "$IS
     # env-free chain (MERGEPATH_AGENT, then nathanpayne-claude) — an
     # empty-set assignment maps to that, not to "absent" (r15).
     REVIEWER_EMPTY_FALLBACK="nathanpayne-claude"
-    if [ -n "${MERGEPATH_AGENT:-}" ]; then
+    if [ -n "${MERGEPATH_AGENT:-}" ] && [ "$IDENTITY_ENV_CLEARED_FOR_WRAPPER" -eq 0 ]; then
+      # env -i strips MERGEPATH_AGENT from the wrapper too — in that
+      # case the wrapper's chain bottoms out at its hardcoded default
+      # regardless of the hook environment (r19).
       REVIEWER_EMPTY_FALLBACK="nathanpayne-$MERGEPATH_AGENT"
     fi
     if [ "$INLINE_GH_AS_REVIEWER_IDENTITY_SET" -eq 1 ]; then

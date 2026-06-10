@@ -165,6 +165,61 @@ else
   fail "empty command: rc=$rc expected 1"
 fi
 
+# --- runtime byline pin (#438) ----------------------------------------
+# Runs IN the wrapper process: environment-manipulation-proof, unlike
+# the PreToolUse hook's static analysis.
+
+PIN_DIR="$WORKDIR/pin-repo"
+mkdir -p "$PIN_DIR/.github"
+printf 'author_identity: nathanjohnpayne\n' >"$PIN_DIR/.github/review-policy.yml"
+
+reset_log
+set +e
+( cd "$PIN_DIR" && OP_PREFLIGHT_AUTHOR_PAT="author-token" GH_AS_AUTHOR_IDENTITY="nathanpayne-codex" \
+    PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$WRAPPER" -- gh pr merge 9 --squash ) >/dev/null 2>"$WORKDIR/pin.err"
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && grep -q "runtime byline pin" "$WORKDIR/pin.err"; then
+  pass "runtime pin: non-policy identity refused before any gh call"
+else
+  fail "runtime pin: expected rc=2 with pin message; rc=$rc err=$(cat "$WORKDIR/pin.err")"
+fi
+if grep -q $'gh\tpr\tmerge' "$WORKDIR/calls.log"; then
+  fail "runtime pin: wrapped command ran despite the refusal"
+else
+  pass "runtime pin: no wrapped command executed on refusal"
+fi
+
+PIN_DIR2="$WORKDIR/pin-repo-custom"
+mkdir -p "$PIN_DIR2/.github"
+printf "author_identity: 'custom-author'\n" >"$PIN_DIR2/.github/review-policy.yml"
+
+reset_log
+set +e
+( cd "$PIN_DIR2" && GH_AS_AUTHOR_IDENTITY="custom-author" \
+    PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$WRAPPER" -- gh pr merge 9 --squash ) >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q $'GH_TOKEN=fallback-custom-author-token GITHUB_TOKEN= gh\tpr\tmerge\t9\t--squash' "$WORKDIR/calls.log"; then
+  pass "runtime pin: matching custom identity (quoted policy) proceeds with its token"
+else
+  fail "runtime pin: matching custom identity should proceed; rc=$rc calls=$(cat "$WORKDIR/calls.log")"
+fi
+
+NO_POLICY_DIR="$WORKDIR/pin-repo-none"
+mkdir -p "$NO_POLICY_DIR"
+reset_log
+set +e
+( cd "$NO_POLICY_DIR" && OP_PREFLIGHT_AUTHOR_PAT="author-token" \
+    PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$WRAPPER" -- gh pr merge 9 --squash ) >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "runtime pin: absent policy file keeps legacy behavior"
+else
+  fail "runtime pin: absent policy file should not block; rc=$rc"
+fi
+
 echo ""
 echo "test_gh_as_author: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
