@@ -1045,7 +1045,10 @@ if [ "$WRAPPER_KIND" = "author" ]; then
   # then the fleet default.
   EXPECTED_AUTHOR="${GH_PR_GUARD_EXPECTED_AUTHOR:-}"
   if [ -z "$EXPECTED_AUTHOR" ] && [ -f ".github/review-policy.yml" ]; then
-    EXPECTED_AUTHOR=$(grep -m1 '^author_identity:' ".github/review-policy.yml" | awk '{print $2}' || true)
+    # Strip surrounding double quotes — `author_identity: "custom-owner"`
+    # is valid YAML and the same quote-tolerance the policy parsers in
+    # codex-review-request.sh / the lane apply (Codex P2 on PR #442 r6).
+    EXPECTED_AUTHOR=$(grep -m1 '^author_identity:' ".github/review-policy.yml" | awk '{print $2}' | sed -E 's/^"//; s/"$//' || true)
   fi
   EXPECTED_AUTHOR="${EXPECTED_AUTHOR:-nathanjohnpayne}"
   # Candidate model (Codex P1 on PR #442 r4): a same-segment prefix on
