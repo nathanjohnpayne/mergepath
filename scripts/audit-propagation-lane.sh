@@ -113,6 +113,15 @@ lane_status_for_files() {  # <label> <policy-file-or-empty> <workflow-file-or-em
     echo "  ⚠ $label: propagation_prs.enabled: false — explicit opt-out; lane will NOT fire (exclude this consumer via --repos if intentional)"
     return 1
   fi
+  # The lane enters only when PROP_ENABLED is exactly 'true' after
+  # defaulting (absent → true). Any other present value — TRUE, False,
+  # typos — leaves the lane dark even though YAML may consider it a
+  # boolean; mirror the lane's exact-match semantics here (Codex P2 on
+  # PR #444 r4).
+  if [ -n "$enabled" ] && [ "$enabled" != "true" ]; then
+    echo "  ✗ $label: propagation_prs.enabled is '$enabled' — the lane only fires on exactly 'true' (or an absent key); normalize the value or remove the key"
+    return 1
+  fi
   # An overridden branch_prefix that doesn't match what
   # sync-to-downstream.sh actually opens means the lane never matches a
   # real sync PR — report would-not-fire, not healthy (Codex P2 on
