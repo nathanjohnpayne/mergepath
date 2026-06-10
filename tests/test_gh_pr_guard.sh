@@ -391,6 +391,27 @@ cd "$ORIG_DIR"
 assert_rc_contains "env -u identity unset allowed in default repo" 0 "" \
   'env -u GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 
+# Space-separated long form: `env --unset NAME` (Codex P1 r18) — the
+# value flag must be consumed or the walk loses the wrapper entirely
+# and skips ALL checks.
+cd "$WORKDIR/repo-custom-author-empty"
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'env --unset GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+  pass "env --unset NAME (space form) fails closed in custom-author repo"
+else
+  fail "env --unset NAME (space form) fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+cd "$ORIG_DIR"
+
+# ...and in a default repo the walk must still SEE the wrapper and
+# evaluate the merge-state checks (BLOCKED state proves the walk
+# reached the merge guard rather than bailing at the unset arg).
+assert_rc_contains "env --unset NAME still reaches merge-state checks" 2 "mergeStateStatus is BLOCKED" \
+  'env --unset GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "BLOCKED" ""
+
 # The unset BUILTIN persists past separators (preempted, r17 family).
 cd "$WORKDIR/repo-custom-author-empty"
 set +e

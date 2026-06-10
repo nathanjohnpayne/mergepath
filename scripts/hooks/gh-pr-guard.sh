@@ -367,7 +367,7 @@ prefix_flag_takes_value() {
     ionice:-c|ionice:-n|ionice:-p)
       return 0
       ;;
-    env:-u|env:-S)
+    env:-u|env:-S|env:--unset)
       return 0
       ;;
   esac
@@ -725,7 +725,7 @@ for i in "${!TOKENS[@]}"; do
     # r15 empty-override semantics — the wrapper falls back to its
     # hardcoded default, which a custom-author repo must fail closed
     # on (Codex P2 on PR #442 r17, env --help verified).
-    if [ "$PENDING_PREFIX_FLAG" = "env:-u" ]; then
+    if [ "$PENDING_PREFIX_FLAG" = "env:-u" ] || [ "$PENDING_PREFIX_FLAG" = "env:--unset" ]; then
       case "$tok" in
         GH_AS_AUTHOR_IDENTITY)
           INLINE_GH_AS_AUTHOR_IDENTITY=""
