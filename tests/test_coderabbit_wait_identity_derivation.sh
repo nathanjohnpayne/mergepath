@@ -39,8 +39,8 @@ make_case() {
   cat >"$dir/.github/review-policy.yml" <<'EOF'
 available_reviewers:
   - nathanpayne-claude
-  - nathanpayne-cursor
-  - nathanpayne-codex
+  - 'nathanpayne-cursor'
+  - "nathanpayne-codex"
 
 coderabbit:
   bot_login: "coderabbitai[bot]"

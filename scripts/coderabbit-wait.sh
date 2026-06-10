@@ -228,7 +228,7 @@ read_available_reviewers() {
     /^available_reviewers:/ {in_block=1; next}
     in_block && /^[^[:space:]#]/ {in_block=0}
     in_block && /^ *-/ {print}
-  ' "$CONFIG" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/'
+  ' "$CONFIG" | sed -E "s/^[[:space:]]*-[[:space:]]*[\"']?([^\"']*)[\"']?[[:space:]]*\$/\1/"
 }
 
 login_is_available_reviewer() {
