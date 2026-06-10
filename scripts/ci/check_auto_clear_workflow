@@ -208,7 +208,13 @@ perm_block=$(
 # expected set below now codifies the single-key shape so re-adding
 # `checks: read` fails this check instead of silently breaking the
 # workflow at runtime.
-expected_perms=$'actions: read\nchecks: write\ncontents: read\npull-requests: write'
+# `issues: read` added in #431 — codex-review-check.sh reads
+# /issues/{pr}/reactions (Codex 👍 clearance) and
+# /issues/{pr}/timeline (force-push anchor). On restricted-default
+# GITHUB_TOKEN repos an omitted scope is `none`, those reads 403,
+# and the gate aborts rc=3 with `needs-external-review` stuck. Same
+# class as the merge-clearance-gate.yml `issues: read` fix (#429).
+expected_perms=$'actions: read\nchecks: write\ncontents: read\nissues: read\npull-requests: write'
 if [ "$perm_block" = "$expected_perms" ]; then
   pass=$((pass + 1))
   echo "  PASS: workflow permissions exactly match the least-privilege set"

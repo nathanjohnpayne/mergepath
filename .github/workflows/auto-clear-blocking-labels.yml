@@ -66,6 +66,15 @@ permissions:
   # nathanjohnpayne/matchline#233 (#306 propagation canary); see
   # #310 for the full repro + permission scope rationale.
   actions: read
+  # `issues: read` is required because codex-review-check.sh reads
+  # issues-scoped endpoints: /issues/{pr}/reactions (Codex 👍
+  # clearance) and /issues/{pr}/timeline (force-push anchor). On a
+  # restricted-default GITHUB_TOKEN an omitted scope defaults to
+  # `none`, so those reads 403 and the gate aborts with rc=3,
+  # leaving `needs-external-review` stuck even after Codex clears.
+  # Same class as the merge-clearance-gate.yml fix on PR #429; see
+  # #431.
+  issues: read
   # `checks: write` is required so the "Surface infra failure as
   # check-run" step (#324) can POST a failed check-run to the PR's
   # checks tab when this workflow hits an infrastructure error
