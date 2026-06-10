@@ -835,15 +835,17 @@ for i in "${!TOKENS[@]}"; do
     continue
   fi
 
-  # `export` (and its declaration-builtin equivalents `declare` /
-  # `typeset`, whose -x flag exports) at command position: assignment
-  # arguments can reach all later processes. Flag the segment so the
-  # skip-path above captures the identity assignments that follow.
-  # declare/typeset without -x are over-captured on purpose — the
-  # candidate model only blocks MISMATCHED values, so the cost of the
-  # ambiguity is a false block on a non-exported mismatched declare,
-  # which is the fail-closed direction for a byline guard.
-  if [ "$tok" = "export" ] || [ "$tok" = "declare" ] || [ "$tok" = "typeset" ]; then
+  # Declaration builtins (`export`, `declare`, `typeset`, `readonly`,
+  # `local`) at command position: their assignment arguments can reach
+  # all later processes (-x exports; readonly -x verified on PR #442
+  # r14). Flag the segment so the skip-path above captures the
+  # identity assignments that follow. Variants without -x are
+  # over-captured on purpose — the candidate model only blocks
+  # MISMATCHED values, so the cost of the ambiguity is a false block
+  # on a non-exported mismatched declaration, which is the fail-closed
+  # direction for a byline guard.
+  case "$tok" in export|declare|typeset|readonly|local) IS_DECLARATION_BUILTIN=1 ;; *) IS_DECLARATION_BUILTIN=0 ;; esac
+  if [ "$IS_DECLARATION_BUILTIN" -eq 1 ]; then
     IN_EXPORT_SEGMENT=1
     SEGMENT_HAS_COMMAND=1
     AT_COMMAND_POSITION=0

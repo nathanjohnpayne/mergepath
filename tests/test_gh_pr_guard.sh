@@ -295,6 +295,13 @@ assert_rc_contains "declare -x non-author identity blocked" 2 "author identity" 
 assert_rc_contains "env-prefixed non-author identity blocked" 2 "author identity" \
   'env GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 
+# readonly -x exports too (Codex P1 on PR #442 r14, hook-verified).
+assert_rc_contains "readonly -x non-author identity blocked" 2 "author identity" \
+  'readonly -x GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"' "CLEAN" ""
+
 # The custom-author shape from the r3 finding: standalone assignment of
 # the CUSTOM identity must NOT satisfy the guard — the wrapper would
 # actually verify its stock default.
