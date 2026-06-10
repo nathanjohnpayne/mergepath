@@ -635,6 +635,8 @@ IN_EXPORT_SEGMENT=0      # 1 = current segment is an `export` command (its
                          # assignment args reach all later processes)
 SEGMENT_HAS_EVAL=0       # 1 = current segment ran `eval` — an eval'd
                          # assignment persists like a bare standalone
+PENDING_PREFIX_FLAG=""   # "<prefix>:<flag>" whose value the next token is
+                         # (lets the consumer recognize `env -u NAME`)
 for i in "${!TOKENS[@]}"; do
   tok="${TOKENS[$i]}"
   # --- phase 2: walking after gh, looking for pr + subcommand ---
@@ -718,6 +720,24 @@ for i in "${!TOKENS[@]}"; do
   # straight to the actual command.
   if [ "$SKIP_PREFIX_VALUE" -eq 1 ]; then
     SKIP_PREFIX_VALUE=0
+    # `env -u NAME` removes NAME from the wrapped command's
+    # environment: for the identity variables that is exactly the
+    # r15 empty-override semantics — the wrapper falls back to its
+    # hardcoded default, which a custom-author repo must fail closed
+    # on (Codex P2 on PR #442 r17, env --help verified).
+    if [ "$PENDING_PREFIX_FLAG" = "env:-u" ]; then
+      case "$tok" in
+        GH_AS_AUTHOR_IDENTITY)
+          INLINE_GH_AS_AUTHOR_IDENTITY=""
+          INLINE_GH_AS_AUTHOR_IDENTITY_SET=1
+          ;;
+        GH_AS_REVIEWER_IDENTITY)
+          INLINE_GH_AS_REVIEWER_IDENTITY=""
+          INLINE_GH_AS_REVIEWER_IDENTITY_SET=1
+          ;;
+      esac
+    fi
+    PENDING_PREFIX_FLAG=""
     continue
   fi
 
@@ -957,7 +977,33 @@ for i in "${!TOKENS[@]}"; do
       # identically.
       if prefix_flag_takes_value "$CURRENT_PREFIX" "$tok"; then
         SKIP_PREFIX_VALUE=1
+        PENDING_PREFIX_FLAG="$CURRENT_PREFIX:$tok"
         continue
+      fi
+      # env's combined/long forms that drop identity variables from
+      # the wrapped command's environment (same r15 empty-override
+      # semantics as `env -u NAME` above): --unset=NAME, and -i which
+      # clears the whole environment.
+      if [ "$CURRENT_PREFIX" = "env" ]; then
+        case "$tok" in
+          --unset=GH_AS_AUTHOR_IDENTITY|-u=GH_AS_AUTHOR_IDENTITY)
+            INLINE_GH_AS_AUTHOR_IDENTITY=""
+            INLINE_GH_AS_AUTHOR_IDENTITY_SET=1
+            continue
+            ;;
+          --unset=GH_AS_REVIEWER_IDENTITY|-u=GH_AS_REVIEWER_IDENTITY)
+            INLINE_GH_AS_REVIEWER_IDENTITY=""
+            INLINE_GH_AS_REVIEWER_IDENTITY_SET=1
+            continue
+            ;;
+          -i|--ignore-environment)
+            INLINE_GH_AS_AUTHOR_IDENTITY=""
+            INLINE_GH_AS_AUTHOR_IDENTITY_SET=1
+            INLINE_GH_AS_REVIEWER_IDENTITY=""
+            INLINE_GH_AS_REVIEWER_IDENTITY_SET=1
+            continue
+            ;;
+        esac
       fi
       # Otherwise: boolean flag of the current prefix (or a flag
       # of an unknown prefix, which we conservatively assume is
