@@ -267,6 +267,18 @@ assert_rc_contains "standalone non-author identity assignment fails closed" 2 "a
 assert_rc_contains "standalone matching author identity assignment allowed" 0 "" \
   'GH_AS_AUTHOR_IDENTITY=nathanjohnpayne ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
 
+# `export VAR=x ; wrapper` is DEFINITELY effective — the assignment is
+# an argument of the export command, not a bare prefix, and reaches
+# every later process (Codex P1 on PR #442 r11).
+assert_rc_contains "exported-via-export-command non-author identity blocked" 2 "author identity" \
+  'export GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "exported-via-export-command matching author identity allowed" 0 "" \
+  'export GH_AS_AUTHOR_IDENTITY=nathanjohnpayne && scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "exported-via-export-command non-reviewer identity blocked" 2 "expected reviewer" \
+  'export GH_AS_REVIEWER_IDENTITY=nathanpayne-codex ; scripts/gh-as-reviewer.sh -- gh pr comment 123 --body "ping"' "CLEAN" ""
+
 # The custom-author shape from the r3 finding: standalone assignment of
 # the CUSTOM identity must NOT satisfy the guard — the wrapper would
 # actually verify its stock default.

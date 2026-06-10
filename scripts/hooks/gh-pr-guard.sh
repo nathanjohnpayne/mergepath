@@ -622,6 +622,8 @@ AT_COMMAND_POSITION=1    # 1 = at command position, 0 = walking unrelated-comman
 SEGMENT_HAS_COMMAND=0    # 1 = this segment has seen a non-assignment command (echo, cat, etc.)
 SKIP_PREFIX_VALUE=0      # 1 = next token is the value of a prefix-command flag
 CURRENT_PREFIX=""        # name of the most recently seen prefix command (sudo/time/etc.)
+IN_EXPORT_SEGMENT=0      # 1 = current segment is an `export` command (its
+                         # assignment args reach all later processes)
 for i in "${!TOKENS[@]}"; do
   tok="${TOKENS[$i]}"
   # --- phase 2: walking after gh, looking for pr + subcommand ---
@@ -726,6 +728,7 @@ for i in "${!TOKENS[@]}"; do
       AT_COMMAND_POSITION=1
       CURRENT_PREFIX=""
       WRAPPER_KIND=""
+      IN_EXPORT_SEGMENT=0
       # Clear inline env vars ONLY when the segment that just ended
       # contained a non-assignment command. That means the assignment
       # was a PREFIX scoped to that command, not a standalone
@@ -809,8 +812,36 @@ for i in "${!TOKENS[@]}"; do
   fi
 
   if [ "$AT_COMMAND_POSITION" -eq 0 ]; then
+    # Arguments of an `export` command are DEFINITELY-effective
+    # identity assignments: `export GH_AS_AUTHOR_IDENTITY=x ; wrapper`
+    # puts the value in every later process's environment, while this
+    # walk would otherwise skip the token as an unrelated-command
+    # argument and the byline guard would fall back to the default
+    # candidate (Codex P1 on PR #442 r11 — the wrong-byline class).
+    # Capture them into the standalone (possibly-effective) slots the
+    # candidate model already validates.
+    if [ "$IN_EXPORT_SEGMENT" -eq 1 ]; then
+      case "$tok" in
+        GH_AS_AUTHOR_IDENTITY=*)
+          STANDALONE_GH_AS_AUTHOR_IDENTITY="${tok#GH_AS_AUTHOR_IDENTITY=}"
+          ;;
+        GH_AS_REVIEWER_IDENTITY=*)
+          STANDALONE_GH_AS_REVIEWER_IDENTITY="${tok#GH_AS_REVIEWER_IDENTITY=}"
+          ;;
+      esac
+    fi
     # Skipping arguments of an unrelated command. Stay until a
     # separator resets us above.
+    continue
+  fi
+
+  # `export` at command position: its assignment arguments reach all
+  # later processes. Flag the segment so the skip-path above captures
+  # the identity assignments that follow.
+  if [ "$tok" = "export" ]; then
+    IN_EXPORT_SEGMENT=1
+    SEGMENT_HAS_COMMAND=1
+    AT_COMMAND_POSITION=0
     continue
   fi
 
