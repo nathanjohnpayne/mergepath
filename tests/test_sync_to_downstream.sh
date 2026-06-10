@@ -95,7 +95,7 @@ git init -q "$SIBLINGS/missing-everything"
 cd "$MP"
 set +e
 output=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
-  "$SCRIPT" --audit --no-clone 2>&1)
+  "$SCRIPT" --audit --use-local-tree --no-clone 2>&1)
 exit_code=$?
 set -e
 
@@ -149,7 +149,7 @@ echo "$output" | awk '
 # Filter test: --paths restriction must shrink the report
 # ---------------------------------------------------------------------------
 filtered=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$SIBLINGS" \
-  "$SCRIPT" --audit --no-clone --paths "scripts/hooks/the-hook.sh" 2>&1 || true)
+  "$SCRIPT" --audit --use-local-tree --no-clone --paths "scripts/hooks/the-hook.sh" 2>&1 || true)
 echo "$filtered" | grep -q "scripts/keep-in-sync.sh" \
   && fail "--paths filter should have excluded scripts/keep-in-sync.sh"
 
@@ -187,7 +187,7 @@ git init -q "$AO_SIBLINGS/beta"
 
 set +e
 audit_override_out=$(MERGEPATH_ROOT_OVERRIDE="$AO_MP" MERGEPATH_SIBLINGS_DIR="$AO_SIBLINGS" \
-  "$SCRIPT" --audit --no-clone 2>&1)
+  "$SCRIPT" --audit --use-local-tree --no-clone 2>&1)
 audit_override_rc=$?
 set -e
 [ "$audit_override_rc" -eq 1 ] \
@@ -231,13 +231,138 @@ echo "gitdir: $WORKDIR/fake.git" >"$worktree_siblings/clean-consumer/.git"
 
 set +e
 output=$(MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_SIBLINGS_DIR="$worktree_siblings" \
-  "$SCRIPT" --audit --no-clone --repos clean-consumer 2>&1)
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos clean-consumer 2>&1)
 worktree_exit=$?
 set -e
 [[ "$worktree_exit" -eq 0 ]] \
   || fail "worktree (.git as file) should be accepted as a sibling; got exit $worktree_exit, output: $output"
 echo "$output" | grep -q "no local worktree" \
   && fail "worktree (.git as file) misclassified as missing"
+
+# ---------------------------------------------------------------------------
+# #439: default audit baseline is the LIVE default branch via the cache
+# clone — never the sibling working tree. A stale sibling (feature
+# branch checked out, behind main) must not affect the default audit,
+# and --use-local-tree must surface loud staleness warnings + the exact
+# baseline ref@sha.
+# ---------------------------------------------------------------------------
+live_origin="$WORKDIR/live-origin/clean-consumer"
+mkdir -p "$live_origin/scripts/hooks" "$live_origin/scripts/ci"
+cp "$MP/scripts/keep-in-sync.sh"   "$live_origin/scripts/keep-in-sync.sh"
+cp "$MP/scripts/hooks/the-hook.sh" "$live_origin/scripts/hooks/the-hook.sh"
+cp "$MP/scripts/ci/check_one"      "$live_origin/scripts/ci/check_one"
+cp "$MP/scripts/ci/check_two"      "$live_origin/scripts/ci/check_two"
+git init -q -b main "$live_origin"
+( cd "$live_origin" \
+    && git add -A \
+    && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "clean state" )
+
+live_cache="$WORKDIR/live-cache"
+mkdir -p "$live_cache"
+# --depth=1 matches clone_consumer_to_cache and implies --single-branch,
+# which is exactly the shape that broke the renamed-default refresh
+# (Codex P2 on PR #443 r2): the clone's refspec only fetches the old
+# default, so the rename test below exercises the explicit-ref fetch.
+git clone -q --depth=1 "file://$live_origin" "$live_cache/clean-consumer"
+
+stale_siblings="$WORKDIR/stale-siblings"
+mkdir -p "$stale_siblings/clean-consumer/scripts/hooks" "$stale_siblings/clean-consumer/scripts/ci"
+cp "$MP/scripts/keep-in-sync.sh"   "$stale_siblings/clean-consumer/scripts/keep-in-sync.sh"
+cp "$MP/scripts/hooks/the-hook.sh" "$stale_siblings/clean-consumer/scripts/hooks/the-hook.sh"
+cp "$MP/scripts/ci/check_one"      "$stale_siblings/clean-consumer/scripts/ci/check_one"
+cp "$MP/scripts/ci/check_two"      "$stale_siblings/clean-consumer/scripts/ci/check_two"
+git init -q -b main "$stale_siblings/clean-consumer"
+( cd "$stale_siblings/clean-consumer" \
+    && git add -A \
+    && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "synced state" \
+    && git checkout -q -b feature/stale-work \
+    && echo "MUTATED" >scripts/keep-in-sync.sh \
+    && git add -A \
+    && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "stale feature work" \
+    && git update-ref refs/remotes/origin/main "$(git rev-parse main)" \
+    && git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main )
+
+# Default mode: the clean cache clone is the baseline; the stale sibling
+# (which WOULD drift) must be ignored entirely.
+set +e
+live_output=$(MERGEPATH_ROOT_OVERRIDE="$MP" \
+  MERGEPATH_SIBLINGS_DIR="$stale_siblings" \
+  MERGEPATH_SYNC_CACHE="$live_cache" \
+  "$SCRIPT" --audit --repos clean-consumer 2>&1)
+live_exit=$?
+set -e
+[[ "$live_exit" -eq 0 ]] \
+  || fail "default audit should read the clean cache clone (exit 0) and ignore the stale sibling; got exit $live_exit, output: $live_output"
+echo "$live_output" | grep -q "baseline: .*cache clone, refreshed" \
+  || fail "default audit should print the cache-clone baseline header; got: $live_output"
+echo "$live_output" | grep -q "LOCAL SIBLING TREE" \
+  && fail "default audit must not read the sibling tree; got: $live_output"
+
+# --use-local-tree: the stale sibling IS the baseline; drift is reported
+# and the baseline header + both staleness warnings make the basis loud.
+set +e
+stale_output=$(MERGEPATH_ROOT_OVERRIDE="$MP" \
+  MERGEPATH_SIBLINGS_DIR="$stale_siblings" \
+  MERGEPATH_SYNC_CACHE="$live_cache" \
+  "$SCRIPT" --audit --use-local-tree --no-clone --repos clean-consumer 2>&1)
+stale_exit=$?
+set -e
+[[ "$stale_exit" -eq 1 ]] \
+  || fail "--use-local-tree audit should report the stale sibling's drift (exit 1); got exit $stale_exit, output: $stale_output"
+echo "$stale_output" | grep -q "baseline: feature/stale-work@.*LOCAL SIBLING TREE" \
+  || fail "--use-local-tree audit should print the sibling baseline ref@sha; got: $stale_output"
+echo "$stale_output" | grep -q "⚠ sibling tree is on 'feature/stale-work', not the default branch 'main'" \
+  || fail "--use-local-tree audit should warn about the non-default branch; got: $stale_output"
+echo "$stale_output" | grep -q "⚠ sibling tree HEAD .* != last-fetched origin/main" \
+  || fail "--use-local-tree audit should warn that HEAD differs from origin/main; got: $stale_output"
+
+# Default mode + --no-clone with NO cache clone present: fail closed with
+# a pointer at --use-local-tree rather than silently reading the sibling.
+set +e
+noclone_output=$(MERGEPATH_ROOT_OVERRIDE="$MP" \
+  MERGEPATH_SIBLINGS_DIR="$stale_siblings" \
+  MERGEPATH_SYNC_CACHE="$WORKDIR/empty-cache-nowhere" \
+  "$SCRIPT" --audit --no-clone --repos clean-consumer 2>&1)
+noclone_exit=$?
+set -e
+[[ "$noclone_exit" -eq 3 ]] \
+  || fail "default audit --no-clone with no cache should exit 3; got $noclone_exit, output: $noclone_output"
+echo "$noclone_output" | grep -q "no cached clone for clean-consumer" \
+  || fail "default audit --no-clone should explain the missing cache clone; got: $noclone_output"
+echo "$noclone_output" | grep -q -- "--use-local-tree" \
+  || fail "default audit --no-clone should point at --use-local-tree; got: $noclone_output"
+
+# --use-local-tree is audit-mode-only.
+set +e
+MERGEPATH_ROOT_OVERRIDE="$MP" "$SCRIPT" --sync-all --use-local-tree --dry-run >/dev/null 2>&1
+ult_sync_exit=$?
+set -e
+[[ "$ult_sync_exit" -eq 2 ]] \
+  || fail "--use-local-tree in sync mode should exit 2; got $ult_sync_exit"
+
+# Default-branch rename: `git fetch` never moves refs/remotes/origin/HEAD,
+# so the refresh must re-resolve the remote default (`remote set-head
+# --auto`) or a renamed default branch silently audits the stale old one
+# (Codex P2 on PR #443). Rename the origin's default to `trunk` with
+# drifted content; the cached clone (cloned when default was `main`)
+# must follow the rename and report the drift.
+( cd "$live_origin" \
+    && git branch -m main trunk \
+    && git symbolic-ref HEAD refs/heads/trunk \
+    && echo "MUTATED-ON-TRUNK" >scripts/keep-in-sync.sh \
+    && git add -A \
+    && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "drift on renamed default" )
+set +e
+rename_output=$(MERGEPATH_ROOT_OVERRIDE="$MP" \
+  MERGEPATH_SIBLINGS_DIR="$stale_siblings" \
+  MERGEPATH_SYNC_CACHE="$live_cache" \
+  "$SCRIPT" --audit --repos clean-consumer 2>&1)
+rename_exit=$?
+set -e
+[[ "$rename_exit" -eq 1 ]] \
+  || fail "default audit should follow a renamed default branch and report its drift (exit 1); got exit $rename_exit, output: $rename_output"
+echo "$rename_output" | grep -q "baseline: trunk@" \
+  || fail "default audit baseline should show the renamed default branch 'trunk'; got: $rename_output"
 
 # ---------------------------------------------------------------------------
 # Symlink guard on cache refresh (cursor CHANGES_REQUESTED on PR #215).
