@@ -166,7 +166,23 @@ if [ -z "${GH_TOKEN:-}" ]; then
   exit 3
 fi
 
-EXPECTED_REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
+# Expected reviewer identity for helper-comment writes. When any of
+# the explicit identity envs is set, honor it via
+# gh_default_reviewer_identity. Otherwise — e.g. agent-review.yml
+# passes only `GH_TOKEN: secrets.REVIEWER_ASSIGNMENT_TOKEN` with no
+# MERGEPATH_AGENT / OP_PREFLIGHT_AGENT / GH_AS_REVIEWER_IDENTITY —
+# leave it empty so verify_reviewer_write_identity derives the
+# expected login from the token itself, constrained to
+# available_reviewers (#438). The old behavior hard-defaulted to
+# nathanpayne-claude, so a repo whose REVIEWER_ASSIGNMENT_TOKEN is a
+# different allowed reviewer failed identity verification before
+# posting a retry/status-probe comment — a rate-limited CodeRabbit
+# run then exited as infra error instead of retrying.
+if [ -n "${GH_AS_REVIEWER_IDENTITY:-}" ] || [ -n "${MERGEPATH_AGENT:-}" ] || [ -n "${OP_PREFLIGHT_AGENT:-}" ]; then
+  EXPECTED_REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
+else
+  EXPECTED_REVIEWER_IDENTITY=""   # derived lazily from the token at write time
+fi
 
 gh_reviewer() (
   unset GITHUB_TOKEN
@@ -199,6 +215,29 @@ coderabbit_field() {
       }
     }
   ' "$CONFIG"
+}
+
+# Read the available_reviewers list (one login per line). Same
+# state-machine awk pattern as codex-review-check.sh's reader; handles
+# quoted and unquoted list items. Used by the token-derived expected-
+# identity path (#438) to keep the derivation fail-closed: only a
+# login on this allow-list may become the expected reviewer.
+read_available_reviewers() {
+  [ -f "$CONFIG" ] || return 0
+  awk '
+    /^available_reviewers:/ {in_block=1; next}
+    in_block && /^[^[:space:]#]/ {in_block=0}
+    in_block && /^ *-/ {print}
+  ' "$CONFIG" | sed -E "s/^[[:space:]]*-[[:space:]]*//; s/[[:space:]]+#.*\$//; s/^[\"']//; s/[\"']\$//; s/[[:space:]]+\$//"
+}
+
+login_is_available_reviewer() {
+  local login=$1 reviewer
+  [ -n "$login" ] || return 1
+  while IFS= read -r reviewer; do
+    [ "$reviewer" = "$login" ] && return 0
+  done <<< "$(read_available_reviewers)"
+  return 1
 }
 
 MAX_WAIT_SECONDS=$(coderabbit_field max_wait_seconds)
@@ -724,6 +763,25 @@ verify_reviewer_write_identity() {
       echo "       Restore the helper, or opt out via" >&2
       echo "       CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 (dev only)." >&2
       return 1
+    fi
+    # Lazy token-derived expected identity (#438): no explicit identity
+    # env was set at startup, so derive the expected login from the
+    # token that will sign this write — constrained to
+    # available_reviewers. An unconstrained derivation would make the
+    # check below a tautology; the allow-list keeps it fail-closed: a
+    # non-reviewer token falls back to the static default and fails
+    # verification exactly as before. Derived here (write time) rather
+    # than at startup so read-only runs never pay the extra API call.
+    if [ -z "$EXPECTED_REVIEWER_IDENTITY" ]; then
+      local token_login
+      token_login=$(gh_reviewer api user --jq .login 2>/dev/null || true)
+      if login_is_available_reviewer "$token_login"; then
+        EXPECTED_REVIEWER_IDENTITY="$token_login"
+        log "derived expected reviewer identity '$token_login' from GH_TOKEN (allow-listed in available_reviewers)"
+      else
+        EXPECTED_REVIEWER_IDENTITY="$(gh_default_reviewer_identity)"
+        log "GH_TOKEN login '${token_login:-<unresolvable>}' is not in available_reviewers; falling back to default expected reviewer '$EXPECTED_REVIEWER_IDENTITY'"
+      fi
     fi
     GH_TOKEN="$GH_TOKEN" "$checker" --expect-token-identity "$EXPECTED_REVIEWER_IDENTITY" \
       || return 1

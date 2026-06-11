@@ -165,6 +165,87 @@ else
   fail "empty command: rc=$rc expected 1"
 fi
 
+# --- runtime byline pin (#438) ----------------------------------------
+# Runs IN the wrapper process: environment-manipulation-proof, unlike
+# the PreToolUse hook's static analysis.
+
+# The pin resolves the policy from the WRAPPER's repo root (r20), so
+# each fixture repo gets its own copy of the wrapper + its lib deps.
+install_wrapper_copy() {
+  local dir=$1
+  mkdir -p "$dir/scripts/lib" "$dir/.github"
+  cp "$ROOT/scripts/gh-as-author.sh" "$dir/scripts/gh-as-author.sh"
+  cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
+  cp "$ROOT/scripts/identity-check.sh" "$dir/scripts/identity-check.sh"
+  chmod +x "$dir/scripts/gh-as-author.sh" "$dir/scripts/identity-check.sh"
+}
+
+PIN_DIR="$WORKDIR/pin-repo"
+install_wrapper_copy "$PIN_DIR"
+printf 'author_identity: nathanjohnpayne\n' >"$PIN_DIR/.github/review-policy.yml"
+
+reset_log
+set +e
+( cd "$PIN_DIR" && OP_PREFLIGHT_AUTHOR_PAT="author-token" GH_AS_AUTHOR_IDENTITY="nathanpayne-codex" \
+    PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$PIN_DIR/scripts/gh-as-author.sh" -- gh pr merge 9 --squash ) >/dev/null 2>"$WORKDIR/pin.err"
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && grep -q "runtime byline pin" "$WORKDIR/pin.err"; then
+  pass "runtime pin: non-policy identity refused before any gh call"
+else
+  fail "runtime pin: expected rc=2 with pin message; rc=$rc err=$(cat "$WORKDIR/pin.err")"
+fi
+if grep -q $'gh\tpr\tmerge' "$WORKDIR/calls.log"; then
+  fail "runtime pin: wrapped command ran despite the refusal"
+else
+  pass "runtime pin: no wrapped command executed on refusal"
+fi
+
+PIN_DIR2="$WORKDIR/pin-repo-custom"
+install_wrapper_copy "$PIN_DIR2"
+printf "author_identity: 'custom-author'\n" >"$PIN_DIR2/.github/review-policy.yml"
+
+reset_log
+set +e
+( cd "$PIN_DIR2" && GH_AS_AUTHOR_IDENTITY="custom-author" \
+    PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$PIN_DIR2/scripts/gh-as-author.sh" -- gh pr merge 9 --squash ) >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q $'GH_TOKEN=fallback-custom-author-token GITHUB_TOKEN= gh\tpr\tmerge\t9\t--squash' "$WORKDIR/calls.log"; then
+  pass "runtime pin: matching custom identity (quoted policy) proceeds with its token"
+else
+  fail "runtime pin: matching custom identity should proceed; rc=$rc calls=$(cat "$WORKDIR/calls.log")"
+fi
+
+# Subdirectory invocation must still load the pin (r20).
+mkdir -p "$PIN_DIR/subdir"
+reset_log
+set +e
+( cd "$PIN_DIR/subdir" && OP_PREFLIGHT_AUTHOR_PAT="author-token" GH_AS_AUTHOR_IDENTITY="nathanpayne-codex" \
+    PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" ../scripts/gh-as-author.sh -- gh pr merge 9 --squash ) >/dev/null 2>"$WORKDIR/pin-sub.err"
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && grep -q "runtime byline pin" "$WORKDIR/pin-sub.err"; then
+  pass "runtime pin: subdirectory invocation still loads the repo-root policy"
+else
+  fail "runtime pin: subdirectory invocation should refuse; rc=$rc err=$(cat "$WORKDIR/pin-sub.err")"
+fi
+
+NO_POLICY_DIR="$WORKDIR/pin-repo-none"
+install_wrapper_copy "$NO_POLICY_DIR"
+rm -rf "$NO_POLICY_DIR/.github"
+reset_log
+set +e
+( cd "$NO_POLICY_DIR" && OP_PREFLIGHT_AUTHOR_PAT="author-token" \
+    PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/calls.log" "$NO_POLICY_DIR/scripts/gh-as-author.sh" -- gh pr merge 9 --squash ) >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "runtime pin: absent policy file keeps legacy behavior"
+else
+  fail "runtime pin: absent policy file should not block; rc=$rc"
+fi
+
 echo ""
 echo "test_gh_as_author: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then

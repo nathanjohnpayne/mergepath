@@ -185,6 +185,32 @@ codex_field() {
   ' "$CONFIG"
 }
 
+# Extract a top-level scalar (column-0 key, no enclosing block) from
+# review-policy.yml — e.g. author_identity. Same quoting/comment
+# tolerance as codex_field.
+policy_top_field() {
+  local field=$1
+  [ -f "$CONFIG" ] || return 0
+  awk -v field="$field" '
+    /^[^[:space:]#]/ && $1 == field":" {
+      sub(/^[^:]+:[[:space:]]*/, "", $0)
+      # Both YAML quote styles (Codex P2 on PR #442 r9) — matching the
+      # quote-tolerance of the gh-pr-guard expected-author parser.
+      gsub(/^["\x27]/, "", $0)
+      gsub(/["\x27][[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print
+      exit
+    }
+  ' "$CONFIG"
+}
+
+# Author identity for the trigger comment write (#438): used to decide
+# whether an ambient GH_TOKEN may be bridged into gh-as-author.sh.
+AUTHOR_IDENTITY=$(policy_top_field author_identity)
+AUTHOR_IDENTITY=${AUTHOR_IDENTITY:-nathanjohnpayne}
+
 TIMEOUT_SECONDS=$(codex_field review_timeout_seconds)
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-600}
 if ! [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
@@ -498,11 +524,44 @@ post_codex_trigger() {
     die 3 "gh-as-author.sh helper unavailable"
   fi
 
+  # Inline author-PAT bridging (#438): gh-as-author.sh's resolver
+  # intentionally ignores ambient GH_TOKEN — it reads only
+  # OP_PREFLIGHT_AUTHOR_PAT or a stored `gh auth token --user`. In a
+  # CI/fresh shell with no preflight cache and no keyring, the
+  # still-documented `GH_TOKEN=<author PAT> codex-review-request.sh`
+  # invocation shape passed every read-side check and then failed the
+  # trigger write despite holding a valid author token, forcing an
+  # unnecessary Phase 4b fallback. Bridge the ambient token into the
+  # wrapper's preferred env var ONLY after verifying it actually
+  # resolves to the author identity; any other token (the common
+  # reviewer-PAT session shape) is left alone so the wrapper's own
+  # resolution proceeds unchanged and fails closed as before.
+  BRIDGE_AUTHOR_PAT=""
+  if [ -n "${GH_TOKEN:-}" ] && [ -z "${OP_PREFLIGHT_AUTHOR_PAT:-}" ]; then
+    IDENTITY_CHECKER="$__CODEX_REQUEST_DIR/identity-check.sh"
+    if [ -x "$IDENTITY_CHECKER" ] \
+      && GH_TOKEN="$GH_TOKEN" "$IDENTITY_CHECKER" --expect-token-identity "$AUTHOR_IDENTITY" >/dev/null 2>&1; then
+      log "ambient GH_TOKEN verifies as author identity $AUTHOR_IDENTITY — bridging it into gh-as-author.sh as OP_PREFLIGHT_AUTHOR_PAT"
+      BRIDGE_AUTHOR_PAT="$GH_TOKEN"
+    fi
+  fi
+
   # Capture stdout+stderr so a failure surfaces the real gh error
   # (404 / 403 / 422) rather than a bare "failed to post". The comment
   # URL gh prints on success is still extractable downstream.
-  POST_OUTPUT=$("$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
-    || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
+  # Pass the configured author identity on BOTH invocation branches:
+  # the wrapper's hard default (nathanjohnpayne) would reject a valid
+  # custom-author token in repos that override author_identity —
+  # bridged-token case (Codex P2 on PR #442 r2) AND warm-preflight /
+  # keyring case (Codex P2 on PR #442 r5). review-policy.yml is the
+  # source of truth this script already reads, so it wins.
+  if [ -n "$BRIDGE_AUTHOR_PAT" ]; then
+    POST_OUTPUT=$(OP_PREFLIGHT_AUTHOR_PAT="$BRIDGE_AUTHOR_PAT" GH_AS_AUTHOR_IDENTITY="$AUTHOR_IDENTITY" "$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
+      || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
+  else
+    POST_OUTPUT=$(GH_AS_AUTHOR_IDENTITY="$AUTHOR_IDENTITY" "$AS_AUTHOR" -- gh pr comment "$PR_NUMBER" --repo "$REPO" --body "@codex review" 2>&1) \
+      || die 3 "failed to post '@codex review' comment: $POST_OUTPUT"
+  fi
   TRIGGER_POSTED=true
 
   # Capture the post time so the poll loop can ignore stale signals

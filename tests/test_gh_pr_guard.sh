@@ -230,6 +230,260 @@ cd "$ORIG_DIR"
 assert_rc_contains "compound direct guarded write blocked" 2 "#348" \
   'gh issue close 7 && gh pr merge --admin 123'
 
+# --- author-wrapper identity pin (#438) -------------------------------
+
+assert_rc_contains "author wrapper inline non-author identity blocked" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "author wrapper inline matching author identity allowed" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=nathanjohnpayne scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "author wrapper inline non-author identity blocked on pr create" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-cursor scripts/gh-as-author.sh -- gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "author wrapper inline non-author identity blocked on codex trigger" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh -- gh pr comment 123 --body "@codex review"'
+
+# A stale inline assignment scoped to an EARLIER command segment must
+# not leak into the author byline guard — the shell would not pass it
+# to the wrapper (Codex P2 on PR #442).
+assert_rc_contains "stale inline author identity from earlier segment does not block" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex echo ok ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# A standalone assignment (no command in its segment) persists as a
+# shell variable, and IF the name carries the export attribute in the
+# calling shell it ALSO reaches the wrapper (Codex P1 on PR #442 r4).
+# The hook cannot observe the export attribute, so a standalone
+# non-author value must fail closed even though it might be inert.
+assert_rc_contains "standalone non-author identity assignment fails closed" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# ...but a standalone assignment of the EXPECTED author is fine either
+# way (exported: wrapper gets the expected value; unexported: wrapper
+# default is the same value).
+assert_rc_contains "standalone matching author identity assignment allowed" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=nathanjohnpayne ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# `export VAR=x ; wrapper` is DEFINITELY effective — the assignment is
+# an argument of the export command, not a bare prefix, and reaches
+# every later process (Codex P1 on PR #442 r11).
+assert_rc_contains "exported-via-export-command non-author identity blocked" 2 "author identity" \
+  'export GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "exported-via-export-command matching author identity allowed" 0 "" \
+  'export GH_AS_AUTHOR_IDENTITY=nathanjohnpayne && scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "exported-via-export-command non-reviewer identity blocked" 2 "expected reviewer" \
+  'export GH_AS_REVIEWER_IDENTITY=nathanpayne-codex ; scripts/gh-as-reviewer.sh -- gh pr comment 123 --body "ping"' "CLEAN" ""
+
+# Prefix-assignment BEFORE the export command in the same segment
+# (`VAR=x export VAR`) persists AND exports (Codex P1 on PR #442 r12).
+assert_rc_contains "prefix-then-export non-author identity blocked" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex export GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr comment 123 --body "@codex review"' "CLEAN" ""
+
+assert_rc_contains "prefix-then-export matching author identity allowed" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=nathanjohnpayne export GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# declare -x is export-equivalent (Codex P1 r12 family, preempted).
+assert_rc_contains "declare -x non-author identity blocked" 2 "author identity" \
+  'declare -x GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# env-prefix on the wrapper command is a definitive same-segment prefix.
+assert_rc_contains "env-prefixed non-author identity blocked" 2 "author identity" \
+  'env GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# eval'd assignments persist like bare standalones (preempted, r14
+# family): possibly-effective, so a mismatch fails closed.
+assert_rc_contains "eval'd non-author identity assignment fails closed" 2 "author identity" \
+  'eval GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# readonly -x exports too (Codex P1 on PR #442 r14, hook-verified).
+assert_rc_contains "readonly -x non-author identity blocked" 2 "author identity" \
+  'readonly -x GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"' "CLEAN" ""
+
+# The custom-author shape from the r3 finding: standalone assignment of
+# the CUSTOM identity must NOT satisfy the guard — the wrapper would
+# actually verify its stock default.
+mkdir -p "$WORKDIR/repo-custom-author-standalone/.github"
+cat >"$WORKDIR/repo-custom-author-standalone/.github/review-policy.yml" <<'YML'
+author_identity: custom-owner
+YML
+cd "$WORKDIR/repo-custom-author-standalone"
+assert_rc_contains "standalone custom-identity assignment does not mask the wrapper default" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=custom-owner && scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
+
+# Exported (non-inline) GH_AS_AUTHOR_IDENTITY must be caught too — the
+# wrapper reads its environment, so the hook must read the same.
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=nathanpayne-codex run_hook 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+  pass "author wrapper exported non-author identity blocked"
+else
+  fail "author wrapper exported non-author identity blocked: rc=$rc; output: $out"
+fi
+
+# The expected author defaults from review-policy.yml author_identity
+# when GH_PR_GUARD_EXPECTED_AUTHOR is unset (Codex P2 on PR #442 r2) —
+# custom-author repos need no hook-specific variable.
+mkdir -p "$WORKDIR/repo-custom-author/.github"
+cat >"$WORKDIR/repo-custom-author/.github/review-policy.yml" <<'YML'
+author_identity: custom-owner
+YML
+cd "$WORKDIR/repo-custom-author"
+assert_rc_contains "author identity from review-policy.yml allows matching wrapper identity" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=custom-owner scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+assert_rc_contains "author identity from review-policy.yml blocks the stock default" 2 "author identity" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
+
+# An EMPTY inline override resets the wrapper to its hardcoded default
+# (Codex P1 on PR #442 r15): in a custom-author repo that is a
+# wrong-byline reset and must fail closed, even when the hook's own
+# environment carries the correct custom identity.
+mkdir -p "$WORKDIR/repo-custom-author-empty/.github"
+cat >"$WORKDIR/repo-custom-author-empty/.github/review-policy.yml" <<'YML'
+author_identity: custom-owner
+YML
+cd "$WORKDIR/repo-custom-author-empty"
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'GH_AS_AUTHOR_IDENTITY= scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+  pass "empty inline author override fails closed in custom-author repo"
+else
+  fail "empty inline author override fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+cd "$ORIG_DIR"
+
+# env -u / --unset / -i remove the identity from the WRAPPER's
+# environment — the r15 empty-override semantics (Codex P2 r17).
+cd "$WORKDIR/repo-custom-author-empty"
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'env -u GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+  pass "env -u identity unset fails closed in custom-author repo"
+else
+  fail "env -u identity unset fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'env --unset=GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+  pass "env --unset= identity fails closed in custom-author repo"
+else
+  fail "env --unset= identity fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+cd "$ORIG_DIR"
+
+assert_rc_contains "env -u identity unset allowed in default repo" 0 "" \
+  'env -u GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# Space-separated long form: `env --unset NAME` (Codex P1 r18) — the
+# value flag must be consumed or the walk loses the wrapper entirely
+# and skips ALL checks.
+cd "$WORKDIR/repo-custom-author-empty"
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'env --unset GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+  pass "env --unset NAME (space form) fails closed in custom-author repo"
+else
+  fail "env --unset NAME (space form) fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+cd "$ORIG_DIR"
+
+# ...and in a default repo the walk must still SEE the wrapper and
+# evaluate the merge-state checks (BLOCKED state proves the walk
+# reached the merge guard rather than bailing at the unset arg).
+assert_rc_contains "env --unset NAME still reaches merge-state checks" 2 "mergeStateStatus is BLOCKED" \
+  'env --unset GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "BLOCKED" ""
+
+# The unset BUILTIN persists past separators (preempted, r17 family).
+cd "$WORKDIR/repo-custom-author-empty"
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'unset GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+  pass "unset builtin identity removal fails closed in custom-author repo"
+else
+  fail "unset builtin identity removal fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+cd "$ORIG_DIR"
+
+assert_rc_contains "unset builtin identity removal allowed in default repo" 0 "" \
+  'unset GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# In a DEFAULT repo an empty override is a no-op (wrapper default ==
+# expected) and must not block.
+assert_rc_contains "empty inline author override allowed in default repo" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY= scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# Subdirectory invocation: the policy is found by upward walk (r21).
+mkdir -p "$WORKDIR/repo-custom-author/subdir"
+cd "$WORKDIR/repo-custom-author/subdir"
+assert_rc_contains "author identity policy found from a subdirectory" 2 "author identity" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
+
+# Quoted author_identity is valid YAML — double AND single quotes must
+# be stripped before comparison (Codex P2s on PR #442 r6/r7).
+mkdir -p "$WORKDIR/repo-quoted-author/.github"
+cat >"$WORKDIR/repo-quoted-author/.github/review-policy.yml" <<'YML'
+author_identity: "custom-owner"
+YML
+cd "$WORKDIR/repo-quoted-author"
+assert_rc_contains "double-quoted author_identity allows matching wrapper identity" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=custom-owner scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
+
+mkdir -p "$WORKDIR/repo-squoted-author/.github"
+cat >"$WORKDIR/repo-squoted-author/.github/review-policy.yml" <<'YML'
+author_identity: 'custom-owner'
+YML
+cd "$WORKDIR/repo-squoted-author"
+assert_rc_contains "single-quoted author_identity allows matching wrapper identity" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=custom-owner scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
+
+# Custom expected author: identity must match the override...
+set +e
+out=$(GH_PR_GUARD_EXPECTED_AUTHOR=custom-owner run_hook 'GH_AS_AUTHOR_IDENTITY=custom-owner scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "author wrapper custom expected author with matching identity allowed"
+else
+  fail "author wrapper custom expected author with matching identity allowed: rc=$rc; output: $out"
+fi
+
+# ...and an UNSET identity fails closed under a custom expected author,
+# because the wrapper would verify its stock default (nathanjohnpayne),
+# not the override.
+set +e
+out=$(GH_PR_GUARD_EXPECTED_AUTHOR=custom-owner run_hook 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+  pass "author wrapper unset identity under custom expected author fails closed"
+else
+  fail "author wrapper unset identity under custom expected author fails closed: rc=$rc; output: $out"
+fi
+
 echo ""
 echo "test_gh_pr_guard: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then

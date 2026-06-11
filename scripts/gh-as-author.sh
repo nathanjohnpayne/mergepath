@@ -33,6 +33,29 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 AUTHOR="${GH_AS_AUTHOR_IDENTITY:-nathanjohnpayne}"
 
+# Runtime byline pin (#438): this check runs IN the wrapper process,
+# whose environment is the actual one the write will use — unlike the
+# PreToolUse hook's static command-line analysis, it cannot be evaded
+# by shell environment manipulation (env -u/-i, unset, export forms,
+# eval'd assignments). If the repo declares author_identity in
+# review-policy.yml, the resolved AUTHOR must match it; otherwise the
+# write would land under the wrong byline no matter which token
+# verifies.
+# Resolve the policy from the wrapper's own repo root, not the
+# caller's cwd — a subdirectory invocation must still load the pin
+# (Codex P2 on PR #442 r20). $ROOT is computed from BASH_SOURCE at
+# the top of this script; in consumers the wrapper is synced into the
+# repo it writes to, so script root == target repo root.
+WRAPPER_POLICY_AUTHOR=""
+if [ -f "$ROOT/.github/review-policy.yml" ]; then
+  WRAPPER_POLICY_AUTHOR=$(grep -m1 '^author_identity:' "$ROOT/.github/review-policy.yml" | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)
+fi
+if [ -n "$WRAPPER_POLICY_AUTHOR" ] && [ "$AUTHOR" != "$WRAPPER_POLICY_AUTHOR" ]; then
+  echo "gh-as-author: refusing to run as '$AUTHOR' — this repo's review-policy.yml declares author_identity: $WRAPPER_POLICY_AUTHOR (#438 runtime byline pin)." >&2
+  echo "gh-as-author: unset GH_AS_AUTHOR_IDENTITY (or set it to $WRAPPER_POLICY_AUTHOR)." >&2
+  exit 2
+fi
+
 [ "${1:-}" = "--" ] && shift
 
 if [ "$#" -eq 0 ]; then
