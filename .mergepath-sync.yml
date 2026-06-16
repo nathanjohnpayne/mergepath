@@ -103,15 +103,17 @@ consumers:
     visibility: private
     facts:
       frameworks: [astro, typescript]
-  # overridebroadway is excluded from the ESLint templated entry's
-  # consumers list. Its original "zero lintable surface" rationale is
-  # under review (#461): it actually has a root package.json and ~81
-  # .ts/.tsx files, so the exclusion is likely wrong — but it is CJS +
-  # TypeScript and the CJS entry has no TS consumer yet, so folding it in
-  # needs CJS-template verification first. No facts block until #461.
+  # overridebroadway is CJS + TypeScript (React 19 + TypeScript, root
+  # package.json, ~81 .ts/.tsx files). The prior "zero lintable surface"
+  # exclusion was false (#461). Folded into the CJS templated entry below;
+  # examples/eslint.config.cjs.js already carries the `frameworks contains
+  # typescript` arm (require("typescript-eslint")), so the CJS + TS render
+  # is supported. First CJS + TS consumer of the canonical floor.
   - name: overridebroadway
     repo: nathanjohnpayne/overridebroadway
     visibility: private
+    facts:
+      frameworks: [react, typescript]
   # device-source-of-truth is a React 19 + TypeScript + Vite SPA with a
   # root package.json and ~148 .ts/.tsx files, so it IS in scope for the
   # canonical ESLint floor (#458). Folded into the ESM templated entry
@@ -719,13 +721,13 @@ paths:
   # maintains both source files in parallel; the body inside the
   # export is byte-identical, only the import/export syntax differs.
   #
-  # Consumer excluded from both entries: overridebroadway. Its
-  # "zero lintable surface" rationale is under review (#461) — it has a
-  # root package.json + ~81 .ts/.tsx files, but it is CJS + TypeScript and
-  # the CJS entry has no TS consumer yet, so folding it in needs template
-  # verification first. device-source-of-truth was previously excluded on
-  # the same (false) rationale; #458 folds it into the ESM entry below
+  # device-source-of-truth was previously excluded on a false "zero
+  # lintable surface" rationale; #458 folds it into the ESM entry below
   # (React 19 + TypeScript + Vite SPA, root package.json, ~148 .ts/.tsx).
+  # overridebroadway carried the same false rationale; #461 folds it into
+  # the CJS entry below (CJS + React 19 + TypeScript, root package.json,
+  # ~81 .ts/.tsx) — the first CJS + TS consumer of the floor. The CJS
+  # template's `frameworks contains typescript` arm renders it correctly.
   #
   # Per-consumer rendered shapes (driven by facts.frameworks; module
   # syntax driven by which entry the consumer is in below):
@@ -735,6 +737,7 @@ paths:
   #   device-source-of-truth (ESM)     → JS + TS + React + react-hooks
   #   friends-and-family-billing (CJS) → JS + React + react-hooks
   #   device-platform-reporting (CJS)  → JS + React + react-hooks
+  #   overridebroadway (CJS)           → JS + TS + React + react-hooks
   #   swipewatch (CJS)                 → JS baseline only
 
   # ESM variant — consumers with `"type": "module"` in package.json
@@ -758,6 +761,7 @@ paths:
     consumers:
       - friends-and-family-billing
       - device-platform-reporting
+      - overridebroadway
       - swipewatch
 
 # Per-consumer exclusions. Use sparingly — drift exceptions become
