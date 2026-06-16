@@ -6,7 +6,7 @@
 # script`, so the gate logic itself is JavaScript embedded in YAML.
 # This check extracts the clearance algorithm into a small Node
 # script that mirrors the workflow's logic verbatim, then runs it
-# against six fixture payloads under
+# against fixture payloads under
 # `scripts/ci/fixtures/pr-audit-codex-clearance/` covering:
 #
 #   - clean-clear.json            — COMMENTED on HEAD, zero P0/P1 → cleared
@@ -16,6 +16,14 @@
 #   - p2-only.json                — only P2/P3 inline findings → cleared (P2/P3 advisory)
 #   - quote-reply-from-author.json — author quote-reply containing `![P1 Badge]` text →
 #                                     cleared (filter scopes to bot author only)
+#   - p1-resolved-clears.json     — P1 finding whose thread isResolved → cleared (#449)
+#   - p1-unresolved-blocks.json   — P1 finding, thread unresolved → NOT cleared (#449)
+#   - resolution-lookup-failed.json — P1 finding, resolution lookup failed → NOT cleared / fail-closed (#449)
+#   - fresh-plus1-clears.json     — Codex +1 inside [HEAD date, merged_at] → cleared (#450)
+#   - stale-plus1-rejected.json   — +1 before the HEAD freshness floor → NOT cleared (#450)
+#   - post-merge-plus1-rejected.json — +1 after merged_at → NOT cleared (#450)
+#   - review-newer-than-reaction-blocks.json — newer review w/ unresolved P1 beats older +1 → NOT cleared (#450)
+#   - reaction-newer-than-review-clears.json — newer +1 beats older review w/ P1 → cleared (#450)
 #
 # Inline-literal pattern: the algorithm under test is duplicated
 # from the workflow YAML into the Node script below, the same way
@@ -62,8 +70,25 @@ const codexBotLogin = fx.codex_bot_login;
 const headSha = fx.head_sha;
 const reviews = fx.reviews || [];
 const inlineComments = fx.inline_comments || [];
+const reactions = fx.reactions || [];
+const headCommitterDate = fx.head_committer_date || '';
+const mergedAt = fx.merged_at || '';
 
-// --- mirrored from .github/workflows/pr-audit.yml (#249) ----------
+// Build the comment-databaseId → isResolved map that the workflow
+// derives from its GraphQL reviewThreads fetch. `resolution_lookup_failed`
+// simulates a GraphQL failure → null (fail closed). Absent review_threads
+// → empty map (every finding unresolved), preserving pre-#449 fixtures.
+let resolutionByCommentId = {};
+if (fx.resolution_lookup_failed === true) {
+  resolutionByCommentId = null;
+} else if (Array.isArray(fx.review_threads)) {
+  for (const t of fx.review_threads) {
+    for (const cid of (t.comment_ids || [])) {
+      resolutionByCommentId[String(cid)] = t.is_resolved === true;
+    }
+  }
+}
+
 const codexReviewsOnHead = reviews.filter(
   r => r.user.login === codexBotLogin &&
        headSha &&
@@ -73,25 +98,58 @@ const codexCommentedOnHead = codexReviewsOnHead.filter(
   r => r.state === 'COMMENTED'
 );
 
+// --- mirrored from .github/workflows/pr-audit.yml (#249/#449/#450) -
 let codexCleared = false;
-if (codexCommentedOnHead.length > 0) {
-  const latestCodexReview = codexCommentedOnHead.reduce(
-    (latest, r) => {
-      if (!latest) return r;
-      return (r.submitted_at > latest.submitted_at) ? r : latest;
-    },
-    null
-  );
+if (inlineComments !== null) {
+  let latestCodexReview = null;
+  if (codexCommentedOnHead.length > 0) {
+    latestCodexReview = codexCommentedOnHead.reduce(
+      (latest, r) => {
+        if (!latest) return r;
+        return (r.submitted_at > latest.submitted_at) ? r : latest;
+      },
+      null
+    );
+  }
+  const latestReviewTime =
+    latestCodexReview ? (latestCodexReview.submitted_at || '') : '';
 
   const p01Regex = /!\[P[01] Badge\]/;
-  const unresolvedP01 = inlineComments.filter(
-    c => c.user && c.user.login === codexBotLogin &&
-         c.pull_request_review_id === latestCodexReview.id &&
-         p01Regex.test(c.body || '')
-  );
+  let reviewHasUnresolvedP01 = false;
+  if (latestCodexReview) {
+    const p01 = inlineComments.filter(
+      c => c.user && c.user.login === codexBotLogin &&
+           c.pull_request_review_id === latestCodexReview.id &&
+           p01Regex.test(c.body || '')
+    );
+    if (resolutionByCommentId === null) {
+      reviewHasUnresolvedP01 = p01.length > 0; // fail closed
+    } else {
+      reviewHasUnresolvedP01 = p01.some(
+        c => resolutionByCommentId[String(c.id)] !== true
+      );
+    }
+  }
 
-  if (unresolvedP01.length === 0) {
+  let latestReactionTime = '';
+  for (const x of reactions) {
+    if (x.user && x.user.login === codexBotLogin &&
+        x.content === '+1' &&
+        headCommitterDate && x.created_at >= headCommitterDate &&
+        mergedAt && x.created_at <= mergedAt &&
+        x.created_at > latestReactionTime) {
+      latestReactionTime = x.created_at;
+    }
+  }
+
+  if (latestReactionTime && latestReviewTime) {
+    codexCleared = (latestReactionTime > latestReviewTime)
+      ? true
+      : !reviewHasUnresolvedP01;
+  } else if (latestReactionTime) {
     codexCleared = true;
+  } else if (latestReviewTime) {
+    codexCleared = !reviewHasUnresolvedP01;
   }
 }
 // --- end mirrored algorithm --------------------------------------
@@ -147,6 +205,44 @@ if grep -qF '#249' "$WORKFLOW"; then
 else
   fail=$((fail + 1))
   echo "  FAIL: $WORKFLOW must reference #249 in a comment for traceability" >&2
+fi
+
+# Structural assertion (#449): the workflow fetches review-thread
+# resolution state via GraphQL reviewThreads. Without it the audit
+# would flag an author-resolved P1 (the sanctioned codex-p1-gate
+# override path) as an unresolved finding — the exact false positive
+# #449 closes. The fixture tests above consume a pre-built resolution
+# map, so they can't catch a dropped fetch at the API call site.
+if grep -qF 'reviewThreads(first:100' "$WORKFLOW" && grep -qF 'isResolved' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW fetches reviewThreads resolution state (#449)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must fetch reviewThreads/isResolved for resolution-aware P0/P1 filtering (#449)" >&2
+fi
+
+# Structural assertion (#450): the workflow reads Codex bot +1
+# reactions and anchors them to merge time (pr.merged_at), not the
+# audit run time. A regression to a NOW-window floor would reject
+# every week-old merge-time +1.
+if grep -qF 'reactions.listForIssue' "$WORKFLOW" && \
+   grep -qF "x.content === '+1'" "$WORKFLOW" && \
+   grep -qF 'pr.merged_at' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW accepts merge-time-anchored Codex +1 clearance (#450)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must read Codex +1 reactions anchored to pr.merged_at (#450)" >&2
+fi
+
+# Structural assertion: the workflow references #449 and #450 for
+# traceability back to the clearance-semantics issues.
+if grep -qF '#449' "$WORKFLOW" && grep -qF '#450' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW references #449 and #450"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must reference #449 and #450 in comments for traceability" >&2
 fi
 
 # Structural assertion: the per-PR review fetch is paginated. PRs

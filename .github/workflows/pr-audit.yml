@@ -319,71 +319,201 @@ jobs:
                   r => r.state === 'COMMENTED'
                 );
 
-                // Two-condition Codex clearance: at least one
-                // COMMENTED review on HEAD, AND no unresolved
-                // P0/P1 inline findings on the latest round.
-                // Findings are scoped to the latest Codex review's
-                // pull_request_review_id (same as merge gate (c))
-                // so an earlier round's already-addressed findings
-                // don't keep the audit failing.
-                let codexCleared = false;
-                if (codexCommentedOnHead.length > 0) {
-                  // Latest Codex review on HEAD (max by submitted_at).
-                  const latestCodexReview = codexCommentedOnHead.reduce(
-                    (latest, r) => {
-                      if (!latest) return r;
-                      return (r.submitted_at > latest.submitted_at) ? r : latest;
-                    },
-                    null
+                // Codex clearance mirrors scripts/codex-review-check.sh
+                // gate (c): a PR clears when the LATEST qualifying Codex
+                // signal on the merge HEAD is either
+                //   - a COMMENTED review with no UNRESOLVED P0/P1 inline
+                //     findings (#249 + resolution-aware, #449), OR
+                //   - a 👍/+1 reaction from the Codex bot inside the
+                //     merge-time freshness window (#450).
+                // Latest-signal-wins decides between them, identically to
+                // the merge gate, so a PR legitimately merged on either
+                // form is not retroactively flagged. Resolves TODO(#235).
+                //
+                // Inline P0/P1 findings live on /pulls/{pr}/comments,
+                // keyed to a review via pull_request_review_id; resolution
+                // state lives on the GraphQL reviewThreads view, joined by
+                // comment databaseId (same join as scripts/codex-p1-gate.sh).
+                let inlineComments = [];
+                try {
+                  inlineComments = await github.paginate(
+                    github.rest.pulls.listReviewComments,
+                    {
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      pull_number: pr.number,
+                      per_page: 100,
+                    }
                   );
+                } catch (e) {
+                  console.log(
+                    `WARNING: could not fetch inline comments for PR #${pr.number}; ` +
+                    `treating Codex clearance as NOT met for safety. Error: ${e.message}`
+                  );
+                  inlineComments = null;
+                }
 
-                  // Fetch inline review comments for this PR. The
-                  // outer review-fetch (listReviews) returns review
-                  // metadata only — inline P0/P1 findings live on
-                  // the /pulls/{pr}/comments endpoint, keyed back
-                  // to a review via pull_request_review_id.
-                  let inlineComments = [];
-                  try {
-                    inlineComments = await github.paginate(
-                      github.rest.pulls.listReviewComments,
+                // Comment-databaseId → isResolved map, paginated over all
+                // review threads. null = lookup failed → fail CLOSED
+                // (#449): every P0/P1 finding is then treated as
+                // unresolved, so the review path cannot clear on a lookup
+                // failure. Inner comments(first:100) matches
+                // scripts/codex-p1-gate.sh (a single P0/P1 thread with
+                // >100 replies is not a real shape).
+                let resolutionByCommentId = {};
+                try {
+                  let cursor = null;
+                  for (;;) {
+                    const tresp = await github.graphql(
+                      `query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
+                         repository(owner:$owner,name:$name){
+                           pullRequest(number:$pr){
+                             reviewThreads(first:100, after:$cursor){
+                               pageInfo { hasNextPage endCursor }
+                               nodes { isResolved comments(first:100){ nodes { databaseId } } }
+                             }
+                           }
+                         }
+                       }`,
                       {
                         owner: context.repo.owner,
-                        repo: context.repo.repo,
-                        pull_number: pr.number,
-                        per_page: 100,
+                        name: context.repo.repo,
+                        pr: pr.number,
+                        cursor,
                       }
                     );
-                  } catch (e) {
-                    console.log(
-                      `WARNING: could not fetch inline comments for PR #${pr.number}; ` +
-                      `treating Codex clearance as NOT met for safety. Error: ${e.message}`
-                    );
-                    inlineComments = null;
+                    const rt = tresp.repository.pullRequest.reviewThreads;
+                    for (const t of rt.nodes) {
+                      for (const c of t.comments.nodes) {
+                        resolutionByCommentId[String(c.databaseId)] = t.isResolved;
+                      }
+                    }
+                    if (!rt.pageInfo.hasNextPage) break;
+                    cursor = rt.pageInfo.endCursor;
                   }
+                } catch (e) {
+                  console.log(
+                    `WARNING: reviewThreads resolution lookup failed for PR #${pr.number}; ` +
+                    `failing closed (P0/P1 findings treated as unresolved). Error: ${e.message}`
+                  );
+                  resolutionByCommentId = null;
+                }
 
-                  if (inlineComments !== null && latestCodexReview) {
-                    // P0/P1 finding heuristic — same regex used by
-                    // scripts/codex-review-check.sh gate (c):
-                    // Codex inlines `![P0 Badge]` / `![P1 Badge]`
-                    // markdown images into each finding body.
-                    // Filter on bot author too — review-thread
-                    // replies (e.g., a quote-reply from the PR
-                    // author addressing a Codex finding) inherit
-                    // the same pull_request_review_id and would
-                    // otherwise be misclassified as unaddressed
-                    // findings (see codex-review-check.sh § P0/P1
-                    // for the nathanpaynedotcom #180 round 3
-                    // history on that filter).
-                    const p01Regex = /!\[P[01] Badge\]/;
-                    const unresolvedP01 = inlineComments.filter(
+                // Codex bot 👍/+1 reactions on the PR issue. The merge
+                // gate anchors freshness to max(HEAD push, NOW - window);
+                // the WEEKLY audit instead anchors to MERGE time, because
+                // a valid merge-time +1 is week-old by audit time and a
+                // NOW - window floor would wrongly reject it (#450). The
+                // window is [HEAD committer date, merged_at]: on/after the
+                // HEAD freshness floor and not a post-merge reaction.
+                let reactions = [];
+                try {
+                  reactions = await github.paginate(
+                    github.rest.reactions.listForIssue,
+                    {
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: pr.number,
+                      per_page: 100,
+                    }
+                  );
+                } catch (e) {
+                  console.log(
+                    `WARNING: could not fetch reactions for PR #${pr.number}; ` +
+                    `reaction-clearance path disabled. Error: ${e.message}`
+                  );
+                  reactions = [];
+                }
+
+                // HEAD committer date — the reaction-window lower bound.
+                // Unavailable → reaction path stays off (fail closed for
+                // that path; the review path is unaffected).
+                let headCommitterDate = '';
+                try {
+                  const commitResp = await github.rest.repos.getCommit({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    ref: headSha,
+                  });
+                  headCommitterDate =
+                    (commitResp.data.commit.committer &&
+                     commitResp.data.commit.committer.date) || '';
+                } catch (e) {
+                  console.log(
+                    `WARNING: could not fetch HEAD commit for PR #${pr.number}; ` +
+                    `reaction-clearance lower bound unavailable. Error: ${e.message}`
+                  );
+                  headCommitterDate = '';
+                }
+                const mergedAt = pr.merged_at || '';
+
+                // ── Clearance algorithm (#249/#449/#450) ──────────────
+                // KEEP IN SYNC with the mirrored runner in
+                // scripts/ci/check_pr_audit_codex_clearance.
+                let codexCleared = false;
+                if (inlineComments !== null) {
+                  // Latest Codex COMMENTED review on HEAD (max submitted_at).
+                  let latestCodexReview = null;
+                  if (codexCommentedOnHead.length > 0) {
+                    latestCodexReview = codexCommentedOnHead.reduce(
+                      (latest, r) => {
+                        if (!latest) return r;
+                        return (r.submitted_at > latest.submitted_at) ? r : latest;
+                      },
+                      null
+                    );
+                  }
+                  const latestReviewTime =
+                    latestCodexReview ? (latestCodexReview.submitted_at || '') : '';
+
+                  // Unresolved P0/P1 findings on the latest review. P0/P1
+                  // markers are the `![P0 Badge]` / `![P1 Badge]` images
+                  // Codex embeds; scope to the bot author so an author
+                  // quote-reply doesn't read as a finding (#249). A
+                  // finding counts as unresolved unless its thread is
+                  // RESOLVED (#449).
+                  const p01Regex = /!\[P[01] Badge\]/;
+                  let reviewHasUnresolvedP01 = false;
+                  if (latestCodexReview) {
+                    const p01 = inlineComments.filter(
                       c => c.user && c.user.login === codexBotLogin &&
                            c.pull_request_review_id === latestCodexReview.id &&
                            p01Regex.test(c.body || '')
                     );
-
-                    if (unresolvedP01.length === 0) {
-                      codexCleared = true;
+                    if (resolutionByCommentId === null) {
+                      reviewHasUnresolvedP01 = p01.length > 0; // fail closed
+                    } else {
+                      reviewHasUnresolvedP01 = p01.some(
+                        c => resolutionByCommentId[String(c.id)] !== true
+                      );
                     }
+                  }
+
+                  // Latest qualifying Codex +1 reaction in the merge-time
+                  // window. Empty latestReactionTime sorts below any ISO
+                  // timestamp, so the first qualifier always sets it.
+                  let latestReactionTime = '';
+                  for (const x of reactions) {
+                    if (x.user && x.user.login === codexBotLogin &&
+                        x.content === '+1' &&
+                        headCommitterDate && x.created_at >= headCommitterDate &&
+                        mergedAt && x.created_at <= mergedAt &&
+                        x.created_at > latestReactionTime) {
+                      latestReactionTime = x.created_at;
+                    }
+                  }
+
+                  // Latest-signal-wins — mirrors codex-review-check.sh:
+                  // a newer +1 clears an older review-with-findings; a
+                  // newer review-with-findings blocks an older +1.
+                  if (latestReactionTime && latestReviewTime) {
+                    codexCleared = (latestReactionTime > latestReviewTime)
+                      ? true
+                      : !reviewHasUnresolvedP01;
+                  } else if (latestReactionTime) {
+                    codexCleared = true;
+                  } else if (latestReviewTime) {
+                    codexCleared = !reviewHasUnresolvedP01;
                   }
                 }
 

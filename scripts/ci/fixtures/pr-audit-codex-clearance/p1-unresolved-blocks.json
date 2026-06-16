@@ -1,0 +1,26 @@
+{
+  "description": "Codex COMMENTED on HEAD with a P1 finding whose review thread is UNRESOLVED → NOT cleared (#449)",
+  "expected_cleared": false,
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "reviews": [
+    {
+      "id": 1001,
+      "state": "COMMENTED",
+      "commit_id": "deadbeefcafe1234567890abcdef1234567890ab",
+      "submitted_at": "2026-05-12T10:00:00Z",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ],
+  "inline_comments": [
+    {
+      "id": 5001,
+      "pull_request_review_id": 1001,
+      "body": "![P1 Badge](https://example.com/p1.svg) Unbounded retry on 5xx.",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ],
+  "review_threads": [
+    { "is_resolved": false, "comment_ids": [5001] }
+  ]
+}
