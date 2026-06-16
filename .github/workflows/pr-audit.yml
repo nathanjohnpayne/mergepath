@@ -425,9 +425,9 @@ jobs:
                   reactions = [];
                 }
 
-                // HEAD committer date — the reaction-window lower bound.
-                // Unavailable → reaction path stays off (fail closed for
-                // that path; the review path is unaffected).
+                // HEAD committer date — the BASE reaction-window lower
+                // bound. Unavailable → reaction path stays off (fail closed
+                // for that path; the review path is unaffected).
                 let headCommitterDate = '';
                 try {
                   const commitResp = await github.rest.repos.getCommit({
@@ -445,6 +445,51 @@ jobs:
                   );
                   headCommitterDate = '';
                 }
+
+                // Raise the lower bound to the latest force-push time when
+                // it is newer than the committer date — mirrors
+                // codex-review-check.sh's HEAD_PUSHED_AT = max(committer
+                // date, head_ref_force_pushed). A PR force-pushed to an
+                // old/reused commit carries an OLD committer date, so
+                // without this a stale +1 from before the force-push could
+                // satisfy the window and falsely clear the audit for
+                // exactly the force-push bypass it exists to catch (Codex
+                // P2 on PR #460).
+                let lastForcePushAt = '';
+                try {
+                  const timeline = await github.paginate(
+                    github.rest.issues.listEventsForTimeline,
+                    {
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: pr.number,
+                      per_page: 100,
+                    }
+                  );
+                  for (const ev of timeline) {
+                    if (ev.event === 'head_ref_force_pushed' &&
+                        ev.created_at && ev.created_at > lastForcePushAt) {
+                      lastForcePushAt = ev.created_at;
+                    }
+                  }
+                } catch (e) {
+                  console.log(
+                    `WARNING: could not fetch timeline for PR #${pr.number}; ` +
+                    `force-push reaction anchor unavailable. Error: ${e.message}`
+                  );
+                  lastForcePushAt = '';
+                }
+
+                // Reaction-window lower bound = max(committer date, last
+                // force-push), lexicographic on ISO-8601. Empty committer
+                // date keeps the reaction path off (fail closed); force-push
+                // only RAISES an existing base, never substitutes for it.
+                const reactionLowerBound = headCommitterDate
+                  ? ((lastForcePushAt > headCommitterDate)
+                      ? lastForcePushAt
+                      : headCommitterDate)
+                  : '';
+
                 const mergedAt = pr.merged_at || '';
 
                 // ── Clearance algorithm (#249/#449/#450) ──────────────
@@ -490,13 +535,14 @@ jobs:
                   }
 
                   // Latest qualifying Codex +1 reaction in the merge-time
-                  // window. Empty latestReactionTime sorts below any ISO
-                  // timestamp, so the first qualifier always sets it.
+                  // window [reactionLowerBound, merged_at]. Empty
+                  // latestReactionTime sorts below any ISO timestamp, so the
+                  // first qualifier always sets it.
                   let latestReactionTime = '';
                   for (const x of reactions) {
                     if (x.user && x.user.login === codexBotLogin &&
                         x.content === '+1' &&
-                        headCommitterDate && x.created_at >= headCommitterDate &&
+                        reactionLowerBound && x.created_at >= reactionLowerBound &&
                         mergedAt && x.created_at <= mergedAt &&
                         x.created_at > latestReactionTime) {
                       latestReactionTime = x.created_at;

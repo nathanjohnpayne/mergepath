@@ -25,6 +25,8 @@
 #   - review-newer-than-reaction-blocks.json — newer review w/ unresolved P1 beats older +1 → NOT cleared (#450)
 #   - reaction-newer-than-review-clears.json — newer +1 beats older review w/ P1 → cleared (#450)
 #   - inline-fetch-failed.json    — inline_comments=null (fetch failed) → fail-closed, NOT cleared (CodeRabbit #460)
+#   - forcepush-stale-plus1-rejected.json — +1 predates a later force-push → raised lower bound, NOT cleared (Codex P2 #460)
+#   - forcepush-fresh-plus1-clears.json   — +1 after the force-push → cleared (anchor must not over-reject, Codex P2 #460)
 #
 # Inline-literal pattern: the algorithm under test is duplicated
 # from the workflow YAML into the Node script below, the same way
@@ -81,6 +83,14 @@ const reviews = fx.reviews || [];
 const inlineComments = (fx.inline_comments === undefined) ? [] : fx.inline_comments;
 const reactions = fx.reactions || [];
 const headCommitterDate = fx.head_committer_date || '';
+const lastForcePushAt = fx.last_force_push_at || '';
+// Reaction-window lower bound mirrors the workflow: max(committer date,
+// last force-push), lexicographic ISO-8601. Empty committer date keeps
+// the reaction path off; force-push only raises an existing base
+// (Codex P2 on PR 460).
+const reactionLowerBound = headCommitterDate
+  ? ((lastForcePushAt > headCommitterDate) ? lastForcePushAt : headCommitterDate)
+  : '';
 const mergedAt = fx.merged_at || '';
 
 // Build the comment-databaseId → isResolved map that the workflow
@@ -144,7 +154,7 @@ if (inlineComments !== null) {
   for (const x of reactions) {
     if (x.user && x.user.login === codexBotLogin &&
         x.content === '+1' &&
-        headCommitterDate && x.created_at >= headCommitterDate &&
+        reactionLowerBound && x.created_at >= reactionLowerBound &&
         mergedAt && x.created_at <= mergedAt &&
         x.created_at > latestReactionTime) {
       latestReactionTime = x.created_at;
@@ -242,6 +252,20 @@ if grep -qF 'reactions.listForIssue' "$WORKFLOW" && \
 else
   fail=$((fail + 1))
   echo "  FAIL: $WORKFLOW must read Codex +1 reactions anchored to pr.merged_at (#450)" >&2
+fi
+
+# Structural assertion (Codex P2 on #460): the workflow raises the
+# reaction-window lower bound to the latest head_ref_force_pushed time,
+# mirroring the merge gate. Without it a stale +1 on a PR force-pushed to
+# an old/reused commit could satisfy the window and falsely clear.
+if grep -qF 'head_ref_force_pushed' "$WORKFLOW" && \
+   grep -qF 'listEventsForTimeline' "$WORKFLOW" && \
+   grep -qF 'reactionLowerBound' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW raises the reaction lower bound to the force-push anchor (Codex P2 #460)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must anchor reactions to head_ref_force_pushed (max with committer date) — Codex P2 #460" >&2
 fi
 
 # Structural assertion: the workflow references #449 and #450 for
