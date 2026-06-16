@@ -30,6 +30,7 @@
 #   - forcepush-stale-plus1-rejected.json — +1 predates a later force-push → raised lower bound, NOT cleared (Codex P2 #460)
 #   - forcepush-fresh-plus1-clears.json   — +1 after the force-push → cleared (anchor must not over-reject, Codex P2 #460)
 #   - stale-prior-head-plus1-rejected.json — +1 before merged_at-window floor → NOT cleared (merge-time freshness floor, Codex P2 #460)
+#   - codex-disabled-plus1-rejected.json — codex.enabled=false + fresh +1, no CLI APPROVED → NOT cleared (codexEnabled gate, Codex P2 #460)
 #
 # Inline-literal pattern: the algorithm under test is duplicated
 # from the workflow YAML into the Node script below, the same way
@@ -74,6 +75,8 @@ const fx = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
 
 const codexBotLogin = fx.codex_bot_login;
 const headSha = fx.head_sha;
+// codex.enabled gate (#460 Codex P2): default true, absent → true.
+const codexEnabled = fx.codex_enabled !== false;
 const reviews = fx.reviews || [];
 // Preserve an explicit JSON null for inline_comments instead of
 // collapsing it to an empty array (CodeRabbit on PR 460). In the
@@ -137,8 +140,10 @@ const codexCommentedOnHead = codexReviewsOnHead.filter(
 );
 
 // --- mirrored from .github/workflows/pr-audit.yml (#249/#449/#450) -
+// Gate on codexEnabled (#460 Codex P2): codex.enabled=false → Codex bot
+// signals are ignored (codexCleared stays false), matching codex-review-check.sh.
 let codexCleared = false;
-if (inlineComments !== null) {
+if (codexEnabled && inlineComments !== null) {
   let latestCodexReview = null;
   if (codexCommentedOnHead.length > 0) {
     latestCodexReview = codexCommentedOnHead.reduce(
@@ -323,6 +328,24 @@ if grep -qF 'reactionFreshnessWindowSeconds' "$WORKFLOW" && \
 else
   fail=$((fail + 1))
   echo "  FAIL: $WORKFLOW must add the merged_at - reaction_freshness_window_seconds floor to the reaction lower bound — Codex P2 #460" >&2
+fi
+
+# Structural assertion (Codex P2 on #460): the workflow honors
+# codex.enabled before accepting any Codex bot clearance signal. When
+# codex.enabled=false, codex-review-check.sh ignores Codex reviews and
+# reactions (gate (c) clears only via a Phase 4b substitute APPROVED);
+# the retrospective audit must match, or a stray 👍 from a still-installed
+# App on a codex-disabled repo would mark a merge compliant that the merge
+# gate never cleared. Captured from policy as codexEnabled, then gated on
+# the clearance algorithm. The codex-disabled-plus1-rejected fixture
+# exercises the runtime path; this canary guards the workflow source.
+if grep -qF 'config.codex.enabled === false' "$WORKFLOW" && \
+   grep -qF 'if (codexEnabled && inlineComments !== null)' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW honors codex.enabled before accepting Codex bot clearance (Codex P2 #460)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must gate Codex clearance on codexEnabled (codex.enabled===false → ignore bot signals) — Codex P2 #460" >&2
 fi
 
 # Structural assertion: the workflow references #449 and #450 for
