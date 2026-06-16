@@ -1,0 +1,16 @@
+{
+  "description": "Inline-comment fetch failed (inline_comments=null) → fail closed even with a clean COMMENTED review on HEAD, NOT cleared (CodeRabbit #460)",
+  "expected_cleared": false,
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "inline_comments": null,
+  "reviews": [
+    {
+      "id": 1001,
+      "state": "COMMENTED",
+      "commit_id": "deadbeefcafe1234567890abcdef1234567890ab",
+      "submitted_at": "2026-05-12T10:00:00Z",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ]
+}

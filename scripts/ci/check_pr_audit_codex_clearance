@@ -24,6 +24,7 @@
 #   - post-merge-plus1-rejected.json — +1 after merged_at → NOT cleared (#450)
 #   - review-newer-than-reaction-blocks.json — newer review w/ unresolved P1 beats older +1 → NOT cleared (#450)
 #   - reaction-newer-than-review-clears.json — newer +1 beats older review w/ P1 → cleared (#450)
+#   - inline-fetch-failed.json    — inline_comments=null (fetch failed) → fail-closed, NOT cleared (CodeRabbit #460)
 #
 # Inline-literal pattern: the algorithm under test is duplicated
 # from the workflow YAML into the Node script below, the same way
@@ -69,7 +70,15 @@ const fx = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
 const codexBotLogin = fx.codex_bot_login;
 const headSha = fx.head_sha;
 const reviews = fx.reviews || [];
-const inlineComments = fx.inline_comments || [];
+// Preserve an explicit JSON null for inline_comments instead of
+// collapsing it to an empty array (CodeRabbit on PR 460). In the
+// workflow a failed inline-comment fetch leaves inlineComments as null
+// and the clearance block is skipped to fail closed; mapping only an
+// omitted key keeps that branch testable. Note: this comment avoids
+// backticks/apostrophes on purpose — the runner lives in a single-quoted
+// bash heredoc inside a command substitution, where bash 3.2 mis-parses
+// stray quotes while scanning for the closing paren.
+const inlineComments = (fx.inline_comments === undefined) ? [] : fx.inline_comments;
 const reactions = fx.reactions || [];
 const headCommitterDate = fx.head_committer_date || '';
 const mergedAt = fx.merged_at || '';
