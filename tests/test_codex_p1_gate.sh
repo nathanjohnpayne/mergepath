@@ -232,6 +232,44 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 1b (#447): gate disabled + NO env (no PR_NUMBER, REPO, or GH_TOKEN).
+# The enabled=false short-circuit must run BEFORE the PR-context
+# requirements, so a disabled consumer no-ops on a bare/ad-hoc invocation
+# instead of erroring on missing env (the documented step-1 contract).
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 1b (#447): gate disabled + no PR/REPO/GH_TOKEN env"
+SCRATCH=$(make_scratch_with_config false)
+: > "$WORKDIR/gh-calls.log"
+set +e
+OUT=$( cd "$SCRATCH" && PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/gh-calls.log" \
+  env -u GH_TOKEN -u PR_NUMBER -u REPO "$SCRIPT" 2>&1 )
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex P1 unresolved: 0" \
+    && ! grep -q "^gh" "$WORKDIR/gh-calls.log"; then
+  pass "#447: disabled gate + no env → exit 0 clean pass (no PR_NUMBER/GH_TOKEN error, no gh calls)"
+else
+  fail "#447: expected rc=0 + 'unresolved: 0' + no gh calls; got rc=$RC, output:"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# Control: gate ENABLED + no env → still errors (env required once enabled).
+echo "--- Test 1c (#447 control): gate enabled + no PR_NUMBER → exit 2"
+SCRATCH=$(make_scratch_with_config true)
+set +e
+OUT=$( cd "$SCRATCH" && PATH="$STUB_DIR:$PATH" \
+  env -u GH_TOKEN -u PR_NUMBER -u REPO "$SCRIPT" 2>&1 )
+RC=$?
+set -e
+if [ "$RC" = 2 ] && echo "$OUT" | grep -q "PR_NUMBER required"; then
+  pass "#447 control: enabled gate + no env → exit 2 (env still required when enabled)"
+else
+  fail "#447 control: expected rc=2 + 'PR_NUMBER required'; got rc=$RC, output:"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Test 2: Gate enabled, no P1 comments at all — exit 0.
 # ---------------------------------------------------------------------------
 echo

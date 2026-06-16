@@ -27,6 +27,7 @@ make_case() {
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
   cp "$ROOT/scripts/coderabbit-wait.sh" "$dir/scripts/coderabbit-wait.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
+  cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
   chmod +x "$dir/scripts/coderabbit-wait.sh"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
@@ -461,6 +462,54 @@ test_review_during_probe_wait_emits_findings() {
   fi
 }
 
+# #446: fast-path StatusContext clearance race. A NEWER rate-limit/
+# in-progress comment than the StatusContext success must suppress the
+# fast-path EVEN WHEN it does not reference the current HEAD — otherwise the
+# wait can declare clearance while CodeRabbit has just announced it is
+# rate-limited / re-reviewing. The full fast-path is gated on
+# trust_status_context_for_clearance: true, which the scenario harness above
+# disables, so this regression pairs a STRUCTURAL assertion on the real
+# arbitration with an inline ordering-decision check (the inline-literal
+# pattern used by scripts/ci/check_pr_audit_codex_clearance). The REAL
+# runtime fast-path (trust enabled + StatusContext stub) — including the
+# created-after-suppress and created-before-clear directions — is exercised
+# end-to-end in scripts/ci/check_canonical_bugs_263caf3 "Bug 6".
+test_446_newer_comment_suppresses_stale_status() {
+  local script="$ROOT/scripts/coderabbit-wait.sh"
+
+  # Structural: the no-HEAD-reference branch must consult comment freshness
+  # (the #446 guard) rather than unconditionally return authoritative.
+  if grep -q "#446" "$script" \
+     && grep -q "StatusContext success suppressed because latest CodeRabbit comment" "$script"; then
+    pass "#446: coderabbit-wait.sh carries the newer-comment freshness guard in the no-HEAD fast-path branch"
+  else
+    fail "#446: coderabbit-wait.sh is missing the newer-comment freshness guard (#446 marker / suppressed-log)"
+  fi
+
+  # Inline ordering decision mirroring status_context_fast_path_blocked_by_comment:
+  # "block" (suppress the fast-path) iff the comment is rate_limit/in_progress
+  # AND not older than the StatusContext success (newer-or-equal), regardless
+  # of HEAD reference. KEEP IN SYNC with the function.
+  decide() {  # <class> <comment_fresh_at> <status_created_at> → block|authoritative
+    case "$1" in
+      rate_limit|in_progress)
+        if [[ "$2" < "$3" ]]; then echo authoritative; else echo block; fi ;;
+      *) echo authoritative ;;
+    esac
+  }
+  local ok=1
+  [[ "$(decide rate_limit  2026-06-04T00:10:00Z 2026-06-04T00:00:00Z)" == block ]]         || ok=0  # no-HEAD newer → block (#446)
+  [[ "$(decide rate_limit  2026-06-03T23:50:00Z 2026-06-04T00:00:00Z)" == authoritative ]] || ok=0  # older → authoritative
+  [[ "$(decide in_progress 2026-06-04T00:10:00Z 2026-06-04T00:00:00Z)" == block ]]         || ok=0  # in_progress newer → block
+  [[ "$(decide normal      2026-06-04T00:10:00Z 2026-06-04T00:00:00Z)" == authoritative ]] || ok=0  # non-rate-limit → authoritative
+  if [ "$ok" = 1 ]; then
+    pass "#446: newer rate-limit/in-progress comment suppresses the fast-path; older or non-rate-limit does not"
+  else
+    fail "#446: fast-path newer-comment-vs-status ordering regressed"
+  fi
+}
+
+test_446_newer_comment_suppresses_stale_status
 test_timeout_probe_posts_once_and_surfaces_reply
 test_existing_status_probe_reply_never_clears
 test_rate_limit_stalled_does_not_probe

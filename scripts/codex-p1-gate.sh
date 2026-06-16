@@ -87,33 +87,6 @@ if [ $# -gt 2 ]; then
   exit 2
 fi
 
-# Positional args take precedence; env fallbacks support the
-# workflow_dispatch / scheduled-sweep paths where it's more
-# ergonomic to set env than to build a positional arg list.
-PR_NUMBER=${1:-${PR_NUMBER:-}}
-if [ -z "$PR_NUMBER" ]; then
-  echo "ERROR: PR_NUMBER required (positional arg or \$PR_NUMBER env)" >&2
-  exit 2
-fi
-if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
-  echo "ERROR: PR_NUMBER must be an integer; got '$PR_NUMBER'" >&2
-  exit 2
-fi
-
-REPO=${2:-${REPO:-}}
-if [ -z "$REPO" ]; then
-  REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
-  if [ -z "$REPO" ]; then
-    echo "ERROR: could not detect current repo via 'gh repo view'. Pass REPO explicitly." >&2
-    exit 2
-  fi
-fi
-
-if [ -z "${GH_TOKEN:-}" ]; then
-  echo "ERROR: GH_TOKEN is required. See REVIEW_POLICY.md § PAT lookup table." >&2
-  exit 2
-fi
-
 # --- config readers ---------------------------------------------------------
 
 CONFIG=".github/review-policy.yml"
@@ -163,6 +136,13 @@ codex_field() {
 # Gate knob: codex.p1_gate.enabled. Default false everywhere except
 # mergepath itself (which sets it true in .github/review-policy.yml).
 # Off-state is a clean pass — no API calls, no work.
+#
+# This off-state short-circuit runs BEFORE the PR_NUMBER/REPO/GH_TOKEN
+# requirements below (#447): the header documents step 1 as
+# "p1_gate.enabled=false → clean pass," so a consumer with the gate
+# disabled must no-op on a bare/ad-hoc invocation instead of erroring on
+# missing PR context. The readers above touch only the local
+# review-policy.yml — no args, no API, no gh.
 P1_GATE_ENABLED=$(codex_p1_gate_field enabled)
 P1_GATE_ENABLED=${P1_GATE_ENABLED:-false}
 case "$P1_GATE_ENABLED" in
@@ -177,6 +157,38 @@ if [ "$P1_GATE_ENABLED" != "true" ]; then
   echo "[codex-p1-gate] codex.p1_gate.enabled=false — skipping (clean pass)"
   echo "Codex P1 unresolved: 0"
   exit 0
+fi
+
+# --- PR context (required only once the gate is enabled) --------------------
+
+# Positional args take precedence; env fallbacks support the
+# workflow_dispatch / scheduled-sweep paths where it's more
+# ergonomic to set env than to build a positional arg list.
+PR_NUMBER=${1:-${PR_NUMBER:-}}
+if [ -z "$PR_NUMBER" ]; then
+  echo "ERROR: PR_NUMBER required (positional arg or \$PR_NUMBER env)" >&2
+  exit 2
+fi
+if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+  echo "ERROR: PR_NUMBER must be an integer; got '$PR_NUMBER'" >&2
+  exit 2
+fi
+
+# Verify GH_TOKEN BEFORE auto-detecting REPO via `gh repo view` — a
+# missing/invalid token otherwise surfaces as a misleading "could not
+# detect current repo" instead of the real auth error (CodeRabbit on #463).
+if [ -z "${GH_TOKEN:-}" ]; then
+  echo "ERROR: GH_TOKEN is required. See REVIEW_POLICY.md § PAT lookup table." >&2
+  exit 2
+fi
+
+REPO=${2:-${REPO:-}}
+if [ -z "$REPO" ]; then
+  REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
+  if [ -z "$REPO" ]; then
+    echo "ERROR: could not detect current repo via 'gh repo view'. Pass REPO explicitly." >&2
+    exit 2
+  fi
 fi
 
 BOT_LOGIN=$(codex_field bot_login)

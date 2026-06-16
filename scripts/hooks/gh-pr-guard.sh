@@ -1023,16 +1023,21 @@ for i in "${!TOKENS[@]}"; do
       fi
       # env's combined/long forms that drop identity variables from
       # the wrapped command's environment (same r15 empty-override
-      # semantics as `env -u NAME` above): --unset=NAME, and -i which
-      # clears the whole environment.
+      # semantics as `env -u NAME` above): --unset=NAME, -u=NAME, the
+      # COMPACT -uNAME (flag and name attached, no `=` — #451), and -i
+      # which clears the whole environment. The space forms `-u NAME` /
+      # `--unset NAME` are consumed by the value-flag path above; only the
+      # attached forms reach this case, and -uNAME is the one
+      # prefix_flag_takes_value (which matches only the bare `-u`) cannot
+      # recognize, so it must be modeled explicitly here.
       if [ "$CURRENT_PREFIX" = "env" ]; then
         case "$tok" in
-          --unset=GH_AS_AUTHOR_IDENTITY|-u=GH_AS_AUTHOR_IDENTITY)
+          --unset=GH_AS_AUTHOR_IDENTITY|-u=GH_AS_AUTHOR_IDENTITY|-uGH_AS_AUTHOR_IDENTITY)
             INLINE_GH_AS_AUTHOR_IDENTITY=""
             INLINE_GH_AS_AUTHOR_IDENTITY_SET=1
             continue
             ;;
-          --unset=GH_AS_REVIEWER_IDENTITY|-u=GH_AS_REVIEWER_IDENTITY)
+          --unset=GH_AS_REVIEWER_IDENTITY|-u=GH_AS_REVIEWER_IDENTITY|-uGH_AS_REVIEWER_IDENTITY)
             INLINE_GH_AS_REVIEWER_IDENTITY=""
             INLINE_GH_AS_REVIEWER_IDENTITY_SET=1
             continue

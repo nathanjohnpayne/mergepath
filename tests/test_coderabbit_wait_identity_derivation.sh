@@ -34,6 +34,7 @@ make_case() {
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
   cp "$ROOT/scripts/coderabbit-wait.sh" "$dir/scripts/coderabbit-wait.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
+  cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
   chmod +x "$dir/scripts/coderabbit-wait.sh"
 
   cat >"$dir/.github/review-policy.yml" <<'EOF'
@@ -285,6 +286,51 @@ test_derives_identity_from_quoted_commented_entry() {
   fi
 }
 
+# #453: the shared scripts/lib/reviewers-helpers.sh parses the allow-list
+# with the strongest normalization (dash + inline comment + BOTH quote
+# styles + whitespace), so coderabbit-wait.sh and codex-review-check.sh stay
+# in lockstep and a quoted/commented reviewer is never silently dropped from
+# the fail-closed token allow-list. Direct unit test of the shared lib.
+test_453_shared_reviewers_helper() {
+  local lib="$ROOT/scripts/lib/reviewers-helpers.sh"
+  if [ ! -r "$lib" ]; then fail "#453: missing $lib"; return; fi
+  local cfg; cfg="$(mktemp)"
+  # `nathanpayne-cursor` is double-quoted WITH trailing padding and NO inline
+  # comment — the Codex P2 on #463 shape (the closing quote must be stripped
+  # despite the trailing spaces). Built with printf so the trailing spaces are
+  # explicit and survive editor/linter whitespace-trimming. `nathanpayne-codex`
+  # is single-quoted with a trailing comment + padding.
+  {
+    printf 'available_reviewers:\n'
+    printf '  - nathanpayne-claude\n'
+    printf '  - "nathanpayne-cursor"   \n'
+    printf "  - 'nathanpayne-codex'   # single quotes + trailing comment + padding\n"
+    printf 'default_external_reviewer: nathanpayne-codex\n'
+  } >"$cfg"
+  ( # shellcheck source=../scripts/lib/reviewers-helpers.sh
+    . "$lib"
+    out=$(read_available_reviewers "$cfg" | tr '\n' ',')
+    [ "$out" = "nathanpayne-claude,nathanpayne-cursor,nathanpayne-codex," ] \
+      || { echo "parse mismatch: [$out]" >&2; exit 1; }
+    login_is_available_reviewer "nathanpayne-cursor" "$cfg" \
+      || { echo "double-quoted member not recognized" >&2; exit 1; }
+    login_is_available_reviewer "nathanpayne-codex" "$cfg" \
+      || { echo "single-quoted+commented member not recognized" >&2; exit 1; }
+    ! login_is_available_reviewer "default_external_reviewer" "$cfg" \
+      || { echo "non-member (out-of-block key) wrongly matched" >&2; exit 1; }
+    ! login_is_available_reviewer "" "$cfg" \
+      || { echo "empty login wrongly matched" >&2; exit 1; }
+  )
+  local rc=$?
+  rm -f "$cfg"
+  if [ "$rc" = 0 ]; then
+    pass "#453: shared reviewers-helpers parses quoted/commented/whitespace entries and matches members fail-closed"
+  else
+    fail "#453: shared reviewers-helpers parsing/membership regressed (rc=$rc)"
+  fi
+}
+
+test_453_shared_reviewers_helper
 test_derives_identity_from_allow_listed_token
 test_derives_identity_from_quoted_commented_entry
 test_non_allow_listed_token_fails_closed
