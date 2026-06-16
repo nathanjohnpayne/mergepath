@@ -31,6 +31,7 @@
 #   - forcepush-fresh-plus1-clears.json   — +1 after the force-push → cleared (anchor must not over-reject, Codex P2 #460)
 #   - stale-prior-head-plus1-rejected.json — +1 before merged_at-window floor → NOT cleared (merge-time freshness floor, Codex P2 #460)
 #   - codex-disabled-plus1-rejected.json — codex.enabled=false + fresh +1, no CLI APPROVED → NOT cleared (codexEnabled gate, Codex P2 #460)
+#   - postmerge-forcepush-plus1-clears.json — force-push AFTER merge ignored; pre-merge +1 still clears (merge-time force-push bound, Codex P2 #460 r2)
 #
 # Inline-literal pattern: the algorithm under test is duplicated
 # from the workflow YAML into the Node script below, the same way
@@ -89,8 +90,15 @@ const reviews = fx.reviews || [];
 const inlineComments = (fx.inline_comments === undefined) ? [] : fx.inline_comments;
 const reactions = fx.reactions || [];
 const headCommitterDate = fx.head_committer_date || '';
-const lastForcePushAt = fx.last_force_push_at || '';
 const mergedAt = fx.merged_at || '';
+// Only force-pushes at or before merged_at are merge-time state; a
+// post-merge force-push must not raise the reaction lower bound past
+// merged_at (Codex P2 on PR 460 round 2). Mirrors the workflow filter of
+// head_ref_force_pushed events to created_at <= merged_at.
+let lastForcePushAt = fx.last_force_push_at || '';
+if (lastForcePushAt && mergedAt && lastForcePushAt > mergedAt) {
+  lastForcePushAt = '';
+}
 const reactionFreshnessWindowSeconds = fx.reaction_freshness_window_seconds || 1800;
 // Merge-time freshness floor: merged_at - window (ms stripped to compare
 // against ms-less ISO timestamps). Mirrors the workflow (#460 Codex P2).
@@ -314,6 +322,22 @@ if grep -qF 'head_ref_force_pushed' "$WORKFLOW" && \
 else
   fail=$((fail + 1))
   echo "  FAIL: $WORKFLOW must anchor reactions to head_ref_force_pushed (max with committer date) — Codex P2 #460" >&2
+fi
+
+# Structural assertion (Codex P2 on #460 round 2): the workflow bounds
+# head_ref_force_pushed events to those at or before merged_at when
+# reconstructing merge-time state. Without it a force-push AFTER merge
+# raises reactionLowerBound past merged_at, empties the [lowerBound,
+# merged_at] reaction window, and falsely flags a PR that legitimately
+# cleared via a pre-merge 👍. Mirrors labelWasPresentAtMerge /
+# resolvedAtMerge. The postmerge-forcepush-plus1-clears fixture exercises
+# the runtime path; this canary guards the workflow source.
+if grep -qF 'ev.created_at <= mergedAt' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW bounds force-push events to merged_at (merge-time state, Codex P2 #460 r2)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must exclude post-merge force-pushes (ev.created_at <= mergedAt) from the reaction lower bound — Codex P2 #460 r2" >&2
 fi
 
 # Structural assertion (Codex P2 on #460): the reaction lower bound also

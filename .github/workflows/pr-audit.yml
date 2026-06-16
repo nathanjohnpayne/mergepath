@@ -486,6 +486,15 @@ jobs:
                 // satisfy the window and falsely clear the audit for
                 // exactly the force-push bypass it exists to catch (Codex
                 // P2 on PR #460).
+                //
+                // Only force-pushes at or before merged_at are part of
+                // merge-time state. A branch force-pushed AFTER merge would
+                // otherwise raise reactionLowerBound past merged_at, emptying
+                // the [lowerBound, merged_at] window and falsely flagging a PR
+                // that legitimately cleared via a pre-merge 👍 (Codex P2 on
+                // PR #460 round 2). Mirrors labelWasPresentAtMerge /
+                // resolvedAtMerge merge-time reconstruction.
+                const mergedAt = pr.merged_at || '';
                 let lastForcePushAt = '';
                 try {
                   const timeline = await github.paginate(
@@ -499,7 +508,9 @@ jobs:
                   );
                   for (const ev of timeline) {
                     if (ev.event === 'head_ref_force_pushed' &&
-                        ev.created_at && ev.created_at > lastForcePushAt) {
+                        ev.created_at &&
+                        (!mergedAt || ev.created_at <= mergedAt) &&
+                        ev.created_at > lastForcePushAt) {
                       lastForcePushAt = ev.created_at;
                     }
                   }
@@ -510,8 +521,6 @@ jobs:
                   );
                   lastForcePushAt = '';
                 }
-
-                const mergedAt = pr.merged_at || '';
 
                 // Merge-time freshness floor for +1 reactions (#460 Codex
                 // P2): the merge gate's reaction lower bound is
