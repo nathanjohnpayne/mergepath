@@ -49,18 +49,35 @@ export_consumer_facts() {
     unset "$var"
   done
 
-  while IFS=$'\t' read -r key value; do
-    [ -z "$key" ] && continue
-    local upper
-    upper=$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
-    export "MERGEPATH_FACT_$upper=$value"
-  done < <(MERGEPATH_CONSUMER_NAME="$consumer_name" yq -r '
+  # Capture yq's output up front so a parse failure surfaces as a
+  # non-zero return (fail CLOSED). A `while ... done < <(yq ...)` process
+  # substitution masks yq's exit code — the loop's status is the last
+  # `read` (or 0 if the body ran), never yq's — so a malformed manifest
+  # would export no facts yet return 0 (fail OPEN), letting a verification
+  # caller proceed on empty/wrong MERGEPATH_FACT_* state. See #457.
+  local facts_tsv
+  if ! facts_tsv=$(MERGEPATH_CONSUMER_NAME="$consumer_name" yq -r '
     env(MERGEPATH_CONSUMER_NAME) as $cn
     | .consumers[] | select(.name == $cn) | .facts // {} | to_entries[]
     | .key + "\t"
       + ((.value | select(tag == "!!seq") | join(" "))
          // (.value | tostring))
-  ' "$manifest")
+  ' "$manifest"); then
+    echo "export_consumer_facts: yq failed to parse $manifest (consumer=$consumer_name)" >&2
+    return 1
+  fi
+
+  # Iterate via a here-string, NOT a `yq | while` pipe: a pipe subshells
+  # the loop body and the MERGEPATH_FACT_* exports would not survive into
+  # the caller's shell. The here-string adds a trailing newline, which the
+  # empty-key guard below absorbs, so empty-facts consumers behave exactly
+  # as before.
+  while IFS=$'\t' read -r key value; do
+    [ -z "$key" ] && continue
+    local upper
+    upper=$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+    export "MERGEPATH_FACT_$upper=$value"
+  done <<< "$facts_tsv"
   # NOTE on the value-typed serialization: mikefarah/yq v4 does NOT
   # accept a top-level `if`-then-else expression in this filter
   # position (the lexer rejects `if` at column-after-pipe). An

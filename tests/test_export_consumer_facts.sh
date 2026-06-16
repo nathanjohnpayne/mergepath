@@ -186,6 +186,36 @@ else
   fail "Case 7 (#322): expected:\n$expected\ngot:\n$out"
 fi
 
+# Case 8 (#457): the helper must fail CLOSED on a manifest yq cannot
+# parse. The earlier `while ... done < <(yq ...)` form masked yq's exit
+# code (the loop's status is the last `read`, never yq's), so a malformed
+# manifest exported no facts yet returned 0 — letting a verification
+# caller proceed on empty/wrong MERGEPATH_FACT_* state. This case sources
+# the lib and calls export_consumer_facts directly (the cases above only
+# exercise a mirror of the filter) to assert non-zero rc AND no exports.
+# shellcheck source=scripts/lib/manifest-fact-helpers.sh
+source "$LIB"
+cat > "$WORKDIR/malformed.yml" <<'EOF'
+version: 1
+consumers:
+  - name: broken
+    facts: {frameworks: [react, typescript
+EOF
+# Precondition: confirm the fixture is genuinely unparseable, else the
+# case would pass vacuously if yq ever grows lenient about this input.
+if yq -r '.' "$WORKDIR/malformed.yml" >/dev/null 2>&1; then
+  fail "Case 8 precondition: fixture parsed cleanly; need a manifest yq rejects"
+else
+  facts_rc=0
+  export_consumer_facts broken "$WORKDIR/malformed.yml" >/dev/null 2>&1 || facts_rc=$?
+  leaked=$(env | awk -F= '/^MERGEPATH_FACT_/ {print $1}')
+  if [ "$facts_rc" -ne 0 ] && [ -z "$leaked" ]; then
+    pass "Case 8 (#457): export_consumer_facts fails closed (rc=$facts_rc) on unparseable manifest, no facts exported"
+  else
+    fail "Case 8 (#457): expected non-zero rc and no exports; got rc=$facts_rc, leaked=[$leaked]"
+  fi
+fi
+
 echo
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -gt 0 ]; then
