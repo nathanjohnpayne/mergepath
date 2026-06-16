@@ -298,7 +298,13 @@ if [ "$TEMPLATED_SURFACE_ACTIVE" = "1" ] && [ -n "$CONSUMER_NAME" ]; then
       render_err=$(mktemp "${TMPDIR:-/tmp}/verify-prop-render-err.XXXXXX")
       render_rc=0
       (
-        export_consumer_facts "$CONSUMER_NAME" "$MANIFEST"
+        # `|| exit $?` explicitly propagates a fail-closed export rc as the
+        # subshell's exit status. Relying on `set -e` alone is unsafe here:
+        # the subshell is the left operand of `|| render_rc=$?`, a context
+        # in which bash suppresses `set -e` for the commands inside it, so
+        # export_consumer_facts returning 1 would otherwise be masked by
+        # template_substitution::render's rc. See #457.
+        export_consumer_facts "$CONSUMER_NAME" "$MANIFEST" || exit $?
         template_substitution::render "$mp_source_abs"
       ) > "$rendered" 2> "$render_err" || render_rc=$?
 
