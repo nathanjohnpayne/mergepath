@@ -268,9 +268,21 @@ paths:
   - path: scripts/lib/manifest-fact-helpers.sh
     type: canonical
     consumers: all
+  # Shared available_reviewers reader (#453). Hard-required (exit 3 if
+  # missing) by coderabbit-wait.sh, codex-review-check.sh, and
+  # audit-propagation-lane.sh — the reviewer allow-list parse is a
+  # fail-closed gate input, so a consumer missing this lib must error, not
+  # silently degrade. Declared in each consumer's requires: below.
+  - path: scripts/lib/reviewers-helpers.sh
+    type: canonical
+    consumers: all
   - path: scripts/coderabbit-wait.sh
     type: canonical
     consumers: all
+    # Hard-sources scripts/lib/reviewers-helpers.sh (#453) for the
+    # token-derived expected-reviewer allow-list; exits 3 if absent.
+    requires:
+      - "scripts/lib/reviewers-helpers.sh"
   - path: scripts/codex-review-request.sh
     type: canonical
     consumers: all
@@ -285,6 +297,7 @@ paths:
     # hard rc=3 and the auto-clear stalls.
     requires:
       - "scripts/lib/gh-retry-helpers.sh"
+      - "scripts/lib/reviewers-helpers.sh"   # #453, hard-sourced for the gate (b)/(c) reviewer allow-list
   - path: scripts/phase-4b-classifier.sh
     type: canonical
     consumers: all
@@ -305,6 +318,13 @@ paths:
   - path: scripts/audit-propagation-lane.sh
     type: canonical
     consumers: all
+    # Live mode hard-sources scripts/lib/reviewers-helpers.sh to verify the
+    # reviewer token identity, and (existence-guarded) preflight-helpers.sh
+    # to auto-source it (#454). preflight-helpers is consumers:all already;
+    # both declared here so the #264 closure invariant covers them.
+    requires:
+      - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/lib/preflight-helpers.sh"
   - path: tests/test_audit_propagation_lane.sh
     type: canonical
     consumers: all

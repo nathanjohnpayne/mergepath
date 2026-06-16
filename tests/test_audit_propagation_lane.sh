@@ -128,6 +128,74 @@ else
   fail "enabled: TRUE should fail; got rc=$RC, out: $OUT"
 fi
 
+# --- #452: quoted author_identity normalization ---------------------------
+# A quoted-but-correct author_identity must pass (the lane and this audit
+# strip both quote styles). Wrong author still fails even when quoted.
+POLICY_QUOTED_DQ="$WORKDIR/policy-quoted-dq.yml"
+printf 'propagation_prs:\n  enabled: true\nauthor_identity: "nathanjohnpayne"\n' >"$POLICY_QUOTED_DQ"
+run_check "$POLICY_QUOTED_DQ" "$WF_NEW"
+if [ "$RC" = "0" ]; then
+  pass "#452: double-quoted author_identity passes (quotes stripped)"
+else
+  fail "#452: double-quoted author_identity should pass; got rc=$RC, out: $OUT"
+fi
+
+POLICY_QUOTED_SQ="$WORKDIR/policy-quoted-sq.yml"
+printf "propagation_prs:\n  enabled: true\nauthor_identity: 'nathanjohnpayne'\n" >"$POLICY_QUOTED_SQ"
+run_check "$POLICY_QUOTED_SQ" "$WF_NEW"
+if [ "$RC" = "0" ]; then
+  pass "#452: single-quoted author_identity passes (quotes stripped)"
+else
+  fail "#452: single-quoted author_identity should pass; got rc=$RC, out: $OUT"
+fi
+
+POLICY_QUOTED_WRONG="$WORKDIR/policy-quoted-wrong.yml"
+printf 'propagation_prs:\n  enabled: true\nauthor_identity: "nathanpayne-claude"\n' >"$POLICY_QUOTED_WRONG"
+run_check "$POLICY_QUOTED_WRONG" "$WF_NEW"
+if [ "$RC" = "1" ] && echo "$OUT" | grep -q "sync PRs are authored by"; then
+  pass "#452: quoted-but-WRONG author_identity still fails (quote-strip is not author-blind)"
+else
+  fail "#452: quoted wrong author should fail; got rc=$RC, out: $OUT"
+fi
+
+# --- #454: live-mode credential binding -----------------------------------
+# Offline --check-files stays credential-free: no GH_TOKEN required.
+set +e
+OUT=$(env -u GH_TOKEN "$SCRIPT" --check-files "$POLICY_BARE" "$WF_NEW" 2>&1)
+RC=$?
+set -e
+if [ "$RC" = "0" ] && ! echo "$OUT" | grep -qi "reviewer token"; then
+  pass "#454: --check-files mode stays credential-free (no GH_TOKEN required)"
+else
+  fail "#454: --check-files should not need GH_TOKEN; got rc=$RC, out: $OUT"
+fi
+
+# Live mode binds to a VERIFIED reviewer token; with no GH_TOKEN and no
+# fresh preflight cache it fails closed (exit 3) BEFORE any network read.
+# Stub yq/gh on PATH so the test doesn't depend on the CI yq-install order
+# (check_propagation_lane_audit runs before the yq install step).
+STUB_BIN="$WORKDIR/stub-bin"; mkdir -p "$STUB_BIN"
+cat > "$STUB_BIN/yq" <<'YQ'
+#!/usr/bin/env bash
+case "${1:-}" in --version) echo "yq (https://github.com/mikefarah/yq/) version v4.44.3" ;; *) echo "[]" ;; esac
+YQ
+cat > "$STUB_BIN/gh" <<'GH'
+#!/usr/bin/env bash
+echo "stub-gh must not be called on the fail-closed path" >&2; exit 99
+GH
+chmod +x "$STUB_BIN/yq" "$STUB_BIN/gh"
+EMPTY_CACHE="$WORKDIR/empty-cache"; mkdir -p "$EMPTY_CACHE"
+set +e
+OUT=$( cd "$ROOT" && PATH="$STUB_BIN:$PATH" OP_PREFLIGHT_CACHE_DIR="$EMPTY_CACHE" \
+  MERGEPATH_AGENT="nobody-xyz" env -u GH_TOKEN "$SCRIPT" --repos __none__ 2>&1 )
+RC=$?
+set -e
+if [ "$RC" = "3" ] && echo "$OUT" | grep -qi "reviewer token"; then
+  pass "#454: live mode fails closed (exit 3) with no token + no fresh cache"
+else
+  fail "#454: live mode should fail closed w/o a token; got rc=$RC, out: $OUT"
+fi
+
 echo ""
 echo "test_audit_propagation_lane: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

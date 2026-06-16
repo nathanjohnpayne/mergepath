@@ -119,6 +119,18 @@ else
   with_gh_retry() { "$@"; }
 fi
 
+# Shared available_reviewers reader (#453) — replaces the local
+# double-quote-only parser so coderabbit-wait.sh and this script parse the
+# allow-list identically (dash + inline comment + BOTH quote styles +
+# whitespace). Hard-require it: REVIEWERS below is a fail-closed gate input
+# (an empty list exits 3), so a missing helper must error, not degrade.
+if [ ! -r "$__CODEX_CHECK_DIR/lib/reviewers-helpers.sh" ]; then
+  echo "ERROR: reviewers-helpers missing: $__CODEX_CHECK_DIR/lib/reviewers-helpers.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/reviewers-helpers.sh
+. "$__CODEX_CHECK_DIR/lib/reviewers-helpers.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
@@ -305,19 +317,10 @@ case "$ALLOW_PHASE_4B_SUBSTITUTE" in
     ;;
 esac
 
-# Read the available_reviewers list (one per line). Same state-machine
-# awk pattern, but collecting list items rather than matching a scalar.
-# Outputs one reviewer login per line to stdout. Handles both quoted
-# (`  - "name"`) and unquoted (`  - name`) list item formats.
-read_available_reviewers() {
-  [ -f "$CONFIG" ] || return 0
-  awk '
-    /^available_reviewers:/ {in_block=1; next}
-    in_block && /^[^[:space:]#]/ {in_block=0}
-    in_block && /^ *-/ {print}
-  ' "$CONFIG" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/'
-}
-
+# read_available_reviewers (and login_is_available_reviewer) now live in
+# scripts/lib/reviewers-helpers.sh (sourced above, #453). They default to
+# $CONFIG, so this call site is unchanged — but the allow-list now parses
+# with the strongest normalization (quoted/commented entries included).
 REVIEWERS=$(read_available_reviewers)
 if [ -z "$REVIEWERS" ]; then
   echo "ERROR: no available_reviewers found in $CONFIG" >&2

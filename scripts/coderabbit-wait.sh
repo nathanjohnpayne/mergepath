@@ -136,6 +136,18 @@ fi
 # shellcheck source=lib/gh-token-resolver.sh
 . "$__CODERABBIT_WAIT_DIR/lib/gh-token-resolver.sh"
 
+# Shared available_reviewers reader (#453) — one strongest-form parser so
+# the token-derived expected-identity allow-list (login_is_available_reviewer,
+# used at write time) can't be weakened by a quoted/commented reviewer
+# entry. Hard-require it: the token-login derivation is a fail-closed
+# security check, so a missing helper must error, not silently degrade.
+if [ ! -r "$__CODERABBIT_WAIT_DIR/lib/reviewers-helpers.sh" ]; then
+  echo "ERROR: reviewers-helpers missing: $__CODERABBIT_WAIT_DIR/lib/reviewers-helpers.sh" >&2
+  exit 3
+fi
+# shellcheck source=lib/reviewers-helpers.sh
+. "$__CODERABBIT_WAIT_DIR/lib/reviewers-helpers.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
@@ -217,28 +229,11 @@ coderabbit_field() {
   ' "$CONFIG"
 }
 
-# Read the available_reviewers list (one login per line). Same
-# state-machine awk pattern as codex-review-check.sh's reader; handles
-# quoted and unquoted list items. Used by the token-derived expected-
-# identity path (#438) to keep the derivation fail-closed: only a
-# login on this allow-list may become the expected reviewer.
-read_available_reviewers() {
-  [ -f "$CONFIG" ] || return 0
-  awk '
-    /^available_reviewers:/ {in_block=1; next}
-    in_block && /^[^[:space:]#]/ {in_block=0}
-    in_block && /^ *-/ {print}
-  ' "$CONFIG" | sed -E "s/^[[:space:]]*-[[:space:]]*//; s/[[:space:]]+#.*\$//; s/^[\"']//; s/[\"']\$//; s/[[:space:]]+\$//"
-}
-
-login_is_available_reviewer() {
-  local login=$1 reviewer
-  [ -n "$login" ] || return 1
-  while IFS= read -r reviewer; do
-    [ "$reviewer" = "$login" ] && return 0
-  done <<< "$(read_available_reviewers)"
-  return 1
-}
+# read_available_reviewers + login_is_available_reviewer now live in
+# scripts/lib/reviewers-helpers.sh (sourced above, #453). They default to
+# $CONFIG, so the call sites below are unchanged. The token-derived
+# expected-identity path (#438) still consumes login_is_available_reviewer
+# to keep the derivation fail-closed.
 
 MAX_WAIT_SECONDS=$(coderabbit_field max_wait_seconds)
 MAX_WAIT_SECONDS=${MAX_WAIT_SECONDS:-300}
@@ -726,6 +721,7 @@ status_context_fast_path_blocked_by_comment() {
     rate_limit|in_progress)
       comment_id=$(echo "$latest" | jq -r '.id')
       comment_fresh_at=$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at')
+      comment_created_at=$(echo "$latest" | jq -r '.created_at // .fresh_at // .updated_at')
       comment_body=$(echo "$latest" | jq -r '.body')
       if printf '%s' "$comment_body" | grep -Fq "$HEAD_SHA"; then
         if iso_on_or_after "$comment_fresh_at" "$status_created_at"; then
@@ -735,7 +731,20 @@ status_context_fast_path_blocked_by_comment() {
         log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class explicitly references current HEAD $HEAD_SHA but fresh_at=$comment_fresh_at is older than status_created=$status_created_at"
         return 1
       fi
-      log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class does not reference current HEAD $HEAD_SHA"
+      # #446: a rate_limit/in_progress comment POSTED (created) at/after the
+      # StatusContext flipped to success means CodeRabbit re-entered a
+      # rate-limited / in-progress state — the fast-path must not declare
+      # clearance over it even though the notice does not reference HEAD.
+      # Compare CREATED_AT, not fresh_at: an OLD comment from a prior round
+      # that merely got edited after the success is stale and must NOT
+      # suppress (the 263caf3 "Bug 6" regression — an unscoped non-HEAD
+      # comment created before the success still clears). Only a comment
+      # actually posted at/after the success suppresses.
+      if iso_on_or_after "$comment_created_at" "$status_created_at"; then
+        log "StatusContext success suppressed because latest CodeRabbit comment id=$comment_id class=$class created=$comment_created_at is at/after status_created=$status_created_at (no HEAD $HEAD_SHA reference, but a post-success rate-limit/in-progress notice) — keep polling"
+        return 0
+      fi
+      log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class does not reference current HEAD $HEAD_SHA and was created=$comment_created_at before status_created=$status_created_at"
       return 1
       ;;
   esac

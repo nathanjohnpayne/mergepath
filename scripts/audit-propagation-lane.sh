@@ -84,6 +84,28 @@ prop_field() {  # <file> <block> <key>
   ' "$1"
 }
 
+# Read a TOP-LEVEL scalar (e.g. author_identity), stripping BOTH YAML quote
+# styles, a trailing inline comment, and surrounding whitespace — the same
+# normalization codex-review-request.sh's policy_top_field and the
+# gh-pr-guard expected-author parser apply (#452). The lane's PR-author
+# fingerprint in pr-review-policy.yml carries the matching extraction, so a
+# quoted-but-correct `author_identity: "nathanjohnpayne"` passes in both the
+# live lane and this audit instead of failing on the retained quotes.
+policy_top_scalar() {  # <file> <key>
+  [ -f "$1" ] || return 0
+  awk -v key="$2" '
+    /^[^[:space:]#]/ && $1 == key":" {
+      sub(/^[^:]+:[[:space:]]*/, "", $0)
+      gsub(/^["\x27]/, "", $0)
+      gsub(/["\x27][[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print
+      exit
+    }
+  ' "$1"
+}
+
 # Evaluate the lane preconditions for one (review-policy, workflow)
 # file pair. Prints a status line; returns 0 if the lane fires, 1 if
 # not.
@@ -106,7 +128,7 @@ lane_status_for_files() {  # <label> <policy-file-or-empty> <workflow-file-or-em
   if [ -n "$policy" ] && [ -f "$policy" ]; then
     enabled=$(prop_field "$policy" propagation_prs enabled)
     prefix=$(prop_field "$policy" propagation_prs branch_prefix)
-    author_id=$(grep -m1 '^author_identity:' "$policy" | awk '{print $2}' || true)
+    author_id=$(policy_top_scalar "$policy" author_identity || true)
   fi
 
   if [ "$enabled" = "false" ]; then
@@ -182,6 +204,38 @@ command -v yq >/dev/null 2>&1 || { err "yq is required (brew install yq)"; exit 
 yq --version 2>&1 | grep -q "mikefarah/yq" || { err "mikefarah/yq v4+ required"; exit 2; }
 command -v gh >/dev/null 2>&1 || { err "gh is required"; exit 2; }
 [ -f "$MANIFEST" ] || { err "$MANIFEST not found (run from the mergepath root)"; exit 2; }
+
+# --- live-mode credential binding (#454) ------------------------------------
+# Live mode does GitHub reads; bind them to a VERIFIED reviewer token rather
+# than ambient gh state. --check-files mode returned above, so none of this
+# runs offline (that mode needs no token, preflight, gh, or network).
+__LANE_AUDIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Auto-source the op-preflight cache when GH_TOKEN is unset and a fresh cache
+# exists — the #282 pattern the sibling helpers use. A caller-supplied
+# GH_TOKEN is respected and still verified below.
+if [ -r "$__LANE_AUDIT_DIR/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=lib/preflight-helpers.sh
+  . "$__LANE_AUDIT_DIR/lib/preflight-helpers.sh"
+  preflight_require_token reviewer || true
+fi
+if [ -z "${GH_TOKEN:-}" ]; then
+  err "live mode needs a reviewer token. Run: eval \"\$(scripts/op-preflight.sh --agent <agent> --mode review)\", or set GH_TOKEN to a reviewer PAT."
+  exit 3
+fi
+# Verify the effective token identity is an available_reviewers reviewer
+# (fail closed). Hard-require the shared reader: an unverifiable token must
+# error rather than read live data under an unknown identity.
+if [ ! -r "$__LANE_AUDIT_DIR/lib/reviewers-helpers.sh" ]; then
+  err "reviewers-helpers missing: $__LANE_AUDIT_DIR/lib/reviewers-helpers.sh"
+  exit 3
+fi
+# shellcheck source=lib/reviewers-helpers.sh
+. "$__LANE_AUDIT_DIR/lib/reviewers-helpers.sh"
+LANE_TOKEN_LOGIN=$(gh api user --jq .login 2>/dev/null || true)
+if [ -z "$LANE_TOKEN_LOGIN" ] || ! login_is_available_reviewer "$LANE_TOKEN_LOGIN"; then
+  err "live-mode token identity '${LANE_TOKEN_LOGIN:-<unresolvable>}' is not in available_reviewers — fail closed"
+  exit 3
+fi
 
 in_repo_filter() {
   local name=$1

@@ -412,6 +412,32 @@ cd "$ORIG_DIR"
 assert_rc_contains "env --unset NAME still reaches merge-state checks" 2 "mergeStateStatus is BLOCKED" \
   'env --unset GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "BLOCKED" ""
 
+# Compact `env -uNAME` form (#451) — flag and name attached, no `=`.
+# prefix_flag_takes_value matches only the bare `-u`, so this token would
+# fall through as a boolean flag unless the case block models it
+# explicitly. Same r15 empty-override semantics as `env -u NAME`.
+cd "$WORKDIR/repo-custom-author-empty"
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'env -uGH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -qi "author identity"; then
+  pass "#451: env -uNAME (compact) author unset fails closed in custom-author repo"
+else
+  fail "#451: env -uNAME (compact) author unset fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+cd "$ORIG_DIR"
+
+# ...and in a default repo the compact form must still reach the merge-state
+# checks (BLOCKED proves the walk didn't bail at the unset arg and skip checks).
+assert_rc_contains "#451: env -uNAME (compact) author unset reaches merge-state checks in default repo" 2 "mergeStateStatus is BLOCKED" \
+  'env -uGH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "BLOCKED" ""
+
+# Reviewer analog: the compact unset falls the wrapper back to its default
+# reviewer; with a different expected reviewer that must fail closed.
+assert_rc_contains "#451: env -uNAME (compact) reviewer unset fails closed vs different expected reviewer" 2 "not expected reviewer" \
+  'env -uGH_AS_REVIEWER_IDENTITY scripts/gh-as-reviewer.sh -- gh pr comment 123 --body "ping"' "CLEAN" "" "nathanpayne-codex"
+
 # The unset BUILTIN persists past separators (preempted, r17 family).
 cd "$WORKDIR/repo-custom-author-empty"
 set +e

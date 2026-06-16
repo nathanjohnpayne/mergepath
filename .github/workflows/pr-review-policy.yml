@@ -139,6 +139,25 @@ jobs:
               }
             ' "$1"
           }
+          # Read a TOP-LEVEL scalar (author_identity), stripping BOTH YAML
+          # quote styles + a trailing comment + whitespace (#452). Mirrors
+          # audit-propagation-lane.sh's policy_top_scalar so the live lane and
+          # its weekly audit normalize author_identity identically — a
+          # quoted-but-correct `author_identity: "nathanjohnpayne"` passes the
+          # PR-author fingerprint below instead of failing on retained quotes.
+          top_field() {  # <file> <key>
+            awk -v key="$2" '
+              /^[^[:space:]#]/ && $1 == key":" {
+                sub(/^[^:]+:[[:space:]]*/, "", $0)
+                gsub(/^["\x27]/, "", $0)
+                gsub(/["\x27][[:space:]]*(#.*)?$/, "", $0)
+                gsub(/[[:space:]]*#.*$/, "", $0)
+                sub(/[[:space:]]+$/, "", $0)
+                print
+                exit
+              }
+            ' "$1"
+          }
           # Lane config + author identity from the BASE commit, not the
           # PR. `git show` the base blobs into tempfiles.
           BASE_POLICY=$(mktemp)
@@ -152,7 +171,7 @@ jobs:
           PROP_PREFIX=$(prop_field "$BASE_POLICY" propagation_prs branch_prefix)
           # Must match SYNC_BRANCH_PREFIX in scripts/sync-to-downstream.sh.
           PROP_PREFIX=${PROP_PREFIX:-mergepath-sync/}
-          AUTHOR_ID=$(grep -m1 '^author_identity:' "$BASE_POLICY" | awk '{print $2}')
+          AUTHOR_ID=$(top_field "$BASE_POLICY" author_identity)
           HEAD_REF="${{ github.event.pull_request.head.ref }}"
           PR_AUTHOR="${{ github.event.pull_request.user.login }}"
           rm -f "$BASE_POLICY"
