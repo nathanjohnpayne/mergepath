@@ -1,6 +1,7 @@
 {
   "description": "A valid +1 (10:05) is older than a Codex COMMENTED review (10:20) carrying an unresolved P1 → newer review wins, NOT cleared (#450 latest-signal-wins)",
   "expected_cleared": false,
+  "authoring_agent": "claude",
   "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
   "codex_bot_login": "chatgpt-codex-connector[bot]",
   "head_committer_date": "2026-05-12T10:00:00Z",

@@ -619,18 +619,41 @@ jobs:
                     }
                   }
 
+                  // Same-agent context (Codex P2 on #460 r3): a Codex +1
+                  // substitutes for gate (b)'s reviewer approval ONLY when the
+                  // PR's Authoring-Agent resolves to an available reviewer
+                  // identity (e.g. `Authoring-Agent: claude` → nathanpayne-
+                  // claude). codex-review-check.sh gates branch 2 (#170) on
+                  // this; the audit must too, or a cross-agent / missing-
+                  // Authoring-Agent PR merged with only a 👍 (which the merge
+                  // gate rejects) would pass this audit. Mirrors the shell's
+                  // AUTHORING_AGENT → SAME_AGENT_REVIEWER suffix match.
+                  let sameAgentContext = false;
+                  const agentMatch = (pr.body || '').match(
+                    /^Authoring-Agent:[ \t]*([A-Za-z0-9_-]+)/im
+                  );
+                  if (agentMatch) {
+                    const authoringAgent = agentMatch[1].toLowerCase();
+                    sameAgentContext = reviewerAccounts.some(
+                      r => String(r).toLowerCase().endsWith('-' + authoringAgent)
+                    );
+                  }
+
                   // Latest qualifying Codex +1 reaction in the merge-time
                   // window [reactionLowerBound, merged_at]. Empty
                   // latestReactionTime sorts below any ISO timestamp, so the
-                  // first qualifier always sets it.
+                  // first qualifier always sets it. Gated on sameAgentContext:
+                  // a +1 from a non-same-agent PR does not clear gate (b).
                   let latestReactionTime = '';
-                  for (const x of reactions) {
-                    if (x.user && x.user.login === codexBotLogin &&
-                        x.content === '+1' &&
-                        reactionLowerBound && x.created_at >= reactionLowerBound &&
-                        mergedAt && x.created_at <= mergedAt &&
-                        x.created_at > latestReactionTime) {
-                      latestReactionTime = x.created_at;
+                  if (sameAgentContext) {
+                    for (const x of reactions) {
+                      if (x.user && x.user.login === codexBotLogin &&
+                          x.content === '+1' &&
+                          reactionLowerBound && x.created_at >= reactionLowerBound &&
+                          mergedAt && x.created_at <= mergedAt &&
+                          x.created_at > latestReactionTime) {
+                        latestReactionTime = x.created_at;
+                      }
                     }
                   }
 

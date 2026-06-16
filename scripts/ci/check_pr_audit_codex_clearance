@@ -32,6 +32,7 @@
 #   - stale-prior-head-plus1-rejected.json — +1 before merged_at-window floor → NOT cleared (merge-time freshness floor, Codex P2 #460)
 #   - codex-disabled-plus1-rejected.json — codex.enabled=false + fresh +1, no CLI APPROVED → NOT cleared (codexEnabled gate, Codex P2 #460)
 #   - postmerge-forcepush-plus1-clears.json — force-push AFTER merge ignored; pre-merge +1 still clears (merge-time force-push bound, Codex P2 #460 r2)
+#   - cross-agent-plus1-rejected.json — fresh +1 but no same-agent Authoring-Agent → +1 cannot substitute reviewer approval, NOT cleared (same-agent gate, Codex P2 #460 r3)
 #
 # Inline-literal pattern: the algorithm under test is duplicated
 # from the workflow YAML into the Node script below, the same way
@@ -191,14 +192,32 @@ if (codexEnabled && inlineComments !== null) {
     }
   }
 
+  // Same-agent context (Codex P2 on PR 460 r3): a Codex +1 substitutes for
+  // gate (b) reviewer approval only when the PR Authoring-Agent resolves to
+  // an available reviewer identity. Mirrors codex-review-check.sh
+  // AUTHORING_AGENT to SAME_AGENT_REVIEWER suffix match. A missing or non-
+  // matching authoring agent leaves sameAgentContext false, so a cross-agent
+  // +1 does not clear (the round-3 finding case).
+  const reviewerAccounts = fx.available_reviewers ||
+    ['nathanpayne-claude', 'nathanpayne-cursor', 'nathanpayne-codex'];
+  let sameAgentContext = false;
+  if (fx.authoring_agent) {
+    const authoringAgent = String(fx.authoring_agent).toLowerCase();
+    sameAgentContext = reviewerAccounts.some(
+      r => String(r).toLowerCase().endsWith('-' + authoringAgent)
+    );
+  }
+
   let latestReactionTime = '';
-  for (const x of reactions) {
-    if (x.user && x.user.login === codexBotLogin &&
-        x.content === '+1' &&
-        reactionLowerBound && x.created_at >= reactionLowerBound &&
-        mergedAt && x.created_at <= mergedAt &&
-        x.created_at > latestReactionTime) {
-      latestReactionTime = x.created_at;
+  if (sameAgentContext) {
+    for (const x of reactions) {
+      if (x.user && x.user.login === codexBotLogin &&
+          x.content === '+1' &&
+          reactionLowerBound && x.created_at >= reactionLowerBound &&
+          mergedAt && x.created_at <= mergedAt &&
+          x.created_at > latestReactionTime) {
+        latestReactionTime = x.created_at;
+      }
     }
   }
 
@@ -370,6 +389,24 @@ if grep -qF 'config.codex.enabled === false' "$WORKFLOW" && \
 else
   fail=$((fail + 1))
   echo "  FAIL: $WORKFLOW must gate Codex clearance on codexEnabled (codex.enabled===false → ignore bot signals) — Codex P2 #460" >&2
+fi
+
+# Structural assertion (Codex P2 on #460 round 3): the workflow gates the
+# Codex +1 reaction path on same-agent context, mirroring the merge gate
+# branch-2 (#170) rule that a 👍 substitutes for reviewer approval only when
+# the PR Authoring-Agent resolves to an available reviewer identity. Without
+# it a cross-agent / missing-Authoring-Agent PR merged with only a 👍 (which
+# codex-review-check.sh rejects) would pass the audit. The
+# cross-agent-plus1-rejected fixture exercises the runtime path; this canary
+# guards the workflow source.
+if grep -qF 'sameAgentContext' "$WORKFLOW" && \
+   grep -qF 'Authoring-Agent:' "$WORKFLOW" && \
+   grep -qF 'if (sameAgentContext)' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW gates the +1 reaction path on same-agent context (Codex P2 #460 r3)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must gate the Codex +1 reaction on sameAgentContext (Authoring-Agent → reviewer) — Codex P2 #460 r3" >&2
 fi
 
 # Structural assertion: the workflow references #449 and #450 for

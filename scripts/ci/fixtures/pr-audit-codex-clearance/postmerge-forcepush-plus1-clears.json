@@ -1,6 +1,7 @@
 {
   "description": "Branch force-pushed AFTER merge; a legitimate pre-merge Codex +1 must still clear. The post-merge head_ref_force_pushed event is excluded from merge-time state, so it does not raise the reaction lower bound past merged_at and empty the window (Codex P2 on #460 round 2). Without the merge-time bound, lastForcePushAt (11:00) > merged_at (10:30) would reject the valid +1.",
   "expected_cleared": true,
+  "authoring_agent": "claude",
   "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
   "codex_bot_login": "chatgpt-codex-connector[bot]",
   "head_committer_date": "2026-05-12T10:00:00Z",
