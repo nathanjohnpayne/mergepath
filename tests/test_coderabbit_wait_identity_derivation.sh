@@ -295,13 +295,18 @@ test_453_shared_reviewers_helper() {
   local lib="$ROOT/scripts/lib/reviewers-helpers.sh"
   if [ ! -r "$lib" ]; then fail "#453: missing $lib"; return; fi
   local cfg; cfg="$(mktemp)"
-  cat >"$cfg" <<'EOF'
-available_reviewers:
-  - nathanpayne-claude
-  - "nathanpayne-cursor"
-  - 'nathanpayne-codex'   # single quotes + trailing comment + padding
-default_external_reviewer: nathanpayne-codex
-EOF
+  # `nathanpayne-cursor` is double-quoted WITH trailing padding and NO inline
+  # comment — the Codex P2 on #463 shape (the closing quote must be stripped
+  # despite the trailing spaces). Built with printf so the trailing spaces are
+  # explicit and survive editor/linter whitespace-trimming. `nathanpayne-codex`
+  # is single-quoted with a trailing comment + padding.
+  {
+    printf 'available_reviewers:\n'
+    printf '  - nathanpayne-claude\n'
+    printf '  - "nathanpayne-cursor"   \n'
+    printf "  - 'nathanpayne-codex'   # single quotes + trailing comment + padding\n"
+    printf 'default_external_reviewer: nathanpayne-codex\n'
+  } >"$cfg"
   ( # shellcheck source=../scripts/lib/reviewers-helpers.sh
     . "$lib"
     out=$(read_available_reviewers "$cfg" | tr '\n' ',')

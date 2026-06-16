@@ -26,8 +26,14 @@
 
 # Emit one normalized reviewer login per line. Normalization order:
 # strip the list dash + leading space, then a trailing inline comment,
-# then a leading and trailing quote (single OR double), then trailing
-# whitespace.
+# then trailing whitespace, then a leading and trailing quote (single OR
+# double), then any remaining trailing whitespace. Trimming trailing
+# whitespace BEFORE the closing-quote strip is load-bearing: a quoted item
+# with padding but no comment (e.g. `- "name"   `) would otherwise keep its
+# closing quote because `["']$` can't match before the trailing spaces, and
+# the stray quote would drop a valid reviewer from the fail-closed allow-list
+# (Codex P2 on #463). The second trailing-whitespace strip covers a space
+# inside the quotes (`- "name "`).
 read_available_reviewers() {
   local cfg="${1:-${CONFIG:-.github/review-policy.yml}}"
   [ -f "$cfg" ] || return 0
@@ -35,7 +41,7 @@ read_available_reviewers() {
     /^available_reviewers:/ {in_block=1; next}
     in_block && /^[^[:space:]#]/ {in_block=0}
     in_block && /^ *-/ {print}
-  ' "$cfg" | sed -E "s/^[[:space:]]*-[[:space:]]*//; s/[[:space:]]+#.*\$//; s/^[\"']//; s/[\"']\$//; s/[[:space:]]+\$//"
+  ' "$cfg" | sed -E "s/^[[:space:]]*-[[:space:]]*//; s/[[:space:]]+#.*\$//; s/[[:space:]]+\$//; s/^[\"']//; s/[\"']\$//; s/[[:space:]]+\$//"
 }
 
 # Return 0 iff <login> is a non-empty, exact member of the allow-list.
