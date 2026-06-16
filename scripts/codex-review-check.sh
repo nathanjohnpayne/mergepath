@@ -919,7 +919,11 @@ if [ "$(echo "$UNADDRESSED_P01" | jq 'length')" -gt 0 ]; then
   RES_OWNER=${REPO%/*}
   RES_NAME=${REPO#*/}
   RES_QUERY='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved comments(first:100){nodes{databaseId}}}}}}}'
-  THREADS_JSON=$(with_gh_retry gh api graphql -F owner="$RES_OWNER" -F name="$RES_NAME" -F pr="$PR_NUMBER" -f query="$RES_QUERY" 2>&1) || THREADS_JSON=""
+  # 2>/dev/null (not 2>&1): with_gh_retry emits retry diagnostics to stderr;
+  # merging them into THREADS_JSON would make a transient-retry-then-success
+  # look like malformed JSON and force a needless fail-closed block
+  # (CodeRabbit Major + Codex P2 on #464). Keep only stdout (the JSON).
+  THREADS_JSON=$(with_gh_retry gh api graphql -F owner="$RES_OWNER" -F name="$RES_NAME" -F pr="$PR_NUMBER" -f query="$RES_QUERY" 2>/dev/null) || THREADS_JSON=""
   if ! echo "$THREADS_JSON" | jq -e '.data.repository.pullRequest.reviewThreads' >/dev/null 2>&1; then
     log "gate (c): WARNING reviewThreads resolution lookup failed — failing closed (treating all P0/P1 findings as unresolved)"
   elif [ "$(echo "$THREADS_JSON" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')" = "true" ]; then
