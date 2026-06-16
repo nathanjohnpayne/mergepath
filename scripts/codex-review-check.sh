@@ -899,6 +899,46 @@ else
   UNADDRESSED_P01='[]'
 fi
 
+# Resolution-aware filter (Option B on #460 / aligns gate (c) with
+# codex-p1-gate.sh and the weekly audit). Thread resolution is the
+# sanctioned override in codex-p1-gate.sh, so gate (c) must honor it too —
+# otherwise the two required checks contradict (codex-p1-gate clears a
+# resolved P0/P1 thread while gate (c) still blocks it, so a legitimately
+# resolved finding can never satisfy both). A P0/P1 finding counts as
+# unaddressed only when its review thread is NOT resolved.
+#
+# This runs at MERGE time (live), so isResolved is the state AT merge — no
+# retrospective staleness applies here (that is the weekly audit's concern,
+# which bounds resolution by merge time). Mirrors codex-p1-gate.sh's
+# GraphQL reviewThreads → comment-databaseId → isResolved join.
+#
+# Fail CLOSED on lookup failure: leave UNADDRESSED_P01 unfiltered (every
+# finding treated as unresolved), so a GraphQL hiccup or a >100-thread PR
+# can't clear a real P0/P1. Only fetched when there is at least one finding.
+if [ "$(echo "$UNADDRESSED_P01" | jq 'length')" -gt 0 ]; then
+  RES_OWNER=${REPO%/*}
+  RES_NAME=${REPO#*/}
+  RES_QUERY='query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved comments(first:100){nodes{databaseId}}}}}}}'
+  # 2>/dev/null (not 2>&1): with_gh_retry emits retry diagnostics to stderr;
+  # merging them into THREADS_JSON would make a transient-retry-then-success
+  # look like malformed JSON and force a needless fail-closed block
+  # (CodeRabbit Major + Codex P2 on #464). Keep only stdout (the JSON).
+  THREADS_JSON=$(with_gh_retry gh api graphql -F owner="$RES_OWNER" -F name="$RES_NAME" -F pr="$PR_NUMBER" -f query="$RES_QUERY" 2>/dev/null) || THREADS_JSON=""
+  if ! echo "$THREADS_JSON" | jq -e '.data.repository.pullRequest.reviewThreads' >/dev/null 2>&1; then
+    log "gate (c): WARNING reviewThreads resolution lookup failed — failing closed (treating all P0/P1 findings as unresolved)"
+  elif [ "$(echo "$THREADS_JSON" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')" = "true" ]; then
+    log "gate (c): WARNING PR has >100 review threads; resolution pagination unsupported — failing closed (treating all P0/P1 findings as unresolved)"
+  else
+    RESOLUTION_MAP=$(echo "$THREADS_JSON" | jq '
+      .data.repository.pullRequest.reviewThreads.nodes
+      | map((.isResolved) as $r | .comments.nodes | map({ key: (.databaseId | tostring), value: $r }))
+      | flatten | from_entries')
+    UNADDRESSED_P01=$(echo "$UNADDRESSED_P01" | jq --argjson map "$RESOLUTION_MAP" '
+      [ .[] | . as $c | ($map[($c.comment_id | tostring)] // false) as $resolved | select($resolved != true) ]')
+    log "gate (c): resolution-aware — $(echo "$UNADDRESSED_P01" | jq 'length') unresolved P0/P1 finding(s) after honoring thread resolution"
+  fi
+fi
+
 UNADDRESSED_COUNT=$(echo "$UNADDRESSED_P01" | jq 'length')
 
 # Latest +1 reaction on the PR issue from the Codex bot, filtered by
