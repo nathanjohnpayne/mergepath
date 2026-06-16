@@ -1383,6 +1383,36 @@ else
   echo "$out" | sed 's/^/    /' >&2
 fi
 
+# #446 positive direction (CodeRabbit on #463): an unscoped non-HEAD
+# rate-limit comment CREATED after the StatusContext success means
+# CodeRabbit re-entered rate-limit post-success — the real fast-path must
+# SUPPRESS (keep polling → rate_limit_stalled), exercising the created_at
+# arbitration in status_context_fast_path_blocked_by_comment directly.
+set +e
+out=$(
+  cd "$CODERABBIT_FASTPATH_ROOT" &&
+    PATH="$SCRATCH:$PATH" \
+    GH_TOKEN=fixture-token \
+    CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+    STUB_COMMENT_CREATED_AT="2999-01-01T00:00:05Z" \
+    STUB_COMMENT_UPDATED_AT="2999-01-01T00:00:05Z" \
+    STUB_STATUS_CREATED_AT="2999-01-01T00:00:01Z" \
+    STUB_COMMENT_BODY_SUFFIX="" \
+    "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" = "5" ] &&
+   echo "$out" | grep -q '"status": "rate_limit_stalled"' &&
+   echo "$out" | grep -q "StatusContext success suppressed"; then
+  pass=$((pass + 1))
+  echo "  PASS: unscoped non-HEAD rate-limit comment created AFTER the status success suppresses the fast-path (#446)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: post-success unscoped rate-limit comment should suppress the fast-path (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
 set +e
 out=$(
   cd "$CODERABBIT_FASTPATH_ROOT" &&

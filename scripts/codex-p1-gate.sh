@@ -174,6 +174,14 @@ if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
   exit 2
 fi
 
+# Verify GH_TOKEN BEFORE auto-detecting REPO via `gh repo view` — a
+# missing/invalid token otherwise surfaces as a misleading "could not
+# detect current repo" instead of the real auth error (CodeRabbit on #463).
+if [ -z "${GH_TOKEN:-}" ]; then
+  echo "ERROR: GH_TOKEN is required. See REVIEW_POLICY.md § PAT lookup table." >&2
+  exit 2
+fi
+
 REPO=${2:-${REPO:-}}
 if [ -z "$REPO" ]; then
   REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
@@ -181,11 +189,6 @@ if [ -z "$REPO" ]; then
     echo "ERROR: could not detect current repo via 'gh repo view'. Pass REPO explicitly." >&2
     exit 2
   fi
-fi
-
-if [ -z "${GH_TOKEN:-}" ]; then
-  echo "ERROR: GH_TOKEN is required. See REVIEW_POLICY.md § PAT lookup table." >&2
-  exit 2
 fi
 
 BOT_LOGIN=$(codex_field bot_login)

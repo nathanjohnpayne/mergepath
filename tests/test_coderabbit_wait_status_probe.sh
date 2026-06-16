@@ -470,7 +470,10 @@ test_review_during_probe_wait_emits_findings() {
 # trust_status_context_for_clearance: true, which the scenario harness above
 # disables, so this regression pairs a STRUCTURAL assertion on the real
 # arbitration with an inline ordering-decision check (the inline-literal
-# pattern used by scripts/ci/check_pr_audit_codex_clearance).
+# pattern used by scripts/ci/check_pr_audit_codex_clearance). The REAL
+# runtime fast-path (trust enabled + StatusContext stub) — including the
+# created-after-suppress and created-before-clear directions — is exercised
+# end-to-end in scripts/ci/check_canonical_bugs_263caf3 "Bug 6".
 test_446_newer_comment_suppresses_stale_status() {
   local script="$ROOT/scripts/coderabbit-wait.sh"
 
