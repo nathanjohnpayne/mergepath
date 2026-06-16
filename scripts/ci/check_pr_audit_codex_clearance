@@ -6,7 +6,7 @@
 # script`, so the gate logic itself is JavaScript embedded in YAML.
 # This check extracts the clearance algorithm into a small Node
 # script that mirrors the workflow's logic verbatim, then runs it
-# against six fixture payloads under
+# against fixture payloads under
 # `scripts/ci/fixtures/pr-audit-codex-clearance/` covering:
 #
 #   - clean-clear.json            — COMMENTED on HEAD, zero P0/P1 → cleared
@@ -16,6 +16,23 @@
 #   - p2-only.json                — only P2/P3 inline findings → cleared (P2/P3 advisory)
 #   - quote-reply-from-author.json — author quote-reply containing `![P1 Badge]` text →
 #                                     cleared (filter scopes to bot author only)
+#   - p1-resolved-clears.json     — P1 thread resolved, last touched pre-merge → cleared (#449 + #460)
+#   - p1-resolved-postmerge-blocks.json — P1 thread resolved but touched after merge → NOT cleared (Codex P1 #460)
+#   - p1-resolved-no-mergedat-blocks.json — P1 thread resolved but merged_at unknown → fail-closed, NOT cleared (Codex P1 #460)
+#   - p1-unresolved-blocks.json   — P1 finding, thread unresolved → NOT cleared (#449)
+#   - resolution-lookup-failed.json — P1 finding, resolution lookup failed → NOT cleared / fail-closed (#449)
+#   - fresh-plus1-clears.json     — Codex +1 inside [HEAD date, merged_at] → cleared (#450)
+#   - stale-plus1-rejected.json   — +1 before the HEAD freshness floor → NOT cleared (#450)
+#   - post-merge-plus1-rejected.json — +1 after merged_at → NOT cleared (#450)
+#   - review-newer-than-reaction-blocks.json — newer review w/ unresolved P1 beats older +1 → NOT cleared (#450)
+#   - reaction-newer-than-review-clears.json — newer +1 beats older review w/ P1 → cleared (#450)
+#   - inline-fetch-failed.json    — inline_comments=null (fetch failed) → fail-closed, NOT cleared (CodeRabbit #460)
+#   - forcepush-stale-plus1-rejected.json — +1 predates a later force-push → raised lower bound, NOT cleared (Codex P2 #460)
+#   - forcepush-fresh-plus1-clears.json   — +1 after the force-push → cleared (anchor must not over-reject, Codex P2 #460)
+#   - stale-prior-head-plus1-rejected.json — +1 before merged_at-window floor → NOT cleared (merge-time freshness floor, Codex P2 #460)
+#   - codex-disabled-plus1-rejected.json — codex.enabled=false + fresh +1, no CLI APPROVED → NOT cleared (codexEnabled gate, Codex P2 #460)
+#   - postmerge-forcepush-plus1-clears.json — force-push AFTER merge ignored; pre-merge +1 still clears (merge-time force-push bound, Codex P2 #460 r2)
+#   - cross-agent-plus1-rejected.json — fresh +1 but no same-agent Authoring-Agent → +1 cannot substitute reviewer approval, NOT cleared (same-agent gate, Codex P2 #460 r3)
 #
 # Inline-literal pattern: the algorithm under test is duplicated
 # from the workflow YAML into the Node script below, the same way
@@ -60,10 +77,68 @@ const fx = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
 
 const codexBotLogin = fx.codex_bot_login;
 const headSha = fx.head_sha;
+// codex.enabled gate (#460 Codex P2): default true, absent → true.
+const codexEnabled = fx.codex_enabled !== false;
 const reviews = fx.reviews || [];
-const inlineComments = fx.inline_comments || [];
+// Preserve an explicit JSON null for inline_comments instead of
+// collapsing it to an empty array (CodeRabbit on PR 460). In the
+// workflow a failed inline-comment fetch leaves inlineComments as null
+// and the clearance block is skipped to fail closed; mapping only an
+// omitted key keeps that branch testable. Note: this comment avoids
+// backticks/apostrophes on purpose — the runner lives in a single-quoted
+// bash heredoc inside a command substitution, where bash 3.2 mis-parses
+// stray quotes while scanning for the closing paren.
+const inlineComments = (fx.inline_comments === undefined) ? [] : fx.inline_comments;
+const reactions = fx.reactions || [];
+const headCommitterDate = fx.head_committer_date || '';
+const mergedAt = fx.merged_at || '';
+// Only force-pushes at or before merged_at are merge-time state; a
+// post-merge force-push must not raise the reaction lower bound past
+// merged_at (Codex P2 on PR 460 round 2). Mirrors the workflow filter of
+// head_ref_force_pushed events to created_at <= merged_at.
+let lastForcePushAt = fx.last_force_push_at || '';
+if (lastForcePushAt && mergedAt && lastForcePushAt > mergedAt) {
+  lastForcePushAt = '';
+}
+const reactionFreshnessWindowSeconds = fx.reaction_freshness_window_seconds || 1800;
+// Merge-time freshness floor: merged_at - window (ms stripped to compare
+// against ms-less ISO timestamps). Mirrors the workflow (#460 Codex P2).
+let mergedAtFloor = '';
+if (mergedAt) {
+  const t = Date.parse(mergedAt);
+  if (!Number.isNaN(t)) {
+    mergedAtFloor = new Date(t - reactionFreshnessWindowSeconds * 1000)
+      .toISOString().replace(/\.\d{3}Z$/, 'Z');
+  }
+}
+// Reaction-window lower bound = max(committer date, last force-push,
+// merged_at - window). Empty committer date keeps the reaction path off;
+// the other two only raise an existing base (Codex P2 on PR 460).
+let reactionLowerBound = '';
+if (headCommitterDate) {
+  reactionLowerBound = headCommitterDate;
+  if (lastForcePushAt > reactionLowerBound) reactionLowerBound = lastForcePushAt;
+  if (mergedAtFloor > reactionLowerBound) reactionLowerBound = mergedAtFloor;
+}
 
-// --- mirrored from .github/workflows/pr-audit.yml (#249) ----------
+// Build the comment-databaseId → isResolved map that the workflow
+// derives from its GraphQL reviewThreads fetch. `resolution_lookup_failed`
+// simulates a GraphQL failure → null (fail closed). Absent review_threads
+// → empty map (every finding unresolved), preserving pre-#449 fixtures.
+let resolutionByCommentId = {};
+if (fx.resolution_lookup_failed === true) {
+  resolutionByCommentId = null;
+} else if (Array.isArray(fx.review_threads)) {
+  for (const t of fx.review_threads) {
+    for (const cid of (t.comment_ids || [])) {
+      resolutionByCommentId[String(cid)] = {
+        resolved: t.is_resolved === true,
+        threadLatestAt: t.latest_comment_at || '',
+      };
+    }
+  }
+}
+
 const codexReviewsOnHead = reviews.filter(
   r => r.user.login === codexBotLogin &&
        headSha &&
@@ -73,25 +148,87 @@ const codexCommentedOnHead = codexReviewsOnHead.filter(
   r => r.state === 'COMMENTED'
 );
 
+// --- mirrored from .github/workflows/pr-audit.yml (#249/#449/#450) -
+// Gate on codexEnabled (#460 Codex P2): codex.enabled=false → Codex bot
+// signals are ignored (codexCleared stays false), matching codex-review-check.sh.
 let codexCleared = false;
-if (codexCommentedOnHead.length > 0) {
-  const latestCodexReview = codexCommentedOnHead.reduce(
-    (latest, r) => {
-      if (!latest) return r;
-      return (r.submitted_at > latest.submitted_at) ? r : latest;
-    },
-    null
-  );
+if (codexEnabled && inlineComments !== null) {
+  let latestCodexReview = null;
+  if (codexCommentedOnHead.length > 0) {
+    latestCodexReview = codexCommentedOnHead.reduce(
+      (latest, r) => {
+        if (!latest) return r;
+        return (r.submitted_at > latest.submitted_at) ? r : latest;
+      },
+      null
+    );
+  }
+  const latestReviewTime =
+    latestCodexReview ? (latestCodexReview.submitted_at || '') : '';
 
   const p01Regex = /!\[P[01] Badge\]/;
-  const unresolvedP01 = inlineComments.filter(
-    c => c.user && c.user.login === codexBotLogin &&
-         c.pull_request_review_id === latestCodexReview.id &&
-         p01Regex.test(c.body || '')
-  );
+  let reviewHasUnresolvedP01 = false;
+  if (latestCodexReview) {
+    const p01 = inlineComments.filter(
+      c => c.user && c.user.login === codexBotLogin &&
+           c.pull_request_review_id === latestCodexReview.id &&
+           p01Regex.test(c.body || '')
+    );
+    if (resolutionByCommentId === null) {
+      reviewHasUnresolvedP01 = p01.length > 0; // fail closed
+    } else {
+      // Resolved counts only when bounded by merge: thread resolved AND
+      // merged_at known AND no thread comment after merged_at (#460 — no
+      // resolvedAt exists, so post-merge activity is the proxy; fail
+      // closed on unknown merged_at).
+      const resolvedAtMerge = (cid) => {
+        const e = resolutionByCommentId[String(cid)];
+        if (!e || e.resolved !== true) return false;
+        if (!mergedAt) return false;
+        if (e.threadLatestAt && e.threadLatestAt > mergedAt) return false;
+        return true;
+      };
+      reviewHasUnresolvedP01 = p01.some(c => !resolvedAtMerge(c.id));
+    }
+  }
 
-  if (unresolvedP01.length === 0) {
+  // Same-agent context (Codex P2 on PR 460 r3): a Codex +1 substitutes for
+  // gate (b) reviewer approval only when the PR Authoring-Agent resolves to
+  // an available reviewer identity. Mirrors codex-review-check.sh
+  // AUTHORING_AGENT to SAME_AGENT_REVIEWER suffix match. A missing or non-
+  // matching authoring agent leaves sameAgentContext false, so a cross-agent
+  // +1 does not clear (the round-3 finding case).
+  const reviewerAccounts = fx.available_reviewers ||
+    ['nathanpayne-claude', 'nathanpayne-cursor', 'nathanpayne-codex'];
+  let sameAgentContext = false;
+  if (fx.authoring_agent) {
+    const authoringAgent = String(fx.authoring_agent).toLowerCase();
+    sameAgentContext = reviewerAccounts.some(
+      r => String(r).toLowerCase().endsWith('-' + authoringAgent)
+    );
+  }
+
+  let latestReactionTime = '';
+  if (sameAgentContext) {
+    for (const x of reactions) {
+      if (x.user && x.user.login === codexBotLogin &&
+          x.content === '+1' &&
+          reactionLowerBound && x.created_at >= reactionLowerBound &&
+          mergedAt && x.created_at <= mergedAt &&
+          x.created_at > latestReactionTime) {
+        latestReactionTime = x.created_at;
+      }
+    }
+  }
+
+  if (latestReactionTime && latestReviewTime) {
+    codexCleared = (latestReactionTime > latestReviewTime)
+      ? true
+      : !reviewHasUnresolvedP01;
+  } else if (latestReactionTime) {
     codexCleared = true;
+  } else if (latestReviewTime) {
+    codexCleared = !reviewHasUnresolvedP01;
   }
 }
 // --- end mirrored algorithm --------------------------------------
@@ -147,6 +284,139 @@ if grep -qF '#249' "$WORKFLOW"; then
 else
   fail=$((fail + 1))
   echo "  FAIL: $WORKFLOW must reference #249 in a comment for traceability" >&2
+fi
+
+# Structural assertion (#449): the workflow fetches review-thread
+# resolution state via GraphQL reviewThreads. Without it the audit
+# would flag an author-resolved P1 (the sanctioned codex-p1-gate
+# override path) as an unresolved finding — the exact false positive
+# #449 closes. The fixture tests above consume a pre-built resolution
+# map, so they can't catch a dropped fetch at the API call site.
+if grep -qF 'reviewThreads(first:100' "$WORKFLOW" && grep -qF 'isResolved' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW fetches reviewThreads resolution state (#449)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must fetch reviewThreads/isResolved for resolution-aware P0/P1 filtering (#449)" >&2
+fi
+
+# Structural assertion (Codex P1 on #460): the retrospective audit must
+# bound thread resolution by merge time. GitHub exposes no resolvedAt, so
+# the workflow uses the thread's newest comment time (createdAt) vs
+# merged_at as the proxy and fails closed otherwise. A regression to bare
+# isResolved would let a post-merge resolve clear a real violation.
+if grep -qF 'resolvedAtMerge' "$WORKFLOW" && \
+   grep -qF 'threadLatestAt' "$WORKFLOW" && \
+   grep -qF 'comments(first:100){ nodes { databaseId createdAt } }' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW bounds thread resolution by merge time (Codex P1 #460)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must bound resolution by merge time (resolvedAtMerge proxy + comment createdAt) — Codex P1 #460" >&2
+fi
+
+# Structural assertion (#450): the workflow reads Codex bot +1
+# reactions and anchors them to merge time (pr.merged_at), not the
+# audit run time. A regression to a NOW-window floor would reject
+# every week-old merge-time +1.
+if grep -qF 'reactions.listForIssue' "$WORKFLOW" && \
+   grep -qF "x.content === '+1'" "$WORKFLOW" && \
+   grep -qF 'pr.merged_at' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW accepts merge-time-anchored Codex +1 clearance (#450)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must read Codex +1 reactions anchored to pr.merged_at (#450)" >&2
+fi
+
+# Structural assertion (Codex P2 on #460): the workflow raises the
+# reaction-window lower bound to the latest head_ref_force_pushed time,
+# mirroring the merge gate. Without it a stale +1 on a PR force-pushed to
+# an old/reused commit could satisfy the window and falsely clear.
+if grep -qF 'head_ref_force_pushed' "$WORKFLOW" && \
+   grep -qF 'listEventsForTimeline' "$WORKFLOW" && \
+   grep -qF 'reactionLowerBound' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW raises the reaction lower bound to the force-push anchor (Codex P2 #460)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must anchor reactions to head_ref_force_pushed (max with committer date) — Codex P2 #460" >&2
+fi
+
+# Structural assertion (Codex P2 on #460 round 2): the workflow bounds
+# head_ref_force_pushed events to those at or before merged_at when
+# reconstructing merge-time state. Without it a force-push AFTER merge
+# raises reactionLowerBound past merged_at, empties the [lowerBound,
+# merged_at] reaction window, and falsely flags a PR that legitimately
+# cleared via a pre-merge 👍. Mirrors labelWasPresentAtMerge /
+# resolvedAtMerge. The postmerge-forcepush-plus1-clears fixture exercises
+# the runtime path; this canary guards the workflow source.
+if grep -qF 'ev.created_at <= mergedAt' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW bounds force-push events to merged_at (merge-time state, Codex P2 #460 r2)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must exclude post-merge force-pushes (ev.created_at <= mergedAt) from the reaction lower bound — Codex P2 #460 r2" >&2
+fi
+
+# Structural assertion (Codex P2 on #460): the reaction lower bound also
+# carries the merge-time freshness floor (merged_at - reaction_freshness_
+# window_seconds), so a stale prior-HEAD +1 the merge gate would reject
+# cannot clear the retrospective audit on an ordinary-push-to-old-commit PR.
+if grep -qF 'reactionFreshnessWindowSeconds' "$WORKFLOW" && \
+   grep -qF 'mergedAtFloor' "$WORKFLOW" && \
+   grep -qF 'reaction_freshness_window_seconds' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW applies the merge-time freshness floor (merged_at - window) to the reaction lower bound (Codex P2 #460)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must add the merged_at - reaction_freshness_window_seconds floor to the reaction lower bound — Codex P2 #460" >&2
+fi
+
+# Structural assertion (Codex P2 on #460): the workflow honors
+# codex.enabled before accepting any Codex bot clearance signal. When
+# codex.enabled=false, codex-review-check.sh ignores Codex reviews and
+# reactions (gate (c) clears only via a Phase 4b substitute APPROVED);
+# the retrospective audit must match, or a stray 👍 from a still-installed
+# App on a codex-disabled repo would mark a merge compliant that the merge
+# gate never cleared. Captured from policy as codexEnabled, then gated on
+# the clearance algorithm. The codex-disabled-plus1-rejected fixture
+# exercises the runtime path; this canary guards the workflow source.
+if grep -qF 'config.codex.enabled === false' "$WORKFLOW" && \
+   grep -qF 'if (codexEnabled && inlineComments !== null)' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW honors codex.enabled before accepting Codex bot clearance (Codex P2 #460)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must gate Codex clearance on codexEnabled (codex.enabled===false → ignore bot signals) — Codex P2 #460" >&2
+fi
+
+# Structural assertion (Codex P2 on #460 round 3): the workflow gates the
+# Codex +1 reaction path on same-agent context, mirroring the merge gate
+# branch-2 (#170) rule that a 👍 substitutes for reviewer approval only when
+# the PR Authoring-Agent resolves to an available reviewer identity. Without
+# it a cross-agent / missing-Authoring-Agent PR merged with only a 👍 (which
+# codex-review-check.sh rejects) would pass the audit. The
+# cross-agent-plus1-rejected fixture exercises the runtime path; this canary
+# guards the workflow source.
+if grep -qF 'sameAgentContext' "$WORKFLOW" && \
+   grep -qF 'Authoring-Agent:' "$WORKFLOW" && \
+   grep -qF 'if (sameAgentContext)' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW gates the +1 reaction path on same-agent context (Codex P2 #460 r3)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must gate the Codex +1 reaction on sameAgentContext (Authoring-Agent → reviewer) — Codex P2 #460 r3" >&2
+fi
+
+# Structural assertion: the workflow references #449 and #450 for
+# traceability back to the clearance-semantics issues.
+if grep -qF '#449' "$WORKFLOW" && grep -qF '#450' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW references #449 and #450"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must reference #449 and #450 in comments for traceability" >&2
 fi
 
 # Structural assertion: the per-PR review fetch is paginated. PRs

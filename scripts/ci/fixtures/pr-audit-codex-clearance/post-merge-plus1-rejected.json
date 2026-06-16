@@ -1,0 +1,18 @@
+{
+  "description": "Codex +1 reaction created AFTER merged_at → not merge-time clearance, NOT cleared (#450)",
+  "expected_cleared": false,
+  "authoring_agent": "claude",
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "head_committer_date": "2026-05-12T10:00:00Z",
+  "merged_at": "2026-05-12T10:30:00Z",
+  "reviews": [],
+  "inline_comments": [],
+  "reactions": [
+    {
+      "content": "+1",
+      "created_at": "2026-05-12T11:00:00Z",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ]
+}
