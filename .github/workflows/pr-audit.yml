@@ -353,13 +353,27 @@ jobs:
                   inlineComments = null;
                 }
 
-                // Comment-databaseId → isResolved map, paginated over all
-                // review threads. null = lookup failed → fail CLOSED
-                // (#449): every P0/P1 finding is then treated as
+                // Comment-databaseId → { resolved, threadLatestAt } map,
+                // paginated over all review threads. null = lookup failed →
+                // fail CLOSED (#449): every P0/P1 finding is then treated as
                 // unresolved, so the review path cannot clear on a lookup
                 // failure. Inner comments(first:100) matches
                 // scripts/codex-p1-gate.sh (a single P0/P1 thread with
                 // >100 replies is not a real shape).
+                //
+                // threadLatestAt is the newest comment time in the thread.
+                // GitHub exposes NO thread resolvedAt and NO resolve
+                // timeline event (verified by schema introspection), so this
+                // retrospective audit cannot read WHEN a thread was resolved.
+                // A thread resolved AFTER merge would otherwise wrongly clear
+                // (Codex P1 on #460). The clearance algorithm below bounds
+                // resolution by merge time using the newest comment as a
+                // proxy: a resolved thread is honored only when it shows no
+                // comment activity after merged_at (and merged_at is known).
+                // Residual: a silent UI-button resolve with no following
+                // comment can't be dated — the codex-p1-gate REQUIRED check
+                // is the at-merge primary enforcement, this audit the
+                // retrospective backstop.
                 let resolutionByCommentId = {};
                 try {
                   let cursor = null;
@@ -370,7 +384,7 @@ jobs:
                            pullRequest(number:$pr){
                              reviewThreads(first:100, after:$cursor){
                                pageInfo { hasNextPage endCursor }
-                               nodes { isResolved comments(first:100){ nodes { databaseId } } }
+                               nodes { isResolved comments(first:100){ nodes { databaseId createdAt } } }
                              }
                            }
                          }
@@ -384,8 +398,17 @@ jobs:
                     );
                     const rt = tresp.repository.pullRequest.reviewThreads;
                     for (const t of rt.nodes) {
+                      let threadLatestAt = '';
                       for (const c of t.comments.nodes) {
-                        resolutionByCommentId[String(c.databaseId)] = t.isResolved;
+                        if (c.createdAt && c.createdAt > threadLatestAt) {
+                          threadLatestAt = c.createdAt;
+                        }
+                      }
+                      for (const c of t.comments.nodes) {
+                        resolutionByCommentId[String(c.databaseId)] = {
+                          resolved: t.isResolved,
+                          threadLatestAt,
+                        };
                       }
                     }
                     if (!rt.pageInfo.hasNextPage) break;
@@ -516,7 +539,8 @@ jobs:
                   // Codex embeds; scope to the bot author so an author
                   // quote-reply doesn't read as a finding (#249). A
                   // finding counts as unresolved unless its thread is
-                  // RESOLVED (#449).
+                  // RESOLVED *and that resolution is bounded by merge time*
+                  // (#449 + #460).
                   const p01Regex = /!\[P[01] Badge\]/;
                   let reviewHasUnresolvedP01 = false;
                   if (latestCodexReview) {
@@ -528,9 +552,22 @@ jobs:
                     if (resolutionByCommentId === null) {
                       reviewHasUnresolvedP01 = p01.length > 0; // fail closed
                     } else {
-                      reviewHasUnresolvedP01 = p01.some(
-                        c => resolutionByCommentId[String(c.id)] !== true
-                      );
+                      // A P0/P1 finding counts as resolved ONLY when its
+                      // thread is resolved AND that resolution is bounded by
+                      // merge: merged_at is known and the thread shows no
+                      // comment activity after it. GitHub exposes no
+                      // resolvedAt, so post-merge comment activity is the
+                      // conservative proxy — a thread resolved after merge
+                      // must not retroactively clear the audit (Codex P1 on
+                      // #460). Fail closed on unknown merged_at.
+                      const resolvedAtMerge = (cid) => {
+                        const e = resolutionByCommentId[String(cid)];
+                        if (!e || e.resolved !== true) return false;
+                        if (!mergedAt) return false;
+                        if (e.threadLatestAt && e.threadLatestAt > mergedAt) return false;
+                        return true;
+                      };
+                      reviewHasUnresolvedP01 = p01.some(c => !resolvedAtMerge(c.id));
                     }
                   }
 

@@ -16,7 +16,9 @@
 #   - p2-only.json                — only P2/P3 inline findings → cleared (P2/P3 advisory)
 #   - quote-reply-from-author.json — author quote-reply containing `![P1 Badge]` text →
 #                                     cleared (filter scopes to bot author only)
-#   - p1-resolved-clears.json     — P1 finding whose thread isResolved → cleared (#449)
+#   - p1-resolved-clears.json     — P1 thread resolved, last touched pre-merge → cleared (#449 + #460)
+#   - p1-resolved-postmerge-blocks.json — P1 thread resolved but touched after merge → NOT cleared (Codex P1 #460)
+#   - p1-resolved-no-mergedat-blocks.json — P1 thread resolved but merged_at unknown → fail-closed, NOT cleared (Codex P1 #460)
 #   - p1-unresolved-blocks.json   — P1 finding, thread unresolved → NOT cleared (#449)
 #   - resolution-lookup-failed.json — P1 finding, resolution lookup failed → NOT cleared / fail-closed (#449)
 #   - fresh-plus1-clears.json     — Codex +1 inside [HEAD date, merged_at] → cleared (#450)
@@ -103,7 +105,10 @@ if (fx.resolution_lookup_failed === true) {
 } else if (Array.isArray(fx.review_threads)) {
   for (const t of fx.review_threads) {
     for (const cid of (t.comment_ids || [])) {
-      resolutionByCommentId[String(cid)] = t.is_resolved === true;
+      resolutionByCommentId[String(cid)] = {
+        resolved: t.is_resolved === true,
+        threadLatestAt: t.latest_comment_at || '',
+      };
     }
   }
 }
@@ -144,9 +149,18 @@ if (inlineComments !== null) {
     if (resolutionByCommentId === null) {
       reviewHasUnresolvedP01 = p01.length > 0; // fail closed
     } else {
-      reviewHasUnresolvedP01 = p01.some(
-        c => resolutionByCommentId[String(c.id)] !== true
-      );
+      // Resolved counts only when bounded by merge: thread resolved AND
+      // merged_at known AND no thread comment after merged_at (#460 — no
+      // resolvedAt exists, so post-merge activity is the proxy; fail
+      // closed on unknown merged_at).
+      const resolvedAtMerge = (cid) => {
+        const e = resolutionByCommentId[String(cid)];
+        if (!e || e.resolved !== true) return false;
+        if (!mergedAt) return false;
+        if (e.threadLatestAt && e.threadLatestAt > mergedAt) return false;
+        return true;
+      };
+      reviewHasUnresolvedP01 = p01.some(c => !resolvedAtMerge(c.id));
     }
   }
 
@@ -238,6 +252,21 @@ if grep -qF 'reviewThreads(first:100' "$WORKFLOW" && grep -qF 'isResolved' "$WOR
 else
   fail=$((fail + 1))
   echo "  FAIL: $WORKFLOW must fetch reviewThreads/isResolved for resolution-aware P0/P1 filtering (#449)" >&2
+fi
+
+# Structural assertion (Codex P1 on #460): the retrospective audit must
+# bound thread resolution by merge time. GitHub exposes no resolvedAt, so
+# the workflow uses the thread's newest comment time (createdAt) vs
+# merged_at as the proxy and fails closed otherwise. A regression to bare
+# isResolved would let a post-merge resolve clear a real violation.
+if grep -qF 'resolvedAtMerge' "$WORKFLOW" && \
+   grep -qF 'threadLatestAt' "$WORKFLOW" && \
+   grep -qF 'comments(first:100){ nodes { databaseId createdAt } }' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW bounds thread resolution by merge time (Codex P1 #460)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must bound resolution by merge time (resolvedAtMerge proxy + comment createdAt) — Codex P1 #460" >&2
 fi
 
 # Structural assertion (#450): the workflow reads Codex bot +1

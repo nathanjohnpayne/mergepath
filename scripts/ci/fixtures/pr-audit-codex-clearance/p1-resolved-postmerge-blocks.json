@@ -1,6 +1,6 @@
 {
-  "description": "Codex COMMENTED on HEAD with a P1 finding whose thread is RESOLVED and last touched BEFORE merge → resolution bounded by merge, cleared (#449 + #460)",
-  "expected_cleared": true,
+  "description": "Codex P1 thread is RESOLVED now, but the thread has comment activity AFTER merge → resolution not bounded by merge, NOT cleared (Codex P1 on #460: a post-merge resolve must not retroactively clear the audit)",
+  "expected_cleared": false,
   "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
   "codex_bot_login": "chatgpt-codex-connector[bot]",
   "merged_at": "2026-05-12T10:30:00Z",
@@ -17,11 +17,11 @@
     {
       "id": 5001,
       "pull_request_review_id": 1001,
-      "body": "![P1 Badge](https://example.com/p1.svg) Author resolved this via the codex-p1-gate override path.",
+      "body": "![P1 Badge](https://example.com/p1.svg) Unbounded retry on 5xx.",
       "user": { "login": "chatgpt-codex-connector[bot]" }
     }
   ],
   "review_threads": [
-    { "is_resolved": true, "comment_ids": [5001], "latest_comment_at": "2026-05-12T10:05:00Z" }
+    { "is_resolved": true, "comment_ids": [5001], "latest_comment_at": "2026-05-12T18:00:00Z" }
   ]
 }
