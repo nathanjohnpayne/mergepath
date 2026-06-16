@@ -55,16 +55,20 @@ jobs:
             let reviewerAccounts;
             let authorIdentity;
             let codexBotLogin;
+            let reactionFreshnessWindowSeconds;
             try {
               const config = yaml.load(fs.readFileSync('.github/review-policy.yml', 'utf8'));
               reviewerAccounts = config.available_reviewers || [];
               authorIdentity = config.author_identity || 'nathanjohnpayne';
               codexBotLogin = (config.codex && config.codex.bot_login) || 'chatgpt-codex-connector[bot]';
+              reactionFreshnessWindowSeconds =
+                (config.codex && config.codex.reaction_freshness_window_seconds) || 1800;
             } catch (e) {
               console.log('WARNING: Could not read review-policy.yml, using defaults');
               reviewerAccounts = ['nathanpayne-claude', 'nathanpayne-codex', 'nathanpayne-cursor'];
               authorIdentity = 'nathanjohnpayne';
               codexBotLogin = 'chatgpt-codex-connector[bot]';
+              reactionFreshnessWindowSeconds = 1800;
             }
 
             // The Codex bot's review-state semantics differ from
@@ -503,17 +507,39 @@ jobs:
                   lastForcePushAt = '';
                 }
 
-                // Reaction-window lower bound = max(committer date, last
-                // force-push), lexicographic on ISO-8601. Empty committer
-                // date keeps the reaction path off (fail closed); force-push
-                // only RAISES an existing base, never substitutes for it.
-                const reactionLowerBound = headCommitterDate
-                  ? ((lastForcePushAt > headCommitterDate)
-                      ? lastForcePushAt
-                      : headCommitterDate)
-                  : '';
-
                 const mergedAt = pr.merged_at || '';
+
+                // Merge-time freshness floor for +1 reactions (#460 Codex
+                // P2): the merge gate's reaction lower bound is
+                // max(HEAD_PUSHED_AT, NOW - reaction_freshness_window). An
+                // ordinary push to a commit with an OLD committer date leaves
+                // the committer/force-push anchor early, so a stale
+                // prior-HEAD 👍 the merge gate would reject (older than its
+                // NOW-window floor) could otherwise clear this retrospective
+                // audit. Anchor the equivalent floor to MERGE time:
+                // merged_at - window. Strip the .000 ms so it compares
+                // lexicographically against the ms-less ISO timestamps.
+                let mergedAtFloor = '';
+                if (mergedAt) {
+                  const t = Date.parse(mergedAt);
+                  if (!Number.isNaN(t)) {
+                    mergedAtFloor = new Date(t - reactionFreshnessWindowSeconds * 1000)
+                      .toISOString().replace(/\.\d{3}Z$/, 'Z');
+                  }
+                }
+
+                // Reaction-window lower bound = max(committer date, last
+                // force-push, merged_at - window), lexicographic on ISO-8601
+                // — the merge gate's max(HEAD_PUSHED_AT, NOW - window) adapted
+                // to merge time. Empty committer date keeps the reaction path
+                // off (fail closed); the force-push and merge-time-floor only
+                // RAISE an existing base, never substitute for it.
+                let reactionLowerBound = '';
+                if (headCommitterDate) {
+                  reactionLowerBound = headCommitterDate;
+                  if (lastForcePushAt > reactionLowerBound) reactionLowerBound = lastForcePushAt;
+                  if (mergedAtFloor > reactionLowerBound) reactionLowerBound = mergedAtFloor;
+                }
 
                 // ── Clearance algorithm (#249/#449/#450) ──────────────
                 // KEEP IN SYNC with the mirrored runner in

@@ -29,6 +29,7 @@
 #   - inline-fetch-failed.json    — inline_comments=null (fetch failed) → fail-closed, NOT cleared (CodeRabbit #460)
 #   - forcepush-stale-plus1-rejected.json — +1 predates a later force-push → raised lower bound, NOT cleared (Codex P2 #460)
 #   - forcepush-fresh-plus1-clears.json   — +1 after the force-push → cleared (anchor must not over-reject, Codex P2 #460)
+#   - stale-prior-head-plus1-rejected.json — +1 before merged_at-window floor → NOT cleared (merge-time freshness floor, Codex P2 #460)
 #
 # Inline-literal pattern: the algorithm under test is duplicated
 # from the workflow YAML into the Node script below, the same way
@@ -86,14 +87,27 @@ const inlineComments = (fx.inline_comments === undefined) ? [] : fx.inline_comme
 const reactions = fx.reactions || [];
 const headCommitterDate = fx.head_committer_date || '';
 const lastForcePushAt = fx.last_force_push_at || '';
-// Reaction-window lower bound mirrors the workflow: max(committer date,
-// last force-push), lexicographic ISO-8601. Empty committer date keeps
-// the reaction path off; force-push only raises an existing base
-// (Codex P2 on PR 460).
-const reactionLowerBound = headCommitterDate
-  ? ((lastForcePushAt > headCommitterDate) ? lastForcePushAt : headCommitterDate)
-  : '';
 const mergedAt = fx.merged_at || '';
+const reactionFreshnessWindowSeconds = fx.reaction_freshness_window_seconds || 1800;
+// Merge-time freshness floor: merged_at - window (ms stripped to compare
+// against ms-less ISO timestamps). Mirrors the workflow (#460 Codex P2).
+let mergedAtFloor = '';
+if (mergedAt) {
+  const t = Date.parse(mergedAt);
+  if (!Number.isNaN(t)) {
+    mergedAtFloor = new Date(t - reactionFreshnessWindowSeconds * 1000)
+      .toISOString().replace(/\.\d{3}Z$/, 'Z');
+  }
+}
+// Reaction-window lower bound = max(committer date, last force-push,
+// merged_at - window). Empty committer date keeps the reaction path off;
+// the other two only raise an existing base (Codex P2 on PR 460).
+let reactionLowerBound = '';
+if (headCommitterDate) {
+  reactionLowerBound = headCommitterDate;
+  if (lastForcePushAt > reactionLowerBound) reactionLowerBound = lastForcePushAt;
+  if (mergedAtFloor > reactionLowerBound) reactionLowerBound = mergedAtFloor;
+}
 
 // Build the comment-databaseId → isResolved map that the workflow
 // derives from its GraphQL reviewThreads fetch. `resolution_lookup_failed`
@@ -295,6 +309,20 @@ if grep -qF 'head_ref_force_pushed' "$WORKFLOW" && \
 else
   fail=$((fail + 1))
   echo "  FAIL: $WORKFLOW must anchor reactions to head_ref_force_pushed (max with committer date) — Codex P2 #460" >&2
+fi
+
+# Structural assertion (Codex P2 on #460): the reaction lower bound also
+# carries the merge-time freshness floor (merged_at - reaction_freshness_
+# window_seconds), so a stale prior-HEAD +1 the merge gate would reject
+# cannot clear the retrospective audit on an ordinary-push-to-old-commit PR.
+if grep -qF 'reactionFreshnessWindowSeconds' "$WORKFLOW" && \
+   grep -qF 'mergedAtFloor' "$WORKFLOW" && \
+   grep -qF 'reaction_freshness_window_seconds' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: $WORKFLOW applies the merge-time freshness floor (merged_at - window) to the reaction lower bound (Codex P2 #460)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: $WORKFLOW must add the merged_at - reaction_freshness_window_seconds floor to the reaction lower bound — Codex P2 #460" >&2
 fi
 
 # Structural assertion: the workflow references #449 and #450 for
