@@ -1,0 +1,26 @@
+{
+  "description": "Codex P1 thread is RESOLVED and last touched before merge, but merged_at is unknown → cannot bound resolution to merge, fail closed, NOT cleared (Codex P1 on #460)",
+  "expected_cleared": false,
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "reviews": [
+    {
+      "id": 1001,
+      "state": "COMMENTED",
+      "commit_id": "deadbeefcafe1234567890abcdef1234567890ab",
+      "submitted_at": "2026-05-12T10:00:00Z",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ],
+  "inline_comments": [
+    {
+      "id": 5001,
+      "pull_request_review_id": 1001,
+      "body": "![P1 Badge](https://example.com/p1.svg) Finding resolved pre-merge but merge time is unknown.",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ],
+  "review_threads": [
+    { "is_resolved": true, "comment_ids": [5001], "latest_comment_at": "2026-05-12T10:05:00Z" }
+  ]
+}

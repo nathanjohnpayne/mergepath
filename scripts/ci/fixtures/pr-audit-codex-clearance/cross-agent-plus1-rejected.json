@@ -1,0 +1,18 @@
+{
+  "description": "Same fresh Codex +1 as fresh-plus1-clears, but the PR has NO Authoring-Agent trailer (or one that does not resolve to an available reviewer) → sameAgentContext is false, so the +1 cannot substitute for gate (b) reviewer approval and does NOT clear (Codex P2 on #460 round 3). The merge gate (codex-review-check.sh branch 2) rejects this exact case; the audit must match. A non-matching authoring_agent (e.g. one absent from available_reviewers) behaves identically.",
+  "expected_cleared": false,
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "head_committer_date": "2026-05-12T10:00:00Z",
+  "merged_at": "2026-05-12T10:30:00Z",
+  "reaction_freshness_window_seconds": 1800,
+  "reviews": [],
+  "inline_comments": [],
+  "reactions": [
+    {
+      "content": "+1",
+      "created_at": "2026-05-12T10:15:00Z",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ]
+}
