@@ -181,8 +181,17 @@ jobs:
           # clean pass when both per-class knobs are off, so we don't
           # filter by label/author here. `--limit 500` mirrors
           # codex-p1-gate.yml's bound.
+          # Fetch the head SHA WITH the number in one list query (#465
+          # nathanpayne-codex round 2): resolving head_sha per-PR in a
+          # separate `gh api` call (as before) could fail for an individual
+          # PR, and without a SHA the sweep cannot post a fresh check_run —
+          # leaving that PR's PREVIOUS green "Merge clearance gate" as the
+          # branch-protection signal (fail open). Sourcing headRefOid from
+          # the list removes that per-PR failure point: every listed PR
+          # carries its SHA, so a red check_run can always be posted.
           if ! prs_raw=$(gh pr list --repo "$REPO" --state open \
-            --limit 500 --json number --jq '.[].number'); then
+            --limit 500 --json number,headRefOid \
+            --jq '.[] | "\(.number)\t\(.headRefOid)"'); then
             echo "::error::Failed to list open PRs on $REPO"
             exit 1
           fi
@@ -212,13 +221,21 @@ jobs:
         run: |
           set -euo pipefail
           had_infra_error=0
-          while IFS= read -r PR; do
+          while IFS=$'\t' read -r PR head_sha; do
             [ -z "$PR" ] && continue
             echo "::group::Sweep PR #$PR"
 
-            head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
             if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
-              echo "::warning::Could not resolve head SHA for PR #$PR; skipping"
+              # The head SHA was unavailable even from the list query — rare
+              # for an open PR (a transient list hiccup or a PR that closed
+              # mid-sweep). Without a SHA we cannot post a check_run, so the
+              # PR's PREVIOUS green "Merge clearance gate" could remain the
+              # branch-protection signal. Fail closed: flag the infra error so
+              # the sweep run ends non-zero and the gap is surfaced. (#465;
+              # sourcing head_sha from the list removed the per-PR resolve
+              # call that previously failed OPEN here — nathanpayne-codex r2.)
+              echo "::error::No head SHA for PR #$PR from the open-PR list; cannot refresh its Merge clearance gate — failing the sweep (#465)."
+              had_infra_error=1
               echo "::endgroup::"
               continue
             fi

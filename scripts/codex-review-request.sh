@@ -744,10 +744,15 @@ while :; do
 
   NOW=$(date +%s)
   if [ "$NOW" -ge "$DEADLINE" ]; then
-    log "TIMEOUT after ${ELAPSED}s — no Codex review or reaction on HEAD"
-    log "emitting JSON with review=null, reaction=null; exit code 4 (FALLBACK_REQUIRED)"
-    # Fall through to JSON emission so the caller still gets a structured
-    # answer (all nulls), then exit 4.
+    # Final scan at the deadline (#465): a Codex signal that arrived between
+    # the last poll and now must not be emitted as a stale timeout. Refresh
+    # FINAL_SCAN so BOTH the JSON emission and the exit-code decision below
+    # reflect current state — if a signal landed, has_*_signal sees it and
+    # the script exits 0 instead of 4 (FALLBACK_REQUIRED) on stale data.
+    if ! FINAL_SCAN=$(scan_codex_state); then
+      die 3 "final timeout-path scan failed"
+    fi
+    log "deadline reached after ${ELAPSED}s — emitted scan is the final one; exit code decided below"
     break
   fi
 

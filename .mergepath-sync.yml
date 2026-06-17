@@ -473,6 +473,11 @@ paths:
   - path: tests/test_codex_review_check_resolution.sh
     type: canonical
     consumers: all
+  # #465 fail-closed structural guards. check_codex_scripts hard-runs it.
+  # Propagation-safe (skips workflows/scripts a consumer does not carry).
+  - path: tests/test_465_fail_closed.sh
+    type: canonical
+    consumers: all
   # Pairs with scripts/merge-clearance-gate.sh +
   # scripts/ci/check_merge_clearance_gate (kit-propagated). The check
   # wrapper hard-requires this test file; same #264/#266 coupling class
@@ -692,6 +697,7 @@ paths:
       - "tests/test_export_consumer_facts.sh"  # check_export_consumer_facts
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
+      - "tests/test_465_fail_closed.sh"        # check_codex_scripts (#465)
       - "tests/test_audit_propagation_lane.sh" # check_propagation_lane_audit
       - "scripts/audit-propagation-lane.sh"    # check_propagation_lane_audit
       - "scripts/codex-p1-gate.sh"             # check_codex_p1_gate

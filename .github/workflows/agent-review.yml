@@ -606,7 +606,18 @@ jobs:
 
       - name: Enable auto-merge
         if: steps.author_merge_token.outputs.enabled == 'true'
-        run: gh pr merge --squash --auto "$PR_URL" || gh pr merge --squash "$PR_URL"
+        run: |
+          # Do NOT fall back to an unconditional "gh pr merge --squash" when
+          # --auto is unavailable (#465): an immediate merge bypasses the
+          # status-check and label guards re-verified above. A sibling job
+          # could apply a blocking label between that re-verify and this step,
+          # and the unconditional fallback would merge it anyway. Fail closed:
+          # if auto-merge cannot be enabled, surface the error and let a human
+          # or a re-run handle it.
+          if ! gh pr merge --squash --auto "$PR_URL"; then
+            echo "::error::Could not enable auto-merge for $PR_URL; refusing to merge unconditionally (#465)."
+            exit 1
+          fi
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
