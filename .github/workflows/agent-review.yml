@@ -429,12 +429,42 @@ jobs:
   # running even if a sibling fails — ordering, not gating, is what
   # `needs:` is for here. See #61 for the cross-event race and this PR
   # for the same-workflow race nathanpayne-codex caught during review.
+  #
+  # Two triggers arm auto-merge (#495):
+  #
+  #   1. `pull_request_review` + `approved` — the original path. The
+  #      approval event IS the signal, so no API approval re-check is
+  #      needed.
+  #   2. `pull_request` + `synchronize` / `reopened` — the RE-ARM path.
+  #      Arming was one-shot on the approval event, so a fix-commit
+  #      pushed AFTER an approval (the common case when Codex's 15–40+
+  #      min review lands a finding at or after the author's approval —
+  #      see #494) never re-attempted `gh pr merge --auto`, and the PR
+  #      sat CLEAN-but-unmerged unless the author re-approved. This path
+  #      re-runs the arming logic on every push, BUT only proceeds when
+  #      the `Gate: require existing non-author approval` step below
+  #      confirms a valid non-author latest-state APPROVED review already
+  #      exists on the PR (`dismiss_stale_reviews` is OFF, so the
+  #      approval carries across the fix-push — see the BEHIND-PR
+  #      carryover behavior). A push with NO existing approval does NOT
+  #      arm. Every other gate (coderabbit-wait, AUTHOR_MERGE_TOKEN
+  #      identity, blocking-label re-verify) re-applies on the NEW HEAD,
+  #      and `gh pr merge --auto` is idempotent when --auto is already
+  #      enabled.
+  #
+  # The job body references only `github.event.pull_request.*` (number,
+  # html_url, labels) — both event types carry that object — so the steps
+  # are event-shape-agnostic. Only the `if:` and the approval-gate step
+  # branch on event name.
   auto-merge-on-approval:
     needs: [detect-disagreement, block-self-approval]
     if: >
       always() &&
-      github.event_name == 'pull_request_review' &&
-      github.event.review.state == 'approved' &&
+      ((github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved') ||
+       (github.event_name == 'pull_request' &&
+        (github.event.action == 'synchronize' ||
+         github.event.action == 'reopened'))) &&
       !contains(github.event.pull_request.labels.*.name, 'needs-external-review') &&
       !contains(github.event.pull_request.labels.*.name, 'needs-human-review') &&
       !contains(github.event.pull_request.labels.*.name, 'human-hold')
@@ -442,8 +472,85 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      # Re-arm gate (#495). On the `synchronize` / `reopened` re-trigger
+      # the approval is NOT in the event payload, so confirm via the API
+      # that a valid non-author latest-state APPROVED review already
+      # exists before arming. On the `pull_request_review` approved path
+      # the approval IS the trigger, so this step is skipped and `proceed`
+      # defaults to true for the downstream guard.
+      #
+      # Approval semantics mirror scripts/codex-review-check.sh gate (b)
+      # and scripts/disagreement-detector.cjs: collapse to each reviewer's
+      # LATEST opinionated review (APPROVED / CHANGES_REQUESTED /
+      # DISMISSED; COMMENTED is informational), exclude the PR author
+      # (GitHub blocks reviewer == author for native approval anyway), and
+      # require that latest state to be APPROVED. A later
+      # CHANGES_REQUESTED or DISMISSED from the same reviewer supersedes an
+      # earlier APPROVED, so a withdrawn approval does NOT re-arm.
+      - name: Gate require existing non-author approval
+        id: require_approval
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::REVIEWER_ASSIGNMENT_TOKEN is not configured; cannot confirm an existing approval for the synchronize re-arm. Skipping auto-merge arming."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Fetch raw pages then flatten with `jq -s 'add // []'` BEFORE
+          # aggregating. `gh api --paginate --jq` applies the filter per
+          # page, so a `group_by` over a >30-review history (default page
+          # size) would collapse each page in isolation and miss a later
+          # CHANGES_REQUESTED on a subsequent page. Flatten first, then run
+          # the latest-state-per-reviewer collapse over the full array.
+          # Mirrors fetch_api_array() in scripts/codex-review-check.sh.
+          if ! RAW=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" 2>&1); then
+            echo "::error::Could not read reviews to confirm an existing approval ($RAW). Failing closed — not arming auto-merge."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Latest opinionated review per non-author reviewer; pass only
+          # when at least one such reviewer's latest state is APPROVED.
+          # `-s` (slurp) merges the per-page arrays into one list-of-arrays;
+          # `add // []` then flattens them to the full review array.
+          if ! APPROVER=$(printf '%s' "$RAW" | jq -r -s \
+            --arg author "$PR_AUTHOR" '
+              [ (add // []) | .[]
+                | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+                | select(.user.login != $author)
+              ]
+              | group_by(.user.login)
+              | map(max_by(.submitted_at))
+              | map(select(.state == "APPROVED"))
+              | first
+              | if . == null then "" else .user.login end' 2>/dev/null); then
+            echo "::error::Could not parse review list to confirm an existing approval. Failing closed — not arming auto-merge."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$APPROVER" ]; then
+            echo "::notice::No valid non-author APPROVED review on PR #$PR_NUMBER; a push does not arm auto-merge without an existing approval (#495)."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Existing non-author approval found ($APPROVER); proceeding with the synchronize re-arm."
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
       - name: Check author merge token
         id: author_merge_token
+        # Skip the entire merge path when the synchronize re-arm gate
+        # found no existing approval. On the pull_request_review path the
+        # step above is skipped, so `proceed` is empty and the `!= 'false'`
+        # test lets the original approval-triggered flow through unchanged.
+        if: steps.require_approval.outputs.proceed != 'false'
         env:
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
         run: |

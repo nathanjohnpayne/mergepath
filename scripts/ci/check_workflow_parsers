@@ -530,6 +530,104 @@ else
 fi
 
 echo
+echo "agent-review.yml auto-merge synchronize re-arm regression (#495)"
+
+# The auto-merge-on-approval job must arm on TWO triggers: the original
+# pull_request_review+approved path AND a pull_request synchronize/reopened
+# RE-ARM path that retries arming after a fix-commit. The re-arm path must
+# be gated on an existing non-author APPROVED review (a push with no
+# approval must NOT arm), and must fail closed if the approval can't be
+# confirmed. Extract the job block (from its key to the next top-level job
+# key at 2-space indent) so these assertions are scoped to the job.
+auto_merge_job_block=$(awk '
+  /^  auto-merge-on-approval:/ {in_block=1}
+  in_block && /^  [a-z]/ && $0 !~ /^  auto-merge-on-approval:/ {exit}
+  in_block {print}
+' "$agent_review_workflow")
+
+# 1. The original approval-event trigger is preserved.
+if printf '%s\n' "$auto_merge_job_block" \
+  | grep -Fq "github.event_name == 'pull_request_review'" \
+  && printf '%s\n' "$auto_merge_job_block" \
+  | grep -Fq "github.event.review.state == 'approved'"; then
+  pass=$((pass + 1))
+  echo "  PASS: auto-merge retains the pull_request_review + approved trigger"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: auto-merge must retain the pull_request_review + approved trigger" >&2
+fi
+
+# 2. The synchronize/reopened re-arm trigger is present in the job if:.
+if printf '%s\n' "$auto_merge_job_block" \
+  | grep -Fq "github.event.action == 'synchronize'" \
+  && printf '%s\n' "$auto_merge_job_block" \
+  | grep -Fq "github.event.action == 'reopened'"; then
+  pass=$((pass + 1))
+  echo "  PASS: auto-merge re-arms on pull_request synchronize/reopened (#495)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: auto-merge must also trigger on pull_request synchronize/reopened to re-arm after a fix-commit (#495)" >&2
+fi
+
+# 3. A dedicated approval gate runs only on the pull_request (push) path.
+if printf '%s\n' "$auto_merge_job_block" | grep -Fq 'id: require_approval' \
+  && printf '%s\n' "$auto_merge_job_block" \
+  | grep -Eq "if:[[:space:]]*github\.event_name == 'pull_request'$"; then
+  pass=$((pass + 1))
+  echo "  PASS: re-arm path has a require_approval gate scoped to pull_request events"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: re-arm path must add a require_approval step gated on github.event_name == 'pull_request' (#495)" >&2
+fi
+
+# 4. The gate confirms an EXISTING non-author APPROVED review: it must
+#    exclude the PR author and require a latest-state APPROVED. Without
+#    this, a push with no approval would arm.
+if printf '%s\n' "$auto_merge_job_block" | grep -Fq '.user.login != $author' \
+  && printf '%s\n' "$auto_merge_job_block" | grep -Fq 'map(select(.state == "APPROVED"))'; then
+  pass=$((pass + 1))
+  echo "  PASS: re-arm gate requires a non-author latest-state APPROVED review"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: re-arm gate must exclude the PR author and require a latest-state APPROVED review (#495)" >&2
+fi
+
+# 5. The gate collapses to each reviewer's LATEST opinionated state so a
+#    withdrawn approval (later CHANGES_REQUESTED/DISMISSED) does not re-arm.
+if printf '%s\n' "$auto_merge_job_block" | grep -Fq 'group_by(.user.login)' \
+  && printf '%s\n' "$auto_merge_job_block" | grep -Fq 'max_by(.submitted_at)'; then
+  pass=$((pass + 1))
+  echo "  PASS: re-arm gate collapses to each reviewer's latest review (supersedes a withdrawn approval)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: re-arm gate must collapse to the latest review per reviewer so a later CHANGES_REQUESTED/DISMISSED supersedes an earlier APPROVED (#495)" >&2
+fi
+
+# 6. Fail-closed: when the approval cannot be confirmed the gate emits
+#    proceed=false, and the merge path is skipped via proceed != 'false'.
+if printf '%s\n' "$auto_merge_job_block" | grep -Fq 'proceed=false' \
+  && printf '%s\n' "$auto_merge_job_block" \
+  | grep -Fq "steps.require_approval.outputs.proceed != 'false'"; then
+  pass=$((pass + 1))
+  echo "  PASS: re-arm fails closed (proceed=false) and the merge path honors it"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: re-arm gate must fail closed (emit proceed=false) and the token step must gate on proceed != 'false' (#495)" >&2
+fi
+
+# 7. Aggregation happens AFTER flattening all pages: a slurped `add // []`
+#    over the raw --paginate stream, not a per-page `gh api --jq` collapse
+#    that would miss a CHANGES_REQUESTED on a later page.
+if printf '%s\n' "$auto_merge_job_block" | grep -Fq 'jq -r -s' \
+  && printf '%s\n' "$auto_merge_job_block" | grep -Fq '(add // [])'; then
+  pass=$((pass + 1))
+  echo "  PASS: re-arm gate flattens paginated reviews before aggregating"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: re-arm gate must slurp + flatten (jq -s 'add // []') the paginated reviews before group_by, so a >30-review history doesn't collapse per page (#495)" >&2
+fi
+
+echo
 echo "dependabot-auto-merge.yml PR-author gate regression (#370)"
 
 dependabot_workflow=".github/workflows/dependabot-auto-merge.yml"
