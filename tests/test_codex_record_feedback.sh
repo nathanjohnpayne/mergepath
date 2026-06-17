@@ -81,6 +81,32 @@ EOF
   chmod +x "$dir/bin/gh"
 }
 
+# make_real_wrapper_case <name> — like make_case, but installs the REAL
+# gh-as-reviewer.sh + gh-token-resolver.sh + identity-check.sh so the reaction
+# WRITE actually travels the production reviewer-token resolution path. Used to
+# exercise the ambient-GH_TOKEN bridge end-to-end (a stubbed wrapper can't).
+# Echoes the case directory.
+make_real_wrapper_case() {
+  local name=$1
+  local dir="$WORKDIR/$name"
+  mkdir -p "$dir/scripts/lib" "$dir/bin" "$dir/.github" "$dir/state"
+
+  cp "$SCRIPT" "$dir/scripts/codex-record-feedback.sh"
+  chmod +x "$dir/scripts/codex-record-feedback.sh"
+  cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
+  cp "$ROOT/scripts/gh-as-reviewer.sh" "$dir/scripts/gh-as-reviewer.sh"
+  chmod +x "$dir/scripts/gh-as-reviewer.sh"
+  cp "$ROOT/scripts/identity-check.sh" "$dir/scripts/identity-check.sh"
+  chmod +x "$dir/scripts/identity-check.sh"
+
+  cat >"$dir/.github/review-policy.yml" <<'EOF'
+codex:
+  bot_login: "chatgpt-codex-connector[bot]"
+EOF
+
+  printf '%s\n' "$dir"
+}
+
 run_case() {
   # run_case <dir> -- <args...>   (env via caller through `env`-style prefix)
   local dir=$1; shift
@@ -418,6 +444,165 @@ EOF
   fi
 }
 
+# Regression for the ambient-GH_TOKEN bridge: a fresh shell that follows the
+# documented `GH_TOKEN=<reviewer PAT> ...` path with NO OP_PREFLIGHT_REVIEWER_PAT
+# and NO stored `gh auth token --user <reviewer>` must still POST the reaction
+# under the reviewer identity. The reaction WRITE travels the REAL
+# gh-as-reviewer.sh -> gh-token-resolver.sh -> identity-check.sh chain (a stubbed
+# wrapper would mask the bug). Attribution is asserted by the gh stub: it returns
+# the reviewer login from `api user` ONLY when the presented token is the bridged
+# ambient PAT, so a green write proves the verified byline is the reviewer.
+test_ambient_gh_token_bridges_to_reviewer_write() {
+  local dir rc
+  dir=$(make_real_wrapper_case "ambient-token-bridge")
+
+  local REVIEWER_PAT="reviewer-pat-sentinel-487"
+  # gh stub: serves reaction GET ([]), the identity-check `api user` probe
+  # (reviewer login ONLY for the bridged PAT), and the reaction POST; and FAILS
+  # `gh auth token --user` so the bridge is the only viable reviewer-token source.
+  cat >"$dir/bin/gh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "\${1:-}" = "auth" ] && [ "\${2:-}" = "token" ]; then
+  # No stored token for any identity in this fresh-shell scenario.
+  echo "no stored token" >&2
+  exit 1
+fi
+[ "\${1:-}" = "api" ] || { echo "unexpected gh: \$*" >&2; exit 9; }
+shift
+if [ "\${1:-}" = "user" ]; then
+  # identity-check.sh --expect-token-identity probe. The byline is whatever
+  # token signs this call; only the bridged reviewer PAT resolves to the
+  # reviewer login. Any other token verifies as a non-reviewer and fails closed.
+  if [ "\${GH_TOKEN:-}" = "$REVIEWER_PAT" ]; then
+    printf 'nathanpayne-claude\n'
+  else
+    printf 'somebody-else\n'
+  fi
+  exit 0
+fi
+[ "\${1:-}" = "--paginate" ] && shift
+case "\${1:-}" in
+  -X)
+    # Reaction POST: record the endpoint + token identity that signed it.
+    shift
+    [ "\${1:-}" = "POST" ] && shift
+    printf '%s\n' "\$*" >>"$dir/state/posts"
+    printf '%s\n' "\${GH_TOKEN:-}" >>"$dir/state/write-token"
+    exit 0
+    ;;
+  repos/owner/repo/pulls/comments/*/reactions) printf '[]\n' ;;
+  repos/owner/repo/issues/comments/*/reactions) printf '[]\n' ;;
+  *) echo "unexpected gh api endpoint: \${1:-}" >&2; exit 9 ;;
+esac
+EOF
+  chmod +x "$dir/bin/gh"
+
+  cat >"$dir/findings.json" <<EOF
+{ "findings": [
+  { "path": "x", "line": 1, "priority": "P1", "comment_id": 1701, "body": "real.\n\n$SOLICIT" }
+] }
+EOF
+
+  # Ambient GH_TOKEN ONLY — no OP_PREFLIGHT_REVIEWER_PAT, no MERGEPATH_AGENT.
+  local rc4=0
+  (
+    cd "$dir"
+    env -u OP_PREFLIGHT_REVIEWER_PAT -u OP_PREFLIGHT_AGENT -u MERGEPATH_AGENT \
+      PATH="$dir/bin:$PATH" \
+      GH_TOKEN="$REVIEWER_PAT" \
+      CODEX_FEEDBACK_LEDGER="$dir/state/ledger.jsonl" \
+      GH_AS_REVIEWER_IDENTITY="nathanpayne-claude" \
+      "$dir/scripts/codex-record-feedback.sh" 999 owner/repo --findings-json findings.json --verdict 1701=fixed \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc4=$?
+  rc=$rc4
+
+  if [ "$rc" != "0" ]; then
+    fail "ambient-bridge: exit $rc, expected 0; stderr=$(cat "$dir/err.log")"
+  elif ! grep -q 'repos/owner/repo/pulls/comments/1701/reactions -f content=+1' "$dir/state/posts" 2>/dev/null; then
+    fail "ambient-bridge: reaction not POSTed via the real wrapper; posts=$(cat "$dir/state/posts" 2>/dev/null), stderr=$(cat "$dir/err.log")"
+  elif [ "$(head -1 "$dir/state/write-token" 2>/dev/null)" != "$REVIEWER_PAT" ]; then
+    fail "ambient-bridge: write did not run under the bridged reviewer PAT (token=$(head -1 "$dir/state/write-token" 2>/dev/null))"
+  elif [ "$(jq -r '.recorded[0].action' "$dir/out.json")" != "posted" ]; then
+    fail "ambient-bridge: action was $(jq -r '.recorded[0].action' "$dir/out.json" 2>/dev/null), expected posted"
+  else
+    pass "ambient GH_TOKEN bridges to the reviewer write path and posts under the verified reviewer identity"
+  fi
+}
+
+# Companion guard: the bridge must NOT clobber an explicit OP_PREFLIGHT_REVIEWER_PAT.
+# When the cached reviewer PAT is present it stays the resolved write token even if
+# ambient GH_TOKEN differs (ambient is only a fallback when no other source exists).
+test_explicit_reviewer_pat_not_clobbered_by_ambient() {
+  local dir rc
+  dir=$(make_real_wrapper_case "explicit-pat-wins")
+
+  local CACHED_PAT="cached-reviewer-pat-487"
+  local AMBIENT_TOKEN="ambient-read-token-487"
+  cat >"$dir/bin/gh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "\${1:-}" = "auth" ] && [ "\${2:-}" = "token" ]; then
+  echo "no stored token" >&2
+  exit 1
+fi
+[ "\${1:-}" = "api" ] || { echo "unexpected gh: \$*" >&2; exit 9; }
+shift
+if [ "\${1:-}" = "user" ]; then
+  # Only the CACHED reviewer PAT verifies as the reviewer.
+  if [ "\${GH_TOKEN:-}" = "$CACHED_PAT" ]; then
+    printf 'nathanpayne-claude\n'
+  else
+    printf 'somebody-else\n'
+  fi
+  exit 0
+fi
+[ "\${1:-}" = "--paginate" ] && shift
+case "\${1:-}" in
+  -X)
+    shift
+    [ "\${1:-}" = "POST" ] && shift
+    printf '%s\n' "\$*" >>"$dir/state/posts"
+    printf '%s\n' "\${GH_TOKEN:-}" >>"$dir/state/write-token"
+    exit 0
+    ;;
+  repos/owner/repo/pulls/comments/*/reactions) printf '[]\n' ;;
+  repos/owner/repo/issues/comments/*/reactions) printf '[]\n' ;;
+  *) echo "unexpected gh api endpoint: \${1:-}" >&2; exit 9 ;;
+esac
+EOF
+  chmod +x "$dir/bin/gh"
+
+  cat >"$dir/findings.json" <<EOF
+{ "findings": [
+  { "path": "x", "line": 1, "priority": "P1", "comment_id": 1801, "body": "real.\n\n$SOLICIT" }
+] }
+EOF
+
+  local rc5=0
+  (
+    cd "$dir"
+    env -u MERGEPATH_AGENT -u OP_PREFLIGHT_AGENT \
+      PATH="$dir/bin:$PATH" \
+      GH_TOKEN="$AMBIENT_TOKEN" \
+      OP_PREFLIGHT_REVIEWER_PAT="$CACHED_PAT" \
+      CODEX_FEEDBACK_LEDGER="$dir/state/ledger.jsonl" \
+      GH_AS_REVIEWER_IDENTITY="nathanpayne-claude" \
+      "$dir/scripts/codex-record-feedback.sh" 999 owner/repo --findings-json findings.json --verdict 1801=fixed \
+      >"$dir/out.json" 2>"$dir/err.log"
+  ) || rc5=$?
+  rc=$rc5
+
+  if [ "$rc" != "0" ]; then
+    fail "explicit-pat: exit $rc, expected 0; stderr=$(cat "$dir/err.log")"
+  elif [ "$(head -1 "$dir/state/write-token" 2>/dev/null)" != "$CACHED_PAT" ]; then
+    fail "explicit-pat: write ran under '$(head -1 "$dir/state/write-token" 2>/dev/null)', expected the cached PAT (ambient must not clobber)"
+  else
+    pass "an explicit OP_PREFLIGHT_REVIEWER_PAT is preferred; ambient GH_TOKEN does not clobber it"
+  fi
+}
+
 test_fixed_reacts_plus1_via_reviewer
 test_rebuttal_reacts_minus1
 test_no_solicitation_is_never_reacted
@@ -429,6 +614,8 @@ test_scan_is_head_pinned_to_latest_round
 test_issue_comment_endpoint_selected_by_location
 test_findings_from_stdin
 test_post_failure_exits_1_and_skips_ledger
+test_ambient_gh_token_bridges_to_reviewer_write
+test_explicit_reviewer_pat_not_clobbered_by_ambient
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

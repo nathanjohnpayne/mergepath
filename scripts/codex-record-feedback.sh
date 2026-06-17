@@ -310,6 +310,25 @@ fi
 
 AS_REVIEWER="$__CRF_DIR/gh-as-reviewer.sh"
 
+# Bridge an inline reviewer token to the write path (documented GH_TOKEN=<PAT>
+# invocation). gh-as-reviewer.sh re-resolves the reviewer credential via
+# gh-token-resolver.sh, whose source precedence is (1) $OP_PREFLIGHT_REVIEWER_PAT
+# then (2) `gh auth token --user <reviewer>` — it never reads ambient $GH_TOKEN.
+# So a caller that followed this helper's "GH_TOKEN=<reviewer PAT> ..." doc on a
+# fresh shell (no op-preflight cache, no stored gh auth token for the reviewer)
+# has its read/scan calls succeed on ambient $GH_TOKEN but its reaction POST fail
+# because the wrapper finds no reviewer-token source. When NO other source is
+# present, forward ambient $GH_TOKEN as $OP_PREFLIGHT_REVIEWER_PAT so the wrapper
+# can use it. Attribution is NOT weakened: gh-token-resolver.sh still verifies the
+# token with identity-check.sh --expect-token-identity "$REVIEWER_IDENTITY", so a
+# non-reviewer token fails closed and the byline stays the reviewer identity.
+if [ -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" ] && [ -n "${GH_TOKEN:-}" ]; then
+  if ! env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$REVIEWER_IDENTITY" >/dev/null 2>&1; then
+    export OP_PREFLIGHT_REVIEWER_PAT="$GH_TOKEN"
+    log "no cached/stored reviewer-token source; bridging ambient GH_TOKEN to the reviewer write path (verified as $REVIEWER_IDENTITY by gh-as-reviewer.sh)"
+  fi
+fi
+
 # Exact feedback solicitation Codex appends to every finding it wants graded.
 # Detection is substring-based so surrounding markdown/whitespace does not
 # defeat the match, but the phrase itself must appear verbatim.
