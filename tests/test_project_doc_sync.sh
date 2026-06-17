@@ -334,4 +334,36 @@ MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize >/
   || fail "F3 materialize should remove central spec mirror of a removed project"
 restore_manifest; resync
 
+# Read-only owner: central spec pruning must NOT require a writable owner
+# checkout — the owner is only read to enumerate sources, and the removal
+# target is the writable central repo. A clone-only owner (path_hint absent,
+# resolved via the read-only cache) must still get its central spec orphans
+# pruned on materialize.
+RO_CACHE="$WORKDIR/ro-owner-cache"
+mkdir -p "$RO_CACHE"
+git clone -q "$APP" "$RO_CACHE/app"
+cat >"$MANIFEST" <<EOF
+version: 1
+central_repo:
+  name: docs
+  repo: example/docs
+  path_hint: "$DOCS"
+projects:
+  - slug: app
+    owner:
+      name: app
+      repo: example/app
+      path_hint: "$WORKDIR/no-such-owner-checkout"
+    specs:
+      - source: specs/
+        mirror: projects/app/specs/
+EOF
+# A generated spec mirror with no matching source in the (cloned) owner.
+cp "$DOCS/projects/app/specs/feature.md" "$DOCS/projects/app/specs/ghost.md"
+MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_PROJECT_DOCS_CACHE="$RO_CACHE" \
+  "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null 2>&1
+[ ! -e "$DOCS/projects/app/specs/ghost.md" ] \
+  || fail "materialize should prune a central spec orphan via a read-only (clone) owner"
+restore_manifest; resync
+
 echo "PASS: project-doc-sync"

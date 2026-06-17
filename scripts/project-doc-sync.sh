@@ -394,45 +394,58 @@ prune_orphan_mirrors() {
     [ -z "$project" ] && continue
     in_project_filter "$project" || continue
 
-    # Resolve the owner. Require a local writable checkout in materialize mode
-    # (so a PRD-orphan rm targets the real repo, never a read-only cache clone)
-    # and read-only in audit. If unreachable, skip BOTH scans for this project
-    # rather than risk flagging every mirror as orphaned.
-    local owner_root owner_write=0
-    [ "$MODE" = "materialize" ] && owner_write=1
-    owner_root=$(resolve_repo "$owner_name" "$owner_repo" "$owner_hint" "$owner_write" 2>/dev/null) || continue
-
-    # PRD orphans (owner side): expected = the project's declared .prds[].mirror.
-    local prd_dir="$owner_root/docs/projects/$project/prds"
-    if [ -d "$prd_dir" ]; then
-      local prd_exp
-      prd_exp=$(mktemp "$RUN_TMPDIR/prd-exp.XXXXXX")
-      while IFS= read -r m; do
-        [ -n "$m" ] && printf '%s\n' "$owner_root/$m"
-      done < <(yq -r ".projects[] | select(.slug == \"$project\") | (.prds // [])[] | .mirror // \"\"" "$manifest") >"$prd_exp"
-      scan_orphan_dir "$prd_dir" "$central_repo" "$project" prd "$prd_exp" \
-        "$project prd" "$owner_name:docs/projects/$project/prds"
-      rm -f "$prd_exp"
-    fi
+    # Spec pruning only READS the owner (to enumerate current sources); the
+    # removal target is the writable central repo. So a read-only owner — a
+    # cloned one included — is sufficient, matching how process_specs mirrors
+    # specs from a read-only clone. Resolve read-only; an owner that is wholly
+    # unreachable is skipped rather than mass-flagging its mirrors.
+    local owner_ro=""
+    owner_ro=$(resolve_repo "$owner_name" "$owner_repo" "$owner_hint" 0 2>/dev/null) || owner_ro=""
 
     # spec orphans (central side): expected = mirrors of the owner's CURRENT
     # source spec files (empty when the source/mapping is gone → all stale).
-    local spec_dir="$central_root/projects/$project/specs"
-    if [ -d "$spec_dir" ]; then
-      local spec_exp
-      spec_exp=$(mktemp "$RUN_TMPDIR/spec-exp.XXXXXX")
-      while IFS=$'\t' read -r s_source s_mirror; do
-        if [ -z "$s_source" ] || [ -z "$s_mirror" ]; then continue; fi
-        local sdir="$owner_root/${s_source%/}"
-        [ -d "$sdir" ] || continue
-        while IFS= read -r sf; do
-          [ -z "$sf" ] && continue
-          printf '%s\n' "$central_root/${s_mirror%/}/${sf#"$sdir/"}"
-        done < <(find "$sdir" -type f -name '*.md' -print)
-      done < <(yq -r ".projects[] | select(.slug == \"$project\") | (.specs // [])[] | (.source // \"\") + \"\t\" + (.mirror // \"\")" "$manifest") >"$spec_exp"
-      scan_orphan_dir "$spec_dir" "$owner_repo" "$project" spec "$spec_exp" \
-        "$project spec" "$central_repo:projects/$project/specs"
-      rm -f "$spec_exp"
+    if [ -n "$owner_ro" ]; then
+      local spec_dir="$central_root/projects/$project/specs"
+      if [ -d "$spec_dir" ]; then
+        local spec_exp
+        spec_exp=$(mktemp "$RUN_TMPDIR/spec-exp.XXXXXX")
+        while IFS=$'\t' read -r s_source s_mirror; do
+          if [ -z "$s_source" ] || [ -z "$s_mirror" ]; then continue; fi
+          local sdir="$owner_ro/${s_source%/}"
+          [ -d "$sdir" ] || continue
+          while IFS= read -r sf; do
+            [ -z "$sf" ] && continue
+            printf '%s\n' "$central_root/${s_mirror%/}/${sf#"$sdir/"}"
+          done < <(find "$sdir" -type f -name '*.md' -print)
+        done < <(yq -r ".projects[] | select(.slug == \"$project\") | (.specs // [])[] | (.source // \"\") + \"\t\" + (.mirror // \"\")" "$manifest") >"$spec_exp"
+        scan_orphan_dir "$spec_dir" "$owner_repo" "$project" spec "$spec_exp" \
+          "$project spec" "$central_repo:projects/$project/specs"
+        rm -f "$spec_exp"
+      fi
+    fi
+
+    # PRD pruning removes files IN the owner repo, so materialize needs a local
+    # writable checkout (matching process_prds); audit can use the same
+    # read-only checkout. A clone-only owner in materialize is skipped here —
+    # process_prds already raised the error for its declared PRD mappings.
+    local owner_rw=""
+    if [ "$MODE" = "materialize" ]; then
+      owner_rw=$(resolve_repo "$owner_name" "$owner_repo" "$owner_hint" 1 2>/dev/null) || owner_rw=""
+    else
+      owner_rw="$owner_ro"
+    fi
+    if [ -n "$owner_rw" ]; then
+      local prd_dir="$owner_rw/docs/projects/$project/prds"
+      if [ -d "$prd_dir" ]; then
+        local prd_exp
+        prd_exp=$(mktemp "$RUN_TMPDIR/prd-exp.XXXXXX")
+        while IFS= read -r m; do
+          [ -n "$m" ] && printf '%s\n' "$owner_rw/$m"
+        done < <(yq -r ".projects[] | select(.slug == \"$project\") | (.prds // [])[] | .mirror // \"\"" "$manifest") >"$prd_exp"
+        scan_orphan_dir "$prd_dir" "$central_repo" "$project" prd "$prd_exp" \
+          "$project prd" "$owner_name:docs/projects/$project/prds"
+        rm -f "$prd_exp"
+      fi
     fi
   done <<< "$rows"
 
