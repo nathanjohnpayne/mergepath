@@ -1612,6 +1612,22 @@ sync_open_pr() {
         return 1
         ;;
     esac
+    # Stage the dest mode in the git INDEX, not just the working tree:
+    # under core.filemode=false (some consumer clones / mode-insensitive
+    # filesystems) the caller's blanket `git add -A` ignores the on-disk
+    # exec bit, so a mode-only flip on an existing tracked file would not
+    # be staged and the propagation PR would carry the wrong mode. Same
+    # fix the templated arm got in #471 (PR #475); extended to the
+    # canonical arms in #476 (executable canonical scripts are far more
+    # common than templated ones). A subsequent `git add -A` preserves an
+    # already-staged index mode (verified under core.filemode=false).
+    local idx_chmod
+    if [ "$src_mode" = "100755" ]; then idx_chmod="+x"; else idx_chmod="-x"; fi
+    if ! git -C "$workspace/repo" add -- "$target" \
+       || ! git -C "$workspace/repo" update-index --chmod="$idx_chmod" -- "$target"; then
+      err "$consumer_name: failed to stage dest mode ($idx_chmod) for $target"
+      return 1
+    fi
   done <<< "$targets"
 
   # Templated materialize — render mergepath@$sha's source templates
@@ -1993,6 +2009,17 @@ sync_all_open_pr() {
         return 1
         ;;
     esac
+    # Stage the dest mode in the git INDEX as well — see the sync_open_pr
+    # canonical arm above. Under core.filemode=false the caller's blanket
+    # `git add -A` drops a mode-only flip, so an executable canonical file
+    # would propagate non-executable (#476).
+    local idx_chmod
+    if [ "$src_mode" = "100755" ]; then idx_chmod="+x"; else idx_chmod="-x"; fi
+    if ! git -C "$workspace/repo" add -- "$target" \
+       || ! git -C "$workspace/repo" update-index --chmod="$idx_chmod" -- "$target"; then
+      err "$consumer_name: failed to stage dest mode ($idx_chmod) for $target"
+      return 1
+    fi
   done <<< "$canonical_targets"
 
   # Materialize kit directories with allow-extras semantics: copy every
@@ -2035,6 +2062,17 @@ sync_all_open_pr() {
           return 1
           ;;
       esac
+      # Stage the kit dest mode in the git INDEX as well — see the
+      # canonical arms above. Under core.filemode=false the caller's
+      # blanket `git add -A` drops a mode-only flip, so an executable kit
+      # file would propagate non-executable (#476).
+      local kit_idx_chmod
+      if [ "$kit_mode" = "100755" ]; then kit_idx_chmod="+x"; else kit_idx_chmod="-x"; fi
+      if ! git -C "$workspace/repo" add -- "$kit_file" \
+         || ! git -C "$workspace/repo" update-index --chmod="$kit_idx_chmod" -- "$kit_file"; then
+        err "$consumer_name: failed to stage kit dest mode ($kit_idx_chmod) for $kit_file"
+        return 1
+      fi
     done <<< "$kit_files"
   done <<< "$kit_targets"
 
