@@ -148,14 +148,14 @@ All agents author code as `nathanjohnpayne`, but each has a dedicated reviewer i
 - **Codex** reviews as `nathanpayne-codex`
 
 This allows:
-- Agents to perform self-peer review by switching identities
+- Agents to perform self-peer review by routing guarded writes through their reviewer identities
 - Internal review (agent → agent) and external review (agent → different agent)
 - Automated external review via CodeRabbit (advisory) and the ChatGPT Codex Connector GitHub App (Phase 4a)
 - A manual CLI fallback (Phase 4b) when the automated Codex path is unavailable or escalates
 - Complete audit trails indistinguishable from multi-developer collaboration
 - Human tiebreaking when agents disagree
 
-The active-identity convention is enforced by tooling: `scripts/gh-as-author.sh` (and `gh-as-reviewer.sh`) wrap any author-identity write (`gh pr create` / `merge` / label edit) in a single atomic switch → command → trap-restore process, and the `gh-pr-guard.sh` PreToolUse hook blocks a `gh pr create` running under the wrong active account. This closes the split-invocation footgun where a switch-create-switch sequence spread across separate shell calls could land a PR under the wrong identity.
+The write-identity convention is enforced by tooling: `scripts/gh-as-author.sh` and `scripts/gh-as-reviewer.sh` wrap guarded GitHub writes, resolve the expected token, verify the effective login, and run the command with process-local `GH_TOKEN`. The `gh-pr-guard.sh` PreToolUse hook blocks bare or inline-token guarded writes that bypass those wrappers. This closes the attribution footgun where a PR create, review, comment, edit, or merge could otherwise land under the wrong identity.
 
 #### Merge-Clearance Gate (HEAD-pinned)
 
@@ -487,7 +487,7 @@ Git hooks for local validation before pushing. Example:
 
 | Hook | Purpose |
 |------|---------|
-| `gh-pr-guard.sh` | PreToolUse hook: blocks `gh pr create` when the active `gh` account is not `nathanjohnpayne`, and enforces PR-body requirements |
+| `gh-pr-guard.sh` | PreToolUse hook: blocks bare or inline-token guarded GitHub writes and enforces wrapper/routing requirements |
 | `label-removal-guard.sh` | PreToolUse hook: prevents interactive agents from removing human-action labels directly |
 
 #### Review, merge, and audit helpers (top-level `scripts/`)
@@ -1147,18 +1147,17 @@ post the Phase 2 review in parallel to the authoring agent's session.
    two PATs (`ANTHROPIC_API_KEY`, `CLAUDE_PAT`) had to be stored as
    repo secrets on every repo, rotated, and audited — for no benefit.
 
-**Correct flow (Phase 2 in-session identity switch).** See
+**Correct flow (Phase 2 in-session identity routing).** See
 REVIEW_POLICY.md § Phase 2 and each repo's `CLAUDE.md` § "After
 opening the PR" steps 4–7. The authoring agent:
 
 1. Runs credential preflight so reviewer and author PATs are available
    for read-path API calls and helper scripts.
-2. Verifies the write-path identity with `gh config get -h github.com
-   user`; reviewer writes require the active keyring account to be the
-   agent reviewer identity.
-3. Reviews the PR under that active reviewer identity, posting review
-   comments or approvals through `gh pr review`.
-4. Switches back to `nathanjohnpayne` and addresses the feedback.
+2. Verifies reviewer read identity with the cached reviewer PAT, then
+   routes guarded review writes through `scripts/gh-as-reviewer.sh`.
+3. Reviews the PR under that verified reviewer identity, posting review
+   comments or approvals through the wrapper.
+4. Commits fixes as `nathanjohnpayne` and addresses the feedback.
 5. Loops until the reviewer identity submits an `APPROVED` review.
 
 The `assign` job still requests the correct reviewer identity as a
@@ -1376,9 +1375,9 @@ Each agent has a dedicated reviewer identity used **only for code review**:
 
 These accounts are **collaborators** on repos owned by `nathanjohnpayne`, not repo owners. They have Write access, allowing them to post reviews and approve PRs, but cannot merge (only `nathanjohnpayne` can merge).
 
-### Identity Switching for Agents
+### Identity Routing for Agents
 
-Identity switching has three layers, each handling a different concern:
+Identity routing has three layers, each handling a different concern:
 
 #### 1. Git commit identity (user.name / user.email)
 
@@ -1418,49 +1417,48 @@ git remote set-url origin git@github.com:nathanjohnpayne/repo-name.git
 `gh` has two relevant identity paths:
 
 - **Read paths** (`gh api user`, GET requests, `gh pr view`, `gh pr checks`) honor `GH_TOKEN`. Use the reviewer or author PAT from `scripts/op-preflight.sh` for these.
-- **Write paths** (`gh pr review`, `gh pr create`, `gh pr merge`, `gh pr edit`, and POST/PATCH API calls) use the keyring's active GitHub account. `GH_TOKEN` does not determine the byline for these commands. Verify the active account with `gh config get -h github.com user`; do not trust `gh auth status` when `GH_TOKEN` is set.
+- **Guarded write paths** (`gh pr create`, `gh pr merge`, `gh pr edit`, `gh pr comment`, `gh pr review`, `gh issue comment`) must go through `scripts/gh-as-author.sh` or `scripts/gh-as-reviewer.sh`. The wrappers resolve the expected token, verify its effective login, run the wrapped command with process-local `GH_TOKEN`, clear `GITHUB_TOKEN`, and never mutate the machine-global `gh` keyring.
+- **Bare or inline-token guarded writes** fail closed in `scripts/hooks/gh-pr-guard.sh`. `GH_TOKEN=... gh pr review ...`, `gh auth switch`, or a bare `gh pr review` is not an approved substitute for the wrapper because it does not prove the write is attributed to the expected identity.
 
 Use the PAT lookup table below for read-path identity checks and helper
-scripts. Use `scripts/gh-as-author.sh` for author-identity writes so the
-switch to `nathanjohnpayne`, the write, and the switch-back happen inside one
-process.
+scripts. Use `scripts/gh-as-author.sh` for author-identity writes and
+`scripts/gh-as-reviewer.sh` for reviewer-identity comments or reviews.
 
 ##### PAT lookup table
 
-| Agent | Reviewer Identity | 1Password Item ID | `op read` path |
-|-------|-------------------|-------------------|----------------|
-| Claude | `nathanpayne-claude` | `pvbq24vl2h6gl7yjclxy2hbote` | `op://Private/pvbq24vl2h6gl7yjclxy2hbote/token` |
-| Cursor | `nathanpayne-cursor` | `bslrih4spwxgookzfy6zedz5g4` | `op://Private/bslrih4spwxgookzfy6zedz5g4/token` |
-| Codex | `nathanpayne-codex` | `o6ekjxjjl5gq6rmcneomrjahpu` | `op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token` |
-| Human | `nathanjohnpayne` | `sm5kopwk6t6p3xmu2igesndzhe` | `op://Private/sm5kopwk6t6p3xmu2igesndzhe/token` |
+| Agent | Reviewer Identity | 1Password Item ID | Cached env var (primary) | `op read` path (setup-only fallback) |
+|-------|-------------------|-------------------|--------------------------|--------------------------------------|
+| Claude | `nathanpayne-claude` | `pvbq24vl2h6gl7yjclxy2hbote` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/pvbq24vl2h6gl7yjclxy2hbote/token` |
+| Cursor | `nathanpayne-cursor` | `bslrih4spwxgookzfy6zedz5g4` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/bslrih4spwxgookzfy6zedz5g4/token` |
+| Codex | `nathanpayne-codex` | `o6ekjxjjl5gq6rmcneomrjahpu` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token` |
+| Human | `nathanjohnpayne` | `sm5kopwk6t6p3xmu2igesndzhe` | `$OP_PREFLIGHT_AUTHOR_PAT` | `op://Private/sm5kopwk6t6p3xmu2igesndzhe/token` |
 
 ```bash
-# Read-path identity check
-GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
-  gh api user --jq '.login'
+# Read-path identity check after preflight
+GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq '.login'
 # expected: nathanpayne-claude
 
-# Write-path review: active keyring account is the byline
-gh config get -h github.com user
-# expected before reviewer writes: nathanpayne-claude
-gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
+# Write-path review: wrapper verifies reviewer token and byline
+GH_AS_REVIEWER_IDENTITY=nathanpayne-claude \
+  scripts/gh-as-reviewer.sh -- gh pr review <PR#> --repo <owner/repo> --approve --body "Review comment"
 
-# Author write: use the wrapper, never split switch/create/switch-back
+# Author write: wrapper verifies author token and byline
 scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
 ```
 
 Use the item ID from the lookup table above for your agent identity. Do not use
-the 1Password item title. If `op whoami` says not signed in, still run the
-preflight command or `op read ...` in an interactive TTY to trigger the
-biometric prompt. `Review Can not approve your own pull request` usually means
-the active keyring account is still the PR author (`nathanjohnpayne`) rather
-than the reviewer identity; fix with `gh auth switch -u nathanpayne-<agent>`
-before posting the review.
+the 1Password item title. If `op whoami` says not signed in, run the preflight
+command in an interactive TTY so the session cache is populated once, then use
+the cached env vars. `Review Can not approve your own pull request` usually
+means the effective token is still the PR author (`nathanjohnpayne`) rather than
+the reviewer identity; rerun preflight and route the review through
+`GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- ...`
+instead of changing global `gh` account selection.
 
 These mechanisms coexist: SSH keys handle git transport, PATs authenticate
-read-path API/helper calls, the active `gh` account determines write bylines,
-and git config handles commit attribution. All switching must be **fully
-automated within the agent's session**—no human intervention required.
+read-path API/helper calls, the write wrappers determine guarded `gh` write
+bylines, and git config handles commit attribution. All identity routing must be
+**fully automated within the agent's session**—no human intervention required.
 
 ### The Review Workflow
 
@@ -1484,9 +1482,9 @@ The review path is explicit by agent: unknown agents fail closed, the reviewer P
 
 #### Phase 2: Internal Self-Peer Review
 
-5. Agent switches to its reviewer identity (`nathanpayne-claude`)
+5. Agent routes review writes through its reviewer wrapper identity (`nathanpayne-claude`)
 6. Reviews the PR and posts comments with specific, actionable feedback
-7. Agent switches back to `nathanjohnpayne` and addresses each comment, pushing fix commits
+7. Agent commits fixes as `nathanjohnpayne` and addresses each comment, pushing fix commits
 8. Steps 5–7 repeat until the reviewer identity approves with no outstanding issues
 
 All review rounds are captured as GitHub PR comments and commits, creating an audit trail indistinguishable from multi-developer collaboration.
@@ -2164,7 +2162,7 @@ than every editor-specific file in the repository.
 | `scripts/firebase/op-firebase-setup` | Bash | First-time project setup | One-time per project |
 | `scripts/gh-as-author.sh` | Bash | Run author-identity GitHub writes safely | PR create/merge/label writes |
 | `scripts/gh-as-reviewer.sh` | Bash | Run reviewer-identity GitHub writes safely | Review/comment writes |
-| `scripts/hooks/gh-pr-guard.sh` | Bash | Guard PR creation under the wrong active account | PreToolUse hook |
+| `scripts/hooks/gh-pr-guard.sh` | Bash | Guard GitHub writes that bypass token-verifying wrappers | PreToolUse hook |
 | `scripts/hooks/label-removal-guard.sh` | Bash | Block interactive agent removal of human-action labels | PreToolUse hook |
 | `scripts/merge-clearance-gate.sh` | Bash | HEAD-pinned merge-clearance gate body (#427/#428) | Required check on PR/review/push |
 | `scripts/codex-p1-gate.sh` | Bash | Codex P1 unresolved-thread merge gate body | Required check (`codex-p1-gate.yml`) |
