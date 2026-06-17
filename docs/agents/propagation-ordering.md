@@ -36,7 +36,8 @@ pairs become verification. Public/simple repos last = cheap confirmation.
 Before any fan-out, sync ONE consumer and get its PR green:
 
 ```bash
-scripts/sync-to-downstream.sh --repos <canary>
+# --repos narrows the --sync-all mode to a single consumer (it is a filter, not a mode)
+scripts/sync-to-downstream.sh --sync-all --repos <canary>
 ```
 
 Pick the canary by the **dominant risk of this change**:
