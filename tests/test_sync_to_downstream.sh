@@ -796,6 +796,13 @@ grep -q 'chmod -x "$consumer_target"' "$SCRIPT" \
 grep -q 'chmod +x "$consumer_target"' "$SCRIPT" \
   || fail "sync_open_pr is missing the 'chmod +x' branch"
 
+# Templated render must additionally stage the dest mode in the git INDEX
+# (not only the working-tree chmod): under core.filemode=false the blanket
+# `git add -A` ignores the on-disk exec bit, so a mode-only flip would not be
+# committed (Codex P2 on PR #475). Assert the index-staging is present.
+grep -q 'update-index --chmod="$tpl_idx_chmod"' "$SCRIPT" \
+  || fail "templated render is missing the 'git update-index --chmod' index-mode staging — mode flips would be lost under core.filemode=false (#475)"
+
 # ---------------------------------------------------------------------------
 # Deletion propagation + tmpdir portability (cursor CHANGES_REQUESTED on
 # PR #217). Two source-grep assertions because the live cycle isn't

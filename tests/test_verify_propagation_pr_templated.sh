@@ -341,6 +341,13 @@ git_quiet -C "$MP8" add -A
 git_quiet -C "$MP8" update-index --chmod=+x examples/source.tpl
 git_quiet -C "$MP8" commit -q -m mp
 chmod -x "$MP8/examples/source.tpl"   # on-disk bit now disagrees with git (100755)
+# Assert the precondition actually held: if the filesystem ignored chmod -x
+# (mode-insensitive FS), the on-disk bit would still be set and Case 8 would
+# pass for the WRONG reason (filesystem read also seeing 100755), not because
+# the verifier read the git tree. Fail loudly instead (CodeRabbit on PR #475).
+if [ -x "$MP8/examples/source.tpl" ]; then
+  fail "Case 8 precondition: chmod -x did not clear the on-disk exec bit (mode-insensitive FS); discriminator invalid"
+else
 C8="$WORKDIR/c8"; build_consumer "$C8" "$EXEC_TEMPLATE8" 100755
 run_verify "$MP8" "$C8"
 if [ "$RC" -ne 0 ]; then
@@ -348,6 +355,7 @@ if [ "$RC" -ne 0 ]; then
   { echo "stderr:"; sed 's/^/  /' "$STDERR_FILE"; } >&2
 else
   pass "Case 8: source mode read from git tree (on-disk bit cleared) → exec dest passes"
+fi
 fi
 
 echo ""
