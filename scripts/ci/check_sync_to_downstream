@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# scripts/ci/check_sync_to_downstream — CI entry point for the
+# sync-to-downstream propagation engine test suite (#488).
+#
+# Wraps tests/test_sync_to_downstream.sh so it runs as an explicit
+# repo_lint.yml step (and is enforced wired by check_ci_scripts_wired,
+# #269). The suite carries the structural regression guards for
+# scripts/sync-to-downstream.sh — the executable-bit mode-mirror chmod
+# branches (#217), mktemp portability, and the git-index mode staging
+# that keeps propagation core.filemode-robust (templated #475,
+# canonical/kit #476). Until this wrapper existed the suite was not run
+# in CI, so those assertions gated nothing on PRs. Mirrors the pattern
+# used by check_sync_overrides and the other check_* scripts here.
+#
+# Requires mikefarah/yq (the test SKIPs without it); repo_lint.yml runs
+# this step AFTER install_yq_for_sync_manifest so the suite actually
+# executes rather than self-skipping.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_sync_to_downstream.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  # Missing test script is a hard error, not a skip — a silent skip
+  # would let an accidental delete/rename disable this check without
+  # surfacing in CI (same rationale as check_sync_overrides, CodeRabbit
+  # Major on PR #228).
+  echo "check_sync_to_downstream: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"

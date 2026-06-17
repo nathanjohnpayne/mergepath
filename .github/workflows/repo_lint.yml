@@ -226,6 +226,16 @@ jobs:
         # mirror lane silently re-overwriting them.
         run: ./scripts/ci/check_sync_overrides
 
+      - name: check_sync_to_downstream
+        # Exercises tests/test_sync_to_downstream.sh — the propagation
+        # engine suite that structurally guards scripts/sync-to-downstream.sh:
+        # the executable-bit mode-mirror chmod branches (#217), mktemp
+        # portability, and the git-index mode staging that keeps
+        # propagation core.filemode-robust (templated #475, canonical/kit
+        # #476). Ordered after install_yq_for_sync_manifest so the suite
+        # runs rather than self-skipping on a missing yq. Wired in #488.
+        run: ./scripts/ci/check_sync_to_downstream
+
       - name: check_template_substitution
         # Exercises tests/test_template_substitution.sh — verifies the
         # Layer 5 template-substitution lib's v1 syntax (variable
