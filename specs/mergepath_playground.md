@@ -62,7 +62,9 @@ reserved, see [`BRAND.md`](../BRAND.md).
 - **Accessibility.** The modal is a true dialog: `role="dialog"`,
   `aria-modal`, `aria-labelledby`, `aria-describedby`, focus moves
   into the dialog on open and returns to the trigger on close, Tab
-  wraps within the dialog, Escape closes. An `aria-live="polite"`
+  wraps within the dialog, and the modal closes on Escape **or** on a
+  click on the backdrop outside the dialog surface (the backdrop click
+  is ignored when it originates inside the dialog). An `aria-live="polite"`
   region announces path add/remove, preset application, YAML and
   command copy. Reduced-motion preferences are respected.
 - **PR normalization.** Injected PR entries are coerced through a
