@@ -800,7 +800,7 @@
             <span>Lines changed at or above this value escalate to Phase 4.</span>
           </div>
           <div class="slider-row">
-            <input type="range" id="threshold" min="50" max="1000" step="10" value="300" />
+            <input type="range" id="threshold" min="50" max="1000" step="10" value="300" aria-label="External review threshold (lines changed)" />
             <span class="val"><span id="thresholdVal">300</span> lines</span>
           </div>
         </div>
@@ -830,7 +830,7 @@
             <span>Advisory auto-review on PR open.</span>
           </div>
           <label class="switch">
-            <input type="checkbox" data-toggle="coderabbit" checked />
+            <input type="checkbox" data-toggle="coderabbit" checked aria-label="Enable CodeRabbit advisory auto-review" />
             <span class="track"></span>
           </label>
         </div>
@@ -841,13 +841,13 @@
             <span>Phase 4a automated external review.</span>
           </div>
           <label class="switch">
-            <input type="checkbox" data-toggle="codex" checked />
+            <input type="checkbox" data-toggle="codex" checked aria-label="Enable Codex GitHub App external review" />
             <span class="track"></span>
           </label>
         </div>
         <div class="nested shown" id="codexNested">
           <div class="slider-row">
-            <input type="range" id="codexRounds" min="1" max="5" step="1" value="2" />
+            <input type="range" id="codexRounds" min="1" max="5" step="1" value="2" aria-label="Codex maximum review rounds" />
             <span class="val">max <span id="codexRoundsVal">2</span> rounds</span>
           </div>
           <p class="hint">Beyond this, Mergepath stops the loop and pings a human.</p>
@@ -955,7 +955,9 @@
   // ---------------------------------------------------------------------
   const DEFAULTS = {
     threshold: 300,
-    protectedPaths: ['src/auth/**', 'src/payments/**', '.github/**', 'credentials/**'],
+    // Mirrors external_review_paths in .github/review-policy.yml — keep the
+    // two in sync (#470). Drift here misrepresents how the real gate routes.
+    protectedPaths: ['src/auth/**', 'src/payments/**', '**/*secret*', '**/*credential*', '.github/**'],
     coderabbit: true,
     codex: true,
     codexRounds: 2,
@@ -984,7 +986,7 @@
   // ---------------------------------------------------------------------
   const SYNTHETIC_PRS = [
     { id: '#142', title: 'Fix footer copyright year',            author: 'claude', lines: 2,   paths: ['src/components/Footer.tsx'] },
-    { id: '#141', title: 'Rotate Stripe webhook secret',         author: 'codex',  lines: 15,  paths: ['src/payments/webhook.ts', 'credentials/stripe.yml'] },
+    { id: '#141', title: 'Rotate Stripe webhook secret',         author: 'codex',  lines: 15,  paths: ['src/payments/webhook.ts', 'infra/stripe.credentials.json'] },
     { id: '#140', title: 'Add dark mode toggle',                 author: 'cursor', lines: 183, paths: ['src/components/Layout.tsx', 'src/hooks/useTheme.ts'] },
     { id: '#139', title: 'Refactor billing module',              author: 'claude', lines: 421, paths: ['src/payments/billing.ts', 'src/payments/invoice.ts'], forcedRounds: 2 },
     { id: '#138', title: 'Migrate users table (email_verified)', author: 'codex',  lines: 287, paths: ['db/migrations/20260414_users_verified.sql', 'src/auth/User.ts'] },
@@ -1339,7 +1341,17 @@
   function applyPreset(name) {
     const p = PRESETS[name];
     if (!p) return;
-    Object.assign(state, p);
+    // A preset is a complete starting point, not a partial overlay (#470):
+    // reset the ENTIRE policy to defaults first, then apply the preset's
+    // overrides, so fields a preset does not mention — protected paths and
+    // reviewers — return to a known state instead of retaining the user's
+    // prior edits. Without this, switching presets left stale paths/reviewers
+    // and the rendered policy no longer matched the named preset.
+    const fresh = (typeof structuredClone === 'function')
+      ? structuredClone(DEFAULTS)
+      : JSON.parse(JSON.stringify(DEFAULTS));
+    Object.assign(state, fresh, p);
+    // Re-sync every control from state, not just the four the preset sets.
     $('threshold').value = state.threshold;
     $('thresholdVal').textContent = state.threshold;
     $('codexRounds').value = state.codexRounds;
@@ -1347,7 +1359,10 @@
     document.querySelector('[data-toggle="coderabbit"]').checked = state.coderabbit;
     document.querySelector('[data-toggle="codex"]').checked = state.codex;
     $('codexNested').classList.toggle('shown', state.codex);
-    renderAll();
+    document.querySelectorAll('[data-reviewer]').forEach(cb => {
+      cb.checked = !!state.reviewers[cb.dataset.reviewer];
+    });
+    renderAll();  // re-renders the protected-path chips from the reset state
     announce('Applied ' + name + ' preset.');
   }
   document.querySelectorAll('[data-preset]').forEach(b => {
@@ -1475,21 +1490,25 @@
   // prevents the mirrored assignment from re-firing the opposite
   // handler into an infinite loop.
   //
-  // Either pane can lose its internal scroll range depending on
-  // viewport size and content — most reliably the workspace at the
-  // ≤960px stacked-layout breakpoint. We wire up listeners
-  // unconditionally and let the sMax/tMax guard below no-op when
-  // either side has nothing to scroll. Simpler than attaching and
-  // detaching on resize transitions.
+  // The columns sit side by side only ABOVE the ≤960px breakpoint; at or
+  // below it the CSS @media block stacks them vertically and each becomes
+  // an ordinary block in page flow. Mirroring rail↔workspace scroll in that
+  // stacked layout is meaningless and fights the user, so gate the mirror
+  // on the SAME media query the CSS uses, read live on each scroll. Reading
+  // matchMedia at scroll time avoids attaching/detaching listeners across
+  // resize transitions. (#470 — the prior version wired the sync
+  // unconditionally and relied only on the sMax/tMax no-op, which does NOT
+  // disable it when both stacked panes still have internal scroll range.)
   // ---------------------------------------------------------------------
   function initSyncScroll() {
     const rail = document.querySelector('.rail');
     const workspace = document.querySelector('.workspace');
     if (!rail || !workspace) return;
+    const stacked = window.matchMedia('(max-width: 960px)');
     let syncing = false;
     function mirror(source, target) {
       return () => {
-        if (syncing) return;
+        if (syncing || stacked.matches) return;
         const sMax = source.scrollHeight - source.clientHeight;
         const tMax = target.scrollHeight - target.clientHeight;
         if (sMax <= 0 || tMax <= 0) return;
