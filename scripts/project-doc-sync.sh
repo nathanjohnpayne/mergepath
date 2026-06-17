@@ -153,7 +153,14 @@ resolve_repo() {
 repo_ref() {
   local root=$1 path=${2:-}
   local ref
-  ref=$(git -C "$root" rev-parse --short HEAD 2>/dev/null || printf 'unknown')
+  if [ -n "$path" ]; then
+    ref=$(git -C "$root" log -n 1 --format=%h -- "$path" 2>/dev/null || true)
+  else
+    ref=""
+  fi
+  if [ -z "$ref" ]; then
+    ref=$(git -C "$root" rev-parse --short HEAD 2>/dev/null || printf 'unknown')
+  fi
   if [ "$ref" != "unknown" ]; then
     local path_args=()
     if [ -n "$path" ]; then
