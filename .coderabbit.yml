@@ -31,14 +31,20 @@ reviews:
     # a future default flip can't silently change it). This is what lets a
     # reviewer-identity fix-commit loop get a fresh CodeRabbit pass per push.
     auto_incremental_review: true
-    # auto_pause_after_reviewed_commits is INTENTIONALLY NOT SET here — it
-    # is owned by #490 (auto-review re-invocation / paused-state handling).
-    # Unset means we inherit CodeRabbit's default of 5: after 5 reviewed
-    # commits since the last pause, incremental review auto-pauses (a
-    # "Reviews paused" NOTE, marker `review paused by coderabbit.ai`), which
-    # on long agent-loop PRs reads as "no review yet". The deliberate value +
-    # the coderabbit-wait.sh `paused` state land in #490; do not pin it here.
-    # See docs/agents/coderabbit-audit.md § auto_pause_after_reviewed_commits.
+    # auto_pause_after_reviewed_commits — DELIBERATE, not the inherited
+    # default of 5 (#490). After this many reviewed commits CodeRabbit
+    # auto-pauses incremental review and posts a "Reviews paused" NOTE; it
+    # does NOT auto-resume. Our agent loop pushes many fix-up commits per PR
+    # (internal review → CodeRabbit rounds → Codex P0/P1 rounds), so a long
+    # PR routinely crosses 5 and silently stops being reviewed mid-flight —
+    # exactly the #485 failure. Raising the threshold to 15 keeps a normal
+    # multi-round PR under the cap while still bounding runaway commit floods.
+    # The runtime safety net for PRs that still cross it is
+    # scripts/coderabbit-wait.sh, which detects the pause marker and posts
+    # `@coderabbitai resume` (bounded by coderabbit.max_resume_retries in
+    # .github/review-policy.yml) rather than timing out. See
+    # docs/agents/coderabbit-audit.md § auto_pause_after_reviewed_commits.
+    auto_pause_after_reviewed_commits: 15
 
   # profile: chill (the default) suppresses 🧹 Nitpick comments entirely
   # — per CodeRabbit's docs, the Nitpick category is "only in Assertive

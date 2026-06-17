@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TESTS=(
   "$REPO_ROOT/tests/test_coderabbit_wait_status_probe.sh"
   "$REPO_ROOT/tests/test_coderabbit_wait_identity_derivation.sh"
+  "$REPO_ROOT/tests/test_coderabbit_wait_paused.sh"
 )
 
 if [ ! -x "$REPO_ROOT/scripts/coderabbit-wait.sh" ]; then
@@ -25,4 +26,6 @@ echo "check_coderabbit_wait: running coderabbit-wait status-probe tests"
 "${TESTS[0]}"
 echo "check_coderabbit_wait: running coderabbit-wait identity-derivation tests (#438)"
 "${TESTS[1]}"
+echo "check_coderabbit_wait: running coderabbit-wait paused/skip tests (#490)"
+"${TESTS[2]}"
 echo "check_coderabbit_wait: PASS"
