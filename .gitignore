@@ -38,6 +38,10 @@ logs/
 .cursor/cache/
 .cursor/state/
 .cursor/plans/
+# Codex feedback verdict ledger (#487) — runtime operational state written
+# by scripts/codex-record-feedback.sh; read by the rollup / pr-audit, never
+# committed.
+.mergepath/
 
 # Testing
 coverage/

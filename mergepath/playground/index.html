@@ -393,6 +393,17 @@
   .nested.shown { display: block; }
   .nested .slider-row { margin-top: 0; }
   .nested .hint { color: var(--soft); font-size: 11px; margin-top: 6px; }
+  .check-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: 10px;
+    cursor: pointer;
+  }
+  .check-row input[type=checkbox] { accent-color: var(--accent); width: 14px; height: 14px; margin-top: 2px; }
+  .check-row .check-copy { display: flex; flex-direction: column; gap: 1px; }
+  .check-row .check-copy .ttl { font-size: 12px; }
+  .check-row .check-copy .sub { color: var(--soft); font-size: 11px; }
 
   /* Reviewers */
   .reviewer {
@@ -851,6 +862,13 @@
             <span class="val">max <span id="codexRoundsVal">2</span> rounds</span>
           </div>
           <p class="hint">Beyond this, Mergepath stops the loop and pings a human.</p>
+          <label class="check-row" for="codexRequestByDefault">
+            <input type="checkbox" id="codexRequestByDefault" data-toggle="codexRequestByDefault" checked aria-label="Request @codex review on every PR" />
+            <span class="check-copy">
+              <span class="ttl">Request <span class="mono">@codex</span> on every PR</span>
+              <span class="sub">Trigger Phase 4a on all PRs, not just above-threshold.</span>
+            </span>
+          </label>
         </div>
       </div>
 
@@ -961,13 +979,17 @@
     coderabbit: true,
     codex: true,
     codexRounds: 2,
+    // Request `@codex review` on every PR, not only above-threshold ones
+    // (#486). Mirrors codex.request_by_default in review-policy.yml; the
+    // owner-decided default is on (#483).
+    codexRequestByDefault: true,
     reviewers: { claude: true, cursor: true, codex: true },
   };
 
   const PRESETS = {
-    strict:   { threshold: 100, coderabbit: true,  codex: true,  codexRounds: 3 },
-    standard: { threshold: 300, coderabbit: true,  codex: true,  codexRounds: 2 },
-    loose:    { threshold: 800, coderabbit: false, codex: false, codexRounds: 1 },
+    strict:   { threshold: 100, coderabbit: true,  codex: true,  codexRounds: 3, codexRequestByDefault: true  },
+    standard: { threshold: 300, coderabbit: true,  codex: true,  codexRounds: 2, codexRequestByDefault: true  },
+    loose:    { threshold: 800, coderabbit: false, codex: false, codexRounds: 1, codexRequestByDefault: true  },
   };
 
   const LIMITS = {
@@ -1085,18 +1107,30 @@
     const protectedHit = pr.paths.some(p => state.protectedPaths.some(pat => matchGlob(p, pat)));
     const gated = overThreshold || protectedHit;
 
+    // Codex is requested when EITHER the PR is threshold/path-gated, OR
+    // request-by-default is on (#486) — in which case every PR gets the
+    // Phase 4a leg, not only above-threshold ones. Both require the Codex
+    // toggle to be enabled; with Codex off, a gated PR falls to the
+    // manual Phase 4b handoff and an ungated PR gets no external leg.
+    const requestByDefault = state.codex && state.codexRequestByDefault;
+    const codexLeg = state.codex && (gated || requestByDefault);
+
     if (gated) {
       phases.push({ key: 'p3', label: 'Phase 3', note: 'Threshold gate' });
-      if (state.codex) {
-        const rounds = Math.max(1, Math.min(pr.forcedRounds || 1, state.codexRounds));
-        phases.push({ key: 'p4a', label: 'Phase 4a', note: 'Codex · ' + rounds + ' round' + (rounds === 1 ? '' : 's') });
-      } else {
-        phases.push({ key: 'p4b', label: 'Phase 4b', note: 'Manual handoff' });
-      }
+    }
+    if (codexLeg) {
+      const rounds = Math.max(1, Math.min(pr.forcedRounds || 1, state.codexRounds));
+      const note = gated
+        ? 'Codex · ' + rounds + ' round' + (rounds === 1 ? '' : 's')
+        : 'Codex · requested by default';
+      phases.push({ key: 'p4a', label: 'Phase 4a', note });
+    } else if (gated) {
+      // Gated but Codex off ⇒ manual handoff.
+      phases.push({ key: 'p4b', label: 'Phase 4b', note: 'Manual handoff' });
     }
 
     phases.push({ key: 'merge', label: 'Merged', note: '' });
-    return { phases, gated, overThreshold, protectedHit };
+    return { phases, gated, overThreshold, protectedHit, codexLeg };
   }
 
   // ---------------------------------------------------------------------
@@ -1210,6 +1244,9 @@
     add('k', 'enabled'); yaml.appendChild(document.createTextNode(': '));
     add('v', String(state.codex)); nl();
     if (state.codex) {
+      yaml.appendChild(document.createTextNode('  '));
+      add('k', 'request_by_default'); yaml.appendChild(document.createTextNode(': '));
+      add('v', String(state.codexRequestByDefault)); nl();
       yaml.appendChild(document.createTextNode('  '));
       add('k', 'max_review_rounds'); yaml.appendChild(document.createTextNode(': '));
       add('v', String(state.codexRounds)); nl();
@@ -1358,6 +1395,7 @@
     $('codexRoundsVal').textContent = state.codexRounds;
     document.querySelector('[data-toggle="coderabbit"]').checked = state.coderabbit;
     document.querySelector('[data-toggle="codex"]').checked = state.codex;
+    document.querySelector('[data-toggle="codexRequestByDefault"]').checked = state.codexRequestByDefault;
     $('codexNested').classList.toggle('shown', state.codex);
     document.querySelectorAll('[data-reviewer]').forEach(cb => {
       cb.checked = !!state.reviewers[cb.dataset.reviewer];
