@@ -83,6 +83,14 @@ echo "$out" | grep -q "MISS  app prd:app" \
 echo "$out" | grep -q "MISS  app spec:feature" \
   || fail "initial audit should report missing app spec mirror: $out"
 
+set +e
+out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --projects typo --no-clone 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "unknown project filter should fail closed (rc=$rc): $out"
+echo "$out" | grep -q "unknown project in --projects: typo" \
+  || fail "unknown project filter should name the bad slug: $out"
+
 MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >"$WORKDIR/project-doc-sync-materialize.out"
 
 [ -f "$APP/docs/projects/app/prds/app.md" ] \
@@ -104,6 +112,16 @@ grep -q "source_repo: example/app" "$DOCS/projects/app/specs/feature.md" \
 out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] || fail "audit should pass after materialize (rc=$rc): $out"
+
+LINK_TARGET="$WORKDIR/symlink-target.txt"
+printf 'do not clobber\n' >"$LINK_TARGET"
+rm "$APP/docs/projects/app/prds/app.md"
+ln -s "$LINK_TARGET" "$APP/docs/projects/app/prds/app.md"
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
+[ ! -L "$APP/docs/projects/app/prds/app.md" ] \
+  || fail "materialize should replace symlinked PRD destination with a regular file"
+[ "$(cat "$LINK_TARGET")" = "do not clobber" ] \
+  || fail "materialize followed and clobbered symlink destination"
 
 rm "$APP/specs/old.md"
 set +e

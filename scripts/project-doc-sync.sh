@@ -224,7 +224,10 @@ compare_or_materialize() {
   local label=$1 expected=$2 target=$3
   if [ "$MODE" = "materialize" ]; then
     mkdir -p "$(dirname "$target")"
-    cp "$expected" "$target"
+    local tmp_target
+    tmp_target=$(mktemp "$(dirname "$target")/.project-doc-sync.XXXXXX")
+    cp "$expected" "$tmp_target"
+    mv -f "$tmp_target" "$target"
     printf "WRITE %s\n" "$label"
     return 0
   fi
@@ -258,6 +261,30 @@ handle_orphan_spec_mirror() {
   fi
   printf "DRIFT %s\n" "$label"
   DRIFT_FOUND=1
+}
+
+validate_project_filter() {
+  local manifest=$1
+  [ -z "$FILTER_PROJECTS" ] && return 0
+
+  local known=","
+  local slug
+  while IFS= read -r slug; do
+    [ -n "$slug" ] || continue
+    known="${known}${slug},"
+  done < <(yq -r '.projects[].slug' "$manifest")
+
+  local old_ifs=$IFS
+  IFS=,
+  for slug in $FILTER_PROJECTS; do
+    [ -n "$slug" ] || continue
+    if [[ "$known" != *",$slug,"* ]]; then
+      err "unknown project in --projects: $slug"
+      IFS=$old_ifs
+      exit 2
+    fi
+  done
+  IFS=$old_ifs
 }
 
 process_prds() {
@@ -394,6 +421,7 @@ require_yq
 require_manifest
 
 manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
+validate_project_filter "$manifest"
 central_name=$(yq -r '.central_repo.name' "$manifest")
 central_repo=$(yq -r '.central_repo.repo' "$manifest")
 central_hint=$(yq -r '.central_repo.path_hint // ""' "$manifest")
