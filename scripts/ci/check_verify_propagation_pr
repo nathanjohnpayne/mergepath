@@ -11,14 +11,25 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TEST_SCRIPT="$REPO_ROOT/tests/test_verify_propagation_pr.sh"
 
-if [ ! -f "$TEST_SCRIPT" ]; then
-  # Missing test script is a hard error, not a skip — silent-skip
-  # would let an accidental delete/rename disable this check
-  # without surfacing in CI.
-  echo "check_verify_propagation_pr: ERROR (missing $TEST_SCRIPT)" >&2
-  exit 1
-fi
+# The verifier and its segment-local protected-path matcher
+# (scripts/workflow/match_protected_paths.sh, #471) are both
+# security-load-bearing for the propagation lane, so both test suites are
+# hard CI gates here.
+TESTS=(
+  "tests/test_verify_propagation_pr.sh"
+  "tests/test_match_protected_paths.sh"
+)
 
-bash "$TEST_SCRIPT"
+for rel in "${TESTS[@]}"; do
+  full="$REPO_ROOT/$rel"
+  if [ ! -f "$full" ]; then
+    # Missing test script is a hard error, not a skip — silent-skip
+    # would let an accidental delete/rename disable this check
+    # without surfacing in CI.
+    echo "check_verify_propagation_pr: ERROR (missing $rel)" >&2
+    exit 1
+  fi
+  echo "check_verify_propagation_pr: running $rel"
+  bash "$full"
+done

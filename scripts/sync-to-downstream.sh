@@ -781,6 +781,20 @@ materialize_templated_targets() {
       return 1
     fi
     rm -f "$tpl_tmp"
+    # Mirror the source template's executable bit onto the rendered dest
+    # (#471): a templated source can be executable, and render_to writes via
+    # shell redirection (mode 644), so without this an executable templated
+    # script would land non-executable in the consumer. Same shape as the
+    # canonical mirror arm.
+    tpl_src_mode=$(git -C "$MERGEPATH_ROOT" ls-tree "$sha" -- "$tpl_source" | awk '{print $1}')
+    case "$tpl_src_mode" in
+      100755) chmod +x "$tpl_consumer_target" ;;
+      100644) chmod -x "$tpl_consumer_target" ;;
+      *)
+        err "$consumer_name: unexpected git mode '$tpl_src_mode' for templated source $tpl_source at mergepath@$short_sha"
+        return 1
+        ;;
+    esac
     printf "  ✎ %s rendered %s → %s\n" "$consumer_name" "$tpl_source" "$tpl_dest"
   done
 }

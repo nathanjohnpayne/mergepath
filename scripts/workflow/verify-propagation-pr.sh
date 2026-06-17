@@ -339,12 +339,26 @@ if [ "$TEMPLATED_SURFACE_ACTIVE" = "1" ] && [ -n "$CONSUMER_NAME" ]; then
         # the templated arm was byte-only while the canonical loop's
         # tree-entry compare (mode + type + oid via `git ls-tree`)
         # was being skipped via the VERIFIED_TEMPLATED_DESTS exempt.
+        # Derive the SOURCE template's expected mode from the trusted
+        # mergepath checkout (#471): a templated source can be executable
+        # (e.g. a templated shell script), so the rendered dest must inherit
+        # the SOURCE mode rather than a hardcoded 100644. The source is
+        # confirmed present above; read its on-disk exec bit (in production
+        # MERGEPATH_DIR is a git checkout, so this matches the recorded git
+        # mode, consistent with the templated arm's existing on-disk source
+        # handling). Compare mode+type only — the render changes content by
+        # design, so the oid legitimately differs.
+        if [ -x "$mp_source_abs" ]; then
+          tpl_source_entry="100755 blob"
+        else
+          tpl_source_entry="100644 blob"
+        fi
         tpl_consumer_entry=$(git -C "$CONSUMER_DIR" ls-tree "$HEAD_SHA" -- "$tpl_dest" 2>/dev/null | awk '{print $1, $2}')
-        if [ "$tpl_consumer_entry" != "100644 blob" ]; then
+        if [ "$tpl_consumer_entry" != "$tpl_source_entry" ]; then
           {
-            echo "verify-propagation-pr.sh: templated dest $tpl_dest has unexpected tree entry [$tpl_consumer_entry], expected [100644 blob] (mode/type tampering — chmod +x flip or symlink swap, not a faithful render)"
+            echo "verify-propagation-pr.sh: templated dest $tpl_dest has unexpected tree entry [$tpl_consumer_entry], expected [$tpl_source_entry] from source $tpl_source (mode/type tampering — chmod +x flip or symlink swap, not a faithful render)"
           } >&2
-          fail_templated_drift "$tpl_dest — templated dest tree entry [$tpl_consumer_entry] differs from expected [100644 blob] (source=$tpl_source, consumer=$CONSUMER_NAME)"
+          fail_templated_drift "$tpl_dest — templated dest tree entry [$tpl_consumer_entry] differs from source [$tpl_source_entry] (source=$tpl_source, consumer=$CONSUMER_NAME)"
           rm -f "$rendered" "$pr_content"
           continue
         fi
