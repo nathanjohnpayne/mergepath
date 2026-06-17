@@ -645,6 +645,56 @@ else
   echo "  FAIL: re-arm gate must slurp + flatten (jq -s 'add // []') the paginated reviews before group_by, so a >30-review history doesn't collapse per page (#495)" >&2
 fi
 
+# 8. `reopened` must be a first-class event in load-config AND triage, not
+#    just in on.pull_request.types and the re-arm if:. When a PR is changed
+#    while closed and then reopened, the reopened event reaches the
+#    auto-merge re-arm; if load-config does not re-parse the policy and
+#    triage does not refresh the threshold/protected-path labels on that
+#    same event, an originally-under-threshold PR can re-arm on a stale or
+#    missing `needs-external-review` label after closed-state changes push
+#    it over the threshold. Scope each assertion to the job's own block so a
+#    `reopened` token elsewhere in the workflow can't satisfy it (#495).
+load_config_job_block=$(awk '
+  /^  load-config:/ {in_block=1}
+  in_block && /^  [a-z]/ && $0 !~ /^  load-config:/ {exit}
+  in_block {print}
+' "$agent_review_workflow")
+triage_job_block=$(awk '
+  /^  triage:/ {in_block=1}
+  in_block && /^  [a-z]/ && $0 !~ /^  triage:/ {exit}
+  in_block {print}
+' "$agent_review_workflow")
+
+if printf '%s\n' "$load_config_job_block" | grep -Fq "github.event.action == 'reopened'"; then
+  pass=$((pass + 1))
+  echo "  PASS: load-config re-parses policy on reopened (re-arm sees fresh threshold/paths) (#495)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: load-config must run on reopened so the re-arm path sees a freshly parsed policy, not a stale snapshot (#495)" >&2
+fi
+
+if printf '%s\n' "$triage_job_block" | grep -Fq "github.event.action == 'reopened'"; then
+  pass=$((pass + 1))
+  echo "  PASS: triage refreshes threshold/protected-path labels on reopened before the re-arm (#495)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: triage must run on reopened so needs-external-review is refreshed before the auto-merge re-arm evaluates (#495)" >&2
+fi
+
+# 9. The re-arm must not race triage: auto-merge-on-approval must `needs:`
+#    triage so triage's label refresh COMPLETES before the runtime
+#    blocking-label re-verify reads labels. Without the ordering edge,
+#    triage and auto-merge run in parallel on reopened and the re-verify can
+#    read labels before needs-external-review lands (#495).
+if printf '%s\n' "$auto_merge_job_block" \
+  | grep -Eq '^[[:space:]]*needs:.*\btriage\b'; then
+  pass=$((pass + 1))
+  echo "  PASS: auto-merge needs triage, so the reopened label refresh precedes the merge re-verify (#495)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: auto-merge-on-approval must list triage in needs: so triage's needs-external-review label lands before the re-verify step reads labels on reopened (#495)" >&2
+fi
+
 echo
 echo "dependabot-auto-merge.yml PR-author gate regression (#370)"
 
