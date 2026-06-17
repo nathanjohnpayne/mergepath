@@ -216,9 +216,17 @@ jobs:
             [ -z "$PR" ] && continue
             echo "::group::Sweep PR #$PR"
 
-            head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
-            if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
-              echo "::warning::Could not resolve head SHA for PR #$PR; skipping"
+            if ! head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null) \
+               || [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
+              # Cannot resolve the PR head SHA, so we cannot post a fresh
+              # check_run to supersede the stale one. Skipping silently would
+              # leave the PR's PREVIOUS green "Merge clearance gate" standing
+              # and the gate would fail OPEN on exactly the no-event refresh
+              # path this sweep exists to close (#465). Fail closed: flag the
+              # infra error so the sweep run ends non-zero (line below) and
+              # the gap is surfaced instead of silently swallowed.
+              echo "::error::Could not resolve head SHA for PR #$PR; cannot refresh its Merge clearance gate — failing the sweep (#465)."
+              had_infra_error=1
               echo "::endgroup::"
               continue
             fi

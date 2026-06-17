@@ -241,13 +241,16 @@ jobs:
             case "$rc" in
               0)
                 echo "Gate passes — removing needs-external-review label."
-                if ! with_gh_retry gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review; then
-                  # The gate passed but the removal API call failed —
-                  # the label is still stuck. That is an infra error,
-                  # not a warning: the job must not report success
-                  # when it failed to do its one job. (CodeRabbit
-                  # Major, #271.)
-                  echo "::error::Failed to remove needs-external-review on PR #$PR — label still stuck."
+                # Single (non-retried) removal of the non-idempotent write,
+                # then verify end state with a retried READ (#465): retrying
+                # --remove-label can double-fire downstream label-event
+                # workflows and can hit a post-success "label not found" that
+                # looks transient. Authoritative success = the label is gone,
+                # not the write's exit code (still fail-closed per #271).
+                gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review 2>/dev/null || true
+                still_present=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels --jq 'any(.labels[]?.name == "needs-external-review")' 2>/dev/null || echo "unknown")
+                if [ "$still_present" != "false" ]; then
+                  echo "::error::Failed to remove needs-external-review on PR #$PR — label still stuck (state: $still_present)."
                   had_infra_error=1
                   failing_prs="$failing_prs $PR"
                   echo "::endgroup::"
@@ -469,15 +472,20 @@ jobs:
             case "$rc" in
               0)
                 echo "Gate passes — removing needs-external-review label."
-                if with_gh_retry gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review; then
+                # Single (non-retried) removal + retried verify (#465) — see
+                # the evaluate-and-clear job above for the full rationale.
+                gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review 2>/dev/null || true
+                still_present=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels --jq 'any(.labels[]?.name == "needs-external-review")' 2>/dev/null || echo "unknown")
+                if [ "$still_present" = "false" ]; then
                   comment_body='**Automated label removal (scheduled sweep).** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD between event triggers (typical: Codex 👍 after the last push, with no synchronize / review / workflow_run event to fire the event-driven path). Removed `needs-external-review`. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#197) for the sweep doctrine.'
                   with_gh_retry gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
                     || echo "::warning::Failed to post attribution comment for PR #$PR"
                 else
-                  # Gate passed but the removal failed — infra error,
-                  # not warning-only. The label is still stuck; the
-                  # sweep must not report success. (CodeRabbit Major, #271.)
-                  echo "::error::Failed to remove needs-external-review on PR #$PR — label still stuck."
+                  # Removal did not take (label still present or verify read
+                  # failed) — infra error, not warning-only. The sweep must
+                  # not report success when the label is still stuck
+                  # (CodeRabbit Major, #271; verify-end-state per #465).
+                  echo "::error::Failed to remove needs-external-review on PR #$PR — label still stuck (state: $still_present)."
                   had_infra_error=1
                   failing_prs="$failing_prs $PR"
                 fi

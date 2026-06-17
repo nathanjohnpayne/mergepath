@@ -635,32 +635,52 @@ ROLLUP_JSON=$(with_gh_retry gh pr view "$PR_NUMBER" --repo "$REPO" --json status
 # checks listed in required_status_checks.contexts AND/OR
 # required_status_checks.checks[].context block the gate.
 BASE_BRANCH=$(echo "$PR_JSON" | jq -r '.base.ref')
-REQUIRED_CHECK_NAMES=$(gh api "repos/$REPO/branches/$BASE_BRANCH/protection/required_status_checks" 2>/dev/null \
-  | jq -r '[.contexts[]?, .checks[]?.context] | unique | .[]' 2>/dev/null \
-  || true)
+# Fetch the branch-protection required-check list, DISTINGUISHING
+# "read OK, none required" (gate (a) imposes no filter, passes) from
+# "could not read" (fail closed) — #465 Option A. The prior code swallowed
+# the gh failure and treated BOTH cases as "no required checks = pass",
+# which fails OPEN: when the token cannot read branch protection (403) or
+# the API errors (5xx), a genuinely-failing required check went unnoticed.
+#
+# gh api exits non-zero on any 4xx/5xx; capture stderr to tell a 404 (the
+# required_status_checks sub-resource is not configured → legitimately NO
+# required checks) apart from 403 (token lacks Administration:read scope) or
+# 5xx/network (transient) — the latter leave the required list UNKNOWN.
+protection_err=$(mktemp)
+if protection_json=$(gh api "repos/$REPO/branches/$BASE_BRANCH/protection/required_status_checks" 2>"$protection_err"); then
+  REQUIRED_CHECK_NAMES=$(printf '%s' "$protection_json" | jq -r '[.contexts[]?, .checks[]?.context] | unique | .[]' 2>/dev/null || true)
+  protection_readable=1
+elif grep -q 'HTTP 404' "$protection_err"; then
+  REQUIRED_CHECK_NAMES=""
+  protection_readable=1   # 404 → no required_status_checks protection → none required
+else
+  REQUIRED_CHECK_NAMES=""
+  protection_readable=0   # 403 token scope / 5xx / network → could not read
+fi
+rm -f "$protection_err"
 
-if [ -z "$REQUIRED_CHECK_NAMES" ]; then
-  # No required-check list available. This can happen because:
-  #   - The branch has no branch protection rules at all, OR
-  #   - The token lacks Administration:read scope (which the
-  #     required_status_checks endpoint requires).
-  #
-  # Earlier versions treated "no list" as "all checks required",
-  # which caused over-strict blocking when the token lacked perms
-  # and optional/flaky checks happened to be failing. Codex caught
-  # this on swipewatch propagation PR #33 round 8.
-  #
-  # New behavior: log a warning and SKIP the required-check filter
-  # entirely, letting gate (a) pass. The rationale is that if
-  # branch protection isn't configured or the token can't read it,
-  # the BRANCH PROTECTION ITSELF doesn't enforce required checks,
-  # so gate (a) shouldn't either.
-  log "gate (a): WARNING — could not determine required checks from branch protection for $BASE_BRANCH (no rules configured or token lacks Administration:read scope). Skipping required-check filter — all checks treated as passing this gate."
-  # Skip gate (a) entirely for this case
+if [ "$protection_readable" -eq 0 ]; then
+  # FAIL CLOSED (#465): the required-check list is UNKNOWN (token lacks
+  # Administration:read, or the API errored). Do NOT optimistically treat
+  # this as "no required checks = pass". Keep the FULL rollup and leave
+  # REQUIRED_JSON empty — the BAD_CHECKS filter below treats an empty
+  # required list as "all checks required", so every non-skipped check must
+  # be green. SKIPPED/NEUTRAL still pass (optional jobs that skip by design
+  # do not block), so this closes the fail-open hole while only blocking on
+  # ACTUAL failures (a narrower reversal of the swipewatch #33 skip than a
+  # blanket exit-3). To restore the precise required-check filter, grant the
+  # token Administration:read.
+  log "gate (a): WARNING — could not read branch-protection required checks for $BASE_BRANCH (token lacks Administration:read scope, or API error). Failing closed: every non-skipped rollup check must be green (#465)."
+  REQUIRED_JSON='[]'
+elif [ -z "$REQUIRED_CHECK_NAMES" ]; then
+  # Read succeeded; branch protection lists NO required checks (404 or empty
+  # contexts). Nothing to enforce — gate (a) imposes no required-check
+  # filter (the other gates still run).
+  log "gate (a): branch protection for $BASE_BRANCH lists no required checks; gate (a) imposes no required-check filter."
   ROLLUP_JSON='{"statusCheckRollup":[]}'
   REQUIRED_JSON='[]'
 else
-  # Build a jq array of required check names
+  # Build a jq array of required check names.
   REQUIRED_JSON=$(echo "$REQUIRED_CHECK_NAMES" | jq -R . | jq -s .)
 fi
 

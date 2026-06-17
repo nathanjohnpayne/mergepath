@@ -48,5 +48,8 @@ echo "check_codex_scripts: running codex-review-request ack tests"
 echo "check_codex_scripts: running codex-review-check gate (c) resolution tests"
 "$REPO_ROOT/tests/test_codex_review_check_resolution.sh"
 
+echo "check_codex_scripts: running #465 fail-closed structural guards"
+"$REPO_ROOT/tests/test_465_fail_closed.sh"
+
 echo "check_codex_scripts: PASS"
 exit 0
