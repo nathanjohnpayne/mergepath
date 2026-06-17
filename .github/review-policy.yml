@@ -170,6 +170,17 @@ coderabbit:
   # rate-limit comment). See nathanjohnpayne/mergepath#138.
   max_rate_limit_retries: 2
 
+  # Maximum number of times `scripts/coderabbit-wait.sh` will post
+  # `@coderabbitai resume` to recover from CodeRabbit's auto-pause state
+  # (the durable "Reviews paused" NOTE CodeRabbit emits after
+  # `reviews.auto_review.auto_pause_after_reviewed_commits` reviewed
+  # commits; configured in `.coderabbit.yml`). `resume` — not a one-shot
+  # `review`, which re-pauses after the next push — re-enables incremental
+  # auto-review. Set to 0 to disable resume retries (the caller sees exit
+  # code 6 / status=paused / skip_reason=paused on the first pause NOTE).
+  # See nathanjohnpayne/mergepath#490.
+  max_resume_retries: 2
+
   # Wallclock freshness floor for the HEAD_ANCHOR in
   # `scripts/coderabbit-wait.sh`. Stacked with the `head_ref_force_pushed`
   # anchor advance — `HEAD_ANCHOR = max(HEAD_COMMITTER_DATE,

@@ -2,7 +2,7 @@
 # scripts/coderabbit-wait.sh — Phase 2.5 CodeRabbit wait + rate-limit retry
 #
 # Polls a pull request for a CodeRabbit review anchored on the current HEAD
-# commit. Handles two CodeRabbit behaviors that the naive "just wait"
+# commit. Handles three CodeRabbit behaviors that the naive "just wait"
 # pattern in AGENTS.md step 5 does not:
 #
 #   1. **Rate-limit state.** CodeRabbit posts a comment matching
@@ -13,12 +13,33 @@
 #      `@coderabbitai, try again.` to re-trigger, and continues polling.
 #      See nathanjohnpayne/mergepath#138.
 #
-#   2. **HEAD freshness.** Auto-merge-on-approval workflows in downstream
+#   2. **Auto-pause state.** After N reviewed commits
+#      (`reviews.auto_review.auto_pause_after_reviewed_commits`, default 5)
+#      CodeRabbit auto-pauses incremental review and posts a "Reviews
+#      paused" NOTE carrying the stable marker
+#      `<!-- This is an auto-generated comment: review paused by
+#      coderabbit.ai -->`. The platform does NOT auto-resume. Our agent
+#      loop pushes many fix-up commits per PR, so long PRs cross the
+#      threshold and silently stop being reviewed (confirmed on #485).
+#      This script detects that marker, posts `@coderabbitai resume`
+#      (NOT a one-shot `review`, which re-pauses after the next push),
+#      and continues polling — bounded by `max_resume_retries`. Distinct
+#      from the rate-limit and in-progress states. See
+#      nathanjohnpayne/mergepath#490.
+#
+#   3. **HEAD freshness.** Auto-merge-on-approval workflows in downstream
 #      repos race CodeRabbit: an internal reviewer can post APPROVED before
 #      CodeRabbit's ~2–3 minute review lands, and the PR auto-merges
 #      pre-review. The script only returns "cleared" when CodeRabbit has
 #      posted a non-rate-limited, non-in-progress comment on or after the
 #      HEAD committer date. See nathanjohnpayne/mergepath#136.
+#
+# It also surfaces — without re-invoking — the other detectable reasons
+# CodeRabbit auto-review never fires: a PR base branch not in the
+# configured `base_branches`, and a draft PR when `drafts: false`. These
+# are reported in the JSON `skip_reason` field (paused / non-base-branch /
+# draft) so the caller can act instead of waiting out a full timeout. See
+# nathanjohnpayne/mergepath#490.
 #
 # Usage:
 #   scripts/coderabbit-wait.sh <PR_NUMBER> [REPO]
@@ -39,14 +60,27 @@
 #      coderabbit.max_rate_limit_retries (default 2) from
 #      .github/review-policy.yml.
 #   2. Fetches PR HEAD SHA + committer date.
+#   0. Before polling, check the static skips that mean auto-review will
+#      never fire on this PR: base branch ∉ `base_branches` (#490), and
+#      draft when `drafts: false`. On either, emit JSON with the
+#      `skip_reason` set and exit 6 (SKIPPED) rather than burning the
+#      whole budget on a review that cannot land.
 #   3. Polls issue + review comments every 15s. For each CodeRabbit
 #      comment newer than HEAD committer date, classifies as:
 #        - rate_limit  — body matches /Rate limit exceeded/i
+#        - paused      — body carries the "review paused by coderabbit.ai"
+#                        auto-generated marker (the #485 auto-pause NOTE)
 #        - in_progress — body matches /review in progress|currently reviewing/i
 #        - review      — anything else authored by coderabbitai[bot]
 #   4. On rate_limit: parse "X minutes and Y seconds" (or "X seconds"),
 #      sleep that duration + 30s buffer, post `@coderabbitai, try again.`,
 #      increment retry counter, continue polling.
+#   4b. On paused: post `@coderabbitai resume` (a one-shot `review`
+#      re-pauses after the next push, so resume is the correct verb),
+#      increment a resume-retry counter, and continue polling. If
+#      resume_retries > max_resume_retries: exit 6 (SKIPPED) with
+#      status=paused and skip_reason=paused so the caller can raise
+#      `auto_pause_after_reviewed_commits` or intervene.
 #   5. On review (non-rate-limit, non-in-progress): emit JSON, exit 0.
 #      Also scans inline diff comments for "Potential issue" / "⚠️"
 #      markers and surfaces them in the JSON so callers can decide.
@@ -65,7 +99,9 @@
 #     "head_sha": "<full sha>",
 #     "head_committer_date": "<iso-8601>",
 #     "bot_login": "coderabbitai[bot]",
-#     "status": "cleared" | "findings" | "timeout" | "rate_limit_stalled",
+#     "status": "cleared" | "findings" | "timeout" | "rate_limit_stalled"
+#               | "paused" | "skipped",
+#     "skip_reason": null | "paused" | "non-base-branch" | "draft",
 #     "review": null | {
 #       "id": N,
 #       "created_at": "<iso-8601>",
@@ -74,6 +110,7 @@
 #     },
 #     "potential_issue_count": N,
 #     "rate_limit_retries": N,
+#     "resume_retries": N,
 #     "status_probe": {
 #       "enabled": true | false,
 #       "posted": true | false,
@@ -100,9 +137,19 @@
 #       may log a warning and proceed (CodeRabbit is advisory), or block.
 #   5   Rate-limit stalled — max_rate_limit_retries exceeded. Distinct
 #       from timeout so callers can alert the human instead of proceeding.
+#   6   Auto-review skipped and not (re-)invocable. Either the static
+#       skip — base branch ∉ base_branches, or draft when drafts:false —
+#       or an auto-pause whose `@coderabbitai resume` retries are
+#       exhausted (max_resume_retries). The JSON `skip_reason` field
+#       names the cause (paused / non-base-branch / draft). Distinct from
+#       a slow-review timeout (4): the review cannot land as-is, so the
+#       caller should raise `auto_pause_after_reviewed_commits`, retarget
+#       the base, mark the PR ready, or escalate — not merely log and
+#       proceed. See nathanjohnpayne/mergepath#490.
 #
 # Design notes:
-#   - Read-only except for retry-trigger comments and timeout status-probe
+#   - Read-only except for retry-trigger comments, the auto-pause
+#     `@coderabbitai resume` re-invocation, and timeout status-probe
 #     comments. Does not push commits, does not modify labels, does not
 #     merge.
 #   - Idempotent across reruns on the same HEAD. A freshly-landed review
@@ -235,6 +282,68 @@ coderabbit_field() {
 # expected-identity path (#438) still consumes login_is_available_reviewer
 # to keep the derivation fail-closed.
 
+# --- .coderabbit.yml readers (#490) -----------------------------------------
+#
+# The auto-review skip conditions (base_branches allow-list, drafts gate)
+# live in CodeRabbit's own config, not review-policy.yml. Read them with the
+# same dependency-free awk-state-machine style used for coderabbit_field so
+# this helper picks up no new `yq` runtime dependency (it already requires
+# only `gh`/`jq`). Both readers walk the nested
+# `reviews:` → `auto_review:` block by indentation. Absent file / key →
+# empty output, and the caller treats that as "no configured constraint"
+# (the skip check is suppressed) so a consumer without the keys is never
+# falsely reported as skipped.
+CODERABBIT_YML=".coderabbit.yml"
+
+# Emit each configured base branch (one per line) from
+# reviews.auto_review.base_branches. Tolerates quotes, inline comments, and
+# leading-dash list syntax. Empty output when the key is absent.
+coderabbit_yml_base_branches() {
+  [ -f "$CODERABBIT_YML" ] || return 0
+  awk '
+    # Track the two-level path into reviews: -> auto_review: -> base_branches:
+    /^reviews:[[:space:]]*$/ { in_reviews=1; in_auto=0; in_list=0; next }
+    in_reviews && /^[^[:space:]#]/ { in_reviews=0; in_auto=0; in_list=0 }
+    in_reviews && /^  auto_review:[[:space:]]*$/ { in_auto=1; in_list=0; next }
+    # A new 2-space key under reviews: closes auto_review:
+    in_auto && /^  [^[:space:]#]/ && $0 !~ /^  auto_review:/ { in_auto=0; in_list=0 }
+    in_auto && /^    base_branches:[[:space:]]*$/ { in_list=1; next }
+    # A new 4-space key under auto_review: closes the base_branches list
+    in_list && /^    [^[:space:]#-]/ { in_list=0 }
+    in_list && /^[[:space:]]*-[[:space:]]*/ {
+      line=$0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+      gsub(/[[:space:]]*#.*$/, "", line)
+      gsub(/^["'"'"']/, "", line)
+      gsub(/["'"'"'][[:space:]]*$/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line != "") print line
+    }
+  ' "$CODERABBIT_YML"
+}
+
+# Emit the literal value of reviews.auto_review.drafts (true|false), or
+# empty when the key is absent.
+coderabbit_yml_drafts() {
+  [ -f "$CODERABBIT_YML" ] || return 0
+  awk '
+    /^reviews:[[:space:]]*$/ { in_reviews=1; in_auto=0; next }
+    in_reviews && /^[^[:space:]#]/ { in_reviews=0; in_auto=0 }
+    in_reviews && /^  auto_review:[[:space:]]*$/ { in_auto=1; next }
+    in_auto && /^  [^[:space:]#]/ && $0 !~ /^  auto_review:/ { in_auto=0 }
+    in_auto && /^    drafts:[[:space:]]*/ {
+      line=$0
+      sub(/^[[:space:]]*drafts:[[:space:]]*/, "", line)
+      gsub(/[[:space:]]*#.*$/, "", line)
+      gsub(/^["'"'"']/, "", line)
+      gsub(/["'"'"'][[:space:]]*$/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      print line
+      exit
+    }
+  ' "$CODERABBIT_YML"
+}
+
 MAX_WAIT_SECONDS=$(coderabbit_field max_wait_seconds)
 MAX_WAIT_SECONDS=${MAX_WAIT_SECONDS:-300}
 if ! [[ "$MAX_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
@@ -246,6 +355,18 @@ MAX_RATE_LIMIT_RETRIES=$(coderabbit_field max_rate_limit_retries)
 MAX_RATE_LIMIT_RETRIES=${MAX_RATE_LIMIT_RETRIES:-2}
 if ! [[ "$MAX_RATE_LIMIT_RETRIES" =~ ^[0-9]+$ ]]; then
   echo "ERROR: coderabbit.max_rate_limit_retries must be an integer; got '$MAX_RATE_LIMIT_RETRIES'" >&2
+  exit 3
+fi
+
+# Auto-pause (#490): how many times to post `@coderabbitai resume` before
+# giving up and exiting 6 (skipped, status=paused). Mirrors
+# max_rate_limit_retries but for the durable auto-pause state — a single
+# resume can re-pause once more fix-up commits land, so a small cap keeps
+# us from a resume↔pause ping-pong while still recovering the common case.
+MAX_RESUME_RETRIES=$(coderabbit_field max_resume_retries)
+MAX_RESUME_RETRIES=${MAX_RESUME_RETRIES:-2}
+if ! [[ "$MAX_RESUME_RETRIES" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: coderabbit.max_resume_retries must be an integer; got '$MAX_RESUME_RETRIES'" >&2
   exit 3
 fi
 
@@ -261,6 +382,13 @@ BOT_LOGIN=${BOT_LOGIN:-"coderabbitai[bot]"}
 POLL_INTERVAL_SECONDS=15
 STATUS_PROBE_POLL_INTERVAL_SECONDS=5
 RATE_LIMIT_BUFFER_SECONDS=30
+
+# Stable marker CodeRabbit wraps its auto-pause "Reviews paused" NOTE in
+# (#490 / #485). Keyed on directly — the prose ("## Reviews paused", the
+# resume/review bullet list) is not versioned, but this HTML-comment marker
+# is the same shape CodeRabbit emits for its other auto-generated notices
+# (cf. the `rate limited by coderabbit.ai` marker on the same surface).
+PAUSED_MARKER='review paused by coderabbit.ai'
 
 # CodeRabbit emits two distinct per-SHA signals:
 #   1. Narrative review comment (issue/PR comment + inline diff comments).
@@ -411,6 +539,11 @@ if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
   die 3 "could not determine HEAD sha for PR #$PR_NUMBER"
 fi
 
+# Base branch + draft state for the #490 static-skip checks below. Both
+# come from the PR metadata already in hand — no extra API call.
+PR_BASE_REF=$(echo "$PR_JSON" | jq -r '.base.ref // ""')
+PR_IS_DRAFT=$(echo "$PR_JSON" | jq -r 'if .draft == true then "true" else "false" end')
+
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
   || die 3 "failed to fetch commit date for $HEAD_SHA: $HEAD_COMMITTER_DATE"
 
@@ -506,11 +639,20 @@ parse_rate_limit_window() {
 }
 
 # Classify a CodeRabbit comment body. Emits one of:
-#   rate_limit | in_progress | status_probe | review
+#   rate_limit | paused | in_progress | status_probe | review
 classify_comment() {
   local body=$1
   if echo "$body" | grep -qiE 'rate[- ]limit exceeded'; then
     echo "rate_limit"
+    return
+  fi
+  # Auto-pause (#490 / #485): the "Reviews paused" NOTE carries a stable
+  # auto-generated marker. Match the marker with a fixed-string grep so the
+  # literal dots in "coderabbit.ai" are not treated as regex wildcards.
+  # Checked before in_progress/review so the durable pause is never mistaken
+  # for a slow review.
+  if printf '%s' "$body" | grep -Fqi "$PAUSED_MARKER"; then
+    echo "paused"
     return
   fi
   # CodeRabbit's free-form command replies, including
@@ -718,7 +860,12 @@ status_context_fast_path_blocked_by_comment() {
 
   class=$(classify_comment "$(echo "$latest" | jq -r '.body')")
   case "$class" in
-    rate_limit|in_progress)
+    rate_limit|paused|in_progress)
+      # #490: `paused` joins rate_limit/in_progress here. An auto-pause NOTE
+      # is durable and, like the rate-limit notice, does not reference HEAD;
+      # a pause posted at/after a stale StatusContext success must suppress
+      # the fast-path so the wait keeps polling (and re-invokes `resume`)
+      # instead of false-clearing over a paused review.
       comment_id=$(echo "$latest" | jq -r '.id')
       comment_fresh_at=$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at')
       comment_created_at=$(echo "$latest" | jq -r '.created_at // .fresh_at // .updated_at')
@@ -731,17 +878,17 @@ status_context_fast_path_blocked_by_comment() {
         log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class explicitly references current HEAD $HEAD_SHA but fresh_at=$comment_fresh_at is older than status_created=$status_created_at"
         return 1
       fi
-      # #446: a rate_limit/in_progress comment POSTED (created) at/after the
-      # StatusContext flipped to success means CodeRabbit re-entered a
-      # rate-limited / in-progress state — the fast-path must not declare
-      # clearance over it even though the notice does not reference HEAD.
-      # Compare CREATED_AT, not fresh_at: an OLD comment from a prior round
-      # that merely got edited after the success is stale and must NOT
+      # #446: a rate_limit/paused/in_progress comment POSTED (created) at/after
+      # the StatusContext flipped to success means CodeRabbit re-entered a
+      # rate-limited / paused / in-progress state — the fast-path must not
+      # declare clearance over it even though the notice does not reference
+      # HEAD. Compare CREATED_AT, not fresh_at: an OLD comment from a prior
+      # round that merely got edited after the success is stale and must NOT
       # suppress (the 263caf3 "Bug 6" regression — an unscoped non-HEAD
       # comment created before the success still clears). Only a comment
       # actually posted at/after the success suppresses.
       if iso_on_or_after "$comment_created_at" "$status_created_at"; then
-        log "StatusContext success suppressed because latest CodeRabbit comment id=$comment_id class=$class created=$comment_created_at is at/after status_created=$status_created_at (no HEAD $HEAD_SHA reference, but a post-success rate-limit/in-progress notice) — keep polling"
+        log "StatusContext success suppressed because latest CodeRabbit comment id=$comment_id class=$class created=$comment_created_at is at/after status_created=$status_created_at (no HEAD $HEAD_SHA reference, but a post-success rate-limit/paused/in-progress notice) — keep polling"
         return 0
       fi
       log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class does not reference current HEAD $HEAD_SHA and was created=$comment_created_at before status_created=$status_created_at"
@@ -823,6 +970,19 @@ post_retry_trigger() {
   log "posting retry trigger comment to PR #$PR_NUMBER as $mention"
   post_reviewer_comment "retry-trigger" "$body" >/dev/null \
     || die 3 "failed to post retry-trigger comment"
+}
+
+# Re-invoke CodeRabbit out of an auto-pause (#490). MUST be `resume`, not a
+# one-shot `review`: the auto-pause is durable and a single `review`
+# re-pauses after the next fix-up push, whereas `resume` re-enables
+# incremental auto-review. Same BOT_LOGIN-derived mention as the retry
+# trigger so a bot_login override stays consistent.
+post_resume_trigger() {
+  local mention="@${BOT_LOGIN%\[bot\]}"
+  local body="${mention} resume"
+  log "posting auto-pause resume trigger comment to PR #$PR_NUMBER as $mention"
+  post_reviewer_comment "resume-trigger" "$body" >/dev/null \
+    || die 3 "failed to post resume-trigger comment"
 }
 
 find_status_probe_reply() {
@@ -986,7 +1146,12 @@ emit_timeout() {
 
 START_EPOCH=$(date +%s)
 RATE_LIMIT_RETRIES=0
+RESUME_RETRIES=0
 LAST_RATE_LIMIT_COMMENT_ID=""
+LAST_PAUSED_COMMENT_ID=""
+# Skip reason surfaced in the JSON. Empty for the normal review/timeout/
+# rate-limit paths; set to paused / non-base-branch / draft on a #490 skip.
+SKIP_REASON=""
 STATUS_PROBE_RAN=false
 STATUS_PROBE_JSON=$(jq -nc \
   --argjson enabled "$([ "$STATUS_PROBE_ENABLED" = "true" ] && echo true || echo false)" \
@@ -994,9 +1159,16 @@ STATUS_PROBE_JSON=$(jq -nc \
 
 emit_json_and_exit() {
   local status=$1 exit_code=$2 review_json=$3 potential_issues=$4
-  local now_epoch waited
+  local now_epoch waited skip_reason_json
   now_epoch=$(date +%s)
   waited=$((now_epoch - START_EPOCH))
+
+  # skip_reason is null unless a #490 skip set it.
+  if [ -n "$SKIP_REASON" ]; then
+    skip_reason_json=$(jq -n --arg r "$SKIP_REASON" '$r')
+  else
+    skip_reason_json="null"
+  fi
 
   jq -n \
     --argjson pr_number "$PR_NUMBER" \
@@ -1005,9 +1177,11 @@ emit_json_and_exit() {
     --arg head_committer_date "$HEAD_COMMITTER_DATE" \
     --arg bot_login "$BOT_LOGIN" \
     --arg status "$status" \
+    --argjson skip_reason "$skip_reason_json" \
     --argjson review "$review_json" \
     --argjson potential_issue_count "$potential_issues" \
     --argjson rate_limit_retries "$RATE_LIMIT_RETRIES" \
+    --argjson resume_retries "$RESUME_RETRIES" \
     --argjson status_probe "$STATUS_PROBE_JSON" \
     --argjson waited_seconds "$waited" \
     '{
@@ -1017,9 +1191,11 @@ emit_json_and_exit() {
       head_committer_date: $head_committer_date,
       bot_login: $bot_login,
       status: $status,
+      skip_reason: $skip_reason,
       review: $review,
       potential_issue_count: $potential_issue_count,
       rate_limit_retries: $rate_limit_retries,
+      resume_retries: $resume_retries,
       status_probe: $status_probe,
       waited_seconds: $waited_seconds
     }'
@@ -1108,6 +1284,39 @@ emit_status_context_verdict() {
   log "StatusContext $state and 0 Potential issue/⚠️ markers — emitting cleared (exit 0)"
   emit_json_and_exit "cleared" 0 "$synthetic" 0
 }
+
+# --- static skip checks (#490) ----------------------------------------------
+#
+# Two configured conditions mean CodeRabbit auto-review will NEVER fire on
+# this PR, so there is nothing to poll for. Detect them up front and exit 6
+# (skipped) with the reason in JSON rather than burning the whole
+# max_wait_seconds budget on a review that cannot land:
+#
+#   1. base branch ∉ reviews.auto_review.base_branches — a PR onto a base
+#      CodeRabbit isn't configured to review (stacked / non-main bases).
+#   2. draft PR when reviews.auto_review.drafts: false — drafts aren't
+#      reviewed until marked ready.
+#
+# Both are read from .coderabbit.yml. When the relevant key is absent (a
+# consumer that doesn't constrain bases, or doesn't set drafts), the reader
+# yields nothing and the corresponding check is suppressed — no false skip.
+# Neither is re-invocable (resume/review won't help), so the JSON surfaces
+# the reason and the caller decides (retarget the base, mark ready, escalate).
+CONFIGURED_BASE_BRANCHES=$(coderabbit_yml_base_branches)
+if [ -n "$CONFIGURED_BASE_BRANCHES" ] && [ -n "$PR_BASE_REF" ]; then
+  if ! printf '%s\n' "$CONFIGURED_BASE_BRANCHES" | grep -Fxq "$PR_BASE_REF"; then
+    SKIP_REASON="non-base-branch"
+    log "PR base branch '$PR_BASE_REF' is not in configured base_branches — CodeRabbit auto-review will not fire (skip)"
+    emit_json_and_exit "skipped" 6 "null" 0
+  fi
+fi
+
+CONFIGURED_DRAFTS=$(coderabbit_yml_drafts)
+if [ "$CONFIGURED_DRAFTS" = "false" ] && [ "$PR_IS_DRAFT" = "true" ]; then
+  SKIP_REASON="draft"
+  log "PR is a draft and reviews.auto_review.drafts is false — CodeRabbit auto-review will not fire until marked ready (skip)"
+  emit_json_and_exit "skipped" 6 "null" 0
+fi
 
 # Pre-loop fast-path. If CodeRabbit posted SUCCESS on this SHA before
 # the script started polling, we can short-circuit immediately and
@@ -1208,6 +1417,33 @@ while :; do
       sleep "$SLEEP_FOR"
       post_retry_trigger
       RATE_LIMIT_RETRIES=$((RATE_LIMIT_RETRIES + 1))
+      continue
+      ;;
+    paused)
+      # Auto-pause (#490 / #485). Re-invoke with `@coderabbitai resume`
+      # (NOT a one-shot `review` — that re-pauses after the next push),
+      # bounded by max_resume_retries, then resume polling. Distinct from
+      # rate_limit (no published wait window; the resume verb differs) and
+      # from in_progress (durable, never self-clears).
+      if [ "$COMMENT_ID" = "$LAST_PAUSED_COMMENT_ID" ]; then
+        # Same pause NOTE as last iteration — our resume hasn't taken
+        # effect yet. Keep polling without re-posting / double-counting.
+        log "still inside prior auto-pause (same NOTE id=$COMMENT_ID); sleeping ${POLL_INTERVAL_SECONDS}s"
+        sleep_or_timeout "$POLL_INTERVAL_SECONDS"
+        continue
+      fi
+      LAST_PAUSED_COMMENT_ID=$COMMENT_ID
+
+      if [ "$RESUME_RETRIES" -ge "$MAX_RESUME_RETRIES" ]; then
+        log "max_resume_retries ($MAX_RESUME_RETRIES) exceeded — CodeRabbit auto-review remains paused (skip)"
+        SKIP_REASON="paused"
+        PAUSED_REVIEW=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
+        emit_json_and_exit "paused" 6 "$PAUSED_REVIEW" 0
+      fi
+      log "CodeRabbit auto-review paused; posting @coderabbitai resume (retry $((RESUME_RETRIES + 1))/$MAX_RESUME_RETRIES) and continuing to poll"
+      post_resume_trigger
+      RESUME_RETRIES=$((RESUME_RETRIES + 1))
+      sleep_or_timeout "$POLL_INTERVAL_SECONDS"
       continue
       ;;
     in_progress)

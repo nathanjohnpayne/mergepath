@@ -448,6 +448,13 @@ paths:
   - path: tests/test_coderabbit_wait_status_probe.sh
     type: canonical
     consumers: all
+  # Locks the #490 auto-pause `paused` state + static skip contract: the
+  # #485 "Reviews paused" marker is recognized, `@coderabbitai resume` is
+  # posted (bounded by max_resume_retries) and never exits 4, and a
+  # non-base-branch / draft PR surfaces skip_reason instead of timing out.
+  - path: tests/test_coderabbit_wait_paused.sh
+    type: canonical
+    consumers: all
   # Pairs with scripts/workflow/verify-propagation-pr.sh (under the
   # scripts/workflow/ kit below). The verifier is security-load-bearing
   # for the propagation-PR review lane; its test travels with it so a
@@ -710,6 +717,7 @@ paths:
       - "tests/test_preflight_agent_name.sh"   # check_op_preflight_contract (#466)
       - "tests/test_coderabbit_wait_status_probe.sh"  # check_coderabbit_wait
       - "tests/test_coderabbit_wait_identity_derivation.sh"  # check_coderabbit_wait (#438)
+      - "tests/test_coderabbit_wait_paused.sh"  # check_coderabbit_wait (#490)
       - "tests/test_codex_p1_gate.sh"          # check_codex_p1_gate
       - "tests/test_merge_clearance_gate.sh"   # check_merge_clearance_gate
       - "tests/test_disagreement_detector.sh"  # check_disagreement_detector
