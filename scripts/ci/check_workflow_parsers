@@ -530,6 +530,188 @@ else
 fi
 
 echo
+echo "agent-review.yml auto-merge synchronize re-arm regression (#495)"
+
+# The auto-merge-on-approval job must arm on TWO triggers: the original
+# pull_request_review+approved path AND a pull_request synchronize/reopened
+# RE-ARM path that retries arming after a fix-commit. The re-arm path must
+# be gated on an existing non-author APPROVED review (a push with no
+# approval must NOT arm), and must fail closed if the approval can't be
+# confirmed. Extract the job block (from its key to the next top-level job
+# key at 2-space indent) so these assertions are scoped to the job.
+auto_merge_job_block=$(awk '
+  /^  auto-merge-on-approval:/ {in_block=1}
+  in_block && /^  [a-z]/ && $0 !~ /^  auto-merge-on-approval:/ {exit}
+  in_block {print}
+' "$agent_review_workflow")
+
+# 1. The original approval-event trigger is preserved.
+if printf '%s\n' "$auto_merge_job_block" \
+  | grep -Fq "github.event_name == 'pull_request_review'" \
+  && printf '%s\n' "$auto_merge_job_block" \
+  | grep -Fq "github.event.review.state == 'approved'"; then
+  pass=$((pass + 1))
+  echo "  PASS: auto-merge retains the pull_request_review + approved trigger"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: auto-merge must retain the pull_request_review + approved trigger" >&2
+fi
+
+# 2. The synchronize/reopened re-arm trigger is present in the job if:.
+if printf '%s\n' "$auto_merge_job_block" \
+  | grep -Fq "github.event.action == 'synchronize'" \
+  && printf '%s\n' "$auto_merge_job_block" \
+  | grep -Fq "github.event.action == 'reopened'"; then
+  pass=$((pass + 1))
+  echo "  PASS: auto-merge re-arms on pull_request synchronize/reopened (#495)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: auto-merge must also trigger on pull_request synchronize/reopened to re-arm after a fix-commit (#495)" >&2
+fi
+
+# 2b. The pull_request trigger must actually subscribe `synchronize` AND
+# `reopened`, otherwise the re-arm `if:` above is dead code: GitHub never
+# delivers an unsubscribed event to the workflow, so the reopened half (and,
+# without synchronize, the whole re-arm) silently never fires (#495).
+pr_trigger_types=$(awk '
+  /^  pull_request:/ {in_pr=1; next}
+  in_pr && /^  [a-z]/ {exit}
+  in_pr && /^    types:/ {print; exit}
+' "$agent_review_workflow")
+if printf '%s\n' "$pr_trigger_types" | grep -Fq "synchronize" \
+  && printf '%s\n' "$pr_trigger_types" | grep -Fq "reopened"; then
+  pass=$((pass + 1))
+  echo "  PASS: on.pull_request.types subscribes synchronize + reopened so the re-arm if: is live (#495)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: on.pull_request.types must include synchronize AND reopened, else the re-arm if: is dead code (#495)" >&2
+fi
+
+# 3. A dedicated approval gate runs only on the pull_request (push) path.
+if printf '%s\n' "$auto_merge_job_block" | grep -Fq 'id: require_approval' \
+  && printf '%s\n' "$auto_merge_job_block" \
+  | grep -Eq "if:[[:space:]]*github\.event_name == 'pull_request'$"; then
+  pass=$((pass + 1))
+  echo "  PASS: re-arm path has a require_approval gate scoped to pull_request events"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: re-arm path must add a require_approval step gated on github.event_name == 'pull_request' (#495)" >&2
+fi
+
+# 4. The gate confirms an EXISTING non-author APPROVED review: it must
+#    exclude the PR author and require a latest-state APPROVED. Without
+#    this, a push with no approval would arm.
+if printf '%s\n' "$auto_merge_job_block" | grep -Fq '.user.login != $author' \
+  && printf '%s\n' "$auto_merge_job_block" | grep -Fq 'map(select(.state == "APPROVED"))'; then
+  pass=$((pass + 1))
+  echo "  PASS: re-arm gate requires a non-author latest-state APPROVED review"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: re-arm gate must exclude the PR author and require a latest-state APPROVED review (#495)" >&2
+fi
+
+# 5. The gate collapses to each reviewer's LATEST opinionated state so a
+#    withdrawn approval (later CHANGES_REQUESTED/DISMISSED) does not re-arm.
+if printf '%s\n' "$auto_merge_job_block" | grep -Fq 'group_by(.user.login)' \
+  && printf '%s\n' "$auto_merge_job_block" | grep -Fq 'max_by(.submitted_at)'; then
+  pass=$((pass + 1))
+  echo "  PASS: re-arm gate collapses to each reviewer's latest review (supersedes a withdrawn approval)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: re-arm gate must collapse to the latest review per reviewer so a later CHANGES_REQUESTED/DISMISSED supersedes an earlier APPROVED (#495)" >&2
+fi
+
+# 6. Fail-closed: when the approval cannot be confirmed the gate emits
+#    proceed=false, and the merge path is skipped via proceed != 'false'.
+if printf '%s\n' "$auto_merge_job_block" | grep -Fq 'proceed=false' \
+  && printf '%s\n' "$auto_merge_job_block" \
+  | grep -Fq "steps.require_approval.outputs.proceed != 'false'"; then
+  pass=$((pass + 1))
+  echo "  PASS: re-arm fails closed (proceed=false) and the merge path honors it"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: re-arm gate must fail closed (emit proceed=false) and the token step must gate on proceed != 'false' (#495)" >&2
+fi
+
+# 7. Aggregation happens AFTER flattening all pages: a slurped `add // []`
+#    over the raw --paginate stream, not a per-page `gh api --jq` collapse
+#    that would miss a CHANGES_REQUESTED on a later page.
+if printf '%s\n' "$auto_merge_job_block" | grep -Fq 'jq -r -s' \
+  && printf '%s\n' "$auto_merge_job_block" | grep -Fq '(add // [])'; then
+  pass=$((pass + 1))
+  echo "  PASS: re-arm gate flattens paginated reviews before aggregating"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: re-arm gate must slurp + flatten (jq -s 'add // []') the paginated reviews before group_by, so a >30-review history doesn't collapse per page (#495)" >&2
+fi
+
+# 8. `synchronize` / `reopened` must be first-class events in load-config
+#    AND triage, not just in on.pull_request.types and the re-arm if:. When
+#    a PR is changed after approval, or while closed and then reopened, that
+#    event reaches the auto-merge re-arm; if load-config does not re-parse
+#    the policy and triage does not refresh the threshold/protected-path
+#    labels on that same event, an originally-under-threshold PR can re-arm
+#    on a stale or missing `needs-external-review` label after later changes
+#    push it over the threshold. Scope each assertion to the job's own block
+#    so a token elsewhere in the workflow can't satisfy it (#495).
+load_config_job_block=$(awk '
+  /^  load-config:/ {in_block=1}
+  in_block && /^  [a-z]/ && $0 !~ /^  load-config:/ {exit}
+  in_block {print}
+' "$agent_review_workflow")
+triage_job_block=$(awk '
+  /^  triage:/ {in_block=1}
+  in_block && /^  [a-z]/ && $0 !~ /^  triage:/ {exit}
+  in_block {print}
+' "$agent_review_workflow")
+
+if printf '%s\n' "$load_config_job_block" | grep -Fq "github.event.action == 'synchronize'" \
+  && printf '%s\n' "$load_config_job_block" | grep -Fq "github.event.action == 'reopened'"; then
+  pass=$((pass + 1))
+  echo "  PASS: load-config re-parses policy on synchronize/reopened (re-arm sees fresh threshold/paths) (#495)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: load-config must run on synchronize/reopened so the re-arm path sees a freshly parsed policy, not a stale snapshot (#495)" >&2
+fi
+
+if printf '%s\n' "$triage_job_block" | grep -Fq "github.event.action == 'synchronize'" \
+  && printf '%s\n' "$triage_job_block" | grep -Fq "github.event.action == 'reopened'"; then
+  pass=$((pass + 1))
+  echo "  PASS: triage refreshes threshold/protected-path labels on synchronize/reopened before the re-arm (#495)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: triage must run on synchronize/reopened so needs-external-review is refreshed before the auto-merge re-arm evaluates (#495)" >&2
+fi
+
+# 9. The re-arm must not race triage: auto-merge-on-approval must `needs:`
+#    triage so triage's label refresh COMPLETES before the runtime
+#    blocking-label re-verify reads labels. Without the ordering edge,
+#    triage and auto-merge run in parallel on synchronize/reopened and the
+#    re-verify can read labels before needs-external-review lands (#495).
+if printf '%s\n' "$auto_merge_job_block" \
+  | grep -Eq '^[[:space:]]*needs:.*\btriage\b'; then
+  pass=$((pass + 1))
+  echo "  PASS: auto-merge needs triage, so synchronize/reopened label refresh precedes the merge re-verify (#495)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: auto-merge-on-approval must list triage in needs: so triage's needs-external-review label lands before the re-verify step reads labels on synchronize/reopened (#495)" >&2
+fi
+
+# 10. Ordering is not enough: the pull_request re-arm path must fail closed
+#     when triage fails or is skipped. The job-level `always()` is required
+#     because event-mismatched sibling jobs are expected to skip, but a
+#     synchronize/reopened re-arm cannot proceed unless triage succeeded and
+#     had the chance to refresh needs-external-review.
+if printf '%s\n' "$auto_merge_job_block" | grep -Fq "github.event_name != 'pull_request'" \
+  && printf '%s\n' "$auto_merge_job_block" | grep -Fq "needs.triage.result == 'success'"; then
+  pass=$((pass + 1))
+  echo "  PASS: pull_request re-arm fails closed unless triage succeeds (#495)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: pull_request synchronize/reopened auto-merge re-arm must require needs.triage.result == 'success' so failed/skipped triage cannot leave stale labels and still arm (#495)" >&2
+fi
+
+echo
 echo "dependabot-auto-merge.yml PR-author gate regression (#370)"
 
 dependabot_workflow=".github/workflows/dependabot-auto-merge.yml"

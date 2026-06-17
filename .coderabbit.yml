@@ -12,6 +12,25 @@ reviews:
   auto_review:
     enabled: true
     drafts: false
+    # base_branches EXTENDS the auto-review set; it does NOT replace the
+    # default branch — CodeRabbit always auto-reviews PRs targeting the
+    # repo's detected primary branch (main/master/dev) regardless of this
+    # list (docs: configuration/auto-review, "base_branches", default []).
+    # Listing `main` here is therefore redundant-but-explicit and harmless.
+    # The load-bearing case: a PR opened against a NON-default base (a
+    # stacked PR onto a feature branch, or a sync PR onto a release line)
+    # is NOT auto-reviewed unless its base is added here (regex accepted,
+    # e.g. "release/.*"). We keep the list to `main` deliberately: the
+    # template's own PRs all target main, and a never-propagated config
+    # (.coderabbit.yml is NOT in .mergepath-sync.yml) means each consumer
+    # owns its own base set. See docs/agents/coderabbit-audit.md § base_branches.
+    base_branches:
+      - main
+    # auto_incremental_review: re-review on every push (CodeRabbit default
+    # is true; pinned explicitly so the fix-up-loop posture is legible and
+    # a future default flip can't silently change it). This is what lets a
+    # reviewer-identity fix-commit loop get a fresh CodeRabbit pass per push.
+    auto_incremental_review: true
     # auto_pause_after_reviewed_commits — DELIBERATE, not the inherited
     # default of 5 (#490). After this many reviewed commits CodeRabbit
     # auto-pauses incremental review and posts a "Reviews paused" NOTE; it
@@ -23,11 +42,9 @@ reviews:
     # The runtime safety net for PRs that still cross it is
     # scripts/coderabbit-wait.sh, which detects the pause marker and posts
     # `@coderabbitai resume` (bounded by coderabbit.max_resume_retries in
-    # .github/review-policy.yml) rather than timing out. This key is owned
-    # here; the #491 propagation audit only references it.
+    # .github/review-policy.yml) rather than timing out. See
+    # docs/agents/coderabbit-audit.md § auto_pause_after_reviewed_commits.
     auto_pause_after_reviewed_commits: 15
-    base_branches:
-      - main
 
   # profile: chill (the default) suppresses 🧹 Nitpick comments entirely
   # — per CodeRabbit's docs, the Nitpick category is "only in Assertive
@@ -68,5 +85,21 @@ chat:
   auto_reply: true
 
 knowledge_base:
+  # learnings.scope governs where CodeRabbit's accumulated review-preference
+  # "learnings" are stored and applied. Allowed values (docs: reference/
+  # configuration#knowledge-base): local (this repo only), global (shared
+  # across the whole org/owner), auto (= local for PUBLIC repos, global for
+  # PRIVATE repos).
+  #
+  # We keep `auto` deliberately. Consequence to be aware of: this template
+  # repo is PUBLIC, so HERE `auto` resolves to `local`. But .coderabbit.yml
+  # is NOT propagated (.mergepath-sync.yml), so each consumer ships its own
+  # copy — and for the three PRIVATE consumers (matchline, overridebroadway,
+  # tadlockpsychiatry) `auto` resolves to GLOBAL: their
+  # learnings are shared org-wide. That is acceptable for a single-owner
+  # fleet under one account (nathanjohnpayne) where cross-repo review
+  # conventions SHOULD carry over. A repo that wants its learnings firewalled
+  # (e.g. a sensitive private repo) should override to `scope: local` in its
+  # own .coderabbit.yml. See docs/agents/coderabbit-audit.md § learnings.scope.
   learnings:
     scope: auto
