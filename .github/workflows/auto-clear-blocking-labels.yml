@@ -248,7 +248,7 @@ jobs:
                 # looks transient. Authoritative success = the label is gone,
                 # not the write's exit code (still fail-closed per #271).
                 gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review 2>/dev/null || true
-                still_present=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels --jq 'any(.labels[]?.name == "needs-external-review")' 2>/dev/null || echo "unknown")
+                still_present=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels --jq 'any(.labels[]?; .name == "needs-external-review")' || echo "unknown")
                 if [ "$still_present" != "false" ]; then
                   echo "::error::Failed to remove needs-external-review on PR #$PR — label still stuck (state: $still_present)."
                   had_infra_error=1
@@ -333,6 +333,30 @@ jobs:
             echo "::group::Posting infra-failure check-run for PR #$PR"
             if ! HEAD_SHA=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
               echo "::warning::Failed to resolve head SHA for PR #$PR — skipping check-run."
+              echo "::endgroup::"
+              continue
+            fi
+            if current_has_label=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels --jq 'any(.labels[]?; .name == "needs-external-review")'); then
+              :
+            else
+              echo "::warning::Failed to re-read needs-external-review on PR #$PR before posting the infra-failure check-run."
+              current_has_label=unknown
+            fi
+            if [ "$current_has_label" = "false" ]; then
+              # Issue #499: the label removal can succeed while the
+              # immediate verification read returns unknown. In that
+              # case a later read proving the label is absent should
+              # heal the synthetic check-run instead of leaving a
+              # permanent failure on the PR's Checks tab.
+              with_gh_retry gh api "repos/$REPO/check-runs" \
+                -X POST \
+                -f name='auto-clear-blocking-labels' \
+                -f "head_sha=$HEAD_SHA" \
+                -f status='completed' \
+                -f conclusion='success' \
+                -F "output[title]=Auto-clear confirmed needs-external-review absent" \
+                -F "output[summary]=PR #$PR — a prior verification failed, but a later read confirmed the label is absent. See workflow run logs: $RUN_URL" \
+                || echo "::warning::Failed to post healed check-run for PR #$PR (workflow log still confirms the label is absent)."
               echo "::endgroup::"
               continue
             fi
@@ -475,7 +499,7 @@ jobs:
                 # Single (non-retried) removal + retried verify (#465) — see
                 # the evaluate-and-clear job above for the full rationale.
                 gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review 2>/dev/null || true
-                still_present=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels --jq 'any(.labels[]?.name == "needs-external-review")' 2>/dev/null || echo "unknown")
+                still_present=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels --jq 'any(.labels[]?; .name == "needs-external-review")' || echo "unknown")
                 if [ "$still_present" = "false" ]; then
                   comment_body='**Automated label removal (scheduled sweep).** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD between event triggers (typical: Codex 👍 after the last push, with no synchronize / review / workflow_run event to fire the event-driven path). Removed `needs-external-review`. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#197) for the sweep doctrine.'
                   with_gh_retry gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
@@ -525,6 +549,30 @@ jobs:
             echo "::group::Posting infra-failure check-run for PR #$PR (sweep)"
             if ! HEAD_SHA=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid); then
               echo "::warning::Failed to resolve head SHA for PR #$PR — skipping check-run."
+              echo "::endgroup::"
+              continue
+            fi
+            if current_has_label=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels --jq 'any(.labels[]?; .name == "needs-external-review")'); then
+              :
+            else
+              echo "::warning::Failed to re-read needs-external-review on PR #$PR before posting the infra-failure check-run (sweep)."
+              current_has_label=unknown
+            fi
+            if [ "$current_has_label" = "false" ]; then
+              # Issue #499: the label removal can succeed while the
+              # immediate verification read returns unknown. In that
+              # case a later read proving the label is absent should
+              # heal the synthetic check-run instead of leaving a
+              # permanent failure on the PR's Checks tab.
+              with_gh_retry gh api "repos/$REPO/check-runs" \
+                -X POST \
+                -f name='auto-clear-blocking-labels' \
+                -f "head_sha=$HEAD_SHA" \
+                -f status='completed' \
+                -f conclusion='success' \
+                -F "output[title]=Auto-clear confirmed needs-external-review absent (scheduled sweep)" \
+                -F "output[summary]=PR #$PR — a prior sweep verification failed, but a later read confirmed the label is absent. See workflow run logs: $RUN_URL" \
+                || echo "::warning::Failed to post healed sweep check-run for PR #$PR (workflow log still confirms the label is absent)."
               echo "::endgroup::"
               continue
             fi
