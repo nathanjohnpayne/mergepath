@@ -450,6 +450,21 @@ issue, can satisfy the Phase 4a signal.
 
      P2 and P3 findings are addressed at the agent's judgment — not every cosmetic or nit-level finding needs a fix or a rebuttal.
 
+13a-bis. **Record the feedback reaction (#487).** Every Codex finding ends with a solicitation: *"Useful? React with 👍 / 👎."* After adjudicating a finding, the agent answers that prompt with a **validated** reaction via `scripts/codex-record-feedback.sh <PR#> --findings-json <request-script-json> --verdict <comment_id>=<verdict>[:<reason>]`:
+
+     - **Validated as real and actioned (fixed)** → react `+1` (👍).
+     - **Determined to be a false positive / rebutted** → react `-1` (👎).
+
+     "Validate" means more than a blanket 👍 — confirm the finding is legitimate before a 👍 (the referenced `path:line` exists on HEAD; the claim reproduces or a fix commit addresses it). A 👎 on a genuine false positive is itself a validated signal. The helper:
+
+     - Only reacts to findings whose body contains the exact solicitation (it never reacts on bot comments that do not solicit feedback).
+     - Posts the reaction through `scripts/gh-as-reviewer.sh` under the **reviewer identity** (e.g. `nathanpayne-claude`), not the author token — this is the first place Mergepath POSTs a reaction, and it is a reviewer-attributed write. It targets the reactions endpoint matching where the finding lives (`repos/{owner}/{repo}/pulls/comments/{id}/reactions` for an inline diff finding, `…/issues/comments/{id}/reactions` for a PR-level comment).
+     - Is **idempotent**: if a reaction by the reviewer identity already exists on the comment, it leaves it (no double-react, no flip).
+     - Is **HEAD-pinned**: `--scan` collects only the current HEAD's latest Codex review round (consistent with `codex-review-request.sh`'s findings scoping), so a finding a later commit already fixed is not 👎'd.
+     - Writes a **durable per-finding verdict** (comment_id, priority, verdict, reaction, optional reason) to a JSONL ledger (`.mergepath/codex-feedback-ledger.jsonl` by default) so Codex review precision is trackable over time and can feed the daily rollup / `pr-audit`.
+
+     This step closes the Codex loop in the other direction from the 👀 eyes-ack read (#419): companion to the request-by-default trigger (#486), Mergepath now both requests the review and records a validated grade on each finding.
+
 14a. The agent increments its round counter and re-runs `scripts/codex-review-request.sh` to request a re-review of the new HEAD.
 
 15a. The loop continues until one of the following terminates it:
