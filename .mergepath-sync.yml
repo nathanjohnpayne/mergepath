@@ -86,6 +86,11 @@
 # structural guard; the canary procedure is the operational practice
 # that makes a manifest gap recoverable for a single PR instead of
 # eight.
+#
+# Full procedure: the risk-ranked fan-out order (riskiest → least, in
+# pairs), the canary-selection rule, and the change-handling playbook
+# live in docs/agents/propagation-ordering.md — reviewed monthly and
+# tracked in issue #492.
 
 # Schema version. Bumped on incompatible changes; the script refuses
 # to run against an unknown version so old scripts can't silently
