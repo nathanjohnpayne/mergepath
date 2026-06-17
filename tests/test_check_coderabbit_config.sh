@@ -96,7 +96,7 @@ run_case() {
 # ---------------------------------------------------------------------------
 
 # Happy path on the template: profile=chill → PASS.
-run_case "template_profile_chill_passes" 0 "PASS (reviews.profile=chill)" \
+run_case "template_profile_chill_passes" 0 "reviews.profile=chill; safety floor OK" \
   "force" \
   "reviews:
   profile: chill"
@@ -135,6 +135,69 @@ run_case "consumer_malformed_yaml_fails" 1 "does not parse as YAML" \
   "reviews:
   profile: chill
   - this: is not valid yaml at this indent: [unterminated"
+
+# --- Safety-posture floor (#481) -------------------------------------
+#
+# auto_review.enabled / request_changes_workflow are enforced
+# UNIVERSALLY (template AND consumer), unlike the template-only profile
+# gate. FAIL only on the explicit dangerous literal; an absent key is
+# the safe default and passes.
+
+# Consumer: auto_review.enabled=false → FAIL (silent-disable guard).
+run_case "consumer_auto_review_disabled_fails" 1 "reviews.auto_review.enabled is false" \
+  "skip" \
+  "reviews:
+  profile: assertive
+  auto_review:
+    enabled: false"
+
+# Template: auto_review.enabled=false → FAIL too (floor is universal,
+# fires before the template profile gate).
+run_case "template_auto_review_disabled_fails" 1 "reviews.auto_review.enabled is false" \
+  "force" \
+  "reviews:
+  profile: chill
+  auto_review:
+    enabled: false"
+
+# Consumer: request_changes_workflow=true → FAIL (don't-hard-block guard).
+run_case "consumer_request_changes_true_fails" 1 "reviews.request_changes_workflow is true" \
+  "skip" \
+  "reviews:
+  profile: assertive
+  request_changes_workflow: true"
+
+# Template: request_changes_workflow=true → FAIL too.
+run_case "template_request_changes_true_fails" 1 "reviews.request_changes_workflow is true" \
+  "force" \
+  "reviews:
+  profile: chill
+  request_changes_workflow: true"
+
+# Consumer: full safe posture → PASS, floor reported OK.
+run_case "consumer_safe_posture_passes" 0 "safety floor OK" \
+  "skip" \
+  "reviews:
+  profile: assertive
+  request_changes_workflow: false
+  auto_review:
+    enabled: true"
+
+# Template: full safe posture + chill → PASS with floor OK.
+run_case "template_safe_posture_passes" 0 "safety floor OK" \
+  "force" \
+  "reviews:
+  profile: chill
+  request_changes_workflow: false
+  auto_review:
+    enabled: true"
+
+# Absent posture keys are the safe default → floor passes (only profile
+# set; no auto_review / request_changes_workflow block).
+run_case "consumer_absent_posture_keys_pass" 0 "safety floor OK" \
+  "skip" \
+  "reviews:
+  profile: assertive"
 
 # Substring assertion via `case` glob — works across newlines where
 # the parameter-expansion `${out#*X}` idiom is unreliable in bash 3.2.

@@ -803,6 +803,26 @@ grep -q 'chmod +x "$consumer_target"' "$SCRIPT" \
 grep -q 'update-index --chmod="$tpl_idx_chmod"' "$SCRIPT" \
   || fail "templated render is missing the 'git update-index --chmod' index-mode staging — mode flips would be lost under core.filemode=false (#475)"
 
+# Canonical mirror arms (sync_open_pr AND sync_all_open_pr) must ALSO stage
+# the dest mode in the git INDEX, exactly like the templated arm — under
+# core.filemode=false the blanket `git add -A` drops a mode-only flip on an
+# existing tracked file, so an executable canonical script (far more common
+# than a templated executable) would propagate non-executable (#476). Both
+# arms share the `$idx_chmod` var, so require the staging to appear twice
+# (one per arm). `|| true`: grep -c exits 1 on zero matches under set -e —
+# the real assertion is the count check below, this just captures the count.
+canonical_idx_count=$(grep -c 'update-index --chmod="$idx_chmod"' "$SCRIPT" || true)
+[ "${canonical_idx_count:-0}" -ge 2 ] \
+  || fail "canonical mirror arms are missing 'git update-index --chmod=\$idx_chmod' index-mode staging in both sync_open_pr and sync_all_open_pr (found ${canonical_idx_count:-0}, need 2) — exec-mode flips would be lost under core.filemode=false (#476)"
+
+# Kit mirror arm: mirror both the chmod-branch greps and the index-staging.
+grep -q 'chmod -x "$consumer_kit_target"' "$SCRIPT" \
+  || fail "kit mirror is missing the 'chmod -x' branch — mode drift would persist on 100644 kit sources (#476)"
+grep -q 'chmod +x "$consumer_kit_target"' "$SCRIPT" \
+  || fail "kit mirror is missing the 'chmod +x' branch (#476)"
+grep -q 'update-index --chmod="$kit_idx_chmod"' "$SCRIPT" \
+  || fail "kit mirror is missing the 'git update-index --chmod' index-mode staging — kit exec-mode flips would be lost under core.filemode=false (#476)"
+
 # ---------------------------------------------------------------------------
 # Deletion propagation + tmpdir portability (cursor CHANGES_REQUESTED on
 # PR #217). Two source-grep assertions because the live cycle isn't
