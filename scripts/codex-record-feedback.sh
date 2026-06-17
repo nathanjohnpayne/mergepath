@@ -512,8 +512,7 @@ post_reaction() {
   local endpoint=$1
   local content=$2
   [ -x "$AS_REVIEWER" ] || die 3 "gh-as-reviewer.sh helper missing or non-executable: $AS_REVIEWER"
-  GH_AS_REVIEWER_IDENTITY="$REVIEWER_IDENTITY" "$AS_REVIEWER" -- \
-    gh api -X POST "$endpoint" -f "content=$content" >/dev/null 2>&1
+  GH_AS_REVIEWER_IDENTITY="$REVIEWER_IDENTITY" "$AS_REVIEWER" -- gh api -X POST "$endpoint" -f "content=$content" >/dev/null 2>&1
 }
 
 # Append one JSONL verdict record to the ledger.
