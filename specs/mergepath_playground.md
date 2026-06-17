@@ -26,10 +26,14 @@ reserved, see [`BRAND.md`](../BRAND.md).
   exposes.
 - Changing any knob updates stats, flows, and YAML without a full
   reload.
-- The control rail and workspace are their own scroll containers and
-  scroll in sync: scrolling one advances the other proportionally so
-  a long PR list and a short control stack stay aligned without the
-  shorter pane getting stranded.
+- The control rail and workspace are their own scroll containers. In the
+  side-by-side (desktop) layout they scroll in sync: scrolling one
+  advances the other proportionally so a long PR list and a short control
+  stack stay aligned without the shorter pane getting stranded. At the
+  `max-width: 960px` stacked breakpoint the columns stack vertically and
+  scroll independently — the sync is disabled there (it would otherwise
+  fight the user), gated on a `matchMedia('(max-width: 960px)')` check
+  read live on each scroll.
 - The page carries an HTML comment injection marker
   `<!-- MERGEPATH_INJECT -->` that `scripts/policy-sim.sh` rewrites
   to `<script>window.__PRS = [...]</script>`. The legacy marker
@@ -62,7 +66,9 @@ reserved, see [`BRAND.md`](../BRAND.md).
 - **Accessibility.** The modal is a true dialog: `role="dialog"`,
   `aria-modal`, `aria-labelledby`, `aria-describedby`, focus moves
   into the dialog on open and returns to the trigger on close, Tab
-  wraps within the dialog, Escape closes. An `aria-live="polite"`
+  wraps within the dialog, and the modal closes on Escape **or** on a
+  click on the backdrop outside the dialog surface (the backdrop click
+  is ignored when it originates inside the dialog). An `aria-live="polite"`
   region announces path add/remove, preset application, YAML and
   command copy. Reduced-motion preferences are respected.
 - **PR normalization.** Injected PR entries are coerced through a
