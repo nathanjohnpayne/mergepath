@@ -432,7 +432,7 @@ propagation-lane PRs.
 > **Note on automation timing:** CI workflows may apply the `needs-external-review` label automatically when a PR is opened or updated, as an early advisory based on line count and protected paths. The label blocks merge via the label-gate until external review clears. When the label is present, the agent's responsibility after internal review passes is to proceed to [Phase 4](#phase-4-external-review) — which routes the PR to Phase 4a (automated via the Codex GitHub App) or Phase 4b (manual handoff) depending on `codex.enabled` and on whether 4a converges. The label itself does NOT imply immediate human mediation; Phase 4b only posts the handoff message when the fallback path is actually taken.
 
 8. After internal review passes, the agent evaluates whether the PR meets the external review threshold (see [Review Policy Configuration](#review-policy-configuration)).
-9. If the threshold is **not** met, the agent runs the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate), then merges the PR as `nathanjohnpayne`. Done.
+9. If the threshold is **not** met: when `codex.request_by_default` is `true` (the default) and `codex.enabled` is not `false`, the agent first requests a Codex review by running `scripts/codex-review-request.sh <PR#>` (without `MERGEPATH_PHASE_4A_GATED`) so the `@codex review` trigger is posted on this under-threshold PR — see [`codex.request_by_default`](#codexrequest_by_default--request-codex-on-every-pr-486). The agent **is** the caller; there is no separate workflow auto-caller. This trigger is **advisory and does not gate the merge** — the threshold (not `request_by_default`) governs the merge gate, so an exit `4` (timeout) or `5` (`NO_TRIGGER_REQUESTED`) does not block. The agent then runs the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate) and merges the PR as `nathanjohnpayne` once that gate is clean. Done.
 10. If the threshold **is** met, the agent proceeds to [Phase 4: External Review](#phase-4-external-review). Phase 4 itself routes the PR to Phase 4a (automated, via the Codex GitHub App) or Phase 4b (manual handoff) based on `codex.enabled` in `.github/review-policy.yml` and on whether 4a's automated loop converges. The agent does NOT post a handoff message directly from this step — Phase 4b posts its own handoff message if and when the fallback path is taken.
 
 ### Phase 3.5: Propagation PR review lane
@@ -929,6 +929,7 @@ coderabbit:
 # per-repo install state and its "Automatic reviews" setting.
 codex:
   enabled: true
+  request_by_default: true                    # post `@codex review` on EVERY PR, not just above-threshold (#486)
   bot_login: "chatgpt-codex-connector[bot]"   # REST API form, with [bot] suffix
   cli_login: nathanpayne-codex                # manual CLI fallback (Phase 4b)
   max_review_rounds: 2                        # runaway guard; 3rd round escalates
@@ -952,6 +953,17 @@ dependabot:
 
 > **Note on `enabled` flags (both `coderabbit` and `codex`).** These flags govern **agent behavior only** — whether the authoring agent waits for the corresponding review in its phase. They do NOT control whether the underlying GitHub App runs. Both apps run based on their own install state on GitHub, independent of what this YAML says. Setting `coderabbit.enabled: false` alone will cause the agent to skip the CodeRabbit phase while the app continues to post reviews silently in the background. Setting `codex.enabled: false` routes the agent to Phase 4b and makes `scripts/codex-review-check.sh` ignore Codex bot reviews/reactions for the merge gate, but the Codex App may still post comments unless it is disabled in ChatGPT/GitHub. To fully disable an integration, uninstall or disable the GitHub App AND set the flag to false.
 
+### `codex.request_by_default` — request Codex on every PR (#486)
+
+`codex.request_by_default` (default `true`) decouples the `@codex review` trigger from the external-review threshold. It governs whether **the agent** posts `@codex review` on every PR: the agent is the caller that runs `scripts/codex-review-request.sh` from the workflow, and there is no separate workflow auto-caller that posts the trigger on its own.
+
+- **`true`** — the agent runs `scripts/codex-review-request.sh` on **every** PR, independent of `external_review_threshold` / `external_review_paths`, so the `@codex review` trigger is posted on under-threshold PRs too. For an under-threshold PR the agent posts it during [Phase 3 step 9](#phase-3-external-review-threshold-check) **before merging**, and the trigger is **advisory** — it does not gate the merge (the threshold governs the merge gate; see [Threshold Evaluation](#threshold-evaluation) below). For an above-threshold PR the same trigger is the Phase 4a entry that *does* gate the merge. This is the full-automation default ([#483](https://github.com/nathanjohnpayne/mergepath/issues/483)).
+- **`false`** — the pre-#486 behavior: the agent requests Codex only when the PR independently qualifies for Phase 4a (lines ≥ threshold **or** a protected-path match), i.e. only as the Phase 4a entry. Under-threshold PRs get no `@codex review`.
+
+The key is **orthogonal to `codex.enabled`**: it governs only *when* the trigger is posted, never *whether* Codex participates. When `codex.enabled: false`, Phase 4a is off and no trigger is posted regardless of `request_by_default`.
+
+`scripts/codex-review-request.sh` parses both keys (via the same `codex_field` helper as the rest of the `codex:` block) and applies them as a Phase 4a entry gate *before* any signal scan or trigger write. It does not recompute the threshold itself — the caller (the agent) tells the worker whether the PR independently qualifies for the gating Phase 4a path by exporting `MERGEPATH_PHASE_4A_GATED=true` (consulted only when `request_by_default` is `false`); the under-threshold Phase 3 step 9 call omits it. When the gate decides to skip, the script emits JSON with `trigger_requested: false` and exits `5` (`NO_TRIGGER_REQUESTED`) — distinct from a timeout (`4`) or an API error (`3`).
+
 ### Threshold Evaluation
 
 A PR requires external review if **either** condition is true:
@@ -959,7 +971,7 @@ A PR requires external review if **either** condition is true:
 1. Total non-generated lines changed (additions + deletions) ≥ `external_review_threshold`. Lockfiles (`*.lock`, `*lock.json`), minified files (`*.min.js`, `*.min.css`), and generated files (`*.generated.*`) are excluded from the count.
 2. Any file in the PR diff matches a pattern in `external_review_paths`
 
-The agent evaluates this after internal review passes, before merging. CI workflows may also evaluate and label earlier as an advisory (see Phase 3 note above).
+The agent evaluates this after internal review passes, before merging. CI workflows may also evaluate and label earlier as an advisory (see Phase 3 note above). Independently of this threshold, when `codex.request_by_default: true` (the default) the agent posts `@codex review` on every PR — for an under-threshold PR it does so in [Phase 3 step 9](#phase-3-external-review-threshold-check) before merging, via `scripts/codex-review-request.sh`; see [`codex.request_by_default`](#codexrequest_by_default--request-codex-on-every-pr-486) above. The threshold still governs the **merge gate** (whether external clearance is *required* to merge): on an under-threshold PR the Codex trigger is **advisory** and never blocks the merge, while on an above-threshold PR the same trigger is the gating Phase 4a entry. `request_by_default` governs only whether the Codex trigger is *posted*, not whether clearance is required.
 
 ## Git Identity Switching
 

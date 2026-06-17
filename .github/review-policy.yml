@@ -274,6 +274,29 @@ coderabbit:
 codex:
   enabled: true
 
+  # Request `@codex review` on EVERY PR, not only the ones that meet the
+  # external-review threshold or touch a protected path (#486).
+  #
+  #   true  → Mergepath posts the `@codex review` trigger on every PR,
+  #           independent of `external_review_threshold` /
+  #           `external_review_paths`. An under-threshold PR gets a Codex
+  #           review too. This is the full-automation default (#483).
+  #   false → pre-#486 behavior: the trigger fires only when the PR
+  #           independently qualifies for Phase 4a (lines ≥ threshold OR a
+  #           protected-path match).
+  #
+  # ORTHOGONAL to `enabled` above: `request_by_default` governs only WHEN
+  # the trigger is posted, never WHETHER Codex participates. When
+  # `enabled: false`, Phase 4a is off and NO trigger is posted regardless
+  # of this key.
+  #
+  # Parsed by `scripts/codex-review-request.sh` (the Phase 4a entry
+  # decision) via the same `codex_field` helper the rest of the codex:
+  # block uses. Absent ⇒ true. The script learns whether a PR is
+  # threshold-gated from the caller's `MERGEPATH_PHASE_4A_GATED` env, so
+  # it does not recompute the threshold itself.
+  request_by_default: true
+
   # GitHub login of the Codex GitHub App bot. Reviews posted by this login
   # satisfy the external-review requirement in `.github/workflows/pr-audit.yml`.
   # Do not change unless OpenAI renames the app. Confirmed via GitHub API

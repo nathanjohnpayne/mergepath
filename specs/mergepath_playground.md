@@ -15,7 +15,10 @@ reserved, see [`BRAND.md`](../BRAND.md).
   - external review threshold (slider)
   - protected-path globs (add / remove chips)
   - CodeRabbit toggle
-  - Codex toggle with a max-review-rounds slider
+  - Codex toggle with a max-review-rounds slider and a
+    "request `@codex` on every PR" checkbox (mirrors
+    `codex.request_by_default`; greyed out / hidden with the rest of
+    the Codex nested controls when the Codex toggle is off)
   - reviewer-identity checkboxes
   - Strict / Standard / Loose presets
 - The right workspace shows summary stats, a per-PR routing flow, and
@@ -23,9 +26,12 @@ reserved, see [`BRAND.md`](../BRAND.md).
   button.
 - The YAML preview reflects the current knob state and matches the
   schema of `.github/review-policy.yml` for the subset of keys the UI
-  exposes.
+  exposes. When Codex is enabled, the `codex:` block serializes
+  `request_by_default` alongside `enabled` and `max_review_rounds`.
 - Changing any knob updates stats, flows, and YAML without a full
-  reload.
+  reload. With the "request `@codex` on every PR" checkbox on, the
+  routing flow shows the Phase 4a (Codex) leg on **every** PR, not only
+  above-threshold ones.
 - The control rail and workspace are their own scroll containers. In the
   side-by-side (desktop) layout they scroll in sync: scrolling one
   advances the other proportionally so a long PR list and a short control
