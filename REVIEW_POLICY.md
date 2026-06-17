@@ -404,11 +404,14 @@ that can change GitHub conversation state.
    branch-protection error "All comments must be resolved" is driven by
    this review-thread state; `gh pr checks`, issue comments, and pull
    request review comments alone are not sufficient readback.
-3. For bot-authored threads only, if the finding has already been fixed
-   on the current HEAD or rebutted on-thread, use
-   `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots` or the
-   identity-checked `resolveReviewThread` path, then query
-   `reviewThreads` again.
+3. For bot-authored current-head threads only, if the finding has
+   already been fixed or rebutted on-thread, use
+   `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots`, then
+   query `reviewThreads` again. For stale bot-authored threads whose
+   finding was fixed by a later commit, use the identity-checked
+   `resolveReviewThread` path directly. If the resolution is not
+   demonstrable from the current HEAD or on-thread rebuttal, request a
+   fresh bot review instead of resolving the thread.
 4. Never auto-resolve human-authored threads. If a human-authored thread
    remains unresolved, stop before merge and wait for the human to
    resolve it or give explicit direction.
@@ -559,7 +562,7 @@ The `phase_4b_default` field in `.github/review-policy.yml` controls when 4b fir
 | `complex-changes` | Run `scripts/phase-4b-classifier.sh` AFTER 4a clears; if any trigger matches, post the 4b handoff before merging. |
 | `always` | Skip the classifier; post the 4b handoff for every external-review-threshold PR. |
 
-**Operating instructions:** the runtime branching that consumes `phase_4b_default` is documented in [CLAUDE.md step 8.5](CLAUDE.md) (and summarized in AGENTS.md § Workflow Summary step 7). Agents read the field via `scripts/codex-review-check.sh` (which parses and exports `PHASE_4B_DEFAULT`), then on `complex-changes` run `scripts/phase-4b-classifier.sh <PR#>` between Phase 4a clearance and merge. The classifier's exit code is load-bearing: 0 (no 4b → merge), 1 (invoke 4b → post handoff per § Handoff Message Format), 2 (config/API error → stop), 3 (bad args → fix invocation).
+**Operating instructions:** the runtime branching that consumes `phase_4b_default` is documented in [CLAUDE.md step 8.5](CLAUDE.md) (and summarized in AGENTS.md § Workflow Summary). Agents read the field via `scripts/codex-review-check.sh` (which parses and exports `PHASE_4B_DEFAULT`), then on `complex-changes` run `scripts/phase-4b-classifier.sh <PR#>` between Phase 4a clearance and merge. The classifier's exit code is load-bearing: 0 (no 4b → merge), 1 (invoke 4b → post handoff per § Handoff Message Format), 2 (config/API error → stop), 3 (bad args → fix invocation).
 
 **Default for new repos:** `complex-changes` (the empirically validated middle ground). **Default for existing repos** that haven't added the field: `fallback-only` (no behavior change without explicit opt-in — see [Migration for existing consumers](#migration-for-existing-consumers) below).
 
@@ -733,7 +736,8 @@ Context: <one line — content classification (novel work, verbatim
          mirror of mergepath@<sha>, sync + N convergence commits, ...)>
 Gate: post APPROVED as nathanpayne-codex on the listed HEAD, OR a
       Codex bot review / 👍 reaction newer than the HEAD committer date.
-Threads: <N> unresolved (auto-resolve-bots once the gate clears).
+Threads: <N> unresolved (resolve addressed bot threads per the pre-merge
+         gate; never resolve human threads automatically).
 ```
 
 **Batch variant** (>1 PR) — emit a markdown table with one row per PR, followed by a single fenced prompt the human can paste into the external reviewer's CLI session:
@@ -756,8 +760,9 @@ Context: <one line — shared content classification if all PRs share
 Gate: for each PR, post APPROVED as nathanpayne-codex on the listed
       HEAD, OR a Codex bot review / 👍 reaction newer than the HEAD
       committer date.
-Threads: see "Unresolved threads" column (auto-resolve-bots once the
-         gate clears).
+Threads: see "Unresolved threads" column (resolve addressed bot threads
+         per the pre-merge gate; never resolve human threads
+         automatically).
 ```
 
 The chat-side block is **additive** to the existing PR-side comment template above. Agents emit both: the PR-side comment is the durable record on the PR; the chat-side block is the human-facing summary that flows into the external CLI session. Neither replaces the other.
