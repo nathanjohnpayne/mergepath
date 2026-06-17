@@ -196,11 +196,16 @@ codex_field() {
     /^codex:/ {in_block=1; next}
     in_block && /^[^[:space:]#]/ {in_block=0}
     in_block {
-      # Match "  field: value" or "  field: \"value\""
+      # Match "  field: value" or a value wrapped in double OR single
+      # quotes. Strip BOTH quote styles (\047 = single quote) so a
+      # single-quoted boolean (valid YAML) survives the == "true"
+      # entry-gate checks below. Matches the quote-tolerance of the
+      # codex_field parser in scripts/codex-review-check.sh and the
+      # workflow parser tests.
       if ($1 == field":") {
         sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-        gsub(/^"/, "", $0)
-        gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+        gsub(/^["\047]/, "", $0)
+        gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
         gsub(/[[:space:]]*#.*$/, "", $0)
         sub(/[[:space:]]+$/, "", $0)
         print

@@ -139,6 +139,26 @@ test_request_by_default_true_triggers_under_threshold() {
   fi
 }
 
+# --- single-quoted booleans ⇒ quotes stripped before the == "true" gate -----
+# Valid single-quoted YAML (`request_by_default: 'true'`, `enabled: 'true'`)
+# must parse as the boolean true, not the literal string "'true'". Before the
+# codex_field quote-stripping fix this triggered the wrong skip (exit 5).
+test_single_quoted_booleans_trigger_under_threshold() {
+  local dir rc count
+  dir=$(make_case "rbd-single-quoted" \
+    "  enabled: 'true'"$'\n'"  request_by_default: 'true'")
+  # Not gated (under threshold): only request_by_default can drive the trigger.
+  rc=$(run_case "$dir" false)
+  count=$(trigger_count "$dir")
+  if [ "$rc" != "4" ]; then
+    fail "single-quoted: exit $rc, expected 4 (trigger posted, then timeout); stderr=$(cat "$dir/err.log")"
+  elif [ "$count" != "1" ]; then
+    fail "single-quoted: trigger count $count, expected 1 (quotes must be stripped before == \"true\")"
+  else
+    pass "single-quoted enabled/request_by_default ⇒ quotes stripped, trigger posted"
+  fi
+}
+
 # --- request_by_default: false + not gated ⇒ skip (exit 5, no trigger) ------
 test_request_by_default_false_skips_under_threshold() {
   local dir rc count requested head
@@ -195,6 +215,7 @@ test_enabled_false_never_triggers() {
 
 test_defaults_request_on_every_pr
 test_request_by_default_true_triggers_under_threshold
+test_single_quoted_booleans_trigger_under_threshold
 test_request_by_default_false_skips_under_threshold
 test_request_by_default_false_triggers_when_gated
 test_enabled_false_never_triggers
