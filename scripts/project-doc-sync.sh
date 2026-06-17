@@ -120,6 +120,21 @@ clone_for_audit() {
   local name=$1 repo=$2
   local target="$CACHE_DIR/$name"
   if [ -e "$target/.git" ]; then
+    local phys_target phys_cache
+    if [ -L "$target" ]; then
+      err "refusing to refresh $target - it is a symbolic link"
+      return 1
+    fi
+    phys_target=$(cd "$target" 2>/dev/null && pwd -P) || return 1
+    phys_cache=$(mkdir -p "$CACHE_DIR" && cd "$CACHE_DIR" 2>/dev/null && pwd -P) || return 1
+    case "$phys_target/" in
+      "$phys_cache"/*) ;;
+      *)
+        err "refusing to refresh $target - physical path escapes cache root"
+        return 1
+        ;;
+    esac
+
     if [ "$(git -C "$target" rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
       git -C "$target" fetch --unshallow --quiet origin >&2 || return 1
     fi

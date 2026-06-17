@@ -122,6 +122,36 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --
 rc=$?
 [ "$rc" -eq 0 ] || fail "audit should pass after orphan removal (rc=$rc): $out"
 
+CACHE_ROOT="$WORKDIR/cache"
+SYMLINK_MP="$WORKDIR/mergepath-symlink-cache"
+mkdir -p "$CACHE_ROOT" "$SYMLINK_MP/scripts"
+cp "$SCRIPT" "$SYMLINK_MP/scripts/project-doc-sync.sh"
+chmod +x "$SYMLINK_MP/scripts/project-doc-sync.sh"
+ln -s "$DOCS" "$CACHE_ROOT/docs"
+cat >"$SYMLINK_MP/.mergepath-project-docs.yml" <<EOF
+version: 1
+central_repo:
+  name: docs
+  repo: example/docs
+  path_hint: "$WORKDIR/missing-docs"
+projects:
+  - slug: app
+    owner:
+      name: app
+      repo: example/app
+      path_hint: "$APP"
+    prds:
+      - slug: app
+        source: projects/app/prds/app.md
+        mirror: docs/projects/app/prds/app.md
+EOF
+set +e
+out=$(MERGEPATH_ROOT_OVERRIDE="$SYMLINK_MP" MERGEPATH_PROJECT_DOCS_CACHE="$CACHE_ROOT" \
+  "$SYMLINK_MP/scripts/project-doc-sync.sh" --audit 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "audit should refuse symlinked cache checkout (rc=$rc): $out"
+
 printf '\nlocal edit\n' >>"$DOCS/projects/app/specs/feature.md"
 set +e
 out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
