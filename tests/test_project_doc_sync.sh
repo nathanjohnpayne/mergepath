@@ -216,4 +216,122 @@ set -e
 echo "$out" | grep -q "DRIFT app spec:feature" \
   || fail "manual central spec edit should report drift: $out"
 
+# ---------------------------------------------------------------------------
+# Mapping/project lifecycle: orphan detection must fire even when the manifest
+# mapping (or the whole project) that anchored a mirror is removed — not only
+# when a single source file is deleted. The orphan pass is project-driven, so a
+# project that stays in the manifest but loses a class mapping is still swept.
+# ---------------------------------------------------------------------------
+MANIFEST="$MP/.mergepath-project-docs.yml"
+ORIG_MANIFEST="$WORKDIR/manifest.orig"
+cp "$MANIFEST" "$ORIG_MANIFEST"
+resync() { MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null; }
+restore_manifest() { cp "$ORIG_MANIFEST" "$MANIFEST"; }
+
+# Re-sync to a clean baseline (the manual-edit case above left feature.md drifted).
+resync
+out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] || fail "lifecycle baseline should be clean (rc=$rc): $out"
+
+# F1: a project's prds: mapping removed (project entry stays) → its PRD mirror
+# in the owner repo is orphaned, flagged on audit and removed on materialize.
+cat >"$MANIFEST" <<EOF
+version: 1
+central_repo:
+  name: docs
+  repo: example/docs
+  path_hint: "$DOCS"
+projects:
+  - slug: app
+    owner:
+      name: app
+      repo: example/app
+      path_hint: "$APP"
+    specs:
+      - source: specs/
+        mirror: projects/app/specs/
+EOF
+set +e
+out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "F1 audit should flag orphan PRD mirror after prds mapping removed (rc=$rc): $out"
+echo "$out" | grep -q "DRIFT app prd:app orphan" \
+  || fail "F1: orphan PRD mirror not reported after prds mapping removed: $out"
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
+[ ! -e "$APP/docs/projects/app/prds/app.md" ] \
+  || fail "F1 materialize should remove orphan PRD mirror after prds mapping removed"
+restore_manifest; resync
+
+# F2: a project's specs: mapping removed (project entry stays) → its central
+# spec mirror is orphaned, flagged on audit and removed on materialize.
+cat >"$MANIFEST" <<EOF
+version: 1
+central_repo:
+  name: docs
+  repo: example/docs
+  path_hint: "$DOCS"
+projects:
+  - slug: app
+    owner:
+      name: app
+      repo: example/app
+      path_hint: "$APP"
+    prds:
+      - slug: app
+        source: projects/app/prds/app.md
+        mirror: docs/projects/app/prds/app.md
+EOF
+set +e
+out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "F2 audit should flag orphan spec mirror after specs mapping removed (rc=$rc): $out"
+echo "$out" | grep -q "DRIFT app spec:feature orphan" \
+  || fail "F2: orphan spec mirror not reported after specs mapping removed: $out"
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
+[ ! -e "$DOCS/projects/app/specs/feature.md" ] \
+  || fail "F2 materialize should remove orphan spec mirror after specs mapping removed"
+restore_manifest; resync
+
+# F4: the owner's entire specs/ source is emptied while the specs mapping stays
+# → every central spec mirror is orphaned, flagged and removed.
+mv "$APP/specs/feature.md" "$WORKDIR/feature.stash"
+set +e
+out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "F4 audit should flag orphan spec mirror when source emptied (rc=$rc): $out"
+echo "$out" | grep -q "DRIFT app spec:feature orphan" \
+  || fail "F4: orphan spec mirror not reported when source emptied: $out"
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
+[ ! -e "$DOCS/projects/app/specs/feature.md" ] \
+  || fail "F4 materialize should remove orphan spec mirror when source emptied"
+mv "$WORKDIR/feature.stash" "$APP/specs/feature.md"; resync
+
+# F3 (central side): a project removed from the manifest entirely → its
+# generated central spec mirror is caught by the full-audit non-manifest sweep.
+# (A --projects-scoped run must NOT touch it; owner-side PRD mirrors of a fully
+# removed project are an accepted, documented limitation.)
+cat >"$MANIFEST" <<EOF
+version: 1
+central_repo:
+  name: docs
+  repo: example/docs
+  path_hint: "$DOCS"
+projects: []
+EOF
+set +e
+out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "F3 full audit should flag central spec mirror of a removed project (rc=$rc): $out"
+echo "$out" | grep -q "app spec:feature orphan (project not in manifest)" \
+  || fail "F3: removed-project central spec mirror not reported: $out"
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize >/dev/null
+[ ! -e "$DOCS/projects/app/specs/feature.md" ] \
+  || fail "F3 materialize should remove central spec mirror of a removed project"
+restore_manifest; resync
+
 echo "PASS: project-doc-sync"
