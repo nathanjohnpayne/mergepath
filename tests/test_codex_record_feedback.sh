@@ -353,7 +353,7 @@ EOF
     fail "scan head-pinned: reacted on the STALE (non-HEAD) finding 1300"
   elif ! grep -q 'comments/1301/reactions' "$(posts_file "$dir")" 2>/dev/null; then
     fail "scan head-pinned: did not react on the current-HEAD finding 1301; posts=$(cat "$(posts_file "$dir")" 2>/dev/null)"
-  elif [ "$(jq -r '[.skipped[] | select(.comment_id==1300)] | length' "$dir/out.json")" != "1" ]; then
+  elif [ "$(jq -r '[.skipped[] | select(.comment_id==1300 and .why=="not-found")] | length' "$dir/out.json")" != "1" ]; then
     fail "scan head-pinned: verdict for stale 1300 should be reported not-found"
   else
     pass "scan picks up only the current-HEAD latest-round finding (HEAD-pinned)"
