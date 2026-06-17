@@ -11,7 +11,7 @@ Authoring-Agent: <!-- claude | codex | cursor -->
 > `human-hold` / `needs-human-review` / `policy-violation` label (`human-hold`
 > is a human-remove-only freeze) — or (2) **a Phase 4b handoff is required** —
 > an above-threshold / protected-path PR routed to human-mediated external
-> review. See REVIEW_POLICY.md § Default disposition.
+> review.
 
 ## Summary
 - Describe the change.
