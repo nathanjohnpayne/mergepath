@@ -120,14 +120,17 @@ clone_for_audit() {
   local name=$1 repo=$2
   local target="$CACHE_DIR/$name"
   if [ -e "$target/.git" ]; then
-    git -C "$target" fetch --depth=1 --quiet origin HEAD >&2 || return 1
+    if [ "$(git -C "$target" rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
+      git -C "$target" fetch --unshallow --quiet origin >&2 || return 1
+    fi
+    git -C "$target" fetch --quiet origin HEAD >&2 || return 1
     git -C "$target" reset --hard --quiet FETCH_HEAD >&2 || return 1
     printf '%s\n' "$target"
     return 0
   fi
   [ "$NO_CLONE" = "1" ] && return 1
   mkdir -p "$CACHE_DIR"
-  gh repo clone "$repo" "$target" -- --depth=1 --quiet >&2 || return 1
+  gh repo clone "$repo" "$target" -- --quiet >&2 || return 1
   printf '%s\n' "$target"
 }
 
