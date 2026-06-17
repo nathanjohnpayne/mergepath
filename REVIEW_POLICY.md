@@ -548,6 +548,20 @@ absent, the workflow stops after validation and leaves manual author
 merge as the default. Reviewer tokens such as
 `REVIEWER_ASSIGNMENT_TOKEN` must not be used for PR merges.
 
+Arming is not one-shot on the approval event. The job arms on two
+triggers (#495): the original `pull_request_review` + `approved`
+event, and a `pull_request` `synchronize` / `reopened` **re-arm**
+path. The re-arm path retries `gh pr merge --auto` after a fix-commit
+— the common case where a late Codex finding lands at or after the
+author's approval and the fix push would otherwise never re-arm — but
+only when the PR already carries a valid non-author latest-state
+`APPROVED` review (the same latest-state-per-reviewer collapse the
+merge gate uses, so a withdrawn approval does not re-arm). A push with
+no existing approval does NOT arm. Every gate (CodeRabbit wait,
+`AUTHOR_MERGE_TOKEN` identity, blocking-label re-verify) re-applies on
+the new HEAD, and the call is idempotent when `--auto` is already
+enabled.
+
 #### Phase 4b: Manual CLI Fallback (Human Handoff)
 
 Phase 4b is invoked when Phase 4a escalates to disagreement or runaway, times out (single timeout, exit code `4` from `codex-review-request.sh`), or when `codex.enabled: false` in the repo. It preserves the cross-agent review flow that existed before the Codex GitHub App integration and provides a human-mediated escape hatch.
