@@ -42,6 +42,11 @@ cat >"$APP/specs/feature.md" <<'EOF'
 
 Implementation contract.
 EOF
+cat >"$APP/specs/old.md" <<'EOF'
+# Old Spec
+
+Will be deleted to verify orphan mirror detection.
+EOF
 git init -q "$DOCS"
 (cd "$DOCS" && git add -A && git -c user.name=t -c user.email=t@example.com commit -q -m docs)
 git init -q "$APP"
@@ -84,6 +89,8 @@ MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --
   || fail "materialize did not create repo-local PRD mirror"
 [ -f "$DOCS/projects/app/specs/feature.md" ] \
   || fail "materialize did not create central spec mirror"
+[ -f "$DOCS/projects/app/specs/old.md" ] \
+  || fail "materialize did not create second central spec mirror"
 
 grep -q "do_not_edit: true" "$APP/docs/projects/app/prds/app.md" \
   || fail "PRD mirror missing generated header"
@@ -97,6 +104,23 @@ grep -q "source_repo: example/app" "$DOCS/projects/app/specs/feature.md" \
 out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] || fail "audit should pass after materialize (rc=$rc): $out"
+
+rm "$APP/specs/old.md"
+set +e
+out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "audit should catch orphaned generated spec mirror (rc=$rc): $out"
+echo "$out" | grep -q "DRIFT app spec:old orphan" \
+  || fail "orphan generated spec mirror should report drift: $out"
+
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
+[ ! -e "$DOCS/projects/app/specs/old.md" ] \
+  || fail "materialize should remove orphaned generated spec mirror"
+
+out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] || fail "audit should pass after orphan removal (rc=$rc): $out"
 
 printf '\nlocal edit\n' >>"$DOCS/projects/app/specs/feature.md"
 set +e

@@ -223,6 +223,25 @@ compare_or_materialize() {
   fi
 }
 
+is_generated_spec_mirror() {
+  local file=$1 source_repo=$2 project=$3
+  sed -n '1,14p' "$file" | grep -Fqx "generated_by: scripts/project-doc-sync.sh" &&
+    sed -n '1,14p' "$file" | grep -Fqx "source_repo: ${source_repo}" &&
+    sed -n '1,14p' "$file" | grep -Fqx "project: ${project}" &&
+    sed -n '1,14p' "$file" | grep -Fqx "document_class: spec"
+}
+
+handle_orphan_spec_mirror() {
+  local label=$1 target=$2
+  if [ "$MODE" = "materialize" ]; then
+    rm -f "$target"
+    printf "REMOVE %s\n" "$label"
+    return 0
+  fi
+  printf "DRIFT %s\n" "$label"
+  DRIFT_FOUND=1
+}
+
 process_prds() {
   local manifest=$1 central_root=$2 central_repo=$3 central_hint=$4
   local rows
@@ -298,9 +317,14 @@ process_specs() {
       continue
     fi
 
+    local expected_rels
+    expected_rels=$(mktemp "${TMPDIR:-/tmp}/project-doc-expected-specs.XXXXXX")
+    local target_dir="$central_root/${mirror%/}"
+
     while IFS= read -r source_file; do
       [ -z "$source_file" ] && continue
       local rel="${source_file#"$source_dir/"}"
+      printf '%s\n' "$rel" >>"$expected_rels"
       local slug="${rel%.md}"
       local target="$central_root/${mirror%/}/$rel"
       local tmp
@@ -310,6 +334,21 @@ process_specs() {
       compare_or_materialize "$project spec:$slug -> ${central_repo}:${mirror%/}/$rel" "$tmp" "$target"
       rm -f "$tmp"
     done < <(find "$source_dir" -type f -name '*.md' -print | LC_ALL=C sort)
+
+    if [ -d "$target_dir" ]; then
+      while IFS= read -r target_file; do
+        [ -z "$target_file" ] && continue
+        local rel="${target_file#"$target_dir/"}"
+        grep -Fxq "$rel" "$expected_rels" && continue
+        is_generated_spec_mirror "$target_file" "$owner_repo" "$project" || continue
+
+        local slug="${rel%.md}"
+        handle_orphan_spec_mirror \
+          "$project spec:$slug orphan -> ${central_repo}:${mirror%/}/$rel" \
+          "$target_file"
+      done < <(find "$target_dir" -type f -name '*.md' -print | LC_ALL=C sort)
+    fi
+    rm -f "$expected_rels"
   done <<< "$rows"
 }
 
