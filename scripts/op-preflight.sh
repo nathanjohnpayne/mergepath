@@ -751,16 +751,32 @@ emit_from_session_file() (
     printf 'export OP_PREFLIGHT_AUTHOR_PAT=%q\n' "$OP_PREFLIGHT_AUTHOR_PAT"
   [[ "${OP_PREFLIGHT_TOKEN_MODE:-0}" == "1" ]] && \
     printf 'export OP_PREFLIGHT_TOKEN_MODE=1\n'
-  [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] && \
-    printf 'export GOOGLE_APPLICATION_CREDENTIALS=%q\n' "$GOOGLE_APPLICATION_CREDENTIALS"
-  [[ -n "${OP_PREFLIGHT_ADC_TMPFILE:-}" ]] && \
-    printf 'export OP_PREFLIGHT_ADC_TMPFILE=%q\n' "$OP_PREFLIGHT_ADC_TMPFILE"
-  [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" ]] && \
-    printf 'export OP_PREFLIGHT_FIREBASE_SA_TMPFILE=%q\n' "$OP_PREFLIGHT_FIREBASE_SA_TMPFILE"
-  [[ -n "${OP_PREFLIGHT_FIREBASE_PROJECT:-}" ]] && \
-    printf 'export OP_PREFLIGHT_FIREBASE_PROJECT=%q\n' "$OP_PREFLIGHT_FIREBASE_PROJECT"
-  [[ -n "${CF_API_TOKEN:-}" ]] && \
-    printf 'export CF_API_TOKEN=%q\n' "$CF_API_TOKEN"
+  # Mode-scope the deploy-credential emission (#466): a review-mode (or
+  # default --check) cache hit must NOT re-export deploy credentials that a
+  # prior `--mode deploy` / `--mode all` run left in the session file. The
+  # deploy-validation block above is already skipped for review mode, so
+  # without this gate a review request silently re-exports stale deploy
+  # creds (GOOGLE_APPLICATION_CREDENTIALS, Firebase SA, CF_API_TOKEN).
+  # Emit them only when the CURRENT request actually asked for deploy creds.
+  if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
+    [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] && \
+      printf 'export GOOGLE_APPLICATION_CREDENTIALS=%q\n' "$GOOGLE_APPLICATION_CREDENTIALS"
+    [[ -n "${OP_PREFLIGHT_ADC_TMPFILE:-}" ]] && \
+      printf 'export OP_PREFLIGHT_ADC_TMPFILE=%q\n' "$OP_PREFLIGHT_ADC_TMPFILE"
+    [[ -n "${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}" ]] && \
+      printf 'export OP_PREFLIGHT_FIREBASE_SA_TMPFILE=%q\n' "$OP_PREFLIGHT_FIREBASE_SA_TMPFILE"
+    [[ -n "${OP_PREFLIGHT_FIREBASE_PROJECT:-}" ]] && \
+      printf 'export OP_PREFLIGHT_FIREBASE_PROJECT=%q\n' "$OP_PREFLIGHT_FIREBASE_PROJECT"
+    [[ -n "${CF_API_TOKEN:-}" ]] && \
+      printf 'export CF_API_TOKEN=%q\n' "$CF_API_TOKEN"
+  else
+    # Review-only request (#466 r2): actively clear any deploy credentials a
+    # prior --mode deploy / --mode all eval exported into the caller's
+    # shell, so a review session does not retain stale deploy creds in its
+    # environment (not just refrain from re-exporting them). Emitting unset
+    # is idempotent when the caller never had them.
+    printf 'unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT CF_API_TOKEN\n'
+  fi
   printf 'export OP_PREFLIGHT_DONE=1\n'
   printf 'export OP_PREFLIGHT_AGENT=%q\n' "$AGENT"
   exit 0

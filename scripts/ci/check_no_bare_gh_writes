@@ -32,7 +32,10 @@ set +e
 awk -v root="$REPO_ROOT/" '
 function bare_write(line) {
   if (line ~ /^[[:space:]]*($|#)/) return 0
-  if (line ~ /NO_BARE_GH_WRITE_EXEMPT:/) return 0
+  # Exemption requires a documented reason after the colon (#466): a bare
+  # NO_BARE_GH_WRITE_EXEMPT: marker with no justification is too weak a
+  # bypass. The error message has always promised "with a reason"; enforce it.
+  if (line ~ /NO_BARE_GH_WRITE_EXEMPT:[[:space:]]*[^[:space:]]/) return 0
   if (line ~ /\\`[^`]*gh[[:space:]]+(pr|issue|api)[^`]*\\`/) return 0
   if (line ~ /^[[:space:]]*(echo|printf)[[:space:]]/ &&
       line !~ /\$\([[:space:]]*gh[[:space:]]+(pr|issue|api)[[:space:]]/ &&
@@ -48,7 +51,10 @@ function bare_write(line) {
   if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+secret[[:space:]]+set([[:space:]]|$)/) return 1
   if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+variable[[:space:]]+set([[:space:]]|$)/) return 1
   if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+project[[:space:]]+(create|edit|field-create|item-add|item-edit)([[:space:]]|$)/) return 1
-  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+api[[:space:]].*(-X[[:space:]]+|--method[[:space:]]+)(POST|PATCH|PUT|DELETE)([[:space:]]|$)/) return 1
+  # Compact and spaced method forms (#466): catch -X POST, -XPOST,
+  # --method POST, and --method=POST (the compact -X<METHOD> / --method=<METHOD>
+  # forms previously slipped through the space-requiring matcher).
+  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+api[[:space:]].*(-X[[:space:]]*|--method[[:space:]]*=?[[:space:]]*)(POST|PATCH|PUT|DELETE)([[:space:]]|$)/) return 1
   if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+api[[:space:]]+graphql/ && line ~ /(mutation|resolveReviewThread|addPullRequestReviewThreadReply|addComment|updateIssue|closeIssue)/) return 1
   return 0
 }

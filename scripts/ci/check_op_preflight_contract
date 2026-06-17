@@ -20,6 +20,7 @@ TESTS=(
   "tests/test_op_preflight_check.sh"
   "tests/test_op_preflight_token_mode.sh"
   "tests/test_helper_autosource.sh"
+  "tests/test_preflight_agent_name.sh"
 )
 
 FAILED=0
