@@ -31,8 +31,10 @@
 #                           Per REVIEW_POLICY.md § Implementation notes
 #                           for branch protection gates: this is a
 #                           CLEAN-UP mechanism, not a policy override.
-#                           Human-authored threads are NEVER auto-
-#                           resolved regardless of mode.
+#                           Non-bot threads are NEVER handled by this
+#                           bot-only mode. Follow REVIEW_POLICY.md's
+#                           pre-merge gate for agent-reviewer vs
+#                           real-human threads.
 #   --dry-run               With --auto-resolve-bots, print what would
 #                           be resolved without mutating.
 #   --rationale <text>      With --auto-resolve-bots, override the
@@ -140,7 +142,7 @@ NO_TAG_REPLY=false
 # (un-suffixed user-facing handle). The trailing `(\[bot\])?` accepts
 # either form so the auto-resolve mode works with the GraphQL data
 # this script reads. Caught on PR #180 review when every CR thread
-# was skipped as "human author" — see #182.
+# was skipped as a non-bot author — see #182.
 BOT_LOGINS_RE='^(coderabbitai|chatgpt-codex-connector|dependabot)(\[bot\])?$'
 
 while [ $# -gt 0 ]; do
@@ -421,8 +423,9 @@ if [ "$MODE" = "list" ]; then
   '
   echo "To resolve bot-authored threads where you have already addressed"
   echo "the finding: re-run with --auto-resolve-bots."
-  echo "Human-authored threads must be resolved via the GitHub UI or by"
-  echo "asking the human. Per REVIEW_POLICY.md § Agent prohibitions."
+  echo "Non-bot threads are not handled by --auto-resolve-bots. Follow"
+  echo "REVIEW_POLICY.md's pre-merge gate for agent-reviewer vs real-human"
+  echo "threads."
   exit 3
 fi
 
@@ -1086,7 +1089,7 @@ while IFS= read -r thread; do
   COMMIT_OID=$(echo "$thread" | jq -r .commit_oid)
 
   if ! [[ "$AUTHOR" =~ $BOT_LOGINS_RE ]]; then
-    echo "  SKIP (human author $AUTHOR): $PATH_"
+    echo "  SKIP (non-bot author $AUTHOR): $PATH_"
     echo "    $EXCERPT"
     SKIPPED_HUMAN=$((SKIPPED_HUMAN + 1))
     continue

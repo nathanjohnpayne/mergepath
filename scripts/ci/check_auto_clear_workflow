@@ -225,6 +225,25 @@ else
   echo "      got:" >&2; echo "$perm_block" | sed 's/^/        /' >&2
 fi
 
+# Issue #499: a successful label removal followed by an unreadable
+# verification read must not leave a permanent failed synthetic
+# `auto-clear-blocking-labels` check-run. The failure-surfacing step
+# gets one last read before posting a check-run; if that read proves
+# the label is already absent, it posts a success check-run with the
+# same name to heal any prior synthetic failure. Both event-driven and
+# scheduled-sweep surfaces need the same behavior.
+heal_title_count=$(grep -c 'Auto-clear confirmed needs-external-review absent' "$WORKFLOW" || true)
+heal_success_count=$(grep -c -- "-f conclusion='success'" "$WORKFLOW" || true)
+heal_read_count=$(grep -c 'current_has_label=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels' "$WORKFLOW" || true)
+valid_label_predicate_count=$(grep -Fc -- "--jq 'any(.labels[]?; .name == \"needs-external-review\")'" "$WORKFLOW" || true)
+if [ "$heal_title_count" -ge 2 ] && [ "$heal_success_count" -ge 2 ] && [ "$heal_read_count" -ge 2 ] && [ "$valid_label_predicate_count" -ge 4 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: infra-failure surfacing heals stale auto-clear check-runs when the label is already absent (#499)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: infra-failure surfacing must re-read label state with a valid jq predicate and post success check-runs when the label is already absent (#499)" >&2
+fi
+
 # Sentinel: rc=3 from codex-review-check.sh sets had_infra_error and
 # the job exits non-zero at the end. Without this, gate-evaluation
 # infrastructure failures would silently leave the workflow green.

@@ -13,7 +13,7 @@ The automated path never pauses to ask for merge permission. It defers to a huma
 1. **The human says otherwise.** An explicit instruction in chat, or a human-action label that the gates enforce — `human-hold` (a human-remove-only hard freeze that supersedes every gate), `needs-human-review`, or `policy-violation`. Agents may add `human-hold` but must never remove it, and must never modify the others (see [Agent prohibitions](#agent-prohibitions)).
 2. **A human handoff or escalation is required.** Either (a) a **Phase 4b handoff** — an above-threshold or protected-path PR where Phase 4a is unavailable or times out, or where `phase_4b_default` routes it to Phase 4b proactively after 4a clearance (`always` for every threshold PR, `complex-changes` only when `scripts/phase-4b-classifier.sh` flags it; see [Phase 4b Triggers](#phase-4b-triggers)); or (b) a **Phase 4a disagreement escalation** — when Codex repeats a finding after a rebuttal, or the round counter exceeds `max_review_rounds`, the agent stops, posts both positions, alerts the human for the tiebreaker, and waits for an explicit decision (see [Disagreements and Tiebreaking](#disagreements-and-tiebreaking)). Phase 4b is the only sanctioned place to post a [handoff message](#handoff-message-format) and wait for a human-mediated external review.
 
-A stuck required gate is separate and non-discretionary, not a disposition choice: a red required check must go green, and a CodeRabbit rate-limit stall (`scripts/coderabbit-wait.sh` exit `5`) must be escalated to the human — alerting does not unblock it; the PR waits for human direction (see [Phase 2.5](#phase-25-automated-external-review-coderabbit)). The agent never works around a stuck gate to merge, but it also never asks permission to merge a green one.
+A stuck required gate is separate and non-discretionary, not a disposition choice: a red required check must go green, unresolved GitHub review conversations must be addressed or resolved per the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate), and a CodeRabbit rate-limit stall (`scripts/coderabbit-wait.sh` exit `5`) must be escalated to the human — alerting does not unblock it; the PR waits for human direction (see [Phase 2.5](#phase-25-automated-external-review-coderabbit)). The agent never works around a stuck gate to merge, but it also never asks permission to merge a green one.
 
 Anything else — a green under-threshold PR, or a Phase 4a clearance where `phase_4b_default` is `fallback-only` or the `complex-changes` classifier exits `0` — merges without a human checkpoint. Presenting a "how far should I take this PR?" disposition prompt on the happy path is a deviation from this policy, not a courtesy.
 
@@ -361,12 +361,23 @@ After internal review passes (Phase 2), CodeRabbit provides an independent autom
    - **Inline review comments on the diff:** `gh api repos/{owner}/{repo}/pulls/{pr_number}/comments` — contains line-by-line findings anchored to specific code.
 3. **Scan for potential issues.** Before proceeding, grep CodeRabbit's inline review comments for `Potential issue` or `⚠️`. These markers indicate findings CodeRabbit considers high-severity. Every such finding must be explicitly addressed (fixed or dismissed with reasoning).
 4. The agent addresses substantive CodeRabbit findings — fixing issues or posting a reply explaining why a finding is not applicable.
-5. The agent is not required to resolve every CodeRabbit comment. Use judgment: fix genuine issues, dismiss false positives with a brief explanation. However, all `Potential issue` / `⚠️` findings require an explicit response.
+5. The agent is not required to fix every CodeRabbit comment. Use judgment: fix genuine issues, dismiss false positives with a brief explanation. However, all `Potential issue` / `⚠️` findings require an explicit response.
 6. CodeRabbit review is advisory. It does not block merge via CI and does not submit a "Changes Requested" review state.
+
+CodeRabbit's advisory status does **not** override GitHub branch
+protection's `required_conversation_resolution` gate. A CodeRabbit
+comment may be left unfixed only when it is not an unresolved GitHub
+review conversation, or when the agent has posted an explicit rationale
+and used the allowed bot-thread resolution path in the
+[Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate).
 
 **CodeRabbit runs on ALL PRs** in enabled repos, regardless of size or whether the external review threshold is met. It provides a consistent automated second opinion on every change.
 
-The agent proceeds to Phase 3 (Threshold Check) after addressing CodeRabbit comments, even if some remain open. CodeRabbit is an additional review layer, not a replacement for the existing threshold-based external agent handoff.
+The agent proceeds to Phase 3 (Threshold Check) after addressing
+CodeRabbit comments, even if some non-blocking comments remain open.
+CodeRabbit is an additional review layer, not a replacement for the
+existing threshold-based external agent handoff or the pre-merge
+conversation-resolution gate.
 
 #### CodeRabbit Review Checklist
 
@@ -379,12 +390,49 @@ Before moving past Phase 2.5, confirm all of the following:
 - [ ] Grepped inline comments for `Potential issue` and `⚠️` — all flagged findings addressed
 - [ ] Substantive findings fixed or dismissed with reasoning
 
+### Pre-Merge Review Conversation Gate
+
+Every merge path must pass this gate immediately before calling
+`gh pr merge`, and must repeat it after any push or review-thread reply
+that can change GitHub conversation state.
+
+1. Query GitHub's review-thread state, not just flat PR comments. Use
+   `scripts/resolve-pr-threads.sh <PR#> --list` or an equivalent GraphQL
+   `reviewThreads` readback that reports each thread's `isResolved`
+   value.
+2. Confirm there are **zero unresolved review conversations**. GitHub's
+   branch-protection error "All comments must be resolved" is driven by
+   this review-thread state; `gh pr checks`, issue comments, and pull
+   request review comments alone are not sufficient readback.
+3. For bot-authored current-head threads only, if the finding has
+   already been fixed or rebutted on-thread, use
+   `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots`, then
+   query `reviewThreads` again. For stale bot-authored threads whose
+   finding was fixed by a later commit, use the identity-checked
+   `resolveReviewThread` path directly. If the resolution is not
+   demonstrable from the current HEAD or on-thread rebuttal, request a
+   fresh bot review instead of resolving the thread.
+4. Registered agent-reviewer threads (`available_reviewers`, for example
+   `nathanpayne-claude`, `nathanpayne-cursor`, and `nathanpayne-codex`)
+   are agent-authored, not real-human-authored. Resolve them only with an
+   identity-checked `resolveReviewThread` path after the finding has been
+   fixed or rebutted and the reviewer identity has accepted the fix,
+   approved the current HEAD, or posted an on-thread acknowledgment.
+5. Never auto-resolve real human-authored threads. If a thread authored
+   by `nathanjohnpayne` or another non-agent human account remains
+   unresolved, stop before merge and wait for the human to resolve it or
+   give explicit direction.
+
+This gate is a branch-protection requirement, not a review-disposition
+choice. It applies to under-threshold PRs, Phase 4a, Phase 4b, and
+propagation-lane PRs.
+
 ### Phase 3: External Review Threshold Check
 
 > **Note on automation timing:** CI workflows may apply the `needs-external-review` label automatically when a PR is opened or updated, as an early advisory based on line count and protected paths. The label blocks merge via the label-gate until external review clears. When the label is present, the agent's responsibility after internal review passes is to proceed to [Phase 4](#phase-4-external-review) — which routes the PR to Phase 4a (automated via the Codex GitHub App) or Phase 4b (manual handoff) depending on `codex.enabled` and on whether 4a converges. The label itself does NOT imply immediate human mediation; Phase 4b only posts the handoff message when the fallback path is actually taken.
 
 8. After internal review passes, the agent evaluates whether the PR meets the external review threshold (see [Review Policy Configuration](#review-policy-configuration)).
-9. If the threshold is **not** met, the agent merges the PR as `nathanjohnpayne`. Done.
+9. If the threshold is **not** met: when `codex.request_by_default` is `true` (the default) and `codex.enabled` is not `false`, the agent first requests a Codex review by running `scripts/codex-review-request.sh <PR#>` (without `MERGEPATH_PHASE_4A_GATED`) so the `@codex review` trigger is posted on this under-threshold PR — see [`codex.request_by_default`](#codexrequest_by_default--request-codex-on-every-pr-486). The agent **is** the caller; there is no separate workflow auto-caller. This trigger is **advisory and does not gate the merge** — the threshold (not `request_by_default`) governs the merge gate, so an exit `4` (timeout) or `5` (`NO_TRIGGER_REQUESTED`) does not block. The agent then runs the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate) and merges the PR as `nathanjohnpayne` once that gate is clean. Done.
 10. If the threshold **is** met, the agent proceeds to [Phase 4: External Review](#phase-4-external-review). Phase 4 itself routes the PR to Phase 4a (automated, via the Codex GitHub App) or Phase 4b (manual handoff) based on `codex.enabled` in `.github/review-policy.yml` and on whether 4a's automated loop converges. The agent does NOT post a handoff message directly from this step — Phase 4b posts its own handoff message if and when the fallback path is taken.
 
 ### Phase 3.5: Propagation PR review lane
@@ -486,7 +534,9 @@ issue, can satisfy the Phase 4a signal.
 
      **No-self-approve rule + branch 2 interaction:** the rule "agents do not `--approve` a PR they authored under their own reviewer identity" applies to Phase 4 PRs (above `external_review_threshold` or matching `external_review_paths`) — that's the scope this section is in. For under-threshold PRs the reviewer identity is allowed and expected to `--approve`; see [No-self-approve scoping](#no-self-approve-scoping) above. Branch 2 is what makes the rule operational for the Phase 4 case — without it, same-agent PRs would deadlock on gate (b) with no escape short of human override. With branch 2, the agent posts a `--comment` review under its reviewer identity (per the rule), and the Codex 👍 carries the cross-check weight.
 
-17a. On a passing merge gate, `nathanjohnpayne` merges the PR with `gh pr merge <n> --squash --delete-branch`. Never `--admin` unless the human explicitly authorizes a break-glass override in chat.
+17a. On a passing merge gate, the agent runs the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate). If any unresolved thread remains, stop before merge and address or resolve it through the allowed path.
+
+18a. After the merge gate and review-conversation gate are both clean, `nathanjohnpayne` merges the PR with `gh pr merge <n> --squash --delete-branch`. Never `--admin` unless the human explicitly authorizes a break-glass override in chat.
 
 The non-Dependabot `auto-merge-on-approval` workflow is opt-in only:
 it may call `gh pr merge` only when the repo has an
@@ -516,7 +566,9 @@ Phase 4b is invoked when Phase 4a escalates to disagreement or runaway, times ou
 
 18b. If the external reviewer flags **observations** or **risks** while approving, those are converted to GitHub Issues on the repo, assigned to `nathanjohnpayne` (see [Post-Merge Issue Creation](#post-merge-issue-creation)).
 
-19b. `nathanjohnpayne` merges the PR. Done.
+19b. The agent runs the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate). If any unresolved thread remains, stop before merge and address or resolve it through the allowed path.
+
+20b. `nathanjohnpayne` merges the PR. Done.
 
 **Auto-clear of `needs-external-review` on Phase 4b clearance.** The `auto-clear-blocking-labels.yml` workflow's gate-evaluation script (`scripts/codex-review-check.sh`) accepts a Phase 4b external reviewer's `APPROVED` on the current HEAD as gate (c) clearance equivalent to Codex (governed by `codex.allow_phase_4b_substitute` in `.github/review-policy.yml`, default `true`; #218). When `codex.enabled: false`, this Phase 4b substitute is the only gate-(c) clearance path; stray Codex bot reviews/reactions are ignored even if the GitHub App is still installed. The auto-clear workflow then removes `needs-external-review` on the next event-driven trigger or scheduled sweep — no human-driven label removal is needed on the Phase 4b happy path. Set the knob to `false` for repos that genuinely require Codex-only clearance (e.g., where the Codex App provides domain-specific checks no other reviewer matches).
 
@@ -532,7 +584,7 @@ The `phase_4b_default` field in `.github/review-policy.yml` controls when 4b fir
 | `complex-changes` | Run `scripts/phase-4b-classifier.sh` AFTER 4a clears; if any trigger matches, post the 4b handoff before merging. |
 | `always` | Skip the classifier; post the 4b handoff for every external-review-threshold PR. |
 
-**Operating instructions:** the runtime branching that consumes `phase_4b_default` is documented in [CLAUDE.md step 8.5](CLAUDE.md) (and summarized in AGENTS.md § Workflow Summary step 7). Agents read the field via `scripts/codex-review-check.sh` (which parses and exports `PHASE_4B_DEFAULT`), then on `complex-changes` run `scripts/phase-4b-classifier.sh <PR#>` between Phase 4a clearance and merge. The classifier's exit code is load-bearing: 0 (no 4b → merge), 1 (invoke 4b → post handoff per § Handoff Message Format), 2 (config/API error → stop), 3 (bad args → fix invocation).
+**Operating instructions:** the runtime branching that consumes `phase_4b_default` is documented in [CLAUDE.md step 8.5](CLAUDE.md) (and summarized in AGENTS.md § Workflow Summary). Agents read the field via `scripts/codex-review-check.sh` (which parses and exports `PHASE_4B_DEFAULT`), then on `complex-changes` run `scripts/phase-4b-classifier.sh <PR#>` between Phase 4a clearance and merge. The classifier's exit code is load-bearing: 0 (no 4b → merge), 1 (invoke 4b → post handoff per § Handoff Message Format), 2 (config/API error → stop), 3 (bad args → fix invocation).
 
 **Default for new repos:** `complex-changes` (the empirically validated middle ground). **Default for existing repos** that haven't added the field: `fallback-only` (no behavior change without explicit opt-in — see [Migration for existing consumers](#migration-for-existing-consumers) below).
 
@@ -592,7 +644,7 @@ When you pull this template change into an existing repo, the new `phase_4b_defa
   │  PHASE 2.5: CODERABBIT REVIEW (if enabled)               │
   │  CodeRabbit auto-posts review on PR                      │
   │  Agent reads findings, addresses substantive issues      │
-  │  Advisory only — does not block merge                    │
+  │  Advisory via CI; conversations still clear later        │
   └──────────────────────────┬──────────────────────────────┘
                              │
                              ▼
@@ -600,7 +652,8 @@ When you pull this template change into an existing repo, the new `phase_4b_defa
   │  PHASE 3: THRESHOLD CHECK                                │
   │  Lines changed ≥ threshold OR protected paths touched?   │
   │                                                          │
-  │  NO ──→ nathanjohnpayne merges. Done.                    │
+  │  NO ──→ Pre-merge review conversation gate               │
+  │          then nathanjohnpayne merges. Done.              │
   │  YES ──→ Proceed to Phase 4                              │
   └──────────────────────────┬──────────────────────────────┘
                              │
@@ -640,10 +693,20 @@ When you pull this template change into an existing repo, the new `phase_4b_defa
              │                  │  Agent fixes. Repeat.       │
              ▼                  │                            │
   ┌──────────────────────────┐  │  Observations/risks →      │
-  │  nathanjohnpayne merges  │  │  GitHub Issues             │
+  │  PRE-MERGE CONVERSATION  │  │  GitHub Issues             │
+  │  GATE: zero unresolved   │  │                            │
+  │  review conversations    │  │  Pre-merge conversation    │
+  │                          │  │  gate: zero unresolved     │
+  │  Addressed bot threads   │  │  review conversations.     │
+  │  may be resolved; human  │  │                            │
+  │  threads stop the merge. │  │  nathanjohnpayne merges.   │
+  └──────────┬───────────────┘  │  Done.                     │
+             │                  │                            │
+             ▼                  │                            │
+  ┌──────────────────────────┐  │                            │
+  │  nathanjohnpayne merges  │  │                            │
   │  (--squash). Done.       │  │                            │
-  └──────────────────────────┘  │  nathanjohnpayne merges.   │
-                                │  Done.                     │
+  └──────────────────────────┘  │                            │
                                 └────────────────────────────┘
 ```
 
@@ -695,7 +758,9 @@ Context: <one line — content classification (novel work, verbatim
          mirror of mergepath@<sha>, sync + N convergence commits, ...)>
 Gate: post APPROVED as nathanpayne-codex on the listed HEAD, OR a
       Codex bot review / 👍 reaction newer than the HEAD committer date.
-Threads: <N> unresolved (auto-resolve-bots once the gate clears).
+Threads: <N> unresolved (resolve addressed bot or agent-reviewer threads
+         per the pre-merge gate; never resolve real-human threads
+         automatically).
 ```
 
 **Batch variant** (>1 PR) — emit a markdown table with one row per PR, followed by a single fenced prompt the human can paste into the external reviewer's CLI session:
@@ -718,8 +783,9 @@ Context: <one line — shared content classification if all PRs share
 Gate: for each PR, post APPROVED as nathanpayne-codex on the listed
       HEAD, OR a Codex bot review / 👍 reaction newer than the HEAD
       committer date.
-Threads: see "Unresolved threads" column (auto-resolve-bots once the
-         gate clears).
+Threads: see "Unresolved threads" column (resolve addressed bot or
+         agent-reviewer threads per the pre-merge gate; never resolve
+         real-human threads automatically).
 ```
 
 The chat-side block is **additive** to the existing PR-side comment template above. Agents emit both: the PR-side comment is the durable record on the PR; the chat-side block is the human-facing summary that flows into the external CLI session. Neither replaces the other.
@@ -778,7 +844,7 @@ Agents must never modify the `needs-external-review`, `needs-human-review`, or `
 
 **Sanctioned automation exceptions.** Two — and only two — automated paths may remove `needs-external-review`. Both are GitHub Actions workflows (not interactive agent sessions); both are reconciling a label the policy automation itself is responsible for, which is categorically different from an agent clearing a human-action label.
 
-1. **`auto-clear-blocking-labels.yml`** (shipped in [#195](https://github.com/nathanjohnpayne/mergepath/issues/195) per parent [#191](https://github.com/nathanjohnpayne/mergepath/issues/191)) removes the label once the merge gate clears. It re-runs `scripts/codex-review-check.sh` on `pull_request_target` / `pull_request_review` / `workflow_run` events AND on a 15-minute `schedule` cron sweep (#197 — catches the 👍-after-last-push case where no event-driven trigger fires), and removes the label when the merge gate passes per the full gate logic in [`scripts/codex-review-check.sh`](scripts/codex-review-check.sh) — gate (a) CI green AND gate (b) reviewer-identity APPROVED OR same-agent + Codex 👍 (per [#170](https://github.com/nathanjohnpayne/mergepath/issues/170)) AND gate (c) Codex cleared on current HEAD. The byline on the removal is `github-actions[bot]` (not an agent identity); the workflow's `if:` guards prevent self-fire loops AND skip the event-driven job on schedule events (cron only runs the sweep); checkout pins to the default branch so a malicious PR cannot supply its own gate-script.
+1. **`auto-clear-blocking-labels.yml`** (shipped in [#195](https://github.com/nathanjohnpayne/mergepath/issues/195) per parent [#191](https://github.com/nathanjohnpayne/mergepath/issues/191)) removes the label once the merge gate clears. It re-runs `scripts/codex-review-check.sh` on `pull_request_target` / `pull_request_review` / `workflow_run` events AND on a 5-minute `schedule` cron sweep (#197/#324 — catches the 👍-after-last-push case where no event-driven trigger fires), and removes the label when the merge gate passes per the full gate logic in [`scripts/codex-review-check.sh`](scripts/codex-review-check.sh) — gate (a) CI green AND gate (b) reviewer-identity APPROVED OR same-agent + Codex 👍 (per [#170](https://github.com/nathanjohnpayne/mergepath/issues/170)) AND gate (c) Codex cleared on current HEAD. The byline on the removal is `github-actions[bot]` (not an agent identity); the workflow's `if:` guards prevent self-fire loops AND skip the event-driven job on schedule events (cron only runs the sweep); checkout pins to the default branch so a malicious PR cannot supply its own gate-script. If an immediate post-removal verification read fails, the workflow re-reads the label state before surfacing a synthetic failure check-run; when that final read proves the label is already absent, it posts a matching success check-run instead of leaving a stale failure on the PR.
 
 2. **`pr-review-policy.yml`'s External Review Check** (the propagation-PR review lane, [#264](https://github.com/nathanjohnpayne/mergepath/issues/264) / [#268](https://github.com/nathanjohnpayne/mergepath/issues/268)) removes the label when a PR is verified to be a faithful propagation mirror — see [§ Phase 3.5](#phase-35-propagation-pr-review-lane). It does not consult the merge gate; it acts on the orthogonal fact that the PR's content was already reviewed upstream, established by `scripts/workflow/verify-propagation-pr.sh`'s byte-comparison against `mergepath@<sha>`. Same `github-actions[bot]` byline; same not-an-agent-override rationale.
 
@@ -791,7 +857,7 @@ resolves to `author_identity` immediately before the merge path. Repos
 without that secret keep the normal manual merge flow under
 `scripts/gh-as-author.sh`.
 
-**Disabling the scheduled sweep.** The 15-minute cron is opt-out via `auto_clear_labels.scheduled_sweep_enabled: false` in `.github/review-policy.yml`. Default is `true`. Set to `false` if your repo has high PR volume and the event-driven path is reliably fast enough that the cron becomes pure noise — but expect occasional stuck `needs-external-review` labels on the 👍-after-last-push case (which the sweep would otherwise catch). The event-driven path remains active regardless of this setting.
+**Disabling the scheduled sweep.** The 5-minute cron is opt-out via `auto_clear_labels.scheduled_sweep_enabled: false` in `.github/review-policy.yml`. Default is `true`. Set to `false` if your repo has high PR volume and the event-driven path is reliably fast enough that the cron becomes pure noise — but expect occasional stuck `needs-external-review` labels on the 👍-after-last-push case (which the sweep would otherwise catch). The event-driven path remains active regardless of this setting.
 
 ## Implementation notes for branch protection gates
 
@@ -815,9 +881,11 @@ The audit reads `GET /repos/{owner}/{repo}/branches/{branch}/protection` and fal
 The GitHub GraphQL `resolveReviewThread` mutation may be used by agents **only** when both:
 
 - The agent has demonstrably addressed the inline finding (a fix is on the current HEAD, or a rebuttal is posted on the thread), AND
-- The bot author of the thread has not auto-resolved within a reasonable window.
+- The bot author has not auto-resolved within a reasonable window, OR the
+  registered agent-reviewer author has accepted the fix, approved the
+  current HEAD, or posted an on-thread acknowledgment.
 
-It is a clean-up mechanism for the `required_conversation_resolution: true` branch-protection gate, NOT a policy override. It does not authorize removing blocking labels, bypassing required reviews, or merging past unaddressed findings. **If the thread author is a human (not a bot), agents must not call this mutation regardless of state.**
+It is the clean-up mechanism used by the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate) for the `required_conversation_resolution: true` branch-protection gate, NOT a policy override. It does not authorize removing blocking labels, bypassing required reviews, or merging past unaddressed findings. **If the thread author is a real human (not a bot and not a registered agent-reviewer identity), agents must not call this mutation regardless of state.**
 
 ## Review Policy Configuration
 
@@ -876,6 +944,7 @@ coderabbit:
 # per-repo install state and its "Automatic reviews" setting.
 codex:
   enabled: true
+  request_by_default: true                    # post `@codex review` on EVERY PR, not just above-threshold (#486)
   bot_login: "chatgpt-codex-connector[bot]"   # REST API form, with [bot] suffix
   cli_login: nathanpayne-codex                # manual CLI fallback (Phase 4b)
   max_review_rounds: 2                        # runaway guard; 3rd round escalates
@@ -899,6 +968,17 @@ dependabot:
 
 > **Note on `enabled` flags (both `coderabbit` and `codex`).** These flags govern **agent behavior only** — whether the authoring agent waits for the corresponding review in its phase. They do NOT control whether the underlying GitHub App runs. Both apps run based on their own install state on GitHub, independent of what this YAML says. Setting `coderabbit.enabled: false` alone will cause the agent to skip the CodeRabbit phase while the app continues to post reviews silently in the background. Setting `codex.enabled: false` routes the agent to Phase 4b and makes `scripts/codex-review-check.sh` ignore Codex bot reviews/reactions for the merge gate, but the Codex App may still post comments unless it is disabled in ChatGPT/GitHub. To fully disable an integration, uninstall or disable the GitHub App AND set the flag to false.
 
+### `codex.request_by_default` — request Codex on every PR (#486)
+
+`codex.request_by_default` (default `true`) decouples the `@codex review` trigger from the external-review threshold. It governs whether **the agent** posts `@codex review` on every PR: the agent is the caller that runs `scripts/codex-review-request.sh` from the workflow, and there is no separate workflow auto-caller that posts the trigger on its own.
+
+- **`true`** — the agent runs `scripts/codex-review-request.sh` on **every** PR, independent of `external_review_threshold` / `external_review_paths`, so the `@codex review` trigger is posted on under-threshold PRs too. For an under-threshold PR the agent posts it during [Phase 3 step 9](#phase-3-external-review-threshold-check) **before merging**, and the trigger is **advisory** — it does not gate the merge (the threshold governs the merge gate; see [Threshold Evaluation](#threshold-evaluation) below). For an above-threshold PR the same trigger is the Phase 4a entry that *does* gate the merge. This is the full-automation default ([#483](https://github.com/nathanjohnpayne/mergepath/issues/483)).
+- **`false`** — the pre-#486 behavior: the agent requests Codex only when the PR independently qualifies for Phase 4a (lines ≥ threshold **or** a protected-path match), i.e. only as the Phase 4a entry. Under-threshold PRs get no `@codex review`.
+
+The key is **orthogonal to `codex.enabled`**: it governs only *when* the trigger is posted, never *whether* Codex participates. When `codex.enabled: false`, Phase 4a is off and no trigger is posted regardless of `request_by_default`.
+
+`scripts/codex-review-request.sh` parses both keys (via the same `codex_field` helper as the rest of the `codex:` block) and applies them as a Phase 4a entry gate *before* any signal scan or trigger write. It does not recompute the threshold itself — the caller (the agent) tells the worker whether the PR independently qualifies for the gating Phase 4a path by exporting `MERGEPATH_PHASE_4A_GATED=true` (consulted only when `request_by_default` is `false`); the under-threshold Phase 3 step 9 call omits it. When the gate decides to skip, the script emits JSON with `trigger_requested: false` and exits `5` (`NO_TRIGGER_REQUESTED`) — distinct from a timeout (`4`) or an API error (`3`).
+
 ### Threshold Evaluation
 
 A PR requires external review if **either** condition is true:
@@ -906,7 +986,7 @@ A PR requires external review if **either** condition is true:
 1. Total non-generated lines changed (additions + deletions) ≥ `external_review_threshold`. Lockfiles (`*.lock`, `*lock.json`), minified files (`*.min.js`, `*.min.css`), and generated files (`*.generated.*`) are excluded from the count.
 2. Any file in the PR diff matches a pattern in `external_review_paths`
 
-The agent evaluates this after internal review passes, before merging. CI workflows may also evaluate and label earlier as an advisory (see Phase 3 note above).
+The agent evaluates this after internal review passes, before merging. CI workflows may also evaluate and label earlier as an advisory (see Phase 3 note above). Independently of this threshold, when `codex.request_by_default: true` (the default) the agent posts `@codex review` on every PR — for an under-threshold PR it does so in [Phase 3 step 9](#phase-3-external-review-threshold-check) before merging, via `scripts/codex-review-request.sh`; see [`codex.request_by_default`](#codexrequest_by_default--request-codex-on-every-pr-486) above. The threshold still governs the **merge gate** (whether external clearance is *required* to merge): on an under-threshold PR the Codex trigger is **advisory** and never blocks the merge, while on an above-threshold PR the same trigger is the gating Phase 4a entry. `request_by_default` governs only whether the Codex trigger is *posted*, not whether clearance is required.
 
 ## Git Identity Switching
 

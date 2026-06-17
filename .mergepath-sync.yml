@@ -491,6 +491,13 @@ paths:
   - path: tests/test_codex_review_request_ack.sh
     type: canonical
     consumers: all
+  # Phase 4a entry-decision regression (#486): codex.request_by_default +
+  # codex.enabled gating of whether `@codex review` is posted at all.
+  # check_codex_scripts hard-runs it (same `No such file` exit-127 coupling
+  # class as the ack suite above), so it must travel to every consumer.
+  - path: tests/test_codex_review_request_entry.sh
+    type: canonical
+    consumers: all
   # Resolution-aware gate (c) regression (#460 Option B). check_codex_scripts
   # (scripts/ci kit) hard-runs it, so it must travel to every consumer.
   - path: tests/test_codex_review_check_resolution.sh
