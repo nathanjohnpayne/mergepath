@@ -61,7 +61,7 @@ projects:
       path_hint: ../overridebroadway
     prds:
       - slug: overridebroadway
-        source: projects/overridebroadway/prds/overridebroadway.md.md
+        source: projects/overridebroadway/prds/overridebroadway.md
         mirror: docs/projects/overridebroadway/prds/overridebroadway.md
     specs:
       - source: specs/
@@ -74,7 +74,7 @@ projects:
       path_hint: ../device-source-of-truth
     prds:
       - slug: device-source-of-truth
-        source: projects/device-source-of-truth/prd/device-source-of-truth.md
+        source: projects/device-source-of-truth/prds/device-source-of-truth.md
         mirror: docs/projects/device-source-of-truth/prds/device-source-of-truth.md
     specs:
       - source: specs/

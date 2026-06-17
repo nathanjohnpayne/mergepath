@@ -78,7 +78,7 @@ echo "$out" | grep -q "MISS  app prd:app" \
 echo "$out" | grep -q "MISS  app spec:feature" \
   || fail "initial audit should report missing app spec mirror: $out"
 
-MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/tmp/project-doc-sync-materialize.out
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >"$WORKDIR/project-doc-sync-materialize.out"
 
 [ -f "$APP/docs/projects/app/prds/app.md" ] \
   || fail "materialize did not create repo-local PRD mirror"

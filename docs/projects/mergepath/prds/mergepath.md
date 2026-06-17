@@ -3,7 +3,7 @@ generated_by: scripts/project-doc-sync.sh
 do_not_edit: true
 source_repo: nathanjohnpayne/docs
 source_path: projects/mergepath/prds/mergepath.md
-source_ref: 5e94eca
+source_ref: 49b1a75
 project: mergepath
 document_class: prd
 document_slug: mergepath
@@ -224,6 +224,18 @@ docs/
       plans/
       archive/
 ```
+
+An owning repository is the source-of-truth home for a project's implementation
+code and authoritative specs. It is distinct from downstream consumer repos:
+consumers receive propagated Mergepath template surfaces, while owning repos
+author and test project-specific implementation contracts.
+
+Operationally, project-doc sync is declared in `.mergepath-project-docs.yml`, a
+companion manifest separate from `.mergepath-sync.yml`. The existing
+`.mergepath-sync.yml` system continues to govern canonical, kit, and templated
+Mergepath propagation to downstream consumers; `.mergepath-project-docs.yml`
+governs cross-repo PRD/spec mirrors between `nathanjohnpayne/docs` and each
+owning repo.
 
 The normalized owning-repo layout is:
 
