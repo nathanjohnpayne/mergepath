@@ -9,9 +9,10 @@ Authoring-Agent: <!-- claude | codex | cursor -->
 > favoring automation is the point of Mergepath. The path stops for only two
 > reasons: (1) **the human says otherwise** — an explicit instruction, or a
 > `human-hold` / `needs-human-review` / `policy-violation` label (`human-hold`
-> is a human-remove-only freeze) — or (2) **a Phase 4b handoff is required** —
-> an above-threshold / protected-path PR routed to human-mediated external
-> review.
+> is a human-remove-only freeze) — or (2) **a human handoff or escalation is
+> required** — a Phase 4b handoff (an above-threshold / protected-path PR
+> routed to external review) or a Phase 4a reviewer-disagreement escalation to
+> the human tiebreaker.
 
 ## Summary
 - Describe the change.
