@@ -221,7 +221,13 @@ COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 # middle of an unrelated command are caught downstream by the token
 # walk, which exits 0 if no `gh pr (create|merge)` subcommand is
 # present.
-if ! echo "$COMMAND" | grep -qE '(^|[[:space:]])([^[:space:]]*/)?gh([[:space:]]|$)'; then
+# Strip quotes before the quick-exit scan (#466 r2): a quoted, path-
+# qualified invocation like '/usr/bin/gh' pr merge would otherwise leave
+# the closing quote glued to `gh` and slip past the boundary. The shlex
+# token walk below strips quotes itself and the */gh case catches it — but
+# only if we do NOT early-exit here. Stripping quotes for this fast-path
+# probe is safe; it only governs whether the authoritative tokenizer runs.
+if ! echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[[:space:]])([^[:space:]]*/)?gh([[:space:]]|$)'; then
   exit 0
 fi
 

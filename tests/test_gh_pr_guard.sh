@@ -139,6 +139,15 @@ assert_rc_contains "path-qualified gh pr create blocked (#466)" 2 "token-verifyi
 assert_rc_contains "path-qualified gh pr merge blocked (#466)" 2 "" \
   '/usr/bin/gh pr merge 123 --squash --delete-branch'
 
+# #466 r2: a QUOTED path-qualified (or bare) gh must not bypass either.
+# The closing quote glued to `gh` previously slipped past the quick-exit
+# grep boundary (verified live by the nathanpayne-codex review).
+assert_rc_contains "quoted path-qualified gh pr merge blocked (#466 r2)" 2 "" \
+  "'/usr/bin/gh' pr merge 123 --squash --delete-branch"
+
+assert_rc_contains "quoted bare gh pr merge blocked (#466 r2)" 2 "" \
+  "'gh' pr merge 5 --squash"
+
 assert_rc_contains "wrapper state does not cross separator" 2 "token-verifying wrapper" \
   'scripts/gh-as-author.sh -- echo ok ; gh pr create --title "t" --body "Authoring-Agent: claude
 

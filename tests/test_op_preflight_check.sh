@@ -1007,15 +1007,25 @@ EOF
     fail "test_check_review_mode_omits_deploy_creds: review PAT missing; out=$out"
     return
   fi
-  if echo "$out" | grep -q "GOOGLE_APPLICATION_CREDENTIALS"; then
-    fail "test_check_review_mode_omits_deploy_creds: deploy ADC leaked into review-mode output; out=$out"
+  if echo "$out" | grep -q "export GOOGLE_APPLICATION_CREDENTIALS"; then
+    fail "test_check_review_mode_omits_deploy_creds: deploy ADC exported into review-mode output; out=$out"
     return
   fi
-  if echo "$out" | grep -q "CF_API_TOKEN"; then
-    fail "test_check_review_mode_omits_deploy_creds: CF_API_TOKEN leaked into review-mode output; out=$out"
+  if echo "$out" | grep -q "export CF_API_TOKEN"; then
+    fail "test_check_review_mode_omits_deploy_creds: CF_API_TOKEN exported into review-mode output; out=$out"
     return
   fi
-  pass "test_check_review_mode_omits_deploy_creds: review --check omits stale deploy creds (#466)"
+  # #466 r2: review mode must ALSO actively unset stale deploy vars that a
+  # prior --mode deploy/all eval left in the caller's shell.
+  if ! echo "$out" | grep -q "unset .*GOOGLE_APPLICATION_CREDENTIALS"; then
+    fail "test_check_review_mode_omits_deploy_creds: review mode did not unset stale deploy vars; out=$out"
+    return
+  fi
+  if ! echo "$out" | grep -q "unset .*CF_API_TOKEN"; then
+    fail "test_check_review_mode_omits_deploy_creds: review mode did not unset CF_API_TOKEN; out=$out"
+    return
+  fi
+  pass "test_check_review_mode_omits_deploy_creds: review --check omits AND unsets stale deploy creds (#466)"
 }
 
 test_check_fresh_cache

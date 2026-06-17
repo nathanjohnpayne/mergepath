@@ -769,6 +769,13 @@ emit_from_session_file() (
       printf 'export OP_PREFLIGHT_FIREBASE_PROJECT=%q\n' "$OP_PREFLIGHT_FIREBASE_PROJECT"
     [[ -n "${CF_API_TOKEN:-}" ]] && \
       printf 'export CF_API_TOKEN=%q\n' "$CF_API_TOKEN"
+  else
+    # Review-only request (#466 r2): actively clear any deploy credentials a
+    # prior --mode deploy / --mode all eval exported into the caller's
+    # shell, so a review session does not retain stale deploy creds in its
+    # environment (not just refrain from re-exporting them). Emitting unset
+    # is idempotent when the caller never had them.
+    printf 'unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT CF_API_TOKEN\n'
   fi
   printf 'export OP_PREFLIGHT_DONE=1\n'
   printf 'export OP_PREFLIGHT_AGENT=%q\n' "$AGENT"
