@@ -412,9 +412,16 @@ that can change GitHub conversation state.
    `resolveReviewThread` path directly. If the resolution is not
    demonstrable from the current HEAD or on-thread rebuttal, request a
    fresh bot review instead of resolving the thread.
-4. Never auto-resolve human-authored threads. If a human-authored thread
-   remains unresolved, stop before merge and wait for the human to
-   resolve it or give explicit direction.
+4. Registered agent-reviewer threads (`available_reviewers`, for example
+   `nathanpayne-claude`, `nathanpayne-cursor`, and `nathanpayne-codex`)
+   are agent-authored, not real-human-authored. Resolve them only with an
+   identity-checked `resolveReviewThread` path after the finding has been
+   fixed or rebutted and the reviewer identity has accepted the fix,
+   approved the current HEAD, or posted an on-thread acknowledgment.
+5. Never auto-resolve real human-authored threads. If a thread authored
+   by `nathanjohnpayne` or another non-agent human account remains
+   unresolved, stop before merge and wait for the human to resolve it or
+   give explicit direction.
 
 This gate is a branch-protection requirement, not a review-disposition
 choice. It applies to under-threshold PRs, Phase 4a, Phase 4b, and
@@ -736,8 +743,9 @@ Context: <one line — content classification (novel work, verbatim
          mirror of mergepath@<sha>, sync + N convergence commits, ...)>
 Gate: post APPROVED as nathanpayne-codex on the listed HEAD, OR a
       Codex bot review / 👍 reaction newer than the HEAD committer date.
-Threads: <N> unresolved (resolve addressed bot threads per the pre-merge
-         gate; never resolve human threads automatically).
+Threads: <N> unresolved (resolve addressed bot or agent-reviewer threads
+         per the pre-merge gate; never resolve real-human threads
+         automatically).
 ```
 
 **Batch variant** (>1 PR) — emit a markdown table with one row per PR, followed by a single fenced prompt the human can paste into the external reviewer's CLI session:
@@ -760,9 +768,9 @@ Context: <one line — shared content classification if all PRs share
 Gate: for each PR, post APPROVED as nathanpayne-codex on the listed
       HEAD, OR a Codex bot review / 👍 reaction newer than the HEAD
       committer date.
-Threads: see "Unresolved threads" column (resolve addressed bot threads
-         per the pre-merge gate; never resolve human threads
-         automatically).
+Threads: see "Unresolved threads" column (resolve addressed bot or
+         agent-reviewer threads per the pre-merge gate; never resolve
+         real-human threads automatically).
 ```
 
 The chat-side block is **additive** to the existing PR-side comment template above. Agents emit both: the PR-side comment is the durable record on the PR; the chat-side block is the human-facing summary that flows into the external CLI session. Neither replaces the other.
@@ -858,9 +866,11 @@ The audit reads `GET /repos/{owner}/{repo}/branches/{branch}/protection` and fal
 The GitHub GraphQL `resolveReviewThread` mutation may be used by agents **only** when both:
 
 - The agent has demonstrably addressed the inline finding (a fix is on the current HEAD, or a rebuttal is posted on the thread), AND
-- The bot author of the thread has not auto-resolved within a reasonable window.
+- The bot author has not auto-resolved within a reasonable window, OR the
+  registered agent-reviewer author has accepted the fix, approved the
+  current HEAD, or posted an on-thread acknowledgment.
 
-It is the clean-up mechanism used by the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate) for the `required_conversation_resolution: true` branch-protection gate, NOT a policy override. It does not authorize removing blocking labels, bypassing required reviews, or merging past unaddressed findings. **If the thread author is a human (not a bot), agents must not call this mutation regardless of state.**
+It is the clean-up mechanism used by the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate) for the `required_conversation_resolution: true` branch-protection gate, NOT a policy override. It does not authorize removing blocking labels, bypassing required reviews, or merging past unaddressed findings. **If the thread author is a real human (not a bot and not a registered agent-reviewer identity), agents must not call this mutation regardless of state.**
 
 ## Review Policy Configuration
 

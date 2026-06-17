@@ -243,8 +243,9 @@ PR ready for external review (Phase 4b):
 Context: ${content}
 Gate: post APPROVED as nathanpayne-codex on the listed HEAD, OR a
       Codex bot review / 👍 reaction newer than the HEAD committer date.
-Threads: ${unresolved} unresolved (resolve addressed bot threads per the pre-merge
-         gate; never resolve human threads automatically).
+Threads: ${unresolved} unresolved (resolve addressed bot or agent-reviewer
+         threads per the pre-merge gate; never resolve real-human
+         threads automatically).
 EOF
 }
 
@@ -320,7 +321,7 @@ echo "Context: ${SHARED_CONTEXT}"
 echo 'Gate: for each PR, post APPROVED as nathanpayne-codex on the listed'
 echo '      HEAD, OR a Codex bot review / 👍 reaction newer than the HEAD'
 echo '      committer date.'
-echo 'Threads: see "Unresolved threads" column (resolve addressed bot threads'
-echo '         per the pre-merge gate; never resolve human threads'
-echo '         automatically).'
+echo 'Threads: see "Unresolved threads" column (resolve addressed bot or'
+echo '         agent-reviewer threads per the pre-merge gate; never resolve'
+echo '         real-human threads automatically).'
 echo '```'
