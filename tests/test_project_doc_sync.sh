@@ -204,6 +204,8 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$SYMLINK_MP" MERGEPATH_PROJECT_DOCS_CACHE="$CACHE
 rc=$?
 set -e
 [ "$rc" -eq 2 ] || fail "audit should refuse symlinked cache checkout (rc=$rc): $out"
+echo "$out" | grep -qi "symbolic link" \
+  || fail "symlinked cache refusal should name the symlink cause, not just exit 2: $out"
 
 printf '\nlocal edit\n' >>"$DOCS/projects/app/specs/feature.md"
 set +e

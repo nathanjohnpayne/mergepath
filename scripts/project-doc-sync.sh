@@ -160,7 +160,11 @@ resolve_repo() {
     err "local writable checkout for '$name' not found (hint: ${hint:-none})"
     return 1
   fi
-  if resolved=$(clone_for_audit "$name" "$repo" 2>/dev/null); then
+  # NB: do not suppress clone_for_audit's stderr here — it carries the
+  # cache safety-guard reasons (symlinked target, path escaping the cache
+  # root) and clone/fetch failures the operator needs to see. It already
+  # runs git/gh with --quiet, so the happy path stays near-silent.
+  if resolved=$(clone_for_audit "$name" "$repo"); then
     printf '%s\n' "$resolved"
     return 0
   fi
