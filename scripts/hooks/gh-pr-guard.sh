@@ -221,7 +221,7 @@ COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 # middle of an unrelated command are caught downstream by the token
 # walk, which exits 0 if no `gh pr (create|merge)` subcommand is
 # present.
-if ! echo "$COMMAND" | grep -qE '(^|\s)gh(\s|$)'; then
+if ! echo "$COMMAND" | grep -qE '(^|[[:space:]])([^[:space:]]*/)?gh([[:space:]]|$)'; then
   exit 0
 fi
 
@@ -546,7 +546,7 @@ for i in "${!TOKENS[@]}"; do
       fi
       continue
       ;;
-    gh)
+    gh|*/gh)
       COMPOUND_GH_COUNT=$((COMPOUND_GH_COUNT + 1))
       if guarded_label=$(guarded_gh_invocation_label "$i"); then
         COMPOUND_GUARDED_COUNT=$((COMPOUND_GUARDED_COUNT + 1))
@@ -996,7 +996,7 @@ for i in "${!TOKENS[@]}"; do
       CURRENT_PREFIX="$tok"
       continue
       ;;
-    gh)
+    gh|*/gh)
       SAW_GH=1
       continue
       ;;

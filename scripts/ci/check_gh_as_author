@@ -19,6 +19,7 @@ TESTS=(
   "tests/test_gh_as_reviewer.sh"
   "tests/test_gh_wrapper_parallel.sh"
   "tests/test_gh_pr_guard.sh"
+  "tests/test_check_no_bare_gh_writes.sh"
 )
 
 FAILED=0

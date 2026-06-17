@@ -127,6 +127,18 @@ assert_rc_contains "wrapper substring spoof still blocked" 2 "token-verifying wr
 ## Self-Review
 - ok"'
 
+# #466: a path-qualified gh (e.g. /usr/bin/gh) must NOT bypass the guard.
+# Before the fix the quick-exit grep only matched bare `gh`, so a
+# path-qualified write skipped the hook entirely (exit 0).
+assert_rc_contains "path-qualified gh pr create blocked (#466)" 2 "token-verifying wrapper" \
+  '/usr/bin/gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "path-qualified gh pr merge blocked (#466)" 2 "" \
+  '/usr/bin/gh pr merge 123 --squash --delete-branch'
+
 assert_rc_contains "wrapper state does not cross separator" 2 "token-verifying wrapper" \
   'scripts/gh-as-author.sh -- echo ok ; gh pr create --title "t" --body "Authoring-Agent: claude
 

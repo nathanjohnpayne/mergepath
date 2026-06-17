@@ -420,6 +420,12 @@ paths:
   - path: tests/test_gh_wrapper_parallel.sh
     type: canonical
     consumers: all
+  # Pairs with scripts/ci/check_no_bare_gh_writes, now run by
+  # check_gh_as_author (#466). Without it propagated, a consumer's
+  # check_gh_as_author fails pre-flight with `Missing required file`.
+  - path: tests/test_check_no_bare_gh_writes.sh
+    type: canonical
+    consumers: all
   # Pairs with scripts/identity-check.sh (#284). The helper is called
   # from the top of every WRITE-path helper script; the test exercises
   # all four assert modes against `gh config get` shims plus an
@@ -488,7 +494,7 @@ paths:
     consumers: all
   # Pairs with scripts/op-preflight.sh + scripts/lib/preflight-helpers.sh
   # + scripts/ci/check_op_preflight_contract. The check wrapper requires
-  # all three test files; same coupling pattern as the gh-as-author and
+  # all four test files; same coupling pattern as the gh-as-author and
   # codex-p1-gate suites above. See #282/#374.
   - path: tests/test_op_preflight_check.sh
     type: canonical
@@ -497,6 +503,12 @@ paths:
     type: canonical
     consumers: all
   - path: tests/test_helper_autosource.sh
+    type: canonical
+    consumers: all
+  # Agent-name path-injection guard for preflight_agent (#466). Added to
+  # check_op_preflight_contract's suite; must travel with the others or a
+  # consumer's check_op_preflight_contract fails on `Missing required file`.
+  - path: tests/test_preflight_agent_name.sh
     type: canonical
     consumers: all
   # Pairs with scripts/resolve-pr-threads.sh +

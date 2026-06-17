@@ -39,13 +39,34 @@ preflight_cache_dir() {
 #   2. $OP_PREFLIGHT_AGENT (left over from a prior eval in this shell)
 #   3. The single cache file under the cache dir (if exactly one exists)
 # Returns empty string if no agent can be determined.
+# Reject agent names that are not a safe path component (#466). The
+# resolved name is interpolated into a cache file path that
+# auto_source_preflight then SOURCES, so a value like "../../etc/evil" or
+# one with shell metacharacters must never reach the path builder. Allow
+# only [A-Za-z0-9_-]; anything else is treated as "no agent" (fail-closed:
+# auto-source skips and no credentials are loaded). Bash 3.2 portable.
+_preflight_agent_name_is_safe() {
+  case "$1" in
+    "" | *[!A-Za-z0-9_-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 preflight_agent() {
   if [[ -n "${MERGEPATH_AGENT:-}" ]]; then
-    printf '%s' "$MERGEPATH_AGENT"
+    if _preflight_agent_name_is_safe "$MERGEPATH_AGENT"; then
+      printf '%s' "$MERGEPATH_AGENT"
+    else
+      echo "preflight: ignoring unsafe MERGEPATH_AGENT (must match [A-Za-z0-9_-]+)" >&2
+    fi
     return 0
   fi
   if [[ -n "${OP_PREFLIGHT_AGENT:-}" ]]; then
-    printf '%s' "$OP_PREFLIGHT_AGENT"
+    if _preflight_agent_name_is_safe "$OP_PREFLIGHT_AGENT"; then
+      printf '%s' "$OP_PREFLIGHT_AGENT"
+    else
+      echo "preflight: ignoring unsafe OP_PREFLIGHT_AGENT (must match [A-Za-z0-9_-]+)" >&2
+    fi
     return 0
   fi
   local cache_dir
@@ -56,7 +77,11 @@ preflight_agent() {
     local base="${files[0]##*/}"
     base="${base#op-preflight-}"
     base="${base%.env}"
-    printf '%s' "$base"
+    # Defense in depth: a glob match cannot contain '/', but still refuse
+    # to emit a name that is not a safe path component.
+    if _preflight_agent_name_is_safe "$base"; then
+      printf '%s' "$base"
+    fi
     return 0
   fi
   return 0
