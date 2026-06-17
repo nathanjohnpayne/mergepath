@@ -219,16 +219,16 @@ scriptable CI gate. Confirm it this way:
    in each repo, confirm a `coderabbitai[bot]` review/summary actually landed:
 
    ```bash
-   eval "$(/opt/homebrew/bin/brew shellenv)" && \
-     for r in matchline nathanpaynedotcom overridebroadway tadlockpsychiatry \
-              device-source-of-truth friends-and-family-billing \
-              device-platform-reporting swipewatch; do
-       echo "=== $r ==="
-       GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api \
-         "repos/nathanjohnpayne/$r/issues/comments?per_page=100" \
-         --jq '[.[] | select(.user.login=="coderabbitai[bot]")] | length' \
-         2>/dev/null || echo "(no recent comments / repo quiet)"
-     done
+   command -v brew >/dev/null 2>&1 && eval "$(brew shellenv)"
+   for r in matchline nathanpaynedotcom overridebroadway tadlockpsychiatry \
+            device-source-of-truth friends-and-family-billing \
+            device-platform-reporting swipewatch; do
+     echo "=== $r ==="
+     GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api \
+       "repos/nathanjohnpayne/$r/issues/comments?per_page=100&sort=created&direction=desc" \
+       --jq '[.[] | select(.user.login=="coderabbitai[bot]")] | length' \
+       2>/dev/null || echo "(no recent comments / repo quiet)"
+   done
    ```
 
    A non-zero count is positive evidence the author seat is working on that
