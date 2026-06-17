@@ -88,8 +88,8 @@ knowledge_base:
   # We keep `auto` deliberately. Consequence to be aware of: this template
   # repo is PUBLIC, so HERE `auto` resolves to `local`. But .coderabbit.yml
   # is NOT propagated (.mergepath-sync.yml), so each consumer ships its own
-  # copy — and for the four PRIVATE consumers (matchline, nathanpaynedotcom,
-  # overridebroadway, tadlockpsychiatry) `auto` resolves to GLOBAL: their
+  # copy — and for the three PRIVATE consumers (matchline, overridebroadway,
+  # tadlockpsychiatry) `auto` resolves to GLOBAL: their
   # learnings are shared org-wide. That is acceptable for a single-owner
   # fleet under one account (nathanjohnpayne) where cross-repo review
   # conventions SHOULD carry over. A repo that wants its learnings firewalled

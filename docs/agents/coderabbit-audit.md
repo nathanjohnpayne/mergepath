@@ -118,10 +118,10 @@ We keep `auto`. The consequence to be aware of, given the fleet split:
 
 | Visibility | Consumers | `auto` resolves to |
 |---|---|---|
-| Public (4) | device-source-of-truth, friends-and-family-billing, device-platform-reporting, swipewatch | `local` |
-| Private (4) | matchline, nathanpaynedotcom, overridebroadway, tadlockpsychiatry | **`global`** |
+| Public (5) | device-source-of-truth, friends-and-family-billing, device-platform-reporting, swipewatch, nathanpaynedotcom | `local` |
+| Private (3) | matchline, overridebroadway, tadlockpsychiatry | **`global`** |
 
-So the four **private** consumers share learnings org-wide: a review
+So the three **private** consumers share learnings org-wide: a review
 convention CodeRabbit learns in one private repo can be applied in another
 repo under the same owner. For a **single-owner fleet** (`nathanjohnpayne`)
 where cross-repo review conventions *should* carry over, that is the intended
@@ -212,9 +212,9 @@ scriptable CI gate. Confirm it this way:
    the org owner (`nathanjohnpayne`).
 2. Verify `nathanjohnpayne` holds an **active** seat and that the seat's
    repo/org coverage includes all 8 consumers:
-   `matchline`, `nathanpaynedotcom`, `overridebroadway`, `tadlockpsychiatry`
+   `matchline`, `overridebroadway`, `tadlockpsychiatry`
    (private) and `device-source-of-truth`, `friends-and-family-billing`,
-   `device-platform-reporting`, `swipewatch` (public).
+   `device-platform-reporting`, `swipewatch`, `nathanpaynedotcom` (public).
 3. **Observational cross-check (the only API-visible signal):** on a recent PR
    in each repo, confirm a `coderabbitai[bot]` review/summary actually landed:
 
