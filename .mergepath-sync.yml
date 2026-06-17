@@ -305,6 +305,18 @@ paths:
     requires:
       - "scripts/lib/gh-retry-helpers.sh"
       - "scripts/lib/reviewers-helpers.sh"   # #453, hard-sourced for the gate (b)/(c) reviewer allow-list
+  # Phase 4a feedback loop (#487): records the validated 👍/👎 reaction
+  # Codex solicits on each finding. WRITE path — every reaction POST goes
+  # through scripts/gh-as-reviewer.sh under the reviewer identity, so the
+  # wrapper (and its scripts/lib/gh-token-resolver.sh dep) MUST travel with
+  # this script or the reaction write fails closed. The reviewer-identity
+  # resolver is also sourced directly for the idempotency owner-check.
+  - path: scripts/codex-record-feedback.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/gh-as-reviewer.sh"
+      - "scripts/lib/gh-token-resolver.sh"
   - path: scripts/phase-4b-classifier.sh
     type: canonical
     consumers: all
@@ -479,6 +491,13 @@ paths:
   - path: tests/test_codex_review_request_ack.sh
     type: canonical
     consumers: all
+  # Phase 4a entry-decision regression (#486): codex.request_by_default +
+  # codex.enabled gating of whether `@codex review` is posted at all.
+  # check_codex_scripts hard-runs it (same `No such file` exit-127 coupling
+  # class as the ack suite above), so it must travel to every consumer.
+  - path: tests/test_codex_review_request_entry.sh
+    type: canonical
+    consumers: all
   # Resolution-aware gate (c) regression (#460 Option B). check_codex_scripts
   # (scripts/ci kit) hard-runs it, so it must travel to every consumer.
   - path: tests/test_codex_review_check_resolution.sh
@@ -487,6 +506,14 @@ paths:
   # #465 fail-closed structural guards. check_codex_scripts hard-runs it.
   # Propagation-safe (skips workflows/scripts a consumer does not carry).
   - path: tests/test_465_fail_closed.sh
+    type: canonical
+    consumers: all
+  # Pairs with scripts/codex-record-feedback.sh (#487). check_codex_scripts
+  # (scripts/ci kit) hard-runs it, so it must travel to every consumer or
+  # the check fails pre-flight with `No such file`. Same #264/#266 closure
+  # class as test_codex_review_request_ack.sh above. Fully stubbed (PATH-
+  # shimmed gh + gh-as-reviewer.sh) — no live GitHub network.
+  - path: tests/test_codex_record_feedback.sh
     type: canonical
     consumers: all
   # Pairs with scripts/merge-clearance-gate.sh +
@@ -722,12 +749,14 @@ paths:
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
       - "tests/test_465_fail_closed.sh"        # check_codex_scripts (#465)
+      - "tests/test_codex_record_feedback.sh"  # check_codex_scripts (#487)
       - "tests/test_audit_propagation_lane.sh" # check_propagation_lane_audit
       - "scripts/audit-propagation-lane.sh"    # check_propagation_lane_audit
       - "scripts/codex-p1-gate.sh"             # check_codex_p1_gate
       - "scripts/merge-clearance-gate.sh"      # check_merge_clearance_gate
       - "scripts/codex-review-request.sh"      # check_codex_scripts
       - "scripts/codex-review-check.sh"        # check_codex_scripts, check_canonical_bugs_263caf3
+      - "scripts/codex-record-feedback.sh"     # check_codex_scripts (#487)
       - "scripts/phase-4b-classifier.sh"       # check_phase_4b_classifier
       - "scripts/disagreement-detector.cjs"    # check_disagreement_detector
       - "scripts/request-label-removal.sh"     # check_canonical_bugs_263caf3

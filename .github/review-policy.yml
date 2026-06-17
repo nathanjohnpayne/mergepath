@@ -116,9 +116,12 @@ author_identity: nathanjohnpayne
 # disabled for private ones. The template ships with enabled: false; set to
 # true when deploying to a public repo.
 #
-# CodeRabbit review is advisory — it does not block merge via CI. The agent
-# is required to read and address substantive CodeRabbit findings before
-# proceeding past Phase 2.5.
+# CodeRabbit review is advisory — it does not block merge via CI. That does
+# not override GitHub's required-conversation-resolution branch protection:
+# unresolved review conversations still block merge until cleared under
+# REVIEW_POLICY.md's pre-merge review conversation gate. The agent is required
+# to read and address substantive CodeRabbit findings before proceeding past
+# Phase 2.5.
 #
 # When enabled, the agent MUST:
 #   1. Wait for CodeRabbit to post before proceeding (up to 3 min; ask
@@ -270,6 +273,29 @@ coderabbit:
 #      behavior, and #218 for the Phase 4b substitute path.
 codex:
   enabled: true
+
+  # Request `@codex review` on EVERY PR, not only the ones that meet the
+  # external-review threshold or touch a protected path (#486).
+  #
+  #   true  → Mergepath posts the `@codex review` trigger on every PR,
+  #           independent of `external_review_threshold` /
+  #           `external_review_paths`. An under-threshold PR gets a Codex
+  #           review too. This is the full-automation default (#483).
+  #   false → pre-#486 behavior: the trigger fires only when the PR
+  #           independently qualifies for Phase 4a (lines ≥ threshold OR a
+  #           protected-path match).
+  #
+  # ORTHOGONAL to `enabled` above: `request_by_default` governs only WHEN
+  # the trigger is posted, never WHETHER Codex participates. When
+  # `enabled: false`, Phase 4a is off and NO trigger is posted regardless
+  # of this key.
+  #
+  # Parsed by `scripts/codex-review-request.sh` (the Phase 4a entry
+  # decision) via the same `codex_field` helper the rest of the codex:
+  # block uses. Absent ⇒ true. The script learns whether a PR is
+  # threshold-gated from the caller's `MERGEPATH_PHASE_4A_GATED` env, so
+  # it does not recompute the threshold itself.
+  request_by_default: true
 
   # GitHub login of the Codex GitHub App bot. Reviews posted by this login
   # satisfy the external-review requirement in `.github/workflows/pr-audit.yml`.

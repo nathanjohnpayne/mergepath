@@ -13,8 +13,8 @@ Authoring-Agent: <!-- claude | codex | cursor -->
 > required** — a Phase 4b handoff (an above-threshold / protected-path PR
 > routed to external review) or a Phase 4a reviewer-disagreement escalation to
 > the human tiebreaker. A stuck required gate is separate from merge
-> disposition: red checks must go green, and a CodeRabbit rate-limit stall waits
-> for human direction.
+> disposition: red checks must go green, unresolved GitHub review conversations
+> must be cleared, and a CodeRabbit rate-limit stall waits for human direction.
 
 ## Summary
 - Describe the change.
