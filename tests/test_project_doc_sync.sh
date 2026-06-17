@@ -140,6 +140,41 @@ out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --
 rc=$?
 [ "$rc" -eq 0 ] || fail "audit should pass after orphan removal (rc=$rc): $out"
 
+# Orphaned generated PRD mirror: a generated PRD file under the owner's
+# prds/ dir that is no longer declared in the manifest (slug renamed or
+# removed) must be reported as drift and removed on materialize, analogous
+# to the spec orphan pass.
+cp "$APP/docs/projects/app/prds/app.md" "$APP/docs/projects/app/prds/legacy.md"
+set +e
+out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "audit should catch orphaned generated PRD mirror (rc=$rc): $out"
+echo "$out" | grep -q "DRIFT app prd:legacy orphan" \
+  || fail "orphan generated PRD mirror should report drift: $out"
+
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
+[ ! -e "$APP/docs/projects/app/prds/legacy.md" ] \
+  || fail "materialize should remove orphaned generated PRD mirror"
+[ -f "$APP/docs/projects/app/prds/app.md" ] \
+  || fail "materialize should keep the declared PRD mirror"
+
+out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] || fail "audit should pass after PRD orphan removal (rc=$rc): $out"
+
+# A hand-written (non-generated) file under the same prds/ dir must never be
+# treated as an orphan mirror or removed: orphan handling is gated on this
+# script's generated header.
+printf '# Notes\n\nHand-written, not a generated mirror.\n' >"$APP/docs/projects/app/prds/NOTES.md"
+out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] || fail "hand-written PRD-dir file must not be flagged as orphan (rc=$rc): $out"
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app >/dev/null
+[ -f "$APP/docs/projects/app/prds/NOTES.md" ] \
+  || fail "materialize must not remove hand-written PRD-dir file"
+rm "$APP/docs/projects/app/prds/NOTES.md"
+
 CACHE_ROOT="$WORKDIR/cache"
 SYMLINK_MP="$WORKDIR/mergepath-symlink-cache"
 mkdir -p "$CACHE_ROOT" "$SYMLINK_MP/scripts"

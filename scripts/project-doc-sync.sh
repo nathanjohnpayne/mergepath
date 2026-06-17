@@ -244,15 +244,17 @@ compare_or_materialize() {
   fi
 }
 
-is_generated_spec_mirror() {
-  local file=$1 source_repo=$2 project=$3
-  sed -n '1,14p' "$file" | grep -Fqx "generated_by: scripts/project-doc-sync.sh" &&
-    sed -n '1,14p' "$file" | grep -Fqx "source_repo: ${source_repo}" &&
-    sed -n '1,14p' "$file" | grep -Fqx "project: ${project}" &&
-    sed -n '1,14p' "$file" | grep -Fqx "document_class: spec"
+is_generated_mirror() {
+  local file=$1 source_repo=$2 project=$3 class=$4
+  local head
+  head=$(sed -n '1,14p' "$file")
+  printf '%s\n' "$head" | grep -Fqx "generated_by: scripts/project-doc-sync.sh" &&
+    printf '%s\n' "$head" | grep -Fqx "source_repo: ${source_repo}" &&
+    printf '%s\n' "$head" | grep -Fqx "project: ${project}" &&
+    printf '%s\n' "$head" | grep -Fqx "document_class: ${class}"
 }
 
-handle_orphan_spec_mirror() {
+handle_orphan_mirror() {
   local label=$1 target=$2
   if [ "$MODE" = "materialize" ]; then
     rm -f "$target"
@@ -302,6 +304,13 @@ process_prds() {
   ' "$manifest")
 
   [ -z "$rows" ] && return 0
+
+  # Track every declared PRD mirror so the orphan pass below can spot
+  # generated PRD files left under a mirror dir after a slug is renamed or
+  # removed from the manifest. Mirrors the spec orphan pass.
+  local prd_expected
+  prd_expected=$(mktemp "${TMPDIR:-/tmp}/project-doc-expected-prds.XXXXXX")
+
   while IFS=$'\t' read -r project owner_name owner_repo owner_hint slug source mirror; do
     [ -z "$project" ] && continue
     in_project_filter "$project" || continue
@@ -311,6 +320,14 @@ process_prds() {
       ERROR_FOUND=1
       continue
     fi
+
+    # Record the declared mirror (even when its source is missing, so a
+    # MISS row is never re-flagged as an orphan) keyed by the owner repo +
+    # mirror dir the orphan scan walks.
+    local mirror_dir="${mirror%/*}"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$owner_root" "$project" "$owner_name" "$mirror_dir" "$owner_root/$mirror" \
+      >>"$prd_expected"
 
     local source_file="$central_root/$source"
     if [ ! -f "$source_file" ]; then
@@ -328,6 +345,44 @@ process_prds() {
     compare_or_materialize "$label" "$tmp" "$owner_root/$mirror"
     rm -f "$tmp"
   done <<< "$rows"
+
+  prune_orphan_prd_mirrors "$central_repo" "$prd_expected"
+  rm -f "$prd_expected"
+}
+
+# Scan each owner repo's PRD mirror dir for generated PRD files that are no
+# longer declared in the manifest (slug renamed/removed) and flag them as
+# drift (or remove them on materialize). Analogous to the spec orphan pass;
+# only files carrying this script's generated header for the matching
+# project + central source repo are ever touched.
+prune_orphan_prd_mirrors() {
+  local central_repo=$1 expected=$2
+  [ -s "$expected" ] || return 0
+
+  local expected_paths groups
+  expected_paths=$(mktemp "${TMPDIR:-/tmp}/project-doc-prd-paths.XXXXXX")
+  groups=$(mktemp "${TMPDIR:-/tmp}/project-doc-prd-groups.XXXXXX")
+  cut -f5 "$expected" | LC_ALL=C sort -u >"$expected_paths"
+  cut -f1,2,3,4 "$expected" | LC_ALL=C sort -u >"$groups"
+
+  local owner_root project owner_name mirror_dir
+  while IFS=$'\t' read -r owner_root project owner_name mirror_dir; do
+    [ -n "$owner_root" ] || continue
+    local dir="$owner_root/$mirror_dir"
+    [ -d "$dir" ] || continue
+    while IFS= read -r target_file; do
+      [ -z "$target_file" ] && continue
+      grep -Fxq "$target_file" "$expected_paths" && continue
+      is_generated_mirror "$target_file" "$central_repo" "$project" prd || continue
+      local rel="${target_file#"$dir/"}"
+      local slug="${rel%.md}"
+      handle_orphan_mirror \
+        "$project prd:$slug orphan -> $owner_name:$mirror_dir/$rel" \
+        "$target_file"
+    done < <(find "$dir" -type f -name '*.md' -print | LC_ALL=C sort)
+  done < "$groups"
+
+  rm -f "$expected_paths" "$groups"
 }
 
 process_specs() {
@@ -385,10 +440,10 @@ process_specs() {
         [ -z "$target_file" ] && continue
         local rel="${target_file#"$target_dir/"}"
         grep -Fxq "$rel" "$expected_rels" && continue
-        is_generated_spec_mirror "$target_file" "$owner_repo" "$project" || continue
+        is_generated_mirror "$target_file" "$owner_repo" "$project" spec || continue
 
         local slug="${rel%.md}"
-        handle_orphan_spec_mirror \
+        handle_orphan_mirror \
           "$project spec:$slug orphan -> ${central_repo}:${mirror%/}/$rel" \
           "$target_file"
       done < <(find "$target_dir" -type f -name '*.md' -print | LC_ALL=C sort)
