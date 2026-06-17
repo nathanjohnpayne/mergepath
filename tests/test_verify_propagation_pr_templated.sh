@@ -84,8 +84,14 @@ build_consumer() {
   git_quiet -C "$cdir" commit -q -m base
   BASE_SHA=$(git -C "$cdir" rev-parse HEAD)
   printf '%s' "$pr_content" >"$cdir/rendered.txt"
-  [ "$dest_mode" = "100755" ] && chmod +x "$cdir/rendered.txt"
   git_quiet -C "$cdir" add -A
+  # Record the executable bit in the git INDEX, not via a filesystem
+  # chmod: under core.filemode=false (some CI images / mode-insensitive
+  # filesystems) git ignores the on-disk exec bit and would commit 100644
+  # regardless, silently breaking Cases 6/7. `git update-index --chmod=+x`
+  # writes mode 100755 directly into the index — same approach Case 5 uses
+  # for its fixture (CodeRabbit on PR #475).
+  [ "$dest_mode" = "100755" ] && git_quiet -C "$cdir" update-index --chmod=+x rendered.txt
   git_quiet -C "$cdir" commit -q -m head
   HEAD_SHA=$(git -C "$cdir" rev-parse HEAD)
 }
@@ -315,6 +321,33 @@ if [ "$RC" -ne 1 ]; then
   fail "Case 7 exec-source mode-drift: expected exit 1, got $RC"
 else
   pass "Case 7: executable source but non-executable dest → exit 1 (mode drift caught)"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 8 — source mode is read from the COMMITTED git tree, not the on-disk
+# exec bit (#475 / CodeRabbit + Codex). This is the PRODUCTION path: a real
+# MERGEPATH_DIR is a git checkout. The source is committed as 100755 but its
+# on-disk exec bit is then CLEARED, so a filesystem `-x` read would see
+# 100644 and wrongly reject the executable dest as drift. Only reading the
+# git mode (100755) makes the faithful render pass — a precise discriminator
+# for the git-tree-mode fix.
+# ---------------------------------------------------------------------------
+EXEC_TEMPLATE8='#!/usr/bin/env bash
+echo run
+'
+MP8="$WORKDIR/mp8"; build_mergepath "$MP8" "$EXEC_TEMPLATE8" ""
+git_quiet -C "$MP8" init -q
+git_quiet -C "$MP8" add -A
+git_quiet -C "$MP8" update-index --chmod=+x examples/source.tpl
+git_quiet -C "$MP8" commit -q -m mp
+chmod -x "$MP8/examples/source.tpl"   # on-disk bit now disagrees with git (100755)
+C8="$WORKDIR/c8"; build_consumer "$C8" "$EXEC_TEMPLATE8" 100755
+run_verify "$MP8" "$C8"
+if [ "$RC" -ne 0 ]; then
+  fail "Case 8 git-mode source read: expected exit 0, got $RC"
+  { echo "stderr:"; sed 's/^/  /' "$STDERR_FILE"; } >&2
+else
+  pass "Case 8: source mode read from git tree (on-disk bit cleared) → exec dest passes"
 fi
 
 echo ""

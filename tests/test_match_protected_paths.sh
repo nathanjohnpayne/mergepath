@@ -17,7 +17,11 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 assert_match() {
   local label=$1 expect=$2 file=$3; shift 3
   local out got
-  out=$(printf '%s\n' "$file" | bash "$M" "$@" 2>/dev/null || true)
+  # No `|| true`: the matcher exits 0 on both match and no-match (its
+  # while-read loop returns 0 at EOF), so a non-zero exit means the matcher
+  # actually crashed — let that abort the suite loudly instead of silently
+  # passing the assertion (CodeRabbit on PR #475).
+  out=$(printf '%s\n' "$file" | bash "$M" "$@" 2>/dev/null)
   if [ "$out" = "$file" ]; then got=yes; else got=no; fi
   if [ "$got" = "$expect" ]; then pass "$label"; else fail "$label: $file vs [$*] -> $got, expected $expect"; fi
 }

@@ -339,20 +339,49 @@ if [ "$TEMPLATED_SURFACE_ACTIVE" = "1" ] && [ -n "$CONSUMER_NAME" ]; then
         # the templated arm was byte-only while the canonical loop's
         # tree-entry compare (mode + type + oid via `git ls-tree`)
         # was being skipped via the VERIFIED_TEMPLATED_DESTS exempt.
-        # Derive the SOURCE template's expected mode from the trusted
+        # Derive the SOURCE template's expected mode+type from the trusted
         # mergepath checkout (#471): a templated source can be executable
         # (e.g. a templated shell script), so the rendered dest must inherit
-        # the SOURCE mode rather than a hardcoded 100644. The source is
-        # confirmed present above; read its on-disk exec bit (in production
-        # MERGEPATH_DIR is a git checkout, so this matches the recorded git
-        # mode, consistent with the templated arm's existing on-disk source
-        # handling). Compare mode+type only — the render changes content by
-        # design, so the oid legitimately differs.
-        if [ -x "$mp_source_abs" ]; then
-          tpl_source_entry="100755 blob"
+        # the SOURCE mode rather than a hardcoded 100644. Compare mode+type
+        # only — the render changes content by design, so the oid
+        # legitimately differs.
+        #
+        # Prefer the COMMITTED git mode (CodeRabbit on PR #475): the on-disk
+        # exec bit can drift from the recorded git mode, and the consumer
+        # side below — plus the canonical loop's mergepath-side read — both
+        # read git modes, so reading the source on-disk broke parity. Use
+        # `git ls-tree HEAD` when MERGEPATH_DIR is a git checkout (always so
+        # in production); fall back to an on-disk stat only when it is not
+        # (test fixtures that stage files without a repo), mirroring the
+        # canonical loop's git-or-disk handling below.
+        if [ -d "$MERGEPATH_DIR/.git" ] || [ -f "$MERGEPATH_DIR/.git" ]; then
+          # Git checkout (always so in production): the committed mode is
+          # authoritative.
+          tpl_source_entry=$(git -C "$MERGEPATH_DIR" ls-tree HEAD -- "$tpl_source" 2>/dev/null | awk '{print $1, $2}')
         else
-          tpl_source_entry="100644 blob"
+          # Non-git fixture dir (tests stage files without a repo): the
+          # filesystem exec bit is the only signal available.
+          if [ -x "$mp_source_abs" ]; then
+            tpl_source_entry="100755 blob"
+          else
+            tpl_source_entry="100644 blob"
+          fi
         fi
+        # Fail closed unless the source resolves to a regular-file blob.
+        # check_sync_manifest already requires templated sources to be
+        # regular files; an empty read (source not tracked at HEAD in the
+        # trusted checkout) or a symlink/submodule entry here is a
+        # misconfiguration, not a faithful render — reject rather than
+        # produce a confusing tree-entry diff. Both review bots on PR #475
+        # asked for this explicit guard.
+        case "$tpl_source_entry" in
+          "100644 blob"|"100755 blob") ;;
+          *)
+            fail_templated_error "$tpl_dest — unsupported/absent templated source tree entry [$tpl_source_entry] (source=$tpl_source, consumer=$CONSUMER_NAME)"
+            rm -f "$rendered" "$pr_content"
+            continue
+            ;;
+        esac
         tpl_consumer_entry=$(git -C "$CONSUMER_DIR" ls-tree "$HEAD_SHA" -- "$tpl_dest" 2>/dev/null | awk '{print $1, $2}')
         if [ "$tpl_consumer_entry" != "$tpl_source_entry" ]; then
           {
