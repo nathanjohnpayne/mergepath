@@ -187,15 +187,15 @@ grep -q "^gh project edit 99 --owner nathanjohnpayne --readme " "$SHIM_LOG" \
   && pass "board-and-summary stage recorded in state file" \
   || fail "state file missing board-and-summary entry: $(cat "$TARGET1/.bootstrap-state" 2>/dev/null)"
 
-# Empty PRD/spec/plan scaffolds at the right paths. The spec stub
-# references "PRD/spec" and the plan stub references "Sprint 0 plan"
-# — operator reading both should see distinct intents (CodeRabbit
+# Empty implementation-spec / plan scaffolds at the right paths. The spec
+# stub references "implementation spec" and the plan stub references
+# "Sprint 0 plan" — operator reading both should see distinct intents (CodeRabbit
 # round-1 nit on #246: identical placeholder text masked the
 # what-vs-how distinction).
 SPEC_FILE="$TARGET1/specs/newboard-repo.md"
 PLAN_FILE="$TARGET1/plans/newboard-repo-sprint-0.md"
 
-if [ -f "$SPEC_FILE" ] && grep -q "TODO: write the PRD/spec" "$SPEC_FILE"; then
+if [ -f "$SPEC_FILE" ] && grep -q "TODO: write the implementation spec" "$SPEC_FILE"; then
   pass "specs/newboard-repo.md placeholder written"
 else
   fail "specs file missing or wrong content"

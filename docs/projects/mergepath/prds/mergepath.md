@@ -1,3 +1,15 @@
+<!--
+generated_by: scripts/project-doc-sync.sh
+do_not_edit: true
+source_repo: nathanjohnpayne/docs
+source_path: projects/mergepath/prds/mergepath.md
+source_ref: 5e94eca
+project: mergepath
+document_class: prd
+document_slug: mergepath
+sync_direction: central-to-repo
+-->
+
 ---
 tags:
   - mergepath
@@ -240,8 +252,8 @@ Source-of-truth rules:
   and any documented exceptions.
 - Repository `docs/` folders remain for repo-local architecture, runbooks,
   design notes, and agent instructions. They are not a catch-all home for PRDs
-  or implementation specs unless a project-specific manifest explicitly declares
-  a legacy exception.
+  or implementation specs; project PRDs and specs use the normalized
+  `docs/projects/<project>/` sync paths.
 
 Sync direction is therefore deliberate and asymmetric: PRDs flow
 `docs/projects` -> owning repos, while implementation specs flow owning repos ->
@@ -251,9 +263,8 @@ authoritative silently.
 
 Migration cleanup should standardize `prd/` to `prds/`, repair accidental names
 such as duplicated `.md` suffixes, add missing central project folders for
-onboarded repos, and move the current root-level `mergepath.md` mirror to the
-project-scoped mirror convention or document it as a temporary legacy exception
-with a removal path.
+onboarded repos, and move root-level PRD mirrors such as `mergepath.md` to the
+project-scoped mirror convention instead of preserving root exceptions.
 
 ### 5. 1Password-Backed Deploy Auth
 
