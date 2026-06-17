@@ -4,6 +4,19 @@
 
 This policy governs how AI coding agents author, review, and merge code across repositories owned by the `nathanjohnpayne` GitHub account. It enforces a structured peer review process where a single agent performs both authoring and self-review under separate GitHub identities, with mandatory external review by a different agent when complexity thresholds are met. All review activity occurs through GitHub PRs, producing a complete audit trail indistinguishable from multi-developer collaboration.
 
+## Default disposition
+
+**Favoring automation is the default, not an option to be confirmed.** Mergepath exists so an agent can carry a change from author → review → merge without human babysitting. On any PR the agent proceeds through the full path autonomously and **does not pause to ask the human for merge permission** ("should I merge?", "how far should I take this?"). For under-threshold PRs that means reviewer-identity `--approve` → merge (see [No-self-approve scoping](#no-self-approve-scoping) and the [Workflow](#workflow)); for above-threshold or protected-path PRs it means driving [Phase 4](#phase-4-external-review) to clearance and then merging.
+
+The automated path never pauses to ask for merge permission. It defers to a human for only two reasons:
+
+1. **The human says otherwise.** An explicit instruction in chat, or a human-action label that the gates enforce — `human-hold` (a human-remove-only hard freeze that supersedes every gate), `needs-human-review`, or `policy-violation`. Agents may add `human-hold` but must never remove it, and must never modify the others (see [Agent prohibitions](#agent-prohibitions)).
+2. **A human handoff or escalation is required.** Either (a) a **Phase 4b handoff** — an above-threshold or protected-path PR where Phase 4a is unavailable or times out, or where `phase_4b_default` routes it to Phase 4b proactively after 4a clearance (`always` for every threshold PR, `complex-changes` only when `scripts/phase-4b-classifier.sh` flags it; see [Phase 4b Triggers](#phase-4b-triggers)); or (b) a **Phase 4a disagreement escalation** — when Codex repeats a finding after a rebuttal, or the round counter exceeds `max_review_rounds`, the agent stops, posts both positions, alerts the human for the tiebreaker, and waits for an explicit decision (see [Disagreements and Tiebreaking](#disagreements-and-tiebreaking)). Phase 4b is the only sanctioned place to post a [handoff message](#handoff-message-format) and wait for a human-mediated external review.
+
+A stuck required gate is separate and non-discretionary, not a disposition choice: a red required check must go green, and a CodeRabbit rate-limit stall (`scripts/coderabbit-wait.sh` exit `5`) must be escalated to the human — alerting does not unblock it; the PR waits for human direction (see [Phase 2.5](#phase-25-automated-external-review-coderabbit)). The agent never works around a stuck gate to merge, but it also never asks permission to merge a green one.
+
+Anything else — a green under-threshold PR, or a Phase 4a clearance where `phase_4b_default` is `fallback-only` or the `complex-changes` classifier exits `0` — merges without a human checkpoint. Presenting a "how far should I take this PR?" disposition prompt on the happy path is a deviation from this policy, not a courtesy.
+
 ## Identities
 
 ### Author Identity
