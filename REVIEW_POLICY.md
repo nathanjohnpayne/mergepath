@@ -13,7 +13,7 @@ The automated path never pauses to ask for merge permission. It defers to a huma
 1. **The human says otherwise.** An explicit instruction in chat, or a human-action label that the gates enforce — `human-hold` (a human-remove-only hard freeze that supersedes every gate), `needs-human-review`, or `policy-violation`. Agents may add `human-hold` but must never remove it, and must never modify the others (see [Agent prohibitions](#agent-prohibitions)).
 2. **A human handoff or escalation is required.** Either (a) a **Phase 4b handoff** — an above-threshold or protected-path PR where Phase 4a is unavailable or times out, or where `phase_4b_default` routes it to Phase 4b proactively after 4a clearance (`always` for every threshold PR, `complex-changes` only when `scripts/phase-4b-classifier.sh` flags it; see [Phase 4b Triggers](#phase-4b-triggers)); or (b) a **Phase 4a disagreement escalation** — when Codex repeats a finding after a rebuttal, or the round counter exceeds `max_review_rounds`, the agent stops, posts both positions, alerts the human for the tiebreaker, and waits for an explicit decision (see [Disagreements and Tiebreaking](#disagreements-and-tiebreaking)). Phase 4b is the only sanctioned place to post a [handoff message](#handoff-message-format) and wait for a human-mediated external review.
 
-A stuck required gate is separate and non-discretionary, not a disposition choice: a red required check must go green, and a CodeRabbit rate-limit stall (`scripts/coderabbit-wait.sh` exit `5`) must be escalated to the human — alerting does not unblock it; the PR waits for human direction (see [Phase 2.5](#phase-25-automated-external-review-coderabbit)). The agent never works around a stuck gate to merge, but it also never asks permission to merge a green one.
+A stuck required gate is separate and non-discretionary, not a disposition choice: a red required check must go green, unresolved GitHub review conversations must be addressed or resolved per the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate), and a CodeRabbit rate-limit stall (`scripts/coderabbit-wait.sh` exit `5`) must be escalated to the human — alerting does not unblock it; the PR waits for human direction (see [Phase 2.5](#phase-25-automated-external-review-coderabbit)). The agent never works around a stuck gate to merge, but it also never asks permission to merge a green one.
 
 Anything else — a green under-threshold PR, or a Phase 4a clearance where `phase_4b_default` is `fallback-only` or the `complex-changes` classifier exits `0` — merges without a human checkpoint. Presenting a "how far should I take this PR?" disposition prompt on the happy path is a deviation from this policy, not a courtesy.
 
@@ -361,12 +361,23 @@ After internal review passes (Phase 2), CodeRabbit provides an independent autom
    - **Inline review comments on the diff:** `gh api repos/{owner}/{repo}/pulls/{pr_number}/comments` — contains line-by-line findings anchored to specific code.
 3. **Scan for potential issues.** Before proceeding, grep CodeRabbit's inline review comments for `Potential issue` or `⚠️`. These markers indicate findings CodeRabbit considers high-severity. Every such finding must be explicitly addressed (fixed or dismissed with reasoning).
 4. The agent addresses substantive CodeRabbit findings — fixing issues or posting a reply explaining why a finding is not applicable.
-5. The agent is not required to resolve every CodeRabbit comment. Use judgment: fix genuine issues, dismiss false positives with a brief explanation. However, all `Potential issue` / `⚠️` findings require an explicit response.
+5. The agent is not required to fix every CodeRabbit comment. Use judgment: fix genuine issues, dismiss false positives with a brief explanation. However, all `Potential issue` / `⚠️` findings require an explicit response.
 6. CodeRabbit review is advisory. It does not block merge via CI and does not submit a "Changes Requested" review state.
+
+CodeRabbit's advisory status does **not** override GitHub branch
+protection's `required_conversation_resolution` gate. A CodeRabbit
+comment may be left unfixed only when it is not an unresolved GitHub
+review conversation, or when the agent has posted an explicit rationale
+and used the allowed bot-thread resolution path in the
+[Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate).
 
 **CodeRabbit runs on ALL PRs** in enabled repos, regardless of size or whether the external review threshold is met. It provides a consistent automated second opinion on every change.
 
-The agent proceeds to Phase 3 (Threshold Check) after addressing CodeRabbit comments, even if some remain open. CodeRabbit is an additional review layer, not a replacement for the existing threshold-based external agent handoff.
+The agent proceeds to Phase 3 (Threshold Check) after addressing
+CodeRabbit comments, even if some non-blocking comments remain open.
+CodeRabbit is an additional review layer, not a replacement for the
+existing threshold-based external agent handoff or the pre-merge
+conversation-resolution gate.
 
 #### CodeRabbit Review Checklist
 
@@ -379,12 +390,39 @@ Before moving past Phase 2.5, confirm all of the following:
 - [ ] Grepped inline comments for `Potential issue` and `⚠️` — all flagged findings addressed
 - [ ] Substantive findings fixed or dismissed with reasoning
 
+### Pre-Merge Review Conversation Gate
+
+Every merge path must pass this gate immediately before calling
+`gh pr merge`, and must repeat it after any push or review-thread reply
+that can change GitHub conversation state.
+
+1. Query GitHub's review-thread state, not just flat PR comments. Use
+   `scripts/resolve-pr-threads.sh <PR#> --list` or an equivalent GraphQL
+   `reviewThreads` readback that reports each thread's `isResolved`
+   value.
+2. Confirm there are **zero unresolved review conversations**. GitHub's
+   branch-protection error "All comments must be resolved" is driven by
+   this review-thread state; `gh pr checks`, issue comments, and pull
+   request review comments alone are not sufficient readback.
+3. For bot-authored threads only, if the finding has already been fixed
+   on the current HEAD or rebutted on-thread, use
+   `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots` or the
+   identity-checked `resolveReviewThread` path, then query
+   `reviewThreads` again.
+4. Never auto-resolve human-authored threads. If a human-authored thread
+   remains unresolved, stop before merge and wait for the human to
+   resolve it or give explicit direction.
+
+This gate is a branch-protection requirement, not a review-disposition
+choice. It applies to under-threshold PRs, Phase 4a, Phase 4b, and
+propagation-lane PRs.
+
 ### Phase 3: External Review Threshold Check
 
 > **Note on automation timing:** CI workflows may apply the `needs-external-review` label automatically when a PR is opened or updated, as an early advisory based on line count and protected paths. The label blocks merge via the label-gate until external review clears. When the label is present, the agent's responsibility after internal review passes is to proceed to [Phase 4](#phase-4-external-review) — which routes the PR to Phase 4a (automated via the Codex GitHub App) or Phase 4b (manual handoff) depending on `codex.enabled` and on whether 4a converges. The label itself does NOT imply immediate human mediation; Phase 4b only posts the handoff message when the fallback path is actually taken.
 
 8. After internal review passes, the agent evaluates whether the PR meets the external review threshold (see [Review Policy Configuration](#review-policy-configuration)).
-9. If the threshold is **not** met, the agent merges the PR as `nathanjohnpayne`. Done.
+9. If the threshold is **not** met, the agent runs the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate), then merges the PR as `nathanjohnpayne`. Done.
 10. If the threshold **is** met, the agent proceeds to [Phase 4: External Review](#phase-4-external-review). Phase 4 itself routes the PR to Phase 4a (automated, via the Codex GitHub App) or Phase 4b (manual handoff) based on `codex.enabled` in `.github/review-policy.yml` and on whether 4a's automated loop converges. The agent does NOT post a handoff message directly from this step — Phase 4b posts its own handoff message if and when the fallback path is taken.
 
 ### Phase 3.5: Propagation PR review lane
@@ -471,7 +509,9 @@ issue, can satisfy the Phase 4a signal.
 
      **No-self-approve rule + branch 2 interaction:** the rule "agents do not `--approve` a PR they authored under their own reviewer identity" applies to Phase 4 PRs (above `external_review_threshold` or matching `external_review_paths`) — that's the scope this section is in. For under-threshold PRs the reviewer identity is allowed and expected to `--approve`; see [No-self-approve scoping](#no-self-approve-scoping) above. Branch 2 is what makes the rule operational for the Phase 4 case — without it, same-agent PRs would deadlock on gate (b) with no escape short of human override. With branch 2, the agent posts a `--comment` review under its reviewer identity (per the rule), and the Codex 👍 carries the cross-check weight.
 
-17a. On a passing merge gate, `nathanjohnpayne` merges the PR with `gh pr merge <n> --squash --delete-branch`. Never `--admin` unless the human explicitly authorizes a break-glass override in chat.
+17a. On a passing merge gate, the agent runs the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate). If any unresolved thread remains, stop before merge and address or resolve it through the allowed path.
+
+18a. After the merge gate and review-conversation gate are both clean, `nathanjohnpayne` merges the PR with `gh pr merge <n> --squash --delete-branch`. Never `--admin` unless the human explicitly authorizes a break-glass override in chat.
 
 The non-Dependabot `auto-merge-on-approval` workflow is opt-in only:
 it may call `gh pr merge` only when the repo has an
@@ -501,7 +541,9 @@ Phase 4b is invoked when Phase 4a escalates to disagreement or runaway, times ou
 
 18b. If the external reviewer flags **observations** or **risks** while approving, those are converted to GitHub Issues on the repo, assigned to `nathanjohnpayne` (see [Post-Merge Issue Creation](#post-merge-issue-creation)).
 
-19b. `nathanjohnpayne` merges the PR. Done.
+19b. The agent runs the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate). If any unresolved thread remains, stop before merge and address or resolve it through the allowed path.
+
+20b. `nathanjohnpayne` merges the PR. Done.
 
 **Auto-clear of `needs-external-review` on Phase 4b clearance.** The `auto-clear-blocking-labels.yml` workflow's gate-evaluation script (`scripts/codex-review-check.sh`) accepts a Phase 4b external reviewer's `APPROVED` on the current HEAD as gate (c) clearance equivalent to Codex (governed by `codex.allow_phase_4b_substitute` in `.github/review-policy.yml`, default `true`; #218). When `codex.enabled: false`, this Phase 4b substitute is the only gate-(c) clearance path; stray Codex bot reviews/reactions are ignored even if the GitHub App is still installed. The auto-clear workflow then removes `needs-external-review` on the next event-driven trigger or scheduled sweep — no human-driven label removal is needed on the Phase 4b happy path. Set the knob to `false` for repos that genuinely require Codex-only clearance (e.g., where the Codex App provides domain-specific checks no other reviewer matches).
 
@@ -802,7 +844,7 @@ The GitHub GraphQL `resolveReviewThread` mutation may be used by agents **only**
 - The agent has demonstrably addressed the inline finding (a fix is on the current HEAD, or a rebuttal is posted on the thread), AND
 - The bot author of the thread has not auto-resolved within a reasonable window.
 
-It is a clean-up mechanism for the `required_conversation_resolution: true` branch-protection gate, NOT a policy override. It does not authorize removing blocking labels, bypassing required reviews, or merging past unaddressed findings. **If the thread author is a human (not a bot), agents must not call this mutation regardless of state.**
+It is the clean-up mechanism used by the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate) for the `required_conversation_resolution: true` branch-protection gate, NOT a policy override. It does not authorize removing blocking labels, bypassing required reviews, or merging past unaddressed findings. **If the thread author is a human (not a bot), agents must not call this mutation regardless of state.**
 
 ## Review Policy Configuration
 
