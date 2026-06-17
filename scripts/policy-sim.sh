@@ -12,6 +12,13 @@
 set -euo pipefail
 
 LIMIT="${1:-20}"
+# Validate the limit is a positive integer before handing it to gh (#469):
+# an arbitrary string is otherwise passed straight to `gh pr list --limit`,
+# which errors opaquely (or, for `0`, silently returns nothing).
+if ! [[ "$LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: limit must be a positive integer (got: '$LIMIT')" >&2
+  exit 1
+fi
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="$REPO_ROOT/mergepath/playground/index.html"
 
@@ -52,7 +59,12 @@ PRS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mergepath-prs.XXXXXX")"
 PRS_FILE="$PRS_DIR/prs.json"
 trap 'rm -rf "$PRS_DIR"' EXIT
 
-gh pr list \
+# Run from REPO_ROOT so `gh pr list` targets THIS repo regardless of the
+# caller's CWD (#469): gh resolves the repo from the current directory's
+# git remote, so invoking policy-sim.sh from another checkout would
+# otherwise list that repo's PRs despite REPO_ROOT being computed above.
+# PRS_FILE is an absolute mktemp path, so the redirect is unaffected by cd.
+( cd "$REPO_ROOT" && gh pr list \
   --state merged \
   --limit "$LIMIT" \
   --json number,title,additions,deletions,author,files,body \
@@ -65,7 +77,7 @@ gh pr list \
     ),
     lines: (.additions + .deletions),
     paths: [.files[].path]
-  }]' > "$PRS_FILE"
+  }]' ) > "$PRS_FILE"
 
 COUNT=$(jq 'length' < "$PRS_FILE")
 echo "Got $COUNT PRs. Injecting and opening..."

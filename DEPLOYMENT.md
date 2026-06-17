@@ -731,6 +731,18 @@ Reference docs:
 [local `.env` validation hook](https://www.1password.dev/environments/agent-hook-validate),
 and [`op run` secret loading](https://www.1password.dev/cli/secrets-environment-variables).
 
+> **Beta / platform caveat (#469):** 1Password Environments, the MCP
+> Server for Codex, and the local `.env` validation hook are early-access
+> (beta) 1Password features at the time of writing (2026-05-21) and carry
+> platform constraints — the MCP Server for Codex is a Codex-specific
+> adapter, and the validation hook depends on the 1Password desktop
+> app + CLI integration on the developer's machine. Treat the model below
+> as descriptive and forward-looking: gate adoption on the 1Password
+> audit ADR workstream (#347/#355/#356/#357) and re-check the upstream
+> docs, since beta surfaces change without notice. The portable-core
+> primitives (`op://` references, `op run`, `op inject`, scoped service
+> accounts) are GA and are the safe baseline.
+
 Mergepath uses a portable core with per-client adapters:
 
 - **Portable core:** 1Password Environments, `op://` secret
