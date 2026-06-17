@@ -38,8 +38,10 @@ jobs:
     # outputs — letting load-config run on labeled would cause
     # assign to re-fire on every label edit and re-request
     # reviewers who have already reviewed. Downstream jobs keep
-    # their own action-specific guards; they stay no-ops on
-    # synchronize. See #59 for the SKIPPED-as-SUCCESS miss this
+    # their own action-specific guards; triage intentionally runs on
+    # synchronize/reopened for the auto-merge re-arm path while assign
+    # stays scoped to opened/ready/labeled. See #59 for the
+    # SKIPPED-as-SUCCESS miss this
     # closes and Codex's P2 on PR #131 for why labeled is excluded.
     if: >
       github.event_name == 'pull_request' &&
@@ -98,19 +100,21 @@ jobs:
   # ──────────────────────────────────────────────
   triage:
     needs: [load-config]
-    # `reopened` is included alongside opened/ready_for_review so a PR
-    # changed while closed and then reopened gets its threshold and
-    # protected-path labels (`needs-external-review`) REFRESHED against the
-    # changed diff before the #495 auto-merge re-arm path evaluates. Without
-    # it, an originally-under-threshold PR whose closed-state changes pushed
-    # it over the threshold (or into a protected path) could re-arm on a
-    # stale/missing label snapshot. Mirrors load-config, which also handles
-    # reopened so this job's threshold/paths inputs are freshly parsed.
+    # `synchronize` / `reopened` are included alongside
+    # opened/ready_for_review so any push-triggered auto-merge re-arm gets
+    # threshold and protected-path labels (`needs-external-review`)
+    # REFRESHED against the changed diff before it evaluates. Without this,
+    # an originally-under-threshold PR whose later push or closed-state
+    # change crossed the threshold (or touched a protected path) could
+    # re-arm on a stale/missing label snapshot. Mirrors load-config, which
+    # also handles synchronize/reopened so this job's threshold/paths inputs
+    # are freshly parsed.
     if: >
       github.event_name == 'pull_request' &&
       github.event.pull_request.user.login != 'dependabot[bot]' &&
       (github.event.action == 'opened' ||
        github.event.action == 'ready_for_review' ||
+       github.event.action == 'synchronize' ||
        github.event.action == 'reopened')
     runs-on: ubuntu-latest
     outputs:
@@ -444,13 +448,14 @@ jobs:
   # constraint they run in parallel with auto-merge. A sibling applying a
   # label 200ms after the runtime re-verify step below fetches labels but
   # 100ms before `gh pr merge` dispatches would still slip through.
-  # `triage` matters specifically on the #495 reopened re-arm path: a PR
-  # changed while closed and reopened over the threshold must have
-  # `needs-external-review` re-applied by triage BEFORE the re-verify step
-  # reads labels, or the re-arm would arm on a stale snapshot. `always()`
+  # `triage` matters specifically on the #495 synchronize/reopened re-arm
+  # path: a PR changed after an approval, or while closed and then
+  # reopened, must have `needs-external-review` re-applied by triage BEFORE
+  # the re-verify step reads labels, or the re-arm would arm on a stale
+  # snapshot. `always()`
   # in the if: expression keeps auto-merge running even if a sibling fails
-  # or is skipped (triage and the two review-event siblings are skipped on
-  # the pull_request re-arm and pull_request_review paths respectively) —
+  # or is skipped (the two review-event siblings are skipped on the
+  # pull_request re-arm path, while triage is skipped on pull_request_review) —
   # ordering, not gating, is what `needs:` is for here. See #61 for the
   # cross-event race and this PR for the same-workflow race nathanpayne-codex
   # caught during review.
