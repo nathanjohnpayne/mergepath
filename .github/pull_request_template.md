@@ -1,7 +1,10 @@
 Authoring-Agent: <!-- claude | codex | cursor -->
 
 > **Merge disposition — default: full automation.** This PR proceeds
-> author → reviewer-identity approval → merge with no human checkpoint. Agents:
+> author → review → merge with no human checkpoint — reviewer-identity
+> approval for under-threshold PRs, Phase 4 external clearance for
+> above-threshold / protected-path PRs (where the authoring agent's reviewer
+> identity posts `--comment` only). Agents:
 > do not pause to ask "should I merge?" / "how far should I take this?" —
 > favoring automation is the point of Mergepath. The path stops for only two
 > reasons: (1) **the human says otherwise** — an explicit instruction, or a
