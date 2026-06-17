@@ -15,7 +15,7 @@ The automated path never pauses to ask for merge permission. It defers to a huma
 
 A stuck required gate is separate and non-discretionary, not a disposition choice: a red required check must go green, and a CodeRabbit rate-limit stall (`scripts/coderabbit-wait.sh` exit `5`) must be escalated to the human — alerting does not unblock it; the PR waits for human direction (see [Phase 2.5](#phase-25-automated-external-review-coderabbit)). The agent never works around a stuck gate to merge, but it also never asks permission to merge a green one.
 
-Anything else — a green under-threshold PR, or a Phase 4a clearance that the Phase 4b classifier does not flag — merges without a human checkpoint. Presenting a "how far should I take this PR?" disposition prompt on the happy path is a deviation from this policy, not a courtesy.
+Anything else — a green under-threshold PR, or a Phase 4a clearance where `phase_4b_default` is `fallback-only` or the `complex-changes` classifier exits `0` — merges without a human checkpoint. Presenting a "how far should I take this PR?" disposition prompt on the happy path is a deviation from this policy, not a courtesy.
 
 ## Identities
 

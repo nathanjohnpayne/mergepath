@@ -26,15 +26,18 @@ This repository uses a multi-identity AI agent code review system. The full poli
 ### Workflow Summary
 
 **Default disposition — favor automation.** Drive every PR all the way through
-(author → reviewer-identity approval for under-threshold PRs → merge) without
-pausing to ask the human for merge permission. It defers to a human for only
-two reasons: (a) the human says otherwise — an explicit instruction or a
-`human-hold` / `needs-human-review` / `policy-violation` label — or (b) a
-Phase 4b handoff is required. (A stuck required gate — a red check, or a
-CodeRabbit rate-limit stall, `scripts/coderabbit-wait.sh` exit `5` — blocks
-merge until resolved; that is a blocked gate, not a disposition prompt.) Do
-not present a "how far should I take this PR?" prompt on the happy path. See
-REVIEW_POLICY.md § Default disposition.
+(author → review → merge) without pausing to ask the human for merge
+permission. For under-threshold PRs, that means reviewer-identity approval →
+merge; for above-threshold or protected-path PRs, that means Phase 4 external
+clearance → merge. It defers to a human for only two reasons: (a) the human
+says otherwise — an explicit instruction or a `human-hold` /
+`needs-human-review` / `policy-violation` label — or (b) a human handoff or
+escalation is required — a Phase 4b handoff or a Phase 4a disagreement /
+runaway escalation. (A stuck required gate — a red check, or a CodeRabbit
+rate-limit stall, `scripts/coderabbit-wait.sh` exit `5` — blocks merge until
+resolved; that is a blocked gate, not a disposition prompt.) Do not present a
+"how far should I take this PR?" prompt on the happy path. See REVIEW_POLICY.md
+§ Default disposition.
 
 0. Run credential preflight at the start of every PR session. The
    canonical session-loop snippet (read-path GH_TOKEN, token-verified
@@ -92,7 +95,7 @@ REVIEW_POLICY.md § Default disposition.
    c. **Grep inline comments** for `Potential issue` or `⚠️` — these must each be explicitly addressed (fixed or dismissed with reasoning).
    d. Address other substantive findings. CodeRabbit review is advisory and does not block merge.
 6. Check .github/review-policy.yml for the external review threshold. If the PR does NOT meet it (lines changed < external_review_threshold AND no file matches external_review_paths), merge as nathanjohnpayne. Done.
-7. If the PR meets the threshold, proceed to Phase 4 (see REVIEW_POLICY.md § Phase 4). Before Phase 4a, consult `phase_4b_default` from `.github/review-policy.yml` (parsed and exported as `PHASE_4B_DEFAULT` by `scripts/codex-review-check.sh`). When set to `complex-changes`, run `scripts/phase-4b-classifier.sh <PR#>` between 4a clearance and merge — exit 1 means post the Phase 4b handoff and wait for an external CLI review; exit 0 means merge. Full detail lives in REVIEW_POLICY.md § Phase 4b Triggers. Phase 4 has two legs:
+7. If the PR meets the threshold, proceed to Phase 4 (see REVIEW_POLICY.md § Phase 4). Before Phase 4a, consult `phase_4b_default` from `.github/review-policy.yml` (parsed and exported as `PHASE_4B_DEFAULT` by `scripts/codex-review-check.sh`). When set to `always`, post the Phase 4b handoff for every threshold PR after 4a clearance. When set to `complex-changes`, run `scripts/phase-4b-classifier.sh <PR#>` between 4a clearance and merge — exit 1 means post the Phase 4b handoff and wait for an external CLI review; exit 0 means merge. Full detail lives in REVIEW_POLICY.md § Phase 4b Triggers. Phase 4 has two legs:
    - **Phase 4a — Automated (preferred)** when ALL of: `codex.enabled: true` in `.github/review-policy.yml`, BOTH `scripts/codex-review-request.sh` AND `scripts/codex-review-check.sh` exist on disk, AND the **ChatGPT Codex Connector GitHub App is review-ready on this repo**. "Review-ready" means installed, Code Review enabled at [chatgpt.com/codex/cloud/settings/code-review](https://chatgpt.com/codex/cloud/settings/code-review), AND a Codex environment configured at [chatgpt.com/codex/cloud/settings/environments](https://chatgpt.com/codex/cloud/settings/environments). Verify only by observation: did a recent PR in this repo receive an auto-review from `chatgpt-codex-connector[bot]`? That is the only reliable check from a reviewer PAT — `gh api repos/{owner}/{repo}/installation` requires a GitHub App JWT and returns 401 for normal tokens. Drive the Codex GitHub App review loop: post `@codex review` via the request script, address **P0/P1** findings (fix code or rebuttal reply — P2/P3 findings do NOT block clearance), loop up to `codex.max_review_rounds`. On clearance (COMMENTED review with no unaddressed P0/P1 findings on the current HEAD, OR 👍 reaction from `chatgpt-codex-connector[bot]`), run `scripts/codex-review-check.sh` to verify the merge gate and merge. On exit code 4 (timeout), drop to Phase 4b. On repeat-after-rebuttal or round > `max_review_rounds`, escalate per § Disagreements below. If any of the conditions is false (Codex App not review-ready, partial script rollout, or Codex disabled in config), fall back to Phase 4b directly rather than entering 4a and stalling.
    - **Phase 4b — Manual CLI fallback** when 4a is unavailable or 4a fell back. When `codex.enabled: false`, `scripts/codex-review-check.sh` ignores Codex bot reviews/reactions and requires this Phase 4b substitute path for gate (c). Post the handoff message (see REVIEW_POLICY.md § Handoff Message Format) as a PR comment, emit the chat-side handoff block per REVIEW_POLICY.md § Handoff Message Format § Chat-side handoff block before alerting the human, and wait for an external reviewer identity (e.g., nathanpayne-codex) to post an `APPROVED` review via a separate agent CLI session. Address feedback via back-and-forth.
 8. If the external reviewer flags observations or risks while approving, create a GitHub Issue for each one assigned to nathanjohnpayne with labels "post-review" and "observation" or "risk" before merging.
