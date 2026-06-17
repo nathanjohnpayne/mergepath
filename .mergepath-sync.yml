@@ -565,6 +565,17 @@ paths:
   - path: tests/test_export_consumer_facts.sh
     type: canonical
     consumers: all
+  # Pairs with scripts/ci/check_coderabbit_config + check_coderabbit_config_tests
+  # (both kit-propagated). check_coderabbit_config_tests hard-fails (exit 1) on a
+  # missing test file, and the test asserts on the check's exact stdout — so the
+  # test MUST travel in lockstep with the check, or a check-output change (e.g.
+  # the #481 "; safety floor OK" suffix) makes every consumer's bootstrap-era
+  # test fail repo_lint after sync. Same #264 closure class as the pairs above;
+  # the latent gap (test never in the manifest, passing on consumers only because
+  # the check's output had been stable) was caught by nathanpayne-codex P1 on #482.
+  - path: tests/test_check_coderabbit_config.sh
+    type: canonical
+    consumers: all
 
   # Canonical workflows — review policy + automation surfaces that
   # should be lockstep across all consumers.
@@ -702,6 +713,7 @@ paths:
       - "tests/test_resolve_pr_threads_rationale_tag.sh"  # check_resolve_pr_threads (delegated test)
       - "tests/test_template_substitution.sh"  # check_template_substitution
       - "tests/test_export_consumer_facts.sh"  # check_export_consumer_facts
+      - "tests/test_check_coderabbit_config.sh"  # check_coderabbit_config_tests (#481/#482)
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
       - "tests/test_465_fail_closed.sh"        # check_codex_scripts (#465)

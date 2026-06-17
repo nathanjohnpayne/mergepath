@@ -41,6 +41,14 @@
 # The profile gate (`reviews.profile == "chill"`) only fires when
 # .coderabbit.yml exists AND this is the Mergepath template repo.
 #
+# Safety-posture floor (#481): two posture keys ARE load-bearing for
+# every repo with CodeRabbit enabled, so they're enforced universally
+# (template AND consumers), unlike the template-scoped profile gate —
+#   reviews.auto_review.enabled        must not be explicitly false
+#   reviews.request_changes_workflow   must not be explicitly true
+# See the block below for the rationale. path_instructions,
+# tone_instructions, tools.*, and profile stay per-repo (NOT enforced).
+#
 # Template-repo detection prefers CI signals (GITHUB_REPOSITORY,
 # which Actions always sets, matched against `*/mergepath`) and
 # falls back to the origin remote URL for local runs. An override
@@ -109,6 +117,50 @@ if ! yq '.' "$CONFIG" >/dev/null 2>&1; then
   exit 1
 fi
 
+# --- universal safety-posture floor (#481) ----------------------------------
+#
+# The profile gate below is template-only (consumers may run assertive
+# locally — Codex P2 on #256). But two posture keys are load-bearing for
+# EVERY repo that has CodeRabbit enabled, and drift in either silently
+# weakens or deadlocks the review automation. Enforce them wherever the
+# config exists, on template and consumers alike:
+#
+#   reviews.auto_review.enabled    — a repo flipping this to `false`
+#       silently turns CodeRabbit off; the existence gate above still
+#       passes (the file is present), so nothing else would catch it.
+#   reviews.request_changes_workflow — flipping this to `true` makes
+#       CodeRabbit post CHANGES_REQUESTED, which hard-blocks PRs on
+#       branch protection and can deadlock the merge-clearance automation
+#       (the design relies on Codex, not CodeRabbit, as the blocking gate).
+#
+# Conservative by design: FAIL only on the explicit dangerous literal,
+# NOT on an absent key — CodeRabbit defaults auto_review.enabled=true and
+# request_changes_workflow=false, so absent is the safe default. Read the
+# raw value and pattern-match the boolean rather than `// default`, which
+# treats the literal `false` as missing (same trap handled at the
+# coderabbit_enabled read above).
+posture_fail=0
+
+auto_review_enabled=$(yq -r '.reviews.auto_review.enabled' "$CONFIG" 2>/dev/null || echo "null")
+if [ "$auto_review_enabled" = "false" ]; then
+  echo "FAIL: reviews.auto_review.enabled is false — CodeRabbit auto-review is disabled."
+  echo "      Default is true; remove the override. If this repo truly opts out of CodeRabbit,"
+  echo "      set 'coderabbit.enabled: false' in .github/review-policy.yml AND delete .coderabbit.yml."
+  posture_fail=1
+fi
+
+request_changes=$(yq -r '.reviews.request_changes_workflow' "$CONFIG" 2>/dev/null || echo "null")
+if [ "$request_changes" = "true" ]; then
+  echo "FAIL: reviews.request_changes_workflow is true — CodeRabbit would post CHANGES_REQUESTED"
+  echo "      and hard-block PRs on branch protection. The merge automation relies on Codex as the"
+  echo "      blocking gate; keep this false (the CodeRabbit default)."
+  posture_fail=1
+fi
+
+if [ "$posture_fail" -ne 0 ]; then
+  exit 1
+fi
+
 # --- template-repo detection ------------------------------------------------
 #
 # Returns 0 if this repo is the Mergepath template (where the profile
@@ -157,7 +209,7 @@ is_mergepath_template() {
 }
 
 if ! is_mergepath_template; then
-  echo "check_coderabbit_config: PASS (parse OK; profile gate skipped — not the Mergepath template repo)"
+  echo "check_coderabbit_config: PASS (parse OK; safety floor OK; profile gate skipped — not the Mergepath template repo)"
   exit 0
 fi
 
@@ -169,5 +221,5 @@ if [ "$profile" != "$EXPECTED_PROFILE" ]; then
   exit 1
 fi
 
-echo "check_coderabbit_config: PASS (reviews.profile=$profile)"
+echo "check_coderabbit_config: PASS (reviews.profile=$profile; safety floor OK)"
 exit 0
