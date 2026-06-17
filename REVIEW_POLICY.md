@@ -861,6 +861,7 @@ coderabbit:
 # per-repo install state and its "Automatic reviews" setting.
 codex:
   enabled: true
+  request_by_default: true                    # post `@codex review` on EVERY PR, not just above-threshold (#486)
   bot_login: "chatgpt-codex-connector[bot]"   # REST API form, with [bot] suffix
   cli_login: nathanpayne-codex                # manual CLI fallback (Phase 4b)
   max_review_rounds: 2                        # runaway guard; 3rd round escalates
@@ -884,6 +885,17 @@ dependabot:
 
 > **Note on `enabled` flags (both `coderabbit` and `codex`).** These flags govern **agent behavior only** — whether the authoring agent waits for the corresponding review in its phase. They do NOT control whether the underlying GitHub App runs. Both apps run based on their own install state on GitHub, independent of what this YAML says. Setting `coderabbit.enabled: false` alone will cause the agent to skip the CodeRabbit phase while the app continues to post reviews silently in the background. Setting `codex.enabled: false` routes the agent to Phase 4b and makes `scripts/codex-review-check.sh` ignore Codex bot reviews/reactions for the merge gate, but the Codex App may still post comments unless it is disabled in ChatGPT/GitHub. To fully disable an integration, uninstall or disable the GitHub App AND set the flag to false.
 
+#### `codex.request_by_default` — request Codex on every PR (#486)
+
+`codex.request_by_default` (default `true`) decouples the `@codex review` trigger from the external-review threshold:
+
+- **`true`** — `scripts/codex-review-request.sh` posts the `@codex review` trigger on **every** PR, independent of `external_review_threshold` / `external_review_paths`. An under-threshold PR receives a Codex review too. This is the full-automation default ([#483](https://github.com/nathanjohnpayne/mergepath/issues/483)).
+- **`false`** — the pre-#486 behavior: the trigger fires only when the PR independently qualifies for Phase 4a (lines ≥ threshold **or** a protected-path match).
+
+The key is **orthogonal to `codex.enabled`**: it governs only *when* the trigger is posted, never *whether* Codex participates. When `codex.enabled: false`, Phase 4a is off and no trigger is posted regardless of `request_by_default`.
+
+`scripts/codex-review-request.sh` parses both keys (via the same `codex_field` helper as the rest of the `codex:` block) and applies them as a Phase 4a entry gate *before* any signal scan or trigger write. It does not recompute the threshold itself — the caller tells the worker whether the PR independently qualifies by exporting `MERGEPATH_PHASE_4A_GATED=true` (consulted only when `request_by_default` is `false`). When the gate decides to skip, the script emits JSON with `trigger_requested: false` and exits `5` (`NO_TRIGGER_REQUESTED`) — distinct from a timeout (`4`) or an API error (`3`).
+
 ### Threshold Evaluation
 
 A PR requires external review if **either** condition is true:
@@ -891,7 +903,7 @@ A PR requires external review if **either** condition is true:
 1. Total non-generated lines changed (additions + deletions) ≥ `external_review_threshold`. Lockfiles (`*.lock`, `*lock.json`), minified files (`*.min.js`, `*.min.css`), and generated files (`*.generated.*`) are excluded from the count.
 2. Any file in the PR diff matches a pattern in `external_review_paths`
 
-The agent evaluates this after internal review passes, before merging. CI workflows may also evaluate and label earlier as an advisory (see Phase 3 note above).
+The agent evaluates this after internal review passes, before merging. CI workflows may also evaluate and label earlier as an advisory (see Phase 3 note above). Independently of this threshold, `codex.request_by_default: true` (the default) requests a Codex review on every PR — see [`codex.request_by_default`](#codexrequest_by_default--request-codex-on-every-pr-486) above. The threshold still governs the **merge gate** (whether external clearance is *required* to merge); `request_by_default` governs whether the Codex trigger is *posted*.
 
 ## Git Identity Switching
 
