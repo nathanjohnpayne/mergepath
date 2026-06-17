@@ -19,9 +19,10 @@ Before opening or updating a pull request, perform a structured self-review and 
 - Only `nathanjohnpayne` merges to the target branch.
 - Never approve your own PR. Self-approvals are automatically dismissed.
 - Never remove `needs-external-review`, `needs-human-review`, `policy-violation`, or `human-hold` labels. Agents may add `human-hold` to freeze a PR.
+- Before merge, verify there are zero unresolved GitHub review conversations per REVIEW_POLICY.md.
 - When external review is required, post a handoff message as described in REVIEW_POLICY.md.
 - See REVIEW_POLICY.md for the complete workflow, handoff format, and post-merge issue rules.
 
 ## CodeRabbit Review
 
-If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`, CodeRabbit provides automated review on every PR (Phase 2.5). Read and address CodeRabbit comments after internal review passes. CodeRabbit is advisory — it does not block merge.
+If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`, CodeRabbit provides automated review on every PR (Phase 2.5). Read and address CodeRabbit comments after internal review passes. CodeRabbit is advisory via CI, but unresolved GitHub review conversations still block merge until cleared under REVIEW_POLICY.md.
