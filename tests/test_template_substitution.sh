@@ -689,7 +689,7 @@ expect_output "12g React Compiler block omitted for non-React consumers" "$r" ""
 r=$(render_case "// >>> if frameworks contains react
 react-hooks/set-state-in-effect: off
 // <<<
-" "MERGEPATH_FACT_FRAMEWORKS=react MERGEPATH_FACT_REACT_COMPILER=true")
+" "MERGEPATH_FACT_FRAMEWORKS=react" "MERGEPATH_FACT_REACT_COMPILER=true")
 expect_output "12h react_compiler=true does NOT suppress disable block (v1 limitation)" "$r" "react-hooks/set-state-in-effect: off"
 
 # ---------------------------------------------------------------------------

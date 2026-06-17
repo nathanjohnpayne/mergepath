@@ -16,9 +16,22 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_verify_propagation_pr_templated.sh"
 
 if [ ! -f "$TEST_SCRIPT" ]; then
-  # Missing test script is a hard error, not a skip — silent-skip
-  # would let an accidental delete/rename disable this check
-  # without surfacing in CI.
+  # Consumer-safe fail-closed (#467): the scripts/ci/ kit propagates
+  # this wrapper to every consumer, but test_verify_propagation_pr_templated.sh
+  # is NOT in the manifest's consumer set, so it is legitimately absent
+  # in a consumer checkout. Distinguish the two cases by the manifest:
+  #   - .mergepath-sync.yml present  → canonical mergepath checkout, the
+  #     test MUST exist; a missing test is an accidental delete/rename
+  #     and is a hard error (so it surfaces in CI rather than silently
+  #     disabling the check).
+  #   - .mergepath-sync.yml absent   → consumer checkout that received
+  #     the wrapper but not the test → SKIP (a hard error here would
+  #     red every consumer's repo-lint for a file they never receive).
+  # Mirrors scripts/ci/check_bootstrap_sh.
+  if [ ! -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
+    echo "check_workflow_verify_propagation_templated: SKIP (consumer checkout: tests/test_verify_propagation_pr_templated.sh + .mergepath-sync.yml both absent)"
+    exit 0
+  fi
   echo "check_workflow_verify_propagation_templated: ERROR (missing $TEST_SCRIPT)" >&2
   exit 1
 fi

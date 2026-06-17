@@ -24,9 +24,23 @@ TESTS=(
 for rel in "${TESTS[@]}"; do
   full="$REPO_ROOT/$rel"
   if [ ! -f "$full" ]; then
-    # Missing test script is a hard error, not a skip — silent-skip
-    # would let an accidental delete/rename disable this check
-    # without surfacing in CI.
+    # Consumer-safe fail-closed (#467). Both wrapped tests travel to
+    # consumers (consumers: all in .mergepath-sync.yml), so in a healthy
+    # consumer they are present and run. But during a partial sync — or
+    # if a future manifest edit narrows their consumer scope — a consumer
+    # could hold this kit-propagated wrapper without the test. Use the
+    # manifest as the canonical/consumer discriminator, same as
+    # scripts/ci/check_bootstrap_sh:
+    #   - .mergepath-sync.yml present → canonical checkout, the test MUST
+    #     exist; a missing test is an accidental delete/rename → hard
+    #     error so it surfaces in CI instead of silently disabling a
+    #     security-load-bearing check.
+    #   - .mergepath-sync.yml absent → consumer checkout missing the
+    #     test → SKIP that test rather than red the consumer's repo-lint.
+    if [ ! -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
+      echo "check_verify_propagation_pr: SKIP $rel (consumer checkout: test + .mergepath-sync.yml both absent)"
+      continue
+    fi
     echo "check_verify_propagation_pr: ERROR (missing $rel)" >&2
     exit 1
   fi
