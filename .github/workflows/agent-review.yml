@@ -10,7 +10,10 @@ on:
     # commit, not just on `opened` / `ready_for_review`. Without it,
     # a shell-parser regression can land on main and only surface
     # weeks later when the next PR happens to be opened. See #59.
-    types: [opened, ready_for_review, labeled, synchronize]
+    # `reopened` is included so the auto-merge re-arm path (#495) actually
+    # fires: the job `if:` matches `synchronize || reopened`, but a reopened
+    # event only reaches this workflow if it is subscribed here.
+    types: [opened, ready_for_review, labeled, synchronize, reopened]
   pull_request_review:
     types: [submitted]
 

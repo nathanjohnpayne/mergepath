@@ -569,6 +569,24 @@ else
   echo "  FAIL: auto-merge must also trigger on pull_request synchronize/reopened to re-arm after a fix-commit (#495)" >&2
 fi
 
+# 2b. The pull_request trigger must actually subscribe `synchronize` AND
+# `reopened`, otherwise the re-arm `if:` above is dead code: GitHub never
+# delivers an unsubscribed event to the workflow, so the reopened half (and,
+# without synchronize, the whole re-arm) silently never fires (#495).
+pr_trigger_types=$(awk '
+  /^  pull_request:/ {in_pr=1; next}
+  in_pr && /^  [a-z]/ {exit}
+  in_pr && /^    types:/ {print; exit}
+' "$agent_review_workflow")
+if printf '%s\n' "$pr_trigger_types" | grep -Fq "synchronize" \
+  && printf '%s\n' "$pr_trigger_types" | grep -Fq "reopened"; then
+  pass=$((pass + 1))
+  echo "  PASS: on.pull_request.types subscribes synchronize + reopened so the re-arm if: is live (#495)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: on.pull_request.types must include synchronize AND reopened, else the re-arm if: is dead code (#495)" >&2
+fi
+
 # 3. A dedicated approval gate runs only on the pull_request (push) path.
 if printf '%s\n' "$auto_merge_job_block" | grep -Fq 'id: require_approval' \
   && printf '%s\n' "$auto_merge_job_block" \
