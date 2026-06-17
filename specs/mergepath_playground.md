@@ -26,10 +26,14 @@ reserved, see [`BRAND.md`](../BRAND.md).
   exposes.
 - Changing any knob updates stats, flows, and YAML without a full
   reload.
-- The control rail and workspace are their own scroll containers and
-  scroll in sync: scrolling one advances the other proportionally so
-  a long PR list and a short control stack stay aligned without the
-  shorter pane getting stranded.
+- The control rail and workspace are their own scroll containers. In the
+  side-by-side (desktop) layout they scroll in sync: scrolling one
+  advances the other proportionally so a long PR list and a short control
+  stack stay aligned without the shorter pane getting stranded. At the
+  `max-width: 960px` stacked breakpoint the columns stack vertically and
+  scroll independently — the sync is disabled there (it would otherwise
+  fight the user), gated on a `matchMedia('(max-width: 960px)')` check
+  read live on each scroll.
 - The page carries an HTML comment injection marker
   `<!-- MERGEPATH_INJECT -->` that `scripts/policy-sim.sh` rewrites
   to `<script>window.__PRS = [...]</script>`. The legacy marker
