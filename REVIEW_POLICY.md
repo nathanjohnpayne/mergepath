@@ -619,7 +619,7 @@ When you pull this template change into an existing repo, the new `phase_4b_defa
   │  PHASE 2.5: CODERABBIT REVIEW (if enabled)               │
   │  CodeRabbit auto-posts review on PR                      │
   │  Agent reads findings, addresses substantive issues      │
-  │  Advisory only — does not block merge                    │
+  │  Advisory via CI; conversations still clear later        │
   └──────────────────────────┬──────────────────────────────┘
                              │
                              ▼
@@ -627,7 +627,8 @@ When you pull this template change into an existing repo, the new `phase_4b_defa
   │  PHASE 3: THRESHOLD CHECK                                │
   │  Lines changed ≥ threshold OR protected paths touched?   │
   │                                                          │
-  │  NO ──→ nathanjohnpayne merges. Done.                    │
+  │  NO ──→ Pre-merge review conversation gate               │
+  │          then nathanjohnpayne merges. Done.              │
   │  YES ──→ Proceed to Phase 4                              │
   └──────────────────────────┬──────────────────────────────┘
                              │
@@ -667,10 +668,20 @@ When you pull this template change into an existing repo, the new `phase_4b_defa
              │                  │  Agent fixes. Repeat.       │
              ▼                  │                            │
   ┌──────────────────────────┐  │  Observations/risks →      │
-  │  nathanjohnpayne merges  │  │  GitHub Issues             │
+  │  PRE-MERGE CONVERSATION  │  │  GitHub Issues             │
+  │  GATE: zero unresolved   │  │                            │
+  │  review conversations    │  │  Pre-merge conversation    │
+  │                          │  │  gate: zero unresolved     │
+  │  Addressed bot threads   │  │  review conversations.     │
+  │  may be resolved; human  │  │                            │
+  │  threads stop the merge. │  │  nathanjohnpayne merges.   │
+  └──────────┬───────────────┘  │  Done.                     │
+             │                  │                            │
+             ▼                  │                            │
+  ┌──────────────────────────┐  │                            │
+  │  nathanjohnpayne merges  │  │                            │
   │  (--squash). Done.       │  │                            │
-  └──────────────────────────┘  │  nathanjohnpayne merges.   │
-                                │  Done.                     │
+  └──────────────────────────┘  │                            │
                                 └────────────────────────────┘
 ```
 
