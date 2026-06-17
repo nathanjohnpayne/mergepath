@@ -885,7 +885,7 @@ dependabot:
 
 > **Note on `enabled` flags (both `coderabbit` and `codex`).** These flags govern **agent behavior only** — whether the authoring agent waits for the corresponding review in its phase. They do NOT control whether the underlying GitHub App runs. Both apps run based on their own install state on GitHub, independent of what this YAML says. Setting `coderabbit.enabled: false` alone will cause the agent to skip the CodeRabbit phase while the app continues to post reviews silently in the background. Setting `codex.enabled: false` routes the agent to Phase 4b and makes `scripts/codex-review-check.sh` ignore Codex bot reviews/reactions for the merge gate, but the Codex App may still post comments unless it is disabled in ChatGPT/GitHub. To fully disable an integration, uninstall or disable the GitHub App AND set the flag to false.
 
-#### `codex.request_by_default` — request Codex on every PR (#486)
+### `codex.request_by_default` — request Codex on every PR (#486)
 
 `codex.request_by_default` (default `true`) decouples the `@codex review` trigger from the external-review threshold. It governs whether **the agent** posts `@codex review` on every PR: the agent is the caller that runs `scripts/codex-review-request.sh` from the workflow, and there is no separate workflow auto-caller that posts the trigger on its own.
 
