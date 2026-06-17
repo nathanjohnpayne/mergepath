@@ -10,10 +10,10 @@ This policy governs how AI coding agents author, review, and merge code across r
 
 The automated path stops for **exactly two** reasons:
 
-1. **The human says otherwise.** An explicit instruction in chat, or a human-action label that the gates enforce — `human-hold` (a human-remove-only hard freeze that supersedes every gate) or `needs-human-review`. Agents may add `human-hold` but must never remove it (see [Agent prohibitions](#agent-prohibitions)).
-2. **A Phase 4b handoff is required.** An above-threshold or protected-path PR where Phase 4a is unavailable, escalates to disagreement/runaway, or times out. Phase 4b is the only sanctioned place to post a [handoff message](#handoff-message-format) and wait for a human-mediated external review.
+1. **The human says otherwise.** An explicit instruction in chat, or a human-action label that the gates enforce — `human-hold` (a human-remove-only hard freeze that supersedes every gate), `needs-human-review`, or `policy-violation`. Agents may add `human-hold` but must never remove it, and must never modify the others (see [Agent prohibitions](#agent-prohibitions)).
+2. **A Phase 4b handoff is required.** An above-threshold or protected-path PR where Phase 4a is unavailable, escalates to disagreement/runaway, or times out — or, where `phase_4b_default` is `complex-changes` or `always`, where `scripts/phase-4b-classifier.sh` flags the PR after 4a clearance (proactive Phase 4b). Phase 4b is the only sanctioned place to post a [handoff message](#handoff-message-format) and wait for a human-mediated external review.
 
-Anything else — a green under-threshold PR, a clean Phase 4a clearance — merges without a human checkpoint. Presenting a "how far should I take this PR?" disposition prompt on the happy path is a deviation from this policy, not a courtesy.
+Anything else — a green under-threshold PR, or a Phase 4a clearance that the Phase 4b classifier does not flag — merges without a human checkpoint. Presenting a "how far should I take this PR?" disposition prompt on the happy path is a deviation from this policy, not a courtesy.
 
 ## Identities
 
