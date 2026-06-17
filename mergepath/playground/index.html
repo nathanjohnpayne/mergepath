@@ -1047,12 +1047,15 @@
   function compileGlob(pattern) {
     if (globCache.has(pattern)) return globCache.get(pattern);
     try {
+      // Segment-local glob → ERE. KEEP IN LOCKSTEP with the shell twin
+      // scripts/workflow/match_protected_paths.sh: ** -> .*, * -> [^/]*,
+      // ? -> [^/] (a `?` does not cross `/`, per #471).
       const re = '^' + pattern
         .replace(/[.+^${}()|[\]\\]/g, '\\$&')
         .replace(/\*\*/g, '::DS::')
         .replace(/\*/g, '[^/]*')
         .replace(/::DS::/g, '.*')
-        .replace(/\?/g, '.') + '$';
+        .replace(/\?/g, '[^/]') + '$';
       const compiled = new RegExp(re);
       globCache.set(pattern, compiled);
       return compiled;

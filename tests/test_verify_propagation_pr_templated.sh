@@ -76,7 +76,7 @@ YAML
 # (rendered.txt added with the supplied content). Sets globals
 # BASE_SHA / HEAD_SHA.
 build_consumer() {
-  local cdir="$1" pr_content="$2"
+  local cdir="$1" pr_content="$2" dest_mode="${3:-100644}"
   mkdir -p "$cdir"
   git_quiet -C "$cdir" init -q
   printf 'app code\n' >"$cdir/app.ts"
@@ -85,6 +85,13 @@ build_consumer() {
   BASE_SHA=$(git -C "$cdir" rev-parse HEAD)
   printf '%s' "$pr_content" >"$cdir/rendered.txt"
   git_quiet -C "$cdir" add -A
+  # Record the executable bit in the git INDEX, not via a filesystem
+  # chmod: under core.filemode=false (some CI images / mode-insensitive
+  # filesystems) git ignores the on-disk exec bit and would commit 100644
+  # regardless, silently breaking Cases 6/7. `git update-index --chmod=+x`
+  # writes mode 100755 directly into the index — same approach Case 5 uses
+  # for its fixture (CodeRabbit on PR #475).
+  [ "$dest_mode" = "100755" ] && git_quiet -C "$cdir" update-index --chmod=+x rendered.txt
   git_quiet -C "$cdir" commit -q -m head
   HEAD_SHA=$(git -C "$cdir" rev-parse HEAD)
 }
@@ -280,6 +287,75 @@ else
   else
     pass "Case 5: mode tampering (chmod +x) → exit 1, tree-entry diagnostic"
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Case 6 — executable templated source: rendered dest must INHERIT +x (#471).
+# Before the fix the verifier hardcoded `100644 blob` and would reject a
+# faithfully-rendered executable template; now it derives the expected mode
+# from the source. A no-facts template renders to itself.
+# ---------------------------------------------------------------------------
+EXEC_TEMPLATE='#!/usr/bin/env bash
+echo hello
+'
+MP6="$WORKDIR/mp6"; build_mergepath "$MP6" "$EXEC_TEMPLATE" ""
+chmod +x "$MP6/examples/source.tpl"
+C6="$WORKDIR/c6"; build_consumer "$C6" "$EXEC_TEMPLATE" 100755
+run_verify "$MP6" "$C6"
+if [ "$RC" -ne 0 ]; then
+  fail "Case 6 exec-template pass: expected exit 0, got $RC"
+  { echo "stderr:"; sed 's/^/  /' "$STDERR_FILE"; } >&2
+else
+  pass "Case 6: executable templated source + executable dest → exit 0 (mode inherited)"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 7 — executable source but dest rendered NON-executable → mode drift.
+# The fix must still catch a mode FLIP relative to the (now executable) source.
+# ---------------------------------------------------------------------------
+MP7="$WORKDIR/mp7"; build_mergepath "$MP7" "$EXEC_TEMPLATE" ""
+chmod +x "$MP7/examples/source.tpl"
+C7="$WORKDIR/c7"; build_consumer "$C7" "$EXEC_TEMPLATE" 100644
+run_verify "$MP7" "$C7"
+if [ "$RC" -ne 1 ]; then
+  fail "Case 7 exec-source mode-drift: expected exit 1, got $RC"
+else
+  pass "Case 7: executable source but non-executable dest → exit 1 (mode drift caught)"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 8 — source mode is read from the COMMITTED git tree, not the on-disk
+# exec bit (#475 / CodeRabbit + Codex). This is the PRODUCTION path: a real
+# MERGEPATH_DIR is a git checkout. The source is committed as 100755 but its
+# on-disk exec bit is then CLEARED, so a filesystem `-x` read would see
+# 100644 and wrongly reject the executable dest as drift. Only reading the
+# git mode (100755) makes the faithful render pass — a precise discriminator
+# for the git-tree-mode fix.
+# ---------------------------------------------------------------------------
+EXEC_TEMPLATE8='#!/usr/bin/env bash
+echo run
+'
+MP8="$WORKDIR/mp8"; build_mergepath "$MP8" "$EXEC_TEMPLATE8" ""
+git_quiet -C "$MP8" init -q
+git_quiet -C "$MP8" add -A
+git_quiet -C "$MP8" update-index --chmod=+x examples/source.tpl
+git_quiet -C "$MP8" commit -q -m mp
+chmod -x "$MP8/examples/source.tpl"   # on-disk bit now disagrees with git (100755)
+# Assert the precondition actually held: if the filesystem ignored chmod -x
+# (mode-insensitive FS), the on-disk bit would still be set and Case 8 would
+# pass for the WRONG reason (filesystem read also seeing 100755), not because
+# the verifier read the git tree. Fail loudly instead (CodeRabbit on PR #475).
+if [ -x "$MP8/examples/source.tpl" ]; then
+  fail "Case 8 precondition: chmod -x did not clear the on-disk exec bit (mode-insensitive FS); discriminator invalid"
+else
+C8="$WORKDIR/c8"; build_consumer "$C8" "$EXEC_TEMPLATE8" 100755
+run_verify "$MP8" "$C8"
+if [ "$RC" -ne 0 ]; then
+  fail "Case 8 git-mode source read: expected exit 0, got $RC"
+  { echo "stderr:"; sed 's/^/  /' "$STDERR_FILE"; } >&2
+else
+  pass "Case 8: source mode read from git tree (on-disk bit cleared) → exec dest passes"
+fi
 fi
 
 echo ""

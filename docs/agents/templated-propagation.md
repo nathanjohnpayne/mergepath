@@ -174,16 +174,17 @@ How it works:
    [mergepath-verify: templated-render] <dest> <consumer> <source>
    ```
 
-5. Failures fall into three typed buckets in the verifier's stderr summary:
+5. Failures fall into typed buckets in the verifier's stderr summary:
    - **Canonical / kit drift** — pre-existing canonical surface.
    - **Templated re-render mismatch** — rendered output differs from PR dest content.
+   - **Templated mode/type drift** — the rendered dest's git tree entry (mode + type) does not match the SOURCE template's. The render preserves the source template's git mode, so an **executable** templated source (e.g. a templated shell script) must render to an **executable** dest; a `chmod +x` flip or symlink swap relative to the source is rejected (#471). The verifier reads the source mode from the trusted mergepath checkout — it is NOT a hardcoded `100644`.
    - **Templated re-render error** — malformed template, missing source at mergepath@<sha>, or strict-mode unset fact.
 
 Consumer-inference fallback: if neither `$MERGEPATH_CONSUMER` is set nor the `origin` remote matches a `.consumers[].repo` field, the templated arm is skipped with a stderr note. The canonical/kit arm still runs, and the templated dest will then fail the path-confinement check, routing the PR to normal Phase 4 review (pre-#323 status quo).
 
 Wire-up:
 
-- CI gate: `scripts/ci/check_workflow_verify_propagation_templated` (test: `tests/test_verify_propagation_pr_templated.sh`) covers the four cases — pass, drift, template syntax error, strict-mode unset fact. Wired into `.github/workflows/repo_lint.yml` alongside `check_verify_propagation_pr`.
+- CI gate: `scripts/ci/check_workflow_verify_propagation_templated` (test: `tests/test_verify_propagation_pr_templated.sh`) covers pass, content drift, template syntax error, strict-mode unset fact, mode tampering, and executable-source mode preservation (#471). Wired into `.github/workflows/repo_lint.yml` alongside `check_verify_propagation_pr`.
 - Rollup attribution: the `templated-render` tag class lives in `scripts/lib/daily-feedback-rollup-helpers.sh` (mapped to `skip` in `tag_class_action`, same routing as `canonical-coverage`) and `scripts/resolve-pr-threads.sh`'s `derive_tag_class` ladder (slotted at rung 1b, right after `canonical-coverage`). Findings on a templated dest are structurally a mergepath concern — fixes belong in the template or in the consumer's `facts:` block — so they route to mergepath rather than surfacing per-consumer.
 
 ## What's queued next

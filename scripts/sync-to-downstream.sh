@@ -781,6 +781,35 @@ materialize_templated_targets() {
       return 1
     fi
     rm -f "$tpl_tmp"
+    # Mirror the source template's executable bit onto the rendered dest
+    # (#471): a templated source can be executable, and render_to writes via
+    # shell redirection (mode 644), so without this an executable templated
+    # script would land non-executable in the consumer. Same shape as the
+    # canonical mirror arm.
+    tpl_src_mode=$(git -C "$MERGEPATH_ROOT" ls-tree "$sha" -- "$tpl_source" | awk '{print $1}')
+    case "$tpl_src_mode" in
+      100755) chmod +x "$tpl_consumer_target" ;;
+      100644) chmod -x "$tpl_consumer_target" ;;
+      *)
+        err "$consumer_name: unexpected git mode '$tpl_src_mode' for templated source $tpl_source at mergepath@$short_sha"
+        return 1
+        ;;
+    esac
+    # Record the mode in the git INDEX, not just the working tree: under
+    # core.filemode=false (some consumer clones / mode-insensitive
+    # filesystems) the caller's blanket `git add -A` ignores the on-disk
+    # exec bit, so a mode-only flip on an existing rendered dest would
+    # silently not be staged and the propagation PR would carry the wrong
+    # mode (Codex P2 on PR #475). Stage the dest and set its index mode
+    # now; a subsequent `git add -A` preserves an already-staged index
+    # mode (verified under core.filemode=false). Mirrors the same lesson
+    # tests/test_verify_propagation_pr_templated.sh applies to its fixture.
+    if [ "$tpl_src_mode" = "100755" ]; then tpl_idx_chmod="+x"; else tpl_idx_chmod="-x"; fi
+    if ! git -C "$workspace/repo" add -- "$tpl_dest" \
+       || ! git -C "$workspace/repo" update-index --chmod="$tpl_idx_chmod" -- "$tpl_dest"; then
+      err "$consumer_name: failed to stage templated dest mode ($tpl_idx_chmod) for $tpl_dest"
+      return 1
+    fi
     printf "  ✎ %s rendered %s → %s\n" "$consumer_name" "$tpl_source" "$tpl_dest"
   done
 }
