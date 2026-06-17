@@ -32,9 +32,15 @@ refute_grep() {  # <label> <file> <fixed-string-that-must-be-absent>
 
 W=.github/workflows
 
-# Defect 1: head-SHA resolve failure fails the sweep (had_infra_error), not a silent skip.
+# Defect 1: head_sha is sourced from the list query (so a check_run can
+# always be posted); a missing SHA flags infra error rather than skipping,
+# and the fragile per-PR head_sha resolve is gone (#465 + r2).
+assert_grep "D1: merge-clearance sources head_sha from the list query" \
+  "$W/merge-clearance-gate.yml" '--json number,headRefOid'
 assert_grep "D1: merge-clearance head-SHA failure flags infra error" \
   "$W/merge-clearance-gate.yml" 'cannot refresh its Merge clearance gate'
+refute_grep "D1: merge-clearance no longer does a fragile per-PR head_sha resolve" \
+  "$W/merge-clearance-gate.yml" 'head_sha=$(gh api "repos/$REPO/pulls/'
 refute_grep "D1: merge-clearance no longer silently skips on unresolved head SHA" \
   "$W/merge-clearance-gate.yml" 'Could not resolve head SHA for PR #$PR; skipping'
 
