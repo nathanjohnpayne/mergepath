@@ -1,3 +1,5 @@
+<!-- markdownlint-disable-file MD041 -->
+
 Tracks Phase 2 of **MUX Video Integration** (Project #5).
 
 **Goal:** Views on `/projects/swipe-watch` (and any other page embedding a MUX video) register in Mux Data with correct `video_title` / `video_id` metadata. Missing env key does not break the player.

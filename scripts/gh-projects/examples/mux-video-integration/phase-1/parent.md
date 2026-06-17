@@ -1,3 +1,5 @@
+<!-- markdownlint-disable-file MD041 -->
+
 Tracks Phase 1 of **MUX Video Integration** (Project #5).
 
 **Goal:** Swipe Watch project page renders a vertical MUX video (autoplay + muted + loop + playsinline) with progress bar tinted to the page's red accent (#c11d19). GIF fallback still renders when JS is disabled. No impact on other project pages.
