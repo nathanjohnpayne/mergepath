@@ -6,12 +6,14 @@ This policy governs how AI coding agents author, review, and merge code across r
 
 ## Default disposition
 
-**Favoring automation is the default, not an option to be confirmed.** Mergepath exists so an agent can carry a change from author → review → merge without human babysitting. On any PR the agent proceeds through the full path autonomously and **does not pause to ask the human for merge permission** ("should I merge?", "how far should I take this?"). For under-threshold PRs that means reviewer-identity `--approve` → merge (see [No-self-approve scoping](#no-self-approve-scoping) and the [Workflow](#workflow)); for above-threshold or protected-path PRs it means driving [Phase 4](#external-review-required) to clearance and then merging.
+**Favoring automation is the default, not an option to be confirmed.** Mergepath exists so an agent can carry a change from author → review → merge without human babysitting. On any PR the agent proceeds through the full path autonomously and **does not pause to ask the human for merge permission** ("should I merge?", "how far should I take this?"). For under-threshold PRs that means reviewer-identity `--approve` → merge (see [No-self-approve scoping](#no-self-approve-scoping) and the [Workflow](#workflow)); for above-threshold or protected-path PRs it means driving [Phase 4](#phase-4-external-review) to clearance and then merging.
 
-The automated path stops for **exactly two** reasons:
+The automated path never pauses to ask for merge permission. It defers to a human for only two reasons:
 
 1. **The human says otherwise.** An explicit instruction in chat, or a human-action label that the gates enforce — `human-hold` (a human-remove-only hard freeze that supersedes every gate), `needs-human-review`, or `policy-violation`. Agents may add `human-hold` but must never remove it, and must never modify the others (see [Agent prohibitions](#agent-prohibitions)).
 2. **A Phase 4b handoff is required.** An above-threshold or protected-path PR where Phase 4a is unavailable, escalates to disagreement/runaway, or times out — or, where `phase_4b_default` is `complex-changes` or `always`, where `scripts/phase-4b-classifier.sh` flags the PR after 4a clearance (proactive Phase 4b). Phase 4b is the only sanctioned place to post a [handoff message](#handoff-message-format) and wait for a human-mediated external review.
+
+A stuck required gate is separate and non-discretionary, not a disposition choice: a red required check, or a CodeRabbit rate-limit stall (`scripts/coderabbit-wait.sh` exit `5`), blocks merge until the gate is fixed or — for the rate-limit stall — the human is alerted (see [Phase 2.5](#phase-25-automated-external-review-coderabbit)). The agent never works around a stuck gate to merge, but it also never asks permission to merge a green one.
 
 Anything else — a green under-threshold PR, or a Phase 4a clearance that the Phase 4b classifier does not flag — merges without a human checkpoint. Presenting a "how far should I take this PR?" disposition prompt on the happy path is a deviation from this policy, not a courtesy.
 
