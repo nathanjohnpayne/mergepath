@@ -27,11 +27,14 @@ This repository uses a multi-identity AI agent code review system. The full poli
 
 **Default disposition — favor automation.** Drive every PR all the way through
 (author → reviewer-identity approval for under-threshold PRs → merge) without
-pausing to ask the human for merge permission. The path stops for only two
-reasons: (a) the human says otherwise — an explicit instruction or a
+pausing to ask the human for merge permission. It defers to a human for only
+two reasons: (a) the human says otherwise — an explicit instruction or a
 `human-hold` / `needs-human-review` / `policy-violation` label — or (b) a
-Phase 4b handoff is required. Do not present a "how far should I take this PR?"
-prompt on the happy path. See REVIEW_POLICY.md § Default disposition.
+Phase 4b handoff is required. (A stuck required gate — a red check, or a
+CodeRabbit rate-limit stall, `scripts/coderabbit-wait.sh` exit `5` — blocks
+merge until resolved; that is a blocked gate, not a disposition prompt.) Do
+not present a "how far should I take this PR?" prompt on the happy path. See
+REVIEW_POLICY.md § Default disposition.
 
 0. Run credential preflight at the start of every PR session. The
    canonical session-loop snippet (read-path GH_TOKEN, token-verified
