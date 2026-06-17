@@ -738,9 +738,17 @@ emit_from_session_file() (
         unset OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT
         exit 2
       else
-        log_stale_adc_guidance
+        # Force a full re-fetch (exit 2) rather than degrading in place
+        # (#469): the cached ADC tempfile is stale, but the 1Password ADC
+        # item may have been refreshed since this cache was written.
+        # Re-reading from op on the full-fetch path gives it that chance;
+        # if op's copy is ALSO stale, the full-fetch path calls
+        # log_stale_adc_guidance and degrades there. This matches the
+        # Firebase-SA branch above, which already exits 2 on a stale cache.
+        echo "# WARNING: cached GCP ADC is unusable; refreshing deploy credentials." >&2
         unset GOOGLE_APPLICATION_CREDENTIALS OP_PREFLIGHT_ADC_TMPFILE
         unset OP_PREFLIGHT_FIREBASE_SA_TMPFILE OP_PREFLIGHT_FIREBASE_PROJECT
+        exit 2
       fi
     fi
   fi

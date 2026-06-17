@@ -23,6 +23,7 @@ npm view mergepath           # verify: owner = nathanjohnpayne, version = 0.0.0
 ```bash
 cd packaging/pypi
 python3 -m pip install --upgrade build twine
+rm -rf dist/ build/ ./*.egg-info  # clear stale artifacts so `twine upload dist/*` only sees this build
 python3 -m build             # produces dist/mergepath-0.0.0.tar.gz + .whl
 python3 -m twine upload dist/*   # auth as nathanjohnpayne
 ```
