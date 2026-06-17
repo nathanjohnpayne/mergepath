@@ -35,11 +35,14 @@
 #      HEAD committer date. See nathanjohnpayne/mergepath#136.
 #
 # It also surfaces — without re-invoking — the other detectable reasons
-# CodeRabbit auto-review never fires: a PR base branch not in the
-# configured `base_branches`, and a draft PR when `drafts: false`. These
-# are reported in the JSON `skip_reason` field (paused / non-base-branch /
-# draft) so the caller can act instead of waiting out a full timeout. See
-# nathanjohnpayne/mergepath#490.
+# CodeRabbit auto-review never fires: a PR base branch matched by none of
+# the configured `base_branches` REGEX patterns (and not the repo default
+# branch, which CodeRabbit always reviews), and a draft PR when
+# `drafts: false`. These are reported in the JSON `skip_reason` field
+# (paused / non-base-branch / draft) so the caller can act instead of
+# waiting out a full timeout. The base-branch check evaluates each entry as
+# a regex and fails SAFE (suppresses the skip) on an unparseable pattern.
+# See nathanjohnpayne/mergepath#490.
 #
 # Usage:
 #   scripts/coderabbit-wait.sh <PR_NUMBER> [REPO]
@@ -61,9 +64,10 @@
 #      .github/review-policy.yml.
 #   2. Fetches PR HEAD SHA + committer date.
 #   0. Before polling, check the static skips that mean auto-review will
-#      never fire on this PR: base branch ∉ `base_branches` (#490), and
-#      draft when `drafts: false`. On either, emit JSON with the
-#      `skip_reason` set and exit 6 (SKIPPED) rather than burning the
+#      never fire on this PR: base branch matched by none of the
+#      `base_branches` regex patterns AND not the repo default branch
+#      (#490), and draft when `drafts: false`. On either, emit JSON with
+#      the `skip_reason` set and exit 6 (SKIPPED) rather than burning the
 #      whole budget on a review that cannot land.
 #   3. Polls issue + review comments every 15s. For each CodeRabbit
 #      comment newer than HEAD committer date, classifies as:
@@ -84,9 +88,13 @@
 #   5. On review (non-rate-limit, non-in-progress): emit JSON, exit 0.
 #      Also scans inline diff comments for "Potential issue" / "⚠️"
 #      markers and surfaces them in the JSON so callers can decide.
-#   6. If total elapsed > max_wait_seconds: optionally post
-#      `@coderabbitai, how is the review going?`, wait a short bounded
-#      status-probe window for CodeRabbit's reply, then exit 4
+#   6. If total elapsed > max_wait_seconds: if a pause was OBSERVED during
+#      polling (a durable same-id pause NOTE never advances the resume
+#      budget to its cap), exit 6 (SKIPPED) with status=paused /
+#      skip_reason=paused — a still-paused PR must not fall through to the
+#      advisory timeout that agent-review.yml merges past. Otherwise
+#      optionally post `@coderabbitai, how is the review going?`, wait a
+#      short bounded status-probe window for CodeRabbit's reply, then exit 4
 #      (TIMEOUT) with the reply excerpt surfaced in JSON. The probe is
 #      narration only, never a review / clearance signal.
 #   7. If rate_limit_retries > max_rate_limit_retries: exit 5 (STALLED),
@@ -539,10 +547,14 @@ if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
   die 3 "could not determine HEAD sha for PR #$PR_NUMBER"
 fi
 
-# Base branch + draft state for the #490 static-skip checks below. Both
-# come from the PR metadata already in hand — no extra API call.
+# Base branch + draft state for the #490 static-skip checks below. All
+# come from the PR metadata already in hand — no extra API call. The
+# repo default branch is needed because CodeRabbit always reviews PRs
+# into the default branch even when it is not redundantly listed in
+# base_branches, so the non-base-branch skip must never fire for it.
 PR_BASE_REF=$(echo "$PR_JSON" | jq -r '.base.ref // ""')
 PR_IS_DRAFT=$(echo "$PR_JSON" | jq -r 'if .draft == true then "true" else "false" end')
+PR_DEFAULT_BRANCH=$(echo "$PR_JSON" | jq -r '.base.repo.default_branch // ""')
 
 HEAD_COMMITTER_DATE=$(gh api "repos/$REPO/commits/$HEAD_SHA" --jq '.commit.committer.date' 2>&1) \
   || die 3 "failed to fetch commit date for $HEAD_SHA: $HEAD_COMMITTER_DATE"
@@ -1137,6 +1149,17 @@ run_status_probe_once() {
 emit_timeout() {
   local message=$1
   log "$message"
+  # Once a pause has been observed, a timeout is a still-paused condition,
+  # not an advisory timeout. Exit 6 (skip_reason=paused) so callers that
+  # treat exit 4 as advisory (agent-review.yml) cannot merge past a PR that
+  # CodeRabbit is still refusing to review. A durable same-id pause NOTE
+  # never advances the resume budget to the cap, so without this latch the
+  # loop would fall through to exit 4. See #490.
+  if [ "${PAUSE_OBSERVED:-false}" = "true" ]; then
+    log "timeout reached while CodeRabbit auto-review remains paused — reporting paused (exit 6), not advisory timeout (exit 4)"
+    SKIP_REASON="paused"
+    emit_json_and_exit "paused" 6 "null" 0
+  fi
   run_status_probe_once
   emit_terminal_review_after_probe_if_present
   emit_json_and_exit "timeout" 4 "null" 0
@@ -1149,6 +1172,14 @@ RATE_LIMIT_RETRIES=0
 RESUME_RETRIES=0
 LAST_RATE_LIMIT_COMMENT_ID=""
 LAST_PAUSED_COMMENT_ID=""
+# Latched the first time a "Reviews paused" NOTE is seen. Once a pause has
+# been OBSERVED, the timeout path must NOT fall back to the advisory exit 4
+# (which agent-review.yml treats as advisory and merges past) — a PR must
+# never merge while CodeRabbit is still paused. When CodeRabbit leaves the
+# SAME durable pause NOTE (unchanged comment id), the resume retry budget
+# never advances and the loop would otherwise time out exit 4; with this
+# latched, emit_timeout exits 6 (skip_reason=paused) instead. See #490.
+PAUSE_OBSERVED=false
 # Skip reason surfaced in the JSON. Empty for the normal review/timeout/
 # rate-limit paths; set to paused / non-base-branch / draft on a #490 skip.
 SKIP_REASON=""
@@ -1302,11 +1333,57 @@ emit_status_context_verdict() {
 # yields nothing and the corresponding check is suppressed — no false skip.
 # Neither is re-invocable (resume/review won't help), so the JSON surfaces
 # the reason and the caller decides (retarget the base, mark ready, escalate).
+#
+# base_branches semantics: CodeRabbit documents each entry as a REGEX
+# pattern that names ADDITIONAL non-default bases to review, and it ALWAYS
+# reviews the repo default branch regardless of whether the default is
+# listed. So the non-base-branch skip must (a) always allow the default
+# branch, and (b) match each configured entry as a regex (anchored — the
+# whole base ref must match), not as a fixed string. A repo configuring
+# `base_branches: ["release/.*"]` must NOT skip a PR into `release/2026`,
+# and a default-branch PR must NOT skip just because the default is not
+# redundantly listed. Fail SAFE: if an entry is not a valid regex, suppress
+# the skip rather than risk a false skip that blocks review/merge.
 CONFIGURED_BASE_BRANCHES=$(coderabbit_yml_base_branches)
 if [ -n "$CONFIGURED_BASE_BRANCHES" ] && [ -n "$PR_BASE_REF" ]; then
-  if ! printf '%s\n' "$CONFIGURED_BASE_BRANCHES" | grep -Fxq "$PR_BASE_REF"; then
+  base_is_allowed=no
+  # The repo default branch is always reviewed by CodeRabbit, listed or not.
+  if [ -n "$PR_DEFAULT_BRANCH" ] && [ "$PR_BASE_REF" = "$PR_DEFAULT_BRANCH" ]; then
+    base_is_allowed=yes
+  fi
+  if [ "$base_is_allowed" = "no" ]; then
+    while IFS= read -r base_pattern; do
+      [ -n "$base_pattern" ] || continue
+      # Anchor the pattern so the whole base ref must match (CodeRabbit's
+      # base_branches regexes are full-match). grep exits 2 on a malformed
+      # ERE (vs 0/1 for match/no-match). An entry we cannot evaluate is one
+      # we cannot reason about, so fail SAFE (allow) rather than risk a
+      # false skip that blocks review/merge. The `|| grep_rc=$?` captures
+      # grep's status without `set -e`/`pipefail` aborting on the
+      # no-match (1) or bad-regex (2) cases.
+      grep_rc=0
+      printf '%s\n' "$PR_BASE_REF" | grep -Eq -e "^(${base_pattern})\$" >/dev/null 2>&1 || grep_rc=$?
+      case "$grep_rc" in
+        0)
+          base_is_allowed=yes
+          break
+          ;;
+        1)
+          : # valid pattern, this base simply did not match — keep checking
+          ;;
+        *)
+          log "base_branches entry '$base_pattern' is not a valid regex — suppressing non-base-branch skip (fail-safe)"
+          base_is_allowed=yes
+          break
+          ;;
+      esac
+    done <<EOF
+$CONFIGURED_BASE_BRANCHES
+EOF
+  fi
+  if [ "$base_is_allowed" = "no" ]; then
     SKIP_REASON="non-base-branch"
-    log "PR base branch '$PR_BASE_REF' is not in configured base_branches — CodeRabbit auto-review will not fire (skip)"
+    log "PR base branch '$PR_BASE_REF' matches no configured base_branches regex and is not the default branch — CodeRabbit auto-review will not fire (skip)"
     emit_json_and_exit "skipped" 6 "null" 0
   fi
 fi
@@ -1425,6 +1502,14 @@ while :; do
       # bounded by max_resume_retries, then resume polling. Distinct from
       # rate_limit (no published wait window; the resume verb differs) and
       # from in_progress (durable, never self-clears).
+      #
+      # Latch PAUSE_OBSERVED on EVERY pause sighting — including the
+      # same-id branch below. If CodeRabbit leaves the SAME durable pause
+      # NOTE (unchanged id) the resume budget never advances to the cap, so
+      # the loop would otherwise time out exit 4 (advisory) and let
+      # agent-review.yml merge past a still-paused PR. With the latch set,
+      # emit_timeout converts that timeout into exit 6 / skip_reason=paused.
+      PAUSE_OBSERVED=true
       if [ "$COMMENT_ID" = "$LAST_PAUSED_COMMENT_ID" ]; then
         # Same pause NOTE as last iteration — our resume hasn't taken
         # effect yet. Keep polling without re-posting / double-counting.

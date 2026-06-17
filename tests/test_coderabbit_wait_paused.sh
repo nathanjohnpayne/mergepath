@@ -27,10 +27,16 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 # plus the "## Reviews paused" NOTE and the resume/review bullets.
 PAUSED_BODY_485='<!-- This is an auto-generated comment: review paused by coderabbit.ai -->\n\n> [!NOTE]\n> ## Reviews paused\n>\n> It looks like this branch is under active development. To avoid overwhelming you with review comments due to an influx of new commits, CodeRabbit has automatically paused this review. You can configure this behavior by changing the `reviews.auto_review.auto_pause_after_reviewed_commits` setting.\n>\n> - `@coderabbitai resume` to resume automatic reviews.\n> - `@coderabbitai review` to trigger a single review.\n\n<!-- end of auto-generated comment: review paused by coderabbit.ai -->'
 
-# make_case <name> <max_wait> <max_resume_retries> [base_ref] [is_draft] [write_coderabbit_yml]
+# make_case <name> <max_wait> <max_resume_retries> [base_ref] [is_draft] \
+#           [write_coderabbit_yml] [base_branches_entry] [default_branch]
 #   base_ref / is_draft default to main / false (the normal not-skipped PR).
-#   write_coderabbit_yml=yes drops a .coderabbit.yml with base_branches:[main]
-#   and drafts:false so the static-skip checks have something to read.
+#   write_coderabbit_yml=yes drops a .coderabbit.yml with base_branches and
+#   drafts:false so the static-skip checks have something to read.
+#   base_branches_entry is the single list entry written under base_branches
+#   (default "main"); pass a regex like "release/.*" to exercise the regex
+#   semantics. default_branch is what the PR-metadata stub reports as the
+#   repo default branch (default "main") so the always-allow-default rule
+#   can be exercised; pass "" to simulate metadata without a default branch.
 make_case() {
   local name=$1
   local max_wait=$2
@@ -38,6 +44,8 @@ make_case() {
   local base_ref=${4:-main}
   local is_draft=${5:-false}
   local write_coderabbit_yml=${6:-no}
+  local base_branches_entry=${7:-main}
+  local default_branch=${8-main}
   local dir="$WORKDIR/$name"
 
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
@@ -58,13 +66,13 @@ coderabbit:
 EOF
 
   if [ "$write_coderabbit_yml" = "yes" ]; then
-    cat >"$dir/.coderabbit.yml" <<'EOF'
+    cat >"$dir/.coderabbit.yml" <<EOF
 reviews:
   auto_review:
     enabled: true
     drafts: false
     base_branches:
-      - main
+      - $base_branches_entry
 EOF
   fi
 
@@ -107,6 +115,7 @@ EOF
 set -euo pipefail
 export CODERABBIT_TEST_BASE_REF='$base_ref'
 export CODERABBIT_TEST_IS_DRAFT='$is_draft'
+export CODERABBIT_TEST_DEFAULT_BRANCH='$default_branch'
 export CODERABBIT_TEST_PAUSED_BODY='$PAUSED_BODY_485'
 exec "$dir/bin/gh-impl" "\$@"
 EOF
@@ -184,8 +193,15 @@ fi
 
 case "$endpoint" in
   repos/owner/repo/pulls/999)
-    printf '{"head":{"sha":"head-sha"},"base":{"ref":"%s"},"draft":%s}\n' \
-      "${CODERABBIT_TEST_BASE_REF:?}" "${CODERABBIT_TEST_IS_DRAFT:?}"
+    # default_branch is emitted as a JSON string, or null when the knob is
+    # empty (simulates PR metadata without a usable default branch).
+    if [ -n "${CODERABBIT_TEST_DEFAULT_BRANCH:-}" ]; then
+      default_branch_json=$(json_string "$CODERABBIT_TEST_DEFAULT_BRANCH")
+    else
+      default_branch_json='null'
+    fi
+    printf '{"head":{"sha":"head-sha"},"base":{"ref":"%s","repo":{"default_branch":%s}},"draft":%s}\n' \
+      "${CODERABBIT_TEST_BASE_REF:?}" "$default_branch_json" "${CODERABBIT_TEST_IS_DRAFT:?}"
     ;;
   repos/owner/repo/commits/head-sha)
     if [ "${1:-}" = "--jq" ]; then
@@ -236,6 +252,15 @@ case "$endpoint" in
         n=$(resume_count)
         printf '[{"id":93%02d,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":%s}]\n' \
           "$n" "$bot" "$head_time" "$head_time" "$(json_string "${CODERABBIT_TEST_PAUSED_BODY:?}")"
+        ;;
+      paused_same_id)
+        # Durable pause that NEVER changes id (CodeRabbit leaves the same
+        # NOTE in place). The same-id dedupe branch suppresses re-posting,
+        # so the resume budget never reaches its cap and the loop reaches
+        # the timeout — which, with a pause observed, must report exit 6
+        # (paused), NOT exit 4 (advisory). Regression for the #490 finding.
+        printf '[{"id":9300,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":%s}]\n' \
+          "$bot" "$head_time" "$head_time" "$(json_string "${CODERABBIT_TEST_PAUSED_BODY:?}")"
         ;;
       *)
         printf '[]\n'
@@ -343,6 +368,38 @@ test_paused_persists_exhausts_cap_exit6() {
   fi
 }
 
+# 2b. Durable SAME-ID pause: CodeRabbit leaves one pause NOTE whose id never
+#     changes. The same-id dedupe branch suppresses re-posting, so the resume
+#     budget never reaches its cap; the loop hits the timeout. Because a pause
+#     was OBSERVED, the timeout must report exit 6 (paused) — NOT exit 4
+#     (advisory timeout, which agent-review.yml would merge past). Exactly one
+#     resume is posted (the first, non-deduped sighting). Regression for #490.
+test_paused_same_id_timeout_exit6_not_exit4() {
+  local dir rc status skip resumes retries
+  dir=$(make_case "paused-same-id" 600 2)
+  rc=$(run_case "$dir" paused_same_id)
+  status=$(jq -r '.status' "$dir/out.json")
+  skip=$(jq -r '.skip_reason' "$dir/out.json")
+  resumes=$(resume_count "$dir")
+  retries=$(jq -r '.resume_retries' "$dir/out.json")
+
+  if [ "$rc" = "4" ]; then
+    fail "paused same-id: exit 4 (advisory timeout) — the #490 bug; a still-paused PR must exit 6. stderr=$(cat "$dir/err.log")"
+  elif [ "$rc" != "6" ]; then
+    fail "paused same-id: exit $rc, expected 6; stderr=$(cat "$dir/err.log")"
+  elif [ "$status" != "paused" ]; then
+    fail "paused same-id: status=$status, expected paused"
+  elif [ "$skip" != "paused" ]; then
+    fail "paused same-id: skip_reason=$skip, expected paused"
+  elif [ "$resumes" != "1" ]; then
+    fail "paused same-id: resume posts=$resumes, expected 1 (only the first non-deduped sighting posts; same-id dedupe suppresses the rest)"
+  elif [ "$retries" != "1" ]; then
+    fail "paused same-id: resume_retries=$retries, expected 1"
+  else
+    pass "durable same-id pause → resume budget stalls → timeout reports exit 6 status=paused (never advisory exit 4)"
+  fi
+}
+
 # 3. Static skip: PR base branch ∉ configured base_branches → exit 6,
 #    skip_reason=non-base-branch, BEFORE any polling, no resume posted.
 test_non_base_branch_skip_exit6() {
@@ -409,11 +466,81 @@ test_allowed_base_non_draft_not_skipped() {
   fi
 }
 
+# 6. base_branches entries are REGEX patterns (#490). A repo with
+#    base_branches:["release/.*"] and a PR into release/2026 must NOT skip —
+#    the entry matches as a regex even though it is not a fixed-string equal.
+test_base_branches_regex_match_not_skipped() {
+  local dir rc status skip
+  # base_ref=release/2026, base_branches entry="release/.*", default=main.
+  dir=$(make_case "base-regex-match" 120 2 "release/2026" false yes "release/.*" main)
+  rc=$(run_case "$dir" paused_then_review)
+  status=$(jq -r '.status' "$dir/out.json")
+  skip=$(jq -r '.skip_reason' "$dir/out.json")
+
+  if [ "$skip" = "non-base-branch" ]; then
+    fail "base regex: skip_reason=non-base-branch — base_branches treated as fixed string, not regex (release/.* should match release/2026)"
+  elif [ "$status" = "skipped" ]; then
+    fail "base regex: status=skipped — regex base did not match (release/.* vs release/2026)"
+  elif [ "$rc" != "0" ] || [ "$status" != "cleared" ]; then
+    fail "base regex: exit $rc status=$status, expected cleared/0; stderr=$(cat "$dir/err.log")"
+  else
+    pass "base_branches regex 'release/.*' matches PR base 'release/2026' → not skipped"
+  fi
+}
+
+# 7. The repo default branch is ALWAYS allowed even if not listed in
+#    base_branches (#490). base_branches:["release/.*"] does not list main, but
+#    a PR into main (the default branch) must NOT skip.
+test_default_branch_always_allowed_not_skipped() {
+  local dir rc status skip
+  # base_ref=main (the default), base_branches lists only release/.*.
+  dir=$(make_case "default-branch-allowed" 120 2 main false yes "release/.*" main)
+  rc=$(run_case "$dir" paused_then_review)
+  status=$(jq -r '.status' "$dir/out.json")
+  skip=$(jq -r '.skip_reason' "$dir/out.json")
+
+  if [ "$skip" = "non-base-branch" ]; then
+    fail "default branch: skip_reason=non-base-branch — default branch must be allowed even when not listed in base_branches"
+  elif [ "$status" = "skipped" ]; then
+    fail "default branch: status=skipped — default-branch PR false-skipped"
+  elif [ "$rc" != "0" ] || [ "$status" != "cleared" ]; then
+    fail "default branch: exit $rc status=$status, expected cleared/0; stderr=$(cat "$dir/err.log")"
+  else
+    pass "default branch (main) allowed even when base_branches lists only release/.* → not skipped"
+  fi
+}
+
+# 8. Fail-safe: an UNPARSEABLE base_branches regex must SUPPRESS the skip
+#    rather than false-skip a PR whose base doesn't fixed-string match (#490).
+#    Entry "[" is an invalid ERE; base unrelated to the default branch.
+test_invalid_base_regex_fails_safe_not_skipped() {
+  local dir rc status skip
+  # base_ref=feature/x (not the default), base_branches entry is a broken ERE.
+  dir=$(make_case "base-regex-invalid" 120 2 "feature/x" false yes "[" main)
+  rc=$(run_case "$dir" paused_then_review)
+  status=$(jq -r '.status' "$dir/out.json")
+  skip=$(jq -r '.skip_reason' "$dir/out.json")
+
+  if [ "$skip" = "non-base-branch" ]; then
+    fail "invalid regex: skip_reason=non-base-branch — an unparseable pattern must fail SAFE (suppress skip), not false-skip"
+  elif [ "$status" = "skipped" ]; then
+    fail "invalid regex: status=skipped — fail-safe did not engage on a broken ERE"
+  elif [ "$rc" != "0" ] || [ "$status" != "cleared" ]; then
+    fail "invalid regex: exit $rc status=$status, expected cleared/0; stderr=$(cat "$dir/err.log")"
+  else
+    pass "unparseable base_branches regex '[' fails safe (skip suppressed) → not skipped"
+  fi
+}
+
 test_paused_resume_then_review_clears
 test_paused_persists_exhausts_cap_exit6
+test_paused_same_id_timeout_exit6_not_exit4
 test_non_base_branch_skip_exit6
 test_draft_skip_exit6
 test_allowed_base_non_draft_not_skipped
+test_base_branches_regex_match_not_skipped
+test_default_branch_always_allowed_not_skipped
+test_invalid_base_regex_fails_safe_not_skipped
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
