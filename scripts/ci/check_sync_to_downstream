@@ -9,8 +9,14 @@
 # branches (#217), mktemp portability, and the git-index mode staging
 # that keeps propagation core.filemode-robust (templated #475,
 # canonical/kit #476). Until this wrapper existed the suite was not run
-# in CI, so those assertions gated nothing on PRs. Mirrors the pattern
-# used by check_sync_overrides and the other check_* scripts here.
+# in CI, so those assertions gated nothing on PRs.
+#
+# Consumer-safe like check_workflow_verify_propagation_templated (#467):
+# the scripts/ci/ kit propagates this wrapper to every consumer, but the
+# suite AND the scripts/sync-to-downstream.sh propagation engine it
+# exercises are mergepath-only (neither is in the manifest's consumer
+# set), so the wrapper SKIPs when the manifest is absent rather than
+# red-ing a consumer's repo-lint (Codex P1 on #493).
 #
 # Requires mikefarah/yq (the test SKIPs without it); repo_lint.yml runs
 # this step AFTER install_yq_for_sync_manifest so the suite actually
@@ -22,10 +28,19 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_sync_to_downstream.sh"
 
 if [ ! -f "$TEST_SCRIPT" ]; then
-  # Missing test script is a hard error, not a skip — a silent skip
-  # would let an accidental delete/rename disable this check without
-  # surfacing in CI (same rationale as check_sync_overrides, CodeRabbit
-  # Major on PR #228).
+  # Distinguish a canonical mergepath checkout from a consumer one by the
+  # manifest (mirrors check_workflow_verify_propagation_templated):
+  #   - .mergepath-sync.yml present → mergepath; the test MUST exist, so a
+  #     missing test is an accidental delete/rename → hard error (surfaces
+  #     in CI rather than silently disabling the check).
+  #   - .mergepath-sync.yml absent  → consumer checkout that received this
+  #     wrapper via the scripts/ci/ kit but not the mergepath-only test or
+  #     engine → SKIP (a hard error would red every consumer's repo-lint
+  #     for files they never receive). Codex P1 on #493.
+  if [ ! -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
+    echo "check_sync_to_downstream: SKIP (consumer checkout: tests/test_sync_to_downstream.sh + .mergepath-sync.yml both absent)"
+    exit 0
+  fi
   echo "check_sync_to_downstream: ERROR (missing $TEST_SCRIPT)" >&2
   exit 1
 fi
