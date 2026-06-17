@@ -697,6 +697,20 @@ else
   echo "  FAIL: auto-merge-on-approval must list triage in needs: so triage's needs-external-review label lands before the re-verify step reads labels on synchronize/reopened (#495)" >&2
 fi
 
+# 10. Ordering is not enough: the pull_request re-arm path must fail closed
+#     when triage fails or is skipped. The job-level `always()` is required
+#     because event-mismatched sibling jobs are expected to skip, but a
+#     synchronize/reopened re-arm cannot proceed unless triage succeeded and
+#     had the chance to refresh needs-external-review.
+if printf '%s\n' "$auto_merge_job_block" | grep -Fq "github.event_name != 'pull_request'" \
+  && printf '%s\n' "$auto_merge_job_block" | grep -Fq "needs.triage.result == 'success'"; then
+  pass=$((pass + 1))
+  echo "  PASS: pull_request re-arm fails closed unless triage succeeds (#495)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: pull_request synchronize/reopened auto-merge re-arm must require needs.triage.result == 'success' so failed/skipped triage cannot leave stale labels and still arm (#495)" >&2
+fi
+
 echo
 echo "dependabot-auto-merge.yml PR-author gate regression (#370)"
 

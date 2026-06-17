@@ -452,13 +452,14 @@ jobs:
   # path: a PR changed after an approval, or while closed and then
   # reopened, must have `needs-external-review` re-applied by triage BEFORE
   # the re-verify step reads labels, or the re-arm would arm on a stale
-  # snapshot. `always()`
-  # in the if: expression keeps auto-merge running even if a sibling fails
-  # or is skipped (the two review-event siblings are skipped on the
-  # pull_request re-arm path, while triage is skipped on pull_request_review) —
-  # ordering, not gating, is what `needs:` is for here. See #61 for the
-  # cross-event race and this PR for the same-workflow race nathanpayne-codex
-  # caught during review.
+  # snapshot. `always()` is still needed because event-mismatched sibling
+  # jobs are expected to skip (`detect-disagreement` / `block-self-approval`
+  # on pull_request events; `triage` on pull_request_review events). The
+  # pull_request re-arm path additionally requires `needs.triage.result ==
+  # 'success'`: ordering alone is not enough, because a failed/skipped triage
+  # could otherwise leave the old no-label snapshot in place and still let
+  # auto-merge arm. See #61 for the cross-event race and this PR for the
+  # same-workflow races nathanpayne-codex caught during review.
   #
   # Two triggers arm auto-merge (#495):
   #
@@ -495,6 +496,8 @@ jobs:
        (github.event_name == 'pull_request' &&
         (github.event.action == 'synchronize' ||
          github.event.action == 'reopened'))) &&
+      (github.event_name != 'pull_request' ||
+       needs.triage.result == 'success') &&
       !contains(github.event.pull_request.labels.*.name, 'needs-external-review') &&
       !contains(github.event.pull_request.labels.*.name, 'needs-human-review') &&
       !contains(github.event.pull_request.labels.*.name, 'human-hold')
