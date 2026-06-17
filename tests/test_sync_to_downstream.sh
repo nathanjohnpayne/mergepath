@@ -1280,11 +1280,21 @@ echo "$sa_out" | grep -qE "branch mergepath-sync/${sa_short} " \
 # ---------------------------------------------------------------------------
 # --version / --help smoke
 # ---------------------------------------------------------------------------
-"$SCRIPT" --version | grep -q "sync-to-downstream.sh" || fail "--version output unexpected"
-"$SCRIPT" --help    | grep -q "Usage:"                || fail "--help output unexpected"
-"$SCRIPT" --help    | grep -q "no-pr"                 || fail "--help missing --no-pr documentation"
-"$SCRIPT" --help    | grep -q "recreate-existing"     || fail "--help missing --recreate-existing documentation"
-"$SCRIPT" --help    | grep -q "verbose"               || fail "--help missing --verbose documentation"
-"$SCRIPT" --help    | grep -q "sync-all"              || fail "--help missing --sync-all documentation"
+# Capture once, then match via here-strings. The direct form
+# `"$SCRIPT" --help | grep -q PATTERN` is fragile under `set -o pipefail`
+# (line 13): grep -q closes the pipe on its first match, the script — still
+# writing its long --help — takes SIGPIPE (exit 141), and pipefail propagates
+# that 141 as the pipeline status, so `|| fail` fires even though PATTERN was
+# present. macOS buffered the whole help before grep closed so it passed
+# there; Linux CI did not (#488). A here-string has no producer process to
+# SIGPIPE, so the match is reliable (and --help/--version run once, not 6x).
+version_out=$("$SCRIPT" --version)
+grep -q "sync-to-downstream.sh" <<<"$version_out" || fail "--version output unexpected"
+help_out=$("$SCRIPT" --help)
+grep -q "Usage:"            <<<"$help_out" || fail "--help output unexpected"
+grep -q "no-pr"             <<<"$help_out" || fail "--help missing --no-pr documentation"
+grep -q "recreate-existing" <<<"$help_out" || fail "--help missing --recreate-existing documentation"
+grep -q "verbose"           <<<"$help_out" || fail "--help missing --verbose documentation"
+grep -q "sync-all"          <<<"$help_out" || fail "--help missing --sync-all documentation"
 
 echo "test_sync_to_downstream: PASS"
