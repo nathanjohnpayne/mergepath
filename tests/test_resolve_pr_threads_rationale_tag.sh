@@ -548,6 +548,83 @@ else
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
 
+# ─────────────────────────────────────────────────────────────────────
+# Test 8 (#467): templated-render class survives a SCALAR `consumers:
+# all` templated entry. The pre-fix fetch_manifest_templated_dests did
+# `.consumers // [] | map(...)`, which on the scalar `all` tried to map
+# over a string — a yq error that (under `|| true`) blanked the WHOLE
+# templated-dest cache, so NO templated dest classified as
+# templated-render. Here a thread anchored on a templated `dest:` whose
+# entry is `consumers: all` must classify as templated-render.
+#
+# This test REWRITES the shared fixture manifest, so it must run LAST
+# (all earlier tests have already executed against the original
+# manifest). It adds a second consumer whose repo is `test/repo` so the
+# `consumers: all` set resolves to include the --repo under test.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 8: templated-render class on a scalar consumers: all templated dest"
+
+cat > "$FIXTURE_ROOT/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - name: test-consumer
+    repo: test/consumer
+    visibility: public
+  - name: this-repo
+    repo: test/repo
+    visibility: public
+paths:
+  - path: scripts/resolve-pr-threads.sh
+    type: canonical
+    consumers: all
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+  - path: examples/foo.tpl
+    type: templated
+    dest: rendered/foo.cfg
+    consumers: all
+YAML
+
+# Thread anchored on the templated DEST (not a .path entry, so step-1
+# canonical-coverage does not fire — only step-1b templated-render).
+THREADS_T8='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_8","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"rendered/foo.cfg","body":"A finding on the rendered output","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"A finding on the rendered output","databaseId":8001}]}
+  }
+]}}}}}'
+FILES_T8='["rendered/foo.cfg"]'
+COMMITS_T8='[]'
+
+GH_ARGV_LOG="$SCRATCH/t8.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T8" "$FILES_T8" "$COMMITS_T8"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -q 'FIELD: body=\[mergepath-resolve: templated-render\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: tag body contains [mergepath-resolve: templated-render] (scalar consumers: all resolved)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: templated-render not emitted for scalar consumers: all dest (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"

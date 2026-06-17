@@ -634,6 +634,62 @@ else
   fail "Case 17 unexpected (rc=$rc): $out"
 fi
 
+# Case 19 (#467): a kit entry whose `source:` override points at a
+# regular FILE is rejected — a kit mirrors a whole subtree, so its
+# source-of-truth must be a directory. Symmetric to Case 13b
+# (templated source pointing at a directory). The previous `-e` check
+# accepted any FS entry, so a file slipped through.
+MANIFEST_KIT_SRC_FILE="$MIN_HEADER
+  - path: scripts/ci/
+    type: kit
+    source: scripts/notadir
+    consumers: all
+"
+PATHS_KIT_SRC_FILE="scripts/ci/
+scripts/notadir"
+set +e
+out=$(run_with_fixture "$MANIFEST_KIT_SRC_FILE" "$PATHS_KIT_SRC_FILE"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "must be a directory for kit entries"; then
+  pass "Case 19: kit source override pointing at a regular file rejected"
+else
+  fail "Case 19 unexpected (rc=$rc): $out"
+fi
+
+# Case 20 (#467): consumer coverage is UNIONED across every covering
+# entry, not taken from the first match. `scripts/ci/helper.sh` is
+# covered by BOTH a narrow exact entry (consumers: [matchline]) AND the
+# broad `scripts/ci/` kit (consumers: all). A requirer with
+# consumers: all requires it. Effective coverage is the union (all), so
+# the closure check must PASS. The pre-fix first-match logic returned
+# the exact entry's narrow [matchline] scope and failed the subset
+# check even though the kit propagates the file everywhere.
+MANIFEST_UNION="$MULTI_HEADER
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+  - path: scripts/ci/helper.sh
+    type: canonical
+    consumers:
+      - matchline
+  - path: scripts/main.sh
+    type: canonical
+    consumers: all
+    requires:
+      - \"scripts/ci/helper.sh\"
+"
+PATHS_UNION="scripts/ci/
+scripts/ci/helper.sh
+scripts/main.sh"
+set +e
+out=$(run_with_fixture "$MANIFEST_UNION" "$PATHS_UNION"); rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+  pass "Case 20: union coverage (narrow exact + broad kit) satisfies an all-scoped requirer"
+else
+  fail "Case 20 unexpected (rc=$rc): $out"
+fi
+
 echo
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -gt 0 ]; then

@@ -402,13 +402,21 @@ while IFS='|' read -r path type consumers dest source has_dest has_source has_pa
   if [ -n "$source" ] && [ "$source" != "$path" ]; then
     src_target="$REPO_ROOT/$source"
     # Templated sources must be regular files (a directory can't be a
-    # template). Canonical/kit also accept the explicit source
-    # override for future flexibility; use `-f` (regular file) for
-    # templated and `-e` (any FS entry, since kit could point at a
-    # directory) for the others. CodeRabbit Major on PR #316.
+    # template). Kit sources must be directories (a kit mirrors a whole
+    # subtree). Canonical accepts any existing FS entry. CodeRabbit
+    # Major on PR #316; kit-directory tightening per #467.
     if [ "$type" = "templated" ]; then
       if [ ! -f "$src_target" ]; then
         echo "FAIL: path '$path' source '$source' must be a regular file for templated entries"
+        FAILED=1
+      fi
+    elif [ "$type" = "kit" ]; then
+      # `-e` (any FS entry) would wrongly accept a regular file here,
+      # letting a `type: kit` entry point its source override at a single
+      # file and silently mis-propagate the subtree (#467). Require a
+      # directory, matching the kit `path` existence check above.
+      if [ ! -d "$src_target" ]; then
+        echo "FAIL: path '$path' source '$source' must be a directory for kit entries"
         FAILED=1
       fi
     elif [ ! -e "$src_target" ]; then
@@ -522,36 +530,49 @@ while IFS= read -r kp; do
   esac
 done <<< "$kit_rows"
 
-# path_consumers_for <path> → echoes the consumer set CSV ("all" or
-# comma-joined names) for the given path. Tries exact match first,
-# then kit-prefix match. Echoes empty string if no match (caller
-# will have already failed in the uncovered-path check).
+# path_consumers_for <path> → echoes the UNIONED consumer set CSV
+# ("all" or comma-joined names) across EVERY manifest entry that covers
+# the path: its exact entry (if any) PLUS every kit whose prefix
+# contains it. Echoes empty string if nothing covers it (caller will
+# have already failed in the uncovered-path check).
+#
+# #467: the prior version returned the FIRST match (exact, else the
+# first containing kit) and ignored the rest. A path covered by a
+# narrow exact entry (e.g. consumers: [matchline]) AND a broad kit
+# (consumers: all) was therefore scored at the NARROW scope, so a
+# requires-closure subset check failed even though the kit actually
+# propagates the file to every consumer. Union is the correct effective
+# coverage: a file reaches a consumer iff ANY covering entry includes
+# it, so if any covering entry is "all" the union is "all".
 path_consumers_for() {
   local needle="$1"
+  local saw_all=0 acc="" p c kp kit_path
+  # Exact match(es).
   while IFS=$'\t' read -r p c; do
     [ -z "$p" ] && continue
     if [ "$p" = "$needle" ]; then
-      printf '%s' "$c"
-      return 0
+      if [ "$c" = "all" ]; then saw_all=1; elif [ -n "$c" ]; then acc="${acc:+$acc,}$c"; fi
     fi
   done <<< "$path_consumers_rows"
-  # Fall back to kit-prefix match. Find the kit whose prefix this
-  # path lives inside, then return that kit's consumer set.
+  # Every kit whose prefix contains the path (trailing-slash bounded so
+  # scripts/ci/ does not cover scripts/cinema/). Union, not first-match.
   for kp in $kit_prefixes; do
     if [[ "$needle" == "$kp"* ]]; then
-      local kit_path="${kp%/}"
-      # Also try with trailing slash since some kit entries are
-      # stored that way in the manifest.
+      kit_path="${kp%/}"
+      # Match the kit entry whether stored with or without a trailing slash.
       while IFS=$'\t' read -r p c; do
         [ -z "$p" ] && continue
         if [ "$p" = "$kit_path" ] || [ "$p" = "$kp" ]; then
-          printf '%s' "$c"
-          return 0
+          if [ "$c" = "all" ]; then saw_all=1; elif [ -n "$c" ]; then acc="${acc:+$acc,}$c"; fi
         fi
       done <<< "$path_consumers_rows"
     fi
   done
-  printf ''
+  if [ "$saw_all" = "1" ]; then
+    printf 'all'
+  else
+    printf '%s' "$acc"
+  fi
 }
 
 # consumers_subset <sub_csv> <sup_csv> — returns 0 if sub is a
