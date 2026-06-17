@@ -185,6 +185,76 @@ Plus the review/automation surface checks: `check_codex_scripts`, `check_codex_p
 
 This PRD defines policy. The `mergepath` repository is the reference implementation. If any mismatch exists between the PRD and Mergepath, the discrepancy must be resolved in the same change that surfaces it — neither document silently overrides the other.
 
+### Project Documentation Sync Contract
+
+Mergepath standardizes project documentation around a central project registry in
+`nathanjohnpayne/docs` and generated mirrors inside the owning repositories. The
+goal is complete project context in `docs/projects/` while preserving a single
+editable source for each document class.
+
+The normalized central layout is:
+
+```text
+docs/
+  projects/
+    <project-slug>/
+      README.md
+      manifest.yml
+      prds/
+        <prd-slug>.md
+      specs/
+        <spec-slug>.md
+      docs/
+        architecture/
+        decisions/
+        runbooks/
+        design/
+      plans/
+      archive/
+```
+
+The normalized owning-repo layout is:
+
+```text
+<repo>/
+  specs/                         # authoritative implementation specs
+  docs/agents/                   # Mergepath agent instructions
+  docs/architecture/             # repo-local technical docs
+  docs/projects/<project>/prds/  # generated PRD mirror from docs repo
+```
+
+Source-of-truth rules:
+
+- PRDs are authored in `nathanjohnpayne/docs/projects/<project>/prds/`.
+- Repo-local `docs/projects/<project>/prds/` files are generated mirrors. They
+  carry a prominent header naming the source repo, source path, source ref, and
+  "do not edit directly" status.
+- Implementation specs are authored in each owning repo's top-level `specs/`
+  directory because those specs are tested and reviewed with the code they
+  govern.
+- Central `docs/projects/<project>/specs/` files are generated mirrors of the
+  owning repo's `specs/` files, so the central project folder remains complete
+  without becoming a second implementation-spec edit path.
+- `docs/projects/<project>/manifest.yml` records the project slug, owning repo,
+  PRD sources, spec sources, mirror destinations, source refs, sync direction,
+  and any documented exceptions.
+- Repository `docs/` folders remain for repo-local architecture, runbooks,
+  design notes, and agent instructions. They are not a catch-all home for PRDs
+  or implementation specs unless a project-specific manifest explicitly declares
+  a legacy exception.
+
+Sync direction is therefore deliberate and asymmetric: PRDs flow
+`docs/projects` -> owning repos, while implementation specs flow owning repos ->
+`docs/projects`. Drift checks should report stale generated mirrors with the
+source path and source ref, and local edits to generated mirrors must not become
+authoritative silently.
+
+Migration cleanup should standardize `prd/` to `prds/`, repair accidental names
+such as duplicated `.md` suffixes, add missing central project folders for
+onboarded repos, and move the current root-level `mergepath.md` mirror to the
+project-scoped mirror convention or document it as a temporary legacy exception
+with a removal path.
+
 ### 5. 1Password-Backed Deploy Auth
 
 Deploy authentication uses a tiered credential resolution chain:
