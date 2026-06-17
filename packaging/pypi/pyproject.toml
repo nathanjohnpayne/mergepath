@@ -9,8 +9,11 @@ description = "Name reservation for the Mergepath umbrella project. No runtime c
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Proprietary" }
+# Name-only author: a placeholder package on a public index should not
+# carry a direct personal email. Contact routes through the project URLs
+# below (matches packaging/npm, which uses name + project site, no email).
 authors = [
-  { name = "Nathan Payne", email = "anthropic@nathanpayne.com" },
+  { name = "Nathan Payne" },
 ]
 keywords = ["mergepath", "placeholder"]
 classifiers = [
