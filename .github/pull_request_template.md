@@ -8,7 +8,7 @@ Authoring-Agent: <!-- claude | codex | cursor -->
 > do not pause to ask "should I merge?" / "how far should I take this?" —
 > favoring automation is the point of Mergepath. The path stops for only two
 > reasons: (1) **the human says otherwise** — an explicit instruction, or a
-> `human-hold` / `needs-human-review` / `decision-needed` label (`human-hold`
+> `human-hold` / `needs-human-review` label (`human-hold`
 > is a human-remove-only freeze) — or (2) **a Phase 4b handoff is required** —
 > an above-threshold / protected-path PR where Phase 4a is unavailable,
 > escalates, or times out. See REVIEW_POLICY.md § Default disposition.

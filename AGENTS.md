@@ -29,7 +29,7 @@ This repository uses a multi-identity AI agent code review system. The full poli
 (author → reviewer-identity approval for under-threshold PRs → merge) without
 pausing to ask the human for merge permission. The path stops for only two
 reasons: (a) the human says otherwise — an explicit instruction or a
-`human-hold` / `needs-human-review` / `decision-needed` label — or (b) a
+`human-hold` / `needs-human-review` label — or (b) a
 Phase 4b handoff is required. Do not present a "how far should I take this PR?"
 prompt on the happy path. See REVIEW_POLICY.md § Default disposition.
 

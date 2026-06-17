@@ -10,7 +10,7 @@ This policy governs how AI coding agents author, review, and merge code across r
 
 The automated path stops for **exactly two** reasons:
 
-1. **The human says otherwise.** An explicit instruction in chat, or one of the human-action labels on the PR — `human-hold` (a human-remove-only hard freeze that supersedes every gate), `needs-human-review`, or `decision-needed`. Agents may add `human-hold` but must never remove it (see [Agent prohibitions](#agent-prohibitions)).
+1. **The human says otherwise.** An explicit instruction in chat, or a human-action label that the gates enforce — `human-hold` (a human-remove-only hard freeze that supersedes every gate) or `needs-human-review`. Agents may add `human-hold` but must never remove it (see [Agent prohibitions](#agent-prohibitions)).
 2. **A Phase 4b handoff is required.** An above-threshold or protected-path PR where Phase 4a is unavailable, escalates to disagreement/runaway, or times out. Phase 4b is the only sanctioned place to post a [handoff message](#handoff-message-format) and wait for a human-mediated external review.
 
 Anything else — a green under-threshold PR, a clean Phase 4a clearance — merges without a human checkpoint. Presenting a "how far should I take this PR?" disposition prompt on the happy path is a deviation from this policy, not a courtesy.
