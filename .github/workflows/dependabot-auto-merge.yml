@@ -306,6 +306,10 @@ jobs:
               exit 0
             fi
             require_current_head_test_success
+            if has_human_hold; then
+              echo "::notice::PR carries human-hold after test wait; skipping Dependabot auto-merge until the human removes the label."
+              exit 0
+            fi
             # The immediate (no --auto) squash does NOT wait for CI. That's
             # acceptable for single patch/minor bumps (the long-standing
             # behavior). Major dev-groups are already held approved-but-

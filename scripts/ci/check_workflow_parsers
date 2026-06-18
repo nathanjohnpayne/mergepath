@@ -821,10 +821,11 @@ if grep -Fq "Required check run 'test'" .github/workflows/dependabot-auto-merge.
    grep -Fq -- "--match-head-commit" .github/workflows/dependabot-auto-merge.yml && \
    grep -Fq "waiting for completion" .github/workflows/dependabot-auto-merge.yml && \
    grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/dependabot-auto-merge.yml; then
+  pass=$((pass + 1))
   echo "  PASS: Dependabot auto-merge waits for current-head test success and binds merges to the tested HEAD"
 else
   echo "  FAIL: Dependabot auto-merge must call the test gate, wait for success, and bind merges to the tested HEAD" >&2
-  failures=$((failures + 1))
+  fail=$((fail + 1))
 fi
 if grep -Fq "Require current-head test success" .github/workflows/agent-review.yml && \
    grep -Fq "Required check run 'test'" .github/workflows/agent-review.yml && \
@@ -833,10 +834,11 @@ if grep -Fq "Require current-head test success" .github/workflows/agent-review.y
    grep -Fq -- "--match-head-commit" .github/workflows/agent-review.yml && \
    grep -Fq "waiting for completion" .github/workflows/agent-review.yml && \
    grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/agent-review.yml; then
+  pass=$((pass + 1))
   echo "  PASS: agent-review auto-merge waits for current-head test success, rechecks labels, and binds merge to the tested HEAD"
 else
   echo "  FAIL: agent-review auto-merge must wait for current-head test success, recheck labels, and bind merge to the tested HEAD" >&2
-  failures=$((failures + 1))
+  fail=$((fail + 1))
 fi
 
 echo "dependabot-auto-merge.yml author-token equality regression (#426)"

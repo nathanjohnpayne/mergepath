@@ -7,6 +7,14 @@ FAIL=0
 report(){ printf '%s\n' "$*"; }
 flag(){ FAIL=1; report "ORPHANED-WORK: $*"; }
 
+branch_has_merged_pr() {
+  local b=$1 count
+  [ -n "$b" ] || return 1
+  command -v gh >/dev/null 2>&1 || return 1
+  count=$(cd "$ROOT" && gh pr list --head "$b" --state merged --json number --jq 'length' 2>/dev/null) || return 1
+  [ "${count:-0}" != "0" ]
+}
+
 if ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "ERROR: not a git worktree: $ROOT" >&2; exit 2
 fi
@@ -18,18 +26,33 @@ if [ -n "$porcelain" ]; then
 fi
 
 branch=$(git -C "$ROOT" branch --show-current || true)
-upstream=$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
 if [ -n "$branch" ]; then
+  upstream=$(git -C "$ROOT" for-each-ref --format='%(upstream:short)' "refs/heads/$branch" 2>/dev/null || true)
+  merged_pr=0
+  if branch_has_merged_pr "$branch"; then
+    merged_pr=1
+  fi
+  upstream_exists=0
+  if [ -n "$upstream" ] && git -C "$ROOT" rev-parse --verify -q "$upstream" >/dev/null; then
+    upstream_exists=1
+  fi
   if [ -z "$upstream" ]; then
     if [ -n "$porcelain" ]; then flag "branch '$branch' has no upstream while local changes exist"; fi
-  elif ! git -C "$ROOT" rev-parse --verify -q "$upstream" >/dev/null; then
-    flag "branch '$branch' upstream '$upstream' is missing/gone"
+  elif [ "$upstream_exists" -ne 1 ]; then
+    if [ "$merged_pr" -ne 1 ]; then
+      flag "branch '$branch' upstream '$upstream' is missing/gone"
+    fi
   fi
-  base_ref=${upstream:-origin/main}
+  base_ref=origin/main
+  if [ "$upstream_exists" -eq 1 ]; then
+    base_ref=$upstream
+  fi
   if git -C "$ROOT" rev-parse --verify -q "$base_ref" >/dev/null; then
     ahead=$(git -C "$ROOT" rev-list --count "$base_ref..HEAD" 2>/dev/null || echo 0)
     if [ "$ahead" != "0" ]; then
-      if git -C "$ROOT" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+      if [ "$merged_pr" -eq 1 ]; then
+        :
+      elif git -C "$ROOT" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
         :
       else
         flag "branch '$branch' has $ahead commit(s) not reachable from $base_ref or origin/main; verify an open/merged PR before closing the session"

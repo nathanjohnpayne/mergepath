@@ -136,8 +136,9 @@ worktree from current `origin/main`; do not continue shipping follow-ups from
 the just-merged branch's stale checkout. Open the tracking PR or issue early
 enough that in-flight work is visible. Run `scripts/session-finalization-check.sh`
 (or equivalent `git status` / stash / worktree checks) before closeout; the
-script is read-only and reports dirty files, stashes, stale branch state, and
-dirty auxiliary worktrees without deleting work.
+script is read-only and reports dirty files, stashes, stale branch state,
+verified-merged local branches, and dirty auxiliary worktrees without deleting
+work.
 
 ## Worktree lifecycle
 
@@ -149,11 +150,13 @@ the chance an agent validates or runs commands from a dead branch.
 
 **After a merge or branch delete**, run `scripts/worktree-cleanup.sh` (dry-run)
 to audit stale worktrees and `scripts/worktree-cleanup.sh --apply` to remove
-safe candidates. The helper identifies three classes of stale state:
+safe candidates. The helper identifies four classes of stale state:
 
 - worktrees whose branch upstream is `[gone]` (the branch was deleted upstream);
 - detached `mergepath-pr-*` worktrees whose corresponding PR is closed/merged
   (cross-checked via `gh pr view`);
+- local branches whose upstream is `[gone]` and whose PR is verified merged
+  (cross-checked via `gh pr list --head <branch> --state merged`);
 - orphaned directories under `.claude/worktrees/` that have no matching
   entry in `git worktree list --porcelain`.
 
@@ -170,7 +173,9 @@ scripts/worktree-cleanup.sh --apply --orphan-clean
 Locked worktrees and orphan dirs are listed in dry-run but require explicit
 `--force-locked` / `--orphan-clean` opt-in under `--apply`, because locked
 worktrees may correspond to in-progress agent sessions and orphan dirs may
-hold partial work the user wants to keep.
+hold partial work the user wants to keep. Verified-merged local branches are
+deleted only after `gh pr list --head <branch> --state merged` confirms the PR
+merged; checked-out local branches are listed but skipped.
 
 This helper is intentionally local-only — worktree state is machine-local
 and should not gate repository CI (see #288).

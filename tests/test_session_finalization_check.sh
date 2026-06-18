@@ -7,6 +7,7 @@ trap 'rm -rf "$TMP"' EXIT
 pass(){ echo "PASS: $*"; }
 fail(){ echo "FAIL: $*" >&2; exit 1; }
 mkrepo(){ local d=$1; mkdir -p "$d"; git -C "$d" init -q; git -C "$d" config user.email a@example.com; git -C "$d" config user.name A; echo base >"$d/file.txt"; git -C "$d" add .; git -C "$d" commit -qm init; git -C "$d" branch -M main; }
+mkremote_repo(){ local d=$1 r=$2; git init --bare -q "$r"; mkrepo "$d"; git -C "$d" remote add origin "$r"; git -C "$d" push -q -u origin main; }
 
 mkrepo "$TMP/clean"
 out=$("$SCRIPT" "$TMP/clean") && [[ $out == *clean* ]] && pass clean || fail clean
@@ -31,3 +32,39 @@ git -C "$TMP/wt-main" worktree add -q "$TMP/wt-aux" -b aux
 echo dirty >>"$TMP/wt-aux/file.txt"
 if out=$("$SCRIPT" "$TMP/wt-main" 2>&1); then fail aux; fi
 [[ $out == *"dirty auxiliary worktree"* && $out == *"file.txt"* ]] && pass aux || fail "aux output: $out"
+
+mkremote_repo "$TMP/merged" "$TMP/merged.git"
+git -C "$TMP/merged" switch -q -c feature
+echo feature >>"$TMP/merged/file.txt"
+git -C "$TMP/merged" commit -am feature -q
+git -C "$TMP/merged" push -q -u origin feature
+git -C "$TMP/merged" push -q origin --delete feature
+git -C "$TMP/merged" fetch -q --prune
+stub="$TMP/stub-bin"; mkdir -p "$stub"
+cat >"$stub/gh" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  head=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --head) head=$2; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ "$head" = "feature" ] && echo 1 || echo 0
+  exit 0
+fi
+exit 1
+STUB
+chmod +x "$stub/gh"
+out=$(PATH="$stub:$PATH" "$SCRIPT" "$TMP/merged") && [[ $out == *clean* ]] && pass merged-squash-branch || fail "merged branch output: $out"
+
+mkremote_repo "$TMP/unmerged" "$TMP/unmerged.git"
+git -C "$TMP/unmerged" switch -q -c feature
+echo feature >>"$TMP/unmerged/file.txt"
+git -C "$TMP/unmerged" commit -am feature -q
+git -C "$TMP/unmerged" push -q -u origin feature
+git -C "$TMP/unmerged" push -q origin --delete feature
+git -C "$TMP/unmerged" fetch -q --prune
+if out=$("$SCRIPT" "$TMP/unmerged" 2>&1); then fail unmerged-ahead; fi
+[[ $out == *"upstream 'origin/feature' is missing/gone"* && $out == *"not reachable"* ]] && pass unmerged-ahead || fail "unmerged output: $out"

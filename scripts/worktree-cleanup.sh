@@ -60,6 +60,11 @@
 #      .claude/worktrees/ that is NOT in `git worktree list --porcelain`
 #      output. These are residue from a `--force` remove that didn't
 #      clean the directory, or from a manual rm of git metadata.
+#   4. Verified-merged local branch. A local branch whose upstream is
+#      gone and whose same-repo PR is verified MERGED via `gh pr list
+#      --head <branch> --state merged`. In --apply mode, branches that
+#      are not checked out in any worktree are deleted with `git branch -D`;
+#      checked-out branches are listed but skipped.
 #
 # Locked detection. `git worktree list --porcelain` emits a `locked`
 # line (possibly with a reason) for locked entries. We classify locked
@@ -159,6 +164,18 @@ gh_pr_state() {
   echo "unknown"
 }
 
+gh_branch_has_merged_pr() {
+  local branch="$1" count
+  if ! command -v gh >/dev/null 2>&1; then
+    return 1
+  fi
+  if count=$(gh pr list --head "$branch" --state merged --json number --jq 'length' 2>/dev/null); then
+    [ "${count:-0}" != "0" ]
+    return $?
+  fi
+  return 1
+}
+
 # Read gone-upstream branches from `git branch -vv`. The format is:
 #   [<spaces>]<branch> <sha> [origin/<branch>: gone] <subject>
 # We grab the branch name when the third field carries `: gone]`.
@@ -233,10 +250,16 @@ is_gone_branch() {
   grep -Fxq -- "$b" "$GONE_FILE"
 }
 
+branch_checked_out() {
+  local b="$1"
+  awk -F'|' -v branch="$b" '$2 == branch { found = 1 } END { exit found ? 0 : 1 }' "$REC_FILE"
+}
+
 # ── Classify and act ──────────────────────────────────────────────────
 SUMMARY_GONE=()
 SUMMARY_DETACHED=()
 SUMMARY_LOCKED=()
+SUMMARY_LOCAL_BRANCH=()
 SUMMARY_OPEN_PR=()
 SUMMARY_ORPHAN=()
 SUMMARY_REMOVED=()
@@ -365,6 +388,41 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
   fi
 done <"$REC_FILE"
 
+# ── Verified-merged local branch sweep ─────────────────────────────────
+# Worktree cleanup removes stale worktrees, but a squash-merged branch can
+# remain as a standalone local ref after the remote branch is deleted. Verify
+# the PR's merged state before listing/deleting so ordinary unpublished work is
+# not swept up just because its upstream is gone.
+while IFS= read -r LOCAL_BRANCH; do
+  [ -n "$LOCAL_BRANCH" ] || continue
+  if ! gh_branch_has_merged_pr "$LOCAL_BRANCH"; then
+    continue
+  fi
+
+  if branch_checked_out "$LOCAL_BRANCH"; then
+    print_record "[MERGED local branch checked out — keeping]" "$C_YELLOW" \
+      "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)" "[gone]" "MERGED" ""
+    SUMMARY_LOCAL_BRANCH+=("$LOCAL_BRANCH (checked out)")
+    if [ "$MODE" = "apply" ]; then
+      echo "    -> skipped (branch is checked out in a worktree)"
+      SUMMARY_SKIPPED+=("$LOCAL_BRANCH (checked out)")
+    fi
+    continue
+  fi
+
+  print_record "[MERGED local branch]" "$C_RED" \
+    "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)" "[gone]" "MERGED" ""
+  SUMMARY_LOCAL_BRANCH+=("$LOCAL_BRANCH")
+  if [ "$MODE" = "apply" ]; then
+    echo "    -> deleting local branch"
+    if (cd "$MAIN_WORKTREE" && git branch -D "$LOCAL_BRANCH") >/dev/null 2>&1; then
+      SUMMARY_REMOVED+=("$LOCAL_BRANCH (local branch)")
+    else
+      SUMMARY_FAILED+=("$LOCAL_BRANCH (local branch)")
+    fi
+  fi
+done <"$GONE_FILE"
+
 # ── Orphan scan ───────────────────────────────────────────────────────
 ORPHAN_ROOT="$MAIN_WORKTREE/.claude/worktrees"
 if [ -d "$ORPHAN_ROOT" ]; then
@@ -446,6 +504,7 @@ echo "${C_BOLD}Summary${C_RESET}"
 printf "  gone-upstream:    %d\n" "${#SUMMARY_GONE[@]}"
 printf "  detached stale:   %d\n" "${#SUMMARY_DETACHED[@]}"
 printf "  locked:           %d\n" "${#SUMMARY_LOCKED[@]}"
+printf "  merged branches:  %d\n" "${#SUMMARY_LOCAL_BRANCH[@]}"
 printf "  open-PR retained: %d\n" "${#SUMMARY_OPEN_PR[@]}"
 printf "  orphan dirs:      %d\n" "${#SUMMARY_ORPHAN[@]}"
 
@@ -468,7 +527,7 @@ fi
 # dry-run: exit 2 if there is anything actionable, 0 otherwise. This lets
 # callers wire it into "audit fails locally" checks while we explicitly
 # keep it OUT of PR CI per #288.
-total_candidates=$(( ${#SUMMARY_GONE[@]} + ${#SUMMARY_DETACHED[@]} + ${#SUMMARY_LOCKED[@]} + ${#SUMMARY_ORPHAN[@]} ))
+total_candidates=$(( ${#SUMMARY_GONE[@]} + ${#SUMMARY_DETACHED[@]} + ${#SUMMARY_LOCKED[@]} + ${#SUMMARY_LOCAL_BRANCH[@]} + ${#SUMMARY_ORPHAN[@]} ))
 if [ "$total_candidates" -gt 0 ]; then
   echo ""
   echo "${C_DIM}Dry run. Re-run with --apply to remove safe candidates.${C_RESET}"
