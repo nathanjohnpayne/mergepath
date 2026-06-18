@@ -366,4 +366,33 @@ MERGEPATH_ROOT_OVERRIDE="$MP" MERGEPATH_PROJECT_DOCS_CACHE="$RO_CACHE" \
   || fail "materialize should prune a central spec orphan via a read-only (clone) owner"
 restore_manifest; resync
 
+# Path traversal: a manifest mirror/source with a `..` component must fail
+# closed (exit 2) before any write, so it can never escape the mirror tree.
+cat >"$MANIFEST" <<EOF
+version: 1
+central_repo:
+  name: docs
+  repo: example/docs
+  path_hint: "$DOCS"
+projects:
+  - slug: app
+    owner:
+      name: app
+      repo: example/app
+      path_hint: "$APP"
+    prds:
+      - slug: app
+        source: projects/app/prds/app.md
+        mirror: ../../escape.md
+EOF
+set +e
+out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize --projects app 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "traversal mirror path should fail closed (rc=$rc): $out"
+echo "$out" | grep -q "traversal component" || fail "traversal path should be named in the error: $out"
+[ ! -e "$WORKDIR/escape.md" ] && [ ! -e "$APP/escape.md" ] \
+  || fail "traversal path must never be written"
+restore_manifest; resync
+
 echo "PASS: project-doc-sync"

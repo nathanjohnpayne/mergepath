@@ -302,6 +302,29 @@ validate_project_filter() {
   IFS=$old_ifs
 }
 
+# Fail closed on any manifest slug/source/mirror that contains a `..` path
+# component, so a mistaken or hostile `mirror: ../../x` can never make
+# --materialize write — or the orphan pass remove — a file outside the
+# generated mirror tree. owner/central `path_hint` is intentionally exempt: it
+# legitimately uses `..` to point at sibling checkouts. (Codex P2 on #509.)
+validate_manifest_paths() {
+  local manifest=$1
+  local bad=0 val
+  while IFS= read -r val; do
+    [ -n "$val" ] || continue
+    case "/$val/" in
+      */../*)
+        err "manifest path contains a '..' traversal component: $val"
+        bad=1
+        ;;
+    esac
+  done < <(yq -r '
+    .projects[]
+    | (.slug, ((.prds // [])[] | (.source, .mirror)), ((.specs // [])[] | (.source, .mirror)))
+  ' "$manifest")
+  [ "$bad" -eq 0 ] || exit 2
+}
+
 process_prds() {
   local manifest=$1 central_root=$2 central_repo=$3
   local rows
@@ -570,6 +593,7 @@ trap 'rm -rf "$RUN_TMPDIR"' EXIT
 
 manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
 validate_project_filter "$manifest"
+validate_manifest_paths "$manifest"
 central_name=$(yq -r '.central_repo.name' "$manifest")
 central_repo=$(yq -r '.central_repo.repo' "$manifest")
 central_hint=$(yq -r '.central_repo.path_hint // ""' "$manifest")
