@@ -302,11 +302,12 @@ validate_project_filter() {
   IFS=$old_ifs
 }
 
-# Fail closed on any manifest slug/source/mirror that contains a `..` path
-# component, so a mistaken or hostile `mirror: ../../x` can never make
-# --materialize write — or the orphan pass remove — a file outside the
-# generated mirror tree. owner/central `path_hint` is intentionally exempt: it
-# legitimately uses `..` to point at sibling checkouts. (Codex P2 on #509.)
+# Fail closed on any manifest slug, owner/central name, or source/mirror that
+# contains a `..` path component, so a mistaken or hostile value can never make
+# --materialize write (or the orphan pass remove) a file outside the generated
+# mirror tree — nor make clone_for_audit place a cache clone outside its root
+# (`name` feeds $CACHE_DIR/$name). owner/central `path_hint` is intentionally
+# exempt: it legitimately uses `..` to point at sibling checkouts. (Codex on #509.)
 validate_manifest_paths() {
   local manifest=$1
   local bad=0 val
@@ -319,8 +320,11 @@ validate_manifest_paths() {
         ;;
     esac
   done < <(yq -r '
-    .projects[]
-    | (.slug, ((.prds // [])[] | (.source, .mirror)), ((.specs // [])[] | (.source, .mirror)))
+    .central_repo.name,
+    (.projects[]
+      | (.slug, .owner.name,
+         ((.prds // [])[] | (.source, .mirror)),
+         ((.specs // [])[] | (.source, .mirror))))
   ' "$manifest")
   [ "$bad" -eq 0 ] || exit 2
 }
@@ -440,7 +444,7 @@ prune_orphan_mirrors() {
             [ -z "$sf" ] && continue
             printf '%s\n' "$central_root/${s_mirror%/}/${sf#"$sdir/"}"
           done < <(find "$sdir" -type f -name '*.md' -print)
-        done < <(yq -r ".projects[] | select(.slug == \"$project\") | (.specs // [])[] | (.source // \"\") + \"\t\" + (.mirror // \"\")" "$manifest") >"$spec_exp"
+        done < <(SLUG="$project" yq -r '.projects[] | select(.slug == strenv(SLUG)) | (.specs // [])[] | (.source // "") + "\t" + (.mirror // "")' "$manifest") >"$spec_exp"
         scan_orphan_dir "$spec_dir" "$owner_repo" "$project" spec "$spec_exp" \
           "$project spec" "$central_repo:projects/$project/specs"
         rm -f "$spec_exp"
@@ -464,7 +468,7 @@ prune_orphan_mirrors() {
         prd_exp=$(mktemp "$RUN_TMPDIR/prd-exp.XXXXXX")
         while IFS= read -r m; do
           [ -n "$m" ] && printf '%s\n' "$owner_rw/$m"
-        done < <(yq -r ".projects[] | select(.slug == \"$project\") | (.prds // [])[] | .mirror // \"\"" "$manifest") >"$prd_exp"
+        done < <(SLUG="$project" yq -r '.projects[] | select(.slug == strenv(SLUG)) | (.prds // [])[] | .mirror // ""' "$manifest") >"$prd_exp"
         scan_orphan_dir "$prd_dir" "$central_repo" "$project" prd "$prd_exp" \
           "$project prd" "$owner_name:docs/projects/$project/prds"
         rm -f "$prd_exp"

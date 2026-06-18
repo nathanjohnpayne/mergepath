@@ -395,4 +395,60 @@ echo "$out" | grep -q "traversal component" || fail "traversal path should be na
   || fail "traversal path must never be written"
 restore_manifest; resync
 
+# yq-expression injection: a slug containing yq-expression characters must not
+# inject the orphan-pass query (which would empty the expected-set and
+# over-delete the project's own valid mirrors). strenv() neutralizes it.
+cat >"$MANIFEST" <<EOF
+version: 1
+central_repo:
+  name: docs
+  repo: example/docs
+  path_hint: "$DOCS"
+projects:
+  - slug: 'inj"slug'
+    owner:
+      name: app
+      repo: example/app
+      path_hint: "$APP"
+    specs:
+      - source: specs/
+        mirror: 'projects/inj"slug/specs/'
+EOF
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize >/dev/null 2>&1
+[ -f "$DOCS/projects/inj\"slug/specs/feature.md" ] \
+  || fail "injection-slug spec mirror should materialize"
+# Re-materialize: with the old string-interpolated query the injected slug
+# breaks the expected-set, so the just-written valid mirror is over-deleted.
+MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --materialize >/dev/null 2>&1
+[ -f "$DOCS/projects/inj\"slug/specs/feature.md" ] \
+  || fail "injection-slug must not break the orphan expected-set (valid mirror over-deleted)"
+rm -rf "$DOCS/projects/inj\"slug" "$APP/docs/projects/inj\"slug"
+restore_manifest; resync
+
+# Name traversal: a `..` in owner/central name must fail closed — it feeds
+# \$CACHE_DIR/\$name in clone_for_audit and could place a clone outside the cache.
+cat >"$MANIFEST" <<EOF
+version: 1
+central_repo:
+  name: docs
+  repo: example/docs
+  path_hint: "$DOCS"
+projects:
+  - slug: app
+    owner:
+      name: ../../escape
+      repo: example/app
+      path_hint: "$APP"
+    specs:
+      - source: specs/
+        mirror: projects/app/specs/
+EOF
+set +e
+out=$(MERGEPATH_ROOT_OVERRIDE="$MP" "$MP/scripts/project-doc-sync.sh" --audit --no-clone 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "owner.name with '..' should fail closed (rc=$rc): $out"
+echo "$out" | grep -q "traversal component" || fail "name traversal should be named in the error: $out"
+restore_manifest; resync
+
 echo "PASS: project-doc-sync"
