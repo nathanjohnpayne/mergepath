@@ -127,6 +127,18 @@ as a design risk and require either:
 - An explicit justification for why the loss is acceptable, or
 - A plan to eliminate the intermediate format
 
+## Session finalization
+
+Before an agent session goes idle, implementation-ready work must end in one
+of three durable states: a committed PR, an explicit issue/PR handoff, or an
+explicit discard. Start follow-up work after a PR merges on a fresh branch or
+worktree from current `origin/main`; do not continue shipping follow-ups from
+the just-merged branch's stale checkout. Open the tracking PR or issue early
+enough that in-flight work is visible. Run `scripts/session-finalization-check.sh`
+(or equivalent `git status` / stash / worktree checks) before closeout; the
+script is read-only and reports dirty files, stashes, stale branch state, and
+dirty auxiliary worktrees without deleting work.
+
 ## Worktree lifecycle
 
 Worktrees created for a task must be removed immediately after the corresponding

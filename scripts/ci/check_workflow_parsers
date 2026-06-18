@@ -813,6 +813,22 @@ else
 fi
 
 echo
+echo "auto-merge workflows require current-head test success (#516)"
+if grep -Fq "Required check run 'test'" .github/workflows/dependabot-auto-merge.yml && \
+   grep -Fq "require_current_head_test_success" .github/workflows/dependabot-auto-merge.yml; then
+  echo "  PASS: Dependabot auto-merge requires current-head test success"
+else
+  echo "  FAIL: Dependabot auto-merge must require current-head test success before merge" >&2
+  failures=$((failures + 1))
+fi
+if grep -Fq "Require current-head test success" .github/workflows/agent-review.yml && \
+   grep -Fq "Required check run 'test'" .github/workflows/agent-review.yml; then
+  echo "  PASS: agent-review auto-merge requires current-head test success"
+else
+  echo "  FAIL: agent-review auto-merge must require current-head test success before merge" >&2
+  failures=$((failures + 1))
+fi
+
 echo "dependabot-auto-merge.yml author-token equality regression (#426)"
 
 # Codex P2 on #426: the merge must run under an author-identity token AND

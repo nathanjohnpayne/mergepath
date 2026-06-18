@@ -1,0 +1,35 @@
+# Generated project-documentation manifest for Mergepath's own project folder.
+# Canonical sync configuration lives in .mergepath-project-docs.yml; this file
+# is the project-scoped, human-readable mirror of the same source/destination
+# contract for agents working from docs/projects/<project>/.
+version: 1
+project: mergepath
+owning_repo: nathanjohnpayne/mergepath
+
+prds:
+  - slug: mergepath
+    source_repo: nathanjohnpayne/docs
+    source_path: projects/mergepath/prds/mergepath.md
+    mirror_repo: nathanjohnpayne/mergepath
+    mirror_path: docs/projects/mergepath/prds/mergepath.md
+    sync_direction: central-to-repo
+    generated_by: scripts/project-doc-sync.sh
+    edit_workflow: edit the central PRD source, then materialize the repo mirror
+
+specs:
+  - slug: mergepath_playground
+    source_repo: nathanjohnpayne/mergepath
+    source_path: specs/mergepath_playground.md
+    mirror_repo: nathanjohnpayne/docs
+    mirror_path: projects/mergepath/specs/mergepath_playground.md
+    sync_direction: repo-to-central
+    generated_by: scripts/project-doc-sync.sh
+    edit_workflow: edit the owning repo spec beside code and tests, then materialize the central mirror
+  - slug: example_spec
+    source_repo: nathanjohnpayne/mergepath
+    source_path: specs/example_spec.md
+    mirror_repo: nathanjohnpayne/docs
+    mirror_path: projects/mergepath/specs/example_spec.md
+    sync_direction: repo-to-central
+    generated_by: scripts/project-doc-sync.sh
+    edit_workflow: edit the owning repo spec beside code and tests, then materialize the central mirror

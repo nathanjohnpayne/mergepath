@@ -778,6 +778,29 @@ jobs:
           done
           echo "No blocking labels present — proceeding to merge."
 
+
+      - name: Require current-head test success
+        if: steps.author_merge_token.outputs.enabled == 'true'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          sha=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)
+          run=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.name == "test")] | sort_by(.started_at // .created_at) | last // empty')
+          if [ -z "$run" ]; then
+            echo "::error::Required check run 'test' is absent on current HEAD $sha; refusing auto-merge."
+            exit 1
+          fi
+          status=$(printf '%s' "$run" | jq -r '.status')
+          conclusion=$(printf '%s' "$run" | jq -r '.conclusion // ""')
+          if [ "$status" != "completed" ] || [ "$conclusion" != "success" ]; then
+            echo "::error::Required check run 'test' is not successful on current HEAD $sha (status=$status conclusion=${conclusion:-none}); refusing auto-merge."
+            exit 1
+          fi
+          echo "Required check run 'test' is successful on current HEAD $sha."
+
       - name: Enable auto-merge
         if: steps.author_merge_token.outputs.enabled == 'true'
         run: |

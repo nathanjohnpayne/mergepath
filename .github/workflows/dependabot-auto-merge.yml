@@ -99,6 +99,24 @@ jobs:
           fi
           echo "::notice::Merge will be performed as $MERGE_AS."
 
+
+          require_current_head_test_success() {
+            local sha runs conclusion status
+            sha=$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)
+            runs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$sha/check-runs?per_page=100" --jq '[.check_runs[] | select(.name == "test")] | sort_by(.started_at // .created_at) | last // empty')
+            if [ -z "$runs" ]; then
+              echo "::error::Required check run 'test' is absent on current HEAD $sha; refusing auto-merge."
+              exit 1
+            fi
+            status=$(printf '%s' "$runs" | jq -r '.status')
+            conclusion=$(printf '%s' "$runs" | jq -r '.conclusion // ""')
+            if [ "$status" != "completed" ] || [ "$conclusion" != "success" ]; then
+              echo "::error::Required check run 'test' is not successful on current HEAD $sha (status=$status conclusion=${conclusion:-none}); refusing auto-merge."
+              exit 1
+            fi
+            echo "::notice::Required check run 'test' is successful on current HEAD $sha."
+          }
+
           has_human_hold() {
             local labels
             if ! labels=$(gh pr view "$PR_URL" --json labels --jq '.labels[].name'); then
@@ -236,6 +254,8 @@ jobs:
             exit 0
           fi
 
+          require_current_head_test_success
+
           # Try GitHub-side auto-merge first (fires when required
           # checks pass). Fall back to an immediate squash ONLY when
           # the failure cause is "auto-merge unavailable" — i.e., the
@@ -268,6 +288,7 @@ jobs:
               echo "::notice::PR carries human-hold immediately before fallback squash; skipping Dependabot auto-merge until the human removes the label."
               exit 0
             fi
+            require_current_head_test_success
             # The immediate (no --auto) squash does NOT wait for CI. That's
             # acceptable for single patch/minor bumps (the long-standing
             # behavior). Major dev-groups are already held approved-but-
