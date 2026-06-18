@@ -99,6 +99,43 @@ jobs:
           fi
           echo "::notice::Merge will be performed as $MERGE_AS."
 
+
+          require_current_head_check_success() {
+            local sha runs conclusion status wait_seconds poll_seconds deadline required_check_name
+            required_check_name=${REQUIRED_HEAD_CHECK_NAME:-lint}
+            wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
+            poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
+            deadline=$((SECONDS + wait_seconds))
+            sha=$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)
+            while :; do
+              runs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$sha/check-runs?per_page=100" \
+                | jq -c --arg check "$required_check_name" '[.check_runs[] | select(.name == $check)] | sort_by(.started_at // .created_at) | last // empty')
+              if [ -n "$runs" ]; then
+                status=$(printf '%s' "$runs" | jq -r '.status')
+                conclusion=$(printf '%s' "$runs" | jq -r '.conclusion // ""')
+                if [ "$status" = "completed" ]; then
+                  if [ "$conclusion" = "success" ]; then
+                    CURRENT_HEAD_SHA="$sha"
+                    echo "::notice::Required check run '$required_check_name' is successful on current HEAD $CURRENT_HEAD_SHA."
+                    return 0
+                  fi
+                  echo "::error::Required check run '$required_check_name' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
+                  exit 1
+                fi
+                echo "::notice::Required check run '$required_check_name' is $status on current HEAD $sha; waiting for completion."
+              else
+                echo "::notice::Required check run '$required_check_name' is absent on current HEAD $sha; waiting for it to start."
+              fi
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "::error::Required check run '$required_check_name' did not complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
+                exit 1
+              fi
+              sleep "$poll_seconds"
+            done
+            echo "::error::Required check run '$required_check_name' wait loop ended unexpectedly; refusing auto-merge."
+            exit 1
+          }
+
           has_human_hold() {
             local labels
             if ! labels=$(gh pr view "$PR_URL" --json labels --jq '.labels[].name'); then
@@ -236,6 +273,8 @@ jobs:
             exit 0
           fi
 
+          require_current_head_check_success
+
           # Try GitHub-side auto-merge first (fires when required
           # checks pass). Fall back to an immediate squash ONLY when
           # the failure cause is "auto-merge unavailable" — i.e., the
@@ -254,7 +293,7 @@ jobs:
             exit 0
           fi
           set +e
-          AUTO_STDERR=$(GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash --auto "$PR_URL" 2>&1 1>/dev/null)
+          AUTO_STDERR=$(GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash --auto --match-head-commit "$CURRENT_HEAD_SHA" "$PR_URL" 2>&1 1>/dev/null)
           AUTO_RC=$?
           set -e
           if [ "$AUTO_RC" -eq 0 ]; then
@@ -266,6 +305,11 @@ jobs:
             echo "::notice::--auto unavailable on this repo (likely no branch protection); falling back to immediate squash."
             if has_human_hold; then
               echo "::notice::PR carries human-hold immediately before fallback squash; skipping Dependabot auto-merge until the human removes the label."
+              exit 0
+            fi
+            require_current_head_check_success
+            if has_human_hold; then
+              echo "::notice::PR carries human-hold after test wait; skipping Dependabot auto-merge until the human removes the label."
               exit 0
             fi
             # The immediate (no --auto) squash does NOT wait for CI. That's
@@ -282,7 +326,7 @@ jobs:
             # approval" gate is satisfied either way.
             if [ "$UPDATE_TYPE" = "version-update:semver-patch" ] || \
                [ "$UPDATE_TYPE" = "version-update:semver-minor" ]; then
-              GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash "$PR_URL"
+              GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash --match-head-commit "$CURRENT_HEAD_SHA" "$PR_URL"
             else
               echo "::notice::update-type='$UPDATE_TYPE' (dependency-group='$DEPENDENCY_GROUP') is not patch/minor and --auto is unavailable; leaving the PR approved-but-unmerged to preserve the CI-green safety case. Configure branch protection/auto-merge or merge manually after CI."
               exit 0
@@ -303,6 +347,7 @@ jobs:
           # keep major dev-group bumps behind CI (#374 / Codex P2 on #405).
           UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
           DEPENDENCY_GROUP: ${{ steps.metadata.outputs.dependency-group }}
+          REQUIRED_HEAD_CHECK_NAME: lint
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           # Author-identity PAT (nathanjohnpayne) used for the merge
           # step only. Reviewer-identity --approve must stay on

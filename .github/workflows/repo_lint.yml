@@ -127,6 +127,9 @@ jobs:
       - name: check_workflow_parsers
         run: ./scripts/ci/check_workflow_parsers
 
+      - name: check_session_finalization
+        run: ./scripts/ci/check_session_finalization
+
       # check_verify_propagation_pr exercises the faithful-mirror
       # verifier (scripts/workflow/verify-propagation-pr.sh) that is
       # the security teeth of the propagation-PR review lane — it is

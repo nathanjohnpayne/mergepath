@@ -813,6 +813,36 @@ else
 fi
 
 echo
+echo "auto-merge workflows require current-head check success (#516)"
+dependabot_check_gate_calls=$(grep -Ec '^[[:space:]]*require_current_head_check_success[[:space:]]*$' .github/workflows/dependabot-auto-merge.yml || true)
+if grep -Fq "REQUIRED_HEAD_CHECK_NAME: lint" .github/workflows/dependabot-auto-merge.yml && \
+   grep -Fq 'select(.name == $check)' .github/workflows/dependabot-auto-merge.yml && \
+   grep -Eq '^[[:space:]]*require_current_head_check_success\(\)[[:space:]]*\{' .github/workflows/dependabot-auto-merge.yml && \
+   [ "$dependabot_check_gate_calls" -ge 2 ] && \
+   grep -Fq -- "--match-head-commit" .github/workflows/dependabot-auto-merge.yml && \
+   grep -Fq "waiting for completion" .github/workflows/dependabot-auto-merge.yml && \
+   grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/dependabot-auto-merge.yml; then
+  pass=$((pass + 1))
+  echo "  PASS: Dependabot auto-merge waits for configured current-head check success and binds merges to the checked HEAD"
+else
+  echo "  FAIL: Dependabot auto-merge must call the configured check gate, wait for success, and bind merges to the checked HEAD" >&2
+  fail=$((fail + 1))
+fi
+if grep -Fq "Require current-head check success" .github/workflows/agent-review.yml && \
+   grep -Fq "REQUIRED_HEAD_CHECK_NAME: lint" .github/workflows/agent-review.yml && \
+   grep -Fq 'select(.name == $check)' .github/workflows/agent-review.yml && \
+   grep -Fq "Re-verify blocking labels after test wait" .github/workflows/agent-review.yml && \
+   grep -Fq 'CURRENT_HEAD_SHA=$sha' .github/workflows/agent-review.yml && \
+   grep -Fq -- "--match-head-commit" .github/workflows/agent-review.yml && \
+   grep -Fq "waiting for completion" .github/workflows/agent-review.yml && \
+   grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/agent-review.yml; then
+  pass=$((pass + 1))
+  echo "  PASS: agent-review auto-merge waits for configured current-head check success, rechecks labels, and binds merge to the checked HEAD"
+else
+  echo "  FAIL: agent-review auto-merge must wait for configured current-head check success, recheck labels, and bind merge to the checked HEAD" >&2
+  fail=$((fail + 1))
+fi
+
 echo "dependabot-auto-merge.yml author-token equality regression (#426)"
 
 # Codex P2 on #426: the merge must run under an author-identity token AND

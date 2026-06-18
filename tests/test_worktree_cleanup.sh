@@ -19,6 +19,11 @@
 #      --apply skips it without --force-locked).
 #   5. Orphaned .claude/worktrees/<dir> with no entry in
 #      `git worktree list`. Must be flagged as ORPHAN.
+#   6. Local branch with a gone upstream and a verified merged PR.
+#      Must be flagged as MERGED local branch and deleted by --apply
+#      when it is not checked out in any worktree.
+#   7. Local branch with the same name as a merged PR but new local
+#      commits after that merge. Must NOT be treated as safe to delete.
 #
 # `gh` is stubbed via a PATH shim that returns CLOSED for our test PR
 # number and "unknown" for anything else, so the test does not touch
@@ -129,6 +134,28 @@ ORPHAN_DIR="$MAIN/.claude/worktrees/agent-zzzz-orphan"
 mkdir -p "$ORPHAN_DIR"
 echo "leftover" > "$ORPHAN_DIR/marker.txt"
 
+# ── Case 6: verified-merged local branch with no worktree ─────────────
+MERGED_BRANCH="merged-local"
+git branch "$MERGED_BRANCH"
+git push -q -u origin "$MERGED_BRANCH"
+MERGED_BRANCH_TIP=$(git rev-parse "$MERGED_BRANCH")
+git push -q origin --delete "$MERGED_BRANCH"
+git fetch -q --prune
+
+# ── Case 7: same branch name has a merged PR, but local tip advanced ───
+UNSAFE_BRANCH="merged-local-new-work"
+git switch -q -c "$UNSAFE_BRANCH"
+echo unsafe > unsafe.txt
+git add unsafe.txt
+git commit -q -m "unsafe branch initial"
+git push -q -u origin "$UNSAFE_BRANCH"
+UNSAFE_MERGED_TIP=$(git rev-parse HEAD)
+git push -q origin --delete "$UNSAFE_BRANCH"
+git fetch -q --prune
+echo followup >> unsafe.txt
+git commit -am "unsafe branch followup" -q
+git switch -q main
+
 # ── gh stub on PATH ───────────────────────────────────────────────────
 STUB_DIR="$WORKDIR/stub-bin"
 mkdir -p "$STUB_DIR"
@@ -143,6 +170,24 @@ if [ "\$1" = "pr" ] && [ "\$2" = "view" ]; then
     echo "CLOSED"
     exit 0
   fi
+fi
+if [ "\$1" = "pr" ] && [ "\$2" = "list" ]; then
+  head=""
+  while [ "\$#" -gt 0 ]; do
+    case "\$1" in
+      --head) head="\$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  if [ "\$head" = "$MERGED_BRANCH" ]; then
+    echo "$MERGED_BRANCH_TIP"
+    exit 0
+  fi
+  if [ "\$head" = "$UNSAFE_BRANCH" ]; then
+    echo "$UNSAFE_MERGED_TIP"
+    exit 0
+  fi
+  exit 0
 fi
 exit 1
 STUB
@@ -214,6 +259,23 @@ else
   show_out_on_fail
 fi
 
+# Case 6: verified-merged local branch listed as MERGED local branch.
+if echo "$OUT" | grep -q "MERGED local branch" \
+   && echo "$OUT" | grep -q -- "$MERGED_BRANCH"; then
+  pass "verified-merged local branch listed"
+else
+  fail "verified-merged local branch not listed"
+  show_out_on_fail
+fi
+
+# Case 7: local commits after the merged PR head must not be swept.
+if echo "$OUT" | grep -q -- "$UNSAFE_BRANCH"; then
+  fail "unsafe advanced local branch appeared as cleanup candidate"
+  show_out_on_fail
+else
+  pass "advanced local branch with old merged PR is not listed"
+fi
+
 # Summary counts: at least 1 in each of gone/detached/locked/orphan.
 if echo "$OUT" | grep -qE "gone-upstream: +[1-9]"; then
   pass "summary shows ≥1 gone-upstream"
@@ -231,6 +293,12 @@ if echo "$OUT" | grep -qE "locked: +[1-9]"; then
   pass "summary shows ≥1 locked"
 else
   fail "summary locked count missing/zero"
+  show_out_on_fail
+fi
+if echo "$OUT" | grep -qE "merged branches: +[1-9]"; then
+  pass "summary shows ≥1 merged branch"
+else
+  fail "summary merged branch count missing/zero"
   show_out_on_fail
 fi
 if echo "$OUT" | grep -qE "orphan dirs: +[1-9]"; then
@@ -285,6 +353,18 @@ if echo "$OUT3" | grep -q -- "$ORPHAN_DIR"; then
   pass "orphan retained after --apply (no --orphan-clean)"
 else
   fail "orphan disappeared without --orphan-clean"
+  echo "$OUT3" >&2
+fi
+if git branch --list "$MERGED_BRANCH" | grep -q "$MERGED_BRANCH"; then
+  fail "verified-merged local branch still present after --apply"
+  echo "$OUT3" >&2
+else
+  pass "verified-merged local branch deleted by --apply"
+fi
+if git branch --list "$UNSAFE_BRANCH" | grep -q "$UNSAFE_BRANCH"; then
+  pass "advanced local branch retained after --apply"
+else
+  fail "advanced local branch was deleted despite tip mismatch"
   echo "$OUT3" >&2
 fi
 

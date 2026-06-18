@@ -239,6 +239,7 @@ export default [
       ...react.configs.recommended.rules,
       ...reactHooks.configs.recommended.rules,
       "react/react-in-jsx-scope": "off",
+      "react/prop-types": "off",
       // React Compiler advisories — disabled by default because they
       // only fire usefully once the React Compiler is adopted; until
       // then they're noisy on idiomatic React (set-state-in-effect
@@ -287,6 +288,7 @@ export default [
       ...react.configs.recommended.rules,
       ...reactHooks.configs.recommended.rules,
       "react/react-in-jsx-scope": "off",
+      "react/prop-types": "off",
       // React Compiler advisories — disabled by default because they
       // only fire usefully once the React Compiler is adopted; until
       // then they're noisy on idiomatic React (set-state-in-effect
