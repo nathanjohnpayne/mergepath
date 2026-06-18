@@ -54,21 +54,55 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   'mergepath/'
   'packaging/'
 
-  # Project-doc orchestrator surface — must NEVER propagate into a new repo.
-  # .mergepath-project-docs.yml has a `path_hint: .` that would resolve a
-  # bootstrapped consumer as the mergepath owner (so project-doc-sync could
+  # Mergepath-only orchestrator surfaces - must NEVER propagate.
+  # The sync-to-downstream and project-doc-sync engines, their manifests, and
+  # their paired tests drive propagation OUT to consumers; they are Mergepath-
+  # internal and must never ship INTO a freshly bootstrapped repo. A new repo
+  # carrying them would (a) ship a manifest naming every private consumer repo,
+  # and (b) look like "Mergepath itself" to the consumer-vs-mergepath detection
+  # baked into the propagated scripts/ci/check_* wrappers.
+  #
+  # Each engine is excluded together with its manifest, paired test, and (for
+  # sync) its hub-only cron driver - not piecemeal, because the consumer-vs-
+  # mergepath detection keys off PAIRS of these files:
+  #
+  #   * check_sync_manifest + check_export_consumer_facts disambiguate on the
+  #     pair (.mergepath-sync.yml + scripts/sync-to-downstream.sh). Dropping the
+  #     manifest alone while leaving the engine trips their "manifest missing
+  #     but engine present -> mergepath misconfig" FAIL branch - this was the
+  #     Codex P1 on #509, which is why #509 shipped only the project-doc
+  #     docs/manifest and deferred the engine. With BOTH absent the wrappers
+  #     take the clean consumer-SKIP path.
+  #   * check_sync_to_downstream keys off the pair (tests/test_sync_to_downstream.sh
+  #     + .mergepath-sync.yml); with both absent it SKIPs at the top, before it
+  #     would reach the project-doc companion test (tests/test_project_doc_sync.sh).
+  #
+  # NB: scripts/sync/ and tests/test_sync_overrides.sh are deliberately NOT
+  # excluded. The kit-propagated scripts/ci/check_sync_overrides hard-requires
+  # that test (it has no consumer-skip path), and the test sources
+  # scripts/sync/{validate,apply}-overrides.sh - so all three are load-bearing
+  # in a consumer and must keep flowing through the mirror.
+  #
+  # Sync-to-downstream surface (engine + manifest + paired test + cron driver).
+  # weekly-drift-audit.yml is the hub-only cron that runs the engine's --audit
+  # across every consumer; it is mergepath-only (a leaf consumer has no
+  # downstream to audit), not propagated via the manifest, and would otherwise
+  # fail every week in a new repo on the now-absent engine.
+  '.mergepath-sync.yml'
+  'scripts/sync-to-downstream.sh'
+  'tests/test_sync_to_downstream.sh'
+  '.github/workflows/weekly-drift-audit.yml'
+  # Project-doc-sync surface. The docs/manifest landed in #509:
+  # .mergepath-project-docs.yml carries a `path_hint: .` that would resolve a
+  # bootstrapped consumer AS the mergepath owner (so project-doc-sync could
   # mirror the consumer's specs/ into docs/projects/mergepath/specs/ or rewrite
   # a Mergepath PRD mirror), and docs/projects/ holds generated PRD/spec mirrors
-  # an agent in the consumer would otherwise read as that repo's product
-  # context. Codex P2 on #509.
-  #
-  # NB: .mergepath-sync.yml is intentionally NOT excluded here — check_sync_manifest
-  # keys "is this Mergepath?" off scripts/sync-to-downstream.sh, so dropping the
-  # manifest alone (without the engine) makes a generated repo fail lint
-  # (Codex P1 on #509). Fully de-Mergepath-ing the sync engine from bootstrap is
-  # a separate, larger change.
+  # an agent in the consumer would otherwise read as that repo's product context
+  # (Codex P2 on #509). The engine + paired test that act on them ship out here.
   '.mergepath-project-docs.yml'
   'docs/projects/'
+  'scripts/project-doc-sync.sh'
+  'tests/test_project_doc_sync.sh'
 
   # Local operator state under .claude/
   '.claude/worktrees/'

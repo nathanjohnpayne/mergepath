@@ -128,9 +128,28 @@ echo "dist artifact" >"$FAKE_MP/dist/output.tgz"
 echo "mergepath internal" >"$FAKE_MP/mergepath/internal.md"
 echo "packaging metadata" >"$FAKE_MP/packaging/meta.json"
 echo "policy sim" >"$FAKE_MP/scripts/policy-sim.sh"
+# Sync-to-downstream orchestrator surface (engine + manifest + paired test +
+# cron driver) - mergepath-only; the engine + manifest are also the
+# consumer-vs-mergepath markers the propagated scripts/ci/check_* wrappers key
+# off, and weekly-drift-audit.yml is the hub-only cron that runs the engine.
+echo "version: 1" >"$FAKE_MP/.mergepath-sync.yml"
+echo "sync engine" >"$FAKE_MP/scripts/sync-to-downstream.sh"
+echo "sync engine test" >"$FAKE_MP/tests/test_sync_to_downstream.sh"
+echo "name: weekly-drift-audit" >"$FAKE_MP/.github/workflows/weekly-drift-audit.yml"
+# Project-doc orchestrator surface (docs/manifest from #509 + engine + test).
 echo "version: 1" >"$FAKE_MP/.mergepath-project-docs.yml"
 mkdir -p "$FAKE_MP/docs/projects/mergepath/prds"
 echo "generated prd mirror" >"$FAKE_MP/docs/projects/mergepath/prds/mergepath.md"
+echo "project-doc engine" >"$FAKE_MP/scripts/project-doc-sync.sh"
+echo "project-doc test" >"$FAKE_MP/tests/test_project_doc_sync.sh"
+# Load-bearing sync internals that MUST still propagate: kit-propagated
+# scripts/ci/check_sync_overrides hard-requires tests/test_sync_overrides.sh
+# (no consumer-skip path), which sources scripts/sync/. Present here so the
+# test can assert they SURVIVE the mirror (excluding them would red lint).
+mkdir -p "$FAKE_MP/scripts/sync"
+echo "validate overrides" >"$FAKE_MP/scripts/sync/validate-overrides.sh"
+echo "apply overrides" >"$FAKE_MP/scripts/sync/apply-overrides.sh"
+echo "sync overrides test" >"$FAKE_MP/tests/test_sync_overrides.sh"
 echo "old log" >"$FAKE_MP/.bootstrap-log"
 echo "old state" >"$FAKE_MP/.bootstrap-state"
 
@@ -152,6 +171,16 @@ cp "$ROOT/scripts/bootstrap/github-infra.sh"        "$FAKE_MP/scripts/bootstrap/
 cp "$ROOT/scripts/bootstrap/firebase-and-codereview.sh" "$FAKE_MP/scripts/bootstrap/firebase-and-codereview.sh"
 cp "$ROOT/scripts/bootstrap/board-and-summary.sh"   "$FAKE_MP/scripts/bootstrap/board-and-summary.sh"
 cp "$ROOT/scripts/bootstrap-new-repo.sh"            "$FAKE_MP/scripts/bootstrap-new-repo.sh"
+
+# Real consumer-detecting check wrappers - copied so the mirror carries them
+# into TARGET (they ride the scripts/ci/ kit in a real bootstrap). The
+# consumer-SKIP assertion below runs them FROM the generated TARGET to prove
+# they take the skip path now that the orchestrator surface is excluded. They
+# are NOT in BOOTSTRAP_NAME_BEARING_FILES, so substitution leaves their
+# ".mergepath-sync.yml" / "scripts/sync-to-downstream.sh" detection intact.
+cp "$ROOT/scripts/ci/check_sync_manifest"         "$FAKE_MP/scripts/ci/check_sync_manifest"
+cp "$ROOT/scripts/ci/check_sync_to_downstream"    "$FAKE_MP/scripts/ci/check_sync_to_downstream"
+cp "$ROOT/scripts/ci/check_export_consumer_facts" "$FAKE_MP/scripts/ci/check_export_consumer_facts"
 
 # git init so preflight check 6 (clean mergepath) passes.
 git -C "$FAKE_MP" init -q
@@ -217,8 +246,14 @@ for excluded in \
   'specs/mergepath_playground.md' \
   'plans/mergepath-playground.md' \
   'scripts/policy-sim.sh' \
+  '.mergepath-sync.yml' \
+  'scripts/sync-to-downstream.sh' \
+  'tests/test_sync_to_downstream.sh' \
+  '.github/workflows/weekly-drift-audit.yml' \
   '.mergepath-project-docs.yml' \
   'docs/projects' \
+  'scripts/project-doc-sync.sh' \
+  'tests/test_project_doc_sync.sh' \
   'bugs/screenshots' \
   '.github/screenshots' ; do
   # Skip .git — the stage init step creates a fresh .git/ in the target.
@@ -227,7 +262,47 @@ for excluded in \
     fail "exclude not honored: $excluded ended up at $TARGET/$excluded"
   fi
 done
-[ "$FAIL" -eq 0 ] && pass "all documented exclude paths honored (incl. orchestrator manifests)"
+[ "$FAIL" -eq 0 ] && pass "all documented exclude paths honored (incl. sync + project-doc orchestrator surface)"
+
+# --- assertion 1b: load-bearing sync internals MUST survive the mirror ---
+# scripts/ci/check_sync_overrides is kit-propagated and has NO consumer-skip
+# path - it hard-errors without tests/test_sync_overrides.sh, which sources
+# scripts/sync/{validate,apply}-overrides.sh. Excluding any of these would red
+# a bootstrapped repo's repo_lint, so they must NOT be swept up with the
+# orchestrator surface above.
+for kept in \
+  'scripts/sync/validate-overrides.sh' \
+  'scripts/sync/apply-overrides.sh' \
+  'tests/test_sync_overrides.sh' ; do
+  [ -e "$TARGET/$kept" ] \
+    && pass "load-bearing sync internal propagated: $kept" \
+    || fail "$kept must propagate (check_sync_overrides hard-requires it)"
+done
+
+# --- assertion 1c: orchestrator checks take the consumer-SKIP path ---
+# The point of excluding the surface: the kit-propagated check_* wrappers that
+# disambiguate "consumer vs mergepath" must SKIP cleanly (exit 0) when run from
+# the generated TARGET, exactly as on a real consumer checkout. Run the REAL
+# wrappers (mirrored into TARGET) so this exercises the actual propagated
+# detection logic, not a re-implementation:
+#   - check_sync_manifest:         .mergepath-sync.yml absent + engine absent
+#   - check_sync_to_downstream:    test_sync_to_downstream.sh absent + manifest absent
+#   - check_export_consumer_facts: engine absent + manifest absent
+for chk in check_sync_manifest check_sync_to_downstream check_export_consumer_facts; do
+  if [ ! -f "$TARGET/scripts/ci/$chk" ]; then
+    fail "$chk wrapper did not propagate into TARGET (scripts/ci/ kit)"
+    continue
+  fi
+  set +e
+  chk_out=$(bash "$TARGET/scripts/ci/$chk" 2>&1)
+  chk_ec=$?
+  set -e
+  if [ "$chk_ec" -eq 0 ] && printf '%s' "$chk_out" | grep -q "SKIP"; then
+    pass "$chk takes consumer-SKIP path on bootstrapped tree"
+  else
+    fail "$chk should SKIP on bootstrapped tree; rc=$chk_ec, out: $chk_out"
+  fi
+done
 
 # .bootstrap-log from the source must NOT propagate as-is into the
 # target. The wizard creates its OWN .bootstrap-log in the target
