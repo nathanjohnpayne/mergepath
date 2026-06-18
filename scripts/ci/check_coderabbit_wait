@@ -9,6 +9,7 @@ TESTS=(
   "$REPO_ROOT/tests/test_coderabbit_wait_identity_derivation.sh"
   "$REPO_ROOT/tests/test_coderabbit_wait_paused.sh"
   "$REPO_ROOT/tests/test_coderabbit_wait_codex_failover.sh"
+  "$REPO_ROOT/tests/test_coderabbit_automerge_rate_limit_gate.sh"
 )
 
 if [ ! -x "$REPO_ROOT/scripts/coderabbit-wait.sh" ]; then
@@ -31,4 +32,6 @@ echo "check_coderabbit_wait: running coderabbit-wait paused/skip tests (#490)"
 "${TESTS[2]}"
 echo "check_coderabbit_wait: running coderabbit-wait codex rate-limit failover tests (#489)"
 "${TESTS[3]}"
+echo "check_coderabbit_wait: running auto-merge rate-limit gate tests (#489)"
+"${TESTS[4]}"
 echo "check_coderabbit_wait: PASS"
