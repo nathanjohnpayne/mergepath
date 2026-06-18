@@ -151,10 +151,25 @@ fi
 
 # --- argument parsing -------------------------------------------------------
 
+# #489: --trigger-only posts (or confirms) the @codex review trigger and
+# returns WITHOUT polling for clearance. coderabbit-wait.sh's rate-limit
+# failover uses it so a rate-limited PR advances via Codex without the wait
+# helper blocking on Codex's full review. Extract the flag, leave positionals.
+TRIGGER_ONLY=false
+__POSITIONAL=()
+for __arg in "$@"; do
+  case "$__arg" in
+    --trigger-only) TRIGGER_ONLY=true ;;
+    *) __POSITIONAL+=("$__arg") ;;
+  esac
+done
+set -- ${__POSITIONAL[@]+"${__POSITIONAL[@]}"}
+
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  echo "Usage: $0 <PR_NUMBER> [REPO]" >&2
-  echo "  PR_NUMBER  pull request number (integer)" >&2
-  echo "  REPO       owner/repo (optional; defaults to current repo)" >&2
+  echo "Usage: $0 [--trigger-only] <PR_NUMBER> [REPO]" >&2
+  echo "  --trigger-only  post/confirm the @codex trigger, then exit 0 (no clearance poll)" >&2
+  echo "  PR_NUMBER       pull request number (integer)" >&2
+  echo "  REPO            owner/repo (optional; defaults to current repo)" >&2
   exit 3
 fi
 
@@ -614,6 +629,23 @@ has_post_trigger_signal() {
   ')" = "true" ]
 }
 
+# #489: HEAD-pinned idempotency for the rate-limit failover. Returns 0 iff an
+# `@codex review` trigger comment already exists on the PR at or after HEAD's
+# committer date — i.e. Codex was already requested for THIS HEAD. Lets
+# --trigger-only skip a duplicate post when coderabbit-wait.sh fires the
+# failover more than once for the same HEAD (e.g. a re-invocation). Fail-open:
+# on any read error it returns non-zero so the caller still posts (better to
+# re-request Codex than to silently skip the failover).
+existing_codex_trigger_on_head() {
+  local comments
+  comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null \
+    | jq -s 'add // []' 2>/dev/null) || return 1
+  [ -n "$comments" ] || return 1
+  echo "$comments" | jq -e --arg since "$HEAD_COMMITTER_DATE" '
+    any(.[]; ((.body // "") | test("@codex review"; "i")) and (.created_at >= $since))
+  ' >/dev/null 2>&1
+}
+
 reset_review_wait_clock() {
   START_TS=$(date +%s)
   DEADLINE=$((START_TS + TIMEOUT_SECONDS))
@@ -827,6 +859,8 @@ TRIGGER_SIGNAL_THRESHOLD=""
 
 if has_cleared_signal "$INITIAL_SCAN"; then
   log "Codex has already cleared on HEAD (reaction or no-P0/P1 review) — skipping trigger comment"
+elif [ "$TRIGGER_ONLY" = "true" ] && existing_codex_trigger_on_head; then
+  log "trigger-only: @codex review already requested on HEAD — skipping duplicate trigger (idempotent, #489)"
 else
   post_codex_trigger
 fi
@@ -839,6 +873,36 @@ if [ "$TRIGGER_POSTED" = "true" ]; then
   run_trigger_ack_gate
 else
   FINAL_SCAN=$INITIAL_SCAN
+fi
+
+# #489 trigger-only: the trigger is posted (or was already present); return
+# WITHOUT polling for clearance. Codex's actual review/clearance is picked up
+# later by the normal Phase 4a flow and the merge-clearance gate. trigger_posted
+# is false when the idempotency check skipped a duplicate, or when Codex had
+# already cleared on HEAD.
+if [ "$TRIGGER_ONLY" = "true" ]; then
+  jq -n \
+    --argjson pr_number "$PR_NUMBER" \
+    --arg repo "$REPO" \
+    --arg head_sha "$HEAD_SHA" \
+    --arg head_committer_date "$HEAD_COMMITTER_DATE" \
+    --arg bot_login "$BOT_LOGIN" \
+    --argjson trigger_posted "$TRIGGER_POSTED" '
+    {
+      pr_number: $pr_number,
+      repo: $repo,
+      head_sha: $head_sha,
+      head_committer_date: $head_committer_date,
+      bot_login: $bot_login,
+      review: null,
+      findings: [],
+      reaction: null,
+      trigger_posted: $trigger_posted,
+      trigger_requested: true,
+      trigger_only: true,
+      rounds_waited_seconds: 0
+    }'
+  exit 0
 fi
 
 # --- poll loop --------------------------------------------------------------

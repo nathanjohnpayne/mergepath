@@ -173,6 +173,19 @@ coderabbit:
   # rate-limit comment). See nathanjohnpayne/mergepath#138.
   max_rate_limit_retries: 2
 
+  # #489: when CodeRabbit reports rate-limited, automatically request
+  # `@codex review` (once, HEAD-pinned) so the PR advances via Codex — the
+  # real blocking gate — instead of idling on the advisory bot's hourly
+  # allowance. `scripts/coderabbit-wait.sh` fires
+  # `scripts/codex-review-request.sh --trigger-only` on the first rate-limit
+  # notice; it is time-boxed and self-reverting (a single trigger per run, no
+  # permanent Codex pin) and composes with `codex.request_by_default` (#486)
+  # without forking it. When the failover engaged, a `rate_limit_stalled`
+  # (exit 5) is a non-blocking note rather than a hard human-alert — the JSON
+  # carries `codex_failover_requested: true`. Set to false to opt out (e.g. a
+  # repo with `codex.enabled: false`, where there is nothing to fail over to).
+  codex_failover_on_rate_limit: true
+
   # Maximum number of times `scripts/coderabbit-wait.sh` will post
   # `@coderabbitai resume` to recover from CodeRabbit's auto-pause state
   # (the durable "Reviews paused" NOTE CodeRabbit emits after
