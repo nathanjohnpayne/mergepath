@@ -61,9 +61,9 @@
 #      output. These are residue from a `--force` remove that didn't
 #      clean the directory, or from a manual rm of git metadata.
 #   4. Verified-merged local branch. A local branch whose upstream is
-#      gone and whose same-repo PR is verified MERGED via `gh pr list
-#      --head <branch> --state merged`. In --apply mode, branches that
-#      are not checked out in any worktree are deleted with `git branch -D`;
+#      gone and whose current tip matches a MERGED PR head from `gh pr list
+#      --head <branch> --state merged`. In --apply mode, branches that are
+#      not checked out in any worktree are deleted with `git branch -D`;
 #      checked-out branches are listed but skipped.
 #
 # Locked detection. `git worktree list --porcelain` emits a `locked`
@@ -164,16 +164,14 @@ gh_pr_state() {
   echo "unknown"
 }
 
-gh_branch_has_merged_pr() {
-  local branch="$1" count
+gh_branch_tip_has_merged_pr() {
+  local branch="$1" tip merged_heads
   if ! command -v gh >/dev/null 2>&1; then
     return 1
   fi
-  if count=$(gh pr list --head "$branch" --state merged --json number --jq 'length' 2>/dev/null); then
-    [ "${count:-0}" != "0" ]
-    return $?
-  fi
-  return 1
+  tip=$(git -C "$MAIN_WORKTREE" rev-parse "$branch" 2>/dev/null) || return 1
+  merged_heads=$(cd "$MAIN_WORKTREE" && gh pr list --head "$branch" --state merged --json headRefOid --jq '.[].headRefOid' 2>/dev/null) || return 1
+  printf '%s\n' "$merged_heads" | grep -Fxq "$tip"
 }
 
 # Read gone-upstream branches from `git branch -vv`. The format is:
@@ -395,7 +393,7 @@ done <"$REC_FILE"
 # not swept up just because its upstream is gone.
 while IFS= read -r LOCAL_BRANCH; do
   [ -n "$LOCAL_BRANCH" ] || continue
-  if ! gh_branch_has_merged_pr "$LOCAL_BRANCH"; then
+  if ! gh_branch_tip_has_merged_pr "$LOCAL_BRANCH"; then
     continue
   fi
 

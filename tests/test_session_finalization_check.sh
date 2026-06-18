@@ -37,27 +37,32 @@ mkremote_repo "$TMP/merged" "$TMP/merged.git"
 git -C "$TMP/merged" switch -q -c feature
 echo feature >>"$TMP/merged/file.txt"
 git -C "$TMP/merged" commit -am feature -q
+merged_tip=$(git -C "$TMP/merged" rev-parse HEAD)
 git -C "$TMP/merged" push -q -u origin feature
 git -C "$TMP/merged" push -q origin --delete feature
 git -C "$TMP/merged" fetch -q --prune
 stub="$TMP/stub-bin"; mkdir -p "$stub"
-cat >"$stub/gh" <<'STUB'
+cat >"$stub/gh" <<STUB
 #!/usr/bin/env bash
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+if [ "\$1" = "pr" ] && [ "\$2" = "list" ]; then
   head=""
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --head) head=$2; shift 2 ;;
+  while [ "\$#" -gt 0 ]; do
+    case "\$1" in
+      --head) head=\$2; shift 2 ;;
       *) shift ;;
     esac
   done
-  [ "$head" = "feature" ] && echo 1 || echo 0
+  [ "\$head" = "feature" ] && echo "$merged_tip" || true
   exit 0
 fi
 exit 1
 STUB
 chmod +x "$stub/gh"
 out=$(PATH="$stub:$PATH" "$SCRIPT" "$TMP/merged") && [[ $out == *clean* ]] && pass merged-squash-branch || fail "merged branch output: $out"
+echo followup >>"$TMP/merged/file.txt"
+git -C "$TMP/merged" commit -am followup -q
+if out=$(PATH="$stub:$PATH" "$SCRIPT" "$TMP/merged" 2>&1); then fail merged-branch-new-commit; fi
+[[ $out == *"upstream 'origin/feature' is missing/gone"* && $out == *"not reachable"* ]] && pass merged-branch-new-commit || fail "merged branch new commit output: $out"
 
 mkremote_repo "$TMP/unmerged" "$TMP/unmerged.git"
 git -C "$TMP/unmerged" switch -q -c feature

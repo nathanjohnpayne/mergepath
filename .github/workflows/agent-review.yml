@@ -780,45 +780,47 @@ jobs:
           echo "No blocking labels present — proceeding to merge."
 
 
-      - name: Require current-head test success
+      - name: Require current-head check success
         if: steps.author_merge_token.outputs.enabled == 'true'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           REPO: ${{ github.repository }}
+          REQUIRED_HEAD_CHECK_NAME: lint
           TEST_CHECK_WAIT_SECONDS: 1200
           TEST_CHECK_POLL_SECONDS: 15
         run: |
+          required_check_name=${REQUIRED_HEAD_CHECK_NAME:-lint}
           wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
           poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
           deadline=$((SECONDS + wait_seconds))
           sha=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)
           while :; do
             run=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
-              --jq '[.check_runs[] | select(.name == "test")] | sort_by(.started_at // .created_at) | last // empty')
+              | jq -c --arg check "$required_check_name" '[.check_runs[] | select(.name == $check)] | sort_by(.started_at // .created_at) | last // empty')
             if [ -n "$run" ]; then
               status=$(printf '%s' "$run" | jq -r '.status')
               conclusion=$(printf '%s' "$run" | jq -r '.conclusion // ""')
               if [ "$status" = "completed" ]; then
                 if [ "$conclusion" = "success" ]; then
                   echo "CURRENT_HEAD_SHA=$sha" >> "$GITHUB_ENV"
-                  echo "Required check run 'test' is successful on current HEAD $sha."
+                  echo "Required check run '$required_check_name' is successful on current HEAD $sha."
                   exit 0
                 fi
-                echo "::error::Required check run 'test' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
+                echo "::error::Required check run '$required_check_name' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
                 exit 1
               fi
-              echo "::notice::Required check run 'test' is $status on current HEAD $sha; waiting for completion."
+              echo "::notice::Required check run '$required_check_name' is $status on current HEAD $sha; waiting for completion."
             else
-              echo "::notice::Required check run 'test' is absent on current HEAD $sha; waiting for it to start."
+              echo "::notice::Required check run '$required_check_name' is absent on current HEAD $sha; waiting for it to start."
             fi
             if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::Required check run 'test' did not complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
+              echo "::error::Required check run '$required_check_name' did not complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
               exit 1
             fi
             sleep "$poll_seconds"
           done
-          echo "::error::Required check run 'test' wait loop ended unexpectedly; refusing auto-merge."
+          echo "::error::Required check run '$required_check_name' wait loop ended unexpectedly; refusing auto-merge."
           exit 1
 
       - name: Re-verify blocking labels after test wait

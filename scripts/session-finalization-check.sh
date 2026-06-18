@@ -7,12 +7,13 @@ FAIL=0
 report(){ printf '%s\n' "$*"; }
 flag(){ FAIL=1; report "ORPHANED-WORK: $*"; }
 
-branch_has_merged_pr() {
-  local b=$1 count
+branch_tip_has_merged_pr() {
+  local b=$1 tip merged_heads
   [ -n "$b" ] || return 1
+  tip=$(git -C "$ROOT" rev-parse "$b" 2>/dev/null) || return 1
   command -v gh >/dev/null 2>&1 || return 1
-  count=$(cd "$ROOT" && gh pr list --head "$b" --state merged --json number --jq 'length' 2>/dev/null) || return 1
-  [ "${count:-0}" != "0" ]
+  merged_heads=$(cd "$ROOT" && gh pr list --head "$b" --state merged --json headRefOid --jq '.[].headRefOid' 2>/dev/null) || return 1
+  printf '%s\n' "$merged_heads" | grep -Fxq "$tip"
 }
 
 if ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -29,7 +30,7 @@ branch=$(git -C "$ROOT" branch --show-current || true)
 if [ -n "$branch" ]; then
   upstream=$(git -C "$ROOT" for-each-ref --format='%(upstream:short)' "refs/heads/$branch" 2>/dev/null || true)
   merged_pr=0
-  if branch_has_merged_pr "$branch"; then
+  if branch_tip_has_merged_pr "$branch"; then
     merged_pr=1
   fi
   upstream_exists=0

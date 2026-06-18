@@ -100,37 +100,39 @@ jobs:
           echo "::notice::Merge will be performed as $MERGE_AS."
 
 
-          require_current_head_test_success() {
-            local sha runs conclusion status wait_seconds poll_seconds deadline
+          require_current_head_check_success() {
+            local sha runs conclusion status wait_seconds poll_seconds deadline required_check_name
+            required_check_name=${REQUIRED_HEAD_CHECK_NAME:-lint}
             wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
             poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
             deadline=$((SECONDS + wait_seconds))
             sha=$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)
             while :; do
-              runs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$sha/check-runs?per_page=100" --jq '[.check_runs[] | select(.name == "test")] | sort_by(.started_at // .created_at) | last // empty')
+              runs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$sha/check-runs?per_page=100" \
+                | jq -c --arg check "$required_check_name" '[.check_runs[] | select(.name == $check)] | sort_by(.started_at // .created_at) | last // empty')
               if [ -n "$runs" ]; then
                 status=$(printf '%s' "$runs" | jq -r '.status')
                 conclusion=$(printf '%s' "$runs" | jq -r '.conclusion // ""')
                 if [ "$status" = "completed" ]; then
                   if [ "$conclusion" = "success" ]; then
                     CURRENT_HEAD_SHA="$sha"
-                    echo "::notice::Required check run 'test' is successful on current HEAD $CURRENT_HEAD_SHA."
+                    echo "::notice::Required check run '$required_check_name' is successful on current HEAD $CURRENT_HEAD_SHA."
                     return 0
                   fi
-                  echo "::error::Required check run 'test' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
+                  echo "::error::Required check run '$required_check_name' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
                   exit 1
                 fi
-                echo "::notice::Required check run 'test' is $status on current HEAD $sha; waiting for completion."
+                echo "::notice::Required check run '$required_check_name' is $status on current HEAD $sha; waiting for completion."
               else
-                echo "::notice::Required check run 'test' is absent on current HEAD $sha; waiting for it to start."
+                echo "::notice::Required check run '$required_check_name' is absent on current HEAD $sha; waiting for it to start."
               fi
               if [ "$SECONDS" -ge "$deadline" ]; then
-                echo "::error::Required check run 'test' did not complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
+                echo "::error::Required check run '$required_check_name' did not complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
                 exit 1
               fi
               sleep "$poll_seconds"
             done
-            echo "::error::Required check run 'test' wait loop ended unexpectedly; refusing auto-merge."
+            echo "::error::Required check run '$required_check_name' wait loop ended unexpectedly; refusing auto-merge."
             exit 1
           }
 
@@ -271,7 +273,7 @@ jobs:
             exit 0
           fi
 
-          require_current_head_test_success
+          require_current_head_check_success
 
           # Try GitHub-side auto-merge first (fires when required
           # checks pass). Fall back to an immediate squash ONLY when
@@ -305,7 +307,7 @@ jobs:
               echo "::notice::PR carries human-hold immediately before fallback squash; skipping Dependabot auto-merge until the human removes the label."
               exit 0
             fi
-            require_current_head_test_success
+            require_current_head_check_success
             if has_human_hold; then
               echo "::notice::PR carries human-hold after test wait; skipping Dependabot auto-merge until the human removes the label."
               exit 0
@@ -345,6 +347,7 @@ jobs:
           # keep major dev-group bumps behind CI (#374 / Codex P2 on #405).
           UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
           DEPENDENCY_GROUP: ${{ steps.metadata.outputs.dependency-group }}
+          REQUIRED_HEAD_CHECK_NAME: lint
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           # Author-identity PAT (nathanjohnpayne) used for the merge
           # step only. Reviewer-identity --approve must stay on
