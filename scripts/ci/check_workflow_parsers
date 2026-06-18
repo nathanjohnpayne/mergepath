@@ -814,22 +814,28 @@ fi
 
 echo
 echo "auto-merge workflows require current-head test success (#516)"
+dependabot_test_gate_calls=$(grep -Ec '^[[:space:]]*require_current_head_test_success[[:space:]]*$' .github/workflows/dependabot-auto-merge.yml || true)
 if grep -Fq "Required check run 'test'" .github/workflows/dependabot-auto-merge.yml && \
-   grep -Fq "require_current_head_test_success" .github/workflows/dependabot-auto-merge.yml && \
+   grep -Eq '^[[:space:]]*require_current_head_test_success\(\)[[:space:]]*\{' .github/workflows/dependabot-auto-merge.yml && \
+   [ "$dependabot_test_gate_calls" -ge 2 ] && \
+   grep -Fq -- "--match-head-commit" .github/workflows/dependabot-auto-merge.yml && \
    grep -Fq "waiting for completion" .github/workflows/dependabot-auto-merge.yml && \
    grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/dependabot-auto-merge.yml; then
-  echo "  PASS: Dependabot auto-merge waits for current-head test success"
+  echo "  PASS: Dependabot auto-merge waits for current-head test success and binds merges to the tested HEAD"
 else
-  echo "  FAIL: Dependabot auto-merge must wait for current-head test success before merge" >&2
+  echo "  FAIL: Dependabot auto-merge must call the test gate, wait for success, and bind merges to the tested HEAD" >&2
   failures=$((failures + 1))
 fi
 if grep -Fq "Require current-head test success" .github/workflows/agent-review.yml && \
    grep -Fq "Required check run 'test'" .github/workflows/agent-review.yml && \
+   grep -Fq "Re-verify blocking labels after test wait" .github/workflows/agent-review.yml && \
+   grep -Fq 'CURRENT_HEAD_SHA=$sha' .github/workflows/agent-review.yml && \
+   grep -Fq -- "--match-head-commit" .github/workflows/agent-review.yml && \
    grep -Fq "waiting for completion" .github/workflows/agent-review.yml && \
    grep -Fq "TEST_CHECK_WAIT_SECONDS" .github/workflows/agent-review.yml; then
-  echo "  PASS: agent-review auto-merge waits for current-head test success"
+  echo "  PASS: agent-review auto-merge waits for current-head test success, rechecks labels, and binds merge to the tested HEAD"
 else
-  echo "  FAIL: agent-review auto-merge must wait for current-head test success before merge" >&2
+  echo "  FAIL: agent-review auto-merge must wait for current-head test success, recheck labels, and bind merge to the tested HEAD" >&2
   failures=$((failures + 1))
 fi
 

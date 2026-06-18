@@ -737,7 +737,7 @@ jobs:
               ;;
           esac
 
-      - name: Re-verify blocking labels right before merge
+      - name: Re-verify blocking labels before test wait
         if: steps.author_merge_token.outputs.enabled == 'true'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -763,8 +763,9 @@ jobs:
           #      (e.g., a human spotting something after approval) and the
           #      job would still merge because the `if:` already evaluated.
           #
-          # Re-fetch the authoritative label state from the GitHub API
-          # immediately before merging. Abort if any blocking label is now
+          # Re-fetch the authoritative label state from the GitHub API before
+          # entering the test wait. The same check repeats after the wait,
+          # immediately before merge. Abort if any blocking label is now
           # present. Also check `policy-violation`, which is applied by the
           # block-self-approval job earlier in this same workflow run (and
           # again, the `if:` at job start wouldn't have seen it).
@@ -800,6 +801,7 @@ jobs:
               conclusion=$(printf '%s' "$run" | jq -r '.conclusion // ""')
               if [ "$status" = "completed" ]; then
                 if [ "$conclusion" = "success" ]; then
+                  echo "CURRENT_HEAD_SHA=$sha" >> "$GITHUB_ENV"
                   echo "Required check run 'test' is successful on current HEAD $sha."
                   exit 0
                 fi
@@ -819,6 +821,22 @@ jobs:
           echo "::error::Required check run 'test' wait loop ended unexpectedly; refusing auto-merge."
           exit 1
 
+      - name: Re-verify blocking labels after test wait
+        if: steps.author_merge_token.outputs.enabled == 'true'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+        run: |
+          LABELS=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name')
+          printf 'Labels after test wait:\n%s\n' "$LABELS"
+          for blocking_label in needs-external-review needs-human-review policy-violation human-hold; do
+            if printf '%s\n' "$LABELS" | grep -Fxq "$blocking_label"; then
+              echo "::error::Blocking label present after test wait: $blocking_label. Aborting auto-merge."
+              exit 1
+            fi
+          done
+          echo "No blocking labels present after test wait — proceeding to merge."
+
       - name: Enable auto-merge
         if: steps.author_merge_token.outputs.enabled == 'true'
         run: |
@@ -829,7 +847,7 @@ jobs:
           # and the unconditional fallback would merge it anyway. Fail closed:
           # if auto-merge cannot be enabled, surface the error and let a human
           # or a re-run handle it.
-          if ! gh pr merge --squash --auto "$PR_URL"; then
+          if ! gh pr merge --squash --auto --match-head-commit "$CURRENT_HEAD_SHA" "$PR_URL"; then
             echo "::error::Could not enable auto-merge for $PR_URL; refusing to merge unconditionally (#465)."
             exit 1
           fi

@@ -113,7 +113,8 @@ jobs:
                 conclusion=$(printf '%s' "$runs" | jq -r '.conclusion // ""')
                 if [ "$status" = "completed" ]; then
                   if [ "$conclusion" = "success" ]; then
-                    echo "::notice::Required check run 'test' is successful on current HEAD $sha."
+                    CURRENT_HEAD_SHA="$sha"
+                    echo "::notice::Required check run 'test' is successful on current HEAD $CURRENT_HEAD_SHA."
                     return 0
                   fi
                   echo "::error::Required check run 'test' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
@@ -290,7 +291,7 @@ jobs:
             exit 0
           fi
           set +e
-          AUTO_STDERR=$(GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash --auto "$PR_URL" 2>&1 1>/dev/null)
+          AUTO_STDERR=$(GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash --auto --match-head-commit "$CURRENT_HEAD_SHA" "$PR_URL" 2>&1 1>/dev/null)
           AUTO_RC=$?
           set -e
           if [ "$AUTO_RC" -eq 0 ]; then
@@ -319,7 +320,7 @@ jobs:
             # approval" gate is satisfied either way.
             if [ "$UPDATE_TYPE" = "version-update:semver-patch" ] || \
                [ "$UPDATE_TYPE" = "version-update:semver-minor" ]; then
-              GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash "$PR_URL"
+              GH_TOKEN="$AUTHOR_MERGE_TOKEN" gh pr merge --squash --match-head-commit "$CURRENT_HEAD_SHA" "$PR_URL"
             else
               echo "::notice::update-type='$UPDATE_TYPE' (dependency-group='$DEPENDENCY_GROUP') is not patch/minor and --auto is unavailable; leaving the PR approved-but-unmerged to preserve the CI-green safety case. Configure branch protection/auto-merge or merge manually after CI."
               exit 0
