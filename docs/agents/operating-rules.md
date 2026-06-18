@@ -137,8 +137,8 @@ the just-merged branch's stale checkout. Open the tracking PR or issue early
 enough that in-flight work is visible. Run `scripts/session-finalization-check.sh`
 (or equivalent `git status` / stash / worktree checks) before closeout; the
 script is read-only and reports dirty files, stashes, stale branch state,
-verified-merged local branches, and dirty auxiliary worktrees without deleting
-work.
+and dirty auxiliary worktrees without deleting work. Verified-merged local
+branch classification is handled by `scripts/worktree-cleanup.sh`.
 
 ## Worktree lifecycle
 
