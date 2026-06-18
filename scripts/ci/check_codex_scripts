@@ -51,6 +51,9 @@ fi
 echo "check_codex_scripts: running codex-review-request ack tests"
 "$REPO_ROOT/tests/test_codex_review_request_ack.sh"
 
+echo "check_codex_scripts: running codex-review-request --trigger-only tests (#489)"
+"$REPO_ROOT/tests/test_codex_review_request_trigger_only.sh"
+
 echo "check_codex_scripts: running codex-review-request Phase 4a entry-decision tests"
 "$REPO_ROOT/tests/test_codex_review_request_entry.sh"
 
