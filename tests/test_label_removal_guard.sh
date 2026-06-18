@@ -155,6 +155,15 @@ assert_allowed "allow: --add-label needs-foo (not in prohibited set)" \
   "gh pr edit 1 --add-label needs-foo"
 assert_allowed "allow: --add-label=human-hold (hard hold is agent-addable)" \
   "gh pr edit 1 --add-label=human-hold"
+# decision-needed is an issue-triage label, NOT a Label-Gate merge-stop
+# (its blocking set is exactly needs-external-review / needs-human-review /
+# policy-violation / human-hold). So the removal guard must not treat it as
+# protected — agents may add or remove it freely. Pins the #496 resolution:
+# the label's description no longer implies a merge block it never enforced.
+assert_allowed "allow: --remove-label decision-needed (issue-triage, not protected; #496)" \
+  "gh pr edit 1 --remove-label decision-needed"
+assert_allowed "allow: --add-label decision-needed (not in the merge blocking set; #496)" \
+  "gh pr edit 1 --add-label decision-needed"
 
 # ─── Allow paths: non-edit subcommands with -R / --repo ─────────────
 # `gh pr view`, `gh pr create` etc. must never be blocked by this
