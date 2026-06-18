@@ -653,6 +653,15 @@ jobs:
         if: steps.author_merge_token.outputs.enabled == 'true' && steps.cr.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          # #489: author token for the rate-limit→Codex failover. coderabbit-wait.sh
+          # runs as the reviewer (GH_TOKEN above) for its own retry comments, but its
+          # failover posts the author-attributed `@codex review` via
+          # codex-review-request.sh → gh-as-author.sh, which resolves the author token
+          # from OP_PREFLIGHT_AUTHOR_PAT and verifies it as author_identity. This step
+          # only runs when author_merge_token is enabled, so the secret is present;
+          # preflight_require_token is a no-op here (GH_TOKEN is set), so this value is
+          # not clobbered, and coderabbit-wait.sh itself reads only the reviewer PAT.
+          OP_PREFLIGHT_AUTHOR_PAT: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
@@ -676,12 +685,18 @@ jobs:
           #   3 — API / infra error. Block and surface.
           #   4 — max_wait_seconds grace window elapsed without a review.
           #       CodeRabbit is advisory; log a warning and proceed.
-          #   5 — rate-limit retry budget exhausted. Do NOT merge —
-          #       block and let the human intervene.
+          #   5 — rate-limit retry budget exhausted. Non-blocking IFF the #489
+          #       Codex failover engaged (codex_failover_requested:true in the
+          #       JSON) — Codex was requested, so the PR advances via the Codex
+          #       gates; otherwise block and let the human intervene.
           set +e
-          bash scripts/coderabbit-wait.sh "$PR_NUMBER" "$REPO"
+          # Capture the helper's JSON (stdout) so the rc=5 branch can read the
+          # #489 codex_failover_requested flag. Its human-readable diagnostics —
+          # and the failover child's own JSON — go to stderr and stream to the log.
+          WAIT_JSON=$(bash scripts/coderabbit-wait.sh "$PR_NUMBER" "$REPO")
           rc=$?
           set -e
+          printf '%s\n' "$WAIT_JSON"
           case "$rc" in
             0)
               echo "CodeRabbit cleared on current HEAD — proceeding to merge."
@@ -694,8 +709,27 @@ jobs:
               echo "::warning::CodeRabbit grace window elapsed without a review. CodeRabbit is advisory — proceeding to merge. Check coderabbit-wait.sh JSON above for status_probe details, if present."
               ;;
             5)
-              echo "::error::CodeRabbit rate-limit retry budget exhausted. Blocking auto-merge; human must re-trigger or merge manually."
-              exit 1
+              # #489: a rate_limit_stalled is non-blocking ONLY when the Codex
+              # failover engaged AND an external-review gate will actually gate
+              # the merge on Codex — i.e. the PR is above-threshold, where
+              # merge-clearance-gate.sh's external_review_gate blocks until
+              # Codex/external clearance. For UNDER-threshold PRs that gate
+              # passes vacuously and --trigger-only does not wait for Codex, so
+              # proceeding would let a rate-limited PR merge with neither bot
+              # having reviewed it — those keep BLOCKING (Codex P2 on #512 r3).
+              # The disposition lives in the unit-tested, fail-closed
+              # scripts/coderabbit-automerge-rate-limit-gate.sh; the
+              # above-threshold signal is the `needs-external-review` label
+              # (present for above-threshold PRs through Phase 2.5, before
+              # external clearance removes it).
+              ext_required=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels \
+                --jq 'any(.labels[]; .name=="needs-external-review")' 2>/dev/null || echo "false")
+              if bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_required"; then
+                echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged on an above-threshold PR — proceeding. merge-clearance's external-review gate blocks the merge until Codex/external clearance lands."
+              else
+                echo "::error::CodeRabbit rate-limit retry budget exhausted — blocking auto-merge. Either the failover did not engage (codex_failover_requested=false) or the PR is under-threshold (no downstream Codex gate, so it must not auto-merge bot-unreviewed). Human must re-trigger or merge manually."
+                exit 1
+              fi
               ;;
             *)
               echo "::error::coderabbit-wait.sh failed with exit code $rc. Blocking auto-merge."

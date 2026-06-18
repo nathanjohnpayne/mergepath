@@ -151,10 +151,25 @@ fi
 
 # --- argument parsing -------------------------------------------------------
 
+# #489: --trigger-only posts (or confirms) the @codex review trigger and
+# returns WITHOUT polling for clearance. coderabbit-wait.sh's rate-limit
+# failover uses it so a rate-limited PR advances via Codex without the wait
+# helper blocking on Codex's full review. Extract the flag, leave positionals.
+TRIGGER_ONLY=false
+__POSITIONAL=()
+for __arg in "$@"; do
+  case "$__arg" in
+    --trigger-only) TRIGGER_ONLY=true ;;
+    *) __POSITIONAL+=("$__arg") ;;
+  esac
+done
+set -- ${__POSITIONAL[@]+"${__POSITIONAL[@]}"}
+
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  echo "Usage: $0 <PR_NUMBER> [REPO]" >&2
-  echo "  PR_NUMBER  pull request number (integer)" >&2
-  echo "  REPO       owner/repo (optional; defaults to current repo)" >&2
+  echo "Usage: $0 [--trigger-only] <PR_NUMBER> [REPO]" >&2
+  echo "  --trigger-only  post/confirm the @codex trigger, then exit 0 (no clearance poll)" >&2
+  echo "  PR_NUMBER       pull request number (integer)" >&2
+  echo "  REPO            owner/repo (optional; defaults to current repo)" >&2
   exit 3
 fi
 
@@ -614,6 +629,37 @@ has_post_trigger_signal() {
   ')" = "true" ]
 }
 
+# #489: HEAD-pinned idempotency for the rate-limit failover. Returns 0 iff a
+# VALID `@codex review` trigger already exists for the current HEAD — meaning a
+# comment authored by the configured `author_identity` (the same identity
+# `post_codex_trigger` writes as, via gh-as-author.sh) whose `created_at` is at
+# or after `REACTION_THRESHOLD` (the PR-scoped pushed-at / freshness anchor,
+# `max(HEAD_PUSHED_AT, freshness floor)`). Author + anchor scoping (Codex P2 on
+# #512) is what makes this sound: a reviewer-authored `@codex review`, or a
+# stale author trigger left on a prior head before a force-push of an
+# old-committer-date commit, must NOT count as "Codex was requested for THIS
+# SHA" — otherwise coderabbit-wait.sh would emit `codex_failover_requested:true`
+# with no valid trigger sent. Lets --trigger-only skip a duplicate post when
+# coderabbit-wait.sh fires the failover more than once for the same HEAD (e.g.
+# a re-invocation). Fail-open: on a missing author identity or any read error it
+# returns non-zero so the caller still posts (better to re-request Codex than to
+# silently skip the failover).
+existing_codex_trigger_on_head() {
+  [ -n "$AUTHOR_IDENTITY" ] || return 1
+  local comments
+  comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null \
+    | jq -s 'add // []' 2>/dev/null) || return 1
+  [ -n "$comments" ] || return 1
+  echo "$comments" | jq -e \
+    --arg author "$AUTHOR_IDENTITY" \
+    --arg since "$REACTION_THRESHOLD" '
+    any(.[];
+      ((.user.login // "") == $author)
+      and ((.body // "") | test("@codex review"; "i"))
+      and (.created_at >= $since))
+  ' >/dev/null 2>&1
+}
+
 reset_review_wait_clock() {
   START_TS=$(date +%s)
   DEADLINE=$((START_TS + TIMEOUT_SECONDS))
@@ -827,8 +873,42 @@ TRIGGER_SIGNAL_THRESHOLD=""
 
 if has_cleared_signal "$INITIAL_SCAN"; then
   log "Codex has already cleared on HEAD (reaction or no-P0/P1 review) — skipping trigger comment"
+elif [ "$TRIGGER_ONLY" = "true" ] && existing_codex_trigger_on_head; then
+  log "trigger-only: @codex review already requested on HEAD — skipping duplicate trigger (idempotent, #489)"
 else
   post_codex_trigger
+fi
+
+# #489 trigger-only: return immediately after posting (or confirming) the
+# trigger — BEFORE run_trigger_ack_gate, which would otherwise re-post
+# @codex up to max_ack_retries (the eyes-ack retry) and break the
+# one-trigger-per-run contract the rate-limit failover relies on. No clearance
+# poll; Codex's actual review/clearance is picked up later by the normal Phase
+# 4a flow and the merge-clearance gate. trigger_posted is false when the
+# idempotency check skipped a duplicate, or when Codex had already cleared.
+if [ "$TRIGGER_ONLY" = "true" ]; then
+  jq -n \
+    --argjson pr_number "$PR_NUMBER" \
+    --arg repo "$REPO" \
+    --arg head_sha "$HEAD_SHA" \
+    --arg head_committer_date "$HEAD_COMMITTER_DATE" \
+    --arg bot_login "$BOT_LOGIN" \
+    --argjson trigger_posted "$TRIGGER_POSTED" '
+    {
+      pr_number: $pr_number,
+      repo: $repo,
+      head_sha: $head_sha,
+      head_committer_date: $head_committer_date,
+      bot_login: $bot_login,
+      review: null,
+      findings: [],
+      reaction: null,
+      trigger_posted: $trigger_posted,
+      trigger_requested: true,
+      trigger_only: true,
+      rounds_waited_seconds: 0
+    }'
+  exit 0
 fi
 
 if [ "$TRIGGER_POSTED" = "true" ]; then

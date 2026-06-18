@@ -34,7 +34,8 @@ says otherwise — an explicit instruction or a `human-hold` /
 `needs-human-review` / `policy-violation` label — or (b) a human handoff or
 escalation is required — a Phase 4b handoff or a Phase 4a disagreement /
 runaway escalation. (A stuck required gate — a red check, or a CodeRabbit
-rate-limit stall, `scripts/coderabbit-wait.sh` exit `5` — blocks merge until
+rate-limit stall, `scripts/coderabbit-wait.sh` exit `5` *without* the #489
+Codex failover (`codex_failover_requested: false`) — blocks merge until
 resolved; that is a blocked gate, not a disposition prompt.) Do not present a
 "how far should I take this PR?" prompt on the happy path. See REVIEW_POLICY.md
 § Default disposition.
@@ -90,7 +91,7 @@ resolved; that is a blocked gate, not a disposition prompt.) Do not present a
 3. Address each comment via fix commits (commits use git config, no gh auth involved — byline stays nathanjohnpayne).
 4. Repeat steps 2–3 until the reviewer identity approves with no outstanding issues. The mechanism: for under-threshold PRs, `gh pr review --approve` from your reviewer identity is the intended path — it satisfies branch protection without bouncing a small PR to an external agent. For above-threshold or protected-path PRs, post `gh pr review --comment` only; Phase 4 carries the cross-agent gate. See REVIEW_POLICY.md § No-self-approve scoping.
 5. If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`:
-   a. **Wait** for CodeRabbit to post its review on the current HEAD. Prefer `scripts/coderabbit-wait.sh <PR#>` over an ad-hoc poll — it anchors "cleared" on the HEAD committer date (closing the race that let auto-merge fire pre-CodeRabbit; see #136), handles CodeRabbit's non-auto-retrying rate-limit state by parsing the published window and posting `@coderabbitai, try again.` itself (see #138), and recovers from CodeRabbit's auto-pause state by posting `@coderabbitai resume` (see #490). Exit codes: `0` cleared, `2` findings, `4` grace-window timeout (advisory — log the `status_probe` reply if present, then skip), `5` rate-limit stalled (alert the human, do not proceed), `6` auto-review skipped and not re-invocable (the JSON `skip_reason` names the cause — `paused` / `non-base-branch` / `draft`; resolve it rather than treating it as a clean clearance).
+   a. **Wait** for CodeRabbit to post its review on the current HEAD. Prefer `scripts/coderabbit-wait.sh <PR#>` over an ad-hoc poll — it anchors "cleared" on the HEAD committer date (closing the race that let auto-merge fire pre-CodeRabbit; see #136), handles CodeRabbit's non-auto-retrying rate-limit state by parsing the published window and posting `@coderabbitai, try again.` itself (see #138), and recovers from CodeRabbit's auto-pause state by posting `@coderabbitai resume` (see #490). Exit codes: `0` cleared, `2` findings, `4` grace-window timeout (advisory — log the `status_probe` reply if present, then skip), `5` rate-limit stalled — alert the human, do not proceed, *unless* `codex_failover_requested: true` in the JSON (the #489 Codex failover requested `@codex review`, so the PR proceeds via Phase 4a and `5` is a non-blocking note), `6` auto-review skipped and not re-invocable (the JSON `skip_reason` names the cause — `paused` / `non-base-branch` / `draft`; resolve it rather than treating it as a clean clearance).
    b. **Read both endpoints:** PR-level comments (`gh api repos/{owner}/{repo}/issues/{pr}/comments`) and inline diff comments (`gh api repos/{owner}/{repo}/pulls/{pr}/comments`).
    c. **Grep inline comments** for `Potential issue` or `⚠️` — these must each be explicitly addressed (fixed or dismissed with reasoning).
    d. Address other substantive findings. CodeRabbit review is advisory and does not block merge.

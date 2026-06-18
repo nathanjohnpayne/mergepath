@@ -391,6 +391,21 @@ POLL_INTERVAL_SECONDS=15
 STATUS_PROBE_POLL_INTERVAL_SECONDS=5
 RATE_LIMIT_BUFFER_SECONDS=30
 
+# #489: CodeRabbit→Codex rate-limit failover. When CodeRabbit posts a
+# rate-limit notice, request `@codex review` once so the PR advances via the
+# real blocking gate (Codex) instead of idling on the advisory bot's hourly
+# allowance. Composes with codex.request_by_default (#486) but fires regardless
+# of it (MERGEPATH_PHASE_4A_GATED=true) for the duration of the stall. It is
+# time-boxed and self-reverting: a single HEAD-pinned trigger per run, so once
+# CodeRabbit recovers the steady-state posture returns with no permanent Codex
+# pin. Default true (opt out with coderabbit.codex_failover_on_rate_limit:
+# false). Only an explicit "false" disables it; a missing key keeps it on.
+CODEX_FAILOVER_ON_RATE_LIMIT=$(coderabbit_field codex_failover_on_rate_limit)
+CODEX_FAILOVER_ON_RATE_LIMIT=${CODEX_FAILOVER_ON_RATE_LIMIT:-true}
+# The Codex request helper, invoked in --trigger-only mode on rate-limit.
+# Overridable for tests via CODERABBIT_WAIT_CODEX_REQUEST_CMD.
+CODEX_REQUEST_CMD="${CODERABBIT_WAIT_CODEX_REQUEST_CMD:-$__CODERABBIT_WAIT_DIR/codex-review-request.sh}"
+
 # Stable marker CodeRabbit wraps its auto-pause "Reviews paused" NOTE in
 # (#490 / #485). Keyed on directly — the prose ("## Reviews paused", the
 # resume/review bullet list) is not versioned, but this HTML-comment marker
@@ -1184,6 +1199,13 @@ PAUSE_OBSERVED=false
 # rate-limit paths; set to paused / non-base-branch / draft on a #490 skip.
 SKIP_REASON=""
 STATUS_PROBE_RAN=false
+# #489 rate-limit→Codex failover state. CODEX_FAILOVER_FIRED latches after the
+# first attempt so retries within a run don't re-post. CODEX_FAILOVER_REQUESTED
+# records whether Codex was actually engaged (the helper posted, or found an
+# existing trigger on HEAD) — surfaced in the JSON so the caller can downgrade a
+# rate_limit_stalled (exit 5) from a hard human-alert to a non-blocking note.
+CODEX_FAILOVER_FIRED=false
+CODEX_FAILOVER_REQUESTED=false
 STATUS_PROBE_JSON=$(jq -nc \
   --argjson enabled "$([ "$STATUS_PROBE_ENABLED" = "true" ] && echo true || echo false)" \
   '{enabled:$enabled, posted:false, reply_present:false, reply:null, waited_seconds:0}')
@@ -1215,6 +1237,7 @@ emit_json_and_exit() {
     --argjson resume_retries "$RESUME_RETRIES" \
     --argjson status_probe "$STATUS_PROBE_JSON" \
     --argjson waited_seconds "$waited" \
+    --argjson codex_failover_requested "$CODEX_FAILOVER_REQUESTED" \
     '{
       pr_number: $pr_number,
       repo: $repo,
@@ -1228,7 +1251,8 @@ emit_json_and_exit() {
       rate_limit_retries: $rate_limit_retries,
       resume_retries: $resume_retries,
       status_probe: $status_probe,
-      waited_seconds: $waited_seconds
+      waited_seconds: $waited_seconds,
+      codex_failover_requested: $codex_failover_requested
     }'
 
   exit "$exit_code"
@@ -1463,6 +1487,26 @@ while :; do
         continue
       fi
       LAST_RATE_LIMIT_COMMENT_ID=$COMMENT_ID
+
+      # #489: fire the Codex failover once, on the first rate-limit notice, so
+      # Codex (the real blocking gate) reviews in parallel instead of the PR
+      # idling on CodeRabbit's hourly allowance. Fired BEFORE the stall checks
+      # below so a budget/retry stall still leaves Codex engaged. Idempotent +
+      # HEAD-pinned: --trigger-only posts at most one @codex trigger per HEAD
+      # (its own scan dedupes across runs); the FIRED latch prevents re-posting
+      # across this run's retries. MERGEPATH_PHASE_4A_GATED=true forces the
+      # request even when codex.request_by_default is false; if Codex is
+      # disabled/opted out the helper no-ops and the failover stays unrecorded.
+      if [ "$CODEX_FAILOVER_ON_RATE_LIMIT" != "false" ] && [ "$CODEX_FAILOVER_FIRED" != "true" ]; then
+        CODEX_FAILOVER_FIRED=true
+        log "codex failover: CodeRabbit rate-limited — requesting @codex review (trigger-only)"
+        if MERGEPATH_PHASE_4A_GATED=true "$CODEX_REQUEST_CMD" --trigger-only "$PR_NUMBER" "$REPO" >&2; then
+          CODEX_FAILOVER_REQUESTED=true
+          log "codex failover: @codex review requested (or already present) on HEAD"
+        else
+          log "codex failover: codex-review-request did not post (Codex disabled/opted out or read error) — continuing CodeRabbit retry"
+        fi
+      fi
 
       if [ "$RATE_LIMIT_RETRIES" -ge "$MAX_RATE_LIMIT_RETRIES" ]; then
         log "max_rate_limit_retries ($MAX_RATE_LIMIT_RETRIES) exceeded — stalling"
