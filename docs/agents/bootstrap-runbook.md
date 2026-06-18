@@ -131,9 +131,10 @@ Implementation: `scripts/bootstrap/github-infra.sh`.
 1. `gh repo create --source=. --push` against the target dir — creates
    the remote and pushes the bootstrap commit. Legitimate push to main
    on a greenfield remote (no `main` to protect yet).
-2. Seed the 11 canonical labels (`needs-external-review`,
+2. Seed the 12 canonical labels (`needs-external-review`,
    `needs-human-review`, `policy-violation`, `human-hold`,
-   `human-action`, `agent-action`, `phase-0` through `phase-4`).
+   `human-action`, `decision-needed`, `agent-action`,
+   `phase-0` through `phase-4`).
 3. Invite reviewer-identity collaborators (`nathanpayne-claude`,
    `-cursor`, `-codex` per `--reviewers`). Each invite is async; the
    wizard pauses for the human to accept each in the agent account's
@@ -413,7 +414,7 @@ And on GitHub:
 
 - Remote repo `nathanjohnpayne/<repo>` with the bootstrap commit pushed
   to main.
-- 11 canonical labels.
+- 12 canonical labels.
 - Reviewer-identity collaborators invited.
 - `REVIEWER_ASSIGNMENT_TOKEN` repo secret set.
 - `AUTHOR_MERGE_TOKEN` unset by default (the wizard does not provision
