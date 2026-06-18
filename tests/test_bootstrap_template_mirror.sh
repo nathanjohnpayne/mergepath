@@ -128,8 +128,9 @@ echo "dist artifact" >"$FAKE_MP/dist/output.tgz"
 echo "mergepath internal" >"$FAKE_MP/mergepath/internal.md"
 echo "packaging metadata" >"$FAKE_MP/packaging/meta.json"
 echo "policy sim" >"$FAKE_MP/scripts/policy-sim.sh"
-echo "version: 1" >"$FAKE_MP/.mergepath-sync.yml"
 echo "version: 1" >"$FAKE_MP/.mergepath-project-docs.yml"
+mkdir -p "$FAKE_MP/docs/projects/mergepath/prds"
+echo "generated prd mirror" >"$FAKE_MP/docs/projects/mergepath/prds/mergepath.md"
 echo "old log" >"$FAKE_MP/.bootstrap-log"
 echo "old state" >"$FAKE_MP/.bootstrap-state"
 
@@ -216,8 +217,8 @@ for excluded in \
   'specs/mergepath_playground.md' \
   'plans/mergepath-playground.md' \
   'scripts/policy-sim.sh' \
-  '.mergepath-sync.yml' \
   '.mergepath-project-docs.yml' \
+  'docs/projects' \
   'bugs/screenshots' \
   '.github/screenshots' ; do
   # Skip .git — the stage init step creates a fresh .git/ in the target.

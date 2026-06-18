@@ -345,10 +345,11 @@ preflight() {
   #    substitution renames the keys to e.g. `<new-repo>_playground` — see
   #    Codex round 3 P1 on #233).
   #
-  #    Note: the bootstrap mirror EXCLUDES the orchestrator manifests
-  #    (`.mergepath-sync.yml`, `.mergepath-project-docs.yml`) so neither
-  #    leaks into a new repo — their self-references misfire in a copied
-  #    context (see template-mirror.sh BOOTSTRAP_MIRROR_EXCLUDES).
+  #    Note: the bootstrap mirror EXCLUDES the project-doc orchestrator
+  #    surface (`.mergepath-project-docs.yml` and generated `docs/projects/`
+  #    mirrors) so it never leaks into a new repo — `path_hint: .` and the
+  #    generated mirrors misfire in a copied context (see template-mirror.sh
+  #    BOOTSTRAP_MIRROR_EXCLUDES).
   #    Treating a missing yq as a soft warning inside the stage was
   #    unsafe: the stage would return 0 + record completion and ship
   #    a target with stale playground metadata.

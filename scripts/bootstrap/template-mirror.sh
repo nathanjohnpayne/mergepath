@@ -54,15 +54,21 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   'mergepath/'
   'packaging/'
 
-  # Mergepath orchestrator manifests — must NEVER propagate. Their self-
-  # references misfire in a copied context: .mergepath-project-docs.yml has a
-  # `path_hint: .` that would resolve a bootstrapped consumer as the mergepath
-  # owner (so project-doc-sync could mirror the consumer's specs/ into
-  # docs/projects/mergepath/specs/ or rewrite a Mergepath PRD mirror), and
-  # .mergepath-sync.yml would make a consumer try to propagate to other
-  # consumers. Codex P2 on #509.
-  '.mergepath-sync.yml'
+  # Project-doc orchestrator surface — must NEVER propagate into a new repo.
+  # .mergepath-project-docs.yml has a `path_hint: .` that would resolve a
+  # bootstrapped consumer as the mergepath owner (so project-doc-sync could
+  # mirror the consumer's specs/ into docs/projects/mergepath/specs/ or rewrite
+  # a Mergepath PRD mirror), and docs/projects/ holds generated PRD/spec mirrors
+  # an agent in the consumer would otherwise read as that repo's product
+  # context. Codex P2 on #509.
+  #
+  # NB: .mergepath-sync.yml is intentionally NOT excluded here — check_sync_manifest
+  # keys "is this Mergepath?" off scripts/sync-to-downstream.sh, so dropping the
+  # manifest alone (without the engine) makes a generated repo fail lint
+  # (Codex P1 on #509). Fully de-Mergepath-ing the sync engine from bootstrap is
+  # a separate, larger change.
   '.mergepath-project-docs.yml'
+  'docs/projects/'
 
   # Local operator state under .claude/
   '.claude/worktrees/'
