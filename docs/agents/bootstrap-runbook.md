@@ -229,10 +229,10 @@ Implementation: `scripts/bootstrap/board-and-summary.sh`.
      / Done), then `gh project edit --readme "..."`.
    - `--project <N>`: reuse existing project; skip create + field-
      create + readme writes.
-2. **Empty PRD/spec/plan scaffolds.** Always run (even when
+2. **Empty implementation-spec / plan scaffolds.** Always run (even when
    `--skip-board` skips sub-step 1):
    - `specs/<repo>.md` — placeholder with the wizard's
-     "deliberate-not-in-scope" note.
+     "deliberate-not-in-scope" note for repo-local behavior specs.
    - `plans/<repo>-sprint-0.md` — same shape.
    - `scripts/gh-projects/examples/<repo>/create-issues.sh` — minimal
      issue-seeding skeleton with `<repo>` placeholders. Executable.
@@ -248,7 +248,9 @@ Implementation: `scripts/bootstrap/board-and-summary.sh`.
    - `CROSS-REPO LOOP UPDATE` — pointer to the Mergepath PR opened in
      stage B (or a manual-action note if anchors were absent).
    - `NEXT STEPS (human-action)` — the explicit checklist of things
-     the operator owns: accept invites, write the PRD, populate
+     the operator owns: accept invites, write the canonical PRD in
+     `nathanjohnpayne/docs/projects/<repo>/prds/`, fill the repo-local
+     implementation spec, populate
      issues, set spend caps, drive Sprint 0.
 
 The project-board calls are `gh` write paths and run under the same
@@ -351,8 +353,11 @@ summary block enumerates them; this section is the canonical reference:
    for review-readiness.
 4. **Install the CodeRabbit App.** Same shape: wizard prints the URL,
    human accepts.
-5. **Write the PRD / spec.** The wizard creates an empty
-   `specs/<repo>.md` placeholder. The human writes the actual content.
+5. **Write the PRD and implementation spec.** The canonical PRD belongs
+   in `nathanjohnpayne/docs/projects/<repo>/prds/`; the wizard-created
+   `specs/<repo>.md` placeholder is the repo-local implementation spec.
+   `scripts/project-doc-sync.sh` is responsible for generated PRD/spec
+   mirrors once the project is added to `.mergepath-project-docs.yml`.
 6. **Populate Phase 0 / Phase 1 issues.** The wizard creates the
    `scripts/gh-projects/examples/<repo>/create-issues.sh` skeleton.
    The human fills it in and runs it.
@@ -399,7 +404,7 @@ By the end of a successful run, the target dir contains:
 - `.bootstrap-log` — full transcript of every side effect + the
   end-of-run summary block.
 - `.bootstrap-state` — append-only list of completed stages.
-- `specs/<repo>.md` — placeholder PRD/spec.
+- `specs/<repo>.md` — placeholder implementation spec.
 - `plans/<repo>-sprint-0.md` — placeholder Sprint 0 plan.
 - `scripts/gh-projects/examples/<repo>/create-issues.sh` — placeholder
   issue-seeding skeleton (executable).

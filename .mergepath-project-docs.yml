@@ -1,0 +1,99 @@
+# .mergepath-project-docs.yml
+#
+# Project documentation sync manifest.
+#
+# This is separate from .mergepath-sync.yml because the source graph is
+# different: .mergepath-sync.yml mirrors Mergepath template files out to
+# consumers, while this manifest syncs project context between the central
+# docs vault and each owning repo.
+
+version: 1
+
+central_repo:
+  name: docs
+  repo: nathanjohnpayne/docs
+  path_hint: ../docs
+
+projects:
+  - slug: mergepath
+    owner:
+      name: mergepath
+      repo: nathanjohnpayne/mergepath
+      path_hint: .
+    prds:
+      - slug: mergepath
+        source: projects/mergepath/prds/mergepath.md
+        mirror: docs/projects/mergepath/prds/mergepath.md
+    specs:
+      - source: specs/
+        mirror: projects/mergepath/specs/
+
+  - slug: matchline
+    owner:
+      name: matchline
+      repo: nathanjohnpayne/matchline
+      path_hint: ../matchline
+    prds:
+      - slug: matchline
+        source: projects/matchline/prds/matchline.md
+        mirror: docs/projects/matchline/prds/matchline.md
+    specs:
+      - source: specs/
+        mirror: projects/matchline/specs/
+
+  - slug: nathanpaynedotcom
+    owner:
+      name: nathanpaynedotcom
+      repo: nathanjohnpayne/nathanpaynedotcom
+      path_hint: ../nathanpaynedotcom
+    prds:
+      - slug: nathanpaynedotcom
+        source: projects/nathanpaynedotcom/prds/nathanpaynedotcom.md
+        mirror: docs/projects/nathanpaynedotcom/prds/nathanpaynedotcom.md
+    specs:
+      - source: specs/
+        mirror: projects/nathanpaynedotcom/specs/
+
+  - slug: overridebroadway
+    owner:
+      name: overridebroadway
+      repo: nathanjohnpayne/overridebroadway
+      path_hint: ../overridebroadway
+    prds:
+      - slug: overridebroadway
+        source: projects/overridebroadway/prds/overridebroadway.md
+        mirror: docs/projects/overridebroadway/prds/overridebroadway.md
+    specs:
+      - source: specs/
+        mirror: projects/overridebroadway/specs/
+
+  - slug: device-source-of-truth
+    owner:
+      name: device-source-of-truth
+      repo: nathanjohnpayne/device-source-of-truth
+      path_hint: ../device-source-of-truth
+    prds:
+      - slug: device-source-of-truth
+        source: projects/device-source-of-truth/prds/device-source-of-truth.md
+        mirror: docs/projects/device-source-of-truth/prds/device-source-of-truth.md
+    specs:
+      - source: specs/
+        mirror: projects/device-source-of-truth/specs/
+
+  - slug: friends-and-family-billing
+    owner:
+      name: friends-and-family-billing
+      repo: nathanjohnpayne/friends-and-family-billing
+      path_hint: ../friends-and-family-billing
+    specs:
+      - source: specs/
+        mirror: projects/friends-and-family-billing/specs/
+
+  - slug: swipewatch
+    owner:
+      name: swipewatch
+      repo: nathanjohnpayne/swipewatch
+      path_hint: ../swipewatch
+    specs:
+      - source: specs/
+        mirror: projects/swipewatch/specs/

@@ -8,6 +8,13 @@ Read in this order before taking any action:
 4. Relevant `specs/` files — understand intended behavior
 5. `.ai_context.md` — load supplemental context
 
+If `docs/projects/<project>/prds/` exists in the repo, read the
+generated PRD mirror as product context. Do not edit that mirror
+directly; edit the canonical PRD in
+`nathanjohnpayne/docs/projects/<project>/prds/`. Implementation
+behavior changes still belong in the owning repo's `specs/`, policy
+files, scripts, and tests.
+
 Conflict resolution:
 
 - If code conflicts with `specs/`: flag the conflict, update spec or
