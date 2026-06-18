@@ -3,7 +3,7 @@ generated_by: scripts/project-doc-sync.sh
 do_not_edit: true
 source_repo: nathanjohnpayne/docs
 source_path: projects/mergepath/prds/mergepath.md
-source_ref: 49b1a75
+source_ref: 1cee969
 project: mergepath
 document_class: prd
 document_slug: mergepath
@@ -180,7 +180,7 @@ Both gates follow the same narrow-start posture as `codex.p1_gate`: enabled in M
 
 ### 4. CI Enforcement of Standards
 
-A large suite of validation checks (44 wired `scripts/ci/check_*` steps as of v1.3, plus two inline steps) runs on every commit via `repo_lint.yml`. A meta-check, `check_ci_scripts_wired`, fails the build if any `scripts/ci/check_*` script on disk is not wired into `repo_lint.yml` as an explicit `run:` step (or carries a documented `# WIRED-EXEMPT` comment), so the on-disk list and the executable list cannot silently diverge. The structural core:
+A large suite of validation checks (43 wired `scripts/ci/check_*` steps as of v1.3 — 44 on disk, with `check_op_firebase_deploy_integration` intentionally `WIRED-EXEMPT` — plus two inline steps) runs on every commit via `repo_lint.yml`. A meta-check, `check_ci_scripts_wired`, fails the build if any `scripts/ci/check_*` script on disk is not wired into `repo_lint.yml` as an explicit `run:` step (or carries a documented `# WIRED-EXEMPT` comment), so the on-disk list and the executable list cannot silently diverge. The structural core:
 
 - `check_required_root_files` — all canonical docs exist
 - `check_no_tool_folder_instructions` — tool folders contain no duplicated behavioral rules
@@ -189,7 +189,7 @@ A large suite of validation checks (44 wired `scripts/ci/check_*` steps as of v1
 - `check_spec_test_alignment` — specs have corresponding tests (matched by `spec_id` frontmatter, `tests:` mapping, or filename convention)
 - `check_duplicate_docs` — no instruction duplication
 
-`repo_lint.yml` also includes an inline `check_review_policy_exists` step that verifies `.github/review-policy.yml` and `REVIEW_POLICY.md` both exist.
+`repo_lint.yml` also includes two inline (non-`scripts/ci`) steps: `check_review_policy_exists`, which verifies `.github/review-policy.yml` and `REVIEW_POLICY.md` both exist, and `check_governance_files`, which verifies `SECURITY.md`, `.github/CODEOWNERS`, and `.github/dependabot.yml` all exist.
 
 Plus the review/automation surface checks: `check_codex_scripts`, `check_codex_p1_gate`, `check_merge_clearance_gate`, `check_gh_as_author`, `check_no_bare_gh_writes`, `check_disagreement_detector`, `check_pr_audit_codex_clearance`, `check_pr_audit_sync_exemption`, `check_resolve_pr_threads`, `check_phase_4b_classifier`, `check_op_preflight_contract`, `check_onepassword_headless_proof_workflow`, `check_daily_feedback_rollup`, `check_workflow_parsers`, `check_auto_clear_workflow`, `check_coderabbit_config` / `check_coderabbit_config_tests` / `check_coderabbit_wait`, `check_eslint_config_present` / `check_eslint_config_policy`, and `check_mktemp_portability`; the sync/propagation checks `check_sync_manifest`, `check_sync_overrides`, `check_verify_propagation_pr`, `check_workflow_verify_propagation_templated`, `check_propagation_lane_audit`, `check_template_substitution`, `check_export_consumer_facts`, and `check_sweep_unresolved_feedback`; the bootstrap suite (`check_bootstrap_sh`, `check_bootstrap_wizard`, `check_bootstrap_template_mirror`, `check_bootstrap_github_infra`, `check_bootstrap_firebase_and_codereview`, `check_bootstrap_board_and_summary`); and regression-pinning checks named for the bug class they preserve (`check_canonical_bugs_*`). `check_op_firebase_deploy_integration` ships on disk but is intentionally `WIRED-EXEMPT` — an opt-in, local-only resolver smoke test gated on `MERGEPATH_RUN_INTEGRATION=1`. Each script-backed `scripts/ci/check_*` wrapper is fail-closed around a `tests/test_*.sh` suite; a missing test script is a hard error, not a silent skip. `.github/workflows/repo_lint.yml` is the executable source of truth for which checks run; `rules/repo_rules.md` § CI Enforcement and `scripts/ci/README.md` summarize them and must be kept in lockstep with it.
 
@@ -1115,6 +1115,12 @@ test_globs:
 **What it checks:** Both `.github/review-policy.yml` and `REVIEW_POLICY.md` exist.
 
 **Why:** The code review system depends on both files. If either is missing, the system breaks.
+
+#### Inline in `repo_lint.yml`: `check_governance_files`
+
+**What it checks:** `SECURITY.md`, `.github/CODEOWNERS`, and `.github/dependabot.yml` all exist.
+
+**Why:** These governance files anchor security disclosure, code ownership, and dependency automation; a missing one silently weakens the repo's baseline posture.
 
 #### Additional Review, Sync, and Bootstrap Checks
 
