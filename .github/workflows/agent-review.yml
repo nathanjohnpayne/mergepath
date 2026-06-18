@@ -785,21 +785,39 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           REPO: ${{ github.repository }}
+          TEST_CHECK_WAIT_SECONDS: 1200
+          TEST_CHECK_POLL_SECONDS: 15
         run: |
+          wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
+          poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
+          deadline=$((SECONDS + wait_seconds))
           sha=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)
-          run=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
-            --jq '[.check_runs[] | select(.name == "test")] | sort_by(.started_at // .created_at) | last // empty')
-          if [ -z "$run" ]; then
-            echo "::error::Required check run 'test' is absent on current HEAD $sha; refusing auto-merge."
-            exit 1
-          fi
-          status=$(printf '%s' "$run" | jq -r '.status')
-          conclusion=$(printf '%s' "$run" | jq -r '.conclusion // ""')
-          if [ "$status" != "completed" ] || [ "$conclusion" != "success" ]; then
-            echo "::error::Required check run 'test' is not successful on current HEAD $sha (status=$status conclusion=${conclusion:-none}); refusing auto-merge."
-            exit 1
-          fi
-          echo "Required check run 'test' is successful on current HEAD $sha."
+          while :; do
+            run=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
+              --jq '[.check_runs[] | select(.name == "test")] | sort_by(.started_at // .created_at) | last // empty')
+            if [ -n "$run" ]; then
+              status=$(printf '%s' "$run" | jq -r '.status')
+              conclusion=$(printf '%s' "$run" | jq -r '.conclusion // ""')
+              if [ "$status" = "completed" ]; then
+                if [ "$conclusion" = "success" ]; then
+                  echo "Required check run 'test' is successful on current HEAD $sha."
+                  exit 0
+                fi
+                echo "::error::Required check run 'test' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
+                exit 1
+              fi
+              echo "::notice::Required check run 'test' is $status on current HEAD $sha; waiting for completion."
+            else
+              echo "::notice::Required check run 'test' is absent on current HEAD $sha; waiting for it to start."
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Required check run 'test' did not complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
+              exit 1
+            fi
+            sleep "$poll_seconds"
+          done
+          echo "::error::Required check run 'test' wait loop ended unexpectedly; refusing auto-merge."
+          exit 1
 
       - name: Enable auto-merge
         if: steps.author_merge_token.outputs.enabled == 'true'
