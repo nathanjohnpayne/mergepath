@@ -54,6 +54,16 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   'mergepath/'
   'packaging/'
 
+  # Mergepath orchestrator manifests — must NEVER propagate. Their self-
+  # references misfire in a copied context: .mergepath-project-docs.yml has a
+  # `path_hint: .` that would resolve a bootstrapped consumer as the mergepath
+  # owner (so project-doc-sync could mirror the consumer's specs/ into
+  # docs/projects/mergepath/specs/ or rewrite a Mergepath PRD mirror), and
+  # .mergepath-sync.yml would make a consumer try to propagate to other
+  # consumers. Codex P2 on #509.
+  '.mergepath-sync.yml'
+  '.mergepath-project-docs.yml'
+
   # Local operator state under .claude/
   '.claude/worktrees/'
   '.claude/settings.local.json'
