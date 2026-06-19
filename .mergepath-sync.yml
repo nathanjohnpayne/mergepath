@@ -498,6 +498,14 @@ paths:
   - path: tests/test_codex_review_request_ack.sh
     type: canonical
     consumers: all
+  # #489 CodeRabbit-rate-limit Codex-failover trigger-only path of
+  # codex-review-request.sh (posts `@codex review` when CodeRabbit is rate-
+  # limited). check_codex_scripts hard-runs it (same `No such file` exit-127
+  # closure class as the ack suite above), so it must travel to every consumer.
+  # Undeclared by #489; surfaced by the swipewatch canary on the 2120dec wave.
+  - path: tests/test_codex_review_request_trigger_only.sh
+    type: canonical
+    consumers: all
   # Phase 4a entry-decision regression (#486): codex.request_by_default +
   # codex.enabled gating of whether `@codex review` is posted at all.
   # check_codex_scripts hard-runs it (same `No such file` exit-127 coupling
@@ -755,6 +763,8 @@ paths:
       - "tests/test_export_consumer_facts.sh"  # check_export_consumer_facts
       - "tests/test_check_coderabbit_config.sh"  # check_coderabbit_config_tests (#481/#482)
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
+      - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)
+      - "tests/test_codex_review_request_entry.sh"  # check_codex_scripts (#486)
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
       - "tests/test_465_fail_closed.sh"        # check_codex_scripts (#465)
       - "tests/test_codex_record_feedback.sh"  # check_codex_scripts (#487)
