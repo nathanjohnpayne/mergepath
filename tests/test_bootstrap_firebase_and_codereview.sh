@@ -28,6 +28,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/scripts/bootstrap-new-repo.sh"
+FIREBASE_SETUP_SCRIPT="$ROOT/scripts/firebase/op-firebase-setup"
 
 if ! command -v rsync >/dev/null 2>&1; then
   echo "SKIP: rsync not installed" >&2; exit 0
@@ -40,6 +41,7 @@ if ! yq --version 2>&1 | grep -q "mikefarah/yq"; then
 fi
 
 [ -x "$SCRIPT" ] || { echo "missing or non-executable $SCRIPT" >&2; exit 1; }
+[ -x "$FIREBASE_SETUP_SCRIPT" ] || { echo "missing or non-executable $FIREBASE_SETUP_SCRIPT" >&2; exit 1; }
 
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/test-firebase-codereview.XXXXXX")
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -47,6 +49,12 @@ trap 'rm -rf "$WORKDIR"' EXIT
 PASS=0; FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+
+# Static setup contract: Firebase Functions v2 deploy analysis needs
+# secretmanager.secrets.get for defineSecret() declarations.
+grep -q 'roles/secretmanager.viewer' "$FIREBASE_SETUP_SCRIPT" \
+  && pass "op-firebase-setup grants Secret Manager metadata reads for functions secrets" \
+  || fail "op-firebase-setup must grant roles/secretmanager.viewer for Firebase Functions defineSecret deploys"
 
 # --- build fixture mergepath ----------------------------------------------
 # Sub-B (template-mirror) rsyncs from a fixture mergepath into the

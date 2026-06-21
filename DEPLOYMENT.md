@@ -641,6 +641,7 @@ FIREBASE_IMPERSONATION_MEMBER=email@example.com op-firebase-setup {project-id}
 3. Grants the deployer service account these project roles:
    - `roles/firebase.admin`
    - `roles/cloudfunctions.admin`
+   - `roles/secretmanager.viewer`
    - `roles/iam.serviceAccountUser`
    - `roles/artifactregistry.writer`
    - `roles/run.admin`
