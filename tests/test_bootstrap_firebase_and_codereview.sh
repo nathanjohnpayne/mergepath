@@ -52,7 +52,7 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
 # Static setup contract: Firebase Functions v2 deploy analysis needs
 # secretmanager.secrets.get for defineSecret() declarations.
-grep -q 'roles/secretmanager.viewer' "$FIREBASE_SETUP_SCRIPT" \
+grep -Fq 'roles/secretmanager.viewer' "$FIREBASE_SETUP_SCRIPT" \
   && pass "op-firebase-setup grants Secret Manager metadata reads for functions secrets" \
   || fail "op-firebase-setup must grant roles/secretmanager.viewer for Firebase Functions defineSecret deploys"
 
