@@ -29,6 +29,7 @@ MEMBER_EMAIL="${FIREBASE_IMPERSONATION_MEMBER:-}"
 ROLES=(
   roles/firebase.admin
   roles/cloudfunctions.admin
+  roles/secretmanager.viewer
   roles/iam.serviceAccountUser
   roles/artifactregistry.writer
   roles/run.admin
