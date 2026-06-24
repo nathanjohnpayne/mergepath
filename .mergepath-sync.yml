@@ -290,6 +290,15 @@ paths:
     # token-derived expected-reviewer allow-list; exits 3 if absent.
     requires:
       - "scripts/lib/reviewers-helpers.sh"
+  # #489 CodeRabbit-rate-limit auto-merge disposition gate. agent-review.yml's
+  # exit-5 (rate-limited) branch calls this script to decide whether the
+  # Codex-failover path may auto-merge. Absent on a consumer it exits 127 and
+  # the workflow's `else` blocks auto-merge — fail-safe, but the PR loses the
+  # #489 nuanced disposition. Referenced by .github/workflows/agent-review.yml;
+  # undeclared by #489, surfaced by the fabb2b1 wave's @codex pass (#521).
+  - path: scripts/coderabbit-automerge-rate-limit-gate.sh
+    type: canonical
+    consumers: all
   - path: scripts/codex-review-request.sh
     type: canonical
     consumers: all
@@ -465,6 +474,17 @@ paths:
   # posted (bounded by max_resume_retries) and never exits 4, and a
   # non-base-branch / draft PR surfaces skip_reason instead of timing out.
   - path: tests/test_coderabbit_wait_paused.sh
+    type: canonical
+    consumers: all
+  # #489 CodeRabbit-rate-limit Codex-failover suite. Both are hard-required
+  # (exit 1 if missing) by scripts/ci/check_coderabbit_wait, and the gate test
+  # additionally runs scripts/coderabbit-automerge-rate-limit-gate.sh, so both
+  # must travel to every consumer. Undeclared by #489; surfaced by the fabb2b1
+  # wave's @codex review pass (#521), same closure class as #519.
+  - path: tests/test_coderabbit_wait_codex_failover.sh
+    type: canonical
+    consumers: all
+  - path: tests/test_coderabbit_automerge_rate_limit_gate.sh
     type: canonical
     consumers: all
   # Pairs with scripts/workflow/verify-propagation-pr.sh (under the
@@ -753,6 +773,8 @@ paths:
       - "tests/test_coderabbit_wait_status_probe.sh"  # check_coderabbit_wait
       - "tests/test_coderabbit_wait_identity_derivation.sh"  # check_coderabbit_wait (#438)
       - "tests/test_coderabbit_wait_paused.sh"  # check_coderabbit_wait (#490)
+      - "tests/test_coderabbit_wait_codex_failover.sh"  # check_coderabbit_wait (#489/#521)
+      - "tests/test_coderabbit_automerge_rate_limit_gate.sh"  # check_coderabbit_wait (#489/#521)
       - "tests/test_codex_p1_gate.sh"          # check_codex_p1_gate
       - "tests/test_merge_clearance_gate.sh"   # check_merge_clearance_gate
       - "tests/test_disagreement_detector.sh"  # check_disagreement_detector
@@ -782,6 +804,7 @@ paths:
       - "scripts/gh-as-author.sh"              # check_gh_as_author (transitive)
       - "scripts/gh-as-reviewer.sh"            # check_gh_as_author (transitive)
       - "scripts/hooks/gh-pr-guard.sh"         # tests/test_gh_pr_guard.sh runs it
+      - "scripts/coderabbit-automerge-rate-limit-gate.sh"  # tests/test_coderabbit_automerge_rate_limit_gate.sh runs it (#489/#521)
       - "scripts/workflow/"                    # check_workflow_parsers
       - ".github/workflows/agent-review.yml"   # check_disagreement_detector structural assertion
       - ".github/workflows/codex-p1-gate.yml"  # check_codex_p1_gate workflow shape
