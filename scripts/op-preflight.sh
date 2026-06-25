@@ -156,12 +156,20 @@ ssh_host_for() {
 }
 
 # ── Cache layout ──────────────────────────────────────────────────────
-# Cache directory is intentionally shared across all consumer repos:
-#   - The session file is keyed by --agent (see SESSION_FILE below).
-#   - PATs are agent-keyed and currently uniform across the Phase 4
-#     propagation set, so a shared cache is functionally correct.
-# Re-evaluate if per-repo PATs ever diverge — at that point, namespace
-# the cache path per consumer repo (e.g. $HOME/.cache/mergepath/$REPO).
+# Cache directory is intentionally shared across all consumer repos and is
+# NOT namespaced per repo. The session file is keyed by --agent (see
+# SESSION_FILE below), and each agent's credentials are per-identity and
+# machine-wide: one reviewer PAT per agent, not per-repo (see CLAUDE.md /
+# REVIEW_POLICY.md PAT lookup table). So the same agent's cached token is
+# identical regardless of which repo invoked preflight — a shared,
+# agent-keyed cache is correct today and a per-repo cache would only
+# duplicate identical material.
+#
+# Per-repo namespacing (e.g. $HOME/.cache/mergepath/$REPO) is a DEFERRED
+# fleet-wide architecture decision (mergepath#532), to revisit only if any
+# consumer ever needs a repo-scoped PAT for the same agent. Until then, do
+# NOT namespace this path — it would fragment the cache and multiply the
+# biometric burst across repos for no security gain.
 DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mergepath"
 CACHE_DIR="${OP_PREFLIGHT_CACHE_DIR:-$DEFAULT_CACHE_DIR}"
 DEFAULT_TTL_SECONDS=14400  # 4 hours
@@ -237,8 +245,16 @@ if $PURGE_ALL; then
   exit 0
 fi
 
-if [[ "$MODE" == "review" || "$MODE" == "all" || "$PURGE" == "true" || "$CHECK" == "true" ]] && [[ -z "$AGENT" ]]; then
-  echo "Error: --agent is required for review, all, --purge, or --check mode." >&2
+# --agent is required for every mode except --purge-all (handled above).
+# `deploy` MUST stay in this gate: cache paths are unconditionally
+# $AGENT-interpolated (op-preflight-$AGENT.env / -adc.json /
+# -firebase-sa.json), so `--mode deploy` with no --agent writes a shared
+# anonymous ("") bucket that `--purge --agent <name>` can never reclaim and
+# that concurrent agent sessions clobber. This was added in #259, silently
+# dropped by a bulk sync, and restored in #534 — the regression test
+# test_deploy_mode_requires_agent guards against another drop.
+if [[ "$MODE" == "review" || "$MODE" == "all" || "$MODE" == "deploy" || "$PURGE" == "true" || "$CHECK" == "true" ]] && [[ -z "$AGENT" ]]; then
+  echo "Error: --agent is required for review, deploy, all, --purge, or --check mode." >&2
   echo "Usage: eval \"\$(scripts/op-preflight.sh --agent claude --mode review)\"" >&2
   exit 1
 fi
@@ -787,6 +803,12 @@ emit_from_session_file() (
   fi
   printf 'export OP_PREFLIGHT_DONE=1\n'
   printf 'export OP_PREFLIGHT_AGENT=%q\n' "$AGENT"
+  # Keep exporting the preflight mode on the cache-hit path (#521): a
+  # consumer that evals this output (e.g. a deploy wrapper that took the
+  # fast path and skipped a fresh fetch) can read OP_PREFLIGHT_MODE to see
+  # which mode actually ran. $MODE is this invocation's mode, which the
+  # cross-mode validation above already proved the cache satisfies.
+  printf 'export OP_PREFLIGHT_MODE=%q\n' "$MODE"
   exit 0
 )
 
@@ -1143,7 +1165,13 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
     chmod 600 "$ADC_TMPFILE"
 
     log_deploy_biometric_once
-    if op read "$DEFAULT_ADC_OP_URI" > "$ADC_TMPFILE" 2>/dev/null && [[ -s "$ADC_TMPFILE" ]]; then
+    # Capture op's stderr so the could-not-read warning can say WHY (vault
+    # locked / item not found / sign-in expired) instead of a bare "not
+    # available" (#534.3). Routed through scrub_op_error so a service-account
+    # token can never leak into the diagnostic, mirroring the Phase 1 reader.
+    ADC_OP_ERR="$(mktemp "${TMPDIR:-/tmp}/op-preflight-adc-err.XXXXXX")"
+    if op read "$DEFAULT_ADC_OP_URI" > "$ADC_TMPFILE" 2>"$ADC_OP_ERR" && [[ -s "$ADC_TMPFILE" ]]; then
+      rm -f "$ADC_OP_ERR"
       if adc_is_usable "$ADC_TMPFILE"; then
         EXPORTS+=("export GOOGLE_APPLICATION_CREDENTIALS=$(printf '%q' "$ADC_TMPFILE")")
         EXPORTS+=("export OP_PREFLIGHT_ADC_TMPFILE=$(printf '%q' "$ADC_TMPFILE")")
@@ -1154,11 +1182,25 @@ if [[ "$MODE" == "deploy" || "$MODE" == "all" ]]; then
         rm -f "$ADC_TMPFILE"
         log_stale_adc_guidance
         SUMMARY+=("GCP ADC: STALE (refresh_token rejected — see warning above)")
+        # Fail closed (#534.2): under `--mode deploy` a deploy script needs a
+        # real credential. Degrading in place (continuing to OP_PREFLIGHT_DONE=1
+        # with no GOOGLE_APPLICATION_CREDENTIALS) is the cache-hit path's
+        # `exit 2` failure mode replayed on the full-fetch path — symmetric to
+        # the line-696 cache-hit guard. `--mode all` deliberately keeps
+        # degrading (callers still want the PATs), so scope this to deploy.
+        if [[ "$MODE" == "deploy" ]]; then exit 1; fi
       fi
     else
-      rm -f "$ADC_TMPFILE"
-      echo "# Warning: could not read GCP ADC. Deploy credentials not cached." >&2
+      adc_op_reason="$(scrub_op_error "$ADC_OP_ERR")"
+      rm -f "$ADC_TMPFILE" "$ADC_OP_ERR"
+      if [[ -n "$adc_op_reason" ]]; then
+        echo "# Warning: could not read GCP ADC. Deploy credentials not cached. (op: ${adc_op_reason})" >&2
+      else
+        echo "# Warning: could not read GCP ADC. Deploy credentials not cached." >&2
+      fi
       SUMMARY+=("GCP ADC: SKIPPED (not available)")
+      # Fail closed (#534.2): see STALE branch above.
+      if [[ "$MODE" == "deploy" ]]; then exit 1; fi
     fi
   fi
 
@@ -1206,6 +1248,10 @@ chmod 600 "$SESSION_FILE"
 # ── Output ────────────────────────────────────────────────────────────
 EXPORTS+=("export OP_PREFLIGHT_DONE=1")
 EXPORTS+=("export OP_PREFLIGHT_AGENT=$(printf '%q' "$AGENT")")
+# Export the mode on the full-fetch path too (#521), symmetric to the
+# cache-hit path above, so consumers can read which mode ran regardless of
+# whether the fetch was fresh or a cache hit.
+EXPORTS+=("export OP_PREFLIGHT_MODE=$(printf '%q' "$MODE")")
 
 # Print export statements to stdout (caller evals them)
 for exp in "${EXPORTS[@]}"; do
