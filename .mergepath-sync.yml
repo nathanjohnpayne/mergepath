@@ -275,6 +275,16 @@ paths:
   - path: scripts/lib/manifest-fact-helpers.sh
     type: canonical
     consumers: all
+  # Templated-propagation render engine (#313). Hard-sourced by
+  # scripts/workflow/verify-propagation-pr.sh: the lane verifier now runs
+  # the consumer's OWN copy from the PR base (not the runtime clone —
+  # mergepath#531), so it sources this render lib locally. It must travel
+  # to every consumer that can receive a templated sync PR (the
+  # eslint.config.js entries below cover all 8). Also declared in the
+  # scripts/workflow/ kit requires:.
+  - path: scripts/lib/template-substitution.sh
+    type: canonical
+    consumers: all
   # Shared available_reviewers reader (#453). Hard-required (exit 3 if
   # missing) by coderabbit-wait.sh, codex-review-check.sh, and
   # audit-propagation-lane.sh — the reviewer allow-list parse is a
@@ -823,6 +833,14 @@ paths:
   - path: scripts/workflow/
     type: kit
     consumers: all
+    # verify-propagation-pr.sh (in this kit) now runs as the consumer's
+    # OWN trusted copy from the PR base (mergepath#531) and sources its
+    # render libs locally, so they must travel with the kit. The parser
+    # helpers (parse_manifest_paths.sh, match_protected_paths.sh) are
+    # already inside this kit; the two scripts/lib/ deps are declared here.
+    requires:
+      - "scripts/lib/template-substitution.sh"   # verify-propagation-pr.sh templated render (#531)
+      - "scripts/lib/manifest-fact-helpers.sh"   # verify-propagation-pr.sh consumer-facts load (#531)
 
   # Templated entries — rendered per consumer via scripts/lib/
   # template-substitution.sh using the consumer's facts.* from the

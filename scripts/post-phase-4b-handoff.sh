@@ -306,11 +306,6 @@ fi
 echo '```'
 echo 'PRs ready for external review (Phase 4b):'
 echo
-while IFS=$'\t' read -r _repo _num url _head_short_unused base_short _content _unresolved; do
-  [[ -n "$_repo" ]] || continue
-  # Re-read to get head_short in the right column.
-  :
-done <<<"$ROWS_TSV"
 # Print one URL line per row, with head + base shorts.
 while IFS=$'\t' read -r _repo _num url head_short base_short _content _unresolved; do
   [[ -n "$_repo" ]] || continue

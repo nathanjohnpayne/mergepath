@@ -656,6 +656,45 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 19 (#536): a SINGLE-QUOTED boolean — `enabled: 'true'` — must be
+# parsed as the bare `true`, not the literal `'true'` that trips the
+# true|false validator (exit 2). Before the nested_field quote-strip fix,
+# this aborted with rc=2; now it reads `true` and the gate evaluates
+# normally (APPROVED on HEAD → exit 0 PASS).
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 19: single-quoted enabled: 'true' parses (no validator trip) (#536)"
+SCRATCH=$(mktemp -d "$WORKDIR/scratch.XXXXXX"); mkdir -p "$SCRATCH/.github"
+cat >"$SCRATCH/.github/review-policy.yml" <<EOF
+external_review_threshold: 300
+external_review_paths:
+  - ".github/**"
+
+available_reviewers:
+  - nathanpayne-claude
+
+codex:
+  external_review_gate:
+    enabled: 'false'
+
+dependabot:
+  reviewer_gate:
+    enabled: 'true'
+EOF
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$(jq -n --arg sha "$HEAD_SHA" '
+  [{ user:{login:"nathanpayne-claude"}, state:"APPROVED", commit_id:$sha, submitted_at:"2026-06-01T10:00:00Z" }]
+')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "PASS"; then
+  pass "single-quoted enabled: 'true' parsed as true → gate evaluates (exit 0)"
+else
+  fail "expected rc=0 PASS (single-quote stripped); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
 echo
 echo "============================================"
 echo "test_merge_clearance_gate.sh: $PASS passed, $FAIL failed"

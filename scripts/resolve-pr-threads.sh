@@ -93,7 +93,12 @@
 #   matchline #181, #190, #192 — observed cases of conversation-
 #                                resolution blocker
 
-set -eo pipefail
+set -euo pipefail
+# `-u` added (#536): optionals are already defaulted (MODE/DRY_RUN/
+# RATIONALE_OVERRIDE/etc. at module top, env vars via `${VAR:-}` and the
+# `:=` default for MERGEPATH_AGENT_AUTHORS), and the arg parser guards
+# `$2` behind a `$# -lt 2` short-circuit, so strict unset-variable
+# handling surfaces genuine typos without breaking documented paths.
 
 # --- preflight auto-source (#282) ------------------------------------------
 # If OP_PREFLIGHT_REVIEWER_PAT is unset and a fresh op-preflight cache
@@ -728,12 +733,28 @@ fetch_manifest_templated_dests() {
     #    cautious failure mode: under-classify rather than over-
     #    classify; templated-render is a skip-class, and a missed
     #    skip just falls back to the rollup's general heuristics).
+    #
+    # 3. `consumers: all` parity with the yq path (#521). The yq pass-1
+    #    resolves a scalar `consumers: all` to EVERY consumer's repo slug,
+    #    i.e. match-any-consumer. The awk fallback previously could not
+    #    distinguish `all` from a name list (it never parsed `consumers:`),
+    #    so an `all` templated entry was under-classified along with every
+    #    other entry. We now detect the scalar `consumers: all` per entry
+    #    and emit a dedicated `__AWK_CONSUMERS_ALL__` sentinel, which
+    #    path_matches_templated_dest treats as "match any repo" — mirroring
+    #    the yq semantics. A `consumers:` followed by a name SEQUENCE stays
+    #    the cautious no-scope sentinel (awk can't reliably resolve
+    #    name→repo cross-references), matching the prior behavior for lists.
     MANIFEST_TEMPLATED_DESTS_CACHE=$(awk '
       function emit() {
         if (cur_type == "templated") {
           out = (cur_dest != "" ? cur_dest : cur_path)
           if (out != "") {
-            printf "%s\t__AWK_NO_CONSUMER_SCOPE__\n", out
+            if (cur_consumers_all) {
+              printf "%s\t__AWK_CONSUMERS_ALL__\n", out
+            } else {
+              printf "%s\t__AWK_NO_CONSUMER_SCOPE__\n", out
+            }
           }
         }
       }
@@ -746,7 +767,7 @@ fetch_manifest_templated_dests() {
         sub(/^[[:space:]]*-[[:space:]]*path:[[:space:]]*/, "", cur_path)
         sub(/[[:space:]]*#.*$/, "", cur_path)
         gsub(/^[[:space:]]+|[[:space:]]+$|^"|"$/, "", cur_path)
-        cur_dest = ""; cur_type = ""
+        cur_dest = ""; cur_type = ""; cur_consumers_all = 0
       }
       /^[[:space:]]*dest:/ {
         cur_dest = $0
@@ -756,6 +777,12 @@ fetch_manifest_templated_dests() {
       }
       /^[[:space:]]*type:[[:space:]]*templated/ {
         cur_type = "templated"
+      }
+      # Scalar `consumers: all` (optionally quoted / trailing comment).
+      # A sequence form (`consumers:` then `- name` lines) does NOT match
+      # this pattern, so it correctly falls through to the no-scope sentinel.
+      /^[[:space:]]*consumers:[[:space:]]*["\047]?all["\047]?[[:space:]]*(#.*)?$/ {
+        cur_consumers_all = 1
       }
       END { emit() }
     ' "$manifest")
@@ -780,6 +807,13 @@ path_matches_templated_dest() {
     dest="${line%%$'\t'*}"
     consumers="${line#*$'\t'}"
     [ "$file_path" = "$dest" ] || continue
+    # The awk fallback emits a scalar-`consumers: all` sentinel (#521).
+    # `all` means every consumer is in scope, so the current repo always
+    # qualifies — match unconditionally, mirroring the yq path which
+    # expands `all` to every consumer's repo slug.
+    if [ "$consumers" = "__AWK_CONSUMERS_ALL__" ]; then
+      return 0
+    fi
     # The awk fallback emits this sentinel when it can't resolve
     # consumer-name → repo-slug (cross-references in awk are
     # brittle). Treat sentinel as "no scope information available"

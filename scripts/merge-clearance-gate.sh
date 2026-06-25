@@ -169,8 +169,14 @@ nested_field() {  # <top_block> <sub_block> <field>
     in_sub && /^[[:space:]]{0,3}[^[:space:]#]/ { in_sub=0 }
     in_sub && $1 == fldkey":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^"/, "", $0)
-      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      # Strip BOTH single and double quotes (#536): a single-quoted
+      # scalar like `enabled: '"'"'true'"'"'` previously kept its quotes
+      # and tripped the true|false validator (exit 2). \047 is the octal
+      # escape for a single quote inside the awk character class, mirroring
+      # codex-p1-gate.sh codex_field and the policy parsers in
+      # check_workflow_parsers.
+      gsub(/^["\047]/, "", $0)
+      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
       gsub(/[[:space:]]*#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)
       print

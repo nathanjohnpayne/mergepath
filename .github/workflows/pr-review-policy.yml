@@ -192,13 +192,31 @@ jobs:
               if git clone --quiet --filter=blob:none \
                    https://github.com/nathanjohnpayne/mergepath "$MP_DIR" \
                  && git -C "$MP_DIR" checkout --quiet "$SYNC_SHA" 2>/dev/null; then
-                VERIFIER="$MP_DIR/scripts/workflow/verify-propagation-pr.sh"
-                if [ -x "$VERIFIER" ] || [ -f "$VERIFIER" ]; then
-                  if bash "$VERIFIER" "$MP_DIR" "$PWD" "$BASE_SHA" "$HEAD_SHA"; then
-                    PROPAGATION_LANE=true
+                # #531: run the TRUSTED in-repo verifier from the PR's
+                # BASE commit (propagated + reviewed; the PR cannot edit
+                # its own base), NOT the verifier shipped inside the
+                # runtime-cloned mergepath@<sha>. The clone ($MP_DIR) is
+                # passed only as a DATA source (manifest + canonical
+                # content); no shell is executed out of it. This removes
+                # the RCE surface of running runtime-fetched code under a
+                # `pull-requests: write` workflow. The base verifier
+                # sources its helpers from its own dir, so they are the
+                # base commit's trusted copies too. fetch-depth:0 above
+                # guarantees BASE_SHA is present for the worktree add.
+                BASE_TREE=$(mktemp -d)
+                if git worktree add --quiet --detach "$BASE_TREE" "$BASE_SHA" 2>/dev/null; then
+                  VERIFIER="$BASE_TREE/scripts/workflow/verify-propagation-pr.sh"
+                  if [ -f "$VERIFIER" ]; then
+                    if bash "$VERIFIER" "$MP_DIR" "$PWD" "$BASE_SHA" "$HEAD_SHA"; then
+                      PROPAGATION_LANE=true
+                    fi
+                  else
+                    echo "Propagation lane: base commit has no scripts/workflow/verify-propagation-pr.sh (consumer not yet on the vendored verifier) — not lane-eligible; falls through to normal review."
                   fi
+                  git worktree remove --force "$BASE_TREE" 2>/dev/null || rm -rf "$BASE_TREE"
                 else
-                  echo "Propagation lane: mergepath@$SYNC_SHA has no verify-propagation-pr.sh — not lane-eligible."
+                  echo "Propagation lane: could not materialize the base-commit verifier (worktree add failed) — not lane-eligible."
+                  rm -rf "$BASE_TREE"
                 fi
               else
                 echo "Propagation lane: could not check out mergepath@$SYNC_SHA — not lane-eligible."

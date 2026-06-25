@@ -43,7 +43,10 @@
 #   1 = bad arguments / unsupported label
 #   2 = gh failure (auth, missing PR, network)
 
-set -eo pipefail
+set -euo pipefail
+# `-u` added (#536): every optional is already guarded with `${VAR:-}`,
+# so unset-variable strictness surfaces genuine typos without breaking the
+# documented optional-arg paths.
 
 # --- preflight auto-source (#282) ------------------------------------------
 # If OP_PREFLIGHT_REVIEWER_PAT is unset and a fresh op-preflight cache
@@ -107,8 +110,13 @@ REPO=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --reason) REASON="$2"; shift 2 ;;
-    --repo)   REPO="$2"; shift 2 ;;
+    # Validate the value is present BEFORE shift 2 (#536): under
+    # `set -eo pipefail` a trailing `--reason` / `--repo` with no value
+    # made `shift 2` abort the script (shifting past the end) instead of
+    # routing to the usage handler. `[ -n "${2:-}" ] || usage` makes the
+    # missing-value case a clean usage exit.
+    --reason) [ -n "${2:-}" ] || usage; REASON="$2"; shift 2 ;;
+    --repo)   [ -n "${2:-}" ] || usage; REPO="$2"; shift 2 ;;
     -h|--help) usage ;;
     -*) echo "Unknown flag: $1" >&2; usage ;;
     *)
@@ -141,6 +149,11 @@ if [ -n "$REPO" ]; then
   REPO_FLAG=(--repo "$REPO")
   REPO_HINT_FOR_BODY=" --repo $REPO"
 fi
+# NOTE: the two `"${REPO_FLAG[@]}"` expansions below use the
+# `${REPO_FLAG[@]+...}` guard form. macOS's default /bin/bash 3.2 raises
+# "unbound variable" on a bare `"${REPO_FLAG[@]}"` when the array is empty
+# (the no-`--repo` common case) under the `-u` added above; the guard
+# expands to nothing when unset and to the elements otherwise.
 # Plain string (set -e safe). The previous form embedded
 # `$([ -n "$REPO" ] && echo "--repo $REPO")` directly inside the BODY
 # heredoc. In the default no-`--repo` case the inline `[` returns 1,
@@ -167,7 +180,7 @@ if ! gh_resolve_token_for_identity "$REVIEWER_IDENTITY" "OP_PREFLIGHT_REVIEWER_P
 fi
 REVIEWER_TOKEN="$GH_RESOLVED_TOKEN"
 
-PR_URL=$(GH_TOKEN="$REVIEWER_TOKEN" gh pr view "$PR_NUM" "${REPO_FLAG[@]}" --json url --jq .url 2>/dev/null) || {
+PR_URL=$(GH_TOKEN="$REVIEWER_TOKEN" gh pr view "$PR_NUM" ${REPO_FLAG[@]+"${REPO_FLAG[@]}"} --json url --jq .url 2>/dev/null) || {
   echo "Could not resolve PR #$PR_NUM. Check --repo and gh auth." >&2
   exit 2
 }
@@ -204,7 +217,7 @@ if [ ! -x "$AS_REVIEWER" ]; then
 fi
 
 if ! GH_AS_REVIEWER_IDENTITY="$REVIEWER_IDENTITY" OP_PREFLIGHT_REVIEWER_PAT="$REVIEWER_TOKEN" \
-  "$AS_REVIEWER" -- gh pr comment "$PR_NUM" "${REPO_FLAG[@]}" --body "$BODY" >/dev/null; then
+  "$AS_REVIEWER" -- gh pr comment "$PR_NUM" ${REPO_FLAG[@]+"${REPO_FLAG[@]}"} --body "$BODY" >/dev/null; then
   echo "Failed to post comment on PR #$PR_NUM" >&2
   exit 2
 fi
