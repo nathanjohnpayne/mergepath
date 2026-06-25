@@ -227,7 +227,7 @@ fi
 
 if [ -z "${GH_TOKEN:-}" ]; then
   echo "ERROR: GH_TOKEN is required. Either:" >&2
-  echo "  - Run: eval \"\$(scripts/op-preflight.sh --agent <agent> --mode review)\"" >&2
+  echo "  - Run: eval \"\$(scripts/op-preflight.sh --agent <agent> --mode all)\"" >&2
   echo "    so this helper auto-sources OP_PREFLIGHT_REVIEWER_PAT, OR" >&2
   echo "  - Set GH_TOKEN to the expected reviewer PAT." >&2
   exit 3
@@ -253,7 +253,10 @@ fi
 
 gh_reviewer() (
   unset GITHUB_TOKEN
-  gh "$@"
+  # Pin reviewer writes to the reviewer PAT rather than inheriting ambient
+  # creds (#533): prefer the preflight-cached reviewer PAT, falling back to
+  # GH_TOKEN. Mirrors scripts/resolve-pr-threads.sh's PAT_GH_TOKEN pattern.
+  GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" gh "$@"
 )
 
 # --- config readers ---------------------------------------------------------
@@ -770,10 +773,17 @@ scan_latest_comment_best_effort() {
 count_potential_issues() {
   local reviews pulls_comments latest_review_id
   reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
-  latest_review_id=$(echo "$reviews" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
+  # Pin the latest-review selection to the current HEAD commit
+  # (`commit_id == HEAD_SHA`), not just freshness (`submitted_at >=
+  # HEAD_ANCHOR`). A review submitted after the anchor but referencing an
+  # intermediate commit (e.g. a rapid push sequence where CodeRabbit
+  # reviewed an earlier SHA) must not be chosen as the HEAD review. Mirror
+  # the HEAD-pinning in scripts/codex-review-check.sh (commit_id == $sha).
+  latest_review_id=$(echo "$reviews" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" --arg head_sha "$HEAD_SHA" '
     [ .[]
       | select(.user.login == $bot)
       | select(.submitted_at >= $after)
+      | select(.commit_id == $head_sha)
     ]
     | sort_by(.submitted_at) | last
     | if . == null then null else .id end
@@ -802,6 +812,32 @@ count_potential_issues() {
       | select(.id as $id | ($addressed_root_ids | index($id)) == null)
     ] | length
   '
+}
+
+# Returns 0 (true) if the latest PR-level CodeRabbit SUMMARY comment body
+# carries a `Potential issue` / ⚠️ marker, else 1.
+#
+# count_potential_issues() scans only INLINE `pulls/{pr}/comments`. When
+# CodeRabbit surfaces a finding solely in its PR-level summary body
+# (issues/{pr}/comments) while the inline count is zero, the findings gate
+# would otherwise wrongly clear. This OR-side check closes that gap (#535).
+# Mirrors latest_comment_from_issue_comments: filter to the bot login,
+# newest comment on/after the HEAD anchor (max of created_at/updated_at,
+# since CodeRabbit edits the summary in place).
+summary_body_has_potential_issue_marker() {
+  local issue_comments latest_body
+  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
+  latest_body=$(echo "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
+    [ .[]
+      | select(.user.login == $bot)
+      | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
+      | select(.fresh_at >= $after)
+    ]
+    | sort_by(.fresh_at)
+    | last
+    | (.body // "")
+  ')
+  printf '%s' "$latest_body" | grep -qiE 'Potential issue|⚠️'
 }
 
 # SHA-scoped variant of count_potential_issues, used by the StatusContext
@@ -1043,8 +1079,14 @@ emit_terminal_review_after_probe_if_present() {
     review)
       potential_issues=$(count_potential_issues)
       review_json=$(echo "$latest" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
+      # #535: also honor a PR-level summary-body marker (the inline count
+      # scans only pulls/{pr}/comments) so the probe-wait clearance path
+      # cannot false-clear over a summary-only finding either.
       if [ "$potential_issues" -gt 0 ]; then
         log "CodeRabbit review landed during status-probe wait with $potential_issues Potential issue/⚠️ marker(s) — emitting findings (exit 2)"
+        emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
+      elif summary_body_has_potential_issue_marker; then
+        log "CodeRabbit review landed during status-probe wait with 0 inline markers but a Potential issue/⚠️ marker in the PR-level summary body — emitting findings (exit 2)"
         emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
       fi
       log "CodeRabbit review landed during status-probe wait with no high-severity markers — emitting cleared (exit 0)"
@@ -1588,8 +1630,14 @@ while :; do
     review)
       POTENTIAL_ISSUES=$(count_potential_issues)
       REVIEW_JSON=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
+      # #535: the inline count scans only pulls/{pr}/comments. Also honor a
+      # PR-level summary-body marker so a finding surfaced solely in the
+      # summary body still yields findings instead of false-clearing.
       if [ "$POTENTIAL_ISSUES" -gt 0 ]; then
         log "CodeRabbit review posted with $POTENTIAL_ISSUES Potential issue/⚠️ markers"
+        emit_json_and_exit "findings" 2 "$REVIEW_JSON" "$POTENTIAL_ISSUES"
+      elif summary_body_has_potential_issue_marker; then
+        log "CodeRabbit review posted with 0 inline markers but a Potential issue/⚠️ marker in the PR-level summary body — findings"
         emit_json_and_exit "findings" 2 "$REVIEW_JSON" "$POTENTIAL_ISSUES"
       else
         log "CodeRabbit review posted with no high-severity markers — cleared"
