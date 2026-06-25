@@ -222,6 +222,16 @@ jobs:
       - name: check_sync_manifest
         run: ./scripts/ci/check_sync_manifest
 
+      - name: check_propagation_closure
+        # Systemic closure-completeness guard — the INVERSE of
+        # check_sync_manifest (#519/#521). check_sync_manifest validates
+        # every DECLARED requires:; this scans references OUT of every
+        # propagated scripts/ci/check_* + canonical workflow and fails if
+        # any on-disk tests/+scripts/ reference is undeclared (would not
+        # travel to consumers → the referencing tool fails closed there).
+        # Shares the yq install with check_sync_manifest above.
+        run: ./scripts/ci/check_propagation_closure
+
       - name: check_sync_overrides
         # Exercises tests/test_sync_overrides.sh — verifies the
         # per-consumer sync override semantics (#200) so a downstream

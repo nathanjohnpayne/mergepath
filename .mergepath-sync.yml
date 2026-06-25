@@ -643,6 +643,17 @@ paths:
   - path: tests/test_check_coderabbit_config.sh
     type: canonical
     consumers: all
+  # Pairs with scripts/ci/check_propagation_closure (#521 systemic
+  # closure-completeness guard — the INVERSE of check_sync_manifest).
+  # The check runs this suite as its regression net AND references it by
+  # path, so it MUST be declared or the check flags ITSELF as an
+  # undeclared propagated-file reference. Declared here (and in the
+  # scripts/ci/ kit requires: below) so it travels with the kit and the
+  # closure invariant stays self-consistent. Same #264 paired-test
+  # closure class as the entries above.
+  - path: tests/test_check_propagation_closure.sh
+    type: canonical
+    consumers: all
 
   # Canonical workflows — review policy + automation surfaces that
   # should be lockstep across all consumers.
@@ -784,6 +795,7 @@ paths:
       - "tests/test_template_substitution.sh"  # check_template_substitution
       - "tests/test_export_consumer_facts.sh"  # check_export_consumer_facts
       - "tests/test_check_coderabbit_config.sh"  # check_coderabbit_config_tests (#481/#482)
+      - "tests/test_check_propagation_closure.sh"  # check_propagation_closure (#521)
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
       - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)
       - "tests/test_codex_review_request_entry.sh"  # check_codex_scripts (#486)
