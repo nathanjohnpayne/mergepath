@@ -488,7 +488,7 @@ jobs:
   # are event-shape-agnostic. Only the `if:` and the approval-gate step
   # branch on event name.
   auto-merge-on-approval:
-    needs: [detect-disagreement, block-self-approval, triage]
+    needs: [load-config, detect-disagreement, block-self-approval, triage]
     if: >
       always() &&
       ((github.event_name == 'pull_request_review' &&
@@ -528,6 +528,14 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           REPO: ${{ github.repository }}
+          # #529: restrict the re-arm approval to REGISTERED agent reviewer
+          # identities (available_reviewers), matching scripts/codex-review-check.sh
+          # gate (b) and the required merge-clearance-gate. A non-author APPROVED
+          # from an account that is NOT a mapped reviewer identity must not arm
+          # auto-merge — defense-in-depth on the identity mapping the internal
+          # self-peer review relies on now that the CI-side reviewer invocation
+          # is gone.
+          REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
         run: |
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::notice::REVIEWER_ASSIGNMENT_TOKEN is not configured; cannot confirm an existing approval for the synchronize re-arm. Skipping auto-merge arming."
@@ -548,15 +556,22 @@ jobs:
             exit 0
           fi
 
-          # Latest opinionated review per non-author reviewer; pass only
-          # when at least one such reviewer's latest state is APPROVED.
-          # `-s` (slurp) merges the per-page arrays into one list-of-arrays;
-          # `add // []` then flattens them to the full review array.
+          # Latest opinionated review per non-author REGISTERED reviewer;
+          # pass only when at least one such reviewer's latest state is
+          # APPROVED. `-s` (slurp) merges the per-page arrays into one
+          # list-of-arrays; `add // []` then flattens to the full review
+          # array. #529: the `IN($reviewers[])` filter restricts to
+          # available_reviewers identities — an approval from a non-reviewer
+          # account does NOT count. Default to [] so an empty/failed
+          # load-config fails CLOSED (no reviewer matches → no re-arm).
+          REVIEWERS_JSON="${REVIEWERS_JSON:-[]}"
           if ! APPROVER=$(printf '%s' "$RAW" | jq -r -s \
-            --arg author "$PR_AUTHOR" '
+            --arg author "$PR_AUTHOR" \
+            --argjson reviewers "$REVIEWERS_JSON" '
               [ (add // []) | .[]
                 | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
                 | select(.user.login != $author)
+                | select(.user.login | IN($reviewers[]))
               ]
               | group_by(.user.login)
               | map(max_by(.submitted_at))
@@ -569,7 +584,7 @@ jobs:
           fi
 
           if [ -z "$APPROVER" ]; then
-            echo "::notice::No valid non-author APPROVED review on PR #$PR_NUMBER; a push does not arm auto-merge without an existing approval (#495)."
+            echo "::notice::No valid non-author APPROVED review from a registered reviewer (available_reviewers) on PR #$PR_NUMBER; a push does not arm auto-merge without one (#495/#529)."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
