@@ -20,7 +20,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 SCRIPT="scripts/merge-clearance-gate.sh"
-WORKFLOW=".github/workflows/merge-clearance-gate.yml"
+# WORKFLOW path is overridable so the test suite can point the workflow-shape
+# assertions (in particular the job-name contract below) at a fixture without
+# touching the canonical workflow on disk. Defaults to the real workflow.
+WORKFLOW="${MERGE_CLEARANCE_WORKFLOW:-.github/workflows/merge-clearance-gate.yml}"
 TEST="tests/test_merge_clearance_gate.sh"
 
 FAILED=0
@@ -86,9 +89,41 @@ if [ -f "$WORKFLOW" ]; then
   # scheduled-sweep posts AND the entry in audit-branch-protection.sh's
   # CANONICAL_REQUIRED_CHECKS. Branch protection keys on the job name, so
   # a drift here would silently de-wire the gate.
-  if ! grep -qE '^[[:space:]]+name:[[:space:]]*Merge clearance gate[[:space:]]*$' "$WORKFLOW"; then
-    echo "FAIL: $WORKFLOW must define a job named exactly 'Merge clearance gate'"
+  #
+  # Scope the assertion to the jobs: block and require the match to be a
+  # JOB name (a `name:` key at the job-content indent, directly under a job
+  # key) — NOT just any indented `name:`. A plain grep for an indented
+  # `name:` also matched a step-level `name: Merge clearance gate` (a
+  # non-first step key, deeper-indented, no leading dash). That let a
+  # coincidentally-named *step* satisfy the required-check contract even if
+  # the *job* name had drifted. The awk state machine below tracks the
+  # jobs: block, records each job key's content indent, and only matches a
+  # `name: Merge clearance gate` at that exact indent.
+  if ! awk '
+    /^jobs:[[:space:]]*$/ { in_jobs=1; next }
+    in_jobs && /^[^[:space:]#]/ { in_jobs=0 }
+    !in_jobs { next }
+    {
+      n=0
+      while (substr($0, n+1, 1) == " ") n++
+    }
+    # A job key is indented exactly two spaces under jobs: and is a bare
+    # "<name>:" block opener (nothing after the colon). Record the indent
+    # of its content (job-name / runs-on / steps live one level deeper).
+    in_jobs && n==2 && $0 ~ /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+      job_content_indent = n + 2
+      next
+    }
+    # A job name sits at the job-content indent. Only this counts.
+    in_jobs && job_content_indent>0 && n==job_content_indent &&
+      $0 ~ /name:[[:space:]]*Merge clearance gate[[:space:]]*$/ {
+      found=1; exit
+    }
+    END { exit (found ? 0 : 1) }
+  ' "$WORKFLOW"; then
+    echo "FAIL: $WORKFLOW must define a JOB named exactly 'Merge clearance gate'"
     echo "      (the required-check context; must match the sweep CHECK_NAME and audit-branch-protection.sh)."
+    echo "      A step-level name: does NOT satisfy this — branch protection keys on the job name."
     FAILED=1
   fi
 fi

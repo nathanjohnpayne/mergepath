@@ -248,8 +248,71 @@ assert_rc_contains "same-agent under-threshold approve allowed" 0 "" \
   'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "small"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "5"
 cd "$ORIG_DIR"
 
+# --- #533 item 2: propagation lane bypass honors propagation_prs.enabled
+# A mergepath-sync/* PR authored by the author identity skips the
+# same-agent self-approve guard even when over-threshold — but ONLY when
+# the lane is enabled. DEFAULT-ON: an absent propagation_prs block counts
+# as enabled; an explicit `enabled: false` must re-impose the guard.
+mkdir -p "$WORKDIR/repo-lane-default/.github"
+cat >"$WORKDIR/repo-lane-default/.github/review-policy.yml" <<'YML'
+external_review_threshold: 300
+YML
+cd "$WORKDIR/repo-lane-default"
+assert_rc_contains "lane bypass allowed (default-on absent block)" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
+cd "$ORIG_DIR"
+
+mkdir -p "$WORKDIR/repo-lane-off/.github"
+cat >"$WORKDIR/repo-lane-off/.github/review-policy.yml" <<'YML'
+external_review_threshold: 300
+propagation_prs:
+  enabled: false
+YML
+cd "$WORKDIR/repo-lane-off"
+assert_rc_contains "lane bypass denied when propagation_prs.enabled false (#533)" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
+cd "$ORIG_DIR"
+
 assert_rc_contains "compound direct guarded write blocked" 2 "#348" \
   'gh issue close 7 && gh pr merge --admin 123'
+
+# --- #533 item 1: eval / sh -c / bash -c admin-merge bypass -----------
+# Each of these returned rc=0 (BYPASS) before the python tokenizer
+# re-tokenized eval/shell -c payloads: shlex kept the inner command as
+# one opaque token, so SAW_GH stayed 0 and the guard exited early. They
+# must now surface the inner guarded gh write and BLOCK (rc=2).
+assert_rc_contains "eval-wrapped gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'eval "gh pr merge 123 --admin"'
+
+assert_rc_contains "eval split-arg gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'eval "gh pr" "merge 123 --admin"'
+
+assert_rc_contains "bash -lc gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'bash -lc "gh pr merge 123 --admin"'
+
+assert_rc_contains "bash -c gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'bash -c "gh pr merge 123 --admin"'
+
+assert_rc_contains "sh -c gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'sh -c "gh pr merge 123 --admin"'
+
+# Recursion: a shell wrapper nesting eval (bash -c -> eval -> gh) must
+# expand all the way down.
+assert_rc_contains "bash -c eval gh pr merge blocked (#533 recursion)" 2 "token-verifying wrapper" \
+  'bash -c "eval gh pr merge 123 --admin"'
+
+# A guarded write hidden inside a shell -c compound must still trip #348.
+assert_rc_contains "shell -c compound guarded write blocked (#533/#348)" 2 "#348" \
+  'sh -c "gh issue close 1 && gh pr merge 123 --admin"'
+
+# No false positives: a wrapped command with no command-position gh
+# write stays allowed (the walk re-establishes command position on the
+# expanded stream, so a gh token that is mere data is not a write).
+assert_rc_contains "eval echo allowed (no gh)" 0 "" \
+  'eval "echo hello world"'
+
+assert_rc_contains "bash -c echo of gh text allowed (gh not in cmd position)" 0 "" \
+  'bash -c "echo gh pr merge --admin"'
 
 # --- author-wrapper identity pin (#438) -------------------------------
 

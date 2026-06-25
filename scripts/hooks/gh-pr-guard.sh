@@ -108,8 +108,9 @@
 # Architecture notes:
 #
 #   The hook does ALL its parsing on a tokenized form of the
-#   command produced by `xargs -n 1`, which honors POSIX shell
-#   quoting. Earlier iterations used substring `grep` on the raw
+#   command produced by a python3 shlex.split tokenizer (see the
+#   tokenizer section below; an earlier version used `xargs -n 1`),
+#   which honors POSIX shell quoting. Earlier iterations used substring `grep` on the raw
 #   command string and were buggy in two correlated ways:
 #
 #     1. nathanpayne-codex caught (PR #66 round 2) that
@@ -140,6 +141,15 @@
 #     comment). This is deliberately conservative: split multi-step
 #     GitHub work into separate Bash tool calls so each write gets
 #     the same single-command guard path (#348).
+#
+#   - eval / sh -c / bash -c / dash -c payloads are re-tokenized so a
+#     guarded gh write hidden inside a quoted shell-string payload is
+#     surfaced to the token walk instead of passing as one opaque
+#     token. The python tokenizer expands these recursively before the
+#     walk runs (over-expansion is safe — the walk re-establishes
+#     command position on the expanded stream), and malformed inner
+#     quoting fails closed like any other parse error. Closes the
+#     eval / bash -c / sh -c admin-merge bypass (#533 item 1).
 #
 #   - The CODEX_CLEARED check is a hook-layer defense-in-depth.
 #     The authoritative merge gate is scripts/codex-review-check.sh;
@@ -283,7 +293,7 @@ trap 'rm -f "$TMP_TOKENS" "$TMP_TOKENS_ERR"' EXIT
 # via newline-separated prefix command was the same shape as the
 # round-5 echo-prefix env spoof, just on a different separator.
 if ! printf '%s' "$COMMAND" | python3 -c '
-import sys, shlex
+import sys, shlex, re
 
 def normalize_unquoted_newlines(cmd):
     """Replace newlines OUTSIDE of single/double quotes with `; `.
@@ -318,10 +328,90 @@ def normalize_unquoted_newlines(cmd):
         i += 1
     return "".join(out)
 
+# --- #533 item 1: surface inner commands hidden behind eval / sh -c ---
+# eval "<payload>" and sh|bash|dash -c "<payload>" run <payload> as a
+# fresh command line, but shlex keeps that payload as one opaque token,
+# so the downstream walk never sees the inner gh write and SAW_GH stays
+# 0 (the admin-merge bypass: eval/bash -c/sh -c forms passed rc=0).
+# Re-tokenize those payloads here, recursively, so the walk evaluates
+# the real inner gh write. Over-expansion is safe: the walk re-
+# establishes command position on the expanded stream, so a quoted-data
+# gh (echo "gh ...") is still not in command position. Malformed inner
+# quoting raises ValueError, failing closed exactly like a top-level
+# parse error.
+_SEPARATORS = {"&&", "||", ";", "|", "|&", "&", "(", ")"}
+_SHELL_BASENAMES = {"sh", "bash", "dash", "zsh", "ksh"}
+_PREFIX_CMDS = {"sudo", "time", "nohup", "env", "command", "exec", "nice", "ionice"}
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+def expand_wrappers(tokens, depth=0):
+    if depth > 25:
+        raise ValueError("eval/shell -c nesting too deep")
+    out = []
+    i = 0
+    n = len(tokens)
+    at_cmd = True
+    while i < n:
+        tok = tokens[i]
+        if tok in _SEPARATORS:
+            out.append(tok)
+            at_cmd = True
+            i += 1
+            continue
+        if not at_cmd:
+            out.append(tok)
+            i += 1
+            continue
+        if _ASSIGN_RE.match(tok):
+            out.append(tok)
+            i += 1
+            continue
+        base = tok.rsplit("/", 1)[-1]
+        if base == "eval":
+            # eval joins its args and parses the result as a command.
+            j = i + 1
+            while j < n and tokens[j] not in _SEPARATORS:
+                j += 1
+            inner = " ".join(tokens[i + 1:j])
+            out.extend(expand_wrappers(shlex.split(normalize_unquoted_newlines(inner)), depth + 1))
+            i = j
+            continue
+        if base in _SHELL_BASENAMES:
+            # sh|bash|dash -c "<payload>" runs <payload> as a command.
+            seg_end = i + 1
+            while seg_end < n and tokens[seg_end] not in _SEPARATORS:
+                seg_end += 1
+            inner = None
+            k = i + 1
+            while k < seg_end:
+                t = tokens[k]
+                if t.startswith("-") and "c" in t:
+                    if k + 1 < seg_end:
+                        inner = tokens[k + 1]
+                    break
+                if t.startswith("-"):
+                    k += 1
+                    continue
+                break
+            if inner is not None:
+                out.extend(expand_wrappers(shlex.split(normalize_unquoted_newlines(inner)), depth + 1))
+            else:
+                out.extend(tokens[i:seg_end])
+            i = seg_end
+            continue
+        if base in _PREFIX_CMDS:
+            out.append(tok)
+            i += 1
+            continue
+        out.append(tok)
+        at_cmd = False
+        i += 1
+    return out
+
 try:
     cmd = sys.stdin.read()
     cmd = normalize_unquoted_newlines(cmd)
-    for tok in shlex.split(cmd):
+    for tok in expand_wrappers(shlex.split(cmd)):
         sys.stdout.buffer.write(tok.encode("utf-8", errors="replace") + b"\x00")
 except ValueError as e:
     print(f"shlex error: {e}", file=sys.stderr)
@@ -1470,11 +1560,36 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
       PR_AUTHOR=$(printf '%s\n' "$REVIEW_PR_JSON" | grep -oE '"author":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"author":[[:space:]]*"([^"]*)".*/\1/' || true)
       LANE_BRANCH_PREFIX="${GH_PR_GUARD_PROPAGATION_BRANCH_PREFIX:-mergepath-sync/}"
       LANE_AUTHOR="${GH_PR_GUARD_EXPECTED_AUTHOR:-nathanjohnpayne}"
-      if [ -n "$PR_HEAD_REF" ] && [ -n "$PR_AUTHOR" ] \
+
+      # #533 item 2: honor propagation_prs.enabled before granting the
+      # lane bypass. A repo that explicitly opts out
+      # (propagation_prs.enabled: false) must NOT get the local
+      # self-approve bypass — mirror the CI Merge Clearance Gate, which
+      # already reads this key. Per the DEFAULT-ON convention (#434) an
+      # absent block or absent `enabled` key counts as enabled; only a
+      # literal `false` disables the lane. Parsed with the same
+      # grep/awk posture the rest of this hook uses (no yq dependency in
+      # the pre-write hook). The block scoping keeps a sibling block's
+      # `enabled:` (coderabbit/codex/...) from being read by mistake.
+      LANE_ENABLED=1
+      LANE_POLICY_PATH="$(guard_policy_file || true)"
+      if [ -f "$LANE_POLICY_PATH" ]; then
+        LANE_PROP_ENABLED=$(awk '
+          /^propagation_prs:[[:space:]]*$/ { inblock=1; next }
+          inblock && /^[^[:space:]#]/ { inblock=0 }
+          inblock && /^[[:space:]]+enabled:/ { print $2; exit }
+        ' "$LANE_POLICY_PATH" 2>/dev/null | sed -E "s/^[\"']//; s/[\"']\$//" || true)
+        if [ "$LANE_PROP_ENABLED" = "false" ]; then
+          LANE_ENABLED=0
+        fi
+      fi
+
+      if [ "$LANE_ENABLED" -eq 1 ] \
+         && [ -n "$PR_HEAD_REF" ] && [ -n "$PR_AUTHOR" ] \
          && [ "$PR_AUTHOR" = "$LANE_AUTHOR" ] \
          && [ "${PR_HEAD_REF#"$LANE_BRANCH_PREFIX"}" != "$PR_HEAD_REF" ]; then
-        # Lane criteria met — skip the self-approve guard entirely.
-        # Allow the gh pr review --approve to proceed.
+        # Lane criteria met (and lane enabled) — skip the self-approve
+        # guard entirely. Allow the gh pr review --approve to proceed.
         exit 0
       fi
 

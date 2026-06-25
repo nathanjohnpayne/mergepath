@@ -259,6 +259,83 @@ fi
 rm -rf "$SCRATCH_GH"
 
 echo
+echo "phase-4b-classifier.sh reviewer-PAT pin tests (#533)"
+
+# The live `gh api .../pulls/{pr}/files` (and the PR body fetch) must
+# authenticate under the reviewer PAT, not under a bare ambient GH_TOKEN.
+# The stub records the GH_TOKEN it observed on each call; we assert the
+# reviewer-PAT sentinel — NOT the differing ambient GH_TOKEN — reached gh.
+SCRATCH_PAT=$(mktemp -d)
+GH_TOKEN_LOG="$SCRATCH_PAT/gh-token.log"
+cat > "$SCRATCH_PAT/gh" <<GH_STUB
+#!/usr/bin/env bash
+# Record the effective GH_TOKEN per call, then return a benign payload so
+# the classifier runs to completion (no trigger → exit 0).
+printf 'TOKEN=%s ARGS=%s\n' "\${GH_TOKEN:-}" "\$*" >> "$GH_TOKEN_LOG"
+case " \$* " in
+  *" repos/"*"/pulls/"*"/files "*|*" repos/"*"/pulls/"*"/files")
+    printf '%s\n' '[{"filename":"README.md","patch":"+docs\n"}]'
+    exit 0
+    ;;
+  *" repos/"*"/pulls/"*)
+    printf '%s\n' 'a benign body with no triggers'
+    exit 0
+    ;;
+  *)
+    echo "Error: unstubbed gh call: \$*" >&2
+    exit 1
+    ;;
+esac
+GH_STUB
+chmod +x "$SCRATCH_PAT/gh"
+mkdir -p "$SCRATCH_PAT/.github"
+echo "phase_4b_default: complex-changes" > "$SCRATCH_PAT/.github/review-policy.yml"
+
+set +e
+out=$(cd "$SCRATCH_PAT" && PATH="$SCRATCH_PAT:$PATH" \
+  GH_TOKEN=ambient-bare-token \
+  OP_PREFLIGHT_REVIEWER_PAT=reviewer-pat-sentinel \
+  MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_PAT/.github/review-policy.yml" \
+  bash "$ROOT/$CLASSIFIER" 99999 --repo nathanjohnpayne/mergepath 2>&1)
+rc=$?
+set -e
+# The files endpoint is the call the issue calls out; assert it ran under
+# the reviewer PAT and that the ambient bare token never reached gh.
+if [ "$rc" = "0" ] \
+   && grep -q 'TOKEN=reviewer-pat-sentinel ARGS=.*pulls/99999/files' "$GH_TOKEN_LOG" \
+   && ! grep -q 'TOKEN=ambient-bare-token' "$GH_TOKEN_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: live gh api files+body fetch pinned to reviewer PAT (ambient GH_TOKEN not used)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: live gh api should run under the reviewer PAT (#533) (rc=$rc)" >&2
+  echo "    gh-token log:" >&2
+  sed 's/^/      /' "$GH_TOKEN_LOG" >&2 2>/dev/null || true
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# Fallback: with no reviewer PAT, the pin falls back to the ambient GH_TOKEN
+# (the empty-token guard requires one or the other). The call must still run.
+: > "$GH_TOKEN_LOG"
+set +e
+out=$(cd "$SCRATCH_PAT" && PATH="$SCRATCH_PAT:$PATH" \
+  GH_TOKEN=ambient-only-token \
+  MERGEPATH_REVIEW_POLICY_PATH="$SCRATCH_PAT/.github/review-policy.yml" \
+  bash "$ROOT/$CLASSIFIER" 99999 --repo nathanjohnpayne/mergepath 2>&1)
+rc=$?
+set -e
+if [ "$rc" = "0" ] && grep -q 'TOKEN=ambient-only-token ARGS=.*pulls/99999/files' "$GH_TOKEN_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: no reviewer PAT → pin falls back to ambient GH_TOKEN (call still runs)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: reviewer-PAT-absent fallback should use ambient GH_TOKEN (#533) (rc=$rc)" >&2
+  sed 's/^/      /' "$GH_TOKEN_LOG" >&2 2>/dev/null || true
+  echo "$out" | sed 's/^/      /' >&2
+fi
+rm -rf "$SCRATCH_PAT"
+
+echo
 echo "phase-4b-classifier.sh argument-validation tests"
 
 # Bad PR# (non-integer) → exit 3
