@@ -617,7 +617,10 @@ fetch_manifest_paths() {
   # Fall back to a grep-based extraction so the helper still functions
   # in environments without yq (the rollup-classifier-side reading is
   # the same shape).
-  if command -v yq >/dev/null 2>&1; then
+  # RESOLVE_PR_THREADS_FORCE_NO_YQ=1 forces the grep/awk fallback — a test
+  # hook for the #521 no-yq path (CI installs yq, so PATH curation is not
+  # portable). Inert in production. Mirrors RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK.
+  if [ -z "${RESOLVE_PR_THREADS_FORCE_NO_YQ:-}" ] && command -v yq >/dev/null 2>&1; then
     MANIFEST_PATHS_CACHE=$(yq -r '.paths[].path' "$manifest" 2>/dev/null || true)
   else
     # Best-effort: read `- path: VALUE` lines. Tolerates surrounding
@@ -671,7 +674,10 @@ fetch_manifest_templated_dests() {
   MANIFEST_TEMPLATED_FETCHED=true
   local manifest="$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml"
   [ -f "$manifest" ] || return 0
-  if command -v yq >/dev/null 2>&1; then
+  # RESOLVE_PR_THREADS_FORCE_NO_YQ=1 forces the grep/awk fallback — a test
+  # hook for the #521 no-yq path (CI installs yq, so PATH curation is not
+  # portable). Inert in production. Mirrors RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK.
+  if [ -z "${RESOLVE_PR_THREADS_FORCE_NO_YQ:-}" ] && command -v yq >/dev/null 2>&1; then
     # #467: a path entry's `consumers` is EITHER a sequence of names OR
     # the scalar literal `all`. The prior single-pass expression did
     # `.consumers // [] | map(...)`, which on the scalar `all` tried to

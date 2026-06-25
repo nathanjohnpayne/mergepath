@@ -647,38 +647,34 @@ if ! grep -q 'consumers: all' "$FIXTURE_ROOT/.mergepath-sync.yml"; then
 fi
 
 GH_ARGV_LOG_B="$SCRATCH/t8b.log"; : > "$GH_ARGV_LOG_B"
-# Put the stub gh in its own dir so we can curate a yq-free PATH.
-NOYQ_BIN="$SCRATCH/noyq-bin"; mkdir -p "$NOYQ_BIN"
-make_gh_stub "$NOYQ_BIN/gh-real" "$THREADS_T8" "$FILES_T8" "$COMMITS_T8"
-make_gh_wrapper "$NOYQ_BIN/gh" "$NOYQ_BIN/gh-real"
-# Minimal PATH: the stub dir + the standard system bins (which do NOT
-# carry the Homebrew yq). Assert yq is truly absent so the test fails loud
-# if the environment changes rather than silently exercising the yq path.
-NOYQ_PATH="$NOYQ_BIN:/usr/bin:/bin:/usr/sbin:/sbin"
-if PATH="$NOYQ_PATH" command -v yq >/dev/null 2>&1; then
-  fail=$((fail + 1))
-  echo "  FAIL: Test 8b setup — yq is reachable on the curated PATH; cannot exercise the no-yq fallback" >&2
+# Stub gh in its own dir. Force the no-yq fallback via the script's test
+# hook (RESOLVE_PR_THREADS_FORCE_NO_YQ=1) rather than curating yq out of
+# PATH: CI installs yq into /usr/bin, so a fixed-PATH exclusion is not
+# portable (it false-failed the setup on the runner). The hook exercises
+# the exact grep/awk branch regardless of where yq is installed.
+T8B_BIN="$SCRATCH/t8b-bin"; mkdir -p "$T8B_BIN"
+make_gh_stub "$T8B_BIN/gh-real" "$THREADS_T8" "$FILES_T8" "$COMMITS_T8"
+make_gh_wrapper "$T8B_BIN/gh" "$T8B_BIN/gh-real"
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG_B" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  RESOLVE_PR_THREADS_FORCE_NO_YQ=1 \
+  PATH="$T8B_BIN:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG_B" && grep -q 'FIELD: body=\[mergepath-resolve: templated-render\]' "$GH_ARGV_LOG_B"; then
+  pass=$((pass + 1))
+  echo "  PASS: no-yq awk fallback classifies consumers: all dest as templated-render (#521)"
 else
-  set +e
-  out=$(
-    GH_ARGV_LOG="$GH_ARGV_LOG_B" \
-    RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
-    PATH="$NOYQ_PATH" \
-    env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
-    bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
-      --repo test/repo --auto-resolve-bots 2>&1
-  )
-  rc=$?
-  set -e
-  if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG_B" && grep -q 'FIELD: body=\[mergepath-resolve: templated-render\]' "$GH_ARGV_LOG_B"; then
-    pass=$((pass + 1))
-    echo "  PASS: no-yq awk fallback classifies consumers: all dest as templated-render (#521)"
-  else
-    fail=$((fail + 1))
-    echo "  FAIL: no-yq fallback did not emit templated-render for consumers: all dest (rc=$rc)" >&2
-    echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
-    echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG_B" | sed 's/^/      /' >&2
-  fi
+  fail=$((fail + 1))
+  echo "  FAIL: no-yq fallback did not emit templated-render for consumers: all dest (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG_B" | sed 's/^/      /' >&2
 fi
 
 echo
