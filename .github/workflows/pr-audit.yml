@@ -251,6 +251,20 @@ jobs:
               // Hand-creating all four signals at once is possible but is
               // an explicit, traceable action that would surface during
               // self-review.
+              //
+              // #528 (ruled DEFER + DOCUMENT): this audit identifies a
+              // propagation PR by a FINGERPRINT (trusted author + same-repo
+              // head + mergepath-sync/<sha> branch + mergepath@<sha> title
+              // marker), NOT by re-running the merge lane's full byte-for-byte
+              // verify-propagation-pr.sh proof. That is accepted
+              // defense-in-depth, not a gap: pr-audit is a RETROSPECTIVE
+              // detector (it flags an already-merged PR that skipped review),
+              // while the load-bearing teeth — the byte-level faithful-mirror
+              // proof — runs at MERGE time in pr-review-policy.yml +
+              // merge-clearance-gate. A forged fingerprint cannot MERGE without
+              // also passing that proof, so duplicating the heavy verify here
+              // would add audit cost without closing a demonstrated bypass.
+              // Revisit if a fingerprint-only merge bypass is ever shown.
               const isTrustedSyncAuthor =
                 pr.user && pr.user.login === authorIdentity;
               const isSameRepoHead =

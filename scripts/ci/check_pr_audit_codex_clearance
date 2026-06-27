@@ -61,9 +61,15 @@ for f in "$FIXTURES_DIR" "$WORKFLOW"; do
   fi
 done
 
+# #527 (ruled fail-closed): this script mirrors the node-based
+# `codexCleared` computation in pr-audit.yml as a parity self-test. A
+# self-test that silently no-ops when its interpreter is absent can mask
+# drift between this mirror and the workflow, so fail closed when node is
+# missing rather than passing vacuously. The real merge gate runs in the
+# workflow, where node is guaranteed.
 if ! command -v node >/dev/null 2>&1; then
-  echo "check_pr_audit_codex_clearance: SKIP — node not on PATH" >&2
-  exit 0
+  echo "check_pr_audit_codex_clearance: FAIL — node not on PATH; the parity self-test cannot run (fail-closed per #527)" >&2
+  exit 1
 fi
 
 # The mirrored algorithm. Keep this in sync with the
