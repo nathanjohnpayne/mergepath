@@ -213,14 +213,20 @@ ALLOW_LIST=(
   "scripts/sweep-unresolved-feedback/*"
   "tests/test_sweep*"
 
-  # Propagation-lane audit + workflow-parser kit. audit-propagation-lane.sh
-  # IS declared (so it is already covered), but allow-listing the audit
-  # test family + the scripts/workflow/ kit keeps the seed robust to a
-  # future manifest reshuffle. scripts/workflow/ is its own kit; its
-  # contents travel via that kit when propagated.
+  # Propagation-lane audit test family. audit-propagation-lane.sh IS
+  # declared (already covered), kept here only for robustness to a future
+  # manifest reshuffle.
+  #
+  # NB: scripts/workflow/* is deliberately NOT allow-listed (nathanpayne-codex
+  # Phase-4b finding on #543). scripts/workflow/ is a propagated kit, so a
+  # reference to a workflow helper that genuinely travels is already covered
+  # by is_covered (the kit prefix). A blanket scripts/workflow/* allow-list
+  # would instead MASK the exact closure gap this check exists to catch — a
+  # propagated workflow that hard-references a scripts/workflow/ helper which
+  # is NOT in the kit/manifest. If a specific workflow helper is genuinely
+  # mergepath-only, exempt that one reference with a narrow justification.
   "scripts/audit-propagation-lane.sh"
   "tests/test_audit*"
-  "scripts/workflow/*"
 
   # Templated-propagation engine lib (#313). check_template_substitution
   # and check_workflow_verify_propagation_templated both SKIP on a

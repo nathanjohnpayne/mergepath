@@ -305,6 +305,40 @@ else
   fail "Case (i) unexpected (rc=$rc): $out"
 fi
 
+# --- Case (j): a propagated workflow referencing an UNDECLARED ---------
+# scripts/workflow/ helper must FAIL. The previously-broad
+# `scripts/workflow/*` allow-list masked exactly this gap
+# (nathanpayne-codex Phase-4b finding on #543): scripts/workflow/ is a
+# kit, so a helper that genuinely travels is covered by is_covered; an
+# undeclared one is the closure gap this check exists to catch.
+WORKFLOW_BODY_J='name: fixture
+on: [pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: bash scripts/workflow/parse_policy_list.sh .github/review-policy.yml available_reviewers
+'
+MANIFEST_J='version: 1
+consumers:
+  - name: example
+    repo: example-org/example
+    visibility: public
+paths:
+  - path: .github/workflows/pr-review-policy.yml
+    type: canonical
+    consumers: all'
+PATHS_J=".github/workflows/pr-review-policy.yml
+scripts/workflow/parse_policy_list.sh"
+set +e
+out=$(run_raw "$MANIFEST_J" "$PATHS_J" "$WORKFLOW_BODY_J" ".github/workflows/pr-review-policy.yml"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "references 'scripts/workflow/parse_policy_list.sh' but that path is NOT covered"; then
+  pass "Case (j): undeclared scripts/workflow/ helper ref in a propagated workflow fails closed (#543)"
+else
+  fail "Case (j) unexpected (rc=$rc): $out"
+fi
+
 echo
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -gt 0 ]; then
