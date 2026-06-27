@@ -583,14 +583,17 @@ else
   echo "  FAIL: on.pull_request.types must include synchronize AND reopened, else the re-arm if: is dead code (#495)" >&2
 fi
 
-# 3. A dedicated approval gate runs only on the pull_request (push) path.
+# 3. A dedicated approval gate runs on the pull_request (re-arm) path and,
+#    since #544, the direct pull_request_review approval path too — so an
+#    unregistered non-author approval arms auto-merge on neither path.
 if grep -Fq 'id: require_approval' <<<"$auto_merge_job_block" \
-  && grep -Eq "if:[[:space:]]*github\.event_name == 'pull_request'$" <<<"$auto_merge_job_block"; then
+  && grep -Eq "github\.event_name == 'pull_request'( \|\||$)" <<<"$auto_merge_job_block" \
+  && grep -Fq "github.event_name == 'pull_request_review'" <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: re-arm path has a require_approval gate scoped to pull_request events"
+  echo "  PASS: require_approval gate covers the pull_request re-arm (#495) and the pull_request_review approval (#544)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: re-arm path must add a require_approval step gated on github.event_name == 'pull_request' (#495)" >&2
+  echo "  FAIL: require_approval step must gate on github.event_name == 'pull_request' (#495) AND 'pull_request_review' (#544)" >&2
 fi
 
 # 4. The gate confirms an EXISTING non-author APPROVED review: it must
