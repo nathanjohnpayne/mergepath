@@ -27,5 +27,6 @@ Local scripts:
 Inline in `repo_lint.yml` (no local script):
 
 - `check_review_policy_exists` — verifies `.github/review-policy.yml` and `REVIEW_POLICY.md` both exist
+- `check_governance_files` — verifies `SECURITY.md`, `.github/CODEOWNERS`, and `.github/dependabot.yml` all exist
 
 See `rules/repo_rules.md` for the full list of enforced checks.

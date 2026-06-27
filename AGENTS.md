@@ -11,6 +11,22 @@ Agent instructions are organized into focused sub-files under `docs/agents/`. Re
 5. **[Testing Requirements](docs/agents/testing-requirements.md)** --- Coverage expectations, test deletion policy
 6. **[Deployment Process](docs/agents/deployment-process.md)** --- Build/deploy flow, 1Password-backed auth
 
+## Repository Layout
+
+Most top-level directories are described by the `docs/agents/` files above or
+are self-evident. One carries its justification out-of-line, per the
+[Code Modification Rules](docs/agents/code-modification-rules.md) requirement
+that new top-level directories document their justification here or in a
+`plans/` entry:
+
+- **`packaging/`** --- placeholder package scaffolds that reserve the
+  `mergepath` name on the npm and PyPI registries (name-squatting
+  prevention). Rationale and publish steps live in
+  [`packaging/README.md`](packaging/README.md); see issues
+  [#92](https://github.com/nathanjohnpayne/mergepath/issues/92) (npm) and
+  [#93](https://github.com/nathanjohnpayne/mergepath/issues/93) (PyPI). The
+  directory is whitelisted in `.repo-template.yml`.
+
 ## Code Review Policy
 
 This repository uses a multi-identity AI agent code review system. The full policy is in REVIEW_POLICY.md. The per-repo configuration is in .github/review-policy.yml.

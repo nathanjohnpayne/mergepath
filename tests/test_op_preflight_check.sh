@@ -571,7 +571,7 @@ EOF
     PATH="$bin_dir:$STUB_DIR:$PATH" \
       OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
       GCP_ADC_OP_URI="$shared_adc_uri" \
-      "$SCRIPT" --mode deploy >"$case_dir/out" 2>"$case_dir/err"
+      "$SCRIPT" --agent claude --mode deploy >"$case_dir/out" 2>"$case_dir/err"
   ) || rc=$?
   out="$(cat "$case_dir/out")"
   err="$(cat "$case_dir/err")"
@@ -626,17 +626,17 @@ JSON
 
   local epoch
   epoch=$(date +%s)
-  cat > "$cache_dir/op-preflight-.env" <<EOF
+  cat > "$cache_dir/op-preflight-claude.env" <<EOF
 OP_PREFLIGHT_CREATED_AT_EPOCH=$epoch
 OP_PREFLIGHT_TTL_SECONDS=14400
-OP_PREFLIGHT_AGENT=''
+OP_PREFLIGHT_AGENT=claude
 OP_PREFLIGHT_MODE=deploy
 OP_PREFLIGHT_DONE=1
 GOOGLE_APPLICATION_CREDENTIALS=$bad_sa_file
 OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$bad_sa_file
 OP_PREFLIGHT_FIREBASE_PROJECT=$project
 EOF
-  chmod 600 "$cache_dir/op-preflight-.env"
+  chmod 600 "$cache_dir/op-preflight-claude.env"
 
   cat > "$bin_dir/op" <<EOF
 #!/usr/bin/env bash
@@ -693,7 +693,7 @@ EOF
     PATH="$bin_dir:$STUB_DIR:$PATH" \
       OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
       GCP_ADC_OP_URI="$shared_adc_uri" \
-      "$SCRIPT" --mode deploy >"$case_dir/out" 2>"$case_dir/err"
+      "$SCRIPT" --agent claude --mode deploy >"$case_dir/out" 2>"$case_dir/err"
   ) || rc=$?
   out="$(cat "$case_dir/out")"
   err="$(cat "$case_dir/err")"
@@ -755,17 +755,17 @@ JSON
 
   local epoch
   epoch=$(date +%s)
-  cat > "$cache_dir/op-preflight-.env" <<EOF
+  cat > "$cache_dir/op-preflight-claude.env" <<EOF
 OP_PREFLIGHT_CREATED_AT_EPOCH=$epoch
 OP_PREFLIGHT_TTL_SECONDS=14400
-OP_PREFLIGHT_AGENT=''
+OP_PREFLIGHT_AGENT=claude
 OP_PREFLIGHT_MODE=deploy
 OP_PREFLIGHT_DONE=1
 GOOGLE_APPLICATION_CREDENTIALS=$cached_sa_file
 OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$cached_sa_file
 OP_PREFLIGHT_FIREBASE_PROJECT=$cached_project
 EOF
-  chmod 600 "$cache_dir/op-preflight-.env"
+  chmod 600 "$cache_dir/op-preflight-claude.env"
 
   cat > "$bin_dir/op" <<EOF
 #!/usr/bin/env bash
@@ -822,7 +822,7 @@ EOF
     PATH="$bin_dir:$STUB_DIR:$PATH" \
       OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
       GCP_ADC_OP_URI="$shared_adc_uri" \
-      "$SCRIPT" --mode deploy >"$case_dir/out" 2>"$case_dir/err"
+      "$SCRIPT" --agent claude --mode deploy >"$case_dir/out" 2>"$case_dir/err"
   ) || rc=$?
   out="$(cat "$case_dir/out")"
   err="$(cat "$case_dir/err")"
@@ -865,7 +865,7 @@ test_deploy_mode_refreshes_cached_firebase_sa_file_mismatch() {
   local shared_adc_uri="op://Private/test-shared-adc-file-mismatch/credential"
   local op_log="$case_dir/op.log"
   mkdir -p "$case_dir" "$cache_dir" "$bin_dir"
-  local cached_sa_file="$cache_dir/op-preflight--firebase-sa.json"
+  local cached_sa_file="$cache_dir/op-preflight-claude-firebase-sa.json"
 
   cat > "$case_dir/.firebaserc" <<JSON
 { "projects": { "default": "$current_project" } }
@@ -885,17 +885,17 @@ JSON
 
   local epoch
   epoch=$(date +%s)
-  cat > "$cache_dir/op-preflight-.env" <<EOF
+  cat > "$cache_dir/op-preflight-claude.env" <<EOF
 OP_PREFLIGHT_CREATED_AT_EPOCH=$epoch
 OP_PREFLIGHT_TTL_SECONDS=14400
-OP_PREFLIGHT_AGENT=''
+OP_PREFLIGHT_AGENT=claude
 OP_PREFLIGHT_MODE=deploy
 OP_PREFLIGHT_DONE=1
 GOOGLE_APPLICATION_CREDENTIALS=$cached_sa_file
 OP_PREFLIGHT_FIREBASE_SA_TMPFILE=$cached_sa_file
 OP_PREFLIGHT_FIREBASE_PROJECT=$current_project
 EOF
-  chmod 600 "$cache_dir/op-preflight-.env"
+  chmod 600 "$cache_dir/op-preflight-claude.env"
 
   cat > "$bin_dir/op" <<EOF
 #!/usr/bin/env bash
@@ -956,7 +956,7 @@ EOF
     PATH="$bin_dir:$STUB_DIR:$PATH" \
       OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
       GCP_ADC_OP_URI="$shared_adc_uri" \
-      "$SCRIPT" --mode deploy >"$case_dir/out" 2>"$case_dir/err"
+      "$SCRIPT" --agent claude --mode deploy >"$case_dir/out" 2>"$case_dir/err"
   ) || rc=$?
   out="$(cat "$case_dir/out")"
   err="$(cat "$case_dir/err")"
@@ -1053,6 +1053,177 @@ test_source_gcp_adc_stale_forces_refresh() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# test_deploy_mode_requires_agent (#534.1): `deploy` must stay in the
+# --agent-required gate. Cache paths are unconditionally $AGENT-interpolated,
+# so `--mode deploy` with no --agent writes a shared anonymous ("") bucket
+# that `--purge --agent <name>` can never reclaim and concurrent sessions
+# clobber. This was added in #259, dropped by a bulk sync, and restored in
+# #534. Behavioral + structural guards so another drop fails CI.
+# ---------------------------------------------------------------------------
+test_deploy_mode_requires_agent() {
+  # Behavioral: --mode deploy with no --agent must fail before doing any work.
+  local rc=0
+  PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$WORKDIR/deploy-no-agent" \
+    "$SCRIPT" --mode deploy >"$WORKDIR/deploy-no-agent.out" 2>"$WORKDIR/deploy-no-agent.err" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    fail "test_deploy_mode_requires_agent: --mode deploy without --agent unexpectedly succeeded"
+    return
+  fi
+  if ! grep -q "agent is required" "$WORKDIR/deploy-no-agent.err"; then
+    fail "test_deploy_mode_requires_agent: missing 'agent is required' diagnostic; stderr=$(cat "$WORKDIR/deploy-no-agent.err")"
+    return
+  fi
+  # The error message itself must enumerate deploy, and no anonymous cache
+  # file may have been written.
+  if ! grep -qi "deploy" "$WORKDIR/deploy-no-agent.err"; then
+    fail "test_deploy_mode_requires_agent: agent-required error does not mention deploy mode"
+    return
+  fi
+  if [ -e "$WORKDIR/deploy-no-agent/op-preflight-.env" ]; then
+    fail "test_deploy_mode_requires_agent: anonymous (empty-agent) cache file was written"
+    return
+  fi
+  # Structural: the gate line that requires --agent (the one testing
+  # `-z "$AGENT"`) must also include the `deploy` mode token. Guards against
+  # a bulk-sync re-dropping deploy even if a future refactor changes the
+  # error string. The gate is the only line carrying both tokens.
+  if ! awk '
+    /-z "\$AGENT" \]\]/ && /"\$MODE" == "deploy"/ { ok = 1 }
+    END { exit (ok ? 0 : 1) }
+  ' "$SCRIPT"; then
+    fail "test_deploy_mode_requires_agent: 'deploy' missing from the --agent-required gate (#534.1 regression)"
+    return
+  fi
+  pass "test_deploy_mode_requires_agent: --mode deploy requires --agent (gate retains deploy)"
+}
+
+# ---------------------------------------------------------------------------
+# test_deploy_full_fetch_fails_closed_on_unreadable_adc (#534.2 / #534.3):
+# on the full-fetch path, when the GCP ADC read fails (op error) under
+# `--mode deploy`, preflight must fail closed (exit non-zero) rather than
+# emitting OP_PREFLIGHT_DONE=1 with no GOOGLE_APPLICATION_CREDENTIALS — the
+# cache-hit path already exit 2's for this. The could-not-read warning must
+# also surface op's stderr reason (#534.3).
+# ---------------------------------------------------------------------------
+test_deploy_full_fetch_fails_closed_on_unreadable_adc() {
+  local case_dir="$WORKDIR/deploy-fail-closed"
+  local cache_dir="$case_dir/cache"
+  local bin_dir="$case_dir/bin"
+  local shared_adc_uri="op://Private/test-unreadable-adc/credential"
+  mkdir -p "$case_dir" "$cache_dir" "$bin_dir"
+  # No .firebaserc → falls through to the GCP ADC branch (not Firebase SA).
+
+  # op stub: every `op read` fails with a recognizable stderr reason; op
+  # inject (Phase 1) is not reached in --mode deploy.
+  cat > "$bin_dir/op" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  read)
+    echo "[ERROR] could not read secret: vault is locked" >&2
+    exit 1
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$bin_dir/op"
+
+  local out err rc=0
+  (
+    cd "$case_dir"
+    PATH="$bin_dir:$STUB_DIR:$PATH" \
+      OP_PREFLIGHT_CACHE_DIR="$cache_dir" \
+      GCP_ADC_OP_URI="$shared_adc_uri" \
+      "$SCRIPT" --agent claude --mode deploy >"$case_dir/out" 2>"$case_dir/err"
+  ) || rc=$?
+  out="$(cat "$case_dir/out")"
+  err="$(cat "$case_dir/err")"
+
+  if [ "$rc" -eq 0 ]; then
+    fail "test_deploy_full_fetch_fails_closed_on_unreadable_adc: --mode deploy with unreadable ADC unexpectedly succeeded (rc=0); out=$out"
+    return
+  fi
+  if echo "$out" | grep -q "export GOOGLE_APPLICATION_CREDENTIALS"; then
+    fail "test_deploy_full_fetch_fails_closed_on_unreadable_adc: exported GOOGLE_APPLICATION_CREDENTIALS despite unreadable ADC; out=$out"
+    return
+  fi
+  if echo "$out" | grep -q "export OP_PREFLIGHT_DONE=1"; then
+    fail "test_deploy_full_fetch_fails_closed_on_unreadable_adc: emitted OP_PREFLIGHT_DONE=1 on a failed deploy; out=$out"
+    return
+  fi
+  # #534.3: the warning must include op's stderr reason.
+  if ! echo "$err" | grep -q "could not read GCP ADC"; then
+    fail "test_deploy_full_fetch_fails_closed_on_unreadable_adc: missing could-not-read warning; stderr=$err"
+    return
+  fi
+  if ! echo "$err" | grep -q "vault is locked"; then
+    fail "test_deploy_full_fetch_fails_closed_on_unreadable_adc: warning did not surface op stderr reason (#534.3); stderr=$err"
+    return
+  fi
+  pass "test_deploy_full_fetch_fails_closed_on_unreadable_adc: deploy fails closed on unreadable ADC and surfaces op stderr"
+}
+
+# ---------------------------------------------------------------------------
+# test_deploy_full_fetch_fail_closed_structural (#534.2): structural guard
+# that BOTH the STALE branch and the could-not-read branch of the full-fetch
+# ADC path carry a deploy-scoped `exit 1`, symmetric to
+# test_source_gcp_adc_stale_forces_refresh's exit-2 guard. A behavioral test
+# covers the could-not-read branch; the STALE branch needs a usable-then-
+# rejected ADC + python3 oauth round-trip that is impractical to fixture
+# hermetically, so assert its fail-closed structurally.
+# ---------------------------------------------------------------------------
+test_deploy_full_fetch_fail_closed_structural() {
+  # STALE branch: a 'GCP ADC: STALE' SUMMARY line must be followed by a
+  # deploy-scoped `exit 1` before the branch's closing `fi`.
+  if ! awk '
+    /GCP ADC: STALE/ { found = 1; next }
+    found && /MODE" == "deploy".*exit 1/ { ok = 1 }
+    found && /^[[:space:]]*fi[[:space:]]*$/ { exit (ok ? 0 : 1) }
+    END { exit (ok ? 0 : 1) }
+  ' "$SCRIPT"; then
+    fail "test_deploy_full_fetch_fail_closed_structural: STALE ADC branch missing deploy-scoped exit 1 (#534.2)"
+    return
+  fi
+  # Could-not-read branch: a 'GCP ADC: SKIPPED' SUMMARY line must be followed
+  # by a deploy-scoped `exit 1` before the branch's closing `fi`.
+  if ! awk '
+    /GCP ADC: SKIPPED/ { found = 1; next }
+    found && /MODE" == "deploy".*exit 1/ { ok = 1 }
+    found && /^[[:space:]]*fi[[:space:]]*$/ { exit (ok ? 0 : 1) }
+    END { exit (ok ? 0 : 1) }
+  ' "$SCRIPT"; then
+    fail "test_deploy_full_fetch_fail_closed_structural: could-not-read ADC branch missing deploy-scoped exit 1 (#534.2)"
+    return
+  fi
+  pass "test_deploy_full_fetch_fail_closed_structural: both full-fetch ADC failure branches fail closed under deploy"
+}
+
+# ---------------------------------------------------------------------------
+# test_preflight_mode_is_exported (#521): the preflight mode must be exported
+# on BOTH the cache-hit path and the full-fetch path so a consumer that evals
+# the output (e.g. a deploy wrapper that took the fast path / skipped deploy)
+# can read which mode ran.
+# ---------------------------------------------------------------------------
+test_preflight_mode_is_exported() {
+  # Cache-hit path: a fresh review cache must emit `export OP_PREFLIGHT_MODE`.
+  local case_dir="$WORKDIR/mode-export-cachehit"
+  make_fresh_cache "$case_dir" claude "rev-pat-m" "author-pat-m"
+  local out rc=0
+  out=$(PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$case_dir" \
+    "$SCRIPT" --agent claude --check 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "test_preflight_mode_is_exported: cache-hit --check rc=$rc"
+    return
+  fi
+  if ! echo "$out" | grep -q "export OP_PREFLIGHT_MODE=review"; then
+    fail "test_preflight_mode_is_exported: cache-hit path did not export OP_PREFLIGHT_MODE; out=$out"
+    return
+  fi
+  pass "test_preflight_mode_is_exported: OP_PREFLIGHT_MODE exported on cache-hit path (#521)"
+}
+
 test_check_fresh_cache
 test_check_missing_cache
 test_check_stale_cache
@@ -1069,6 +1240,10 @@ test_deploy_mode_refreshes_mismatched_cached_firebase_sa
 test_deploy_mode_refreshes_cached_firebase_sa_file_mismatch
 test_check_review_mode_omits_deploy_creds
 test_source_gcp_adc_stale_forces_refresh
+test_deploy_mode_requires_agent
+test_deploy_full_fetch_fails_closed_on_unreadable_adc
+test_deploy_full_fetch_fail_closed_structural
+test_preflight_mode_is_exported
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

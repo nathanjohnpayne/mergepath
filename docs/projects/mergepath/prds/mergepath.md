@@ -180,7 +180,7 @@ Both gates follow the same narrow-start posture as `codex.p1_gate`: enabled in M
 
 ### 4. CI Enforcement of Standards
 
-A large suite of validation checks (43 wired `scripts/ci/check_*` steps as of v1.3 — 44 on disk, with `check_op_firebase_deploy_integration` intentionally `WIRED-EXEMPT` — plus two inline steps) runs on every commit via `repo_lint.yml`. A meta-check, `check_ci_scripts_wired`, fails the build if any `scripts/ci/check_*` script on disk is not wired into `repo_lint.yml` as an explicit `run:` step (or carries a documented `# WIRED-EXEMPT` comment), so the on-disk list and the executable list cannot silently diverge. The structural core:
+A large suite of validation checks (45 wired `scripts/ci/check_*` steps — 46 on disk, with `check_op_firebase_deploy_integration` the one intentionally `WIRED-EXEMPT` — plus two inline steps) runs on every commit via `repo_lint.yml`. A meta-check, `check_ci_scripts_wired`, fails the build if any `scripts/ci/check_*` script on disk is not wired into `repo_lint.yml` as an explicit `run:` step (or carries a documented `# WIRED-EXEMPT` comment), so the on-disk list and the executable list cannot silently diverge; it prints the live tally (`46 check_* scripts, all wired or exempt`), the authoritative count this paragraph tracks. The structural core:
 
 - `check_required_root_files` — all canonical docs exist
 - `check_no_tool_folder_instructions` — tool folders contain no duplicated behavioral rules
