@@ -464,6 +464,23 @@ _PREFIX_CMDS = {"sudo", "time", "nohup", "env", "command", "exec", "nice", "ioni
 # and miss a trailing -c (#540: bash --rcfile FILE -c "<payload>").
 _SHELL_VALUE_OPTS = {"--rcfile", "--init-file", "-o", "+o", "-O", "+O"}
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Per-prefix options that consume the NEXT token as a value, so the value
+# is not mistaken for the wrapped command. Per-prefix because the same
+# letter differs by tool: nice -n N takes a value, but sudo -n is a
+# no-value flag. A prefix not listed here is treated as flags-only.
+_PREFIX_VALUE_OPTS = {
+    "sudo": frozenset({"-u", "--user", "-g", "--group", "-p", "--prompt",
+                       "-h", "--host", "-t", "--type", "-r", "--role",
+                       "-C", "--close-from", "-D", "--chdir",
+                       "-R", "--chroot", "-U", "--other-user",
+                       "-T", "--command-timeout"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "ionice": frozenset({"-c", "--class", "-n", "--classdata",
+                         "-p", "--pid", "-t"}),
+    "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
+    "exec": frozenset({"-a"}),
+}
+_EMPTY_FROZENSET = frozenset()
 
 def expand_wrappers(tokens, depth=0):
     if depth > 25:
@@ -543,6 +560,39 @@ def expand_wrappers(tokens, depth=0):
         if base in _PREFIX_CMDS:
             out.append(tok)
             i += 1
+            # Consume the options that belong to this prefix before the
+            # wrapped command, keeping command position so a
+            # <prefix> [opts] bash -c "<payload>" form is still expanded.
+            # Value-taking options (sudo -u USER, nice -n N, ...) consume
+            # their value too; env NAME=VALUE assignments are skipped. The
+            # first shell / nested-prefix / eval / bare token is the wrapped
+            # command, left for the main loop at command position. #540 P1:
+            # a prefix option used to fall through and flip at_cmd off,
+            # hiding a trailing bash -c gh-write.
+            vopts = _PREFIX_VALUE_OPTS.get(base, _EMPTY_FROZENSET)
+            while i < n:
+                a = tokens[i]
+                if a in _SEPARATORS:
+                    break
+                a_base = a.rsplit("/", 1)[-1]
+                if a_base in _SHELL_BASENAMES or a_base in _PREFIX_CMDS or a_base == "eval":
+                    break
+                if _ASSIGN_RE.match(a):
+                    out.append(a)
+                    i += 1
+                    continue
+                if a in vopts:
+                    out.append(a)
+                    i += 1
+                    if i < n and tokens[i] not in _SEPARATORS:
+                        out.append(tokens[i])
+                        i += 1
+                    continue
+                if a.startswith("-"):
+                    out.append(a)
+                    i += 1
+                    continue
+                break
             continue
         out.append(tok)
         at_cmd = False
@@ -1720,7 +1770,9 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
       LANE_POLICY_PATH="$(guard_policy_file || true)"
       if [ -f "$LANE_POLICY_PATH" ]; then
         LANE_PROP_ENABLED=$(awk '
-          /^propagation_prs:[[:space:]]*$/ { inblock=1; next }
+          # Accept a trailing comment / text after the key (propagation_prs: # opt-out),
+          # matching the workflow parser; an exact-EOL match failed open (#540 P2).
+          /^propagation_prs:([[:space:]]|$)/ { inblock=1; next }
           inblock && /^[^[:space:]#]/ { inblock=0 }
           inblock && /^[[:space:]]+enabled:/ { print $2; exit }
         ' "$LANE_POLICY_PATH" 2>/dev/null | sed -E "s/^[\"']//; s/[\"']\$//" || true)

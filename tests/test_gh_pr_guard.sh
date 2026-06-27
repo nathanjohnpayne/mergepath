@@ -286,6 +286,21 @@ assert_rc_contains "lane bypass denied when propagation_prs.enabled is a present
   'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
 cd "$ORIG_DIR"
 
+# #540 P2 (4a review): a trailing comment on the propagation_prs header
+# (propagation_prs: # opt-out) must still be parsed, so enabled:false
+# disables the lane. The prior exact-EOL header match missed it and the
+# lane failed open.
+mkdir -p "$WORKDIR/repo-lane-comment/.github"
+cat >"$WORKDIR/repo-lane-comment/.github/review-policy.yml" <<'YML'
+external_review_threshold: 300
+propagation_prs:  # this repo opted out of the self-approve lane
+  enabled: false
+YML
+cd "$WORKDIR/repo-lane-comment"
+assert_rc_contains "lane bypass denied when propagation_prs header has a trailing comment (#540 P2)" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
+cd "$ORIG_DIR"
+
 assert_rc_contains "compound direct guarded write blocked" 2 "#348" \
   'gh issue close 7 && gh pr merge --admin 123'
 
@@ -336,6 +351,30 @@ assert_rc_contains "bash --norc -c gh pr merge --admin blocked (#540)" 2 "" \
   'bash --noprofile --norc -c "gh pr merge 1 --admin"'
 assert_rc_contains "bash --rcfile -c still finds the real -c (#540)" 2 "" \
   'bash --rcfile /dev/null -c "gh pr merge 1 --admin"'
+
+# (3) <prefix> [opts] bash -c "<payload>": a prefix command with its OWN
+#     options (env -i, sudo -u USER, nice -n N) must consume those options
+#     so the wrapped bash -c is still found. Previously a prefix option
+#     fell through and flipped command-position off, hiding the bash -c
+#     gh-write (#540 P1, 4a review).
+assert_rc_contains "env -i bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'env -i bash -c "gh pr merge 1 --admin"'
+assert_rc_contains "sudo -u USER bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'sudo -u nobody bash -c "gh pr merge 1 --admin"'
+assert_rc_contains "nice -n N bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'nice -n 5 bash -c "gh pr merge 1 --admin"'
+# sudo -n is a no-value FLAG (unlike nice -n), so bash stays in command
+# position and is still expanded (per-prefix value-option table).
+assert_rc_contains "sudo -n bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'sudo -n bash -c "gh pr merge 1 --admin"'
+# An env NAME=VALUE assignment before the shell is skipped, not mistaken
+# for the wrapped command.
+assert_rc_contains "env VAR=x bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'env FOO=bar bash -c "gh pr merge 1 --admin"'
+# Control: a prefix wrapping a benign echo of gh text stays allowed (gh is
+# not in command position inside the echo).
+assert_rc_contains "sudo -u x bash -c echo gh text allowed (#540 P1)" 0 "" \
+  'sudo -u nobody bash -c "echo gh pr merge --admin"'
 
 # (2) a command substitution with a quoted ) desynced shlex quote tracking
 #     and glued a top-level "; gh ..." into a data token. The python
