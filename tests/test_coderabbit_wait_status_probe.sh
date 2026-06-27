@@ -182,10 +182,22 @@ case "$endpoint" in
           count=$(cat "$state_dir/probe-count")
         fi
         if [ "$count" -gt 0 ] && [ "$(fake_now)" -ge 2000000006 ]; then
-          printf '[{"id":9901,"user":{"login":"%s"},"submitted_at":"%s"}]\n' "$bot" "$reply_time"
+          printf '[{"id":9901,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$reply_time"
         else
           printf '[]\n'
         fi
+        ;;
+      summary_marker_only)
+        # #535.1: one CodeRabbit review on HEAD, no inline findings, but the
+        # PR-level summary body carries a Potential issue marker.
+        printf '[{"id":9921,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        ;;
+      intermediate_review_head_pin)
+        # #535.2: a NEWER review (later submitted_at) references an
+        # intermediate commit, while the HEAD review is older. The
+        # HEAD-pinned selection must pick the HEAD review (9931), not the
+        # newer intermediate one (9932).
+        printf '[{"id":9931,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"},{"id":9932,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"intermediate-sha"}]\n' "$bot" "$head_time" "$bot" "$reply_time"
         ;;
       *)
         printf '[]\n'
@@ -204,6 +216,17 @@ case "$endpoint" in
         else
           printf '[]\n'
         fi
+        ;;
+      summary_marker_only)
+        # #535.1: no inline findings at all — the marker lives only in the
+        # PR-level summary body (issues endpoint below).
+        printf '[]\n'
+        ;;
+      intermediate_review_head_pin)
+        # #535.2: the ⚠️ inline finding is tied to the HEAD review (9931).
+        # The newer intermediate review (9932) has no inline findings, so
+        # selecting it (the pre-fix freshness-only behavior) would clear.
+        printf '[{"id":9933,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","commit_id":"head-sha","pull_request_review_id":9931,"in_reply_to_id":null,"body":"_⚠️ Potential issue_ | _🟠 Major_\\n\\nFinding on the HEAD review."}]\n' "$bot" "$head_time" "$head_time"
         ;;
       *)
         printf '[]\n'
@@ -239,6 +262,19 @@ case "$endpoint" in
         else
           printf '[]\n'
         fi
+        ;;
+      summary_marker_only)
+        # #535.1: latest PR-level summary classifies as a review (not a
+        # rate-limit/paused/in-progress/status-probe narration) and carries a
+        # Potential issue marker in its body. The inline count is 0, so the
+        # gate must rely on this summary-body marker to emit findings.
+        printf '[{"id":8821,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 1**\\n\\n<details>\\n<summary>foo.sh (1)</summary>\\n\\n_⚠️ Potential issue_\\n\\nThis only appears in the summary body."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      intermediate_review_head_pin)
+        # #535.2: a plain review-completed summary with NO Potential issue
+        # marker, so clearance is decided purely by the HEAD-pinned inline
+        # count (which finds the finding on the HEAD review).
+        printf '[{"id":8831,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 1**\\n\\nSee inline findings on the latest HEAD review."}]\n' "$bot" "$head_time" "$head_time"
         ;;
       reply_poll_failure)
         count=0
@@ -462,6 +498,66 @@ test_review_during_probe_wait_emits_findings() {
   fi
 }
 
+# #535.1: the findings gate must also honor a PR-level summary-body marker.
+# A CodeRabbit review on HEAD with ZERO inline findings but a "Potential
+# issue"/⚠️ marker in its PR-level summary body must emit findings (exit 2),
+# not false-clear. Pre-fix this cleared (exit 0) because count_potential_
+# issues scans only the inline pulls/{pr}/comments list. max_wait is large
+# so the first poll reaches the in-loop `review)` arm before any timeout.
+test_535_1_summary_body_marker_emits_findings() {
+  local dir rc status potential review_endpoint
+  dir=$(make_case "summary-marker-only" 600 false 0 2)
+  rc=$(run_case "$dir" summary_marker_only)
+  if [ "$rc" != "2" ]; then
+    fail "#535.1 summary-body marker: exit $rc, expected findings 2; stderr=$(cat "$dir/err.log")"
+    return
+  elif [ ! -s "$dir/out.json" ]; then
+    fail "#535.1 summary-body marker: missing findings JSON output; stderr=$(cat "$dir/err.log")"
+    return
+  fi
+  status=$(jq -r '.status' "$dir/out.json")
+  potential=$(jq -r '.potential_issue_count' "$dir/out.json")
+  review_endpoint=$(jq -r '.review.endpoint' "$dir/out.json")
+  if [ "$status" != "findings" ]; then
+    fail "#535.1 summary-body marker: status=$status, expected findings"
+  elif [ "$potential" != "0" ]; then
+    fail "#535.1 summary-body marker: potential_issue_count=$potential, expected 0 (marker is summary-only, inline count is 0)"
+  elif [ "$review_endpoint" != "issues" ]; then
+    fail "#535.1 summary-body marker: review.endpoint=$review_endpoint, expected issues"
+  else
+    pass "#535.1: PR-level summary-body Potential issue/⚠️ marker yields findings even with 0 inline findings"
+  fi
+}
+
+# #535.2: latest-review selection must be pinned to the HEAD commit, not just
+# freshness. A NEWER review (later submitted_at) that references an
+# intermediate commit must not be chosen over the HEAD review. Here the HEAD
+# review carries the only ⚠️ inline finding; the newer intermediate review
+# has none. Pre-fix (freshness-only `submitted_at >= anchor`) selected the
+# intermediate review and cleared (exit 0); with the commit_id == HEAD_SHA
+# pin the HEAD review is selected and the finding is counted (exit 2).
+test_535_2_head_pinned_review_selection_emits_findings() {
+  local dir rc status potential
+  dir=$(make_case "intermediate-review-head-pin" 600 false 0 2)
+  rc=$(run_case "$dir" intermediate_review_head_pin)
+  if [ "$rc" != "2" ]; then
+    fail "#535.2 head-pinned review: exit $rc, expected findings 2; stderr=$(cat "$dir/err.log")"
+    return
+  elif [ ! -s "$dir/out.json" ]; then
+    fail "#535.2 head-pinned review: missing findings JSON output; stderr=$(cat "$dir/err.log")"
+    return
+  fi
+  status=$(jq -r '.status' "$dir/out.json")
+  potential=$(jq -r '.potential_issue_count' "$dir/out.json")
+  if [ "$status" != "findings" ]; then
+    fail "#535.2 head-pinned review: status=$status, expected findings (HEAD review's inline finding must count)"
+  elif [ "$potential" != "1" ]; then
+    fail "#535.2 head-pinned review: potential_issue_count=$potential, expected 1"
+  else
+    pass "#535.2: latest-review selection pins to HEAD commit; a newer intermediate-commit review does not shadow the HEAD finding"
+  fi
+}
+
 # #446: fast-path StatusContext clearance race. A NEWER rate-limit/
 # in-progress comment than the StatusContext success must suppress the
 # fast-path EVEN WHEN it does not reference the current HEAD — otherwise the
@@ -516,6 +612,8 @@ test_rate_limit_stalled_does_not_probe
 test_probe_post_failure_stays_timeout_advisory
 test_probe_reply_poll_failure_stays_timeout_advisory
 test_review_during_probe_wait_emits_findings
+test_535_1_summary_body_marker_emits_findings
+test_535_2_head_pinned_review_selection_emits_findings
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
