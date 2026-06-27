@@ -196,6 +196,34 @@ else
   fail "expected 3 attempts + rc=1 + 503 on stderr; got rc=$RC attempts=$attempts_used err=[$ERR]"
 fi
 
+# ---------------------------------------------------------------------------
+# Test 6 (#545 4a P2): the cleanup RETURN trap must self-clear, so it does
+# not linger and re-fire on an ENCLOSING function's return — where the
+# helper-local `err` is out of scope and, under set -u, would abort the
+# caller with `err: unbound variable`. with_gh_retry is invoked from inside
+# a function (not the test's usual subshell) to exercise exactly that path.
+# ---------------------------------------------------------------------------
+echo "--- Test 6: cleanup RETURN trap self-clears (no lingering abort in a set -u caller)"
+: > "$WORKDIR/att6"
+set +e
+LINGER_OUT=$(
+  set -uo pipefail
+  PATH="$STUB_DIR:$PATH"
+  export GH_RETRY_BACKOFF_SECONDS=0
+  export FAKE_GH_STDOUT=ok FAKE_GH_RCS=0 ATTEMPT_FILE="$WORKDIR/att6"
+  . "$LIB"
+  caller_fn() { with_gh_retry gh api x >/dev/null 2>&1; }
+  caller_fn
+  echo SURVIVED
+)
+LINGER_RC=$?
+set -e
+if [ "$LINGER_RC" = 0 ] && [ "$LINGER_OUT" = SURVIVED ]; then
+  pass "RETURN trap self-clears — enclosing function return does not hit err: unbound variable"
+else
+  fail "lingering RETURN trap aborted the caller (rc=$LINGER_RC out=[$LINGER_OUT])"
+fi
+
 echo
 echo "test_gh_retry_helpers: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

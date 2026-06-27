@@ -71,12 +71,15 @@ with_gh_retry() {
     err=""
   }
   # Clean up the tmpfile on any return path (success, permanent-fail,
-  # exhausted retries) via a function-scoped RETURN trap. No caller in
-  # this repo installs its own RETURN trap, so none is clobbered here; if
-  # one ever does, save the prior `trap -p RETURN` before this line and
-  # restore it on the return paths.
+  # exhausted retries) via a RETURN trap that CLEARS ITSELF (trap -
+  # RETURN) as it fires. Self-clearing is required: a bare RETURN trap
+  # lingers after with_gh_retry returns and re-fires on the caller's own
+  # function / source return, where the local `err` is out of scope —
+  # under set -u that aborts the caller with `err: unbound variable`
+  # (#545 P2). No caller in this repo installs its own RETURN trap, so
+  # clearing (rather than save/restore) clobbers nothing.
   if [ -n "$err" ]; then
-    trap 'rm -f "$err"' RETURN
+    trap 'rm -f "$err"; trap - RETURN' RETURN
   fi
 
   while [ "$attempt" -le "$attempts" ]; do
