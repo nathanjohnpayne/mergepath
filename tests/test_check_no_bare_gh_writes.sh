@@ -83,6 +83,11 @@ assert_clean   "echo \$(date) stays exempt"          'echo "$(date)"'
 # Control for the #540 regression: a quoted ) inside $() with NO gh write
 # stays exempt (the quote-aware walk must not over-flag).
 assert_clean   "quoted-paren in cmdsub, no gh write, exempt"  "echo \"\$(printf '%s' ')')\""
+# #540 P2 (4a review): a $( inside SINGLE quotes, or an escaped \$( in
+# double quotes, is a literal — bash runs no substitution — so an echo of
+# such help/example text must NOT be flagged as a write.
+assert_clean   "single-quoted dollar-paren literal exempt"   "echo '\$(gh repo create x)'"
+assert_clean   "escaped dollar-paren in dquotes exempt"      'echo "\$(gh repo create x)"'
 # Regression: a gh write spelled in echo TEXT but OUTSIDE the substitution
 # (e.g. a log line whose only substitution is $(date)) must stay exempt —
 # the masking fix must not over-match plain documentation text.

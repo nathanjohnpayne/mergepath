@@ -57,12 +57,14 @@ function gh_write_class(s) {
 # a log message that literally spells "gh project create") is excluded, so it
 # does not falsely match. Bash-3.2-safe / POSIX-awk: manual character walk,
 # no capture groups.
-function cmdsub_interiors(line,   i, c, n, depth, out, inbt, prev, q) {
+function cmdsub_interiors(line,   i, c, n, depth, out, inbt, prev, q, oq, esc) {
   n = length(line)
   out = ""
   depth = 0   # nesting depth inside $(...)
   inbt = 0    # currently inside a backtick pair
   q = ""      # quote state inside $(): "" none, single, or double quote
+  oq = ""     # OUTER quote at depth 0: "" none, single, or double quote
+  esc = 0     # previous char at depth 0 was an active backslash escape
   prev = ""
   for (i = 1; i <= n; i++) {
     c = substr(line, i, 1)
@@ -95,8 +97,22 @@ function cmdsub_interiors(line,   i, c, n, depth, out, inbt, prev, q) {
       prev = c
       continue
     }
-    # Outside any substitution.
-    if (c == "(" && prev == "$") { depth = 1; prev = c; continue }
+    # Outside any substitution (depth 0). Track the OUTER quote and a
+    # backslash escape so a $( or backtick inside single-quotes, or an
+    # escaped backslash-dollar, is literal (bash runs no substitution
+    # there) and an echo of such text is not treated as a write (#540 P2).
+    if (esc) { esc = 0; prev = "x"; continue }
+    if (oq == sq) { if (c == sq) oq = ""; prev = c; continue }
+    if (c == "\\") { esc = 1; prev = c; continue }
+    if (oq == "\"") {
+      if (c == "\"") { oq = ""; prev = c; continue }
+      if (c == "(" && prev == "$") { depth = 1; q = ""; prev = c; continue }
+      if (c == "`") { inbt = 1; prev = c; continue }
+      prev = c; continue
+    }
+    if (c == sq) { oq = sq; prev = c; continue }
+    if (c == "\"") { oq = "\""; prev = c; continue }
+    if (c == "(" && prev == "$") { depth = 1; q = ""; prev = c; continue }
     if (c == "`") { inbt = 1; prev = c; continue }
     prev = c
   }
