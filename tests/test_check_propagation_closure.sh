@@ -223,27 +223,29 @@ else
   fail "Case (f) unexpected (rc=$rc): $out"
 fi
 
-# --- Case (g): self-reference is not flagged --------------------------
-# A check that mentions its OWN path must not flag itself, even though
-# the check is propagated (covered) — self-ref is skipped before the
-# coverage test. We use a check whose body literally contains its own
-# path string, plus a kit that covers it.
+# --- Case (g): self-reference is skipped, not flagged -----------------
+# A propagated check that names its OWN .sh path must not flag itself:
+# the self-ref skip (`[ "$ref" = "$rel" ] && continue`) fires before the
+# coverage test. The body references its own rel path WITH a .sh
+# extension so the extractor actually emits it as a candidate — an
+# extensionless name is never emitted by the scripts/*.{sh,cjs,js}
+# matcher, so the earlier fixture exercised nothing. The scripts/ci/ kit
+# covers the file, so it is scanned and the self-ref branch is hit.
+# (The skip is belt-and-suspenders: a scan file is always is_covered, so
+# its self-ref would be covered anyway — but we want the branch
+# exercised and guarded against a future matcher that emits a file's own
+# path.)
 CHECK_BODY_SELF='#!/usr/bin/env bash
-# scripts/ci/check_selfref enumerates ... (mentions its own path)
-echo "scripts/ci/check_selfref"
+# scripts/ci/check_selfref.sh enumerates ... (names its own path)
+echo "scripts/ci/check_selfref.sh"
 '
 MANIFEST_G="$MIN_HEADER"
 PATHS_G="scripts/ci/"
 set +e
-out=$(run_raw "$MANIFEST_G" "$PATHS_G" "$CHECK_BODY_SELF" "scripts/ci/check_selfref"); rc=$?
+out=$(run_raw "$MANIFEST_G" "$PATHS_G" "$CHECK_BODY_SELF" "scripts/ci/check_selfref.sh"); rc=$?
 set -e
-# Note: scripts/ci/check_selfref ends in .sh? No — but the body mentions
-# the path without an extension, so grep won't match it anyway. To make
-# the self-ref path actually appear as a candidate we reference a .sh
-# sibling spelled as the check's own rel path is not possible (no ext).
-# Instead assert the run simply passes (no false positive from the body).
 if [ "$rc" = "0" ] && echo "$out" | grep -q "check_propagation_closure: PASS"; then
-  pass "Case (g): a check mentioning its own path produces no false positive"
+  pass "Case (g): a propagated check naming its own .sh path is self-ref-skipped (no false positive)"
 else
   fail "Case (g) unexpected (rc=$rc): $out"
 fi
