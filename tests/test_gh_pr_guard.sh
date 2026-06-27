@@ -314,6 +314,41 @@ assert_rc_contains "eval echo allowed (no gh)" 0 "" \
 assert_rc_contains "bash -c echo of gh text allowed (gh not in cmd position)" 0 "" \
   'bash -c "echo gh pr merge --admin"'
 
+# --- #540 Phase-4b: nathanpayne-codex found two more guard bypasses ----
+# (1) bash --noprofile --norc -c "<payload>": the option scan matched any
+#     flag containing a 'c', so --norc consumed the real -c and dropped the
+#     command string. Long (--) options are now skipped so the real -c is
+#     found.
+assert_rc_contains "bash --norc -c gh pr merge --admin blocked (#540)" 2 "" \
+  'bash --noprofile --norc -c "gh pr merge 1 --admin"'
+assert_rc_contains "bash --rcfile -c still finds the real -c (#540)" 2 "" \
+  'bash --rcfile /dev/null -c "gh pr merge 1 --admin"'
+
+# (2) a command substitution with a quoted ) desynced shlex quote tracking
+#     and glued a top-level "; gh ..." into a data token. The python
+#     preprocessor is now command-substitution aware: it pads unquoted
+#     separators and surfaces commands inside $(...) / backticks.
+assert_rc_contains "cmd-sub quoted-paren hides top-level gh merge blocked (#540)" 2 "" \
+  'echo "$(printf %s ")")"; gh pr merge 1 --admin'
+
+# Related command-substitution / subshell vectors the same fix closes: a
+# gh write that EXECUTES inside $(...), a backtick, a subshell, or an
+# assignment substitution is surfaced and blocked (also required the
+# fast-path pre-filter boundary to count ( / $ / ; / backtick, not only
+# whitespace, so the hook does not early-exit before tokenizing).
+assert_rc_contains "gh write inside command substitution blocked (#540)" 2 "" \
+  'echo "$(gh pr merge 1 --admin)"'
+assert_rc_contains "gh write in subshell blocked (#540)" 2 "" \
+  '(gh pr merge 1 --admin)'
+assert_rc_contains "gh write in assignment substitution blocked (#540)" 2 "" \
+  'X=$(gh pr merge 1 --admin)'
+assert_rc_contains "gh write in backtick substitution blocked (#540)" 2 "" \
+  'echo `gh pr merge 1 --admin`'
+
+# Control: a READ inside a substitution is not a guarded write -> allowed.
+assert_rc_contains "gh read inside command substitution allowed (#540)" 0 "" \
+  'echo "$(gh pr view 1)"'
+
 # --- author-wrapper identity pin (#438) -------------------------------
 
 assert_rc_contains "author wrapper inline non-author identity blocked" 2 "author identity" \

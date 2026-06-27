@@ -237,7 +237,16 @@ COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 # token walk below strips quotes itself and the */gh case catches it — but
 # only if we do NOT early-exit here. Stripping quotes for this fast-path
 # probe is safe; it only governs whether the authoritative tokenizer runs.
-if ! echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[[:space:]])([^[:space:]]*/)?gh([[:space:]]|$)'; then
+#
+# #540 Phase-4b: the boundary classes are [^A-Za-z0-9_] on BOTH sides, not
+# just whitespace, so a `gh` reached through a command substitution or a
+# subshell — `$(gh ...)`, `(gh ...)`, `;gh`, backtick gh — is not skipped
+# here (after quote-stripping it is preceded by `(` / `$` / `;` / a
+# backtick, never a space, so the old whitespace-only boundary missed it
+# and the hook exited before tokenizing). Erring toward NOT early-exiting
+# is the fail-closed direction: a false positive costs one tokenizer run;
+# a false negative is a bypass.
+if ! echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])([^[:space:]]*/)?gh([^A-Za-z0-9_]|$)'; then
   exit 0
 fi
 
@@ -295,38 +304,145 @@ trap 'rm -f "$TMP_TOKENS" "$TMP_TOKENS_ERR"' EXIT
 if ! printf '%s' "$COMMAND" | python3 -c '
 import sys, shlex, re
 
-def normalize_unquoted_newlines(cmd):
-    """Replace newlines OUTSIDE of single/double quotes with `; `.
-    Preserves newlines inside quoted strings as literal characters."""
-    out = []
+# chr(39)/chr(34) are single/double quote; chr() avoids embedding a
+# literal single quote inside the python3 -c surrounding heredoc.
+_SQ = chr(39)
+_DQ = chr(34)
+
+def _read_paren_span(cmd, start):
+    # `start` points just AFTER the opening "$(". Return (inner, index
+    # after the matching ")"). Tracks nested $( / ( and an INDEPENDENT
+    # quote context (a ) inside quotes does not close the span), matching
+    # bash command-substitution parsing. Raises on an unterminated span.
+    depth = 1
+    i = start
+    n = len(cmd)
     in_single = False
     in_double = False
-    i = 0
-    while i < len(cmd):
+    while i < n:
         c = cmd[i]
-        # Handle backslash-escaped char in double quotes / unquoted
-        if c == "\\" and not in_single and i + 1 < len(cmd):
+        if c == "\\" and not in_single and i + 1 < n:
+            i += 2
+            continue
+        if c == _SQ and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if c == _DQ and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if c == "$" and i + 1 < n and cmd[i + 1] == "(":
+                depth += 1
+                i += 2
+                continue
+            if c == "(":
+                depth += 1
+                i += 1
+                continue
+            if c == ")":
+                depth -= 1
+                if depth == 0:
+                    return cmd[start:i], i + 1
+                i += 1
+                continue
+        i += 1
+    raise ValueError("unterminated command substitution")
+
+def _read_backtick_span(cmd, start):
+    # `start` points just AFTER the opening backtick. Return (inner, index
+    # after the closing backtick). Backticks do not nest; backslash escapes
+    # the next char. Raises on an unterminated span.
+    i = start
+    n = len(cmd)
+    bt = chr(96)
+    while i < n:
+        c = cmd[i]
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if c == bt:
+            return cmd[start:i], i + 1
+        i += 1
+    raise ValueError("unterminated backtick substitution")
+
+def flatten_command(cmd, depth=0):
+    """Normalize a command for shlex tokenization so the downstream walk
+    sees every command-position gh write. Three jobs (#533, plus the #540
+    Phase-4b findings):
+      1. Replace UNQUOTED newlines AND shell separators (; | & && || |& ( ))
+         with space-padded standalone tokens. shlex never splits on these,
+         so without padding a `"foo";gh pr merge` or `$(...)`-glued `;`
+         leaves a top-level guarded write fused to a data token and unseen.
+      2. Extract $(...) and `...` command-substitution spans (with correct
+         nested + independent-quote tracking) and append each as its own
+         `; <span>` command segment, so a gh write that EXECUTES inside a
+         substitution is surfaced. The outer keeps a placeholder token.
+      3. Preserve quoted separators/newlines verbatim.
+    Unbalanced quotes / unterminated substitutions raise ValueError -> the
+    hook fails closed exactly like any other parse error."""
+    if depth > 25:
+        raise ValueError("command-substitution nesting too deep")
+    out = []
+    spans = []
+    i = 0
+    n = len(cmd)
+    in_single = False
+    in_double = False
+    while i < n:
+        c = cmd[i]
+        if c == "\\" and not in_single and i + 1 < n:
             out.append(c)
             out.append(cmd[i + 1])
             i += 2
             continue
-        # chr(39) is a single quote; using chr() avoids embedding a
-        # literal single quote inside the bash heredoc (which would
-        # break the python3 -c '...' surrounding quote).
-        if c == chr(39) and not in_double:
+        if c == _SQ and not in_double:
             in_single = not in_single
-        elif c == chr(34) and not in_single:
-            in_double = not in_double
-        elif c == "\n" and not in_single and not in_double:
-            # Pad with spaces on BOTH sides so shlex parses the
-            # `;` as its own token rather than gluing it to the
-            # preceding word (e.g. "ok;" instead of "ok" + ";").
-            out.append(" ; ")
+            out.append(c)
             i += 1
             continue
+        if c == _DQ and not in_single:
+            in_double = not in_double
+            out.append(c)
+            i += 1
+            continue
+        # Command substitution is performed unquoted AND inside double
+        # quotes, never inside single quotes.
+        if not in_single and c == "$" and i + 1 < n and cmd[i + 1] == "(":
+            span, j = _read_paren_span(cmd, i + 2)
+            spans.append(span)
+            out.append(" __MERGEPATH_CMDSUB__ ")
+            i = j
+            continue
+        if not in_single and c == chr(96):
+            span, j = _read_backtick_span(cmd, i + 1)
+            spans.append(span)
+            out.append(" __MERGEPATH_CMDSUB__ ")
+            i = j
+            continue
+        if not in_single and not in_double:
+            two = cmd[i:i + 2]
+            if two in ("&&", "||", "|&"):
+                out.append(" " + two + " ")
+                i += 2
+                continue
+            if c in (";", "|", "&", "(", ")"):
+                out.append(" " + c + " ")
+                i += 1
+                continue
+            if c == "\n":
+                out.append(" ; ")
+                i += 1
+                continue
         out.append(c)
         i += 1
-    return "".join(out)
+    if in_single or in_double:
+        raise ValueError("unbalanced quote")
+    result = "".join(out)
+    for span in spans:
+        result = result + " ; " + flatten_command(span, depth + 1)
+    return result
 
 # --- #533 item 1: surface inner commands hidden behind eval / sh -c ---
 # eval "<payload>" and sh|bash|dash -c "<payload>" run <payload> as a
@@ -342,6 +458,11 @@ def normalize_unquoted_newlines(cmd):
 _SEPARATORS = {"&&", "||", ";", "|", "|&", "&", "(", ")"}
 _SHELL_BASENAMES = {"sh", "bash", "dash", "zsh", "ksh"}
 _PREFIX_CMDS = {"sudo", "time", "nohup", "env", "command", "exec", "nice", "ionice"}
+# sh/bash options that consume the NEXT token as their value, so the -c
+# command flag (and the script positional) lie AFTER that value. Skipping
+# only the option (not its value) would mis-read the value as the script
+# and miss a trailing -c (#540: bash --rcfile FILE -c "<payload>").
+_SHELL_VALUE_OPTS = {"--rcfile", "--init-file", "-o", "+o", "-O", "+O"}
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 def expand_wrappers(tokens, depth=0):
@@ -373,7 +494,7 @@ def expand_wrappers(tokens, depth=0):
             while j < n and tokens[j] not in _SEPARATORS:
                 j += 1
             inner = " ".join(tokens[i + 1:j])
-            out.extend(expand_wrappers(shlex.split(normalize_unquoted_newlines(inner)), depth + 1))
+            out.extend(expand_wrappers(shlex.split(flatten_command(inner)), depth + 1))
             i = j
             continue
         if base in _SHELL_BASENAMES:
@@ -385,8 +506,28 @@ def expand_wrappers(tokens, depth=0):
             k = i + 1
             while k < seg_end:
                 t = tokens[k]
+                # A value-taking option consumes the NEXT token; skip both so
+                # the value is not mistaken for the script positional and a
+                # trailing -c is still found (#540: bash --rcfile FILE -c CMD).
+                if t in _SHELL_VALUE_OPTS:
+                    k += 2
+                    continue
+                # A long option (--norc, --noprofile, --rcfile=FILE, ...) is
+                # NOT the -c command-string flag even when it contains a c.
+                # #540 finding 1: matching any "c in t" let --norc consume the
+                # real -c as its payload and discard the command string.
+                if t.startswith("--"):
+                    k += 1
+                    continue
+                # A single-dash cluster including c IS the -c command flag
+                # (-c, -lc, -xc, ...). The command is the text attached after
+                # the c (-cCMD) or, failing that, the next token (-c CMD).
                 if t.startswith("-") and "c" in t:
-                    if k + 1 < seg_end:
+                    cpos = t.index("c", 1)
+                    attached = t[cpos + 1:]
+                    if attached:
+                        inner = attached
+                    elif k + 1 < seg_end:
                         inner = tokens[k + 1]
                     break
                 if t.startswith("-"):
@@ -394,7 +535,7 @@ def expand_wrappers(tokens, depth=0):
                     continue
                 break
             if inner is not None:
-                out.extend(expand_wrappers(shlex.split(normalize_unquoted_newlines(inner)), depth + 1))
+                out.extend(expand_wrappers(shlex.split(flatten_command(inner)), depth + 1))
             else:
                 out.extend(tokens[i:seg_end])
             i = seg_end
@@ -410,7 +551,7 @@ def expand_wrappers(tokens, depth=0):
 
 try:
     cmd = sys.stdin.read()
-    cmd = normalize_unquoted_newlines(cmd)
+    cmd = flatten_command(cmd)
     for tok in expand_wrappers(shlex.split(cmd)):
         sys.stdout.buffer.write(tok.encode("utf-8", errors="replace") + b"\x00")
 except ValueError as e:
