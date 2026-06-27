@@ -285,10 +285,10 @@ fi
 # trip the negatives, which would have caused a spurious FAIL). Indented
 # executable lines inside `run:` blocks still match (no `#` precedes the
 # command).
-if grep -qE '^[^#]*gh pr edit .+--remove-label needs-external-review' "$WORKFLOW" && \
-   ! grep -qE '^[^#]*gh pr edit .+--remove-label needs-human-review' "$WORKFLOW" && \
-   ! grep -qE '^[^#]*gh pr edit .+--remove-label policy-violation' "$WORKFLOW" && \
-   ! grep -qE '^[^#]*gh pr edit .+--remove-label human-hold' "$WORKFLOW"; then
+if grep -qE '^[^#]*gh pr edit[^#]*--remove-label needs-external-review([[:space:]]|$)' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label needs-human-review([[:space:]]|$)' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label policy-violation([[:space:]]|$)' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label human-hold([[:space:]]|$)' "$WORKFLOW"; then
   pass=$((pass + 1))
   echo "  PASS: scope discipline — only needs-external-review is auto-removed (executable line)"
 else
