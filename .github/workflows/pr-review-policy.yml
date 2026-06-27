@@ -206,12 +206,19 @@ jobs:
                 BASE_TREE=$(mktemp -d)
                 if git worktree add --quiet --detach "$BASE_TREE" "$BASE_SHA" 2>/dev/null; then
                   VERIFIER="$BASE_TREE/scripts/workflow/verify-propagation-pr.sh"
-                  if [ -f "$VERIFIER" ]; then
-                    if bash "$VERIFIER" "$MP_DIR" "$PWD" "$BASE_SHA" "$HEAD_SHA"; then
-                      PROPAGATION_LANE=true
-                    fi
-                  else
+                  if [ ! -f "$VERIFIER" ]; then
                     echo "Propagation lane: base commit has no scripts/workflow/verify-propagation-pr.sh (consumer not yet on the vendored verifier) — not lane-eligible; falls through to normal review."
+                  elif ! grep -q 'mergepath-verifier-contract: self-sourced-helpers-v1' "$VERIFIER"; then
+                    # #545 (4a P1): a base verifier predating the #531
+                    # self-sourcing hardening would source its helpers from
+                    # the runtime-cloned mergepath ($MP_DIR) — fetched shell
+                    # under a pull-requests: write job (RCE). Fail closed: do
+                    # NOT run it; fall through to normal review. The lane turns
+                    # on once the hardened verifier itself has propagated into
+                    # the consumer base.
+                    echo "Propagation lane: base verifier predates the #531 self-sourcing contract (no self-sourced-helpers-v1 tag) — not lane-eligible; falls through to normal review."
+                  elif bash "$VERIFIER" "$MP_DIR" "$PWD" "$BASE_SHA" "$HEAD_SHA"; then
+                    PROPAGATION_LANE=true
                   fi
                   git worktree remove --force "$BASE_TREE" 2>/dev/null || rm -rf "$BASE_TREE"
                 else

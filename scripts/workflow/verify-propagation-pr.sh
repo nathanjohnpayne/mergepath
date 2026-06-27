@@ -23,6 +23,16 @@ set -euo pipefail
 # (a `pull-requests: write` workflow running runtime-fetched shell is an
 # RCE surface).
 #
+# mergepath-verifier-contract: self-sourced-helpers-v1
+#   pr-review-policy.yml greps the BASE-commit copy of this file for the
+#   exact tag above BEFORE running it. A base verifier without the tag
+#   predates the #531 self-sourcing hardening (it sources its helpers
+#   from the runtime-cloned mergepath, i.e. fetched shell), so the review
+#   workflow fails closed and falls through to normal review instead of
+#   executing it. Keep this tag in lockstep with the self-sourcing block
+#   below — if you ever revert to sourcing from the runtime clone, drop
+#   the tag so no consumer treats the old shape as trusted.
+#
 # Two verification surfaces:
 #
 #   A. Canonical / kit entries — byte-for-byte equality against
