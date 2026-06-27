@@ -56,7 +56,7 @@ jobs:
       reviewers: ${{ steps.config.outputs.reviewers }}
       author_identity: ${{ steps.config.outputs.author_identity }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Parse review-policy.yml
         id: config
@@ -278,7 +278,7 @@ jobs:
     if: github.event_name == 'pull_request_review'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install js-yaml
         run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml
@@ -385,7 +385,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Dismiss self-approval from reviewer bot accounts
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install js-yaml
         run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml
@@ -503,7 +503,7 @@ jobs:
       !contains(github.event.pull_request.labels.*.name, 'human-hold')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Re-arm gate (#495). On the `synchronize` / `reopened` re-trigger
       # the approval is NOT in the event payload, so confirm via the API
