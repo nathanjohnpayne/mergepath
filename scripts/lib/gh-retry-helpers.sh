@@ -71,8 +71,10 @@ with_gh_retry() {
     err=""
   }
   # Clean up the tmpfile on any return path (success, permanent-fail,
-  # exhausted retries). Scoped to this function via RETURN trap; saved
-  # and restored so a caller-installed RETURN trap is not clobbered.
+  # exhausted retries) via a function-scoped RETURN trap. No caller in
+  # this repo installs its own RETURN trap, so none is clobbered here; if
+  # one ever does, save the prior `trap -p RETURN` before this line and
+  # restore it on the return paths.
   if [ -n "$err" ]; then
     trap 'rm -f "$err"' RETURN
   fi
