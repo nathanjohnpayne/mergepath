@@ -1707,8 +1707,12 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
       # (propagation_prs.enabled: false) must NOT get the local
       # self-approve bypass — mirror the CI Merge Clearance Gate, which
       # already reads this key. Per the DEFAULT-ON convention (#434) an
-      # absent block or absent `enabled` key counts as enabled; only a
-      # literal `false` disables the lane. Parsed with the same
+      # absent block or absent `enabled` key counts as enabled; otherwise
+      # ONLY a literal `true` keeps the lane on — any other present value
+      # (`false`, `TRUE`, `yes`, `1`, a typo) fails closed and disables
+      # the bypass (#540), matching the propagation-lane audit's
+      # exact-match rule so a misconfigured policy never silently grants
+      # self-approve. Parsed with the same
       # grep/awk posture the rest of this hook uses (no yq dependency in
       # the pre-write hook). The block scoping keeps a sibling block's
       # `enabled:` (coderabbit/codex/...) from being read by mistake.
@@ -1720,7 +1724,7 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
           inblock && /^[^[:space:]#]/ { inblock=0 }
           inblock && /^[[:space:]]+enabled:/ { print $2; exit }
         ' "$LANE_POLICY_PATH" 2>/dev/null | sed -E "s/^[\"']//; s/[\"']\$//" || true)
-        if [ "$LANE_PROP_ENABLED" = "false" ]; then
+        if [ -n "$LANE_PROP_ENABLED" ] && [ "$LANE_PROP_ENABLED" != "true" ]; then
           LANE_ENABLED=0
         fi
       fi

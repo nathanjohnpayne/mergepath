@@ -252,7 +252,9 @@ cd "$ORIG_DIR"
 # A mergepath-sync/* PR authored by the author identity skips the
 # same-agent self-approve guard even when over-threshold — but ONLY when
 # the lane is enabled. DEFAULT-ON: an absent propagation_prs block counts
-# as enabled; an explicit `enabled: false` must re-impose the guard.
+# as enabled; an explicit `enabled: false` must re-impose the guard, and
+# per #540 any other present non-`true` value (e.g. `yes`, a typo) also
+# re-imposes it (fail-closed exact-match).
 mkdir -p "$WORKDIR/repo-lane-default/.github"
 cat >"$WORKDIR/repo-lane-default/.github/review-policy.yml" <<'YML'
 external_review_threshold: 300
@@ -270,6 +272,17 @@ propagation_prs:
 YML
 cd "$WORKDIR/repo-lane-off"
 assert_rc_contains "lane bypass denied when propagation_prs.enabled false (#533)" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
+cd "$ORIG_DIR"
+
+mkdir -p "$WORKDIR/repo-lane-typo/.github"
+cat >"$WORKDIR/repo-lane-typo/.github/review-policy.yml" <<'YML'
+external_review_threshold: 300
+propagation_prs:
+  enabled: yes
+YML
+cd "$WORKDIR/repo-lane-typo"
+assert_rc_contains "lane bypass denied when propagation_prs.enabled is a present non-true value (#540)" 2 "self-approve detected" \
   'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
 cd "$ORIG_DIR"
 

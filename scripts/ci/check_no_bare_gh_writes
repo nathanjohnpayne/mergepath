@@ -29,7 +29,9 @@ if [ "${#FILES[@]}" -eq 0 ]; then
 fi
 
 set +e
-awk -v root="$REPO_ROOT/" '
+# sq carries a single-quote char into the (single-quoted) awk program so it
+# can match quotes inside command substitutions without a literal quote (#540).
+awk -v root="$REPO_ROOT/" -v sq="'" '
 # The write-class matchers, factored out so they can be run against BOTH a
 # whole line AND the contents of an echo/printf command substitution (#533).
 function gh_write_class(s) {
@@ -55,11 +57,12 @@ function gh_write_class(s) {
 # a log message that literally spells "gh project create") is excluded, so it
 # does not falsely match. Bash-3.2-safe / POSIX-awk: manual character walk,
 # no capture groups.
-function cmdsub_interiors(line,   i, c, n, depth, out, inbt, prev) {
+function cmdsub_interiors(line,   i, c, n, depth, out, inbt, prev, q) {
   n = length(line)
   out = ""
   depth = 0   # nesting depth inside $(...)
   inbt = 0    # currently inside a backtick pair
+  q = ""      # quote state inside $(): "" none, single, or double quote
   prev = ""
   for (i = 1; i <= n; i++) {
     c = substr(line, i, 1)
@@ -70,6 +73,22 @@ function cmdsub_interiors(line,   i, c, n, depth, out, inbt, prev) {
       continue
     }
     if (depth > 0) {
+      # Inside a command substitution. Track quotes so a ) or ( that sits
+      # inside a single- or double-quoted string is treated as literal,
+      # not as structure (bash does not end a substitution on a quoted
+      # paren). Quoted content is still captured so a gh write inside the
+      # quotes is not lost (the #540 quoted-paren-before-write bypass).
+      # sq holds a single-quote char (passed via -v) so this single-quoted
+      # awk program needs no literal quote of its own.
+      if (q != "") {
+        out = out c
+        if (q == sq) { if (c == sq) q = "" }
+        else if (c == "\"" && prev != "\\") { q = "" }
+        prev = c
+        continue
+      }
+      if (c == sq) { q = sq; out = out c; prev = c; continue }
+      if (c == "\"") { q = "\""; out = out c; prev = c; continue }
       if (c == "(" && prev == "$") { depth++ }
       else if (c == ")") { depth--; if (depth == 0) out = out " " }
       else { out = out c }
