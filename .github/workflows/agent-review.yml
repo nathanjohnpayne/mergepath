@@ -522,21 +522,47 @@ jobs:
       # earlier APPROVED, so a withdrawn approval does NOT re-arm.
       - name: Gate require existing non-author approval
         id: require_approval
-        if: github.event_name == 'pull_request'
+        if: >
+          github.event_name == 'pull_request' ||
+          github.event_name == 'pull_request_review'
         env:
           GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           REPO: ${{ github.repository }}
-          # #529: restrict the re-arm approval to REGISTERED agent reviewer
-          # identities (available_reviewers), matching scripts/codex-review-check.sh
-          # gate (b) and the required merge-clearance-gate. A non-author APPROVED
-          # from an account that is NOT a mapped reviewer identity must not arm
-          # auto-merge — defense-in-depth on the identity mapping the internal
-          # self-peer review relies on now that the CI-side reviewer invocation
-          # is gone.
+          # #529 / #544: restrict the approval that arms auto-merge to a
+          # REGISTERED agent reviewer identity (available_reviewers), matching
+          # scripts/codex-review-check.sh gate (b) and the required
+          # merge-clearance-gate. An APPROVED from an account that is NOT a
+          # mapped reviewer identity must not arm auto-merge on EITHER path:
+          # the synchronize re-arm (existing-review API check below) OR the
+          # direct pull_request_review approved event. #544 review: the gate
+          # previously ran only on pull_request, so a direct approval from an
+          # unregistered non-author skipped it (the merge-clearance-gate still
+          # backstopped the actual merge, but the arming gate should be
+          # consistent on both paths).
+          EVENT_REVIEWER: ${{ github.event.review.user.login }}
           REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
         run: |
+          REVIEWERS_JSON="${REVIEWERS_JSON:-[]}"
+          # Direct approval event: the approval IS the trigger, so verify the
+          # event reviewer is a registered, non-author reviewer here (#544).
+          if [ "${GITHUB_EVENT_NAME:-}" = "pull_request_review" ]; then
+            if [ -z "$EVENT_REVIEWER" ] || [ "$EVENT_REVIEWER" = "$PR_AUTHOR" ]; then
+              echo "::notice::Approval reviewer '$EVENT_REVIEWER' is empty or the PR author; not arming auto-merge."
+              echo "proceed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if ! printf '%s' "$REVIEWERS_JSON" | jq -e --arg r "$EVENT_REVIEWER" 'index($r) != null' >/dev/null 2>&1; then
+              echo "::notice::Approval reviewer '$EVENT_REVIEWER' is not a registered reviewer (available_reviewers); not arming auto-merge (#544)."
+              echo "proceed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Direct approval from registered reviewer $EVENT_REVIEWER; proceeding."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # --- synchronize / reopened re-arm path (existing API check) ---
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::notice::REVIEWER_ASSIGNMENT_TOKEN is not configured; cannot confirm an existing approval for the synchronize re-arm. Skipping auto-merge arming."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
@@ -594,10 +620,12 @@ jobs:
 
       - name: Check author merge token
         id: author_merge_token
-        # Skip the entire merge path when the synchronize re-arm gate
-        # found no existing approval. On the pull_request_review path the
-        # step above is skipped, so `proceed` is empty and the `!= 'false'`
-        # test lets the original approval-triggered flow through unchanged.
+        # Skip the entire merge path when the require_approval gate set
+        # proceed=false — either the synchronize re-arm found no existing
+        # registered-reviewer approval, or (since #544) the direct
+        # pull_request_review approver was not a registered reviewer. The
+        # `!= 'false'` test still lets a genuine registered-reviewer approval
+        # (proceed=true) and any other event shape (empty) through.
         if: steps.require_approval.outputs.proceed != 'false'
         env:
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
