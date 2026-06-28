@@ -695,6 +695,120 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 20 (#533): the check_merge_clearance_gate workflow-shape pre-flight
+# must require the required-check name to be a JOB name, not just any
+# indented name:. A step-level `name: Merge clearance gate` under a
+# differently-named job MUST fail the check — otherwise a coincidentally
+# named step could satisfy the branch-protection required-check contract
+# while the actual job name silently drifted and de-wired the gate.
+#
+# These point the check's WORKFLOW at a fixture via MERGE_CLEARANCE_WORKFLOW.
+# A failing workflow-shape pre-flight exits 1 BEFORE the check runs its
+# fixture test suite, so this stays cheap (no recursion into this file).
+# ---------------------------------------------------------------------------
+# Re-entrancy guard: Case C below invokes check_merge_clearance_gate, which
+# (on a clean pre-flight) runs THIS test file as its fixture suite. Skip the
+# Test 20 block in that nested run to avoid infinite recursion — the nested
+# run still exercises Tests 1-18.
+if [ -z "${MCG_SKIP_FIX3_SELFTEST:-}" ]; then
+echo; echo "--- Test 20: check_merge_clearance_gate job-name scope (#533)"
+CHECK_BIN="$ROOT/scripts/ci/check_merge_clearance_gate"
+
+# A minimal workflow that is otherwise shape-valid (all required triggers +
+# a schedule cron) so ONLY the job-name assertion is under test.
+write_wf_header() {
+  cat <<'WF'
+name: Merge Clearance Gate
+on:
+  pull_request:
+    types: [opened, synchronize]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  schedule:
+    - cron: "*/15 * * * *"
+permissions:
+  contents: read
+jobs:
+WF
+}
+
+# Case A (negative): the required name appears ONLY as a non-first step key
+# (deeper indent, no leading dash) under a differently-named job. Must FAIL.
+WF_STEP_NAME="$WORKDIR/wf-step-name.yml"
+{
+  write_wf_header
+  cat <<'WF'
+  some-other-job:
+    name: A completely different job
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        name: Merge clearance gate
+WF
+} > "$WF_STEP_NAME"
+set +e
+OUT=$(MERGE_CLEARANCE_WORKFLOW="$WF_STEP_NAME" "$CHECK_BIN" 2>&1)
+RC=$?
+set -e
+if [ "$RC" -ne 0 ] && echo "$OUT" | grep -q "must define a JOB named"; then
+  pass "step-level name: Merge clearance gate under a differently-named job → check FAILS (#533)"
+else
+  fail "expected check FAIL on step-level name (#533); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# Case B (negative): job name DRIFTED, but a step is named like the required
+# check. The drifted job + correctly-named step must still FAIL.
+WF_DRIFT="$WORKDIR/wf-job-drift.yml"
+{
+  write_wf_header
+  cat <<'WF'
+  merge-clearance-gate:
+    name: Merge clearance gate DRIFTED
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge clearance gate
+        run: echo step named like the required check
+WF
+} > "$WF_DRIFT"
+set +e
+OUT=$(MERGE_CLEARANCE_WORKFLOW="$WF_DRIFT" "$CHECK_BIN" 2>&1)
+RC=$?
+set -e
+if [ "$RC" -ne 0 ] && echo "$OUT" | grep -q "must define a JOB named"; then
+  pass "drifted job name + correctly-named step → check FAILS (#533)"
+else
+  fail "expected check FAIL on drifted job name (#533); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# Case C (positive control): a correctly-named JOB satisfies the assertion.
+# The check proceeds past the workflow-shape pre-flight (and runs its own
+# fixture suite). We only assert the job-name assertion does NOT fire — i.e.
+# the check does not emit the job-name FAIL line and exits clean.
+WF_OK="$WORKDIR/wf-ok.yml"
+{
+  write_wf_header
+  cat <<'WF'
+  merge-clearance-gate:
+    name: Merge clearance gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run gate
+        run: echo ok
+WF
+} > "$WF_OK"
+set +e
+OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$WF_OK" "$CHECK_BIN" 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 0 ] && ! echo "$OUT" | grep -q "must define a JOB named"; then
+  pass "correctly-named JOB → job-name assertion passes (#533)"
+else
+  fail "expected job-name assertion to pass on a correct job name (#533); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+fi  # end re-entrancy guard (MCG_SKIP_FIX3_SELFTEST)
+# ---------------------------------------------------------------------------
 echo
 echo "============================================"
 echo "test_merge_clearance_gate.sh: $PASS passed, $FAIL failed"

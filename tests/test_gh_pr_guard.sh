@@ -248,8 +248,158 @@ assert_rc_contains "same-agent under-threshold approve allowed" 0 "" \
   'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "small"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "5"
 cd "$ORIG_DIR"
 
+# --- #533 item 2: propagation lane bypass honors propagation_prs.enabled
+# A mergepath-sync/* PR authored by the author identity skips the
+# same-agent self-approve guard even when over-threshold — but ONLY when
+# the lane is enabled. DEFAULT-ON: an absent propagation_prs block counts
+# as enabled; an explicit `enabled: false` must re-impose the guard, and
+# per #540 any other present non-`true` value (e.g. `yes`, a typo) also
+# re-imposes it (fail-closed exact-match).
+mkdir -p "$WORKDIR/repo-lane-default/.github"
+cat >"$WORKDIR/repo-lane-default/.github/review-policy.yml" <<'YML'
+external_review_threshold: 300
+YML
+cd "$WORKDIR/repo-lane-default"
+assert_rc_contains "lane bypass allowed (default-on absent block)" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
+cd "$ORIG_DIR"
+
+mkdir -p "$WORKDIR/repo-lane-off/.github"
+cat >"$WORKDIR/repo-lane-off/.github/review-policy.yml" <<'YML'
+external_review_threshold: 300
+propagation_prs:
+  enabled: false
+YML
+cd "$WORKDIR/repo-lane-off"
+assert_rc_contains "lane bypass denied when propagation_prs.enabled false (#533)" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
+cd "$ORIG_DIR"
+
+mkdir -p "$WORKDIR/repo-lane-typo/.github"
+cat >"$WORKDIR/repo-lane-typo/.github/review-policy.yml" <<'YML'
+external_review_threshold: 300
+propagation_prs:
+  enabled: yes
+YML
+cd "$WORKDIR/repo-lane-typo"
+assert_rc_contains "lane bypass denied when propagation_prs.enabled is a present non-true value (#540)" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
+cd "$ORIG_DIR"
+
+# #540 P2 (4a review): a trailing comment on the propagation_prs header
+# (propagation_prs: # opt-out) must still be parsed, so enabled:false
+# disables the lane. The prior exact-EOL header match missed it and the
+# lane failed open.
+mkdir -p "$WORKDIR/repo-lane-comment/.github"
+cat >"$WORKDIR/repo-lane-comment/.github/review-policy.yml" <<'YML'
+external_review_threshold: 300
+propagation_prs:  # this repo opted out of the self-approve lane
+  enabled: false
+YML
+cd "$WORKDIR/repo-lane-comment"
+assert_rc_contains "lane bypass denied when propagation_prs header has a trailing comment (#540 P2)" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
+cd "$ORIG_DIR"
+
 assert_rc_contains "compound direct guarded write blocked" 2 "#348" \
   'gh issue close 7 && gh pr merge --admin 123'
+
+# --- #533 item 1: eval / sh -c / bash -c admin-merge bypass -----------
+# Each of these returned rc=0 (BYPASS) before the python tokenizer
+# re-tokenized eval/shell -c payloads: shlex kept the inner command as
+# one opaque token, so SAW_GH stayed 0 and the guard exited early. They
+# must now surface the inner guarded gh write and BLOCK (rc=2).
+assert_rc_contains "eval-wrapped gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'eval "gh pr merge 123 --admin"'
+
+assert_rc_contains "eval split-arg gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'eval "gh pr" "merge 123 --admin"'
+
+assert_rc_contains "bash -lc gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'bash -lc "gh pr merge 123 --admin"'
+
+assert_rc_contains "bash -c gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'bash -c "gh pr merge 123 --admin"'
+
+assert_rc_contains "sh -c gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'sh -c "gh pr merge 123 --admin"'
+
+# Recursion: a shell wrapper nesting eval (bash -c -> eval -> gh) must
+# expand all the way down.
+assert_rc_contains "bash -c eval gh pr merge blocked (#533 recursion)" 2 "token-verifying wrapper" \
+  'bash -c "eval gh pr merge 123 --admin"'
+
+# A guarded write hidden inside a shell -c compound must still trip #348.
+assert_rc_contains "shell -c compound guarded write blocked (#533/#348)" 2 "#348" \
+  'sh -c "gh issue close 1 && gh pr merge 123 --admin"'
+
+# No false positives: a wrapped command with no command-position gh
+# write stays allowed (the walk re-establishes command position on the
+# expanded stream, so a gh token that is mere data is not a write).
+assert_rc_contains "eval echo allowed (no gh)" 0 "" \
+  'eval "echo hello world"'
+
+assert_rc_contains "bash -c echo of gh text allowed (gh not in cmd position)" 0 "" \
+  'bash -c "echo gh pr merge --admin"'
+
+# --- #540 Phase-4b: nathanpayne-codex found two more guard bypasses ----
+# (1) bash --noprofile --norc -c "<payload>": the option scan matched any
+#     flag containing a 'c', so --norc consumed the real -c and dropped the
+#     command string. Long (--) options are now skipped so the real -c is
+#     found.
+assert_rc_contains "bash --norc -c gh pr merge --admin blocked (#540)" 2 "" \
+  'bash --noprofile --norc -c "gh pr merge 1 --admin"'
+assert_rc_contains "bash --rcfile -c still finds the real -c (#540)" 2 "" \
+  'bash --rcfile /dev/null -c "gh pr merge 1 --admin"'
+
+# (3) <prefix> [opts] bash -c "<payload>": a prefix command with its OWN
+#     options (env -i, sudo -u USER, nice -n N) must consume those options
+#     so the wrapped bash -c is still found. Previously a prefix option
+#     fell through and flipped command-position off, hiding the bash -c
+#     gh-write (#540 P1, 4a review).
+assert_rc_contains "env -i bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'env -i bash -c "gh pr merge 1 --admin"'
+assert_rc_contains "sudo -u USER bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'sudo -u nobody bash -c "gh pr merge 1 --admin"'
+assert_rc_contains "nice -n N bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'nice -n 5 bash -c "gh pr merge 1 --admin"'
+# sudo -n is a no-value FLAG (unlike nice -n), so bash stays in command
+# position and is still expanded (per-prefix value-option table).
+assert_rc_contains "sudo -n bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'sudo -n bash -c "gh pr merge 1 --admin"'
+# An env NAME=VALUE assignment before the shell is skipped, not mistaken
+# for the wrapped command.
+assert_rc_contains "env VAR=x bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'env FOO=bar bash -c "gh pr merge 1 --admin"'
+# Control: a prefix wrapping a benign echo of gh text stays allowed (gh is
+# not in command position inside the echo).
+assert_rc_contains "sudo -u x bash -c echo gh text allowed (#540 P1)" 0 "" \
+  'sudo -u nobody bash -c "echo gh pr merge --admin"'
+
+# (2) a command substitution with a quoted ) desynced shlex quote tracking
+#     and glued a top-level "; gh ..." into a data token. The python
+#     preprocessor is now command-substitution aware: it pads unquoted
+#     separators and surfaces commands inside $(...) / backticks.
+assert_rc_contains "cmd-sub quoted-paren hides top-level gh merge blocked (#540)" 2 "" \
+  'echo "$(printf %s ")")"; gh pr merge 1 --admin'
+
+# Related command-substitution / subshell vectors the same fix closes: a
+# gh write that EXECUTES inside $(...), a backtick, a subshell, or an
+# assignment substitution is surfaced and blocked (also required the
+# fast-path pre-filter boundary to count ( / $ / ; / backtick, not only
+# whitespace, so the hook does not early-exit before tokenizing).
+assert_rc_contains "gh write inside command substitution blocked (#540)" 2 "" \
+  'echo "$(gh pr merge 1 --admin)"'
+assert_rc_contains "gh write in subshell blocked (#540)" 2 "" \
+  '(gh pr merge 1 --admin)'
+assert_rc_contains "gh write in assignment substitution blocked (#540)" 2 "" \
+  'X=$(gh pr merge 1 --admin)'
+assert_rc_contains "gh write in backtick substitution blocked (#540)" 2 "" \
+  'echo `gh pr merge 1 --admin`'
+
+# Control: a READ inside a substitution is not a guarded write -> allowed.
+assert_rc_contains "gh read inside command substitution allowed (#540)" 0 "" \
+  'echo "$(gh pr view 1)"'
 
 # --- author-wrapper identity pin (#438) -------------------------------
 
