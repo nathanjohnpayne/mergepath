@@ -142,6 +142,28 @@ assert_eq "inline comment stripped from payments entry" "1" "$got"
 got=$(bash "$PARSE" "$FIXTURE" external_review_paths | grep 'payments' | head -1)
 assert_eq "payments entry is clean glob, no trailing comment" "src/payments/**" "$got"
 
+# #536: single-quoted list entries must have their quotes stripped, same
+# as double-quoted. Before the fix, `- '.github/**'` came out as the
+# literal `'.github/**'` (quotes intact), so downstream glob matching
+# silently missed it. Mixed single/double + an inline comment on a
+# single-quoted entry exercises the close-quote + comment strip.
+sq_fixture=$(mktemp "${TMPDIR:-/tmp}/policy-singlequote.XXXXXX")
+cat >"$sq_fixture" <<'YAML'
+external_review_paths:
+  - '.github/**'
+  - 'src/auth/**'  # single-quoted with trailing comment
+  - "src/payments/**"
+  - unquoted/**
+next_key: stop
+YAML
+got=$(bash "$PARSE" "$sq_fixture" external_review_paths)
+want='.github/**
+src/auth/**
+src/payments/**
+unquoted/**'
+assert_eq "#536: single-quoted entries strip quotes (mixed single/double/unquoted)" "$want" "$got"
+rm -f "$sq_fixture"
+
 echo
 echo "match_protected_paths.sh tests"
 

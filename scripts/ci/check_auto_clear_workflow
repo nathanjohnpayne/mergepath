@@ -35,7 +35,11 @@ if command -v yq >/dev/null 2>&1; then
     echo "  FAIL: workflow YAML invalid (per yq)" >&2
   fi
 elif python3 -c "import yaml" >/dev/null 2>&1; then
-  if python3 -c "import yaml; yaml.safe_load(open('$WORKFLOW'))" 2>/dev/null; then
+  # Pass the path via argv (sys.argv[1]) instead of string-interpolating
+  # `$WORKFLOW` into the Python source literal. Interpolation was brittle:
+  # a path containing a quote or backslash would break the literal (or
+  # worse). argv keeps the path out of the parsed Python text entirely.
+  if WORKFLOW="$WORKFLOW" python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$WORKFLOW" 2>/dev/null; then
     pass=$((pass + 1))
     echo "  PASS: workflow YAML parses (via python+PyYAML)"
   else
@@ -274,10 +278,17 @@ fi
 # `gh pr edit ... --remove-label` executable line, not anywhere in
 # the file (header comments/attribution-message would otherwise
 # satisfy the match even if the executable line regressed).
-if grep -qE 'gh pr edit .+--remove-label needs-external-review' "$WORKFLOW" && \
-   ! grep -qE 'gh pr edit .+--remove-label needs-human-review' "$WORKFLOW" && \
-   ! grep -qE 'gh pr edit .+--remove-label policy-violation' "$WORKFLOW" && \
-   ! grep -qE 'gh pr edit .+--remove-label human-hold' "$WORKFLOW"; then
+# #536 hardening: anchor with `^[^#]*` so a `#` appearing before
+# `gh pr edit` disqualifies the line — a COMMENT that merely mentions
+# `gh pr edit --remove-label needs-external-review` can no longer satisfy
+# the positive check (nor can a commented-out forbidden-label removal
+# trip the negatives, which would have caused a spurious FAIL). Indented
+# executable lines inside `run:` blocks still match (no `#` precedes the
+# command).
+if grep -qE '^[^#]*gh pr edit[^#]*--remove-label needs-external-review([[:space:]]|$)' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label needs-human-review([[:space:]]|$)' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label policy-violation([[:space:]]|$)' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label human-hold([[:space:]]|$)' "$WORKFLOW"; then
   pass=$((pass + 1))
   echo "  PASS: scope discipline — only needs-external-review is auto-removed (executable line)"
 else

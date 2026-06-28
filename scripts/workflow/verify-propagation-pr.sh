@@ -13,10 +13,25 @@ set -euo pipefail
 #
 # This script is the teeth. It byte-compares every file the PR
 # changes against the SAME path in a checkout of mergepath at the
-# sync's source commit. It is TRUSTED ONLY when invoked from that
-# mergepath checkout (the immutable, public commit the PR's branch
-# name points at) — never from the PR's own checkout, which the PR
-# could have tampered with.
+# sync's source commit (<mergepath_dir>, used as a DATA source only).
+# It is TRUSTED when invoked from a tamper-proof in-repo location:
+# pr-review-policy.yml runs the consumer's OWN copy from the PR's BASE
+# commit (propagated + reviewed; the PR cannot edit its base), and this
+# script sources its helper scripts + libs from its own directory
+# (#531). It must NOT be run from the PR's own checkout (the PR could
+# tamper with it) nor executed out of the runtime-cloned mergepath@<sha>
+# (a `pull-requests: write` workflow running runtime-fetched shell is an
+# RCE surface).
+#
+# mergepath-verifier-contract: self-sourced-helpers-v1
+#   pr-review-policy.yml greps the BASE-commit copy of this file for the
+#   exact tag above BEFORE running it. A base verifier without the tag
+#   predates the #531 self-sourcing hardening (it sources its helpers
+#   from the runtime-cloned mergepath, i.e. fetched shell), so the review
+#   workflow fails closed and falls through to normal review instead of
+#   executing it. Keep this tag in lockstep with the self-sourcing block
+#   below — if you ever revert to sourcing from the runtime clone, drop
+#   the tag so no consumer treats the old shape as trusted.
 #
 # Two verification surfaces:
 #
@@ -91,13 +106,20 @@ if [ ! -f "$MANIFEST" ]; then
   exit 2
 fi
 
-# The parser is taken from the mergepath checkout too — TRUSTED,
-# same provenance as the manifest and the canonical content.
-PARSE_MANIFEST="$MERGEPATH_DIR/scripts/workflow/parse_manifest_paths.sh"
-MATCH_PATHS="$MERGEPATH_DIR/scripts/workflow/match_protected_paths.sh"
+# #531: the parser + match helpers run from THIS verifier's own
+# directory (the consumer's in-repo, propagated, reviewed copy — invoked
+# from the PR's BASE commit by pr-review-policy.yml, which the PR cannot
+# tamper with), NOT from $MERGEPATH_DIR. $MERGEPATH_DIR is a DATA source
+# ONLY (manifest text + canonical content via git ls-tree / git show +
+# template sources), so no shell is ever executed out of the
+# runtime-cloned mergepath@<sha> — the RCE surface a `pull-requests:
+# write` workflow must not have.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PARSE_MANIFEST="$SCRIPT_DIR/parse_manifest_paths.sh"
+MATCH_PATHS="$SCRIPT_DIR/match_protected_paths.sh"
 for h in "$PARSE_MANIFEST" "$MATCH_PATHS"; do
   if [ ! -f "$h" ]; then
-    echo "verify-propagation-pr.sh: missing trusted helper in mergepath checkout: $h" >&2
+    echo "verify-propagation-pr.sh: missing trusted in-repo helper alongside the verifier: $h" >&2
     exit 2
   fi
 done
@@ -114,7 +136,22 @@ fi
 
 # Files the PR changes (three-dot: changes since the merge-base, the
 # same range the External Review Check uses).
-CHANGED_FILES=$(git -C "$CONSUMER_DIR" diff --name-only "$BASE_SHA...$HEAD_SHA")
+#
+# #536: the lane is intentionally DIFF-SCOPED — it verifies that THIS
+# PR's changed files are a faithful mirror. Standing drift on already-
+# merged manifest paths OUTSIDE this PR's diff is the weekly drift
+# audit's job (scripts/audit-propagation-lane.sh checks every consumer's
+# live default branch), not the per-PR lane's. Re-verifying the full
+# canonical surface here would also false-fail consumers carrying a
+# legitimate .sync-overrides.yml exception on an unrelated path.
+#
+# #536: capture git's failure explicitly so an unresolved base/head (or
+# a non-work-tree CONSUMER_DIR) returns the documented exit 2 instead of
+# git's raw 128 escaping through `set -e`.
+if ! CHANGED_FILES=$(git -C "$CONSUMER_DIR" diff --name-only "$BASE_SHA...$HEAD_SHA" 2>/dev/null); then
+  echo "verify-propagation-pr.sh: could not compute the PR diff ($BASE_SHA...$HEAD_SHA in $CONSUMER_DIR) — unresolved base/head or not a git work tree" >&2
+  exit 2
+fi
 if [ -z "$CHANGED_FILES" ]; then
   echo "verify-propagation-pr.sh: PR has no changed files — nothing to verify" >&2
   exit 1
@@ -220,11 +257,13 @@ infer_consumer_from_pr_context() {
   return 1
 }
 
-# Source the template lib and facts helper from the TRUSTED mergepath
-# checkout. Same provenance rule as the parser helpers above — never
-# from the PR's working tree.
-TEMPLATE_LIB="$MERGEPATH_DIR/scripts/lib/template-substitution.sh"
-FACTS_HELPER="$MERGEPATH_DIR/scripts/lib/manifest-fact-helpers.sh"
+# #531: source the template lib + facts helper from THIS verifier's own
+# tree (the trusted in-repo copy alongside SCRIPT_DIR), NOT from the
+# runtime-cloned $MERGEPATH_DIR. The clone supplies only the template
+# SOURCE files (data, rendered by this trusted code) and the consumer
+# facts (read from the manifest text) — never executable shell.
+TEMPLATE_LIB="$SCRIPT_DIR/../lib/template-substitution.sh"
+FACTS_HELPER="$SCRIPT_DIR/../lib/manifest-fact-helpers.sh"
 
 # Only attempt the templated surface if both trusted helpers are
 # present in mergepath@<sha>. Missing helpers → fall through to the

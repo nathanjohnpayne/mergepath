@@ -52,19 +52,67 @@ with_gh_retry() {
   # already caught.
   local attempt=1
   local rc=0
+  local out=""
+  local errtext=""
   local output=""
 
+  # Separate stderr capture (#536): gh writes deprecation notices and
+  # other warnings to stderr even on a successful call. The prior
+  # implementation captured `2>&1` and re-emitted the combined stream on
+  # success, so that stderr chatter contaminated JSON / exact-text
+  # consumers (e.g. codex-review-check.sh parsing statusCheckRollup). We
+  # now route stderr to a tmpfile, emit ONLY stdout on success, and fold
+  # the two streams together (`output`) solely for failure
+  # classification + logging. A tmpfile (not process substitution) keeps
+  # this bash 3.2 safe and avoids the subshell-scoping traps of `<(...)`.
+  local err
+  err=$(mktemp "${TMPDIR:-/tmp}/gh-retry-err.XXXXXX") || {
+    printf '[gh-retry] WARN: mktemp failed; falling back to combined stream\n' >&2
+    err=""
+  }
+  # Clean up the tmpfile on any return path (success, permanent-fail,
+  # exhausted retries) via a RETURN trap that CLEARS ITSELF (trap -
+  # RETURN) as it fires. Self-clearing is required: a bare RETURN trap
+  # lingers after with_gh_retry returns and re-fires on the caller's own
+  # function / source return, where the local `err` is out of scope —
+  # under set -u that aborts the caller with `err: unbound variable`
+  # (#545 P2). No caller in this repo installs its own RETURN trap, so
+  # clearing (rather than save/restore) clobbers nothing.
+  if [ -n "$err" ]; then
+    trap 'rm -f "$err"; trap - RETURN' RETURN
+  fi
+
   while [ "$attempt" -le "$attempts" ]; do
-    # Capture stdout+stderr AND the exit code in one shot. Using
-    # `if output=...; then` would discard `$?` after the failed
+    # Capture stdout and the exit code; stderr goes to the tmpfile.
+    # Using `if out=...; then` would discard `$?` after the failed
     # `if` test (bash resets $? to 0 in that position), so we
     # invoke + check separately. `|| rc=$?` keeps `set -e` happy
     # because the `||` short-circuit consumes the non-zero exit.
     rc=0
-    output=$("$@" 2>&1) || rc=$?
+    if [ -n "$err" ]; then
+      out=$("$@" 2>"$err") || rc=$?
+      errtext=$(cat "$err" 2>/dev/null || true)
+    else
+      # Fallback path (mktemp unavailable): preserve prior combined
+      # behavior rather than dropping stderr entirely.
+      out=$("$@" 2>&1) || rc=$?
+      errtext=""
+    fi
     if [ "$rc" -eq 0 ]; then
-      printf '%s' "$output"
+      # Success: emit ONLY stdout. Any stderr (warnings/deprecations)
+      # is intentionally dropped so downstream parsers see clean output.
+      printf '%s' "$out"
       return 0
+    fi
+
+    # Combined stream for classification + logging on the FAILURE path
+    # only. Joining with a newline keeps grep line-anchored matches
+    # working across the stdout/stderr boundary.
+    if [ -n "$errtext" ]; then
+      output="$out
+$errtext"
+    else
+      output="$out"
     fi
 
     # Classify the failure. Permanent failures break out immediately.

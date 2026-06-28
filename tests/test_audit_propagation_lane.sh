@@ -196,6 +196,30 @@ else
   fail "#454: live mode should fail closed w/o a token; got rc=$RC, out: $OUT"
 fi
 
+# --- #521: token check ordered BEFORE manifest/yq prerequisites -----------
+# Run live mode from a directory with NO .mergepath-sync.yml and NO yq on
+# PATH, with no token. Pre-#521 the yq/manifest checks ran first and the
+# script exited 2 ("yq is required" / "manifest not found") — the WRONG
+# diagnostic when the real blocker is the absent reviewer token. After the
+# reorder, the token-presence check fires first → exit 3 + "reviewer token".
+NO_MANIFEST_DIR="$WORKDIR/no-manifest"; mkdir -p "$NO_MANIFEST_DIR"
+# Minimal PATH WITHOUT yq (and without the stub yq), so if the yq check ran
+# first it would exit 2. jq/coreutils from /usr/bin keep the script runnable
+# up to the token gate.
+NOYQ_PATH_521="/usr/bin:/bin:/usr/sbin:/sbin"
+set +e
+OUT=$( cd "$NO_MANIFEST_DIR" && PATH="$NOYQ_PATH_521" OP_PREFLIGHT_CACHE_DIR="$EMPTY_CACHE" \
+  MERGEPATH_AGENT="nobody-xyz" env -u GH_TOKEN "$SCRIPT" --repos __none__ 2>&1 )
+RC=$?
+set -e
+if [ "$RC" = "3" ] && echo "$OUT" | grep -qi "reviewer token" \
+   && ! echo "$OUT" | grep -qi "yq is required" \
+   && ! echo "$OUT" | grep -qi "not found"; then
+  pass "#521: missing token fails fast (exit 3) BEFORE the yq/manifest checks"
+else
+  fail "#521: token check should precede manifest/yq prereqs; got rc=$RC, out: $OUT"
+fi
+
 echo ""
 echo "test_audit_propagation_lane: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

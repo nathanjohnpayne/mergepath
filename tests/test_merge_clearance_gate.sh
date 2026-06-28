@@ -656,7 +656,46 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 19 (#533): the check_merge_clearance_gate workflow-shape pre-flight
+# Test 19 (#536): a SINGLE-QUOTED boolean — `enabled: 'true'` — must be
+# parsed as the bare `true`, not the literal `'true'` that trips the
+# true|false validator (exit 2). Before the nested_field quote-strip fix,
+# this aborted with rc=2; now it reads `true` and the gate evaluates
+# normally (APPROVED on HEAD → exit 0 PASS).
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 19: single-quoted enabled: 'true' parses (no validator trip) (#536)"
+SCRATCH=$(mktemp -d "$WORKDIR/scratch.XXXXXX"); mkdir -p "$SCRATCH/.github"
+cat >"$SCRATCH/.github/review-policy.yml" <<EOF
+external_review_threshold: 300
+external_review_paths:
+  - ".github/**"
+
+available_reviewers:
+  - nathanpayne-claude
+
+codex:
+  external_review_gate:
+    enabled: 'false'
+
+dependabot:
+  reviewer_gate:
+    enabled: 'true'
+EOF
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$(jq -n --arg sha "$HEAD_SHA" '
+  [{ user:{login:"nathanpayne-claude"}, state:"APPROVED", commit_id:$sha, submitted_at:"2026-06-01T10:00:00Z" }]
+')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "PASS"; then
+  pass "single-quoted enabled: 'true' parsed as true → gate evaluates (exit 0)"
+else
+  fail "expected rc=0 PASS (single-quote stripped); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 20 (#533): the check_merge_clearance_gate workflow-shape pre-flight
 # must require the required-check name to be a JOB name, not just any
 # indented name:. A step-level `name: Merge clearance gate` under a
 # differently-named job MUST fail the check — otherwise a coincidentally
@@ -669,10 +708,10 @@ fi
 # ---------------------------------------------------------------------------
 # Re-entrancy guard: Case C below invokes check_merge_clearance_gate, which
 # (on a clean pre-flight) runs THIS test file as its fixture suite. Skip the
-# Test 19 block in that nested run to avoid infinite recursion — the nested
+# Test 20 block in that nested run to avoid infinite recursion — the nested
 # run still exercises Tests 1-18.
 if [ -z "${MCG_SKIP_FIX3_SELFTEST:-}" ]; then
-echo; echo "--- Test 19: check_merge_clearance_gate job-name scope (#533)"
+echo; echo "--- Test 20: check_merge_clearance_gate job-name scope (#533)"
 CHECK_BIN="$ROOT/scripts/ci/check_merge_clearance_gate"
 
 # A minimal workflow that is otherwise shape-valid (all required triggers +
@@ -769,7 +808,6 @@ else
   fail "expected job-name assertion to pass on a correct job name (#533); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 fi  # end re-entrancy guard (MCG_SKIP_FIX3_SELFTEST)
-
 # ---------------------------------------------------------------------------
 echo
 echo "============================================"

@@ -200,15 +200,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-command -v yq >/dev/null 2>&1 || { err "yq is required (brew install yq)"; exit 2; }
-yq --version 2>&1 | grep -q "mikefarah/yq" || { err "mikefarah/yq v4+ required"; exit 2; }
-command -v gh >/dev/null 2>&1 || { err "gh is required"; exit 2; }
-[ -f "$MANIFEST" ] || { err "$MANIFEST not found (run from the mergepath root)"; exit 2; }
-
 # --- live-mode credential binding (#454) ------------------------------------
 # Live mode does GitHub reads; bind them to a VERIFIED reviewer token rather
 # than ambient gh state. --check-files mode returned above, so none of this
 # runs offline (that mode needs no token, preflight, gh, or network).
+#
+# #521: the token-presence check is ordered BEFORE the manifest/yq/gh
+# prerequisite checks so a missing reviewer token fails fast with its own
+# diagnostic (exit 3), rather than first erroring on a missing yq/manifest
+# (exit 2) — which is the wrong signal when the real blocker is the absent
+# credential. The token-presence path depends only on the preflight cache,
+# not on yq/gh/the manifest. The IDENTITY verification below still runs
+# after the `gh` check, since it calls `gh api user`.
 __LANE_AUDIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Auto-source the op-preflight cache when GH_TOKEN is unset and a fresh cache
 # exists — the #282 pattern the sibling helpers use. A caller-supplied
@@ -222,6 +225,14 @@ if [ -z "${GH_TOKEN:-}" ]; then
   err "live mode needs a reviewer token. Run: eval \"\$(scripts/op-preflight.sh --agent <agent> --mode review)\", or set GH_TOKEN to a reviewer PAT."
   exit 3
 fi
+
+# Manifest / tooling prerequisites (needed for the live per-consumer loop
+# AND the identity verification's `gh api user` call below).
+command -v yq >/dev/null 2>&1 || { err "yq is required (brew install yq)"; exit 2; }
+yq --version 2>&1 | grep -q "mikefarah/yq" || { err "mikefarah/yq v4+ required"; exit 2; }
+command -v gh >/dev/null 2>&1 || { err "gh is required"; exit 2; }
+[ -f "$MANIFEST" ] || { err "$MANIFEST not found (run from the mergepath root)"; exit 2; }
+
 # Verify the effective token identity is an available_reviewers reviewer
 # (fail closed). Hard-require the shared reader: an unverifiable token must
 # error rather than read live data under an unknown identity.

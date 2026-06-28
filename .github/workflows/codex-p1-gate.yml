@@ -90,7 +90,18 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 0
+          # persist-credentials: false (#545 review / zizmor artipacked):
+          # this job only runs the API-driven scripts/codex-p1-gate.sh — it
+          # never pushes or uses the workspace git remote, so no token needs
+          # to linger in .git/config.
+          persist-credentials: false
+          # Shallow checkout (#536): this job only runs
+          # scripts/codex-p1-gate.sh, which is API-driven (takes a PR
+          # number + repo and queries the GitHub API) — it never reads
+          # git history. `fetch-depth: 0` cloned the entire history for
+          # nothing; the default depth-1 checkout is sufficient for the
+          # trusted gate script.
+          fetch-depth: 1
 
       - name: Resolve PR number
         id: pr
@@ -157,7 +168,16 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 0
+          # persist-credentials: false (#545 review / zizmor artipacked):
+          # this job only runs the API-driven scripts/codex-p1-gate.sh — it
+          # never pushes or uses the workspace git remote, so no token needs
+          # to linger in .git/config.
+          persist-credentials: false
+          # Shallow checkout (#536): the scheduled sweep also only runs
+          # the API-driven scripts/codex-p1-gate.sh per open PR (listed
+          # via `gh pr list`, head SHA via `gh api`). No git history is
+          # read, so the full-history clone was pure overhead.
+          fetch-depth: 1
 
       - name: Find open PRs
         id: find

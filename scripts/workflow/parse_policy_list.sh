@@ -51,11 +51,17 @@ awk -v key="$KEY" '
   in_block && /^ *-/ {
     line = $0
     sub(/^ *- */, "", line)
-    if (line ~ /^"/) {
-      # Quoted entry: strip the leading `"`, then the closing `"`
-      # plus any trailing whitespace and inline comment.
-      sub(/^"/, "", line)
-      sub(/"[[:space:]]*(#.*)?$/, "", line)
+    if (line ~ /^["\047]/) {
+      # Quoted entry (single OR double, #536): strip the leading quote,
+      # then the matching closing quote plus any trailing whitespace and
+      # inline comment. \047 is the octal escape for a single quote.
+      # Single-quoted entries like `- '"'"'.github/**'"'"'` previously kept
+      # their quotes, so policy matching silently missed them. Capture the
+      # opening quote char and strip the SAME char at the close so a value
+      # legitimately containing the other quote style is preserved.
+      q = substr(line, 1, 1)
+      sub(/^["\047]/, "", line)
+      sub(q "[[:space:]]*(#.*)?$", "", line)
     } else {
       # Unquoted entry: strip only the trailing whitespace + comment.
       sub(/[[:space:]]+#.*$/, "", line)
