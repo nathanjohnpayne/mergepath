@@ -707,6 +707,40 @@ else
   fail "author wrapper unset identity under custom expected author fails closed: rc=$rc; output: $out"
 fi
 
+# --- #546: parser-completeness hardening (gap 1 + gap 2) --------------
+# Gap 1 — a blessed wrapper must not hide a shell-c payload. Before #546 the
+# wrappers were not prefix-like in expand_wrappers, so a "<wrapper> -- bash
+# -c <gh write>" left the inner write opaque and it ran under the verified
+# token WITHOUT the merge-state / admin / CODEX gate. The inner write must
+# now surface and face the same checks as a visible "<wrapper> -- gh ...".
+assert_rc_contains "author wrapper hides bash -c merge: state still checked (#546 gap 1)" 2 "mergeStateStatus is BLOCKED" \
+  'scripts/gh-as-author.sh -- bash -c "gh pr merge 123 --squash"' "BLOCKED" ""
+assert_rc_contains "author wrapper bash -c clean merge still allowed (#546 gap 1, no false block)" 0 "" \
+  'scripts/gh-as-author.sh -- bash -c "gh pr merge 123 --squash"' "CLEAN" ""
+assert_rc_contains "author wrapper hides eval admin merge: surfaced + blocked (#546 gap 1)" 2 "" \
+  'scripts/gh-as-author.sh -- eval "gh pr merge 123 --admin"' "CLEAN" ""
+assert_rc_contains "reviewer wrapper hides bash -c admin merge: surfaced + blocked (#546 gap 1)" 2 "" \
+  'scripts/gh-as-reviewer.sh -- bash -c "gh pr merge 123 --admin"' "CLEAN" ""
+assert_rc_contains "wrapper bash -c echo of gh text is not a write (#546 gap 1, no false positive)" 0 "" \
+  'scripts/gh-as-author.sh -- bash -c "echo gh pr merge --admin"' "CLEAN" ""
+
+# Gap 2 — the python pre-pass and the bash walk read ONE shared
+# PREFIX_VALUE_OPTS_SPEC, so a long-form prefix value-option no longer
+# mis-skips. Before #546 python expanded "sudo --user X bash -c <gh write>"
+# but the bash compound scan (short-forms only) mis-read X as the command
+# and never saw the surfaced gh, so a guarded write passed rc=0.
+assert_rc_contains "sudo --user long form bash -c gh write surfaced (#546 gap 2)" 2 "token-verifying wrapper" \
+  'sudo --user root bash -c "gh pr merge 123 --admin"'
+assert_rc_contains "nice --adjustment long form bash -c gh write surfaced (#546 gap 2)" 2 "token-verifying wrapper" \
+  'nice --adjustment 10 bash -c "gh pr merge 123 --admin"'
+assert_rc_contains "time -f value option bash -c gh write surfaced (#546 gap 2)" 2 "token-verifying wrapper" \
+  'time -f FMT bash -c "gh pr merge 123 --admin"'
+# Bogus sudo:-s / sudo:-c removed from the shared spec: -s is a no-value
+# flag, so the FOLLOWING token is the command, not -s's value. Before #546
+# the bash table wrongly skipped it and lost the gh write.
+assert_rc_contains "sudo -s no-value flag does not swallow the gh write (#546 gap 2)" 2 "token-verifying wrapper" \
+  'sudo -s gh pr merge 123 --admin'
+
 echo ""
 echo "test_gh_pr_guard: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
