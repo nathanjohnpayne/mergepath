@@ -43,12 +43,23 @@ jobs:
     # stays scoped to opened/ready/labeled. See #59 for the
     # SKIPPED-as-SUCCESS miss this
     # closes and Codex's P2 on PR #131 for why labeled is excluded.
+    # #557: ALSO run on approved pull_request_review events. The
+    # auto-merge-on-approval registered-reviewer gate (require_approval)
+    # reads needs.load-config.outputs.reviewers on the direct-approval
+    # path; if load-config is skipped on review events that list is empty,
+    # the gate defaults REVIEWERS_JSON to [], rejects every approver as
+    # "not a registered reviewer", and never arms auto-merge (the merge
+    # still backstops via merge-clearance-gate, but the convenience #544
+    # added — and the one-shot-arming gap #495 closed — regress). This job
+    # only reads the static review-policy.yml, so it is event-shape-agnostic.
     if: >
-      github.event_name == 'pull_request' &&
-      (github.event.action == 'opened' ||
-       github.event.action == 'ready_for_review' ||
-       github.event.action == 'synchronize' ||
-       github.event.action == 'reopened')
+      (github.event_name == 'pull_request' &&
+       (github.event.action == 'opened' ||
+        github.event.action == 'ready_for_review' ||
+        github.event.action == 'synchronize' ||
+        github.event.action == 'reopened')) ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.state == 'approved')
     runs-on: ubuntu-latest
     outputs:
       threshold: ${{ steps.config.outputs.threshold }}
