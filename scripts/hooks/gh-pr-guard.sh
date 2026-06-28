@@ -261,6 +261,18 @@ elif echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|
   # Quote-stripped (Codex #551): a quoted `'env'` runs env but would otherwise
   # leave a quote, not whitespace, after `env` and dodge this probe.
   NEEDS_TOKENIZE=1
+elif echo "$COMMAND" | tr -d "\"'" \
+     | grep -qE '(^|[;&|(])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*(\$\(|`)'; then
+  # #553 (CodeRabbit Critical): a command substitution in COMMAND position can
+  # synthesize the executable name (e.g. `$(printf '\147\150')` -> gh), so the
+  # raw command carries no literal `gh` and the gh / env -S probes above miss
+  # it. Force tokenization when a cmdsub sits at command position (start, after
+  # a `;`/`&&`/`||`/`|`/`(` separator, or after env-assignment prefixes); the
+  # flattener lifts it to __MERGEPATH_CMDSUB__ and the command-position arms in
+  # the token walk treat it as a potential `gh` and fail closed on any pr/issue
+  # write that follows. Over-matching only costs one tokenizer run; a false
+  # negative is a bypass.
+  NEEDS_TOKENIZE=1
 fi
 if [ "$NEEDS_TOKENIZE" -eq 0 ]; then
   exit 0
@@ -891,6 +903,53 @@ guarded_gh_invocation_label() {
 
   return 1
 }
+
+# #553 (CodeRabbit Critical): a command substitution in COMMAND position can
+# synthesize the executable name ($(printf '\147\150') -> gh), so the flattened
+# __MERGEPATH_CMDSUB__ placeholder sits where the command name belongs and the
+# literal-`gh` detection below misses it entirely. Fail closed when a
+# COMMAND-position placeholder — at the start of a command, after a separator, or
+# after a prefix command (eval/sudo/env/...) — is followed by a guarded pr/issue
+# write. A placeholder that is an assignment VALUE (`X=$(...)`, previous token
+# `X=`) or an ordinary command ARGUMENT (`echo $(...)`, previous token `echo`) is
+# NOT command position, so it is left to the normal walk, which still catches any
+# real gh write lifted out of the substitution into its own segment.
+for _ci in "${!TOKENS[@]}"; do
+  [ "${TOKENS[$_ci]}" = "__MERGEPATH_CMDSUB__" ] || continue
+  _cp=0
+  if [ "$_ci" -eq 0 ]; then
+    _cp=1
+  else
+    _cprev="${TOKENS[$((_ci - 1))]}"
+    if is_guard_separator "$_cprev"; then
+      _cp=1
+    else
+      case "$_cprev" in
+        sudo|eval|time|nohup|env|command|exec|nice|ionice)
+          _cp=1 ;;
+        *=)
+          # Bare assignment `NAME=`: the placeholder is its VALUE (e.g.
+          # `X=$(...)`), not a command. Leave it to the walk, which still
+          # catches any real gh write lifted from inside the substitution.
+          : ;;
+        [A-Za-z_]*=*)
+          # Env-assignment prefix WITH a value (`FOO=1 $(...) pr merge`): the
+          # placeholder sits at the command position the prefix introduces.
+          _cp=1 ;;
+      esac
+    fi
+  fi
+  [ "$_cp" -eq 1 ] || continue
+  if _synth_label=$(guarded_gh_invocation_label "$_ci"); then
+    echo "BLOCKED: command-position command substitution may synthesize a gh write ($_synth_label)." >&2
+    echo "  A \$(...) or backtick in command position can produce the executable name" >&2
+    echo "  (e.g. \$(printf '\\147\\150') -> gh), so the guard cannot verify it. Run the" >&2
+    echo "  write directly through the verifying wrapper instead:" >&2
+    echo "    scripts/gh-as-author.sh -- gh ..." >&2
+    echo "    scripts/gh-as-reviewer.sh -- gh ..." >&2
+    exit 2
+  fi
+done
 
 COMPOUND_GH_COUNT=0
 COMPOUND_GUARDED_COUNT=0
@@ -2104,7 +2163,14 @@ fi
 # protection: even if branch protection is misconfigured or
 # disabled for an emergency hotfix, the hook will still refuse
 # to dispatch the merge.
-GH_JQ='.mergeStateStatus, .mergeable, ([.statusCheckRollup[] | {n:(.name//.context//"?"), c:(.conclusion//.state//"PENDING"), t:(.completedAt//.startedAt//"")}] | group_by(.n) | map(max_by(.t).c) | map(select(. != "SUCCESS" and . != "SKIPPED" and . != "NEUTRAL")) | length), .labels[].name'
+#
+# #553 (CodeRabbit Major): a check group counts as green ONLY if no run is
+# still pending AND its latest terminal run is green. The prior `max_by(.t).c`
+# alone mis-ranked an un-timestamped PENDING re-run (t="" sorts lowest) behind a
+# timestamped SUCCESS, so an UNSTABLE PR with a check still re-running counted
+# all-green and could merge before CI finished. `if any(.[]; .c=="PENDING")`
+# treats a group with ANY in-progress run as non-green regardless of timestamps.
+GH_JQ='.mergeStateStatus, .mergeable, ([.statusCheckRollup[] | {n:(.name//.context//"?"), c:(.conclusion//.state//"PENDING"), t:(.completedAt//.startedAt//"")}] | group_by(.n) | map(if any(.[]; .c == "PENDING") then "PENDING" else max_by(.t).c end) | map(select(. != "SUCCESS" and . != "SKIPPED" and . != "NEUTRAL")) | length), .labels[].name'
 GH_ARGS=(pr view --json labels,mergeStateStatus,mergeable,statusCheckRollup --jq "$GH_JQ")
 if [ -n "$PR_SELECTOR" ]; then
   GH_ARGS=(pr view "$PR_SELECTOR" --json labels,mergeStateStatus,mergeable,statusCheckRollup --jq "$GH_JQ")

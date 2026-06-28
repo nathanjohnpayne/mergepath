@@ -93,6 +93,21 @@ assert_clean   "escaped dollar-paren in dquotes exempt"      'echo "\$(gh repo c
 # the masking fix must not over-match plain documentation text.
 assert_clean   "gh write text outside subst exempt"  'echo "$(date -u) create Project v2: gh project create --owner o --title t"'
 
+# #553 (Major): the echo/printf exemption must cover ONLY the echo/printf
+# command, NOT a second command chained after a top-level separator. `echo ok;
+# gh pr merge 1` previously slipped through because the branch returned exempt
+# without scanning past the `;`. Re-check the tail after the first top-level
+# (unquoted, non-substitution) separator, recursively. Echoed TEXT, pipes into
+# non-gh commands, and chained WRAPPED writes stay exempt.
+assert_flagged "echo then ;-chained bare gh merge caught"     'echo ok; gh pr merge 1'
+assert_flagged "echo then &&-chained bare gh merge caught"    'echo done && gh pr merge 1'
+assert_flagged "printf then ;-chained gh secret set caught"   "printf '%s' done; gh secret set X"
+assert_flagged "double echo then chained bare gh merge caught" 'echo a; echo b; gh pr merge 1'
+assert_flagged "echo piped into bare gh merge caught"         'echo body | gh pr merge 1'
+assert_clean   "echoed gh-write TEXT (no chained cmd) exempt"  'echo "gh pr merge 1 is documented here"'
+assert_clean   "echo piped into a non-gh command exempt"       'echo ok | grep gh'
+assert_clean   "echo then ;-chained WRAPPED gh merge exempt"   'echo ok; scripts/gh-as-author.sh -- gh pr merge 1'
+
 echo ""
 echo "test_check_no_bare_gh_writes: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

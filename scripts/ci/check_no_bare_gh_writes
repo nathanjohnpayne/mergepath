@@ -69,7 +69,10 @@ function cmdsub_interiors(line,   i, c, n, depth, out, inbt, prev, q, oq, esc) {
   for (i = 1; i <= n; i++) {
     c = substr(line, i, 1)
     if (inbt) {
-      if (c == "`") { inbt = 0; out = out " " }
+      # #553 (Minor): honor a backslash-escaped backtick — bash treats `\`` as a
+      # literal backtick, not a span terminator, so a later gh write in the same
+      # legacy substitution is not split off and missed.
+      if (c == "`" && prev != "\\") { inbt = 0; out = out " " }
       else { out = out c }
       prev = c
       continue
@@ -128,7 +131,49 @@ function gh_write_in_cmdsub(line) {
   if (line !~ /\$\(/ && line !~ /`/) return 0
   return gh_write_class(cmdsub_interiors(line))
 }
-function bare_write(line) {
+# Return the substring of `line` AFTER the first TOP-LEVEL command separator
+# (`;`, `&&`, `||`, `|`, `&`) — a separator that is NOT inside single/double
+# quotes, a $(...) substitution, or a backtick span. Returns "" when the line is
+# a single top-level command. Used to stop the echo/printf exemption from
+# covering a SECOND command chained after the echo (#553). Bash-3.2-safe POSIX
+# awk: manual char walk mirroring the cmdsub_interiors quote/substitution walk.
+function tail_after_top_sep(line,   i, c, n, depth, inbt, oq, q, esc, prev) {
+  n = length(line); depth = 0; inbt = 0; oq = ""; q = ""; esc = 0; prev = ""
+  for (i = 1; i <= n; i++) {
+    c = substr(line, i, 1)
+    if (inbt) { if (c == "`" && prev != "\\") inbt = 0; prev = c; continue }
+    if (depth > 0) {
+      if (q != "") {
+        if (q == sq) { if (c == sq) q = "" }
+        else if (c == "\"" && prev != "\\") q = ""
+        prev = c; continue
+      }
+      if (c == sq) { q = sq; prev = c; continue }
+      if (c == "\"") { q = "\""; prev = c; continue }
+      if (c == "(" && prev == "$") depth++
+      else if (c == ")") depth--
+      prev = c; continue
+    }
+    if (esc) { esc = 0; prev = "x"; continue }
+    if (oq == sq) { if (c == sq) oq = ""; prev = c; continue }
+    if (c == "\\") { esc = 1; prev = c; continue }
+    if (oq == "\"") {
+      if (c == "\"") oq = ""
+      else if (c == "(" && prev == "$") depth = 1
+      else if (c == "`") inbt = 1
+      prev = c; continue
+    }
+    if (c == sq) { oq = sq; prev = c; continue }
+    if (c == "\"") { oq = "\""; prev = c; continue }
+    if (c == "(" && prev == "$") { depth = 1; prev = c; continue }
+    if (c == "`") { inbt = 1; prev = c; continue }
+    if (substr(line, i, 2) == "&&" || substr(line, i, 2) == "||") return substr(line, i + 2)
+    if (c == ";" || c == "|" || c == "&") return substr(line, i + 1)
+    prev = c
+  }
+  return ""
+}
+function bare_write(line,   rest) {
   if (line ~ /^[[:space:]]*($|#)/) return 0
   # Exemption requires a documented reason after the colon (#466): a bare
   # NO_BARE_GH_WRITE_EXEMPT: marker with no justification is too weak a
@@ -150,6 +195,13 @@ function bare_write(line) {
   # substitution contents before granting the exemption.
   if (line ~ /^[[:space:]]*(echo|printf)[[:space:]]/) {
     if (gh_write_in_cmdsub(line)) return 1
+    # #553 (Major): the echo/printf exemption must cover ONLY the echo/printf
+    # command itself, not a SECOND command chained after a top-level separator.
+    # `echo ok; gh pr merge 1` previously passed clean because this branch
+    # returned 0 without scanning past the `;`. Re-check the tail after the first
+    # top-level (unquoted, non-substitution) separator.
+    rest = tail_after_top_sep(line)
+    if (rest != "") return bare_write(rest)
     return 0
   }
   return gh_write_class(line)
