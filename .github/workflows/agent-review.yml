@@ -57,6 +57,10 @@ jobs:
       author_identity: ${{ steps.config.outputs.author_identity }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Explicit-token gh / github-script only, no authenticated git, so
+          # don't leave the checkout token in .git/config (#548 / Codex #550).
+          persist-credentials: false
 
       - name: Parse review-policy.yml
         id: config
@@ -279,6 +283,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Explicit-token gh / github-script only, no authenticated git, so
+          # don't leave the checkout token in .git/config (#548 / Codex #550).
+          persist-credentials: false
 
       - name: Install js-yaml
         run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml
@@ -386,6 +394,10 @@ jobs:
     steps:
       - name: Dismiss self-approval from reviewer bot accounts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Explicit-token github-script only, no authenticated git, so don't
+          # leave the checkout token in .git/config (#548 / Codex #550).
+          persist-credentials: false
 
       - name: Install js-yaml
         run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml
@@ -504,6 +516,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Explicit-token gh merge path only, no authenticated git, so don't
+          # leave the checkout token in .git/config (#548 / Codex #550).
+          persist-credentials: false
 
       # Re-arm gate (#495). On the `synchronize` / `reopened` re-trigger
       # the approval is NOT in the event payload, so confirm via the API

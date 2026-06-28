@@ -48,6 +48,12 @@ permissions:
 jobs:
   rollup:
     name: Classify + post rollup issues
+    # Reject manual dispatch from a non-default ref (#550 Codex P1): on
+    # workflow_dispatch GitHub runs the workflow DEFINITION from the chosen
+    # ref, which the checkout pin cannot constrain — a feature branch could
+    # leak REVIEWER_ASSIGNMENT_TOKEN before checkout. Scheduled runs and
+    # default-branch dispatch pass; a feature-branch dispatch is skipped.
+    if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -61,6 +67,10 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.repository.default_branch }}
+          # The rollup only runs gh with REVIEWER_ASSIGNMENT_TOKEN (an explicit
+          # env token) and does no authenticated git, so don't leave the
+          # checkout token in .git/config (#548 / Codex #550).
+          persist-credentials: false
 
       - name: Ensure jq + gh present
         run: |

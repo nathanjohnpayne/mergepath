@@ -29,9 +29,27 @@ permissions:
 jobs:
   audit:
     name: Audit Merged PRs
+    # Reject manual dispatch from a non-default ref (#550 Codex P1): on
+    # workflow_dispatch GitHub runs the workflow DEFINITION from the chosen
+    # ref, which the checkout pin cannot constrain — a feature branch could
+    # leak REVIEWER_ASSIGNMENT_TOKEN before checkout. Scheduled runs and
+    # default-branch dispatch pass; a feature-branch dispatch is skipped.
+    if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     steps:
+      # Pin to the trusted default branch (#548): this workflow has a
+      # workflow_dispatch trigger and runs the inline actions/github-script
+      # audit under the cross-repo REVIEWER_ASSIGNMENT_TOKEN, reading
+      # .github/review-policy.yml from the checkout. Without an explicit ref a
+      # manually-dispatched branch could supply tampered policy/code that runs
+      # under that privileged PAT. Always audit from the canonical default branch.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          # The audit reads via gh / github-script with an explicit token; it
+          # never does git-authenticated writes, so don't leave the checkout
+          # token in .git/config (#548 defense-in-depth).
+          persist-credentials: false
 
       - name: Install js-yaml
         run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml

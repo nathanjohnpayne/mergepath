@@ -57,6 +57,12 @@ permissions:
 jobs:
   audit:
     name: Audit downstream consumers for drift
+    # Reject manual dispatch from a non-default ref (#550 Codex P1): on
+    # workflow_dispatch GitHub runs the workflow DEFINITION from the chosen
+    # ref, which the checkout pin cannot constrain — a feature branch could
+    # leak REVIEWER_ASSIGNMENT_TOKEN before checkout. Scheduled runs and
+    # default-branch dispatch pass; a feature-branch dispatch is skipped.
+    if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -64,7 +70,19 @@ jobs:
       ISSUE_TITLE: 'Cross-repo propagation drift detected'
     steps:
       - name: Checkout mergepath
+        # Pin to the trusted default branch (#548): this workflow has a
+        # workflow_dispatch trigger and runs scripts/sync-to-downstream.sh and
+        # scripts/audit-propagation-lane.sh under the cross-repo
+        # REVIEWER_ASSIGNMENT_TOKEN, so without an explicit ref a
+        # manually-dispatched branch could run tampered scripts under that
+        # privileged PAT. Always run the canonical scripts from the default
+        # branch. persist-credentials:false is safe: cross-repo reads use
+        # `gh auth setup-git` (a separate credential helper), not the
+        # workspace checkout token.
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
       - name: Install yq (mikefarah/yq v4)
         # sync-to-downstream.sh requires mikefarah/yq v4+. The
