@@ -125,6 +125,9 @@ jobs:
           # PR HEAD against base. The script doesn't currently do that
           # but a future tightening might.
           fetch-depth: 0
+          # Explicit-token gh only, no authenticated git, so don't leave the
+          # checkout token in .git/config (#548 / Codex #550).
+          persist-credentials: false
 
       - name: Resolve PR number from event
         id: pr
@@ -400,6 +403,9 @@ jobs:
           # job above.
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
+          # Explicit-token gh only, no authenticated git, so don't leave the
+          # checkout token in .git/config (#548 / Codex #550).
+          persist-credentials: false
 
       - name: Find PRs carrying needs-external-review
         id: find

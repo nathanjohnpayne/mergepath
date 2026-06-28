@@ -119,6 +119,19 @@ assert_grep "D7: repo_lint drops the persisted checkout token (#548)" \
   "$W/repo_lint.yml" 'persist-credentials: false'
 assert_grep "D7: pr-audit drops the persisted checkout token (#548)" \
   "$W/pr-audit.yml" 'persist-credentials: false'
+assert_grep "D7: daily-feedback-rollup drops the persisted checkout token (#548 / Codex #550)" \
+  "$W/daily-feedback-rollup.yml" 'persist-credentials: false'
+# Completeness sweep (Codex #550): every cross-repo-PAT workflow drops the
+# persisted token on ALL its checkouts (gh-with-explicit-token only, no authed
+# git). Count-based so a regression of any one checkout is caught.
+if [ -f "$W/agent-review.yml" ]; then
+  _ar=$(grep -c 'persist-credentials: false' "$W/agent-review.yml")
+  if [ "$_ar" -ge 4 ]; then pass "D7: agent-review hardens all 4 checkouts (#550)"; else fail "D7: agent-review checkouts (#550): $_ar persist-credentials, expected >= 4"; fi
+else echo "SKIP: D7 agent-review (absent)"; SKIP=$((SKIP + 1)); fi
+if [ -f "$W/auto-clear-blocking-labels.yml" ]; then
+  _ac=$(grep -c 'persist-credentials: false' "$W/auto-clear-blocking-labels.yml")
+  if [ "$_ac" -ge 2 ]; then pass "D7: auto-clear hardens both checkouts (#550)"; else fail "D7: auto-clear checkouts (#550): $_ac persist-credentials, expected >= 2"; fi
+else echo "SKIP: D7 auto-clear (absent)"; SKIP=$((SKIP + 1)); fi
 
 # Defect 8 (#550 Codex P1): secret-bearing dispatchable workflows guard the JOB
 # on the default branch, so a non-default workflow_dispatch — which runs the
