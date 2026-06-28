@@ -256,8 +256,10 @@ COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 NEEDS_TOKENIZE=0
 if echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])([^[:space:]]*/)?gh([^A-Za-z0-9_]|$)'; then
   NEEDS_TOKENIZE=1
-elif echo "$COMMAND" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
-     && echo "$COMMAND" | grep -qE '(-[A-Za-z]*S|--split-string)'; then
+elif echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
+     && echo "$COMMAND" | tr -d "\"'" | grep -qE '(-[A-Za-z]*S|--split-string)'; then
+  # Quote-stripped (Codex #551): a quoted `'env'` runs env but would otherwise
+  # leave a quote, not whitespace, after `env` and dodge this probe.
   NEEDS_TOKENIZE=1
 fi
 if [ "$NEEDS_TOKENIZE" -eq 0 ]; then
@@ -637,10 +639,15 @@ def expand_wrappers(tokens, depth=0):
                 # payload is surfaced (CodeRabbit #551, a pre-existing exotic
                 # gap). Handles the next-token, --split-string=STR, and -SSTR
                 # (attached) forms.
-                if base == "env" and (a in ("-S", "--split-string")
+                if base == "env" and (a == "--split-string"
                                       or a.startswith("--split-string=")
-                                      or (len(a) > 2 and a.startswith("-S")
-                                          and not a.startswith("--"))):
+                                      or (a.startswith("-") and not a.startswith("--")
+                                          and next((c for c in a[1:] if c in "uCS"), "") == "S")):
+                    # A short cluster IS env -S when the first value-taking-or-S
+                    # option in it is S (CodeRabbit #551: -vS etc., not only a
+                    # leading -S). -u/-C consume the rest of the cluster as their
+                    # value, so an S inside e.g. -uNAME_WITH_S is NOT the split
+                    # flag (keeps the #451 env -uNAME tests passing).
                     # env -S / --split-string FAILS CLOSED (Codex #551 r1-r4).
                     # GNU env -S has rich, exotic semantics: whitespace
                     # splitting, $VAR/${VAR} expansion, $(...)/backtick
