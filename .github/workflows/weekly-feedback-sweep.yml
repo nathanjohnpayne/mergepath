@@ -135,6 +135,12 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # The failure-notify job only runs gh issue create (explicit
+          # GITHUB_TOKEN); it needs the checkout for repo inference but does no
+          # authenticated git, so drop the persisted token too — keeps the #548
+          # invariant true for the WHOLE workflow (Codex #550 P2).
+          persist-credentials: false
       - name: Open failure-tracking issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

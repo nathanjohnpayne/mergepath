@@ -92,6 +92,19 @@ assert_grep "D7: weekly-feedback-sweep pins checkout ref (#548 Major)" \
   "$W/weekly-feedback-sweep.yml" 'ref: ${{ github.event.repository.default_branch }}'
 assert_grep "D7: weekly-feedback-sweep drops the persisted checkout token (#548)" \
   "$W/weekly-feedback-sweep.yml" 'persist-credentials: false'
+# Both checkouts (main sweep + the notify-on-failure job) must drop the token,
+# so the #548 invariant holds for the WHOLE file (Codex #550 P2 caught that the
+# failure-notify checkout was initially missed). Propagation-safe: skip if absent.
+if [ -f "$W/weekly-feedback-sweep.yml" ]; then
+  _wfs_pc=$(grep -c 'persist-credentials: false' "$W/weekly-feedback-sweep.yml")
+  if [ "$_wfs_pc" -ge 2 ]; then
+    pass "D7: weekly-feedback-sweep hardens BOTH checkouts (#548 / Codex #550)"
+  else
+    fail "D7: weekly-feedback-sweep both checkouts (#548): $_wfs_pc persist-credentials, expected >= 2"
+  fi
+else
+  echo "SKIP: D7 weekly-feedback-sweep both checkouts (absent)"; SKIP=$((SKIP + 1))
+fi
 assert_grep "D7: weekly-drift-audit pins checkout ref (#548)" \
   "$W/weekly-drift-audit.yml" 'ref: ${{ github.event.repository.default_branch }}'
 assert_grep "D7: weekly-drift-audit drops the persisted checkout token (#548)" \
