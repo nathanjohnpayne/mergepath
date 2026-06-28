@@ -761,6 +761,12 @@ assert_rc_contains "env --split-string=STR (attached) command is expanded (#551)
 # No false positive: gh as mere data inside the split string is not a write.
 assert_rc_contains "env -S echo of gh text is not a write (#551, no false positive)" 0 "" \
   'env -S "echo gh pr merge --admin"'
+# GNU env -S expands $VAR/${VAR} before splitting; shlex cannot resolve that,
+# so a "${G} ..." payload must FAIL CLOSED, not be left unexpanded and bypass
+# the guard (Codex #551 P1). $(...) command-subs are still handled (lifted by
+# flatten_command), so only an unresolvable parameter expansion blocks.
+assert_rc_contains "env -S with variable expansion fails closed, not bypass (#551 Codex)" 2 "tokenize" \
+  'G=gh env -S "${G} pr merge 123 --admin"'
 
 echo ""
 echo "test_gh_pr_guard: $PASS passed, $FAIL failed"

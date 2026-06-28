@@ -508,6 +508,20 @@ for _entry in _RAW_PREFIX_SPEC.split(";"):
     _PREFIX_VALUE_OPTS[_pfx] = frozenset(o for o in _opts.split(",") if o)
 _EMPTY_FROZENSET = frozenset()
 
+def _split_string_tokens(arg, depth):
+    # env -S / --split-string runs ARG as a SPLIT command. GNU env -S also
+    # performs $VAR/${VAR} expansion before splitting (coreutils env.c reads
+    # getenv while parsing the split string), which shlex cannot resolve, so a
+    # "${G} pr merge" payload would leave the command token unexpanded and
+    # bypass the guard (Codex #551). flatten_command first lifts out
+    # $(...) / backtick command-subs into their own segments; any "$" that
+    # REMAINS after that is a parameter expansion we cannot statically resolve,
+    # so FAIL CLOSED (raise -> the hook blocks) rather than risk a hidden write.
+    flat = flatten_command(arg)
+    if "$" in flat:
+        raise ValueError("env -S split-string with $-expansion is not statically resolvable")
+    return expand_wrappers(shlex.split(flat), depth + 1)
+
 def expand_wrappers(tokens, depth=0):
     if depth > 25:
         raise ValueError("eval/shell -c nesting too deep")
@@ -615,21 +629,18 @@ def expand_wrappers(tokens, depth=0):
                 # (attached) forms.
                 if base == "env" and a in ("-S", "--split-string"):
                     if i + 1 < n and tokens[i + 1] not in _SEPARATORS:
-                        out.extend(expand_wrappers(
-                            shlex.split(flatten_command(tokens[i + 1])), depth + 1))
+                        out.extend(_split_string_tokens(tokens[i + 1], depth))
                         i += 2
                     else:
                         out.append(a)
                         i += 1
                     continue
                 if base == "env" and a.startswith("--split-string="):
-                    out.extend(expand_wrappers(
-                        shlex.split(flatten_command(a[len("--split-string="):])), depth + 1))
+                    out.extend(_split_string_tokens(a[len("--split-string="):], depth))
                     i += 1
                     continue
                 if base == "env" and len(a) > 2 and a.startswith("-S") and not a.startswith("--"):
-                    out.extend(expand_wrappers(
-                        shlex.split(flatten_command(a[2:])), depth + 1))
+                    out.extend(_split_string_tokens(a[2:], depth))
                     i += 1
                     continue
                 if a in vopts:
