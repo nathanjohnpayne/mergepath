@@ -74,9 +74,11 @@ reset_log() {
 }
 
 reset_log
+set +e
 OP_PREFLIGHT_REVIEWER_PAT="reviewer-token" GITHUB_TOKEN="ambient-token" \
   run_wrapper -- gh pr review 123 --comment --body "ok" >/dev/null 2>&1
 rc=$?
+set -e
 if [ "$rc" -ne 0 ]; then
   fail "review happy path: rc=$rc"
 elif grep -q $'gh\tauth\tswitch' "$WORKDIR/calls.log"; then
@@ -89,9 +91,11 @@ else
 fi
 
 reset_log
+set +e
 MERGEPATH_AGENT=codex OP_PREFLIGHT_REVIEWER_PAT="codex-token" \
   run_wrapper -- gh issue comment 7 --body "thanks" >/dev/null 2>&1
 rc=$?
+set -e
 if [ "$rc" -ne 0 ]; then
   fail "MERGEPATH_AGENT fallback: rc=$rc"
 elif ! grep -q $'GH_TOKEN=codex-token GITHUB_TOKEN= gh\tissue\tcomment\t7' "$WORKDIR/calls.log"; then
@@ -102,9 +106,11 @@ else
 fi
 
 reset_log
+set +e
 OP_PREFLIGHT_AGENT=codex OP_PREFLIGHT_REVIEWER_PAT="codex-token" \
   run_wrapper -- gh issue comment 8 --body "thanks" >/dev/null 2>&1
 rc=$?
+set -e
 if [ "$rc" -ne 0 ]; then
   fail "OP_PREFLIGHT_AGENT fallback: rc=$rc"
 elif ! grep -q $'GH_TOKEN=codex-token GITHUB_TOKEN= gh\tissue\tcomment\t8' "$WORKDIR/calls.log"; then
@@ -115,9 +121,11 @@ else
 fi
 
 reset_log
+set +e
 GH_AS_REVIEWER_IDENTITY=nathanpayne-codex OP_PREFLIGHT_REVIEWER_PAT="codex-token" \
   run_wrapper -- gh pr comment 123 --body "ping" >/dev/null 2>&1
 rc=$?
+set -e
 if [ "$rc" -ne 0 ]; then
   fail "explicit identity: rc=$rc"
 elif ! grep -q $'GH_TOKEN=codex-token GITHUB_TOKEN= gh\tpr\tcomment\t123' "$WORKDIR/calls.log"; then
@@ -129,8 +137,10 @@ fi
 
 reset_log
 unset OP_PREFLIGHT_REVIEWER_PAT
+set +e
 run_wrapper -- gh pr review 123 --comment --body "ok" >/dev/null 2>&1
 rc=$?
+set -e
 if [ "$rc" -ne 0 ]; then
   fail "fallback token: rc=$rc"
 elif ! grep -q $'GH_TOKEN=fallback-claude-token GITHUB_TOKEN= gh\tpr\treview' "$WORKDIR/calls.log"; then
@@ -153,6 +163,62 @@ elif grep -q $'gh\tpr\treview' "$WORKDIR/calls.log"; then
 else
   pass "wrong preferred token: fails before wrapped write"
 fi
+
+# --- ambient GH_TOKEN candidate (#533) --------------------------------
+# A verified ambient GH_TOKEN (no OP_PREFLIGHT_*, picked up before the
+# keyring fallback) must be used directly. reviewer-token verifies as
+# nathanpayne-claude (the default reviewer). We assert the wrapped write
+# ran with the AMBIENT token value, NOT the keyring's fallback-claude-token
+# — proving candidate 2 won, not candidate 3.
+reset_log
+unset OP_PREFLIGHT_REVIEWER_PAT
+set +e
+GH_TOKEN="reviewer-token" run_wrapper -- gh pr review 123 --comment --body "ok" >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "ambient token verified: rc=$rc"
+elif grep -q $'gh\tauth\tswitch' "$WORKDIR/calls.log"; then
+  fail "ambient token verified: called gh auth switch"
+elif ! grep -q $'GH_TOKEN=reviewer-token GITHUB_TOKEN= gh\tpr\treview\t123\t--comment' "$WORKDIR/calls.log"; then
+  fail "ambient token verified: wrapped write did not run with the ambient token"
+  cat "$WORKDIR/calls.log" >&2
+elif grep -q "fallback-claude-token" "$WORKDIR/calls.log"; then
+  fail "ambient token verified: fell through to keyring despite a usable ambient token"
+  cat "$WORKDIR/calls.log" >&2
+else
+  pass "ambient token verified: a usable ambient GH_TOKEN is used before the keyring fallback"
+fi
+
+# An ambient GH_TOKEN that verifies to the WRONG identity must be rejected
+# and fall through to the keyring fallback — never blindly trusted.
+# author-token verifies as nathanjohnpayne (wrong for reviewer
+# nathanpayne-claude); the keyring then yields fallback-claude-token.
+reset_log
+unset OP_PREFLIGHT_REVIEWER_PAT
+set +e
+err=$(GH_TOKEN="author-token" run_wrapper -- gh pr review 123 --comment --body "ok" 2>&1 >/dev/null)
+rc=$?
+set -e
+# The wrapped write (gh pr review) must run under the keyring token, never
+# under the wrong ambient token. (The verification probe `gh api user` does
+# run under author-token — that's expected; we only forbid the wrapped
+# pr-review line under it.)
+if [ "$rc" -ne 0 ]; then
+  fail "ambient token wrong identity: rc=$rc (expected fallthrough success)"
+elif ! grep -q $'GH_TOKEN=fallback-claude-token GITHUB_TOKEN= gh\tpr\treview' "$WORKDIR/calls.log"; then
+  fail "ambient token wrong identity: did not fall through to the keyring fallback"
+  cat "$WORKDIR/calls.log" >&2
+elif grep -q $'GH_TOKEN=author-token GITHUB_TOKEN= gh\tpr\treview' "$WORKDIR/calls.log"; then
+  fail "ambient token wrong identity: wrong ambient token reached the wrapped write"
+  cat "$WORKDIR/calls.log" >&2
+elif ! echo "$err" | grep -q "ambient GH_TOKEN did not verify"; then
+  fail "ambient token wrong identity: missing fallthrough diagnostic"
+  echo "$err" >&2
+else
+  pass "ambient token wrong identity: rejected and falls through to the keyring fallback"
+fi
+unset GH_TOKEN
 
 reset_log
 set +e

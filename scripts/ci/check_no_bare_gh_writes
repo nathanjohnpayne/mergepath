@@ -29,7 +29,105 @@ if [ "${#FILES[@]}" -eq 0 ]; then
 fi
 
 set +e
-awk -v root="$REPO_ROOT/" '
+# sq carries a single-quote char into the (single-quoted) awk program so it
+# can match quotes inside command substitutions without a literal quote (#540).
+awk -v root="$REPO_ROOT/" -v sq="'" '
+# The write-class matchers, factored out so they can be run against BOTH a
+# whole line AND the contents of an echo/printf command substitution (#533).
+function gh_write_class(s) {
+  if (s ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+pr[[:space:]]+(-R[[:space:]]+[^[:space:]]+[[:space:]]+|--repo[[:space:]]+[^[:space:]]+[[:space:]]+|--repo=[^[:space:]]+[[:space:]]+)?(create|merge|review|comment|edit)([[:space:]]|$)/) return 1
+  if (s ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+pr[[:space:]]+close([[:space:]]|$)/) return 1
+  if (s ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+issue[[:space:]]+(create|comment|edit|close)([[:space:]]|$)/) return 1
+  if (s ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+repo[[:space:]]+(create|delete|edit)([[:space:]]|$)/) return 1
+  if (s ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+label[[:space:]]+(create|edit|delete)([[:space:]]|$)/) return 1
+  if (s ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+secret[[:space:]]+set([[:space:]]|$)/) return 1
+  if (s ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+variable[[:space:]]+set([[:space:]]|$)/) return 1
+  if (s ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+project[[:space:]]+(create|edit|field-create|item-add|item-edit)([[:space:]]|$)/) return 1
+  # Compact and spaced method forms (#466): catch -X POST, -XPOST,
+  # --method POST, and --method=POST (the compact -X<METHOD> / --method=<METHOD>
+  # forms previously slipped through the space-requiring matcher).
+  if (s ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+api[[:space:]].*(-X[[:space:]]*|--method[[:space:]]*=?[[:space:]]*)(POST|PATCH|PUT|DELETE)([[:space:]]|$)/) return 1
+  if (s ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+api[[:space:]]+graphql/ && s ~ /(mutation|resolveReviewThread|addPullRequestReviewThreadReply|addComment|updateIssue|closeIssue)/) return 1
+  return 0
+}
+# Collect ONLY the interiors of command substitutions on a line — the text
+# between a `$(` and its matching `)` (handling nesting), plus the text
+# between a pair of backticks. Returns that text joined by spaces. Text that
+# merely sits inside the echo/printf string but OUTSIDE a substitution (e.g.
+# a log message that literally spells "gh project create") is excluded, so it
+# does not falsely match. Bash-3.2-safe / POSIX-awk: manual character walk,
+# no capture groups.
+function cmdsub_interiors(line,   i, c, n, depth, out, inbt, prev, q, oq, esc) {
+  n = length(line)
+  out = ""
+  depth = 0   # nesting depth inside $(...)
+  inbt = 0    # currently inside a backtick pair
+  q = ""      # quote state inside $(): "" none, single, or double quote
+  oq = ""     # OUTER quote at depth 0: "" none, single, or double quote
+  esc = 0     # previous char at depth 0 was an active backslash escape
+  prev = ""
+  for (i = 1; i <= n; i++) {
+    c = substr(line, i, 1)
+    if (inbt) {
+      if (c == "`") { inbt = 0; out = out " " }
+      else { out = out c }
+      prev = c
+      continue
+    }
+    if (depth > 0) {
+      # Inside a command substitution. Track quotes so a ) or ( that sits
+      # inside a single- or double-quoted string is treated as literal,
+      # not as structure (bash does not end a substitution on a quoted
+      # paren). Quoted content is still captured so a gh write inside the
+      # quotes is not lost (the #540 quoted-paren-before-write bypass).
+      # sq holds a single-quote char (passed via -v) so this single-quoted
+      # awk program needs no literal quote of its own.
+      if (q != "") {
+        out = out c
+        if (q == sq) { if (c == sq) q = "" }
+        else if (c == "\"" && prev != "\\") { q = "" }
+        prev = c
+        continue
+      }
+      if (c == sq) { q = sq; out = out c; prev = c; continue }
+      if (c == "\"") { q = "\""; out = out c; prev = c; continue }
+      if (c == "(" && prev == "$") { depth++ }
+      else if (c == ")") { depth--; if (depth == 0) out = out " " }
+      else { out = out c }
+      prev = c
+      continue
+    }
+    # Outside any substitution (depth 0). Track the OUTER quote and a
+    # backslash escape so a $( or backtick inside single-quotes, or an
+    # escaped backslash-dollar, is literal (bash runs no substitution
+    # there) and an echo of such text is not treated as a write (#540 P2).
+    if (esc) { esc = 0; prev = "x"; continue }
+    if (oq == sq) { if (c == sq) oq = ""; prev = c; continue }
+    if (c == "\\") { esc = 1; prev = c; continue }
+    if (oq == "\"") {
+      if (c == "\"") { oq = ""; prev = c; continue }
+      if (c == "(" && prev == "$") { depth = 1; q = ""; prev = c; continue }
+      if (c == "`") { inbt = 1; prev = c; continue }
+      prev = c; continue
+    }
+    if (c == sq) { oq = sq; prev = c; continue }
+    if (c == "\"") { oq = "\""; prev = c; continue }
+    if (c == "(" && prev == "$") { depth = 1; q = ""; prev = c; continue }
+    if (c == "`") { inbt = 1; prev = c; continue }
+    prev = c
+  }
+  return out
+}
+# Does an echo/printf line hide a gh WRITE inside a command substitution
+# ($(...) or backticks)? A plain documented echo of non-write text — or a
+# read like `echo "$(gh pr view 1)"`, or a log line that merely names a gh
+# write OUTSIDE the substitution — stays exempt, while
+# `echo "$(gh repo create x)"` / `printf "%s" "$(gh secret set X)"` are
+# caught (#533).
+function gh_write_in_cmdsub(line) {
+  if (line !~ /\$\(/ && line !~ /`/) return 0
+  return gh_write_class(cmdsub_interiors(line))
+}
 function bare_write(line) {
   if (line ~ /^[[:space:]]*($|#)/) return 0
   # Exemption requires a documented reason after the colon (#466): a bare
@@ -37,26 +135,24 @@ function bare_write(line) {
   # bypass. The error message has always promised "with a reason"; enforce it.
   if (line ~ /NO_BARE_GH_WRITE_EXEMPT:[[:space:]]*[^[:space:]]/) return 0
   if (line ~ /\\`[^`]*gh[[:space:]]+(pr|issue|api)[^`]*\\`/) return 0
-  if (line ~ /^[[:space:]]*(echo|printf)[[:space:]]/ &&
-      line !~ /\$\([[:space:]]*gh[[:space:]]+(pr|issue|api)[[:space:]]/ &&
-      line !~ /`[^`]*gh[[:space:]]+(pr|issue|api)[^`]*`/) return 0
+  # Verified-wrapper / helper exemptions. Evaluated BEFORE the echo/printf
+  # branch so a wrapped write that happens to live inside an echo
+  # substitution (e.g. echo "$(scripts/gh-as-author.sh -- gh pr merge ...)")
+  # stays exempt, exactly as the prior ordering allowed.
   if (line ~ /gh-as-(author|reviewer)\.sh[^;&|]*--[[:space:]]+gh/) return 0
   if (line ~ /\$"?[A-Z_]*AS_(AUTHOR|REVIEWER)"?[[:space:]]+--[[:space:]]+gh/) return 0
   if (line ~ /(^|[[:space:]])(sync_author_gh|bootstrap::run_author_gh|bootstrap::author_gh|ghp_gh|gh_reviewer|gh_pat)[[:space:]]+/) return 0
-  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+pr[[:space:]]+(-R[[:space:]]+[^[:space:]]+[[:space:]]+|--repo[[:space:]]+[^[:space:]]+[[:space:]]+|--repo=[^[:space:]]+[[:space:]]+)?(create|merge|review|comment|edit)([[:space:]]|$)/) return 1
-  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+pr[[:space:]]+close([[:space:]]|$)/) return 1
-  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+issue[[:space:]]+(create|comment|edit|close)([[:space:]]|$)/) return 1
-  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+repo[[:space:]]+(create|delete|edit)([[:space:]]|$)/) return 1
-  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+label[[:space:]]+(create|edit|delete)([[:space:]]|$)/) return 1
-  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+secret[[:space:]]+set([[:space:]]|$)/) return 1
-  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+variable[[:space:]]+set([[:space:]]|$)/) return 1
-  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+project[[:space:]]+(create|edit|field-create|item-add|item-edit)([[:space:]]|$)/) return 1
-  # Compact and spaced method forms (#466): catch -X POST, -XPOST,
-  # --method POST, and --method=POST (the compact -X<METHOD> / --method=<METHOD>
-  # forms previously slipped through the space-requiring matcher).
-  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+api[[:space:]].*(-X[[:space:]]*|--method[[:space:]]*=?[[:space:]]*)(POST|PATCH|PUT|DELETE)([[:space:]]|$)/) return 1
-  if (line ~ /(^|[^A-Za-z0-9_.\/-])gh[[:space:]]+api[[:space:]]+graphql/ && line ~ /(mutation|resolveReviewThread|addPullRequestReviewThreadReply|addComment|updateIssue|closeIssue)/) return 1
-  return 0
+  # echo/printf masking (#533): an echo/printf line is exempt UNLESS it hides
+  # a gh write inside a command substitution. The prior negative-check only
+  # looked for gh pr|issue|api in the substitution, so a write via any OTHER
+  # verb (repo create, secret set, label create, variable set, project ...,
+  # gh api -X POST) slipped through. Run the full write-class matchers on the
+  # substitution contents before granting the exemption.
+  if (line ~ /^[[:space:]]*(echo|printf)[[:space:]]/) {
+    if (gh_write_in_cmdsub(line)) return 1
+    return 0
+  }
+  return gh_write_class(line)
 }
 {
   rel = FILENAME
