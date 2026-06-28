@@ -115,8 +115,11 @@ assert_grep "D7: onepassword-headless-proof pins checkout ref (#548)" \
   "$W/onepassword-headless-proof.yml" 'ref: ${{ github.event.repository.default_branch }}'
 assert_grep "D7: pr-review-policy drops the persisted checkout token (#548)" \
   "$W/pr-review-policy.yml" 'persist-credentials: false'
-assert_grep "D7: repo_lint drops the persisted checkout token (#548)" \
-  "$W/repo_lint.yml" 'persist-credentials: false'
+# NB: repo_lint.yml is NOT a propagated path (it is consumer-local — each repo
+# runs its own lint), so this PROPAGATED suite must not assert its contents:
+# consumers have repo_lint.yml present-but-unsynced, which fails (not skips) the
+# grep. The canonical repo_lint persist-credentials (#548) stays in the file; it
+# just is not a fleet-wide invariant. Caught by the swipewatch sync canary #78.
 assert_grep "D7: pr-audit drops the persisted checkout token (#548)" \
   "$W/pr-audit.yml" 'persist-credentials: false'
 assert_grep "D7: daily-feedback-rollup drops the persisted checkout token (#548 / Codex #550)" \
