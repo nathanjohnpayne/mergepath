@@ -808,6 +808,29 @@ assert_rc_contains "command-position cmdsub with NO gh write stays allowed (#553
 assert_rc_contains "eval cmdsub before a wrapped write is allowed (#553)" 0 "" \
   'eval "$(/opt/homebrew/bin/brew shellenv)" && scripts/gh-as-author.sh -- gh pr merge 1 --repo o/r --squash'
 
+# #560 (residual of #553): a command-position cmdsub-synthesized gh must fail
+# closed even after a prefix command + options (command -p, env -i), a
+# value-taking flag (env -u NAME), or a quoted env assignment (FOO="a b"). The
+# command-position forward pass tracks position through prefix/flag/assignment
+# tokens (via prefix_flag_takes_value), not just the immediate previous token.
+assert_rc_contains "command -p cmdsub-synth pr merge fails closed (#560)" 2 "wrapper" \
+  'command -p $(printf "\147\150") pr merge 1'
+assert_rc_contains "env -i cmdsub-synth pr merge fails closed (#560)" 2 "wrapper" \
+  'env -i $(printf "\147\150") pr merge 1'
+assert_rc_contains "quoted-assignment cmdsub-synth pr merge fails closed (#560)" 2 "wrapper" \
+  'FOO="bar baz" $(printf "\147\150") pr merge 1'
+assert_rc_contains "value-flag arg then cmdsub-synth pr merge fails closed (#560)" 2 "wrapper" \
+  'env -u FOO $(printf "\147\150") pr merge 1'
+assert_rc_contains "sudo -n cmdsub-synth issue comment fails closed (#560)" 2 "wrapper" \
+  'sudo -n $(printf "\147\150") issue comment 5 --body hi'
+# Controls: a cmdsub CONSUMED as a value-taking flag's argument is NOT command
+# position (env -u $(...) -> the synth is the var NAME, `pr merge` is the cmd),
+# and an echo argument just prints. Both stay allowed.
+assert_rc_contains "cmdsub as value-taking flag arg stays allowed (#560)" 0 "" \
+  'env -u $(printf "\147\150") pr merge 1'
+assert_rc_contains "cmdsub as echo argument stays allowed (#560)" 0 "" \
+  'echo $(printf "\147\150") pr merge'
+
 # #553 fix (b): the merge-state jq counts an un-timestamped PENDING re-run as
 # non-green even when a timestamped SUCCESS exists for the same check (the prior
 # max_by(.t) mis-ranked the empty-timestamp PENDING behind the SUCCESS, so an
