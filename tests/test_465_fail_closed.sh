@@ -120,6 +120,19 @@ assert_grep "D7: repo_lint drops the persisted checkout token (#548)" \
 assert_grep "D7: pr-audit drops the persisted checkout token (#548)" \
   "$W/pr-audit.yml" 'persist-credentials: false'
 
+# Defect 8 (#550 Codex P1): secret-bearing dispatchable workflows guard the JOB
+# on the default branch, so a non-default workflow_dispatch — which runs the
+# chosen ref's workflow DEFINITION, beyond the checkout pin's reach — cannot
+# leak the secret via a step added ahead of the pinned checkout.
+assert_grep "D8: onepassword-headless-proof guards dispatch to the default branch (#550)" \
+  "$W/onepassword-headless-proof.yml" 'if: github.ref_name == github.event.repository.default_branch'
+assert_grep "D8: weekly-feedback-sweep guards dispatch to the default branch (#550)" \
+  "$W/weekly-feedback-sweep.yml" 'if: github.ref_name == github.event.repository.default_branch'
+assert_grep "D8: weekly-drift-audit guards dispatch to the default branch (#550)" \
+  "$W/weekly-drift-audit.yml" 'if: github.ref_name == github.event.repository.default_branch'
+assert_grep "D8: pr-audit guards dispatch to the default branch (#550)" \
+  "$W/pr-audit.yml" 'if: github.ref_name == github.event.repository.default_branch'
+
 echo ""
 echo "test_465_fail_closed: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ] || exit 1
