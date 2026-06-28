@@ -784,6 +784,41 @@ assert_rc_contains "quoted env -S without a literal gh fails closed (#551 Codex)
 assert_rc_contains "plain env prefix still surfaces the gh write (#551 regression)" 2 "token-verifying wrapper" \
   'env FOO=bar gh pr merge 123 --admin'
 
+# #553 (CodeRabbit Critical): a command substitution in COMMAND position can
+# synthesize the executable name ($(printf "\147\150") is octal for gh), so the
+# raw command carries no literal gh. The fast-path now force-tokenizes a
+# command-position cmdsub, and the walk treats the flattened placeholder as a
+# potential gh, failing closed on any pr/issue WRITE that follows. A placeholder
+# NOT followed by a guarded write subcommand stays allowed.
+assert_rc_contains "cmdsub-synth pr merge fails closed (#553)" 2 "wrapper" \
+  '$(printf "\147\150") pr merge 123 --admin'
+assert_rc_contains "backtick-synth issue comment fails closed (#553)" 2 "wrapper" \
+  '`printf "\147\150"` issue comment 5 --body hi'
+assert_rc_contains "assignment-prefixed cmdsub-synth pr merge fails closed (#553)" 2 "wrapper" \
+  'FOO=1 $(printf "\147\150") pr merge 1'
+assert_rc_contains "separator-then cmdsub-synth pr merge fails closed (#553 empirical)" 2 "wrapper" \
+  'gh --version ; $(printf "\147\150") pr merge 123 --admin'
+assert_rc_contains "command-position cmdsub with NO gh write stays allowed (#553)" 0 "" \
+  '$(date -u) >/dev/null'
+# #553 regression: a benign command-position cmdsub (the ubiquitous
+# `eval "$(brew shellenv)"`) before a WRAPPED write must NOT false-trip the
+# compound #348 block. An interim fix counted the placeholder as a gh
+# invocation in the pre-scan; the synth bypass is caught by the main walk, not
+# the compound pre-scan, so the pre-scan must ignore the placeholder.
+assert_rc_contains "eval cmdsub before a wrapped write is allowed (#553)" 0 "" \
+  'eval "$(/opt/homebrew/bin/brew shellenv)" && scripts/gh-as-author.sh -- gh pr merge 1 --repo o/r --squash'
+
+# #553 fix (b): the merge-state jq counts an un-timestamped PENDING re-run as
+# non-green even when a timestamped SUCCESS exists for the same check (the prior
+# max_by(.t) mis-ranked the empty-timestamp PENDING behind the SUCCESS, so an
+# UNSTABLE PR with a check still re-running could merge before CI finished).
+GH_JQ_def=$(grep -m1 '^GH_JQ=' "$HOOK")
+eval "$GH_JQ_def"
+_ng=$(printf '%s' '{"statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS","completedAt":"2026-06-28T10:00:00Z"},{"name":"ci","state":"PENDING"}],"labels":[]}' | jq -r "$GH_JQ" | sed -n '3p')
+if [ "${_ng:-0}" -ge 1 ]; then pass "merge-state jq: un-timestamped PENDING re-run counts non-green (#553)"; else fail "merge-state jq (#553): expected non-green >= 1, got '$_ng'"; fi
+_ng2=$(printf '%s' '{"statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS","completedAt":"2026-06-28T10:00:00Z"},{"name":"lint","conclusion":"SUCCESS","completedAt":"2026-06-28T11:00:00Z"}],"labels":[]}' | jq -r "$GH_JQ" | sed -n '3p')
+if [ "${_ng2:-x}" = "0" ]; then pass "merge-state jq: all-terminal-green stays 0 (no false block) (#553)"; else fail "merge-state jq (#553): expected 0, got '$_ng2'"; fi
+
 echo ""
 echo "test_gh_pr_guard: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
