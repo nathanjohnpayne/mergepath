@@ -261,17 +261,19 @@ elif echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|
   # Quote-stripped (Codex #551): a quoted `'env'` runs env but would otherwise
   # leave a quote, not whitespace, after `env` and dodge this probe.
   NEEDS_TOKENIZE=1
-elif echo "$COMMAND" | tr -d "\"'" \
-     | grep -qE '(^|[;&|(])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*(\$\(|`)'; then
-  # #553 (CodeRabbit Critical): a command substitution in COMMAND position can
-  # synthesize the executable name (e.g. `$(printf '\147\150')` -> gh), so the
-  # raw command carries no literal `gh` and the gh / env -S probes above miss
-  # it. Force tokenization when a cmdsub sits at command position (start, after
-  # a `;`/`&&`/`||`/`|`/`(` separator, or after env-assignment prefixes); the
-  # flattener lifts it to __MERGEPATH_CMDSUB__ and the command-position arms in
-  # the token walk treat it as a potential `gh` and fail closed on any pr/issue
-  # write that follows. Over-matching only costs one tokenizer run; a false
-  # negative is a bypass.
+elif echo "$COMMAND" | tr -d "\"'" | grep -qE '\$\(|`' \
+     && echo "$COMMAND" | tr -d "\"'" \
+        | grep -qE '(^|[^A-Za-z0-9_])(pr|issue)[[:space:]]'; then
+  # #553 / #560: a command substitution can synthesize the executable name in
+  # COMMAND position (e.g. `$(printf '\147\150')` -> gh), so the raw command
+  # carries no literal `gh` and the gh / env -S probes above miss it. This holds
+  # even after a prefix command + options (`command -p`, `env -i`), a value-taking
+  # flag (`env -u NAME`), or a quoted env assignment (`FOO="a b"`) — forms the
+  # earlier command-position-only regex could not express. Force tokenization
+  # whenever a cmdsub coexists with a gh pr/issue write noun; the command-position
+  # forward pass below then fails closed ONLY on a genuine command-position synth
+  # write and ignores benign cmdsubs and arguments. Over-matching costs one
+  # tokenizer run; a false negative is a bypass.
   NEEDS_TOKENIZE=1
 fi
 if [ "$NEEDS_TOKENIZE" -eq 0 ]; then
@@ -904,51 +906,85 @@ guarded_gh_invocation_label() {
   return 1
 }
 
-# #553 (CodeRabbit Critical): a command substitution in COMMAND position can
-# synthesize the executable name ($(printf '\147\150') -> gh), so the flattened
+# #553 / #560: a command substitution in COMMAND position can synthesize the
+# executable name ($(printf '\147\150') -> gh), so the flattened
 # __MERGEPATH_CMDSUB__ placeholder sits where the command name belongs and the
-# literal-`gh` detection below misses it entirely. Fail closed when a
-# COMMAND-position placeholder — at the start of a command, after a separator, or
-# after a prefix command (eval/sudo/env/...) — is followed by a guarded pr/issue
-# write. A placeholder that is an assignment VALUE (`X=$(...)`, previous token
-# `X=`) or an ordinary command ARGUMENT (`echo $(...)`, previous token `echo`) is
-# NOT command position, so it is left to the normal walk, which still catches any
-# real gh write lifted out of the substitution into its own segment.
+# literal-`gh` detection below misses it entirely. A single forward pass tracks
+# command position exactly as the main walk does — through prefix commands and
+# their boolean / value-taking flags (`prefix_flag_takes_value`) and
+# env-assignment prefixes — so a placeholder reached AT command position AND
+# directly followed by a guarded pr/issue write fails closed, even after
+# `command -p`, `env -i`, `env -u NAME`, or a quoted assignment (`FOO="a b"`)
+# (#560). A placeholder consumed as a value-taking flag's argument, or as a bare
+# assignment's VALUE (`X=$(gh pr merge)` lifts the real write into a later
+# ;-segment, #540), is NOT flagged; the main gh walk still catches any real write
+# lifted out of the substitution. Keeping this OUT of the main walk (no SAW_GH)
+# avoids the assignment-substitution command-position ambiguity.
+_synth_cp=1
+_synth_skip_val=0
+_synth_prefix=""
 for _ci in "${!TOKENS[@]}"; do
-  [ "${TOKENS[$_ci]}" = "__MERGEPATH_CMDSUB__" ] || continue
-  _cp=0
-  if [ "$_ci" -eq 0 ]; then
-    _cp=1
-  else
-    _cprev="${TOKENS[$((_ci - 1))]}"
-    if is_guard_separator "$_cprev"; then
-      _cp=1
-    else
-      case "$_cprev" in
-        sudo|eval|time|nohup|env|command|exec|nice|ionice)
-          _cp=1 ;;
-        *=)
-          # Bare assignment `NAME=`: the placeholder is its VALUE (e.g.
-          # `X=$(...)`), not a command. Leave it to the walk, which still
-          # catches any real gh write lifted from inside the substitution.
-          : ;;
-        [A-Za-z_]*=*)
-          # Env-assignment prefix WITH a value (`FOO=1 $(...) pr merge`): the
-          # placeholder sits at the command position the prefix introduces.
-          _cp=1 ;;
-      esac
-    fi
+  _stok="${TOKENS[$_ci]}"
+  if is_guard_separator "$_stok"; then
+    _synth_cp=1
+    _synth_skip_val=0
+    _synth_prefix=""
+    continue
   fi
-  [ "$_cp" -eq 1 ] || continue
-  if _synth_label=$(guarded_gh_invocation_label "$_ci"); then
-    echo "BLOCKED: command-position command substitution may synthesize a gh write ($_synth_label)." >&2
-    echo "  A \$(...) or backtick in command position can produce the executable name" >&2
-    echo "  (e.g. \$(printf '\\147\\150') -> gh), so the guard cannot verify it. Run the" >&2
-    echo "  write directly through the verifying wrapper instead:" >&2
-    echo "    scripts/gh-as-author.sh -- gh ..." >&2
-    echo "    scripts/gh-as-reviewer.sh -- gh ..." >&2
-    exit 2
+  if [ "$_synth_skip_val" -eq 1 ]; then
+    _synth_skip_val=0
+    continue
   fi
+  if [ "$_synth_cp" -eq 0 ]; then
+    continue
+  fi
+  case "$_stok" in
+    __MERGEPATH_CMDSUB__)
+      if _synth_label=$(guarded_gh_invocation_label "$_ci"); then
+        echo "BLOCKED: command-position command substitution may synthesize a gh write ($_synth_label)." >&2
+        echo "  A \$(...) or backtick in command position can produce the executable name" >&2
+        echo "  (e.g. \$(printf '\\147\\150') -> gh), so the guard cannot verify it. Run the" >&2
+        echo "  write directly through the verifying wrapper instead:" >&2
+        echo "    scripts/gh-as-author.sh -- gh ..." >&2
+        echo "    scripts/gh-as-reviewer.sh -- gh ..." >&2
+        exit 2
+      fi
+      # In command position but NOT followed by a guarded write (e.g. `$(date)`,
+      # or `X=$(gh pr merge)` whose real write is lifted past a `;`): treat the
+      # placeholder as the command and skip its arguments.
+      _synth_cp=0
+      continue
+      ;;
+    [A-Za-z_]*=)
+      # Bare assignment `NAME=`: the NEXT token is its VALUE (e.g. `X=$(...)`),
+      # not a command — consume it so a placeholder-as-value is not mis-read.
+      _synth_skip_val=1
+      continue
+      ;;
+    [A-Za-z_]*=*)
+      # Env-assignment prefix WITH an inline value (`FOO=1`, `FOO="a b"`): the
+      # real command (which may be a synth cmdsub) follows — stay command position.
+      continue
+      ;;
+    sudo|eval|time|nohup|env|command|exec|nice|ionice)
+      _synth_prefix="$_stok"
+      continue
+      ;;
+    -*)
+      # Flag of the current prefix command. A value-taking flag (`env -u NAME`,
+      # `sudo -u USER`) consumes the NEXT token as its value; a boolean flag
+      # (`command -p`, `env -i`) does not — either way we stay command position.
+      if prefix_flag_takes_value "$_synth_prefix" "$_stok"; then
+        _synth_skip_val=1
+      fi
+      continue
+      ;;
+    *)
+      # A real (non-gh) command — its arguments are not command position.
+      _synth_cp=0
+      continue
+      ;;
+  esac
 done
 
 COMPOUND_GH_COUNT=0
