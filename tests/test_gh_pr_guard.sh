@@ -768,6 +768,11 @@ assert_rc_contains "env -S command-substitution payload fails closed (#551 Codex
   'env -S "$(printf gh) pr merge 123 --admin"'
 assert_rc_contains "env -S following-argv payload fails closed (#551 Codex)" 2 "tokenize" \
   'env -S "bash -c" "gh pr merge 123 --admin"'
+# No literal "gh" in the raw command (gh synthesized via octal printf), so the
+# no-gh fast-path would skip the tokenizer — but env -S forces tokenization and
+# then fails closed (Codex #551 r5: tokenize env -S even without a literal gh).
+assert_rc_contains "env -S without a literal gh still fails closed (#551 Codex)" 2 "tokenize" \
+  'G=$(printf "\147\150") env -S "${G} pr merge 123 --admin"'
 # A plain env prefix (no -S) is unaffected — it still surfaces the wrapped write.
 assert_rc_contains "plain env prefix still surfaces the gh write (#551 regression)" 2 "token-verifying wrapper" \
   'env FOO=bar gh pr merge 123 --admin'

@@ -246,7 +246,21 @@ COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 # and the hook exited before tokenizing). Erring toward NOT early-exiting
 # is the fail-closed direction: a false positive costs one tokenizer run;
 # a false negative is a bypass.
-if ! echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])([^[:space:]]*/)?gh([^A-Za-z0-9_]|$)'; then
+# #551 (Codex): env -S / --split-string can synthesize `gh` dynamically (e.g.
+# from an octal printf in a $(...) substitution), so the raw command may carry
+# NO literal `gh` yet still run `gh pr merge`. A no-`gh` early-exit would then
+# skip the env -S fail-closed branch in the tokenizer below. Force tokenization
+# whenever the command carries `gh` OR an env -S / --split-string flag (the
+# tokenizer then blocks the env -S, fail-closed). Over-matching only costs one
+# tokenizer run; a false negative is a bypass.
+NEEDS_TOKENIZE=0
+if echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])([^[:space:]]*/)?gh([^A-Za-z0-9_]|$)'; then
+  NEEDS_TOKENIZE=1
+elif echo "$COMMAND" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
+     && echo "$COMMAND" | grep -qE '(-[A-Za-z]*S|--split-string)'; then
+  NEEDS_TOKENIZE=1
+fi
+if [ "$NEEDS_TOKENIZE" -eq 0 ]; then
   exit 0
 fi
 
@@ -529,6 +543,16 @@ def expand_wrappers(tokens, depth=0):
         if _ASSIGN_RE.match(tok):
             out.append(tok)
             i += 1
+            # NAME=$(...) is split by flatten_command into "NAME=" + the
+            # __MERGEPATH_CMDSUB__ placeholder; re-attach the placeholder as the
+            # assignment value so it does not read as "NAME= <command>" and let
+            # a following prefix lose command position (Codex #551:
+            # G=$(printf gh) env -S "${G} ..." must still reach the env -S
+            # fail-closed branch). Only a trailing-"=" (empty-value) assignment
+            # immediately followed by the placeholder is the flatten artifact.
+            if tok.endswith("=") and i < n and tokens[i] == "__MERGEPATH_CMDSUB__":
+                out.append(tokens[i])
+                i += 1
             continue
         base = tok.rsplit("/", 1)[-1]
         if base == "eval":
