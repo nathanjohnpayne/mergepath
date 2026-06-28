@@ -47,6 +47,21 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
+# --- preflight auto-source (#282) ------------------------------------------
+# When the live `gh api .../pulls/{pr}/files` path runs (no --fixture), it
+# must authenticate as the reviewer identity, not under a bare ambient
+# GH_TOKEN. Mirror codex-review-check.sh: if GH_TOKEN is unset and a fresh
+# op-preflight cache exists for this agent, source it so the reviewer PAT is
+# available. The classifier is read-only, so reviewer scope is correct.
+# Guarded by existence — a hand-built install without the helper still runs
+# (it just won't auto-source).
+__P4B_CLASSIFIER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -r "$__P4B_CLASSIFIER_DIR/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=lib/preflight-helpers.sh
+  . "$__P4B_CLASSIFIER_DIR/lib/preflight-helpers.sh"
+  preflight_require_token reviewer || true
+fi
+
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
 PR_NUM=""
@@ -224,7 +239,13 @@ else
     echo "Error: GH_TOKEN required for live API call (or use --fixture)." >&2
     exit 2
   fi
-  FILES_JSON=$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/files" 2>&1) || {
+  # Pin the reviewer PAT on the live call (#533). Prefer the cached reviewer
+  # PAT (set above by preflight_require_token, or already exported by an
+  # op-preflight session) over a bare ambient GH_TOKEN, mirroring the sibling
+  # agent-session helpers. Falls back to the ambient GH_TOKEN when no reviewer
+  # PAT is present (the empty-token guard above already required one or the
+  # other to be set).
+  FILES_JSON=$(GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" gh api --paginate "repos/$REPO/pulls/$PR_NUM/files" 2>&1) || {
     echo "Error: failed to fetch PR files: $FILES_JSON" >&2; exit 2
   }
   # gh --paginate emits a stream of arrays; flatten into one. Normalize
@@ -246,7 +267,9 @@ else
   # "invariant" body mention). Hard-fail with exit 2 instead of
   # falling through with PR_BODY="" — codex r1 Phase 4b on PR #190
   # caught the prior `|| echo ""` swallow + reproduced with stubbed gh.
-  PR_BODY=$(gh api "repos/$REPO/pulls/$PR_NUM" --jq '.body // ""' 2>&1) || {
+  # Same reviewer-PAT pin as the files fetch above (#533): both live agent
+  # calls authenticate as the reviewer identity, not under a bare GH_TOKEN.
+  PR_BODY=$(GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" gh api "repos/$REPO/pulls/$PR_NUM" --jq '.body // ""' 2>&1) || {
     echo "Error: failed to fetch PR body for $REPO#$PR_NUM: $PR_BODY" >&2
     echo "       Body-only triggers (state-machine / invariant body mention) require this fetch to succeed." >&2
     exit 2
