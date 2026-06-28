@@ -1997,10 +1997,10 @@ fi
 # protection: even if branch protection is misconfigured or
 # disabled for an emergency hotfix, the hook will still refuse
 # to dispatch the merge.
-GH_JQ='.mergeStateStatus, .labels[].name'
-GH_ARGS=(pr view --json labels,mergeStateStatus --jq "$GH_JQ")
+GH_JQ='.mergeStateStatus, .mergeable, ([.statusCheckRollup[] | {n:(.name//.context//"?"), c:(.conclusion//.state//"PENDING"), t:(.completedAt//.startedAt//"")}] | group_by(.n) | map(max_by(.t).c) | map(select(. != "SUCCESS" and . != "SKIPPED" and . != "NEUTRAL")) | length), .labels[].name'
+GH_ARGS=(pr view --json labels,mergeStateStatus,mergeable,statusCheckRollup --jq "$GH_JQ")
 if [ -n "$PR_SELECTOR" ]; then
-  GH_ARGS=(pr view "$PR_SELECTOR" --json labels,mergeStateStatus --jq "$GH_JQ")
+  GH_ARGS=(pr view "$PR_SELECTOR" --json labels,mergeStateStatus,mergeable,statusCheckRollup --jq "$GH_JQ")
 fi
 if [ -n "$REPO_ARG" ]; then
   GH_ARGS+=(--repo "$REPO_ARG")
@@ -2035,13 +2035,19 @@ if ! GH_OUTPUT=$(gh "${GH_ARGS[@]}" 2>"$GH_STDERR"); then
   exit 2
 fi
 
-# Line 1 is mergeStateStatus; lines 2..N are label names (one per
-# line, possibly zero). Empty/missing MERGE_STATE (e.g. transient
-# API state) falls into the `*` case below and fails closed.
-# LABELS keeps the newline-delimited remainder for the exact-match
-# gate further down — never re-join it into a delimited string.
+# Line 1 is mergeStateStatus; line 2 is mergeable (MERGEABLE /
+# CONFLICTING / UNKNOWN — conflict-only, NOT a check-pass signal);
+# line 3 is the count of check names whose LATEST run is non-green
+# (a stale failure superseded by a later passing run does NOT count);
+# lines 4..N are label names (one per line, possibly zero).
+# Empty/missing MERGE_STATE (e.g. transient API state) falls into the
+# `*` case below and fails closed. LABELS keeps the newline-delimited
+# remainder for the exact-match gate further down — never re-join it
+# into a delimited string.
 MERGE_STATE=$(printf '%s\n' "$GH_OUTPUT" | sed -n '1p')
-LABELS=$(printf '%s\n' "$GH_OUTPUT" | sed -n '2,$p')
+MERGEABLE_STATE=$(printf '%s\n' "$GH_OUTPUT" | sed -n '2p')
+ROLLUP_NONGREEN=$(printf '%s\n' "$GH_OUTPUT" | sed -n '3p')
+LABELS=$(printf '%s\n' "$GH_OUTPUT" | sed -n '4,$p')
 
 # `human-hold` is a human-controlled hard freeze. Check it before
 # mergeStateStatus, --admin, or needs-external-review handling so no
@@ -2063,7 +2069,13 @@ fi
 #   BLOCKED     — required check failing OR active CHANGES_REQUESTED
 #                 review
 #   DIRTY       — merge conflict
-#   UNSTABLE    — non-required check failed
+#   UNSTABLE    — a non-passing commit status. Allowed ONLY when the
+#                 check rollup confirms every check name's LATEST run is
+#                 green (a stale pre-approval failure superseded by a
+#                 later pass) AND mergeable=MERGEABLE. A genuinely-red
+#                 (or misconfigured-required) check is NOT trusted as
+#                 benign just because mergeable — which is conflict-only
+#                 — says MERGEABLE; that would reopen #170/#171 (#547)
 #   BEHIND      — base has commits the head lacks (with "Require
 #                 branches to be up to date" enabled)
 #   DRAFT       — PR is in draft mode (covered explicitly so the
@@ -2087,7 +2099,32 @@ case "$MERGE_STATE" in
       exit 2
     fi
     ;;
-  BLOCKED|DIRTY|UNSTABLE|BEHIND)
+  UNSTABLE)
+    # UNSTABLE = a non-passing commit status, but mergeable. The naive
+    # read (allow because mergeable=MERGEABLE) is WRONG: GitHub defines
+    # `mergeable` purely by merge CONFLICTS, not check status, so a red
+    # REQUIRED check surfaced as UNSTABLE (or branch protection
+    # misconfigured) would still be MERGEABLE and slip through —
+    # reopening the #170/#171 red-CI bypass. So verify the check ROLLUP:
+    # allow only when every check name's LATEST run is green
+    # (ROLLUP_NONGREEN == 0). That clears the real #547 case — a STALE
+    # pre-approval failed check-suite superseded by a later passing run
+    # (its latest is green) — while a genuinely-red latest check (count
+    # > 0) stays blocked. mergeable=MERGEABLE is kept as a belt-and-
+    # suspenders conflict guard. BLOCKED/DIRTY/BEHIND still block below.
+    if [ "$ROLLUP_NONGREEN" = "0" ] && [ "$MERGEABLE_STATE" = "MERGEABLE" ]; then
+      echo "ALLOW: mergeStateStatus=UNSTABLE, but every check name's LATEST run is green and mergeable=MERGEABLE — a stale check-suite superseded by a later pass (#547)." >&2
+    elif [ "$EFFECTIVE_BREAK_GLASS_MERGE_STATE" = "1" ]; then
+      echo "BREAK-GLASS: merge with mergeStateStatus=UNSTABLE (non-green latest checks=$ROLLUP_NONGREEN, mergeable=$MERGEABLE_STATE) authorized by human." >&2
+    else
+      echo "BLOCKED: PR mergeStateStatus is UNSTABLE with $ROLLUP_NONGREEN check(s) whose latest run is not green (mergeable=$MERGEABLE_STATE) — fail-closed; a red required check is NOT trusted as benign (mergeable is conflict-only)." >&2
+      echo "  Resolve the failing checks, or wait for GitHub's recompute, then retry." >&2
+      echo "  Override: BREAK_GLASS_MERGE_STATE=1 (export or inline prefix; must be authorized by human in chat)." >&2
+      echo "  See #170 / #171 for the regression this guard closes." >&2
+      exit 2
+    fi
+    ;;
+  BLOCKED|DIRTY|BEHIND)
     if [ "$EFFECTIVE_BREAK_GLASS_MERGE_STATE" = "1" ]; then
       echo "BREAK-GLASS: merge with mergeStateStatus=$MERGE_STATE authorized by human." >&2
     else

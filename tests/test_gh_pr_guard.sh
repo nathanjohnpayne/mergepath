@@ -55,6 +55,8 @@ case "${1:-} ${2:-}" in
         ;;
       *)
         echo "${STUB_MERGE_STATE:-CLEAN}"
+        echo "${STUB_MERGEABLE:-MERGEABLE}"
+        echo "${STUB_ROLLUP_NONGREEN:-0}"
         if [ -n "${STUB_LABELS:-}" ]; then
           echo "$STUB_LABELS" | tr ';' '\n'
         fi
@@ -83,6 +85,8 @@ run_hook() {
   payload=$(jq -n --arg c "$cmd" '{tool_input: {command: $c}}')
   PATH="$STUB_DIR:$PATH" \
   STUB_MERGE_STATE="$merge_state" \
+  STUB_MERGEABLE="${STUB_MERGEABLE:-MERGEABLE}" \
+  STUB_ROLLUP_NONGREEN="${STUB_ROLLUP_NONGREEN:-0}" \
   STUB_LABELS="$labels" \
   STUB_PR_BODY="$pr_body" \
   STUB_PR_ADDITIONS="$additions" \
@@ -189,6 +193,28 @@ assert_rc_contains "direct pr merge blocked" 2 "token-verifying wrapper" \
 
 assert_rc_contains "author wrapper pr merge blocked state" 2 "mergeStateStatus is BLOCKED" \
   'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "BLOCKED" ""
+
+# #547: UNSTABLE is a non-passing commit status. It is allowed ONLY when
+# the check ROLLUP confirms every check name's LATEST run is green
+# (ROLLUP_NONGREEN=0 — a stale failure superseded by a later pass) AND
+# mergeable=MERGEABLE. A genuinely-red check (rollup non-green > 0) is NOT
+# trusted as benign just because mergeable is MERGEABLE: mergeable is
+# conflict-only, so trusting it would reopen the #170/#171 red-CI bypass.
+assert_rc_contains "UNSTABLE + green rollup + MERGEABLE allowed (#547)" 0 "" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "UNSTABLE" ""
+STUB_ROLLUP_NONGREEN=1 \
+  assert_rc_contains "UNSTABLE + a red latest check fails closed (#547)" 2 "latest run is not green" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "UNSTABLE" ""
+STUB_MERGEABLE=UNKNOWN \
+  assert_rc_contains "UNSTABLE + green rollup but mergeable=UNKNOWN fails closed (#547)" 2 "fail-closed" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "UNSTABLE" ""
+STUB_ROLLUP_NONGREEN=1 \
+  assert_rc_contains "UNSTABLE + red rollup + break-glass allowed (#547)" 0 "BREAK-GLASS" \
+  'BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --squash' "UNSTABLE" ""
+# DIRTY (merge conflict) stays blocked regardless — the UNSTABLE allowance
+# must not leak to the other non-CLEAN states.
+assert_rc_contains "DIRTY stays blocked (#547 split)" 2 "mergeStateStatus is DIRTY" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "DIRTY" ""
 
 assert_rc_contains "author wrapper pr merge human-hold blocks" 2 "human-hold" \
   'CODEX_CLEARED=1 BREAK_GLASS_ADMIN=1 BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash' "DIRTY" "human-hold"
