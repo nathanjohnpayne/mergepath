@@ -260,17 +260,16 @@ jobs:
                 # delimiter must be column-0 unless using `<<-` with
                 # tabs; YAML run blocks make that brittle).
                 comment_body='**Automated label removal.** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD (CI green + reviewer-identity APPROVED + Codex cleared). Removed `needs-external-review` so Label Gate passes and the PR can merge. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#195) for the trigger doctrine.'
-                # #530 (ruled DEFER + DOCUMENT): this attribution-comment POST
-                # sits inside with_gh_retry, so a timeout-after-accept could in
-                # principle duplicate the comment. Accepted as a low-probability,
-                # cosmetic residual: the failure path is warn-only (non-fatal),
-                # and the only other retried writes in this workflow are
-                # check-runs keyed on (name, head_sha), which GitHub UPSERTS
-                # (idempotent). A duplicate attribution NOTE on a merged PR is
-                # harmless; gating this POST behind a read-before-write dedup
-                # would add latency to the common single-success path for no
-                # functional gain. Revisit if duplicate comments are ever seen.
-                with_gh_retry gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
+                # #530 (IMPLEMENTED — was DEFER+DOCUMENT, human-ratified
+                # 2026-06-28): this attribution-comment POST is NON-idempotent,
+                # so it is deliberately NOT wrapped in with_gh_retry. A retry
+                # after a timeout-after-accept would post a DUPLICATE comment;
+                # a single unretried attempt cannot. Failure stays warn-only
+                # (non-fatal) and is purely cosmetic — the label is already
+                # cleared and the workflow log records the action. The other
+                # retried writes here are check-runs keyed on (name, head_sha),
+                # which GitHub UPSERTS (idempotent), so those stay wrapped.
+                gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
                   || echo "::warning::Failed to post attribution comment for PR #$PR"
                 ;;
               1)
@@ -512,7 +511,10 @@ jobs:
                 still_present=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels --jq 'any(.labels[]?; .name == "needs-external-review")' || echo "unknown")
                 if [ "$still_present" = "false" ]; then
                   comment_body='**Automated label removal (scheduled sweep).** `scripts/codex-review-check.sh` cleared the merge gate on this HEAD between event triggers (typical: Codex 👍 after the last push, with no synchronize / review / workflow_run event to fire the event-driven path). Removed `needs-external-review`. See [.github/workflows/auto-clear-blocking-labels.yml](.github/workflows/auto-clear-blocking-labels.yml) (#191/#197) for the sweep doctrine.'
-                  with_gh_retry gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
+                  # #530: non-idempotent comment POST — deliberately unretried
+                  # (a single attempt cannot duplicate); see the event-driven
+                  # job above for the full rationale. Failure is warn-only.
+                  gh pr comment "$PR" --repo "$REPO" --body "$comment_body" \
                     || echo "::warning::Failed to post attribution comment for PR #$PR"
                 else
                   # Removal did not take (label still present or verify read

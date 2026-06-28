@@ -10,6 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Lint only runs scripts/ci/check_* against the checked-out tree; it
+          # never pushes or uses the workspace remote, so don't leave the
+          # checkout token in .git/config (#548 defense-in-depth).
+          persist-credentials: false
 
       - name: make_ci_scripts_executable
         run: chmod +x scripts/ci/*

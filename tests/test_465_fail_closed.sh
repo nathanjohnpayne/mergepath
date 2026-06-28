@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Structural regression guards for the #465 fail-open / early-clear fixes.
+# Structural regression guards for the #465 fail-open / early-clear fixes,
+# plus the #530 non-idempotent comment-POST and #548 checkout-hardening
+# invariants (cross-workflow, source-level assertions; propagation-safe via
+# the assert_grep/refute_grep SKIP-if-absent contract).
 #
 # The six defects span four YAML workflows and two shell scripts; the
 # workflow ones cannot be unit-executed without a full Actions runner, so
@@ -55,6 +58,13 @@ assert_grep "D3: auto-clear verifies label end-state (still_present)" \
   "$W/auto-clear-blocking-labels.yml" 'still_present'
 refute_grep "D3: auto-clear no longer retries the --remove-label write" \
   "$W/auto-clear-blocking-labels.yml" 'with_gh_retry gh pr edit "$PR" --repo "$REPO" --remove-label needs-external-review'
+# #530: the attribution-comment POST is non-idempotent (a retry after a
+# timeout-after-accept duplicates the comment), so it must NOT be retried;
+# the idempotent (name,head_sha) check-run POSTs stay wrapped.
+refute_grep "D3: auto-clear no longer retries the non-idempotent comment POST (#530)" \
+  "$W/auto-clear-blocking-labels.yml" 'with_gh_retry gh pr comment "$PR" --repo "$REPO" --body "$comment_body"'
+assert_grep "D3: auto-clear keeps check-run POSTs retried (idempotent name,head_sha) (#530)" \
+  "$W/auto-clear-blocking-labels.yml" 'with_gh_retry gh api "repos/$REPO/check-runs"'
 
 # Defect 4: codex-review-request re-scans at the deadline before emitting.
 assert_grep "D4: codex-review-request final scan at deadline" \
@@ -73,6 +83,25 @@ assert_grep "D6: codex-review-check tells 404 apart via HTTP status" \
   scripts/codex-review-check.sh 'HTTP 404'
 refute_grep "D6: codex-review-check dropped the unconditional skip-all-checks fail-open" \
   scripts/codex-review-check.sh 'Skipping required-check filter — all checks treated as passing this gate.'
+
+# Defect 7 (#548): every dispatchable-privileged checkout pins the trusted
+# default branch (blocks a manually-dispatched branch from running tampered
+# repo code under a privileged PAT), and checkouts with no authenticated-git
+# path drop the persisted checkout token (defense-in-depth).
+assert_grep "D7: weekly-feedback-sweep pins checkout ref (#548 Major)" \
+  "$W/weekly-feedback-sweep.yml" 'ref: ${{ github.event.repository.default_branch }}'
+assert_grep "D7: weekly-drift-audit pins checkout ref (#548)" \
+  "$W/weekly-drift-audit.yml" 'ref: ${{ github.event.repository.default_branch }}'
+assert_grep "D7: pr-audit pins checkout ref (#548)" \
+  "$W/pr-audit.yml" 'ref: ${{ github.event.repository.default_branch }}'
+assert_grep "D7: onepassword-headless-proof pins checkout ref (#548)" \
+  "$W/onepassword-headless-proof.yml" 'ref: ${{ github.event.repository.default_branch }}'
+assert_grep "D7: pr-review-policy drops the persisted checkout token (#548)" \
+  "$W/pr-review-policy.yml" 'persist-credentials: false'
+assert_grep "D7: repo_lint drops the persisted checkout token (#548)" \
+  "$W/repo_lint.yml" 'persist-credentials: false'
+assert_grep "D7: pr-audit drops the persisted checkout token (#548)" \
+  "$W/pr-audit.yml" 'persist-credentials: false'
 
 echo ""
 echo "test_465_fail_closed: $PASS passed, $FAIL failed, $SKIP skipped"
