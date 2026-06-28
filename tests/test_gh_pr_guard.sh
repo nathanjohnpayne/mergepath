@@ -749,29 +749,28 @@ assert_rc_contains "ionice -t flag does not swallow bash -c gh write (#551)" 2 "
 # ionice -c is still a real value option (regression: must skip its value).
 assert_rc_contains "ionice -c value option still skips its value, then surfaces gh (#551)" 2 "token-verifying wrapper" \
   'ionice -c 2 bash -c "gh pr merge 123 --admin"'
-# env -S/--split-string runs its argument as a SPLIT command: it must be
-# expanded (a nested command), not skipped as a value. env -S "gh ..." runs
-# gh directly via split-string.
-assert_rc_contains "env -S split-string command is expanded + surfaced (#551)" 2 "token-verifying wrapper" \
+# env -S / --split-string FAILS CLOSED (#551, Codex r1-r4). GNU env -S has
+# exotic dynamic semantics — whitespace splitting, $VAR expansion,
+# $(...)/backtick substitution, AND appending the remaining argv after the
+# split string — that the guard cannot safely + completely model (each partial
+# model surfaced a new bypass). env -S on a command line is an exotic shebang
+# feature no gh workflow needs, so ANY env -S is blocked rather than risk a
+# hidden write.
+assert_rc_contains "env -S gh write fails closed (#551)" 2 "tokenize" \
   'env -S "gh pr merge 123 --admin"'
-assert_rc_contains "env --split-string (next token) command is expanded (#551)" 2 "token-verifying wrapper" \
+assert_rc_contains "env --split-string gh write fails closed (#551)" 2 "tokenize" \
   'env --split-string "gh pr merge 123 --admin"'
-assert_rc_contains "env --split-string=STR (attached) command is expanded (#551)" 2 "token-verifying wrapper" \
+assert_rc_contains "env --split-string=STR gh write fails closed (#551)" 2 "tokenize" \
   'env --split-string="gh pr merge 123 --admin"'
-# No false positive: gh as mere data inside the split string is not a write.
-assert_rc_contains "env -S echo of gh text is not a write (#551, no false positive)" 0 "" \
-  'env -S "echo gh pr merge --admin"'
-# GNU env -S expands $VAR/${VAR} before splitting; shlex cannot resolve that,
-# so a "${G} ..." payload must FAIL CLOSED, not be left unexpanded and bypass
-# the guard (Codex #551 P1). $(...) command-subs are still handled (lifted by
-# flatten_command), so only an unresolvable parameter expansion blocks.
-assert_rc_contains "env -S with variable expansion fails closed, not bypass (#551 Codex)" 2 "tokenize" \
+assert_rc_contains "env -S variable-expansion payload fails closed (#551 Codex)" 2 "tokenize" \
   'G=gh env -S "${G} pr merge 123 --admin"'
-# Command substitution inside env -S: bash expands $(...) BEFORE env runs, so
-# the result becomes env -S command. The outer flatten lifts the $(...) out
-# into a placeholder, which must ALSO fail closed, not pass (Codex #551 r2).
-assert_rc_contains "env -S with command substitution fails closed, not bypass (#551 Codex)" 2 "tokenize" \
+assert_rc_contains "env -S command-substitution payload fails closed (#551 Codex)" 2 "tokenize" \
   'env -S "$(printf gh) pr merge 123 --admin"'
+assert_rc_contains "env -S following-argv payload fails closed (#551 Codex)" 2 "tokenize" \
+  'env -S "bash -c" "gh pr merge 123 --admin"'
+# A plain env prefix (no -S) is unaffected — it still surfaces the wrapped write.
+assert_rc_contains "plain env prefix still surfaces the gh write (#551 regression)" 2 "token-verifying wrapper" \
+  'env FOO=bar gh pr merge 123 --admin'
 
 echo ""
 echo "test_gh_pr_guard: $PASS passed, $FAIL failed"

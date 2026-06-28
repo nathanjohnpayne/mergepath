@@ -313,9 +313,9 @@ trap 'rm -f "$TMP_TOKENS" "$TMP_TOKENS_ERR"' EXIT
 # because the same letter differs by tool (nice -n takes a value; sudo -n
 # does not). Format: ";"-joined "<prefix>=<opt>,<opt>,..." entries. ONLY
 # value-CONSUMING options belong here: ionice -t/--ignore is a no-value flag
-# (CodeRabbit #551), and env -S/--split-string is NOT a value either — its
-# argument is a nested SPLIT command, re-tokenized + expanded in
-# expand_wrappers, so it is handled there rather than skipped as a value.
+# (CodeRabbit #551), and env -S/--split-string is NOT a value either — it runs
+# its argument as a SPLIT command with exotic dynamic semantics, so it FAILS
+# CLOSED in expand_wrappers (Codex #551) rather than being skipped here.
 PREFIX_VALUE_OPTS_SPEC="sudo=-u,--user,-g,--group,-p,--prompt,-h,--host,-t,--type,-r,--role,-C,--close-from,-D,--chdir,-R,--chroot,-U,--other-user,-T,--command-timeout;nice=-n,--adjustment;ionice=-c,--class,-n,--classdata,-p,--pid;env=-u,--unset,-C,--chdir;exec=-a;time=-f,--format,-o,--output"
 export PREFIX_VALUE_OPTS_SPEC
 if ! printf '%s' "$COMMAND" | python3 -c '
@@ -508,21 +508,6 @@ for _entry in _RAW_PREFIX_SPEC.split(";"):
     _PREFIX_VALUE_OPTS[_pfx] = frozenset(o for o in _opts.split(",") if o)
 _EMPTY_FROZENSET = frozenset()
 
-def _split_string_tokens(arg, depth):
-    # env -S is fully dynamic: GNU env -S expands $VAR/${VAR}, and bash expands
-    # $(...) / backtick substitutions BEFORE env runs, so the real command is
-    # produced at runtime and is NOT statically resolvable. Fail closed (Codex
-    # #551) when ARG carries any of those. By the time we get here the OUTER
-    # flatten_command has already lifted any $(...) / backtick out of this
-    # token, leaving a __MERGEPATH_CMDSUB__ placeholder where the substitution
-    # was — and that substitution RESULT becomes env -S command (e.g.
-    # env -S "$(printf gh) pr merge --admin"), so the placeholder must block,
-    # not pass. A literal "$" that survives is a parameter expansion. Either
-    # way the command is unknowable, so block rather than risk a hidden write.
-    if "$" in arg or "__MERGEPATH_CMDSUB__" in arg:
-        raise ValueError("env -S split-string with $-expansion or command-substitution is not statically resolvable")
-    return expand_wrappers(shlex.split(flatten_command(arg)), depth + 1)
-
 def expand_wrappers(tokens, depth=0):
     if depth > 25:
         raise ValueError("eval/shell -c nesting too deep")
@@ -628,22 +613,20 @@ def expand_wrappers(tokens, depth=0):
                 # payload is surfaced (CodeRabbit #551, a pre-existing exotic
                 # gap). Handles the next-token, --split-string=STR, and -SSTR
                 # (attached) forms.
-                if base == "env" and a in ("-S", "--split-string"):
-                    if i + 1 < n and tokens[i + 1] not in _SEPARATORS:
-                        out.extend(_split_string_tokens(tokens[i + 1], depth))
-                        i += 2
-                    else:
-                        out.append(a)
-                        i += 1
-                    continue
-                if base == "env" and a.startswith("--split-string="):
-                    out.extend(_split_string_tokens(a[len("--split-string="):], depth))
-                    i += 1
-                    continue
-                if base == "env" and len(a) > 2 and a.startswith("-S") and not a.startswith("--"):
-                    out.extend(_split_string_tokens(a[2:], depth))
-                    i += 1
-                    continue
+                if base == "env" and (a in ("-S", "--split-string")
+                                      or a.startswith("--split-string=")
+                                      or (len(a) > 2 and a.startswith("-S")
+                                          and not a.startswith("--"))):
+                    # env -S / --split-string FAILS CLOSED (Codex #551 r1-r4).
+                    # GNU env -S has rich, exotic semantics: whitespace
+                    # splitting, $VAR/${VAR} expansion, $(...)/backtick
+                    # substitution (bash expands those first), AND appending the
+                    # remaining argv after the split string (env -S "bash -c"
+                    # "<payload>"). Each partial model we tried surfaced a new
+                    # bypass, and env -S on a command line is an exotic shebang
+                    # feature no gh workflow needs, so BLOCK any env -S rather
+                    # than risk a hidden write. Reformulate without -S if needed.
+                    raise ValueError("env -S / --split-string is not statically resolvable; reformulate without -S")
                 if a in vopts:
                     out.append(a)
                     i += 1
