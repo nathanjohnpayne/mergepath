@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# check_propagation_closure
+#
+# Systemic closure-completeness guard — the INVERSE of
+# check_sync_manifest. See #519 / #521 for the drift class this closes.
+#
+# ─────────────────────────────────────────────────────────────────────
+# The gap this closes
+# ─────────────────────────────────────────────────────────────────────
+#
+# check_sync_manifest validates that every DECLARED `requires:` entry is
+# COVERED by the manifest (an exact path, inside a kit, or another
+# requires:). It cannot detect a MISSING one: a PROPAGATED file — a
+# `scripts/ci/check_*` wrapper, or a propagated `.github/workflows/*.yml`
+# — that hard-references a `tests/` or `scripts/` path which is neither a
+# manifest path, inside a kit, nor in any `requires:` list. That
+# referenced file then does NOT travel to consumers, and the referencing
+# tool fails closed on the consumer.
+#
+# This is the #519 / #521 drift class (3rd occurrence): e.g.
+# scripts/ci/check_coderabbit_wait referenced
+# tests/test_coderabbit_wait_codex_failover.sh +
+# tests/test_coderabbit_automerge_rate_limit_gate.sh, and
+# agent-review.yml referenced scripts/coderabbit-automerge-rate-limit-gate.sh,
+# none declared — fixed in #526 by adding them to the manifest. This
+# check would have caught all three at manifest-edit time.
+#
+# ─────────────────────────────────────────────────────────────────────
+# What it does
+# ─────────────────────────────────────────────────────────────────────
+#
+# Enumerate references OUT of every propagated check_*/workflow file;
+# FAIL if any tests/+scripts/ reference is undeclared — i.e. not an exact
+# manifest path, not inside a kit, not in any requires: list — UNLESS:
+#
+#   - the referenced path does NOT exist on disk in this mergepath
+#     checkout. A non-existent ref cannot be a propagation dependency:
+#     there is nothing to propagate, and the referencing tool is not
+#     shelling out to a real file at runtime. In practice these are
+#     fixture-string paths embedded in a check's heredoc test data
+#     (e.g. `"path": "scripts/a.sh"` inside a synthetic PR body), doc
+#     examples in a comment (e.g. `scripts/cinema/foo.js`), or test
+#     assertion literals (`scripts/has-type.sh`). Skipping them is
+#     fail-CLOSED in the right direction — a real undeclared dependency
+#     is, by definition, a real file in mergepath that must travel.
+#
+#   - the ref is on the orchestrator/mergepath-internal ALLOW_LIST below
+#     (refs intentionally NOT propagated — the propagation engine
+#     itself, the new-repo bootstrap seeders, the weekly-sweep pipeline,
+#     and the self-tests of checks that are mergepath-only / SKIP on
+#     consumers / are never wired into a consumer's repo_lint.yml). Each
+#     entry is justified inline; keep entries SPECIFIC so the allow-list
+#     never masks a genuine gap.
+#
+#   - the ref is the scan file's OWN path (self-reference).
+#
+# This check is read-only and does NOT contact downstream repos.
+
+set -euo pipefail
+
+# Env overrides for tests/test_check_propagation_closure.sh — same
+# contract as check_sync_manifest:
+#   MERGEPATH_MANIFEST_PATH — point at a fixture manifest YAML
+#   MERGEPATH_REPO_ROOT     — point at a fixture repo tree (so the scan
+#                             enumerates the fixture's check_*/workflow
+#                             files and the exists-on-disk filter probes
+#                             the fixture). Default is the script's own
+#                             repo root in PR CI.
+REPO_ROOT="${MERGEPATH_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+MANIFEST="${MERGEPATH_MANIFEST_PATH:-$REPO_ROOT/.mergepath-sync.yml}"
+
+# ─────────────────────────────────────────────────────────────────────
+# Consumer-side vs mergepath-side disambiguation — BEFORE the yq check.
+# ─────────────────────────────────────────────────────────────────────
+#
+# Identical posture to check_sync_manifest. The manifest is
+# mergepath-internal by design (it lists every consumer's private
+# metadata, #268/#271), so a consumer that received THIS check via the
+# scripts/ci/ kit must no-op rather than fail. The marker file
+# scripts/sync-to-downstream.sh exists in mergepath and is intentionally
+# NOT propagated, so its presence distinguishes a mergepath checkout
+# from a consumer one.
+#
+#   (a) consumer checkout (sync-to-downstream.sh ALSO absent) → SKIP exit 0.
+#   (b) mergepath checkout (sync-to-downstream.sh present)    → FAIL exit 1
+#       (the manifest was accidentally deleted/renamed in a PR that
+#       modifies the canonical repo).
+if [ ! -f "$MANIFEST" ]; then
+  MARKER="$REPO_ROOT/scripts/sync-to-downstream.sh"
+  if [ ! -f "$MARKER" ]; then
+    echo "check_propagation_closure: SKIP (mergepath-only: .mergepath-sync.yml not present in this checkout; scripts/sync-to-downstream.sh also absent → consumer checkout)"
+    exit 0
+  fi
+  echo "FAIL: .mergepath-sync.yml is missing at repo root (but scripts/sync-to-downstream.sh IS present — looks like mergepath itself; the manifest must not be deleted/renamed)"
+  exit 1
+fi
+
+if ! command -v yq >/dev/null 2>&1; then
+  echo "FAIL: yq is required (mikefarah/yq v4+). Install via 'brew install yq' or apt."
+  exit 2
+fi
+
+# Parse-check: yq exits non-zero on a malformed YAML.
+if ! yq '.' "$MANIFEST" >/dev/null 2>&1; then
+  echo "FAIL: .mergepath-sync.yml does not parse as YAML"
+  yq '.' "$MANIFEST" || true
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Build the COVERED set from the manifest.
+# ─────────────────────────────────────────────────────────────────────
+#
+# Same fail-closed extraction idioms as check_sync_manifest: capture
+# each yq stream into a variable with an explicit error check so a
+# malformed manifest fails loudly instead of yielding an empty set (which
+# would silently flag every ref).
+#
+#   exact_set    — comma-joined .paths[].path, sentinel-padded so a
+#                  substring lookup can't false-match (",foo/bar," is
+#                  unambiguous).
+#   requires_set — comma-joined every .requires[] entry, same padding.
+#   kit_prefixes — each kit .path forced to a trailing slash so the
+#                  prefix match is slash-bounded (scripts/ci/ covers
+#                  scripts/ci/x but NOT scripts/cinema/x).
+if ! exact_rows=$(yq -r '.paths[].path' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract manifest paths (yq error):"
+  printf '%s\n' "$exact_rows"
+  echo "check_propagation_closure: FAIL"
+  exit 1
+fi
+if ! requires_rows=$(yq -r '.paths[] | select(has("requires")) | .requires[]' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract manifest requires: entries (yq error):"
+  printf '%s\n' "$requires_rows"
+  echo "check_propagation_closure: FAIL"
+  exit 1
+fi
+if ! kit_rows=$(yq -r '.paths[] | select(.type == "kit") | .path' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract kit paths from the manifest (yq error):"
+  printf '%s\n' "$kit_rows"
+  echo "check_propagation_closure: FAIL"
+  exit 1
+fi
+
+exact_set=",$(echo "$exact_rows" | tr '\n' ',')"
+requires_set=",$(echo "$requires_rows" | tr '\n' ',')"
+
+kit_prefixes=""
+while IFS= read -r kp; do
+  [ -z "$kp" ] && continue
+  case "$kp" in
+    */) kit_prefixes="$kit_prefixes $kp" ;;
+    *)  kit_prefixes="$kit_prefixes $kp/" ;;
+  esac
+done <<< "$kit_rows"
+
+# is_covered <ref> — 0 if the manifest propagates the ref: an exact
+# entry, a declared requires:, or strictly inside a kit subtree.
+is_covered() {
+  local ref="$1" kp
+  [[ "$exact_set" == *",$ref,"* ]] && return 0
+  [[ "$requires_set" == *",$ref,"* ]] && return 0
+  for kp in $kit_prefixes; do
+    [[ "$ref" == "$kp"* ]] && return 0
+  done
+  return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# ALLOW_LIST — orchestrator / mergepath-internal refs NOT propagated.
+# ─────────────────────────────────────────────────────────────────────
+#
+# Each pattern is matched against a ref with bash `case` glob semantics
+# (so a trailing /* matches a whole subtree). SEEDED from the #521 design
+# and refined empirically against the live tree: every entry below was
+# verified to belong to a check/workflow that is EITHER never wired into
+# a consumer's repo_lint.yml OR SKIPs on a consumer (manifest-absent
+# guard), so the referenced file legitimately never needs to travel.
+# Verified 2026-06-24: device-source-of-truth + swipewatch consumers
+# carry none of these scripts/tests, and their repo_lint.yml wires none
+# of the referencing checks.
+#
+# Keep entries SPECIFIC. A pattern broad enough to swallow a real
+# consumer-wired dependency would re-open the #519/#521 gap.
+ALLOW_LIST=(
+  # The propagation engine itself + its project-doc-mirror sibling.
+  # scripts/sync-to-downstream.sh is the orchestrator — explicitly NEVER
+  # propagated (see the manifest's "NOT propagated" note). Referenced
+  # only in comments by pr-audit.yml / pr-review-policy.yml and by the
+  # sync/manifest checks. project-doc-sync.sh (#508) is its mergepath-only
+  # sibling; check_sync_to_downstream SKIPs on consumers.
+  "scripts/sync-to-downstream.sh"
+  "scripts/project-doc-sync.sh"
+  "tests/test_sync_to_downstream.sh"
+  "tests/test_sync_overrides.sh"
+  "tests/test_project_doc_sync.sh"
+
+  # New-repo bootstrap seeders (scripts/bootstrap.sh, bootstrap-new-repo.sh,
+  # bootstrap-config.sh, and the scripts/bootstrap/ subtree). These seed a
+  # NEW repo once; they are orchestrator-only and never propagated. Their
+  # check_bootstrap_* wrappers are not wired into any consumer repo_lint.
+  # NB: glob patterns are STORED LITERALLY (fully quoted) so the array
+  # literal is not subject to pathname expansion at definition time; the
+  # `case` statement in is_allow_listed() does the glob match.
+  "scripts/bootstrap.sh"
+  "scripts/bootstrap-new-repo.sh"
+  "scripts/bootstrap-config.sh"
+  "scripts/bootstrap/*"
+  "tests/test_bootstrap*"
+
+  # Weekly unresolved-feedback sweep pipeline — mergepath-only cron
+  # workhorse; check_sweep_unresolved_feedback is not wired on consumers.
+  "scripts/sweep-unresolved-feedback/*"
+  "tests/test_sweep*"
+
+  # Propagation-lane audit test family. audit-propagation-lane.sh IS
+  # declared (already covered), kept here only for robustness to a future
+  # manifest reshuffle.
+  #
+  # NB: scripts/workflow/* is deliberately NOT allow-listed (nathanpayne-codex
+  # Phase-4b finding on #543). scripts/workflow/ is a propagated kit, so a
+  # reference to a workflow helper that genuinely travels is already covered
+  # by is_covered (the kit prefix). A blanket scripts/workflow/* allow-list
+  # would instead MASK the exact closure gap this check exists to catch — a
+  # propagated workflow that hard-references a scripts/workflow/ helper which
+  # is NOT in the kit/manifest. If a specific workflow helper is genuinely
+  # mergepath-only, exempt that one reference with a narrow justification.
+  "scripts/audit-propagation-lane.sh"
+  "tests/test_audit*"
+
+  # Templated-propagation engine lib (#313). check_template_substitution
+  # and check_workflow_verify_propagation_templated both SKIP on a
+  # consumer (manifest-absent guard); the lib + its templated-verify test
+  # are mergepath-internal and never travel.
+  "scripts/lib/template-substitution.sh"
+  "tests/test_verify_propagation_pr_templated.sh"
+
+  # 1Password headless-proof setup — mergepath-only operator tooling;
+  # check_onepassword_headless_proof_workflow is not wired on consumers.
+  "scripts/onepassword-headless-proof-setup.sh"
+
+  # Self-tests of mergepath-only CI checks that are NOT wired into any
+  # consumer's repo_lint.yml (verified against live consumers). The
+  # check wrapper ships via the scripts/ci/ kit but never runs on a
+  # consumer, so its paired test legitimately does not travel:
+  #   - check_eslint_config_policy  → test_eslint_policy_check.sh
+  #   - check_mktemp_portability    → test_check_mktemp_portability.sh
+  #   - check_session_finalization  → test_session_finalization_check.sh
+  #   - check_sync_manifest         → test_check_sync_manifest.sh (also
+  #     SKIPs on consumers via the manifest-absent guard)
+  "tests/test_eslint_policy_check.sh"
+  "tests/test_check_mktemp_portability.sh"
+  "tests/test_session_finalization_check.sh"
+  "tests/test_check_sync_manifest.sh"
+)
+
+is_allow_listed() {
+  local ref="$1" pat
+  for pat in "${ALLOW_LIST[@]}"; do
+    # shellcheck disable=SC2254  # intentional glob match against the pattern
+    case "$ref" in
+      $pat) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Enumerate scan files: every propagated check_* + every exact-manifest
+# workflow.
+# ─────────────────────────────────────────────────────────────────────
+#
+# Bash 3.2 portable — no mapfile, no associative arrays. Build a
+# newline-delimited list in a variable.
+scan_files=""
+
+# (1) every scripts/ci/check_* that is_covered (i.e. actually propagated).
+if [ -d "$REPO_ROOT/scripts/ci" ]; then
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    rel="${f#"$REPO_ROOT"/}"
+    if is_covered "$rel"; then
+      scan_files="$scan_files$f
+"
+    fi
+  done <<EOF
+$(find "$REPO_ROOT/scripts/ci" -maxdepth 1 -type f -name 'check_*' | LC_ALL=C sort)
+EOF
+fi
+
+# (2) every .github/workflows/*.yml|*.yaml that is an EXACT manifest
+# entry (propagated workflows are canonical, not kit, so an exact-set
+# membership test is the right gate).
+while IFS= read -r p; do
+  [ -z "$p" ] && continue
+  case "$p" in
+    .github/workflows/*.yml|.github/workflows/*.yaml)
+      if [ -f "$REPO_ROOT/$p" ]; then
+        scan_files="$scan_files$REPO_ROOT/$p
+"
+      fi
+      ;;
+  esac
+done <<< "$exact_rows"
+
+FAILED=0
+SCANNED=0
+
+# ─────────────────────────────────────────────────────────────────────
+# For each scan file, extract refs and check coverage.
+# ─────────────────────────────────────────────────────────────────────
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  [ -f "$f" ] || continue
+  SCANNED=$((SCANNED + 1))
+  rel="${f#"$REPO_ROOT"/}"
+
+  # Extract candidate references: tests/test_<name>.sh and
+  # scripts/<path>.{sh,cjs,js}. sort -u dedupes within a file.
+  refs=$(grep -oE '(tests/test_[A-Za-z0-9_-]+\.sh|scripts/[A-Za-z0-9_./-]+\.(sh|cjs|js))' "$f" | sort -u || true)
+
+  while IFS= read -r ref; do
+    [ -z "$ref" ] && continue
+    # Self-reference — a file naming its own path is not a dependency.
+    [ "$ref" = "$rel" ] && continue
+    # Allow-listed orchestrator / mergepath-internal ref.
+    is_allow_listed "$ref" && continue
+    # A ref that does not resolve to a real file in mergepath cannot be a
+    # propagation dependency (fixture string / doc example / assertion
+    # literal). Skip — fail-closed: a real undeclared dependency IS a
+    # real file that must travel.
+    [ -e "$REPO_ROOT/$ref" ] || continue
+    # The load-bearing test: a real, propagated, on-disk dependency that
+    # the manifest does NOT carry.
+    if ! is_covered "$ref"; then
+      echo "FAIL: '$rel' references '$ref' but that path is NOT covered by the manifest"
+      echo "      (no exact entry, not inside any kit, not in any requires: list). '$rel' is"
+      echo "      propagated to consumers, so '$ref' must travel with it — otherwise the"
+      echo "      consumer receives '$rel' without '$ref' and any tool that hard-requires it"
+      echo "      fails closed at consumer lint time. This is the #519/#521 drift class."
+      echo "      Fix by adding '$ref' to the requires: of the manifest entry that propagates"
+      echo "      '$rel' (e.g. the scripts/ci/ kit entry, or the workflow's own entry), or by"
+      echo "      giving '$ref' its own manifest path entry."
+      FAILED=1
+    fi
+  done <<< "$refs"
+done <<< "$scan_files"
+
+if [ "$FAILED" -eq 1 ]; then
+  echo "check_propagation_closure: FAIL"
+  exit 1
+fi
+
+# Run the regression test suite if present — same guard as
+# check_sync_manifest: skip when this invocation was itself driven by a
+# fixture (MERGEPATH_MANIFEST_PATH set), since that is the test harness
+# calling back into us.
+TEST_SUITE="$REPO_ROOT/tests/test_check_propagation_closure.sh"
+if [ -z "${MERGEPATH_MANIFEST_PATH:-}" ] && [ -x "$TEST_SUITE" ]; then
+  echo "check_propagation_closure: running regression test suite"
+  if ! bash "$TEST_SUITE"; then
+    echo "check_propagation_closure: FAIL (regression test suite failed)"
+    exit 1
+  fi
+fi
+
+echo "check_propagation_closure: PASS ($SCANNED propagated file(s) scanned; all tests/+scripts/ references are covered, allow-listed, or non-propagated)"
+exit 0
