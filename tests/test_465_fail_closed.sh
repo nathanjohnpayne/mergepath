@@ -90,8 +90,12 @@ refute_grep "D6: codex-review-check dropped the unconditional skip-all-checks fa
 # path drop the persisted checkout token (defense-in-depth).
 assert_grep "D7: weekly-feedback-sweep pins checkout ref (#548 Major)" \
   "$W/weekly-feedback-sweep.yml" 'ref: ${{ github.event.repository.default_branch }}'
+assert_grep "D7: weekly-feedback-sweep drops the persisted checkout token (#548)" \
+  "$W/weekly-feedback-sweep.yml" 'persist-credentials: false'
 assert_grep "D7: weekly-drift-audit pins checkout ref (#548)" \
   "$W/weekly-drift-audit.yml" 'ref: ${{ github.event.repository.default_branch }}'
+assert_grep "D7: weekly-drift-audit drops the persisted checkout token (#548)" \
+  "$W/weekly-drift-audit.yml" 'persist-credentials: false'
 assert_grep "D7: pr-audit pins checkout ref (#548)" \
   "$W/pr-audit.yml" 'ref: ${{ github.event.repository.default_branch }}'
 assert_grep "D7: onepassword-headless-proof pins checkout ref (#548)" \
