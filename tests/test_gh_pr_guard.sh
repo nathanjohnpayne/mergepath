@@ -741,6 +741,27 @@ assert_rc_contains "time -f value option bash -c gh write surfaced (#546 gap 2)"
 assert_rc_contains "sudo -s no-value flag does not swallow the gh write (#546 gap 2)" 2 "token-verifying wrapper" \
   'sudo -s gh pr merge 123 --admin'
 
+# --- #546 follow-on (CodeRabbit #551): spec correctness for ionice/env ----
+# ionice -t/--ignore is a no-value FLAG, so it must not consume the next
+# token; before this it swallowed the bash that followed and hid the write.
+assert_rc_contains "ionice -t flag does not swallow bash -c gh write (#551)" 2 "token-verifying wrapper" \
+  'ionice -t bash -c "gh pr merge 123 --admin"'
+# ionice -c is still a real value option (regression: must skip its value).
+assert_rc_contains "ionice -c value option still skips its value, then surfaces gh (#551)" 2 "token-verifying wrapper" \
+  'ionice -c 2 bash -c "gh pr merge 123 --admin"'
+# env -S/--split-string runs its argument as a SPLIT command: it must be
+# expanded (a nested command), not skipped as a value. env -S "gh ..." runs
+# gh directly via split-string.
+assert_rc_contains "env -S split-string command is expanded + surfaced (#551)" 2 "token-verifying wrapper" \
+  'env -S "gh pr merge 123 --admin"'
+assert_rc_contains "env --split-string (next token) command is expanded (#551)" 2 "token-verifying wrapper" \
+  'env --split-string "gh pr merge 123 --admin"'
+assert_rc_contains "env --split-string=STR (attached) command is expanded (#551)" 2 "token-verifying wrapper" \
+  'env --split-string="gh pr merge 123 --admin"'
+# No false positive: gh as mere data inside the split string is not a write.
+assert_rc_contains "env -S echo of gh text is not a write (#551, no false positive)" 0 "" \
+  'env -S "echo gh pr merge --admin"'
+
 echo ""
 echo "test_gh_pr_guard: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then

@@ -311,8 +311,12 @@ trap 'rm -f "$TMP_TOKENS" "$TMP_TOKENS_ERR"' EXIT
 # (#546 gap 2: the bash walk lacked the long forms the python table had).
 # Defined ONCE here and read by BOTH, so they cannot drift. Per-prefix
 # because the same letter differs by tool (nice -n takes a value; sudo -n
-# does not). Format: ";"-joined "<prefix>=<opt>,<opt>,..." entries.
-PREFIX_VALUE_OPTS_SPEC="sudo=-u,--user,-g,--group,-p,--prompt,-h,--host,-t,--type,-r,--role,-C,--close-from,-D,--chdir,-R,--chroot,-U,--other-user,-T,--command-timeout;nice=-n,--adjustment;ionice=-c,--class,-n,--classdata,-p,--pid,-t;env=-u,--unset,-C,--chdir,-S,--split-string;exec=-a;time=-f,--format,-o,--output"
+# does not). Format: ";"-joined "<prefix>=<opt>,<opt>,..." entries. ONLY
+# value-CONSUMING options belong here: ionice -t/--ignore is a no-value flag
+# (CodeRabbit #551), and env -S/--split-string is NOT a value either — its
+# argument is a nested SPLIT command, re-tokenized + expanded in
+# expand_wrappers, so it is handled there rather than skipped as a value.
+PREFIX_VALUE_OPTS_SPEC="sudo=-u,--user,-g,--group,-p,--prompt,-h,--host,-t,--type,-r,--role,-C,--close-from,-D,--chdir,-R,--chroot,-U,--other-user,-T,--command-timeout;nice=-n,--adjustment;ionice=-c,--class,-n,--classdata,-p,--pid;env=-u,--unset,-C,--chdir;exec=-a;time=-f,--format,-o,--output"
 export PREFIX_VALUE_OPTS_SPEC
 if ! printf '%s' "$COMMAND" | python3 -c '
 import sys, shlex, re, os
@@ -601,6 +605,31 @@ def expand_wrappers(tokens, depth=0):
                     break
                 if _ASSIGN_RE.match(a):
                     out.append(a)
+                    i += 1
+                    continue
+                # env -S STRING / --split-string STRING runs STRING as a SPLIT
+                # command, so its argument is a NESTED command, not a value to
+                # skip: re-tokenize + expand it so a "env -S bash -c <gh write>"
+                # payload is surfaced (CodeRabbit #551, a pre-existing exotic
+                # gap). Handles the next-token, --split-string=STR, and -SSTR
+                # (attached) forms.
+                if base == "env" and a in ("-S", "--split-string"):
+                    if i + 1 < n and tokens[i + 1] not in _SEPARATORS:
+                        out.extend(expand_wrappers(
+                            shlex.split(flatten_command(tokens[i + 1])), depth + 1))
+                        i += 2
+                    else:
+                        out.append(a)
+                        i += 1
+                    continue
+                if base == "env" and a.startswith("--split-string="):
+                    out.extend(expand_wrappers(
+                        shlex.split(flatten_command(a[len("--split-string="):])), depth + 1))
+                    i += 1
+                    continue
+                if base == "env" and len(a) > 2 and a.startswith("-S") and not a.startswith("--"):
+                    out.extend(expand_wrappers(
+                        shlex.split(flatten_command(a[2:])), depth + 1))
                     i += 1
                     continue
                 if a in vopts:
