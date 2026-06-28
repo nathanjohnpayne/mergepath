@@ -55,6 +55,7 @@ case "${1:-} ${2:-}" in
         ;;
       *)
         echo "${STUB_MERGE_STATE:-CLEAN}"
+        echo "${STUB_MERGEABLE:-MERGEABLE}"
         if [ -n "${STUB_LABELS:-}" ]; then
           echo "$STUB_LABELS" | tr ';' '\n'
         fi
@@ -83,6 +84,7 @@ run_hook() {
   payload=$(jq -n --arg c "$cmd" '{tool_input: {command: $c}}')
   PATH="$STUB_DIR:$PATH" \
   STUB_MERGE_STATE="$merge_state" \
+  STUB_MERGEABLE="${STUB_MERGEABLE:-MERGEABLE}" \
   STUB_LABELS="$labels" \
   STUB_PR_BODY="$pr_body" \
   STUB_PR_ADDITIONS="$additions" \
@@ -189,6 +191,24 @@ assert_rc_contains "direct pr merge blocked" 2 "token-verifying wrapper" \
 
 assert_rc_contains "author wrapper pr merge blocked state" 2 "mergeStateStatus is BLOCKED" \
   'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "BLOCKED" ""
+
+# #547: UNSTABLE means a NON-required check is failing while every
+# required check passes (a failing REQUIRED check is BLOCKED, not
+# UNSTABLE), and stale pre-approval check-suites also leave a green,
+# approved PR UNSTABLE. So UNSTABLE + mergeable=MERGEABLE is allowed;
+# a non-MERGEABLE mergeable (UNKNOWN/CONFLICTING) fails closed.
+assert_rc_contains "UNSTABLE + mergeable=MERGEABLE allowed (#547)" 0 "" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "UNSTABLE" ""
+STUB_MERGEABLE=UNKNOWN \
+  assert_rc_contains "UNSTABLE + mergeable=UNKNOWN fails closed (#547)" 2 "mergeStateStatus is UNSTABLE and mergeable is UNKNOWN" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "UNSTABLE" ""
+STUB_MERGEABLE=UNKNOWN \
+  assert_rc_contains "UNSTABLE + mergeable=UNKNOWN + break-glass allowed (#547)" 0 "BREAK-GLASS" \
+  'BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --squash' "UNSTABLE" ""
+# DIRTY (merge conflict) stays blocked regardless of mergeable — the
+# UNSTABLE allowance must not leak to the other non-CLEAN states.
+assert_rc_contains "DIRTY stays blocked (#547 split)" 2 "mergeStateStatus is DIRTY" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "DIRTY" ""
 
 assert_rc_contains "author wrapper pr merge human-hold blocks" 2 "human-hold" \
   'CODEX_CLEARED=1 BREAK_GLASS_ADMIN=1 BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash' "DIRTY" "human-hold"
