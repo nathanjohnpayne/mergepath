@@ -767,6 +767,11 @@ assert_rc_contains "env -S echo of gh text is not a write (#551, no false positi
 # flatten_command), so only an unresolvable parameter expansion blocks.
 assert_rc_contains "env -S with variable expansion fails closed, not bypass (#551 Codex)" 2 "tokenize" \
   'G=gh env -S "${G} pr merge 123 --admin"'
+# Command substitution inside env -S: bash expands $(...) BEFORE env runs, so
+# the result becomes env -S command. The outer flatten lifts the $(...) out
+# into a placeholder, which must ALSO fail closed, not pass (Codex #551 r2).
+assert_rc_contains "env -S with command substitution fails closed, not bypass (#551 Codex)" 2 "tokenize" \
+  'env -S "$(printf gh) pr merge 123 --admin"'
 
 echo ""
 echo "test_gh_pr_guard: $PASS passed, $FAIL failed"

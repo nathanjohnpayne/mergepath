@@ -509,18 +509,19 @@ for _entry in _RAW_PREFIX_SPEC.split(";"):
 _EMPTY_FROZENSET = frozenset()
 
 def _split_string_tokens(arg, depth):
-    # env -S / --split-string runs ARG as a SPLIT command. GNU env -S also
-    # performs $VAR/${VAR} expansion before splitting (coreutils env.c reads
-    # getenv while parsing the split string), which shlex cannot resolve, so a
-    # "${G} pr merge" payload would leave the command token unexpanded and
-    # bypass the guard (Codex #551). flatten_command first lifts out
-    # $(...) / backtick command-subs into their own segments; any "$" that
-    # REMAINS after that is a parameter expansion we cannot statically resolve,
-    # so FAIL CLOSED (raise -> the hook blocks) rather than risk a hidden write.
-    flat = flatten_command(arg)
-    if "$" in flat:
-        raise ValueError("env -S split-string with $-expansion is not statically resolvable")
-    return expand_wrappers(shlex.split(flat), depth + 1)
+    # env -S is fully dynamic: GNU env -S expands $VAR/${VAR}, and bash expands
+    # $(...) / backtick substitutions BEFORE env runs, so the real command is
+    # produced at runtime and is NOT statically resolvable. Fail closed (Codex
+    # #551) when ARG carries any of those. By the time we get here the OUTER
+    # flatten_command has already lifted any $(...) / backtick out of this
+    # token, leaving a __MERGEPATH_CMDSUB__ placeholder where the substitution
+    # was — and that substitution RESULT becomes env -S command (e.g.
+    # env -S "$(printf gh) pr merge --admin"), so the placeholder must block,
+    # not pass. A literal "$" that survives is a parameter expansion. Either
+    # way the command is unknowable, so block rather than risk a hidden write.
+    if "$" in arg or "__MERGEPATH_CMDSUB__" in arg:
+        raise ValueError("env -S split-string with $-expansion or command-substitution is not statically resolvable")
+    return expand_wrappers(shlex.split(flatten_command(arg)), depth + 1)
 
 def expand_wrappers(tokens, depth=0):
     if depth > 25:
