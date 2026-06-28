@@ -707,6 +707,83 @@ else
   fail "author wrapper unset identity under custom expected author fails closed: rc=$rc; output: $out"
 fi
 
+# --- #546: parser-completeness hardening (gap 1 + gap 2) --------------
+# Gap 1 — a blessed wrapper must not hide a shell-c payload. Before #546 the
+# wrappers were not prefix-like in expand_wrappers, so a "<wrapper> -- bash
+# -c <gh write>" left the inner write opaque and it ran under the verified
+# token WITHOUT the merge-state / admin / CODEX gate. The inner write must
+# now surface and face the same checks as a visible "<wrapper> -- gh ...".
+assert_rc_contains "author wrapper hides bash -c merge: state still checked (#546 gap 1)" 2 "mergeStateStatus is BLOCKED" \
+  'scripts/gh-as-author.sh -- bash -c "gh pr merge 123 --squash"' "BLOCKED" ""
+assert_rc_contains "author wrapper bash -c clean merge still allowed (#546 gap 1, no false block)" 0 "" \
+  'scripts/gh-as-author.sh -- bash -c "gh pr merge 123 --squash"' "CLEAN" ""
+assert_rc_contains "author wrapper hides eval admin merge: surfaced + blocked (#546 gap 1)" 2 "" \
+  'scripts/gh-as-author.sh -- eval "gh pr merge 123 --admin"' "CLEAN" ""
+assert_rc_contains "reviewer wrapper hides bash -c admin merge: surfaced + blocked (#546 gap 1)" 2 "" \
+  'scripts/gh-as-reviewer.sh -- bash -c "gh pr merge 123 --admin"' "CLEAN" ""
+assert_rc_contains "wrapper bash -c echo of gh text is not a write (#546 gap 1, no false positive)" 0 "" \
+  'scripts/gh-as-author.sh -- bash -c "echo gh pr merge --admin"' "CLEAN" ""
+
+# Gap 2 — the python pre-pass and the bash walk read ONE shared
+# PREFIX_VALUE_OPTS_SPEC, so a long-form prefix value-option no longer
+# mis-skips. Before #546 python expanded "sudo --user X bash -c <gh write>"
+# but the bash compound scan (short-forms only) mis-read X as the command
+# and never saw the surfaced gh, so a guarded write passed rc=0.
+assert_rc_contains "sudo --user long form bash -c gh write surfaced (#546 gap 2)" 2 "token-verifying wrapper" \
+  'sudo --user root bash -c "gh pr merge 123 --admin"'
+assert_rc_contains "nice --adjustment long form bash -c gh write surfaced (#546 gap 2)" 2 "token-verifying wrapper" \
+  'nice --adjustment 10 bash -c "gh pr merge 123 --admin"'
+assert_rc_contains "time -f value option bash -c gh write surfaced (#546 gap 2)" 2 "token-verifying wrapper" \
+  'time -f FMT bash -c "gh pr merge 123 --admin"'
+# Bogus sudo:-s / sudo:-c removed from the shared spec: -s is a no-value
+# flag, so the FOLLOWING token is the command, not -s's value. Before #546
+# the bash table wrongly skipped it and lost the gh write.
+assert_rc_contains "sudo -s no-value flag does not swallow the gh write (#546 gap 2)" 2 "token-verifying wrapper" \
+  'sudo -s gh pr merge 123 --admin'
+
+# --- #546 follow-on (CodeRabbit #551): spec correctness for ionice/env ----
+# ionice -t/--ignore is a no-value FLAG, so it must not consume the next
+# token; before this it swallowed the bash that followed and hid the write.
+assert_rc_contains "ionice -t flag does not swallow bash -c gh write (#551)" 2 "token-verifying wrapper" \
+  'ionice -t bash -c "gh pr merge 123 --admin"'
+# ionice -c is still a real value option (regression: must skip its value).
+assert_rc_contains "ionice -c value option still skips its value, then surfaces gh (#551)" 2 "token-verifying wrapper" \
+  'ionice -c 2 bash -c "gh pr merge 123 --admin"'
+# env -S / --split-string FAILS CLOSED (#551, Codex r1-r4). GNU env -S has
+# exotic dynamic semantics — whitespace splitting, $VAR expansion,
+# $(...)/backtick substitution, AND appending the remaining argv after the
+# split string — that the guard cannot safely + completely model (each partial
+# model surfaced a new bypass). env -S on a command line is an exotic shebang
+# feature no gh workflow needs, so ANY env -S is blocked rather than risk a
+# hidden write.
+assert_rc_contains "env -S gh write fails closed (#551)" 2 "tokenize" \
+  'env -S "gh pr merge 123 --admin"'
+assert_rc_contains "env --split-string gh write fails closed (#551)" 2 "tokenize" \
+  'env --split-string "gh pr merge 123 --admin"'
+assert_rc_contains "env --split-string=STR gh write fails closed (#551)" 2 "tokenize" \
+  'env --split-string="gh pr merge 123 --admin"'
+assert_rc_contains "env -S variable-expansion payload fails closed (#551 Codex)" 2 "tokenize" \
+  'G=gh env -S "${G} pr merge 123 --admin"'
+assert_rc_contains "env -S command-substitution payload fails closed (#551 Codex)" 2 "tokenize" \
+  'env -S "$(printf gh) pr merge 123 --admin"'
+assert_rc_contains "env -S following-argv payload fails closed (#551 Codex)" 2 "tokenize" \
+  'env -S "bash -c" "gh pr merge 123 --admin"'
+# No literal "gh" in the raw command (gh synthesized via octal printf), so the
+# no-gh fast-path would skip the tokenizer — but env -S forces tokenization and
+# then fails closed (Codex #551 r5: tokenize env -S even without a literal gh).
+assert_rc_contains "env -S without a literal gh still fails closed (#551 Codex)" 2 "tokenize" \
+  'G=$(printf "\147\150") env -S "${G} pr merge 123 --admin"'
+# Clustered env split-string flag (-vS), not just a leading -S (CodeRabbit #551).
+assert_rc_contains "env clustered -vS fails closed (#551)" 2 "tokenize" \
+  'env -vS "gh pr merge 123 --admin"'
+# Quoted `env` (the shell strips the quotes and runs env) with no literal gh:
+# the fast-path quote-strips before probing, then env -S fails closed (Codex #551).
+assert_rc_contains "quoted env -S without a literal gh fails closed (#551 Codex)" 2 "tokenize" \
+  'G=$(printf "\147\150") "env" -S "${G} pr merge 123 --admin"'
+# A plain env prefix (no -S) is unaffected — it still surfaces the wrapped write.
+assert_rc_contains "plain env prefix still surfaces the gh write (#551 regression)" 2 "token-verifying wrapper" \
+  'env FOO=bar gh pr merge 123 --admin'
+
 echo ""
 echo "test_gh_pr_guard: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then

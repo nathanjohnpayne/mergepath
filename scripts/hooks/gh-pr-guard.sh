@@ -246,7 +246,23 @@ COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 # and the hook exited before tokenizing). Erring toward NOT early-exiting
 # is the fail-closed direction: a false positive costs one tokenizer run;
 # a false negative is a bypass.
-if ! echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])([^[:space:]]*/)?gh([^A-Za-z0-9_]|$)'; then
+# #551 (Codex): env -S / --split-string can synthesize `gh` dynamically (e.g.
+# from an octal printf in a $(...) substitution), so the raw command may carry
+# NO literal `gh` yet still run `gh pr merge`. A no-`gh` early-exit would then
+# skip the env -S fail-closed branch in the tokenizer below. Force tokenization
+# whenever the command carries `gh` OR an env -S / --split-string flag (the
+# tokenizer then blocks the env -S, fail-closed). Over-matching only costs one
+# tokenizer run; a false negative is a bypass.
+NEEDS_TOKENIZE=0
+if echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])([^[:space:]]*/)?gh([^A-Za-z0-9_]|$)'; then
+  NEEDS_TOKENIZE=1
+elif echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
+     && echo "$COMMAND" | tr -d "\"'" | grep -qE '(-[A-Za-z]*S|--split-string)'; then
+  # Quote-stripped (Codex #551): a quoted `'env'` runs env but would otherwise
+  # leave a quote, not whitespace, after `env` and dodge this probe.
+  NEEDS_TOKENIZE=1
+fi
+if [ "$NEEDS_TOKENIZE" -eq 0 ]; then
   exit 0
 fi
 
@@ -301,8 +317,25 @@ trap 'rm -f "$TMP_TOKENS" "$TMP_TOKENS_ERR"' EXIT
 # on swipewatch propagation PR #33 round 6 — privilege escalation
 # via newline-separated prefix command was the same shape as the
 # round-5 echo-prefix env spoof, just on a different separator.
+#
+# --- #546: single source of truth for prefix value-consuming options ---
+# Both the python pre-pass (which surfaces a bash -c payload hidden behind a
+# prefix) and the bash compound-scan + main walk (which skip prefix options
+# to find a command-position gh) MUST agree on which options consume the
+# NEXT token. If the two drift, a "<prefix> <value-opt> VALUE bash -c
+# <gh write>" payload slips through whichever layer is missing the option
+# (#546 gap 2: the bash walk lacked the long forms the python table had).
+# Defined ONCE here and read by BOTH, so they cannot drift. Per-prefix
+# because the same letter differs by tool (nice -n takes a value; sudo -n
+# does not). Format: ";"-joined "<prefix>=<opt>,<opt>,..." entries. ONLY
+# value-CONSUMING options belong here: ionice -t/--ignore is a no-value flag
+# (CodeRabbit #551), and env -S/--split-string is NOT a value either — it runs
+# its argument as a SPLIT command with exotic dynamic semantics, so it FAILS
+# CLOSED in expand_wrappers (Codex #551) rather than being skipped here.
+PREFIX_VALUE_OPTS_SPEC="sudo=-u,--user,-g,--group,-p,--prompt,-h,--host,-t,--type,-r,--role,-C,--close-from,-D,--chdir,-R,--chroot,-U,--other-user,-T,--command-timeout;nice=-n,--adjustment;ionice=-c,--class,-n,--classdata,-p,--pid;env=-u,--unset,-C,--chdir;exec=-a;time=-f,--format,-o,--output"
+export PREFIX_VALUE_OPTS_SPEC
 if ! printf '%s' "$COMMAND" | python3 -c '
-import sys, shlex, re
+import sys, shlex, re, os
 
 # chr(39)/chr(34) are single/double quote; chr() avoids embedding a
 # literal single quote inside the python3 -c surrounding heredoc.
@@ -458,6 +491,12 @@ def flatten_command(cmd, depth=0):
 _SEPARATORS = {"&&", "||", ";", "|", "|&", "&", "(", ")"}
 _SHELL_BASENAMES = {"sh", "bash", "dash", "zsh", "ksh"}
 _PREFIX_CMDS = {"sudo", "time", "nohup", "env", "command", "exec", "nice", "ionice"}
+# The canonical gh wrappers run "<wrapper> -- <command>". Treat the wrapper
+# (and the -- separator) as prefix-like so a "<wrapper> -- bash -c <gh write>"
+# payload keeps command position and the inner gh write is surfaced and
+# re-checked, not hidden behind the wrapper as an opaque shell-c token
+# (#546 gap 1).
+_WRAPPER_CMDS = {"gh-as-author.sh", "gh-as-reviewer.sh"}
 # sh/bash options that consume the NEXT token as their value, so the -c
 # command flag (and the script positional) lie AFTER that value. Skipping
 # only the option (not its value) would mis-read the value as the script
@@ -465,21 +504,24 @@ _PREFIX_CMDS = {"sudo", "time", "nohup", "env", "command", "exec", "nice", "ioni
 _SHELL_VALUE_OPTS = {"--rcfile", "--init-file", "-o", "+o", "-O", "+O"}
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # Per-prefix options that consume the NEXT token as a value, so the value
-# is not mistaken for the wrapped command. Per-prefix because the same
+# is not mistaken for the wrapped command. Read from the shared
+# PREFIX_VALUE_OPTS_SPEC env var (#546) so THIS python table and the bash
+# prefix_flag_takes_value table cannot drift. Per-prefix because the same
 # letter differs by tool: nice -n N takes a value, but sudo -n is a
-# no-value flag. A prefix not listed here is treated as flags-only.
-_PREFIX_VALUE_OPTS = {
-    "sudo": frozenset({"-u", "--user", "-g", "--group", "-p", "--prompt",
-                       "-h", "--host", "-t", "--type", "-r", "--role",
-                       "-C", "--close-from", "-D", "--chdir",
-                       "-R", "--chroot", "-U", "--other-user",
-                       "-T", "--command-timeout"}),
-    "nice": frozenset({"-n", "--adjustment"}),
-    "ionice": frozenset({"-c", "--class", "-n", "--classdata",
-                         "-p", "--pid", "-t"}),
-    "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
-    "exec": frozenset({"-a"}),
-}
+# no-value flag. A prefix not listed is treated as flags-only. Fail closed
+# when the spec is absent: without it every prefix looks flags-only and a
+# "value-opt VALUE" pair would be mis-read as the wrapped command, hiding a
+# trailing bash -c gh-write.
+_PREFIX_VALUE_OPTS = {}
+_RAW_PREFIX_SPEC = os.environ.get("PREFIX_VALUE_OPTS_SPEC", "")
+if not _RAW_PREFIX_SPEC:
+    print("gh-pr-guard: PREFIX_VALUE_OPTS_SPEC unset", file=sys.stderr)
+    sys.exit(1)
+for _entry in _RAW_PREFIX_SPEC.split(";"):
+    if not _entry:
+        continue
+    _pfx, _eq, _opts = _entry.partition("=")
+    _PREFIX_VALUE_OPTS[_pfx] = frozenset(o for o in _opts.split(",") if o)
 _EMPTY_FROZENSET = frozenset()
 
 def expand_wrappers(tokens, depth=0):
@@ -503,6 +545,16 @@ def expand_wrappers(tokens, depth=0):
         if _ASSIGN_RE.match(tok):
             out.append(tok)
             i += 1
+            # NAME=$(...) is split by flatten_command into "NAME=" + the
+            # __MERGEPATH_CMDSUB__ placeholder; re-attach the placeholder as the
+            # assignment value so it does not read as "NAME= <command>" and let
+            # a following prefix lose command position (Codex #551:
+            # G=$(printf gh) env -S "${G} ..." must still reach the env -S
+            # fail-closed branch). Only a trailing-"=" (empty-value) assignment
+            # immediately followed by the placeholder is the flatten artifact.
+            if tok.endswith("=") and i < n and tokens[i] == "__MERGEPATH_CMDSUB__":
+                out.append(tokens[i])
+                i += 1
             continue
         base = tok.rsplit("/", 1)[-1]
         if base == "eval":
@@ -581,6 +633,31 @@ def expand_wrappers(tokens, depth=0):
                     out.append(a)
                     i += 1
                     continue
+                # env -S STRING / --split-string STRING runs STRING as a SPLIT
+                # command, so its argument is a NESTED command, not a value to
+                # skip: re-tokenize + expand it so a "env -S bash -c <gh write>"
+                # payload is surfaced (CodeRabbit #551, a pre-existing exotic
+                # gap). Handles the next-token, --split-string=STR, and -SSTR
+                # (attached) forms.
+                if base == "env" and (a == "--split-string"
+                                      or a.startswith("--split-string=")
+                                      or (a.startswith("-") and not a.startswith("--")
+                                          and next((c for c in a[1:] if c in "uCS"), "") == "S")):
+                    # A short cluster IS env -S when the first value-taking-or-S
+                    # option in it is S (CodeRabbit #551: -vS etc., not only a
+                    # leading -S). -u/-C consume the rest of the cluster as their
+                    # value, so an S inside e.g. -uNAME_WITH_S is NOT the split
+                    # flag (keeps the #451 env -uNAME tests passing).
+                    # env -S / --split-string FAILS CLOSED (Codex #551 r1-r4).
+                    # GNU env -S has rich, exotic semantics: whitespace
+                    # splitting, $VAR/${VAR} expansion, $(...)/backtick
+                    # substitution (bash expands those first), AND appending the
+                    # remaining argv after the split string (env -S "bash -c"
+                    # "<payload>"). Each partial model we tried surfaced a new
+                    # bypass, and env -S on a command line is an exotic shebang
+                    # feature no gh workflow needs, so BLOCK any env -S rather
+                    # than risk a hidden write. Reformulate without -S if needed.
+                    raise ValueError("env -S / --split-string is not statically resolvable; reformulate without -S")
                 if a in vopts:
                     out.append(a)
                     i += 1
@@ -589,6 +666,31 @@ def expand_wrappers(tokens, depth=0):
                         i += 1
                     continue
                 if a.startswith("-"):
+                    out.append(a)
+                    i += 1
+                    continue
+                break
+            continue
+        if base in _WRAPPER_CMDS:
+            # Wrapper invocation (gh-as-author.sh / gh-as-reviewer.sh): keep
+            # command position through the -- arg separator and any wrapper
+            # flags so a trailing bash -c / sh -c / prefix / eval payload is
+            # expanded by the main loop and the inner gh write is re-checked,
+            # instead of running under the verified token without the
+            # merge-state / CODEX_CLEARED gate (#546 gap 1). A normal
+            # "<wrapper> -- gh pr merge" is unaffected (gh is not a shell to
+            # expand), so this only matters when a shell/prefix follows.
+            out.append(tok)
+            i += 1
+            while i < n:
+                a = tokens[i]
+                if a in _SEPARATORS:
+                    break
+                a_base = a.rsplit("/", 1)[-1]
+                if (a_base in _SHELL_BASENAMES or a_base in _PREFIX_CMDS
+                        or a_base in _WRAPPER_CMDS or a_base == "eval"):
+                    break
+                if a == "--" or a.startswith("-"):
                     out.append(a)
                     i += 1
                     continue
@@ -641,23 +743,28 @@ is_guard_separator() {
 }
 
 prefix_flag_takes_value() {
-  case "$1:$2" in
-    sudo:-u|sudo:-g|sudo:-U|sudo:-h|sudo:-p|sudo:-r|sudo:-s|sudo:-t|sudo:-c|sudo:-D)
-      return 0
-      ;;
-    time:-f|time:-o)
-      return 0
-      ;;
-    nice:-n)
-      return 0
-      ;;
-    ionice:-c|ionice:-n|ionice:-p)
-      return 0
-      ;;
-    env:-u|env:-S|env:--unset)
-      return 0
-      ;;
+  # Single source of truth: PREFIX_VALUE_OPTS_SPEC (#546). The python
+  # pre-pass and this bash walk read the SAME spec, so the two prefix-option
+  # tables cannot drift. The old hand-maintained case list HAD drifted: it
+  # lacked the long forms the python table carried, so "sudo --user X bash
+  # -c <gh write>" surfaced the inner gh in python but the bash compound
+  # scan mis-read X as the command and never saw it. Spec: ";"-joined
+  # "<prefix>=<opt>,<opt>,..." entries.
+  local pfx="$1" opt="$2" spec opts o
+  spec=";$PREFIX_VALUE_OPTS_SPEC"
+  case "$spec" in
+    *";$pfx="*) ;;
+    *) return 1 ;;
   esac
+  opts="${spec##*;$pfx=}"   # text after the (unique) ";<pfx>="
+  opts="${opts%%;*}"        # up to the next prefix entry
+  # Literal equality (NOT a case glob) so an attacker-supplied option token
+  # such as "-*" cannot glob-match a real value-option and mis-skip the
+  # following gh write.
+  local IFS=,
+  for o in $opts; do
+    [ "$o" = "$opt" ] && return 0
+  done
   return 1
 }
 
