@@ -151,6 +151,23 @@ assert_grep "D8: pr-audit guards dispatch to the default branch (#550)" \
 assert_grep "D8: daily-feedback-rollup guards dispatch to the default branch (#550 Codex)" \
   "$W/daily-feedback-rollup.yml" 'if: github.ref_name == github.event.repository.default_branch'
 
+# Defect 9 (#557): load-config must ALSO run on approved pull_request_review
+# events. The auto-merge-on-approval require_approval gate reads
+# needs.load-config.outputs.reviewers on the direct-approval path; if
+# load-config is skipped on review events that list is empty, the gate defaults
+# REVIEWERS_JSON to [] and rejects every approver as unregistered, so
+# approval-triggered auto-merge never arms (regressing #544 / #495). Job-scoped
+# (extract the load-config block) so it cannot false-match the auto-merge gate's
+# own pull_request_review branch.
+if [ -f "$W/agent-review.yml" ]; then
+  _lc_block=$(awk '/^  load-config:/{f=1;print;next} /^  [A-Za-z._-]+:/{f=0} f{print}' "$W/agent-review.yml")
+  if printf '%s\n' "$_lc_block" | grep -q 'pull_request_review'; then
+    pass "D9: load-config runs on pull_request_review so the arming gate sees reviewers (#557)"
+  else
+    fail "D9: load-config must gate on pull_request_review (#557) — direct-approval arming regressed"
+  fi
+else echo "SKIP: D9 agent-review (absent)"; SKIP=$((SKIP + 1)); fi
+
 echo ""
 echo "test_465_fail_closed: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ] || exit 1
