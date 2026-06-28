@@ -132,6 +132,8 @@ assert_grep "D8: weekly-drift-audit guards dispatch to the default branch (#550)
   "$W/weekly-drift-audit.yml" 'if: github.ref_name == github.event.repository.default_branch'
 assert_grep "D8: pr-audit guards dispatch to the default branch (#550)" \
   "$W/pr-audit.yml" 'if: github.ref_name == github.event.repository.default_branch'
+assert_grep "D8: daily-feedback-rollup guards dispatch to the default branch (#550 Codex)" \
+  "$W/daily-feedback-rollup.yml" 'if: github.ref_name == github.event.repository.default_branch'
 
 echo ""
 echo "test_465_fail_closed: $PASS passed, $FAIL failed, $SKIP skipped"

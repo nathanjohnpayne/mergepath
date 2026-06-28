@@ -48,6 +48,12 @@ permissions:
 jobs:
   rollup:
     name: Classify + post rollup issues
+    # Reject manual dispatch from a non-default ref (#550 Codex P1): on
+    # workflow_dispatch GitHub runs the workflow DEFINITION from the chosen
+    # ref, which the checkout pin cannot constrain — a feature branch could
+    # leak REVIEWER_ASSIGNMENT_TOKEN before checkout. Scheduled runs and
+    # default-branch dispatch pass; a feature-branch dispatch is skipped.
+    if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
