@@ -138,6 +138,31 @@ auto_source_preflight() {
   return 0
 }
 
+# Load OP_PREFLIGHT_* env vars from the cache file unconditionally —
+# even when GH_TOKEN is already set. auto_source_preflight skips when
+# GH_TOKEN is present (to preserve caller-provided creds), but callers
+# that build a per-command token pin like
+#   GH_TOKEN="${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}" gh api ...
+# need OP_PREFLIGHT_REVIEWER_PAT populated from disk even when an ambient
+# GH_TOKEN is already exported. GH_TOKEN is restored to its prior value
+# after sourcing so the caller's ambient token is not displaced.
+# Returns 0 in all cases (callers tolerate a missing cache gracefully).
+load_preflight_env_vars() {
+  local agent cache_dir session_file _saved_gh_token
+  agent="$(preflight_agent)"
+  [[ -z "$agent" ]] && return 0
+  cache_dir="$(preflight_cache_dir)"
+  session_file="$cache_dir/op-preflight-${agent}.env"
+  preflight_session_is_fresh "$session_file" || return 0
+  _saved_gh_token="${GH_TOKEN:-}"
+  # shellcheck disable=SC1090
+  . "$session_file"
+  if [[ -n "$_saved_gh_token" ]]; then
+    GH_TOKEN="$_saved_gh_token"
+  fi
+  return 0
+}
+
 # Convenience wrappers: helpers that need a reviewer-scoped token call
 # `preflight_require_token reviewer`; helpers that want author scope
 # pass `author`. The function auto-sources the cache (if needed) and

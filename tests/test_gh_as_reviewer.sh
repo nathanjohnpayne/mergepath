@@ -173,7 +173,7 @@ fi
 reset_log
 unset OP_PREFLIGHT_REVIEWER_PAT
 set +e
-GH_TOKEN="reviewer-token" run_wrapper -- gh pr review 123 --comment --body "ok" >/dev/null 2>&1
+GITHUB_TOKEN= GH_TOKEN="reviewer-token" run_wrapper -- gh pr review 123 --comment --body "ok" >/dev/null 2>&1
 rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
@@ -197,7 +197,7 @@ fi
 reset_log
 unset OP_PREFLIGHT_REVIEWER_PAT
 set +e
-err=$(GH_TOKEN="author-token" run_wrapper -- gh pr review 123 --comment --body "ok" 2>&1 >/dev/null)
+err=$(GITHUB_TOKEN= GH_TOKEN="author-token" run_wrapper -- gh pr review 123 --comment --body "ok" 2>&1 >/dev/null)
 rc=$?
 set -e
 # The wrapped write (gh pr review) must run under the keyring token, never

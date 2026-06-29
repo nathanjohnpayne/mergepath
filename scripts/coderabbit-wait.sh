@@ -827,11 +827,17 @@ count_potential_issues() {
 summary_body_has_potential_issue_marker() {
   local issue_comments latest_body
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
+  # Mirror latest_comment_from_issue_comments: exclude status-probe narration
+  # replies so a newer probe comment doesn't mask an earlier real summary that
+  # contains a "Potential issue" marker (false-clear of the #535 gate).
   latest_body=$(echo "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" '
+    def status_probe_reply:
+      ((.body // "") | test("CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits"; "i"));
     [ .[]
       | select(.user.login == $bot)
       | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
       | select(.fresh_at >= $after)
+      | select(status_probe_reply | not)
     ]
     | sort_by(.fresh_at)
     | last

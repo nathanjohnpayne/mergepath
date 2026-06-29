@@ -45,17 +45,27 @@ if [ -z "$WAIT_JSON" ]; then
   exit 1
 fi
 
-failover=$(printf '%s' "$WAIT_JSON" | jq -r '.codex_failover_requested // false' 2>/dev/null || echo "false")
+# Gate 0: only downgrade an actual rate_limit_stalled status. A cleared or
+# timeout status with codex_failover_requested: true must NOT proceed —
+# the gate is exclusively for the exit-5 rate-limit-stalled path.
+status=$(printf '%s' "$WAIT_JSON" | jq -r '.status // ""' 2>/dev/null || echo "")
+if [ "$status" != "rate_limit_stalled" ]; then
+  echo "rate-limit-gate: status=${status} (expected rate_limit_stalled) — block (fail-closed)" >&2
+  exit 1
+fi
 
-if [ "$failover" != "true" ]; then
-  echo "rate-limit-gate: codex_failover_requested=${failover} — no failover engaged; block" >&2
+# Gate 1: require a real JSON boolean true (not a string "true"). jq -e exits
+# non-zero when the selected value is false or null, so a string "true" or an
+# absent field produces a non-zero exit and we block.
+if ! printf '%s' "$WAIT_JSON" | jq -e '.codex_failover_requested == true' >/dev/null 2>&1; then
+  echo "rate-limit-gate: codex_failover_requested is not JSON boolean true — no failover engaged; block" >&2
   exit 1
 fi
 
 if [ "$EXTERNAL_REVIEW_REQUIRED" != "true" ]; then
-  echo "rate-limit-gate: failover engaged but PR is under-threshold (external_review_required=${EXTERNAL_REVIEW_REQUIRED}) — no downstream Codex gate; block (#512 r3)" >&2
+  echo "rate-limit-gate: rate-limit stall + failover engaged but PR is under-threshold (external_review_required=${EXTERNAL_REVIEW_REQUIRED}) — no downstream Codex gate; block (#512 r3)" >&2
   exit 1
 fi
 
-echo "rate-limit-gate: failover engaged + external review required — merge-clearance gates Codex; proceed" >&2
+echo "rate-limit-gate: rate-limit stall + failover engaged + external review required — merge-clearance gates Codex; proceed" >&2
 exit 0
