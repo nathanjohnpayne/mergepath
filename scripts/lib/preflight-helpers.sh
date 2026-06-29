@@ -148,15 +148,23 @@ auto_source_preflight() {
 # after sourcing so the caller's ambient token is not displaced.
 # Returns 0 in all cases (callers tolerate a missing cache gracefully).
 load_preflight_env_vars() {
-  local agent cache_dir session_file _saved_gh_token
+  local agent cache_dir session_file _saved_gh_token _r _a
   agent="$(preflight_agent)"
   [[ -z "$agent" ]] && return 0
   cache_dir="$(preflight_cache_dir)"
   session_file="$cache_dir/op-preflight-${agent}.env"
   preflight_session_is_fresh "$session_file" || return 0
   _saved_gh_token="${GH_TOKEN:-}"
+  # Source in a subshell and copy back only the two PAT vars. The session file
+  # can include deploy credentials (GOOGLE_APPLICATION_CREDENTIALS, CF_API_TOKEN)
+  # from a prior --mode deploy run; subshell isolation prevents those from
+  # leaking into the caller's process. (#554/#556 CodeRabbit Major)
   # shellcheck disable=SC1090
-  . "$session_file"
+  _r=$(. "$session_file" 2>/dev/null && printf '%s' "${OP_PREFLIGHT_REVIEWER_PAT:-}") || true
+  # shellcheck disable=SC1090
+  _a=$(. "$session_file" 2>/dev/null && printf '%s' "${OP_PREFLIGHT_AUTHOR_PAT:-}") || true
+  [[ -n "${_r:-}" ]] && OP_PREFLIGHT_REVIEWER_PAT="$_r"
+  [[ -n "${_a:-}" ]] && OP_PREFLIGHT_AUTHOR_PAT="$_a"
   if [[ -n "$_saved_gh_token" ]]; then
     GH_TOKEN="$_saved_gh_token"
   fi

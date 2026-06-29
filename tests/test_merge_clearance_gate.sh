@@ -804,7 +804,8 @@ set +e
 OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$WF_OK" "$CHECK_BIN" 2>&1)
 RC=$?
 set -e
-if ! echo "$OUT" | grep -q "must define a JOB named"; then
+if ! echo "$OUT" | grep -q "must define a JOB named" \
+   && echo "$OUT" | grep -q "check_merge_clearance_gate:"; then
   pass "correctly-named JOB → job-name assertion passes (#533)"
 else
   fail "expected job-name assertion to pass on a correct job name (#533); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2

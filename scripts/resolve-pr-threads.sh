@@ -764,7 +764,7 @@ fetch_manifest_templated_dests() {
         v=$0
         sub(/^[[:space:]]*repo:[[:space:]]*/, "", v)
         sub(/[[:space:]]*#.*$/, "", v)
-        gsub(/^[[:space:]]+|[[:space:]]+$|^"|"$/, "", v)
+        gsub(/^[[:space:]]+|[[:space:]]+$|^["\047]|["\047]$/, "", v)
         if (v != "") repos = repos (repos=="" ? "" : ",") v
       }
       END { print repos }
