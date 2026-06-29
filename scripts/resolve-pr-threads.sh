@@ -236,6 +236,20 @@ if ! [[ "$PR_NUM" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+# #565: --rationale is an --auto-resolve-bots affordance (override the class
+# for a deliberate deferred resolve). It is incompatible with
+# --resolve-actioned, whose whole contract is to resolve ONLY on derived
+# action evidence — a free-form rationale override would resolve a thread
+# while mis-tagging it deferred-to-followup, so the daily rollup would treat
+# an actioned, resolved thread as deferred/unhandled. Reject the combo.
+if [ "$MODE" = "resolve-actioned" ] && $RATIONALE_FLAG_USED; then
+  echo "Error: --rationale is not valid with --resolve-actioned (it applies" >&2
+  echo "       only to --auto-resolve-bots). --resolve-actioned resolves on" >&2
+  echo "       derived action evidence; use --auto-resolve-bots --rationale" >&2
+  echo "       to deliberately resolve a deferred thread with a rationale." >&2
+  exit 1
+fi
+
 # Resolve the reviewer PAT once + define the wrapper before any `gh`
 # call. CR Major on PR #194 r4 caught that the bare `gh repo view`
 # and `gh api` invocations below this point would still hit the
@@ -376,11 +390,16 @@ QUERY='
             # and substantive rebuttal detection (≥30 chars from an
             # agent author → `rebuttal-recorded`).
             #
-            # Cap at first 50 — same conservative limit as commentsFirst.
-            # A thread deep enough to exceed 50 replies during one
-            # auto-resolve invocation is vanishingly rare and would
-            # already be a process-smell worth surfacing manually.
-            allComments: comments(first: 50) {
+            # `last: 50` (not first: 50) — the staleness checks (#565) need
+            # the MOST RECENT comments: latest_nonagent_created and the
+            # last-word marker/rebuttal logic must see a bot re-raise even on
+            # a long thread. `first: 50` truncated the newest comments, so a
+            # re-raise past comment 50 was invisible and an older fix/rebuttal
+            # looked like the latest word — resolving live feedback (Codex P2
+            # on #565). The most-recent 50 always include the latest re-raise;
+            # only very old comments (>50 back) drop off, and those never make
+            # a thread look MORE actioned, so the gate stays fail-safe.
+            allComments: comments(last: 50) {
               nodes {
                 author { login }
                 body
@@ -1049,32 +1068,33 @@ derive_tag_class() {
     fi
     rc_i=$((rc_i + 1))
   done
-  case "$recorded_class" in
-    addressed-elsewhere|rebuttal-recorded)
-      # Genuinely-actioned marker (in the --resolve-actioned gate set):
-      # honor only if it is the agent's last word, so a stale marker
-      # followed by fresh bot feedback cannot resolve a re-raised thread.
-      if [ "$last_marker_idx" -gt "$last_nonagent_idx" ]; then
+  # Honor a recorded marker ONLY in the TAG path (default). The GATE path
+  # (--resolve-actioned / skip_routing) treats ANY marker as rationale only
+  # and falls through to re-derive fresh evidence below — so a stale marker
+  # (from an earlier deferral, a readback-failed resolve, or the older weak
+  # heuristic this patch replaces) can never resolve a thread without
+  # re-checking the fix commit / rebuttal against the latest comments. This
+  # closes the marker-staleness cluster on #565 (re-verify actioned markers;
+  # let later fixes override stale surface markers; don't let stale deferral
+  # tags mask later rebuttals). `last_nonagent_idx` is reused by step 3.
+  if [ -z "$skip_routing" ]; then
+    case "$recorded_class" in
+      addressed-elsewhere|rebuttal-recorded)
+        # Genuinely-actioned marker: honor only if it is the agent's last
+        # word, so a stale marker followed by fresh bot feedback cannot
+        # resolve a re-raised thread.
+        if [ "$last_marker_idx" -gt "$last_nonagent_idx" ]; then
+          echo "$recorded_class"
+          return
+        fi ;;
+      canonical-coverage|templated-render|nitpick-noted|deferred-to-followup)
+        # Routing / surface markers: honoring even a stale one only routes or
+        # skips (never a wrong resolve), so the TAG path honors it
+        # unconditionally to keep the recorded class flowing to the rollup.
         echo "$recorded_class"
-        return
-      fi ;;
-    canonical-coverage|templated-render)
-      # Routing markers: honored for the TAG path, but IGNORED in the GATE
-      # path (skip_routing) so the ladder can still find real action
-      # evidence on a canonical/templated thread that was actually fixed
-      # (#565). Honoring even a stale routing marker can never cause a wrong
-      # resolve (routing is not in the actioned set), so the TAG path honors
-      # it unconditionally.
-      if [ -z "$skip_routing" ]; then
-        echo "$recorded_class"
-        return
-      fi ;;
-    nitpick-noted|deferred-to-followup)
-      # Surface markers: honoring even a stale one only skips (the safe
-      # outcome), so honor unconditionally in both paths.
-      echo "$recorded_class"
-      return ;;
-  esac
+        return ;;
+    esac
+  fi
 
   # 1. canonical-coverage (routing — skipped in the GATE path so real action
   # evidence on a canonical path is not masked, #565).
@@ -1398,11 +1418,20 @@ while IFS= read -r thread; do
     continue
   fi
 
-  # Current-HEAD check. The advertised contract is "resolve only when
-  # the latest comment is on the current HEAD" — a thread anchored to
-  # an older commit (or with no commit linkage at all) means the
-  # agent's most recent push hasn't been re-reviewed by the bot, so
-  # resolving it would force-clear an unaddressed finding.
+  # Current-HEAD check — applies to --auto-resolve-bots ONLY. The contract
+  # there is "resolve only when the latest comment is on the current HEAD":
+  # a thread anchored to an older commit means the agent's most recent push
+  # has not been re-reviewed by the bot, so resolving it would force-clear
+  # an unaddressed finding.
+  #
+  # --resolve-actioned BYPASSES this proxy (#565): pushing a fix commit
+  # advances HEAD while the bot's last comment still points at the previous
+  # commit, so this gate would skip a fixed-by-commit thread as "stale"
+  # before derive_tag_class could see the fix. Instead, --resolve-actioned
+  # relies on its stronger, direct evidence check (a fix commit touching the
+  # anchored file AFTER the latest bot/reviewer comment, or a rebuttal after
+  # the bot's last word) — so a later fix commit is recognized even when the
+  # bot has not re-commented on the new HEAD.
   #
   # Codex r1 on PR #172 caught that the previous check
   # `if [ -n "$COMMIT_OID" ] && [ "$COMMIT_OID" != "$HEAD_OID" ]`
@@ -1410,7 +1439,8 @@ while IFS= read -r thread; do
   # commit linkage in the GraphQL response would be force-resolved
   # silently. The safe default is the opposite: missing oid is
   # treated as stale.
-  if [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ] || [ "$COMMIT_OID" != "$HEAD_OID" ]; then
+  if [ "$MODE" != "resolve-actioned" ] \
+     && { [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ] || [ "$COMMIT_OID" != "$HEAD_OID" ]; }; then
     if [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ]; then
       reason="no commit linkage"
     else

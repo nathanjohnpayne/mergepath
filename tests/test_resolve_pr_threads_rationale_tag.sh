@@ -906,17 +906,15 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────
-# Test 13 (#564, Codex P2 on #565): --resolve-actioned HONORS an existing
-# [mergepath-resolve: <surface-class>] marker and skips the thread. A prior
-# resolve attempt left an agent-authored deferred-to-followup marker reply.
-# That reply is ≥30 chars and agent-authored, so WITHOUT the step-0 marker
-# parse derive_tag_class would mis-read it as rebuttal-recorded (actioned)
-# and --resolve-actioned would wrongly resolve a deliberately-deferred
-# thread. It must instead classify as deferred-to-followup and be left
-# unresolved (no mutation, exit 3).
+# Test 13 (#564, Codex P2 on #565): a deferred-marked thread with no real
+# action evidence is left unresolved by --resolve-actioned. The GATE ignores
+# recorded markers and re-derives fresh evidence (#565): the marker reply is
+# ≥30 chars and agent-authored, but step 3's marker guard excludes it, so the
+# ladder finds no fix/rebuttal and classifies deferred-to-followup → skipped
+# (no mutation, exit 3). (It must NOT be mis-read as rebuttal-recorded.)
 # ─────────────────────────────────────────────────────────────────────
 echo
-echo "Test 13: --resolve-actioned honors an existing deferred marker, skips (#564 / Codex #565)"
+echo "Test 13: --resolve-actioned leaves a deferred-marked, unfixed thread unresolved (#564 / Codex #565)"
 
 THREADS_T13='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
   {"id":"PRT_13","isResolved":false,"isOutdated":false,
@@ -1273,6 +1271,166 @@ else
   echo "  FAIL: fixed canonical-path thread was NOT resolved under --resolve-actioned (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 20 (#565 Codex P2 "let later fixes override stale surface markers"):
+# a thread with a stale [mergepath-resolve: deferred-to-followup] marker BUT
+# a later fix commit touching the anchored file must RESOLVE — the GATE
+# ignores the marker and re-derives addressed-elsewhere from the fix.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 20: --resolve-actioned lets a later fix override a stale deferred marker (#565)"
+
+THREADS_T20='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_20","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/x.md","body":"Finding later fixed","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding later fixed","databaseId":20001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: deferred-to-followup] deferred earlier; resolving for the gate.","databaseId":20002,"createdAt":"2026-01-02T00:00:00Z"}
+   ]}
+  }
+]}}}}}'
+FILES_T20='["docs/x.md"]'
+COMMITS_T20='[{"sha":"fix2020abc","login":"nathanpayne-claude","date":"2026-01-03T00:00:00Z"}]'
+CFILES_T20='{"fix2020abc":["docs/x.md"]}'
+
+GH_ARGV_LOG="$SCRATCH/t20.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T20" "$FILES_T20" "$COMMITS_T20" "$CFILES_T20"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --resolve-actioned 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: later fix overrides the stale deferred marker — resolved as addressed-elsewhere"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale deferred marker masked the later fix (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 21 (#565 Codex P2 "re-verify actioned markers before resolving"): a
+# thread carrying an [mergepath-resolve: addressed-elsewhere] marker but NO
+# actual qualifying commit must NOT resolve — the GATE re-derives evidence
+# and finds none.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 21: --resolve-actioned re-verifies a stale addressed-elsewhere marker, skips (#565)"
+
+THREADS_T21='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_21","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/y.md","body":"Finding never actually fixed","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding never actually fixed","databaseId":21001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: addressed-elsewhere] addressed by commit deadbeef.","databaseId":21002,"createdAt":"2026-01-02T00:00:00Z"}
+   ]}
+  }
+]}}}}}'
+FILES_T21='[]'
+COMMITS_T21='[]'
+
+GH_ARGV_LOG="$SCRATCH/t21.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T21" "$FILES_T21" "$COMMITS_T21"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --resolve-actioned 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: stale addressed-elsewhere marker without a real commit is re-verified and skipped"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale addressed-elsewhere marker resolved without re-verification (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 22 (#565 Codex P2 "reject rationale overrides in actioned mode"):
+# --resolve-actioned with --rationale is rejected (exit 1), never resolves.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 22: --resolve-actioned --rationale is rejected (#565)"
+
+GH_ARGV_LOG="$SCRATCH/t22.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T4" "$FILES_T4" "$COMMITS_T4"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --resolve-actioned --rationale "manual note" 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 1 ] \
+   && grep -q 'not valid with --resolve-actioned' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: --resolve-actioned --rationale rejected with exit 1, no mutation"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --rationale not rejected under --resolve-actioned (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 23 (#565 Codex P2 "allow later fix commits past the stale-thread
+# gate"): a fixed-by-commit thread whose bot comment is on an OLDER commit
+# (commit_oid != HEAD) must still RESOLVE under --resolve-actioned — the
+# gate bypasses the current-HEAD stale skip and relies on the fix evidence.
+# (--auto-resolve-bots would skip this thread as stale-HEAD.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 23: --resolve-actioned resolves a fixed thread whose bot comment is on an older commit (#565)"
+
+THREADS_T23='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_23","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/z.md","body":"Finding fixed by a later commit","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"OLDCOMMIT0"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Finding fixed by a later commit","databaseId":23001,"createdAt":"2026-01-01T00:00:00Z"}]}
+  }
+]}}}}}'
+FILES_T23='["docs/z.md"]'
+COMMITS_T23='[{"sha":"fix2323abc","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
+CFILES_T23='{"fix2323abc":["docs/z.md"]}'
+
+GH_ARGV_LOG="$SCRATCH/t23.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T23" "$FILES_T23" "$COMMITS_T23" "$CFILES_T23"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --resolve-actioned 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'SKIP (stale' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: stale-HEAD fixed thread resolved via evidence (current-HEAD gate bypassed)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale-HEAD fixed thread not resolved under --resolve-actioned (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
 fi
 
 echo
