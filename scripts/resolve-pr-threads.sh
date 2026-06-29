@@ -35,7 +35,25 @@
 #                           bot-only mode. Follow REVIEW_POLICY.md's
 #                           pre-merge gate for agent-reviewer vs
 #                           real-human threads.
-#   --dry-run               With --auto-resolve-bots, print what would
+#   --resolve-actioned      Like --auto-resolve-bots (same bot-author,
+#                           current-HEAD, identity, tag-reply, and readback
+#                           handling) but resolves a thread ONLY when its
+#                           derived class is demonstrably actioned — the
+#                           skip-set mirrored from the daily rollup
+#                           classifier: addressed-elsewhere,
+#                           canonical-coverage, rebuttal-recorded, or
+#                           templated-render. Threads classified as
+#                           nitpick-noted / deferred-to-followup (or any
+#                           class that can't be positively determined) are
+#                           LEFT UNRESOLVED so the weekly unresolved-
+#                           feedback sweep keeps surfacing them (#564). Use
+#                           this to mark genuinely-handled feedback resolved
+#                           without the blunt "resolve everything" of
+#                           --auto-resolve-bots. To merge past a deferral on
+#                           a conversation-resolution-gated repo, fix/rebut
+#                           it (making it actioned) or defer it explicitly
+#                           via --auto-resolve-bots --rationale.
+#   --dry-run               With either resolve mode, print what would
 #                           be resolved without mutating.
 #   --rationale <text>      With --auto-resolve-bots, override the
 #                           auto-synthesized class with a free-form
@@ -124,16 +142,22 @@ fi
 usage() {
   cat <<'EOF' >&2
 Usage: scripts/resolve-pr-threads.sh <PR#> [--repo owner/name] [--list]
-                                            [--auto-resolve-bots] [--dry-run]
-                                            [--rationale <text>] [--no-tag-reply]
+                                            [--auto-resolve-bots | --resolve-actioned]
+                                            [--dry-run] [--rationale <text>] [--no-tag-reply]
 
   --list                List unresolved threads (default).
-  --auto-resolve-bots   Resolve bot-authored threads on current HEAD.
-  --dry-run             With --auto-resolve-bots, print without mutating.
+  --auto-resolve-bots   Resolve ALL current-HEAD bot-authored threads
+                        (clears the conversation-resolution gate; the
+                        daily rollup re-surfaces deferrals).
+  --resolve-actioned    Resolve ONLY current-HEAD bot threads whose fix or
+                        rebuttal is demonstrable (derived class in the
+                        actioned skip-set); leave the rest unresolved so
+                        the weekly sweep keeps surfacing them.
+  --dry-run             With either resolve mode, print without mutating.
   --rationale <text>    With --auto-resolve-bots, free-form rationale
                         appended after the [mergepath-resolve: deferred-to-followup]
                         tag (overrides auto-classification).
-  --no-tag-reply        With --auto-resolve-bots, suppress the
+  --no-tag-reply        With either resolve mode, suppress the
                         [mergepath-resolve:<class>] reply emission
                         (the resolve mutation still runs).
 EOF
@@ -169,6 +193,7 @@ while [ $# -gt 0 ]; do
       REPO="$2"; shift 2 ;;
     --list) MODE="list"; shift ;;
     --auto-resolve-bots) MODE="auto-resolve-bots"; shift ;;
+    --resolve-actioned) MODE="resolve-actioned"; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     --rationale)
       # Same defensive value check as --repo (Codex r2 on PR #172):
@@ -988,6 +1013,29 @@ derive_tag_class() {
   echo "deferred-to-followup"
 }
 
+# class_is_actioned <class> — exit 0 if the class is a demonstrably-actioned
+# ("skip") class, 1 otherwise. This is the gate for --resolve-actioned
+# (#564): only resolve threads whose fix or accepted rebuttal is
+# demonstrable from the current PR state, leaving the rest unresolved so
+# the weekly sweep keeps surfacing them.
+#
+# The skip-set / surface-set split MUST stay in step with
+# scripts/lib/daily-feedback-rollup-helpers.sh `tag_class_action`
+# (the single source of the taxonomy):
+#   skip    (actioned):  addressed-elsewhere, canonical-coverage,
+#                        rebuttal-recorded, templated-render
+#   surface (needs work): nitpick-noted, deferred-to-followup
+# Unknown classes are treated as NOT actioned — fail safe (do not resolve
+# something we could not positively classify as handled).
+class_is_actioned() {
+  case "$1" in
+    addressed-elsewhere|canonical-coverage|rebuttal-recorded|templated-render)
+      return 0 ;;
+    *)
+      return 1 ;;
+  esac
+}
+
 # synth_rationale <class> <thread_json> → one-line free-form rationale
 # matching the class. Kept short (≤120 chars) so the reply stays
 # compact in the GitHub UI. The classifier reads only the tag in
@@ -1121,6 +1169,11 @@ post_tag_reply() {
 RESOLVED_COUNT=0
 SKIPPED_HUMAN=0
 SKIPPED_STALE=0
+# #564 --resolve-actioned: threads skipped because their derived class is
+# NOT demonstrably actioned (surface-set: nitpick-noted / deferred-to-
+# followup). Left unresolved on purpose so the weekly sweep still surfaces
+# them; counted so the exit code reflects that work remains.
+SKIPPED_NOT_ACTIONED=0
 WOULD_RESOLVE_COUNT=0
 FAILED_COUNT=0
 TAG_REPLY_POSTED=0
@@ -1173,6 +1226,31 @@ while IFS= read -r thread; do
     continue
   fi
 
+  # #564 --resolve-actioned: gate the resolve on demonstrable action.
+  # Derive the thread's class BEFORE the dry-run / tag steps, but ONLY in
+  # resolve-actioned mode — auto-resolve-bots keeps its existing behavior
+  # (resolve every current-HEAD bot thread to clear the conversation gate;
+  # the daily rollup re-surfaces deferrals), and in particular must NOT
+  # make tag-data API calls on a --dry-run. Threads whose class is not in
+  # the actioned skip-set are left unresolved so the weekly sweep keeps
+  # surfacing them.
+  thread_class=""
+  thread_class_computed=false
+  if [ "$MODE" = "resolve-actioned" ]; then
+    fetch_pr_tag_data
+    augment_pr_commits_with_sha
+    thread_class=$(derive_tag_class "$thread")
+    thread_class_computed=true
+    if ! class_is_actioned "$thread_class"; then
+      echo "  SKIP (not demonstrably actioned: $thread_class): [$AUTHOR] $PATH_"
+      echo "    $EXCERPT"
+      echo "    Left unresolved so the weekly sweep still surfaces it. Fix or"
+      echo "    rebut the finding, or defer it via --auto-resolve-bots --rationale."
+      SKIPPED_NOT_ACTIONED=$((SKIPPED_NOT_ACTIONED + 1))
+      continue
+    fi
+  fi
+
   if $DRY_RUN; then
     echo "  WOULD RESOLVE [$AUTHOR] $PATH_"
     echo "    $EXCERPT"
@@ -1208,13 +1286,21 @@ while IFS= read -r thread; do
       # fixture. Calling here also fulfills the "one-shot cache reused
       # across threads" intention — fetch_pr_tag_data's TAG_DATA_FETCHED
       # short-circuit only works if it's set in the loop's shell.
-      fetch_pr_tag_data
-      # Need the augmented commits cache (with .sha) for the
-      # addressed-elsewhere rationale; the bare cache from
-      # fetch_pr_tag_data doesn't carry .sha. derive_tag_class only
-      # needs login + date so it runs against either shape.
-      augment_pr_commits_with_sha
-      tag_class=$(derive_tag_class "$thread")
+      #
+      # #564: resolve-actioned mode already derived the class (and warmed
+      # the caches) above — reuse it so derive_tag_class / synth_rationale
+      # run at most once per thread.
+      if ! $thread_class_computed; then
+        fetch_pr_tag_data
+        # Need the augmented commits cache (with .sha) for the
+        # addressed-elsewhere rationale; the bare cache from
+        # fetch_pr_tag_data doesn't carry .sha. derive_tag_class only
+        # needs login + date so it runs against either shape.
+        augment_pr_commits_with_sha
+        thread_class=$(derive_tag_class "$thread")
+        thread_class_computed=true
+      fi
+      tag_class="$thread_class"
       tag_rationale=$(synth_rationale "$tag_class" "$thread")
     fi
     if post_tag_reply "$THREAD_ID" "$tag_class" "$tag_rationale"; then
@@ -1259,7 +1345,7 @@ done < <(printf '%s\n' "$UNRESOLVED")
 
 echo ""
 if $DRY_RUN; then
-  echo "(dry-run; no threads modified) — would-resolve: $WOULD_RESOLVE_COUNT, skipped (human): $SKIPPED_HUMAN, skipped (stale-HEAD): $SKIPPED_STALE"
+  echo "(dry-run; no threads modified) — would-resolve: $WOULD_RESOLVE_COUNT, skipped (human): $SKIPPED_HUMAN, skipped (stale-HEAD): $SKIPPED_STALE, skipped (not-actioned): $SKIPPED_NOT_ACTIONED"
   # Codex r2 on PR #172: dry-run previously exited 0 when only
   # current-HEAD bot threads remained (because dry-run does not mutate
   # them and they didn't increment SKIPPED_*). Callers would treat
@@ -1268,7 +1354,7 @@ if $DRY_RUN; then
   # human-skipped, or stale-skipped). The only exit-0 path through
   # auto-resolve-bots --dry-run is "no unresolved threads at all"
   # which is already short-circuited above (UNRESOLVED is empty).
-  if [ "$WOULD_RESOLVE_COUNT" -gt 0 ] || [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ]; then
+  if [ "$WOULD_RESOLVE_COUNT" -gt 0 ] || [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ]; then
     exit 3
   fi
   exit 0
@@ -1344,7 +1430,7 @@ if [ "${#RESOLVED_IDS[@]}" -gt 0 ]; then
   fi
 fi
 
-echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Failed: $FAILED_COUNT  Readback-failed: $READBACK_FAILED"
+echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Skipped (not-actioned): $SKIPPED_NOT_ACTIONED  Failed: $FAILED_COUNT  Readback-failed: $READBACK_FAILED"
 if ! $NO_TAG_REPLY; then
   echo "Tag replies: posted=$TAG_REPLY_POSTED  failed=$TAG_REPLY_FAILED"
 fi
@@ -1371,7 +1457,7 @@ fi
 # non-zero; whether that trips `set -e` depends on subtle list-tail
 # rules. The `if` form is unambiguous and matches the block above.
 # (CodeRabbit Major, #271/#272.)
-if [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ]; then
+if [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ]; then
   exit 3
 fi
 exit 0

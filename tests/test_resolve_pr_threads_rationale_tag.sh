@@ -786,6 +786,106 @@ else
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
 
+# ─────────────────────────────────────────────────────────────────────
+# Test 11 (#564): --resolve-actioned RESOLVES a demonstrably-actioned
+# thread. A ≥30-char agent reply classifies as rebuttal-recorded (an
+# actioned skip-set class, manifest-independent), so --resolve-actioned
+# must tag, resolve, and confirm it via the readback — exit 0.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 11: --resolve-actioned resolves an actioned-class thread (#564)"
+
+THREADS_T11='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_11","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/notes.md","body":"Some non-canonical finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Some non-canonical finding","databaseId":11001},
+     {"author":{"login":"nathanpayne-claude"},"body":"Disagree — this is intentional for the propagation path; see #200 for context.","databaseId":11002}
+   ]}
+  }
+]}}}}}'
+FILES_T11='[]'
+COMMITS_T11='[]'
+
+GH_ARGV_LOG="$SCRATCH/t11.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T11" "$FILES_T11" "$COMMITS_T11"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\]' "$GH_ARGV_LOG" \
+   && grep -q 'Readback: all 1 resolved thread(s) confirmed isResolved:true' <<<"$out" \
+   && ! grep -q 'not demonstrably actioned' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: actioned (rebuttal-recorded) thread resolved + confirmed under --resolve-actioned"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --resolve-actioned did not resolve the actioned thread (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 12 (#564): --resolve-actioned SKIPS a non-actioned thread. A bot
+# finding with no badge, no fix commit, and no agent reply classifies as
+# deferred-to-followup (a surface-set class). --resolve-actioned must LEAVE
+# IT UNRESOLVED: no resolveReviewThread mutation, a "not demonstrably
+# actioned" skip line, and exit 3 (work remains) so the sweep still sees it.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 12: --resolve-actioned skips a non-actioned (deferred) thread (#564)"
+
+THREADS_T12='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_12","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/random.md","body":"Some opaque finding without a badge","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Some opaque finding without a badge","databaseId":12001}]}
+  }
+]}}}}}'
+FILES_T12='[]'
+COMMITS_T12='[]'
+
+GH_ARGV_LOG="$SCRATCH/t12.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T12" "$FILES_T12" "$COMMITS_T12"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not demonstrably actioned: deferred-to-followup)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: non-actioned thread left unresolved (no mutation), exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --resolve-actioned did not skip the non-actioned thread (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"
