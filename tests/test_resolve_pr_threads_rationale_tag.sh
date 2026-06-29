@@ -944,6 +944,111 @@ else
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
 
+# ─────────────────────────────────────────────────────────────────────
+# Test 14 (#564, CodeRabbit Major on #565): a STALE actioned marker is NOT
+# honored when the bot posts fresh feedback after it. Thread: finding →
+# agent rebuttal → [mergepath-resolve: rebuttal-recorded] marker → bot
+# RE-RAISES. The marker (and the rebuttal) predate the bot's last word, so
+# --resolve-actioned must NOT resolve — it classifies deferred-to-followup
+# and leaves the thread unresolved (no mutation, exit 3).
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 14: --resolve-actioned ignores a stale actioned marker after a bot re-raise (#565)"
+
+THREADS_T14='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_14","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/stale.md","body":"Original finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Original finding","databaseId":14001},
+     {"author":{"login":"nathanpayne-claude"},"body":"Disagree — intentional for the propagation path; see #200 for the rationale.","databaseId":14002},
+     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: rebuttal-recorded] agent rebuttal posted on thread; resolving.","databaseId":14003},
+     {"author":{"login":"coderabbitai"},"body":"Still a problem after your rebuttal — please reconsider.","databaseId":14004}
+   ]}
+  }
+]}}}}}'
+FILES_T14='[]'
+COMMITS_T14='[]'
+
+GH_ARGV_LOG="$SCRATCH/t14.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T14" "$FILES_T14" "$COMMITS_T14"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not demonstrably actioned: deferred-to-followup)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: stale actioned marker after a bot re-raise is not honored — thread left unresolved, exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale actioned marker was honored under --resolve-actioned (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 15 (#564, CodeRabbit Major on #565): the same staleness rule on the
+# rebuttal heuristic (no marker). Thread: finding → agent rebuttal → bot
+# RE-RAISES. The rebuttal predates the bot's last word, so it must NOT count
+# as rebuttal-recorded; --resolve-actioned leaves the thread unresolved.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 15: --resolve-actioned ignores a stale rebuttal after a bot re-raise (#565)"
+
+THREADS_T15='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_15","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/stale2.md","body":"Original finding two","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Original finding two","databaseId":15001},
+     {"author":{"login":"nathanpayne-claude"},"body":"Disagree — intentional for the propagation path; see #200 for the rationale.","databaseId":15002},
+     {"author":{"login":"coderabbitai"},"body":"Still a problem after your rebuttal — please reconsider.","databaseId":15003}
+   ]}
+  }
+]}}}}}'
+FILES_T15='[]'
+COMMITS_T15='[]'
+
+GH_ARGV_LOG="$SCRATCH/t15.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T15" "$FILES_T15" "$COMMITS_T15"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not demonstrably actioned: deferred-to-followup)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: stale rebuttal after a bot re-raise is not counted — thread left unresolved, exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale rebuttal was counted as actioned under --resolve-actioned (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"

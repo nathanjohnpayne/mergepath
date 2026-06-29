@@ -923,18 +923,27 @@ derive_tag_class() {
   thread_body=$(printf '%s' "$thread_json" | jq -r '.body // ""')
 
   # 0. honor an existing [mergepath-resolve: <class>] marker (#564, Codex
-  # P2 on #565). A prior resolve attempt — e.g. a deferred-to-followup that
-  # was tagged but whose resolve readback-failed, or a thread re-opened
-  # after tagging — leaves an agent-authored marker reply on the thread.
-  # That marker records an explicit classification decision and MUST win
-  # over the heuristic ladder below: without this, the rebuttal-recorded
-  # step (#3) mis-reads the marker reply itself (it is ≥30 chars and
-  # agent-authored) as a rebuttal and reclassifies a deliberately-deferred
-  # thread as actioned, so --resolve-actioned would wrongly resolve it.
-  # Mirrors daily-feedback-rollup-helpers.sh, which also prefers the
-  # recorded tag over heuristics. Most-recent valid marker wins; an
-  # unrecognized class is ignored and falls through to the ladder.
+  # P2 + CodeRabbit Major on #565). A prior resolve attempt — e.g. a
+  # deferred-to-followup that was tagged but whose resolve readback-failed,
+  # or a thread re-opened after tagging — leaves an agent-authored marker
+  # reply on the thread. That marker records an explicit classification
+  # decision and is preferred over the heuristic ladder below: without it,
+  # the rebuttal-recorded step (#3) mis-reads the marker reply itself (it is
+  # ≥30 chars and agent-authored) as a rebuttal. Mirrors
+  # daily-feedback-rollup-helpers.sh, which also prefers the recorded tag.
+  #
+  # STALENESS GUARD (CodeRabbit Major on #565): a marker is authoritative
+  # only as the agent's "last word". An ACTIONED marker followed by fresh
+  # non-agent (bot/reviewer) feedback is stale — honoring it would resolve a
+  # thread the bot just re-raised — so it is honored ONLY when it post-dates
+  # the most recent non-agent comment; otherwise it falls through to the
+  # ladder (which applies the same last-word rule to rebuttals). A SURFACE
+  # marker (nitpick-noted / deferred-to-followup) is honored regardless,
+  # because it only ever causes a skip — the fail-closed/safe outcome — even
+  # if later replies exist. Most-recent valid marker wins; an unrecognized
+  # class is ignored. `last_nonagent_idx` is reused by step 3.
   local recorded_class="" rc_count rc_i rc_login rc_body rc_tag
+  local last_marker_idx=-1 last_nonagent_idx=-1
   rc_count=$(printf '%s' "$thread_json" | jq '.all_comments | length' 2>/dev/null || echo 0)
   rc_i=0
   while [ "$rc_i" -lt "$rc_count" ]; do
@@ -943,14 +952,23 @@ derive_tag_class() {
       rc_body=$(printf '%s' "$thread_json" | jq -r ".all_comments[$rc_i].body // \"\"")
       rc_tag=$(printf '%s' "$rc_body" \
         | sed -n 's/.*\[mergepath-resolve:[[:space:]]*\([a-z][a-z-]*\)[[:space:]]*\].*/\1/p' | head -1)
-      [ -n "$rc_tag" ] && recorded_class="$rc_tag"
+      if [ -n "$rc_tag" ]; then recorded_class="$rc_tag"; last_marker_idx=$rc_i; fi
+    else
+      last_nonagent_idx=$rc_i
     fi
     rc_i=$((rc_i + 1))
   done
   case "$recorded_class" in
-    addressed-elsewhere|canonical-coverage|rebuttal-recorded|templated-render|nitpick-noted|deferred-to-followup)
+    nitpick-noted|deferred-to-followup)
+      # surface marker — honoring it only skips, so it is always safe.
       echo "$recorded_class"
       return ;;
+    addressed-elsewhere|canonical-coverage|rebuttal-recorded|templated-render)
+      # actioned marker — honor only if it is the agent's last word.
+      if [ "$last_marker_idx" -gt "$last_nonagent_idx" ]; then
+        echo "$recorded_class"
+        return
+      fi ;;
   esac
 
   # 1. canonical-coverage
@@ -1019,7 +1037,13 @@ derive_tag_class() {
   local reply_count
   reply_count=$(printf '%s' "$thread_json" | jq '.all_comments | length' 2>/dev/null || echo 0)
   if [ "$reply_count" -gt 1 ]; then
-    local k=1
+    # Only replies AFTER the bot's most recent comment count (CodeRabbit
+    # Major on #565): a rebuttal that predates a later bot re-raise is stale
+    # and must not mark the thread actioned. last_nonagent_idx was computed
+    # in step 0. Start the scan just past the last non-agent comment (but at
+    # least index 1, to always skip the original finding at index 0).
+    local k=$((last_nonagent_idx + 1))
+    [ "$k" -lt 1 ] && k=1
     while [ "$k" -lt "$reply_count" ]; do
       local r_login
       local r_body
