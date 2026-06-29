@@ -368,6 +368,10 @@ QUERY='
                 author { login }
                 body
                 databaseId
+                # createdAt powers the addressed-elsewhere staleness guard
+                # (#565): a fix commit must post-date the LATEST bot/reviewer
+                # comment, not just the original finding, to count as actioning.
+                createdAt
               }
             }
           }
@@ -547,6 +551,34 @@ is_agent_author_local() {
     [ "$login" = "$a" ] && return 0
   done
   return 1
+}
+
+# latest_nonagent_created <thread_json> → ISO timestamp on stdout.
+# The createdAt of the most recent NON-agent (bot / real-reviewer) comment on
+# the thread, floored at the original finding's createdAt (`.created`). This is
+# the "bot's last word" timestamp used by the addressed-elsewhere staleness
+# guard (#565): a fix commit only counts as actioning the thread if it
+# post-dates this — otherwise a stale fix that predates a later bot re-raise
+# would falsely clear live feedback. ISO 8601 sorts lexicographically, so the
+# `\>` string comparison is chronological. Single-sourced here so
+# derive_tag_class and synth_rationale apply the identical predicate.
+latest_nonagent_created() {
+  local tj="$1"
+  local latest cnt i login created
+  latest=$(printf '%s' "$tj" | jq -r '.created // ""')
+  cnt=$(printf '%s' "$tj" | jq '.all_comments | length' 2>/dev/null || echo 0)
+  i=0
+  while [ "$i" -lt "$cnt" ]; do
+    login=$(printf '%s' "$tj" | jq -r ".all_comments[$i].author.login // \"\"")
+    if ! is_agent_author_local "$login"; then
+      created=$(printf '%s' "$tj" | jq -r ".all_comments[$i].createdAt // \"\"")
+      if [ -n "$created" ] && { [ -z "$latest" ] || [ "$created" \> "$latest" ]; }; then
+        latest="$created"
+      fi
+    fi
+    i=$((i + 1))
+  done
+  printf '%s' "$latest"
 }
 
 # classify_severity_local <body> → P0|P1|...|Nitpick|Trivial|Unknown
@@ -916,11 +948,12 @@ REPO_ROOT_FOR_MANIFEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 derive_tag_class() {
   local thread_json="$1"
   local thread_path
-  local thread_created
   local thread_body
   thread_path=$(printf '%s' "$thread_json" | jq -r '.path // ""')
-  thread_created=$(printf '%s' "$thread_json" | jq -r '.created // ""')
   thread_body=$(printf '%s' "$thread_json" | jq -r '.body // ""')
+  # NB: the original-finding timestamp (.created) is intentionally NOT used
+  # directly for the addressed-elsewhere check — that compares against the
+  # LATEST bot/reviewer comment via latest_nonagent_created (#565).
 
   # 0. honor an existing [mergepath-resolve: <class>] marker (#564, Codex
   # P2 + CodeRabbit Major on #565). A prior resolve attempt — e.g. a
@@ -996,7 +1029,14 @@ derive_tag_class() {
   # it; falls back to the rollup's per-PR weak heuristic when the
   # files endpoint is unreachable.
   fetch_pr_tag_data
-  if [ -n "$thread_created" ] && [ -n "$PR_COMMITS_CACHE" ]; then
+  # #565 staleness guard: the fix commit must post-date the LATEST
+  # bot/reviewer comment, not just the original finding. A commit that
+  # predates a later re-raise has NOT actioned the live feedback, so
+  # comparing against thread_created alone would let --resolve-actioned
+  # resolve a thread the bot re-opened after the stale fix.
+  local last_nonagent_created
+  last_nonagent_created=$(latest_nonagent_created "$thread_json")
+  if [ -n "$last_nonagent_created" ] && [ -n "$PR_COMMITS_CACHE" ]; then
     local file_match=false
     if [ -n "$thread_path" ] && [ "$thread_path" != "(no path)" ]; then
       if printf '%s' "$PR_FILES_CACHE" \
@@ -1020,7 +1060,7 @@ derive_tag_class() {
         c_login=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].login // \"\"")
         c_date=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].date // \"\"")
         if [ -n "$c_login" ] && [ -n "$c_date" ] \
-           && [ "$c_date" \> "$thread_created" ] \
+           && [ "$c_date" \> "$last_nonagent_created" ] \
            && is_agent_author_local "$c_login"; then
           # Short SHA on stdout would be nice — emit the class and
           # let the caller render the SHA into the rationale.
@@ -1107,18 +1147,18 @@ synth_rationale() {
   local class="$1"
   local thread_json="$2"
   local thread_path
-  local thread_created
   thread_path=$(printf '%s' "$thread_json" | jq -r '.path // ""')
-  thread_created=$(printf '%s' "$thread_json" | jq -r '.created // ""')
   local short_sha=""
   case "$class" in
     addressed-elsewhere)
       # Surface the SHA of a commit that actually satisfies
-      # derive_tag_class's predicate (agent-authored AND
-      # authoredDate > thread_created). Re-run the same check here
-      # so the cited SHA matches the one that triggered the
-      # classification — otherwise we could cite a pre-thread
-      # commit that didn't qualify.
+      # derive_tag_class's predicate (agent-authored AND authoredDate >
+      # the latest bot/reviewer comment). Re-run the SAME check here — using
+      # the same last_nonagent_created floor (#565) — so the cited SHA
+      # matches the one that triggered the classification rather than a
+      # pre-thread or stale commit.
+      local last_nonagent_created
+      last_nonagent_created=$(latest_nonagent_created "$thread_json")
       local commit_count i
       commit_count=$(printf '%s' "$PR_COMMITS_CACHE" | jq 'length' 2>/dev/null || echo 0)
       i=0
@@ -1128,7 +1168,7 @@ synth_rationale() {
         c_date=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].date // \"\"")
         c_sha=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].sha // \"\"")
         if [ -n "$c_login" ] && [ -n "$c_date" ] \
-           && { [ -z "$thread_created" ] || [ "$c_date" \> "$thread_created" ]; } \
+           && { [ -z "$last_nonagent_created" ] || [ "$c_date" \> "$last_nonagent_created" ]; } \
            && is_agent_author_local "$c_login"; then
           short_sha="$c_sha"
           break
