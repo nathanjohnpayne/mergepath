@@ -270,6 +270,13 @@ fi
 OWNER="${REPO%/*}"
 NAME="${REPO#*/}"
 
+# Per-commit file-list cache for the addressed-elsewhere check (#565). Keyed
+# by commit SHA, stored on disk so the cache survives the command-substitution
+# subshells that derive_tag_class / synth_rationale run in (a shell-var cache
+# would be lost when those subshells exit). Removed on exit.
+COMMIT_FILES_CACHE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/resolve-pr-commitfiles.XXXXXX")"
+trap 'rm -rf "$COMMIT_FILES_CACHE_DIR"' EXIT
+
 # Fetch the PR's current HEAD commit oid — used by --auto-resolve-bots
 # to verify each thread's latest comment is on the current HEAD before
 # resolving. Codex P2 on PR #172 caught that the docstring promised
@@ -579,6 +586,35 @@ latest_nonagent_created() {
     i=$((i + 1))
   done
   printf '%s' "$latest"
+}
+
+# commit_files <sha> → JSON array of the filenames a commit touched, on
+# stdout ("" if the per-commit fetch fails). Disk-cached under
+# COMMIT_FILES_CACHE_DIR so each sha is fetched at most once across the
+# per-thread command-substitution subshells. The PR /commits cache carries
+# no file list, so addressed-elsewhere needs this per-commit lookup (#565).
+commit_files() {
+  local sha="$1"
+  [ -z "$sha" ] && return 0
+  local cf="$COMMIT_FILES_CACHE_DIR/$sha"
+  if [ ! -f "$cf" ]; then
+    gh_pat api "repos/$OWNER/$NAME/commits/$sha" --jq '[.files[].filename]' \
+      >"$cf" 2>/dev/null || : >"$cf"
+  fi
+  cat "$cf"
+}
+
+# commit_touches_file <sha> <path> → exit 0 if the commit's file list
+# includes <path>, 1 otherwise. FAIL CLOSED (#565): a commit whose files
+# cannot be read (empty result) does NOT match, so a fetch failure can never
+# make a thread look actioned, and an agent commit on an UNRELATED file no
+# longer satisfies addressed-elsewhere for this thread.
+commit_touches_file() {
+  local sha="$1" path="$2" files
+  { [ -z "$sha" ] || [ -z "$path" ] || [ "$path" = "(no path)" ]; } && return 1
+  files=$(commit_files "$sha")
+  [ -z "$files" ] && return 1
+  printf '%s' "$files" | jq -e --arg p "$path" 'any(. == $p)' >/dev/null 2>&1
 }
 
 # classify_severity_local <body> → P0|P1|...|Nitpick|Trivial|Unknown
@@ -1023,47 +1059,54 @@ derive_tag_class() {
     return
   fi
 
-  # 2. addressed-elsewhere — agent-author commit on PR with
-  # authoredDate > createdAt AND (file in PR's changed-files OR
-  # changed-files unavailable). Per-file precision when we can get
-  # it; falls back to the rollup's per-PR weak heuristic when the
-  # files endpoint is unreachable.
+  # 2. addressed-elsewhere — an agent-authored commit that BOTH (a)
+  # post-dates the latest bot/reviewer comment (the #565 staleness guard)
+  # AND (b) actually TOUCHES the anchored file. Both are required.
+  #
+  # The earlier form gated on two independent PR-level facts — "the anchored
+  # file is in the PR's overall changed-file list" AND "some agent commit
+  # post-dates the re-raise" — which do not compose: an agent commit on an
+  # UNRELATED file could satisfy the date check while a stale/earlier commit
+  # was the only one touching the anchored file, so live feedback got
+  # resolved (nathanpayne-codex CHANGES_REQUESTED on #565). The PR /commits
+  # cache has no per-commit file list, so confirm per commit via
+  # commit_touches_file (cached). Fail closed: a commit whose files cannot
+  # be read does not qualify, and a pathless thread cannot be proven here.
   fetch_pr_tag_data
-  # #565 staleness guard: the fix commit must post-date the LATEST
-  # bot/reviewer comment, not just the original finding. A commit that
-  # predates a later re-raise has NOT actioned the live feedback, so
-  # comparing against thread_created alone would let --resolve-actioned
-  # resolve a thread the bot re-opened after the stale fix.
   local last_nonagent_created
   last_nonagent_created=$(latest_nonagent_created "$thread_json")
-  if [ -n "$last_nonagent_created" ] && [ -n "$PR_COMMITS_CACHE" ]; then
-    local file_match=false
-    if [ -n "$thread_path" ] && [ "$thread_path" != "(no path)" ]; then
-      if printf '%s' "$PR_FILES_CACHE" \
-         | jq -e --arg p "$thread_path" 'any(. == $p)' >/dev/null 2>&1; then
-        file_match=true
+  if [ -n "$last_nonagent_created" ] && [ -n "$PR_COMMITS_CACHE" ] \
+     && [ -n "$thread_path" ] && [ "$thread_path" != "(no path)" ]; then
+    # Cheap PR-level pre-filter: if the PR's overall changed-file list is
+    # known and does NOT include the anchored file, no commit touched it —
+    # skip the per-commit fetches. When the list is empty/unavailable we
+    # cannot pre-filter, so fall through to the authoritative per-commit
+    # check below (which is itself fail-closed).
+    local pr_touched_file=true
+    if [ -n "$PR_FILES_CACHE" ] && [ "$PR_FILES_CACHE" != "[]" ]; then
+      if ! printf '%s' "$PR_FILES_CACHE" \
+           | jq -e --arg p "$thread_path" 'any(. == $p)' >/dev/null 2>&1; then
+        pr_touched_file=false
       fi
     fi
-    # When PR_FILES_CACHE failed to populate (network error → '[]'),
-    # treat as match-any so we fall back to the per-PR heuristic
-    # rather than under-classifying.
-    if [ "$PR_FILES_CACHE" = "[]" ] || [ -z "$PR_FILES_CACHE" ]; then
-      file_match=true
-    fi
-    if $file_match; then
+    if $pr_touched_file; then
       local commit_count
       commit_count=$(printf '%s' "$PR_COMMITS_CACHE" | jq 'length' 2>/dev/null || echo 0)
       local i=0
       while [ "$i" -lt "$commit_count" ]; do
         local c_login
         local c_date
+        local c_sha
         c_login=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].login // \"\"")
         c_date=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].date // \"\"")
+        c_sha=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].sha // \"\"")
+        # Order matters: cheap date/identity checks short-circuit BEFORE the
+        # per-commit file fetch, so we only fetch files for an agent commit
+        # that post-dates the re-raise.
         if [ -n "$c_login" ] && [ -n "$c_date" ] \
            && [ "$c_date" \> "$last_nonagent_created" ] \
-           && is_agent_author_local "$c_login"; then
-          # Short SHA on stdout would be nice — emit the class and
-          # let the caller render the SHA into the rationale.
+           && is_agent_author_local "$c_login" \
+           && commit_touches_file "$c_sha" "$thread_path"; then
           echo "addressed-elsewhere"
           return
         fi
@@ -1169,7 +1212,8 @@ synth_rationale() {
         c_sha=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].sha // \"\"")
         if [ -n "$c_login" ] && [ -n "$c_date" ] \
            && { [ -z "$last_nonagent_created" ] || [ "$c_date" \> "$last_nonagent_created" ]; } \
-           && is_agent_author_local "$c_login"; then
+           && is_agent_author_local "$c_login" \
+           && commit_touches_file "$c_sha" "$thread_path"; then
           short_sha="$c_sha"
           break
         fi

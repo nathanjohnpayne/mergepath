@@ -105,6 +105,10 @@ make_gh_stub() {
   local threads_json="$2"
   local files_json="$3"
   local commits_json="$4"
+  # #565: per-commit file map (sha -> [filenames]) for the
+  # addressed-elsewhere commit_touches_file check. Defaults to empty so the
+  # many call sites that never reach a per-commit fetch need not pass it.
+  local commit_files_map="${5:-{}}"
   cat > "$stub_path" <<GH_STUB
 #!/usr/bin/env bash
 echo "ARGV: \$*" >> "\$GH_ARGV_LOG"
@@ -177,6 +181,15 @@ JSON_FILES
 ${commits_json}
 JSON_COMMITS
         ;;
+      "repos/"*"/commits/"*)
+        # #565 per-commit files: extract the sha (last path segment) and
+        # return its file list from the provided sha->[filenames] map (or []
+        # if absent). The script calls this with --jq '[.files[].filename]',
+        # so (like the /files and /commits stubs) return the already-
+        # transformed array of filenames directly.
+        __sha="\${2##*/}"
+        printf '%s' '${commit_files_map}' | jq -c --arg s "\$__sha" '.[\$s] // []'
+        ;;
       "repos/"*"/pulls/"*)
         # HEAD oid fetch — the script calls this with --jq .head.sha
         # and captures stdout; the stub doesn't actually parse --jq,
@@ -235,7 +248,9 @@ FILES_T1='["scripts/foo.sh","scripts/bar.sh"]'
 COMMITS_T1='[{"sha":"abc1234567","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
 
 GH_ARGV_LOG="$SCRATCH/t1.log"; : > "$GH_ARGV_LOG"
-make_gh_stub "$SCRATCH/gh-real" "$THREADS_T1" "$FILES_T1" "$COMMITS_T1"
+# #565: the fix commit abc1234567 must be shown to TOUCH scripts/foo.sh for
+# addressed-elsewhere to hold (per-commit file verification).
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T1" "$FILES_T1" "$COMMITS_T1" '{"abc1234567":["scripts/foo.sh"]}'
 make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
 
 set +e
@@ -1099,6 +1114,59 @@ if [ "$rc" -eq 3 ] \
 else
   fail=$((fail + 1))
   echo "  FAIL: stale fix commit was treated as addressed-elsewhere under --resolve-actioned (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 17 (#564, nathanpayne-codex CHANGES_REQUESTED on #565): a later
+# agent commit on an UNRELATED file must NOT make addressed-elsewhere hold
+# for a thread anchored on a different file. Thread on scripts/foo.sh; the
+# PR's overall file list includes foo.sh (so the old PR-level check passed),
+# but the only qualifying agent commit touched scripts/bar.sh — NOT foo.sh.
+# Per-commit verification must reject it → --resolve-actioned leaves the
+# thread unresolved (no mutation, exit 3).
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 17: --resolve-actioned rejects addressed-elsewhere when the commit touched another file (#565)"
+
+THREADS_T17='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_17","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/foo.sh","body":"Finding on foo, never fixed","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Finding on foo, never fixed","databaseId":17001,"createdAt":"2026-01-01T00:00:00Z"}]}
+  }
+]}}}}}'
+# PR overall touched BOTH files; the later agent commit touched only bar.sh.
+FILES_T17='["scripts/foo.sh","scripts/bar.sh"]'
+COMMITS_T17='[{"sha":"bar9999999","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
+# Per-commit map: bar9999999 touched scripts/bar.sh ONLY (not foo.sh).
+CFILES_T17='{"bar9999999":["scripts/bar.sh"]}'
+
+GH_ARGV_LOG="$SCRATCH/t17.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T17" "$FILES_T17" "$COMMITS_T17" "$CFILES_T17"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not demonstrably actioned: deferred-to-followup)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: commit on an unrelated file is not addressed-elsewhere — thread left unresolved, exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: unrelated-file commit was treated as addressed-elsewhere (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
