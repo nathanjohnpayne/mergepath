@@ -778,7 +778,7 @@ fetch_manifest_templated_dests() {
               # Resolve `consumers: all` to the actual consumer repo list so
               # path_matches_templated_dest can check $REPO membership, mirroring
               # the yq pass-1 behaviour. Fall back to no-scope if the list is
-              # empty (can't determine membership → conservative non-match).
+              # empty (cannot determine membership → conservative non-match).
               if (all_repos != "") {
                 printf "%s\t%s\n", out, all_repos
               } else {
