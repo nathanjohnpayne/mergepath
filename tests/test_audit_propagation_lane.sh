@@ -209,7 +209,7 @@ NO_MANIFEST_DIR="$WORKDIR/no-manifest"; mkdir -p "$NO_MANIFEST_DIR"
 NOYQ_PATH_521="/usr/bin:/bin:/usr/sbin:/sbin"
 set +e
 OUT=$( cd "$NO_MANIFEST_DIR" && PATH="$NOYQ_PATH_521" OP_PREFLIGHT_CACHE_DIR="$EMPTY_CACHE" \
-  MERGEPATH_AGENT="nobody-xyz" env -u GH_TOKEN "$SCRIPT" --repos __none__ 2>&1 )
+  MERGEPATH_AGENT="nobody-xyz" env -u GH_TOKEN -u GITHUB_TOKEN -u OP_PREFLIGHT_REVIEWER_PAT "$SCRIPT" --repos __none__ 2>&1 )
 RC=$?
 set -e
 if [ "$RC" = "3" ] && echo "$OUT" | grep -qi "reviewer token" \

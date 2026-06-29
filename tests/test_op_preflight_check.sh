@@ -1207,7 +1207,7 @@ test_deploy_full_fetch_fail_closed_structural() {
 # can read which mode ran.
 # ---------------------------------------------------------------------------
 test_preflight_mode_is_exported() {
-  # Cache-hit path: a fresh review cache must emit `export OP_PREFLIGHT_MODE`.
+  # Sub-case A: cache-hit path — a fresh review cache must emit `export OP_PREFLIGHT_MODE`.
   local case_dir="$WORKDIR/mode-export-cachehit"
   make_fresh_cache "$case_dir" claude "rev-pat-m" "author-pat-m"
   local out rc=0
@@ -1222,6 +1222,40 @@ test_preflight_mode_is_exported() {
     return
   fi
   pass "test_preflight_mode_is_exported: OP_PREFLIGHT_MODE exported on cache-hit path (#521)"
+
+  # Sub-case B: cold/full-fetch path — a review run with no cache must still
+  # emit `export OP_PREFLIGHT_MODE=review` in its output (#556).
+  local ff_dir="$WORKDIR/mode-export-fullfetch"
+  local ff_cache="$ff_dir/cache"
+  local ff_bin="$ff_dir/bin"
+  mkdir -p "$ff_dir" "$ff_cache" "$ff_bin"
+  # op stub: handle inject (returns PATs), reject everything else.
+  cat > "$ff_bin/op" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  inject)
+    printf '%s\n' "REVIEWER_PAT=ff-reviewer-pat"
+    printf '%s\n' "AUTHOR_PAT=ff-author-pat"
+    ;;
+  *)
+    echo "unexpected op call: $*" >&2
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$ff_bin/op"
+  rc=0
+  out=$(PATH="$ff_bin:$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$ff_cache" \
+    "$SCRIPT" --agent claude --mode review --skip-ssh 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "test_preflight_mode_is_exported: full-fetch --mode review rc=$rc"
+    return
+  fi
+  if ! echo "$out" | grep -q "export OP_PREFLIGHT_MODE=review"; then
+    fail "test_preflight_mode_is_exported: full-fetch path did not export OP_PREFLIGHT_MODE; out=$out"
+    return
+  fi
+  pass "test_preflight_mode_is_exported: OP_PREFLIGHT_MODE exported on full-fetch path (#556)"
 }
 
 test_check_fresh_cache

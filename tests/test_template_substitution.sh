@@ -799,6 +799,50 @@ for tpl in "$ESM_TEMPLATE" "$CJS_TEMPLATE"; do
 done
 
 # ---------------------------------------------------------------------------
+# 15. Strict-mode conditional existence-check regression (#555)
+#     >>> if key and >>> if !key on an UNSET fact must NOT hard-fail under
+#     MERGEPATH_TEMPLATE_STRICT=1. The documented contract scopes strict mode
+#     to a *substitution* of an unset fact, not a set-ness test.
+# ---------------------------------------------------------------------------
+
+# 15a: strict mode + bare-key conditional on unset fact → skips block (lenient)
+r=$(render_case "before
+// >>> if has_ts
+typescript line
+// <<<
+after
+" "MERGEPATH_TEMPLATE_STRICT=1")
+expect_output "15a strict mode: bare-key conditional on unset fact skips block (no rc 3)" "$r" "before
+after"
+
+# 15b: strict mode + !key conditional on unset fact → includes block (lenient)
+r=$(render_case "before
+// >>> if !has_ts
+no typescript
+// <<<
+after
+" "MERGEPATH_TEMPLATE_STRICT=1")
+expect_output "15b strict mode: !key conditional on unset fact includes block (no rc 3)" "$r" "before
+no typescript
+after"
+
+# 15c: strict mode + bare-key on a SET fact still renders the block.
+r=$(render_case "before
+// >>> if has_ts
+typescript line
+// <<<
+after
+" "MERGEPATH_TEMPLATE_STRICT=1" "MERGEPATH_FACT_HAS_TS=1")
+expect_output "15c strict mode: bare-key conditional on set fact includes block" "$r" "before
+typescript line
+after"
+
+# 15d: strict mode + substitution of an unset fact still hard-fails (rc 3).
+r=$(render_case "value: {{missing_key}}
+" "MERGEPATH_TEMPLATE_STRICT=1")
+expect_rc "15d strict mode: {{substitution}} of unset fact still hard-fails (rc 3)" "$r" 3
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

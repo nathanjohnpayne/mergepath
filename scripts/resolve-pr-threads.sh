@@ -751,13 +751,39 @@ fetch_manifest_templated_dests() {
     #    the yq semantics. A `consumers:` followed by a name SEQUENCE stays
     #    the cautious no-scope sentinel (awk can't reliably resolve
     #    name→repo cross-references), matching the prior behavior for lists.
-    MANIFEST_TEMPLATED_DESTS_CACHE=$(awk '
+    # Pre-extract top-level consumer repos so the awk path can resolve
+    # `consumers: all` to an actual repo slug list — matching what the yq
+    # pass-1 does via `$root.consumers | map(.repo) | join(",")`. Without
+    # this, the `consumers: all` sentinel matched every repo unconditionally,
+    # including foreign repos not in the consumers list (#554 item 1 / #556).
+    local _awk_all_repos
+    _awk_all_repos=$(awk '
+      /^consumers:/ { in_c=1; next }
+      in_c && /^[^[:space:]#]/ { in_c=0 }
+      in_c && /^[[:space:]]*repo:/ {
+        v=$0
+        sub(/^[[:space:]]*repo:[[:space:]]*/, "", v)
+        sub(/[[:space:]]*#.*$/, "", v)
+        gsub(/^[[:space:]]+|[[:space:]]+$|^["\047]|["\047]$/, "", v)
+        if (v != "") repos = repos (repos=="" ? "" : ",") v
+      }
+      END { print repos }
+    ' "$manifest" 2>/dev/null || true)
+    MANIFEST_TEMPLATED_DESTS_CACHE=$(awk -v all_repos="$_awk_all_repos" '
       function emit() {
         if (cur_type == "templated") {
           out = (cur_dest != "" ? cur_dest : cur_path)
           if (out != "") {
             if (cur_consumers_all) {
-              printf "%s\t__AWK_CONSUMERS_ALL__\n", out
+              # Resolve `consumers: all` to the actual consumer repo list so
+              # path_matches_templated_dest can check $REPO membership, mirroring
+              # the yq pass-1 behaviour. Fall back to no-scope if the list is
+              # empty (cannot determine membership → conservative non-match).
+              if (all_repos != "") {
+                printf "%s\t%s\n", out, all_repos
+              } else {
+                printf "%s\t__AWK_NO_CONSUMER_SCOPE__\n", out
+              }
             } else {
               printf "%s\t__AWK_NO_CONSUMER_SCOPE__\n", out
             }
@@ -813,12 +839,14 @@ path_matches_templated_dest() {
     dest="${line%%$'\t'*}"
     consumers="${line#*$'\t'}"
     [ "$file_path" = "$dest" ] || continue
-    # The awk fallback emits a scalar-`consumers: all` sentinel (#521).
-    # `all` means every consumer is in scope, so the current repo always
-    # qualifies — match unconditionally, mirroring the yq path which
-    # expands `all` to every consumer's repo slug.
+    # Legacy sentinel — the awk fallback previously emitted this when it
+    # detected `consumers: all` but could not resolve the consumer repo list.
+    # The awk path now resolves `all` to the actual repo slug list (matching
+    # the yq path), so this sentinel is no longer emitted in practice (#556).
+    # Kept as a safety net: if somehow emitted, fall through to no-scope
+    # (conservative non-match) rather than matching unconditionally.
     if [ "$consumers" = "__AWK_CONSUMERS_ALL__" ]; then
-      return 0
+      continue
     fi
     # The awk fallback emits this sentinel when it can't resolve
     # consumer-name → repo-slug (cross-references in awk are

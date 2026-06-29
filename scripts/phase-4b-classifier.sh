@@ -60,6 +60,12 @@ if [ -r "$__P4B_CLASSIFIER_DIR/lib/preflight-helpers.sh" ]; then
   # shellcheck source=lib/preflight-helpers.sh
   . "$__P4B_CLASSIFIER_DIR/lib/preflight-helpers.sh"
   preflight_require_token reviewer || true
+  # Also load OP_PREFLIGHT_REVIEWER_PAT from disk even when an ambient
+  # GH_TOKEN is already set — preflight_require_token returns early on a
+  # pre-existing GH_TOKEN, so without this call the per-command reviewer
+  # PAT pin at the live gh api calls below would fall back to the bare
+  # ambient token instead of the cached reviewer PAT (#554 fix).
+  load_preflight_env_vars
 fi
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
