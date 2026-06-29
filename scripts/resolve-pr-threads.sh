@@ -38,13 +38,18 @@
 #   --resolve-actioned      Like --auto-resolve-bots (same bot-author,
 #                           current-HEAD, identity, tag-reply, and readback
 #                           handling) but resolves a thread ONLY when its
-#                           derived class is demonstrably actioned — the
-#                           skip-set mirrored from the daily rollup
-#                           classifier: addressed-elsewhere,
-#                           canonical-coverage, rebuttal-recorded, or
-#                           templated-render. Threads classified as
-#                           nitpick-noted / deferred-to-followup (or any
-#                           class that can't be positively determined) are
+#                           derived class proves ACTION on this PR:
+#                           addressed-elsewhere (an agent commit touching the
+#                           anchored file, after the latest re-raise) or
+#                           rebuttal-recorded (a substantive agent rebuttal
+#                           after the latest re-raise). Routing-only classes
+#                           — canonical-coverage / templated-render — are
+#                           NOT actioned here: they show WHERE a fix belongs
+#                           (upstream), not that one happened, so a fresh
+#                           finding on a canonical path must not be resolved
+#                           by routing alone (#565). Those, plus
+#                           nitpick-noted / deferred-to-followup and any
+#                           class that can't be positively determined, are
 #                           LEFT UNRESOLVED so the weekly unresolved-
 #                           feedback sweep keeps surfacing them (#564). Use
 #                           this to mark genuinely-handled feedback resolved
@@ -1028,16 +1033,22 @@ derive_tag_class() {
     rc_i=$((rc_i + 1))
   done
   case "$recorded_class" in
-    nitpick-noted|deferred-to-followup)
-      # surface marker — honoring it only skips, so it is always safe.
-      echo "$recorded_class"
-      return ;;
-    addressed-elsewhere|canonical-coverage|rebuttal-recorded|templated-render)
-      # actioned marker — honor only if it is the agent's last word.
+    addressed-elsewhere|rebuttal-recorded)
+      # Genuinely-actioned marker (in the --resolve-actioned gate set):
+      # honor only if it is the agent's last word, so a stale marker
+      # followed by fresh bot feedback cannot resolve a re-raised thread.
       if [ "$last_marker_idx" -gt "$last_nonagent_idx" ]; then
         echo "$recorded_class"
         return
       fi ;;
+    canonical-coverage|templated-render|nitpick-noted|deferred-to-followup)
+      # Routing (canonical/templated) and surface (nitpick/deferred) markers
+      # are NOT in the actioned gate set, so honoring even a stale one can
+      # never cause a wrong resolve — it just routes/skips. Honor
+      # unconditionally so the recorded class still flows to the
+      # --auto-resolve-bots tag / daily rollup.
+      echo "$recorded_class"
+      return ;;
   esac
 
   # 1. canonical-coverage
@@ -1159,23 +1170,35 @@ derive_tag_class() {
   echo "deferred-to-followup"
 }
 
-# class_is_actioned <class> — exit 0 if the class is a demonstrably-actioned
-# ("skip") class, 1 otherwise. This is the gate for --resolve-actioned
-# (#564): only resolve threads whose fix or accepted rebuttal is
-# demonstrable from the current PR state, leaving the rest unresolved so
-# the weekly sweep keeps surfacing them.
+# class_is_actioned <class> — exit 0 if the class is a DEMONSTRABLY-ACTIONED
+# class, 1 otherwise. This is the gate for --resolve-actioned (#564): only
+# resolve threads whose fix or accepted rebuttal is demonstrable from the
+# current PR state, leaving the rest unresolved so the weekly sweep keeps
+# surfacing them.
 #
-# The skip-set / surface-set split MUST stay in step with
-# scripts/lib/daily-feedback-rollup-helpers.sh `tag_class_action`
-# (the single source of the taxonomy):
-#   skip    (actioned):  addressed-elsewhere, canonical-coverage,
-#                        rebuttal-recorded, templated-render
-#   surface (needs work): nitpick-noted, deferred-to-followup
-# Unknown classes are treated as NOT actioned — fail safe (do not resolve
-# something we could not positively classify as handled).
+# Only two classes prove ACTION on this PR:
+#   addressed-elsewhere  an agent commit that touches the anchored file and
+#                        post-dates the latest re-raise (verified per-commit)
+#   rebuttal-recorded    a substantive agent rebuttal that post-dates the
+#                        latest re-raise on the thread
+#
+# This is intentionally STRICTER than (a subset of) the rollup's skip-set in
+# scripts/lib/daily-feedback-rollup-helpers.sh `tag_class_action`, which also
+# skips canonical-coverage and templated-render. Those are ROUTING classes —
+# derived from path/manifest membership alone, before any fix-commit or
+# rebuttal evidence. Routing tells you WHERE a durable fix belongs (upstream
+# in mergepath), NOT that one happened: a fresh, unfixed bot finding on a
+# canonical path (e.g. scripts/resolve-pr-threads.sh is itself canonical)
+# would classify as canonical-coverage. Treating that as actioned would
+# resolve live, unactioned feedback — the exact failure #564 guards against
+# (nathanpayne-codex P1 CHANGES_REQUESTED on #565). So routing classes are
+# EXCLUDED from the actioned gate; --auto-resolve-bots / the daily rollup
+# may still record canonical/templated context, but the actioned-only
+# resolver must not equate routing with action. Unknown classes are NOT
+# actioned — fail safe.
 class_is_actioned() {
   case "$1" in
-    addressed-elsewhere|canonical-coverage|rebuttal-recorded|templated-render)
+    addressed-elsewhere|rebuttal-recorded)
       return 0 ;;
     *)
       return 1 ;;

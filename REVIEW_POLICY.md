@@ -419,10 +419,14 @@ that can change GitHub conversation state.
    weekly unresolved-feedback sweep. Two resolve paths:
    - `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` resolves
      **only** threads whose fix or rebuttal is demonstrable from the
-     current PR state (the helper derives each thread's class and resolves
-     only the actioned ones — `addressed-elsewhere`, `canonical-coverage`,
-     `rebuttal-recorded`, `templated-render` — leaving the rest unresolved
-     so the weekly sweep keeps surfacing them). Prefer this to mark
+     current PR state — `addressed-elsewhere` (an agent commit touching the
+     anchored file, after the latest re-raise) or `rebuttal-recorded` (a
+     substantive agent rebuttal after the latest re-raise). Routing-only
+     classes (`canonical-coverage`, `templated-render`) are deliberately
+     **not** treated as actioned here: they indicate where a durable fix
+     belongs, not that one happened, so a fresh finding on a canonical path
+     is left unresolved rather than auto-resolved by routing alone. Every
+     non-actioned thread is left for the weekly sweep. Prefer this to mark
      genuinely-handled feedback resolved.
    - `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots` resolves
      **every** current-HEAD bot thread, which is what clears the

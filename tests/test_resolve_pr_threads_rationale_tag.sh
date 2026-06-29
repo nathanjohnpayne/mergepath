@@ -1171,6 +1171,56 @@ else
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
 
+# ─────────────────────────────────────────────────────────────────────
+# Test 18 (#564, nathanpayne-codex P1 CHANGES_REQUESTED on #565): a routing
+# class (canonical-coverage / templated-render) is NOT actioned for
+# --resolve-actioned. A fresh bot finding on a canonical manifest path
+# classifies as canonical-coverage from routing alone, with no fix commit
+# or rebuttal — it must be LEFT UNRESOLVED, not auto-resolved. (The fixture
+# manifest, rewritten by Test 8, marks scripts/resolve-pr-threads.sh
+# canonical.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 18: --resolve-actioned does NOT resolve a routing-only canonical thread (#565)"
+
+THREADS_T18='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_18","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/resolve-pr-threads.sh","body":"Fresh unfixed finding on a canonical path","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Fresh unfixed finding on a canonical path","databaseId":18001,"createdAt":"2026-01-01T00:00:00Z"}]}
+  }
+]}}}}}'
+FILES_T18='["scripts/resolve-pr-threads.sh"]'
+COMMITS_T18='[]'
+
+GH_ARGV_LOG="$SCRATCH/t18.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T18" "$FILES_T18" "$COMMITS_T18"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not demonstrably actioned: canonical-coverage)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: routing-only canonical thread left unresolved (no mutation), exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: routing-only canonical thread was treated as actioned (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"
