@@ -104,7 +104,7 @@ resolved; that is a blocked gate, not a disposition prompt.) Do not present a
    `--purge-all`) at end of session to delete the cached PATs.
 1. Author code as nathanjohnpayne. File a PR.
 2. Review the PR under your reviewer identity using `GH_AS_REVIEWER_IDENTITY=nathanpayne-{your-agent} scripts/gh-as-reviewer.sh -- gh pr review ...`. Post comments.
-3. Address each comment via fix commits (commits use git config, no gh auth involved — byline stays nathanjohnpayne).
+3. Address each comment via fix commits (commits use git config, no gh auth involved — byline stays nathanjohnpayne). Addressing feedback **includes resolving the associated review thread** once the fix or rebuttal is on the PR — a code commit alone does not close the conversation, and an unresolved-but-fixed thread both blocks the conversation-resolution gate and resurfaces in the weekly sweep. Resolve demonstrably-actioned bot/agent-reviewer threads with `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` (see step 6 and REVIEW_POLICY.md § Pre-Merge Review Conversation Gate); never resolve real human-authored threads.
 4. Repeat steps 2–3 until the reviewer identity approves with no outstanding issues. The mechanism: for under-threshold PRs, `gh pr review --approve` from your reviewer identity is the intended path — it satisfies branch protection without bouncing a small PR to an external agent. For above-threshold or protected-path PRs, post `gh pr review --comment` only; Phase 4 carries the cross-agent gate. See REVIEW_POLICY.md § No-self-approve scoping.
 5. If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`:
    a. **Wait** for CodeRabbit to post its review on the current HEAD. Prefer `scripts/coderabbit-wait.sh <PR#>` over an ad-hoc poll — it anchors "cleared" on the HEAD committer date (closing the race that let auto-merge fire pre-CodeRabbit; see #136), handles CodeRabbit's non-auto-retrying rate-limit state by parsing the published window and posting `@coderabbitai, try again.` itself (see #138), and recovers from CodeRabbit's auto-pause state by posting `@coderabbitai resume` (see #490). Exit codes: `0` cleared, `2` findings, `4` grace-window timeout (advisory — log the `status_probe` reply if present, then skip), `5` rate-limit stalled — alert the human, do not proceed, *unless* `codex_failover_requested: true` in the JSON (the #489 Codex failover requested `@codex review`, so the PR proceeds via Phase 4a and `5` is a non-blocking note), `6` auto-review skipped and not re-invocable (the JSON `skip_reason` names the cause — `paused` / `non-base-branch` / `draft`; resolve it rather than treating it as a clean clearance).
@@ -120,8 +120,13 @@ resolved; that is a blocked gate, not a disposition prompt.) Do not present a
    equivalent GraphQL `reviewThreads` readback. Confirm there are zero
    unresolved review conversations. For bot-authored current-head threads,
    if the finding has been fixed or rebutted on-thread, resolve via
-   `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots`. For stale
-   bot-authored threads fixed by a later commit, use the identity-checked
+   `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` (resolves only
+   threads whose fix/rebuttal is demonstrable, leaving the rest for the
+   weekly sweep) or `--auto-resolve-bots` (resolves every current-HEAD bot
+   thread to clear the conversation-resolution gate); both run an
+   identity-checked `resolveReviewThread` plus a readback confirming
+   `isResolved: true` and fail closed otherwise. For stale bot-authored
+   threads fixed by a later commit, use the identity-checked
    `resolveReviewThread` path directly, then list again. Registered
    agent-reviewer threads (`nathanpayne-*` in `available_reviewers`) are
    agent-authored, not real-human threads; resolve them only after the fix
