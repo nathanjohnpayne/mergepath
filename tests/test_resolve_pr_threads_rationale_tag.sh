@@ -142,11 +142,15 @@ case "\$1" in
           echo '{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}'
         elif grep -q "nodes(ids:" "\$GH_ARGV_LOG.lastcall"; then
           # #564 post-resolve readback. The script re-reads each resolved
-          # thread via the top-level nodes(ids:) lookup. Return the fixture
-          # threads as resolved (isResolved:true) so a normal run confirms
-          # cleanly. GH_STUB_READBACK_UNRESOLVED=<id> forces ONE thread to
-          # read back false, exercising the fail-closed readback path.
-          cat <<'JSON_READBACK' | jq -c --arg kf "\${GH_STUB_READBACK_UNRESOLVED:-}" '{data:{nodes:[.data.repository.pullRequest.reviewThreads.nodes[] | {id, isResolved: (if .id == \$kf then false else true end)}]}}'
+          # thread via the top-level nodes(ids:) lookup. Return ONLY the ids
+          # the readback query actually requested (parsed from the recorded
+          # argv) so a wrong nodes(ids:) list built by the script is caught
+          # — CodeRabbit on #565 — each resolved unless
+          # GH_STUB_READBACK_UNRESOLVED names it (which exercises the
+          # fail-closed readback path).
+          __req=\$(grep -oE 'nodes\(ids: \[[^]]*\]' "\$GH_ARGV_LOG.lastcall" | head -1 | sed -E 's/^nodes\(ids: //')
+          [ -z "\$__req" ] && __req='[]'
+          cat <<'JSON_READBACK' | jq -c --argjson req "\$__req" --arg kf "\${GH_STUB_READBACK_UNRESOLVED:-}" '{data:{nodes:[.data.repository.pullRequest.reviewThreads.nodes[] | select(.id as \$i | \$req | index(\$i)) | {id, isResolved: (if .id == \$kf then false else true end)}]}}'
 ${threads_json}
 JSON_READBACK
         else
@@ -882,6 +886,60 @@ if [ "$rc" -eq 3 ] \
 else
   fail=$((fail + 1))
   echo "  FAIL: --resolve-actioned did not skip the non-actioned thread (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 13 (#564, Codex P2 on #565): --resolve-actioned HONORS an existing
+# [mergepath-resolve: <surface-class>] marker and skips the thread. A prior
+# resolve attempt left an agent-authored deferred-to-followup marker reply.
+# That reply is ≥30 chars and agent-authored, so WITHOUT the step-0 marker
+# parse derive_tag_class would mis-read it as rebuttal-recorded (actioned)
+# and --resolve-actioned would wrongly resolve a deliberately-deferred
+# thread. It must instead classify as deferred-to-followup and be left
+# unresolved (no mutation, exit 3).
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 13: --resolve-actioned honors an existing deferred marker, skips (#564 / Codex #565)"
+
+THREADS_T13='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_13","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/marked.md","body":"Some finding deferred earlier","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Some finding deferred earlier","databaseId":13001},
+     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: deferred-to-followup] deferred to follow-up; resolving for branch-protection conversation gate.","databaseId":13002}
+   ]}
+  }
+]}}}}}'
+FILES_T13='[]'
+COMMITS_T13='[]'
+
+GH_ARGV_LOG="$SCRATCH/t13.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T13" "$FILES_T13" "$COMMITS_T13"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not demonstrably actioned: deferred-to-followup)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: existing deferred marker honored — thread left unresolved (no mutation), exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: deferred marker not honored under --resolve-actioned (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi

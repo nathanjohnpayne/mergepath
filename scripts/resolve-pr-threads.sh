@@ -922,6 +922,37 @@ derive_tag_class() {
   thread_created=$(printf '%s' "$thread_json" | jq -r '.created // ""')
   thread_body=$(printf '%s' "$thread_json" | jq -r '.body // ""')
 
+  # 0. honor an existing [mergepath-resolve: <class>] marker (#564, Codex
+  # P2 on #565). A prior resolve attempt — e.g. a deferred-to-followup that
+  # was tagged but whose resolve readback-failed, or a thread re-opened
+  # after tagging — leaves an agent-authored marker reply on the thread.
+  # That marker records an explicit classification decision and MUST win
+  # over the heuristic ladder below: without this, the rebuttal-recorded
+  # step (#3) mis-reads the marker reply itself (it is ≥30 chars and
+  # agent-authored) as a rebuttal and reclassifies a deliberately-deferred
+  # thread as actioned, so --resolve-actioned would wrongly resolve it.
+  # Mirrors daily-feedback-rollup-helpers.sh, which also prefers the
+  # recorded tag over heuristics. Most-recent valid marker wins; an
+  # unrecognized class is ignored and falls through to the ladder.
+  local recorded_class="" rc_count rc_i rc_login rc_body rc_tag
+  rc_count=$(printf '%s' "$thread_json" | jq '.all_comments | length' 2>/dev/null || echo 0)
+  rc_i=0
+  while [ "$rc_i" -lt "$rc_count" ]; do
+    rc_login=$(printf '%s' "$thread_json" | jq -r ".all_comments[$rc_i].author.login // \"\"")
+    if is_agent_author_local "$rc_login"; then
+      rc_body=$(printf '%s' "$thread_json" | jq -r ".all_comments[$rc_i].body // \"\"")
+      rc_tag=$(printf '%s' "$rc_body" \
+        | sed -n 's/.*\[mergepath-resolve:[[:space:]]*\([a-z][a-z-]*\)[[:space:]]*\].*/\1/p' | head -1)
+      [ -n "$rc_tag" ] && recorded_class="$rc_tag"
+    fi
+    rc_i=$((rc_i + 1))
+  done
+  case "$recorded_class" in
+    addressed-elsewhere|canonical-coverage|rebuttal-recorded|templated-render|nitpick-noted|deferred-to-followup)
+      echo "$recorded_class"
+      return ;;
+  esac
+
   # 1. canonical-coverage
   if path_matches_manifest "$thread_path"; then
     echo "canonical-coverage"
@@ -991,9 +1022,17 @@ derive_tag_class() {
     local k=1
     while [ "$k" -lt "$reply_count" ]; do
       local r_login
+      local r_body
       local r_body_len
       r_login=$(printf '%s' "$thread_json" | jq -r ".all_comments[$k].author.login // \"\"")
-      r_body_len=$(printf '%s' "$thread_json" | jq -r ".all_comments[$k].body // \"\" | length")
+      r_body=$(printf '%s' "$thread_json" | jq -r ".all_comments[$k].body // \"\"")
+      r_body_len=${#r_body}
+      # Skip our own [mergepath-resolve: ...] marker replies — a resolution
+      # marker is not a rebuttal (step 0 already honored a recognized one;
+      # this also covers an unrecognized-class marker). Codex P2 on #565.
+      case "$r_body" in
+        *"[mergepath-resolve:"*) k=$((k + 1)); continue ;;
+      esac
       if [ -n "$r_login" ] && [ "$r_body_len" -ge 30 ] && is_agent_author_local "$r_login"; then
         echo "rebuttal-recorded"
         return
@@ -1371,11 +1410,11 @@ fi
 # enumeration `reviewThreads` query).
 #
 # Fail CLOSED: any thread that does not read back isResolved:true (state
-# drift, eventual-consistency lag, a malformed id, or a token that could
-# write but a later read that cannot) increments READBACK_FAILED and forces
-# a non-zero exit, so a caller never treats an unconfirmed resolve as a
-# clean conversation-resolution gate. A readback that confirms nothing is
-# never treated as "all good".
+# drift, eventual-consistency lag, an id that no longer resolves, or a
+# token that could write but a later read that cannot) increments
+# READBACK_FAILED and forces a non-zero exit, so a caller never treats an
+# unconfirmed resolve as a clean conversation-resolution gate. A readback
+# that confirms nothing is never treated as "all good".
 #
 # `nodes(ids:)` caps at 100 nodes per query, so batch — a single PR run
 # resolving >100 threads is vanishingly rare, but the batch loop keeps the
@@ -1386,32 +1425,22 @@ if [ "${#RESOLVED_IDS[@]}" -gt 0 ]; then
   while [ "$rb_start" -lt "$rb_total" ]; do
     rb_batch=("${RESOLVED_IDS[@]:$rb_start:100}")
     rb_start=$((rb_start + 100))
-    # Build a validated GraphQL ID-array literal. The ids come from
-    # GitHub's own GraphQL `.id` field, but validate before inlining so a
-    # malformed id can never become a query-injection vector — and a
-    # malformed id is itself a readback failure (fail closed).
-    rb_id_list=""
-    for rb_id in "${rb_batch[@]}"; do
-      case "$rb_id" in
-        ''|*[!A-Za-z0-9_=-]*)
-          echo "  READBACK FAILED: malformed thread id '$rb_id'" >&2
-          READBACK_FAILED=$((READBACK_FAILED + 1)) ;;
-        *)
-          rb_id_list="${rb_id_list}\"${rb_id}\"," ;;
-      esac
-    done
-    [ -z "$rb_id_list" ] && continue
-    rb_query="query { nodes(ids: [${rb_id_list%,}]) { ... on PullRequestReviewThread { id isResolved } } }"
+    # Build the GraphQL ID-array literal by JSON-encoding the ids. GitHub
+    # node IDs are documented as OPAQUE, so do not assume a charset or parse
+    # them — JSON encoding (jq) escapes any content correctly, making the
+    # inlined literal injection-safe for any id without a charset whitelist
+    # (CodeRabbit on #565). A JSON string array is also a valid GraphQL
+    # list-of-strings literal. Empty / drifted ids simply fail the per-id
+    # readback below (fail closed).
+    rb_ids_json=$(printf '%s\n' "${rb_batch[@]}" | jq -R . | jq -s -c .)
+    rb_query="query { nodes(ids: ${rb_ids_json}) { ... on PullRequestReviewThread { id isResolved } } }"
     if ! rb_resp=$(gh_pat api graphql -f query="$rb_query" 2>&1); then
       echo "  READBACK FAILED: reviewThreads readback query errored: $rb_resp" >&2
-      # Fail closed — count every well-formed id in this batch as unconfirmed.
-      for rb_id in "${rb_batch[@]}"; do
-        case "$rb_id" in ''|*[!A-Za-z0-9_=-]*) ;; *) READBACK_FAILED=$((READBACK_FAILED + 1)) ;; esac
-      done
+      # Fail closed — count every id in this batch as unconfirmed.
+      for rb_id in "${rb_batch[@]}"; do READBACK_FAILED=$((READBACK_FAILED + 1)); done
       continue
     fi
     for rb_id in "${rb_batch[@]}"; do
-      case "$rb_id" in ''|*[!A-Za-z0-9_=-]*) continue ;; esac  # already counted above
       rb_state=$(printf '%s' "$rb_resp" \
         | jq -r --arg id "$rb_id" \
             '(.data.nodes // []) | map(select(.id == $id)) | .[0].isResolved
