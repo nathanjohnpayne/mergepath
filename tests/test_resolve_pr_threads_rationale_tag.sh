@@ -140,6 +140,15 @@ case "\$1" in
           echo '{"data":{"addPullRequestReviewThreadReply":{"comment":{"id":"C_kwT1"}}}}'
         elif grep -q "resolveReviewThread" "\$GH_ARGV_LOG.lastcall"; then
           echo '{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}'
+        elif grep -q "nodes(ids:" "\$GH_ARGV_LOG.lastcall"; then
+          # #564 post-resolve readback. The script re-reads each resolved
+          # thread via the top-level nodes(ids:) lookup. Return the fixture
+          # threads as resolved (isResolved:true) so a normal run confirms
+          # cleanly. GH_STUB_READBACK_UNRESOLVED=<id> forces ONE thread to
+          # read back false, exercising the fail-closed readback path.
+          cat <<'JSON_READBACK' | jq -c --arg kf "\${GH_STUB_READBACK_UNRESOLVED:-}" '{data:{nodes:[.data.repository.pullRequest.reviewThreads.nodes[] | {id, isResolved: (if .id == \$kf then false else true end)}]}}'
+${threads_json}
+JSON_READBACK
         else
           # reviewThreads pagination query.
           cat <<'JSON_THREADS'
@@ -675,6 +684,106 @@ else
   echo "  FAIL: no-yq fallback did not emit templated-render for consumers: all dest (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG_B" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 9 (#564): post-resolve readback confirms isResolved:true. After a
+# successful resolve, the script must re-read the thread via the top-level
+# nodes(ids:) lookup and report the confirmation. Assert (a) the readback
+# query was actually issued, (b) the confirmation line is printed, and
+# (c) the script exits 0.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 9: post-resolve readback confirms isResolved:true (#564)"
+
+# Non-manifest path → deferred-to-followup class; readback is independent
+# of the class, so any resolvable bot thread on current HEAD exercises it.
+THREADS_T9='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_9","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/readback.md","body":"Some finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Some finding","databaseId":9001}]}
+  }
+]}}}}}'
+FILES_T9='[]'
+COMMITS_T9='[]'
+
+GH_ARGV_LOG="$SCRATCH/t9.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T9" "$FILES_T9" "$COMMITS_T9"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'nodes(ids:' "$GH_ARGV_LOG" \
+   && grep -q 'Readback: all 1 resolved thread(s) confirmed isResolved:true' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: readback query issued and confirmed isResolved:true (rc=0)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: post-resolve readback did not confirm as expected (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 10 (#564): post-resolve readback FAILS CLOSED. If the readback
+# reports isResolved:false for a thread the mutation claimed to resolve
+# (state drift / eventual-consistency lag / a write that did not stick),
+# the script must NOT report success: it prints a READBACK FAILED line and
+# exits 2. Drive this by forcing the stub's readback branch to return
+# isResolved:false for the resolved thread id via GH_STUB_READBACK_UNRESOLVED.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 10: post-resolve readback fails closed on unconfirmed resolve (#564)"
+
+THREADS_T10='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_10","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/readback.md","body":"Some finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Some finding","databaseId":10001}]}
+  }
+]}}}}}'
+FILES_T10='[]'
+COMMITS_T10='[]'
+
+GH_ARGV_LOG="$SCRATCH/t10.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T10" "$FILES_T10" "$COMMITS_T10"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  GH_STUB_READBACK_UNRESOLVED="PRT_10" \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 2 ] \
+   && grep -q 'READBACK FAILED \[PRT_10\]' <<<"$out" \
+   && grep -q 'failing closed' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: unconfirmed readback → READBACK FAILED + exit 2 (fail closed)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: readback did not fail closed on isResolved:false (rc=$rc, expected 2)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
 
 echo

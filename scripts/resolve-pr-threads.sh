@@ -83,7 +83,12 @@
 # Exit codes:
 #   0 — no unresolved threads
 #   1 — bad arguments
-#   2 — gh failure (auth, missing PR, network)
+#   2 — gh failure (auth, missing PR, network), a resolve mutation that did
+#       not return isResolved:true, OR a post-resolve readback that could
+#       not confirm isResolved:true (#564 — fail closed). After every
+#       --auto-resolve-bots run, the helper re-reads each thread it
+#       resolved via a `nodes(ids:)` readback and refuses to report success
+#       unless GitHub confirms isResolved:true for all of them.
 #   3 — unresolved threads exist (in --list mode); call again with
 #       --auto-resolve-bots after addressing findings, or resolve
 #       human-authored threads via the GitHub UI.
@@ -1121,6 +1126,15 @@ FAILED_COUNT=0
 TAG_REPLY_POSTED=0
 TAG_REPLY_FAILED=0
 TAG_REPLY_SKIPPED=0
+# #564 — post-resolve readback. RESOLVED_IDS collects the GraphQL node IDs
+# of threads whose resolve mutation reported isResolved:true, so the
+# consolidated readback after the loop can re-read each and confirm the
+# state actually persisted. The loop runs in the parent shell (process
+# substitution below), so a plain array survives past it. READBACK_FAILED
+# counts threads that did NOT read back isResolved:true — a fail-closed
+# signal that forces a non-zero exit.
+RESOLVED_IDS=()
+READBACK_FAILED=0
 while IFS= read -r thread; do
   AUTHOR=$(echo "$thread" | jq -r .author)
   THREAD_ID=$(echo "$thread" | jq -r .id)
@@ -1216,17 +1230,29 @@ while IFS= read -r thread; do
 
   # Identity check moved out of the loop in #293 r2 — see the
   # single-gate block above the loop.
-  if gh_pat api graphql -f query='
+  #
+  # #564: capture the mutation's returned `thread.isResolved` rather than
+  # discarding the response. A mutation that returns HTTP 200 but
+  # isResolved!=true did NOT actually resolve the thread, so it must count
+  # as FAILED, not RESOLVED. Threads confirmed true here are collected into
+  # RESOLVED_IDS for the consolidated reviewThreads readback after the loop.
+  resolve_state=""
+  if mutation_out=$(gh_pat api graphql -f query='
     mutation($id: ID!) {
       resolveReviewThread(input: {threadId: $id}) {
         thread { isResolved }
       }
     }
-  ' -F id="$THREAD_ID" >/dev/null 2>&1; then
+  ' -F id="$THREAD_ID" 2>/dev/null); then
+    resolve_state=$(printf '%s' "$mutation_out" \
+      | jq -r '.data.resolveReviewThread.thread.isResolved' 2>/dev/null || echo "")
+  fi
+  if [ "$resolve_state" = "true" ]; then
     echo "  RESOLVED [$AUTHOR] $PATH_"
     RESOLVED_COUNT=$((RESOLVED_COUNT + 1))
+    RESOLVED_IDS+=("$THREAD_ID")
   else
-    echo "  FAILED [$AUTHOR] $PATH_ — mutation rejected" >&2
+    echo "  FAILED [$AUTHOR] $PATH_ — mutation rejected (returned isResolved=${resolve_state:-none})" >&2
     FAILED_COUNT=$((FAILED_COUNT + 1))
   fi
 done < <(printf '%s\n' "$UNRESOLVED")
@@ -1247,18 +1273,96 @@ if $DRY_RUN; then
   fi
   exit 0
 fi
-echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Failed: $FAILED_COUNT"
+
+# --- post-resolve readback (#564) ------------------------------------------
+# Acceptance criterion: "Actioned review feedback is resolved through an
+# identity-checked resolveReviewThread path before merge, with a follow-up
+# reviewThreads readback confirming isResolved: true." The per-thread
+# mutation return value is checked in the loop above; this is the SEPARATE
+# confirming read. We re-read each just-resolved thread via the top-level
+# `nodes(ids:)` lookup — O(resolved), no pagination, and it reads back
+# exactly the set we mutated (and is syntactically distinct from the
+# enumeration `reviewThreads` query).
+#
+# Fail CLOSED: any thread that does not read back isResolved:true (state
+# drift, eventual-consistency lag, a malformed id, or a token that could
+# write but a later read that cannot) increments READBACK_FAILED and forces
+# a non-zero exit, so a caller never treats an unconfirmed resolve as a
+# clean conversation-resolution gate. A readback that confirms nothing is
+# never treated as "all good".
+#
+# `nodes(ids:)` caps at 100 nodes per query, so batch — a single PR run
+# resolving >100 threads is vanishingly rare, but the batch loop keeps the
+# confirmation complete if it ever happens.
+if [ "${#RESOLVED_IDS[@]}" -gt 0 ]; then
+  rb_total=${#RESOLVED_IDS[@]}
+  rb_start=0
+  while [ "$rb_start" -lt "$rb_total" ]; do
+    rb_batch=("${RESOLVED_IDS[@]:$rb_start:100}")
+    rb_start=$((rb_start + 100))
+    # Build a validated GraphQL ID-array literal. The ids come from
+    # GitHub's own GraphQL `.id` field, but validate before inlining so a
+    # malformed id can never become a query-injection vector — and a
+    # malformed id is itself a readback failure (fail closed).
+    rb_id_list=""
+    for rb_id in "${rb_batch[@]}"; do
+      case "$rb_id" in
+        ''|*[!A-Za-z0-9_=-]*)
+          echo "  READBACK FAILED: malformed thread id '$rb_id'" >&2
+          READBACK_FAILED=$((READBACK_FAILED + 1)) ;;
+        *)
+          rb_id_list="${rb_id_list}\"${rb_id}\"," ;;
+      esac
+    done
+    [ -z "$rb_id_list" ] && continue
+    rb_query="query { nodes(ids: [${rb_id_list%,}]) { ... on PullRequestReviewThread { id isResolved } } }"
+    if ! rb_resp=$(gh_pat api graphql -f query="$rb_query" 2>&1); then
+      echo "  READBACK FAILED: reviewThreads readback query errored: $rb_resp" >&2
+      # Fail closed — count every well-formed id in this batch as unconfirmed.
+      for rb_id in "${rb_batch[@]}"; do
+        case "$rb_id" in ''|*[!A-Za-z0-9_=-]*) ;; *) READBACK_FAILED=$((READBACK_FAILED + 1)) ;; esac
+      done
+      continue
+    fi
+    for rb_id in "${rb_batch[@]}"; do
+      case "$rb_id" in ''|*[!A-Za-z0-9_=-]*) continue ;; esac  # already counted above
+      rb_state=$(printf '%s' "$rb_resp" \
+        | jq -r --arg id "$rb_id" \
+            '(.data.nodes // []) | map(select(.id == $id)) | .[0].isResolved
+             | if . == null then "missing" else tostring end' 2>/dev/null \
+        || echo "missing")
+      if [ "$rb_state" != "true" ]; then
+        echo "  READBACK FAILED [$rb_id]: isResolved=$rb_state (expected true)" >&2
+        READBACK_FAILED=$((READBACK_FAILED + 1))
+      fi
+    done
+  done
+  if [ "$READBACK_FAILED" -gt 0 ]; then
+    echo "Readback: $READBACK_FAILED of $rb_total resolved thread(s) did NOT confirm isResolved:true — failing closed." >&2
+  else
+    echo "Readback: all $rb_total resolved thread(s) confirmed isResolved:true."
+  fi
+fi
+
+echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Failed: $FAILED_COUNT  Readback-failed: $READBACK_FAILED"
 if ! $NO_TAG_REPLY; then
   echo "Tag replies: posted=$TAG_REPLY_POSTED  failed=$TAG_REPLY_FAILED"
 fi
 # Codex r1 on PR #172: previously this exited 0 even with stale or
 # human-authored threads remaining — callers would treat it as "all
 # clear" and proceed to merge into a still-BLOCKED PR. Exit codes:
-#   2 = mutation failure (transient: gh/network)
+#   2 = mutation failure (transient: gh/network), a resolve mutation that
+#       did not return isResolved:true, OR a post-resolve readback that
+#       could not confirm isResolved:true (#564 — fail closed)
 #   3 = unresolved threads remain (human or stale-bot) — PR still
 #       conversation-resolution-blocked; address and retry
 #   0 = no unresolved threads on current HEAD
-[ "$FAILED_COUNT" -gt 0 ] && exit 2
+# Explicit `if` (not `[ a ] && exit`): two OR-ed conditions, and an
+# `&& exit` chain would be ambiguous under set -e (see the SKIPPED block
+# below). A readback failure is as fail-closed as a mutation failure.
+if [ "$FAILED_COUNT" -gt 0 ] || [ "$READBACK_FAILED" -gt 0 ]; then
+  exit 2
+fi
 # Use an explicit `if`, not `[ a ] || [ b ] && exit 3`. In that
 # one-liner `&&` and `||` are equal-precedence and left-associative,
 # so it parses as `([ a ] || [ b ]) && exit 3` — and under
