@@ -47,7 +47,12 @@
 #                           NOT actioned here: they show WHERE a fix belongs
 #                           (upstream), not that one happened, so a fresh
 #                           finding on a canonical path must not be resolved
-#                           by routing alone (#565). Those, plus
+#                           by routing alone (#565). The gate evaluates
+#                           action INDEPENDENTLY of routing, so a
+#                           canonical/templated thread that DOES carry action
+#                           evidence (a fix commit touching it, or a
+#                           rebuttal) is still resolved. Routing-only threads,
+#                           plus
 #                           nitpick-noted / deferred-to-followup and any
 #                           class that can't be positively determined, are
 #                           LEFT UNRESOLVED so the weekly unresolved-
@@ -988,6 +993,18 @@ REPO_ROOT_FOR_MANIFEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # about WHERE the durable fix should live.)
 derive_tag_class() {
   local thread_json="$1"
+  # skip_routing (#565): when non-empty (the --resolve-actioned GATE path),
+  # the routing-only classes canonical-coverage / templated-render are NOT
+  # emitted — neither from a recorded marker (step 0) nor from the path
+  # checks (steps 1 / 1b) — so the ladder falls through to real ACTION
+  # evidence (addressed-elsewhere / rebuttal-recorded). The default (empty)
+  # keeps the routing-first ladder for the --auto-resolve-bots tag / daily
+  # rollup, where routing context is wanted. This decouples the actioned
+  # GATE (needs proof of action) from the routing TAG (proof of where a fix
+  # belongs): a fresh canonical-path finding is still NOT actioned, but a
+  # canonical-path thread that WAS fixed or rebutted now is (nathanpayne-codex
+  # P1 CHANGES_REQUESTED on #565 — routing was masking real action evidence).
+  local skip_routing="${2:-}"
   local thread_path
   local thread_body
   thread_path=$(printf '%s' "$thread_json" | jq -r '.path // ""')
@@ -1041,18 +1058,27 @@ derive_tag_class() {
         echo "$recorded_class"
         return
       fi ;;
-    canonical-coverage|templated-render|nitpick-noted|deferred-to-followup)
-      # Routing (canonical/templated) and surface (nitpick/deferred) markers
-      # are NOT in the actioned gate set, so honoring even a stale one can
-      # never cause a wrong resolve — it just routes/skips. Honor
-      # unconditionally so the recorded class still flows to the
-      # --auto-resolve-bots tag / daily rollup.
+    canonical-coverage|templated-render)
+      # Routing markers: honored for the TAG path, but IGNORED in the GATE
+      # path (skip_routing) so the ladder can still find real action
+      # evidence on a canonical/templated thread that was actually fixed
+      # (#565). Honoring even a stale routing marker can never cause a wrong
+      # resolve (routing is not in the actioned set), so the TAG path honors
+      # it unconditionally.
+      if [ -z "$skip_routing" ]; then
+        echo "$recorded_class"
+        return
+      fi ;;
+    nitpick-noted|deferred-to-followup)
+      # Surface markers: honoring even a stale one only skips (the safe
+      # outcome), so honor unconditionally in both paths.
       echo "$recorded_class"
       return ;;
   esac
 
-  # 1. canonical-coverage
-  if path_matches_manifest "$thread_path"; then
+  # 1. canonical-coverage (routing — skipped in the GATE path so real action
+  # evidence on a canonical path is not masked, #565).
+  if [ -z "$skip_routing" ] && path_matches_manifest "$thread_path"; then
     echo "canonical-coverage"
     return
   fi
@@ -1065,7 +1091,7 @@ derive_tag_class() {
   # the path predicate alone is the right signal: if a thread is
   # anchored on the templated dest, the durable fix is either in
   # mergepath's template or in the consumer's facts:* block.
-  if path_matches_templated_dest "$thread_path"; then
+  if [ -z "$skip_routing" ] && path_matches_templated_dest "$thread_path"; then
     echo "templated-render"
     return
   fi
@@ -1409,7 +1435,11 @@ while IFS= read -r thread; do
   if [ "$MODE" = "resolve-actioned" ]; then
     fetch_pr_tag_data
     augment_pr_commits_with_sha
-    thread_class=$(derive_tag_class "$thread")
+    # GATE path: classify with routing skipped, so a canonical/templated
+    # thread that was actually fixed/rebutted resolves on its action
+    # evidence, while a fresh routing-only finding still falls through to a
+    # non-actioned class and is left for the sweep (#565).
+    thread_class=$(derive_tag_class "$thread" skip-routing)
     thread_class_computed=true
     if ! class_is_actioned "$thread_class"; then
       echo "  SKIP (not demonstrably actioned: $thread_class): [$AUTHOR] $PATH_"

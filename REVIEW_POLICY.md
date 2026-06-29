@@ -425,9 +425,11 @@ that can change GitHub conversation state.
      classes (`canonical-coverage`, `templated-render`) are deliberately
      **not** treated as actioned here: they indicate where a durable fix
      belongs, not that one happened, so a fresh finding on a canonical path
-     is left unresolved rather than auto-resolved by routing alone. Every
-     non-actioned thread is left for the weekly sweep. Prefer this to mark
-     genuinely-handled feedback resolved.
+     is left unresolved rather than auto-resolved by routing alone. The gate
+     evaluates action **independently of routing**, so a canonical/templated
+     thread that *does* carry action evidence (a fix commit touching it, or
+     a rebuttal) is still resolved. Every non-actioned thread is left for the
+     weekly sweep. Prefer this to mark genuinely-handled feedback resolved.
    - `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots` resolves
      **every** current-HEAD bot thread, which is what clears the
      `required_conversation_resolution` gate to merge; it tags each

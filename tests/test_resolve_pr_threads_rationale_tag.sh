@@ -1172,16 +1172,17 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────
-# Test 18 (#564, nathanpayne-codex P1 CHANGES_REQUESTED on #565): a routing
-# class (canonical-coverage / templated-render) is NOT actioned for
-# --resolve-actioned. A fresh bot finding on a canonical manifest path
-# classifies as canonical-coverage from routing alone, with no fix commit
-# or rebuttal — it must be LEFT UNRESOLVED, not auto-resolved. (The fixture
-# manifest, rewritten by Test 8, marks scripts/resolve-pr-threads.sh
-# canonical.)
+# Test 18 (#564, nathanpayne-codex P1 CHANGES_REQUESTED on #565): a fresh
+# bot finding on a canonical manifest path with NO fix commit and NO
+# rebuttal must be LEFT UNRESOLVED by --resolve-actioned. The GATE skips
+# routing (skip_routing), so the thread no longer short-circuits to
+# canonical-coverage; it falls through to a non-actioned class (here
+# deferred-to-followup) and is skipped — routing alone never resolves.
+# (The fixture manifest, rewritten by Test 8, marks
+# scripts/resolve-pr-threads.sh canonical.)
 # ─────────────────────────────────────────────────────────────────────
 echo
-echo "Test 18: --resolve-actioned does NOT resolve a routing-only canonical thread (#565)"
+echo "Test 18: --resolve-actioned does NOT resolve a fresh, unfixed canonical-path thread (#565)"
 
 THREADS_T18='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
   {"id":"PRT_18","isResolved":false,"isOutdated":false,
@@ -1210,13 +1211,66 @@ rc=$?
 set -e
 
 if [ "$rc" -eq 3 ] \
-   && grep -q 'SKIP (not demonstrably actioned: canonical-coverage)' <<<"$out" \
+   && grep -q 'SKIP (not demonstrably actioned:' <<<"$out" \
    && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
   echo "  PASS: routing-only canonical thread left unresolved (no mutation), exit 3"
 else
   fail=$((fail + 1))
   echo "  FAIL: routing-only canonical thread was treated as actioned (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 19 (#564, nathanpayne-codex P1 CHANGES_REQUESTED on #565): the
+# counterpart to Test 18 — a canonical-path thread that WAS actually fixed
+# MUST resolve. Before the skip_routing gate path, derive_tag_class returned
+# canonical-coverage (routing, step 1) before checking the fix commit
+# (step 2), so a real fix on a canonical path was masked and skipped. With
+# routing skipped in the gate, the fix commit touching the anchored
+# canonical file classifies as addressed-elsewhere → resolved + readback.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 19: --resolve-actioned DOES resolve a fixed canonical-path thread (#565)"
+
+THREADS_T19='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_19","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/resolve-pr-threads.sh","body":"Finding on a canonical path that we then fixed","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Finding on a canonical path that we then fixed","databaseId":19001,"createdAt":"2026-01-01T00:00:00Z"}]}
+  }
+]}}}}}'
+FILES_T19='["scripts/resolve-pr-threads.sh"]'
+# Agent fix commit AFTER the finding, touching the anchored canonical file.
+COMMITS_T19='[{"sha":"can1234567","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
+CFILES_T19='{"can1234567":["scripts/resolve-pr-threads.sh"]}'
+
+GH_ARGV_LOG="$SCRATCH/t19.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T19" "$FILES_T19" "$COMMITS_T19" "$CFILES_T19"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" \
+   && grep -q 'Readback: all 1 resolved thread(s) confirmed isResolved:true' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: fixed canonical-path thread resolved as addressed-elsewhere + readback-confirmed"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: fixed canonical-path thread was NOT resolved under --resolve-actioned (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
