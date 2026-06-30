@@ -208,10 +208,14 @@ ALLOW_LIST=(
   "scripts/bootstrap/*"
   "tests/test_bootstrap*"
 
-  # Weekly unresolved-feedback sweep pipeline — mergepath-only cron
-  # workhorse; check_sweep_unresolved_feedback is not wired on consumers.
+  # Weekly unresolved-feedback sweep pipeline + the one-time backfill driver
+  # (#566) — mergepath-only cron/operator workhorses; never travel to consumers.
+  # The sweep glob already covers scripts/sweep-unresolved-feedback/backfill.sh;
+  # test_sweep* does NOT match the backfill test, so it is listed explicitly
+  # (check_sweep_unresolved_feedback runs it on the hub only).
   "scripts/sweep-unresolved-feedback/*"
   "tests/test_sweep*"
+  "tests/test_backfill_unresolved_feedback.sh"
 
   # Propagation-lane audit test family. audit-propagation-lane.sh IS
   # declared (already covered), kept here only for robustness to a future
