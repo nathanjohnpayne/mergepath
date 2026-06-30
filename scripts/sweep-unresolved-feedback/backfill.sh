@@ -102,9 +102,20 @@ fi
 echo "backfill: $($DRY_RUN && echo 'DRY-RUN (no mutations)' || echo 'EXECUTE (will resolve)') — enumerating unresolved threads" >&2
 
 FINDINGS="$WORK/findings.ndjson"
-SWEEP_OUTPUT="$FINDINGS" "$ENUMERATE" "$ENUM_TARGETS" >&2 || {
-  echo "backfill: enumerate.sh failed" >&2; exit 1
+ENUM_STDERR="$WORK/enumerate.stderr"
+SWEEP_OUTPUT="$FINDINGS" "$ENUMERATE" "$ENUM_TARGETS" >/dev/null 2>"$ENUM_STDERR" || {
+  cat "$ENUM_STDERR" >&2; echo "backfill: enumerate.sh failed" >&2; exit 1
 }
+cat "$ENUM_STDERR" >&2
+# Fail closed if enumerate could not LIST a target repo. enumerate.sh is
+# tolerant by design (it WARNs and skips an unlistable repo so the weekly
+# sweep still covers the rest), but a one-time fail-closed drain must not
+# report a partial drain — and for `--repo <invalid>` it would otherwise
+# report a successful EMPTY drain (Codex Phase-4b on #571).
+if grep -q 'WARN gh pr list failed' "$ENUM_STDERR"; then
+  echo "backfill: enumerate could not list one or more target repos (see WARN above); refusing to report a partial/empty drain — failing closed" >&2
+  exit 2
+fi
 
 # Distinct (repo, pr) pairs that have at least one unresolved thread. These
 # are the PRs worth visiting; --resolve-actioned decides per-thread whether

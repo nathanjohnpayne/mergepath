@@ -52,5 +52,24 @@ if ! bash "$TEST"; then
   exit 1
 fi
 
+# Backfill driver (#566) is mergepath-only: scripts/sweep-unresolved-feedback/
+# backfill.sh + its test are allow-listed in check_propagation_closure and never
+# travel to consumers. Run the test where BOTH are present (the hub); skip
+# cleanly where BOTH are absent (a consumer checkout). FAIL if exactly one is
+# present — a broken script/test pairing, not a legitimate consumer state
+# (Codex Phase-4b on #571: don't silently skip the regression suite).
+BACKFILL_SCRIPT="$REPO_ROOT/scripts/sweep-unresolved-feedback/backfill.sh"
+BACKFILL_TEST="$REPO_ROOT/tests/test_backfill_unresolved_feedback.sh"
+if [ -f "$BACKFILL_SCRIPT" ] && [ -f "$BACKFILL_TEST" ]; then
+  echo "check_sweep_unresolved_feedback: running $BACKFILL_TEST"
+  if ! bash "$BACKFILL_TEST"; then
+    echo "check_sweep_unresolved_feedback: FAIL (backfill tests)" >&2
+    exit 1
+  fi
+elif [ -f "$BACKFILL_SCRIPT" ] || [ -f "$BACKFILL_TEST" ]; then
+  echo "check_sweep_unresolved_feedback: FAIL (backfill script/test pairing broken — exactly one of backfill.sh / its test is present)" >&2
+  exit 1
+fi
+
 echo "check_sweep_unresolved_feedback: PASS"
 exit 0

@@ -35,6 +35,11 @@ cat > "$FR/scripts/sweep-unresolved-feedback/enumerate.sh" <<'STUB'
 set -euo pipefail
 out="${SWEEP_OUTPUT:-/dev/stdout}"
 case "$out" in /dev/stdout|-) : ;; *) : > "$out" ;; esac
+if [ "${STUB_ENUM_MODE:-ok}" = "skip" ]; then
+  # Mimic enumerate.sh's tolerant skip of an unlistable repo: WARN + no findings.
+  echo "enumerate: WARN gh pr list failed for owner/alpha (skipping)" >&2
+  exit 0
+fi
 {
   printf '%s\n' '{"repo":"owner/alpha","pr_number":11,"thread_id":"T1"}'
   printf '%s\n' '{"repo":"owner/alpha","pr_number":11,"thread_id":"T2"}'
@@ -73,13 +78,23 @@ esac
 STUB
 chmod +x "$FR/scripts/resolve-pr-threads.sh"
 
+# Hermetic `gh` shim: backfill.sh runs `command -v gh` as a dependency check
+# (and never calls gh in the fixture — enumerate.sh + resolve-pr-threads.sh are
+# stubbed). Provide a no-op gh on PATH so the suite runs on minimal hosts with
+# no GitHub CLI installed (Codex Phase-4b on #571). jq stays real (the driver
+# parses findings with it), so it is left on the inherited PATH.
+mkdir -p "$FR/bin"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$FR/bin/gh"
+chmod +x "$FR/bin/gh"
+SHIM_PATH="$FR/bin:$PATH"
+
 BF="$FR/scripts/sweep-unresolved-feedback/backfill.sh"
 
 run_bf() { # mode, extra-args... → sets OUT/RC, fresh resolve log
   STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"
   export STUB_RESOLVE_LOG
   set +e
-  OUT=$(STUB_RESOLVE_MODE="$1" GH_TOKEN=dummy bash "$BF" "${@:2}" --repo owner/alpha 2>&1)
+  OUT=$(PATH="$SHIM_PATH" STUB_RESOLVE_MODE="$1" GH_TOKEN=dummy bash "$BF" "${@:2}" --repo owner/alpha 2>&1)
   RC=$?
   set -e
 }
@@ -93,7 +108,7 @@ if [ "$RC" -eq 0 ] \
    && [ "$(grep -c 'RESOLVE_ARGV:.*--dry-run' "$STUB_RESOLVE_LOG")" -eq 2 ]; then
   pass=$((pass+1)); echo "PASS: dry-run default — 2 PRs, --dry-run passed, would-resolve aggregated"
 else
-  fail=$((fail+1)); echo "FAIL: dry-run default (rc=$RC)" >&2; echo "$OUT" | sed 's/^/  /' >&2
+  fail=$((fail+1)); echo "FAIL: dry-run default (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
 # ── Test 2: --execute drops --dry-run and aggregates resolved, exit 0.
@@ -105,7 +120,7 @@ if [ "$RC" -eq 0 ] \
    && [ "$(grep -c 'RESOLVE_ARGV:.*--resolve-actioned' "$STUB_RESOLVE_LOG")" -eq 2 ]; then
   pass=$((pass+1)); echo "PASS: --execute — no --dry-run, resolved aggregated"
 else
-  fail=$((fail+1)); echo "FAIL: --execute (rc=$RC)" >&2; echo "$OUT" | sed 's/^/  /' >&2
+  fail=$((fail+1)); echo "FAIL: --execute (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
 # ── Test 3: a resolve/readback failure on any PR → backfill exits 2.
@@ -113,7 +128,7 @@ run_bf fail --execute
 if [ "$RC" -eq 2 ] && grep -q 'failed=' <<<"$OUT"; then
   pass=$((pass+1)); echo "PASS: resolve failure propagates as exit 2 (fail closed)"
 else
-  fail=$((fail+1)); echo "FAIL: failure should exit 2 (rc=$RC)" >&2; echo "$OUT" | sed 's/^/  /' >&2
+  fail=$((fail+1)); echo "FAIL: failure should exit 2 (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
 # ── Test 4: resolve-actioned is the mode passed (never --auto-resolve-bots).
@@ -131,20 +146,34 @@ run_bf die --execute
 if [ "$RC" -eq 2 ] && grep -q 'failed=' <<<"$OUT"; then
   pass=$((pass+1)); echo "PASS: summary-less resolver death fails closed (exit-code backstop)"
 else
-  fail=$((fail+1)); echo "FAIL: die mode should exit 2 (rc=$RC)" >&2; echo "$OUT" | sed 's/^/  /' >&2
+  fail=$((fail+1)); echo "FAIL: die mode should exit 2 (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
 # ── Test 6: a non-numeric BACKFILL_MAX_PRS is rejected up front (exit 1),
 #    not left to crash `[ "$MAX" -gt 0 ]` under set -e mid-loop.
 STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
 set +e
-OUT=$(STUB_RESOLVE_MODE=ok GH_TOKEN=dummy BACKFILL_MAX_PRS=foo bash "$BF" --repo owner/alpha 2>&1)
+OUT=$(PATH="$SHIM_PATH" STUB_RESOLVE_MODE=ok GH_TOKEN=dummy BACKFILL_MAX_PRS=foo bash "$BF" --repo owner/alpha 2>&1)
 RC=$?
 set -e
-if [ "$RC" -eq 1 ] && grep -qi 'BACKFILL_MAX_PRS must be' <<<"$OUT"; then
-  pass=$((pass+1)); echo "PASS: non-numeric BACKFILL_MAX_PRS rejected up front (exit 1)"
+if [ "$RC" -eq 1 ] && grep -qi 'BACKFILL_MAX_PRS must be' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: non-numeric BACKFILL_MAX_PRS rejected up front (exit 1, no resolver call)"
 else
-  fail=$((fail+1)); echo "FAIL: bad BACKFILL_MAX_PRS should exit 1 (rc=$RC)" >&2; echo "$OUT" | sed 's/^/  /' >&2
+  fail=$((fail+1)); echo "FAIL: bad BACKFILL_MAX_PRS should exit 1 with no resolver call (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 7: enumerate skips an unlistable target (WARN, no findings) → the
+#    backfill fails closed instead of reporting a successful empty drain, and
+#    never calls the resolver (Codex Phase-4b on #571).
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" STUB_ENUM_MODE=skip STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --execute --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -ne 0 ] && grep -qi 'failing closed' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: enumerate skip (unlistable repo) fails closed, no resolver call"
+else
+  fail=$((fail+1)); echo "FAIL: enumerate skip should fail closed (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
 echo
