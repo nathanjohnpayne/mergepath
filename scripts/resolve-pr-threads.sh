@@ -35,7 +35,35 @@
 #                           bot-only mode. Follow REVIEW_POLICY.md's
 #                           pre-merge gate for agent-reviewer vs
 #                           real-human threads.
-#   --dry-run               With --auto-resolve-bots, print what would
+#   --resolve-actioned      Like --auto-resolve-bots (same bot-author,
+#                           current-HEAD, identity, tag-reply, and readback
+#                           handling) but resolves a thread ONLY when its
+#                           derived class proves ACTION on this PR:
+#                           addressed-elsewhere (an agent commit touching the
+#                           anchored file, after the latest re-raise) or
+#                           rebuttal-recorded (a substantive agent rebuttal
+#                           after the latest re-raise). Routing-only classes
+#                           — canonical-coverage / templated-render — are
+#                           NOT actioned here: they show WHERE a fix belongs
+#                           (upstream), not that one happened, so a fresh
+#                           finding on a canonical path must not be resolved
+#                           by routing alone (#565). The gate evaluates
+#                           action INDEPENDENTLY of routing, so a
+#                           canonical/templated thread that DOES carry action
+#                           evidence (a fix commit touching it, or a
+#                           rebuttal) is still resolved. Routing-only threads,
+#                           plus
+#                           nitpick-noted / deferred-to-followup and any
+#                           class that can't be positively determined, are
+#                           LEFT UNRESOLVED so the weekly unresolved-
+#                           feedback sweep keeps surfacing them (#564). Use
+#                           this to mark genuinely-handled feedback resolved
+#                           without the blunt "resolve everything" of
+#                           --auto-resolve-bots. To merge past a deferral on
+#                           a conversation-resolution-gated repo, fix/rebut
+#                           it (making it actioned) or defer it explicitly
+#                           via --auto-resolve-bots --rationale.
+#   --dry-run               With either resolve mode, print what would
 #                           be resolved without mutating.
 #   --rationale <text>      With --auto-resolve-bots, override the
 #                           auto-synthesized class with a free-form
@@ -83,7 +111,12 @@
 # Exit codes:
 #   0 — no unresolved threads
 #   1 — bad arguments
-#   2 — gh failure (auth, missing PR, network)
+#   2 — gh failure (auth, missing PR, network), a resolve mutation that did
+#       not return isResolved:true, OR a post-resolve readback that could
+#       not confirm isResolved:true (#564 — fail closed). After every
+#       --auto-resolve-bots run, the helper re-reads each thread it
+#       resolved via a `nodes(ids:)` readback and refuses to report success
+#       unless GitHub confirms isResolved:true for all of them.
 #   3 — unresolved threads exist (in --list mode); call again with
 #       --auto-resolve-bots after addressing findings, or resolve
 #       human-authored threads via the GitHub UI.
@@ -119,16 +152,22 @@ fi
 usage() {
   cat <<'EOF' >&2
 Usage: scripts/resolve-pr-threads.sh <PR#> [--repo owner/name] [--list]
-                                            [--auto-resolve-bots] [--dry-run]
-                                            [--rationale <text>] [--no-tag-reply]
+                                            [--auto-resolve-bots | --resolve-actioned]
+                                            [--dry-run] [--rationale <text>] [--no-tag-reply]
 
   --list                List unresolved threads (default).
-  --auto-resolve-bots   Resolve bot-authored threads on current HEAD.
-  --dry-run             With --auto-resolve-bots, print without mutating.
+  --auto-resolve-bots   Resolve ALL current-HEAD bot-authored threads
+                        (clears the conversation-resolution gate; the
+                        daily rollup re-surfaces deferrals).
+  --resolve-actioned    Resolve ONLY current-HEAD bot threads whose fix or
+                        rebuttal is demonstrable (derived class in the
+                        actioned skip-set); leave the rest unresolved so
+                        the weekly sweep keeps surfacing them.
+  --dry-run             With either resolve mode, print without mutating.
   --rationale <text>    With --auto-resolve-bots, free-form rationale
                         appended after the [mergepath-resolve: deferred-to-followup]
                         tag (overrides auto-classification).
-  --no-tag-reply        With --auto-resolve-bots, suppress the
+  --no-tag-reply        With either resolve mode, suppress the
                         [mergepath-resolve:<class>] reply emission
                         (the resolve mutation still runs).
 EOF
@@ -164,6 +203,7 @@ while [ $# -gt 0 ]; do
       REPO="$2"; shift 2 ;;
     --list) MODE="list"; shift ;;
     --auto-resolve-bots) MODE="auto-resolve-bots"; shift ;;
+    --resolve-actioned) MODE="resolve-actioned"; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     --rationale)
       # Same defensive value check as --repo (Codex r2 on PR #172):
@@ -193,6 +233,20 @@ done
 # PR_NUM must be a positive integer (no leading zeros, no other chars).
 if ! [[ "$PR_NUM" =~ ^[1-9][0-9]*$ ]]; then
   echo "Invalid PR number: '$PR_NUM' (must be a positive integer)" >&2
+  exit 1
+fi
+
+# #565: --rationale is an --auto-resolve-bots affordance (override the class
+# for a deliberate deferred resolve). It is incompatible with
+# --resolve-actioned, whose whole contract is to resolve ONLY on derived
+# action evidence — a free-form rationale override would resolve a thread
+# while mis-tagging it deferred-to-followup, so the daily rollup would treat
+# an actioned, resolved thread as deferred/unhandled. Reject the combo.
+if [ "$MODE" = "resolve-actioned" ] && $RATIONALE_FLAG_USED; then
+  echo "Error: --rationale is not valid with --resolve-actioned (it applies" >&2
+  echo "       only to --auto-resolve-bots). --resolve-actioned resolves on" >&2
+  echo "       derived action evidence; use --auto-resolve-bots --rationale" >&2
+  echo "       to deliberately resolve a deferred thread with a rationale." >&2
   exit 1
 fi
 
@@ -239,6 +293,13 @@ fi
 
 OWNER="${REPO%/*}"
 NAME="${REPO#*/}"
+
+# Per-commit file-list cache for the addressed-elsewhere check (#565). Keyed
+# by commit SHA, stored on disk so the cache survives the command-substitution
+# subshells that derive_tag_class / synth_rationale run in (a shell-var cache
+# would be lost when those subshells exit). Removed on exit.
+COMMIT_FILES_CACHE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/resolve-pr-commitfiles.XXXXXX")"
+trap 'rm -rf "$COMMIT_FILES_CACHE_DIR"' EXIT
 
 # Fetch the PR's current HEAD commit oid — used by --auto-resolve-bots
 # to verify each thread's latest comment is on the current HEAD before
@@ -329,15 +390,24 @@ QUERY='
             # and substantive rebuttal detection (≥30 chars from an
             # agent author → `rebuttal-recorded`).
             #
-            # Cap at first 50 — same conservative limit as commentsFirst.
-            # A thread deep enough to exceed 50 replies during one
-            # auto-resolve invocation is vanishingly rare and would
-            # already be a process-smell worth surfacing manually.
-            allComments: comments(first: 50) {
+            # `last: 50` (not first: 50) — the staleness checks (#565) need
+            # the MOST RECENT comments: latest_nonagent_created and the
+            # last-word marker/rebuttal logic must see a bot re-raise even on
+            # a long thread. `first: 50` truncated the newest comments, so a
+            # re-raise past comment 50 was invisible and an older fix/rebuttal
+            # looked like the latest word — resolving live feedback (Codex P2
+            # on #565). The most-recent 50 always include the latest re-raise;
+            # only very old comments (>50 back) drop off, and those never make
+            # a thread look MORE actioned, so the gate stays fail-safe.
+            allComments: comments(last: 50) {
               nodes {
                 author { login }
                 body
                 databaseId
+                # createdAt powers the addressed-elsewhere staleness guard
+                # (#565): a fix commit must post-date the LATEST bot/reviewer
+                # comment, not just the original finding, to count as actioning.
+                createdAt
               }
             }
           }
@@ -519,6 +589,63 @@ is_agent_author_local() {
   return 1
 }
 
+# latest_nonagent_created <thread_json> → ISO timestamp on stdout.
+# The createdAt of the most recent NON-agent (bot / real-reviewer) comment on
+# the thread, floored at the original finding's createdAt (`.created`). This is
+# the "bot's last word" timestamp used by the addressed-elsewhere staleness
+# guard (#565): a fix commit only counts as actioning the thread if it
+# post-dates this — otherwise a stale fix that predates a later bot re-raise
+# would falsely clear live feedback. ISO 8601 sorts lexicographically, so the
+# `\>` string comparison is chronological. Single-sourced here so
+# derive_tag_class and synth_rationale apply the identical predicate.
+latest_nonagent_created() {
+  local tj="$1"
+  local latest cnt i login created
+  latest=$(printf '%s' "$tj" | jq -r '.created // ""')
+  cnt=$(printf '%s' "$tj" | jq '.all_comments | length' 2>/dev/null || echo 0)
+  i=0
+  while [ "$i" -lt "$cnt" ]; do
+    login=$(printf '%s' "$tj" | jq -r ".all_comments[$i].author.login // \"\"")
+    if ! is_agent_author_local "$login"; then
+      created=$(printf '%s' "$tj" | jq -r ".all_comments[$i].createdAt // \"\"")
+      if [ -n "$created" ] && { [ -z "$latest" ] || [ "$created" \> "$latest" ]; }; then
+        latest="$created"
+      fi
+    fi
+    i=$((i + 1))
+  done
+  printf '%s' "$latest"
+}
+
+# commit_files <sha> → JSON array of the filenames a commit touched, on
+# stdout ("" if the per-commit fetch fails). Disk-cached under
+# COMMIT_FILES_CACHE_DIR so each sha is fetched at most once across the
+# per-thread command-substitution subshells. The PR /commits cache carries
+# no file list, so addressed-elsewhere needs this per-commit lookup (#565).
+commit_files() {
+  local sha="$1"
+  [ -z "$sha" ] && return 0
+  local cf="$COMMIT_FILES_CACHE_DIR/$sha"
+  if [ ! -f "$cf" ]; then
+    gh_pat api "repos/$OWNER/$NAME/commits/$sha" --jq '[.files[].filename]' \
+      >"$cf" 2>/dev/null || : >"$cf"
+  fi
+  cat "$cf"
+}
+
+# commit_touches_file <sha> <path> → exit 0 if the commit's file list
+# includes <path>, 1 otherwise. FAIL CLOSED (#565): a commit whose files
+# cannot be read (empty result) does NOT match, so a fetch failure can never
+# make a thread look actioned, and an agent commit on an UNRELATED file no
+# longer satisfies addressed-elsewhere for this thread.
+commit_touches_file() {
+  local sha="$1" path="$2" files
+  { [ -z "$sha" ] || [ -z "$path" ] || [ "$path" = "(no path)" ]; } && return 1
+  files=$(commit_files "$sha")
+  [ -z "$files" ] && return 1
+  printf '%s' "$files" | jq -e --arg p "$path" 'any(. == $p)' >/dev/null 2>&1
+}
+
 # classify_severity_local <body> → P0|P1|...|Nitpick|Trivial|Unknown
 # Mirrors the rollup helpers' classify_severity, anchored on the
 # first ~600 chars to avoid false-matching severity words deep in
@@ -564,9 +691,16 @@ fetch_pr_tag_data() {
   # PR_COMMITS_CACHE now includes `sha` so synth_rationale can cite
   # the matching commit. The predicate the rationale builds must
   # match derive_tag_class's predicate (CodeRabbit major on #308).
+  # login fallback chain (#565 round 8): .author.login is null for commits
+  # whose author email is not linked to a GitHub account — which is THIS
+  # repo's normal case (commits are authored as nathanjohnpayne with a
+  # placeholder .example email). So fall back to .commit.author.name (the git
+  # config name, e.g. "nathanjohnpayne", which IS in MERGEPATH_AGENT_AUTHORS)
+  # BEFORE the email, or agent fix commits are never recognized as
+  # agent-authored and addressed-elsewhere never fires.
   PR_COMMITS_CACHE=$(_fetch_paginated \
     "repos/$OWNER/$NAME/pulls/$PR_NUM/commits" \
-    '[.[] | {sha: (.sha // ""), login: (.author.login // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]')
+    '[.[] | {sha: (.sha // ""), login: (.author.login // .commit.author.name // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]')
 }
 
 # _fetch_paginated <base-url> <jq-projection> → JSON array on stdout.
@@ -913,15 +1047,93 @@ REPO_ROOT_FOR_MANIFEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # about WHERE the durable fix should live.)
 derive_tag_class() {
   local thread_json="$1"
+  # skip_routing (#565): when non-empty (the --resolve-actioned GATE path),
+  # the routing-only classes canonical-coverage / templated-render are NOT
+  # emitted — neither from a recorded marker (step 0) nor from the path
+  # checks (steps 1 / 1b) — so the ladder falls through to real ACTION
+  # evidence (addressed-elsewhere / rebuttal-recorded). The default (empty)
+  # keeps the routing-first ladder for the --auto-resolve-bots tag / daily
+  # rollup, where routing context is wanted. This decouples the actioned
+  # GATE (needs proof of action) from the routing TAG (proof of where a fix
+  # belongs): a fresh canonical-path finding is still NOT actioned, but a
+  # canonical-path thread that WAS fixed or rebutted now is (nathanpayne-codex
+  # P1 CHANGES_REQUESTED on #565 — routing was masking real action evidence).
+  local skip_routing="${2:-}"
   local thread_path
-  local thread_created
   local thread_body
   thread_path=$(printf '%s' "$thread_json" | jq -r '.path // ""')
-  thread_created=$(printf '%s' "$thread_json" | jq -r '.created // ""')
   thread_body=$(printf '%s' "$thread_json" | jq -r '.body // ""')
+  # NB: the original-finding timestamp (.created) is intentionally NOT used
+  # directly for the addressed-elsewhere check — that compares against the
+  # LATEST bot/reviewer comment via latest_nonagent_created (#565).
 
-  # 1. canonical-coverage
-  if path_matches_manifest "$thread_path"; then
+  # 0. honor an existing [mergepath-resolve: <class>] marker (#564, Codex
+  # P2 + CodeRabbit Major on #565). A prior resolve attempt — e.g. a
+  # deferred-to-followup that was tagged but whose resolve readback-failed,
+  # or a thread re-opened after tagging — leaves an agent-authored marker
+  # reply on the thread. That marker records an explicit classification
+  # decision and is preferred over the heuristic ladder below: without it,
+  # the rebuttal-recorded step (#3) mis-reads the marker reply itself (it is
+  # ≥30 chars and agent-authored) as a rebuttal. Mirrors
+  # daily-feedback-rollup-helpers.sh, which also prefers the recorded tag.
+  #
+  # STALENESS GUARD (CodeRabbit Major on #565): a marker is authoritative
+  # only as the agent's "last word". An ACTIONED marker followed by fresh
+  # non-agent (bot/reviewer) feedback is stale — honoring it would resolve a
+  # thread the bot just re-raised — so it is honored ONLY when it post-dates
+  # the most recent non-agent comment; otherwise it falls through to the
+  # ladder (which applies the same last-word rule to rebuttals). A SURFACE
+  # marker (nitpick-noted / deferred-to-followup) is honored regardless,
+  # because it only ever causes a skip — the fail-closed/safe outcome — even
+  # if later replies exist. Most-recent valid marker wins; an unrecognized
+  # class is ignored. `last_nonagent_idx` is reused by step 3.
+  local recorded_class="" rc_count rc_i rc_login rc_body rc_tag
+  local last_marker_idx=-1 last_nonagent_idx=-1
+  rc_count=$(printf '%s' "$thread_json" | jq '.all_comments | length' 2>/dev/null || echo 0)
+  rc_i=0
+  while [ "$rc_i" -lt "$rc_count" ]; do
+    rc_login=$(printf '%s' "$thread_json" | jq -r ".all_comments[$rc_i].author.login // \"\"")
+    if is_agent_author_local "$rc_login"; then
+      rc_body=$(printf '%s' "$thread_json" | jq -r ".all_comments[$rc_i].body // \"\"")
+      rc_tag=$(printf '%s' "$rc_body" \
+        | sed -n 's/.*\[mergepath-resolve:[[:space:]]*\([a-z][a-z-]*\)[[:space:]]*\].*/\1/p' | head -1)
+      if [ -n "$rc_tag" ]; then recorded_class="$rc_tag"; last_marker_idx=$rc_i; fi
+    else
+      last_nonagent_idx=$rc_i
+    fi
+    rc_i=$((rc_i + 1))
+  done
+  # Honor a recorded marker ONLY in the TAG path (default). The GATE path
+  # (--resolve-actioned / skip_routing) treats ANY marker as rationale only
+  # and falls through to re-derive fresh evidence below — so a stale marker
+  # (from an earlier deferral, a readback-failed resolve, or the older weak
+  # heuristic this patch replaces) can never resolve a thread without
+  # re-checking the fix commit / rebuttal against the latest comments. This
+  # closes the marker-staleness cluster on #565 (re-verify actioned markers;
+  # let later fixes override stale surface markers; don't let stale deferral
+  # tags mask later rebuttals). `last_nonagent_idx` is reused by step 3.
+  if [ -z "$skip_routing" ]; then
+    case "$recorded_class" in
+      addressed-elsewhere|rebuttal-recorded)
+        # Genuinely-actioned marker: honor only if it is the agent's last
+        # word, so a stale marker followed by fresh bot feedback cannot
+        # resolve a re-raised thread.
+        if [ "$last_marker_idx" -gt "$last_nonagent_idx" ]; then
+          echo "$recorded_class"
+          return
+        fi ;;
+      canonical-coverage|templated-render|nitpick-noted|deferred-to-followup)
+        # Routing / surface markers: honoring even a stale one only routes or
+        # skips (never a wrong resolve), so the TAG path honors it
+        # unconditionally to keep the recorded class flowing to the rollup.
+        echo "$recorded_class"
+        return ;;
+    esac
+  fi
+
+  # 1. canonical-coverage (routing — skipped in the GATE path so real action
+  # evidence on a canonical path is not masked, #565).
+  if [ -z "$skip_routing" ] && path_matches_manifest "$thread_path"; then
     echo "canonical-coverage"
     return
   fi
@@ -934,45 +1146,59 @@ derive_tag_class() {
   # the path predicate alone is the right signal: if a thread is
   # anchored on the templated dest, the durable fix is either in
   # mergepath's template or in the consumer's facts:* block.
-  if path_matches_templated_dest "$thread_path"; then
+  if [ -z "$skip_routing" ] && path_matches_templated_dest "$thread_path"; then
     echo "templated-render"
     return
   fi
 
-  # 2. addressed-elsewhere — agent-author commit on PR with
-  # authoredDate > createdAt AND (file in PR's changed-files OR
-  # changed-files unavailable). Per-file precision when we can get
-  # it; falls back to the rollup's per-PR weak heuristic when the
-  # files endpoint is unreachable.
+  # 2. addressed-elsewhere — an agent-authored commit that BOTH (a)
+  # post-dates the latest bot/reviewer comment (the #565 staleness guard)
+  # AND (b) actually TOUCHES the anchored file. Both are required.
+  #
+  # The earlier form gated on two independent PR-level facts — "the anchored
+  # file is in the PR's overall changed-file list" AND "some agent commit
+  # post-dates the re-raise" — which do not compose: an agent commit on an
+  # UNRELATED file could satisfy the date check while a stale/earlier commit
+  # was the only one touching the anchored file, so live feedback got
+  # resolved (nathanpayne-codex CHANGES_REQUESTED on #565). The PR /commits
+  # cache has no per-commit file list, so confirm per commit via
+  # commit_touches_file (cached). Fail closed: a commit whose files cannot
+  # be read does not qualify, and a pathless thread cannot be proven here.
   fetch_pr_tag_data
-  if [ -n "$thread_created" ] && [ -n "$PR_COMMITS_CACHE" ]; then
-    local file_match=false
-    if [ -n "$thread_path" ] && [ "$thread_path" != "(no path)" ]; then
-      if printf '%s' "$PR_FILES_CACHE" \
-         | jq -e --arg p "$thread_path" 'any(. == $p)' >/dev/null 2>&1; then
-        file_match=true
+  local last_nonagent_created
+  last_nonagent_created=$(latest_nonagent_created "$thread_json")
+  if [ -n "$last_nonagent_created" ] && [ -n "$PR_COMMITS_CACHE" ] \
+     && [ -n "$thread_path" ] && [ "$thread_path" != "(no path)" ]; then
+    # Cheap PR-level pre-filter: if the PR's overall changed-file list is
+    # known and does NOT include the anchored file, no commit touched it —
+    # skip the per-commit fetches. When the list is empty/unavailable we
+    # cannot pre-filter, so fall through to the authoritative per-commit
+    # check below (which is itself fail-closed).
+    local pr_touched_file=true
+    if [ -n "$PR_FILES_CACHE" ] && [ "$PR_FILES_CACHE" != "[]" ]; then
+      if ! printf '%s' "$PR_FILES_CACHE" \
+           | jq -e --arg p "$thread_path" 'any(. == $p)' >/dev/null 2>&1; then
+        pr_touched_file=false
       fi
     fi
-    # When PR_FILES_CACHE failed to populate (network error → '[]'),
-    # treat as match-any so we fall back to the per-PR heuristic
-    # rather than under-classifying.
-    if [ "$PR_FILES_CACHE" = "[]" ] || [ -z "$PR_FILES_CACHE" ]; then
-      file_match=true
-    fi
-    if $file_match; then
+    if $pr_touched_file; then
       local commit_count
       commit_count=$(printf '%s' "$PR_COMMITS_CACHE" | jq 'length' 2>/dev/null || echo 0)
       local i=0
       while [ "$i" -lt "$commit_count" ]; do
         local c_login
         local c_date
+        local c_sha
         c_login=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].login // \"\"")
         c_date=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].date // \"\"")
+        c_sha=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].sha // \"\"")
+        # Order matters: cheap date/identity checks short-circuit BEFORE the
+        # per-commit file fetch, so we only fetch files for an agent commit
+        # that post-dates the re-raise.
         if [ -n "$c_login" ] && [ -n "$c_date" ] \
-           && [ "$c_date" \> "$thread_created" ] \
-           && is_agent_author_local "$c_login"; then
-          # Short SHA on stdout would be nice — emit the class and
-          # let the caller render the SHA into the rationale.
+           && [ "$c_date" \> "$last_nonagent_created" ] \
+           && is_agent_author_local "$c_login" \
+           && commit_touches_file "$c_sha" "$thread_path"; then
           echo "addressed-elsewhere"
           return
         fi
@@ -986,12 +1212,26 @@ derive_tag_class() {
   local reply_count
   reply_count=$(printf '%s' "$thread_json" | jq '.all_comments | length' 2>/dev/null || echo 0)
   if [ "$reply_count" -gt 1 ]; then
-    local k=1
+    # Only replies AFTER the bot's most recent comment count (CodeRabbit
+    # Major on #565): a rebuttal that predates a later bot re-raise is stale
+    # and must not mark the thread actioned. last_nonagent_idx was computed
+    # in step 0. Start the scan just past the last non-agent comment (but at
+    # least index 1, to always skip the original finding at index 0).
+    local k=$((last_nonagent_idx + 1))
+    [ "$k" -lt 1 ] && k=1
     while [ "$k" -lt "$reply_count" ]; do
       local r_login
+      local r_body
       local r_body_len
       r_login=$(printf '%s' "$thread_json" | jq -r ".all_comments[$k].author.login // \"\"")
-      r_body_len=$(printf '%s' "$thread_json" | jq -r ".all_comments[$k].body // \"\" | length")
+      r_body=$(printf '%s' "$thread_json" | jq -r ".all_comments[$k].body // \"\"")
+      r_body_len=${#r_body}
+      # Skip our own [mergepath-resolve: ...] marker replies — a resolution
+      # marker is not a rebuttal (step 0 already honored a recognized one;
+      # this also covers an unrecognized-class marker). Codex P2 on #565.
+      case "$r_body" in
+        *"[mergepath-resolve:"*) k=$((k + 1)); continue ;;
+      esac
       if [ -n "$r_login" ] && [ "$r_body_len" -ge 30 ] && is_agent_author_local "$r_login"; then
         echo "rebuttal-recorded"
         return
@@ -1011,6 +1251,41 @@ derive_tag_class() {
   echo "deferred-to-followup"
 }
 
+# class_is_actioned <class> — exit 0 if the class is a DEMONSTRABLY-ACTIONED
+# class, 1 otherwise. This is the gate for --resolve-actioned (#564): only
+# resolve threads whose fix or accepted rebuttal is demonstrable from the
+# current PR state, leaving the rest unresolved so the weekly sweep keeps
+# surfacing them.
+#
+# Only two classes prove ACTION on this PR:
+#   addressed-elsewhere  an agent commit that touches the anchored file and
+#                        post-dates the latest re-raise (verified per-commit)
+#   rebuttal-recorded    a substantive agent rebuttal that post-dates the
+#                        latest re-raise on the thread
+#
+# This is intentionally STRICTER than (a subset of) the rollup's skip-set in
+# scripts/lib/daily-feedback-rollup-helpers.sh `tag_class_action`, which also
+# skips canonical-coverage and templated-render. Those are ROUTING classes —
+# derived from path/manifest membership alone, before any fix-commit or
+# rebuttal evidence. Routing tells you WHERE a durable fix belongs (upstream
+# in mergepath), NOT that one happened: a fresh, unfixed bot finding on a
+# canonical path (e.g. scripts/resolve-pr-threads.sh is itself canonical)
+# would classify as canonical-coverage. Treating that as actioned would
+# resolve live, unactioned feedback — the exact failure #564 guards against
+# (nathanpayne-codex P1 CHANGES_REQUESTED on #565). So routing classes are
+# EXCLUDED from the actioned gate; --auto-resolve-bots / the daily rollup
+# may still record canonical/templated context, but the actioned-only
+# resolver must not equate routing with action. Unknown classes are NOT
+# actioned — fail safe.
+class_is_actioned() {
+  case "$1" in
+    addressed-elsewhere|rebuttal-recorded)
+      return 0 ;;
+    *)
+      return 1 ;;
+  esac
+}
+
 # synth_rationale <class> <thread_json> → one-line free-form rationale
 # matching the class. Kept short (≤120 chars) so the reply stays
 # compact in the GitHub UI. The classifier reads only the tag in
@@ -1019,18 +1294,18 @@ synth_rationale() {
   local class="$1"
   local thread_json="$2"
   local thread_path
-  local thread_created
   thread_path=$(printf '%s' "$thread_json" | jq -r '.path // ""')
-  thread_created=$(printf '%s' "$thread_json" | jq -r '.created // ""')
   local short_sha=""
   case "$class" in
     addressed-elsewhere)
       # Surface the SHA of a commit that actually satisfies
-      # derive_tag_class's predicate (agent-authored AND
-      # authoredDate > thread_created). Re-run the same check here
-      # so the cited SHA matches the one that triggered the
-      # classification — otherwise we could cite a pre-thread
-      # commit that didn't qualify.
+      # derive_tag_class's predicate (agent-authored AND authoredDate >
+      # the latest bot/reviewer comment). Re-run the SAME check here — using
+      # the same last_nonagent_created floor (#565) — so the cited SHA
+      # matches the one that triggered the classification rather than a
+      # pre-thread or stale commit.
+      local last_nonagent_created
+      last_nonagent_created=$(latest_nonagent_created "$thread_json")
       local commit_count i
       commit_count=$(printf '%s' "$PR_COMMITS_CACHE" | jq 'length' 2>/dev/null || echo 0)
       i=0
@@ -1040,8 +1315,9 @@ synth_rationale() {
         c_date=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].date // \"\"")
         c_sha=$(printf '%s' "$PR_COMMITS_CACHE" | jq -r ".[$i].sha // \"\"")
         if [ -n "$c_login" ] && [ -n "$c_date" ] \
-           && { [ -z "$thread_created" ] || [ "$c_date" \> "$thread_created" ]; } \
-           && is_agent_author_local "$c_login"; then
+           && { [ -z "$last_nonagent_created" ] || [ "$c_date" \> "$last_nonagent_created" ]; } \
+           && is_agent_author_local "$c_login" \
+           && commit_touches_file "$c_sha" "$thread_path"; then
           short_sha="$c_sha"
           break
         fi
@@ -1096,8 +1372,11 @@ augment_pr_commits_with_sha() {
   if printf '%s' "$PR_COMMITS_CACHE" | jq -e '.[0].sha // empty' >/dev/null 2>&1; then
     return 0
   fi
+  # Same login fallback chain as fetch_pr_tag_data (#565 round 8):
+  # .commit.author.name before the (often-unlinked) email so agent-authored
+  # commits are recognized.
   PR_COMMITS_CACHE=$(gh_pat api "repos/$OWNER/$NAME/pulls/$PR_NUM/commits?per_page=100" \
-    --jq '[.[] | {sha: .sha, login: (.author.login // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]' 2>/dev/null || echo "$PR_COMMITS_CACHE")
+    --jq '[.[] | {sha: .sha, login: (.author.login // .commit.author.name // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]' 2>/dev/null || echo "$PR_COMMITS_CACHE")
 }
 
 # post_tag_reply — emit a `[mergepath-resolve: <class>] <rationale>`
@@ -1144,11 +1423,25 @@ post_tag_reply() {
 RESOLVED_COUNT=0
 SKIPPED_HUMAN=0
 SKIPPED_STALE=0
+# #564 --resolve-actioned: threads skipped because their derived class is
+# NOT demonstrably actioned (surface-set: nitpick-noted / deferred-to-
+# followup). Left unresolved on purpose so the weekly sweep still surfaces
+# them; counted so the exit code reflects that work remains.
+SKIPPED_NOT_ACTIONED=0
 WOULD_RESOLVE_COUNT=0
 FAILED_COUNT=0
 TAG_REPLY_POSTED=0
 TAG_REPLY_FAILED=0
 TAG_REPLY_SKIPPED=0
+# #564 — post-resolve readback. RESOLVED_IDS collects the GraphQL node IDs
+# of threads whose resolve mutation reported isResolved:true, so the
+# consolidated readback after the loop can re-read each and confirm the
+# state actually persisted. The loop runs in the parent shell (process
+# substitution below), so a plain array survives past it. READBACK_FAILED
+# counts threads that did NOT read back isResolved:true — a fail-closed
+# signal that forces a non-zero exit.
+RESOLVED_IDS=()
+READBACK_FAILED=0
 while IFS= read -r thread; do
   AUTHOR=$(echo "$thread" | jq -r .author)
   THREAD_ID=$(echo "$thread" | jq -r .id)
@@ -1163,11 +1456,20 @@ while IFS= read -r thread; do
     continue
   fi
 
-  # Current-HEAD check. The advertised contract is "resolve only when
-  # the latest comment is on the current HEAD" — a thread anchored to
-  # an older commit (or with no commit linkage at all) means the
-  # agent's most recent push hasn't been re-reviewed by the bot, so
-  # resolving it would force-clear an unaddressed finding.
+  # Current-HEAD check — applies to --auto-resolve-bots ONLY. The contract
+  # there is "resolve only when the latest comment is on the current HEAD":
+  # a thread anchored to an older commit means the agent's most recent push
+  # has not been re-reviewed by the bot, so resolving it would force-clear
+  # an unaddressed finding.
+  #
+  # --resolve-actioned BYPASSES this proxy (#565): pushing a fix commit
+  # advances HEAD while the bot's last comment still points at the previous
+  # commit, so this gate would skip a fixed-by-commit thread as "stale"
+  # before derive_tag_class could see the fix. Instead, --resolve-actioned
+  # relies on its stronger, direct evidence check (a fix commit touching the
+  # anchored file AFTER the latest bot/reviewer comment, or a rebuttal after
+  # the bot's last word) — so a later fix commit is recognized even when the
+  # bot has not re-commented on the new HEAD.
   #
   # Codex r1 on PR #172 caught that the previous check
   # `if [ -n "$COMMIT_OID" ] && [ "$COMMIT_OID" != "$HEAD_OID" ]`
@@ -1175,7 +1477,8 @@ while IFS= read -r thread; do
   # commit linkage in the GraphQL response would be force-resolved
   # silently. The safe default is the opposite: missing oid is
   # treated as stale.
-  if [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ] || [ "$COMMIT_OID" != "$HEAD_OID" ]; then
+  if [ "$MODE" != "resolve-actioned" ] \
+     && { [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ] || [ "$COMMIT_OID" != "$HEAD_OID" ]; }; then
     if [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ]; then
       reason="no commit linkage"
     else
@@ -1185,6 +1488,35 @@ while IFS= read -r thread; do
     echo "    Push a fix commit (or rebuttal reply) to re-trigger the bot, then retry."
     SKIPPED_STALE=$((SKIPPED_STALE + 1))
     continue
+  fi
+
+  # #564 --resolve-actioned: gate the resolve on demonstrable action.
+  # Derive the thread's class BEFORE the dry-run / tag steps, but ONLY in
+  # resolve-actioned mode — auto-resolve-bots keeps its existing behavior
+  # (resolve every current-HEAD bot thread to clear the conversation gate;
+  # the daily rollup re-surfaces deferrals), and in particular must NOT
+  # make tag-data API calls on a --dry-run. Threads whose class is not in
+  # the actioned skip-set are left unresolved so the weekly sweep keeps
+  # surfacing them.
+  thread_class=""
+  thread_class_computed=false
+  if [ "$MODE" = "resolve-actioned" ]; then
+    fetch_pr_tag_data
+    augment_pr_commits_with_sha
+    # GATE path: classify with routing skipped, so a canonical/templated
+    # thread that was actually fixed/rebutted resolves on its action
+    # evidence, while a fresh routing-only finding still falls through to a
+    # non-actioned class and is left for the sweep (#565).
+    thread_class=$(derive_tag_class "$thread" skip-routing)
+    thread_class_computed=true
+    if ! class_is_actioned "$thread_class"; then
+      echo "  SKIP (not demonstrably actioned: $thread_class): [$AUTHOR] $PATH_"
+      echo "    $EXCERPT"
+      echo "    Left unresolved so the weekly sweep still surfaces it. Fix or"
+      echo "    rebut the finding, or defer it via --auto-resolve-bots --rationale."
+      SKIPPED_NOT_ACTIONED=$((SKIPPED_NOT_ACTIONED + 1))
+      continue
+    fi
   fi
 
   if $DRY_RUN; then
@@ -1222,13 +1554,21 @@ while IFS= read -r thread; do
       # fixture. Calling here also fulfills the "one-shot cache reused
       # across threads" intention — fetch_pr_tag_data's TAG_DATA_FETCHED
       # short-circuit only works if it's set in the loop's shell.
-      fetch_pr_tag_data
-      # Need the augmented commits cache (with .sha) for the
-      # addressed-elsewhere rationale; the bare cache from
-      # fetch_pr_tag_data doesn't carry .sha. derive_tag_class only
-      # needs login + date so it runs against either shape.
-      augment_pr_commits_with_sha
-      tag_class=$(derive_tag_class "$thread")
+      #
+      # #564: resolve-actioned mode already derived the class (and warmed
+      # the caches) above — reuse it so derive_tag_class / synth_rationale
+      # run at most once per thread.
+      if ! $thread_class_computed; then
+        fetch_pr_tag_data
+        # Need the augmented commits cache (with .sha) for the
+        # addressed-elsewhere rationale; the bare cache from
+        # fetch_pr_tag_data doesn't carry .sha. derive_tag_class only
+        # needs login + date so it runs against either shape.
+        augment_pr_commits_with_sha
+        thread_class=$(derive_tag_class "$thread")
+        thread_class_computed=true
+      fi
+      tag_class="$thread_class"
       tag_rationale=$(synth_rationale "$tag_class" "$thread")
     fi
     if post_tag_reply "$THREAD_ID" "$tag_class" "$tag_rationale"; then
@@ -1244,24 +1584,36 @@ while IFS= read -r thread; do
 
   # Identity check moved out of the loop in #293 r2 — see the
   # single-gate block above the loop.
-  if gh_pat api graphql -f query='
+  #
+  # #564: capture the mutation's returned `thread.isResolved` rather than
+  # discarding the response. A mutation that returns HTTP 200 but
+  # isResolved!=true did NOT actually resolve the thread, so it must count
+  # as FAILED, not RESOLVED. Threads confirmed true here are collected into
+  # RESOLVED_IDS for the consolidated reviewThreads readback after the loop.
+  resolve_state=""
+  if mutation_out=$(gh_pat api graphql -f query='
     mutation($id: ID!) {
       resolveReviewThread(input: {threadId: $id}) {
         thread { isResolved }
       }
     }
-  ' -F id="$THREAD_ID" >/dev/null 2>&1; then
+  ' -F id="$THREAD_ID" 2>/dev/null); then
+    resolve_state=$(printf '%s' "$mutation_out" \
+      | jq -r '.data.resolveReviewThread.thread.isResolved' 2>/dev/null || echo "")
+  fi
+  if [ "$resolve_state" = "true" ]; then
     echo "  RESOLVED [$AUTHOR] $PATH_"
     RESOLVED_COUNT=$((RESOLVED_COUNT + 1))
+    RESOLVED_IDS+=("$THREAD_ID")
   else
-    echo "  FAILED [$AUTHOR] $PATH_ — mutation rejected" >&2
+    echo "  FAILED [$AUTHOR] $PATH_ — mutation rejected (returned isResolved=${resolve_state:-none})" >&2
     FAILED_COUNT=$((FAILED_COUNT + 1))
   fi
 done < <(printf '%s\n' "$UNRESOLVED")
 
 echo ""
 if $DRY_RUN; then
-  echo "(dry-run; no threads modified) — would-resolve: $WOULD_RESOLVE_COUNT, skipped (human): $SKIPPED_HUMAN, skipped (stale-HEAD): $SKIPPED_STALE"
+  echo "(dry-run; no threads modified) — would-resolve: $WOULD_RESOLVE_COUNT, skipped (human): $SKIPPED_HUMAN, skipped (stale-HEAD): $SKIPPED_STALE, skipped (not-actioned): $SKIPPED_NOT_ACTIONED"
   # Codex r2 on PR #172: dry-run previously exited 0 when only
   # current-HEAD bot threads remained (because dry-run does not mutate
   # them and they didn't increment SKIPPED_*). Callers would treat
@@ -1270,23 +1622,91 @@ if $DRY_RUN; then
   # human-skipped, or stale-skipped). The only exit-0 path through
   # auto-resolve-bots --dry-run is "no unresolved threads at all"
   # which is already short-circuited above (UNRESOLVED is empty).
-  if [ "$WOULD_RESOLVE_COUNT" -gt 0 ] || [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ]; then
+  if [ "$WOULD_RESOLVE_COUNT" -gt 0 ] || [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ]; then
     exit 3
   fi
   exit 0
 fi
-echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Failed: $FAILED_COUNT"
+
+# --- post-resolve readback (#564) ------------------------------------------
+# Acceptance criterion: "Actioned review feedback is resolved through an
+# identity-checked resolveReviewThread path before merge, with a follow-up
+# reviewThreads readback confirming isResolved: true." The per-thread
+# mutation return value is checked in the loop above; this is the SEPARATE
+# confirming read. We re-read each just-resolved thread via the top-level
+# `nodes(ids:)` lookup — O(resolved), no pagination, and it reads back
+# exactly the set we mutated (and is syntactically distinct from the
+# enumeration `reviewThreads` query).
+#
+# Fail CLOSED: any thread that does not read back isResolved:true (state
+# drift, eventual-consistency lag, an id that no longer resolves, or a
+# token that could write but a later read that cannot) increments
+# READBACK_FAILED and forces a non-zero exit, so a caller never treats an
+# unconfirmed resolve as a clean conversation-resolution gate. A readback
+# that confirms nothing is never treated as "all good".
+#
+# `nodes(ids:)` caps at 100 nodes per query, so batch — a single PR run
+# resolving >100 threads is vanishingly rare, but the batch loop keeps the
+# confirmation complete if it ever happens.
+if [ "${#RESOLVED_IDS[@]}" -gt 0 ]; then
+  rb_total=${#RESOLVED_IDS[@]}
+  rb_start=0
+  while [ "$rb_start" -lt "$rb_total" ]; do
+    rb_batch=("${RESOLVED_IDS[@]:$rb_start:100}")
+    rb_start=$((rb_start + 100))
+    # Build the GraphQL ID-array literal by JSON-encoding the ids. GitHub
+    # node IDs are documented as OPAQUE, so do not assume a charset or parse
+    # them — JSON encoding (jq) escapes any content correctly, making the
+    # inlined literal injection-safe for any id without a charset whitelist
+    # (CodeRabbit on #565). A JSON string array is also a valid GraphQL
+    # list-of-strings literal. Empty / drifted ids simply fail the per-id
+    # readback below (fail closed).
+    rb_ids_json=$(printf '%s\n' "${rb_batch[@]}" | jq -R . | jq -s -c .)
+    rb_query="query { nodes(ids: ${rb_ids_json}) { ... on PullRequestReviewThread { id isResolved } } }"
+    if ! rb_resp=$(gh_pat api graphql -f query="$rb_query" 2>&1); then
+      echo "  READBACK FAILED: reviewThreads readback query errored: $rb_resp" >&2
+      # Fail closed — count every id in this batch as unconfirmed.
+      for rb_id in "${rb_batch[@]}"; do READBACK_FAILED=$((READBACK_FAILED + 1)); done
+      continue
+    fi
+    for rb_id in "${rb_batch[@]}"; do
+      rb_state=$(printf '%s' "$rb_resp" \
+        | jq -r --arg id "$rb_id" \
+            '(.data.nodes // []) | map(select(.id == $id)) | .[0].isResolved
+             | if . == null then "missing" else tostring end' 2>/dev/null \
+        || echo "missing")
+      if [ "$rb_state" != "true" ]; then
+        echo "  READBACK FAILED [$rb_id]: isResolved=$rb_state (expected true)" >&2
+        READBACK_FAILED=$((READBACK_FAILED + 1))
+      fi
+    done
+  done
+  if [ "$READBACK_FAILED" -gt 0 ]; then
+    echo "Readback: $READBACK_FAILED of $rb_total resolved thread(s) did NOT confirm isResolved:true — failing closed." >&2
+  else
+    echo "Readback: all $rb_total resolved thread(s) confirmed isResolved:true."
+  fi
+fi
+
+echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Skipped (not-actioned): $SKIPPED_NOT_ACTIONED  Failed: $FAILED_COUNT  Readback-failed: $READBACK_FAILED"
 if ! $NO_TAG_REPLY; then
   echo "Tag replies: posted=$TAG_REPLY_POSTED  failed=$TAG_REPLY_FAILED"
 fi
 # Codex r1 on PR #172: previously this exited 0 even with stale or
 # human-authored threads remaining — callers would treat it as "all
 # clear" and proceed to merge into a still-BLOCKED PR. Exit codes:
-#   2 = mutation failure (transient: gh/network)
+#   2 = mutation failure (transient: gh/network), a resolve mutation that
+#       did not return isResolved:true, OR a post-resolve readback that
+#       could not confirm isResolved:true (#564 — fail closed)
 #   3 = unresolved threads remain (human or stale-bot) — PR still
 #       conversation-resolution-blocked; address and retry
 #   0 = no unresolved threads on current HEAD
-[ "$FAILED_COUNT" -gt 0 ] && exit 2
+# Explicit `if` (not `[ a ] && exit`): two OR-ed conditions, and an
+# `&& exit` chain would be ambiguous under set -e (see the SKIPPED block
+# below). A readback failure is as fail-closed as a mutation failure.
+if [ "$FAILED_COUNT" -gt 0 ] || [ "$READBACK_FAILED" -gt 0 ]; then
+  exit 2
+fi
 # Use an explicit `if`, not `[ a ] || [ b ] && exit 3`. In that
 # one-liner `&&` and `||` are equal-precedence and left-associative,
 # so it parses as `([ a ] || [ b ]) && exit 3` — and under
@@ -1295,7 +1715,7 @@ fi
 # non-zero; whether that trips `set -e` depends on subtle list-tail
 # rules. The `if` form is unambiguous and matches the block above.
 # (CodeRabbit Major, #271/#272.)
-if [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ]; then
+if [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ]; then
   exit 3
 fi
 exit 0

@@ -213,6 +213,14 @@ UTC. It enumerates UNRESOLVED review threads on closed PRs across the org
 gate AND remained unresolved through the daily rollup's 24h window —
 typically because the resolving agent's day rolled over before triage.
 
+The sweep keys purely on GitHub review-thread state (`isResolved == false
+&& isOutdated == false`), so a finding that was fixed during the PR but
+whose thread was left open re-surfaces here as if it were unactioned.
+Resolving actioned threads during the PR — `scripts/resolve-pr-threads.sh
+<PR#> --resolve-actioned`, which resolves only demonstrably-actioned
+threads and confirms each with an `isResolved: true` readback — keeps this
+backlog focused on feedback that still needs attention (#564).
+
 See `scripts/sweep-unresolved-feedback/enumerate.sh` +
 `scripts/sweep-unresolved-feedback/render.sh`.
 

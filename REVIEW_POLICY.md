@@ -412,9 +412,34 @@ that can change GitHub conversation state.
    this review-thread state; `gh pr checks`, issue comments, and pull
    request review comments alone are not sufficient readback.
 3. For bot-authored current-head threads only, if the finding has
-   already been fixed or rebutted on-thread, use
-   `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots`, then
-   query `reviewThreads` again. For stale bot-authored threads whose
+   already been fixed or rebutted on-thread, resolve it. **Fixing review
+   feedback includes resolving the associated review thread, not just
+   pushing a code commit** — a fix that leaves its thread open still
+   blocks the conversation-resolution gate and still surfaces in the
+   weekly unresolved-feedback sweep. Two resolve paths:
+   - `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` resolves
+     **only** threads whose fix or rebuttal is demonstrable from the
+     current PR state — `addressed-elsewhere` (an agent commit touching the
+     anchored file, after the latest re-raise) or `rebuttal-recorded` (a
+     substantive agent rebuttal after the latest re-raise). Routing-only
+     classes (`canonical-coverage`, `templated-render`) are deliberately
+     **not** treated as actioned here: they indicate where a durable fix
+     belongs, not that one happened, so a fresh finding on a canonical path
+     is left unresolved rather than auto-resolved by routing alone. The gate
+     evaluates action **independently of routing**, so a canonical/templated
+     thread that *does* carry action evidence (a fix commit touching it, or
+     a rebuttal) is still resolved. Every non-actioned thread is left for the
+     weekly sweep. Prefer this to mark genuinely-handled feedback resolved.
+   - `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots` resolves
+     **every** current-HEAD bot thread, which is what clears the
+     `required_conversation_resolution` gate to merge; it tags each
+     deferral with `[mergepath-resolve:<class>]` so the daily rollup
+     re-surfaces it.
+
+   Either path runs an identity-checked `resolveReviewThread` followed by
+   a `reviewThreads`/`nodes(ids:)` readback confirming `isResolved: true`,
+   and exits non-zero (fail closed) if any resolve cannot be confirmed.
+   Then query `reviewThreads` again. For stale bot-authored threads whose
    finding was fixed by a later commit, use the identity-checked
    `resolveReviewThread` path directly. If the resolution is not
    demonstrable from the current HEAD or on-thread rebuttal, request a
@@ -907,6 +932,8 @@ The GitHub GraphQL `resolveReviewThread` mutation may be used by agents **only**
   current HEAD, or posted an on-thread acknowledgment.
 
 It is the clean-up mechanism used by the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate) for the `required_conversation_resolution: true` branch-protection gate, NOT a policy override. It does not authorize removing blocking labels, bypassing required reviews, or merging past unaddressed findings. **If the thread author is a real human (not a bot and not a registered agent-reviewer identity), agents must not call this mutation regardless of state.**
+
+Every `resolveReviewThread` call must be **confirmed by a follow-up readback**: re-read the thread (via `reviewThreads` or the top-level `nodes(ids:)` lookup) and verify it reports `isResolved: true`. A mutation that returns success but does not read back resolved (state drift, eventual-consistency lag, or a token that could write but a later read that cannot) must be treated as a failure — **never infer a thread is resolved from an unconfirmed write** (fail closed). `scripts/resolve-pr-threads.sh` does this automatically: after resolving, it reads back every thread it resolved and exits non-zero if any does not confirm `isResolved: true`.
 
 ## Review Policy Configuration
 
