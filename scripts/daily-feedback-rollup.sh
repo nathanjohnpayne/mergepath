@@ -357,20 +357,18 @@ while [ "$i" -lt "$pr_count" ]; do
     done
 
     if [ -n "$tag_class" ]; then
-      case "$tag_class" in
-        addressed-elsewhere|canonical-coverage|rebuttal-recorded)
-          COUNT_TAGGED_SKIP=$((COUNT_TAGGED_SKIP + 1))
-          continue
-          ;;
-        nitpick-noted|deferred-to-followup)
-          COUNT_TAGGED_SURFACE=$((COUNT_TAGGED_SURFACE + 1))
-          # Fall through to severity-routing below.
-          ;;
-        *)
-          # Unknown tag class → surface as substantive per spec.
-          COUNT_TAGGED_SURFACE=$((COUNT_TAGGED_SURFACE + 1))
-          ;;
-      esac
+      # Single-source the skip/surface decision through tag_class_action
+      # (scripts/lib/daily-feedback-rollup-helpers.sh) so this path cannot
+      # drift from the canonical taxonomy — the drift that previously omitted
+      # templated-render here and re-filed routed templated threads as
+      # deferred (#568, Codex P2 on #565). Unknown classes map to surface.
+      if [ "$(tag_class_action "$tag_class")" = "skip" ]; then
+        COUNT_TAGGED_SKIP=$((COUNT_TAGGED_SKIP + 1))
+        continue
+      else
+        # surface (incl. unknown) → fall through to severity-routing below.
+        COUNT_TAGGED_SURFACE=$((COUNT_TAGGED_SURFACE + 1))
+      fi
     else
       # Heuristic 2: addressed-via-fix — any agent-author commit on
       # the PR with authoredDate > comment.createdAt. The spec's

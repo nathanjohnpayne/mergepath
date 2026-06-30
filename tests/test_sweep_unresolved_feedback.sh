@@ -741,6 +741,93 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 12 (#564): actioned threads marked isResolved:true are EXCLUDED from
+# the backlog. This is the explicit regression for the unresolved-feedback
+# sweep contract behind #564 — when a finding is fixed/rebutted during the
+# PR process and the review thread is resolved (isResolved:true), the weekly
+# sweep MUST NOT re-surface it (that is the noise #562 exhibited). Mixed
+# fixture on a fresh repo: one resolved/actioned thread carrying a
+# [mergepath-resolve: ...] marker + one still-open thread; only the open one
+# may appear. Test 1 covers this implicitly via its surviving-id set; this
+# names the contract directly so a future filter change can't quietly
+# re-admit resolved threads.
+# ---------------------------------------------------------------------------
+cat >"$STUB_FIXTURES/pr-list-owner_delta.json" <<'JSON'
+[
+  {"number": 5, "title": "Actioned + open mix", "url": "https://github.com/owner/delta/pull/5"}
+]
+JSON
+
+cat >"$STUB_FIXTURES/threads-owner_delta_5.json" <<'JSON'
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "totalCount": 2,
+          "pageInfo": {"hasNextPage": false, "endCursor": null},
+          "nodes": [
+            {
+              "id": "PRT_delta_5_actioned",
+              "isResolved": true,
+              "isOutdated": false,
+              "comments": {"nodes": [{
+                "author": {"login": "coderabbitai[bot]"},
+                "body": "P1 - Potential issue: fixed during the PR. [mergepath-resolve: addressed-elsewhere] addressed by commit abc1234.",
+                "url": "https://github.com/owner/delta/pull/5#discussion_r5001"
+              }]}
+            },
+            {
+              "id": "PRT_delta_5_open",
+              "isResolved": false,
+              "isOutdated": false,
+              "comments": {"nodes": [{
+                "author": {"login": "coderabbitai[bot]"},
+                "body": "P1 - Potential issue: still needs attention.",
+                "url": "https://github.com/owner/delta/pull/5#discussion_r5002"
+              }]}
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+JSON
+
+DELTA_TARGETS="$WORKDIR/targets-delta.txt"
+printf '%s\n' "owner/delta" >"$DELTA_TARGETS"
+DELTA_NDJSON="$WORKDIR/findings-delta.ndjson"
+: > "$GH_CALLS_LOG"
+
+set +e
+PATH="$STUB_DIR:$PATH" \
+GH_TOKEN="dummy-pat" \
+STUB_FIXTURES="$STUB_FIXTURES" \
+GH_CALLS_LOG="$GH_CALLS_LOG" \
+SWEEP_OUTPUT="$DELTA_NDJSON" \
+  "$ENUMERATE" "$DELTA_TARGETS" 2>"$WORKDIR/enum-delta.stderr"
+rc=$?
+set -e
+
+DELTA_IDS=$(jq -r '.thread_id' "$DELTA_NDJSON" 2>/dev/null | sort | tr '\n' ' ')
+if [ "$rc" -eq 0 ] && [ "$DELTA_IDS" = "PRT_delta_5_open " ]; then
+  pass "enumerate: actioned isResolved:true thread excluded; only the open thread surfaces (#564)"
+else
+  fail "enumerate: #564 exclusion failed — expected only PRT_delta_5_open, got [$DELTA_IDS] (rc=$rc)"
+  cat "$DELTA_NDJSON" >&2 2>/dev/null || true
+  cat "$WORKDIR/enum-delta.stderr" >&2 2>/dev/null || true
+fi
+
+# Belt-and-suspenders: the resolved thread_id must NOT appear anywhere in
+# the emitted NDJSON.
+if grep -q 'PRT_delta_5_actioned' "$DELTA_NDJSON" 2>/dev/null; then
+  fail "enumerate: resolved/actioned thread leaked into the backlog (#564)"
+else
+  pass "enumerate: resolved/actioned thread_id absent from NDJSON (#564)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
