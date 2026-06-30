@@ -103,7 +103,14 @@ if [ -n "$ONLY_REPO" ]; then
   ENUM_TARGETS="$WORK/targets.txt"
 else
   [ -f "$TARGETS_FILE" ] || { echo "backfill: targets file not found: $TARGETS_FILE" >&2; exit 1; }
-  ENUM_TARGETS="$TARGETS_FILE"
+  # Normalize into a temp copy with a guaranteed trailing newline. A targets
+  # file whose FINAL entry lacks a newline would otherwise be silently dropped
+  # by the `while read` loops here AND in enumerate.sh (read returns non-zero on
+  # an EOF-terminated last line), turning an invalid/unscanned final target into
+  # a false empty drain (CodeRabbit + Codex Phase-4b r4 on #571). An already
+  # newline-terminated file just gains a harmless trailing blank line (skipped).
+  ENUM_TARGETS="$WORK/targets.txt"
+  { cat "$TARGETS_FILE"; printf '\n'; } > "$ENUM_TARGETS"
 fi
 
 # Verify every target repo RESOLVES with the current token before draining.
@@ -113,7 +120,9 @@ fi
 # explicitly with `gh repo view` and fail closed; this distinguishes a real
 # repo with zero findings from an unresolvable target (Codex Phase-4b r2 on
 # #571 — the enumerate WARN path does NOT fire on this empty-success case).
-while IFS= read -r _trepo; do
+# `|| [ -n "$_trepo" ]` keeps the final line even if the normalize above is ever
+# bypassed (defense-in-depth for the no-trailing-newline drop, #571 r4).
+while IFS= read -r _trepo || [ -n "$_trepo" ]; do
   _trepo=$(printf '%s' "$_trepo" | sed -E 's/[[:space:]]+$//')
   case "$_trepo" in ''|\#*) continue ;; esac
   if ! gh repo view "$_trepo" --json nameWithOwner >/dev/null 2>&1; then

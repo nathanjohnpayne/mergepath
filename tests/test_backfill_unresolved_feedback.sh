@@ -266,6 +266,24 @@ else
   fail=$((fail+1)); echo "FAIL: >100-threads truncation should fail closed (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
+# ── Test 12: a positional targets FILE whose final entry has NO trailing
+#    newline is not silently dropped — backfill normalizes it, validates the
+#    entry, and fails closed on the invalid repo instead of a false empty drain
+#    (CodeRabbit + Codex Phase-4b r4 on #571: `while read` drops a no-newline
+#    last line).
+NL_TARGETS="$SCRATCH/no-newline-targets.txt"
+printf 'owner/alpha' > "$NL_TARGETS"   # deliberately NO trailing newline
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" STUB_GH_REPO_VIEW_FAIL=1 STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" "$NL_TARGETS" 2>&1)
+RC=$?
+set -e
+if [ "$RC" -ne 0 ] && grep -qi 'not resolvable' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: no-trailing-newline targets file — final entry validated, fails closed (not dropped)"
+else
+  fail=$((fail+1)); echo "FAIL: no-newline targets final entry should not be dropped (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_backfill_unresolved_feedback: PASS ($pass tests)"; exit 0
