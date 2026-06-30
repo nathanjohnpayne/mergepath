@@ -524,12 +524,12 @@ issue, can satisfy the Phase 4a signal.
      - **Codex posts a summary issue comment** — "Codex Review: …" with a `Reviewed commit: <sha>` line — on the PR conversation (`issues/{pr}/comments`), NOT a review object. When that sha equals the current HEAD and there are no unaddressed P0/P1 inline findings on HEAD, the verdict is a clearance signal too. Check issue comments, not only review objects and reactions: Codex routes its verdict here, so a `pulls/{pr}/reviews`-only check can miss a completed re-review (#567). NB: the automated merge gate `scripts/codex-review-check.sh` currently recognizes only review objects + 👍 reactions for gate (c); extending it to honor the HEAD-anchored issue-comment verdict is tracked in #567, so until then do not treat an issue-comment-only Codex clearance as sufficient for the *automated* gate — a 👍 / review object or a Phase 4b substitute still carries gate (c).
      - **Timeout.** No review and no reaction within `codex.review_timeout_seconds` (default: 600s / 10 min). The script exits with code `4` (`FALLBACK_REQUIRED`).
 
-13a. If Codex posted inline findings, the agent addresses each P0/P1 by either:
+13a. If Codex posted inline findings, the agent dispositions each finding in a **`required`** tier by either:
 
      - **Fixing the code** and pushing a new commit to the same branch, or
      - **Replying on the finding thread** with a clear rebuttal explaining why the finding does not apply (for false positives or scope disagreements).
 
-     P2 and P3 findings are addressed at the agent's judgment — not every cosmetic or nit-level finding needs a fix or a rebuttal.
+     Which tiers are `required` is governed by `feedback_policy` in `.github/review-policy.yml` — see [§ Feedback Disposition Policy](#feedback-disposition-policy). The **default**, and the behavior when the block is absent, is **P0/P1 required** (as above) and **P2/P3 discretionary** — addressed at the agent's judgment, so not every cosmetic or nit-level finding needs a fix or a rebuttal. A repo may mark additional tiers `required`, or set `mode: address-all` so that **every** finding must be fixed or rebutted before merge. The same tier policy applies to CodeRabbit findings (Phase 2.5), mapped onto the shared ladder.
 
 13a-bis. **Record the feedback reaction (#487).** Every Codex finding ends with a solicitation: *"Useful? React with 👍 / 👎."* After adjudicating a finding, the agent answers that prompt with a **validated** reaction via `scripts/codex-record-feedback.sh <PR#> --findings-json <request-script-json> --verdict <comment_id>=<verdict>[:<reason>]`:
 
@@ -756,6 +756,83 @@ When you pull this template change into an existing repo, the new `phase_4b_defa
   └──────────────────────────┘  │                            │
                                 └────────────────────────────┘
 ```
+
+## Feedback Disposition Policy
+
+The `feedback_policy` block in `.github/review-policy.yml` controls **which
+bot-review findings the authoring agent must disposition before merge**. A
+*disposition* is one of: **fix** the code, **or** post a **rebuttal** reply
+explaining why the finding does not apply — and then **resolve the thread**.
+It governs disposition *requirements* only; it does not change who reviews or
+the external-review threshold.
+
+### Normalized severity ladder
+
+Both reviewers are mapped onto one ladder so a single policy covers them:
+
+| Tier | Meaning | Codex (exact) | CodeRabbit (heuristic) |
+|------|---------|---------------|------------------------|
+| `p0` | critical / blocker | `![P0 Badge]` / `**P0` | `⚠️` + `Critical`, `Security` |
+| `p1` | high / blocking | `![P1 Badge]` / `**P1` | `⚠️ Potential issue` / `⚠️` + `Major` |
+| `p2` | minor | `![P2 Badge]` / `**P2` | `⚠️` + `Minor`, `🛠️ Refactor suggestion` |
+| `p3` | cosmetic / trivial | `![P3 Badge]` / `**P3` | — |
+| `nitpick` | style / nit | `![P3 Badge]` (alias) | `🧹 Nitpick` |
+
+Codex emits an explicit machine-readable badge per finding; CodeRabbit has no
+numeric scale, so its tier is derived heuristically (category + a
+`Critical`/`Major`/`Minor` qualifier) by `coderabbit_tier_of` in
+`scripts/lib/feedback-policy-helpers.sh`.
+
+### Schema
+
+```yaml
+feedback_policy:
+  mode: by-priority        # by-priority | address-all
+  priorities:              # consulted only when mode: by-priority
+    p0: required           # required | discretionary | ignore
+    p1: required
+    p2: discretionary
+    p3: discretionary
+    nitpick: discretionary
+```
+
+- **`mode: by-priority`** (default) — each tier is independently `required`
+  (must fix-or-rebut + resolve; merge-blocking), `discretionary` (agent's
+  judgment; never blocks), or `ignore` (never surfaced).
+- **`mode: address-all`** — every finding at every tier is `required`; the
+  `priorities:` map is ignored. This is "address or rebut all feedback."
+
+### Defaults & backward compatibility
+
+An **absent** `feedback_policy` block reproduces today's behavior exactly:
+disposition defaults of **P0/P1 required, P2/P3 discretionary**, and the merge
+gates enforce **P1 only**. The default lives in the parser
+(`resolve_required_tiers`), not just in this file, because
+`.github/review-policy.yml` is not synced to consumers — the same
+default-on-absent posture as `phase_4b_default` and `propagation_prs`.
+
+### Enforcement (two symmetric gates)
+
+The blocking tier set resolved from this block is enforced by two
+required-check gates that share `scripts/lib/feedback-policy-helpers.sh`:
+
+- **Codex** — `scripts/codex-p1-gate.sh` (required check `Codex P1 Gate /
+  Codex P1 unresolved threads`), gated by `codex.p1_gate.enabled`.
+- **CodeRabbit** — `scripts/coderabbit-severity-gate.sh` (required check
+  `CodeRabbit Severity Gate / CodeRabbit unresolved blocking findings`), gated
+  by `coderabbit.severity_gate.enabled`.
+
+> **Rollout note (#574).** Sub-issue #576 ships the schema above and the
+> shared parser/classifier library **only** — it changes no enforcement.
+> Generalizing `codex-p1-gate.sh` beyond P1 and adding
+> `coderabbit-severity-gate.sh` (so `required` tiers actually block) lands in
+> sub-issue #577. Until then, `feedback_policy` is documentary and the gates
+> behave as before (Codex P1 only).
+
+> **CodeRabbit profile dependency.** `nitpick: required` only has teeth when
+> `.coderabbit.yml` uses `reviews.profile: assertive`; the shipped `chill`
+> profile suppresses the 🧹 Nitpick category entirely, so the requirement is a
+> no-op there. See [`docs/agents/coderabbit-audit.md`](docs/agents/coderabbit-audit.md).
 
 ## Handoff Message Format
 
