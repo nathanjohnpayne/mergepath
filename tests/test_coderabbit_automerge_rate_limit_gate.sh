@@ -53,6 +53,18 @@ assert_rc "full rate_limit_stalled payload, engaged + above-threshold → procee
 assert_rc "full payload, engaged + under-threshold → block" 1 \
   '{"pr_number":1,"status":"rate_limit_stalled","rate_limit_retries":2,"codex_failover_requested":true,"waited_seconds":120}' false
 
+# --- status gate (#554 fix 1): wrong/absent status blocks even with failover=true ---
+assert_rc "status=cleared + failover=true + above-threshold → block (only rate_limit_stalled ok)" 1 \
+  '{"status":"cleared","codex_failover_requested":true}' true
+assert_rc "status=timeout + failover=true + above-threshold → block" 1 \
+  '{"status":"timeout","codex_failover_requested":true}' true
+assert_rc "absent status field + failover=true + above-threshold → block" 1 \
+  '{"codex_failover_requested":true}' true
+
+# --- boolean precision (#554 fix 1): string "true" must not satisfy the gate ---
+assert_rc "codex_failover_requested as string-true + rate_limit_stalled → block (must be JSON boolean)" 1 \
+  '{"status":"rate_limit_stalled","codex_failover_requested":"true"}' true
+
 echo "----"
 echo "test_coderabbit_automerge_rate_limit_gate: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

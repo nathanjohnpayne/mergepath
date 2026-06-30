@@ -317,7 +317,7 @@ while IFS= read -r f; do
 
   # Extract candidate references: tests/test_<name>.sh and
   # scripts/<path>.{sh,cjs,js}. sort -u dedupes within a file.
-  refs=$(grep -oE '(tests/test_[A-Za-z0-9_-]+\.sh|scripts/[A-Za-z0-9_./-]+\.(sh|cjs|js))' "$f" | sort -u || true)
+  refs=$(grep -oE '(tests/[A-Za-z0-9_./-]+\.(sh|cjs|js)|scripts/[A-Za-z0-9_./-]+\.(sh|cjs|js))' "$f" | sort -u || true)
 
   while IFS= read -r ref; do
     [ -z "$ref" ] && continue

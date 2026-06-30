@@ -782,10 +782,12 @@ else
   fail "expected check FAIL on drifted job name (#533); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 
-# Case C (positive control): a correctly-named JOB satisfies the assertion.
-# The check proceeds past the workflow-shape pre-flight (and runs its own
-# fixture suite). We only assert the job-name assertion does NOT fire — i.e.
-# the check does not emit the job-name FAIL line and exits clean.
+# Case C (positive control): a correctly-named JOB satisfies the job-name
+# assertion. We only assert the job-name FAIL line was NOT emitted — we do
+# not assert RC=0 here because the check also runs its own fixture suite,
+# and a pre-existing unrelated failure there would couple this test to the
+# state of unrelated fixtures (#556). The job-name assertion is structural;
+# the RC of the nested fixture run is a separate concern.
 WF_OK="$WORKDIR/wf-ok.yml"
 {
   write_wf_header
@@ -802,7 +804,8 @@ set +e
 OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$WF_OK" "$CHECK_BIN" 2>&1)
 RC=$?
 set -e
-if [ "$RC" -eq 0 ] && ! echo "$OUT" | grep -q "must define a JOB named"; then
+if ! echo "$OUT" | grep -q "must define a JOB named" \
+   && echo "$OUT" | grep -q "check_merge_clearance_gate:"; then
   pass "correctly-named JOB → job-name assertion passes (#533)"
 else
   fail "expected job-name assertion to pass on a correct job name (#533); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2

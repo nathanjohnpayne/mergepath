@@ -96,11 +96,12 @@ assert_grep "D7: weekly-feedback-sweep drops the persisted checkout token (#548)
 # so the #548 invariant holds for the WHOLE file (Codex #550 P2 caught that the
 # failure-notify checkout was initially missed). Propagation-safe: skip if absent.
 if [ -f "$W/weekly-feedback-sweep.yml" ]; then
-  _wfs_pc=$(grep -c 'persist-credentials: false' "$W/weekly-feedback-sweep.yml")
-  if [ "$_wfs_pc" -ge 2 ]; then
-    pass "D7: weekly-feedback-sweep hardens BOTH checkouts (#548 / Codex #550)"
+  _wfs_co=$(grep -c 'uses:.*actions/checkout' "$W/weekly-feedback-sweep.yml" || true)
+  _wfs_pc=$(grep -c 'persist-credentials: false' "$W/weekly-feedback-sweep.yml" || true)
+  if [ "$_wfs_co" -gt 0 ] && [ "$_wfs_pc" -eq "$_wfs_co" ]; then
+    pass "D7: weekly-feedback-sweep hardens ALL $_wfs_co checkout(s) (#548 / Codex #550)"
   else
-    fail "D7: weekly-feedback-sweep both checkouts (#548): $_wfs_pc persist-credentials, expected >= 2"
+    fail "D7: weekly-feedback-sweep checkouts (#548): $_wfs_pc persist-credentials vs $_wfs_co checkouts (expected equal)"
   fi
 else
   echo "SKIP: D7 weekly-feedback-sweep both checkouts (absent)"; SKIP=$((SKIP + 1))
@@ -128,12 +129,22 @@ assert_grep "D7: daily-feedback-rollup drops the persisted checkout token (#548 
 # persisted token on ALL its checkouts (gh-with-explicit-token only, no authed
 # git). Count-based so a regression of any one checkout is caught.
 if [ -f "$W/agent-review.yml" ]; then
-  _ar=$(grep -c 'persist-credentials: false' "$W/agent-review.yml")
-  if [ "$_ar" -ge 4 ]; then pass "D7: agent-review hardens all 4 checkouts (#550)"; else fail "D7: agent-review checkouts (#550): $_ar persist-credentials, expected >= 4"; fi
+  _ar_co=$(grep -c 'uses:.*actions/checkout' "$W/agent-review.yml" || true)
+  _ar=$(grep -c 'persist-credentials: false' "$W/agent-review.yml" || true)
+  if [ "$_ar_co" -gt 0 ] && [ "$_ar" -eq "$_ar_co" ]; then
+    pass "D7: agent-review hardens all $_ar_co checkout(s) (#550)"
+  else
+    fail "D7: agent-review checkouts (#550): $_ar persist-credentials vs $_ar_co checkouts (expected equal)"
+  fi
 else echo "SKIP: D7 agent-review (absent)"; SKIP=$((SKIP + 1)); fi
 if [ -f "$W/auto-clear-blocking-labels.yml" ]; then
-  _ac=$(grep -c 'persist-credentials: false' "$W/auto-clear-blocking-labels.yml")
-  if [ "$_ac" -ge 2 ]; then pass "D7: auto-clear hardens both checkouts (#550)"; else fail "D7: auto-clear checkouts (#550): $_ac persist-credentials, expected >= 2"; fi
+  _ac_co=$(grep -c 'uses:.*actions/checkout' "$W/auto-clear-blocking-labels.yml" || true)
+  _ac=$(grep -c 'persist-credentials: false' "$W/auto-clear-blocking-labels.yml" || true)
+  if [ "$_ac_co" -gt 0 ] && [ "$_ac" -eq "$_ac_co" ]; then
+    pass "D7: auto-clear hardens all $_ac_co checkout(s) (#550)"
+  else
+    fail "D7: auto-clear checkouts (#550): $_ac persist-credentials vs $_ac_co checkouts (expected equal)"
+  fi
 else echo "SKIP: D7 auto-clear (absent)"; SKIP=$((SKIP + 1)); fi
 
 # Defect 8 (#550 Codex P1): secret-bearing dispatchable workflows guard the JOB

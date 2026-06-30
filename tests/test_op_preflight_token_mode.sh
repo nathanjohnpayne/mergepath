@@ -65,7 +65,7 @@ case "\${1:-}" in
         echo "FATAL: token mode attempted author PAT read" >&2
         exit 66
         ;;
-      op://Private/c2v6emkwppjzjjaq2bdqk3wnlm/credential|op://Private/4x6wslp3f6pal5t6h3jhhe63ie/credential)
+      op://Private/FAKESENTINEL0ID0000000000001/credential|op://Private/FAKESENTINEL0ID0000000000002/credential)
         echo "FATAL: token mode attempted deploy secret read" >&2
         exit 67
         ;;
@@ -236,7 +236,11 @@ test_token_mode_agents() {
       fail "test_token_mode_agents($agent): token mode used op inject"
       return
     fi
-    if grep -q "FAKEAUTHORITEMID00000000000\\|c2v6emkwppjzjjaq2bdqk3wnlm\\|4x6wslp3f6pal5t6h3jhhe63ie" "$OP_LOG"; then
+    # The two IDs here are out-of-scope test sentinels (not reviewer/author PAT
+    # UUIDs from REVIEW_POLICY.md). Using fake IDs keeps raw op item IDs out of
+    # tracked test files per repo guidance. The first ID is a pre-existing fake;
+    # the remaining two are replaced with structurally-similar fake sentinels.
+    if grep -q "FAKEAUTHORITEMID00000000000\\|FAKESENTINEL0ID0000000000001\\|FAKESENTINEL0ID0000000000002" "$OP_LOG"; then
       fail "test_token_mode_agents($agent): token mode attempted out-of-scope op item"
       return
     fi

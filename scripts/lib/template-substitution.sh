@@ -138,8 +138,13 @@ template_substitution::eval_expr() {
     "!"*)
       local inner=${expr#!}
       inner=$(printf '%s' "$inner" | sed -e 's/^[[:space:]]*//')
-      local v
-      v=$(template_substitution::_fact_value "$inner") || return $?
+      local v rc=0
+      # Existence-check: strict mode must not abort here — an unset fact is
+      # simply false (and therefore !key is true). Suppress strict for the
+      # _fact_value call; treat rc 3 (strict-mode fact-miss) as "unset".
+      v=$(MERGEPATH_TEMPLATE_STRICT=0; template_substitution::_fact_value "$inner") || rc=$?
+      if [ "$rc" -eq 3 ]; then return 0; fi  # unset → !key is true
+      if [ "$rc" -ne 0 ]; then return "$rc"; fi
       if [ -z "$v" ]; then return 0; else return 1; fi
       ;;
     *" contains "*)
@@ -179,9 +184,12 @@ template_substitution::eval_expr() {
       return 2
       ;;
     *)
-      # Bare key — truthy iff non-empty.
-      local v
-      v=$(template_substitution::_fact_value "$expr") || return $?
+      # Bare key — truthy iff non-empty. Strict mode must not abort here —
+      # an unset fact is simply false for the existence check.
+      local v rc=0
+      v=$(MERGEPATH_TEMPLATE_STRICT=0; template_substitution::_fact_value "$expr") || rc=$?
+      if [ "$rc" -eq 3 ]; then return 1; fi  # unset → bare-key is false
+      if [ "$rc" -ne 0 ]; then return "$rc"; fi
       if [ -n "$v" ]; then return 0; else return 1; fi
       ;;
   esac
