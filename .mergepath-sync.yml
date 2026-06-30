@@ -350,6 +350,13 @@ paths:
   - path: scripts/codex-p1-gate.sh
     type: canonical
     consumers: all
+  # Shared reader + tier classifiers for the feedback_policy block (#576).
+  # Sourced by scripts/ci/check_feedback_policy_helpers (via its test); once
+  # #577 lands, both severity gates source it too. First-class entry so the
+  # #264 closure invariant holds for every tool that hard-sources it.
+  - path: scripts/lib/feedback-policy-helpers.sh
+    type: canonical
+    consumers: all
   # Hub-side fleet audit for the propagation lane (#434); consumers
   # receive it because the scripts/ci kit's check_propagation_lane_audit
   # hard-requires it (and its offline test) on every lint run.
@@ -517,6 +524,13 @@ paths:
   # in pre-flight with `Missing required file`. Same #264/#266 coupling
   # class — surfaced again by the 024e0da propagation wave (#273).
   - path: tests/test_codex_p1_gate.sh
+    type: canonical
+    consumers: all
+  # Pairs with scripts/lib/feedback-policy-helpers.sh + scripts/ci/
+  # check_feedback_policy_helpers (#576). The check wrapper hard-requires this
+  # test; without it propagated, every consumer's check_feedback_policy_helpers
+  # fails pre-flight with `Missing required file`. Same #264/#266 closure class.
+  - path: tests/test_feedback_policy_helpers.sh
     type: canonical
     consumers: all
   # Pairs with scripts/codex-review-request.sh + scripts/ci/check_codex_scripts

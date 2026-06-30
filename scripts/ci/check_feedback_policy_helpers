@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# check_feedback_policy_helpers
+#
+# CI wrapper for scripts/lib/feedback-policy-helpers.sh — the shared reader +
+# tier classifiers for the `feedback_policy` block (nathanjohnpayne/
+# mergepath#574, sub-issue #576).
+#
+# Two concerns:
+#   1. The library and its test must exist on disk; the test must be
+#      executable (consistent with check_codex_p1_gate). The library is
+#      sourced, not executed, so it is not required to be +x.
+#   2. The library's parsing + classification logic must work. We delegate
+#      this to tests/test_feedback_policy_helpers.sh, which sources the lib
+#      and walks it through the field reader, the blocking-set resolver
+#      (incl. backward-compat absent-block -> p1 and fail-closed on malformed
+#      mode/tier), and both tier classifiers.
+#
+# Invoked by .github/workflows/repo_lint.yml alongside the other
+# scripts/ci/check_* scripts.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+LIB="scripts/lib/feedback-policy-helpers.sh"
+TEST="tests/test_feedback_policy_helpers.sh"
+
+FAILED=0
+
+if [ ! -f "$LIB" ]; then
+  echo "FAIL: Missing required library: $LIB"
+  FAILED=1
+fi
+
+if [ ! -f "$TEST" ]; then
+  echo "FAIL: Missing required test: $TEST"
+  FAILED=1
+elif [ ! -x "$TEST" ]; then
+  echo "FAIL: Test is not executable: $TEST"
+  echo "      Fix with: chmod +x $TEST"
+  FAILED=1
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_feedback_policy_helpers: FAIL (pre-flight)"
+  exit 1
+fi
+
+if ! bash "$TEST"; then
+  echo "check_feedback_policy_helpers: FAIL (test suite)"
+  exit 1
+fi
+
+echo "check_feedback_policy_helpers: PASS"
+exit 0
