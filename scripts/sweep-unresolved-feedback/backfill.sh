@@ -99,6 +99,22 @@ else
   ENUM_TARGETS="$TARGETS_FILE"
 fi
 
+# Verify every target repo RESOLVES with the current token before draining.
+# gh pr list returns an empty SUCCESSFUL list (exit 0, no error) for a
+# nonexistent / renamed / unauthorized repo, so a typo'd or inaccessible
+# --repo would otherwise look like a clean empty drain. Validate existence
+# explicitly with `gh repo view` and fail closed; this distinguishes a real
+# repo with zero findings from an unresolvable target (Codex Phase-4b r2 on
+# #571 — the enumerate WARN path does NOT fire on this empty-success case).
+while IFS= read -r _trepo; do
+  _trepo=$(printf '%s' "$_trepo" | sed -E 's/[[:space:]]+$//')
+  case "$_trepo" in ''|\#*) continue ;; esac
+  if ! gh repo view "$_trepo" --json nameWithOwner >/dev/null 2>&1; then
+    echo "backfill: target repo not resolvable with the current token (nonexistent, renamed, or no access): $_trepo — failing closed" >&2
+    exit 2
+  fi
+done < "$ENUM_TARGETS"
+
 echo "backfill: $($DRY_RUN && echo 'DRY-RUN (no mutations)' || echo 'EXECUTE (will resolve)') — enumerating unresolved threads" >&2
 
 FINDINGS="$WORK/findings.ndjson"

@@ -40,6 +40,13 @@ if [ "${STUB_ENUM_MODE:-ok}" = "skip" ]; then
   echo "enumerate: WARN gh pr list failed for owner/alpha (skipping)" >&2
   exit 0
 fi
+if [ "${STUB_ENUM_MODE:-ok}" = "empty" ]; then
+  # Real empty-SUCCESS case: gh pr list returned an empty list (exit 0, no WARN)
+  # — a valid repo with zero closed PRs, OR an unresolvable repo gh silently
+  # treats as empty. enumerate emits NO findings and exits 0. This is the case
+  # the WARN grep cannot catch; the gh-repo-view pre-validation must.
+  exit 0
+fi
 {
   printf '%s\n' '{"repo":"owner/alpha","pr_number":11,"thread_id":"T1"}'
   printf '%s\n' '{"repo":"owner/alpha","pr_number":11,"thread_id":"T2"}'
@@ -84,7 +91,18 @@ chmod +x "$FR/scripts/resolve-pr-threads.sh"
 # no GitHub CLI installed (Codex Phase-4b on #571). jq stays real (the driver
 # parses findings with it), so it is left on the inherited PATH.
 mkdir -p "$FR/bin"
-printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$FR/bin/gh"
+cat > "$FR/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+# No-op gh shim. backfill.sh validates each target with `gh repo view`; force
+# that to fail via STUB_GH_REPO_VIEW_FAIL=1 to simulate a nonexistent /
+# unauthorized repo — the real empty-success `gh pr list` case that enumerate
+# cannot distinguish. All other gh calls are no-ops (enumerate + resolve are
+# stubbed, and the dependency check only does `command -v gh`).
+if [ "${1:-}" = "repo" ] && [ "${2:-}" = "view" ] && [ "${STUB_GH_REPO_VIEW_FAIL:-0}" = "1" ]; then
+  exit 1
+fi
+exit 0
+STUB
 chmod +x "$FR/bin/gh"
 SHIM_PATH="$FR/bin:$PATH"
 
@@ -174,6 +192,34 @@ if [ "$RC" -ne 0 ] && grep -qi 'failing closed' <<<"$OUT" && [ ! -s "$STUB_RESOL
   pass=$((pass+1)); echo "PASS: enumerate skip (unlistable repo) fails closed, no resolver call"
 else
   fail=$((fail+1)); echo "FAIL: enumerate skip should fail closed (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 8: an unresolvable --repo target (gh repo view fails) fails closed
+#    BEFORE enumerate, even when gh pr list would have returned empty-SUCCESS
+#    (the real case Codex flagged: the WARN path does not fire). No resolver call.
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" STUB_GH_REPO_VIEW_FAIL=1 STUB_ENUM_MODE=empty STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -ne 0 ] && grep -qi 'not resolvable' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: unresolvable --repo (gh repo view fails) fails closed, no resolver call"
+else
+  fail=$((fail+1)); echo "FAIL: unresolvable --repo should fail closed (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 9: a RESOLVABLE repo with zero findings (gh repo view OK + enumerate
+#    empty-success) is a legitimate clean drain → exit 0, NOT a false failure.
+#    Proves the fix distinguishes "real repo, 0 findings" from "bad repo".
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" STUB_ENUM_MODE=empty STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 0 ] && grep -q 'would-resolve=0' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: resolvable repo with zero findings is a clean empty drain (exit 0)"
+else
+  fail=$((fail+1)); echo "FAIL: valid empty repo should exit 0 (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
 echo
