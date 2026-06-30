@@ -114,6 +114,10 @@ PAIR_COUNT=$(printf '%s' "$PAIRS" | grep -c . || true)
 echo "backfill: $PAIR_COUNT distinct closed PR(s) with unresolved threads" >&2
 
 MAX="${BACKFILL_MAX_PRS:-0}"
+case "$MAX" in
+  ''|*[!0-9]*)
+    echo "backfill: BACKFILL_MAX_PRS must be a non-negative integer (got: '$MAX')" >&2; exit 1 ;;
+esac
 TOTAL_RESOLVED=0
 TOTAL_WOULD=0
 TOTAL_SKIPPED=0
@@ -133,7 +137,10 @@ while IFS=$'\t' read -r repo pr; do
   PRS_DONE=$((PRS_DONE + 1))
   args=("$pr" --repo "$repo" --resolve-actioned)
   $DRY_RUN && args+=(--dry-run)
-  out=$("$RESOLVE" "${args[@]}" 2>&1) || true
+  set +e
+  out=$("$RESOLVE" "${args[@]}" 2>&1)
+  resolve_rc=$?
+  set -e
   rc_line=$(printf '%s\n' "$out" | tail -40)
   # Pull the summary counters from resolve-pr-threads.sh output.
   resolved=$(printf '%s\n' "$out" | sed -n 's/.*Resolved: \([0-9]*\) .*/\1/p' | tail -1)
@@ -146,10 +153,22 @@ while IFS=$'\t' read -r repo pr; do
   TOTAL_RESOLVED=$((TOTAL_RESOLVED + resolved))
   TOTAL_WOULD=$((TOTAL_WOULD + would))
   TOTAL_SKIPPED=$((TOTAL_SKIPPED + skipped))
-  if [ "$failed" -gt 0 ] || [ "$readback_failed" -gt 0 ]; then
-    TOTAL_FAILED=$((TOTAL_FAILED + failed + readback_failed))
+  # Fail closed on EITHER parsed Failed:/Readback-failed: counters OR an
+  # unexpected resolver exit. resolve-pr-threads.sh exits: 0 clean, 3
+  # work-remains (expected for a backfill), 2 fail-closed, 1 setup. A crash
+  # before the summary prints leaves the counters at 0, so the exit code is
+  # the backstop that keeps a summary-less death from reading as success.
+  pr_failed=0
+  if [ "$failed" -gt 0 ] || [ "$readback_failed" -gt 0 ]; then pr_failed=1; fi
+  case "$resolve_rc" in
+    0|3) : ;;
+    *) pr_failed=1 ;;
+  esac
+  if [ "$pr_failed" -eq 1 ]; then
+    n=$((failed + readback_failed)); [ "$n" -eq 0 ] && n=1
+    TOTAL_FAILED=$((TOTAL_FAILED + n))
     ANY_FAILURE=1
-    echo "  $repo#$pr: FAILED=$failed readback-failed=$readback_failed (see below)" >&2
+    echo "  $repo#$pr: FAILED (exit=$resolve_rc failed=$failed readback-failed=$readback_failed)" >&2
     printf '%s\n' "$rc_line" | sed 's/^/    /' >&2
   fi
   if $DRY_RUN; then

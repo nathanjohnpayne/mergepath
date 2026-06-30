@@ -55,6 +55,12 @@ case "${STUB_RESOLVE_MODE:-ok}" in
   fail)
     echo "Resolved: 0  Skipped (human): 0  Skipped (stale-HEAD): 0  Skipped (not-actioned): 0  Failed: 1  Readback-failed: 0"
     exit 2 ;;
+  die)
+    # Non-zero exit with NO parseable summary line (a crash before the
+    # resolver could print its counters). The backfill must still fail
+    # closed on the exit code alone.
+    echo "resolve: boom (no parseable summary)" >&2
+    exit 2 ;;
   *)
     if [ "$dry" -eq 1 ]; then
       echo "(dry-run; no threads modified) — would-resolve: 1, skipped (human): 0, skipped (stale-HEAD): 0, skipped (not-actioned): 1"
@@ -116,6 +122,29 @@ if ! grep -q -- '--auto-resolve-bots' "$STUB_RESOLVE_LOG"; then
   pass=$((pass+1)); echo "PASS: never invokes the blunt --auto-resolve-bots mode"
 else
   fail=$((fail+1)); echo "FAIL: backfill used --auto-resolve-bots" >&2
+fi
+
+# ── Test 5: resolver dies non-zero with NO parseable summary → the backfill
+#    still fails closed (exit 2) via the exit-code backstop, not just the
+#    parsed Failed:/Readback-failed: counters.
+run_bf die --execute
+if [ "$RC" -eq 2 ] && grep -q 'failed=' <<<"$OUT"; then
+  pass=$((pass+1)); echo "PASS: summary-less resolver death fails closed (exit-code backstop)"
+else
+  fail=$((fail+1)); echo "FAIL: die mode should exit 2 (rc=$RC)" >&2; echo "$OUT" | sed 's/^/  /' >&2
+fi
+
+# ── Test 6: a non-numeric BACKFILL_MAX_PRS is rejected up front (exit 1),
+#    not left to crash `[ "$MAX" -gt 0 ]` under set -e mid-loop.
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(STUB_RESOLVE_MODE=ok GH_TOKEN=dummy BACKFILL_MAX_PRS=foo bash "$BF" --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 1 ] && grep -qi 'BACKFILL_MAX_PRS must be' <<<"$OUT"; then
+  pass=$((pass+1)); echo "PASS: non-numeric BACKFILL_MAX_PRS rejected up front (exit 1)"
+else
+  fail=$((fail+1)); echo "FAIL: bad BACKFILL_MAX_PRS should exit 1 (rc=$RC)" >&2; echo "$OUT" | sed 's/^/  /' >&2
 fi
 
 echo
