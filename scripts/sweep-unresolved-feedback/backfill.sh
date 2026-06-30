@@ -47,8 +47,9 @@
 # Exit codes:
 #   0  completed (dry-run, or every actioned thread resolved + confirmed)
 #   1  setup error (missing dep/script/targets, GH_TOKEN unset)
-#   2  fail closed: an unresolvable target repo, an enumerate skip (repo list
-#      or per-PR thread fetch), or a resolve/readback failure on some PR
+#   2  fail closed: an unresolvable target repo, ANY enumerate warning (repo-list
+#      skip, per-PR thread-fetch skip, or >100-review-threads page truncation),
+#      or a resolve/readback failure on some PR
 #
 # Bash 3.2 compatible.
 
@@ -129,14 +130,18 @@ SWEEP_OUTPUT="$FINDINGS" "$ENUMERATE" "$ENUM_TARGETS" >/dev/null 2>"$ENUM_STDERR
   cat "$ENUM_STDERR" >&2; echo "backfill: enumerate.sh failed" >&2; exit 1
 }
 cat "$ENUM_STDERR" >&2
-# Fail closed if enumerate SKIPPED any work. enumerate.sh is tolerant by design
-# (it WARNs and skips an unlistable repo OR an unfetchable PR so the weekly sweep
-# still covers the rest), but a one-time fail-closed drain must not report a
-# partial drain. The gh-repo-view pre-validation above catches an invalid --repo
-# target up front; this catches a TRANSIENT repo-list or per-PR thread-fetch
-# failure that slips past it (Codex Phase-4b r2 on #571).
-if grep -qE 'WARN gh pr list failed|WARN GraphQL threads query failed' "$ENUM_STDERR"; then
-  echo "backfill: enumerate skipped a repo list or a PR thread fetch (see WARN above); refusing to report a partial drain — failing closed" >&2
+# Fail closed if enumerate emitted ANY warning. enumerate.sh is tolerant by
+# design — it WARNs and continues on an unlistable repo, an unfetchable PR's
+# threads, OR a PR with >100 review threads (it examines only the first page) —
+# so the weekly sweep still covers the rest. But a one-time fail-closed drain
+# must not report a PARTIAL drain as complete: any such WARN means some threads
+# were never visited. The gh-repo-view pre-validation above catches an invalid
+# --repo target up front; matching every `enumerate: WARN` here catches the rest
+# without a fragile per-warning whitelist — a repo-list skip, a per-PR
+# thread-fetch skip, AND the >100-threads page truncation (Codex Phase-4b on
+# #571: r2 the per-PR skip, r3 the >100-threads page cap).
+if grep -q 'enumerate: WARN' "$ENUM_STDERR"; then
+  echo "backfill: enumerate reported incomplete coverage (see WARN above: a repo-list skip, a per-PR thread-fetch skip, or a >100-review-threads page truncation); refusing to report a partial drain — failing closed" >&2
   exit 2
 fi
 

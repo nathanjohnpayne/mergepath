@@ -55,6 +55,14 @@ if [ "${STUB_ENUM_MODE:-ok}" = "skip_pr" ]; then
   printf '%s\n' '{"repo":"owner/alpha","pr_number":11,"thread_id":"T1"}' >> "$out"
   exit 0
 fi
+if [ "${STUB_ENUM_MODE:-ok}" = "skip_100" ]; then
+  # Mimic enumerate.sh examining only page 1 of a PR with >100 review threads:
+  # emit findings PLUS the >100-threads truncation WARN — a partial (non-empty)
+  # drain that must still fail closed (Codex Phase-4b r3 on #571).
+  echo "enumerate: WARN owner/alpha#11 has >100 review threads; sweep examined first page only" >&2
+  printf '%s\n' '{"repo":"owner/alpha","pr_number":11,"thread_id":"T1"}' >> "$out"
+  exit 0
+fi
 {
   printf '%s\n' '{"repo":"owner/alpha","pr_number":11,"thread_id":"T1"}'
   printf '%s\n' '{"repo":"owner/alpha","pr_number":11,"thread_id":"T2"}'
@@ -242,6 +250,20 @@ if [ "$RC" -ne 0 ] && grep -qi 'failing closed' <<<"$OUT" && [ ! -s "$STUB_RESOL
   pass=$((pass+1)); echo "PASS: per-PR thread-fetch skip fails closed before resolving (partial drain)"
 else
   fail=$((fail+1)); echo "FAIL: per-PR skip should fail closed (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 11: a PR with >100 review threads (enumerate examines page 1 only +
+#    emits the truncation WARN) → backfill fails closed on the partial drain,
+#    before the resolve loop (Codex Phase-4b r3 on #571, P2).
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" STUB_ENUM_MODE=skip_100 STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --execute --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -ne 0 ] && grep -qi 'failing closed' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: >100-review-threads truncation fails closed before resolving (partial drain)"
+else
+  fail=$((fail+1)); echo "FAIL: >100-threads truncation should fail closed (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
 echo
