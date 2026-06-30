@@ -47,6 +47,14 @@ if [ "${STUB_ENUM_MODE:-ok}" = "empty" ]; then
   # the WARN grep cannot catch; the gh-repo-view pre-validation must.
   exit 0
 fi
+if [ "${STUB_ENUM_MODE:-ok}" = "skip_pr" ]; then
+  # Mimic enumerate.sh skipping ONE PR's thread fetch: emit findings for the PRs
+  # it could read PLUS a per-PR GraphQL WARN — a partial (non-empty) drain that
+  # must still fail closed.
+  echo "enumerate: WARN GraphQL threads query failed for owner/alpha#22 (skipping)" >&2
+  printf '%s\n' '{"repo":"owner/alpha","pr_number":11,"thread_id":"T1"}' >> "$out"
+  exit 0
+fi
 {
   printf '%s\n' '{"repo":"owner/alpha","pr_number":11,"thread_id":"T1"}'
   printf '%s\n' '{"repo":"owner/alpha","pr_number":11,"thread_id":"T2"}'
@@ -220,6 +228,20 @@ if [ "$RC" -eq 0 ] && grep -q 'would-resolve=0' <<<"$OUT" && [ ! -s "$STUB_RESOL
   pass=$((pass+1)); echo "PASS: resolvable repo with zero findings is a clean empty drain (exit 0)"
 else
   fail=$((fail+1)); echo "FAIL: valid empty repo should exit 0 (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 10: enumerate skips ONE PR's thread fetch (per-PR GraphQL WARN) while
+#    emitting other findings → backfill still fails closed on the partial drain,
+#    before the resolve loop (Codex Phase-4b r2 on #571, P2).
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" STUB_ENUM_MODE=skip_pr STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --execute --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -ne 0 ] && grep -qi 'failing closed' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: per-PR thread-fetch skip fails closed before resolving (partial drain)"
+else
+  fail=$((fail+1)); echo "FAIL: per-PR skip should fail closed (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
 echo
