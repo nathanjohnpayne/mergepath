@@ -691,9 +691,16 @@ fetch_pr_tag_data() {
   # PR_COMMITS_CACHE now includes `sha` so synth_rationale can cite
   # the matching commit. The predicate the rationale builds must
   # match derive_tag_class's predicate (CodeRabbit major on #308).
+  # login fallback chain (#565 round 8): .author.login is null for commits
+  # whose author email is not linked to a GitHub account — which is THIS
+  # repo's normal case (commits are authored as nathanjohnpayne with a
+  # placeholder .example email). So fall back to .commit.author.name (the git
+  # config name, e.g. "nathanjohnpayne", which IS in MERGEPATH_AGENT_AUTHORS)
+  # BEFORE the email, or agent fix commits are never recognized as
+  # agent-authored and addressed-elsewhere never fires.
   PR_COMMITS_CACHE=$(_fetch_paginated \
     "repos/$OWNER/$NAME/pulls/$PR_NUM/commits" \
-    '[.[] | {sha: (.sha // ""), login: (.author.login // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]')
+    '[.[] | {sha: (.sha // ""), login: (.author.login // .commit.author.name // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]')
 }
 
 # _fetch_paginated <base-url> <jq-projection> → JSON array on stdout.
@@ -1337,8 +1344,11 @@ augment_pr_commits_with_sha() {
   if printf '%s' "$PR_COMMITS_CACHE" | jq -e '.[0].sha // empty' >/dev/null 2>&1; then
     return 0
   fi
+  # Same login fallback chain as fetch_pr_tag_data (#565 round 8):
+  # .commit.author.name before the (often-unlinked) email so agent-authored
+  # commits are recognized.
   PR_COMMITS_CACHE=$(gh_pat api "repos/$OWNER/$NAME/pulls/$PR_NUM/commits?per_page=100" \
-    --jq '[.[] | {sha: .sha, login: (.author.login // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]' 2>/dev/null || echo "$PR_COMMITS_CACHE")
+    --jq '[.[] | {sha: .sha, login: (.author.login // .commit.author.name // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]' 2>/dev/null || echo "$PR_COMMITS_CACHE")
 }
 
 # post_tag_reply — emit a `[mergepath-resolve: <class>] <rationale>`

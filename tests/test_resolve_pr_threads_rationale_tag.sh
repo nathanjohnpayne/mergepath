@@ -1433,6 +1433,41 @@ else
   echo "$out" | sed 's/^/      /' >&2
 fi
 
+# ─────────────────────────────────────────────────────────────────────
+# Test 24 (#565 round-8 P1): commit-cache login normalization. GitHub
+# returns author.login=null for commits whose author email is not linked to
+# a GitHub account — THIS repo's normal case (commits are authored as
+# nathanjohnpayne with a placeholder .example email). The commit-cache login
+# projection must fall back to .commit.author.name (= nathanjohnpayne, an
+# agent author) BEFORE the unlinked email, or fixed-by-commit feedback is
+# never recognized as agent-authored and addressed-elsewhere never fires.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 24: commit-cache login falls back to .commit.author.name when author.login is null (#565)"
+
+# (a) The exact projection both builders use must map a null-author commit to
+#     the git author name (the #565-round-8 reviewer's live shape).
+RAW_COMMITS_T24='[{"sha":"deadbeef","author":null,"commit":{"author":{"name":"nathanjohnpayne","email":"nathan@nathanjohnpayne.example","date":"2026-01-02T00:00:00Z"}}}]'
+PROJECTED_LOGIN=$(printf '%s' "$RAW_COMMITS_T24" | jq -r '[.[] | {login: (.author.login // .commit.author.name // .commit.author.email // "")}][0].login')
+if [ "$PROJECTED_LOGIN" = "nathanjohnpayne" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: null author.login -> .commit.author.name (nathanjohnpayne)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: projection gave [$PROJECTED_LOGIN], expected nathanjohnpayne" >&2
+fi
+
+# (b) BOTH commit-cache builders in the script carry the .commit.author.name
+#     fallback (regression guard against either reverting).
+BUILDER_HITS=$(grep -c '\.author\.login // \.commit\.author\.name // \.commit\.author\.email' "$SCRIPT")
+if [ "$BUILDER_HITS" -ge 2 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both commit-cache builders include the .commit.author.name fallback ($BUILDER_HITS)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: expected >=2 builders with .commit.author.name fallback, found $BUILDER_HITS" >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"
