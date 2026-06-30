@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# scripts/sweep-unresolved-feedback/backfill.sh
+#
+# One-time backfill (#566) that drains the standing unresolved-feedback
+# backlog (#562). It enumerates closed PRs that still carry unresolved bot
+# review threads — via enumerate.sh, the same enumerator the weekly sweep
+# uses — and runs `scripts/resolve-pr-threads.sh --resolve-actioned` on each
+# distinct PR.
+#
+# Because it delegates to --resolve-actioned, ONLY demonstrably-actioned
+# bot-authored threads are resolved: a fix commit that touches the anchored
+# file after the latest bot/reviewer comment (addressed-elsewhere), or a
+# substantive agent rebuttal after the bot's last word (rebuttal-recorded).
+# Routing-only (canonical/templated), surface (nitpick/deferred), and any
+# human-authored threads are LEFT UNRESOLVED for the weekly sweep, and every
+# resolve is readback-confirmed (isResolved:true) and fails closed otherwise.
+# The forward fix (#564/#565) prevents the backlog from growing; this drains
+# the part that is already, demonstrably handled.
+#
+# SAFETY: dry-run by DEFAULT. It mutates only with --execute. The dry-run
+# previews per-PR would-resolve / skipped-not-actioned counts so the operator
+# can review the scope before any write.
+#
+# Usage:
+#   scripts/sweep-unresolved-feedback/backfill.sh [--execute]
+#       [--repo owner/name] [targets-file]
+#
+#   --execute        Actually resolve (default: dry-run, no mutations).
+#   --repo o/n       Restrict to a single repo (default: every repo in the
+#                    targets file).
+#   targets-file     Path to the target-repos list (default:
+#                    target-repos.txt alongside this script).
+#
+# Environment:
+#   GH_TOKEN                 required. PR read + (when --execute) the
+#                            identity-checked resolve mutation, per
+#                            resolve-pr-threads.sh.
+#   SWEEP_LOOKBACK_DAYS      forwarded to enumerate.sh (default 90).
+#   BACKFILL_MAX_PRS         optional safety cap on the number of distinct
+#                            PRs processed in one run (default 0 = no cap).
+#
+# Exit codes:
+#   0  completed (dry-run, or every actioned thread resolved + confirmed)
+#   1  setup error (missing dep/script/targets, GH_TOKEN unset)
+#   2  one or more PRs reported a resolve/readback failure (fail closed)
+#
+# Bash 3.2 compatible.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ENUMERATE="$SCRIPT_DIR/enumerate.sh"
+RESOLVE="$ROOT/scripts/resolve-pr-threads.sh"
+
+DRY_RUN=true
+ONLY_REPO=""
+TARGETS_FILE=""
+
+usage() { sed -n '2,40p' "$0" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --execute) DRY_RUN=false; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --repo)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then echo "backfill: --repo needs a value" >&2; exit 1; fi
+      ONLY_REPO="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    -*) echo "backfill: unknown flag: $1" >&2; usage ;;
+    *)
+      if [ -z "$TARGETS_FILE" ]; then TARGETS_FILE="$1"; else echo "backfill: unexpected arg: $1" >&2; usage; fi
+      shift ;;
+  esac
+done
+
+TARGETS_FILE="${TARGETS_FILE:-$SCRIPT_DIR/target-repos.txt}"
+
+for f in "$ENUMERATE" "$RESOLVE"; do
+  [ -x "$f" ] || { echo "backfill: missing or non-executable: $f" >&2; exit 1; }
+done
+for dep in gh jq; do
+  command -v "$dep" >/dev/null 2>&1 || { echo "backfill: required dependency missing: $dep" >&2; exit 1; }
+done
+if [ -z "${GH_TOKEN:-}" ]; then
+  echo "backfill: GH_TOKEN not set." >&2; exit 1
+fi
+
+# Build the targets file enumerate.sh reads. With --repo we hand it a
+# one-line temp file so a single repo can be drained without editing the
+# shipped list.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/backfill.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+if [ -n "$ONLY_REPO" ]; then
+  printf '%s\n' "$ONLY_REPO" > "$WORK/targets.txt"
+  ENUM_TARGETS="$WORK/targets.txt"
+else
+  [ -f "$TARGETS_FILE" ] || { echo "backfill: targets file not found: $TARGETS_FILE" >&2; exit 1; }
+  ENUM_TARGETS="$TARGETS_FILE"
+fi
+
+echo "backfill: $($DRY_RUN && echo 'DRY-RUN (no mutations)' || echo 'EXECUTE (will resolve)') — enumerating unresolved threads" >&2
+
+FINDINGS="$WORK/findings.ndjson"
+SWEEP_OUTPUT="$FINDINGS" "$ENUMERATE" "$ENUM_TARGETS" >&2 || {
+  echo "backfill: enumerate.sh failed" >&2; exit 1
+}
+
+# Distinct (repo, pr) pairs that have at least one unresolved thread. These
+# are the PRs worth visiting; --resolve-actioned decides per-thread whether
+# each is actually actioned.
+PAIRS=$(jq -r '[.repo, (.pr_number|tostring)] | @tsv' "$FINDINGS" 2>/dev/null | sort -u)
+PAIR_COUNT=$(printf '%s' "$PAIRS" | grep -c . || true)
+echo "backfill: $PAIR_COUNT distinct closed PR(s) with unresolved threads" >&2
+
+MAX="${BACKFILL_MAX_PRS:-0}"
+TOTAL_RESOLVED=0
+TOTAL_WOULD=0
+TOTAL_SKIPPED=0
+TOTAL_FAILED=0
+PRS_DONE=0
+ANY_FAILURE=0
+
+# Process each PR through the actioned resolver. resolve-pr-threads.sh exit
+# codes: 0 clean, 2 a resolve/readback failure (fail closed), 3 work remains
+# (threads left unresolved) — for a backfill, 3 is expected and NOT a failure.
+while IFS=$'\t' read -r repo pr; do
+  [ -z "$repo" ] && continue
+  if [ "$MAX" -gt 0 ] && [ "$PRS_DONE" -ge "$MAX" ]; then
+    echo "backfill: BACKFILL_MAX_PRS=$MAX reached; stopping (remaining PRs not processed)" >&2
+    break
+  fi
+  PRS_DONE=$((PRS_DONE + 1))
+  args=("$pr" --repo "$repo" --resolve-actioned)
+  $DRY_RUN && args+=(--dry-run)
+  out=$("$RESOLVE" "${args[@]}" 2>&1) || true
+  rc_line=$(printf '%s\n' "$out" | tail -40)
+  # Pull the summary counters from resolve-pr-threads.sh output.
+  resolved=$(printf '%s\n' "$out" | sed -n 's/.*Resolved: \([0-9]*\) .*/\1/p' | tail -1)
+  would=$(printf '%s\n' "$out" | sed -n 's/.*would-resolve: \([0-9]*\).*/\1/p' | tail -1)
+  skipped=$(printf '%s\n' "$out" | sed -n 's/.*[Ss]kipped (not-actioned): \([0-9]*\).*/\1/p' | tail -1)
+  failed=$(printf '%s\n' "$out" | sed -n 's/.*Failed: \([0-9]*\) .*/\1/p' | tail -1)
+  readback_failed=$(printf '%s\n' "$out" | sed -n 's/.*Readback-failed: \([0-9]*\).*/\1/p' | tail -1)
+  resolved=${resolved:-0}; would=${would:-0}; skipped=${skipped:-0}
+  failed=${failed:-0}; readback_failed=${readback_failed:-0}
+  TOTAL_RESOLVED=$((TOTAL_RESOLVED + resolved))
+  TOTAL_WOULD=$((TOTAL_WOULD + would))
+  TOTAL_SKIPPED=$((TOTAL_SKIPPED + skipped))
+  if [ "$failed" -gt 0 ] || [ "$readback_failed" -gt 0 ]; then
+    TOTAL_FAILED=$((TOTAL_FAILED + failed + readback_failed))
+    ANY_FAILURE=1
+    echo "  $repo#$pr: FAILED=$failed readback-failed=$readback_failed (see below)" >&2
+    printf '%s\n' "$rc_line" | sed 's/^/    /' >&2
+  fi
+  if $DRY_RUN; then
+    [ "$would" -gt 0 ] && echo "  $repo#$pr: would-resolve=$would skipped-not-actioned=$skipped"
+  else
+    [ "$resolved" -gt 0 ] && echo "  $repo#$pr: resolved=$resolved skipped-not-actioned=$skipped"
+  fi
+done <<< "$PAIRS"
+
+echo "" >&2
+if $DRY_RUN; then
+  echo "backfill DRY-RUN summary: $PRS_DONE PR(s) scanned — would-resolve=$TOTAL_WOULD, skipped-not-actioned=$TOTAL_SKIPPED. Re-run with --execute to resolve." >&2
+else
+  echo "backfill EXECUTE summary: $PRS_DONE PR(s) — resolved=$TOTAL_RESOLVED, skipped-not-actioned=$TOTAL_SKIPPED, failed=$TOTAL_FAILED." >&2
+fi
+
+[ "$ANY_FAILURE" -eq 1 ] && exit 2
+exit 0
