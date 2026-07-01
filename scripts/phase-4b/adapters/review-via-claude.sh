@@ -29,7 +29,15 @@
 #
 # Env:
 #   CLAUDE_BIN  claude executable (default: claude). Tests point this at a fake.
-#   CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY   reasoning-plane auth.
+#   Claude Code plan login   reasoning-plane auth. This adapter runs the
+#               CLI with ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN SCRUBBED
+#               (env -u), so review reasoning bills against the operator's
+#               Claude Code PLAN (subscription login, or `claude setup-token`
+#               -> CLAUDE_CODE_OAUTH_TOKEN, or the OS keychain), never the
+#               pay-per-token API. CLAUDE_CODE_OAUTH_TOKEN (the subscription
+#               headless token) is PRESERVED. If claude is not logged in on a
+#               plan the read-only call fails and the orchestrator falls back
+#               to the manual handoff (fail-closed).
 #   P4B_CLAUDE_PERMISSION_MODE  default: plan (read-only).
 #   P4B_CLAUDE_ALLOWED_TOOLS    default: "Read,Bash(git diff *),Bash(git log *)".
 #   GH_TOKEN    only used if the diff must be fetched (no --diff-file).
@@ -95,7 +103,7 @@ stake a merge on it. Do not edit files. Do not post anything to GitHub."
 
 set +e
 ENVELOPE="$(
-  printf '%s\n' "$DIFF" | "$CLAUDE_BIN" -p "$PROMPT" \
+  printf '%s\n' "$DIFF" | env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "$CLAUDE_BIN" -p "$PROMPT" \
     --permission-mode "$PERMISSION_MODE" \
     --output-format json \
     ${MODEL:+--model "$MODEL"} \
@@ -103,7 +111,7 @@ ENVELOPE="$(
 )"
 RC=$?
 set -e
-[ "$RC" -eq 0 ] || p4b_die 4 "claude -p failed (rc=$RC) — fall back to manual handoff"
+[ "$RC" -eq 0 ] || p4b_die 4 "claude -p failed (rc=$RC) — ensure claude is logged in on a plan (API keys are scrubbed for plan-only billing); falling back to the manual handoff"
 [ -n "$ENVELOPE" ] || p4b_die 4 "claude -p produced no output"
 
 # Extract the model's answer from the print-mode JSON envelope (.result).

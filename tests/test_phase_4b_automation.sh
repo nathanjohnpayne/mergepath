@@ -81,6 +81,16 @@ mk_fake fake-claude-changes \
 mk_fake fake-claude-junk \
   "jq -n '{type:\"result\",result:\"no json here\",session_id:\"t\"}'"
 
+# key-leak canaries: exit non-zero if the adapter did NOT scrub the
+# pay-per-token API-key env vars (proves plan-only billing enforcement).
+# The verdict JSON is printed raw; both adapters accept that shape.
+mk_fake fake-codex-keyleak \
+  "if [ -n \"\${OPENAI_API_KEY:-}\${CODEX_API_KEY:-}\" ]; then echo API-KEY-LEAKED >&2; exit 7; fi
+printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[]}'"
+mk_fake fake-claude-keyleak \
+  "if [ -n \"\${ANTHROPIC_API_KEY:-}\${ANTHROPIC_AUTH_TOKEN:-}\" ]; then echo API-KEY-LEAKED >&2; exit 7; fi
+printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"ok\",\"findings\":[]}'"
+
 # ===========================================================================
 echo "lib.sh — reviewer selection"
 # ===========================================================================
@@ -150,6 +160,27 @@ CLAUDE_BIN="$BIN/fake-claude-junk" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-fi
 set -e
 [ "$rc" = 4 ] && pass "claude adapter fails closed (exit 4) on junk result" \
   || fail "claude adapter junk should exit 4 (got $rc)"
+
+# ===========================================================================
+echo "adapters — plan-only billing (API keys scrubbed before the CLI runs)"
+# ===========================================================================
+# If the adapter forwarded OPENAI_API_KEY/CODEX_API_KEY the fake exits 7
+# and the adapter reports rc 4; a clean APPROVED proves the keys were scrubbed.
+set +e
+out="$(OPENAI_API_KEY=sk-should-scrub CODEX_API_KEY=sk-should-scrub \
+  CODEX_BIN="$BIN/fake-codex-keyleak" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
+  pass "codex adapter scrubs OPENAI_API_KEY/CODEX_API_KEY (plan-only billing)"
+else fail "codex adapter leaked an API key to the CLI (rc=$rc, out=$out)"; fi
+
+set +e
+out="$(ANTHROPIC_API_KEY=sk-should-scrub ANTHROPIC_AUTH_TOKEN=tok-should-scrub \
+  CLAUDE_BIN="$BIN/fake-claude-keyleak" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
+  pass "claude adapter scrubs ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN (plan-only billing)"
+else fail "claude adapter leaked an API key to the CLI (rc=$rc, out=$out)"; fi
 
 # ===========================================================================
 echo "orchestrator — entry decision + dispatch (dry-run, offline)"

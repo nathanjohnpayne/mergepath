@@ -24,10 +24,17 @@
 #
 # Env:
 #   CODEX_BIN   codex executable (default: codex). Tests point this at a fake.
-#   CODEX_API_KEY / codex login   reasoning-plane auth (NOT exported here;
-#               provide it in the environment per the Codex docs' warning
-#               against job-level OPENAI_API_KEY/CODEX_API_KEY around
-#               repo-controlled code).
+#   codex login (subscription plan)   reasoning-plane auth. This adapter
+#               runs the CLI with OPENAI_API_KEY and CODEX_API_KEY SCRUBBED
+#               (env -u), so review reasoning bills against the operator's
+#               ChatGPT/Codex PLAN (~/.codex/auth.json), never the
+#               pay-per-token API. A stray key in the environment can NOT
+#               divert a handoff to metered billing; if codex is not
+#               logged in on a plan the read-only call fails and the
+#               orchestrator falls back to the manual handoff (fail-closed).
+#               This also honors the Codex docs' warning against exposing
+#               OPENAI_API_KEY/CODEX_API_KEY as job-level env around
+#               repo-controlled code.
 #   GH_TOKEN    only used if the diff must be fetched (no --diff-file).
 #
 # Exit codes:
@@ -99,7 +106,7 @@ trap "rm -f '$TMP_OUT'" EXIT
 
 set +e
 RAW="$(
-  printf '%s\n' "$DIFF" | "$CODEX_BIN" exec \
+  printf '%s\n' "$DIFF" | env -u OPENAI_API_KEY -u CODEX_API_KEY "$CODEX_BIN" exec \
     --sandbox "$SANDBOX" \
     --ask-for-approval never \
     ${MODEL:+--model "$MODEL"} \
@@ -109,7 +116,7 @@ RAW="$(
 )"
 RC=$?
 set -e
-[ "$RC" -eq 0 ] || p4b_die 4 "codex exec failed (rc=$RC) — fall back to manual handoff"
+[ "$RC" -eq 0 ] || p4b_die 4 "codex exec failed (rc=$RC) — ensure 'codex login' is active on a plan (API keys are scrubbed for plan-only billing); falling back to the manual handoff"
 
 # Prefer the --output-last-message file; fall back to captured stdout.
 CANDIDATE=""

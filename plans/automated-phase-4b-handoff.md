@@ -364,7 +364,7 @@ routes to the existing manual handoff via `scripts/post-phase-4b-handoff.sh`.
 There are two independent authentication planes, and conflating them is the main
 footgun:
 
-1. **Reasoning plane (LLM provider).** The reviewer CLI authenticates to OpenAI or Anthropic to think. Codex: `CODEX_API_KEY` single-run or `codex login`. Claude: `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`.
+1. **Reasoning plane (LLM provider).** The reviewer CLI authenticates to OpenAI or Anthropic to think, on the operator's **individual subscription plan** — Codex via `codex login` (ChatGPT account, `~/.codex/auth.json`); Claude via its subscription login (`claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`, or the OS keychain). **Plan-only billing is enforced, not assumed:** the adapters scrub the pay-per-token API-key env vars (`OPENAI_API_KEY`/`CODEX_API_KEY` for Codex; `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` for Claude) from the CLI invocation, so a stray key can never silently divert a handoff review to metered API billing. If the CLI is not plan-logged-in, the read-only call fails and the orchestrator falls back to the manual handoff (fail-closed) — it never bills the API.
 2. **Attribution plane (GitHub).** The review must be posted as `nathanpayne-codex` / `nathanpayne-claude` using the reviewer PAT through `scripts/gh-as-reviewer.sh`, which verifies the effective token identity before the write (`REVIEW_POLICY.md` § PAT lookup table; Operation-to-Identity Matrix).
 
 Because the sandboxed/plan-mode CLI runs read-only, it **cannot** post the GitHub
@@ -431,7 +431,7 @@ YAML block is a follow-up. The block is additive and does not alter the existing
 
 - **Prompt injection via PR diff.** A hostile diff could try to steer the reviewer CLI toward a spurious approval. Mitigations: the adapter runs read-only (Codex `--sandbox read-only`, Claude `--permission-mode plan`), so the CLI cannot act on injected instructions; the orchestrator—not the CLI—posts the review; and `fail_closed: true` means any non-conformant or ambiguous verdict downgrades to `COMMENTED` + human alert rather than `APPROVED`. Protected-path and threshold rules continue to apply upstream.
 - **Auto-approve is now a real merge signal.** Because the posted `APPROVED` clears the gate, the bar for emitting it must be high: only an unambiguous, schema-conformant approval on the *current* HEAD. Never infer approval from a partial parse.
-- **Credential blast radius.** New CLI credentials are scoped, resolved via `op-preflight`, and never exported as job-level env around repo-controlled code (Codex docs' explicit warning). Reviewer PATs keep their existing minimal scope; the GitHub write still flows through the token-verifying `gh-as-reviewer.sh`.
+- **Credential blast radius.** New CLI credentials are scoped, resolved via `op-preflight`, and never exported as job-level env around repo-controlled code (Codex docs' explicit warning). The adapters additionally **scrub the pay-per-token API-key env vars** (§ 11) so review reasoning runs only on the operator's subscription-plan login. Reviewer PATs keep their existing minimal scope; the GitHub write still flows through the token-verifying `gh-as-reviewer.sh`.
 - **Attribution integrity.** The two-plane split (§ 11) guarantees the review byline is the verified reviewer identity, not the CLI's ambient token.
 
 ## 15. Acceptance criteria
@@ -459,6 +459,7 @@ YAML block is a follow-up. The block is additive and does not alter the existing
 - **Claude `/review` field contract.** Confirm the exact `--output-format json` field names and whether `/review` posts its own review (to be suppressed in favor of the wrapper-posted one) or only emits findings.
 - **Cursor reviewer.** Worth a third adapter now, or defer until the interface stabilizes?
 - **Latency budget.** Headless review wall-clock vs the existing `review_timeout_seconds`; where to set the adapter timeout before manual fallback.
+- **Billing model — resolved.** Reviewer CLIs run on the operator's individual subscription plans, never the pay-per-token API. Enforced in the adapters by scrubbing `OPENAI_API_KEY`/`CODEX_API_KEY` (Codex) and `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` (Claude) before the CLI call, and covered by `tests/test_phase_4b_automation.sh`. A configurable API-billing mode — for a CI or org runner that has no plan login — is a deferred follow-up, not part of this reference.
 
 ## 18. References
 

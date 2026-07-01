@@ -44,10 +44,16 @@ phase-4b-classifier.sh (is 4b needed?) ─▶ phase-4b-review.sh
 
 - **Runtime:** `bash` (3.2+), `jq`, `gh`, `git`, and the reviewer CLI
   (`codex` and/or `claude`) on `PATH`.
-- **Reasoning-plane auth (per direction):** Codex — `CODEX_API_KEY` or
-  `codex login`; Claude — `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`)
-  or `ANTHROPIC_API_KEY`. Keep these out of job-level env around
-  repo-controlled code (Codex docs' warning).
+- **Reasoning-plane auth (per direction) — subscription plan only:** the
+  adapters run the reviewer CLI with the pay-per-token API-key env vars
+  scrubbed (`OPENAI_API_KEY`/`CODEX_API_KEY` for Codex;
+  `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` for Claude), so reasoning bills
+  against the operator's **individual plan**, never the metered API. Log in
+  once per direction: Codex via `codex login` (ChatGPT account); Claude via
+  its subscription login or `claude setup-token` (`CLAUDE_CODE_OAUTH_TOKEN`,
+  which is preserved). If the CLI is not plan-logged-in, the read-only call
+  fails and the orchestrator falls back to the manual handoff (fail-closed) —
+  it never uses the API.
 - **Attribution-plane auth:** the reviewer PAT, resolved by
   `scripts/op-preflight.sh` and used through `scripts/gh-as-reviewer.sh`
   (the script auto-sources the preflight cache).

@@ -544,6 +544,13 @@ phase_4b_default: complex-changes
 # scripts/phase-4b-review.sh exits 5 and the caller uses today's manual
 # handoff (scripts/post-phase-4b-handoff.sh) — no behavior change. Opt in
 # per repo, Mergepath first (narrow-start, like codex.p1_gate).
+#
+# BILLING: reviewer CLIs run on the operator's individual subscription
+# plans only. The adapters scrub OPENAI_API_KEY/CODEX_API_KEY (Codex) and
+# ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN (Claude) before invoking the CLI,
+# so a handoff review can never silently fall back to pay-per-token API
+# billing; if the CLI is not plan-logged-in the review fails closed to the
+# manual handoff. See plans/automated-phase-4b-handoff.md § 11.
 phase_4b_automation:
   # Master switch. false ⇒ manual handoff (current behavior).
   enabled: false
