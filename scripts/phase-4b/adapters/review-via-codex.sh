@@ -39,7 +39,7 @@
 #   GH_TOKEN    only used if the diff must be fetched (no --diff-file).
 #   P4B_REVIEW_CLI_TIMEOUT_SECONDS  default: P4B_ADAPTER_TIMEOUT_SECONDS
 #               or 900. Timeout maps to exit 4 / manual fallback.
-#   P4B_CODEX_EFFORT  reasoning effort (minimal|low|medium|high). Empty/unset
+#   P4B_CODEX_EFFORT  reasoning effort (minimal|low|medium|high|xhigh). Empty/unset
 #               ⇒ omit the flag and use the Codex CLI default. Maps to
 #               `codex -c model_reasoning_effort=<v>`. The orchestrator sets
 #               this from phase_4b_automation.codex_effort.
@@ -91,8 +91,8 @@ done
 command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
 [ -r "$SCHEMA" ] || p4b_die 3 "verdict schema not readable: $SCHEMA"
 case "$EFFORT" in
-  ''|minimal|low|medium|high) ;;
-  *) p4b_die 3 "invalid P4B_CODEX_EFFORT '$EFFORT' (expected minimal|low|medium|high)" ;;
+  ''|minimal|low|medium|high|xhigh) ;;
+  *) p4b_die 3 "invalid P4B_CODEX_EFFORT '$EFFORT' (expected minimal|low|medium|high|xhigh)" ;;
 esac
 
 # --- obtain the diff -------------------------------------------------------

@@ -111,35 +111,59 @@ if [ "$CLAUDE_PRESENT" = true ]; then
   [ "$CLAUDE_AUTH" = ok ] && CLAUDE_AUTH_OK=true
 fi
 
+# --- resolver validity per adapter (INVALID config is itself a blocker) -----
+# The orchestrator exits fail-closed on a malformed timeout/effort, so a config
+# that would not even start is not "ready" regardless of auth (#598 Codex P2).
+CODEX_CONFIG_OK=true;  p4b_resolve_adapter_timeout codex  >/dev/null 2>&1 && p4b_resolve_adapter_effort codex  >/dev/null 2>&1 || CODEX_CONFIG_OK=false
+CLAUDE_CONFIG_OK=true; p4b_resolve_adapter_timeout claude >/dev/null 2>&1 && p4b_resolve_adapter_effort claude >/dev/null 2>&1 || CLAUDE_CONFIG_OK=false
+
 # --- optional adapter dry-run per available direction ----------------------
 # A "direction is ready" when its CLI is present AND plan-authed. Run the
-# adapter directly (no orchestrator, so enabled:true is not required) and
-# capture the resulting verdict + rc.
-run_dryrun() { # run_dryrun <adapter> <bin-ok> -> prints "rc=<n> verdict=<v|->"
-  local adapter="$1" ok="$2" script args verdict rc out
+# adapter directly (no orchestrator, so enabled:true is not required) UNDER THE
+# SAME resolved timeout/effort the orchestrator would apply, so the dry-run
+# actually exercises the config being enabled (#598 Codex P2). Sets a global
+# <ADAPTER>_DRYRUN_STATUS of ok|failed|skipped.
+# Emits "<status>\t<display>" (status ∈ ok|failed|skipped) so the caller gets
+# BOTH from the command substitution — a status global set inside $(...) would
+# not reach the parent shell.
+run_dryrun() { # run_dryrun <adapter> <bin-ok>
+  local adapter="$1" ok="$2" script args verdict rc out timeout effort
   script="$HERE/adapters/review-via-${adapter}.sh"
-  [ "$ok" = true ] || { printf 'skipped (CLI absent or not plan-authed)'; return; }
-  [ -x "$script" ] || { printf 'skipped (adapter missing)'; return; }
+  [ "$ok" = true ] || { printf 'skipped\tskipped (CLI absent or not plan-authed)'; return; }
+  [ -x "$script" ] || { printf 'skipped\tskipped (adapter missing)'; return; }
   if [ -z "$DIFF_FILE" ] && { [ -z "$PR" ] || [ -z "$REPO" ]; }; then
-    printf 'skipped (pass --diff-file, or --pr and --repo)'; return
+    printf 'skipped\tskipped (pass --diff-file, or --pr and --repo)'; return
   fi
+  timeout="$(p4b_resolve_adapter_timeout "$adapter" 2>/dev/null)" \
+    || { printf 'failed\tfailed (invalid timeout config)'; return; }
+  effort="$(p4b_resolve_adapter_effort "$adapter" 2>/dev/null)" \
+    || { printf 'failed\tfailed (invalid effort config)'; return; }
   args=( --pr "${PR:-0}" )
   [ -n "$REPO" ]      && args+=( --repo "$REPO" )
   [ -n "$DIFF_FILE" ] && args+=( --diff-file "$DIFF_FILE" )
+  local env_prefix=( "P4B_REVIEW_CLI_TIMEOUT_SECONDS=$timeout" )
+  case "$adapter" in
+    codex)  [ -n "$effort" ] && env_prefix+=( "P4B_CODEX_EFFORT=$effort" ) ;;
+    claude) env_prefix+=( "P4B_CLAUDE_EFFORT=${effort:-medium}" ) ;;
+  esac
   set +e
-  out="$("$script" "${args[@]}" 2>/dev/null)"; rc=$?
+  out="$(env "${env_prefix[@]}" "$script" "${args[@]}" 2>/dev/null)"; rc=$?
   set -e
   if [ "$rc" -eq 0 ]; then
     verdict="$(printf '%s' "$out" | jq -r '.verdict // "?"' 2>/dev/null || printf '?')"
-    printf 'rc=0 verdict=%s' "$verdict"
+    printf 'ok\trc=0 verdict=%s' "$verdict"
   else
-    printf 'rc=%s verdict=- (fail-closed)' "$rc"
+    printf 'failed\trc=%s verdict=- (fail-closed)' "$rc"
   fi
 }
 CODEX_DRYRUN="not-run"; CLAUDE_DRYRUN="not-run"
+CODEX_DRYRUN_STATUS=skipped; CLAUDE_DRYRUN_STATUS=skipped
 if [ "$RUN_DRYRUN" != off ]; then
-  CODEX_DRYRUN="$(run_dryrun codex "$CODEX_AUTH_OK")"
-  CLAUDE_DRYRUN="$(run_dryrun claude "$CLAUDE_AUTH_OK")"
+  _r="$(run_dryrun codex "$CODEX_AUTH_OK")"
+  CODEX_DRYRUN_STATUS="${_r%%$'\t'*}"; CODEX_DRYRUN="${_r#*$'\t'}"
+  _r="$(run_dryrun claude "$CLAUDE_AUTH_OK")"
+  CLAUDE_DRYRUN_STATUS="${_r%%$'\t'*}"; CLAUDE_DRYRUN="${_r#*$'\t'}"
+  unset _r
 fi
 
 # --- readiness verdict -----------------------------------------------------
@@ -149,6 +173,20 @@ if [ "$ANY_KEY_SET" -eq 1 ]; then
 fi
 if [ "$CODEX_AUTH_OK" != true ] && [ "$CLAUDE_AUTH_OK" != true ]; then
   READY=false; BLOCKERS="${BLOCKERS}no direction has a plan-authed reviewer CLI; "
+fi
+# A plan-authed direction whose config is INVALID or whose requested dry-run
+# FAILED is not ready — the orchestrator would fail closed on it (#598 Codex P2).
+if [ "$CODEX_AUTH_OK" = true ] && [ "$CODEX_CONFIG_OK" != true ]; then
+  READY=false; BLOCKERS="${BLOCKERS}codex config resolves INVALID (timeout/effort out of range); "
+fi
+if [ "$CLAUDE_AUTH_OK" = true ] && [ "$CLAUDE_CONFIG_OK" != true ]; then
+  READY=false; BLOCKERS="${BLOCKERS}claude config resolves INVALID (timeout/effort out of range); "
+fi
+if [ "$CODEX_AUTH_OK" = true ] && [ "$CODEX_DRYRUN_STATUS" = failed ]; then
+  READY=false; BLOCKERS="${BLOCKERS}codex dry-run failed; "
+fi
+if [ "$CLAUDE_AUTH_OK" = true ] && [ "$CLAUDE_DRYRUN_STATUS" = failed ]; then
+  READY=false; BLOCKERS="${BLOCKERS}claude dry-run failed; "
 fi
 
 # --- emit ------------------------------------------------------------------

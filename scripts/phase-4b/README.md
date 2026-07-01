@@ -90,11 +90,11 @@ phase-4b-classifier.sh (is 4b needed?) ─▶ phase-4b-review.sh
     runs. A timeout exits through the same fail-closed manual-handoff path as any
     other adapter error.
   - **Effort:** `claude_effort` (`low|medium|high|xhigh|max`, default `medium`,
-    → `claude --effort`) and `codex_effort` (`minimal|low|medium|high`, default
-    empty = Codex CLI default, → `codex -c model_reasoning_effort`, validated
-    against codex-cli 0.137; `--strict-config` is not used, so an unrecognized
-    key on a future CLI is a harmless no-op). An invalid value is rejected
-    fail-closed.
+    → `claude --effort`) and `codex_effort` (`minimal|low|medium|high|xhigh`,
+    `xhigh` model-dependent, default empty = Codex CLI default, → `codex -c
+    model_reasoning_effort`, validated against codex-cli 0.137; `--strict-config`
+    is not used, so an unrecognized key on a future CLI is a harmless no-op). An
+    invalid value is rejected fail-closed.
 - **Review metadata:** posted reviews include reviewed head SHA, reviewer
   identity, adapter, adapter run count, timeout, token usage when exposed by
   the CLI, and an explicit `not exposed` marker for model-internal turn count.

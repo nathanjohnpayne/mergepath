@@ -626,9 +626,10 @@ phase_4b_automation:
 
   # Effort: how hard the reviewer CLI thinks. Accepted values differ per CLI.
   #   claude_effort → claude --effort: low|medium|high|xhigh|max (default medium)
-  #   codex_effort  → codex -c model_reasoning_effort: minimal|low|medium|high
-  #                   (default empty = the Codex CLI default; validated against
-  #                   codex-cli 0.137's config knob. If a future Codex CLI drops
+  #   codex_effort  → codex -c model_reasoning_effort: minimal|low|medium|high|xhigh
+  #                   (xhigh is model-dependent; default empty = the Codex CLI
+  #                   default; validated against codex-cli 0.137's config knob.
+  #                   If a future Codex CLI drops
   #                   the key it is a harmless no-op because --strict-config is
   #                   not used.)
   # An invalid value here is rejected fail-closed (orchestrator exits).

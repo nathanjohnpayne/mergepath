@@ -128,9 +128,9 @@ p4b_resolve_adapter_timeout() {
 # Resolve the reviewer CLI effort level for <adapter> from
 # phase_4b_automation.<adapter>_effort, validated against that adapter's
 # accepted set:
-#   claude → low|medium|high|xhigh|max   (maps to `claude --effort`; default medium)
-#   codex  → minimal|low|medium|high     (maps to `codex -c model_reasoning_effort`;
-#                                          default empty = CLI default / no-op)
+#   claude → low|medium|high|xhigh|max        (maps to `claude --effort`; default medium)
+#   codex  → minimal|low|medium|high|xhigh    (maps to `codex -c model_reasoning_effort`;
+#                                              default empty = CLI default / no-op)
 # Prints the value (possibly empty for codex) on success; returns non-zero on an
 # invalid configured value so the caller fails closed.
 p4b_resolve_adapter_effort() {
@@ -147,7 +147,7 @@ p4b_resolve_adapter_effort() {
     codex)
       [ -n "$val" ] || return 0   # empty = no -c flag (CLI default)
       case "$val" in
-        minimal|low|medium|high) printf '%s' "$val" ;;
+        minimal|low|medium|high|xhigh) printf '%s' "$val" ;;
         *) return 1 ;;
       esac
       ;;

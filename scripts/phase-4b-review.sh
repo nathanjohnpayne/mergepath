@@ -182,18 +182,27 @@ RESOLVED_EFFORT="$(p4b_resolve_adapter_effort "$ADAPTER")" \
   || p4b_die 3 "invalid phase_4b_automation effort for adapter '$ADAPTER'"
 # Outer adapter-call bound: env override wins, else the policy-resolved value.
 ADAPTER_TIMEOUT="${ADAPTER_TIMEOUT_ENV:-$RESOLVED_TIMEOUT}"
-# Feed the policy-resolved bounds to the adapter via env, but only where the
-# caller has not already set them (env override wins for tests/manual runs).
-: "${P4B_REVIEW_CLI_TIMEOUT_SECONDS:=$RESOLVED_TIMEOUT}"
+# Feed the effective bounds to the adapter via env, but only where the caller
+# has not already set them (env override wins for tests/manual runs). The inner
+# CLI timeout defaults to the SAME effective outer timeout (ADAPTER_TIMEOUT), so
+# a P4B_ADAPTER_TIMEOUT_SECONDS override to extend a slow run reaches the adapter
+# too and does not get shadowed by the policy value (#598 Codex P2).
+: "${P4B_REVIEW_CLI_TIMEOUT_SECONDS:=$ADAPTER_TIMEOUT}"
 export P4B_REVIEW_CLI_TIMEOUT_SECONDS
+# EFFECTIVE_EFFORT is the value the adapter actually runs at — an existing
+# P4B_{CLAUDE,CODEX}_EFFORT override is preserved by `:=`, so record THAT (not
+# the policy-resolved value) in the review metadata (#598 Codex P3).
 case "$ADAPTER" in
-  claude) : "${P4B_CLAUDE_EFFORT:=$RESOLVED_EFFORT}"; export P4B_CLAUDE_EFFORT ;;
+  claude) : "${P4B_CLAUDE_EFFORT:=$RESOLVED_EFFORT}"; export P4B_CLAUDE_EFFORT
+          EFFECTIVE_EFFORT="$P4B_CLAUDE_EFFORT" ;;
   codex)  if [ -n "$RESOLVED_EFFORT" ]; then
             : "${P4B_CODEX_EFFORT:=$RESOLVED_EFFORT}"; export P4B_CODEX_EFFORT
-          fi ;;
+          fi
+          EFFECTIVE_EFFORT="${P4B_CODEX_EFFORT:-}" ;;
+  *)      EFFECTIVE_EFFORT="$RESOLVED_EFFORT" ;;
 esac
 
-p4b_log "PR $REPO#$PR  HEAD=${HEAD:-?}  direction=$DIRECTION  reviewer=$REVIEWER  adapter=$ADAPTER  timeout=${ADAPTER_TIMEOUT}s  effort=${RESOLVED_EFFORT:-cli-default}  dry_run=$DRY_RUN"
+p4b_log "PR $REPO#$PR  HEAD=${HEAD:-?}  direction=$DIRECTION  reviewer=$REVIEWER  adapter=$ADAPTER  timeout=${ADAPTER_TIMEOUT}s  effort=${EFFECTIVE_EFFORT:-cli-default}  dry_run=$DRY_RUN"
 
 # --- manual-handoff fallback -----------------------------------------------
 fall_back_to_manual() {
@@ -263,7 +272,7 @@ trap "rm -f '$BODY_FILE'" EXIT
   printf -- '- Adapter: `%s`\n' "$ADAPTER"
   printf -- '- Adapter runs: `%s`\n' "$ADAPTER_RUNS"
   printf -- '- Adapter timeout: `%ss`\n' "$ADAPTER_TIMEOUT"
-  printf -- '- Reviewer effort: `%s`\n' "${RESOLVED_EFFORT:-cli-default}"
+  printf -- '- Reviewer effort: `%s`\n' "${EFFECTIVE_EFFORT:-cli-default}"
   if [ -n "$TOKEN_COUNT" ]; then
     printf -- '- Token usage: `%s` tokens' "$TOKEN_COUNT"
     [ -n "$USAGE_SOURCE" ] && printf ' (source: `%s`)' "$USAGE_SOURCE"
@@ -358,7 +367,7 @@ jq -n \
   --arg token_count "${TOKEN_COUNT:-}" \
   --arg usage_source "$USAGE_SOURCE" \
   --argjson adapter_timeout "$ADAPTER_TIMEOUT" \
-  --arg effort "$RESOLVED_EFFORT" \
+  --arg effort "$EFFECTIVE_EFFORT" \
   --argjson findings_count "$FINDINGS_COUNT" '
   {
     pr_number: $pr,
