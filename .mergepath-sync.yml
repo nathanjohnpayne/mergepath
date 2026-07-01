@@ -613,6 +613,14 @@ paths:
   - path: tests/test_phase_4b_automation.sh
     type: canonical
     consumers: all
+  # Schema↔validator parity fixtures hard-read at runtime by
+  # tests/test_phase_4b_automation.sh (#585). Without this propagated, a
+  # consumer's check_phase_4b_automation fails at "parity fixtures missing"
+  # even though the hub passes. The #519/#521 closure check does not scan
+  # tests/ references, so this first-class entry is what carries it.
+  - path: tests/fixtures/phase_4b_verdicts.jsonl
+    type: canonical
+    consumers: all
   # Pairs with scripts/op-preflight.sh + scripts/lib/preflight-helpers.sh
   # + scripts/ci/check_op_preflight_contract. The check wrapper requires
   # all four test files; same coupling pattern as the gh-as-author and

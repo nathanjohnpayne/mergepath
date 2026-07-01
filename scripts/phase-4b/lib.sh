@@ -343,7 +343,18 @@ p4b_validate_verdict() {
     | ($s.properties.usage.required | sort) as $usage_keys
     | def okstr: (type == "string") and (length > 0);
       def okintnull: (. == null) or (type == "number" and floor == . and . >= 0);
-      ((keys_unsorted | sort) == $top_keys)
+      # Guard the derived constants are the right SHAPE first. `sort` already
+      # errors (→ fail closed) if a required-key field is not an array, but the
+      # enums are consumed with `index`, which on a STRING does a substring
+      # search instead of array membership — a malformed schema (or a hostile
+      # P4B_VERDICT_SCHEMA_PATH) with an enum as a scalar would then wrongly
+      # accept "APPROVED"/"P1". Assert array shape so a bad schema fails closed.
+      (($verdict_enum | type) == "array")
+      and (($severity_enum | type) == "array")
+      and (($top_keys | type) == "array")
+      and (($finding_keys | type) == "array")
+      and (($usage_keys | type) == "array")
+      and ((keys_unsorted | sort) == $top_keys)
       and ((.verdict) as $v | ($verdict_enum | index($v)) != null)
       and (.summary | okstr)
       and (.findings | type == "array")
@@ -366,19 +377,22 @@ p4b_validate_verdict() {
 }
 
 # p4b_extract_json_block <text>
-# Emit the first COMPLETE, balanced, top-level JSON object embedded in the
-# text. Used by the Claude adapter, whose model output may wrap the JSON in
-# prose. Leaves already-pure JSON unchanged.
+# Emit the SOLE complete, balanced, top-level JSON object embedded in the text.
+# Used by the Claude adapter, whose model output may wrap the JSON in prose.
+# Leaves already-pure JSON unchanged.
 #
 # Implementation (#587): a string-aware brace-depth scanner, not a naive
-# first-"{"-to-last-"}" slice. It tracks JSON string literals (honoring \"
-# and \\ escapes) so braces inside string VALUES do not change nesting
-# depth, and it stops at the matching close brace of the first object — so
-# balanced-brace prose AFTER the JSON object (e.g. "For example: { ... }")
-# can no longer extend the slice and poison extraction. Markdown code fences
-# alone on a line are stripped first. When no balanced object is found it
-# emits nothing, so downstream schema validation fails closed on ambiguous
-# or non-JSON model output.
+# first-"{"-to-last-"}" slice. It tracks JSON string literals (honoring \" and
+# \\ escapes) so braces inside string VALUES do not change nesting depth, and
+# it isolates the first balanced top-level object — so balanced-brace prose
+# after the JSON object can no longer extend the slice and poison extraction.
+#
+# It then requires that to be the ONLY top-level object: if a second `{` opens
+# outside a string in the remainder, the output is ambiguous (e.g. a draft
+# APPROVED followed by a corrected CHANGES_REQUESTED) and this emits nothing so
+# downstream schema validation fails closed rather than silently posting the
+# first verdict (#594 Codex). Markdown code fences alone on a line are stripped
+# first. Unbalanced, object-free, or multi-object input all emit nothing.
 p4b_extract_json_block() {
   printf '%s\n' "$1" \
     | sed -e 's/^```[A-Za-z0-9]*[[:space:]]*$//' -e 's/^```[[:space:]]*$//' \
@@ -388,7 +402,7 @@ p4b_extract_json_block() {
           n = length(buf)
           start = index(buf, "{")
           if (start == 0) exit 0
-          depth = 0; instr = 0; esc = 0
+          depth = 0; instr = 0; esc = 0; endpos = 0
           for (i = start; i <= n; i++) {
             c = substr(buf, i, 1)
             if (instr) {
@@ -401,13 +415,25 @@ p4b_extract_json_block() {
             if (c == "{")  { depth++ }
             else if (c == "}") {
               depth--
-              if (depth == 0) {                         # matched the first object
-                printf "%s", substr(buf, start, i - start + 1)
-                exit 0
-              }
+              if (depth == 0) { endpos = i; break }    # first object closed
             }
           }
-          # Never returned to depth 0 (unbalanced): emit nothing → fail closed.
+          if (endpos == 0) exit 0                       # unbalanced → fail closed
+          # Reject a SECOND top-level object in the remainder (string-aware):
+          # ambiguous multi-verdict output must fail closed, not take the first.
+          instr = 0; esc = 0
+          for (i = endpos + 1; i <= n; i++) {
+            c = substr(buf, i, 1)
+            if (instr) {
+              if (esc)       { esc = 0;   continue }
+              if (c == "\\") { esc = 1;   continue }
+              if (c == "\"") { instr = 0; continue }
+              continue
+            }
+            if (c == "\"") { instr = 1; continue }
+            if (c == "{")  { exit 0 }                   # second object → fail closed
+          }
+          printf "%s", substr(buf, start, endpos - start + 1)
         }'
 }
 

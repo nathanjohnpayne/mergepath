@@ -189,13 +189,20 @@ mk_fake fake-claude-braces \
   "jq -n --arg r 'Here is the verdict:
 {\"verdict\":\"CHANGES_REQUESTED\",\"summary\":\"body has braces\",\"findings\":[{\"severity\":\"P1\",\"path\":\"x.js\",\"line\":2,\"body\":\"snippet contains { braces } and stays valid\"}]}
 Done.' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",total_cost_usd:0}'"
-# #587: a valid verdict object FOLLOWED by prose that itself contains balanced
-# braces. A naive first-{-to-last-} slice would swallow the trailing braces and
-# corrupt the JSON; the string-aware scanner stops at the first object's close.
+# #587: a valid verdict object FOLLOWED by prose (with a lone brace char, no
+# second object). A naive first-{-to-last-} slice would swallow the trailing
+# brace and corrupt the JSON; the string-aware scanner isolates the first
+# object. (A trailing balanced OBJECT instead fails closed — see #594.)
 mk_fake fake-claude-trailing-braces \
   "jq -n --arg r 'Here is my verdict:
 {\"verdict\":\"APPROVED\",\"summary\":\"clean\",\"findings\":[]}
-For example, a config like { \"a\": { \"b\": 1 } } would also pass review.' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",total_cost_usd:0}'"
+Looks good to me. The } below is just prose.' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",total_cost_usd:0}'"
+# #594: two verdict objects (draft then correction) must fail closed, not post
+# the first.
+mk_fake fake-claude-multi-verdict \
+  "jq -n --arg r '{\"verdict\":\"APPROVED\",\"summary\":\"draft\",\"findings\":[]}
+On reflection:
+{\"verdict\":\"CHANGES_REQUESTED\",\"summary\":\"final\",\"findings\":[{\"severity\":\"P1\",\"path\":\"x.js\",\"line\":2,\"body\":\"bug\"}]}' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",total_cost_usd:0}'"
 mk_fake fake-claude-junk \
   "jq -n '{type:\"result\",result:\"no json here\",session_id:\"t\"}'"
 
@@ -454,17 +461,24 @@ chk_extract "extract: pure JSON unchanged" \
   '{"a":1}' '{"a":1}'
 chk_extract "extract: leading prose skipped" \
   'blah blah {"a":1}' '{"a":1}'
-chk_extract "extract: trailing balanced-brace prose ignored" \
+chk_extract "extract: trailing prose (no second object) is ignored" \
   '{"a":1}
-For example { "x": { "y": 1 } } is fine.' '{"a":1}'
+Looks good, ship it. The } char in prose is harmless.' '{"a":1}'
+chk_extract "extract: trailing balanced-brace OBJECT prose fails closed (#594)" \
+  '{"a":1}
+For example { "x": { "y": 1 } } is fine.' ''
 chk_extract "extract: braces inside string value preserved" \
   '{"body":"has } and { inside"}' '{"body":"has } and { inside"}'
 chk_extract "extract: escaped quote before brace stays in string" \
   '{"body":"quote \" then } still in"}' '{"body":"quote \" then } still in"}'
 chk_extract "extract: nested object emitted whole" \
   '{"a":{"b":2}}' '{"a":{"b":2}}'
-chk_extract "extract: only the first of multiple objects" \
-  '{"a":1} {"b":2}' '{"a":1}'
+chk_extract "extract: multiple top-level objects fail closed (#594)" \
+  '{"a":1} {"b":2}' ''
+chk_extract "extract: draft-then-correction multi-verdict fails closed (#594)" \
+  '{"verdict":"APPROVED"}
+Actually, correcting:
+{"verdict":"CHANGES_REQUESTED"}' ''
 chk_extract "extract: unbalanced object emits nothing (fail closed)" \
   '{"a":' ''
 chk_extract "extract: no object at all emits nothing" \
@@ -524,6 +538,20 @@ while IFS= read -r key; do
   p4b_validate_verdict "$v" && fail "verdict missing schema-required key accepted: $key" \
     || pass "verdict missing schema-required key rejected: $key"
 done < <(jq -r '.required[]' "$SCHEMA_FILE")
+
+# (b') Malformed schema (#594): an enum degraded to a SCALAR string must fail
+# closed, not let jq's `index` do substring matching (which would accept
+# "APPROVED"/"P1"). Point P4B_VERDICT_SCHEMA_PATH at a bad schema and confirm an
+# otherwise-valid verdict is rejected.
+BAD_SCHEMA="$WORK/bad-schema.json"
+jq '.properties.verdict.enum = "APPROVED"' "$SCHEMA_FILE" > "$BAD_SCHEMA"
+if P4B_VERDICT_SCHEMA_PATH="$BAD_SCHEMA" p4b_validate_verdict '{"verdict":"APPROVED","summary":"x","findings":[],"usage":null}'; then
+  fail "scalar verdict enum in a malformed schema accepted (should fail closed)"
+else pass "malformed schema (verdict enum as scalar) fails closed"; fi
+jq '.properties.findings.items.properties.severity.enum = "P1"' "$SCHEMA_FILE" > "$BAD_SCHEMA"
+if P4B_VERDICT_SCHEMA_PATH="$BAD_SCHEMA" p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P1","path":"a","line":1,"body":"b"}],"usage":null}'; then
+  fail "scalar severity enum in a malformed schema accepted (should fail closed)"
+else pass "malformed schema (severity enum as scalar) fails closed"; fi
 
 # (c) Optional independent cross-check against the JSON Schema itself. The
 # validator is a superset of the schema (it adds the feedback_policy gate), so
@@ -604,7 +632,7 @@ if [ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.findings[0].body == "snippet co
   pass "claude adapter extracts verdict when finding text contains braces"
 else fail "claude adapter braces extraction (rc=$rc, out=$out)"; fi
 
-# #587: prose with balanced braces AFTER the JSON object must not poison
+# #587: prose (no second object) AFTER the JSON object must not poison
 # extraction; the adapter still returns the first object's clean verdict.
 set +e
 out="$(CLAUDE_BIN="$BIN/fake-claude-trailing-braces" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
@@ -612,8 +640,16 @@ set -e
 if [ "$rc" = 0 ] \
    && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ] \
    && [ "$(printf '%s' "$out" | jq -r '.findings | length')" = "0" ]; then
-  pass "claude adapter ignores balanced-brace prose trailing the JSON object (#587)"
-else fail "claude adapter trailing-brace extraction (rc=$rc, out=$out)"; fi
+  pass "claude adapter ignores trailing prose after the JSON object (#587)"
+else fail "claude adapter trailing-prose extraction (rc=$rc, out=$out)"; fi
+
+# #594: two verdict objects (draft + correction) → fail closed, never post the
+# first (which could be an APPROVED the model then retracted).
+set +e
+CLAUDE_BIN="$BIN/fake-claude-multi-verdict" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF" >/dev/null 2>&1; rc=$?
+set -e
+[ "$rc" = 4 ] && pass "claude adapter fails closed (exit 4) on multi-verdict output (#594)" \
+  || fail "claude adapter multi-verdict should exit 4 (got $rc)"
 
 set +e
 CLAUDE_BIN="$BIN/fake-claude-junk" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF" >/dev/null 2>&1; rc=$?
