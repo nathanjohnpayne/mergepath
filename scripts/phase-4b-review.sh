@@ -32,7 +32,14 @@
 #   CODEX_BIN / CLAUDE_BIN          adapter CLI overrides (tests).
 #   P4B_GH_AS_REVIEWER              reviewer wrapper override (tests).
 #   P4B_HANDOFF                     manual handoff renderer override (tests).
-#   P4B_ADAPTER_TIMEOUT_SECONDS     default: 900.
+#   P4B_ADAPTER_TIMEOUT_SECONDS     env override for the outer adapter-call
+#                                   timeout; default is resolved per-adapter
+#                                   from phase_4b_automation (900 when absent).
+#   Timeout + effort are otherwise read from phase_4b_automation
+#   (adapter_timeout_seconds / <adapter>_timeout_seconds / <adapter>_effort;
+#   see p4b_resolve_adapter_timeout / p4b_resolve_adapter_effort) and passed to
+#   the adapter via P4B_REVIEW_CLI_TIMEOUT_SECONDS / P4B_{CLAUDE,CODEX}_EFFORT.
+#   A malformed or out-of-range config fails closed (exit 3).
 #
 # Exit codes:
 #   0  APPROVED — review posted (or would post under --dry-run).
@@ -53,7 +60,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ADAPTER_DIR="$ROOT/phase-4b/adapters"
 HANDOFF="${P4B_HANDOFF:-$ROOT/post-phase-4b-handoff.sh}"
 GH_AS_REVIEWER="${P4B_GH_AS_REVIEWER:-$ROOT/gh-as-reviewer.sh}"
-ADAPTER_TIMEOUT="${P4B_ADAPTER_TIMEOUT_SECONDS:-900}"
+# Outer adapter-call timeout. An explicit env override wins (tests/manual);
+# otherwise it is resolved per-adapter from policy after the reviewer is chosen
+# (see p4b_resolve_adapter_timeout). Captured here so the env override is not
+# shadowed by the policy resolution below.
+ADAPTER_TIMEOUT_ENV="${P4B_ADAPTER_TIMEOUT_SECONDS:-}"
+ADAPTER_TIMEOUT=""
 
 PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; DIFF_FILE="" ; DRY_RUN=false
 
@@ -161,7 +173,36 @@ ADAPTER="$(p4b_adapter_of_login "$REVIEWER")"
 ADAPTER_SCRIPT="$ADAPTER_DIR/review-via-${ADAPTER}.sh"
 DIRECTION="${AUTHOR_AGENT}->${ADAPTER}"
 
-p4b_log "PR $REPO#$PR  HEAD=${HEAD:-?}  direction=$DIRECTION  reviewer=$REVIEWER  adapter=$ADAPTER  dry_run=$DRY_RUN"
+# --- resolve reviewer CLI runtime bounds from policy (#589) -----------------
+# Fail closed on a malformed/out-of-range config rather than running the CLI
+# mis-bounded or with an invalid effort.
+RESOLVED_TIMEOUT="$(p4b_resolve_adapter_timeout "$ADAPTER")" \
+  || p4b_die 3 "invalid phase_4b_automation timeout for adapter '$ADAPTER' (integer seconds in [${P4B_MIN_ADAPTER_TIMEOUT_SECONDS}, ${P4B_MAX_ADAPTER_TIMEOUT_SECONDS}] required)"
+RESOLVED_EFFORT="$(p4b_resolve_adapter_effort "$ADAPTER")" \
+  || p4b_die 3 "invalid phase_4b_automation effort for adapter '$ADAPTER'"
+# Outer adapter-call bound: env override wins, else the policy-resolved value.
+ADAPTER_TIMEOUT="${ADAPTER_TIMEOUT_ENV:-$RESOLVED_TIMEOUT}"
+# Feed the effective bounds to the adapter via env, but only where the caller
+# has not already set them (env override wins for tests/manual runs). The inner
+# CLI timeout defaults to the SAME effective outer timeout (ADAPTER_TIMEOUT), so
+# a P4B_ADAPTER_TIMEOUT_SECONDS override to extend a slow run reaches the adapter
+# too and does not get shadowed by the policy value (#598 Codex P2).
+: "${P4B_REVIEW_CLI_TIMEOUT_SECONDS:=$ADAPTER_TIMEOUT}"
+export P4B_REVIEW_CLI_TIMEOUT_SECONDS
+# EFFECTIVE_EFFORT is the value the adapter actually runs at — an existing
+# P4B_{CLAUDE,CODEX}_EFFORT override is preserved by `:=`, so record THAT (not
+# the policy-resolved value) in the review metadata (#598 Codex P3).
+case "$ADAPTER" in
+  claude) : "${P4B_CLAUDE_EFFORT:=$RESOLVED_EFFORT}"; export P4B_CLAUDE_EFFORT
+          EFFECTIVE_EFFORT="$P4B_CLAUDE_EFFORT" ;;
+  codex)  if [ -n "$RESOLVED_EFFORT" ]; then
+            : "${P4B_CODEX_EFFORT:=$RESOLVED_EFFORT}"; export P4B_CODEX_EFFORT
+          fi
+          EFFECTIVE_EFFORT="${P4B_CODEX_EFFORT:-}" ;;
+  *)      EFFECTIVE_EFFORT="$RESOLVED_EFFORT" ;;
+esac
+
+p4b_log "PR $REPO#$PR  HEAD=${HEAD:-?}  direction=$DIRECTION  reviewer=$REVIEWER  adapter=$ADAPTER  timeout=${ADAPTER_TIMEOUT}s  effort=${EFFECTIVE_EFFORT:-cli-default}  dry_run=$DRY_RUN"
 
 # --- manual-handoff fallback -----------------------------------------------
 fall_back_to_manual() {
@@ -231,6 +272,7 @@ trap "rm -f '$BODY_FILE'" EXIT
   printf -- '- Adapter: `%s`\n' "$ADAPTER"
   printf -- '- Adapter runs: `%s`\n' "$ADAPTER_RUNS"
   printf -- '- Adapter timeout: `%ss`\n' "$ADAPTER_TIMEOUT"
+  printf -- '- Reviewer effort: `%s`\n' "${EFFECTIVE_EFFORT:-cli-default}"
   if [ -n "$TOKEN_COUNT" ]; then
     printf -- '- Token usage: `%s` tokens' "$TOKEN_COUNT"
     [ -n "$USAGE_SOURCE" ] && printf ' (source: `%s`)' "$USAGE_SOURCE"
@@ -324,6 +366,8 @@ jq -n \
   --argjson dry_run "$DRY_RUN" \
   --arg token_count "${TOKEN_COUNT:-}" \
   --arg usage_source "$USAGE_SOURCE" \
+  --argjson adapter_timeout "$ADAPTER_TIMEOUT" \
+  --arg effort "$EFFECTIVE_EFFORT" \
   --argjson findings_count "$FINDINGS_COUNT" '
   {
     pr_number: $pr,
@@ -336,6 +380,8 @@ jq -n \
     review_posted: $review_posted,
     dry_run: $dry_run,
     findings_count: $findings_count,
+    adapter_timeout_seconds: $adapter_timeout,
+    reviewer_effort: (if $effort == "" then null else $effort end),
     token_count: (if $token_count == "" then null else ($token_count | tonumber) end),
     usage_source: (if $usage_source == "" then null else $usage_source end),
     fell_back_to_manual: false,

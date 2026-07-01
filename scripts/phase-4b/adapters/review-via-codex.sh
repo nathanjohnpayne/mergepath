@@ -39,6 +39,10 @@
 #   GH_TOKEN    only used if the diff must be fetched (no --diff-file).
 #   P4B_REVIEW_CLI_TIMEOUT_SECONDS  default: P4B_ADAPTER_TIMEOUT_SECONDS
 #               or 900. Timeout maps to exit 4 / manual fallback.
+#   P4B_CODEX_EFFORT  reasoning effort (minimal|low|medium|high|xhigh). Empty/unset
+#               ⇒ omit the flag and use the Codex CLI default. Maps to
+#               `codex -c model_reasoning_effort=<v>`. The orchestrator sets
+#               this from phase_4b_automation.codex_effort.
 #
 # Exit codes:
 #   0  valid verdict JSON on stdout.
@@ -60,6 +64,11 @@ CODEX_BIN="${CODEX_BIN:-codex}"
 PR="" ; REPO="" ; HEAD="" ; DIFF_FILE="" ; MODEL="${P4B_CODEX_MODEL:-}"
 SANDBOX=read-only
 CLI_TIMEOUT="${P4B_REVIEW_CLI_TIMEOUT_SECONDS:-${P4B_ADAPTER_TIMEOUT_SECONDS:-900}}"
+# Reasoning effort (#589). Empty ⇒ omit the flag and use the Codex CLI default
+# (historical behavior). When set it maps to `-c model_reasoning_effort=<v>`,
+# the config knob exposed by codex-cli 0.137. --strict-config is intentionally
+# NOT used, so an unrecognized key on a future CLI is a harmless no-op.
+EFFORT="${P4B_CODEX_EFFORT:-}"
 
 usage() {
   echo "usage: review-via-codex.sh --pr <N> --repo <owner/repo> [--head <sha>] [--diff-file <path>] [--model <m>]" >&2
@@ -81,6 +90,10 @@ done
 [ -n "$PR" ] || usage
 command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
 [ -r "$SCHEMA" ] || p4b_die 3 "verdict schema not readable: $SCHEMA"
+case "$EFFORT" in
+  ''|minimal|low|medium|high|xhigh) ;;
+  *) p4b_die 3 "invalid P4B_CODEX_EFFORT '$EFFORT' (expected minimal|low|medium|high|xhigh)" ;;
+esac
 
 # --- obtain the diff -------------------------------------------------------
 DIFF=""
@@ -154,6 +167,7 @@ RAW="$(
     --ignore-rules \
     --sandbox "$SANDBOX" \
     ${MODEL:+--model "$MODEL"} \
+    ${EFFORT:+-c model_reasoning_effort="$EFFORT"} \
     --output-schema "$SCHEMA" \
     -o "$TMP_OUT" \
     "$PROMPT" 2>"$ERR_OUT"
