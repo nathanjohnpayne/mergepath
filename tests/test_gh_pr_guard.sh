@@ -823,7 +823,8 @@ assert_rc_contains "backtick-synth exe+noun (gh issue) then bare comment fails c
 assert_rc_contains "cmdsub-synth exe then --repo before a bare create verb fails closed (#573)" 2 "wrapper" \
   '$(printf "\147\150") --repo o/r create --title x'
 # No false positive: a command-position cmdsub followed by a NON-write
-# subcommand (a gh read) is not force-tokenized and stays allowed.
+# subcommand (a gh read) is tokenized (#611 r3: any substitution tokenizes)
+# but carries no guarded-write evidence, so it stays allowed.
 assert_rc_contains "command-position cmdsub then a non-write subcommand stays allowed (#573)" 0 "" \
   '$(printf "\147\150") status'
 # CodeRabbit Major on #611: the fast-path verb probe must also fire when the
@@ -855,6 +856,48 @@ assert_rc_contains "cmdsub as value-taking flag arg stays allowed (#560)" 0 "" \
   'env -u $(printf "\147\150") pr merge 1'
 assert_rc_contains "cmdsub as echo argument stays allowed (#560)" 0 "" \
   'echo $(printf "\147\150") pr merge'
+
+# --- #611 round 3 (Codex P1 x2): escape spellings + split placeholder runs ---
+# (1) The write verb can be escape-spelled (m\erge): bash unescapes it at
+# execution, but no literal probe can enumerate escape spellings. The
+# fast-path now force-tokenizes on ANY substitution; shlex canonicalizes the
+# escape and synth_cmdsub_write_label sees the bare verb.
+assert_rc_contains "cmdsub-synth exe+noun then ESCAPED verb fails closed (#611 r3)" 2 "wrapper" \
+  '$(printf "\147\150\40\160\162") m\erge 123 --admin'
+# (2) The exe and noun split across a placeholder RUN with a literal verb:
+# evidence mode treats placeholders as transparent and blocks the guarded
+# verb reached across the run.
+assert_rc_contains "split placeholder run (gh)(pr) then merge fails closed (#611 r3)" 2 "wrapper" \
+  '$(printf "\147\150") $(printf "\160\162") merge 123 --admin'
+# (2b) A run containing an empty-expansion substitution before literal
+# noun+verb: $(true) expands to nothing, so bash still executes gh pr merge.
+assert_rc_contains "placeholder run with literal noun+verb fails closed (#611 r3)" 2 "wrapper" \
+  '$(printf "\147\150") $(true) pr merge 1'
+# (3) The EXECUTABLE escape-spelled with no substitution at all: the
+# backslash-stripped fast-path probe sees gh, and shlex canonicalizes the
+# token for the main walk.
+assert_rc_contains "escaped executable g\\h pr merge fails closed (#611 r3)" 2 "wrapper" \
+  'g\h pr merge 123 --admin'
+# (4) A LITERAL gh with a substitution in its subcommand stream (strict
+# mode): the substitution can synthesize the noun, the verb, or both, so no
+# literal evidence can clear it — fail closed on the placeholder itself.
+assert_rc_contains "literal gh + cmdsub noun + bare merge fails closed (#611 r3)" 2 "wrapper" \
+  'gh $(printf "\160\162") merge 123 --admin'
+assert_rc_contains "literal gh + cmdsub noun-and-verb fails closed (#611 r3)" 2 "wrapper" \
+  'gh $(printf "\160\162\40\155\145\162\147\145") 123 --admin'
+assert_rc_contains "literal gh pr + cmdsub verb fails closed (#611 r3)" 2 "wrapper" \
+  'gh pr $(printf "\155\145\162\147\145") 123 --admin'
+assert_rc_contains "literal gh + empty-expansion cmdsub + pr merge fails closed (#611 r3)" 2 "wrapper" \
+  'gh $(true) pr merge 123'
+# Controls: benign substitutions stay allowed — a path-building cmdsub, a
+# cmdsub argument after a literal gh READ verb, and a placeholder run with no
+# guarded evidence at all.
+assert_rc_contains "path-building cmdsub stays allowed (#611 r3)" 0 "" \
+  '$(brew --prefix)/bin/some-tool --admin'
+assert_rc_contains "gh read with cmdsub argument stays allowed (#611 r3)" 0 "" \
+  'gh pr view $(printf "\61") --json title'
+assert_rc_contains "placeholder run with no guarded evidence stays allowed (#611 r3)" 0 "" \
+  '$(printf a) $(printf b) c'
 
 # #553 fix (b): the merge-state jq counts an un-timestamped PENDING re-run as
 # non-green even when a timestamped SUCCESS exists for the same check (the prior

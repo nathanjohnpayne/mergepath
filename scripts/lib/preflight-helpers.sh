@@ -133,12 +133,31 @@ auto_source_preflight() {
   # GITHUB_TOKEN over the freshly-sourced GH_TOKEN — shadow the cached PAT
   # the cache is about to export. Unset both so the resolved environment
   # ends with ONLY the cache's own credentials, never a leaked ambient one.
+  #
+  # #611 (Codex P2): the scrub must not DESTROY the caller's auth when the
+  # cache provides no replacement. A fresh cache from `--mode deploy` (or any
+  # cache without a GitHub PAT) exports no GH_TOKEN and no OP_PREFLIGHT_*_PAT,
+  # and unconditionally dropping the ambient GITHUB_TOKEN would leave the
+  # caller with no GitHub credential at all. Snapshot the ambient value and
+  # restore it below iff sourcing produced NO GitHub credential of any kind —
+  # the shadowing hazard the scrub exists for only arises when the cache
+  # actually supplies one.
+  local _ambient_github_token_set=0 _ambient_github_token=""
+  if [[ -n "${GITHUB_TOKEN+x}" ]]; then
+    _ambient_github_token_set=1
+    _ambient_github_token="$GITHUB_TOKEN"
+  fi
   unset GH_TOKEN GITHUB_TOKEN
   # Source the cache file. Permissions are 0600 in a 0700 cache dir,
   # owner-only; we trust the file the same way op-preflight.sh itself
   # does on the cache-hit path.
   # shellcheck disable=SC1090
   . "$session_file"
+  if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" \
+        && -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" && -z "${OP_PREFLIGHT_AUTHOR_PAT:-}" \
+        && "$_ambient_github_token_set" -eq 1 ]]; then
+    export GITHUB_TOKEN="$_ambient_github_token"
+  fi
   if [[ "${OP_PREFLIGHT_QUIET:-0}" != "1" ]]; then
     echo "# auto-source: loaded op-preflight cache for agent=$agent (no biometric)" >&2
   fi

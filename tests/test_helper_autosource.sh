@@ -224,6 +224,45 @@ test_lib_auto_source_scrubs_ambient_github_token() {
 }
 
 # ---------------------------------------------------------------------------
+# Test 3d (#611 Codex P2): the #573 scrub must NOT destroy the caller's
+# ambient GITHUB_TOKEN when the fresh cache supplies no GitHub credential of
+# its own (a --mode deploy cache exports no GH_TOKEN and no
+# OP_PREFLIGHT_*_PAT). The ambient token is restored after sourcing; with a
+# PAT-bearing cache (test 3b) it stays scrubbed.
+# ---------------------------------------------------------------------------
+test_lib_auto_source_preserves_ambient_when_cache_has_no_pat() {
+  (
+    local case_dir="$WORKDIR/lib3d"
+    mkdir -p "$case_dir"
+    chmod 700 "$case_dir"
+    cat > "$case_dir/op-preflight-claude.env" <<EOF
+OP_PREFLIGHT_CREATED_AT_EPOCH=$(date +%s)
+OP_PREFLIGHT_TTL_SECONDS=14400
+OP_PREFLIGHT_AGENT=claude
+OP_PREFLIGHT_MODE=deploy
+OP_PREFLIGHT_DONE=1
+EOF
+    chmod 600 "$case_dir/op-preflight-claude.env"
+    unset GH_TOKEN OP_PREFLIGHT_REVIEWER_PAT OP_PREFLIGHT_AUTHOR_PAT
+    export OP_PREFLIGHT_CACHE_DIR="$case_dir"
+    export MERGEPATH_AGENT=claude
+    export GITHUB_TOKEN="caller-ci-github-token"
+    # shellcheck source=../scripts/lib/preflight-helpers.sh
+    . "$LIB"
+    auto_source_preflight
+    if [ "${GITHUB_TOKEN:-}" != "caller-ci-github-token" ]; then
+      echo "PAT-less cache destroyed ambient GITHUB_TOKEN (got '${GITHUB_TOKEN:-}')" >&2
+      exit 1
+    fi
+  ) >"$WORKDIR/lib3d.out" 2>"$WORKDIR/lib3d.err" && local rc=0 || local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "test_lib_auto_source_preserves_ambient_when_cache_has_no_pat: rc=$rc stderr=$(cat "$WORKDIR/lib3d.err")"
+    return
+  fi
+  pass "test_lib_auto_source_preserves_ambient_when_cache_has_no_pat: PAT-less cache restores ambient GITHUB_TOKEN (#611)"
+}
+
+# ---------------------------------------------------------------------------
 # Test 3c (#573): load_preflight_env_vars scrubs ambient GH_TOKEN /
 # GITHUB_TOKEN inside the sourcing subshells, so a stray ambient token cannot
 # leak into the resolved PATs. The cache derives its PATs from $GH_TOKEN /
@@ -423,6 +462,7 @@ test_lib_auto_source_basic
 test_lib_gh_token_passthrough
 test_lib_stale_cache_noop
 test_lib_auto_source_scrubs_ambient_github_token
+test_lib_auto_source_preserves_ambient_when_cache_has_no_pat
 test_lib_load_env_vars_scrubs_ambient_token
 test_lib_require_token_reviewer
 test_lib_require_token_author

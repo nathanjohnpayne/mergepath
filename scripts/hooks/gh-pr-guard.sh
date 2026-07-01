@@ -254,36 +254,29 @@ COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 # tokenizer then blocks the env -S, fail-closed). Over-matching only costs one
 # tokenizer run; a false negative is a bypass.
 NEEDS_TOKENIZE=0
-if echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])([^[:space:]]*/)?gh([^A-Za-z0-9_]|$)'; then
+if echo "$COMMAND" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])([^[:space:]]*/)?gh([^A-Za-z0-9_]|$)'; then
   NEEDS_TOKENIZE=1
-elif echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
-     && echo "$COMMAND" | tr -d "\"'" | grep -qE '(-[A-Za-z]*S|--split-string)'; then
+elif echo "$COMMAND" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
+     && echo "$COMMAND" | tr -d "\"'\\\\" | grep -qE '(-[A-Za-z]*S|--split-string)'; then
   # Quote-stripped (Codex #551): a quoted `'env'` runs env but would otherwise
-  # leave a quote, not whitespace, after `env` and dodge this probe.
+  # leave a quote, not whitespace, after `env` and dodge this probe. Backslashes
+  # are stripped alongside quotes (#611 round 3): bash unescapes `g\h` / `e\nv`
+  # to `gh` / `env` at execution, so escape-spelled literals must reach the
+  # probes in their canonical form too.
   NEEDS_TOKENIZE=1
-elif echo "$COMMAND" | tr -d "\"'" | grep -qE '\$\(|`' \
-     && echo "$COMMAND" | tr -d "\"'" \
-        | grep -qE '(^|[^A-Za-z0-9_])(pr|issue|create|merge|comment|review|edit)([[:space:]]|$)'; then
-  # #553 / #560: a command substitution can synthesize the executable name in
-  # COMMAND position (e.g. `$(printf '\147\150')` -> gh), so the raw command
-  # carries no literal `gh` and the gh / env -S probes above miss it. This holds
-  # even after a prefix command + options (`command -p`, `env -i`), a value-taking
-  # flag (`env -u NAME`), or a quoted env assignment (`FOO="a b"`) — forms the
-  # earlier command-position-only regex could not express.
-  #
-  # #573: the cmdsub can synthesize BOTH the executable AND the noun
-  # (`$(printf '\147\150\40\160\162')` -> `gh pr`), so the raw command carries
-  # neither a literal `gh` NOR a literal `pr`/`issue` — only the trailing write
-  # VERB (`merge`, `create`, `comment`, `review`, `edit`). Widen the noun probe
-  # to also fire on a bare gh-write verb so this shape reaches the tokenizer;
-  # the command-position forward pass (_synth_ walk) below then fails closed
-  # ONLY when the verb (or a `pr`/`issue` subcommand) sits directly after a
-  # command-position cmdsub placeholder, and ignores benign cmdsubs, arguments,
-  # and non-command-position verbs. Over-matching costs one tokenizer run; a
-  # false negative is a bypass. The verb probe accepts end-of-line as well as
-  # whitespace after the verb (`([[:space:]]|$)`) so an argument-less trailing
-  # verb — `$(printf '\147\150\40\160\162') merge` — cannot skip the tokenizer
-  # (CodeRabbit Major on #611).
+elif echo "$COMMAND" | grep -qE '\$\(|`'; then
+  # #553 / #560 / #573: a command substitution (or backtick) can synthesize ANY
+  # token of a gh write — the executable (`$(printf '\147\150')` -> gh), the
+  # noun (`gh pr`), and even the verb in escape-spelled form (`m\erge`) that no
+  # literal probe can enumerate (#611 round 3: `$(printf '\147\150\40\160\162')
+  # m\erge` carries no raw `gh`, `pr`, or `merge` text at all). Earlier
+  # revisions paired the cmdsub probe with a literal noun/verb probe; every
+  # such pairing leaves an escape/quoting spelling that dodges it, so the mere
+  # PRESENCE of a substitution now forces tokenization. shlex then normalizes
+  # quotes and escapes, and the command-position forward pass (_synth_ walk)
+  # below fails closed ONLY on guarded-write evidence after a command-position
+  # placeholder, ignoring benign cmdsubs, arguments, and non-command-position
+  # verbs. Over-matching costs one tokenizer run; a false negative is a bypass.
   NEEDS_TOKENIZE=1
 fi
 if [ "$NEEDS_TOKENIZE" -eq 0 ]; then
@@ -841,10 +834,33 @@ is_any_wrapper_named_token() {
   return 1
 }
 
+# guarded_gh_invocation_label INDEX [MODE]
+#
+# Scan forward from INDEX for a guarded pr/issue write and print its label.
+# MODE picks the fail-closed posture for __MERGEPATH_CMDSUB__ placeholders in
+# the subcommand stream (#611 round 3):
+#
+#   strict   (default; INDEX is a LITERAL `gh`): the executable is known to be
+#            gh, so a substitution in noun or verb position can expand to any
+#            subcommand — including a guarded write (`gh $(x) 123` runs
+#            `gh pr merge 123` when x prints the noun AND verb). No literal
+#            evidence can decide it; fail closed on the placeholder itself.
+#   evidence (INDEX is a command-position placeholder in the _synth_ walk):
+#            the executable itself is unproven, so placeholders alone cannot
+#            block (`$(cc) $(cflags) -o out` is benign). Placeholders are
+#            TRANSPARENT — they may expand to nothing (`$(true)`), the exe, or
+#            the noun — and the scan keeps looking for literal guarded
+#            evidence past them: a literal `pr`/`issue` noun reached across a
+#            placeholder run, a literal guarded verb after it, or a bare
+#            guarded verb with the noun synthesized. A literal noun followed
+#            by a placeholder in VERB position also fails closed (the verb is
+#            unverifiable on a plausible gh-noun: `$(a) pr $(b) 123`).
 guarded_gh_invocation_label() {
   local gh_index="$1"
+  local mode="${2:-strict}"
   local parent=""
   local skip_global_as=""
+  local saw_ph=0
   local k
   local tok
 
@@ -865,9 +881,29 @@ guarded_gh_invocation_label() {
 
     if [ -z "$parent" ]; then
       case "$tok" in
+        __MERGEPATH_CMDSUB__)
+          if [ "$mode" = "strict" ]; then
+            # Literal gh + unverifiable subcommand stream: the substitution
+            # may synthesize `pr merge` wholesale. Fail closed.
+            printf 'gh <unverifiable command substitution in subcommand position>\n'
+            return 0
+          fi
+          saw_ph=1
+          continue
+          ;;
         pr|issue)
           parent="$tok"
           continue
+          ;;
+        create|merge|comment|review|edit)
+          if [ "$saw_ph" -eq 1 ]; then
+            # Guarded verb reached across a placeholder run with no literal
+            # noun: the noun (and possibly the exe) was synthesized —
+            # `$(printf '\147\150') $(printf '\160\162') merge` (#611 round 3).
+            printf 'gh <synthesized> %s\n' "$tok"
+            return 0
+          fi
+          return 1
           ;;
         -R|--repo)
           skip_global_as="repo"
@@ -886,6 +922,13 @@ guarded_gh_invocation_label() {
     fi
 
     case "$tok" in
+      __MERGEPATH_CMDSUB__)
+        # Literal pr/issue noun with a substitution in VERB position: the verb
+        # is unverifiable (`gh pr $(printf '\155...')  123` / `$(a) pr $(b)`).
+        # Fail closed in both modes — the noun is literal guarded evidence.
+        printf 'gh %s <synthesized verb>\n' "$parent"
+        return 0
+        ;;
       -R|--repo)
         skip_global_as="repo"
         continue
@@ -1015,13 +1058,18 @@ for _ci in "${!TOKENS[@]}"; do
   fi
   case "$_stok" in
     __MERGEPATH_CMDSUB__)
-      # Two synthesis shapes, both fail closed:
+      # Synthesis shapes, all fail closed:
       #   (a) exe synthesized, noun literal:  $(printf gh) pr merge
       #       -> guarded_gh_invocation_label sees `pr merge` after the placeholder.
       #   (b) exe AND noun synthesized:        $(printf 'gh pr') merge   (#573)
       #       -> no literal `pr`/`issue`; synth_cmdsub_write_label sees the bare
       #          write verb (`merge`) directly after the placeholder.
-      if _synth_label=$(guarded_gh_invocation_label "$_ci") \
+      #   (c) exe and noun split across a placeholder RUN (#611 round 3):
+      #       $(printf '\147\150') $(printf '\160\162') merge
+      #       -> evidence mode treats placeholders as transparent and blocks on
+      #          the literal guarded verb (or literal noun + synthesized verb)
+      #          reached across the run.
+      if _synth_label=$(guarded_gh_invocation_label "$_ci" evidence) \
          || _synth_label=$(synth_cmdsub_write_label "$_ci"); then
         echo "BLOCKED: command-position command substitution may synthesize a gh write ($_synth_label)." >&2
         echo "  A \$(...) or backtick in command position can produce the executable name" >&2
@@ -1233,6 +1281,24 @@ PENDING_PREFIX_FLAG=""   # "<prefix>:<flag>" whose value the next token is
                          # (lets the consumer recognize `env -u NAME`)
 IDENTITY_ENV_CLEARED_FOR_WRAPPER=0  # 1 = env -i seen: the wrapper sees an
                          # EMPTY environment (no MERGEPATH_AGENT either)
+
+# #611 round 3: a substitution in a LITERAL gh's subcommand stream can
+# synthesize the noun, the verb, or a whole guarded write — `gh $(printf
+# '\160\162') merge`, `gh pr $(printf '\155...')`, `gh $(true) pr merge`
+# (empty expansion shifts the literal tokens into place). No literal evidence
+# can classify it, so the walk below fails closed the moment a placeholder
+# appears between gh and its resolved subcommand.
+block_cmdsub_in_gh_stream() {
+  echo "BLOCKED: unverifiable command substitution inside a gh command (#611)." >&2
+  echo "  A \$(...) or backtick between gh and its subcommand can synthesize the" >&2
+  echo "  noun or verb of a guarded write (e.g. gh \$(printf '\\160\\162') merge)," >&2
+  echo "  so the guard cannot classify this invocation. Use literal gh" >&2
+  echo "  subcommands, and run writes through the token-verifying wrapper:" >&2
+  echo "    scripts/gh-as-author.sh -- gh ..." >&2
+  echo "    scripts/gh-as-reviewer.sh -- gh ..." >&2
+  exit 2
+}
+
 for i in "${!TOKENS[@]}"; do
   tok="${TOKENS[$i]}"
   # --- phase 2: walking after gh, looking for pr + subcommand ---
@@ -1274,6 +1340,10 @@ for i in "${!TOKENS[@]}"; do
           # globals.
           continue
           ;;
+        __MERGEPATH_CMDSUB__)
+          # Placeholder in NOUN position (#611 r3): fail closed.
+          block_cmdsub_in_gh_stream
+          ;;
         *)
           # Non-flag, non-pr, non-issue token before the parent. Either
           # gh aliases are in play (out of scope) or this is a gh
@@ -1303,6 +1373,11 @@ for i in "${!TOKENS[@]}"; do
     esac
 
     # SAW_PR=1 OR SAW_ISSUE=1 — this token IS the subcommand.
+    if [ "$tok" = "__MERGEPATH_CMDSUB__" ]; then
+      # Placeholder in VERB position (#611 r3): `gh pr $(...) 123` executes
+      # whatever the substitution yields as the subcommand. Fail closed.
+      block_cmdsub_in_gh_stream
+    fi
     PR_SUBCOMMAND="$tok"
     PR_SUBCOMMAND_INDEX=$i
     break
