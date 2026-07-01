@@ -1140,16 +1140,34 @@ status_context_fast_path_blocked_by_comment() {
         # 1s-newer success as authoritative and false-cleared (the #595 dogfood:
         # notice @07:49:36, status success @07:49:37, zero review). Distinguish
         # by latency rather than raw ordering: SUPPRESS a success that landed
-        # within STATUS_SUCCESS_GRACE_SECONDS of the notice (the spurious
-        # rate-limit flip — this also covers a notice created at/after the
-        # success, since status <= fresh_at <= fresh_at + grace); TRUST a success
-        # that postdates the notice by more (a genuine later re-review, which per
-        # #221 can be silent, i.e. flip the status with no new summary comment).
-        if iso_within_seconds_after "$comment_fresh_at" "$status_created_at" "$STATUS_SUCCESS_GRACE_SECONDS"; then
-          log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class references current HEAD $HEAD_SHA and the success (status_created=$status_created_at) landed within ${STATUS_SUCCESS_GRACE_SECONDS}s of it (fresh_at=$comment_fresh_at) — CodeRabbit's near-simultaneous rate-limit status flip, not a completed review"
+        # within an effective grace window of the notice; TRUST a success that
+        # postdates it by more (a genuine later re-review, which per #221 can be
+        # silent, i.e. flip the status with no new summary comment).
+        #
+        # The effective grace is the base near-simultaneous-flip window
+        # (STATUS_SUCCESS_GRACE_SECONDS), WIDENED to CodeRabbit's own published
+        # wait window when the notice carries one. A rate-limit notice ("Next
+        # review available in: N minutes") promises no review before
+        # comment_created + N, so a success anywhere inside that window cannot be
+        # a completed review no matter how far past the base grace it lands
+        # (#599 Codex P2: with a fixed 120s grace, a success at 121s but still
+        # mid-13-minute-window would false-clear). paused/in_progress notices
+        # carry no parseable window, so they keep the base grace. The
+        # RATE_LIMIT_BUFFER_SECONDS margin mirrors the retry-sleep path.
+        local effective_grace=$STATUS_SUCCESS_GRACE_SECONDS
+        local published_window
+        published_window=$(parse_rate_limit_window "$comment_body" || echo "")
+        if [ -n "$published_window" ]; then
+          local windowed=$((published_window + RATE_LIMIT_BUFFER_SECONDS))
+          if [ "$windowed" -gt "$effective_grace" ]; then
+            effective_grace=$windowed
+          fi
+        fi
+        if iso_within_seconds_after "$comment_fresh_at" "$status_created_at" "$effective_grace"; then
+          log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class references current HEAD $HEAD_SHA and the success (status_created=$status_created_at) is within the ${effective_grace}s window after the notice (fresh_at=$comment_fresh_at) — CodeRabbit has not completed a review of this HEAD (near-simultaneous rate-limit status flip, or a success still inside the published wait window)"
           return 0
         fi
-        log "StatusContext success remains authoritative: it postdates the HEAD-referencing $class notice id=$comment_id ($HEAD_SHA) by more than ${STATUS_SUCCESS_GRACE_SECONDS}s (fresh_at=$comment_fresh_at, status_created=$status_created_at) — a genuine later re-review of the current HEAD"
+        log "StatusContext success remains authoritative: it postdates the HEAD-referencing $class notice id=$comment_id ($HEAD_SHA) by more than ${effective_grace}s (fresh_at=$comment_fresh_at, status_created=$status_created_at) — a genuine later re-review of the current HEAD"
         return 1
       fi
       # #446: a rate_limit/paused/in_progress comment POSTED (created) at/after

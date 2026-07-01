@@ -230,9 +230,26 @@ test_headref_review_still_clears() {
   [ "$FAIL" -ne "$before" ] || pass "2: control — a genuine review comment + StatusContext success still clears via the fast-path (no over-suppression)"
 }
 
+# --- Test 4: #599 P2 — success past the base grace but INSIDE the published --
+# rate-limit window is still suppressed. The HEAD-ref notice carries "Next
+# review available in: 13 minutes" (780s), so the effective grace widens to
+# 780+30=810s. A StatusContext success at T+121s is beyond the 120s base grace
+# (a fixed grace would false-clear it) but well inside the promised window, so
+# CodeRabbit cannot have reviewed yet → suppress → failover + exit 5.
+test_headref_within_published_window_suppresses() {
+  local dir rc before=$FAIL
+  dir=$(make_case "headref-window" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T00:02:01Z")  # T+121s
+  rc=$(run_case "$dir")
+  [ "$rc" = "5" ] || fail "4: expected exit 5 (suppressed within published window), got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "4: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
+  grep -q 'within the 810s window' "$dir/err.log" || fail "4: expected the published-window (810s) suppression log; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  [ "$FAIL" -ne "$before" ] || pass "4: #599 — success past the 120s base grace but inside the published 13-minute window is still suppressed (window-aware grace)"
+}
+
 test_headref_ratelimit_suppresses_status
 test_headref_review_still_clears
 test_headref_later_success_clears
+test_headref_within_published_window_suppresses
 
 echo "----"
 echo "test_coderabbit_wait_statuscontext_ratelimit: $PASS passed, $FAIL failed"

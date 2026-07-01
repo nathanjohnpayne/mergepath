@@ -1428,12 +1428,12 @@ rc=$?
 set -e
 if [ "$rc" = "5" ] &&
    echo "$out" | grep -q '"status": "rate_limit_stalled"' &&
-   echo "$out" | grep -q "landed within 120s of it"; then
+   echo "$out" | grep -q "within the 630s window"; then
   pass=$((pass + 1))
-  echo "  PASS: near-simultaneous (1s) StatusContext success does NOT clear a current-head rate-limit comment (#596)"
+  echo "  PASS: a StatusContext success 1s after a current-head rate-limit notice is suppressed within the published 10-minute window (630s, window-aware grace) (#596/#599)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: #596 — a 1s-newer StatusContext success false-cleared a current-head rate-limit comment (rc=$rc)" >&2
+  echo "  FAIL: #596/#599 — a StatusContext success inside the published rate-limit window false-cleared a current-head rate-limit comment (rc=$rc)" >&2
   echo "$out" | sed 's/^/    /' >&2
 fi
 
