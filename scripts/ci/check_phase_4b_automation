@@ -65,6 +65,19 @@ fi
 # --severity=warning fails on warnings + errors but tolerates info/style
 # (e.g. SC1091 unfollowed `source`, the intentional &&/|| test idiom). No
 # -x, so we lint only these files and do not transitively re-lint repo libs.
+#
+# When shellcheck is ABSENT this used to skip silently (#588). It now routes
+# through scripts/lib/lint-tooling.sh, which prints a loud WARN locally and, in
+# CI (or with MERGEPATH_REQUIRE_SHELLCHECK=1), fails hard — so a runner that has
+# lost shellcheck can no longer pass this check without linting.
+LINT_TOOLING_LIB="$REPO_ROOT/scripts/lib/lint-tooling.sh"
+if [ ! -f "$LINT_TOOLING_LIB" ]; then
+  echo "FAIL: missing required library: scripts/lib/lint-tooling.sh"
+  echo "check_phase_4b_automation: FAIL"
+  exit 1
+fi
+# shellcheck source=../lib/lint-tooling.sh
+. "$LINT_TOOLING_LIB"
 if command -v shellcheck >/dev/null 2>&1; then
   if ! shellcheck --severity=warning \
       "$REPO_ROOT/scripts/phase-4b-review.sh" \
@@ -75,6 +88,8 @@ if command -v shellcheck >/dev/null 2>&1; then
       "$REPO_ROOT/tests/test_phase_4b_automation.sh"; then
     echo "FAIL: shellcheck reported warnings/errors in the phase-4b scripts"; FAILED=1
   fi
+else
+  lint_tooling_require_shellcheck || FAILED=1
 fi
 
 if [ "$FAILED" -eq 1 ]; then

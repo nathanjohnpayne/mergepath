@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# check_lint_tooling
+#
+# CI wrapper for scripts/lib/lint-tooling.sh — the shared visibility helper for
+# OPTIONAL lint tooling (#588). The helper makes a missing shellcheck loud (a
+# WARN locally, a hard FAIL in CI) instead of a silent skip, and provides a
+# one-shot availability report a developer can run before pushing.
+#
+# Two concerns, mirroring check_feedback_policy_helpers:
+#   1. The library and its test must exist on disk; the test must be
+#      executable. The library is sourced, not executed, so it is not required
+#      to be +x. It IS shellcheck-linted here when shellcheck is present.
+#   2. The helper's strict/warn logic must work. We delegate that to
+#      tests/test_lint_tooling.sh, which sources the lib and drives the
+#      present-shellcheck, missing-shellcheck (local WARN), CI-strict FAIL, and
+#      MERGEPATH_REQUIRE_SHELLCHECK override paths under a controlled PATH.
+#
+# Invoked by .github/workflows/repo_lint.yml alongside the other
+# scripts/ci/check_* scripts.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+LIB="scripts/lib/lint-tooling.sh"
+TEST="tests/test_lint_tooling.sh"
+
+FAILED=0
+
+if [ ! -f "$LIB" ]; then
+  echo "FAIL: Missing required library: $LIB"
+  FAILED=1
+fi
+
+if [ ! -f "$TEST" ]; then
+  echo "FAIL: Missing required test: $TEST"
+  FAILED=1
+elif [ ! -x "$TEST" ]; then
+  echo "FAIL: Test is not executable: $TEST"
+  echo "      Fix with: chmod +x $TEST"
+  FAILED=1
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_lint_tooling: FAIL (pre-flight)"
+  exit 1
+fi
+
+# Lint the helper itself when shellcheck is present.
+if command -v shellcheck >/dev/null 2>&1; then
+  if ! shellcheck --severity=warning "$LIB"; then
+    echo "check_lint_tooling: FAIL (shellcheck on $LIB)"
+    exit 1
+  fi
+fi
+
+if ! bash "$TEST"; then
+  echo "check_lint_tooling: FAIL (test suite)"
+  exit 1
+fi
+
+echo "check_lint_tooling: PASS"
+exit 0
