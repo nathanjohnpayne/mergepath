@@ -545,8 +545,12 @@ scan_codex_state() {
 
   # Inline findings from the bot on the current HEAD commit, scoped
   # to the LATEST review round (via pull_request_review_id), with
-  # P0-P3 priority extracted from the ![P{0-3} Badge] markdown
-  # shortcode. If there's no current review, findings is empty.
+  # P0-P3 priority extracted from EITHER the ![P{0-3} Badge] badge image OR
+  # the **Pn text fallback Codex emits when the badge is absent — mirroring
+  # codex_tier_of in scripts/lib/feedback-policy-helpers.sh so a fallback-only
+  # finding is classified consistently (CodeRabbit Major on #590). The
+  # alternation's leftmost match wins, matching codex_tier_of's first-marker
+  # rule. If there's no current review, findings is empty.
   if [ -n "$latest_review_id" ] && [ "$latest_review_id" != "null" ]; then
     findings=$(echo "$comments" | jq \
       --arg bot "$BOT_LOGIN" \
@@ -555,7 +559,7 @@ scan_codex_state() {
       [ .[]
         | select(.user.login == $bot)
         | select(.pull_request_review_id == $review_id)
-        | ( (.body | capture("!\\[P(?<n>[0-3]) Badge\\]")? // {n: null}) | .n ) as $n
+        | ( (.body | capture("!\\[P(?<b>[0-3]) Badge\\]|\\*\\*P(?<f>[0-3])")? // {}) | (.b // .f) ) as $n
         | { path, line, comment_id: .id, body,
             priority: ( if $n == null then "P?" else "P" + $n end ),
             # blocking (#577): this finding sits in a `required` tier per the
