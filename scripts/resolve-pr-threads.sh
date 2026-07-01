@@ -56,7 +56,14 @@
 #                           nitpick-noted / deferred-to-followup and any
 #                           class that can't be positively determined, are
 #                           LEFT UNRESOLVED so the weekly unresolved-
-#                           feedback sweep keeps surfacing them (#564). Use
+#                           feedback sweep keeps surfacing them (#564).
+#                           The action evidence is checked against the
+#                           thread's ENTIRE comment history: threads with
+#                           more comments than the enumeration window get
+#                           a full paginated re-fetch, and a re-fetch
+#                           failure skips the thread (fail closed) so a
+#                           hidden re-raise can never be resolved over
+#                           (#573 item 2). Use
 #                           this to mark genuinely-handled feedback resolved
 #                           without the blunt "resolve everything" of
 #                           --auto-resolve-bots. To merge past a deferral on
@@ -396,10 +403,22 @@ QUERY='
             # a long thread. `first: 50` truncated the newest comments, so a
             # re-raise past comment 50 was invisible and an older fix/rebuttal
             # looked like the latest word — resolving live feedback (Codex P2
-            # on #565). The most-recent 50 always include the latest re-raise;
-            # only very old comments (>50 back) drop off, and those never make
-            # a thread look MORE actioned, so the gate stays fail-safe.
+            # on #565).
+            #
+            # #573 item 2: the newest-50 window is NOT always fail-safe on
+            # its own. When the latest bot/reviewer re-raise is followed by
+            # 50+ agent replies (ack/marker churn on a long-lived thread),
+            # the re-raise itself falls OUT of the window, so
+            # latest_nonagent_created understates the staleness floor and a
+            # STALE fix/rebuttal looks like the latest word — resolving live
+            # feedback. totalCount + hasPreviousPage detect that truncation;
+            # truncated threads get a full cursor-paginated re-fetch
+            # (complete_thread_comments) before any staleness-sensitive
+            # classification, and a re-fetch failure fails closed (the
+            # thread is skipped, never resolved on incomplete data).
             allComments: comments(last: 50) {
+              totalCount
+              pageInfo { hasPreviousPage }
               nodes {
                 author { login }
                 body
@@ -477,7 +496,18 @@ UNRESOLVED=$(echo "$THREADS_JSON" | jq -c '
       commit_oid: (.commentsLast.nodes[0].commit.oid // ""),
       body: (.commentsFirst.nodes[0].body // ""),
       excerpt: ((.commentsFirst.nodes[0].body // "") | .[0:160]),
-      all_comments: (.allComments.nodes // [])
+      all_comments: (.allComments.nodes // []),
+      # all_comments_truncated (#573 item 2): true when the last-50 window
+      # provably misses older comments — either the connection reports a
+      # previous page, or its totalCount exceeds the nodes returned. A
+      # truncated thread MUST have its full comment list re-fetched
+      # (complete_thread_comments) before latest_nonagent_created is
+      # trusted; missing pageInfo/totalCount (older stubs/fixtures) reads
+      # as not-truncated, preserving the pre-#573 shape.
+      all_comments_truncated: (
+        ((.allComments.pageInfo.hasPreviousPage // false) == true)
+        or ((.allComments.totalCount // 0) > ((.allComments.nodes // []) | length))
+      )
     }
 ')
 
@@ -590,14 +620,29 @@ is_agent_author_local() {
 }
 
 # latest_nonagent_created <thread_json> → ISO timestamp on stdout.
-# The createdAt of the most recent NON-agent (bot / real-reviewer) comment on
-# the thread, floored at the original finding's createdAt (`.created`). This is
-# the "bot's last word" timestamp used by the addressed-elsewhere staleness
-# guard (#565): a fix commit only counts as actioning the thread if it
-# post-dates this — otherwise a stale fix that predates a later bot re-raise
-# would falsely clear live feedback. ISO 8601 sorts lexicographically, so the
-# `\>` string comparison is chronological. Single-sourced here so
-# derive_tag_class and synth_rationale apply the identical predicate.
+#
+# THE STALENESS FLOOR. The createdAt of the most recent NON-agent (bot /
+# real-reviewer) comment on the thread, floored at the original finding's
+# createdAt (`.created`). This is the "bot's last word" timestamp used by
+# the addressed-elsewhere staleness guard (#565): a fix commit (or a
+# rebuttal, via the index-based variant in derive_tag_class step 0/3) only
+# counts as actioning the thread if it post-dates this — otherwise a stale
+# fix that predates a later bot re-raise would falsely clear live feedback.
+# ISO 8601 sorts lexicographically, so the `\>` string comparison is
+# chronological. Single-sourced here so derive_tag_class and
+# synth_rationale apply the identical predicate.
+#
+# COMPLETENESS PRECONDITION (#573 item 2): the floor is only correct when
+# `.all_comments` covers the ENTIRE thread. The enumeration query fetches
+# only the newest 50 comments; on a longer thread whose latest re-raise is
+# buried under 50+ agent replies, that window omits the re-raise and this
+# function silently falls back to an OLDER timestamp — understating the
+# floor and letting --resolve-actioned resolve live feedback. Callers on
+# any staleness-sensitive path MUST first run the thread JSON through
+# complete_thread_comments (below), which re-fetches the full comment list
+# for truncated threads and FAILS CLOSED (thread skipped, left unresolved)
+# when the full list cannot be assembled. Later work (verified-propagation
+# resolution) builds on this floor — keep the complete-thread invariant.
 latest_nonagent_created() {
   local tj="$1"
   local latest cnt i login created
@@ -615,6 +660,139 @@ latest_nonagent_created() {
     i=$((i + 1))
   done
   printf '%s' "$latest"
+}
+
+# --- #573 item 2: full-thread comment pagination ----------------------------
+#
+# fetch_all_thread_comments <thread-node-id> → the thread's COMPLETE comment
+# list (JSON array, same node shape as allComments.nodes) on stdout.
+#
+# Forward cursor pagination via the top-level `node(id:)` lookup +
+# `comments(first: 100, after: $cursor)`, mirroring the enumeration loop's
+# two load-bearing patterns: the typed-null-first-call cursor handling
+# (#192 — `-F cursor=null` sends GraphQL null; `-f` would send the string
+# "null") and the totalCount cross-validation (an assembled count that
+# disagrees with the API's totalCount is never trusted).
+#
+# FAIL CLOSED — returns non-zero (and callers must NOT classify the thread)
+# on ANY of:
+#   - a gh/GraphQL error on any page
+#   - a page missing `.data.node.comments.nodes` (null node / partial page)
+#   - hasNextPage=true without a usable endCursor
+#   - hasNextPage missing entirely (cannot prove the walk terminated)
+#   - more than THREAD_COMMENTS_MAX_PAGES pages (runaway-loop guard)
+#   - an assembled count != totalCount
+THREAD_COMMENTS_MAX_PAGES=20  # 20 × 100 = 2,000 comments; beyond any real thread
+fetch_all_thread_comments() {
+  local thread_id="$1"
+  local query='
+    query($id: ID!, $cursor: String) {
+      node(id: $id) {
+        ... on PullRequestReviewThread {
+          comments(first: 100, after: $cursor) {
+            totalCount
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              author { login }
+              body
+              databaseId
+              createdAt
+            }
+          }
+        }
+      }
+    }
+  '
+  local merged='[]' cursor="" resp nodes total="null" has_next pages=0 have
+  while :; do
+    pages=$((pages + 1))
+    if [ "$pages" -gt "$THREAD_COMMENTS_MAX_PAGES" ]; then
+      echo "thread-comments pagination exceeded $THREAD_COMMENTS_MAX_PAGES pages for $thread_id — failing closed" >&2
+      return 1
+    fi
+    # Cursor-typing discipline per #192: typed null (-F) on the first
+    # call, string cursor (-f) on every subsequent page.
+    if [ -z "$cursor" ]; then
+      resp=$(gh_pat api graphql -f query="$query" -F id="$thread_id" -F cursor=null 2>&1) || {
+        echo "thread-comments page fetch failed for $thread_id: $resp" >&2
+        return 1
+      }
+    else
+      resp=$(gh_pat api graphql -f query="$query" -F id="$thread_id" -f cursor="$cursor" 2>&1) || {
+        echo "thread-comments page fetch failed for $thread_id: $resp" >&2
+        return 1
+      }
+    fi
+    nodes=$(printf '%s' "$resp" | jq -c '.data.node.comments.nodes // null' 2>/dev/null) || nodes="null"
+    if [ -z "$nodes" ] || [ "$nodes" = "null" ]; then
+      echo "thread-comments page for $thread_id returned no nodes (null node / partial page) — failing closed" >&2
+      return 1
+    fi
+    merged=$(printf '%s' "$nodes" | jq -c --argjson acc "$merged" '$acc + .' 2>/dev/null) || {
+      echo "thread-comments page merge failed for $thread_id — failing closed" >&2
+      return 1
+    }
+    total=$(printf '%s' "$resp" | jq -r '.data.node.comments.totalCount // "null"' 2>/dev/null) || total="null"
+    # NB: `// "null"` would be wrong for hasNextPage — jq's `//` treats
+    # `false` as empty, so a legitimate final page (hasNextPage=false)
+    # would read as missing. Use an explicit null check instead.
+    has_next=$(printf '%s' "$resp" \
+      | jq -r '.data.node.comments.pageInfo.hasNextPage
+               | if . == null then "null" else tostring end' 2>/dev/null) || has_next="null"
+    if [ "$has_next" = "true" ]; then
+      cursor=$(printf '%s' "$resp" | jq -r '.data.node.comments.pageInfo.endCursor // ""' 2>/dev/null) || cursor=""
+      if [ -z "$cursor" ] || [ "$cursor" = "null" ]; then
+        echo "thread-comments page for $thread_id has hasNextPage=true but no endCursor — failing closed" >&2
+        return 1
+      fi
+      continue
+    fi
+    if [ "$has_next" != "false" ]; then
+      echo "thread-comments page for $thread_id missing pageInfo.hasNextPage — failing closed" >&2
+      return 1
+    fi
+    break
+  done
+  have=$(printf '%s' "$merged" | jq -r 'length' 2>/dev/null) || have="-1"
+  if [ "$total" = "null" ] || [ "$have" != "$total" ]; then
+    echo "thread-comments count mismatch for $thread_id (assembled=$have totalCount=$total) — failing closed" >&2
+    return 1
+  fi
+  printf '%s' "$merged"
+}
+
+# complete_thread_comments <thread_json> → thread JSON on stdout whose
+# `.all_comments` is the COMPLETE comment list; the exit status is the
+# completeness verdict:
+#   0 — .all_comments covers the whole thread (it already did — the
+#       enumeration window was not truncated — or the windowed re-fetch
+#       above succeeded and replaced it)
+#   1 — the comment list could NOT be completed (pagination error / page
+#       cap / count mismatch). The input JSON is echoed back unchanged.
+#       Callers on a staleness-sensitive path MUST fail closed: treat the
+#       thread as NOT actioned and leave it unresolved. Never classify —
+#       and never resolve — on a comment list that may be missing the
+#       latest bot/reviewer re-raise (#573 item 2; extends the #564
+#       fail-closed guarantee).
+complete_thread_comments() {
+  local tj="$1"
+  local truncated thread_id full
+  truncated=$(printf '%s' "$tj" | jq -r '.all_comments_truncated // false' 2>/dev/null) || truncated="true"
+  if [ "$truncated" != "true" ]; then
+    printf '%s' "$tj"
+    return 0
+  fi
+  thread_id=$(printf '%s' "$tj" | jq -r '.id // ""' 2>/dev/null) || thread_id=""
+  if [ -z "$thread_id" ]; then
+    printf '%s' "$tj"
+    return 1
+  fi
+  if ! full=$(fetch_all_thread_comments "$thread_id"); then
+    printf '%s' "$tj"
+    return 1
+  fi
+  printf '%s' "$tj" | jq -c --argjson fc "$full" \
+    '.all_comments = $fc | .all_comments_truncated = false'
 }
 
 # commit_files <sha> → JSON array of the filenames a commit touched, on
@@ -1375,8 +1553,23 @@ augment_pr_commits_with_sha() {
   # Same login fallback chain as fetch_pr_tag_data (#565 round 8):
   # .commit.author.name before the (often-unlinked) email so agent-authored
   # commits are recognized.
-  PR_COMMITS_CACHE=$(gh_pat api "repos/$OWNER/$NAME/pulls/$PR_NUM/commits?per_page=100" \
-    --jq '[.[] | {sha: .sha, login: (.author.login // .commit.author.name // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]' 2>/dev/null || echo "$PR_COMMITS_CACHE")
+  #
+  # #573 item 2: paginate via _fetch_paginated — the prior single
+  # `?per_page=100` fetch capped this shim at 100 commits, so a
+  # qualifying fix commit beyond page 1 of a large PR was invisible.
+  # That truncation is fail-SAFE for the actioned gate (a missing
+  # commit can only REMOVE addressed-elsewhere evidence, never add it —
+  # the thread is just left unresolved), but it wrongly skipped
+  # genuinely-actioned threads. Only overwrite the cache when the
+  # refetch produced something, so a transient failure (which
+  # _fetch_paginated maps to `[]`) cannot blank a populated cache.
+  local refreshed
+  refreshed=$(_fetch_paginated \
+    "repos/$OWNER/$NAME/pulls/$PR_NUM/commits" \
+    '[.[] | {sha: (.sha // ""), login: (.author.login // .commit.author.name // .commit.author.email // ""), date: (.commit.author.date // .commit.committer.date // "")}]')
+  if [ -n "$refreshed" ] && [ "$refreshed" != "[]" ]; then
+    PR_COMMITS_CACHE="$refreshed"
+  fi
 }
 
 # post_tag_reply — emit a `[mergepath-resolve: <class>] <rationale>`
@@ -1428,6 +1621,12 @@ SKIPPED_STALE=0
 # followup). Left unresolved on purpose so the weekly sweep still surfaces
 # them; counted so the exit code reflects that work remains.
 SKIPPED_NOT_ACTIONED=0
+# #573 item 2 --resolve-actioned: threads skipped because their comment
+# list is TRUNCATED (>50 comments) and the full re-fetch failed — the
+# staleness floor cannot be trusted, so the thread is left unresolved
+# (fail closed) rather than classified on a window that may be missing
+# the latest bot/reviewer re-raise. Counted into the exit-3 predicate.
+SKIPPED_COMMENTS_INCOMPLETE=0
 WOULD_RESOLVE_COUNT=0
 FAILED_COUNT=0
 TAG_REPLY_POSTED=0
@@ -1503,6 +1702,21 @@ while IFS= read -r thread; do
   if [ "$MODE" = "resolve-actioned" ]; then
     fetch_pr_tag_data
     augment_pr_commits_with_sha
+    # #573 item 2: the staleness floor (latest_nonagent_created) is only
+    # trustworthy over the COMPLETE thread. If the enumeration's last-50
+    # window truncated this thread, re-fetch every comment before
+    # classifying; on ANY pagination failure, FAIL CLOSED — skip the
+    # thread (left unresolved for the sweep) rather than classify on a
+    # window that may be missing the latest bot/reviewer re-raise.
+    if ! thread=$(complete_thread_comments "$thread"); then
+      echo "  SKIP (comment list incomplete — pagination failed; failing closed): [$AUTHOR] $PATH_"
+      echo "    $EXCERPT"
+      echo "    The thread has more comments than one window returns and the full"
+      echo "    re-fetch failed, so the latest re-raise may be invisible. Left"
+      echo "    unresolved; retry, or resolve deliberately via --auto-resolve-bots."
+      SKIPPED_COMMENTS_INCOMPLETE=$((SKIPPED_COMMENTS_INCOMPLETE + 1))
+      continue
+    fi
     # GATE path: classify with routing skipped, so a canonical/templated
     # thread that was actually fixed/rebutted resolves on its action
     # evidence, while a fresh routing-only finding still falls through to a
@@ -1565,7 +1779,21 @@ while IFS= read -r thread; do
         # fetch_pr_tag_data doesn't carry .sha. derive_tag_class only
         # needs login + date so it runs against either shape.
         augment_pr_commits_with_sha
-        thread_class=$(derive_tag_class "$thread")
+        # #573 item 2: the TAG class needs the same complete-thread rule as
+        # the gate — a truncated window can hide the latest re-raise and
+        # mis-tag live feedback as addressed/rebutted, which the daily
+        # rollup would then read as handled. On a re-fetch failure don't
+        # guess from the truncated window: record the honest fail-safe
+        # class deferred-to-followup (the rollup keeps re-surfacing it).
+        # The resolve mutation itself still proceeds — that is
+        # --auto-resolve-bots' documented blunt contract, gated on the
+        # current-HEAD anchor (commentsLast), not on this classification.
+        if thread=$(complete_thread_comments "$thread"); then
+          thread_class=$(derive_tag_class "$thread")
+        else
+          echo "  WARN: comment pagination incomplete for [$AUTHOR] $PATH_ — tagging deferred-to-followup (fail-safe)" >&2
+          thread_class="deferred-to-followup"
+        fi
         thread_class_computed=true
       fi
       tag_class="$thread_class"
@@ -1613,7 +1841,7 @@ done < <(printf '%s\n' "$UNRESOLVED")
 
 echo ""
 if $DRY_RUN; then
-  echo "(dry-run; no threads modified) — would-resolve: $WOULD_RESOLVE_COUNT, skipped (human): $SKIPPED_HUMAN, skipped (stale-HEAD): $SKIPPED_STALE, skipped (not-actioned): $SKIPPED_NOT_ACTIONED"
+  echo "(dry-run; no threads modified) — would-resolve: $WOULD_RESOLVE_COUNT, skipped (human): $SKIPPED_HUMAN, skipped (stale-HEAD): $SKIPPED_STALE, skipped (not-actioned): $SKIPPED_NOT_ACTIONED, skipped (comments-incomplete): $SKIPPED_COMMENTS_INCOMPLETE"
   # Codex r2 on PR #172: dry-run previously exited 0 when only
   # current-HEAD bot threads remained (because dry-run does not mutate
   # them and they didn't increment SKIPPED_*). Callers would treat
@@ -1622,7 +1850,7 @@ if $DRY_RUN; then
   # human-skipped, or stale-skipped). The only exit-0 path through
   # auto-resolve-bots --dry-run is "no unresolved threads at all"
   # which is already short-circuited above (UNRESOLVED is empty).
-  if [ "$WOULD_RESOLVE_COUNT" -gt 0 ] || [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ]; then
+  if [ "$WOULD_RESOLVE_COUNT" -gt 0 ] || [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ] || [ "$SKIPPED_COMMENTS_INCOMPLETE" -gt 0 ]; then
     exit 3
   fi
   exit 0
@@ -1688,7 +1916,7 @@ if [ "${#RESOLVED_IDS[@]}" -gt 0 ]; then
   fi
 fi
 
-echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Skipped (not-actioned): $SKIPPED_NOT_ACTIONED  Failed: $FAILED_COUNT  Readback-failed: $READBACK_FAILED"
+echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Skipped (not-actioned): $SKIPPED_NOT_ACTIONED  Skipped (comments-incomplete): $SKIPPED_COMMENTS_INCOMPLETE  Failed: $FAILED_COUNT  Readback-failed: $READBACK_FAILED"
 if ! $NO_TAG_REPLY; then
   echo "Tag replies: posted=$TAG_REPLY_POSTED  failed=$TAG_REPLY_FAILED"
 fi
@@ -1698,8 +1926,9 @@ fi
 #   2 = mutation failure (transient: gh/network), a resolve mutation that
 #       did not return isResolved:true, OR a post-resolve readback that
 #       could not confirm isResolved:true (#564 — fail closed)
-#   3 = unresolved threads remain (human or stale-bot) — PR still
-#       conversation-resolution-blocked; address and retry
+#   3 = unresolved threads remain (human, stale-bot, not-actioned, or
+#       comments-incomplete — the #573 truncated-thread fail-closed skip)
+#       — PR still conversation-resolution-blocked; address and retry
 #   0 = no unresolved threads on current HEAD
 # Explicit `if` (not `[ a ] && exit`): two OR-ed conditions, and an
 # `&& exit` chain would be ambiguous under set -e (see the SKIPPED block
@@ -1715,7 +1944,7 @@ fi
 # non-zero; whether that trips `set -e` depends on subtle list-tail
 # rules. The `if` form is unambiguous and matches the block above.
 # (CodeRabbit Major, #271/#272.)
-if [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ]; then
+if [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ] || [ "$SKIPPED_COMMENTS_INCOMPLETE" -gt 0 ]; then
   exit 3
 fi
 exit 0

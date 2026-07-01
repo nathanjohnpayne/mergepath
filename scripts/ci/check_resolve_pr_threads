@@ -470,6 +470,31 @@ else
   bash "$TAG_TEST" 2>&1 | sed 's/^/      /' >&2 || true
 fi
 
+# ── Test 9: delegate to tests/test_resolve_pr_threads_staleness_pagination.sh
+# Exercises the #573-item-2 staleness-floor pagination: threads with more
+# comments than the enumeration's last-50 window get a full cursor-
+# paginated re-fetch so the latest bot/reviewer re-raise is never
+# invisible to --resolve-actioned, and any pagination failure fails
+# closed (thread skipped, left unresolved). Same delegation pattern as
+# Test 8 above.
+echo
+echo "resolve-pr-threads.sh staleness-floor pagination (#573 item 2)"
+
+PAGINATION_TEST="$ROOT/tests/test_resolve_pr_threads_staleness_pagination.sh"
+if [ ! -f "$PAGINATION_TEST" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: missing $PAGINATION_TEST" >&2
+elif bash "$PAGINATION_TEST" >/dev/null 2>&1; then
+  pass=$((pass + 1))
+  echo "  PASS: tests/test_resolve_pr_threads_staleness_pagination.sh"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: tests/test_resolve_pr_threads_staleness_pagination.sh exited non-zero" >&2
+  # Re-run with output captured so the CI log shows what broke.
+  echo "    re-running with output:" >&2
+  bash "$PAGINATION_TEST" 2>&1 | sed 's/^/      /' >&2 || true
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "check_resolve_pr_threads: PASS ($pass tests)"
