@@ -263,7 +263,7 @@ elif echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|
   NEEDS_TOKENIZE=1
 elif echo "$COMMAND" | tr -d "\"'" | grep -qE '\$\(|`' \
      && echo "$COMMAND" | tr -d "\"'" \
-        | grep -qE '(^|[^A-Za-z0-9_])(pr|issue|create|merge|comment|review|edit)[[:space:]]'; then
+        | grep -qE '(^|[^A-Za-z0-9_])(pr|issue|create|merge|comment|review|edit)([[:space:]]|$)'; then
   # #553 / #560: a command substitution can synthesize the executable name in
   # COMMAND position (e.g. `$(printf '\147\150')` -> gh), so the raw command
   # carries no literal `gh` and the gh / env -S probes above miss it. This holds
@@ -280,7 +280,10 @@ elif echo "$COMMAND" | tr -d "\"'" | grep -qE '\$\(|`' \
   # ONLY when the verb (or a `pr`/`issue` subcommand) sits directly after a
   # command-position cmdsub placeholder, and ignores benign cmdsubs, arguments,
   # and non-command-position verbs. Over-matching costs one tokenizer run; a
-  # false negative is a bypass.
+  # false negative is a bypass. The verb probe accepts end-of-line as well as
+  # whitespace after the verb (`([[:space:]]|$)`) so an argument-less trailing
+  # verb — `$(printf '\147\150\40\160\162') merge` — cannot skip the tokenizer
+  # (CodeRabbit Major on #611).
   NEEDS_TOKENIZE=1
 fi
 if [ "$NEEDS_TOKENIZE" -eq 0 ]; then

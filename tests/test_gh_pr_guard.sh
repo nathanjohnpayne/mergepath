@@ -826,6 +826,12 @@ assert_rc_contains "cmdsub-synth exe then --repo before a bare create verb fails
 # subcommand (a gh read) is not force-tokenized and stays allowed.
 assert_rc_contains "command-position cmdsub then a non-write subcommand stays allowed (#573)" 0 "" \
   '$(printf "\147\150") status'
+# CodeRabbit Major on #611: the fast-path verb probe must also fire when the
+# bare verb ends the COMMAND (no trailing whitespace) — `$(...) merge` with no
+# arguments previously skipped the tokenizer because the probe required
+# `[[:space:]]` after the verb.
+assert_rc_contains "cmdsub-synth exe+noun then END-OF-LINE bare verb fails closed (#611)" 2 "wrapper" \
+  '$(printf "\147\150\40\160\162") merge'
 
 # #560 (residual of #553): a command-position cmdsub-synthesized gh must fail
 # closed even after a prefix command + options (command -p, env -i), a
