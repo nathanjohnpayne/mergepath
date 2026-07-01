@@ -138,6 +138,8 @@ SAFE_ENV=(env -i
   "CODEX_HOME=$RUN_CODEX_HOME"
 )
 
+# Codex CLI v0.137 exposes --ask-for-approval as a global flag; placing it
+# after `exec` is rejected by `codex exec --help` / argument parsing.
 set +e
 RAW="$(
   printf '%s\n' "$DIFF" | p4b_run_with_timeout "$CLI_TIMEOUT" \

@@ -171,6 +171,9 @@ mk_fake fake-codex-usage \
   "printf '%s\n' 'tokens used' >&2
 printf '%s\n' '1,234' >&2
 printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[]}'"
+# Current Codex exposes --ask-for-approval as a global option. The real CLI
+# rejects `codex exec --ask-for-approval never ...`, so the adapter pins the
+# global flag before the exec subcommand.
 mk_fake fake-codex-arg-order \
   "if [ \"\${1:-}\" != '--ask-for-approval' ] || [ \"\${2:-}\" != 'never' ] || [ \"\${3:-}\" != 'exec' ]; then echo BAD-CODEX-ARG-ORDER >&2; exit 8; fi
 shift 3
