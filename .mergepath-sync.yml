@@ -384,6 +384,14 @@ paths:
   - path: scripts/lib/feedback-policy-helpers.sh
     type: canonical
     consumers: all
+  # Shared visibility helper for OPTIONAL lint tooling (#588). Sourced by
+  # scripts/ci/check_phase_4b_automation for its shellcheck step, and tested by
+  # scripts/ci/check_lint_tooling (via its test). First-class entry so the #264
+  # closure invariant holds for every consumer whose check_phase_4b_automation
+  # hard-sources it — without it propagated, that check aborts on `source`.
+  - path: scripts/lib/lint-tooling.sh
+    type: canonical
+    consumers: all
   # Hub-side fleet audit for the propagation lane (#434); consumers
   # receive it because the scripts/ci kit's check_propagation_lane_audit
   # hard-requires it (and its offline test) on every lint run.
@@ -566,6 +574,13 @@ paths:
   # test; without it propagated, every consumer's check_feedback_policy_helpers
   # fails pre-flight with `Missing required file`. Same #264/#266 closure class.
   - path: tests/test_feedback_policy_helpers.sh
+    type: canonical
+    consumers: all
+  # Pairs with scripts/lib/lint-tooling.sh + scripts/ci/check_lint_tooling
+  # (#588). The check wrapper hard-requires this test; without it propagated,
+  # every consumer's check_lint_tooling fails pre-flight with `Missing required
+  # file`. Same #264/#266 closure class as test_feedback_policy_helpers.sh above.
+  - path: tests/test_lint_tooling.sh
     type: canonical
     consumers: all
   # Pairs with scripts/codex-review-request.sh + scripts/ci/check_codex_scripts
