@@ -18,7 +18,8 @@ validation from the enablement environment before flipping
 | [`adapters/review-via-codex.sh`](adapters/review-via-codex.sh) | Direction A (Claude→Codex). `codex --ask-for-approval never exec --sandbox read-only --output-schema verdict.schema.json`. |
 | [`adapters/review-via-claude.sh`](adapters/review-via-claude.sh) | Direction B (Codex→Claude). `claude -p --system-prompt ... --permission-mode plan --effort medium --tools "" --output-format json`. |
 | [`verdict.schema.json`](verdict.schema.json) | The normalized verdict contract both adapters emit, with optional adapter-populated token usage metadata when the CLI exposes it. **Single source of truth for the structural contract** — the `lib.sh` validator derives its key sets and enums from this file (see below). |
-| [`lib.sh`](lib.sh) | Shared config readers, reviewer selection, `jq`-based verdict validation, and JSON-block extraction. |
+| [`lib.sh`](lib.sh) | Shared config readers, reviewer selection, `jq`-based verdict validation, JSON-block extraction, and the per-adapter timeout/effort resolvers. |
+| [`collect-enablement-evidence.sh`](collect-enablement-evidence.sh) | Captures the pre-enablement evidence (#586): CLI versions, plan-auth status, API-key env scan, resolved config, and an optional adapter dry-run. Markdown or `--json`; exits `1` when BLOCKED. |
 
 ### Verdict contract: drift resistance & extraction
 
@@ -99,10 +100,25 @@ phase-4b-classifier.sh (is 4b needed?) ─▶ phase-4b-review.sh
   disabled slash commands, and no session persistence. The diff is supplied on
   stdin in both directions, so neither reviewer needs repo or home-directory
   read tools.
-- **Timeouts:** adapter execution and the underlying reviewer CLI are bounded
-  by `P4B_ADAPTER_TIMEOUT_SECONDS` / `P4B_REVIEW_CLI_TIMEOUT_SECONDS`
-  (default `900`). A timeout exits through the same fail-closed manual handoff
-  path as any other adapter error.
+- **Timeouts + effort (configurable, #589):** the reviewer CLI timeout and
+  effort are read per-adapter from `phase_4b_automation` so Codex and Claude can
+  be tuned without editing the adapter scripts. The orchestrator resolves them
+  (`p4b_resolve_adapter_timeout` / `p4b_resolve_adapter_effort`) and passes them
+  down via `P4B_REVIEW_CLI_TIMEOUT_SECONDS` and `P4B_{CLAUDE,CODEX}_EFFORT`.
+  - **Timeout:** `adapter_timeout_seconds` (shared) with optional
+    `codex_timeout_seconds` / `claude_timeout_seconds` overrides. Must be an
+    integer in `[1, 3600]`; absent ⇒ `900`. A non-integer or out-of-range value
+    is rejected **fail-closed** (the orchestrator exits `3`) so a typo can never
+    effectively unbound the CLI. `P4B_ADAPTER_TIMEOUT_SECONDS` /
+    `P4B_REVIEW_CLI_TIMEOUT_SECONDS` still override at runtime for tests/manual
+    runs. A timeout exits through the same fail-closed manual-handoff path as any
+    other adapter error.
+  - **Effort:** `claude_effort` (`low|medium|high|xhigh|max`, default `medium`,
+    → `claude --effort`) and `codex_effort` (`minimal|low|medium|high|xhigh`,
+    `xhigh` model-dependent, default empty = Codex CLI default, → `codex -c
+    model_reasoning_effort`, validated against codex-cli 0.137; `--strict-config`
+    is not used, so an unrecognized key on a future CLI is a harmless no-op). An
+    invalid value is rejected fail-closed.
 - **Review metadata:** posted reviews include reviewed head SHA, reviewer
   identity, adapter, adapter run count, timeout, token usage when exposed by
   the CLI, and an explicit `not exposed` marker for model-internal turn count.
@@ -127,6 +143,21 @@ phase-4b-classifier.sh (is 4b needed?) ─▶ phase-4b-review.sh
   until a repo opts in).
 
 ## Enabling
+
+Before flipping the switch, capture the enablement evidence (#586) from the
+environment that will post reviews, on plan auth, with no API-key env vars set:
+
+```bash
+# Markdown for a PR comment, or --json for machine checks. Exits 1 if BLOCKED
+# (an API key is set, or no direction has a plan-authed CLI). Add
+# --diff-file <patch> (or --pr N --repo owner/repo) to include a live dry-run.
+scripts/phase-4b/collect-enablement-evidence.sh
+```
+
+It records `codex --version` / `claude --version`, each adapter's plan-auth
+status, the disallowed-API-key scan, the resolved per-adapter timeout/effort,
+and (optionally) a successful adapter dry-run — the exact evidence the
+enablement PR should paste. Then flip the switch:
 
 ```yaml
 # .github/review-policy.yml

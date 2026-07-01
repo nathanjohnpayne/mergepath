@@ -93,6 +93,77 @@ p4b_top_field() {
   ' "$cfg"
 }
 
+# --- reviewer CLI runtime bounds: timeout + effort (#589) -------------------
+
+# Conservative defaults preserve the historical hard-coded behavior (a 900s
+# timeout, Claude effort medium, Codex effort unset/no-op).
+P4B_DEFAULT_ADAPTER_TIMEOUT_SECONDS=900
+# Safety bounds for a POLICY-configured timeout. A value outside this range, or
+# a non-integer, is rejected fail-closed so a typo (e.g. 90000000) cannot
+# effectively unbound the reviewer CLI. The P4B_*_TIMEOUT_SECONDS env overrides
+# the orchestrator/adapters honor are a deliberate escape hatch for tests and
+# manual runs and are NOT bounded here.
+P4B_MIN_ADAPTER_TIMEOUT_SECONDS=1
+P4B_MAX_ADAPTER_TIMEOUT_SECONDS=3600
+
+# p4b_resolve_adapter_timeout <adapter>
+# Resolve the reviewer CLI timeout (seconds) for <adapter> from policy:
+#   phase_4b_automation.<adapter>_timeout_seconds  (per-adapter override)
+#   phase_4b_automation.adapter_timeout_seconds    (shared default)
+#   P4B_DEFAULT_ADAPTER_TIMEOUT_SECONDS            (900)
+# Prints the resolved integer on success. Returns non-zero (no output) when a
+# configured value is non-integer or outside [MIN, MAX] so the caller fails
+# closed instead of running the CLI mis-bounded. Env overrides are layered on
+# by the orchestrator, not here.
+p4b_resolve_adapter_timeout() {
+  local adapter="$1" val
+  val="$(p4b_automation_field "${adapter}_timeout_seconds")"
+  [ -n "$val" ] || val="$(p4b_automation_field adapter_timeout_seconds)"
+  [ -n "$val" ] || { printf '%s' "$P4B_DEFAULT_ADAPTER_TIMEOUT_SECONDS"; return 0; }
+  case "$val" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  if [ "$val" -lt "$P4B_MIN_ADAPTER_TIMEOUT_SECONDS" ] \
+     || [ "$val" -gt "$P4B_MAX_ADAPTER_TIMEOUT_SECONDS" ]; then
+    return 1
+  fi
+  printf '%s' "$val"
+}
+
+# p4b_resolve_adapter_effort <adapter>
+# Resolve the reviewer CLI effort level for <adapter> from
+# phase_4b_automation.<adapter>_effort, validated against that adapter's
+# accepted set:
+#   claude → low|medium|high|xhigh|max        (maps to `claude --effort`; default medium)
+#   codex  → minimal|low|medium|high|xhigh    (maps to `codex -c model_reasoning_effort`;
+#                                              default empty = CLI default / no-op)
+# Prints the value (possibly empty for codex) on success; returns non-zero on an
+# invalid configured value so the caller fails closed.
+p4b_resolve_adapter_effort() {
+  local adapter="$1" val
+  val="$(p4b_automation_field "${adapter}_effort")"
+  case "$adapter" in
+    claude)
+      [ -n "$val" ] || { printf 'medium'; return 0; }
+      case "$val" in
+        low|medium|high|xhigh|max) printf '%s' "$val" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    codex)
+      [ -n "$val" ] || return 0   # empty = no -c flag (CLI default)
+      case "$val" in
+        minimal|low|medium|high|xhigh) printf '%s' "$val" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *)
+      # Unknown adapter has no effort knob; any configured value is invalid.
+      [ -n "$val" ] && return 1 || return 0
+      ;;
+  esac
+}
+
 # --- feedback-disposition policy (#574-compatible approval gate) -----------
 
 # p4b_feedback_policy_mode — mode under `feedback_policy:`. The absent-block
