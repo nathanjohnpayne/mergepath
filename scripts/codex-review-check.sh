@@ -27,12 +27,23 @@
 #
 #   (c) Codex (when codex.enabled=true) or a Phase 4b substitute
 #       reviewer has cleared on or after the current HEAD commit via
-#       one of three signals:
+#       one of four signals:
 #
 #         - A COMMENTED review from the Codex bot on the current HEAD
 #           with NO unaddressed P0/P1 inline findings, OR
 #         - A +1 / 👍 reaction from the Codex bot on the PR issue
 #           with created_at >= current HEAD committer date, OR
+#         - **Issue-comment verdict (#600/#567):** a Codex-bot PR issue
+#           comment carrying its stable affirmative verdict phrasing
+#           ("Didn't find any major issues") AND a `Reviewed commit:
+#           <sha>` line whose sha prefixes the current HEAD_SHA
+#           (HEAD-anchored), with NO unaddressed P0/P1 inline findings
+#           on HEAD. Codex routes its verdict here rather than to a
+#           review object, and its 👍 reaction expires after
+#           `reaction_freshness_window_seconds`, so a genuinely-clean
+#           clearance can exist only as this comment. Fail-closed: a
+#           stale-HEAD, findings-bearing, changes-requested, or
+#           unrecognized verdict does not match. OR
 #         - **Phase 4b substitute (#218):** an APPROVED review on the
 #           current HEAD (`commit_id == HEAD_SHA`) from a non-author
 #           identity in `available_reviewers`, gated on
@@ -740,6 +751,68 @@ log "gate (a): CI is green (Label Gate failure, if present, is expected during P
 
 fi  # end REQUIRE_CI_GREEN
 
+# --- Codex issue-comment verdict signal (#600 / #567) ----------------------
+#
+# Codex posts its review verdict as a PR ISSUE COMMENT
+# (issues/{pr}/comments), e.g. "Codex Review: Didn't find any major issues.
+# Swish!" followed by a "**Reviewed commit:** <sha>" line — NOT always a
+# review object or a 👍 reaction (#567). The 👍 reaction additionally
+# EXPIRES after reaction_freshness_window_seconds and Codex does not
+# reliably re-post it on a re-review, so a genuinely-clean Codex clearance
+# can manifest purely as this issue-comment verdict. Recognize a
+# HEAD-anchored AFFIRMATIVE verdict as a clearance signal for gate (b)
+# branch 2 and gate (c) (#600); this ADDS to — never replaces — the
+# existing review-object and 👍 paths.
+#
+# Fail-closed matching — a comment qualifies as CODEX_HEAD_VERDICT_TIME
+# ONLY when ALL hold:
+#   1. author == BOT_LOGIN (the Codex connector bot);
+#   2. body matches Codex's STABLE affirmative phrasing
+#      ("Didn't find any major issues") — a structured shape, not
+#      open-ended NLP;
+#   3. body carries a `Reviewed commit: <sha>` line whose <sha> is a
+#      prefix of the current HEAD_SHA (HEAD-anchored; Codex abbreviates
+#      the sha, so match by prefix, not equality).
+# A findings-bearing verdict, a changes-requested verdict, a stale-HEAD
+# verdict (Reviewed commit != HEAD), or unrecognized text does NOT match —
+# the signal stays empty and the gate falls through to its other
+# (fail-closed) paths. Gate (c) additionally cross-checks that there are
+# zero unaddressed P0/P1 inline findings on HEAD before honoring it, so a
+# verdict comment can never override a live required-tier finding.
+#
+# Only a Codex-bot signal, so compute it only when codex.enabled=true;
+# leaves disabled repos byte-identical in behavior.
+CODEX_HEAD_VERDICT_TIME=""
+if [ "$CODEX_ENABLED" = "true" ]; then
+  ISSUE_COMMENTS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
+  CODEX_HEAD_VERDICT_TIME=$(echo "$ISSUE_COMMENTS_JSON" | jq -r \
+    --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
+    ($sha | ascii_downcase) as $head
+    | [ .[]
+        | select(.user.login == $bot)
+        # (2) stable affirmative phrasing (case-insensitive; the .? in
+        #     didn.?t tolerates a straight, absent, or typographic apostrophe).
+        | select(.body | test("(?i)didn.?t find any major issues"))
+        | . as $c
+        # (3) HEAD anchor — extract every "Reviewed commit: <sha>" hex token
+        #     (lowercased; tolerate ":", "**", backticks, whitespace between
+        #     the label and the sha) and require at least one to prefix HEAD.
+        | ( [ $c.body
+              | ascii_downcase
+              | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
+              | .[0]
+            ] ) as $shas
+        | select( ($shas | length) > 0
+                  and ($shas | any(. as $s | $head | startswith($s))) )
+        | $c.created_at
+      ]
+    | max // ""
+  ')
+  if [ -n "$CODEX_HEAD_VERDICT_TIME" ]; then
+    log "codex verdict: HEAD-anchored affirmative issue-comment verdict @ $CODEX_HEAD_VERDICT_TIME (Reviewed commit prefixes $HEAD_SHA)"
+  fi
+fi
+
 # --- gate (b): reviewer identity approval ----------------------------------
 
 log "gate (b): checking for latest-state APPROVED review from a reviewer identity"
@@ -848,6 +921,18 @@ if [ -z "$APPROVING_REVIEWER" ]; then
     if [ -n "$GATE_B_THUMBS_UP" ]; then
       log "gate (b): same-agent + Codex 👍 @ $GATE_B_THUMBS_UP (≥ threshold $REACTION_THRESHOLD) — branch 2 cleared"
       APPROVING_REVIEWER="(branch 2: same-agent + Codex 👍)"
+    elif [ -n "$CODEX_HEAD_VERDICT_TIME" ]; then
+      # #600: the 👍 reaction expires after reaction_freshness_window_seconds
+      # and Codex does not reliably re-post it on a re-review, but its
+      # HEAD-anchored affirmative issue-comment verdict ("Didn't find any
+      # major issues" + "Reviewed commit: <HEAD>") is an equally strong
+      # same-agent cross-review signal — and, being HEAD-anchored by the
+      # Reviewed-commit sha, needs no time-window freshness check. Accept it
+      # as a branch-2 clearance too. (gate (c) still enforces zero
+      # unaddressed P0/P1 on HEAD, so this only substitutes for the reviewer
+      # cross-check, not the findings check.)
+      log "gate (b): same-agent + Codex HEAD-anchored verdict comment @ $CODEX_HEAD_VERDICT_TIME — branch 2 cleared (#600)"
+      APPROVING_REVIEWER="(branch 2: same-agent + Codex verdict comment)"
     fi
   fi
 
@@ -1028,6 +1113,24 @@ elif [ -n "$CODEX_REVIEW_TIME" ]; then
     CLEARED=true
     CLEARANCE_REASON="COMMENTED review from $BOT_LOGIN @ $CODEX_REVIEW_TIME on $HEAD_SHA with no unaddressed P0/P1 findings"
   fi
+fi
+
+# Issue-comment verdict path (#600): if none of the review-object / 👍
+# paths above cleared, a HEAD-anchored AFFIRMATIVE verdict comment
+# ("Didn't find any major issues" + "Reviewed commit: <HEAD>") clears
+# gate (c) — BUT only when there are zero unaddressed P0/P1 inline findings
+# on HEAD (UNADDRESSED_COUNT == 0). This is the fail-closed cross-check the
+# #600 acceptance criteria require: a verdict that still names required-tier
+# findings, or one paired with an unresolved P0/P1 review thread on HEAD,
+# does NOT clear. Because UNADDRESSED_P01 is scoped to a Codex review on
+# HEAD, when the verdict comment stands alone (no review object on HEAD)
+# UNADDRESSED_COUNT is 0 and the verdict clears; when a findings-bearing
+# review co-exists on HEAD, UNADDRESSED_COUNT>0 blocks it. This is the exact
+# scenario from #600: the 👍 expired and Codex's clearance is only its
+# issue-comment verdict.
+if [ "$CLEARED" != "true" ] && [ -n "$CODEX_HEAD_VERDICT_TIME" ] && [ "$UNADDRESSED_COUNT" -eq 0 ]; then
+  CLEARED=true
+  CLEARANCE_REASON="HEAD-anchored affirmative Codex verdict comment @ $CODEX_HEAD_VERDICT_TIME (Reviewed commit prefixes $HEAD_SHA; no unaddressed P0/P1 findings on HEAD) (#600)"
 fi
 
 else
