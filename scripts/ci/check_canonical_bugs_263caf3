@@ -1426,14 +1426,45 @@ out=$(
 )
 rc=$?
 set -e
-if [ "$rc" = "0" ] &&
-   echo "$out" | grep -q '"status": "cleared"' &&
-   echo "$out" | grep -q "references current HEAD headsha but fresh_at=2999-01-01T00:00:00Z is older than status_created=2999-01-01T00:00:01Z"; then
+if [ "$rc" = "5" ] &&
+   echo "$out" | grep -q '"status": "rate_limit_stalled"' &&
+   echo "$out" | grep -q "within the 630s window"; then
   pass=$((pass + 1))
-  echo "  PASS: newer StatusContext success clears despite an older current-head rate-limit comment"
+  echo "  PASS: a StatusContext success 1s after a current-head rate-limit notice is suppressed within the published 10-minute window (630s, window-aware grace) (#596/#599)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: stale current-head rate-limit comment incorrectly suppressed a newer StatusContext success (rc=$rc)" >&2
+  echo "  FAIL: #596/#599 — a StatusContext success inside the published rate-limit window false-cleared a current-head rate-limit comment (rc=$rc)" >&2
+  echo "$out" | sed 's/^/    /' >&2
+fi
+
+# #596 escape: a StatusContext success that postdates the HEAD-referencing
+# rate-limit notice by MORE than STATUS_SUCCESS_GRACE_SECONDS (120s) is a
+# genuine later re-review (which per #221 can be silent — the status flips with
+# no new summary comment) and must still clear. Preserves the original "inverse"
+# intent (an older rate-limit comment followed by a genuinely later success
+# clears), now with a realistic post-window gap instead of the 1s that the #595
+# evidence disproved. fresh_at=2999:00 (via updated_at), status=+2h.
+set +e
+out=$(
+  cd "$CODERABBIT_FASTPATH_ROOT" &&
+    PATH="$SCRATCH:$PATH" \
+    GH_TOKEN=fixture-token \
+    CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+    STUB_COMMENT_CREATED_AT="2998-01-01T00:00:00Z" \
+    STUB_COMMENT_UPDATED_AT="2999-01-01T00:00:00Z" \
+    STUB_STATUS_CREATED_AT="2999-01-01T02:00:00Z" \
+    "$ROOT/$CODERABBIT_WAIT_SCRIPT" 12345 nathanjohnpayne/mergepath 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" = "0" ] &&
+   echo "$out" | grep -q '"status": "cleared"' &&
+   echo "$out" | grep -q "postdates the HEAD-referencing rate_limit notice"; then
+  pass=$((pass + 1))
+  echo "  PASS: a genuinely later StatusContext success (beyond the grace window) still clears despite an earlier current-head rate-limit comment (#596)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a genuine later StatusContext success failed to clear over an earlier current-head rate-limit comment (rc=$rc)" >&2
   echo "$out" | sed 's/^/    /' >&2
 fi
 

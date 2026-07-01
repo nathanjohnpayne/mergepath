@@ -582,10 +582,14 @@ test_446_newer_comment_suppresses_stale_status() {
     fail "#446: coderabbit-wait.sh is missing the newer-comment freshness guard (#446 marker / suppressed-log)"
   fi
 
-  # Inline ordering decision mirroring status_context_fast_path_blocked_by_comment:
-  # "block" (suppress the fast-path) iff the comment is rate_limit/in_progress
-  # AND not older than the StatusContext success (newer-or-equal), regardless
-  # of HEAD reference. KEEP IN SYNC with the function.
+  # Inline ordering decision mirroring the NO-HEAD-reference branch of
+  # status_context_fast_path_blocked_by_comment: "block" (suppress the
+  # fast-path) iff the comment is rate_limit/in_progress AND not older than the
+  # StatusContext success (newer-or-equal). NB: since #596 the HEAD-referencing
+  # branch instead uses a grace window (a success within
+  # STATUS_SUCCESS_GRACE_SECONDS of a HEAD-referencing notice is suppressed;
+  # a later one stays authoritative) — this model covers only the no-HEAD path
+  # it asserts below. KEEP IN SYNC with the function.
   decide() {  # <class> <comment_fresh_at> <status_created_at> → block|authoritative
     case "$1" in
       rate_limit|in_progress)
