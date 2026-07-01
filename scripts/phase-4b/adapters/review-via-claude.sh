@@ -16,7 +16,8 @@
 # mode) to RETURN the structured verdict, and let the orchestrator post it.
 #
 # Docs (verbatim flags):
-#   claude -p "<prompt>" --permission-mode plan --output-format json \
+#   claude -p "<prompt>" --system-prompt "<structured reviewer>" \
+#     --permission-mode plan --output-format json \
 #     --tools ""
 #   https://code.claude.com/docs/en/headless
 #   https://code.claude.com/docs/en/permission-modes
@@ -41,7 +42,8 @@
 #               PRESERVED. If claude is not logged in on a plan the read-only
 #               call fails and the orchestrator falls back to the manual
 #               handoff (fail-closed).
-#   Claude always runs with --permission-mode plan and --tools "".
+#   Claude always runs with a text-only system prompt, --permission-mode plan,
+#   and --tools "".
 #   Environment overrides cannot widen the tool or permission posture.
 #   GH_TOKEN    only used if the diff must be fetched (no --diff-file).
 #   P4B_REVIEW_CLI_TIMEOUT_SECONDS  default: P4B_ADAPTER_TIMEOUT_SECONDS
@@ -59,6 +61,7 @@ SCHEMA="$HERE/../verdict.schema.json"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 PERMISSION_MODE=plan
 TOOLS=""
+SYSTEM_PROMPT="You are a text-only structured-output code reviewer. Do not use tools. Do not plan implementation. Return exactly the requested JSON object and no prose."
 
 PR="" ; REPO="" ; HEAD="" ; DIFF_FILE="" ; MODEL="${P4B_CLAUDE_MODEL:-}"
 CLI_TIMEOUT="${P4B_REVIEW_CLI_TIMEOUT_SECONDS:-${P4B_ADAPTER_TIMEOUT_SECONDS:-900}}"
@@ -135,6 +138,7 @@ ENVELOPE="$(
   printf '%s\n' "$DIFF" | p4b_run_with_timeout "$CLI_TIMEOUT" \
     "${SAFE_ENV[@]}" \
     "$CLAUDE_BIN" -p "$PROMPT" \
+    --system-prompt "$SYSTEM_PROMPT" \
     --permission-mode "$PERMISSION_MODE" \
     --output-format json \
     --no-session-persistence \

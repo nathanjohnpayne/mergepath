@@ -224,6 +224,7 @@ exit 8"
 mk_fake fake-claude-readonly \
   "permission=''
 tools='__unset__'
+system_prompt_seen=false
 safe_mode=false
 no_persist=false
 slash_disabled=false
@@ -231,6 +232,7 @@ while [ \"\$#\" -gt 0 ]; do
   case \"\$1\" in
     --permission-mode) permission=\"\${2:-}\"; shift 2 ;;
     --tools) tools=\"\${2-}\"; shift 2 ;;
+    --system-prompt) system_prompt_seen=true; shift 2 ;;
     --safe-mode) safe_mode=true; shift ;;
     --no-session-persistence) no_persist=true; shift ;;
     --disable-slash-commands) slash_disabled=true; shift ;;
@@ -239,6 +241,7 @@ while [ \"\$#\" -gt 0 ]; do
 done
 [ \"\$permission\" = 'plan' ] || { echo BAD-PERMISSION-MODE >&2; exit 8; }
 [ \"\$tools\" = '' ] || { echo BAD-TOOLS >&2; exit 8; }
+[ \"\$system_prompt_seen\" = true ] || { echo MISSING-SYSTEM-PROMPT >&2; exit 8; }
 [ \"\$safe_mode\" = true ] || { echo MISSING-SAFE-MODE >&2; exit 8; }
 [ \"\$no_persist\" = true ] || { echo MISSING-NO-PERSIST >&2; exit 8; }
 [ \"\$slash_disabled\" = true ] || { echo MISSING-DISABLE-SLASH >&2; exit 8; }
