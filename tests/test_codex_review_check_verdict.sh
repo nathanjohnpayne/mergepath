@@ -62,15 +62,32 @@ else
   fail "gate (c) is missing the verdict clearance path or its UNADDRESSED_COUNT==0 cross-check"
 fi
 
+# ── 3b. Structural (#608): latest-verdict-first (a newer non-affirmative
+#      verdict supersedes an older clean one), and the latest verdict timestamp
+#      (any disposition) is carried into the Phase 4b substitute freshness guard.
+if grep -q "CODEX_HEAD_VERDICT_ANY_TIME" "$SCRIPT" \
+   && grep -q "max_by(.created_at)" "$SCRIPT" \
+   && grep -q "#608" "$SCRIPT"; then
+  pass "codex-review-check.sh selects latest verdict first then requires affirmative, and folds the any-verdict timestamp into the Phase 4b guard (#608 P1/P2)"
+else
+  fail "codex-review-check.sh is missing the latest-verdict-first restructure (max_by / CODEX_HEAD_VERDICT_ANY_TIME / #608)"
+fi
+
 # ── 4. Inline logic: the verdict-matching jq filter. KEEP IN SYNC with
-#      scripts/codex-review-check.sh CODEX_HEAD_VERDICT_TIME.
+#      scripts/codex-review-check.sh CODEX_VERDICT_JSON. The filter selects the
+#      LATEST HEAD-anchored verdict FIRST (any disposition), then requires that
+#      latest verdict to be affirmative — so a newer NON-affirmative verdict on
+#      the same HEAD supersedes an older clean one and fails closed (Codex P1 on
+#      #608). VERDICT_FILTER returns the affirmative-gated clearance timestamp
+#      (CODEX_HEAD_VERDICT_TIME); ANY_FILTER returns the latest verdict
+#      timestamp regardless of disposition (CODEX_HEAD_VERDICT_ANY_TIME, used by
+#      the Phase 4b freshness guard).
 BOT="chatgpt-codex-connector[bot]"
 HEAD="d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"
-VERDICT_FILTER='
+LATEST_HEAD_VERDICT='
     ($sha | ascii_downcase) as $head
     | [ .[]
         | select(.user.login == $bot)
-        | select(.body | test("(?i)didn.?t find any major issues"))
         | . as $c
         | ( [ $c.body
               | ascii_downcase
@@ -79,9 +96,14 @@ VERDICT_FILTER='
             ] ) as $shas
         | select( ($shas | length) > 0
                   and ($shas | any(. as $s | $head | startswith($s))) )
-        | $c.created_at
+        | { created_at: .created_at,
+            affirmative: (.body | test("(?i)didn.?t find any major issues")) }
       ]
-    | max // ""'
+    | max_by(.created_at) // null'
+VERDICT_FILTER="$LATEST_HEAD_VERDICT"'
+    | if . == null then "" elif .affirmative then .created_at else "" end'
+ANY_FILTER="$LATEST_HEAD_VERDICT"'
+    | if . == null then "" else .created_at end'
 
 # fixture builder — guarantees valid JSON encoding (real newlines, apostrophes)
 mk() { jq -n --arg login "$1" --arg body "$2" --arg t "$3" \
@@ -146,6 +168,36 @@ check_case "two qualifying verdicts → picks the latest created_at" \
      {user:{login:$bot},body:("Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0"),created_at:"2026-07-01T10:00:00Z"},
      {user:{login:$bot},body:("Didn'"'"'t find any major issues. Keep them coming!\nReviewed commit: d05ff4d0e"),created_at:"2026-07-01T12:00:00Z"}
    ]')"
+
+# 4i. P1 (#608) latest-wins fail-closed: older AFFIRMATIVE then a NEWER
+#     NON-affirmative verdict on the same HEAD → clearance signal is EMPTY
+#     (the newer negative verdict supersedes the older clean one).
+NEWER_NEGATIVE="$(jq -n --arg bot "$BOT" '[
+   {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0"),created_at:"2026-07-01T10:00:00Z"},
+   {user:{login:$bot},body:("Codex Review: Found 2 issues to address.\nReviewed commit: d05ff4d0e"),created_at:"2026-07-01T12:00:00Z"}
+ ]')"
+check_case "older affirmative + NEWER non-affirmative verdict → clearance empty (P1 #608)" \
+  "" "$NEWER_NEGATIVE"
+
+# 4j. latest-wins accept: older NON-affirmative then a NEWER affirmative → the
+#     newer affirmative clears (returns its created_at).
+check_case "older non-affirmative + NEWER affirmative verdict → clears on the newer" \
+  "2026-07-01T12:00:00Z" \
+  "$(jq -n --arg bot "$BOT" '[
+     {user:{login:$bot},body:("Codex Review: Found 1 issue.\nReviewed commit: d05ff4d0"),created_at:"2026-07-01T10:00:00Z"},
+     {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0e"),created_at:"2026-07-01T12:00:00Z"}
+   ]')"
+
+# 4k. ANY-timestamp (Phase 4b guard, #608 P2): the latest HEAD-anchored verdict
+#     timestamp is carried REGARDLESS of disposition, so a newer NEGATIVE
+#     verdict still raises the freshness floor above a stale Phase 4b approval.
+run_any() { printf '%s' "$1" | jq -r --arg bot "$BOT" --arg sha "$HEAD" "$ANY_FILTER"; }
+GOT_ANY="$(run_any "$NEWER_NEGATIVE")"
+if [ "$GOT_ANY" = "2026-07-01T12:00:00Z" ]; then
+  pass "verdict ANY-timestamp: newer non-affirmative verdict is carried for the Phase 4b guard (#608 P2)"
+else
+  fail "verdict ANY-timestamp: expected 2026-07-01T12:00:00Z, got '$GOT_ANY'"
+fi
 
 # ── 5. Gate (c) fail-closed cross-check: the verdict clears ONLY when there
 #      are zero unaddressed P0/P1 findings on HEAD. Model the exact shell

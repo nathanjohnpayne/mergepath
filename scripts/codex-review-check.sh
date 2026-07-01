@@ -783,20 +783,30 @@ fi  # end REQUIRE_CI_GREEN
 # Only a Codex-bot signal, so compute it only when codex.enabled=true;
 # leaves disabled repos byte-identical in behavior.
 CODEX_HEAD_VERDICT_TIME=""
+CODEX_HEAD_VERDICT_ANY_TIME=""
 if [ "$CODEX_ENABLED" = "true" ]; then
   ISSUE_COMMENTS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
-  CODEX_HEAD_VERDICT_TIME=$(echo "$ISSUE_COMMENTS_JSON" | jq -r \
+  # Select the LATEST HEAD-anchored Codex verdict comment FIRST (any
+  # disposition), THEN decide whether that latest one is affirmative. Filtering
+  # to affirmative-only BEFORE taking max() would let an older clean "Didn't
+  # find any major issues" keep the signal non-empty even when a NEWER
+  # "Codex Review: Found …" / changes-requested verdict for the same HEAD was
+  # posted after it — a false clear (Codex P1 on #608). A "HEAD-anchored
+  # verdict" is any Codex-bot comment carrying a `Reviewed commit: <sha>` line
+  # whose sha prefixes HEAD; keeping the non-affirmative timestamp too lets the
+  # Phase 4b substitute freshness guard reject a stale approval over a newer
+  # negative verdict (Codex P2 on #608).
+  CODEX_VERDICT_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
     --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
     ($sha | ascii_downcase) as $head
     | [ .[]
         | select(.user.login == $bot)
-        # (2) stable affirmative phrasing (case-insensitive; the .? in
-        #     didn.?t tolerates a straight, absent, or typographic apostrophe).
-        | select(.body | test("(?i)didn.?t find any major issues"))
         | . as $c
-        # (3) HEAD anchor — extract every "Reviewed commit: <sha>" hex token
-        #     (lowercased; tolerate ":", "**", backticks, whitespace between
-        #     the label and the sha) and require at least one to prefix HEAD.
+        # HEAD anchor — extract every "Reviewed commit: <sha>" hex token
+        # (lowercased; tolerate ":", "**", backticks, whitespace between the
+        # label and the sha) and require at least one to prefix HEAD. This
+        # keeps verdicts of ANY disposition so latest-wins can see a newer
+        # negative verdict.
         | ( [ $c.body
               | ascii_downcase
               | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
@@ -804,12 +814,19 @@ if [ "$CODEX_ENABLED" = "true" ]; then
             ] ) as $shas
         | select( ($shas | length) > 0
                   and ($shas | any(. as $s | $head | startswith($s))) )
-        | $c.created_at
+        # affirmative = Codex stable phrasing (case-insensitive; the .? in
+        # didn.?t tolerates a straight, absent, or typographic apostrophe).
+        | { created_at: .created_at,
+            affirmative: (.body | test("(?i)didn.?t find any major issues")) }
       ]
-    | max // ""
+    | max_by(.created_at) // null
   ')
-  if [ -n "$CODEX_HEAD_VERDICT_TIME" ]; then
-    log "codex verdict: HEAD-anchored affirmative issue-comment verdict @ $CODEX_HEAD_VERDICT_TIME (Reviewed commit prefixes $HEAD_SHA)"
+  CODEX_HEAD_VERDICT_ANY_TIME=$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "" else .created_at end')
+  if [ "$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "false" else (.affirmative | tostring) end')" = "true" ]; then
+    CODEX_HEAD_VERDICT_TIME="$CODEX_HEAD_VERDICT_ANY_TIME"
+    log "codex verdict: latest HEAD-anchored verdict @ $CODEX_HEAD_VERDICT_TIME is AFFIRMATIVE (Reviewed commit prefixes $HEAD_SHA)"
+  elif [ -n "$CODEX_HEAD_VERDICT_ANY_TIME" ]; then
+    log "codex verdict: latest HEAD-anchored verdict @ $CODEX_HEAD_VERDICT_ANY_TIME is NON-affirmative — not a clearance signal (fail closed); carried into the Phase 4b freshness guard"
   fi
 fi
 
@@ -1213,6 +1230,15 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
     LATEST_CODEX_SIGNAL_TIME="$LATEST_THUMBS_UP_TIME"
     if [ -n "$CODEX_REVIEW_TIME" ] && { [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || [[ "$CODEX_REVIEW_TIME" > "$LATEST_CODEX_SIGNAL_TIME" ]]; }; then
       LATEST_CODEX_SIGNAL_TIME="$CODEX_REVIEW_TIME"
+    fi
+    # #608 P2: a HEAD-anchored Codex verdict COMMENT (affirmative OR not) is
+    # also a Codex signal on HEAD. Fold its timestamp in so a stale Phase 4b
+    # APPROVED cannot clear over a NEWER negative verdict comment — the
+    # affirmative-only CODEX_HEAD_VERDICT_TIME would drop a newer negative
+    # verdict and let the stale approval through. CODEX_HEAD_VERDICT_ANY_TIME
+    # is the latest HEAD-anchored verdict regardless of disposition.
+    if [ -n "$CODEX_HEAD_VERDICT_ANY_TIME" ] && { [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || [[ "$CODEX_HEAD_VERDICT_ANY_TIME" > "$LATEST_CODEX_SIGNAL_TIME" ]]; }; then
+      LATEST_CODEX_SIGNAL_TIME="$CODEX_HEAD_VERDICT_ANY_TIME"
     fi
     if [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || [[ "$PHASE_4B_TIME" > "$LATEST_CODEX_SIGNAL_TIME" ]]; then
       CLEARED=true
