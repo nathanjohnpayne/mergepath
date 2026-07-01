@@ -391,29 +391,51 @@ fi
 
 # --- fetch review-thread resolution state via GraphQL ----------------------
 
-# GraphQL `reviewThreads(first: N)` returns each thread with `isResolved`
-# and a `comments` connection. We extract a mapping (comment_id →
-# isResolved) keyed on the first comment's databaseId, then look each
-# blocking-tier comment up.
+# Build a mapping (comment_id → isResolved) across ALL review threads and ALL
+# comments in each thread, then look each blocking-tier comment up.
 #
-# A single page of 100 review threads is enough for the typical PR; a
-# PR with >100 review threads is unusual and warrants a hard error
-# rather than a silent truncation (same posture as codex-p1-gate.sh).
+# PAGINATION (#592). The GraphQL `reviewThreads` connection and each thread's
+# nested `comments` connection each cap at 100 items per page. A PR with >100
+# review threads, or a thread with >100 comments (the gap nathanpayne-codex
+# flagged as P1 on #590), would truncate the map — a blocking comment id beyond
+# the cap would be absent, fall to `// false` in the classification below, and
+# be counted as unresolved. That is already fail-SAFE (over-block, never
+# false-clear), but it turns an extreme-but-legitimate PR into a hard exit 2.
+# So instead of erroring on overflow, we PAGINATE both connections with a
+# cursor loop and classify precisely.
+#
+# FAIL-CLOSED POSTURE IS PRESERVED (#592). The loop fails closed (die 2, the
+# same exit code as the pre-pagination hard errors) on ANY of: a GraphQL error,
+# a null/malformed page (missing reviewThreads), or exceeding the max-page
+# safety cap. It never treats a partial or failed scan as complete, so a
+# truncated map can NEVER silently under-count blocking findings. This block is
+# mirrored verbatim (bar the log prefix) in scripts/codex-p1-gate.sh — keep the
+# two in lockstep; a shared paginator was considered but the shared lib
+# (scripts/lib/feedback-policy-helpers.sh) is contractually gh/network-free.
 
 OWNER=${REPO%/*}
 NAME=${REPO#*/}
 
-GRAPHQL_QUERY=$(cat <<'EOF'
-query($owner: String!, $name: String!, $pr: Int!) {
+# Safety cap: 100 threads/page × 100 pages = 10k threads; 100 comments/page ×
+# 100 pages = 10k comments/thread. Far beyond any real PR; a loop that reaches
+# it indicates a cursor-stall / non-terminating pagination bug, so we fail
+# closed rather than spin.
+MAX_PAGES=100
+
+# Top-level reviewThreads query (paged via $cursor). Each thread carries its
+# first page of comments plus that connection's pageInfo so we can detect a
+# >100-comment thread and page it separately below.
+THREADS_QUERY=$(cat <<'EOF'
+query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $pr) {
-      reviewThreads(first: 100) {
-        totalCount
-        pageInfo { hasNextPage }
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
         nodes {
+          id
           isResolved
           comments(first: 100) {
-            pageInfo { hasNextPage }
+            pageInfo { hasNextPage endCursor }
             nodes { databaseId }
           }
         }
@@ -424,40 +446,96 @@ query($owner: String!, $name: String!, $pr: Int!) {
 EOF
 )
 
-THREADS_JSON=$(gh api graphql \
-  -F owner="$OWNER" \
-  -F name="$NAME" \
-  -F pr="$PR_NUMBER" \
-  -f query="$GRAPHQL_QUERY" 2>&1) \
-  || die 2 "failed to query reviewThreads: $THREADS_JSON"
+# Per-thread comments query (paged via $cursor) for a thread whose comments
+# connection overflowed 100. Keyed by the thread node id.
+THREAD_COMMENTS_QUERY=$(cat <<'EOF'
+query($id: ID!, $cursor: String) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { databaseId }
+      }
+    }
+  }
+}
+EOF
+)
 
-HAS_NEXT=$(echo "$THREADS_JSON" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')
-if [ "$HAS_NEXT" = "true" ]; then
-  die 2 "PR has >100 review threads; pagination not yet supported (#592). Failing closed."
-fi
+# Accumulate every thread node (with a fully-paginated comment id list) into
+# ALL_THREADS as a JSON array of { isResolved, comment_ids: [databaseId,...] }.
+ALL_THREADS='[]'
+CURSOR=""
+PAGE=0
+while :; do
+  PAGE=$((PAGE + 1))
+  if [ "$PAGE" -gt "$MAX_PAGES" ]; then
+    die 2 "reviewThreads pagination exceeded $MAX_PAGES pages (#592 safety cap) — failing closed."
+  fi
+  if [ -z "$CURSOR" ]; then
+    THREADS_JSON=$(gh api graphql -F owner="$OWNER" -F name="$NAME" \
+      -F pr="$PR_NUMBER" -F cursor=null -f query="$THREADS_QUERY" 2>&1) \
+      || die 2 "failed to query reviewThreads (page $PAGE): $THREADS_JSON"
+  else
+    THREADS_JSON=$(gh api graphql -F owner="$OWNER" -F name="$NAME" \
+      -F pr="$PR_NUMBER" -f cursor="$CURSOR" -f query="$THREADS_QUERY" 2>&1) \
+      || die 2 "failed to query reviewThreads (page $PAGE): $THREADS_JSON"
+  fi
+  # Fail closed on a malformed / null page: a missing reviewThreads object
+  # means the scan cannot be trusted complete.
+  if ! echo "$THREADS_JSON" | jq -e '.data.repository.pullRequest.reviewThreads.nodes' >/dev/null 2>&1; then
+    die 2 "malformed reviewThreads response (page $PAGE) — failing closed."
+  fi
 
-# Nested-comments overflow: a thread with >100 comments would truncate its
-# comment id list, so a blocking finding beyond the 100th comment could be
-# absent from RESOLUTION_MAP. The classification below fails closed on a
-# missing id (`// false` -> counted unresolved), but we ALSO die 2 here so a
-# truncated scan can NEVER silently under-count — matching the threads guard
-# above and closing the gap nathanpayne-codex flagged as P1 on #590 (the
-# threads connection was guarded; the nested comments connection was not).
-# Full cursor pagination for both connections is tracked in #592.
-COMMENTS_OVERFLOW=$(echo "$THREADS_JSON" | jq -r '
-  [ .data.repository.pullRequest.reviewThreads.nodes[]
-    | .comments.pageInfo.hasNextPage ] | any')
-if [ "$COMMENTS_OVERFLOW" = "true" ]; then
-  die 2 "a review thread has >100 comments; pagination not yet supported (#592). Failing closed."
-fi
+  # For each thread on this page, resolve its comment id list — paginating the
+  # nested comments connection if it overflowed 100.
+  PAGE_NODE_COUNT=$(echo "$THREADS_JSON" | jq '.data.repository.pullRequest.reviewThreads.nodes | length')
+  n=0
+  while [ "$n" -lt "$PAGE_NODE_COUNT" ]; do
+    NODE=$(echo "$THREADS_JSON" | jq -c ".data.repository.pullRequest.reviewThreads.nodes[$n]")
+    NODE_RESOLVED=$(echo "$NODE" | jq '.isResolved')
+    NODE_ID=$(echo "$NODE" | jq -r '.id')
+    COMMENT_IDS=$(echo "$NODE" | jq -c '[.comments.nodes[].databaseId]')
+    C_HAS_NEXT=$(echo "$NODE" | jq -r '.comments.pageInfo.hasNextPage')
+    C_CURSOR=$(echo "$NODE" | jq -r '.comments.pageInfo.endCursor')
+    C_PAGE=1
+    while [ "$C_HAS_NEXT" = "true" ]; do
+      C_PAGE=$((C_PAGE + 1))
+      if [ "$C_PAGE" -gt "$MAX_PAGES" ]; then
+        die 2 "thread comments pagination exceeded $MAX_PAGES pages (#592 safety cap) — failing closed."
+      fi
+      CJSON=$(gh api graphql -F id="$NODE_ID" -f cursor="$C_CURSOR" \
+        -f query="$THREAD_COMMENTS_QUERY" 2>&1) \
+        || die 2 "failed to query thread comments (thread $NODE_ID, page $C_PAGE): $CJSON"
+      if ! echo "$CJSON" | jq -e '.data.node.comments.nodes' >/dev/null 2>&1; then
+        die 2 "malformed thread comments response (thread $NODE_ID, page $C_PAGE) — failing closed."
+      fi
+      COMMENT_IDS=$(jq -c -n --argjson acc "$COMMENT_IDS" --argjson pg \
+        "$(echo "$CJSON" | jq -c '[.data.node.comments.nodes[].databaseId]')" '$acc + $pg')
+      C_HAS_NEXT=$(echo "$CJSON" | jq -r '.data.node.comments.pageInfo.hasNextPage')
+      C_CURSOR=$(echo "$CJSON" | jq -r '.data.node.comments.pageInfo.endCursor')
+    done
+    ALL_THREADS=$(jq -c -n --argjson acc "$ALL_THREADS" \
+      --argjson resolved "$NODE_RESOLVED" --argjson ids "$COMMENT_IDS" \
+      '$acc + [{ isResolved: $resolved, comment_ids: $ids }]')
+    n=$((n + 1))
+  done
 
-# Build a JSON object: { "<comment_id>": isResolved, ... }
-RESOLUTION_MAP=$(echo "$THREADS_JSON" | jq '
-  .data.repository.pullRequest.reviewThreads.nodes
-  | map(
+  HAS_NEXT=$(echo "$THREADS_JSON" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')
+  [ "$HAS_NEXT" = "true" ] || break
+  CURSOR=$(echo "$THREADS_JSON" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor')
+  if [ -z "$CURSOR" ] || [ "$CURSOR" = "null" ]; then
+    die 2 "reviewThreads reported hasNextPage but no endCursor — failing closed."
+  fi
+done
+
+# Build a JSON object: { "<comment_id>": isResolved, ... } from the fully
+# paginated thread set.
+RESOLUTION_MAP=$(echo "$ALL_THREADS" | jq '
+  map(
       (.isResolved) as $resolved
-      | .comments.nodes
-      | map({ key: (.databaseId | tostring), value: $resolved })
+      | .comment_ids
+      | map({ key: (. | tostring), value: $resolved })
     )
   | flatten
   | from_entries

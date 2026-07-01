@@ -703,6 +703,19 @@ paths:
   - path: tests/test_resolve_pr_threads_rationale_tag.sh
     type: canonical
     consumers: all
+  # Pairs with scripts/resolve-pr-threads.sh +
+  # scripts/ci/check_resolve_pr_threads (second delegated test file,
+  # after the rationale-tag test above). Exercises the #573-item-2
+  # staleness-floor pagination: a >50-comment thread's full comment
+  # list is re-fetched so the latest bot re-raise is never invisible
+  # to --resolve-actioned, and pagination failures fail closed (thread
+  # skipped, left unresolved). Without this test propagated, every
+  # consumer's check_resolve_pr_threads exits 1 on the wrapper's
+  # "missing $PAGINATION_TEST" branch — same #264/#266 coupling class
+  # as the rationale-tag pairing above. See #573.
+  - path: tests/test_resolve_pr_threads_staleness_pagination.sh
+    type: canonical
+    consumers: all
   # Pairs with scripts/daily-feedback-rollup.sh +
   # scripts/ci/check_daily_feedback_rollup (which sources this test
   # via paired-suite layer-1 before its own layer-2 shimmed smoke).
@@ -917,6 +930,7 @@ paths:
       - "tests/test_verify_propagation_pr.sh"  # check_verify_propagation_pr
       - "tests/test_match_protected_paths.sh"  # check_verify_propagation_pr (#471)
       - "tests/test_resolve_pr_threads_rationale_tag.sh"  # check_resolve_pr_threads (delegated test)
+      - "tests/test_resolve_pr_threads_staleness_pagination.sh"  # check_resolve_pr_threads (delegated test, #573)
       - "tests/test_template_substitution.sh"  # check_template_substitution
       - "tests/test_export_consumer_facts.sh"  # check_export_consumer_facts
       - "tests/test_check_coderabbit_config.sh"  # check_coderabbit_config_tests (#481/#482)
