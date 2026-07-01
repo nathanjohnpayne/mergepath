@@ -176,6 +176,16 @@ eq ""        "$(coderabbit_tier_of 'This is a Minor cleanup note, not a CodeRabb
 eq ""        "$(coderabbit_tier_of 'This is Trivial, no finding badge.')"                    "cr_tier_of: bare titlecase Trivial prose -> empty (#581 4b F2)"
 eq "p2"      "$(coderabbit_tier_of '_📐 Maintainability_ | _🟡 Minor_: This cleanup is Trivial but visible')" "cr_tier_of: Minor badge beats Trivial-in-prose -> p2 (#581 4b F2)"
 
+# --- rc-safety under set -euo pipefail (#581 4b F1) ------------------------
+# A markerless / unclassified call must return rc 0 + empty output, NOT abort a
+# `tier=$(fn "$body")` caller. Asserted directly: the eq cases above nest the
+# call in a command substitution passed as an argument, which masks the rc.
+# (This file runs under `set -euo pipefail`.)
+rc=0; out=$(codex_tier_of 'plain comment, no priority markers here') || rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "codex_tier_of: markerless is rc0+empty under set -e"; else fail "codex_tier_of: markerless rc=$rc out=[$out]"; fi
+rc=0; out=$(coderabbit_tier_of 'plain comment, no CodeRabbit badge here') || rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "coderabbit_tier_of: markerless is rc0+empty under set -e"; else fail "coderabbit_tier_of: markerless rc=$rc out=[$out]"; fi
+
 # ---------------------------------------------------------------------------
 echo
 echo "feedback-policy-helpers: $PASS passed, $FAIL failed"

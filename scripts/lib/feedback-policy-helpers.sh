@@ -110,10 +110,17 @@ resolve_required_tiers() {
 # (nathanpayne-codex Phase 4b on #581). grep -oE emits matches in position
 # order; head -n1 takes the earliest.
 codex_tier_of() {
-  local body=${1:-} n
-  n=$(printf '%s' "$body" | grep -oE '!\[P[0-3] Badge\]|\*\*P[0-3]' | head -n1 | sed -E 's/.*P([0-3]).*/\1/')
-  [ -n "$n" ] && echo "p$n"
-  return 0
+  local body=${1:-} marker n
+  # Status-safe under `set -euo pipefail`: grep exits 1 on no match (and can
+  # take SIGPIPE from `head`), which with pipefail would fail the assignment
+  # and abort a caller doing `tier=$(codex_tier_of "$b")` before this function
+  # returns. `|| true` keeps a markerless body as a clean empty result, rc 0
+  # (nathanpayne-codex Phase 4b P1 on #581). Split into extract-then-parse so
+  # the failable grep is isolated from the always-succeeding sed.
+  marker=$(printf '%s' "$body" | grep -oE '!\[P[0-3] Badge\]|\*\*P[0-3]' | head -n1 || true)
+  [ -n "$marker" ] || return 0
+  n=$(printf '%s' "$marker" | sed -E 's/.*P([0-3]).*/\1/')
+  echo "p$n"
 }
 
 # Map a CodeRabbit finding body to a tier, or empty if it is not a gradeable
