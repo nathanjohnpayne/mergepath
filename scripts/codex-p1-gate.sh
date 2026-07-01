@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
-# scripts/codex-p1-gate.sh — Codex P1 unresolved-thread merge gate
+# scripts/codex-p1-gate.sh — Codex blocking-tier unresolved-thread merge gate
 #
-# Reports "Codex P1 unresolved: N" for a pull request and fails (exit 1)
-# when N > 0. Read-only. Never merges, labels, or comments.
+# Reports "Codex blocking-tier unresolved: N" for a pull request and fails
+# (exit 1) when N > 0. Read-only. Never merges, labels, or comments.
 #
 # Context: per nathanjohnpayne/mergepath#235, the 2026-05-13 sweep of
 # unresolved reviewer feedback (#234) found 62 Codex P1 items sitting
 # on merged PRs across 9 repos. P1 is Codex's "blocking" severity tag;
 # 62 P1s riding through to closed state is evidence that the label was
 # advisory, not enforced. This script is the v1 enforcement.
+#
+# Generalization (nathanjohnpayne/mergepath#574, sub-issue #577): the gate
+# no longer hard-codes P1. It enforces the BLOCKING TIER SET resolved by
+# scripts/lib/feedback-policy-helpers.sh's resolve_required_tiers from the
+# `feedback_policy` block in .github/review-policy.yml, and classifies each
+# Codex inline comment with codex_tier_of. When the feedback_policy block is
+# ABSENT, resolve_required_tiers returns "p1" only, so the gate stays
+# byte-identical to its original P1-only behavior. The required-check NAME
+# (`Codex P1 Gate / Codex P1 unresolved threads`) is UNCHANGED — branch
+# protection depends on it — even though the gate now spans the resolved
+# tier set.
 #
 # Usage:
 #   scripts/codex-p1-gate.sh <PR_NUMBER> [REPO]
@@ -36,10 +47,11 @@
 #   2. Fetch all inline review comments on the PR via
 #      `repos/{repo}/pulls/{pr}/comments`.
 #   3. Filter to comments authored by `chatgpt-codex-connector[bot]`
-#      (or whatever `codex.bot_login` is configured to) that contain a
-#      P1 marker — the badge image pattern `![P1 Badge]` or the text
-#      pattern `**P1` (covers Codex's text-only fallback when image
-#      rendering is suppressed).
+#      (or whatever `codex.bot_login` is configured to) whose Codex
+#      tier (codex_tier_of: the badge image `![Pn Badge]` or the text
+#      fallback `**Pn`) is in the resolved BLOCKING tier set. With the
+#      feedback_policy block absent the set is {p1}, so this matches the
+#      original `![P1 Badge]` / `**P1` filter exactly.
 #   4. For each candidate, fetch its review thread state via GraphQL
 #      `reviewThreads` and check `isResolved`. The author or any
 #      collaborator can resolve a thread via the GitHub UI or
@@ -48,12 +60,14 @@
 #   5. SHA scope: a P1 finding only gates if its comment was attached
 #      to the PR's current HEAD. A P1 from an earlier SHA that is now
 #      either resolved OR no longer on HEAD does not count.
-#   6. Print one line per unresolved P1 to stdout for CI visibility,
-#      then the summary "Codex P1 unresolved: N".
+#   6. Print one line per unresolved blocking-tier finding to stdout for
+#      CI visibility, then the summary "Codex blocking-tier unresolved: N".
 #
 # Exit codes:
-#   0   No unresolved P1s on current HEAD (or gate disabled).
-#   1   One or more unresolved P1s on current HEAD — gate blocks.
+#   0   No unresolved blocking-tier findings on current HEAD (or gate
+#       disabled).
+#   1   One or more unresolved blocking-tier findings on current HEAD —
+#       gate blocks.
 #   2   Usage / config error. Error message on stderr.
 #
 # Design notes:
@@ -90,6 +104,17 @@ fi
 # --- config readers ---------------------------------------------------------
 
 CONFIG=".github/review-policy.yml"
+
+# Shared blocking-tier resolver + Codex tier classifier (#576 foundation).
+# resolve_required_tiers reads CONFIG (the global set above) and prints the
+# blocking tier set one per line — "p1" when the feedback_policy block is
+# absent, preserving this gate's original behavior. codex_tier_of maps a
+# Codex finding body to p0..p3. Sourced by absolute-ish path relative to
+# this script so it resolves regardless of cwd (the script runs from the
+# trusted default-branch checkout root, but lib lives under scripts/).
+__P1_GATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/feedback-policy-helpers.sh
+. "$__P1_GATE_DIR/lib/feedback-policy-helpers.sh"
 
 # Read a scalar field nested inside `codex:` `<sub_block>:` `<field>:`.
 # Same state-machine awk pattern as codex-review-check.sh, but tracks
@@ -155,7 +180,7 @@ esac
 
 if [ "$P1_GATE_ENABLED" != "true" ]; then
   echo "[codex-p1-gate] codex.p1_gate.enabled=false — skipping (clean pass)"
-  echo "Codex P1 unresolved: 0"
+  echo "Codex blocking-tier unresolved: 0"
   exit 0
 fi
 
@@ -194,6 +219,35 @@ fi
 BOT_LOGIN=$(codex_field bot_login)
 BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
 
+# Resolve the BLOCKING tier set from the feedback_policy block (#577). Absent
+# block -> "p1" (byte-identical to the original P1-only gate). Only rc 2 is
+# the documented "malformed mode/tier" signal — fail closed as a config error
+# (exit 2), the same posture as the p1_gate.enabled validation above. A
+# non-2 non-zero rc is NOT a failure: resolve_required_tiers' by-priority
+# branch inherits the exit status of its final loop iteration (e.g. rc 1 when
+# the last tier, nitpick, is not `required`), which is benign. Capture the
+# output regardless and branch on the rc explicitly so that benign tail
+# status does not get misread as malformed.
+set +e
+REQUIRED_TIERS=$(resolve_required_tiers "$CONFIG")
+RT_RC=$?
+set -e
+if [ "$RT_RC" -eq 2 ]; then
+  echo "ERROR: malformed feedback_policy block in $CONFIG (resolve_required_tiers exit 2)" >&2
+  exit 2
+fi
+
+# Return 0 iff $1 (a tier like p0..p3) is in the resolved REQUIRED_TIERS set.
+# Newline-delimited exact match — mirrors login_is_available_reviewer.
+tier_is_required() {
+  local needle=$1 t
+  [ -n "$needle" ] || return 1
+  while IFS= read -r t; do
+    [ "$t" = "$needle" ] && return 0
+  done <<< "$REQUIRED_TIERS"
+  return 1
+}
+
 # --- logging helpers --------------------------------------------------------
 
 log() {
@@ -230,43 +284,68 @@ if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
 fi
 log "HEAD = $HEAD_SHA    bot_login = $BOT_LOGIN"
 
-# --- fetch Codex P1 inline comments ----------------------------------------
+# --- fetch Codex blocking-tier inline comments ------------------------------
 
 COMMENTS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
 
-# Filter:
+log "blocking tier set: $(echo "$REQUIRED_TIERS" | tr '\n' ' ')"
+
+# Stage 1 (jq): narrow to bot-authored comments on the current HEAD —
 #   - author == bot_login
-#   - body contains a P1 marker: the badge image (`![P1 Badge]`) OR the
-#     text fallback (`**P1` at any position; covers titles like
-#     `**P1**: Stop retrying endlessly`).
 #   - on the current HEAD: original_commit_id == HEAD or commit_id == HEAD.
-#     A P1 from an earlier SHA that was addressed in a later commit will
-#     have commit_id != HEAD; we treat it as out-of-scope for this gate
-#     regardless of thread state (it's already resolved by virtue of
-#     not being on HEAD).
-#
-# Output: array of {id, path, line, body_snippet}. body_snippet is a
-# trimmed first line for log readability.
-P1_COMMENTS=$(echo "$COMMENTS_JSON" | jq \
+#     A finding from an earlier SHA that was addressed in a later commit
+#     has commit_id != HEAD; we treat it as out-of-scope for this gate
+#     regardless of thread state (already resolved by not being on HEAD).
+# We keep the FULL body here so stage 2 can classify each candidate with
+# the shared codex_tier_of — no tier filter in jq, to avoid re-implementing
+# (and drifting from) the classifier in scripts/lib/feedback-policy-helpers.sh.
+CANDIDATES=$(echo "$COMMENTS_JSON" | jq -c \
   --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
   [ .[]
     | select(.user.login == $bot)
-    | select(.body | test("!\\[P1 Badge\\]") or test("\\*\\*P1"))
     | select((.commit_id == $sha) or (.original_commit_id == $sha))
     | {
         id: .id,
         path: .path,
         line: (.line // .original_line // 0),
-        body_snippet: ((.body // "") | split("\n")[0] | .[0:120])
+        body: (.body // "")
       }
   ]
 ')
 
-P1_COUNT=$(echo "$P1_COMMENTS" | jq 'length')
-log "found $P1_COUNT P1 comment(s) on HEAD"
+# Stage 2 (bash): classify each candidate via codex_tier_of and keep only
+# those whose tier is in the resolved blocking set. With the feedback_policy
+# block absent the set is {p1}, so this reproduces the original
+# `![P1 Badge]` / `**P1` filter exactly (codex_tier_of matches those two
+# markers). Re-assemble the kept comments into a JSON array of
+# {id, path, line, body_snippet} (trimmed first line for log readability).
+BLOCKING_COMMENTS="[]"
+CAND_COUNT=$(echo "$CANDIDATES" | jq 'length')
+i=0
+while [ "$i" -lt "$CAND_COUNT" ]; do
+  c=$(echo "$CANDIDATES" | jq -c ".[$i]")
+  body=$(echo "$c" | jq -r '.body')
+  tier=$(codex_tier_of "$body")
+  if tier_is_required "$tier"; then
+    BLOCKING_COMMENTS=$(echo "$BLOCKING_COMMENTS" | jq -c \
+      --argjson c "$c" --arg tier "$tier" '
+      . + [ {
+        id: $c.id,
+        path: $c.path,
+        line: $c.line,
+        tier: $tier,
+        body_snippet: ($c.body | split("\n")[0] | .[0:120])
+      } ]
+    ')
+  fi
+  i=$((i + 1))
+done
 
-if [ "$P1_COUNT" -eq 0 ]; then
-  echo "Codex P1 unresolved: 0"
+BLOCKING_COUNT=$(echo "$BLOCKING_COMMENTS" | jq 'length')
+log "found $BLOCKING_COUNT blocking-tier comment(s) on HEAD"
+
+if [ "$BLOCKING_COUNT" -eq 0 ]; then
+  echo "Codex blocking-tier unresolved: 0"
   exit 0
 fi
 
@@ -275,7 +354,7 @@ fi
 # GraphQL `reviewThreads(first: N)` returns each thread with `isResolved`
 # and a `comments` connection. We extract a mapping (comment_id →
 # isResolved) keyed on the first comment's databaseId, then look each
-# P1-bearing comment up.
+# blocking-tier comment up.
 #
 # A single page of 100 review threads is enough for the typical PR; a
 # PR with >100 review threads is unusual and warrants a hard error
@@ -329,9 +408,9 @@ RESOLUTION_MAP=$(echo "$THREADS_JSON" | jq '
   | from_entries
 ')
 
-# --- classify P1 comments by resolution ------------------------------------
+# --- classify blocking-tier comments by resolution -------------------------
 
-UNRESOLVED_P1=$(echo "$P1_COMMENTS" | jq \
+UNRESOLVED_BLOCKING=$(echo "$BLOCKING_COMMENTS" | jq \
   --argjson map "$RESOLUTION_MAP" '
   [ .[]
     | . as $c
@@ -340,15 +419,15 @@ UNRESOLVED_P1=$(echo "$P1_COMMENTS" | jq \
   ]
 ')
 
-UNRESOLVED_COUNT=$(echo "$UNRESOLVED_P1" | jq 'length')
+UNRESOLVED_COUNT=$(echo "$UNRESOLVED_BLOCKING" | jq 'length')
 
 # --- report ----------------------------------------------------------------
 
 if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
   echo ""
-  echo "Unresolved Codex P1 findings on current HEAD ($HEAD_SHA):"
-  echo "$UNRESOLVED_P1" | jq -r '
-    .[] | "  - \(.path):\(.line) (comment id \(.id))\n      \(.body_snippet)"
+  echo "Unresolved Codex blocking-tier findings on current HEAD ($HEAD_SHA):"
+  echo "$UNRESOLVED_BLOCKING" | jq -r '
+    .[] | "  - [\(.tier | ascii_upcase)] \(.path):\(.line) (comment id \(.id))\n      \(.body_snippet)"
   '
   echo ""
   echo "Resolve each thread via the GitHub UI (or GraphQL"
@@ -356,7 +435,7 @@ if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
   echo ""
 fi
 
-echo "Codex P1 unresolved: $UNRESOLVED_COUNT"
+echo "Codex blocking-tier unresolved: $UNRESOLVED_COUNT"
 
 if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
   exit 1

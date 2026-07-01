@@ -9,9 +9,9 @@
 # returns the fixture matching the endpoint. Same shape as the
 # PATH-shimmed gh in tests/test_gh_as_reviewer.sh.
 #
-# Cases covered (per nathanjohnpayne/mergepath#235):
+# Cases covered (per nathanjohnpayne/mergepath#235, generalized in #577):
 #   1. Gate disabled (codex.p1_gate.enabled=false) → exit 0, no API calls.
-#   2. No P1 comments on the PR → exit 0, "Codex P1 unresolved: 0".
+#   2. No P1 comments on the PR → exit 0, "Codex blocking-tier unresolved: 0".
 #   3. P1 present and resolved (review-thread isResolved=true) → exit 0.
 #   4. P1 present and unresolved → exit 1, count > 0, paths listed.
 #   5. P1 only on a stale SHA (not HEAD) → exit 0, doesn't gate.
@@ -24,6 +24,18 @@
 #   12. PR_NUMBER + REPO supplied via env (no positional args) →
 #       same behavior as positional. Covers the scheduled-sweep /
 #       workflow_dispatch invocation shape added in #257.
+#
+# Generalized tier-gate cases (#577 — feedback_policy block PRESENT):
+#   14. feedback_policy block ABSENT → P1-only: an unresolved P0 does NOT
+#       block (P0 ∉ {p1}), an unresolved P1 DOES. (Backward-compat default.)
+#   15. feedback_policy by-priority with p0+p1 required → an unresolved P0
+#       on HEAD blocks (exit 1, count=1).
+#   16. feedback_policy by-priority with p0+p1 required → an unresolved P2
+#       does NOT block (P2 ∉ {p0,p1}); exit 0.
+#   17. feedback_policy mode: address-all → an unresolved P3 blocks (every
+#       tier required); exit 1.
+#   18. Malformed feedback_policy (bad tier value) with gate enabled →
+#       exit 2 (resolve_required_tiers fails closed).
 #
 # Bash 3.2 portable.
 
@@ -125,6 +137,49 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Helper (#577): scratch dir with the gate ENABLED plus a feedback_policy
+# block appended verbatim. $1 is the multi-line block text (already
+# `feedback_policy:`-rooted) or empty for "no feedback_policy block".
+# Lets the tier-gate cases below drive resolve_required_tiers off a real
+# on-disk config the way the script reads it.
+# ---------------------------------------------------------------------------
+make_scratch_with_policy() {
+  local policy_block=$1
+  local dir
+  dir=$(mktemp -d "$WORKDIR/scratch.XXXXXX")
+  mkdir -p "$dir/.github"
+  {
+    cat <<EOF
+codex:
+  bot_login: "chatgpt-codex-connector[bot]"
+  p1_gate:
+    enabled: true
+EOF
+    if [ -n "$policy_block" ]; then
+      printf '%s\n' "$policy_block"
+    fi
+  } >"$dir/.github/review-policy.yml"
+  echo "$dir"
+}
+
+# Build a single-finding comments fixture for a given tier marker body.
+# $1 = HEAD sha, $2 = comment body. id is fixed at 1001.
+make_single_comment_fixture() {
+  local sha=$1 body=$2
+  make_comments_fixture "$(jq -n --arg sha "$sha" --arg body "$body" '
+    [{
+      id: 1001,
+      user: { login: "chatgpt-codex-connector[bot]" },
+      body: $body,
+      path: "src/foo.ts",
+      line: 42,
+      commit_id: $sha,
+      original_commit_id: $sha
+    }]
+  ')"
+}
+
+# ---------------------------------------------------------------------------
 # Helper: make a PR-metadata fixture with a configurable HEAD sha.
 # ---------------------------------------------------------------------------
 make_pr_fixture() {
@@ -221,7 +276,7 @@ set +e
 OUT=$(run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex P1 unresolved: 0" \
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0" \
     && ! grep -q "^gh" "$WORKDIR/gh-calls.log"; then
   pass "gate disabled exits 0 with no API calls"
 else
@@ -246,7 +301,7 @@ OUT=$( cd "$SCRATCH" && PATH="$STUB_DIR:$PATH" GH_CALLS_LOG="$WORKDIR/gh-calls.l
   env -u GH_TOKEN -u PR_NUMBER -u REPO "$SCRIPT" 2>&1 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex P1 unresolved: 0" \
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0" \
     && ! grep -q "^gh" "$WORKDIR/gh-calls.log"; then
   pass "#447: disabled gate + no env → exit 0 clean pass (no PR_NUMBER/GH_TOKEN error, no gh calls)"
 else
@@ -288,7 +343,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex P1 unresolved: 0"; then
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
   pass "no P1s → exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
@@ -324,7 +379,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex P1 unresolved: 0"; then
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
   pass "P1 + resolved → exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
@@ -360,7 +415,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex P1 unresolved: 1" \
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1" \
     && echo "$OUT" | grep -q "src/foo.ts:42"; then
   pass "P1 + unresolved → exit 1 with path listed"
 else
@@ -398,7 +453,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex P1 unresolved: 0"; then
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
   pass "P1 on stale SHA → out of scope, exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
@@ -437,7 +492,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex P1 unresolved: 0"; then
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
   pass "P1 body from human → ignored, exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
@@ -487,7 +542,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex P1 unresolved: 1" \
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1" \
     && echo "$OUT" | grep -q "src/bar.ts:99" \
     && ! echo "$OUT" | grep -qE "Unresolved.*foo\.ts:42"; then
   pass "mix → exit 1, count=1, only bar.ts listed"
@@ -584,7 +639,7 @@ set +e
 OUT=$(run_gate "$SCRATCH" 99 owner/repo 2>&1)
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex P1 unresolved: 0"; then
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
   pass "missing p1_gate block → defaults to disabled → exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
@@ -617,7 +672,7 @@ OUT=$(
 )
 RC=$?
 set -e
-if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex P1 unresolved: 0"; then
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
   pass "env-only PR_NUMBER + REPO → exit 0"
 else
   fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
@@ -643,6 +698,179 @@ if [ "$RC" = 2 ] && echo "$OUT" | grep -qi "PR_NUMBER required"; then
   pass "missing PR_NUMBER → exit 2"
 else
   fail "expected rc=2 with 'PR_NUMBER required'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ===========================================================================
+# Generalized tier-gate cases (#577). These drive resolve_required_tiers off
+# a feedback_policy block written into the scratch config and confirm the
+# gate enforces the resolved tier SET (not hard-coded P1).
+# ===========================================================================
+HEAD_SHA="abc123def456"
+P0_BODY="![P0 Badge](url) Critical: drop the privilege escalation."
+P2_BODY="![P2 Badge](url) Minor: tidy this branch."
+P3_BODY="![P3 Badge](url) Trivial: rename the local."
+
+# ---------------------------------------------------------------------------
+# Test 14: feedback_policy ABSENT → P1-only. An unresolved P0 must NOT block
+#          (P0 ∉ {p1}); the gate is byte-compatible with its original scope.
+#          (Tests 3/4/7 already cover that an unresolved P1 DOES block.)
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 14 (#577): feedback_policy absent → P0 does NOT block (P1-only)"
+SCRATCH=$(make_scratch_with_policy "")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$P0_BODY")
+FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [1001]}]')
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
+  pass "absent feedback_policy → unresolved P0 out of scope (P1-only) → exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0' (P0 ∉ {p1}); got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 15: feedback_policy by-priority, p0+p1 required → unresolved P0 blocks.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 15 (#577): by-priority p0+p1 required → unresolved P0 blocks"
+SCRATCH=$(make_scratch_with_policy "$(cat <<'EOF'
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p0: required
+    p1: required
+    p2: discretionary
+    p3: discretionary
+    nitpick: discretionary
+EOF
+)")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$P0_BODY")
+FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [1001]}]')
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "\[P0\] src/foo.ts:42"; then
+  pass "p0 required → unresolved P0 → exit 1, listed as [P0]"
+else
+  fail "expected rc=1 with 'unresolved: 1' + [P0] path; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 16: feedback_policy by-priority, p0+p1 required → unresolved P2 clears.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 16 (#577): by-priority p0+p1 required → unresolved P2 does NOT block"
+SCRATCH=$(make_scratch_with_policy "$(cat <<'EOF'
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p0: required
+    p1: required
+    p2: discretionary
+    p3: discretionary
+    nitpick: discretionary
+EOF
+)")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$P2_BODY")
+FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [1001]}]')
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0"; then
+  pass "p2 discretionary → unresolved P2 out of scope → exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0' (P2 ∉ {p0,p1}); got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 17: feedback_policy mode: address-all → unresolved P3 blocks (every
+#          tier required).
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 17 (#577): mode address-all → unresolved P3 blocks"
+SCRATCH=$(make_scratch_with_policy "$(cat <<'EOF'
+feedback_policy:
+  mode: address-all
+EOF
+)")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$P3_BODY")
+FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [1001]}]')
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "\[P3\] src/foo.ts:42"; then
+  pass "address-all → unresolved P3 → exit 1, listed as [P3]"
+else
+  fail "expected rc=1 with 'unresolved: 1' + [P3] path; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 18: malformed feedback_policy (bad tier value) + gate enabled → exit 2.
+#          resolve_required_tiers returns 2; the gate treats it as a config
+#          error, the same posture as a bad p1_gate.enabled value.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 18 (#577): malformed feedback_policy tier value → exit 2"
+SCRATCH=$(make_scratch_with_policy "$(cat <<'EOF'
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p0: banana
+    p1: required
+EOF
+)")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$P0_BODY")
+FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [1001]}]')
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 2 ] && echo "$OUT" | grep -qi "malformed feedback_policy"; then
+  pass "malformed feedback_policy tier → exit 2 (fail closed)"
+else
+  fail "expected rc=2 with 'malformed feedback_policy'; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 

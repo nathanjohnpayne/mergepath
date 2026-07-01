@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# check_coderabbit_severity_gate
+#
+# CI wrapper for scripts/coderabbit-severity-gate.sh — the CodeRabbit
+# blocking-tier unresolved-thread merge gate (nathanjohnpayne/
+# mergepath#574/#577). The CodeRabbit twin of check_codex_p1_gate.
+#
+# Two concerns:
+#   1. The script and its workflow must exist on disk and be executable
+#      (consistent with check_codex_p1_gate).
+#   2. The script's parsing + decision logic must work against fixture
+#      review-comment payloads. We delegate this to
+#      tests/test_coderabbit_severity_gate.sh which PATH-shims `gh` and
+#      walks the script through the enabled/disabled, finding
+#      present/absent, resolved/unresolved, SHA scoping, non-bot author,
+#      pagination overflow, and tier-set cases.
+#
+# Invoked by .github/workflows/repo_lint.yml alongside the other
+# scripts/ci/check_* scripts.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+SCRIPT="scripts/coderabbit-severity-gate.sh"
+WORKFLOW=".github/workflows/coderabbit-severity-gate.yml"
+TEST="tests/test_coderabbit_severity_gate.sh"
+
+FAILED=0
+
+# Existence + executability checks.
+for rel in "$SCRIPT" "$TEST"; do
+  if [ ! -f "$rel" ]; then
+    echo "FAIL: Missing required file: $rel"
+    FAILED=1
+    continue
+  fi
+  if [ ! -x "$rel" ]; then
+    echo "FAIL: File is not executable: $rel"
+    echo "      Fix with: chmod +x $rel"
+    FAILED=1
+  fi
+done
+
+# Workflow file exists (not executable; YAML is not a shell script).
+if [ ! -f "$WORKFLOW" ]; then
+  echo "FAIL: Missing required workflow: $WORKFLOW"
+  FAILED=1
+fi
+
+# Workflow trigger shape (mirrors check_codex_p1_gate). GitHub Actions
+# does NOT document `pull_request_review_thread` as a workflow trigger — it
+# exists as a webhook event for Apps, but the Actions
+# events-that-trigger-workflows reference omits it, and adding it to `on:`
+# is a no-op (the gate would NEVER re-fire on UI resolves). The corrected
+# shape is:
+#   - pull_request + pull_request_review + pull_request_review_comment
+#     for the event-driven path.
+#   - schedule (cron) as the safety net for UI "Resolve conversation"
+#     clicks, which produce no Actions event.
+# Additionally, the workflow MUST NOT list pull_request_review_thread —
+# its presence is misleading (suggests we have UI-resolve coverage when we
+# don't).
+if [ -f "$WORKFLOW" ]; then
+  for trigger in pull_request pull_request_review pull_request_review_comment schedule; do
+    if ! grep -qE "^[[:space:]]*${trigger}:" "$WORKFLOW"; then
+      echo "FAIL: $WORKFLOW missing required trigger: $trigger"
+      echo "      The gate must fire on push, review submission, inline-comment, AND on a periodic schedule (UI-resolve safety net)."
+      FAILED=1
+    fi
+  done
+
+  # Forbid the misleading pull_request_review_thread trigger.
+  if grep -qE "^[[:space:]]*pull_request_review_thread:" "$WORKFLOW"; then
+    echo "FAIL: $WORKFLOW lists pull_request_review_thread as a workflow trigger."
+    echo "      That event is a webhook payload for GitHub Apps, NOT a documented Actions workflow trigger."
+    echo "      See https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows"
+    echo "      Use schedule (cron) for the UI-resolve safety net instead. See PR #257 / codex-p1-gate.yml."
+    FAILED=1
+  fi
+
+  # Schedule cron must be present in the on: block. Loose check — the
+  # value just has to mention */N or a cron string under schedule:.
+  if ! awk '
+    /^on:/ {in_on=1; next}
+    in_on && /^[^[:space:]#]/ {in_on=0}
+    in_on && /^[[:space:]]+schedule:/ {in_sched=1; next}
+    in_sched && /^[[:space:]]+- cron:/ {found=1; exit}
+    in_sched && /^[[:space:]]+[a-z]/ {in_sched=0}
+    END {exit (found ? 0 : 1)}
+  ' "$WORKFLOW"; then
+    echo "FAIL: $WORKFLOW schedule: block missing a 'cron:' entry."
+    echo "      The schedule trigger needs a cron expression (e.g. '*/15 * * * *')."
+    FAILED=1
+  fi
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_coderabbit_severity_gate: FAIL (pre-flight)"
+  exit 1
+fi
+
+# Run the fixture-driven test suite.
+if ! bash "$TEST"; then
+  echo "check_coderabbit_severity_gate: FAIL (test suite)"
+  exit 1
+fi
+
+echo "check_coderabbit_severity_gate: PASS"
+exit 0
