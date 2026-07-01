@@ -610,6 +610,13 @@ if [ "$rc" = 5 ] && [ "$(printf '%s' "$out" | jq -r '.skipped')" = "true" ]; the
   pass "automation disabled → exit 5 even when jq is unavailable"
 else fail "disabled path without jq (rc=$rc, out=$out)"; fi
 
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_OFF" bash "$ORCH" 123 --repo $'o/r\nextra' 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 5 ] && printf '%s' "$out" | jq -e '.repo == "o/r\nextra"' >/dev/null; then
+  pass "automation disabled JSON escapes control characters"
+else fail "disabled path JSON escaping (rc=$rc, out=$out)"; fi
+
 # Direction A: author=claude → reviewer codex → APPROVED → exit 0
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \

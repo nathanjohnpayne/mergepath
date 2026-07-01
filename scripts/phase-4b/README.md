@@ -4,10 +4,10 @@ Reference implementation for automating the Phase 4b external-review
 handoff (REVIEW_POLICY.md § Phase 4b). Design and diagrams:
 [`plans/automated-phase-4b-handoff.md`](../../plans/automated-phase-4b-handoff.md).
 
-These are **reference stubs**: runnable, fail-closed, and unit-tested with
-fake CLIs, but the live `codex` / `claude` integration should be validated
-against a real CLI before the feature is enabled in a repo (see the open
-questions in the plan).
+This ships as a disabled reference implementation: runnable, fail-closed,
+unit-tested with fake CLIs, and validated during PR #580 against real plan-backed
+`codex` / `claude` CLIs. Re-run the live adapter validation from the enablement
+environment before flipping `phase_4b_automation.enabled: true` in a repo.
 
 ## Components
 
