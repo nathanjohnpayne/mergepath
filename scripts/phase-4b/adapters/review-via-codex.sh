@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# scripts/phase-4b/adapters/review-via-codex.sh
+#
+# Phase 4b reviewer adapter — Direction A (Claude -> Codex). Drives the
+# OpenAI Codex CLI in non-interactive, read-only mode to review a PR diff
+# and emit a normalized verdict object (verdict.schema.json) on stdout.
+#
+# REFERENCE IMPLEMENTATION. It does the REASONING only; it never posts to
+# GitHub. The orchestrator (scripts/phase-4b-review.sh) posts the verdict
+# under the reviewer PAT via scripts/gh-as-reviewer.sh so attribution is
+# the verified reviewer identity, not the CLI's ambient token.
+#
+# Docs (verbatim flags):
+#   codex --ask-for-approval never exec --sandbox read-only \
+#     --output-schema <schema> -o <file> "<prompt>"   (stdin = extra context)
+#   https://developers.openai.com/codex/noninteractive
+#   https://developers.openai.com/codex/cli/reference
+# Codex has no `codex review` subcommand and no native review STATE, so we
+# impose structure with --output-schema and map it to a verdict here.
+#
+# Usage:
+#   review-via-codex.sh --pr <N> --repo <owner/repo> [--head <sha>]
+#                       [--diff-file <path>] [--model <m>]
+#
+# Env:
+#   CODEX_BIN   codex executable (default: codex). Tests point this at a fake.
+#   codex login (subscription plan)   reasoning-plane auth. This adapter
+#               requires ~/.codex/auth.json auth_mode=chatgpt and launches the
+#               CLI with a tightly allowlisted environment, so review reasoning
+#               bills against the operator's ChatGPT/Codex PLAN, never the
+#               pay-per-token API, and prompt-injected diffs cannot read
+#               ambient GitHub/deploy/cloud credential env vars. A persisted
+#               API-key login or a stray key in the environment can NOT divert
+#               a handoff to metered billing; the adapter exits 4 and the
+#               orchestrator falls back to the manual handoff (fail-closed).
+#               This also honors the Codex docs' warning against exposing
+#               OPENAI_API_KEY/CODEX_API_KEY as job-level env around
+#               repo-controlled code.
+#   GH_TOKEN    only used if the diff must be fetched (no --diff-file).
+#   P4B_REVIEW_CLI_TIMEOUT_SECONDS  default: P4B_ADAPTER_TIMEOUT_SECONDS
+#               or 900. Timeout maps to exit 4 / manual fallback.
+#
+# Exit codes:
+#   0  valid verdict JSON on stdout.
+#   2  usage error.
+#   3  missing dependency (codex/jq/gh) or unreadable schema.
+#   4  adapter could not produce a VALID verdict (CLI error, timeout, or
+#      non-conformant output) — the orchestrator falls back to the manual
+#      handoff. Fail-closed: never emits an APPROVED on doubt.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib.sh
+. "$HERE/../lib.sh"
+
+SCHEMA="$HERE/../verdict.schema.json"
+CODEX_BIN="${CODEX_BIN:-codex}"
+
+PR="" ; REPO="" ; HEAD="" ; DIFF_FILE="" ; MODEL="${P4B_CODEX_MODEL:-}"
+SANDBOX=read-only
+CLI_TIMEOUT="${P4B_REVIEW_CLI_TIMEOUT_SECONDS:-${P4B_ADAPTER_TIMEOUT_SECONDS:-900}}"
+
+usage() {
+  echo "usage: review-via-codex.sh --pr <N> --repo <owner/repo> [--head <sha>] [--diff-file <path>] [--model <m>]" >&2
+  exit 2
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pr)        PR="${2:-}"; shift 2 ;;
+    --repo)      REPO="${2:-}"; shift 2 ;;
+    --head)      HEAD="${2:-}"; shift 2 ;;
+    --diff-file) DIFF_FILE="${2:-}"; shift 2 ;;
+    --model)     MODEL="${2:-}"; shift 2 ;;
+    -h|--help)   usage ;;
+    *) echo "review-via-codex.sh: unknown arg: $1" >&2; usage ;;
+  esac
+done
+
+[ -n "$PR" ] || usage
+command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
+[ -r "$SCHEMA" ] || p4b_die 3 "verdict schema not readable: $SCHEMA"
+
+# --- obtain the diff -------------------------------------------------------
+DIFF=""
+if [ -n "$DIFF_FILE" ]; then
+  [ -r "$DIFF_FILE" ] || p4b_die 3 "diff file not readable: $DIFF_FILE"
+  DIFF="$(cat "$DIFF_FILE")"
+else
+  command -v gh >/dev/null 2>&1 || p4b_die 3 "gh is required to fetch the diff (or pass --diff-file)"
+  [ -n "$REPO" ] || p4b_die 2 "--repo is required when no --diff-file is given"
+  DIFF="$(gh pr diff "$PR" --repo "$REPO" 2>/dev/null)" || p4b_die 4 "failed to fetch PR diff via gh"
+fi
+[ -n "$DIFF" ] || p4b_die 4 "empty diff — nothing to review"
+
+command -v "$CODEX_BIN" >/dev/null 2>&1 || p4b_die 3 "codex CLI not found on PATH (set CODEX_BIN)"
+p4b_require_codex_plan_auth
+CODEX_AUTH_SOURCE="$(p4b_codex_auth_file)"
+
+# --- run the review --------------------------------------------------------
+REQUIRED_SEVERITIES="$(p4b_required_verdict_severities_json)" \
+  || p4b_die 3 "invalid feedback_policy; cannot determine required verdict severities"
+PROMPT="You are an external code reviewer for GitHub PR #${PR}${REPO:+ in ${REPO}}${HEAD:+ at commit ${HEAD}}.
+Exhaustive code review: keep looking for additional findings until you stop
+finding new issues.
+The unified diff is provided on stdin. Return ONLY a JSON object conforming
+to the provided output schema: a 'verdict' of APPROVED or CHANGES_REQUESTED,
+a short 'summary', and a 'findings' array ({severity P0-P3, path, line, body}).
+Set usage to null; the adapter records CLI usage only when it is exposed outside
+the model response. Approve only if you would stake a merge on it; otherwise
+request changes and list every required-severity issue you identify in this
+pass, not just the first one. For this repository, these finding severities
+require disposition before merge: ${REQUIRED_SEVERITIES}.
+If any finding with one of those severities exists, the verdict must be
+CHANGES_REQUESTED, not APPROVED. Do not edit files. Do not post anything to
+GitHub."
+
+TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/p4b-codex.XXXXXX")"
+ERR_OUT="$(mktemp "${TMPDIR:-/tmp}/p4b-codex-stderr.XXXXXX")"
+RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/p4b-codex-run.XXXXXX")"
+RUN_HOME="$(mktemp -d "${TMPDIR:-/tmp}/p4b-codex-home.XXXXXX")"
+RUN_CODEX_HOME="$(mktemp -d "${TMPDIR:-/tmp}/p4b-codex-auth.XXXXXX")"
+cp "$CODEX_AUTH_SOURCE" "$RUN_CODEX_HOME/auth.json"
+chmod 600 "$RUN_CODEX_HOME/auth.json" 2>/dev/null || true
+# shellcheck disable=SC2064
+trap "rm -f '$TMP_OUT' '$ERR_OUT'; rm -rf '$RUN_DIR' '$RUN_HOME' '$RUN_CODEX_HOME'" EXIT
+
+SAFE_ENV=(env -i
+  "PATH=${PATH:-/usr/bin:/bin}"
+  "HOME=$RUN_HOME"
+  "USER=${USER:-}"
+  "LOGNAME=${LOGNAME:-}"
+  "SHELL=${SHELL:-/bin/sh}"
+  "TMPDIR=${TMPDIR:-/tmp}"
+  "LANG=${LANG:-C}"
+  "TERM=${TERM:-dumb}"
+  "CODEX_HOME=$RUN_CODEX_HOME"
+)
+
+# Codex CLI v0.137 exposes --ask-for-approval as a global flag; placing it
+# after `exec` is rejected by `codex exec --help` / argument parsing.
+set +e
+RAW="$(
+  printf '%s\n' "$DIFF" | p4b_run_with_timeout "$CLI_TIMEOUT" \
+    "${SAFE_ENV[@]}" \
+    "$CODEX_BIN" \
+    --ask-for-approval never \
+    exec \
+    --cd "$RUN_DIR" \
+    --skip-git-repo-check \
+    --ephemeral \
+    --ignore-user-config \
+    --ignore-rules \
+    --sandbox "$SANDBOX" \
+    ${MODEL:+--model "$MODEL"} \
+    --output-schema "$SCHEMA" \
+    -o "$TMP_OUT" \
+    "$PROMPT" 2>"$ERR_OUT"
+)"
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+  if p4b_is_timeout_rc "$RC"; then
+    p4b_die 4 "codex exec timed out after ${CLI_TIMEOUT}s — falling back to the manual handoff"
+  fi
+  p4b_die 4 "codex exec failed (rc=$RC) — ensure 'codex login' is active on a plan (child env is allowlisted for plan-only billing); falling back to the manual handoff"
+fi
+
+# Prefer the --output-last-message file; fall back to captured stdout.
+CANDIDATE=""
+if [ -s "$TMP_OUT" ]; then
+  CANDIDATE="$(cat "$TMP_OUT")"
+else
+  CANDIDATE="$RAW"
+fi
+
+VERDICT_JSON="$(p4b_extract_json_block "$CANDIDATE")"
+VERDICT_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c 'if has("usage") then . else . + {usage: null} end' 2>/dev/null || true)"
+if ! p4b_validate_verdict "$VERDICT_JSON"; then
+  p4b_warn "codex output did not conform to verdict.schema.json (fail-closed)"
+  exit 4
+fi
+
+TOKEN_COUNT="$(awk '
+  seen {
+    value=$1
+    gsub(/,/, "", value)
+    if (value ~ /^[0-9]+$/) { print value; exit }
+    seen=0
+  }
+  /tokens used/ { seen=1 }
+' "$ERR_OUT" 2>/dev/null || true)"
+
+if [ -n "$TOKEN_COUNT" ]; then
+  USAGE="$(jq -n --argjson token "$TOKEN_COUNT" \
+    '{token_count:$token,input_tokens:null,output_tokens:null,source:"codex-cli-stderr"}')"
+else
+  USAGE="null"
+fi
+
+printf '%s' "$VERDICT_JSON" | jq -c --argjson usage "$USAGE" '. + {usage: $usage}'
+exit 0

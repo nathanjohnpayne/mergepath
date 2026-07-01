@@ -57,6 +57,7 @@ EOF
 }
 
 [[ $# -ge 1 ]] || usage
+REVIEWER_IDENTITY="${PHASE_4B_REVIEWER_IDENTITY:-nathanpayne-codex}"
 
 command -v gh >/dev/null 2>&1 || {
   echo "post-phase-4b-handoff.sh: gh not on PATH" >&2
@@ -241,7 +242,7 @@ PR ready for external review (Phase 4b):
   ${url}  head ${head_short}  (base ${base_short})
 
 Context: ${content}
-Gate: post APPROVED as nathanpayne-codex on the listed HEAD, OR a
+Gate: post APPROVED as ${REVIEWER_IDENTITY} on the listed HEAD, OR a
       Codex bot review / 👍 reaction newer than the HEAD committer date.
 Threads: ${unresolved} unresolved (resolve addressed bot or agent-reviewer
          threads per the pre-merge gate; never resolve real-human
@@ -313,7 +314,7 @@ while IFS=$'\t' read -r _repo _num url head_short base_short _content _unresolve
 done <<<"$ROWS_TSV"
 echo
 echo "Context: ${SHARED_CONTEXT}"
-echo 'Gate: for each PR, post APPROVED as nathanpayne-codex on the listed'
+echo "Gate: for each PR, post APPROVED as ${REVIEWER_IDENTITY} on the listed"
 echo '      HEAD, OR a Codex bot review / 👍 reaction newer than the HEAD'
 echo '      committer date.'
 echo 'Threads: see "Unresolved threads" column (resolve addressed bot or'
