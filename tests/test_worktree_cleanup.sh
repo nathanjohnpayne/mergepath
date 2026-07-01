@@ -358,16 +358,16 @@ DIVERGED_LABEL=$(echo "$OUT" | awk -v b="$DIVERGED_BRANCH" '
   /^  \[/            { label = $0 }
   $1 == "branch:" && $2 == b { print label; exit }
 ')
-if echo "$DIVERGED_LABEL" | grep -q "MERGED local branch"; then
-  pass "diverged merged branch (extra commit on top) is listed under a MERGED record"
+if echo "$DIVERGED_LABEL" | grep -q "MERGED PR.*review manually, keeping"; then
+  pass "diverged merged branch (extra commit on top) is surfaced under a review-manually record"
 else
-  fail "diverged merged branch not under a MERGED record (regressed to skip/kept; label='$DIVERGED_LABEL')"
+  fail "diverged merged branch not surfaced for review (label='$DIVERGED_LABEL')"
   show_out_on_fail
 fi
-if echo "$OUT" | grep -q "local tip diverged"; then
-  pass "diverged merged branch surfaced with a CLEAR 'local tip diverged' log line"
+if echo "$OUT" | grep -q "beyond the merged head"; then
+  pass "diverged merged branch surfaced with a CLEAR 'beyond the merged head' reason line"
 else
-  fail "no 'local tip diverged' log line for the diverged branch (silent-skip risk)"
+  fail "no 'beyond the merged head' reason line for the diverged branch (silent-skip risk)"
   show_out_on_fail
 fi
 
@@ -498,13 +498,14 @@ else
   pass "verified-merged local branch deleted by --apply"
 fi
 
-# Case 7 (#605): diverged merged branch (extra commit on top) is now DELETED
-# by --apply — the PR merged, so the ref is safe to remove.
+# Case 7 (#605 + Codex P1): the diverged branch (extra commit on top of the
+# merged head) is NOT auto-deleted by --apply — the extra commit(s) may be
+# unmerged follow-up work, so it is surfaced for manual review and KEPT.
 if git branch --list "$DIVERGED_BRANCH" | grep -q "$DIVERGED_BRANCH"; then
-  fail "diverged merged branch still present after --apply (should be deleted)"
-  echo "$OUT3" >&2
+  pass "diverged merged branch is NOT auto-deleted (surfaced for manual review, kept)"
 else
-  pass "diverged merged branch deleted by --apply (name-based detection)"
+  fail "diverged merged branch was auto-deleted — could lose unmerged follow-up work"
+  echo "$OUT3" >&2
 fi
 
 # Case 10 (#605 / CodeRabbit Major): the reused-name branch — whose tip does NOT

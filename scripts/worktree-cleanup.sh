@@ -178,14 +178,20 @@ gh_pr_state() {
 #   exact     — a merged PR exists for this branch name AND its recorded
 #               headRefOid equals the branch tip (clean squash-merge, no
 #               local commits on top).
-#   diverged  — a merged PR exists for this branch name, but the branch tip
-#               is NOT one of the merged heads (e.g. a routine `git merge
-#               main` housekeeping commit landed on top of the merged head).
-#               Still safe to delete: the branch's PR merged; the extra local
-#               commits are not the reason to keep it.
-#   none      — no merged PR exists for this branch name (or gh is missing /
-#               the tip cannot be resolved). NEVER treat as merged.
-# Exit status: 0 for exact|diverged (safe to delete), 1 for none (keep).
+#   diverged  — a merged PR exists for this branch name AND the merged head is
+#               an ANCESTOR of the tip, but the tip carries EXTRA commit(s) on
+#               top (e.g. a `git merge main` housekeeping commit, OR unmerged
+#               follow-up work). The caller SURFACES these for manual review and
+#               NEVER auto-deletes them: descending from the old PR head only
+#               proves the old PR is in history, not that the extra commits are
+#               already merged/safe (Codex P1). The ancestry requirement also
+#               guards against a REUSED branch name whose old PR merged but
+#               whose current tip is unrelated new work.
+#   none      — no merged PR exists for this branch name, OR no merged head is
+#               an ancestor of the tip (reused name), OR gh is missing / the tip
+#               cannot be resolved. NEVER treat as merged.
+# Exit status: 0 for exact|diverged, 1 for none. Only `exact` is auto-deleted;
+# `diverged` is surfaced-and-kept.
 #
 # Rationale (#605 root cause 2): the prior `grep -Fxq "$tip"` required an
 # exact tip==headRefOid match, so any branch carrying a commit beyond the PR
@@ -327,6 +333,10 @@ SUMMARY_FAILED=()
 # the dry-run summary going forward (#605 acceptance: distinguish "evaluated,
 # not a candidate" from "not evaluated").
 SUMMARY_EXAMINED_NOT_MERGED=()
+# Gone-upstream branches whose PR merged for the head name but whose local tip
+# carries EXTRA commit(s) on top of the merged head. Surfaced for manual review
+# and NEVER auto-deleted (the extra commits may be unmerged follow-up work).
+SUMMARY_DIVERGED_KEPT=()
 
 print_record() {
   local label="$1" color="$2" path="$3" branch="$4" head="$5" upstream="$6" pr_state="$7" lock_reason="$8"
@@ -488,17 +498,29 @@ while IFS= read -r LOCAL_BRANCH; do
     continue
   fi
 
-  # exact | diverged → a merged PR exists for this branch's head name, so the
-  # ref is safe to delete. Note the divergence explicitly when the tip sits
-  # beyond the merged head (an extra local housekeeping commit) so it is
-  # never a silent skip.
-  DIVERGED_NOTE=""
+  # A merged PR exists for this head name. Split by how the local tip relates
+  # to the merged head:
+  #
+  #   diverged → the tip DESCENDS from the merged head but carries EXTRA local
+  #     commit(s). Those commits are NOT proven merged — "kept working on the
+  #     same branch after the PR merged/was deleted" is a common shape — so
+  #     auto-deleting would lose real unpushed follow-up work (Codex P1 on
+  #     #608's sibling). SURFACE it clearly for manual review (this satisfies
+  #     #605's actual complaint — the branch is no longer a SILENT omission) but
+  #     do NOT auto-delete. Only an EXACT tip==merged-head match is provably
+  #     fully merged and safe to `git branch -D`.
   if [ "$MERGED_STATUS" = "diverged" ]; then
-    DIVERGED_NOTE=" (local tip diverged from PR head — extra commit(s) on top)"
+    DIVERGED_TIP=$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)
+    print_record "[MERGED PR, local tip has unmerged commit(s) on top — review manually, keeping]" "$C_YELLOW" \
+      "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$DIVERGED_TIP" "[gone]" "MERGED+extra" ""
+    echo "    reason:   PR for this head name merged, but the local tip carries commit(s) beyond the merged head; not auto-deleted (may be unmerged follow-up work — delete by hand after review)"
+    SUMMARY_DIVERGED_KEPT+=("$LOCAL_BRANCH")
+    continue
   fi
 
+  # exact: tip == merged head → provably fully merged, safe to delete.
   if branch_checked_out "$LOCAL_BRANCH"; then
-    print_record "[MERGED local branch checked out — keeping]${DIVERGED_NOTE}" "$C_YELLOW" \
+    print_record "[MERGED local branch checked out — keeping]" "$C_YELLOW" \
       "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)" "[gone]" "MERGED" ""
     SUMMARY_LOCAL_BRANCH+=("$LOCAL_BRANCH (checked out)")
     if [ "$MODE" = "apply" ]; then
@@ -508,7 +530,7 @@ while IFS= read -r LOCAL_BRANCH; do
     continue
   fi
 
-  print_record "[MERGED local branch]${DIVERGED_NOTE}" "$C_RED" \
+  print_record "[MERGED local branch]" "$C_RED" \
     "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)" "[gone]" "MERGED" ""
   SUMMARY_LOCAL_BRANCH+=("$LOCAL_BRANCH")
   if [ "$MODE" = "apply" ]; then
@@ -608,6 +630,9 @@ printf "  merged branches:  %d\n" "${#SUMMARY_LOCAL_BRANCH[@]}"
 # mode) is visible: a branch that WAS evaluated but is not a candidate shows
 # up here rather than vanishing without a trace.
 printf "  gone kept (unmerged): %d\n" "${#SUMMARY_EXAMINED_NOT_MERGED[@]}"
+# Merged-PR branches whose local tip has extra commit(s) on top — surfaced for
+# manual review, never auto-deleted (may hold unmerged follow-up work).
+printf "  merged+extra (review): %d\n" "${#SUMMARY_DIVERGED_KEPT[@]}"
 printf "  open-PR retained: %d\n" "${#SUMMARY_OPEN_PR[@]}"
 printf "  orphan dirs:      %d\n" "${#SUMMARY_ORPHAN[@]}"
 
