@@ -10,6 +10,7 @@ TESTS=(
   "$REPO_ROOT/tests/test_coderabbit_wait_paused.sh"
   "$REPO_ROOT/tests/test_coderabbit_wait_codex_failover.sh"
   "$REPO_ROOT/tests/test_coderabbit_automerge_rate_limit_gate.sh"
+  "$REPO_ROOT/tests/test_coderabbit_wait_statuscontext_ratelimit.sh"
 )
 
 if [ ! -x "$REPO_ROOT/scripts/coderabbit-wait.sh" ]; then
@@ -34,4 +35,6 @@ echo "check_coderabbit_wait: running coderabbit-wait codex rate-limit failover t
 "${TESTS[3]}"
 echo "check_coderabbit_wait: running auto-merge rate-limit gate tests (#489)"
 "${TESTS[4]}"
+echo "check_coderabbit_wait: running StatusContext rate-limit false-clear tests (#596)"
+"${TESTS[5]}"
 echo "check_coderabbit_wait: PASS"

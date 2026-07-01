@@ -59,9 +59,12 @@ REVIEW_BODY_CLEAN='<!-- This is an auto-generated comment: summarize by coderabb
 
 Reviewed everything up to head-sha. LGTM!'
 
-# make_case <name> <comment_body>
+# make_case <name> <comment_body> [status_time]
+#   status_time overrides when the CodeRabbit StatusContext success was created
+#   (default STATUS_TIME = 1s after the comment). Pass a far-later time to model
+#   a genuine re-review success beyond the grace window.
 make_case() {
-  local name=$1 comment_body=$2
+  local name=$1 comment_body=$2 status_time=${3:-$STATUS_TIME}
   local dir="$WORKDIR/$name"
 
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
@@ -115,7 +118,7 @@ EOF
 set -euo pipefail
 bot='coderabbitai[bot]'
 head_time='$HEAD_TIME'
-status_time='$STATUS_TIME'
+status_time='$status_time'
 state_dir=\${CODERABBIT_TEST_STATE_DIR:?}
 [ "\${1:-}" = "api" ] || { echo "unexpected gh command: \$*" >&2; exit 99; }
 shift
@@ -197,8 +200,23 @@ test_headref_ratelimit_suppresses_status() {
   [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "1: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
   [ "$(jqf "$dir" '.codex_failover_requested')" = "true" ] || fail "1: codex_failover_requested=$(jqf "$dir" '.codex_failover_requested'), expected true (failover fired after suppression)"
   [ "$(stub_calls "$dir")" = "1" ] || fail "1: Codex failover invoked $(stub_calls "$dir") time(s), expected 1"
-  grep -q 'a success status does not represent a completed review' "$dir/err.log" || fail "1: expected the #596 suppression log line; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
-  [ "$FAIL" -ne "$before" ] || pass "1: #596 — HEAD-referencing rate-limit notice suppresses the StatusContext fast-path (no false-clear) → failover + exit 5"
+  grep -q 'near-simultaneous rate-limit status flip' "$dir/err.log" || fail "1: expected the #596 suppression log line; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  [ "$FAIL" -ne "$before" ] || pass "1: #596 — near-simultaneous StatusContext success does not clear a HEAD-referencing rate-limit notice → failover + exit 5"
+}
+
+# --- Test 3: #596 escape — a genuinely LATER success (beyond grace) clears ----
+# The comment is a HEAD-referencing rate-limit notice at T, but the success
+# StatusContext lands 2h later — well beyond STATUS_SUCCESS_GRACE_SECONDS — so
+# it is a genuine (possibly silent, per #221) re-review of HEAD and must clear.
+test_headref_later_success_clears() {
+  local dir rc before=$FAIL
+  dir=$(make_case "headref-later" "$RATE_LIMIT_BODY_HEADREF" "2026-06-04T02:00:00Z")
+  rc=$(run_case "$dir")
+  [ "$rc" = "0" ] || fail "3: expected exit 0 (cleared) for a genuine later success, got $rc; err=$(tail -4 "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "cleared" ] || fail "3: status=$(jqf "$dir" '.status'), expected cleared"
+  [ "$(stub_calls "$dir")" = "0" ] || fail "3: failover should not fire on a genuine-later clearance, fired $(stub_calls "$dir")"
+  grep -q 'remains authoritative' "$dir/err.log" || fail "3: expected the authoritative-later-success log; err=$(grep -i statuscontext "$dir/err.log" | tail -2)"
+  [ "$FAIL" -ne "$before" ] || pass "3: #596 escape — a StatusContext success beyond the grace window (genuine later re-review) still clears"
 }
 
 # --- Test 2: control — genuine review + status success STILL clears ----------
@@ -214,6 +232,7 @@ test_headref_review_still_clears() {
 
 test_headref_ratelimit_suppresses_status
 test_headref_review_still_clears
+test_headref_later_success_clears
 
 echo "----"
 echo "test_coderabbit_wait_statuscontext_ratelimit: $PASS passed, $FAIL failed"
