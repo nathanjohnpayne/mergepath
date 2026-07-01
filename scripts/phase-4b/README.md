@@ -5,9 +5,10 @@ handoff (REVIEW_POLICY.md § Phase 4b). Design and diagrams:
 [`plans/automated-phase-4b-handoff.md`](../../plans/automated-phase-4b-handoff.md).
 
 This ships as a disabled reference implementation: runnable, fail-closed,
-unit-tested with fake CLIs, and validated during PR #580 against real plan-backed
-`codex` / `claude` CLIs. Re-run the live adapter validation from the enablement
-environment before flipping `phase_4b_automation.enabled: true` in a repo.
+unit-tested with fake CLIs, and accompanied by real plan-backed `codex` /
+`claude` validation evidence in PR #580's review thread. Re-run the live adapter
+validation from the enablement environment before flipping
+`phase_4b_automation.enabled: true` in a repo.
 
 ## Components
 
@@ -81,6 +82,8 @@ phase-4b-classifier.sh (is 4b needed?) ─▶ phase-4b-review.sh
 - **Review metadata:** posted reviews include reviewed head SHA, reviewer
   identity, adapter, adapter run count, timeout, token usage when exposed by
   the CLI, and an explicit `not exposed` marker for model-internal turn count.
+  CLI token counters are best-effort because reviewer CLI stderr/envelope
+  formats can change; when parsing fails the adapters safely emit `usage: null`.
 - **Feedback-policy approval gate:** the verdict validator reads
   `feedback_policy` when present (#574). `APPROVED` may not carry findings in
   any policy-required severity tier; absent `feedback_policy` defaults to

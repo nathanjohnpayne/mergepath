@@ -185,6 +185,10 @@ mk_fake fake-claude-changes \
   "jq -n --arg r '{\"verdict\":\"CHANGES_REQUESTED\",\"summary\":\"needs work\",\"findings\":[{\"severity\":\"P1\",\"path\":\"x.js\",\"line\":2,\"body\":\"bug\"}]}' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",total_cost_usd:0}'"
 mk_fake fake-claude-approve-usage \
   "jq -n --arg r '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[]}' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",usage:{input_tokens:120,output_tokens:30,total_tokens:150}}'"
+mk_fake fake-claude-braces \
+  "jq -n --arg r 'Here is the verdict:
+{\"verdict\":\"CHANGES_REQUESTED\",\"summary\":\"body has braces\",\"findings\":[{\"severity\":\"P1\",\"path\":\"x.js\",\"line\":2,\"body\":\"snippet contains { braces } and stays valid\"}]}
+Done.' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",total_cost_usd:0}'"
 mk_fake fake-claude-junk \
   "jq -n '{type:\"result\",result:\"no json here\",session_id:\"t\"}'"
 
@@ -465,6 +469,13 @@ set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "CHANGES_REQUESTED" ]; then
   pass "claude adapter extracts verdict from .result envelope"
 else fail "claude adapter CHANGES_REQUESTED (rc=$rc, out=$out)"; fi
+
+set +e
+out="$(CLAUDE_BIN="$BIN/fake-claude-braces" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.findings[0].body == "snippet contains { braces } and stays valid"' >/dev/null; then
+  pass "claude adapter extracts verdict when finding text contains braces"
+else fail "claude adapter braces extraction (rc=$rc, out=$out)"; fi
 
 set +e
 CLAUDE_BIN="$BIN/fake-claude-junk" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF" >/dev/null 2>&1; rc=$?
