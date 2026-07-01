@@ -67,6 +67,11 @@ phase-4b-classifier.sh (is 4b needed?) ─▶ phase-4b-review.sh
   head SHA is re-read. The write uses the pull-review API with `commit_id` set
   to the reviewed SHA and verifies the created review response is pinned to
   that SHA.
+- **Tool/file-access isolation:** Codex runs from an empty scratch review root
+  with scratch `HOME`/`CODEX_HOME`; the copied Codex auth file lives outside the
+  review root. Claude runs with `--tools ""`, `--safe-mode`, disabled slash
+  commands, and no session persistence. The diff is supplied on stdin in both
+  directions, so neither reviewer needs repo or home-directory read tools.
 - **Timeouts:** adapter execution and the underlying reviewer CLI are bounded
   by `P4B_ADAPTER_TIMEOUT_SECONDS` / `P4B_REVIEW_CLI_TIMEOUT_SECONDS`
   (default `900`). A timeout exits through the same fail-closed manual handoff

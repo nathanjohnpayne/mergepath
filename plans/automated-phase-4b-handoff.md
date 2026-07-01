@@ -237,9 +237,11 @@ git diff "origin/${BASE}...${HEAD_SHA}" \
 - `--output-schema <file>` forces the final response to conform to a JSON Schema (`{verdict, findings[]}`), which the orchestrator parses deterministically—this is how we recover a review *state* the CLI does not natively emit.
 - `-o, --output-last-message <file>` writes the final message to a file (and stdout) for capture.
 - Auth is the operator's persisted ChatGPT/Codex plan login via `codex login`.
-  The adapter launches Codex under a tightly allowlisted child environment, so
-  a stray metered API key, GitHub token, deploy/cloud credential, or SSH agent
-  socket cannot become available to prompt-injected review commands.
+  The adapter launches Codex under a tightly allowlisted child environment and
+  an empty scratch review root. Its copied `CODEX_HOME/auth.json` lives outside
+  that root, so a stray metered API key, GitHub token, deploy/cloud credential,
+  SSH agent socket, or user-home file cannot become available to
+  prompt-injected review commands.
 
 The orchestrator then posts the verdict as a GitHub review under the reviewer PAT
 (never from inside the sandboxed CLI), using the pull-review API so the created
@@ -267,7 +269,7 @@ sequenceDiagram
 
     CX->>OR: invoke (PR#, direction=codex->claude)
     OR->>OR: HEAD-pin SHA, build diff + focus areas
-    OR->>CL: claude -p "<schema prompt>" --permission-mode plan<br/>--output-format json --allowedTools "Read,Bash(git *)"
+    OR->>CL: claude -p "<schema prompt>" --permission-mode plan<br/>--tools "" --output-format json
     CL-->>OR: JSON envelope with verdict object in .result
     alt approved
         OR->>GR: create pull review via API<br/>event=APPROVE, commit_id=HEAD
@@ -291,14 +293,17 @@ Illustrative adapter invocation:
 ```bash
 claude -p "$PROMPT_WITH_VERDICT_SCHEMA" \
   --permission-mode plan \
-  --allowedTools "Read,Bash(git diff *),Bash(git log *)" \
+  --tools "" \
+  --safe-mode \
+  --disable-slash-commands \
+  --no-session-persistence \
   --model "${CLAUDE_MODEL}" \
   --output-format json > out.json
 # Parse: jq -r '.result' out.json
 ```
 
 - `--permission-mode plan` keeps the run read-only (research/propose, no edits)—the appropriate posture for an unattended reviewer ([permission modes](https://code.claude.com/docs/en/permission-modes)).
-- `--allowedTools` scopes the run to reads and read-only git; no write tools are granted, so the CLI cannot mutate the repo or the PR.
+- `--tools ""` disables Claude Code tools entirely. The diff is already on stdin, so the reviewer does not need `Read` or `Bash`; this prevents prompt-injected diffs from steering the CLI into reading local files or environment state.
 - `--output-format json` yields a structured result (result text, `session_id`, cost) for the orchestrator to parse ([headless mode](https://code.claude.com/docs/en/headless)).
 - Headless auth uses the operator's Claude Code subscription login, preserving
   `CLAUDE_CODE_OAUTH_TOKEN` when present. The adapter launches Claude under a
@@ -320,7 +325,7 @@ GH_AS_REVIEWER_IDENTITY=nathanpayne-claude \
 |-----------|-------------------------------|------------------------------|
 | Built-in review affordance used here | None—no `codex review`, no `/review`; review is a prompted `codex exec` | None for posting; review is a prompted `claude -p` run |
 | Native review state | None (free-form text) → impose `--output-schema`, map to state | None posted by CLI; prompt for the shared verdict schema inside `.result` |
-| Read-only posture | `--sandbox read-only` (also the default) + `--ask-for-approval never` | `--permission-mode plan` + scoped `--allowedTools` |
+| Read-only posture | `--sandbox read-only`, scratch `--cd`, isolated scratch HOME/CODEX_HOME + `--ask-for-approval never` | `--permission-mode plan`, `--tools ""`, safe mode, no session persistence |
 | Output capture | `--json` (JSONL events) and `-o/--output-last-message <file>` | `--output-format json` (`result`, `session_id`, cost) |
 | Structured output | `--output-schema <file>` (schema-validated final message) | System-prompt-shaped + JSON parse |
 | LLM auth (reasoning plane) | `codex login` / ChatGPT plan login; child env allowlist excludes API keys and ambient credentials | Claude Code subscription login / `CLAUDE_CODE_OAUTH_TOKEN`; child env allowlist excludes API keys and ambient credentials |

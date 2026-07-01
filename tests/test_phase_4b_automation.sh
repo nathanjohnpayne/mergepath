@@ -220,17 +220,41 @@ echo MISSING-SANDBOX >&2
 exit 8"
 mk_fake fake-claude-readonly \
   "permission=''
-tools=''
+tools='__unset__'
+safe_mode=false
+no_persist=false
+slash_disabled=false
 while [ \"\$#\" -gt 0 ]; do
   case \"\$1\" in
     --permission-mode) permission=\"\${2:-}\"; shift 2 ;;
-    --allowedTools) tools=\"\${2:-}\"; shift 2 ;;
+    --tools) tools=\"\${2-}\"; shift 2 ;;
+    --safe-mode) safe_mode=true; shift ;;
+    --no-session-persistence) no_persist=true; shift ;;
+    --disable-slash-commands) slash_disabled=true; shift ;;
     *) shift ;;
   esac
 done
 [ \"\$permission\" = 'plan' ] || { echo BAD-PERMISSION-MODE >&2; exit 8; }
-[ \"\$tools\" = 'Read,Bash(git diff *),Bash(git log *)' ] || { echo BAD-ALLOWED-TOOLS >&2; exit 8; }
+[ \"\$tools\" = '' ] || { echo BAD-TOOLS >&2; exit 8; }
+[ \"\$safe_mode\" = true ] || { echo MISSING-SAFE-MODE >&2; exit 8; }
+[ \"\$no_persist\" = true ] || { echo MISSING-NO-PERSIST >&2; exit 8; }
+[ \"\$slash_disabled\" = true ] || { echo MISSING-DISABLE-SLASH >&2; exit 8; }
 jq -n --arg r '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[]}' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\"}'"
+PARENT_HOME_FOR_TEST="$HOME"
+mk_fake fake-codex-isolated \
+  "cd_arg=''
+while [ \"\$#\" -gt 0 ]; do
+  case \"\$1\" in
+    --cd) cd_arg=\"\${2:-}\"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n \"\$cd_arg\" ] || { echo MISSING-CD >&2; exit 8; }
+[ \"\${HOME:-}\" != '$PARENT_HOME_FOR_TEST' ] || { echo PARENT-HOME-LEAKED >&2; exit 8; }
+[ -n \"\${CODEX_HOME:-}\" ] || { echo MISSING-CODEX-HOME >&2; exit 8; }
+[ -r \"\$CODEX_HOME/auth.json\" ] || { echo MISSING-ISOLATED-AUTH >&2; exit 8; }
+case \"\$CODEX_HOME\" in \"\$cd_arg\"/*|\"\$cd_arg\") echo AUTH-INSIDE-REVIEW-ROOT >&2; exit 8 ;; esac
+printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[]}'"
 mk_fake fake-codex-sleep \
   "sleep 5
 printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"too late\",\"findings\":[]}'"
@@ -238,7 +262,7 @@ mk_fake fake-claude-sleep \
   "sleep 5
 printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"too late\",\"findings\":[]}'"
 mk_fake fake-handoff \
-  "printf '%s\n' \"\$*\" > \"\${P4B_HANDOFF_LOG:?}\""
+  "printf '%s %s\n' \"\${PHASE_4B_REVIEWER_IDENTITY:-}\" \"\$*\" > \"\${P4B_HANDOFF_LOG:?}\""
 NO_JQ_DIR="$WORK/no-jq-bin"
 mkdir -p "$NO_JQ_DIR"
 cat > "$NO_JQ_DIR/jq" <<'SH'
@@ -331,6 +355,20 @@ a="$(p4b_adapter_of_login NATHANPAYNE-CODEX)"
 [ "$a" = "codex" ] && pass "adapter_of_login(NATHANPAYNE-CODEX)=codex" || fail "adapter_of_login uppercase codex -> '$a'"
 a="$(p4b_adapter_of_login nathanpayne-claude)"
 [ "$a" = "claude" ] && pass "adapter_of_login(nathanpayne-claude)=claude" || fail "adapter_of_login claude -> '$a'"
+
+CODEX_HOME_ALT="$WORK/codex-home-alt"
+mkdir -p "$CODEX_HOME_ALT"
+cp "$CODEX_AUTH_CHATGPT" "$CODEX_HOME_ALT/auth.json"
+SAVED_P4B_CODEX_AUTH_FILE="${P4B_CODEX_AUTH_FILE:-}"
+SAVED_CODEX_HOME="${CODEX_HOME:-}"
+unset P4B_CODEX_AUTH_FILE
+CODEX_HOME="$CODEX_HOME_ALT"
+auth_path="$(p4b_codex_auth_file)"
+P4B_CODEX_AUTH_FILE="$SAVED_P4B_CODEX_AUTH_FILE"
+CODEX_HOME="$SAVED_CODEX_HOME"
+export P4B_CODEX_AUTH_FILE CODEX_HOME
+[ "$auth_path" = "$CODEX_HOME_ALT/auth.json" ] && pass "codex auth lookup honors CODEX_HOME/auth.json" \
+  || fail "codex auth lookup with CODEX_HOME -> '$auth_path' (expected $CODEX_HOME_ALT/auth.json)"
 
 # ===========================================================================
 echo "lib.sh — verdict validation (fail-closed)"
@@ -519,8 +557,15 @@ out="$(P4B_CLAUDE_PERMISSION_MODE=bypassPermissions P4B_CLAUDE_ALLOWED_TOOLS='Wr
   CLAUDE_BIN="$BIN/fake-claude-readonly" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
-  pass "claude adapter pins permission mode/tools to read-only despite env override"
+  pass "claude adapter disables tools and pins permission mode despite env override"
 else fail "claude adapter honored unsafe permission/tool override (rc=$rc, out=$out)"; fi
+
+set +e
+out="$(CODEX_BIN="$BIN/fake-codex-isolated" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
+  pass "codex adapter uses isolated HOME/CODEX_HOME outside review root"
+else fail "codex adapter did not isolate HOME/CODEX_HOME from review root (rc=$rc, out=$out)"; fi
 
 # Bounded execution: hung auth/network/model calls fail closed to manual
 # handoff instead of wedging the Phase 4b path.
@@ -590,9 +635,21 @@ out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-junk
 set -e
 if [ "$rc" = 4 ] \
    && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ] \
-   && [ "$(cat "$HANDOFF_LOG")" = "o/r#125" ]; then
+   && [ "$(cat "$HANDOFF_LOG")" = "nathanpayne-codex o/r#125" ]; then
   pass "junk adapter verdict → fail closed to manual handoff for target repo, no auto-approve"
 else fail "fail-closed path (rc=$rc): $out"; fi
+
+HANDOFF_LOG="$WORK/handoff-claude.log"
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CLAUDE_BIN="$BIN/fake-claude-junk" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" \
+  bash "$ORCH" 126 --repo o/r --author codex --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ] \
+   && [ "$(cat "$HANDOFF_LOG")" = "nathanpayne-claude o/r#126" ]; then
+  pass "manual fallback handoff targets the selected Claude reviewer for codex-authored PRs"
+else fail "claude fallback target (rc=$rc): $out"; fi
 
 # #574 feedback_policy: a finding in a configured required tier cannot be
 # carried by an approval, even when the adapter output is otherwise valid.

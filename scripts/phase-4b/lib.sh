@@ -376,7 +376,11 @@ p4b_codex_auth_file() {
     printf '%s' "$P4B_CODEX_AUTH_FILE"
     return 0
   fi
-  printf '%s/.codex/auth.json' "${CODEX_HOME:-$HOME}"
+  if [ -n "${CODEX_HOME:-}" ]; then
+    printf '%s/auth.json' "$CODEX_HOME"
+    return 0
+  fi
+  printf '%s/.codex/auth.json' "$HOME"
 }
 
 p4b_require_codex_plan_auth() {

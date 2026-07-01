@@ -96,6 +96,7 @@ fi
 
 command -v "$CODEX_BIN" >/dev/null 2>&1 || p4b_die 3 "codex CLI not found on PATH (set CODEX_BIN)"
 p4b_require_codex_plan_auth
+CODEX_AUTH_SOURCE="$(p4b_codex_auth_file)"
 
 # --- run the review --------------------------------------------------------
 REQUIRED_SEVERITIES="$(p4b_required_verdict_severities_json)" \
@@ -117,20 +118,25 @@ GitHub."
 
 TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/p4b-codex.XXXXXX")"
 ERR_OUT="$(mktemp "${TMPDIR:-/tmp}/p4b-codex-stderr.XXXXXX")"
+RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/p4b-codex-run.XXXXXX")"
+RUN_HOME="$(mktemp -d "${TMPDIR:-/tmp}/p4b-codex-home.XXXXXX")"
+RUN_CODEX_HOME="$(mktemp -d "${TMPDIR:-/tmp}/p4b-codex-auth.XXXXXX")"
+cp "$CODEX_AUTH_SOURCE" "$RUN_CODEX_HOME/auth.json"
+chmod 600 "$RUN_CODEX_HOME/auth.json" 2>/dev/null || true
 # shellcheck disable=SC2064
-trap "rm -f '$TMP_OUT' '$ERR_OUT'" EXIT
+trap "rm -f '$TMP_OUT' '$ERR_OUT'; rm -rf '$RUN_DIR' '$RUN_HOME' '$RUN_CODEX_HOME'" EXIT
 
 SAFE_ENV=(env -i
   "PATH=${PATH:-/usr/bin:/bin}"
-  "HOME=${HOME:-}"
+  "HOME=$RUN_HOME"
   "USER=${USER:-}"
   "LOGNAME=${LOGNAME:-}"
   "SHELL=${SHELL:-/bin/sh}"
   "TMPDIR=${TMPDIR:-/tmp}"
   "LANG=${LANG:-C}"
   "TERM=${TERM:-dumb}"
+  "CODEX_HOME=$RUN_CODEX_HOME"
 )
-[ -n "${CODEX_HOME:-}" ] && SAFE_ENV+=("CODEX_HOME=$CODEX_HOME")
 
 set +e
 RAW="$(
@@ -139,6 +145,11 @@ RAW="$(
     "$CODEX_BIN" \
     --ask-for-approval never \
     exec \
+    --cd "$RUN_DIR" \
+    --skip-git-repo-check \
+    --ephemeral \
+    --ignore-user-config \
+    --ignore-rules \
     --sandbox "$SANDBOX" \
     ${MODEL:+--model "$MODEL"} \
     --output-schema "$SCHEMA" \

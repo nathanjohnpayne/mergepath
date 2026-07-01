@@ -166,7 +166,8 @@ fall_back_to_manual() {
   [ -n "$REPO" ] && handoff_ref="${REPO}#${PR}"
   p4b_warn "falling back to the manual Phase 4b handoff: $why"
   if [ -x "$HANDOFF" ]; then
-    "$HANDOFF" "$handoff_ref" >&2 2>/dev/null || p4b_warn "could not render chat-side handoff block (needs gh); brief the human manually"
+    PHASE_4B_REVIEWER_IDENTITY="$REVIEWER" "$HANDOFF" "$handoff_ref" >&2 2>/dev/null \
+      || p4b_warn "could not render chat-side handoff block (needs gh); brief the human manually"
   fi
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \

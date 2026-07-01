@@ -17,7 +17,7 @@
 #
 # Docs (verbatim flags):
 #   claude -p "<prompt>" --permission-mode plan --output-format json \
-#     --allowedTools "Read,Bash(git diff *)"
+#     --tools ""
 #   https://code.claude.com/docs/en/headless
 #   https://code.claude.com/docs/en/permission-modes
 # The print-mode JSON envelope carries the model's answer in `.result`
@@ -41,7 +41,7 @@
 #               PRESERVED. If claude is not logged in on a plan the read-only
 #               call fails and the orchestrator falls back to the manual
 #               handoff (fail-closed).
-#   Claude always runs with --permission-mode plan and read-only allowedTools.
+#   Claude always runs with --permission-mode plan and --tools "".
 #   Environment overrides cannot widen the tool or permission posture.
 #   GH_TOKEN    only used if the diff must be fetched (no --diff-file).
 #   P4B_REVIEW_CLI_TIMEOUT_SECONDS  default: P4B_ADAPTER_TIMEOUT_SECONDS
@@ -58,7 +58,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCHEMA="$HERE/../verdict.schema.json"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 PERMISSION_MODE=plan
-ALLOWED_TOOLS="Read,Bash(git diff *),Bash(git log *)"
+TOOLS=""
 
 PR="" ; REPO="" ; HEAD="" ; DIFF_FILE="" ; MODEL="${P4B_CLAUDE_MODEL:-}"
 CLI_TIMEOUT="${P4B_REVIEW_CLI_TIMEOUT_SECONDS:-${P4B_ADAPTER_TIMEOUT_SECONDS:-900}}"
@@ -137,8 +137,12 @@ ENVELOPE="$(
     "$CLAUDE_BIN" -p "$PROMPT" \
     --permission-mode "$PERMISSION_MODE" \
     --output-format json \
+    --no-session-persistence \
+    --safe-mode \
+    --disable-slash-commands \
+    --tools "$TOOLS" \
     ${MODEL:+--model "$MODEL"} \
-    --allowedTools "$ALLOWED_TOOLS" 2>/dev/null
+    2>/dev/null
 )"
 RC=$?
 set -e
