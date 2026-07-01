@@ -23,6 +23,11 @@ committing the YAML.
 - **Codex GitHub App.** Toggles Phase 4a automated external review,
   with a max-rounds cap.
 - **Reviewers.** The identities eligible to serve as internal reviewer.
+- **Feedback policy.** Which bot-review findings the agent must
+  disposition (fix or rebut + resolve) before merge — either "address
+  or rebut all feedback" (`mode: address-all`) or a per-priority
+  checkbox group (P0–P3) that marks each tier `required` or
+  `discretionary`.
 - **Presets.** Strict / Standard / Loose starting points.
 
 ### How to run it

@@ -405,6 +405,25 @@
   .check-row .check-copy .ttl { font-size: 12px; }
   .check-row .check-copy .sub { color: var(--soft); font-size: 11px; }
 
+  /* Feedback-policy per-tier group. When "address all" is on the tiers are
+   * forced checked + disabled and the whole group greys out — the same
+   * visual cue #codexNested uses when its parent toggle is off. */
+  .tier-group {
+    margin-top: 12px;
+    transition: opacity 160ms ease;
+  }
+  .tier-group .tier-label {
+    display: block;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 2px;
+  }
+  .tier-group.greyed {
+    opacity: 0.5;
+  }
+  .tier-group.greyed .check-row { cursor: default; }
+
   /* Reviewers */
   .reviewer {
     display: flex;
@@ -896,6 +915,51 @@
       </div>
 
       <div class="panel">
+        <h2>Feedback policy</h2>
+        <p class="help">Which bot-review findings the agent must disposition before merge.</p>
+
+        <div class="switch-row">
+          <div class="switch-copy">
+            <strong>Address or rebut all feedback</strong>
+            <span>Every finding at every tier blocks merge until fixed or rebutted.</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="feedbackAddressAll" data-toggle="feedbackAddressAll" aria-label="Require disposition of all feedback at every tier" />
+            <span class="track"></span>
+          </label>
+        </div>
+
+        <div class="tier-group" id="feedbackTiers">
+          <span class="tier-label" id="feedbackTiersLabel">Require disposition by priority</span>
+          <label class="check-row" for="feedbackP0">
+            <input type="checkbox" id="feedbackP0" data-priority="p0" checked aria-labelledby="feedbackTiersLabel feedbackP0Ttl" />
+            <span class="check-copy">
+              <span class="ttl" id="feedbackP0Ttl">P0 &mdash; Critical</span>
+            </span>
+          </label>
+          <label class="check-row" for="feedbackP1">
+            <input type="checkbox" id="feedbackP1" data-priority="p1" checked aria-labelledby="feedbackTiersLabel feedbackP1Ttl" />
+            <span class="check-copy">
+              <span class="ttl" id="feedbackP1Ttl">P1 &mdash; High</span>
+            </span>
+          </label>
+          <label class="check-row" for="feedbackP2">
+            <input type="checkbox" id="feedbackP2" data-priority="p2" aria-labelledby="feedbackTiersLabel feedbackP2Ttl" />
+            <span class="check-copy">
+              <span class="ttl" id="feedbackP2Ttl">P2 &mdash; Minor</span>
+            </span>
+          </label>
+          <label class="check-row" for="feedbackP3">
+            <input type="checkbox" id="feedbackP3" data-priority="p3" aria-labelledby="feedbackTiersLabel feedbackP3Ttl" />
+            <span class="check-copy">
+              <span class="ttl" id="feedbackP3Ttl">P3 / Nitpick &mdash; Cosmetic</span>
+            </span>
+          </label>
+          <p class="hint">Required = must fix or rebut and resolve the thread before merge (blocks merge). Unchecked = agent's judgment, non-blocking. <span class="mono">ignore</span> is a YAML-only advanced value.</p>
+        </div>
+      </div>
+
+      <div class="panel">
         <h2>Presets</h2>
         <p class="help">Opinionated starting points. Adjust from there.</p>
         <div class="presets">
@@ -984,12 +1048,18 @@
     // owner-decided default is on (#483).
     codexRequestByDefault: true,
     reviewers: { claude: true, cursor: true, codex: true },
+    // Feedback disposition policy (#574/#578). Mirrors the `feedback_policy`
+    // block in .github/review-policy.yml. `by-priority` consults the per-tier
+    // map; `address-all` ignores it and requires every tier. Owner-decided
+    // default matches the foundation file: p0/p1 required, p2/p3 discretionary.
+    feedbackMode: 'by-priority',
+    feedbackPriorities: { p0: true, p1: true, p2: false, p3: false },
   };
 
   const PRESETS = {
-    strict:   { threshold: 100, coderabbit: true,  codex: true,  codexRounds: 3, codexRequestByDefault: true  },
-    standard: { threshold: 300, coderabbit: true,  codex: true,  codexRounds: 2, codexRequestByDefault: true  },
-    loose:    { threshold: 800, coderabbit: false, codex: false, codexRounds: 1, codexRequestByDefault: true  },
+    strict:   { threshold: 100, coderabbit: true,  codex: true,  codexRounds: 3, codexRequestByDefault: true,  feedbackMode: 'address-all', feedbackPriorities: { p0: true, p1: true, p2: true,  p3: true  } },
+    standard: { threshold: 300, coderabbit: true,  codex: true,  codexRounds: 2, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: true, p2: false, p3: false } },
+    loose:    { threshold: 800, coderabbit: false, codex: false, codexRounds: 1, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: false, p2: false, p3: false } },
   };
 
   const LIMITS = {
@@ -1239,6 +1309,14 @@
     yaml.appendChild(document.createTextNode('  '));
     add('k', 'enabled'); yaml.appendChild(document.createTextNode(': '));
     add('v', String(state.coderabbit)); nl();
+    // CodeRabbit severity gate (#574/#577) — the CodeRabbit twin of
+    // codex.p1_gate. Mirrors coderabbit.severity_gate.enabled in the real
+    // policy file so the preview stays a legal drop-in.
+    yaml.appendChild(document.createTextNode('  '));
+    add('k', 'severity_gate'); yaml.appendChild(document.createTextNode(':')); nl();
+    yaml.appendChild(document.createTextNode('    '));
+    add('k', 'enabled'); yaml.appendChild(document.createTextNode(': '));
+    add('v', String(state.coderabbit)); nl();
     add('k', 'codex'); yaml.appendChild(document.createTextNode(':')); nl();
     yaml.appendChild(document.createTextNode('  '));
     add('k', 'enabled'); yaml.appendChild(document.createTextNode(': '));
@@ -1251,6 +1329,14 @@
       add('k', 'max_review_rounds'); yaml.appendChild(document.createTextNode(': '));
       add('v', String(state.codexRounds)); nl();
     }
+    // Codex P1 merge gate (#235), generalized by #574/#577 to enforce the
+    // feedback_policy tiers. Mirrors codex.p1_gate.enabled in the real policy
+    // file; always nested under codex: so the preview is a legal drop-in.
+    yaml.appendChild(document.createTextNode('  '));
+    add('k', 'p1_gate'); yaml.appendChild(document.createTextNode(':')); nl();
+    yaml.appendChild(document.createTextNode('    '));
+    add('k', 'enabled'); yaml.appendChild(document.createTextNode(': '));
+    add('v', String(state.codex)); nl();
     add('k', 'available_reviewers');
     // The UI tracks reviewers by short alias; the real policy file lists full
     // GitHub logins (nathanpayne-<alias>). Emit the login form so the preview
@@ -1271,6 +1357,26 @@
         yaml.appendChild(document.createTextNode('  - '));
         add('s', reviewerLogins[k] || k);
         nl();
+      });
+    }
+
+    // Feedback disposition policy (#574/#578). Serialize the shared
+    // `feedback_policy` block. `address-all` emits just the mode and OMITS the
+    // `priorities:` map (it is ignored in that mode). `by-priority` emits the
+    // mode plus the per-tier required/discretionary map. Checked ⇒ required,
+    // unchecked ⇒ discretionary; `ignore` is a YAML-only advanced value not
+    // surfaced by the UI. Keep this a legal drop-in for review-policy.yml.
+    add('k', 'feedback_policy'); yaml.appendChild(document.createTextNode(':')); nl();
+    yaml.appendChild(document.createTextNode('  '));
+    add('k', 'mode'); yaml.appendChild(document.createTextNode(': '));
+    add('v', state.feedbackMode); nl();
+    if (state.feedbackMode === 'by-priority') {
+      yaml.appendChild(document.createTextNode('  '));
+      add('k', 'priorities'); yaml.appendChild(document.createTextNode(':')); nl();
+      ['p0', 'p1', 'p2', 'p3'].forEach(tier => {
+        yaml.appendChild(document.createTextNode('    '));
+        add('k', tier); yaml.appendChild(document.createTextNode(': '));
+        add('v', state.feedbackPriorities[tier] ? 'required' : 'discretionary'); nl();
       });
     }
   }
@@ -1357,13 +1463,48 @@
     announce('Removed ' + removed + '.');
   });
 
+  // Reflect the feedback-policy mode + per-tier map onto the controls. In
+  // `address-all` the tiers are forced checked + disabled and the group greys
+  // out (mirrors how #codexNested greys when its parent toggle is off); in
+  // `by-priority` each tier reflects state.feedbackPriorities and is editable.
+  function syncFeedbackControls() {
+    const addressAll = state.feedbackMode === 'address-all';
+    $('feedbackAddressAll').checked = addressAll;
+    document.querySelectorAll('[data-priority]').forEach(cb => {
+      const tier = cb.dataset.priority;
+      cb.checked = addressAll ? true : !!state.feedbackPriorities[tier];
+      cb.disabled = addressAll;
+    });
+    $('feedbackTiers').classList.toggle('greyed', addressAll);
+  }
+
   document.querySelectorAll('[data-toggle]').forEach(t => {
     t.addEventListener('change', () => {
       const key = t.dataset.toggle;
+      if (key === 'feedbackAddressAll') {
+        // The address-all switch drives feedbackMode, not a boolean state key.
+        state.feedbackMode = t.checked ? 'address-all' : 'by-priority';
+        syncFeedbackControls();
+        announce(t.checked
+          ? 'Feedback policy: address or rebut all feedback.'
+          : 'Feedback policy: require disposition by priority.');
+        renderAll();
+        return;
+      }
       state[key] = t.checked;
       if (key === 'codex') {
         $('codexNested').classList.toggle('shown', state.codex);
       }
+      renderAll();
+    });
+  });
+
+  document.querySelectorAll('[data-priority]').forEach(c => {
+    c.addEventListener('change', () => {
+      // Disabled tiers (address-all mode) never fire a user-driven change, but
+      // guard anyway so a synthetic event can't mutate the ignored map.
+      if (state.feedbackMode === 'address-all') return;
+      state.feedbackPriorities[c.dataset.priority] = c.checked;
       renderAll();
     });
   });
@@ -1388,6 +1529,10 @@
       ? structuredClone(DEFAULTS)
       : JSON.parse(JSON.stringify(DEFAULTS));
     Object.assign(state, fresh, p);
+    // Object.assign is shallow: a preset that defines `feedbackPriorities`
+    // would otherwise alias state.feedbackPriorities to the PRESETS literal,
+    // so a later per-tier toggle would silently mutate the preset. Detach it.
+    state.feedbackPriorities = { ...state.feedbackPriorities };
     // Re-sync every control from state, not just the four the preset sets.
     $('threshold').value = state.threshold;
     $('thresholdVal').textContent = state.threshold;
@@ -1400,6 +1545,7 @@
     document.querySelectorAll('[data-reviewer]').forEach(cb => {
       cb.checked = !!state.reviewers[cb.dataset.reviewer];
     });
+    syncFeedbackControls();  // address-all switch + per-tier checkboxes + greying
     renderAll();  // re-renders the protected-path chips from the reset state
     announce('Applied ' + name + ' preset.');
   }
@@ -1562,6 +1708,7 @@
   // ---------------------------------------------------------------------
   // Go
   // ---------------------------------------------------------------------
+  syncFeedbackControls();  // make the feedback-policy controls authoritative on load
   renderAll();
   initSyncScroll();
 </script>

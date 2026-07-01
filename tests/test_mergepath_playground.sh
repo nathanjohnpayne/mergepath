@@ -64,6 +64,16 @@ grep -q "nathanpayne-claude"                     "$PAGE" || { echo "YAML preview
 grep -q "nathanpayne-codex"                      "$PAGE" || { echo "YAML preview missing full reviewer login nathanpayne-codex"; exit 1; }
 
 # ---------------------------------------------------------------------------
+# Feedback-policy panel (#578) — the address-all switch + per-tier checkboxes.
+# ---------------------------------------------------------------------------
+grep -q 'id="feedbackAddressAll"'                "$PAGE" || { echo "feedback address-all toggle missing"; exit 1; }
+grep -q 'id="feedbackTiers"'                     "$PAGE" || { echo "feedback tier group missing"; exit 1; }
+grep -q 'data-priority="p0"'                     "$PAGE" || { echo "feedback P0 tier checkbox missing"; exit 1; }
+grep -q 'data-priority="p1"'                     "$PAGE" || { echo "feedback P1 tier checkbox missing"; exit 1; }
+grep -q 'data-priority="p2"'                     "$PAGE" || { echo "feedback P2 tier checkbox missing"; exit 1; }
+grep -q 'data-priority="p3"'                     "$PAGE" || { echo "feedback P3 tier checkbox missing"; exit 1; }
+
+# ---------------------------------------------------------------------------
 # XSS-safety stance: data must never flow through innerHTML.
 # Also extract the script block to $CHECK_FILE for node --check.
 # ---------------------------------------------------------------------------
@@ -96,6 +106,8 @@ required = [
     'validatePath', 'copyText', 'openModal', 'closeModal',
     'renderChips', 'renderPRs', 'renderYaml', 'applyPreset',
     'announce', 'initSyncScroll',
+    # Feedback-policy controls (#578).
+    'feedbackMode', 'feedbackPriorities', 'syncFeedbackControls',
 ]
 missing = [name for name in required if name not in body]
 if missing:
@@ -142,5 +154,92 @@ scripts = re.findall(r'<script\b[^>]*>(.*?)</script>', html_no_comments, flags=r
 sys.stdout.write('\n'.join(scripts))
 PY
 node --check "$CHECK_FILE"
+
+# ---------------------------------------------------------------------------
+# feedback_policy serialization (#578). Drive renderYaml() under a minimal DOM
+# stub in both modes and assert the emitted YAML is a well-formed drop-in:
+#   - by-priority emits `mode: by-priority` + the priorities map (required /
+#     discretionary), reflecting DEFAULTS (p0/p1 required, p2/p3 discretionary).
+#   - address-all emits just `mode: address-all` and OMITS priorities:.
+#   - both modes carry codex.p1_gate.enabled and coderabbit.severity_gate.enabled
+#     so the preview matches the real review-policy.yml schema.
+# ---------------------------------------------------------------------------
+YAML_HARNESS="$TMPDIR_SAFE/yaml_harness.mjs"
+
+python3 - "$PAGE" "$YAML_HARNESS" <<'PY'
+import re, sys
+html = open(sys.argv[1]).read()
+html_no_comments = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
+scripts = re.findall(r'<script\b[^>]*>(.*?)</script>', html_no_comments, flags=re.DOTALL)
+if len(scripts) != 1:
+    sys.exit(f"expected exactly one <script> block, found {len(scripts)}")
+body = scripts[0].replace("'use strict';", "", 1)
+
+harness = r'''
+class FakeNode {
+  constructor(){ this.children=[]; this._text=''; this.className=''; this.dataset={}; this.attrs={};
+    this.classList={ _s:new Set(), add(c){this._s.add(c);}, remove(c){this._s.delete(c);},
+      toggle(c,on){ if(on===undefined){ this._s.has(c)?this._s.delete(c):this._s.add(c);} else { on?this._s.add(c):this._s.delete(c);} },
+      contains(c){return this._s.has(c);} }; }
+  set textContent(v){ this._text=v; this.children=[]; }
+  get textContent(){ return this._text + this.children.map(c=>c.textContent).join(''); }
+  appendChild(c){ this.children.push(c); return c; }
+  setAttribute(k,v){ this.attrs[k]=v; }
+  addEventListener(){}
+  querySelectorAll(){ return []; }
+  querySelector(){ return new FakeNode(); }
+  focus(){}
+}
+const _store = {};
+const document = {
+  createElement(){ return new FakeNode(); },
+  createTextNode(t){ const n=new FakeNode(); n._text=t; return n; },
+  getElementById(id){ if(!_store[id]) _store[id]=new FakeNode(); return _store[id]; },
+  querySelectorAll(){ return []; },
+  querySelector(){ return new FakeNode(); },
+  addEventListener(){},
+  activeElement: null,
+  body: new FakeNode(),
+};
+const window = { matchMedia: () => ({ matches:false, addEventListener(){} }), isSecureContext:false };
+const navigator = {};
+const requestAnimationFrame = () => {};
+const setTimeout = () => {};
+const structuredClone = (o) => JSON.parse(JSON.stringify(o));
+'''
+
+footer = r'''
+function emit(){ _store['yaml'] = new FakeNode(); renderYaml(); return _store['yaml'].textContent; }
+function fail(m){ console.error("feedback_policy serialization: " + m); process.exit(1); }
+
+state.feedbackMode = 'by-priority';
+state.feedbackPriorities = { p0:true, p1:true, p2:false, p3:false };
+const byPriority = emit();
+state.feedbackMode = 'address-all';
+const addressAll = emit();
+
+if (!/coderabbit:\s*\n\s+enabled:.*\n\s+severity_gate:\s*\n\s+enabled:/.test(byPriority))
+  fail("coderabbit.severity_gate.enabled missing or misnested");
+if (!/codex:[\s\S]*?\n\s+p1_gate:\s*\n\s+enabled:/.test(byPriority))
+  fail("codex.p1_gate.enabled missing or misnested");
+if (!/feedback_policy:\s*\n\s+mode: by-priority\s*\n\s+priorities:\s*\n\s+p0: required\s*\n\s+p1: required\s*\n\s+p2: discretionary\s*\n\s+p3: discretionary/.test(byPriority))
+  fail("by-priority block not well-formed (mode + priorities map)");
+
+const fpStart = addressAll.indexOf('feedback_policy:');
+const fpBlock = addressAll.slice(fpStart);
+if (!/feedback_policy:\s*\n\s+mode: address-all/.test(fpBlock))
+  fail("address-all mode line missing");
+if (fpBlock.includes('priorities:'))
+  fail("address-all must OMIT the priorities map");
+if (!/severity_gate:\s*\n\s+enabled:/.test(addressAll) || !/p1_gate:\s*\n\s+enabled:/.test(addressAll))
+  fail("both gate keys must be present in address-all mode too");
+
+console.error("feedback_policy serialization OK (both modes + both gate keys)");
+'''
+
+open(sys.argv[2], 'w').write(harness + body + footer)
+PY
+
+node "$YAML_HARNESS"
 
 echo "OK: Mergepath Playground checks passed"

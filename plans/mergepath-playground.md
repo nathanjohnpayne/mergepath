@@ -32,7 +32,8 @@ identities panel, and exposed advanced Codex knobs (bot login,
 reaction freshness, CI-green gate, timeouts). Those were cut. The
 dashboard is now a playground for the frequently-tuned subset:
 threshold, protected paths, automation toggles, max rounds, reviewer
-roster, and presets.
+roster, the feedback-disposition policy (address-all vs per-priority
+tiers), and presets.
 
 If a future iteration needs the full schema or read/write behavior, it
 should ship as a separate page (likely `mergepath/cockpit/` — see the

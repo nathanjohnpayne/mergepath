@@ -20,6 +20,14 @@ reserved, see [`BRAND.md`](../BRAND.md).
     `codex.request_by_default`; greyed out / hidden with the rest of
     the Codex nested controls when the Codex toggle is off)
   - reviewer-identity checkboxes
+  - a feedback-policy panel: an "address or rebut all feedback"
+    switch (mode `address-all`) and, when it is off (mode
+    `by-priority`), a "require disposition by priority" checkbox group
+    — P0 / P1 / P2 / P3. A checked tier is `required`; unchecked is
+    `discretionary` (`ignore` is a YAML-only advanced value). When the
+    address-all switch is on, the per-tier checkboxes are forced checked
+    and disabled and the group greys out — the same visual cue the Codex
+    nested controls use when the Codex toggle is off.
   - Strict / Standard / Loose presets
 - The right workspace shows summary stats, a per-PR routing flow, and
   a live YAML preview of the draft policy with a copy-to-clipboard
@@ -28,6 +36,16 @@ reserved, see [`BRAND.md`](../BRAND.md).
   schema of `.github/review-policy.yml` for the subset of keys the UI
   exposes. When Codex is enabled, the `codex:` block serializes
   `request_by_default` alongside `enabled` and `max_review_rounds`.
+- The YAML preview serializes a `feedback_policy:` block from the
+  feedback-policy panel. In `address-all` mode it emits only
+  `mode: address-all` and **omits** the `priorities:` map (that map is
+  ignored in that mode). In `by-priority` mode it emits
+  `mode: by-priority` plus a `priorities:` map with each tier set to
+  `required` (checked) or `discretionary` (unchecked). The preview also
+  always carries the two feedback-gate switches —
+  `codex.p1_gate.enabled` (nested under `codex:`) and
+  `coderabbit.severity_gate.enabled` (nested under `coderabbit:`) — so
+  it stays a legal drop-in for `.github/review-policy.yml`.
 - Changing any knob updates stats, flows, and YAML without a full
   reload. With the "request `@codex` on every PR" checkbox on, the
   routing flow shows the Phase 4a (Codex) leg on **every** PR, not only
