@@ -1,0 +1,294 @@
+name: CodeRabbit Severity Gate
+
+# Enforces nathanjohnpayne/mergepath#574/#577: CodeRabbit inline-review
+# findings whose mapped tier (see `feedback_policy` in
+# .github/review-policy.yml) is `required` must be resolved (via the GitHub
+# UI's "Resolve conversation" button or the GraphQL `resolveReviewThread`
+# mutation) before a PR can merge. The CodeRabbit twin of
+# .github/workflows/codex-p1-gate.yml.
+#
+# Reports "CodeRabbit blocking-tier unresolved: N" via
+# scripts/coderabbit-severity-gate.sh. The script exits 1 (gate fails)
+# when any CodeRabbit blocking-tier thread on the current HEAD is
+# unresolved.
+#
+# Gate ON/OFF is controlled by coderabbit.severity_gate.enabled in
+# .github/review-policy.yml. Mergepath sets it to true (the canonical
+# source). Downstream consumers default to false — today CodeRabbit has no
+# merge gate — so this is a clean no-op (always green) when off and safe to
+# require everywhere ahead of flipping the switch per repo (the same
+# narrow-start posture as the Codex P1 gate).
+#
+# Re-runs on every push to a PR AND on every review-related event, so a
+# human who clicks "Resolve conversation" on a blocking-tier thread sees the
+# gate go green without needing a push.
+#
+# Trigger shape note (mirrors codex-p1-gate.yml / #257 codex CR): GitHub
+# Actions does NOT document `pull_request_review_thread` as a workflow
+# trigger. It exists as a webhook event for GitHub Apps, but the Actions
+# "events-that-trigger-workflows" reference omits it
+# (https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows),
+# and adding it to `on:` is a no-op in practice — clicking "Resolve
+# conversation" produces no workflow run. To cover the UI-resolve case we
+# combine:
+#   - pull_request + pull_request_review + pull_request_review_comment
+#     for the event-driven path (push, review submit/edit/dismiss,
+#     inline comment activity).
+#   - schedule (every 15 minutes) as the safety net for the UI-resolve
+#     case, since no other event fires when a human clicks "Resolve
+#     conversation" on a thread.
+# The schedule job is read-only and idempotent (no-op when no open PRs
+# match — and a no-op when the gate is disabled, which is the default), so
+# the 15-min cadence is safe to run unconditionally across this repo.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  # pull_request_review_comment fires when a reviewer posts (or edits /
+  # deletes) an inline diff comment. Catches the case where CodeRabbit
+  # posts a new blocking-tier finding mid-review without a fresh
+  # review-submission event.
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+  # Periodic sweep — catches the "human clicks Resolve conversation on a
+  # CodeRabbit blocking-tier thread" case. The thread-resolution webhook
+  # fires but does NOT trigger Actions workflows (no Actions event for it
+  # per GitHub docs), so without the schedule the required check would stay
+  # red until the next push or manual rerun. 15-min cadence mirrors
+  # codex-p1-gate.yml § scheduled-sweep.
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+  pull-requests: read
+  # `checks: write` is required for the scheduled sweep job: it posts a
+  # check_run on each open PR's head SHA so a UI-resolve clears the
+  # stuck-red required check without a push. The event-driven job below
+  # produces its check natively (Actions auto-creates the check on the PR's
+  # head when triggered by pull_request* events) and would not need this
+  # permission on its own.
+  checks: write
+
+jobs:
+  coderabbit-severity-gate:
+    name: CodeRabbit unresolved blocking findings
+    runs-on: ubuntu-latest
+    # Event-driven path. The scheduled sweep below runs the same gate but
+    # on every open PR via the Checks API; gating this job to non-schedule
+    # events avoids paying for an empty no-op run.
+    if: github.event_name != 'schedule'
+    steps:
+      - name: Checkout repo (default branch — trusted gate script)
+        # Pin to the default branch, NOT the PR HEAD. The gate is a
+        # REQUIRED status check: if it ran scripts/coderabbit-severity-gate.sh
+        # from the PR's own checkout, a PR could edit that script to
+        # `exit 0`, satisfy the required check, and merge past unresolved
+        # blocking-tier threads in the window before the scheduled sweep
+        # re-evaluates. Satisfying a required check IS the weaponization.
+        # The gate script doesn't need the PR diff anyway: it takes a PR
+        # number + repo and queries the GitHub API. Same trusted-checkout
+        # posture as codex-p1-gate.yml.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          # persist-credentials: false: this job only runs the API-driven
+          # scripts/coderabbit-severity-gate.sh — it never pushes or uses
+          # the workspace git remote, so no token needs to linger in
+          # .git/config (#545 zizmor artipacked posture).
+          persist-credentials: false
+          # Shallow checkout: the gate is API-driven (takes a PR number +
+          # repo and queries the GitHub API) — it never reads git history.
+          fetch-depth: 1
+
+      - name: Resolve PR number
+        id: pr
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_JSON: ${{ toJSON(github.event) }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request|pull_request_review|pull_request_review_comment)
+              pr=$(jq -r '.pull_request.number' <<<"$EVENT_JSON")
+              ;;
+            *)
+              echo "Unsupported event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          if [ -z "$pr" ] || [ "$pr" = "null" ]; then
+            echo "Could not resolve PR number from event payload." >&2
+            exit 1
+          fi
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Run scripts/coderabbit-severity-gate.sh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Bootstrap (nathanjohnpayne/mergepath#577): we run the TRUSTED copy of
+          # the gate script from the default branch (checked out above), never
+          # the PR HEAD. On the PR that INTRODUCES this gate the script does not
+          # exist on the default branch yet, so there is nothing to run — soft-
+          # pass. The gate cannot guard its own introduction (that PR is human/
+          # Codex reviewed), and it activates for every subsequent PR the moment
+          # this merges. A PR cannot fake this to bypass the gate: the check is
+          # against the default-branch tree, which no unmerged PR can alter.
+          if [ ! -f scripts/coderabbit-severity-gate.sh ]; then
+            echo "::notice::coderabbit-severity-gate.sh is not on the default branch yet (bootstrap PR introducing the gate); soft-passing — the gate activates for all PRs once this merges."
+            exit 0
+          fi
+          # The script is the source of truth for what blocks merge.
+          # Exit codes:
+          #   0 = no unresolved blocking-tier findings on HEAD (or gate disabled)
+          #   1 = unresolved blocking-tier findings present (gate blocks)
+          #   2 = config / usage error (CI failure, not a gate block)
+          set +e
+          scripts/coderabbit-severity-gate.sh "$PR_NUMBER" "$REPO"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::coderabbit-severity-gate.sh exited 2 (config/usage error)"
+            exit 1
+          fi
+          exit "$rc"
+
+  scheduled-sweep:
+    name: CodeRabbit severity scheduled sweep
+    # Periodic re-evaluation across every open PR. Required because:
+    #   - GitHub Actions does NOT support pull_request_review_thread as a
+    #     workflow trigger (see top-of-file comment).
+    #   - When a human clicks "Resolve conversation" on a CodeRabbit
+    #     blocking-tier thread, no Actions event fires — so the required
+    #     check `CodeRabbit unresolved blocking findings` stays red on the
+    #     PR's head SHA until a push or manual rerun.
+    # This sweep walks every open PR, runs the same gate script, and posts a
+    # fresh check_run on each PR's head SHA via the Checks API.
+    # Required-check resolution keys on (head_sha, name), so the new check
+    # supersedes the stale red one. Idempotent: no-op when the gate result
+    # is unchanged (and a clean pass everywhere the gate is disabled).
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (default branch — trusted scripts)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Find open PRs
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # List ALL open PRs. The gate script itself short-circuits when
+          # coderabbit.severity_gate.enabled=false, so we don't filter by
+          # label here. `--limit 500` mirrors codex-p1-gate.yml's bound.
+          if ! prs_raw=$(gh pr list --repo "$REPO" --state open \
+            --limit 500 --json number --jq '.[].number'); then
+            echo "::error::Failed to list open PRs on $REPO"
+            exit 1
+          fi
+          if [ -z "$prs_raw" ]; then
+            echo "No open PRs on $REPO; sweep is a no-op."
+            echo "prs=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo 'prs<<EOF'
+            printf '%s\n' "$prs_raw"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Re-evaluate gate per PR and post check_run
+        if: steps.find.outputs.prs != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRS: ${{ steps.find.outputs.prs }}
+          REPO: ${{ github.repository }}
+          # Check name MUST match the event-driven job name above so branch
+          # protection's required-check entry resolves either source as the
+          # same gate. GitHub keys required checks on (head_sha, name); a
+          # fresh check_run with the same name supersedes the stale one.
+          CHECK_NAME: "CodeRabbit unresolved blocking findings"
+        run: |
+          set -euo pipefail
+          # Bootstrap (see the event-driven job): the trusted script is run from
+          # the default-branch checkout. Until this gate merges to the default
+          # branch the script is absent there, so the sweep has nothing to run —
+          # no-op rather than 127 for every open PR.
+          if [ ! -f scripts/coderabbit-severity-gate.sh ]; then
+            echo "::notice::coderabbit-severity-gate.sh is not on the default branch yet (bootstrap); sweep is a no-op until the gate merges."
+            exit 0
+          fi
+          had_infra_error=0
+          while IFS= read -r PR; do
+            [ -z "$PR" ] && continue
+            echo "::group::Sweep PR #$PR"
+
+            # Look up the PR's head SHA so the check_run lands on the
+            # branch-protection-relevant commit (NOT the schedule's
+            # default-branch HEAD).
+            head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
+            if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
+              echo "::warning::Could not resolve head SHA for PR #$PR; skipping"
+              echo "::endgroup::"
+              continue
+            fi
+
+            set +e
+            output=$(scripts/coderabbit-severity-gate.sh "$PR" "$REPO" 2>&1)
+            rc=$?
+            set -e
+            echo "$output"
+
+            case "$rc" in
+              0) conclusion="success" ;;
+              1) conclusion="failure" ;;
+              *)
+                echo "::error::coderabbit-severity-gate.sh rc=$rc on PR #$PR (config/usage error)"
+                had_infra_error=1
+                echo "::endgroup::"
+                continue
+                ;;
+            esac
+
+            # Truncate to stay under GitHub's 65535-char summary limit.
+            # Bash slice, NOT `printf | head -c`: under `set -euo pipefail`
+            # a >60KB output makes head close the pipe early, printf takes
+            # SIGPIPE (141), pipefail propagates it, and `summary=$(...)`
+            # aborts the sweep BEFORE the check_run POST — fail-open on the
+            # UI-resolve path this sweep exists to close. Slicing is
+            # pipefail-safe + char-based (same fix as codex-p1-gate.yml).
+            summary="${output:0:60000}"
+
+            # Posting the check_run IS the sweep's whole purpose — it's what
+            # supersedes the stale red required-check after a UI
+            # thread-resolve. If the POST fails, the sweep did not do its
+            # job; that's an infra error, not a warning.
+            if ! gh api -X POST "repos/$REPO/check-runs" \
+              -f name="$CHECK_NAME" \
+              -f head_sha="$head_sha" \
+              -f status="completed" \
+              -f conclusion="$conclusion" \
+              -f "output[title]=CodeRabbit severity gate (scheduled re-evaluation)" \
+              -f "output[summary]=$summary" \
+              >/dev/null; then
+              echo "::error::Failed to post check_run for PR #$PR — stale required check not refreshed."
+              had_infra_error=1
+            fi
+            echo "::endgroup::"
+          done <<<"$PRS"
+          if [ "$had_infra_error" -ne 0 ]; then
+            echo "::error::Sweep finished with one or more infra errors"
+            exit 1
+          fi

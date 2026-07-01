@@ -619,6 +619,13 @@ Phase 4b is invoked when Phase 4a escalates to disagreement or runaway, times ou
 
 **Auto-clear of `needs-external-review` on Phase 4b clearance.** The `auto-clear-blocking-labels.yml` workflow's gate-evaluation script (`scripts/codex-review-check.sh`) accepts a Phase 4b external reviewer's `APPROVED` on the current HEAD as gate (c) clearance equivalent to Codex (governed by `codex.allow_phase_4b_substitute` in `.github/review-policy.yml`, default `true`; #218). When `codex.enabled: false`, this Phase 4b substitute is the only gate-(c) clearance path; stray Codex bot reviews/reactions are ignored even if the GitHub App is still installed. The auto-clear workflow then removes `needs-external-review` on the next event-driven trigger or scheduled sweep — no human-driven label removal is needed on the Phase 4b happy path. Set the knob to `false` for repos that genuinely require Codex-only clearance (e.g., where the Codex App provides domain-specific checks no other reviewer matches).
 
+**Automated Phase 4b (reference implementation).** `scripts/phase-4b-review.sh` can drive the cross-agent Phase 4b review by shelling out to a reviewer CLI (Codex or Claude) under the operator's **subscription plan** (never a pay-per-token API key), then posting the resulting `APPROVED` / `CHANGES_REQUESTED` verdict under the reviewer PAT — the same Phase 4b substitute clearance described above. It ships **disabled** (`phase_4b_automation.enabled: false`), so behavior is unchanged until a repo opts in. Knobs live in the `phase_4b_automation` block of `.github/review-policy.yml`:
+
+- **Per-adapter timeout + effort (#589):** `adapter_timeout_seconds` (shared, integer in `[1, 3600]`, default `900`) with optional `codex_timeout_seconds` / `claude_timeout_seconds` overrides; `claude_effort` (`low|medium|high|xhigh|max`, default `medium`) and `codex_effort` (`minimal|low|medium|high|xhigh`, default the Codex CLI default). Codex and Claude can therefore be tuned without editing the adapter scripts. A missing, non-integer, or out-of-range value is rejected **fail-closed** (the orchestrator exits non-zero rather than running the CLI unbounded or with an invalid effort).
+- **Enablement evidence (#586):** before flipping `enabled: true`, run `scripts/phase-4b/collect-enablement-evidence.sh` in the environment that will post reviews to record `codex --version` / `claude --version`, per-adapter plan-auth status, a scan proving no disallowed API-key env vars are set, and an optional live dry-run. It exits non-zero when BLOCKED.
+
+Full detail (child-env credential isolation, verdict schema, dry-run) lives in [`scripts/phase-4b/README.md`](scripts/phase-4b/README.md).
+
 ### Phase 4b Triggers
 
 Phase 4b is documented above as a fallback (4a unavailable / escalates / times out). Per empirical evidence from matchline (#158: 9 PRs of the same author through both 4a and 4b — 4b caught 6+ real bugs on state-machine + concurrency + transactional changes that 4a cleared past), Phase 4b ALSO has high catch-rate value as a **first-class proactive gate** on a specific class of PR — not just as a fallback.
@@ -813,31 +820,49 @@ gates enforce **P1 only**. The default lives in the parser
 `.github/review-policy.yml` is not synced to consumers — the same
 default-on-absent posture as `phase_4b_default` and `propagation_prs`.
 
-### Enforcement (two symmetric gates — planned)
+### Enforcement (two symmetric gates)
 
-**Today, only Codex P1 is enforced at merge.** The blocking tier set resolved
-from this block *will be* enforced by two required-check gates that share
-`scripts/lib/feedback-policy-helpers.sh`:
+The blocking tier set resolved from this block is enforced by two
+required-check gates that share `scripts/lib/feedback-policy-helpers.sh`, so
+the two reviewers' blocking sets cannot drift apart:
 
 - **Codex** — `scripts/codex-p1-gate.sh` (required check `Codex P1 Gate /
-  Codex P1 unresolved threads`), gated by `codex.p1_gate.enabled`. Enforces
-  Codex **P1 only** today; generalized to the resolved `required` tier set in
-  #577.
+  Codex P1 unresolved threads`), gated by `codex.p1_gate.enabled`. It
+  classifies each Codex inline finding with `codex_tier_of` and blocks merge
+  on any unresolved thread whose tier is in the resolved `required` set. The
+  required-check **name is unchanged** (branch protection depends on it) even
+  though the gate now spans the full tier set rather than only P1.
 - **CodeRabbit** — `scripts/coderabbit-severity-gate.sh` (required check
   `CodeRabbit Severity Gate / CodeRabbit unresolved blocking findings`), gated
-  by `coderabbit.severity_gate.enabled`. **New in #577** (does not exist yet).
+  by `coderabbit.severity_gate.enabled`. It classifies each CodeRabbit inline
+  finding with `coderabbit_tier_of` and blocks on the same `required`-tier
+  set. Default `false` everywhere (today CodeRabbit has no gate) — a clean
+  no-op when off, so it is safe to add to required checks ahead of enabling.
 
-> **Rollout note (#574).** Sub-issue #576 ships the schema above and the
-> shared parser/classifier library **only** — it changes no enforcement.
-> Generalizing `codex-p1-gate.sh` beyond P1 and adding
-> `coderabbit-severity-gate.sh` (so `required` tiers actually block) lands in
-> sub-issue #577. Until then, `feedback_policy` is documentary and the gates
-> behave as before (Codex P1 only).
+Both gates clear a finding the same way: **resolve the thread** (the GitHub
+UI "Resolve conversation" button or the `resolveReviewThread` mutation) once
+it is fixed or rebutted. An absent `feedback_policy` block resolves to `{p1}`,
+so the Codex gate stays byte-identical to its pre-#574 P1-only behavior.
+
+The same tier resolution also drives the **agent-facing surfacing** (advisory,
+never merge-blocking): `scripts/codex-review-request.sh` tags each emitted
+finding with `blocking: true|false`, and `scripts/coderabbit-wait.sh` reports
+a `blocking_tier_unresolved` count in its JSON when the block is present.
+
+> **Rollout note (#574).** Sub-issue #576 shipped the schema above and the
+> shared parser/classifier library. Sub-issue #577 makes the gates **act**:
+> `codex-p1-gate.sh` is generalized beyond P1 and `coderabbit-severity-gate.sh`
+> is added, both honoring the resolved `required` tiers, plus the agent-facing
+> `blocking` surfacing above. `feedback_policy` is therefore now enforced, not
+> just documentary (an absent block still reproduces the prior Codex-P1-only
+> behavior exactly).
 
 > **CodeRabbit profile dependency.** `nitpick: required` only has teeth when
 > `.coderabbit.yml` uses `reviews.profile: assertive`; the shipped `chill`
 > profile suppresses the 🧹 Nitpick category entirely, so the requirement is a
-> no-op there. See [`docs/agents/coderabbit-audit.md`](docs/agents/coderabbit-audit.md).
+> no-op there. `coderabbit-severity-gate.sh` emits a non-fatal warning when it
+> sees `nitpick: required` under a chill profile. See
+> [`docs/agents/coderabbit-audit.md`](docs/agents/coderabbit-audit.md).
 
 ## Handoff Message Format
 
@@ -998,7 +1023,8 @@ Each repo using this template must mark these as required on `main` (Settings �
 
 - **`Label Gate`** — fails when any of `needs-external-review`, `needs-human-review`, `policy-violation`, or `human-hold` is on the PR. The hard gate behind the doctrine in [Agent prohibitions](#agent-prohibitions). Those four are its **complete** blocking set. The `decision-needed` label is deliberately **not** in it: `decision-needed` is an issue-triage marker (an issue awaiting a human decision before work proceeds), not a PR merge-stop, so applying it to a PR does **not** block merge. To freeze a PR pending a human decision, use `human-hold` (or `needs-human-review` for an agent-disagreement hold). This resolves the contradiction in #496, where `decision-needed`'s label description implied a merge block the gate never enforced.
 - **`Self-Review Required`** — fails when the PR body lacks a `## Self-Review` section (Dependabot-exempt).
-- **`Codex P1 unresolved threads`** — fails when any Codex P1 inline-finding thread on the current HEAD is unresolved (`codex.p1_gate.enabled`, #235). A no-op (always green) when the knob is off, so it is safe to require everywhere.
+- **`Codex P1 unresolved threads`** — fails when any Codex inline-finding thread on the current HEAD whose tier is in the resolved `feedback_policy` `required` set is unresolved (`codex.p1_gate.enabled`, #235; generalized beyond P1 in #577 — the check **name is unchanged** for branch-protection stability). A no-op (always green) when the knob is off, so it is safe to require everywhere.
+- **`CodeRabbit unresolved blocking findings`** — the CodeRabbit twin of the Codex gate: fails when any CodeRabbit inline-finding thread on the current HEAD whose mapped tier is in the resolved `required` set is unresolved (`coderabbit.severity_gate.enabled`, #574/#577). A no-op (always green) when the knob is off — default `false` everywhere — so it is safe to require everywhere ahead of enabling it per repo.
 - **`Merge clearance gate`** — the HEAD-pinned, merge-time enforcement of clearance (#427/#428). Fails when a Dependabot PR has no reviewer-identity `APPROVED` review on the current HEAD (`dependabot.reviewer_gate.enabled`), or when a `needs-external-review` PR is not cleared on the current HEAD by `scripts/codex-review-check.sh` (`codex.external_review_gate.enabled`). It re-evaluates on every push (and via a scheduled sweep for no-event transitions), so a clearance recorded on an earlier HEAD — or an approval dismissed by a rebase push — cannot ride a new HEAD to merge. This closes the two escapes that previously surfaced only in the weekly retroactive audit: a Dependabot dev-deps bump merged with no approval on HEAD (matchline#245), and an external-review PR merged on a HEAD with no `APPROVED` CLI review and no Codex review (nathanpaynedotcom#405). A no-op (always green) when both knobs are off. **Caveat:** a required check is bypassable by an admin "merge without waiting for requirements"; both escapes were admin merges, so pair this with branch-protection `enforce_admins: true` to fully close the human-merge path.
 
 Audit a repo's branch protection with `scripts/audit-branch-protection.sh` (read-only; exits 3 if any canonical check is not required, with a fix recipe). Re-run after every protection change.

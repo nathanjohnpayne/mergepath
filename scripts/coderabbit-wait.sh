@@ -117,6 +117,14 @@
 #       "body_excerpt": "<first 200 chars>"
 #     },
 #     "potential_issue_count": N,
+#     # blocking_tier_unresolved (#577): count of unaddressed inline HEAD
+#     # findings whose coderabbit_tier_of tier is in the resolved
+#     # feedback_policy required set. null when the feedback_policy block is
+#     # ABSENT (preserving the historical shape + exit-code contract) or on
+#     # any non-findings/cleared terminal. Report-only — it never affects the
+#     # exit code; the merge-blocking CodeRabbit gate is
+#     # scripts/coderabbit-severity-gate.sh.
+#     "blocking_tier_unresolved": null | N,
 #     "rate_limit_retries": N,
 #     "resume_retries": N,
 #     "status_probe": {
@@ -405,6 +413,50 @@ RATE_LIMIT_BUFFER_SECONDS=30
 # flip latency (seconds) yet below its minutes-long rate-limit windows, so the
 # #595 false success is caught while a real recovery review still clears.
 STATUS_SUCCESS_GRACE_SECONDS=120
+
+# --- tier-aware classification (#577) ---------------------------------------
+# Additive tier-awareness layered ON TOP of the existing binary
+# `Potential issue`/⚠️ detector — it NEVER replaces the exit-code fast-paths
+# below (HEAD-anchoring, rate-limit, auto-pause). When the feedback_policy
+# block is PRESENT, this surfaces a `blocking_tier_unresolved` count (findings
+# on HEAD whose coderabbit_tier_of tier is in the resolved required set) in
+# the emitted JSON. When the block is ABSENT — or the shared lib is not on
+# disk (some test harnesses stage this script without scripts/lib) —
+# BLOCKING_TIER_UNRESOLVED stays `null` and the exit-code contract is
+# byte-identical to before. Guarded source, same posture as the preflight
+# helpers above: surfacing is best-effort, not a gate.
+#
+# NOTE: the merge-BLOCKING CodeRabbit gate is scripts/coderabbit-severity-gate.sh
+# (a required check); this helper only REPORTS the count so the authoring
+# agent can prioritize, mirroring codex-review-request.sh's per-finding
+# `blocking` flag. It does not itself block.
+BLOCKING_TIER_UNRESOLVED="null"
+FEEDBACK_POLICY_PRESENT=false
+if [ -f "$CONFIG" ] && grep -qE '^feedback_policy:' "$CONFIG" \
+    && [ -r "$__CODERABBIT_WAIT_DIR/lib/feedback-policy-helpers.sh" ]; then
+  # shellcheck source=lib/feedback-policy-helpers.sh
+  . "$__CODERABBIT_WAIT_DIR/lib/feedback-policy-helpers.sh"
+  set +e
+  __CRW_REQUIRED_TIERS=$(resolve_required_tiers "$CONFIG")
+  __CRW_RT_RC=$?
+  set -e
+  if [ "$__CRW_RT_RC" -eq 2 ]; then
+    echo "ERROR: malformed feedback_policy block in $CONFIG (resolve_required_tiers exit 2)" >&2
+    exit 3
+  fi
+  FEEDBACK_POLICY_PRESENT=true
+fi
+
+# Return 0 iff $1 (a tier like p0..p3|nitpick) is in the resolved set.
+# Only meaningful when FEEDBACK_POLICY_PRESENT=true.
+crw_tier_is_required() {
+  local needle=$1 t
+  [ -n "$needle" ] || return 1
+  while IFS= read -r t; do
+    [ "$t" = "$needle" ] && return 0
+  done <<< "${__CRW_REQUIRED_TIERS:-}"
+  return 1
+}
 
 # #489: CodeRabbit→Codex rate-limit failover. When CodeRabbit posts a
 # rate-limit notice, request `@codex review` once so the PR advances via the
@@ -865,6 +917,72 @@ count_potential_issues() {
       | select(.id as $id | ($addressed_root_ids | index($id)) == null)
     ] | length
   '
+}
+
+# Count unaddressed inline findings on HEAD whose coderabbit_tier_of tier is
+# in the resolved required set (#577). Tier-aware sibling of
+# count_potential_issues: SAME latest-review-on-HEAD + review_comment_addressed
+# scoping, but stage 1 (jq) emits the candidate finding BODIES and stage 2
+# (bash) classifies each with the shared coderabbit_tier_of and keeps only
+# required-tier ones — reusing the classifier rather than re-implementing its
+# heuristic in jq. Additive/advisory only: the return value populates the
+# JSON's blocking_tier_unresolved and NEVER feeds an exit code. Guarded by
+# FEEDBACK_POLICY_PRESENT at the single call site, so it never runs (and the
+# lib functions are never referenced) when the block is absent.
+count_blocking_tier_issues() {
+  local reviews pulls_comments latest_review_id candidates cand_count blocking body tier i
+  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
+  latest_review_id=$(echo "$reviews" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" --arg head_sha "$HEAD_SHA" '
+    [ .[]
+      | select(.user.login == $bot)
+      | select(.submitted_at >= $after)
+      | select(.commit_id == $head_sha)
+    ]
+    | sort_by(.submitted_at) | last
+    | if . == null then null else .id end
+  ')
+
+  if [ -z "$latest_review_id" ] || [ "$latest_review_id" = "null" ]; then
+    echo "0"
+    return
+  fi
+
+  pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
+  # Stage 1: same addressed-root exclusion + latest-review scoping as
+  # count_potential_issues, but emit each candidate's body (NOT a count) so
+  # stage 2 can tier-classify. We keep the `Potential issue|⚠️` prefilter OFF
+  # here on purpose: coderabbit_tier_of also grades 🧹 Nitpick / Refactor
+  # findings, which a required nitpick/p2 tier must be able to catch.
+  candidates=$(echo "$pulls_comments" | jq -c \
+    --arg bot "$BOT_LOGIN" \
+    --argjson review_id "$latest_review_id" '
+    [ .[]
+      | select(.user.login == $bot)
+      | select(.in_reply_to_id != null)
+      | select((.body // "") | test("review_comment_addressed"; "i"))
+      | .in_reply_to_id
+    ] as $addressed_root_ids
+    | [ .[]
+      | select(.user.login == $bot)
+      | select(.pull_request_review_id == $review_id)
+      | select(.in_reply_to_id == null)
+      | select(.id as $id | ($addressed_root_ids | index($id)) == null)
+      | (.body // "")
+    ]
+  ')
+
+  blocking=0
+  cand_count=$(echo "$candidates" | jq 'length')
+  i=0
+  while [ "$i" -lt "$cand_count" ]; do
+    body=$(echo "$candidates" | jq -r ".[$i]")
+    tier=$(coderabbit_tier_of "$body")
+    if crw_tier_is_required "$tier"; then
+      blocking=$((blocking + 1))
+    fi
+    i=$((i + 1))
+  done
+  echo "$blocking"
 }
 
 # Returns 0 (true) if the latest PR-level CodeRabbit SUMMARY comment body
@@ -1358,6 +1476,34 @@ emit_json_and_exit() {
     skip_reason_json="null"
   fi
 
+  # blocking_tier_unresolved (#577): lazily compute the required-tier finding
+  # count ONLY when the feedback_policy block is present AND this is a
+  # findings-relevant terminal (`findings` / `cleared`) — the statuses where
+  # inline HEAD findings are meaningful and API access is in play. Every other
+  # terminal (timeout / rate_limit_stalled / paused / skip / config error)
+  # leaves it null, so no extra API calls are made on those paths and the
+  # historical JSON shape is unchanged except for one additive null field.
+  # This never affects $exit_code — the value is report-only.
+  if [ "$FEEDBACK_POLICY_PRESENT" = true ] && [ "$BLOCKING_TIER_UNRESOLVED" = "null" ]; then
+    case "$status" in
+      findings|cleared)
+        # Guard the advisory decoration so it can NEVER flip the terminal exit
+        # code or break the JSON emit (nathanpayne-codex P2 on #590). Two
+        # layers: `|| true` stops a die inside count_blocking_tier_issues from
+        # aborting under set -e, and the numeric-or-null validation forces a
+        # value the downstream `jq --argjson` accepts. The earlier `$(...) ||
+        # VAR=null` was insufficient: when an internal fetch_api_array dies,
+        # count_blocking_tier_issues can exit 0 with EMPTY output, so the `||`
+        # never fired and the empty value broke `jq --argjson` — a hard failure
+        # on an otherwise-terminal path. Validation catches empty/non-numeric.
+        BLOCKING_TIER_UNRESOLVED=$(count_blocking_tier_issues 2>/dev/null || true)
+        case "$BLOCKING_TIER_UNRESOLVED" in
+          ''|*[!0-9]*) BLOCKING_TIER_UNRESOLVED=null ;;
+        esac
+        ;;
+    esac
+  fi
+
   jq -n \
     --argjson pr_number "$PR_NUMBER" \
     --arg repo "$REPO" \
@@ -1368,6 +1514,7 @@ emit_json_and_exit() {
     --argjson skip_reason "$skip_reason_json" \
     --argjson review "$review_json" \
     --argjson potential_issue_count "$potential_issues" \
+    --argjson blocking_tier_unresolved "$BLOCKING_TIER_UNRESOLVED" \
     --argjson rate_limit_retries "$RATE_LIMIT_RETRIES" \
     --argjson resume_retries "$RESUME_RETRIES" \
     --argjson status_probe "$STATUS_PROBE_JSON" \
@@ -1383,6 +1530,7 @@ emit_json_and_exit() {
       skip_reason: $skip_reason,
       review: $review,
       potential_issue_count: $potential_issue_count,
+      blocking_tier_unresolved: $blocking_tier_unresolved,
       rate_limit_retries: $rate_limit_retries,
       resume_retries: $resume_retries,
       status_probe: $status_probe,
