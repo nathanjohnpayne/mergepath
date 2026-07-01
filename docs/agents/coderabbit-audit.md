@@ -64,8 +64,9 @@ repo only; consumers may set `assertive` locally.
 > `profile: assertive` — under `chill` the 🧹 Nitpick category is suppressed,
 > so no nitpick threads exist and `nitpick: required` is a **silent no-op**. A
 > repo that genuinely wants nitpicks gated must set `assertive` here as well.
-> The #577 CodeRabbit severity gate emits a warning when it detects
-> `nitpick: required` while the profile is `chill`.
+> (Planned, not yet shipped: when the #577 CodeRabbit severity gate lands it
+> will emit a warning on `nitpick: required` under the `chill` profile. #576
+> ships the schema + docs only — no gate yet.)
 
 ### `auto_incremental_review: true` — pinned explicitly (config change)
 
