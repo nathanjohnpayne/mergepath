@@ -813,16 +813,19 @@ gates enforce **P1 only**. The default lives in the parser
 `.github/review-policy.yml` is not synced to consumers — the same
 default-on-absent posture as `phase_4b_default` and `propagation_prs`.
 
-### Enforcement (two symmetric gates)
+### Enforcement (two symmetric gates — planned)
 
-The blocking tier set resolved from this block is enforced by two
-required-check gates that share `scripts/lib/feedback-policy-helpers.sh`:
+**Today, only Codex P1 is enforced at merge.** The blocking tier set resolved
+from this block *will be* enforced by two required-check gates that share
+`scripts/lib/feedback-policy-helpers.sh`:
 
 - **Codex** — `scripts/codex-p1-gate.sh` (required check `Codex P1 Gate /
-  Codex P1 unresolved threads`), gated by `codex.p1_gate.enabled`.
+  Codex P1 unresolved threads`), gated by `codex.p1_gate.enabled`. Enforces
+  Codex **P1 only** today; generalized to the resolved `required` tier set in
+  #577.
 - **CodeRabbit** — `scripts/coderabbit-severity-gate.sh` (required check
   `CodeRabbit Severity Gate / CodeRabbit unresolved blocking findings`), gated
-  by `coderabbit.severity_gate.enabled`.
+  by `coderabbit.severity_gate.enabled`. **New in #577** (does not exist yet).
 
 > **Rollout note (#574).** Sub-issue #576 ships the schema above and the
 > shared parser/classifier library **only** — it changes no enforcement.

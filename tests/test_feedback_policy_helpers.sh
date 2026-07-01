@@ -160,6 +160,8 @@ eq "p2" "$(codex_tier_of '![P2 Badge]')"                         "codex_tier_of:
 eq "p3" "$(codex_tier_of '![P3 Badge]')"                         "codex_tier_of: P3 badge"
 eq "p1" "$(codex_tier_of '**P1**: stop retrying endlessly')"     "codex_tier_of: text fallback **P1"
 eq ""   "$(codex_tier_of 'just a normal comment')"               "codex_tier_of: none -> empty"
+eq "p1" "$(codex_tier_of 'first ![P1 Badge] then later ![P2 Badge]')" "codex_tier_of: first badge wins over later (#581 4b F3)"
+eq "p1" "$(codex_tier_of '**P1** first, then **P3** later')"          "codex_tier_of: first text marker wins over later (#581 4b F3)"
 
 # --- coderabbit_tier_of ----------------------------------------------------
 eq "nitpick" "$(coderabbit_tier_of '🧹 Nitpick: rename this var')"                         "cr_tier_of: nitpick"
@@ -170,6 +172,9 @@ eq "p2"      "$(coderabbit_tier_of '_📐 Maintainability_ | _🟡 Minor_: renam
 eq "p3"      "$(coderabbit_tier_of '_🔵 Trivial issue_: cosmetic tweak')"                   "cr_tier_of: trivial -> p3 (#581 r2)"
 eq ""        "$(coderabbit_tier_of '🛠️ Refactor suggestion to extract a security helper')" "cr_tier_of: refactor + security-in-prose -> empty (no severity badge; #581 r2)"
 eq ""        "$(coderabbit_tier_of '📝 Note: verified the change')"                         "cr_tier_of: plain note -> empty"
+eq ""        "$(coderabbit_tier_of 'This is a Minor cleanup note, not a CodeRabbit badge.')" "cr_tier_of: bare titlecase Minor prose -> empty (#581 4b F2)"
+eq ""        "$(coderabbit_tier_of 'This is Trivial, no finding badge.')"                    "cr_tier_of: bare titlecase Trivial prose -> empty (#581 4b F2)"
+eq "p2"      "$(coderabbit_tier_of '_📐 Maintainability_ | _🟡 Minor_: This cleanup is Trivial but visible')" "cr_tier_of: Minor badge beats Trivial-in-prose -> p2 (#581 4b F2)"
 
 # ---------------------------------------------------------------------------
 echo

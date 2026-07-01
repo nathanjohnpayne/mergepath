@@ -102,51 +102,49 @@ resolve_required_tiers() {
 }
 
 # Map a Codex finding body to a tier, or empty if it carries no Codex priority
-# marker. EXACT match: the badge image `![P0 Badge]`..`![P3 Badge]` (the form
-# scripts/codex-p1-gate.sh and scripts/codex-record-feedback.sh already parse),
-# then the text fallback `**P0`..`**P3` Codex emits when the badge image is
-# absent. First marker wins.
+# marker. Matches the badge image `![P0 Badge]`..`![P3 Badge]` (the form
+# scripts/codex-p1-gate.sh and scripts/codex-record-feedback.sh already parse)
+# and the text fallback `**P0`..`**P3` Codex emits when the badge image is
+# absent. The FIRST marker in document order wins across BOTH forms — a
+# blocking P1 must not be downgraded by a later P2/P3 in quoted/example text
+# (nathanpayne-codex Phase 4b on #581). grep -oE emits matches in position
+# order; head -n1 takes the earliest.
 codex_tier_of() {
   local body=${1:-} n
-  n=$(printf '%s' "$body" | sed -nE 's/.*\!\[P([0-3]) Badge\].*/\1/p' | head -n1)
-  [ -z "$n" ] && n=$(printf '%s' "$body" | sed -nE 's/.*\*\*P([0-3]).*/\1/p' | head -n1)
+  n=$(printf '%s' "$body" | grep -oE '!\[P[0-3] Badge\]|\*\*P[0-3]' | head -n1 | sed -E 's/.*P([0-3]).*/\1/')
   [ -n "$n" ] && echo "p$n"
   return 0
 }
 
 # Map a CodeRabbit finding body to a tier, or empty if it is not a gradeable
-# finding (a plain Note / verification comment). HEURISTIC: CodeRabbit has no
-# numeric scale, so we read its category marker plus an optional
-# Critical/Major/Minor qualifier (see REVIEW_POLICY.md § Feedback Disposition
-# Policy mapping table). Best-effort — the #577 gate validates this against
-# real CodeRabbit fixtures and may refine it.
+# finding (a plain Note / prose comment). CodeRabbit has no numeric scale, so
+# we read its category/severity MARKERS.
 #
-# This MIRRORS classify_severity in scripts/lib/daily-feedback-rollup-helpers.sh
-# — the repo's canonical CodeRabbit badge parser — kept as a separate mapping to
-# avoid cross-lib coupling (a future refactor may extract one shared severity
-# module). Anchored on the first 600 chars (the badge sits near the top; deeper
-# prose must not false-match) and ordered highest-confidence first.
+# Derived from classify_severity in scripts/lib/daily-feedback-rollup-helpers.sh
+# (the repo's canonical CodeRabbit badge parser) but STRICTER: it matches ONLY
+# the actual markers — the emoji badges and the distinctive "Potential issue" /
+# "Outside diff range" category phrases — and DROPS classify_severity's
+# bare-titlecase fallbacks. A bare `Minor`/`Trivial`/`Nitpick` word in plain
+# prose must NOT be classified, per this helper's contract that unknown/
+# plain-note shapes stay unclassified (nathanpayne-codex Phase 4b P1 on #581: a
+# bare-word match would let the #577 gate block/clear the wrong tier, and a
+# Minor badge whose prose says "Trivial" must stay p2). Anchored on the first
+# 600 chars (the marker sits near the top), ordered highest-confidence first.
 #
-# CodeRabbit canonical badges → tier:
-#   🟠 Major / Potential issue / ⚠️  → p1   (CodeRabbit's top severity; p0 is
-#                                            Codex-only, so CodeRabbit never maps
-#                                            to p0 — matches classify_severity)
+# CodeRabbit markers → tier (p0 is Codex-only; CodeRabbit never maps to p0):
+#   🟠 Major / Potential issue / ⚠️  → p1
 #   🧹 Nitpick                       → nitpick
 #   🔵 Trivial / Outside diff range  → p3
 #   🟡 Minor                         → p2
-# Anything else (Refactor suggestion, plain Note, a stray "security" mention in
-# prose) is unclassified → empty. Keying off the badge, NOT prose keywords, is
-# deliberate: a refactor whose text mentions "security" must not escalate to p0
-# (Codex P2 #581 r2), and a Major finding whose prose says "minor" must not
-# downgrade (Codex P2 #581 r1).
+# Anything else (Refactor suggestion, plain Note, bare titlecase prose) → empty.
 coderabbit_tier_of() {
   local head
   head=$(printf '%s' "${1:-}" | head -c 600)
   case "$head" in
-    *"🟠 Major"*|*"Potential issue"*|*"⚠️"*)          echo p1; return 0 ;;
-    *"🧹 Nitpick"*|*Nitpick*)                          echo nitpick; return 0 ;;
-    *"🔵 Trivial"*|*Trivial*|*"Outside diff range"*)   echo p3; return 0 ;;
-    *"🟡 Minor"*|*Minor*)                              echo p2; return 0 ;;
+    *"🟠 Major"*|*"Potential issue"*|*"⚠️"*)  echo p1; return 0 ;;
+    *"🧹 Nitpick"*)                            echo nitpick; return 0 ;;
+    *"🔵 Trivial"*|*"Outside diff range"*)     echo p3; return 0 ;;
+    *"🟡 Minor"*)                              echo p2; return 0 ;;
   esac
   return 0
 }

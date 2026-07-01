@@ -502,55 +502,6 @@ codex:
     enabled: true
 
 # ---------------------------------------------------------------------------
-# Feedback disposition policy (#574)
-# ---------------------------------------------------------------------------
-# Controls WHICH bot-review findings the authoring agent must disposition
-# (fix the code, OR post a rebuttal reply explaining why it does not apply —
-# and then resolve the thread) before merge. Spans BOTH reviewers via one
-# normalized severity ladder: Codex maps exactly from its ![P0–P3 Badge]
-# markers; CodeRabbit maps heuristically from its ⚠️ Potential issue /
-# 🧹 Nitpick / Refactor categories (+ Critical/Major/Minor). See
-# REVIEW_POLICY.md § Feedback Disposition Policy and
-# scripts/lib/feedback-policy-helpers.sh.
-#
-# This governs DISPOSITION REQUIREMENTS only — not who reviews
-# (codex:/coderabbit:/available_reviewers:) nor the external-review threshold.
-#
-# Default-on-absent (lives in the parser, not just this file, because
-# review-policy.yml is not synced to consumers — same posture as
-# phase_4b_default / propagation_prs): an ABSENT block reproduces today's
-# behavior exactly — disposition defaults of p0/p1 required, p2/p3/nitpick
-# discretionary, and the merge gates enforce P1 only.
-#
-# NOTE: the gates that ACT on this block (the generalized codex.p1_gate and
-# the new coderabbit.severity_gate) land in #577. In #576 this block is the
-# schema + shared parser only; setting it here is inert until #577 wires it.
-feedback_policy:
-  # by-priority → consult the per-tier `priorities:` map below (DEFAULT).
-  # address-all → EVERY finding at EVERY tier must be fixed-or-rebutted and its
-  #               thread resolved before merge; the `priorities:` map is
-  #               ignored. ("Address or rebut all feedback.")
-  mode: by-priority
-
-  # Per-tier disposition requirement (mode: by-priority only). Tiers:
-  #   p0,p1,p2,p3 ← Codex badges ![P0 Badge]…![P3 Badge]
-  #   nitpick     ← CodeRabbit 🧹 Nitpick (distinct tier; Codex P3 maps to p3, not nitpick)
-  # Values:
-  #   required      → must fix-or-rebut AND resolve; merge-blocking (via gate).
-  #   discretionary → agent's judgment; never blocks (today's P2/P3 behavior).
-  #   ignore        → never surfaced as an action item.
-  #
-  # NOTE: nitpick gating only has teeth when .coderabbit.yml uses
-  # reviews.profile: assertive — the shipped `chill` profile suppresses the
-  # 🧹 Nitpick category entirely, so `nitpick: required` is a no-op there.
-  priorities:
-    p0: required
-    p1: required
-    p2: discretionary
-    p3: discretionary
-    nitpick: discretionary
-
-# ---------------------------------------------------------------------------
 # Dependabot reviewer-approval merge gate (#427)
 # ---------------------------------------------------------------------------
 # When reviewer_gate.enabled is true, scripts/merge-clearance-gate.sh runs
