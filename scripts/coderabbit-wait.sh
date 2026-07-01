@@ -468,6 +468,18 @@ CODEX_REQUEST_CMD="${CODERABBIT_WAIT_CODEX_REQUEST_CMD:-$__CODERABBIT_WAIT_DIR/c
 # (cf. the `rate limited by coderabbit.ai` marker on the same surface).
 PAUSED_MARKER='review paused by coderabbit.ai'
 
+# Stable marker CodeRabbit wraps its rate-limit notice in, on the same
+# auto-generated surface as PAUSED_MARKER. Keyed on directly because the
+# user-facing prose is NOT versioned and has already drifted: the original
+# notice (#138) read "Rate limit exceeded" / "Please wait X minutes and Y
+# seconds", but CodeRabbit's adaptive "Fair Usage Limits" variant reads
+# "Review limit reached" / "Next review available in: N minutes" — matching
+# NONE of the old text patterns. The HTML-comment marker is identical across
+# both, so classify_comment() keys on it first (see #593: a drifted notice
+# misclassified as a clean `review` false-cleared the gate and merged #591
+# with no CodeRabbit review).
+RATE_LIMIT_MARKER='rate limited by coderabbit.ai'
+
 # CodeRabbit emits two distinct per-SHA signals:
 #   1. Narrative review comment (issue/PR comment + inline diff comments).
 #      The freshness-anchored polling loop watches for this. Posted only
@@ -717,6 +729,24 @@ parse_rate_limit_window() {
     echo "$total"
     return 0
   fi
+  # Adaptive "Fair Usage Limits" variant (#593): "Next review available in:
+  # **N minutes**" (or "... N seconds"). CodeRabbit wraps the label and value
+  # in markdown bold, so the star/space run between them varies — [* ]* absorbs
+  # it. Held in a variable and matched unquoted so the literal spaces are part
+  # of the regex, not shell word-split (bash 3.2 safe).
+  local re_next_min='[Nn]ext review available in:[* ]*([0-9]+)[* ]*minutes?'
+  if [[ "$body" =~ $re_next_min ]]; then
+    mins=${BASH_REMATCH[1]}
+    total=$((mins * 60))
+    echo "$total"
+    return 0
+  fi
+  local re_next_sec='[Nn]ext review available in:[* ]*([0-9]+)[* ]*seconds?'
+  if [[ "$body" =~ $re_next_sec ]]; then
+    secs=${BASH_REMATCH[1]}
+    echo "$secs"
+    return 0
+  fi
   return 1
 }
 
@@ -724,6 +754,17 @@ parse_rate_limit_window() {
 #   rate_limit | paused | in_progress | status_probe | review
 classify_comment() {
   local body=$1
+  # #593: key on the stable auto-generated marker FIRST, before any prose
+  # match, so a rate-limit notice is recognized regardless of CodeRabbit's
+  # user-facing wording ("Rate limit exceeded" vs "Review limit reached" /
+  # "Fair Usage Limits"). Fixed-string grep (-F) so the literal dots in
+  # "coderabbit.ai" are not treated as regex wildcards, mirroring PAUSED_MARKER.
+  if printf '%s' "$body" | grep -Fqi "$RATE_LIMIT_MARKER"; then
+    echo "rate_limit"
+    return
+  fi
+  # Legacy prose fallback: the original notice text, retained so a notice that
+  # somehow lacks the marker (or an older cached body) still classifies.
   if echo "$body" | grep -qiE 'rate[- ]limit exceeded'; then
     echo "rate_limit"
     return
