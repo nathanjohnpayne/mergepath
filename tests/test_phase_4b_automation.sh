@@ -617,6 +617,20 @@ if [ "$rc" = 5 ] && [ "$(printf '%s' "$out" | jq -r '.skipped')" = "true" ]; the
   pass "automation disabled → exit 5, skipped"
 else fail "disabled path (rc=$rc, out=$out)"; fi
 
+PREFLIGHT_TRAP_DIR="$WORK/preflight-trap"
+mkdir -p "$PREFLIGHT_TRAP_DIR"
+cat > "$PREFLIGHT_TRAP_DIR/op-preflight-codex.env" <<EOF
+OP_PREFLIGHT_CREATED_AT_EPOCH='$(date +%s)'
+echo PREFLIGHT_SHOULD_NOT_SOURCE >&2
+exit 97
+EOF
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_OFF" OP_PREFLIGHT_CACHE_DIR="$PREFLIGHT_TRAP_DIR" MERGEPATH_AGENT=codex bash "$ORCH" 123 --repo o/r 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 5 ] && [ "$(printf '%s' "$out" | jq -r '.skipped')" = "true" ]; then
+  pass "automation disabled does not source reviewer preflight"
+else fail "disabled path sourced preflight or failed unexpectedly (rc=$rc, out=$out)"; fi
+
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_OFF" PATH="$NO_JQ_DIR:$PATH" bash "$ORCH" 123 --repo o/r 2>/dev/null)"; rc=$?
 set -e

@@ -50,15 +50,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=phase-4b/lib.sh
 . "$ROOT/phase-4b/lib.sh"
 
-# Auto-source the op-preflight reviewer PAT when GH_TOKEN is unset (#282),
-# mirroring the sibling helpers. Read-only-plus-one-review scope = reviewer.
-if [ -r "$ROOT/lib/preflight-helpers.sh" ]; then
-  # shellcheck source=lib/preflight-helpers.sh
-  . "$ROOT/lib/preflight-helpers.sh"
-  preflight_require_token reviewer || true
-  load_preflight_env_vars
-fi
-
 ADAPTER_DIR="$ROOT/phase-4b/adapters"
 HANDOFF="${P4B_HANDOFF:-$ROOT/post-phase-4b-handoff.sh}"
 GH_AS_REVIEWER="${P4B_GH_AS_REVIEWER:-$ROOT/gh-as-reviewer.sh}"
@@ -121,6 +112,16 @@ if [ "$MODE" != "local" ]; then
 fi
 
 command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
+
+# Auto-source the op-preflight reviewer PAT only after the disabled/mode checks.
+# The default disabled path must stay credential-free and exit 5 without
+# touching 1Password/GitHub auth state.
+if [ -r "$ROOT/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=lib/preflight-helpers.sh
+  . "$ROOT/lib/preflight-helpers.sh"
+  preflight_require_token reviewer || true
+  load_preflight_env_vars
+fi
 
 # --- resolve repo / head / author ------------------------------------------
 need_gh() { command -v gh >/dev/null 2>&1 || p4b_die 3 "gh is required for this path (or pass the matching override flag)"; }
