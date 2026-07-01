@@ -26,9 +26,9 @@
 #   7. Local branch whose PR merged but whose local tip DIVERGED from the
 #      merged PR head via an extra commit on top (e.g. a routine
 #      `git merge main`). Under the #605 name-based detection this is now
-#      treated as safe to delete — the branch's PR merged; the extra local
-#      commit is not a reason to keep it — and the divergence is surfaced
-#      with a CLEAR "local tip diverged" log line rather than a silent skip.
+#      SURFACED for manual review and KEPT — never auto-deleted, because the
+#      extra commit(s) may be unmerged follow-up work (Codex P1) — under a
+#      clear "review manually, keeping" record rather than a silent skip.
 #   8. #605 same-run re-snapshot: a gone-upstream worktree removed by the
 #      worktree-removal pass, whose branch ALSO has a merged PR, must become
 #      eligible for `git branch -D` in the SAME --apply invocation (the
