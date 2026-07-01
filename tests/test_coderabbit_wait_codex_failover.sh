@@ -29,12 +29,37 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
-# make_case <name> <max_wait> <max_retries> <failover>
+# Rate-limit comment bodies served by the gh stub. OLD is the original #138
+# prose (no marker) — exercises classify_comment's legacy text fallback. NEW is
+# CodeRabbit's adaptive "Fair Usage Limits" variant (#593 / observed on #591):
+# the stable `rate limited by coderabbit.ai` marker + "Review limit reached"
+# prose + a "Next review available in: **13 minutes**" window — none of which
+# match the old text patterns. Before #593 this NEW body misclassified as a
+# clean `review` and the script false-cleared (exit 0), merging #591 unreviewed.
+OLD_RATE_LIMIT_BODY='Rate limit exceeded. Please wait 10 seconds before requesting another review.'
+NEW_RATE_LIMIT_BODY='<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->
+
+> [!WARNING]
+> ## Review limit reached
+>
+> You have reached a temporary PR review limit under our Fair Usage Limits Policy.
+>
+> **Next review available in:** **13 minutes**
+
+<!-- end of auto-generated comment: rate limited by coderabbit.ai -->'
+
+# make_case <name> <max_wait> <max_retries> <failover> [rate_limit_body]
+#   rate_limit_body defaults to the OLD format; pass NEW_RATE_LIMIT_BODY to
+#   exercise the adaptive-limit variant.
 make_case() {
   local name=$1 max_wait=$2 max_retries=$3 failover=$4
+  local rate_limit_body=${5:-$OLD_RATE_LIMIT_BODY}
   local dir="$WORKDIR/$name"
 
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
+  # The gh stub reads the served rate-limit comment body from here so a case
+  # can pick OLD vs NEW format without regenerating the stub.
+  printf '%s' "$rate_limit_body" >"$dir/state/ratelimit-body.txt"
   cp "$ROOT/scripts/coderabbit-wait.sh" "$dir/scripts/coderabbit-wait.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
@@ -87,6 +112,7 @@ EOF
 set -euo pipefail
 bot='coderabbitai[bot]'
 head_time='2026-06-04T00:00:00Z'
+state_dir=${CODERABBIT_TEST_STATE_DIR:?}
 [ "${1:-}" = "api" ] || { echo "unexpected gh command: $*" >&2; exit 99; }
 shift
 method="GET"
@@ -110,7 +136,9 @@ case "$endpoint" in
   repos/owner/repo/pulls/999/reviews) printf '[]\n' ;;
   repos/owner/repo/pulls/999/comments) printf '[]\n' ;;
   repos/owner/repo/issues/999/comments)
-    printf '[{"id":7701,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"Rate limit exceeded. Please wait 10 seconds before requesting another review."}]\n' "$bot" "$head_time" "$head_time" ;;
+    rl_body=$(cat "$state_dir/ratelimit-body.txt")
+    jq -cn --arg bot "$bot" --arg t "$head_time" --arg body "$rl_body" \
+      '[{id:7701,user:{login:$bot},created_at:$t,updated_at:$t,body:$body}]' ;;
   *) echo "unexpected gh api endpoint: $endpoint" >&2; exit 99 ;;
 esac
 EOF
@@ -210,10 +238,41 @@ test_failover_idempotent_across_retries() {
   [ "$FAIL" -ne "$before" ] || pass "D: failover fires exactly once across a multi-poll run (idempotent FIRED latch)"
 }
 
+# --- Test E: NEW adaptive rate-limit format (#593) classifies as rate_limit ---
+# The regression for #591. Before the fix, classify_comment saw neither
+# "rate[- ]limit exceeded" nor the paused marker in this body and fell through
+# to `review` → the script exited 0 (cleared) with NO failover, false-clearing
+# the gate. With the marker-based classification it behaves exactly like the
+# old format: failover fires once, exit 5, requested:true.
+test_newformat_fires() {
+  local dir rc before=$FAIL
+  dir=$(make_case "newfmt-fires" 300 0 true "$NEW_RATE_LIMIT_BODY")
+  rc=$(run_case "$dir" 0)
+  [ "$rc" = "5" ] || fail "E: expected exit 5 on new-format rate-limit, got $rc; err=$(cat "$dir/err.log")"
+  [ "$(jqf "$dir" '.status')" = "rate_limit_stalled" ] || fail "E: status=$(jqf "$dir" '.status'), expected rate_limit_stalled"
+  [ "$(jqf "$dir" '.codex_failover_requested')" = "true" ] || fail "E: codex_failover_requested=$(jqf "$dir" '.codex_failover_requested'), expected true"
+  [ "$(stub_calls "$dir")" = "1" ] || fail "E: Codex helper invoked $(stub_calls "$dir") time(s), expected 1"
+  [ "$FAIL" -ne "$before" ] || pass "E: new 'Review limit reached' format classifies as rate_limit → failover + exit 5 (not a false-clear)"
+}
+
+# --- Test F: NEW format window "Next review available in: N minutes" parsed ---
+# max_retries=1 + a generous budget so the loop parses the window and sleeps it
+# (logging window=Ns) before looping on the persistent NOTE to the timeout.
+test_newformat_window_parsed() {
+  local dir rc before=$FAIL
+  dir=$(make_case "newfmt-window" 1800 1 true "$NEW_RATE_LIMIT_BODY")
+  rc=$(run_case "$dir" 0)
+  [ "$rc" = "4" ] || fail "F: expected exit 4 (timeout after one retry), got $rc; err=$(tail -3 "$dir/err.log")"
+  grep -q 'window=780s' "$dir/err.log" || fail "F: expected parsed window=780s (13 min); log=$(grep -i window "$dir/err.log" || echo none)"
+  [ "$FAIL" -ne "$before" ] || pass "F: 'Next review available in: 13 minutes' parsed to a 780s window"
+}
+
 test_failover_fires
 test_failover_opt_out
 test_failover_codex_disabled
 test_failover_idempotent_across_retries
+test_newformat_fires
+test_newformat_window_parsed
 
 echo "----"
 echo "test_coderabbit_wait_codex_failover: $PASS passed, $FAIL failed"
