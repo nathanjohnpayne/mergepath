@@ -534,7 +534,7 @@ feedback_policy:
 
   # Per-tier disposition requirement (mode: by-priority only). Tiers:
   #   p0,p1,p2,p3 ← Codex badges ![P0 Badge]…![P3 Badge]
-  #   nitpick     ← CodeRabbit 🧹 Nitpick (Codex P3 alias)
+  #   nitpick     ← CodeRabbit 🧹 Nitpick (distinct tier; Codex P3 maps to p3, not nitpick)
   # Values:
   #   required      → must fix-or-rebut AND resolve; merge-blocking (via gate).
   #   discretionary → agent's judgment; never blocks (today's P2/P3 behavior).

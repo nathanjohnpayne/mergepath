@@ -365,7 +365,7 @@ After internal review passes (Phase 2), CodeRabbit provides an independent autom
 2. **Read both API endpoints.** CodeRabbit posts two types of comments that must both be checked:
    - **PR-level summary:** `gh api repos/{owner}/{repo}/issues/{pr_number}/comments` — contains the high-level walkthrough and summary.
    - **Inline review comments on the diff:** `gh api repos/{owner}/{repo}/pulls/{pr_number}/comments` — contains line-by-line findings anchored to specific code.
-3. **Scan for potential issues.** Before proceeding, grep CodeRabbit's inline review comments for `Potential issue` or `⚠️`. These markers indicate findings CodeRabbit considers high-severity. Every such finding must be explicitly addressed (fixed or dismissed with reasoning).
+3. **Scan for potential issues.** Before proceeding, grep CodeRabbit's inline review comments for `Potential issue` or `⚠️`. These markers indicate findings CodeRabbit considers high-severity. Every such finding must be explicitly addressed (fixed or dismissed with reasoning). When `feedback_policy` marks additional CodeRabbit tiers `required` (e.g. `p2` / `nitpick`, or `mode: address-all`), disposition those too — map each finding onto the shared ladder per [§ Feedback Disposition Policy](#feedback-disposition-policy). The tier-aware CodeRabbit gate that *enforces* this at merge time lands in #577; until then this is an agent-discipline instruction.
 4. The agent addresses substantive CodeRabbit findings — fixing issues or posting a reply explaining why a finding is not applicable.
 5. The agent is not required to fix every CodeRabbit comment. Use judgment: fix genuine issues, dismiss false positives with a brief explanation. However, all `Potential issue` / `⚠️` findings require an explicit response.
 6. CodeRabbit review is advisory. It does not block merge via CI and does not submit a "Changes Requested" review state.
@@ -776,7 +776,7 @@ Both reviewers are mapped onto one ladder so a single policy covers them:
 | `p1` | high / blocking | `![P1 Badge]` / `**P1` | `⚠️ Potential issue` / `⚠️` + `Major` |
 | `p2` | minor | `![P2 Badge]` / `**P2` | `⚠️` + `Minor`, `🛠️ Refactor suggestion` |
 | `p3` | cosmetic / trivial | `![P3 Badge]` / `**P3` | — |
-| `nitpick` | style / nit | `![P3 Badge]` (alias) | `🧹 Nitpick` |
+| `nitpick` | style / nit | — (Codex P3 maps to `p3`) | `🧹 Nitpick` |
 
 Codex emits an explicit machine-readable badge per finding; CodeRabbit has no
 numeric scale, so its tier is derived heuristically (category + a

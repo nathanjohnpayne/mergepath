@@ -167,6 +167,8 @@ eq "p1"      "$(coderabbit_tier_of '⚠️ Potential issue: unhandled error')"  
 eq "p0"      "$(coderabbit_tier_of '⚠️ Potential issue (Critical): RCE')"     "cr_tier_of: critical -> p0"
 eq "p2"      "$(coderabbit_tier_of '⚠️ Potential issue — Minor: nit')"        "cr_tier_of: minor -> p2"
 eq "p1"      "$(coderabbit_tier_of '⚠️ Potential issue — Major: bug')"        "cr_tier_of: major -> p1"
+eq "p1"      "$(coderabbit_tier_of '⚠️ Potential issue — Major: breaks on the minor version bump')" "cr_tier_of: major wins over minor in prose -> p1 (#581)"
+eq "p0"      "$(coderabbit_tier_of 'Security: hardcoded credential in config default')" "cr_tier_of: standalone Security -> p0 (#581)"
 eq "p2"      "$(coderabbit_tier_of '🛠️ Refactor suggestion: extract method')" "cr_tier_of: refactor -> p2"
 eq ""        "$(coderabbit_tier_of '📝 Note: verified the change')"           "cr_tier_of: plain note -> empty"
 
