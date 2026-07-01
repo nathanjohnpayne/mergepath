@@ -365,7 +365,7 @@ After internal review passes (Phase 2), CodeRabbit provides an independent autom
 2. **Read both API endpoints.** CodeRabbit posts two types of comments that must both be checked:
    - **PR-level summary:** `gh api repos/{owner}/{repo}/issues/{pr_number}/comments` — contains the high-level walkthrough and summary.
    - **Inline review comments on the diff:** `gh api repos/{owner}/{repo}/pulls/{pr_number}/comments` — contains line-by-line findings anchored to specific code.
-3. **Scan for potential issues.** Before proceeding, grep CodeRabbit's inline review comments for `Potential issue` or `⚠️`. These markers indicate findings CodeRabbit considers high-severity. Every such finding must be explicitly addressed (fixed or dismissed with reasoning).
+3. **Scan for potential issues.** Before proceeding, grep CodeRabbit's inline review comments for `Potential issue` or `⚠️`. These markers indicate findings CodeRabbit considers high-severity. Every such finding must be explicitly addressed (fixed or dismissed with reasoning). When `feedback_policy` marks additional CodeRabbit tiers `required` (e.g. `p2` / `nitpick`, or `mode: address-all`), disposition those too — map each finding onto the shared ladder per [§ Feedback Disposition Policy](#feedback-disposition-policy). The tier-aware CodeRabbit gate that *enforces* this at merge time lands in #577; until then this is an agent-discipline instruction.
 4. The agent addresses substantive CodeRabbit findings — fixing issues or posting a reply explaining why a finding is not applicable.
 5. The agent is not required to fix every CodeRabbit comment. Use judgment: fix genuine issues, dismiss false positives with a brief explanation. However, all `Potential issue` / `⚠️` findings require an explicit response.
 6. CodeRabbit review is advisory. It does not block merge via CI and does not submit a "Changes Requested" review state.
@@ -514,22 +514,22 @@ trigger comment. In GitHub's REST reactions payload the content value is
 `@codex review` trigger through the same author wrapper up to
 `codex.max_ack_retries`, then continues the normal review wait. The
 acknowledgment is not clearance: only a Codex review on HEAD with no
-unaddressed P0/P1 findings, or a fresh 👍 / `+1` reaction on the PR
-issue, can satisfy the Phase 4a signal.
+unaddressed required-tier findings (P0/P1 by default), or a fresh 👍 /
+`+1` reaction on the PR issue, can satisfy the Phase 4a signal.
 
 12a. `codex-review-request.sh` polls the PR until one of the following:
 
      - **Codex posts a review.** Always in `COMMENTED` state — the Codex GitHub App never uses `APPROVED` or `CHANGES_REQUESTED`. Findings appear as **inline comments on the diff** (`/pulls/{pr}/comments` endpoint), not in the top-level review body. Inline findings carry priority markers: `![P0 Badge]`, `![P1 Badge]`, `![P2 Badge]`, or `![P3 Badge]`.
      - **Codex reacts 👍 / `+1`** on the PR issue with no review body. This is Codex's no-findings clearance signal per the ChatGPT Codex Connector documentation.
-     - **Codex posts a summary issue comment** — "Codex Review: …" with a `Reviewed commit: <sha>` line — on the PR conversation (`issues/{pr}/comments`), NOT a review object. When that sha equals the current HEAD and there are no unaddressed P0/P1 inline findings on HEAD, the verdict is a clearance signal too. Check issue comments, not only review objects and reactions: Codex routes its verdict here, so a `pulls/{pr}/reviews`-only check can miss a completed re-review (#567). NB: the automated merge gate `scripts/codex-review-check.sh` currently recognizes only review objects + 👍 reactions for gate (c); extending it to honor the HEAD-anchored issue-comment verdict is tracked in #567, so until then do not treat an issue-comment-only Codex clearance as sufficient for the *automated* gate — a 👍 / review object or a Phase 4b substitute still carries gate (c).
+     - **Codex posts a summary issue comment** — "Codex Review: …" with a `Reviewed commit: <sha>` line — on the PR conversation (`issues/{pr}/comments`), NOT a review object. When that sha equals the current HEAD and there are no unaddressed required-tier (P0/P1 by default) inline findings on HEAD, the verdict is a clearance signal too. Check issue comments, not only review objects and reactions: Codex routes its verdict here, so a `pulls/{pr}/reviews`-only check can miss a completed re-review (#567). NB: the automated merge gate `scripts/codex-review-check.sh` currently recognizes only review objects + 👍 reactions for gate (c); extending it to honor the HEAD-anchored issue-comment verdict is tracked in #567, so until then do not treat an issue-comment-only Codex clearance as sufficient for the *automated* gate — a 👍 / review object or a Phase 4b substitute still carries gate (c).
      - **Timeout.** No review and no reaction within `codex.review_timeout_seconds` (default: 600s / 10 min). The script exits with code `4` (`FALLBACK_REQUIRED`).
 
-13a. If Codex posted inline findings, the agent addresses each P0/P1 by either:
+13a. If Codex posted inline findings, the agent dispositions each finding in a **`required`** tier by either:
 
      - **Fixing the code** and pushing a new commit to the same branch, or
      - **Replying on the finding thread** with a clear rebuttal explaining why the finding does not apply (for false positives or scope disagreements).
 
-     P2 and P3 findings are addressed at the agent's judgment — not every cosmetic or nit-level finding needs a fix or a rebuttal.
+     Which tiers are `required` is governed by `feedback_policy` in `.github/review-policy.yml` — see [§ Feedback Disposition Policy](#feedback-disposition-policy). The **default**, and the behavior when the block is absent, is **P0/P1 required** (as above) and **P2/P3 discretionary** — addressed at the agent's judgment, so not every cosmetic or nit-level finding needs a fix or a rebuttal. A repo may mark additional tiers `required`, or set `mode: address-all` so that **every** finding must be fixed or rebutted before merge. The same tier policy applies to CodeRabbit findings (Phase 2.5), mapped onto the shared ladder.
 
 13a-bis. **Record the feedback reaction (#487).** Every Codex finding ends with a solicitation: *"Useful? React with 👍 / 👎."* After adjudicating a finding, the agent answers that prompt with a **validated** reaction via `scripts/codex-record-feedback.sh <PR#> --findings-json <request-script-json> --verdict <comment_id>=<verdict>[:<reason>]`:
 
@@ -550,7 +550,7 @@ issue, can satisfy the Phase 4a signal.
 
 15a. The loop continues until one of the following terminates it:
 
-     - **Clearance (happy path).** Codex posts a review with no unaddressed P0/P1 inline findings on the current HEAD, OR reacts 👍 on or after the current HEAD commit. Proceed to step 16a.
+     - **Clearance (happy path).** Codex posts a review with no unaddressed **`required`-tier** inline findings (P0/P1 by default; see [§ Feedback Disposition Policy](#feedback-disposition-policy)) on the current HEAD, OR reacts 👍 on or after the current HEAD commit. Proceed to step 16a.
      - **Disagreement (escalate).** Codex re-flags the same finding after the agent posted a rebuttal. This is "repeat-after-rebuttal." See [Disagreements and Tiebreaking](#disagreements-and-tiebreaking).
      - **Runaway (escalate).** The round counter exceeds `codex.max_review_rounds` (default: 2). The 3rd round trips this guard. See [Disagreements and Tiebreaking](#disagreements-and-tiebreaking).
      - **Timeout (fall back).** `codex-review-request.sh` exits with code `4` (`FALLBACK_REQUIRED`) for the current round. The agent falls back to Phase 4b. There is no "second timeout" escalation — a single timeout already routes to human mediation via the 4b handoff.
@@ -756,6 +756,88 @@ When you pull this template change into an existing repo, the new `phase_4b_defa
   └──────────────────────────┘  │                            │
                                 └────────────────────────────┘
 ```
+
+## Feedback Disposition Policy
+
+The `feedback_policy` block in `.github/review-policy.yml` controls **which
+bot-review findings the authoring agent must disposition before merge**. A
+*disposition* is one of: **fix** the code, **or** post a **rebuttal** reply
+explaining why the finding does not apply — and then **resolve the thread**.
+It governs disposition *requirements* only; it does not change who reviews or
+the external-review threshold.
+
+### Normalized severity ladder
+
+Both reviewers are mapped onto one ladder so a single policy covers them:
+
+| Tier | Meaning | Codex (exact) | CodeRabbit (heuristic) |
+|------|---------|---------------|------------------------|
+| `p0` | critical / blocker | `![P0 Badge]` / `**P0` | — (Codex-only; CodeRabbit tops at p1) |
+| `p1` | high / blocking | `![P1 Badge]` / `**P1` | `⚠️ Potential issue` / `🟠 Major` |
+| `p2` | minor | `![P2 Badge]` / `**P2` | `🟡 Minor` |
+| `p3` | cosmetic / trivial | `![P3 Badge]` / `**P3` | `🔵 Trivial` |
+| `nitpick` | style / nit | — (Codex P3 maps to `p3`) | `🧹 Nitpick` |
+
+The CodeRabbit column mirrors `classify_severity` (`scripts/lib/daily-feedback-rollup-helpers.sh`), the repo's canonical badge parser: CodeRabbit findings are keyed off the severity badge, top out at `p1` (Major / Potential issue / ⚠️), and never map to `p0` — `p0` is Codex-only. A Refactor suggestion or a stray "security" mention carries no severity badge, so it is unclassified (discretionary).
+
+Codex emits an explicit machine-readable badge per finding; CodeRabbit has no
+numeric scale, so its tier is derived heuristically (category + a
+`Critical`/`Major`/`Minor` qualifier) by `coderabbit_tier_of` in
+`scripts/lib/feedback-policy-helpers.sh`.
+
+### Schema
+
+```yaml
+feedback_policy:
+  mode: by-priority        # by-priority | address-all
+  priorities:              # consulted only when mode: by-priority
+    p0: required           # required | discretionary | ignore
+    p1: required
+    p2: discretionary
+    p3: discretionary
+    nitpick: discretionary
+```
+
+- **`mode: by-priority`** (default) — each tier is independently `required`
+  (must fix-or-rebut + resolve; merge-blocking), `discretionary` (agent's
+  judgment; never blocks), or `ignore` (never surfaced).
+- **`mode: address-all`** — every finding at every tier is `required`; the
+  `priorities:` map is ignored. This is "address or rebut all feedback."
+
+### Defaults & backward compatibility
+
+An **absent** `feedback_policy` block reproduces today's behavior exactly:
+disposition defaults of **P0/P1 required, P2/P3 discretionary**, and the merge
+gates enforce **P1 only**. The default lives in the parser
+(`resolve_required_tiers`), not just in this file, because
+`.github/review-policy.yml` is not synced to consumers — the same
+default-on-absent posture as `phase_4b_default` and `propagation_prs`.
+
+### Enforcement (two symmetric gates — planned)
+
+**Today, only Codex P1 is enforced at merge.** The blocking tier set resolved
+from this block *will be* enforced by two required-check gates that share
+`scripts/lib/feedback-policy-helpers.sh`:
+
+- **Codex** — `scripts/codex-p1-gate.sh` (required check `Codex P1 Gate /
+  Codex P1 unresolved threads`), gated by `codex.p1_gate.enabled`. Enforces
+  Codex **P1 only** today; generalized to the resolved `required` tier set in
+  #577.
+- **CodeRabbit** — `scripts/coderabbit-severity-gate.sh` (required check
+  `CodeRabbit Severity Gate / CodeRabbit unresolved blocking findings`), gated
+  by `coderabbit.severity_gate.enabled`. **New in #577** (does not exist yet).
+
+> **Rollout note (#574).** Sub-issue #576 ships the schema above and the
+> shared parser/classifier library **only** — it changes no enforcement.
+> Generalizing `codex-p1-gate.sh` beyond P1 and adding
+> `coderabbit-severity-gate.sh` (so `required` tiers actually block) lands in
+> sub-issue #577. Until then, `feedback_policy` is documentary and the gates
+> behave as before (Codex P1 only).
+
+> **CodeRabbit profile dependency.** `nitpick: required` only has teeth when
+> `.coderabbit.yml` uses `reviews.profile: assertive`; the shipped `chill`
+> profile suppresses the 🧹 Nitpick category entirely, so the requirement is a
+> no-op there. See [`docs/agents/coderabbit-audit.md`](docs/agents/coderabbit-audit.md).
 
 ## Handoff Message Format
 

@@ -260,6 +260,23 @@ coderabbit:
   # See nathanjohnpayne/mergepath#221.
   trust_status_context_for_clearance: true
 
+  # CodeRabbit severity gate (#574 / #577) — the CodeRabbit twin of
+  # codex.p1_gate below. When enabled, scripts/coderabbit-severity-gate.sh
+  # runs as the required check `CodeRabbit Severity Gate / CodeRabbit
+  # unresolved blocking findings` and BLOCKS merge on any unresolved
+  # CodeRabbit inline thread whose mapped tier (see `feedback_policy` further
+  # down) is `required`. CodeRabbit has no numeric P-scale, so the tier is
+  # derived heuristically from its category + Critical/Major/Minor qualifier
+  # by scripts/lib/feedback-policy-helpers.sh (coderabbit_tier_of).
+  #
+  # NOTE: the gate SCRIPT lands in #577. This key is CONFIG-ONLY until then —
+  # no consumer reads it yet, so setting it here is inert. Narrow-start
+  # posture, identical to codex.p1_gate / external_review_gate: default false
+  # everywhere, true in mergepath first. A no-op (always green) when disabled,
+  # so it is safe to add to required checks everywhere.
+  severity_gate:
+    enabled: true
+
 # ---------------------------------------------------------------------------
 # Codex (Automated External Review — Phase 4a)
 # ---------------------------------------------------------------------------

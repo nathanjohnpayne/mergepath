@@ -58,6 +58,16 @@ Refactor / Security). Nothing in the current docs contradicts that. The
 template stays on `chill` and the floor check enforces it for the template
 repo only; consumers may set `assertive` locally.
 
+> **Interaction with `feedback_policy` (#574).** The `feedback_policy` block in
+> `.github/review-policy.yml` can mark the `nitpick` tier `required` (or use
+> `mode: address-all`). That requirement only has teeth under
+> `profile: assertive` — under `chill` the 🧹 Nitpick category is suppressed,
+> so no nitpick threads exist and `nitpick: required` is a **silent no-op**. A
+> repo that genuinely wants nitpicks gated must set `assertive` here as well.
+> (Planned, not yet shipped: when the #577 CodeRabbit severity gate lands it
+> will emit a warning on `nitpick: required` under the `chill` profile. #576
+> ships the schema + docs only — no gate yet.)
+
 ### `auto_incremental_review: true` — pinned explicitly (config change)
 
 Default is `true` ("re-run the review on each push"). We previously inherited
