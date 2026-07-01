@@ -210,9 +210,11 @@ p4b_available_reviewers() {
 # Strip the reviewer-login prefix to get the agent short name.
 #   nathanpayne-codex -> codex ; claude -> claude
 p4b_agent_of_login() {
-  case "$1" in
-    nathanpayne-*) printf '%s' "${1#nathanpayne-}" | tr '[:upper:]' '[:lower:]' ;;
-    *)             printf '%s' "$1" | tr '[:upper:]' '[:lower:]' ;;
+  local login
+  login="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$login" in
+    nathanpayne-*) printf '%s' "${login#nathanpayne-}" ;;
+    *)             printf '%s' "$login" ;;
   esac
 }
 
@@ -231,9 +233,24 @@ p4b_login_of_agent() {
 # without a review-via-<name>.sh adapter as unsupported (manual fallback).
 p4b_adapter_of_login() { p4b_agent_of_login "$1"; }
 
+p4b_adapter_dir() {
+  if [ -n "${P4B_ADAPTER_DIR:-}" ]; then
+    printf '%s' "$P4B_ADAPTER_DIR"
+    return 0
+  fi
+  printf '%s/scripts/phase-4b/adapters' "$(p4b_repo_root)"
+}
+
+p4b_adapter_supported_for_login() {
+  local adapter
+  adapter="$(p4b_adapter_of_login "$1")"
+  [ -x "$(p4b_adapter_dir)/review-via-${adapter}.sh" ]
+}
+
 # p4b_select_reviewer <author-agent-or-login>
 # Echo the external reviewer login: a member of available_reviewers whose
-# agent differs from the author, preferring default_external_reviewer.
+# agent differs from the author and has a local adapter, preferring
+# default_external_reviewer.
 # Exit 1 (no echo) if none can be found.
 p4b_select_reviewer() {
   local author_in="$1" author_agent default def_agent r r_agent
@@ -242,7 +259,7 @@ p4b_select_reviewer() {
   default="$(p4b_top_field default_external_reviewer)"
   if [ -n "$default" ]; then
     def_agent="$(p4b_agent_of_login "$default")"
-    if [ "$def_agent" != "$author_agent" ]; then
+    if [ "$def_agent" != "$author_agent" ] && p4b_adapter_supported_for_login "$default"; then
       printf '%s' "$default"; return 0
     fi
   fi
@@ -250,7 +267,7 @@ p4b_select_reviewer() {
   while IFS= read -r r; do
     [ -n "$r" ] || continue
     r_agent="$(p4b_agent_of_login "$r")"
-    if [ "$r_agent" != "$author_agent" ]; then
+    if [ "$r_agent" != "$author_agent" ] && p4b_adapter_supported_for_login "$r"; then
       printf '%s' "$r"; return 0
     fi
   done <<EOF

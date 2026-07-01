@@ -93,6 +93,18 @@ feedback_policy:
   mode: address-all
 YAML
 
+POLICY_CURSOR_FIRST="$WORK/policy-cursor-first.yml"
+cat > "$POLICY_CURSOR_FIRST" <<'YAML'
+available_reviewers:
+  - nathanpayne-cursor
+  - nathanpayne-claude
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+  enabled: true
+  mode: local
+YAML
+
 POLICY_BAD_FEEDBACK="$WORK/policy-bad-feedback.yml"
 cat > "$POLICY_BAD_FEEDBACK" <<'YAML'
 available_reviewers:
@@ -256,12 +268,20 @@ r="$(p4b_select_reviewer Codex || true)"
 [ "$r" = "nathanpayne-claude" ] && pass "author=Codex normalizes case before reviewer selection" \
   || fail "author=Codex -> '$r' (expected nathanpayne-claude)"
 
+export MERGEPATH_REVIEW_POLICY_PATH="$POLICY_CURSOR_FIRST"
+r="$(p4b_select_reviewer codex || true)"
+[ "$r" = "nathanpayne-claude" ] && pass "author=codex skips unsupported reviewer when a supported adapter exists" \
+  || fail "cursor-first author=codex -> '$r' (expected nathanpayne-claude)"
+export MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON"
+
 r="$(p4b_select_reviewer cursor || true)"
 [ "$r" = "nathanpayne-codex" ] && pass "author=cursor selects nathanpayne-codex" \
   || fail "author=cursor -> '$r' (expected nathanpayne-codex)"
 
 a="$(p4b_adapter_of_login nathanpayne-codex)"
 [ "$a" = "codex" ] && pass "adapter_of_login(nathanpayne-codex)=codex" || fail "adapter_of_login codex -> '$a'"
+a="$(p4b_adapter_of_login NATHANPAYNE-CODEX)"
+[ "$a" = "codex" ] && pass "adapter_of_login(NATHANPAYNE-CODEX)=codex" || fail "adapter_of_login uppercase codex -> '$a'"
 a="$(p4b_adapter_of_login nathanpayne-claude)"
 [ "$a" = "claude" ] && pass "adapter_of_login(nathanpayne-claude)=claude" || fail "adapter_of_login claude -> '$a'"
 

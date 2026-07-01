@@ -106,6 +106,22 @@ default_external_reviewer: nathanpayne-codex
 author_identity: nathanjohnpayne
 
 # ---------------------------------------------------------------------------
+# Review-feedback disposition policy (#574)
+# ---------------------------------------------------------------------------
+# Controls which review findings require disposition before merge. A
+# disposition is a fix, or an explicit rebuttal explaining why the finding does
+# not apply. The absent-block default is the same as this default block:
+# P0/P1 required, P2/P3/nitpick discretionary.
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p0: required
+    p1: required
+    p2: discretionary
+    p3: discretionary
+    nitpick: discretionary
+
+# ---------------------------------------------------------------------------
 # CodeRabbit (Automated External Review — Phase 2.5)
 # ---------------------------------------------------------------------------
 # When enabled, CodeRabbit provides automated code review on every PR as an
