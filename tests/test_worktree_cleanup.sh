@@ -74,6 +74,12 @@ git init -q -b main "$MAIN"
 cd "$MAIN"
 git config user.email "test@example.com"
 git config user.name "Test"
+# Disable commit/tag signing in the fixture repo so the test is portable — CI
+# runners (and a machine whose signing key is not currently unlocked) have no
+# signing key, and an inherited global commit.gpgsign=true would otherwise make
+# every fixture `git commit` fail with "failed to write commit object".
+git config commit.gpgsign false
+git config tag.gpgsign false
 git remote add origin "$REMOTE"
 echo "hello" > README.md
 git add README.md
@@ -199,6 +205,23 @@ git push -q -u origin "$NOPR_BRANCH"
 git push -q origin --delete "$NOPR_BRANCH"
 git fetch -q --prune
 
+# ── Case 10 (#605 / CodeRabbit Major): REUSED branch name. A branch whose NAME
+# matches an old merged PR but whose current tip does NOT descend from that
+# merged head (the name was reused for unrelated, unmerged work) must be KEPT,
+# not deleted. The stub returns DIVERGED_MERGED_TIP (a real commit that is NOT
+# an ancestor of this off-main branch) as the "merged head", so the ancestry
+# guard must fail safe to `none`.
+git switch -q main
+REUSED_BRANCH="reused-name-unrelated"
+git switch -q -c "$REUSED_BRANCH"
+echo reused-new > reused-new.txt
+git add reused-new.txt
+git commit -q -m "unrelated NEW work under a reused branch name"
+git push -q -u origin "$REUSED_BRANCH"
+git push -q origin --delete "$REUSED_BRANCH"
+git switch -q main
+git fetch -q --prune
+
 # ── gh stub on PATH ───────────────────────────────────────────────────
 STUB_DIR="$WORKDIR/stub-bin"
 mkdir -p "$STUB_DIR"
@@ -229,6 +252,13 @@ if [ "\$1" = "pr" ] && [ "\$2" = "list" ]; then
   if [ "\$head" = "$DIVERGED_BRANCH" ]; then
     # Merged head is BEFORE the local housekeeping commit → the helper sees
     # the local tip diverge from this merged head.
+    echo "$DIVERGED_MERGED_TIP"
+    exit 0
+  fi
+  if [ "\$head" = "$REUSED_BRANCH" ]; then
+    # A merged PR exists for this NAME, but its head ($DIVERGED_MERGED_TIP) is
+    # NOT an ancestor of the reused branch tip → the ancestry guard must return
+    # none and KEEP the branch.
     echo "$DIVERGED_MERGED_TIP"
     exit 0
   fi
@@ -357,9 +387,17 @@ else
   fail "summary gone-kept-unmerged count missing/zero"
   show_out_on_fail
 fi
-# The unmerged branch must NOT be counted as a MERGED candidate.
-if echo "$OUT" | grep -q "MERGED local branch.*$NOPR_BRANCH"; then
-  fail "unmerged branch wrongly flagged as MERGED candidate"
+# The unmerged branch must NOT be counted as a MERGED candidate. print_record
+# emits the label and the `branch:` field on SEPARATE lines, so a single-line
+# `grep "MERGED local branch.*$NOPR_BRANCH"` can never match (. does not cross
+# newlines) and would tautologically pass (CodeRabbit Major). Correlate the
+# branch field back to its label line via awk, as elsewhere in this file.
+NOPR_LABEL=$(echo "$OUT" | awk -v b="$NOPR_BRANCH" '
+  /^  \[/            { label = $0 }
+  $1 == "branch:" && $2 == b { print label; exit }
+')
+if echo "$NOPR_LABEL" | grep -q "MERGED local branch"; then
+  fail "unmerged branch wrongly flagged as MERGED candidate (label=$NOPR_LABEL)"
   show_out_on_fail
 else
   pass "unmerged branch is NOT flagged as a MERGED deletion candidate"
@@ -467,6 +505,15 @@ if git branch --list "$DIVERGED_BRANCH" | grep -q "$DIVERGED_BRANCH"; then
   echo "$OUT3" >&2
 else
   pass "diverged merged branch deleted by --apply (name-based detection)"
+fi
+
+# Case 10 (#605 / CodeRabbit Major): the reused-name branch — whose tip does NOT
+# descend from the name-matched merged head — must survive --apply. The ancestry
+# guard fails safe to `none`, preserving unmerged work.
+if git rev-parse --verify -q "refs/heads/$REUSED_BRANCH" >/dev/null; then
+  pass "reused-name branch (tip not descended from merged head) is NOT deleted (ancestry guard)"
+else
+  fail "reused-name branch was deleted despite its tip not descending from the merged head"
 fi
 
 # Case 8 (#605): the same --apply that removed SAMERUN_WT must ALSO delete

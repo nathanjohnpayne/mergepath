@@ -211,8 +211,25 @@ gh_branch_merged_pr_status() {
     echo "exact"
     return 0
   fi
-  echo "diverged"
-  return 0
+  # diverged: a merged PR exists for this head NAME but the tip is not one of
+  # the merged heads. Only safe to delete when the tip actually DESCENDS from a
+  # merged head — confirm with `git merge-base --is-ancestor`. Without this, a
+  # REUSED branch name (its old PR merged, but the current local tip is
+  # UNRELATED new work that was never merged) would be classified diverged and
+  # deleted, losing unmerged work (CodeRabbit Major). If no merged head is an
+  # ancestor of the tip, treat as `none` (keep — fail-safe).
+  local mh
+  while IFS= read -r mh; do
+    [ -n "$mh" ] || continue
+    if git -C "$MAIN_WORKTREE" merge-base --is-ancestor "$mh" "$tip" 2>/dev/null; then
+      echo "diverged"
+      return 0
+    fi
+  done <<EOF
+$merged_heads
+EOF
+  echo "none"
+  return 1
 }
 
 # Read gone-upstream branches from `git branch -vv`. The format is:
