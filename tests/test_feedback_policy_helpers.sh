@@ -162,15 +162,14 @@ eq "p1" "$(codex_tier_of '**P1**: stop retrying endlessly')"     "codex_tier_of:
 eq ""   "$(codex_tier_of 'just a normal comment')"               "codex_tier_of: none -> empty"
 
 # --- coderabbit_tier_of ----------------------------------------------------
-eq "nitpick" "$(coderabbit_tier_of '🧹 Nitpick: rename this var')"            "cr_tier_of: nitpick"
-eq "p1"      "$(coderabbit_tier_of '⚠️ Potential issue: unhandled error')"    "cr_tier_of: potential issue -> p1"
-eq "p0"      "$(coderabbit_tier_of '⚠️ Potential issue (Critical): RCE')"     "cr_tier_of: critical -> p0"
-eq "p2"      "$(coderabbit_tier_of '⚠️ Potential issue — Minor: nit')"        "cr_tier_of: minor -> p2"
-eq "p1"      "$(coderabbit_tier_of '⚠️ Potential issue — Major: bug')"        "cr_tier_of: major -> p1"
-eq "p1"      "$(coderabbit_tier_of '⚠️ Potential issue — Major: breaks on the minor version bump')" "cr_tier_of: major wins over minor in prose -> p1 (#581)"
-eq "p0"      "$(coderabbit_tier_of 'Security: hardcoded credential in config default')" "cr_tier_of: standalone Security -> p0 (#581)"
-eq "p2"      "$(coderabbit_tier_of '🛠️ Refactor suggestion: extract method')" "cr_tier_of: refactor -> p2"
-eq ""        "$(coderabbit_tier_of '📝 Note: verified the change')"           "cr_tier_of: plain note -> empty"
+eq "nitpick" "$(coderabbit_tier_of '🧹 Nitpick: rename this var')"                         "cr_tier_of: nitpick"
+eq "p1"      "$(coderabbit_tier_of '⚠️ Potential issue: unhandled error')"                 "cr_tier_of: potential issue -> p1"
+eq "p1"      "$(coderabbit_tier_of '_⚠️ Potential issue_ | _🔴 Critical_: RCE')"            "cr_tier_of: critical/potential-issue -> p1 (CodeRabbit tops at p1)"
+eq "p1"      "$(coderabbit_tier_of '_⚠️ Potential issue_ | _🟠 Major_: breaks on the minor version bump')" "cr_tier_of: major wins over minor-in-prose -> p1 (#581 r1)"
+eq "p2"      "$(coderabbit_tier_of '_📐 Maintainability_ | _🟡 Minor_: rename var')"        "cr_tier_of: minor (no potential-issue marker) -> p2"
+eq "p3"      "$(coderabbit_tier_of '_🔵 Trivial issue_: cosmetic tweak')"                   "cr_tier_of: trivial -> p3 (#581 r2)"
+eq ""        "$(coderabbit_tier_of '🛠️ Refactor suggestion to extract a security helper')" "cr_tier_of: refactor + security-in-prose -> empty (no severity badge; #581 r2)"
+eq ""        "$(coderabbit_tier_of '📝 Note: verified the change')"                         "cr_tier_of: plain note -> empty"
 
 # ---------------------------------------------------------------------------
 echo

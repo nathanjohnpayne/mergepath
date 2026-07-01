@@ -121,39 +121,32 @@ codex_tier_of() {
 # Policy mapping table). Best-effort — the #577 gate validates this against
 # real CodeRabbit fixtures and may refine it.
 #
-# Order matters:
-#  1. nitpick first (a 🧹 Nitpick that mentions "minor" must not be mis-bucketed);
-#  2. Security next — a Security-category finding is p0 even when CodeRabbit
-#     omits the Potential issue / ⚠️ marker (Codex P2 on #581: a standalone
-#     Security finding otherwise fell through to an empty tier);
-#  3. the high-severity ⚠️ / Potential issue bucket, resolved by DESCENDING
-#     severity so the highest marker present wins — a Major finding whose prose
-#     mentions a minor case must not downgrade to p2 (Codex P2 on #581);
-#  4. refactor suggestions (p2).
-# Marker-precise parsing (reading only CodeRabbit's severity marker rather than
-# the whole body) is refined against real CodeRabbit fixtures in the #577 gate.
+# This MIRRORS classify_severity in scripts/lib/daily-feedback-rollup-helpers.sh
+# — the repo's canonical CodeRabbit badge parser — kept as a separate mapping to
+# avoid cross-lib coupling (a future refactor may extract one shared severity
+# module). Anchored on the first 600 chars (the badge sits near the top; deeper
+# prose must not false-match) and ordered highest-confidence first.
+#
+# CodeRabbit canonical badges → tier:
+#   🟠 Major / Potential issue / ⚠️  → p1   (CodeRabbit's top severity; p0 is
+#                                            Codex-only, so CodeRabbit never maps
+#                                            to p0 — matches classify_severity)
+#   🧹 Nitpick                       → nitpick
+#   🔵 Trivial / Outside diff range  → p3
+#   🟡 Minor                         → p2
+# Anything else (Refactor suggestion, plain Note, a stray "security" mention in
+# prose) is unclassified → empty. Keying off the badge, NOT prose keywords, is
+# deliberate: a refactor whose text mentions "security" must not escalate to p0
+# (Codex P2 #581 r2), and a Major finding whose prose says "minor" must not
+# downgrade (Codex P2 #581 r1).
 coderabbit_tier_of() {
-  local body=${1:-} lc
-  lc=$(printf '%s' "$body" | tr '[:upper:]' '[:lower:]')
-  case "$lc" in
-    *nitpick*) echo nitpick; return 0 ;;
-  esac
-  case "$lc" in
-    *security*) echo p0; return 0 ;;
-  esac
-  case "$lc" in
-    *"potential issue"*|*'⚠'*)
-      case "$lc" in
-        *critical*) echo p0 ;;
-        *major*)    echo p1 ;;
-        *minor*)    echo p2 ;;
-        *)          echo p1 ;;
-      esac
-      return 0
-      ;;
-  esac
-  case "$lc" in
-    *"refactor suggestion"*|*refactor*) echo p2; return 0 ;;
+  local head
+  head=$(printf '%s' "${1:-}" | head -c 600)
+  case "$head" in
+    *"🟠 Major"*|*"Potential issue"*|*"⚠️"*)          echo p1; return 0 ;;
+    *"🧹 Nitpick"*|*Nitpick*)                          echo nitpick; return 0 ;;
+    *"🔵 Trivial"*|*Trivial*|*"Outside diff range"*)   echo p3; return 0 ;;
+    *"🟡 Minor"*|*Minor*)                              echo p2; return 0 ;;
   esac
   return 0
 }

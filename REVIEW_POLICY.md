@@ -514,14 +514,14 @@ trigger comment. In GitHub's REST reactions payload the content value is
 `@codex review` trigger through the same author wrapper up to
 `codex.max_ack_retries`, then continues the normal review wait. The
 acknowledgment is not clearance: only a Codex review on HEAD with no
-unaddressed P0/P1 findings, or a fresh 👍 / `+1` reaction on the PR
-issue, can satisfy the Phase 4a signal.
+unaddressed required-tier findings (P0/P1 by default), or a fresh 👍 /
+`+1` reaction on the PR issue, can satisfy the Phase 4a signal.
 
 12a. `codex-review-request.sh` polls the PR until one of the following:
 
      - **Codex posts a review.** Always in `COMMENTED` state — the Codex GitHub App never uses `APPROVED` or `CHANGES_REQUESTED`. Findings appear as **inline comments on the diff** (`/pulls/{pr}/comments` endpoint), not in the top-level review body. Inline findings carry priority markers: `![P0 Badge]`, `![P1 Badge]`, `![P2 Badge]`, or `![P3 Badge]`.
      - **Codex reacts 👍 / `+1`** on the PR issue with no review body. This is Codex's no-findings clearance signal per the ChatGPT Codex Connector documentation.
-     - **Codex posts a summary issue comment** — "Codex Review: …" with a `Reviewed commit: <sha>` line — on the PR conversation (`issues/{pr}/comments`), NOT a review object. When that sha equals the current HEAD and there are no unaddressed P0/P1 inline findings on HEAD, the verdict is a clearance signal too. Check issue comments, not only review objects and reactions: Codex routes its verdict here, so a `pulls/{pr}/reviews`-only check can miss a completed re-review (#567). NB: the automated merge gate `scripts/codex-review-check.sh` currently recognizes only review objects + 👍 reactions for gate (c); extending it to honor the HEAD-anchored issue-comment verdict is tracked in #567, so until then do not treat an issue-comment-only Codex clearance as sufficient for the *automated* gate — a 👍 / review object or a Phase 4b substitute still carries gate (c).
+     - **Codex posts a summary issue comment** — "Codex Review: …" with a `Reviewed commit: <sha>` line — on the PR conversation (`issues/{pr}/comments`), NOT a review object. When that sha equals the current HEAD and there are no unaddressed required-tier (P0/P1 by default) inline findings on HEAD, the verdict is a clearance signal too. Check issue comments, not only review objects and reactions: Codex routes its verdict here, so a `pulls/{pr}/reviews`-only check can miss a completed re-review (#567). NB: the automated merge gate `scripts/codex-review-check.sh` currently recognizes only review objects + 👍 reactions for gate (c); extending it to honor the HEAD-anchored issue-comment verdict is tracked in #567, so until then do not treat an issue-comment-only Codex clearance as sufficient for the *automated* gate — a 👍 / review object or a Phase 4b substitute still carries gate (c).
      - **Timeout.** No review and no reaction within `codex.review_timeout_seconds` (default: 600s / 10 min). The script exits with code `4` (`FALLBACK_REQUIRED`).
 
 13a. If Codex posted inline findings, the agent dispositions each finding in a **`required`** tier by either:
@@ -550,7 +550,7 @@ issue, can satisfy the Phase 4a signal.
 
 15a. The loop continues until one of the following terminates it:
 
-     - **Clearance (happy path).** Codex posts a review with no unaddressed P0/P1 inline findings on the current HEAD, OR reacts 👍 on or after the current HEAD commit. Proceed to step 16a.
+     - **Clearance (happy path).** Codex posts a review with no unaddressed **`required`-tier** inline findings (P0/P1 by default; see [§ Feedback Disposition Policy](#feedback-disposition-policy)) on the current HEAD, OR reacts 👍 on or after the current HEAD commit. Proceed to step 16a.
      - **Disagreement (escalate).** Codex re-flags the same finding after the agent posted a rebuttal. This is "repeat-after-rebuttal." See [Disagreements and Tiebreaking](#disagreements-and-tiebreaking).
      - **Runaway (escalate).** The round counter exceeds `codex.max_review_rounds` (default: 2). The 3rd round trips this guard. See [Disagreements and Tiebreaking](#disagreements-and-tiebreaking).
      - **Timeout (fall back).** `codex-review-request.sh` exits with code `4` (`FALLBACK_REQUIRED`) for the current round. The agent falls back to Phase 4b. There is no "second timeout" escalation — a single timeout already routes to human mediation via the 4b handoff.
@@ -772,11 +772,13 @@ Both reviewers are mapped onto one ladder so a single policy covers them:
 
 | Tier | Meaning | Codex (exact) | CodeRabbit (heuristic) |
 |------|---------|---------------|------------------------|
-| `p0` | critical / blocker | `![P0 Badge]` / `**P0` | `⚠️` + `Critical`, `Security` |
-| `p1` | high / blocking | `![P1 Badge]` / `**P1` | `⚠️ Potential issue` / `⚠️` + `Major` |
-| `p2` | minor | `![P2 Badge]` / `**P2` | `⚠️` + `Minor`, `🛠️ Refactor suggestion` |
-| `p3` | cosmetic / trivial | `![P3 Badge]` / `**P3` | — |
+| `p0` | critical / blocker | `![P0 Badge]` / `**P0` | — (Codex-only; CodeRabbit tops at p1) |
+| `p1` | high / blocking | `![P1 Badge]` / `**P1` | `⚠️ Potential issue` / `🟠 Major` |
+| `p2` | minor | `![P2 Badge]` / `**P2` | `🟡 Minor` |
+| `p3` | cosmetic / trivial | `![P3 Badge]` / `**P3` | `🔵 Trivial` |
 | `nitpick` | style / nit | — (Codex P3 maps to `p3`) | `🧹 Nitpick` |
+
+The CodeRabbit column mirrors `classify_severity` (`scripts/lib/daily-feedback-rollup-helpers.sh`), the repo's canonical badge parser: CodeRabbit findings are keyed off the severity badge, top out at `p1` (Major / Potential issue / ⚠️), and never map to `p0` — `p0` is Codex-only. A Refactor suggestion or a stray "security" mention carries no severity badge, so it is unclassified (discretionary).
 
 Codex emits an explicit machine-readable badge per finding; CodeRabbit has no
 numeric scale, so its tier is derived heuristically (category + a
