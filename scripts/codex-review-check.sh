@@ -1094,67 +1094,63 @@ LATEST_THUMBS_UP_TIME=$(echo "$REACTIONS_JSON" | jq -r \
 # Latest Codex review submission time on HEAD (empty if none).
 CODEX_REVIEW_TIME=$(echo "$CODEX_REVIEW" | jq -r 'if . == null then "" else .submitted_at end')
 
-# Decide clearance using the LATEST Codex signal, not whichever signal
-# the script happens to check first. See #64 Codex P1 finding ("Reject
-# stale thumbs-up when newer Codex findings exist").
+# Decide clearance using the LATEST Codex signal on HEAD among THREE signal
+# types — 👍 reaction, COMMENTED review, and issue-comment verdict — not
+# whichever the script checks first (#64, extended for the verdict in
+# #600/#608). Codex emits one signal per pass but can accumulate several on the
+# same HEAD across rounds; the newest wins:
 #
-# Semantics: Codex sends either a review OR a 👍 reaction per pass, but
-# on a PR with multiple rounds on the same HEAD it can end up with both
-# historical review comments AND a reaction. The LATEST one wins:
+#   - 👍 reaction: Codex reacts 👍 only when it has no suggestions → affirmative,
+#     clears (a newer 👍 overrides an earlier review's findings).
+#   - COMMENTED review: clears iff no unaddressed P0/P1 on HEAD.
+#   - issue-comment verdict: clears iff the latest HEAD-anchored verdict is
+#     AFFIRMATIVE (CODEX_HEAD_VERDICT_TIME non-empty) AND no unaddressed P0/P1.
+#     A NON-affirmative latest verdict fails closed.
 #
-#   - If Codex's most recent signal is a review, inspect its P0/P1
-#     findings. Zero findings → clear. Any findings → block.
-#   - If Codex's most recent signal is a 👍 reaction, clear. Codex only
-#     reacts 👍 when it has no suggestions, so a newer 👍 overrides any
-#     earlier review's findings.
-#   - If both timestamps exist, use max() to pick the latest.
-#   - If neither exists, block.
-#
-# All review-side analysis still uses the latest review's
-# pull_request_review_id to scope findings (addressed in round 1's
-# finding 2), so an older review's stale comments are never counted.
+# #608 P1: the verdict MUST participate in latest-signal-wins, not run as a
+# fallback after CLEARED is set — otherwise an older clean 👍/review clears the
+# gate even though Codex re-flagged issues in a NEWER negative verdict. Pick the
+# newest signal by timestamp; ties resolve to the most authoritative disposition
+# (verdict > review > 👍, via iteration order + replace-on-tie), so an ambiguous
+# same-second tie fails closed when the verdict is negative. All review-side
+# P0/P1 analysis still scopes to the latest review's pull_request_review_id
+# (round-1 finding 2), so stale comments never count.
+LATEST_SIGNAL_KIND=""
+LATEST_SIGNAL_TIME=""
+for __sig in "thumbs|$LATEST_THUMBS_UP_TIME" "review|$CODEX_REVIEW_TIME" "verdict|$CODEX_HEAD_VERDICT_ANY_TIME"; do
+  __k=${__sig%%|*}
+  __t=${__sig#*|}
+  [ -n "$__t" ] || continue
+  # Replace on strictly-newer OR on an equal timestamp: iterating thumbs →
+  # review → verdict means the last one at the max time wins the tie, giving
+  # priority verdict > review > 👍.
+  if [ -z "$LATEST_SIGNAL_TIME" ] || [[ "$__t" > "$LATEST_SIGNAL_TIME" ]] \
+     || [ "$__t" = "$LATEST_SIGNAL_TIME" ]; then
+    LATEST_SIGNAL_TIME="$__t"
+    LATEST_SIGNAL_KIND="$__k"
+  fi
+done
 
-if [ -n "$LATEST_THUMBS_UP_TIME" ] && [ -n "$CODEX_REVIEW_TIME" ]; then
-  # Both signals present on HEAD — compare timestamps. ISO 8601 sorts
-  # chronologically under lexicographic string comparison.
-  if [[ "$LATEST_THUMBS_UP_TIME" > "$CODEX_REVIEW_TIME" ]]; then
+case "$LATEST_SIGNAL_KIND" in
+  thumbs)
     CLEARED=true
-    CLEARANCE_REASON="latest signal is 👍 reaction @ $LATEST_THUMBS_UP_TIME (newer than review @ $CODEX_REVIEW_TIME)"
-  else
+    CLEARANCE_REASON="latest Codex signal is 👍 reaction @ $LATEST_SIGNAL_TIME (newest of 👍/review/verdict on HEAD; on or after reaction threshold $REACTION_THRESHOLD)"
+    ;;
+  review)
     if [ "$UNADDRESSED_COUNT" -eq 0 ]; then
       CLEARED=true
-      CLEARANCE_REASON="latest signal is COMMENTED review @ $CODEX_REVIEW_TIME on $HEAD_SHA with no unaddressed P0/P1 findings (newer than 👍 @ $LATEST_THUMBS_UP_TIME)"
+      CLEARANCE_REASON="latest Codex signal is COMMENTED review @ $LATEST_SIGNAL_TIME on $HEAD_SHA with no unaddressed P0/P1 findings"
     fi
-  fi
-elif [ -n "$LATEST_THUMBS_UP_TIME" ]; then
-  # Only a qualifying reaction, no review on HEAD.
-  CLEARED=true
-  CLEARANCE_REASON="👍 reaction from $BOT_LOGIN @ $LATEST_THUMBS_UP_TIME (on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)"
-elif [ -n "$CODEX_REVIEW_TIME" ]; then
-  # Only a review on HEAD, no qualifying reaction.
-  if [ "$UNADDRESSED_COUNT" -eq 0 ]; then
-    CLEARED=true
-    CLEARANCE_REASON="COMMENTED review from $BOT_LOGIN @ $CODEX_REVIEW_TIME on $HEAD_SHA with no unaddressed P0/P1 findings"
-  fi
-fi
-
-# Issue-comment verdict path (#600): if none of the review-object / 👍
-# paths above cleared, a HEAD-anchored AFFIRMATIVE verdict comment
-# ("Didn't find any major issues" + "Reviewed commit: <HEAD>") clears
-# gate (c) — BUT only when there are zero unaddressed P0/P1 inline findings
-# on HEAD (UNADDRESSED_COUNT == 0). This is the fail-closed cross-check the
-# #600 acceptance criteria require: a verdict that still names required-tier
-# findings, or one paired with an unresolved P0/P1 review thread on HEAD,
-# does NOT clear. Because UNADDRESSED_P01 is scoped to a Codex review on
-# HEAD, when the verdict comment stands alone (no review object on HEAD)
-# UNADDRESSED_COUNT is 0 and the verdict clears; when a findings-bearing
-# review co-exists on HEAD, UNADDRESSED_COUNT>0 blocks it. This is the exact
-# scenario from #600: the 👍 expired and Codex's clearance is only its
-# issue-comment verdict.
-if [ "$CLEARED" != "true" ] && [ -n "$CODEX_HEAD_VERDICT_TIME" ] && [ "$UNADDRESSED_COUNT" -eq 0 ]; then
-  CLEARED=true
-  CLEARANCE_REASON="HEAD-anchored affirmative Codex verdict comment @ $CODEX_HEAD_VERDICT_TIME (Reviewed commit prefixes $HEAD_SHA; no unaddressed P0/P1 findings on HEAD) (#600)"
-fi
+    ;;
+  verdict)
+    if [ -n "$CODEX_HEAD_VERDICT_TIME" ] && [ "$UNADDRESSED_COUNT" -eq 0 ]; then
+      CLEARED=true
+      CLEARANCE_REASON="latest Codex signal is a HEAD-anchored AFFIRMATIVE verdict comment @ $LATEST_SIGNAL_TIME (Reviewed commit prefixes $HEAD_SHA; no unaddressed P0/P1) (#600)"
+    else
+      log "gate (c): latest Codex signal is a non-affirmative or findings-bearing verdict comment @ $LATEST_SIGNAL_TIME — fail closed, does not clear (#608 P1)"
+    fi
+    ;;
+esac
 
 else
   log "gate (c): codex.enabled=false — ignoring Codex bot review/reaction signals; requiring Phase 4b substitute clearance when allowed"

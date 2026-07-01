@@ -54,12 +54,16 @@ else
   fail "gate (b) branch 2 does not accept the verdict comment"
 fi
 
-# ── 3. Structural: gate (c) accepts the verdict comment ONLY with the
-#      fail-closed UNADDRESSED_COUNT==0 cross-check.
-if grep -Eq 'if \[ "\$CLEARED" != "true" \] && \[ -n "\$CODEX_HEAD_VERDICT_TIME" \] && \[ "\$UNADDRESSED_COUNT" -eq 0 \]; then' "$SCRIPT"; then
-  pass "gate (c) honors the verdict comment gated on zero unaddressed P0/P1 findings (fail-closed, #600)"
+# ── 3. Structural: gate (c) folds the verdict into a UNIFIED latest-signal-wins
+#      decision (not a fallback after CLEARED), and the verdict path clears ONLY
+#      when the latest verdict is affirmative AND there are zero unaddressed
+#      P0/P1 — a non-affirmative latest verdict fails closed (#608 P1).
+if grep -q "LATEST_SIGNAL_KIND" "$SCRIPT" \
+   && grep -Eq 'if \[ -n "\$CODEX_HEAD_VERDICT_TIME" \] && \[ "\$UNADDRESSED_COUNT" -eq 0 \]; then' "$SCRIPT" \
+   && grep -q "fail closed, does not clear (#608 P1)" "$SCRIPT"; then
+  pass "gate (c) folds the verdict into latest-signal-wins; a non-affirmative latest verdict fails closed (#608 P1)"
 else
-  fail "gate (c) is missing the verdict clearance path or its UNADDRESSED_COUNT==0 cross-check"
+  fail "gate (c) is missing the unified latest-signal-wins decision or the verdict fail-closed branch"
 fi
 
 # ── 3b. Structural (#608): latest-verdict-first (a newer non-affirmative
@@ -220,40 +224,43 @@ check_case "affirmative header on a later line (multiline anchor) → clears" \
 Codex Review: Didn't find any major issues.
 Reviewed commit: d05ff4d0" "2026-07-01T14:00:00Z")"
 
-# ── 5. Gate (c) fail-closed cross-check: the verdict clears ONLY when there
-#      are zero unaddressed P0/P1 findings on HEAD. Model the exact shell
-#      condition `CLEARED!=true && VERDICT!="" && UNADDRESSED_COUNT==0`.
-gatec_verdict_clears() { # cleared verdict_time unaddressed_count -> "yes"/"no"
-  local cleared="$1" vt="$2" uc="$3"
-  if [ "$cleared" != "true" ] && [ -n "$vt" ] && [ "$uc" -eq 0 ]; then
-    echo yes
-  else
-    echo no
-  fi
+# ── 5. Gate (c) unified latest-signal-wins (#608 P1). Model the case block in
+#      codex-review-check.sh: pick the newest of {👍, review, verdict} (ties go
+#      verdict > review > 👍), then clear per that signal's disposition. KEEP IN
+#      SYNC with the LATEST_SIGNAL_KIND case in codex-review-check.sh.
+gatec_clears() { # thumbs_t review_t verdict_any_t verdict_affirm(0/1) unaddressed
+  local tt="$1" rt="$2" vt="$3" va="$4" uc="$5"
+  local kind="" time="" sig k t
+  for sig in "thumbs|$tt" "review|$rt" "verdict|$vt"; do
+    k=${sig%%|*}; t=${sig#*|}
+    [ -n "$t" ] || continue
+    if [ -z "$time" ] || [[ "$t" > "$time" ]] || [ "$t" = "$time" ]; then
+      time="$t"; kind="$k"
+    fi
+  done
+  case "$kind" in
+    thumbs) echo yes ;;
+    review) if [ "$uc" -eq 0 ]; then echo yes; else echo no; fi ;;
+    verdict) if [ "$va" = "1" ] && [ "$uc" -eq 0 ]; then echo yes; else echo no; fi ;;
+    *) echo no ;;
+  esac
 }
-# not-yet-cleared ("false") models the verdict path being reached after the
-# review / 👍 paths did not clear.
-if [ "$(gatec_verdict_clears false "2026-07-01T10:00:00Z" 0)" = "yes" ]; then
-  pass "gate (c): verdict present + 0 unaddressed P0/P1 → clears"
-else
-  fail "gate (c): verdict + 0 findings should clear"
-fi
-if [ "$(gatec_verdict_clears false "2026-07-01T10:00:00Z" 2)" = "no" ]; then
-  pass "gate (c): verdict present + 2 unaddressed P0/P1 → does NOT clear (fail-closed)"
-else
-  fail "gate (c): verdict + unresolved findings must NOT clear"
-fi
-if [ "$(gatec_verdict_clears false "" 0)" = "no" ]; then
-  pass "gate (c): no verdict comment → verdict path is a no-op"
-else
-  fail "gate (c): absent verdict must not clear via this path"
-fi
-# already-cleared ("true", e.g. via 👍/review) short-circuits the verdict path.
-if [ "$(gatec_verdict_clears true "2026-07-01T10:00:00Z" 0)" = "no" ]; then
-  pass "gate (c): already-cleared short-circuits the verdict path (no double-eval)"
-else
-  fail "gate (c): CLEARED=true should short-circuit the verdict path"
-fi
+gc() { # desc expected thumbs review verdict affirm unaddressed
+  local desc="$1" exp="$2" got
+  got=$(gatec_clears "$3" "$4" "$5" "$6" "$7")
+  if [ "$got" = "$exp" ]; then pass "gate (c) latest-signal: $desc"; else fail "gate (c) latest-signal: $desc — expected $exp got $got"; fi
+}
+# THE #608 P1 regression: an older clean 👍/review must NOT clear when a NEWER
+# non-affirmative verdict exists on HEAD.
+gc "older 👍 + NEWER non-affirmative verdict → NO (P1 #608)"        no  "2026-07-01T10:00:00Z" ""                    "2026-07-01T12:00:00Z" 0 0
+gc "older clean review + NEWER non-affirmative verdict → NO (#608)" no  ""                    "2026-07-01T10:00:00Z" "2026-07-01T12:00:00Z" 0 0
+gc "same-second 👍 vs non-affirmative verdict → verdict wins tie → NO" no "2026-07-01T10:00:00Z" ""                 "2026-07-01T10:00:00Z" 0 0
+gc "older non-affirmative verdict + NEWER 👍 → YES"                 yes "2026-07-01T12:00:00Z" ""                    "2026-07-01T10:00:00Z" 0 0
+gc "verdict-only affirmative + 0 findings → YES"                    yes ""                    ""                    "2026-07-01T10:00:00Z" 1 0
+gc "verdict-only affirmative + unaddressed findings → NO"           no  ""                    ""                    "2026-07-01T10:00:00Z" 1 2
+gc "thumbs-only → YES"                                              yes "2026-07-01T10:00:00Z" ""                    ""                    0 0
+gc "review-only clean → YES"                                        yes ""                    "2026-07-01T10:00:00Z" ""                    0 0
+gc "no signals at all → NO"                                         no  ""                    ""                    ""                    0 0
 
 echo ""
 echo "test_codex_review_check_verdict: $PASS passed, $FAIL failed"
