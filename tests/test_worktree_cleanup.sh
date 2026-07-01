@@ -222,6 +222,16 @@ git push -q origin --delete "$REUSED_BRANCH"
 git switch -q main
 git fetch -q --prune
 
+# ── Case 11 (Codex P2): gone-upstream branch whose merged-PR LOOKUP FAILS ─
+# (the stubbed `gh pr list` exits 1 for it, simulating an auth/API failure).
+# Must surface as NOT EVALUATED ("lookup FAILED", counted under "gone
+# unverified") — distinct from the verified "no merged PR" bucket — and kept.
+UNKNOWN_BRANCH="gone-lookup-fails"
+git branch "$UNKNOWN_BRANCH"
+git push -q -u origin "$UNKNOWN_BRANCH"
+git push -q origin --delete "$UNKNOWN_BRANCH"
+git fetch -q --prune
+
 # ── gh stub on PATH ───────────────────────────────────────────────────
 STUB_DIR="$WORKDIR/stub-bin"
 mkdir -p "$STUB_DIR"
@@ -265,6 +275,11 @@ if [ "\$1" = "pr" ] && [ "\$2" = "list" ]; then
   if [ "\$head" = "$SAMERUN_BRANCH" ]; then
     echo "$SAMERUN_MERGED_TIP"
     exit 0
+  fi
+  if [ "\$head" = "$UNKNOWN_BRANCH" ]; then
+    # Simulated auth/API failure → the helper must classify this as
+    # unknown (NOT evaluated), never as a verified "no merged PR".
+    exit 1
   fi
   # $NOPR_BRANCH (and anything else) → no merged PR: empty stdout, exit 0.
   exit 0
@@ -403,6 +418,26 @@ else
   pass "unmerged branch is NOT flagged as a MERGED deletion candidate"
 fi
 
+# Case 11 (Codex P2): the lookup-failure branch is surfaced as NOT EVALUATED
+# ("lookup FAILED" + the "gone unverified" counter) — never mislabeled as the
+# verified "no merged PR" bucket, never a deletion candidate.
+UNKNOWN_LABEL=$(echo "$OUT" | awk -v b="$UNKNOWN_BRANCH" '
+  /^  \[/            { label = $0 }
+  $1 == "branch:" && $2 == b { print label; exit }
+')
+if echo "$UNKNOWN_LABEL" | grep -q "lookup FAILED"; then
+  pass "lookup-failure branch surfaced as NOT EVALUATED (lookup FAILED label)"
+else
+  fail "lookup-failure branch mislabeled (label=$UNKNOWN_LABEL)"
+  show_out_on_fail
+fi
+if echo "$OUT" | grep -qE "gone unverified \(lookup failed\): +[1-9]"; then
+  pass "summary shows ≥1 gone-unverified (lookup-failure visibility)"
+else
+  fail "summary gone-unverified count missing/zero"
+  show_out_on_fail
+fi
+
 # Summary counts: at least 1 in each of gone/detached/locked/orphan.
 if echo "$OUT" | grep -qE "gone-upstream: +[1-9]"; then
   pass "summary shows ≥1 gone-upstream"
@@ -517,6 +552,14 @@ else
   fail "reused-name branch was deleted despite its tip not descending from the merged head"
 fi
 
+# Case 11 (Codex P2): the lookup-failure branch must also survive --apply — an
+# unverified branch is never a deletion candidate.
+if git rev-parse --verify -q "refs/heads/$UNKNOWN_BRANCH" >/dev/null; then
+  pass "lookup-failure branch is NOT deleted (unverified, kept)"
+else
+  fail "lookup-failure branch was deleted despite the merged-PR lookup failing"
+fi
+
 # Case 8 (#605): the same --apply that removed SAMERUN_WT must ALSO delete
 # its branch ref in the SAME run (re-snapshot after removals). Assert both
 # the worktree is gone AND the branch ref is gone AND the removal+deletion
@@ -580,17 +623,34 @@ else
   echo "$OUT4" >&2
 fi
 
-# Final dry-run should be clean.
+# Final dry-run: the diverged merged branch is still present (kept for manual
+# review — --apply never touches it), and a review-needed branch counts as
+# actionable, so the audit stays exit 2 until a human resolves it (Codex P2:
+# a dry-run that reports "review manually" but exits 0 defeats the signal).
 set +e
 OUT5=$(PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1)
 RC5=$?
 set -e
 
-if [ "$RC5" -eq 0 ]; then
-  pass "final dry-run audit clean (exit 0)"
+if [ "$RC5" -eq 2 ] && echo "$OUT5" | grep -qE "merged\+extra \(review\): +[1-9]"; then
+  pass "final dry-run stays exit 2 while the diverged branch awaits manual review"
 else
-  fail "final dry-run not clean (exit $RC5)"
+  fail "final dry-run expected exit 2 with merged+extra >=1, got exit $RC5"
   echo "$OUT5" >&2
+fi
+
+# Hand-resolve the diverged branch (the human decision the audit is asking
+# for), then the audit is genuinely clean.
+git branch -D "$DIVERGED_BRANCH" >/dev/null 2>&1 || true
+set +e
+OUT6=$(PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1)
+RC6=$?
+set -e
+if [ "$RC6" -eq 0 ]; then
+  pass "final dry-run audit clean (exit 0) after the diverged branch is hand-resolved"
+else
+  fail "final dry-run not clean after hand-resolving diverged branch (exit $RC6)"
+  echo "$OUT6" >&2
 fi
 
 # Clean up the /tmp PR worktree path on success too, since we created it

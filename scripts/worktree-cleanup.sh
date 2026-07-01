@@ -187,11 +187,15 @@ gh_pr_state() {
 #               already merged/safe (Codex P1). The ancestry requirement also
 #               guards against a REUSED branch name whose old PR merged but
 #               whose current tip is unrelated new work.
-#   none      — no merged PR exists for this branch name, OR no merged head is
-#               an ancestor of the tip (reused name), OR gh is missing / the tip
-#               cannot be resolved. NEVER treat as merged.
-# Exit status: 0 for exact|diverged, 1 for none. Only `exact` is auto-deleted;
-# `diverged` is surfaced-and-kept.
+#   none      — the lookup SUCCEEDED and either no merged PR exists for this
+#               branch name, or no merged head is an ancestor of the tip
+#               (reused name). NEVER treat as merged.
+#   unknown   — the lookup FAILED (gh missing, ref unresolvable, or `gh pr
+#               list` errored). Not a verified "no merged PR" — the caller
+#               surfaces it as NOT EVALUATED rather than examined-not-merged
+#               (Codex P2: auth/API failures must stay visible).
+# Exit status: 0 for exact|diverged, 1 for none|unknown. Only `exact` is
+# auto-deleted; `diverged` is surfaced-and-kept; `none`/`unknown` are kept.
 #
 # Rationale (#605 root cause 2): the prior `grep -Fxq "$tip"` required an
 # exact tip==headRefOid match, so any branch carrying a commit beyond the PR
@@ -202,13 +206,19 @@ gh_pr_state() {
 # instead of a silent skip.
 gh_branch_merged_pr_status() {
   local branch="$1" tip merged_heads
+  # `unknown` ≠ `none`: a missing gh, an unresolvable ref, or a failed
+  # `gh pr list` call is a VERIFICATION FAILURE, not a verified "no merged
+  # PR". Collapsing the two would report gone branches on a gh-less /
+  # unauthenticated machine as "examined, not merged" when they were never
+  # actually evaluated — the exact evaluated-vs-not-evaluated distinction
+  # #605 requires (Codex P2). Both keep the branch; only the label differs.
   if ! command -v gh >/dev/null 2>&1; then
-    echo "none"
+    echo "unknown"
     return 1
   fi
-  tip=$(git -C "$MAIN_WORKTREE" rev-parse "$branch" 2>/dev/null) || { echo "none"; return 1; }
-  merged_heads=$(cd "$MAIN_WORKTREE" && gh pr list --head "$branch" --state merged --json headRefOid --jq '.[].headRefOid' 2>/dev/null) || { echo "none"; return 1; }
-  # No merged PR for this head name → not safe to delete.
+  tip=$(git -C "$MAIN_WORKTREE" rev-parse "$branch" 2>/dev/null) || { echo "unknown"; return 1; }
+  merged_heads=$(cd "$MAIN_WORKTREE" && gh pr list --head "$branch" --state merged --json headRefOid --jq '.[].headRefOid' 2>/dev/null) || { echo "unknown"; return 1; }
+  # Successful lookup, no merged PR for this head name → not safe to delete.
   if [ -z "$merged_heads" ]; then
     echo "none"
     return 1
@@ -337,6 +347,10 @@ SUMMARY_EXAMINED_NOT_MERGED=()
 # carries EXTRA commit(s) on top of the merged head. Surfaced for manual review
 # and NEVER auto-deleted (the extra commits may be unmerged follow-up work).
 SUMMARY_DIVERGED_KEPT=()
+# Gone-upstream branches whose merged-PR lookup FAILED (gh missing /
+# unauthenticated / API error) — NOT evaluated, distinct from both "examined,
+# not merged" and the deletion candidates (Codex P2 on #610).
+SUMMARY_LOOKUP_UNKNOWN=()
 
 print_record() {
   local label="$1" color="$2" path="$3" branch="$4" head="$5" upstream="$6" pr_state="$7" lock_reason="$8"
@@ -485,6 +499,17 @@ while IFS= read -r LOCAL_BRANCH; do
   # would abort the script. The verdict string is already on stdout, so we
   # only need to neutralize the exit status here.
   MERGED_STATUS=$(gh_branch_merged_pr_status "$LOCAL_BRANCH") || true
+  if [ "$MERGED_STATUS" = "unknown" ]; then
+    # Lookup FAILED (gh missing / unauthenticated / API error): the branch was
+    # NOT evaluated. Say so explicitly — do not let a verification failure
+    # masquerade as a verified "no merged PR" (Codex P2). Kept, never deleted.
+    LOCAL_BRANCH_TIP=$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)
+    print_record "[gone-upstream local branch — merged-PR lookup FAILED, keeping]" "$C_YELLOW" \
+      "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$LOCAL_BRANCH_TIP" "[gone]" "" ""
+    echo "    reason:   could not verify merged state (gh missing, unauthenticated, or API error) — branch NOT evaluated"
+    SUMMARY_LOOKUP_UNKNOWN+=("$LOCAL_BRANCH")
+    continue
+  fi
   if [ "$MERGED_STATUS" = "none" ]; then
     # Evaluated but NOT a deletion candidate: no merged PR for this head
     # name. Emit a CLEAR line (rather than a silent `continue`) so the
@@ -633,6 +658,9 @@ printf "  gone kept (unmerged): %d\n" "${#SUMMARY_EXAMINED_NOT_MERGED[@]}"
 # Merged-PR branches whose local tip has extra commit(s) on top — surfaced for
 # manual review, never auto-deleted (may hold unmerged follow-up work).
 printf "  merged+extra (review): %d\n" "${#SUMMARY_DIVERGED_KEPT[@]}"
+# Branches whose merged-PR lookup FAILED — not evaluated (gh missing /
+# unauthenticated / API error). Distinct from "gone kept (unmerged)".
+printf "  gone unverified (lookup failed): %d\n" "${#SUMMARY_LOOKUP_UNKNOWN[@]}"
 printf "  open-PR retained: %d\n" "${#SUMMARY_OPEN_PR[@]}"
 printf "  orphan dirs:      %d\n" "${#SUMMARY_ORPHAN[@]}"
 
@@ -655,7 +683,17 @@ fi
 # dry-run: exit 2 if there is anything actionable, 0 otherwise. This lets
 # callers wire it into "audit fails locally" checks while we explicitly
 # keep it OUT of PR CI per #288.
-total_candidates=$(( ${#SUMMARY_GONE[@]} + ${#SUMMARY_DETACHED[@]} + ${#SUMMARY_LOCKED[@]} + ${#SUMMARY_LOCAL_BRANCH[@]} + ${#SUMMARY_ORPHAN[@]} ))
+#
+# SUMMARY_DIVERGED_KEPT counts as actionable (Codex P2 on #610): a merged-PR
+# branch with extra local commits needs a HUMAN decision (rebase/extract or
+# hand-delete), and it is exactly the newly surfaced #605 class — a dry-run
+# that reports it but exits 0 would defeat the audit signal. --apply never
+# touches these, so the exit-2 persists until the human resolves the branch.
+# SUMMARY_LOOKUP_UNKNOWN is deliberately NOT in the exit code: on a gh-less or
+# unauthenticated machine EVERY gone branch is unknown, and hard-failing the
+# audit there would make it unusable exactly where it can verify least; the
+# summary line + per-branch records carry the visibility instead.
+total_candidates=$(( ${#SUMMARY_GONE[@]} + ${#SUMMARY_DETACHED[@]} + ${#SUMMARY_LOCKED[@]} + ${#SUMMARY_LOCAL_BRANCH[@]} + ${#SUMMARY_ORPHAN[@]} + ${#SUMMARY_DIVERGED_KEPT[@]} ))
 if [ "$total_candidates" -gt 0 ]; then
   echo ""
   echo "${C_DIM}Dry run. Re-run with --apply to remove safe candidates.${C_RESET}"
