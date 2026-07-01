@@ -234,6 +234,11 @@
         "automated_attempts": { "type": ["integer", "null"], "minimum": 0 },
         "fail_closed_events": { "type": ["integer", "null"], "minimum": 0 },
         "tokens_total": { "type": ["integer", "null"], "minimum": 0 },
+        "elapsed_seconds_total": {
+          "description": "Cumulative reviewer wall-clock (seconds) across the aggregated records. Optional: records aggregated from pre-#602 sources may not carry it; the renderer shows 'unavailable' when absent/null.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
         "notional_usd": { "type": ["number", "null"], "minimum": 0 },
         "human_minutes_saved_estimate": {
           "description": "Two-element [low, high] range of human shuttle minutes displaced, or null when unavailable.",

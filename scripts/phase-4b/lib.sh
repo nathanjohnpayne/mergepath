@@ -412,6 +412,7 @@ p4b_validate_verdict() {
     | ($s.properties.findings.items.required | sort) as $finding_keys
     | ($s.properties.findings.items.properties.severity.enum) as $severity_enum
     | ($s.properties.usage.required | sort) as $usage_keys
+    | ($s.properties.usage.properties | keys | sort) as $usage_all_keys
     | def okstr: (type == "string") and (length > 0);
       def okintnull: (. == null) or (type == "number" and floor == . and . >= 0);
       # Guard the derived constants are the right SHAPE first. `sort` already
@@ -437,12 +438,22 @@ p4b_validate_verdict() {
             and (.body | okstr))
       and ((.verdict != "APPROVED")
            or all(.findings[]?; (.severity as $s2 | ($required_severities | index($s2) | not))))
+      # usage: the schema-required keys must all be present, any other key
+      # must be one the schema DECLARES (the additive optional #602 fields),
+      # and every field must type-check. This mirrors the JSON Schema exactly:
+      # required ⊆ keys ⊆ properties, additionalProperties: false.
       and ((.usage == null)
            or ((.usage | type == "object")
-               and ((.usage | keys_unsorted | sort) == $usage_keys)
+               and ((.usage | keys_unsorted | sort) as $uk
+                    | (($usage_keys - $uk) == []) and (($uk - $usage_all_keys) == []))
                and (.usage.token_count | okintnull)
                and (.usage.input_tokens | okintnull)
                and (.usage.output_tokens | okintnull)
+               and ((.usage.cache_creation_input_tokens // null) | okintnull)
+               and ((.usage.cache_read_input_tokens // null) | okintnull)
+               and ((.usage.reasoning_tokens // null) | okintnull)
+               and ((.usage.total_cost_usd // null) as $c
+                    | ($c == null) or (($c | type) == "number" and $c >= 0))
                and (.usage.source | okstr)))
   ' >/dev/null 2>&1
 }

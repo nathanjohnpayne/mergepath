@@ -57,6 +57,22 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=phase-4b/lib.sh
 . "$ROOT/phase-4b/lib.sh"
 
+# Phase 4b approval-loop accounting (#602). Sourced when present so the hook
+# call sites below exist; a missing or unsourceable module simply leaves
+# accounting off (the plain-summary review body posts unchanged). Advisory to
+# safety: no accounting failure may block, fabricate, or re-code a review.
+P4B_ACCT_AVAILABLE=false
+if [ -r "$ROOT/phase-4b/accounting.sh" ]; then
+  # shellcheck source=phase-4b/accounting.sh
+  if . "$ROOT/phase-4b/accounting.sh"; then
+    P4B_ACCT_AVAILABLE=true
+  fi
+fi
+# True iff the module loaded AND phase_4b_automation.accounting.enabled is
+# not false (defaults on under the disabled-by-default parent; this line is
+# only reached when the parent automation is enabled).
+p4b_acct_on() { [ "$P4B_ACCT_AVAILABLE" = true ] && p4b_acct_hook_active; }
+
 ADAPTER_DIR="$ROOT/phase-4b/adapters"
 HANDOFF="${P4B_HANDOFF:-$ROOT/post-phase-4b-handoff.sh}"
 GH_AS_REVIEWER="${P4B_GH_AS_REVIEWER:-$ROOT/gh-as-reviewer.sh}"
@@ -210,6 +226,12 @@ fall_back_to_manual() {
   local handoff_ref="$PR"
   [ -n "$REPO" ] && handoff_ref="${REPO}#${PR}"
   p4b_warn "falling back to the manual Phase 4b handoff: $why"
+  # Accounting (#602): record the fail-closed loop as positive safety
+  # evidence. Advisory — a recording failure never alters this fallback.
+  if p4b_acct_on 2>/dev/null; then
+    p4b_acct_hook_note_fallback "$why" \
+      || p4b_warn "accounting: could not record the fail-closed loop (continuing)"
+  fi
   if [ -x "$HANDOFF" ]; then
     PHASE_4B_REVIEWER_IDENTITY="$REVIEWER" "$HANDOFF" "$handoff_ref" >&2 2>/dev/null \
       || p4b_warn "could not render chat-side handoff block (needs gh); brief the human manually"
@@ -233,10 +255,15 @@ ADAPTER_ARGS=( --pr "$PR" )
 [ -n "$HEAD" ]      && ADAPTER_ARGS+=( --head "$HEAD" )
 [ -n "$DIFF_FILE" ] && ADAPTER_ARGS+=( --diff-file "$DIFF_FILE" )
 
+# Accounting (#602): per-loop timing signals, captured whether or not the
+# adapter succeeds so fail-closed loops carry their duration too.
+P4B_ACCT_LOOP_STARTED_EPOCH="$(date +%s)"
 set +e
 VERDICT_JSON="$(p4b_run_with_timeout "$ADAPTER_TIMEOUT" "$ADAPTER_SCRIPT" "${ADAPTER_ARGS[@]}")"
 ADAPTER_RC=$?
 set -e
+P4B_ACCT_LOOP_ELAPSED_SECONDS=$(( $(date +%s) - P4B_ACCT_LOOP_STARTED_EPOCH ))
+export P4B_ACCT_LOOP_STARTED_EPOCH P4B_ACCT_LOOP_ELAPSED_SECONDS
 if [ "$ADAPTER_RC" -ne 0 ]; then
   if p4b_is_timeout_rc "$ADAPTER_RC"; then
     fall_back_to_manual "adapter timed out after ${ADAPTER_TIMEOUT}s"
@@ -289,6 +316,28 @@ trap "rm -f '$BODY_FILE'" EXIT
   fi
   printf '\n\n_Posted by scripts/phase-4b-review.sh under the reviewer identity. See plans/automated-phase-4b-handoff.md._\n'
 } > "$BODY_FILE"
+
+# --- Phase 4b approval-loop accounting (#602) --------------------------------
+# Advisory to safety: any failure below leaves BODY_FILE as the plain summary
+# above and never changes review posting or exit codes. Gated on
+# phase_4b_automation.accounting.enabled (default true under the disabled
+# parent). Loop records accumulate across invocations in the per-PR loop log
+# so a CHANGES_REQUESTED → fix → APPROVED cycle renders its full history.
+if p4b_acct_on 2>/dev/null; then
+  ACCT_POSTED_STATE="posted"
+  [ "$DRY_RUN" = true ] && ACCT_POSTED_STATE="dry-run"
+  p4b_acct_hook_record_loop "$VERDICT" "$ACCT_POSTED_STATE" false "" \
+    || p4b_warn "accounting: could not record this loop (plain summary unaffected)"
+  if [ "$VERDICT" = "APPROVED" ]; then
+    if ACCT_BLOCK="$(p4b_acct_hook_render_approval_block)" && [ -n "$ACCT_BLOCK" ]; then
+      if ! { printf '\n\n'; printf '%s\n' "$ACCT_BLOCK"; } >> "$BODY_FILE"; then
+        p4b_warn "accounting: could not append the accounting block; posting the plain-summary approval"
+      fi
+    else
+      p4b_warn "accounting: report generation failed; posting the plain-summary approval (never blocks a valid approval)"
+    fi
+  fi
+fi
 
 # --- map verdict -> GitHub review state ------------------------------------
 post_review() {

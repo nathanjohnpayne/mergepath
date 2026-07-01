@@ -203,6 +203,13 @@ USAGE="$(printf '%s' "$ENVELOPE" | jq -c '
         token_count: ($total | int_or_null),
         input_tokens: ($input | int_or_null),
         output_tokens: ($output | int_or_null),
+        # Additive #602 usage fields — populated ONLY from the CLI envelope
+        # (optional + nullable in verdict.schema.json), never estimated.
+        cache_creation_input_tokens: ((.usage.cache_creation_input_tokens // .usage.cache_creation_tokens // null) | int_or_null),
+        cache_read_input_tokens: ((.usage.cache_read_input_tokens // .usage.cache_read_tokens // null) | int_or_null),
+        reasoning_tokens: ((.usage.reasoning_tokens // null) | int_or_null),
+        total_cost_usd: ((.total_cost_usd? // null) as $c
+                         | if ($c | type) == "number" and $c >= 0 then $c else null end),
         source: "claude-json-envelope"
       }
       end

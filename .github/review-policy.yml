@@ -636,6 +636,31 @@ phase_4b_automation:
   claude_effort: medium
   # codex_effort: high           # optional; empty/absent ⇒ Codex CLI default
 
+  # --- Approval-loop accounting (#602) -------------------------------------
+  # Folds the "## Phase 4b Approval Accounting" block (plus the embedded
+  # machine-readable `p4b-accounting:v1` record) into the automated APPROVED
+  # review body: loop-centric ledger, findings lifecycle, rigor
+  # proof-of-work, four-part cost model (wall-clock / tokens / throttle /
+  # labeled-notional $), and repo-wide running totals. Advisory to safety:
+  # if report generation fails the orchestrator posts its plain-summary
+  # approval — accounting never blocks and never fabricates an approval.
+  # Renderer: scripts/phase-4b/accounting.sh; record schema:
+  # scripts/phase-4b/accounting.schema.json.
+  accounting:
+    # Sub-toggle. Default TRUE — but only reachable when the parent
+    # `enabled: true` above flips, so shipping this block changes nothing
+    # today. Set false to keep automation while posting the plain summary.
+    enabled: true
+    # Notional-cost price keys into scripts/phase-4b/prices.json
+    # (`<provider>.<model...>.<tier>`). The adapters do NOT capture exact
+    # model IDs yet, so pricing is an explicit OPT-IN mapping: leave these
+    # unset and the cost row renders `n/a — no price resolvable` (billed
+    # cost is $0.00 on the plan either way; the record still posts).
+    # The keys below match prices.json `backfills.pr_580`; uncomment to
+    # opt in once the reviewer CLIs' models are known for this repo.
+    # codex_price_key: openai.gpt-5.3-codex.standard
+    # claude_price_key: anthropic.claude-sonnet-4.6.standard
+
 # ---------------------------------------------------------------------------
 # Auto-clear blocking labels (#195/#197)
 # ---------------------------------------------------------------------------

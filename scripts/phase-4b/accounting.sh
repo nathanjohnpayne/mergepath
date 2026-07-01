@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# scripts/phase-4b/accounting.sh — Phase 4b approval-loop accounting.
+# scripts/phase-4b/accounting.sh — Phase 4b approval-loop accounting (#602).
 #
-# REFERENCE IMPLEMENTATION (#602). Sourced by scripts/phase-4b-review.sh; it
-# does NOT set -euo pipefail on the caller. Bash 3.2 portable (macOS). Pure
-# functions over JSON inputs — no network, no GitHub, no reviewer CLI — so the
-# whole module is unit-testable in isolation (tests/test_phase_4b_accounting.sh).
+# REFERENCE IMPLEMENTATION. Sourced by scripts/phase-4b-review.sh; it does NOT
+# set -euo pipefail on the caller. Bash 3.2 portable (macOS). Pure functions
+# over JSON inputs — no network, no GitHub, no reviewer CLI — so the whole
+# module is unit-testable in isolation (tests/test_phase_4b_accounting.sh).
 #
 # What it produces: the human-readable "## Phase 4b Approval Accounting" block
 # AND the embedded machine-readable `<!-- p4b-accounting:v1 ... -->` JSON record
@@ -12,12 +12,15 @@
 # adapter attempt, not just the final approval), carries findings lifecycle +
 # disposition, a rigor-as-proof-of-work table, a four-part cost model
 # (wall-clock / tokens / throttle / labeled-notional$), and repo-wide running
-# totals aggregated STATELESSLY from prior embedded records.
+# totals aggregated from prior embedded records.
 #
 # Data-integrity posture (all enforced here, fail-closed):
 #   - No estimated tokens. A CLI that exposes nothing renders "unavailable".
 #   - No green rigor check without a captured signal; else "n/a — reason".
-#   - A required-tier (P0/P1) finding can NEVER accompany a posted APPROVED.
+#   - A required-tier (P0/P1 by default) finding can NEVER accompany a posted
+#     APPROVED. Required findings on CHANGES_REQUESTED loops are legitimate
+#     history (the changes-requested-then-fixed lifecycle) and never poison a
+#     later clean approval's record.
 #   - Notional $ is ALWAYS labeled not-billed; prices come from the versioned
 #     prices.json (never hardcoded); a missing price ⇒ notional n/a, record
 #     still posts.
@@ -33,6 +36,9 @@
 P4B_ACCT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 p4b_acct_warn() { echo "[phase-4b-acct] WARN: $*" >&2; }
+
+# Repo root: accounting.sh lives at <root>/scripts/phase-4b/accounting.sh.
+p4b_acct_repo_root() { ( cd -P "$P4B_ACCT_DIR/../.." && pwd ); }
 
 # scripts/phase-4b/prices.json unless overridden (tests).
 p4b_acct_prices_path() {
@@ -53,9 +59,60 @@ p4b_acct_schema_path() {
 }
 
 # Cited human-shuttle-avoided constant. REVIEW_POLICY.md § Phase 4b Triggers:
-# "the human-mediated handoff typically adds 30 minutes to a few hours per PR".
+# "The human-mediated handoff typically adds 30 minutes to a few hours per PR."
 P4B_ACCT_HUMAN_MINUTES_LOW=30
 P4B_ACCT_HUMAN_MINUTES_HIGH=180
+
+# --- config (phase_4b_automation.accounting) --------------------------------
+
+# The policy file. Overridable via MERGEPATH_REVIEW_POLICY_PATH (tests) —
+# the same override lib.sh honors.
+p4b_acct_config() {
+  if [ -n "${MERGEPATH_REVIEW_POLICY_PATH:-}" ]; then
+    printf '%s' "$MERGEPATH_REVIEW_POLICY_PATH"
+    return 0
+  fi
+  printf '%s/.github/review-policy.yml' "$(p4b_acct_repo_root)"
+}
+
+# p4b_acct_config_field <field> — scalar under
+# phase_4b_automation.accounting.<field>. Empty string if absent.
+p4b_acct_config_field() {
+  local field="$1" cfg
+  cfg="$(p4b_acct_config)"
+  [ -f "$cfg" ] || return 0
+  awk -v field="$field" '
+    /^phase_4b_automation:/ { inauto=1; inacct=0; next }
+    inauto && /^[^[:space:]#]/ { inauto=0; inacct=0 }
+    inauto && /^[[:space:]][[:space:]]accounting:[[:space:]]*(#.*)?$/ { inacct=1; next }
+    inauto && inacct {
+      line=$0
+      gsub(/[[:space:]]*#.*$/, "", line)
+      if (line ~ /^[[:space:]]*$/) next
+      indent = match(line, /[^[:space:]]/) - 1
+      if (indent <= 2) { inacct=0; next }
+      key=line
+      sub(/^[[:space:]]*/, "", key)
+      sub(/:.*/, "", key)
+      if (key == field) {
+        sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", line)
+        gsub(/^["\047]/, "", line)
+        gsub(/["\047][[:space:]]*$/, "", line)
+        sub(/[[:space:]]+$/, "", line)
+        print line; exit
+      }
+    }
+  ' "$cfg"
+}
+
+# Sub-toggle: phase_4b_automation.accounting.enabled. Defaults to TRUE under
+# the (disabled-by-default) parent — accounting renders whenever the parent
+# automation actually posts, unless a repo opts out explicitly.
+p4b_acct_config_enabled() {
+  local v
+  v="$(p4b_acct_config_field enabled)"
+  [ "${v:-true}" != "false" ]
+}
 
 # --- price table -----------------------------------------------------------
 
@@ -105,21 +162,14 @@ p4b_acct_resolve_rate() {
 # p4b_acct_notional_from_tokens <tokens-json> <price_key> <rate_fields-json>
 # Compute a notional USD figure for one loop's token object using the named
 # rate fields resolved from prices.json. Two modes:
-#   - explicit input/output/cache split: rate_fields lists which of
-#     {input,output,cache_creation:cache_write_5m,cache_read} to price, matched
-#     to the token object's fields.
+#   - explicit split: rate_fields lists which of
+#     {input, output, cache_write_5m, cache_read} to price, matched to the
+#     token object's {input, output, cache_creation, cache_read} fields.
 #   - total-only: rate_fields == ["total_only_blended_80_20"] (or any single
-#     blended field) applied to tokens.total.
-# Prints the dollar figure (bc-scale 6) on success. Returns non-zero (no
-# output) if any required rate is unresolvable OR the needed token count is
-# null — so the caller renders notional n/a rather than an estimate.
-#
-# The mapping from a token field to its rate field is fixed here:
-#   input          -> the rate field literally named in rate_fields if "input"
-#   output         -> "output"
-#   cache_creation -> "cache_write_5m"
-#   cache_read     -> "cache_read"
-#   total          -> "total_only_blended_80_20" (or the sole blended field)
+#     field matching /blended|total_only/) applied to tokens.total.
+# Prints the dollar figure on success. Returns non-zero (no output) if any
+# required rate is unresolvable OR the needed token count is null — the
+# caller renders notional n/a rather than an estimate.
 p4b_acct_notional_from_tokens() {
   local tokens_json="$1" price_key="$2" rate_fields_json="$3"
   [ -n "$tokens_json" ] && [ -n "$price_key" ] && [ -n "$rate_fields_json" ] || return 1
@@ -135,7 +185,7 @@ p4b_acct_notional_from_tokens() {
     total="$(printf '%s' "$tokens_json" | jq -r '.total // empty' 2>/dev/null || true)"
     [ -n "$total" ] || return 1
     rate="$(p4b_acct_resolve_rate "$price_key" "$field")" || return 1
-    printf '%s' "$total" | jq -r --argjson rate "$rate" '(. / 1000000.0) * $rate'
+    printf '%s' "$total" | jq --argjson rate "$rate" '(. / 1000000.0) * $rate'
     return 0
   fi
 
@@ -165,6 +215,87 @@ p4b_acct_notional_from_tokens() {
   jq -n "${args[@]}" "$sum_expr"
 }
 
+# p4b_acct_notional_auto <tokens-json> <price_key>
+# Price one loop's tokens: prefer the exact split (input+output, plus the
+# cache components actually counted), else fall back to the total-only
+# blended rate (marked approximate by construction — see prices.json
+# estimation_policy). Non-zero when nothing can be priced.
+p4b_acct_notional_auto() {
+  local tokens_json="$1" price_key="$2" fields nfields
+  [ -n "$tokens_json" ] && [ -n "$price_key" ] || return 1
+  fields="$(printf '%s' "$tokens_json" | jq -c '
+    [ (if .input != null and .output != null then "input", "output" else empty end),
+      (if .cache_creation != null then "cache_write_5m" else empty end),
+      (if .cache_read != null then "cache_read" else empty end) ]' 2>/dev/null)" || return 1
+  nfields="$(printf '%s' "$fields" | jq -r 'length' 2>/dev/null || echo 0)"
+  if [ "${nfields:-0}" -ge 2 ]; then
+    if p4b_acct_notional_from_tokens "$tokens_json" "$price_key" "$fields"; then
+      return 0
+    fi
+  fi
+  p4b_acct_notional_from_tokens "$tokens_json" "$price_key" '["total_only_blended_80_20"]'
+}
+
+# p4b_acct_loop_provider <loop-json>
+# Classify a loop's token provider. Keys off the reviewer identity
+# (nathanpayne-codex -> codex), which is meaningful even for
+# orchestrator-dry-run loops whose adapter name is not the reviewer CLI;
+# falls back to the adapter name, then the direction target, then "other".
+p4b_acct_loop_provider() {
+  printf '%s' "$1" | jq -r '
+    ((.reviewer // "") | ascii_downcase) as $rev
+    | (.adapter // "") as $ad
+    | (.direction // "") as $dir
+    | if ($rev | test("codex")) or ($ad | test("codex")) or ($dir | test("->codex")) then "codex"
+      elif ($rev | test("claude")) or ($ad | test("claude")) or ($dir | test("->claude")) then "claude"
+      else "other" end' 2>/dev/null
+}
+
+# p4b_acct_price_key_for_provider <codex|claude|other>
+# The configured price key for a provider, from
+# phase_4b_automation.accounting.{codex,claude}_price_key. Empty when not
+# configured — the adapters do not capture exact model IDs yet (#602), so
+# pricing is an explicit opt-in mapping, never a guess.
+p4b_acct_price_key_for_provider() {
+  case "$1" in
+    codex)  p4b_acct_config_field codex_price_key ;;
+    claude) p4b_acct_config_field claude_price_key ;;
+    *)      : ;;
+  esac
+}
+
+# p4b_acct_notional_for_loops <loops-json-array>
+# Total notional USD (rounded to cents) across all loops with CLI-exposed
+# token counts. Loops with no exposed tokens contribute nothing (you cannot
+# price what was not measured). Fail-closed: if ANY token-bearing loop cannot
+# be priced (no configured key, missing price/field), or NO loop has tokens,
+# return non-zero so the caller renders `n/a` instead of a partial figure.
+p4b_acct_notional_for_loops() {
+  local loops_json="$1" n i loop tokens has_tokens prov key val
+  local vals="" priced=0
+  n="$(printf '%s' "$loops_json" | jq -r 'length' 2>/dev/null)" || return 1
+  [ -n "$n" ] || return 1
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    loop="$(printf '%s' "$loops_json" | jq -c ".[$i]" 2>/dev/null)" || return 1
+    tokens="$(printf '%s' "$loop" | jq -c '.tokens' 2>/dev/null)" || return 1
+    has_tokens="$(printf '%s' "$tokens" | jq -r '
+      (.total != null) or (.input != null and .output != null)' 2>/dev/null)" || return 1
+    if [ "$has_tokens" = "true" ]; then
+      prov="$(p4b_acct_loop_provider "$loop")"
+      key="$(p4b_acct_price_key_for_provider "$prov")"
+      [ -n "$key" ] || return 1
+      val="$(p4b_acct_notional_auto "$tokens" "$key")" || return 1
+      vals="${vals}${val}
+"
+      priced=$((priced + 1))
+    fi
+    i=$((i + 1))
+  done
+  [ "$priced" -gt 0 ] || return 1
+  printf '%s' "$vals" | jq -s 'add * 100 | round / 100'
+}
+
 # --- record extraction + aggregation ---------------------------------------
 
 # p4b_acct_marker — the embedded-block marker string.
@@ -175,15 +306,19 @@ p4b_acct_marker() { printf 'p4b-accounting:v1'; }
 # well-formed objects carrying the v1 schema tag are emitted; malformed or
 # non-conformant blocks are skipped (they must not corrupt aggregation). Used
 # to aggregate running totals statelessly from GitHub-fetched prior approval
-# bodies. The block spans from the `p4b-accounting:v1` marker line to the `-->`
-# HTML-comment close.
+# bodies. The block spans from the `<!-- p4b-accounting:v1` comment-open line
+# to the `-->` close; matching the full comment-open (not the bare marker)
+# keeps prose mentions of the marker (e.g. the totals-source footer) from
+# starting a bogus capture.
 p4b_acct_extract_records() {
   awk -v marker="$(p4b_acct_marker)" '
-    index($0, marker) > 0 { capturing = 1; buf = ""; next }
+    BEGIN { open_tag = "<!-- " marker }
+    index($0, open_tag) > 0 { capturing = 1; buf = ""; next }
     capturing {
       if ($0 ~ /-->/) {
-        sub(/-->.*/, "", $0)
-        buf = buf $0 " "
+        line = $0
+        sub(/-->.*/, "", line)
+        buf = buf line " "
         printf "%s\n", buf
         capturing = 0
         next
@@ -199,40 +334,40 @@ p4b_acct_extract_records() {
   done
 }
 
-# p4b_acct_aggregate_running_totals — read prior p4b-accounting:v1 records as
-# JSONL on stdin (one record per line, e.g. the output of extracting embedded
-# blocks) and print a running_totals object (matching the schema's
-# running_totals shape) on stdout. <source> ("github-derived" | "ledger-cache")
-# labels where the records came from. On any parse trouble it prints an
-# {"source":"unavailable","records":0,"reason":...} object and returns 0 — the
-# renderer shows "running totals unavailable" rather than wrong numbers.
+# p4b_acct_aggregate_running_totals [source-label]
+# Read prior p4b-accounting:v1 records as JSONL on stdin (one record per
+# line) and print a running_totals object (matching the schema shape) on
+# stdout. <source> ("github-derived" | "ledger-cache") labels where the
+# records came from. On any parse trouble it prints
+# {"source":"unavailable","records":0,"reason":...} and returns 0 — the
+# renderer then shows "running totals unavailable" rather than wrong numbers.
+# Empty input is VALID (records: 0 — the first-ever approval).
 p4b_acct_aggregate_running_totals() {
   local source_label="${1:-github-derived}"
   local input result
   input="$(cat)"
-  # Empty input ⇒ zero prior records (valid: first-ever approval).
-  result="$(printf '%s' "$input" | jq -s \
+  result="$(printf '%s' "$input" | jq -cs \
     --arg source "$source_label" \
     --argjson mlow "$P4B_ACCT_HUMAN_MINUTES_LOW" \
     --argjson mhigh "$P4B_ACCT_HUMAN_MINUTES_HIGH" '
-    # Each line must be a v1 record; a non-conformant line aborts to unavailable.
     (map(select(type == "object" and .schema == "p4b-accounting/v1"))) as $recs
     | if ($recs | length) != (. | length) and (. | length) > 0
       then error("non-conformant record in ledger")
       else
         ($recs | length) as $n
+        | ([ $recs[] | select(.final_verdict == "APPROVED") ] | length) as $approved
         | {
             source: $source,
             records: $n,
-            auto_approved_prs: ([ $recs[] | select(.final_verdict == "APPROVED") ] | length),
+            auto_approved_prs: $approved,
             automated_attempts: ([ $recs[] | .totals.adapter_invocations // 0 ] | add // 0),
             fail_closed_events: ([ $recs[] | .totals.fail_closed_events // 0 ] | add // 0),
             tokens_total: ([ $recs[] | .totals.tokens_total // 0 ] | add // 0),
-            notional_usd: ([ $recs[] | .totals.notional_usd // 0 ] | add // 0),
+            elapsed_seconds_total: ([ $recs[] | .totals.elapsed_seconds_total // 0 ] | add // 0),
+            notional_usd: (([ $recs[] | .totals.notional_usd // 0 ] | add // 0) * 100 | round / 100),
             human_minutes_saved_estimate:
               (if $n == 0 then null
-               else [ ([ $recs[] | select(.final_verdict == "APPROVED") ] | length) * $mlow,
-                      ([ $recs[] | select(.final_verdict == "APPROVED") ] | length) * $mhigh ]
+               else [ $approved * $mlow, $approved * $mhigh ]
                end)
           }
       end
@@ -245,29 +380,65 @@ p4b_acct_aggregate_running_totals() {
   printf '%s' "$result"
 }
 
+# p4b_acct_running_totals_for_post [ledger-file]
+# Resolve the running-totals source at post time. Priority:
+#   1. P4B_ACCT_PRIOR_RECORDS_JSONL — an injected prior-record file (e.g. the
+#      output of piping GitHub-fetched prior review bodies through
+#      p4b_acct_extract_records), labeled via P4B_ACCT_PRIOR_RECORDS_SOURCE
+#      (default "github-derived"). This is the stateless GitHub path.
+#   2. The append-only ledger cache (labeled "ledger-cache").
+#   3. Neither ⇒ explicit "unavailable" (never a guessed zero baseline).
+p4b_acct_running_totals_for_post() {
+  local ledger="${1:-}"
+  if [ -n "${P4B_ACCT_PRIOR_RECORDS_JSONL:-}" ]; then
+    if [ -r "$P4B_ACCT_PRIOR_RECORDS_JSONL" ]; then
+      p4b_acct_aggregate_running_totals "${P4B_ACCT_PRIOR_RECORDS_SOURCE:-github-derived}" \
+        < "$P4B_ACCT_PRIOR_RECORDS_JSONL"
+      return 0
+    fi
+    jq -nc --arg reason "prior-records file not readable: $P4B_ACCT_PRIOR_RECORDS_JSONL" \
+      '{source:"unavailable", records:0, reason:$reason}'
+    return 0
+  fi
+  if [ -n "$ledger" ] && [ -r "$ledger" ]; then
+    p4b_acct_aggregate_running_totals "ledger-cache" < "$ledger"
+    return 0
+  fi
+  jq -nc '{source:"unavailable", records:0,
+           reason:"no prior-record source (GitHub aggregation not attempted; ledger cache absent)"}'
+}
+
 # --- per-approval totals ---------------------------------------------------
 
-# p4b_acct_compute_totals <loops-json-array> <price_table_version> <notional_usd|null>
-# Compute the per-approval `totals` object from the loop array. Token totals
-# sum only the loops with a non-null total; provider split keys off the adapter
-# name. notional_usd is passed in (the renderer resolves it via the price
-# table) and echoed through; a null value is preserved (missing price).
+# p4b_acct_compute_totals <loops-json-array> <price_table_version> <notional_usd|null> [unique-findings-json]
+# Compute the per-approval `totals` object from the loop array. Token/elapsed
+# totals sum only the loops that exposed a value; when NO loop exposed one the
+# total is null (explicitly unavailable, never a fabricated 0). notional_usd
+# is passed in (the caller resolves it via the price table) and echoed
+# through; null is preserved (missing price). advisory_issues_filed is derived
+# from the unique-finding issue links.
 p4b_acct_compute_totals() {
-  local loops_json="$1" ptv="$2" notional="$3"
-  local ptv_arg notional_arg
-  if [ -n "$ptv" ]; then ptv_arg="$ptv"; else ptv_arg="null"; fi
-  if [ -n "$notional" ] && [ "$notional" != "null" ]; then notional_arg="$notional"; else notional_arg="null"; fi
+  local loops_json="$1" ptv="$2" notional="$3" uf_json="${4:-[]}"
+  local ptv_json notional_json
+  if [ -n "$ptv" ]; then
+    ptv_json="$(jq -nc --arg v "$ptv" '$v' 2>/dev/null)" || return 1
+  else
+    ptv_json="null"
+  fi
+  if [ -n "$notional" ] && [ "$notional" != "null" ]; then
+    notional_json="$notional"
+  else
+    notional_json="null"
+  fi
   printf '%s' "$loops_json" | jq -c \
-    --argjson ptv "$(printf '%s' "$ptv_arg" | jq -R 'if . == "null" then null else . end')" \
-    --argjson notional "$notional_arg" '
+    --argjson ptv "$ptv_json" \
+    --argjson notional "$notional_json" \
+    --argjson uf "$uf_json" '
     {
       adapter_invocations: length,
-      tokens_total: ([ .[] | .tokens.total // empty ] | if length == 0 then 0 else add end),
+      tokens_total: ([ .[] | .tokens.total // empty ]
+                     | if length == 0 then null else add end),
       tokens_by_provider: (
-        # Classify by the reviewer identity (nathanpayne-codex -> codex), which
-        # is meaningful even for orchestrator-dry-run loops whose adapter name
-        # is not the reviewer CLI; fall back to the adapter name, then to the
-        # direction's target reviewer, then "other".
         reduce .[] as $l ({};
           (($l.reviewer // "") | ascii_downcase) as $rev
           | ($l.adapter // "") as $ad
@@ -278,13 +449,14 @@ p4b_acct_compute_totals() {
           | if ($l.tokens.total == null) then .
             else .[$prov] = ((.[$prov] // 0) + $l.tokens.total) end)
       ),
-      elapsed_seconds_total: ([ .[] | .elapsed_seconds // empty ] | if length == 0 then null else add end),
+      elapsed_seconds_total: ([ .[] | .elapsed_seconds // empty ]
+                              | if length == 0 then null else add end),
       billed_usd: 0.0,
       notional_usd: $notional,
       price_table_version: $ptv,
       fail_closed_events: ([ .[] | select(.fail_closed.happened == true) ] | length),
-      advisory_issues_filed: []
-    }'
+      advisory_issues_filed: ([ $uf[] | .issue | select(. != null) ] | unique)
+    }' 2>/dev/null
 }
 
 # --- fail-closed assertion -------------------------------------------------
@@ -300,21 +472,140 @@ p4b_acct_required_severities_json() {
 }
 
 # p4b_acct_assert_no_required_with_approved <final_verdict> <loops-json-array>
-# Fail-closed invariant: a posted APPROVED must not carry a required-tier
-# finding in ANY loop's histogram. Returns 0 when safe, non-zero when the
-# combination is illegal (the orchestrator must then NOT post the accounting
-# approval — it falls back). Mirrors the orchestrator's strict posting rule.
+# Fail-closed invariant on the strict posting rule: an APPROVED verdict may
+# never carry a required-tier finding.
+#   - Any loop recorded as APPROVED / APPROVED_WITH_ADVISORIES with a positive
+#     required-tier count and NO fail-closed marker is a violation (that
+#     approval should have been refused, never recorded as clean history).
+#   - When the record's final verdict is APPROVED, at least one loop must be a
+#     clean APPROVED: verdict APPROVED with required-tier counts present
+#     (non-null) and zero. A record cannot claim an approval no loop produced.
+# Required-tier findings on CHANGES_REQUESTED loops are legitimate history
+# (changes-requested-then-fixed) and do NOT violate the rule.
+# Returns 0 when safe, non-zero when the combination is illegal.
 p4b_acct_assert_no_required_with_approved() {
-  local final_verdict="$1" loops_json="$2" required
-  [ "$final_verdict" = "APPROVED" ] || return 0
+  local final_verdict="$1" loops_json="$2" required ok
   required="$(p4b_acct_required_severities_json)" || return 1
-  # For each required tier, any loop with a positive count is a violation.
-  local violated
-  violated="$(printf '%s' "$loops_json" | jq -r \
+  ok="$(printf '%s' "$loops_json" | jq -r \
+    --arg final "$final_verdict" \
     --argjson req "$required" '
-    [ .[] | .findings as $f
-      | $req[] | select(($f[.] // 0) > 0) ] | length' 2>/dev/null || echo 1)"
-  [ "$violated" = "0" ]
+    def reqcount($f): [ $req[] | ($f[.] // 0) ] | add // 0;
+    def reqnull($f):  ([ $req[] | select($f[.] == null) ] | length) > 0;
+    ( [ .[]
+        | select((.verdict == "APPROVED") or (.verdict == "APPROVED_WITH_ADVISORIES"))
+        | select((.fail_closed.happened // false) | not)
+        | select(reqcount(.findings) > 0)
+      ] | length == 0 ) as $history_ok
+    | (if $final == "APPROVED"
+       then ([ .[]
+               | select(.verdict == "APPROVED")
+               | select(reqnull(.findings) | not)
+               | select(reqcount(.findings) == 0)
+             ] | length) > 0
+       else true end) as $final_ok
+    | ($history_ok and $final_ok)
+  ' 2>/dev/null)" || return 1
+  [ "$ok" = "true" ]
+}
+
+# --- verdict -> accounting mappers ------------------------------------------
+
+# p4b_acct_tokens_from_verdict <verdict-json>
+# Map a verdict.schema.json object's usage into the accounting tokens shape.
+# usage null/absent ⇒ all-null counts with source "unavailable" — never an
+# estimate. The additive #602 usage fields (cache_creation_input_tokens,
+# cache_read_input_tokens, reasoning_tokens) map onto the accounting names.
+p4b_acct_tokens_from_verdict() {
+  printf '%s' "${1:-null}" | jq -c '
+    (.usage // null) as $u
+    | if $u == null then
+        {total: null, input: null, output: null, cache_creation: null,
+         cache_read: null, reasoning: null, source: "unavailable"}
+      else
+        { total: ($u.token_count // null),
+          input: ($u.input_tokens // null),
+          output: ($u.output_tokens // null),
+          cache_creation: ($u.cache_creation_input_tokens // null),
+          cache_read: ($u.cache_read_input_tokens // null),
+          reasoning: ($u.reasoning_tokens // null),
+          source: ($u.source // "unavailable") }
+      end' 2>/dev/null
+}
+
+# p4b_acct_findings_hist_from_verdict <verdict-json>
+# Severity histogram over the accounting severity superset. The verdict
+# contract is P0-P3; nitpick/unknown absorb other sources and anything
+# unmapped. A null/absent findings array counts as zero findings.
+p4b_acct_findings_hist_from_verdict() {
+  printf '%s' "${1:-null}" | jq -c '
+    (.findings // []) as $f
+    | { P0: ([ $f[] | select(.severity == "P0") ] | length),
+        P1: ([ $f[] | select(.severity == "P1") ] | length),
+        P2: ([ $f[] | select(.severity == "P2") ] | length),
+        P3: ([ $f[] | select(.severity == "P3") ] | length),
+        nitpick: ([ $f[] | select(.severity == "nitpick") ] | length),
+        unknown: ([ $f[]
+                    | (.severity // "unknown") as $s
+                    | select((["P0","P1","P2","P3","nitpick"] | index($s)) == null)
+                  ] | length) }' 2>/dev/null
+}
+
+# The all-null histogram: a loop whose finding counts were not retained
+# (e.g. a fail-closed loop whose verdict was discarded before parsing).
+p4b_acct_findings_hist_null() {
+  printf '%s' '{"P0":null,"P1":null,"P2":null,"P3":null,"nitpick":null,"unknown":null}'
+}
+
+# p4b_acct_finding_details_from_verdict <verdict-json> <loop#>
+# Emit one JSONL line per finding: {loop, severity, path, line, body}. Feeds
+# p4b_acct_unique_findings for the cross-loop lifecycle.
+p4b_acct_finding_details_from_verdict() {
+  local vj="${1:-null}" loop="$2"
+  case "$loop" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$vj" | jq -c --argjson loop "$loop" '
+    (.findings // [])[]
+    | { loop: $loop,
+        severity: (.severity // "unknown"),
+        path: (.path // null),
+        line: (.line // null),
+        body: (.body // "") }' 2>/dev/null
+}
+
+# p4b_acct_unique_findings [dispositions-json]
+# Read finding-detail JSONL on stdin (the concatenated output of
+# p4b_acct_finding_details_from_verdict across loops) and emit the
+# unique_findings array: de-duplicated by (severity, path, line, body),
+# ordered by first appearance, ids F1..Fn, with first_loop / last_loop
+# lifecycle. Dispositions come ONLY from the optional dispositions map
+# ({"F1":{"disposition":"fixed","fix_commit":"abc","issue":null}, ...});
+# the default is "unresolved" with null links — the accounting never GUESSES
+# a disposition.
+p4b_acct_unique_findings() {
+  local disp="${1:-}"
+  [ -n "$disp" ] || disp='{}'
+  jq -cs --argjson disp "$disp" '
+    reduce .[] as $d ( {order: [], map: {}} ;
+      ( $d.severity + "|" + (($d.path // "~") | tostring)
+        + "|" + (($d.line // -1) | tostring) + "|" + $d.body ) as $k
+      | if .map[$k] != null then
+          .map[$k].last_loop = ([ .map[$k].last_loop, $d.loop ] | max)
+          | .map[$k].first_loop = ([ .map[$k].first_loop, $d.loop ] | min)
+        else
+          .order += [$k]
+          | .map[$k] = {severity: $d.severity, first_loop: $d.loop, last_loop: $d.loop}
+        end )
+    | . as $st
+    | [ range(0; ($st.order | length)) as $i
+        | $st.order[$i] as $k
+        | ("F" + (($i + 1) | tostring)) as $id
+        | ($disp[$id] // {}) as $o
+        | { id: $id,
+            severity: $st.map[$k].severity,
+            first_loop: $st.map[$k].first_loop,
+            last_loop: $st.map[$k].last_loop,
+            disposition: ($o.disposition // "unresolved"),
+            fix_commit: ($o.fix_commit // null),
+            issue: ($o.issue // null) } ]' 2>/dev/null
 }
 
 # --- record assembly -------------------------------------------------------
@@ -322,10 +613,10 @@ p4b_acct_assert_no_required_with_approved() {
 # p4b_acct_build_record — assemble the full p4b-accounting/v1 record.
 # All inputs are passed explicitly (pure function). Prints the compact record
 # JSON on stdout, or returns non-zero (no output) if the fail-closed invariant
-# is violated or the inputs cannot be assembled into schema-valid JSON.
+# is violated or the inputs cannot be assembled into valid JSON.
 #
-# Env-style named inputs (all required unless noted):
-#   $1 pr                                   integer
+# Positional inputs (all required unless noted):
+#   $1 pr                                   positive integer
 #   $2 final_head_sha                       string
 #   $3 final_verdict                        APPROVED|CHANGES_REQUESTED
 #   $4 final_reviewer                       string
@@ -342,15 +633,22 @@ p4b_acct_build_record() {
   local astate="$6" wall="$7" loops_json="$8" uf_json="$9"
   local totals_json="${10}" running_json="${11}" gen_at="${12}"
 
-  # Fail-closed: never emit an APPROVED record that carries a required finding.
+  case "$pr" in ''|*[!0-9]*) return 1 ;; esac
+
+  # Fail-closed: never emit an APPROVED record whose loop history violates
+  # the strict posting rule (see the assertion's contract above).
   if ! p4b_acct_assert_no_required_with_approved "$verdict" "$loops_json"; then
-    p4b_acct_warn "refusing to build APPROVED accounting: a required-tier finding is present in loop history (fail-closed)"
+    p4b_acct_warn "refusing to build APPROVED accounting: loop history violates the required-tier posting rule (fail-closed)"
     return 1
   fi
 
   [ -n "$gen_at" ] || gen_at="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
   local wall_arg
-  if [ -n "$wall" ]; then wall_arg="$wall"; else wall_arg="null"; fi
+  case "$wall" in
+    '') wall_arg="null" ;;
+    *[!0-9]*) return 1 ;;
+    *) wall_arg="$wall" ;;
+  esac
 
   jq -nc \
     --argjson pr "$pr" \
@@ -384,8 +682,9 @@ p4b_acct_build_record() {
 
 # --- rendering helpers -----------------------------------------------------
 
-# Render a token count cell for the loop table: "N,NNN (source)" or
-# "unavailable (source)" — never an estimate.
+# Render a token count cell for the loop table: "N,NNN (source)", with the
+# in/out split when the CLI exposed one, or "unavailable (source)" — never
+# an estimate.
 p4b_acct_fmt_tokens_cell() {
   local tokens_json="$1"
   printf '%s' "$tokens_json" | jq -r '
@@ -394,12 +693,14 @@ p4b_acct_fmt_tokens_cell() {
       | explode | reverse
       | [ range(0; length) as $i | .[$i], (if ($i % 3 == 2 and $i != length-1) then 44 else empty end) ]
       | reverse | implode;
-    if .total != null then "\(.total | commafy) (\(.source))"
-    else "unavailable (\(.source))" end'
+    if .total != null and .input != null and .output != null then
+      "\(.total | commafy) (\(.source): in \(.input | commafy) / out \(.output | commafy))"
+    elif .total != null then "\(.total | commafy) (\(.source))"
+    else "unavailable (\(.source))" end' 2>/dev/null
 }
 
 # Render one rigor row: "| <check> | <result> | <evidence> |". A row whose
-# signal is absent renders "n/a — reason" rather than a green check.
+# signal is absent renders "n/a" + the reason rather than a green check.
 # args: <check> <captured:true|false> <evidence-or-reason>
 p4b_acct_rigor_row() {
   local check="$1" captured="$2" text="$3"
@@ -413,43 +714,51 @@ p4b_acct_rigor_row() {
 # p4b_acct_render_block <record-json>
 # Render the full human-readable "## Phase 4b Approval Accounting" block with
 # the machine-readable record embedded as an HTML comment. Input is the record
-# produced by p4b_acct_build_record. Prints markdown on stdout.
+# produced by p4b_acct_build_record. Prints markdown on stdout; returns
+# non-zero (no output committed to the caller) on malformed input or when the
+# record violates the required-tier posting rule (defense in depth — the
+# builder already refuses, but render can be called on arbitrary records).
 p4b_acct_render_block() {
   local rec="$1"
   [ -n "$rec" ] || return 1
   printf '%s' "$rec" | jq -e . >/dev/null 2>&1 || return 1
 
-  local pr head verdict reviewer direction astate wall
+  local pr head verdict reviewer direction astate wall loops_json
   pr="$(printf '%s' "$rec" | jq -r '.pr')"
   head="$(printf '%s' "$rec" | jq -r '.final_head_sha')"
   verdict="$(printf '%s' "$rec" | jq -r '.final_verdict')"
   reviewer="$(printf '%s' "$rec" | jq -r '.final_reviewer')"
   direction="$(printf '%s' "$rec" | jq -r '.final_direction')"
   astate="$(printf '%s' "$rec" | jq -r '.automation_state')"
-  wall="$(printf '%s' "$rec" | jq -r '.wall_time_first_loop_to_approval_seconds // "n/a"')"
+  wall="$(printf '%s' "$rec" | jq -r '.wall_time_first_loop_to_approval_seconds // "unavailable"')"
+  loops_json="$(printf '%s' "$rec" | jq -c '.loops')"
+
+  # Defense in depth: refuse to render an illegal record.
+  p4b_acct_assert_no_required_with_approved "$verdict" "$loops_json" || return 1
+
+  local wall_disp
+  if [ "$wall" = "unavailable" ]; then wall_disp="unavailable"; else wall_disp="${wall} s"; fi
 
   printf '## Phase 4b Approval Accounting\n\n'
-  printf '**Reviewed head:** `%s` · **Final approval:** `%s` as `%s` (%s) · **Automation state:** %s · **Wall time, first 4b loop → approval:** %s%s\n\n' \
-    "$head" "$verdict" "$reviewer" "$direction" "$astate" "$wall" \
-    "$([ "$wall" != "n/a" ] && printf ' s reviewer time' || printf '')"
+  printf '**Reviewed head:** `%s` · **Final verdict:** `%s` as `%s` (%s) · **Automation state:** %s · **Wall time, first 4b loop → approval:** %s\n\n' \
+    "$head" "$verdict" "$reviewer" "$direction" "$astate" "$wall_disp"
 
   # --- Loop summary ---
   printf '### Loop summary\n\n'
   printf '| Loop | Reviewer | Adapter · direction | Verdict | Posted? | Elapsed | Tokens (source) | P0 | P1 | P2 | P3 | Nit | Fail-closed |\n'
   printf '|---:|---|---|---|---|---:|---|---:|---:|---:|---:|---:|---|\n'
-  local loops_count i
+  local loops_count i loop_json tok_cell
   loops_count="$(printf '%s' "$rec" | jq -r '.loops | length')"
   i=0
   while [ "$i" -lt "$loops_count" ]; do
-    local loop_json tok_cell
     loop_json="$(printf '%s' "$rec" | jq -c ".loops[$i]")"
     tok_cell="$(p4b_acct_fmt_tokens_cell "$(printf '%s' "$loop_json" | jq -c '.tokens')")"
     printf '%s' "$loop_json" | jq -r --arg tok "$tok_cell" '
-      def cell(x): (if x == null then "—" else (x|tostring) end);
+      def cell(x): (if x == null then "—" else (x | tostring) end);
       "| \(.loop) | \(.reviewer) | \(.adapter) · \(.direction) | \(.verdict) | \(.posted) | "
       + (if .elapsed_seconds == null then "n/a" else "\(.elapsed_seconds) s" end)
       + " | \($tok) | \(cell(.findings.P0)) | \(cell(.findings.P1)) | \(cell(.findings.P2)) | \(cell(.findings.P3)) | \(cell(.findings.nitpick)) | "
-      + (if .fail_closed.happened then "**yes** — \(.fail_closed.reason)" else "no" end)
+      + (if .fail_closed.happened then "**yes** — \(.fail_closed.reason // "unrecorded reason")" else "no" end)
       + " |"'
     i=$((i + 1))
   done
@@ -460,7 +769,7 @@ p4b_acct_render_block() {
   uf_count="$(printf '%s' "$rec" | jq -r '.unique_findings | length')"
   printf '### Findings and disposition\n\n'
   if [ "$uf_count" -eq 0 ]; then
-    printf '_No findings on the approved HEAD. See the rigor table below for proof this was reviewed hard rather than rubber-stamped._\n\n'
+    printf '_No findings recorded on the approved HEAD. See the rigor table below for evidence this was reviewed hard rather than rubber-stamped._\n\n'
   else
     printf '| Finding | Severity | First loop | Last seen | Disposition | Fix commit / issue |\n'
     printf '|---|---|---:|---:|---|---|\n'
@@ -473,43 +782,75 @@ p4b_acct_render_block() {
         + " |"'
     printf '\n'
     printf '%s' "$rec" | jq -r '
-      ([ .unique_findings[] | select(.first_loop == .last_loop) ] | length) as $uniq
-      | ([ .unique_findings[] | select(.first_loop != .last_loop) ] | length) as $rep
+      ([ .unique_findings[] | select(.first_loop != .last_loop) ] | length) as $rep
       | "Unique current-head findings: \(.unique_findings | length). Repeated/stale across loops: \($rep)."'
     printf '\n\n'
   fi
 
   # --- Rigor (proof-of-work for the final posted approval) ---
+  # Every green row is backed by a signal captured in the record or enforced
+  # structurally by the orchestrator path that produced it; anything not
+  # captured renders n/a with the reason (never a green check on faith).
   printf '### Rigor (final posted approval)\n\n'
   printf '| Check | Result | Evidence |\n'
   printf '|---|---|---|\n'
-  # Each row is backed by a captured signal already recorded in the record.
-  local final_loop
-  final_loop="$(printf '%s' "$rec" | jq -c '.loops | last')"
-  # Verdict schema-conformant: the orchestrator only reaches here on a validated verdict.
-  p4b_acct_rigor_row "Verdict schema-conformant" true "lib.sh jq mirror of verdict.schema.json accepted the verdict"
-  p4b_acct_rigor_row "Reviewed current HEAD" true "posted commit_id=\`$head\`, created-review SHA re-verified"
-  # Cross-agent: reviewer login prefix vs direction author.
-  local xagent xagent_ev
-  xagent="$(printf '%s' "$rec" | jq -r '(.final_direction | test("->")) and ((.final_direction | split("->")[0]) != (.final_reviewer | sub("^nathanpayne-";"")))')"
-  xagent_ev="direction \`$direction\`, reviewer \`$reviewer\`"
-  p4b_acct_rigor_row "Cross-agent (reviewer ≠ author)" "$xagent" "$xagent_ev"
-  # Plan-only auth: from the final loop's plan_auth signal.
+  local is_auto=false final_loop
+  [ "$astate" != "manual" ] && is_auto=true
+  # The loop backing the posted verdict: the last clean APPROVED loop for an
+  # APPROVED record (probes/fail-closed loops may follow it), else the last.
+  final_loop="$(printf '%s' "$rec" | jq -c '
+    if .final_verdict == "APPROVED"
+    then ((.loops | map(select(.verdict == "APPROVED")) | last) // (.loops | last))
+    else (.loops | last) end')"
+
+  if [ "$is_auto" = true ]; then
+    p4b_acct_rigor_row "Verdict schema-conformant" true "orchestrator validated via the lib.sh jq mirror of verdict.schema.json before rendering"
+    p4b_acct_rigor_row "Reviewed current HEAD" true "review POST pinned commit_id=\`$head\`; created-review SHA re-verified (head drift falls back)"
+  else
+    p4b_acct_rigor_row "Verdict schema-conformant" false "manual handoff; validation signal not captured"
+    p4b_acct_rigor_row "Reviewed current HEAD" false "manual handoff; HEAD-pin signal not captured"
+  fi
+
+  local xagent
+  xagent="$(printf '%s' "$rec" | jq -r '
+    (.final_direction | test("->"))
+    and ((.final_direction | split("->")[0])
+         != (.final_reviewer | sub("^nathanpayne-"; "")))')"
+  if [ "$xagent" = "true" ]; then
+    p4b_acct_rigor_row "Cross-agent (reviewer ≠ author)" true "direction \`$direction\`, reviewer \`$reviewer\`"
+  else
+    p4b_acct_rigor_row "Cross-agent (reviewer ≠ author)" false "direction \`$direction\` does not evidence a distinct authoring agent"
+  fi
+
   local plan_auth
   plan_auth="$(printf '%s' "$final_loop" | jq -r '.plan_auth // ""')"
   if [ -n "$plan_auth" ]; then
-    p4b_acct_rigor_row "Plan-only auth (no metered API)" true "\`plan_auth=$plan_auth\`; API-key env scrubbed by the adapter"
+    p4b_acct_rigor_row "Plan-only auth (no metered API)" true "\`plan_auth=$plan_auth\` verified by the adapter gate; API-key env scrubbed"
   else
     p4b_acct_rigor_row "Plan-only auth (no metered API)" false "plan-auth posture not captured for this loop"
   fi
-  # Read-only posture: always true for the reference adapters.
-  p4b_acct_rigor_row "Read-only posture" true "codex \`--sandbox read-only\` / claude \`--permission-mode plan --tools \"\"\`"
-  p4b_acct_rigor_row "Exhaustive review pass" true "bounded \"Exhaustive code review\" adapter prompt"
-  # Fail-closed rule honored: 0 required findings on the approval, and any fail-closed loop is recorded.
+
+  local known_adapter
+  known_adapter="$(printf '%s' "$final_loop" | jq -r '
+    (.adapter // "") | test("^review-via-(codex|claude)\\.sh$|^orchestrator")')"
+  if [ "$known_adapter" = "true" ]; then
+    p4b_acct_rigor_row "Read-only posture" true "codex \`--sandbox read-only\` / claude \`--permission-mode plan --tools \"\"\` (pinned by the adapter)"
+    p4b_acct_rigor_row "Exhaustive review pass" true "bounded \"Exhaustive code review\" adapter prompt"
+  else
+    p4b_acct_rigor_row "Read-only posture" false "adapter posture not captured for this loop"
+    p4b_acct_rigor_row "Exhaustive review pass" false "adapter prompt not captured for this loop"
+  fi
+
   local fc_events
   fc_events="$(printf '%s' "$rec" | jq -r '.totals.fail_closed_events // 0')"
-  p4b_acct_rigor_row "Fail-closed rule honored" true "0 required-tier findings on the approval; $fc_events fail-closed loop(s) recorded"
-  # Reviewer CLI version: captured only if the final loop recorded it (#586).
+  p4b_acct_rigor_row "Fail-closed rule honored" true "0 required-tier findings on the posted approval (asserted at build + render); $fc_events fail-closed loop(s) recorded"
+
+  if [ -n "${P4B_ACCT_GATES_EVIDENCE:-}" ]; then
+    p4b_acct_rigor_row "Local gates green" true "$P4B_ACCT_GATES_EVIDENCE"
+  else
+    p4b_acct_rigor_row "Local gates green" false "local gate results not captured for this run"
+  fi
+
   local cli_ver
   cli_ver="$(printf '%s' "$final_loop" | jq -r '.cli_version // ""')"
   if [ -n "$cli_ver" ]; then
@@ -526,18 +867,24 @@ p4b_acct_render_block() {
   printf '%s' "$rec" | jq -r \
     --argjson mlow "$P4B_ACCT_HUMAN_MINUTES_LOW" --argjson mhigh "$P4B_ACCT_HUMAN_MINUTES_HIGH" '
     .totals as $t
-    | (if $t.elapsed_seconds_total == null then "unavailable" else "\($t.elapsed_seconds_total) s across \($t.adapter_invocations) loop(s)" end) as $wall
-    | (if $t.tokens_total == null or $t.tokens_total == 0 then "unavailable (no CLI-exposed counts)"
-       else "\($t.tokens_total) total (" + ([ $t.tokens_by_provider | to_entries[] | "\(.key) \(.value)" ] | join(", ")) + ")" end) as $tok
-    | (if $t.notional_usd == null then "n/a — no price for the recorded model(s)"
-       else "~$\($t.notional_usd * 100 | round / 100)  *(not billed; price table `\($t.price_table_version // "unknown")`)*" end) as $notional
-    | ([ .loops[] | .throttle_events // 0 ] | add // 0) as $throttle
-    | "| Reviewer wall-clock | **\($wall)** |\n"
+    | (if $t.elapsed_seconds_total == null then "unavailable (no loop timings captured)"
+       else "\($t.elapsed_seconds_total) s across \($t.adapter_invocations) loop(s)" end) as $wallrow
+    | (if $t.tokens_total == null then "unavailable (no CLI-exposed counts)"
+       else "\($t.tokens_total) total ("
+            + ([ $t.tokens_by_provider | to_entries[] | "\(.key) \(.value)" ] | join(", "))
+            + ")" end) as $tok
+    | (if $t.notional_usd == null then "n/a — no price resolvable for the recorded loops *(not billed either way)*"
+       else "~$\($t.notional_usd) *(not billed; price table `\($t.price_table_version // "unknown")`)*" end) as $notional
+    | ([ .loops[] | .throttle_events | select(. != null) ]) as $thr
+    | (if ($thr | length) == 0 then "not captured" else ($thr | add | tostring) end) as $throttle
+    | ((.loops | last | .timeout_seconds) // null) as $timeout
+    | "| Reviewer wall-clock | **\($wallrow)** |\n"
+      + (if $timeout != null then "| Timeout budget | \($timeout) s configured (#589) |\n" else "" end)
       + "| Tokens observed | \($tok) |\n"
       + "| Billed cost | **$0.00** — operator subscription plan |\n"
       + "| Notional API-equivalent | **\($notional)** |\n"
       + "| Plan-capacity throttle events | \($throttle) |\n"
-      + "| Human shuttle avoided | **~\($mlow) min – \($mhigh / 60) h** (manual Phase 4b handoff, per REVIEW_POLICY.md) |"'
+      + "| Human shuttle avoided | **~\($mlow) min – \($mhigh / 60) h** (manual Phase 4b handoff, per REVIEW_POLICY.md § Phase 4b Triggers) |"'
   printf '\n\n'
 
   # --- Running totals ---
@@ -545,7 +892,7 @@ p4b_acct_render_block() {
   local rt_source
   rt_source="$(printf '%s' "$rec" | jq -r '.running_totals.source')"
   if [ "$rt_source" = "unavailable" ]; then
-    printf '%s' "$rec" | jq -r '"_Running totals unavailable — \(.running_totals.reason // "aggregation degraded").__"'
+    printf '%s' "$rec" | jq -r '"_Running totals unavailable — \(.running_totals.reason // "aggregation degraded")._"'
     printf '\n\n'
   else
     printf '| Metric | Cumulative |\n'
@@ -554,19 +901,25 @@ p4b_acct_render_block() {
       .running_totals as $r
       | ($r.auto_approved_prs // 0) as $ap
       | ($r.automated_attempts // 0) as $at
-      | (if $at > 0 then "\($ap) / \($at) = \(($ap / $at) * 100 | round)% approved · \((($at - ($r.fail_closed_events // 0)) ) )/\($at) non-fail-closed"
-         else "n/a (no attempts yet)" end) as $rate
+      | ($r.fail_closed_events // 0) as $fc
+      | ($r.records // 0) as $n
+      | (if $n > 0 then "\($ap) / \($n) records approved = \((($ap / $n) * 100) | round)% · \($fc) fail-closed loop(s) to human"
+         else "n/a (no prior records)" end) as $rate
       | "| Auto-approved PRs | \($ap) |\n"
         + "| Automated attempts (posted + fell-back) | \($at) |\n"
-        + "| **Auto-approval / fail-closed rate** | **\($rate)** (\($r.fail_closed_events // 0) fail-closed to human) |\n"
+        + "| **Auto-approval / fail-closed rate** | **\($rate)** |\n"
+        + "| Cumulative wall-clock | "
+        + (if $r.elapsed_seconds_total == null then "unavailable"
+           else "\(($r.elapsed_seconds_total / 60) | floor) min" end)
+        + " |\n"
         + "| Cumulative tokens | \($r.tokens_total // 0) |\n"
-        + "| Cumulative notional API-equivalent | ~$\((($r.notional_usd // 0) * 100 | round) / 100) *(not billed)* |\n"
+        + "| Cumulative notional API-equivalent | ~$\($r.notional_usd // 0) *(not billed)* |\n"
         + "| Cumulative human time saved (est.) | "
         + (if $r.human_minutes_saved_estimate == null then "unavailable"
            else "~\(($r.human_minutes_saved_estimate[0] / 60) | floor) – \(($r.human_minutes_saved_estimate[1] / 60) | floor) h" end)
         + " |"'
     printf '\n\n'
-    printf '%s' "$rec" | jq -r '"*Totals source: \(.running_totals.source) (\(.running_totals.records) p4b-accounting:v1 record(s)).*"'
+    printf '%s' "$rec" | jq -r '"*Totals source: \(.running_totals.source) (\(.running_totals.records) prior record(s)).*"'
     printf '\n\n'
   fi
 
@@ -574,4 +927,215 @@ p4b_acct_render_block() {
   printf '<!-- %s\n' "$(p4b_acct_marker)"
   printf '%s\n' "$(printf '%s' "$rec" | jq -c '.')"
   printf -- '-->\n'
+}
+
+# ============================================================================
+# Orchestrator hook layer (#602)
+# ============================================================================
+# Thin glue so the diff in scripts/phase-4b-review.sh stays minimal. These
+# functions read the orchestrator's documented runtime globals:
+#   PR REPO HEAD REVIEWER ADAPTER DIRECTION VERDICT_JSON ADAPTER_TIMEOUT
+#   EFFECTIVE_EFFORT DRY_RUN P4B_ACCT_LOOP_STARTED_EPOCH
+#   P4B_ACCT_LOOP_ELAPSED_SECONDS
+# (tests set the same globals). Every function returns non-zero on failure
+# and NEVER exits — the orchestrator treats any failure as "post the plain
+# summary". State lives under .mergepath/ (gitignored runtime state, the same
+# home as the codex-record-feedback ledger); override via P4B_ACCT_STATE_DIR.
+
+p4b_acct_state_dir() {
+  if [ -n "${P4B_ACCT_STATE_DIR:-}" ]; then
+    printf '%s' "$P4B_ACCT_STATE_DIR"
+    return 0
+  fi
+  printf '%s/.mergepath' "$(p4b_acct_repo_root)"
+}
+
+# Per-PR loop log (JSONL of {"schema":"p4b-loop-log/v1", started_at_epoch,
+# loop:{...accounting loop...}, details:[{loop,severity,path,line,body}...]}).
+# Accumulates one line per orchestrator invocation so a later APPROVED can
+# render the full multi-loop history.
+p4b_acct_hook_loop_log() {
+  local repo_slug
+  repo_slug="$(printf '%s' "${REPO:-unknown}" | tr '/ ' '--')"
+  printf '%s/phase-4b-loops/%s-pr%s.jsonl' "$(p4b_acct_state_dir)" "$repo_slug" "${PR:-0}"
+}
+
+# Append-only running-totals ledger cache (the spec's
+# .mergepath/phase-4b-ledger.jsonl fallback source).
+p4b_acct_hook_ledger() {
+  printf '%s/phase-4b-ledger.jsonl' "$(p4b_acct_state_dir)"
+}
+
+# Gate for every hook call site: the accounting sub-toggle.
+p4b_acct_hook_active() { p4b_acct_config_enabled; }
+
+# p4b_acct_hook_record_loop <verdict-label> <posted> <fell_back> <fail-reason|"">
+# Build this invocation's loop record from the orchestrator globals and
+# append it to the per-PR loop log. verdict-label is the accounting verdict
+# enum (APPROVED | APPROVED_WITH_ADVISORIES | CHANGES_REQUESTED |
+# UNAVAILABLE). UNAVAILABLE ⇒ finding counts were not retained (all-null
+# histogram); otherwise they come from VERDICT_JSON.
+p4b_acct_hook_record_loop() {
+  local vlabel="$1" posted="$2" fell_back="$3" fail_reason="${4:-}"
+  local log logdir loopno tokens hist details fc line
+  local elapsed_json started_json timeout_json effort_json plan_auth_json details_json
+  log="$(p4b_acct_hook_loop_log)" || return 1
+  logdir="$(dirname "$log")"
+  mkdir -p "$logdir" 2>/dev/null || return 1
+  loopno=1
+  if [ -f "$log" ]; then
+    loopno="$(($(wc -l < "$log") + 1))" 2>/dev/null || loopno=1
+  fi
+
+  if [ "$vlabel" = "UNAVAILABLE" ] || [ -z "${VERDICT_JSON:-}" ]; then
+    tokens="$(p4b_acct_tokens_from_verdict 'null')" || return 1
+    hist="$(p4b_acct_findings_hist_null)"
+    details=""
+  else
+    tokens="$(p4b_acct_tokens_from_verdict "${VERDICT_JSON:-null}")" || return 1
+    hist="$(p4b_acct_findings_hist_from_verdict "${VERDICT_JSON:-null}")" || return 1
+    details="$(p4b_acct_finding_details_from_verdict "${VERDICT_JSON:-null}" "$loopno")" || details=""
+  fi
+  details_json="$(printf '%s\n' "$details" | jq -cs '.' 2>/dev/null)" || details_json='[]'
+
+  case "${P4B_ACCT_LOOP_ELAPSED_SECONDS:-}" in
+    ''|*[!0-9]*) elapsed_json="null" ;;
+    *) elapsed_json="${P4B_ACCT_LOOP_ELAPSED_SECONDS}" ;;
+  esac
+  case "${P4B_ACCT_LOOP_STARTED_EPOCH:-}" in
+    ''|*[!0-9]*) started_json="null" ;;
+    *) started_json="${P4B_ACCT_LOOP_STARTED_EPOCH}" ;;
+  esac
+  case "${ADAPTER_TIMEOUT:-}" in
+    ''|*[!0-9]*) timeout_json="null" ;;
+    *) timeout_json="${ADAPTER_TIMEOUT}" ;;
+  esac
+  if [ -n "${EFFECTIVE_EFFORT:-}" ]; then
+    effort_json="$(jq -nc --arg v "${EFFECTIVE_EFFORT}" '$v' 2>/dev/null)" || effort_json="null"
+  else
+    effort_json="null"
+  fi
+  # plan_auth: only recorded for a loop whose adapter actually ran to a
+  # verdict — the adapters' own plan-auth gates (auth_mode=chatgpt /
+  # apiProvider=firstParty) are what enforce it, so a completed verdict IS
+  # the captured signal. A fallback loop records null (not captured).
+  plan_auth_json="null"
+  if [ -n "${VERDICT_JSON:-}" ] && [ "$vlabel" != "UNAVAILABLE" ]; then
+    case "${ADAPTER:-}" in
+      codex)  plan_auth_json='"chatgpt"' ;;
+      claude) plan_auth_json='"firstParty"' ;;
+    esac
+  fi
+  if [ "$fell_back" = "true" ] || [ "$fell_back" = true ]; then
+    fc="$(jq -nc --arg reason "$fail_reason" --argjson dur "$elapsed_json" \
+      '{happened: true, reason: (if $reason == "" then null else $reason end), duration_seconds: $dur}')" || return 1
+  else
+    fc='{"happened":false,"reason":null,"duration_seconds":null}'
+  fi
+
+  line="$(jq -nc \
+    --argjson loopno "$loopno" \
+    --arg reviewer "${REVIEWER:-unknown}" \
+    --arg adapter "review-via-${ADAPTER:-unknown}.sh" \
+    --arg direction "${DIRECTION:-unknown}" \
+    --arg head "${HEAD:-unknown}" \
+    --arg vlabel "$vlabel" \
+    --arg posted "$posted" \
+    --argjson fell_back "$( [ "$fell_back" = "true" ] || [ "$fell_back" = true ] && printf 'true' || printf 'false' )" \
+    --argjson elapsed "$elapsed_json" \
+    --argjson started "$started_json" \
+    --argjson tokens "$tokens" \
+    --argjson findings "$hist" \
+    --argjson timeout "$timeout_json" \
+    --argjson effort "$effort_json" \
+    --argjson plan_auth "$plan_auth_json" \
+    --argjson fc "$fc" \
+    --argjson details "$details_json" '
+    {
+      schema: "p4b-loop-log/v1",
+      started_at_epoch: $started,
+      loop: {
+        loop: $loopno,
+        reviewer: $reviewer,
+        adapter: $adapter,
+        direction: $direction,
+        head_sha: $head,
+        verdict: $vlabel,
+        posted: $posted,
+        fell_back: $fell_back,
+        elapsed_seconds: $elapsed,
+        tokens: $tokens,
+        findings: $findings,
+        cli_version: null,
+        timeout_seconds: $timeout,
+        effort: $effort,
+        throttle_events: null,
+        plan_auth: $plan_auth,
+        fail_closed: $fc
+      },
+      details: $details
+    }')" || return 1
+  printf '%s\n' "$line" >> "$log" || return 1
+}
+
+# p4b_acct_hook_note_fallback <why>
+# Record a fail-closed loop from the orchestrator's manual-fallback path.
+# The approved-verdict-carried-findings case keeps its histogram (the verdict
+# WAS parsed); every other fallback discards the verdict (UNAVAILABLE).
+p4b_acct_hook_note_fallback() {
+  local why="$1" vlabel="UNAVAILABLE"
+  case "$why" in
+    "approved verdict included findings"*) vlabel="APPROVED_WITH_ADVISORIES" ;;
+  esac
+  p4b_acct_hook_record_loop "$vlabel" "not-posted" true "$why"
+}
+
+# p4b_acct_hook_render_approval_block
+# Assemble + render the accounting block for the current APPROVED verdict
+# from the accumulated loop log. Prints the markdown block on stdout; returns
+# non-zero on ANY failure (the orchestrator then posts the plain summary).
+# On a live (non-dry-run) post the finished record is appended to the ledger
+# cache so future running totals can aggregate it.
+# P4B_ACCT_SELFTEST_FAIL=1 is a test seam that forces the failure path.
+p4b_acct_hook_render_approval_block() {
+  if [ "${P4B_ACCT_SELFTEST_FAIL:-0}" = "1" ]; then
+    p4b_acct_warn "P4B_ACCT_SELFTEST_FAIL=1 — forcing report-generation failure (test seam)"
+    return 1
+  fi
+  local log loops details uf ptv notional totals running astate wall
+  local first_started record block ledger
+  log="$(p4b_acct_hook_loop_log)"
+  [ -r "$log" ] || return 1
+  loops="$(jq -cs '[ .[] | .loop ]' "$log" 2>/dev/null)" || return 1
+  [ -n "$loops" ] && [ "$loops" != "[]" ] || return 1
+  details="$(jq -c '.details[]?' "$log" 2>/dev/null)" || return 1
+  uf="$(printf '%s\n' "$details" | p4b_acct_unique_findings "${P4B_ACCT_DISPOSITIONS_JSON:-}")" || return 1
+  [ -n "$uf" ] || return 1
+  ptv="$(p4b_acct_price_table_version)"
+  if ! notional="$(p4b_acct_notional_for_loops "$loops")"; then
+    notional="null"
+  fi
+  totals="$(p4b_acct_compute_totals "$loops" "$ptv" "$notional" "$uf")" || return 1
+  [ -n "$totals" ] || return 1
+  ledger="$(p4b_acct_hook_ledger)"
+  running="$(p4b_acct_running_totals_for_post "$ledger")" || return 1
+  if [ "${DRY_RUN:-false}" = true ]; then astate="dry-run"; else astate="posted"; fi
+  wall=""
+  first_started="$(jq -s '[ .[] | .started_at_epoch | select(. != null) ] | min' "$log" 2>/dev/null || true)"
+  if [ -n "$first_started" ] && [ "$first_started" != "null" ]; then
+    wall="$(( $(date +%s) - first_started ))"
+    [ "$wall" -ge 0 ] 2>/dev/null || wall=""
+  fi
+  record="$(p4b_acct_build_record "${PR:-0}" "${HEAD:-unknown}" "APPROVED" \
+    "${REVIEWER:-unknown}" "${DIRECTION:-unknown}" "$astate" "$wall" \
+    "$loops" "$uf" "$totals" "$running" "")" || return 1
+  block="$(p4b_acct_render_block "$record")" || return 1
+  [ -n "$block" ] || return 1
+  if [ "$astate" = "posted" ]; then
+    # Advisory: a ledger-append failure must not lose the block.
+    if ! { mkdir -p "$(dirname "$ledger")" && printf '%s\n' "$record" >> "$ledger"; } 2>/dev/null; then
+      p4b_acct_warn "could not append to the ledger cache (future running totals may lag)"
+    fi
+  fi
+  printf '%s' "$block"
 }
