@@ -132,6 +132,18 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # Bootstrap (nathanjohnpayne/mergepath#577): we run the TRUSTED copy of
+          # the gate script from the default branch (checked out above), never
+          # the PR HEAD. On the PR that INTRODUCES this gate the script does not
+          # exist on the default branch yet, so there is nothing to run — soft-
+          # pass. The gate cannot guard its own introduction (that PR is human/
+          # Codex reviewed), and it activates for every subsequent PR the moment
+          # this merges. A PR cannot fake this to bypass the gate: the check is
+          # against the default-branch tree, which no unmerged PR can alter.
+          if [ ! -f scripts/coderabbit-severity-gate.sh ]; then
+            echo "::notice::coderabbit-severity-gate.sh is not on the default branch yet (bootstrap PR introducing the gate); soft-passing — the gate activates for all PRs once this merges."
+            exit 0
+          fi
           # The script is the source of truth for what blocks merge.
           # Exit codes:
           #   0 = no unresolved blocking-tier findings on HEAD (or gate disabled)
@@ -210,6 +222,14 @@ jobs:
           CHECK_NAME: "CodeRabbit unresolved blocking findings"
         run: |
           set -euo pipefail
+          # Bootstrap (see the event-driven job): the trusted script is run from
+          # the default-branch checkout. Until this gate merges to the default
+          # branch the script is absent there, so the sweep has nothing to run —
+          # no-op rather than 127 for every open PR.
+          if [ ! -f scripts/coderabbit-severity-gate.sh ]; then
+            echo "::notice::coderabbit-severity-gate.sh is not on the default branch yet (bootstrap); sweep is a no-op until the gate merges."
+            exit 0
+          fi
           had_infra_error=0
           while IFS= read -r PR; do
             [ -z "$PR" ] && continue
