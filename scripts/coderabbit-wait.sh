@@ -1400,11 +1400,19 @@ emit_json_and_exit() {
   if [ "$FEEDBACK_POLICY_PRESENT" = true ] && [ "$BLOCKING_TIER_UNRESOLVED" = "null" ]; then
     case "$status" in
       findings|cleared)
-        # Guard the advisory decoration: a transient gh api failure inside
-        # count_blocking_tier_issues must NEVER flip the terminal exit code
-        # under `set -e` (Codex P2 on #590). On any failure, leave the field
-        # null — it is report-only, as the comment above promises.
-        BLOCKING_TIER_UNRESOLVED=$(count_blocking_tier_issues 2>/dev/null) || BLOCKING_TIER_UNRESOLVED=null
+        # Guard the advisory decoration so it can NEVER flip the terminal exit
+        # code or break the JSON emit (nathanpayne-codex P2 on #590). Two
+        # layers: `|| true` stops a die inside count_blocking_tier_issues from
+        # aborting under set -e, and the numeric-or-null validation forces a
+        # value the downstream `jq --argjson` accepts. The earlier `$(...) ||
+        # VAR=null` was insufficient: when an internal fetch_api_array dies,
+        # count_blocking_tier_issues can exit 0 with EMPTY output, so the `||`
+        # never fired and the empty value broke `jq --argjson` — a hard failure
+        # on an otherwise-terminal path. Validation catches empty/non-numeric.
+        BLOCKING_TIER_UNRESOLVED=$(count_blocking_tier_issues 2>/dev/null || true)
+        case "$BLOCKING_TIER_UNRESOLVED" in
+          ''|*[!0-9]*) BLOCKING_TIER_UNRESOLVED=null ;;
+        esac
         ;;
     esac
   fi

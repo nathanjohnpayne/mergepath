@@ -22,6 +22,7 @@
 #   7. enabled knob absent → default false → exit 0.
 #   8. Malformed PR_NUMBER → exit 2.
 #   9. >100 review threads → exit 2 (pagination not supported in v1).
+#   9b. >100 comments in one thread → exit 2 (nested-connection pagination).
 #   10. PR_NUMBER + REPO via env (no positional args) → same behavior.
 #
 # Tier-aware cases (the gate enforces the resolved tier SET):
@@ -197,11 +198,12 @@ make_threads_fixture() {
   local nodes_expr=$1
   local total=${2:-}
   local has_next=${3:-false}
+  local comments_has_next=${4:-false}   # nested comments(first:100) overflow (#590 4b)
   local file="$WORKDIR/threads.$$.$RANDOM.json"
   local resolved_nodes
-  resolved_nodes=$(jq -n "$nodes_expr | [.[] | {
+  resolved_nodes=$(jq -n --arg cnext "$comments_has_next" "$nodes_expr | [.[] | {
     isResolved: .isResolved,
-    comments: { nodes: ([.comment_ids[] | {databaseId: .}]) }
+    comments: { pageInfo: { hasNextPage: (\$cnext == \"true\") }, nodes: ([.comment_ids[] | {databaseId: .}]) }
   }]")
   if [ -z "$total" ]; then
     total=$(echo "$resolved_nodes" | jq 'length')
@@ -495,6 +497,35 @@ if [ "$RC" = 2 ] && echo "$OUT" | grep -q ">100 review threads"; then
   pass ">100 threads → exit 2"
 else
   fail "expected rc=2 with pagination error; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 9b: a thread with >100 comments (nested comments.pageInfo.hasNextPage
+# =true) → exit 2. Mirrors Test 9 for the nested connection — the gap
+# nathanpayne-codex flagged as P1 on #590 (the threads connection had a
+# paginated-overflow guard; the nested comments connection did not, so a
+# blocking finding past the 100th comment could be silently dropped).
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 9b: >100 comments in a thread (nested pagination)"
+SCRATCH=$(make_scratch_with_config true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$MAJOR_BODY")
+FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [2001]}]' "" false true)
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 2 ] && echo "$OUT" | grep -q ">100 comments"; then
+  pass ">100 comments in a thread → exit 2"
+else
+  fail "expected rc=2 with nested-comments pagination error; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 

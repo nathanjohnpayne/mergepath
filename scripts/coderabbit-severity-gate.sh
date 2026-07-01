@@ -413,6 +413,7 @@ query($owner: String!, $name: String!, $pr: Int!) {
         nodes {
           isResolved
           comments(first: 100) {
+            pageInfo { hasNextPage }
             nodes { databaseId }
           }
         }
@@ -432,7 +433,22 @@ THREADS_JSON=$(gh api graphql \
 
 HAS_NEXT=$(echo "$THREADS_JSON" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')
 if [ "$HAS_NEXT" = "true" ]; then
-  die 2 "PR has >100 review threads; pagination not yet supported. File a follow-up issue."
+  die 2 "PR has >100 review threads; pagination not yet supported (#592). Failing closed."
+fi
+
+# Nested-comments overflow: a thread with >100 comments would truncate its
+# comment id list, so a blocking finding beyond the 100th comment could be
+# absent from RESOLUTION_MAP. The classification below fails closed on a
+# missing id (`// false` -> counted unresolved), but we ALSO die 2 here so a
+# truncated scan can NEVER silently under-count — matching the threads guard
+# above and closing the gap nathanpayne-codex flagged as P1 on #590 (the
+# threads connection was guarded; the nested comments connection was not).
+# Full cursor pagination for both connections is tracked in #592.
+COMMENTS_OVERFLOW=$(echo "$THREADS_JSON" | jq -r '
+  [ .data.repository.pullRequest.reviewThreads.nodes[]
+    | .comments.pageInfo.hasNextPage ] | any')
+if [ "$COMMENTS_OVERFLOW" = "true" ]; then
+  die 2 "a review thread has >100 comments; pagination not yet supported (#592). Failing closed."
 fi
 
 # Build a JSON object: { "<comment_id>": isResolved, ... }
