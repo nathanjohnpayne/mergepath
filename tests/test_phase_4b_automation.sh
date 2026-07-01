@@ -189,6 +189,20 @@ mk_fake fake-claude-braces \
   "jq -n --arg r 'Here is the verdict:
 {\"verdict\":\"CHANGES_REQUESTED\",\"summary\":\"body has braces\",\"findings\":[{\"severity\":\"P1\",\"path\":\"x.js\",\"line\":2,\"body\":\"snippet contains { braces } and stays valid\"}]}
 Done.' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",total_cost_usd:0}'"
+# #587: a valid verdict object FOLLOWED by prose (with a lone brace char, no
+# second object). A naive first-{-to-last-} slice would swallow the trailing
+# brace and corrupt the JSON; the string-aware scanner isolates the first
+# object. (A trailing balanced OBJECT instead fails closed — see #594.)
+mk_fake fake-claude-trailing-braces \
+  "jq -n --arg r 'Here is my verdict:
+{\"verdict\":\"APPROVED\",\"summary\":\"clean\",\"findings\":[]}
+Looks good to me. The } below is just prose.' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",total_cost_usd:0}'"
+# #594: two verdict objects (draft then correction) must fail closed, not post
+# the first.
+mk_fake fake-claude-multi-verdict \
+  "jq -n --arg r '{\"verdict\":\"APPROVED\",\"summary\":\"draft\",\"findings\":[]}
+On reflection:
+{\"verdict\":\"CHANGES_REQUESTED\",\"summary\":\"final\",\"findings\":[{\"severity\":\"P1\",\"path\":\"x.js\",\"line\":2,\"body\":\"bug\"}]}' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",total_cost_usd:0}'"
 mk_fake fake-claude-junk \
   "jq -n '{type:\"result\",result:\"no json here\",session_id:\"t\"}'"
 
@@ -432,6 +446,147 @@ if p4b_validate_verdict 'not json'; then
 unset MERGEPATH_REVIEW_POLICY_PATH
 
 # ===========================================================================
+echo "lib.sh — JSON extraction hardening (#587)"
+# ===========================================================================
+# p4b_extract_json_block must emit the FIRST complete, balanced, top-level
+# JSON object — string-aware so braces inside string values do not miscount,
+# and stopping at the first object so balanced-brace prose AFTER it cannot
+# extend the slice. Unbalanced input emits nothing so validation fails closed.
+chk_extract() { # chk_extract <label> <input> <expected-exact-output>
+  local label="$1" input="$2" want="$3" got
+  got="$(p4b_extract_json_block "$input")"
+  [ "$got" = "$want" ] && pass "$label" || fail "$label (got=[$got] want=[$want])"
+}
+chk_extract "extract: pure JSON unchanged" \
+  '{"a":1}' '{"a":1}'
+chk_extract "extract: leading prose skipped" \
+  'blah blah {"a":1}' '{"a":1}'
+chk_extract "extract: trailing prose (no second object) is ignored" \
+  '{"a":1}
+Looks good, ship it. The } char in prose is harmless.' '{"a":1}'
+chk_extract "extract: trailing balanced-brace OBJECT prose fails closed (#594)" \
+  '{"a":1}
+For example { "x": { "y": 1 } } is fine.' ''
+chk_extract "extract: braces inside string value preserved" \
+  '{"body":"has } and { inside"}' '{"body":"has } and { inside"}'
+chk_extract "extract: escaped quote before brace stays in string" \
+  '{"body":"quote \" then } still in"}' '{"body":"quote \" then } still in"}'
+chk_extract "extract: nested object emitted whole" \
+  '{"a":{"b":2}}' '{"a":{"b":2}}'
+chk_extract "extract: multiple top-level objects fail closed (#594)" \
+  '{"a":1} {"b":2}' ''
+chk_extract "extract: draft-then-correction multi-verdict fails closed (#594)" \
+  '{"verdict":"APPROVED"}
+Actually, correcting:
+{"verdict":"CHANGES_REQUESTED"}' ''
+chk_extract "extract: unbalanced object emits nothing (fail closed)" \
+  '{"a":' ''
+chk_extract "extract: no object at all emits nothing" \
+  'no json here' ''
+chk_extract "extract: fenced block unwrapped" \
+  '```json
+{"a":1}
+```' '{"a":1}'
+
+# ===========================================================================
+echo "lib.sh — schema↔validator parity (#585)"
+# ===========================================================================
+# Pin the default policy so structural validity == validator validity for the
+# fixtures (P0/P1 required, P2/P3 discretionary).
+export MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON"
+SCHEMA_FILE="$ROOT/scripts/phase-4b/verdict.schema.json"
+FIXTURES="$ROOT/tests/fixtures/phase_4b_verdicts.jsonl"
+
+# (a) Behavior-locking parity fixtures: every curated verdict validates
+# exactly as its `valid` label says.
+[ -r "$FIXTURES" ] || fail "parity fixtures missing: $FIXTURES"
+fixture_count=0
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  fixture_count=$((fixture_count + 1))
+  name="$(printf '%s' "$line" | jq -r '.name')"
+  want="$(printf '%s' "$line" | jq -r '.valid')"
+  vj="$(printf '%s' "$line" | jq -c '.verdict')"
+  if p4b_validate_verdict "$vj"; then got=true; else got=false; fi
+  [ "$got" = "$want" ] && pass "parity fixture [$name]: validator=$got" \
+    || fail "parity fixture [$name]: validator=$got but fixture says valid=$want ($vj)"
+done < "$FIXTURES"
+[ "$fixture_count" -ge 20 ] && pass "parity fixture corpus is non-trivial ($fixture_count cases)" \
+  || fail "parity fixture corpus too small ($fixture_count)"
+
+# (b) Anti-drift: the validator's structural constants are DERIVED from the
+# schema, so its accept/reject boundaries must track the schema's own enums
+# and required-key sets. If a future edit changes the schema but not the
+# validator (or vice versa), one of these fails.
+while IFS= read -r sev; do
+  v="$(jq -nc --arg s "$sev" '{verdict:"CHANGES_REQUESTED",summary:"x",findings:[{severity:$s,path:"a",line:1,body:"b"}],usage:null}')"
+  p4b_validate_verdict "$v" && pass "schema severity enum member accepted: $sev" \
+    || fail "schema declares severity $sev but validator rejects it (drift)"
+done < <(jq -r '.properties.findings.items.properties.severity.enum[]' "$SCHEMA_FILE")
+for bogus in P4 PX p1 P; do
+  v="$(jq -nc --arg s "$bogus" '{verdict:"CHANGES_REQUESTED",summary:"x",findings:[{severity:$s,path:"a",line:1,body:"b"}],usage:null}')"
+  p4b_validate_verdict "$v" && fail "severity outside schema enum accepted: $bogus" \
+    || pass "severity outside schema enum rejected: $bogus"
+done
+while IFS= read -r vd; do
+  v="$(jq -nc --arg v "$vd" '{verdict:$v,summary:"x",findings:[],usage:null}')"
+  p4b_validate_verdict "$v" && pass "schema verdict enum member accepted: $vd" \
+    || fail "schema declares verdict $vd but validator rejects it (drift)"
+done < <(jq -r '.properties.verdict.enum[]' "$SCHEMA_FILE")
+while IFS= read -r key; do
+  v="$(jq -c --arg k "$key" 'del(.[$k])' <<<'{"verdict":"APPROVED","summary":"x","findings":[],"usage":null}')"
+  p4b_validate_verdict "$v" && fail "verdict missing schema-required key accepted: $key" \
+    || pass "verdict missing schema-required key rejected: $key"
+done < <(jq -r '.required[]' "$SCHEMA_FILE")
+
+# (b') Malformed schema (#594): an enum degraded to a SCALAR string must fail
+# closed, not let jq's `index` do substring matching (which would accept
+# "APPROVED"/"P1"). Point P4B_VERDICT_SCHEMA_PATH at a bad schema and confirm an
+# otherwise-valid verdict is rejected.
+BAD_SCHEMA="$WORK/bad-schema.json"
+jq '.properties.verdict.enum = "APPROVED"' "$SCHEMA_FILE" > "$BAD_SCHEMA"
+if P4B_VERDICT_SCHEMA_PATH="$BAD_SCHEMA" p4b_validate_verdict '{"verdict":"APPROVED","summary":"x","findings":[],"usage":null}'; then
+  fail "scalar verdict enum in a malformed schema accepted (should fail closed)"
+else pass "malformed schema (verdict enum as scalar) fails closed"; fi
+jq '.properties.findings.items.properties.severity.enum = "P1"' "$SCHEMA_FILE" > "$BAD_SCHEMA"
+if P4B_VERDICT_SCHEMA_PATH="$BAD_SCHEMA" p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P1","path":"a","line":1,"body":"b"}],"usage":null}'; then
+  fail "scalar severity enum in a malformed schema accepted (should fail closed)"
+else pass "malformed schema (severity enum as scalar) fails closed"; fi
+
+# (c) Optional independent cross-check against the JSON Schema itself. The
+# validator is a superset of the schema (it adds the feedback_policy gate), so
+# every fixture the validator ACCEPTS must also be schema-valid. Runs only when
+# a JSON Schema validator is installed; when none is present it skips cleanly,
+# the same optional-tool posture the lint step uses.
+schema_validate() { # schema_validate <datafile> -> rc 0 valid / non-zero invalid
+  if command -v check-jsonschema >/dev/null 2>&1; then
+    check-jsonschema --schemafile "$SCHEMA_FILE" "$1" >/dev/null 2>&1
+  elif command -v ajv >/dev/null 2>&1; then
+    ajv validate -s "$SCHEMA_FILE" -d "$1" >/dev/null 2>&1
+  else
+    return 2
+  fi
+}
+if command -v check-jsonschema >/dev/null 2>&1 || command -v ajv >/dev/null 2>&1; then
+  xcheck=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ "$(printf '%s' "$line" | jq -r '.valid')" = "true" ] || continue
+    name="$(printf '%s' "$line" | jq -r '.name')"
+    df="$WORK/xcheck.json"
+    printf '%s' "$line" | jq -c '.verdict' > "$df"
+    if schema_validate "$df"; then pass "schema cross-check: validator-accepted [$name] is schema-valid"
+    else fail "schema cross-check: validator accepts [$name] but JSON Schema rejects it"; fi
+    xcheck=$((xcheck + 1))
+  done < "$FIXTURES"
+  [ "$xcheck" -gt 0 ] && pass "external JSON Schema cross-check ran on $xcheck accepted fixtures" \
+    || fail "external JSON Schema cross-check found no accepted fixtures"
+else
+  echo "  SKIP: no JSON Schema validator (check-jsonschema/ajv) — schema cross-check skipped"
+fi
+unset MERGEPATH_REVIEW_POLICY_PATH
+
+# ===========================================================================
 echo "adapters — normalized verdict output + fail-closed"
 # ===========================================================================
 set +e
@@ -476,6 +631,25 @@ set -e
 if [ "$rc" = 0 ] && printf '%s' "$out" | jq -e '.findings[0].body == "snippet contains { braces } and stays valid"' >/dev/null; then
   pass "claude adapter extracts verdict when finding text contains braces"
 else fail "claude adapter braces extraction (rc=$rc, out=$out)"; fi
+
+# #587: prose (no second object) AFTER the JSON object must not poison
+# extraction; the adapter still returns the first object's clean verdict.
+set +e
+out="$(CLAUDE_BIN="$BIN/fake-claude-trailing-braces" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.findings | length')" = "0" ]; then
+  pass "claude adapter ignores trailing prose after the JSON object (#587)"
+else fail "claude adapter trailing-prose extraction (rc=$rc, out=$out)"; fi
+
+# #594: two verdict objects (draft + correction) → fail closed, never post the
+# first (which could be an APPROVED the model then retracted).
+set +e
+CLAUDE_BIN="$BIN/fake-claude-multi-verdict" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF" >/dev/null 2>&1; rc=$?
+set -e
+[ "$rc" = 4 ] && pass "claude adapter fails closed (exit 4) on multi-verdict output (#594)" \
+  || fail "claude adapter multi-verdict should exit 4 (got $rc)"
 
 set +e
 CLAUDE_BIN="$BIN/fake-claude-junk" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF" >/dev/null 2>&1; rc=$?
