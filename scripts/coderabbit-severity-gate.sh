@@ -1,29 +1,32 @@
 #!/usr/bin/env bash
-# scripts/codex-p1-gate.sh — Codex blocking-tier unresolved-thread merge gate
+# scripts/coderabbit-severity-gate.sh — CodeRabbit blocking-tier
+# unresolved-thread merge gate
 #
-# Reports "Codex blocking-tier unresolved: N" for a pull request and fails
-# (exit 1) when N > 0. Read-only. Never merges, labels, or comments.
+# The CodeRabbit twin of scripts/codex-p1-gate.sh (nathanjohnpayne/
+# mergepath#574, sub-issue #577). Reports "CodeRabbit blocking-tier
+# unresolved: N" for a pull request and fails (exit 1) when N > 0.
+# Read-only. Never merges, labels, or comments.
 #
-# Context: per nathanjohnpayne/mergepath#235, the 2026-05-13 sweep of
-# unresolved reviewer feedback (#234) found 62 Codex P1 items sitting
-# on merged PRs across 9 repos. P1 is Codex's "blocking" severity tag;
-# 62 P1s riding through to closed state is evidence that the label was
-# advisory, not enforced. This script is the v1 enforcement.
+# Context: #574 makes the disposition policy symmetric across BOTH bot
+# reviewers. The Codex side already had a teeth-bearing gate (#235); this
+# is its CodeRabbit mirror. CodeRabbit has no numeric P-scale, so each
+# inline finding is mapped to the normalized tier ladder HEURISTICALLY by
+# scripts/lib/feedback-policy-helpers.sh's coderabbit_tier_of (category +
+# Critical/Major/Minor qualifier; 🧹 Nitpick -> nitpick). The gate then
+# enforces the BLOCKING tier set resolved by resolve_required_tiers from
+# the `feedback_policy` block in .github/review-policy.yml.
 #
-# Generalization (nathanjohnpayne/mergepath#574, sub-issue #577): the gate
-# no longer hard-codes P1. It enforces the BLOCKING TIER SET resolved by
-# scripts/lib/feedback-policy-helpers.sh's resolve_required_tiers from the
-# `feedback_policy` block in .github/review-policy.yml, and classifies each
-# Codex inline comment with codex_tier_of. When the feedback_policy block is
-# ABSENT, resolve_required_tiers returns "p1" only, so the gate stays
-# byte-identical to its original P1-only behavior. The required-check NAME
-# (`Codex P1 Gate / Codex P1 unresolved threads`) is UNCHANGED — branch
-# protection depends on it — even though the gate now spans the resolved
-# tier set.
+# Narrow-start posture (identical to codex.p1_gate / external_review_gate):
+# the gate is gated by `coderabbit.severity_gate.enabled`, which defaults
+# to false EVERYWHERE — today CodeRabbit has no merge gate at all — and is
+# set true in mergepath first. When disabled the gate is a clean no-op
+# (always green), exactly like codex-p1-gate.sh's off-state short-circuit,
+# so it is safe to add to required checks everywhere before flipping the
+# switch on a given repo.
 #
 # Usage:
-#   scripts/codex-p1-gate.sh <PR_NUMBER> [REPO]
-#   scripts/codex-p1-gate.sh                       # env-only mode
+#   scripts/coderabbit-severity-gate.sh <PR_NUMBER> [REPO]
+#   scripts/coderabbit-severity-gate.sh                # env-only mode
 #
 # Arguments:
 #   PR_NUMBER  Required (positional or via $PR_NUMBER env). Integer.
@@ -33,35 +36,35 @@
 # Environment:
 #   GH_TOKEN   Required. Needs pull_requests:read.
 #   PR_NUMBER  Optional fallback for the positional arg. The
-#              scheduled-sweep job in .github/workflows/codex-p1-
-#              gate.yml passes PR_NUMBER positionally per iteration,
-#              but other callers (workflow_dispatch, ad-hoc CLI use,
-#              CI matrix jobs) may find it easier to set it as env.
+#              scheduled-sweep job in
+#              .github/workflows/coderabbit-severity-gate.yml passes
+#              PR_NUMBER positionally per iteration, but other callers
+#              (workflow_dispatch, ad-hoc CLI use, CI matrix jobs) may
+#              find it easier to set it as env.
 #   REPO       Optional fallback for the positional REPO arg. Same
 #              motivation as PR_NUMBER above.
 #
 # Algorithm:
-#   1. Read .github/review-policy.yml `codex.p1_gate.enabled`. If false
-#      (the default everywhere except mergepath), exit 0 — clean pass,
-#      gate disabled.
+#   1. Read .github/review-policy.yml `coderabbit.severity_gate.enabled`.
+#      If false (the default everywhere except mergepath), exit 0 — clean
+#      pass, gate disabled.
 #   2. Fetch all inline review comments on the PR via
 #      `repos/{repo}/pulls/{pr}/comments`.
-#   3. Filter to comments authored by `chatgpt-codex-connector[bot]`
-#      (or whatever `codex.bot_login` is configured to) whose Codex
-#      tier (codex_tier_of: the badge image `![Pn Badge]` or the text
-#      fallback `**Pn`) is in the resolved BLOCKING tier set. With the
-#      feedback_policy block absent the set is {p1}, so this matches the
-#      original `![P1 Badge]` / `**P1` filter exactly.
+#   3. Filter to comments authored by `coderabbitai[bot]` (or whatever
+#      `coderabbit.bot_login` is configured to) whose CodeRabbit tier
+#      (coderabbit_tier_of) is in the resolved BLOCKING tier set.
 #   4. For each candidate, fetch its review thread state via GraphQL
 #      `reviewThreads` and check `isResolved`. The author or any
-#      collaborator can resolve a thread via the GitHub UI or
-#      `resolveReviewThread` mutation; this script does NOT fight
-#      against a human-or-agent-marked-resolved state.
-#   5. SHA scope: a P1 finding only gates if its comment was attached
-#      to the PR's current HEAD. A P1 from an earlier SHA that is now
-#      either resolved OR no longer on HEAD does not count.
+#      collaborator can resolve a thread via the GitHub UI's "Resolve
+#      conversation" button or the `resolveReviewThread` mutation; this
+#      script does NOT fight against a human-or-agent-marked-resolved
+#      state.
+#   5. SHA scope: a finding only gates if its comment was attached to the
+#      PR's current HEAD. A finding from an earlier SHA that is now either
+#      resolved OR no longer on HEAD does not count.
 #   6. Print one line per unresolved blocking-tier finding to stdout for
-#      CI visibility, then the summary "Codex blocking-tier unresolved: N".
+#      CI visibility, then the summary "CodeRabbit blocking-tier
+#      unresolved: N".
 #
 # Exit codes:
 #   0   No unresolved blocking-tier findings on current HEAD (or gate
@@ -75,21 +78,18 @@
 #   - bash 3.2 portable (`#!/usr/bin/env bash`, no associative arrays
 #     or [[ ]] regex features beyond what 3.2 supports).
 #   - PATH-shimmable: tests substitute a `gh` stub on PATH that returns
-#     canned payloads. See tests/test_codex_p1_gate.sh.
-#   - The override pattern from #235 (`p1-already-fixed`,
-#     `p1-rejected`, `p1-moot`, `p1-deferred`) is NOT implemented in
-#     v1 — instead, the override path is "mark the thread resolved
-#     via the GitHub UI or GraphQL". The structured taxonomy lands in
-#     a follow-up once we see how the basic gate behaves in practice.
+#     canned payloads. See tests/test_coderabbit_severity_gate.sh.
+#   - The override path is "mark the thread resolved via the GitHub UI or
+#     GraphQL" — the same mechanism the author or any collaborator already
+#     uses to clear any review thread. Resolving a finding that
+#     legitimately does not apply (rebutted with rationale, moot, deferred
+#     to a follow-up issue) clears the gate.
 #
 # References:
-#   - nathanjohnpayne/mergepath#235 — this script
-#   - nathanjohnpayne/mergepath#234 — the sweep that motivated it
-#   - REVIEW_POLICY.md § Phase 4a merge gate — the companion script
-#     `codex-review-check.sh` covers Codex clearance more broadly;
-#     this script is a narrower per-thread enforcement that exists
-#     specifically to catch the "Codex flagged P1 but author shipped
-#     anyway" failure mode.
+#   - nathanjohnpayne/mergepath#574 — the symmetric feedback policy
+#   - nathanjohnpayne/mergepath#577 — this script + the generalized Codex gate
+#   - scripts/codex-p1-gate.sh — the Codex twin this mirrors
+#   - REVIEW_POLICY.md § Feedback Disposition Policy — the normalized ladder
 
 set -euo pipefail
 
@@ -105,29 +105,29 @@ fi
 
 CONFIG=".github/review-policy.yml"
 
-# Shared blocking-tier resolver + Codex tier classifier (#576 foundation).
-# resolve_required_tiers reads CONFIG (the global set above) and prints the
-# blocking tier set one per line — "p1" when the feedback_policy block is
-# absent, preserving this gate's original behavior. codex_tier_of maps a
-# Codex finding body to p0..p3. Sourced by absolute-ish path relative to
-# this script so it resolves regardless of cwd (the script runs from the
-# trusted default-branch checkout root, but lib lives under scripts/).
-__P1_GATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Shared blocking-tier resolver + CodeRabbit tier classifier (#576
+# foundation). resolve_required_tiers reads CONFIG (the global set above)
+# and prints the blocking tier set one per line — "p1" when the
+# feedback_policy block is absent. coderabbit_tier_of maps a CodeRabbit
+# finding body to p0..p3|nitpick. Sourced relative to this script so it
+# resolves regardless of cwd (the gate runs from the trusted default-branch
+# checkout root, but lib lives under scripts/).
+__CR_GATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/feedback-policy-helpers.sh
-. "$__P1_GATE_DIR/lib/feedback-policy-helpers.sh"
+. "$__CR_GATE_DIR/lib/feedback-policy-helpers.sh"
 
-# Read a scalar field nested inside `codex:` `<sub_block>:` `<field>:`.
-# Same state-machine awk pattern as codex-review-check.sh, but tracks
-# nesting one level deeper for the `p1_gate` sub-block.
-codex_p1_gate_field() {
+# Read a scalar field nested inside `coderabbit:` `severity_gate:`
+# `<field>:`. Same state-machine awk pattern as codex_p1_gate_field in
+# scripts/codex-p1-gate.sh, retargeted to the coderabbit: block.
+coderabbit_severity_gate_field() {
   local field=$1
   [ -f "$CONFIG" ] || return 0
   awk -v field="$field" '
-    /^codex:/ { in_codex=1; in_p1_gate=0; next }
-    in_codex && /^[^[:space:]#]/ { in_codex=0; in_p1_gate=0 }
-    in_codex && /^[[:space:]]+p1_gate:/ { in_p1_gate=1; next }
-    in_p1_gate && /^[[:space:]]{0,3}[^[:space:]#]/ { in_p1_gate=0 }
-    in_p1_gate && $1 == field":" {
+    /^coderabbit:/ { in_cr=1; in_sg=0; next }
+    in_cr && /^[^[:space:]#]/ { in_cr=0; in_sg=0 }
+    in_cr && /^[[:space:]]+severity_gate:/ { in_sg=1; next }
+    in_sg && /^[[:space:]]{0,3}[^[:space:]#]/ { in_sg=0 }
+    in_sg && $1 == field":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
       gsub(/^"/, "", $0)
       gsub(/"[[:space:]]*(#.*)?$/, "", $0)
@@ -139,12 +139,13 @@ codex_p1_gate_field() {
   ' "$CONFIG"
 }
 
-# Read a scalar field from the codex: block. Mirrors codex-review-check.sh.
-codex_field() {
+# Read a scalar field from the coderabbit: block. Mirrors
+# scripts/coderabbit-wait.sh's coderabbit_field.
+coderabbit_field() {
   local field=$1
   [ -f "$CONFIG" ] || return 0
   awk -v field="$field" '
-    /^codex:/ {in_block=1; next}
+    /^coderabbit:/ {in_block=1; next}
     in_block && /^[^[:space:]#]/ {in_block=0}
     in_block && $1 == field":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
@@ -158,29 +159,29 @@ codex_field() {
   ' "$CONFIG"
 }
 
-# Gate knob: codex.p1_gate.enabled. Default false everywhere except
-# mergepath itself (which sets it true in .github/review-policy.yml).
-# Off-state is a clean pass — no API calls, no work.
+# Gate knob: coderabbit.severity_gate.enabled. Default false EVERYWHERE
+# (today CodeRabbit has no gate); mergepath sets it true. Off-state is a
+# clean pass — no API calls, no work.
 #
 # This off-state short-circuit runs BEFORE the PR_NUMBER/REPO/GH_TOKEN
-# requirements below (#447): the header documents step 1 as
-# "p1_gate.enabled=false → clean pass," so a consumer with the gate
+# requirements below (mirrors codex-p1-gate.sh #447): step 1 is
+# "severity_gate.enabled=false → clean pass," so a consumer with the gate
 # disabled must no-op on a bare/ad-hoc invocation instead of erroring on
 # missing PR context. The readers above touch only the local
 # review-policy.yml — no args, no API, no gh.
-P1_GATE_ENABLED=$(codex_p1_gate_field enabled)
-P1_GATE_ENABLED=${P1_GATE_ENABLED:-false}
-case "$P1_GATE_ENABLED" in
+GATE_ENABLED=$(coderabbit_severity_gate_field enabled)
+GATE_ENABLED=${GATE_ENABLED:-false}
+case "$GATE_ENABLED" in
   true|false) ;;
   *)
-    echo "ERROR: codex.p1_gate.enabled must be true|false; got '$P1_GATE_ENABLED'" >&2
+    echo "ERROR: coderabbit.severity_gate.enabled must be true|false; got '$GATE_ENABLED'" >&2
     exit 2
     ;;
 esac
 
-if [ "$P1_GATE_ENABLED" != "true" ]; then
-  echo "[codex-p1-gate] codex.p1_gate.enabled=false — skipping (clean pass)"
-  echo "Codex blocking-tier unresolved: 0"
+if [ "$GATE_ENABLED" != "true" ]; then
+  echo "[coderabbit-severity-gate] coderabbit.severity_gate.enabled=false — skipping (clean pass)"
+  echo "CodeRabbit blocking-tier unresolved: 0"
   exit 0
 fi
 
@@ -201,7 +202,8 @@ fi
 
 # Verify GH_TOKEN BEFORE auto-detecting REPO via `gh repo view` — a
 # missing/invalid token otherwise surfaces as a misleading "could not
-# detect current repo" instead of the real auth error (CodeRabbit on #463).
+# detect current repo" instead of the real auth error (matches
+# codex-p1-gate.sh, CodeRabbit on #463).
 if [ -z "${GH_TOKEN:-}" ]; then
   echo "ERROR: GH_TOKEN is required. See REVIEW_POLICY.md § PAT lookup table." >&2
   exit 2
@@ -216,18 +218,15 @@ if [ -z "$REPO" ]; then
   fi
 fi
 
-BOT_LOGIN=$(codex_field bot_login)
-BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
+BOT_LOGIN=$(coderabbit_field bot_login)
+BOT_LOGIN=${BOT_LOGIN:-"coderabbitai[bot]"}
 
 # Resolve the BLOCKING tier set from the feedback_policy block (#577). Absent
-# block -> "p1" (byte-identical to the original P1-only gate). Only rc 2 is
-# the documented "malformed mode/tier" signal — fail closed as a config error
-# (exit 2), the same posture as the p1_gate.enabled validation above. A
-# non-2 non-zero rc is NOT a failure: resolve_required_tiers' by-priority
-# branch inherits the exit status of its final loop iteration (e.g. rc 1 when
-# the last tier, nitpick, is not `required`), which is benign. Capture the
-# output regardless and branch on the rc explicitly so that benign tail
-# status does not get misread as malformed.
+# block -> "p1". Only rc 2 is the documented "malformed mode/tier" signal —
+# fail closed as a config error (exit 2). A non-2 non-zero rc is benign:
+# resolve_required_tiers' by-priority branch inherits the exit status of its
+# final loop iteration (e.g. rc 1 when the last tier, nitpick, is not
+# `required`). Capture the output regardless and branch on the rc explicitly.
 set +e
 REQUIRED_TIERS=$(resolve_required_tiers "$CONFIG")
 RT_RC=$?
@@ -237,7 +236,7 @@ if [ "$RT_RC" -eq 2 ]; then
   exit 2
 fi
 
-# Return 0 iff $1 (a tier like p0..p3) is in the resolved REQUIRED_TIERS set.
+# Return 0 iff $1 (a tier like p0..p3|nitpick) is in the resolved set.
 # Newline-delimited exact match — mirrors login_is_available_reviewer.
 tier_is_required() {
   local needle=$1 t
@@ -251,17 +250,59 @@ tier_is_required() {
 # --- logging helpers --------------------------------------------------------
 
 log() {
-  echo "[codex-p1-gate] $*" >&2
+  echo "[coderabbit-severity-gate] $*" >&2
 }
 
 die() {
   local code=$1
   shift
-  echo "[codex-p1-gate] ERROR: $*" >&2
+  echo "[coderabbit-severity-gate] ERROR: $*" >&2
   exit "$code"
 }
 
-# Paginated fetch helper — same shape as codex-review-check.sh.
+# --- nitpick-under-chill no-op warning (#577) -------------------------------
+# `nitpick: required` only has teeth when .coderabbit.yml runs
+# reviews.profile: assertive — the shipped `chill` profile suppresses the
+# 🧹 Nitpick category ENTIRELY, so CodeRabbit never emits a nitpick finding
+# for this gate to catch. When the resolved required set includes `nitpick`
+# but the profile is (or defaults to) chill, warn that the gating is a
+# silent no-op. Advisory only: it does NOT change the gate result and NEVER
+# rewrites .coderabbit.yml (both out of scope per the issue). Read the
+# profile with the same dependency-free awk-state-machine style as
+# coderabbit_field, retargeted to the reviews: block in .coderabbit.yml.
+coderabbit_yml_profile() {
+  local f=".coderabbit.yml"
+  [ -f "$f" ] || return 0
+  awk '
+    /^reviews:/ { in_rev=1; next }
+    in_rev && /^[^[:space:]#]/ { in_rev=0 }
+    in_rev && $1 == "profile:" {
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+      gsub(/^"/, "", $0)
+      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print
+      exit
+    }
+  ' "$f"
+}
+
+if tier_is_required nitpick; then
+  CR_PROFILE=$(coderabbit_yml_profile)
+  # Absent .coderabbit.yml / absent profile ⇒ CodeRabbit's own default,
+  # which is chill — so treat empty as chill for the purpose of this warning.
+  CR_PROFILE=${CR_PROFILE:-chill}
+  if [ "$CR_PROFILE" = "chill" ]; then
+    log "WARNING: feedback_policy marks 'nitpick' required, but .coderabbit.yml"
+    log "         reviews.profile is '$CR_PROFILE' — the chill profile suppresses the"
+    log "         🧹 Nitpick category entirely, so nitpick gating is a silent no-op."
+    log "         Set reviews.profile: assertive in .coderabbit.yml to give it teeth,"
+    log "         or set feedback_policy nitpick to discretionary to drop the claim."
+  fi
+fi
+
+# Paginated fetch helper — same shape as codex-p1-gate.sh.
 fetch_api_array() {
   local endpoint=$1
   local label=$2
@@ -284,7 +325,7 @@ if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
 fi
 log "HEAD = $HEAD_SHA    bot_login = $BOT_LOGIN"
 
-# --- fetch Codex blocking-tier inline comments ------------------------------
+# --- fetch CodeRabbit blocking-tier inline comments -------------------------
 
 COMMENTS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
 
@@ -297,8 +338,9 @@ log "blocking tier set: $(echo "$REQUIRED_TIERS" | tr '\n' ' ')"
 #     has commit_id != HEAD; we treat it as out-of-scope for this gate
 #     regardless of thread state (already resolved by not being on HEAD).
 # We keep the FULL body here so stage 2 can classify each candidate with
-# the shared codex_tier_of — no tier filter in jq, to avoid re-implementing
-# (and drifting from) the classifier in scripts/lib/feedback-policy-helpers.sh.
+# the shared coderabbit_tier_of — no tier filter in jq, to avoid
+# re-implementing (and drifting from) the classifier in
+# scripts/lib/feedback-policy-helpers.sh.
 CANDIDATES=$(echo "$COMMENTS_JSON" | jq -c \
   --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
   [ .[]
@@ -313,19 +355,17 @@ CANDIDATES=$(echo "$COMMENTS_JSON" | jq -c \
   ]
 ')
 
-# Stage 2 (bash): classify each candidate via codex_tier_of and keep only
-# those whose tier is in the resolved blocking set. With the feedback_policy
-# block absent the set is {p1}, so this reproduces the original
-# `![P1 Badge]` / `**P1` filter exactly (codex_tier_of matches those two
-# markers). Re-assemble the kept comments into a JSON array of
-# {id, path, line, body_snippet} (trimmed first line for log readability).
+# Stage 2 (bash): classify each candidate via coderabbit_tier_of and keep
+# only those whose tier is in the resolved blocking set. Re-assemble the
+# kept comments into a JSON array of {id, path, line, tier, body_snippet}
+# (trimmed first line for log readability).
 BLOCKING_COMMENTS="[]"
 CAND_COUNT=$(echo "$CANDIDATES" | jq 'length')
 i=0
 while [ "$i" -lt "$CAND_COUNT" ]; do
   c=$(echo "$CANDIDATES" | jq -c ".[$i]")
   body=$(echo "$c" | jq -r '.body')
-  tier=$(codex_tier_of "$body")
+  tier=$(coderabbit_tier_of "$body")
   if tier_is_required "$tier"; then
     BLOCKING_COMMENTS=$(echo "$BLOCKING_COMMENTS" | jq -c \
       --argjson c "$c" --arg tier "$tier" '
@@ -345,7 +385,7 @@ BLOCKING_COUNT=$(echo "$BLOCKING_COMMENTS" | jq 'length')
 log "found $BLOCKING_COUNT blocking-tier comment(s) on HEAD"
 
 if [ "$BLOCKING_COUNT" -eq 0 ]; then
-  echo "Codex blocking-tier unresolved: 0"
+  echo "CodeRabbit blocking-tier unresolved: 0"
   exit 0
 fi
 
@@ -358,8 +398,7 @@ fi
 #
 # A single page of 100 review threads is enough for the typical PR; a
 # PR with >100 review threads is unusual and warrants a hard error
-# rather than a silent truncation (same pattern as the manual GraphQL
-# fallback in CLAUDE.md § Before merging step 7.6 escape hatch).
+# rather than a silent truncation (same posture as codex-p1-gate.sh).
 
 OWNER=${REPO%/*}
 NAME=${REPO#*/}
@@ -425,7 +464,7 @@ UNRESOLVED_COUNT=$(echo "$UNRESOLVED_BLOCKING" | jq 'length')
 
 if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
   echo ""
-  echo "Unresolved Codex blocking-tier findings on current HEAD ($HEAD_SHA):"
+  echo "Unresolved CodeRabbit blocking-tier findings on current HEAD ($HEAD_SHA):"
   echo "$UNRESOLVED_BLOCKING" | jq -r '
     .[] | "  - [\(.tier | ascii_upcase)] \(.path):\(.line) (comment id \(.id))\n      \(.body_snippet)"
   '
@@ -435,7 +474,7 @@ if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
   echo ""
 fi
 
-echo "Codex blocking-tier unresolved: $UNRESOLVED_COUNT"
+echo "CodeRabbit blocking-tier unresolved: $UNRESOLVED_COUNT"
 
 if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
   exit 1
