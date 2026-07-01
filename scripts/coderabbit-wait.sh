@@ -962,7 +962,7 @@ iso_on_or_after() {
 
 status_context_fast_path_blocked_by_comment() {
   local status_created_at=$1
-  local latest class comment_id comment_fresh_at comment_body
+  local latest class comment_id comment_created_at comment_body
   latest=$(scan_latest_comment)
   if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
     return 1
@@ -977,16 +977,24 @@ status_context_fast_path_blocked_by_comment() {
       # the fast-path so the wait keeps polling (and re-invokes `resume`)
       # instead of false-clearing over a paused review.
       comment_id=$(echo "$latest" | jq -r '.id')
-      comment_fresh_at=$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at')
       comment_created_at=$(echo "$latest" | jq -r '.created_at // .fresh_at // .updated_at')
       comment_body=$(echo "$latest" | jq -r '.body')
       if printf '%s' "$comment_body" | grep -Fq "$HEAD_SHA"; then
-        if iso_on_or_after "$comment_fresh_at" "$status_created_at"; then
-          log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class explicitly references current HEAD $HEAD_SHA and fresh_at=$comment_fresh_at is not older than status_created=$status_created_at"
-          return 0
-        fi
-        log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class explicitly references current HEAD $HEAD_SHA but fresh_at=$comment_fresh_at is older than status_created=$status_created_at"
-        return 1
+        # #596: a rate_limit/paused/in_progress notice that references the
+        # CURRENT HEAD proves CodeRabbit has NOT completed a review of this
+        # HEAD — a completed review posts a NEWER summary comment, which
+        # scan_latest_comment would have returned as class=review instead of
+        # this notice. CodeRabbit nonetheless flips its commit StatusContext to
+        # success while rate-limited, typically ~1s AFTER posting the notice, so
+        # the previous `iso_on_or_after comment_fresh_at status_created_at` gate
+        # treated that 1-second-newer success as authoritative and false-cleared
+        # (the #595 dogfood: rate-limit comment @07:49:36, status success
+        # @07:49:37, zero review). Suppress unconditionally: while the latest
+        # HEAD-referencing CodeRabbit comment is a non-review notice, a success
+        # StatusContext does not represent a completed review of this HEAD,
+        # regardless of sub-second ordering.
+        log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class is a non-review notice referencing current HEAD $HEAD_SHA (created=$comment_created_at) — a success status does not represent a completed review of this HEAD"
+        return 0
       fi
       # #446: a rate_limit/paused/in_progress comment POSTED (created) at/after
       # the StatusContext flipped to success means CodeRabbit re-entered a
