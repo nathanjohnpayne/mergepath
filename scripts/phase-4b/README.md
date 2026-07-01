@@ -15,7 +15,7 @@ questions in the plan).
 |------|------|
 | [`../phase-4b-review.sh`](../phase-4b-review.sh) | Orchestrator. Selects the reviewer (≠ author), dispatches to an adapter, fails closed on any doubt, and posts the verdict under the reviewer PAT via `gh-as-reviewer.sh`. |
 | [`adapters/review-via-codex.sh`](adapters/review-via-codex.sh) | Direction A (Claude→Codex). `codex --ask-for-approval never exec --sandbox read-only --output-schema verdict.schema.json`. |
-| [`adapters/review-via-claude.sh`](adapters/review-via-claude.sh) | Direction B (Codex→Claude). `claude -p --system-prompt ... --permission-mode plan --tools "" --output-format json`. |
+| [`adapters/review-via-claude.sh`](adapters/review-via-claude.sh) | Direction B (Codex→Claude). `claude -p --system-prompt ... --permission-mode plan --effort medium --tools "" --output-format json`. |
 | [`verdict.schema.json`](verdict.schema.json) | The normalized verdict contract both adapters emit, with optional adapter-populated token usage metadata when the CLI exposes it. |
 | [`lib.sh`](lib.sh) | Shared config readers, reviewer selection, and `jq`-based verdict validation. |
 
@@ -69,10 +69,11 @@ phase-4b-classifier.sh (is 4b needed?) ─▶ phase-4b-review.sh
   that SHA.
 - **Tool/file-access isolation:** Codex runs from an empty scratch review root
   with scratch `HOME`/`CODEX_HOME`; the copied Codex auth file lives outside the
-  review root. Claude runs with a text-only structured-output system prompt,
-  `--tools ""`, `--safe-mode`, disabled slash commands, and no session
-  persistence. The diff is supplied on stdin in both directions, so neither
-  reviewer needs repo or home-directory read tools.
+  review root. Claude runs with a compact structured-output prompt, a
+  text-only system prompt, `--effort medium`, `--tools ""`, `--safe-mode`,
+  disabled slash commands, and no session persistence. The diff is supplied on
+  stdin in both directions, so neither reviewer needs repo or home-directory
+  read tools.
 - **Timeouts:** adapter execution and the underlying reviewer CLI are bounded
   by `P4B_ADAPTER_TIMEOUT_SECONDS` / `P4B_REVIEW_CLI_TIMEOUT_SECONDS`
   (default `900`). A timeout exits through the same fail-closed manual handoff

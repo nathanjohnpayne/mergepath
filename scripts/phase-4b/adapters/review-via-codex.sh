@@ -102,8 +102,8 @@ CODEX_AUTH_SOURCE="$(p4b_codex_auth_file)"
 REQUIRED_SEVERITIES="$(p4b_required_verdict_severities_json)" \
   || p4b_die 3 "invalid feedback_policy; cannot determine required verdict severities"
 PROMPT="You are an external code reviewer for GitHub PR #${PR}${REPO:+ in ${REPO}}${HEAD:+ at commit ${HEAD}}.
-Perform an exhaustive code review: keep looking for additional findings until
-you stop finding new issues.
+Exhaustive code review: keep looking for additional findings until you stop
+finding new issues.
 The unified diff is provided on stdin. Return ONLY a JSON object conforming
 to the provided output schema: a 'verdict' of APPROVED or CHANGES_REQUESTED,
 a short 'summary', and a 'findings' array ({severity P0-P3, path, line, body}).

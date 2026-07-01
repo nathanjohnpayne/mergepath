@@ -223,6 +223,7 @@ echo MISSING-SANDBOX >&2
 exit 8"
 mk_fake fake-claude-readonly \
   "permission=''
+effort=''
 tools='__unset__'
 system_prompt_seen=false
 safe_mode=false
@@ -231,6 +232,7 @@ slash_disabled=false
 while [ \"\$#\" -gt 0 ]; do
   case \"\$1\" in
     --permission-mode) permission=\"\${2:-}\"; shift 2 ;;
+    --effort) effort=\"\${2:-}\"; shift 2 ;;
     --tools) tools=\"\${2-}\"; shift 2 ;;
     --system-prompt) system_prompt_seen=true; shift 2 ;;
     --safe-mode) safe_mode=true; shift ;;
@@ -240,6 +242,7 @@ while [ \"\$#\" -gt 0 ]; do
   esac
 done
 [ \"\$permission\" = 'plan' ] || { echo BAD-PERMISSION-MODE >&2; exit 8; }
+[ \"\$effort\" = 'medium' ] || { echo BAD-EFFORT >&2; exit 8; }
 [ \"\$tools\" = '' ] || { echo BAD-TOOLS >&2; exit 8; }
 [ \"\$system_prompt_seen\" = true ] || { echo MISSING-SYSTEM-PROMPT >&2; exit 8; }
 [ \"\$safe_mode\" = true ] || { echo MISSING-SAFE-MODE >&2; exit 8; }

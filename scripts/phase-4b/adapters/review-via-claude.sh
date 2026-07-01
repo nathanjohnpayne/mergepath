@@ -17,7 +17,7 @@
 #
 # Docs (verbatim flags):
 #   claude -p "<prompt>" --system-prompt "<structured reviewer>" \
-#     --permission-mode plan --output-format json \
+#     --permission-mode plan --effort medium --output-format json \
 #     --tools ""
 #   https://code.claude.com/docs/en/headless
 #   https://code.claude.com/docs/en/permission-modes
@@ -43,9 +43,10 @@
 #               call fails and the orchestrator falls back to the manual
 #               handoff (fail-closed).
 #   Claude always runs with a text-only system prompt, --permission-mode plan,
-#   and --tools "".
+#   --effort medium, and --tools "".
 #   Environment overrides cannot widen the tool or permission posture.
 #   GH_TOKEN    only used if the diff must be fetched (no --diff-file).
+#   P4B_CLAUDE_EFFORT  effort level for the Claude run (default: medium).
 #   P4B_REVIEW_CLI_TIMEOUT_SECONDS  default: P4B_ADAPTER_TIMEOUT_SECONDS
 #               or 900. Timeout maps to exit 4 / manual fallback.
 #
@@ -62,6 +63,7 @@ CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 PERMISSION_MODE=plan
 TOOLS=""
 SYSTEM_PROMPT="You are a text-only structured-output code reviewer. Do not use tools. Do not plan implementation. Return exactly the requested JSON object and no prose."
+EFFORT="${P4B_CLAUDE_EFFORT:-medium}"
 
 PR="" ; REPO="" ; HEAD="" ; DIFF_FILE="" ; MODEL="${P4B_CLAUDE_MODEL:-}"
 CLI_TIMEOUT="${P4B_REVIEW_CLI_TIMEOUT_SECONDS:-${P4B_ADAPTER_TIMEOUT_SECONDS:-900}}"
@@ -86,6 +88,10 @@ done
 [ -n "$PR" ] || usage
 command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
 [ -r "$SCHEMA" ] || p4b_die 3 "verdict schema not readable: $SCHEMA"
+case "$EFFORT" in
+  low|medium|high|xhigh|max) ;;
+  *) p4b_die 3 "invalid P4B_CLAUDE_EFFORT '$EFFORT' (expected low|medium|high|xhigh|max)" ;;
+esac
 
 # --- obtain the diff -------------------------------------------------------
 DIFF=""
@@ -105,21 +111,26 @@ p4b_require_claude_plan_auth "$CLAUDE_BIN"
 # --- run the review --------------------------------------------------------
 REQUIRED_SEVERITIES="$(p4b_required_verdict_severities_json)" \
   || p4b_die 3 "invalid feedback_policy; cannot determine required verdict severities"
-SCHEMA_TEXT="$(cat "$SCHEMA")"
 PROMPT="You are an external code reviewer for GitHub PR #${PR}${REPO:+ in ${REPO}}${HEAD:+ at commit ${HEAD}}.
-Perform an exhaustive code review: keep looking for additional findings until
-you stop finding new issues.
-The unified diff is on stdin. Respond with ONLY a single JSON object (no
-prose, no code fence) conforming to this JSON Schema:
-${SCHEMA_TEXT}
-verdict must be APPROVED or CHANGES_REQUESTED. Approve only if you would
-stake a merge on it. For this repository, these finding severities require
+Exhaustive code review: keep looking for additional findings until you stop
+finding new issues, then return the verdict.
+The unified diff is on stdin. Respond with ONLY this JSON object shape, with no
+prose, no code fence, and no extra keys:
+{
+  \"verdict\": \"APPROVED or CHANGES_REQUESTED\",
+  \"summary\": \"1-4 sentence rationale\",
+  \"findings\": [
+    {\"severity\":\"P0|P1|P2|P3\",\"path\":\"repo-relative path or null\", \"line\": 123, \"body\":\"finding text\"}
+  ],
+  \"usage\": null
+}
+Use an empty findings array for a clean approval. path and line must be null
+for PR-level findings. For this repository, these finding severities require
 disposition before merge: ${REQUIRED_SEVERITIES}. If any finding with one of
-those severities exists, the verdict must be CHANGES_REQUESTED, not APPROVED.
-When requesting changes, list every required-severity issue you identify in
-this pass, not just the first one.
-Set usage to null; the adapter will populate CLI usage metadata if the CLI
-exposes it. Do not edit files. Do not post anything to GitHub."
+those severities exists, verdict must be CHANGES_REQUESTED, not APPROVED. When
+requesting changes, list every required-severity issue you identify in this
+pass, not just the first one. Do not edit files. Do not post anything to
+GitHub."
 
 SAFE_ENV=(env -i
   "PATH=${PATH:-/usr/bin:/bin}"
@@ -140,6 +151,7 @@ ENVELOPE="$(
     "$CLAUDE_BIN" -p "$PROMPT" \
     --system-prompt "$SYSTEM_PROMPT" \
     --permission-mode "$PERMISSION_MODE" \
+    --effort "$EFFORT" \
     --output-format json \
     --no-session-persistence \
     --safe-mode \

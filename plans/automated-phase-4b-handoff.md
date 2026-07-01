@@ -269,7 +269,7 @@ sequenceDiagram
 
     CX->>OR: invoke (PR#, direction=codex->claude)
     OR->>OR: HEAD-pin SHA, build diff + focus areas
-    OR->>CL: claude -p "<schema prompt>" --system-prompt "<structured reviewer>"<br/>--permission-mode plan --tools "" --output-format json
+    OR->>CL: claude -p "<compact schema prompt>" --system-prompt "<structured reviewer>"<br/>--permission-mode plan --effort medium --tools "" --output-format json
     CL-->>OR: JSON envelope with verdict object in .result
     alt approved
         OR->>GR: create pull review via API<br/>event=APPROVE, commit_id=HEAD
@@ -285,9 +285,10 @@ sequenceDiagram
 **Why Claude still uses a wrapper prompt.** Claude Code has built-in review
 slash commands, but the reference adapter does not let the CLI post GitHub
 reviews directly. It runs `claude -p` in plan mode with a replacement
-text-only structured-output system prompt, asks for the same verdict schema the
-Codex direction uses, parses the print-mode JSON envelope, and leaves GitHub
-attribution to `scripts/gh-as-reviewer.sh`.
+text-only structured-output system prompt, asks for the same verdict contract
+the Codex direction uses, validates the response against the shared schema
+after parsing the print-mode JSON envelope, and leaves GitHub attribution to
+`scripts/gh-as-reviewer.sh`.
 
 Illustrative adapter invocation:
 
@@ -295,6 +296,7 @@ Illustrative adapter invocation:
 claude -p "$PROMPT_WITH_VERDICT_SCHEMA" \
   --system-prompt "$TEXT_ONLY_STRUCTURED_REVIEWER_PROMPT" \
   --permission-mode plan \
+  --effort medium \
   --tools "" \
   --safe-mode \
   --disable-slash-commands \
@@ -306,8 +308,11 @@ claude -p "$PROMPT_WITH_VERDICT_SCHEMA" \
 
 - The replacement `--system-prompt` keeps Claude Code in text-review mode
   instead of returning an implementation-planning transcript; the shared
-  verdict schema still lives in the user prompt.
+  verdict contract still lives in the user prompt and the adapter validates the
+  parsed object against `verdict.schema.json`.
 - `--permission-mode plan` keeps the run read-only (research/propose, no edits)—the appropriate posture for an unattended reviewer ([permission modes](https://code.claude.com/docs/en/permission-modes)).
+- `--effort medium` keeps the large-diff review bounded enough for the adapter
+  timeout while still doing a full review pass.
 - `--tools ""` disables Claude Code tools entirely. The diff is already on stdin, so the reviewer does not need `Read` or `Bash`; this prevents prompt-injected diffs from steering the CLI into reading local files or environment state.
 - `--output-format json` yields a structured result (result text, `session_id`, cost) for the orchestrator to parse ([headless mode](https://code.claude.com/docs/en/headless)).
 - Headless auth uses the operator's Claude Code subscription login, preserving
@@ -330,9 +335,9 @@ GH_AS_REVIEWER_IDENTITY=nathanpayne-claude \
 |-----------|-------------------------------|------------------------------|
 | Built-in review affordance used here | None—no `codex review`, no `/review`; review is a prompted `codex exec` | None for posting; review is a prompted `claude -p` run |
 | Native review state | None (free-form text) → impose `--output-schema`, map to state | None posted by CLI; prompt for the shared verdict schema inside `.result` |
-| Read-only posture | `--sandbox read-only`, scratch `--cd`, isolated scratch HOME/CODEX_HOME + `--ask-for-approval never` | Text-only `--system-prompt`, `--permission-mode plan`, `--tools ""`, safe mode, no session persistence |
+| Read-only posture | `--sandbox read-only`, scratch `--cd`, isolated scratch HOME/CODEX_HOME + `--ask-for-approval never` | Text-only `--system-prompt`, `--permission-mode plan`, `--effort medium`, `--tools ""`, safe mode, no session persistence |
 | Output capture | `--json` (JSONL events) and `-o/--output-last-message <file>` | `--output-format json` (`result`, `session_id`, cost) |
-| Structured output | `--output-schema <file>` (schema-validated final message) | Text-only system prompt + shared schema prompt + JSON parse |
+| Structured output | `--output-schema <file>` (schema-validated final message) | Text-only system prompt + compact contract prompt + JSON parse + shared schema validation |
 | LLM auth (reasoning plane) | `codex login` / ChatGPT plan login; child env allowlist excludes API keys and ambient credentials | Claude Code subscription login / `CLAUDE_CODE_OAUTH_TOKEN`; child env allowlist excludes API keys and ambient credentials |
 | GitHub auth (attribution plane) | `nathanpayne-codex` PAT via `gh-as-reviewer.sh` | `nathanpayne-claude` PAT via `gh-as-reviewer.sh` |
 | Session continuation | `codex exec resume --last "..."` | `--resume <id>` / `--continue` / `--session-id` |
@@ -349,10 +354,11 @@ the orchestrator and the merge gate stay direction-agnostic.
 ## 10. Review round loop and fail-closed degradation
 
 The reference orchestrator performs one exhaustive adapter pass per invocation:
-the prompt asks the reviewer to keep looking for additional findings until it
-stops finding new issues, then return the full verdict object. `max_review_rounds`
-is a declarative cap for the outer review flow that re-runs this helper after
-`CHANGES_REQUESTED`; this first ship does not persist round state inside the
+the prompt uses "Exhaustive code review" and asks the reviewer to keep looking
+for additional findings until it stops finding new issues, then return the full
+verdict object. `max_review_rounds` is a declarative cap for the outer review
+flow that re-runs this helper after `CHANGES_REQUESTED`; this first ship does
+not persist round state inside the
 helper itself.
 The key safety property: **the system only ever posts `APPROVED` when an adapter
 returns an unambiguous approval with no findings at all.** The shared validator
