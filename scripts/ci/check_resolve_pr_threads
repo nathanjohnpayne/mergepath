@@ -495,6 +495,33 @@ else
   bash "$PAGINATION_TEST" 2>&1 | sed 's/^/      /' >&2 || true
 fi
 
+# ── Test 10: delegate to tests/test_resolve_pr_threads_verified_propagation.sh
+# Exercises the #572 --resolve-verified-propagation mode: canonical/templated
+# routing-class threads resolve ONLY on a byte-verified propagation match
+# (consumer current content vs mergepath canonical source / re-rendered
+# template with consumer facts), with drift and every verification failure
+# skipped fail-closed, surface-class + human threads untouched, and a
+# working --dry-run preview. The #575 deferred→actioned tag auto-upgrade
+# guard is covered by the rationale-tag suite (Test 8 above). Same
+# delegation pattern as Tests 8/9.
+echo
+echo "resolve-pr-threads.sh verified-propagation resolution (#572)"
+
+VERIFIED_PROPAGATION_TEST="$ROOT/tests/test_resolve_pr_threads_verified_propagation.sh"
+if [ ! -f "$VERIFIED_PROPAGATION_TEST" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: missing $VERIFIED_PROPAGATION_TEST" >&2
+elif bash "$VERIFIED_PROPAGATION_TEST" >/dev/null 2>&1; then
+  pass=$((pass + 1))
+  echo "  PASS: tests/test_resolve_pr_threads_verified_propagation.sh"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: tests/test_resolve_pr_threads_verified_propagation.sh exited non-zero" >&2
+  # Re-run with output captured so the CI log shows what broke.
+  echo "    re-running with output:" >&2
+  bash "$VERIFIED_PROPAGATION_TEST" 2>&1 | sed 's/^/      /' >&2 || true
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "check_resolve_pr_threads: PASS ($pass tests)"

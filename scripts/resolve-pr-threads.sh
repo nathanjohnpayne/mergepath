@@ -13,21 +13,53 @@
 #
 # Usage:
 #   scripts/resolve-pr-threads.sh <PR#> [--repo owner/name] [--list]
-#                                 [--auto-resolve-bots] [--dry-run]
-#                                 [--rationale <text>] [--no-tag-reply]
+#                                 [--auto-resolve-bots | --resolve-actioned
+#                                  | --resolve-verified-propagation]
+#                                 [--dry-run] [--rationale <text>]
+#                                 [--no-tag-reply]
 #
-# Modes:
+# Modes — split by DISPOSITION (#575). Pick the mode that matches what
+# actually HAPPENED to the feedback, because each mode records a
+# different [mergepath-resolve:<class>] tag, and the daily rollup /
+# weekly sweep read that tag as the disposition of record:
+#
+#   fixed or rebutted        → --resolve-actioned  (addressed-elsewhere /
+#                                                    rebuttal-recorded)
+#   explicitly deferred      → --auto-resolve-bots (deferred-to-followup)
+#   propagated from upstream → --resolve-verified-propagation
+#                                                   (verified-propagation)
+#
 #   --list                  List unresolved threads with author + path +
 #                           first-comment excerpt. No mutations.
-#   --auto-resolve-bots     Resolve threads whose author is a bot
-#                           (CodeRabbit, Codex Connector, Dependabot)
-#                           AND whose latest comment is on the current
-#                           HEAD. Use ONLY when:
-#                           - The agent has already addressed each
-#                             finding in a fix commit on this HEAD, OR
-#                             posted a rebuttal reply, AND
-#                           - The bot author has not auto-resolved in
-#                             a reasonable window.
+#   --auto-resolve-bots     THE tool for EXPLICIT DEFERRAL. Resolves
+#                           threads whose author is a bot (CodeRabbit,
+#                           Codex Connector, Dependabot) AND whose latest
+#                           comment is on the current HEAD, for findings
+#                           you are deliberately NOT fixing on this PR
+#                           because they are tracked elsewhere — the
+#                           standard case being canonical-coverage
+#                           findings on sync mirrors deferred to a
+#                           follow-up issue via --rationale. The tag
+#                           defaults to deferred-to-followup: the honest
+#                           marker for "not handled here", which the
+#                           daily rollup keeps re-surfacing.
+#                           Do NOT reach for this mode on findings you
+#                           fixed or rebutted — that silently mis-records
+#                           them as deferred (the #571 failure that
+#                           motivated #575). Guard: when a thread about
+#                           to be tagged deferred-to-followup is
+#                           demonstrably ACTIONED (the same evidence gate
+#                           --resolve-actioned uses derives
+#                           addressed-elsewhere / rebuttal-recorded), the
+#                           tag is AUTO-UPGRADED to the truthful class
+#                           with an INFO line. Auto-upgrade (not
+#                           warn-only) is deliberate: the upgrade can
+#                           never overclaim — it fires only on the
+#                           fail-closed evidence gate — while a warning
+#                           would leave the mis-tag in place for every
+#                           operator who misses the log line. A thread
+#                           that is NOT demonstrably actioned keeps
+#                           deferred-to-followup.
 #                           Per REVIEW_POLICY.md § Implementation notes
 #                           for branch protection gates: this is a
 #                           CLEAN-UP mechanism, not a policy override.
@@ -35,9 +67,11 @@
 #                           bot-only mode. Follow REVIEW_POLICY.md's
 #                           pre-merge gate for agent-reviewer vs
 #                           real-human threads.
-#   --resolve-actioned      Like --auto-resolve-bots (same bot-author,
-#                           current-HEAD, identity, tag-reply, and readback
-#                           handling) but resolves a thread ONLY when its
+#   --resolve-actioned      THE tool for FIXED or REBUTTED feedback — the
+#                           default on a PR you pushed fixes to. Like
+#                           --auto-resolve-bots (same bot-author,
+#                           identity, tag-reply, and readback handling)
+#                           but resolves a thread ONLY when its
 #                           derived class proves ACTION on this PR:
 #                           addressed-elsewhere (an agent commit touching the
 #                           anchored file, after the latest re-raise) or
@@ -70,8 +104,55 @@
 #                           a conversation-resolution-gated repo, fix/rebut
 #                           it (making it actioned) or defer it explicitly
 #                           via --auto-resolve-bots --rationale.
-#   --dry-run               With either resolve mode, print what would
-#                           be resolved without mutating.
+#   --resolve-verified-propagation
+#                           THE tool for the routing-class residual on
+#                           CONSUMER sync PRs (#572): canonical-coverage /
+#                           templated-render threads whose content has
+#                           PROVABLY propagated. Routing alone (path
+#                           membership in .mergepath-sync.yml) never counts
+#                           as actioned — it says WHERE a fix belongs, not
+#                           that one happened (#565) — but when the
+#                           consumer's CURRENT content byte-matches the
+#                           canonical/rendered source, the upstream state
+#                           has provably propagated and the thread is
+#                           handled. Per thread anchored at path P:
+#                           - P matches a canonical/kit entry in mergepath's
+#                             .mergepath-sync.yml → byte-compare the
+#                             consumer's CURRENT content at P (gh contents
+#                             API at the repo's default-branch HEAD) against
+#                             mergepath's canonical source file.
+#                           - P matches a templated entry's dest for this
+#                             consumer → re-render the source template with
+#                             the consumer's facts (the SAME render engine
+#                             scripts/workflow/verify-propagation-pr.sh
+#                             uses: scripts/lib/template-substitution.sh +
+#                             scripts/lib/manifest-fact-helpers.sh) and
+#                             byte-compare against the consumer's current
+#                             content.
+#                           Byte-match → resolve (same identity-checked
+#                           resolveReviewThread + isResolved:true readback
+#                           as the other modes) tagged
+#                           [mergepath-resolve: verified-propagation].
+#                           NO byte-match (drifted, or the upstream fix has
+#                           not propagated yet) → LEAVE the thread
+#                           unresolved with a per-thread reason. FAIL
+#                           CLOSED — skip with reason, never resolve — on:
+#                           manifest entry missing, consumer content fetch
+#                           failure, render failure, facts/consumer-name
+#                           missing, yq missing, or a pagination-incomplete
+#                           comment list (#573/#614). Surface-class threads
+#                           (nitpick-noted etc.) and non-bot authors are
+#                           never touched. The PR-HEAD staleness proxy is
+#                           bypassed (like --resolve-actioned): the
+#                           verification target is the consumer's CURRENT
+#                           default branch, and the target population is
+#                           backlog threads on merged sync PRs (#562).
+#                           Run from a mergepath checkout with
+#                           --repo <owner/consumer-repo>; on a checkout
+#                           without .mergepath-sync.yml every thread skips
+#                           fail-closed.
+#   --dry-run               With any resolve mode, print what would
+#                           be resolved or skipped without mutating.
 #   --rationale <text>      With --auto-resolve-bots, override the
 #                           auto-synthesized class with a free-form
 #                           rationale. Class defaults to
@@ -80,6 +161,11 @@
 #                           Useful when the auto-heuristic would
 #                           misclassify (e.g. P2 deferred to a tracked
 #                           follow-up issue). Implies tag-reply emission.
+#                           The #575 guard still applies to the CLASS: a
+#                           demonstrably-actioned thread is upgraded to
+#                           addressed-elsewhere / rebuttal-recorded while
+#                           keeping the operator's rationale text — the
+#                           override records WHY, never falsifies WHAT.
 #   --no-tag-reply          With --auto-resolve-bots, suppress the
 #                           pre-resolution `[mergepath-resolve:<class>]`
 #                           reply emission. The resolve mutation still
@@ -110,6 +196,12 @@
 #     rebuttal-recorded     a substantive agent-authored reply (≥30
 #                           chars) is on the thread
 #     deferred-to-followup  default fallback / --rationale override
+#     verified-propagation  consumer content at the anchored path
+#                           byte-matches mergepath's canonical source
+#                           (or the re-rendered template with the
+#                           consumer's facts) at resolution time —
+#                           emitted only by
+#                           --resolve-verified-propagation (#572)
 #
 #   Tag emission failure is logged + skipped (does NOT block the
 #   resolve mutation). The rollup's classifier accepts any string
@@ -124,9 +216,12 @@
 #       --auto-resolve-bots run, the helper re-reads each thread it
 #       resolved via a `nodes(ids:)` readback and refuses to report success
 #       unless GitHub confirms isResolved:true for all of them.
-#   3 — unresolved threads exist (in --list mode); call again with
-#       --auto-resolve-bots after addressing findings, or resolve
-#       human-authored threads via the GitHub UI.
+#   3 — unresolved threads exist (in --list mode), or a resolve mode left
+#       threads unresolved (human-authored, stale-HEAD, not-actioned,
+#       comments-incomplete, not-propagation-routed, drifted, or
+#       verification-failed). Address the findings and retry with the
+#       mode that matches the disposition, or resolve human-authored
+#       threads via the GitHub UI.
 #
 # References:
 #   nathanjohnpayne/mergepath#166 — the issue this closes
@@ -159,22 +254,43 @@ fi
 usage() {
   cat <<'EOF' >&2
 Usage: scripts/resolve-pr-threads.sh <PR#> [--repo owner/name] [--list]
-                                            [--auto-resolve-bots | --resolve-actioned]
+                                            [--auto-resolve-bots | --resolve-actioned
+                                             | --resolve-verified-propagation]
                                             [--dry-run] [--rationale <text>] [--no-tag-reply]
 
+Resolve modes are split by DISPOSITION (#575) — pick the one that matches
+what actually happened to the feedback (the recorded tag is read by the
+daily rollup / weekly sweep as the disposition of record):
+
   --list                List unresolved threads (default).
-  --auto-resolve-bots   Resolve ALL current-HEAD bot-authored threads
-                        (clears the conversation-resolution gate; the
-                        daily rollup re-surfaces deferrals).
-  --resolve-actioned    Resolve ONLY current-HEAD bot threads whose fix or
-                        rebuttal is demonstrable (derived class in the
-                        actioned skip-set); leave the rest unresolved so
-                        the weekly sweep keeps surfacing them.
-  --dry-run             With either resolve mode, print without mutating.
+  --resolve-actioned    FIXED/REBUTTED feedback — the default on a PR you
+                        pushed fixes to. Resolves ONLY current-HEAD bot
+                        threads whose fix or rebuttal is demonstrable
+                        (tags the truthful addressed-elsewhere /
+                        rebuttal-recorded classes); leaves the rest
+                        unresolved so the weekly sweep keeps surfacing them.
+  --auto-resolve-bots   EXPLICIT DEFERRAL — resolve ALL current-HEAD
+                        bot-authored threads you are deliberately not
+                        fixing here (clears the conversation-resolution
+                        gate; tags deferred-to-followup and the daily
+                        rollup re-surfaces them). A demonstrably-actioned
+                        thread is auto-upgraded to its truthful class
+                        with an INFO line (#575).
+  --resolve-verified-propagation
+                        VERIFIED PROPAGATION on a consumer repo (#572) —
+                        resolve canonical/templated routing threads whose
+                        anchored content byte-matches mergepath's
+                        canonical source (or the re-rendered template
+                        with the consumer's facts); tags
+                        verified-propagation. Drift or ANY verification
+                        failure skips fail-closed.
+  --dry-run             With any resolve mode, print would-resolve /
+                        would-skip per thread without mutating.
   --rationale <text>    With --auto-resolve-bots, free-form rationale
                         appended after the [mergepath-resolve: deferred-to-followup]
-                        tag (overrides auto-classification).
-  --no-tag-reply        With either resolve mode, suppress the
+                        tag (overrides auto-classification; the #575
+                        actioned auto-upgrade still applies to the class).
+  --no-tag-reply        With any resolve mode, suppress the
                         [mergepath-resolve:<class>] reply emission
                         (the resolve mutation still runs).
 EOF
@@ -211,6 +327,7 @@ while [ $# -gt 0 ]; do
     --list) MODE="list"; shift ;;
     --auto-resolve-bots) MODE="auto-resolve-bots"; shift ;;
     --resolve-actioned) MODE="resolve-actioned"; shift ;;
+    --resolve-verified-propagation) MODE="resolve-verified-propagation"; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     --rationale)
       # Same defensive value check as --repo (Codex r2 on PR #172):
@@ -249,11 +366,18 @@ fi
 # action evidence — a free-form rationale override would resolve a thread
 # while mis-tagging it deferred-to-followup, so the daily rollup would treat
 # an actioned, resolved thread as deferred/unhandled. Reject the combo.
-if [ "$MODE" = "resolve-actioned" ] && $RATIONALE_FLAG_USED; then
-  echo "Error: --rationale is not valid with --resolve-actioned (it applies" >&2
-  echo "       only to --auto-resolve-bots). --resolve-actioned resolves on" >&2
-  echo "       derived action evidence; use --auto-resolve-bots --rationale" >&2
-  echo "       to deliberately resolve a deferred thread with a rationale." >&2
+# #572: the same logic applies to --resolve-verified-propagation, whose
+# contract is to resolve ONLY on byte-verified propagation evidence and whose
+# rationale IS the verification result — an override would replace the
+# evidence record.
+if { [ "$MODE" = "resolve-actioned" ] || [ "$MODE" = "resolve-verified-propagation" ]; } \
+   && $RATIONALE_FLAG_USED; then
+  echo "Error: --rationale is not valid with --resolve-actioned or" >&2
+  echo "       --resolve-verified-propagation (it applies only to" >&2
+  echo "       --auto-resolve-bots). Those modes resolve on derived evidence" >&2
+  echo "       (action / byte-verified propagation); use" >&2
+  echo "       --auto-resolve-bots --rationale to deliberately resolve a" >&2
+  echo "       deferred thread with a rationale." >&2
   exit 1
 fi
 
@@ -1196,6 +1320,234 @@ path_matches_templated_dest() {
 # propagate.
 REPO_ROOT_FOR_MANIFEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# ---------------------------------------------------------------------
+# #572 — verified-propagation resolution helpers
+# ---------------------------------------------------------------------
+#
+# All of these FAIL CLOSED: any lookup/fetch/render failure returns
+# non-zero and the caller must SKIP the thread (leave it unresolved),
+# never resolve on partial evidence. The byte-compare is the resolution
+# evidence; routing (path membership) alone never resolves (#565).
+
+# The templated arm REUSES the exact render engine
+# scripts/workflow/verify-propagation-pr.sh uses — the same
+# template-substitution lib + manifest-fact-helpers pair, sourced in a
+# subshell so the MERGEPATH_FACT_* exports don't leak between threads.
+# Do NOT reimplement the render here; divergence between the two
+# byte-compare surfaces would make "verified" mean two different things.
+VP_TEMPLATE_LIB="$__RESOLVE_THREADS_DIR/lib/template-substitution.sh"
+VP_FACTS_HELPER="$__RESOLVE_THREADS_DIR/lib/manifest-fact-helpers.sh"
+
+# fetch_consumer_default_branch — resolve (once) the consumer repo's
+# default branch, the ref the CURRENT-content byte-compare reads.
+# Cached; returns non-zero (fail closed) when it cannot be resolved.
+CONSUMER_DEFAULT_BRANCH=""
+CONSUMER_DEFAULT_BRANCH_FETCHED=false
+fetch_consumer_default_branch() {
+  if ! $CONSUMER_DEFAULT_BRANCH_FETCHED; then
+    CONSUMER_DEFAULT_BRANCH_FETCHED=true
+    CONSUMER_DEFAULT_BRANCH=$(gh_pat api "repos/$OWNER/$NAME" \
+      --jq .default_branch 2>/dev/null) || CONSUMER_DEFAULT_BRANCH=""
+    [ "$CONSUMER_DEFAULT_BRANCH" = "null" ] && CONSUMER_DEFAULT_BRANCH=""
+  fi
+  [ -n "$CONSUMER_DEFAULT_BRANCH" ]
+}
+
+# fetch_consumer_content <path> <out-file> — write the consumer repo's
+# CURRENT content at <path> (default-branch HEAD, raw bytes via the
+# contents endpoint) into <out-file>. Non-zero on any failure. The
+# content goes to a FILE, not a command substitution, so trailing
+# newlines survive and the compare is truly byte-for-byte.
+fetch_consumer_content() {
+  local vp_path="$1" out="$2"
+  fetch_consumer_default_branch || return 1
+  gh_pat api -H "Accept: application/vnd.github.raw" \
+    "repos/$OWNER/$NAME/contents/$vp_path?ref=$CONSUMER_DEFAULT_BRANCH" \
+    > "$out" 2>/dev/null
+}
+
+# manifest_consumer_name_for_repo — resolve (once) the manifest consumer
+# NAME whose .repo slug equals $REPO, needed to load the consumer's
+# facts for the templated re-render. Cached; non-zero (fail closed) when
+# the manifest is absent, yq is unavailable, or $REPO is not a declared
+# consumer.
+MANIFEST_CONSUMER_NAME=""
+MANIFEST_CONSUMER_NAME_FETCHED=false
+manifest_consumer_name_for_repo() {
+  if ! $MANIFEST_CONSUMER_NAME_FETCHED; then
+    MANIFEST_CONSUMER_NAME_FETCHED=true
+    local manifest="$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml"
+    if [ -f "$manifest" ] && command -v yq >/dev/null 2>&1; then
+      MANIFEST_CONSUMER_NAME=$(MP_VP_REPO="$REPO" yq -r '
+        .consumers[] | select(.repo == env(MP_VP_REPO)) | .name
+      ' "$manifest" 2>/dev/null | head -1) || MANIFEST_CONSUMER_NAME=""
+      [ "$MANIFEST_CONSUMER_NAME" = "null" ] && MANIFEST_CONSUMER_NAME=""
+    fi
+  fi
+  [ -n "$MANIFEST_CONSUMER_NAME" ]
+}
+
+# manifest_templated_source_for_dest <dest> <consumer_name> — echo the
+# SOURCE template path of the templated manifest entry whose dest is
+# <dest> AND whose consumers scope includes <consumer_name> (or is the
+# scalar `all`). Consumer scoping matters: two templated entries can
+# legitimately share one dest with disjoint consumer lists (the live
+# ESM/CJS eslint.config.js pair). Two yq passes mirror
+# fetch_manifest_templated_dests (mikefarah/yq rejects the inline
+# if/then/else that would branch on the consumers tag in one pass); the
+# seq-membership check runs in bash with the same anchored comma-grep
+# path_matches_templated_dest uses. Non-zero (fail closed) on no match,
+# missing manifest, or missing yq.
+manifest_templated_source_for_dest() {
+  local vp_dest="$1" consumer_name="$2"
+  local manifest="$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml"
+  [ -f "$manifest" ] || return 1
+  command -v yq >/dev/null 2>&1 || return 1
+  local src rows line src_field names
+  # Pass 1 — scalar `consumers: all` (every consumer is in scope).
+  src=$(MP_VP_DEST="$vp_dest" yq -r '
+    .paths[]
+    | select(.type == "templated")
+    | select((.dest // .path) == env(MP_VP_DEST))
+    | select(.consumers == "all")
+    | (.source // .path)
+  ' "$manifest" 2>/dev/null | head -1) || src=""
+  if [ -n "$src" ] && [ "$src" != "null" ]; then
+    printf '%s' "$src"
+    return 0
+  fi
+  # Pass 2 — sequence consumers: emit source + name list, membership in
+  # bash.
+  rows=$(MP_VP_DEST="$vp_dest" yq -r '
+    .paths[]
+    | select(.type == "templated")
+    | select((.dest // .path) == env(MP_VP_DEST))
+    | select(.consumers | tag == "!!seq")
+    | (.source // .path) + "\t" + (.consumers | join(","))
+  ' "$manifest" 2>/dev/null) || rows=""
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    src_field="${line%%$'\t'*}"
+    names="${line#*$'\t'}"
+    if printf ',%s,' "$names" | grep -qF ",$consumer_name,"; then
+      printf '%s' "$src_field"
+      return 0
+    fi
+  done <<< "$rows"
+  return 1
+}
+
+# verify_propagation_content <class> <path> — the #572 byte-compare.
+# stdout: a one-line detail message (the tag rationale on success, the
+# skip reason otherwise). Exit status is the verdict:
+#   0 — byte-match: the consumer's CURRENT content at <path> equals
+#       mergepath's canonical source (canonical-coverage) or the
+#       re-rendered template with this consumer's facts
+#       (templated-render). The thread may be resolved.
+#   1 — DRIFT: the compare ran and the bytes differ (consumer drifted,
+#       or the upstream fix has not propagated). Leave unresolved.
+#   2 — verification error (fail closed): manifest entry missing,
+#       content fetch failure, render failure, facts/consumer-name
+#       missing, or libs/yq unavailable. Leave unresolved.
+verify_propagation_content() {
+  local vp_class="$1" vp_path="$2"
+  local consumer_tmp mp_src rendered render_err render_rc consumer_name
+  case "$vp_class" in
+    canonical-coverage|templated-render) : ;;
+    *) echo "internal: unexpected class '$vp_class' reached verification"; return 2 ;;
+  esac
+  if [ -z "$vp_path" ] || [ "$vp_path" = "(no path)" ]; then
+    echo "thread has no anchored file path to verify"
+    return 2
+  fi
+  consumer_tmp=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-consumer.XXXXXX")
+  if ! fetch_consumer_content "$vp_path" "$consumer_tmp"; then
+    rm -f "$consumer_tmp"
+    echo "could not fetch $REPO:$vp_path at the default-branch HEAD (contents API)"
+    return 2
+  fi
+
+  if [ "$vp_class" = "canonical-coverage" ]; then
+    # Re-check manifest membership: the class can also arrive from a
+    # recorded marker, and the byte-compare source must be a real
+    # canonical/kit entry in THIS manifest.
+    if ! path_matches_manifest "$vp_path"; then
+      rm -f "$consumer_tmp"
+      echo "no canonical/kit entry in .mergepath-sync.yml covers $vp_path"
+      return 2
+    fi
+    mp_src="$REPO_ROOT_FOR_MANIFEST/$vp_path"
+    if [ ! -f "$mp_src" ]; then
+      rm -f "$consumer_tmp"
+      echo "canonical source $vp_path is missing from the mergepath working tree"
+      return 2
+    fi
+    if cmp -s "$mp_src" "$consumer_tmp"; then
+      rm -f "$consumer_tmp"
+      echo "consumer content at $vp_path byte-matches the mergepath canonical source; propagation verified."
+      return 0
+    fi
+    rm -f "$consumer_tmp"
+    echo "consumer content at $vp_path does NOT byte-match the mergepath canonical source (drifted, or the upstream fix has not propagated)"
+    return 1
+  fi
+
+  # templated-render — consumer facts + source lookup, then the shared
+  # render engine.
+  if ! manifest_consumer_name_for_repo; then
+    rm -f "$consumer_tmp"
+    echo "cannot resolve a consumer name for $REPO in .mergepath-sync.yml (facts unavailable)"
+    return 2
+  fi
+  consumer_name="$MANIFEST_CONSUMER_NAME"
+  if ! mp_src=$(manifest_templated_source_for_dest "$vp_path" "$consumer_name"); then
+    rm -f "$consumer_tmp"
+    echo "no templated manifest entry maps dest $vp_path for consumer $consumer_name"
+    return 2
+  fi
+  if [ ! -f "$REPO_ROOT_FOR_MANIFEST/$mp_src" ]; then
+    rm -f "$consumer_tmp"
+    echo "templated source $mp_src is missing from the mergepath working tree"
+    return 2
+  fi
+  if [ ! -r "$VP_FACTS_HELPER" ] || [ ! -r "$VP_TEMPLATE_LIB" ]; then
+    rm -f "$consumer_tmp"
+    echo "render libs missing (need scripts/lib/manifest-fact-helpers.sh + scripts/lib/template-substitution.sh)"
+    return 2
+  fi
+  rendered=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-rendered.XXXXXX")
+  render_err=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-render-err.XXXXXX")
+  render_rc=0
+  # Subshell render — identical shape to verify-propagation-pr.sh: facts
+  # exports stay contained, and `|| exit $?` propagates a fail-closed
+  # export rc (set -e is suppressed on the left of `||`; see #457).
+  (
+    # shellcheck source=lib/manifest-fact-helpers.sh
+    . "$VP_FACTS_HELPER" || exit 2
+    # shellcheck source=lib/template-substitution.sh
+    . "$VP_TEMPLATE_LIB" || exit 2
+    export_consumer_facts "$consumer_name" "$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml" || exit $?
+    template_substitution::render "$REPO_ROOT_FOR_MANIFEST/$mp_src"
+  ) > "$rendered" 2> "$render_err" || render_rc=$?
+  if [ "$render_rc" != "0" ]; then
+    if [ -s "$render_err" ]; then
+      sed 's/^/    /' "$render_err" >&2
+    fi
+    rm -f "$consumer_tmp" "$rendered" "$render_err"
+    echo "templated re-render failed for source $mp_src (consumer=$consumer_name, rc=$render_rc)"
+    return 2
+  fi
+  rm -f "$render_err"
+  if cmp -s "$rendered" "$consumer_tmp"; then
+    rm -f "$consumer_tmp" "$rendered"
+    echo "consumer content at $vp_path byte-matches the re-rendered template $mp_src (consumer=$consumer_name); propagation verified."
+    return 0
+  fi
+  rm -f "$consumer_tmp" "$rendered"
+  echo "consumer content at $vp_path does NOT byte-match the re-rendered template $mp_src (consumer=$consumer_name)"
+  return 1
+}
+
 # derive_tag_class — given the thread JSON (one line of UNRESOLVED),
 # return one of the rollup's class strings on stdout.
 #
@@ -1627,6 +1979,21 @@ SKIPPED_NOT_ACTIONED=0
 # (fail closed) rather than classified on a window that may be missing
 # the latest bot/reviewer re-raise. Counted into the exit-3 predicate.
 SKIPPED_COMMENTS_INCOMPLETE=0
+# #572 --resolve-verified-propagation skip counters, all in the exit-3
+# predicate:
+#   SKIPPED_NOT_PROPAGATION  the thread's class is not canonical-coverage /
+#                            templated-render — this mode only handles
+#                            routing-class threads (surface + actioned
+#                            classes have their own modes).
+#   SKIPPED_DRIFT            the byte-compare RAN and MISMATCHED — the
+#                            consumer content drifted or the upstream fix
+#                            has not propagated; left unresolved on purpose.
+#   SKIPPED_VERIFY_ERROR     the verification could not run (manifest entry
+#                            missing, fetch/render failure, facts missing) —
+#                            fail closed, left unresolved.
+SKIPPED_NOT_PROPAGATION=0
+SKIPPED_DRIFT=0
+SKIPPED_VERIFY_ERROR=0
 WOULD_RESOLVE_COUNT=0
 FAILED_COUNT=0
 TAG_REPLY_POSTED=0
@@ -1670,13 +2037,18 @@ while IFS= read -r thread; do
   # the bot's last word) — so a later fix commit is recognized even when the
   # bot has not re-commented on the new HEAD.
   #
+  # --resolve-verified-propagation ALSO bypasses it (#572): its evidence is
+  # the consumer's CURRENT default-branch content, not the PR HEAD, and its
+  # target population is backlog threads on long-merged sync PRs — where the
+  # PR-HEAD anchor proxy is meaningless.
+  #
   # Codex r1 on PR #172 caught that the previous check
   # `if [ -n "$COMMIT_OID" ] && [ "$COMMIT_OID" != "$HEAD_OID" ]`
   # treated EMPTY commit_oid as "matches HEAD" → bot threads with no
   # commit linkage in the GraphQL response would be force-resolved
   # silently. The safe default is the opposite: missing oid is
   # treated as stale.
-  if [ "$MODE" != "resolve-actioned" ] \
+  if [ "$MODE" != "resolve-actioned" ] && [ "$MODE" != "resolve-verified-propagation" ] \
      && { [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ] || [ "$COMMIT_OID" != "$HEAD_OID" ]; }; then
     if [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ]; then
       reason="no commit linkage"
@@ -1733,9 +2105,80 @@ while IFS= read -r thread; do
     fi
   fi
 
+  # #572 --resolve-verified-propagation: gate the resolve on a byte-verified
+  # propagation match. The gate runs in dry-run too (all reads, no writes)
+  # so the would-resolve / would-skip preview is the real verdict — dry-run-
+  # first is the operating contract.
+  VERIFIED_RATIONALE=""
+  if [ "$MODE" = "resolve-verified-propagation" ]; then
+    # Same complete-thread precondition as --resolve-actioned (#573 item 2 /
+    # #614): never classify on a truncated comment window — a hidden
+    # re-raise or marker must not be invisible to the ladder. Fail closed.
+    if ! thread=$(complete_thread_comments "$thread"); then
+      echo "  SKIP (comment list incomplete — pagination failed; failing closed): [$AUTHOR] $PATH_"
+      echo "    $EXCERPT"
+      echo "    The thread has more comments than one window returns and the full"
+      echo "    re-fetch failed, so the classification inputs are untrustworthy."
+      echo "    Left unresolved; retry."
+      SKIPPED_COMMENTS_INCOMPLETE=$((SKIPPED_COMMENTS_INCOMPLETE + 1))
+      continue
+    fi
+    # Warm every cache in THIS shell before the classify/verify command-
+    # substitution subshells (same subshell-cache rule as the tag path; the
+    # subshells inherit warmed caches but cannot write back).
+    fetch_pr_tag_data
+    augment_pr_commits_with_sha
+    fetch_manifest_paths
+    fetch_manifest_templated_dests
+    fetch_consumer_default_branch || true
+    manifest_consumer_name_for_repo || true
+    # Routing classification via the standard (routing-first) ladder: only
+    # canonical-coverage / templated-render threads are this mode's
+    # population. Surface-class threads (nitpick-noted, deferred) and
+    # actioned-class threads are never touched here — they have their own
+    # modes.
+    thread_class=$(derive_tag_class "$thread")
+    thread_class_computed=true
+    case "$thread_class" in
+      canonical-coverage|templated-render) : ;;
+      *)
+        echo "  SKIP (class $thread_class — not propagation-routed): [$AUTHOR] $PATH_"
+        echo "    $EXCERPT"
+        echo "    --resolve-verified-propagation handles only canonical-coverage /"
+        echo "    templated-render threads. Use --resolve-actioned for fixed or"
+        echo "    rebutted feedback, --auto-resolve-bots for an explicit deferral."
+        SKIPPED_NOT_PROPAGATION=$((SKIPPED_NOT_PROPAGATION + 1))
+        continue ;;
+    esac
+    vp_rc=0
+    vp_msg=$(verify_propagation_content "$thread_class" "$PATH_") || vp_rc=$?
+    if [ "$vp_rc" -eq 1 ]; then
+      echo "  SKIP (propagation NOT verified — content drift): [$AUTHOR] $PATH_"
+      echo "    $vp_msg"
+      echo "    Left unresolved: the byte-compare is the resolution evidence and it"
+      echo "    did not match. Propagate the upstream fix (or fix it upstream), then"
+      echo "    retry."
+      SKIPPED_DRIFT=$((SKIPPED_DRIFT + 1))
+      continue
+    elif [ "$vp_rc" -ne 0 ]; then
+      echo "  SKIP (propagation verification failed — failing closed): [$AUTHOR] $PATH_"
+      echo "    $vp_msg"
+      echo "    Left unresolved: a verification that cannot run never resolves."
+      SKIPPED_VERIFY_ERROR=$((SKIPPED_VERIFY_ERROR + 1))
+      continue
+    fi
+    # Byte-match — resolve with the verified-propagation tag; the
+    # verification message IS the tag rationale.
+    thread_class="verified-propagation"
+    VERIFIED_RATIONALE="$vp_msg"
+  fi
+
   if $DRY_RUN; then
     echo "  WOULD RESOLVE [$AUTHOR] $PATH_"
     echo "    $EXCERPT"
+    if [ "$MODE" = "resolve-verified-propagation" ]; then
+      echo "    → [mergepath-resolve: verified-propagation] $VERIFIED_RATIONALE"
+    fi
     WOULD_RESOLVE_COUNT=$((WOULD_RESOLVE_COUNT + 1))
     continue
   fi
@@ -1755,6 +2198,34 @@ while IFS= read -r thread; do
     if $RATIONALE_FLAG_USED; then
       tag_class="deferred-to-followup"
       tag_rationale="$RATIONALE_OVERRIDE"
+      # #575 guard on the EXPLICIT-DEFERRAL override: --rationale is exactly
+      # how the #571 mis-marking happened — a blanket
+      # `--auto-resolve-bots --rationale` run over a thread set that included
+      # FIXED findings recorded them all as deferred-to-followup. The class
+      # is the machine-read disposition of record (the free-form text is
+      # human-facing), so when the thread is demonstrably ACTIONED — the
+      # same fail-closed evidence gate --resolve-actioned trusts derives
+      # addressed-elsewhere / rebuttal-recorded — upgrade the CLASS to the
+      # truthful value and keep the operator's rationale text. Auto-upgrade
+      # over warn-only is deliberate: the upgrade can never overclaim (it
+      # fires only on demonstrated evidence), while a warning leaves the
+      # mis-tag in place for every operator who misses the log line. A
+      # pagination-incomplete thread keeps the deferred class — action
+      # cannot be demonstrated on a truncated window (fail safe, #573).
+      fetch_pr_tag_data
+      augment_pr_commits_with_sha
+      if thread=$(complete_thread_comments "$thread"); then
+        upgraded_class=$(derive_tag_class "$thread" skip-routing)
+        if class_is_actioned "$upgraded_class"; then
+          echo "  INFO: tag auto-upgraded deferred-to-followup → $upgraded_class for [$AUTHOR] $PATH_ (demonstrably actioned; #575)"
+          tag_class="$upgraded_class"
+        fi
+      fi
+    elif [ "$MODE" = "resolve-verified-propagation" ]; then
+      # #572: the gate above already byte-verified the propagation; the
+      # verification message is the rationale of record.
+      tag_class="verified-propagation"
+      tag_rationale="$VERIFIED_RATIONALE"
     else
       # Warm the tag-data cache (PR_FILES_CACHE / PR_COMMITS_CACHE +
       # the TAG_DATA_FETCHED guard) in THIS shell BEFORE the command-
@@ -1790,8 +2261,30 @@ while IFS= read -r thread; do
         # current-HEAD anchor (commentsLast), not on this classification.
         if thread=$(complete_thread_comments "$thread"); then
           thread_class=$(derive_tag_class "$thread")
+          # #575 guard on the auto-derived class: the TAG ladder can land on
+          # deferred-to-followup even when the thread was actually actioned —
+          # the concrete case is a stale recorded
+          # `[mergepath-resolve: deferred-to-followup]` marker (honored by
+          # the TAG path's step 0) sitting above a LATER fix commit or
+          # rebuttal. Re-derive with the GATE classification
+          # (--resolve-actioned's skip-routing path, which ignores markers
+          # and re-checks fresh evidence); if it proves action, upgrade the
+          # tag to the truthful class with an INFO line. A thread that is
+          # not demonstrably actioned keeps deferred-to-followup. See the
+          # header's --auto-resolve-bots entry for why auto-upgrade beats
+          # warn-only.
+          if [ "$thread_class" = "deferred-to-followup" ]; then
+            upgraded_class=$(derive_tag_class "$thread" skip-routing)
+            if class_is_actioned "$upgraded_class"; then
+              echo "  INFO: tag auto-upgraded deferred-to-followup → $upgraded_class for [$AUTHOR] $PATH_ (demonstrably actioned; #575)"
+              thread_class="$upgraded_class"
+            fi
+          fi
         else
           echo "  WARN: comment pagination incomplete for [$AUTHOR] $PATH_ — tagging deferred-to-followup (fail-safe)" >&2
+          # #575 guard intentionally NOT applied here: action cannot be
+          # demonstrated on a truncated comment window (the hidden tail may
+          # carry a re-raise), so the fail-safe deferred class stands.
           thread_class="deferred-to-followup"
         fi
         thread_class_computed=true
@@ -1841,7 +2334,7 @@ done < <(printf '%s\n' "$UNRESOLVED")
 
 echo ""
 if $DRY_RUN; then
-  echo "(dry-run; no threads modified) — would-resolve: $WOULD_RESOLVE_COUNT, skipped (human): $SKIPPED_HUMAN, skipped (stale-HEAD): $SKIPPED_STALE, skipped (not-actioned): $SKIPPED_NOT_ACTIONED, skipped (comments-incomplete): $SKIPPED_COMMENTS_INCOMPLETE"
+  echo "(dry-run; no threads modified) — would-resolve: $WOULD_RESOLVE_COUNT, skipped (human): $SKIPPED_HUMAN, skipped (stale-HEAD): $SKIPPED_STALE, skipped (not-actioned): $SKIPPED_NOT_ACTIONED, skipped (comments-incomplete): $SKIPPED_COMMENTS_INCOMPLETE, skipped (not-propagation): $SKIPPED_NOT_PROPAGATION, skipped (drift): $SKIPPED_DRIFT, skipped (verify-error): $SKIPPED_VERIFY_ERROR"
   # Codex r2 on PR #172: dry-run previously exited 0 when only
   # current-HEAD bot threads remained (because dry-run does not mutate
   # them and they didn't increment SKIPPED_*). Callers would treat
@@ -1850,7 +2343,7 @@ if $DRY_RUN; then
   # human-skipped, or stale-skipped). The only exit-0 path through
   # auto-resolve-bots --dry-run is "no unresolved threads at all"
   # which is already short-circuited above (UNRESOLVED is empty).
-  if [ "$WOULD_RESOLVE_COUNT" -gt 0 ] || [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ] || [ "$SKIPPED_COMMENTS_INCOMPLETE" -gt 0 ]; then
+  if [ "$WOULD_RESOLVE_COUNT" -gt 0 ] || [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ] || [ "$SKIPPED_COMMENTS_INCOMPLETE" -gt 0 ] || [ "$SKIPPED_NOT_PROPAGATION" -gt 0 ] || [ "$SKIPPED_DRIFT" -gt 0 ] || [ "$SKIPPED_VERIFY_ERROR" -gt 0 ]; then
     exit 3
   fi
   exit 0
@@ -1916,7 +2409,7 @@ if [ "${#RESOLVED_IDS[@]}" -gt 0 ]; then
   fi
 fi
 
-echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Skipped (not-actioned): $SKIPPED_NOT_ACTIONED  Skipped (comments-incomplete): $SKIPPED_COMMENTS_INCOMPLETE  Failed: $FAILED_COUNT  Readback-failed: $READBACK_FAILED"
+echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Skipped (not-actioned): $SKIPPED_NOT_ACTIONED  Skipped (comments-incomplete): $SKIPPED_COMMENTS_INCOMPLETE  Skipped (not-propagation): $SKIPPED_NOT_PROPAGATION  Skipped (drift): $SKIPPED_DRIFT  Skipped (verify-error): $SKIPPED_VERIFY_ERROR  Failed: $FAILED_COUNT  Readback-failed: $READBACK_FAILED"
 if ! $NO_TAG_REPLY; then
   echo "Tag replies: posted=$TAG_REPLY_POSTED  failed=$TAG_REPLY_FAILED"
 fi
@@ -1926,9 +2419,11 @@ fi
 #   2 = mutation failure (transient: gh/network), a resolve mutation that
 #       did not return isResolved:true, OR a post-resolve readback that
 #       could not confirm isResolved:true (#564 — fail closed)
-#   3 = unresolved threads remain (human, stale-bot, not-actioned, or
-#       comments-incomplete — the #573 truncated-thread fail-closed skip)
-#       — PR still conversation-resolution-blocked; address and retry
+#   3 = unresolved threads remain (human, stale-bot, not-actioned,
+#       comments-incomplete — the #573 truncated-thread fail-closed skip —
+#       or the #572 skips: not-propagation-routed, drifted, or
+#       verification-failed) — PR still conversation-resolution-blocked;
+#       address and retry
 #   0 = no unresolved threads on current HEAD
 # Explicit `if` (not `[ a ] && exit`): two OR-ed conditions, and an
 # `&& exit` chain would be ambiguous under set -e (see the SKIPPED block
@@ -1944,7 +2439,7 @@ fi
 # non-zero; whether that trips `set -e` depends on subtle list-tail
 # rules. The `if` form is unambiguous and matches the block above.
 # (CodeRabbit Major, #271/#272.)
-if [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ] || [ "$SKIPPED_COMMENTS_INCOMPLETE" -gt 0 ]; then
+if [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ] || [ "$SKIPPED_COMMENTS_INCOMPLETE" -gt 0 ] || [ "$SKIPPED_NOT_PROPAGATION" -gt 0 ] || [ "$SKIPPED_DRIFT" -gt 0 ] || [ "$SKIPPED_VERIFY_ERROR" -gt 0 ]; then
   exit 3
 fi
 exit 0

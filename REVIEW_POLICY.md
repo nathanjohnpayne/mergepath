@@ -416,25 +416,38 @@ that can change GitHub conversation state.
    feedback includes resolving the associated review thread, not just
    pushing a code commit** — a fix that leaves its thread open still
    blocks the conversation-resolution gate and still surfaces in the
-   weekly unresolved-feedback sweep. Two resolve paths:
-   - `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` resolves
-     **only** threads whose fix or rebuttal is demonstrable from the
-     current PR state — `addressed-elsewhere` (an agent commit touching the
-     anchored file, after the latest re-raise) or `rebuttal-recorded` (a
-     substantive agent rebuttal after the latest re-raise). Routing-only
-     classes (`canonical-coverage`, `templated-render`) are deliberately
+   weekly unresolved-feedback sweep. The two resolve paths are split by
+   **disposition** — each records a different `[mergepath-resolve:<class>]`
+   tag, and the daily rollup / weekly sweep read that tag as the
+   disposition of record, so pick the mode that matches what actually
+   happened to the feedback (#575):
+   - `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` is the tool
+     for **fixed or rebutted** feedback — the default on a PR you pushed
+     fixes to. It resolves **only** threads whose fix or rebuttal is
+     demonstrable from the current PR state, tagging the truthful classes —
+     `addressed-elsewhere` (an agent commit touching the anchored file,
+     after the latest re-raise) or `rebuttal-recorded` (a substantive agent
+     rebuttal after the latest re-raise). Routing-only classes
+     (`canonical-coverage`, `templated-render`) are deliberately
      **not** treated as actioned here: they indicate where a durable fix
      belongs, not that one happened, so a fresh finding on a canonical path
      is left unresolved rather than auto-resolved by routing alone. The gate
      evaluates action **independently of routing**, so a canonical/templated
      thread that *does* carry action evidence (a fix commit touching it, or
      a rebuttal) is still resolved. Every non-actioned thread is left for the
-     weekly sweep. Prefer this to mark genuinely-handled feedback resolved.
-   - `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots` resolves
-     **every** current-HEAD bot thread, which is what clears the
-     `required_conversation_resolution` gate to merge; it tags each
-     deferral with `[mergepath-resolve:<class>]` so the daily rollup
-     re-surfaces it.
+     weekly sweep.
+   - `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots` is the tool
+     for **explicit deferral** — current-HEAD bot threads deliberately left
+     unfixed on this PR because they are tracked elsewhere (the standard
+     case: canonical-coverage findings on sync mirrors, deferred to a
+     follow-up issue via `--rationale`). It resolves **every** current-HEAD
+     bot thread, which is what clears the `required_conversation_resolution`
+     gate to merge, and tags each thread `deferred-to-followup` so the daily
+     rollup re-surfaces it. It is **not** the tool for fixed or rebutted
+     findings — that mis-records them as deferred (#571). As a guard, a
+     thread that is demonstrably actioned (per the same evidence gate
+     `--resolve-actioned` uses) is auto-upgraded to its truthful
+     `addressed-elsewhere`/`rebuttal-recorded` tag with an INFO line.
 
    Either path runs an identity-checked `resolveReviewThread` followed by
    a `reviewThreads`/`nodes(ids:)` readback confirming `isResolved: true`,

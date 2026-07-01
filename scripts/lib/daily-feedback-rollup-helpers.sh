@@ -99,7 +99,14 @@ tag_class_action() {
     # templated dest is structurally a mergepath concern (the template
     # lives in mergepath), so route it to mergepath rather than
     # surfacing on each consumer's daily rollup.
-    addressed-elsewhere|canonical-coverage|rebuttal-recorded|templated-render) echo "skip" ;;
+    #
+    # verified-propagation — resolve-pr-threads.sh
+    # --resolve-verified-propagation byte-compared the consumer's
+    # CURRENT content at the anchored path against mergepath's
+    # canonical source (or the re-rendered template with the
+    # consumer's facts) and confirmed equality (mergepath#572). The
+    # thread is evidence-verified handled — skip, don't re-surface.
+    addressed-elsewhere|canonical-coverage|rebuttal-recorded|templated-render|verified-propagation) echo "skip" ;;
     nitpick-noted|deferred-to-followup) echo "surface" ;;
     "") echo "" ;;  # no tag → caller falls through to heuristics
     *)  echo "surface" ;;  # unknown → surface

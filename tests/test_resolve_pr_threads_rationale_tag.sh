@@ -1468,6 +1468,114 @@ else
   echo "  FAIL: expected >=2 builders with .commit.author.name fallback, found $BUILDER_HITS" >&2
 fi
 
+# ─────────────────────────────────────────────────────────────────────
+# Test 25 (#575 guard, auto-derive path): --auto-resolve-bots on a
+# demonstrably-ACTIONED thread must AUTO-UPGRADE the deferred tag to the
+# truthful class. Thread: bot finding → stale recorded
+# [mergepath-resolve: deferred-to-followup] marker → LATER agent fix commit
+# touching the anchored file. The TAG ladder honors the surface marker
+# (deferred-to-followup), but the guard re-derives with the GATE
+# classification (skip-routing, marker-blind) which proves
+# addressed-elsewhere — so the emitted tag is the truthful
+# addressed-elsewhere, with an INFO line. (The negative case — a
+# genuinely-deferred thread keeping deferred-to-followup — is locked by
+# Tests 4 and 5 above, which run through the same guard and stay deferred.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 25: --auto-resolve-bots auto-upgrades a demonstrably-actioned deferred tag (#575)"
+
+THREADS_T25='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_25","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/upgraded.md","body":"Finding deferred earlier, then fixed","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding deferred earlier, then fixed","databaseId":25001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: deferred-to-followup] deferred earlier; resolving for the gate.","databaseId":25002,"createdAt":"2026-01-02T00:00:00Z"}
+   ]}
+  }
+]}}}}}'
+FILES_T25='["docs/upgraded.md"]'
+COMMITS_T25='[{"sha":"fix2525abc","login":"nathanpayne-claude","date":"2026-01-03T00:00:00Z"}]'
+CFILES_T25='{"fix2525abc":["docs/upgraded.md"]}'
+
+GH_ARGV_LOG="$SCRATCH/t25.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T25" "$FILES_T25" "$COMMITS_T25" "$CFILES_T25"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --auto-resolve-bots 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'INFO: tag auto-upgraded deferred-to-followup → addressed-elsewhere' <<<"$out" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: actioned thread auto-upgraded deferred-to-followup → addressed-elsewhere with INFO line"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: actioned thread was not auto-upgraded (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 26 (#575 guard, --rationale path): the explicit-deferral override is
+# exactly how the #571 mis-marking happened, so the guard applies there
+# too. A thread carrying a substantive agent rebuttal, resolved via
+# `--auto-resolve-bots --rationale`, must emit the truthful
+# rebuttal-recorded CLASS while keeping the operator's rationale TEXT.
+# (Test 5 above locks the negative case: a non-actioned thread keeps
+# deferred-to-followup with the custom text.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 26: --auto-resolve-bots --rationale auto-upgrades the class on an actioned thread (#575)"
+
+THREADS_T26='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_26","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/rebutted.md","body":"Finding that was rebutted on-thread","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding that was rebutted on-thread","databaseId":26001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Disagree — this is intentional for the propagation path; see #200 for context.","databaseId":26002,"createdAt":"2026-01-02T00:00:00Z"}
+   ]}
+  }
+]}}}}}'
+FILES_T26='[]'
+COMMITS_T26='[]'
+
+GH_ARGV_LOG="$SCRATCH/t26.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T26" "$FILES_T26" "$COMMITS_T26"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+T26_RATIONALE="bulk pass over the sync backlog; see the follow-up issue"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --auto-resolve-bots \
+  --rationale "$T26_RATIONALE" 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'INFO: tag auto-upgraded deferred-to-followup → rebuttal-recorded' <<<"$out" \
+   && grep -qF "FIELD: body=[mergepath-resolve: rebuttal-recorded] $T26_RATIONALE" "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: rationale override kept the operator text but upgraded the class to rebuttal-recorded"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: rationale-path guard did not upgrade the class (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"
