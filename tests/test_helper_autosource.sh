@@ -74,6 +74,33 @@ EOF
   chmod 600 "$dir/op-preflight-$agent.env"
 }
 
+# A fresh cache whose PATs are computed FROM the ambient GH_TOKEN / GITHUB_TOKEN
+# at source time. If the sourcing path fails to scrub the ambient tokens first,
+# the resolved PATs capture the leaked ambient value; with the #573 scrub in
+# place they resolve to the fixed sentinel (the parameter default), proving the
+# ambient token never reached the sourced result.
+make_ambient_derived_cache() {
+  local dir="$1" agent="$2"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  local epoch
+  epoch=$(date +%s)
+  cat > "$dir/op-preflight-$agent.env" <<'EOF'
+OP_PREFLIGHT_CREATED_AT_EPOCH=__EPOCH__
+OP_PREFLIGHT_TTL_SECONDS=14400
+OP_PREFLIGHT_AGENT=__AGENT__
+OP_PREFLIGHT_MODE=review
+OP_PREFLIGHT_DONE=1
+OP_PREFLIGHT_REVIEWER_PAT="${GH_TOKEN:-cache-rev}"
+OP_PREFLIGHT_AUTHOR_PAT="${GITHUB_TOKEN:-cache-auth}"
+EOF
+  # Fill the placeholders without disturbing the deliberate $GH_TOKEN /
+  # $GITHUB_TOKEN references that must survive verbatim into the file.
+  sed -i.bak "s/__EPOCH__/$epoch/; s/__AGENT__/$agent/" "$dir/op-preflight-$agent.env"
+  rm -f "$dir/op-preflight-$agent.env.bak"
+  chmod 600 "$dir/op-preflight-$agent.env"
+}
+
 # ---------------------------------------------------------------------------
 # Test 1: auto_source_preflight loads a fresh cache when GH_TOKEN is
 # unset, and is silent when GH_TOKEN is already set.
@@ -160,6 +187,90 @@ test_lib_stale_cache_noop() {
     return
   fi
   pass "test_lib_stale_cache_noop: stale cache is not loaded"
+}
+
+# ---------------------------------------------------------------------------
+# Test 3b (#573): auto_source_preflight scrubs a stray ambient GITHUB_TOKEN
+# before sourcing, so it cannot survive to shadow the cache's GH_TOKEN (gh
+# prefers GITHUB_TOKEN over GH_TOKEN). GH_TOKEN is unset here (auto-source
+# only runs on an unset GH_TOKEN), and the ambient GITHUB_TOKEN must be gone
+# after the source.
+# ---------------------------------------------------------------------------
+test_lib_auto_source_scrubs_ambient_github_token() {
+  (
+    local case_dir="$WORKDIR/lib3b"
+    make_fresh_cache "$case_dir" claude "rev-3b" "auth-3b"
+    unset GH_TOKEN OP_PREFLIGHT_REVIEWER_PAT OP_PREFLIGHT_AUTHOR_PAT
+    export OP_PREFLIGHT_CACHE_DIR="$case_dir"
+    export MERGEPATH_AGENT=claude
+    export GITHUB_TOKEN="ambient-leaked-github-token"
+    # shellcheck source=../scripts/lib/preflight-helpers.sh
+    . "$LIB"
+    auto_source_preflight
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+      echo "auto_source left ambient GITHUB_TOKEN in place (got '${GITHUB_TOKEN:-}')" >&2
+      exit 1
+    fi
+    if [ "${OP_PREFLIGHT_REVIEWER_PAT:-}" != "rev-3b" ]; then
+      echo "auto_source did not load the cache (REVIEWER_PAT='${OP_PREFLIGHT_REVIEWER_PAT:-}')" >&2
+      exit 1
+    fi
+  ) >"$WORKDIR/lib3b.out" 2>"$WORKDIR/lib3b.err" && local rc=0 || local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "test_lib_auto_source_scrubs_ambient_github_token: rc=$rc stderr=$(cat "$WORKDIR/lib3b.err")"
+    return
+  fi
+  pass "test_lib_auto_source_scrubs_ambient_github_token: ambient GITHUB_TOKEN scrubbed before cache source (#573)"
+}
+
+# ---------------------------------------------------------------------------
+# Test 3c (#573): load_preflight_env_vars scrubs ambient GH_TOKEN /
+# GITHUB_TOKEN inside the sourcing subshells, so a stray ambient token cannot
+# leak into the resolved PATs. The cache derives its PATs from $GH_TOKEN /
+# $GITHUB_TOKEN at source time; with the scrub the resolved PATs fall back to
+# the fixed cache sentinels, NOT the ambient values. The caller's ambient
+# GH_TOKEN is restored afterward (documented behavior).
+# ---------------------------------------------------------------------------
+test_lib_load_env_vars_scrubs_ambient_token() {
+  (
+    local case_dir="$WORKDIR/lib3c"
+    make_ambient_derived_cache "$case_dir" claude
+    export OP_PREFLIGHT_CACHE_DIR="$case_dir"
+    export MERGEPATH_AGENT=claude
+    export GH_TOKEN="ambient-leaked-gh-token"
+    export GITHUB_TOKEN="ambient-leaked-github-token"
+    unset OP_PREFLIGHT_REVIEWER_PAT OP_PREFLIGHT_AUTHOR_PAT
+    # shellcheck source=../scripts/lib/preflight-helpers.sh
+    . "$LIB"
+    load_preflight_env_vars
+    if [ "${OP_PREFLIGHT_REVIEWER_PAT:-}" = "ambient-leaked-gh-token" ]; then
+      echo "ambient GH_TOKEN leaked into REVIEWER_PAT" >&2
+      exit 1
+    fi
+    if [ "${OP_PREFLIGHT_AUTHOR_PAT:-}" = "ambient-leaked-github-token" ]; then
+      echo "ambient GITHUB_TOKEN leaked into AUTHOR_PAT" >&2
+      exit 1
+    fi
+    if [ "${OP_PREFLIGHT_REVIEWER_PAT:-}" != "cache-rev" ]; then
+      echo "REVIEWER_PAT did not resolve to the scrubbed cache sentinel (got '${OP_PREFLIGHT_REVIEWER_PAT:-}')" >&2
+      exit 1
+    fi
+    if [ "${OP_PREFLIGHT_AUTHOR_PAT:-}" != "cache-auth" ]; then
+      echo "AUTHOR_PAT did not resolve to the scrubbed cache sentinel (got '${OP_PREFLIGHT_AUTHOR_PAT:-}')" >&2
+      exit 1
+    fi
+    # The caller's ambient GH_TOKEN must be restored (not scrubbed in the
+    # caller's own process).
+    if [ "${GH_TOKEN:-}" != "ambient-leaked-gh-token" ]; then
+      echo "caller GH_TOKEN not restored after load_preflight_env_vars (got '${GH_TOKEN:-}')" >&2
+      exit 1
+    fi
+  ) >"$WORKDIR/lib3c.out" 2>"$WORKDIR/lib3c.err" && local rc=0 || local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "test_lib_load_env_vars_scrubs_ambient_token: rc=$rc stderr=$(cat "$WORKDIR/lib3c.err")"
+    return
+  fi
+  pass "test_lib_load_env_vars_scrubs_ambient_token: ambient token scrubbed inside cache-source subshells (#573)"
 }
 
 # ---------------------------------------------------------------------------
@@ -311,6 +422,8 @@ EOF
 test_lib_auto_source_basic
 test_lib_gh_token_passthrough
 test_lib_stale_cache_noop
+test_lib_auto_source_scrubs_ambient_github_token
+test_lib_load_env_vars_scrubs_ambient_token
 test_lib_require_token_reviewer
 test_lib_require_token_author
 test_helpers_source_lib

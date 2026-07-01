@@ -127,6 +127,13 @@ auto_source_preflight() {
   if ! preflight_session_is_fresh "$session_file"; then
     return 0
   fi
+  # Scrub ambient GH_TOKEN / GITHUB_TOKEN before sourcing the cache (#573).
+  # GH_TOKEN is guaranteed unset here by the early return above, but a stray
+  # ambient GITHUB_TOKEN would otherwise survive and — because gh prefers
+  # GITHUB_TOKEN over the freshly-sourced GH_TOKEN — shadow the cached PAT
+  # the cache is about to export. Unset both so the resolved environment
+  # ends with ONLY the cache's own credentials, never a leaked ambient one.
+  unset GH_TOKEN GITHUB_TOKEN
   # Source the cache file. Permissions are 0600 in a 0700 cache dir,
   # owner-only; we trust the file the same way op-preflight.sh itself
   # does on the cache-hit path.
@@ -159,10 +166,19 @@ load_preflight_env_vars() {
   # can include deploy credentials (GOOGLE_APPLICATION_CREDENTIALS, CF_API_TOKEN)
   # from a prior --mode deploy run; subshell isolation prevents those from
   # leaking into the caller's process. (#554/#556 CodeRabbit Major)
+  #
+  # Scrub ambient GH_TOKEN / GITHUB_TOKEN INSIDE each subshell before sourcing
+  # (#573): the subshell inherits the caller's environment, so a stray ambient
+  # token would otherwise be visible while the cache is sourced and could leak
+  # into the resolved PAT (a cache/legacy file that computes a PAT from
+  # $GH_TOKEN / $GITHUB_TOKEN would capture the ambient value). Unsetting both
+  # first pins the resolved PATs to the cache's OWN credentials. The caller's
+  # ambient GH_TOKEN is restored from _saved_gh_token below, so this scoping
+  # never disturbs the caller's process.
   # shellcheck disable=SC1090
-  _r=$(. "$session_file" 2>/dev/null && printf '%s' "${OP_PREFLIGHT_REVIEWER_PAT:-}") || true
+  _r=$(unset GH_TOKEN GITHUB_TOKEN; . "$session_file" 2>/dev/null && printf '%s' "${OP_PREFLIGHT_REVIEWER_PAT:-}") || true
   # shellcheck disable=SC1090
-  _a=$(. "$session_file" 2>/dev/null && printf '%s' "${OP_PREFLIGHT_AUTHOR_PAT:-}") || true
+  _a=$(unset GH_TOKEN GITHUB_TOKEN; . "$session_file" 2>/dev/null && printf '%s' "${OP_PREFLIGHT_AUTHOR_PAT:-}") || true
   [[ -n "${_r:-}" ]] && OP_PREFLIGHT_REVIEWER_PAT="$_r"
   [[ -n "${_a:-}" ]] && OP_PREFLIGHT_AUTHOR_PAT="$_a"
   if [[ -n "$_saved_gh_token" ]]; then

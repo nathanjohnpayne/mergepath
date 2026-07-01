@@ -108,6 +108,25 @@ assert_clean   "echoed gh-write TEXT (no chained cmd) exempt"  'echo "gh pr merg
 assert_clean   "echo piped into a non-gh command exempt"       'echo ok | grep gh'
 assert_clean   "echo then ;-chained WRAPPED gh merge exempt"   'echo ok; scripts/gh-as-author.sh -- gh pr merge 1'
 
+# #573 (Major): an exempt WRAPPED / helper write must cover ONLY the wrapped
+# command, NOT a bare gh write chained after a top-level separator on the same
+# line. Before the fix the wrapper exemption returned clean for the whole line,
+# shielding the trailing bare `gh pr create` from detection.
+assert_flagged "wrapped merge then &&-chained bare gh create caught (#573)" \
+  'scripts/gh-as-author.sh -- gh pr merge 1 && gh pr create --title t --body b'
+assert_flagged "wrapped merge then ;-chained bare gh create caught (#573)" \
+  'scripts/gh-as-author.sh -- gh pr merge 1 ; gh pr create --title t --body b'
+assert_flagged "reviewer-wrapped comment then &&-chained bare gh comment caught (#573)" \
+  'scripts/gh-as-reviewer.sh -- gh pr comment 1 --body ok && gh issue comment 2 --body hi'
+assert_flagged "helper-fn write then &&-chained bare gh merge caught (#573)" \
+  'sync_author_gh pr merge 1 && gh pr merge 2 --admin'
+# Control: two chained WRAPPED writes both stay exempt (no bare write present).
+assert_clean   "wrapped merge then &&-chained WRAPPED create stays exempt (#573)" \
+  'scripts/gh-as-author.sh -- gh pr merge 1 && scripts/gh-as-author.sh -- gh pr create --title t --body "Authoring-Agent: claude"'
+# Control: a wrapped write with a trailing non-gh command stays exempt.
+assert_clean   "wrapped merge then &&-chained non-gh command stays exempt (#573)" \
+  'scripts/gh-as-author.sh -- gh pr merge 1 && echo done'
+
 echo ""
 echo "test_check_no_bare_gh_writes: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

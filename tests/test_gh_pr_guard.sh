@@ -808,6 +808,25 @@ assert_rc_contains "command-position cmdsub with NO gh write stays allowed (#553
 assert_rc_contains "eval cmdsub before a wrapped write is allowed (#553)" 0 "" \
   'eval "$(/opt/homebrew/bin/brew shellenv)" && scripts/gh-as-author.sh -- gh pr merge 1 --repo o/r --squash'
 
+# #573 item 1 (Codex P1): a command-position cmdsub can synthesize BOTH the
+# executable AND the noun (e.g. octal printf for "gh pr"), so the raw command
+# carries no literal gh/pr/issue — only a bare write verb follows. The fast-path
+# now triggers on any gh-write verb, and synth_cmdsub_write_label blocks a
+# command-position cmdsub followed by create|merge|comment|review|edit even
+# without a literal noun. Fail closed: the guard cannot see what the cmdsub
+# expands to, so any such shape is routed to the verifying wrapper.
+# \147\150\40\160\162 = "gh pr", \40\151\163\163\165\145 = " issue".
+assert_rc_contains "cmdsub-synth BOTH exe+noun (gh pr) then bare merge fails closed (#573)" 2 "wrapper" \
+  '$(printf "\147\150\40\160\162") merge 123 --admin'
+assert_rc_contains "backtick-synth exe+noun (gh issue) then bare comment fails closed (#573)" 2 "wrapper" \
+  '`printf "\147\150\40\151\163\163\165\145"` comment 5 --body hi'
+assert_rc_contains "cmdsub-synth exe then --repo before a bare create verb fails closed (#573)" 2 "wrapper" \
+  '$(printf "\147\150") --repo o/r create --title x'
+# No false positive: a command-position cmdsub followed by a NON-write
+# subcommand (a gh read) is not force-tokenized and stays allowed.
+assert_rc_contains "command-position cmdsub then a non-write subcommand stays allowed (#573)" 0 "" \
+  '$(printf "\147\150") status'
+
 # #560 (residual of #553): a command-position cmdsub-synthesized gh must fail
 # closed even after a prefix command + options (command -p, env -i), a
 # value-taking flag (env -u NAME), or a quoted env assignment (FOO="a b"). The
