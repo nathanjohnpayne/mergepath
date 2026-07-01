@@ -20,6 +20,12 @@ p4b_die()  { local c="$1"; shift; echo "[phase-4b] ERROR: $*" >&2; exit "$c"; }
 
 # --- config location -------------------------------------------------------
 
+# This library's own directory, captured at SOURCE time (when BASH_SOURCE is
+# reliable — unlike call-time inside a function). Files that ship alongside
+# lib.sh (e.g. verdict.schema.json) are resolved relative to this, so they
+# are found regardless of $PWD or how the caller was invoked.
+P4B_LIB_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Resolve the repo root from this library's own location (follow symlinks),
 # NOT $PWD — the same posture scripts/phase-4b-classifier.sh uses so a
 # PATH-symlinked or subdir invocation still finds the policy file.
@@ -286,57 +292,122 @@ EOF
   return 1
 }
 
-# --- verdict validation (jq mirror of verdict.schema.json) -----------------
+# --- verdict validation (structural contract derived from the schema) ------
+
+# p4b_verdict_schema_path — location of verdict.schema.json, the single
+# source of truth for the verdict's structural contract. It ships alongside
+# this library, so it is resolved relative to P4B_LIB_DIR (captured at source
+# time). Overridable via P4B_VERDICT_SCHEMA_PATH (tests / non-standard layouts).
+p4b_verdict_schema_path() {
+  if [ -n "${P4B_VERDICT_SCHEMA_PATH:-}" ]; then
+    printf '%s' "$P4B_VERDICT_SCHEMA_PATH"
+    return 0
+  fi
+  printf '%s/verdict.schema.json' "$P4B_LIB_DIR"
+}
 
 # p4b_validate_verdict <json-string>
 # Returns 0 iff the string is a verdict object conforming to
 # verdict.schema.json's required shape plus the semantic invariants that
 # keep a posted APPROVED review from clearing a PR while still carrying
-# blocking findings. Fail-closed: any deviation, empty input, or jq error
-# returns non-zero. No stdout.
+# blocking findings. Fail-closed: any deviation, empty input, missing or
+# malformed schema, or jq error returns non-zero. No stdout.
+#
+# Drift resistance (#585): the structural constants most likely to drift —
+# the top-level key set, the verdict enum, the per-finding key set, the
+# severity enum, and the usage key set — are read FROM the schema at
+# validation time rather than hand-mirrored in this jq program. Changing a
+# key or enum value in verdict.schema.json therefore reconfigures the
+# validator automatically, and tests/test_phase_4b_automation.sh adds
+# schema-vs-validator parity fixtures as defense in depth. The remaining
+# checks encode semantics the JSON Schema cannot express on its own: the
+# config-dependent feedback_policy approval gate, the all-or-nothing usage
+# object, and the 1-based line bound.
 p4b_validate_verdict() {
-  local json="$1" required_severities
+  local json="$1" required_severities schema
   [ -n "$json" ] || return 1
   required_severities="$(p4b_required_verdict_severities_json)" || return 1
-  printf '%s' "$json" | jq -e --argjson required_severities "$required_severities" '
-    def okstr: (type == "string") and (length > 0);
-    def okintnull: (. == null) or (type == "number" and floor == . and . >= 0);
-    ((keys_unsorted | sort) == ["findings","summary","usage","verdict"])
-    and ((.verdict == "APPROVED") or (.verdict == "CHANGES_REQUESTED"))
-    and (.summary | okstr)
-    and (.findings | type == "array")
-    and all(.findings[]?;
-          ((keys_unsorted | sort) == ["body","line","path","severity"])
-          and (.severity | type == "string" and test("^P[0-3]$"))
-          and ((.path == null) or (.path | type == "string"))
-          and ((.line == null) or (.line | type == "number" and floor == . and . >= 1))
-          and (.body | okstr))
-    and ((.verdict != "APPROVED")
-         or all(.findings[]?; (.severity as $s | ($required_severities | index($s) | not))))
-    and ((.usage == null)
-         or ((.usage | type == "object")
-             and ((.usage | keys_unsorted | sort) == ["input_tokens","output_tokens","source","token_count"])
-             and (.usage.token_count | okintnull)
-             and (.usage.input_tokens | okintnull)
-             and (.usage.output_tokens | okintnull)
-             and (.usage.source | okstr)))
+  schema="$(p4b_verdict_schema_path)"
+  [ -r "$schema" ] || return 1
+  printf '%s' "$json" | jq -e \
+      --argjson required_severities "$required_severities" \
+      --slurpfile schema_doc "$schema" '
+    # Structural constants, derived from verdict.schema.json (single source
+    # of truth). A missing/empty schema slurp makes these error → jq exits
+    # non-zero → validation fails closed.
+    ($schema_doc[0]) as $s
+    | ($s.required | sort) as $top_keys
+    | ($s.properties.verdict.enum) as $verdict_enum
+    | ($s.properties.findings.items.required | sort) as $finding_keys
+    | ($s.properties.findings.items.properties.severity.enum) as $severity_enum
+    | ($s.properties.usage.required | sort) as $usage_keys
+    | def okstr: (type == "string") and (length > 0);
+      def okintnull: (. == null) or (type == "number" and floor == . and . >= 0);
+      ((keys_unsorted | sort) == $top_keys)
+      and ((.verdict) as $v | ($verdict_enum | index($v)) != null)
+      and (.summary | okstr)
+      and (.findings | type == "array")
+      and all(.findings[]?;
+            ((keys_unsorted | sort) == $finding_keys)
+            and ((.severity) as $sv | ($severity_enum | index($sv)) != null)
+            and ((.path == null) or (.path | type == "string"))
+            and ((.line == null) or (.line | type == "number" and floor == . and . >= 1))
+            and (.body | okstr))
+      and ((.verdict != "APPROVED")
+           or all(.findings[]?; (.severity as $s2 | ($required_severities | index($s2) | not))))
+      and ((.usage == null)
+           or ((.usage | type == "object")
+               and ((.usage | keys_unsorted | sort) == $usage_keys)
+               and (.usage.token_count | okintnull)
+               and (.usage.input_tokens | okintnull)
+               and (.usage.output_tokens | okintnull)
+               and (.usage.source | okstr)))
   ' >/dev/null 2>&1
 }
 
 # p4b_extract_json_block <text>
-# Best-effort: strip Markdown code fences, then emit the substring from
-# the first "{" to the last "}". Leaves already-pure JSON unchanged. Used
-# by the Claude adapter, whose model output may wrap the JSON in prose.
+# Emit the first COMPLETE, balanced, top-level JSON object embedded in the
+# text. Used by the Claude adapter, whose model output may wrap the JSON in
+# prose. Leaves already-pure JSON unchanged.
+#
+# Implementation (#587): a string-aware brace-depth scanner, not a naive
+# first-"{"-to-last-"}" slice. It tracks JSON string literals (honoring \"
+# and \\ escapes) so braces inside string VALUES do not change nesting
+# depth, and it stops at the matching close brace of the first object — so
+# balanced-brace prose AFTER the JSON object (e.g. "For example: { ... }")
+# can no longer extend the slice and poison extraction. Markdown code fences
+# alone on a line are stripped first. When no balanced object is found it
+# emits nothing, so downstream schema validation fails closed on ambiguous
+# or non-JSON model output.
 p4b_extract_json_block() {
   printf '%s\n' "$1" \
     | sed -e 's/^```[A-Za-z0-9]*[[:space:]]*$//' -e 's/^```[[:space:]]*$//' \
     | awk '
         { buf = buf $0 "\n" }
         END {
+          n = length(buf)
           start = index(buf, "{")
-          last = 0
-          for (i = 1; i <= length(buf); i++) if (substr(buf, i, 1) == "}") last = i
-          if (start > 0 && last >= start) printf "%s", substr(buf, start, last - start + 1)
+          if (start == 0) exit 0
+          depth = 0; instr = 0; esc = 0
+          for (i = start; i <= n; i++) {
+            c = substr(buf, i, 1)
+            if (instr) {
+              if (esc)       { esc = 0;   continue }   # this char is escaped
+              if (c == "\\") { esc = 1;   continue }   # begin escape sequence
+              if (c == "\"") { instr = 0; continue }   # end of string literal
+              continue                                  # any other in-string char
+            }
+            if (c == "\"") { instr = 1; continue }     # begin string literal
+            if (c == "{")  { depth++ }
+            else if (c == "}") {
+              depth--
+              if (depth == 0) {                         # matched the first object
+                printf "%s", substr(buf, start, i - start + 1)
+                exit 0
+              }
+            }
+          }
+          # Never returned to depth 0 (unbalanced): emit nothing → fail closed.
         }'
 }
 
