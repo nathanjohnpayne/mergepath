@@ -93,8 +93,14 @@
 #     },
 #     "findings": [
 #       { "path": "...", "line": N, "priority": "P0|P1|P2|P3",
-#         "comment_id": N, "body": "<full finding body>" }
+#         "comment_id": N, "body": "<full finding body>",
+#         "blocking": true|false }
 #     ],
+#     # `blocking` (#577) is derived from the resolved feedback_policy
+#     # required-tier set (scripts/lib/feedback-policy-helpers.sh
+#     # resolve_required_tiers) — true iff this finding's tier is one the
+#     # codex-p1-gate would block merge on. Absent feedback_policy block ⇒
+#     # only P1 is blocking. An unmarked (P?) finding is never blocking.
 #     "reaction": null | {
 #       "content": "+1",
 #       "created_at": "<iso-8601>",
@@ -265,6 +271,40 @@ fi
 
 BOT_LOGIN=$(codex_field bot_login)
 BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
+
+# --- blocking-tier surfacing (#577) -----------------------------------------
+# Source the shared feedback-policy resolver so each emitted finding can
+# carry `blocking: true|false` derived from the SAME resolve_required_tiers
+# the codex-p1-gate uses. This is purely additive to the JSON contract — it
+# never changes the exit-code behavior below. Absent feedback_policy block
+# ⇒ blocking set {p1}, so only P1 findings are marked blocking (today's
+# de-facto gate scope). rc 2 = malformed; a benign non-2 tail status (rc 1
+# when the last tier isn't required) is ignored, mirroring codex-p1-gate.sh.
+#
+# The source is GUARDED (same posture as the preflight-helpers source
+# above): in some test harnesses this script is copied to a scratch tree
+# WITHOUT scripts/lib, so we degrade to the documented absent-block default
+# ({p1}) rather than hard-erroring — surfacing is a best-effort convenience,
+# not a merge gate. The gate scripts (codex-p1-gate.sh) always run from the
+# full checkout and DO source the lib unconditionally.
+__CODEX_REQ_LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REQUIRED_TIERS_JSON='["p1"]'
+if [ -r "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh" ]; then
+  # shellcheck source=lib/feedback-policy-helpers.sh
+  . "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh"
+  set +e
+  __REQUIRED_TIERS=$(resolve_required_tiers "$CONFIG")
+  __RT_RC=$?
+  set -e
+  if [ "$__RT_RC" -eq 2 ]; then
+    echo "ERROR: malformed feedback_policy block in $CONFIG (resolve_required_tiers exit 2)" >&2
+    exit 3
+  fi
+  # JSON array of required tiers (lowercase p0..p3|nitpick) for jq
+  # membership tests. Empty input ⇒ [].
+  REQUIRED_TIERS_JSON=$(printf '%s\n' "$__REQUIRED_TIERS" \
+    | jq -R . | jq -s 'map(select(. != ""))')
+fi
 
 # --- Phase 4a entry decision (#486) -----------------------------------------
 # Two codex: block keys govern whether this run posts an `@codex review`
@@ -505,20 +545,30 @@ scan_codex_state() {
 
   # Inline findings from the bot on the current HEAD commit, scoped
   # to the LATEST review round (via pull_request_review_id), with
-  # P0-P3 priority extracted from the ![P{0-3} Badge] markdown
-  # shortcode. If there's no current review, findings is empty.
+  # P0-P3 priority extracted from EITHER the ![P{0-3} Badge] badge image OR
+  # the **Pn text fallback Codex emits when the badge is absent — mirroring
+  # codex_tier_of in scripts/lib/feedback-policy-helpers.sh so a fallback-only
+  # finding is classified consistently (CodeRabbit Major on #590). The
+  # alternation's leftmost match wins, matching codex_tier_of's first-marker
+  # rule. If there's no current review, findings is empty.
   if [ -n "$latest_review_id" ] && [ "$latest_review_id" != "null" ]; then
     findings=$(echo "$comments" | jq \
       --arg bot "$BOT_LOGIN" \
-      --argjson review_id "$latest_review_id" '
+      --argjson review_id "$latest_review_id" \
+      --argjson required "$REQUIRED_TIERS_JSON" '
       [ .[]
         | select(.user.login == $bot)
         | select(.pull_request_review_id == $review_id)
+        | ( (.body | capture("!\\[P(?<b>[0-3]) Badge\\]|\\*\\*P(?<f>[0-3])")? // {}) | (.b // .f) ) as $n
         | { path, line, comment_id: .id, body,
-            priority: (
-              (.body | capture("!\\[P(?<n>[0-3]) Badge\\]")? // {n: null}) | .n
-              | if . == null then "P?" else "P" + . end
-            )
+            priority: ( if $n == null then "P?" else "P" + $n end ),
+            # blocking (#577): this finding sits in a `required` tier per the
+            # resolved feedback_policy set. An unmarked finding ($n == null,
+            # "P?") is never blocking. Membership test lowercases the
+            # normalized tier (p0..p3) against $required (from
+            # resolve_required_tiers) so the surfaced flag matches exactly
+            # what the codex-p1-gate enforces at merge time.
+            blocking: ( $n != null and ( ("p" + $n) as $t | $required | index($t) != null ) )
           }
       ]
     ')
@@ -565,10 +615,11 @@ has_signal() {
 # CLEARED (no further @codex review trigger needed). Cleared means
 # EITHER:
 #   - any +1 reaction on the PR issue (the no-findings happy path), OR
-#   - a review on HEAD with zero P0/P1 inline findings (the
-#     reviewed-and-clean path)
+#   - a review on HEAD with zero blocking (required-tier) inline findings
+#     (the reviewed-and-clean path; "blocking" reflects the resolved
+#     feedback_policy required set, so this is P0/P1 by default)
 #
-# A review with P0/P1 findings does NOT count as cleared — the caller
+# A review with blocking findings does NOT count as cleared — the caller
 # may have replied to the findings with a rebuttal and want Codex to
 # re-evaluate. Earlier versions of this function used has_signal in
 # the pre-flight, which caused the rebuttal-without-commit path to
@@ -591,13 +642,19 @@ has_cleared_signal() {
   #   - reaction exists AND (review is null OR reaction is newer
   #     than review), OR
   #   - review exists AND review is newer than (or only signal vs)
-  #     reaction AND review has zero P0/P1 findings (the findings
+  #     reaction AND review has zero blocking findings (the findings
   #     array is already scoped to the latest review's id by the
   #     pull_request_review_id filter in scan_codex_state)
   [ "$(echo "$scan" | jq -r '
     def review_time: if .review == null then "" else .review.submitted_at end;
     def reaction_time: if .reaction == null then "" else .reaction.created_at end;
-    def review_clean: ([.findings[] | select(.priority == "P0" or .priority == "P1")] | length) == 0;
+    # P0 ALWAYS blocks clearance (the absent-policy disposition default is
+    # P0/P1), regardless of the resolved gate set — otherwise a consumer with
+    # no feedback_policy block (resolve_required_tiers -> {p1}) would emit a
+    # P0-only review as blocking:false and prematurely clear it, skipping the
+    # re-request (Codex P2 round 2 on #590). On top of the always-blocking P0,
+    # anything in the resolved `required` set (the `blocking` flag) also blocks.
+    def review_clean: ([.findings[] | select(.priority == "P0" or .blocking == true)] | length) == 0;
 
     if .reaction == null and .review == null then "false"
     elif .reaction != null and .review == null then "true"
@@ -872,7 +929,7 @@ TRIGGER_POST_TIME=""
 TRIGGER_SIGNAL_THRESHOLD=""
 
 if has_cleared_signal "$INITIAL_SCAN"; then
-  log "Codex has already cleared on HEAD (reaction or no-P0/P1 review) — skipping trigger comment"
+  log "Codex has already cleared on HEAD (reaction or no-blocking-tier review) — skipping trigger comment"
 elif [ "$TRIGGER_ONLY" = "true" ] && existing_codex_trigger_on_head; then
   log "trigger-only: @codex review already requested on HEAD — skipping duplicate trigger (idempotent, #489)"
 else

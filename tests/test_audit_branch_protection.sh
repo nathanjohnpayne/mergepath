@@ -106,7 +106,7 @@ case "$path" in
       classic_protected)
         # Classic protection present; required_status_checks includes
         # all canonical checks plus an extra one.
-        emit_status_and_body 200 '{"required_status_checks":{"contexts":["Label Gate","Self-Review Required","Codex P1 unresolved threads","Merge clearance gate","lint"]}}'
+        emit_status_and_body 200 '{"required_status_checks":{"contexts":["Label Gate","Self-Review Required","Codex P1 unresolved threads","CodeRabbit unresolved blocking findings","Merge clearance gate","lint"]}}'
         exit $?
         ;;
       classic_missing_clearance_gate)
@@ -168,12 +168,12 @@ case "$path" in
     ;;
   */rulesets/101)
     # ~ALL include, canonical checks
-    printf '%s\n' '{"id":101,"target":"branch","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"Merge clearance gate"}]}}]}'
+    printf '%s\n' '{"id":101,"target":"branch","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
     exit 0
     ;;
   */rulesets/102)
     # refs/heads/* glob include, canonical checks
-    printf '%s\n' '{"id":102,"target":"branch","conditions":{"ref_name":{"include":["refs/heads/*"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"Merge clearance gate"}]}}]}'
+    printf '%s\n' '{"id":102,"target":"branch","conditions":{"ref_name":{"include":["refs/heads/*"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
     exit 0
     ;;
   */rulesets/201)
@@ -186,7 +186,7 @@ case "$path" in
     ;;
   */rulesets/202)
     # ~DEFAULT_BRANCH with canonical checks — should match audit of main.
-    printf '%s\n' '{"id":202,"target":"branch","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"Merge clearance gate"}]}}]}'
+    printf '%s\n' '{"id":202,"target":"branch","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
     exit 0
     ;;
   */rulesets/301)
