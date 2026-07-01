@@ -250,7 +250,9 @@ trap "rm -f '$BODY_FILE'" EXIT
 # --- map verdict -> GitHub review state ------------------------------------
 post_review() {
   local state_flag="$1"
-  local gh_bin=gh api_cmd=api event payload_file review_response review_rc created_commit
+  local gh_bin=gh
+  local api_cmd=api
+  local event payload_file review_response review_rc created_commit
   [ -x "$GH_AS_REVIEWER" ] || p4b_die 3 "gh-as-reviewer.sh not found at $GH_AS_REVIEWER"
   command -v gh >/dev/null 2>&1 || p4b_die 3 "gh is required to post the review"
   case "$state_flag" in

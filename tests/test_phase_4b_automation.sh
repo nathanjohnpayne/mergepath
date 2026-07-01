@@ -302,6 +302,9 @@ cat > "$BIN/fake-gh-as-reviewer" <<'SH'
   printf 'OP_PREFLIGHT_REVIEWER_PAT=%s\n' "${OP_PREFLIGHT_REVIEWER_PAT:-}"
   printf '%s\n' "$*"
 } > "${P4B_WRAPPER_LOG:?}"
+[ "${1:-}" = "--" ] || { echo "expected wrapper separator" >&2; exit 64; }
+[ "${2:-}" = "gh" ] || { echo "expected gh command" >&2; exit 64; }
+[ "${3:-}" = "api" ] || { echo "expected gh api subcommand" >&2; exit 64; }
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--input" ]; then
     if [ -n "${P4B_WRAPPER_PAYLOAD:-}" ]; then
