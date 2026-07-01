@@ -17,8 +17,32 @@ validation from the enablement environment before flipping
 | [`../phase-4b-review.sh`](../phase-4b-review.sh) | Orchestrator. Selects the reviewer (≠ author), dispatches to an adapter, fails closed on any doubt, and posts the verdict under the reviewer PAT via `gh-as-reviewer.sh`. |
 | [`adapters/review-via-codex.sh`](adapters/review-via-codex.sh) | Direction A (Claude→Codex). `codex --ask-for-approval never exec --sandbox read-only --output-schema verdict.schema.json`. |
 | [`adapters/review-via-claude.sh`](adapters/review-via-claude.sh) | Direction B (Codex→Claude). `claude -p --system-prompt ... --permission-mode plan --effort medium --tools "" --output-format json`. |
-| [`verdict.schema.json`](verdict.schema.json) | The normalized verdict contract both adapters emit, with optional adapter-populated token usage metadata when the CLI exposes it. |
-| [`lib.sh`](lib.sh) | Shared config readers, reviewer selection, and `jq`-based verdict validation. |
+| [`verdict.schema.json`](verdict.schema.json) | The normalized verdict contract both adapters emit, with optional adapter-populated token usage metadata when the CLI exposes it. **Single source of truth for the structural contract** — the `lib.sh` validator derives its key sets and enums from this file (see below). |
+| [`lib.sh`](lib.sh) | Shared config readers, reviewer selection, `jq`-based verdict validation, and JSON-block extraction. |
+
+### Verdict contract: drift resistance & extraction
+
+- **Schema-derived validation (#585).** `p4b_validate_verdict` no longer
+  hand-mirrors the verdict's structural constants. It reads the top-level key
+  set, the `verdict` enum, the per-finding key set, the `severity` enum, and
+  the `usage` key set **from `verdict.schema.json` at validation time**, so
+  editing the schema reconfigures the validator automatically — the two cannot
+  silently drift. Only the semantics the JSON Schema cannot express stay in
+  `jq`: the config-dependent `feedback_policy` approval gate, the
+  all-or-nothing `usage` object, and the 1-based `line` bound. A missing or
+  malformed schema makes validation fail closed. `tests/test_phase_4b_automation.sh`
+  adds behavior-locking parity fixtures (`tests/fixtures/phase_4b_verdicts.jsonl`),
+  schema-vs-validator boundary assertions, and — when a JSON Schema validator
+  (`check-jsonschema`/`ajv`) is installed — an independent cross-check that every
+  validator-accepted fixture is also schema-valid.
+- **Hardened JSON extraction (#587).** `p4b_extract_json_block` (used by the
+  Claude adapter to pull the verdict out of model output) is a string-aware
+  brace-depth scanner rather than a naive first-`{`-to-last-`}` slice. It tracks
+  JSON string literals (honoring `\"` / `\\` escapes) so braces inside string
+  values don't miscount, and it stops at the matching close of the **first**
+  balanced object — so balanced-brace prose *after* the JSON object can no
+  longer extend the slice and corrupt it. Unbalanced or object-free input emits
+  nothing, so schema validation still fails closed on ambiguous output.
 
 ## How it plugs in (no merge-gate changes)
 
