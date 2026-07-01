@@ -900,6 +900,11 @@ case "$1" in
         repos/nathanjohnpayne/mergepath/issues/99999/timeline) printf '[]\n' ;;
         repos/nathanjohnpayne/mergepath/pulls/99999/reviews) reviews_json ;;
         repos/nathanjohnpayne/mergepath/pulls/99999/comments) printf '[]\n' ;;
+        # Issue comments carry Codex's HEAD-anchored verdict (#600). These bug-4
+        # cases exercise the 👍 / review clearance paths, so no verdict comment
+        # is present — return an empty array (CODEX_HEAD_VERDICT_TIME stays
+        # empty and the existing clearance path is unchanged).
+        repos/nathanjohnpayne/mergepath/issues/99999/comments) printf '[]\n' ;;
         repos/nathanjohnpayne/mergepath/issues/99999/reactions) reactions_json ;;
         *) printf 'unexpected paginated endpoint: %s\n' "${1:-}" >&2; exit 9 ;;
       esac
