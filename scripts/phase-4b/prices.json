@@ -1,0 +1,254 @@
+{
+  "schema_version": 1,
+  "version": "2026-07-01",
+  "currency": "USD",
+  "unit": "per_1m_tokens",
+  "purpose": "Phase 4b approval-loop accounting uses this table for notional API-equivalent cost estimates. Reviewer CLIs should still run on subscription-plan authentication; this table is not permission to use pay-per-token API keys.",
+  "retrieved_at": "2026-07-01",
+  "billing_note": "Plan-authenticated Claude Code and Codex/ChatGPT runs may have zero marginal billed cost to the operator. Values here are public list-price equivalents for reporting and comparison.",
+  "sources": [
+    {
+      "provider": "openai",
+      "url": "https://developers.openai.com/api/docs/pricing",
+      "retrieved_at": "2026-07-01",
+      "notes": "OpenAI API public prices per 1M tokens, including specialized Codex pricing."
+    },
+    {
+      "provider": "openai_codex",
+      "url": "https://developers.openai.com/codex/pricing",
+      "retrieved_at": "2026-07-01",
+      "notes": "Codex plan and API-key billing context."
+    },
+    {
+      "provider": "anthropic",
+      "url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "retrieved_at": "2026-07-01",
+      "notes": "Claude public API model prices per MTok, including cache columns."
+    },
+    {
+      "provider": "anthropic_claude_code",
+      "url": "https://code.claude.com/docs/en/costs",
+      "retrieved_at": "2026-07-01",
+      "notes": "Claude Code token and plan-billing context."
+    }
+  ],
+  "estimation_policy": {
+    "prefer_actual_input_output_tokens": true,
+    "default_total_only_input_share": 0.8,
+    "default_total_only_output_share": 0.2,
+    "total_only_note": "Use only when the CLI exposes total tokens without input/output split. Mark the result approximate and retain the blended rate field used.",
+    "price_key_note": "Backfill price keys resolve to rate objects. The companion rate_fields array names which scalar fields inside that object were used."
+  },
+  "providers": {
+    "openai": {
+      "models": {
+        "gpt-5.3-codex": {
+          "standard": {
+            "input": 1.75,
+            "cached_input": 0.175,
+            "output": 14.0,
+            "total_only_blended_80_20": 4.2
+          },
+          "priority": {
+            "input": 3.5,
+            "cached_input": 0.35,
+            "output": 28.0,
+            "total_only_blended_80_20": 8.4
+          }
+        },
+        "gpt-5.5": {
+          "standard_short_context": {
+            "input": 5.0,
+            "cached_input": 0.5,
+            "output": 30.0,
+            "total_only_blended_80_20": 10.0
+          },
+          "standard_long_context": {
+            "input": 10.0,
+            "cached_input": 1.0,
+            "output": 45.0,
+            "total_only_blended_80_20": 17.0
+          },
+          "priority_short_context": {
+            "input": 12.5,
+            "cached_input": 1.25,
+            "output": 75.0,
+            "total_only_blended_80_20": 25.0
+          }
+        },
+        "gpt-5.4": {
+          "standard_short_context": {
+            "input": 2.5,
+            "cached_input": 0.25,
+            "output": 15.0,
+            "total_only_blended_80_20": 5.0
+          },
+          "standard_long_context": {
+            "input": 5.0,
+            "cached_input": 0.5,
+            "output": 22.5,
+            "total_only_blended_80_20": 8.5
+          },
+          "priority_short_context": {
+            "input": 5.0,
+            "cached_input": 0.5,
+            "output": 30.0,
+            "total_only_blended_80_20": 10.0
+          }
+        },
+        "gpt-5.4-mini": {
+          "standard": {
+            "input": 0.75,
+            "cached_input": 0.075,
+            "output": 4.5,
+            "total_only_blended_80_20": 1.5
+          },
+          "priority": {
+            "input": 1.5,
+            "cached_input": 0.15,
+            "output": 9.0,
+            "total_only_blended_80_20": 3.0
+          }
+        },
+        "gpt-5.4-nano": {
+          "standard": {
+            "input": 0.2,
+            "cached_input": 0.02,
+            "output": 1.25,
+            "total_only_blended_80_20": 0.41
+          }
+        },
+        "chat-latest": {
+          "standard": {
+            "input": 5.0,
+            "cached_input": 0.5,
+            "output": 30.0,
+            "total_only_blended_80_20": 10.0
+          }
+        }
+      }
+    },
+    "anthropic": {
+      "models": {
+        "claude-fable-5": {
+          "standard": {
+            "input": 10.0,
+            "cache_write_5m": 12.5,
+            "cache_write_1h": 20.0,
+            "cache_read": 1.0,
+            "output": 50.0,
+            "total_only_blended_80_20": 18.0
+          }
+        },
+        "claude-mythos-5": {
+          "standard": {
+            "input": 10.0,
+            "cache_write_5m": 12.5,
+            "cache_write_1h": 20.0,
+            "cache_read": 1.0,
+            "output": 50.0,
+            "total_only_blended_80_20": 18.0
+          }
+        },
+        "claude-opus-4.8": {
+          "standard": {
+            "input": 5.0,
+            "cache_write_5m": 6.25,
+            "cache_write_1h": 10.0,
+            "cache_read": 0.5,
+            "output": 25.0,
+            "total_only_blended_80_20": 9.0
+          }
+        },
+        "claude-opus-4.7": {
+          "standard": {
+            "input": 5.0,
+            "cache_write_5m": 6.25,
+            "cache_write_1h": 10.0,
+            "cache_read": 0.5,
+            "output": 25.0,
+            "total_only_blended_80_20": 9.0
+          }
+        },
+        "claude-opus-4.6": {
+          "standard": {
+            "input": 5.0,
+            "cache_write_5m": 6.25,
+            "cache_write_1h": 10.0,
+            "cache_read": 0.5,
+            "output": 25.0,
+            "total_only_blended_80_20": 9.0
+          }
+        },
+        "claude-sonnet-5": {
+          "standard_through_2026-08-31": {
+            "input": 2.0,
+            "cache_write_5m": 2.5,
+            "cache_write_1h": 4.0,
+            "cache_read": 0.2,
+            "output": 10.0,
+            "total_only_blended_80_20": 3.6
+          },
+          "standard_from_2026-09-01": {
+            "input": 3.0,
+            "cache_write_5m": 3.75,
+            "cache_write_1h": 6.0,
+            "cache_read": 0.3,
+            "output": 15.0,
+            "total_only_blended_80_20": 5.4
+          }
+        },
+        "claude-sonnet-4.6": {
+          "standard": {
+            "input": 3.0,
+            "cache_write_5m": 3.75,
+            "cache_write_1h": 6.0,
+            "cache_read": 0.3,
+            "output": 15.0,
+            "total_only_blended_80_20": 5.4
+          }
+        },
+        "claude-sonnet-4.5": {
+          "standard": {
+            "input": 3.0,
+            "cache_write_5m": 3.75,
+            "cache_write_1h": 6.0,
+            "cache_read": 0.3,
+            "output": 15.0,
+            "total_only_blended_80_20": 5.4
+          }
+        },
+        "claude-haiku-4.5": {
+          "standard": {
+            "input": 1.0,
+            "cache_write_5m": 1.25,
+            "cache_write_1h": 2.0,
+            "cache_read": 0.1,
+            "output": 5.0,
+            "total_only_blended_80_20": 1.8
+          }
+        },
+        "claude-haiku-3.5": {
+          "standard": {
+            "input": 0.8,
+            "cache_write_5m": 1.0,
+            "cache_write_1h": 1.6,
+            "cache_read": 0.08,
+            "output": 4.0,
+            "total_only_blended_80_20": 1.44
+          }
+        }
+      }
+    }
+  },
+  "backfills": {
+    "pr_580": {
+      "recorded_model_ids": false,
+      "codex_price_key": "openai.gpt-5.3-codex.standard",
+      "codex_rate_fields": ["total_only_blended_80_20"],
+      "claude_price_key": "anthropic.claude-sonnet-4.6.standard",
+      "claude_rate_fields": ["input", "output"],
+      "notes": "PR #580 retained token counts but not exact model IDs. Price keys resolve to rate objects; rate_fields names the scalar fields used. These keys are a notional backfill only; issue #602 requires exact model ID capture before future durable cost reporting."
+    }
+  }
+}
