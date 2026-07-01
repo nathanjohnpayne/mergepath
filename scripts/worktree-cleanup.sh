@@ -61,10 +61,19 @@
 #      output. These are residue from a `--force` remove that didn't
 #      clean the directory, or from a manual rm of git metadata.
 #   4. Verified-merged local branch. A local branch whose upstream is
-#      gone and whose current tip matches a MERGED PR head from `gh pr list
-#      --head <branch> --state merged`. In --apply mode, branches that are
+#      gone and for whose head NAME a MERGED PR exists per `gh pr list
+#      --head <branch> --state merged`. The match is by branch head name,
+#      NOT an exact tip==headRefOid comparison, so a branch carrying an
+#      extra local commit on top of the merged head (e.g. a routine
+#      `git merge main`) is still recognized as merged and logged as
+#      "local tip diverged from PR head" rather than silently skipped
+#      (#605). A branch with NO merged PR for its head name is examined
+#      and kept (never deleted). In --apply mode, matched branches that are
 #      not checked out in any worktree are deleted with `git branch -D`;
-#      checked-out branches are listed but skipped.
+#      checked-out branches are listed but skipped. The worktree snapshot
+#      used for the checked-out test is re-taken AFTER the worktree-removal
+#      pass so a branch whose worktree was removed earlier in the same
+#      --apply run becomes eligible for deletion in that run (#605).
 #
 # Locked detection. `git worktree list --porcelain` emits a `locked`
 # line (possibly with a reason) for locked entries. We classify locked
@@ -164,14 +173,46 @@ gh_pr_state() {
   echo "unknown"
 }
 
-gh_branch_tip_has_merged_pr() {
+# Classify a local branch against its merged PRs by HEAD *name* (not by an
+# exact tip==headRefOid match). Prints one of:
+#   exact     — a merged PR exists for this branch name AND its recorded
+#               headRefOid equals the branch tip (clean squash-merge, no
+#               local commits on top).
+#   diverged  — a merged PR exists for this branch name, but the branch tip
+#               is NOT one of the merged heads (e.g. a routine `git merge
+#               main` housekeeping commit landed on top of the merged head).
+#               Still safe to delete: the branch's PR merged; the extra local
+#               commits are not the reason to keep it.
+#   none      — no merged PR exists for this branch name (or gh is missing /
+#               the tip cannot be resolved). NEVER treat as merged.
+# Exit status: 0 for exact|diverged (safe to delete), 1 for none (keep).
+#
+# Rationale (#605 root cause 2): the prior `grep -Fxq "$tip"` required an
+# exact tip==headRefOid match, so any branch carrying a commit beyond the PR
+# head silently failed the check and the caller `continue`d with NO output —
+# invisible in both the listing and the summary. Falling back to a name-based
+# existence check keeps the fail-safe contract (a merged PR for this head name
+# must actually exist) while surfacing the diverged case with a CLEAR log line
+# instead of a silent skip.
+gh_branch_merged_pr_status() {
   local branch="$1" tip merged_heads
   if ! command -v gh >/dev/null 2>&1; then
+    echo "none"
     return 1
   fi
-  tip=$(git -C "$MAIN_WORKTREE" rev-parse "$branch" 2>/dev/null) || return 1
-  merged_heads=$(cd "$MAIN_WORKTREE" && gh pr list --head "$branch" --state merged --json headRefOid --jq '.[].headRefOid' 2>/dev/null) || return 1
-  printf '%s\n' "$merged_heads" | grep -Fxq "$tip"
+  tip=$(git -C "$MAIN_WORKTREE" rev-parse "$branch" 2>/dev/null) || { echo "none"; return 1; }
+  merged_heads=$(cd "$MAIN_WORKTREE" && gh pr list --head "$branch" --state merged --json headRefOid --jq '.[].headRefOid' 2>/dev/null) || { echo "none"; return 1; }
+  # No merged PR for this head name → not safe to delete.
+  if [ -z "$merged_heads" ]; then
+    echo "none"
+    return 1
+  fi
+  if printf '%s\n' "$merged_heads" | grep -Fxq "$tip"; then
+    echo "exact"
+    return 0
+  fi
+  echo "diverged"
+  return 0
 }
 
 # Read gone-upstream branches from `git branch -vv`. The format is:
@@ -263,6 +304,12 @@ SUMMARY_ORPHAN=()
 SUMMARY_REMOVED=()
 SUMMARY_SKIPPED=()
 SUMMARY_FAILED=()
+# Gone-upstream branches that were EXAMINED in the merged-branch sweep but
+# were NOT flagged as deletion candidates (no merged PR for the head name).
+# Tracked separately from "not evaluated" so silent omissions are visible in
+# the dry-run summary going forward (#605 acceptance: distinguish "evaluated,
+# not a candidate" from "not evaluated").
+SUMMARY_EXAMINED_NOT_MERGED=()
 
 print_record() {
   local label="$1" color="$2" path="$3" branch="$4" head="$5" upstream="$6" pr_state="$7" lock_reason="$8"
@@ -386,6 +433,19 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
   fi
 done <"$REC_FILE"
 
+# ── Re-snapshot worktree records (#605 root cause 1) ───────────────────
+# $REC_FILE was captured once at the top, BEFORE the worktree-removal loop
+# above ran. In --apply mode that loop can remove worktrees, so the stale
+# snapshot would still report a just-removed worktree's branch as "checked
+# out" and the merged-branch sweep below would skip deleting its ref in the
+# SAME run. Re-snapshot now so branch_checked_out() reflects worktree state
+# as of AFTER removals. Harmless in dry-run (nothing was removed, so the
+# re-read is identical). The orphan scan below also reads $REC_FILE, so it
+# benefits from the fresh snapshot too.
+if [ "$MODE" = "apply" ]; then
+  worktree_records >"$REC_FILE"
+fi
+
 # ── Verified-merged local branch sweep ─────────────────────────────────
 # Worktree cleanup removes stale worktrees, but a squash-merged branch can
 # remain as a standalone local ref after the remote branch is deleted. Verify
@@ -393,12 +453,35 @@ done <"$REC_FILE"
 # not swept up just because its upstream is gone.
 while IFS= read -r LOCAL_BRANCH; do
   [ -n "$LOCAL_BRANCH" ] || continue
-  if ! gh_branch_tip_has_merged_pr "$LOCAL_BRANCH"; then
+  # `|| true`: the helper returns 1 for the "none" verdict, and under
+  # `set -e` a `VAR=$(func)` assignment inherits that non-zero status and
+  # would abort the script. The verdict string is already on stdout, so we
+  # only need to neutralize the exit status here.
+  MERGED_STATUS=$(gh_branch_merged_pr_status "$LOCAL_BRANCH") || true
+  if [ "$MERGED_STATUS" = "none" ]; then
+    # Evaluated but NOT a deletion candidate: no merged PR for this head
+    # name. Emit a CLEAR line (rather than a silent `continue`) so the
+    # dry-run summary distinguishes "examined, not merged" from branches we
+    # never evaluated. Keeps the fail-safe contract — nothing is deleted.
+    LOCAL_BRANCH_TIP=$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)
+    print_record "[gone-upstream local branch — no merged PR, keeping]" "$C_DIM" \
+      "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$LOCAL_BRANCH_TIP" "[gone]" "" ""
+    echo "    reason:   no merged PR found for head name (unpublished or unmerged work)"
+    SUMMARY_EXAMINED_NOT_MERGED+=("$LOCAL_BRANCH")
     continue
   fi
 
+  # exact | diverged → a merged PR exists for this branch's head name, so the
+  # ref is safe to delete. Note the divergence explicitly when the tip sits
+  # beyond the merged head (an extra local housekeeping commit) so it is
+  # never a silent skip.
+  DIVERGED_NOTE=""
+  if [ "$MERGED_STATUS" = "diverged" ]; then
+    DIVERGED_NOTE=" (local tip diverged from PR head — extra commit(s) on top)"
+  fi
+
   if branch_checked_out "$LOCAL_BRANCH"; then
-    print_record "[MERGED local branch checked out — keeping]" "$C_YELLOW" \
+    print_record "[MERGED local branch checked out — keeping]${DIVERGED_NOTE}" "$C_YELLOW" \
       "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)" "[gone]" "MERGED" ""
     SUMMARY_LOCAL_BRANCH+=("$LOCAL_BRANCH (checked out)")
     if [ "$MODE" = "apply" ]; then
@@ -408,7 +491,7 @@ while IFS= read -r LOCAL_BRANCH; do
     continue
   fi
 
-  print_record "[MERGED local branch]" "$C_RED" \
+  print_record "[MERGED local branch]${DIVERGED_NOTE}" "$C_RED" \
     "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)" "[gone]" "MERGED" ""
   SUMMARY_LOCAL_BRANCH+=("$LOCAL_BRANCH")
   if [ "$MODE" = "apply" ]; then
@@ -503,6 +586,11 @@ printf "  gone-upstream:    %d\n" "${#SUMMARY_GONE[@]}"
 printf "  detached stale:   %d\n" "${#SUMMARY_DETACHED[@]}"
 printf "  locked:           %d\n" "${#SUMMARY_LOCKED[@]}"
 printf "  merged branches:  %d\n" "${#SUMMARY_LOCAL_BRANCH[@]}"
+# Gone-upstream branches examined by the merged-branch sweep but kept because
+# no merged PR backs them. Reported so a silent omission (the #605 failure
+# mode) is visible: a branch that WAS evaluated but is not a candidate shows
+# up here rather than vanishing without a trace.
+printf "  gone kept (unmerged): %d\n" "${#SUMMARY_EXAMINED_NOT_MERGED[@]}"
 printf "  open-PR retained: %d\n" "${#SUMMARY_OPEN_PR[@]}"
 printf "  orphan dirs:      %d\n" "${#SUMMARY_ORPHAN[@]}"
 
