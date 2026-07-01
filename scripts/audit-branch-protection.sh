@@ -54,6 +54,7 @@ CANONICAL_REQUIRED_CHECKS=(
   # require them, which is the gap #427/#428 exploited (the gate ran but
   # was advisory, so escapes were caught only by the weekly audit).
   "Codex P1 unresolved threads"   # .github/workflows/codex-p1-gate.yml (#235)
+  "CodeRabbit unresolved blocking findings"  # .github/workflows/coderabbit-severity-gate.yml (#577); no-op/green when coderabbit.severity_gate.enabled is off
   "Merge clearance gate"          # .github/workflows/merge-clearance-gate.yml (#427/#428)
 )
 

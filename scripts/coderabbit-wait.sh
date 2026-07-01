@@ -1400,7 +1400,11 @@ emit_json_and_exit() {
   if [ "$FEEDBACK_POLICY_PRESENT" = true ] && [ "$BLOCKING_TIER_UNRESOLVED" = "null" ]; then
     case "$status" in
       findings|cleared)
-        BLOCKING_TIER_UNRESOLVED=$(count_blocking_tier_issues)
+        # Guard the advisory decoration: a transient gh api failure inside
+        # count_blocking_tier_issues must NEVER flip the terminal exit code
+        # under `set -e` (Codex P2 on #590). On any failure, leave the field
+        # null — it is report-only, as the comment above promises.
+        BLOCKING_TIER_UNRESOLVED=$(count_blocking_tier_issues 2>/dev/null) || BLOCKING_TIER_UNRESOLVED=null
         ;;
     esac
   fi

@@ -615,10 +615,11 @@ has_signal() {
 # CLEARED (no further @codex review trigger needed). Cleared means
 # EITHER:
 #   - any +1 reaction on the PR issue (the no-findings happy path), OR
-#   - a review on HEAD with zero P0/P1 inline findings (the
-#     reviewed-and-clean path)
+#   - a review on HEAD with zero blocking (required-tier) inline findings
+#     (the reviewed-and-clean path; "blocking" reflects the resolved
+#     feedback_policy required set, so this is P0/P1 by default)
 #
-# A review with P0/P1 findings does NOT count as cleared — the caller
+# A review with blocking findings does NOT count as cleared — the caller
 # may have replied to the findings with a rebuttal and want Codex to
 # re-evaluate. Earlier versions of this function used has_signal in
 # the pre-flight, which caused the rebuttal-without-commit path to
@@ -641,13 +642,13 @@ has_cleared_signal() {
   #   - reaction exists AND (review is null OR reaction is newer
   #     than review), OR
   #   - review exists AND review is newer than (or only signal vs)
-  #     reaction AND review has zero P0/P1 findings (the findings
+  #     reaction AND review has zero blocking findings (the findings
   #     array is already scoped to the latest review's id by the
   #     pull_request_review_id filter in scan_codex_state)
   [ "$(echo "$scan" | jq -r '
     def review_time: if .review == null then "" else .review.submitted_at end;
     def reaction_time: if .reaction == null then "" else .reaction.created_at end;
-    def review_clean: ([.findings[] | select(.priority == "P0" or .priority == "P1")] | length) == 0;
+    def review_clean: ([.findings[] | select(.blocking == true)] | length) == 0;
 
     if .reaction == null and .review == null then "false"
     elif .reaction != null and .review == null then "true"
@@ -922,7 +923,7 @@ TRIGGER_POST_TIME=""
 TRIGGER_SIGNAL_THRESHOLD=""
 
 if has_cleared_signal "$INITIAL_SCAN"; then
-  log "Codex has already cleared on HEAD (reaction or no-P0/P1 review) — skipping trigger comment"
+  log "Codex has already cleared on HEAD (reaction or no-blocking-tier review) — skipping trigger comment"
 elif [ "$TRIGGER_ONLY" = "true" ] && existing_codex_trigger_on_head; then
   log "trigger-only: @codex review already requested on HEAD — skipping duplicate trigger (idempotent, #489)"
 else
