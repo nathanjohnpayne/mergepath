@@ -23,6 +23,7 @@ REQUIRED_EXEC=(
   "scripts/phase-4b-review.sh"
   "scripts/phase-4b/adapters/review-via-codex.sh"
   "scripts/phase-4b/adapters/review-via-claude.sh"
+  "scripts/phase-4b/collect-enablement-evidence.sh"
 )
 REQUIRED_FILES=(
   "scripts/phase-4b/lib.sh"
@@ -70,6 +71,7 @@ if command -v shellcheck >/dev/null 2>&1; then
       "$REPO_ROOT/scripts/phase-4b/lib.sh" \
       "$REPO_ROOT/scripts/phase-4b/adapters/review-via-codex.sh" \
       "$REPO_ROOT/scripts/phase-4b/adapters/review-via-claude.sh" \
+      "$REPO_ROOT/scripts/phase-4b/collect-enablement-evidence.sh" \
       "$REPO_ROOT/tests/test_phase_4b_automation.sh"; then
     echo "FAIL: shellcheck reported warnings/errors in the phase-4b scripts"; FAILED=1
   fi

@@ -608,6 +608,33 @@ phase_4b_automation:
   # block and alert the human. (Documentary; the only implemented behavior.)
   fallback_on_error: manual-handoff
 
+  # --- Reviewer CLI runtime bounds (#589) ---------------------------------
+  # Per-adapter timeout + effort for the reviewer CLI, so Codex and Claude can
+  # be tuned without editing the adapter scripts. Conservative defaults below
+  # exactly reproduce the historical hard-coded behavior, so leaving this block
+  # as-is changes nothing.
+  #
+  # Timeout (seconds): shared default, optionally overridden per adapter. A
+  # value must be an integer in [1, 3600]; anything non-integer or out of range
+  # is rejected FAIL-CLOSED (the orchestrator exits with an error rather than
+  # running the CLI unbounded). Absent ⇒ 900. Env vars
+  # P4B_ADAPTER_TIMEOUT_SECONDS / P4B_REVIEW_CLI_TIMEOUT_SECONDS still override
+  # at runtime for tests and manual runs.
+  adapter_timeout_seconds: 900   # shared default for both adapters
+  # codex_timeout_seconds: 900   # optional per-adapter override
+  # claude_timeout_seconds: 900  # optional per-adapter override
+
+  # Effort: how hard the reviewer CLI thinks. Accepted values differ per CLI.
+  #   claude_effort → claude --effort: low|medium|high|xhigh|max (default medium)
+  #   codex_effort  → codex -c model_reasoning_effort: minimal|low|medium|high
+  #                   (default empty = the Codex CLI default; validated against
+  #                   codex-cli 0.137's config knob. If a future Codex CLI drops
+  #                   the key it is a harmless no-op because --strict-config is
+  #                   not used.)
+  # An invalid value here is rejected fail-closed (orchestrator exits).
+  claude_effort: medium
+  # codex_effort: high           # optional; empty/absent ⇒ Codex CLI default
+
 # ---------------------------------------------------------------------------
 # Auto-clear blocking labels (#195/#197)
 # ---------------------------------------------------------------------------

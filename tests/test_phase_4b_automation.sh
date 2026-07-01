@@ -817,6 +817,257 @@ bash "$ORCH" abc --repo o/r >/dev/null 2>&1; rc=$?
 set -e
 [ "$rc" = 3 ] && pass "non-integer PR# rejected with exit 3" || fail "bad PR# should exit 3 (got $rc)"
 
+# ===========================================================================
+echo "lib.sh — timeout/effort resolvers (#589)"
+# ===========================================================================
+cat > "$WORK/policy-te.yml" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+  enabled: true
+  mode: local
+  adapter_timeout_seconds: 1200
+  codex_timeout_seconds: 120
+  codex_effort: high
+  claude_effort: xhigh
+YAML
+cat > "$WORK/policy-te-defaults.yml" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+  enabled: true
+  mode: local
+YAML
+cat > "$WORK/policy-te-t1.yml" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+  enabled: true
+  mode: local
+  adapter_timeout_seconds: 1
+YAML
+cat > "$WORK/policy-te-bad-timeout.yml" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+  enabled: true
+  mode: local
+  codex_timeout_seconds: abc
+YAML
+cat > "$WORK/policy-te-range.yml" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+  enabled: true
+  mode: local
+  adapter_timeout_seconds: 99999
+YAML
+cat > "$WORK/policy-te-bad-effort.yml" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+  enabled: true
+  mode: local
+  codex_effort: bogus
+YAML
+
+export MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te-defaults.yml"
+r="$(p4b_resolve_adapter_timeout codex)"; [ "$r" = 900 ] && pass "timeout defaults to 900 when unset" || fail "timeout default -> $r"
+r="$(p4b_resolve_adapter_effort claude)"; [ "$r" = medium ] && pass "claude effort defaults to medium" || fail "claude effort default -> $r"
+r="$(p4b_resolve_adapter_effort codex)"; [ -z "$r" ] && pass "codex effort defaults to empty (CLI default)" || fail "codex effort default -> [$r]"
+
+export MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te.yml"
+r="$(p4b_resolve_adapter_timeout codex)"; [ "$r" = 120 ] && pass "codex per-adapter timeout override (120)" || fail "codex timeout override -> $r"
+r="$(p4b_resolve_adapter_timeout claude)"; [ "$r" = 1200 ] && pass "claude falls back to shared timeout (1200)" || fail "claude shared timeout -> $r"
+r="$(p4b_resolve_adapter_effort codex)"; [ "$r" = high ] && pass "codex effort from policy (high)" || fail "codex effort -> $r"
+r="$(p4b_resolve_adapter_effort claude)"; [ "$r" = xhigh ] && pass "claude effort from policy (xhigh)" || fail "claude effort -> $r"
+
+export MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te-bad-timeout.yml"
+set +e; p4b_resolve_adapter_timeout codex >/dev/null 2>&1; rc=$?; set -e
+[ "$rc" != 0 ] && pass "non-integer timeout rejected (fail closed)" || fail "non-integer timeout accepted"
+export MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te-range.yml"
+set +e; p4b_resolve_adapter_timeout codex >/dev/null 2>&1; rc=$?; set -e
+[ "$rc" != 0 ] && pass "out-of-range timeout (99999 > 3600) rejected" || fail "out-of-range timeout accepted"
+export MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te-bad-effort.yml"
+set +e; p4b_resolve_adapter_effort codex >/dev/null 2>&1; rc=$?; set -e
+[ "$rc" != 0 ] && pass "invalid codex effort rejected (fail closed)" || fail "invalid codex effort accepted"
+unset MERGEPATH_REVIEW_POLICY_PATH
+
+# ===========================================================================
+echo "adapters — configurable effort (#589)"
+# ===========================================================================
+# These fakes read the effort off their OWN argv (which survives the adapter's
+# env -i allowlist, unlike an env var) and echo it back in the verdict summary,
+# so the test can assert what the adapter actually passed to the CLI.
+mk_fake fake-codex-effort \
+  "eff=none; prev=''
+for a in \"\$@\"; do
+  if [ \"\$prev\" = '-c' ]; then case \"\$a\" in model_reasoning_effort=*) eff=\"\${a#model_reasoning_effort=}\";; esac; fi
+  prev=\"\$a\"
+done
+printf '{\"verdict\":\"APPROVED\",\"summary\":\"effort=%s\",\"findings\":[]}' \"\$eff\""
+mk_fake fake-claude-effort \
+  "eff=none; prev=''
+for a in \"\$@\"; do
+  if [ \"\$prev\" = '--effort' ]; then eff=\"\$a\"; fi
+  prev=\"\$a\"
+done
+printf '{\"verdict\":\"APPROVED\",\"summary\":\"effort=%s\",\"findings\":[]}' \"\$eff\""
+
+set +e
+out="$(P4B_CODEX_EFFORT=high CODEX_BIN="$BIN/fake-codex-effort" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.summary')" = "effort=high" ]; then
+  pass "codex adapter passes -c model_reasoning_effort=<v> when P4B_CODEX_EFFORT set"
+else fail "codex effort wiring (rc=$rc, out=$out)"; fi
+
+set +e
+out="$(CODEX_BIN="$BIN/fake-codex-effort" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.summary')" = "effort=none" ]; then
+  pass "codex adapter omits the effort flag when unset (CLI default / no-op)"
+else fail "codex effort default (rc=$rc, out=$out)"; fi
+
+set +e
+P4B_CODEX_EFFORT=bogus CODEX_BIN="$BIN/fake-codex-effort" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$DIFF" >/dev/null 2>&1; rc=$?
+set -e
+[ "$rc" = 3 ] && pass "codex adapter rejects invalid effort with exit 3" || fail "codex invalid effort should exit 3 (got $rc)"
+
+set +e
+out="$(P4B_CLAUDE_EFFORT=high CLAUDE_BIN="$BIN/fake-claude-effort" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.summary')" = "effort=high" ]; then
+  pass "claude adapter passes --effort <v> when P4B_CLAUDE_EFFORT set (no adapter edit)"
+else fail "claude effort wiring (rc=$rc, out=$out)"; fi
+
+# ===========================================================================
+echo "orchestrator — policy-driven timeout/effort (#589)"
+# ===========================================================================
+# End-to-end: a non-dry-run post captures the review body. The codex fake
+# echoes the effort it saw (effort=high) into the verdict summary, so the
+# posted body proves policy → orchestrator → env → adapter → CLI arg wiring.
+EFFORT_BODY="$WORK/orch-effort-body.md"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te.yml" CODEX_BIN="$BIN/fake-codex-effort" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/orch-effort-wrapper.log" P4B_WRAPPER_BODY="$EFFORT_BODY" P4B_FAKE_LIVE_HEAD=abc123 \
+  bash "$ORCH" 140 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.reviewer_effort')" = "high" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.adapter_timeout_seconds')" = "120" ] \
+   && grep -q "effort=high" "$EFFORT_BODY" \
+   && grep -q -- "Reviewer effort: \`high\`" "$EFFORT_BODY"; then
+  pass "orchestrator resolves codex effort=high + timeout=120 from policy and wires them end-to-end"
+else fail "orchestrator policy codex effort/timeout (rc=$rc, out=$out, body=$(test -e "$EFFORT_BODY" && cat "$EFFORT_BODY" || true))"; fi
+
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te.yml" CLAUDE_BIN="$BIN/fake-claude-effort" \
+  bash "$ORCH" 141 --repo o/r --author codex --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.reviewer_effort')" = "xhigh" ]; then
+  pass "orchestrator resolves claude effort=xhigh from policy (author=codex → reviewer claude)"
+else fail "orchestrator policy claude effort (rc=$rc, out=$out)"; fi
+
+# Outer bound is policy-driven: disable the inner CLI timeout (env 0) so only
+# the policy-resolved outer bound fires deterministically on the 5s sleep.
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te-t1.yml" P4B_REVIEW_CLI_TIMEOUT_SECONDS=0 CODEX_BIN="$BIN/fake-codex-sleep" \
+  bash "$ORCH" 142 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r '.reason')" = "adapter timed out after 1s" ]; then
+  pass "orchestrator outer timeout is policy-driven (adapter_timeout_seconds=1 → exit 4)"
+else fail "orchestrator policy timeout (rc=$rc, out=$out)"; fi
+
+set +e
+MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te-bad-timeout.yml" CODEX_BIN="$BIN/fake-codex-approve" \
+  bash "$ORCH" 143 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run >/dev/null 2>&1; rc=$?
+set -e
+[ "$rc" = 3 ] && pass "orchestrator fails closed (exit 3) on invalid policy timeout" || fail "invalid policy timeout should exit 3 (got $rc)"
+
+set +e
+MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te-bad-effort.yml" CODEX_BIN="$BIN/fake-codex-approve" \
+  bash "$ORCH" 144 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run >/dev/null 2>&1; rc=$?
+set -e
+[ "$rc" = 3 ] && pass "orchestrator fails closed (exit 3) on invalid policy effort" || fail "invalid policy effort should exit 3 (got $rc)"
+
+# ===========================================================================
+echo "collect-enablement-evidence.sh (#586)"
+# ===========================================================================
+EVI="$ROOT/scripts/phase-4b/collect-enablement-evidence.sh"
+[ -x "$EVI" ] && pass "evidence script present and executable" || fail "evidence script missing/not executable: $EVI"
+mk_fake fake-codex-evi \
+  "if [ \"\${1:-}\" = '--version' ]; then echo 'codex-cli 1.2.3-evi'; exit 0; fi
+printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"ok\",\"findings\":[]}'"
+mk_fake fake-claude-evi \
+  "if [ \"\${1:-}\" = '--version' ]; then echo 'claude 4.5.6-evi'; exit 0; fi
+jq -n --arg r '{\"verdict\":\"APPROVED\",\"summary\":\"ok\",\"findings\":[]}' '{type:\"result\",result:\$r,session_id:\"t\"}'"
+
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" P4B_CODEX_AUTH_FILE="$CODEX_AUTH_CHATGPT" P4B_CLAUDE_AUTH_STATUS_FILE="$CLAUDE_AUTH_PLAN" \
+  CODEX_BIN="$BIN/fake-codex-evi" CLAUDE_BIN="$BIN/fake-claude-evi" \
+  env -u OPENAI_API_KEY -u CODEX_API_KEY -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN bash "$EVI" --json --no-dry-run)"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.ready')" = "true" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.adapters.codex.version')" = "codex-cli 1.2.3-evi" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.adapters.claude.plan_auth_ok')" = "true" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.api_key_env.any_set')" = "false" ]; then
+  pass "evidence: READY (versions + plan auth + no API keys) → exit 0"
+else fail "evidence READY (rc=$rc): $out"; fi
+
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" P4B_CODEX_AUTH_FILE="$CODEX_AUTH_CHATGPT" P4B_CLAUDE_AUTH_STATUS_FILE="$CLAUDE_AUTH_PLAN" \
+  CODEX_BIN="$BIN/fake-codex-evi" CLAUDE_BIN="$BIN/fake-claude-evi" OPENAI_API_KEY=sk-should-block \
+  bash "$EVI" --json --no-dry-run)"; rc=$?
+set -e
+if [ "$rc" = 1 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.ready')" = "false" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.api_key_env.OPENAI_API_KEY')" = "SET" ] \
+   && ! printf '%s' "$out" | grep -q "sk-should-block"; then
+  pass "evidence: a SET API-key env var → BLOCKED (exit 1), value never printed"
+else fail "evidence BLOCKED-by-key (rc=$rc): $out"; fi
+
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" P4B_CODEX_AUTH_FILE="$CODEX_AUTH_API" P4B_CLAUDE_AUTH_STATUS_FILE="$CLAUDE_AUTH_API" \
+  CODEX_BIN="$BIN/fake-codex-evi" CLAUDE_BIN="$BIN/fake-claude-evi" \
+  env -u OPENAI_API_KEY -u CODEX_API_KEY -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN bash "$EVI" --json --no-dry-run)"; rc=$?
+set -e
+if [ "$rc" = 1 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.adapters.codex.plan_auth_ok')" = "false" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.adapters.claude.plan_auth_ok')" = "false" ]; then
+  pass "evidence: no plan-authed CLI (API-key auth) → BLOCKED (exit 1)"
+else fail "evidence BLOCKED-by-auth (rc=$rc): $out"; fi
+
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" P4B_CODEX_AUTH_FILE="$CODEX_AUTH_CHATGPT" P4B_CLAUDE_AUTH_STATUS_FILE="$CLAUDE_AUTH_PLAN" \
+  CODEX_BIN="$BIN/fake-codex-evi" CLAUDE_BIN="$BIN/fake-claude-evi" \
+  env -u OPENAI_API_KEY -u CODEX_API_KEY -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN bash "$EVI" --json --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.adapters.codex.dry_run')" = "rc=0 verdict=APPROVED" ]; then
+  pass "evidence: dry-run runs the adapter and reports its verdict"
+else fail "evidence dry-run (rc=$rc): $out"; fi
+
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" P4B_CODEX_AUTH_FILE="$CODEX_AUTH_CHATGPT" P4B_CLAUDE_AUTH_STATUS_FILE="$CLAUDE_AUTH_PLAN" \
+  CODEX_BIN="$BIN/fake-codex-evi" CLAUDE_BIN="$BIN/fake-claude-evi" \
+  env -u OPENAI_API_KEY -u CODEX_API_KEY -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN bash "$EVI" --no-dry-run)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "ENABLEMENT READINESS: READY" && printf '%s' "$out" | grep -q "Phase 4b enablement evidence"; then
+  pass "evidence: markdown report renders the readiness verdict"
+else fail "evidence markdown (rc=$rc): $out"; fi
+
 echo
 echo "Summary: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
