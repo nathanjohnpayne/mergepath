@@ -402,6 +402,18 @@ POLL_INTERVAL_SECONDS=15
 STATUS_PROBE_POLL_INTERVAL_SECONDS=5
 RATE_LIMIT_BUFFER_SECONDS=30
 
+# #596: CodeRabbit flips its commit StatusContext to `success` while
+# rate-limited, ~1s AFTER posting the rate-limit notice (the #595 spurious
+# success). When the latest HEAD-referencing CodeRabbit comment is a
+# non-review notice (rate_limit/paused/in_progress), a `success` that lands
+# within this many seconds of it is treated as that near-simultaneous flip and
+# suppressed (keep polling); a `success` that postdates the notice by MORE than
+# this is a genuine later re-review — which per #221 can be silent (no new
+# summary comment) — and stays authoritative. Comfortably above CodeRabbit's
+# flip latency (seconds) yet below its minutes-long rate-limit windows, so the
+# #595 false success is caught while a real recovery review still clears.
+STATUS_SUCCESS_GRACE_SECONDS=120
+
 # --- tier-aware classification (#577) ---------------------------------------
 # Additive tier-awareness layered ON TOP of the existing binary
 # `Potential issue`/⚠️ detector — it NEVER replaces the exit-code fast-paths
@@ -1078,9 +1090,30 @@ iso_on_or_after() {
   esac
 }
 
+# #596: return 0 (true) when `status` landed at most `grace` seconds after
+# `comment` — i.e. status <= comment + grace. Used to recognize CodeRabbit's
+# near-simultaneous rate-limit StatusContext flip (a `status` within `grace` of
+# the notice) versus a genuinely later re-review (`status` well after it). Fails
+# OPEN (true → suppress the fast-path) on unparseable input, matching the
+# conservative posture of iso_on_or_after.
+iso_within_seconds_after() {
+  local comment=$1 status=$2 grace=$3 rc
+  if [ -z "$comment" ] || [ "$comment" = "null" ] || [ -z "$status" ] || [ "$status" = "null" ]; then
+    return 0
+  fi
+  jq -en --arg c "$comment" --arg s "$status" --argjson g "$grace" \
+    '($s | fromdateiso8601) <= ($c | fromdateiso8601) + $g' >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 status_context_fast_path_blocked_by_comment() {
   local status_created_at=$1
-  local latest class comment_id comment_fresh_at comment_body
+  local latest class comment_id comment_created_at comment_fresh_at comment_body
   latest=$(scan_latest_comment)
   if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
     return 1
@@ -1095,15 +1128,46 @@ status_context_fast_path_blocked_by_comment() {
       # the fast-path so the wait keeps polling (and re-invokes `resume`)
       # instead of false-clearing over a paused review.
       comment_id=$(echo "$latest" | jq -r '.id')
-      comment_fresh_at=$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at')
       comment_created_at=$(echo "$latest" | jq -r '.created_at // .fresh_at // .updated_at')
+      comment_fresh_at=$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at')
       comment_body=$(echo "$latest" | jq -r '.body')
       if printf '%s' "$comment_body" | grep -Fq "$HEAD_SHA"; then
-        if iso_on_or_after "$comment_fresh_at" "$status_created_at"; then
-          log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class explicitly references current HEAD $HEAD_SHA and fresh_at=$comment_fresh_at is not older than status_created=$status_created_at"
+        # #596: a HEAD-referencing rate_limit/paused/in_progress notice means
+        # CodeRabbit has not (yet) completed a review of this HEAD. CodeRabbit
+        # nonetheless flips its commit StatusContext to success while
+        # rate-limited, ~1s AFTER posting the notice, so the previous
+        # `iso_on_or_after comment_fresh_at status_created_at` gate treated that
+        # 1s-newer success as authoritative and false-cleared (the #595 dogfood:
+        # notice @07:49:36, status success @07:49:37, zero review). Distinguish
+        # by latency rather than raw ordering: SUPPRESS a success that landed
+        # within an effective grace window of the notice; TRUST a success that
+        # postdates it by more (a genuine later re-review, which per #221 can be
+        # silent, i.e. flip the status with no new summary comment).
+        #
+        # The effective grace is the base near-simultaneous-flip window
+        # (STATUS_SUCCESS_GRACE_SECONDS), WIDENED to CodeRabbit's own published
+        # wait window when the notice carries one. A rate-limit notice ("Next
+        # review available in: N minutes") promises no review before
+        # comment_created + N, so a success anywhere inside that window cannot be
+        # a completed review no matter how far past the base grace it lands
+        # (#599 Codex P2: with a fixed 120s grace, a success at 121s but still
+        # mid-13-minute-window would false-clear). paused/in_progress notices
+        # carry no parseable window, so they keep the base grace. The
+        # RATE_LIMIT_BUFFER_SECONDS margin mirrors the retry-sleep path.
+        local effective_grace=$STATUS_SUCCESS_GRACE_SECONDS
+        local published_window
+        published_window=$(parse_rate_limit_window "$comment_body" || echo "")
+        if [ -n "$published_window" ]; then
+          local windowed=$((published_window + RATE_LIMIT_BUFFER_SECONDS))
+          if [ "$windowed" -gt "$effective_grace" ]; then
+            effective_grace=$windowed
+          fi
+        fi
+        if iso_within_seconds_after "$comment_fresh_at" "$status_created_at" "$effective_grace"; then
+          log "StatusContext success ignored because latest CodeRabbit comment id=$comment_id class=$class references current HEAD $HEAD_SHA and the success (status_created=$status_created_at) is within the ${effective_grace}s window after the notice (fresh_at=$comment_fresh_at) — CodeRabbit has not completed a review of this HEAD (near-simultaneous rate-limit status flip, or a success still inside the published wait window)"
           return 0
         fi
-        log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class explicitly references current HEAD $HEAD_SHA but fresh_at=$comment_fresh_at is older than status_created=$status_created_at"
+        log "StatusContext success remains authoritative: it postdates the HEAD-referencing $class notice id=$comment_id ($HEAD_SHA) by more than ${effective_grace}s (fresh_at=$comment_fresh_at, status_created=$status_created_at) — a genuine later re-review of the current HEAD"
         return 1
       fi
       # #446: a rate_limit/paused/in_progress comment POSTED (created) at/after

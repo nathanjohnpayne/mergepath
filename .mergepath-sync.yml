@@ -539,6 +539,14 @@ paths:
   - path: tests/test_coderabbit_automerge_rate_limit_gate.sh
     type: canonical
     consumers: all
+  # #596 StatusContext rate-limit false-clear suite. Hard-required (exit 1 if
+  # missing) by scripts/ci/check_coderabbit_wait, so it must travel to every
+  # consumer. Locks that a rate-limited CodeRabbit's near-simultaneous
+  # StatusContext=success does NOT false-clear the fast-path (the #595 case),
+  # while a genuinely later success still clears.
+  - path: tests/test_coderabbit_wait_statuscontext_ratelimit.sh
+    type: canonical
+    consumers: all
   # Pairs with scripts/workflow/verify-propagation-pr.sh (under the
   # scripts/workflow/ kit below). The verifier is security-load-bearing
   # for the propagation-PR review lane; its test travels with it so a
