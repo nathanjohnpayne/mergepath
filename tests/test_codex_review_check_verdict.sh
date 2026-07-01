@@ -67,8 +67,10 @@ fi
 #      (any disposition) is carried into the Phase 4b substitute freshness guard.
 if grep -q "CODEX_HEAD_VERDICT_ANY_TIME" "$SCRIPT" \
    && grep -q "max_by(.created_at)" "$SCRIPT" \
+   && grep -qF '(?im)^' "$SCRIPT" \
+   && grep -qi "codex review:" "$SCRIPT" \
    && grep -q "#608" "$SCRIPT"; then
-  pass "codex-review-check.sh selects latest verdict first then requires affirmative, and folds the any-verdict timestamp into the Phase 4b guard (#608 P1/P2)"
+  pass "codex-review-check.sh selects latest verdict first, anchors the affirmative match to the Codex verdict header, and folds the any-verdict timestamp into the Phase 4b guard (#608 P1/P2/CR-Major)"
 else
   fail "codex-review-check.sh is missing the latest-verdict-first restructure (max_by / CODEX_HEAD_VERDICT_ANY_TIME / #608)"
 fi
@@ -97,7 +99,7 @@ LATEST_HEAD_VERDICT='
         | select( ($shas | length) > 0
                   and ($shas | any(. as $s | $head | startswith($s))) )
         | { created_at: .created_at,
-            affirmative: (.body | test("(?i)didn.?t find any major issues")) }
+            affirmative: (.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")) }
       ]
     | max_by(.created_at) // null'
 VERDICT_FILTER="$LATEST_HEAD_VERDICT"'
@@ -152,21 +154,21 @@ Reviewed commit: d05ff4d0" "2026-07-01T10:00:00Z")"
 # 4f. accept: full 40-char sha (exact match is a prefix of itself).
 check_case "full 40-char Reviewed-commit sha → clears" \
   "2026-07-01T11:00:00Z" \
-  "$(mk "$BOT" "Didn't find any major issues.
+  "$(mk "$BOT" "Codex Review: Didn't find any major issues.
 Reviewed commit: $HEAD" "2026-07-01T11:00:00Z")"
 
 # 4g. accept: apostrophe-less 'Didnt' + backticked sha.
 check_case "apostrophe-less 'Didnt' + backticked sha → clears" \
   "2026-07-01T09:00:00Z" \
-  "$(mk "$BOT" "Didnt find any major issues.
+  "$(mk "$BOT" "Codex Review: Didnt find any major issues.
 Reviewed commit: \`d05ff4d0e\`" "2026-07-01T09:00:00Z")"
 
 # 4h. latest-wins: two qualifying comments → max(created_at).
 check_case "two qualifying verdicts → picks the latest created_at" \
   "2026-07-01T12:00:00Z" \
   "$(jq -n --arg bot "$BOT" --arg h "$HEAD" '[
-     {user:{login:$bot},body:("Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0"),created_at:"2026-07-01T10:00:00Z"},
-     {user:{login:$bot},body:("Didn'"'"'t find any major issues. Keep them coming!\nReviewed commit: d05ff4d0e"),created_at:"2026-07-01T12:00:00Z"}
+     {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0"),created_at:"2026-07-01T10:00:00Z"},
+     {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues. Keep them coming!\nReviewed commit: d05ff4d0e"),created_at:"2026-07-01T12:00:00Z"}
    ]')"
 
 # 4i. P1 (#608) latest-wins fail-closed: older AFFIRMATIVE then a NEWER
@@ -198,6 +200,25 @@ if [ "$GOT_ANY" = "2026-07-01T12:00:00Z" ]; then
 else
   fail "verdict ANY-timestamp: expected 2026-07-01T12:00:00Z, got '$GOT_ANY'"
 fi
+
+# 4l. CodeRabbit Major (#608): a HEAD-anchored NEGATIVE verdict that QUOTES a
+#     prior affirmative (blockquote) must NOT read as affirmative — the match is
+#     anchored to the "Codex Review:" header line, so quoted text is ignored.
+check_case "negative verdict quoting an affirmative (blockquote) → clearance empty (anchored, #608)" \
+  "" \
+  "$(mk "$BOT" "Codex Review: Found 2 issues to address.
+
+> Codex Review: Didn't find any major issues
+
+Reviewed commit: d05ff4d0" "2026-07-01T13:00:00Z")"
+
+# 4m. accept: a genuine affirmative whose body has a leading preamble line, with
+#     the "Codex Review:" verdict header on its own line (multiline anchor).
+check_case "affirmative header on a later line (multiline anchor) → clears" \
+  "2026-07-01T14:00:00Z" \
+  "$(mk "$BOT" "Here are some automated review suggestions.
+Codex Review: Didn't find any major issues.
+Reviewed commit: d05ff4d0" "2026-07-01T14:00:00Z")"
 
 # ── 5. Gate (c) fail-closed cross-check: the verdict clears ONLY when there
 #      are zero unaddressed P0/P1 findings on HEAD. Model the exact shell

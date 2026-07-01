@@ -814,10 +814,16 @@ if [ "$CODEX_ENABLED" = "true" ]; then
             ] ) as $shas
         | select( ($shas | length) > 0
                   and ($shas | any(. as $s | $head | startswith($s))) )
-        # affirmative = Codex stable phrasing (case-insensitive; the .? in
-        # didn.?t tolerates a straight, absent, or typographic apostrophe).
+        # affirmative ONLY when the Codex verdict HEADER line is the clean
+        # verdict — anchored to a line starting with "codex review:" then the
+        # no-major-issues phrase (multiline, case-insensitive; .? tolerates a
+        # straight, absent, or typographic apostrophe). Matching the phrase
+        # ANYWHERE would let a NEGATIVE or unrecognized verdict that QUOTES
+        # prior affirmative text (e.g. a blockquote of an earlier clean
+        # verdict) read as affirmative and break fail-closed (CodeRabbit Major
+        # on #608). Real Codex verdicts always lead with that header line.
         | { created_at: .created_at,
-            affirmative: (.body | test("(?i)didn.?t find any major issues")) }
+            affirmative: (.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")) }
       ]
     | max_by(.created_at) // null
   ')
