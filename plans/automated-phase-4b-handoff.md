@@ -237,8 +237,9 @@ git diff "origin/${BASE}...${HEAD_SHA}" \
 - `--output-schema <file>` forces the final response to conform to a JSON Schema (`{verdict, findings[]}`), which the orchestrator parses deterministically—this is how we recover a review *state* the CLI does not natively emit.
 - `-o, --output-last-message <file>` writes the final message to a file (and stdout) for capture.
 - Auth is the operator's persisted ChatGPT/Codex plan login via `codex login`.
-  The adapter deliberately scrubs `OPENAI_API_KEY` / `CODEX_API_KEY` before
-  launching the CLI, so a stray metered API key cannot become the billing path.
+  The adapter launches Codex under a tightly allowlisted child environment, so
+  a stray metered API key, GitHub token, deploy/cloud credential, or SSH agent
+  socket cannot become available to prompt-injected review commands.
 
 The orchestrator then posts the verdict as a GitHub review under the reviewer PAT
 (never from inside the sandboxed CLI), using the pull-review API so the created
@@ -300,9 +301,10 @@ claude -p "$PROMPT_WITH_VERDICT_SCHEMA" \
 - `--allowedTools` scopes the run to reads and read-only git; no write tools are granted, so the CLI cannot mutate the repo or the PR.
 - `--output-format json` yields a structured result (result text, `session_id`, cost) for the orchestrator to parse ([headless mode](https://code.claude.com/docs/en/headless)).
 - Headless auth uses the operator's Claude Code subscription login, preserving
-  `CLAUDE_CODE_OAUTH_TOKEN` when present. The adapter deliberately scrubs
-  `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` before launching the CLI, so a
-  stray metered API token cannot become the billing path.
+  `CLAUDE_CODE_OAUTH_TOKEN` when present. The adapter launches Claude under a
+  tightly allowlisted child environment, so a stray metered API token, GitHub
+  token, deploy/cloud credential, or SSH agent socket cannot become available
+  to prompt-injected review commands.
 
 As in Direction A, attribution is the orchestrator's job:
 
@@ -321,7 +323,7 @@ GH_AS_REVIEWER_IDENTITY=nathanpayne-claude \
 | Read-only posture | `--sandbox read-only` (also the default) + `--ask-for-approval never` | `--permission-mode plan` + scoped `--allowedTools` |
 | Output capture | `--json` (JSONL events) and `-o/--output-last-message <file>` | `--output-format json` (`result`, `session_id`, cost) |
 | Structured output | `--output-schema <file>` (schema-validated final message) | System-prompt-shaped + JSON parse |
-| LLM auth (reasoning plane) | `codex login` / ChatGPT plan login; API-key env vars scrubbed | Claude Code subscription login / `CLAUDE_CODE_OAUTH_TOKEN`; API-key env vars scrubbed |
+| LLM auth (reasoning plane) | `codex login` / ChatGPT plan login; child env allowlist excludes API keys and ambient credentials | Claude Code subscription login / `CLAUDE_CODE_OAUTH_TOKEN`; child env allowlist excludes API keys and ambient credentials |
 | GitHub auth (attribution plane) | `nathanpayne-codex` PAT via `gh-as-reviewer.sh` | `nathanpayne-claude` PAT via `gh-as-reviewer.sh` |
 | Session continuation | `codex exec resume --last "..."` | `--resume <id>` / `--continue` / `--session-id` |
 | CI option (deferred) | `openai/codex-action@v1` | `anthropics/claude-code-action` |
@@ -376,8 +378,8 @@ routes to the existing manual handoff via `scripts/post-phase-4b-handoff.sh`.
 There are two independent authentication planes, and conflating them is the main
 footgun:
 
-1. **Reasoning plane (LLM provider).** The reviewer CLI authenticates to OpenAI or Anthropic to think, on the operator's **individual subscription plan** — Codex via `codex login` (ChatGPT account, `~/.codex/auth.json` with `auth_mode=chatgpt`); Claude via its subscription login (`claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`, or the OS keychain, with `claude auth status --json` reporting `apiProvider=firstParty` and either `authMethod=claude.ai` plus a `subscriptionType`, or `authMethod=oauth_token` for the headless subscription-token path). **Plan-only billing is enforced, not assumed:** the adapters reject persisted API-key auth modes and also scrub the pay-per-token API-key env vars (`OPENAI_API_KEY`/`CODEX_API_KEY` for Codex; `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` for Claude) from the CLI invocation, so neither a configured API-key login nor a stray env key can silently divert a handoff review to metered API billing. If the CLI is not plan-logged-in, the read-only call fails and the orchestrator falls back to the manual handoff (fail-closed) — it never bills the API.
-2. **Attribution plane (GitHub).** The review must be posted as `nathanpayne-codex` / `nathanpayne-claude` using the reviewer PAT through `scripts/gh-as-reviewer.sh`, which verifies the effective token identity before the write (`REVIEW_POLICY.md` § PAT lookup table; Operation-to-Identity Matrix). GitHub tokens stay in the parent orchestrator process only; the reviewer CLI child process also runs with `GH_TOKEN`, `GITHUB_TOKEN`, enterprise GitHub token vars, and the cached `OP_PREFLIGHT_*_PAT` vars scrubbed so prompt-injected diffs cannot use the reasoning CLI to bypass the verified wrapper. Before the final GitHub write, the orchestrator sets `GH_AS_REVIEWER_IDENTITY` and clears a stale `OP_PREFLIGHT_REVIEWER_PAT` from the authoring agent session so `gh-as-reviewer.sh` resolves and verifies the selected external reviewer rather than the current agent.
+1. **Reasoning plane (LLM provider).** The reviewer CLI authenticates to OpenAI or Anthropic to think, on the operator's **individual subscription plan** — Codex via `codex login` (ChatGPT account, `~/.codex/auth.json` with `auth_mode=chatgpt`); Claude via its subscription login (`claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`, or the OS keychain, with `claude auth status --json` reporting `apiProvider=firstParty` and either `authMethod=claude.ai` plus a `subscriptionType`, or `authMethod=oauth_token` for the headless subscription-token path). **Plan-only billing is enforced, not assumed:** the adapters reject persisted API-key auth modes and launch the reviewer CLI under an allowlisted environment, so neither a configured API-key login nor a stray env key can silently divert a handoff review to metered API billing. If the CLI is not plan-logged-in, the read-only call fails and the orchestrator falls back to the manual handoff (fail-closed) — it never bills the API.
+2. **Attribution plane (GitHub).** The review must be posted as `nathanpayne-codex` / `nathanpayne-claude` using the reviewer PAT through `scripts/gh-as-reviewer.sh`, which verifies the effective token identity before the write (`REVIEW_POLICY.md` § PAT lookup table; Operation-to-Identity Matrix). GitHub tokens stay in the parent orchestrator process only; the reviewer CLI child process receives only a minimal allowlist (`PATH`, `HOME`, locale/tmp basics, and `CODEX_HOME` or `CLAUDE_CODE_OAUTH_TOKEN` when needed), so prompt-injected diffs cannot use the reasoning CLI to read GitHub tokens, deploy/cloud credentials, or SSH-agent state from the parent session. Before the final GitHub write, the orchestrator sets `GH_AS_REVIEWER_IDENTITY` and clears a stale `OP_PREFLIGHT_REVIEWER_PAT` from the authoring agent session so `gh-as-reviewer.sh` resolves and verifies the selected external reviewer rather than the current agent.
 
 Because the sandboxed/plan-mode CLI runs read-only, it **cannot** post the GitHub
 review itself; the orchestrator does, on the reasoning plane's behalf. This is a
@@ -411,11 +413,12 @@ phase_4b_automation:
 The reference implementation ships this exact block (disabled) in
 `.github/review-policy.yml`. A flat top-level key is used rather than a nested
 `phase_4b.automation` to avoid colliding with the existing `phase_4b_default`
-scalar and to keep the awk policy reader shallow. Adapter-level knobs (Codex
-sandbox/model, Claude permission-mode/model/allowed-tools) are read from
-environment variables / flags with safe defaults in the reference
-(`P4B_CODEX_MODEL`, `P4B_CLAUDE_PERMISSION_MODE`, etc.); promoting them into the
-YAML block is a follow-up. The block is additive and does not alter the existing
+scalar and to keep the awk policy reader shallow. Non-security adapter knobs
+(for example reviewer model and timeout) are read from environment variables /
+flags with safe defaults in the reference; read-only sandbox, permission mode,
+and allowed tools are pinned in code and cannot be widened by env override.
+Promoting safe knobs into the YAML block is a follow-up. The block is additive
+and does not alter the existing
 `codex:`, `dependabot:`, or top-level keys the merge gate reads.
 
 ## 13. New and changed components
@@ -442,11 +445,11 @@ YAML block is a follow-up. The block is additive and does not alter the existing
 ## 14. Security considerations
 
 - **Prompt injection via PR diff.** A hostile diff could try to steer the reviewer CLI toward a spurious approval. Mitigations: the adapter runs read-only (Codex `--sandbox read-only`, Claude `--permission-mode plan`), so the CLI cannot act on injected instructions; the orchestrator—not the CLI—posts the review; and `fail_closed: true` means any non-conformant or ambiguous verdict routes to the manual handoff rather than `APPROVED`. Protected-path and threshold rules continue to apply upstream.
-- **GitHub-token isolation and pinned writes.** The reviewer CLI receives the diff but not GitHub token env vars. All GitHub write authority remains in the parent orchestrator and flows through `gh-as-reviewer.sh` after the current PR head is re-read. The write uses the pull-review API with `commit_id` set to the reviewed SHA, then verifies the created review response reports that same SHA, so prompt injection cannot convert reasoning-plane execution into a direct PR write or an unpinned approval.
+- **Credential isolation and pinned writes.** The reviewer CLI receives the diff but only a minimal allowlisted environment, excluding GitHub tokens, pay-per-token API keys, deploy/cloud credentials, and SSH-agent state. All GitHub write authority remains in the parent orchestrator and flows through `gh-as-reviewer.sh` after the current PR head is re-read. The write uses the pull-review API with `commit_id` set to the reviewed SHA, then verifies the created review response reports that same SHA, so prompt injection cannot convert reasoning-plane execution into a direct PR write or an unpinned approval.
 - **Hung reviewer CLI.** Auth, network, rate-limit, or tool hangs are bounded by adapter and CLI timeouts (`P4B_ADAPTER_TIMEOUT_SECONDS` / `P4B_REVIEW_CLI_TIMEOUT_SECONDS`, default `900`). Timeout is classified as an adapter error and falls back to the manual handoff instead of wedging the Phase 4b path.
 - **Auto-approve is now a real merge signal.** Because the posted `APPROVED` clears the gate, the bar for emitting it must be high: only an unambiguous, schema-conformant approval on the *current* HEAD. Never infer approval from a partial parse.
 - **Findings cannot clear the gate as an automated approval.** The shared verdict validator reads `feedback_policy` and rejects `APPROVED` responses that contain findings in any required severity tier before either adapter output or orchestrator output can be posted. The orchestrator then applies the stricter repository process rule: an `APPROVED` verdict with any remaining findings falls back to the manual handoff so the post-review issue path can be handled before a Phase 4b substitute approval clears merge gates. With no `feedback_policy` block, P0/P1 remain required and P2/P3 remain advisory for verdict validity; with `mode: address-all`, any finding is required.
-- **Credential blast radius.** New CLI credentials are scoped, resolved via `op-preflight`, and never exported as job-level env around repo-controlled code (Codex docs' explicit warning). The adapters additionally **scrub the pay-per-token API-key env vars** (§ 11) so review reasoning runs only on the operator's subscription-plan login. Reviewer PATs keep their existing minimal scope; the GitHub write still flows through the token-verifying `gh-as-reviewer.sh`.
+- **Credential blast radius.** New CLI credentials are scoped, resolved via `op-preflight`, and never exported as job-level env around repo-controlled code (Codex docs' explicit warning). The adapters additionally use a child-process environment allowlist (§ 11) so review reasoning runs only on the operator's subscription-plan login and cannot inspect ambient deploy/cloud credentials from the parent session. Reviewer PATs keep their existing minimal scope; the GitHub write still flows through the token-verifying `gh-as-reviewer.sh`.
 - **Attribution integrity.** The two-plane split (§ 11) guarantees the review byline is the verified reviewer identity, not the CLI's ambient token.
 - **Audit metadata.** The posted review body records the reviewed head SHA, reviewer identity, adapter, adapter run count, timeout, and token usage when the CLI exposes a reliable count. If a CLI does not expose usage, the body says so explicitly; adapters must not ask the model to estimate its own token usage.
 
@@ -475,7 +478,7 @@ YAML block is a follow-up. The block is additive and does not alter the existing
 - **Outer loop persistence.** If a follow-up wants fully automatic re-run loops, persist and enforce `max_review_rounds` outside the one-pass helper so runaway review cycles still escalate cleanly.
 - **Cursor reviewer.** Worth a third adapter now, or defer until the interface stabilizes?
 - **Latency budget — initial default.** Headless reviewer CLI execution is bounded at 900 seconds by default (`P4B_ADAPTER_TIMEOUT_SECONDS` / `P4B_REVIEW_CLI_TIMEOUT_SECONDS`) before manual fallback. Tune this after observing live wall-clock behavior across several 4b reviews.
-- **Billing model — resolved.** Reviewer CLIs run on the operator's individual subscription plans, never the pay-per-token API. Enforced in the adapters by rejecting persisted API-key auth modes (`auth_mode != chatgpt` for Codex; Claude auth status must be `apiProvider=firstParty` with `authMethod=claude.ai` plus a subscription type, or `authMethod=oauth_token`) and by scrubbing `OPENAI_API_KEY`/`CODEX_API_KEY` (Codex) and `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` (Claude) before the CLI call. Both paths are covered by `tests/test_phase_4b_automation.sh`. A configurable API-billing mode — for a CI or org runner that has no plan login — is a deferred follow-up, not part of this reference.
+- **Billing model — resolved.** Reviewer CLIs run on the operator's individual subscription plans, never the pay-per-token API. Enforced in the adapters by rejecting persisted API-key auth modes (`auth_mode != chatgpt` for Codex; Claude auth status must be `apiProvider=firstParty` with `authMethod=claude.ai` plus a subscription type, or `authMethod=oauth_token`) and by launching the child CLI under an allowlisted environment that excludes API-key env vars and ambient credentials. Both paths are covered by `tests/test_phase_4b_automation.sh`. A configurable API-billing mode — for a CI or org runner that has no plan login — is a deferred follow-up, not part of this reference.
 
 ## 18. References
 

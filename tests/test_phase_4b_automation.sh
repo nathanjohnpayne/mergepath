@@ -105,6 +105,16 @@ phase_4b_automation:
   mode: local
 YAML
 
+POLICY_STALE_DEFAULT="$WORK/policy-stale-default.yml"
+cat > "$POLICY_STALE_DEFAULT" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+  enabled: true
+  mode: local
+YAML
+
 POLICY_BAD_FEEDBACK="$WORK/policy-bad-feedback.yml"
 cat > "$POLICY_BAD_FEEDBACK" <<'YAML'
 available_reviewers:
@@ -175,7 +185,7 @@ mk_fake fake-claude-approve-usage \
 mk_fake fake-claude-junk \
   "jq -n '{type:\"result\",result:\"no json here\",session_id:\"t\"}'"
 
-# key-leak canaries: exit non-zero if the adapter did NOT scrub the
+# key-leak canaries: exit non-zero if the adapter child env allowlist includes
 # pay-per-token API-key env vars (proves plan-only billing enforcement).
 # The verdict JSON is printed raw; both adapters accept that shape.
 mk_fake fake-codex-keyleak \
@@ -190,6 +200,37 @@ printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[
 mk_fake fake-claude-gh-token-leak \
   "if [ -n \"\${GH_TOKEN:-}\${GITHUB_TOKEN:-}\${GH_ENTERPRISE_TOKEN:-}\${GITHUB_ENTERPRISE_TOKEN:-}\${OP_PREFLIGHT_REVIEWER_PAT:-}\${OP_PREFLIGHT_AUTHOR_PAT:-}\" ]; then echo GH-TOKEN-LEAKED >&2; exit 7; fi
 printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"ok\",\"findings\":[]}'"
+mk_fake fake-codex-secret-leak \
+  "if [ -n \"\${GOOGLE_APPLICATION_CREDENTIALS:-}\${CF_API_TOKEN:-}\${CLOUDFLARE_API_TOKEN:-}\${OP_PREFLIGHT_ADC_TMPFILE:-}\${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}\${SSH_AUTH_SOCK:-}\${AWS_ACCESS_KEY_ID:-}\${AZURE_CLIENT_SECRET:-}\${FIREBASE_TOKEN:-}\" ]; then echo SECRET-ENV-LEAKED >&2; exit 7; fi
+printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[]}'"
+mk_fake fake-claude-secret-leak \
+  "if [ -n \"\${GOOGLE_APPLICATION_CREDENTIALS:-}\${CF_API_TOKEN:-}\${CLOUDFLARE_API_TOKEN:-}\${OP_PREFLIGHT_ADC_TMPFILE:-}\${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}\${SSH_AUTH_SOCK:-}\${AWS_ACCESS_KEY_ID:-}\${AZURE_CLIENT_SECRET:-}\${FIREBASE_TOKEN:-}\" ]; then echo SECRET-ENV-LEAKED >&2; exit 7; fi
+printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"ok\",\"findings\":[]}'"
+mk_fake fake-codex-sandbox \
+  "shift 3
+while [ \"\$#\" -gt 0 ]; do
+  if [ \"\$1\" = '--sandbox' ]; then
+    [ \"\${2:-}\" = 'read-only' ] || { echo BAD-SANDBOX >&2; exit 8; }
+    printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[]}'
+    exit 0
+  fi
+  shift
+done
+echo MISSING-SANDBOX >&2
+exit 8"
+mk_fake fake-claude-readonly \
+  "permission=''
+tools=''
+while [ \"\$#\" -gt 0 ]; do
+  case \"\$1\" in
+    --permission-mode) permission=\"\${2:-}\"; shift 2 ;;
+    --allowedTools) tools=\"\${2:-}\"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ \"\$permission\" = 'plan' ] || { echo BAD-PERMISSION-MODE >&2; exit 8; }
+[ \"\$tools\" = 'Read,Bash(git diff *),Bash(git log *)' ] || { echo BAD-ALLOWED-TOOLS >&2; exit 8; }
+jq -n --arg r '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[]}' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\"}'"
 mk_fake fake-codex-sleep \
   "sleep 5
 printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"too late\",\"findings\":[]}'"
@@ -272,6 +313,12 @@ export MERGEPATH_REVIEW_POLICY_PATH="$POLICY_CURSOR_FIRST"
 r="$(p4b_select_reviewer codex || true)"
 [ "$r" = "nathanpayne-claude" ] && pass "author=codex skips unsupported reviewer when a supported adapter exists" \
   || fail "cursor-first author=codex -> '$r' (expected nathanpayne-claude)"
+export MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON"
+
+export MERGEPATH_REVIEW_POLICY_PATH="$POLICY_STALE_DEFAULT"
+r="$(p4b_select_reviewer cursor || true)"
+[ "$r" = "nathanpayne-claude" ] && pass "stale default_external_reviewer is ignored unless listed in available_reviewers" \
+  || fail "stale-default author=cursor -> '$r' (expected nathanpayne-claude)"
 export MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON"
 
 r="$(p4b_select_reviewer cursor || true)"
@@ -376,16 +423,16 @@ set -e
   || fail "claude adapter junk should exit 4 (got $rc)"
 
 # ===========================================================================
-echo "adapters — plan-only billing (API keys scrubbed before the CLI runs)"
+echo "adapters — plan-only billing (child env allowlist before the CLI runs)"
 # ===========================================================================
 # If the adapter forwarded OPENAI_API_KEY/CODEX_API_KEY the fake exits 7
-# and the adapter reports rc 4; a clean APPROVED proves the keys were scrubbed.
+# and the adapter reports rc 4; a clean APPROVED proves the keys were excluded.
 set +e
 out="$(OPENAI_API_KEY=sk-should-scrub CODEX_API_KEY=sk-should-scrub \
   CODEX_BIN="$BIN/fake-codex-keyleak" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
-  pass "codex adapter scrubs OPENAI_API_KEY/CODEX_API_KEY (plan-only billing)"
+  pass "codex adapter excludes OPENAI_API_KEY/CODEX_API_KEY (plan-only billing)"
 else fail "codex adapter leaked an API key to the CLI (rc=$rc, out=$out)"; fi
 
 set +e
@@ -393,7 +440,7 @@ out="$(ANTHROPIC_API_KEY=sk-should-scrub ANTHROPIC_AUTH_TOKEN=tok-should-scrub \
   CLAUDE_BIN="$BIN/fake-claude-keyleak" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
-  pass "claude adapter scrubs ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN (plan-only billing)"
+  pass "claude adapter excludes ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN (plan-only billing)"
 else fail "claude adapter leaked an API key to the CLI (rc=$rc, out=$out)"; fi
 
 set +e
@@ -427,7 +474,7 @@ out="$(GH_TOKEN=ghp-reviewer GITHUB_TOKEN=ghp-actions GH_ENTERPRISE_TOKEN=ghp-en
   CODEX_BIN="$BIN/fake-codex-gh-token-leak" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
-  pass "codex adapter scrubs GitHub token env before reviewer CLI"
+  pass "codex adapter excludes GitHub token env before reviewer CLI"
 else fail "codex adapter leaked a GitHub token to the CLI (rc=$rc, out=$out)"; fi
 
 set +e
@@ -436,8 +483,44 @@ out="$(GH_TOKEN=ghp-reviewer GITHUB_TOKEN=ghp-actions GH_ENTERPRISE_TOKEN=ghp-en
   CLAUDE_BIN="$BIN/fake-claude-gh-token-leak" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
-  pass "claude adapter scrubs GitHub token env before reviewer CLI"
+  pass "claude adapter excludes GitHub token env before reviewer CLI"
 else fail "claude adapter leaked a GitHub token to the CLI (rc=$rc, out=$out)"; fi
+
+set +e
+out="$(GOOGLE_APPLICATION_CREDENTIALS=/tmp/adc.json CF_API_TOKEN=cf-token CLOUDFLARE_API_TOKEN=cf-token2 \
+  OP_PREFLIGHT_ADC_TMPFILE=/tmp/adc OP_PREFLIGHT_FIREBASE_SA_TMPFILE=/tmp/firebase SSH_AUTH_SOCK=/tmp/ssh.sock \
+  AWS_ACCESS_KEY_ID=aws-key AZURE_CLIENT_SECRET=azure-secret FIREBASE_TOKEN=firebase-token \
+  CODEX_BIN="$BIN/fake-codex-secret-leak" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
+  pass "codex adapter allowlists child env and strips deploy/cloud credentials"
+else fail "codex adapter leaked deploy/cloud credential env to CLI (rc=$rc, out=$out)"; fi
+
+set +e
+out="$(GOOGLE_APPLICATION_CREDENTIALS=/tmp/adc.json CF_API_TOKEN=cf-token CLOUDFLARE_API_TOKEN=cf-token2 \
+  OP_PREFLIGHT_ADC_TMPFILE=/tmp/adc OP_PREFLIGHT_FIREBASE_SA_TMPFILE=/tmp/firebase SSH_AUTH_SOCK=/tmp/ssh.sock \
+  AWS_ACCESS_KEY_ID=aws-key AZURE_CLIENT_SECRET=azure-secret FIREBASE_TOKEN=firebase-token \
+  CLAUDE_CODE_OAUTH_TOKEN=oauth-ok CLAUDE_BIN="$BIN/fake-claude-secret-leak" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
+  pass "claude adapter allowlists child env and strips deploy/cloud credentials"
+else fail "claude adapter leaked deploy/cloud credential env to CLI (rc=$rc, out=$out)"; fi
+
+set +e
+out="$(P4B_CODEX_SANDBOX=danger-full-access CODEX_BIN="$BIN/fake-codex-sandbox" \
+  bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
+  pass "codex adapter pins sandbox to read-only despite env override"
+else fail "codex adapter honored unsafe sandbox override (rc=$rc, out=$out)"; fi
+
+set +e
+out="$(P4B_CLAUDE_PERMISSION_MODE=bypassPermissions P4B_CLAUDE_ALLOWED_TOOLS='Write,Bash(rm *)' \
+  CLAUDE_BIN="$BIN/fake-claude-readonly" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
+  pass "claude adapter pins permission mode/tools to read-only despite env override"
+else fail "claude adapter honored unsafe permission/tool override (rc=$rc, out=$out)"; fi
 
 # Bounded execution: hung auth/network/model calls fail closed to manual
 # handoff instead of wedging the Phase 4b path.

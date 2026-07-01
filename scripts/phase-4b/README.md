@@ -45,26 +45,28 @@ phase-4b-classifier.sh (is 4b needed?) ─▶ phase-4b-review.sh
 - **Runtime:** `bash` (3.2+), `jq`, `gh`, `git`, and the reviewer CLI
   (`codex` and/or `claude`) on `PATH`.
 - **Reasoning-plane auth (per direction) — subscription plan only:** the
-  adapters verify the persisted CLI auth mode before launch and also scrub
-  pay-per-token API-key env vars (`OPENAI_API_KEY`/`CODEX_API_KEY` for Codex;
-  `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` for Claude). Codex must report
+  adapters verify the persisted CLI auth mode before launch and run the
+  reviewer CLI under a tightly allowlisted child environment. Codex must report
   `auth_mode=chatgpt`; Claude must report `apiProvider=firstParty` with either
   `authMethod=claude.ai` plus a `subscriptionType`, or
   `authMethod=oauth_token` for a headless Claude Code subscription token.
   Reasoning therefore bills against the operator's **individual plan**, never
-  the metered API.
+  the metered API. API-key env vars, GitHub tokens, deploy/cloud credentials,
+  and SSH-agent state are not inherited by the child CLI.
   Log in once per direction: Codex via `codex login` (ChatGPT account);
   Claude via its subscription login or `claude setup-token`
   (`CLAUDE_CODE_OAUTH_TOKEN`, which is preserved). If the CLI is not
   plan-logged-in, the read-only call fails and the orchestrator falls back to
   the manual handoff (fail-closed) — it never uses the API.
-- **GitHub-token isolation:** the reviewer CLI child process also runs with
-  GitHub token env vars scrubbed (`GH_TOKEN`, `GITHUB_TOKEN`,
-  `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, and the cached
-  `OP_PREFLIGHT_*_PAT` vars). Only the parent orchestrator keeps the reviewer
-  PAT, and only for the final `gh-as-reviewer.sh` write after the head SHA is
-  re-read. The write uses the pull-review API with `commit_id` set to the
-  reviewed SHA and verifies the created review response is pinned to that SHA.
+- **Child-process credential isolation:** the reviewer CLI child process is
+  launched with an allowlisted environment (`PATH`, `HOME`, locale/tmp basics,
+  plus `CODEX_HOME` or `CLAUDE_CODE_OAUTH_TOKEN` only when needed). It does not
+  inherit GitHub tokens, pay-per-token API keys, deploy/cloud credentials, or
+  SSH agent state from the parent session. Only the parent orchestrator keeps
+  the reviewer PAT, and only for the final `gh-as-reviewer.sh` write after the
+  head SHA is re-read. The write uses the pull-review API with `commit_id` set
+  to the reviewed SHA and verifies the created review response is pinned to
+  that SHA.
 - **Timeouts:** adapter execution and the underlying reviewer CLI are bounded
   by `P4B_ADAPTER_TIMEOUT_SECONDS` / `P4B_REVIEW_CLI_TIMEOUT_SECONDS`
   (default `900`). A timeout exits through the same fail-closed manual handoff

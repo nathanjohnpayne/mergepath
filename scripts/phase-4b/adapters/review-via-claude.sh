@@ -33,15 +33,16 @@
 #               `claude auth status --json` to report apiProvider=firstParty
 #               with authMethod=claude.ai plus subscriptionType, or
 #               authMethod=oauth_token for the headless subscription token.
-#               It also runs the CLI with ANTHROPIC_API_KEY and
-#               ANTHROPIC_AUTH_TOKEN SCRUBBED (env -u), so review reasoning
-#               bills against the operator's Claude Code PLAN, never the
-#               pay-per-token API. CLAUDE_CODE_OAUTH_TOKEN (the subscription
-#               headless token) is PRESERVED. If claude is not logged in on a
-#               plan the read-only call fails and the orchestrator falls back
-#               to the manual handoff (fail-closed).
-#   P4B_CLAUDE_PERMISSION_MODE  default: plan (read-only).
-#   P4B_CLAUDE_ALLOWED_TOOLS    default: "Read,Bash(git diff *),Bash(git log *)".
+#               It also runs the CLI with a tightly allowlisted environment,
+#               so review reasoning bills against the operator's Claude Code
+#               PLAN, never the pay-per-token API, and prompt-injected diffs
+#               cannot read ambient GitHub/deploy/cloud credential env vars.
+#               CLAUDE_CODE_OAUTH_TOKEN (the subscription headless token) is
+#               PRESERVED. If claude is not logged in on a plan the read-only
+#               call fails and the orchestrator falls back to the manual
+#               handoff (fail-closed).
+#   Claude always runs with --permission-mode plan and read-only allowedTools.
+#   Environment overrides cannot widen the tool or permission posture.
 #   GH_TOKEN    only used if the diff must be fetched (no --diff-file).
 #   P4B_REVIEW_CLI_TIMEOUT_SECONDS  default: P4B_ADAPTER_TIMEOUT_SECONDS
 #               or 900. Timeout maps to exit 4 / manual fallback.
@@ -56,8 +57,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SCHEMA="$HERE/../verdict.schema.json"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
-PERMISSION_MODE="${P4B_CLAUDE_PERMISSION_MODE:-plan}"
-ALLOWED_TOOLS="${P4B_CLAUDE_ALLOWED_TOOLS:-Read,Bash(git diff *),Bash(git log *)}"
+PERMISSION_MODE=plan
+ALLOWED_TOOLS="Read,Bash(git diff *),Bash(git log *)"
 
 PR="" ; REPO="" ; HEAD="" ; DIFF_FILE="" ; MODEL="${P4B_CLAUDE_MODEL:-}"
 CLI_TIMEOUT="${P4B_REVIEW_CLI_TIMEOUT_SECONDS:-${P4B_ADAPTER_TIMEOUT_SECONDS:-900}}"
@@ -117,12 +118,22 @@ this pass, not just the first one.
 Set usage to null; the adapter will populate CLI usage metadata if the CLI
 exposes it. Do not edit files. Do not post anything to GitHub."
 
+SAFE_ENV=(env -i
+  "PATH=${PATH:-/usr/bin:/bin}"
+  "HOME=${HOME:-}"
+  "USER=${USER:-}"
+  "LOGNAME=${LOGNAME:-}"
+  "SHELL=${SHELL:-/bin/sh}"
+  "TMPDIR=${TMPDIR:-/tmp}"
+  "LANG=${LANG:-C}"
+  "TERM=${TERM:-dumb}"
+)
+[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && SAFE_ENV+=("CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
+
 set +e
 ENVELOPE="$(
-  printf '%s\n' "$DIFF" | p4b_run_with_timeout "$CLI_TIMEOUT" env \
-    -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
-    -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
-    -u OP_PREFLIGHT_REVIEWER_PAT -u OP_PREFLIGHT_AUTHOR_PAT \
+  printf '%s\n' "$DIFF" | p4b_run_with_timeout "$CLI_TIMEOUT" \
+    "${SAFE_ENV[@]}" \
     "$CLAUDE_BIN" -p "$PROMPT" \
     --permission-mode "$PERMISSION_MODE" \
     --output-format json \
@@ -135,7 +146,7 @@ if [ "$RC" -ne 0 ]; then
   if p4b_is_timeout_rc "$RC"; then
     p4b_die 4 "claude -p timed out after ${CLI_TIMEOUT}s — falling back to the manual handoff"
   fi
-  p4b_die 4 "claude -p failed (rc=$RC) — ensure claude is logged in on a plan (API keys are scrubbed for plan-only billing); falling back to the manual handoff"
+  p4b_die 4 "claude -p failed (rc=$RC) — ensure claude is logged in on a plan (child env is allowlisted for plan-only billing); falling back to the manual handoff"
 fi
 [ -n "$ENVELOPE" ] || p4b_die 4 "claude -p produced no output"
 

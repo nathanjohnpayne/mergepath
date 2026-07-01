@@ -25,10 +25,11 @@
 # Env:
 #   CODEX_BIN   codex executable (default: codex). Tests point this at a fake.
 #   codex login (subscription plan)   reasoning-plane auth. This adapter
-#               requires ~/.codex/auth.json auth_mode=chatgpt and also runs
-#               the CLI with OPENAI_API_KEY and CODEX_API_KEY SCRUBBED
-#               (env -u), so review reasoning bills against the operator's
-#               ChatGPT/Codex PLAN, never the pay-per-token API. A persisted
+#               requires ~/.codex/auth.json auth_mode=chatgpt and launches the
+#               CLI with a tightly allowlisted environment, so review reasoning
+#               bills against the operator's ChatGPT/Codex PLAN, never the
+#               pay-per-token API, and prompt-injected diffs cannot read
+#               ambient GitHub/deploy/cloud credential env vars. A persisted
 #               API-key login or a stray key in the environment can NOT divert
 #               a handoff to metered billing; the adapter exits 4 and the
 #               orchestrator falls back to the manual handoff (fail-closed).
@@ -57,7 +58,7 @@ SCHEMA="$HERE/../verdict.schema.json"
 CODEX_BIN="${CODEX_BIN:-codex}"
 
 PR="" ; REPO="" ; HEAD="" ; DIFF_FILE="" ; MODEL="${P4B_CODEX_MODEL:-}"
-SANDBOX="${P4B_CODEX_SANDBOX:-read-only}"
+SANDBOX=read-only
 CLI_TIMEOUT="${P4B_REVIEW_CLI_TIMEOUT_SECONDS:-${P4B_ADAPTER_TIMEOUT_SECONDS:-900}}"
 
 usage() {
@@ -119,12 +120,22 @@ ERR_OUT="$(mktemp "${TMPDIR:-/tmp}/p4b-codex-stderr.XXXXXX")"
 # shellcheck disable=SC2064
 trap "rm -f '$TMP_OUT' '$ERR_OUT'" EXIT
 
+SAFE_ENV=(env -i
+  "PATH=${PATH:-/usr/bin:/bin}"
+  "HOME=${HOME:-}"
+  "USER=${USER:-}"
+  "LOGNAME=${LOGNAME:-}"
+  "SHELL=${SHELL:-/bin/sh}"
+  "TMPDIR=${TMPDIR:-/tmp}"
+  "LANG=${LANG:-C}"
+  "TERM=${TERM:-dumb}"
+)
+[ -n "${CODEX_HOME:-}" ] && SAFE_ENV+=("CODEX_HOME=$CODEX_HOME")
+
 set +e
 RAW="$(
-  printf '%s\n' "$DIFF" | p4b_run_with_timeout "$CLI_TIMEOUT" env \
-    -u OPENAI_API_KEY -u CODEX_API_KEY \
-    -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
-    -u OP_PREFLIGHT_REVIEWER_PAT -u OP_PREFLIGHT_AUTHOR_PAT \
+  printf '%s\n' "$DIFF" | p4b_run_with_timeout "$CLI_TIMEOUT" \
+    "${SAFE_ENV[@]}" \
     "$CODEX_BIN" \
     --ask-for-approval never \
     exec \
@@ -140,7 +151,7 @@ if [ "$RC" -ne 0 ]; then
   if p4b_is_timeout_rc "$RC"; then
     p4b_die 4 "codex exec timed out after ${CLI_TIMEOUT}s — falling back to the manual handoff"
   fi
-  p4b_die 4 "codex exec failed (rc=$RC) — ensure 'codex login' is active on a plan (API keys are scrubbed for plan-only billing); falling back to the manual handoff"
+  p4b_die 4 "codex exec failed (rc=$RC) — ensure 'codex login' is active on a plan (child env is allowlisted for plan-only billing); falling back to the manual handoff"
 fi
 
 # Prefer the --output-last-message file; fall back to captured stdout.

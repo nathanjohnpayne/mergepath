@@ -247,6 +247,16 @@ p4b_adapter_supported_for_login() {
   [ -x "$(p4b_adapter_dir)/review-via-${adapter}.sh" ]
 }
 
+p4b_available_reviewer_contains() {
+  local needle="$1" r
+  while IFS= read -r r; do
+    [ "$r" = "$needle" ] && return 0
+  done <<EOF
+$(p4b_available_reviewers)
+EOF
+  return 1
+}
+
 # p4b_select_reviewer <author-agent-or-login>
 # Echo the external reviewer login: a member of available_reviewers whose
 # agent differs from the author and has a local adapter, preferring
@@ -257,7 +267,7 @@ p4b_select_reviewer() {
   author_agent="$(p4b_agent_of_login "$author_in")"
 
   default="$(p4b_top_field default_external_reviewer)"
-  if [ -n "$default" ]; then
+  if [ -n "$default" ] && p4b_available_reviewer_contains "$default"; then
     def_agent="$(p4b_agent_of_login "$default")"
     if [ "$def_agent" != "$author_agent" ] && p4b_adapter_supported_for_login "$default"; then
       printf '%s' "$default"; return 0
