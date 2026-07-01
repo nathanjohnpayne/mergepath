@@ -363,6 +363,20 @@ paths:
   - path: scripts/codex-p1-gate.sh
     type: canonical
     consumers: all
+    # Generalized in #577 to source scripts/lib/feedback-policy-helpers.sh
+    # and enforce the resolved feedback_policy `required` tier set. Without
+    # the lib propagated, the gate fails-closed on a missing-source error for
+    # every PR in the consumer.
+    requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
+  # CodeRabbit twin of codex-p1-gate.sh (#577). Run directly by
+  # .github/workflows/coderabbit-severity-gate.yml and by scripts/ci/
+  # check_coderabbit_severity_gate; sources the shared feedback-policy lib.
+  - path: scripts/coderabbit-severity-gate.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
   # Shared reader + tier classifiers for the feedback_policy block (#576).
   # Sourced by scripts/ci/check_feedback_policy_helpers (via its test); once
   # #577 lands, both severity gates source it too. First-class entry so the
@@ -537,6 +551,14 @@ paths:
   # in pre-flight with `Missing required file`. Same #264/#266 coupling
   # class — surfaced again by the 024e0da propagation wave (#273).
   - path: tests/test_codex_p1_gate.sh
+    type: canonical
+    consumers: all
+  # Pairs with scripts/coderabbit-severity-gate.sh + scripts/ci/
+  # check_coderabbit_severity_gate (kit-propagated, #577). The check wrapper
+  # hard-requires this test file; without it propagated, every consumer's
+  # check_coderabbit_severity_gate fails pre-flight with `Missing required
+  # file`. Same #264/#266 coupling class as test_codex_p1_gate.sh above.
+  - path: tests/test_coderabbit_severity_gate.sh
     type: canonical
     consumers: all
   # Pairs with scripts/lib/feedback-policy-helpers.sh + scripts/ci/
@@ -750,6 +772,19 @@ paths:
     # `command not found` for every PR in the consumer.
     requires:
       - "scripts/codex-p1-gate.sh"
+  - path: .github/workflows/coderabbit-severity-gate.yml
+    type: canonical
+    consumers: all
+    # CodeRabbit twin of codex-p1-gate.yml (#577). Both jobs run
+    # `scripts/coderabbit-severity-gate.sh` directly, which sources
+    # scripts/lib/feedback-policy-helpers.sh. Propagating the workflow
+    # without those fails-closed on missing-file for every PR in the
+    # consumer. Same coupling class as codex-p1-gate.yml above. A clean
+    # no-op (always green) when coderabbit.severity_gate.enabled is unset
+    # (the default everywhere), so it is safe to add as a required check.
+    requires:
+      - "scripts/coderabbit-severity-gate.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
   - path: .github/workflows/merge-clearance-gate.yml
     type: canonical
     consumers: all
@@ -838,6 +873,8 @@ paths:
       - "tests/test_coderabbit_wait_codex_failover.sh"  # check_coderabbit_wait (#489/#521)
       - "tests/test_coderabbit_automerge_rate_limit_gate.sh"  # check_coderabbit_wait (#489/#521)
       - "tests/test_codex_p1_gate.sh"          # check_codex_p1_gate
+      - "tests/test_coderabbit_severity_gate.sh"  # check_coderabbit_severity_gate (#577)
+      - "tests/test_feedback_policy_helpers.sh"  # check_feedback_policy_helpers (#576)
       - "tests/test_merge_clearance_gate.sh"   # check_merge_clearance_gate
       - "tests/test_disagreement_detector.sh"  # check_disagreement_detector
       - "tests/test_verify_propagation_pr.sh"  # check_verify_propagation_pr
@@ -857,6 +894,8 @@ paths:
       - "tests/test_audit_propagation_lane.sh" # check_propagation_lane_audit
       - "scripts/audit-propagation-lane.sh"    # check_propagation_lane_audit
       - "scripts/codex-p1-gate.sh"             # check_codex_p1_gate
+      - "scripts/coderabbit-severity-gate.sh"  # check_coderabbit_severity_gate (#577)
+      - "scripts/lib/feedback-policy-helpers.sh"  # check_feedback_policy_helpers + both severity gates source it (#576/#577)
       - "scripts/merge-clearance-gate.sh"      # check_merge_clearance_gate
       - "scripts/codex-review-request.sh"      # check_codex_scripts
       - "scripts/codex-review-check.sh"        # check_codex_scripts, check_canonical_bugs_263caf3
@@ -874,6 +913,7 @@ paths:
       - "scripts/workflow/"                    # check_workflow_parsers
       - ".github/workflows/agent-review.yml"   # check_disagreement_detector structural assertion
       - ".github/workflows/codex-p1-gate.yml"  # check_codex_p1_gate workflow shape
+      - ".github/workflows/coderabbit-severity-gate.yml"  # check_coderabbit_severity_gate workflow shape (#577)
       - ".github/workflows/merge-clearance-gate.yml"  # check_merge_clearance_gate workflow shape
       - ".github/workflows/pr-audit.yml"       # check_pr_audit_codex_clearance
   - path: scripts/gh-projects/

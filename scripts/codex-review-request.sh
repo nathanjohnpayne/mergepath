@@ -93,8 +93,14 @@
 #     },
 #     "findings": [
 #       { "path": "...", "line": N, "priority": "P0|P1|P2|P3",
-#         "comment_id": N, "body": "<full finding body>" }
+#         "comment_id": N, "body": "<full finding body>",
+#         "blocking": true|false }
 #     ],
+#     # `blocking` (#577) is derived from the resolved feedback_policy
+#     # required-tier set (scripts/lib/feedback-policy-helpers.sh
+#     # resolve_required_tiers) — true iff this finding's tier is one the
+#     # codex-p1-gate would block merge on. Absent feedback_policy block ⇒
+#     # only P1 is blocking. An unmarked (P?) finding is never blocking.
 #     "reaction": null | {
 #       "content": "+1",
 #       "created_at": "<iso-8601>",
@@ -265,6 +271,40 @@ fi
 
 BOT_LOGIN=$(codex_field bot_login)
 BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
+
+# --- blocking-tier surfacing (#577) -----------------------------------------
+# Source the shared feedback-policy resolver so each emitted finding can
+# carry `blocking: true|false` derived from the SAME resolve_required_tiers
+# the codex-p1-gate uses. This is purely additive to the JSON contract — it
+# never changes the exit-code behavior below. Absent feedback_policy block
+# ⇒ blocking set {p1}, so only P1 findings are marked blocking (today's
+# de-facto gate scope). rc 2 = malformed; a benign non-2 tail status (rc 1
+# when the last tier isn't required) is ignored, mirroring codex-p1-gate.sh.
+#
+# The source is GUARDED (same posture as the preflight-helpers source
+# above): in some test harnesses this script is copied to a scratch tree
+# WITHOUT scripts/lib, so we degrade to the documented absent-block default
+# ({p1}) rather than hard-erroring — surfacing is a best-effort convenience,
+# not a merge gate. The gate scripts (codex-p1-gate.sh) always run from the
+# full checkout and DO source the lib unconditionally.
+__CODEX_REQ_LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REQUIRED_TIERS_JSON='["p1"]'
+if [ -r "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh" ]; then
+  # shellcheck source=lib/feedback-policy-helpers.sh
+  . "$__CODEX_REQ_LIBDIR/lib/feedback-policy-helpers.sh"
+  set +e
+  __REQUIRED_TIERS=$(resolve_required_tiers "$CONFIG")
+  __RT_RC=$?
+  set -e
+  if [ "$__RT_RC" -eq 2 ]; then
+    echo "ERROR: malformed feedback_policy block in $CONFIG (resolve_required_tiers exit 2)" >&2
+    exit 3
+  fi
+  # JSON array of required tiers (lowercase p0..p3|nitpick) for jq
+  # membership tests. Empty input ⇒ [].
+  REQUIRED_TIERS_JSON=$(printf '%s\n' "$__REQUIRED_TIERS" \
+    | jq -R . | jq -s 'map(select(. != ""))')
+fi
 
 # --- Phase 4a entry decision (#486) -----------------------------------------
 # Two codex: block keys govern whether this run posts an `@codex review`
@@ -510,15 +550,21 @@ scan_codex_state() {
   if [ -n "$latest_review_id" ] && [ "$latest_review_id" != "null" ]; then
     findings=$(echo "$comments" | jq \
       --arg bot "$BOT_LOGIN" \
-      --argjson review_id "$latest_review_id" '
+      --argjson review_id "$latest_review_id" \
+      --argjson required "$REQUIRED_TIERS_JSON" '
       [ .[]
         | select(.user.login == $bot)
         | select(.pull_request_review_id == $review_id)
+        | ( (.body | capture("!\\[P(?<n>[0-3]) Badge\\]")? // {n: null}) | .n ) as $n
         | { path, line, comment_id: .id, body,
-            priority: (
-              (.body | capture("!\\[P(?<n>[0-3]) Badge\\]")? // {n: null}) | .n
-              | if . == null then "P?" else "P" + . end
-            )
+            priority: ( if $n == null then "P?" else "P" + $n end ),
+            # blocking (#577): this finding sits in a `required` tier per the
+            # resolved feedback_policy set. An unmarked finding ($n == null,
+            # "P?") is never blocking. Membership test lowercases the
+            # normalized tier (p0..p3) against $required (from
+            # resolve_required_tiers) so the surfaced flag matches exactly
+            # what the codex-p1-gate enforces at merge time.
+            blocking: ( $n != null and ( ("p" + $n) as $t | $required | index($t) != null ) )
           }
       ]
     ')
