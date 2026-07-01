@@ -648,7 +648,13 @@ has_cleared_signal() {
   [ "$(echo "$scan" | jq -r '
     def review_time: if .review == null then "" else .review.submitted_at end;
     def reaction_time: if .reaction == null then "" else .reaction.created_at end;
-    def review_clean: ([.findings[] | select(.blocking == true)] | length) == 0;
+    # P0 ALWAYS blocks clearance (the absent-policy disposition default is
+    # P0/P1), regardless of the resolved gate set — otherwise a consumer with
+    # no feedback_policy block (resolve_required_tiers -> {p1}) would emit a
+    # P0-only review as blocking:false and prematurely clear it, skipping the
+    # re-request (Codex P2 round 2 on #590). On top of the always-blocking P0,
+    # anything in the resolved `required` set (the `blocking` flag) also blocks.
+    def review_clean: ([.findings[] | select(.priority == "P0" or .blocking == true)] | length) == 0;
 
     if .reaction == null and .review == null then "false"
     elif .reaction != null and .review == null then "true"
