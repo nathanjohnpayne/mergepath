@@ -21,8 +21,11 @@
 #   6. Finding from a NON-bot author → exit 0 (must be bot to count).
 #   7. enabled knob absent → default false → exit 0.
 #   8. Malformed PR_NUMBER → exit 2.
-#   9. >100 review threads → exit 2 (pagination not supported in v1).
-#   9b. >100 comments in one thread → exit 2 (nested-connection pagination).
+#   9. >100 review threads → PAGINATED (#592): finding on threads page 2,
+#      collected + classified unresolved → exit 1 (was exit 2 in v1).
+#   9b. >100 comments in one thread → nested comments PAGINATED (#592): the
+#      blocking comment id sits on comments page 2, is fetched, thread
+#      unresolved → exit 1 (was exit 2 in v1). Closes the #590 gap PRECISELY.
 #   10. PR_NUMBER + REPO via env (no positional args) → same behavior.
 #
 # Tier-aware cases (the gate enforces the resolved tier SET):
@@ -38,6 +41,13 @@
 #   15. nitpick required + .coderabbit.yml reviews.profile: chill → WARNING.
 #   16. nitpick required + reviews.profile: assertive → no warning.
 #   17. nitpick discretionary (default) + chill → no warning (claim not made).
+#
+# Pagination cases (#592 — reviewThreads + nested comments cursor loop):
+#   18. finding RESOLVED on threads page 2 → collected + honored → exit 0.
+#   19. blocking id on nested comments page 2, thread resolved → exit 0.
+#   20. nested comments page-2 GraphQL error → fail closed exit 2.
+#   21. reviewThreads page-2 GraphQL error → fail closed exit 2.
+#   22. hasNextPage=true but endCursor=null → fail closed exit 2.
 #
 # Bash 3.2 portable.
 
@@ -82,9 +92,37 @@ if [ "$1" = "api" ]; then
 
   endpoint="${1:-}"
 
+  # For graphql, capture the query body + cursor + node id so the stub can
+  # serve the right pagination page (#592). Same routing as
+  # tests/test_codex_p1_gate.sh.
+  q=""
+  cursor="__none__"
+  node_id="__none__"
+  for a in "$@"; do
+    case "$a" in
+      query=*) q="${a#query=}" ;;
+      cursor=*) cursor="${a#cursor=}" ;;
+      id=*)     node_id="${a#id=}" ;;
+    esac
+  done
+
   case "$endpoint" in
     graphql)
-      cat "${FIXTURE_THREADS:-/dev/null}"
+      if printf '%s' "$q" | grep -q 'PullRequestReviewThread'; then
+        f="FIXTURE_TCOMMENTS_${node_id}_${cursor}"
+        cat "${!f:-/dev/null}"
+        exit 0
+      fi
+      if [ "$cursor" = "null" ] || [ "$cursor" = "__none__" ]; then
+        if [ -n "${FIXTURE_THREADS_null:-}" ]; then
+          cat "$FIXTURE_THREADS_null"
+        else
+          cat "${FIXTURE_THREADS:-/dev/null}"
+        fi
+      else
+        f="FIXTURE_THREADS_${cursor}"
+        cat "${!f:-/dev/null}"
+      fi
       exit 0
       ;;
     repos/*/pulls/*/comments)
@@ -192,18 +230,43 @@ make_single_comment_fixture() {
   ')"
 }
 
-# reviewThreads GraphQL response fixture — same contract as
-# tests/test_codex_p1_gate.sh.
+# reviewThreads GraphQL response fixture (one page) — same contract as
+# tests/test_codex_p1_gate.sh. The paginating gate (#592) needs each node's
+# `id` + comments pageInfo{hasNextPage,endCursor}, and the top-level page's
+# endCursor.
+#
+# Args:
+#   $1 = jq nodes expr — array of {isResolved, comment_ids} objects, optionally
+#        with: id, comments_has_next, comments_end_cursor.
+#   $2 = totalCount (retained for back-compat; ignored by the paginating gate).
+#   $3 = top-level hasNextPage (default false).
+#   $4 = GLOBAL nested-comments-hasNextPage override (default "": leave per-node
+#        default). Back-compat with the #590 tests that flipped every node's
+#        comments overflow via this positional. Per-node comments_has_next in
+#        $1 takes precedence when set.
+#   $5 = top-level endCursor (default null).
 make_threads_fixture() {
   local nodes_expr=$1
   local total=${2:-}
   local has_next=${3:-false}
-  local comments_has_next=${4:-false}   # nested comments(first:100) overflow (#590 4b)
+  local global_cnext=${4:-}
+  local end_cursor=${5:-null}
   local file="$WORKDIR/threads.$$.$RANDOM.json"
   local resolved_nodes
-  resolved_nodes=$(jq -n --arg cnext "$comments_has_next" "$nodes_expr | [.[] | {
+  resolved_nodes=$(jq -n --arg gcnext "$global_cnext" "$nodes_expr | [ to_entries[] | .key as \$idx | .value | {
+    id: (.id // \"T\(\$idx)\"),
     isResolved: .isResolved,
-    comments: { pageInfo: { hasNextPage: (\$cnext == \"true\") }, nodes: ([.comment_ids[] | {databaseId: .}]) }
+    comments: {
+      pageInfo: {
+        hasNextPage: (
+          if .comments_has_next != null then .comments_has_next
+          elif \$gcnext == \"true\" then true
+          else false end
+        ),
+        endCursor: (.comments_end_cursor // null)
+      },
+      nodes: ([.comment_ids[] | {databaseId: .}])
+    }
   }]")
   if [ -z "$total" ]; then
     total=$(echo "$resolved_nodes" | jq 'length')
@@ -211,16 +274,52 @@ make_threads_fixture() {
   jq -n \
     --argjson nodes "$resolved_nodes" \
     --argjson total "$total" \
-    --arg has_next "$has_next" '
+    --arg has_next "$has_next" \
+    --arg end_cursor "$end_cursor" '
     {
       data: {
         repository: {
           pullRequest: {
             reviewThreads: {
               totalCount: $total,
-              pageInfo: { hasNextPage: ($has_next == "true") },
+              pageInfo: {
+                hasNextPage: ($has_next == "true"),
+                endCursor: (if $end_cursor == "null" then null else $end_cursor end)
+              },
               nodes: $nodes
             }
+          }
+        }
+      }
+    }
+  ' > "$file"
+  echo "$file"
+}
+
+# Per-thread comments-page fixture for the node(id:...) query the gate issues
+# when a thread's comments connection overflows 100 (#592). Same shape as
+# tests/test_codex_p1_gate.sh's make_thread_comments_fixture.
+#   $1 = jq expr → array of comment databaseIds.
+#   $2 = hasNextPage (default false).
+#   $3 = endCursor   (default null).
+make_thread_comments_fixture() {
+  local ids_expr=$1
+  local has_next=${2:-false}
+  local end_cursor=${3:-null}
+  local file="$WORKDIR/tcomments.$$.$RANDOM.json"
+  jq -n \
+    --argjson ids "$(jq -n "$ids_expr")" \
+    --arg has_next "$has_next" \
+    --arg end_cursor "$end_cursor" '
+    {
+      data: {
+        node: {
+          comments: {
+            pageInfo: {
+              hasNextPage: ($has_next == "true"),
+              endCursor: (if $end_cursor == "null" then null else $end_cursor end)
+            },
+            nodes: ([$ids[] | {databaseId: .}])
           }
         }
       }
@@ -476,56 +575,68 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 9: >100 review threads (hasNextPage=true) → exit 2.
+# Test 9 (#592): >100 review threads — the ⚠️ Major finding is on threads
+# PAGE 2 and UNRESOLVED. v1 hard-errored (exit 2) on hasNextPage; the
+# paginating gate fetches page 2 and blocks (exit 1). Page 1 holds an unrelated
+# resolved thread (comment 9001); page 2 (cursor CUR1) holds comment 2001.
 # ---------------------------------------------------------------------------
 echo
-echo "--- Test 9: >100 review threads (pagination)"
+echo "--- Test 9 (#592): >100 review threads → page 2 finding paginated, unresolved → exit 1"
 SCRATCH=$(make_scratch_with_config true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
 FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$MAJOR_BODY")
-FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [2001]}]' 101 true)
+FIXTURE_THREADS_null=$(make_threads_fixture \
+  '[{isResolved: true, comment_ids: [9001]}]' "" true "" CUR1)
+FIXTURE_THREADS_CUR1=$(make_threads_fixture \
+  '[{isResolved: false, comment_ids: [2001]}]')
 set +e
 OUT=$(
   FIXTURE_PR="$FIXTURE_PR" \
   FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
-  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_THREADS_null="$FIXTURE_THREADS_null" \
+  FIXTURE_THREADS_CUR1="$FIXTURE_THREADS_CUR1" \
     run_gate "$SCRATCH" 99 owner/repo 2>&1
 )
 RC=$?
 set -e
-if [ "$RC" = 2 ] && echo "$OUT" | grep -q ">100 review threads"; then
-  pass ">100 threads → exit 2"
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "src/foo.ts:42"; then
+  pass ">100 threads → page 2 paginated, unresolved → exit 1"
 else
-  fail "expected rc=2 with pagination error; got rc=$RC"
+  fail "expected rc=1 with 'unresolved: 1' + path (page-2 pagination); got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
 # ---------------------------------------------------------------------------
-# Test 9b: a thread with >100 comments (nested comments.pageInfo.hasNextPage
-# =true) → exit 2. Mirrors Test 9 for the nested connection — the gap
-# nathanpayne-codex flagged as P1 on #590 (the threads connection had a
-# paginated-overflow guard; the nested comments connection did not, so a
-# blocking finding past the 100th comment could be silently dropped).
+# Test 9b (#592): a thread with >100 comments — the blocking comment id sits on
+# comments PAGE 2. v1 hard-errored (exit 2) on the nested overflow (the #590
+# gap nathanpayne-codex flagged as P1); the paginating gate fetches nested page
+# 2, finds id 2001, and (thread unresolved) blocks (exit 1). Comments page 1
+# carries an unrelated id (5555) + hasNextPage=true + endCursor CCUR1.
 # ---------------------------------------------------------------------------
 echo
-echo "--- Test 9b: >100 comments in a thread (nested pagination)"
+echo "--- Test 9b (#592): blocking comment on nested comments page 2 → caught → exit 1"
 SCRATCH=$(make_scratch_with_config true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
 FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "$MAJOR_BODY")
-FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [2001]}]' "" false true)
+FIXTURE_THREADS_null=$(make_threads_fixture \
+  '[{id: "TX", isResolved: false, comment_ids: [5555], comments_has_next: true, comments_end_cursor: "CCUR1"}]')
+FIXTURE_TCOMMENTS_TX_CCUR1=$(make_thread_comments_fixture '[2001]')
 set +e
 OUT=$(
   FIXTURE_PR="$FIXTURE_PR" \
   FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
-  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_THREADS_null="$FIXTURE_THREADS_null" \
+  FIXTURE_TCOMMENTS_TX_CCUR1="$FIXTURE_TCOMMENTS_TX_CCUR1" \
     run_gate "$SCRATCH" 99 owner/repo 2>&1
 )
 RC=$?
 set -e
-if [ "$RC" = 2 ] && echo "$OUT" | grep -q ">100 comments"; then
-  pass ">100 comments in a thread → exit 2"
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "src/foo.ts:42"; then
+  pass ">100 comments → nested page 2 paginated, id caught, unresolved → exit 1"
 else
-  fail "expected rc=2 with nested-comments pagination error; got rc=$RC"
+  fail "expected rc=1 with 'unresolved: 1' + path (nested pagination); got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
