@@ -87,6 +87,103 @@ p4b_top_field() {
   ' "$cfg"
 }
 
+# --- feedback-disposition policy (#574-compatible approval gate) -----------
+
+# p4b_feedback_policy_mode — mode under `feedback_policy:`. The absent-block
+# default mirrors today's review policy: by-priority with P0/P1 required.
+p4b_feedback_policy_mode() {
+  local cfg
+  cfg="$(p4b_config)"
+  [ -f "$cfg" ] || { printf '%s' "by-priority"; return 0; }
+  awk '
+    /^feedback_policy:/ { inblk=1; next }
+    inblk && /^[^[:space:]#]/ { inblk=0 }
+    inblk && $1 == "mode:" {
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+      gsub(/^["\047]/, "", $0)
+      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print; exit
+    }
+  ' "$cfg"
+}
+
+# p4b_feedback_priority_value <p0|p1|p2|p3|nitpick>
+# Returns the configured disposition value under feedback_policy.priorities,
+# or the parser default if absent: P0/P1 required, lower tiers discretionary.
+p4b_feedback_priority_value() {
+  local tier="$1" cfg value
+  cfg="$(p4b_config)"
+  if [ -f "$cfg" ]; then
+    value="$(
+      awk -v tier="$tier" '
+        /^feedback_policy:/ { inblk=1; inprio=0; next }
+        inblk && /^[^[:space:]#]/ { inblk=0; inprio=0 }
+        inblk && /^[[:space:]]+priorities:/ { inprio=1; next }
+        inprio {
+          line=$0
+          gsub(/[[:space:]]*#.*$/, "", line)
+          if (line ~ /^[[:space:]]*$/) next
+          indent = match(line, /[^[:space:]]/) - 1
+          if (indent <= 2) { inprio=0; next }
+          key=line
+          sub(/^[[:space:]]*/, "", key)
+          sub(/:.*/, "", key)
+          if (key == tier) {
+            sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", line)
+            gsub(/^["\047]/, "", line)
+            gsub(/["\047][[:space:]]*$/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            print line; exit
+          }
+        }
+      ' "$cfg"
+    )"
+  fi
+  if [ -n "${value:-}" ]; then
+    printf '%s' "$value"
+    return 0
+  fi
+  case "$tier" in
+    p0|p1) printf '%s' "required" ;;
+    p2|p3|nitpick) printf '%s' "discretionary" ;;
+    *) return 1 ;;
+  esac
+}
+
+# p4b_required_verdict_severities_json
+# Returns a JSON array of verdict severities that cannot appear in an
+# APPROVED response. Phase 4b adapter verdicts use P0-P3; CodeRabbit-only
+# nitpick policy applies to the CodeRabbit gate, not this schema.
+p4b_required_verdict_severities_json() {
+  local mode tier value first=true
+  mode="$(p4b_feedback_policy_mode)"
+  mode="${mode:-by-priority}"
+  case "$mode" in
+    address-all)
+      printf '%s' '["P0","P1","P2","P3"]'
+      return 0
+      ;;
+    by-priority) ;;
+    *) return 1 ;;
+  esac
+
+  printf '['
+  for tier in p0 p1 p2 p3; do
+    value="$(p4b_feedback_priority_value "$tier")" || return 1
+    case "$value" in
+      required)
+        if [ "$first" = true ]; then first=false; else printf ','; fi
+        printf '"%s"' "$(printf '%s' "$tier" | tr '[:lower:]' '[:upper:]')"
+        ;;
+      discretionary|ignore) ;;
+      *) return 1 ;;
+    esac
+  done
+  printf ']'
+}
+
 # p4b_available_reviewers — newline-separated list items under
 # `available_reviewers:`.
 p4b_available_reviewers() {
@@ -114,8 +211,8 @@ p4b_available_reviewers() {
 #   nathanpayne-codex -> codex ; claude -> claude
 p4b_agent_of_login() {
   case "$1" in
-    nathanpayne-*) printf '%s' "${1#nathanpayne-}" ;;
-    *)             printf '%s' "$1" ;;
+    nathanpayne-*) printf '%s' "${1#nathanpayne-}" | tr '[:upper:]' '[:lower:]' ;;
+    *)             printf '%s' "$1" | tr '[:upper:]' '[:lower:]' ;;
   esac
 }
 
@@ -166,19 +263,36 @@ EOF
 
 # p4b_validate_verdict <json-string>
 # Returns 0 iff the string is a verdict object conforming to
-# verdict.schema.json's required shape. Fail-closed: any deviation,
-# empty input, or jq error returns non-zero. No stdout.
+# verdict.schema.json's required shape plus the semantic invariants that
+# keep a posted APPROVED review from clearing a PR while still carrying
+# blocking findings. Fail-closed: any deviation, empty input, or jq error
+# returns non-zero. No stdout.
 p4b_validate_verdict() {
-  local json="$1"
+  local json="$1" required_severities
   [ -n "$json" ] || return 1
-  printf '%s' "$json" | jq -e '
+  required_severities="$(p4b_required_verdict_severities_json)" || return 1
+  printf '%s' "$json" | jq -e --argjson required_severities "$required_severities" '
     def okstr: (type == "string") and (length > 0);
-    ((.verdict == "APPROVED") or (.verdict == "CHANGES_REQUESTED"))
+    def okintnull: (. == null) or (type == "number" and floor == . and . >= 0);
+    ((keys_unsorted | sort) == ["findings","summary","usage","verdict"])
+    and ((.verdict == "APPROVED") or (.verdict == "CHANGES_REQUESTED"))
     and (.summary | okstr)
     and (.findings | type == "array")
     and all(.findings[]?;
-          (.severity | type == "string" and test("^P[0-3]$"))
+          ((keys_unsorted | sort) == ["body","line","path","severity"])
+          and (.severity | type == "string" and test("^P[0-3]$"))
+          and ((.path == null) or (.path | type == "string"))
+          and ((.line == null) or (.line | type == "number" and floor == . and . >= 1))
           and (.body | okstr))
+    and ((.verdict != "APPROVED")
+         or all(.findings[]?; (.severity as $s | ($required_severities | index($s) | not))))
+    and ((.usage == null)
+         or ((.usage | type == "object")
+             and ((.usage | keys_unsorted | sort) == ["input_tokens","output_tokens","source","token_count"])
+             and (.usage.token_count | okintnull)
+             and (.usage.input_tokens | okintnull)
+             and (.usage.output_tokens | okintnull)
+             and (.usage.source | okstr)))
   ' >/dev/null 2>&1
 }
 
@@ -197,4 +311,80 @@ p4b_extract_json_block() {
           for (i = 1; i <= length(buf); i++) if (substr(buf, i, 1) == "}") last = i
           if (start > 0 && last >= start) printf "%s", substr(buf, start, last - start + 1)
         }'
+}
+
+# p4b_run_with_timeout <seconds> <command> [args...]
+# Portable bounded execution for reviewer CLIs/adapters. GNU coreutils
+# `timeout` is common on Linux; macOS has perl, and the inherited alarm
+# timer survives exec so the target process is still bounded.
+p4b_run_with_timeout() {
+  local seconds="$1"
+  shift
+  case "$seconds" in
+    ''|0) "$@"; return $? ;;
+    *[!0-9]*) p4b_die 3 "timeout seconds must be a non-negative integer; got '$seconds'" ;;
+  esac
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+    return $?
+  fi
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift @ARGV; exec @ARGV or die "exec failed: $!\n"' "$seconds" "$@"
+    return $?
+  fi
+  p4b_die 3 "bounded review execution requires GNU timeout or perl"
+}
+
+p4b_is_timeout_rc() {
+  case "$1" in
+    124|142) return 0 ;;
+    *)       return 1 ;;
+  esac
+}
+
+# --- plan-only reviewer CLI auth guards ------------------------------------
+
+p4b_codex_auth_file() {
+  if [ -n "${P4B_CODEX_AUTH_FILE:-}" ]; then
+    printf '%s' "$P4B_CODEX_AUTH_FILE"
+    return 0
+  fi
+  printf '%s/.codex/auth.json' "${CODEX_HOME:-$HOME}"
+}
+
+p4b_require_codex_plan_auth() {
+  local auth_file mode
+  auth_file="$(p4b_codex_auth_file)"
+  [ -r "$auth_file" ] || p4b_die 4 "codex plan login not found at $auth_file; run codex login (API-key auth is not allowed for Phase 4b)"
+  mode="$(jq -r '.auth_mode // empty' "$auth_file" 2>/dev/null || true)"
+  [ "$mode" = "chatgpt" ] || p4b_die 4 "codex auth_mode is '${mode:-unknown}', not 'chatgpt'; API-key auth is not allowed for Phase 4b"
+}
+
+p4b_claude_auth_status() {
+  local claude_bin="$1"
+  if [ -n "${P4B_CLAUDE_AUTH_STATUS_FILE:-}" ]; then
+    cat "$P4B_CLAUDE_AUTH_STATUS_FILE"
+    return 0
+  fi
+  "$claude_bin" auth status --json 2>/dev/null
+}
+
+p4b_require_claude_plan_auth() {
+  local claude_bin="$1" status logged_in auth_method api_provider subscription_type
+  status="$(p4b_claude_auth_status "$claude_bin")" \
+    || p4b_die 4 "claude plan login status could not be read; run claude auth login (API-key auth is not allowed for Phase 4b)"
+  logged_in="$(printf '%s' "$status" | jq -r '.loggedIn // false' 2>/dev/null || true)"
+  auth_method="$(printf '%s' "$status" | jq -r '.authMethod // empty' 2>/dev/null || true)"
+  api_provider="$(printf '%s' "$status" | jq -r '.apiProvider // empty' 2>/dev/null || true)"
+  subscription_type="$(printf '%s' "$status" | jq -r '.subscriptionType // empty' 2>/dev/null || true)"
+  [ "$logged_in" = "true" ] || p4b_die 4 "claude is not logged in; run claude auth login (API-key auth is not allowed for Phase 4b)"
+  case "$auth_method" in
+    claude.ai|oauth_token) ;;
+    *) p4b_die 4 "claude authMethod is '${auth_method:-unknown}', not a first-party subscription method; API-key auth is not allowed for Phase 4b" ;;
+  esac
+  [ "$api_provider" = "firstParty" ] || p4b_die 4 "claude apiProvider is '${api_provider:-unknown}', not 'firstParty'; API-key auth is not allowed for Phase 4b"
+  if [ "$auth_method" = "claude.ai" ]; then
+    [ -n "$subscription_type" ] && [ "$subscription_type" != "null" ] \
+      || p4b_die 4 "claude subscriptionType is missing; a Claude Code subscription login is required for Phase 4b"
+  fi
 }

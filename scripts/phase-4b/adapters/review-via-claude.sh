@@ -29,11 +29,13 @@
 #
 # Env:
 #   CLAUDE_BIN  claude executable (default: claude). Tests point this at a fake.
-#   Claude Code plan login   reasoning-plane auth. This adapter runs the
-#               CLI with ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN SCRUBBED
-#               (env -u), so review reasoning bills against the operator's
-#               Claude Code PLAN (subscription login, or `claude setup-token`
-#               -> CLAUDE_CODE_OAUTH_TOKEN, or the OS keychain), never the
+#   Claude Code plan login   reasoning-plane auth. This adapter requires
+#               `claude auth status --json` to report apiProvider=firstParty
+#               with authMethod=claude.ai plus subscriptionType, or
+#               authMethod=oauth_token for the headless subscription token.
+#               It also runs the CLI with ANTHROPIC_API_KEY and
+#               ANTHROPIC_AUTH_TOKEN SCRUBBED (env -u), so review reasoning
+#               bills against the operator's Claude Code PLAN, never the
 #               pay-per-token API. CLAUDE_CODE_OAUTH_TOKEN (the subscription
 #               headless token) is PRESERVED. If claude is not logged in on a
 #               plan the read-only call fails and the orchestrator falls back
@@ -41,6 +43,8 @@
 #   P4B_CLAUDE_PERMISSION_MODE  default: plan (read-only).
 #   P4B_CLAUDE_ALLOWED_TOOLS    default: "Read,Bash(git diff *),Bash(git log *)".
 #   GH_TOKEN    only used if the diff must be fetched (no --diff-file).
+#   P4B_REVIEW_CLI_TIMEOUT_SECONDS  default: P4B_ADAPTER_TIMEOUT_SECONDS
+#               or 900. Timeout maps to exit 4 / manual fallback.
 #
 # Exit codes: identical contract to review-via-codex.sh (0/2/3/4).
 
@@ -56,6 +60,7 @@ PERMISSION_MODE="${P4B_CLAUDE_PERMISSION_MODE:-plan}"
 ALLOWED_TOOLS="${P4B_CLAUDE_ALLOWED_TOOLS:-Read,Bash(git diff *),Bash(git log *)}"
 
 PR="" ; REPO="" ; HEAD="" ; DIFF_FILE="" ; MODEL="${P4B_CLAUDE_MODEL:-}"
+CLI_TIMEOUT="${P4B_REVIEW_CLI_TIMEOUT_SECONDS:-${P4B_ADAPTER_TIMEOUT_SECONDS:-900}}"
 
 usage() {
   echo "usage: review-via-claude.sh --pr <N> --repo <owner/repo> [--head <sha>] [--diff-file <path>] [--model <m>]" >&2
@@ -91,19 +96,34 @@ fi
 [ -n "$DIFF" ] || p4b_die 4 "empty diff — nothing to review"
 
 command -v "$CLAUDE_BIN" >/dev/null 2>&1 || p4b_die 3 "claude CLI not found on PATH (set CLAUDE_BIN)"
+p4b_require_claude_plan_auth "$CLAUDE_BIN"
 
 # --- run the review --------------------------------------------------------
+REQUIRED_SEVERITIES="$(p4b_required_verdict_severities_json)" \
+  || p4b_die 3 "invalid feedback_policy; cannot determine required verdict severities"
 SCHEMA_TEXT="$(cat "$SCHEMA")"
 PROMPT="You are an external code reviewer for GitHub PR #${PR}${REPO:+ in ${REPO}}${HEAD:+ at commit ${HEAD}}.
+Perform an exhaustive code review: keep looking for additional findings until
+you stop finding new issues.
 The unified diff is on stdin. Respond with ONLY a single JSON object (no
 prose, no code fence) conforming to this JSON Schema:
 ${SCHEMA_TEXT}
 verdict must be APPROVED or CHANGES_REQUESTED. Approve only if you would
-stake a merge on it. Do not edit files. Do not post anything to GitHub."
+stake a merge on it. For this repository, these finding severities require
+disposition before merge: ${REQUIRED_SEVERITIES}. If any finding with one of
+those severities exists, the verdict must be CHANGES_REQUESTED, not APPROVED.
+When requesting changes, list every required-severity issue you identify in
+this pass, not just the first one.
+Set usage to null; the adapter will populate CLI usage metadata if the CLI
+exposes it. Do not edit files. Do not post anything to GitHub."
 
 set +e
 ENVELOPE="$(
-  printf '%s\n' "$DIFF" | env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "$CLAUDE_BIN" -p "$PROMPT" \
+  printf '%s\n' "$DIFF" | p4b_run_with_timeout "$CLI_TIMEOUT" env \
+    -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+    -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+    -u OP_PREFLIGHT_REVIEWER_PAT -u OP_PREFLIGHT_AUTHOR_PAT \
+    "$CLAUDE_BIN" -p "$PROMPT" \
     --permission-mode "$PERMISSION_MODE" \
     --output-format json \
     ${MODEL:+--model "$MODEL"} \
@@ -111,7 +131,12 @@ ENVELOPE="$(
 )"
 RC=$?
 set -e
-[ "$RC" -eq 0 ] || p4b_die 4 "claude -p failed (rc=$RC) — ensure claude is logged in on a plan (API keys are scrubbed for plan-only billing); falling back to the manual handoff"
+if [ "$RC" -ne 0 ]; then
+  if p4b_is_timeout_rc "$RC"; then
+    p4b_die 4 "claude -p timed out after ${CLI_TIMEOUT}s — falling back to the manual handoff"
+  fi
+  p4b_die 4 "claude -p failed (rc=$RC) — ensure claude is logged in on a plan (API keys are scrubbed for plan-only billing); falling back to the manual handoff"
+fi
 [ -n "$ENVELOPE" ] || p4b_die 4 "claude -p produced no output"
 
 # Extract the model's answer from the print-mode JSON envelope (.result).
@@ -121,10 +146,37 @@ RESULT="$(printf '%s' "$ENVELOPE" | jq -r '.result // empty' 2>/dev/null || true
 [ -n "$RESULT" ] || RESULT="$ENVELOPE"
 
 VERDICT_JSON="$(p4b_extract_json_block "$RESULT")"
+VERDICT_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c 'if has("usage") then . else . + {usage: null} end' 2>/dev/null || true)"
 if ! p4b_validate_verdict "$VERDICT_JSON"; then
   p4b_warn "claude output did not conform to verdict.schema.json (fail-closed)"
   exit 4
 fi
 
-printf '%s' "$VERDICT_JSON" | jq -c .
+USAGE="$(printf '%s' "$ENVELOPE" | jq -c '
+  def int_or_null: if type == "number" then floor else null end;
+  if type != "object" then null
+  else
+    ( .usage.total_tokens
+      // .usage.total
+      // .usage.token_count
+      // .total_tokens
+      // .metrics.total_tokens
+      // (if (.usage.input_tokens? != null and .usage.output_tokens? != null)
+          then (.usage.input_tokens + .usage.output_tokens)
+          else null end)
+    ) as $total
+    | ( .usage.input_tokens // .input_tokens // .metrics.input_tokens // null ) as $input
+    | ( .usage.output_tokens // .output_tokens // .metrics.output_tokens // null ) as $output
+    | if $total == null and $input == null and $output == null then null
+      else {
+        token_count: ($total | int_or_null),
+        input_tokens: ($input | int_or_null),
+        output_tokens: ($output | int_or_null),
+        source: "claude-json-envelope"
+      }
+      end
+  end
+' 2>/dev/null || printf 'null')"
+
+printf '%s' "$VERDICT_JSON" | jq -c --argjson usage "$USAGE" '. + {usage: $usage}'
 exit 0

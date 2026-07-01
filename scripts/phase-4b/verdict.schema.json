@@ -2,13 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://nathanjohnpayne.dev/mergepath/phase-4b/verdict.schema.json",
   "title": "Mergepath Phase 4b automated-review verdict",
-  "description": "Normalized verdict object that every Phase 4b reviewer adapter (codex / claude) must emit on stdout. Also passed verbatim to `codex exec --output-schema` so the Codex CLI constrains its final message to this shape. Strict (additionalProperties:false, all properties required) for OpenAI structured-output compatibility.",
+  "description": "Normalized verdict object that every Phase 4b reviewer adapter (codex / claude) must emit on stdout. Also passed to `codex exec --output-schema` so the Codex CLI constrains its final message to this shape. `usage` is required for OpenAI structured-output compatibility but may be null; adapters populate it only when the CLI exposes token counts.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "summary", "findings"],
+  "required": ["verdict", "summary", "findings", "usage"],
   "properties": {
     "verdict": {
-      "description": "The reviewer's merge decision. APPROVED becomes a `gh pr review --approve` (the Phase 4b substitute clearance the merge gate accepts); CHANGES_REQUESTED becomes `gh pr review --request-changes`. There is deliberately no COMMENTED/abstain value: an adapter that cannot reach one of these two decisions must exit non-zero so the orchestrator fails closed to the manual handoff rather than posting an ambiguous review.",
+      "description": "The reviewer's merge decision. APPROVED becomes a GitHub APPROVED review (the Phase 4b substitute clearance the merge gate accepts); CHANGES_REQUESTED becomes a GitHub changes-requested review. APPROVED must not be paired with findings whose severity is required by feedback_policy (P0/P1 by default); adapters and the orchestrator reject that combination fail-closed. There is deliberately no COMMENTED/abstain value: an adapter that cannot reach one of these two decisions must exit non-zero so the orchestrator fails closed to the manual handoff rather than posting an ambiguous review.",
       "type": "string",
       "enum": ["APPROVED", "CHANGES_REQUESTED"]
     },
@@ -18,7 +18,7 @@
       "minLength": 1
     },
     "findings": {
-      "description": "Per-issue findings. Empty array is valid (a clean APPROVED). For CHANGES_REQUESTED there should be at least one P0/P1 finding.",
+      "description": "Per-issue findings. Empty array is valid (a clean APPROVED). Policy-required severities require CHANGES_REQUESTED; discretionary severities may accompany APPROVED as advisory observations.",
       "type": "array",
       "items": {
         "type": "object",
@@ -43,6 +43,30 @@
             "type": "string",
             "minLength": 1
           }
+        }
+      }
+    },
+    "usage": {
+      "description": "Optional adapter-populated usage metadata. Null means the reviewer CLI did not expose a reliable token count; adapters must not ask the model to guess it.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["token_count", "input_tokens", "output_tokens", "source"],
+      "properties": {
+        "token_count": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "input_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
         }
       }
     }

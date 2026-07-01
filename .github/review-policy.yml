@@ -561,8 +561,9 @@ phase_4b_automation:
   # future follow-up (not implemented in the reference).
   mode: local
 
-  # Bounded review rounds before escalating to the human per
-  # REVIEW_POLICY.md § Disagreements and Tiebreaking.
+  # Declarative cap for callers that loop this one-review-round helper after
+  # CHANGES_REQUESTED. The reference orchestrator performs one adapter pass per
+  # invocation and does not persist round state.
   max_review_rounds: 2
 
   # Fail closed: an ambiguous / non-schema-conformant adapter verdict must

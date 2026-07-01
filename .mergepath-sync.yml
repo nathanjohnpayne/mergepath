@@ -339,6 +339,19 @@ paths:
   - path: scripts/phase-4b-classifier.sh
     type: canonical
     consumers: all
+  # Automated Phase 4b handoff orchestrator (#579). It sources the
+  # scripts/phase-4b/ kit for adapter selection, schema validation, and
+  # timeout helpers, then delegates review posting to the identity-checked
+  # reviewer wrapper. Keep these edges explicit so consumer repos that
+  # receive the scripts/ci/ kit do not get a hard-failing lint wrapper
+  # without the runnable handoff package it checks.
+  - path: scripts/phase-4b-review.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/phase-4b/"
+      - "scripts/gh-as-reviewer.sh"
+      - "scripts/post-phase-4b-handoff.sh"
   # Chat-side Phase 4b handoff block renderer (#281). Read-only,
   # stdout-only: emits the single-PR or batch handoff variant per
   # REVIEW_POLICY.md § Handoff Message Format § Chat-side handoff
@@ -580,6 +593,12 @@ paths:
   - path: tests/test_post_phase_4b_handoff.sh
     type: canonical
     consumers: all
+  # Pairs with scripts/phase-4b-review.sh + the scripts/phase-4b/ kit
+  # and is hard-required by scripts/ci/check_phase_4b_automation.
+  # Fake CLIs and fake gh wrappers only; no live GitHub network.
+  - path: tests/test_phase_4b_automation.sh
+    type: canonical
+    consumers: all
   # Pairs with scripts/op-preflight.sh + scripts/lib/preflight-helpers.sh
   # + scripts/ci/check_op_preflight_contract. The check wrapper requires
   # all four test files; same coupling pattern as the gh-as-author and
@@ -772,6 +791,14 @@ paths:
     # specific consumer templates. Keep labels to GitHub default
     # labels (`bug`, `documentation`, `enhancement`) so consumer
     # repos do not silently drop non-existent front-matter labels.
+  - path: scripts/phase-4b/
+    type: kit
+    consumers: all
+    # Automated Phase 4b handoff package (#579): adapters, schema, shared
+    # shell helpers, and README. The top-level orchestrator and CI check
+    # both depend on these files as one versioned package; consumer repos
+    # may add local notes/scripts in this directory without forking the
+    # canonical files.
   - path: scripts/ci/
     type: kit
     consumers: all
@@ -806,6 +833,7 @@ paths:
       - "tests/test_export_consumer_facts.sh"  # check_export_consumer_facts
       - "tests/test_check_coderabbit_config.sh"  # check_coderabbit_config_tests (#481/#482)
       - "tests/test_check_propagation_closure.sh"  # check_propagation_closure (#521)
+      - "tests/test_phase_4b_automation.sh"  # check_phase_4b_automation (#579)
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
       - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)
       - "tests/test_codex_review_request_entry.sh"  # check_codex_scripts (#486)
@@ -820,6 +848,8 @@ paths:
       - "scripts/codex-review-check.sh"        # check_codex_scripts, check_canonical_bugs_263caf3
       - "scripts/codex-record-feedback.sh"     # check_codex_scripts (#487)
       - "scripts/phase-4b-classifier.sh"       # check_phase_4b_classifier
+      - "scripts/phase-4b-review.sh"           # check_phase_4b_automation (#579)
+      - "scripts/phase-4b/"                    # check_phase_4b_automation (#579)
       - "scripts/disagreement-detector.cjs"    # check_disagreement_detector
       - "scripts/request-label-removal.sh"     # check_canonical_bugs_263caf3
       - "scripts/resolve-pr-threads.sh"        # check_resolve_pr_threads

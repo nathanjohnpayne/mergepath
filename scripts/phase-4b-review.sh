@@ -21,7 +21,8 @@
 # Overrides (mostly for tests / non-git contexts):
 #   --author    PR's authoring agent (claude|codex|...). Default: parsed
 #               from the PR body `Authoring-Agent:` line.
-#   --reviewer  force the external reviewer login (skips selection).
+#   --reviewer  force the external reviewer login (skips selection, but still
+#               must differ from the authoring agent).
 #   --head      HEAD sha. Default: gh api pulls/<n> .head.sha.
 #   --diff-file pre-fetched unified diff (skips `gh pr diff`).
 #   --dry-run   do everything EXCEPT post the review; print intended action.
@@ -29,6 +30,9 @@
 # Env:
 #   GH_TOKEN / op-preflight cache   reviewer-scoped token (auto-sourced).
 #   CODEX_BIN / CLAUDE_BIN          adapter CLI overrides (tests).
+#   P4B_GH_AS_REVIEWER              reviewer wrapper override (tests).
+#   P4B_HANDOFF                     manual handoff renderer override (tests).
+#   P4B_ADAPTER_TIMEOUT_SECONDS     default: 900.
 #
 # Exit codes:
 #   0  APPROVED — review posted (or would post under --dry-run).
@@ -56,8 +60,9 @@ if [ -r "$ROOT/lib/preflight-helpers.sh" ]; then
 fi
 
 ADAPTER_DIR="$ROOT/phase-4b/adapters"
-HANDOFF="$ROOT/post-phase-4b-handoff.sh"
-GH_AS_REVIEWER="$ROOT/gh-as-reviewer.sh"
+HANDOFF="${P4B_HANDOFF:-$ROOT/post-phase-4b-handoff.sh}"
+GH_AS_REVIEWER="${P4B_GH_AS_REVIEWER:-$ROOT/gh-as-reviewer.sh}"
+ADAPTER_TIMEOUT="${P4B_ADAPTER_TIMEOUT_SECONDS:-900}"
 
 PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; DIFF_FILE="" ; DRY_RUN=false
 
@@ -84,15 +89,21 @@ done
 
 [ -n "$PR" ] || usage
 [[ "$PR" =~ ^[1-9][0-9]*$ ]] || p4b_die 3 "PR# must be a positive integer; got '$PR'"
-command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
 
 # --- automation entry decision ---------------------------------------------
 ENABLED="$(p4b_automation_field enabled)"; ENABLED="${ENABLED:-false}"
 MODE="$(p4b_automation_field mode)"; MODE="${MODE:-local}"
 
+json_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
 emit_skip_json() {
-  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg reason "$1" \
-    '{pr_number:$pr, repo:$repo, automation_enabled:false, skipped:true, reason:$reason}'
+  printf '{"pr_number":%s,"repo":%s,"automation_enabled":false,"skipped":true,"reason":%s}\n' \
+    "$PR" "$(json_string "$REPO")" "$(json_string "$1")"
 }
 
 if [ "$ENABLED" != "true" ]; then
@@ -106,6 +117,8 @@ if [ "$MODE" != "local" ]; then
   exit 5
 fi
 
+command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
+
 # --- resolve repo / head / author ------------------------------------------
 need_gh() { command -v gh >/dev/null 2>&1 || p4b_die 3 "gh is required for this path (or pass the matching override flag)"; }
 
@@ -115,28 +128,33 @@ if [ -z "$REPO" ]; then
   [ -n "$REPO" ] || p4b_die 3 "could not resolve repo; pass --repo owner/name"
 fi
 
-if [ -z "$HEAD" ] && [ -z "$DIFF_FILE" ]; then
+if [ -z "$HEAD" ]; then
   need_gh
   HEAD="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
   [ -n "$HEAD" ] || p4b_die 3 "could not resolve HEAD sha for $REPO#$PR; pass --head"
 fi
 
-# Authoring agent: explicit override, else parse the PR body line.
-if [ -z "$AUTHOR" ] && [ -z "$REVIEWER" ]; then
+# Authoring agent: explicit override, else parse the PR body line. Required
+# even when --reviewer is forced so the cross-agent invariant still applies.
+if [ -z "$AUTHOR" ]; then
   need_gh
   body="$(gh api "repos/$REPO/pulls/$PR" --jq '.body // ""' 2>/dev/null || true)"
   AUTHOR="$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*Authoring-Agent:[[:space:]]*\([A-Za-z0-9_-]*\).*/\1/p' | head -n1)"
-  [ -n "$AUTHOR" ] || p4b_die 3 "could not parse Authoring-Agent from PR body; pass --author or --reviewer"
+  [ -n "$AUTHOR" ] || p4b_die 3 "could not parse Authoring-Agent from PR body; pass --author"
 fi
 
 # --- select reviewer + adapter ---------------------------------------------
+AUTHOR_AGENT="$(p4b_agent_of_login "$AUTHOR")"
 if [ -z "$REVIEWER" ]; then
   REVIEWER="$(p4b_select_reviewer "$AUTHOR" || true)"
   [ -n "$REVIEWER" ] || p4b_die 3 "no external reviewer (≠ author '$AUTHOR') in available_reviewers"
 fi
+REVIEWER_AGENT="$(p4b_agent_of_login "$REVIEWER")"
+if [ "$REVIEWER_AGENT" = "$AUTHOR_AGENT" ]; then
+  p4b_die 3 "reviewer '$REVIEWER' matches authoring agent '$AUTHOR'; Phase 4b requires a different reviewer identity"
+fi
 ADAPTER="$(p4b_adapter_of_login "$REVIEWER")"
 ADAPTER_SCRIPT="$ADAPTER_DIR/review-via-${ADAPTER}.sh"
-AUTHOR_AGENT="${AUTHOR:-$(p4b_agent_of_login "$REVIEWER")}"
 DIRECTION="${AUTHOR_AGENT}->${ADAPTER}"
 
 p4b_log "PR $REPO#$PR  HEAD=${HEAD:-?}  direction=$DIRECTION  reviewer=$REVIEWER  adapter=$ADAPTER  dry_run=$DRY_RUN"
@@ -144,9 +162,11 @@ p4b_log "PR $REPO#$PR  HEAD=${HEAD:-?}  direction=$DIRECTION  reviewer=$REVIEWER
 # --- manual-handoff fallback -----------------------------------------------
 fall_back_to_manual() {
   local why="$1"
+  local handoff_ref="$PR"
+  [ -n "$REPO" ] && handoff_ref="${REPO}#${PR}"
   p4b_warn "falling back to the manual Phase 4b handoff: $why"
   if [ -x "$HANDOFF" ]; then
-    "$HANDOFF" "$PR" >&2 2>/dev/null || p4b_warn "could not render chat-side handoff block (needs gh); brief the human manually"
+    "$HANDOFF" "$handoff_ref" >&2 2>/dev/null || p4b_warn "could not render chat-side handoff block (needs gh); brief the human manually"
   fi
   jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
         --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
@@ -168,10 +188,13 @@ ADAPTER_ARGS=( --pr "$PR" )
 [ -n "$DIFF_FILE" ] && ADAPTER_ARGS+=( --diff-file "$DIFF_FILE" )
 
 set +e
-VERDICT_JSON="$("$ADAPTER_SCRIPT" "${ADAPTER_ARGS[@]}")"
+VERDICT_JSON="$(p4b_run_with_timeout "$ADAPTER_TIMEOUT" "$ADAPTER_SCRIPT" "${ADAPTER_ARGS[@]}")"
 ADAPTER_RC=$?
 set -e
 if [ "$ADAPTER_RC" -ne 0 ]; then
+  if p4b_is_timeout_rc "$ADAPTER_RC"; then
+    fall_back_to_manual "adapter timed out after ${ADAPTER_TIMEOUT}s"
+  fi
   fall_back_to_manual "adapter exited $ADAPTER_RC"
 fi
 # Defense in depth: re-validate before we act on it.
@@ -182,6 +205,13 @@ fi
 VERDICT="$(printf '%s' "$VERDICT_JSON" | jq -r '.verdict')"
 SUMMARY="$(printf '%s' "$VERDICT_JSON" | jq -r '.summary')"
 FINDINGS_COUNT="$(printf '%s' "$VERDICT_JSON" | jq -r '.findings | length')"
+TOKEN_COUNT="$(printf '%s' "$VERDICT_JSON" | jq -r '.usage.token_count // empty')"
+USAGE_SOURCE="$(printf '%s' "$VERDICT_JSON" | jq -r '.usage.source // empty')"
+ADAPTER_RUNS=1
+
+if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
+  fall_back_to_manual "approved verdict included findings; post-review issue filing is required before Phase 4b clearance"
+fi
 
 # Render the PR review body (summary + findings list).
 BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
@@ -190,6 +220,20 @@ trap "rm -f '$BODY_FILE'" EXIT
 {
   printf '**Automated Phase 4b review** (%s, reviewer %s)\n\n' "$DIRECTION" "$REVIEWER"
   printf '%s\n' "$SUMMARY"
+  printf '\n### Review Metadata\n\n'
+  printf -- '- Reviewed head: `%s`\n' "${HEAD:-unknown}"
+  printf -- '- Reviewer identity: `%s`\n' "$REVIEWER"
+  printf -- '- Adapter: `%s`\n' "$ADAPTER"
+  printf -- '- Adapter runs: `%s`\n' "$ADAPTER_RUNS"
+  printf -- '- Adapter timeout: `%ss`\n' "$ADAPTER_TIMEOUT"
+  if [ -n "$TOKEN_COUNT" ]; then
+    printf -- '- Token usage: `%s` tokens' "$TOKEN_COUNT"
+    [ -n "$USAGE_SOURCE" ] && printf ' (source: `%s`)' "$USAGE_SOURCE"
+    printf '\n'
+  else
+    printf -- '- Token usage: not exposed by adapter/CLI\n'
+  fi
+  printf -- '- Model-internal turn count: not exposed by the adapter contract\n'
   if [ "$FINDINGS_COUNT" -gt 0 ]; then
     printf '\n### Findings\n\n'
     printf '%s' "$VERDICT_JSON" | jq -r '
@@ -202,10 +246,34 @@ trap "rm -f '$BODY_FILE'" EXIT
 # --- map verdict -> GitHub review state ------------------------------------
 post_review() {
   local state_flag="$1"
+  local gh_bin=gh api_cmd=api event payload_file review_response review_rc created_commit
   [ -x "$GH_AS_REVIEWER" ] || p4b_die 3 "gh-as-reviewer.sh not found at $GH_AS_REVIEWER"
   command -v gh >/dev/null 2>&1 || p4b_die 3 "gh is required to post the review"
-  GH_AS_REVIEWER_IDENTITY="$REVIEWER" "$GH_AS_REVIEWER" -- \
-    gh pr review "$PR" --repo "$REPO" "$state_flag" --body-file "$BODY_FILE"
+  case "$state_flag" in
+    --approve) event="APPROVE" ;;
+    --request-changes) event="REQUEST_CHANGES" ;;
+    *) p4b_die 3 "unsupported review state flag: $state_flag" ;;
+  esac
+  local live_head
+  live_head="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
+  [ -n "$live_head" ] || p4b_die 3 "could not re-read live PR head before posting review"
+  if [ "$live_head" != "$HEAD" ]; then
+    fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head)"
+  fi
+  payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
+  jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
+    '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"
+  set +e
+  review_response="$(
+    env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$REVIEWER" "$GH_AS_REVIEWER" -- \
+      "$gh_bin" "$api_cmd" "repos/$REPO/pulls/$PR/reviews" --method POST --input "$payload_file"
+  )"
+  review_rc=$?
+  set -e
+  rm -f "$payload_file"
+  [ "$review_rc" -eq 0 ] || return "$review_rc"
+  created_commit="$(printf '%s' "$review_response" | jq -r '.commit_id // empty' 2>/dev/null || true)"
+  [ "$created_commit" = "$HEAD" ] || p4b_die 3 "created review was not pinned to reviewed head (expected $HEAD, got ${created_commit:-unknown})"
 }
 
 REVIEW_POSTED=false
@@ -247,6 +315,8 @@ jq -n \
   --arg verdict "$VERDICT" \
   --argjson review_posted "$REVIEW_POSTED" \
   --argjson dry_run "$DRY_RUN" \
+  --arg token_count "${TOKEN_COUNT:-}" \
+  --arg usage_source "$USAGE_SOURCE" \
   --argjson findings_count "$FINDINGS_COUNT" '
   {
     pr_number: $pr,
@@ -259,6 +329,8 @@ jq -n \
     review_posted: $review_posted,
     dry_run: $dry_run,
     findings_count: $findings_count,
+    token_count: (if $token_count == "" then null else ($token_count | tonumber) end),
+    usage_source: (if $usage_source == "" then null else $usage_source end),
     fell_back_to_manual: false,
     automation_enabled: true
   }'
