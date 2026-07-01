@@ -529,6 +529,45 @@ dependabot:
 phase_4b_default: complex-changes
 
 # ---------------------------------------------------------------------------
+# Phase 4b automated review handoff (reference feature)
+# ---------------------------------------------------------------------------
+# Automates the Phase 4b handoff itself: instead of a human shuttling the
+# PR into a second agent's CLI session, scripts/phase-4b-review.sh invokes
+# the external reviewer's CLI headless (codex exec / claude -p), then posts
+# the resulting APPROVED / CHANGES_REQUESTED review under the reviewer PAT
+# via scripts/gh-as-reviewer.sh. The posted APPROVED on the current HEAD is
+# the same "Phase 4b substitute" clearance the merge gate already accepts
+# (see codex.allow_phase_4b_substitute above), so this adds NO merge-gate
+# code. Design + diagrams: plans/automated-phase-4b-handoff.md.
+#
+# DISABLED BY DEFAULT. While enabled != true (or mode != local),
+# scripts/phase-4b-review.sh exits 5 and the caller uses today's manual
+# handoff (scripts/post-phase-4b-handoff.sh) — no behavior change. Opt in
+# per repo, Mergepath first (narrow-start, like codex.p1_gate).
+phase_4b_automation:
+  # Master switch. false ⇒ manual handoff (current behavior).
+  enabled: false
+
+  # Execution model. 'local' = the authoring agent's session shells out to
+  # the reviewer CLI on the same machine (reuses op-preflight + the gh
+  # reviewer wrapper). 'manual' defers to the human handoff. A CI mode is a
+  # future follow-up (not implemented in the reference).
+  mode: local
+
+  # Bounded review rounds before escalating to the human per
+  # REVIEW_POLICY.md § Disagreements and Tiebreaking.
+  max_review_rounds: 2
+
+  # Fail closed: an ambiguous / non-schema-conformant adapter verdict must
+  # NEVER become an APPROVED. The orchestrator falls back to the manual
+  # handoff instead. (Documentary; the reference always fails closed.)
+  fail_closed: true
+
+  # What to do on adapter error/timeout: emit the manual chat-side handoff
+  # block and alert the human. (Documentary; the only implemented behavior.)
+  fallback_on_error: manual-handoff
+
+# ---------------------------------------------------------------------------
 # Auto-clear blocking labels (#195/#197)
 # ---------------------------------------------------------------------------
 # Knobs for .github/workflows/auto-clear-blocking-labels.yml. The

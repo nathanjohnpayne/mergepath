@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nathanjohnpayne.dev/mergepath/phase-4b/verdict.schema.json",
+  "title": "Mergepath Phase 4b automated-review verdict",
+  "description": "Normalized verdict object that every Phase 4b reviewer adapter (codex / claude) must emit on stdout. Also passed verbatim to `codex exec --output-schema` so the Codex CLI constrains its final message to this shape. Strict (additionalProperties:false, all properties required) for OpenAI structured-output compatibility.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "findings"],
+  "properties": {
+    "verdict": {
+      "description": "The reviewer's merge decision. APPROVED becomes a `gh pr review --approve` (the Phase 4b substitute clearance the merge gate accepts); CHANGES_REQUESTED becomes `gh pr review --request-changes`. There is deliberately no COMMENTED/abstain value: an adapter that cannot reach one of these two decisions must exit non-zero so the orchestrator fails closed to the manual handoff rather than posting an ambiguous review.",
+      "type": "string",
+      "enum": ["APPROVED", "CHANGES_REQUESTED"]
+    },
+    "summary": {
+      "description": "One to four sentences explaining the verdict. Posted as the review body.",
+      "type": "string",
+      "minLength": 1
+    },
+    "findings": {
+      "description": "Per-issue findings. Empty array is valid (a clean APPROVED). For CHANGES_REQUESTED there should be at least one P0/P1 finding.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "path", "line", "body"],
+        "properties": {
+          "severity": {
+            "description": "P0/P1 block clearance; P2/P3 are advisory (mirrors the Codex GitHub App priority markers).",
+            "type": "string",
+            "enum": ["P0", "P1", "P2", "P3"]
+          },
+          "path": {
+            "description": "Repo-relative file path the finding anchors to, or null for a PR-level finding.",
+            "type": ["string", "null"]
+          },
+          "line": {
+            "description": "1-based line in the new file, or null.",
+            "type": ["integer", "null"]
+          },
+          "body": {
+            "description": "The finding text.",
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

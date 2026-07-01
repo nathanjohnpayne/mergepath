@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# check_phase_4b_automation
+#
+# Verifies the Phase 4b automated-review handoff package is present,
+# executable, structurally sound, and passing its unit tests. The package
+# automates REVIEW_POLICY.md § Phase 4b (design:
+# plans/automated-phase-4b-handoff.md):
+#
+#   scripts/phase-4b-review.sh                      (orchestrator)
+#   scripts/phase-4b/adapters/review-via-codex.sh   (Direction A: codex exec)
+#   scripts/phase-4b/adapters/review-via-claude.sh  (Direction B: claude -p)
+#   scripts/phase-4b/verdict.schema.json            (verdict contract)
+#   scripts/phase-4b/lib.sh                          (shared, sourced)
+#
+# Fail-closed around tests/test_phase_4b_automation.sh: a missing test
+# script is a hard error, not a silent skip (matches check_codex_scripts).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+REQUIRED_EXEC=(
+  "scripts/phase-4b-review.sh"
+  "scripts/phase-4b/adapters/review-via-codex.sh"
+  "scripts/phase-4b/adapters/review-via-claude.sh"
+)
+REQUIRED_FILES=(
+  "scripts/phase-4b/lib.sh"
+  "scripts/phase-4b/verdict.schema.json"
+)
+TEST="tests/test_phase_4b_automation.sh"
+
+FAILED=0
+
+for rel in "${REQUIRED_EXEC[@]}"; do
+  full="$REPO_ROOT/$rel"
+  if [ ! -f "$full" ]; then
+    echo "FAIL: missing required script: $rel"; FAILED=1; continue
+  fi
+  if [ ! -x "$full" ]; then
+    echo "FAIL: script is not executable: $rel"
+    echo "      Fix with: chmod +x $rel"; FAILED=1
+  fi
+done
+
+for rel in "${REQUIRED_FILES[@]}"; do
+  if [ ! -f "$REPO_ROOT/$rel" ]; then
+    echo "FAIL: missing required file: $rel"; FAILED=1
+  fi
+done
+
+# verdict.schema.json must be valid JSON (it is fed to `codex exec
+# --output-schema`, and lib.sh's validator mirrors it).
+if command -v jq >/dev/null 2>&1; then
+  if [ -f "$REPO_ROOT/scripts/phase-4b/verdict.schema.json" ] \
+     && ! jq -e . "$REPO_ROOT/scripts/phase-4b/verdict.schema.json" >/dev/null 2>&1; then
+    echo "FAIL: scripts/phase-4b/verdict.schema.json is not valid JSON"; FAILED=1
+  fi
+else
+  echo "WARN: jq not available — skipping schema JSON validation"
+fi
+
+# Optional static analysis: run shellcheck when present (CI has it).
+# --severity=warning fails on warnings + errors but tolerates info/style
+# (e.g. SC1091 unfollowed `source`, the intentional &&/|| test idiom). No
+# -x, so we lint only these files and do not transitively re-lint repo libs.
+if command -v shellcheck >/dev/null 2>&1; then
+  if ! shellcheck --severity=warning \
+      "$REPO_ROOT/scripts/phase-4b-review.sh" \
+      "$REPO_ROOT/scripts/phase-4b/lib.sh" \
+      "$REPO_ROOT/scripts/phase-4b/adapters/review-via-codex.sh" \
+      "$REPO_ROOT/scripts/phase-4b/adapters/review-via-claude.sh" \
+      "$REPO_ROOT/tests/test_phase_4b_automation.sh"; then
+    echo "FAIL: shellcheck reported warnings/errors in the phase-4b scripts"; FAILED=1
+  fi
+fi
+
+if [ "$FAILED" -eq 1 ]; then
+  echo "check_phase_4b_automation: FAIL"
+  exit 1
+fi
+
+if [ ! -f "$REPO_ROOT/$TEST" ]; then
+  echo "FAIL: missing required test: $TEST (fail-closed — no silent skip)"
+  echo "check_phase_4b_automation: FAIL"
+  exit 1
+fi
+
+echo "check_phase_4b_automation: running $TEST"
+"$REPO_ROOT/$TEST"
+
+echo "check_phase_4b_automation: PASS"
+exit 0
