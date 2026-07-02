@@ -42,7 +42,18 @@
 #                           follow-up issue via --rationale. The tag
 #                           defaults to deferred-to-followup: the honest
 #                           marker for "not handled here", which the
-#                           daily rollup keeps re-surfacing.
+#                           daily rollup keeps re-surfacing. That default
+#                           also applies when the TAG ladder lands on a
+#                           ROUTING class (canonical-coverage /
+#                           templated-render) for a non-actioned thread
+#                           (#616): the rollup SKIPS routing classes, so
+#                           recording one here would bury the deliberate
+#                           deferral forever. The routing context is
+#                           logged (INFO line); the disposition of record
+#                           stays deferred-to-followup until the finding
+#                           is actioned or
+#                           --resolve-verified-propagation proves the
+#                           propagation.
 #                           Do NOT reach for this mode on findings you
 #                           fixed or rebutted — that silently mis-records
 #                           them as deferred (the #571 failure that
@@ -1086,16 +1097,15 @@ fetch_manifest_paths() {
   fi
 }
 
-# path_matches_manifest <file-path> → exit 0 on match, 1 otherwise.
-# A file matches a canonical entry if the manifest path equals the
-# file path, or if the manifest path ends with `/` (kit) and the file
-# starts with it.
-path_matches_manifest() {
-  local file_path="$1"
+# _path_matches_entry_list <file-path> <newline-separated-paths> — shared
+# matcher for the manifest path predicates: a file matches an entry if the
+# entry path equals the file path, or if the entry path ends with `/`
+# (kit) and the file path starts with it. Empty list never matches.
+_path_matches_entry_list() {
+  local file_path="$1" entry_list="$2" mp
   [ -z "$file_path" ] && return 1
   [ "$file_path" = "(no path)" ] && return 1
-  fetch_manifest_paths
-  [ -z "$MANIFEST_PATHS_CACHE" ] && return 1
+  [ -z "$entry_list" ] && return 1
   while IFS= read -r mp; do
     [ -z "$mp" ] && continue
     if [ "${mp: -1}" = "/" ]; then
@@ -1105,8 +1115,77 @@ path_matches_manifest() {
     else
       [ "$file_path" = "$mp" ] && return 0
     fi
-  done <<< "$MANIFEST_PATHS_CACHE"
+  done <<< "$entry_list"
   return 1
+}
+
+# path_matches_manifest <file-path> → exit 0 on match, 1 otherwise.
+# Matches ANY manifest entry's .path (canonical, kit, or a templated
+# entry's SOURCE) — the broad routing signal the TAG ladder uses.
+path_matches_manifest() {
+  fetch_manifest_paths
+  _path_matches_entry_list "$1" "$MANIFEST_PATHS_CACHE"
+}
+
+# fetch_manifest_canonical_paths — like fetch_manifest_paths but ONLY the
+# canonical + kit entries (#616, Codex finding 3509930343). A templated
+# entry's `.path` is the MERGEPATH SOURCE — consumers receive `.dest`, not
+# the source — so a consumer file that coincidentally sits at a templated
+# source path is NOT propagated content and must never byte-verify against
+# it. --resolve-verified-propagation's canonical branch therefore routes on
+# this cache; templated routing goes by dest (path_matches_templated_dest).
+MANIFEST_CANONICAL_PATHS_CACHE=""
+MANIFEST_CANONICAL_FETCHED=false
+fetch_manifest_canonical_paths() {
+  $MANIFEST_CANONICAL_FETCHED && return 0
+  MANIFEST_CANONICAL_FETCHED=true
+  local manifest="$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml"
+  [ -f "$manifest" ] || return 0
+  # RESOLVE_PR_THREADS_FORCE_NO_YQ=1 forces the awk fallback — same test
+  # hook as the sibling caches (#521). Inert in production.
+  if [ -z "${RESOLVE_PR_THREADS_FORCE_NO_YQ:-}" ] && command -v yq >/dev/null 2>&1; then
+    MANIFEST_CANONICAL_PATHS_CACHE=$(yq -r '
+      .paths[] | select(.type == "canonical" or .type == "kit") | .path
+    ' "$manifest" 2>/dev/null || true)
+  else
+    # awk fallback — entry-boundary emission mirroring
+    # fetch_manifest_templated_dests: pair `path:` with `type:` within a
+    # paths-block entry, emit ONLY canonical/kit entries. Positive
+    # selection is deliberate: an entry with no recognized type is
+    # excluded (conservative under-match → the verified-propagation mode
+    # skips fail-closed rather than byte-comparing a non-canonical path).
+    MANIFEST_CANONICAL_PATHS_CACHE=$(awk '
+      function emit() {
+        if ((cur_type == "canonical" || cur_type == "kit") && cur_path != "")
+          print cur_path
+      }
+      /^paths:/ { in_p = 1; next }
+      in_p && /^[^[:space:]#]/ { emit(); in_p = 0 }
+      !in_p { next }
+      /^[[:space:]]*-[[:space:]]*path:/ {
+        emit()
+        cur_path = $0
+        sub(/^[[:space:]]*-[[:space:]]*path:[[:space:]]*/, "", cur_path)
+        sub(/[[:space:]]*#.*$/, "", cur_path)
+        gsub(/^[[:space:]]+|[[:space:]]+$|^"|"$/, "", cur_path)
+        cur_type = ""
+      }
+      /^[[:space:]]*type:[[:space:]]*["\047]?canonical["\047]?[[:space:]]*(#.*)?$/ {
+        cur_type = "canonical"
+      }
+      /^[[:space:]]*type:[[:space:]]*["\047]?kit["\047]?[[:space:]]*(#.*)?$/ {
+        cur_type = "kit"
+      }
+      END { emit() }
+    ' "$manifest" 2>/dev/null || true)
+  fi
+}
+
+# path_matches_canonical_entry <file-path> → exit 0 when the path matches
+# a canonical/kit manifest entry (templated sources excluded), 1 otherwise.
+path_matches_canonical_entry() {
+  fetch_manifest_canonical_paths
+  _path_matches_entry_list "$1" "$MANIFEST_CANONICAL_PATHS_CACHE"
 }
 
 # fetch_manifest_templated_dests — extract dest + eligible consumer
@@ -1463,6 +1542,14 @@ manifest_templated_source_for_dest() {
 # is a manifest canonical/kit entry, `templated-render` when it is a
 # templated entry's dest for this consumer, `not-routed` otherwise.
 #
+# The canonical branch matches CANONICAL/KIT entries only
+# (path_matches_canonical_entry, NOT the broad path_matches_manifest) —
+# a templated entry's `.path` is the mergepath SOURCE while the consumer
+# receives `.dest`, so a consumer file coincidentally at a templated
+# source path with matching bytes must not resolve as verified
+# propagation (#616, Codex finding 3509930343). Templated routing goes
+# by dest, below.
+#
 # Deliberately IGNORES recorded [mergepath-resolve: ...] markers, unlike
 # derive_tag_class's default TAG ladder (whose step 0 honors a surface
 # marker BEFORE the path checks). The mode's target population is exactly
@@ -1477,7 +1564,7 @@ manifest_templated_source_for_dest() {
 derive_routing_class() {
   local thread_path
   thread_path=$(printf '%s' "$1" | jq -r '.path // ""')
-  if path_matches_manifest "$thread_path"; then
+  if path_matches_canonical_entry "$thread_path"; then
     echo "canonical-coverage"
     return
   fi
@@ -1528,8 +1615,9 @@ verify_propagation_content() {
     # from this same predicate (derive_routing_class), so this is
     # belt-and-braces for any future caller whose class arrives another
     # way (e.g. a recorded marker): the byte-compare source must be a
-    # real canonical/kit entry in THIS manifest.
-    if ! path_matches_manifest "$vp_path"; then
+    # real canonical/kit entry in THIS manifest — templated sources are
+    # excluded (#616, Codex finding 3509930343).
+    if ! path_matches_canonical_entry "$vp_path"; then
       rm -f "$consumer_tmp"
       echo "no canonical/kit entry in .mergepath-sync.yml covers $vp_path"
       return 2
@@ -2194,7 +2282,7 @@ while IFS= read -r thread; do
     # subshells inherit warmed caches but cannot write back).
     fetch_pr_tag_data
     augment_pr_commits_with_sha
-    fetch_manifest_paths
+    fetch_manifest_canonical_paths
     fetch_manifest_templated_dests
     fetch_consumer_default_branch || true
     manifest_consumer_name_for_repo || true
@@ -2365,13 +2453,30 @@ while IFS= read -r thread; do
           # not demonstrably actioned keeps deferred-to-followup. See the
           # header's --auto-resolve-bots entry for why auto-upgrade beats
           # warn-only.
-          if [ "$thread_class" = "deferred-to-followup" ]; then
-            upgraded_class=$(derive_tag_class "$thread" skip-routing)
-            if class_is_actioned "$upgraded_class"; then
-              echo "  INFO: tag auto-upgraded deferred-to-followup → $upgraded_class for [$AUTHOR] $PATH_ (demonstrably actioned; #575)"
-              thread_class="$upgraded_class"
-            fi
-          fi
+          #
+          # #616 (Codex finding 3509930338): the ROUTING classes the ladder
+          # emits first — canonical-coverage / templated-render — get the
+          # same actioned re-check, and when NOT actioned they are recorded
+          # as deferred-to-followup, not the routing tag. This mode is THE
+          # tool for EXPLICIT DEFERRAL, and the daily rollup SKIPS routing
+          # classes — a routing tag here would bury a deliberate deferral so
+          # it never resurfaces, contrary to the #575 disposition contract.
+          # Routing says WHERE a fix belongs, not that one happened (#565);
+          # once propagation provably lands, --resolve-verified-propagation
+          # is the mode that closes these under a verified tag.
+          case "$thread_class" in
+            deferred-to-followup|canonical-coverage|templated-render)
+              orig_class="$thread_class"
+              upgraded_class=$(derive_tag_class "$thread" skip-routing)
+              if class_is_actioned "$upgraded_class"; then
+                echo "  INFO: tag auto-upgraded $orig_class → $upgraded_class for [$AUTHOR] $PATH_ (demonstrably actioned; #575)"
+                thread_class="$upgraded_class"
+              elif [ "$orig_class" != "deferred-to-followup" ]; then
+                echo "  INFO: routing class $orig_class recorded as deferred-to-followup for [$AUTHOR] $PATH_ (explicit deferral, not actioned; #616)"
+                thread_class="deferred-to-followup"
+              fi
+              ;;
+          esac
         else
           echo "  WARN: comment pagination incomplete for [$AUTHOR] $PATH_ — tagging deferred-to-followup (fail-safe)" >&2
           # #575 guard intentionally NOT applied here: action cannot be

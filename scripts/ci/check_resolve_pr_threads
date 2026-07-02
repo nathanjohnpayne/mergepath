@@ -13,25 +13,29 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SCRIPT="$ROOT/scripts/resolve-pr-threads.sh"
 
-# ── CI-only yq self-bootstrap (#616, Codex finding 3509734393)
+# ── CI-only yq self-bootstrap (#616, Codex findings 3509734393 + 3509930342)
 # The delegated verified-propagation suite (Test 10 below) hard-requires
 # mikefarah/yq. On mergepath, repo_lint.yml's install_yq_for_sync_manifest
 # step installs it before this check runs — but consumers receive this
 # check via the manifest-synced scripts/ci kit while their repo_lint.yml
 # (with the install-step ordering) arrives separately on the
 # template-mirror lane (#601), so a skew window could run this check with
-# no yq on the runner. Self-bootstrap via the shared pinned installer,
-# CI-only: --ci-only no-ops outside GITHUB_ACTIONS=true, so local runs
-# keep the suite's own hard "yq is required" error instead of a surprise
-# sudo install. A bootstrap that cannot run fails closed here rather than
-# letting Test 10 produce a less obvious failure.
-if ! command -v yq >/dev/null 2>&1; then
-  ENSURE_YQ="$ROOT/scripts/lib/ensure-yq.sh"
-  if [ -f "$ENSURE_YQ" ]; then
-    if ! bash "$ENSURE_YQ" --ci-only; then
-      echo "check_resolve_pr_threads: FAIL — yq bootstrap failed (scripts/lib/ensure-yq.sh)" >&2
-      exit 1
-    fi
+# no yq — or the WRONG yq (e.g. the Python wrapper preinstalled on some
+# runners) — on the runner. ALWAYS delegate to the shared pinned installer:
+# ensure-yq.sh owns the implementation detection (its short-circuit greps
+# `yq --version` for mikefarah/yq), so a non-mikefarah yq on PATH still
+# bootstraps the pinned binary instead of failing later with parser
+# errors. Do NOT gate this on `command -v yq` — that skips the bootstrap
+# whenever ANY yq is present (finding 3509930342). CI-only: --ci-only
+# no-ops outside GITHUB_ACTIONS=true, so local runs keep the suite's own
+# hard "yq is required" error instead of a surprise sudo install. A
+# bootstrap that cannot run fails closed here rather than letting Test 10
+# produce a less obvious failure.
+ENSURE_YQ="$ROOT/scripts/lib/ensure-yq.sh"
+if [ -f "$ENSURE_YQ" ]; then
+  if ! bash "$ENSURE_YQ" --ci-only; then
+    echo "check_resolve_pr_threads: FAIL — yq bootstrap failed (scripts/lib/ensure-yq.sh)" >&2
+    exit 1
   fi
 fi
 

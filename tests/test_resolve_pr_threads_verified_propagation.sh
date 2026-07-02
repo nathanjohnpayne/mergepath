@@ -48,15 +48,24 @@
 #      instead of verified-propagation (#616 finding 3509734396); the
 #      byte-compare is skipped (no contents fetch — resolves even over
 #      drifted consumer content, on the action evidence).
+# 10b. A consumer thread anchored at a TEMPLATED entry's SOURCE path
+#      (which the manifest lists as `.path` but never propagates to the
+#      consumer — the consumer receives `dest`) must NOT resolve as
+#      verified propagation even when the consumer content byte-matches
+#      the mergepath source: routing skips it as not-propagation-routed
+#      (#616 finding 3509930343).
 #  11. scripts/lib/ensure-yq.sh short-circuits when a mikefarah yq is
 #      already on PATH (no installer calls).
 #  12. scripts/lib/ensure-yq.sh --ci-only: no-op without
 #      GITHUB_ACTIONS=true; with it, installs the PINNED release via
 #      stubbed sudo/wget (no network) to ENSURE_YQ_DEST (#616 finding
-#      3509734393).
+#      3509734393) — INCLUDING when a wrong-implementation (non-mikefarah)
+#      yq is already on PATH (#616 finding 3509930342).
 #  13. check_resolve_pr_threads wires the CI-only bootstrap: structural
-#      assertions that the missing-yq guard delegates to
-#      scripts/lib/ensure-yq.sh --ci-only and the lib exists.
+#      assertions that the check ALWAYS delegates to
+#      scripts/lib/ensure-yq.sh --ci-only (no `command -v yq` gate — a
+#      wrong-implementation yq on PATH must not skip the bootstrap,
+#      #616 finding 3509930342) and the lib exists.
 
 set -euo pipefail
 
@@ -64,8 +73,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/scripts/resolve-pr-threads.sh"
 [ -f "$SCRIPT" ] || { echo "missing $SCRIPT" >&2; exit 1; }
 
-if ! command -v yq >/dev/null 2>&1; then
-  echo "test_resolve_pr_threads_verified_propagation: yq is required (mikefarah/yq v4+)" >&2
+# Require the mikefarah implementation specifically, not just any `yq` on
+# PATH — the Python wrapper answers `command -v yq` but rejects v4 syntax,
+# which would surface here as opaque parser errors mid-suite (#616 finding
+# 3509930342). The implementation sniff mirrors the canonical short-circuit
+# in scripts/lib/ensure-yq.sh (which check_resolve_pr_threads delegates to
+# unconditionally under CI, so runners self-heal before this guard runs).
+if ! command -v yq >/dev/null 2>&1 || ! yq --version 2>&1 | grep -q "mikefarah/yq"; then
+  echo "test_resolve_pr_threads_verified_propagation: mikefarah/yq v4+ is required (missing or wrong yq implementation on PATH)" >&2
   exit 1
 fi
 
@@ -627,6 +642,52 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────
+# Test 10b: a thread anchored at a TEMPLATED entry's SOURCE path must NOT
+# resolve as verified propagation (#616 finding 3509930343). The fixture
+# manifest's templated entry has path/source examples/tpl.txt with dest
+# rendered/out.txt — the consumer only ever receives the DEST, so a
+# consumer file that happens to sit at examples/tpl.txt with bytes equal
+# to the mergepath source is a coincidence, not propagation. Pre-fix,
+# the canonical routing predicate matched ANY manifest `.paths[].path`
+# (templated sources included) and byte-verified → wrong resolve. Now the
+# canonical branch matches canonical/kit entries only, the templated
+# branch routes by dest, so this thread is skipped
+# not-propagation-routed: exit 3, no mutations, no contents fetch.
+# (Test 7 corrupted examples/tpl.txt in the fixture tree; irrelevant here
+# — the consumer fixture copies whatever the current source bytes are, so
+# the pre-fix byte-compare would still match.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 10b: templated SOURCE path coincidence never verifies as canonical (#616)"
+
+make_thread_fixture "PRT_VP10B" "examples/tpl.txt" "coderabbitai" \
+  "Finding on a file at the templated source path" "OLDCOMMIT0" \
+  "$SCRATCH/threads_vp10b.json"
+CONSUMER_TPL_SOURCE_COPY="$SCRATCH/consumer-tpl-source-copy.txt"
+cp "$FIXTURE_ROOT/examples/tpl.txt" "$CONSUMER_TPL_SOURCE_COPY"
+if ! cmp -s "$FIXTURE_ROOT/examples/tpl.txt" "$CONSUMER_TPL_SOURCE_COPY"; then
+  fail=$((fail + 1))
+  echo "  FAIL: precondition — consumer fixture must byte-match the templated source" >&2
+fi
+
+GH_ARGV_LOG="$SCRATCH/t10b.log"; : > "$GH_ARGV_LOG"
+run_mode "$SCRATCH/threads_vp10b.json" "$CONSUMER_TPL_SOURCE_COPY"
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not propagation-routed)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG" \
+   && ! grep -q '/contents/' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: templated-source-path thread skipped not-propagation-routed (no mutations, no contents fetch)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: templated-source-path thread was treated as canonical coverage (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
 # Tests 11–13: the #616 (finding 3509734393) CI-only yq bootstrap.
 # scripts/lib/ensure-yq.sh is the single source for the pinned mikefarah
 # yq install; check_resolve_pr_threads self-bootstraps through it under
@@ -725,19 +786,49 @@ out_b=$(env GITHUB_ACTIONS=true PATH="$YQBOOT_BIN" \
 rc_b=$?
 set -e
 
+# 12c — CI, but a WRONG-implementation yq (the Python wrapper shape:
+# `yq --version` with no mikefarah marker) is already on PATH (#616
+# finding 3509930342). The short-circuit's implementation sniff must
+# REJECT it and still install the pinned mikefarah release — the
+# pre-#616 caller-side `command -v yq` gate skipped the bootstrap
+# entirely in exactly this environment.
+YQWRONG_BIN="$SCRATCH/yqwrong-bin"
+mkdir -p "$YQWRONG_BIN" "$SCRATCH/yqboot-dest-c"
+ln -s "$(command -v grep)" "$YQWRONG_BIN/grep"
+ln -s "$YQBOOT_BIN/sudo" "$YQWRONG_BIN/sudo"
+ln -s "$YQBOOT_BIN/wget" "$YQWRONG_BIN/wget"
+ln -s "$(command -v chmod)" "$YQWRONG_BIN/chmod"
+cat > "$YQWRONG_BIN/yq" <<'YQ_WRONG'
+#!/bin/sh
+echo "yq 3.4.3"
+YQ_WRONG
+chmod +x "$YQWRONG_BIN/yq"
+
+set +e
+out_c=$(env GITHUB_ACTIONS=true PATH="$YQWRONG_BIN" \
+  ENSURE_YQ_DEST="$SCRATCH/yqboot-dest-c/yq" \
+  "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
+rc_c=$?
+set -e
+
 if [ "$rc_a" -eq 0 ] \
    && grep -q 'not a CI run' <<<"$out_a" \
    && [ "$rc_b" -eq 0 ] \
    && grep -q 'WGET: https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64' "$YQBOOT_LOG" \
    && [ -x "$SCRATCH/yqboot-dest/yq" ] \
-   && grep -q 'version v4.44.3' <<<"$out_b"; then
+   && grep -q 'version v4.44.3' <<<"$out_b" \
+   && [ "$rc_c" -eq 0 ] \
+   && ! grep -q 'yq already present' <<<"$out_c" \
+   && [ -x "$SCRATCH/yqboot-dest-c/yq" ] \
+   && grep -q 'version v4.44.3' <<<"$out_c"; then
   pass=$((pass + 1))
-  echo "  PASS: non-CI no-op; CI run installed the pinned release via stubs only"
+  echo "  PASS: non-CI no-op; CI installs pinned when yq is missing AND when a wrong-implementation yq is on PATH"
 else
   fail=$((fail + 1))
-  echo "  FAIL: --ci-only gating or pinned install broken (rc_a=$rc_a rc_b=$rc_b)" >&2
+  echo "  FAIL: --ci-only gating, pinned install, or wrong-impl detection broken (rc_a=$rc_a rc_b=$rc_b rc_c=$rc_c)" >&2
   echo "    non-CI output:" >&2; echo "$out_a" | sed 's/^/      /' >&2
   echo "    CI output:" >&2; echo "$out_b" | sed 's/^/      /' >&2
+  echo "    wrong-impl output:" >&2; echo "$out_c" | sed 's/^/      /' >&2
   echo "    installer log:" >&2; sed 's/^/      /' "$YQBOOT_LOG" >&2 || true
 fi
 
@@ -745,20 +836,29 @@ echo
 echo "Test 13: check_resolve_pr_threads wires the CI-only yq bootstrap (#616)"
 
 CHECK_WRAPPER="$ROOT/scripts/ci/check_resolve_pr_threads"
-# Structural: the wrapper must (a) exist alongside the lib, (b) guard on
-# a MISSING yq, and (c) delegate to the shared lib with --ci-only. The
-# wrapper and this test travel in the same sync wave (scripts/ci kit +
-# canonical tests/ entry), so asserting on its contents is skew-safe.
+# Structural: the wrapper must (a) exist alongside the lib, (b) delegate
+# to the shared lib with --ci-only, and (c) delegate UNCONDITIONALLY —
+# no `command -v yq` gate around the bootstrap. The pre-#616-round-3
+# shape only invoked ensure-yq.sh when yq was MISSING, so a
+# wrong-implementation yq on PATH (the Python wrapper) skipped the
+# bootstrap and the delegated suite failed later with parser errors
+# (finding 3509930342); implementation detection is single-sourced in
+# ensure-yq.sh's short-circuit. The wrapper and this test travel in the
+# same sync wave (scripts/ci kit + canonical tests/ entry), so asserting
+# on its contents is skew-safe. The negative grep scans only the
+# wrapper's CODE lines (comments stripped) so prose ABOUT the old gate
+# does not trip it.
+CHECK_WRAPPER_CODE=$(sed 's/[[:space:]]*#.*$//' "$CHECK_WRAPPER" 2>/dev/null || true)
 if [ -f "$CHECK_WRAPPER" ] \
    && [ -f "$ENSURE_YQ" ] \
-   && grep -q 'command -v yq' "$CHECK_WRAPPER" \
    && grep -q 'scripts/lib/ensure-yq.sh' "$CHECK_WRAPPER" \
-   && grep -Eq 'ensure-yq\.sh[^#]*--ci-only|"\$ENSURE_YQ" --ci-only' "$CHECK_WRAPPER"; then
+   && grep -Eq 'ensure-yq\.sh[^#]*--ci-only|"\$ENSURE_YQ" --ci-only' "$CHECK_WRAPPER" \
+   && ! grep -q 'command -v yq' <<<"$CHECK_WRAPPER_CODE"; then
   pass=$((pass + 1))
-  echo "  PASS: wrapper guards on missing yq and delegates to ensure-yq.sh --ci-only"
+  echo "  PASS: wrapper delegates unconditionally to ensure-yq.sh --ci-only (no command -v yq gate)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: check_resolve_pr_threads is missing the CI-only yq bootstrap wiring" >&2
+  echo "  FAIL: check_resolve_pr_threads must delegate to ensure-yq.sh --ci-only WITHOUT a command -v yq gate (#616 finding 3509930342)" >&2
 fi
 
 echo
