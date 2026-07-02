@@ -739,6 +739,24 @@ p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD_GUARDED,$RER
 p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD,$RERUN_APPROVED_SAMEHEAD]" \
   && pass "no final head supplied ⇒ same-head guard skipped (backward-compatible contract)" \
   || fail "two-argument call wrongly enforced the same-head guard"
+# --- same_head_only mode (#615 round 9, CodeRabbit; fails pre-fix) -----------
+# The approval-time hook runs this assertion against the LIVE loop log, where
+# the current loop can be legitimately absent (its record append failed). Full
+# mode would then demand a clean APPROVED loop that is not in the log and
+# refuse a VALID head-advanced approval; same_head_only applies exactly the
+# laundering clause and nothing record-scoped.
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD]" def456 same_head_only \
+  && pass "same_head_only: head-advanced approval passes with only a prior CR-P1 loop in the log (current loop unrecorded) (round 9 CodeRabbit)" \
+  || fail "same_head_only wrongly refused a head-advanced approval whose current loop is unrecorded"
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD]" def456 \
+  && fail "full mode accepted a final APPROVED with no clean approved loop (record-context regression)" \
+  || pass "full mode still requires the clean APPROVED loop (record context unchanged)"
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD]" abc123 same_head_only \
+  && fail "same_head_only laundered a same-head unresolved P1" \
+  || pass "same_head_only still fails closed on a same-head unresolved required finding"
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD]" def456 bogus-mode \
+  && fail "an unrecognized mode weakened the assertion (must behave as full)" \
+  || pass "an unrecognized mode falls back to full (stricter is the safe direction)"
 # build_record threads its final-head argument into the guard: a same-head
 # rerun record is REFUSED (fails pre-fix).
 p4b_acct_build_record 55 abc123 APPROVED nathanpayne-codex "claude->codex" posted "" \
@@ -1459,6 +1477,28 @@ if (
   pass "loop numbering counts JSON objects: a multi-line record cannot inflate the next loop ID (#615 round 4)"
 else fail "object-count loop numbering (log=$(cat "$WORK/state-prettylog/phase-4b-loops/"*.jsonl 2>/dev/null | tail -3))"; fi
 
+# Approval-time same-head gate at the HOOK level (#615 round 9, CodeRabbit;
+# fails pre-fix): a live log holding ONLY a prior CR-P1 loop, current loop
+# unrecorded. A head-advanced approval (def456) must be SAFE (pre-fix the
+# full-mode record clauses refused it: no clean APPROVED loop in the log); a
+# same-head rerun (abc123) must still BLOCK (the laundering clause survives
+# the mode split).
+# shellcheck disable=SC2034  # orchestrator globals read by the sourced hook
+if (
+  P4B_ACCT_STATE_DIR="$WORK/state-samehead-hook"; export P4B_ACCT_STATE_DIR
+  REPO="o/r"; PR=303; HEAD=def456
+  log="$(p4b_acct_hook_loop_log)"
+  mkdir -p "$(dirname "$log")"
+  jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123)" \
+    '{schema:"p4b-loop-log/v1", started_at_epoch:null, loop:$loop, details:[]}' > "$log"
+  p4b_acct_hook_same_head_required_block || exit 1
+  HEAD=abc123
+  p4b_acct_hook_same_head_required_block && exit 1
+  exit 0
+); then
+  pass "approval-time hook: head-advanced approval is safe with the current loop unrecorded; a same-head rerun still blocks (#615 round 9 CodeRabbit)"
+else fail "approval-time hook safe/block split wrong on an unrecorded current loop"; fi
+
 # #615 Codex round 7, finding 2 (fails pre-fix): an APPROVED verdict carrying a
 # REQUIRED-tier finding is rejected by p4b_validate_verdict BEFORE the
 # discretionary gate, so note_fallback is reached with the GENERIC reason
@@ -1818,13 +1858,21 @@ BIGBLK="$(head -c 400000 /dev/zero | tr '\0' 'a')"
 # probe runs in its own strict subshell (mirroring the orchestrator's mode);
 # `|| FIX_RC=$?` keeps a subshell abort from tripping THIS script's set -e so
 # the assertion below can report it.
+# Capture-mechanism self-check first (#615 round 9, CodeRabbit): the earlier
+# `if ! ( ... ); then FIX_RC=$?` form read $? AFTER the ! negation — always 0
+# on the taken branch — so FIX_RC could never record a failure and the a3d
+# assertion was unfalsifiable. Prove the corrected `|| { RC=$?; }` pattern
+# actually captures a real strict-subshell failure code before trusting it.
+CAP_RC=0
+( set -euo pipefail; exit 7 ) || { CAP_RC=$?; }
+if [ "$CAP_RC" -eq 7 ]; then
+  pass "rc-capture pattern records a failing strict-subshell status — the a3d tripwire is falsifiable (round 9 CodeRabbit)"
+else fail "rc-capture pattern lost the subshell status (CAP_RC=$CAP_RC, want 7); the a3d assertion below cannot be trusted"; fi
 FIX_RC=0
 for _t in 1 2 3 4 5; do
-  if ! ( set -euo pipefail
-         v="$(LC_ALL=C; printf '%s' "${BIGBLK:0:64}")"
-         [ "${#v}" -eq 64 ] || exit 91 ); then
-    FIX_RC=$?; break
-  fi
+  ( set -euo pipefail
+    v="$(LC_ALL=C; printf '%s' "${BIGBLK:0:64}")"
+    [ "${#v}" -eq 64 ] || exit 91 ) || { FIX_RC=$?; break; }
 done
 # The vulnerable construct: run in a loop; record whether the pipe form ever
 # aborts a strict subshell (exit 141/SIGPIPE). Racy, so we do not REQUIRE an
@@ -1926,6 +1974,77 @@ if [ "$rc1" = 0 ] && [ "$rc2" = 0 ] \
    && [ "$(wc -l < "$LEDGER_C2" | tr -d '[:space:]')" = "1" ]; then
   pass "render-fail approval then clean approval of the same PR: the second record embeds only its own loop; the render-failed loop was rotated out (no double-count) (#615 round 7, finding 1)"
 else fail "render-fail no-double-count e2e (rc1=$rc1 rc2=$rc2, recA='$REC_C2A', recB loops=$(printf '%s' "$REC_C2B" | jq '.loops|length' 2>/dev/null), ledger-lines=$(wc -l < "$LEDGER_C2" 2>/dev/null))"; fi
+
+# (c3) #615 round 9, CodeRabbit (fails pre-fix): the accounting MODULE is
+#      ABSENT entirely. The module-missing contract says accounting is simply
+#      off (plain summary posts) — but the round-9 same-head safety gate
+#      called its hook unguarded, so the undefined function (exit 127) drove
+#      every valid APPROVED into fall_back_to_manual (exit 4).
+STATE_C3="$WORK/state-noacct"; BODY_C3="$WORK/body-noacct.md"
+# Repo-SHAPED copy (root/scripts/...): lib.sh resolves the repo root two dirs
+# above itself, and reviewer selection requires an executable adapter under
+# <root>/scripts/phase-4b/adapters — a bare copy of scripts/ would resolve
+# the root into $WORK and find no adapters (die 3 before the gate under test).
+NOACCT="$WORK/noacct-root"
+mkdir -p "$NOACCT"
+cp -Rp "$ROOT/scripts" "$NOACCT/scripts"
+rm -f "$NOACCT/scripts/phase-4b/accounting.sh"
+ORCH_SAVED="$ORCH"; ORCH="$NOACCT/scripts/phase-4b-review.sh"
+set +e
+out="$(run_orch "$STATE_C3" "$POLICY_ON" fake-codex-approve 306 P4B_WRAPPER_BODY="$BODY_C3" -- 2>"$WORK/noacct.err")"; rc=$?
+set -e
+ORCH="$ORCH_SAVED"
+if [ "$rc" = 0 ] \
+   && printf '%s' "$out" | jq -e '.verdict == "APPROVED" and .review_posted == true' >/dev/null \
+   && grep -q '^\*\*Automated Phase 4b review\*\*' "$BODY_C3" \
+   && ! grep -q 'Phase 4b Approval Accounting' "$BODY_C3" \
+   && [ ! -d "$STATE_C3" ]; then
+  pass "missing accounting module: a valid APPROVED still posts plain (no undefined-hook manual fallback, no state writes) (#615 round 9 CodeRabbit)"
+else fail "module-absent approval regressed (rc=$rc, out=$(printf '%s' "$out" | head -c 200), err=$(tail -c 300 "$WORK/noacct.err" 2>/dev/null))"; fi
+
+# (c4) #615 round 9, CodeRabbit (fails pre-fix), end-to-end: the current
+#      loop's record append FAILS (read-only log) while the log holds a prior
+#      CR-P1 loop on a DIFFERENT head. The head-advanced APPROVED is valid and
+#      must post (pre-fix the gate ran the record-scoped full assertion
+#      against the live log, found no clean APPROVED loop — the current one
+#      never recorded — and refused to manual fallback).
+STATE_C4="$WORK/state-c4"; BODY_C4="$WORK/body-c4.md"
+LOG_C4="$(P4B_ACCT_STATE_DIR="$STATE_C4" REPO="o/r" PR=307 p4b_acct_hook_loop_log)"
+mkdir -p "$(dirname "$LOG_C4")"
+jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false zzz999)" \
+  '{schema:"p4b-loop-log/v1", started_at_epoch:null, loop:$loop, details:[]}' > "$LOG_C4"
+chmod 444 "$LOG_C4"
+set +e
+out="$(run_orch "$STATE_C4" "$POLICY_ON" fake-codex-approve 307 P4B_WRAPPER_BODY="$BODY_C4" -- 2>/dev/null)"; rc=$?
+set -e
+chmod 644 "$LOG_C4"
+if [ "$rc" = 0 ] \
+   && printf '%s' "$out" | jq -e '.verdict == "APPROVED" and .review_posted == true' >/dev/null \
+   && grep -q '^\*\*Automated Phase 4b review\*\*' "$BODY_C4" \
+   && [ "$(jq -s length "$LOG_C4")" = 1 ]; then
+  pass "record-append failure + prior-head CR history: the head-advanced APPROVED still posts (live-log gate is same-head-only) (#615 round 9 CodeRabbit)"
+else fail "not-recorded head-advanced approval regressed (rc=$rc, out=$(printf '%s' "$out" | head -c 200))"; fi
+
+# (c5) the safety direction of the same split: identical setup but the prior
+#      unresolved CR-P1 sits on the RUN head itself (abc123) — the rerun
+#      without a fix commit must STILL be refused to the manual handoff even
+#      though its own record append failed (the gate must not need the
+#      current loop to enforce the laundering block).
+STATE_C5="$WORK/state-c5"; BODY_C5="$WORK/body-c5.md"
+LOG_C5="$(P4B_ACCT_STATE_DIR="$STATE_C5" REPO="o/r" PR=308 p4b_acct_hook_loop_log)"
+mkdir -p "$(dirname "$LOG_C5")"
+jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123)" \
+  '{schema:"p4b-loop-log/v1", started_at_epoch:null, loop:$loop, details:[]}' > "$LOG_C5"
+chmod 444 "$LOG_C5"
+set +e
+out="$(run_orch "$STATE_C5" "$POLICY_ON" fake-codex-approve 308 P4B_WRAPPER_BODY="$BODY_C5" -- 2>/dev/null)"; rc=$?
+set -e
+chmod 644 "$LOG_C5"
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -e '.review_posted == false and .fell_back_to_manual == true' >/dev/null \
+   && [ ! -e "$BODY_C5" ]; then
+  pass "record-append failure does NOT disarm the same-head laundering block: the no-fix rerun is refused to manual (exit 4, nothing posted)"
+else fail "same-head laundering block lost under a failed record append (rc=$rc, out=$(printf '%s' "$out" | head -c 200))"; fi
 
 # (d) changes-requested-then-fixed across two invocations: loop history
 #     accumulates and the final approval renders both loops + the lifecycle.

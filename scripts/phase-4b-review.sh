@@ -487,8 +487,19 @@ _[accounting truncated: the full block would exceed the review-body size limit; 
   # (fall_back_to_manual, exit 4), never posted. A head change (a real fix
   # commit) or a fail-closed-marked prior loop clears it — the assertion permits
   # the legitimate changes-requested-then-fixed path. Gate is a no-op when the
-  # verdict is not APPROVED or when there is no readable/parseable loop log.
+  # verdict is not APPROVED, when there is no readable/parseable loop log, or
+  # when the accounting module never loaded (P4B_ACCT_AVAILABLE=false: nothing
+  # ever recorded history, so there is no history to launder — and the hook
+  # function does not exist, so a bare call would exit 127 into
+  # fall_back_to_manual and refuse every valid approval the module-missing
+  # contract at the top of this file says must post plain; #615 round 9,
+  # CodeRabbit). Deliberately P4B_ACCT_AVAILABLE and NOT p4b_acct_on: a
+  # config disable must not bypass this gate while recorded history exists
+  # (that would reopen the same-head laundering hole via a toggle), so a
+  # loaded-but-disabled module still runs the gate against whatever loop log
+  # is present.
   if [ "$VERDICT" = "APPROVED" ] \
+     && [ "$P4B_ACCT_AVAILABLE" = true ] \
      && ! p4b_acct_hook_same_head_required_block; then
     fall_back_to_manual "an unresolved required-tier finding was recorded on the current head ($HEAD) in a prior Phase 4b loop; a rerun without a fix commit cannot launder it into a clean approval (fail-closed)"
   fi

@@ -635,7 +635,7 @@ p4b_acct_required_severities_json() {
   printf '%s' '["P0","P1"]'
 }
 
-# p4b_acct_assert_no_required_with_approved <final_verdict> <loops-json-array> [final_head]
+# p4b_acct_assert_no_required_with_approved <final_verdict> <loops-json-array> [final_head] [mode]
 # Fail-closed invariant on the strict posting rule: an APPROVED verdict may
 # never carry a required-tier finding.
 #   - Any loop recorded as APPROVED / APPROVED_WITH_ADVISORIES with a positive
@@ -667,14 +667,26 @@ p4b_acct_required_severities_json() {
 # fail-closed marker to clear. <final_head> is OPTIONAL and defaults to the
 # empty string; when absent (or empty/"unknown") the same-head guard is skipped
 # and behavior matches the original two-argument contract.
+#
+# <mode> is OPTIONAL (#615 round 9, CodeRabbit). "full" (the default, and any
+# unrecognized value — stricter is the safe direction) applies every clause:
+# the RECORD context, where the loop set must also contain the clean APPROVED
+# loop that produced the final verdict and no recorded approval may carry a
+# required finding. "same_head_only" applies ONLY the same-head
+# unresolved-required clause: the LIVE-LOG context of the approval-time safety
+# hook, where the current loop can be legitimately absent (its record append
+# failed) — demanding the record-scoped clean-APPROVED loop there refuses a
+# VALID head-advanced approval, and prior-head history defects are the record
+# builder's advisory concern, not grounds to block the approval itself.
 # Returns 0 when safe, non-zero when the combination is illegal.
 p4b_acct_assert_no_required_with_approved() {
-  local final_verdict="$1" loops_json="$2" final_head="${3:-}" required ok
+  local final_verdict="$1" loops_json="$2" final_head="${3:-}" mode="${4:-full}" required ok
   required="$(p4b_acct_required_severities_json)" || return 1
   case "$final_head" in unknown) final_head="" ;; esac
   ok="$(printf '%s' "$loops_json" | jq -r \
     --arg final "$final_verdict" \
     --arg head "$final_head" \
+    --arg mode "$mode" \
     --argjson req "$required" '
     def reqcount($f): [ $req[] | ($f[.] // 0) ] | add // 0;
     def reqnull($f):  ([ $req[] | select($f[.] == null) ] | length) > 0;
@@ -702,7 +714,11 @@ p4b_acct_assert_no_required_with_approved() {
                | select(reqcount(.findings) > 0)
              ] | length == 0)
        else true end) as $same_head_ok
-    | ($history_ok and $final_ok and $same_head_ok)
+    # same_head_only (#615 round 9, CodeRabbit): the approval-time hook checks
+    # the LIVE loop log, where the current loop can be legitimately absent —
+    # the record-scoped history/final clauses must not apply there.
+    | (if $mode == "same_head_only" then $same_head_ok
+       else ($history_ok and $final_ok and $same_head_ok) end)
   ' 2>/dev/null)" || return 1
   [ "$ok" = "true" ]
 }
@@ -1938,9 +1954,17 @@ p4b_acct_hook_render_approval_block() {
 # This hook exposes the SAME assertion, keyed to the CURRENT head, so the
 # orchestrator can refuse the approval itself.
 #
-# Reads the live per-PR loop log (the current loop was appended by
-# p4b_acct_hook_record_loop before this call), extracts the full loop objects,
-# and runs the assertion for an APPROVED verdict on the current HEAD. Returns:
+# Reads the live per-PR loop log (the current loop is USUALLY present —
+# appended by p4b_acct_hook_record_loop before this call — but can be
+# legitimately ABSENT when that append failed; the orchestrator still runs
+# this gate on its not-recorded path), extracts the full loop objects, and
+# runs the assertion in same_head_only mode for an APPROVED verdict on the
+# current HEAD. same_head_only matters (#615 round 9, CodeRabbit): the
+# full-mode record clauses (at least one clean APPROVED loop; no
+# findings-bearing approved loop anywhere in history) are record-scoped and
+# would refuse a VALID head-advanced approval whenever the current loop is
+# absent from the log; the laundering block this gate exists for is exactly
+# the same-head clause. Returns:
 #   0  — safe to post the approval (no same-head unresolved required finding, or
 #        no readable/parseable loop log to check).
 #   1  — a same-head unresolved required finding is present; the approval MUST
@@ -1959,7 +1983,7 @@ p4b_acct_hook_same_head_required_block() {
   # would be laundered. Invert: report 1 (block) exactly when the assertion
   # refuses. A jq/assertion internal error also returns non-zero from assert;
   # fail closed on it too (an unverifiable history blocks the approval).
-  if p4b_acct_assert_no_required_with_approved "APPROVED" "$loops" "${HEAD:-}"; then
+  if p4b_acct_assert_no_required_with_approved "APPROVED" "$loops" "${HEAD:-}" same_head_only; then
     return 0
   fi
   return 1
