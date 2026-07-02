@@ -263,6 +263,10 @@ printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[
 # Claude envelope exposing the additive #602 usage fields.
 mk_fake fake-claude-cache-usage \
   "jq -n --arg r '{\"verdict\":\"APPROVED\",\"summary\":\"ok\",\"findings\":[]}' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",total_cost_usd:0.42,usage:{input_tokens:100,output_tokens:50,total_tokens:150,cache_creation_input_tokens:30,cache_read_input_tokens:20}}'"
+# Claude envelope exposing ONLY a cost — no token counts at all (#615 round
+# 11, Codex P2): the adapter must still emit a usage object carrying the cost.
+mk_fake fake-claude-cost-only \
+  "jq -n --arg r '{\"verdict\":\"APPROVED\",\"summary\":\"ok\",\"findings\":[]}' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\",total_cost_usd:0.37}'"
 
 cat > "$BIN/gh" <<'SH'
 #!/usr/bin/env bash
@@ -1411,6 +1415,23 @@ if [ "$rc" = 0 ] && printf '%s' "$out" | jq -e '
   pass "claude adapter populates the additive usage fields from the CLI envelope (CLI-sourced only)"
 else fail "claude adapter additive usage (rc=$rc, out=$out)"; fi
 
+# #615 round 11, Codex P2 (fails pre-fix): a COST-ONLY envelope (no token
+# counts anywhere) used to hit the all-null-tokens bail and return usage:
+# null, dropping the only CLI-sourced cost signal. The additive fields now
+# participate in the emit decision; token fields stay honestly null.
+set +e
+out="$(CLAUDE_BIN="$BIN/fake-claude-cost-only" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && printf '%s' "$out" | jq -e '
+    .usage != null
+    and .usage.total_cost_usd == 0.37
+    and .usage.token_count == null
+    and .usage.input_tokens == null
+    and .usage.output_tokens == null
+    and .usage.source == "claude-json-envelope"' >/dev/null; then
+  pass "a cost-only claude envelope still yields a usage object carrying the reported cost (no fabricated tokens) (#615 round 11)"
+else fail "cost-only claude envelope dropped (rc=$rc, out=$out)"; fi
+
 # ===========================================================================
 echo "lib.sh — parent-block reader is nesting-aware (#615 round 3)"
 # ===========================================================================
@@ -2075,7 +2096,12 @@ jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false zzz999)" \
 # appending (the CI gate runs as root), which would record the current loop,
 # rotate the log on approval, and fail the length assertion below. Use the
 # same make_file_unappendable/skip seam as the D2 test.
-LOCK_C4="$(make_file_unappendable "$LOG_C4")"; lock_rc=$?
+# Capture the helper status OUTSIDE set -e (#615 round 11, Codex P1): a bare
+# VAR="$(helper)"; rc=$? dies under the global set -e when the helper returns
+# unsupported (root without an immutable-flag tool), so the documented skip
+# branch was unreachable in exactly the environment it exists for.
+lock_rc=0
+LOCK_C4="$(make_file_unappendable "$LOG_C4")" || lock_rc=$?
 if [ "$lock_rc" -ne 0 ]; then
   skip "record-append-fail head-advanced gate: no root-robust unwritable seam available ($LOCK_C4) (#615 round 10)"
 else
@@ -2101,7 +2127,8 @@ LOG_C5="$(P4B_ACCT_STATE_DIR="$STATE_C5" REPO="o/r" PR=308 p4b_acct_hook_loop_lo
 mkdir -p "$(dirname "$LOG_C5")"
 jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123)" \
   '{schema:"p4b-loop-log/v1", started_at_epoch:null, loop:$loop, details:[]}' > "$LOG_C5"
-LOCK_C5="$(make_file_unappendable "$LOG_C5")"; lock_rc=$?
+lock_rc=0
+LOCK_C5="$(make_file_unappendable "$LOG_C5")" || lock_rc=$?
 if [ "$lock_rc" -ne 0 ]; then
   skip "record-append-fail same-head block: no root-robust unwritable seam available ($LOCK_C5) (#615 round 10)"
 else
@@ -2230,10 +2257,12 @@ fi
 set -e
 
 # (e) findings-bearing APPROVED verdict → existing fail-closed fallback (exit
-#     4) preserved; the fail-closed loop is recorded as safety evidence.
+#     4) preserved; the fail-closed loop is recorded as safety evidence. Runs
+#     WITHOUT --dry-run since #615 round 11 (dry-runs no longer persist state);
+#     the fallback fires before any posting, so the recorded shape is the same.
 STATE_E="$WORK/state-e"
 set +e
-run_orch "$STATE_E" "$POLICY_ON" fake-codex-approve-p2 205 -- --dry-run >/dev/null 2>&1; rc=$?
+run_orch "$STATE_E" "$POLICY_ON" fake-codex-approve-p2 205 -- >/dev/null 2>&1; rc=$?
 set -e
 LOG_E="$(find "$STATE_E/phase-4b-loops" -name '*.jsonl' 2>/dev/null | head -n1)"
 if [ "$rc" = 4 ] && [ -n "$LOG_E" ] \
@@ -2247,14 +2276,54 @@ if [ "$rc" = 4 ] && [ -n "$LOG_E" ] \
   pass "findings-bearing approval still falls back (exit 4) and is recorded as a fail-closed loop with its histogram"
 else fail "fail-closed recording (rc=$rc, log=$(cat "$LOG_E" 2>/dev/null))"; fi
 
-# (f) dry-run APPROVED → exit 0, dry-run never contaminates the ledger cache.
+# (f) dry-run APPROVED → exit 0, dry-run never contaminates ANY persistent
+#     accounting state (#615 round 11, Codex P2, fails pre-fix for the loop
+#     log): the ledger stays absent AND no per-PR loop log is written — the
+#     simulated loop lands only in the throwaway sandbox.
 STATE_F="$WORK/state-f"
 set +e
 run_orch "$STATE_F" "$POLICY_ON" fake-codex-approve 206 -- --dry-run >/dev/null 2>&1; rc=$?
 set -e
-if [ "$rc" = 0 ] && [ ! -e "$STATE_F/phase-4b-ledger.jsonl" ]; then
-  pass "dry-run renders without appending the running-totals ledger"
-else fail "dry-run ledger hygiene (rc=$rc)"; fi
+if [ "$rc" = 0 ] && [ ! -e "$STATE_F/phase-4b-ledger.jsonl" ] \
+   && [ -z "$(find "$STATE_F/phase-4b-loops" -name '*.jsonl' 2>/dev/null)" ]; then
+  pass "dry-run renders without persisting the ledger OR the per-PR loop log (#615 round 11)"
+else fail "dry-run state hygiene (rc=$rc, loops=$(find "$STATE_F/phase-4b-loops" -type f 2>/dev/null | head -3))"; fi
+
+# (f2) #615 round 11, Codex P2 (fails pre-fix): rehearsal history must not
+#      leak into real accounting. Pre-fix, a dry-run loop stayed in the live
+#      per-PR log (never rotated — nothing posted), so the NEXT real approval
+#      of the same PR embedded the rehearsal loop in its record and counted
+#      its attempt in the totals. Post-fix the real run records only itself.
+STATE_F2="$WORK/state-f2"; BODY_F2="$WORK/body-f2.md"
+set +e
+run_orch "$STATE_F2" "$POLICY_ON" fake-codex-approve 207 -- --dry-run >/dev/null 2>&1; rc1=$?
+run_orch "$STATE_F2" "$POLICY_ON" fake-codex-approve 207 P4B_WRAPPER_BODY="$BODY_F2" -- >/dev/null 2>&1; rc2=$?
+set -e
+REC_F2="$(p4b_acct_extract_records < "$BODY_F2" 2>/dev/null || true)"
+if [ "$rc1" = 0 ] && [ "$rc2" = 0 ] \
+   && printf '%s' "$REC_F2" | jq -e '
+        (.loops | length) == 1 and .loops[0].loop == 1
+        and .totals.adapter_invocations == 1' >/dev/null \
+   && [ "$(wc -l < "$STATE_F2/phase-4b-ledger.jsonl" | tr -d '[:space:]')" = "1" ]; then
+  pass "a dry-run rehearsal leaves no trace in the next real approval: one loop, one attempt, one ledger record (#615 round 11)"
+else fail "dry-run rehearsal leaked into real accounting (rc1=$rc1 rc2=$rc2, loops=$(printf '%s' "$REC_F2" | jq '.loops|length' 2>/dev/null), invocations=$(printf '%s' "$REC_F2" | jq '.totals.adapter_invocations' 2>/dev/null))"; fi
+
+# (f3) dry-run gate fidelity: with REAL history holding an unresolved CR-P1 on
+#      the run head, a dry-run APPROVED rehearsal must predict the refusal
+#      (exit 4) — the sandbox COPIES real state — while the real log stays
+#      byte-identical (still exactly the seeded loop).
+STATE_F3="$WORK/state-f3"
+LOG_F3="$(P4B_ACCT_STATE_DIR="$STATE_F3" REPO="o/r" PR=208 p4b_acct_hook_loop_log)"
+mkdir -p "$(dirname "$LOG_F3")"
+jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123)" \
+  '{schema:"p4b-loop-log/v1", started_at_epoch:null, loop:$loop, details:[]}' > "$LOG_F3"
+F3_BEFORE="$(cat "$LOG_F3")"
+set +e
+run_orch "$STATE_F3" "$POLICY_ON" fake-codex-approve 208 -- --dry-run >/dev/null 2>&1; rc=$?
+set -e
+if [ "$rc" = 4 ] && [ "$(cat "$LOG_F3")" = "$F3_BEFORE" ]; then
+  pass "a dry-run rehearsal predicts the same-head refusal from copied real history without touching the real log (#615 round 11)"
+else fail "dry-run gate fidelity (rc=$rc, log-changed=$([ "$(cat "$LOG_F3")" = "$F3_BEFORE" ] && echo no || echo yes))"; fi
 
 # (g) parent automation disabled → exit 5 unchanged, zero accounting writes.
 STATE_G="$WORK/state-g"

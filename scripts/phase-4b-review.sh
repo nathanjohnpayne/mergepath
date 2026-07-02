@@ -284,6 +284,47 @@ fall_back_to_manual() {
   exit 4
 }
 
+# Temp hygiene: one EXIT trap owns every temp path this run creates (the
+# review body rendered below and the dry-run accounting sandbox, when one
+# exists).
+_p4b_cleanup_tmp() {
+  if [ -n "${BODY_FILE:-}" ]; then rm -f "$BODY_FILE" 2>/dev/null || true; fi
+  if [ -n "${_P4B_ACCT_DRY_STATE:-}" ]; then rm -rf "$_P4B_ACCT_DRY_STATE" 2>/dev/null || true; fi
+}
+trap _p4b_cleanup_tmp EXIT
+
+# Dry-run accounting isolation (#615 Codex round 11, P2): a dry-run must not
+# mutate persistent accounting state. It used to append its simulated loop to
+# the REAL per-PR loop log, where it was never rotated (no review posts on a
+# dry-run) — so a later real run consumed rehearsal history: a dry-run
+# CHANGES_REQUESTED P1 on the current head would trip the same-head safety
+# gate against a subsequent valid approval, and a dry-run APPROVED loop
+# inflated the next posted record's loop history and running totals. Redirect
+# ALL accounting state (loop log, pending stage, ledger) to a throwaway COPY
+# of the real state for the rest of this run: every hook — recording, render,
+# rotation, the same-head gate — behaves exactly as a real run would (full
+# history present, gate fidelity preserved), and the real state is untouched.
+# Placed BEFORE the first fall_back_to_manual call site so even an early
+# fallback's note_fallback recording lands in the sandbox.
+_P4B_ACCT_DRY_STATE=""
+if [ "$DRY_RUN" = true ] && [ "$P4B_ACCT_AVAILABLE" = true ]; then
+  _p4b_real_state="$(p4b_acct_state_dir)"
+  if _P4B_ACCT_DRY_STATE="$(mktemp -d "${TMPDIR:-/tmp}/p4b-acct-dry.XXXXXX" 2>/dev/null)"; then
+    if [ -d "$_p4b_real_state" ]; then
+      cp -Rp "$_p4b_real_state/." "$_P4B_ACCT_DRY_STATE/" 2>/dev/null \
+        || p4b_warn "accounting: could not copy state into the dry-run sandbox; the dry-run renders from empty history (real state untouched)"
+    fi
+  else
+    # No sandbox ⇒ still never touch real state: point at a fresh unused
+    # path; hooks mkdir/append there or degrade advisorily (warn + plain
+    # summary). Real state stays untouched either way.
+    _P4B_ACCT_DRY_STATE="${TMPDIR:-/tmp}/p4b-acct-dry-unavailable.$$"
+    p4b_warn "accounting: could not create the dry-run sandbox; dry-run accounting starts from empty state (real state untouched)"
+  fi
+  P4B_ACCT_STATE_DIR="$_P4B_ACCT_DRY_STATE"
+  export P4B_ACCT_STATE_DIR
+fi
+
 if [ ! -x "$ADAPTER_SCRIPT" ]; then
   fall_back_to_manual "no adapter for reviewer '$REVIEWER' (expected $ADAPTER_SCRIPT)"
 fi
@@ -327,8 +368,7 @@ fi
 
 # Render the PR review body (summary + findings list).
 BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
-# shellcheck disable=SC2064
-trap "rm -f '$BODY_FILE'" EXIT
+# (cleanup is owned by the _p4b_cleanup_tmp EXIT trap installed above)
 {
   printf '**Automated Phase 4b review** (%s, reviewer %s)\n\n' "$DIRECTION" "$REVIEWER"
   printf '%s\n' "$SUMMARY"
