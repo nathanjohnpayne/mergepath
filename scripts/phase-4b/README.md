@@ -65,9 +65,14 @@ orchestrator sources `accounting.sh` and:
    with dispositions, a rigor proof-of-work table (rows are green only when
    the backing signal was captured; otherwise `n/a — reason`), the four-part
    cost model (wall-clock / CLI-exposed tokens / throttle / labeled
-   **notional** $ with billed `$0.00` on the plan), repo running totals with
+   **notional** $ with billed `$0.00` on the plan; a CLI-REPORTED cost —
+   Claude envelope `total_cost_usd` → `tokens.cost_usd` /
+   `totals.reported_cost_usd` — is preferred over the price-table notional,
+   labeled `CLI-reported`), repo running totals with
    an explicit totals-source footer, and the embedded machine-readable
-   `<!-- p4b-accounting:v1 ... -->` record (`accounting.schema.json`).
+   `<!-- p4b-accounting:v1 ... -->` record (`accounting.schema.json`,
+   comment-delimiter sequences inside record strings emitted as JSON
+   unicode escapes so a hostile title can never close the comment early).
 3. **Fails open for reporting, closed for integrity.** Any generation error ⇒
    the plain-summary approval posts unchanged (a report failure never blocks
    or fabricates an approval; exit codes are untouched). The builder and the
@@ -79,8 +84,12 @@ orchestrator sources `accounting.sh` and:
 
 Running totals prefer an injected GitHub-derived prior-record file
 (`P4B_ACCT_PRIOR_RECORDS_JSONL`, e.g. prior review bodies piped through
-`p4b_acct_extract_records`), then fall back to the append-only
-`.mergepath/phase-4b-ledger.jsonl` cache (two-phase commit: the record is
+`p4b_acct_extract_records`); when none is injected the hook layer fetches
+one itself — a single read-only `gh api graphql` call over the most
+recently updated 50 merged PRs (cap via `P4B_ACCT_PRIOR_SCAN_PRS`),
+plan-safe, PATH-shimmable in tests — so the real orchestrator path reports
+repo-wide totals from any checkout. On fetch failure they fall back to the
+append-only `.mergepath/phase-4b-ledger.jsonl` cache (two-phase commit: the record is
 staged at render time and appended only after the review POST actually
 succeeds, so dry-runs, head drift, and POST failures never contaminate it —
 those failure paths also correct the per-PR loop log in place, so local state

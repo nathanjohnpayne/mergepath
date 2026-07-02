@@ -152,6 +152,19 @@ if [ "${1:-}" = "api" ]; then
       printf '%s\n' "${P4B_FAKE_LIVE_HEAD:-abc123}"
       exit 0
       ;;
+    graphql)
+      # Prior-record fetch shim (#615 round 2): emits the review bodies the
+      # real single read-only GraphQL call would stream via --jq. Default is
+      # a successful EMPTY fetch (a repo with no prior records).
+      if [ -n "${P4B_FAKE_GRAPHQL_FAIL:-}" ]; then
+        echo "simulated graphql failure" >&2
+        exit 1
+      fi
+      if [ -n "${P4B_FAKE_PRIOR_BODIES:-}" ] && [ -f "${P4B_FAKE_PRIOR_BODIES}" ]; then
+        cat "${P4B_FAKE_PRIOR_BODIES}"
+      fi
+      exit 0
+      ;;
   esac
 fi
 echo "unexpected fake gh invocation: $*" >&2
@@ -185,10 +198,10 @@ GOLDEN_RAW="$WORK/golden-raw.json"
 cat > "$GOLDEN_RAW" <<'JSON'
 {"schema":"p4b-accounting/v1","pr":580,"final_head_sha":"d05ff4d0…","final_verdict":"APPROVED","final_reviewer":"nathanpayne-codex","final_direction":"claude->codex","automation_state":"dry-run","wall_time_first_loop_to_approval_seconds":225,
  "loops":[
-  {"loop":1,"reviewer":"nathanpayne-codex","adapter":"review-via-codex.sh","direction":"claude->codex","head_sha":"d05ff4d0…","verdict":"APPROVED","posted":"direct-probe","fell_back":false,"elapsed_seconds":18,"tokens":{"total":55926,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"codex-stderr"},"findings":{"P0":0,"P1":0,"P2":0,"P3":0,"nitpick":0,"unknown":0},"cli_version":"codex/0.137","timeout_seconds":900,"effort":null,"throttle_events":1,"plan_auth":"chatgpt","fail_closed":{"happened":false,"reason":null,"duration_seconds":null}},
-  {"loop":2,"reviewer":"nathanpayne-codex","adapter":"orchestrator-dry-run","direction":"claude->codex","head_sha":"d05ff4d0…","verdict":"APPROVED","posted":"dry-run","fell_back":false,"elapsed_seconds":65,"tokens":{"total":113918,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"codex-stderr"},"findings":{"P0":0,"P1":0,"P2":0,"P3":0,"nitpick":0,"unknown":0},"cli_version":"codex/0.137","timeout_seconds":900,"effort":null,"throttle_events":0,"plan_auth":"chatgpt","fail_closed":{"happened":false,"reason":null,"duration_seconds":null}},
-  {"loop":3,"reviewer":"nathanpayne-claude","adapter":"review-via-claude.sh","direction":"codex->claude","head_sha":"d05ff4d0…","verdict":"APPROVED_WITH_ADVISORIES","posted":"direct-probe","fell_back":false,"elapsed_seconds":66,"tokens":{"total":7360,"input":1589,"output":5771,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"claude-json"},"findings":{"P0":0,"P1":0,"P2":2,"P3":2,"nitpick":0,"unknown":0},"cli_version":null,"timeout_seconds":900,"effort":"medium","throttle_events":0,"plan_auth":"firstParty","fail_closed":{"happened":false,"reason":null,"duration_seconds":null}},
-  {"loop":4,"reviewer":"nathanpayne-claude","adapter":"orchestrator-dry-run","direction":"codex->claude","head_sha":"d05ff4d0…","verdict":"CHANGES_REQUESTED","posted":"not-posted","fell_back":true,"elapsed_seconds":76,"tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"unavailable"},"findings":{"P0":0,"P1":0,"P2":null,"P3":null,"nitpick":null,"unknown":null},"cli_version":null,"timeout_seconds":900,"effort":"medium","throttle_events":0,"plan_auth":"firstParty","fail_closed":{"happened":true,"reason":"approval-carried-findings","duration_seconds":76}}
+  {"loop":1,"reviewer":"nathanpayne-codex","adapter":"review-via-codex.sh","direction":"claude->codex","head_sha":"d05ff4d0…","verdict":"APPROVED","posted":"direct-probe","fell_back":false,"elapsed_seconds":18,"tokens":{"total":55926,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"codex-stderr"},"findings":{"P0":0,"P1":0,"P2":0,"P3":0,"nitpick":0,"unknown":0},"cli_version":"codex/0.137","timeout_seconds":900,"effort":null,"throttle_events":1,"plan_auth":"chatgpt","fail_closed":{"happened":false,"reason":null,"duration_seconds":null}},
+  {"loop":2,"reviewer":"nathanpayne-codex","adapter":"orchestrator-dry-run","direction":"claude->codex","head_sha":"d05ff4d0…","verdict":"APPROVED","posted":"dry-run","fell_back":false,"elapsed_seconds":65,"tokens":{"total":113918,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"codex-stderr"},"findings":{"P0":0,"P1":0,"P2":0,"P3":0,"nitpick":0,"unknown":0},"cli_version":"codex/0.137","timeout_seconds":900,"effort":null,"throttle_events":0,"plan_auth":"chatgpt","fail_closed":{"happened":false,"reason":null,"duration_seconds":null}},
+  {"loop":3,"reviewer":"nathanpayne-claude","adapter":"review-via-claude.sh","direction":"codex->claude","head_sha":"d05ff4d0…","verdict":"APPROVED_WITH_ADVISORIES","posted":"direct-probe","fell_back":false,"elapsed_seconds":66,"tokens":{"total":7360,"input":1589,"output":5771,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"claude-json"},"findings":{"P0":0,"P1":0,"P2":2,"P3":2,"nitpick":0,"unknown":0},"cli_version":null,"timeout_seconds":900,"effort":"medium","throttle_events":0,"plan_auth":"firstParty","fail_closed":{"happened":false,"reason":null,"duration_seconds":null}},
+  {"loop":4,"reviewer":"nathanpayne-claude","adapter":"orchestrator-dry-run","direction":"codex->claude","head_sha":"d05ff4d0…","verdict":"CHANGES_REQUESTED","posted":"not-posted","fell_back":true,"elapsed_seconds":76,"tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"unavailable"},"findings":{"P0":0,"P1":0,"P2":null,"P3":null,"nitpick":null,"unknown":null},"cli_version":null,"timeout_seconds":900,"effort":"medium","throttle_events":0,"plan_auth":"firstParty","fail_closed":{"happened":true,"reason":"approval-carried-findings","duration_seconds":76}}
  ],
  "unique_findings":[
   {"id":"F1","severity":"P2","path":null,"line":null,"title":"Codex `--output-schema` vs jq validator drift (`line` min)","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":585},
@@ -196,7 +209,7 @@ cat > "$GOLDEN_RAW" <<'JSON'
   {"id":"F3","severity":"P3","path":null,"line":null,"title":"Harden Claude JSON extraction beyond first/last brace","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":587},
   {"id":"F4","severity":"P3","path":null,"line":null,"title":"Make local shellcheck absence more visible","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":588}
  ],
- "totals":{"adapter_invocations":4,"tokens_total":177204,"tokens_by_provider":{"codex":169844,"claude":7360},"elapsed_seconds_total":225,"billed_usd":0.0,"notional_usd":0.66,"price_table_version":"2026-07-01","fail_closed_events":1,"advisory_issues_filed":[585,586,587,588]},
+ "totals":{"adapter_invocations":4,"tokens_total":177204,"tokens_by_provider":{"codex":169844,"claude":7360},"elapsed_seconds_total":225,"billed_usd":0.0,"notional_usd":0.66,"reported_cost_usd":null,"price_table_version":"2026-07-01","fail_closed_events":1,"advisory_issues_filed":[585,586,587,588]},
  "running_totals":{"source":"github-derived","records":24,"auto_approved_prs":24,"automated_attempts":27,"fail_closed_events":3,"tokens_total":2360000,"notional_usd":9.40,"human_minutes_saved_estimate":[720,4320]},
  "generated_at":"2026-07-01T16:24:01Z"}
 JSON
@@ -234,12 +247,19 @@ echo "accounting.sh — verdict → accounting mappers"
 t="$(p4b_acct_tokens_from_verdict '{"verdict":"APPROVED","summary":"x","findings":[],"usage":null}')"
 [ "$(printf '%s' "$t" | jq -r '.source')" = "unavailable" ] \
   && [ "$(printf '%s' "$t" | jq -r '.total')" = "null" ] \
-  && pass "null usage → all-null tokens with explicit source=unavailable (never estimated)" \
+  && [ "$(printf '%s' "$t" | jq -r '.cost_usd')" = "null" ] \
+  && pass "null usage → all-null tokens (incl. cost_usd) with explicit source=unavailable (never estimated)" \
   || fail "null-usage tokens mapping: $t"
 t="$(p4b_acct_tokens_from_verdict '{"verdict":"APPROVED","summary":"x","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":30,"cache_read_input_tokens":20,"reasoning_tokens":7,"total_cost_usd":0.42,"source":"claude-json-envelope"}}')"
 if printf '%s' "$t" | jq -e '.total == 150 and .input == 100 and .output == 50 and .cache_creation == 30 and .cache_read == 20 and .reasoning == 7 and .source == "claude-json-envelope"' >/dev/null; then
   pass "full usage (incl. additive #602 fields) maps onto the accounting token names"
 else fail "full-usage tokens mapping: $t"; fi
+# #615 round 2 (fails pre-fix): the mapper used to DROP total_cost_usd, so
+# records could only ever show notional or n/a even when the CLI reported a
+# real cost.
+if printf '%s' "$t" | jq -e '.cost_usd == 0.42' >/dev/null; then
+  pass "CLI-reported total_cost_usd is preserved as tokens.cost_usd (#615 round 2)"
+else fail "cost_usd dropped by the mapper: $t"; fi
 
 h="$(p4b_acct_findings_hist_from_verdict '{"findings":[{"severity":"P1","path":"a","line":1,"body":"x"},{"severity":"P2","path":"a","line":2,"body":"y"},{"severity":"P2","path":null,"line":null,"body":"z"},{"severity":"weird","body":"w"}]}')"
 if printf '%s' "$h" | jq -e '.P0 == 0 and .P1 == 1 and .P2 == 2 and .P3 == 0 and .nitpick == 0 and .unknown == 1' >/dev/null; then
@@ -301,22 +321,22 @@ p4b_acct_resolve_rate "testprov.model-x.standard" "no_such_field" >/dev/null \
 p4b_acct_resolve_rate "testprov.nope.standard" "input" >/dev/null \
   && fail "missing model accepted" || pass "missing model → non-zero"
 
-TOK_SPLIT='{"total":150,"input":100,"output":50,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"x"}'
+TOK_SPLIT='{"total":150,"input":100,"output":50,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"x"}'
 n="$(p4b_acct_notional_from_tokens "$TOK_SPLIT" "testprov.model-x.standard" '["input","output"]')"
 if printf '%s' "$n" | jq -e '. > 0.0006999 and . < 0.0007001' >/dev/null; then
   pass "split notional math exact (100·2 + 50·10 per-1M = 0.0007)"
 else fail "split notional -> '$n'"; fi
-TOK_TOTAL='{"total":1000000,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"x"}'
+TOK_TOTAL='{"total":1000000,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"x"}'
 n="$(p4b_acct_notional_from_tokens "$TOK_TOTAL" "testprov.model-x.standard" '["total_only_blended_80_20"]')"
 if printf '%s' "$n" | jq -e '. == 4.0' >/dev/null; then
   pass "total-only blended math exact (1M · 4.0)"
 else fail "blended notional -> '$n'"; fi
-TOK_CACHE='{"total":200,"input":100,"output":50,"cache_creation":40,"cache_read":10,"reasoning":null,"source":"x"}'
+TOK_CACHE='{"total":200,"input":100,"output":50,"cache_creation":40,"cache_read":10,"reasoning":null,"cost_usd":null,"source":"x"}'
 n="$(p4b_acct_notional_auto "$TOK_CACHE" "testprov.model-y.standard")"
 if printf '%s' "$n" | jq -e '(. * 1000000 | round) == 2210' >/dev/null; then
   pass "auto pricing includes counted cache components (in+out+cache_write+cache_read)"
 else fail "auto cache notional -> '$n'"; fi
-p4b_acct_notional_from_tokens '{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"unavailable"}' "testprov.model-x.standard" '["input","output"]' >/dev/null \
+p4b_acct_notional_from_tokens '{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"unavailable"}' "testprov.model-x.standard" '["input","output"]' >/dev/null \
   && fail "null token counts priced" || pass "null token counts → non-zero (no partial estimate)"
 n="$(p4b_acct_notional_auto "$TOK_SPLIT" "testprov.model-x.standard")"
 if printf '%s' "$n" | jq -e '. > 0.0006999 and . < 0.0007001' >/dev/null; then
@@ -331,9 +351,9 @@ p4b_acct_notional_auto "$TOK_TOTAL" "testprov.model-nototal.standard" >/dev/null
   || pass "missing blended rate → non-zero (missing price ⇒ n/a)"
 
 LOOPS_MIXED='[
- {"loop":1,"reviewer":"nathanpayne-codex","adapter":"review-via-codex.sh","direction":"claude->codex","tokens":{"total":1000000,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"codex-stderr"}},
- {"loop":2,"reviewer":"nathanpayne-claude","adapter":"review-via-claude.sh","direction":"codex->claude","tokens":{"total":150,"input":100,"output":50,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"claude-json"}},
- {"loop":3,"reviewer":"nathanpayne-claude","adapter":"orchestrator-dry-run","direction":"codex->claude","tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"unavailable"}}
+ {"loop":1,"reviewer":"nathanpayne-codex","adapter":"review-via-codex.sh","direction":"claude->codex","tokens":{"total":1000000,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"codex-stderr"}},
+ {"loop":2,"reviewer":"nathanpayne-claude","adapter":"review-via-claude.sh","direction":"codex->claude","tokens":{"total":150,"input":100,"output":50,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"claude-json"}},
+ {"loop":3,"reviewer":"nathanpayne-claude","adapter":"orchestrator-dry-run","direction":"codex->claude","tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"unavailable"}}
 ]'
 n="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ACCT_PRICES" p4b_acct_notional_for_loops "$LOOPS_MIXED")"
 # codex loop: 1M · blended 4.0 = 4.0 ; claude loop: 100·10 + 50·20 per-1M = 0.002 ; rounded → 4.0
@@ -343,7 +363,7 @@ else fail "notional_for_loops -> '$n'"; fi
 MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" p4b_acct_notional_for_loops "$LOOPS_MIXED" >/dev/null \
   && fail "unpriced loops summed without configured keys" \
   || pass "no configured price key → non-zero (fail-closed to n/a, no partial figure)"
-LOOPS_NOTOK='[{"loop":1,"reviewer":"nathanpayne-codex","adapter":"a","direction":"claude->codex","tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"unavailable"}}]'
+LOOPS_NOTOK='[{"loop":1,"reviewer":"nathanpayne-codex","adapter":"a","direction":"claude->codex","tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"unavailable"}}]'
 MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ACCT_PRICES" p4b_acct_notional_for_loops "$LOOPS_NOTOK" >/dev/null \
   && fail "notional computed with zero measured loops" \
   || pass "all-unavailable tokens → notional n/a (cannot price what was not measured)"
@@ -368,10 +388,43 @@ if printf '%s' "$tt" | jq -e '
     and .advisory_issues_filed == [585,586,587,588]' >/dev/null; then
   pass "compute_totals reproduces the golden totals from the golden loops (incl. provider split + advisory links)"
 else fail "compute_totals: $tt"; fi
-tt="$(p4b_acct_compute_totals '[{"loop":1,"reviewer":"nathanpayne-codex","adapter":"a","direction":"claude->codex","elapsed_seconds":null,"tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"unavailable"},"fail_closed":{"happened":false,"reason":null,"duration_seconds":null}}]' "" "null" '[]')"
+tt="$(p4b_acct_compute_totals '[{"loop":1,"reviewer":"nathanpayne-codex","adapter":"a","direction":"claude->codex","elapsed_seconds":null,"tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"unavailable"},"fail_closed":{"happened":false,"reason":null,"duration_seconds":null}}]' "" "null" '[]')"
 if printf '%s' "$tt" | jq -e '.tokens_total == null and .elapsed_seconds_total == null and .notional_usd == null and .price_table_version == null' >/dev/null; then
   pass "totals degrade to explicit null when nothing was measured (never a fabricated 0)"
 else fail "degraded totals: $tt"; fi
+# #615 round 2 (fails pre-fix): CLI-reported per-loop costs must reach the
+# totals, fail-closed — a token-bearing loop WITHOUT a reported cost nulls
+# the sum (a partial sum would silently underreport), while loops with
+# nothing measured contribute nothing and never block.
+mkcostloop() { # mkcostloop <n> <tokens-json>
+  jq -nc --argjson n "$1" --argjson tokens "$2" '
+    {loop:$n, reviewer:"nathanpayne-claude", adapter:"review-via-claude.sh",
+     direction:"codex->claude", elapsed_seconds:9, tokens:$tokens,
+     fail_closed:{happened:false, reason:null, duration_seconds:null}}'
+}
+COST_TOK='{"total":150,"input":100,"output":50,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":0.42,"source":"claude-json"}'
+NOCOST_TOK='{"total":1000,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"codex-stderr"}'
+NOTOK_TOK='{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"unavailable"}'
+CL_COST="$(mkcostloop 1 "$COST_TOK")"
+CL_NOCOST="$(mkcostloop 2 "$NOCOST_TOK")"
+CL_NOTOK="$(mkcostloop 3 "$NOTOK_TOK")"
+CL_COST2="$(mkcostloop 4 "$(printf '%s' "$COST_TOK" | jq -c '.cost_usd = 0.081')")"
+tt="$(p4b_acct_compute_totals "[$CL_COST]" "" null '[]')"
+printf '%s' "$tt" | jq -e '.reported_cost_usd == 0.42' >/dev/null \
+  && pass "a CLI-reported loop cost is carried into totals.reported_cost_usd (#615 round 2)" \
+  || fail "reported cost dropped: $tt"
+tt="$(p4b_acct_compute_totals "[$CL_COST,$CL_NOTOK]" "" null '[]')"
+printf '%s' "$tt" | jq -e '.reported_cost_usd == 0.42' >/dev/null \
+  && pass "an unmeasured loop does not block the reported sum" \
+  || fail "unmeasured loop blocked reported cost: $tt"
+tt="$(p4b_acct_compute_totals "[$CL_COST,$CL_NOCOST]" "" null '[]')"
+printf '%s' "$tt" | jq -e '.reported_cost_usd == null' >/dev/null \
+  && pass "a token-bearing loop without a reported cost fail-closes the sum to null (never a partial underreport)" \
+  || fail "partial reported sum emitted: $tt"
+tt="$(p4b_acct_compute_totals "[$CL_COST,$CL_COST2]" "" null '[]')"
+printf '%s' "$tt" | jq -e '.reported_cost_usd == 0.5' >/dev/null \
+  && pass "reported costs sum across loops and round to cents (0.42 + 0.081 → 0.5)" \
+  || fail "reported sum/rounding: $tt"
 
 # ===========================================================================
 echo "accounting.sh — fail-closed posting-rule assertion + record builder"
@@ -382,7 +435,7 @@ mkloop() { # mkloop <n> <verdict> <P0> <P1> <fail_closed_bool>
      direction:"claude->codex", head_sha:"abc123", verdict:$v,
      posted:(if $fc then "not-posted" else "posted" end), fell_back:$fc,
      elapsed_seconds:10,
-     tokens:{total:null,input:null,output:null,cache_creation:null,cache_read:null,reasoning:null,source:"unavailable"},
+     tokens:{total:null,input:null,output:null,cache_creation:null,cache_read:null,reasoning:null,cost_usd:null,source:"unavailable"},
      findings:{P0:$p0,P1:$p1,P2:0,P3:0,nitpick:0,unknown:0},
      cli_version:null, timeout_seconds:900, effort:null, throttle_events:null,
      plan_auth:"chatgpt",
@@ -539,6 +592,28 @@ else fail "round-trip mismatch"; fi
 RT_N="$(printf 'prose mentions p4b-accounting:v1 in passing\n%s\n' "$BLOCK" | p4b_acct_extract_records | wc -l | tr -d '[:space:]')"
 [ "$RT_N" = "1" ] && pass "extractor keys on the comment-open, not bare marker prose" \
   || fail "extractor captured $RT_N records with marker prose present"
+# #615 round 2 (fails pre-fix): a `-->` inside any record string — e.g. a
+# hostile finding title — used to close the embedded HTML comment early
+# (GitHub renders the tail visibly) AND truncate extraction, silently
+# dropping the record from future running totals. The writer now encodes
+# the comment-delimiter angle brackets as JSON unicode escapes.
+enc="$(printf '%s' '{"a":"x --> y","b":"<!-- open","c":"z --!> w"}' | p4b_acct_encode_comment_payload)"
+if [ "$(printf '%s' "$enc" | jq -r '.a + "|" + .b + "|" + .c')" = 'x --> y|<!-- open|z --!> w' ] \
+   && ! printf '%s' "$enc" | grep -q -- '-->' \
+   && ! printf '%s' "$enc" | grep -qF '<!--' \
+   && ! printf '%s' "$enc" | grep -qF -- '--!>'; then
+  pass "payload encoder strips every literal comment delimiter while the parsed value round-trips"
+else fail "payload encoder: $enc"; fi
+HOSTILE="$(printf '%s' "$GOLDEN" | jq -c '.unique_findings[0].title = "hostile --> terminator <!-- reopen --!> tail"')"
+HBLOCK="$(p4b_acct_render_block "$HOSTILE")" || HBLOCK=""
+HTERMS="$(printf '%s\n' "$HBLOCK" | sed -n '/<!-- p4b-accounting:v1/,$p' | grep -c -- '-->' || true)"
+[ "$HTERMS" = "1" ] \
+  && pass "a hostile title cannot terminate the embedded comment early (exactly one --> after the comment-open)" \
+  || fail "embedded comment carries $HTERMS terminator line(s)"
+HRT="$(printf '%s\n' "$HBLOCK" | p4b_acct_extract_records)"
+if [ -n "$HRT" ] && [ "$(printf '%s' "$HRT" | jq -S .)" = "$(printf '%s' "$HOSTILE" | jq -S .)" ]; then
+  pass "hostile-title record round-trips: render → extract == original (#615 round 2)"
+else fail "hostile round-trip mismatch: $HRT"; fi
 BADREC="$(printf '%s' "$GOLDEN" | jq -c '.loops[0].findings.P1 = 3')"
 p4b_acct_render_block "$BADREC" >/dev/null \
   && fail "render_block rendered an illegal APPROVED record" \
@@ -607,6 +682,64 @@ rt="$(p4b_acct_running_totals_for_post "$WORK/no-such-ledger.jsonl")"
   || fail "no-source: $rt"
 
 # ===========================================================================
+echo "accounting.sh — GitHub-derived prior-record fetch (#615 round 2)"
+# ===========================================================================
+# fails pre-fix: p4b_acct_fetch_prior_records / p4b_acct_hook_running_totals
+# did not exist — the real orchestrator path never populated
+# P4B_ACCT_PRIOR_RECORDS_JSONL, so totals always fell through to the
+# gitignored per-checkout ledger.
+PRIOR_BODY="$WORK/prior-review-body.txt"
+{ printf 'Automated Phase 4b review prose above the accounting block.\n\n'
+  p4b_acct_render_block "$GOLDEN"; } > "$PRIOR_BODY"
+set +e
+out="$(PATH="$BIN:$PATH" P4B_FAKE_PRIOR_BODIES="$PRIOR_BODY" p4b_acct_fetch_prior_records o/r)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -S .)" = "$(printf '%s' "$GOLDEN" | jq -S .)" ]; then
+  pass "fetch pulls prior review bodies via the PATH-shimmed gh and re-emits the embedded record"
+else fail "fetch happy path (rc=$rc, out=$out)"; fi
+set +e
+out="$(PATH="$BIN:$PATH" p4b_acct_fetch_prior_records o/r)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ -z "$out" ]; then
+  pass "a repo with no prior records is a VALID empty fetch (first-ever approval)"
+else fail "empty fetch (rc=$rc, out='$out')"; fi
+set +e
+PATH="$BIN:$PATH" P4B_FAKE_GRAPHQL_FAIL=1 p4b_acct_fetch_prior_records o/r >/dev/null 2>&1; rc=$?
+set -e
+[ "$rc" != 0 ] && pass "an API failure returns non-zero (the caller falls back explicitly)" \
+  || fail "graphql failure not surfaced"
+set +e
+p4b_acct_fetch_prior_records "" >/dev/null 2>&1; rc=$?
+set -e
+[ "$rc" != 0 ] && pass "an unusable repo slug refuses to fetch" || fail "empty slug accepted"
+
+# Hook resolution order: injected file > GitHub fetch > ledger cache
+# (explicitly labeled) > unavailable with the fetch-failed reason.
+HOOK_STATE="$WORK/hook-rt-state"
+mkdir -p "$HOOK_STATE"
+printf '%s\n%s\n' "$GOLDEN" "$REC2" > "$HOOK_STATE/phase-4b-ledger.jsonl"
+rt="$(PATH="$BIN:$PATH" REPO=o/r P4B_ACCT_STATE_DIR="$HOOK_STATE" \
+      P4B_FAKE_PRIOR_BODIES="$PRIOR_BODY" p4b_acct_hook_running_totals)"
+[ "$(printf '%s' "$rt" | jq -r '.source + "/" + (.records | tostring)')" = "github-derived/1" ] \
+  && pass "the GitHub fetch outranks a populated local ledger (repo-wide, not per-checkout)" \
+  || fail "fetch-over-ledger priority: $rt"
+rt="$(PATH="$BIN:$PATH" REPO=o/r P4B_ACCT_STATE_DIR="$HOOK_STATE" \
+      P4B_FAKE_GRAPHQL_FAIL=1 p4b_acct_hook_running_totals 2>/dev/null)"
+[ "$(printf '%s' "$rt" | jq -r '.source + "/" + (.records | tostring)')" = "ledger-cache/2" ] \
+  && pass "fetch failure falls back to the ledger cache, labeled explicitly (never presented as repo-wide)" \
+  || fail "fetch-failure ledger fallback: $rt"
+rt="$(PATH="$BIN:$PATH" REPO=o/r P4B_ACCT_STATE_DIR="$WORK/hook-rt-empty" \
+      P4B_FAKE_GRAPHQL_FAIL=1 p4b_acct_hook_running_totals 2>/dev/null)"
+printf '%s' "$rt" | jq -e '.source == "unavailable" and (.reason | test("fetch failed"))' >/dev/null \
+  && pass "fetch failure with no ledger renders explicit unavailable with the fetch-failed reason" \
+  || fail "fetch-failure unavailable: $rt"
+rt="$(PATH="$BIN:$PATH" REPO=o/r P4B_ACCT_STATE_DIR="$HOOK_STATE" \
+      P4B_FAKE_GRAPHQL_FAIL=1 P4B_ACCT_PRIOR_RECORDS_JSONL="$PRIOR" p4b_acct_hook_running_totals)"
+[ "$(printf '%s' "$rt" | jq -r '.source + "/" + (.records | tostring)')" = "github-derived/1" ] \
+  && pass "an injected prior-record file still wins (no fetch attempted)" \
+  || fail "injection priority: $rt"
+
+# ===========================================================================
 echo "accounting.sh — zero-finding + degraded rendering"
 # ===========================================================================
 ZLOOP="$(printf '%s' "$CLEAN_LOOP" | jq -c '.cli_version = null | .plan_auth = null')"
@@ -629,6 +762,21 @@ printf '%s' "$ZBLOCK" | grep -q '_Running totals unavailable — no prior-record
   && pass "unavailable running totals render the degradation reason" || fail "running-totals degradation missing"
 printf '%s' "$ZBLOCK" | grep -q '| Plan-capacity throttle events | not captured |' \
   && pass "uncaptured throttle events render as not captured (no fabricated 0)" || fail "throttle row wrong"
+# #615 round 2 (fails pre-fix): when the CLI reported a real cost the cost
+# row prefers it over the price-table notional, labeled with its source;
+# the notional and n/a renderings are byte-unchanged otherwise (asserted by
+# the golden render tests above).
+CFULL_LOOP="$(printf '%s' "$CLEAN_LOOP" | jq -c '.tokens = {total:150, input:100, output:50, cache_creation:null, cache_read:null, reasoning:null, cost_usd:0.42, source:"claude-json"}')"
+CTOT="$(p4b_acct_compute_totals "[$CFULL_LOOP]" "test-1" "0.66" '[]')"
+CREC="$(p4b_acct_build_record 9 abc123 APPROVED nathanpayne-claude "codex->claude" posted 9 \
+  "[$CFULL_LOOP]" "[]" "$CTOT" "$RT_ZERO" "2026-07-01T00:00:00Z")"
+CBLOCK="$(p4b_acct_render_block "$CREC")"
+printf '%s' "$CBLOCK" | grep -qF -- '~$0.42 *(not billed; CLI-reported)*' \
+  && pass "render prefers the CLI-reported cost with a source label (#615 round 2)" \
+  || fail "CLI-reported preference missing: $(printf '%s' "$CBLOCK" | grep 'Notional API-equivalent')"
+printf '%s' "$CBLOCK" | grep -q 'price table `test-1`' \
+  && fail "price-table notional shown despite a CLI-reported cost" \
+  || pass "the price-table notional stays out of the row when a reported cost wins"
 
 # ===========================================================================
 echo "verdict.schema.json + lib.sh — additive nullable usage fields (#602)"
@@ -723,8 +871,12 @@ else fail "hook happy path (rc=$rc, body=$(cat "$BODY_A" 2>/dev/null | head -5),
 if [ -z "$(find "$STATE_A/phase-4b-pending" -type f 2>/dev/null)" ]; then
   pass "two-phase ledger commit leaves no staged record behind after a successful post (#615)"
 else fail "staged pending record left behind: $(find "$STATE_A/phase-4b-pending" -type f)"; fi
-if printf '%s' "$REC_A" | jq -e '.running_totals.source == "unavailable"' >/dev/null 2>&1; then
-  pass "first-ever post reports running totals unavailable (no prior source) rather than a guessed baseline"
+# #615 round 2: the hook now fetches prior records from GitHub itself, so a
+# first-ever post on a repo with no prior records is a VALID github-derived
+# 0-record baseline (previously: unavailable, because nothing populated
+# P4B_ACCT_PRIOR_RECORDS_JSONL on the real path).
+if printf '%s' "$REC_A" | jq -e '.running_totals.source == "github-derived" and .running_totals.records == 0' >/dev/null 2>&1; then
+  pass "first-ever post derives totals from GitHub: a clean empty fetch is a 0-record baseline, never a guess (#615 round 2)"
 else fail "first-post running totals: $REC_A"; fi
 
 # (b) accounting sub-toggle off → plain summary only, exit 0, no state writes.
@@ -883,6 +1035,71 @@ if [ "$rc" = 3 ] \
         and (.[0].loop.fail_closed.reason | test("POST failed"))' "$LOG_J" >/dev/null; then
   pass "review POST failure: loop corrected to not-posted, ledger untouched, exit 3 preserved (#615)"
 else fail "POST-failure correction (rc=$rc, ledger=$(cat "$STATE_J/phase-4b-ledger.jsonl" 2>/dev/null), log=$(cat "$LOG_J" 2>/dev/null))"; fi
+
+# (k) totals-from-GitHub fetch path (#615 round 2, fails pre-fix): the real
+#     orchestrator path never set P4B_ACCT_PRIOR_RECORDS_JSONL, so running
+#     totals always fell through to the gitignored local ledger — a fresh
+#     checkout reported unavailable/local-only even when prior PRs embedded
+#     records. The hook now fetches prior review bodies itself (shimmed gh).
+STATE_K="$WORK/state-k"; BODY_K="$WORK/body-k.md"
+set +e
+out="$(run_orch "$STATE_K" "$POLICY_ON" fake-codex-approve 211 \
+  P4B_WRAPPER_BODY="$BODY_K" P4B_FAKE_PRIOR_BODIES="$PRIOR_BODY" -- 2>/dev/null)"; rc=$?
+set -e
+REC_K="$(p4b_acct_extract_records < "$BODY_K" 2>/dev/null || true)"
+if [ "$rc" = 0 ] && [ -n "$REC_K" ] \
+   && printf '%s' "$REC_K" | jq -e '
+        .running_totals.source == "github-derived"
+        and .running_totals.records == 1
+        and .running_totals.auto_approved_prs == 1
+        and .running_totals.automated_attempts == 4' >/dev/null \
+   && grep -qF '*Totals source: github-derived (1 prior record(s)).*' "$BODY_K"; then
+  pass "posted approval aggregates GitHub-fetched prior records into repo-wide running totals (#615 round 2)"
+else fail "github-derived totals e2e (rc=$rc, rec=$REC_K)"; fi
+
+# (l) fetch failure → the ledger fallback stays EXPLICITLY labeled
+#     ledger-cache in the posted body — local-only totals are never silently
+#     presented as repo-wide (post-fix guard; pre-fix the ledger was the only
+#     real source, so this asserts the new failure path keeps the label).
+STATE_L="$WORK/state-l"; BODY_L="$WORK/body-l.md"
+mkdir -p "$STATE_L"
+printf '%s\n' "$GOLDEN" > "$STATE_L/phase-4b-ledger.jsonl"
+set +e
+out="$(run_orch "$STATE_L" "$POLICY_ON" fake-codex-approve 212 \
+  P4B_WRAPPER_BODY="$BODY_L" P4B_FAKE_GRAPHQL_FAIL=1 -- 2>/dev/null)"; rc=$?
+set -e
+REC_L="$(p4b_acct_extract_records < "$BODY_L" 2>/dev/null || true)"
+if [ "$rc" = 0 ] && [ -n "$REC_L" ] \
+   && printf '%s' "$REC_L" | jq -e '
+        .running_totals.source == "ledger-cache" and .running_totals.records == 1' >/dev/null \
+   && grep -qF '*Totals source: ledger-cache (1 prior record(s)).*' "$BODY_L"; then
+  pass "fetch failure posts ledger-cache totals under the explicit local-only label (#615 round 2)"
+else fail "ledger-fallback e2e (rc=$rc, rec=$REC_L)"; fi
+
+# (m) CLI-reported cost end-to-end (#615 round 2, fails pre-fix): a claude
+#     reviewer loop whose envelope reports total_cost_usd must surface it in
+#     the posted record (tokens.cost_usd, fail-closed reported total) and the
+#     cost row must prefer it over notional, labeled CLI-reported.
+STATE_M="$WORK/state-m"; BODY_M="$WORK/body-m.md"
+set +e
+out="$(env PATH="$BIN:$PATH" \
+  MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+  P4B_ACCT_STATE_DIR="$STATE_M" \
+  CLAUDE_BIN="$BIN/fake-claude-cache-usage" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
+  P4B_FAKE_LIVE_HEAD=abc123 \
+  P4B_WRAPPER_BODY="$BODY_M" \
+  bash "$ORCH" 213 --repo o/r --author codex --reviewer nathanpayne-claude \
+    --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+REC_M="$(p4b_acct_extract_records < "$BODY_M" 2>/dev/null || true)"
+if [ "$rc" = 0 ] && [ -n "$REC_M" ] \
+   && printf '%s' "$REC_M" | jq -e '
+        .loops[0].tokens.cost_usd == 0.42
+        and .totals.reported_cost_usd == 0.42' >/dev/null \
+   && grep -qF -- '~$0.42 *(not billed; CLI-reported)*' "$BODY_M"; then
+  pass "claude envelope total_cost_usd flows into the posted record and the cost row prefers it (#615 round 2)"
+else fail "reported-cost e2e (rc=$rc, rec=$REC_M)"; fi
 
 echo
 echo "Summary: $PASS passed, $FAIL failed"

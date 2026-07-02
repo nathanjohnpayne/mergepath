@@ -5,6 +5,9 @@
 # set -euo pipefail on the caller. Bash 3.2 portable (macOS). Pure functions
 # over JSON inputs — no network, no GitHub, no reviewer CLI — so the whole
 # module is unit-testable in isolation (tests/test_phase_4b_accounting.sh).
+# Single exception: the hook-layer prior-record fetch shells out to `gh`
+# (read-only, PATH-shimmable in tests) to gather aggregation input; every
+# fetch failure degrades to the local ledger / explicit unavailable.
 #
 # What it produces: the human-readable "## Phase 4b Approval Accounting" block
 # AND the embedded machine-readable `<!-- p4b-accounting:v1 ... -->` JSON record
@@ -301,6 +304,29 @@ p4b_acct_notional_for_loops() {
 # p4b_acct_marker — the embedded-block marker string.
 p4b_acct_marker() { printf 'p4b-accounting:v1'; }
 
+# p4b_acct_encode_comment_payload — stdin filter: encode the HTML-comment
+# delimiter sequences inside a compact-JSON payload so an embedded record can
+# never terminate (or restart) its enclosing `<!-- p4b-accounting:v1 ... -->`
+# comment (#615 Codex round 2). A `-->` inside any record string (e.g. a
+# hostile finding title) would otherwise close the hidden comment early —
+# GitHub renders the remainder visibly AND p4b_acct_extract_records truncates
+# at the first terminator, dropping the record from future running totals.
+# In valid JSON text `<` / `>` occur only inside string literals, so the
+# filter rewrites the angle bracket of each delimiter to its JSON unicode
+# escape (backslash-u003e for `>`, backslash-u003c for `<`): the parsed
+# record is identical, but the serialized payload carries no literal
+# delimiter. Covered sequences: `-->` (the comment terminator), `--!>`
+# (the HTML parser closes a comment on it too), and `<!--` (would restart
+# a capture in the extractor).
+p4b_acct_encode_comment_payload() {
+  local payload
+  payload="$(cat)"
+  payload="${payload//-->/--\\u003e}"
+  payload="${payload//--!>/--!\\u003e}"
+  payload="${payload//<!--/\\u003c!--}"
+  printf '%s' "$payload"
+}
+
 # p4b_acct_extract_records — read prior review bodies on stdin and emit each
 # embedded p4b-accounting:v1 JSON record as one compact line (JSONL). Only
 # well-formed objects carrying the v1 schema tag are emitted; malformed or
@@ -424,8 +450,12 @@ p4b_acct_running_totals_for_post() {
 # totals sum only the loops that exposed a value; when NO loop exposed one the
 # total is null (explicitly unavailable, never a fabricated 0). notional_usd
 # is passed in (the caller resolves it via the price table) and echoed
-# through; null is preserved (missing price). advisory_issues_filed is derived
-# from the unique-finding issue links.
+# through; null is preserved (missing price). reported_cost_usd sums the
+# CLI-reported per-loop costs (#615 Codex round 2) fail-closed: null unless
+# every loop with measured usage also reported a cost — a token-bearing loop
+# without one would make the sum a silent underreport (never a partial
+# figure); loops with nothing measured contribute nothing and do not block.
+# advisory_issues_filed is derived from the unique-finding issue links.
 p4b_acct_compute_totals() {
   local loops_json="$1" ptv="$2" notional="$3" uf_json="${4:-[]}"
   local ptv_json notional_json
@@ -462,6 +492,15 @@ p4b_acct_compute_totals() {
                               | if length == 0 then null else add end),
       billed_usd: 0.0,
       notional_usd: $notional,
+      reported_cost_usd: (
+        ([ .[] | .tokens.cost_usd | select(. != null) ]) as $rep
+        | ([ .[] | select(.tokens.cost_usd == null
+                          and ((.tokens.total != null)
+                               or (.tokens.input != null and .tokens.output != null))) ]
+           | length) as $measured_costless
+        | if ($rep | length) == 0 or $measured_costless > 0 then null
+          else ($rep | add * 100 | round / 100) end
+      ),
       price_table_version: $ptv,
       fail_closed_events: ([ .[] | select(.fail_closed.happened == true) ] | length),
       advisory_issues_filed: ([ $uf[] | .issue | select(. != null) ] | unique)
@@ -523,13 +562,18 @@ p4b_acct_assert_no_required_with_approved() {
 # Map a verdict.schema.json object's usage into the accounting tokens shape.
 # usage null/absent ⇒ all-null counts with source "unavailable" — never an
 # estimate. The additive #602 usage fields (cache_creation_input_tokens,
-# cache_read_input_tokens, reasoning_tokens) map onto the accounting names.
+# cache_read_input_tokens, reasoning_tokens, total_cost_usd) map onto the
+# accounting names — total_cost_usd is the CLI-REPORTED cost (e.g. the
+# Claude print-mode envelope), carried through as cost_usd so the record
+# and cost table can prefer a real reported figure over the price-table
+# notional (#615 Codex round 2); absent stays null, never estimated.
 p4b_acct_tokens_from_verdict() {
   printf '%s' "${1:-null}" | jq -c '
     (.usage // null) as $u
     | if $u == null then
         {total: null, input: null, output: null, cache_creation: null,
-         cache_read: null, reasoning: null, source: "unavailable"}
+         cache_read: null, reasoning: null, cost_usd: null,
+         source: "unavailable"}
       else
         { total: ($u.token_count // null),
           input: ($u.input_tokens // null),
@@ -537,6 +581,7 @@ p4b_acct_tokens_from_verdict() {
           cache_creation: ($u.cache_creation_input_tokens // null),
           cache_read: ($u.cache_read_input_tokens // null),
           reasoning: ($u.reasoning_tokens // null),
+          cost_usd: ($u.total_cost_usd // null),
           source: ($u.source // "unavailable") }
       end' 2>/dev/null
 }
@@ -915,7 +960,11 @@ p4b_acct_render_block() {
        else "\($t.tokens_total) total ("
             + ([ $t.tokens_by_provider | to_entries[] | "\(.key) \(.value)" ] | join(", "))
             + ")" end) as $tok
-    | (if $t.notional_usd == null then "n/a — no price resolvable for the recorded loops *(not billed either way)*"
+    # Cost-source preference (#615 Codex round 2): a CLI-REPORTED cost beats
+    # the price-table notional, each labeled with its source; when neither
+    # exists the row stays an explicit n/a — never a guess.
+    | (if $t.reported_cost_usd != null then "~$\($t.reported_cost_usd) *(not billed; CLI-reported)*"
+       elif $t.notional_usd == null then "n/a — no price resolvable for the recorded loops *(not billed either way)*"
        else "~$\($t.notional_usd) *(not billed; price table `\($t.price_table_version // "unknown")`)*" end) as $notional
     | ([ .loops[] | .throttle_events | select(. != null) ]) as $thr
     | (if ($thr | length) == 0 then "not captured" else ($thr | add | tostring) end) as $throttle
@@ -976,8 +1025,19 @@ p4b_acct_render_block() {
   fi
 
   # --- Embedded machine-readable record ---
+  # Comment-delimiter sequences inside record strings are encoded as JSON
+  # unicode escapes (#615 Codex round 2) so the payload can never close the
+  # comment early (visible render + truncated extraction). The case guard is
+  # the writer-side guarantee: refuse to emit rather than post a delimiter-
+  # carrying payload (structurally unreachable after the encoder).
+  local payload
+  payload="$(printf '%s' "$rec" | jq -c '.' | p4b_acct_encode_comment_payload)"
+  [ -n "$payload" ] || return 1
+  case "$payload" in
+    *'-->'*|*'--!>'*|*'<!--'*) return 1 ;;
+  esac
   printf '<!-- %s\n' "$(p4b_acct_marker)"
-  printf '%s\n' "$(printf '%s' "$rec" | jq -c '.')"
+  printf '%s\n' "$payload"
   printf -- '-->\n'
 }
 
@@ -1206,6 +1266,85 @@ p4b_acct_hook_note_fallback() {
   p4b_acct_hook_record_loop "$vlabel" "not-posted" true "$why"
 }
 
+# p4b_acct_fetch_prior_records <owner/repo>
+# Stateless GitHub-derived prior-record fetch (#615 Codex round 2): pull the
+# review bodies of the most recently updated N merged PRs (default 50,
+# override via P4B_ACCT_PRIOR_SCAN_PRS) in ONE read-only `gh api graphql`
+# call — subscription/plan-safe, no reviewer CLI, no API key — and emit
+# every embedded p4b-accounting:v1 record as JSONL via
+# p4b_acct_extract_records. Empty output with exit 0 is VALID (no prior
+# records — the first-ever approval). Returns non-zero when the repo slug
+# is unusable, gh is absent, or the API call fails; the caller then falls
+# back to the local ledger cache, which stays explicitly labeled
+# ledger-cache (never presented as repo-wide). Testable via a PATH-shimmed
+# gh.
+p4b_acct_fetch_prior_records() {
+  local repo="${1:-}" owner name n bodies
+  case "$repo" in
+    */*) ;;
+    *) return 1 ;;
+  esac
+  owner="${repo%%/*}"
+  name="${repo#*/}"
+  [ -n "$owner" ] && [ -n "$name" ] || return 1
+  n="${P4B_ACCT_PRIOR_SCAN_PRS:-50}"
+  case "$n" in ''|0*|*[!0-9]*) n=50 ;; esac
+  command -v gh >/dev/null 2>&1 || return 1
+  bodies="$(gh api graphql \
+    -F owner="$owner" -F name="$name" -F prs="$n" \
+    -f query='query($owner: String!, $name: String!, $prs: Int!) {
+        repository(owner: $owner, name: $name) {
+          pullRequests(states: MERGED, first: $prs,
+                       orderBy: {field: UPDATED_AT, direction: DESC}) {
+            nodes { reviews(last: 50) { nodes { body } } }
+          }
+        }
+      }' \
+    --jq '.data.repository.pullRequests.nodes[].reviews.nodes[].body // empty' \
+    2>/dev/null)" || return 1
+  printf '%s\n' "$bodies" | p4b_acct_extract_records
+}
+
+# p4b_acct_hook_running_totals
+# Resolve the running-totals object for the post (#615 Codex round 2). The
+# real phase-4b-review.sh path never injected P4B_ACCT_PRIOR_RECORDS_JSONL,
+# so totals always fell through to the gitignored per-checkout ledger — a
+# fresh checkout reported unavailable/local-only even when prior PRs carried
+# embedded records. Priority now:
+#   1. An injected P4B_ACCT_PRIOR_RECORDS_JSONL (tests / callers that
+#      already fetched) — unchanged.
+#   2. The GitHub-derived fetch above (repo-wide, stateless).
+#   3. On fetch failure: the local ledger cache, EXPLICITLY labeled
+#      ledger-cache — or unavailable with the fetch-failed reason. Never
+#      silently presented as repo-wide.
+p4b_acct_hook_running_totals() {
+  local ledger fetched
+  ledger="$(p4b_acct_hook_ledger)"
+  if [ -n "${P4B_ACCT_PRIOR_RECORDS_JSONL:-}" ]; then
+    p4b_acct_running_totals_for_post "$ledger"
+    return 0
+  fi
+  if ! fetched="$(mktemp "${TMPDIR:-/tmp}/p4b-prior.XXXXXX")"; then
+    p4b_acct_running_totals_for_post "$ledger"
+    return 0
+  fi
+  if p4b_acct_fetch_prior_records "${REPO:-}" > "$fetched" 2>/dev/null; then
+    P4B_ACCT_PRIOR_RECORDS_JSONL="$fetched" \
+      P4B_ACCT_PRIOR_RECORDS_SOURCE="github-derived" \
+      p4b_acct_running_totals_for_post "$ledger"
+    rm -f "$fetched" 2>/dev/null || true
+    return 0
+  fi
+  rm -f "$fetched" 2>/dev/null || true
+  p4b_acct_warn "GitHub prior-record fetch failed; running totals fall back to the local ledger cache (labeled ledger-cache/unavailable, never repo-wide)"
+  if [ -r "$ledger" ]; then
+    p4b_acct_aggregate_running_totals "ledger-cache" < "$ledger"
+    return 0
+  fi
+  jq -nc '{source:"unavailable", records:0,
+           reason:"GitHub prior-record fetch failed and no local ledger cache exists"}'
+}
+
 # p4b_acct_hook_render_approval_block
 # Assemble + render the accounting block for the current APPROVED verdict
 # from the accumulated loop log. Prints the markdown block on stdout; returns
@@ -1220,7 +1359,7 @@ p4b_acct_hook_render_approval_block() {
     return 1
   fi
   local log loops details uf ptv notional totals running astate wall
-  local first_started record block ledger
+  local first_started record block
   log="$(p4b_acct_hook_loop_log)"
   [ -r "$log" ] || return 1
   loops="$(jq -cs '[ .[] | .loop ]' "$log" 2>/dev/null)" || return 1
@@ -1234,8 +1373,10 @@ p4b_acct_hook_render_approval_block() {
   fi
   totals="$(p4b_acct_compute_totals "$loops" "$ptv" "$notional" "$uf")" || return 1
   [ -n "$totals" ] || return 1
-  ledger="$(p4b_acct_hook_ledger)"
-  running="$(p4b_acct_running_totals_for_post "$ledger")" || return 1
+  # GitHub-derived prior records are fetched here (#615 Codex round 2) so
+  # the rendered totals are repo-wide by default, not local-ledger-only.
+  running="$(p4b_acct_hook_running_totals)" || return 1
+  [ -n "$running" ] || return 1
   if [ "${DRY_RUN:-false}" = true ]; then astate="dry-run"; else astate="posted"; fi
   wall=""
   first_started="$(jq -s '[ .[] | .started_at_epoch | select(. != null) ] | min' "$log" 2>/dev/null || true)"

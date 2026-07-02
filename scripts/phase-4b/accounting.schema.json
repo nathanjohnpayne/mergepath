@@ -85,7 +85,7 @@
       "description": "Per-loop token counts. CLI-sourced only; any field the CLI did not expose is null (never estimated). `source` is 'unavailable' with the reason implied when nothing was exposed.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["total", "input", "output", "cache_creation", "cache_read", "reasoning", "source"],
+      "required": ["total", "input", "output", "cache_creation", "cache_read", "reasoning", "cost_usd", "source"],
       "properties": {
         "total": { "type": ["integer", "null"], "minimum": 0 },
         "input": { "type": ["integer", "null"], "minimum": 0 },
@@ -93,6 +93,11 @@
         "cache_creation": { "type": ["integer", "null"], "minimum": 0 },
         "cache_read": { "type": ["integer", "null"], "minimum": 0 },
         "reasoning": { "type": ["integer", "null"], "minimum": 0 },
+        "cost_usd": {
+          "description": "CLI-REPORTED cost in USD for this loop when the CLI exposed one (e.g. the Claude print-mode envelope's total_cost_usd) (#615 Codex round 2). Null when not exposed — a reported figure only, never a notional estimate.",
+          "type": ["number", "null"],
+          "minimum": 0
+        },
         "source": { "type": "string", "minLength": 1 }
       }
     },
@@ -195,7 +200,8 @@
       "required": [
         "adapter_invocations", "tokens_total", "tokens_by_provider",
         "elapsed_seconds_total", "billed_usd", "notional_usd",
-        "price_table_version", "fail_closed_events", "advisory_issues_filed"
+        "reported_cost_usd", "price_table_version", "fail_closed_events",
+        "advisory_issues_filed"
       ],
       "properties": {
         "adapter_invocations": { "type": "integer", "minimum": 0 },
@@ -212,6 +218,11 @@
         },
         "notional_usd": {
           "description": "Notional metered-API-equivalent cost (NOT billed). Null when no price could be resolved.",
+          "type": ["number", "null"],
+          "minimum": 0
+        },
+        "reported_cost_usd": {
+          "description": "Sum of the CLI-REPORTED per-loop costs (NOT billed) (#615 Codex round 2). Fail-closed: null unless every loop with measured usage also reported a cost, so the figure is never a partial underreport. The renderer prefers this over notional_usd, labeled CLI-reported.",
           "type": ["number", "null"],
           "minimum": 0
         },
