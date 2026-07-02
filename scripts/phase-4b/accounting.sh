@@ -40,6 +40,37 @@ P4B_ACCT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 p4b_acct_warn() { echo "[phase-4b-acct] WARN: $*" >&2; }
 
+# p4b_acct_run_bounded <seconds> <command> [args...]
+# Portable, GRACEFULLY-DEGRADING bounded execution for the OPTIONAL prior-record
+# fetch (#615 Codex round 8, finding 2). Unlike lib.sh's p4b_run_with_timeout
+# (which p4b_die's when no timeout tool exists — correct for the REQUIRED
+# reviewer-CLI path), accounting is advisory: a missing timeout tool must never
+# abort the run, and accounting.sh is sourced WITHOUT lib.sh in tests, so this
+# stays self-contained. Prefers GNU/coreutils `timeout` (or macOS `gtimeout`),
+# then `perl`'s alarm; if NEITHER is present it runs the command unbounded
+# (advisory can't hard-fail on a missing tool). On timeout the underlying tool
+# returns 124 (perl exits non-zero via the alarm), which the fetch treats as a
+# fetch failure and degrades to the ledger-cache/unavailable path. seconds<=0 or
+# non-numeric ⇒ unbounded (an explicit opt-out / defensive default).
+p4b_acct_run_bounded() {
+  local seconds="$1"; shift
+  case "$seconds" in
+    ''|0|*[!0-9]*) "$@"; return $? ;;
+  esac
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"; return $?
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$seconds" "$@"; return $?
+  fi
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift @ARGV; exec @ARGV or die "exec failed: $!\n"' \
+      "$seconds" "$@"; return $?
+  fi
+  p4b_acct_warn "no timeout/gtimeout/perl available — the prior-record fetch runs unbounded (advisory; a stalled read cannot be time-boxed on this host)"
+  "$@"; return $?
+}
+
 # Repo root: accounting.sh lives at <root>/scripts/phase-4b/accounting.sh.
 p4b_acct_repo_root() { ( cd -P "$P4B_ACCT_DIR/../.." && pwd ); }
 
@@ -604,7 +635,7 @@ p4b_acct_required_severities_json() {
   printf '%s' '["P0","P1"]'
 }
 
-# p4b_acct_assert_no_required_with_approved <final_verdict> <loops-json-array>
+# p4b_acct_assert_no_required_with_approved <final_verdict> <loops-json-array> [final_head]
 # Fail-closed invariant on the strict posting rule: an APPROVED verdict may
 # never carry a required-tier finding.
 #   - Any loop recorded as APPROVED / APPROVED_WITH_ADVISORIES with a positive
@@ -614,13 +645,36 @@ p4b_acct_required_severities_json() {
 #     clean APPROVED: verdict APPROVED with required-tier counts present
 #     (non-null) and zero. A record cannot claim an approval no loop produced.
 # Required-tier findings on CHANGES_REQUESTED loops are legitimate history
-# (changes-requested-then-fixed) and do NOT violate the rule.
+# (changes-requested-then-fixed) and do NOT violate the rule — PROVIDED a new
+# commit followed (the head changed).
+#
+# Same-head required-finding rejection (#615 Codex round 8, finding 3): the
+# loop log is per-segment and only rotates AFTER an approval posts (round 6/7),
+# so a CHANGES_REQUESTED loop with a P0/P1 on head `abc` survives in the live
+# segment until an approval posts. If the operator reruns Phase 4b WITHOUT a
+# new commit and the adapter returns a clean APPROVED for the SAME head, the
+# earlier required finding on that head was NEVER addressed by a new commit —
+# yet the two-argument checks above accept it (the P0/P1 sits on a CR loop, and
+# a clean APPROVED loop exists). This mirrors the merge-gate semantic (a
+# required finding on the CURRENT head blocks): when <final_head> is supplied
+# and the final verdict is APPROVED, ANY loop (CR or otherwise, excluding
+# fail-closed-marked loops) that recorded a required-tier finding on THAT SAME
+# head is treated as an unresolved required finding and fails closed. A head
+# change (a real fix commit) moves the clean approval onto a different head and
+# clears it — the legitimate changes-requested-then-fixed path. A finding
+# explicitly rebutted/fixed in-place is out of the loop-histogram's scope and,
+# per the fail-closed contract, is left to a fresh head or an explicit
+# fail-closed marker to clear. <final_head> is OPTIONAL and defaults to the
+# empty string; when absent (or empty/"unknown") the same-head guard is skipped
+# and behavior matches the original two-argument contract.
 # Returns 0 when safe, non-zero when the combination is illegal.
 p4b_acct_assert_no_required_with_approved() {
-  local final_verdict="$1" loops_json="$2" required ok
+  local final_verdict="$1" loops_json="$2" final_head="${3:-}" required ok
   required="$(p4b_acct_required_severities_json)" || return 1
+  case "$final_head" in unknown) final_head="" ;; esac
   ok="$(printf '%s' "$loops_json" | jq -r \
     --arg final "$final_verdict" \
+    --arg head "$final_head" \
     --argjson req "$required" '
     def reqcount($f): [ $req[] | ($f[.] // 0) ] | add // 0;
     def reqnull($f):  ([ $req[] | select($f[.] == null) ] | length) > 0;
@@ -636,7 +690,19 @@ p4b_acct_assert_no_required_with_approved() {
                | select(reqcount(.findings) == 0)
              ] | length) > 0
        else true end) as $final_ok
-    | ($history_ok and $final_ok)
+    # Same-head unresolved required-tier finding (finding 3). Only enforced when
+    # a non-empty final head is supplied and the final verdict is APPROVED. Any
+    # non-fail-closed loop on that same head that recorded a required-tier
+    # finding blocks — a rerun-without-commit cannot launder it into a clean
+    # approval, because the head never advanced past the required finding.
+    | (if $final == "APPROVED" and ($head | length) > 0
+       then ([ .[]
+               | select((.fail_closed.happened // false) | not)
+               | select(.head_sha == $head)
+               | select(reqcount(.findings) > 0)
+             ] | length == 0)
+       else true end) as $same_head_ok
+    | ($history_ok and $final_ok and $same_head_ok)
   ' 2>/dev/null)" || return 1
   [ "$ok" = "true" ]
 }
@@ -803,8 +869,10 @@ p4b_acct_build_record() {
   case "$pr" in ''|*[!0-9]*) return 1 ;; esac
 
   # Fail-closed: never emit an APPROVED record whose loop history violates
-  # the strict posting rule (see the assertion's contract above).
-  if ! p4b_acct_assert_no_required_with_approved "$verdict" "$loops_json"; then
+  # the strict posting rule (see the assertion's contract above). The final
+  # head is passed so a same-head unresolved required finding (a rerun without
+  # a new commit, #615 round 8 finding 3) is rejected, not laundered.
+  if ! p4b_acct_assert_no_required_with_approved "$verdict" "$loops_json" "$head"; then
     p4b_acct_warn "refusing to build APPROVED accounting: loop history violates the required-tier posting rule (fail-closed)"
     return 1
   fi
@@ -900,8 +968,9 @@ p4b_acct_render_block() {
   wall="$(printf '%s' "$rec" | jq -r '.wall_time_first_loop_to_approval_seconds // "unavailable"')"
   loops_json="$(printf '%s' "$rec" | jq -c '.loops')"
 
-  # Defense in depth: refuse to render an illegal record.
-  p4b_acct_assert_no_required_with_approved "$verdict" "$loops_json" || return 1
+  # Defense in depth: refuse to render an illegal record (incl. a same-head
+  # unresolved required finding, #615 round 8 finding 3 — head threaded).
+  p4b_acct_assert_no_required_with_approved "$verdict" "$loops_json" "$head" || return 1
 
   local wall_disp
   if [ "$wall" = "unavailable" ]; then wall_disp="unavailable"; else wall_disp="${wall} s"; fi
@@ -1603,14 +1672,20 @@ p4b_acct_hook_note_fallback() {
 # in a diagnostics line, never aggregated). No registered reviewers ⇒
 # fail-closed non-zero (records cannot be attributed).
 #
+# Bounded (#615 round 8, finding 2): each `gh api graphql` call is wrapped in
+# p4b_acct_run_bounded with a per-call timeout (P4B_ACCT_FETCH_TIMEOUT, default
+# 20s; 0 = unbounded) so a stalled network read cannot indefinitely delay the
+# valid APPROVED post this fetch runs before. A timeout returns non-zero like
+# any other API failure and degrades to the ledger-cache/unavailable path.
+#
 # Empty output with exit 0 is VALID (no prior records — the first-ever
 # approval). Returns non-zero when the repo slug is unusable, gh is
-# absent, no reviewers are registered, or any API call fails; the caller
-# then falls back to the local ledger cache, which stays explicitly
+# absent, no reviewers are registered, or any API call fails/TIMES OUT; the
+# caller then falls back to the local ledger cache, which stays explicitly
 # labeled ledger-cache (never presented as repo-wide). Testable via a
 # PATH-shimmed gh.
 p4b_acct_fetch_prior_records() {
-  local repo="${1:-}" owner name per_page max_pages trusted
+  local repo="${1:-}" owner name per_page max_pages trusted fetch_timeout
   local page cursor resp page_records page_skipped page_rtrunc nodes has_next
   local records="" scanned=0 skipped=0 rtrunc=0
   local -a args
@@ -1631,6 +1706,12 @@ p4b_acct_fetch_prior_records() {
   case "$per_page" in ''|0*|*[!0-9]*) per_page=50 ;; esac
   max_pages="${P4B_ACCT_PRIOR_SCAN_PAGES:-4}"
   case "$max_pages" in ''|0*|*[!0-9]*) max_pages=4 ;; esac
+  # Per-call network bound (#615 Codex round 8, finding 2): each read-only
+  # `gh api graphql` call is time-boxed so a stalled/hung read degrades the
+  # OPTIONAL fetch to the ledger-cache/unavailable path instead of indefinitely
+  # delaying a valid APPROVED post. Default 20s; 0 opts out (unbounded).
+  fetch_timeout="${P4B_ACCT_FETCH_TIMEOUT:-20}"
+  case "$fetch_timeout" in ''|*[!0-9]*) fetch_timeout=20 ;; esac
   command -v gh >/dev/null 2>&1 || return 1
   trusted="$(p4b_acct_available_reviewers_json)"
   if [ -z "$trusted" ] || [ "$trusted" = "[]" ]; then
@@ -1643,7 +1724,7 @@ p4b_acct_fetch_prior_records() {
   while [ "$page" -lt "$max_pages" ]; do
     args=(-F owner="$owner" -F name="$name" -F prs="$per_page")
     [ -n "$cursor" ] && args+=(-f after="$cursor")
-    resp="$(gh api graphql "${args[@]}" \
+    resp="$(p4b_acct_run_bounded "$fetch_timeout" gh api graphql "${args[@]}" \
       -f query='query($owner: String!, $name: String!, $prs: Int!, $after: String) {
           repository(owner: $owner, name: $name) {
             pullRequests(states: MERGED, first: $prs, after: $after,

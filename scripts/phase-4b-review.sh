@@ -394,8 +394,62 @@ if p4b_acct_on 2>/dev/null; then
   # blocked). A recorded-but-otherwise-degraded render still fails-open below.
   if [ "$VERDICT" = "APPROVED" ] && [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
     if ACCT_BLOCK="$(p4b_acct_hook_render_approval_block)" && [ -n "$ACCT_BLOCK" ]; then
-      if ! { printf '\n\n'; printf '%s\n' "$ACCT_BLOCK"; } >> "$BODY_FILE"; then
-        p4b_warn "accounting: could not append the accounting block; posting the plain-summary approval"
+      # Size guard (#615 Codex round 8, finding 1): the appended block becomes
+      # part of the ONLY body POSTed to GitHub, whose review body has a hard
+      # ~65536-char cap. A large accounting block (many loops/findings) could
+      # push the combined body past that cap and make the APPROVE POST fail —
+      # letting advisory accounting block a valid clearance. Accounting must
+      # never do that. If appending the block would exceed the safe budget
+      # (default 60000, leaving GitHub headroom over the plain summary), the
+      # block is TRUNCATED with an explicit notice; if even the notice would
+      # not fit, the block is dropped and the plain-summary approval posts.
+      # Configurable via P4B_ACCT_MAX_BODY_BYTES (0 disables the guard).
+      _p4b_acct_max_body="${P4B_ACCT_MAX_BODY_BYTES:-60000}"
+      case "$_p4b_acct_max_body" in ''|*[!0-9]*) _p4b_acct_max_body=60000 ;; esac
+      _p4b_acct_notice='
+
+_[accounting truncated: the full block would exceed the review-body size limit; running totals and the machine-readable record are omitted here to keep this valid approval postable. See the per-checkout ledger / prior approvals for complete accounting.]_'
+      if [ "$_p4b_acct_max_body" -gt 0 ]; then
+        _p4b_acct_base_bytes="$(wc -c < "$BODY_FILE" 2>/dev/null | tr -d '[:space:]')"
+        case "$_p4b_acct_base_bytes" in ''|*[!0-9]*) _p4b_acct_base_bytes=0 ;; esac
+        # The append writes "\n\n" (2) + `printf '%s\n' "$ACCT_BLOCK"`. Measure a
+        # candidate append as base + 2 + bytes-of(printf '%s\n' block), so every
+        # size decision uses the SAME accounting (no off-by-one drift).
+        _p4b_acct_appended_bytes() { # <candidate-block> -> total posted body bytes
+          local blk="$1" n
+          n="$(printf '%s\n' "$blk" | wc -c 2>/dev/null | tr -d '[:space:]')"
+          case "$n" in ''|*[!0-9]*) n=0 ;; esac
+          printf '%s' "$(( _p4b_acct_base_bytes + 2 + n ))"
+        }
+        if [ "$(_p4b_acct_appended_bytes "$ACCT_BLOCK")" -gt "$_p4b_acct_max_body" ]; then
+          # Budget for the block CONTENT prefix we keep, leaving room for the
+          # "\n\n" separator, the notice, and printf's trailing "\n".
+          _p4b_acct_notice_bytes="$(printf '%s' "$_p4b_acct_notice" | wc -c 2>/dev/null | tr -d '[:space:]')"
+          case "$_p4b_acct_notice_bytes" in ''|*[!0-9]*) _p4b_acct_notice_bytes=0 ;; esac
+          # -8 safety margin absorbs a multibyte cut at the head -c boundary so
+          # the final body lands comfortably under the cap (no belt trigger).
+          _p4b_acct_keep=$(( _p4b_acct_max_body - _p4b_acct_base_bytes - 2 - _p4b_acct_notice_bytes - 1 - 8 ))
+          if [ "$_p4b_acct_keep" -gt 0 ]; then
+            ACCT_BLOCK="$(printf '%s' "$ACCT_BLOCK" | head -c "$_p4b_acct_keep")$_p4b_acct_notice"
+            p4b_warn "accounting: block exceeds the review-body size budget ($_p4b_acct_max_body bytes); truncating it so the approval still posts"
+          else
+            ACCT_BLOCK=""
+            p4b_warn "accounting: no room for the accounting block within the review-body size budget; posting the plain-summary approval"
+          fi
+          # Belt-and-suspenders: if a multibyte cut left the candidate still over
+          # the cap, drop the block entirely rather than risk a POST-rejecting
+          # body. The approval is never blocked either way.
+          if [ -n "$ACCT_BLOCK" ] \
+             && [ "$(_p4b_acct_appended_bytes "$ACCT_BLOCK")" -gt "$_p4b_acct_max_body" ]; then
+            ACCT_BLOCK=""
+            p4b_warn "accounting: truncated block still exceeded the body budget; dropping it and posting the plain-summary approval"
+          fi
+        fi
+      fi
+      if [ -n "$ACCT_BLOCK" ]; then
+        if ! { printf '\n\n'; printf '%s\n' "$ACCT_BLOCK"; } >> "$BODY_FILE"; then
+          p4b_warn "accounting: could not append the accounting block; posting the plain-summary approval"
+        fi
       fi
     else
       p4b_warn "accounting: report generation failed; posting the plain-summary approval (never blocks a valid approval)"

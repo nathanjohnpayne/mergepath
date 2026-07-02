@@ -281,6 +281,12 @@ if [ "${1:-}" = "api" ]; then
         echo "simulated graphql failure" >&2
         exit 1
       fi
+      # Stalled-read simulation (#615 round 8, finding 2): sleep so the
+      # bounded fetch's timeout fires. The sleep must OUTLAST the timeout for
+      # the wrapper to interrupt it; a real hung network read is unbounded.
+      if [ -n "${P4B_FAKE_GRAPHQL_SLEEP:-}" ]; then
+        sleep "${P4B_FAKE_GRAPHQL_SLEEP}"
+      fi
       # Multi-page fixtures (#615 round 3): the endCursor of page N names
       # the NEXT page's fixture file; no `after` arg serves page1.json.
       if [ -n "${P4B_FAKE_GRAPHQL_PAGE_DIR:-}" ]; then
@@ -625,10 +631,11 @@ printf '%s' "$tt" | jq -e '.reported_cost_usd == 0.5' >/dev/null \
 # ===========================================================================
 echo "accounting.sh — fail-closed posting-rule assertion + record builder"
 # ===========================================================================
-mkloop() { # mkloop <n> <verdict> <P0> <P1> <fail_closed_bool>
-  jq -nc --argjson n "$1" --arg v "$2" --argjson p0 "$3" --argjson p1 "$4" --argjson fc "$5" '
+mkloop() { # mkloop <n> <verdict> <P0> <P1> <fail_closed_bool> [head]
+  jq -nc --argjson n "$1" --arg v "$2" --argjson p0 "$3" --argjson p1 "$4" --argjson fc "$5" \
+    --arg head "${6:-abc123}" '
     {loop:$n, reviewer:"nathanpayne-codex", adapter:"review-via-codex.sh",
-     direction:"claude->codex", head_sha:"abc123", verdict:$v,
+     direction:"claude->codex", head_sha:$head, verdict:$v,
      posted:(if $fc then "not-posted" else "posted" end), fell_back:$fc,
      elapsed_seconds:10,
      tokens:{total:null,input:null,output:null,cache_creation:null,cache_read:null,reasoning:null,cost_usd:null,source:"unavailable"},
@@ -640,14 +647,16 @@ mkloop() { # mkloop <n> <verdict> <P0> <P1> <fail_closed_bool>
 }
 CLEAN_LOOP="$(mkloop 1 APPROVED 0 0 false)"
 CR_LOOP="$(mkloop 1 CHANGES_REQUESTED 0 1 false)"
-FIXED_LOOP="$(mkloop 2 APPROVED 0 0 false)"
+# A REAL fix advances the head: the CR loop's P1 is on abc123, and the approval
+# lands on def456 (a new commit). Same-head reruns are covered separately below.
+FIXED_LOOP="$(mkloop 2 APPROVED 0 0 false def456)"
 BAD_APPROVED_LOOP="$(mkloop 1 APPROVED 0 1 false)"
-GUARDED_BAD_LOOP="$(mkloop 2 APPROVED_WITH_ADVISORIES 0 1 true)"
+GUARDED_BAD_LOOP="$(mkloop 2 APPROVED_WITH_ADVISORIES 0 1 true def456)"
 
 p4b_acct_assert_no_required_with_approved "APPROVED" "[$CLEAN_LOOP]" \
   && pass "zero-finding APPROVED passes the posting-rule assertion" \
   || fail "clean APPROVED rejected"
-p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_LOOP,$FIXED_LOOP]" \
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_LOOP,$FIXED_LOOP]" def456 \
   && pass "changes-requested-then-fixed history passes (P1 on a CR loop is legitimate history)" \
   || fail "changes-requested-then-fixed wrongly refused"
 p4b_acct_assert_no_required_with_approved "APPROVED" "[$BAD_APPROVED_LOOP]" \
@@ -660,14 +669,54 @@ NULLREQ_LOOP="$(printf '%s' "$CLEAN_LOOP" | jq -c '.findings.P1 = null')"
 p4b_acct_assert_no_required_with_approved "APPROVED" "[$NULLREQ_LOOP]" \
   && fail "null required-tier counts on the only approved loop accepted" \
   || pass "null required-tier counts cannot back a posted APPROVED (fail-closed)"
-p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_LOOP,$FIXED_LOOP,$GUARDED_BAD_LOOP]" \
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_LOOP,$FIXED_LOOP,$GUARDED_BAD_LOOP]" def456 \
   && pass "a fail-closed-guarded findings-bearing approval is recorded history, not a violation" \
   || fail "guarded fail-closed loop wrongly poisons the record"
 p4b_acct_assert_no_required_with_approved "APPROVED" "$GOLDEN_LOOPS" \
   && pass "golden loop history passes the assertion" || fail "golden loops refused"
 
 RT_ZERO='{"source":"unavailable","records":0,"reason":"test"}'
-rec="$(p4b_acct_build_record 42 abc123 APPROVED nathanpayne-codex "claude->codex" posted "" \
+# --- Same-head unresolved required finding (#615 round 8, finding 3) ---------
+# FAILS pre-fix (the two-argument checks accept a CR-P1-then-clean-APPROVED on
+# the SAME head): the loop log only rotates after an approval posts, so a CR
+# loop with a P1 on abc123 survives a rerun-without-commit that returns a clean
+# APPROVED for the SAME abc123. Approving that would record a clean approval for
+# a head whose required finding was never fixed.
+CR_SAMEHEAD="$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123)"
+RERUN_APPROVED_SAMEHEAD="$(mkloop 2 APPROVED 0 0 false abc123)"
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD,$RERUN_APPROVED_SAMEHEAD]" abc123 \
+  && fail "same-head rerun laundered an unresolved P1 into a clean approval" \
+  || pass "a clean APPROVED on the SAME head as an earlier unresolved required finding fails closed (finding 3)"
+# The fix path — the approval lands on a NEW head (def456) — still passes: the
+# required finding on abc123 was addressed by a real commit.
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD,$FIXED_LOOP]" def456 \
+  && pass "an approval on a NEW head clears the earlier required finding (real fix commit)" \
+  || fail "new-head fix wrongly rejected by the same-head guard"
+# A P0 case on the same head is likewise rejected.
+CR_SAMEHEAD_P0="$(jq -c '.findings.P0 = 1 | .findings.P1 = 0' <<<"$CR_SAMEHEAD")"
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD_P0,$RERUN_APPROVED_SAMEHEAD]" abc123 \
+  && fail "same-head rerun laundered an unresolved P0" \
+  || pass "a same-head unresolved P0 fails closed too (finding 3)"
+# A fail-closed-marked same-head required finding is legitimate recorded history
+# (it was already refused as an approval) and does NOT re-block.
+CR_SAMEHEAD_GUARDED="$(mkloop 1 APPROVED_WITH_ADVISORIES 0 1 true abc123)"
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD_GUARDED,$RERUN_APPROVED_SAMEHEAD]" abc123 \
+  && pass "a fail-closed-marked same-head required finding is history, not a re-block (finding 3)" \
+  || fail "guarded same-head loop wrongly re-blocked"
+# Omitting the final head (or passing 'unknown') skips the same-head guard —
+# backward-compatible with the original two-argument contract.
+p4b_acct_assert_no_required_with_approved "APPROVED" "[$CR_SAMEHEAD,$RERUN_APPROVED_SAMEHEAD]" \
+  && pass "no final head supplied ⇒ same-head guard skipped (backward-compatible contract)" \
+  || fail "two-argument call wrongly enforced the same-head guard"
+# build_record threads its final-head argument into the guard: a same-head
+# rerun record is REFUSED (fails pre-fix).
+p4b_acct_build_record 55 abc123 APPROVED nathanpayne-codex "claude->codex" posted "" \
+  "[$CR_SAMEHEAD,$RERUN_APPROVED_SAMEHEAD]" "[]" \
+  "$(p4b_acct_compute_totals "[$CR_SAMEHEAD,$RERUN_APPROVED_SAMEHEAD]" "" null '[]')" "$RT_ZERO" "" >/dev/null 2>&1 \
+  && fail "build_record emitted a same-head laundered approval" \
+  || pass "build_record refuses a same-head laundered approval (finding 3, head threaded)"
+
+rec="$(p4b_acct_build_record 42 def456 APPROVED nathanpayne-codex "claude->codex" posted "" \
   "[$CR_LOOP,$FIXED_LOOP]" "[]" \
   "$(p4b_acct_compute_totals "[$CR_LOOP,$FIXED_LOOP]" "" null '[]')" "$RT_ZERO" "2026-07-01T00:00:00Z")"
 if [ -n "$rec" ] && printf '%s' "$rec" | jq -e '.schema == "p4b-accounting/v1" and (.loops | length) == 2 and .wall_time_first_loop_to_approval_seconds == null' >/dev/null; then
@@ -982,6 +1031,44 @@ set +e
 p4b_acct_fetch_prior_records "" >/dev/null 2>&1; rc=$?
 set -e
 [ "$rc" != 0 ] && pass "an unusable repo slug refuses to fetch" || fail "empty slug accepted"
+
+# --- Bounded fetch: a stalled read times out (#615 round 8, finding 2) --------
+# FAILS pre-fix: the gh api graphql call had no timeout, so a hung read blocked
+# the valid APPROVED post indefinitely. With P4B_ACCT_FETCH_TIMEOUT the bounded
+# wrapper interrupts a slow read and returns non-zero (a fetch failure), and the
+# hook degrades to the ledger-cache path — never blocking the approval.
+HOOK_STATE_TIMEOUT="$WORK/hook-rt-timeout"
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1 \
+   || command -v perl >/dev/null 2>&1; then
+  set +e
+  _t0=$(date +%s)
+  PATH="$BIN:$PATH" P4B_FAKE_GRAPHQL_SLEEP=30 P4B_ACCT_FETCH_TIMEOUT=1 \
+    P4B_FAKE_PRIOR_BODIES="$PRIOR_BODY" \
+    p4b_acct_fetch_prior_records o/r >/dev/null 2>&1; rc=$?
+  _t1=$(date +%s)
+  set -e
+  if [ "$rc" != 0 ] && [ "$(( _t1 - _t0 ))" -lt 15 ]; then
+    pass "a stalled graphql read is time-boxed and returns non-zero well under the sleep (finding 2)"
+  else fail "bounded fetch (rc=$rc, elapsed=$(( _t1 - _t0 ))s)"; fi
+  # The hook degrades to explicit unavailable when the bounded fetch times out
+  # and no ledger cache exists — the approval path never stalls on accounting.
+  rt="$(PATH="$BIN:$PATH" REPO=o/r P4B_ACCT_STATE_DIR="$HOOK_STATE_TIMEOUT" \
+        P4B_FAKE_GRAPHQL_SLEEP=30 P4B_ACCT_FETCH_TIMEOUT=1 \
+        p4b_acct_hook_running_totals 2>/dev/null)"
+  [ "$(printf '%s' "$rt" | jq -r '.source')" = "unavailable" ] \
+    && pass "a timed-out fetch with no ledger degrades to explicit unavailable, never a stall (finding 2)" \
+    || fail "timed-out hook degradation: $rt"
+  # 0 opts out of the bound (unbounded) — a fast fixture still succeeds.
+  set +e
+  out="$(PATH="$BIN:$PATH" P4B_ACCT_FETCH_TIMEOUT=0 \
+    P4B_FAKE_PRIOR_BODIES="$PRIOR_BODY" p4b_acct_fetch_prior_records o/r)"; rc=$?
+  set -e
+  [ "$rc" = 0 ] && [ -n "$out" ] \
+    && pass "P4B_ACCT_FETCH_TIMEOUT=0 opts out of the bound (unbounded fetch still works)" \
+    || fail "unbounded opt-out (rc=$rc)"
+else
+  skip "no timeout/gtimeout/perl available — cannot exercise the bounded-fetch path"
+fi
 
 # Hook resolution order: injected file > GitHub fetch > ledger cache
 # (explicitly labeled) > unavailable with the fetch-failed reason.
@@ -1594,6 +1681,51 @@ else fail "staged pending record left behind: $(find "$STATE_A/phase-4b-pending"
 if printf '%s' "$REC_A" | jq -e '.running_totals.source == "github-derived" and .running_totals.records == 0' >/dev/null 2>&1; then
   pass "first-ever post derives totals from GitHub: a clean empty fetch is a 0-record baseline, never a guess (#615 round 2)"
 else fail "first-post running totals: $REC_A"; fi
+
+# (a3) Oversized accounting block never blocks the approval (#615 round 8,
+#      finding 1). FAILS pre-fix: the block was appended to the ONLY POSTed
+#      body with no size guard, so a block that pushes the body past GitHub's
+#      ~65536-char review-body cap would fail the POST and block a valid
+#      clearance. With a small P4B_ACCT_MAX_BODY_BYTES the append is TRUNCATED
+#      (an explicit notice) yet the plain-summary APPROVED still posts (exit 0,
+#      review posted). The capped body is strictly smaller than the full block.
+STATE_A3F="$WORK/state-a3f"; BODY_A3F="$WORK/body-a3f.md"
+set +e
+run_orch "$STATE_A3F" "$POLICY_ON" fake-codex-approve 233 \
+  P4B_WRAPPER_BODY="$BODY_A3F" -- >/dev/null 2>&1
+set -e
+FULL_BYTES="$(wc -c < "$BODY_A3F" 2>/dev/null | tr -d '[:space:]')"
+BASE_BYTES="$(awk '/^## Phase 4b Approval Accounting/{exit} {print}' "$BODY_A3F" | wc -c | tr -d '[:space:]')"
+STATE_A3="$WORK/state-a3"; BODY_A3="$WORK/body-a3.md"
+# Cap ABOVE the plain summary but BELOW the full block so the TRUNCATION path
+# (keep a prefix + notice) runs, not the drop-entirely path.
+CAP_A3=$(( BASE_BYTES + 1000 ))
+set +e
+out="$(run_orch "$STATE_A3" "$POLICY_ON" fake-codex-approve 231 \
+  P4B_WRAPPER_BODY="$BODY_A3" P4B_ACCT_MAX_BODY_BYTES="$CAP_A3" -- 2>/dev/null)"; rc=$?
+set -e
+CAP_BYTES="$(wc -c < "$BODY_A3" 2>/dev/null | tr -d '[:space:]')"
+if [ "$rc" = 0 ] \
+   && grep -q '^\*\*Automated Phase 4b review\*\*' "$BODY_A3" \
+   && grep -qF 'accounting truncated' "$BODY_A3" \
+   && [ "${CAP_BYTES:-0}" -lt "${FULL_BYTES:-0}" ] \
+   && [ "${CAP_BYTES:-0}" -le "$CAP_A3" ] \
+   && printf '%s' "$out" | jq -e '.verdict == "APPROVED" and .review_posted == true' >/dev/null; then
+  pass "an oversized accounting block is truncated with a notice; body stays within the cap and the valid APPROVED still posts (finding 1)"
+else fail "oversized-block truncation (rc=$rc, cap_bytes=$CAP_BYTES budget=$CAP_A3 full=$FULL_BYTES base=$BASE_BYTES, tail=$(tail -2 "$BODY_A3" 2>/dev/null))"; fi
+# An even tighter budget (no room for the notice) drops the block entirely and
+# posts the plain summary — the approval is still not blocked.
+STATE_A3B="$WORK/state-a3b"; BODY_A3B="$WORK/body-a3b.md"
+set +e
+out="$(run_orch "$STATE_A3B" "$POLICY_ON" fake-codex-approve 232 \
+  P4B_WRAPPER_BODY="$BODY_A3B" P4B_ACCT_MAX_BODY_BYTES=1 -- 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && grep -q '^\*\*Automated Phase 4b review\*\*' "$BODY_A3B" \
+   && ! grep -q '## Phase 4b Approval Accounting' "$BODY_A3B" \
+   && printf '%s' "$out" | jq -e '.verdict == "APPROVED" and .review_posted == true' >/dev/null; then
+  pass "a budget too small even for the notice drops the block and posts the plain-summary approval (finding 1)"
+else fail "block-dropped approval (rc=$rc, body=$(head -3 "$BODY_A3B" 2>/dev/null))"; fi
 
 # (a2) #615 round 6 (fails pre-fix): TWO automated approvals of the SAME PR
 #      (a second commit reran Phase 4b). Pre-fix the per-PR loop log kept the
