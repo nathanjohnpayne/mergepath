@@ -1020,6 +1020,39 @@ assert_rc_contains "quoted heredoc piped into grep stays allowed (#611 r11)" 0 "
   'cat <<'"'"'EOF'"'"' | grep merge
 $(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
 EOF'
+
+# --- #611 round 12: multi-heredoc, process substitution, prefixed synth ----
+# (P1) an UNQUOTED heredoc before a quoted one: the unquoted A body expands
+# its substitutions, so it must be scanned — the line is not simple (more
+# heredocs than quoted), so no body is skipped and the A-body write blocks.
+assert_rc_contains "unquoted-before-quoted heredoc scans the unquoted body (#611 r12)" 2 "" \
+  'cat <<A <<'"'"'B'"'"'
+$(gh pr merge 1)
+A
+data
+B'
+# (P1) process substitution feeds a quoted body to a shell: not simple
+# (>(...) present), so the body is scanned and the literal write blocks.
+assert_rc_contains "quoted heredoc into process-sub shell fails closed (#611 r12)" 2 "" \
+  'cat <<'"'"'EOF'"'"' > >(bash)
+gh pr merge 1
+EOF'
+assert_rc_contains "tee into process-sub sh fails closed (#611 r12)" 2 "" \
+  'tee >(sh) <<'"'"'EOF'"'"'
+gh pr merge 1
+EOF'
+# (P1) a prefix command inside the synth span: command printf still emits
+# the write; the expander unwraps command/env/... to reach printf.
+assert_rc_contains "command-prefixed printf synthesis fails closed (#611 r12)" 2 "wrapper" \
+  '$(command printf "\147\150\40\160\162\40\155\145\162\147\145") 1 --admin'
+assert_rc_contains "env-prefixed printf synthesis fails closed (#611 r12)" 2 "wrapper" \
+  '$(env printf "\147\150\40\160\162\40\155\145\162\147\145") 1 --admin'
+# Control: a single quoted heredoc with no procsub / interpreter still skips
+# its inert body (the simple fixture case is unchanged).
+assert_rc_contains "single quoted heredoc fixture still allowed (#611 r12 regression)" 0 "" \
+  'cat <<'"'"'EOF'"'"' > /tmp/fx
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
 assert_rc_contains "parse failure with octal gh spelling still fails closed (#611 r4)" 2 "tokenize" \
   '$(printf "\147\150") pr merge 1 "oops'
 

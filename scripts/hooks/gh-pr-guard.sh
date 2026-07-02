@@ -583,6 +583,7 @@ def _is_literal_printf_echo(span):
         argv = shlex.split(span)
     except ValueError:
         return False
+    argv = _unwrap_synth_prefixes(argv)  # command printf ... (#611 r12)
     # Match the command-word BASENAME (#611 r10): $(/bin/echo ...) and
     # $(/usr/bin/printf ...) word-split into the same synthesized write as
     # the bare forms, so a path-qualified printf/echo is just as much a
@@ -596,6 +597,24 @@ def _is_literal_printf_echo(span):
 # entirely — literal spans then fail closed via the unexpandable sentinel
 # in command position and stay inert elsewhere. Set before flattening.
 _IFS_TOUCHED = False
+
+# Prefix commands that can precede a real command inside a substitution
+# ($(command printf ...), $(env printf ...)) — bash runs the wrapped command,
+# so the synth classifier must unwrap them to see the real printf/echo (#611
+# r12). Reuses the flatten prefix set plus leading flags/assignments.
+_SYNTH_PREFIX_CMDS = {"command", "env", "sudo", "exec", "nice",
+                      "ionice", "nohup", "time", "builtin"}
+
+def _unwrap_synth_prefixes(argv):
+    k = 0
+    while k < len(argv):
+        t = argv[k]
+        if t in _SYNTH_PREFIX_CMDS or t.startswith("-") \
+                or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
+            k += 1
+            continue
+        break
+    return argv[k:]
 
 def _static_expand(span):
     # Return the literal expansion of a pure printf/echo span, or None when
@@ -612,6 +631,7 @@ def _static_expand(span):
         argv = shlex.split(span)
     except ValueError:
         return None
+    argv = _unwrap_synth_prefixes(argv)  # command printf ... (#611 r12)
     if not argv:
         return None
     # Match the command-word BASENAME (#611 r10): /bin/echo, /usr/bin/printf
@@ -813,6 +833,7 @@ def flatten_command(cmd, depth=0):
     # Unquoted-tag heredocs keep the existing behavior: bash DOES expand
     # their substitutions, so scanning them is correct.
     pending_heredocs = []
+    heredoc_count_line = 0
     line_start = 0
 
     def _splice(span, in_double_now):
@@ -890,6 +911,7 @@ def flatten_command(cmd, depth=0):
             while j < n and cmd[j] in (" ", "\t"):
                 j += 1
             tag, quoted, k2 = _read_heredoc_delimiter(cmd, j)
+            heredoc_count_line += 1
             if quoted and tag:
                 pending_heredocs.append((tag, allow_tabs))
                 out.append(" __MERGEPATH_HEREDOC__ ")
@@ -917,16 +939,23 @@ def flatten_command(cmd, depth=0):
                 cur_word = ""
                 line = cmd[line_start:i]
                 i += 1
-                # #611 r10/r11: a quoted heredoc body executes iff ANY
-                # pipeline/list segment command word on the producer line is a
-                # shell interpreter — the command the heredoc feeds OR a
-                # downstream pipe target (cat <<'EOF' | bash runs the body).
-                # A shell name in a redirection target or argument does NOT
-                # count (r10). Only skip the body when NO segment is an
-                # interpreter.
-                if pending_heredocs and not any(
-                        w in _LINE_INTERPRETERS
-                        for w in _line_command_words(line)):
+                # A quoted heredoc body is skipped as inert data ONLY when the
+                # producer line is SIMPLE enough to model exactly (#611 r12):
+                #   * every heredoc on the line is quoted (no unquoted-tag body
+                #     whose substitutions bash DOES expand — cat <<A <<'B'),
+                #   * no process substitution ( >(sh) / <(bash) feeds the body
+                #     to a shell the pipeline scan cannot see), AND
+                #   * no pipeline/list segment command word is a shell
+                #     interpreter (cat <<'EOF' | bash runs the body, #611 r11;
+                #     a shell name in a redirection target does NOT count, r10).
+                # Any other shape fails closed: the bodies flow into the token
+                # stream and are scanned, exactly as bash would execute them.
+                line_simple = (
+                    len(pending_heredocs) == heredoc_count_line
+                    and not re.search(r"[<>]\(", line)
+                    and not any(w in _LINE_INTERPRETERS
+                                for w in _line_command_words(line)))
+                if pending_heredocs and line_simple:
                     for _tag, _allow_tabs in pending_heredocs:
                         while i < n:
                             nl = cmd.find("\n", i)
@@ -936,6 +965,7 @@ def flatten_command(cmd, depth=0):
                             if chk == _tag:
                                 break
                 pending_heredocs = []
+                heredoc_count_line = 0
                 line_start = i
                 continue
             if c in (" ", "\t"):
