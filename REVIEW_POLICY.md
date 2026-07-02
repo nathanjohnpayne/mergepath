@@ -368,7 +368,20 @@ After internal review passes (Phase 2), CodeRabbit provides an independent autom
 3. **Scan for potential issues.** Before proceeding, grep CodeRabbit's inline review comments for `Potential issue` or `⚠️`. These markers indicate findings CodeRabbit considers high-severity. Every such finding must be explicitly addressed (fixed or dismissed with reasoning). When `feedback_policy` marks additional CodeRabbit tiers `required` (e.g. `p2` / `nitpick`, or `mode: address-all`), disposition those too — map each finding onto the shared ladder per [§ Feedback Disposition Policy](#feedback-disposition-policy). The tier-aware CodeRabbit gate that *enforces* this at merge time lands in #577; until then this is an agent-discipline instruction.
 4. The agent addresses substantive CodeRabbit findings — fixing issues or posting a reply explaining why a finding is not applicable.
 5. The agent is not required to fix every CodeRabbit comment. Use judgment: fix genuine issues, dismiss false positives with a brief explanation. However, all `Potential issue` / `⚠️` findings require an explicit response.
-6. CodeRabbit review is advisory. It does not block merge via CI and does not submit a "Changes Requested" review state.
+6. **Record the feedback disposition (#584).** After adjudicating each CodeRabbit finding (step 4), record a per-finding verdict via `scripts/coderabbit-record-feedback.sh <PR#> [--scan | --findings-json <FILE|->] --verdict <comment_id>=<verdict>[:<reason>]`:
+
+   - **Validated as real and actioned (fixed)** → `--verdict <id>=fixed` (disposition `fixed`).
+   - **Determined to be a false positive / rebutted** → `--verdict <id>=false-positive[:<reason>]` (disposition `rebutted`).
+
+   This is the CodeRabbit counterpart of the Codex step 13a-bis recorder, with **one by-nature asymmetry**: Codex ends each finding with *"Useful? React with 👍 / 👎."*, so `scripts/codex-record-feedback.sh` POSTs the solicited reaction. CodeRabbit does **not** solicit per-finding reactions, so `scripts/coderabbit-record-feedback.sh` is **disposition-logging only** — it NEVER posts a reaction (or any other write) to GitHub; every GitHub call it makes is a read (REST GETs plus the read-only GraphQL `reviewThreads` query for the `resolved` bit). The helper:
+
+   - Classifies each finding with the shared `coderabbit_tier_of` (the same classifier `scripts/coderabbit-severity-gate.sh` keys on), so the ledger tier vocabulary cannot drift.
+   - Is **HEAD-pinned**: `--scan` collects only the current HEAD's CodeRabbit inline findings (bot-authored AND `commit_id`/`original_commit_id` == HEAD — the same current-finding scope the severity gate gates on). Findings supplied via `--findings-json` inherit the producer's scoping.
+   - Is **idempotent / append-only**: re-recording a comment with the same disposition is a no-op; a different disposition appends a superseding row flagged `superseded_prior: true` without rewriting prior rows.
+   - Writes a **durable per-finding verdict** (comment_id, tier, verdict, disposition, optional reason, resolved bit) to a JSONL ledger (`.mergepath/coderabbit-feedback-ledger.jsonl` by default) so CodeRabbit review precision is trackable over time, symmetric with the Codex ledger from #487.
+
+   This step is disposition-tracking, not a merge gate — CodeRabbit remains advisory. It records the same fix/rebuttal decisions the agent already made in step 4; skipping it leaves the CodeRabbit ledger empty but does not block the merge.
+7. CodeRabbit review is advisory. It does not block merge via CI and does not submit a "Changes Requested" review state.
 
 CodeRabbit's advisory status does **not** override GitHub branch
 protection's `required_conversation_resolution` gate. A CodeRabbit
@@ -396,6 +409,7 @@ Before moving past Phase 2.5, confirm all of the following:
 - [ ] Read inline diff comments via `pulls/{pr}/comments` endpoint
 - [ ] Grepped inline comments for `Potential issue` and `⚠️` — all flagged findings addressed
 - [ ] Substantive findings fixed or dismissed with reasoning
+- [ ] Recorded each finding's disposition (fixed / rebutted) via `scripts/coderabbit-record-feedback.sh` (disposition-logging only — no reaction posted; #584)
 
 ### Pre-Merge Review Conversation Gate
 
@@ -416,27 +430,58 @@ that can change GitHub conversation state.
    feedback includes resolving the associated review thread, not just
    pushing a code commit** — a fix that leaves its thread open still
    blocks the conversation-resolution gate and still surfaces in the
-   weekly unresolved-feedback sweep. Two resolve paths:
-   - `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` resolves
-     **only** threads whose fix or rebuttal is demonstrable from the
-     current PR state — `addressed-elsewhere` (an agent commit touching the
-     anchored file, after the latest re-raise) or `rebuttal-recorded` (a
-     substantive agent rebuttal after the latest re-raise). Routing-only
-     classes (`canonical-coverage`, `templated-render`) are deliberately
+   weekly unresolved-feedback sweep. The two resolve paths are split by
+   **disposition** — each records a different `[mergepath-resolve:<class>]`
+   tag, and the daily rollup / weekly sweep read that tag as the
+   disposition of record, so pick the mode that matches what actually
+   happened to the feedback (#575):
+   - `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` is the tool
+     for **fixed or rebutted** feedback — the default on a PR you pushed
+     fixes to. It resolves **only** threads whose fix or rebuttal is
+     demonstrable from the current PR state, tagging the truthful classes —
+     `addressed-elsewhere` (an agent commit touching the anchored file,
+     after the latest re-raise) or `rebuttal-recorded` (a substantive agent
+     rebuttal after the latest re-raise). Routing-only classes
+     (`canonical-coverage`, `templated-render`) are deliberately
      **not** treated as actioned here: they indicate where a durable fix
      belongs, not that one happened, so a fresh finding on a canonical path
      is left unresolved rather than auto-resolved by routing alone. The gate
      evaluates action **independently of routing**, so a canonical/templated
      thread that *does* carry action evidence (a fix commit touching it, or
      a rebuttal) is still resolved. Every non-actioned thread is left for the
-     weekly sweep. Prefer this to mark genuinely-handled feedback resolved.
-   - `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots` resolves
-     **every** current-HEAD bot thread, which is what clears the
-     `required_conversation_resolution` gate to merge; it tags each
-     deferral with `[mergepath-resolve:<class>]` so the daily rollup
-     re-surfaces it.
+     weekly sweep.
+   - `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots` is the tool
+     for **explicit deferral** — current-HEAD bot threads deliberately left
+     unfixed on this PR because they are tracked elsewhere (the standard
+     case: canonical-coverage findings on sync mirrors, deferred to a
+     follow-up issue via `--rationale`). It resolves **every** current-HEAD
+     bot thread, which is what clears the `required_conversation_resolution`
+     gate to merge, and tags each thread `deferred-to-followup` so the daily
+     rollup re-surfaces it. It is **not** the tool for fixed or rebutted
+     findings — that mis-records them as deferred (#571). As a guard, a
+     thread that is demonstrably actioned (per the same evidence gate
+     `--resolve-actioned` uses) is auto-upgraded to its truthful
+     `addressed-elsewhere`/`rebuttal-recorded` tag with an INFO line.
+   - `scripts/resolve-pr-threads.sh <PR#> --resolve-verified-propagation`
+     is the tool for **verified canonical propagation** — routing-class
+     threads (`canonical-coverage`, `templated-render`) whose durable fix
+     already landed in mergepath and demonstrably reached this consumer.
+     It resolves a thread only when the consumer file at the compared
+     ref — the PR's own head while the PR is open (so a pre-merge run
+     never resolves over drift the PR itself carries), the
+     default-branch HEAD once it is closed/merged — byte-matches the
+     mergepath canonical source (or, for templated entries, the rendered
+     template output for that consumer), the consumer tree entry's
+     mode/type matches the source (chmod flip / symlink swap rejection),
+     and the mergepath source has a fix commit strictly newer than the
+     finding (upstream-fix evidence; a pre-dating fix skips
+     conservatively — resolve manually with evidence), tagging
+     `verified-propagation` (#572, #616). Any lookup, fetch,
+     or render failure is a fail-closed skip, never a resolve. A thread
+     with action evidence is auto-upgraded to its truthful actioned class
+     first (#575); unverifiable threads are left for the weekly sweep.
 
-   Either path runs an identity-checked `resolveReviewThread` followed by
+   Each path runs an identity-checked `resolveReviewThread` followed by
    a `reviewThreads`/`nodes(ids:)` readback confirming `isResolved: true`,
    and exits non-zero (fail closed) if any resolve cannot be confirmed.
    Then query `reviewThreads` again. For stale bot-authored threads whose

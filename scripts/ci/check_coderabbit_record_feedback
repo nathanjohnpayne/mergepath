@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# check_coderabbit_record_feedback
+#
+# CI wrapper for scripts/coderabbit-record-feedback.sh — the CodeRabbit
+# disposition-verdict ledger (nathanjohnpayne/mergepath#584), the
+# DISPOSITION-ONLY twin of scripts/codex-record-feedback.sh (#487).
+#
+# Why a dedicated check (not a check_codex_scripts extension): that check
+# is the Phase 4a CODEX helper cluster — its contract, repo_rules entry,
+# and manifest coupling are Codex-specific. The CodeRabbit side already
+# established the one-check-per-feature pattern with
+# check_coderabbit_severity_gate (#577); this follows it, minus the
+# workflow-shape assertions (the recorder is an agent-invoked helper, not
+# a required-check gate, so it has no workflow of its own).
+#
+# Two concerns:
+#   1. The script must exist on disk and be executable, so the #584
+#      disposition loop can run in every consumer that receives it.
+#   2. The recorder's verdict-mapping, coderabbit_tier_of classification,
+#      HEAD-pinned scan, idempotency/superseding ledger contract, dry-run,
+#      and — the #574 asymmetry — the ZERO-writes guarantee must hold. We
+#      delegate this to tests/test_coderabbit_record_feedback.sh, which
+#      PATH-shims `gh` (no live GitHub network).
+#
+# Invoked by .github/workflows/repo_lint.yml alongside the other
+# scripts/ci/check_* scripts.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+SCRIPT="scripts/coderabbit-record-feedback.sh"
+TEST="tests/test_coderabbit_record_feedback.sh"
+
+FAILED=0
+
+for rel in "$SCRIPT" "$TEST"; do
+  if [ ! -f "$rel" ]; then
+    echo "FAIL: Missing required file: $rel"
+    FAILED=1
+    continue
+  fi
+  if [ ! -x "$rel" ]; then
+    echo "FAIL: File is not executable: $rel"
+    echo "      Fix with: chmod +x $rel"
+    FAILED=1
+  fi
+done
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_coderabbit_record_feedback: FAIL (pre-flight)"
+  exit 1
+fi
+
+echo "check_coderabbit_record_feedback: running coderabbit-record-feedback tests (#584)"
+if ! bash "$TEST"; then
+  echo "check_coderabbit_record_feedback: FAIL (test suite)"
+  exit 1
+fi
+
+echo "check_coderabbit_record_feedback: PASS"
+exit 0

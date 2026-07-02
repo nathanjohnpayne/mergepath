@@ -115,15 +115,48 @@ resolved; that is a blocked gate, not a disposition prompt.) Do not present a
       conversation-resolution gate. Any unresolved CodeRabbit review
       conversation still blocks merge until it is fixed or rebutted and
       resolved through the pre-merge review conversation gate.
+   f. **Record each finding's disposition (#584)** via
+      `scripts/coderabbit-record-feedback.sh <PR#> [--scan | --findings-json
+      <FILE|->] --verdict <comment_id>=<verdict>[:<reason>]` — fixed →
+      `<id>=fixed`, false-positive/rebutted → `<id>=false-positive[:<reason>]`,
+      each written to a durable JSONL ledger
+      (`.mergepath/coderabbit-feedback-ledger.jsonl`) so CodeRabbit review
+      precision is trackable, symmetric with the Codex ledger (#487). Unlike
+      `scripts/codex-record-feedback.sh`, this is **disposition-logging only**:
+      CodeRabbit solicits no per-finding reaction, so the helper NEVER posts to
+      GitHub (every call is a read — REST GETs plus the read-only `reviewThreads`
+      query). It is HEAD-pinned (`--scan` scopes to current-HEAD bot findings,
+      the severity-gate scope), tier-classified via the shared
+      `coderabbit_tier_of`, and idempotent/append-only. This tracks the fix/
+      rebuttal decisions from step 5.d; it is not a merge gate.
 6. Before any merge attempt, query GitHub review-thread state, not just flat
    PR comments: run `scripts/resolve-pr-threads.sh <PR#> --list` or an
    equivalent GraphQL `reviewThreads` readback. Confirm there are zero
-   unresolved review conversations. For bot-authored current-head threads,
-   if the finding has been fixed or rebutted on-thread, resolve via
-   `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` (resolves only
-   threads whose fix/rebuttal is demonstrable, leaving the rest for the
-   weekly sweep) or `--auto-resolve-bots` (resolves every current-HEAD bot
-   thread to clear the conversation-resolution gate); both run an
+   unresolved review conversations. For bot-authored threads, pick the
+   resolve mode by **disposition** — each mode records a different
+   `[mergepath-resolve:<class>]` tag, and the daily rollup / weekly sweep
+   read that tag as the disposition of record (#575):
+   `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` is the tool for
+   **fixed or rebutted** feedback — the default on a PR you pushed fixes
+   to. It resolves only threads whose fix/rebuttal is demonstrable, tags
+   the truthful `addressed-elsewhere`/`rebuttal-recorded` classes, and
+   leaves the rest for the weekly sweep. `--auto-resolve-bots` is the tool
+   for **explicit deferral** — current-HEAD bot threads you are
+   deliberately not fixing here (the standard case: canonical-coverage
+   findings on sync mirrors tracked in a follow-up issue, recorded via
+   `--rationale`); it clears the conversation-resolution gate and tags
+   `deferred-to-followup`, auto-upgrading any demonstrably-actioned thread
+   to its truthful class. Do not use it on findings you fixed or rebutted —
+   that mis-records them as deferred (the #571 failure).
+   `--resolve-verified-propagation` is the tool for **verified canonical
+   propagation** — routing-class threads (canonical-coverage /
+   templated-render) resolved only when the consumer file at the compared
+   ref (the PR head while the PR is open; the default-branch HEAD once
+   closed/merged) byte-matches the mergepath canonical source (or
+   rendered template output) with a matching tree-entry mode/type, and
+   the mergepath source carries a fix commit newer than the finding
+   (#616), tagging `verified-propagation`; any lookup,
+   fetch, or render failure is a fail-closed skip (#572). All modes run an
    identity-checked `resolveReviewThread` plus a readback confirming
    `isResolved: true` and fail closed otherwise. For stale bot-authored
    threads fixed by a later commit, use the identity-checked

@@ -19,8 +19,13 @@
 # Cases (matching the spec's class taxonomy):
 #   1. addressed-elsewhere  fix-commit by agent author after createdAt
 #                           touching the comment's anchored file
-#   2. canonical-coverage   path matches a canonical entry in
-#                           .mergepath-sync.yml
+#   2. canonical routing → deferred-to-followup: a NON-ACTIONED thread
+#                           on a manifest path is an explicit deferral
+#                           and must resurface in the daily rollup,
+#                           which SKIPS routing classes (#616 finding
+#                           3509930338); the routing context is logged
+#                           as an INFO line, the recorded class is
+#                           deferred-to-followup
 #   3. nitpick-noted        Nitpick severity, no stronger signal
 #   4. deferred-to-followup default fallback
 #   5. --rationale override emits deferred-to-followup with custom text
@@ -302,10 +307,16 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────
-# Test 2: canonical-coverage when path matches manifest
+# Test 2: a NON-ACTIONED thread on a canonical manifest path is recorded
+# as deferred-to-followup, NOT canonical-coverage (#616 finding
+# 3509930338). --auto-resolve-bots is THE explicit-deferral tool and the
+# daily rollup SKIPS routing classes — tagging the routing class here
+# would bury the deliberate deferral so it never resurfaces. The ladder
+# still derives canonical-coverage (locking the manifest classification,
+# which the INFO line surfaces); the disposition of record is deferred.
 # ─────────────────────────────────────────────────────────────────────
 echo
-echo "Test 2: canonical-coverage class (path in .mergepath-sync.yml)"
+echo "Test 2: canonical-path non-actioned deferral records deferred-to-followup (#616)"
 
 # scripts/resolve-pr-threads.sh IS in the fixture manifest as canonical.
 THREADS_T2='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
@@ -334,12 +345,15 @@ out=$(
 rc=$?
 set -e
 
-if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -q 'FIELD: body=\[mergepath-resolve: canonical-coverage\]' "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" \
+   && grep -q 'INFO: routing class canonical-coverage recorded as deferred-to-followup' <<<"$out" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: canonical-coverage\]' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
-  echo "  PASS: tag body contains [mergepath-resolve: canonical-coverage]"
+  echo "  PASS: canonical routing logged (INFO) but the recorded tag is deferred-to-followup"
 else
   fail=$((fail + 1))
-  echo "  FAIL: canonical-coverage tag not emitted (rc=$rc)" >&2
+  echo "  FAIL: non-actioned canonical-path thread not recorded as deferred-to-followup (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
@@ -585,6 +599,14 @@ fi
 # templated-render. Here a thread anchored on a templated `dest:` whose
 # entry is `consumers: all` must classify as templated-render.
 #
+# Post-#616 (finding 3509930338) the CLASSIFICATION is asserted via the
+# INFO line ("routing class templated-render recorded as
+# deferred-to-followup") and the recorded tag is deferred-to-followup:
+# a non-actioned templated-dest thread auto-resolved here is an explicit
+# deferral, and routing classes are rollup-skip classes. A blanked
+# templated-dest cache (the #467 regression this test locks) would skip
+# the INFO line entirely and fall straight to deferred-to-followup.
+#
 # This test REWRITES the shared fixture manifest, so it must run LAST
 # (all earlier tests have already executed against the original
 # manifest). It adds a second consumer whose repo is `test/repo` so the
@@ -643,12 +665,15 @@ out=$(
 rc=$?
 set -e
 
-if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -q 'FIELD: body=\[mergepath-resolve: templated-render\]' "$GH_ARGV_LOG"; then
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" \
+   && grep -q 'INFO: routing class templated-render recorded as deferred-to-followup' <<<"$out" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: templated-render\]' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
-  echo "  PASS: tag body contains [mergepath-resolve: templated-render] (scalar consumers: all resolved)"
+  echo "  PASS: templated-render classified (scalar consumers: all resolved), recorded as deferred-to-followup"
 else
   fail=$((fail + 1))
-  echo "  FAIL: templated-render not emitted for scalar consumers: all dest (rc=$rc)" >&2
+  echo "  FAIL: templated-render not classified for scalar consumers: all dest, or wrong recorded tag (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
@@ -695,12 +720,15 @@ out=$(
 )
 rc=$?
 set -e
-if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG_B" && grep -q 'FIELD: body=\[mergepath-resolve: templated-render\]' "$GH_ARGV_LOG_B"; then
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG_B" \
+   && grep -q 'INFO: routing class templated-render recorded as deferred-to-followup' <<<"$out" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG_B" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: templated-render\]' "$GH_ARGV_LOG_B"; then
   pass=$((pass + 1))
-  echo "  PASS: no-yq awk fallback classifies consumers: all dest as templated-render (#521)"
+  echo "  PASS: no-yq awk fallback classifies consumers: all dest as templated-render (#521), recorded as deferred-to-followup"
 else
   fail=$((fail + 1))
-  echo "  FAIL: no-yq fallback did not emit templated-render for consumers: all dest (rc=$rc)" >&2
+  echo "  FAIL: no-yq fallback did not classify templated-render for consumers: all dest, or wrong recorded tag (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG_B" | sed 's/^/      /' >&2
 fi
@@ -1466,6 +1494,165 @@ if [ "$BUILDER_HITS" -ge 2 ]; then
 else
   fail=$((fail + 1))
   echo "  FAIL: expected >=2 builders with .commit.author.name fallback, found $BUILDER_HITS" >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 25 (#575 guard, auto-derive path): --auto-resolve-bots on a
+# demonstrably-ACTIONED thread must AUTO-UPGRADE the deferred tag to the
+# truthful class. Thread: bot finding → stale recorded
+# [mergepath-resolve: deferred-to-followup] marker → LATER agent fix commit
+# touching the anchored file. The TAG ladder honors the surface marker
+# (deferred-to-followup), but the guard re-derives with the GATE
+# classification (skip-routing, marker-blind) which proves
+# addressed-elsewhere — so the emitted tag is the truthful
+# addressed-elsewhere, with an INFO line. (The negative case — a
+# genuinely-deferred thread keeping deferred-to-followup — is locked by
+# Tests 4 and 5 above, which run through the same guard and stay deferred.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 25: --auto-resolve-bots auto-upgrades a demonstrably-actioned deferred tag (#575)"
+
+THREADS_T25='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_25","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/upgraded.md","body":"Finding deferred earlier, then fixed","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding deferred earlier, then fixed","databaseId":25001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: deferred-to-followup] deferred earlier; resolving for the gate.","databaseId":25002,"createdAt":"2026-01-02T00:00:00Z"}
+   ]}
+  }
+]}}}}}'
+FILES_T25='["docs/upgraded.md"]'
+COMMITS_T25='[{"sha":"fix2525abc","login":"nathanpayne-claude","date":"2026-01-03T00:00:00Z"}]'
+CFILES_T25='{"fix2525abc":["docs/upgraded.md"]}'
+
+GH_ARGV_LOG="$SCRATCH/t25.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T25" "$FILES_T25" "$COMMITS_T25" "$CFILES_T25"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --auto-resolve-bots 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'INFO: tag auto-upgraded deferred-to-followup → addressed-elsewhere' <<<"$out" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: actioned thread auto-upgraded deferred-to-followup → addressed-elsewhere with INFO line"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: actioned thread was not auto-upgraded (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 26 (#575 guard, --rationale path): the explicit-deferral override is
+# exactly how the #571 mis-marking happened, so the guard applies there
+# too. A thread carrying a substantive agent rebuttal, resolved via
+# `--auto-resolve-bots --rationale`, must emit the truthful
+# rebuttal-recorded CLASS while keeping the operator's rationale TEXT.
+# (Test 5 above locks the negative case: a non-actioned thread keeps
+# deferred-to-followup with the custom text.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 26: --auto-resolve-bots --rationale auto-upgrades the class on an actioned thread (#575)"
+
+THREADS_T26='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_26","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/rebutted.md","body":"Finding that was rebutted on-thread","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding that was rebutted on-thread","databaseId":26001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Disagree — this is intentional for the propagation path; see #200 for context.","databaseId":26002,"createdAt":"2026-01-02T00:00:00Z"}
+   ]}
+  }
+]}}}}}'
+FILES_T26='[]'
+COMMITS_T26='[]'
+
+GH_ARGV_LOG="$SCRATCH/t26.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T26" "$FILES_T26" "$COMMITS_T26"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+T26_RATIONALE="bulk pass over the sync backlog; see the follow-up issue"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --auto-resolve-bots \
+  --rationale "$T26_RATIONALE" 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'INFO: tag auto-upgraded deferred-to-followup → rebuttal-recorded' <<<"$out" \
+   && grep -qF "FIELD: body=[mergepath-resolve: rebuttal-recorded] $T26_RATIONALE" "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: rationale override kept the operator text but upgraded the class to rebuttal-recorded"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: rationale-path guard did not upgrade the class (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 27 (#616 finding 3509930338, actioned side): a ROUTING-class
+# thread that IS demonstrably actioned gets the truthful actioned tag,
+# not deferred-to-followup and not the routing tag. The anchored path is
+# canonical in the fixture manifest (Test 8 rewrote the manifest but kept
+# the scripts/resolve-pr-threads.sh canonical entry) AND an agent fix
+# commit touching it post-dates the finding → the #575 auto-upgrade now
+# also runs for routing classes: INFO line `canonical-coverage →
+# addressed-elsewhere`, tag addressed-elsewhere. (Tests 2/8/8b lock the
+# NON-actioned side: routing class → deferred-to-followup.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 27: actioned canonical-path thread auto-upgrades routing → addressed-elsewhere (#616)"
+
+THREADS_T27='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_27","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/resolve-pr-threads.sh","body":"Canonical-path finding that was then fixed","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Canonical-path finding that was then fixed","databaseId":27001,"createdAt":"2026-01-01T00:00:00Z"}]}
+  }
+]}}}}}'
+FILES_T27='["scripts/resolve-pr-threads.sh"]'
+COMMITS_T27='[{"sha":"fix2727abc","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
+CFILES_T27='{"fix2727abc":["scripts/resolve-pr-threads.sh"]}'
+
+GH_ARGV_LOG="$SCRATCH/t27.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T27" "$FILES_T27" "$COMMITS_T27" "$CFILES_T27"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --auto-resolve-bots 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'INFO: tag auto-upgraded canonical-coverage → addressed-elsewhere' <<<"$out" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: canonical-coverage\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: routing class auto-upgraded to addressed-elsewhere on fix-commit evidence"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: actioned canonical-path thread was not upgraded to addressed-elsewhere (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
 
 echo
