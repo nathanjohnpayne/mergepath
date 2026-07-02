@@ -215,10 +215,12 @@ test_lib_auto_source_scrubs_ambient_github_token() {
       echo "auto_source did not load the cache (REVIEWER_PAT='${OP_PREFLIGHT_REVIEWER_PAT:-}')" >&2
       exit 1
     fi
-    # #611 r9: the scrubbed ambient token is REPLACED by the cache reviewer
-    # PAT so bare gh reads keep a usable credential.
-    if [ "${GH_TOKEN:-}" != "rev-3b" ]; then
-      echo "auto_source did not export the cache reviewer PAT as GH_TOKEN (got '${GH_TOKEN:-}')" >&2
+    # #611 r10: a review-mode cache (with PATs) leaves GH_TOKEN UNSET — it
+    # must NOT impose the reviewer PAT, so identity-specific callers
+    # (sync_read_gh -> require_token author on empty GH_TOKEN) get the right
+    # token. Callers pin $OP_PREFLIGHT_*_PAT per command instead.
+    if [ -n "${GH_TOKEN:-}" ]; then
+      echo "auto_source imposed a GH_TOKEN from a review cache (got '${GH_TOKEN:-}')" >&2
       exit 1
     fi
   ) >"$WORKDIR/lib3b.out" 2>"$WORKDIR/lib3b.err" && local rc=0 || local rc=$?

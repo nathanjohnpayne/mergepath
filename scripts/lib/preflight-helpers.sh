@@ -153,22 +153,23 @@ auto_source_preflight() {
   # does on the cache-hit path.
   # shellcheck disable=SC1090
   . "$session_file"
-  # #611 r9: REPLACE the cleared ambient token before leaving. The cache
-  # exports OP_PREFLIGHT_*_PAT variables, not GH_TOKEN, so a caller that had
-  # only an ambient GITHUB_TOKEN would otherwise end up with NO usable
-  # credential for bare gh reads after the scrub. When the cache FILE
-  # supplied a reviewer PAT (file-decided, same principle as the restore
-  # below — a stale env PAT from an earlier run does not count), export it
-  # as GH_TOKEN — the cache credential wins, which is exactly the shadowing
-  # outcome the #573 scrub exists to guarantee.
-  if [[ -z "${GH_TOKEN:-}" && -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]] \
-     && grep -qE '^(export[[:space:]]+)?OP_PREFLIGHT_REVIEWER_PAT=' "$session_file"; then
-    export GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"
-  fi
-  # Whether the cache supplied a GitHub credential is decided by the CACHE
-  # FILE, not the post-source environment (#611 r7): OP_PREFLIGHT_*_PAT
-  # values inherited from an EARLIER run would otherwise masquerade as
-  # cache-supplied and suppress the restore after a PAT-less cache source.
+  # #611 r10: do NOT synthesize a GH_TOKEN from the cache reviewer PAT here.
+  # The round-9 reviewer-export imposed the reviewer identity on every
+  # auto_source caller, but callers that need a specific identity for bare
+  # gh — notably scripts/sync-to-downstream.sh, whose sync_read_gh calls
+  # `preflight_require_token author` precisely WHEN GH_TOKEN is empty —
+  # depend on GH_TOKEN staying unset so they can acquire the RIGHT token.
+  # A review-mode cache therefore leaves GH_TOKEN unset (callers pin
+  # $OP_PREFLIGHT_{REVIEWER,AUTHOR}_PAT per command, or require_token).
+  #
+  # Only the PAT-less cache path restores the caller's ambient GITHUB_TOKEN:
+  # when the cache supplied no credential of its own (a --mode deploy cache
+  # with neither GH_TOKEN nor an OP_PREFLIGHT_*_PAT), the scrubbed ambient
+  # token is the caller's only credential and there is no per-command pin to
+  # shadow, so restoring it is both safe and necessary. Decided by the CACHE
+  # FILE, not post-source env (#611 r7): a stale OP_PREFLIGHT_*_PAT inherited
+  # from an earlier run must not masquerade as cache-supplied and suppress
+  # the restore.
   if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" \
         && "$_ambient_github_token_set" -eq 1 ]] \
      && ! grep -qE '^(export[[:space:]]+)?(OP_PREFLIGHT_REVIEWER_PAT|OP_PREFLIGHT_AUTHOR_PAT|GH_TOKEN|GITHUB_TOKEN)=' "$session_file"; then

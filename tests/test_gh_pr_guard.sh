@@ -971,6 +971,37 @@ assert_rc_contains "parse failure with gh in an unquoted heredoc body fails clos
 "unmatched
 $(gh pr merge 1)
 EOF'
+
+# --- #611 round 10: path-qualified synth, quoted-delim forms, cmd word ----
+# (P1) a path-qualified printf/echo word-splits into the same synthesized
+# write as the bare form — the basename is the literal-synth source.
+assert_rc_contains "path-qualified /bin/echo synthesized write fails closed (#611 r10)" 2 "wrapper" \
+  '$(/bin/echo gh pr merge) 123 --squash'
+assert_rc_contains "path-qualified /usr/bin/printf synthesized write fails closed (#611 r10)" 2 "wrapper" \
+  '$(/usr/bin/printf "\147\150\40\160\162\40\155\145\162\147\145") 123 --admin'
+# (P2) more quoted-delimiter forms are inert data: <<\EOF (escaped) and a
+# quoted tag with punctuation <<'"'"'EOF-MP'"'"' — their fixture bodies with
+# encoded substitutions must stay allowed.
+assert_rc_contains "backslash-escaped heredoc delimiter body stays allowed (#611 r10)" 0 "" \
+  'cat <<\EOF > /tmp/fx
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+assert_rc_contains "punctuation quoted-delimiter body stays allowed (#611 r10)" 0 "" \
+  'cat <<'"'"'EOF-MP'"'"' > /tmp/fx
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF-MP'
+# (P2) a shell name in a REDIRECTION TARGET is not the command word: a
+# quoted-heredoc fixture written to a bash-named path is inert data for cat.
+assert_rc_contains "shell-named redirection target does not force body scan (#611 r10)" 0 "" \
+  'cat > /tmp/bash-fixture <<'"'"'EOF'"'"'
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+# Fail-closed control: a real shell interpreter as the command word still
+# scans the quoted-tag body even with a redirection present.
+assert_rc_contains "bash command word with redirection still scans body (#611 r10)" 2 "wrapper" \
+  'bash > /tmp/out <<'"'"'EOF'"'"'
+$(printf "\147\150\40\160\162") merge 1
+EOF'
 assert_rc_contains "parse failure with octal gh spelling still fails closed (#611 r4)" 2 "tokenize" \
   '$(printf "\147\150") pr merge 1 "oops'
 

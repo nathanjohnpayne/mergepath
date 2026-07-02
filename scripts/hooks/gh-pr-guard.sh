@@ -583,7 +583,11 @@ def _is_literal_printf_echo(span):
         argv = shlex.split(span)
     except ValueError:
         return False
-    return bool(argv) and argv[0] in ("printf", "echo")
+    # Match the command-word BASENAME (#611 r10): $(/bin/echo ...) and
+    # $(/usr/bin/printf ...) word-split into the same synthesized write as
+    # the bare forms, so a path-qualified printf/echo is just as much a
+    # literal synth source.
+    return bool(argv) and argv[0].rsplit("/", 1)[-1] in ("printf", "echo")
 
 # #611 round 7: an IFS assignment anywhere in the command re-defines how
 # bash word-splits unquoted substitution output (IFS=/ makes a synthesized
@@ -610,14 +614,17 @@ def _static_expand(span):
         return None
     if not argv:
         return None
-    if argv[0] == "echo":
+    # Match the command-word BASENAME (#611 r10): /bin/echo, /usr/bin/printf
+    # expand identically to their bare forms.
+    cmd0 = argv[0].rsplit("/", 1)[-1]
+    if cmd0 == "echo":
         args = argv[1:]
         if args and args[0] == "-n":
             args = args[1:]
         if args and args[0].startswith("-"):
             return None  # -e/-E/clustered flags: bail to the placeholder
         out = " ".join(args)
-    elif argv[0] == "printf":
+    elif cmd0 == "printf":
         if len(argv) < 2:
             return None
         fmt = _decode_fmt_escapes(argv[1])
@@ -676,6 +683,80 @@ def _static_expand(span):
     if not _SPLICE_SAFE_RE.match(out):
         return None
     return out
+
+_LINE_PREFIX_CMDS = {"sudo", "env", "command", "exec", "nice",
+                     "ionice", "nohup", "time"}
+_LINE_INTERPRETERS = {"sh", "bash", "dash", "zsh", "ksh", "eval",
+                      "source", "."}
+
+def _read_heredoc_delimiter(cmd, j):
+    # cmd[j:] begins at the heredoc delimiter WORD (after `<<`, an optional
+    # `-`, and optional blanks). Return (literal_tag, quoted, end_index).
+    # A delimiter is "quoted" (bash disables body expansion) if ANY part is
+    # single/double-quoted OR backslash-escaped — covers <<'EOF', <<"EOF",
+    # <<\EOF, <<E\OF, and quoted tags with punctuation like <<'EOF-MP'
+    # (#611 r10). The literal tag is the word with quotes/backslashes removed
+    # (what the closing line must equal). An empty word ends the scan.
+    n = len(cmd)
+    chars = []
+    quoted = False
+    while j < n:
+        c = cmd[j]
+        if c == "\\" and j + 1 < n:
+            quoted = True
+            chars.append(cmd[j + 1])
+            j += 2
+            continue
+        if c == _SQ:
+            quoted = True
+            j += 1
+            while j < n and cmd[j] != _SQ:
+                chars.append(cmd[j]); j += 1
+            if j < n:
+                j += 1
+            continue
+        if c == _DQ:
+            quoted = True
+            j += 1
+            while j < n and cmd[j] != _DQ:
+                if cmd[j] == "\\" and j + 1 < n:
+                    chars.append(cmd[j + 1]); j += 2; continue
+                chars.append(cmd[j]); j += 1
+            if j < n:
+                j += 1
+            continue
+        if c in (" ", "\t", "\n", ";", "&", "|", "(", ")", "<", ">"):
+            break
+        chars.append(c)
+        j += 1
+    return "".join(chars), quoted, j
+
+def _line_command_word(line):
+    # The command-word BASENAME of a shell line, with redirections and their
+    # targets, leading env assignments, and known prefix commands + their
+    # flags skipped (#611 r10: `bash` in a redirection path or an argument
+    # must NOT be read as the interpreter). Backslash/quote-stripped first so
+    # an escape-spelled command word is recognized (#611 r9).
+    toks = line.replace("\\", "").replace(_SQ, "").replace(_DQ, "").split()
+    k = 0
+    while k < len(toks):
+        t = toks[k]
+        if re.match(r"^[0-9]*(>>|>|<<?|>&|&>)", t):
+            # A redirection operator; a bare operator token also consumes its
+            # target. `<<TAG` / `>file` (attached) consume only themselves.
+            if t in (">", ">>", "<", ">&", "&>", "1>", "2>", "0<"):
+                k += 2
+            else:
+                k += 1
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
+            k += 1
+            continue
+        if t in _LINE_PREFIX_CMDS or t.startswith("-"):
+            k += 1
+            continue
+        return t.rsplit("/", 1)[-1]
+    return ""
 
 def flatten_command(cmd, depth=0):
     """Normalize a command for shlex tokenization so the downstream walk
@@ -781,10 +862,11 @@ def flatten_command(cmd, depth=0):
             continue
         if (not in_single and not in_double and c == "<" and i + 1 < n
                 and cmd[i + 1] == "<" and (i + 2 >= n or cmd[i + 2] != "<")):
-            # Heredoc operator (not a <<< herestring). A QUOTED tag queues
-            # the body for verbatim skipping at the next newline; an
-            # unquoted or unparsable tag keeps the raw operator text and
-            # the existing body scanning.
+            # Heredoc operator (not a <<< herestring). A QUOTED-delimiter
+            # heredoc (bash disables body expansion) queues the body for
+            # verbatim skipping at the next newline; an UNQUOTED delimiter
+            # keeps the raw operator text and the existing body scanning
+            # (bash DOES expand unquoted-tag bodies, #611 r9).
             j = i + 2
             allow_tabs = False
             if j < n and cmd[j] == "-":
@@ -792,19 +874,12 @@ def flatten_command(cmd, depth=0):
                 j += 1
             while j < n and cmd[j] in (" ", "\t"):
                 j += 1
-            qch = ""
-            if j < n and (cmd[j] == _SQ or cmd[j] == _DQ):
-                qch = cmd[j]
-                j += 1
-            k2 = j
-            while k2 < n and (cmd[k2].isalnum() or cmd[k2] == "_"):
-                k2 += 1
-            tag = cmd[j:k2]
-            if qch and tag and k2 < n and cmd[k2] == qch:
+            tag, quoted, k2 = _read_heredoc_delimiter(cmd, j)
+            if quoted and tag:
                 pending_heredocs.append((tag, allow_tabs))
                 out.append(" __MERGEPATH_HEREDOC__ ")
                 cur_word = ""
-                i = k2 + 1
+                i = k2
                 continue
             out.append(cmd[i:i + 2])
             cur_word += cmd[i:i + 2]
@@ -827,13 +902,14 @@ def flatten_command(cmd, depth=0):
                 cur_word = ""
                 line = cmd[line_start:i]
                 i += 1
-                # #611 r9: bash unescapes command words before execution, so
-                # the interpreter probe runs on backslash- and quote-stripped
-                # text (b-backslash-ash executes bash).
-                line_n = line.replace("\\", "").replace(_SQ, "").replace(_DQ, "")
-                if pending_heredocs and not re.search(
-                        r"(^|[^A-Za-z0-9_])(sh|bash|dash|zsh|ksh|eval|source)"
-                        r"([^A-Za-z0-9_]|$)|(^|[\s])\.([\s])", line_n):
+                # #611 r10: only the line COMMAND WORD decides whether a
+                # quoted heredoc body executes — a shell name in a redirection
+                # target or an argument (cat > /tmp/bash-fixture <<'EOF') must
+                # not force body scanning. _line_command_word skips
+                # redirections/assignments/prefixes and strips escapes (#611
+                # r9) before checking the interpreter set.
+                if pending_heredocs and \
+                        _line_command_word(line) not in _LINE_INTERPRETERS:
                     for _tag, _allow_tabs in pending_heredocs:
                         while i < n:
                             nl = cmd.find("\n", i)
