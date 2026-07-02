@@ -87,7 +87,7 @@
       "additionalProperties": false,
       "required": ["total", "input", "output", "cache_creation", "cache_read", "reasoning", "cost_usd", "source"],
       "properties": {
-        "total": { "type": ["integer", "null"], "minimum": 0 },
+        "total": { "description": "Total tokens for the loop. The CLI-reported token_count when the envelope exposes one; otherwise the EXACT input+output sum when both splits are present (#615 Codex round 6, split-only CLIs); null only when neither a reported total nor both splits were captured — never estimated.", "type": ["integer", "null"], "minimum": 0 },
         "input": { "type": ["integer", "null"], "minimum": 0 },
         "output": { "type": ["integer", "null"], "minimum": 0 },
         "cache_creation": { "type": ["integer", "null"], "minimum": 0 },

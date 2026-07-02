@@ -32,8 +32,47 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/p4b-acct-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 PASS=0; FAIL=0
+SKIP=0
 pass() { echo "  PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+skip() { echo "  SKIP: $*" >&2; SKIP=$((SKIP + 1)); }
+
+# make_file_unappendable / restore_file — a ROOT-ROBUST unwritable seam
+# (#615 Codex round 6). `chmod 0444` does NOT stop root from appending (the CI
+# check_phase_4b_accounting job runs as root), so a permissions-only injection
+# silently exercises the SUCCESS path there. As a non-root user chmod 0444 is
+# enough; as root we fall back to the filesystem immutable flag (`chattr +i` on
+# Linux, `chflags uchg`/`schg` on macOS/BSD), which blocks even root's own
+# writes while keeping the file READABLE — exactly the read-only-log shape the
+# render path needs. make_file_unappendable prints the token naming HOW it was
+# locked (chmod|chattr|chflags) on success, or "unsupported" when running as
+# root with no immutable-flag tool available (the caller then skips the
+# injection-dependent assertion with a clear reason rather than passing on an
+# unexercised failure path). restore_file undoes whichever lock was applied.
+make_file_unappendable() {
+  local f="$1"
+  if [ "$(id -u)" -ne 0 ]; then
+    chmod 0444 "$f" 2>/dev/null && { printf 'chmod'; return 0; }
+  fi
+  if command -v chattr >/dev/null 2>&1 && chattr +i "$f" 2>/dev/null; then
+    printf 'chattr'; return 0
+  fi
+  if command -v chflags >/dev/null 2>&1 && chflags uchg "$f" 2>/dev/null; then
+    printf 'chflags'; return 0
+  fi
+  # As root on Linux, chmod alone is not enough; only reachable if the
+  # immutable-flag tools are missing or failed.
+  printf 'unsupported'; return 1
+}
+restore_file() {
+  local f="$1" how="$2"
+  case "$how" in
+    chattr)  chattr -i "$f" 2>/dev/null || true ;;
+    chflags) chflags nouchg "$f" 2>/dev/null || true ;;
+    *)       : ;;
+  esac
+  chmod 0644 "$f" 2>/dev/null || true
+}
 
 # --- fixtures ----------------------------------------------------------------
 DIFF="$WORK/diff.patch"
@@ -380,6 +419,43 @@ else fail "full-usage tokens mapping: $t"; fi
 if printf '%s' "$t" | jq -e '.cost_usd == 0.42' >/dev/null; then
   pass "CLI-reported total_cost_usd is preserved as tokens.cost_usd (#615 round 2)"
 else fail "cost_usd dropped by the mapper: $t"; fi
+
+# #615 round 6 (fails pre-fix): a schema-valid split-only envelope exposes
+# input_tokens + output_tokens but token_count: null. Pre-fix `total` stayed
+# null, so downstream totals/loop-table reported usage unavailable despite an
+# EXACT split. total is now derived as input+output (never a guess).
+t_split="$(p4b_acct_tokens_from_verdict '{"verdict":"APPROVED","summary":"x","findings":[],"usage":{"token_count":null,"input_tokens":100,"output_tokens":50,"source":"split-only-cli"}}')"
+if printf '%s' "$t_split" | jq -e '.total == 150 and .input == 100 and .output == 50 and .source == "split-only-cli"' >/dev/null; then
+  pass "split-only envelope (token_count null, both splits present) derives total = input+output (#615 round 6)"
+else fail "split-total derivation: $t_split"; fi
+# never-guess: token_count null and either split absent/null → total stays null.
+t_partial="$(p4b_acct_tokens_from_verdict '{"verdict":"APPROVED","summary":"x","findings":[],"usage":{"token_count":null,"input_tokens":100,"output_tokens":null,"source":"x"}}')"
+if printf '%s' "$t_partial" | jq -e '.total == null and .input == 100 and .output == null' >/dev/null; then
+  pass "split derivation stays null when either split is absent (never-guess preserved) (#615 round 6)"
+else fail "partial-split must stay null-total: $t_partial"; fi
+# an explicit reported token_count always wins over the split (even if it
+# differs) — a reported total is never overwritten by a derivation.
+t_both="$(p4b_acct_tokens_from_verdict '{"verdict":"APPROVED","summary":"x","findings":[],"usage":{"token_count":200,"input_tokens":100,"output_tokens":50,"source":"x"}}')"
+if printf '%s' "$t_both" | jq -e '.total == 200' >/dev/null; then
+  pass "an explicit token_count is preferred over the input+output split (#615 round 6)"
+else fail "token_count must win over split: $t_both"; fi
+# The derived total must reach the downstream consumers Codex named: the
+# per-approval totals and the loop-table cell (#615 round 6). Build a loop
+# whose tokens came from a split-only envelope and check both surfaces report
+# 150, not "unavailable".
+loop_split="$(jq -nc --argjson tok "$t_split" '
+  {loop:1,reviewer:"nathanpayne-codex",adapter:"review-via-codex.sh",
+   direction:"claude->codex",head_sha:"h",verdict:"APPROVED",posted:"posted",
+   fell_back:false,elapsed_seconds:5,tokens:$tok,
+   findings:{P0:0,P1:0,P2:0,P3:0,nitpick:0,unknown:0},cli_version:null,
+   timeout_seconds:900,effort:null,throttle_events:null,plan_auth:"chatgpt",
+   fail_closed:{happened:false,reason:null,duration_seconds:null}}')"
+tot_split="$(p4b_acct_compute_totals "[$loop_split]" "" "null")"
+cell_split="$(p4b_acct_fmt_tokens_cell "$t_split")"
+if printf '%s' "$tot_split" | jq -e '.tokens_total == 150 and .tokens_by_provider.codex == 150' >/dev/null \
+   && printf '%s' "$cell_split" | grep -q '^150 (split-only-cli: in 100 / out 50)$'; then
+  pass "the derived total flows into per-approval totals and the loop-table cell, not 'unavailable' (#615 round 6)"
+else fail "derived-total downstream (totals=$tot_split cell=$cell_split)"; fi
 
 h="$(p4b_acct_findings_hist_from_verdict '{"findings":[{"severity":"P1","path":"a","line":1,"body":"x"},{"severity":"P2","path":"a","line":2,"body":"y"},{"severity":"P2","path":null,"line":null,"body":"z"},{"severity":"weird","body":"w"}]}')"
 if printf '%s' "$h" | jq -e '.P0 == 0 and .P1 == 1 and .P2 == 2 and .P3 == 0 and .nitpick == 0 and .unknown == 1' >/dev/null; then
@@ -1245,6 +1321,94 @@ if (
   pass "loop numbering counts JSON objects: a multi-line record cannot inflate the next loop ID (#615 round 4)"
 else fail "object-count loop numbering (log=$(cat "$WORK/state-prettylog/phase-4b-loops/"*.jsonl 2>/dev/null | tail -3))"; fi
 
+# --- two-phase commit: stale-pending discard + per-approval log reset --------
+# (#615 round 6, both fail pre-fix)
+
+# Stale pending record (finding 2): a PRIOR run crashed after staging a pending
+# record but before posting, leaving `<pending>` (with a DIFFERENT run id). A
+# later APPROVED run whose accounting render failed/skipped never re-stages;
+# pre-fix commit_posted_record appended that stale record after the new review
+# posted, corrupting the ledger. The commit now proves ownership by the run-id
+# sidecar and DISCARDS a record it did not stage.
+# shellcheck disable=SC2034  # orchestrator globals read by the sourced hook functions
+if (
+  P4B_ACCT_STATE_DIR="$WORK/state-stalepending"; export P4B_ACCT_STATE_DIR
+  REPO="o/r"; PR=330
+  pending="$(p4b_acct_hook_pending_record_path)"
+  runid="$(p4b_acct_hook_pending_runid_path)"
+  ledger="$(p4b_acct_hook_ledger)"
+  mkdir -p "$(dirname "$pending")"
+  printf '%s\n' '{"schema":"p4b-accounting/v1","pr":330,"phantom":true}' > "$pending"
+  printf '%s' 'crashed-run-9999' > "$runid"          # a DIFFERENT run's id
+  # This invocation's run id differs from the staged one.
+  P4B_ACCT_RUN_ID="current-run-1234"; export P4B_ACCT_RUN_ID
+  p4b_acct_hook_commit_posted_record
+  # ledger must NOT have gained the phantom; pending + sidecar cleared.
+  [ ! -e "$ledger" ] || { grep -q phantom "$ledger" && exit 1; }
+  [ ! -e "$pending" ] || exit 1
+  [ ! -e "$runid" ] || exit 1
+); then
+  pass "commit discards a stale pending record from a crashed prior run (run-id mismatch), never appending it to the ledger (#615 round 6, finding 2)"
+else fail "stale-pending discard (ledger=$(cat "$WORK/state-stalepending/phase-4b-ledger.jsonl" 2>/dev/null))"; fi
+
+# Positive control: a pending record staged BY THIS run (matching sidecar) IS
+# committed — the ownership guard does not break the happy path.
+# shellcheck disable=SC2034
+if (
+  P4B_ACCT_STATE_DIR="$WORK/state-ownpending"; export P4B_ACCT_STATE_DIR
+  REPO="o/r"; PR=331
+  pending="$(p4b_acct_hook_pending_record_path)"
+  runid="$(p4b_acct_hook_pending_runid_path)"
+  ledger="$(p4b_acct_hook_ledger)"
+  mkdir -p "$(dirname "$pending")"
+  P4B_ACCT_RUN_ID="mine-42"; export P4B_ACCT_RUN_ID
+  printf '%s\n' '{"schema":"p4b-accounting/v1","pr":331,"mine":true}' > "$pending"
+  printf '%s' "$(p4b_acct_run_id)" > "$runid"          # matching sidecar
+  p4b_acct_hook_commit_posted_record
+  grep -q '"mine":true' "$ledger" || exit 1
+  [ ! -e "$pending" ] || exit 1
+  [ ! -e "$runid" ] || exit 1
+); then
+  pass "commit appends a pending record staged by THIS run (matching run-id sidecar) and clears the staging files (#615 round 6)"
+else fail "own-pending commit (ledger=$(cat "$WORK/state-ownpending/phase-4b-ledger.jsonl" 2>/dev/null))"; fi
+
+# Per-approval loop-log reset (finding 4): after a committed approval, the
+# consumed loop-log lines are rotated to the archive and the live log is
+# emptied so a LATER rerun aggregates only loops SINCE the approval — the next
+# posted record cannot repeat the earlier loops (which would double-count
+# attempts/tokens/wall-time in cumulative running totals). Pre-fix the live log
+# kept every historical line, so the second record re-embedded the first
+# approval's loops.
+# shellcheck disable=SC2034
+if (
+  P4B_ACCT_STATE_DIR="$WORK/state-logreset"; export P4B_ACCT_STATE_DIR
+  REPO="o/r"; PR=332; REVIEWER=nathanpayne-codex; ADAPTER=codex
+  DIRECTION="claude->codex"; HEAD=abc123
+  VERDICT_JSON='{"verdict":"APPROVED","summary":"ok","findings":[]}'
+  P4B_ACCT_RUN_ID="reset-run"; export P4B_ACCT_RUN_ID
+  log="$(p4b_acct_hook_loop_log)"
+  archive="${log}.archive"
+  # Record two loops (simulating a CR→approve or probe history) then stage +
+  # commit an approval so the reset fires.
+  p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
+  p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
+  [ "$(jq -s length "$log")" = 2 ] || exit 1
+  pending="$(p4b_acct_hook_pending_record_path)"
+  mkdir -p "$(dirname "$pending")"
+  printf '%s\n' '{"schema":"p4b-accounting/v1","pr":332}' > "$pending"
+  printf '%s' "$(p4b_acct_run_id)" > "$(p4b_acct_hook_pending_runid_path)"
+  p4b_acct_hook_commit_posted_record
+  # After the commit: live log emptied, archive holds the two consumed loops.
+  [ "$(jq -s length "$log" 2>/dev/null || echo -1)" = 0 ] || exit 1
+  [ "$(jq -s length "$archive")" = 2 ] || exit 1
+  # A subsequent loop starts a fresh segment: numbering restarts at 1 and the
+  # live log holds ONLY the new loop (no re-embedding of the consumed loops).
+  p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
+  jq -e -s 'length == 1 and .[0].loop.loop == 1' "$log" >/dev/null || exit 1
+); then
+  pass "post-approval loop-log reset: consumed loops rotate to the archive and the next rerun starts a fresh segment (no double-count) (#615 round 6, finding 4)"
+else fail "loop-log reset (live=$(jq -s length "$WORK/state-logreset/phase-4b-loops/"*.jsonl 2>/dev/null), archive=$(cat "$WORK/state-logreset/phase-4b-loops/"*.archive 2>/dev/null | jq -s length 2>/dev/null))"; fi
+
 # ===========================================================================
 echo "orchestrator — accounting hook (fail-open, exit codes preserved)"
 # ===========================================================================
@@ -1295,6 +1459,30 @@ else fail "staged pending record left behind: $(find "$STATE_A/phase-4b-pending"
 if printf '%s' "$REC_A" | jq -e '.running_totals.source == "github-derived" and .running_totals.records == 0' >/dev/null 2>&1; then
   pass "first-ever post derives totals from GitHub: a clean empty fetch is a 0-record baseline, never a guess (#615 round 2)"
 else fail "first-post running totals: $REC_A"; fi
+
+# (a2) #615 round 6 (fails pre-fix): TWO automated approvals of the SAME PR
+#      (a second commit reran Phase 4b). Pre-fix the per-PR loop log kept the
+#      first approval's loop, so the SECOND posted record re-embedded it — two
+#      loops — and the ledger then held record1 (1 loop) + record2 (2 loops),
+#      double-counting the first loop's attempt/tokens/wall-time in cumulative
+#      running totals. Post-fix the first approval rotates its loop out, so the
+#      second record embeds ONLY its own loop and each loop lives in exactly
+#      one ledger record.
+STATE_A2="$WORK/state-a2"; BODY_A2A="$WORK/body-a2a.md"; BODY_A2B="$WORK/body-a2b.md"
+set +e
+run_orch "$STATE_A2" "$POLICY_ON" fake-codex-approve 230 P4B_WRAPPER_BODY="$BODY_A2A" -- >/dev/null 2>&1; rc1=$?
+run_orch "$STATE_A2" "$POLICY_ON" fake-codex-approve 230 P4B_WRAPPER_BODY="$BODY_A2B" -- >/dev/null 2>&1; rc2=$?
+set -e
+REC_A2A="$(p4b_acct_extract_records < "$BODY_A2A" 2>/dev/null || true)"
+REC_A2B="$(p4b_acct_extract_records < "$BODY_A2B" 2>/dev/null || true)"
+LEDGER_A2="$STATE_A2/phase-4b-ledger.jsonl"
+if [ "$rc1" = 0 ] && [ "$rc2" = 0 ] \
+   && printf '%s' "$REC_A2A" | jq -e '(.loops | length) == 1 and .loops[0].loop == 1' >/dev/null \
+   && printf '%s' "$REC_A2B" | jq -e '(.loops | length) == 1 and .loops[0].loop == 1 and .totals.adapter_invocations == 1' >/dev/null \
+   && [ "$(wc -l < "$LEDGER_A2" | tr -d '[:space:]')" = "2" ] \
+   && [ "$(jq -s '[ .[].loops | length ] | add' "$LEDGER_A2")" = "2" ]; then
+  pass "two approvals of the same PR: the second record embeds only its own loop; each loop lives in exactly one ledger record (no double-count) (#615 round 6, finding 4)"
+else fail "no-double-count e2e (rc1=$rc1 rc2=$rc2, recA loops=$(printf '%s' "$REC_A2A" | jq '.loops|length' 2>/dev/null), recB loops=$(printf '%s' "$REC_A2B" | jq '.loops|length' 2>/dev/null), ledger-loops=$(jq -s '[ .[].loops | length ] | add' "$LEDGER_A2" 2>/dev/null))"; fi
 
 # (b) accounting sub-toggle off → plain summary only, exit 0, no state writes.
 STATE_B="$WORK/state-b"; BODY_B="$WORK/body-b.md"
@@ -1365,33 +1553,48 @@ if printf '%s' "$REC_D" | jq -e '
 else fail "historical labeling end-to-end (rec=$REC_D, body=$(grep -F '| F1 ' "$BODY_D2" 2>/dev/null))"; fi
 
 # (d2) #615 Codex round 5 (fails pre-fix): when recording THIS invocation's
-#      loop fails (a read-only loop-log) but the log ALREADY holds a clean
+#      loop fails (an unwritable loop-log) but the log ALREADY holds a clean
 #      APPROVED loop, the orchestrator must SKIP the accounting block rather
 #      than render it from the stale log. Pre-fix the render ran off the stale
 #      log and appended a block stamped with the CURRENT head claiming that
 #      head was reviewed while silently OMITTING the current loop (a HEAD-
 #      stamped block that misses this invocation entirely). The plain-summary
-#      approval still posts (exit 0); accounting is advisory. The first
-#      invocation is a normal APPROVED so the log holds a valid approved loop
-#      the stale render could (wrongly) build from.
+#      approval still posts (exit 0); accounting is advisory.
+#
+# Root-safe injection (#615 round 6, fails pre-fix under root): the earlier
+# `chmod 0444` seam did NOT make the append fail as root (CI runs the gate as
+# root), so under root the second run recorded another loop and DID render —
+# the exact `record-failure skips render ... blockB=1` failure Codex flagged.
+# make_file_unappendable now uses chmod as a non-root user and the filesystem
+# immutable flag as root (blocks even root, keeps the file readable). Post
+# round-6 the first APPROVED run rotates its consumed loop out of the live log,
+# so we re-seed the live log from the archive to recreate the exact
+# "log holds a prior approved loop the stale render could build from" premise.
 STATE_D2="$WORK/state-d2"; BODY_D2A="$WORK/body-d2a.md"; BODY_D2B="$WORK/body-d2b.md"
 set +e
 # First invocation (APPROVED) records + posts loop 1 normally (block present).
 run_orch "$STATE_D2" "$POLICY_ON" fake-codex-approve 220 P4B_WRAPPER_BODY="$BODY_D2A" -- >/dev/null 2>&1; rc1=$?
-# Make the per-PR loop log read-only so the SECOND APPROVED invocation's
-# record-loop append fails while the render read of the stale (approved) log
-# would still succeed — the exact read-only-loop-log case Codex named.
+# The live loop log is `*.jsonl`; the round-6 rotation archive is `*.jsonl.archive`
+# (never matched by `-name '*.jsonl'`). Re-seed the (now empty) live log with the
+# archived approved loop so the render read finds a clean approved loop while the
+# CURRENT record-loop append fails.
 LOG_D2="$(find "$STATE_D2/phase-4b-loops" -name '*.jsonl' 2>/dev/null | head -n1)"
-chmod 0444 "$LOG_D2" 2>/dev/null
-run_orch "$STATE_D2" "$POLICY_ON" fake-codex-approve 220 P4B_WRAPPER_BODY="$BODY_D2B" -- >/dev/null 2>&1; rc2=$?
-chmod 0644 "$LOG_D2" 2>/dev/null
+ARCHIVE_D2="${LOG_D2}.archive"
+[ -s "$ARCHIVE_D2" ] && cat "$ARCHIVE_D2" > "$LOG_D2"
+LOCK_D2="$(make_file_unappendable "$LOG_D2")"; lock_rc=$?
+if [ "$lock_rc" -ne 0 ]; then
+  skip "record-failure skip-render root-safety: no root-robust unwritable seam available ($LOCK_D2); cannot exercise the record-loop failure path here (#615 round 6)"
+else
+  run_orch "$STATE_D2" "$POLICY_ON" fake-codex-approve 220 P4B_WRAPPER_BODY="$BODY_D2B" -- >/dev/null 2>&1; rc2=$?
+  restore_file "$LOG_D2" "$LOCK_D2"
+  if [ "$rc1" = 0 ] && [ "$rc2" = 0 ] \
+     && grep -q 'Phase 4b Approval Accounting' "$BODY_D2A" \
+     && grep -q '^\*\*Automated Phase 4b review\*\*' "$BODY_D2B" \
+     && ! grep -q 'Phase 4b Approval Accounting' "$BODY_D2B"; then
+    pass "record-loop failure (root-robust unwritable log via $LOCK_D2) skips the accounting block even when the stale log holds an approved loop; plain summary posts, exit 0 (#615 rounds 5+6)"
+  else fail "record-failure skips render (lock=$LOCK_D2 rc1=$rc1 rc2=$rc2, blockA=$(grep -c 'Phase 4b Approval Accounting' "$BODY_D2A" 2>/dev/null) blockB=$(grep -c 'Phase 4b Approval Accounting' "$BODY_D2B" 2>/dev/null))"; fi
+fi
 set -e
-if [ "$rc1" = 0 ] && [ "$rc2" = 0 ] \
-   && grep -q 'Phase 4b Approval Accounting' "$BODY_D2A" \
-   && grep -q '^\*\*Automated Phase 4b review\*\*' "$BODY_D2B" \
-   && ! grep -q 'Phase 4b Approval Accounting' "$BODY_D2B"; then
-  pass "record-loop failure (read-only log) skips the accounting block even when the stale log holds an approved loop; plain summary posts, exit 0 (#615 round 5)"
-else fail "record-failure skips render (rc1=$rc1 rc2=$rc2, blockA=$(grep -c 'Phase 4b Approval Accounting' "$BODY_D2A" 2>/dev/null) blockB=$(grep -c 'Phase 4b Approval Accounting' "$BODY_D2B" 2>/dev/null))"; fi
 
 # (e) findings-bearing APPROVED verdict → existing fail-closed fallback (exit
 #     4) preserved; the fail-closed loop is recorded as safety evidence.
@@ -1597,5 +1800,5 @@ if [ "$rc" = 0 ] && [ -n "$REC_M" ] \
 else fail "reported-cost e2e (rc=$rc, rec=$REC_M)"; fi
 
 echo
-echo "Summary: $PASS passed, $FAIL failed"
+echo "Summary: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]

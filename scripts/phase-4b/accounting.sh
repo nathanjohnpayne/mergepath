@@ -652,6 +652,17 @@ p4b_acct_assert_no_required_with_approved() {
 # Claude print-mode envelope), carried through as cost_usd so the record
 # and cost table can prefer a real reported figure over the price-table
 # notional (#615 Codex round 2); absent stays null, never estimated.
+#
+# Split-total derivation (#615 Codex round 6): a schema-valid envelope may
+# expose exact input_tokens + output_tokens while leaving token_count null
+# (split-only CLIs). tokens.total then stayed null and every downstream
+# consumer (per-approval totals, the loop-table cell, notional pricing,
+# running totals) reported usage "unavailable" even though the split WAS
+# captured. total is now derived from input+output when token_count is null
+# but BOTH splits are present integers — an EXACT sum of measured counts,
+# not a guess. never-guess semantics hold: if token_count is absent AND
+# either split is null/absent, total stays null. token_count wins when
+# present (even 0) so an explicit reported total is never overwritten.
 p4b_acct_tokens_from_verdict() {
   printf '%s' "${1:-null}" | jq -c '
     (.usage // null) as $u
@@ -660,7 +671,10 @@ p4b_acct_tokens_from_verdict() {
          cache_read: null, reasoning: null, cost_usd: null,
          source: "unavailable"}
       else
-        { total: ($u.token_count // null),
+        { total: (if $u.token_count != null then $u.token_count
+                  elif ($u.input_tokens != null and $u.output_tokens != null)
+                  then ($u.input_tokens + $u.output_tokens)
+                  else null end),
           input: ($u.input_tokens // null),
           output: ($u.output_tokens // null),
           cache_creation: ($u.cache_creation_input_tokens // null),
@@ -1203,27 +1217,111 @@ p4b_acct_hook_pending_record_path() {
   printf '%s/phase-4b-pending/%s-pr%s.json' "$(p4b_acct_state_dir)" "$repo_slug" "${PR:-0}"
 }
 
+# Sidecar carrying the run id of the invocation that STAGED the pending record
+# (#615 Codex round 6). The two-phase commit spans a subshell (render stages
+# on disk) and the parent commit call, so ownership cannot ride a shell var;
+# it is written next to the pending record and compared at commit time.
+p4b_acct_hook_pending_runid_path() {
+  printf '%s.runid' "$(p4b_acct_hook_pending_record_path)"
+}
+
+# p4b_acct_run_id — this invocation's staging token. Set once by the
+# orchestrator (exported P4B_ACCT_RUN_ID so the render subshell and the parent
+# commit call agree); a stable per-process fallback (PID + start time) keeps
+# direct hook callers/tests correct when unset. NEVER regenerated per call.
+p4b_acct_run_id() {
+  if [ -n "${P4B_ACCT_RUN_ID:-}" ]; then
+    printf '%s' "$P4B_ACCT_RUN_ID"
+    return 0
+  fi
+  printf 'pid-%s' "$$"
+}
+
 # p4b_acct_hook_commit_posted_record — phase two of the ledger commit: append
-# the staged record (if any) to the ledger cache and clear the staging file.
-# Called by the orchestrator only after a successful live review POST.
-# Advisory: an append failure warns (future running totals may lag) but never
-# alters review flow. Always returns 0.
+# the staged record to the ledger cache and clear the staging file. Called by
+# the orchestrator only after a successful live review POST.
+#
+# Ownership check (#615 Codex round 6): commit ONLY a record staged by THIS
+# invocation. Without it, a previous run that crashed AFTER staging but BEFORE
+# posting leaves a stale pending record; a later APPROVED run whose accounting
+# render fails/skips (the fail-open path) never re-stages, yet this commit
+# would append that phantom/old record after the new review posts — corrupting
+# the ledger and running totals. The staged record's sidecar run id must match
+# this invocation's; a mismatch (or a missing sidecar) means the pending record
+# belongs to a different run and is DISCARDED, never committed (fail-closed:
+# when unsure, drop). Advisory: an append failure warns (future running totals
+# may lag) but never alters review flow. Always returns 0.
 p4b_acct_hook_commit_posted_record() {
-  local pending ledger
+  local pending runid_file staged_runid ledger
   pending="$(p4b_acct_hook_pending_record_path)"
   [ -s "$pending" ] || return 0
+  runid_file="$(p4b_acct_hook_pending_runid_path)"
+  staged_runid=""
+  [ -r "$runid_file" ] && staged_runid="$(cat "$runid_file" 2>/dev/null || true)"
+  if [ -z "$staged_runid" ] || [ "$staged_runid" != "$(p4b_acct_run_id)" ]; then
+    p4b_acct_warn "discarding a pending ledger record from a different invocation (run id '${staged_runid:-none}' != '$(p4b_acct_run_id)'); the current run did not stage it, so it is not committed (#615 round 6)"
+    p4b_acct_hook_discard_pending_record
+    return 0
+  fi
   ledger="$(p4b_acct_hook_ledger)"
   if ! { mkdir -p "$(dirname "$ledger")" && cat "$pending" >> "$ledger"; } 2>/dev/null; then
     p4b_acct_warn "could not append the posted record to the ledger cache (future running totals may lag)"
   fi
-  rm -f "$pending" 2>/dev/null || true
+  p4b_acct_hook_discard_pending_record
+  # Per-approval loop-log rotation (#615 Codex round 6): now that THIS run's
+  # approval record is committed, the loops it embedded are consumed. Rotate
+  # them out of the per-PR loop log so a later rerun (another commit → another
+  # Phase 4b pass) aggregates only loops SINCE this approval — otherwise the
+  # NEXT posted record would repeat these attempts and cumulative running
+  # totals (which sum loop spend across ALL posted records) would double-count
+  # tokens, attempts, and wall time. Advisory — a rotation failure warns but
+  # never alters review flow.
+  p4b_acct_hook_rotate_loop_log_after_approval || true
   return 0
 }
 
-# p4b_acct_hook_discard_pending_record — drop a staged record that will not
-# be committed (the review did not post). Always returns 0.
+# p4b_acct_hook_rotate_loop_log_after_approval — archive the current per-PR
+# loop log so the next rerun starts a fresh segment (#615 Codex round 6).
+# Called ONLY from the confirmed-post commit path, so it fires exactly once
+# per posted approval. The consumed lines are appended to a per-PR archive
+# (never deleted — the full history stays auditable and the archive is the
+# high-water mark) and the live log is truncated. Loop numbering
+# (p4b_acct_hook_record_loop counts objects in the LIVE log) then restarts at
+# 1 for the next segment, so each posted record's loops are self-contained and
+# appear in exactly one record — the round-4 in-record lifecycle links still
+# hold (they are keyed within a single segment/record).
+#
+# Interaction (#615 round 6): this reset governs the per-approval loops[]/
+# totals embedded in EACH record. The GitHub-fetch dedup (round 5) dedups only
+# the auto_approved_prs PR metric; loop SPEND is deliberately summed across all
+# records. With each loop now embedded in exactly one record, that per-record
+# summation counts every loop once — the two corrections are orthogonal (PR
+# dedup vs. one-record-per-loop), never double-correcting the same axis.
+p4b_acct_hook_rotate_loop_log_after_approval() {
+  local log archive
+  log="$(p4b_acct_hook_loop_log)" || return 1
+  [ -s "$log" ] || return 0
+  # Archive suffix deliberately does NOT end in .jsonl so a `*.jsonl` glob over
+  # the loop-log dir (tests, other consumers) never picks the archive as the
+  # live log (#615 round 6).
+  archive="${log}.archive"
+  if ! { mkdir -p "$(dirname "$archive")" && cat "$log" >> "$archive"; } 2>/dev/null; then
+    p4b_acct_warn "could not archive the per-PR loop log after approval; leaving it in place (a rerun may repeat these loops)"
+    return 1
+  fi
+  # Truncate the live log so the next segment starts empty (loop numbering
+  # restarts at 1). Removing the file would work too, but truncation keeps a
+  # stable path and permissions for the next append.
+  : > "$log" 2>/dev/null || { p4b_acct_warn "could not truncate the per-PR loop log after archiving"; return 1; }
+  return 0
+}
+
+# p4b_acct_hook_discard_pending_record — drop a staged record (and its run-id
+# sidecar) that will not be committed (the review did not post, or it belongs
+# to a different invocation). Always returns 0.
 p4b_acct_hook_discard_pending_record() {
-  rm -f "$(p4b_acct_hook_pending_record_path)" 2>/dev/null || true
+  rm -f "$(p4b_acct_hook_pending_record_path)" \
+        "$(p4b_acct_hook_pending_runid_path)" 2>/dev/null || true
   return 0
 }
 
@@ -1642,13 +1740,20 @@ p4b_acct_hook_render_approval_block() {
   # Two-phase ledger commit (#615 Codex): stage the record now; the
   # orchestrator commits it only after the review POST succeeds. Any prior
   # staging leftover (e.g. a crashed run) is dropped first so a later commit
-  # can never append a record from a different invocation.
+  # can never append a record from a different invocation. The record is
+  # tagged with THIS invocation's run id (sidecar) so commit-time can prove
+  # ownership even when the fail-open path skips re-staging (#615 round 6).
   p4b_acct_hook_discard_pending_record
   if [ "$astate" = "posted" ]; then
-    local pending
+    local pending runid_file
     pending="$(p4b_acct_hook_pending_record_path)"
-    # Advisory: a staging failure must not lose the block.
-    if ! { mkdir -p "$(dirname "$pending")" && printf '%s\n' "$record" > "$pending"; } 2>/dev/null; then
+    runid_file="$(p4b_acct_hook_pending_runid_path)"
+    # Advisory: a staging failure must not lose the block. Stage the record
+    # THEN its run-id sidecar; a sidecar without a record (or vice versa)
+    # fails the commit-time ownership check and is discarded, never committed.
+    if ! { mkdir -p "$(dirname "$pending")" \
+             && printf '%s\n' "$record" > "$pending" \
+             && printf '%s' "$(p4b_acct_run_id)" > "$runid_file"; } 2>/dev/null; then
       p4b_acct_warn "could not stage the record for the ledger cache (future running totals may lag)"
     fi
   fi

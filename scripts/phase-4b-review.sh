@@ -78,6 +78,15 @@ p4b_acct_on() { [ "$P4B_ACCT_AVAILABLE" = true ] && p4b_acct_hook_active; }
 # that never actually posted is corrected instead of double-recorded.
 P4B_ACCT_LOOP_RECORDED=false
 
+# Per-invocation ledger-staging token (#615 Codex round 6). Exported so the
+# render subshell (which stages the pending record on disk) and this process's
+# later commit call agree on ownership: the two-phase commit only appends a
+# pending record whose sidecar run id matches this value, so a stale record
+# left by a prior crashed run is discarded instead of committed on the
+# fail-open path. Generated once here; NEVER regenerated per hook call.
+P4B_ACCT_RUN_ID="p4b-$$-$(date +%s 2>/dev/null || echo 0)-${RANDOM:-0}"
+export P4B_ACCT_RUN_ID
+
 # p4b_acct_mark_unposted <why>
 # Correct the provisional accounting state when the review did NOT actually
 # post (#615 Codex): amend this invocation's loop-log line (posted →
@@ -354,6 +363,14 @@ trap "rm -f '$BODY_FILE'" EXIT
 # parent). Loop records accumulate across invocations in the per-PR loop log
 # so a CHANGES_REQUESTED → fix → APPROVED cycle renders its full history.
 if p4b_acct_on 2>/dev/null; then
+  # Clear any stale pending ledger record from a prior run that crashed after
+  # staging but before posting (#615 Codex round 6). Without this, an APPROVED
+  # run whose accounting render later fails/skips (the fail-open path) never
+  # re-stages, and the two-phase commit would append that phantom/old record
+  # after the new review posts. The render below re-stages a freshly tagged
+  # record on the happy path; the commit-time run-id check is the belt to this
+  # suspenders. Advisory — never alters review flow.
+  p4b_acct_hook_discard_pending_record || true
   ACCT_POSTED_STATE="posted"
   [ "$DRY_RUN" = true ] && ACCT_POSTED_STATE="dry-run"
   # The loop is recorded (and the block rendered) BEFORE post_review so the
