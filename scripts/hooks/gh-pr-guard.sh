@@ -537,6 +537,13 @@ def _static_expand(span):
             out = "".join(parts)
     else:
         return None
+    # IFS whitespace inside a literal expansion word-splits exactly like a
+    # space (#611 round 4: printf newlines between synthesized words), so
+    # normalize space/tab/newline RUNS to single spaces BEFORE the
+    # splice-safety check. No strip: a leading/trailing separator still
+    # separates the expansion from glued adjacent text, exactly as bash
+    # field-splits it.
+    out = re.sub(r"[ \t\n]+", " ", out)
     if not _SPLICE_SAFE_RE.match(out):
         return None
     return out
@@ -866,6 +873,20 @@ except ValueError as e:
     print(f"shlex error: {e}", file=sys.stderr)
     sys.exit(1)
 ' > "$TMP_TOKENS" 2> "$TMP_TOKENS_ERR"; then
+  # #611 round 4 (Codex P2): the broadened fast path tokenizes ANY command
+  # carrying a substitution, including valid-but-unmodeled shell (e.g. a
+  # heredoc body with an unbalanced quote) that this parser cannot
+  # tokenize. Failing closed on those would turn the gh guard into a
+  # blocker for unrelated shell work. Restore pre-broadening parity: a
+  # parse failure with NO guarded-write evidence anywhere in the raw text
+  # (no gh in stripped or octal/hex escape spelling, no env -S, no
+  # pr/issue noun, no guarded verb) exits 0 exactly like the evidence-free
+  # fast path always did. ANY evidence keeps the fail-closed block below.
+  if ! echo "$COMMAND" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(([^[:space:]]*/)?gh|pr|issue|create|merge|comment|review|edit)([^A-Za-z0-9_]|$)' \
+     && ! echo "$COMMAND" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
+     && ! echo "$COMMAND" | grep -qE '\\(147|150|107|110|x67|x68|x47|x48)'; then
+    exit 0
+  fi
   echo "BLOCKED: gh-pr-guard could not tokenize the gh command (malformed shell quoting)." >&2
   echo "  command: $COMMAND" >&2
   echo "  shlex error: $(cat "$TMP_TOKENS_ERR")" >&2

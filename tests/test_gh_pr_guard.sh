@@ -931,6 +931,26 @@ assert_rc_contains "statically expanded benign printf stays allowed (#611 r2)" 0
 assert_rc_contains "non-static printf form still fails closed on evidence (#611 r2)" 2 "wrapper" \
   '$(printf "\147\150" x) pr merge 1'
 
+# --- #611 round 4: IFS whitespace in expansions + benign parse failures ---
+# (P1) printf can emit NEWLINES between synthesized words; bash word-splits
+# them exactly like spaces. The expansion is whitespace-normalized before
+# the splice-safety check, so the walk sees the real gh pr merge.
+# \147\150 \n \160\162 \n \155\145\162\147\145 = gh<NL>pr<NL>merge.
+assert_rc_contains "newline-separated synthesized gh pr merge fails closed (#611 r4)" 2 "wrapper" \
+  '$(printf "\147\150\n\160\162\n\155\145\162\147\145") 123 --admin'
+assert_rc_contains "tab-separated synthesized gh pr fails closed (#611 r4)" 2 "wrapper" \
+  '$(printf "\147\150\11\160\162") merge 1'
+# (P2) A substitution-bearing command the parser cannot tokenize (unbalanced
+# quote in otherwise-valid shell, e.g. heredoc bodies) must NOT fail closed
+# when it carries no guarded-write evidence — pre-broadening parity: the
+# evidence-free fast path always exited 0. Evidence keeps the block.
+assert_rc_contains "parse failure with no guarded evidence stays allowed (#611 r4)" 0 "" \
+  '$(date) "oops'
+assert_rc_contains "parse failure WITH gh evidence still fails closed (#611 r4)" 2 "tokenize" \
+  '$(date) "oops gh pr merge 1'
+assert_rc_contains "parse failure with octal gh spelling still fails closed (#611 r4)" 2 "tokenize" \
+  '$(printf "\147\150") pr merge 1 "oops'
+
 # #553 fix (b): the merge-state jq counts an un-timestamped PENDING re-run as
 # non-green even when a timestamped SUCCESS exists for the same check (the prior
 # max_by(.t) mis-ranked the empty-timestamp PENDING behind the SUCCESS, so an
