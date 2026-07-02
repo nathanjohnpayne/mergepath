@@ -777,6 +777,26 @@ printf '%s' "$NULLRTBLOCK" | grep -qF '| Cumulative tokens | unavailable (not me
 printf '%s' "$NULLRTBLOCK" | grep -qF '| Cumulative notional API-equivalent | unavailable (not priced in every prior record) *(not billed either way)* |' \
   && pass "null cumulative notional renders unavailable, not ~\$0 (#615)" \
   || fail "null cumulative notional rendered wrong"
+# #615 Codex round 7, finding 3 (fails pre-fix): a sub-hour cumulative
+# human-time-saved lower bound must render in minutes, never floored to ~0 h.
+# Pre-fix [30,180] rendered "~0 – 3 h", understating the documented 30-minute
+# floor; post-fix it renders "~30 min – 3 h" (per-bound units once the low bound
+# drops below an hour).
+SUBHOURREC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.human_minutes_saved_estimate = [30, 180]')"
+SUBHOURBLOCK="$(p4b_acct_render_block "$SUBHOURREC")"
+if printf '%s' "$SUBHOURBLOCK" | grep -qF '| Cumulative human time saved (est.) | ~30 min – 3 h |' \
+   && ! printf '%s' "$SUBHOURBLOCK" | grep -qF '~0 – 3 h'; then
+  pass "sub-hour cumulative human-time-saved renders in minutes (~30 min – 3 h), not floored to ~0 h (#615 round 7, finding 3)"
+else fail "sub-hour human-time render: $(printf '%s' "$SUBHOURBLOCK" | grep -F 'Cumulative human time saved')"; fi
+# Both bounds below an hour render as a minutes-only range.
+SUBHOUR2REC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.human_minutes_saved_estimate = [30, 50]')"
+printf '%s' "$(p4b_acct_render_block "$SUBHOUR2REC")" | grep -qF '| Cumulative human time saved (est.) | ~30 – 50 min |' \
+  && pass "a fully sub-hour range renders minutes on both bounds (~30 – 50 min) (#615 round 7, finding 3)" \
+  || fail "fully-sub-hour human-time render"
+# The whole-hour shared-unit form is unchanged for bounds >= 60 min (spec golden).
+printf '%s' "$BLOCK" | grep -qF '| Cumulative human time saved (est.) | ~12 – 72 h |' \
+  && pass "both-bounds >= 1h keep the shared-unit ~A – B h form (spec golden unchanged)" \
+  || fail "whole-hour human-time render drifted from the spec golden"
 GATES_BLOCK="$(P4B_ACCT_GATES_EVIDENCE="check_phase_4b_automation 67/67 green" p4b_acct_render_block "$GOLDEN")"
 printf '%s' "$GATES_BLOCK" | grep -q '| Local gates green | ✅ | check_phase_4b_automation 67/67 green |' \
   && pass "captured gate evidence renders the gates row green" || fail "gates evidence row wrong"
@@ -1321,6 +1341,58 @@ if (
   pass "loop numbering counts JSON objects: a multi-line record cannot inflate the next loop ID (#615 round 4)"
 else fail "object-count loop numbering (log=$(cat "$WORK/state-prettylog/phase-4b-loops/"*.jsonl 2>/dev/null | tail -3))"; fi
 
+# #615 Codex round 7, finding 2 (fails pre-fix): an APPROVED verdict carrying a
+# REQUIRED-tier finding is rejected by p4b_validate_verdict BEFORE the
+# discretionary gate, so note_fallback is reached with the GENERIC reason
+# "adapter returned a non-conformant verdict". Pre-fix that reason keyed to
+# UNAVAILABLE — the parsed P1 severity count/details of the unsafe approval the
+# gate PREVENTED were dropped, underreporting the fail-closed loop. Post-fix the
+# label is derived from the parsed verdict, so the histogram/details survive as
+# an APPROVED_WITH_ADVISORIES fail-closed loop. It is still fell_back=true with a
+# fail_closed marker (not a real approval), so it does NOT violate the posting
+# rule (assert_no_required_with_approved excludes fail-closed-marked loops).
+# shellcheck disable=SC2034  # orchestrator globals read by the sourced hook functions
+if (
+  P4B_ACCT_STATE_DIR="$WORK/state-reqtier-fallback"; export P4B_ACCT_STATE_DIR
+  REPO="o/r"; PR=340; REVIEWER=nathanpayne-codex; ADAPTER=codex
+  DIRECTION="claude->codex"; HEAD=abc123
+  # An APPROVED verdict carrying a required-tier (P1) finding: what the adapter
+  # returned and validate_verdict rejected. VERDICT_JSON is still set (it parsed).
+  VERDICT_JSON='{"verdict":"APPROVED","summary":"ok despite issue","findings":[{"severity":"P1","path":"a.js","line":3,"body":"unsafe"}]}'
+  p4b_acct_hook_note_fallback "adapter returned a non-conformant verdict" || exit 1
+  log="$(p4b_acct_hook_loop_log)"
+  jq -e -s '
+      length == 1
+      and .[0].loop.verdict == "APPROVED_WITH_ADVISORIES"
+      and .[0].loop.posted == "not-posted"
+      and .[0].loop.fell_back == true
+      and .[0].loop.fail_closed.happened == true
+      and .[0].loop.findings.P1 == 1
+      and (.[0].details | length) == 1
+      and .[0].details[0].severity == "P1"' "$log" >/dev/null || exit 1
+  # The recorded loop must NOT trip the required-tier posting-rule assertion
+  # (fail-closed-marked loops are legitimate fail-closed history, not approvals).
+  loops="$(jq -cs '[ .[] | .loop ]' "$log")"
+  p4b_acct_assert_no_required_with_approved CHANGES_REQUESTED "$loops" || exit 1
+); then
+  pass "a required-tier APPROVED-with-findings rejection records a fail-closed loop that PRESERVES the P1 histogram/details, not UNAVAILABLE (#615 round 7, finding 2)"
+else fail "required-tier fail-closed accounting ($(cat "$WORK/state-reqtier-fallback/phase-4b-loops/"*.jsonl 2>/dev/null))"; fi
+# A truly malformed verdict (not parseable as clean APPROVED-with-findings)
+# still falls through to UNAVAILABLE — preservation is verdict-driven, not
+# reason-string-driven, so it does not fabricate a histogram from garbage.
+# shellcheck disable=SC2034
+if (
+  P4B_ACCT_STATE_DIR="$WORK/state-malformed-fallback"; export P4B_ACCT_STATE_DIR
+  REPO="o/r"; PR=341; REVIEWER=nathanpayne-codex; ADAPTER=codex
+  DIRECTION="claude->codex"; HEAD=abc123
+  VERDICT_JSON='not even json'
+  p4b_acct_hook_note_fallback "adapter returned a non-conformant verdict" || exit 1
+  log="$(p4b_acct_hook_loop_log)"
+  jq -e -s 'length == 1 and .[0].loop.verdict == "UNAVAILABLE" and .[0].loop.findings.P1 == null' "$log" >/dev/null || exit 1
+); then
+  pass "a genuinely malformed verdict still records UNAVAILABLE (preservation is verdict-driven, not reason-string-driven) (#615 round 7, finding 2)"
+else fail "malformed-verdict fallback stayed UNAVAILABLE"; fi
+
 # --- two-phase commit: stale-pending discard + per-approval log reset --------
 # (#615 round 6, both fail pre-fix)
 
@@ -1408,6 +1480,69 @@ if (
 ); then
   pass "post-approval loop-log reset: consumed loops rotate to the archive and the next rerun starts a fresh segment (no double-count) (#615 round 6, finding 4)"
 else fail "loop-log reset (live=$(jq -s length "$WORK/state-logreset/phase-4b-loops/"*.jsonl 2>/dev/null), archive=$(cat "$WORK/state-logreset/phase-4b-loops/"*.archive 2>/dev/null | jq -s length 2>/dev/null))"; fi
+
+# #615 Codex round 7, finding 1 (fails pre-fix): the approval POSTED but the
+# accounting render FAILED/skipped, so NO pending record was staged. commit is
+# still called (post-success branch), and this run's APPROVED loop is already in
+# the live log. Pre-fix commit returned early on the empty-pending guard WITHOUT
+# rotating, leaving that consumed loop in the live log to be re-counted by the
+# next rerun's record. Rotation now keys off "the approval posted", so the loop
+# is archived and the live log emptied even with no record committed. Composes
+# with round-6: no ledger record is committed here (nothing was staged), only
+# the LOOP log rotates.
+# shellcheck disable=SC2034  # orchestrator globals read by the sourced hook functions
+if (
+  P4B_ACCT_STATE_DIR="$WORK/state-norecord-rotate"; export P4B_ACCT_STATE_DIR
+  REPO="o/r"; PR=350; REVIEWER=nathanpayne-codex; ADAPTER=codex
+  DIRECTION="claude->codex"; HEAD=abc123
+  VERDICT_JSON='{"verdict":"APPROVED","summary":"ok","findings":[]}'
+  P4B_ACCT_RUN_ID="norecord-run"; export P4B_ACCT_RUN_ID
+  log="$(p4b_acct_hook_loop_log)"; archive="${log}.archive"
+  # This run appends its APPROVED loop, then the render FAILS so nothing is
+  # staged (no pending record). The approval still posts → commit is called.
+  p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
+  [ "$(jq -s length "$log")" = 1 ] || exit 1
+  [ ! -e "$(p4b_acct_hook_pending_record_path)" ] || exit 1   # render staged nothing
+  p4b_acct_hook_commit_posted_record
+  # The consumed loop must be rotated out even though no record was committed.
+  [ "$(jq -s length "$log" 2>/dev/null || echo -1)" = 0 ] || exit 1
+  [ "$(jq -s length "$archive")" = 1 ] || exit 1
+  # A rerun therefore starts fresh (loop 1), never re-counting the posted loop.
+  p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
+  jq -e -s 'length == 1 and .[0].loop.loop == 1' "$log" >/dev/null || exit 1
+); then
+  pass "commit rotates this run's posted loop even when the render staged NO record (approval-keyed rotation, no re-count) (#615 round 7, finding 1)"
+else fail "no-record rotation (live=$(jq -s length "$WORK/state-norecord-rotate/phase-4b-loops/"*.jsonl 2>/dev/null), archive=$(cat "$WORK/state-norecord-rotate/phase-4b-loops/"*.jsonl.archive 2>/dev/null | jq -s length 2>/dev/null))"; fi
+
+# Ownership-mismatch path (#615 round 7, finding 1 + round 6 compose): a stale
+# pending record from a DIFFERENT run is discarded (round-6 ownership check),
+# and this run's own posted loop is ALSO rotated out (round-7). Pre-fix the
+# mismatch path returned WITHOUT rotating, re-counting the loop next rerun.
+# shellcheck disable=SC2034
+if (
+  P4B_ACCT_STATE_DIR="$WORK/state-mismatch-rotate"; export P4B_ACCT_STATE_DIR
+  REPO="o/r"; PR=351; REVIEWER=nathanpayne-codex; ADAPTER=codex
+  DIRECTION="claude->codex"; HEAD=abc123
+  VERDICT_JSON='{"verdict":"APPROVED","summary":"ok","findings":[]}'
+  P4B_ACCT_RUN_ID="mine-mismatch"; export P4B_ACCT_RUN_ID
+  log="$(p4b_acct_hook_loop_log)"; archive="${log}.archive"
+  ledger="$(p4b_acct_hook_ledger)"
+  p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
+  # A stale pending record from a crashed OTHER run (different sidecar).
+  pending="$(p4b_acct_hook_pending_record_path)"
+  mkdir -p "$(dirname "$pending")"
+  printf '%s\n' '{"schema":"p4b-accounting/v1","pr":351,"phantom":true}' > "$pending"
+  printf '%s' 'other-run-777' > "$(p4b_acct_hook_pending_runid_path)"
+  p4b_acct_hook_commit_posted_record
+  # Ledger never gains the phantom; the pending files are cleared; AND this
+  # run's own posted loop is rotated out (approval-keyed rotation).
+  [ ! -e "$ledger" ] || { grep -q phantom "$ledger" && exit 1; }
+  [ ! -e "$pending" ] || exit 1
+  [ "$(jq -s length "$log" 2>/dev/null || echo -1)" = 0 ] || exit 1
+  [ "$(jq -s length "$archive")" = 1 ] || exit 1
+); then
+  pass "commit discards a foreign pending record AND rotates this run's own posted loop (round-6 ownership + round-7 approval-keyed rotation) (#615 round 7, finding 1)"
+else fail "mismatch rotation (ledger=$(cat "$WORK/state-mismatch-rotate/phase-4b-ledger.jsonl" 2>/dev/null), live=$(jq -s length "$WORK/state-mismatch-rotate/phase-4b-loops/"*.jsonl 2>/dev/null))"; fi
 
 # ===========================================================================
 echo "orchestrator — accounting hook (fail-open, exit codes preserved)"
@@ -1517,6 +1652,31 @@ if [ "$rc" = 0 ] \
    && grep -q 'Reviewed head: `abc123`' "$BODY_C"; then
   pass "report-generation error → plain-summary approval still posts with exit 0 (fail-open for reporting only)"
 else fail "generation-error fallback (rc=$rc, body=$(cat "$BODY_C" 2>/dev/null | head -3))"; fi
+
+# (c2) #615 Codex round 7, finding 1 (fails pre-fix), end-to-end: a first
+#      APPROVED whose accounting RENDER FAILS (P4B_ACCT_SELFTEST_FAIL) still
+#      posts (plain summary), staging NO ledger record — but its loop was
+#      appended to the live log. Pre-fix that loop lingered (commit returned
+#      early with no record to rotate), so the SECOND, clean APPROVED of the
+#      same PR re-embedded it (two loops) and the running totals double-counted
+#      the first approval's attempt/tokens/wall-time. Post-fix the first
+#      approval's loop is rotated out on the confirmed post, so the second
+#      record embeds ONLY its own loop.
+STATE_C2="$WORK/state-c2"; BODY_C2A="$WORK/body-c2a.md"; BODY_C2B="$WORK/body-c2b.md"
+set +e
+run_orch "$STATE_C2" "$POLICY_ON" fake-codex-approve 240 P4B_WRAPPER_BODY="$BODY_C2A" P4B_ACCT_SELFTEST_FAIL=1 -- >/dev/null 2>&1; rc1=$?
+run_orch "$STATE_C2" "$POLICY_ON" fake-codex-approve 240 P4B_WRAPPER_BODY="$BODY_C2B" -- >/dev/null 2>&1; rc2=$?
+set -e
+REC_C2A="$(p4b_acct_extract_records < "$BODY_C2A" 2>/dev/null || true)"
+REC_C2B="$(p4b_acct_extract_records < "$BODY_C2B" 2>/dev/null || true)"
+LEDGER_C2="$STATE_C2/phase-4b-ledger.jsonl"
+if [ "$rc1" = 0 ] && [ "$rc2" = 0 ] \
+   && ! grep -q 'Phase 4b Approval Accounting' "$BODY_C2A" \
+   && [ -z "$REC_C2A" ] \
+   && printf '%s' "$REC_C2B" | jq -e '(.loops | length) == 1 and .loops[0].loop == 1 and .totals.adapter_invocations == 1' >/dev/null \
+   && [ "$(wc -l < "$LEDGER_C2" | tr -d '[:space:]')" = "1" ]; then
+  pass "render-fail approval then clean approval of the same PR: the second record embeds only its own loop; the render-failed loop was rotated out (no double-count) (#615 round 7, finding 1)"
+else fail "render-fail no-double-count e2e (rc1=$rc1 rc2=$rc2, recA='$REC_C2A', recB loops=$(printf '%s' "$REC_C2B" | jq '.loops|length' 2>/dev/null), ledger-lines=$(wc -l < "$LEDGER_C2" 2>/dev/null))"; fi
 
 # (d) changes-requested-then-fixed across two invocations: loop history
 #     accumulates and the final approval renders both loops + the lifecycle.

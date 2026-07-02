@@ -1133,8 +1133,25 @@ p4b_acct_render_block() {
            else "~$\($r.notional_usd) *(not billed)*" end)
         + " |\n"
         + "| Cumulative human time saved (est.) | "
+        # Sub-hour bounds render in minutes, not floored-to-zero hours (#615
+        # Codex round 7, finding 3): a low bound like 30 min divided by 60 and
+        # floored reads as ~0 h, understating the documented 30-minute floor.
+        # When BOTH bounds are >= 60 min the shared-unit "~A – B h" form is kept
+        # (matches the spec golden ~12 – 72 h); once the low bound drops below an
+        # hour each bound carries its own unit ("~30 min – 3 h", or "~30 – 50 min"
+        # when both are sub-hour), consistent with the per-loop shuttle block.
         + (if $r.human_minutes_saved_estimate == null then "unavailable"
-           else "~\(($r.human_minutes_saved_estimate[0] / 60) | floor) – \(($r.human_minutes_saved_estimate[1] / 60) | floor) h" end)
+           else ($r.human_minutes_saved_estimate[0]) as $lo
+                | ($r.human_minutes_saved_estimate[1]) as $hi
+                # A bound < 60 min renders in minutes; >= 60 min in floored
+                # hours. When both bounds share a unit the unit is stated once
+                # ("~12 – 72 h", "~30 – 50 min"); a mixed range carries a unit on
+                # each bound ("~30 min – 3 h").
+                | def num($m): if $m < 60 then ($m | tostring) else (($m / 60) | floor | tostring) end;
+                  def unit($m): if $m < 60 then "min" else "h" end;
+                  if unit($lo) == unit($hi)
+                  then "~\(num($lo)) – \(num($hi)) \(unit($hi))"
+                  else "~\(num($lo)) \(unit($lo)) – \(num($hi)) \(unit($hi))" end end)
         + " |"'
     printf '\n\n'
     printf '%s' "$rec" | jq -r '
@@ -1239,7 +1256,8 @@ p4b_acct_run_id() {
 
 # p4b_acct_hook_commit_posted_record — phase two of the ledger commit: append
 # the staged record to the ledger cache and clear the staging file. Called by
-# the orchestrator only after a successful live review POST.
+# the orchestrator ONLY from the confirmed-post branch (after a successful live
+# review POST), so reaching this function means "the approval posted".
 #
 # Ownership check (#615 Codex round 6): commit ONLY a record staged by THIS
 # invocation. Without it, a previous run that crashed AFTER staging but BEFORE
@@ -1251,16 +1269,44 @@ p4b_acct_run_id() {
 # belongs to a different run and is DISCARDED, never committed (fail-closed:
 # when unsure, drop). Advisory: an append failure warns (future running totals
 # may lag) but never alters review flow. Always returns 0.
+#
+# Loop-log rotation keys off "the approval posted", NOT "a record was committed"
+# (#615 Codex round 7, finding 1). This run's APPROVED loop was appended to the
+# live log by p4b_acct_hook_record_loop BEFORE the render/post step, so the loop
+# is in the live log regardless of whether the render staged a ledger record.
+# When rendering FAILED/skipped (no pending record) or the only pending record
+# belongs to a DIFFERENT run (ownership mismatch), the earlier logic returned
+# early WITHOUT rotating — leaving this run's consumed APPROVED loop in the live
+# log to be re-counted by the next rerun's record (double-counting attempts,
+# tokens, and wall time). The rotation is now the single unconditional trailing
+# step, so it fires exactly once per posted-approval commit call across ALL
+# three exit paths (no-record, ownership-mismatch, committed). It never
+# double-rotates (one call per commit; rotate archives+truncates the whole live
+# log) and never rotates a NON-posted run (non-posted runs never reach this
+# function — the orchestrator calls it only in the post-success branch).
+# Composes with the round-6 run-id ownership check: ownership governs which
+# LEDGER record is committed; rotation governs the LOOP log — orthogonal axes,
+# and this run's own appended loop is consumed either way.
 p4b_acct_hook_commit_posted_record() {
   local pending runid_file staged_runid ledger
   pending="$(p4b_acct_hook_pending_record_path)"
-  [ -s "$pending" ] || return 0
+  if [ ! -s "$pending" ]; then
+    # Rendering failed/skipped: no record to commit, but the approval posted, so
+    # this run's already-appended APPROVED loop must still be consumed (#615
+    # round 7, finding 1).
+    p4b_acct_hook_rotate_loop_log_after_approval || true
+    return 0
+  fi
   runid_file="$(p4b_acct_hook_pending_runid_path)"
   staged_runid=""
   [ -r "$runid_file" ] && staged_runid="$(cat "$runid_file" 2>/dev/null || true)"
   if [ -z "$staged_runid" ] || [ "$staged_runid" != "$(p4b_acct_run_id)" ]; then
     p4b_acct_warn "discarding a pending ledger record from a different invocation (run id '${staged_runid:-none}' != '$(p4b_acct_run_id)'); the current run did not stage it, so it is not committed (#615 round 6)"
     p4b_acct_hook_discard_pending_record
+    # The foreign record is dropped, but THIS run's approval still posted — its
+    # appended loop must be rotated out too, or a rerun re-counts it (#615
+    # round 7, finding 1).
+    p4b_acct_hook_rotate_loop_log_after_approval || true
     return 0
   fi
   ledger="$(p4b_acct_hook_ledger)"
@@ -1479,12 +1525,43 @@ p4b_acct_hook_record_loop() {
 
 # p4b_acct_hook_note_fallback <why>
 # Record a fail-closed loop from the orchestrator's manual-fallback path.
-# The approved-verdict-carried-findings case keeps its histogram (the verdict
-# WAS parsed); every other fallback discards the verdict (UNAVAILABLE).
+# An APPROVED-with-findings verdict keeps its parsed histogram/details (the
+# verdict WAS parsed — the loop is real fail-closed evidence); every other
+# fallback (a genuinely non-conformant or unavailable verdict) discards it as
+# UNAVAILABLE.
+#
+# Required-tier preservation (#615 Codex round 7, finding 2): an APPROVED
+# verdict carrying a REQUIRED-tier finding (P0/P1 by default, or P2/P3 under a
+# stricter feedback_policy) is rejected by p4b_validate_verdict BEFORE the
+# discretionary "approved verdict included findings" gate is reached, so the
+# orchestrator reaches this hook with the generic reason "adapter returned a
+# non-conformant verdict". Keying only off that reason string would drop the
+# parsed severity counts/details of exactly the unsafe approval the gate
+# prevented, underreporting the fail-closed loop. So the label is derived from
+# the VERDICT itself, not the reason: if VERDICT_JSON cleanly parses as an
+# APPROVED verdict carrying a non-empty findings array, record it as
+# APPROVED_WITH_ADVISORIES so the histogram/details survive — regardless of
+# which gate (required-tier or discretionary) rejected it. A truly malformed
+# verdict does not parse as clean APPROVED-with-findings and falls through to
+# UNAVAILABLE. The loop is still fell_back=true with a fail_closed marker, so it
+# is NOT a real approval and does not violate the required-tier posting rule
+# (p4b_acct_assert_no_required_with_approved excludes fail-closed-marked loops);
+# the rejection behavior in the orchestrator is unchanged.
 p4b_acct_hook_note_fallback() {
   local why="$1" vlabel="UNAVAILABLE"
   case "$why" in
     "approved verdict included findings"*) vlabel="APPROVED_WITH_ADVISORIES" ;;
+    *)
+      # Preserve an APPROVED-with-findings verdict rejected on a required-tier
+      # (or any other) semantic. `jq -e` exits non-zero on a missing/malformed
+      # verdict, so a non-parseable VERDICT_JSON leaves vlabel=UNAVAILABLE.
+      if [ -n "${VERDICT_JSON:-}" ] \
+         && printf '%s' "$VERDICT_JSON" \
+              | jq -e '.verdict == "APPROVED" and ((.findings | type) == "array") and ((.findings | length) > 0)' \
+              >/dev/null 2>&1; then
+        vlabel="APPROVED_WITH_ADVISORIES"
+      fi
+      ;;
   esac
   p4b_acct_hook_record_loop "$vlabel" "not-posted" true "$why"
 }

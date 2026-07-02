@@ -166,6 +166,13 @@ Unique findings across loops: 4 — 4 on the approved head, 0 historical (earlie
 
 *Totals source: github-derived (24 `p4b-accounting:v1` records).*
 
+> Cumulative human-time-saved rendering (#615 Codex round 7): a bound below one
+> hour renders in minutes, never floored to `~0 h`. Both bounds ≥ 60 min keep
+> the shared-unit `~A – B h` form shown above; a sub-hour low bound switches to
+> per-bound units — e.g. a single prior approval (`[30, 180]`) renders
+> `~30 min – 3 h` (the documented 30-minute floor, matching the per-loop "Human
+> shuttle avoided" line), and `[30, 50]` renders `~30 – 50 min`.
+
 ### Safety and value notes
 
 - Fail-closed events: **1** (loop 4, approval-carried-findings, 76 s) — prevented an unsafe auto-approval. ✅
