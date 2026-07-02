@@ -108,6 +108,39 @@ assert_clean   "echoed gh-write TEXT (no chained cmd) exempt"  'echo "gh pr merg
 assert_clean   "echo piped into a non-gh command exempt"       'echo ok | grep gh'
 assert_clean   "echo then ;-chained WRAPPED gh merge exempt"   'echo ok; scripts/gh-as-author.sh -- gh pr merge 1'
 
+# #573 (Major): an exempt WRAPPED / helper write must cover ONLY the wrapped
+# command, NOT a bare gh write chained after a top-level separator on the same
+# line. Before the fix the wrapper exemption returned clean for the whole line,
+# shielding the trailing bare `gh pr create` from detection.
+assert_flagged "wrapped merge then &&-chained bare gh create caught (#573)" \
+  'scripts/gh-as-author.sh -- gh pr merge 1 && gh pr create --title t --body b'
+assert_flagged "wrapped merge then ;-chained bare gh create caught (#573)" \
+  'scripts/gh-as-author.sh -- gh pr merge 1 ; gh pr create --title t --body b'
+assert_flagged "reviewer-wrapped comment then &&-chained bare gh comment caught (#573)" \
+  'scripts/gh-as-reviewer.sh -- gh pr comment 1 --body ok && gh issue comment 2 --body hi'
+assert_flagged "helper-fn write then &&-chained bare gh merge caught (#573)" \
+  'sync_author_gh pr merge 1 && gh pr merge 2 --admin'
+# Control: two chained WRAPPED writes both stay exempt (no bare write present).
+assert_clean   "wrapped merge then &&-chained WRAPPED create stays exempt (#573)" \
+  'scripts/gh-as-author.sh -- gh pr merge 1 && scripts/gh-as-author.sh -- gh pr create --title t --body "Authoring-Agent: claude"'
+# Control: a wrapped write with a trailing non-gh command stays exempt.
+assert_clean   "wrapped merge then &&-chained non-gh command stays exempt (#573)" \
+  'scripts/gh-as-author.sh -- gh pr merge 1 && echo done'
+
+# CodeRabbit Major on #611 — the MIRROR direction: a bare gh write BEFORE an
+# exempt wrapped write on the same line must also be caught. The wrapper
+# regexes match anywhere in the line, so before the split-scan fix the whole
+# line was exempted and the bare HEAD escaped.
+assert_flagged "bare gh create then &&-chained wrapped merge caught (head shielding, #611)" \
+  'gh pr create --title t --body b && scripts/gh-as-author.sh -- gh pr merge 1'
+assert_flagged "bare gh comment then ;-chained reviewer-wrapped review caught (head shielding, #611)" \
+  'gh issue comment 2 --body hi ; scripts/gh-as-reviewer.sh -- gh pr review 1 --comment --body ok'
+assert_flagged "bare write SANDWICHED between two wrapped writes caught (#611)" \
+  'scripts/gh-as-author.sh -- gh pr merge 1 && gh pr edit 2 --title x && scripts/gh-as-author.sh -- gh pr merge 3'
+# Control: non-gh head then a wrapped write stays exempt.
+assert_clean   "non-gh head then &&-chained wrapped merge stays exempt (#611)" \
+  'echo starting && scripts/gh-as-author.sh -- gh pr merge 1'
+
 echo ""
 echo "test_check_no_bare_gh_writes: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

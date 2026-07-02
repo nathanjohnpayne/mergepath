@@ -796,7 +796,11 @@ assert_rc_contains "backtick-synth issue comment fails closed (#553)" 2 "wrapper
   '`printf "\147\150"` issue comment 5 --body hi'
 assert_rc_contains "assignment-prefixed cmdsub-synth pr merge fails closed (#553)" 2 "wrapper" \
   'FOO=1 $(printf "\147\150") pr merge 1'
-assert_rc_contains "separator-then cmdsub-synth pr merge fails closed (#553 empirical)" 2 "wrapper" \
+# #611 r2: the span is now statically expanded to a literal gh, so this
+# shape blocks via the compound-gh rule (#348: two command-position gh
+# invocations, one guarded) rather than the synth-placeholder rule. Either
+# rule is fail-closed; assert only the block.
+assert_rc_contains "separator-then cmdsub-synth pr merge fails closed (#553 empirical)" 2 "" \
   'gh --version ; $(printf "\147\150") pr merge 123 --admin'
 assert_rc_contains "command-position cmdsub with NO gh write stays allowed (#553)" 0 "" \
   '$(date -u) >/dev/null'
@@ -807,6 +811,36 @@ assert_rc_contains "command-position cmdsub with NO gh write stays allowed (#553
 # the compound pre-scan, so the pre-scan must ignore the placeholder.
 assert_rc_contains "eval cmdsub before a wrapped write is allowed (#553)" 0 "" \
   'eval "$(/opt/homebrew/bin/brew shellenv)" && scripts/gh-as-author.sh -- gh pr merge 1 --repo o/r --squash'
+
+# #573 item 1 (Codex P1): a command-position cmdsub can synthesize BOTH the
+# executable AND the noun (e.g. octal printf for "gh pr"), so the raw command
+# carries no literal gh/pr/issue — only a bare write verb follows. The fast-path
+# now triggers on any gh-write verb, and synth_cmdsub_write_label blocks a
+# command-position cmdsub followed by create|merge|comment|review|edit even
+# without a literal noun. Fail closed: the guard cannot see what the cmdsub
+# expands to, so any such shape is routed to the verifying wrapper.
+# \147\150\40\160\162 = "gh pr", \40\151\163\163\165\145 = " issue".
+assert_rc_contains "cmdsub-synth BOTH exe+noun (gh pr) then bare merge fails closed (#573)" 2 "wrapper" \
+  '$(printf "\147\150\40\160\162") merge 123 --admin'
+assert_rc_contains "backtick-synth exe+noun (gh issue) then bare comment fails closed (#573)" 2 "wrapper" \
+  '`printf "\147\150\40\151\163\163\165\145"` comment 5 --body hi'
+# #611 r2: statically expanded to `gh --repo o/r create --title x`, which is
+# now DECIDABLE — gh has no top-level `create` (the guarded verbs live under
+# pr/issue), so this is no longer an unverifiable synth shape and is allowed,
+# matching the `gh status` control below.
+assert_rc_contains "cmdsub-synth exe then --repo before a bare create verb decides statically (#573/#611 r2)" 0 "" \
+  '$(printf "\147\150") --repo o/r create --title x'
+# No false positive: a command-position cmdsub followed by a NON-write
+# subcommand (a gh read) is tokenized (#611 r3: any substitution tokenizes)
+# but carries no guarded-write evidence, so it stays allowed.
+assert_rc_contains "command-position cmdsub then a non-write subcommand stays allowed (#573)" 0 "" \
+  '$(printf "\147\150") status'
+# CodeRabbit Major on #611: the fast-path verb probe must also fire when the
+# bare verb ends the COMMAND (no trailing whitespace) — `$(...) merge` with no
+# arguments previously skipped the tokenizer because the probe required
+# `[[:space:]]` after the verb.
+assert_rc_contains "cmdsub-synth exe+noun then END-OF-LINE bare verb fails closed (#611)" 2 "wrapper" \
+  '$(printf "\147\150\40\160\162") merge'
 
 # #560 (residual of #553): a command-position cmdsub-synthesized gh must fail
 # closed even after a prefix command + options (command -p, env -i), a
@@ -830,6 +864,349 @@ assert_rc_contains "cmdsub as value-taking flag arg stays allowed (#560)" 0 "" \
   'env -u $(printf "\147\150") pr merge 1'
 assert_rc_contains "cmdsub as echo argument stays allowed (#560)" 0 "" \
   'echo $(printf "\147\150") pr merge'
+
+# --- #611 round 3 (Codex P1 x2): escape spellings + split placeholder runs ---
+# (1) The write verb can be escape-spelled (m\erge): bash unescapes it at
+# execution, but no literal probe can enumerate escape spellings. The
+# fast-path now force-tokenizes on ANY substitution; shlex canonicalizes the
+# escape and synth_cmdsub_write_label sees the bare verb.
+assert_rc_contains "cmdsub-synth exe+noun then ESCAPED verb fails closed (#611 r3)" 2 "wrapper" \
+  '$(printf "\147\150\40\160\162") m\erge 123 --admin'
+# (2) The exe and noun split across a placeholder RUN with a literal verb:
+# evidence mode treats placeholders as transparent and blocks the guarded
+# verb reached across the run.
+assert_rc_contains "split placeholder run (gh)(pr) then merge fails closed (#611 r3)" 2 "wrapper" \
+  '$(printf "\147\150") $(printf "\160\162") merge 123 --admin'
+# (2b) A run containing an empty-expansion substitution before literal
+# noun+verb: $(true) expands to nothing, so bash still executes gh pr merge.
+assert_rc_contains "placeholder run with literal noun+verb fails closed (#611 r3)" 2 "wrapper" \
+  '$(printf "\147\150") $(true) pr merge 1'
+# (3) The EXECUTABLE escape-spelled with no substitution at all: the
+# backslash-stripped fast-path probe sees gh, and shlex canonicalizes the
+# token for the main walk.
+assert_rc_contains "escaped executable g\\h pr merge fails closed (#611 r3)" 2 "wrapper" \
+  'g\h pr merge 123 --admin'
+# (4) A LITERAL gh with a substitution in its subcommand stream (strict
+# mode): the substitution can synthesize the noun, the verb, or both, so no
+# literal evidence can clear it — fail closed on the placeholder itself.
+assert_rc_contains "literal gh + cmdsub noun + bare merge fails closed (#611 r3)" 2 "wrapper" \
+  'gh $(printf "\160\162") merge 123 --admin'
+assert_rc_contains "literal gh + cmdsub noun-and-verb fails closed (#611 r3)" 2 "wrapper" \
+  'gh $(printf "\160\162\40\155\145\162\147\145") 123 --admin'
+assert_rc_contains "literal gh pr + cmdsub verb fails closed (#611 r3)" 2 "wrapper" \
+  'gh pr $(printf "\155\145\162\147\145") 123 --admin'
+assert_rc_contains "literal gh + empty-expansion cmdsub + pr merge fails closed (#611 r3)" 2 "wrapper" \
+  'gh $(true) pr merge 123'
+# Controls: benign substitutions stay allowed — a path-building cmdsub, a
+# cmdsub argument after a literal gh READ verb, and a placeholder run with no
+# guarded evidence at all.
+assert_rc_contains "path-building cmdsub stays allowed (#611 r3)" 0 "" \
+  '$(brew --prefix)/bin/some-tool --admin'
+assert_rc_contains "gh read with cmdsub argument stays allowed (#611 r3)" 0 "" \
+  'gh pr view $(printf "\61") --json title'
+assert_rc_contains "placeholder run with no guarded evidence stays allowed (#611 r3)" 0 "" \
+  '$(printf a) $(printf b) c'
+
+# --- #611 round 2 (Codex P1): FULLY synthesized guarded writes ------------
+# $(printf "...") can emit the ENTIRE gh pr merge sequence, leaving zero
+# literal evidence in the outer command — undecidable by any placeholder
+# heuristic. Literal-only printf/echo spans are now statically EMULATED and
+# spliced into the token stream, so the walk decides the real expansion
+# exactly: synthesized writes block, synthesized data stays allowed, and
+# dynamic spans still fall back to the placeholder + evidence scan.
+# \147\150\40\160\162\40\155\145\162\147\145 = "gh pr merge".
+assert_rc_contains "FULLY synthesized gh pr merge fails closed (#611 r2)" 2 "wrapper" \
+  '$(printf "\147\150\40\160\162\40\155\145\162\147\145") 123 --admin'
+assert_rc_contains "echo-synthesized gh pr merge fails closed (#611 r2)" 2 "wrapper" \
+  '$(echo gh pr merge) 1'
+assert_rc_contains "percent-s printf synthesis fails closed (#611 r2)" 2 "wrapper" \
+  '$(printf "%s" gh) pr merge 1'
+assert_rc_contains "backtick fully synthesized issue comment fails closed (#611 r2)" 2 "wrapper" \
+  '`printf "\147\150\40\151\163\163\165\145\40\143\157\155\155\145\156\164"` 5 --body hi'
+# Controls: a statically expanded BENIGN span is allowed as the data it is,
+# and a non-static printf (format-reuse form, not emulated) still fails
+# closed via the placeholder evidence scan when guarded evidence follows.
+assert_rc_contains "statically expanded benign printf stays allowed (#611 r2)" 0 "" \
+  '$(printf hello) world'
+assert_rc_contains "non-static printf form still fails closed on evidence (#611 r2)" 2 "wrapper" \
+  '$(printf "\147\150" x) pr merge 1'
+
+# --- #611 round 4: IFS whitespace in expansions + benign parse failures ---
+# (P1) printf can emit NEWLINES between synthesized words; bash word-splits
+# them exactly like spaces. The expansion is whitespace-normalized before
+# the splice-safety check, so the walk sees the real gh pr merge.
+# \147\150 \n \160\162 \n \155\145\162\147\145 = gh<NL>pr<NL>merge.
+assert_rc_contains "newline-separated synthesized gh pr merge fails closed (#611 r4)" 2 "wrapper" \
+  '$(printf "\147\150\n\160\162\n\155\145\162\147\145") 123 --admin'
+assert_rc_contains "tab-separated synthesized gh pr fails closed (#611 r4)" 2 "wrapper" \
+  '$(printf "\147\150\11\160\162") merge 1'
+# (P2) A substitution-bearing command the parser cannot tokenize (unbalanced
+# quote in otherwise-valid shell, e.g. heredoc bodies) must NOT fail closed
+# when it carries no guarded-write evidence — pre-broadening parity: the
+# evidence-free fast path always exited 0. Evidence keeps the block.
+assert_rc_contains "parse failure with no guarded evidence stays allowed (#611 r4)" 0 "" \
+  '$(date) "oops'
+assert_rc_contains "parse failure WITH gh evidence still fails closed (#611 r4)" 2 "tokenize" \
+  '$(date) "oops gh pr merge 1'
+
+# --- #611 round 9: assignment prefixes, escaped shells, unquoted bodies ---
+# (P1) a bare-assignment token consumes its VALUE in every walk: the
+# flattened FOO=$(date) leaves FOO= + placeholder, and the following
+# spliced gh write is the real command, not the placeholder-as-command.
+assert_rc_contains "assignment-substitution prefix before synthesized write fails closed (#611 r9)" 2 "wrapper" \
+  'FOO=$(date) $(printf gh) pr merge 1'
+assert_rc_contains "assignment-substitution prefix with benign command stays allowed (#611 r9)" 0 "" \
+  'FOO=$(date) $(printf hello) world'
+# (P1) bash unescapes command words: an escape-spelled shell name feeding a
+# quoted-tag heredoc still executes the body as a script.
+assert_rc_contains "escape-spelled bash feeding quoted heredoc fails closed (#611 r9)" 2 "wrapper" \
+  'b\ash <<'"'"'EOF'"'"'
+$(printf "\147\150\40\160\162") merge 1
+EOF'
+# (P1) UNQUOTED-tag heredoc bodies expand their substitutions while the
+# heredoc is built, so in-body gh evidence must keep failing closed on a
+# parse failure (only QUOTED-tag bodies are inert data).
+assert_rc_contains "parse failure with gh in an unquoted heredoc body fails closed (#611 r9)" 2 "tokenize" \
+  'cat <<EOF
+"unmatched
+$(gh pr merge 1)
+EOF'
+
+# --- #611 round 10: path-qualified synth, quoted-delim forms, cmd word ----
+# (P1) a path-qualified printf/echo word-splits into the same synthesized
+# write as the bare form — the basename is the literal-synth source.
+assert_rc_contains "path-qualified /bin/echo synthesized write fails closed (#611 r10)" 2 "wrapper" \
+  '$(/bin/echo gh pr merge) 123 --squash'
+assert_rc_contains "path-qualified /usr/bin/printf synthesized write fails closed (#611 r10)" 2 "wrapper" \
+  '$(/usr/bin/printf "\147\150\40\160\162\40\155\145\162\147\145") 123 --admin'
+# (P2) more quoted-delimiter forms are inert data: <<\EOF (escaped) and a
+# quoted tag with punctuation <<'"'"'EOF-MP'"'"' — their fixture bodies with
+# encoded substitutions must stay allowed.
+assert_rc_contains "backslash-escaped heredoc delimiter body stays allowed (#611 r10)" 0 "" \
+  'cat <<\EOF > /tmp/fx
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+assert_rc_contains "punctuation quoted-delimiter body stays allowed (#611 r10)" 0 "" \
+  'cat <<'"'"'EOF-MP'"'"' > /tmp/fx
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF-MP'
+# (P2) a shell name in a REDIRECTION TARGET is not the command word: a
+# quoted-heredoc fixture written to a bash-named path is inert data for cat.
+assert_rc_contains "shell-named redirection target does not force body scan (#611 r10)" 0 "" \
+  'cat > /tmp/bash-fixture <<'"'"'EOF'"'"'
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+# Fail-closed control: a real shell interpreter as the command word still
+# scans the quoted-tag body even with a redirection present.
+assert_rc_contains "bash command word with redirection still scans body (#611 r10)" 2 "wrapper" \
+  'bash > /tmp/out <<'"'"'EOF'"'"'
+$(printf "\147\150\40\160\162") merge 1
+EOF'
+
+# --- #611 round 11: quoted heredoc PIPED into a shell executes the body ---
+# cat <<'EOF' | bash runs the body even though the first command word is
+# cat, so any pipeline segment being an interpreter forces body scanning.
+assert_rc_contains "quoted heredoc piped into bash fails closed (#611 r11)" 2 "wrapper" \
+  'cat <<'"'"'EOF'"'"' | bash
+$(printf "\147\150\40\160\162") merge 1
+EOF'
+assert_rc_contains "quoted heredoc through tee then sh fails closed (#611 r11)" 2 "wrapper" \
+  'cat <<'"'"'EOF'"'"' | tee /tmp/x | sh
+$(printf "\147\150\40\160\162") merge 1
+EOF'
+# Control: piped into a NON-shell (grep) the body is not executed — stays
+# inert data for cat, allowed.
+assert_rc_contains "quoted heredoc piped into grep stays allowed (#611 r11)" 0 "" \
+  'cat <<'"'"'EOF'"'"' | grep merge
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+
+# --- #611 round 12: multi-heredoc, process substitution, prefixed synth ----
+# (P1) an UNQUOTED heredoc before a quoted one: the unquoted A body expands
+# its substitutions, so it must be scanned — the line is not simple (more
+# heredocs than quoted), so no body is skipped and the A-body write blocks.
+assert_rc_contains "unquoted-before-quoted heredoc scans the unquoted body (#611 r12)" 2 "" \
+  'cat <<A <<'"'"'B'"'"'
+$(gh pr merge 1)
+A
+data
+B'
+# (P1) process substitution feeds a quoted body to a shell: not simple
+# (>(...) present), so the body is scanned and the literal write blocks.
+assert_rc_contains "quoted heredoc into process-sub shell fails closed (#611 r12)" 2 "" \
+  'cat <<'"'"'EOF'"'"' > >(bash)
+gh pr merge 1
+EOF'
+assert_rc_contains "tee into process-sub sh fails closed (#611 r12)" 2 "" \
+  'tee >(sh) <<'"'"'EOF'"'"'
+gh pr merge 1
+EOF'
+# (P1) a prefix command inside the synth span: command printf still emits
+# the write; the expander unwraps command/env/... to reach printf.
+assert_rc_contains "command-prefixed printf synthesis fails closed (#611 r12)" 2 "wrapper" \
+  '$(command printf "\147\150\40\160\162\40\155\145\162\147\145") 1 --admin'
+assert_rc_contains "env-prefixed printf synthesis fails closed (#611 r12)" 2 "wrapper" \
+  '$(env printf "\147\150\40\160\162\40\155\145\162\147\145") 1 --admin'
+# Control: a single quoted heredoc with no procsub / interpreter still skips
+# its inert body (the simple fixture case is unchanged).
+assert_rc_contains "single quoted heredoc fixture still allowed (#611 r12 regression)" 0 "" \
+  'cat <<'"'"'EOF'"'"' > /tmp/fx
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+
+# --- #611 round 13: value-taking prefix option before a piped shell --------
+# The pipeline command-word scan must consume a value-taking prefix option's
+# VALUE (sudo -u nobody bash) so the real interpreter (bash) is seen and the
+# heredoc body scanned.
+assert_rc_contains "quoted heredoc piped to sudo -u USER bash fails closed (#611 r13)" 2 "" \
+  'cat <<'"'"'EOF'"'"' | sudo -u nobody bash
+gh pr merge 1
+EOF'
+# Control: the value-option VALUE itself is not mistaken for an interpreter
+# (piped to `sudo -u bash cat` — cat is the command, bash is -u value).
+assert_rc_contains "value-option value named bash is not the interpreter (#611 r13)" 0 "" \
+  'cat <<'"'"'EOF'"'"' | sudo -u bash cat
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+
+# --- #611 round 14: -R cmdsub, prefix value-opt in synth, eval-quoted, ANSI-C word
+# (P1) a cmdsub as the -R/--repo value can word-split a guarded verb into argv.
+assert_rc_contains "cmdsub as -R value fails closed (#611 r14)" 2 "" \
+  'gh pr -R $(cat file) 1'
+# (P1) a value-taking prefix option inside a synth span: env -u X printf ...
+# unwraps to printf, so the write is recognized.
+assert_rc_contains "env -u VALUE printf synthesis fails closed (#611 r14)" 2 "wrapper" \
+  '$(env -u X printf "\147\150\40\160\162\40\155\145\162\147\145") 1 --admin'
+# (P1) a literal-printf substitution inside eval double quotes is reparsed
+# and executed by eval, so it must be expanded, not left as a placeholder.
+assert_rc_contains "eval of quoted printf synthesis fails closed (#611 r14)" 2 "" \
+  'eval "$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1 --admin"'
+assert_rc_contains "bash -c of quoted printf synthesis fails closed (#611 r14)" 2 "" \
+  'bash -c "$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1"'
+# (P1) a bare ANSI-C-quoted command word: $'\147\150' pr merge -> gh pr merge.
+assert_rc_contains "ANSI-C-quoted bare command word fails closed (#611 r14)" 2 "wrapper" \
+  "\$'\\147\\150' pr merge 1 --admin"
+# Control: a benign quoted printf substitution as echo DATA stays allowed
+# (expanded to a single word, not a command position).
+assert_rc_contains "echo of quoted printf expansion stays allowed (#611 r14)" 0 "" \
+  'echo "$(printf "\147\150\40\160\162")"'
+assert_rc_contains "parse failure with octal gh spelling still fails closed (#611 r4)" 2 "tokenize" \
+  '$(printf "\147\150") pr merge 1 "oops'
+
+# --- #611 round 5: unexpandable literal printf + assignment-word splices ---
+# (P1a) printf %b decodes escapes in its ARGUMENT — not emulated, so the
+# span cannot be statically expanded. A literal printf/echo that cannot be
+# expanded now fails closed in command position (it can synthesize an
+# entire guarded write with zero outside evidence), instead of degrading to
+# an anonymous placeholder the evidence scan cannot see through.
+assert_rc_contains "unexpandable percent-b printf synthesis fails closed (#611 r5)" 2 "wrapper" \
+  '$(printf %b "\147\150\40\160\162\40\155\145\162\147\145") 123 --admin'
+assert_rc_contains "unexpandable percent-d printf in command position fails closed (#611 r5)" 2 "wrapper" \
+  '$(printf "%d" 5) --admin'
+assert_rc_contains "literal gh + unexpandable printf noun fails closed (#611 r5)" 2 "wrapper" \
+  'gh $(printf %b "\160\162") merge 1'
+# Controls: an unexpandable literal printf in ARGUMENT or assignment-value
+# position is not command position and stays allowed.
+assert_rc_contains "unexpandable printf as echo argument stays allowed (#611 r5)" 0 "" \
+  'echo $(printf %b "\150\151")'
+assert_rc_contains "unexpandable printf as assignment value stays allowed (#611 r5)" 0 "" \
+  'X=$(printf %b hi) true'
+# (P1b) bash does NOT field-split a substitution inside an assignment word,
+# so a spacey expansion spliced there must stay ONE token — otherwise the
+# stray words shift command position and hide the real command
+# (X=$(printf "a b") $(printf gh) pr merge ran gh while the guard walked b).
+assert_rc_contains "assignment-word spacey splice keeps command position on the write (#611 r5)" 2 "wrapper" \
+  'X=$(printf "a b") $(printf "\147\150") pr merge 7 --admin'
+assert_rc_contains "assignment-word spacey splice with benign command stays allowed (#611 r5)" 0 "" \
+  'X=$(printf "a b") true'
+
+# --- #611 round 6: ANSI-C quoting, heredoc evidence, splice fidelity ------
+# (P1) $-single-quote ANSI-C strings are decoded and re-wrapped before the
+# literal classification, so an ANSI-C-synthesized write is spliced and
+# decided exactly like the plain-quoted octal forms.
+assert_rc_contains "ANSI-C-quoted synthesized gh pr merge fails closed (#611 r6)" 2 "wrapper" \
+  "\$(echo \$'\\147\\150\\40\\160\\162\\40\\155\\145\\162\\147\\145') 1 --admin"
+assert_rc_contains "ANSI-C-quoted benign expansion stays allowed (#611 r6)" 0 "" \
+  "\$(echo \$'hi') there"
+# Locale quoting ($ + double-quoted string) is its literal content for any
+# untranslated string — the same dodge shape as ANSI-C, preempted with it.
+assert_rc_contains "locale-quoted synthesized gh pr merge fails closed (#611 r6)" 2 "wrapper" \
+  '$(echo $"gh pr merge") 1 --admin'
+assert_rc_contains "locale-quoted benign expansion stays allowed (#611 r6)" 0 "" \
+  '$(echo $"hello") world'
+
+# --- #611 round 7: source-fed heredocs + IFS-dependent splices ------------
+# (P1) source / the dot builtin execute their input: a parse failure whose
+# gh evidence sits in a source-fed heredoc body must keep failing closed.
+assert_rc_contains "parse failure in source-fed heredoc with in-body gh fails closed (#611 r7)" 2 "tokenize" \
+  'source /dev/stdin <<EOF
+gh pr merge 1 "oops
+EOF'
+assert_rc_contains "parse failure in dot-builtin heredoc with in-body gh fails closed (#611 r7)" 2 "tokenize" \
+  '. /dev/stdin <<EOF
+gh pr merge 1 "oops
+EOF'
+# (P1) an IFS assignment re-defines word splitting for substitution output
+# (IFS=/ splits a synthesized gh-slash into a gh word) — static splicing is
+# disabled under ANY IFS touch, so the literal span fails closed as
+# unverifiable in command position.
+assert_rc_contains "IFS-modified synthesized write fails closed (#611 r7)" 2 "wrapper" \
+  'IFS=/; $(printf "gh/") pr merge 1'
+# Control: with DEFAULT IFS the same expansion is spliced faithfully — the
+# command word is gh-slash (not gh), which executes nothing gh-related.
+assert_rc_contains "default-IFS gh-slash expansion stays allowed (#611 r7)" 0 "" \
+  '$(printf "gh/") pr merge 1'
+
+# --- #611 round 8: quoted-tag heredoc bodies are inert data ---------------
+# bash performs NO expansion inside a quoted-tag heredoc body, so an encoded
+# substitution there is fixture text, not a command — the flattener skips
+# such bodies instead of statically expanding them into command segments.
+assert_rc_contains "quoted-heredoc fixture with encoded write stays allowed (#611 r8)" 0 "" \
+  'cat <<'"'"'EOF'"'"' > /tmp/fixture
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+assert_rc_contains "double-quoted-tag heredoc fixture stays allowed (#611 r8)" 0 "" \
+  'cat <<"EOF" > /tmp/fixture
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+# Fail-closed control: a shell-fed quoted-tag heredoc EXECUTES its body as a
+# script, so the body keeps being scanned and the synthesized write blocks.
+assert_rc_contains "bash-fed quoted-heredoc synthesized write fails closed (#611 r8)" 2 "wrapper" \
+  'bash <<'"'"'EOF'"'"'
+$(printf "\147\150\40\160\162") merge 1
+EOF'
+# (P2) QUOTED-tag heredoc BODIES are data for the receiving command: a
+# parse failure whose only guarded-verb evidence sits inside a quoted cat
+# heredoc body must not fail closed (#611 r9 narrowed this to quoted tags —
+# unquoted bodies expand their substitutions). A shell interpreter outside
+# the bodies keeps full-text evidence (bash <<EOF executes its body), and
+# command-line evidence outside the body still blocks.
+assert_rc_contains "parse failure with evidence only in a quoted cat heredoc body stays allowed (#611 r6)" 0 "" \
+  'cat <<'"'"'EOF'"'"' "oops
+$(date) merge
+EOF'
+assert_rc_contains "parse failure in a bash heredoc with in-body gh still fails closed (#611 r6)" 2 "tokenize" \
+  'bash <<EOF
+gh pr merge 1 "oops
+EOF'
+assert_rc_contains "parse failure with gh evidence outside the heredoc still fails closed (#611 r6)" 2 "tokenize" \
+  'cat <<EOF
+"oops
+EOF
+gh pr merge 1'
+# (P3) bash strips TRAILING newlines from substitution output before
+# concatenation: gh-then-newline glued to pr runs ghpr (not a gh write).
+assert_rc_contains "trailing-newline splice glues to adjacent text like bash (#611 r6)" 0 "" \
+  '$(printf "\147\150\n")pr merge 1'
+# (P3) an expansion-derived word is never an assignment prefix in bash
+# (assignment recognition precedes substitution): an = in the expansion is
+# no longer splice-safe, so the span fails closed as unverifiable in
+# command position instead of being re-parsed as an env assignment, and
+# stays inert elsewhere.
+assert_rc_contains "assignment-looking expansion in command position fails closed (#611 r6)" 2 "wrapper" \
+  '$(printf "X=Y") gh pr merge 1'
+assert_rc_contains "assignment-looking expansion as argument stays allowed (#611 r6)" 0 "" \
+  'echo $(printf "X=Y")'
 
 # #553 fix (b): the merge-state jq counts an un-timestamped PENDING re-run as
 # non-green even when a timestamped SUCCESS exists for the same check (the prior

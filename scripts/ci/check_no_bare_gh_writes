@@ -131,13 +131,13 @@ function gh_write_in_cmdsub(line) {
   if (line !~ /\$\(/ && line !~ /`/) return 0
   return gh_write_class(cmdsub_interiors(line))
 }
-# Return the substring of `line` AFTER the first TOP-LEVEL command separator
-# (`;`, `&&`, `||`, `|`, `&`) — a separator that is NOT inside single/double
-# quotes, a $(...) substitution, or a backtick span. Returns "" when the line is
-# a single top-level command. Used to stop the echo/printf exemption from
-# covering a SECOND command chained after the echo (#553). Bash-3.2-safe POSIX
-# awk: manual char walk mirroring the cmdsub_interiors quote/substitution walk.
-function tail_after_top_sep(line,   i, c, n, depth, inbt, oq, q, esc, prev) {
+# Position of the first TOP-LEVEL command separator (`;`, `&&`, `||`, `|`,
+# `&`) — a separator that is NOT inside single/double quotes, a $(...)
+# substitution, or a backtick span. Returns 0 when the line is a single
+# top-level command. Bash-3.2-safe POSIX awk: manual char walk mirroring the
+# cmdsub_interiors quote/substitution walk. Single-sources the walk for both
+# the head- and tail- accessors below.
+function top_sep_pos(line,   i, c, n, depth, inbt, oq, q, esc, prev) {
   n = length(line); depth = 0; inbt = 0; oq = ""; q = ""; esc = 0; prev = ""
   for (i = 1; i <= n; i++) {
     c = substr(line, i, 1)
@@ -167,11 +167,44 @@ function tail_after_top_sep(line,   i, c, n, depth, inbt, oq, q, esc, prev) {
     if (c == "\"") { oq = "\""; prev = c; continue }
     if (c == "(" && prev == "$") { depth = 1; prev = c; continue }
     if (c == "`") { inbt = 1; prev = c; continue }
-    if (substr(line, i, 2) == "&&" || substr(line, i, 2) == "||") return substr(line, i + 2)
-    if (c == ";" || c == "|" || c == "&") return substr(line, i + 1)
+    if (substr(line, i, 2) == "&&" || substr(line, i, 2) == "||") return i
+    if (c == ";" || c == "|" || c == "&") return i
     prev = c
   }
-  return ""
+  return 0
+}
+# Substring AFTER the first top-level separator ("" for a single command).
+# Used to stop the echo/printf exemption from covering a SECOND command
+# chained after the echo (#553).
+function tail_after_top_sep(line,   p) {
+  p = top_sep_pos(line)
+  if (p == 0) return ""
+  if (substr(line, p, 2) == "&&" || substr(line, p, 2) == "||") return substr(line, p + 2)
+  return substr(line, p + 1)
+}
+# Substring BEFORE the first top-level separator ("" for a single command).
+function head_before_top_sep(line,   p) {
+  p = top_sep_pos(line)
+  if (p == 0) return ""
+  return substr(line, 1, p - 1)
+}
+# A wrapped/helper-write exemption regex matched SOMEWHERE in the line. The
+# exemption may only cover the OWN top-level segment of the wrapper: the regexes
+# match a wrapper anywhere, so `gh pr create x && gh-as-author.sh -- gh pr
+# merge 1` would otherwise exempt the whole line and shield the bare HEAD
+# (CodeRabbit Major on #611 — the mirror image of the tail-shielding case).
+# Decompose at the first top-level separator and re-scan head and tail
+# INDEPENDENTLY (each recursion re-evaluates exemptions per segment, so
+# wrapper segments stay exempt wherever they sit and every bare segment is
+# caught). A separator-free line containing the wrapper is the wrapped
+# command itself → exempt. Returns 1 (flag) when any segment hides a bare
+# write, else 0 (clean).
+function exempt_split_scan(line,   head, rest) {
+  rest = tail_after_top_sep(line)
+  if (rest == "") return 0
+  head = head_before_top_sep(line)
+  if (bare_write(head)) return 1
+  return bare_write(rest)
 }
 function bare_write(line,   rest) {
   if (line ~ /^[[:space:]]*($|#)/) return 0
@@ -184,9 +217,18 @@ function bare_write(line,   rest) {
   # branch so a wrapped write that happens to live inside an echo
   # substitution (e.g. echo "$(scripts/gh-as-author.sh -- gh pr merge ...)")
   # stays exempt, exactly as the prior ordering allowed.
-  if (line ~ /gh-as-(author|reviewer)\.sh[^;&|]*--[[:space:]]+gh/) return 0
-  if (line ~ /\$"?[A-Z_]*AS_(AUTHOR|REVIEWER)"?[[:space:]]+--[[:space:]]+gh/) return 0
-  if (line ~ /(^|[[:space:]])(sync_author_gh|bootstrap::run_author_gh|bootstrap::author_gh|ghp_gh|gh_reviewer|gh_pat)[[:space:]]+/) return 0
+  #
+  # #573 (Major): the exemption must cover ONLY the top-level segment of the
+  # wrapped/helper command itself, NOT other commands chained on the same line. The
+  # regexes match a wrapper ANYWHERE in the line, so both shielding directions
+  # existed: `wrapper -- gh pr merge 1 && gh pr create x` exempted the whole
+  # line (bare TAIL shielded), and `gh pr create x && wrapper -- gh pr merge 1`
+  # did too (bare HEAD shielded — CodeRabbit Major on #611). exempt_split_scan
+  # decomposes at the first top-level (unquoted, non-substitution) separator
+  # and re-scans each segment independently, recursively.
+  if (line ~ /gh-as-(author|reviewer)\.sh[^;&|]*--[[:space:]]+gh/) return exempt_split_scan(line)
+  if (line ~ /\$"?[A-Z_]*AS_(AUTHOR|REVIEWER)"?[[:space:]]+--[[:space:]]+gh/) return exempt_split_scan(line)
+  if (line ~ /(^|[[:space:]])(sync_author_gh|bootstrap::run_author_gh|bootstrap::author_gh|ghp_gh|gh_reviewer|gh_pat)[[:space:]]+/) return exempt_split_scan(line)
   # echo/printf masking (#533): an echo/printf line is exempt UNLESS it hides
   # a gh write inside a command substitution. The prior negative-check only
   # looked for gh pr|issue|api in the substitution, so a write via any OTHER
