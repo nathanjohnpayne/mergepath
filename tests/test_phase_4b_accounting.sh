@@ -93,6 +93,43 @@ phase_4b_automation:
   enabled: false
 YAML
 
+# #615 round 3 collision fixtures: the parent `enabled` is ABSENT (or comes
+# AFTER the sub-block) while the nested accounting sub-toggle says true. The
+# flat parent-block scanner used to read the nested key as the master switch.
+POLICY_NESTED_ONLY="$WORK/policy-nested-only.yml"
+cat > "$POLICY_NESTED_ONLY" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+author_identity: nathanjohnpayne
+phase_4b_automation:
+  accounting:
+    enabled: true
+YAML
+POLICY_NESTED_REORDER="$WORK/policy-nested-reorder.yml"
+cat > "$POLICY_NESTED_REORDER" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+  accounting:
+    enabled: true
+  enabled: false
+  mode: local
+YAML
+
+# #615 round 3 trust fixture: automation on but NO registered reviewers —
+# prior records cannot be attributed, so the fetch must fail closed.
+POLICY_NO_REVIEWERS="$WORK/policy-no-reviewers.yml"
+cat > "$POLICY_NO_REVIEWERS" <<'YAML'
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+  enabled: true
+  mode: local
+YAML
+
 # Deterministic test price table (never depend on live prices for math).
 TEST_PRICES="$WORK/prices-test.json"
 cat > "$TEST_PRICES" <<'JSON'
@@ -153,16 +190,37 @@ if [ "${1:-}" = "api" ]; then
       exit 0
       ;;
     graphql)
-      # Prior-record fetch shim (#615 round 2): emits the review bodies the
-      # real single read-only GraphQL call would stream via --jq. Default is
-      # a successful EMPTY fetch (a repo with no prior records).
+      # Prior-record fetch shim (#615 rounds 2+3): serves the raw GraphQL
+      # response JSON the real read-only call returns (the fetch now parses
+      # author logins + pageInfo locally). Default is a successful EMPTY
+      # fetch (a repo with no prior records).
       if [ -n "${P4B_FAKE_GRAPHQL_FAIL:-}" ]; then
         echo "simulated graphql failure" >&2
         exit 1
       fi
-      if [ -n "${P4B_FAKE_PRIOR_BODIES:-}" ] && [ -f "${P4B_FAKE_PRIOR_BODIES}" ]; then
-        cat "${P4B_FAKE_PRIOR_BODIES}"
+      # Multi-page fixtures (#615 round 3): the endCursor of page N names
+      # the NEXT page's fixture file; no `after` arg serves page1.json.
+      if [ -n "${P4B_FAKE_GRAPHQL_PAGE_DIR:-}" ]; then
+        after=""
+        for a in "$@"; do
+          case "$a" in after=*) after="${a#after=}" ;; esac
+        done
+        pagefile="${P4B_FAKE_GRAPHQL_PAGE_DIR}/${after:-page1}.json"
+        if [ -f "$pagefile" ]; then cat "$pagefile"; exit 0; fi
+        echo "no fixture page: $pagefile" >&2
+        exit 1
       fi
+      # Single-page single-review body fixture; author defaults to a
+      # registered reviewer identity so pre-round-3 tests stay valid.
+      if [ -n "${P4B_FAKE_PRIOR_BODIES:-}" ] && [ -f "${P4B_FAKE_PRIOR_BODIES}" ]; then
+        jq -Rs --arg login "${P4B_FAKE_PRIOR_AUTHOR:-nathanpayne-codex}" '
+          {data:{repository:{pullRequests:{
+            pageInfo:{hasNextPage:false, endCursor:null},
+            nodes:[{reviews:{nodes:[{author:{login:$login}, body:.}]}}]}}}}' \
+          "${P4B_FAKE_PRIOR_BODIES}"
+        exit 0
+      fi
+      printf '%s\n' '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}'
       exit 0
       ;;
   esac
@@ -740,6 +798,113 @@ rt="$(PATH="$BIN:$PATH" REPO=o/r P4B_ACCT_STATE_DIR="$HOOK_STATE" \
   || fail "injection priority: $rt"
 
 # ===========================================================================
+echo "accounting.sh — pagination, trusted authors, honest window (#615 round 3)"
+# ===========================================================================
+# Two-page fixture: page 1 carries a trusted record (nathanpayne-codex)
+# AND a fabricated record embedded by the unregistered account "mallory";
+# page 2 carries a second trusted record (nathanpayne-claude).
+mkbody() { printf 'Automated Phase 4b review prose.\n\n<!-- p4b-accounting:v1\n%s\n-->\n' "$1"; }
+FAKE_REC="$(printf '%s' "$GOLDEN" | jq -c '.pr = 999 | .totals.tokens_total = 999999999')"
+PAGES_DIR="$WORK/gh-pages"; mkdir -p "$PAGES_DIR"
+jq -n --arg b1 "$(mkbody "$GOLDEN")" --arg b2 "$(mkbody "$FAKE_REC")" '
+  {data:{repository:{pullRequests:{
+    pageInfo:{hasNextPage:true, endCursor:"page2"},
+    nodes:[
+      {reviews:{nodes:[{author:{login:"nathanpayne-codex"}, body:$b1}]}},
+      {reviews:{nodes:[{author:{login:"mallory"}, body:$b2}]}}
+    ]}}}}' > "$PAGES_DIR/page1.json"
+jq -n --arg b "$(mkbody "$REC2")" '
+  {data:{repository:{pullRequests:{
+    pageInfo:{hasNextPage:false, endCursor:null},
+    nodes:[{reviews:{nodes:[{author:{login:"nathanpayne-claude"}, body:$b}]}}]}}}}' \
+  > "$PAGES_DIR/page2.json"
+
+# (fails pre-fix: the fetch read one page and never followed endCursor)
+set +e
+PATH="$BIN:$PATH" P4B_FAKE_GRAPHQL_PAGE_DIR="$PAGES_DIR" \
+  p4b_acct_fetch_prior_records o/r > "$WORK/fetch-pages.jsonl" 2>"$WORK/fetch-pages.err"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && [ "$(grep -c . "$WORK/fetch-pages.jsonl")" = "2" ] \
+   && [ "$(jq -s -S '.[0]' "$WORK/fetch-pages.jsonl")" = "$(printf '%s' "$GOLDEN" | jq -S .)" ] \
+   && [ "$(jq -s -S '.[1]' "$WORK/fetch-pages.jsonl")" = "$(printf '%s' "$REC2" | jq -S .)" ]; then
+  pass "fetch follows pageInfo.endCursor: trusted records from BOTH pages, in scan order (#615 round 3)"
+else fail "pagination (rc=$rc, out=$(cat "$WORK/fetch-pages.jsonl" 2>/dev/null))"; fi
+[ "${P4B_ACCT_PRIOR_FETCH_TRUNCATED:-}" = "false" ] && [ "${P4B_ACCT_PRIOR_FETCH_SCANNED_PRS:-}" = "3" ] \
+  && pass "a fully-drained scan reports its window: 3 PRs scanned, not truncated" \
+  || fail "window globals: trunc=${P4B_ACCT_PRIOR_FETCH_TRUNCATED:-}, scanned=${P4B_ACCT_PRIOR_FETCH_SCANNED_PRS:-}"
+# (fails pre-fix: author.login was never fetched, so mallory's fabricated
+# record poisoned the totals)
+if ! grep -qF '"pr":999' "$WORK/fetch-pages.jsonl"; then
+  pass "a record embedded by an unregistered author never reaches the output (#615 round 3)"
+else fail "poisoned record extracted into the aggregate stream"; fi
+[ "${P4B_ACCT_PRIOR_FETCH_SKIPPED_RECORDS:-}" = "1" ] \
+  && grep -q 'unregistered review author' "$WORK/fetch-pages.err" \
+  && pass "the skipped untrusted record is counted and surfaced as a diagnostics line, not aggregated" \
+  || fail "skip diagnostics: skipped=${P4B_ACCT_PRIOR_FETCH_SKIPPED_RECORDS:-}, err=$(cat "$WORK/fetch-pages.err" 2>/dev/null)"
+
+# (fails pre-fix: no window was tracked at all) page-cap truncation is
+# detected and reported so the renderer can label a bounded window.
+set +e
+PATH="$BIN:$PATH" P4B_FAKE_GRAPHQL_PAGE_DIR="$PAGES_DIR" P4B_ACCT_PRIOR_SCAN_PAGES=1 \
+  p4b_acct_fetch_prior_records o/r > "$WORK/fetch-trunc.jsonl" 2>/dev/null; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && [ "$(grep -c . "$WORK/fetch-trunc.jsonl")" = "1" ] \
+   && [ "${P4B_ACCT_PRIOR_FETCH_TRUNCATED:-}" = "true" ] \
+   && [ "${P4B_ACCT_PRIOR_FETCH_SCANNED_PRS:-}" = "2" ]; then
+  pass "a page-cap hit with history remaining reports a truncated 2-PR window"
+else fail "truncated fetch (rc=$rc, trunc=${P4B_ACCT_PRIOR_FETCH_TRUNCATED:-}, scanned=${P4B_ACCT_PRIOR_FETCH_SCANNED_PRS:-})"; fi
+
+# An untrusted-author-only history is a clean 0-record fetch, skip counted.
+set +e
+PATH="$BIN:$PATH" P4B_FAKE_PRIOR_BODIES="$PRIOR_BODY" P4B_FAKE_PRIOR_AUTHOR=mallory \
+  p4b_acct_fetch_prior_records o/r > "$WORK/fetch-untrusted.jsonl" 2>/dev/null; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ ! -s "$WORK/fetch-untrusted.jsonl" ] \
+   && [ "${P4B_ACCT_PRIOR_FETCH_SKIPPED_RECORDS:-}" = "1" ]; then
+  pass "the same body under an unregistered author yields 0 records (fabrication cannot inflate totals)"
+else fail "untrusted-only fetch (rc=$rc, skipped=${P4B_ACCT_PRIOR_FETCH_SKIPPED_RECORDS:-})"; fi
+# No registered reviewers ⇒ records unattributable ⇒ fail-closed.
+set +e
+MERGEPATH_REVIEW_POLICY_PATH="$POLICY_NO_REVIEWERS" PATH="$BIN:$PATH" \
+  P4B_FAKE_PRIOR_BODIES="$PRIOR_BODY" p4b_acct_fetch_prior_records o/r >/dev/null 2>&1; rc=$?
+set -e
+[ "$rc" != 0 ] && pass "no registered available_reviewers → the fetch fails closed (ledger/unavailable fallback)" \
+  || fail "reviewer-less policy fetch accepted"
+
+# Hook threads the scan window into the running-totals object.
+rt="$(PATH="$BIN:$PATH" REPO=o/r P4B_ACCT_STATE_DIR="$WORK/hook-rt-window" \
+      P4B_FAKE_GRAPHQL_PAGE_DIR="$PAGES_DIR" P4B_ACCT_PRIOR_SCAN_PAGES=1 \
+      p4b_acct_hook_running_totals 2>/dev/null)"
+printf '%s' "$rt" | jq -e '.source == "github-derived" and .records == 1
+    and .window.truncated == true and .window.scanned_prs == 2' >/dev/null \
+  && pass "hook totals carry the truncated scan window for the renderer (#615 round 3)" \
+  || fail "hook truncated window: $rt"
+rt="$(PATH="$BIN:$PATH" REPO=o/r P4B_ACCT_STATE_DIR="$WORK/hook-rt-window" \
+      P4B_FAKE_PRIOR_BODIES="$PRIOR_BODY" p4b_acct_hook_running_totals 2>/dev/null)"
+printf '%s' "$rt" | jq -e '.source == "github-derived" and .window.truncated == false' >/dev/null \
+  && pass "an untruncated fetch attaches truncated=false (the repo-wide claim stays earned)" \
+  || fail "hook untruncated window: $rt"
+
+# (fails pre-fix: the heading claimed repo, to date unconditionally)
+WINREC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.window = {scanned_prs: 200, truncated: true}')"
+WINBLOCK="$(p4b_acct_render_block "$WINREC")"
+if printf '%s' "$WINBLOCK" | grep -q '^### Running totals — window: last 200 merged PRs$' \
+   && ! printf '%s' "$WINBLOCK" | grep -q 'repo, to date'; then
+  pass "a truncated window renders the bounded-window heading, never a repo-wide claim"
+else fail "window heading: $(printf '%s' "$WINBLOCK" | grep '### Running totals')"; fi
+printf '%s' "$WINBLOCK" | grep -qF '*Totals source: github-derived (24 prior record(s)); window: last 200 merged PRs — older history beyond the scan cap is not included.*' \
+  && pass "the totals-source footer states the truncated window explicitly" \
+  || fail "window footer: $(printf '%s' "$WINBLOCK" | grep 'Totals source')"
+LCREC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.source = "ledger-cache"')"
+LCBLOCK="$(p4b_acct_render_block "$LCREC")"
+if printf '%s' "$LCBLOCK" | grep -q '^### Running totals — local ledger cache (this checkout only)$' \
+   && ! printf '%s' "$LCBLOCK" | grep -q 'repo, to date'; then
+  pass "ledger-cache totals no longer claim repo, to date (#615 round 3)"
+else fail "ledger-cache heading: $(printf '%s' "$LCBLOCK" | grep '### Running totals')"; fi
+
+# ===========================================================================
 echo "accounting.sh — zero-finding + degraded rendering"
 # ===========================================================================
 ZLOOP="$(printf '%s' "$CLEAN_LOOP" | jq -c '.cli_version = null | .plan_auth = null')"
@@ -827,6 +992,31 @@ if [ "$rc" = 0 ] && printf '%s' "$out" | jq -e '
     and .usage.token_count == 150' >/dev/null; then
   pass "claude adapter populates the additive usage fields from the CLI envelope (CLI-sourced only)"
 else fail "claude adapter additive usage (rc=$rc, out=$out)"; fi
+
+# ===========================================================================
+echo "lib.sh — parent-block reader is nesting-aware (#615 round 3)"
+# ===========================================================================
+# (fails pre-fix) The flat whole-block scanner matched the NESTED
+# accounting.enabled as the parent phase_4b_automation.enabled whenever the
+# parent key was absent — the accounting sub-toggle wrongly became the
+# orchestrator master switch.
+v="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_NESTED_ONLY" p4b_automation_field enabled)"
+[ -z "$v" ] && pass "parent enabled ABSENT + accounting.enabled true → parent reads empty (default-disabled)" \
+  || fail "nested-toggle collision: parent enabled -> '$v'"
+# (fails pre-fix) …and first-match-wins let a REORDERED sub-block shadow a
+# later parent enabled: false.
+v="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_NESTED_REORDER" p4b_automation_field enabled)"
+[ "$v" = "false" ] && pass "a sub-block listed first cannot shadow the later parent enabled: false" \
+  || fail "reordered collision: parent enabled -> '$v'"
+v="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_NESTED_REORDER" p4b_automation_field mode)"
+[ "$v" = "local" ] && pass "direct-child keys AFTER a nested sub-block still resolve (no over-skip)" \
+  || fail "post-sub-block key lost: mode -> '$v'"
+v="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ACCT_PRICES" p4b_automation_field enabled)"
+[ "$v" = "true" ] && pass "a normally-shaped block still reads the parent enabled: true" \
+  || fail "normal parent read: '$v'"
+v="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_NESTED_ONLY" p4b_acct_config_field enabled)"
+[ "$v" = "true" ] && pass "the accounting sub-block reader still resolves its own nested enabled" \
+  || fail "sub-block reader: '$v'"
 
 # ===========================================================================
 echo "orchestrator — accounting hook (fail-open, exit codes preserved)"
@@ -972,6 +1162,20 @@ if [ "$rc" = 5 ] && [ ! -d "$STATE_G" ]; then
   pass "disabled parent still exits 5 with no accounting side effects"
 else fail "disabled parent (rc=$rc)"; fi
 
+# (g2) #615 round 3 (fails pre-fix): a downstream policy that OMITS the
+#      parent enabled while the nested accounting sub-toggle says true must
+#      take the documented default-disabled path (exit 5) — the flat
+#      scanner used to read the sub-toggle as the master switch and RUN the
+#      orchestrator (it posted a full review here pre-fix).
+STATE_G2="$WORK/state-g2"
+set +e
+out="$(run_orch "$STATE_G2" "$POLICY_NESTED_ONLY" fake-codex-approve 214 -- 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 5 ] && [ ! -d "$STATE_G2" ] \
+   && printf '%s' "$out" | jq -e '.skipped == true and .reason == "automation-disabled"' >/dev/null; then
+  pass "the accounting sub-toggle alone cannot enable the orchestrator (exit 5, no writes) (#615 round 3)"
+else fail "nested-toggle orchestrator gate (rc=$rc, out=$out)"; fi
+
 # (h) notional pricing end-to-end: configured price keys + CLI-exposed tokens
 #     → labeled notional in the posted body and record.
 STATE_H="$WORK/state-h"; BODY_H="$WORK/body-h.md"
@@ -1056,6 +1260,29 @@ if [ "$rc" = 0 ] && [ -n "$REC_K" ] \
    && grep -qF '*Totals source: github-derived (1 prior record(s)).*' "$BODY_K"; then
   pass "posted approval aggregates GitHub-fetched prior records into repo-wide running totals (#615 round 2)"
 else fail "github-derived totals e2e (rc=$rc, rec=$REC_K)"; fi
+
+# (k2) truncated-scan e2e (#615 round 3, fails pre-fix): when the page cap
+#      leaves history unscanned, the POSTED body labels the totals as a
+#      bounded window (heading + footer) and the embedded record carries
+#      the window object — never an unearned repo-wide claim.
+STATE_K2="$WORK/state-k2"; BODY_K2="$WORK/body-k2.md"
+set +e
+out="$(run_orch "$STATE_K2" "$POLICY_ON" fake-codex-approve 215 \
+  P4B_WRAPPER_BODY="$BODY_K2" P4B_FAKE_GRAPHQL_PAGE_DIR="$PAGES_DIR" \
+  P4B_ACCT_PRIOR_SCAN_PAGES=1 -- 2>/dev/null)"; rc=$?
+set -e
+REC_K2="$(p4b_acct_extract_records < "$BODY_K2" 2>/dev/null || true)"
+if [ "$rc" = 0 ] && [ -n "$REC_K2" ] \
+   && printf '%s' "$REC_K2" | jq -e '
+        .running_totals.source == "github-derived"
+        and .running_totals.records == 1
+        and .running_totals.window.truncated == true
+        and .running_totals.window.scanned_prs == 2' >/dev/null \
+   && grep -q '^### Running totals — window: last 2 merged PRs$' "$BODY_K2" \
+   && ! grep -q 'repo, to date' "$BODY_K2" \
+   && grep -qF 'window: last 2 merged PRs — older history beyond the scan cap is not included' "$BODY_K2"; then
+  pass "a cap-truncated scan posts window-labeled totals end-to-end, never a repo-wide claim (#615 round 3)"
+else fail "truncated-window e2e (rc=$rc, rec=$REC_K2, heading=$(grep '### Running totals' "$BODY_K2" 2>/dev/null))"; fi
 
 # (l) fetch failure → the ledger fallback stays EXPLICITLY labeled
 #     ledger-cache in the posted body — local-only totals are never silently

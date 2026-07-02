@@ -55,14 +55,28 @@ p4b_config() {
 
 # p4b_automation_field <field> — scalar under the top-level
 # `phase_4b_automation:` block. Empty string if absent; caller defaults.
+# Nesting-aware (#615 Codex round 3): only DIRECT children of the block
+# match. The block carries nested sub-blocks (e.g. `accounting.enabled`),
+# and the previous flat scan matched a nested key as the parent-level
+# field — a downstream policy that omitted or reordered the parent
+# `enabled` would read the accounting sub-toggle as the master switch and
+# wrongly run the orchestrator. The direct-child indent is captured from
+# the first key line inside the block (so 2- and 4-space styles both
+# work); deeper-indented lines belong to sub-blocks and never match —
+# sub-block readers (p4b_acct_config_field, mirroring codex_p1_gate_field)
+# own those.
 p4b_automation_field() {
   local field="$1" cfg
   cfg="$(p4b_config)"
   [ -f "$cfg" ] || return 0
   awk -v field="$field" '
-    /^phase_4b_automation:/ { inblk=1; next }
+    /^phase_4b_automation:/ { inblk=1; child_indent=-1; next }
     inblk && /^[^[:space:]#]/ { inblk=0 }
     inblk {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      indent = match($0, /[^[:space:]]/) - 1
+      if (child_indent < 0) child_indent = indent
+      if (indent > child_indent) next
       if ($1 == field":") {
         sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
         gsub(/^["\047]/, "", $0)

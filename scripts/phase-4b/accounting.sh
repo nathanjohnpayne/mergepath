@@ -117,6 +117,33 @@ p4b_acct_config_enabled() {
   [ "${v:-true}" != "false" ]
 }
 
+# p4b_acct_available_reviewers_json — the registered reviewer identities
+# (top-level `available_reviewers:` list in review-policy.yml) as a compact
+# JSON array, e.g. ["nathanpayne-claude","nathanpayne-codex"]. Mirrors
+# lib.sh's p4b_available_reviewers awk (accounting.sh stays sourceable in
+# isolation). Prints "[]" when the list is absent/empty. Used to filter
+# GitHub-fetched prior records to trusted review authors (#615 Codex
+# round 3): the spec aggregates reviews BY available_reviewers identities,
+# so a record embedded by any other account must never reach the totals.
+p4b_acct_available_reviewers_json() {
+  local cfg
+  cfg="$(p4b_acct_config)"
+  [ -f "$cfg" ] || { printf '[]'; return 0; }
+  awk '
+    /^available_reviewers:/ { inlist=1; next }
+    inlist && /^[[:space:]]*-[[:space:]]*/ {
+      line=$0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+      gsub(/[[:space:]]*#.*$/, "", line)
+      gsub(/^["\047]/, "", line); gsub(/["\047][[:space:]]*$/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line != "") print line
+      next
+    }
+    inlist && /^[^[:space:]#-]/ { inlist=0 }
+  ' "$cfg" | jq -Rnc '[inputs | select(length > 0)]' 2>/dev/null || printf '[]'
+}
+
 # --- price table -----------------------------------------------------------
 
 # p4b_acct_price_table_version — the `version` stamp of prices.json, or empty
@@ -979,9 +1006,24 @@ p4b_acct_render_block() {
   printf '\n\n'
 
   # --- Running totals ---
-  printf '### Running totals — repo, to date\n\n'
-  local rt_source
+  # Honest scope labeling (#615 Codex round 3): the heading names exactly
+  # what was scanned. "repo, to date" is claimed ONLY for a github-derived
+  # aggregation whose scan window was NOT truncated; a cap-truncated scan
+  # is labeled as a bounded window of recently updated merged PRs, and the
+  # ledger-cache fallback as the local cache it is — never repo-wide.
+  local rt_source rt_trunc rt_scanned
   rt_source="$(printf '%s' "$rec" | jq -r '.running_totals.source')"
+  rt_trunc="$(printf '%s' "$rec" | jq -r '.running_totals.window.truncated // false')"
+  rt_scanned="$(printf '%s' "$rec" | jq -r '.running_totals.window.scanned_prs // 0')"
+  if [ "$rt_source" = "github-derived" ] && [ "$rt_trunc" = "true" ]; then
+    printf '### Running totals — window: last %s merged PRs\n\n' "$rt_scanned"
+  elif [ "$rt_source" = "github-derived" ]; then
+    printf '### Running totals — repo, to date\n\n'
+  elif [ "$rt_source" = "ledger-cache" ]; then
+    printf '### Running totals — local ledger cache (this checkout only)\n\n'
+  else
+    printf '### Running totals\n\n'
+  fi
   if [ "$rt_source" = "unavailable" ]; then
     printf '%s' "$rec" | jq -r '"_Running totals unavailable — \(.running_totals.reason // "aggregation degraded")._"'
     printf '\n\n'
@@ -1020,7 +1062,12 @@ p4b_acct_render_block() {
            else "~\(($r.human_minutes_saved_estimate[0] / 60) | floor) – \(($r.human_minutes_saved_estimate[1] / 60) | floor) h" end)
         + " |"'
     printf '\n\n'
-    printf '%s' "$rec" | jq -r '"*Totals source: \(.running_totals.source) (\(.running_totals.records) prior record(s)).*"'
+    printf '%s' "$rec" | jq -r '
+      "*Totals source: \(.running_totals.source) (\(.running_totals.records) prior record(s))"
+      + (if (.running_totals.window.truncated // false)
+         then "; window: last \(.running_totals.window.scanned_prs) merged PRs — older history beyond the scan cap is not included"
+         else "" end)
+      + ".*"'
     printf '\n\n'
   fi
 
@@ -1267,19 +1314,45 @@ p4b_acct_hook_note_fallback() {
 }
 
 # p4b_acct_fetch_prior_records <owner/repo>
-# Stateless GitHub-derived prior-record fetch (#615 Codex round 2): pull the
-# review bodies of the most recently updated N merged PRs (default 50,
-# override via P4B_ACCT_PRIOR_SCAN_PRS) in ONE read-only `gh api graphql`
-# call — subscription/plan-safe, no reviewer CLI, no API key — and emit
-# every embedded p4b-accounting:v1 record as JSONL via
-# p4b_acct_extract_records. Empty output with exit 0 is VALID (no prior
-# records — the first-ever approval). Returns non-zero when the repo slug
-# is unusable, gh is absent, or the API call fails; the caller then falls
-# back to the local ledger cache, which stays explicitly labeled
-# ledger-cache (never presented as repo-wide). Testable via a PATH-shimmed
-# gh.
+# Stateless GitHub-derived prior-record fetch (#615 Codex rounds 2+3): pull
+# the review bodies of the most recently updated merged PRs via read-only
+# `gh api graphql` — subscription/plan-safe, no reviewer CLI, no API key —
+# and emit every embedded p4b-accounting:v1 record as JSONL via
+# p4b_acct_extract_records.
+#
+# Pagination (#615 round 3): follows pageInfo.hasNextPage/endCursor across
+# up to P4B_ACCT_PRIOR_SCAN_PAGES pages (default 4) of
+# P4B_ACCT_PRIOR_SCAN_PRS PRs each (default 50, so up to 200 merged PRs by
+# default). When history remains beyond the cap the scan is TRUNCATED and
+# the caller must label the totals as a bounded window — never repo-wide.
+# The window is reported through globals (this function is invoked with an
+# output redirect, not a subshell, so they persist):
+#   P4B_ACCT_PRIOR_FETCH_SCANNED_PRS      merged PRs actually scanned
+#   P4B_ACCT_PRIOR_FETCH_TRUNCATED        true|false (older history left)
+#   P4B_ACCT_PRIOR_FETCH_SKIPPED_RECORDS  untrusted-author records skipped
+#
+# Trusted authors only (#615 round 3): the spec aggregates reviews by the
+# registered `available_reviewers` identities. The query fetches each
+# review's author.login and only bodies from those identities are
+# extracted — a record fabricated by any other account is SKIPPED (counted
+# in a diagnostics line, never aggregated). No registered reviewers ⇒
+# fail-closed non-zero (records cannot be attributed).
+#
+# Empty output with exit 0 is VALID (no prior records — the first-ever
+# approval). Returns non-zero when the repo slug is unusable, gh is
+# absent, no reviewers are registered, or any API call fails; the caller
+# then falls back to the local ledger cache, which stays explicitly
+# labeled ledger-cache (never presented as repo-wide). Testable via a
+# PATH-shimmed gh.
 p4b_acct_fetch_prior_records() {
-  local repo="${1:-}" owner name n bodies
+  local repo="${1:-}" owner name per_page max_pages trusted
+  local page cursor resp page_records page_skipped nodes has_next
+  local records="" scanned=0 skipped=0
+  local -a args
+  P4B_ACCT_PRIOR_FETCH_SCANNED_PRS=0
+  P4B_ACCT_PRIOR_FETCH_TRUNCATED=false
+  # shellcheck disable=SC2034  # documented contract: read by callers/tests after the call
+  P4B_ACCT_PRIOR_FETCH_SKIPPED_RECORDS=0
   case "$repo" in
     */*) ;;
     *) return 1 ;;
@@ -1287,22 +1360,77 @@ p4b_acct_fetch_prior_records() {
   owner="${repo%%/*}"
   name="${repo#*/}"
   [ -n "$owner" ] && [ -n "$name" ] || return 1
-  n="${P4B_ACCT_PRIOR_SCAN_PRS:-50}"
-  case "$n" in ''|0*|*[!0-9]*) n=50 ;; esac
+  per_page="${P4B_ACCT_PRIOR_SCAN_PRS:-50}"
+  case "$per_page" in ''|0*|*[!0-9]*) per_page=50 ;; esac
+  max_pages="${P4B_ACCT_PRIOR_SCAN_PAGES:-4}"
+  case "$max_pages" in ''|0*|*[!0-9]*) max_pages=4 ;; esac
   command -v gh >/dev/null 2>&1 || return 1
-  bodies="$(gh api graphql \
-    -F owner="$owner" -F name="$name" -F prs="$n" \
-    -f query='query($owner: String!, $name: String!, $prs: Int!) {
-        repository(owner: $owner, name: $name) {
-          pullRequests(states: MERGED, first: $prs,
-                       orderBy: {field: UPDATED_AT, direction: DESC}) {
-            nodes { reviews(last: 50) { nodes { body } } }
+  trusted="$(p4b_acct_available_reviewers_json)"
+  if [ -z "$trusted" ] || [ "$trusted" = "[]" ]; then
+    p4b_acct_warn "no available_reviewers registered in review-policy.yml — prior records cannot be attributed to a trusted reviewer (fail-closed, #615 round 3)"
+    return 1
+  fi
+  cursor=""
+  page=0
+  has_next=false
+  while [ "$page" -lt "$max_pages" ]; do
+    args=(-F owner="$owner" -F name="$name" -F prs="$per_page")
+    [ -n "$cursor" ] && args+=(-f after="$cursor")
+    resp="$(gh api graphql "${args[@]}" \
+      -f query='query($owner: String!, $name: String!, $prs: Int!, $after: String) {
+          repository(owner: $owner, name: $name) {
+            pullRequests(states: MERGED, first: $prs, after: $after,
+                         orderBy: {field: UPDATED_AT, direction: DESC}) {
+              pageInfo { hasNextPage endCursor }
+              nodes { reviews(last: 50) { nodes { body author { login } } } }
+            }
           }
-        }
-      }' \
-    --jq '.data.repository.pullRequests.nodes[].reviews.nodes[].body // empty' \
-    2>/dev/null)" || return 1
-  printf '%s\n' "$bodies" | p4b_acct_extract_records
+        }' 2>/dev/null)" || return 1
+    printf '%s' "$resp" | jq -e '
+      .data.repository.pullRequests
+      | (.nodes | type == "array") and (.pageInfo | type == "object")' \
+      >/dev/null 2>&1 || return 1
+    # Trusted-author bodies → records; untrusted marker-bearing bodies →
+    # diagnostics counter only (skipped, never aggregated).
+    page_records="$(printf '%s' "$resp" | jq -r --argjson trusted "$trusted" '
+      .data.repository.pullRequests.nodes[].reviews.nodes[]
+      | (.author.login // "") as $login
+      | select(($trusted | index($login)) != null)
+      | .body // empty' 2>/dev/null | p4b_acct_extract_records)" || return 1
+    page_skipped="$(printf '%s' "$resp" | jq -r --argjson trusted "$trusted" '
+      .data.repository.pullRequests.nodes[].reviews.nodes[]
+      | (.author.login // "") as $login
+      | select(($trusted | index($login)) == null)
+      | .body // empty' 2>/dev/null | p4b_acct_extract_records | grep -c . || true)"
+    case "$page_skipped" in ''|*[!0-9]*) page_skipped=0 ;; esac
+    skipped=$((skipped + page_skipped))
+    [ -n "$page_records" ] && records="${records}${page_records}
+"
+    nodes="$(printf '%s' "$resp" | jq -r \
+      '.data.repository.pullRequests.nodes | length' 2>/dev/null)" || nodes=0
+    case "$nodes" in ''|*[!0-9]*) nodes=0 ;; esac
+    scanned=$((scanned + nodes))
+    has_next="$(printf '%s' "$resp" | jq -r \
+      '.data.repository.pullRequests.pageInfo.hasNextPage // false' 2>/dev/null)" || has_next=false
+    cursor="$(printf '%s' "$resp" | jq -r \
+      '.data.repository.pullRequests.pageInfo.endCursor // empty' 2>/dev/null)" || cursor=""
+    page=$((page + 1))
+    [ "$has_next" = "true" ] || break
+    # hasNextPage without a cursor cannot be followed — treated as truncated.
+    [ -n "$cursor" ] || break
+  done
+  P4B_ACCT_PRIOR_FETCH_SCANNED_PRS="$scanned"
+  # shellcheck disable=SC2034  # documented contract: read by callers/tests after the call
+  P4B_ACCT_PRIOR_FETCH_SKIPPED_RECORDS="$skipped"
+  if [ "$has_next" = "true" ]; then
+    P4B_ACCT_PRIOR_FETCH_TRUNCATED=true
+    p4b_acct_warn "prior-record scan stopped at its page cap after $scanned merged PR(s) with older history remaining — totals will be labeled as a bounded window, not repo-wide (#615 round 3)"
+  fi
+  if [ "$skipped" -gt 0 ]; then
+    p4b_acct_warn "skipped $skipped prior accounting record(s) embedded by unregistered review author(s) — diagnostics only, never aggregated (#615 round 3)"
+  fi
+  [ -n "$records" ] && printf '%s' "$records"
+  return 0
 }
 
 # p4b_acct_hook_running_totals
@@ -1313,12 +1441,15 @@ p4b_acct_fetch_prior_records() {
 # embedded records. Priority now:
 #   1. An injected P4B_ACCT_PRIOR_RECORDS_JSONL (tests / callers that
 #      already fetched) — unchanged.
-#   2. The GitHub-derived fetch above (repo-wide, stateless).
+#   2. The GitHub-derived fetch above (stateless). The fetch's scan window
+#      (#615 round 3) is attached as .window {scanned_prs, truncated} so
+#      the renderer claims repo-wide ONLY when the scan saw the full
+#      history and labels a cap-truncated scan as a bounded window.
 #   3. On fetch failure: the local ledger cache, EXPLICITLY labeled
 #      ledger-cache — or unavailable with the fetch-failed reason. Never
 #      silently presented as repo-wide.
 p4b_acct_hook_running_totals() {
-  local ledger fetched
+  local ledger fetched rt rt_w
   ledger="$(p4b_acct_hook_ledger)"
   if [ -n "${P4B_ACCT_PRIOR_RECORDS_JSONL:-}" ]; then
     p4b_acct_running_totals_for_post "$ledger"
@@ -1328,11 +1459,20 @@ p4b_acct_hook_running_totals() {
     p4b_acct_running_totals_for_post "$ledger"
     return 0
   fi
-  if p4b_acct_fetch_prior_records "${REPO:-}" > "$fetched" 2>/dev/null; then
-    P4B_ACCT_PRIOR_RECORDS_JSONL="$fetched" \
+  # stdout only is redirected (no subshell), so the fetch's window/skip
+  # globals persist and its diagnostics lines still reach stderr.
+  if p4b_acct_fetch_prior_records "${REPO:-}" > "$fetched"; then
+    rt="$(P4B_ACCT_PRIOR_RECORDS_JSONL="$fetched" \
       P4B_ACCT_PRIOR_RECORDS_SOURCE="github-derived" \
-      p4b_acct_running_totals_for_post "$ledger"
+      p4b_acct_running_totals_for_post "$ledger")"
     rm -f "$fetched" 2>/dev/null || true
+    rt_w="$(printf '%s' "$rt" | jq -c \
+      --argjson scanned "${P4B_ACCT_PRIOR_FETCH_SCANNED_PRS:-0}" \
+      --argjson trunc "${P4B_ACCT_PRIOR_FETCH_TRUNCATED:-false}" '
+      if .source == "github-derived"
+      then . + {window: {scanned_prs: $scanned, truncated: $trunc}}
+      else . end' 2>/dev/null)" || rt_w=""
+    if [ -n "$rt_w" ]; then printf '%s' "$rt_w"; else printf '%s' "$rt"; fi
     return 0
   fi
   rm -f "$fetched" 2>/dev/null || true

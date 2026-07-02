@@ -238,7 +238,7 @@
       }
     },
     "running_totals": {
-      "description": "Repo-wide cumulative figures computed at post time from prior p4b-accounting:v1 records (github-derived) or the ledger-cache fallback. Degrades to source='unavailable' rather than reporting wrong numbers.",
+      "description": "Cumulative figures computed at post time from prior p4b-accounting:v1 records (github-derived) or the ledger-cache fallback. Repo-wide ONLY when source is github-derived and the scan window was not truncated (see `window`, #615 round 3). Degrades to source='unavailable' rather than reporting wrong numbers.",
       "type": "object",
       "additionalProperties": false,
       "required": ["source", "records"],
@@ -248,6 +248,16 @@
           "enum": ["github-derived", "ledger-cache", "unavailable"]
         },
         "records": { "type": "integer", "minimum": 0 },
+        "window": {
+          "description": "GitHub-derived scan window (#615 round 3): how many recently updated merged PRs were scanned for prior records and whether the page cap left older history unscanned. truncated=true means the totals are a bounded window (renderer labels 'window: last N merged PRs'), never repo-wide. Absent for non-github-derived sources and pre-window records.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scanned_prs", "truncated"],
+          "properties": {
+            "scanned_prs": { "type": "integer", "minimum": 0 },
+            "truncated": { "type": "boolean" }
+          }
+        },
         "auto_approved_prs": { "type": ["integer", "null"], "minimum": 0 },
         "automated_attempts": { "type": ["integer", "null"], "minimum": 0 },
         "fail_closed_events": { "type": ["integer", "null"], "minimum": 0 },

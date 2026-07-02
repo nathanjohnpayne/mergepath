@@ -650,6 +650,10 @@ phase_4b_automation:
     # Sub-toggle. Default TRUE — but only reachable when the parent
     # `enabled: true` above flips, so shipping this block changes nothing
     # today. Set false to keep automation while posting the plain summary.
+    # NB: the parent-block reader (lib.sh p4b_automation_field) is
+    # nesting-aware (#615 Codex round 3), so this nested `enabled` can
+    # never be read as the parent master switch even when a downstream
+    # policy omits or reorders `phase_4b_automation.enabled`.
     enabled: true
     # Notional-cost price keys into scripts/phase-4b/prices.json
     # (`<provider>.<model...>.<tier>`). The adapters do NOT capture exact
