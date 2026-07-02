@@ -285,6 +285,8 @@ jobs:
         run: ./scripts/ci/check_foo
 "
 mk_annex "$repo" "name: t-local
+on:
+  pull_request:
 jobs:
   lint-local:
     steps:
@@ -319,6 +321,8 @@ jobs:
         run: ./scripts/ci/check_foo
 "
 mk_annex "$repo" "name: t-local
+on:
+  pull_request:
 jobs:
   lint-local:
     steps:
@@ -338,6 +342,8 @@ fi
 # Comment-only mention in the ANNEX must not count as wired either
 # (same trap as Case 4, annex edition).
 mk_annex "$repo" "name: t-local
+on:
+  pull_request:
 # the annex talks about ./scripts/ci/check_nowhere in a comment only
 jobs:
   lint-local:
@@ -353,6 +359,107 @@ if [[ $rc -ne 0 ]] && echo "$out" | grep -q "check_nowhere"; then
   pass "annex comment-only mention: NOT counted as wired"
 else
   fail "annex comment-only mention: expected nonzero exit naming check_nowhere, got rc=$rc; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 7b (#624 Codex P2, fails pre-fix): annex SHAPE gate. An annex that
+# Actions never runs cannot satisfy the wiring contract — a shapeless annex
+# (no on: block) used to mark its checks wired anyway. Now: hard FAIL
+# naming the trigger contract.
+# ---------------------------------------------------------------------------
+repo="$(make_scratch_repo case7b_annex_no_trigger)"
+mk_check "$repo" check_foo
+mk_check "$repo" check_consumer_local
+mk_workflow "$repo" "name: t
+jobs:
+  lint:
+    steps:
+      - name: check_ci_scripts_wired
+        run: ./scripts/ci/check_ci_scripts_wired
+      - name: check_foo
+        run: ./scripts/ci/check_foo
+"
+mk_annex "$repo" "name: t-local
+jobs:
+  lint-local:
+    steps:
+      - name: check_consumer_local
+        run: ./scripts/ci/check_consumer_local
+"
+set +e
+out=$(run_check "$repo" 2>&1)
+rc=$?
+set -e
+if [[ $rc -ne 0 ]] && echo "$out" | grep -q "no push/pull_request trigger"; then
+  pass "annex without any on: trigger is rejected — cannot satisfy wiring (#624)"
+else
+  fail "shapeless annex accepted (rc=$rc); output: $out"
+fi
+
+# Case 7c (#624): a manual-only (workflow_dispatch) annex is likewise not a
+# wiring vehicle — it never runs on pushes or PRs.
+repo="$(make_scratch_repo case7c_annex_dispatch_only)"
+mk_check "$repo" check_foo
+mk_check "$repo" check_consumer_local
+mk_workflow "$repo" "name: t
+jobs:
+  lint:
+    steps:
+      - name: check_ci_scripts_wired
+        run: ./scripts/ci/check_ci_scripts_wired
+      - name: check_foo
+        run: ./scripts/ci/check_foo
+"
+mk_annex "$repo" "name: t-local
+on:
+  workflow_dispatch:
+jobs:
+  lint-local:
+    steps:
+      - name: check_consumer_local
+        run: ./scripts/ci/check_consumer_local
+"
+set +e
+out=$(run_check "$repo" 2>&1)
+rc=$?
+set -e
+if [[ $rc -ne 0 ]] && echo "$out" | grep -q "no push/pull_request trigger"; then
+  pass "workflow_dispatch-only annex is rejected — not a wiring vehicle (#624)"
+else
+  fail "dispatch-only annex accepted (rc=$rc); output: $out"
+fi
+
+# Case 7d (#624): push-trigger annex is a valid wiring vehicle (positive
+# control for the shape gate; case 6 covers pull_request).
+repo="$(make_scratch_repo case7d_annex_push)"
+mk_check "$repo" check_foo
+mk_check "$repo" check_consumer_local
+mk_workflow "$repo" "name: t
+jobs:
+  lint:
+    steps:
+      - name: check_ci_scripts_wired
+        run: ./scripts/ci/check_ci_scripts_wired
+      - name: check_foo
+        run: ./scripts/ci/check_foo
+"
+mk_annex "$repo" "name: t-local
+on:
+  push:
+jobs:
+  lint-local:
+    steps:
+      - name: check_consumer_local
+        run: ./scripts/ci/check_consumer_local
+"
+set +e
+out=$(run_check "$repo" 2>&1)
+rc=$?
+set -e
+if [[ $rc -eq 0 ]]; then
+  pass "push-trigger annex satisfies wiring (shape-gate positive control) (#624)"
+else
+  fail "push-trigger annex rejected (rc=$rc); output: $out"
 fi
 
 # ---------------------------------------------------------------------------
@@ -372,6 +479,8 @@ jobs:
         run: ./scripts/ci/check_foo
 "
 mk_annex "$repo" "name: t-local
+on:
+  pull_request:
 # WIRED-EXEMPT: check_local_pending — consumer-local, intentionally pending
 jobs: {}
 "

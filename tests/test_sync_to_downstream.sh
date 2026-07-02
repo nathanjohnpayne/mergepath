@@ -1297,4 +1297,139 @@ grep -q "recreate-existing" <<<"$help_out" || fail "--help missing --recreate-ex
 grep -q "verbose"           <<<"$help_out" || fail "--help missing --verbose documentation"
 grep -q "sync-all"          <<<"$help_out" || fail "--help missing --sync-all documentation"
 
+# ---------------------------------------------------------------------------
+# Commit-path requires-closure gate (#624 Codex P1; fails pre-fix). A commit
+# touching ONLY a requires-bearing canonical (repo_lint.yml) must not open a
+# consumer PR while the required kit is missing/stale on that consumer — the
+# shipped workflow would run: kit checks the consumer does not have. The gate
+# passes when the kit is byte-current, and honors consumer overrides for
+# required files (documented divergence).
+# ---------------------------------------------------------------------------
+req_workdir="$WORKDIR/requires-gate"
+REQ_MP="$req_workdir/mergepath"
+REQ_FAKE_BIN="$req_workdir/bin"
+REQ_CAPTURE="$req_workdir/capture"
+mkdir -p "$REQ_MP/scripts/sync" "$REQ_MP/scripts/lib" "$REQ_MP/scripts/ci" \
+         "$REQ_MP/.github/workflows" "$REQ_FAKE_BIN" "$REQ_CAPTURE"
+cp "$ROOT/scripts/sync/apply-overrides.sh" "$REQ_MP/scripts/sync/apply-overrides.sh"
+cp "$ROOT/scripts/lib/manifest-fact-helpers.sh" "$REQ_MP/scripts/lib/manifest-fact-helpers.sh"
+cat >"$REQ_MP/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - {name: alpha, repo: example/alpha}
+paths:
+  - path: .github/workflows/repo_lint.yml
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/ci/"
+  - {path: scripts/ci/, type: kit, consumers: all}
+YAML
+cat >"$REQ_MP/.github/review-policy.yml" <<'YAML'
+author_identity: nathanjohnpayne
+YAML
+printf 'lint v1\n' >"$REQ_MP/.github/workflows/repo_lint.yml"
+printf 'check a v1\n' >"$REQ_MP/scripts/ci/check_a"
+printf 'check b v1\n' >"$REQ_MP/scripts/ci/check_b"
+git -C "$REQ_MP" init -q
+git -C "$REQ_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$REQ_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m initial
+printf 'lint v2\n' >"$REQ_MP/.github/workflows/repo_lint.yml"
+git -C "$REQ_MP" -c user.email=t@t -c user.name=t add -A
+git -C "$REQ_MP" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "repo_lint bump only"
+req_sha=$(git -C "$REQ_MP" rev-parse HEAD)
+
+# Same stub gh as the metadata block: clone from the env remote, capture
+# pr create bodies into the capture dir.
+cp "$META_FAKE_BIN/gh" "$REQ_FAKE_BIN/gh"
+chmod +x "$REQ_FAKE_BIN/gh"
+
+req_setup_remote() {
+  local remote=$1 seed=$2
+  git init --bare -q "$remote"
+  git -C "$remote" symbolic-ref HEAD refs/heads/main
+  mkdir -p "$seed"
+  git init -q "$seed"
+  git -C "$seed" checkout -q -b main
+  echo consumer >"$seed/README.md"
+}
+req_push_seed() {
+  local remote=$1 seed=$2
+  git -C "$seed" -c user.email=t@t -c user.name=t add -A
+  git -C "$seed" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m initial
+  git -C "$seed" remote add origin "$remote"
+  git -C "$seed" push -q origin main
+}
+req_run() {
+  local run_id=$1 remote=$2
+  env PATH="$REQ_FAKE_BIN:$PATH" \
+    MERGEPATH_ROOT_OVERRIDE="$REQ_MP" \
+    MERGEPATH_TEST_REMOTE_ALPHA="$remote" \
+    MERGEPATH_TEST_CAPTURE_DIR="$REQ_CAPTURE" \
+    MERGEPATH_TEST_RUN="$run_id" \
+    MERGEPATH_SYNC_SKIP_AUTHOR_TOKEN_CHECK=1 \
+    "$SCRIPT" "$req_sha" --repos alpha 2>&1
+}
+
+# (1) Required kit entirely MISSING on the consumer → the gate blocks this
+#     consumer, names a missing kit file, points at the sync-all remedy, and
+#     no PR is created (fails pre-fix: the PR shipped repo_lint.yml alone).
+remote1="$req_workdir/nokit.git"; seed1="$req_workdir/nokit-seed"
+req_setup_remote "$remote1" "$seed1"
+req_push_seed "$remote1" "$seed1"
+set +e
+output=$(req_run reqgate1 "$remote1")
+set -e
+echo "$output" | grep -q "requires-closure gate" \
+  || fail "requires gate did not fire for the kit-less consumer: $output"
+echo "$output" | grep -q "scripts/ci/check_a" \
+  || fail "gate message does not name a missing kit file: $output"
+echo "$output" | grep -q -- "--sync-all" \
+  || fail "gate message does not point at the sync-all remedy: $output"
+[ ! -f "$REQ_CAPTURE/pr-title-reqgate1.txt" ] \
+  || fail "PR was opened despite the missing required kit"
+echo "PASS: requires-closure gate blocks a commit-path sync onto a kit-less consumer (#624)"
+
+# (2) Required kit byte-current on the consumer → the gate passes and the
+#     PR opens (kit content is unchanged between the two hub commits, so the
+#     v1 seed matches the synced sha).
+remote2="$req_workdir/kitok.git"; seed2="$req_workdir/kitok-seed"
+req_setup_remote "$remote2" "$seed2"
+mkdir -p "$seed2/scripts/ci"
+printf 'check a v1\n' >"$seed2/scripts/ci/check_a"
+printf 'check b v1\n' >"$seed2/scripts/ci/check_b"
+req_push_seed "$remote2" "$seed2"
+set +e
+output=$(req_run reqgate2 "$remote2")
+set -e
+echo "$output" | grep -q "requires-closure gate" \
+  && fail "requires gate fired on a kit-current consumer: $output"
+[ -f "$REQ_CAPTURE/pr-title-reqgate2.txt" ] \
+  || fail "kit-current consumer did not get a PR: $output"
+echo "PASS: requires-closure gate passes a kit-current consumer and the PR opens (#624)"
+
+# (3) A required file the consumer skips via .sync-overrides.yml is a
+#     documented divergence, not a gate violation: check_b absent but
+#     override-skipped → PR opens.
+remote3="$req_workdir/kitovr.git"; seed3="$req_workdir/kitovr-seed"
+req_setup_remote "$remote3" "$seed3"
+mkdir -p "$seed3/scripts/ci"
+printf 'check a v1\n' >"$seed3/scripts/ci/check_a"
+cat >"$seed3/.sync-overrides.yml" <<'YAML'
+version: 1
+skip_paths:
+  - path: scripts/ci/check_b
+    reason: |
+      Consumer-local replacement; tracked for convergence in alpha#1.
+YAML
+req_push_seed "$remote3" "$seed3"
+set +e
+output=$(req_run reqgate3 "$remote3")
+set -e
+echo "$output" | grep -q "requires-closure gate" \
+  && fail "requires gate fired on an override-skipped required file: $output"
+[ -f "$REQ_CAPTURE/pr-title-reqgate3.txt" ] \
+  || fail "override-skipped consumer did not get a PR: $output"
+echo "PASS: requires-closure gate honors consumer overrides for required files (#624)"
+
 echo "test_sync_to_downstream: PASS"

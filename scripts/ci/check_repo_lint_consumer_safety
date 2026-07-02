@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# scripts/ci/check_repo_lint_consumer_safety — CI entry point for the #601
+# consumer-safety net (Codex P2 on #624: the net existed but nothing ran it).
+#
+# Wraps tests/test_repo_lint_consumer_safety.sh, which re-runs every
+# scripts/ci/check_* wrapper inside a consumer-SHAPED checkout (hub-only
+# files stripped) and fails if any wrapper errors instead of skipping or
+# passing — catching a hub-only check that would red a consumer BEFORE the
+# wave propagates it. Hub-only by nature (it needs the full hub tree to
+# build the consumer shape from), so it uses the standard nested
+# consumer-safety guard itself. Runtime is a few minutes; it runs in the
+# repo_lint job's check_* loop on the hub and SKIPs everywhere else.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_repo_lint_consumer_safety.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  # Consumer-safety guard (#601): repo_lint.yml is manifest-canonical, so
+  # consumers run this wrapper too — but the suite it wraps is hub-only
+  # (never propagated). scripts/sync-to-downstream.sh is the standard hub
+  # marker (intentionally NOT propagated; same disambiguator as
+  # check_sync_manifest). Consulted ONLY inside this missing-test branch:
+  # both absent → consumer checkout → SKIP; marker present → the hub lost
+  # the test (accidental delete/rename) → hard error. Hub marker loss can
+  # never silently disable this check — with the test present the wrapper
+  # runs it regardless of the marker.
+  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+    echo "check_repo_lint_consumer_safety: SKIP (consumer checkout: wrapped test + scripts/sync-to-downstream.sh both absent; hub-only consumer-safety net)"
+    exit 0
+  fi
+  echo "check_repo_lint_consumer_safety: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"

@@ -289,6 +289,16 @@ jobs:
       - name: check_sweep_unresolved_feedback
         run: ./scripts/ci/check_sweep_unresolved_feedback
 
+      - name: check_repo_lint_consumer_safety
+        # #601 consumer-safety net (Codex P2 on #624: it existed unwired).
+        # Re-runs every check_* wrapper inside a consumer-SHAPED checkout
+        # and fails if any errors instead of skipping/passing — catching a
+        # hub-only check that would red a consumer BEFORE a wave ships it.
+        # Hub-only (needs the full hub tree); SKIPs on consumers. The
+        # longest check in this job (a few minutes) — keep it late in the
+        # step list so cheap checks fail fast first.
+        run: ./scripts/ci/check_repo_lint_consumer_safety
+
       - name: check_disagreement_detector
         run: ./scripts/ci/check_disagreement_detector
 
