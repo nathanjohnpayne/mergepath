@@ -992,6 +992,28 @@ assert_rc_contains "locale-quoted synthesized gh pr merge fails closed (#611 r6)
   '$(echo $"gh pr merge") 1 --admin'
 assert_rc_contains "locale-quoted benign expansion stays allowed (#611 r6)" 0 "" \
   '$(echo $"hello") world'
+
+# --- #611 round 7: source-fed heredocs + IFS-dependent splices ------------
+# (P1) source / the dot builtin execute their input: a parse failure whose
+# gh evidence sits in a source-fed heredoc body must keep failing closed.
+assert_rc_contains "parse failure in source-fed heredoc with in-body gh fails closed (#611 r7)" 2 "tokenize" \
+  'source /dev/stdin <<EOF
+gh pr merge 1 "oops
+EOF'
+assert_rc_contains "parse failure in dot-builtin heredoc with in-body gh fails closed (#611 r7)" 2 "tokenize" \
+  '. /dev/stdin <<EOF
+gh pr merge 1 "oops
+EOF'
+# (P1) an IFS assignment re-defines word splitting for substitution output
+# (IFS=/ splits a synthesized gh-slash into a gh word) — static splicing is
+# disabled under ANY IFS touch, so the literal span fails closed as
+# unverifiable in command position.
+assert_rc_contains "IFS-modified synthesized write fails closed (#611 r7)" 2 "wrapper" \
+  'IFS=/; $(printf "gh/") pr merge 1'
+# Control: with DEFAULT IFS the same expansion is spliced faithfully — the
+# command word is gh-slash (not gh), which executes nothing gh-related.
+assert_rc_contains "default-IFS gh-slash expansion stays allowed (#611 r7)" 0 "" \
+  '$(printf "gh/") pr merge 1'
 # (P2) heredoc BODIES are data for the receiving command: a parse failure
 # whose only guarded-verb evidence sits inside a cat heredoc body must not
 # fail closed. A shell interpreter outside the bodies keeps full-text

@@ -153,9 +153,13 @@ auto_source_preflight() {
   # does on the cache-hit path.
   # shellcheck disable=SC1090
   . "$session_file"
+  # Whether the cache supplied a GitHub credential is decided by the CACHE
+  # FILE, not the post-source environment (#611 r7): OP_PREFLIGHT_*_PAT
+  # values inherited from an EARLIER run would otherwise masquerade as
+  # cache-supplied and suppress the restore after a PAT-less cache source.
   if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" \
-        && -z "${OP_PREFLIGHT_REVIEWER_PAT:-}" && -z "${OP_PREFLIGHT_AUTHOR_PAT:-}" \
-        && "$_ambient_github_token_set" -eq 1 ]]; then
+        && "$_ambient_github_token_set" -eq 1 ]] \
+     && ! grep -qE '^(export[[:space:]]+)?(OP_PREFLIGHT_REVIEWER_PAT|OP_PREFLIGHT_AUTHOR_PAT|GH_TOKEN|GITHUB_TOKEN)=' "$session_file"; then
     export GITHUB_TOKEN="$_ambient_github_token"
   fi
   if [[ "${OP_PREFLIGHT_QUIET:-0}" != "1" ]]; then

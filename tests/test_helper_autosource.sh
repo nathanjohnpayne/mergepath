@@ -263,6 +263,46 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Test 3e (#611 r7): STALE OP_PREFLIGHT_*_PAT vars inherited from an earlier
+# run must not masquerade as cache-supplied credentials — the restore
+# decision reads the cache FILE, so a PAT-less cache still restores the
+# ambient GITHUB_TOKEN even when stale PAT vars are in the environment.
+# ---------------------------------------------------------------------------
+test_lib_auto_source_restore_ignores_stale_pat_vars() {
+  (
+    local case_dir="$WORKDIR/lib3e"
+    mkdir -p "$case_dir"
+    chmod 700 "$case_dir"
+    cat > "$case_dir/op-preflight-claude.env" <<EOF
+OP_PREFLIGHT_CREATED_AT_EPOCH=$(date +%s)
+OP_PREFLIGHT_TTL_SECONDS=14400
+OP_PREFLIGHT_AGENT=claude
+OP_PREFLIGHT_MODE=deploy
+OP_PREFLIGHT_DONE=1
+EOF
+    chmod 600 "$case_dir/op-preflight-claude.env"
+    unset GH_TOKEN
+    export OP_PREFLIGHT_REVIEWER_PAT="stale-from-earlier-run"
+    export OP_PREFLIGHT_AUTHOR_PAT="stale-from-earlier-run"
+    export OP_PREFLIGHT_CACHE_DIR="$case_dir"
+    export MERGEPATH_AGENT=claude
+    export GITHUB_TOKEN="caller-ci-github-token"
+    # shellcheck source=../scripts/lib/preflight-helpers.sh
+    . "$LIB"
+    auto_source_preflight
+    if [ "${GITHUB_TOKEN:-}" != "caller-ci-github-token" ]; then
+      echo "stale PAT vars suppressed the ambient restore (got '${GITHUB_TOKEN:-}')" >&2
+      exit 1
+    fi
+  ) >"$WORKDIR/lib3e.out" 2>"$WORKDIR/lib3e.err" && local rc=0 || local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "test_lib_auto_source_restore_ignores_stale_pat_vars: rc=$rc stderr=$(cat "$WORKDIR/lib3e.err")"
+    return
+  fi
+  pass "test_lib_auto_source_restore_ignores_stale_pat_vars: restore decision reads the cache file, not stale env (#611 r7)"
+}
+
+# ---------------------------------------------------------------------------
 # Test 3c (#573): load_preflight_env_vars scrubs ambient GH_TOKEN /
 # GITHUB_TOKEN inside the sourcing subshells, so a stray ambient token cannot
 # leak into the resolved PATs. The cache derives its PATs from $GH_TOKEN /
@@ -463,6 +503,7 @@ test_lib_gh_token_passthrough
 test_lib_stale_cache_noop
 test_lib_auto_source_scrubs_ambient_github_token
 test_lib_auto_source_preserves_ambient_when_cache_has_no_pat
+test_lib_auto_source_restore_ignores_stale_pat_vars
 test_lib_load_env_vars_scrubs_ambient_token
 test_lib_require_token_reviewer
 test_lib_require_token_author

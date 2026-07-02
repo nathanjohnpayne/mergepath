@@ -585,9 +585,19 @@ def _is_literal_printf_echo(span):
         return False
     return bool(argv) and argv[0] in ("printf", "echo")
 
+# #611 round 7: an IFS assignment anywhere in the command re-defines how
+# bash word-splits unquoted substitution output (IFS=/ makes a synthesized
+# gh-slash split into a gh word), which the whitespace-based splicer cannot
+# model. When the raw command touches IFS, static expansion is disabled
+# entirely — literal spans then fail closed via the unexpandable sentinel
+# in command position and stay inert elsewhere. Set before flattening.
+_IFS_TOUCHED = False
+
 def _static_expand(span):
     # Return the literal expansion of a pure printf/echo span, or None when
     # the span is dynamic or the expansion is not splice-safe.
+    if _IFS_TOUCHED:
+        return None
     span, ok = _rewrite_ansi_c(span, None)
     if not ok:
         return None
@@ -1017,6 +1027,7 @@ def expand_wrappers(tokens, depth=0):
 
 try:
     cmd = sys.stdin.read()
+    _IFS_TOUCHED = bool(re.search(r"(^|[^A-Za-z0-9_])IFS=", cmd))
     cmd = flatten_command(cmd)
     for tok in expand_wrappers(shlex.split(cmd)):
         sys.stdout.buffer.write(tok.encode("utf-8", errors="replace") + b"\x00")
@@ -1057,7 +1068,10 @@ except ValueError as e:
         skip = 1
       }
     }')
-  if ! printf '%s\n' "$STRIPPED_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(sh|bash|dash|zsh|ksh|eval)([^A-Za-z0-9_]|$)'; then
+  # `source` and the `.` builtin execute their input too (#611 r7:
+  # `source /dev/stdin <<EOF` runs the body) — a standalone dot token is
+  # probed as start-or-space + dot + space.
+  if ! printf '%s\n' "$STRIPPED_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(sh|bash|dash|zsh|ksh|eval|source)([^A-Za-z0-9_]|$)|(^|[[:space:]])\.[[:space:]]'; then
     EVIDENCE_TEXT="$STRIPPED_TEXT"
   fi
   if ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(([^[:space:]]*/)?gh|pr|issue|create|merge|comment|review|edit)([^A-Za-z0-9_]|$)' \
