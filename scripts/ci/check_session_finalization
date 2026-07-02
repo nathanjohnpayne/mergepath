@@ -1,3 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
-bash tests/test_session_finalization_check.sh
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_session_finalization_check.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  # Consumer-safety guard (#601): repo_lint.yml is manifest-canonical,
+  # so consumers run this wrapper too — but the suite it wraps is
+  # hub-only (not manifest-propagated; live consumers do not carry it).
+  # scripts/sync-to-downstream.sh is the standard hub marker
+  # (intentionally NOT propagated; same disambiguator as
+  # check_sync_manifest): both absent → consumer checkout → SKIP.
+  # Marker present → hub lost the test (accidental delete/rename) →
+  # hard error, preserving the pre-#601 fail-closed hub behavior.
+  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+    echo "check_session_finalization: SKIP (consumer checkout: tests/test_session_finalization_check.sh + scripts/sync-to-downstream.sh both absent)"
+    exit 0
+  fi
+  echo "check_session_finalization: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"

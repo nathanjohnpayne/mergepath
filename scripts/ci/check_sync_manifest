@@ -734,6 +734,73 @@ if [ -n "$requires_rows" ]; then
   done <<< "$requires_rows"
 fi
 
+# 8. repo_lint.yml wiring-propagation contract (#601) — mergepath-only.
+#
+# The fleet CI workflow .github/workflows/repo_lint.yml MUST stay a
+# canonical, consumers-all manifest entry, and the scripts/ci/ kit MUST
+# declare it in requires: (bidirectional coupling: the kit's checks are
+# only enforced where the workflow that wires them travels, and the
+# workflow's steps only run where the kit travels). Without this
+# assertion a future manifest edit could silently drop the entry and
+# reopen the pre-#601 skew (consumers stuck on a bootstrap-era
+# repo_lint.yml while the kit keeps growing).
+#
+# Scoped OFF for fixture-driven invocations (MERGEPATH_MANIFEST_PATH
+# set) so the synthetic manifests in tests/test_check_sync_manifest.sh
+# stay valid; fixture cases that exercise THIS assertion opt back in
+# via MERGEPATH_ASSERT_REPO_LINT=1.
+if [ -z "${MERGEPATH_MANIFEST_PATH:-}" ] || [ "${MERGEPATH_ASSERT_REPO_LINT:-0}" = "1" ]; then
+  RL_PATH=".github/workflows/repo_lint.yml"
+  if ! rl_rows=$(yq -r '
+    .paths[]
+    | select(.path == ".github/workflows/repo_lint.yml")
+    | (.type // "null") + "|" + (.consumers | (select(tag == "!!str") // (join(","))) | tostring)
+  ' "$MANIFEST" 2>&1); then
+    echo "FAIL: could not extract the repo_lint.yml manifest entry (yq error):"
+    printf '%s\n' "$rl_rows"
+    echo "check_sync_manifest: FAIL"
+    exit 1
+  fi
+  if [ -z "$rl_rows" ]; then
+    echo "FAIL: manifest has no entry for '$RL_PATH' — the fleet CI workflow must be declared"
+    echo "      type: canonical, consumers: all so the scripts/ci/ kit wiring contract is"
+    echo "      enforced on every consumer, not just mergepath (#601)."
+    FAILED=1
+  else
+    # Iterate (a duplicate entry for the same path would be its own
+    # manifest smell, but each declared entry must satisfy the contract).
+    while IFS='|' read -r rl_type rl_consumers; do
+      [ -z "$rl_type$rl_consumers" ] && continue
+      if [ "$rl_type" != "canonical" ]; then
+        echo "FAIL: '$RL_PATH' manifest entry must be type: canonical (got '$rl_type') — #601"
+        FAILED=1
+      fi
+      if [ "$rl_consumers" != "all" ]; then
+        echo "FAIL: '$RL_PATH' manifest entry must be consumers: all (got '$rl_consumers') — #601"
+        FAILED=1
+      fi
+    done <<< "$rl_rows"
+  fi
+  # The scripts/ci/ kit entry must require the workflow back.
+  if ! kit_rl_count=$(yq -r '
+    [.paths[]
+     | select(.type == "kit" and (.path == "scripts/ci/" or .path == "scripts/ci"))
+     | (.requires // [])[]
+     | select(. == ".github/workflows/repo_lint.yml")]
+    | length
+  ' "$MANIFEST" 2>&1); then
+    echo "FAIL: could not probe the scripts/ci/ kit requires: for repo_lint.yml (yq error):"
+    printf '%s\n' "$kit_rl_count"
+    echo "check_sync_manifest: FAIL"
+    exit 1
+  fi
+  if [ "$kit_rl_count" = "0" ]; then
+    echo "FAIL: the scripts/ci/ kit entry's requires: must include '$RL_PATH' — the kit's"
+    echo "      checks are only enforced where the workflow that wires them travels (#601)."
+    FAILED=1
+  fi
+fi
+
 if [ "$FAILED" -eq 1 ]; then
   echo "check_sync_manifest: FAIL"
   exit 1

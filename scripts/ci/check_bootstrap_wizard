@@ -11,6 +11,16 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_bootstrap_wizard.sh"
 
+# Consumer-safety guard (#601): repo_lint.yml is manifest-canonical, so
+# consumers run this wrapper too — but the bootstrap suite it wraps is
+# hub-only (never propagated). scripts/sync-to-downstream.sh is the
+# standard hub marker (intentionally NOT propagated; same disambiguator
+# as check_sync_manifest): absent → consumer checkout → SKIP.
+if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  echo "check_bootstrap_wizard: SKIP (consumer checkout: scripts/sync-to-downstream.sh absent; hub-only bootstrap suite)"
+  exit 0
+fi
+
 if [ ! -f "$TEST_SCRIPT" ]; then
   # Missing test script is a hard error (silent skip would let an
   # accidental delete/rename disable this check). Matches the

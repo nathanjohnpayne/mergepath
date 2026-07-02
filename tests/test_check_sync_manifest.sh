@@ -690,6 +690,134 @@ else
   fail "Case 20 unexpected (rc=$rc): $out"
 fi
 
+# --- repo_lint.yml wiring-propagation contract (#601) ----------------
+#
+# The mergepath-only assertion (step 8 in check_sync_manifest) is OFF
+# for fixture-driven runs (all cases above) and opted back in here via
+# MERGEPATH_ASSERT_REPO_LINT=1. Same fixture helper, extra env var.
+run_with_fixture_assert_rl() {
+  local manifest_content="$1" paths="$2"
+  local fix
+  fix="$(mktemp -d "$WORKDIR/fix.XXXXXX")"
+  printf '%s' "$manifest_content" > "$fix/manifest.yml"
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    case "$p" in
+      */) mkdir -p "$fix/$p" ;;
+      *)  mkdir -p "$(dirname "$fix/$p")"; : > "$fix/$p" ;;
+    esac
+  done <<< "$paths"
+  MERGEPATH_MANIFEST_PATH="$fix/manifest.yml" MERGEPATH_REPO_ROOT="$fix" \
+    MERGEPATH_ASSERT_REPO_LINT=1 bash "$CHECK" 2>&1
+}
+
+# Case 21: contract satisfied — repo_lint.yml canonical/all entry +
+# scripts/ci/ kit requires: it (and it requires the kit back) → PASS.
+MANIFEST_RL_OK="$MIN_HEADER
+  - path: .github/workflows/repo_lint.yml
+    type: canonical
+    consumers: all
+    requires:
+      - \"scripts/ci/\"
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+    requires:
+      - \".github/workflows/repo_lint.yml\"
+"
+PATHS_RL_OK=".github/workflows/repo_lint.yml
+scripts/ci/"
+set +e
+out=$(run_with_fixture_assert_rl "$MANIFEST_RL_OK" "$PATHS_RL_OK"); rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+  pass "Case 21: repo_lint.yml wiring contract satisfied passes (#601)"
+else
+  fail "Case 21 unexpected (rc=$rc): $out"
+fi
+
+# Case 22: manifest missing the repo_lint.yml canonical entry entirely
+# (and the kit requires:) → FAIL with the #601 diagnostics.
+MANIFEST_RL_MISSING="$MIN_HEADER
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+"
+PATHS_RL_MISSING="scripts/ci/"
+set +e
+out=$(run_with_fixture_assert_rl "$MANIFEST_RL_MISSING" "$PATHS_RL_MISSING"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "manifest has no entry for '.github/workflows/repo_lint.yml'" && \
+   echo "$out" | grep -q "#601"; then
+  pass "Case 22: missing repo_lint.yml canonical entry fails closed citing #601"
+else
+  fail "Case 22 unexpected (rc=$rc): $out"
+fi
+
+# Case 23: repo_lint.yml entry present (canonical, all) but the
+# scripts/ci/ kit requires: does NOT include it → FAIL naming the kit
+# requires gap.
+MANIFEST_RL_NO_KIT_REQ="$MIN_HEADER
+  - path: .github/workflows/repo_lint.yml
+    type: canonical
+    consumers: all
+    requires:
+      - \"scripts/ci/\"
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+"
+set +e
+out=$(run_with_fixture_assert_rl "$MANIFEST_RL_NO_KIT_REQ" "$PATHS_RL_OK"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "kit entry's requires: must include '.github/workflows/repo_lint.yml'" && \
+   echo "$out" | grep -q "#601"; then
+  pass "Case 23: kit requires: missing repo_lint.yml fails closed citing #601"
+else
+  fail "Case 23 unexpected (rc=$rc): $out"
+fi
+
+# Case 24: repo_lint.yml entry present but with narrowed consumers →
+# FAIL (must be consumers: all so the wiring contract is fleet-wide).
+MANIFEST_RL_NARROW="$MIN_HEADER
+  - path: .github/workflows/repo_lint.yml
+    type: canonical
+    consumers:
+      - example
+    requires:
+      - \"scripts/ci/\"
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+    requires:
+      - \".github/workflows/repo_lint.yml\"
+"
+set +e
+out=$(run_with_fixture_assert_rl "$MANIFEST_RL_NARROW" "$PATHS_RL_OK"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "must be consumers: all" && \
+   echo "$out" | grep -q "#601"; then
+  pass "Case 24: narrowed repo_lint.yml consumers fails closed citing #601"
+else
+  fail "Case 24 unexpected (rc=$rc): $out"
+fi
+
+# Case 25: assertion stays OFF for fixture runs that do not opt in —
+# the same entry-less manifest as Case 22 passes without
+# MERGEPATH_ASSERT_REPO_LINT=1 (regression guard for the scoping, so
+# the earlier fixture cases stay valid).
+set +e
+out=$(run_with_fixture "$MANIFEST_RL_MISSING" "$PATHS_RL_MISSING"); rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+  pass "Case 25: #601 assertion scoped off for non-opted-in fixture runs"
+else
+  fail "Case 25 unexpected (rc=$rc): $out"
+fi
+
 echo
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -gt 0 ]; then

@@ -1,3 +1,22 @@
+# repo_lint.yml — canonical fleet CI workflow (manifest-propagated, #601).
+#
+# This file is a `canonical` entry in .mergepath-sync.yml (consumers: all):
+# every consumer receives it byte-for-byte on each sync wave. Editing rules:
+#
+#   - A new scripts/ci/check_* MUST add its `run: ./scripts/ci/check_X` step
+#     here in the SAME PR that adds the script. check_ci_scripts_wired
+#     enforces wired-or-exempt on every repo in the fleet, so the check and
+#     its wiring travel to consumers atomically in the same sync PR.
+#   - Consumer-local wiring (consumer-only steps, consumer-local
+#     WIRED-EXEMPT lines) belongs in the OPTIONAL, never-propagated
+#     .github/workflows/repo_lint_local.yml annex — NOT here. Local edits to
+#     this file are drift and get overwritten by the next sync wave.
+#   - Every step must be consumer-safe: SKIP-guard hub-only checks (the
+#     scripts/sync-to-downstream.sh marker idiom — see check_sync_manifest),
+#     depend only on manifest-propagated files, or soft-pass when the
+#     backing script is absent (the #590-style
+#     `[ -f scripts/<gate>.sh ] || exit 0` one-liner).
+
 name: repo-lint
 
 on: [push, pull_request]

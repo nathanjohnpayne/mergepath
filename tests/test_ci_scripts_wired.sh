@@ -67,6 +67,13 @@ mk_workflow() {
   printf '%s\n' "$body" >"$repo/.github/workflows/repo_lint.yml"
 }
 
+# Write the consumer-local annex (#601) from a heredoc-passed body.
+mk_annex() {
+  local repo="$1"
+  local body="$2"
+  printf '%s\n' "$body" >"$repo/.github/workflows/repo_lint_local.yml"
+}
+
 run_check() {
   local repo="$1"
   ( cd "$repo" && bash "$repo/scripts/ci/check_ci_scripts_wired" )
@@ -257,6 +264,153 @@ if [[ $rc -eq 0 ]]; then
   pass "non-executable check file: WIRED-EXEMPT honored as escape hatch"
 else
   fail "non-executable + WIRED-EXEMPT: expected exit 0, got $rc; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 6 (#601): consumer-local annex — a check wired ONLY in
+# .github/workflows/repo_lint_local.yml counts as wired. This is the
+# consumer path: repo_lint.yml is manifest-canonical, so a consumer's
+# own check_* is wired in the never-propagated annex instead.
+# ---------------------------------------------------------------------------
+repo="$(make_scratch_repo case6_annex_wired)"
+mk_check "$repo" check_foo
+mk_check "$repo" check_consumer_local
+mk_workflow "$repo" "name: t
+jobs:
+  lint:
+    steps:
+      - name: check_ci_scripts_wired
+        run: ./scripts/ci/check_ci_scripts_wired
+      - name: check_foo
+        run: ./scripts/ci/check_foo
+"
+mk_annex "$repo" "name: t-local
+jobs:
+  lint-local:
+    steps:
+      - name: check_consumer_local
+        run: ./scripts/ci/check_consumer_local
+"
+set +e
+out=$(run_check "$repo" 2>&1)
+rc=$?
+set -e
+if [[ $rc -eq 0 ]]; then
+  pass "annex-only wiring: check wired only in repo_lint_local.yml counts as wired"
+else
+  fail "annex-only wiring: expected exit 0, got $rc; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 7 (#601): annex present but the check is wired in NEITHER file →
+# still fails closed and names the check. The annex must not blanket-
+# satisfy the guard just by existing.
+# ---------------------------------------------------------------------------
+repo="$(make_scratch_repo case7_annex_unwired)"
+mk_check "$repo" check_foo
+mk_check "$repo" check_nowhere
+mk_workflow "$repo" "name: t
+jobs:
+  lint:
+    steps:
+      - name: check_ci_scripts_wired
+        run: ./scripts/ci/check_ci_scripts_wired
+      - name: check_foo
+        run: ./scripts/ci/check_foo
+"
+mk_annex "$repo" "name: t-local
+jobs:
+  lint-local:
+    steps:
+      - name: something_else
+        run: echo unrelated
+"
+set +e
+out=$(run_check "$repo" 2>&1)
+rc=$?
+set -e
+if [[ $rc -ne 0 ]] && echo "$out" | grep -q "check_nowhere"; then
+  pass "annex present, unwired in both: fails closed and names check_nowhere"
+else
+  fail "annex present, unwired in both: expected nonzero exit naming check_nowhere, got rc=$rc; output: $out"
+fi
+
+# Comment-only mention in the ANNEX must not count as wired either
+# (same trap as Case 4, annex edition).
+mk_annex "$repo" "name: t-local
+# the annex talks about ./scripts/ci/check_nowhere in a comment only
+jobs:
+  lint-local:
+    steps:
+      - name: something_else
+        run: echo unrelated
+"
+set +e
+out=$(run_check "$repo" 2>&1)
+rc=$?
+set -e
+if [[ $rc -ne 0 ]] && echo "$out" | grep -q "check_nowhere"; then
+  pass "annex comment-only mention: NOT counted as wired"
+else
+  fail "annex comment-only mention: expected nonzero exit naming check_nowhere, got rc=$rc; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 8 (#601): WIRED-EXEMPT honored from the annex — a consumer can
+# exempt a consumer-local check without touching the canonical file.
+# ---------------------------------------------------------------------------
+repo="$(make_scratch_repo case8_annex_exempt)"
+mk_check "$repo" check_foo
+mk_check "$repo" check_local_pending
+mk_workflow "$repo" "name: t
+jobs:
+  lint:
+    steps:
+      - name: check_ci_scripts_wired
+        run: ./scripts/ci/check_ci_scripts_wired
+      - name: check_foo
+        run: ./scripts/ci/check_foo
+"
+mk_annex "$repo" "name: t-local
+# WIRED-EXEMPT: check_local_pending — consumer-local, intentionally pending
+jobs: {}
+"
+set +e
+out=$(run_check "$repo" 2>&1)
+rc=$?
+set -e
+if [[ $rc -eq 0 ]]; then
+  pass "annex WIRED-EXEMPT: exemption honored from repo_lint_local.yml"
+else
+  fail "annex WIRED-EXEMPT: expected exit 0, got $rc; output: $out"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 9 (#601): annex ABSENT → behavior identical to the single-file
+# scan (regression guard for the pre-#601 contract). Identical fixture
+# to Case 2 (one missing check), no annex on disk: same failure, same
+# diagnostic.
+# ---------------------------------------------------------------------------
+repo="$(make_scratch_repo case9_no_annex_baseline)"
+mk_check "$repo" check_foo
+mk_check "$repo" check_bar
+mk_workflow "$repo" "name: t
+jobs:
+  lint:
+    steps:
+      - name: check_ci_scripts_wired
+        run: ./scripts/ci/check_ci_scripts_wired
+      - name: check_foo
+        run: ./scripts/ci/check_foo
+"
+set +e
+out=$(run_check "$repo" 2>&1)
+rc=$?
+set -e
+if [[ $rc -ne 0 ]] && echo "$out" | grep -q "check_bar" && [[ ! -f "$repo/.github/workflows/repo_lint_local.yml" ]]; then
+  pass "annex absent: single-file behavior preserved (fails closed, names check_bar)"
+else
+  fail "annex absent: expected nonzero exit naming check_bar with no annex on disk, got rc=$rc; output: $out"
 fi
 
 # ---------------------------------------------------------------------------
