@@ -827,9 +827,13 @@ def flatten_command(cmd, depth=0):
                 cur_word = ""
                 line = cmd[line_start:i]
                 i += 1
+                # #611 r9: bash unescapes command words before execution, so
+                # the interpreter probe runs on backslash- and quote-stripped
+                # text (b-backslash-ash executes bash).
+                line_n = line.replace("\\", "").replace(_SQ, "").replace(_DQ, "")
                 if pending_heredocs and not re.search(
                         r"(^|[^A-Za-z0-9_])(sh|bash|dash|zsh|ksh|eval|source)"
-                        r"([^A-Za-z0-9_]|$)|(^|[\s])\.([\s])", line):
+                        r"([^A-Za-z0-9_]|$)|(^|[\s])\.([\s])", line_n):
                     for _tag, _allow_tabs in pending_heredocs:
                         while i < n:
                             nl = cmd.find("\n", i)
@@ -1101,12 +1105,15 @@ except ValueError as e:
   # pr/issue noun, no guarded verb) exits 0 exactly like the evidence-free
   # fast path always did. ANY evidence keeps the fail-closed block below.
   #
-  # #611 round 6 (Codex P2): heredoc BODIES are data for the receiving
-  # command (cat/tee templates legitimately contain shell-looking text and
-  # guarded verbs), so they are excluded from the evidence probe — UNLESS
-  # a shell interpreter appears outside the bodies (bash <<EOF executes
-  # its body; keep full-text evidence there, matching the pre-broadening
-  # behavior where a literal in-body gh blocked the parse failure).
+  # #611 round 6 (Codex P2): QUOTED-tag heredoc BODIES are data for the
+  # receiving command (cat/tee templates legitimately contain shell-looking
+  # text and guarded verbs), so they are excluded from the evidence probe —
+  # UNLESS a shell interpreter appears outside the bodies (bash <<EOF
+  # executes its body; keep full-text evidence there, matching the
+  # pre-broadening behavior where a literal in-body gh blocked the parse
+  # failure). #611 round 9: UNQUOTED-tag bodies are NOT stripped — bash
+  # expands their command substitutions while building the heredoc, so an
+  # in-body $(gh ...) executes and its evidence must keep failing closed.
   EVIDENCE_TEXT="$COMMAND"
   STRIPPED_TEXT=$(printf '%s\n' "$COMMAND" | awk '
     skip == 1 {
@@ -1117,9 +1124,9 @@ except ValueError as e:
     }
     {
       print
-      if (match($0, /<<-?[[:space:]]*["'\'']?[A-Za-z_][A-Za-z0-9_]*/)) {
+      if (match($0, /<<-?[[:space:]]*["'\''][A-Za-z_][A-Za-z0-9_]*/)) {
         t = substr($0, RSTART, RLENGTH)
-        sub(/<<-?[[:space:]]*["'\'']?/, "", t)
+        sub(/<<-?[[:space:]]*["'\'']/, "", t)
         tag = t
         skip = 1
       }
@@ -1565,6 +1572,20 @@ for i in "${!TOKENS[@]}"; do
   fi
 
   case "$tok" in
+    [A-Za-z_]*=)
+      # Bare assignment (#611 r9): a flattened X=$(...) leaves X= followed
+      # by a PLACEHOLDER that is really the assignment VALUE — consume it
+      # and stay in command position, so a following spliced gh write is
+      # scanned as the command (FOO=$(date) $(printf gh) pr merge). Any
+      # OTHER next token means a genuinely EMPTY assignment (X= cmd) whose
+      # next token IS the command — do not consume it.
+      case "${TOKENS[$((i+1))]:-}" in
+        __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+          SCAN_SKIP_PREFIX_VALUE=1
+          ;;
+      esac
+      continue
+      ;;
     [A-Za-z_]*=*)
       continue
       ;;
@@ -2040,6 +2061,22 @@ for i in "${!TOKENS[@]}"; do
   fi
 
   case "$tok" in
+    [A-Za-z_]*=)
+      # Bare assignment (#611 r9): a flattened X=$(...) leaves X= followed
+      # by a PLACEHOLDER that is really the assignment VALUE — consume it
+      # and stay in command position, so a following spliced gh write is
+      # scanned as the command (FOO=$(date) $(printf gh) pr merge ran gh
+      # unguarded). Any OTHER next token means a genuinely EMPTY assignment
+      # (X= cmd, e.g. the identity-override wrapper forms) whose next token
+      # IS the command — do not consume it.
+      case "${TOKENS[$((i+1))]:-}" in
+        __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+          SKIP_PREFIX_VALUE=1
+          PENDING_PREFIX_FLAG=""
+          ;;
+      esac
+      continue
+      ;;
     [A-Za-z_]*=*)
       # Env assignment. Stay in command position.
       continue

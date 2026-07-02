@@ -948,6 +948,29 @@ assert_rc_contains "parse failure with no guarded evidence stays allowed (#611 r
   '$(date) "oops'
 assert_rc_contains "parse failure WITH gh evidence still fails closed (#611 r4)" 2 "tokenize" \
   '$(date) "oops gh pr merge 1'
+
+# --- #611 round 9: assignment prefixes, escaped shells, unquoted bodies ---
+# (P1) a bare-assignment token consumes its VALUE in every walk: the
+# flattened FOO=$(date) leaves FOO= + placeholder, and the following
+# spliced gh write is the real command, not the placeholder-as-command.
+assert_rc_contains "assignment-substitution prefix before synthesized write fails closed (#611 r9)" 2 "wrapper" \
+  'FOO=$(date) $(printf gh) pr merge 1'
+assert_rc_contains "assignment-substitution prefix with benign command stays allowed (#611 r9)" 0 "" \
+  'FOO=$(date) $(printf hello) world'
+# (P1) bash unescapes command words: an escape-spelled shell name feeding a
+# quoted-tag heredoc still executes the body as a script.
+assert_rc_contains "escape-spelled bash feeding quoted heredoc fails closed (#611 r9)" 2 "wrapper" \
+  'b\ash <<'"'"'EOF'"'"'
+$(printf "\147\150\40\160\162") merge 1
+EOF'
+# (P1) UNQUOTED-tag heredoc bodies expand their substitutions while the
+# heredoc is built, so in-body gh evidence must keep failing closed on a
+# parse failure (only QUOTED-tag bodies are inert data).
+assert_rc_contains "parse failure with gh in an unquoted heredoc body fails closed (#611 r9)" 2 "tokenize" \
+  'cat <<EOF
+"unmatched
+$(gh pr merge 1)
+EOF'
 assert_rc_contains "parse failure with octal gh spelling still fails closed (#611 r4)" 2 "tokenize" \
   '$(printf "\147\150") pr merge 1 "oops'
 
@@ -1033,14 +1056,15 @@ assert_rc_contains "bash-fed quoted-heredoc synthesized write fails closed (#611
   'bash <<'"'"'EOF'"'"'
 $(printf "\147\150\40\160\162") merge 1
 EOF'
-# (P2) heredoc BODIES are data for the receiving command: a parse failure
-# whose only guarded-verb evidence sits inside a cat heredoc body must not
-# fail closed. A shell interpreter outside the bodies keeps full-text
-# evidence (bash <<EOF executes its body), and command-line evidence
-# outside the body still blocks.
-assert_rc_contains "parse failure with evidence only in a cat heredoc body stays allowed (#611 r6)" 0 "" \
-  'cat <<EOF
-$(date) merge "oops
+# (P2) QUOTED-tag heredoc BODIES are data for the receiving command: a
+# parse failure whose only guarded-verb evidence sits inside a quoted cat
+# heredoc body must not fail closed (#611 r9 narrowed this to quoted tags —
+# unquoted bodies expand their substitutions). A shell interpreter outside
+# the bodies keeps full-text evidence (bash <<EOF executes its body), and
+# command-line evidence outside the body still blocks.
+assert_rc_contains "parse failure with evidence only in a quoted cat heredoc body stays allowed (#611 r6)" 0 "" \
+  'cat <<'"'"'EOF'"'"' "oops
+$(date) merge
 EOF'
 assert_rc_contains "parse failure in a bash heredoc with in-body gh still fails closed (#611 r6)" 2 "tokenize" \
   'bash <<EOF

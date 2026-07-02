@@ -153,6 +153,18 @@ auto_source_preflight() {
   # does on the cache-hit path.
   # shellcheck disable=SC1090
   . "$session_file"
+  # #611 r9: REPLACE the cleared ambient token before leaving. The cache
+  # exports OP_PREFLIGHT_*_PAT variables, not GH_TOKEN, so a caller that had
+  # only an ambient GITHUB_TOKEN would otherwise end up with NO usable
+  # credential for bare gh reads after the scrub. When the cache FILE
+  # supplied a reviewer PAT (file-decided, same principle as the restore
+  # below — a stale env PAT from an earlier run does not count), export it
+  # as GH_TOKEN — the cache credential wins, which is exactly the shadowing
+  # outcome the #573 scrub exists to guarantee.
+  if [[ -z "${GH_TOKEN:-}" && -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]] \
+     && grep -qE '^(export[[:space:]]+)?OP_PREFLIGHT_REVIEWER_PAT=' "$session_file"; then
+    export GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT"
+  fi
   # Whether the cache supplied a GitHub credential is decided by the CACHE
   # FILE, not the post-source environment (#611 r7): OP_PREFLIGHT_*_PAT
   # values inherited from an EARLIER run would otherwise masquerade as
