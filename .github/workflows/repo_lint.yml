@@ -197,18 +197,23 @@ jobs:
         # #572, parses the sync manifest and hard-fails without yq —
         # fail-closed by design, so this install MUST precede it).
         # Ordered before the FIRST yq-dependent check; keep it ahead of
-        # check_resolve_pr_threads if steps are reshuffled. Pin a recent
-        # v4 release; bumped opportunistically. The official
-        # ubuntu-latest runner ships yq 4.x preinstalled today, but
-        # pinning makes the checks resilient to runner image changes.
+        # check_resolve_pr_threads if steps are reshuffled.
+        #
+        # Single source for the version pin: scripts/lib/ensure-yq.sh
+        # (#616), which check_resolve_pr_threads also invokes (CI-only)
+        # so it stays self-sufficient when a consumer's repo_lint.yml
+        # lags the manifest-synced scripts/ci kit (#601 skew window).
+        # The reverse skew (this workflow arriving before the lib) falls
+        # back to the runner image's preinstalled yq 4.x rather than
+        # duplicating the pin inline.
         run: |
-          if command -v yq >/dev/null 2>&1 && yq --version 2>&1 | grep -q "mikefarah/yq"; then
-            echo "yq already present: $(yq --version)"
+          if [ -f scripts/lib/ensure-yq.sh ]; then
+            bash scripts/lib/ensure-yq.sh
+          elif command -v yq >/dev/null 2>&1; then
+            echo "scripts/lib/ensure-yq.sh not synced yet (#601 skew) — using preinstalled $(yq --version)"
           else
-            sudo wget -q -O /usr/local/bin/yq \
-              https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
-            sudo chmod +x /usr/local/bin/yq
-            yq --version
+            echo "FAIL: scripts/lib/ensure-yq.sh is missing and no yq is on PATH" >&2
+            exit 1
           fi
 
       - name: check_resolve_pr_threads

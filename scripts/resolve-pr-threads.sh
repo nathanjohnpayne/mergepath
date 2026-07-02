@@ -115,7 +115,24 @@
 #                           consumer's CURRENT content byte-matches the
 #                           canonical/rendered source, the upstream state
 #                           has provably propagated and the thread is
-#                           handled. Per thread anchored at path P:
+#                           handled. Routing is decided by the PATH ALONE
+#                           (derive_routing_class): a previously recorded
+#                           [mergepath-resolve: deferred-to-followup] (or
+#                           other) marker from an earlier deferral pass
+#                           never masks the manifest check — resolving
+#                           exactly those previously-deferred threads once
+#                           propagation lands is this mode's main use case
+#                           (#616). A routed thread with demonstrable
+#                           ACTION evidence (the --resolve-actioned gate:
+#                           an agent fix commit touching the anchored file
+#                           after the latest re-raise, or a substantive
+#                           rebuttal) is resolved under its truthful
+#                           addressed-elsewhere / rebuttal-recorded tag
+#                           instead, with an INFO line (mirrors the #575
+#                           auto-upgrade); the byte-compare is skipped for
+#                           these since the action evidence is the
+#                           resolution evidence. Per non-actioned thread
+#                           anchored at path P:
 #                           - P matches a canonical/kit entry in mergepath's
 #                             .mergepath-sync.yml → byte-compare the
 #                             consumer's CURRENT content at P (gh contents
@@ -283,7 +300,10 @@ daily rollup / weekly sweep as the disposition of record):
                         canonical source (or the re-rendered template
                         with the consumer's facts); tags
                         verified-propagation. Drift or ANY verification
-                        failure skips fail-closed.
+                        failure skips fail-closed. Routing ignores
+                        previously recorded deferral markers (#616), and a
+                        demonstrably-actioned thread is tagged with its
+                        truthful actioned class instead (#575 upgrade).
   --dry-run             With any resolve mode, print would-resolve /
                         would-skip per thread without mutating.
   --rationale <text>    With --auto-resolve-bots, free-form rationale
@@ -1437,6 +1457,37 @@ manifest_templated_source_for_dest() {
   return 1
 }
 
+# derive_routing_class <thread_json> — ROUTING-ONLY classification for
+# --resolve-verified-propagation (#616, Codex finding 3509734391).
+# Pure PATH predicate: emits `canonical-coverage` when the anchored path
+# is a manifest canonical/kit entry, `templated-render` when it is a
+# templated entry's dest for this consumer, `not-routed` otherwise.
+#
+# Deliberately IGNORES recorded [mergepath-resolve: ...] markers, unlike
+# derive_tag_class's default TAG ladder (whose step 0 honors a surface
+# marker BEFORE the path checks). The mode's target population is exactly
+# the previously-DEFERRED routing threads (the #562 backlog): a sync
+# finding tagged [mergepath-resolve: deferred-to-followup] on an earlier
+# deferral pass would, under the TAG ladder, classify as
+# deferred-to-followup forever and be skipped as "not propagation-routed"
+# even after the consumer content byte-matches — defeating the mode's
+# main use case. Routing is a property of the PATH, not of the thread's
+# reply history; the byte-compare (or the actioned-evidence upgrade in
+# the mode gate) still decides the actual resolve.
+derive_routing_class() {
+  local thread_path
+  thread_path=$(printf '%s' "$1" | jq -r '.path // ""')
+  if path_matches_manifest "$thread_path"; then
+    echo "canonical-coverage"
+    return
+  fi
+  if path_matches_templated_dest "$thread_path"; then
+    echo "templated-render"
+    return
+  fi
+  echo "not-routed"
+}
+
 # verify_propagation_content <class> <path> — the #572 byte-compare.
 # stdout: a one-line detail message (the tag rationale on success, the
 # skip reason otherwise). Exit status is the verdict:
@@ -1473,9 +1524,11 @@ verify_propagation_content() {
   fi
 
   if [ "$vp_class" = "canonical-coverage" ]; then
-    # Re-check manifest membership: the class can also arrive from a
-    # recorded marker, and the byte-compare source must be a real
-    # canonical/kit entry in THIS manifest.
+    # Re-check manifest membership. The #616 mode gate derives the class
+    # from this same predicate (derive_routing_class), so this is
+    # belt-and-braces for any future caller whose class arrives another
+    # way (e.g. a recorded marker): the byte-compare source must be a
+    # real canonical/kit entry in THIS manifest.
     if ! path_matches_manifest "$vp_path"; then
       rm -f "$consumer_tmp"
       echo "no canonical/kit entry in .mergepath-sync.yml covers $vp_path"
@@ -2145,52 +2198,76 @@ while IFS= read -r thread; do
     fetch_manifest_templated_dests
     fetch_consumer_default_branch || true
     manifest_consumer_name_for_repo || true
-    # Routing classification via the standard (routing-first) ladder: only
-    # canonical-coverage / templated-render threads are this mode's
-    # population. Surface-class threads (nitpick-noted, deferred) and
-    # actioned-class threads are never touched here — they have their own
-    # modes.
-    thread_class=$(derive_tag_class "$thread")
-    thread_class_computed=true
+    # Routing classification is a PURE PATH predicate (#616 finding
+    # 3509734391): derive_routing_class checks manifest membership /
+    # templated dests and IGNORES recorded surface markers, so a
+    # previously-deferred [mergepath-resolve: deferred-to-followup] tag on
+    # a sync finding never masks the routing check — resolving exactly
+    # those previously-deferred canonical findings once propagation lands
+    # IS this mode's main use case. Only canonical-coverage /
+    # templated-render paths are this mode's population; everything else
+    # skips here (surface threads on non-routed paths included).
+    thread_class=$(derive_routing_class "$thread")
     case "$thread_class" in
       canonical-coverage|templated-render) : ;;
       *)
-        echo "  SKIP (class $thread_class — not propagation-routed): [$AUTHOR] $PATH_"
+        echo "  SKIP (not propagation-routed): [$AUTHOR] $PATH_"
         echo "    $EXCERPT"
-        echo "    --resolve-verified-propagation handles only canonical-coverage /"
-        echo "    templated-render threads. Use --resolve-actioned for fixed or"
-        echo "    rebutted feedback, --auto-resolve-bots for an explicit deferral."
+        echo "    --resolve-verified-propagation handles only threads anchored on a"
+        echo "    manifest canonical/kit path or a templated dest for this consumer."
+        echo "    Use --resolve-actioned for fixed or rebutted feedback,"
+        echo "    --auto-resolve-bots for an explicit deferral."
         SKIPPED_NOT_PROPAGATION=$((SKIPPED_NOT_PROPAGATION + 1))
         continue ;;
     esac
-    vp_rc=0
-    vp_msg=$(verify_propagation_content "$thread_class" "$PATH_") || vp_rc=$?
-    if [ "$vp_rc" -eq 1 ]; then
-      echo "  SKIP (propagation NOT verified — content drift): [$AUTHOR] $PATH_"
-      echo "    $vp_msg"
-      echo "    Left unresolved: the byte-compare is the resolution evidence and it"
-      echo "    did not match. Propagate the upstream fix (or fix it upstream), then"
-      echo "    retry."
-      SKIPPED_DRIFT=$((SKIPPED_DRIFT + 1))
-      continue
-    elif [ "$vp_rc" -ne 0 ]; then
-      echo "  SKIP (propagation verification failed — failing closed): [$AUTHOR] $PATH_"
-      echo "    $vp_msg"
-      echo "    Left unresolved: a verification that cannot run never resolves."
-      SKIPPED_VERIFY_ERROR=$((SKIPPED_VERIFY_ERROR + 1))
-      continue
+    thread_class_computed=true
+    # Actioned-evidence upgrade (#616 finding 3509734396), mirroring the
+    # #575 auto-upgrade guard in --auto-resolve-bots: a routing-path
+    # thread that ALSO carries demonstrable action evidence — an agent fix
+    # commit touching the anchored file after the latest re-raise, or a
+    # substantive rebuttal (the same fail-closed GATE classification
+    # --resolve-actioned trusts) — is resolved under its truthful
+    # addressed-elsewhere / rebuttal-recorded tag, not blanket-tagged
+    # verified-propagation. The action evidence IS the resolution evidence
+    # for these (exactly what --resolve-actioned would resolve on), so the
+    # byte-compare is skipped; non-actioned threads fall through to it.
+    upgraded_class=$(derive_tag_class "$thread" skip-routing)
+    if class_is_actioned "$upgraded_class"; then
+      echo "  INFO: tag auto-upgraded verified-propagation → $upgraded_class for [$AUTHOR] $PATH_ (demonstrably actioned; #575)"
+      thread_class="$upgraded_class"
+      VERIFIED_RATIONALE=$(synth_rationale "$upgraded_class" "$thread")
+    else
+      vp_rc=0
+      vp_msg=$(verify_propagation_content "$thread_class" "$PATH_") || vp_rc=$?
+      if [ "$vp_rc" -eq 1 ]; then
+        echo "  SKIP (propagation NOT verified — content drift): [$AUTHOR] $PATH_"
+        echo "    $vp_msg"
+        echo "    Left unresolved: the byte-compare is the resolution evidence and it"
+        echo "    did not match. Propagate the upstream fix (or fix it upstream), then"
+        echo "    retry."
+        SKIPPED_DRIFT=$((SKIPPED_DRIFT + 1))
+        continue
+      elif [ "$vp_rc" -ne 0 ]; then
+        echo "  SKIP (propagation verification failed — failing closed): [$AUTHOR] $PATH_"
+        echo "    $vp_msg"
+        echo "    Left unresolved: a verification that cannot run never resolves."
+        SKIPPED_VERIFY_ERROR=$((SKIPPED_VERIFY_ERROR + 1))
+        continue
+      fi
+      # Byte-match — resolve with the verified-propagation tag; the
+      # verification message IS the tag rationale.
+      thread_class="verified-propagation"
+      VERIFIED_RATIONALE="$vp_msg"
     fi
-    # Byte-match — resolve with the verified-propagation tag; the
-    # verification message IS the tag rationale.
-    thread_class="verified-propagation"
-    VERIFIED_RATIONALE="$vp_msg"
   fi
 
   if $DRY_RUN; then
     echo "  WOULD RESOLVE [$AUTHOR] $PATH_"
     echo "    $EXCERPT"
     if [ "$MODE" = "resolve-verified-propagation" ]; then
-      echo "    → [mergepath-resolve: verified-propagation] $VERIFIED_RATIONALE"
+      # thread_class is verified-propagation for a byte-verified thread,
+      # or the truthful actioned class after the #616 upgrade above.
+      echo "    → [mergepath-resolve: $thread_class] $VERIFIED_RATIONALE"
     fi
     WOULD_RESOLVE_COUNT=$((WOULD_RESOLVE_COUNT + 1))
     continue
@@ -2235,9 +2312,11 @@ while IFS= read -r thread; do
         fi
       fi
     elif [ "$MODE" = "resolve-verified-propagation" ]; then
-      # #572: the gate above already byte-verified the propagation; the
-      # verification message is the rationale of record.
-      tag_class="verified-propagation"
+      # #572: the gate above already byte-verified the propagation (or
+      # upgraded the class to the truthful addressed-elsewhere /
+      # rebuttal-recorded on demonstrated action evidence, #616);
+      # thread_class + VERIFIED_RATIONALE carry the verdict of record.
+      tag_class="$thread_class"
       tag_rationale="$VERIFIED_RATIONALE"
     else
       # Warm the tag-data cache (PR_FILES_CACHE / PR_COMMITS_CACHE +

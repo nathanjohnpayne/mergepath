@@ -13,6 +13,28 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SCRIPT="$ROOT/scripts/resolve-pr-threads.sh"
 
+# ── CI-only yq self-bootstrap (#616, Codex finding 3509734393)
+# The delegated verified-propagation suite (Test 10 below) hard-requires
+# mikefarah/yq. On mergepath, repo_lint.yml's install_yq_for_sync_manifest
+# step installs it before this check runs — but consumers receive this
+# check via the manifest-synced scripts/ci kit while their repo_lint.yml
+# (with the install-step ordering) arrives separately on the
+# template-mirror lane (#601), so a skew window could run this check with
+# no yq on the runner. Self-bootstrap via the shared pinned installer,
+# CI-only: --ci-only no-ops outside GITHUB_ACTIONS=true, so local runs
+# keep the suite's own hard "yq is required" error instead of a surprise
+# sudo install. A bootstrap that cannot run fails closed here rather than
+# letting Test 10 produce a less obvious failure.
+if ! command -v yq >/dev/null 2>&1; then
+  ENSURE_YQ="$ROOT/scripts/lib/ensure-yq.sh"
+  if [ -f "$ENSURE_YQ" ]; then
+    if ! bash "$ENSURE_YQ" --ci-only; then
+      echo "check_resolve_pr_threads: FAIL — yq bootstrap failed (scripts/lib/ensure-yq.sh)" >&2
+      exit 1
+    fi
+  fi
+fi
+
 pass=0
 fail=0
 
@@ -501,9 +523,13 @@ fi
 # (consumer current content vs mergepath canonical source / re-rendered
 # template with consumer facts), with drift and every verification failure
 # skipped fail-closed, surface-class + human threads untouched, and a
-# working --dry-run preview. The #575 deferred→actioned tag auto-upgrade
-# guard is covered by the rationale-tag suite (Test 8 above). Same
-# delegation pattern as Tests 8/9.
+# working --dry-run preview. Also covers the #616 fixes: routing as a pure
+# path predicate (a previously recorded deferral marker never blocks the
+# classification), the actioned-evidence upgrade to the truthful
+# addressed-elsewhere/rebuttal-recorded tag, and the CI-only yq bootstrap
+# above (scripts/lib/ensure-yq.sh). The --auto-resolve-bots #575
+# deferred→actioned tag auto-upgrade guard is covered by the rationale-tag
+# suite (Test 8 above). Same delegation pattern as Tests 8/9.
 echo
 echo "resolve-pr-threads.sh verified-propagation resolution (#572)"
 

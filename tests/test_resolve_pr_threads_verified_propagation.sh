@@ -37,6 +37,26 @@
 #      no mutations.
 #   8. --dry-run on a matched thread → would-resolve preview with the
 #      verified-propagation tag, exit 3, NO mutations.
+#   9. A previously recorded [mergepath-resolve: deferred-to-followup]
+#      marker on a canonical-path thread does NOT block the routing
+#      classification (#616 finding 3509734391): routing is a pure path
+#      predicate (derive_routing_class), so the previously-deferred
+#      thread byte-verifies and resolves as verified-propagation.
+#  10. A routed thread that ALSO carries action evidence (a substantive
+#      agent rebuttal after the bot's last word) is auto-upgraded to its
+#      truthful actioned tag (rebuttal-recorded) with an INFO line
+#      instead of verified-propagation (#616 finding 3509734396); the
+#      byte-compare is skipped (no contents fetch — resolves even over
+#      drifted consumer content, on the action evidence).
+#  11. scripts/lib/ensure-yq.sh short-circuits when a mikefarah yq is
+#      already on PATH (no installer calls).
+#  12. scripts/lib/ensure-yq.sh --ci-only: no-op without
+#      GITHUB_ACTIONS=true; with it, installs the PINNED release via
+#      stubbed sudo/wget (no network) to ENSURE_YQ_DEST (#616 finding
+#      3509734393).
+#  13. check_resolve_pr_threads wires the CI-only bootstrap: structural
+#      assertions that the missing-yq guard delegates to
+#      scripts/lib/ensure-yq.sh --ci-only and the lib exists.
 
 set -euo pipefail
 
@@ -250,6 +270,41 @@ make_thread_fixture() {
     }}}}}' > "$out_file"
 }
 
+# make_thread_fixture_with_reply <thread-id> <path> <author> <body> <oid> \
+#     <reply-login> <reply-body> <out-file>
+# Bot thread plus ONE later agent-authored reply (allComments totalCount
+# 2, complete window — no pagination refetch). The shape of a
+# previously-tagged (deferral marker) or rebutted thread (#616).
+make_thread_fixture_with_reply() {
+  local thread_id="$1" anchor_path="$2" author="$3" body="$4" oid="$5"
+  local reply_login="$6" reply_body="$7" out_file="$8"
+  jq -nc --arg id "$thread_id" --arg p "$anchor_path" \
+     --arg a "$author" --arg b "$body" --arg o "$oid" \
+     --arg rl "$reply_login" --arg rb "$reply_body" '
+    {data:{repository:{pullRequest:{reviewThreads:{
+      totalCount: 1,
+      pageInfo: {hasNextPage: false, endCursor: null},
+      nodes: [{
+        id: $id, isResolved: false, isOutdated: false,
+        commentsFirst: {nodes: [{
+          author: {login: $a}, path: $p, body: $b,
+          createdAt: "2026-01-01T00:00:00Z"
+        }]},
+        commentsLast: {nodes: [{commit: {oid: $o}}]},
+        allComments: {
+          totalCount: 2,
+          pageInfo: {hasPreviousPage: false},
+          nodes: [
+            {author: {login: $a}, body: $b, databaseId: 1001,
+             createdAt: "2026-01-01T00:00:00Z"},
+            {author: {login: $rl}, body: $rb, databaseId: 1002,
+             createdAt: "2026-01-02T00:00:00Z"}
+          ]
+        }
+      }]
+    }}}}}' > "$out_file"
+}
+
 # run_mode <threads-file> <content-file> [extra-flag ...] → runs the mode,
 # sets $out and $rc. Extra env via the RUN_* variables.
 run_mode() {
@@ -362,12 +417,13 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────
-# Test 4: surface-class thread (Nitpick badge on a NON-manifest path →
-# class nitpick-noted) → never touched: skipped as not-propagation-routed,
-# no mutations, and no consumer-content fetch is even attempted.
+# Test 4: surface-class thread (Nitpick badge on a NON-manifest path,
+# not a templated dest → routing class not-routed) → never touched:
+# skipped as not-propagation-routed, no mutations, and no
+# consumer-content fetch is even attempted.
 # ─────────────────────────────────────────────────────────────────────
 echo
-echo "Test 4: surface-class (nitpick-noted) thread → never touched (#572)"
+echo "Test 4: non-routed (nitpick, non-manifest path) thread → never touched (#572)"
 
 make_thread_fixture "PRT_VP4" "docs/unrelated.md" "coderabbitai" \
   "_🧹 Nitpick (assertive)_ minor wording issue" "HEADCURRENT" "$SCRATCH/threads_vp4.json"
@@ -376,7 +432,7 @@ GH_ARGV_LOG="$SCRATCH/t4.log"; : > "$GH_ARGV_LOG"
 run_mode "$SCRATCH/threads_vp4.json" "$CONSUMER_MATCH_CANONICAL"
 
 if [ "$rc" -eq 3 ] \
-   && grep -q 'SKIP (class nitpick-noted — not propagation-routed)' <<<"$out" \
+   && grep -q 'SKIP (not propagation-routed)' <<<"$out" \
    && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
    && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG" \
    && ! grep -q '/contents/' "$GH_ARGV_LOG"; then
@@ -495,6 +551,214 @@ else
   echo "  FAIL: dry-run behavior incorrect (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 9: a previously recorded [mergepath-resolve: deferred-to-followup]
+# marker does NOT block the routing classification (#616 finding
+# 3509734391). This is the mode's MAIN use case: a sync finding deferred
+# on an earlier pass, whose consumer content NOW byte-matches, must
+# byte-verify and resolve as verified-propagation — not resurface forever
+# as "not propagation-routed" because the old surface tag wins the TAG
+# ladder. NOTE: Test 7 corrupted the fixture template, but this test
+# uses only the canonical arm.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 9: previously-deferred surface marker no longer blocks routing (#616)"
+
+make_thread_fixture_with_reply "PRT_VP9" "docs/canonical.md" "coderabbitai" \
+  "Finding on propagated canonical content" "OLDCOMMIT0" \
+  "nathanpayne-claude" \
+  "[mergepath-resolve: deferred-to-followup] canonical-coverage tracked in the follow-up issue mergepath#562" \
+  "$SCRATCH/threads_vp9.json"
+
+GH_ARGV_LOG="$SCRATCH/t9.log"; : > "$GH_ARGV_LOG"
+run_mode "$SCRATCH/threads_vp9.json" "$CONSUMER_MATCH_CANONICAL"
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: verified-propagation\] consumer content at docs/canonical.md byte-matches the mergepath canonical source' "$GH_ARGV_LOG" \
+   && grep -q 'Readback: all 1 resolved thread(s) confirmed isResolved:true' <<<"$out" \
+   && ! grep -q 'SKIP (not propagation-routed)' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: deferred-marker thread routed on its path, byte-verified, resolved"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: previously-deferred thread was not resolved (rc=$rc) — stale marker blocked routing?" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 10: a routed thread that ALSO carries action evidence — a
+# substantive (≥30 char, non-marker) agent rebuttal AFTER the bot's last
+# word — is auto-upgraded to the truthful rebuttal-recorded tag with an
+# INFO line, NOT blanket-tagged verified-propagation (#616 finding
+# 3509734396). The action evidence is the resolution evidence, so the
+# byte-compare is skipped entirely: the consumer content here is the
+# DRIFTED fixture and no contents fetch may occur.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 10: actioned (rebutted) routed thread → truthful upgraded tag (#616)"
+
+make_thread_fixture_with_reply "PRT_VP10" "docs/canonical.md" "coderabbitai" \
+  "Finding on propagated canonical content" "OLDCOMMIT0" \
+  "nathanpayne-claude" \
+  "This finding is intentionally divergent upstream; the canonical source is correct as written. See mergepath#562." \
+  "$SCRATCH/threads_vp10.json"
+
+GH_ARGV_LOG="$SCRATCH/t10.log"; : > "$GH_ARGV_LOG"
+run_mode "$SCRATCH/threads_vp10.json" "$CONSUMER_DRIFT_CANONICAL"
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'INFO: tag auto-upgraded verified-propagation → rebuttal-recorded' <<<"$out" \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\] agent rebuttal posted on thread; resolving.' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: verified-propagation\]' "$GH_ARGV_LOG" \
+   && ! grep -q '/contents/' "$GH_ARGV_LOG" \
+   && grep -q 'Readback: all 1 resolved thread(s) confirmed isResolved:true' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: actioned thread upgraded to rebuttal-recorded (INFO logged, no byte-compare)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: actioned thread was not upgraded (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Tests 11–13: the #616 (finding 3509734393) CI-only yq bootstrap.
+# scripts/lib/ensure-yq.sh is the single source for the pinned mikefarah
+# yq install; check_resolve_pr_threads self-bootstraps through it under
+# GITHUB_ACTIONS=true so the consumer-side skew window (scripts/ci kit
+# via manifest sync vs repo_lint.yml via template-mirror, #601) cannot
+# leave this suite red on a runner with no yq. All offline: sudo/wget
+# are PATH shims, the install destination is a scratch dir.
+# ─────────────────────────────────────────────────────────────────────
+ENSURE_YQ="$ROOT/scripts/lib/ensure-yq.sh"
+YQBOOT_LOG="$SCRATCH/yqboot-installer.log"
+
+# Shim bin for the "yq missing" runs: sudo strips itself and execs the
+# rest (so wget/chmod resolve to the stubs/symlinks here); wget records
+# the URL and writes a fake mikefarah yq to the -O destination.
+YQBOOT_BIN="$SCRATCH/yqboot-bin"
+mkdir -p "$YQBOOT_BIN" "$SCRATCH/yqboot-dest"
+ln -s "$(command -v chmod)" "$YQBOOT_BIN/chmod"
+cat > "$YQBOOT_BIN/sudo" <<SUDO_STUB
+#!/bin/sh
+echo "SUDO: \$*" >> "$YQBOOT_LOG"
+exec "\$@"
+SUDO_STUB
+chmod +x "$YQBOOT_BIN/sudo"
+cat > "$YQBOOT_BIN/wget" <<WGET_STUB
+#!/bin/sh
+dest=""
+url=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -q) shift ;;
+    -O) dest="\$2"; shift 2 ;;
+    *) url="\$1"; shift ;;
+  esac
+done
+echo "WGET: \$url" >> "$YQBOOT_LOG"
+printf '%s\n%s\n' '#!/bin/sh' \
+  'echo "yq (https://github.com/mikefarah/yq/) version v4.44.3"' > "\$dest"
+chmod +x "\$dest"
+WGET_STUB
+chmod +x "$YQBOOT_BIN/wget"
+
+# Shim bin for the "mikefarah yq present" run: fake yq + the grep the
+# short-circuit's version sniff needs; same sudo/wget stubs so any
+# (wrong) install attempt is visible in the log.
+YQPRESENT_BIN="$SCRATCH/yqpresent-bin"
+mkdir -p "$YQPRESENT_BIN"
+ln -s "$(command -v grep)" "$YQPRESENT_BIN/grep"
+ln -s "$YQBOOT_BIN/sudo" "$YQPRESENT_BIN/sudo"
+ln -s "$YQBOOT_BIN/wget" "$YQPRESENT_BIN/wget"
+cat > "$YQPRESENT_BIN/yq" <<'YQ_FAKE'
+#!/bin/sh
+echo "yq (https://github.com/mikefarah/yq/) version v4.44.3"
+YQ_FAKE
+chmod +x "$YQPRESENT_BIN/yq"
+
+echo
+echo "Test 11: ensure-yq.sh short-circuits on a present mikefarah yq (#616)"
+
+: > "$YQBOOT_LOG"
+set +e
+out=$(env PATH="$YQPRESENT_BIN" "$BASH" "$ENSURE_YQ" 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'yq already present' <<<"$out" \
+   && [ ! -s "$YQBOOT_LOG" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: present yq short-circuits with no installer calls"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: short-circuit broken (rc=$rc)" >&2
+  echo "    output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    installer log:" >&2; sed 's/^/      /' "$YQBOOT_LOG" >&2 || true
+fi
+
+echo
+echo "Test 12: ensure-yq.sh --ci-only gates on GITHUB_ACTIONS and installs pinned (#616)"
+
+# 12a — NOT CI (GITHUB_ACTIONS explicitly unset; the suite itself may be
+# running inside Actions): --ci-only must no-op successfully with no
+# installer calls, leaving local runs to this suite's own hard yq error.
+: > "$YQBOOT_LOG"
+set +e
+out_a=$(env -u GITHUB_ACTIONS PATH="$YQBOOT_BIN" "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
+rc_a=$?
+set -e
+
+# 12b — CI (GITHUB_ACTIONS=true), yq absent from the shim PATH: install
+# the PINNED release via the stubbed sudo/wget (no network) into
+# ENSURE_YQ_DEST, then verify the installed binary runs.
+set +e
+out_b=$(env GITHUB_ACTIONS=true PATH="$YQBOOT_BIN" \
+  ENSURE_YQ_DEST="$SCRATCH/yqboot-dest/yq" \
+  "$BASH" "$ENSURE_YQ" --ci-only 2>&1)
+rc_b=$?
+set -e
+
+if [ "$rc_a" -eq 0 ] \
+   && grep -q 'not a CI run' <<<"$out_a" \
+   && [ "$rc_b" -eq 0 ] \
+   && grep -q 'WGET: https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64' "$YQBOOT_LOG" \
+   && [ -x "$SCRATCH/yqboot-dest/yq" ] \
+   && grep -q 'version v4.44.3' <<<"$out_b"; then
+  pass=$((pass + 1))
+  echo "  PASS: non-CI no-op; CI run installed the pinned release via stubs only"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --ci-only gating or pinned install broken (rc_a=$rc_a rc_b=$rc_b)" >&2
+  echo "    non-CI output:" >&2; echo "$out_a" | sed 's/^/      /' >&2
+  echo "    CI output:" >&2; echo "$out_b" | sed 's/^/      /' >&2
+  echo "    installer log:" >&2; sed 's/^/      /' "$YQBOOT_LOG" >&2 || true
+fi
+
+echo
+echo "Test 13: check_resolve_pr_threads wires the CI-only yq bootstrap (#616)"
+
+CHECK_WRAPPER="$ROOT/scripts/ci/check_resolve_pr_threads"
+# Structural: the wrapper must (a) exist alongside the lib, (b) guard on
+# a MISSING yq, and (c) delegate to the shared lib with --ci-only. The
+# wrapper and this test travel in the same sync wave (scripts/ci kit +
+# canonical tests/ entry), so asserting on its contents is skew-safe.
+if [ -f "$CHECK_WRAPPER" ] \
+   && [ -f "$ENSURE_YQ" ] \
+   && grep -q 'command -v yq' "$CHECK_WRAPPER" \
+   && grep -q 'scripts/lib/ensure-yq.sh' "$CHECK_WRAPPER" \
+   && grep -Eq 'ensure-yq\.sh[^#]*--ci-only|"\$ENSURE_YQ" --ci-only' "$CHECK_WRAPPER"; then
+  pass=$((pass + 1))
+  echo "  PASS: wrapper guards on missing yq and delegates to ensure-yq.sh --ci-only"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: check_resolve_pr_threads is missing the CI-only yq bootstrap wiring" >&2
 fi
 
 echo
