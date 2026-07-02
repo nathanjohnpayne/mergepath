@@ -11,9 +11,22 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_sync_overrides.sh"
 
 if [ ! -f "$TEST_SCRIPT" ]; then
-  # Missing test script is a hard error, not a skip — silent-skip
-  # would let an accidental delete/rename disable this check
-  # without surfacing in CI. CodeRabbit ⚠️ Major on PR #228 round 4.
+  # Consumer-safety guard (#601): repo_lint.yml is manifest-canonical,
+  # so consumers run this wrapper too. The overrides test is seeded by
+  # the bootstrap template-mirror (deliberately NOT excluded — see
+  # BOOTSTRAP_MIRROR_EXCLUDES) but is not manifest-propagated, so
+  # consumers bootstrapped from older snapshots do not carry it.
+  # scripts/sync-to-downstream.sh is the standard hub marker
+  # (intentionally NOT propagated; same disambiguator as
+  # check_sync_manifest): both absent → consumer checkout → SKIP.
+  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+    echo "check_sync_overrides: SKIP (consumer checkout: tests/test_sync_overrides.sh + scripts/sync-to-downstream.sh both absent)"
+    exit 0
+  fi
+  # Marker present → hub. Missing test script is a hard error, not a
+  # skip — silent-skip would let an accidental delete/rename disable
+  # this check without surfacing in CI. CodeRabbit ⚠️ Major on PR #228
+  # round 4.
   echo "check_sync_overrides: ERROR (missing $TEST_SCRIPT)" >&2
   exit 1
 fi

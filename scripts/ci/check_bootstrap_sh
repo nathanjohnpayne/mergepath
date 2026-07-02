@@ -10,6 +10,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_bootstrap_sh.sh"
 
 if [ ! -f "$TEST_SCRIPT" ]; then
+  # Consumer-safety guard (#601): repo_lint.yml is manifest-canonical, so
+  # consumers run this wrapper too — but the bootstrap suite it wraps is
+  # hub-only (never propagated). .mergepath-sync.yml is a hub marker
+  # (deliberately never propagated). Consulted ONLY inside this
+  # missing-test branch (CodeRabbit Major on #624): both absent →
+  # consumer checkout → SKIP; marker present → the hub lost the test →
+  # hard error. Hub marker loss can never silently disable this check —
+  # with the test present the wrapper runs it regardless of the marker.
   if [ ! -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
     echo "check_bootstrap_sh: SKIP (consumer checkout: tests/test_bootstrap_sh.sh + .mergepath-sync.yml both absent)"
     exit 0

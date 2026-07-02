@@ -33,24 +33,76 @@
 #     workflow step, OR it's an opt-in local-only check like
 #     check_op_firebase_deploy_integration), add a
 #     `# WIRED-EXEMPT: check_X — reason` line anywhere in
-#     repo_lint.yml. The check honors that exemption.
+#     repo_lint.yml (or the local annex, below).
+#   - Consumer-local annex (#601): repo_lint.yml is manifest-canonical
+#     (consumers: all), so consumers must not edit it — local edits are
+#     drift and get overwritten by the next sync wave. A consumer that
+#     adds its own scripts/ci/check_* wires (or exempts) it in the
+#     OPTIONAL, never-propagated .github/workflows/repo_lint_local.yml
+#     annex instead. This guard scans the UNION of both files: a check
+#     counts as wired/exempt if either file wires or exempts it. Annex
+#     absent → behavior identical to the single-file scan (mergepath
+#     itself carries no annex).
 #
 # Implementation is pure Bash/awk so this script can run BEFORE any
 # yq install — it is one of the first steps in repo_lint.yml.
 #
 # Enforces the `rules/repo_rules.md` § CI Enforcement entry that
-# every scripts/ci/check_* must be wired or documented-exempt.
+# every scripts/ci/check_* must be wired or documented-exempt — on
+# every repo in the fleet, now that repo_lint.yml propagates (#601).
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORKFLOW="$REPO_ROOT/.github/workflows/repo_lint.yml"
+LOCAL_ANNEX="$REPO_ROOT/.github/workflows/repo_lint_local.yml"
 CHECK_DIR="$REPO_ROOT/scripts/ci"
 
 if [[ ! -f "$WORKFLOW" ]]; then
   echo "FAIL: workflow not found: $WORKFLOW" >&2
   echo "check_ci_scripts_wired: FAIL" >&2
   exit 1
+fi
+
+# Scan set: the canonical workflow plus the optional consumer-local
+# annex (#601). Same awk applied to both; absent annex → single file.
+#
+# Annex shape gate (Codex P2 on #624): an annex only counts toward the
+# wiring contract if it is an ACTUAL runnable workflow — it must carry a
+# push and/or pull_request trigger, or its run: lines would mark checks
+# wired that Actions never executes. An annex that exists but cannot run
+# is a hard error (fail closed), not a silent ignore: the consumer
+# explicitly claimed annex wiring, so a non-running annex is a broken
+# claim, not an absent one. Trigger detection parses YAML with the same
+# ruby -ryaml approach as check_onepassword_headless_proof_workflow
+# (Psych parses the Actions `on` key as boolean true under YAML 1.1, so
+# grep-based detection is not sound).
+SCAN_FILES=("$WORKFLOW")
+if [[ -f "$LOCAL_ANNEX" ]]; then
+  annex_triggers="$(ruby -ryaml -e '
+    begin
+      doc = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: false)
+    rescue Psych::Exception
+      exit
+    end
+    exit unless doc.is_a?(Hash)
+    on_value = doc.key?("on") ? doc["on"] : doc[true]
+    triggers =
+      case on_value
+      when Hash then on_value.keys
+      when Array then on_value
+      when String, Symbol then [on_value]
+      else []
+      end
+    triggers.map(&:to_s).each { |t| puts t }
+  ' "$LOCAL_ANNEX" 2>/dev/null || true)"
+  if printf '%s\n' "$annex_triggers" | grep -qxE 'push|pull_request'; then
+    SCAN_FILES+=("$LOCAL_ANNEX")
+  else
+    echo "FAIL: repo_lint_local.yml annex exists but has no push/pull_request trigger (found: [$(printf '%s' "$annex_triggers" | tr '\n' ' ' | sed 's/ $//')]); an annex Actions never runs on pushes or PRs cannot satisfy the wiring contract" >&2
+    echo "check_ci_scripts_wired: FAIL" >&2
+    exit 1
+  fi
 fi
 
 if [[ ! -d "$CHECK_DIR" ]]; then
@@ -99,7 +151,7 @@ WIRED=$(awk '
       print line
     }
   }
-' "$WORKFLOW" | LC_ALL=C sort -u)
+' "${SCAN_FILES[@]}" | LC_ALL=C sort -u)
 
 # Extract documented exemptions. Format:
 #   `# WIRED-EXEMPT: check_X — reason` (em-dash OR `--` OR `:` after the name).
@@ -111,7 +163,7 @@ EXEMPT=$(awk '
       print line
     }
   }
-' "$WORKFLOW" | LC_ALL=C sort -u)
+' "${SCAN_FILES[@]}" | LC_ALL=C sort -u)
 
 # Compute on-disk \ (wired ∪ exempt). Anything left is an unwired
 # check that ships on disk but never runs in CI.
@@ -127,7 +179,7 @@ for name in "${ON_DISK[@]}"; do
 done
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
-  echo "FAIL: scripts/ci/check_* not wired into .github/workflows/repo_lint.yml:" >&2
+  echo "FAIL: scripts/ci/check_* not wired into .github/workflows/repo_lint.yml (or repo_lint_local.yml):" >&2
   for name in "${MISSING[@]}"; do
     echo "  - $name" >&2
   done
@@ -136,10 +188,15 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
   echo "  - name: <name>" >&2
   echo "    run: ./scripts/ci/<name>" >&2
   echo "" >&2
+  echo "repo_lint.yml is manifest-canonical (#601): on mergepath, add the step" >&2
+  echo "there (check + wiring travel in the same sync PR). On a consumer repo," >&2
+  echo "wire consumer-local checks in .github/workflows/repo_lint_local.yml" >&2
+  echo "instead — local edits to repo_lint.yml are overwritten by sync." >&2
+  echo "" >&2
   echo "If the check is intentionally not wired (e.g. invoked by another" >&2
   echo "check rather than a top-level workflow step, or opt-in via env), add:" >&2
   echo "  # WIRED-EXEMPT: <name> — <reason>" >&2
-  echo "anywhere in repo_lint.yml." >&2
+  echo "anywhere in repo_lint.yml (or, on a consumer, repo_lint_local.yml)." >&2
   echo "check_ci_scripts_wired: FAIL" >&2
   exit 1
 fi

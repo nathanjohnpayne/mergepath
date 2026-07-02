@@ -14,6 +14,21 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_bootstrap_template_mirror.sh"
 
 if [ ! -f "$TEST_SCRIPT" ]; then
+  # Consumer-safety guard (#601): repo_lint.yml is manifest-canonical,
+  # so consumers run this wrapper too — but the bootstrap suite it
+  # wraps is hub-only (never propagated). scripts/sync-to-downstream.sh
+  # is the standard hub marker (intentionally NOT propagated; same
+  # disambiguator as check_sync_manifest). The marker is consulted ONLY
+  # inside this missing-test branch (CodeRabbit Major on #624): both
+  # absent → consumer checkout → SKIP; marker present → the hub lost
+  # the test (accidental delete/rename) → hard error, preserving the
+  # pre-#601 fail-closed hub behavior. Marker loss on the hub can
+  # never silently disable this check: with the test present the
+  # wrapper runs it regardless of the marker.
+  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+    echo "check_bootstrap_template_mirror: SKIP (consumer checkout: wrapped test + scripts/sync-to-downstream.sh both absent; hub-only bootstrap suite)"
+    exit 0
+  fi
   echo "check_bootstrap_template_mirror: ERROR (missing $TEST_SCRIPT)" >&2
   exit 1
 fi

@@ -1641,6 +1641,67 @@ sync_open_pr() {
     return 1
   fi
 
+  # Commit-path requires-closure gate (#624 Codex P1). The manifest
+  # `requires:` key is validated statically by check_sync_manifest, but the
+  # per-commit path builds targets from CHANGED canonical files only — kit
+  # entries never travel here (they are the sync-all layer). So a commit
+  # touching .github/workflows/repo_lint.yml alone would ship the workflow
+  # WITHOUT the scripts/ci wrappers its run: steps execute, turning every
+  # consumer lint red on the first #601 wave (and on any consumer whose kit
+  # is stale). Rather than silently materializing unrequested kit files
+  # (surprising wave semantics — the operator asked to propagate one
+  # commit), FAIL CLOSED per consumer: after this sync's own files are
+  # materialized above, every path a target `requires:` must be
+  # byte-current in the consumer clone. Files in this sync's own target
+  # set pass automatically (just written); a requirement whose manifest
+  # entry scopes `consumers:` away from this consumer is skipped (they
+  # never receive it); a consumer-override-skipped file is the consumer's
+  # documented divergence (same posture as the override filter above).
+  # Anything else missing or stale aborts THIS consumer with the sync-all
+  # remedy; other consumers proceed independently.
+  local requires_manifest="$MERGEPATH_ROOT/$MANIFEST_PATH"
+  local req_violations="" req_target req_entry req_files req_file req_consumers
+  while IFS= read -r req_target; do
+    [ -z "$req_target" ] && continue
+    while IFS= read -r req_entry; do
+      [ -z "$req_entry" ] && continue
+      # Scope the requirement: if the manifest entry covering the required
+      # path names an explicit consumer list that excludes this consumer,
+      # the kit never ships here and must not block.
+      # mikefarah yq v4 (the engine's dialect): parameterize via strenv, not
+      # the jq-style --arg (which yq does not support — a silent no-op gate
+      # was the first version of this bug, caught by the reqgate1 test).
+      req_consumers=$(REQ_GATE_PATH="$req_entry" yq -r '
+        .paths[] | select(.path == strenv(REQ_GATE_PATH))
+        | .consumers | (select(tag == "!!str") // (join(","))) | tostring
+      ' "$requires_manifest" 2>/dev/null | head -n1)
+      if [ -n "$req_consumers" ] && [ "$req_consumers" != "all" ]; then
+        case ",$req_consumers," in
+          *",$consumer_name,"*) : ;;
+          *) continue ;;
+        esac
+      fi
+      case "$req_entry" in
+        */) req_files=$(git -C "$MERGEPATH_ROOT" ls-tree -r --name-only "$sha" -- "$req_entry" 2>/dev/null || true) ;;
+        *)  req_files="$req_entry" ;;
+      esac
+      while IFS= read -r req_file; do
+        [ -z "$req_file" ] && continue
+        if override_should_skip_path "$consumer_overrides" "$req_file"; then
+          continue
+        fi
+        if ! git -C "$MERGEPATH_ROOT" show "$sha:$req_file" 2>/dev/null \
+             | cmp -s - "$workspace/repo/$req_file" 2>/dev/null; then
+          req_violations+="${req_violations:+$'\n'}$req_file (required by $req_target)"
+        fi
+      done <<< "$req_files"
+    done <<< "$(REQ_GATE_PATH="$req_target" yq -r '.paths[] | select(.path == strenv(REQ_GATE_PATH)) | (.requires // [])[]' "$requires_manifest" 2>/dev/null)"
+  done <<< "$targets"
+  if [ -n "$req_violations" ]; then
+    err "$consumer_name: requires-closure gate (#624): $(echo "$req_violations" | wc -l | tr -d ' ') file(s) required by this sync's target(s) are missing or stale on the consumer (first: $(echo "$req_violations" | head -n1)). A commit-path sync must not ship a requires-bearing target ahead of its kit — run the --sync-all wave path (which carries kit targets) to bring this consumer current, then retry."
+    return 1
+  fi
+
   # Sanity: did the copy actually change anything? If the consumer was
   # already in sync (someone hand-propagated it before us, or a prior
   # sync ran but the PR was never opened), don't push an empty commit.

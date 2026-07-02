@@ -15,6 +15,20 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+# Consumer-safety guard (#601): repo_lint.yml is manifest-canonical, so
+# consumers run this wrapper too — but the policy-check unit tests are
+# hub-only (not manifest-propagated; live consumers do not carry them).
+# The policy itself still runs on every consumer via
+# check_eslint_config_present. scripts/sync-to-downstream.sh is the
+# standard hub marker (intentionally NOT propagated; same disambiguator
+# as check_sync_manifest): both absent → consumer checkout → SKIP.
+# Marker present → hub → the missing-test hard error below stands.
+if [ ! -f "$REPO_ROOT/tests/test_eslint_policy_check.sh" ] \
+   && [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  echo "check_eslint_config_policy: SKIP (consumer checkout: tests/test_eslint_policy_check.sh + scripts/sync-to-downstream.sh both absent)"
+  exit 0
+fi
+
 TESTS=(
   "tests/test_eslint_policy_check.sh"
 )

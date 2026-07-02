@@ -84,6 +84,39 @@ problem.
    **Never rerun a stale-payload run** (close/redo it). Some consumers
    auto-merge on approval; bootstrap-gated repos need a human break-glass.
 
+## repo_lint.yml travels in waves (#601)
+
+`.github/workflows/repo_lint.yml` is a **canonical, consumers-all** manifest
+entry as of #601 — it was previously seeded exactly once by the bootstrap
+template-mirror and never again, so consumers ran a bootstrap-era ~8-step
+workflow against the full, kit-propagated `scripts/ci/`. Wave implications:
+
+- **Atomicity:** a new `scripts/ci/check_*` and its `run:` step land in the
+  same mergepath PR, so the check + its wiring arrive at each consumer in the
+  SAME sync PR and `check_ci_scripts_wired` stays green at every sync point.
+  The `scripts/ci/` kit and `repo_lint.yml` `requires:` each other
+  (bidirectionally, asserted by `check_sync_manifest`), so neither can fan
+  out without the other.
+- **Canary expectation on the FIRST #601 wave:** the consumer's `lint` job
+  jumps from the bootstrap-era ~8 executed checks to the full wired set
+  (~50). Expect a much longer lint run and read the log accordingly: hub-only
+  checks must show `SKIP (consumer checkout: ...)` lines, not failures. A
+  FAIL on a consumer that traces to a missing hub-only file is a
+  consumer-safety gap in that check — fix at the source (add the
+  `scripts/sync-to-downstream.sh` marker SKIP guard), never in the consumer
+  copy. The hub-only `tests/test_repo_lint_consumer_safety.sh` net models
+  exactly this and should have caught it first.
+- **Pre-wave annex migration (matchline, and any consumer with local
+  repo_lint edits):** consumer-local steps and consumer-local `WIRED-EXEMPT`
+  lines sitting in a consumer's `repo_lint.yml` copy get **clobbered** by the
+  first canonical overwrite. BEFORE fanning out the first #601 wave to such a
+  consumer, move its local wiring into the never-propagated
+  `.github/workflows/repo_lint_local.yml` annex (a real workflow file — it
+  runs its own steps — and `check_ci_scripts_wired` scans the union of both
+  files). matchline is the known carrier of consumer-local check wiring;
+  audit each consumer's `repo_lint.yml` against the mergepath copy before its
+  wave slot.
+
 ## Maintenance
 
 - **This doc is canonical.** [mergepath#492](https://github.com/nathanjohnpayne/mergepath/issues/492)

@@ -198,7 +198,9 @@ ALLOW_LIST=(
   # New-repo bootstrap seeders (scripts/bootstrap.sh, bootstrap-new-repo.sh,
   # bootstrap-config.sh, and the scripts/bootstrap/ subtree). These seed a
   # NEW repo once; they are orchestrator-only and never propagated. Their
-  # check_bootstrap_* wrappers are not wired into any consumer repo_lint.
+  # check_bootstrap_* wrappers ARE wired on every consumer now that
+  # repo_lint.yml propagates (#601), but each SKIPs on a consumer via the
+  # scripts/sync-to-downstream.sh marker guard, so the suites never run there.
   # NB: glob patterns are STORED LITERALLY (fully quoted) so the array
   # literal is not subject to pathname expansion at definition time; the
   # `case` statement in is_allow_listed() does the glob match.
@@ -243,19 +245,30 @@ ALLOW_LIST=(
   # check_onepassword_headless_proof_workflow is not wired on consumers.
   "scripts/onepassword-headless-proof-setup.sh"
 
-  # Self-tests of mergepath-only CI checks that are NOT wired into any
-  # consumer's repo_lint.yml (verified against live consumers). The
-  # check wrapper ships via the scripts/ci/ kit but never runs on a
-  # consumer, so its paired test legitimately does not travel:
+  # Self-tests of hub-only CI check suites. The check wrappers ship via
+  # the scripts/ci/ kit and — now that repo_lint.yml propagates (#601) —
+  # run on every consumer, but each one SKIPs (or skips its suite) when
+  # the hub-only test is absent, so the paired test legitimately does
+  # not travel. tests/test_repo_lint_consumer_safety.sh (hub-only)
+  # asserts every wired check exits 0 on a consumer-shaped tree:
   #   - check_eslint_config_policy  → test_eslint_policy_check.sh
+  #     (both-absent marker SKIP, #601)
   #   - check_mktemp_portability    → test_check_mktemp_portability.sh
+  #     (suite guarded by [ -x ]; scan itself runs everywhere)
   #   - check_session_finalization  → test_session_finalization_check.sh
+  #     (both-absent marker SKIP, #601)
   #   - check_sync_manifest         → test_check_sync_manifest.sh (also
   #     SKIPs on consumers via the manifest-absent guard)
   "tests/test_eslint_policy_check.sh"
   "tests/test_check_mktemp_portability.sh"
   "tests/test_session_finalization_check.sh"
   "tests/test_check_sync_manifest.sh"
+
+  # The #601 consumer-safety net itself — hub-only BY DESIGN: it encodes
+  # the hub-only removal list (this ALLOW_LIST + the bootstrap mirror
+  # excludes) to build a consumer-shaped fixture, so it can never travel.
+  # No propagated check runs it; it is referenced from comments only.
+  "tests/test_repo_lint_consumer_safety.sh"
 )
 
 is_allow_listed() {

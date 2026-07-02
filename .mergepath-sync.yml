@@ -931,6 +931,22 @@ paths:
       - "scripts/lib/daily-feedback-rollup-helpers.sh"
       - "scripts/ci/check_daily_feedback_rollup"
       - "tests/test_daily_feedback_rollup.sh"
+  # Fleet CI wiring contract (#601). repo_lint.yml was previously seeded
+  # exactly ONCE by the bootstrap template-mirror rsync and never again, so
+  # consumers kept a bootstrap-era ~8-step workflow while carrying the full
+  # scripts/ci/ kit — check_ci_scripts_wired enforced the wiring contract on
+  # mergepath only, a permanent silent skew invisible to weekly-drift-audit.
+  # Canonical propagation closes it. ATOMICITY CONTRACT: a new
+  # scripts/ci/check_* and its repo_lint.yml `run:` step land in the same
+  # mergepath PR, so the check + its wiring travel to consumers in the SAME
+  # sync PR and check_ci_scripts_wired stays green fleet-wide at every sync
+  # point. Consumer-local steps/exemptions live in the never-propagated
+  # .github/workflows/repo_lint_local.yml annex (see check_ci_scripts_wired).
+  - path: .github/workflows/repo_lint.yml
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/ci/"   # every run: step executes a kit check — must travel together (#601)
 
   # NOTE: `.mergepath-sync.yml` is deliberately NOT propagated.
   # #268 briefly made it a canonical path on the theory the lane
@@ -1038,6 +1054,7 @@ paths:
       - ".github/workflows/coderabbit-severity-gate.yml"  # check_coderabbit_severity_gate workflow shape (#577)
       - ".github/workflows/merge-clearance-gate.yml"  # check_merge_clearance_gate workflow shape
       - ".github/workflows/pr-audit.yml"       # check_pr_audit_codex_clearance
+      - ".github/workflows/repo_lint.yml"      # check_ci_scripts_wired scans it; bidirectional with its requires: scripts/ci/ (#601)
   - path: scripts/gh-projects/
     type: kit
     consumers: all

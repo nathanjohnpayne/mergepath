@@ -76,15 +76,37 @@ All checks must pass before merge.
 - check_session_finalization: `scripts/session-finalization-check.sh` + `tests/test_session_finalization_check.sh` must exist and pass. Guards the session-closeout workflow against orphaned local implementation work, stale stashes, and dirty auxiliary worktrees.
 - check_ci_scripts_wired: every `scripts/ci/check_*` file (executable
   or not — see r5 below) must be invoked as an explicit
-  `run: ./scripts/ci/check_X` step in `.github/workflows/repo_lint.yml`,
-  OR carry a documented exemption on a
-  `# WIRED-EXEMPT: check_X — reason` line in the same workflow.
-  Comment-only mentions of a check (e.g. inside a comment block) do
-  NOT count as wiring — only real `run:` lines. Pure-bash so it can
-  run before the yq install. Catches the #269 failure mode where a
-  check ships on disk and passes review under its own tests yet
-  never actually executes in CI because the matching workflow step
-  was never added. The check itself must be wired into repo_lint.yml.
+  `run: ./scripts/ci/check_X` step in `.github/workflows/repo_lint.yml`
+  OR in the optional consumer-local annex
+  `.github/workflows/repo_lint_local.yml` (#601), OR carry a documented
+  exemption on a `# WIRED-EXEMPT: check_X — reason` line in either
+  file. The guard scans the UNION of the two files; the annex absent →
+  identical to the single-file scan. Comment-only mentions of a check
+  (e.g. inside a comment block) do NOT count as wiring — only real
+  `run:` lines. Pure-bash so it can run before the yq install. Catches
+  the #269 failure mode where a check ships on disk and passes review
+  under its own tests yet never actually executes in CI because the
+  matching workflow step was never added. The check itself must be
+  wired into repo_lint.yml.
+  Fleet enforcement (#601): `repo_lint.yml` is a canonical,
+  consumers-all entry in `.mergepath-sync.yml` (previously it was
+  seeded exactly once by the bootstrap template-mirror and never
+  updated, so this wiring contract was enforced on mergepath only —
+  consumers ran a bootstrap-era step subset against the full,
+  kit-propagated `scripts/ci/`). A new check and its `run:` step land
+  in the same PR and travel to consumers in the same sync PR
+  (atomicity), so the contract holds on every repo at every sync
+  point; `check_sync_manifest` asserts the manifest keeps the entry
+  (canonical, consumers: all) and the `scripts/ci/` kit `requires:` it.
+  Consumers wire their own repo-local checks (and record consumer-local
+  exemptions) in `repo_lint_local.yml` — never by editing the canonical
+  `repo_lint.yml`, which the next sync wave overwrites. Every step in
+  `repo_lint.yml` must be consumer-safe: SKIP-guard hub-only checks via
+  the `scripts/sync-to-downstream.sh` marker idiom, depend only on
+  manifest-propagated files, or soft-pass when the backing script is
+  absent (#590); the hub-only
+  `tests/test_repo_lint_consumer_safety.sh` net runs every wired check
+  against a consumer-shaped fixture tree and asserts each exits 0.
   Note (#269 r5): the guard counts ALL `check_*` files regardless of
   executable bit. The earlier r3-r4 spec carved out non-executable
   files as "WIP skip", but repo_lint.yml runs

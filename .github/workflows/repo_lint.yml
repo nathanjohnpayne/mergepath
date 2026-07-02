@@ -1,3 +1,22 @@
+# repo_lint.yml — canonical fleet CI workflow (manifest-propagated, #601).
+#
+# This file is a `canonical` entry in .mergepath-sync.yml (consumers: all):
+# every consumer receives it byte-for-byte on each sync wave. Editing rules:
+#
+#   - A new scripts/ci/check_* MUST add its `run: ./scripts/ci/check_X` step
+#     here in the SAME PR that adds the script. check_ci_scripts_wired
+#     enforces wired-or-exempt on every repo in the fleet, so the check and
+#     its wiring travel to consumers atomically in the same sync PR.
+#   - Consumer-local wiring (consumer-only steps, consumer-local
+#     WIRED-EXEMPT lines) belongs in the OPTIONAL, never-propagated
+#     .github/workflows/repo_lint_local.yml annex — NOT here. Local edits to
+#     this file are drift and get overwritten by the next sync wave.
+#   - Every step must be consumer-safe: SKIP-guard hub-only checks (the
+#     scripts/sync-to-downstream.sh marker idiom — see check_sync_manifest),
+#     depend only on manifest-propagated files, or soft-pass when the
+#     backing script is absent (the #590-style
+#     `[ -f scripts/<gate>.sh ] || exit 0` one-liner).
+
 name: repo-lint
 
 on: [push, pull_request]
@@ -269,6 +288,16 @@ jobs:
 
       - name: check_sweep_unresolved_feedback
         run: ./scripts/ci/check_sweep_unresolved_feedback
+
+      - name: check_repo_lint_consumer_safety
+        # #601 consumer-safety net (Codex P2 on #624: it existed unwired).
+        # Re-runs every check_* wrapper inside a consumer-SHAPED checkout
+        # and fails if any errors instead of skipping/passing — catching a
+        # hub-only check that would red a consumer BEFORE a wave ships it.
+        # Hub-only (needs the full hub tree); SKIPs on consumers. The
+        # longest check in this job (a few minutes) — keep it late in the
+        # step list so cheap checks fail fast first.
+        run: ./scripts/ci/check_repo_lint_consumer_safety
 
       - name: check_disagreement_detector
         run: ./scripts/ci/check_disagreement_detector

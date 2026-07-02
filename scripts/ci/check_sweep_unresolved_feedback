@@ -22,6 +22,28 @@ REQUIRED_FILES=(
   "tests/test_sweep_unresolved_feedback.sh"
 )
 
+# Consumer-safety guard (#601): repo_lint.yml is manifest-canonical, so
+# consumers run this wrapper too — but the weekly sweep pipeline it
+# checks is hub-only (never propagated; allow-listed in
+# check_propagation_closure). SKIP only when EVERY sweep input AND the
+# hub marker scripts/sync-to-downstream.sh are absent (the consumer
+# shape; none of them propagate). Deliberately not a marker-first early
+# exit (CodeRabbit Major on #624): with ANY sweep file present, the
+# fail-closed presence loop below runs — hub-side marker loss can never
+# silently disable this check.
+_any_sweep_input_present=0
+for rel in "${REQUIRED_FILES[@]}"; do
+  if [ -f "$REPO_ROOT/$rel" ]; then
+    _any_sweep_input_present=1
+    break
+  fi
+done
+if [ "$_any_sweep_input_present" -eq 0 ] \
+   && [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  echo "check_sweep_unresolved_feedback: SKIP (consumer checkout: sweep pipeline files + scripts/sync-to-downstream.sh all absent; hub-only sweep pipeline)"
+  exit 0
+fi
+
 FAILED=0
 for rel in "${REQUIRED_FILES[@]}"; do
   full="$REPO_ROOT/$rel"
