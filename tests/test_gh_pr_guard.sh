@@ -951,6 +951,33 @@ assert_rc_contains "parse failure WITH gh evidence still fails closed (#611 r4)"
 assert_rc_contains "parse failure with octal gh spelling still fails closed (#611 r4)" 2 "tokenize" \
   '$(printf "\147\150") pr merge 1 "oops'
 
+# --- #611 round 5: unexpandable literal printf + assignment-word splices ---
+# (P1a) printf %b decodes escapes in its ARGUMENT — not emulated, so the
+# span cannot be statically expanded. A literal printf/echo that cannot be
+# expanded now fails closed in command position (it can synthesize an
+# entire guarded write with zero outside evidence), instead of degrading to
+# an anonymous placeholder the evidence scan cannot see through.
+assert_rc_contains "unexpandable percent-b printf synthesis fails closed (#611 r5)" 2 "wrapper" \
+  '$(printf %b "\147\150\40\160\162\40\155\145\162\147\145") 123 --admin'
+assert_rc_contains "unexpandable percent-d printf in command position fails closed (#611 r5)" 2 "wrapper" \
+  '$(printf "%d" 5) --admin'
+assert_rc_contains "literal gh + unexpandable printf noun fails closed (#611 r5)" 2 "wrapper" \
+  'gh $(printf %b "\160\162") merge 1'
+# Controls: an unexpandable literal printf in ARGUMENT or assignment-value
+# position is not command position and stays allowed.
+assert_rc_contains "unexpandable printf as echo argument stays allowed (#611 r5)" 0 "" \
+  'echo $(printf %b "\150\151")'
+assert_rc_contains "unexpandable printf as assignment value stays allowed (#611 r5)" 0 "" \
+  'X=$(printf %b hi) true'
+# (P1b) bash does NOT field-split a substitution inside an assignment word,
+# so a spacey expansion spliced there must stay ONE token — otherwise the
+# stray words shift command position and hide the real command
+# (X=$(printf "a b") $(printf gh) pr merge ran gh while the guard walked b).
+assert_rc_contains "assignment-word spacey splice keeps command position on the write (#611 r5)" 2 "wrapper" \
+  'X=$(printf "a b") $(printf "\147\150") pr merge 7 --admin'
+assert_rc_contains "assignment-word spacey splice with benign command stays allowed (#611 r5)" 0 "" \
+  'X=$(printf "a b") true'
+
 # #553 fix (b): the merge-state jq counts an un-timestamped PENDING re-run as
 # non-green even when a timestamped SUCCESS exists for the same check (the prior
 # max_by(.t) mis-ranked the empty-timestamp PENDING behind the SUCCESS, so an

@@ -472,6 +472,23 @@ def _decode_fmt_escapes(s):
 
 _SPLICE_SAFE_RE = re.compile(r"[A-Za-z0-9_./=,:@+% -]*\Z")
 
+def _is_literal_printf_echo(span):
+    # True when the span is a PURE-LITERAL printf/echo invocation (no shell-
+    # active characters, tokenizable, printf/echo command) — the class
+    # _static_expand emulates. Used to fail closed when such a span is NOT
+    # expandable (%b and other decoder directives, format-reuse forms): a
+    # literal printf can synthesize an entire guarded write with zero outside
+    # evidence, so an unexpandable one in command position is blocked rather
+    # than allowed through as an anonymous placeholder (#611 round 5).
+    for ch in ("$", chr(96), ";", "|", "&", "<", ">", "(", ")", "{", "}"):
+        if ch in span:
+            return False
+    try:
+        argv = shlex.split(span)
+    except ValueError:
+        return False
+    return bool(argv) and argv[0] in ("printf", "echo")
+
 def _static_expand(span):
     # Return the literal expansion of a pure printf/echo span, or None when
     # the span is dynamic or the expansion is not splice-safe.
@@ -571,67 +588,98 @@ def flatten_command(cmd, depth=0):
     n = len(cmd)
     in_single = False
     in_double = False
+    # cur_word tracks the text of the shell word being built (reset on
+    # unquoted whitespace/separators, quotes kept in place) so a splice can
+    # tell whether it lands inside an ASSIGNMENT word — bash does not
+    # field-split a substitution in an assignment value, so whitespace
+    # spliced there must be quoted to keep one token (#611 round 5:
+    # X=$(printf "a b") $(printf gh) pr merge shifted command position).
+    cur_word = ""
+
+    def _splice(span, in_double_now):
+        # Returns the text to append for a substitution span. Three cases:
+        #   1. statically expandable literal printf/echo -> the expansion
+        #      (quoted when whitespace lands inside an assignment word);
+        #   2. literal printf/echo that CANNOT be expanded (%b and other
+        #      decoder directives, format-reuse forms) -> a distinct
+        #      fail-closed sentinel: such a span can synthesize an entire
+        #      guarded write with zero outside evidence (#611 round 5);
+        #   3. anything dynamic -> the ordinary placeholder + evidence scan.
+        # Inside double quotes the expansion never field-splits; keep the
+        # placeholder there.
+        exp = None if in_double_now else _static_expand(span)
+        if exp is not None:
+            if _ASSIGN_RE.match(cur_word) and (" " in exp):
+                return _DQ + exp + _DQ
+            # NO padding: the expansion must stay glued to adjacent text
+            # exactly as bash glues it (G=$(printf gh) is ONE assignment
+            # word `G=gh`, not an assignment plus a command).
+            return exp
+        spans.append(span)
+        if not in_double_now and _is_literal_printf_echo(span):
+            return " __MERGEPATH_CMDSUB_LITERAL__ "
+        return " __MERGEPATH_CMDSUB__ "
+
     while i < n:
         c = cmd[i]
         if c == "\\" and not in_single and i + 1 < n:
             out.append(c)
             out.append(cmd[i + 1])
+            cur_word += c + cmd[i + 1]
             i += 2
             continue
         if c == _SQ and not in_double:
             in_single = not in_single
             out.append(c)
+            cur_word += c
             i += 1
             continue
         if c == _DQ and not in_single:
             in_double = not in_double
             out.append(c)
+            cur_word += c
             i += 1
             continue
         # Command substitution is performed unquoted AND inside double
         # quotes, never inside single quotes.
         if not in_single and c == "$" and i + 1 < n and cmd[i + 1] == "(":
             span, j = _read_paren_span(cmd, i + 2)
-            # #611: an UNQUOTED literal printf/echo span is spliced as its
-            # real expansion (word-splitting applies, exactly like bash), so
-            # a fully synthesized write is decided precisely. Inside double
-            # quotes the expansion stays one word — keep the placeholder.
-            exp = None if in_double else _static_expand(span)
-            if exp is None:
-                spans.append(span)
-                out.append(" __MERGEPATH_CMDSUB__ ")
-            else:
-                # NO padding: the expansion must stay glued to adjacent text
-                # exactly as bash glues it (G=$(printf gh) is ONE assignment
-                # word `G=gh`, not an assignment plus a command).
-                out.append(exp)
+            piece = _splice(span, in_double)
+            out.append(piece)
+            cur_word = "" if piece.endswith(" ") else cur_word + piece
             i = j
             continue
         if not in_single and c == chr(96):
             span, j = _read_backtick_span(cmd, i + 1)
-            exp = None if in_double else _static_expand(span)
-            if exp is None:
-                spans.append(span)
-                out.append(" __MERGEPATH_CMDSUB__ ")
-            else:
-                out.append(exp)
+            piece = _splice(span, in_double)
+            out.append(piece)
+            cur_word = "" if piece.endswith(" ") else cur_word + piece
             i = j
             continue
         if not in_single and not in_double:
             two = cmd[i:i + 2]
             if two in ("&&", "||", "|&"):
                 out.append(" " + two + " ")
+                cur_word = ""
                 i += 2
                 continue
             if c in (";", "|", "&", "(", ")"):
                 out.append(" " + c + " ")
+                cur_word = ""
                 i += 1
                 continue
             if c == "\n":
                 out.append(" ; ")
+                cur_word = ""
+                i += 1
+                continue
+            if c in (" ", "\t"):
+                out.append(c)
+                cur_word = ""
                 i += 1
                 continue
         out.append(c)
+        cur_word += c
         i += 1
     if in_single or in_double:
         raise ValueError("unbalanced quote")
@@ -715,7 +763,8 @@ def expand_wrappers(tokens, depth=0):
             # G=$(printf gh) env -S "${G} ..." must still reach the env -S
             # fail-closed branch). Only a trailing-"=" (empty-value) assignment
             # immediately followed by the placeholder is the flatten artifact.
-            if tok.endswith("=") and i < n and tokens[i] == "__MERGEPATH_CMDSUB__":
+            if tok.endswith("=") and i < n and tokens[i] in (
+                    "__MERGEPATH_CMDSUB__", "__MERGEPATH_CMDSUB_LITERAL__"):
                 out.append(tokens[i])
                 i += 1
             continue
@@ -1041,7 +1090,7 @@ guarded_gh_invocation_label() {
 
     if [ -z "$parent" ]; then
       case "$tok" in
-        __MERGEPATH_CMDSUB__)
+        __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
           if [ "$mode" = "strict" ]; then
             # Literal gh + unverifiable subcommand stream: the substitution
             # may synthesize `pr merge` wholesale. Fail closed.
@@ -1082,7 +1131,7 @@ guarded_gh_invocation_label() {
     fi
 
     case "$tok" in
-      __MERGEPATH_CMDSUB__)
+      __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
         # Literal pr/issue noun with a substitution in VERB position: the verb
         # is unverifiable (`gh pr $(printf '\155...')  123` / `$(a) pr $(b)`).
         # Fail closed in both modes — the noun is literal guarded evidence.
@@ -1217,6 +1266,20 @@ for _ci in "${!TOKENS[@]}"; do
     continue
   fi
   case "$_stok" in
+    __MERGEPATH_CMDSUB_LITERAL__)
+      # #611 round 5: a command-position literal printf/echo that could NOT
+      # be statically expanded (%b and other decoder directives, format-reuse
+      # forms) can synthesize an ENTIRE guarded write with zero outside
+      # evidence — the exact class the static expander decides for %s-only
+      # spans. Unconditional fail closed.
+      echo "BLOCKED: command-position printf/echo substitution could not be statically verified (#611)." >&2
+      echo "  A literal printf with a decoder directive (e.g. %b) can synthesize a full gh write" >&2
+      echo "  with no literal evidence outside the substitution. Rewrite without the substitution" >&2
+      echo "  in command position, or run the write through the token-verifying wrapper:" >&2
+      echo "    scripts/gh-as-author.sh -- gh ..." >&2
+      echo "    scripts/gh-as-reviewer.sh -- gh ..." >&2
+      exit 2
+      ;;
     __MERGEPATH_CMDSUB__)
       # Synthesis shapes, all fail closed:
       #   (a) exe synthesized, noun literal:  $(printf gh) pr merge
@@ -1500,7 +1563,7 @@ for i in "${!TOKENS[@]}"; do
           # globals.
           continue
           ;;
-        __MERGEPATH_CMDSUB__)
+        __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
           # Placeholder in NOUN position (#611 r3): fail closed.
           block_cmdsub_in_gh_stream
           ;;
@@ -1533,7 +1596,7 @@ for i in "${!TOKENS[@]}"; do
     esac
 
     # SAW_PR=1 OR SAW_ISSUE=1 — this token IS the subcommand.
-    if [ "$tok" = "__MERGEPATH_CMDSUB__" ]; then
+    if [ "$tok" = "__MERGEPATH_CMDSUB__" ] || [ "$tok" = "__MERGEPATH_CMDSUB_LITERAL__" ]; then
       # Placeholder in VERB position (#611 r3): `gh pr $(...) 123` executes
       # whatever the substitution yields as the subcommand. Fail closed.
       block_cmdsub_in_gh_stream
