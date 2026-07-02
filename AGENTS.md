@@ -115,6 +115,20 @@ resolved; that is a blocked gate, not a disposition prompt.) Do not present a
       conversation-resolution gate. Any unresolved CodeRabbit review
       conversation still blocks merge until it is fixed or rebutted and
       resolved through the pre-merge review conversation gate.
+   f. **Record each finding's disposition (#584)** via
+      `scripts/coderabbit-record-feedback.sh <PR#> [--scan | --findings-json
+      <FILE|->] --verdict <comment_id>=<verdict>[:<reason>]` — fixed →
+      `<id>=fixed`, false-positive/rebutted → `<id>=false-positive[:<reason>]`,
+      each written to a durable JSONL ledger
+      (`.mergepath/coderabbit-feedback-ledger.jsonl`) so CodeRabbit review
+      precision is trackable, symmetric with the Codex ledger (#487). Unlike
+      `scripts/codex-record-feedback.sh`, this is **disposition-logging only**:
+      CodeRabbit solicits no per-finding reaction, so the helper NEVER posts to
+      GitHub (every call is a read — REST GETs plus the read-only `reviewThreads`
+      query). It is HEAD-pinned (`--scan` scopes to current-HEAD bot findings,
+      the severity-gate scope), tier-classified via the shared
+      `coderabbit_tier_of`, and idempotent/append-only. This tracks the fix/
+      rebuttal decisions from step 5.d; it is not a merge gate.
 6. Before any merge attempt, query GitHub review-thread state, not just flat
    PR comments: run `scripts/resolve-pr-threads.sh <PR#> --list` or an
    equivalent GraphQL `reviewThreads` readback. Confirm there are zero

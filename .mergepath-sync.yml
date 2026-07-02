@@ -389,6 +389,17 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/feedback-policy-helpers.sh"
+  # CodeRabbit disposition-verdict ledger (#584) — the DISPOSITION-ONLY twin
+  # of scripts/codex-record-feedback.sh (#487). By-nature asymmetry (#574):
+  # CodeRabbit does not solicit per-finding reactions, so this helper never
+  # posts a reaction — GETs only, plus a local JSONL ledger append. It
+  # hard-sources the shared coderabbit_tier_of classifier (exit 3 if absent),
+  # so the feedback-policy lib must travel with it.
+  - path: scripts/coderabbit-record-feedback.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
   # Shared reader + tier classifiers for the feedback_policy block (#576).
   # Sourced by scripts/ci/check_feedback_policy_helpers (via its test); once
   # #577 lands, both severity gates source it too. First-class entry so the
@@ -657,6 +668,16 @@ paths:
   # class as test_codex_review_request_ack.sh above. Fully stubbed (PATH-
   # shimmed gh + gh-as-reviewer.sh) — no live GitHub network.
   - path: tests/test_codex_record_feedback.sh
+    type: canonical
+    consumers: all
+  # Pairs with scripts/coderabbit-record-feedback.sh (#584).
+  # check_coderabbit_record_feedback (scripts/ci kit) hard-runs it, so it
+  # must travel to every consumer or the check fails pre-flight with
+  # `Missing required file`. Same #264/#266 closure class as
+  # test_codex_record_feedback.sh above. Fully stubbed (PATH-shimmed gh) —
+  # no live GitHub network; it also copies the propagated
+  # scripts/lib/feedback-policy-helpers.sh (declared above).
+  - path: tests/test_coderabbit_record_feedback.sh
     type: canonical
     consumers: all
   # Pairs with scripts/merge-clearance-gate.sh +
@@ -978,6 +999,7 @@ paths:
       - "tests/test_codex_review_check_verdict.sh"  # check_codex_scripts (#600/#567)
       - "tests/test_465_fail_closed.sh"        # check_codex_scripts (#465)
       - "tests/test_codex_record_feedback.sh"  # check_codex_scripts (#487)
+      - "tests/test_coderabbit_record_feedback.sh"  # check_coderabbit_record_feedback (#584)
       - "tests/test_audit_propagation_lane.sh" # check_propagation_lane_audit
       - "scripts/audit-propagation-lane.sh"    # check_propagation_lane_audit
       - "scripts/codex-p1-gate.sh"             # check_codex_p1_gate
@@ -987,6 +1009,7 @@ paths:
       - "scripts/codex-review-request.sh"      # check_codex_scripts
       - "scripts/codex-review-check.sh"        # check_codex_scripts, check_canonical_bugs_263caf3
       - "scripts/codex-record-feedback.sh"     # check_codex_scripts (#487)
+      - "scripts/coderabbit-record-feedback.sh"  # check_coderabbit_record_feedback (#584)
       - "scripts/phase-4b-classifier.sh"       # check_phase_4b_classifier
       - "scripts/phase-4b-review.sh"           # check_phase_4b_automation (#579)
       - "scripts/phase-4b/"                    # check_phase_4b_automation (#579)

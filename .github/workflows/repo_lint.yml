@@ -341,6 +341,18 @@ jobs:
         # reply in JSON, and never counts the reply as clearance.
         run: ./scripts/ci/check_coderabbit_wait
 
+      - name: check_coderabbit_record_feedback
+        # CodeRabbit disposition-verdict ledger (#584) — the disposition-only
+        # twin of check_codex_scripts' codex-record-feedback coverage (#487).
+        # Verifies scripts/coderabbit-record-feedback.sh exists + is
+        # executable and runs its PATH-shimmed offline suite, including the
+        # #574 asymmetry guarantee that the recorder never issues a gh write.
+        # The `|| { ...; }` tail is the #590-style self-bootstrap guard:
+        # soft-pass when the check script is absent in this tree (a checkout
+        # whose repo_lint.yml arrived ahead of the scripts/ci kit sync — the
+        # #601 skew window); the check activates the moment the kit lands.
+        run: ./scripts/ci/check_coderabbit_record_feedback || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_record_feedback ]; then echo "check_coderabbit_record_feedback not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
+
       - name: check_mktemp_portability
         # Regression guard for mergepath#286. Hard-fails on any
         # tracked shell file using the BSD-only `mktemp -t <prefix>`

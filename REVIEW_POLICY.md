@@ -368,7 +368,20 @@ After internal review passes (Phase 2), CodeRabbit provides an independent autom
 3. **Scan for potential issues.** Before proceeding, grep CodeRabbit's inline review comments for `Potential issue` or `⚠️`. These markers indicate findings CodeRabbit considers high-severity. Every such finding must be explicitly addressed (fixed or dismissed with reasoning). When `feedback_policy` marks additional CodeRabbit tiers `required` (e.g. `p2` / `nitpick`, or `mode: address-all`), disposition those too — map each finding onto the shared ladder per [§ Feedback Disposition Policy](#feedback-disposition-policy). The tier-aware CodeRabbit gate that *enforces* this at merge time lands in #577; until then this is an agent-discipline instruction.
 4. The agent addresses substantive CodeRabbit findings — fixing issues or posting a reply explaining why a finding is not applicable.
 5. The agent is not required to fix every CodeRabbit comment. Use judgment: fix genuine issues, dismiss false positives with a brief explanation. However, all `Potential issue` / `⚠️` findings require an explicit response.
-6. CodeRabbit review is advisory. It does not block merge via CI and does not submit a "Changes Requested" review state.
+6. **Record the feedback disposition (#584).** After adjudicating each CodeRabbit finding (step 4), record a per-finding verdict via `scripts/coderabbit-record-feedback.sh <PR#> [--scan | --findings-json <FILE|->] --verdict <comment_id>=<verdict>[:<reason>]`:
+
+   - **Validated as real and actioned (fixed)** → `--verdict <id>=fixed` (disposition `fixed`).
+   - **Determined to be a false positive / rebutted** → `--verdict <id>=false-positive[:<reason>]` (disposition `rebutted`).
+
+   This is the CodeRabbit counterpart of the Codex step 13a-bis recorder, with **one by-nature asymmetry**: Codex ends each finding with *"Useful? React with 👍 / 👎."*, so `scripts/codex-record-feedback.sh` POSTs the solicited reaction. CodeRabbit does **not** solicit per-finding reactions, so `scripts/coderabbit-record-feedback.sh` is **disposition-logging only** — it NEVER posts a reaction (or any other write) to GitHub; every GitHub call it makes is a read (REST GETs plus the read-only GraphQL `reviewThreads` query for the `resolved` bit). The helper:
+
+   - Classifies each finding with the shared `coderabbit_tier_of` (the same classifier `scripts/coderabbit-severity-gate.sh` keys on), so the ledger tier vocabulary cannot drift.
+   - Is **HEAD-pinned**: `--scan` collects only the current HEAD's CodeRabbit inline findings (bot-authored AND `commit_id`/`original_commit_id` == HEAD — the same current-finding scope the severity gate gates on). Findings supplied via `--findings-json` inherit the producer's scoping.
+   - Is **idempotent / append-only**: re-recording a comment with the same disposition is a no-op; a different disposition appends a superseding row flagged `superseded_prior: true` without rewriting prior rows.
+   - Writes a **durable per-finding verdict** (comment_id, tier, verdict, disposition, optional reason, resolved bit) to a JSONL ledger (`.mergepath/coderabbit-feedback-ledger.jsonl` by default) so CodeRabbit review precision is trackable over time, symmetric with the Codex ledger from #487.
+
+   This step is disposition-tracking, not a merge gate — CodeRabbit remains advisory. It records the same fix/rebuttal decisions the agent already made in step 4; skipping it leaves the CodeRabbit ledger empty but does not block the merge.
+7. CodeRabbit review is advisory. It does not block merge via CI and does not submit a "Changes Requested" review state.
 
 CodeRabbit's advisory status does **not** override GitHub branch
 protection's `required_conversation_resolution` gate. A CodeRabbit
@@ -396,6 +409,7 @@ Before moving past Phase 2.5, confirm all of the following:
 - [ ] Read inline diff comments via `pulls/{pr}/comments` endpoint
 - [ ] Grepped inline comments for `Potential issue` and `⚠️` — all flagged findings addressed
 - [ ] Substantive findings fixed or dismissed with reasoning
+- [ ] Recorded each finding's disposition (fixed / rebutted) via `scripts/coderabbit-record-feedback.sh` (disposition-logging only — no reaction posted; #584)
 
 ### Pre-Merge Review Conversation Gate
 
