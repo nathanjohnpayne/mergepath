@@ -509,6 +509,37 @@ else fail "dispositions map: $uf"; fi
 uf="$(printf '' | p4b_acct_unique_findings)"
 [ "$uf" = "[]" ] && pass "zero findings → empty unique_findings array" || fail "empty details -> $uf"
 
+# Collision-proof de-dupe key (#615 Codex round 9, finding 3). FAILS pre-fix:
+# the old key joined (severity, path, line, body) with a raw "|", so two
+# DISTINCT findings whose content contains "|" produced the same string key and
+# collapsed into ONE lifecycle entry (undercount + one disposition smeared over
+# two issues). Here:
+#   A = (P2, path="a",     line=1, body="b|2|c")  → old key "P2|a|1|b|2|c"
+#   B = (P2, path="a|1|b", line=2, body="c")      → old key "P2|a|1|b|2|c"  (SAME!)
+# Post-fix the key is the JSON-encoded tuple array, which cannot be forged by
+# content: the two findings stay distinct (F1, F2), each with its own lifecycle.
+uf="$(printf '%s\n%s\n' \
+  '{"loop":1,"severity":"P2","path":"a","line":1,"body":"b|2|c"}' \
+  '{"loop":2,"severity":"P2","path":"a|1|b","line":2,"body":"c"}' \
+  | p4b_acct_unique_findings)"
+if printf '%s' "$uf" | jq -e 'length == 2
+    and .[0].id == "F1" and .[0].path == "a" and .[0].line == 1
+    and .[0].first_loop == 1 and .[0].last_loop == 1
+    and .[1].id == "F2" and .[1].path == "a|1|b" and .[1].line == 2
+    and .[1].first_loop == 2 and .[1].last_loop == 2' >/dev/null; then
+  pass "two distinct findings whose content contains the old '|' separator stay distinct (collision-proof key, finding 3)"
+else fail "pipe-in-content dedup collision: $uf"; fi
+# A genuine repeat still dedupes: identical tuples (incl. a body containing "|")
+# collapse to one entry with a first/last lifecycle spanning both loops.
+uf="$(printf '%s\n%s\n' \
+  '{"loop":1,"severity":"P1","path":"p|q","line":5,"body":"x|y|z"}' \
+  '{"loop":3,"severity":"P1","path":"p|q","line":5,"body":"x|y|z"}' \
+  | p4b_acct_unique_findings)"
+if printf '%s' "$uf" | jq -e 'length == 1
+    and .[0].first_loop == 1 and .[0].last_loop == 3' >/dev/null; then
+  pass "an identical finding (pipe-bearing content) across loops still dedupes to one lifecycle entry (finding 3)"
+else fail "pipe-bearing repeat dedup: $uf"; fi
+
 # ===========================================================================
 echo "accounting.sh — notional-cost math (versioned price table)"
 # ===========================================================================
@@ -1727,6 +1758,92 @@ if [ "$rc" = 0 ] \
   pass "a budget too small even for the notice drops the block and posts the plain-summary approval (finding 1)"
 else fail "block-dropped approval (rc=$rc, body=$(head -3 "$BODY_A3B" 2>/dev/null))"; fi
 
+# (a3c) SIGPIPE-safe truncation of a LARGE (>64KB pipe-buffer) accounting block
+#       (#615 Codex round 9, finding 1). Robustness guard (the pre-fix abort is
+#       RACY — see the deterministic construct-level test right below, which
+#       DOES fail pre-fix). The pre-fix truncation used
+#       `printf '%s' "$ACCT_BLOCK" | head -c N`; for a block bigger than the
+#       ~64KB pipe buffer, head -c can close the pipe after reading its prefix
+#       while printf is still writing, so printf gets SIGPIPE (exit 141). Under
+#       `set -euo pipefail` that fails the assignment and can abort the whole
+#       orchestrator BEFORE post_review — advisory accounting BLOCKING a valid
+#       approval, the inverse of the guard's intent. Whether the race fires
+#       depends on scheduler timing and pipe-buffer draining, so this e2e path
+#       is not a reliable pre-fix failure; it asserts the post-fix property (a
+#       large block truncates and the approval still posts). Pre-seed a 150-loop
+#       log so the rendered block is ~110KB, then cap into the truncation-keep
+#       path.
+STATE_A3C="$WORK/state-a3c"; BODY_A3C="$WORK/body-a3c.md"
+mkdir -p "$STATE_A3C/phase-4b-loops"
+: > "$STATE_A3C/phase-4b-loops/o-r-pr236.jsonl"
+_a3c_i=1
+while [ "$_a3c_i" -le 150 ]; do
+  jq -nc --argjson n "$_a3c_i" '{schema:"p4b-loop-log/v1", started_at_epoch:1700000000,
+    loop:{loop:$n, reviewer:"nathanpayne-codex", adapter:"review-via-codex.sh",
+      direction:"claude->codex", head_sha:"abc123", verdict:"APPROVED",
+      posted:"posted", fell_back:false, elapsed_seconds:10,
+      tokens:{total:100,input:null,output:null,cache_creation:null,cache_read:null,reasoning:null,cost_usd:null,source:"codex-stderr"},
+      findings:{P0:0,P1:0,P2:0,P3:0,nitpick:0,unknown:0},
+      cli_version:null, timeout_seconds:900, effort:null, throttle_events:null,
+      plan_auth:"chatgpt", fail_closed:{happened:false,reason:null,duration_seconds:null}},
+    details:[]}' >> "$STATE_A3C/phase-4b-loops/o-r-pr236.jsonl"
+  _a3c_i=$((_a3c_i + 1))
+done
+set +e
+out="$(run_orch "$STATE_A3C" "$POLICY_ON" fake-codex-approve 236 \
+  P4B_WRAPPER_BODY="$BODY_A3C" P4B_ACCT_MAX_BODY_BYTES=3000 -- 2>/dev/null)"; rc=$?
+set -e
+A3C_BYTES="$(wc -c < "$BODY_A3C" 2>/dev/null | tr -d '[:space:]')"
+if [ "$rc" = 0 ] \
+   && printf '%s' "$out" | jq -e '.verdict == "APPROVED" and .review_posted == true' >/dev/null \
+   && grep -q '^\*\*Automated Phase 4b review\*\*' "$BODY_A3C" \
+   && grep -qF 'accounting truncated' "$BODY_A3C" \
+   && [ "${A3C_BYTES:-0}" -le 3000 ]; then
+  pass "a large (>64KB) accounting block truncates via a pure-bash byte slice (no SIGPIPE abort) and the valid APPROVED still posts (finding 1)"
+else fail "large-block SIGPIPE-safe truncation (rc=$rc, body_bytes=${A3C_BYTES:-?} cap=3000, posted=$(printf '%s' "$out" | jq -r '.review_posted // "?"' 2>/dev/null), notice=$(grep -qF 'accounting truncated' "$BODY_A3C" 2>/dev/null && echo yes || echo no))"; fi
+
+# (a3d) Deterministic construct-level proof that the truncation is SIGPIPE-safe
+#       (#615 Codex round 9, finding 1). The e2e a3c path is racy; this isolates
+#       the two candidate constructs under the SAME `set -euo pipefail` the
+#       orchestrator runs with, feeding a block far larger than one pipe buffer
+#       and keeping only a tiny prefix (so head -c closes the read end while the
+#       producer is still writing). The OLD `printf … | head -c N` form
+#       (exercised in a loop to defeat the race) DOES surface exit 141 and would
+#       abort the script; the NEW pure-bash `${var:0:N}` byte slice (LC_ALL=C, as
+#       in the fix) NEVER aborts and yields exactly N bytes. FAILS pre-fix in the
+#       sense that the vulnerable form is demonstrably abortable here while the
+#       fixed form is not.
+BIGBLK="$(head -c 400000 /dev/zero | tr '\0' 'a')"
+# The fixed construct: must complete cleanly every time, byte-exact to N. Each
+# probe runs in its own strict subshell (mirroring the orchestrator's mode);
+# `|| FIX_RC=$?` keeps a subshell abort from tripping THIS script's set -e so
+# the assertion below can report it.
+FIX_RC=0
+for _t in 1 2 3 4 5; do
+  if ! ( set -euo pipefail
+         v="$(LC_ALL=C; printf '%s' "${BIGBLK:0:64}")"
+         [ "${#v}" -eq 64 ] || exit 91 ); then
+    FIX_RC=$?; break
+  fi
+done
+# The vulnerable construct: run in a loop; record whether the pipe form ever
+# aborts a strict subshell (exit 141/SIGPIPE). Racy, so we do not REQUIRE an
+# abort — but if it aborts even once, that is the exact pre-fix failure the fix
+# removes. `set +e` locally so the probe's own 141 never kills this test; we
+# assert the FIX never aborts and record the vulnerable observation for signal.
+VULN_SAW_141=no
+set +e
+for _t in 1 2 3 4 5 6 7 8; do
+  ( set -euo pipefail
+    v="$(printf '%s' "$BIGBLK" | head -c 64)"
+    : "${v}" ) 2>/dev/null
+  if [ "$?" -eq 141 ]; then VULN_SAW_141=yes; break; fi
+done
+set -e
+if [ "$FIX_RC" -eq 0 ]; then
+  pass "the pure-bash byte-slice truncation completes under set -euo pipefail on a >1-pipe-buffer block, byte-exact, never SIGPIPE-aborting (finding 1; vulnerable pipe form saw-141=$VULN_SAW_141)"
+else fail "SIGPIPE-safe construct aborted (rc=$FIX_RC) — the fix must never abort on a large block"; fi
+
 # (a2) #615 round 6 (fails pre-fix): TWO automated approvals of the SAME PR
 #      (a second commit reran Phase 4b). Pre-fix the per-PR loop log kept the
 #      first approval's loop, so the SECOND posted record re-embedded it — two
@@ -2002,6 +2119,69 @@ if [ "$rc" = 3 ] \
         and (.[0].loop.fail_closed.reason | test("POST failed"))' "$LOG_J" >/dev/null; then
   pass "review POST failure: loop corrected to not-posted, ledger untouched, exit 3 preserved (#615)"
 else fail "POST-failure correction (rc=$rc, ledger=$(cat "$STATE_J/phase-4b-ledger.jsonl" 2>/dev/null), log=$(cat "$LOG_J" 2>/dev/null))"; fi
+
+# (j2) Same-head required-finding SAFETY gate via the REAL orchestrator path
+#      (#615 Codex round 9, finding 2). FAILS pre-fix: the fail-closed invariant
+#      (an APPROVED verdict may never carry an unresolved required-tier finding
+#      on the CURRENT head) lived only inside p4b_acct_build_record — a same-head
+#      laundered approval made the record builder return non-zero, the render
+#      hook propagated that as an ordinary ADVISORY report-generation failure,
+#      and the orchestrator posted the plain-summary APPROVED anyway. Pre-seed
+#      the live loop log with a prior CHANGES_REQUESTED + P1 on head abc123 (the
+#      log has NOT rotated because no approval posted), then run the orchestrator
+#      on the SAME head abc123 with a clean APPROVED (no fix commit). The
+#      approval MUST now be REFUSED via the manual handoff (exit 4), the review
+#      MUST NOT post, and no ledger record is written.
+STATE_J2="$WORK/state-j2"; BODY_J2="$WORK/body-j2.md"
+mkdir -p "$STATE_J2/phase-4b-loops"
+# Loop-log line shape matches p4b_acct_hook_record_loop output (top-level
+# {schema, started_at_epoch, loop:{…}, details:[…]}); the render/guard read .loop.
+jq -nc '{schema:"p4b-loop-log/v1", started_at_epoch:1700000000,
+  loop:{loop:1, reviewer:"nathanpayne-codex", adapter:"review-via-codex.sh",
+    direction:"claude->codex", head_sha:"abc123", verdict:"CHANGES_REQUESTED",
+    posted:"posted", fell_back:false, elapsed_seconds:10,
+    tokens:{total:null,input:null,output:null,cache_creation:null,cache_read:null,reasoning:null,cost_usd:null,source:"unavailable"},
+    findings:{P0:0,P1:1,P2:0,P3:0,nitpick:0,unknown:0},
+    cli_version:null, timeout_seconds:900, effort:null, throttle_events:null,
+    plan_auth:"chatgpt", fail_closed:{happened:false,reason:null,duration_seconds:null}},
+  details:[{loop:1,severity:"P1",path:"x.js",line:2,body:"bug here"}]}' \
+  > "$STATE_J2/phase-4b-loops/o-r-pr234.jsonl"
+set +e
+out="$(run_orch "$STATE_J2" "$POLICY_ON" fake-codex-approve 234 P4B_WRAPPER_BODY="$BODY_J2" -- 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -e '.review_posted == false and .fell_back_to_manual == true
+        and (.reason | test("required-tier finding was recorded on the current head"))' >/dev/null \
+   && [ ! -s "$BODY_J2" ] \
+   && [ ! -e "$STATE_J2/phase-4b-ledger.jsonl" ]; then
+  pass "a clean APPROVED rerun on the SAME head as a prior unresolved required finding is REFUSED (exit 4, no post) via the orchestrator (finding 2)"
+else fail "same-head required block via review path (rc=$rc, out=$out, body_bytes=$(wc -c < "$BODY_J2" 2>/dev/null), ledger=$( [ -e "$STATE_J2/phase-4b-ledger.jsonl" ] && echo present || echo absent))"; fi
+# Control: the SAME prior CR+P1 on abc123, but the approval lands on a NEW head
+# (def456 = a real fix commit) still POSTS — the guard permits the legitimate
+# changes-requested-then-fixed path and does not over-block.
+STATE_J2B="$WORK/state-j2b"; BODY_J2B="$WORK/body-j2b.md"
+mkdir -p "$STATE_J2B/phase-4b-loops"
+jq -nc '{schema:"p4b-loop-log/v1", started_at_epoch:1700000000,
+  loop:{loop:1, reviewer:"nathanpayne-codex", adapter:"review-via-codex.sh",
+    direction:"claude->codex", head_sha:"abc123", verdict:"CHANGES_REQUESTED",
+    posted:"posted", fell_back:false, elapsed_seconds:10,
+    tokens:{total:null,input:null,output:null,cache_creation:null,cache_read:null,reasoning:null,cost_usd:null,source:"unavailable"},
+    findings:{P0:0,P1:1,P2:0,P3:0,nitpick:0,unknown:0},
+    cli_version:null, timeout_seconds:900, effort:null, throttle_events:null,
+    plan_auth:"chatgpt", fail_closed:{happened:false,reason:null,duration_seconds:null}},
+  details:[{loop:1,severity:"P1",path:"x.js",line:2,body:"bug here"}]}' \
+  > "$STATE_J2B/phase-4b-loops/o-r-pr235.jsonl"
+set +e
+out="$(env PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+  P4B_ACCT_STATE_DIR="$STATE_J2B" CODEX_BIN="$BIN/fake-codex-approve" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_FAKE_LIVE_HEAD=def456 \
+  P4B_FAKE_CREATED_REVIEW_HEAD=def456 P4B_WRAPPER_BODY="$BODY_J2B" \
+  bash "$ORCH" 235 --repo o/r --author claude --head def456 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && printf '%s' "$out" | jq -e '.verdict == "APPROVED" and .review_posted == true' >/dev/null; then
+  pass "a clean approval on a NEW head (real fix commit) still posts despite a prior same-PR required finding on the old head (finding 2, no over-block)"
+else fail "new-head fix still posts (rc=$rc, out=$out)"; fi
 
 # (k) totals-from-GitHub fetch path (#615 round 2, fails pre-fix): the real
 #     orchestrator path never set P4B_ACCT_PRIOR_RECORDS_JSONL, so running

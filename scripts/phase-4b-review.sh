@@ -426,11 +426,24 @@ _[accounting truncated: the full block would exceed the review-body size limit; 
           # "\n\n" separator, the notice, and printf's trailing "\n".
           _p4b_acct_notice_bytes="$(printf '%s' "$_p4b_acct_notice" | wc -c 2>/dev/null | tr -d '[:space:]')"
           case "$_p4b_acct_notice_bytes" in ''|*[!0-9]*) _p4b_acct_notice_bytes=0 ;; esac
-          # -8 safety margin absorbs a multibyte cut at the head -c boundary so
-          # the final body lands comfortably under the cap (no belt trigger).
+          # -8 safety margin absorbs a multibyte cut at the truncation boundary
+          # so the final body lands comfortably under the cap (no belt trigger).
           _p4b_acct_keep=$(( _p4b_acct_max_body - _p4b_acct_base_bytes - 2 - _p4b_acct_notice_bytes - 1 - 8 ))
           if [ "$_p4b_acct_keep" -gt 0 ]; then
-            ACCT_BLOCK="$(printf '%s' "$ACCT_BLOCK" | head -c "$_p4b_acct_keep")$_p4b_acct_notice"
+            # SIGPIPE-safe truncation (#615 Codex round 9, finding 1): the prior
+            # `printf … | head -c` form aborts the whole orchestrator under
+            # `set -euo pipefail`. For a block larger than the pipe buffer, head
+            # -c closes the pipe after reading its prefix and printf gets SIGPIPE
+            # (exit 141); pipefail then fails the command substitution and, under
+            # set -e, exits the script BEFORE post_review — advisory accounting
+            # would block a valid approval, the exact opposite of the guard's
+            # intent. Use a pure-bash byte substring (no pipe, no producer to
+            # signal). `LC_ALL=C` makes `${var:0:N}` count BYTES (default UTF-8
+            # locale counts characters), so the slice honors the byte budget and
+            # the -8 margin still absorbs a mid-multibyte cut; the belt below
+            # re-measures and drops the block if a cut still overshoots.
+            _p4b_acct_trunc="$(LC_ALL=C; printf '%s' "${ACCT_BLOCK:0:$_p4b_acct_keep}")"
+            ACCT_BLOCK="${_p4b_acct_trunc}${_p4b_acct_notice}"
             p4b_warn "accounting: block exceeds the review-body size budget ($_p4b_acct_max_body bytes); truncating it so the approval still posts"
           else
             ACCT_BLOCK=""
@@ -456,6 +469,28 @@ _[accounting truncated: the full block would exceed the review-body size limit; 
     fi
   elif [ "$VERDICT" = "APPROVED" ]; then
     p4b_warn "accounting: current loop was not recorded; skipping the accounting block so the posted approval never omits this loop while stamping the current head (plain summary posts)"
+  fi
+
+  # --- Same-head required-finding SAFETY gate (#615 Codex round 9, finding 2) -
+  # Unlike the accounting BLOCK above (advisory — its failure never blocks a
+  # valid approval), this is a fail-closed SAFETY check on the approval itself.
+  # The fail-closed invariant (an APPROVED verdict may never carry an unresolved
+  # required-tier finding on the CURRENT head) lived only inside the accounting
+  # RECORD builder: a same-head laundered approval made p4b_acct_build_record
+  # return non-zero, the render hook propagated that as an ordinary advisory
+  # report-generation failure, and the orchestrator posted the plain-summary
+  # APPROVED anyway — letting a P0/P1 CHANGES_REQUESTED on head `abc` be
+  # laundered into a clean approval by rerunning the reviewer on the SAME head
+  # with no fix commit. Here we run the SAME assertion against the live loop log
+  # (which already holds this run's loop, appended above) keyed to the current
+  # HEAD; when it refuses, the approval is REFUSED via the manual handoff
+  # (fall_back_to_manual, exit 4), never posted. A head change (a real fix
+  # commit) or a fail-closed-marked prior loop clears it — the assertion permits
+  # the legitimate changes-requested-then-fixed path. Gate is a no-op when the
+  # verdict is not APPROVED or when there is no readable/parseable loop log.
+  if [ "$VERDICT" = "APPROVED" ] \
+     && ! p4b_acct_hook_same_head_required_block; then
+    fall_back_to_manual "an unresolved required-tier finding was recorded on the current head ($HEAD) in a prior Phase 4b loop; a rerun without a fix commit cannot launder it into a clean approval (fail-closed)"
   fi
 fi
 

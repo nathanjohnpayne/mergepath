@@ -811,8 +811,16 @@ p4b_acct_unique_findings() {
       | (if length > 80 then .[0:79] + "…" else . end)
       | (if . == "" then null else . end);
     reduce .[] as $d ( {order: [], map: {}} ;
-      ( $d.severity + "|" + (($d.path // "~") | tostring)
-        + "|" + (($d.line // -1) | tostring) + "|" + $d.body ) as $k
+      # Collision-proof de-dupe key (#615 Codex round 9, finding 3): JSON-encode
+      # the (severity, path, line, body) tuple as an ARRAY so structural
+      # boundaries can never be forged by content. The prior `severity | path |
+      # line | body` string join let a finding whose text/path contained the
+      # `|` separator collapse two distinct findings into one lifecycle entry
+      # (e.g. (path=a, line=1, body="b|2|c") vs (path="a|1|b", line=2, body="c")
+      # produced the same key), undercounting findings and attaching one
+      # disposition to several issues. `tojson` on a heterogenous array
+      # (strings + a number/null for line) is unambiguous and injective.
+      ( [ $d.severity, ($d.path // null), ($d.line // null), $d.body ] | tojson ) as $k
       | if .map[$k] != null then
           .map[$k].last_loop = ([ .map[$k].last_loop, $d.loop ] | max)
           | .map[$k].first_loop = ([ .map[$k].first_loop, $d.loop ] | min)
@@ -1916,4 +1924,43 @@ p4b_acct_hook_render_approval_block() {
     fi
   fi
   printf '%s' "$block"
+}
+
+# p4b_acct_hook_same_head_required_block — SAFETY gate (not advisory).
+#
+# Fail-closed check the orchestrator runs BEFORE posting an APPROVED review
+# (#615 Codex round 9, finding 2). The record builder's
+# p4b_acct_assert_no_required_with_approved already refuses to BUILD an
+# accounting record whose loop history laundered a same-head required finding,
+# but that failure was caught as an ordinary advisory report-generation failure
+# and the orchestrator still posted the plain-summary APPROVED — the fail-closed
+# invariant lived only in the accounting record, never in the approval decision.
+# This hook exposes the SAME assertion, keyed to the CURRENT head, so the
+# orchestrator can refuse the approval itself.
+#
+# Reads the live per-PR loop log (the current loop was appended by
+# p4b_acct_hook_record_loop before this call), extracts the full loop objects,
+# and runs the assertion for an APPROVED verdict on the current HEAD. Returns:
+#   0  — safe to post the approval (no same-head unresolved required finding, or
+#        no readable/parseable loop log to check).
+#   1  — a same-head unresolved required finding is present; the approval MUST
+#        be refused (fail closed).
+# A missing/empty/unparseable loop log returns 0: this gate never fabricates a
+# block from the absence of history — the assertion is only meaningful with a
+# loop log, and a genuinely first-ever clean approval has none. The orchestrator
+# calls this ONLY on the APPROVED path; other verdicts do not post an approval.
+p4b_acct_hook_same_head_required_block() {
+  local log loops
+  log="$(p4b_acct_hook_loop_log)" || return 0
+  [ -r "$log" ] || return 0
+  loops="$(jq -cs '[ .[] | .loop ]' "$log" 2>/dev/null)" || return 0
+  [ -n "$loops" ] && [ "$loops" != "[]" ] || return 0
+  # assert returns 0 when SAFE, non-zero when the same-head required finding
+  # would be laundered. Invert: report 1 (block) exactly when the assertion
+  # refuses. A jq/assertion internal error also returns non-zero from assert;
+  # fail closed on it too (an unverifiable history blocks the approval).
+  if p4b_acct_assert_no_required_with_approved "APPROVED" "$loops" "${HEAD:-}"; then
+    return 0
+  fi
+  return 1
 }
