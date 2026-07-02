@@ -978,6 +978,46 @@ assert_rc_contains "assignment-word spacey splice keeps command position on the 
 assert_rc_contains "assignment-word spacey splice with benign command stays allowed (#611 r5)" 0 "" \
   'X=$(printf "a b") true'
 
+# --- #611 round 6: ANSI-C quoting, heredoc evidence, splice fidelity ------
+# (P1) $-single-quote ANSI-C strings are decoded and re-wrapped before the
+# literal classification, so an ANSI-C-synthesized write is spliced and
+# decided exactly like the plain-quoted octal forms.
+assert_rc_contains "ANSI-C-quoted synthesized gh pr merge fails closed (#611 r6)" 2 "wrapper" \
+  "\$(echo \$'\\147\\150\\40\\160\\162\\40\\155\\145\\162\\147\\145') 1 --admin"
+assert_rc_contains "ANSI-C-quoted benign expansion stays allowed (#611 r6)" 0 "" \
+  "\$(echo \$'hi') there"
+# (P2) heredoc BODIES are data for the receiving command: a parse failure
+# whose only guarded-verb evidence sits inside a cat heredoc body must not
+# fail closed. A shell interpreter outside the bodies keeps full-text
+# evidence (bash <<EOF executes its body), and command-line evidence
+# outside the body still blocks.
+assert_rc_contains "parse failure with evidence only in a cat heredoc body stays allowed (#611 r6)" 0 "" \
+  'cat <<EOF
+$(date) merge "oops
+EOF'
+assert_rc_contains "parse failure in a bash heredoc with in-body gh still fails closed (#611 r6)" 2 "tokenize" \
+  'bash <<EOF
+gh pr merge 1 "oops
+EOF'
+assert_rc_contains "parse failure with gh evidence outside the heredoc still fails closed (#611 r6)" 2 "tokenize" \
+  'cat <<EOF
+"oops
+EOF
+gh pr merge 1'
+# (P3) bash strips TRAILING newlines from substitution output before
+# concatenation: gh-then-newline glued to pr runs ghpr (not a gh write).
+assert_rc_contains "trailing-newline splice glues to adjacent text like bash (#611 r6)" 0 "" \
+  '$(printf "\147\150\n")pr merge 1'
+# (P3) an expansion-derived word is never an assignment prefix in bash
+# (assignment recognition precedes substitution): an = in the expansion is
+# no longer splice-safe, so the span fails closed as unverifiable in
+# command position instead of being re-parsed as an env assignment, and
+# stays inert elsewhere.
+assert_rc_contains "assignment-looking expansion in command position fails closed (#611 r6)" 2 "wrapper" \
+  '$(printf "X=Y") gh pr merge 1'
+assert_rc_contains "assignment-looking expansion as argument stays allowed (#611 r6)" 0 "" \
+  'echo $(printf "X=Y")'
+
 # #553 fix (b): the merge-state jq counts an un-timestamped PENDING re-run as
 # non-green even when a timestamped SUCCESS exists for the same check (the prior
 # max_by(.t) mis-ranked the empty-timestamp PENDING behind the SUCCESS, so an

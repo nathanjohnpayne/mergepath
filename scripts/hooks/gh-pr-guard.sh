@@ -470,7 +470,93 @@ def _decode_fmt_escapes(s):
         i += 2
     return "".join(out)
 
-_SPLICE_SAFE_RE = re.compile(r"[A-Za-z0-9_./=,:@+% -]*\Z")
+_SPLICE_SAFE_RE = re.compile(r"[A-Za-z0-9_./,:@+% -]*\Z")
+
+def _decode_ansi_c(s):
+    # bash ANSI-C quoting ($ + single-quoted string) decodes C escapes:
+    # \NNN octal, \xHH hex, the C letters, and quote escapes. Unknown
+    # escapes stay verbatim (bash keeps them).
+    simple = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r",
+              "t": "\t", "v": "\v", "\\": "\\", _SQ: _SQ, _DQ: _DQ}
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        nxt = s[i + 1]
+        if nxt in simple:
+            out.append(simple[nxt])
+            i += 2
+            continue
+        if nxt == "x":
+            m = re.match(r"[0-9A-Fa-f]{1,2}", s[i + 2:i + 4])
+            if m:
+                out.append(chr(int(m.group(0), 16)))
+                i += 2 + len(m.group(0))
+                continue
+            out.append("\\")
+            i += 1
+            continue
+        m = re.match(r"[0-7]{1,3}", s[i + 1:i + 4])
+        if m:
+            out.append(chr(int(m.group(0), 8)))
+            i += 1 + len(m.group(0))
+            continue
+        out.append("\\")
+        out.append(nxt)
+        i += 2
+    return "".join(out)
+
+def _rewrite_ansi_c(span, neutral):
+    # Rewrite every $-single-quote ANSI-C string in span to a PLAIN
+    # single-quoted string holding its decoded text, so the downstream
+    # literal classification and shlex see the real content (#611 round 6:
+    # $(echo $-quoted octal for a gh write) dodged the literal classifier
+    # via its $). A decoded chunk that cannot be re-wrapped (contains a
+    # single quote) is replaced by `neutral` when given — classification
+    # still sees a literal printf/echo and the span fails closed as
+    # unexpandable — or aborts the rewrite when neutral is None
+    # (_static_expand: not expandable). Unterminated quoting aborts too.
+    out = []
+    i = 0
+    n = len(span)
+    while i < n:
+        c = span[i]
+        if c == "$" and i + 1 < n and span[i + 1] == _SQ:
+            j = i + 2
+            buf = []
+            closed = False
+            while j < n:
+                d = span[j]
+                if d == "\\" and j + 1 < n:
+                    buf.append(d)
+                    buf.append(span[j + 1])
+                    j += 2
+                    continue
+                if d == _SQ:
+                    closed = True
+                    j += 1
+                    break
+                buf.append(d)
+                j += 1
+            if not closed:
+                return (None, False)
+            dec = _decode_ansi_c("".join(buf))
+            if _SQ in dec:
+                if neutral is None:
+                    return (None, False)
+                out.append(neutral)
+            else:
+                out.append(_SQ + dec + _SQ)
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return ("".join(out), True)
 
 def _is_literal_printf_echo(span):
     # True when the span is a PURE-LITERAL printf/echo invocation (no shell-
@@ -480,6 +566,9 @@ def _is_literal_printf_echo(span):
     # literal printf can synthesize an entire guarded write with zero outside
     # evidence, so an unexpandable one in command position is blocked rather
     # than allowed through as an anonymous placeholder (#611 round 5).
+    span, ok = _rewrite_ansi_c(span, _SQ + "MPANSIC" + _SQ)
+    if not ok:
+        return False
     for ch in ("$", chr(96), ";", "|", "&", "<", ">", "(", ")", "{", "}"):
         if ch in span:
             return False
@@ -492,6 +581,9 @@ def _is_literal_printf_echo(span):
 def _static_expand(span):
     # Return the literal expansion of a pure printf/echo span, or None when
     # the span is dynamic or the expansion is not splice-safe.
+    span, ok = _rewrite_ansi_c(span, None)
+    if not ok:
+        return None
     for ch in ("$", chr(96), ";", "|", "&", "<", ">", "(", ")", "{", "}"):
         if ch in span:
             return None
@@ -554,12 +646,15 @@ def _static_expand(span):
             out = "".join(parts)
     else:
         return None
-    # IFS whitespace inside a literal expansion word-splits exactly like a
-    # space (#611 round 4: printf newlines between synthesized words), so
-    # normalize space/tab/newline RUNS to single spaces BEFORE the
-    # splice-safety check. No strip: a leading/trailing separator still
-    # separates the expansion from glued adjacent text, exactly as bash
-    # field-splits it.
+    # bash removes TRAILING newlines from substitution output before any
+    # concatenation (#611 round 6: printf gh-then-newline glued to pr runs
+    # ghpr, not gh pr) — strip them first. Remaining IFS whitespace inside
+    # the expansion word-splits exactly like a space (#611 round 4: printf
+    # newlines between synthesized words), so normalize space/tab/newline
+    # RUNS to single spaces BEFORE the splice-safety check. No other strip:
+    # a leading (or trailing space/tab) separator still separates the
+    # expansion from glued adjacent text, exactly as bash field-splits it.
+    out = re.sub(r"\n+\Z", "", out)
     out = re.sub(r"[ \t\n]+", " ", out)
     if not _SPLICE_SAFE_RE.match(out):
         return None
@@ -931,9 +1026,36 @@ except ValueError as e:
   # (no gh in stripped or octal/hex escape spelling, no env -S, no
   # pr/issue noun, no guarded verb) exits 0 exactly like the evidence-free
   # fast path always did. ANY evidence keeps the fail-closed block below.
-  if ! echo "$COMMAND" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(([^[:space:]]*/)?gh|pr|issue|create|merge|comment|review|edit)([^A-Za-z0-9_]|$)' \
-     && ! echo "$COMMAND" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
-     && ! echo "$COMMAND" | grep -qE '\\(147|150|107|110|x67|x68|x47|x48)'; then
+  #
+  # #611 round 6 (Codex P2): heredoc BODIES are data for the receiving
+  # command (cat/tee templates legitimately contain shell-looking text and
+  # guarded verbs), so they are excluded from the evidence probe — UNLESS
+  # a shell interpreter appears outside the bodies (bash <<EOF executes
+  # its body; keep full-text evidence there, matching the pre-broadening
+  # behavior where a literal in-body gh blocked the parse failure).
+  EVIDENCE_TEXT="$COMMAND"
+  STRIPPED_TEXT=$(printf '%s\n' "$COMMAND" | awk '
+    skip == 1 {
+      line = $0
+      sub(/^\t+/, "", line)
+      if (line == tag) { skip = 0 }
+      next
+    }
+    {
+      print
+      if (match($0, /<<-?[[:space:]]*["'\'']?[A-Za-z_][A-Za-z0-9_]*/)) {
+        t = substr($0, RSTART, RLENGTH)
+        sub(/<<-?[[:space:]]*["'\'']?/, "", t)
+        tag = t
+        skip = 1
+      }
+    }')
+  if ! printf '%s\n' "$STRIPPED_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(sh|bash|dash|zsh|ksh|eval)([^A-Za-z0-9_]|$)'; then
+    EVIDENCE_TEXT="$STRIPPED_TEXT"
+  fi
+  if ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(([^[:space:]]*/)?gh|pr|issue|create|merge|comment|review|edit)([^A-Za-z0-9_]|$)' \
+     && ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
+     && ! printf '%s\n' "$EVIDENCE_TEXT" | grep -qE '\\(147|150|107|110|x67|x68|x47|x48)'; then
     exit 0
   fi
   echo "BLOCKED: gh-pr-guard could not tokenize the gh command (malformed shell quoting)." >&2
