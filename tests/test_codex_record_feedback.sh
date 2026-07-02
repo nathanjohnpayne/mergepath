@@ -132,6 +132,42 @@ ledger_lines() {
 
 # --- tests -----------------------------------------------------------------
 
+test_string_id_coerced_no_double_report() {
+  # #618 (mirror of the #617 coderabbit-recorder fix): a digit-STRING
+  # comment_id from --findings-json used to be recorded via string compare
+  # while the numeric not-found pass missed it — one adjudicated finding
+  # recorded AND reported skipped:not-found at once. Post-fix the id is
+  # coerced to a number during normalization: exactly one ledger row (typed
+  # number), the reaction posts to the right endpoint, zero not-found skips.
+  local dir rc
+  dir=$(make_case "string-id")
+  write_gh_readonly "$dir"
+  cat >"$dir/findings.json" <<EOF
+{ "findings": [
+  { "path": "scripts/ci/check_y", "line": 3, "priority": "P2", "comment_id": "5002",
+    "body": "String id finding.\n\n$SOLICIT" }
+] }
+EOF
+  rc=$(run_case "$dir" -- 999 owner/repo --findings-json findings.json --verdict 5002=fixed)
+
+  local row notfound
+  row=$(head -1 "$dir/state/ledger.jsonl" 2>/dev/null || printf '')
+  notfound=$(jq -r '[.skipped[] | select((.comment_id|tostring)=="5002" and .why=="not-found")] | length' "$dir/out.json")
+  if [ "$rc" != "0" ]; then
+    fail "string-id: exit $rc, expected 0; stderr=$(cat "$dir/err.log")"
+  elif ! grep -q 'gh api -X POST repos/owner/repo/pulls/comments/5002/reactions -f content=+1' "$(posts_file "$dir")"; then
+    fail "string-id: did not POST +1 to comment 5002; posts=$(cat "$(posts_file "$dir")" 2>/dev/null)"
+  elif [ "$(ledger_lines "$dir")" != "1" ]; then
+    fail "string-id: ledger has $(ledger_lines "$dir") lines, expected 1"
+  elif [ "$notfound" != "0" ]; then
+    fail "string-id: id 5002 reported not-found $notfound time(s) despite being recorded; out=$(cat "$dir/out.json")"
+  elif [ "$(printf '%s' "$row" | jq -r '.comment_id|type')" != "number" ]; then
+    fail "string-id: recorded comment_id type was $(printf '%s' "$row" | jq -r '.comment_id|type'), expected number (coerced)"
+  else
+    pass "a digit-string comment_id is coerced at normalization: one ledger row, +1 posted, zero not-found skips (#618)"
+  fi
+}
+
 test_fixed_reacts_plus1_via_reviewer() {
   local dir rc
   dir=$(make_case "fixed-plus1")
@@ -603,6 +639,7 @@ EOF
   fi
 }
 
+test_string_id_coerced_no_double_report
 test_fixed_reacts_plus1_via_reviewer
 test_rebuttal_reacts_minus1
 test_no_solicitation_is_never_reacted
