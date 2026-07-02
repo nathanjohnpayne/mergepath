@@ -366,7 +366,16 @@ if p4b_acct_on 2>/dev/null; then
   else
     p4b_warn "accounting: could not record this loop (plain summary unaffected)"
   fi
-  if [ "$VERDICT" = "APPROVED" ]; then
+  # Render the accounting block ONLY when THIS invocation's loop was recorded
+  # (#615 Codex round 5). p4b_acct_hook_render_approval_block builds the block
+  # from the loop log; if recording the current loop failed (e.g. a read-only
+  # loop-log), the log still holds this PR's OLDER loops, and rendering from it
+  # would emit a block stamped with the CURRENT head whose rigor table claims
+  # that head was reviewed while SILENTLY omitting the current loop — corrupted
+  # accounting instead of an honest fallback. Skipping the render here posts the
+  # plain-summary approval (accounting is advisory; the approval is never
+  # blocked). A recorded-but-otherwise-degraded render still fails-open below.
+  if [ "$VERDICT" = "APPROVED" ] && [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
     if ACCT_BLOCK="$(p4b_acct_hook_render_approval_block)" && [ -n "$ACCT_BLOCK" ]; then
       if ! { printf '\n\n'; printf '%s\n' "$ACCT_BLOCK"; } >> "$BODY_FILE"; then
         p4b_warn "accounting: could not append the accounting block; posting the plain-summary approval"
@@ -374,6 +383,8 @@ if p4b_acct_on 2>/dev/null; then
     else
       p4b_warn "accounting: report generation failed; posting the plain-summary approval (never blocks a valid approval)"
     fi
+  elif [ "$VERDICT" = "APPROVED" ]; then
+    p4b_warn "accounting: current loop was not recorded; skipping the accounting block so the posted approval never omits this loop while stamping the current head (plain summary posts)"
   fi
 fi
 

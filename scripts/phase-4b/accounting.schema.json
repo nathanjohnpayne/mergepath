@@ -248,6 +248,11 @@
           "enum": ["github-derived", "ledger-cache", "unavailable"]
         },
         "records": { "type": "integer", "minimum": 0 },
+        "records_dropped_nonconformant": {
+          "description": "Diagnostics count (#615 round 5): prior records that carried the p4b-accounting/v1 tag but were dropped from aggregation because they were missing schema-required fields (partial write / manual edit / buggy emitter). They are never counted toward `records` or any aggregate — a syntactically valid but incomplete record must degrade, not silently understate totals. Optional: absent on pre-round-5 records.",
+          "type": "integer",
+          "minimum": 0
+        },
         "window": {
           "description": "GitHub-derived scan window (#615 round 3): how many recently updated merged PRs were scanned for prior records and whether the page cap left older history unscanned. truncated=true means the totals are a bounded window (renderer labels 'window: last N merged PRs'), never repo-wide. Absent for non-github-derived sources and pre-window records.",
           "type": "object",

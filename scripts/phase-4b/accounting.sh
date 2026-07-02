@@ -422,12 +422,50 @@ p4b_acct_aggregate_running_totals() {
     --arg source "$source_label" \
     --argjson mlow "$P4B_ACCT_HUMAN_MINUTES_LOW" \
     --argjson mhigh "$P4B_ACCT_HUMAN_MINUTES_HIGH" '
-    (map(select(type == "object" and .schema == "p4b-accounting/v1"))) as $recs
-    | if ($recs | length) != (. | length) and (. | length) > 0
+    # Schema-mirror conformance (#615 Codex round 5): a syntactically valid but
+    # INCOMPLETE record (partial local write, manual edit, buggy earlier
+    # emitter) can carry the schema tag while missing the fields the aggregation
+    # reads — the tag-only filter would then count it as records:1 with zero
+    # attempts/fail-closed events, silently understating repo-wide totals
+    # instead of degrading. This def mirrors accounting.schema.json required
+    # keys (the same required-set the record must satisfy) so a tagged record
+    # missing any of them is dropped from aggregation (and counted in a
+    # diagnostics line), never treated as conformant. Nullable fields must be
+    # PRESENT (has()) but may be null — matching the schema, which requires the
+    # key and permits an explicit-null value.
+    def conformant:
+      (["pr","final_head_sha","final_verdict","final_reviewer",
+        "final_direction","automation_state",
+        "wall_time_first_loop_to_approval_seconds","loops","unique_findings",
+        "totals","running_totals","generated_at"]) as $req
+      | (["adapter_invocations","tokens_total","tokens_by_provider",
+          "elapsed_seconds_total","billed_usd","notional_usd",
+          "reported_cost_usd","price_table_version","fail_closed_events",
+          "advisory_issues_filed"]) as $treq
+      | (type == "object")
+        and (.schema == "p4b-accounting/v1")
+        and (($req - keys_unsorted) | length) == 0
+        and (.totals | type == "object")
+        and (($treq - (.totals | keys_unsorted)) | length) == 0;
+    (map(select(type == "object" and .schema == "p4b-accounting/v1"))) as $tagged
+    | ([ $tagged[] | select(conformant) ]) as $recs
+    | (($tagged | length) - ($recs | length)) as $dropped
+    | if ($tagged | length) != (. | length) and (. | length) > 0
       then error("non-conformant record in ledger")
       else
         ($recs | length) as $n
-        | ([ $recs[] | select(.final_verdict == "APPROVED") ] | length) as $approved
+        # Auto-approved PRs is a DISTINCT-PR count (#615 Codex round 5): a PR
+        # approved twice (two commits → two automated approvals) leaves two
+        # APPROVED bodies with the same .pr, and counting both inflated the PR
+        # metric and the human-time-saved derived from it. Dedupe by .pr among
+        # APPROVED records. Loop/attempt SPEND metrics below (attempts,
+        # fail-closed, tokens, elapsed, notional) deliberately stay summed over
+        # ALL records — a re-approval really did spend a second review, so the
+        # cost/effort totals must reflect actual spend, not the deduped PR set
+        # (Codex: "count distinct approved PR numbers for the PR metric while
+        # still summing all recorded loop attempts separately").
+        | ([ $recs[] | select(.final_verdict == "APPROVED") | .pr ]
+           | unique | length) as $approved
         # Measured metrics propagate unavailability (#615 Codex): a prior
         # record whose tokens/elapsed/notional is null (unavailable) makes the
         # CUMULATIVE figure null too — summing only the measured records would
@@ -439,6 +477,7 @@ p4b_acct_aggregate_running_totals() {
         {
             source: $source,
             records: $n,
+            records_dropped_nonconformant: $dropped,
             auto_approved_prs: $approved,
             automated_attempts: ([ $recs[] | .totals.adapter_invocations // 0 ] | add // 0),
             fail_closed_events: ([ $recs[] | .totals.fail_closed_events // 0 ] | add // 0),
@@ -447,7 +486,7 @@ p4b_acct_aggregate_running_totals() {
             notional_usd: (addall(.totals.notional_usd)
                            | if . == null then null else (. * 100 | round / 100) end),
             human_minutes_saved_estimate:
-              (if $n == 0 then null
+              (if $approved == 0 then null
                else [ $approved * $mlow, $approved * $mhigh ]
                end)
           }
@@ -1086,6 +1125,9 @@ p4b_acct_render_block() {
     printf '\n\n'
     printf '%s' "$rec" | jq -r '
       "*Totals source: \(.running_totals.source) (\(.running_totals.records) prior record(s))"
+      + (if ((.running_totals.records_dropped_nonconformant // 0) > 0)
+         then "; \(.running_totals.records_dropped_nonconformant) tagged record(s) dropped as incomplete (missing required fields — never aggregated)"
+         else "" end)
       + (if (.running_totals.window.truncated // false)
          then "; window: last \(.running_totals.window.scanned_prs) merged PRs — older history beyond the scan cap is not included"
          else "" end)

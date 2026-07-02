@@ -747,7 +747,12 @@ echo "accounting.sh — running-totals aggregation"
 REC2="$(printf '%s' "$GOLDEN" | jq -c '.pr = 581 | .final_verdict = "CHANGES_REQUESTED"
   | .totals.tokens_total = 1000 | .totals.elapsed_seconds_total = 60
   | .totals.notional_usd = 0.10 | .totals.adapter_invocations = 2 | .totals.fail_closed_events = 0')"
-agg="$(printf '%s\n%s\n%s\n' "$GOLDEN" "$REC2" "$GOLDEN" | p4b_acct_aggregate_running_totals github-derived)"
+# Three DISTINCT PRs (580 approved, 581 changes-requested, 582 approved) so the
+# sum-every-metric intent is unambiguous and auto_approved_prs counts distinct
+# approved PR numbers, not APPROVED records (#615 Codex round 5 — a same-PR
+# duplicate is exercised as its own regression below).
+REC3="$(printf '%s' "$GOLDEN" | jq -c '.pr = 582')"
+agg="$(printf '%s\n%s\n%s\n' "$GOLDEN" "$REC2" "$REC3" | p4b_acct_aggregate_running_totals github-derived)"
 if printf '%s' "$agg" | jq -e '
     .source == "github-derived" and .records == 3
     and .auto_approved_prs == 2 and .automated_attempts == 10
@@ -756,6 +761,23 @@ if printf '%s' "$agg" | jq -e '
     and .human_minutes_saved_estimate == [60, 360]' >/dev/null; then
   pass "aggregation over N records sums every metric and derives the human-minutes range"
 else fail "aggregation: $agg"; fi
+# #615 Codex round 5 (fails pre-fix): a PR approved twice (two commits, two
+# automated approvals) leaves two APPROVED bodies with the SAME .pr. The PR
+# metric must dedupe by .pr (distinct approved PRs = 1) and the derived
+# human-time-saved must follow it — while automated_attempts / tokens / elapsed
+# / notional still SUM across both approvals (actual spend, two real reviews).
+DUP_A="$(printf '%s' "$GOLDEN" | jq -c '.pr = 900 | .final_head_sha = "aaa111"')"
+DUP_B="$(printf '%s' "$GOLDEN" | jq -c '.pr = 900 | .final_head_sha = "bbb222"')"
+agg="$(printf '%s\n%s\n' "$DUP_A" "$DUP_B" | p4b_acct_aggregate_running_totals github-derived)"
+if printf '%s' "$agg" | jq -e '
+    .records == 2
+    and .auto_approved_prs == 1
+    and .human_minutes_saved_estimate == [30, 180]
+    and .automated_attempts == 8 and .fail_closed_events == 2
+    and .tokens_total == 354408 and .elapsed_seconds_total == 450
+    and .notional_usd == 1.32' >/dev/null; then
+  pass "two approvals of the SAME PR count as one distinct auto-approved PR; spend metrics still sum (#615 round 5)"
+else fail "duplicate-PR dedupe: $agg"; fi
 # #615 Codex: a prior record with an unavailable (null) measurement makes the
 # CUMULATIVE figure unavailable too — per metric, independently — instead of
 # being coerced to 0 (which underreports repo-wide totals in the common
@@ -779,9 +801,41 @@ agg="$(printf '%s\n%s\n' "$GOLDEN" "$REC_NULLELAPSED" | p4b_acct_aggregate_runni
 if printf '%s' "$agg" | jq -e '.elapsed_seconds_total == null and .tokens_total == 354408' >/dev/null; then
   pass "an unmeasured elapsed total degrades cumulative wall-clock to null (#615)"
 else fail "null-elapsed aggregation: $agg"; fi
+# #615 Codex round 5 (fails pre-fix): a syntactically valid object carrying the
+# schema tag but MISSING required fields (partial write / manual edit / buggy
+# emitter) used to pass the tag-only filter — counted as records:1 with zero
+# attempts/fail-closed events, silently understating repo-wide totals. It must
+# now be DROPPED from aggregation (schema-mirror required-key check) and counted
+# in a diagnostics line, while the conformant records aggregate unaffected.
+INCOMPLETE='{"schema":"p4b-accounting/v1","pr":999,"final_verdict":"APPROVED"}'
+agg="$(printf '%s\n%s\n' "$GOLDEN" "$INCOMPLETE" | p4b_acct_aggregate_running_totals github-derived)"
+if printf '%s' "$agg" | jq -e '
+    .source == "github-derived"
+    and .records == 1
+    and .records_dropped_nonconformant == 1
+    and .auto_approved_prs == 1
+    and .automated_attempts == 4 and .fail_closed_events == 1
+    and .tokens_total == 177204' >/dev/null; then
+  pass "an incomplete schema-tagged record is dropped (not counted as conformant) and reported in diagnostics (#615 round 5)"
+else fail "incomplete-record rejection: $agg"; fi
+# A record missing only the required totals sub-keys is likewise non-conformant
+# (the aggregation reads .totals.* and must not treat a totals-less record as
+# zero-attempt conformant history).
+INCOMPLETE_TOTALS="$(printf '%s' "$GOLDEN" | jq -c 'del(.totals.adapter_invocations)')"
+agg="$(printf '%s\n%s\n' "$GOLDEN" "$INCOMPLETE_TOTALS" | p4b_acct_aggregate_running_totals github-derived)"
+if printf '%s' "$agg" | jq -e '
+    .records == 1 and .records_dropped_nonconformant == 1
+    and .automated_attempts == 4' >/dev/null; then
+  pass "a record missing a required totals sub-key is dropped from aggregation (#615 round 5)"
+else fail "incomplete-totals rejection: $agg"; fi
+# A fully conformant aggregation reports zero drops (diagnostics honesty).
+agg="$(printf '%s\n' "$GOLDEN" | p4b_acct_aggregate_running_totals github-derived)"
+printf '%s' "$agg" | jq -e '.records_dropped_nonconformant == 0' >/dev/null \
+  && pass "a clean aggregation reports zero dropped records" \
+  || fail "clean-aggregation drop count: $agg"
 agg="$(printf '%s\ngarbage-line\n' "$GOLDEN" | p4b_acct_aggregate_running_totals ledger-cache)"
 [ "$(printf '%s' "$agg" | jq -r '.source')" = "unavailable" ] \
-  && pass "a malformed ledger line degrades the whole aggregation to unavailable (never wrong numbers)" \
+  && pass "a malformed (non-object) ledger line degrades the whole aggregation to unavailable (never wrong numbers)" \
   || fail "malformed line aggregation: $agg"
 agg="$(printf '' | p4b_acct_aggregate_running_totals ledger-cache)"
 if printf '%s' "$agg" | jq -e '.source == "ledger-cache" and .records == 0 and .human_minutes_saved_estimate == null' >/dev/null; then
@@ -1309,6 +1363,35 @@ if printf '%s' "$REC_D" | jq -e '
    && grep -qF 'Unique findings across loops: 1 — 0 on the approved head, 1 historical (earlier loops only).' "$BODY_D2"; then
   pass "fixed-then-approved: the prior-commit finding renders with content and a historical label (#615)"
 else fail "historical labeling end-to-end (rec=$REC_D, body=$(grep -F '| F1 ' "$BODY_D2" 2>/dev/null))"; fi
+
+# (d2) #615 Codex round 5 (fails pre-fix): when recording THIS invocation's
+#      loop fails (a read-only loop-log) but the log ALREADY holds a clean
+#      APPROVED loop, the orchestrator must SKIP the accounting block rather
+#      than render it from the stale log. Pre-fix the render ran off the stale
+#      log and appended a block stamped with the CURRENT head claiming that
+#      head was reviewed while silently OMITTING the current loop (a HEAD-
+#      stamped block that misses this invocation entirely). The plain-summary
+#      approval still posts (exit 0); accounting is advisory. The first
+#      invocation is a normal APPROVED so the log holds a valid approved loop
+#      the stale render could (wrongly) build from.
+STATE_D2="$WORK/state-d2"; BODY_D2A="$WORK/body-d2a.md"; BODY_D2B="$WORK/body-d2b.md"
+set +e
+# First invocation (APPROVED) records + posts loop 1 normally (block present).
+run_orch "$STATE_D2" "$POLICY_ON" fake-codex-approve 220 P4B_WRAPPER_BODY="$BODY_D2A" -- >/dev/null 2>&1; rc1=$?
+# Make the per-PR loop log read-only so the SECOND APPROVED invocation's
+# record-loop append fails while the render read of the stale (approved) log
+# would still succeed — the exact read-only-loop-log case Codex named.
+LOG_D2="$(find "$STATE_D2/phase-4b-loops" -name '*.jsonl' 2>/dev/null | head -n1)"
+chmod 0444 "$LOG_D2" 2>/dev/null
+run_orch "$STATE_D2" "$POLICY_ON" fake-codex-approve 220 P4B_WRAPPER_BODY="$BODY_D2B" -- >/dev/null 2>&1; rc2=$?
+chmod 0644 "$LOG_D2" 2>/dev/null
+set -e
+if [ "$rc1" = 0 ] && [ "$rc2" = 0 ] \
+   && grep -q 'Phase 4b Approval Accounting' "$BODY_D2A" \
+   && grep -q '^\*\*Automated Phase 4b review\*\*' "$BODY_D2B" \
+   && ! grep -q 'Phase 4b Approval Accounting' "$BODY_D2B"; then
+  pass "record-loop failure (read-only log) skips the accounting block even when the stale log holds an approved loop; plain summary posts, exit 0 (#615 round 5)"
+else fail "record-failure skips render (rc1=$rc1 rc2=$rc2, blockA=$(grep -c 'Phase 4b Approval Accounting' "$BODY_D2A" 2>/dev/null) blockB=$(grep -c 'Phase 4b Approval Accounting' "$BODY_D2B" 2>/dev/null))"; fi
 
 # (e) findings-bearing APPROVED verdict → existing fail-closed fallback (exit
 #     4) preserved; the fail-closed loop is recorded as safety evidence.
