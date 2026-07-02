@@ -707,6 +707,17 @@ def flatten_command(cmd, depth=0):
     # spliced there must be quoted to keep one token (#611 round 5:
     # X=$(printf "a b") $(printf gh) pr merge shifted command position).
     cur_word = ""
+    # #611 round 8: a QUOTED-tag heredoc body is pure data — bash performs
+    # no expansion in it and the receiving command just reads it — so its
+    # lines must NOT be flattened into command segments (a fixture write
+    # like cat with a quoted-tag heredoc containing an encoded substitution
+    # was statically expanded and blocked). Bodies are skipped verbatim
+    # UNLESS a shell interpreter appears on the heredoc line (a bash-fed
+    # body executes as a script; keep scanning those, fail-closed).
+    # Unquoted-tag heredocs keep the existing behavior: bash DOES expand
+    # their substitutions, so scanning them is correct.
+    pending_heredocs = []
+    line_start = 0
 
     def _splice(span, in_double_now):
         # Returns the text to append for a substitution span. Three cases:
@@ -768,6 +779,37 @@ def flatten_command(cmd, depth=0):
             cur_word = "" if piece.endswith(" ") else cur_word + piece
             i = j
             continue
+        if (not in_single and not in_double and c == "<" and i + 1 < n
+                and cmd[i + 1] == "<" and (i + 2 >= n or cmd[i + 2] != "<")):
+            # Heredoc operator (not a <<< herestring). A QUOTED tag queues
+            # the body for verbatim skipping at the next newline; an
+            # unquoted or unparsable tag keeps the raw operator text and
+            # the existing body scanning.
+            j = i + 2
+            allow_tabs = False
+            if j < n and cmd[j] == "-":
+                allow_tabs = True
+                j += 1
+            while j < n and cmd[j] in (" ", "\t"):
+                j += 1
+            qch = ""
+            if j < n and (cmd[j] == _SQ or cmd[j] == _DQ):
+                qch = cmd[j]
+                j += 1
+            k2 = j
+            while k2 < n and (cmd[k2].isalnum() or cmd[k2] == "_"):
+                k2 += 1
+            tag = cmd[j:k2]
+            if qch and tag and k2 < n and cmd[k2] == qch:
+                pending_heredocs.append((tag, allow_tabs))
+                out.append(" __MERGEPATH_HEREDOC__ ")
+                cur_word = ""
+                i = k2 + 1
+                continue
+            out.append(cmd[i:i + 2])
+            cur_word += cmd[i:i + 2]
+            i += 2
+            continue
         if not in_single and not in_double:
             two = cmd[i:i + 2]
             if two in ("&&", "||", "|&"):
@@ -783,7 +825,21 @@ def flatten_command(cmd, depth=0):
             if c == "\n":
                 out.append(" ; ")
                 cur_word = ""
+                line = cmd[line_start:i]
                 i += 1
+                if pending_heredocs and not re.search(
+                        r"(^|[^A-Za-z0-9_])(sh|bash|dash|zsh|ksh|eval|source)"
+                        r"([^A-Za-z0-9_]|$)|(^|[\s])\.([\s])", line):
+                    for _tag, _allow_tabs in pending_heredocs:
+                        while i < n:
+                            nl = cmd.find("\n", i)
+                            body_line = cmd[i:] if nl == -1 else cmd[i:nl]
+                            i = n if nl == -1 else nl + 1
+                            chk = body_line.lstrip("\t") if _allow_tabs else body_line
+                            if chk == _tag:
+                                break
+                pending_heredocs = []
+                line_start = i
                 continue
             if c in (" ", "\t"):
                 out.append(c)

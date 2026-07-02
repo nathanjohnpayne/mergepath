@@ -1014,6 +1014,25 @@ assert_rc_contains "IFS-modified synthesized write fails closed (#611 r7)" 2 "wr
 # command word is gh-slash (not gh), which executes nothing gh-related.
 assert_rc_contains "default-IFS gh-slash expansion stays allowed (#611 r7)" 0 "" \
   '$(printf "gh/") pr merge 1'
+
+# --- #611 round 8: quoted-tag heredoc bodies are inert data ---------------
+# bash performs NO expansion inside a quoted-tag heredoc body, so an encoded
+# substitution there is fixture text, not a command — the flattener skips
+# such bodies instead of statically expanding them into command segments.
+assert_rc_contains "quoted-heredoc fixture with encoded write stays allowed (#611 r8)" 0 "" \
+  'cat <<'"'"'EOF'"'"' > /tmp/fixture
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+assert_rc_contains "double-quoted-tag heredoc fixture stays allowed (#611 r8)" 0 "" \
+  'cat <<"EOF" > /tmp/fixture
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+# Fail-closed control: a shell-fed quoted-tag heredoc EXECUTES its body as a
+# script, so the body keeps being scanned and the synthesized write blocks.
+assert_rc_contains "bash-fed quoted-heredoc synthesized write fails closed (#611 r8)" 2 "wrapper" \
+  'bash <<'"'"'EOF'"'"'
+$(printf "\147\150\40\160\162") merge 1
+EOF'
 # (P2) heredoc BODIES are data for the receiving command: a parse failure
 # whose only guarded-verb evidence sits inside a cat heredoc body must not
 # fail closed. A shell interpreter outside the bodies keeps full-text
