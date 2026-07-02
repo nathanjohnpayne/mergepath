@@ -7,8 +7,11 @@
 # The mode drains the routing-class residual on consumer sync PRs
 # (canonical-coverage / templated-render threads, the #562 backlog):
 # routing alone (path membership) never resolves, but when the consumer's
-# CURRENT default-branch content byte-matches mergepath's canonical source
-# (or the re-rendered template with the consumer's facts), the propagation
+# content at the COMPARED REF (the PR head while the PR is open, the
+# default branch once closed/merged — #616) byte-matches mergepath's
+# canonical source (or the re-rendered template with the consumer's
+# facts), the tree entry's mode/type matches the source, and the source
+# carries an upstream fix commit newer than the finding, the propagation
 # is PROVEN and the thread is resolved with the
 # [mergepath-resolve: verified-propagation] tag. Any mismatch or
 # verification error leaves the thread unresolved (fail closed).
@@ -66,6 +69,26 @@
 #      scripts/lib/ensure-yq.sh --ci-only (no `command -v yq` gate — a
 #      wrong-implementation yq on PATH must not skip the bootstrap,
 #      #616 finding 3509930342) and the lib exists.
+#  14. OPEN-PR compare ref (#616 finding 3510170875): while the target PR
+#      is open the byte-compare reads the PR HEAD (ref=<head sha>), not
+#      the default branch. 14: head drift skips even when the default
+#      branch byte-matches (pre-fix this resolved — REGRESSION, fails
+#      pre-fix). 14b: a byte-matching head resolves even when the
+#      default branch drifts (also fails pre-fix, locking that open PRs
+#      are compared, not blanket-skipped).
+#  15. Upstream-fix evidence gate (#616 finding 3510170879): a byte-match
+#      whose mergepath source has NO commit strictly newer than the
+#      finding's staleness floor skips fail-closed under the dedicated
+#      no-upstream-evidence counter (pre-fix this resolved — REGRESSION,
+#      fails pre-fix). The proceed direction (commit newer than the
+#      floor) is locked by tests 1/2/8/9: the fixture repo's commit is
+#      backdated to 2026-02-01, after their threads' 2026-01-01
+#      createdAt.
+#  16. Tree-entry mode/type gate (#616 finding 3510170883): byte-equal
+#      content whose consumer tree entry is chmod-flipped (100755 blob
+#      vs the committed 100644 source) skips as drift (pre-fix this
+#      resolved — REGRESSION, fails pre-fix); 16b: a trees-API lookup
+#      failure skips fail-closed (verification error).
 
 set -euo pipefail
 
@@ -156,11 +179,37 @@ react block enabled
 greeting is hola
 OUT
 
+# The #616 upstream-fix evidence gate requires REPO_ROOT_FOR_MANIFEST to
+# be a git work tree whose latest commit touching the mergepath source is
+# STRICTLY NEWER than the finding's staleness floor, and the tree-entry
+# gate reads the source's COMMITTED mode via `git ls-tree HEAD`. Make the
+# fixture tree a real git repo with one BACKDATED commit (2026-02-01):
+# newer than the default thread createdAt (2026-01-01 → evidence present
+# for the happy-path tests) and older than test 15's createdAt
+# (2026-03-01 → no evidence, fail-closed skip). Test 7's later template
+# corruption stays uncommitted on purpose — the render reads the working
+# tree, while ls-tree/log read HEAD.
+git -C "$FIXTURE_ROOT" init -q
+git -C "$FIXTURE_ROOT" add -A
+GIT_AUTHOR_DATE="2026-02-01T00:00:00Z" GIT_COMMITTER_DATE="2026-02-01T00:00:00Z" \
+  git -C "$FIXTURE_ROOT" -c user.name=fixture -c user.email=fixture@example.com \
+  -c commit.gpgsign=false commit -q -m "fixture tree (backdated for the #616 evidence gate)"
+
 # make_gh_stub <stub-path> <threads-file>
 # Routes graphql calls on the recorded lastcall body (same shape as the
-# sibling resolve-pr-threads tests) plus the #572 REST routes:
-#   repos/*/contents/*  → consumer CURRENT content ($CONSUMER_CONTENT_FILE),
-#                         or a hard failure when GH_STUB_FAIL_CONTENTS=1
+# sibling resolve-pr-threads tests) plus the #572/#616 REST routes:
+#   repos/*/contents/*  → consumer content: the DEFAULT-BRANCH fixture
+#                         ($CONSUMER_CONTENT_FILE) normally, the PR-HEAD
+#                         fixture ($CONSUMER_HEAD_CONTENT_FILE, falling
+#                         back to the default-branch one) when the URL
+#                         carries ref=HEADCURRENT (#616 3510170875), or a
+#                         hard failure when GH_STUB_FAIL_CONTENTS=1
+#   repos/*/git/trees/* → the consumer tree listing ($CONSUMER_TREE_FILE;
+#                         #616 3510170883), or a hard failure when
+#                         GH_STUB_FAIL_TREES=1
+#   repos/*/pulls/<n>   → --jq .head.sha → "HEADCURRENT"; --jq .state →
+#                         $GH_STUB_PR_STATE (default "closed", the #562
+#                         backlog shape; #616 3510170875)
 #   repos/{owner}/{repo} (bare) → default branch ("main"; the script reads
 #                         --jq .default_branch, which stubs return bare)
 make_gh_stub() {
@@ -213,7 +262,22 @@ case "\$1" in
           echo "simulated contents fetch failure" >&2
           exit 1
         fi
-        cat "\$CONSUMER_CONTENT_FILE"
+        case "\$__url" in
+          *"ref=HEADCURRENT"*)
+            # Open-PR compare ref — serve the PR HEAD's content (#616).
+            cat "\${CONSUMER_HEAD_CONTENT_FILE:-\$CONSUMER_CONTENT_FILE}"
+            ;;
+          *)
+            cat "\$CONSUMER_CONTENT_FILE"
+            ;;
+        esac
+        ;;
+      "repos/"*"/git/trees/"*)
+        if [ -n "\${GH_STUB_FAIL_TREES:-}" ]; then
+          echo "simulated trees fetch failure" >&2
+          exit 1
+        fi
+        cat "\$CONSUMER_TREE_FILE"
         ;;
       "repos/"*"/pulls/"*"/files"*)
         echo '[]'
@@ -225,7 +289,14 @@ case "\$1" in
         echo '[]'
         ;;
       "repos/"*"/pulls/"*)
-        echo "HEADCURRENT"
+        # Two scalars come off this endpoint: --jq .head.sha (HEAD oid)
+        # and --jq .state (compare-ref selection, #616). Route on the jq
+        # expression present in argv.
+        if printf '%s\n' "\$@" | grep -qxF '.state'; then
+          echo "\${GH_STUB_PR_STATE:-closed}"
+        else
+          echo "HEADCURRENT"
+        fi
         ;;
       "repos/"*)
         # Bare repos/{owner}/{repo} — default-branch fetch.
@@ -258,13 +329,18 @@ WRAP_STUB
   chmod +x "$wrapper_path"
 }
 
-# make_thread_fixture <thread-id> <path> <author> <body> <oid> <out-file>
+# make_thread_fixture <thread-id> <path> <author> <body> <oid> <out-file> \
+#     [created-at]
 # Single non-truncated bot (or human) thread — the enumeration shape the
-# script projects.
+# script projects. The optional created-at (default 2026-01-01, BEFORE the
+# fixture repo's backdated 2026-02-01 commit) is the finding's staleness
+# floor for the #616 upstream-evidence gate; test 15 pushes it past the
+# commit date.
 make_thread_fixture() {
   local thread_id="$1" anchor_path="$2" author="$3" body="$4" oid="$5" out_file="$6"
+  local created="${7:-2026-01-01T00:00:00Z}"
   jq -nc --arg id "$thread_id" --arg p "$anchor_path" \
-     --arg a "$author" --arg b "$body" --arg o "$oid" '
+     --arg a "$author" --arg b "$body" --arg o "$oid" --arg c "$created" '
     {data:{repository:{pullRequest:{reviewThreads:{
       totalCount: 1,
       pageInfo: {hasNextPage: false, endCursor: null},
@@ -272,14 +348,14 @@ make_thread_fixture() {
         id: $id, isResolved: false, isOutdated: false,
         commentsFirst: {nodes: [{
           author: {login: $a}, path: $p, body: $b,
-          createdAt: "2026-01-01T00:00:00Z"
+          createdAt: $c
         }]},
         commentsLast: {nodes: [{commit: {oid: $o}}]},
         allComments: {
           totalCount: 1,
           pageInfo: {hasPreviousPage: false},
           nodes: [{author: {login: $a}, body: $b, databaseId: 1001,
-                   createdAt: "2026-01-01T00:00:00Z"}]
+                   createdAt: $c}]
         }
       }]
     }}}}}' > "$out_file"
@@ -321,17 +397,41 @@ make_thread_fixture_with_reply() {
 }
 
 # run_mode <threads-file> <content-file> [extra-flag ...] → runs the mode,
-# sets $out and $rc. Extra env via the RUN_* variables.
+# sets $out and $rc. Extra env via the RUN_* variables:
+#   RUN_FAIL_CONTENTS=1        contents fetch hard-fails
+#   RUN_FAIL_TREES=1           git-trees fetch hard-fails (#616)
+#   RUN_PR_STATE=open|closed   PR state served to --jq .state
+#                              (default closed — the #562 backlog shape)
+#   RUN_HEAD_CONTENT_FILE=...  content served at ref=HEADCURRENT (open-PR
+#                              compare; default: same as <content-file>)
+#   RUN_TREE_MODE=100755       mode reported for every consumer tree
+#                              entry (default 100644, matching the
+#                              fixture repo's committed modes)
+#   RUN_TREE_FILE=...          full override of the tree listing
 run_mode() {
   local threads_file="$1" content_file="$2"
   shift 2
   make_gh_stub "$SCRATCH/gh-real" "$threads_file"
   make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  local tree_file="${RUN_TREE_FILE:-$SCRATCH/consumer-tree.json}"
+  if [ -z "${RUN_TREE_FILE:-}" ]; then
+    jq -n --arg m "${RUN_TREE_MODE:-100644}" '{
+      truncated: false,
+      tree: [
+        {path: "docs/canonical.md", mode: $m, type: "blob"},
+        {path: "rendered/out.txt",  mode: $m, type: "blob"}
+      ]
+    }' > "$tree_file"
+  fi
   set +e
   out=$(
     GH_ARGV_LOG="$GH_ARGV_LOG" \
     CONSUMER_CONTENT_FILE="$content_file" \
+    CONSUMER_HEAD_CONTENT_FILE="${RUN_HEAD_CONTENT_FILE:-}" \
+    CONSUMER_TREE_FILE="$tree_file" \
     GH_STUB_FAIL_CONTENTS="${RUN_FAIL_CONTENTS:-}" \
+    GH_STUB_FAIL_TREES="${RUN_FAIL_TREES:-}" \
+    GH_STUB_PR_STATE="${RUN_PR_STATE:-closed}" \
     RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
     PATH="$SCRATCH:$PATH" \
     env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
@@ -859,6 +959,153 @@ if [ -f "$CHECK_WRAPPER" ] \
 else
   fail=$((fail + 1))
   echo "  FAIL: check_resolve_pr_threads must delegate to ensure-yq.sh --ci-only WITHOUT a command -v yq gate (#616 finding 3509930342)" >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 14: OPEN-PR compare ref (#616 finding 3510170875) — REGRESSION,
+# fails pre-fix. The target PR is OPEN and its HEAD drifts from the
+# canonical source while the DEFAULT BRANCH byte-matches. Pre-fix the
+# mode compared the default branch and RESOLVED the thread even though
+# the content being merged still carried drift; post-fix the compare
+# reads ref=HEADCURRENT (the PR head sha) and skips as drift. Reuses the
+# canonical-arm thread fixture (threads_vp1).
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 14: open PR — head drift skips even when the default branch matches (#616)"
+
+GH_ARGV_LOG="$SCRATCH/t14.log"; : > "$GH_ARGV_LOG"
+RUN_PR_STATE=open RUN_HEAD_CONTENT_FILE="$CONSUMER_DRIFT_CANONICAL" \
+  run_mode "$SCRATCH/threads_vp1.json" "$CONSUMER_MATCH_CANONICAL"
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (propagation NOT verified — content drift)' <<<"$out" \
+   && grep -q 'contents/docs/canonical.md?ref=HEADCURRENT' "$GH_ARGV_LOG" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: open-PR compare read the PR head (ref=HEADCURRENT) and skipped the drift"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: open-PR head drift was not skipped (rc=$rc) — default-branch match resolved over PR-head drift?" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 14b: the other direction — the OPEN PR's head byte-matches while
+# the default branch drifts → the thread RESOLVES on the head compare.
+# Locks that open PRs are genuinely compared against their head, not
+# blanket-skipped (also fails pre-fix: the default-branch compare saw
+# drift and skipped).
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 14b: open PR — byte-matching head resolves even when the default branch drifts (#616)"
+
+GH_ARGV_LOG="$SCRATCH/t14b.log"; : > "$GH_ARGV_LOG"
+RUN_PR_STATE=open RUN_HEAD_CONTENT_FILE="$CONSUMER_MATCH_CANONICAL" \
+  run_mode "$SCRATCH/threads_vp1.json" "$CONSUMER_DRIFT_CANONICAL"
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'contents/docs/canonical.md?ref=HEADCURRENT' "$GH_ARGV_LOG" \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: verified-propagation\] consumer content at docs/canonical.md byte-matches the mergepath canonical source' "$GH_ARGV_LOG" \
+   && grep -q 'Readback: all 1 resolved thread(s) confirmed isResolved:true' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: open-PR head byte-match resolved via the head compare"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: open-PR byte-matching head did not resolve (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 15: upstream-fix evidence gate (#616 finding 3510170879) —
+# REGRESSION, fails pre-fix. The thread's createdAt (2026-03-01) is
+# NEWER than the fixture repo's only commit touching docs/canonical.md
+# (backdated 2026-02-01), so a byte-match proves only that the consumer
+# mirrors the CURRENT — possibly still-problematic — source. Pre-fix the
+# byte-match resolved and buried the finding; post-fix it skips
+# fail-closed under the dedicated no-upstream-evidence counter. The
+# proceed direction (commit strictly newer than the floor) is locked by
+# tests 1/2/8/9/14b, whose threads pre-date the commit.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 15: byte-match without a newer upstream fix commit skips fail-closed (#616)"
+
+make_thread_fixture "PRT_VP15" "docs/canonical.md" "coderabbitai" \
+  "Finding newer than the last upstream commit" "OLDCOMMIT0" \
+  "$SCRATCH/threads_vp15.json" "2026-03-01T00:00:00Z"
+
+GH_ARGV_LOG="$SCRATCH/t15.log"; : > "$GH_ARGV_LOG"
+run_mode "$SCRATCH/threads_vp15.json" "$CONSUMER_MATCH_CANONICAL"
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (no upstream-fix evidence — failing closed)' <<<"$out" \
+   && grep -q 'byte-match without upstream-fix evidence' <<<"$out" \
+   && grep -q 'Skipped (no-upstream-evidence): 1' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: no-newer-commit byte-match skipped fail-closed (dedicated counter), exit 3, no mutations"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: byte-match without upstream evidence was not skipped (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 16: tree-entry mode/type gate (#616 finding 3510170883) —
+# REGRESSION, fails pre-fix. The consumer bytes equal the canonical
+# source but the consumer tree entry is chmod-flipped (100755 blob vs
+# the fixture repo's committed 100644 blob). The real propagation
+# verifier (verify-propagation-pr.sh) rejects exactly this metadata
+# drift; pre-fix the byte-only compare resolved it. Post-fix it skips
+# as drift with the tree-entry reason.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 16: chmod-flipped consumer tree entry skips despite byte-equal content (#616)"
+
+GH_ARGV_LOG="$SCRATCH/t16.log"; : > "$GH_ARGV_LOG"
+RUN_TREE_MODE=100755 run_mode "$SCRATCH/threads_vp1.json" "$CONSUMER_MATCH_CANONICAL"
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (propagation NOT verified — content drift)' <<<"$out" \
+   && grep -q 'consumer tree entry for docs/canonical.md is \[100755 blob\], expected \[100644 blob\]' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: mode-flipped tree entry skipped as drift (byte-equality was not sufficient)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: chmod-flipped consumer entry was not rejected (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 16b: a git-trees lookup failure is a fail-closed VERIFICATION
+# ERROR — an entry whose mode/type cannot be read never resolves.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 16b: trees-API lookup failure skips fail-closed (#616)"
+
+GH_ARGV_LOG="$SCRATCH/t16b.log"; : > "$GH_ARGV_LOG"
+RUN_FAIL_TREES=1 run_mode "$SCRATCH/threads_vp1.json" "$CONSUMER_MATCH_CANONICAL"
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (propagation verification failed — failing closed)' <<<"$out" \
+   && grep -q 'could not read the consumer tree entry for docs/canonical.md' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: unreadable tree entry skipped fail-closed, exit 3, no mutations"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: trees lookup failure did not fail closed (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
 
 echo

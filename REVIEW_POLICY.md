@@ -452,10 +452,17 @@ that can change GitHub conversation state.
      is the tool for **verified canonical propagation** — routing-class
      threads (`canonical-coverage`, `templated-render`) whose durable fix
      already landed in mergepath and demonstrably reached this consumer.
-     It resolves a thread only when the consumer file at the
-     default-branch HEAD byte-matches the mergepath canonical source (or,
-     for templated entries, the rendered template output for that
-     consumer), tagging `verified-propagation` (#572). Any lookup, fetch,
+     It resolves a thread only when the consumer file at the compared
+     ref — the PR's own head while the PR is open (so a pre-merge run
+     never resolves over drift the PR itself carries), the
+     default-branch HEAD once it is closed/merged — byte-matches the
+     mergepath canonical source (or, for templated entries, the rendered
+     template output for that consumer), the consumer tree entry's
+     mode/type matches the source (chmod flip / symlink swap rejection),
+     and the mergepath source has a fix commit strictly newer than the
+     finding (upstream-fix evidence; a pre-dating fix skips
+     conservatively — resolve manually with evidence), tagging
+     `verified-propagation` (#572, #616). Any lookup, fetch,
      or render failure is a fail-closed skip, never a resolve. A thread
      with action evidence is auto-upgraded to its truthful actioned class
      first (#575); unverifiable threads are left for the weekly sweep.

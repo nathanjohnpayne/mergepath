@@ -524,16 +524,20 @@ fi
 # ── Test 10: delegate to tests/test_resolve_pr_threads_verified_propagation.sh
 # Exercises the #572 --resolve-verified-propagation mode: canonical/templated
 # routing-class threads resolve ONLY on a byte-verified propagation match
-# (consumer current content vs mergepath canonical source / re-rendered
-# template with consumer facts), with drift and every verification failure
-# skipped fail-closed, surface-class + human threads untouched, and a
-# working --dry-run preview. Also covers the #616 fixes: routing as a pure
-# path predicate (a previously recorded deferral marker never blocks the
-# classification), the actioned-evidence upgrade to the truthful
-# addressed-elsewhere/rebuttal-recorded tag, and the CI-only yq bootstrap
-# above (scripts/lib/ensure-yq.sh). The --auto-resolve-bots #575
-# deferred→actioned tag auto-upgrade guard is covered by the rationale-tag
-# suite (Test 8 above). Same delegation pattern as Tests 8/9.
+# (consumer content at the compared ref vs mergepath canonical source /
+# re-rendered template with consumer facts), with drift and every
+# verification failure skipped fail-closed, surface-class + human threads
+# untouched, and a working --dry-run preview. Also covers the #616 fixes:
+# routing as a pure path predicate (a previously recorded deferral marker
+# never blocks the classification), the actioned-evidence upgrade to the
+# truthful addressed-elsewhere/rebuttal-recorded tag, the CI-only yq
+# bootstrap above (scripts/lib/ensure-yq.sh), and the round-4 verification
+# gates — open-PR compares read the PR HEAD ref (3510170875), byte-match
+# requires an upstream fix commit newer than the finding (3510170879), and
+# tree-entry mode/type parity mirrors verify-propagation-pr.sh
+# (3510170883). The --auto-resolve-bots #575 deferred→actioned tag
+# auto-upgrade guard is covered by the rationale-tag suite (Test 8 above).
+# Same delegation pattern as Tests 8/9.
 echo
 echo "resolve-pr-threads.sh verified-propagation resolution (#572)"
 

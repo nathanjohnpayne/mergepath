@@ -136,9 +136,12 @@ resolved; that is a blocked gate, not a disposition prompt.) Do not present a
    that mis-records them as deferred (the #571 failure).
    `--resolve-verified-propagation` is the tool for **verified canonical
    propagation** — routing-class threads (canonical-coverage /
-   templated-render) resolved only when the consumer file at the
-   default-branch HEAD byte-matches the mergepath canonical source (or
-   rendered template output), tagging `verified-propagation`; any lookup,
+   templated-render) resolved only when the consumer file at the compared
+   ref (the PR head while the PR is open; the default-branch HEAD once
+   closed/merged) byte-matches the mergepath canonical source (or
+   rendered template output) with a matching tree-entry mode/type, and
+   the mergepath source carries a fix commit newer than the finding
+   (#616), tagging `verified-propagation`; any lookup,
    fetch, or render failure is a fail-closed skip (#572). All modes run an
    identity-checked `resolveReviewThread` plus a readback confirming
    `isResolved: true` and fail closed otherwise. For stale bot-authored
