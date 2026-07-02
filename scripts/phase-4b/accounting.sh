@@ -80,29 +80,48 @@ p4b_acct_config() {
 
 # p4b_acct_config_field <field> — scalar under
 # phase_4b_automation.accounting.<field>. Empty string if absent.
+# Indent-agnostic (#615 Codex round 4): the previous reader hardcoded the
+# two-space style (an `accounting:` header at exactly column 2, children at
+# indent > 2), so a downstream policy formatted with four-space children
+# never entered the sub-block — `accounting.enabled: false` read as ABSENT,
+# defaulted to true, and an opted-out repo still got accounting appended.
+# Now mirrors the lib.sh p4b_automation_field mechanism: the automation
+# block's direct-child indent is captured from its first key line, the
+# `accounting:` header must sit exactly at that indent (a deeper `accounting:`
+# inside some other sub-block never matches), and the accounting block's own
+# child indent is captured from ITS first key line — any consistent style
+# works, and only direct children of `accounting:` resolve.
 p4b_acct_config_field() {
   local field="$1" cfg
   cfg="$(p4b_acct_config)"
   [ -f "$cfg" ] || return 0
   awk -v field="$field" '
-    /^phase_4b_automation:/ { inauto=1; inacct=0; next }
+    /^phase_4b_automation:/ { inauto=1; inacct=0; auto_ci=-1; acct_indent=-1; acct_ci=-1; next }
     inauto && /^[^[:space:]#]/ { inauto=0; inacct=0 }
-    inauto && /^[[:space:]][[:space:]]accounting:[[:space:]]*(#.*)?$/ { inacct=1; next }
-    inauto && inacct {
+    inauto {
       line=$0
       gsub(/[[:space:]]*#.*$/, "", line)
       if (line ~ /^[[:space:]]*$/) next
       indent = match(line, /[^[:space:]]/) - 1
-      if (indent <= 2) { inacct=0; next }
-      key=line
-      sub(/^[[:space:]]*/, "", key)
-      sub(/:.*/, "", key)
-      if (key == field) {
-        sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", line)
-        gsub(/^["\047]/, "", line)
-        gsub(/["\047][[:space:]]*$/, "", line)
-        sub(/[[:space:]]+$/, "", line)
-        print line; exit
+      if (inacct && indent <= acct_indent) inacct=0
+      if (inacct) {
+        if (acct_ci < 0) acct_ci = indent
+        if (indent > acct_ci) next
+        key=line
+        sub(/^[[:space:]]*/, "", key)
+        sub(/:.*/, "", key)
+        if (key == field) {
+          sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", line)
+          gsub(/^["\047]/, "", line)
+          gsub(/["\047][[:space:]]*$/, "", line)
+          sub(/[[:space:]]+$/, "", line)
+          print line; exit
+        }
+        next
+      }
+      if (auto_ci < 0) auto_ci = indent
+      if (indent == auto_ci && line ~ /^[[:space:]]*accounting:[[:space:]]*$/) {
+        inacct=1; acct_indent=indent; acct_ci=-1
       }
     }
   ' "$cfg"
@@ -1011,6 +1030,9 @@ p4b_acct_render_block() {
   # aggregation whose scan window was NOT truncated; a cap-truncated scan
   # is labeled as a bounded window of recently updated merged PRs, and the
   # ledger-cache fallback as the local cache it is — never repo-wide.
+  # Nested review truncation (#615 round 4) folds into the same truncated
+  # labeling, and the footer additionally names the PRs whose deeper review
+  # history was left unscanned.
   local rt_source rt_trunc rt_scanned
   rt_source="$(printf '%s' "$rec" | jq -r '.running_totals.source')"
   rt_trunc="$(printf '%s' "$rec" | jq -r '.running_totals.window.truncated // false')"
@@ -1066,6 +1088,9 @@ p4b_acct_render_block() {
       "*Totals source: \(.running_totals.source) (\(.running_totals.records) prior record(s))"
       + (if (.running_totals.window.truncated // false)
          then "; window: last \(.running_totals.window.scanned_prs) merged PRs — older history beyond the scan cap is not included"
+         else "" end)
+      + (if ((.running_totals.window.review_truncated_prs // 0) > 0)
+         then "; \(.running_totals.window.review_truncated_prs) scanned PR(s) hold more reviews than the nested review window — their older reviews are not included"
          else "" end)
       + ".*"'
     printf '\n\n'
@@ -1205,9 +1230,20 @@ p4b_acct_hook_record_loop() {
   log="$(p4b_acct_hook_loop_log)" || return 1
   logdir="$(dirname "$log")"
   mkdir -p "$logdir" 2>/dev/null || return 1
+  # The next loop number counts the JSON OBJECTS already in the log, not its
+  # lines (#615 Codex round 4). Every writer here is compact-JSONL already —
+  # the append below is jq -nc and the unposted-correction rewrite is jq -cs
+  # (one object per line, verified by test) — but a line count would silently
+  # inflate loop IDs (and break the finding-lifecycle links keyed on them) if
+  # a record ever spanned multiple lines, so numbering is anchored to the
+  # parse instead. A log jq cannot parse falls back to the historical line
+  # count (degraded numbering, never a blocked loop).
   loopno=1
   if [ -f "$log" ]; then
-    loopno="$(($(wc -l < "$log") + 1))" 2>/dev/null || loopno=1
+    loopno="$(jq -s 'length + 1' "$log" 2>/dev/null)" || loopno=""
+    case "$loopno" in
+      ''|*[!0-9]*) loopno="$(($(wc -l < "$log") + 1))" 2>/dev/null || loopno=1 ;;
+    esac
   fi
 
   if [ "$vlabel" = "UNAVAILABLE" ] || [ -z "${VERDICT_JSON:-}" ]; then
@@ -1325,11 +1361,23 @@ p4b_acct_hook_note_fallback() {
 # P4B_ACCT_PRIOR_SCAN_PRS PRs each (default 50, so up to 200 merged PRs by
 # default). When history remains beyond the cap the scan is TRUNCATED and
 # the caller must label the totals as a bounded window — never repo-wide.
+#
+# Nested review window (#615 round 4): each scanned PR contributes only its
+# LAST 50 reviews, so a PR with a deeper review history could silently omit
+# an older embedded record while the PR-level scan looked complete. The
+# query now requests the nested reviews pageInfo.hasPreviousPage, and any
+# PR whose review list is truncated makes the WHOLE scan window
+# truncated=true (the round-3 honest-labeling path) — a deliberate choice
+# over per-PR nested pagination: 50+ reviews on one PR is rare, and honest
+# bounded-window labeling is acceptable where silent omission is not.
+#
 # The window is reported through globals (this function is invoked with an
 # output redirect, not a subshell, so they persist):
 #   P4B_ACCT_PRIOR_FETCH_SCANNED_PRS      merged PRs actually scanned
 #   P4B_ACCT_PRIOR_FETCH_TRUNCATED        true|false (older history left)
 #   P4B_ACCT_PRIOR_FETCH_SKIPPED_RECORDS  untrusted-author records skipped
+#   P4B_ACCT_PRIOR_FETCH_REVIEW_TRUNCATED_PRS  scanned PRs whose review list
+#                                              exceeded the nested window
 #
 # Trusted authors only (#615 round 3): the spec aggregates reviews by the
 # registered `available_reviewers` identities. The query fetches each
@@ -1346,13 +1394,15 @@ p4b_acct_hook_note_fallback() {
 # PATH-shimmed gh.
 p4b_acct_fetch_prior_records() {
   local repo="${1:-}" owner name per_page max_pages trusted
-  local page cursor resp page_records page_skipped nodes has_next
-  local records="" scanned=0 skipped=0
+  local page cursor resp page_records page_skipped page_rtrunc nodes has_next
+  local records="" scanned=0 skipped=0 rtrunc=0
   local -a args
   P4B_ACCT_PRIOR_FETCH_SCANNED_PRS=0
   P4B_ACCT_PRIOR_FETCH_TRUNCATED=false
   # shellcheck disable=SC2034  # documented contract: read by callers/tests after the call
   P4B_ACCT_PRIOR_FETCH_SKIPPED_RECORDS=0
+  # shellcheck disable=SC2034  # documented contract: read by callers/tests after the call
+  P4B_ACCT_PRIOR_FETCH_REVIEW_TRUNCATED_PRS=0
   case "$repo" in
     */*) ;;
     *) return 1 ;;
@@ -1382,7 +1432,9 @@ p4b_acct_fetch_prior_records() {
             pullRequests(states: MERGED, first: $prs, after: $after,
                          orderBy: {field: UPDATED_AT, direction: DESC}) {
               pageInfo { hasNextPage endCursor }
-              nodes { reviews(last: 50) { nodes { body author { login } } } }
+              nodes { reviews(last: 50) {
+                pageInfo { hasPreviousPage }
+                nodes { body author { login } } } }
             }
           }
         }' 2>/dev/null)" || return 1
@@ -1410,6 +1462,15 @@ p4b_acct_fetch_prior_records() {
       '.data.repository.pullRequests.nodes | length' 2>/dev/null)" || nodes=0
     case "$nodes" in ''|*[!0-9]*) nodes=0 ;; esac
     scanned=$((scanned + nodes))
+    # Nested review truncation (#615 round 4): PRs whose review connection
+    # holds more reviews than the nested last:50 window. Absent pageInfo
+    # (older fixtures / defensive) counts as not-truncated.
+    page_rtrunc="$(printf '%s' "$resp" | jq -r '
+      [ .data.repository.pullRequests.nodes[]
+        | select(.reviews.pageInfo.hasPreviousPage == true) ]
+      | length' 2>/dev/null)" || page_rtrunc=0
+    case "$page_rtrunc" in ''|*[!0-9]*) page_rtrunc=0 ;; esac
+    rtrunc=$((rtrunc + page_rtrunc))
     has_next="$(printf '%s' "$resp" | jq -r \
       '.data.repository.pullRequests.pageInfo.hasNextPage // false' 2>/dev/null)" || has_next=false
     cursor="$(printf '%s' "$resp" | jq -r \
@@ -1422,9 +1483,14 @@ p4b_acct_fetch_prior_records() {
   P4B_ACCT_PRIOR_FETCH_SCANNED_PRS="$scanned"
   # shellcheck disable=SC2034  # documented contract: read by callers/tests after the call
   P4B_ACCT_PRIOR_FETCH_SKIPPED_RECORDS="$skipped"
+  P4B_ACCT_PRIOR_FETCH_REVIEW_TRUNCATED_PRS="$rtrunc"
   if [ "$has_next" = "true" ]; then
     P4B_ACCT_PRIOR_FETCH_TRUNCATED=true
     p4b_acct_warn "prior-record scan stopped at its page cap after $scanned merged PR(s) with older history remaining — totals will be labeled as a bounded window, not repo-wide (#615 round 3)"
+  fi
+  if [ "$rtrunc" -gt 0 ]; then
+    P4B_ACCT_PRIOR_FETCH_TRUNCATED=true
+    p4b_acct_warn "$rtrunc scanned PR(s) hold more reviews than the nested 50-review window — their older reviews (and any embedded records in them) were not scanned; totals will be labeled as a bounded window, not repo-wide (#615 round 4)"
   fi
   if [ "$skipped" -gt 0 ]; then
     p4b_acct_warn "skipped $skipped prior accounting record(s) embedded by unregistered review author(s) — diagnostics only, never aggregated (#615 round 3)"
@@ -1468,9 +1534,11 @@ p4b_acct_hook_running_totals() {
     rm -f "$fetched" 2>/dev/null || true
     rt_w="$(printf '%s' "$rt" | jq -c \
       --argjson scanned "${P4B_ACCT_PRIOR_FETCH_SCANNED_PRS:-0}" \
-      --argjson trunc "${P4B_ACCT_PRIOR_FETCH_TRUNCATED:-false}" '
+      --argjson trunc "${P4B_ACCT_PRIOR_FETCH_TRUNCATED:-false}" \
+      --argjson rtrunc "${P4B_ACCT_PRIOR_FETCH_REVIEW_TRUNCATED_PRS:-0}" '
       if .source == "github-derived"
-      then . + {window: {scanned_prs: $scanned, truncated: $trunc}}
+      then . + {window: {scanned_prs: $scanned, truncated: $trunc,
+                         review_truncated_prs: $rtrunc}}
       else . end' 2>/dev/null)" || rt_w=""
     if [ -n "$rt_w" ]; then printf '%s' "$rt_w"; else printf '%s' "$rt"; fi
     return 0

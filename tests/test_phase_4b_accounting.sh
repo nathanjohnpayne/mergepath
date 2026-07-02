@@ -130,6 +130,50 @@ phase_4b_automation:
   mode: local
 YAML
 
+# #615 round 4 indent fixtures: the SAME policies formatted with four-space
+# children. The sub-block reader hardcoded the two-space style, so the
+# nested accounting block was never entered — accounting.enabled: false read
+# as ABSENT (default true) and an opted-out repo still got accounting.
+POLICY_ACCT_OFF4="$WORK/policy-acct-off-4space.yml"
+cat > "$POLICY_ACCT_OFF4" <<'YAML'
+available_reviewers:
+    - nathanpayne-claude
+    - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+    enabled: true
+    mode: local
+    accounting:
+        enabled: false
+YAML
+POLICY_ACCT_PRICES4="$WORK/policy-acct-prices-4space.yml"
+cat > "$POLICY_ACCT_PRICES4" <<'YAML'
+available_reviewers:
+    - nathanpayne-claude
+    - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+    enabled: true
+    mode: local
+    accounting:
+        enabled: true            # explicit, with a trailing comment
+        codex_price_key: testprov.model-x.standard   # fixture key
+YAML
+# Guard: an `accounting:` header nested INSIDE another sub-block is not the
+# accounting sub-block — its keys must never resolve (direct children only,
+# mirroring the round-3 p4b_automation_field semantics).
+POLICY_ACCT_DEEP="$WORK/policy-acct-deep.yml"
+cat > "$POLICY_ACCT_DEEP" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+default_external_reviewer: nathanpayne-codex
+phase_4b_automation:
+  enabled: true
+  some_future_block:
+    accounting:
+      enabled: false
+YAML
+
 # Deterministic test price table (never depend on live prices for math).
 TEST_PRICES="$WORK/prices-test.json"
 cat > "$TEST_PRICES" <<'JSON'
@@ -298,6 +342,24 @@ v="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ACCT_PRICES" p4b_acct_config_field cl
   || fail "claude_price_key -> '$v'"
 v="$(p4b_acct_config_field codex_price_key)"
 [ -z "$v" ] && pass "unset price key reads empty (notional stays n/a)" || fail "unset price key -> '$v'"
+# #615 round 4 (fails pre-fix): a four-space-indented policy never entered
+# the nested accounting block, so an explicit opt-out was silently ignored.
+MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ACCT_OFF4" p4b_acct_config_enabled \
+  && fail "four-space accounting.enabled: false ignored (opt-out must work at any consistent indent)" \
+  || pass "four-space-indented accounting.enabled: false disables the sub-toggle (#615 round 4)"
+# (fails pre-fix) …and price keys under four-space children were ignored too.
+v="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ACCT_PRICES4" p4b_acct_config_field codex_price_key)"
+[ "$v" = "testprov.model-x.standard" ] \
+  && pass "four-space nested reader resolves price keys (strips trailing comment)" \
+  || fail "four-space codex_price_key -> '$v'"
+MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ACCT_PRICES4" p4b_acct_config_enabled \
+  && pass "four-space accounting.enabled: true honored" \
+  || fail "four-space explicit enabled true rejected"
+# Guard (passes pre- and post-fix): an accounting: header nested inside some
+# OTHER sub-block is not phase_4b_automation.accounting — direct children only.
+MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ACCT_DEEP" p4b_acct_config_enabled \
+  && pass "a deeper-nested accounting: block never shadows the real sub-block (direct children only)" \
+  || fail "deep-nested accounting.enabled: false wrongly resolved as the sub-toggle"
 
 # ===========================================================================
 echo "accounting.sh — verdict → accounting mappers"
@@ -904,6 +966,58 @@ if printf '%s' "$LCBLOCK" | grep -q '^### Running totals — local ledger cache 
   pass "ledger-cache totals no longer claim repo, to date (#615 round 3)"
 else fail "ledger-cache heading: $(printf '%s' "$LCBLOCK" | grep '### Running totals')"; fi
 
+# --- nested review truncation (#615 round 4) --------------------------------
+# A PR with more reviews than the nested last:50 window can silently omit an
+# older embedded approval while PR-level pagination looks complete. The fetch
+# now reads the nested reviews pageInfo.hasPreviousPage and any truncated
+# review list makes the WHOLE scan window truncated (honest labeling; nested
+# pagination deliberately not attempted — see the fetch contract).
+RTRUNC_DIR="$WORK/gh-review-trunc"; mkdir -p "$RTRUNC_DIR"
+jq -n --arg b "$(mkbody "$GOLDEN")" '
+  {data:{repository:{pullRequests:{
+    pageInfo:{hasNextPage:false, endCursor:null},
+    nodes:[
+      {reviews:{pageInfo:{hasPreviousPage:true},
+                nodes:[{author:{login:"nathanpayne-codex"}, body:$b}]}},
+      {reviews:{pageInfo:{hasPreviousPage:false}, nodes:[]}}
+    ]}}}}' > "$RTRUNC_DIR/page1.json"
+# (fails pre-fix: the query had no nested pageInfo, so the scan reported
+# truncated=false and the totals claimed repo, to date)
+set +e
+PATH="$BIN:$PATH" P4B_FAKE_GRAPHQL_PAGE_DIR="$RTRUNC_DIR" \
+  p4b_acct_fetch_prior_records o/r > "$WORK/fetch-rtrunc.jsonl" 2>"$WORK/fetch-rtrunc.err"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && [ "$(grep -c . "$WORK/fetch-rtrunc.jsonl")" = "1" ] \
+   && [ "${P4B_ACCT_PRIOR_FETCH_TRUNCATED:-}" = "true" ] \
+   && [ "${P4B_ACCT_PRIOR_FETCH_SCANNED_PRS:-}" = "2" ] \
+   && [ "${P4B_ACCT_PRIOR_FETCH_REVIEW_TRUNCATED_PRS:-}" = "1" ]; then
+  pass "a PR with a truncated review list makes the whole scan window truncated (#615 round 4)"
+else fail "review-truncated fetch (rc=$rc, trunc=${P4B_ACCT_PRIOR_FETCH_TRUNCATED:-}, scanned=${P4B_ACCT_PRIOR_FETCH_SCANNED_PRS:-}, rtrunc=${P4B_ACCT_PRIOR_FETCH_REVIEW_TRUNCATED_PRS:-})"; fi
+grep -q 'more reviews than the nested' "$WORK/fetch-rtrunc.err" \
+  && pass "the unscanned deeper review history is surfaced as a diagnostics line" \
+  || fail "review-truncation diagnostics missing: $(cat "$WORK/fetch-rtrunc.err" 2>/dev/null)"
+# The hook threads the review-truncated window into the running totals…
+rt="$(PATH="$BIN:$PATH" REPO=o/r P4B_ACCT_STATE_DIR="$WORK/hook-rt-rtrunc" \
+      P4B_FAKE_GRAPHQL_PAGE_DIR="$RTRUNC_DIR" p4b_acct_hook_running_totals 2>/dev/null)"
+printf '%s' "$rt" | jq -e '.source == "github-derived" and .records == 1
+    and .window.truncated == true and .window.scanned_prs == 2
+    and .window.review_truncated_prs == 1' >/dev/null \
+  && pass "hook totals carry the review-truncated window (#615 round 4)" \
+  || fail "hook review-truncated window: $rt"
+# …and the renderer labels a bounded window plus the deeper-history footer,
+# never a repo-wide claim. (fails pre-fix: no footer clause existed)
+RTWINREC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.window
+  = {scanned_prs: 3, truncated: true, review_truncated_prs: 1}')"
+RTWINBLOCK="$(p4b_acct_render_block "$RTWINREC")"
+if printf '%s' "$RTWINBLOCK" | grep -q '^### Running totals — window: last 3 merged PRs$' \
+   && ! printf '%s' "$RTWINBLOCK" | grep -q 'repo, to date' \
+   && printf '%s' "$RTWINBLOCK" | grep -qF '1 scanned PR(s) hold more reviews than the nested review window — their older reviews are not included'; then
+  pass "review truncation renders the bounded-window heading + deeper-history footer (#615 round 4)"
+else fail "review-truncation render: $(printf '%s' "$RTWINBLOCK" | grep -E '### Running totals|Totals source')"; fi
+# Old fixtures without nested pageInfo stay valid (absent ⇒ not truncated;
+# already exercised by every pre-round-4 fetch test above).
+
 # ===========================================================================
 echo "accounting.sh — zero-finding + degraded rendering"
 # ===========================================================================
@@ -1017,6 +1131,65 @@ v="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ACCT_PRICES" p4b_automation_field ena
 v="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_NESTED_ONLY" p4b_acct_config_field enabled)"
 [ "$v" = "true" ] && pass "the accounting sub-block reader still resolves its own nested enabled" \
   || fail "sub-block reader: '$v'"
+# #615 round 4 parity: both readers share the first-key-line indent-capture
+# mechanism, so the four-space policy resolves at BOTH nesting levels.
+v="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ACCT_OFF4" p4b_automation_field enabled)"
+[ "$v" = "true" ] && pass "the parent-block reader handles the four-space style (round-3 mechanism)" \
+  || fail "four-space parent enabled -> '$v'"
+v="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ACCT_OFF4" p4b_automation_field mode)"
+[ "$v" = "local" ] && pass "four-space direct-child keys after the sub-block still resolve" \
+  || fail "four-space mode -> '$v'"
+
+# ===========================================================================
+echo "accounting.sh — loop-log JSONL integrity + object-count numbering (#615 round 4)"
+# ===========================================================================
+# (passes pre-fix — documents the standing guarantee) The unposted-loop
+# correction rewrites through `jq -cs`, so a corrected log must stay one
+# compact object per line and keep the corrected loop reachable by later
+# retries.
+# shellcheck disable=SC2034  # orchestrator globals read by the sourced hook functions
+if (
+  P4B_ACCT_STATE_DIR="$WORK/state-jsonl"; export P4B_ACCT_STATE_DIR
+  REPO="o/r"; PR=301; REVIEWER=nathanpayne-codex; ADAPTER=codex
+  DIRECTION="claude->codex"; HEAD=abc123
+  VERDICT_JSON='{"verdict":"APPROVED","summary":"ok","findings":[]}'
+  p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
+  p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
+  p4b_acct_hook_mark_last_loop_unposted "review POST failed" || exit 1
+  log="$(p4b_acct_hook_loop_log)"
+  [ "$(wc -l < "$log" | tr -d '[:space:]')" = "2" ] || exit 1
+  while IFS= read -r l; do
+    printf '%s' "$l" | jq -e 'type == "object" and .schema == "p4b-loop-log/v1"' >/dev/null || exit 1
+  done < "$log"
+  jq -e -s 'length == 2
+      and .[0].loop.loop == 1 and .[0].loop.posted == "posted"
+      and .[1].loop.loop == 2 and .[1].loop.posted == "not-posted"
+      and .[1].loop.fail_closed.happened == true' "$log" >/dev/null || exit 1
+); then
+  pass "a corrected loop log stays compact JSONL: 2 loops → 2 one-object lines, correction in place"
+else fail "corrected loop log lost its JSONL shape or its correction"; fi
+# (fails pre-fix) The retry after a correction derives the next loop number
+# by counting JSON OBJECTS, not lines — a record spanning multiple lines
+# (any non-compact writer/corruption) used to inflate loop IDs via `wc -l`,
+# breaking the finding-lifecycle links keyed on them.
+# shellcheck disable=SC2034  # orchestrator globals read by the sourced hook functions
+if (
+  P4B_ACCT_STATE_DIR="$WORK/state-prettylog"; export P4B_ACCT_STATE_DIR
+  REPO="o/r"; PR=302; REVIEWER=nathanpayne-codex; ADAPTER=codex
+  DIRECTION="claude->codex"; HEAD=abc123
+  log="$(p4b_acct_hook_loop_log)"
+  mkdir -p "$(dirname "$log")"
+  # one record, PRETTY-PRINTED across many lines (simulated non-compact write)
+  jq -n '{schema:"p4b-loop-log/v1", started_at_epoch:null,
+          loop:{loop:1, reviewer:"nathanpayne-codex", posted:"posted"},
+          details:[]}' > "$log"
+  [ "$(wc -l < "$log" | tr -d '[:space:]')" -gt 1 ] || exit 1
+  VERDICT_JSON='{"verdict":"APPROVED","summary":"ok","findings":[]}'
+  p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
+  jq -e -s 'length == 2 and .[1].loop.loop == 2' "$log" >/dev/null || exit 1
+); then
+  pass "loop numbering counts JSON objects: a multi-line record cannot inflate the next loop ID (#615 round 4)"
+else fail "object-count loop numbering (log=$(cat "$WORK/state-prettylog/phase-4b-loops/"*.jsonl 2>/dev/null | tail -3))"; fi
 
 # ===========================================================================
 echo "orchestrator — accounting hook (fail-open, exit codes preserved)"
@@ -1077,6 +1250,18 @@ set -e
 if [ "$rc" = 0 ] && ! grep -q 'Phase 4b Approval Accounting' "$BODY_B" && [ ! -d "$STATE_B" ]; then
   pass "accounting.enabled: false → plain summary, no state writes, exit 0"
 else fail "sub-toggle off (rc=$rc)"; fi
+
+# (b2) #615 round 4 (fails pre-fix): the SAME opt-out formatted with
+#      four-space children — the two-space-hardcoded reader read
+#      accounting.enabled: false as absent, so the opted-out repo still got
+#      the accounting block appended to its posted approval.
+STATE_B2="$WORK/state-b2"; BODY_B2="$WORK/body-b2.md"
+set +e
+out="$(run_orch "$STATE_B2" "$POLICY_ACCT_OFF4" fake-codex-approve 216 P4B_WRAPPER_BODY="$BODY_B2" -- 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && ! grep -q 'Phase 4b Approval Accounting' "$BODY_B2" && [ ! -d "$STATE_B2" ]; then
+  pass "a four-space-indented opt-out is honored end-to-end: plain summary, no state writes (#615 round 4)"
+else fail "four-space sub-toggle off (rc=$rc, body=$(grep -c 'Phase 4b Approval Accounting' "$BODY_B2" 2>/dev/null) accounting block(s))"; fi
 
 # (c) forced report-generation error → plain summary posts, exit 0 (never
 #     blocks or fabricates the approval).

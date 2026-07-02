@@ -255,7 +255,12 @@
           "required": ["scanned_prs", "truncated"],
           "properties": {
             "scanned_prs": { "type": "integer", "minimum": 0 },
-            "truncated": { "type": "boolean" }
+            "truncated": { "type": "boolean" },
+            "review_truncated_prs": {
+              "description": "Scanned PRs whose review connection held more reviews than the nested per-PR review window (#615 round 4) — their older reviews (and any embedded records in them) were not scanned. Any positive count forces truncated=true (honest bounded-window labeling instead of nested pagination). Optional: absent on pre-round-4 records.",
+              "type": "integer",
+              "minimum": 0
+            }
           }
         },
         "auto_approved_prs": { "type": ["integer", "null"], "minimum": 0 },
