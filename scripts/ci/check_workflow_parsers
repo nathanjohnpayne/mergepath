@@ -625,12 +625,12 @@ else
 fi
 if grep -Fq "github.event.action == 'unlabeled'" <<<"$auto_merge_job_block" \
   && grep -Fq "github.event.label.name" <<<"$auto_merge_job_block" \
-  && grep -Fq '"needs-external-review","needs-human-review","human-hold"' <<<"$auto_merge_job_block"; then
+  && grep -Fq '"needs-external-review","needs-human-review","policy-violation","human-hold"' <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
   echo "  PASS: auto-merge unlabeled re-arm is scoped to the blocking label names (#620)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: auto-merge must re-arm on unlabeled ONLY for the blocking labels (github.event.label.name against the three blocking names) (#620)" >&2
+  echo "  FAIL: auto-merge must re-arm on unlabeled ONLY for the blocking labels (github.event.label.name against the four blocking names incl. policy-violation) (#620)" >&2
 fi
 if grep -Fq "needs.triage.result == 'skipped'" <<<"$auto_merge_job_block" \
   && grep -B1 "needs.triage.result == 'skipped'" <<<"$auto_merge_job_block" | grep -Fq "github.event.action == 'unlabeled'"; then

@@ -524,7 +524,8 @@ jobs:
   #      re-confirms a registered non-author APPROVED via the API (same
   #      as path 2), and every downstream guard re-applies unchanged.
   #      The job `if:` additionally requires the REMOVED label to be one
-  #      of the blocking three, so unrelated label churn does not spend
+  #      of the four blocking names (the full Label Gate blocking set,
+  #      including policy-violation - Codex P2 on the #620 PR), so unrelated label churn does not spend
   #      runner minutes. triage deliberately does NOT run on `unlabeled`
   #      (its action filter excludes it — re-applying labels here would
   #      flap against auto-clear), so the triage-success requirement
@@ -546,7 +547,7 @@ jobs:
         (github.event.action == 'synchronize' ||
          github.event.action == 'reopened' ||
          (github.event.action == 'unlabeled' &&
-          contains(fromJSON('["needs-external-review","needs-human-review","human-hold"]'), github.event.label.name))))) &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))))) &&
       (github.event_name != 'pull_request' ||
        needs.triage.result == 'success' ||
        (github.event.action == 'unlabeled' &&
