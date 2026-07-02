@@ -13,7 +13,13 @@ on:
     # `reopened` is included so the auto-merge re-arm path (#495) actually
     # fires: the job `if:` matches `synchronize || reopened`, but a reopened
     # event only reaches this workflow if it is subscribed here.
-    types: [opened, ready_for_review, labeled, synchronize, reopened]
+    # `unlabeled` is the #620 re-arm: on an over-threshold PR with a
+    # carried-over approval, update-branch makes triage re-apply
+    # needs-external-review, the label re-verify inside auto-merge sees it
+    # and hard-fails (correctly), and auto-clear removes the label moments
+    # later once the clearance gate passes — with no trigger on the removal,
+    # the PR sat CLEAN-but-unmerged until a human reran the failed job.
+    types: [opened, ready_for_review, labeled, synchronize, reopened, unlabeled]
   pull_request_review:
     types: [submitted]
 
@@ -57,7 +63,8 @@ jobs:
        (github.event.action == 'opened' ||
         github.event.action == 'ready_for_review' ||
         github.event.action == 'synchronize' ||
-        github.event.action == 'reopened')) ||
+        github.event.action == 'reopened' ||
+        github.event.action == 'unlabeled')) ||
       (github.event_name == 'pull_request_review' &&
        github.event.review.state == 'approved')
     runs-on: ubuntu-latest
@@ -484,7 +491,7 @@ jobs:
   # auto-merge arm. See #61 for the cross-event race and this PR for the
   # same-workflow races nathanpayne-codex caught during review.
   #
-  # Two triggers arm auto-merge (#495):
+  # Three triggers arm auto-merge (#495, #620):
   #
   #   1. `pull_request_review` + `approved` — the original path. The
   #      approval event IS the signal, so no API approval re-check is
@@ -505,11 +512,30 @@ jobs:
   #      identity, blocking-label re-verify) re-applies on the NEW HEAD,
   #      and `gh pr merge --auto` is idempotent when --auto is already
   #      enabled.
+  #   3. `pull_request` + `unlabeled` for a BLOCKING label (#620) — the
+  #      settle path. On an over-threshold PR with a carried-over
+  #      approval, update-branch makes triage re-apply
+  #      needs-external-review; the re-verify inside a concurrent arming
+  #      run reads that transient state and hard-fails (correct in
+  #      isolation — anti-#61); auto-clear then removes the label once
+  #      the clearance gate passes on the new head — and nothing
+  #      re-armed. The label REMOVAL is the state-settled signal, so it
+  #      re-runs the same fully-gated arming logic: the approval gate
+  #      re-confirms a registered non-author APPROVED via the API (same
+  #      as path 2), and every downstream guard re-applies unchanged.
+  #      The job `if:` additionally requires the REMOVED label to be one
+  #      of the blocking three, so unrelated label churn does not spend
+  #      runner minutes. triage deliberately does NOT run on `unlabeled`
+  #      (its action filter excludes it — re-applying labels here would
+  #      flap against auto-clear), so the triage-success requirement
+  #      accepts `skipped` on this path: no sibling job can apply a
+  #      label in an unlabeled run, and the two in-job label re-verifies
+  #      still read the live API state fail-closed before any merge.
   #
   # The job body references only `github.event.pull_request.*` (number,
-  # html_url, labels) — both event types carry that object — so the steps
-  # are event-shape-agnostic. Only the `if:` and the approval-gate step
-  # branch on event name.
+  # html_url, labels) — all trigger shapes carry that object — so the
+  # steps are event-shape-agnostic. Only the `if:` and the approval-gate
+  # step branch on event name.
   auto-merge-on-approval:
     needs: [load-config, detect-disagreement, block-self-approval, triage]
     if: >
@@ -518,9 +544,13 @@ jobs:
         github.event.review.state == 'approved') ||
        (github.event_name == 'pull_request' &&
         (github.event.action == 'synchronize' ||
-         github.event.action == 'reopened'))) &&
+         github.event.action == 'reopened' ||
+         (github.event.action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","human-hold"]'), github.event.label.name))))) &&
       (github.event_name != 'pull_request' ||
-       needs.triage.result == 'success') &&
+       needs.triage.result == 'success' ||
+       (github.event.action == 'unlabeled' &&
+        needs.triage.result == 'skipped')) &&
       !contains(github.event.pull_request.labels.*.name, 'needs-external-review') &&
       !contains(github.event.pull_request.labels.*.name, 'needs-human-review') &&
       !contains(github.event.pull_request.labels.*.name, 'human-hold')
