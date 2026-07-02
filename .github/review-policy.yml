@@ -585,8 +585,13 @@ phase_4b_default: complex-changes
 # billing; if the CLI is not plan-logged-in the review fails closed to the
 # manual handoff. See plans/automated-phase-4b-handoff.md § 11.
 phase_4b_automation:
-  # Master switch. false ⇒ manual handoff (current behavior).
-  enabled: false
+  # Master switch. true ⇒ scripts/phase-4b-review.sh runs the reviewer CLI
+  # locally (mode: local below) instead of the manual handoff; every
+  # fail-closed path (non-conformant verdict, timeout, head drift,
+  # same-head required-finding gate) still falls back to the manual
+  # handoff. Enabled 2026-07-02 per operator request, together with xhigh
+  # reviewer effort and the (already-default) accounting sub-toggle.
+  enabled: true
 
   # Execution model. 'local' = the authoring agent's session shells out to
   # the reviewer CLI on the same machine (reuses op-preflight + the gh
@@ -633,8 +638,13 @@ phase_4b_automation:
   #                   the key it is a harmless no-op because --strict-config is
   #                   not used.)
   # An invalid value here is rejected fail-closed (orchestrator exits).
-  claude_effort: medium
-  # codex_effort: high           # optional; empty/absent ⇒ Codex CLI default
+  # xhigh on both adapters (2026-07-02 operator request: maximum reviewer
+  # rigor now that automation is on). xhigh is in both validated sets;
+  # for Codex it is model-dependent and degrades to a harmless no-op on a
+  # CLI that drops the knob (no --strict-config). Timeout stays 900s —
+  # raise adapter_timeout_seconds if xhigh rounds start hitting it.
+  claude_effort: xhigh
+  codex_effort: xhigh
 
   # --- Approval-loop accounting (#602) -------------------------------------
   # Folds the "## Phase 4b Approval Accounting" block (plus the embedded
