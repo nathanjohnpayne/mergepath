@@ -254,26 +254,35 @@ COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 # tokenizer then blocks the env -S, fail-closed). Over-matching only costs one
 # tokenizer run; a false negative is a bypass.
 NEEDS_TOKENIZE=0
-if echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])([^[:space:]]*/)?gh([^A-Za-z0-9_]|$)'; then
+if echo "$COMMAND" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])([^[:space:]]*/)?gh([^A-Za-z0-9_]|$)'; then
   NEEDS_TOKENIZE=1
-elif echo "$COMMAND" | tr -d "\"'" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
-     && echo "$COMMAND" | tr -d "\"'" | grep -qE '(-[A-Za-z]*S|--split-string)'; then
+elif echo "$COMMAND" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
+     && echo "$COMMAND" | tr -d "\"'\\\\" | grep -qE '(-[A-Za-z]*S|--split-string)'; then
   # Quote-stripped (Codex #551): a quoted `'env'` runs env but would otherwise
-  # leave a quote, not whitespace, after `env` and dodge this probe.
+  # leave a quote, not whitespace, after `env` and dodge this probe. Backslashes
+  # are stripped alongside quotes (#611 round 3): bash unescapes `g\h` / `e\nv`
+  # to `gh` / `env` at execution, so escape-spelled literals must reach the
+  # probes in their canonical form too.
   NEEDS_TOKENIZE=1
-elif echo "$COMMAND" | tr -d "\"'" | grep -qE '\$\(|`' \
-     && echo "$COMMAND" | tr -d "\"'" \
-        | grep -qE '(^|[^A-Za-z0-9_])(pr|issue)[[:space:]]'; then
-  # #553 / #560: a command substitution can synthesize the executable name in
-  # COMMAND position (e.g. `$(printf '\147\150')` -> gh), so the raw command
-  # carries no literal `gh` and the gh / env -S probes above miss it. This holds
-  # even after a prefix command + options (`command -p`, `env -i`), a value-taking
-  # flag (`env -u NAME`), or a quoted env assignment (`FOO="a b"`) — forms the
-  # earlier command-position-only regex could not express. Force tokenization
-  # whenever a cmdsub coexists with a gh pr/issue write noun; the command-position
-  # forward pass below then fails closed ONLY on a genuine command-position synth
-  # write and ignores benign cmdsubs and arguments. Over-matching costs one
-  # tokenizer run; a false negative is a bypass.
+elif echo "$COMMAND" | grep -qE '\$\(|`'; then
+  # #553 / #560 / #573: a command substitution (or backtick) can synthesize ANY
+  # token of a gh write — the executable (`$(printf '\147\150')` -> gh), the
+  # noun (`gh pr`), and even the verb in escape-spelled form (`m\erge`) that no
+  # literal probe can enumerate (#611 round 3: `$(printf '\147\150\40\160\162')
+  # m\erge` carries no raw `gh`, `pr`, or `merge` text at all). Earlier
+  # revisions paired the cmdsub probe with a literal noun/verb probe; every
+  # such pairing leaves an escape/quoting spelling that dodges it, so the mere
+  # PRESENCE of a substitution now forces tokenization. shlex then normalizes
+  # quotes and escapes, and the command-position forward pass (_synth_ walk)
+  # below fails closed ONLY on guarded-write evidence after a command-position
+  # placeholder, ignoring benign cmdsubs, arguments, and non-command-position
+  # verbs. Over-matching costs one tokenizer run; a false negative is a bypass.
+  NEEDS_TOKENIZE=1
+elif printf '%s' "$COMMAND" | grep -qF "\$'"; then
+  # #611 r14: bash ANSI-C quoting ($'...') decodes backslash escapes, so
+  # `$'\147\150' pr merge` runs `gh pr merge` with no literal gh in the raw
+  # text (and shlex does not decode $'...'). Force tokenization on any $'
+  # so the python flatten decodes it before the walk.
   NEEDS_TOKENIZE=1
 fi
 if [ "$NEEDS_TOKENIZE" -eq 0 ]; then
@@ -414,6 +423,408 @@ def _read_backtick_span(cmd, start):
         i += 1
     raise ValueError("unterminated backtick substitution")
 
+# --- #611 round 2/3: statically expand literal-only printf/echo spans ---
+# A substitution like $(printf "\147\150\40\160\162\40\155\145\162\147\145")
+# can synthesize an ENTIRE guarded write with zero literal evidence left in
+# the outer command, which no placeholder heuristic can decide. But such a
+# span is a PURE FUNCTION of literal text — the guard can emulate it and
+# splice the real expansion into the token stream, deciding the command
+# exactly: a synthesized `gh pr merge` is blocked as the guarded write it
+# is, and a synthesized `hello world` is allowed as the data it is. Only
+# unquoted spans whose argv is a flag-free echo or a %s-only printf with
+# fully literal arguments are expanded; anything dynamic (variables, nested
+# substitutions, other commands, exotic directives) falls back to the
+# placeholder + evidence scan. The spliced text is restricted to a shell-
+# inert charset so it can never introduce new syntax.
+
+def _decode_fmt_escapes(s):
+    # bash printf decodes backslash escapes in its FORMAT argument:
+    # \NNN (octal), \xHH (hex), and the C letters. Unknown escapes stay
+    # verbatim (bash prints them as-is).
+    simple = {"a": "\a", "b": "\b", "f": "\f", "n": "\n",
+              "r": "\r", "t": "\t", "v": "\v", "\\": "\\"}
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        nxt = s[i + 1]
+        if nxt in simple:
+            out.append(simple[nxt])
+            i += 2
+            continue
+        if nxt == "x":
+            m = re.match(r"[0-9A-Fa-f]{1,2}", s[i + 2:i + 4])
+            if m:
+                out.append(chr(int(m.group(0), 16)))
+                i += 2 + len(m.group(0))
+                continue
+            out.append("\\")
+            i += 1
+            continue
+        m = re.match(r"[0-7]{1,3}", s[i + 1:i + 4])
+        if m:
+            out.append(chr(int(m.group(0), 8)))
+            i += 1 + len(m.group(0))
+            continue
+        out.append("\\")
+        out.append(nxt)
+        i += 2
+    return "".join(out)
+
+_SPLICE_SAFE_RE = re.compile(r"[A-Za-z0-9_./,:@+% -]*\Z")
+
+def _decode_ansi_c(s):
+    # bash ANSI-C quoting ($ + single-quoted string) decodes C escapes:
+    # \NNN octal, \xHH hex, the C letters, and quote escapes. Unknown
+    # escapes stay verbatim (bash keeps them).
+    simple = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r",
+              "t": "\t", "v": "\v", "\\": "\\", _SQ: _SQ, _DQ: _DQ}
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        nxt = s[i + 1]
+        if nxt in simple:
+            out.append(simple[nxt])
+            i += 2
+            continue
+        if nxt == "x":
+            m = re.match(r"[0-9A-Fa-f]{1,2}", s[i + 2:i + 4])
+            if m:
+                out.append(chr(int(m.group(0), 16)))
+                i += 2 + len(m.group(0))
+                continue
+            out.append("\\")
+            i += 1
+            continue
+        m = re.match(r"[0-7]{1,3}", s[i + 1:i + 4])
+        if m:
+            out.append(chr(int(m.group(0), 8)))
+            i += 1 + len(m.group(0))
+            continue
+        out.append("\\")
+        out.append(nxt)
+        i += 2
+    return "".join(out)
+
+def _rewrite_ansi_c(span, neutral):
+    # Rewrite every $-single-quote ANSI-C string in span to a PLAIN
+    # single-quoted string holding its decoded text, so the downstream
+    # literal classification and shlex see the real content (#611 round 6:
+    # $(echo $-quoted octal for a gh write) dodged the literal classifier
+    # via its $). A decoded chunk that cannot be re-wrapped (contains a
+    # single quote) is replaced by `neutral` when given — classification
+    # still sees a literal printf/echo and the span fails closed as
+    # unexpandable — or aborts the rewrite when neutral is None
+    # (_static_expand: not expandable). Unterminated quoting aborts too.
+    out = []
+    i = 0
+    n = len(span)
+    while i < n:
+        c = span[i]
+        if c == "$" and i + 1 < n and span[i + 1] == _DQ:
+            # bash LOCALE quoting ($ + double-quoted string) is its literal
+            # content for any untranslated string — same dodge shape as
+            # ANSI-C, preempted alongside it: drop the $ and let the plain
+            # double-quoted string flow through classification/shlex.
+            i += 1
+            continue
+        if c == "$" and i + 1 < n and span[i + 1] == _SQ:
+            j = i + 2
+            buf = []
+            closed = False
+            while j < n:
+                d = span[j]
+                if d == "\\" and j + 1 < n:
+                    buf.append(d)
+                    buf.append(span[j + 1])
+                    j += 2
+                    continue
+                if d == _SQ:
+                    closed = True
+                    j += 1
+                    break
+                buf.append(d)
+                j += 1
+            if not closed:
+                return (None, False)
+            dec = _decode_ansi_c("".join(buf))
+            if _SQ in dec:
+                if neutral is None:
+                    return (None, False)
+                out.append(neutral)
+            else:
+                out.append(_SQ + dec + _SQ)
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return ("".join(out), True)
+
+def _is_literal_printf_echo(span):
+    # True when the span is a PURE-LITERAL printf/echo invocation (no shell-
+    # active characters, tokenizable, printf/echo command) — the class
+    # _static_expand emulates. Used to fail closed when such a span is NOT
+    # expandable (%b and other decoder directives, format-reuse forms): a
+    # literal printf can synthesize an entire guarded write with zero outside
+    # evidence, so an unexpandable one in command position is blocked rather
+    # than allowed through as an anonymous placeholder (#611 round 5).
+    span, ok = _rewrite_ansi_c(span, _SQ + "MPANSIC" + _SQ)
+    if not ok:
+        return False
+    for ch in ("$", chr(96), ";", "|", "&", "<", ">", "(", ")", "{", "}"):
+        if ch in span:
+            return False
+    try:
+        argv = shlex.split(span)
+    except ValueError:
+        return False
+    argv = _unwrap_synth_prefixes(argv)  # command printf ... (#611 r12)
+    # Match the command-word BASENAME (#611 r10): $(/bin/echo ...) and
+    # $(/usr/bin/printf ...) word-split into the same synthesized write as
+    # the bare forms, so a path-qualified printf/echo is just as much a
+    # literal synth source.
+    return bool(argv) and argv[0].rsplit("/", 1)[-1] in ("printf", "echo")
+
+# #611 round 7: an IFS assignment anywhere in the command re-defines how
+# bash word-splits unquoted substitution output (IFS=/ makes a synthesized
+# gh-slash split into a gh word), which the whitespace-based splicer cannot
+# model. When the raw command touches IFS, static expansion is disabled
+# entirely — literal spans then fail closed via the unexpandable sentinel
+# in command position and stay inert elsewhere. Set before flattening.
+_IFS_TOUCHED = False
+
+# Prefix commands that can precede a real command inside a substitution
+# ($(command printf ...), $(env printf ...)) — bash runs the wrapped command,
+# so the synth classifier must unwrap them to see the real printf/echo (#611
+# r12). Reuses the flatten prefix set plus leading flags/assignments.
+_SYNTH_PREFIX_CMDS = {"command", "env", "sudo", "exec", "nice",
+                      "ionice", "nohup", "time", "builtin"}
+
+def _unwrap_synth_prefixes(argv):
+    k = 0
+    prefix = ""
+    while k < len(argv):
+        t = argv[k]
+        if t in _SYNTH_PREFIX_CMDS:
+            prefix = t
+            k += 1
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
+            k += 1
+            continue
+        if t.startswith("-"):
+            # A value-taking prefix option consumes its VALUE too (#611 r14:
+            # env -u X printf — X is the value of -u, not the command), using
+            # the same per-prefix table as the walks so they cannot drift.
+            opts = _PREFIX_VALUE_OPTS.get(prefix, _EMPTY_FROZENSET)
+            if "=" not in t and t in opts:
+                k += 2
+            else:
+                k += 1
+            continue
+        break
+    return argv[k:]
+
+def _static_expand(span):
+    # Return the literal expansion of a pure printf/echo span, or None when
+    # the span is dynamic or the expansion is not splice-safe.
+    if _IFS_TOUCHED:
+        return None
+    span, ok = _rewrite_ansi_c(span, None)
+    if not ok:
+        return None
+    for ch in ("$", chr(96), ";", "|", "&", "<", ">", "(", ")", "{", "}"):
+        if ch in span:
+            return None
+    try:
+        argv = shlex.split(span)
+    except ValueError:
+        return None
+    argv = _unwrap_synth_prefixes(argv)  # command printf ... (#611 r12)
+    if not argv:
+        return None
+    # Match the command-word BASENAME (#611 r10): /bin/echo, /usr/bin/printf
+    # expand identically to their bare forms.
+    cmd0 = argv[0].rsplit("/", 1)[-1]
+    if cmd0 == "echo":
+        args = argv[1:]
+        if args and args[0] == "-n":
+            args = args[1:]
+        if args and args[0].startswith("-"):
+            return None  # -e/-E/clustered flags: bail to the placeholder
+        out = " ".join(args)
+    elif cmd0 == "printf":
+        if len(argv) < 2:
+            return None
+        fmt = _decode_fmt_escapes(argv[1])
+        args = argv[2:]
+        # Split the format on %s directives; reject any other directive.
+        pieces = []
+        cur = []
+        i = 0
+        ns = 0
+        while i < len(fmt):
+            c = fmt[i]
+            if c == "%":
+                if i + 1 < len(fmt) and fmt[i + 1] == "%":
+                    cur.append("%")
+                    i += 2
+                    continue
+                if i + 1 < len(fmt) and fmt[i + 1] == "s":
+                    pieces.append("".join(cur))
+                    cur = []
+                    ns += 1
+                    i += 2
+                    continue
+                return None
+            cur.append(c)
+            i += 1
+        pieces.append("".join(cur))
+        if ns == 0:
+            if args:
+                return None  # format-reuse semantics: bail
+            out = pieces[0]
+        else:
+            # The format is reused until all args are consumed; missing
+            # args behave as empty strings (bash printf semantics).
+            reps = ((len(args) + ns - 1) // ns) if args else 1
+            parts = []
+            ai = 0
+            for _ in range(reps):
+                for j in range(ns):
+                    parts.append(pieces[j])
+                    parts.append(args[ai] if ai < len(args) else "")
+                    ai += 1
+                parts.append(pieces[ns])
+            out = "".join(parts)
+    else:
+        return None
+    # bash removes TRAILING newlines from substitution output before any
+    # concatenation (#611 round 6: printf gh-then-newline glued to pr runs
+    # ghpr, not gh pr) — strip them first. Remaining IFS whitespace inside
+    # the expansion word-splits exactly like a space (#611 round 4: printf
+    # newlines between synthesized words), so normalize space/tab/newline
+    # RUNS to single spaces BEFORE the splice-safety check. No other strip:
+    # a leading (or trailing space/tab) separator still separates the
+    # expansion from glued adjacent text, exactly as bash field-splits it.
+    out = re.sub(r"\n+\Z", "", out)
+    out = re.sub(r"[ \t\n]+", " ", out)
+    if not _SPLICE_SAFE_RE.match(out):
+        return None
+    return out
+
+_LINE_PREFIX_CMDS = {"sudo", "env", "command", "exec", "nice",
+                     "ionice", "nohup", "time"}
+_LINE_INTERPRETERS = {"sh", "bash", "dash", "zsh", "ksh", "eval",
+                      "source", "."}
+
+def _read_heredoc_delimiter(cmd, j):
+    # cmd[j:] begins at the heredoc delimiter WORD (after `<<`, an optional
+    # `-`, and optional blanks). Return (literal_tag, quoted, end_index).
+    # A delimiter is "quoted" (bash disables body expansion) if ANY part is
+    # single/double-quoted OR backslash-escaped — covers <<'EOF', <<"EOF",
+    # <<\EOF, <<E\OF, and quoted tags with punctuation like <<'EOF-MP'
+    # (#611 r10). The literal tag is the word with quotes/backslashes removed
+    # (what the closing line must equal). An empty word ends the scan.
+    n = len(cmd)
+    chars = []
+    quoted = False
+    while j < n:
+        c = cmd[j]
+        if c == "\\" and j + 1 < n:
+            quoted = True
+            chars.append(cmd[j + 1])
+            j += 2
+            continue
+        if c == _SQ:
+            quoted = True
+            j += 1
+            while j < n and cmd[j] != _SQ:
+                chars.append(cmd[j]); j += 1
+            if j < n:
+                j += 1
+            continue
+        if c == _DQ:
+            quoted = True
+            j += 1
+            while j < n and cmd[j] != _DQ:
+                if cmd[j] == "\\" and j + 1 < n:
+                    chars.append(cmd[j + 1]); j += 2; continue
+                chars.append(cmd[j]); j += 1
+            if j < n:
+                j += 1
+            continue
+        if c in (" ", "\t", "\n", ";", "&", "|", "(", ")", "<", ">"):
+            break
+        chars.append(c)
+        j += 1
+    return "".join(chars), quoted, j
+
+def _segment_command_word(toks):
+    # The command-word BASENAME of one pipeline/list SEGMENT (already
+    # whitespace-split, escapes/quotes stripped), with redirections and their
+    # targets, leading env assignments, and prefix commands + flags skipped
+    # (#611 r10: `bash` in a redirection path or an argument must NOT be read
+    # as the interpreter). A value-taking prefix option consumes its VALUE
+    # too (#611 r13: sudo -u nobody bash — nobody is the value of -u, not the
+    # command), using the same per-prefix PREFIX_VALUE_OPTS_SPEC table as the
+    # main walk so the two cannot drift.
+    k = 0
+    prefix = ""
+    while k < len(toks):
+        t = toks[k]
+        if re.match(r"^[0-9]*(>>|>|<<?|>&|&>)", t):
+            # A redirection operator; a bare operator token also consumes its
+            # target. `<<TAG` / `>file` (attached) consume only themselves.
+            if t in (">", ">>", "<", ">&", "&>", "1>", "2>", "0<"):
+                k += 2
+            else:
+                k += 1
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
+            k += 1
+            continue
+        if t in _LINE_PREFIX_CMDS:
+            prefix = t
+            k += 1
+            continue
+        if t.startswith("-"):
+            opts = _PREFIX_VALUE_OPTS.get(prefix, _EMPTY_FROZENSET)
+            if "=" not in t and t in opts:
+                k += 2  # value-taking option consumes the next token
+            else:
+                k += 1
+            continue
+        return t.rsplit("/", 1)[-1]
+    return ""
+
+def _line_command_words(line):
+    # Command-word basenames of EVERY pipeline/list segment of a shell line
+    # (#611 r11: a quoted heredoc piped into a shell — `cat <<'EOF' | bash` —
+    # executes the body even though the FIRST command word is cat, so the
+    # interpreter check must see the pipe target too). Split the
+    # escape/quote-stripped line on top-level pipe/list operators and take
+    # the command word of each segment. Backslash/quote-stripped first so an
+    # escape-spelled command word is recognized (#611 r9).
+    stripped = line.replace("\\", "").replace(_SQ, "").replace(_DQ, "")
+    words = []
+    for seg in re.split(r"\|\||&&|[|;&]", stripped):
+        w = _segment_command_word(seg.split())
+        if w:
+            words.append(w)
+    return words
+
 def flatten_command(cmd, depth=0):
     """Normalize a command for shlex tokenization so the downstream walk
     sees every command-position gh write. Three jobs (#533, plus the #540
@@ -437,52 +848,171 @@ def flatten_command(cmd, depth=0):
     n = len(cmd)
     in_single = False
     in_double = False
+    # cur_word tracks the text of the shell word being built (reset on
+    # unquoted whitespace/separators, quotes kept in place) so a splice can
+    # tell whether it lands inside an ASSIGNMENT word — bash does not
+    # field-split a substitution in an assignment value, so whitespace
+    # spliced there must be quoted to keep one token (#611 round 5:
+    # X=$(printf "a b") $(printf gh) pr merge shifted command position).
+    cur_word = ""
+    # #611 round 8: a QUOTED-tag heredoc body is pure data — bash performs
+    # no expansion in it and the receiving command just reads it — so its
+    # lines must NOT be flattened into command segments (a fixture write
+    # like cat with a quoted-tag heredoc containing an encoded substitution
+    # was statically expanded and blocked). Bodies are skipped verbatim
+    # UNLESS a shell interpreter appears on the heredoc line (a bash-fed
+    # body executes as a script; keep scanning those, fail-closed).
+    # Unquoted-tag heredocs keep the existing behavior: bash DOES expand
+    # their substitutions, so scanning them is correct.
+    pending_heredocs = []
+    heredoc_count_line = 0
+    line_start = 0
+
+    def _splice(span, in_double_now):
+        # Returns the text to append for a substitution span. Three cases:
+        #   1. statically expandable literal printf/echo -> the expansion
+        #      (quoted when whitespace lands inside an assignment word);
+        #   2. literal printf/echo that CANNOT be expanded (%b and other
+        #      decoder directives, format-reuse forms) -> a distinct
+        #      fail-closed sentinel: such a span can synthesize an entire
+        #      guarded write with zero outside evidence (#611 round 5);
+        #   3. anything dynamic -> the ordinary placeholder + evidence scan.
+        exp = _static_expand(span)
+        if exp is not None:
+            if in_double_now:
+                # Inside double quotes the expansion is one word (no field
+                # split), but it MUST still be spliced literally (#611 r14):
+                # a quoted literal substitution reparsed by eval or bash -c
+                # executes the expansion, so a placeholder would hide the
+                # write. We are already inside the open double-quote context,
+                # so emit the raw expansion glued in place.
+                return exp
+            if _ASSIGN_RE.match(cur_word) and (" " in exp):
+                return _DQ + exp + _DQ
+            # NO padding: the expansion must stay glued to adjacent text
+            # exactly as bash glues it (G=$(printf gh) is ONE assignment
+            # word `G=gh`, not an assignment plus a command).
+            return exp
+        spans.append(span)
+        if not in_double_now and _is_literal_printf_echo(span):
+            return " __MERGEPATH_CMDSUB_LITERAL__ "
+        return " __MERGEPATH_CMDSUB__ "
+
     while i < n:
         c = cmd[i]
         if c == "\\" and not in_single and i + 1 < n:
             out.append(c)
             out.append(cmd[i + 1])
+            cur_word += c + cmd[i + 1]
             i += 2
             continue
         if c == _SQ and not in_double:
             in_single = not in_single
             out.append(c)
+            cur_word += c
             i += 1
             continue
         if c == _DQ and not in_single:
             in_double = not in_double
             out.append(c)
+            cur_word += c
             i += 1
             continue
         # Command substitution is performed unquoted AND inside double
         # quotes, never inside single quotes.
         if not in_single and c == "$" and i + 1 < n and cmd[i + 1] == "(":
             span, j = _read_paren_span(cmd, i + 2)
-            spans.append(span)
-            out.append(" __MERGEPATH_CMDSUB__ ")
+            piece = _splice(span, in_double)
+            out.append(piece)
+            cur_word = "" if piece.endswith(" ") else cur_word + piece
             i = j
             continue
         if not in_single and c == chr(96):
             span, j = _read_backtick_span(cmd, i + 1)
-            spans.append(span)
-            out.append(" __MERGEPATH_CMDSUB__ ")
+            piece = _splice(span, in_double)
+            out.append(piece)
+            cur_word = "" if piece.endswith(" ") else cur_word + piece
             i = j
+            continue
+        if (not in_single and not in_double and c == "<" and i + 1 < n
+                and cmd[i + 1] == "<" and (i + 2 >= n or cmd[i + 2] != "<")):
+            # Heredoc operator (not a <<< herestring). A QUOTED-delimiter
+            # heredoc (bash disables body expansion) queues the body for
+            # verbatim skipping at the next newline; an UNQUOTED delimiter
+            # keeps the raw operator text and the existing body scanning
+            # (bash DOES expand unquoted-tag bodies, #611 r9).
+            j = i + 2
+            allow_tabs = False
+            if j < n and cmd[j] == "-":
+                allow_tabs = True
+                j += 1
+            while j < n and cmd[j] in (" ", "\t"):
+                j += 1
+            tag, quoted, k2 = _read_heredoc_delimiter(cmd, j)
+            heredoc_count_line += 1
+            if quoted and tag:
+                pending_heredocs.append((tag, allow_tabs))
+                out.append(" __MERGEPATH_HEREDOC__ ")
+                cur_word = ""
+                i = k2
+                continue
+            out.append(cmd[i:i + 2])
+            cur_word += cmd[i:i + 2]
+            i += 2
             continue
         if not in_single and not in_double:
             two = cmd[i:i + 2]
             if two in ("&&", "||", "|&"):
                 out.append(" " + two + " ")
+                cur_word = ""
                 i += 2
                 continue
             if c in (";", "|", "&", "(", ")"):
                 out.append(" " + c + " ")
+                cur_word = ""
                 i += 1
                 continue
             if c == "\n":
                 out.append(" ; ")
+                cur_word = ""
+                line = cmd[line_start:i]
+                i += 1
+                # A quoted heredoc body is skipped as inert data ONLY when the
+                # producer line is SIMPLE enough to model exactly (#611 r12):
+                #   * every heredoc on the line is quoted (no unquoted-tag body
+                #     whose substitutions bash DOES expand — cat <<A <<'B'),
+                #   * no process substitution ( >(sh) / <(bash) feeds the body
+                #     to a shell the pipeline scan cannot see), AND
+                #   * no pipeline/list segment command word is a shell
+                #     interpreter (cat <<'EOF' | bash runs the body, #611 r11;
+                #     a shell name in a redirection target does NOT count, r10).
+                # Any other shape fails closed: the bodies flow into the token
+                # stream and are scanned, exactly as bash would execute them.
+                line_simple = (
+                    len(pending_heredocs) == heredoc_count_line
+                    and not re.search(r"[<>]\(", line)
+                    and not any(w in _LINE_INTERPRETERS
+                                for w in _line_command_words(line)))
+                if pending_heredocs and line_simple:
+                    for _tag, _allow_tabs in pending_heredocs:
+                        while i < n:
+                            nl = cmd.find("\n", i)
+                            body_line = cmd[i:] if nl == -1 else cmd[i:nl]
+                            i = n if nl == -1 else nl + 1
+                            chk = body_line.lstrip("\t") if _allow_tabs else body_line
+                            if chk == _tag:
+                                break
+                pending_heredocs = []
+                heredoc_count_line = 0
+                line_start = i
+                continue
+            if c in (" ", "\t"):
+                out.append(c)
+                cur_word = ""
                 i += 1
                 continue
         out.append(c)
+        cur_word += c
         i += 1
     if in_single or in_double:
         raise ValueError("unbalanced quote")
@@ -566,7 +1096,8 @@ def expand_wrappers(tokens, depth=0):
             # G=$(printf gh) env -S "${G} ..." must still reach the env -S
             # fail-closed branch). Only a trailing-"=" (empty-value) assignment
             # immediately followed by the placeholder is the flatten artifact.
-            if tok.endswith("=") and i < n and tokens[i] == "__MERGEPATH_CMDSUB__":
+            if tok.endswith("=") and i < n and tokens[i] in (
+                    "__MERGEPATH_CMDSUB__", "__MERGEPATH_CMDSUB_LITERAL__"):
                 out.append(tokens[i])
                 i += 1
             continue
@@ -717,6 +1248,16 @@ def expand_wrappers(tokens, depth=0):
 
 try:
     cmd = sys.stdin.read()
+    _IFS_TOUCHED = bool(re.search(r"(^|[^A-Za-z0-9_])IFS=", cmd))
+    # #611 r14: decode ANSI-C quoting ($'...') across the WHOLE command
+    # before flattening, so an ANSI-C-spelled command word ($'\147\150' pr
+    # merge -> gh pr merge) is canonicalized for shlex, which does not
+    # implement $'...' decoding. An undecodable string (one that would need a
+    # bare single quote) leaves the command unchanged and falls to the
+    # fail-closed tokenizer path.
+    _ac, _ac_ok = _rewrite_ansi_c(cmd, None)
+    if _ac_ok:
+        cmd = _ac
     cmd = flatten_command(cmd)
     for tok in expand_wrappers(shlex.split(cmd)):
         sys.stdout.buffer.write(tok.encode("utf-8", errors="replace") + b"\x00")
@@ -724,6 +1265,53 @@ except ValueError as e:
     print(f"shlex error: {e}", file=sys.stderr)
     sys.exit(1)
 ' > "$TMP_TOKENS" 2> "$TMP_TOKENS_ERR"; then
+  # #611 round 4 (Codex P2): the broadened fast path tokenizes ANY command
+  # carrying a substitution, including valid-but-unmodeled shell (e.g. a
+  # heredoc body with an unbalanced quote) that this parser cannot
+  # tokenize. Failing closed on those would turn the gh guard into a
+  # blocker for unrelated shell work. Restore pre-broadening parity: a
+  # parse failure with NO guarded-write evidence anywhere in the raw text
+  # (no gh in stripped or octal/hex escape spelling, no env -S, no
+  # pr/issue noun, no guarded verb) exits 0 exactly like the evidence-free
+  # fast path always did. ANY evidence keeps the fail-closed block below.
+  #
+  # #611 round 6 (Codex P2): QUOTED-tag heredoc BODIES are data for the
+  # receiving command (cat/tee templates legitimately contain shell-looking
+  # text and guarded verbs), so they are excluded from the evidence probe —
+  # UNLESS a shell interpreter appears outside the bodies (bash <<EOF
+  # executes its body; keep full-text evidence there, matching the
+  # pre-broadening behavior where a literal in-body gh blocked the parse
+  # failure). #611 round 9: UNQUOTED-tag bodies are NOT stripped — bash
+  # expands their command substitutions while building the heredoc, so an
+  # in-body $(gh ...) executes and its evidence must keep failing closed.
+  EVIDENCE_TEXT="$COMMAND"
+  STRIPPED_TEXT=$(printf '%s\n' "$COMMAND" | awk '
+    skip == 1 {
+      line = $0
+      sub(/^\t+/, "", line)
+      if (line == tag) { skip = 0 }
+      next
+    }
+    {
+      print
+      if (match($0, /<<-?[[:space:]]*["'\''][A-Za-z_][A-Za-z0-9_]*/)) {
+        t = substr($0, RSTART, RLENGTH)
+        sub(/<<-?[[:space:]]*["'\'']/, "", t)
+        tag = t
+        skip = 1
+      }
+    }')
+  # `source` and the `.` builtin execute their input too (#611 r7:
+  # `source /dev/stdin <<EOF` runs the body) — a standalone dot token is
+  # probed as start-or-space + dot + space.
+  if ! printf '%s\n' "$STRIPPED_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(sh|bash|dash|zsh|ksh|eval|source)([^A-Za-z0-9_]|$)|(^|[[:space:]])\.[[:space:]]'; then
+    EVIDENCE_TEXT="$STRIPPED_TEXT"
+  fi
+  if ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])(([^[:space:]]*/)?gh|pr|issue|create|merge|comment|review|edit)([^A-Za-z0-9_]|$)' \
+     && ! printf '%s\n' "$EVIDENCE_TEXT" | tr -d "\"'\\\\" | grep -qE '(^|[^A-Za-z0-9_])env([[:space:]]|$)' \
+     && ! printf '%s\n' "$EVIDENCE_TEXT" | grep -qE '\\(147|150|107|110|x67|x68|x47|x48)'; then
+    exit 0
+  fi
   echo "BLOCKED: gh-pr-guard could not tokenize the gh command (malformed shell quoting)." >&2
   echo "  command: $COMMAND" >&2
   echo "  shlex error: $(cat "$TMP_TOKENS_ERR")" >&2
@@ -831,10 +1419,33 @@ is_any_wrapper_named_token() {
   return 1
 }
 
+# guarded_gh_invocation_label INDEX [MODE]
+#
+# Scan forward from INDEX for a guarded pr/issue write and print its label.
+# MODE picks the fail-closed posture for __MERGEPATH_CMDSUB__ placeholders in
+# the subcommand stream (#611 round 3):
+#
+#   strict   (default; INDEX is a LITERAL `gh`): the executable is known to be
+#            gh, so a substitution in noun or verb position can expand to any
+#            subcommand — including a guarded write (`gh $(x) 123` runs
+#            `gh pr merge 123` when x prints the noun AND verb). No literal
+#            evidence can decide it; fail closed on the placeholder itself.
+#   evidence (INDEX is a command-position placeholder in the _synth_ walk):
+#            the executable itself is unproven, so placeholders alone cannot
+#            block (`$(cc) $(cflags) -o out` is benign). Placeholders are
+#            TRANSPARENT — they may expand to nothing (`$(true)`), the exe, or
+#            the noun — and the scan keeps looking for literal guarded
+#            evidence past them: a literal `pr`/`issue` noun reached across a
+#            placeholder run, a literal guarded verb after it, or a bare
+#            guarded verb with the noun synthesized. A literal noun followed
+#            by a placeholder in VERB position also fails closed (the verb is
+#            unverifiable on a plausible gh-noun: `$(a) pr $(b) 123`).
 guarded_gh_invocation_label() {
   local gh_index="$1"
+  local mode="${2:-strict}"
   local parent=""
   local skip_global_as=""
+  local saw_ph=0
   local k
   local tok
 
@@ -855,9 +1466,29 @@ guarded_gh_invocation_label() {
 
     if [ -z "$parent" ]; then
       case "$tok" in
+        __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+          if [ "$mode" = "strict" ]; then
+            # Literal gh + unverifiable subcommand stream: the substitution
+            # may synthesize `pr merge` wholesale. Fail closed.
+            printf 'gh <unverifiable command substitution in subcommand position>\n'
+            return 0
+          fi
+          saw_ph=1
+          continue
+          ;;
         pr|issue)
           parent="$tok"
           continue
+          ;;
+        create|merge|comment|review|edit)
+          if [ "$saw_ph" -eq 1 ]; then
+            # Guarded verb reached across a placeholder run with no literal
+            # noun: the noun (and possibly the exe) was synthesized —
+            # `$(printf '\147\150') $(printf '\160\162') merge` (#611 round 3).
+            printf 'gh <synthesized> %s\n' "$tok"
+            return 0
+          fi
+          return 1
           ;;
         -R|--repo)
           skip_global_as="repo"
@@ -876,6 +1507,13 @@ guarded_gh_invocation_label() {
     fi
 
     case "$tok" in
+      __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+        # Literal pr/issue noun with a substitution in VERB position: the verb
+        # is unverifiable (`gh pr $(printf '\155...')  123` / `$(a) pr $(b)`).
+        # Fail closed in both modes — the noun is literal guarded evidence.
+        printf 'gh %s <synthesized verb>\n' "$parent"
+        return 0
+        ;;
       -R|--repo)
         skip_global_as="repo"
         continue
@@ -895,6 +1533,71 @@ guarded_gh_invocation_label() {
         ;;
       issue:comment)
         printf 'gh issue comment\n'
+        return 0
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+# #573: a command substitution in COMMAND position can synthesize BOTH the
+# executable AND the noun (e.g. $(printf '\147\150\40\160\162') -> `gh pr`), so
+# after flattening the __MERGEPATH_CMDSUB__ placeholder is followed directly by
+# a bare gh-write VERB (`merge`, `create`, ...) with NO literal `pr`/`issue`
+# token in between. guarded_gh_invocation_label needs that `pr`/`issue` parent,
+# so it returns "not guarded" for this shape. This companion recognizes a
+# placeholder whose first significant (non-flag) token is a gh-write verb and
+# reports it as a guarded write. Only ever consulted for the cmdsub placeholder
+# in the _synth_ command-position pass (NEVER for a literal `gh`, where a bare
+# verb like `gh auth login` is not a pr/issue write) — so it does not widen the
+# literal-gh compound scan. Global -R/--repo (value + = forms) and any other
+# -flag before the verb are skipped, mirroring guarded_gh_invocation_label; a
+# separator ends the search (return 1).
+synth_cmdsub_write_label() {
+  local ph_index="$1"
+  local skip_global_as=""
+  local k
+  local tok
+
+  for k in "${!TOKENS[@]}"; do
+    if [ "$k" -le "$ph_index" ]; then
+      continue
+    fi
+
+    tok="${TOKENS[$k]}"
+    if is_guard_separator "$tok"; then
+      return 1
+    fi
+
+    if [ "$skip_global_as" = "repo" ]; then
+      skip_global_as=""
+      continue
+    fi
+
+    case "$tok" in
+      -R|--repo)
+        skip_global_as="repo"
+        continue
+        ;;
+      -R=*|--repo=*)
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+    esac
+
+    # First significant non-flag token. A synthesized `gh pr` / `gh issue`
+    # leaves a bare write verb here. `comment` covers both `gh pr comment`
+    # and `gh issue comment`; either way it is a guarded write, so blocking
+    # is the fail-closed answer.
+    case "$tok" in
+      create|merge|comment|review|edit)
+        printf 'gh <synthesized> %s\n' "$tok"
         return 0
         ;;
       *)
@@ -939,12 +1642,38 @@ for _ci in "${!TOKENS[@]}"; do
     continue
   fi
   case "$_stok" in
+    __MERGEPATH_CMDSUB_LITERAL__)
+      # #611 round 5: a command-position literal printf/echo that could NOT
+      # be statically expanded (%b and other decoder directives, format-reuse
+      # forms) can synthesize an ENTIRE guarded write with zero outside
+      # evidence — the exact class the static expander decides for %s-only
+      # spans. Unconditional fail closed.
+      echo "BLOCKED: command-position printf/echo substitution could not be statically verified (#611)." >&2
+      echo "  A literal printf with a decoder directive (e.g. %b) can synthesize a full gh write" >&2
+      echo "  with no literal evidence outside the substitution. Rewrite without the substitution" >&2
+      echo "  in command position, or run the write through the token-verifying wrapper:" >&2
+      echo "    scripts/gh-as-author.sh -- gh ..." >&2
+      echo "    scripts/gh-as-reviewer.sh -- gh ..." >&2
+      exit 2
+      ;;
     __MERGEPATH_CMDSUB__)
-      if _synth_label=$(guarded_gh_invocation_label "$_ci"); then
+      # Synthesis shapes, all fail closed:
+      #   (a) exe synthesized, noun literal:  $(printf gh) pr merge
+      #       -> guarded_gh_invocation_label sees `pr merge` after the placeholder.
+      #   (b) exe AND noun synthesized:        $(printf 'gh pr') merge   (#573)
+      #       -> no literal `pr`/`issue`; synth_cmdsub_write_label sees the bare
+      #          write verb (`merge`) directly after the placeholder.
+      #   (c) exe and noun split across a placeholder RUN (#611 round 3):
+      #       $(printf '\147\150') $(printf '\160\162') merge
+      #       -> evidence mode treats placeholders as transparent and blocks on
+      #          the literal guarded verb (or literal noun + synthesized verb)
+      #          reached across the run.
+      if _synth_label=$(guarded_gh_invocation_label "$_ci" evidence) \
+         || _synth_label=$(synth_cmdsub_write_label "$_ci"); then
         echo "BLOCKED: command-position command substitution may synthesize a gh write ($_synth_label)." >&2
         echo "  A \$(...) or backtick in command position can produce the executable name" >&2
-        echo "  (e.g. \$(printf '\\147\\150') -> gh), so the guard cannot verify it. Run the" >&2
-        echo "  write directly through the verifying wrapper instead:" >&2
+        echo "  (e.g. \$(printf '\\147\\150') -> gh) AND the noun (e.g. \$(printf '\\147\\150\\40\\160\\162') -> gh pr)," >&2
+        echo "  so the guard cannot verify it. Run the write directly through the verifying wrapper instead:" >&2
         echo "    scripts/gh-as-author.sh -- gh ..." >&2
         echo "    scripts/gh-as-reviewer.sh -- gh ..." >&2
         exit 2
@@ -1013,6 +1742,20 @@ for i in "${!TOKENS[@]}"; do
   fi
 
   case "$tok" in
+    [A-Za-z_]*=)
+      # Bare assignment (#611 r9): a flattened X=$(...) leaves X= followed
+      # by a PLACEHOLDER that is really the assignment VALUE — consume it
+      # and stay in command position, so a following spliced gh write is
+      # scanned as the command (FOO=$(date) $(printf gh) pr merge). Any
+      # OTHER next token means a genuinely EMPTY assignment (X= cmd) whose
+      # next token IS the command — do not consume it.
+      case "${TOKENS[$((i+1))]:-}" in
+        __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+          SCAN_SKIP_PREFIX_VALUE=1
+          ;;
+      esac
+      continue
+      ;;
     [A-Za-z_]*=*)
       continue
       ;;
@@ -1151,11 +1894,37 @@ PENDING_PREFIX_FLAG=""   # "<prefix>:<flag>" whose value the next token is
                          # (lets the consumer recognize `env -u NAME`)
 IDENTITY_ENV_CLEARED_FOR_WRAPPER=0  # 1 = env -i seen: the wrapper sees an
                          # EMPTY environment (no MERGEPATH_AGENT either)
+
+# #611 round 3: a substitution in a LITERAL gh's subcommand stream can
+# synthesize the noun, the verb, or a whole guarded write — `gh $(printf
+# '\160\162') merge`, `gh pr $(printf '\155...')`, `gh $(true) pr merge`
+# (empty expansion shifts the literal tokens into place). No literal evidence
+# can classify it, so the walk below fails closed the moment a placeholder
+# appears between gh and its resolved subcommand.
+block_cmdsub_in_gh_stream() {
+  echo "BLOCKED: unverifiable command substitution inside a gh command (#611)." >&2
+  echo "  A \$(...) or backtick between gh and its subcommand can synthesize the" >&2
+  echo "  noun or verb of a guarded write (e.g. gh \$(printf '\\160\\162') merge)," >&2
+  echo "  so the guard cannot classify this invocation. Use literal gh" >&2
+  echo "  subcommands, and run writes through the token-verifying wrapper:" >&2
+  echo "    scripts/gh-as-author.sh -- gh ..." >&2
+  echo "    scripts/gh-as-reviewer.sh -- gh ..." >&2
+  exit 2
+}
+
 for i in "${!TOKENS[@]}"; do
   tok="${TOKENS[$i]}"
   # --- phase 2: walking after gh, looking for pr + subcommand ---
   if [ "$SAW_GH" -eq 1 ]; then
     if [ "$SKIP_GLOBAL_AS" = "repo" ]; then
+      # #611 r14: a command substitution as the -R/--repo VALUE
+      # (gh pr -R $(cat file) 1) is unverifiable — bash word-splits the
+      # substitution output, so it can inject additional argv including a
+      # guarded verb (-R "owner/repo merge" -> ... merge ...). Fail closed
+      # rather than swallow the placeholder as an opaque repo value.
+      if [ "$tok" = "__MERGEPATH_CMDSUB__" ] || [ "$tok" = "__MERGEPATH_CMDSUB_LITERAL__" ]; then
+        block_cmdsub_in_gh_stream
+      fi
       GLOBAL_REPO="$tok"
       SKIP_GLOBAL_AS=""
       continue
@@ -1192,6 +1961,10 @@ for i in "${!TOKENS[@]}"; do
           # globals.
           continue
           ;;
+        __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+          # Placeholder in NOUN position (#611 r3): fail closed.
+          block_cmdsub_in_gh_stream
+          ;;
         *)
           # Non-flag, non-pr, non-issue token before the parent. Either
           # gh aliases are in play (out of scope) or this is a gh
@@ -1221,6 +1994,11 @@ for i in "${!TOKENS[@]}"; do
     esac
 
     # SAW_PR=1 OR SAW_ISSUE=1 — this token IS the subcommand.
+    if [ "$tok" = "__MERGEPATH_CMDSUB__" ] || [ "$tok" = "__MERGEPATH_CMDSUB_LITERAL__" ]; then
+      # Placeholder in VERB position (#611 r3): `gh pr $(...) 123` executes
+      # whatever the substitution yields as the subcommand. Fail closed.
+      block_cmdsub_in_gh_stream
+    fi
     PR_SUBCOMMAND="$tok"
     PR_SUBCOMMAND_INDEX=$i
     break
@@ -1461,6 +2239,22 @@ for i in "${!TOKENS[@]}"; do
   fi
 
   case "$tok" in
+    [A-Za-z_]*=)
+      # Bare assignment (#611 r9): a flattened X=$(...) leaves X= followed
+      # by a PLACEHOLDER that is really the assignment VALUE — consume it
+      # and stay in command position, so a following spliced gh write is
+      # scanned as the command (FOO=$(date) $(printf gh) pr merge ran gh
+      # unguarded). Any OTHER next token means a genuinely EMPTY assignment
+      # (X= cmd, e.g. the identity-override wrapper forms) whose next token
+      # IS the command — do not consume it.
+      case "${TOKENS[$((i+1))]:-}" in
+        __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+          SKIP_PREFIX_VALUE=1
+          PENDING_PREFIX_FLAG=""
+          ;;
+      esac
+      continue
+      ;;
     [A-Za-z_]*=*)
       # Env assignment. Stay in command position.
       continue

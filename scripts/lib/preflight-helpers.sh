@@ -127,11 +127,62 @@ auto_source_preflight() {
   if ! preflight_session_is_fresh "$session_file"; then
     return 0
   fi
+  # Scrub ambient GH_TOKEN / GITHUB_TOKEN before sourcing the cache (#573).
+  # GH_TOKEN is guaranteed unset here by the early return above, but a stray
+  # ambient GITHUB_TOKEN would otherwise survive and — because gh prefers
+  # GITHUB_TOKEN over the freshly-sourced GH_TOKEN — shadow the cached PAT
+  # the cache is about to export. Unset both so the resolved environment
+  # ends with ONLY the cache's own credentials, never a leaked ambient one.
+  #
+  # #611 (Codex P2): the scrub must not DESTROY the caller's auth when the
+  # cache provides no replacement. A fresh cache from `--mode deploy` (or any
+  # cache without a GitHub PAT) exports no GH_TOKEN and no OP_PREFLIGHT_*_PAT,
+  # and unconditionally dropping the ambient GITHUB_TOKEN would leave the
+  # caller with no GitHub credential at all. Snapshot the ambient value and
+  # restore it below iff sourcing produced NO GitHub credential of any kind —
+  # the shadowing hazard the scrub exists for only arises when the cache
+  # actually supplies one.
+  local _ambient_github_token_set=0 _ambient_github_token=""
+  if [[ -n "${GITHUB_TOKEN+x}" ]]; then
+    _ambient_github_token_set=1
+    _ambient_github_token="$GITHUB_TOKEN"
+  fi
+  unset GH_TOKEN GITHUB_TOKEN
   # Source the cache file. Permissions are 0600 in a 0700 cache dir,
   # owner-only; we trust the file the same way op-preflight.sh itself
   # does on the cache-hit path.
   # shellcheck disable=SC1090
   . "$session_file"
+  # #611 r10: do NOT synthesize a GH_TOKEN from the cache reviewer PAT here.
+  # The round-9 reviewer-export imposed the reviewer identity on every
+  # auto_source caller, but callers that need a specific identity for bare
+  # gh — notably scripts/sync-to-downstream.sh, whose sync_read_gh calls
+  # `preflight_require_token author` precisely WHEN GH_TOKEN is empty —
+  # depend on GH_TOKEN staying unset so they can acquire the RIGHT token.
+  # A review-mode cache therefore leaves GH_TOKEN unset (callers pin
+  # $OP_PREFLIGHT_{REVIEWER,AUTHOR}_PAT per command, or require_token).
+  #
+  # Restore the caller's ambient GITHUB_TOKEN whenever the cache did NOT
+  # export a GH_TOKEN of its own (#611 r13). This preserves bare-`gh`
+  # callers (that rely on ambient GITHUB_TOKEN, not require_token) in
+  # token-only environments, and unifies the r7/r9/r10/r11 special cases.
+  #
+  # It is SAFE against the #573 shadowing concern: gh resolves GH_TOKEN
+  # BEFORE GITHUB_TOKEN (verified empirically — with both set, gh reports
+  # "using token (GH_TOKEN)"; the manual lists them "in order of
+  # precedence"), so a per-command `GH_TOKEN=$OP_PREFLIGHT_*_PAT` pin (and a
+  # require_token-set GH_TOKEN) ALWAYS wins over the restored fallback. The
+  # earlier #573 auto-source comment had this precedence backwards; the real
+  # #573 protection (a cache that computes a PAT from a leaked $GITHUB_TOKEN)
+  # lives in load_preflight_env_vars' subshell scrub, which is unchanged.
+  # A cache that DOES export its own GH_TOKEN needs no restore (GH_TOKEN is
+  # already set and wins). Decided by the CACHE FILE, not post-source env
+  # (#611 r7): a stale ambient PAT must not affect the decision.
+  if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" \
+        && "$_ambient_github_token_set" -eq 1 ]] \
+     && ! grep -qE '^(export[[:space:]]+)?GH_TOKEN=' "$session_file"; then
+    export GITHUB_TOKEN="$_ambient_github_token"
+  fi
   if [[ "${OP_PREFLIGHT_QUIET:-0}" != "1" ]]; then
     echo "# auto-source: loaded op-preflight cache for agent=$agent (no biometric)" >&2
   fi
@@ -159,10 +210,19 @@ load_preflight_env_vars() {
   # can include deploy credentials (GOOGLE_APPLICATION_CREDENTIALS, CF_API_TOKEN)
   # from a prior --mode deploy run; subshell isolation prevents those from
   # leaking into the caller's process. (#554/#556 CodeRabbit Major)
+  #
+  # Scrub ambient GH_TOKEN / GITHUB_TOKEN INSIDE each subshell before sourcing
+  # (#573): the subshell inherits the caller's environment, so a stray ambient
+  # token would otherwise be visible while the cache is sourced and could leak
+  # into the resolved PAT (a cache/legacy file that computes a PAT from
+  # $GH_TOKEN / $GITHUB_TOKEN would capture the ambient value). Unsetting both
+  # first pins the resolved PATs to the cache's OWN credentials. The caller's
+  # ambient GH_TOKEN is restored from _saved_gh_token below, so this scoping
+  # never disturbs the caller's process.
   # shellcheck disable=SC1090
-  _r=$(. "$session_file" 2>/dev/null && printf '%s' "${OP_PREFLIGHT_REVIEWER_PAT:-}") || true
+  _r=$(unset GH_TOKEN GITHUB_TOKEN; . "$session_file" 2>/dev/null && printf '%s' "${OP_PREFLIGHT_REVIEWER_PAT:-}") || true
   # shellcheck disable=SC1090
-  _a=$(. "$session_file" 2>/dev/null && printf '%s' "${OP_PREFLIGHT_AUTHOR_PAT:-}") || true
+  _a=$(unset GH_TOKEN GITHUB_TOKEN; . "$session_file" 2>/dev/null && printf '%s' "${OP_PREFLIGHT_AUTHOR_PAT:-}") || true
   [[ -n "${_r:-}" ]] && OP_PREFLIGHT_REVIEWER_PAT="$_r"
   [[ -n "${_a:-}" ]] && OP_PREFLIGHT_AUTHOR_PAT="$_a"
   if [[ -n "$_saved_gh_token" ]]; then
