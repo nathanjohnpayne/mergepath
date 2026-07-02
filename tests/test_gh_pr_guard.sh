@@ -1053,6 +1053,21 @@ assert_rc_contains "single quoted heredoc fixture still allowed (#611 r12 regres
   'cat <<'"'"'EOF'"'"' > /tmp/fx
 $(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
 EOF'
+
+# --- #611 round 13: value-taking prefix option before a piped shell --------
+# The pipeline command-word scan must consume a value-taking prefix option's
+# VALUE (sudo -u nobody bash) so the real interpreter (bash) is seen and the
+# heredoc body scanned.
+assert_rc_contains "quoted heredoc piped to sudo -u USER bash fails closed (#611 r13)" 2 "" \
+  'cat <<'"'"'EOF'"'"' | sudo -u nobody bash
+gh pr merge 1
+EOF'
+# Control: the value-option VALUE itself is not mistaken for an interpreter
+# (piped to `sudo -u bash cat` — cat is the command, bash is -u value).
+assert_rc_contains "value-option value named bash is not the interpreter (#611 r13)" 0 "" \
+  'cat <<'"'"'EOF'"'"' | sudo -u bash cat
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
 assert_rc_contains "parse failure with octal gh spelling still fails closed (#611 r4)" 2 "tokenize" \
   '$(printf "\147\150") pr merge 1 "oops'
 

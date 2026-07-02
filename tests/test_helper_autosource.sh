@@ -190,11 +190,14 @@ test_lib_stale_cache_noop() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 3b (#573): auto_source_preflight scrubs a stray ambient GITHUB_TOKEN
-# before sourcing, so it cannot survive to shadow the cache's GH_TOKEN (gh
-# prefers GITHUB_TOKEN over GH_TOKEN). GH_TOKEN is unset here (auto-source
-# only runs on an unset GH_TOKEN), and the ambient GITHUB_TOKEN must be gone
-# after the source.
+# Test 3b (#573 + #611 r13): auto_source_preflight scrubs the ambient
+# GITHUB_TOKEN before sourcing (so a cache that computes a PAT cannot capture
+# it), then RESTORES it afterward because the cache exports no GH_TOKEN of
+# its own. This is safe: gh resolves GH_TOKEN before GITHUB_TOKEN (verified
+# empirically), so a per-command $OP_PREFLIGHT_*_PAT pin still wins, while a
+# bare-gh caller keeps its fallback. auto-source must NOT impose a GH_TOKEN
+# from the cache (r10) — GH_TOKEN stays unset so identity-specific callers
+# (sync_read_gh -> require_token author) resolve the right token.
 # ---------------------------------------------------------------------------
 test_lib_auto_source_scrubs_ambient_github_token() {
   (
@@ -203,22 +206,21 @@ test_lib_auto_source_scrubs_ambient_github_token() {
     unset GH_TOKEN OP_PREFLIGHT_REVIEWER_PAT OP_PREFLIGHT_AUTHOR_PAT
     export OP_PREFLIGHT_CACHE_DIR="$case_dir"
     export MERGEPATH_AGENT=claude
-    export GITHUB_TOKEN="ambient-leaked-github-token"
+    export GITHUB_TOKEN="ambient-caller-github-token"
     # shellcheck source=../scripts/lib/preflight-helpers.sh
     . "$LIB"
     auto_source_preflight
-    if [ -n "${GITHUB_TOKEN:-}" ]; then
-      echo "auto_source left ambient GITHUB_TOKEN in place (got '${GITHUB_TOKEN:-}')" >&2
+    if [ "${GITHUB_TOKEN:-}" != "ambient-caller-github-token" ]; then
+      echo "auto_source did not restore the ambient GITHUB_TOKEN fallback (got '${GITHUB_TOKEN:-}')" >&2
       exit 1
     fi
     if [ "${OP_PREFLIGHT_REVIEWER_PAT:-}" != "rev-3b" ]; then
       echo "auto_source did not load the cache (REVIEWER_PAT='${OP_PREFLIGHT_REVIEWER_PAT:-}')" >&2
       exit 1
     fi
-    # #611 r10: a review-mode cache (with PATs) leaves GH_TOKEN UNSET — it
-    # must NOT impose the reviewer PAT, so identity-specific callers
-    # (sync_read_gh -> require_token author on empty GH_TOKEN) get the right
-    # token. Callers pin $OP_PREFLIGHT_*_PAT per command instead.
+    # r10: a review-mode cache leaves GH_TOKEN UNSET — it must NOT impose the
+    # reviewer PAT; callers pin $OP_PREFLIGHT_*_PAT per command, which wins
+    # over the restored GITHUB_TOKEN by gh precedence.
     if [ -n "${GH_TOKEN:-}" ]; then
       echo "auto_source imposed a GH_TOKEN from a review cache (got '${GH_TOKEN:-}')" >&2
       exit 1
@@ -228,7 +230,7 @@ test_lib_auto_source_scrubs_ambient_github_token() {
     fail "test_lib_auto_source_scrubs_ambient_github_token: rc=$rc stderr=$(cat "$WORKDIR/lib3b.err")"
     return
   fi
-  pass "test_lib_auto_source_scrubs_ambient_github_token: ambient GITHUB_TOKEN scrubbed before cache source (#573)"
+  pass "test_lib_auto_source_scrubs_ambient_github_token: ambient GITHUB_TOKEN restored as fallback, GH_TOKEN unimposed (#611 r13)"
 }
 
 # ---------------------------------------------------------------------------

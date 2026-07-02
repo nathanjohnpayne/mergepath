@@ -756,8 +756,12 @@ def _segment_command_word(toks):
     # whitespace-split, escapes/quotes stripped), with redirections and their
     # targets, leading env assignments, and prefix commands + flags skipped
     # (#611 r10: `bash` in a redirection path or an argument must NOT be read
-    # as the interpreter).
+    # as the interpreter). A value-taking prefix option consumes its VALUE
+    # too (#611 r13: sudo -u nobody bash — nobody is the value of -u, not the
+    # command), using the same per-prefix PREFIX_VALUE_OPTS_SPEC table as the
+    # main walk so the two cannot drift.
     k = 0
+    prefix = ""
     while k < len(toks):
         t = toks[k]
         if re.match(r"^[0-9]*(>>|>|<<?|>&|&>)", t):
@@ -771,8 +775,16 @@ def _segment_command_word(toks):
         if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
             k += 1
             continue
-        if t in _LINE_PREFIX_CMDS or t.startswith("-"):
+        if t in _LINE_PREFIX_CMDS:
+            prefix = t
             k += 1
+            continue
+        if t.startswith("-"):
+            opts = _PREFIX_VALUE_OPTS.get(prefix, _EMPTY_FROZENSET)
+            if "=" not in t and t in opts:
+                k += 2  # value-taking option consumes the next token
+            else:
+                k += 1
             continue
         return t.rsplit("/", 1)[-1]
     return ""

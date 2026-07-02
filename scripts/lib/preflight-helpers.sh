@@ -162,32 +162,25 @@ auto_source_preflight() {
   # A review-mode cache therefore leaves GH_TOKEN unset (callers pin
   # $OP_PREFLIGHT_{REVIEWER,AUTHOR}_PAT per command, or require_token).
   #
-  # Restore the caller's ambient GITHUB_TOKEN unless the cache is COMPLETE.
-  # A cache is complete when it can serve every identity a caller may
-  # require: it exports its own GH_TOKEN, OR it carries BOTH the reviewer
-  # AND author PATs. In that case the caller uses require_token / a
-  # per-command pin for the right identity and the #573 scrub stands (no
-  # leaked ambient token survives to be mistaken for a proper credential).
+  # Restore the caller's ambient GITHUB_TOKEN whenever the cache did NOT
+  # export a GH_TOKEN of its own (#611 r13). This preserves bare-`gh`
+  # callers (that rely on ambient GITHUB_TOKEN, not require_token) in
+  # token-only environments, and unifies the r7/r9/r10/r11 special cases.
   #
-  # An INCOMPLETE cache leaves a gap: a --mode deploy cache (no PAT at all,
-  # #611 r7) or a service-account review cache with ONLY the reviewer PAT
-  # (#611 r11) cannot serve `preflight_require_token author`, so scrubbing
-  # the caller's ambient GITHUB_TOKEN would strip its only fallback and leave
-  # direct read helpers (sync_read_gh) unauthenticated. Restore it there — a
-  # per-command `GH_TOKEN=<pat>` pin still takes precedence over GITHUB_TOKEN
-  # per the gh precedence order, so the restored fallback never shadows an
-  # explicit pin. Decided by the CACHE FILE, not post-source env (#611 r7):
-  # a stale OP_PREFLIGHT_*_PAT inherited from an earlier run must not
-  # masquerade as cache-supplied.
-  local _cache_complete=0
-  if grep -qE '^(export[[:space:]]+)?GH_TOKEN=' "$session_file"; then
-    _cache_complete=1
-  elif grep -qE '^(export[[:space:]]+)?OP_PREFLIGHT_REVIEWER_PAT=' "$session_file" \
-       && grep -qE '^(export[[:space:]]+)?OP_PREFLIGHT_AUTHOR_PAT=' "$session_file"; then
-    _cache_complete=1
-  fi
+  # It is SAFE against the #573 shadowing concern: gh resolves GH_TOKEN
+  # BEFORE GITHUB_TOKEN (verified empirically — with both set, gh reports
+  # "using token (GH_TOKEN)"; the manual lists them "in order of
+  # precedence"), so a per-command `GH_TOKEN=$OP_PREFLIGHT_*_PAT` pin (and a
+  # require_token-set GH_TOKEN) ALWAYS wins over the restored fallback. The
+  # earlier #573 auto-source comment had this precedence backwards; the real
+  # #573 protection (a cache that computes a PAT from a leaked $GITHUB_TOKEN)
+  # lives in load_preflight_env_vars' subshell scrub, which is unchanged.
+  # A cache that DOES export its own GH_TOKEN needs no restore (GH_TOKEN is
+  # already set and wins). Decided by the CACHE FILE, not post-source env
+  # (#611 r7): a stale ambient PAT must not affect the decision.
   if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" \
-        && "$_ambient_github_token_set" -eq 1 && "$_cache_complete" -eq 0 ]]; then
+        && "$_ambient_github_token_set" -eq 1 ]] \
+     && ! grep -qE '^(export[[:space:]]+)?GH_TOKEN=' "$session_file"; then
     export GITHUB_TOKEN="$_ambient_github_token"
   fi
   if [[ "${OP_PREFLIGHT_QUIET:-0}" != "1" ]]; then
