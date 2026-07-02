@@ -796,7 +796,11 @@ assert_rc_contains "backtick-synth issue comment fails closed (#553)" 2 "wrapper
   '`printf "\147\150"` issue comment 5 --body hi'
 assert_rc_contains "assignment-prefixed cmdsub-synth pr merge fails closed (#553)" 2 "wrapper" \
   'FOO=1 $(printf "\147\150") pr merge 1'
-assert_rc_contains "separator-then cmdsub-synth pr merge fails closed (#553 empirical)" 2 "wrapper" \
+# #611 r2: the span is now statically expanded to a literal gh, so this
+# shape blocks via the compound-gh rule (#348: two command-position gh
+# invocations, one guarded) rather than the synth-placeholder rule. Either
+# rule is fail-closed; assert only the block.
+assert_rc_contains "separator-then cmdsub-synth pr merge fails closed (#553 empirical)" 2 "" \
   'gh --version ; $(printf "\147\150") pr merge 123 --admin'
 assert_rc_contains "command-position cmdsub with NO gh write stays allowed (#553)" 0 "" \
   '$(date -u) >/dev/null'
@@ -820,7 +824,11 @@ assert_rc_contains "cmdsub-synth BOTH exe+noun (gh pr) then bare merge fails clo
   '$(printf "\147\150\40\160\162") merge 123 --admin'
 assert_rc_contains "backtick-synth exe+noun (gh issue) then bare comment fails closed (#573)" 2 "wrapper" \
   '`printf "\147\150\40\151\163\163\165\145"` comment 5 --body hi'
-assert_rc_contains "cmdsub-synth exe then --repo before a bare create verb fails closed (#573)" 2 "wrapper" \
+# #611 r2: statically expanded to `gh --repo o/r create --title x`, which is
+# now DECIDABLE — gh has no top-level `create` (the guarded verbs live under
+# pr/issue), so this is no longer an unverifiable synth shape and is allowed,
+# matching the `gh status` control below.
+assert_rc_contains "cmdsub-synth exe then --repo before a bare create verb decides statically (#573/#611 r2)" 0 "" \
   '$(printf "\147\150") --repo o/r create --title x'
 # No false positive: a command-position cmdsub followed by a NON-write
 # subcommand (a gh read) is tokenized (#611 r3: any substitution tokenizes)
@@ -898,6 +906,30 @@ assert_rc_contains "gh read with cmdsub argument stays allowed (#611 r3)" 0 "" \
   'gh pr view $(printf "\61") --json title'
 assert_rc_contains "placeholder run with no guarded evidence stays allowed (#611 r3)" 0 "" \
   '$(printf a) $(printf b) c'
+
+# --- #611 round 2 (Codex P1): FULLY synthesized guarded writes ------------
+# $(printf "...") can emit the ENTIRE gh pr merge sequence, leaving zero
+# literal evidence in the outer command — undecidable by any placeholder
+# heuristic. Literal-only printf/echo spans are now statically EMULATED and
+# spliced into the token stream, so the walk decides the real expansion
+# exactly: synthesized writes block, synthesized data stays allowed, and
+# dynamic spans still fall back to the placeholder + evidence scan.
+# \147\150\40\160\162\40\155\145\162\147\145 = "gh pr merge".
+assert_rc_contains "FULLY synthesized gh pr merge fails closed (#611 r2)" 2 "wrapper" \
+  '$(printf "\147\150\40\160\162\40\155\145\162\147\145") 123 --admin'
+assert_rc_contains "echo-synthesized gh pr merge fails closed (#611 r2)" 2 "wrapper" \
+  '$(echo gh pr merge) 1'
+assert_rc_contains "percent-s printf synthesis fails closed (#611 r2)" 2 "wrapper" \
+  '$(printf "%s" gh) pr merge 1'
+assert_rc_contains "backtick fully synthesized issue comment fails closed (#611 r2)" 2 "wrapper" \
+  '`printf "\147\150\40\151\163\163\165\145\40\143\157\155\155\145\156\164"` 5 --body hi'
+# Controls: a statically expanded BENIGN span is allowed as the data it is,
+# and a non-static printf (format-reuse form, not emulated) still fails
+# closed via the placeholder evidence scan when guarded evidence follows.
+assert_rc_contains "statically expanded benign printf stays allowed (#611 r2)" 0 "" \
+  '$(printf hello) world'
+assert_rc_contains "non-static printf form still fails closed on evidence (#611 r2)" 2 "wrapper" \
+  '$(printf "\147\150" x) pr merge 1'
 
 # #553 fix (b): the merge-state jq counts an un-timestamped PENDING re-run as
 # non-green even when a timestamped SUCCESS exists for the same check (the prior

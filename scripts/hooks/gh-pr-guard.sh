@@ -417,6 +417,130 @@ def _read_backtick_span(cmd, start):
         i += 1
     raise ValueError("unterminated backtick substitution")
 
+# --- #611 round 2/3: statically expand literal-only printf/echo spans ---
+# A substitution like $(printf "\147\150\40\160\162\40\155\145\162\147\145")
+# can synthesize an ENTIRE guarded write with zero literal evidence left in
+# the outer command, which no placeholder heuristic can decide. But such a
+# span is a PURE FUNCTION of literal text — the guard can emulate it and
+# splice the real expansion into the token stream, deciding the command
+# exactly: a synthesized `gh pr merge` is blocked as the guarded write it
+# is, and a synthesized `hello world` is allowed as the data it is. Only
+# unquoted spans whose argv is a flag-free echo or a %s-only printf with
+# fully literal arguments are expanded; anything dynamic (variables, nested
+# substitutions, other commands, exotic directives) falls back to the
+# placeholder + evidence scan. The spliced text is restricted to a shell-
+# inert charset so it can never introduce new syntax.
+
+def _decode_fmt_escapes(s):
+    # bash printf decodes backslash escapes in its FORMAT argument:
+    # \NNN (octal), \xHH (hex), and the C letters. Unknown escapes stay
+    # verbatim (bash prints them as-is).
+    simple = {"a": "\a", "b": "\b", "f": "\f", "n": "\n",
+              "r": "\r", "t": "\t", "v": "\v", "\\": "\\"}
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        nxt = s[i + 1]
+        if nxt in simple:
+            out.append(simple[nxt])
+            i += 2
+            continue
+        if nxt == "x":
+            m = re.match(r"[0-9A-Fa-f]{1,2}", s[i + 2:i + 4])
+            if m:
+                out.append(chr(int(m.group(0), 16)))
+                i += 2 + len(m.group(0))
+                continue
+            out.append("\\")
+            i += 1
+            continue
+        m = re.match(r"[0-7]{1,3}", s[i + 1:i + 4])
+        if m:
+            out.append(chr(int(m.group(0), 8)))
+            i += 1 + len(m.group(0))
+            continue
+        out.append("\\")
+        out.append(nxt)
+        i += 2
+    return "".join(out)
+
+_SPLICE_SAFE_RE = re.compile(r"[A-Za-z0-9_./=,:@+% -]*\Z")
+
+def _static_expand(span):
+    # Return the literal expansion of a pure printf/echo span, or None when
+    # the span is dynamic or the expansion is not splice-safe.
+    for ch in ("$", chr(96), ";", "|", "&", "<", ">", "(", ")", "{", "}"):
+        if ch in span:
+            return None
+    try:
+        argv = shlex.split(span)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    if argv[0] == "echo":
+        args = argv[1:]
+        if args and args[0] == "-n":
+            args = args[1:]
+        if args and args[0].startswith("-"):
+            return None  # -e/-E/clustered flags: bail to the placeholder
+        out = " ".join(args)
+    elif argv[0] == "printf":
+        if len(argv) < 2:
+            return None
+        fmt = _decode_fmt_escapes(argv[1])
+        args = argv[2:]
+        # Split the format on %s directives; reject any other directive.
+        pieces = []
+        cur = []
+        i = 0
+        ns = 0
+        while i < len(fmt):
+            c = fmt[i]
+            if c == "%":
+                if i + 1 < len(fmt) and fmt[i + 1] == "%":
+                    cur.append("%")
+                    i += 2
+                    continue
+                if i + 1 < len(fmt) and fmt[i + 1] == "s":
+                    pieces.append("".join(cur))
+                    cur = []
+                    ns += 1
+                    i += 2
+                    continue
+                return None
+            cur.append(c)
+            i += 1
+        pieces.append("".join(cur))
+        if ns == 0:
+            if args:
+                return None  # format-reuse semantics: bail
+            out = pieces[0]
+        else:
+            # The format is reused until all args are consumed; missing
+            # args behave as empty strings (bash printf semantics).
+            reps = ((len(args) + ns - 1) // ns) if args else 1
+            parts = []
+            ai = 0
+            for _ in range(reps):
+                for j in range(ns):
+                    parts.append(pieces[j])
+                    parts.append(args[ai] if ai < len(args) else "")
+                    ai += 1
+                parts.append(pieces[ns])
+            out = "".join(parts)
+    else:
+        return None
+    if not _SPLICE_SAFE_RE.match(out):
+        return None
+    return out
+
 def flatten_command(cmd, depth=0):
     """Normalize a command for shlex tokenization so the downstream walk
     sees every command-position gh write. Three jobs (#533, plus the #540
@@ -461,14 +585,29 @@ def flatten_command(cmd, depth=0):
         # quotes, never inside single quotes.
         if not in_single and c == "$" and i + 1 < n and cmd[i + 1] == "(":
             span, j = _read_paren_span(cmd, i + 2)
-            spans.append(span)
-            out.append(" __MERGEPATH_CMDSUB__ ")
+            # #611: an UNQUOTED literal printf/echo span is spliced as its
+            # real expansion (word-splitting applies, exactly like bash), so
+            # a fully synthesized write is decided precisely. Inside double
+            # quotes the expansion stays one word — keep the placeholder.
+            exp = None if in_double else _static_expand(span)
+            if exp is None:
+                spans.append(span)
+                out.append(" __MERGEPATH_CMDSUB__ ")
+            else:
+                # NO padding: the expansion must stay glued to adjacent text
+                # exactly as bash glues it (G=$(printf gh) is ONE assignment
+                # word `G=gh`, not an assignment plus a command).
+                out.append(exp)
             i = j
             continue
         if not in_single and c == chr(96):
             span, j = _read_backtick_span(cmd, i + 1)
-            spans.append(span)
-            out.append(" __MERGEPATH_CMDSUB__ ")
+            exp = None if in_double else _static_expand(span)
+            if exp is None:
+                spans.append(span)
+                out.append(" __MERGEPATH_CMDSUB__ ")
+            else:
+                out.append(exp)
             i = j
             continue
         if not in_single and not in_double:
