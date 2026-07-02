@@ -366,6 +366,47 @@ test_scan_is_head_pinned() {
   fi
 }
 
+test_string_id_findings_json_matches_consistently() {
+  # Regression for #617 (finding 3511089558): when --findings-json supplies the
+  # comment_id as a STRING ("8001"), all three id-matching sites must agree.
+  #
+  # PRE-FIX this case FAILS: normalize_findings preserved the string, so the
+  # main loop's lookup_verdict string-matched and recorded ONE row, while the
+  # final not-found pass (numeric index($c)) missed it and ALSO reported the
+  # same id as skipped:not-found — one adjudicated finding written resolved
+  # AND reported not-found at once. The fix coerces the id to a number during
+  # normalization, so exactly one row is written and zero not-found skips fire.
+  local dir rc
+  dir=$(make_case "string-id")
+  cat >"$dir/findings.json" <<EOF
+{ "findings": [
+  { "path": "src/str.ts", "line": 12, "comment_id": "8001",
+    "body": $(jq -n --arg b "$MINOR_BODY" '$b') }
+] }
+EOF
+  make_threads_fixture '[{isResolved: true, comment_ids: [8001]}]' >"$dir/threads.json"
+  rc=$(run_case "$dir" -- 999 --repo owner/repo --findings-json findings.json --verdict 8001=fixed)
+
+  local row notfound
+  row=$(head -1 "$(ledger_file "$dir")" 2>/dev/null || printf '')
+  notfound=$(jq -r '[.skipped[] | select((.comment_id|tostring)=="8001" and .why=="not-found")] | length' "$dir/out.json")
+  if [ "$rc" != "0" ]; then
+    fail "string-id: exit $rc, expected 0; stderr=$(cat "$dir/err.log")"
+  elif [ "$(ledger_lines "$dir")" != "1" ]; then
+    fail "string-id: ledger has $(ledger_lines "$dir") lines, expected 1"
+  elif [ "$notfound" != "0" ]; then
+    fail "string-id: id 8001 reported not-found $notfound time(s) despite being recorded; out=$(cat "$dir/out.json")"
+  elif [ "$(printf '%s' "$row" | jq -r '.comment_id')" != "8001" ]; then
+    fail "string-id: recorded comment_id was $(printf '%s' "$row" | jq -r '.comment_id'), expected 8001 (coerced to number)"
+  elif [ "$(printf '%s' "$row" | jq -r '.comment_id|type')" != "number" ]; then
+    fail "string-id: comment_id type was $(printf '%s' "$row" | jq -r '.comment_id|type'), expected number (coerced)"
+  elif [ "$(printf '%s' "$row" | jq -r '.resolved')" != "true" ]; then
+    fail "string-id: resolved was $(printf '%s' "$row" | jq -r '.resolved'), expected true (thread map matched by coerced id)"
+  else
+    pass "a string comment_id in --findings-json matches consistently (recorded once, no phantom not-found, resolved bit honored)"
+  fi
+}
+
 test_never_posts_any_write() {
   # Asymmetry guarantee (#574/#584): across EVERY case above, the gh stub
   # must never have seen a write marker (-X / --method) — the recorder is
@@ -395,6 +436,7 @@ test_unknown_verdict_exits_2_pre_write
 test_idempotent_rerecord_noop
 test_superseding_verdict_appends_flagged_row
 test_scan_is_head_pinned
+test_string_id_findings_json_matches_consistently
 test_never_posts_any_write
 
 echo

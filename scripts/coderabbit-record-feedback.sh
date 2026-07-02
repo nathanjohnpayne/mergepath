@@ -409,15 +409,29 @@ HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
 # Accepts either an object carrying a findings array or a bare array. `tier`
 # here is only the producer's FALLBACK — classification below re-derives it
 # from the body via coderabbit_tier_of whenever a marker is present.
+#
+# comment_id is COERCED to a number (#617): a GitHub inline-comment databaseId
+# is always an integer, but a --findings-json producer may emit it as a string
+# ("5001"). The three id-matching sites downstream are inconsistent — the main
+# loop's lookup_verdict string-compares, while the NEED_RESOLUTION_MAP scan and
+# the final not-found pass compare against numeric --argjson values — so a
+# string id would be BOTH recorded (matched by lookup_verdict) AND reported
+# skipped:not-found (missed by index($c)). Coercing here makes comment_id
+# numeric everywhere, matching the --scan path (which reads a JSON number) and
+# the integer-validated --verdict ids, so all three sites agree. A value that
+# is neither a number nor a numeric string is left untouched (it simply will
+# not match — the conservative default) rather than aborting normalization.
 normalize_findings() {
   jq '
+    def coerce_id:
+      if type == "string" and test("^[0-9]+$") then tonumber else . end;
     (if type == "object" and has("findings") then .findings else . end)
     | (if type == "array" then . else [] end)
     | [ .[]
         | {
             path: (.path // null),
             line: (.line // null),
-            comment_id: (.comment_id // .id),
+            comment_id: ((.comment_id // .id) | coerce_id),
             body: (.body // ""),
             tier: (.tier // null)
           }
