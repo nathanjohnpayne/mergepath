@@ -160,6 +160,7 @@ assert_action "addressed-elsewhere"   "skip"
 assert_action "canonical-coverage"    "skip"
 assert_action "rebuttal-recorded"     "skip"
 assert_action "templated-render"      "skip"      # #568: routing/skip class
+assert_action "verified-propagation"  "skip"      # #572: byte-verified propagation
 assert_action "nitpick-noted"         "surface"
 assert_action "deferred-to-followup"  "surface"
 assert_action "future-unknown-class"  "surface"   # spec: err on surface

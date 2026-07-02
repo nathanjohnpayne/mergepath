@@ -293,6 +293,18 @@ paths:
   - path: scripts/lib/reviewers-helpers.sh
     type: canonical
     consumers: all
+  # Single-source pinned mikefarah/yq bootstrap (#616). Invoked CI-only
+  # (--ci-only, gated on GITHUB_ACTIONS=true) by
+  # scripts/ci/check_resolve_pr_threads when yq is missing, so the
+  # yq-dependent delegated verified-propagation suite is self-sufficient
+  # during the #601 skew window: the scripts/ci kit arrives via manifest
+  # sync while repo_lint.yml (whose install_yq_for_sync_manifest step
+  # delegates to this same script) travels separately on the
+  # template-mirror lane. Also declared in the scripts/ci/ kit requires:
+  # below so the closure invariant records the coupling.
+  - path: scripts/lib/ensure-yq.sh
+    type: canonical
+    consumers: all
   - path: scripts/coderabbit-wait.sh
     type: canonical
     consumers: all
@@ -444,6 +456,14 @@ paths:
   - path: scripts/resolve-pr-threads.sh
     type: canonical
     consumers: all
+    # #572 --resolve-verified-propagation's templated arm sources the SAME
+    # render pair verify-propagation-pr.sh uses (existence-guarded — a
+    # missing lib skips the thread fail-closed rather than aborting). Both
+    # are consumers:all entries already; declared here so the #264 closure
+    # invariant keeps the coupling explicit.
+    requires:
+      - "scripts/lib/template-substitution.sh"
+      - "scripts/lib/manifest-fact-helpers.sh"
   - path: scripts/request-label-removal.sh
     type: canonical
     consumers: all
@@ -716,6 +736,20 @@ paths:
   - path: tests/test_resolve_pr_threads_staleness_pagination.sh
     type: canonical
     consumers: all
+  # Pairs with scripts/resolve-pr-threads.sh +
+  # scripts/ci/check_resolve_pr_threads (third delegated test file, after
+  # the rationale-tag + staleness-pagination tests above). Exercises the
+  # #572 --resolve-verified-propagation mode: byte-verified resolution of
+  # canonical/templated routing threads (consumer current content vs
+  # mergepath canonical source / re-rendered template), drift and every
+  # verification failure skipped fail-closed, surface-class and human
+  # threads never touched, and the --dry-run preview. Without this test
+  # propagated, every consumer's check_resolve_pr_threads exits 1 on the
+  # wrapper's "missing $VERIFIED_PROPAGATION_TEST" branch — same #264/#266
+  # coupling class as the two pairings above. See #572.
+  - path: tests/test_resolve_pr_threads_verified_propagation.sh
+    type: canonical
+    consumers: all
   # Pairs with scripts/daily-feedback-rollup.sh +
   # scripts/ci/check_daily_feedback_rollup (which sources this test
   # via paired-suite layer-1 before its own layer-2 shimmed smoke).
@@ -931,6 +965,7 @@ paths:
       - "tests/test_match_protected_paths.sh"  # check_verify_propagation_pr (#471)
       - "tests/test_resolve_pr_threads_rationale_tag.sh"  # check_resolve_pr_threads (delegated test)
       - "tests/test_resolve_pr_threads_staleness_pagination.sh"  # check_resolve_pr_threads (delegated test, #573)
+      - "tests/test_resolve_pr_threads_verified_propagation.sh"  # check_resolve_pr_threads (delegated test, #572)
       - "tests/test_template_substitution.sh"  # check_template_substitution
       - "tests/test_export_consumer_facts.sh"  # check_export_consumer_facts
       - "tests/test_check_coderabbit_config.sh"  # check_coderabbit_config_tests (#481/#482)
@@ -958,6 +993,7 @@ paths:
       - "scripts/disagreement-detector.cjs"    # check_disagreement_detector
       - "scripts/request-label-removal.sh"     # check_canonical_bugs_263caf3
       - "scripts/resolve-pr-threads.sh"        # check_resolve_pr_threads
+      - "scripts/lib/ensure-yq.sh"             # check_resolve_pr_threads CI-only yq bootstrap (#616)
       - "scripts/gh-as-author.sh"              # check_gh_as_author (transitive)
       - "scripts/gh-as-reviewer.sh"            # check_gh_as_author (transitive)
       - "scripts/hooks/gh-pr-guard.sh"         # tests/test_gh_pr_guard.sh runs it
