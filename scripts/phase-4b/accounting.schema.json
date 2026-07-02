@@ -159,14 +159,21 @@
       }
     },
     "unique_finding": {
+      "description": "One de-duplicated finding with lifecycle, disposition, and enough CONTENT (path, line, 80-char single-line title) that a GitHub reader can tell what was found without local runtime state. Full bodies stay in the local loop log, never in the posted record.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "severity", "first_loop", "last_loop", "disposition", "fix_commit", "issue"],
+      "required": ["id", "severity", "path", "line", "title", "first_loop", "last_loop", "disposition", "fix_commit", "issue"],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "severity": {
           "type": "string",
           "enum": ["P0", "P1", "P2", "P3", "nitpick", "unknown"]
+        },
+        "path": { "type": ["string", "null"] },
+        "line": { "type": ["integer", "null"], "minimum": 1 },
+        "title": {
+          "description": "First line of the finding body, truncated to 80 chars (a summary, never the full body). Null when the body was empty.",
+          "type": ["string", "null"]
         },
         "first_loop": { "type": "integer", "minimum": 1 },
         "last_loop": { "type": "integer", "minimum": 1 },

@@ -73,6 +73,29 @@ fi
 # only reached when the parent automation is enabled).
 p4b_acct_on() { [ "$P4B_ACCT_AVAILABLE" = true ] && p4b_acct_hook_active; }
 
+# Whether THIS invocation's loop record has been appended to the loop log.
+# Set after the pre-post record; consulted by the failure paths so a review
+# that never actually posted is corrected instead of double-recorded.
+P4B_ACCT_LOOP_RECORDED=false
+
+# p4b_acct_mark_unposted <why>
+# Correct the provisional accounting state when the review did NOT actually
+# post (#615 Codex): amend this invocation's loop-log line (posted →
+# not-posted, fail-closed with the reason) and discard the staged ledger
+# record so local state never claims a phantom posted approval. Advisory —
+# never alters review flow or exit codes.
+p4b_acct_mark_unposted() {
+  local why="$1"
+  p4b_acct_on 2>/dev/null || return 0
+  p4b_acct_hook_discard_pending_record || true
+  if [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
+    p4b_acct_hook_mark_last_loop_unposted "$why" \
+      || p4b_warn "accounting: could not correct the unposted loop record (continuing)"
+    P4B_ACCT_LOOP_RECORDED=false
+  fi
+  return 0
+}
+
 ADAPTER_DIR="$ROOT/phase-4b/adapters"
 HANDOFF="${P4B_HANDOFF:-$ROOT/post-phase-4b-handoff.sh}"
 GH_AS_REVIEWER="${P4B_GH_AS_REVIEWER:-$ROOT/gh-as-reviewer.sh}"
@@ -228,9 +251,16 @@ fall_back_to_manual() {
   p4b_warn "falling back to the manual Phase 4b handoff: $why"
   # Accounting (#602): record the fail-closed loop as positive safety
   # evidence. Advisory — a recording failure never alters this fallback.
+  # When this invocation's loop is ALREADY in the log (recorded before the
+  # posting step, e.g. head drift inside post_review), amend that line
+  # instead of appending a duplicate fail-closed loop (#615 Codex).
   if p4b_acct_on 2>/dev/null; then
-    p4b_acct_hook_note_fallback "$why" \
-      || p4b_warn "accounting: could not record the fail-closed loop (continuing)"
+    if [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
+      p4b_acct_mark_unposted "$why"
+    else
+      p4b_acct_hook_note_fallback "$why" \
+        || p4b_warn "accounting: could not record the fail-closed loop (continuing)"
+    fi
   fi
   if [ -x "$HANDOFF" ]; then
     PHASE_4B_REVIEWER_IDENTITY="$REVIEWER" "$HANDOFF" "$handoff_ref" >&2 2>/dev/null \
@@ -326,8 +356,16 @@ trap "rm -f '$BODY_FILE'" EXIT
 if p4b_acct_on 2>/dev/null; then
   ACCT_POSTED_STATE="posted"
   [ "$DRY_RUN" = true ] && ACCT_POSTED_STATE="dry-run"
-  p4b_acct_hook_record_loop "$VERDICT" "$ACCT_POSTED_STATE" false "" \
-    || p4b_warn "accounting: could not record this loop (plain summary unaffected)"
+  # The loop is recorded (and the block rendered) BEFORE post_review so the
+  # posted body can include this loop; the posted claim is provisional until
+  # the POST succeeds — every non-posting exit path below corrects it via
+  # p4b_acct_mark_unposted, and the ledger record is staged, committed only
+  # after a successful POST (#615 Codex: no phantom posted approvals).
+  if p4b_acct_hook_record_loop "$VERDICT" "$ACCT_POSTED_STATE" false ""; then
+    P4B_ACCT_LOOP_RECORDED=true
+  else
+    p4b_warn "accounting: could not record this loop (plain summary unaffected)"
+  fi
   if [ "$VERDICT" = "APPROVED" ]; then
     if ACCT_BLOCK="$(p4b_acct_hook_render_approval_block)" && [ -n "$ACCT_BLOCK" ]; then
       if ! { printf '\n\n'; printf '%s\n' "$ACCT_BLOCK"; } >> "$BODY_FILE"; then
@@ -345,8 +383,8 @@ post_review() {
   local gh_bin=gh
   local api_cmd=api
   local event payload_file review_response review_rc created_commit
-  [ -x "$GH_AS_REVIEWER" ] || p4b_die 3 "gh-as-reviewer.sh not found at $GH_AS_REVIEWER"
-  command -v gh >/dev/null 2>&1 || p4b_die 3 "gh is required to post the review"
+  [ -x "$GH_AS_REVIEWER" ] || { p4b_acct_mark_unposted "gh-as-reviewer.sh not found"; p4b_die 3 "gh-as-reviewer.sh not found at $GH_AS_REVIEWER"; }
+  command -v gh >/dev/null 2>&1 || { p4b_acct_mark_unposted "gh unavailable for review POST"; p4b_die 3 "gh is required to post the review"; }
   case "$state_flag" in
     --approve) event="APPROVE" ;;
     --request-changes) event="REQUEST_CHANGES" ;;
@@ -354,7 +392,7 @@ post_review() {
   esac
   local live_head
   live_head="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
-  [ -n "$live_head" ] || p4b_die 3 "could not re-read live PR head before posting review"
+  [ -n "$live_head" ] || { p4b_acct_mark_unposted "could not re-read live PR head before posting review"; p4b_die 3 "could not re-read live PR head before posting review"; }
   if [ "$live_head" != "$HEAD" ]; then
     fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head)"
   fi
@@ -369,9 +407,9 @@ post_review() {
   review_rc=$?
   set -e
   rm -f "$payload_file"
-  [ "$review_rc" -eq 0 ] || return "$review_rc"
+  [ "$review_rc" -eq 0 ] || { p4b_acct_mark_unposted "review POST failed (gh exit $review_rc)"; return "$review_rc"; }
   created_commit="$(printf '%s' "$review_response" | jq -r '.commit_id // empty' 2>/dev/null || true)"
-  [ "$created_commit" = "$HEAD" ] || p4b_die 3 "created review was not pinned to reviewed head (expected $HEAD, got ${created_commit:-unknown})"
+  [ "$created_commit" = "$HEAD" ] || { p4b_acct_mark_unposted "created review not pinned to reviewed head"; p4b_die 3 "created review was not pinned to reviewed head (expected $HEAD, got ${created_commit:-unknown})"; }
 }
 
 REVIEW_POSTED=false
@@ -383,6 +421,11 @@ case "$VERDICT" in
     else
       post_review --approve || p4b_die 3 "failed to post APPROVED review"
       REVIEW_POSTED=true
+      # Phase two of the accounting ledger commit (#615 Codex): the review is
+      # confirmed on GitHub, so the staged record may now enter the ledger.
+      if p4b_acct_on 2>/dev/null; then
+        p4b_acct_hook_commit_posted_record || true
+      fi
       p4b_log "posted APPROVED as $REVIEWER — Phase 4b substitute clearance is now on HEAD"
     fi
     EXIT_CODE=0

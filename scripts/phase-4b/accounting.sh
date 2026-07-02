@@ -356,15 +356,24 @@ p4b_acct_aggregate_running_totals() {
       else
         ($recs | length) as $n
         | ([ $recs[] | select(.final_verdict == "APPROVED") ] | length) as $approved
-        | {
+        # Measured metrics propagate unavailability (#615 Codex): a prior
+        # record whose tokens/elapsed/notional is null (unavailable) makes the
+        # CUMULATIVE figure null too — summing only the measured records would
+        # silently underreport, and coercing null to 0 fabricates a measurement
+        # the contract forbids. Counts (attempts, fail-closed) are always
+        # emitted by the builder, so their defensive `// 0` stays.
+        | def addall(f): if any($recs[]; f == null) then null
+                         else ([ $recs[] | f ] | add // 0) end;
+        {
             source: $source,
             records: $n,
             auto_approved_prs: $approved,
             automated_attempts: ([ $recs[] | .totals.adapter_invocations // 0 ] | add // 0),
             fail_closed_events: ([ $recs[] | .totals.fail_closed_events // 0 ] | add // 0),
-            tokens_total: ([ $recs[] | .totals.tokens_total // 0 ] | add // 0),
-            elapsed_seconds_total: ([ $recs[] | .totals.elapsed_seconds_total // 0 ] | add // 0),
-            notional_usd: (([ $recs[] | .totals.notional_usd // 0 ] | add // 0) * 100 | round / 100),
+            tokens_total: addall(.totals.tokens_total),
+            elapsed_seconds_total: addall(.totals.elapsed_seconds_total),
+            notional_usd: (addall(.totals.notional_usd)
+                           | if . == null then null else (. * 100 | round / 100) end),
             human_minutes_saved_estimate:
               (if $n == 0 then null
                else [ $approved * $mlow, $approved * $mhigh ]
@@ -576,7 +585,11 @@ p4b_acct_finding_details_from_verdict() {
 # p4b_acct_finding_details_from_verdict across loops) and emit the
 # unique_findings array: de-duplicated by (severity, path, line, body),
 # ordered by first appearance, ids F1..Fn, with first_loop / last_loop
-# lifecycle. Dispositions come ONLY from the optional dispositions map
+# lifecycle. Each entry carries the finding CONTENT too — path, line, and a
+# single-line title (first body line, truncated to 80 chars) — so a GitHub
+# reader can tell what was fixed/deferred from the posted record alone
+# (#615 Codex); full bodies stay in the local loop log, never in the posted
+# block. Dispositions come ONLY from the optional dispositions map
 # ({"F1":{"disposition":"fixed","fix_commit":"abc","issue":null}, ...});
 # the default is "unresolved" with null links — the accounting never GUESSES
 # a disposition.
@@ -584,6 +597,9 @@ p4b_acct_unique_findings() {
   local disp="${1:-}"
   [ -n "$disp" ] || disp='{}'
   jq -cs --argjson disp "$disp" '
+    def title_of: (. // "") | split("\n")[0]
+      | (if length > 80 then .[0:79] + "…" else . end)
+      | (if . == "" then null else . end);
     reduce .[] as $d ( {order: [], map: {}} ;
       ( $d.severity + "|" + (($d.path // "~") | tostring)
         + "|" + (($d.line // -1) | tostring) + "|" + $d.body ) as $k
@@ -592,7 +608,11 @@ p4b_acct_unique_findings() {
           | .map[$k].first_loop = ([ .map[$k].first_loop, $d.loop ] | min)
         else
           .order += [$k]
-          | .map[$k] = {severity: $d.severity, first_loop: $d.loop, last_loop: $d.loop}
+          | .map[$k] = {severity: $d.severity,
+                        path: ($d.path // null),
+                        line: ($d.line // null),
+                        title: ($d.body | title_of),
+                        first_loop: $d.loop, last_loop: $d.loop}
         end )
     | . as $st
     | [ range(0; ($st.order | length)) as $i
@@ -601,6 +621,9 @@ p4b_acct_unique_findings() {
         | ($disp[$id] // {}) as $o
         | { id: $id,
             severity: $st.map[$k].severity,
+            path: $st.map[$k].path,
+            line: $st.map[$k].line,
+            title: $st.map[$k].title,
             first_loop: $st.map[$k].first_loop,
             last_loop: $st.map[$k].last_loop,
             disposition: ($o.disposition // "unresolved"),
@@ -771,20 +794,39 @@ p4b_acct_render_block() {
   if [ "$uf_count" -eq 0 ]; then
     printf '_No findings recorded on the approved HEAD. See the rigor table below for evidence this was reviewed hard rather than rubber-stamped._\n\n'
   else
-    printf '| Finding | Severity | First loop | Last seen | Disposition | Fix commit / issue |\n'
-    printf '|---|---|---:|---:|---|---|\n'
+    # Scope labels findings truthfully (#615 Codex): a finding is
+    # "current-head" only when it was last seen on a loop that reviewed the
+    # record's final head sha; findings last seen on a prior commit are
+    # "historical" (the changes-requested-then-fixed lifecycle), never
+    # relabeled as residual current-head risk. An unmappable last_loop
+    # degrades to current-head — risk is overstated, never understated.
+    # Location/Summary come from the embedded record so a GitHub reader can
+    # reconstruct what was fixed/deferred without local files (#615 Codex);
+    # summaries are single-line 80-char truncations, never full bodies.
+    printf '| Finding | Severity | Location | Summary | Scope | First loop | Last seen | Disposition | Fix commit / issue |\n'
+    printf '|---|---|---|---|---|---:|---:|---|---|\n'
     printf '%s' "$rec" | jq -r '
-      .unique_findings[]
-      | "| \(.id) | \(.severity) | \(.first_loop) | \(.last_loop) | \(.disposition) | "
-        + (if .fix_commit != null then "`\(.fix_commit)`"
-           elif .issue != null then "#\(.issue)"
-           else "—" end)
-        + " |"'
+      (.final_head_sha) as $head
+      | ([ .loops[] | select(.head_sha == $head) | .loop ]) as $hl
+      | def scope($ll): if ($hl | length) == 0 then "current-head"
+                        elif ($hl | index($ll)) != null then "current-head"
+                        else "historical" end;
+      ( .unique_findings[]
+        | "| \(.id) | \(.severity) | "
+          + (if (.path // null) == null then "—"
+             else "`\(.path)\(if .line != null then ":\(.line)" else "" end)`" end)
+          + " | "
+          + ((.title // "—") | gsub("\\|"; "\\\\|"))
+          + " | \(scope(.last_loop)) | \(.first_loop) | \(.last_loop) | \(.disposition) | "
+          + (if .fix_commit != null then "`\(.fix_commit)`"
+             elif .issue != null then "#\(.issue)"
+             else "—" end)
+          + " |" ),
+      "",
+      ( ([ .unique_findings[] | select(.first_loop != .last_loop) ] | length) as $rep
+        | ([ .unique_findings[] | select(scope(.last_loop) == "current-head") ] | length) as $cur
+        | "Unique findings across loops: \(.unique_findings | length) — \($cur) on the approved head, \((.unique_findings | length) - $cur) historical (earlier loops only). Repeated across loops: \($rep)." )'
     printf '\n'
-    printf '%s' "$rec" | jq -r '
-      ([ .unique_findings[] | select(.first_loop != .last_loop) ] | length) as $rep
-      | "Unique current-head findings: \(.unique_findings | length). Repeated/stale across loops: \($rep)."'
-    printf '\n\n'
   fi
 
   # --- Rigor (proof-of-work for the final posted approval) ---
@@ -902,18 +944,28 @@ p4b_acct_render_block() {
       | ($r.auto_approved_prs // 0) as $ap
       | ($r.automated_attempts // 0) as $at
       | ($r.fail_closed_events // 0) as $fc
-      | ($r.records // 0) as $n
-      | (if $n > 0 then "\($ap) / \($n) records approved = \((($ap / $n) * 100) | round)% · \($fc) fail-closed loop(s) to human"
-         else "n/a (no prior records)" end) as $rate
+      # Rate denominator is automated ATTEMPTS, not records (#615 Codex):
+      # records are only emitted on approvals, so approvals/records would
+      # render 100% even across fail-closed history. Attempts include every
+      # recorded loop (posted + fell-back), which is the trust signal the
+      # spec golden shows (24 / 27 = 89%).
+      | (if $at > 0 then "\($ap) approved / \($at) automated attempts = \((($ap / $at) * 100) | round)% · \($fc) fail-closed loop(s) to human"
+         else "n/a (no recorded attempts)" end) as $rate
       | "| Auto-approved PRs | \($ap) |\n"
         + "| Automated attempts (posted + fell-back) | \($at) |\n"
         + "| **Auto-approval / fail-closed rate** | **\($rate)** |\n"
         + "| Cumulative wall-clock | "
-        + (if $r.elapsed_seconds_total == null then "unavailable"
+        + (if $r.elapsed_seconds_total == null then "unavailable (not measured in every prior record)"
            else "\(($r.elapsed_seconds_total / 60) | floor) min" end)
         + " |\n"
-        + "| Cumulative tokens | \($r.tokens_total // 0) |\n"
-        + "| Cumulative notional API-equivalent | ~$\($r.notional_usd // 0) *(not billed)* |\n"
+        + "| Cumulative tokens | "
+        + (if $r.tokens_total == null then "unavailable (not measured in every prior record)"
+           else ($r.tokens_total | tostring) end)
+        + " |\n"
+        + "| Cumulative notional API-equivalent | "
+        + (if $r.notional_usd == null then "unavailable (not priced in every prior record) *(not billed either way)*"
+           else "~$\($r.notional_usd) *(not billed)*" end)
+        + " |\n"
         + "| Cumulative human time saved (est.) | "
         + (if $r.human_minutes_saved_estimate == null then "unavailable"
            else "~\(($r.human_minutes_saved_estimate[0] / 60) | floor) – \(($r.human_minutes_saved_estimate[1] / 60) | floor) h" end)
@@ -964,6 +1016,70 @@ p4b_acct_hook_loop_log() {
 # .mergepath/phase-4b-ledger.jsonl fallback source).
 p4b_acct_hook_ledger() {
   printf '%s/phase-4b-ledger.jsonl' "$(p4b_acct_state_dir)"
+}
+
+# Per-PR staging file for the two-phase ledger commit (#615 Codex): the
+# render hook runs in a command substitution (subshell), so the pending
+# record is staged on disk, and the orchestrator commits it to the ledger
+# ONLY after the GitHub review POST actually succeeds. A head-drift or POST
+# failure discards it — the ledger never gains a phantom posted approval.
+p4b_acct_hook_pending_record_path() {
+  local repo_slug
+  repo_slug="$(printf '%s' "${REPO:-unknown}" | tr '/ ' '--')"
+  printf '%s/phase-4b-pending/%s-pr%s.json' "$(p4b_acct_state_dir)" "$repo_slug" "${PR:-0}"
+}
+
+# p4b_acct_hook_commit_posted_record — phase two of the ledger commit: append
+# the staged record (if any) to the ledger cache and clear the staging file.
+# Called by the orchestrator only after a successful live review POST.
+# Advisory: an append failure warns (future running totals may lag) but never
+# alters review flow. Always returns 0.
+p4b_acct_hook_commit_posted_record() {
+  local pending ledger
+  pending="$(p4b_acct_hook_pending_record_path)"
+  [ -s "$pending" ] || return 0
+  ledger="$(p4b_acct_hook_ledger)"
+  if ! { mkdir -p "$(dirname "$ledger")" && cat "$pending" >> "$ledger"; } 2>/dev/null; then
+    p4b_acct_warn "could not append the posted record to the ledger cache (future running totals may lag)"
+  fi
+  rm -f "$pending" 2>/dev/null || true
+  return 0
+}
+
+# p4b_acct_hook_discard_pending_record — drop a staged record that will not
+# be committed (the review did not post). Always returns 0.
+p4b_acct_hook_discard_pending_record() {
+  rm -f "$(p4b_acct_hook_pending_record_path)" 2>/dev/null || true
+  return 0
+}
+
+# p4b_acct_hook_mark_last_loop_unposted <reason>
+# Correct this invocation's provisional loop record after the GitHub POST did
+# NOT complete (#615 Codex): the loop is recorded (posted state claimed)
+# before post_review re-reads the live head and sends the review, so on
+# head-drift/POST failure the log would otherwise keep a phantom posted
+# entry. Rewrites the loop log's LAST line to posted="not-posted",
+# fell_back=true, with a fail-closed marker carrying the reason (the verdict
+# itself is kept — it WAS parsed; only the posting claim was false).
+p4b_acct_hook_mark_last_loop_unposted() {
+  local reason="$1" log tmp
+  log="$(p4b_acct_hook_loop_log)" || return 1
+  [ -s "$log" ] || return 1
+  tmp="${log}.tmp.$$"
+  if jq -cs --arg reason "$reason" '
+      (.[0:length-1][]),
+      (.[length-1]
+       | .loop.posted = "not-posted"
+       | .loop.fell_back = true
+       | .loop.fail_closed = {happened: true,
+                              reason: (if $reason == "" then null else $reason end),
+                              duration_seconds: .loop.elapsed_seconds})
+    ' "$log" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$log" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  else
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
 }
 
 # Gate for every hook call site: the accounting sub-toggle.
@@ -1094,8 +1210,9 @@ p4b_acct_hook_note_fallback() {
 # Assemble + render the accounting block for the current APPROVED verdict
 # from the accumulated loop log. Prints the markdown block on stdout; returns
 # non-zero on ANY failure (the orchestrator then posts the plain summary).
-# On a live (non-dry-run) post the finished record is appended to the ledger
-# cache so future running totals can aggregate it.
+# On a live (non-dry-run) run the finished record is STAGED (two-phase
+# commit, #615 Codex); the orchestrator appends it to the ledger cache via
+# p4b_acct_hook_commit_posted_record only after the review actually posts.
 # P4B_ACCT_SELFTEST_FAIL=1 is a test seam that forces the failure path.
 p4b_acct_hook_render_approval_block() {
   if [ "${P4B_ACCT_SELFTEST_FAIL:-0}" = "1" ]; then
@@ -1131,10 +1248,17 @@ p4b_acct_hook_render_approval_block() {
     "$loops" "$uf" "$totals" "$running" "")" || return 1
   block="$(p4b_acct_render_block "$record")" || return 1
   [ -n "$block" ] || return 1
+  # Two-phase ledger commit (#615 Codex): stage the record now; the
+  # orchestrator commits it only after the review POST succeeds. Any prior
+  # staging leftover (e.g. a crashed run) is dropped first so a later commit
+  # can never append a record from a different invocation.
+  p4b_acct_hook_discard_pending_record
   if [ "$astate" = "posted" ]; then
-    # Advisory: a ledger-append failure must not lose the block.
-    if ! { mkdir -p "$(dirname "$ledger")" && printf '%s\n' "$record" >> "$ledger"; } 2>/dev/null; then
-      p4b_acct_warn "could not append to the ledger cache (future running totals may lag)"
+    local pending
+    pending="$(p4b_acct_hook_pending_record_path)"
+    # Advisory: a staging failure must not lose the block.
+    if ! { mkdir -p "$(dirname "$pending")" && printf '%s\n' "$record" > "$pending"; } 2>/dev/null; then
+      p4b_acct_warn "could not stage the record for the ledger cache (future running totals may lag)"
     fi
   fi
   printf '%s' "$block"

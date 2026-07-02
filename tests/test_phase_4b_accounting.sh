@@ -161,6 +161,10 @@ chmod +x "$BIN/gh"
 
 cat > "$BIN/fake-gh-as-reviewer" <<'SH'
 #!/usr/bin/env bash
+if [ -n "${P4B_FAKE_WRAPPER_FAIL:-}" ]; then
+  echo "simulated review POST failure" >&2
+  exit 1
+fi
 [ "${1:-}" = "--" ] || { echo "expected wrapper separator" >&2; exit 64; }
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--input" ]; then
@@ -187,10 +191,10 @@ cat > "$GOLDEN_RAW" <<'JSON'
   {"loop":4,"reviewer":"nathanpayne-claude","adapter":"orchestrator-dry-run","direction":"codex->claude","head_sha":"d05ff4d0…","verdict":"CHANGES_REQUESTED","posted":"not-posted","fell_back":true,"elapsed_seconds":76,"tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"unavailable"},"findings":{"P0":0,"P1":0,"P2":null,"P3":null,"nitpick":null,"unknown":null},"cli_version":null,"timeout_seconds":900,"effort":"medium","throttle_events":0,"plan_auth":"firstParty","fail_closed":{"happened":true,"reason":"approval-carried-findings","duration_seconds":76}}
  ],
  "unique_findings":[
-  {"id":"F1","severity":"P2","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":585},
-  {"id":"F2","severity":"P2","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":586},
-  {"id":"F3","severity":"P3","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":587},
-  {"id":"F4","severity":"P3","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":588}
+  {"id":"F1","severity":"P2","path":null,"line":null,"title":"Codex `--output-schema` vs jq validator drift (`line` min)","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":585},
+  {"id":"F2","severity":"P2","path":null,"line":null,"title":"Record reviewer CLI version before enablement","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":586},
+  {"id":"F3","severity":"P3","path":null,"line":null,"title":"Harden Claude JSON extraction beyond first/last brace","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":587},
+  {"id":"F4","severity":"P3","path":null,"line":null,"title":"Make local shellcheck absence more visible","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":588}
  ],
  "totals":{"adapter_invocations":4,"tokens_total":177204,"tokens_by_provider":{"codex":169844,"claude":7360},"elapsed_seconds_total":225,"billed_usd":0.0,"notional_usd":0.66,"price_table_version":"2026-07-01","fail_closed_events":1,"advisory_issues_filed":[585,586,587,588]},
  "running_totals":{"source":"github-derived","records":24,"auto_approved_prs":24,"automated_attempts":27,"fail_closed_events":3,"tokens_total":2360000,"notional_usd":9.40,"human_minutes_saved_estimate":[720,4320]},
@@ -257,6 +261,24 @@ if printf '%s' "$uf" | jq -e 'length == 2
     and (all(.[]; .disposition == "unresolved" and .fix_commit == null and .issue == null))' >/dev/null; then
   pass "repeated finding across loops dedupes to one entry with first/last lifecycle; default disposition never guessed"
 else fail "unique findings: $uf"; fi
+# #615 Codex: unique findings carry content (path/line/title) so the posted
+# record is reconstructable without local files — never the full body.
+if printf '%s' "$uf" | jq -e '
+    .[0].path == "a.js" and .[0].line == 3 and .[0].title == "dup"
+    and .[1].path == null and .[1].line == null and .[1].title == "solo"' >/dev/null; then
+  pass "unique findings carry path/line/title content (#615)"
+else fail "unique-finding content: $uf"; fi
+LONGBODY="$(printf 'A%.0s' $(seq 1 100))"
+uf="$(printf '{"loop":1,"severity":"P2","path":"b.js","line":1,"body":"%s"}\n' "$LONGBODY" \
+  | p4b_acct_unique_findings)"
+if printf '%s' "$uf" | jq -e '.[0].title | (length == 80) and endswith("…") and startswith("AAAA")' >/dev/null; then
+  pass "title truncates a long body to 80 chars with an ellipsis (never the full body)"
+else fail "title truncation: $uf"; fi
+uf="$(printf '{"loop":1,"severity":"P2","path":"b.js","line":1,"body":"first line\\nsecond line"}\n' \
+  | p4b_acct_unique_findings)"
+if printf '%s' "$uf" | jq -e '.[0].title == "first line"' >/dev/null; then
+  pass "title keeps only the first body line"
+else fail "multi-line title: $uf"; fi
 uf="$(printf '%s\n' '{"loop":1,"severity":"P2","path":"a.js","line":3,"body":"dup"}' \
   | p4b_acct_unique_findings '{"F1":{"disposition":"deferred-to-follow-up","issue":585}}')"
 if printf '%s' "$uf" | jq -e '.[0].disposition == "deferred-to-follow-up" and .[0].issue == 585' >/dev/null; then
@@ -455,8 +477,23 @@ printf '%s' "$BLOCK" | grep -q -- 'unavailable (unavailable)' \
   && pass "loop with no CLI counts renders explicit unavailable" || fail "missing unavailable cell"
 printf '%s' "$BLOCK" | grep -q -- '\*\*yes\*\* — approval-carried-findings' \
   && pass "fail-closed loop rendered as positive safety evidence" || fail "fail-closed loop row missing"
-printf '%s' "$BLOCK" | grep -q '| F1 | P2 | 3 | 3 | deferred-to-follow-up | #585 |' \
-  && pass "findings table links the follow-up issue" || fail "findings row missing"
+printf '%s' "$BLOCK" | grep -qF '| F1 | P2 | — | Codex `--output-schema` vs jq validator drift (`line` min) | current-head | 3 | 3 | deferred-to-follow-up | #585 |' \
+  && pass "findings table carries content (path/summary), scope, and the follow-up issue link (#615)" \
+  || fail "findings row missing"
+printf '%s' "$BLOCK" | grep -qF 'Unique findings across loops: 4 — 4 on the approved head, 0 historical (earlier loops only). Repeated across loops: 0.' \
+  && pass "findings summary counts approved-head vs historical findings truthfully" \
+  || fail "findings summary sentence wrong"
+# #615 Codex: findings last seen on a PRIOR commit must be labeled historical,
+# never current-head. Rewrite loop 3 (the advisory-bearing loop) to an older
+# head; F1–F4 were last seen there, so all four become historical.
+HISTREC="$(printf '%s' "$GOLDEN" | jq -c '.loops[2].head_sha = "older111"')"
+HISTBLOCK="$(p4b_acct_render_block "$HISTREC")"
+printf '%s' "$HISTBLOCK" | grep -qF '| F1 | P2 | — | Codex `--output-schema` vs jq validator drift (`line` min) | historical | 3 | 3 |' \
+  && pass "findings from a prior commit are labeled historical, not current-head (#615)" \
+  || fail "historical scope label missing"
+printf '%s' "$HISTBLOCK" | grep -qF 'Unique findings across loops: 4 — 0 on the approved head, 4 historical (earlier loops only).' \
+  && pass "summary sentence separates historical findings from approved-head ones" \
+  || fail "historical summary sentence wrong"
 printf '%s' "$BLOCK" | grep -q -- '~\$0.66 \*(not billed; price table `2026-07-01`)\*' \
   && pass "notional cost labeled not-billed with the price-table version stamp" || fail "notional row wrong"
 printf '%s' "$BLOCK" | grep -q -- '\*\*\$0.00\*\* — operator subscription plan' \
@@ -467,6 +504,30 @@ printf '%s' "$BLOCK" | grep -q '| Local gates green | n/a | local gate results n
   && pass "uncaptured gate signal renders n/a with the reason (never a green check)" || fail "gates rigor row wrong"
 printf '%s' "$BLOCK" | grep -q '\*Totals source: github-derived (24 prior record(s)).\*' \
   && pass "running-totals footer names the totals source" || fail "totals-source footer missing"
+# #615 Codex: the trust-signal rate divides by automated ATTEMPTS (27), not by
+# emitted records (24) — records only exist for approvals, so records as the
+# denominator rendered 100% even across fail-closed history.
+printf '%s' "$BLOCK" | grep -qF '24 approved / 27 automated attempts = 89%' \
+  && pass "auto-approval rate uses the attempts denominator (24/27 = 89%, the spec golden)" \
+  || fail "approval-rate denominator wrong"
+RATEREC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.auto_approved_prs = 1
+  | .running_totals.records = 1 | .running_totals.automated_attempts = 4
+  | .running_totals.fail_closed_events = 3')"
+RATEBLOCK="$(p4b_acct_render_block "$RATEREC")"
+printf '%s' "$RATEBLOCK" | grep -qF '1 approved / 4 automated attempts = 25%' \
+  && pass "fail-closed-heavy history can no longer render as 100% approved (#615)" \
+  || fail "fail-closed rate render wrong"
+# #615 Codex: a null (unavailable) cumulative measurement renders unavailable,
+# never a fabricated 0 / ~$0.
+NULLRTREC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.tokens_total = null
+  | .running_totals.notional_usd = null')"
+NULLRTBLOCK="$(p4b_acct_render_block "$NULLRTREC")"
+printf '%s' "$NULLRTBLOCK" | grep -qF '| Cumulative tokens | unavailable (not measured in every prior record) |' \
+  && pass "null cumulative tokens render unavailable, not 0 (#615)" \
+  || fail "null cumulative tokens rendered wrong"
+printf '%s' "$NULLRTBLOCK" | grep -qF '| Cumulative notional API-equivalent | unavailable (not priced in every prior record) *(not billed either way)* |' \
+  && pass "null cumulative notional renders unavailable, not ~\$0 (#615)" \
+  || fail "null cumulative notional rendered wrong"
 GATES_BLOCK="$(P4B_ACCT_GATES_EVIDENCE="check_phase_4b_automation 67/67 green" p4b_acct_render_block "$GOLDEN")"
 printf '%s' "$GATES_BLOCK" | grep -q '| Local gates green | ✅ | check_phase_4b_automation 67/67 green |' \
   && pass "captured gate evidence renders the gates row green" || fail "gates evidence row wrong"
@@ -500,6 +561,29 @@ if printf '%s' "$agg" | jq -e '
     and .human_minutes_saved_estimate == [60, 360]' >/dev/null; then
   pass "aggregation over N records sums every metric and derives the human-minutes range"
 else fail "aggregation: $agg"; fi
+# #615 Codex: a prior record with an unavailable (null) measurement makes the
+# CUMULATIVE figure unavailable too — per metric, independently — instead of
+# being coerced to 0 (which underreports repo-wide totals in the common
+# no-price-key case). Counts (records/attempts/fail-closed) still sum.
+REC_NULLTOK="$(printf '%s' "$GOLDEN" | jq -c '.totals.tokens_total = null')"
+agg="$(printf '%s\n%s\n' "$GOLDEN" "$REC_NULLTOK" | p4b_acct_aggregate_running_totals github-derived)"
+if printf '%s' "$agg" | jq -e '
+    .tokens_total == null
+    and .elapsed_seconds_total == 450 and .notional_usd == 1.32
+    and .records == 2 and .automated_attempts == 8 and .fail_closed_events == 2' >/dev/null; then
+  pass "one unmeasured tokens_total degrades cumulative tokens to null while other metrics still sum (#615)"
+else fail "null-token aggregation: $agg"; fi
+REC_NULLNOTIONAL="$(printf '%s' "$GOLDEN" | jq -c '.totals.notional_usd = null')"
+agg="$(printf '%s\n%s\n' "$GOLDEN" "$REC_NULLNOTIONAL" | p4b_acct_aggregate_running_totals github-derived)"
+if printf '%s' "$agg" | jq -e '
+    .notional_usd == null and .tokens_total == 354408 and .elapsed_seconds_total == 450' >/dev/null; then
+  pass "an unpriced record degrades cumulative notional to null, never ~\$0 (#615, the no-price-key case)"
+else fail "null-notional aggregation: $agg"; fi
+REC_NULLELAPSED="$(printf '%s' "$GOLDEN" | jq -c '.totals.elapsed_seconds_total = null')"
+agg="$(printf '%s\n%s\n' "$GOLDEN" "$REC_NULLELAPSED" | p4b_acct_aggregate_running_totals github-derived)"
+if printf '%s' "$agg" | jq -e '.elapsed_seconds_total == null and .tokens_total == 354408' >/dev/null; then
+  pass "an unmeasured elapsed total degrades cumulative wall-clock to null (#615)"
+else fail "null-elapsed aggregation: $agg"; fi
 agg="$(printf '%s\ngarbage-line\n' "$GOLDEN" | p4b_acct_aggregate_running_totals ledger-cache)"
 [ "$(printf '%s' "$agg" | jq -r '.source')" = "unavailable" ] \
   && pass "a malformed ledger line degrades the whole aggregation to unavailable (never wrong numbers)" \
@@ -566,6 +650,21 @@ else pass "unknown usage key still rejected (additionalProperties stays closed)"
 if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":"lots","source":"x"}}'; then
   fail "non-integer cache count accepted"
 else pass "mistyped additive field rejected"; fi
+# #615 Codex: jq `//` treats false as absent, so `X // null` let BOOLEAN
+# additive fields sneak past the type check. The schema allows only
+# integer/number/null — booleans must fail closed.
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":false,"source":"x"}}'; then
+  fail "boolean cache_read_input_tokens accepted"
+else pass "boolean cache_read_input_tokens rejected (#615: the //-vs-false footgun)"; fi
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":true,"source":"x"}}'; then
+  fail "boolean cache_creation_input_tokens accepted"
+else pass "boolean cache_creation_input_tokens rejected"; fi
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"reasoning_tokens":false,"source":"x"}}'; then
+  fail "boolean reasoning_tokens accepted"
+else pass "boolean reasoning_tokens rejected"; fi
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"total_cost_usd":false,"source":"x"}}'; then
+  fail "boolean total_cost_usd accepted"
+else pass "boolean total_cost_usd rejected"; fi
 if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"source":"x"}}'; then
   fail "usage missing required keys accepted"
 else pass "usage missing schema-required keys still rejected"; fi
@@ -585,17 +684,20 @@ else fail "claude adapter additive usage (rc=$rc, out=$out)"; fi
 echo "orchestrator — accounting hook (fail-open, exit codes preserved)"
 # ===========================================================================
 run_orch() { # run_orch <state-dir> <policy> <codex-fake> <pr> [extra env as VAR=VAL...] -- [extra args...]
+  # Extra env vars come LAST so a test can override the defaults below (env
+  # takes the last assignment); extra args land after the defaults, and the
+  # orchestrator flag parser is last-wins, so e.g. `-- --head def456` works.
   local state="$1" policy="$2" fake="$3" pr="$4"; shift 4
   local -a envs=()
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
-  env "${envs[@]:-_P4B_NOOP=1}" \
-    PATH="$BIN:$PATH" \
+  env PATH="$BIN:$PATH" \
     MERGEPATH_REVIEW_POLICY_PATH="$policy" \
     P4B_ACCT_STATE_DIR="$state" \
     CODEX_BIN="$BIN/$fake" \
     P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" \
     P4B_FAKE_LIVE_HEAD=abc123 \
+    "${envs[@]:-_P4B_NOOP=1}" \
     bash "$ORCH" "$pr" --repo o/r --author claude --head abc123 --diff-file "$DIFF" "$@"
 }
 
@@ -618,6 +720,9 @@ if [ "$rc" = 0 ] \
    && [ "$(wc -l < "$STATE_A/phase-4b-ledger.jsonl" | tr -d '[:space:]')" = "1" ]; then
   pass "posted APPROVED embeds the accounting block + record, keeps the plain summary, appends the ledger, exit 0"
 else fail "hook happy path (rc=$rc, body=$(cat "$BODY_A" 2>/dev/null | head -5), rec=$REC_A)"; fi
+if [ -z "$(find "$STATE_A/phase-4b-pending" -type f 2>/dev/null)" ]; then
+  pass "two-phase ledger commit leaves no staged record behind after a successful post (#615)"
+else fail "staged pending record left behind: $(find "$STATE_A/phase-4b-pending" -type f)"; fi
 if printf '%s' "$REC_A" | jq -e '.running_totals.source == "unavailable"' >/dev/null 2>&1; then
   pass "first-ever post reports running totals unavailable (no prior source) rather than a guessed baseline"
 else fail "first-post running totals: $REC_A"; fi
@@ -646,10 +751,14 @@ else fail "generation-error fallback (rc=$rc, body=$(cat "$BODY_C" 2>/dev/null |
 
 # (d) changes-requested-then-fixed across two invocations: loop history
 #     accumulates and the final approval renders both loops + the lifecycle.
+#     The fix lands as a NEW head (def456), so the loop-1 finding must be
+#     labeled historical, never current-head (#615 Codex).
 STATE_D="$WORK/state-d"; BODY_D1="$WORK/body-d1.md"; BODY_D2="$WORK/body-d2.md"
 set +e
 run_orch "$STATE_D" "$POLICY_ON" fake-codex-changes 204 P4B_WRAPPER_BODY="$BODY_D1" -- >/dev/null 2>&1; rc1=$?
-run_orch "$STATE_D" "$POLICY_ON" fake-codex-approve 204 P4B_WRAPPER_BODY="$BODY_D2" -- >/dev/null 2>&1; rc2=$?
+run_orch "$STATE_D" "$POLICY_ON" fake-codex-approve 204 \
+  P4B_WRAPPER_BODY="$BODY_D2" P4B_FAKE_LIVE_HEAD=def456 P4B_FAKE_CREATED_REVIEW_HEAD=def456 \
+  -- --head def456 >/dev/null 2>&1; rc2=$?
 set -e
 REC_D="$(p4b_acct_extract_records < "$BODY_D2" 2>/dev/null || true)"
 if [ "$rc1" = 1 ] && [ "$rc2" = 0 ] \
@@ -665,6 +774,14 @@ if [ "$rc1" = 1 ] && [ "$rc2" = 0 ] \
         and .totals.adapter_invocations == 2' >/dev/null; then
   pass "changes-requested-then-fixed: exit codes 1 then 0 preserved; final record carries both loops + finding lifecycle"
 else fail "CR-then-fixed (rc1=$rc1 rc2=$rc2, rec=$REC_D)"; fi
+if printf '%s' "$REC_D" | jq -e '
+     .final_head_sha == "def456"
+     and .unique_findings[0].path == "x.js" and .unique_findings[0].line == 2
+     and .unique_findings[0].title == "bug here"' >/dev/null 2>&1 \
+   && grep -qF '| F1 | P1 | `x.js:2` | bug here | historical | 1 | 1 | unresolved | — |' "$BODY_D2" \
+   && grep -qF 'Unique findings across loops: 1 — 0 on the approved head, 1 historical (earlier loops only).' "$BODY_D2"; then
+  pass "fixed-then-approved: the prior-commit finding renders with content and a historical label (#615)"
+else fail "historical labeling end-to-end (rec=$REC_D, body=$(grep -F '| F1 ' "$BODY_D2" 2>/dev/null))"; fi
 
 # (e) findings-bearing APPROVED verdict → existing fail-closed fallback (exit
 #     4) preserved; the fail-closed loop is recorded as safety evidence.
@@ -721,6 +838,51 @@ if [ "$rc" = 0 ] && [ -n "$REC_H" ] \
    && grep -q 'not billed; price table `test-1`' "$BODY_H"; then
   pass "configured price keys yield a stamped, labeled notional figure end-to-end"
 else fail "notional end-to-end (rc=$rc, rec=$REC_H)"; fi
+
+# (i) head drift during the APPROVED post (#615 Codex): the provisionally
+#     recorded loop must be corrected to not-posted/fail-closed (one line, no
+#     duplicate fallback loop) and the staged ledger record discarded — local
+#     state never claims a phantom posted approval.
+STATE_I="$WORK/state-i"
+set +e
+run_orch "$STATE_I" "$POLICY_ON" fake-codex-approve 209 P4B_FAKE_LIVE_HEAD=zzz999 -- >/dev/null 2>&1; rc=$?
+set -e
+LOG_I="$(find "$STATE_I/phase-4b-loops" -name '*.jsonl' 2>/dev/null | head -n1)"
+if [ "$rc" = 4 ] \
+   && [ ! -e "$STATE_I/phase-4b-ledger.jsonl" ] \
+   && [ -z "$(find "$STATE_I/phase-4b-pending" -type f 2>/dev/null)" ] \
+   && [ -n "$LOG_I" ] \
+   && jq -e -s '
+        length == 1
+        and .[0].loop.verdict == "APPROVED"
+        and .[0].loop.posted == "not-posted"
+        and .[0].loop.fell_back == true
+        and .[0].loop.fail_closed.happened == true
+        and (.[0].loop.fail_closed.reason | test("head changed"))' "$LOG_I" >/dev/null; then
+  pass "head drift after the provisional record: loop corrected in place, no phantom ledger approval, exit 4 (#615)"
+else fail "head-drift correction (rc=$rc, ledger=$(cat "$STATE_I/phase-4b-ledger.jsonl" 2>/dev/null), log=$(cat "$LOG_I" 2>/dev/null))"; fi
+
+# (j) review POST failure (#615 Codex): same correction on the gh-write
+#     failure path — exit 3 preserved, no ledger record, loop marked
+#     not-posted with the failure disposition.
+STATE_J="$WORK/state-j"
+set +e
+run_orch "$STATE_J" "$POLICY_ON" fake-codex-approve 210 P4B_FAKE_WRAPPER_FAIL=1 -- >/dev/null 2>&1; rc=$?
+set -e
+LOG_J="$(find "$STATE_J/phase-4b-loops" -name '*.jsonl' 2>/dev/null | head -n1)"
+if [ "$rc" = 3 ] \
+   && [ ! -e "$STATE_J/phase-4b-ledger.jsonl" ] \
+   && [ -z "$(find "$STATE_J/phase-4b-pending" -type f 2>/dev/null)" ] \
+   && [ -n "$LOG_J" ] \
+   && jq -e -s '
+        length == 1
+        and .[0].loop.verdict == "APPROVED"
+        and .[0].loop.posted == "not-posted"
+        and .[0].loop.fell_back == true
+        and .[0].loop.fail_closed.happened == true
+        and (.[0].loop.fail_closed.reason | test("POST failed"))' "$LOG_J" >/dev/null; then
+  pass "review POST failure: loop corrected to not-posted, ledger untouched, exit 3 preserved (#615)"
+else fail "POST-failure correction (rc=$rc, ledger=$(cat "$STATE_J/phase-4b-ledger.jsonl" 2>/dev/null), log=$(cat "$LOG_J" 2>/dev/null))"; fi
 
 echo
 echo "Summary: $PASS passed, $FAIL failed"

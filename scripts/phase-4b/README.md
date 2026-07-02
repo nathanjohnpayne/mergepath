@@ -80,8 +80,13 @@ orchestrator sources `accounting.sh` and:
 Running totals prefer an injected GitHub-derived prior-record file
 (`P4B_ACCT_PRIOR_RECORDS_JSONL`, e.g. prior review bodies piped through
 `p4b_acct_extract_records`), then fall back to the append-only
-`.mergepath/phase-4b-ledger.jsonl` cache (only live posts append to it —
-dry-runs never contaminate it), else render `unavailable`. Notional pricing
+`.mergepath/phase-4b-ledger.jsonl` cache (two-phase commit: the record is
+staged at render time and appended only after the review POST actually
+succeeds, so dry-runs, head drift, and POST failures never contaminate it —
+those failure paths also correct the per-PR loop log in place, so local state
+never claims a phantom posted approval), else render `unavailable`. A prior
+record with an unavailable (null) tokens/elapsed/notional measurement makes
+that CUMULATIVE figure `unavailable` too, per metric — never coerced to 0. Notional pricing
 requires the opt-in `accounting.{codex,claude}_price_key` mappings into
 `prices.json` because the adapters do not capture exact model IDs yet.
 Covered by `tests/test_phase_4b_accounting.sh` via

@@ -449,10 +449,16 @@ p4b_validate_verdict() {
                and (.usage.token_count | okintnull)
                and (.usage.input_tokens | okintnull)
                and (.usage.output_tokens | okintnull)
-               and ((.usage.cache_creation_input_tokens // null) | okintnull)
-               and ((.usage.cache_read_input_tokens // null) | okintnull)
-               and ((.usage.reasoning_tokens // null) | okintnull)
-               and ((.usage.total_cost_usd // null) as $c
+               # Optional #602 fields: plain `.usage.X` yields null for an
+               # ABSENT key (accepted), while a PRESENT wrong-typed value must
+               # fail the type check. Never `// null` here — the jq alternative
+               # operator treats `false` as absent, so a boolean field
+               # (cache_read_input_tokens:false) would silently pass (#615
+               # Codex; the known repo `//`-vs-false footgun).
+               and (.usage.cache_creation_input_tokens | okintnull)
+               and (.usage.cache_read_input_tokens | okintnull)
+               and (.usage.reasoning_tokens | okintnull)
+               and (.usage.total_cost_usd as $c
                     | ($c == null) or (($c | type) == "number" and $c >= 0))
                and (.usage.source | okstr)))
   ' >/dev/null 2>&1

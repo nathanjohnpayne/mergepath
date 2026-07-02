@@ -129,14 +129,14 @@ This reproduces the #580 four-loop story that had to be posted by hand, as the w
 
 ### Findings and disposition
 
-| Finding | Severity | First loop | Last seen | Disposition | Fix commit / issue |
-|---|---|---:|---:|---|---|
-| Codex `--output-schema` vs jq validator drift (`line` min) | P2 | 3 | 3 | deferred-to-follow-up | #585 |
-| Record reviewer CLI version before enablement | P2 | 3 | 3 | deferred-to-follow-up | #586 |
-| Harden Claude JSON extraction beyond first/last brace | P3 | 3 | 3 | deferred-to-follow-up | #587 |
-| Make local shellcheck absence more visible | P3 | 3 | 3 | deferred-to-follow-up | #588 |
+| Finding | Severity | Location | Summary | Scope | First loop | Last seen | Disposition | Fix commit / issue |
+|---|---|---|---|---|---:|---:|---|---|
+| F1 | P2 | — | Codex `--output-schema` vs jq validator drift (`line` min) | current-head | 3 | 3 | deferred-to-follow-up | #585 |
+| F2 | P2 | — | Record reviewer CLI version before enablement | current-head | 3 | 3 | deferred-to-follow-up | #586 |
+| F3 | P3 | — | Harden Claude JSON extraction beyond first/last brace | current-head | 3 | 3 | deferred-to-follow-up | #587 |
+| F4 | P3 | — | Make local shellcheck absence more visible | current-head | 3 | 3 | deferred-to-follow-up | #588 |
 
-Unique current-head findings: 4 (all advisory, non-blocking). Repeated/stale across loops: 0.
+Unique findings across loops: 4 — 4 on the approved head, 0 historical (earlier loops only). Repeated across loops: 0. (Scope is derived per finding: `current-head` only when it was last seen on a loop that reviewed the final head sha; a finding last seen on a prior commit — the changes-requested-then-fixed lifecycle — renders `historical`, never as residual current-head risk. Summary is the first body line truncated to 80 chars; full bodies stay in the local loop log, never in the posted block.)
 
 ### Cost and effort
 
@@ -182,10 +182,10 @@ Unique current-head findings: 4 (all advisory, non-blocking). Repeated/stale acr
   {"loop":4,"reviewer":"nathanpayne-claude","adapter":"orchestrator-dry-run","direction":"codex->claude","head_sha":"d05ff4d0…","verdict":"CHANGES_REQUESTED","posted":"not-posted","fell_back":true,"elapsed_seconds":76,"tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"unavailable"},"findings":{"P0":0,"P1":0,"P2":null,"P3":null,"nitpick":null,"unknown":null},"cli_version":null,"timeout_seconds":900,"effort":"medium","throttle_events":0,"plan_auth":"firstParty","fail_closed":{"happened":true,"reason":"approval-carried-findings","duration_seconds":76}}
  ],
  "unique_findings":[
-  {"id":"F1","severity":"P2","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":585},
-  {"id":"F2","severity":"P2","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":586},
-  {"id":"F3","severity":"P3","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":587},
-  {"id":"F4","severity":"P3","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":588}
+  {"id":"F1","severity":"P2","path":null,"line":null,"title":"Codex `--output-schema` vs jq validator drift (`line` min)","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":585},
+  {"id":"F2","severity":"P2","path":null,"line":null,"title":"Record reviewer CLI version before enablement","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":586},
+  {"id":"F3","severity":"P3","path":null,"line":null,"title":"Harden Claude JSON extraction beyond first/last brace","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":587},
+  {"id":"F4","severity":"P3","path":null,"line":null,"title":"Make local shellcheck absence more visible","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":588}
  ],
  "totals":{"adapter_invocations":4,"tokens_total":177204,"tokens_by_provider":{"codex":169844,"claude":7360},"elapsed_seconds_total":225,"billed_usd":0.0,"notional_usd":0.66,"price_table_version":"2026-07-01","fail_closed_events":1,"advisory_issues_filed":[585,586,587,588]},
  "running_totals":{"source":"github-derived","records":24,"auto_approved_prs":24,"automated_attempts":27,"fail_closed_events":3,"tokens_total":2360000,"notional_usd":9.40,"human_minutes_saved_estimate":[720,4320]},
