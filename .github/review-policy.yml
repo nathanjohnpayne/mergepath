@@ -591,6 +591,12 @@ phase_4b_automation:
   # same-head required-finding gate) still falls back to the manual
   # handoff. Enabled 2026-07-02 per operator request, together with xhigh
   # reviewer effort and the (already-default) accounting sub-toggle.
+  # Trusted-path rule (#628 Codex P1): the orchestrator + adapters +
+  # gh-as-reviewer MUST be executed from a trusted main-ref checkout,
+  # never from the PR-under-review's own checkout - the PR is passed by
+  # number/head and its diff reviewed as data, so a PR that edits the
+  # phase-4b scripts cannot shape its own verdict. Bootstrap mirrors of
+  # this file reset the switch to false (new repos opt in explicitly).
   enabled: true
 
   # Execution model. 'local' = the authoring agent's session shells out to

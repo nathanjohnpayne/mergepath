@@ -198,6 +198,18 @@ bootstrap::stage_template_mirror() {
     return "$step_rc"
   fi
 
+  # Step 5: reset opt-in policy defaults the hub has flipped for itself.
+  # phase_4b_automation.enabled: true on the hub (#628) must NOT opt every
+  # future bootstrapped repo into local reviewer-CLI automation - a new
+  # repo opts in explicitly after validating plan-logins on its operator
+  # machine (Codex P2 on #628). Scoped to the parent block's direct child
+  # so codex.enabled / accounting.enabled are untouched.
+  bootstrap::_reset_phase_4b_enabled "$target" || step_rc=$?
+  if [ "$step_rc" -ne 0 ]; then
+    bootstrap::err "template-mirror: phase-4b default reset failed (rc=$step_rc); aborting stage"
+    return "$step_rc"
+  fi
+
   # Step 5: initialize git history.
   bootstrap::_init_target_git "$target" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
@@ -243,6 +255,24 @@ bootstrap::_resolve_source_root() {
   fi
   # Last resort: walk up from this stage file.
   (cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+}
+
+bootstrap::_reset_phase_4b_enabled() {
+  local target=$1
+  local policy="$target/.github/review-policy.yml"
+  [ -f "$policy" ] || return 0
+  awk '
+    /^phase_4b_automation:/ { inblk=1; print; next }
+    inblk && /^[^[:space:]#]/ { inblk=0 }
+    inblk && !done && /^  enabled:/ {
+      print "  # Reset to the manual-handoff default by the bootstrap mirror"
+      print "  # (#628): a new repo opts in to local reviewer-CLI automation"
+      print "  # explicitly, after validating plan-logins on its own machine."
+      print "  enabled: false"
+      done=1; next
+    }
+    { print }
+  ' "$policy" > "$policy.bootstrap-tmp" && mv "$policy.bootstrap-tmp" "$policy"
 }
 
 bootstrap::_rsync_template() {
