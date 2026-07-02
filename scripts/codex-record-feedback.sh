@@ -352,6 +352,14 @@ fetch_api_array() {
 # request-script findings live) when the producer did not set it.
 normalize_findings() {
   jq '
+    # Mirror of the #617 coderabbit-recorder fix (#618): a digit-string id
+    # from --findings-json is coerced to a number during normalization so
+    # string-compare recording and the numeric not-found pass see the SAME
+    # id — pre-fix a string id was recorded AND reported skipped:not-found
+    # at once. Non-numeric strings pass through untouched (conservative
+    # default; they then fail the not-found pass visibly).
+    def coerce_id:
+      if type == "string" and test("^[0-9]+$") then tonumber else . end;
     (if type == "object" and has("findings") then .findings else . end)
     | (if type == "array" then . else [] end)
     | [ .[]
@@ -359,7 +367,7 @@ normalize_findings() {
             path: (.path // null),
             line: (.line // null),
             priority: (.priority // "P?"),
-            comment_id: (.comment_id // .id),
+            comment_id: ((.comment_id // .id) | coerce_id),
             body: (.body // ""),
             location: (.location // "pull_request_review_comment")
           }
