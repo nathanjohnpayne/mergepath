@@ -1002,6 +1002,24 @@ assert_rc_contains "bash command word with redirection still scans body (#611 r1
   'bash > /tmp/out <<'"'"'EOF'"'"'
 $(printf "\147\150\40\160\162") merge 1
 EOF'
+
+# --- #611 round 11: quoted heredoc PIPED into a shell executes the body ---
+# cat <<'EOF' | bash runs the body even though the first command word is
+# cat, so any pipeline segment being an interpreter forces body scanning.
+assert_rc_contains "quoted heredoc piped into bash fails closed (#611 r11)" 2 "wrapper" \
+  'cat <<'"'"'EOF'"'"' | bash
+$(printf "\147\150\40\160\162") merge 1
+EOF'
+assert_rc_contains "quoted heredoc through tee then sh fails closed (#611 r11)" 2 "wrapper" \
+  'cat <<'"'"'EOF'"'"' | tee /tmp/x | sh
+$(printf "\147\150\40\160\162") merge 1
+EOF'
+# Control: piped into a NON-shell (grep) the body is not executed — stays
+# inert data for cat, allowed.
+assert_rc_contains "quoted heredoc piped into grep stays allowed (#611 r11)" 0 "" \
+  'cat <<'"'"'EOF'"'"' | grep merge
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
 assert_rc_contains "parse failure with octal gh spelling still fails closed (#611 r4)" 2 "tokenize" \
   '$(printf "\147\150") pr merge 1 "oops'
 

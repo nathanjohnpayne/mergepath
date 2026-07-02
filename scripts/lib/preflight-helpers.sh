@@ -162,17 +162,32 @@ auto_source_preflight() {
   # A review-mode cache therefore leaves GH_TOKEN unset (callers pin
   # $OP_PREFLIGHT_{REVIEWER,AUTHOR}_PAT per command, or require_token).
   #
-  # Only the PAT-less cache path restores the caller's ambient GITHUB_TOKEN:
-  # when the cache supplied no credential of its own (a --mode deploy cache
-  # with neither GH_TOKEN nor an OP_PREFLIGHT_*_PAT), the scrubbed ambient
-  # token is the caller's only credential and there is no per-command pin to
-  # shadow, so restoring it is both safe and necessary. Decided by the CACHE
-  # FILE, not post-source env (#611 r7): a stale OP_PREFLIGHT_*_PAT inherited
-  # from an earlier run must not masquerade as cache-supplied and suppress
-  # the restore.
+  # Restore the caller's ambient GITHUB_TOKEN unless the cache is COMPLETE.
+  # A cache is complete when it can serve every identity a caller may
+  # require: it exports its own GH_TOKEN, OR it carries BOTH the reviewer
+  # AND author PATs. In that case the caller uses require_token / a
+  # per-command pin for the right identity and the #573 scrub stands (no
+  # leaked ambient token survives to be mistaken for a proper credential).
+  #
+  # An INCOMPLETE cache leaves a gap: a --mode deploy cache (no PAT at all,
+  # #611 r7) or a service-account review cache with ONLY the reviewer PAT
+  # (#611 r11) cannot serve `preflight_require_token author`, so scrubbing
+  # the caller's ambient GITHUB_TOKEN would strip its only fallback and leave
+  # direct read helpers (sync_read_gh) unauthenticated. Restore it there — a
+  # per-command `GH_TOKEN=<pat>` pin still takes precedence over GITHUB_TOKEN
+  # per the gh precedence order, so the restored fallback never shadows an
+  # explicit pin. Decided by the CACHE FILE, not post-source env (#611 r7):
+  # a stale OP_PREFLIGHT_*_PAT inherited from an earlier run must not
+  # masquerade as cache-supplied.
+  local _cache_complete=0
+  if grep -qE '^(export[[:space:]]+)?GH_TOKEN=' "$session_file"; then
+    _cache_complete=1
+  elif grep -qE '^(export[[:space:]]+)?OP_PREFLIGHT_REVIEWER_PAT=' "$session_file" \
+       && grep -qE '^(export[[:space:]]+)?OP_PREFLIGHT_AUTHOR_PAT=' "$session_file"; then
+    _cache_complete=1
+  fi
   if [[ -z "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" \
-        && "$_ambient_github_token_set" -eq 1 ]] \
-     && ! grep -qE '^(export[[:space:]]+)?(OP_PREFLIGHT_REVIEWER_PAT|OP_PREFLIGHT_AUTHOR_PAT|GH_TOKEN|GITHUB_TOKEN)=' "$session_file"; then
+        && "$_ambient_github_token_set" -eq 1 && "$_cache_complete" -eq 0 ]]; then
     export GITHUB_TOKEN="$_ambient_github_token"
   fi
   if [[ "${OP_PREFLIGHT_QUIET:-0}" != "1" ]]; then

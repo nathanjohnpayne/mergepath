@@ -271,6 +271,50 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Test 3f (#611 r11): an INCOMPLETE review cache — a service-account
+# review-mode cache carrying ONLY the reviewer PAT (no author PAT) — cannot
+# serve preflight_require_token author, so the caller's ambient GITHUB_TOKEN
+# must be preserved as its fallback. A COMPLETE cache (both PATs, test 3b)
+# still scrubs.
+# ---------------------------------------------------------------------------
+test_lib_auto_source_preserves_ambient_when_cache_missing_author() {
+  (
+    local case_dir="$WORKDIR/lib3f"
+    mkdir -p "$case_dir"
+    chmod 700 "$case_dir"
+    cat > "$case_dir/op-preflight-claude.env" <<EOF
+OP_PREFLIGHT_CREATED_AT_EPOCH=$(date +%s)
+OP_PREFLIGHT_TTL_SECONDS=14400
+OP_PREFLIGHT_AGENT=claude
+OP_PREFLIGHT_MODE=review
+OP_PREFLIGHT_DONE=1
+OP_PREFLIGHT_REVIEWER_PAT=rev-3f
+EOF
+    chmod 600 "$case_dir/op-preflight-claude.env"
+    unset GH_TOKEN OP_PREFLIGHT_REVIEWER_PAT OP_PREFLIGHT_AUTHOR_PAT
+    export OP_PREFLIGHT_CACHE_DIR="$case_dir"
+    export MERGEPATH_AGENT=claude
+    export GITHUB_TOKEN="caller-fallback-github-token"
+    # shellcheck source=../scripts/lib/preflight-helpers.sh
+    . "$LIB"
+    auto_source_preflight
+    if [ "${GITHUB_TOKEN:-}" != "caller-fallback-github-token" ]; then
+      echo "reviewer-only cache destroyed ambient GITHUB_TOKEN fallback (got '${GITHUB_TOKEN:-}')" >&2
+      exit 1
+    fi
+    if [ "${OP_PREFLIGHT_REVIEWER_PAT:-}" != "rev-3f" ]; then
+      echo "reviewer-only cache did not load the reviewer PAT" >&2
+      exit 1
+    fi
+  ) >"$WORKDIR/lib3f.out" 2>"$WORKDIR/lib3f.err" && local rc=0 || local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "test_lib_auto_source_preserves_ambient_when_cache_missing_author: rc=$rc stderr=$(cat "$WORKDIR/lib3f.err")"
+    return
+  fi
+  pass "test_lib_auto_source_preserves_ambient_when_cache_missing_author: reviewer-only cache preserves ambient GITHUB_TOKEN (#611 r11)"
+}
+
+# ---------------------------------------------------------------------------
 # Test 3e (#611 r7): STALE OP_PREFLIGHT_*_PAT vars inherited from an earlier
 # run must not masquerade as cache-supplied credentials — the restore
 # decision reads the cache FILE, so a PAT-less cache still restores the
@@ -511,6 +555,7 @@ test_lib_gh_token_passthrough
 test_lib_stale_cache_noop
 test_lib_auto_source_scrubs_ambient_github_token
 test_lib_auto_source_preserves_ambient_when_cache_has_no_pat
+test_lib_auto_source_preserves_ambient_when_cache_missing_author
 test_lib_auto_source_restore_ignores_stale_pat_vars
 test_lib_load_env_vars_scrubs_ambient_token
 test_lib_require_token_reviewer

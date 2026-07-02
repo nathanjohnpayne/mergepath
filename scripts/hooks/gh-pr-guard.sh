@@ -731,13 +731,12 @@ def _read_heredoc_delimiter(cmd, j):
         j += 1
     return "".join(chars), quoted, j
 
-def _line_command_word(line):
-    # The command-word BASENAME of a shell line, with redirections and their
-    # targets, leading env assignments, and known prefix commands + their
-    # flags skipped (#611 r10: `bash` in a redirection path or an argument
-    # must NOT be read as the interpreter). Backslash/quote-stripped first so
-    # an escape-spelled command word is recognized (#611 r9).
-    toks = line.replace("\\", "").replace(_SQ, "").replace(_DQ, "").split()
+def _segment_command_word(toks):
+    # The command-word BASENAME of one pipeline/list SEGMENT (already
+    # whitespace-split, escapes/quotes stripped), with redirections and their
+    # targets, leading env assignments, and prefix commands + flags skipped
+    # (#611 r10: `bash` in a redirection path or an argument must NOT be read
+    # as the interpreter).
     k = 0
     while k < len(toks):
         t = toks[k]
@@ -757,6 +756,22 @@ def _line_command_word(line):
             continue
         return t.rsplit("/", 1)[-1]
     return ""
+
+def _line_command_words(line):
+    # Command-word basenames of EVERY pipeline/list segment of a shell line
+    # (#611 r11: a quoted heredoc piped into a shell — `cat <<'EOF' | bash` —
+    # executes the body even though the FIRST command word is cat, so the
+    # interpreter check must see the pipe target too). Split the
+    # escape/quote-stripped line on top-level pipe/list operators and take
+    # the command word of each segment. Backslash/quote-stripped first so an
+    # escape-spelled command word is recognized (#611 r9).
+    stripped = line.replace("\\", "").replace(_SQ, "").replace(_DQ, "")
+    words = []
+    for seg in re.split(r"\|\||&&|[|;&]", stripped):
+        w = _segment_command_word(seg.split())
+        if w:
+            words.append(w)
+    return words
 
 def flatten_command(cmd, depth=0):
     """Normalize a command for shlex tokenization so the downstream walk
@@ -902,14 +917,16 @@ def flatten_command(cmd, depth=0):
                 cur_word = ""
                 line = cmd[line_start:i]
                 i += 1
-                # #611 r10: only the line COMMAND WORD decides whether a
-                # quoted heredoc body executes — a shell name in a redirection
-                # target or an argument (cat > /tmp/bash-fixture <<'EOF') must
-                # not force body scanning. _line_command_word skips
-                # redirections/assignments/prefixes and strips escapes (#611
-                # r9) before checking the interpreter set.
-                if pending_heredocs and \
-                        _line_command_word(line) not in _LINE_INTERPRETERS:
+                # #611 r10/r11: a quoted heredoc body executes iff ANY
+                # pipeline/list segment command word on the producer line is a
+                # shell interpreter — the command the heredoc feeds OR a
+                # downstream pipe target (cat <<'EOF' | bash runs the body).
+                # A shell name in a redirection target or argument does NOT
+                # count (r10). Only skip the body when NO segment is an
+                # interpreter.
+                if pending_heredocs and not any(
+                        w in _LINE_INTERPRETERS
+                        for w in _line_command_words(line)):
                     for _tag, _allow_tabs in pending_heredocs:
                         while i < n:
                             nl = cmd.find("\n", i)
