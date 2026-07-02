@@ -13,21 +13,64 @@
 #
 # Usage:
 #   scripts/resolve-pr-threads.sh <PR#> [--repo owner/name] [--list]
-#                                 [--auto-resolve-bots] [--dry-run]
-#                                 [--rationale <text>] [--no-tag-reply]
+#                                 [--auto-resolve-bots | --resolve-actioned
+#                                  | --resolve-verified-propagation]
+#                                 [--dry-run] [--rationale <text>]
+#                                 [--no-tag-reply]
 #
-# Modes:
+# Modes — split by DISPOSITION (#575). Pick the mode that matches what
+# actually HAPPENED to the feedback, because each mode records a
+# different [mergepath-resolve:<class>] tag, and the daily rollup /
+# weekly sweep read that tag as the disposition of record:
+#
+#   fixed or rebutted        → --resolve-actioned  (addressed-elsewhere /
+#                                                    rebuttal-recorded)
+#   explicitly deferred      → --auto-resolve-bots (deferred-to-followup)
+#   propagated from upstream → --resolve-verified-propagation
+#                                                   (verified-propagation)
+#
 #   --list                  List unresolved threads with author + path +
 #                           first-comment excerpt. No mutations.
-#   --auto-resolve-bots     Resolve threads whose author is a bot
-#                           (CodeRabbit, Codex Connector, Dependabot)
-#                           AND whose latest comment is on the current
-#                           HEAD. Use ONLY when:
-#                           - The agent has already addressed each
-#                             finding in a fix commit on this HEAD, OR
-#                             posted a rebuttal reply, AND
-#                           - The bot author has not auto-resolved in
-#                             a reasonable window.
+#   --auto-resolve-bots     THE tool for EXPLICIT DEFERRAL. Resolves
+#                           threads whose author is a bot (CodeRabbit,
+#                           Codex Connector, Dependabot) AND whose latest
+#                           comment is on the current HEAD, for findings
+#                           you are deliberately NOT fixing on this PR
+#                           because they are tracked elsewhere — the
+#                           standard case being canonical-coverage
+#                           findings on sync mirrors deferred to a
+#                           follow-up issue via --rationale. The tag
+#                           defaults to deferred-to-followup: the honest
+#                           marker for "not handled here", which the
+#                           daily rollup keeps re-surfacing. That default
+#                           also applies when the TAG ladder lands on a
+#                           ROUTING class (canonical-coverage /
+#                           templated-render) for a non-actioned thread
+#                           (#616): the rollup SKIPS routing classes, so
+#                           recording one here would bury the deliberate
+#                           deferral forever. The routing context is
+#                           logged (INFO line); the disposition of record
+#                           stays deferred-to-followup until the finding
+#                           is actioned or
+#                           --resolve-verified-propagation proves the
+#                           propagation.
+#                           Do NOT reach for this mode on findings you
+#                           fixed or rebutted — that silently mis-records
+#                           them as deferred (the #571 failure that
+#                           motivated #575). Guard: when a thread about
+#                           to be tagged deferred-to-followup is
+#                           demonstrably ACTIONED (the same evidence gate
+#                           --resolve-actioned uses derives
+#                           addressed-elsewhere / rebuttal-recorded), the
+#                           tag is AUTO-UPGRADED to the truthful class
+#                           with an INFO line. Auto-upgrade (not
+#                           warn-only) is deliberate: the upgrade can
+#                           never overclaim — it fires only on the
+#                           fail-closed evidence gate — while a warning
+#                           would leave the mis-tag in place for every
+#                           operator who misses the log line. A thread
+#                           that is NOT demonstrably actioned keeps
+#                           deferred-to-followup.
 #                           Per REVIEW_POLICY.md § Implementation notes
 #                           for branch protection gates: this is a
 #                           CLEAN-UP mechanism, not a policy override.
@@ -35,9 +78,11 @@
 #                           bot-only mode. Follow REVIEW_POLICY.md's
 #                           pre-merge gate for agent-reviewer vs
 #                           real-human threads.
-#   --resolve-actioned      Like --auto-resolve-bots (same bot-author,
-#                           current-HEAD, identity, tag-reply, and readback
-#                           handling) but resolves a thread ONLY when its
+#   --resolve-actioned      THE tool for FIXED or REBUTTED feedback — the
+#                           default on a PR you pushed fixes to. Like
+#                           --auto-resolve-bots (same bot-author,
+#                           identity, tag-reply, and readback handling)
+#                           but resolves a thread ONLY when its
 #                           derived class proves ACTION on this PR:
 #                           addressed-elsewhere (an agent commit touching the
 #                           anchored file, after the latest re-raise) or
@@ -70,8 +115,139 @@
 #                           a conversation-resolution-gated repo, fix/rebut
 #                           it (making it actioned) or defer it explicitly
 #                           via --auto-resolve-bots --rationale.
-#   --dry-run               With either resolve mode, print what would
-#                           be resolved without mutating.
+#   --resolve-verified-propagation
+#                           THE tool for the routing-class residual on
+#                           CONSUMER sync PRs (#572): canonical-coverage /
+#                           templated-render threads whose content has
+#                           PROVABLY propagated. Routing alone (path
+#                           membership in .mergepath-sync.yml) never counts
+#                           as actioned — it says WHERE a fix belongs, not
+#                           that one happened (#565) — but when the
+#                           consumer's CURRENT content byte-matches the
+#                           canonical/rendered source, the upstream state
+#                           has provably propagated and the thread is
+#                           handled. Routing is decided by the PATH ALONE
+#                           (derive_routing_class): a previously recorded
+#                           [mergepath-resolve: deferred-to-followup] (or
+#                           other) marker from an earlier deferral pass
+#                           never masks the manifest check — resolving
+#                           exactly those previously-deferred threads once
+#                           propagation lands is this mode's main use case
+#                           (#616). A routed thread with demonstrable
+#                           ACTION evidence (the --resolve-actioned gate:
+#                           an agent fix commit touching the anchored file
+#                           after the latest re-raise, or a substantive
+#                           rebuttal) is resolved under its truthful
+#                           addressed-elsewhere / rebuttal-recorded tag
+#                           instead, with an INFO line (mirrors the #575
+#                           auto-upgrade); the byte-compare is skipped for
+#                           these since the action evidence is the
+#                           resolution evidence. The COMPARED REF is
+#                           state-dependent (#616 finding 3510170875): while
+#                           the target PR is OPEN (the pre-merge
+#                           conversation gate) the compare reads the PR's
+#                           own HEAD sha — the PR being merged may itself
+#                           change the same canonical/templated destination,
+#                           so a default-branch byte-match must not resolve
+#                           a thread whose candidate content still carries
+#                           drift; once the PR is closed/merged the compare
+#                           reads the default branch PINNED to its tip
+#                           commit SHA — resolved once and reused by BOTH
+#                           the contents and git-trees reads, so the two
+#                           can never see different commits if the branch
+#                           advances between them (#616 finding
+#                           3510442271; the #562 backlog case). An
+#                           unresolvable PR state, tip-SHA resolution
+#                           failure, or compared-ref content fetch failure
+#                           skips fail-closed.
+#                           Per non-actioned thread anchored at path P:
+#                           - P matches a canonical/kit entry in mergepath's
+#                             .mergepath-sync.yml → byte-compare the
+#                             consumer's content at P (gh contents API at
+#                             the compared ref) against mergepath's
+#                             canonical source file.
+#                           - P matches a templated entry's dest for this
+#                             consumer → re-render the source template with
+#                             the consumer's facts (the SAME render engine
+#                             scripts/workflow/verify-propagation-pr.sh
+#                             uses: scripts/lib/template-substitution.sh +
+#                             scripts/lib/manifest-fact-helpers.sh) and
+#                             byte-compare against the consumer's content
+#                             at the compared ref.
+#                           Both arms read the mergepath source at the
+#                           COMMITTED HEAD (git show HEAD:path), never the
+#                           working tree (#616 finding 3510442268):
+#                           uncommitted local edits never count as
+#                           propagation sources — only committed content
+#                           can have propagated, and the tree-entry +
+#                           upstream-evidence gates below already read
+#                           HEAD, so all three checks see one committed
+#                           state. The templated arm's render INPUTS —
+#                           consumer facts, consumer-name lookup, and the
+#                           dest→source templated-entry mapping — read a
+#                           committed .mergepath-sync.yml snapshot too
+#                           (#616 finding 3510689518): a dirty manifest's
+#                           uncommitted fact edits must never produce a
+#                           rendered match (or mask a genuine committed
+#                           one).
+#                           A byte-match alone is NECESSARY, NOT SUFFICIENT
+#                           (#616 findings 3510170883 + 3510170879). Two
+#                           further gates run before any resolve:
+#                           - TREE-ENTRY PARITY: the consumer tree entry at
+#                             the compared ref must be a regular blob whose
+#                             mode matches the mergepath source's committed
+#                             mode (100644/100755) — the same mode/type
+#                             check verify-propagation-pr.sh applies, so a
+#                             chmod flip or symlink swap with identical raw
+#                             bytes never verifies as faithful propagation.
+#                             Mismatch skips as drift; a tree lookup
+#                             failure (or a truncated tree listing) skips
+#                             fail-closed.
+#                           - UPSTREAM-FIX EVIDENCE: the local mergepath
+#                             checkout (REPO_ROOT_FOR_MANIFEST, a git work
+#                             tree) must carry a commit touching the
+#                             mergepath source STRICTLY NEWER than the
+#                             finding's staleness floor
+#                             (latest_nonagent_created — the latest bot/
+#                             reviewer re-raise). A byte-match only proves
+#                             the consumer mirrors the CURRENT source; if
+#                             the follow-up was never applied upstream, the
+#                             consumer mirrors a still-problematic file and
+#                             resolving would bury the deferred finding.
+#                             DELIBERATE BIAS: an upstream fix that
+#                             PRE-dates the finding (or an uncommitted
+#                             working-tree fix, or a non-git checkout) also
+#                             skips — conservative; the thread stays
+#                             deferred and resurfaces, and the operator can
+#                             resolve manually with evidence.
+#                           All gates pass → resolve (same identity-checked
+#                           resolveReviewThread + isResolved:true readback
+#                           as the other modes) tagged
+#                           [mergepath-resolve: verified-propagation].
+#                           NO byte-match (drifted, or the upstream fix has
+#                           not propagated yet) → LEAVE the thread
+#                           unresolved with a per-thread reason. FAIL
+#                           CLOSED — skip with reason, never resolve — on:
+#                           manifest entry missing, consumer content fetch
+#                           failure, render failure, facts/consumer-name
+#                           missing, yq missing, unresolvable PR state,
+#                           tree-entry lookup failure, missing upstream-fix
+#                           evidence, or a pagination-incomplete
+#                           comment list (#573/#614). Surface-class threads
+#                           (nitpick-noted etc.) and non-bot authors are
+#                           never touched. The PR-HEAD staleness proxy is
+#                           bypassed (like --resolve-actioned): the
+#                           verification evidence is the consumer's content
+#                           at the compared ref (not the bot comment's
+#                           anchor commit), and the primary target
+#                           population is backlog threads on merged sync
+#                           PRs (#562).
+#                           Run from a mergepath checkout with
+#                           --repo <owner/consumer-repo>; on a checkout
+#                           without .mergepath-sync.yml every thread skips
+#                           fail-closed.
+#   --dry-run               With any resolve mode, print what would
+#                           be resolved or skipped without mutating.
 #   --rationale <text>      With --auto-resolve-bots, override the
 #                           auto-synthesized class with a free-form
 #                           rationale. Class defaults to
@@ -80,6 +256,11 @@
 #                           Useful when the auto-heuristic would
 #                           misclassify (e.g. P2 deferred to a tracked
 #                           follow-up issue). Implies tag-reply emission.
+#                           The #575 guard still applies to the CLASS: a
+#                           demonstrably-actioned thread is upgraded to
+#                           addressed-elsewhere / rebuttal-recorded while
+#                           keeping the operator's rationale text — the
+#                           override records WHY, never falsifies WHAT.
 #   --no-tag-reply          With --auto-resolve-bots, suppress the
 #                           pre-resolution `[mergepath-resolve:<class>]`
 #                           reply emission. The resolve mutation still
@@ -110,6 +291,15 @@
 #     rebuttal-recorded     a substantive agent-authored reply (≥30
 #                           chars) is on the thread
 #     deferred-to-followup  default fallback / --rationale override
+#     verified-propagation  consumer content at the anchored path (at the
+#                           compared ref: PR head while open, default
+#                           branch once closed/merged) byte-matches
+#                           mergepath's canonical source (or the
+#                           re-rendered template with the consumer's
+#                           facts) at resolution time, with tree-entry
+#                           mode/type parity and upstream-fix evidence
+#                           (#616) — emitted only by
+#                           --resolve-verified-propagation (#572)
 #
 #   Tag emission failure is logged + skipped (does NOT block the
 #   resolve mutation). The rollup's classifier accepts any string
@@ -124,9 +314,13 @@
 #       --auto-resolve-bots run, the helper re-reads each thread it
 #       resolved via a `nodes(ids:)` readback and refuses to report success
 #       unless GitHub confirms isResolved:true for all of them.
-#   3 — unresolved threads exist (in --list mode); call again with
-#       --auto-resolve-bots after addressing findings, or resolve
-#       human-authored threads via the GitHub UI.
+#   3 — unresolved threads exist (in --list mode), or a resolve mode left
+#       threads unresolved (human-authored, stale-HEAD, not-actioned,
+#       comments-incomplete, not-propagation-routed, drifted,
+#       verification-failed, or byte-matched without upstream-fix
+#       evidence). Address the findings and retry with the
+#       mode that matches the disposition, or resolve human-authored
+#       threads via the GitHub UI.
 #
 # References:
 #   nathanjohnpayne/mergepath#166 — the issue this closes
@@ -159,22 +353,53 @@ fi
 usage() {
   cat <<'EOF' >&2
 Usage: scripts/resolve-pr-threads.sh <PR#> [--repo owner/name] [--list]
-                                            [--auto-resolve-bots | --resolve-actioned]
+                                            [--auto-resolve-bots | --resolve-actioned
+                                             | --resolve-verified-propagation]
                                             [--dry-run] [--rationale <text>] [--no-tag-reply]
 
+Resolve modes are split by DISPOSITION (#575) — pick the one that matches
+what actually happened to the feedback (the recorded tag is read by the
+daily rollup / weekly sweep as the disposition of record):
+
   --list                List unresolved threads (default).
-  --auto-resolve-bots   Resolve ALL current-HEAD bot-authored threads
-                        (clears the conversation-resolution gate; the
-                        daily rollup re-surfaces deferrals).
-  --resolve-actioned    Resolve ONLY current-HEAD bot threads whose fix or
-                        rebuttal is demonstrable (derived class in the
-                        actioned skip-set); leave the rest unresolved so
-                        the weekly sweep keeps surfacing them.
-  --dry-run             With either resolve mode, print without mutating.
+  --resolve-actioned    FIXED/REBUTTED feedback — the default on a PR you
+                        pushed fixes to. Resolves ONLY current-HEAD bot
+                        threads whose fix or rebuttal is demonstrable
+                        (tags the truthful addressed-elsewhere /
+                        rebuttal-recorded classes); leaves the rest
+                        unresolved so the weekly sweep keeps surfacing them.
+  --auto-resolve-bots   EXPLICIT DEFERRAL — resolve ALL current-HEAD
+                        bot-authored threads you are deliberately not
+                        fixing here (clears the conversation-resolution
+                        gate; tags deferred-to-followup and the daily
+                        rollup re-surfaces them). A demonstrably-actioned
+                        thread is auto-upgraded to its truthful class
+                        with an INFO line (#575).
+  --resolve-verified-propagation
+                        VERIFIED PROPAGATION on a consumer repo (#572) —
+                        resolve canonical/templated routing threads whose
+                        anchored content byte-matches mergepath's
+                        canonical source (or the re-rendered template
+                        with the consumer's facts) at the compared ref
+                        (the PR head while the PR is open, the default
+                        branch pinned to its tip SHA once closed/merged).
+                        The mergepath source is read at the COMMITTED
+                        HEAD — uncommitted working-tree edits never count
+                        as propagation sources (#616). Requires a matching
+                        tree-entry mode/type and an upstream fix commit
+                        newer than the finding (#616); tags
+                        verified-propagation. Drift or ANY verification
+                        failure skips fail-closed. Routing ignores
+                        previously recorded deferral markers (#616), and a
+                        demonstrably-actioned thread is tagged with its
+                        truthful actioned class instead (#575 upgrade).
+  --dry-run             With any resolve mode, print would-resolve /
+                        would-skip per thread without mutating.
   --rationale <text>    With --auto-resolve-bots, free-form rationale
                         appended after the [mergepath-resolve: deferred-to-followup]
-                        tag (overrides auto-classification).
-  --no-tag-reply        With either resolve mode, suppress the
+                        tag (overrides auto-classification; the #575
+                        actioned auto-upgrade still applies to the class).
+  --no-tag-reply        With any resolve mode, suppress the
                         [mergepath-resolve:<class>] reply emission
                         (the resolve mutation still runs).
 EOF
@@ -211,6 +436,7 @@ while [ $# -gt 0 ]; do
     --list) MODE="list"; shift ;;
     --auto-resolve-bots) MODE="auto-resolve-bots"; shift ;;
     --resolve-actioned) MODE="resolve-actioned"; shift ;;
+    --resolve-verified-propagation) MODE="resolve-verified-propagation"; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     --rationale)
       # Same defensive value check as --repo (Codex r2 on PR #172):
@@ -249,11 +475,18 @@ fi
 # action evidence — a free-form rationale override would resolve a thread
 # while mis-tagging it deferred-to-followup, so the daily rollup would treat
 # an actioned, resolved thread as deferred/unhandled. Reject the combo.
-if [ "$MODE" = "resolve-actioned" ] && $RATIONALE_FLAG_USED; then
-  echo "Error: --rationale is not valid with --resolve-actioned (it applies" >&2
-  echo "       only to --auto-resolve-bots). --resolve-actioned resolves on" >&2
-  echo "       derived action evidence; use --auto-resolve-bots --rationale" >&2
-  echo "       to deliberately resolve a deferred thread with a rationale." >&2
+# #572: the same logic applies to --resolve-verified-propagation, whose
+# contract is to resolve ONLY on byte-verified propagation evidence and whose
+# rationale IS the verification result — an override would replace the
+# evidence record.
+if { [ "$MODE" = "resolve-actioned" ] || [ "$MODE" = "resolve-verified-propagation" ]; } \
+   && $RATIONALE_FLAG_USED; then
+  echo "Error: --rationale is not valid with --resolve-actioned or" >&2
+  echo "       --resolve-verified-propagation (it applies only to" >&2
+  echo "       --auto-resolve-bots). Those modes resolve on derived evidence" >&2
+  echo "       (action / byte-verified propagation); use" >&2
+  echo "       --auto-resolve-bots --rationale to deliberately resolve a" >&2
+  echo "       deferred thread with a rationale." >&2
   exit 1
 fi
 
@@ -942,16 +1175,15 @@ fetch_manifest_paths() {
   fi
 }
 
-# path_matches_manifest <file-path> → exit 0 on match, 1 otherwise.
-# A file matches a canonical entry if the manifest path equals the
-# file path, or if the manifest path ends with `/` (kit) and the file
-# starts with it.
-path_matches_manifest() {
-  local file_path="$1"
+# _path_matches_entry_list <file-path> <newline-separated-paths> — shared
+# matcher for the manifest path predicates: a file matches an entry if the
+# entry path equals the file path, or if the entry path ends with `/`
+# (kit) and the file path starts with it. Empty list never matches.
+_path_matches_entry_list() {
+  local file_path="$1" entry_list="$2" mp
   [ -z "$file_path" ] && return 1
   [ "$file_path" = "(no path)" ] && return 1
-  fetch_manifest_paths
-  [ -z "$MANIFEST_PATHS_CACHE" ] && return 1
+  [ -z "$entry_list" ] && return 1
   while IFS= read -r mp; do
     [ -z "$mp" ] && continue
     if [ "${mp: -1}" = "/" ]; then
@@ -961,8 +1193,77 @@ path_matches_manifest() {
     else
       [ "$file_path" = "$mp" ] && return 0
     fi
-  done <<< "$MANIFEST_PATHS_CACHE"
+  done <<< "$entry_list"
   return 1
+}
+
+# path_matches_manifest <file-path> → exit 0 on match, 1 otherwise.
+# Matches ANY manifest entry's .path (canonical, kit, or a templated
+# entry's SOURCE) — the broad routing signal the TAG ladder uses.
+path_matches_manifest() {
+  fetch_manifest_paths
+  _path_matches_entry_list "$1" "$MANIFEST_PATHS_CACHE"
+}
+
+# fetch_manifest_canonical_paths — like fetch_manifest_paths but ONLY the
+# canonical + kit entries (#616, Codex finding 3509930343). A templated
+# entry's `.path` is the MERGEPATH SOURCE — consumers receive `.dest`, not
+# the source — so a consumer file that coincidentally sits at a templated
+# source path is NOT propagated content and must never byte-verify against
+# it. --resolve-verified-propagation's canonical branch therefore routes on
+# this cache; templated routing goes by dest (path_matches_templated_dest).
+MANIFEST_CANONICAL_PATHS_CACHE=""
+MANIFEST_CANONICAL_FETCHED=false
+fetch_manifest_canonical_paths() {
+  $MANIFEST_CANONICAL_FETCHED && return 0
+  MANIFEST_CANONICAL_FETCHED=true
+  local manifest="$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml"
+  [ -f "$manifest" ] || return 0
+  # RESOLVE_PR_THREADS_FORCE_NO_YQ=1 forces the awk fallback — same test
+  # hook as the sibling caches (#521). Inert in production.
+  if [ -z "${RESOLVE_PR_THREADS_FORCE_NO_YQ:-}" ] && command -v yq >/dev/null 2>&1; then
+    MANIFEST_CANONICAL_PATHS_CACHE=$(yq -r '
+      .paths[] | select(.type == "canonical" or .type == "kit") | .path
+    ' "$manifest" 2>/dev/null || true)
+  else
+    # awk fallback — entry-boundary emission mirroring
+    # fetch_manifest_templated_dests: pair `path:` with `type:` within a
+    # paths-block entry, emit ONLY canonical/kit entries. Positive
+    # selection is deliberate: an entry with no recognized type is
+    # excluded (conservative under-match → the verified-propagation mode
+    # skips fail-closed rather than byte-comparing a non-canonical path).
+    MANIFEST_CANONICAL_PATHS_CACHE=$(awk '
+      function emit() {
+        if ((cur_type == "canonical" || cur_type == "kit") && cur_path != "")
+          print cur_path
+      }
+      /^paths:/ { in_p = 1; next }
+      in_p && /^[^[:space:]#]/ { emit(); in_p = 0 }
+      !in_p { next }
+      /^[[:space:]]*-[[:space:]]*path:/ {
+        emit()
+        cur_path = $0
+        sub(/^[[:space:]]*-[[:space:]]*path:[[:space:]]*/, "", cur_path)
+        sub(/[[:space:]]*#.*$/, "", cur_path)
+        gsub(/^[[:space:]]+|[[:space:]]+$|^"|"$/, "", cur_path)
+        cur_type = ""
+      }
+      /^[[:space:]]*type:[[:space:]]*["\047]?canonical["\047]?[[:space:]]*(#.*)?$/ {
+        cur_type = "canonical"
+      }
+      /^[[:space:]]*type:[[:space:]]*["\047]?kit["\047]?[[:space:]]*(#.*)?$/ {
+        cur_type = "kit"
+      }
+      END { emit() }
+    ' "$manifest" 2>/dev/null || true)
+  fi
+}
+
+# path_matches_canonical_entry <file-path> → exit 0 when the path matches
+# a canonical/kit manifest entry (templated sources excluded), 1 otherwise.
+path_matches_canonical_entry() {
+  fetch_manifest_canonical_paths
+  _path_matches_entry_list "$1" "$MANIFEST_CANONICAL_PATHS_CACHE"
 }
 
 # fetch_manifest_templated_dests — extract dest + eligible consumer
@@ -1195,6 +1496,666 @@ path_matches_templated_dest() {
 # helper's canonical-coverage class agrees with what would actually
 # propagate.
 REPO_ROOT_FOR_MANIFEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# ---------------------------------------------------------------------
+# #572 — verified-propagation resolution helpers
+# ---------------------------------------------------------------------
+#
+# All of these FAIL CLOSED: any lookup/fetch/render failure returns
+# non-zero and the caller must SKIP the thread (leave it unresolved),
+# never resolve on partial evidence. The byte-compare is the resolution
+# evidence; routing (path membership) alone never resolves (#565).
+
+# The templated arm REUSES the exact render engine
+# scripts/workflow/verify-propagation-pr.sh uses — the same
+# template-substitution lib + manifest-fact-helpers pair, sourced in a
+# subshell so the MERGEPATH_FACT_* exports don't leak between threads.
+# Do NOT reimplement the render here; divergence between the two
+# byte-compare surfaces would make "verified" mean two different things.
+VP_TEMPLATE_LIB="$__RESOLVE_THREADS_DIR/lib/template-substitution.sh"
+VP_FACTS_HELPER="$__RESOLVE_THREADS_DIR/lib/manifest-fact-helpers.sh"
+
+# fetch_consumer_default_branch — resolve (once) the consumer repo's
+# default branch NAME, which resolve_consumer_compare_ref pins to its
+# tip commit SHA for CLOSED/MERGED PRs (#616 finding 3510442271).
+# Cached; returns non-zero (fail closed) when it cannot be resolved.
+CONSUMER_DEFAULT_BRANCH=""
+CONSUMER_DEFAULT_BRANCH_FETCHED=false
+fetch_consumer_default_branch() {
+  if ! $CONSUMER_DEFAULT_BRANCH_FETCHED; then
+    CONSUMER_DEFAULT_BRANCH_FETCHED=true
+    CONSUMER_DEFAULT_BRANCH=$(gh_pat api "repos/$OWNER/$NAME" \
+      --jq .default_branch 2>/dev/null) || CONSUMER_DEFAULT_BRANCH=""
+    [ "$CONSUMER_DEFAULT_BRANCH" = "null" ] && CONSUMER_DEFAULT_BRANCH=""
+  fi
+  [ -n "$CONSUMER_DEFAULT_BRANCH" ]
+}
+
+# resolve_consumer_compare_ref — resolve (once) the ref every #572
+# byte-compare and tree-entry read targets (#616 finding 3510170875):
+#   PR OPEN          → the PR's own HEAD sha ($HEAD_OID). The pre-merge
+#                      conversation gate runs this mode on OPEN consumer
+#                      PRs, and the PR being merged may itself change the
+#                      same canonical/templated destination — comparing
+#                      the default branch there would resolve a thread
+#                      while the candidate content still carries drift.
+#   PR CLOSED/MERGED → the default branch's TIP COMMIT SHA (the #562
+#                      backlog case: the thread's own PR is history; the
+#                      consumer's current state is the propagation
+#                      evidence). Pinned to a SHA ONCE (#616 finding
+#                      3510442271): the branch NAME is a moving ref — the
+#                      contents fetch and the git-trees fetch would each
+#                      re-resolve it at request time and could read
+#                      DIFFERENT commits if the branch advances between
+#                      the two reads, letting the byte-compare and the
+#                      mode/type gate pass against inconsistent states.
+#                      One immutable SHA keeps every read coherent; an
+#                      unresolvable tip fails closed like every other
+#                      lookup here.
+#   anything else    → FAIL CLOSED (state fetch failure / unknown state
+#                      never verifies).
+# Cached like the default-branch lookup; the warm-cache call in the mode
+# gate runs this in the parent shell so the per-thread verification
+# subshells inherit one resolution for the whole run.
+CONSUMER_COMPARE_REF=""
+CONSUMER_COMPARE_REF_KIND=""
+CONSUMER_COMPARE_REF_FETCHED=false
+resolve_consumer_compare_ref() {
+  local pr_state tip_sha
+  if ! $CONSUMER_COMPARE_REF_FETCHED; then
+    CONSUMER_COMPARE_REF_FETCHED=true
+    pr_state=$(gh_pat api "repos/$OWNER/$NAME/pulls/$PR_NUM" \
+      --jq .state 2>/dev/null) || pr_state=""
+    case "$pr_state" in
+      open)
+        if [ -n "$HEAD_OID" ] && [ "$HEAD_OID" != "null" ]; then
+          CONSUMER_COMPARE_REF="$HEAD_OID"
+          CONSUMER_COMPARE_REF_KIND="pr-head"
+        fi
+        ;;
+      closed|merged)
+        # REST reports merged PRs as state=closed; `merged` is accepted
+        # defensively for any future/GraphQL-shaped stub.
+        if fetch_consumer_default_branch; then
+          tip_sha=$(gh_pat api \
+            "repos/$OWNER/$NAME/git/ref/heads/$CONSUMER_DEFAULT_BRANCH" \
+            --jq .object.sha 2>/dev/null) || tip_sha=""
+          [ "$tip_sha" = "null" ] && tip_sha=""
+          if [ -n "$tip_sha" ]; then
+            CONSUMER_COMPARE_REF="$tip_sha"
+            CONSUMER_COMPARE_REF_KIND="default-branch-tip"
+          fi
+        fi
+        ;;
+      *) : ;;  # unknown/empty state → fail closed below
+    esac
+  fi
+  [ -n "$CONSUMER_COMPARE_REF" ]
+}
+
+# resolve_consumer_compare_tree — echo the TREE sha of the compared
+# ref's commit (#616 finding 3510689525). CONSUMER_COMPARE_REF is a
+# COMMIT sha (the PR head, or the pinned default-branch tip), but the
+# git/trees endpoint's documented contract takes "the SHA1 value or ref
+# (branch or tag) name of the TREE" — peel the commit to its tree
+# explicitly (repos/{o}/{r}/commits/{sha} → .commit.tree.sha, the same
+# commits endpoint the commit-files cache reads) rather than leaning on
+# undocumented commit-sha acceptance. One commits read per run, cached
+# to a FILE under COMMIT_FILES_CACHE_DIR alongside the compare ref's
+# tree listing (same subshell-survival rule as that cache). Non-zero
+# (fail closed) when the compare ref is unresolvable or the commit read
+# does not yield a tree sha.
+resolve_consumer_compare_tree() {
+  local cache="$COMMIT_FILES_CACHE_DIR/consumer-compare-tree.sha" tree_sha
+  if [ -s "$cache" ]; then
+    cat "$cache"
+    return 0
+  fi
+  resolve_consumer_compare_ref || return 1
+  tree_sha=$(gh_pat api "repos/$OWNER/$NAME/commits/$CONSUMER_COMPARE_REF" \
+    --jq .commit.tree.sha 2>/dev/null) || tree_sha=""
+  [ "$tree_sha" = "null" ] && tree_sha=""
+  [ -n "$tree_sha" ] || return 1
+  printf '%s' "$tree_sha" > "$cache"
+  printf '%s' "$tree_sha"
+}
+
+# fetch_consumer_content <path> <out-file> — write the consumer repo's
+# content at <path> at the COMPARED REF (raw bytes via the contents
+# endpoint) into <out-file>. Non-zero on any failure — including an
+# unresolvable compare ref or a PR-head fetch failure (#616 finding
+# 3510170875: fail closed, never fall back to the default branch for an
+# open PR). The content goes to a FILE, not a command substitution, so
+# trailing newlines survive and the compare is truly byte-for-byte.
+fetch_consumer_content() {
+  local vp_path="$1" out="$2"
+  resolve_consumer_compare_ref || return 1
+  gh_pat api -H "Accept: application/vnd.github.raw" \
+    "repos/$OWNER/$NAME/contents/$vp_path?ref=$CONSUMER_COMPARE_REF" \
+    > "$out" 2>/dev/null
+}
+
+# fetch_consumer_tree_entry <path> — echo the consumer's git tree entry
+# ("<mode> <type>", e.g. "100644 blob") for <path> at the compared ref.
+# The recursive git-trees fetch targets the compared commit's PEELED
+# TREE sha (resolve_consumer_compare_tree, #616 finding 3510689525) —
+# the endpoint's documented parameter is a tree sha or ref name, not a
+# commit sha. One recursive git-trees fetch per run, cached to a FILE
+# under COMMIT_FILES_CACHE_DIR so the cache survives the
+# command-substitution subshells verify_propagation_content runs in.
+# Non-zero (fail closed) on: unresolvable compare ref, commit→tree
+# resolution failure, fetch failure, a TRUNCATED tree listing (GitHub
+# caps recursive listings — a truncated response cannot prove the
+# entry's shape), or the path missing from the tree.
+CONSUMER_TREE_CACHE=""
+fetch_consumer_tree_entry() {
+  local vp_path="$1"
+  local truncated entry tree_sha
+  resolve_consumer_compare_ref || return 1
+  tree_sha=$(resolve_consumer_compare_tree) || return 1
+  CONSUMER_TREE_CACHE="$COMMIT_FILES_CACHE_DIR/consumer-tree.json"
+  if [ ! -s "$CONSUMER_TREE_CACHE" ]; then
+    if ! gh_pat api "repos/$OWNER/$NAME/git/trees/$tree_sha?recursive=1" \
+        > "$CONSUMER_TREE_CACHE.tmp" 2>/dev/null; then
+      rm -f "$CONSUMER_TREE_CACHE.tmp"
+      return 1
+    fi
+    mv "$CONSUMER_TREE_CACHE.tmp" "$CONSUMER_TREE_CACHE"
+  fi
+  truncated=$(jq -r '.truncated // false' "$CONSUMER_TREE_CACHE" 2>/dev/null) || return 1
+  [ "$truncated" = "false" ] || return 1
+  entry=$(jq -r --arg p "$vp_path" \
+    '[.tree[]? | select(.path == $p) | .mode + " " + .type] | .[0] // ""' \
+    "$CONSUMER_TREE_CACHE" 2>/dev/null) || return 1
+  [ -n "$entry" ] || return 1
+  printf '%s' "$entry"
+}
+
+# expected_source_tree_entry <mergepath-src-rel> — echo the tree entry
+# ("100644 blob" / "100755 blob") the consumer's file must carry, derived
+# from the mergepath source. Mirrors verify-propagation-pr.sh exactly:
+# prefer the COMMITTED git mode (`git ls-tree HEAD`) when
+# REPO_ROOT_FOR_MANIFEST is a git checkout (always so in production —
+# the on-disk exec bit can drift from the recorded git mode); fall back
+# to the on-disk exec bit only for non-git fixture trees. Fails closed
+# (non-zero) unless the source resolves to a regular-file blob — a
+# symlink/submodule source is a misconfiguration, not a comparable
+# entry.
+expected_source_tree_entry() {
+  local src_rel="$1"
+  local entry=""
+  if [ -d "$REPO_ROOT_FOR_MANIFEST/.git" ] || [ -f "$REPO_ROOT_FOR_MANIFEST/.git" ]; then
+    entry=$(git -C "$REPO_ROOT_FOR_MANIFEST" ls-tree HEAD -- "$src_rel" 2>/dev/null \
+      | awk '{print $1, $2}')
+  elif [ -f "$REPO_ROOT_FOR_MANIFEST/$src_rel" ]; then
+    if [ -x "$REPO_ROOT_FOR_MANIFEST/$src_rel" ]; then
+      entry="100755 blob"
+    else
+      entry="100644 blob"
+    fi
+  fi
+  case "$entry" in
+    "100644 blob"|"100755 blob") printf '%s' "$entry"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# committed_source_content <mergepath-src-rel> <out-file> — write the
+# mergepath SOURCE bytes AT THE COMMITTED HEAD into <out-file> (#616
+# finding 3510442268). The byte-compare (and the templated render input)
+# must read the same committed state the other two gates read — the
+# tree-entry gate (`git ls-tree HEAD`) and the upstream-evidence gate
+# (`git log`) — so uncommitted working-tree edits NEVER count as
+# propagation sources: a consumer byte-matching a local edit that has
+# not been committed (and so cannot have propagated) must not resolve,
+# and a dirty source file must not mask a genuine committed match.
+# Mirrors expected_source_tree_entry's git detection exactly: a non-git
+# fixture tree falls back to the on-disk file, the same fallback the
+# mode/type check uses. Non-zero (fail closed) when the path is absent
+# from HEAD (e.g. an uncommitted new file) or, in the fallback, from
+# the fixture tree.
+committed_source_content() {
+  local src_rel="$1" out="$2"
+  if [ -d "$REPO_ROOT_FOR_MANIFEST/.git" ] || [ -f "$REPO_ROOT_FOR_MANIFEST/.git" ]; then
+    git -C "$REPO_ROOT_FOR_MANIFEST" show "HEAD:$src_rel" > "$out" 2>/dev/null
+  elif [ -f "$REPO_ROOT_FOR_MANIFEST/$src_rel" ]; then
+    cat "$REPO_ROOT_FOR_MANIFEST/$src_rel" > "$out" 2>/dev/null
+  else
+    return 1
+  fi
+}
+
+# committed_manifest_file — echo the path of a .mergepath-sync.yml
+# snapshot AT THE COMMITTED HEAD (#616 finding 3510689518). The
+# templated arm's render INPUTS — the consumer facts, the consumer-name
+# lookup, and the dest→source templated-entry mapping — must come from
+# the same committed state the template bytes come from
+# (committed_source_content): with a DIRTY working-tree manifest, an
+# uncommitted fact or templated-entry edit could render output the
+# consumer happens to match, resolving a thread as verified-propagation
+# even though the COMMITTED manifest that could actually have propagated
+# renders different bytes. Materialized once per run under
+# COMMIT_FILES_CACHE_DIR (a file, so the snapshot survives the
+# verification command-substitution subshells); mirrors
+# committed_source_content's git detection exactly — a non-git fixture
+# tree falls back to the on-disk manifest, the same fallback the source
+# reads use. Non-zero (fail closed) when the manifest is absent from
+# HEAD (or, in the fallback, from the fixture tree).
+#
+# NB: the ROUTING predicates (path_matches_canonical_entry /
+# path_matches_templated_dest) intentionally keep reading the
+# working-tree manifest (see the REPO_ROOT_FOR_MANIFEST note above) —
+# routing alone never resolves; only the verification inputs here are
+# resolution evidence.
+committed_manifest_file() {
+  local snap="$COMMIT_FILES_CACHE_DIR/committed-manifest.yml"
+  if [ -s "$snap" ]; then
+    printf '%s' "$snap"
+    return 0
+  fi
+  if [ -d "$REPO_ROOT_FOR_MANIFEST/.git" ] || [ -f "$REPO_ROOT_FOR_MANIFEST/.git" ]; then
+    if ! git -C "$REPO_ROOT_FOR_MANIFEST" show "HEAD:.mergepath-sync.yml" \
+        > "$snap.tmp" 2>/dev/null; then
+      rm -f "$snap.tmp"
+      return 1
+    fi
+    mv "$snap.tmp" "$snap"
+    printf '%s' "$snap"
+    return 0
+  fi
+  if [ -f "$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml" ]; then
+    printf '%s' "$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml"
+    return 0
+  fi
+  return 1
+}
+
+# verify_consumer_tree_entry <consumer-path> <mergepath-src-rel> — the
+# #616 (finding 3510170883) mode/type gate, mirroring the tree-entry
+# check in scripts/workflow/verify-propagation-pr.sh: byte equality is
+# necessary but not sufficient — a chmod flip or a symlink swap keeps
+# the raw bytes identical while changing the consumer's on-disk file
+# behavior, and the real propagation verifier rejects exactly that. The
+# consumer tree entry at the compared ref must be a regular blob whose
+# mode matches the mergepath source's committed mode (100644/100755; a
+# symlink is mode 120000 even though its git type is blob, so the
+# mode+type tuple catches the swap). stdout: a one-line reason on
+# non-zero. Exit: 0 parity, 1 mismatch (drift-shaped — not a faithful
+# mirror), 2 lookup failure (fail closed).
+verify_consumer_tree_entry() {
+  local vp_path="$1" src_rel="$2"
+  local expected consumer_entry
+  if ! expected=$(expected_source_tree_entry "$src_rel"); then
+    echo "unsupported/absent mergepath source tree entry for $src_rel (expected a regular 100644/100755 blob)"
+    return 2
+  fi
+  if ! consumer_entry=$(fetch_consumer_tree_entry "$vp_path"); then
+    echo "could not read the consumer tree entry for $vp_path at the compared ref (git trees API failure, truncated listing, or path absent)"
+    return 2
+  fi
+  if [ "$consumer_entry" != "$expected" ]; then
+    echo "consumer tree entry for $vp_path is [$consumer_entry], expected [$expected] from the mergepath source (mode/type drift — chmod flip or symlink swap; not a faithful mirror)"
+    return 1
+  fi
+  return 0
+}
+
+# upstream_fix_evidence <mergepath-src-rel> <floor-iso> — the #616
+# (finding 3510170879) upstream-fix evidence gate. A byte-match only
+# proves the consumer mirrors the CURRENT mergepath source; it does not
+# prove the upstream finding was ever fixed — a never-applied follow-up
+# whose consumer already mirrors the still-problematic canonical file
+# must NOT be resolved and buried. Evidence = the local mergepath
+# checkout (REPO_ROOT_FOR_MANIFEST, required to be a git work tree) has
+# a commit touching <mergepath-src-rel> STRICTLY NEWER than <floor-iso>
+# (the staleness floor the caller derives via latest_nonagent_created —
+# the latest bot/reviewer re-raise, floored at the finding's createdAt).
+# The commit timestamp is rendered as UTC ISO-8601 Z so the strictly-
+# greater comparison is the same lexicographic-chronological compare the
+# staleness machinery uses. Exit 0 = evidence present; non-zero = no
+# evidence (missing floor, non-git checkout, no commit touching the
+# source — e.g. shallow-clone truncation or an uncommitted working-tree
+# fix — or the latest commit does not post-date the floor).
+# DELIBERATE BIAS (documented in the header): an upstream fix that
+# PRE-dates the finding also fails this gate — conservative; the thread
+# stays deferred and resurfaces, and the operator can resolve manually
+# with evidence.
+upstream_fix_evidence() {
+  local src_rel="$1" floor_iso="$2"
+  local commit_iso
+  [ -n "$floor_iso" ] || return 1
+  git -C "$REPO_ROOT_FOR_MANIFEST" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || return 1
+  commit_iso=$(TZ=UTC git -C "$REPO_ROOT_FOR_MANIFEST" log -1 \
+    --date=format-local:'%Y-%m-%dT%H:%M:%SZ' --format=%cd -- "$src_rel" \
+    2>/dev/null) || commit_iso=""
+  [ -n "$commit_iso" ] || return 1
+  [ "$commit_iso" \> "$floor_iso" ]
+}
+
+# manifest_consumer_name_for_repo — resolve (once) the manifest consumer
+# NAME whose .repo slug equals $REPO, needed to load the consumer's
+# facts for the templated re-render. Reads the COMMITTED manifest
+# snapshot (#616 finding 3510689518), the same committed state the
+# template bytes come from. Cached; non-zero (fail closed) when the
+# manifest is absent from HEAD, yq is unavailable, or $REPO is not a
+# declared consumer.
+MANIFEST_CONSUMER_NAME=""
+MANIFEST_CONSUMER_NAME_FETCHED=false
+manifest_consumer_name_for_repo() {
+  if ! $MANIFEST_CONSUMER_NAME_FETCHED; then
+    MANIFEST_CONSUMER_NAME_FETCHED=true
+    local manifest
+    manifest=$(committed_manifest_file) || manifest=""
+    if [ -n "$manifest" ] && [ -f "$manifest" ] && command -v yq >/dev/null 2>&1; then
+      MANIFEST_CONSUMER_NAME=$(MP_VP_REPO="$REPO" yq -r '
+        .consumers[] | select(.repo == env(MP_VP_REPO)) | .name
+      ' "$manifest" 2>/dev/null | head -1) || MANIFEST_CONSUMER_NAME=""
+      [ "$MANIFEST_CONSUMER_NAME" = "null" ] && MANIFEST_CONSUMER_NAME=""
+    fi
+  fi
+  [ -n "$MANIFEST_CONSUMER_NAME" ]
+}
+
+# manifest_templated_source_for_dest <dest> <consumer_name> — echo the
+# SOURCE template path of the templated manifest entry whose dest is
+# <dest> AND whose consumers scope includes <consumer_name> (or is the
+# scalar `all`). Consumer scoping matters: two templated entries can
+# legitimately share one dest with disjoint consumer lists (the live
+# ESM/CJS eslint.config.js pair). Two yq passes mirror
+# fetch_manifest_templated_dests (mikefarah/yq rejects the inline
+# if/then/else that would branch on the consumers tag in one pass); the
+# seq-membership check runs in bash with the same anchored comma-grep
+# path_matches_templated_dest uses. Reads the COMMITTED manifest
+# snapshot (#616 finding 3510689518) so an uncommitted templated-entry
+# edit never redirects the byte-compare source. Non-zero (fail closed)
+# on no match, missing manifest, or missing yq.
+manifest_templated_source_for_dest() {
+  local vp_dest="$1" consumer_name="$2"
+  local manifest
+  manifest=$(committed_manifest_file) || return 1
+  [ -f "$manifest" ] || return 1
+  command -v yq >/dev/null 2>&1 || return 1
+  local src rows line src_field names
+  # Pass 1 — scalar `consumers: all` (every consumer is in scope).
+  src=$(MP_VP_DEST="$vp_dest" yq -r '
+    .paths[]
+    | select(.type == "templated")
+    | select((.dest // .path) == env(MP_VP_DEST))
+    | select(.consumers == "all")
+    | (.source // .path)
+  ' "$manifest" 2>/dev/null | head -1) || src=""
+  if [ -n "$src" ] && [ "$src" != "null" ]; then
+    printf '%s' "$src"
+    return 0
+  fi
+  # Pass 2 — sequence consumers: emit source + name list, membership in
+  # bash.
+  rows=$(MP_VP_DEST="$vp_dest" yq -r '
+    .paths[]
+    | select(.type == "templated")
+    | select((.dest // .path) == env(MP_VP_DEST))
+    | select(.consumers | tag == "!!seq")
+    | (.source // .path) + "\t" + (.consumers | join(","))
+  ' "$manifest" 2>/dev/null) || rows=""
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    src_field="${line%%$'\t'*}"
+    names="${line#*$'\t'}"
+    if printf ',%s,' "$names" | grep -qF ",$consumer_name,"; then
+      printf '%s' "$src_field"
+      return 0
+    fi
+  done <<< "$rows"
+  return 1
+}
+
+# derive_routing_class <thread_json> — ROUTING-ONLY classification for
+# --resolve-verified-propagation (#616, Codex finding 3509734391).
+# Pure PATH predicate: emits `canonical-coverage` when the anchored path
+# is a manifest canonical/kit entry, `templated-render` when it is a
+# templated entry's dest for this consumer, `not-routed` otherwise.
+#
+# The canonical branch matches CANONICAL/KIT entries only
+# (path_matches_canonical_entry, NOT the broad path_matches_manifest) —
+# a templated entry's `.path` is the mergepath SOURCE while the consumer
+# receives `.dest`, so a consumer file coincidentally at a templated
+# source path with matching bytes must not resolve as verified
+# propagation (#616, Codex finding 3509930343). Templated routing goes
+# by dest, below.
+#
+# Deliberately IGNORES recorded [mergepath-resolve: ...] markers, unlike
+# derive_tag_class's default TAG ladder (whose step 0 honors a surface
+# marker BEFORE the path checks). The mode's target population is exactly
+# the previously-DEFERRED routing threads (the #562 backlog): a sync
+# finding tagged [mergepath-resolve: deferred-to-followup] on an earlier
+# deferral pass would, under the TAG ladder, classify as
+# deferred-to-followup forever and be skipped as "not propagation-routed"
+# even after the consumer content byte-matches — defeating the mode's
+# main use case. Routing is a property of the PATH, not of the thread's
+# reply history; the byte-compare (or the actioned-evidence upgrade in
+# the mode gate) still decides the actual resolve.
+derive_routing_class() {
+  local thread_path
+  thread_path=$(printf '%s' "$1" | jq -r '.path // ""')
+  if path_matches_canonical_entry "$thread_path"; then
+    echo "canonical-coverage"
+    return
+  fi
+  if path_matches_templated_dest "$thread_path"; then
+    echo "templated-render"
+    return
+  fi
+  echo "not-routed"
+}
+
+# verify_propagation_content <class> <path> <floor-iso> — the #572
+# verification: byte-compare at the compared ref, then the #616 gates
+# (tree-entry parity + upstream-fix evidence). <floor-iso> is the
+# thread's staleness floor (latest_nonagent_created over the COMPLETE
+# comment list) the evidence gate compares against.
+# stdout: a one-line detail message (the tag rationale on success, the
+# skip reason otherwise). Exit status is the verdict:
+#   0 — VERIFIED: the consumer's content at <path> (compared ref)
+#       byte-matches mergepath's canonical source (canonical-coverage)
+#       or the re-rendered template with this consumer's facts
+#       (templated-render) — both read at the COMMITTED HEAD via
+#       committed_source_content, never the working tree (#616 finding
+#       3510442268) — the consumer tree entry's mode/type matches
+#       the mergepath source, AND the source carries an upstream fix
+#       commit newer than <floor-iso>. The thread may be resolved.
+#   1 — DRIFT: the compare ran and the bytes differ (consumer drifted,
+#       or the upstream fix has not propagated), or the bytes match but
+#       the tree entry's mode/type does not (chmod flip / symlink swap —
+#       not a faithful mirror, #616 finding 3510170883). Leave
+#       unresolved.
+#   2 — verification error (fail closed): manifest entry missing,
+#       compare-ref/PR-state resolution failure, content fetch failure,
+#       source absent from the committed mergepath HEAD, render
+#       failure, facts/consumer-name missing, tree-entry lookup
+#       failure, or libs/yq unavailable. Leave unresolved.
+#   3 — NO UPSTREAM-FIX EVIDENCE (fail closed, #616 finding 3510170879):
+#       the bytes (and tree entry) match, but the local mergepath
+#       checkout has no commit touching the source strictly newer than
+#       <floor-iso> — the match may mirror a still-problematic source.
+#       Leave unresolved (stays deferred and resurfaces — safe).
+verify_propagation_content() {
+  local vp_class="$1" vp_path="$2" vp_floor="${3:-}"
+  local consumer_tmp mp_src src_tmp rendered render_err render_rc consumer_name
+  local vte_rc vte_msg
+  case "$vp_class" in
+    canonical-coverage|templated-render) : ;;
+    *) echo "internal: unexpected class '$vp_class' reached verification"; return 2 ;;
+  esac
+  if [ -z "$vp_path" ] || [ "$vp_path" = "(no path)" ]; then
+    echo "thread has no anchored file path to verify"
+    return 2
+  fi
+  # mktemp failures (unwritable/full TMPDIR) must be a logged fail-closed
+  # skip, not an ambiguous-redirect bash error (CodeRabbit on #616).
+  if ! consumer_tmp=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-consumer.XXXXXX"); then
+    echo "mktemp failed for consumer content (TMPDIR unwritable or full?)"
+    return 2
+  fi
+  if ! fetch_consumer_content "$vp_path" "$consumer_tmp"; then
+    rm -f "$consumer_tmp"
+    echo "could not fetch $REPO:$vp_path at the compared ref (${CONSUMER_COMPARE_REF_KIND:-unresolved PR state or default-branch tip}; contents API)"
+    return 2
+  fi
+
+  if [ "$vp_class" = "canonical-coverage" ]; then
+    # Re-check manifest membership. The #616 mode gate derives the class
+    # from this same predicate (derive_routing_class), so this is
+    # belt-and-braces for any future caller whose class arrives another
+    # way (e.g. a recorded marker): the byte-compare source must be a
+    # real canonical/kit entry in THIS manifest — templated sources are
+    # excluded (#616, Codex finding 3509930343).
+    if ! path_matches_canonical_entry "$vp_path"; then
+      rm -f "$consumer_tmp"
+      echo "no canonical/kit entry in .mergepath-sync.yml covers $vp_path"
+      return 2
+    fi
+    # #616 finding 3510442268: compare against the COMMITTED HEAD bytes
+    # (git show), not the working-tree file — the tree-entry and
+    # upstream-evidence gates below read HEAD, and an uncommitted local
+    # edit cannot have propagated.
+    if ! src_tmp=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-src.XXXXXX"); then
+      rm -f "$consumer_tmp"
+      echo "mktemp failed for committed source content (TMPDIR unwritable or full?)"
+      return 2
+    fi
+    if ! committed_source_content "$vp_path" "$src_tmp"; then
+      rm -f "$consumer_tmp" "$src_tmp"
+      echo "canonical source $vp_path is missing from the committed mergepath HEAD (uncommitted working-tree files never count as propagation sources)"
+      return 2
+    fi
+    if cmp -s "$src_tmp" "$consumer_tmp"; then
+      rm -f "$consumer_tmp" "$src_tmp"
+      # #616 finding 3510170883: byte equality is necessary, not
+      # sufficient — the tree entry's mode/type must match too.
+      vte_rc=0
+      vte_msg=$(verify_consumer_tree_entry "$vp_path" "$vp_path") || vte_rc=$?
+      if [ "$vte_rc" -ne 0 ]; then
+        echo "$vte_msg"
+        return "$vte_rc"
+      fi
+      # #616 finding 3510170879: require an upstream fix commit newer
+      # than the finding's staleness floor before resolving.
+      if ! upstream_fix_evidence "$vp_path" "$vp_floor"; then
+        echo "byte-match without upstream-fix evidence: no commit in the local mergepath checkout touches $vp_path strictly after the finding floor (${vp_floor:-unknown}) — the mirrored source may still carry the flagged issue"
+        return 3
+      fi
+      echo "consumer content at $vp_path byte-matches the mergepath canonical source; propagation verified."
+      return 0
+    fi
+    rm -f "$consumer_tmp" "$src_tmp"
+    echo "consumer content at $vp_path does NOT byte-match the mergepath canonical source (drifted, or the upstream fix has not propagated)"
+    return 1
+  fi
+
+  # templated-render — consumer facts + source lookup, then the shared
+  # render engine.
+  if ! manifest_consumer_name_for_repo; then
+    rm -f "$consumer_tmp"
+    echo "cannot resolve a consumer name for $REPO in .mergepath-sync.yml (facts unavailable)"
+    return 2
+  fi
+  consumer_name="$MANIFEST_CONSUMER_NAME"
+  if ! mp_src=$(manifest_templated_source_for_dest "$vp_path" "$consumer_name"); then
+    rm -f "$consumer_tmp"
+    echo "no templated manifest entry maps dest $vp_path for consumer $consumer_name"
+    return 2
+  fi
+  # #616 finding 3510442268: render the COMMITTED HEAD template bytes
+  # (git show), not the working-tree file — same committed-state rule as
+  # the canonical arm; an uncommitted template edit cannot have
+  # propagated.
+  if ! src_tmp=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-src.XXXXXX"); then
+    rm -f "$consumer_tmp"
+    echo "mktemp failed for committed source content (TMPDIR unwritable or full?)"
+    return 2
+  fi
+  if ! committed_source_content "$mp_src" "$src_tmp"; then
+    rm -f "$consumer_tmp" "$src_tmp"
+    echo "templated source $mp_src is missing from the committed mergepath HEAD (uncommitted working-tree files never count as propagation sources)"
+    return 2
+  fi
+  if [ ! -r "$VP_FACTS_HELPER" ] || [ ! -r "$VP_TEMPLATE_LIB" ]; then
+    rm -f "$consumer_tmp" "$src_tmp"
+    echo "render libs missing (need scripts/lib/manifest-fact-helpers.sh + scripts/lib/template-substitution.sh)"
+    return 2
+  fi
+  # #616 finding 3510689518: the facts fed to the render must come from
+  # the COMMITTED manifest — the same committed state as the template
+  # bytes above — never the working-tree .mergepath-sync.yml, whose
+  # uncommitted fact edits cannot have propagated.
+  local manifest_snapshot
+  if ! manifest_snapshot=$(committed_manifest_file); then
+    rm -f "$consumer_tmp" "$src_tmp"
+    echo ".mergepath-sync.yml is missing from the committed mergepath HEAD (uncommitted manifest state never feeds the verification render)"
+    return 2
+  fi
+  if ! rendered=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-rendered.XXXXXX"); then
+    rm -f "$consumer_tmp" "$src_tmp"
+    echo "mktemp failed for render output (TMPDIR unwritable or full?)"
+    return 2
+  fi
+  if ! render_err=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-render-err.XXXXXX"); then
+    rm -f "$consumer_tmp" "$src_tmp" "$rendered"
+    echo "mktemp failed for render stderr (TMPDIR unwritable or full?)"
+    return 2
+  fi
+  render_rc=0
+  # Subshell render — identical shape to verify-propagation-pr.sh: facts
+  # exports stay contained, and `|| exit $?` propagates a fail-closed
+  # export rc (set -e is suppressed on the left of `||`; see #457).
+  (
+    # shellcheck source=lib/manifest-fact-helpers.sh
+    . "$VP_FACTS_HELPER" || exit 2
+    # shellcheck source=lib/template-substitution.sh
+    . "$VP_TEMPLATE_LIB" || exit 2
+    export_consumer_facts "$consumer_name" "$manifest_snapshot" || exit $?
+    # $src_tmp carries the COMMITTED HEAD bytes of $mp_src (#616
+    # finding 3510442268); render errors are re-labeled with the real
+    # source path in the wrapper message below.
+    template_substitution::render "$src_tmp"
+  ) > "$rendered" 2> "$render_err" || render_rc=$?
+  if [ "$render_rc" != "0" ]; then
+    if [ -s "$render_err" ]; then
+      sed 's/^/    /' "$render_err" >&2
+    fi
+    rm -f "$consumer_tmp" "$src_tmp" "$rendered" "$render_err"
+    echo "templated re-render failed for source $mp_src (consumer=$consumer_name, rc=$render_rc)"
+    return 2
+  fi
+  rm -f "$render_err" "$src_tmp"
+  if cmp -s "$rendered" "$consumer_tmp"; then
+    rm -f "$consumer_tmp" "$rendered"
+    # #616 finding 3510170883: the rendered dest must inherit the
+    # TEMPLATE SOURCE's committed mode (mode+type only — the render
+    # changes content by design), mirroring the templated arm of
+    # verify-propagation-pr.sh.
+    vte_rc=0
+    vte_msg=$(verify_consumer_tree_entry "$vp_path" "$mp_src") || vte_rc=$?
+    if [ "$vte_rc" -ne 0 ]; then
+      echo "$vte_msg"
+      return "$vte_rc"
+    fi
+    # #616 finding 3510170879: evidence gate on the TEMPLATE SOURCE —
+    # the mergepath path an upstream fix for a templated finding lands
+    # on. (A facts-only change in .mergepath-sync.yml does not count as
+    # evidence — conservative, per the documented bias.)
+    if ! upstream_fix_evidence "$mp_src" "$vp_floor"; then
+      echo "byte-match without upstream-fix evidence: no commit in the local mergepath checkout touches $mp_src strictly after the finding floor (${vp_floor:-unknown}) — the mirrored render may still carry the flagged issue"
+      return 3
+    fi
+    echo "consumer content at $vp_path byte-matches the re-rendered template $mp_src (consumer=$consumer_name); propagation verified."
+    return 0
+  fi
+  rm -f "$consumer_tmp" "$rendered"
+  echo "consumer content at $vp_path does NOT byte-match the re-rendered template $mp_src (consumer=$consumer_name)"
+  return 1
+}
 
 # derive_tag_class — given the thread JSON (one line of UNRESOLVED),
 # return one of the rollup's class strings on stdout.
@@ -1627,6 +2588,32 @@ SKIPPED_NOT_ACTIONED=0
 # (fail closed) rather than classified on a window that may be missing
 # the latest bot/reviewer re-raise. Counted into the exit-3 predicate.
 SKIPPED_COMMENTS_INCOMPLETE=0
+# #572 --resolve-verified-propagation skip counters, all in the exit-3
+# predicate:
+#   SKIPPED_NOT_PROPAGATION  the thread's class is not canonical-coverage /
+#                            templated-render — this mode only handles
+#                            routing-class threads (surface + actioned
+#                            classes have their own modes).
+#   SKIPPED_DRIFT            the byte-compare RAN and MISMATCHED — the
+#                            consumer content drifted or the upstream fix
+#                            has not propagated; left unresolved on purpose.
+#   SKIPPED_VERIFY_ERROR     the verification could not run (manifest entry
+#                            missing, compare-ref/PR-state resolution
+#                            failure, fetch/render failure, tree-entry
+#                            lookup failure, facts missing) — fail closed,
+#                            left unresolved.
+#   SKIPPED_NO_UPSTREAM_EVIDENCE
+#                            the bytes (and tree entry) matched but the
+#                            local mergepath checkout has no commit
+#                            touching the source strictly newer than the
+#                            finding's staleness floor (#616 finding
+#                            3510170879) — the consumer may be mirroring a
+#                            still-problematic source; fail closed, left
+#                            unresolved (stays deferred and resurfaces).
+SKIPPED_NOT_PROPAGATION=0
+SKIPPED_DRIFT=0
+SKIPPED_VERIFY_ERROR=0
+SKIPPED_NO_UPSTREAM_EVIDENCE=0
 WOULD_RESOLVE_COUNT=0
 FAILED_COUNT=0
 TAG_REPLY_POSTED=0
@@ -1670,13 +2657,20 @@ while IFS= read -r thread; do
   # the bot's last word) — so a later fix commit is recognized even when the
   # bot has not re-commented on the new HEAD.
   #
+  # --resolve-verified-propagation ALSO bypasses it (#572): its evidence is
+  # the consumer's content at the COMPARED REF (the PR's own head while the
+  # PR is open, the default branch once closed/merged — #616 finding
+  # 3510170875), not the bot comment's anchor commit, and its primary
+  # target population is backlog threads on long-merged sync PRs — where
+  # the PR-HEAD anchor proxy is meaningless.
+  #
   # Codex r1 on PR #172 caught that the previous check
   # `if [ -n "$COMMIT_OID" ] && [ "$COMMIT_OID" != "$HEAD_OID" ]`
   # treated EMPTY commit_oid as "matches HEAD" → bot threads with no
   # commit linkage in the GraphQL response would be force-resolved
   # silently. The safe default is the opposite: missing oid is
   # treated as stale.
-  if [ "$MODE" != "resolve-actioned" ] \
+  if [ "$MODE" != "resolve-actioned" ] && [ "$MODE" != "resolve-verified-propagation" ] \
      && { [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ] || [ "$COMMIT_OID" != "$HEAD_OID" ]; }; then
     if [ -z "$COMMIT_OID" ] || [ "$COMMIT_OID" = "null" ]; then
       reason="no commit linkage"
@@ -1733,9 +2727,124 @@ while IFS= read -r thread; do
     fi
   fi
 
+  # #572 --resolve-verified-propagation: gate the resolve on a byte-verified
+  # propagation match. The gate runs in dry-run too (all reads, no writes)
+  # so the would-resolve / would-skip preview is the real verdict — dry-run-
+  # first is the operating contract.
+  VERIFIED_RATIONALE=""
+  if [ "$MODE" = "resolve-verified-propagation" ]; then
+    # Same complete-thread precondition as --resolve-actioned (#573 item 2 /
+    # #614): never classify on a truncated comment window — a hidden
+    # re-raise or marker must not be invisible to the ladder. Fail closed.
+    if ! thread=$(complete_thread_comments "$thread"); then
+      echo "  SKIP (comment list incomplete — pagination failed; failing closed): [$AUTHOR] $PATH_"
+      echo "    $EXCERPT"
+      echo "    The thread has more comments than one window returns and the full"
+      echo "    re-fetch failed, so the classification inputs are untrustworthy."
+      echo "    Left unresolved; retry."
+      SKIPPED_COMMENTS_INCOMPLETE=$((SKIPPED_COMMENTS_INCOMPLETE + 1))
+      continue
+    fi
+    # Warm every cache in THIS shell before the classify/verify command-
+    # substitution subshells (same subshell-cache rule as the tag path; the
+    # subshells inherit warmed caches but cannot write back).
+    fetch_pr_tag_data
+    augment_pr_commits_with_sha
+    fetch_manifest_canonical_paths
+    fetch_manifest_templated_dests
+    fetch_consumer_default_branch || true
+    # Compare-ref resolution (#616 finding 3510170875) is cached here in
+    # the parent shell so every verification subshell inherits one
+    # PR-state read for the whole run; a failure stays cached and each
+    # verify fails closed on it.
+    resolve_consumer_compare_ref || true
+    manifest_consumer_name_for_repo || true
+    # Routing classification is a PURE PATH predicate (#616 finding
+    # 3509734391): derive_routing_class checks manifest membership /
+    # templated dests and IGNORES recorded surface markers, so a
+    # previously-deferred [mergepath-resolve: deferred-to-followup] tag on
+    # a sync finding never masks the routing check — resolving exactly
+    # those previously-deferred canonical findings once propagation lands
+    # IS this mode's main use case. Only canonical-coverage /
+    # templated-render paths are this mode's population; everything else
+    # skips here (surface threads on non-routed paths included).
+    thread_class=$(derive_routing_class "$thread")
+    case "$thread_class" in
+      canonical-coverage|templated-render) : ;;
+      *)
+        echo "  SKIP (not propagation-routed): [$AUTHOR] $PATH_"
+        echo "    $EXCERPT"
+        echo "    --resolve-verified-propagation handles only threads anchored on a"
+        echo "    manifest canonical/kit path or a templated dest for this consumer."
+        echo "    Use --resolve-actioned for fixed or rebutted feedback,"
+        echo "    --auto-resolve-bots for an explicit deferral."
+        SKIPPED_NOT_PROPAGATION=$((SKIPPED_NOT_PROPAGATION + 1))
+        continue ;;
+    esac
+    thread_class_computed=true
+    # Actioned-evidence upgrade (#616 finding 3509734396), mirroring the
+    # #575 auto-upgrade guard in --auto-resolve-bots: a routing-path
+    # thread that ALSO carries demonstrable action evidence — an agent fix
+    # commit touching the anchored file after the latest re-raise, or a
+    # substantive rebuttal (the same fail-closed GATE classification
+    # --resolve-actioned trusts) — is resolved under its truthful
+    # addressed-elsewhere / rebuttal-recorded tag, not blanket-tagged
+    # verified-propagation. The action evidence IS the resolution evidence
+    # for these (exactly what --resolve-actioned would resolve on), so the
+    # byte-compare is skipped; non-actioned threads fall through to it.
+    upgraded_class=$(derive_tag_class "$thread" skip-routing)
+    if class_is_actioned "$upgraded_class"; then
+      echo "  INFO: tag auto-upgraded verified-propagation → $upgraded_class for [$AUTHOR] $PATH_ (demonstrably actioned; #575)"
+      thread_class="$upgraded_class"
+      VERIFIED_RATIONALE=$(synth_rationale "$upgraded_class" "$thread")
+    else
+      vp_rc=0
+      # Staleness floor for the upstream-evidence gate (#616 finding
+      # 3510170879): the latest bot/reviewer re-raise, floored at the
+      # finding's createdAt — the same complete-thread floor the
+      # actioned machinery trusts (complete_thread_comments ran above).
+      vp_floor=$(latest_nonagent_created "$thread")
+      vp_msg=$(verify_propagation_content "$thread_class" "$PATH_" "$vp_floor") || vp_rc=$?
+      if [ "$vp_rc" -eq 1 ]; then
+        echo "  SKIP (propagation NOT verified — content drift): [$AUTHOR] $PATH_"
+        echo "    $vp_msg"
+        echo "    Left unresolved: the byte-compare is the resolution evidence and it"
+        echo "    did not match. Propagate the upstream fix (or fix it upstream), then"
+        echo "    retry."
+        SKIPPED_DRIFT=$((SKIPPED_DRIFT + 1))
+        continue
+      elif [ "$vp_rc" -eq 3 ]; then
+        echo "  SKIP (no upstream-fix evidence — failing closed): [$AUTHOR] $PATH_"
+        echo "    $vp_msg"
+        echo "    A byte-match alone only proves the consumer mirrors the CURRENT"
+        echo "    mergepath source — not that the upstream finding was ever fixed."
+        echo "    Left unresolved (stays deferred and resurfaces). Deliberate bias:"
+        echo "    an upstream fix that PRE-dates the finding also skips here;"
+        echo "    resolve manually with evidence in that case."
+        SKIPPED_NO_UPSTREAM_EVIDENCE=$((SKIPPED_NO_UPSTREAM_EVIDENCE + 1))
+        continue
+      elif [ "$vp_rc" -ne 0 ]; then
+        echo "  SKIP (propagation verification failed — failing closed): [$AUTHOR] $PATH_"
+        echo "    $vp_msg"
+        echo "    Left unresolved: a verification that cannot run never resolves."
+        SKIPPED_VERIFY_ERROR=$((SKIPPED_VERIFY_ERROR + 1))
+        continue
+      fi
+      # Byte-match — resolve with the verified-propagation tag; the
+      # verification message IS the tag rationale.
+      thread_class="verified-propagation"
+      VERIFIED_RATIONALE="$vp_msg"
+    fi
+  fi
+
   if $DRY_RUN; then
     echo "  WOULD RESOLVE [$AUTHOR] $PATH_"
     echo "    $EXCERPT"
+    if [ "$MODE" = "resolve-verified-propagation" ]; then
+      # thread_class is verified-propagation for a byte-verified thread,
+      # or the truthful actioned class after the #616 upgrade above.
+      echo "    → [mergepath-resolve: $thread_class] $VERIFIED_RATIONALE"
+    fi
     WOULD_RESOLVE_COUNT=$((WOULD_RESOLVE_COUNT + 1))
     continue
   fi
@@ -1755,6 +2864,36 @@ while IFS= read -r thread; do
     if $RATIONALE_FLAG_USED; then
       tag_class="deferred-to-followup"
       tag_rationale="$RATIONALE_OVERRIDE"
+      # #575 guard on the EXPLICIT-DEFERRAL override: --rationale is exactly
+      # how the #571 mis-marking happened — a blanket
+      # `--auto-resolve-bots --rationale` run over a thread set that included
+      # FIXED findings recorded them all as deferred-to-followup. The class
+      # is the machine-read disposition of record (the free-form text is
+      # human-facing), so when the thread is demonstrably ACTIONED — the
+      # same fail-closed evidence gate --resolve-actioned trusts derives
+      # addressed-elsewhere / rebuttal-recorded — upgrade the CLASS to the
+      # truthful value and keep the operator's rationale text. Auto-upgrade
+      # over warn-only is deliberate: the upgrade can never overclaim (it
+      # fires only on demonstrated evidence), while a warning leaves the
+      # mis-tag in place for every operator who misses the log line. A
+      # pagination-incomplete thread keeps the deferred class — action
+      # cannot be demonstrated on a truncated window (fail safe, #573).
+      fetch_pr_tag_data
+      augment_pr_commits_with_sha
+      if thread=$(complete_thread_comments "$thread"); then
+        upgraded_class=$(derive_tag_class "$thread" skip-routing)
+        if class_is_actioned "$upgraded_class"; then
+          echo "  INFO: tag auto-upgraded deferred-to-followup → $upgraded_class for [$AUTHOR] $PATH_ (demonstrably actioned; #575)"
+          tag_class="$upgraded_class"
+        fi
+      fi
+    elif [ "$MODE" = "resolve-verified-propagation" ]; then
+      # #572: the gate above already byte-verified the propagation (or
+      # upgraded the class to the truthful addressed-elsewhere /
+      # rebuttal-recorded on demonstrated action evidence, #616);
+      # thread_class + VERIFIED_RATIONALE carry the verdict of record.
+      tag_class="$thread_class"
+      tag_rationale="$VERIFIED_RATIONALE"
     else
       # Warm the tag-data cache (PR_FILES_CACHE / PR_COMMITS_CACHE +
       # the TAG_DATA_FETCHED guard) in THIS shell BEFORE the command-
@@ -1790,8 +2929,47 @@ while IFS= read -r thread; do
         # current-HEAD anchor (commentsLast), not on this classification.
         if thread=$(complete_thread_comments "$thread"); then
           thread_class=$(derive_tag_class "$thread")
+          # #575 guard on the auto-derived class: the TAG ladder can land on
+          # deferred-to-followup even when the thread was actually actioned —
+          # the concrete case is a stale recorded
+          # `[mergepath-resolve: deferred-to-followup]` marker (honored by
+          # the TAG path's step 0) sitting above a LATER fix commit or
+          # rebuttal. Re-derive with the GATE classification
+          # (--resolve-actioned's skip-routing path, which ignores markers
+          # and re-checks fresh evidence); if it proves action, upgrade the
+          # tag to the truthful class with an INFO line. A thread that is
+          # not demonstrably actioned keeps deferred-to-followup. See the
+          # header's --auto-resolve-bots entry for why auto-upgrade beats
+          # warn-only.
+          #
+          # #616 (Codex finding 3509930338): the ROUTING classes the ladder
+          # emits first — canonical-coverage / templated-render — get the
+          # same actioned re-check, and when NOT actioned they are recorded
+          # as deferred-to-followup, not the routing tag. This mode is THE
+          # tool for EXPLICIT DEFERRAL, and the daily rollup SKIPS routing
+          # classes — a routing tag here would bury a deliberate deferral so
+          # it never resurfaces, contrary to the #575 disposition contract.
+          # Routing says WHERE a fix belongs, not that one happened (#565);
+          # once propagation provably lands, --resolve-verified-propagation
+          # is the mode that closes these under a verified tag.
+          case "$thread_class" in
+            deferred-to-followup|canonical-coverage|templated-render)
+              orig_class="$thread_class"
+              upgraded_class=$(derive_tag_class "$thread" skip-routing)
+              if class_is_actioned "$upgraded_class"; then
+                echo "  INFO: tag auto-upgraded $orig_class → $upgraded_class for [$AUTHOR] $PATH_ (demonstrably actioned; #575)"
+                thread_class="$upgraded_class"
+              elif [ "$orig_class" != "deferred-to-followup" ]; then
+                echo "  INFO: routing class $orig_class recorded as deferred-to-followup for [$AUTHOR] $PATH_ (explicit deferral, not actioned; #616)"
+                thread_class="deferred-to-followup"
+              fi
+              ;;
+          esac
         else
           echo "  WARN: comment pagination incomplete for [$AUTHOR] $PATH_ — tagging deferred-to-followup (fail-safe)" >&2
+          # #575 guard intentionally NOT applied here: action cannot be
+          # demonstrated on a truncated comment window (the hidden tail may
+          # carry a re-raise), so the fail-safe deferred class stands.
           thread_class="deferred-to-followup"
         fi
         thread_class_computed=true
@@ -1841,7 +3019,7 @@ done < <(printf '%s\n' "$UNRESOLVED")
 
 echo ""
 if $DRY_RUN; then
-  echo "(dry-run; no threads modified) — would-resolve: $WOULD_RESOLVE_COUNT, skipped (human): $SKIPPED_HUMAN, skipped (stale-HEAD): $SKIPPED_STALE, skipped (not-actioned): $SKIPPED_NOT_ACTIONED, skipped (comments-incomplete): $SKIPPED_COMMENTS_INCOMPLETE"
+  echo "(dry-run; no threads modified) — would-resolve: $WOULD_RESOLVE_COUNT, skipped (human): $SKIPPED_HUMAN, skipped (stale-HEAD): $SKIPPED_STALE, skipped (not-actioned): $SKIPPED_NOT_ACTIONED, skipped (comments-incomplete): $SKIPPED_COMMENTS_INCOMPLETE, skipped (not-propagation): $SKIPPED_NOT_PROPAGATION, skipped (drift): $SKIPPED_DRIFT, skipped (verify-error): $SKIPPED_VERIFY_ERROR, skipped (no-upstream-evidence): $SKIPPED_NO_UPSTREAM_EVIDENCE"
   # Codex r2 on PR #172: dry-run previously exited 0 when only
   # current-HEAD bot threads remained (because dry-run does not mutate
   # them and they didn't increment SKIPPED_*). Callers would treat
@@ -1850,7 +3028,7 @@ if $DRY_RUN; then
   # human-skipped, or stale-skipped). The only exit-0 path through
   # auto-resolve-bots --dry-run is "no unresolved threads at all"
   # which is already short-circuited above (UNRESOLVED is empty).
-  if [ "$WOULD_RESOLVE_COUNT" -gt 0 ] || [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ] || [ "$SKIPPED_COMMENTS_INCOMPLETE" -gt 0 ]; then
+  if [ "$WOULD_RESOLVE_COUNT" -gt 0 ] || [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ] || [ "$SKIPPED_COMMENTS_INCOMPLETE" -gt 0 ] || [ "$SKIPPED_NOT_PROPAGATION" -gt 0 ] || [ "$SKIPPED_DRIFT" -gt 0 ] || [ "$SKIPPED_VERIFY_ERROR" -gt 0 ] || [ "$SKIPPED_NO_UPSTREAM_EVIDENCE" -gt 0 ]; then
     exit 3
   fi
   exit 0
@@ -1916,7 +3094,7 @@ if [ "${#RESOLVED_IDS[@]}" -gt 0 ]; then
   fi
 fi
 
-echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Skipped (not-actioned): $SKIPPED_NOT_ACTIONED  Skipped (comments-incomplete): $SKIPPED_COMMENTS_INCOMPLETE  Failed: $FAILED_COUNT  Readback-failed: $READBACK_FAILED"
+echo "Resolved: $RESOLVED_COUNT  Skipped (human): $SKIPPED_HUMAN  Skipped (stale-HEAD): $SKIPPED_STALE  Skipped (not-actioned): $SKIPPED_NOT_ACTIONED  Skipped (comments-incomplete): $SKIPPED_COMMENTS_INCOMPLETE  Skipped (not-propagation): $SKIPPED_NOT_PROPAGATION  Skipped (drift): $SKIPPED_DRIFT  Skipped (verify-error): $SKIPPED_VERIFY_ERROR  Skipped (no-upstream-evidence): $SKIPPED_NO_UPSTREAM_EVIDENCE  Failed: $FAILED_COUNT  Readback-failed: $READBACK_FAILED"
 if ! $NO_TAG_REPLY; then
   echo "Tag replies: posted=$TAG_REPLY_POSTED  failed=$TAG_REPLY_FAILED"
 fi
@@ -1926,9 +3104,12 @@ fi
 #   2 = mutation failure (transient: gh/network), a resolve mutation that
 #       did not return isResolved:true, OR a post-resolve readback that
 #       could not confirm isResolved:true (#564 — fail closed)
-#   3 = unresolved threads remain (human, stale-bot, not-actioned, or
-#       comments-incomplete — the #573 truncated-thread fail-closed skip)
-#       — PR still conversation-resolution-blocked; address and retry
+#   3 = unresolved threads remain (human, stale-bot, not-actioned,
+#       comments-incomplete — the #573 truncated-thread fail-closed skip —
+#       or the #572 skips: not-propagation-routed, drifted,
+#       verification-failed, or byte-matched without upstream-fix
+#       evidence, #616) — PR still conversation-resolution-blocked;
+#       address and retry
 #   0 = no unresolved threads on current HEAD
 # Explicit `if` (not `[ a ] && exit`): two OR-ed conditions, and an
 # `&& exit` chain would be ambiguous under set -e (see the SKIPPED block
@@ -1944,7 +3125,7 @@ fi
 # non-zero; whether that trips `set -e` depends on subtle list-tail
 # rules. The `if` form is unambiguous and matches the block above.
 # (CodeRabbit Major, #271/#272.)
-if [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ] || [ "$SKIPPED_COMMENTS_INCOMPLETE" -gt 0 ]; then
+if [ "$SKIPPED_HUMAN" -gt 0 ] || [ "$SKIPPED_STALE" -gt 0 ] || [ "$SKIPPED_NOT_ACTIONED" -gt 0 ] || [ "$SKIPPED_COMMENTS_INCOMPLETE" -gt 0 ] || [ "$SKIPPED_NOT_PROPAGATION" -gt 0 ] || [ "$SKIPPED_DRIFT" -gt 0 ] || [ "$SKIPPED_VERIFY_ERROR" -gt 0 ] || [ "$SKIPPED_NO_UPSTREAM_EVIDENCE" -gt 0 ]; then
   exit 3
 fi
 exit 0

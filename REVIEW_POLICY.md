@@ -416,27 +416,58 @@ that can change GitHub conversation state.
    feedback includes resolving the associated review thread, not just
    pushing a code commit** — a fix that leaves its thread open still
    blocks the conversation-resolution gate and still surfaces in the
-   weekly unresolved-feedback sweep. Two resolve paths:
-   - `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` resolves
-     **only** threads whose fix or rebuttal is demonstrable from the
-     current PR state — `addressed-elsewhere` (an agent commit touching the
-     anchored file, after the latest re-raise) or `rebuttal-recorded` (a
-     substantive agent rebuttal after the latest re-raise). Routing-only
-     classes (`canonical-coverage`, `templated-render`) are deliberately
+   weekly unresolved-feedback sweep. The two resolve paths are split by
+   **disposition** — each records a different `[mergepath-resolve:<class>]`
+   tag, and the daily rollup / weekly sweep read that tag as the
+   disposition of record, so pick the mode that matches what actually
+   happened to the feedback (#575):
+   - `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` is the tool
+     for **fixed or rebutted** feedback — the default on a PR you pushed
+     fixes to. It resolves **only** threads whose fix or rebuttal is
+     demonstrable from the current PR state, tagging the truthful classes —
+     `addressed-elsewhere` (an agent commit touching the anchored file,
+     after the latest re-raise) or `rebuttal-recorded` (a substantive agent
+     rebuttal after the latest re-raise). Routing-only classes
+     (`canonical-coverage`, `templated-render`) are deliberately
      **not** treated as actioned here: they indicate where a durable fix
      belongs, not that one happened, so a fresh finding on a canonical path
      is left unresolved rather than auto-resolved by routing alone. The gate
      evaluates action **independently of routing**, so a canonical/templated
      thread that *does* carry action evidence (a fix commit touching it, or
      a rebuttal) is still resolved. Every non-actioned thread is left for the
-     weekly sweep. Prefer this to mark genuinely-handled feedback resolved.
-   - `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots` resolves
-     **every** current-HEAD bot thread, which is what clears the
-     `required_conversation_resolution` gate to merge; it tags each
-     deferral with `[mergepath-resolve:<class>]` so the daily rollup
-     re-surfaces it.
+     weekly sweep.
+   - `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots` is the tool
+     for **explicit deferral** — current-HEAD bot threads deliberately left
+     unfixed on this PR because they are tracked elsewhere (the standard
+     case: canonical-coverage findings on sync mirrors, deferred to a
+     follow-up issue via `--rationale`). It resolves **every** current-HEAD
+     bot thread, which is what clears the `required_conversation_resolution`
+     gate to merge, and tags each thread `deferred-to-followup` so the daily
+     rollup re-surfaces it. It is **not** the tool for fixed or rebutted
+     findings — that mis-records them as deferred (#571). As a guard, a
+     thread that is demonstrably actioned (per the same evidence gate
+     `--resolve-actioned` uses) is auto-upgraded to its truthful
+     `addressed-elsewhere`/`rebuttal-recorded` tag with an INFO line.
+   - `scripts/resolve-pr-threads.sh <PR#> --resolve-verified-propagation`
+     is the tool for **verified canonical propagation** — routing-class
+     threads (`canonical-coverage`, `templated-render`) whose durable fix
+     already landed in mergepath and demonstrably reached this consumer.
+     It resolves a thread only when the consumer file at the compared
+     ref — the PR's own head while the PR is open (so a pre-merge run
+     never resolves over drift the PR itself carries), the
+     default-branch HEAD once it is closed/merged — byte-matches the
+     mergepath canonical source (or, for templated entries, the rendered
+     template output for that consumer), the consumer tree entry's
+     mode/type matches the source (chmod flip / symlink swap rejection),
+     and the mergepath source has a fix commit strictly newer than the
+     finding (upstream-fix evidence; a pre-dating fix skips
+     conservatively — resolve manually with evidence), tagging
+     `verified-propagation` (#572, #616). Any lookup, fetch,
+     or render failure is a fail-closed skip, never a resolve. A thread
+     with action evidence is auto-upgraded to its truthful actioned class
+     first (#575); unverifiable threads are left for the weekly sweep.
 
-   Either path runs an identity-checked `resolveReviewThread` followed by
+   Each path runs an identity-checked `resolveReviewThread` followed by
    a `reviewThreads`/`nodes(ids:)` readback confirming `isResolved: true`,
    and exits non-zero (fail closed) if any resolve cannot be confirmed.
    Then query `reviewThreads` again. For stale bot-authored threads whose
@@ -521,7 +552,7 @@ unaddressed required-tier findings (P0/P1 by default), or a fresh 👍 /
 
      - **Codex posts a review.** Always in `COMMENTED` state — the Codex GitHub App never uses `APPROVED` or `CHANGES_REQUESTED`. Findings appear as **inline comments on the diff** (`/pulls/{pr}/comments` endpoint), not in the top-level review body. Inline findings carry priority markers: `![P0 Badge]`, `![P1 Badge]`, `![P2 Badge]`, or `![P3 Badge]`.
      - **Codex reacts 👍 / `+1`** on the PR issue with no review body. This is Codex's no-findings clearance signal per the ChatGPT Codex Connector documentation.
-     - **Codex posts a summary issue comment** — "Codex Review: …" with a `Reviewed commit: <sha>` line — on the PR conversation (`issues/{pr}/comments`), NOT a review object. When that sha equals the current HEAD and there are no unaddressed required-tier (P0/P1 by default) inline findings on HEAD, the verdict is a clearance signal too. Check issue comments, not only review objects and reactions: Codex routes its verdict here, so a `pulls/{pr}/reviews`-only check can miss a completed re-review (#567). NB: the automated merge gate `scripts/codex-review-check.sh` currently recognizes only review objects + 👍 reactions for gate (c); extending it to honor the HEAD-anchored issue-comment verdict is tracked in #567, so until then do not treat an issue-comment-only Codex clearance as sufficient for the *automated* gate — a 👍 / review object or a Phase 4b substitute still carries gate (c).
+     - **Codex posts a summary issue comment** — "Codex Review: …" with a `Reviewed commit: <sha>` line — on the PR conversation (`issues/{pr}/comments`), NOT a review object. When that sha prefixes the current HEAD and there are no unaddressed required-tier (P0/P1 by default) inline findings on HEAD, the verdict is a clearance signal too. Check issue comments, not only review objects and reactions: Codex routes its verdict here, so a `pulls/{pr}/reviews`-only check can miss a completed re-review (#567). The automated merge gate `scripts/codex-review-check.sh` **honors** this HEAD-anchored issue-comment verdict for gate (b) branch 2 and gate (c) as of #600 (in addition to review objects and 👍 reactions): a `chatgpt-codex-connector[bot]` comment matching Codex's stable affirmative phrasing (`Didn't find any major issues`) whose `Reviewed commit: <sha>` **prefixes** the current HEAD, with zero unaddressed required-tier findings on HEAD, is accepted as clearance. It **fails closed** on a stale-HEAD, findings-bearing, changes-requested, or unrecognized verdict — so an ambiguous comment never clears the gate. Note: this issue-comment verdict is a **merge-gate** clearance signal; `codex-review-request.sh`'s automated poll does **not** yet key off it (it scans review objects and reactions), so a verdict-only Codex response advances via the merge gate rather than terminating the request poll early — teaching the poller to recognize it is tracked in #609.
      - **Timeout.** No review and no reaction within `codex.review_timeout_seconds` (default: 600s / 10 min). The script exits with code `4` (`FALLBACK_REQUIRED`).
 
 13a. If Codex posted inline findings, the agent dispositions each finding in a **`required`** tier by either:
@@ -550,7 +581,7 @@ unaddressed required-tier findings (P0/P1 by default), or a fresh 👍 /
 
 15a. The loop continues until one of the following terminates it:
 
-     - **Clearance (happy path).** Codex posts a review with no unaddressed **`required`-tier** inline findings (P0/P1 by default; see [§ Feedback Disposition Policy](#feedback-disposition-policy)) on the current HEAD, OR reacts 👍 on or after the current HEAD commit. Proceed to step 16a.
+     - **Clearance (happy path).** Codex posts a review with no unaddressed **`required`-tier** inline findings (P0/P1 by default; see [§ Feedback Disposition Policy](#feedback-disposition-policy)) on the current HEAD, OR reacts 👍 on or after the current HEAD commit, OR posts a HEAD-anchored affirmative issue-comment verdict (`Didn't find any major issues` + a `Reviewed commit: <sha>` line whose sha prefixes HEAD) with no unaddressed required-tier findings on HEAD (#600/#567). Proceed to step 16a. **Note on a verdict-only response:** the issue-comment verdict is a **merge-gate** clearance signal — `codex-review-check.sh` (step 16a) honors it as of #600 — but `codex-review-request.sh`'s poll does **not** yet key off it (it scans reviews/reactions; see step 12a). A verdict-only Codex response is therefore recognized by the merge-gate check, not by the request loop; teaching the poller to recognize it (so the loop terminates on it rather than reaching its timeout) is tracked in #609.
      - **Disagreement (escalate).** Codex re-flags the same finding after the agent posted a rebuttal. This is "repeat-after-rebuttal." See [Disagreements and Tiebreaking](#disagreements-and-tiebreaking).
      - **Runaway (escalate).** The round counter exceeds `codex.max_review_rounds` (default: 2). The 3rd round trips this guard. See [Disagreements and Tiebreaking](#disagreements-and-tiebreaking).
      - **Timeout (fall back).** `codex-review-request.sh` exits with code `4` (`FALLBACK_REQUIRED`) for the current round. The agent falls back to Phase 4b. There is no "second timeout" escalation — a single timeout already routes to human mediation via the 4b handoff.
@@ -560,8 +591,8 @@ unaddressed required-tier findings (P0/P1 by default), or a fresh 👍 /
      - `gh pr checks` reports all required CI checks green
      - **Gate (b)** — one of:
        - **Branch 1 (cross-agent):** a reviewer identity from `available_reviewers` has posted an `APPROVED` review (Phase 2 internal self-peer review by a DIFFERENT agent than the author)
-       - **Branch 2 (same-agent fallback, #170):** when `codex.enabled: true`, the PR's `Authoring-Agent:` matches an entry in `available_reviewers` AND `chatgpt-codex-connector[bot]` has a fresh 👍 reaction on the PR issue (timestamped at-or-after the same `REACTION_THRESHOLD` gate (c) uses). This is the normal path for single-agent sessions where the no-self-approve rule prohibits the author's reviewer identity from approving — Codex's external review is the cross-agent signal that substitutes for an APPROVED state.
-     - **Gate (c)** — when `codex.enabled: true`, Codex has signaled clearance on the current HEAD via one of the two forms in step 12a, OR a Phase 4b substitute clearance has landed (an `APPROVED` review on the current HEAD from a non-author identity in `available_reviewers`). The Phase 4b substitute is the merge gate's understanding of Phase 4b clearance — without it, a PR that clears via Phase 4b would leave gate (c) failing forever and the auto-clear workflow would not remove `needs-external-review`. When `codex.enabled: false`, `scripts/codex-review-check.sh` ignores Codex bot reviews/reactions and gate (c) can clear only through the Phase 4b substitute path. Toggle via `codex.allow_phase_4b_substitute: true|false` in `.github/review-policy.yml` (default `true`; #218).
+       - **Branch 2 (same-agent fallback, #170):** when `codex.enabled: true`, the PR's `Authoring-Agent:` matches an entry in `available_reviewers` AND `chatgpt-codex-connector[bot]` has EITHER a fresh 👍 reaction on the PR issue (timestamped at-or-after the same `REACTION_THRESHOLD` gate (c) uses) OR a HEAD-anchored affirmative issue-comment verdict (`Reviewed commit` prefixes HEAD, so no time-window is needed; #600). This is the normal path for single-agent sessions where the no-self-approve rule prohibits the author's reviewer identity from approving — Codex's external review is the cross-agent signal that substitutes for an APPROVED state. The verdict-comment branch matters because the 👍 reaction expires and Codex does not reliably re-post it on a re-review.
+     - **Gate (c)** — when `codex.enabled: true`, Codex has signaled clearance on the current HEAD via one of the three forms in step 12a (COMMENTED review with no unaddressed required-tier findings, a fresh 👍 reaction, or a HEAD-anchored affirmative issue-comment verdict with no unaddressed required-tier findings; #600), OR a Phase 4b substitute clearance has landed (an `APPROVED` review on the current HEAD from a non-author identity in `available_reviewers`). The Phase 4b substitute is the merge gate's understanding of Phase 4b clearance — without it, a PR that clears via Phase 4b would leave gate (c) failing forever and the auto-clear workflow would not remove `needs-external-review`. When `codex.enabled: false`, `scripts/codex-review-check.sh` ignores Codex bot reviews/reactions and gate (c) can clear only through the Phase 4b substitute path. Toggle via `codex.allow_phase_4b_substitute: true|false` in `.github/review-policy.yml` (default `true`; #218).
 
      **The merge gate must never require an `APPROVED` review state from `chatgpt-codex-connector[bot]` — the app does not emit that state.** This point is load-bearing; a merge gate that looks for Codex APPROVED will never be satisfied and the Phase 4a happy path will be unreachable.
 

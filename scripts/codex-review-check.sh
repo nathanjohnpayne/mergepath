@@ -27,12 +27,23 @@
 #
 #   (c) Codex (when codex.enabled=true) or a Phase 4b substitute
 #       reviewer has cleared on or after the current HEAD commit via
-#       one of three signals:
+#       one of four signals:
 #
 #         - A COMMENTED review from the Codex bot on the current HEAD
 #           with NO unaddressed P0/P1 inline findings, OR
 #         - A +1 / 👍 reaction from the Codex bot on the PR issue
 #           with created_at >= current HEAD committer date, OR
+#         - **Issue-comment verdict (#600/#567):** a Codex-bot PR issue
+#           comment carrying its stable affirmative verdict phrasing
+#           ("Didn't find any major issues") AND a `Reviewed commit:
+#           <sha>` line whose sha prefixes the current HEAD_SHA
+#           (HEAD-anchored), with NO unaddressed P0/P1 inline findings
+#           on HEAD. Codex routes its verdict here rather than to a
+#           review object, and its 👍 reaction expires after
+#           `reaction_freshness_window_seconds`, so a genuinely-clean
+#           clearance can exist only as this comment. Fail-closed: a
+#           stale-HEAD, findings-bearing, changes-requested, or
+#           unrecognized verdict does not match. OR
 #         - **Phase 4b substitute (#218):** an APPROVED review on the
 #           current HEAD (`commit_id == HEAD_SHA`) from a non-author
 #           identity in `available_reviewers`, gated on
@@ -740,6 +751,91 @@ log "gate (a): CI is green (Label Gate failure, if present, is expected during P
 
 fi  # end REQUIRE_CI_GREEN
 
+# --- Codex issue-comment verdict signal (#600 / #567) ----------------------
+#
+# Codex posts its review verdict as a PR ISSUE COMMENT
+# (issues/{pr}/comments), e.g. "Codex Review: Didn't find any major issues.
+# Swish!" followed by a "**Reviewed commit:** <sha>" line — NOT always a
+# review object or a 👍 reaction (#567). The 👍 reaction additionally
+# EXPIRES after reaction_freshness_window_seconds and Codex does not
+# reliably re-post it on a re-review, so a genuinely-clean Codex clearance
+# can manifest purely as this issue-comment verdict. Recognize a
+# HEAD-anchored AFFIRMATIVE verdict as a clearance signal for gate (b)
+# branch 2 and gate (c) (#600); this ADDS to — never replaces — the
+# existing review-object and 👍 paths.
+#
+# Fail-closed matching — a comment qualifies as CODEX_HEAD_VERDICT_TIME
+# ONLY when ALL hold:
+#   1. author == BOT_LOGIN (the Codex connector bot);
+#   2. body matches Codex's STABLE affirmative phrasing
+#      ("Didn't find any major issues") — a structured shape, not
+#      open-ended NLP;
+#   3. body carries a `Reviewed commit: <sha>` line whose <sha> is a
+#      prefix of the current HEAD_SHA (HEAD-anchored; Codex abbreviates
+#      the sha, so match by prefix, not equality).
+# A findings-bearing verdict, a changes-requested verdict, a stale-HEAD
+# verdict (Reviewed commit != HEAD), or unrecognized text does NOT match —
+# the signal stays empty and the gate falls through to its other
+# (fail-closed) paths. Gate (c) additionally cross-checks that there are
+# zero unaddressed P0/P1 inline findings on HEAD before honoring it, so a
+# verdict comment can never override a live required-tier finding.
+#
+# Only a Codex-bot signal, so compute it only when codex.enabled=true;
+# leaves disabled repos byte-identical in behavior.
+CODEX_HEAD_VERDICT_TIME=""
+CODEX_HEAD_VERDICT_ANY_TIME=""
+if [ "$CODEX_ENABLED" = "true" ]; then
+  ISSUE_COMMENTS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
+  # Select the LATEST HEAD-anchored Codex verdict comment FIRST (any
+  # disposition), THEN decide whether that latest one is affirmative. Filtering
+  # to affirmative-only BEFORE taking max() would let an older clean "Didn't
+  # find any major issues" keep the signal non-empty even when a NEWER
+  # "Codex Review: Found …" / changes-requested verdict for the same HEAD was
+  # posted after it — a false clear (Codex P1 on #608). A "HEAD-anchored
+  # verdict" is any Codex-bot comment carrying a `Reviewed commit: <sha>` line
+  # whose sha prefixes HEAD; keeping the non-affirmative timestamp too lets the
+  # Phase 4b substitute freshness guard reject a stale approval over a newer
+  # negative verdict (Codex P2 on #608).
+  CODEX_VERDICT_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
+    --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
+    ($sha | ascii_downcase) as $head
+    | [ .[]
+        | select(.user.login == $bot)
+        | . as $c
+        # HEAD anchor — extract every "Reviewed commit: <sha>" hex token
+        # (lowercased; tolerate ":", "**", backticks, whitespace between the
+        # label and the sha) and require at least one to prefix HEAD. This
+        # keeps verdicts of ANY disposition so latest-wins can see a newer
+        # negative verdict.
+        | ( [ $c.body
+              | ascii_downcase
+              | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
+              | .[0]
+            ] ) as $shas
+        | select( ($shas | length) > 0
+                  and ($shas | any(. as $s | $head | startswith($s))) )
+        # affirmative ONLY when the Codex verdict HEADER line is the clean
+        # verdict — anchored to a line starting with "codex review:" then the
+        # no-major-issues phrase (multiline, case-insensitive; .? tolerates a
+        # straight, absent, or typographic apostrophe). Matching the phrase
+        # ANYWHERE would let a NEGATIVE or unrecognized verdict that QUOTES
+        # prior affirmative text (e.g. a blockquote of an earlier clean
+        # verdict) read as affirmative and break fail-closed (CodeRabbit Major
+        # on #608). Real Codex verdicts always lead with that header line.
+        | { created_at: .created_at,
+            affirmative: (.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")) }
+      ]
+    | max_by(.created_at) // null
+  ')
+  CODEX_HEAD_VERDICT_ANY_TIME=$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "" else .created_at end')
+  if [ "$(echo "$CODEX_VERDICT_JSON" | jq -r 'if . == null then "false" else (.affirmative | tostring) end')" = "true" ]; then
+    CODEX_HEAD_VERDICT_TIME="$CODEX_HEAD_VERDICT_ANY_TIME"
+    log "codex verdict: latest HEAD-anchored verdict @ $CODEX_HEAD_VERDICT_TIME is AFFIRMATIVE (Reviewed commit prefixes $HEAD_SHA)"
+  elif [ -n "$CODEX_HEAD_VERDICT_ANY_TIME" ]; then
+    log "codex verdict: latest HEAD-anchored verdict @ $CODEX_HEAD_VERDICT_ANY_TIME is NON-affirmative — not a clearance signal (fail closed); carried into the Phase 4b freshness guard"
+  fi
+fi
+
 # --- gate (b): reviewer identity approval ----------------------------------
 
 log "gate (b): checking for latest-state APPROVED review from a reviewer identity"
@@ -848,6 +944,18 @@ if [ -z "$APPROVING_REVIEWER" ]; then
     if [ -n "$GATE_B_THUMBS_UP" ]; then
       log "gate (b): same-agent + Codex 👍 @ $GATE_B_THUMBS_UP (≥ threshold $REACTION_THRESHOLD) — branch 2 cleared"
       APPROVING_REVIEWER="(branch 2: same-agent + Codex 👍)"
+    elif [ -n "$CODEX_HEAD_VERDICT_TIME" ]; then
+      # #600: the 👍 reaction expires after reaction_freshness_window_seconds
+      # and Codex does not reliably re-post it on a re-review, but its
+      # HEAD-anchored affirmative issue-comment verdict ("Didn't find any
+      # major issues" + "Reviewed commit: <HEAD>") is an equally strong
+      # same-agent cross-review signal — and, being HEAD-anchored by the
+      # Reviewed-commit sha, needs no time-window freshness check. Accept it
+      # as a branch-2 clearance too. (gate (c) still enforces zero
+      # unaddressed P0/P1 on HEAD, so this only substitutes for the reviewer
+      # cross-check, not the findings check.)
+      log "gate (b): same-agent + Codex HEAD-anchored verdict comment @ $CODEX_HEAD_VERDICT_TIME — branch 2 cleared (#600)"
+      APPROVING_REVIEWER="(branch 2: same-agent + Codex verdict comment)"
     fi
   fi
 
@@ -986,49 +1094,63 @@ LATEST_THUMBS_UP_TIME=$(echo "$REACTIONS_JSON" | jq -r \
 # Latest Codex review submission time on HEAD (empty if none).
 CODEX_REVIEW_TIME=$(echo "$CODEX_REVIEW" | jq -r 'if . == null then "" else .submitted_at end')
 
-# Decide clearance using the LATEST Codex signal, not whichever signal
-# the script happens to check first. See #64 Codex P1 finding ("Reject
-# stale thumbs-up when newer Codex findings exist").
+# Decide clearance using the LATEST Codex signal on HEAD among THREE signal
+# types — 👍 reaction, COMMENTED review, and issue-comment verdict — not
+# whichever the script checks first (#64, extended for the verdict in
+# #600/#608). Codex emits one signal per pass but can accumulate several on the
+# same HEAD across rounds; the newest wins:
 #
-# Semantics: Codex sends either a review OR a 👍 reaction per pass, but
-# on a PR with multiple rounds on the same HEAD it can end up with both
-# historical review comments AND a reaction. The LATEST one wins:
+#   - 👍 reaction: Codex reacts 👍 only when it has no suggestions → affirmative,
+#     clears (a newer 👍 overrides an earlier review's findings).
+#   - COMMENTED review: clears iff no unaddressed P0/P1 on HEAD.
+#   - issue-comment verdict: clears iff the latest HEAD-anchored verdict is
+#     AFFIRMATIVE (CODEX_HEAD_VERDICT_TIME non-empty) AND no unaddressed P0/P1.
+#     A NON-affirmative latest verdict fails closed.
 #
-#   - If Codex's most recent signal is a review, inspect its P0/P1
-#     findings. Zero findings → clear. Any findings → block.
-#   - If Codex's most recent signal is a 👍 reaction, clear. Codex only
-#     reacts 👍 when it has no suggestions, so a newer 👍 overrides any
-#     earlier review's findings.
-#   - If both timestamps exist, use max() to pick the latest.
-#   - If neither exists, block.
-#
-# All review-side analysis still uses the latest review's
-# pull_request_review_id to scope findings (addressed in round 1's
-# finding 2), so an older review's stale comments are never counted.
+# #608 P1: the verdict MUST participate in latest-signal-wins, not run as a
+# fallback after CLEARED is set — otherwise an older clean 👍/review clears the
+# gate even though Codex re-flagged issues in a NEWER negative verdict. Pick the
+# newest signal by timestamp; ties resolve to the most authoritative disposition
+# (verdict > review > 👍, via iteration order + replace-on-tie), so an ambiguous
+# same-second tie fails closed when the verdict is negative. All review-side
+# P0/P1 analysis still scopes to the latest review's pull_request_review_id
+# (round-1 finding 2), so stale comments never count.
+LATEST_SIGNAL_KIND=""
+LATEST_SIGNAL_TIME=""
+for __sig in "thumbs|$LATEST_THUMBS_UP_TIME" "review|$CODEX_REVIEW_TIME" "verdict|$CODEX_HEAD_VERDICT_ANY_TIME"; do
+  __k=${__sig%%|*}
+  __t=${__sig#*|}
+  [ -n "$__t" ] || continue
+  # Replace on strictly-newer OR on an equal timestamp: iterating thumbs →
+  # review → verdict means the last one at the max time wins the tie, giving
+  # priority verdict > review > 👍.
+  if [ -z "$LATEST_SIGNAL_TIME" ] || [[ "$__t" > "$LATEST_SIGNAL_TIME" ]] \
+     || [ "$__t" = "$LATEST_SIGNAL_TIME" ]; then
+    LATEST_SIGNAL_TIME="$__t"
+    LATEST_SIGNAL_KIND="$__k"
+  fi
+done
 
-if [ -n "$LATEST_THUMBS_UP_TIME" ] && [ -n "$CODEX_REVIEW_TIME" ]; then
-  # Both signals present on HEAD — compare timestamps. ISO 8601 sorts
-  # chronologically under lexicographic string comparison.
-  if [[ "$LATEST_THUMBS_UP_TIME" > "$CODEX_REVIEW_TIME" ]]; then
+case "$LATEST_SIGNAL_KIND" in
+  thumbs)
     CLEARED=true
-    CLEARANCE_REASON="latest signal is 👍 reaction @ $LATEST_THUMBS_UP_TIME (newer than review @ $CODEX_REVIEW_TIME)"
-  else
+    CLEARANCE_REASON="latest Codex signal is 👍 reaction @ $LATEST_SIGNAL_TIME (newest of 👍/review/verdict on HEAD; on or after reaction threshold $REACTION_THRESHOLD)"
+    ;;
+  review)
     if [ "$UNADDRESSED_COUNT" -eq 0 ]; then
       CLEARED=true
-      CLEARANCE_REASON="latest signal is COMMENTED review @ $CODEX_REVIEW_TIME on $HEAD_SHA with no unaddressed P0/P1 findings (newer than 👍 @ $LATEST_THUMBS_UP_TIME)"
+      CLEARANCE_REASON="latest Codex signal is COMMENTED review @ $LATEST_SIGNAL_TIME on $HEAD_SHA with no unaddressed P0/P1 findings"
     fi
-  fi
-elif [ -n "$LATEST_THUMBS_UP_TIME" ]; then
-  # Only a qualifying reaction, no review on HEAD.
-  CLEARED=true
-  CLEARANCE_REASON="👍 reaction from $BOT_LOGIN @ $LATEST_THUMBS_UP_TIME (on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)"
-elif [ -n "$CODEX_REVIEW_TIME" ]; then
-  # Only a review on HEAD, no qualifying reaction.
-  if [ "$UNADDRESSED_COUNT" -eq 0 ]; then
-    CLEARED=true
-    CLEARANCE_REASON="COMMENTED review from $BOT_LOGIN @ $CODEX_REVIEW_TIME on $HEAD_SHA with no unaddressed P0/P1 findings"
-  fi
-fi
+    ;;
+  verdict)
+    if [ -n "$CODEX_HEAD_VERDICT_TIME" ] && [ "$UNADDRESSED_COUNT" -eq 0 ]; then
+      CLEARED=true
+      CLEARANCE_REASON="latest Codex signal is a HEAD-anchored AFFIRMATIVE verdict comment @ $LATEST_SIGNAL_TIME (Reviewed commit prefixes $HEAD_SHA; no unaddressed P0/P1) (#600)"
+    else
+      log "gate (c): latest Codex signal is a non-affirmative or findings-bearing verdict comment @ $LATEST_SIGNAL_TIME — fail closed, does not clear (#608 P1)"
+    fi
+    ;;
+esac
 
 else
   log "gate (c): codex.enabled=false — ignoring Codex bot review/reaction signals; requiring Phase 4b substitute clearance when allowed"
@@ -1110,6 +1232,15 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
     LATEST_CODEX_SIGNAL_TIME="$LATEST_THUMBS_UP_TIME"
     if [ -n "$CODEX_REVIEW_TIME" ] && { [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || [[ "$CODEX_REVIEW_TIME" > "$LATEST_CODEX_SIGNAL_TIME" ]]; }; then
       LATEST_CODEX_SIGNAL_TIME="$CODEX_REVIEW_TIME"
+    fi
+    # #608 P2: a HEAD-anchored Codex verdict COMMENT (affirmative OR not) is
+    # also a Codex signal on HEAD. Fold its timestamp in so a stale Phase 4b
+    # APPROVED cannot clear over a NEWER negative verdict comment — the
+    # affirmative-only CODEX_HEAD_VERDICT_TIME would drop a newer negative
+    # verdict and let the stale approval through. CODEX_HEAD_VERDICT_ANY_TIME
+    # is the latest HEAD-anchored verdict regardless of disposition.
+    if [ -n "$CODEX_HEAD_VERDICT_ANY_TIME" ] && { [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || [[ "$CODEX_HEAD_VERDICT_ANY_TIME" > "$LATEST_CODEX_SIGNAL_TIME" ]]; }; then
+      LATEST_CODEX_SIGNAL_TIME="$CODEX_HEAD_VERDICT_ANY_TIME"
     fi
     if [ -z "$LATEST_CODEX_SIGNAL_TIME" ] || [[ "$PHASE_4B_TIME" > "$LATEST_CODEX_SIGNAL_TIME" ]]; then
       CLEARED=true
