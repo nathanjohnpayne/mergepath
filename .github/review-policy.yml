@@ -663,9 +663,10 @@ phase_4b_automation:
   # Renderer: scripts/phase-4b/accounting.sh; record schema:
   # scripts/phase-4b/accounting.schema.json.
   accounting:
-    # Sub-toggle. Default TRUE — but only reachable when the parent
-    # `enabled: true` above flips, so shipping this block changes nothing
-    # today. Set false to keep automation while posting the plain summary.
+    # Sub-toggle. Default TRUE — and LIVE since the parent flipped to
+    # enabled: true (#628, 2026-07-02): every automated APPROVED now
+    # carries the accounting block + embedded record. Set false to keep
+    # automation while posting the plain summary.
     # NB: the parent-block reader (lib.sh p4b_automation_field) is
     # nesting-aware (#615 Codex round 3), so this nested `enabled` can
     # never be read as the parent master switch even when a downstream
