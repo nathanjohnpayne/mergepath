@@ -1022,6 +1022,24 @@ if printf '%s' "$agg" | jq -e '
     and .automated_attempts == 4' >/dev/null; then
   pass "a record missing a required totals sub-key is dropped from aggregation (#615 round 5)"
 else fail "incomplete-totals rejection: $agg"; fi
+# #615 Codex round 10 (fails pre-fix): key-present but wrong-TYPED values
+# passed the required-key mirror — totals.tokens_total: "oops" flowed through
+# addall into running_totals.tokens_total under a github-derived label,
+# publishing corrupt cumulative data. A record whose aggregation-read fields
+# do not match the schema types is dropped and counted like a missing key.
+BADTYPE="$(printf '%s' "$GOLDEN" | jq -c '.totals.tokens_total = "oops"')"
+agg="$(printf '%s\n%s\n' "$GOLDEN" "$BADTYPE" | p4b_acct_aggregate_running_totals github-derived)"
+if printf '%s' "$agg" | jq -e '
+    .records == 1 and .records_dropped_nonconformant == 1
+    and .tokens_total == 177204' >/dev/null; then
+  pass "a wrong-typed totals field (tokens_total: string) drops the record instead of publishing corrupt running totals (#615 round 10)"
+else fail "type-invalid record accepted: $agg"; fi
+# Fractional counts are schema-invalid integers and likewise dropped.
+BADFRAC="$(printf '%s' "$GOLDEN" | jq -c '.totals.adapter_invocations = 2.5')"
+agg="$(printf '%s\n%s\n' "$GOLDEN" "$BADFRAC" | p4b_acct_aggregate_running_totals github-derived)"
+printf '%s' "$agg" | jq -e '.records == 1 and .records_dropped_nonconformant == 1' >/dev/null \
+  && pass "a fractional adapter_invocations count is dropped (schema integer mirror) (#615 round 10)" \
+  || fail "fractional-count record accepted: $agg"
 # A fully conformant aggregation reports zero drops (diagnostics honesty).
 agg="$(printf '%s\n' "$GOLDEN" | p4b_acct_aggregate_running_totals github-derived)"
 printf '%s' "$agg" | jq -e '.records_dropped_nonconformant == 0' >/dev/null \
@@ -1703,6 +1721,45 @@ if (
 else fail "mismatch rotation (ledger=$(cat "$WORK/state-mismatch-rotate/phase-4b-ledger.jsonl" 2>/dev/null), live=$(jq -s length "$WORK/state-mismatch-rotate/phase-4b-loops/"*.jsonl 2>/dev/null))"; fi
 
 # ===========================================================================
+echo "accounting.sh — p4b_acct_safe_truncate (marker-safe body cut)"
+# ===========================================================================
+# #615 round 10, Codex P3 (fails pre-fix as a raw byte slice): a cut landing
+# between the `<!-- p4b-accounting:v1` comment-open and its closing `-->`
+# leaves an unterminated HTML comment that hides the appended truncation
+# notice. The helper backs such a cut off to just before the marker; cuts
+# before the marker or past the terminated comment stay plain byte slices.
+PRE_T='0123456789ABCDEF'                          # 16 bytes, all ASCII
+CMT_T='<!-- p4b-accounting:v1 {"x":1} -->'
+TAIL_T='-tail-tail-tail'
+BLK_T="${PRE_T}${CMT_T}${TAIL_T}"
+CMT_END_T=$(( ${#PRE_T} + ${#CMT_T} ))
+out_t="$(p4b_acct_safe_truncate "$BLK_T" 10)"
+[ "$out_t" = "0123456789" ] \
+  && pass "a cut before the marker is a plain byte slice" \
+  || fail "pre-marker cut wrong: '$out_t'"
+out_t="$(p4b_acct_safe_truncate "$BLK_T" $(( ${#PRE_T} + 5 )))"
+[ "$out_t" = "$PRE_T" ] \
+  && pass "a cut inside the embedded record comment backs off to just before the marker (notice stays visible) (#615 round 10)" \
+  || fail "inside-comment cut did not back off: '$out_t'"
+out_t="$(p4b_acct_safe_truncate "$BLK_T" $(( CMT_END_T + 3 )))"
+if [ "$out_t" = "${BLK_T:0:$(( CMT_END_T + 3 ))}" ] && case "$out_t" in *'-->'*) true ;; *) false ;; esac; then
+  pass "a cut past the terminated comment keeps the whole record (plain slice, comment intact)"
+else fail "post-comment cut wrong: '$out_t'"; fi
+out_t="$(p4b_acct_safe_truncate "$BLK_T" $(( ${#BLK_T} + 50 )))"
+[ "$out_t" = "$BLK_T" ] \
+  && pass "a budget past the block end returns the whole block unchanged" \
+  || fail "over-length cut wrong"
+out_t="$(p4b_acct_safe_truncate "no marker here at all" 7)"
+[ "$out_t" = "no mark" ] \
+  && pass "a block with no embedded record truncates as a plain byte slice" \
+  || fail "no-marker cut wrong: '$out_t'"
+BLK_U="${PRE_T}<!-- p4b-accounting:v1 unterminated"
+out_t="$(p4b_acct_safe_truncate "$BLK_U" $(( ${#BLK_U} - 2 )))"
+[ "$out_t" = "$PRE_T" ] \
+  && pass "a defensive cut into an unterminated comment backs off to before the marker" \
+  || fail "unterminated-comment cut wrong: '$out_t'"
+
+# ===========================================================================
 echo "orchestrator — accounting hook (fail-open, exit codes preserved)"
 # ===========================================================================
 run_orch() { # run_orch <state-dir> <policy> <codex-fake> <pr> [extra env as VAR=VAL...] -- [extra args...]
@@ -1838,6 +1895,7 @@ if [ "$rc" = 0 ] \
    && printf '%s' "$out" | jq -e '.verdict == "APPROVED" and .review_posted == true' >/dev/null \
    && grep -q '^\*\*Automated Phase 4b review\*\*' "$BODY_A3C" \
    && grep -qF 'accounting truncated' "$BODY_A3C" \
+   && { ! grep -qF '<!-- p4b-accounting:v1' "$BODY_A3C" || grep -qF -- '-->' "$BODY_A3C"; } \
    && [ "${A3C_BYTES:-0}" -le 3000 ]; then
   pass "a large (>64KB) accounting block truncates via a pure-bash byte slice (no SIGPIPE abort) and the valid APPROVED still posts (finding 1)"
 else fail "large-block SIGPIPE-safe truncation (rc=$rc, body_bytes=${A3C_BYTES:-?} cap=3000, posted=$(printf '%s' "$out" | jq -r '.review_posted // "?"' 2>/dev/null), notice=$(grep -qF 'accounting truncated' "$BODY_A3C" 2>/dev/null && echo yes || echo no))"; fi
@@ -2013,17 +2071,25 @@ LOG_C4="$(P4B_ACCT_STATE_DIR="$STATE_C4" REPO="o/r" PR=307 p4b_acct_hook_loop_lo
 mkdir -p "$(dirname "$LOG_C4")"
 jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false zzz999)" \
   '{schema:"p4b-loop-log/v1", started_at_epoch:null, loop:$loop, details:[]}' > "$LOG_C4"
-chmod 444 "$LOG_C4"
-set +e
-out="$(run_orch "$STATE_C4" "$POLICY_ON" fake-codex-approve 307 P4B_WRAPPER_BODY="$BODY_C4" -- 2>/dev/null)"; rc=$?
-set -e
-chmod 644 "$LOG_C4"
-if [ "$rc" = 0 ] \
-   && printf '%s' "$out" | jq -e '.verdict == "APPROVED" and .review_posted == true' >/dev/null \
-   && grep -q '^\*\*Automated Phase 4b review\*\*' "$BODY_C4" \
-   && [ "$(jq -s length "$LOG_C4")" = 1 ]; then
-  pass "record-append failure + prior-head CR history: the head-advanced APPROVED still posts (live-log gate is same-head-only) (#615 round 9 CodeRabbit)"
-else fail "not-recorded head-advanced approval regressed (rc=$rc, out=$(printf '%s' "$out" | head -c 200))"; fi
+# Root-robust lock (#615 round 10 Codex): chmod 0444 does not stop root from
+# appending (the CI gate runs as root), which would record the current loop,
+# rotate the log on approval, and fail the length assertion below. Use the
+# same make_file_unappendable/skip seam as the D2 test.
+LOCK_C4="$(make_file_unappendable "$LOG_C4")"; lock_rc=$?
+if [ "$lock_rc" -ne 0 ]; then
+  skip "record-append-fail head-advanced gate: no root-robust unwritable seam available ($LOCK_C4) (#615 round 10)"
+else
+  set +e
+  out="$(run_orch "$STATE_C4" "$POLICY_ON" fake-codex-approve 307 P4B_WRAPPER_BODY="$BODY_C4" -- 2>/dev/null)"; rc=$?
+  set -e
+  restore_file "$LOG_C4" "$LOCK_C4"
+  if [ "$rc" = 0 ] \
+     && printf '%s' "$out" | jq -e '.verdict == "APPROVED" and .review_posted == true' >/dev/null \
+     && grep -q '^\*\*Automated Phase 4b review\*\*' "$BODY_C4" \
+     && [ "$(jq -s length "$LOG_C4")" = 1 ]; then
+    pass "record-append failure (root-robust lock via $LOCK_C4) + prior-head CR history: the head-advanced APPROVED still posts (live-log gate is same-head-only) (#615 round 9 CodeRabbit)"
+  else fail "not-recorded head-advanced approval regressed (lock=$LOCK_C4 rc=$rc, out=$(printf '%s' "$out" | head -c 200))"; fi
+fi
 
 # (c5) the safety direction of the same split: identical setup but the prior
 #      unresolved CR-P1 sits on the RUN head itself (abc123) — the rerun
@@ -2035,16 +2101,55 @@ LOG_C5="$(P4B_ACCT_STATE_DIR="$STATE_C5" REPO="o/r" PR=308 p4b_acct_hook_loop_lo
 mkdir -p "$(dirname "$LOG_C5")"
 jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123)" \
   '{schema:"p4b-loop-log/v1", started_at_epoch:null, loop:$loop, details:[]}' > "$LOG_C5"
-chmod 444 "$LOG_C5"
+LOCK_C5="$(make_file_unappendable "$LOG_C5")"; lock_rc=$?
+if [ "$lock_rc" -ne 0 ]; then
+  skip "record-append-fail same-head block: no root-robust unwritable seam available ($LOCK_C5) (#615 round 10)"
+else
+  set +e
+  out="$(run_orch "$STATE_C5" "$POLICY_ON" fake-codex-approve 308 P4B_WRAPPER_BODY="$BODY_C5" -- 2>/dev/null)"; rc=$?
+  set -e
+  restore_file "$LOG_C5" "$LOCK_C5"
+  if [ "$rc" = 4 ] \
+     && printf '%s' "$out" | jq -e '.review_posted == false and .fell_back_to_manual == true' >/dev/null \
+     && [ ! -e "$BODY_C5" ]; then
+    pass "record-append failure (root-robust lock via $LOCK_C5) does NOT disarm the same-head laundering block: the no-fix rerun is refused to manual (exit 4, nothing posted)"
+  else fail "same-head laundering block lost under a failed record append (lock=$LOCK_C5 rc=$rc, out=$(printf '%s' "$out" | head -c 200))"; fi
+fi
+
+# (c6) #615 round 10, Codex P2 (fails pre-fix): accounting DISABLED by config
+#      (sub-toggle off) with a prior unresolved CR-P1 on the RUN head already
+#      in the loop log (recorded while accounting was still enabled). Pre-fix
+#      the same-head gate lived INSIDE the p4b_acct_on block, so the opt-out
+#      skipped it and the rerun posted a clean APPROVED on the laundered head.
+#      The gate now sits OUTSIDE the sub-toggle: history on disk still blocks.
+STATE_C6="$WORK/state-c6"; BODY_C6="$WORK/body-c6.md"
+LOG_C6="$(P4B_ACCT_STATE_DIR="$STATE_C6" REPO="o/r" PR=309 p4b_acct_hook_loop_log)"
+mkdir -p "$(dirname "$LOG_C6")"
+jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false abc123)" \
+  '{schema:"p4b-loop-log/v1", started_at_epoch:null, loop:$loop, details:[]}' > "$LOG_C6"
 set +e
-out="$(run_orch "$STATE_C5" "$POLICY_ON" fake-codex-approve 308 P4B_WRAPPER_BODY="$BODY_C5" -- 2>/dev/null)"; rc=$?
+out="$(run_orch "$STATE_C6" "$POLICY_ACCT_OFF" fake-codex-approve 309 P4B_WRAPPER_BODY="$BODY_C6" -- 2>/dev/null)"; rc=$?
 set -e
-chmod 644 "$LOG_C5"
 if [ "$rc" = 4 ] \
    && printf '%s' "$out" | jq -e '.review_posted == false and .fell_back_to_manual == true' >/dev/null \
-   && [ ! -e "$BODY_C5" ]; then
-  pass "record-append failure does NOT disarm the same-head laundering block: the no-fix rerun is refused to manual (exit 4, nothing posted)"
-else fail "same-head laundering block lost under a failed record append (rc=$rc, out=$(printf '%s' "$out" | head -c 200))"; fi
+   && [ ! -e "$BODY_C6" ]; then
+  pass "accounting opt-out cannot launder a same-head required finding: the gate runs outside the sub-toggle and refuses to manual (#615 round 10 Codex)"
+else fail "ACCT-OFF same-head laundering not blocked (rc=$rc, out=$(printf '%s' "$out" | head -c 200))"; fi
+# The no-over-block control: same opt-out, prior finding on a DIFFERENT head —
+# the valid head-advanced approval still posts plain (no accounting block).
+STATE_C6B="$WORK/state-c6b"; BODY_C6B="$WORK/body-c6b.md"
+LOG_C6B="$(P4B_ACCT_STATE_DIR="$STATE_C6B" REPO="o/r" PR=310 p4b_acct_hook_loop_log)"
+mkdir -p "$(dirname "$LOG_C6B")"
+jq -cn --argjson loop "$(mkloop 1 CHANGES_REQUESTED 0 1 false zzz999)" \
+  '{schema:"p4b-loop-log/v1", started_at_epoch:null, loop:$loop, details:[]}' > "$LOG_C6B"
+set +e
+out="$(run_orch "$STATE_C6B" "$POLICY_ACCT_OFF" fake-codex-approve 310 P4B_WRAPPER_BODY="$BODY_C6B" -- 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && printf '%s' "$out" | jq -e '.verdict == "APPROVED" and .review_posted == true' >/dev/null \
+   && ! grep -q 'Phase 4b Approval Accounting' "$BODY_C6B"; then
+  pass "accounting opt-out with prior-head-only history still posts the plain approval (gate does not over-block) (#615 round 10)"
+else fail "ACCT-OFF head-advanced approval over-blocked (rc=$rc, out=$(printf '%s' "$out" | head -c 200))"; fi
 
 # (d) changes-requested-then-fixed across two invocations: loop history
 #     accumulates and the final approval renders both loops + the lifecycle.

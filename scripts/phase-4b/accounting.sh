@@ -381,6 +381,43 @@ p4b_acct_notional_for_loops() {
 # p4b_acct_marker — the embedded-block marker string.
 p4b_acct_marker() { printf 'p4b-accounting:v1'; }
 
+# p4b_acct_safe_truncate <block> <keep-bytes>
+# Print a byte-prefix of <block> of at most <keep-bytes> that never ends
+# INSIDE the embedded `<!-- p4b-accounting:v1 ... -->` record comment (#615
+# Codex round 10, P3). A raw ${var:0:N} cut landing between the comment-open
+# marker and its closing `-->` leaves an unterminated HTML comment, and the
+# truncation notice the caller appends after the prefix is then swallowed
+# (hidden) by the unterminated comment — a silently chopped block instead of
+# a visibly truncated one. When the requested cut would land inside the
+# comment, the cut backs off to just before the comment-open marker (dropping
+# the whole machine-readable record cleanly). A cut before the marker or past
+# the terminated comment is a plain byte slice. A render block carries at
+# most ONE embedded record comment (the renderer emits exactly one, and
+# earlier hardening guarantees loop content cannot terminate or restart it),
+# so guarding the first marker suffices. LC_ALL=C makes ${var:0:N} and ${#var}
+# count BYTES; pure bash — no pipe, no SIGPIPE (the round-9 requirement).
+p4b_acct_safe_truncate() {
+  local block="$1" keep="$2"
+  (
+    LC_ALL=C
+    _marker='<!-- p4b-accounting:v1'
+    _pre="${block%%"$_marker"*}"
+    if [ "${#_pre}" -lt "${#block}" ] && [ "$keep" -gt "${#_pre}" ]; then
+      _rest="${block:${#_pre}}"
+      _inner="${_rest%%-->*}"
+      if [ "$_inner" != "$_rest" ]; then
+        _mend=$(( ${#_pre} + ${#_inner} + 3 ))
+      else
+        # Defensive: an unterminated comment in the input — everything from
+        # the marker on is comment; any cut past the marker stays inside it.
+        _mend=${#block}
+      fi
+      if [ "$keep" -lt "$_mend" ]; then keep=${#_pre}; fi
+    fi
+    printf '%s' "${block:0:$keep}"
+  )
+}
+
 # p4b_acct_encode_comment_payload — stdin filter: encode the HTML-comment
 # delimiter sequences inside a compact-JSON payload so an embedded record can
 # never terminate (or restart) its enclosing `<!-- p4b-accounting:v1 ... -->`
@@ -464,6 +501,15 @@ p4b_acct_aggregate_running_totals() {
     # diagnostics line), never treated as conformant. Nullable fields must be
     # PRESENT (has()) but may be null — matching the schema, which requires the
     # key and permits an explicit-null value.
+    #
+    # Type mirror (#615 Codex round 10): key presence alone still accepted
+    # wrong-TYPED values (totals.tokens_total: "oops" from a manually edited,
+    # partially written, or buggy-older-emitter record), and addall would then
+    # publish the corrupt value straight into running_totals under a
+    # github-derived label. Every field this aggregation READS must also match
+    # its accounting.schema.json type (integers where the schema says integer,
+    # number-or-null where it says nullable) or the record is dropped and
+    # counted, exactly like a missing key.
     def conformant:
       (["pr","final_head_sha","final_verdict","final_reviewer",
         "final_direction","automation_state",
@@ -473,11 +519,21 @@ p4b_acct_aggregate_running_totals() {
           "elapsed_seconds_total","billed_usd","notional_usd",
           "reported_cost_usd","price_table_version","fail_closed_events",
           "advisory_issues_filed"]) as $treq
-      | (type == "object")
+      | def intok($v): ($v | type) == "number" and $v >= 0 and $v == ($v | floor);
+        def intornull($v): $v == null or intok($v);
+        def numornull($v): $v == null or (($v | type) == "number" and $v >= 0);
+      (type == "object")
         and (.schema == "p4b-accounting/v1")
         and (($req - keys_unsorted) | length) == 0
         and (.totals | type == "object")
-        and (($treq - (.totals | keys_unsorted)) | length) == 0;
+        and (($treq - (.totals | keys_unsorted)) | length) == 0
+        and intok(.pr) and .pr >= 1
+        and ((.final_verdict | type) == "string")
+        and intok(.totals.adapter_invocations)
+        and intok(.totals.fail_closed_events)
+        and intornull(.totals.tokens_total)
+        and intornull(.totals.elapsed_seconds_total)
+        and numornull(.totals.notional_usd);
     (map(select(type == "object" and .schema == "p4b-accounting/v1"))) as $tagged
     | ([ $tagged[] | select(conformant) ]) as $recs
     | (($tagged | length) - ($recs | length)) as $dropped

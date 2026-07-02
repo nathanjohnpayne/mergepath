@@ -442,7 +442,12 @@ _[accounting truncated: the full block would exceed the review-body size limit; 
             # locale counts characters), so the slice honors the byte budget and
             # the -8 margin still absorbs a mid-multibyte cut; the belt below
             # re-measures and drops the block if a cut still overshoots.
-            _p4b_acct_trunc="$(LC_ALL=C; printf '%s' "${ACCT_BLOCK:0:$_p4b_acct_keep}")"
+            # Marker-safe cut (#615 Codex round 10, P3): a raw byte-prefix cut
+            # can land INSIDE the embedded `<!-- p4b-accounting:v1 ... -->`
+            # record, leaving an unterminated HTML comment that swallows the
+            # visible truncation notice appended below. The helper backs the
+            # cut off to just before the comment-open marker in that case.
+            _p4b_acct_trunc="$(p4b_acct_safe_truncate "$ACCT_BLOCK" "$_p4b_acct_keep")"
             ACCT_BLOCK="${_p4b_acct_trunc}${_p4b_acct_notice}"
             p4b_warn "accounting: block exceeds the review-body size budget ($_p4b_acct_max_body bytes); truncating it so the approval still posts"
           else
@@ -471,38 +476,44 @@ _[accounting truncated: the full block would exceed the review-body size limit; 
     p4b_warn "accounting: current loop was not recorded; skipping the accounting block so the posted approval never omits this loop while stamping the current head (plain summary posts)"
   fi
 
-  # --- Same-head required-finding SAFETY gate (#615 Codex round 9, finding 2) -
-  # Unlike the accounting BLOCK above (advisory — its failure never blocks a
-  # valid approval), this is a fail-closed SAFETY check on the approval itself.
-  # The fail-closed invariant (an APPROVED verdict may never carry an unresolved
-  # required-tier finding on the CURRENT head) lived only inside the accounting
-  # RECORD builder: a same-head laundered approval made p4b_acct_build_record
-  # return non-zero, the render hook propagated that as an ordinary advisory
-  # report-generation failure, and the orchestrator posted the plain-summary
-  # APPROVED anyway — letting a P0/P1 CHANGES_REQUESTED on head `abc` be
-  # laundered into a clean approval by rerunning the reviewer on the SAME head
-  # with no fix commit. Here we run the SAME assertion against the live loop log
-  # (which already holds this run's loop, appended above) keyed to the current
-  # HEAD; when it refuses, the approval is REFUSED via the manual handoff
-  # (fall_back_to_manual, exit 4), never posted. A head change (a real fix
-  # commit) or a fail-closed-marked prior loop clears it — the assertion permits
-  # the legitimate changes-requested-then-fixed path. Gate is a no-op when the
-  # verdict is not APPROVED, when there is no readable/parseable loop log, or
-  # when the accounting module never loaded (P4B_ACCT_AVAILABLE=false: nothing
-  # ever recorded history, so there is no history to launder — and the hook
-  # function does not exist, so a bare call would exit 127 into
-  # fall_back_to_manual and refuse every valid approval the module-missing
-  # contract at the top of this file says must post plain; #615 round 9,
-  # CodeRabbit). Deliberately P4B_ACCT_AVAILABLE and NOT p4b_acct_on: a
-  # config disable must not bypass this gate while recorded history exists
-  # (that would reopen the same-head laundering hole via a toggle), so a
-  # loaded-but-disabled module still runs the gate against whatever loop log
-  # is present.
-  if [ "$VERDICT" = "APPROVED" ] \
-     && [ "$P4B_ACCT_AVAILABLE" = true ] \
-     && ! p4b_acct_hook_same_head_required_block; then
-    fall_back_to_manual "an unresolved required-tier finding was recorded on the current head ($HEAD) in a prior Phase 4b loop; a rerun without a fix commit cannot launder it into a clean approval (fail-closed)"
-  fi
+fi
+
+# --- Same-head required-finding SAFETY gate (#615 Codex round 9, finding 2) --
+# Unlike the accounting BLOCK above (advisory — its failure never blocks a
+# valid approval), this is a fail-closed SAFETY check on the approval itself.
+# The fail-closed invariant (an APPROVED verdict may never carry an unresolved
+# required-tier finding on the CURRENT head) lived only inside the accounting
+# RECORD builder: a same-head laundered approval made p4b_acct_build_record
+# return non-zero, the render hook propagated that as an ordinary advisory
+# report-generation failure, and the orchestrator posted the plain-summary
+# APPROVED anyway — letting a P0/P1 CHANGES_REQUESTED on head `abc` be
+# laundered into a clean approval by rerunning the reviewer on the SAME head
+# with no fix commit. Here we run the SAME assertion against the live loop log
+# keyed to the current HEAD, in same_head_only mode (#615 round 9 CodeRabbit:
+# the current loop is legitimately ABSENT from the log whenever recording
+# failed or accounting is disabled, so the record-scoped clauses must not
+# apply); when it refuses, the approval is REFUSED via the manual handoff
+# (fall_back_to_manual, exit 4), never posted. A head change (a real fix
+# commit) or a fail-closed-marked prior loop clears it — the assertion permits
+# the legitimate changes-requested-then-fixed path.
+#
+# Placement (#615 Codex round 10): this gate sits OUTSIDE the p4b_acct_on
+# sub-toggle block above, guarded on P4B_ACCT_AVAILABLE (module loaded) alone.
+# Inside that block, opting out via phase_4b_automation.accounting.enabled:
+# false AFTER a prior loop logged a required finding on this head would skip
+# the gate and launder the finding through a same-head rerun. Out here the
+# toggle only stops NEW recording; history already on disk still blocks. Gate
+# is a no-op when the verdict is not APPROVED, when there is no
+# readable/parseable loop log, or when the module never loaded
+# (P4B_ACCT_AVAILABLE=false: nothing ever recorded history, so there is no
+# history to launder — and the hook function does not exist, so a bare call
+# would exit 127 into fall_back_to_manual and refuse every valid approval the
+# module-missing contract at the top of this file says must post plain; #615
+# round 9, CodeRabbit).
+if [ "$VERDICT" = "APPROVED" ] \
+   && [ "$P4B_ACCT_AVAILABLE" = true ] \
+   && ! p4b_acct_hook_same_head_required_block; then
+  fall_back_to_manual "an unresolved required-tier finding was recorded on the current head ($HEAD) in a prior Phase 4b loop; a rerun without a fix commit cannot launder it into a clean approval (fail-closed)"
 fi
 
 # --- map verdict -> GitHub review state ------------------------------------
