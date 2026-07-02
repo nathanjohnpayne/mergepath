@@ -463,7 +463,7 @@ loop_split="$(jq -nc --argjson tok "$t_split" '
 tot_split="$(p4b_acct_compute_totals "[$loop_split]" "" "null")"
 cell_split="$(p4b_acct_fmt_tokens_cell "$t_split")"
 if printf '%s' "$tot_split" | jq -e '.tokens_total == 150 and .tokens_by_provider.codex == 150' >/dev/null \
-   && printf '%s' "$cell_split" | grep -q '^150 (split-only-cli: in 100 / out 50)$'; then
+   && grep -q '^150 (split-only-cli: in 100 / out 50)$' <<<"$cell_split"; then
   pass "the derived total flows into per-approval totals and the loop-table cell, not 'unavailable' (#615 round 6)"
 else fail "derived-total downstream (totals=$tot_split cell=$cell_split)"; fi
 
@@ -818,20 +818,20 @@ fi
 
 BLOCK="$(p4b_acct_render_block "$GOLDEN")" || BLOCK=""
 [ -n "$BLOCK" ] || fail "render_block produced nothing for the golden record"
-printf '%s' "$BLOCK" | grep -q '^## Phase 4b Approval Accounting' \
+grep -q  '^## Phase 4b Approval Accounting' <<<"$BLOCK" \
   && pass "golden render carries the block heading" || fail "missing block heading"
-printf '%s' "$BLOCK" | grep -q -- '55,926 (codex-stderr)' \
+grep -q  -- '55,926 (codex-stderr)' <<<"$BLOCK" \
   && pass "golden render formats total-only tokens with source" || fail "token cell (total-only) wrong"
-printf '%s' "$BLOCK" | grep -q -- '7,360 (claude-json: in 1,589 / out 5,771)' \
+grep -q  -- '7,360 (claude-json: in 1,589 / out 5,771)' <<<"$BLOCK" \
   && pass "golden render formats split tokens with in/out" || fail "token cell (split) wrong"
-printf '%s' "$BLOCK" | grep -q -- 'unavailable (unavailable)' \
+grep -q  -- 'unavailable (unavailable)' <<<"$BLOCK" \
   && pass "loop with no CLI counts renders explicit unavailable" || fail "missing unavailable cell"
-printf '%s' "$BLOCK" | grep -q -- '\*\*yes\*\* — approval-carried-findings' \
+grep -q  -- '\*\*yes\*\* — approval-carried-findings' <<<"$BLOCK" \
   && pass "fail-closed loop rendered as positive safety evidence" || fail "fail-closed loop row missing"
-printf '%s' "$BLOCK" | grep -qF '| F1 | P2 | — | Codex `--output-schema` vs jq validator drift (`line` min) | current-head | 3 | 3 | deferred-to-follow-up | #585 |' \
+grep -qF '| F1 | P2 | — | Codex `--output-schema` vs jq validator drift (`line` min) | current-head | 3 | 3 | deferred-to-follow-up | #585 |' <<<"$BLOCK" \
   && pass "findings table carries content (path/summary), scope, and the follow-up issue link (#615)" \
   || fail "findings row missing"
-printf '%s' "$BLOCK" | grep -qF 'Unique findings across loops: 4 — 4 on the approved head, 0 historical (earlier loops only). Repeated across loops: 0.' \
+grep -qF  'Unique findings across loops: 4 — 4 on the approved head, 0 historical (earlier loops only). Repeated across loops: 0.' <<<"$BLOCK" \
   && pass "findings summary counts approved-head vs historical findings truthfully" \
   || fail "findings summary sentence wrong"
 # #615 Codex: findings last seen on a PRIOR commit must be labeled historical,
@@ -839,33 +839,33 @@ printf '%s' "$BLOCK" | grep -qF 'Unique findings across loops: 4 — 4 on the ap
 # head; F1–F4 were last seen there, so all four become historical.
 HISTREC="$(printf '%s' "$GOLDEN" | jq -c '.loops[2].head_sha = "older111"')"
 HISTBLOCK="$(p4b_acct_render_block "$HISTREC")"
-printf '%s' "$HISTBLOCK" | grep -qF '| F1 | P2 | — | Codex `--output-schema` vs jq validator drift (`line` min) | historical | 3 | 3 |' \
+grep -qF '| F1 | P2 | — | Codex `--output-schema` vs jq validator drift (`line` min) | historical | 3 | 3 |' <<<"$HISTBLOCK" \
   && pass "findings from a prior commit are labeled historical, not current-head (#615)" \
   || fail "historical scope label missing"
-printf '%s' "$HISTBLOCK" | grep -qF 'Unique findings across loops: 4 — 0 on the approved head, 4 historical (earlier loops only).' \
+grep -qF  'Unique findings across loops: 4 — 0 on the approved head, 4 historical (earlier loops only).' <<<"$HISTBLOCK" \
   && pass "summary sentence separates historical findings from approved-head ones" \
   || fail "historical summary sentence wrong"
-printf '%s' "$BLOCK" | grep -q -- '~\$0.66 \*(not billed; price table `2026-07-01`)\*' \
+grep -q  -- '~\$0.66 \*(not billed; price table `2026-07-01`)\*' <<<"$BLOCK" \
   && pass "notional cost labeled not-billed with the price-table version stamp" || fail "notional row wrong"
-printf '%s' "$BLOCK" | grep -q -- '\*\*\$0.00\*\* — operator subscription plan' \
+grep -q  -- '\*\*\$0.00\*\* — operator subscription plan' <<<"$BLOCK" \
   && pass "billed cost row states \$0.00 plainly" || fail "billed row missing"
-printf '%s' "$BLOCK" | grep -q '| Reviewer CLI version | ✅ | `codex/0.137` (#586) |' \
+grep -q '| Reviewer CLI version | ✅ | `codex/0.137` (#586) |' <<<"$BLOCK" \
   && pass "captured CLI version renders green with evidence" || fail "cli version rigor row wrong"
-printf '%s' "$BLOCK" | grep -q '| Local gates green | n/a | local gate results not captured for this run |' \
+grep -q '| Local gates green | n/a | local gate results not captured for this run |' <<<"$BLOCK" \
   && pass "uncaptured gate signal renders n/a with the reason (never a green check)" || fail "gates rigor row wrong"
-printf '%s' "$BLOCK" | grep -q '\*Totals source: github-derived (24 prior record(s)).\*' \
+grep -q  '\*Totals source: github-derived (24 prior record(s)).\*' <<<"$BLOCK" \
   && pass "running-totals footer names the totals source" || fail "totals-source footer missing"
 # #615 Codex: the trust-signal rate divides by automated ATTEMPTS (27), not by
 # emitted records (24) — records only exist for approvals, so records as the
 # denominator rendered 100% even across fail-closed history.
-printf '%s' "$BLOCK" | grep -qF '24 approved / 27 automated attempts = 89%' \
+grep -qF  '24 approved / 27 automated attempts = 89%' <<<"$BLOCK" \
   && pass "auto-approval rate uses the attempts denominator (24/27 = 89%, the spec golden)" \
   || fail "approval-rate denominator wrong"
 RATEREC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.auto_approved_prs = 1
   | .running_totals.records = 1 | .running_totals.automated_attempts = 4
   | .running_totals.fail_closed_events = 3')"
 RATEBLOCK="$(p4b_acct_render_block "$RATEREC")"
-printf '%s' "$RATEBLOCK" | grep -qF '1 approved / 4 automated attempts = 25%' \
+grep -qF  '1 approved / 4 automated attempts = 25%' <<<"$RATEBLOCK" \
   && pass "fail-closed-heavy history can no longer render as 100% approved (#615)" \
   || fail "fail-closed rate render wrong"
 # #615 Codex: a null (unavailable) cumulative measurement renders unavailable,
@@ -873,10 +873,10 @@ printf '%s' "$RATEBLOCK" | grep -qF '1 approved / 4 automated attempts = 25%' \
 NULLRTREC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.tokens_total = null
   | .running_totals.notional_usd = null')"
 NULLRTBLOCK="$(p4b_acct_render_block "$NULLRTREC")"
-printf '%s' "$NULLRTBLOCK" | grep -qF '| Cumulative tokens | unavailable (not measured in every prior record) |' \
+grep -qF '| Cumulative tokens | unavailable (not measured in every prior record) |' <<<"$NULLRTBLOCK" \
   && pass "null cumulative tokens render unavailable, not 0 (#615)" \
   || fail "null cumulative tokens rendered wrong"
-printf '%s' "$NULLRTBLOCK" | grep -qF '| Cumulative notional API-equivalent | unavailable (not priced in every prior record) *(not billed either way)* |' \
+grep -qF '| Cumulative notional API-equivalent | unavailable (not priced in every prior record) *(not billed either way)* |' <<<"$NULLRTBLOCK" \
   && pass "null cumulative notional renders unavailable, not ~\$0 (#615)" \
   || fail "null cumulative notional rendered wrong"
 # #615 Codex round 7, finding 3 (fails pre-fix): a sub-hour cumulative
@@ -886,21 +886,21 @@ printf '%s' "$NULLRTBLOCK" | grep -qF '| Cumulative notional API-equivalent | un
 # drops below an hour).
 SUBHOURREC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.human_minutes_saved_estimate = [30, 180]')"
 SUBHOURBLOCK="$(p4b_acct_render_block "$SUBHOURREC")"
-if printf '%s' "$SUBHOURBLOCK" | grep -qF '| Cumulative human time saved (est.) | ~30 min – 3 h |' \
-   && ! printf '%s' "$SUBHOURBLOCK" | grep -qF '~0 – 3 h'; then
+if grep -qF '| Cumulative human time saved (est.) | ~30 min – 3 h |' <<<"$SUBHOURBLOCK" \
+   && ! grep -qF '~0 – 3 h' <<<"$SUBHOURBLOCK"; then
   pass "sub-hour cumulative human-time-saved renders in minutes (~30 min – 3 h), not floored to ~0 h (#615 round 7, finding 3)"
 else fail "sub-hour human-time render: $(printf '%s' "$SUBHOURBLOCK" | grep -F 'Cumulative human time saved')"; fi
 # Both bounds below an hour render as a minutes-only range.
 SUBHOUR2REC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.human_minutes_saved_estimate = [30, 50]')"
-printf '%s' "$(p4b_acct_render_block "$SUBHOUR2REC")" | grep -qF '| Cumulative human time saved (est.) | ~30 – 50 min |' \
+grep -qF '| Cumulative human time saved (est.) | ~30 – 50 min |' <<<"$(p4b_acct_render_block "$SUBHOUR2REC")" \
   && pass "a fully sub-hour range renders minutes on both bounds (~30 – 50 min) (#615 round 7, finding 3)" \
   || fail "fully-sub-hour human-time render"
 # The whole-hour shared-unit form is unchanged for bounds >= 60 min (spec golden).
-printf '%s' "$BLOCK" | grep -qF '| Cumulative human time saved (est.) | ~12 – 72 h |' \
+grep -qF '| Cumulative human time saved (est.) | ~12 – 72 h |' <<<"$BLOCK" \
   && pass "both-bounds >= 1h keep the shared-unit ~A – B h form (spec golden unchanged)" \
   || fail "whole-hour human-time render drifted from the spec golden"
 GATES_BLOCK="$(P4B_ACCT_GATES_EVIDENCE="check_phase_4b_automation 67/67 green" p4b_acct_render_block "$GOLDEN")"
-printf '%s' "$GATES_BLOCK" | grep -q '| Local gates green | ✅ | check_phase_4b_automation 67/67 green |' \
+grep -q '| Local gates green | ✅ | check_phase_4b_automation 67/67 green |' <<<"$GATES_BLOCK" \
   && pass "captured gate evidence renders the gates row green" || fail "gates evidence row wrong"
 
 RT="$(printf '%s\n' "$BLOCK" | p4b_acct_extract_records)"
@@ -917,9 +917,9 @@ RT_N="$(printf 'prose mentions p4b-accounting:v1 in passing\n%s\n' "$BLOCK" | p4
 # the comment-delimiter angle brackets as JSON unicode escapes.
 enc="$(printf '%s' '{"a":"x --> y","b":"<!-- open","c":"z --!> w"}' | p4b_acct_encode_comment_payload)"
 if [ "$(printf '%s' "$enc" | jq -r '.a + "|" + .b + "|" + .c')" = 'x --> y|<!-- open|z --!> w' ] \
-   && ! printf '%s' "$enc" | grep -q -- '-->' \
-   && ! printf '%s' "$enc" | grep -qF '<!--' \
-   && ! printf '%s' "$enc" | grep -qF -- '--!>'; then
+   && ! grep -q  -- '-->' <<<"$enc" \
+   && ! grep -qF  '<!--' <<<"$enc" \
+   && ! grep -qF -- '--!>' <<<"$enc"; then
   pass "payload encoder strips every literal comment delimiter while the parsed value round-trips"
 else fail "payload encoder: $enc"; fi
 HOSTILE="$(printf '%s' "$GOLDEN" | jq -c '.unique_findings[0].title = "hostile --> terminator <!-- reopen --!> tail"')"
@@ -1260,17 +1260,17 @@ printf '%s' "$rt" | jq -e '.source == "github-derived" and .window.truncated == 
 # (fails pre-fix: the heading claimed repo, to date unconditionally)
 WINREC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.window = {scanned_prs: 200, truncated: true}')"
 WINBLOCK="$(p4b_acct_render_block "$WINREC")"
-if printf '%s' "$WINBLOCK" | grep -q '^### Running totals — window: last 200 merged PRs$' \
-   && ! printf '%s' "$WINBLOCK" | grep -q 'repo, to date'; then
+if grep -q  '^### Running totals — window: last 200 merged PRs$' <<<"$WINBLOCK" \
+   && ! grep -q 'repo, to date' <<<"$WINBLOCK"; then
   pass "a truncated window renders the bounded-window heading, never a repo-wide claim"
 else fail "window heading: $(printf '%s' "$WINBLOCK" | grep '### Running totals')"; fi
-printf '%s' "$WINBLOCK" | grep -qF '*Totals source: github-derived (24 prior record(s)); window: last 200 merged PRs — older history beyond the scan cap is not included.*' \
+grep -qF  '*Totals source: github-derived (24 prior record(s)); window: last 200 merged PRs — older history beyond the scan cap is not included.*' <<<"$WINBLOCK" \
   && pass "the totals-source footer states the truncated window explicitly" \
   || fail "window footer: $(printf '%s' "$WINBLOCK" | grep 'Totals source')"
 LCREC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.source = "ledger-cache"')"
 LCBLOCK="$(p4b_acct_render_block "$LCREC")"
-if printf '%s' "$LCBLOCK" | grep -q '^### Running totals — local ledger cache (this checkout only)$' \
-   && ! printf '%s' "$LCBLOCK" | grep -q 'repo, to date'; then
+if grep -q  '^### Running totals — local ledger cache (this checkout only)$' <<<"$LCBLOCK" \
+   && ! grep -q 'repo, to date' <<<"$LCBLOCK"; then
   pass "ledger-cache totals no longer claim repo, to date (#615 round 3)"
 else fail "ledger-cache heading: $(printf '%s' "$LCBLOCK" | grep '### Running totals')"; fi
 
@@ -1318,9 +1318,9 @@ printf '%s' "$rt" | jq -e '.source == "github-derived" and .records == 1
 RTWINREC="$(printf '%s' "$GOLDEN" | jq -c '.running_totals.window
   = {scanned_prs: 3, truncated: true, review_truncated_prs: 1}')"
 RTWINBLOCK="$(p4b_acct_render_block "$RTWINREC")"
-if printf '%s' "$RTWINBLOCK" | grep -q '^### Running totals — window: last 3 merged PRs$' \
-   && ! printf '%s' "$RTWINBLOCK" | grep -q 'repo, to date' \
-   && printf '%s' "$RTWINBLOCK" | grep -qF '1 scanned PR(s) hold more reviews than the nested review window — their older reviews are not included'; then
+if grep -q  '^### Running totals — window: last 3 merged PRs$' <<<"$RTWINBLOCK" \
+   && ! grep -q  'repo, to date' <<<"$RTWINBLOCK" \
+   && grep -qF '1 scanned PR(s) hold more reviews than the nested review window — their older reviews are not included' <<<"$RTWINBLOCK"; then
   pass "review truncation renders the bounded-window heading + deeper-history footer (#615 round 4)"
 else fail "review-truncation render: $(printf '%s' "$RTWINBLOCK" | grep -E '### Running totals|Totals source')"; fi
 # Old fixtures without nested pageInfo stay valid (absent ⇒ not truncated;
@@ -1335,19 +1335,19 @@ ZREC="$(p4b_acct_build_record 7 headzz APPROVED nathanpayne-codex "claude->codex
   "$(p4b_acct_compute_totals "[$ZLOOP]" "" null '[]')" \
   '{"source":"unavailable","records":0,"reason":"no prior-record source"}' "2026-07-01T00:00:00Z")"
 ZBLOCK="$(p4b_acct_render_block "$ZREC")"
-printf '%s' "$ZBLOCK" | grep -q '_No findings recorded on the approved HEAD' \
+grep -q  '_No findings recorded on the approved HEAD' <<<"$ZBLOCK" \
   && pass "zero-finding approval names the rigor table as its proof-of-work" || fail "zero-finding text missing"
-printf '%s' "$ZBLOCK" | grep -q '| Plan-only auth (no metered API) | n/a | plan-auth posture not captured' \
+grep -q '| Plan-only auth (no metered API) | n/a | plan-auth posture not captured' <<<"$ZBLOCK" \
   && pass "missing plan-auth signal renders n/a, not a green check" || fail "plan-auth n/a row missing"
-printf '%s' "$ZBLOCK" | grep -q '| Reviewer CLI version | n/a |' \
+grep -q '| Reviewer CLI version | n/a |' <<<"$ZBLOCK" \
   && pass "missing CLI version renders n/a" || fail "cli-version n/a row missing"
-printf '%s' "$ZBLOCK" | grep -q 'unavailable (no CLI-exposed counts)' \
+grep -q  'unavailable (no CLI-exposed counts)' <<<"$ZBLOCK" \
   && pass "missing token totals render explicit unavailable with reason" || fail "token unavailable row missing"
-printf '%s' "$ZBLOCK" | grep -q -- 'n/a — no price resolvable' \
+grep -q  -- 'n/a — no price resolvable' <<<"$ZBLOCK" \
   && pass "missing price renders notional n/a while the record still posts" || fail "notional n/a row missing"
-printf '%s' "$ZBLOCK" | grep -q '_Running totals unavailable — no prior-record source._' \
+grep -q  '_Running totals unavailable — no prior-record source._' <<<"$ZBLOCK" \
   && pass "unavailable running totals render the degradation reason" || fail "running-totals degradation missing"
-printf '%s' "$ZBLOCK" | grep -q '| Plan-capacity throttle events | not captured |' \
+grep -q '| Plan-capacity throttle events | not captured |' <<<"$ZBLOCK" \
   && pass "uncaptured throttle events render as not captured (no fabricated 0)" || fail "throttle row wrong"
 # #615 round 2 (fails pre-fix): when the CLI reported a real cost the cost
 # row prefers it over the price-table notional, labeled with its source;
@@ -1358,10 +1358,10 @@ CTOT="$(p4b_acct_compute_totals "[$CFULL_LOOP]" "test-1" "0.66" '[]')"
 CREC="$(p4b_acct_build_record 9 abc123 APPROVED nathanpayne-claude "codex->claude" posted 9 \
   "[$CFULL_LOOP]" "[]" "$CTOT" "$RT_ZERO" "2026-07-01T00:00:00Z")"
 CBLOCK="$(p4b_acct_render_block "$CREC")"
-printf '%s' "$CBLOCK" | grep -qF -- '~$0.42 *(not billed; CLI-reported)*' \
+grep -qF  -- '~$0.42 *(not billed; CLI-reported)*' <<<"$CBLOCK" \
   && pass "render prefers the CLI-reported cost with a source label (#615 round 2)" \
   || fail "CLI-reported preference missing: $(printf '%s' "$CBLOCK" | grep 'Notional API-equivalent')"
-printf '%s' "$CBLOCK" | grep -q 'price table `test-1`' \
+grep -q  'price table `test-1`' <<<"$CBLOCK" \
   && fail "price-table notional shown despite a CLI-reported cost" \
   || pass "the price-table notional stays out of the row when a reported cost wins"
 
