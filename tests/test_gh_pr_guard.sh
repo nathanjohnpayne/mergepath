@@ -986,6 +986,12 @@ assert_rc_contains "ANSI-C-quoted synthesized gh pr merge fails closed (#611 r6)
   "\$(echo \$'\\147\\150\\40\\160\\162\\40\\155\\145\\162\\147\\145') 1 --admin"
 assert_rc_contains "ANSI-C-quoted benign expansion stays allowed (#611 r6)" 0 "" \
   "\$(echo \$'hi') there"
+# Locale quoting ($ + double-quoted string) is its literal content for any
+# untranslated string — the same dodge shape as ANSI-C, preempted with it.
+assert_rc_contains "locale-quoted synthesized gh pr merge fails closed (#611 r6)" 2 "wrapper" \
+  '$(echo $"gh pr merge") 1 --admin'
+assert_rc_contains "locale-quoted benign expansion stays allowed (#611 r6)" 0 "" \
+  '$(echo $"hello") world'
 # (P2) heredoc BODIES are data for the receiving command: a parse failure
 # whose only guarded-verb evidence sits inside a cat heredoc body must not
 # fail closed. A shell interpreter outside the bodies keeps full-text

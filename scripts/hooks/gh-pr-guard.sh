@@ -526,6 +526,13 @@ def _rewrite_ansi_c(span, neutral):
     n = len(span)
     while i < n:
         c = span[i]
+        if c == "$" and i + 1 < n and span[i + 1] == _DQ:
+            # bash LOCALE quoting ($ + double-quoted string) is its literal
+            # content for any untranslated string — same dodge shape as
+            # ANSI-C, preempted alongside it: drop the $ and let the plain
+            # double-quoted string flow through classification/shlex.
+            i += 1
+            continue
         if c == "$" and i + 1 < n and span[i + 1] == _SQ:
             j = i + 2
             buf = []
