@@ -20,6 +20,9 @@ validation from the enablement environment before flipping
 | [`verdict.schema.json`](verdict.schema.json) | The normalized verdict contract both adapters emit, with optional adapter-populated token usage metadata when the CLI exposes it. **Single source of truth for the structural contract** — the `lib.sh` validator derives its key sets and enums from this file (see below). |
 | [`lib.sh`](lib.sh) | Shared config readers, reviewer selection, `jq`-based verdict validation, JSON-block extraction, and the per-adapter timeout/effort resolvers. |
 | [`collect-enablement-evidence.sh`](collect-enablement-evidence.sh) | Captures the pre-enablement evidence (#586): CLI versions, plan-auth status, API-key env scan, resolved config, and an optional adapter dry-run. Markdown or `--json`; exits `1` when BLOCKED. |
+| [`accounting.sh`](accounting.sh) | Approval-loop accounting (#602). Sourced by the orchestrator; renders the "## Phase 4b Approval Accounting" block + embedded `p4b-accounting:v1` record into the automated `APPROVED` review body. Pure functions, no network; advisory to safety (any failure ⇒ the plain summary posts). |
+| [`accounting.schema.json`](accounting.schema.json) | JSON Schema for the embedded `p4b-accounting/v1` record; the golden #580 sample is validated against it in `tests/test_phase_4b_accounting.sh`. |
+| [`prices.json`](prices.json) | Versioned public-list-price table (#604) for the accounting's **notional** (not-billed) cost figures; every record stamps the `price_table_version` it used. |
 
 ### Verdict contract: drift resistance & extraction
 
@@ -44,6 +47,61 @@ validation from the enablement environment before flipping
   balanced object — so balanced-brace prose *after* the JSON object can no
   longer extend the slice and corrupt it. Unbalanced or object-free input emits
   nothing, so schema validation still fails closed on ambiguous output.
+
+### Approval-loop accounting (#602)
+
+When `phase_4b_automation.accounting.enabled` is not `false` (the default is
+`true`, but the parent `enabled: false` still gates everything), the
+orchestrator sources `accounting.sh` and:
+
+1. **Records every loop.** Each invocation appends one loop record to a
+   per-PR loop log under `.mergepath/phase-4b-loops/` (gitignored runtime
+   state; override with `P4B_ACCT_STATE_DIR`) — including CHANGES_REQUESTED
+   rounds and fail-closed fallbacks (reason + duration, counted as positive
+   safety evidence), so a changes-requested-then-fixed cycle renders its full
+   history.
+2. **Augments the APPROVED body.** On an approval it appends the
+   "## Phase 4b Approval Accounting" block — loop table, findings lifecycle
+   with dispositions, a rigor proof-of-work table (rows are green only when
+   the backing signal was captured; otherwise `n/a — reason`), the four-part
+   cost model (wall-clock / CLI-exposed tokens / throttle / labeled
+   **notional** $ with billed `$0.00` on the plan; a CLI-REPORTED cost —
+   Claude envelope `total_cost_usd` → `tokens.cost_usd` /
+   `totals.reported_cost_usd` — is preferred over the price-table notional,
+   labeled `CLI-reported`), repo running totals with
+   an explicit totals-source footer, and the embedded machine-readable
+   `<!-- p4b-accounting:v1 ... -->` record (`accounting.schema.json`,
+   comment-delimiter sequences inside record strings emitted as JSON
+   unicode escapes so a hostile title can never close the comment early).
+3. **Fails open for reporting, closed for integrity.** Any generation error ⇒
+   the plain-summary approval posts unchanged (a report failure never blocks
+   or fabricates an approval; exit codes are untouched). The builder and the
+   renderer both refuse a record whose loop history would pair a posted
+   `APPROVED` with a required-tier finding; token counts are never estimated
+   (`unavailable` + source); a missing price ⇒ notional `n/a` while the record
+   still posts; running-totals aggregation trouble degrades to `unavailable`
+   rather than wrong numbers.
+
+Running totals prefer an injected GitHub-derived prior-record file
+(`P4B_ACCT_PRIOR_RECORDS_JSONL`, e.g. prior review bodies piped through
+`p4b_acct_extract_records`); when none is injected the hook layer fetches
+one itself — a single read-only `gh api graphql` call over the most
+recently updated 50 merged PRs (cap via `P4B_ACCT_PRIOR_SCAN_PRS`),
+plan-safe, PATH-shimmable in tests — so the real orchestrator path reports
+repo-wide totals from any checkout. On fetch failure they fall back to the
+append-only `.mergepath/phase-4b-ledger.jsonl` cache (two-phase commit: the record is
+staged at render time and appended only after the review POST actually
+succeeds, so dry-runs, head drift, and POST failures never contaminate it —
+those failure paths also correct the per-PR loop log in place, so local state
+never claims a phantom posted approval), else render `unavailable`. A prior
+record with an unavailable (null) tokens/elapsed/notional measurement makes
+that CUMULATIVE figure `unavailable` too, per metric — never coerced to 0. Notional pricing
+requires the opt-in `accounting.{codex,claude}_price_key` mappings into
+`prices.json` because the adapters do not capture exact model IDs yet.
+Covered by `tests/test_phase_4b_accounting.sh` via
+`scripts/ci/check_phase_4b_accounting`; design detail in
+`plans/automated-phase-4b-handoff.md` § 17 and the reconciled spec
+`plans/issue-602-phase-4b-accounting-SPEC.md`.
 
 ## How it plugs in (no merge-gate changes)
 

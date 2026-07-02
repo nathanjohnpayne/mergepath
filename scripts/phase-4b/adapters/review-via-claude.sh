@@ -198,11 +198,28 @@ USAGE="$(printf '%s' "$ENVELOPE" | jq -c '
     ) as $total
     | ( .usage.input_tokens // .input_tokens // .metrics.input_tokens // null ) as $input
     | ( .usage.output_tokens // .output_tokens // .metrics.output_tokens // null ) as $output
-    | if $total == null and $input == null and $output == null then null
+    # Additive #602 usage fields — populated ONLY from the CLI envelope
+    # (optional + nullable in verdict.schema.json), never estimated. Computed
+    # BEFORE the emit decision (#615 Codex round 11, P2): a cost-only or
+    # cache/reasoning-only envelope (no token totals) used to hit the
+    # all-null-tokens bail below and return usage: null, dropping the only
+    # CLI-sourced cost signal the accounting could have reported.
+    | ((.usage.cache_creation_input_tokens // .usage.cache_creation_tokens // null) | int_or_null) as $cachec
+    | ((.usage.cache_read_input_tokens // .usage.cache_read_tokens // null) | int_or_null) as $cacher
+    | ((.usage.reasoning_tokens // null) | int_or_null) as $reason
+    | ((.total_cost_usd? // null) as $c
+       | if ($c | type) == "number" and $c >= 0 then $c else null end) as $cost
+    | if $total == null and $input == null and $output == null
+         and $cachec == null and $cacher == null and $reason == null and $cost == null
+      then null
       else {
         token_count: ($total | int_or_null),
         input_tokens: ($input | int_or_null),
         output_tokens: ($output | int_or_null),
+        cache_creation_input_tokens: $cachec,
+        cache_read_input_tokens: $cacher,
+        reasoning_tokens: $reason,
+        total_cost_usd: $cost,
         source: "claude-json-envelope"
       }
       end

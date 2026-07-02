@@ -1,0 +1,295 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nathanjohnpayne.dev/mergepath/phase-4b/accounting.schema.json",
+  "title": "Mergepath Phase 4b approval-loop accounting record (p4b-accounting/v1)",
+  "description": "Machine-readable record embedded (as an HTML comment `<!-- p4b-accounting:v1 ... -->`) in every automated Phase 4b APPROVED review body by scripts/phase-4b/accounting.sh. It captures the full loop-centric rigor / cost / time / findings story for one approval so an operator (product / finance) can reconstruct it later without opening the code, and so a stateless aggregator can compute repo-wide running totals from prior records. All missing data is represented with explicit null / \"unavailable\" — never silently omitted, never estimated.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "pr",
+    "final_head_sha",
+    "final_verdict",
+    "final_reviewer",
+    "final_direction",
+    "automation_state",
+    "wall_time_first_loop_to_approval_seconds",
+    "loops",
+    "unique_findings",
+    "totals",
+    "running_totals",
+    "generated_at"
+  ],
+  "properties": {
+    "schema": {
+      "description": "Schema identifier + version. Fixed to the v1 tag so an aggregator can select records by marker and version.",
+      "type": "string",
+      "const": "p4b-accounting/v1"
+    },
+    "pr": {
+      "description": "PR number this approval accounting belongs to.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "final_head_sha": {
+      "description": "The reviewed HEAD sha the final posted approval was pinned to (may be an abbreviated display form).",
+      "type": "string",
+      "minLength": 1
+    },
+    "final_verdict": {
+      "description": "The verdict of the posted review this block accompanies. A posted APPROVED can never carry a required-tier finding (asserted fail-closed by the renderer).",
+      "type": "string",
+      "enum": ["APPROVED", "CHANGES_REQUESTED"]
+    },
+    "final_reviewer": {
+      "description": "Reviewer login (a non-author available_reviewers identity) that posted the final review.",
+      "type": "string",
+      "minLength": 1
+    },
+    "final_direction": {
+      "description": "Reviewer direction for the final loop, e.g. claude->codex / codex->claude / manual.",
+      "type": "string",
+      "minLength": 1
+    },
+    "automation_state": {
+      "description": "How this approval was produced: posted (live), dry-run (feature disabled / --dry-run), or manual (old-style handoff recorded after the fact).",
+      "type": "string",
+      "enum": ["posted", "dry-run", "manual"]
+    },
+    "wall_time_first_loop_to_approval_seconds": {
+      "description": "Repo-level wall clock from the first 4b loop to the posted approval. Null when not measurable.",
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "loops": {
+      "description": "Every Phase 4b loop/attempt recorded for this approval (direct probes, orchestrator dry-runs, fail-closed fallbacks, manual handoffs). Never just the final one.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/loop" }
+    },
+    "unique_findings": {
+      "description": "Findings de-duplicated across loops with lifecycle + disposition. Empty for a zero-finding approval.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/unique_finding" }
+    },
+    "totals": { "$ref": "#/$defs/totals" },
+    "running_totals": { "$ref": "#/$defs/running_totals" },
+    "generated_at": {
+      "description": "RFC3339 UTC timestamp the block was generated.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "$defs": {
+    "tokens": {
+      "description": "Per-loop token counts. CLI-sourced only; any field the CLI did not expose is null (never estimated). `source` is 'unavailable' with the reason implied when nothing was exposed.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "input", "output", "cache_creation", "cache_read", "reasoning", "cost_usd", "source"],
+      "properties": {
+        "total": { "description": "Total tokens for the loop. The CLI-reported token_count when the envelope exposes one; otherwise the EXACT input+output sum when both splits are present (#615 Codex round 6, split-only CLIs); null only when neither a reported total nor both splits were captured — never estimated.", "type": ["integer", "null"], "minimum": 0 },
+        "input": { "type": ["integer", "null"], "minimum": 0 },
+        "output": { "type": ["integer", "null"], "minimum": 0 },
+        "cache_creation": { "type": ["integer", "null"], "minimum": 0 },
+        "cache_read": { "type": ["integer", "null"], "minimum": 0 },
+        "reasoning": { "type": ["integer", "null"], "minimum": 0 },
+        "cost_usd": {
+          "description": "CLI-REPORTED cost in USD for this loop when the CLI exposed one (e.g. the Claude print-mode envelope's total_cost_usd) (#615 Codex round 2). Null when not exposed — a reported figure only, never a notional estimate.",
+          "type": ["number", "null"],
+          "minimum": 0
+        },
+        "source": { "type": "string", "minLength": 1 }
+      }
+    },
+    "findings_counts": {
+      "description": "Severity histogram for a loop over the accounting severity superset. A null bucket means the count was not retained for that loop (e.g. a fail-closed loop whose verdict was discarded).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["P0", "P1", "P2", "P3", "nitpick", "unknown"],
+      "properties": {
+        "P0": { "type": ["integer", "null"], "minimum": 0 },
+        "P1": { "type": ["integer", "null"], "minimum": 0 },
+        "P2": { "type": ["integer", "null"], "minimum": 0 },
+        "P3": { "type": ["integer", "null"], "minimum": 0 },
+        "nitpick": { "type": ["integer", "null"], "minimum": 0 },
+        "unknown": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "fail_closed": {
+      "description": "Fail-closed record for a loop, counted as positive safety evidence. happened=false ⇒ reason/duration null.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["happened", "reason", "duration_seconds"],
+      "properties": {
+        "happened": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] },
+        "duration_seconds": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "loop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "loop", "reviewer", "adapter", "direction", "head_sha", "verdict",
+        "posted", "fell_back", "elapsed_seconds", "tokens", "findings",
+        "cli_version", "timeout_seconds", "effort", "throttle_events",
+        "plan_auth", "fail_closed"
+      ],
+      "properties": {
+        "loop": { "type": "integer", "minimum": 1 },
+        "reviewer": { "type": "string", "minLength": 1 },
+        "adapter": { "type": "string", "minLength": 1 },
+        "direction": { "type": "string", "minLength": 1 },
+        "head_sha": { "type": "string", "minLength": 1 },
+        "verdict": {
+          "description": "Loop verdict. The accounting layer widens the verdict enum (vs verdict.schema.json's APPROVED/CHANGES_REQUESTED) to record advisory-carrying approvals and unresolved states as loop history without loosening the strict posting rule.",
+          "type": "string",
+          "enum": ["APPROVED", "APPROVED_WITH_ADVISORIES", "CHANGES_REQUESTED", "UNAVAILABLE"]
+        },
+        "posted": {
+          "description": "How/whether this loop was posted to GitHub.",
+          "type": "string",
+          "enum": ["posted", "dry-run", "direct-probe", "not-posted"]
+        },
+        "fell_back": { "type": "boolean" },
+        "elapsed_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "tokens": { "$ref": "#/$defs/tokens" },
+        "findings": { "$ref": "#/$defs/findings_counts" },
+        "cli_version": { "type": ["string", "null"] },
+        "timeout_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "effort": { "type": ["string", "null"] },
+        "throttle_events": { "type": ["integer", "null"], "minimum": 0 },
+        "plan_auth": { "type": ["string", "null"] },
+        "fail_closed": { "$ref": "#/$defs/fail_closed" }
+      }
+    },
+    "unique_finding": {
+      "description": "One de-duplicated finding with lifecycle, disposition, and enough CONTENT (path, line, 80-char single-line title) that a GitHub reader can tell what was found without local runtime state. Full bodies stay in the local loop log, never in the posted record.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "severity", "path", "line", "title", "first_loop", "last_loop", "disposition", "fix_commit", "issue"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "severity": {
+          "type": "string",
+          "enum": ["P0", "P1", "P2", "P3", "nitpick", "unknown"]
+        },
+        "path": { "type": ["string", "null"] },
+        "line": { "type": ["integer", "null"], "minimum": 1 },
+        "title": {
+          "description": "First line of the finding body, truncated to 80 chars (a summary, never the full body). Null when the body was empty.",
+          "type": ["string", "null"]
+        },
+        "first_loop": { "type": "integer", "minimum": 1 },
+        "last_loop": { "type": "integer", "minimum": 1 },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "fixed", "rebutted", "deferred-to-follow-up",
+            "accepted-risk", "false-positive", "unresolved"
+          ]
+        },
+        "fix_commit": { "type": ["string", "null"] },
+        "issue": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "totals": {
+      "description": "Per-approval aggregates over this record's loops.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "adapter_invocations", "tokens_total", "tokens_by_provider",
+        "elapsed_seconds_total", "billed_usd", "notional_usd",
+        "reported_cost_usd", "price_table_version", "fail_closed_events",
+        "advisory_issues_filed"
+      ],
+      "properties": {
+        "adapter_invocations": { "type": "integer", "minimum": 0 },
+        "tokens_total": { "type": ["integer", "null"], "minimum": 0 },
+        "tokens_by_provider": {
+          "type": "object",
+          "additionalProperties": { "type": ["integer", "null"], "minimum": 0 }
+        },
+        "elapsed_seconds_total": { "type": ["integer", "null"], "minimum": 0 },
+        "billed_usd": {
+          "description": "Marginal billed cost on the plan. Always 0 for the plan-only path.",
+          "type": "number",
+          "minimum": 0
+        },
+        "notional_usd": {
+          "description": "Notional metered-API-equivalent cost (NOT billed). Null when no price could be resolved.",
+          "type": ["number", "null"],
+          "minimum": 0
+        },
+        "reported_cost_usd": {
+          "description": "Sum of the CLI-REPORTED per-loop costs (NOT billed) (#615 Codex round 2). Fail-closed: null unless every loop with measured usage also reported a cost, so the figure is never a partial underreport. The renderer prefers this over notional_usd, labeled CLI-reported.",
+          "type": ["number", "null"],
+          "minimum": 0
+        },
+        "price_table_version": {
+          "description": "Version stamp of scripts/phase-4b/prices.json used for the notional figure, so historical totals stay reproducible. Null when no price table was available.",
+          "type": ["string", "null"]
+        },
+        "fail_closed_events": { "type": "integer", "minimum": 0 },
+        "advisory_issues_filed": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "running_totals": {
+      "description": "Cumulative figures computed at post time from prior p4b-accounting:v1 records (github-derived) or the ledger-cache fallback. Repo-wide ONLY when source is github-derived and the scan window was not truncated (see `window`, #615 round 3). Degrades to source='unavailable' rather than reporting wrong numbers.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "records"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["github-derived", "ledger-cache", "unavailable"]
+        },
+        "records": { "type": "integer", "minimum": 0 },
+        "records_dropped_nonconformant": {
+          "description": "Diagnostics count (#615 round 5): prior records that carried the p4b-accounting/v1 tag but were dropped from aggregation because they were missing schema-required fields (partial write / manual edit / buggy emitter). They are never counted toward `records` or any aggregate — a syntactically valid but incomplete record must degrade, not silently understate totals. Optional: absent on pre-round-5 records.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "window": {
+          "description": "GitHub-derived scan window (#615 round 3): how many recently updated merged PRs were scanned for prior records and whether the page cap left older history unscanned. truncated=true means the totals are a bounded window (renderer labels 'window: last N merged PRs'), never repo-wide. Absent for non-github-derived sources and pre-window records.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scanned_prs", "truncated"],
+          "properties": {
+            "scanned_prs": { "type": "integer", "minimum": 0 },
+            "truncated": { "type": "boolean" },
+            "review_truncated_prs": {
+              "description": "Scanned PRs whose review connection held more reviews than the nested per-PR review window (#615 round 4) — their older reviews (and any embedded records in them) were not scanned. Any positive count forces truncated=true (honest bounded-window labeling instead of nested pagination). Optional: absent on pre-round-4 records.",
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "auto_approved_prs": { "type": ["integer", "null"], "minimum": 0 },
+        "automated_attempts": { "type": ["integer", "null"], "minimum": 0 },
+        "fail_closed_events": { "type": ["integer", "null"], "minimum": 0 },
+        "tokens_total": { "type": ["integer", "null"], "minimum": 0 },
+        "elapsed_seconds_total": {
+          "description": "Cumulative reviewer wall-clock (seconds) across the aggregated records. Optional: records aggregated from pre-#602 sources may not carry it; the renderer shows 'unavailable' when absent/null.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "notional_usd": { "type": ["number", "null"], "minimum": 0 },
+        "human_minutes_saved_estimate": {
+          "description": "Two-element [low, high] range of human shuttle minutes displaced, or null when unavailable.",
+          "type": ["array", "null"],
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "number", "minimum": 0 }
+        },
+        "reason": {
+          "description": "Present only when source == 'unavailable': why aggregation degraded.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}

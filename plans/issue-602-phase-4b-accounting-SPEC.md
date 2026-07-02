@@ -86,6 +86,8 @@ notional_usd = input/1e6·p.input + output/1e6·p.output
 
 When only a total is exposed (Codex), apply a single `p.blended` per-million rate and mark it `~approx`. Store rates per model in a **versioned** table (`scripts/phase-4b/prices.json` or a `phase_4b_automation.accounting.prices` map) and stamp `price_table_version` into every record so historical totals stay reproducible. **Do not hardcode prices from memory**; populate from current published list prices and treat as config. Missing price ⇒ notional `n/a`, record still posts.
 
+When the CLI **reports** a cost directly (the Claude print-mode envelope's `total_cost_usd`), prefer it over the computed notional: the per-loop record carries it as `tokens.cost_usd`, the per-approval `totals.reported_cost_usd` sums it fail-closed (null unless every loop with measured usage also reported one — never a partial underreport), and the cost row labels its source (`CLI-reported` vs the price-table notional). Absent stays `n/a` — the never-guess contract is unchanged.
+
 Present the expense as four real costs, not one number: **wall-clock** (the actual scarce resource — merge-cycle latency), **tokens**, **plan-capacity/throttle events**, and the labeled **notional $**. Pair it with **human shuttle time avoided** — the manual Phase 4b handoff "typically adds 30 minutes to a few hours per PR" (`REVIEW_POLICY.md` § Phase 4b Triggers) — so the reader weighs cost against value.
 
 ## Running totals (cumulative, computed at post time)
@@ -129,14 +131,14 @@ This reproduces the #580 four-loop story that had to be posted by hand, as the w
 
 ### Findings and disposition
 
-| Finding | Severity | First loop | Last seen | Disposition | Fix commit / issue |
-|---|---|---:|---:|---|---|
-| Codex `--output-schema` vs jq validator drift (`line` min) | P2 | 3 | 3 | deferred-to-follow-up | #585 |
-| Record reviewer CLI version before enablement | P2 | 3 | 3 | deferred-to-follow-up | #586 |
-| Harden Claude JSON extraction beyond first/last brace | P3 | 3 | 3 | deferred-to-follow-up | #587 |
-| Make local shellcheck absence more visible | P3 | 3 | 3 | deferred-to-follow-up | #588 |
+| Finding | Severity | Location | Summary | Scope | First loop | Last seen | Disposition | Fix commit / issue |
+|---|---|---|---|---|---:|---:|---|---|
+| F1 | P2 | — | Codex `--output-schema` vs jq validator drift (`line` min) | current-head | 3 | 3 | deferred-to-follow-up | #585 |
+| F2 | P2 | — | Record reviewer CLI version before enablement | current-head | 3 | 3 | deferred-to-follow-up | #586 |
+| F3 | P3 | — | Harden Claude JSON extraction beyond first/last brace | current-head | 3 | 3 | deferred-to-follow-up | #587 |
+| F4 | P3 | — | Make local shellcheck absence more visible | current-head | 3 | 3 | deferred-to-follow-up | #588 |
 
-Unique current-head findings: 4 (all advisory, non-blocking). Repeated/stale across loops: 0.
+Unique findings across loops: 4 — 4 on the approved head, 0 historical (earlier loops only). Repeated across loops: 0. (Scope is derived per finding: `current-head` only when it was last seen on a loop that reviewed the final head sha; a finding last seen on a prior commit — the changes-requested-then-fixed lifecycle — renders `historical`, never as residual current-head risk. Summary is the first body line truncated to 80 chars; full bodies stay in the local loop log, never in the posted block.)
 
 ### Cost and effort
 
@@ -164,6 +166,13 @@ Unique current-head findings: 4 (all advisory, non-blocking). Repeated/stale acr
 
 *Totals source: github-derived (24 `p4b-accounting:v1` records).*
 
+> Cumulative human-time-saved rendering (#615 Codex round 7): a bound below one
+> hour renders in minutes, never floored to `~0 h`. Both bounds ≥ 60 min keep
+> the shared-unit `~A – B h` form shown above; a sub-hour low bound switches to
+> per-bound units — e.g. a single prior approval (`[30, 180]`) renders
+> `~30 min – 3 h` (the documented 30-minute floor, matching the per-loop "Human
+> shuttle avoided" line), and `[30, 50]` renders `~30 – 50 min`.
+
 ### Safety and value notes
 
 - Fail-closed events: **1** (loop 4, approval-carried-findings, 76 s) — prevented an unsafe auto-approval. ✅
@@ -176,18 +185,18 @@ Unique current-head findings: 4 (all advisory, non-blocking). Repeated/stale acr
 <!-- p4b-accounting:v1
 {"schema":"p4b-accounting/v1","pr":580,"final_head_sha":"d05ff4d0…","final_verdict":"APPROVED","final_reviewer":"nathanpayne-codex","final_direction":"claude->codex","automation_state":"dry-run","wall_time_first_loop_to_approval_seconds":225,
  "loops":[
-  {"loop":1,"reviewer":"nathanpayne-codex","adapter":"review-via-codex.sh","direction":"claude->codex","head_sha":"d05ff4d0…","verdict":"APPROVED","posted":"direct-probe","fell_back":false,"elapsed_seconds":18,"tokens":{"total":55926,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"codex-stderr"},"findings":{"P0":0,"P1":0,"P2":0,"P3":0,"nitpick":0,"unknown":0},"cli_version":"codex/0.137","timeout_seconds":900,"effort":null,"throttle_events":1,"plan_auth":"chatgpt","fail_closed":{"happened":false,"reason":null,"duration_seconds":null}},
-  {"loop":2,"reviewer":"nathanpayne-codex","adapter":"orchestrator-dry-run","direction":"claude->codex","head_sha":"d05ff4d0…","verdict":"APPROVED","posted":"dry-run","fell_back":false,"elapsed_seconds":65,"tokens":{"total":113918,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"codex-stderr"},"findings":{"P0":0,"P1":0,"P2":0,"P3":0,"nitpick":0,"unknown":0},"cli_version":"codex/0.137","timeout_seconds":900,"effort":null,"throttle_events":0,"plan_auth":"chatgpt","fail_closed":{"happened":false,"reason":null,"duration_seconds":null}},
-  {"loop":3,"reviewer":"nathanpayne-claude","adapter":"review-via-claude.sh","direction":"codex->claude","head_sha":"d05ff4d0…","verdict":"APPROVED_WITH_ADVISORIES","posted":"direct-probe","fell_back":false,"elapsed_seconds":66,"tokens":{"total":7360,"input":1589,"output":5771,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"claude-json"},"findings":{"P0":0,"P1":0,"P2":2,"P3":2,"nitpick":0,"unknown":0},"cli_version":null,"timeout_seconds":900,"effort":"medium","throttle_events":0,"plan_auth":"firstParty","fail_closed":{"happened":false,"reason":null,"duration_seconds":null}},
-  {"loop":4,"reviewer":"nathanpayne-claude","adapter":"orchestrator-dry-run","direction":"codex->claude","head_sha":"d05ff4d0…","verdict":"CHANGES_REQUESTED","posted":"not-posted","fell_back":true,"elapsed_seconds":76,"tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"source":"unavailable"},"findings":{"P0":0,"P1":0,"P2":null,"P3":null,"nitpick":null,"unknown":null},"cli_version":null,"timeout_seconds":900,"effort":"medium","throttle_events":0,"plan_auth":"firstParty","fail_closed":{"happened":true,"reason":"approval-carried-findings","duration_seconds":76}}
+  {"loop":1,"reviewer":"nathanpayne-codex","adapter":"review-via-codex.sh","direction":"claude->codex","head_sha":"d05ff4d0…","verdict":"APPROVED","posted":"direct-probe","fell_back":false,"elapsed_seconds":18,"tokens":{"total":55926,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"codex-stderr"},"findings":{"P0":0,"P1":0,"P2":0,"P3":0,"nitpick":0,"unknown":0},"cli_version":"codex/0.137","timeout_seconds":900,"effort":null,"throttle_events":1,"plan_auth":"chatgpt","fail_closed":{"happened":false,"reason":null,"duration_seconds":null}},
+  {"loop":2,"reviewer":"nathanpayne-codex","adapter":"orchestrator-dry-run","direction":"claude->codex","head_sha":"d05ff4d0…","verdict":"APPROVED","posted":"dry-run","fell_back":false,"elapsed_seconds":65,"tokens":{"total":113918,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"codex-stderr"},"findings":{"P0":0,"P1":0,"P2":0,"P3":0,"nitpick":0,"unknown":0},"cli_version":"codex/0.137","timeout_seconds":900,"effort":null,"throttle_events":0,"plan_auth":"chatgpt","fail_closed":{"happened":false,"reason":null,"duration_seconds":null}},
+  {"loop":3,"reviewer":"nathanpayne-claude","adapter":"review-via-claude.sh","direction":"codex->claude","head_sha":"d05ff4d0…","verdict":"APPROVED_WITH_ADVISORIES","posted":"direct-probe","fell_back":false,"elapsed_seconds":66,"tokens":{"total":7360,"input":1589,"output":5771,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"claude-json"},"findings":{"P0":0,"P1":0,"P2":2,"P3":2,"nitpick":0,"unknown":0},"cli_version":null,"timeout_seconds":900,"effort":"medium","throttle_events":0,"plan_auth":"firstParty","fail_closed":{"happened":false,"reason":null,"duration_seconds":null}},
+  {"loop":4,"reviewer":"nathanpayne-claude","adapter":"orchestrator-dry-run","direction":"codex->claude","head_sha":"d05ff4d0…","verdict":"CHANGES_REQUESTED","posted":"not-posted","fell_back":true,"elapsed_seconds":76,"tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"unavailable"},"findings":{"P0":0,"P1":0,"P2":null,"P3":null,"nitpick":null,"unknown":null},"cli_version":null,"timeout_seconds":900,"effort":"medium","throttle_events":0,"plan_auth":"firstParty","fail_closed":{"happened":true,"reason":"approval-carried-findings","duration_seconds":76}}
  ],
  "unique_findings":[
-  {"id":"F1","severity":"P2","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":585},
-  {"id":"F2","severity":"P2","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":586},
-  {"id":"F3","severity":"P3","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":587},
-  {"id":"F4","severity":"P3","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":588}
+  {"id":"F1","severity":"P2","path":null,"line":null,"title":"Codex `--output-schema` vs jq validator drift (`line` min)","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":585},
+  {"id":"F2","severity":"P2","path":null,"line":null,"title":"Record reviewer CLI version before enablement","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":586},
+  {"id":"F3","severity":"P3","path":null,"line":null,"title":"Harden Claude JSON extraction beyond first/last brace","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":587},
+  {"id":"F4","severity":"P3","path":null,"line":null,"title":"Make local shellcheck absence more visible","first_loop":3,"last_loop":3,"disposition":"deferred-to-follow-up","fix_commit":null,"issue":588}
  ],
- "totals":{"adapter_invocations":4,"tokens_total":177204,"tokens_by_provider":{"codex":169844,"claude":7360},"elapsed_seconds_total":225,"billed_usd":0.0,"notional_usd":0.66,"price_table_version":"2026-07-01","fail_closed_events":1,"advisory_issues_filed":[585,586,587,588]},
+ "totals":{"adapter_invocations":4,"tokens_total":177204,"tokens_by_provider":{"codex":169844,"claude":7360},"elapsed_seconds_total":225,"billed_usd":0.0,"notional_usd":0.66,"reported_cost_usd":null,"price_table_version":"2026-07-01","fail_closed_events":1,"advisory_issues_filed":[585,586,587,588]},
  "running_totals":{"source":"github-derived","records":24,"auto_approved_prs":24,"automated_attempts":27,"fail_closed_events":3,"tokens_total":2360000,"notional_usd":9.40,"human_minutes_saved_estimate":[720,4320]},
  "generated_at":"2026-07-01T16:24:01Z"}
 -->
@@ -220,6 +229,7 @@ Unique current-head findings: 4 (all advisory, non-blocking). Repeated/stale acr
 - A required-tier (P0/P1) finding can **never** accompany a posted `APPROVED` — assert and fail closed.
 - Totals degrade to `unavailable` rather than guessing.
 - Machine-readable block uses explicit `null` / `"unavailable"`, never silent omission; schema-versioned (`p4b-accounting/v1`).
+- The embedded payload is HTML-comment-safe: any `-->` / `--!>` / `<!--` sequence inside a record string (e.g. a hostile finding title) is emitted with its angle bracket as a JSON unicode escape — identical parsed value, but the hidden comment can never terminate early (visible render) or truncate extraction.
 
 ## Acceptance criteria
 

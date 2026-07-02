@@ -170,6 +170,18 @@ jobs:
       - name: check_phase_4b_automation
         run: ./scripts/ci/check_phase_4b_automation
 
+      - name: check_phase_4b_accounting
+        # Phase 4b approval-loop accounting (#602), wired like
+        # check_phase_4b_automation above. Self-bootstrap guard (#590
+        # class): repo_lint.yml reaches consumers via the template mirror
+        # ahead of the manifest-synced scripts, so a tree can carry this
+        # step before scripts/ci/check_phase_4b_accounting exists — that
+        # window soft-passes instead of 127-failing, and the check
+        # activates as soon as the script lands. (Kept on one line so the
+        # check_ci_scripts_wired parser still sees an explicit
+        # `run: ./scripts/ci/check_phase_4b_accounting` wire.)
+        run: ./scripts/ci/check_phase_4b_accounting || { rc=$?; if [ ! -f scripts/ci/check_phase_4b_accounting ]; then echo "check_phase_4b_accounting not on this tree yet — soft pass (self-bootstrap)"; exit 0; fi; exit "$rc"; }
+
       - name: check_lint_tooling
         run: ./scripts/ci/check_lint_tooling
 

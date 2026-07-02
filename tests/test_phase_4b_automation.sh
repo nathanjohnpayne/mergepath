@@ -28,6 +28,13 @@ done
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/p4b-auto-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
+# (#602) The approval-loop accounting hook defaults ON under an enabled
+# phase_4b_automation block, so the orchestrator runs below would otherwise
+# write loop-log/ledger runtime state into the repo's .mergepath/. Keep the
+# suite hermetic; accounting behavior itself is covered by
+# tests/test_phase_4b_accounting.sh.
+export P4B_ACCT_STATE_DIR="$WORK/acct-state"
+
 PASS=0; FAIL=0
 pass() { echo "  PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $*" >&2; FAIL=$((FAIL + 1)); }

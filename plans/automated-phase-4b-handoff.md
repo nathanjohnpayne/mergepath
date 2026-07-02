@@ -487,7 +487,59 @@ and does not alter the existing
 3. **Auto-merge composition.** Confirm the existing `auto-merge-on-approval` path arms on the automated `APPROVED` for true zero-touch merge.
 4. **Propagate to consumers.** Add the `phase_4b.automation` block to the templated surface; consumers opt in explicitly.
 
-## 17. Open questions
+## 17. Approval-loop accounting (#602)
+
+Every automated Phase 4b approval now carries its own rigor / cost / time /
+quality story so an operator never reconstructs it after the fact (as had to
+happen on #580). The reconciled source of truth is
+[`plans/issue-602-phase-4b-accounting-SPEC.md`](issue-602-phase-4b-accounting-SPEC.md);
+this section is the design summary.
+
+- **Where it lives.** `scripts/phase-4b/accounting.sh` (sourced by the
+  orchestrator; pure functions over JSON, unit-testable offline via
+  `tests/test_phase_4b_accounting.sh` / `scripts/ci/check_phase_4b_accounting`)
+  renders a `## Phase 4b Approval Accounting` block that the orchestrator
+  appends to the **body of the automated `APPROVED` review** — the same
+  HEAD-pinned pull-review POST as today, no separate comment. The block embeds
+  a machine-readable `<!-- p4b-accounting:v1 ... -->` record validated by
+  `scripts/phase-4b/accounting.schema.json`.
+- **Loop-centric.** Each orchestrator invocation appends one loop record to a
+  per-PR loop log (`.mergepath/phase-4b-loops/…`, gitignored runtime state),
+  including CHANGES_REQUESTED rounds and fail-closed fallbacks (recorded as
+  positive safety evidence: reason + duration), so the final approval renders
+  the whole changes-requested-then-fixed history, the findings lifecycle
+  (first/last loop, disposition, fix-commit/issue links), and a rigor
+  proof-of-work table whose rows are green only when the backing signal was
+  captured (else `n/a — reason`).
+- **Advisory to safety, fail-closed for integrity.** Report-generation failure
+  ⇒ the orchestrator posts its existing plain-summary approval (exit codes
+  unchanged); accounting can never block or fabricate an approval. Conversely
+  the builder/renderer refuse (fail closed) any record whose loop history
+  would pair a posted `APPROVED` with a required-tier (P0/P1 by default)
+  finding, tokens are never estimated (`unavailable` with source/reason), and
+  running totals degrade to `unavailable` rather than guessing.
+- **Cost model.** Billed marginal cost is `$0.00` (plan-only auth); the block
+  additionally reports wall-clock, CLI-exposed tokens (the additive nullable
+  `usage` fields in `verdict.schema.json` carry cache/reasoning/cost when the
+  CLI envelope exposes them), plan-capacity throttle events, a **notional**
+  metered-API equivalent priced from the versioned
+  `scripts/phase-4b/prices.json` (`price_table_version` stamped into every
+  record; missing price ⇒ `n/a`, record still posts), and the cited
+  human-shuttle-avoided range from REVIEW_POLICY.md § Phase 4b Triggers.
+- **Running totals.** Aggregated at post time from prior `p4b-accounting:v1`
+  records — an injected GitHub-derived record file
+  (`P4B_ACCT_PRIOR_RECORDS_JSONL`, produced by piping prior review bodies
+  through `p4b_acct_extract_records`) wins; the append-only
+  `.mergepath/phase-4b-ledger.jsonl` cache is the fallback; neither ⇒ the
+  section says `unavailable` with the reason. The totals source is always
+  named in the block footer.
+- **Toggles.** `phase_4b_automation.accounting.enabled` (default `true` under
+  the disabled-by-default parent) plus opt-in
+  `accounting.{codex,claude}_price_key` mappings for the notional figure —
+  the adapters do not capture exact model IDs yet, so pricing is never
+  inferred.
+
+## 18. Open questions
 
 - **Verdict reliability bar.** What false-approval rate is acceptable before auto-posting `APPROVED` versus defaulting to `COMMENTED` + human confirm during phase 1–2?
 - **Codex output schema fidelity.** Does `--output-schema` constrain `codex exec` tightly enough to trust the mapped state, or should the Codex direction also gate on a confirmation pass?
@@ -496,7 +548,7 @@ and does not alter the existing
 - **Latency budget — initial default.** Headless reviewer CLI execution is bounded at 900 seconds by default (`P4B_ADAPTER_TIMEOUT_SECONDS` / `P4B_REVIEW_CLI_TIMEOUT_SECONDS`) before manual fallback. Tune this after observing live wall-clock behavior across several 4b reviews.
 - **Billing model — resolved.** Reviewer CLIs run on the operator's individual subscription plans, never the pay-per-token API. Enforced in the adapters by rejecting persisted API-key auth modes (`auth_mode != chatgpt` for Codex; Claude auth status must be `apiProvider=firstParty` with `authMethod=claude.ai` plus a subscription type, or `authMethod=oauth_token`) and by launching the child CLI under an allowlisted environment that excludes API-key env vars and ambient credentials. Both paths are covered by `tests/test_phase_4b_automation.sh`. A configurable API-billing mode — for a CI or org runner that has no plan login — is a deferred follow-up, not part of this reference.
 
-## 18. References
+## 19. References
 
 **Internal**
 

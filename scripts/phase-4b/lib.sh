@@ -55,14 +55,28 @@ p4b_config() {
 
 # p4b_automation_field <field> — scalar under the top-level
 # `phase_4b_automation:` block. Empty string if absent; caller defaults.
+# Nesting-aware (#615 Codex round 3): only DIRECT children of the block
+# match. The block carries nested sub-blocks (e.g. `accounting.enabled`),
+# and the previous flat scan matched a nested key as the parent-level
+# field — a downstream policy that omitted or reordered the parent
+# `enabled` would read the accounting sub-toggle as the master switch and
+# wrongly run the orchestrator. The direct-child indent is captured from
+# the first key line inside the block (so 2- and 4-space styles both
+# work); deeper-indented lines belong to sub-blocks and never match —
+# sub-block readers (p4b_acct_config_field, mirroring codex_p1_gate_field)
+# own those.
 p4b_automation_field() {
   local field="$1" cfg
   cfg="$(p4b_config)"
   [ -f "$cfg" ] || return 0
   awk -v field="$field" '
-    /^phase_4b_automation:/ { inblk=1; next }
+    /^phase_4b_automation:/ { inblk=1; child_indent=-1; next }
     inblk && /^[^[:space:]#]/ { inblk=0 }
     inblk {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      indent = match($0, /[^[:space:]]/) - 1
+      if (child_indent < 0) child_indent = indent
+      if (indent > child_indent) next
       if ($1 == field":") {
         sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
         gsub(/^["\047]/, "", $0)
@@ -412,6 +426,7 @@ p4b_validate_verdict() {
     | ($s.properties.findings.items.required | sort) as $finding_keys
     | ($s.properties.findings.items.properties.severity.enum) as $severity_enum
     | ($s.properties.usage.required | sort) as $usage_keys
+    | ($s.properties.usage.properties | keys | sort) as $usage_all_keys
     | def okstr: (type == "string") and (length > 0);
       def okintnull: (. == null) or (type == "number" and floor == . and . >= 0);
       # Guard the derived constants are the right SHAPE first. `sort` already
@@ -437,12 +452,28 @@ p4b_validate_verdict() {
             and (.body | okstr))
       and ((.verdict != "APPROVED")
            or all(.findings[]?; (.severity as $s2 | ($required_severities | index($s2) | not))))
+      # usage: the schema-required keys must all be present, any other key
+      # must be one the schema DECLARES (the additive optional #602 fields),
+      # and every field must type-check. This mirrors the JSON Schema exactly:
+      # required ⊆ keys ⊆ properties, additionalProperties: false.
       and ((.usage == null)
            or ((.usage | type == "object")
-               and ((.usage | keys_unsorted | sort) == $usage_keys)
+               and ((.usage | keys_unsorted | sort) as $uk
+                    | (($usage_keys - $uk) == []) and (($uk - $usage_all_keys) == []))
                and (.usage.token_count | okintnull)
                and (.usage.input_tokens | okintnull)
                and (.usage.output_tokens | okintnull)
+               # Optional #602 fields: plain `.usage.X` yields null for an
+               # ABSENT key (accepted), while a PRESENT wrong-typed value must
+               # fail the type check. Never `// null` here — the jq alternative
+               # operator treats `false` as absent, so a boolean field
+               # (cache_read_input_tokens:false) would silently pass (#615
+               # Codex; the known repo `//`-vs-false footgun).
+               and (.usage.cache_creation_input_tokens | okintnull)
+               and (.usage.cache_read_input_tokens | okintnull)
+               and (.usage.reasoning_tokens | okintnull)
+               and (.usage.total_cost_usd as $c
+                    | ($c == null) or (($c | type) == "number" and $c >= 0))
                and (.usage.source | okstr)))
   ' >/dev/null 2>&1
 }

@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# check_phase_4b_accounting
+#
+# Verifies the Phase 4b approval-loop accounting package (#602) is present,
+# structurally sound, and passing its unit tests. The package renders the
+# "## Phase 4b Approval Accounting" block (+ embedded p4b-accounting:v1
+# record) into automated Phase 4b APPROVED review bodies, advisory to safety
+# (a report failure never blocks or fabricates an approval):
+#
+#   scripts/phase-4b/accounting.sh           (ledger builder + renderer, sourced)
+#   scripts/phase-4b/accounting.schema.json  (p4b-accounting/v1 record contract)
+#   scripts/phase-4b/prices.json             (versioned notional-cost rates)
+#
+# Fail-closed around tests/test_phase_4b_accounting.sh: a missing test
+# script is a hard error, not a silent skip (matches check_phase_4b_automation).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+REQUIRED_FILES=(
+  "scripts/phase-4b/accounting.sh"
+  "scripts/phase-4b/accounting.schema.json"
+  "scripts/phase-4b/prices.json"
+)
+TEST="tests/test_phase_4b_accounting.sh"
+
+FAILED=0
+
+for rel in "${REQUIRED_FILES[@]}"; do
+  if [ ! -f "$REPO_ROOT/$rel" ]; then
+    echo "FAIL: missing required file: $rel"; FAILED=1
+  fi
+done
+
+# accounting.sh is sourced (not executed) but must at least parse.
+if [ -f "$REPO_ROOT/scripts/phase-4b/accounting.sh" ] \
+   && ! bash -n "$REPO_ROOT/scripts/phase-4b/accounting.sh"; then
+  echo "FAIL: scripts/phase-4b/accounting.sh has a bash syntax error"; FAILED=1
+fi
+
+# The record schema and the price table must be valid JSON; the price table
+# must carry the version stamp every record embeds (reproducible totals).
+if command -v jq >/dev/null 2>&1; then
+  for rel in "scripts/phase-4b/accounting.schema.json" "scripts/phase-4b/prices.json"; do
+    if [ -f "$REPO_ROOT/$rel" ] && ! jq -e . "$REPO_ROOT/$rel" >/dev/null 2>&1; then
+      echo "FAIL: $rel is not valid JSON"; FAILED=1
+    fi
+  done
+  if [ -f "$REPO_ROOT/scripts/phase-4b/prices.json" ] \
+     && ! jq -e '.version | type == "string" and length > 0' \
+          "$REPO_ROOT/scripts/phase-4b/prices.json" >/dev/null 2>&1; then
+    echo "FAIL: scripts/phase-4b/prices.json is missing its version stamp"; FAILED=1
+  fi
+else
+  echo "WARN: jq not available — skipping schema/price-table JSON validation"
+fi
+
+# Optional static analysis: run shellcheck when present (CI has it). Same
+# posture as check_phase_4b_automation — when shellcheck is ABSENT this routes
+# through scripts/lib/lint-tooling.sh (#588): loud WARN locally, hard fail in
+# CI / with MERGEPATH_REQUIRE_SHELLCHECK=1.
+LINT_TOOLING_LIB="$REPO_ROOT/scripts/lib/lint-tooling.sh"
+if [ ! -f "$LINT_TOOLING_LIB" ]; then
+  echo "FAIL: missing required library: scripts/lib/lint-tooling.sh"
+  echo "check_phase_4b_accounting: FAIL"
+  exit 1
+fi
+# shellcheck source=../lib/lint-tooling.sh
+. "$LINT_TOOLING_LIB"
+if command -v shellcheck >/dev/null 2>&1; then
+  if ! shellcheck --severity=warning \
+      "$REPO_ROOT/scripts/phase-4b/accounting.sh" \
+      "$REPO_ROOT/tests/test_phase_4b_accounting.sh"; then
+    echo "FAIL: shellcheck reported warnings/errors in the phase-4b accounting scripts"; FAILED=1
+  fi
+else
+  lint_tooling_require_shellcheck || FAILED=1
+fi
+
+if [ "$FAILED" -eq 1 ]; then
+  echo "check_phase_4b_accounting: FAIL"
+  exit 1
+fi
+
+if [ ! -f "$REPO_ROOT/$TEST" ]; then
+  echo "FAIL: missing required test: $TEST (fail-closed — no silent skip)"
+  echo "check_phase_4b_accounting: FAIL"
+  exit 1
+fi
+
+echo "check_phase_4b_accounting: running $TEST"
+"$REPO_ROOT/$TEST"
+
+echo "check_phase_4b_accounting: PASS"
+exit 0

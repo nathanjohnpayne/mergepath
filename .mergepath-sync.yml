@@ -705,6 +705,13 @@ paths:
   - path: tests/test_phase_4b_automation.sh
     type: canonical
     consumers: all
+  # Pairs with scripts/phase-4b/accounting.sh (+ accounting.schema.json and
+  # prices.json, all carried by the scripts/phase-4b/ kit) and is
+  # hard-required by scripts/ci/check_phase_4b_accounting (#602). Offline:
+  # fake CLIs, fake gh wrapper, fixture policy + price tables; no network.
+  - path: tests/test_phase_4b_accounting.sh
+    type: canonical
+    consumers: all
   # Schema↔validator parity fixtures hard-read at runtime by
   # tests/test_phase_4b_automation.sh (#585). Without this propagated, a
   # consumer's check_phase_4b_automation fails at "parity fixtures missing"
@@ -949,10 +956,13 @@ paths:
     type: kit
     consumers: all
     # Automated Phase 4b handoff package (#579): adapters, schema, shared
-    # shell helpers, and README. The top-level orchestrator and CI check
-    # both depend on these files as one versioned package; consumer repos
-    # may add local notes/scripts in this directory without forking the
-    # canonical files.
+    # shell helpers, and README — plus the approval-loop accounting module
+    # (#602: accounting.sh, accounting.schema.json, prices.json) rendered
+    # into automated APPROVED review bodies. The top-level orchestrator and
+    # CI checks (check_phase_4b_automation, check_phase_4b_accounting) all
+    # depend on these files as one versioned package; consumer repos may add
+    # local notes/scripts in this directory without forking the canonical
+    # files.
   - path: scripts/ci/
     type: kit
     consumers: all
@@ -992,6 +1002,7 @@ paths:
       - "tests/test_check_coderabbit_config.sh"  # check_coderabbit_config_tests (#481/#482)
       - "tests/test_check_propagation_closure.sh"  # check_propagation_closure (#521)
       - "tests/test_phase_4b_automation.sh"  # check_phase_4b_automation (#579)
+      - "tests/test_phase_4b_accounting.sh"  # check_phase_4b_accounting (#602)
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
       - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)
       - "tests/test_codex_review_request_entry.sh"  # check_codex_scripts (#486)
