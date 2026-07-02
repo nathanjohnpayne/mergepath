@@ -202,7 +202,42 @@ jobs:
       - name: check_merge_clearance_gate
         run: ./scripts/ci/check_merge_clearance_gate
 
+      - name: install_yq_for_sync_manifest
+        # mikefarah/yq is needed by check_sync_manifest and by
+        # check_resolve_pr_threads (whose delegated
+        # tests/test_resolve_pr_threads_verified_propagation.sh suite,
+        # #572, parses the sync manifest and hard-fails without yq —
+        # fail-closed by design, so this install MUST precede it).
+        # Ordered before the FIRST yq-dependent check; keep it ahead of
+        # check_resolve_pr_threads if steps are reshuffled.
+        #
+        # Single source for the version pin: scripts/lib/ensure-yq.sh
+        # (#616), which check_resolve_pr_threads also invokes (CI-only)
+        # so it stays self-sufficient when a consumer's repo_lint.yml
+        # lags the manifest-synced scripts/ci kit (#601 skew window).
+        # The reverse skew (this workflow arriving before the lib) falls
+        # back to the runner image's preinstalled yq 4.x rather than
+        # duplicating the pin inline — but only after the same
+        # implementation sniff ensure-yq.sh applies (#616 finding
+        # 3510689523): any other executable named yq (e.g. the Python
+        # wrapper) would pass a bare `command -v` and then fail the
+        # later mikefarah-v4 manifest parses with opaque errors instead
+        # of failing loudly here.
+        run: |
+          if [ -f scripts/lib/ensure-yq.sh ]; then
+            bash scripts/lib/ensure-yq.sh
+          elif command -v yq >/dev/null 2>&1 \
+              && yq --version 2>&1 | grep -q "mikefarah/yq"; then
+            echo "scripts/lib/ensure-yq.sh not synced yet (#601 skew) — using preinstalled $(yq --version)"
+          else
+            echo "FAIL: scripts/lib/ensure-yq.sh is missing and no mikefarah/yq is on PATH — sync scripts/lib/ensure-yq.sh (the single-source pinned bootstrap) to resolve" >&2
+            exit 1
+          fi
+
       - name: check_resolve_pr_threads
+        # Requires yq via the delegated verified-propagation suite —
+        # runs after install_yq_for_sync_manifest above (Codex P2 on
+        # #616, finding 3509567286).
         run: ./scripts/ci/check_resolve_pr_threads
 
       - name: check_gh_as_author
@@ -238,22 +273,10 @@ jobs:
       - name: check_disagreement_detector
         run: ./scripts/ci/check_disagreement_detector
 
-      - name: install_yq_for_sync_manifest
-        # mikefarah/yq is needed by check_sync_manifest. Pin a recent v4
-        # release; bumped opportunistically. The official ubuntu-latest
-        # runner ships yq 4.x preinstalled today, but pinning makes the
-        # check resilient to runner image changes.
-        run: |
-          if command -v yq >/dev/null 2>&1 && yq --version 2>&1 | grep -q "mikefarah/yq"; then
-            echo "yq already present: $(yq --version)"
-          else
-            sudo wget -q -O /usr/local/bin/yq \
-              https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
-            sudo chmod +x /usr/local/bin/yq
-            yq --version
-          fi
-
       - name: check_sync_manifest
+        # Requires mikefarah/yq — installed by install_yq_for_sync_manifest,
+        # which now runs earlier (before check_resolve_pr_threads, the
+        # first yq-dependent step; see that step for the pin rationale).
         run: ./scripts/ci/check_sync_manifest
 
       - name: check_propagation_closure
@@ -329,6 +352,18 @@ jobs:
         # Verifies exit-4 status probing stays advisory, surfaces the
         # reply in JSON, and never counts the reply as clearance.
         run: ./scripts/ci/check_coderabbit_wait
+
+      - name: check_coderabbit_record_feedback
+        # CodeRabbit disposition-verdict ledger (#584) — the disposition-only
+        # twin of check_codex_scripts' codex-record-feedback coverage (#487).
+        # Verifies scripts/coderabbit-record-feedback.sh exists + is
+        # executable and runs its PATH-shimmed offline suite, including the
+        # #574 asymmetry guarantee that the recorder never issues a gh write.
+        # The `|| { ...; }` tail is the #590-style self-bootstrap guard:
+        # soft-pass when the check script is absent in this tree (a checkout
+        # whose repo_lint.yml arrived ahead of the scripts/ci kit sync — the
+        # #601 skew window); the check activates the moment the kit lands.
+        run: ./scripts/ci/check_coderabbit_record_feedback || { rc=$?; if [ ! -f scripts/ci/check_coderabbit_record_feedback ]; then echo "check_coderabbit_record_feedback not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
 
       - name: check_mktemp_portability
         # Regression guard for mergepath#286. Hard-fails on any

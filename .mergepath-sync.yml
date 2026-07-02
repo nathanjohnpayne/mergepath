@@ -293,6 +293,18 @@ paths:
   - path: scripts/lib/reviewers-helpers.sh
     type: canonical
     consumers: all
+  # Single-source pinned mikefarah/yq bootstrap (#616). Invoked CI-only
+  # (--ci-only, gated on GITHUB_ACTIONS=true) by
+  # scripts/ci/check_resolve_pr_threads when yq is missing, so the
+  # yq-dependent delegated verified-propagation suite is self-sufficient
+  # during the #601 skew window: the scripts/ci kit arrives via manifest
+  # sync while repo_lint.yml (whose install_yq_for_sync_manifest step
+  # delegates to this same script) travels separately on the
+  # template-mirror lane. Also declared in the scripts/ci/ kit requires:
+  # below so the closure invariant records the coupling.
+  - path: scripts/lib/ensure-yq.sh
+    type: canonical
+    consumers: all
   - path: scripts/coderabbit-wait.sh
     type: canonical
     consumers: all
@@ -377,6 +389,17 @@ paths:
     consumers: all
     requires:
       - "scripts/lib/feedback-policy-helpers.sh"
+  # CodeRabbit disposition-verdict ledger (#584) — the DISPOSITION-ONLY twin
+  # of scripts/codex-record-feedback.sh (#487). By-nature asymmetry (#574):
+  # CodeRabbit does not solicit per-finding reactions, so this helper never
+  # posts a reaction — GETs only, plus a local JSONL ledger append. It
+  # hard-sources the shared coderabbit_tier_of classifier (exit 3 if absent),
+  # so the feedback-policy lib must travel with it.
+  - path: scripts/coderabbit-record-feedback.sh
+    type: canonical
+    consumers: all
+    requires:
+      - "scripts/lib/feedback-policy-helpers.sh"
   # Shared reader + tier classifiers for the feedback_policy block (#576).
   # Sourced by scripts/ci/check_feedback_policy_helpers (via its test); once
   # #577 lands, both severity gates source it too. First-class entry so the
@@ -444,6 +467,14 @@ paths:
   - path: scripts/resolve-pr-threads.sh
     type: canonical
     consumers: all
+    # #572 --resolve-verified-propagation's templated arm sources the SAME
+    # render pair verify-propagation-pr.sh uses (existence-guarded — a
+    # missing lib skips the thread fail-closed rather than aborting). Both
+    # are consumers:all entries already; declared here so the #264 closure
+    # invariant keeps the coupling explicit.
+    requires:
+      - "scripts/lib/template-substitution.sh"
+      - "scripts/lib/manifest-fact-helpers.sh"
   - path: scripts/request-label-removal.sh
     type: canonical
     consumers: all
@@ -620,6 +651,12 @@ paths:
   - path: tests/test_codex_review_check_resolution.sh
     type: canonical
     consumers: all
+  # HEAD-anchored Codex issue-comment verdict clearance (#600/#567).
+  # check_codex_scripts (scripts/ci kit) hard-runs it, so it must travel to
+  # every consumer or the check fails pre-flight with `No such file`.
+  - path: tests/test_codex_review_check_verdict.sh
+    type: canonical
+    consumers: all
   # #465 fail-closed structural guards. check_codex_scripts hard-runs it.
   # Propagation-safe (skips workflows/scripts a consumer does not carry).
   - path: tests/test_465_fail_closed.sh
@@ -631,6 +668,16 @@ paths:
   # class as test_codex_review_request_ack.sh above. Fully stubbed (PATH-
   # shimmed gh + gh-as-reviewer.sh) — no live GitHub network.
   - path: tests/test_codex_record_feedback.sh
+    type: canonical
+    consumers: all
+  # Pairs with scripts/coderabbit-record-feedback.sh (#584).
+  # check_coderabbit_record_feedback (scripts/ci kit) hard-runs it, so it
+  # must travel to every consumer or the check fails pre-flight with
+  # `Missing required file`. Same #264/#266 closure class as
+  # test_codex_record_feedback.sh above. Fully stubbed (PATH-shimmed gh) —
+  # no live GitHub network; it also copies the propagated
+  # scripts/lib/feedback-policy-helpers.sh (declared above).
+  - path: tests/test_coderabbit_record_feedback.sh
     type: canonical
     consumers: all
   # Pairs with scripts/merge-clearance-gate.sh +
@@ -715,6 +762,20 @@ paths:
   # "missing $PAGINATION_TEST" branch — same #264/#266 coupling class
   # as the rationale-tag pairing above. See #573.
   - path: tests/test_resolve_pr_threads_staleness_pagination.sh
+    type: canonical
+    consumers: all
+  # Pairs with scripts/resolve-pr-threads.sh +
+  # scripts/ci/check_resolve_pr_threads (third delegated test file, after
+  # the rationale-tag + staleness-pagination tests above). Exercises the
+  # #572 --resolve-verified-propagation mode: byte-verified resolution of
+  # canonical/templated routing threads (consumer current content vs
+  # mergepath canonical source / re-rendered template), drift and every
+  # verification failure skipped fail-closed, surface-class and human
+  # threads never touched, and the --dry-run preview. Without this test
+  # propagated, every consumer's check_resolve_pr_threads exits 1 on the
+  # wrapper's "missing $VERIFIED_PROPAGATION_TEST" branch — same #264/#266
+  # coupling class as the two pairings above. See #572.
+  - path: tests/test_resolve_pr_threads_verified_propagation.sh
     type: canonical
     consumers: all
   # Pairs with scripts/daily-feedback-rollup.sh +
@@ -935,6 +996,7 @@ paths:
       - "tests/test_match_protected_paths.sh"  # check_verify_propagation_pr (#471)
       - "tests/test_resolve_pr_threads_rationale_tag.sh"  # check_resolve_pr_threads (delegated test)
       - "tests/test_resolve_pr_threads_staleness_pagination.sh"  # check_resolve_pr_threads (delegated test, #573)
+      - "tests/test_resolve_pr_threads_verified_propagation.sh"  # check_resolve_pr_threads (delegated test, #572)
       - "tests/test_template_substitution.sh"  # check_template_substitution
       - "tests/test_export_consumer_facts.sh"  # check_export_consumer_facts
       - "tests/test_check_coderabbit_config.sh"  # check_coderabbit_config_tests (#481/#482)
@@ -945,8 +1007,10 @@ paths:
       - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)
       - "tests/test_codex_review_request_entry.sh"  # check_codex_scripts (#486)
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
+      - "tests/test_codex_review_check_verdict.sh"  # check_codex_scripts (#600/#567)
       - "tests/test_465_fail_closed.sh"        # check_codex_scripts (#465)
       - "tests/test_codex_record_feedback.sh"  # check_codex_scripts (#487)
+      - "tests/test_coderabbit_record_feedback.sh"  # check_coderabbit_record_feedback (#584)
       - "tests/test_audit_propagation_lane.sh" # check_propagation_lane_audit
       - "scripts/audit-propagation-lane.sh"    # check_propagation_lane_audit
       - "scripts/codex-p1-gate.sh"             # check_codex_p1_gate
@@ -956,12 +1020,14 @@ paths:
       - "scripts/codex-review-request.sh"      # check_codex_scripts
       - "scripts/codex-review-check.sh"        # check_codex_scripts, check_canonical_bugs_263caf3
       - "scripts/codex-record-feedback.sh"     # check_codex_scripts (#487)
+      - "scripts/coderabbit-record-feedback.sh"  # check_coderabbit_record_feedback (#584)
       - "scripts/phase-4b-classifier.sh"       # check_phase_4b_classifier
       - "scripts/phase-4b-review.sh"           # check_phase_4b_automation (#579)
       - "scripts/phase-4b/"                    # check_phase_4b_automation (#579)
       - "scripts/disagreement-detector.cjs"    # check_disagreement_detector
       - "scripts/request-label-removal.sh"     # check_canonical_bugs_263caf3
       - "scripts/resolve-pr-threads.sh"        # check_resolve_pr_threads
+      - "scripts/lib/ensure-yq.sh"             # check_resolve_pr_threads CI-only yq bootstrap (#616)
       - "scripts/gh-as-author.sh"              # check_gh_as_author (transitive)
       - "scripts/gh-as-reviewer.sh"            # check_gh_as_author (transitive)
       - "scripts/hooks/gh-pr-guard.sh"         # tests/test_gh_pr_guard.sh runs it
