@@ -190,7 +190,31 @@ jobs:
       - name: check_merge_clearance_gate
         run: ./scripts/ci/check_merge_clearance_gate
 
+      - name: install_yq_for_sync_manifest
+        # mikefarah/yq is needed by check_sync_manifest and by
+        # check_resolve_pr_threads (whose delegated
+        # tests/test_resolve_pr_threads_verified_propagation.sh suite,
+        # #572, parses the sync manifest and hard-fails without yq —
+        # fail-closed by design, so this install MUST precede it).
+        # Ordered before the FIRST yq-dependent check; keep it ahead of
+        # check_resolve_pr_threads if steps are reshuffled. Pin a recent
+        # v4 release; bumped opportunistically. The official
+        # ubuntu-latest runner ships yq 4.x preinstalled today, but
+        # pinning makes the checks resilient to runner image changes.
+        run: |
+          if command -v yq >/dev/null 2>&1 && yq --version 2>&1 | grep -q "mikefarah/yq"; then
+            echo "yq already present: $(yq --version)"
+          else
+            sudo wget -q -O /usr/local/bin/yq \
+              https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+            yq --version
+          fi
+
       - name: check_resolve_pr_threads
+        # Requires yq via the delegated verified-propagation suite —
+        # runs after install_yq_for_sync_manifest above (Codex P2 on
+        # #616, finding 3509567286).
         run: ./scripts/ci/check_resolve_pr_threads
 
       - name: check_gh_as_author
@@ -226,22 +250,10 @@ jobs:
       - name: check_disagreement_detector
         run: ./scripts/ci/check_disagreement_detector
 
-      - name: install_yq_for_sync_manifest
-        # mikefarah/yq is needed by check_sync_manifest. Pin a recent v4
-        # release; bumped opportunistically. The official ubuntu-latest
-        # runner ships yq 4.x preinstalled today, but pinning makes the
-        # check resilient to runner image changes.
-        run: |
-          if command -v yq >/dev/null 2>&1 && yq --version 2>&1 | grep -q "mikefarah/yq"; then
-            echo "yq already present: $(yq --version)"
-          else
-            sudo wget -q -O /usr/local/bin/yq \
-              https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
-            sudo chmod +x /usr/local/bin/yq
-            yq --version
-          fi
-
       - name: check_sync_manifest
+        # Requires mikefarah/yq — installed by install_yq_for_sync_manifest,
+        # which now runs earlier (before check_resolve_pr_threads, the
+        # first yq-dependent step; see that step for the pin rationale).
         run: ./scripts/ci/check_sync_manifest
 
       - name: check_propagation_closure
