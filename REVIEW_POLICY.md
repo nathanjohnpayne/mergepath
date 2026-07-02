@@ -448,8 +448,19 @@ that can change GitHub conversation state.
      thread that is demonstrably actioned (per the same evidence gate
      `--resolve-actioned` uses) is auto-upgraded to its truthful
      `addressed-elsewhere`/`rebuttal-recorded` tag with an INFO line.
+   - `scripts/resolve-pr-threads.sh <PR#> --resolve-verified-propagation`
+     is the tool for **verified canonical propagation** — routing-class
+     threads (`canonical-coverage`, `templated-render`) whose durable fix
+     already landed in mergepath and demonstrably reached this consumer.
+     It resolves a thread only when the consumer file at the
+     default-branch HEAD byte-matches the mergepath canonical source (or,
+     for templated entries, the rendered template output for that
+     consumer), tagging `verified-propagation` (#572). Any lookup, fetch,
+     or render failure is a fail-closed skip, never a resolve. A thread
+     with action evidence is auto-upgraded to its truthful actioned class
+     first (#575); unverifiable threads are left for the weekly sweep.
 
-   Either path runs an identity-checked `resolveReviewThread` followed by
+   Each path runs an identity-checked `resolveReviewThread` followed by
    a `reviewThreads`/`nodes(ids:)` readback confirming `isResolved: true`,
    and exits non-zero (fail closed) if any resolve cannot be confirmed.
    Then query `reviewThreads` again. For stale bot-authored threads whose

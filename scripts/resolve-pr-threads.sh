@@ -1460,7 +1460,12 @@ verify_propagation_content() {
     echo "thread has no anchored file path to verify"
     return 2
   fi
-  consumer_tmp=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-consumer.XXXXXX")
+  # mktemp failures (unwritable/full TMPDIR) must be a logged fail-closed
+  # skip, not an ambiguous-redirect bash error (CodeRabbit on #616).
+  if ! consumer_tmp=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-consumer.XXXXXX"); then
+    echo "mktemp failed for consumer content (TMPDIR unwritable or full?)"
+    return 2
+  fi
   if ! fetch_consumer_content "$vp_path" "$consumer_tmp"; then
     rm -f "$consumer_tmp"
     echo "could not fetch $REPO:$vp_path at the default-branch HEAD (contents API)"
@@ -1515,8 +1520,16 @@ verify_propagation_content() {
     echo "render libs missing (need scripts/lib/manifest-fact-helpers.sh + scripts/lib/template-substitution.sh)"
     return 2
   fi
-  rendered=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-rendered.XXXXXX")
-  render_err=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-render-err.XXXXXX")
+  if ! rendered=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-rendered.XXXXXX"); then
+    rm -f "$consumer_tmp"
+    echo "mktemp failed for render output (TMPDIR unwritable or full?)"
+    return 2
+  fi
+  if ! render_err=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-render-err.XXXXXX"); then
+    rm -f "$consumer_tmp" "$rendered"
+    echo "mktemp failed for render stderr (TMPDIR unwritable or full?)"
+    return 2
+  fi
   render_rc=0
   # Subshell render — identical shape to verify-propagation-pr.sh: facts
   # exports stay contained, and `|| exit $?` propagates a fail-closed

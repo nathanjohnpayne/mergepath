@@ -133,7 +133,13 @@ resolved; that is a blocked gate, not a disposition prompt.) Do not present a
    `--rationale`); it clears the conversation-resolution gate and tags
    `deferred-to-followup`, auto-upgrading any demonstrably-actioned thread
    to its truthful class. Do not use it on findings you fixed or rebutted —
-   that mis-records them as deferred (the #571 failure). Both modes run an
+   that mis-records them as deferred (the #571 failure).
+   `--resolve-verified-propagation` is the tool for **verified canonical
+   propagation** — routing-class threads (canonical-coverage /
+   templated-render) resolved only when the consumer file at the
+   default-branch HEAD byte-matches the mergepath canonical source (or
+   rendered template output), tagging `verified-propagation`; any lookup,
+   fetch, or render failure is a fail-closed skip (#572). All modes run an
    identity-checked `resolveReviewThread` plus a readback confirming
    `isResolved: true` and fail closed otherwise. For stale bot-authored
    threads fixed by a later commit, use the identity-checked
