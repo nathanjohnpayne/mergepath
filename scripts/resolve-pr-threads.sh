@@ -151,9 +151,15 @@
 #                           so a default-branch byte-match must not resolve
 #                           a thread whose candidate content still carries
 #                           drift; once the PR is closed/merged the compare
-#                           reads the default-branch HEAD (the #562 backlog
-#                           case). An unresolvable PR state or a compared-
-#                           ref content fetch failure skips fail-closed.
+#                           reads the default branch PINNED to its tip
+#                           commit SHA — resolved once and reused by BOTH
+#                           the contents and git-trees reads, so the two
+#                           can never see different commits if the branch
+#                           advances between them (#616 finding
+#                           3510442271; the #562 backlog case). An
+#                           unresolvable PR state, tip-SHA resolution
+#                           failure, or compared-ref content fetch failure
+#                           skips fail-closed.
 #                           Per non-actioned thread anchored at path P:
 #                           - P matches a canonical/kit entry in mergepath's
 #                             .mergepath-sync.yml → byte-compare the
@@ -168,6 +174,15 @@
 #                             scripts/lib/manifest-fact-helpers.sh) and
 #                             byte-compare against the consumer's content
 #                             at the compared ref.
+#                           Both arms read the mergepath source at the
+#                           COMMITTED HEAD (git show HEAD:path), never the
+#                           working tree (#616 finding 3510442268):
+#                           uncommitted local edits never count as
+#                           propagation sources — only committed content
+#                           can have propagated, and the tree-entry +
+#                           upstream-evidence gates below already read
+#                           HEAD, so all three checks see one committed
+#                           state.
 #                           A byte-match alone is NECESSARY, NOT SUFFICIENT
 #                           (#616 findings 3510170883 + 3510170879). Two
 #                           further gates run before any resolve:
@@ -360,7 +375,10 @@ daily rollup / weekly sweep as the disposition of record):
                         canonical source (or the re-rendered template
                         with the consumer's facts) at the compared ref
                         (the PR head while the PR is open, the default
-                        branch once closed/merged), with a matching
+                        branch pinned to its tip SHA once closed/merged).
+                        The mergepath source is read at the COMMITTED
+                        HEAD — uncommitted working-tree edits never count
+                        as propagation sources (#616). Requires a matching
                         tree-entry mode/type and an upstream fix commit
                         newer than the finding (#616); tags
                         verified-propagation. Drift or ANY verification
@@ -1491,7 +1509,8 @@ VP_TEMPLATE_LIB="$__RESOLVE_THREADS_DIR/lib/template-substitution.sh"
 VP_FACTS_HELPER="$__RESOLVE_THREADS_DIR/lib/manifest-fact-helpers.sh"
 
 # fetch_consumer_default_branch — resolve (once) the consumer repo's
-# default branch, the ref the byte-compare reads for CLOSED/MERGED PRs.
+# default branch NAME, which resolve_consumer_compare_ref pins to its
+# tip commit SHA for CLOSED/MERGED PRs (#616 finding 3510442271).
 # Cached; returns non-zero (fail closed) when it cannot be resolved.
 CONSUMER_DEFAULT_BRANCH=""
 CONSUMER_DEFAULT_BRANCH_FETCHED=false
@@ -1513,9 +1532,19 @@ fetch_consumer_default_branch() {
 #                      same canonical/templated destination — comparing
 #                      the default branch there would resolve a thread
 #                      while the candidate content still carries drift.
-#   PR CLOSED/MERGED → the default-branch HEAD (the #562 backlog case:
-#                      the thread's own PR is history; the consumer's
-#                      current state is the propagation evidence).
+#   PR CLOSED/MERGED → the default branch's TIP COMMIT SHA (the #562
+#                      backlog case: the thread's own PR is history; the
+#                      consumer's current state is the propagation
+#                      evidence). Pinned to a SHA ONCE (#616 finding
+#                      3510442271): the branch NAME is a moving ref — the
+#                      contents fetch and the git-trees fetch would each
+#                      re-resolve it at request time and could read
+#                      DIFFERENT commits if the branch advances between
+#                      the two reads, letting the byte-compare and the
+#                      mode/type gate pass against inconsistent states.
+#                      One immutable SHA keeps every read coherent; an
+#                      unresolvable tip fails closed like every other
+#                      lookup here.
 #   anything else    → FAIL CLOSED (state fetch failure / unknown state
 #                      never verifies).
 # Cached like the default-branch lookup; the warm-cache call in the mode
@@ -1525,7 +1554,7 @@ CONSUMER_COMPARE_REF=""
 CONSUMER_COMPARE_REF_KIND=""
 CONSUMER_COMPARE_REF_FETCHED=false
 resolve_consumer_compare_ref() {
-  local pr_state
+  local pr_state tip_sha
   if ! $CONSUMER_COMPARE_REF_FETCHED; then
     CONSUMER_COMPARE_REF_FETCHED=true
     pr_state=$(gh_pat api "repos/$OWNER/$NAME/pulls/$PR_NUM" \
@@ -1541,8 +1570,14 @@ resolve_consumer_compare_ref() {
         # REST reports merged PRs as state=closed; `merged` is accepted
         # defensively for any future/GraphQL-shaped stub.
         if fetch_consumer_default_branch; then
-          CONSUMER_COMPARE_REF="$CONSUMER_DEFAULT_BRANCH"
-          CONSUMER_COMPARE_REF_KIND="default-branch"
+          tip_sha=$(gh_pat api \
+            "repos/$OWNER/$NAME/git/ref/heads/$CONSUMER_DEFAULT_BRANCH" \
+            --jq .object.sha 2>/dev/null) || tip_sha=""
+          [ "$tip_sha" = "null" ] && tip_sha=""
+          if [ -n "$tip_sha" ]; then
+            CONSUMER_COMPARE_REF="$tip_sha"
+            CONSUMER_COMPARE_REF_KIND="default-branch-tip"
+          fi
         fi
         ;;
       *) : ;;  # unknown/empty state → fail closed below
@@ -1624,6 +1659,31 @@ expected_source_tree_entry() {
     "100644 blob"|"100755 blob") printf '%s' "$entry"; return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# committed_source_content <mergepath-src-rel> <out-file> — write the
+# mergepath SOURCE bytes AT THE COMMITTED HEAD into <out-file> (#616
+# finding 3510442268). The byte-compare (and the templated render input)
+# must read the same committed state the other two gates read — the
+# tree-entry gate (`git ls-tree HEAD`) and the upstream-evidence gate
+# (`git log`) — so uncommitted working-tree edits NEVER count as
+# propagation sources: a consumer byte-matching a local edit that has
+# not been committed (and so cannot have propagated) must not resolve,
+# and a dirty source file must not mask a genuine committed match.
+# Mirrors expected_source_tree_entry's git detection exactly: a non-git
+# fixture tree falls back to the on-disk file, the same fallback the
+# mode/type check uses. Non-zero (fail closed) when the path is absent
+# from HEAD (e.g. an uncommitted new file) or, in the fallback, from
+# the fixture tree.
+committed_source_content() {
+  local src_rel="$1" out="$2"
+  if [ -d "$REPO_ROOT_FOR_MANIFEST/.git" ] || [ -f "$REPO_ROOT_FOR_MANIFEST/.git" ]; then
+    git -C "$REPO_ROOT_FOR_MANIFEST" show "HEAD:$src_rel" > "$out" 2>/dev/null
+  elif [ -f "$REPO_ROOT_FOR_MANIFEST/$src_rel" ]; then
+    cat "$REPO_ROOT_FOR_MANIFEST/$src_rel" > "$out" 2>/dev/null
+  else
+    return 1
+  fi
 }
 
 # verify_consumer_tree_entry <consumer-path> <mergepath-src-rel> — the
@@ -1809,7 +1869,9 @@ derive_routing_class() {
 #   0 — VERIFIED: the consumer's content at <path> (compared ref)
 #       byte-matches mergepath's canonical source (canonical-coverage)
 #       or the re-rendered template with this consumer's facts
-#       (templated-render), the consumer tree entry's mode/type matches
+#       (templated-render) — both read at the COMMITTED HEAD via
+#       committed_source_content, never the working tree (#616 finding
+#       3510442268) — the consumer tree entry's mode/type matches
 #       the mergepath source, AND the source carries an upstream fix
 #       commit newer than <floor-iso>. The thread may be resolved.
 #   1 — DRIFT: the compare ran and the bytes differ (consumer drifted,
@@ -1819,7 +1881,8 @@ derive_routing_class() {
 #       unresolved.
 #   2 — verification error (fail closed): manifest entry missing,
 #       compare-ref/PR-state resolution failure, content fetch failure,
-#       render failure, facts/consumer-name missing, tree-entry lookup
+#       source absent from the committed mergepath HEAD, render
+#       failure, facts/consumer-name missing, tree-entry lookup
 #       failure, or libs/yq unavailable. Leave unresolved.
 #   3 — NO UPSTREAM-FIX EVIDENCE (fail closed, #616 finding 3510170879):
 #       the bytes (and tree entry) match, but the local mergepath
@@ -1828,7 +1891,7 @@ derive_routing_class() {
 #       Leave unresolved (stays deferred and resurfaces — safe).
 verify_propagation_content() {
   local vp_class="$1" vp_path="$2" vp_floor="${3:-}"
-  local consumer_tmp mp_src rendered render_err render_rc consumer_name
+  local consumer_tmp mp_src src_tmp rendered render_err render_rc consumer_name
   local vte_rc vte_msg
   case "$vp_class" in
     canonical-coverage|templated-render) : ;;
@@ -1846,7 +1909,7 @@ verify_propagation_content() {
   fi
   if ! fetch_consumer_content "$vp_path" "$consumer_tmp"; then
     rm -f "$consumer_tmp"
-    echo "could not fetch $REPO:$vp_path at the compared ref (${CONSUMER_COMPARE_REF_KIND:-unresolved PR state}; contents API)"
+    echo "could not fetch $REPO:$vp_path at the compared ref (${CONSUMER_COMPARE_REF_KIND:-unresolved PR state or default-branch tip}; contents API)"
     return 2
   fi
 
@@ -1862,14 +1925,22 @@ verify_propagation_content() {
       echo "no canonical/kit entry in .mergepath-sync.yml covers $vp_path"
       return 2
     fi
-    mp_src="$REPO_ROOT_FOR_MANIFEST/$vp_path"
-    if [ ! -f "$mp_src" ]; then
+    # #616 finding 3510442268: compare against the COMMITTED HEAD bytes
+    # (git show), not the working-tree file — the tree-entry and
+    # upstream-evidence gates below read HEAD, and an uncommitted local
+    # edit cannot have propagated.
+    if ! src_tmp=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-src.XXXXXX"); then
       rm -f "$consumer_tmp"
-      echo "canonical source $vp_path is missing from the mergepath working tree"
+      echo "mktemp failed for committed source content (TMPDIR unwritable or full?)"
       return 2
     fi
-    if cmp -s "$mp_src" "$consumer_tmp"; then
-      rm -f "$consumer_tmp"
+    if ! committed_source_content "$vp_path" "$src_tmp"; then
+      rm -f "$consumer_tmp" "$src_tmp"
+      echo "canonical source $vp_path is missing from the committed mergepath HEAD (uncommitted working-tree files never count as propagation sources)"
+      return 2
+    fi
+    if cmp -s "$src_tmp" "$consumer_tmp"; then
+      rm -f "$consumer_tmp" "$src_tmp"
       # #616 finding 3510170883: byte equality is necessary, not
       # sufficient — the tree entry's mode/type must match too.
       vte_rc=0
@@ -1887,7 +1958,7 @@ verify_propagation_content() {
       echo "consumer content at $vp_path byte-matches the mergepath canonical source; propagation verified."
       return 0
     fi
-    rm -f "$consumer_tmp"
+    rm -f "$consumer_tmp" "$src_tmp"
     echo "consumer content at $vp_path does NOT byte-match the mergepath canonical source (drifted, or the upstream fix has not propagated)"
     return 1
   fi
@@ -1905,23 +1976,32 @@ verify_propagation_content() {
     echo "no templated manifest entry maps dest $vp_path for consumer $consumer_name"
     return 2
   fi
-  if [ ! -f "$REPO_ROOT_FOR_MANIFEST/$mp_src" ]; then
+  # #616 finding 3510442268: render the COMMITTED HEAD template bytes
+  # (git show), not the working-tree file — same committed-state rule as
+  # the canonical arm; an uncommitted template edit cannot have
+  # propagated.
+  if ! src_tmp=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-src.XXXXXX"); then
     rm -f "$consumer_tmp"
-    echo "templated source $mp_src is missing from the mergepath working tree"
+    echo "mktemp failed for committed source content (TMPDIR unwritable or full?)"
+    return 2
+  fi
+  if ! committed_source_content "$mp_src" "$src_tmp"; then
+    rm -f "$consumer_tmp" "$src_tmp"
+    echo "templated source $mp_src is missing from the committed mergepath HEAD (uncommitted working-tree files never count as propagation sources)"
     return 2
   fi
   if [ ! -r "$VP_FACTS_HELPER" ] || [ ! -r "$VP_TEMPLATE_LIB" ]; then
-    rm -f "$consumer_tmp"
+    rm -f "$consumer_tmp" "$src_tmp"
     echo "render libs missing (need scripts/lib/manifest-fact-helpers.sh + scripts/lib/template-substitution.sh)"
     return 2
   fi
   if ! rendered=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-rendered.XXXXXX"); then
-    rm -f "$consumer_tmp"
+    rm -f "$consumer_tmp" "$src_tmp"
     echo "mktemp failed for render output (TMPDIR unwritable or full?)"
     return 2
   fi
   if ! render_err=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-render-err.XXXXXX"); then
-    rm -f "$consumer_tmp" "$rendered"
+    rm -f "$consumer_tmp" "$src_tmp" "$rendered"
     echo "mktemp failed for render stderr (TMPDIR unwritable or full?)"
     return 2
   fi
@@ -1935,17 +2015,20 @@ verify_propagation_content() {
     # shellcheck source=lib/template-substitution.sh
     . "$VP_TEMPLATE_LIB" || exit 2
     export_consumer_facts "$consumer_name" "$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml" || exit $?
-    template_substitution::render "$REPO_ROOT_FOR_MANIFEST/$mp_src"
+    # $src_tmp carries the COMMITTED HEAD bytes of $mp_src (#616
+    # finding 3510442268); render errors are re-labeled with the real
+    # source path in the wrapper message below.
+    template_substitution::render "$src_tmp"
   ) > "$rendered" 2> "$render_err" || render_rc=$?
   if [ "$render_rc" != "0" ]; then
     if [ -s "$render_err" ]; then
       sed 's/^/    /' "$render_err" >&2
     fi
-    rm -f "$consumer_tmp" "$rendered" "$render_err"
+    rm -f "$consumer_tmp" "$src_tmp" "$rendered" "$render_err"
     echo "templated re-render failed for source $mp_src (consumer=$consumer_name, rc=$render_rc)"
     return 2
   fi
-  rm -f "$render_err"
+  rm -f "$render_err" "$src_tmp"
   if cmp -s "$rendered" "$consumer_tmp"; then
     rm -f "$consumer_tmp" "$rendered"
     # #616 finding 3510170883: the rendered dest must inherit the

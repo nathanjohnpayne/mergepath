@@ -8,9 +8,11 @@
 # (canonical-coverage / templated-render threads, the #562 backlog):
 # routing alone (path membership) never resolves, but when the consumer's
 # content at the COMPARED REF (the PR head while the PR is open, the
-# default branch once closed/merged — #616) byte-matches mergepath's
-# canonical source (or the re-rendered template with the consumer's
-# facts), the tree entry's mode/type matches the source, and the source
+# default branch pinned to its tip SHA once closed/merged — #616)
+# byte-matches mergepath's canonical source (or the re-rendered template
+# with the consumer's facts) AT THE COMMITTED HEAD (#616: uncommitted
+# working-tree edits never count as propagation sources), the tree
+# entry's mode/type matches the source, and the source
 # carries an upstream fix commit newer than the finding, the propagation
 # is PROVEN and the thread is resolved with the
 # [mergepath-resolve: verified-propagation] tag. Any mismatch or
@@ -88,6 +90,23 @@
 #      content whose consumer tree entry is chmod-flipped (100755 blob
 #      vs the committed 100644 source) skips as drift (pre-fix this
 #      resolved — REGRESSION, fails pre-fix); 16b: a trees-API lookup
+#      failure skips fail-closed (verification error).
+#  17. Committed-source compare (#616 finding 3510442268) — REGRESSION,
+#      fails pre-fix: an UNCOMMITTED working-tree edit to the canonical
+#      source diverges from HEAD, and the consumer byte-matches the
+#      EDIT. Pre-fix the compare read the working tree and resolved
+#      even though the committed source that actually propagates
+#      differs; post-fix the compare reads HEAD and skips as drift.
+#      17b (also fails pre-fix): with the working tree still dirty, a
+#      consumer byte-matching the COMMITTED HEAD resolves — a dirty
+#      source never blocks (or fakes) a genuine committed match.
+#  18. Default-branch SHA pinning (#616 finding 3510442271) —
+#      REGRESSION, fails pre-fix: for a closed PR the compare ref must
+#      be the default branch's tip commit SHA resolved ONCE
+#      (git/ref/heads/<branch>, stub tip DEFAULTTIP0), and BOTH the
+#      contents fetch and the git-trees fetch must carry that pinned
+#      SHA — never the branch name, which each API would re-resolve
+#      independently while the branch advances. 18b: a tip-resolution
 #      failure skips fail-closed (verification error).
 
 set -euo pipefail
@@ -186,9 +205,11 @@ OUT
 # fixture tree a real git repo with one BACKDATED commit (2026-02-01):
 # newer than the default thread createdAt (2026-01-01 → evidence present
 # for the happy-path tests) and older than test 15's createdAt
-# (2026-03-01 → no evidence, fail-closed skip). Test 7's later template
-# corruption stays uncommitted on purpose — the render reads the working
-# tree, while ls-tree/log read HEAD.
+# (2026-03-01 → no evidence, fail-closed skip). The byte-compare and the
+# templated render ALSO read the COMMITTED HEAD (#616 finding
+# 3510442268), so test 7 COMMITS its template corruption (an uncommitted
+# one would be invisible to the verifier) and test 17 relies on an
+# uncommitted edit being ignored.
 git -C "$FIXTURE_ROOT" init -q
 git -C "$FIXTURE_ROOT" add -A
 GIT_AUTHOR_DATE="2026-02-01T00:00:00Z" GIT_COMMITTER_DATE="2026-02-01T00:00:00Z" \
@@ -207,6 +228,10 @@ GIT_AUTHOR_DATE="2026-02-01T00:00:00Z" GIT_COMMITTER_DATE="2026-02-01T00:00:00Z"
 #   repos/*/git/trees/* → the consumer tree listing ($CONSUMER_TREE_FILE;
 #                         #616 3510170883), or a hard failure when
 #                         GH_STUB_FAIL_TREES=1
+#   repos/*/git/ref/heads/* → the default branch's tip commit SHA
+#                         ("DEFAULTTIP0" — the pinned compare ref for
+#                         closed PRs, #616 3510442271), or a hard
+#                         failure when GH_STUB_FAIL_REF=1
 #   repos/*/pulls/<n>   → --jq .head.sha → "HEADCURRENT"; --jq .state →
 #                         $GH_STUB_PR_STATE (default "closed", the #562
 #                         backlog shape; #616 3510170875)
@@ -278,6 +303,13 @@ case "\$1" in
           exit 1
         fi
         cat "\$CONSUMER_TREE_FILE"
+        ;;
+      "repos/"*"/git/ref/heads/"*)
+        if [ -n "\${GH_STUB_FAIL_REF:-}" ]; then
+          echo "simulated ref resolution failure" >&2
+          exit 1
+        fi
+        echo "DEFAULTTIP0"
         ;;
       "repos/"*"/pulls/"*"/files"*)
         echo '[]'
@@ -400,6 +432,8 @@ make_thread_fixture_with_reply() {
 # sets $out and $rc. Extra env via the RUN_* variables:
 #   RUN_FAIL_CONTENTS=1        contents fetch hard-fails
 #   RUN_FAIL_TREES=1           git-trees fetch hard-fails (#616)
+#   RUN_FAIL_REF=1             default-branch tip resolution hard-fails
+#                              (#616 finding 3510442271)
 #   RUN_PR_STATE=open|closed   PR state served to --jq .state
 #                              (default closed — the #562 backlog shape)
 #   RUN_HEAD_CONTENT_FILE=...  content served at ref=HEADCURRENT (open-PR
@@ -431,6 +465,7 @@ run_mode() {
     CONSUMER_TREE_FILE="$tree_file" \
     GH_STUB_FAIL_CONTENTS="${RUN_FAIL_CONTENTS:-}" \
     GH_STUB_FAIL_TREES="${RUN_FAIL_TREES:-}" \
+    GH_STUB_FAIL_REF="${RUN_FAIL_REF:-}" \
     GH_STUB_PR_STATE="${RUN_PR_STATE:-closed}" \
     RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
     PATH="$SCRATCH:$PATH" \
@@ -613,8 +648,12 @@ fi
 # ─────────────────────────────────────────────────────────────────────
 # Test 7: template render failure — the source template is malformed
 # (unclosed conditional) → skipped FAIL CLOSED, exit 3, no mutations.
-# NOTE: rewrites the fixture template, so any test needing the good
-# template must run BEFORE this one.
+# NOTE: rewrites AND COMMITS the fixture template (the verifier renders
+# the COMMITTED HEAD bytes, #616 finding 3510442268 — an uncommitted
+# corruption would be invisible), so any test needing the good template
+# must run BEFORE this one. Backdated like the fixture commit; the
+# commit touches only examples/tpl.txt, so docs/canonical.md keeps its
+# 2026-02-01 evidence timestamp for the later tests.
 # ─────────────────────────────────────────────────────────────────────
 echo
 echo "Test 7: template render failure → skipped fail-closed (#572)"
@@ -623,6 +662,10 @@ cat > "$FIXTURE_ROOT/examples/tpl.txt" <<'TPL'
 # >>> if frameworks contains react
 react block enabled — but the conditional is never closed
 TPL
+git -C "$FIXTURE_ROOT" add examples/tpl.txt
+GIT_AUTHOR_DATE="2026-02-01T00:00:00Z" GIT_COMMITTER_DATE="2026-02-01T00:00:00Z" \
+  git -C "$FIXTURE_ROOT" -c user.name=fixture -c user.email=fixture@example.com \
+  -c commit.gpgsign=false commit -q -m "corrupt the template (test 7 — committed: the verifier reads HEAD)"
 
 GH_ARGV_LOG="$SCRATCH/t7.log"; : > "$GH_ARGV_LOG"
 run_mode "$SCRATCH/threads_vp2.json" "$EXPECTED_RENDER"
@@ -1104,6 +1147,136 @@ if [ "$rc" -eq 3 ] \
 else
   fail=$((fail + 1))
   echo "  FAIL: trees lookup failure did not fail closed (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 17: committed-source compare (#616 finding 3510442268) —
+# REGRESSION, fails pre-fix. The fixture repo's docs/canonical.md gets
+# an UNCOMMITTED working-tree edit; the consumer byte-matches the EDIT,
+# not the committed HEAD. Pre-fix the byte-compare read the working
+# tree while the tree-entry gate (ls-tree HEAD) and the evidence gate
+# (git log) read HEAD, so the divergent trio RESOLVED the thread even
+# though the committed source that will actually propagate carries
+# different bytes; post-fix the compare reads HEAD (git show) and skips
+# as drift. Uncommitted local edits never count as propagation sources.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 17: consumer matching an UNCOMMITTED working-tree edit skips as drift (#616)"
+
+cat > "$FIXTURE_ROOT/docs/canonical.md" <<'MD'
+# Canonical doc
+
+Uncommitted local edit that has not propagated anywhere.
+MD
+CONSUMER_MATCH_DIRTY="$SCRATCH/consumer-canonical-dirty.md"
+cp "$FIXTURE_ROOT/docs/canonical.md" "$CONSUMER_MATCH_DIRTY"
+if cmp -s <(git -C "$FIXTURE_ROOT" show HEAD:docs/canonical.md) "$CONSUMER_MATCH_DIRTY"; then
+  fail=$((fail + 1))
+  echo "  FAIL: precondition — the dirty edit must diverge from the committed HEAD" >&2
+fi
+
+GH_ARGV_LOG="$SCRATCH/t17.log"; : > "$GH_ARGV_LOG"
+run_mode "$SCRATCH/threads_vp1.json" "$CONSUMER_MATCH_DIRTY"
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (propagation NOT verified — content drift)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: working-tree-edit byte-match skipped as drift (compare reads the committed HEAD)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: consumer matching an uncommitted edit was not skipped (rc=$rc) — compare read the working tree?" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 17b: the other direction (also fails pre-fix) — the working tree
+# is STILL dirty, but the consumer byte-matches the COMMITTED HEAD →
+# resolves. A dirty source file neither fakes a match (17) nor blocks a
+# genuine committed one (17b); the compare is pinned to HEAD, the same
+# state the tree-entry and evidence gates read. Restores the working
+# tree afterwards.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 17b: consumer matching the COMMITTED HEAD resolves despite a dirty working tree (#616)"
+
+GH_ARGV_LOG="$SCRATCH/t17b.log"; : > "$GH_ARGV_LOG"
+run_mode "$SCRATCH/threads_vp1.json" "$CONSUMER_MATCH_CANONICAL"
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: verified-propagation\] consumer content at docs/canonical.md byte-matches the mergepath canonical source' "$GH_ARGV_LOG" \
+   && grep -q 'Readback: all 1 resolved thread(s) confirmed isResolved:true' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: committed-HEAD byte-match resolved; the dirty working tree was ignored"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: committed-HEAD match did not resolve under a dirty working tree (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+git -C "$FIXTURE_ROOT" checkout -q -- docs/canonical.md
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 18: default-branch SHA pinning (#616 finding 3510442271) —
+# REGRESSION, fails pre-fix. For a closed PR the compare ref must be
+# the default branch's tip commit SHA, resolved exactly ONCE via
+# git/ref/heads/<branch> (stub tip: DEFAULTTIP0) and carried by BOTH
+# the contents fetch and the git-trees fetch. Pre-fix the stored ref
+# was the branch NAME ("main"), which the two APIs re-resolved
+# independently — a branch advancing between the reads lets the
+# byte-compare and the mode/type gate see different commits and still
+# resolve.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 18: closed-PR compare pins both fetches to the default-branch tip SHA (#616)"
+
+GH_ARGV_LOG="$SCRATCH/t18.log"; : > "$GH_ARGV_LOG"
+run_mode "$SCRATCH/threads_vp1.json" "$CONSUMER_MATCH_CANONICAL"
+
+if [ "$rc" -eq 0 ] \
+   && [ "$(grep -c 'git/ref/heads/main' "$GH_ARGV_LOG")" -eq 1 ] \
+   && grep -q 'contents/docs/canonical.md?ref=DEFAULTTIP0' "$GH_ARGV_LOG" \
+   && grep -q 'git/trees/DEFAULTTIP0?recursive=1' "$GH_ARGV_LOG" \
+   && ! grep -qF '?ref=main' "$GH_ARGV_LOG" \
+   && ! grep -qF 'git/trees/main' "$GH_ARGV_LOG" \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: one tip resolution; contents + trees both read ref=DEFAULTTIP0, never the branch name"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: compare fetches were not pinned to the tip SHA (rc=$rc) — branch-name ref leaked?" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 18b: a default-branch tip resolution failure is a fail-closed
+# VERIFICATION ERROR — with no pinned SHA the compare ref is
+# unresolved, so the content fetch never runs and nothing resolves.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 18b: tip-resolution failure skips fail-closed (#616)"
+
+GH_ARGV_LOG="$SCRATCH/t18b.log"; : > "$GH_ARGV_LOG"
+RUN_FAIL_REF=1 run_mode "$SCRATCH/threads_vp1.json" "$CONSUMER_MATCH_CANONICAL"
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (propagation verification failed — failing closed)' <<<"$out" \
+   && grep -q 'could not fetch test/consumer:docs/canonical.md' <<<"$out" \
+   && ! grep -q '/contents/' "$GH_ARGV_LOG" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: unresolvable tip skipped fail-closed (no content fetch), exit 3, no mutations"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: tip-resolution failure did not fail closed (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
