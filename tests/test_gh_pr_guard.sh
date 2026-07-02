@@ -1068,6 +1068,28 @@ assert_rc_contains "value-option value named bash is not the interpreter (#611 r
   'cat <<'"'"'EOF'"'"' | sudo -u bash cat
 $(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
 EOF'
+
+# --- #611 round 14: -R cmdsub, prefix value-opt in synth, eval-quoted, ANSI-C word
+# (P1) a cmdsub as the -R/--repo value can word-split a guarded verb into argv.
+assert_rc_contains "cmdsub as -R value fails closed (#611 r14)" 2 "" \
+  'gh pr -R $(cat file) 1'
+# (P1) a value-taking prefix option inside a synth span: env -u X printf ...
+# unwraps to printf, so the write is recognized.
+assert_rc_contains "env -u VALUE printf synthesis fails closed (#611 r14)" 2 "wrapper" \
+  '$(env -u X printf "\147\150\40\160\162\40\155\145\162\147\145") 1 --admin'
+# (P1) a literal-printf substitution inside eval double quotes is reparsed
+# and executed by eval, so it must be expanded, not left as a placeholder.
+assert_rc_contains "eval of quoted printf synthesis fails closed (#611 r14)" 2 "" \
+  'eval "$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1 --admin"'
+assert_rc_contains "bash -c of quoted printf synthesis fails closed (#611 r14)" 2 "" \
+  'bash -c "$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1"'
+# (P1) a bare ANSI-C-quoted command word: $'\147\150' pr merge -> gh pr merge.
+assert_rc_contains "ANSI-C-quoted bare command word fails closed (#611 r14)" 2 "wrapper" \
+  "\$'\\147\\150' pr merge 1 --admin"
+# Control: a benign quoted printf substitution as echo DATA stays allowed
+# (expanded to a single word, not a command position).
+assert_rc_contains "echo of quoted printf expansion stays allowed (#611 r14)" 0 "" \
+  'echo "$(printf "\147\150\40\160\162")"'
 assert_rc_contains "parse failure with octal gh spelling still fails closed (#611 r4)" 2 "tokenize" \
   '$(printf "\147\150") pr merge 1 "oops'
 

@@ -278,6 +278,12 @@ elif echo "$COMMAND" | grep -qE '\$\(|`'; then
   # placeholder, ignoring benign cmdsubs, arguments, and non-command-position
   # verbs. Over-matching costs one tokenizer run; a false negative is a bypass.
   NEEDS_TOKENIZE=1
+elif printf '%s' "$COMMAND" | grep -qF "\$'"; then
+  # #611 r14: bash ANSI-C quoting ($'...') decodes backslash escapes, so
+  # `$'\147\150' pr merge` runs `gh pr merge` with no literal gh in the raw
+  # text (and shlex does not decode $'...'). Force tokenization on any $'
+  # so the python flatten decodes it before the walk.
+  NEEDS_TOKENIZE=1
 fi
 if [ "$NEEDS_TOKENIZE" -eq 0 ]; then
   exit 0
@@ -607,11 +613,25 @@ _SYNTH_PREFIX_CMDS = {"command", "env", "sudo", "exec", "nice",
 
 def _unwrap_synth_prefixes(argv):
     k = 0
+    prefix = ""
     while k < len(argv):
         t = argv[k]
-        if t in _SYNTH_PREFIX_CMDS or t.startswith("-") \
-                or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
+        if t in _SYNTH_PREFIX_CMDS:
+            prefix = t
             k += 1
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
+            k += 1
+            continue
+        if t.startswith("-"):
+            # A value-taking prefix option consumes its VALUE too (#611 r14:
+            # env -u X printf — X is the value of -u, not the command), using
+            # the same per-prefix table as the walks so they cannot drift.
+            opts = _PREFIX_VALUE_OPTS.get(prefix, _EMPTY_FROZENSET)
+            if "=" not in t and t in opts:
+                k += 2
+            else:
+                k += 1
             continue
         break
     return argv[k:]
@@ -857,10 +877,16 @@ def flatten_command(cmd, depth=0):
         #      fail-closed sentinel: such a span can synthesize an entire
         #      guarded write with zero outside evidence (#611 round 5);
         #   3. anything dynamic -> the ordinary placeholder + evidence scan.
-        # Inside double quotes the expansion never field-splits; keep the
-        # placeholder there.
-        exp = None if in_double_now else _static_expand(span)
+        exp = _static_expand(span)
         if exp is not None:
+            if in_double_now:
+                # Inside double quotes the expansion is one word (no field
+                # split), but it MUST still be spliced literally (#611 r14):
+                # a quoted literal substitution reparsed by eval or bash -c
+                # executes the expansion, so a placeholder would hide the
+                # write. We are already inside the open double-quote context,
+                # so emit the raw expansion glued in place.
+                return exp
             if _ASSIGN_RE.match(cur_word) and (" " in exp):
                 return _DQ + exp + _DQ
             # NO padding: the expansion must stay glued to adjacent text
@@ -1223,6 +1249,15 @@ def expand_wrappers(tokens, depth=0):
 try:
     cmd = sys.stdin.read()
     _IFS_TOUCHED = bool(re.search(r"(^|[^A-Za-z0-9_])IFS=", cmd))
+    # #611 r14: decode ANSI-C quoting ($'...') across the WHOLE command
+    # before flattening, so an ANSI-C-spelled command word ($'\147\150' pr
+    # merge -> gh pr merge) is canonicalized for shlex, which does not
+    # implement $'...' decoding. An undecodable string (one that would need a
+    # bare single quote) leaves the command unchanged and falls to the
+    # fail-closed tokenizer path.
+    _ac, _ac_ok = _rewrite_ansi_c(cmd, None)
+    if _ac_ok:
+        cmd = _ac
     cmd = flatten_command(cmd)
     for tok in expand_wrappers(shlex.split(cmd)):
         sys.stdout.buffer.write(tok.encode("utf-8", errors="replace") + b"\x00")
@@ -1882,6 +1917,14 @@ for i in "${!TOKENS[@]}"; do
   # --- phase 2: walking after gh, looking for pr + subcommand ---
   if [ "$SAW_GH" -eq 1 ]; then
     if [ "$SKIP_GLOBAL_AS" = "repo" ]; then
+      # #611 r14: a command substitution as the -R/--repo VALUE
+      # (gh pr -R $(cat file) 1) is unverifiable — bash word-splits the
+      # substitution output, so it can inject additional argv including a
+      # guarded verb (-R "owner/repo merge" -> ... merge ...). Fail closed
+      # rather than swallow the placeholder as an opaque repo value.
+      if [ "$tok" = "__MERGEPATH_CMDSUB__" ] || [ "$tok" = "__MERGEPATH_CMDSUB_LITERAL__" ]; then
+        block_cmdsub_in_gh_stream
+      fi
       GLOBAL_REPO="$tok"
       SKIP_GLOBAL_AS=""
       continue
