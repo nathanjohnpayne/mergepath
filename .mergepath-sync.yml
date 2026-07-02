@@ -640,6 +640,12 @@ paths:
   - path: tests/test_codex_review_check_resolution.sh
     type: canonical
     consumers: all
+  # HEAD-anchored Codex issue-comment verdict clearance (#600/#567).
+  # check_codex_scripts (scripts/ci kit) hard-runs it, so it must travel to
+  # every consumer or the check fails pre-flight with `No such file`.
+  - path: tests/test_codex_review_check_verdict.sh
+    type: canonical
+    consumers: all
   # #465 fail-closed structural guards. check_codex_scripts hard-runs it.
   # Propagation-safe (skips workflows/scripts a consumer does not carry).
   - path: tests/test_465_fail_closed.sh
@@ -969,6 +975,7 @@ paths:
       - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)
       - "tests/test_codex_review_request_entry.sh"  # check_codex_scripts (#486)
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
+      - "tests/test_codex_review_check_verdict.sh"  # check_codex_scripts (#600/#567)
       - "tests/test_465_fail_closed.sh"        # check_codex_scripts (#465)
       - "tests/test_codex_record_feedback.sh"  # check_codex_scripts (#487)
       - "tests/test_audit_propagation_lane.sh" # check_propagation_lane_audit
