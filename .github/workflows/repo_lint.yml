@@ -205,14 +205,20 @@ jobs:
         # lags the manifest-synced scripts/ci kit (#601 skew window).
         # The reverse skew (this workflow arriving before the lib) falls
         # back to the runner image's preinstalled yq 4.x rather than
-        # duplicating the pin inline.
+        # duplicating the pin inline — but only after the same
+        # implementation sniff ensure-yq.sh applies (#616 finding
+        # 3510689523): any other executable named yq (e.g. the Python
+        # wrapper) would pass a bare `command -v` and then fail the
+        # later mikefarah-v4 manifest parses with opaque errors instead
+        # of failing loudly here.
         run: |
           if [ -f scripts/lib/ensure-yq.sh ]; then
             bash scripts/lib/ensure-yq.sh
-          elif command -v yq >/dev/null 2>&1; then
+          elif command -v yq >/dev/null 2>&1 \
+              && yq --version 2>&1 | grep -q "mikefarah/yq"; then
             echo "scripts/lib/ensure-yq.sh not synced yet (#601 skew) — using preinstalled $(yq --version)"
           else
-            echo "FAIL: scripts/lib/ensure-yq.sh is missing and no yq is on PATH" >&2
+            echo "FAIL: scripts/lib/ensure-yq.sh is missing and no mikefarah/yq is on PATH — sync scripts/lib/ensure-yq.sh (the single-source pinned bootstrap) to resolve" >&2
             exit 1
           fi
 

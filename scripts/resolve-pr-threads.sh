@@ -182,7 +182,14 @@
 #                           can have propagated, and the tree-entry +
 #                           upstream-evidence gates below already read
 #                           HEAD, so all three checks see one committed
-#                           state.
+#                           state. The templated arm's render INPUTS —
+#                           consumer facts, consumer-name lookup, and the
+#                           dest→source templated-entry mapping — read a
+#                           committed .mergepath-sync.yml snapshot too
+#                           (#616 finding 3510689518): a dirty manifest's
+#                           uncommitted fact edits must never produce a
+#                           rendered match (or mask a genuine committed
+#                           one).
 #                           A byte-match alone is NECESSARY, NOT SUFFICIENT
 #                           (#616 findings 3510170883 + 3510170879). Two
 #                           further gates run before any resolve:
@@ -1586,6 +1593,33 @@ resolve_consumer_compare_ref() {
   [ -n "$CONSUMER_COMPARE_REF" ]
 }
 
+# resolve_consumer_compare_tree — echo the TREE sha of the compared
+# ref's commit (#616 finding 3510689525). CONSUMER_COMPARE_REF is a
+# COMMIT sha (the PR head, or the pinned default-branch tip), but the
+# git/trees endpoint's documented contract takes "the SHA1 value or ref
+# (branch or tag) name of the TREE" — peel the commit to its tree
+# explicitly (repos/{o}/{r}/commits/{sha} → .commit.tree.sha, the same
+# commits endpoint the commit-files cache reads) rather than leaning on
+# undocumented commit-sha acceptance. One commits read per run, cached
+# to a FILE under COMMIT_FILES_CACHE_DIR alongside the compare ref's
+# tree listing (same subshell-survival rule as that cache). Non-zero
+# (fail closed) when the compare ref is unresolvable or the commit read
+# does not yield a tree sha.
+resolve_consumer_compare_tree() {
+  local cache="$COMMIT_FILES_CACHE_DIR/consumer-compare-tree.sha" tree_sha
+  if [ -s "$cache" ]; then
+    cat "$cache"
+    return 0
+  fi
+  resolve_consumer_compare_ref || return 1
+  tree_sha=$(gh_pat api "repos/$OWNER/$NAME/commits/$CONSUMER_COMPARE_REF" \
+    --jq .commit.tree.sha 2>/dev/null) || tree_sha=""
+  [ "$tree_sha" = "null" ] && tree_sha=""
+  [ -n "$tree_sha" ] || return 1
+  printf '%s' "$tree_sha" > "$cache"
+  printf '%s' "$tree_sha"
+}
+
 # fetch_consumer_content <path> <out-file> — write the consumer repo's
 # content at <path> at the COMPARED REF (raw bytes via the contents
 # endpoint) into <out-file>. Non-zero on any failure — including an
@@ -1603,20 +1637,25 @@ fetch_consumer_content() {
 
 # fetch_consumer_tree_entry <path> — echo the consumer's git tree entry
 # ("<mode> <type>", e.g. "100644 blob") for <path> at the compared ref.
-# One recursive git-trees fetch per run, cached to a FILE under
-# COMMIT_FILES_CACHE_DIR so the cache survives the command-substitution
-# subshells verify_propagation_content runs in. Non-zero (fail closed)
-# on: unresolvable compare ref, fetch failure, a TRUNCATED tree listing
-# (GitHub caps recursive listings — a truncated response cannot prove
-# the entry's shape), or the path missing from the tree.
+# The recursive git-trees fetch targets the compared commit's PEELED
+# TREE sha (resolve_consumer_compare_tree, #616 finding 3510689525) —
+# the endpoint's documented parameter is a tree sha or ref name, not a
+# commit sha. One recursive git-trees fetch per run, cached to a FILE
+# under COMMIT_FILES_CACHE_DIR so the cache survives the
+# command-substitution subshells verify_propagation_content runs in.
+# Non-zero (fail closed) on: unresolvable compare ref, commit→tree
+# resolution failure, fetch failure, a TRUNCATED tree listing (GitHub
+# caps recursive listings — a truncated response cannot prove the
+# entry's shape), or the path missing from the tree.
 CONSUMER_TREE_CACHE=""
 fetch_consumer_tree_entry() {
   local vp_path="$1"
-  local truncated entry
+  local truncated entry tree_sha
   resolve_consumer_compare_ref || return 1
+  tree_sha=$(resolve_consumer_compare_tree) || return 1
   CONSUMER_TREE_CACHE="$COMMIT_FILES_CACHE_DIR/consumer-tree.json"
   if [ ! -s "$CONSUMER_TREE_CACHE" ]; then
-    if ! gh_pat api "repos/$OWNER/$NAME/git/trees/$CONSUMER_COMPARE_REF?recursive=1" \
+    if ! gh_pat api "repos/$OWNER/$NAME/git/trees/$tree_sha?recursive=1" \
         > "$CONSUMER_TREE_CACHE.tmp" 2>/dev/null; then
       rm -f "$CONSUMER_TREE_CACHE.tmp"
       return 1
@@ -1686,6 +1725,51 @@ committed_source_content() {
   fi
 }
 
+# committed_manifest_file — echo the path of a .mergepath-sync.yml
+# snapshot AT THE COMMITTED HEAD (#616 finding 3510689518). The
+# templated arm's render INPUTS — the consumer facts, the consumer-name
+# lookup, and the dest→source templated-entry mapping — must come from
+# the same committed state the template bytes come from
+# (committed_source_content): with a DIRTY working-tree manifest, an
+# uncommitted fact or templated-entry edit could render output the
+# consumer happens to match, resolving a thread as verified-propagation
+# even though the COMMITTED manifest that could actually have propagated
+# renders different bytes. Materialized once per run under
+# COMMIT_FILES_CACHE_DIR (a file, so the snapshot survives the
+# verification command-substitution subshells); mirrors
+# committed_source_content's git detection exactly — a non-git fixture
+# tree falls back to the on-disk manifest, the same fallback the source
+# reads use. Non-zero (fail closed) when the manifest is absent from
+# HEAD (or, in the fallback, from the fixture tree).
+#
+# NB: the ROUTING predicates (path_matches_canonical_entry /
+# path_matches_templated_dest) intentionally keep reading the
+# working-tree manifest (see the REPO_ROOT_FOR_MANIFEST note above) —
+# routing alone never resolves; only the verification inputs here are
+# resolution evidence.
+committed_manifest_file() {
+  local snap="$COMMIT_FILES_CACHE_DIR/committed-manifest.yml"
+  if [ -s "$snap" ]; then
+    printf '%s' "$snap"
+    return 0
+  fi
+  if [ -d "$REPO_ROOT_FOR_MANIFEST/.git" ] || [ -f "$REPO_ROOT_FOR_MANIFEST/.git" ]; then
+    if ! git -C "$REPO_ROOT_FOR_MANIFEST" show "HEAD:.mergepath-sync.yml" \
+        > "$snap.tmp" 2>/dev/null; then
+      rm -f "$snap.tmp"
+      return 1
+    fi
+    mv "$snap.tmp" "$snap"
+    printf '%s' "$snap"
+    return 0
+  fi
+  if [ -f "$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml" ]; then
+    printf '%s' "$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml"
+    return 0
+  fi
+  return 1
+}
+
 # verify_consumer_tree_entry <consumer-path> <mergepath-src-rel> — the
 # #616 (finding 3510170883) mode/type gate, mirroring the tree-entry
 # check in scripts/workflow/verify-propagation-pr.sh: byte equality is
@@ -1751,16 +1835,19 @@ upstream_fix_evidence() {
 
 # manifest_consumer_name_for_repo — resolve (once) the manifest consumer
 # NAME whose .repo slug equals $REPO, needed to load the consumer's
-# facts for the templated re-render. Cached; non-zero (fail closed) when
-# the manifest is absent, yq is unavailable, or $REPO is not a declared
-# consumer.
+# facts for the templated re-render. Reads the COMMITTED manifest
+# snapshot (#616 finding 3510689518), the same committed state the
+# template bytes come from. Cached; non-zero (fail closed) when the
+# manifest is absent from HEAD, yq is unavailable, or $REPO is not a
+# declared consumer.
 MANIFEST_CONSUMER_NAME=""
 MANIFEST_CONSUMER_NAME_FETCHED=false
 manifest_consumer_name_for_repo() {
   if ! $MANIFEST_CONSUMER_NAME_FETCHED; then
     MANIFEST_CONSUMER_NAME_FETCHED=true
-    local manifest="$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml"
-    if [ -f "$manifest" ] && command -v yq >/dev/null 2>&1; then
+    local manifest
+    manifest=$(committed_manifest_file) || manifest=""
+    if [ -n "$manifest" ] && [ -f "$manifest" ] && command -v yq >/dev/null 2>&1; then
       MANIFEST_CONSUMER_NAME=$(MP_VP_REPO="$REPO" yq -r '
         .consumers[] | select(.repo == env(MP_VP_REPO)) | .name
       ' "$manifest" 2>/dev/null | head -1) || MANIFEST_CONSUMER_NAME=""
@@ -1779,11 +1866,14 @@ manifest_consumer_name_for_repo() {
 # fetch_manifest_templated_dests (mikefarah/yq rejects the inline
 # if/then/else that would branch on the consumers tag in one pass); the
 # seq-membership check runs in bash with the same anchored comma-grep
-# path_matches_templated_dest uses. Non-zero (fail closed) on no match,
-# missing manifest, or missing yq.
+# path_matches_templated_dest uses. Reads the COMMITTED manifest
+# snapshot (#616 finding 3510689518) so an uncommitted templated-entry
+# edit never redirects the byte-compare source. Non-zero (fail closed)
+# on no match, missing manifest, or missing yq.
 manifest_templated_source_for_dest() {
   local vp_dest="$1" consumer_name="$2"
-  local manifest="$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml"
+  local manifest
+  manifest=$(committed_manifest_file) || return 1
   [ -f "$manifest" ] || return 1
   command -v yq >/dev/null 2>&1 || return 1
   local src rows line src_field names
@@ -1995,6 +2085,16 @@ verify_propagation_content() {
     echo "render libs missing (need scripts/lib/manifest-fact-helpers.sh + scripts/lib/template-substitution.sh)"
     return 2
   fi
+  # #616 finding 3510689518: the facts fed to the render must come from
+  # the COMMITTED manifest — the same committed state as the template
+  # bytes above — never the working-tree .mergepath-sync.yml, whose
+  # uncommitted fact edits cannot have propagated.
+  local manifest_snapshot
+  if ! manifest_snapshot=$(committed_manifest_file); then
+    rm -f "$consumer_tmp" "$src_tmp"
+    echo ".mergepath-sync.yml is missing from the committed mergepath HEAD (uncommitted manifest state never feeds the verification render)"
+    return 2
+  fi
   if ! rendered=$(mktemp "${TMPDIR:-/tmp}/resolve-vp-rendered.XXXXXX"); then
     rm -f "$consumer_tmp" "$src_tmp"
     echo "mktemp failed for render output (TMPDIR unwritable or full?)"
@@ -2014,7 +2114,7 @@ verify_propagation_content() {
     . "$VP_FACTS_HELPER" || exit 2
     # shellcheck source=lib/template-substitution.sh
     . "$VP_TEMPLATE_LIB" || exit 2
-    export_consumer_facts "$consumer_name" "$REPO_ROOT_FOR_MANIFEST/.mergepath-sync.yml" || exit $?
+    export_consumer_facts "$consumer_name" "$manifest_snapshot" || exit $?
     # $src_tmp carries the COMMITTED HEAD bytes of $mp_src (#616
     # finding 3510442268); render errors are re-labeled with the real
     # source path in the wrapper message below.

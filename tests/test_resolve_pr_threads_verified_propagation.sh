@@ -108,6 +108,37 @@
 #      SHA — never the branch name, which each API would re-resolve
 #      independently while the branch advances. 18b: a tip-resolution
 #      failure skips fail-closed (verification error).
+#  19. Committed-manifest render inputs (#616 finding 3510689518) —
+#      REGRESSION, fails pre-fix: an UNCOMMITTED working-tree edit to a
+#      consumer fact in .mergepath-sync.yml renders output the consumer
+#      byte-matches. Pre-fix the facts (and templated-entry lookups)
+#      came from the working-tree manifest while the template bytes
+#      came from committed HEAD, so the thread resolved even though the
+#      COMMITTED manifest renders different bytes; post-fix every
+#      render input reads a committed manifest snapshot and the compare
+#      skips as drift. 19b (also fails pre-fix): with the manifest
+#      still dirty, a consumer matching the COMMITTED-manifest render
+#      resolves — dirty facts neither fake a match nor block a genuine
+#      committed one.
+#  20. repo_lint.yml install_yq_for_sync_manifest reverse-skew fallback
+#      (#616 finding 3510689523) — scripted execution of the extracted
+#      run block, CANONICAL CHECKOUT ONLY (repo_lint.yml travels on the
+#      template-mirror lane, not this test's manifest wave, so consumer
+#      checkouts skip-pass; gate: scripts/sync-to-downstream.sh): the
+#      fallback must REJECT a wrong-implementation yq with a loud
+#      pointer at ensure-yq.sh (20a — fails pre-fix: the bare
+#      `command -v yq` accepted any executable named yq), accept a
+#      mikefarah yq (20b), and delegate to scripts/lib/ensure-yq.sh
+#      when the lib is present (20c).
+#  21. Commit→tree peel for the git-trees fetch (#616 finding
+#      3510689525): CONSUMER_COMPARE_REF is a COMMIT sha, but the
+#      git/trees endpoint's documented parameter is a TREE sha (or ref
+#      name) — the trees call must receive the peeled tree
+#      (commits/<sha> → .commit.tree.sha; stub: HEADCURRENT→TREEHEAD0,
+#      DEFAULTTIP0→TREEDEFAULT0). Positive direction locked by the
+#      updated 14b/18 trees-URL asserts (both fail pre-fix); 21: a
+#      peel failure skips fail-closed (verification error) with no
+#      trees fetch.
 
 set -euo pipefail
 
@@ -228,6 +259,13 @@ GIT_AUTHOR_DATE="2026-02-01T00:00:00Z" GIT_COMMITTER_DATE="2026-02-01T00:00:00Z"
 #   repos/*/git/trees/* → the consumer tree listing ($CONSUMER_TREE_FILE;
 #                         #616 3510170883), or a hard failure when
 #                         GH_STUB_FAIL_TREES=1
+#   repos/*/commits/<sha> with --jq .commit.tree.sha → the commit→tree
+#                         peel (#616 3510689525): HEADCURRENT →
+#                         "TREEHEAD0", DEFAULTTIP0 → "TREEDEFAULT0"
+#                         (anything else hard-fails — the peel must only
+#                         ever see the pinned compare ref), or a hard
+#                         failure when GH_STUB_FAIL_COMMIT_TREE=1; any
+#                         other jq keeps the commit-files "[]" shape
 #   repos/*/git/ref/heads/* → the default branch's tip commit SHA
 #                         ("DEFAULTTIP0" — the pinned compare ref for
 #                         closed PRs, #616 3510442271), or a hard
@@ -318,7 +356,27 @@ case "\$1" in
         echo '[]'
         ;;
       "repos/"*"/commits/"*)
-        echo '[]'
+        # Two readers hit this endpoint: the commit-files cache
+        # (--jq '[.files[].filename]' → keep the "[]" shape) and the
+        # #616 (finding 3510689525) commit→tree peel
+        # (--jq .commit.tree.sha → the compare commit's TREE sha).
+        # Route on the jq expression, like the pulls scalar route.
+        if printf '%s\n' "\$@" | grep -qxF '.commit.tree.sha'; then
+          if [ -n "\${GH_STUB_FAIL_COMMIT_TREE:-}" ]; then
+            echo "simulated commit-to-tree resolution failure" >&2
+            exit 1
+          fi
+          case "\$__url" in
+            *"/commits/HEADCURRENT") echo "TREEHEAD0" ;;
+            *"/commits/DEFAULTTIP0") echo "TREEDEFAULT0" ;;
+            *)
+              echo "commit-to-tree peel saw an unexpected commit sha: \$__url" >&2
+              exit 1
+              ;;
+          esac
+        else
+          echo '[]'
+        fi
         ;;
       "repos/"*"/pulls/"*)
         # Two scalars come off this endpoint: --jq .head.sha (HEAD oid)
@@ -434,6 +492,8 @@ make_thread_fixture_with_reply() {
 #   RUN_FAIL_TREES=1           git-trees fetch hard-fails (#616)
 #   RUN_FAIL_REF=1             default-branch tip resolution hard-fails
 #                              (#616 finding 3510442271)
+#   RUN_FAIL_COMMIT_TREE=1     commit→tree peel hard-fails (#616 finding
+#                              3510689525)
 #   RUN_PR_STATE=open|closed   PR state served to --jq .state
 #                              (default closed — the #562 backlog shape)
 #   RUN_HEAD_CONTENT_FILE=...  content served at ref=HEADCURRENT (open-PR
@@ -466,6 +526,7 @@ run_mode() {
     GH_STUB_FAIL_CONTENTS="${RUN_FAIL_CONTENTS:-}" \
     GH_STUB_FAIL_TREES="${RUN_FAIL_TREES:-}" \
     GH_STUB_FAIL_REF="${RUN_FAIL_REF:-}" \
+    GH_STUB_FAIL_COMMIT_TREE="${RUN_FAIL_COMMIT_TREE:-}" \
     GH_STUB_PR_STATE="${RUN_PR_STATE:-closed}" \
     RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
     PATH="$SCRATCH:$PATH" \
@@ -1050,11 +1111,13 @@ RUN_PR_STATE=open RUN_HEAD_CONTENT_FILE="$CONSUMER_MATCH_CANONICAL" \
 
 if [ "$rc" -eq 0 ] \
    && grep -q 'contents/docs/canonical.md?ref=HEADCURRENT' "$GH_ARGV_LOG" \
+   && grep -q 'git/trees/TREEHEAD0?recursive=1' "$GH_ARGV_LOG" \
+   && ! grep -q 'git/trees/HEADCURRENT' "$GH_ARGV_LOG" \
    && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
    && grep -q 'FIELD: body=\[mergepath-resolve: verified-propagation\] consumer content at docs/canonical.md byte-matches the mergepath canonical source' "$GH_ARGV_LOG" \
    && grep -q 'Readback: all 1 resolved thread(s) confirmed isResolved:true' <<<"$out"; then
   pass=$((pass + 1))
-  echo "  PASS: open-PR head byte-match resolved via the head compare"
+  echo "  PASS: open-PR head byte-match resolved via the head compare (trees read the peeled TREE sha)"
 else
   fail=$((fail + 1))
   echo "  FAIL: open-PR byte-matching head did not resolve (rc=$rc)" >&2
@@ -1231,7 +1294,11 @@ git -C "$FIXTURE_ROOT" checkout -q -- docs/canonical.md
 # was the branch NAME ("main"), which the two APIs re-resolved
 # independently — a branch advancing between the reads lets the
 # byte-compare and the mode/type gate see different commits and still
-# resolve.
+# resolve. #616 finding 3510689525 layers the commit→tree peel on top
+# (also fails pre-peel-fix): the git-trees fetch must receive the
+# pinned commit's PEELED TREE sha (commits/DEFAULTTIP0 →
+# .commit.tree.sha → TREEDEFAULT0, resolved exactly once), never the
+# commit sha the endpoint's contract does not document.
 # ─────────────────────────────────────────────────────────────────────
 echo
 echo "Test 18: closed-PR compare pins both fetches to the default-branch tip SHA (#616)"
@@ -1242,15 +1309,17 @@ run_mode "$SCRATCH/threads_vp1.json" "$CONSUMER_MATCH_CANONICAL"
 if [ "$rc" -eq 0 ] \
    && [ "$(grep -c 'git/ref/heads/main' "$GH_ARGV_LOG")" -eq 1 ] \
    && grep -q 'contents/docs/canonical.md?ref=DEFAULTTIP0' "$GH_ARGV_LOG" \
-   && grep -q 'git/trees/DEFAULTTIP0?recursive=1' "$GH_ARGV_LOG" \
+   && [ "$(grep -c 'commits/DEFAULTTIP0' "$GH_ARGV_LOG")" -eq 1 ] \
+   && grep -q 'git/trees/TREEDEFAULT0?recursive=1' "$GH_ARGV_LOG" \
+   && ! grep -q 'git/trees/DEFAULTTIP0' "$GH_ARGV_LOG" \
    && ! grep -qF '?ref=main' "$GH_ARGV_LOG" \
    && ! grep -qF 'git/trees/main' "$GH_ARGV_LOG" \
    && grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
   pass=$((pass + 1))
-  echo "  PASS: one tip resolution; contents + trees both read ref=DEFAULTTIP0, never the branch name"
+  echo "  PASS: one tip resolution; contents reads ref=DEFAULTTIP0, trees reads the peeled TREEDEFAULT0 (one peel), never the branch name or the commit sha"
 else
   fail=$((fail + 1))
-  echo "  FAIL: compare fetches were not pinned to the tip SHA (rc=$rc) — branch-name ref leaked?" >&2
+  echo "  FAIL: compare fetches were not pinned to the tip SHA (rc=$rc) — branch-name ref leaked, or the trees fetch got the commit sha instead of the peeled tree?" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
@@ -1277,6 +1346,211 @@ if [ "$rc" -eq 3 ] \
 else
   fail=$((fail + 1))
   echo "  FAIL: tip-resolution failure did not fail closed (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 19: committed-manifest render inputs (#616 finding 3510689518) —
+# REGRESSION, fails pre-fix. The fixture manifest gets an UNCOMMITTED
+# working-tree edit to a consumer fact (greeting: hola → bonjour); the
+# consumer's content byte-matches the DIRTY render. Pre-fix the facts
+# (and the templated-entry lookup) were exported from the working-tree
+# .mergepath-sync.yml while the template bytes came from committed
+# HEAD, so the divergent pair RESOLVED the thread even though the
+# committed manifest that could actually have propagated renders
+# different bytes; post-fix every render input reads the committed
+# manifest snapshot and the compare skips as drift. First restores the
+# good template (test 7 corrupted AND committed it), backdated like the
+# other fixture commits so the evidence gate still holds.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 19: consumer matching an UNCOMMITTED manifest fact edit skips as drift (#616)"
+
+cat > "$FIXTURE_ROOT/examples/tpl.txt" <<'TPL'
+# >>> if frameworks contains react
+react block enabled
+# <<<
+greeting is {{greeting}}
+TPL
+git -C "$FIXTURE_ROOT" add examples/tpl.txt
+GIT_AUTHOR_DATE="2026-02-01T00:00:00Z" GIT_COMMITTER_DATE="2026-02-01T00:00:00Z" \
+  git -C "$FIXTURE_ROOT" -c user.name=fixture -c user.email=fixture@example.com \
+  -c commit.gpgsign=false commit -q -m "restore the template (tests 19+ render the committed HEAD)"
+
+# UNCOMMITTED manifest edit — flip the greeting fact in the working
+# tree only (portable sed-to-tmp: -i differs between BSD and GNU).
+sed 's/greeting: hola/greeting: bonjour/' "$FIXTURE_ROOT/.mergepath-sync.yml" \
+  > "$FIXTURE_ROOT/.mergepath-sync.yml.tmp"
+mv "$FIXTURE_ROOT/.mergepath-sync.yml.tmp" "$FIXTURE_ROOT/.mergepath-sync.yml"
+if git -C "$FIXTURE_ROOT" diff --quiet -- .mergepath-sync.yml; then
+  fail=$((fail + 1))
+  echo "  FAIL: precondition — the manifest fact edit must leave the working tree dirty" >&2
+fi
+
+# The consumer content matches the DIRTY-facts render, not the
+# committed one.
+CONSUMER_DIRTY_FACTS_RENDER="$SCRATCH/consumer-dirty-facts-render.txt"
+cat > "$CONSUMER_DIRTY_FACTS_RENDER" <<'OUT'
+react block enabled
+greeting is bonjour
+OUT
+
+GH_ARGV_LOG="$SCRATCH/t19.log"; : > "$GH_ARGV_LOG"
+run_mode "$SCRATCH/threads_vp2.json" "$CONSUMER_DIRTY_FACTS_RENDER"
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (propagation NOT verified — content drift)' <<<"$out" \
+   && grep -q 'does NOT byte-match the re-rendered template examples/tpl.txt' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: dirty-manifest render match skipped as drift (facts read the committed manifest)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: consumer matching a dirty-manifest render was not skipped (rc=$rc) — facts read the working-tree manifest?" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 19b: the other direction (also fails pre-fix) — the manifest is
+# STILL dirty, but the consumer byte-matches the COMMITTED-manifest
+# render (greeting is hola) → resolves. Dirty facts neither fake a
+# match (19) nor block a genuine committed one (19b); the render inputs
+# are pinned to HEAD, the same state the template bytes, tree-entry and
+# evidence gates read. Restores the manifest afterwards.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 19b: consumer matching the COMMITTED-manifest render resolves despite dirty facts (#616)"
+
+GH_ARGV_LOG="$SCRATCH/t19b.log"; : > "$GH_ARGV_LOG"
+run_mode "$SCRATCH/threads_vp2.json" "$EXPECTED_RENDER"
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: verified-propagation\] consumer content at rendered/out.txt byte-matches the re-rendered template examples/tpl.txt (consumer=test-consumer)' "$GH_ARGV_LOG" \
+   && grep -q 'Readback: all 1 resolved thread(s) confirmed isResolved:true' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: committed-manifest render match resolved; the dirty fact edit was ignored"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: committed-manifest render match did not resolve under a dirty manifest (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+git -C "$FIXTURE_ROOT" checkout -q -- .mergepath-sync.yml
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 20: repo_lint.yml install_yq_for_sync_manifest fallback (#616
+# finding 3510689523). The reverse-skew branch (workflow arrives before
+# scripts/lib/ensure-yq.sh) must apply the same mikefarah
+# implementation sniff ensure-yq.sh applies — a bare `command -v yq`
+# accepts the Python wrapper and defers the failure to opaque
+# mikefarah-v4 parse errors in the later manifest checks. Scripted
+# check: extract the step's run block via yq and execute it against the
+# shim PATHs. 20a (wrong-impl rejected) FAILS PRE-FIX; 20b/20c lock the
+# accept and delegate branches.
+#
+# CANONICAL CHECKOUT ONLY: repo_lint.yml travels on the template-mirror
+# lane, NOT the manifest wave this test travels on (#601), so a
+# consumer checkout may legitimately carry an older workflow while this
+# test is already current. Gate on scripts/sync-to-downstream.sh — the
+# established mergepath-vs-consumer discriminator (intentionally never
+# propagated; see check_sync_manifest) — and skip-pass on consumers.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 20: repo_lint.yml yq fallback rejects a wrong-implementation yq (#616)"
+
+WORKFLOW_FILE="$ROOT/.github/workflows/repo_lint.yml"
+if [ ! -f "$ROOT/scripts/sync-to-downstream.sh" ] || [ ! -f "$WORKFLOW_FILE" ]; then
+  pass=$((pass + 1))
+  echo "  SKIP-PASS: consumer checkout — repo_lint.yml is template-mirror-laned (#601), so only the canonical mergepath checkout is authoritative for its step contents"
+else
+  YQ_STEP_RUN=$(yq -r '
+    .jobs[].steps[]
+    | select(.name == "install_yq_for_sync_manifest")
+    | .run
+  ' "$WORKFLOW_FILE" 2>/dev/null) || YQ_STEP_RUN=""
+
+  W20_EMPTY_CWD="$SCRATCH/w20-empty-cwd"
+  W20_LIB_CWD="$SCRATCH/w20-lib-cwd"
+  W20_DELEGATE_LOG="$SCRATCH/w20-delegate.log"
+  mkdir -p "$W20_EMPTY_CWD" "$W20_LIB_CWD/scripts/lib"
+  : > "$W20_DELEGATE_LOG"
+  cat > "$W20_LIB_CWD/scripts/lib/ensure-yq.sh" <<DELEGATE_STUB
+#!/bin/sh
+echo "delegated" >> "$W20_DELEGATE_LOG"
+DELEGATE_STUB
+  W20_BASH_BIN="$SCRATCH/w20-bash-bin"
+  mkdir -p "$W20_BASH_BIN"
+  ln -s "$(command -v bash)" "$W20_BASH_BIN/bash"
+
+  # 20a — wrong-implementation yq, lib absent (the reverse-skew
+  # fallback): must FAIL loudly, pointing at ensure-yq.sh as the
+  # resolution. REGRESSION — fails pre-fix.
+  set +e
+  out_wa=$(cd "$W20_EMPTY_CWD" && env PATH="$YQWRONG_BIN" "$BASH" -c "$YQ_STEP_RUN" 2>&1)
+  rc_wa=$?
+  set -e
+  # 20b — mikefarah yq, lib absent: the fallback accepts it.
+  set +e
+  out_wb=$(cd "$W20_EMPTY_CWD" && env PATH="$YQPRESENT_BIN" "$BASH" -c "$YQ_STEP_RUN" 2>&1)
+  rc_wb=$?
+  set -e
+  # 20c — lib present: delegates to scripts/lib/ensure-yq.sh (the
+  # implementation sniff is single-sourced there; even a wrong yq on
+  # PATH must not divert the primary branch).
+  set +e
+  out_wc=$(cd "$W20_LIB_CWD" && env PATH="$W20_BASH_BIN:$YQWRONG_BIN" "$BASH" -c "$YQ_STEP_RUN" 2>&1)
+  rc_wc=$?
+  set -e
+
+  if [ -n "$YQ_STEP_RUN" ] \
+     && [ "$rc_wa" -ne 0 ] \
+     && grep -q 'ensure-yq.sh' <<<"$out_wa" \
+     && [ "$rc_wb" -eq 0 ] \
+     && grep -q 'using preinstalled' <<<"$out_wb" \
+     && [ "$rc_wc" -eq 0 ] \
+     && grep -q 'delegated' "$W20_DELEGATE_LOG"; then
+    pass=$((pass + 1))
+    echo "  PASS: fallback rejects a non-mikefarah yq (fail-loud), accepts mikefarah, and delegates when the lib is present"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: install_yq_for_sync_manifest fallback shape wrong (rc_wa=$rc_wa rc_wb=$rc_wb rc_wc=$rc_wc)" >&2
+    echo "    wrong-impl output:" >&2; echo "$out_wa" | sed 's/^/      /' >&2
+    echo "    mikefarah output:" >&2; echo "$out_wb" | sed 's/^/      /' >&2
+    echo "    lib-present output:" >&2; echo "$out_wc" | sed 's/^/      /' >&2
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 21: a commit→tree peel failure (#616 finding 3510689525) is a
+# fail-closed VERIFICATION ERROR — byte-equal content whose compare
+# commit cannot be resolved to its tree never resolves, and the trees
+# endpoint is never called with an unpeeled ref. The positive
+# direction (trees receives the peeled TREE sha) is locked by the
+# updated 14b (open PR → TREEHEAD0) and 18 (closed PR → TREEDEFAULT0)
+# asserts, both of which fail pre-fix.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 21: commit-to-tree peel failure skips fail-closed (#616)"
+
+GH_ARGV_LOG="$SCRATCH/t21.log"; : > "$GH_ARGV_LOG"
+RUN_FAIL_COMMIT_TREE=1 run_mode "$SCRATCH/threads_vp1.json" "$CONSUMER_MATCH_CANONICAL"
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (propagation verification failed — failing closed)' <<<"$out" \
+   && grep -q 'could not read the consumer tree entry for docs/canonical.md' <<<"$out" \
+   && ! grep -q 'git/trees/' "$GH_ARGV_LOG" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: unpeelable compare commit skipped fail-closed (no trees fetch), exit 3, no mutations"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: commit-to-tree peel failure did not fail closed (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
