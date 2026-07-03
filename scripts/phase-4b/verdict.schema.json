@@ -89,6 +89,10 @@
           "minLength": 1
         }
       }
+    },
+    "cli_version": {
+      "description": "The reviewer CLI's own reported version (e.g. from `codex --version` / `claude --version`), captured by the adapter AFTER the review run — never the model's self-report, which cannot know its own CLI build. Null means the adapter could not capture it (best-effort, never a guessed value).",
+      "type": ["string", "null"]
     }
   }
 }
