@@ -652,6 +652,36 @@ phase_4b_automation:
   claude_effort: xhigh
   codex_effort: xhigh
 
+  # --- Review-diff byte budget (#635/#636) ---------------------------------
+  # A PR whose diff carries bulk committed artifacts can exceed the reviewer
+  # CLI's model context (#629: 6.4 MB, the CLI exits 1 and the whole
+  # automated leg falls back to manual). The adapters bound what they pipe
+  # to the CLI:
+  #
+  #   diff_max_bytes   Review-diff byte budget. Integer in [4096, 10485760];
+  #                    invalid values are rejected fail-closed. Absent ⇒
+  #                    600000 (~150k tokens). Env escape hatch:
+  #                    P4B_DIFF_MAX_BYTES (tests/manual runs).
+  #   diff_omit_globs  Allowlist of paths whose over-budget diff sections MAY
+  #                    be omitted (largest-first, replaced with in-diff
+  #                    placeholders plus a prompt disclosure naming each
+  #                    omitted path+size). Bash-glob syntax, matched against
+  #                    the repo-relative path; `*` crosses `/`. A section
+  #                    NOT matching the allowlist is never omitted — the run
+  #                    fails closed to the manual handoff instead, so a
+  #                    posted APPROVED can never clear the Phase 4b
+  #                    substitute gate around unreviewed application code
+  #                    (#636 Codex P1). Absent/empty ⇒ nothing is
+  #                    omission-eligible. Env escape hatch:
+  #                    P4B_DIFF_OMIT_GLOBS (comma-separated).
+  #
+  # diff_max_bytes intentionally not set: the 600000 default is right for
+  # every current reviewer CLI. The allowlist below names the one bulk-
+  # artifact family this repo commits today (retrospective-audit extracts,
+  # e.g. the #623 study data that motivated all of this).
+  diff_omit_globs:
+    - "docs/audits/data/*"
+
   # --- Approval-loop accounting (#602) -------------------------------------
   # Folds the "## Phase 4b Approval Accounting" block (plus the embedded
   # machine-readable `p4b-accounting:v1` record) into the automated APPROVED

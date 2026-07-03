@@ -571,6 +571,225 @@ p4b_is_timeout_rc() {
   esac
 }
 
+# --- review-diff byte budget (#635) -----------------------------------------
+
+# A PR whose diff carries bulk artifacts (mined JSONL extracts, generated
+# datasets) can exceed the reviewer CLI's model context; the CLI then fails
+# with an opaque nonzero exit and the whole automated leg falls back to the
+# manual handoff even though the reviewable code is small (#629: a 6.4 MB
+# diff, 6.2 MB of it two committed data files). The adapters therefore bound
+# what they pipe to the reviewer CLI: when the diff exceeds the budget, the
+# LARGEST per-file sections (bulk artifacts by construction) are omitted
+# until it fits, each replaced with an explicit placeholder line, and every
+# omission is reported so the adapter can disclose it in the review prompt.
+# The reviewer must never be led to believe an omitted file is absent from
+# the PR — an undisclosed manual trim on #629 produced exactly that
+# false-positive P1.
+
+P4B_DEFAULT_DIFF_MAX_BYTES=600000   # ~150k tokens: fits every current
+                                    # reviewer CLI context with headroom
+P4B_MIN_DIFF_MAX_BYTES=4096
+P4B_MAX_DIFF_MAX_BYTES=10485760
+
+# p4b_resolve_diff_max_bytes
+# Resolve the review-diff byte budget: P4B_DIFF_MAX_BYTES env override
+# (tests/manual escape hatch — integer-validated but not range-bounded,
+# mirroring the P4B_*_TIMEOUT_SECONDS envs) → the
+# phase_4b_automation.diff_max_bytes policy knob (bounded fail-closed, like
+# adapter_timeout_seconds) → P4B_DEFAULT_DIFF_MAX_BYTES. Prints the budget
+# on success; returns non-zero (no output) on an invalid configured value
+# so the caller fails closed instead of running the CLI mis-bounded.
+p4b_resolve_diff_max_bytes() {
+  local val
+  if [ -n "${P4B_DIFF_MAX_BYTES:-}" ]; then
+    case "$P4B_DIFF_MAX_BYTES" in
+      *[!0-9]*) return 1 ;;
+    esac
+    printf '%s' "$P4B_DIFF_MAX_BYTES"
+    return 0
+  fi
+  val="$(p4b_automation_field diff_max_bytes)"
+  [ -n "$val" ] || { printf '%s' "$P4B_DEFAULT_DIFF_MAX_BYTES"; return 0; }
+  case "$val" in
+    *[!0-9]*) return 1 ;;
+  esac
+  if [ "$val" -lt "$P4B_MIN_DIFF_MAX_BYTES" ] \
+     || [ "$val" -gt "$P4B_MAX_DIFF_MAX_BYTES" ]; then
+    return 1
+  fi
+  printf '%s' "$val"
+}
+
+# p4b_diff_omit_globs
+# Newline-separated shell-glob allowlist of paths whose diff sections MAY be
+# omitted from an over-budget review diff. Resolution: P4B_DIFF_OMIT_GLOBS
+# env override (comma-separated; tests/manual runs) → the
+# phase_4b_automation.diff_omit_globs policy list → EMPTY. Empty means no
+# section is omission-eligible, so an over-budget diff fails closed to the
+# manual handoff. This is the structural guard the Phase 4b substitute gate
+# needs (#636 Codex P1): trimming by size alone could silently drop a large
+# APPLICATION-CODE section and let the posted APPROVED clear a merge on code
+# no reviewer saw — only operator-declared bulk-artifact paths are ever
+# omitted. Patterns are bash `case` globs (`*` crosses `/`); a section is
+# eligible only when EVERY repo path it touches — b/-side, a/-side, and any
+# rename/copy source — matches (see p4b_trim_review_diff).
+p4b_diff_omit_globs() {
+  local cfg
+  if [ -n "${P4B_DIFF_OMIT_GLOBS:-}" ]; then
+    printf '%s\n' "$P4B_DIFF_OMIT_GLOBS" | tr ',' '\n' \
+      | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' || true
+    return 0
+  fi
+  cfg="$(p4b_config)"
+  [ -f "$cfg" ] || return 0
+  awk '
+    /^phase_4b_automation:/ { inblk=1; inlist=0; next }
+    inblk && /^[^[:space:]#]/ { inblk=0; inlist=0 }
+    inblk {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      if ($0 ~ /^[[:space:]]*diff_omit_globs:[[:space:]]*$/) { inlist=1; next }
+      if (inlist) {
+        if ($0 ~ /^[[:space:]]*-[[:space:]]*/) {
+          line = $0
+          sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+          gsub(/[[:space:]]*#.*$/, "", line)
+          gsub(/^["\047]/, "", line); gsub(/["\047][[:space:]]*$/, "", line)
+          sub(/[[:space:]]+$/, "", line)
+          if (line != "") print line
+          next
+        }
+        inlist = 0
+      }
+    }
+  ' "$cfg"
+}
+
+# p4b_path_matches_any_glob <path> <globs-newline-separated>
+p4b_path_matches_any_glob() {
+  local path="$1" g
+  while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    # $g is intentionally unquoted: it is the glob pattern itself.
+    # shellcheck disable=SC2254
+    case "$path" in
+      $g) return 0 ;;
+    esac
+  done <<EOF
+$2
+EOF
+  return 1
+}
+
+# p4b_trim_review_diff <in_file> <out_file> <max_bytes> [<omit_globs>]
+# Byte-bound a unified diff for reviewer-CLI consumption. Under-budget input
+# is copied through verbatim (empty stdout). Over-budget input has its
+# largest OMISSION-ELIGIBLE per-file sections omitted, each replaced in the
+# output with a single
+#   [phase-4b diff-budget: <path> omitted - oversized diff section]
+# placeholder line, and one "<path><TAB><bytes>" line per omission printed
+# on stdout for the caller's disclosure note. Returns non-zero (fail-closed)
+# when omitting every eligible section still cannot meet the budget (never
+# omits a non-eligible section), or when no reviewable file section survives
+# — the caller must fall back rather than review a husk or approve around
+# unreviewed code.
+#
+# Eligible = EVERY repo path the section touches matches <omit_globs>
+# (newline-separated shell globs; see p4b_diff_omit_globs). A section touches
+# its b/-side path, its a/-side path, AND — for a rename or copy — the
+# `rename from` / `copy from` source. Checking only the b/-side (the #636
+# round-1 shape) let a large rename FROM a non-allowlisted application path
+# (`src/foo.sh`) TO an allowlisted artifact path (`docs/audits/data/foo.sh`)
+# be omitted, hiding the removal of application code while an APPROVED could
+# still post (#636 round-2 P1). Requiring the a/-side and rename source to be
+# allowlisted too fails such a section closed.
+p4b_trim_review_diff() {
+  local in="$1" out="$2" max="$3" globs="${4:-}" total sizes omit="" projected
+  local b i bside aside rfrom plh plen
+  [ -r "$in" ] || return 1
+  case "$max" in ''|*[!0-9]*) return 1 ;; esac
+  total="$(wc -c < "$in" | tr -d '[:space:]')"
+  if [ "$total" -le "$max" ]; then
+    cp "$in" "$out" || return 1
+    return 0
+  fi
+  # Per-section metadata as "bytes<TAB>index<TAB>bside<TAB>aside<TAB>rename_from",
+  # largest first. Sections are keyed by INDEX (omission never depends on path
+  # parsing); the b/-side is the display path, and a/-side + rename source are
+  # carried so the caller can require EVERY touched path to be allowlisted.
+  # a/-side is derived by stripping the parsed " b/<bside>" suffix, so it uses
+  # the same split point as the b/-side. LC_ALL=C keeps length() byte-exact.
+  sizes="$(LC_ALL=C awk '
+    /^diff --git /{ n++; hdr[n] = $0; bytes[n] = 0; rfrom[n] = "" }
+    n > 0 { bytes[n] += length($0) + 1 }
+    /^rename from /{ if (n > 0 && rfrom[n] == "") rfrom[n] = substr($0, 13) }
+    /^copy from /  { if (n > 0 && rfrom[n] == "") rfrom[n] = substr($0, 11) }
+    END {
+      for (i = 1; i <= n; i++) {
+        b = hdr[i]; sub(/^diff --git a\/.* b\//, "", b)
+        a = hdr[i]; sub(/^diff --git a\//, "", a)
+        suf = " b/" b
+        if (substr(a, length(a) - length(suf) + 1) == suf) a = substr(a, 1, length(a) - length(suf))
+        printf "%d\t%d\t%s\t%s\t%s\n", bytes[i], i, b, a, rfrom[i]
+      }
+    }
+  ' "$in" | sort -rn)"
+  [ -n "$sizes" ] || return 1
+  # Omit largest-first until the PROJECTED output size fits. `projected` models
+  # the exact output byte count — each omission removes the section's bytes and
+  # adds its placeholder line — so a placeholder can no longer push the final
+  # output back over budget after the loop stops (#636 round-2 P2).
+  projected="$total"
+  while IFS=$'\t' read -r b i bside aside rfrom; do
+    [ "$projected" -le "$max" ] && break
+    p4b_path_matches_any_glob "$bside" "$globs" || continue
+    p4b_path_matches_any_glob "$aside" "$globs" || continue
+    if [ -n "$rfrom" ]; then
+      p4b_path_matches_any_glob "$rfrom" "$globs" || continue
+    fi
+    plh="[phase-4b diff-budget: ${bside} omitted - oversized diff section; see the prompt note]"
+    plen="$(printf '%s\n' "$plh" | LC_ALL=C wc -c | tr -d '[:space:]')"
+    projected=$(( projected - b + plen ))
+    omit="$omit $i"
+    printf '%s\t%s\n' "$bside" "$b"
+  done <<EOF
+$sizes
+EOF
+  [ "$projected" -le "$max" ] || return 1
+  LC_ALL=C awk -v omit_list="$omit" '
+    BEGIN { split(omit_list, parts, " "); for (k in parts) if (parts[k] != "") omit[parts[k]] = 1 }
+    /^diff --git /{
+      n++
+      skipping = ((n "") in omit) ? 1 : 0
+      if (skipping) {
+        p = $0
+        sub(/^diff --git a\/.* b\//, "", p)
+        printf "[phase-4b diff-budget: %s omitted - oversized diff section; see the prompt note]\n", p
+      } else print
+      next
+    }
+    !skipping { print }
+  ' "$in" > "$out" || return 1
+  # Placeholders add bytes the loop above does not model; assert the OUTPUT
+  # honors the budget and still carries at least one reviewable section.
+  [ "$(wc -c < "$out" | tr -d '[:space:]')" -le "$max" ] || return 1
+  grep -q '^diff --git ' "$out" || return 1
+  return 0
+}
+
+# p4b_stderr_tail <file>
+# One sanitized line (<= ~400 bytes) from the tail of a captured stderr
+# file, for embedding the reviewer CLI's actual complaint in a failure
+# message. Non-printable bytes are blanked and whitespace runs collapsed;
+# an empty or missing file prints nothing. (#635: the previous rc!=0
+# handling guessed "auth" for every failure — a context-overflow rc=1 read
+# as a login problem while the CLI's real error was discarded.)
+p4b_stderr_tail() {
+  [ -n "${1:-}" ] && [ -s "$1" ] || return 0
+  tail -c 400 "$1" \
+    | LC_ALL=C tr -c '[:print:]' ' ' \
+    | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ *//' -e 's/ *$//'
+}
+
 # --- plan-only reviewer CLI auth guards ------------------------------------
 
 p4b_codex_auth_file() {

@@ -43,6 +43,18 @@
 #               ⇒ omit the flag and use the Codex CLI default. Maps to
 #               `codex -c model_reasoning_effort=<v>`. The orchestrator sets
 #               this from phase_4b_automation.codex_effort.
+#   P4B_DIFF_MAX_BYTES  review-diff byte budget override (integer; tests and
+#               manual runs). Default resolution: the
+#               phase_4b_automation.diff_max_bytes policy knob, else 600000.
+#               An over-budget diff has its largest ALLOWLISTED per-file
+#               sections omitted with in-diff placeholders plus a prompt
+#               disclosure naming each omitted path+size (#635); when nothing
+#               reviewable survives the budget, exit 4 (manual fallback).
+#   P4B_DIFF_OMIT_GLOBS  comma-separated override of the omission allowlist
+#               (phase_4b_automation.diff_omit_globs). Only matching paths
+#               are ever omitted from an over-budget diff — a non-matching
+#               oversized section fails closed to the manual handoff so an
+#               APPROVED can never post around unreviewed code (#636 P1).
 #
 # Exit codes:
 #   0  valid verdict JSON on stdout.
@@ -111,6 +123,46 @@ command -v "$CODEX_BIN" >/dev/null 2>&1 || p4b_die 3 "codex CLI not found on PAT
 p4b_require_codex_plan_auth
 CODEX_AUTH_SOURCE="$(p4b_codex_auth_file)"
 
+TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/p4b-codex.XXXXXX")"
+ERR_OUT="$(mktemp "${TMPDIR:-/tmp}/p4b-codex-stderr.XXXXXX")"
+DIFF_RAW="$(mktemp "${TMPDIR:-/tmp}/p4b-codex-diff-raw.XXXXXX")"
+DIFF_FIT="$(mktemp "${TMPDIR:-/tmp}/p4b-codex-diff-fit.XXXXXX")"
+RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/p4b-codex-run.XXXXXX")"
+RUN_HOME="$(mktemp -d "${TMPDIR:-/tmp}/p4b-codex-home.XXXXXX")"
+RUN_CODEX_HOME="$(mktemp -d "${TMPDIR:-/tmp}/p4b-codex-auth.XXXXXX")"
+cp "$CODEX_AUTH_SOURCE" "$RUN_CODEX_HOME/auth.json"
+chmod 600 "$RUN_CODEX_HOME/auth.json" 2>/dev/null || true
+# shellcheck disable=SC2064
+trap "rm -f '$TMP_OUT' '$ERR_OUT' '$DIFF_RAW' '$DIFF_FIT'; rm -rf '$RUN_DIR' '$RUN_HOME' '$RUN_CODEX_HOME'" EXIT
+
+# --- bound the diff to the review byte budget (#635) ------------------------
+MAX_DIFF_BYTES="$(p4b_resolve_diff_max_bytes)" \
+  || p4b_die 3 "invalid diff byte budget (P4B_DIFF_MAX_BYTES must be an integer; phase_4b_automation.diff_max_bytes must be an integer in ${P4B_MIN_DIFF_MAX_BYTES}..${P4B_MAX_DIFF_MAX_BYTES})"
+printf '%s\n' "$DIFF" > "$DIFF_RAW"
+DIFF_BYTES="$(wc -c < "$DIFF_RAW" | tr -d '[:space:]')"
+OMIT_GLOBS="$(p4b_diff_omit_globs)"
+OMITTED="$(p4b_trim_review_diff "$DIFF_RAW" "$DIFF_FIT" "$MAX_DIFF_BYTES" "$OMIT_GLOBS")" \
+  || p4b_die 4 "diff (${DIFF_BYTES} bytes) exceeds the ${MAX_DIFF_BYTES}-byte review budget and cannot be reduced by omitting policy-allowlisted bulk sections (phase_4b_automation.diff_omit_globs) — refusing to omit unreviewed code (#636); pass a curated --diff-file or extend the allowlist; falling back to the manual handoff"
+DIFF_NOTE=""
+if [ -n "$OMITTED" ]; then
+  DIFF="$(cat "$DIFF_FIT")"
+  OMIT_COUNT="$(printf '%s\n' "$OMITTED" | grep -c .)"
+  p4b_log "diff over budget (${DIFF_BYTES} > ${MAX_DIFF_BYTES} bytes): omitted ${OMIT_COUNT} allowlisted file section(s): $(printf '%s\n' "$OMITTED" | awk -F'\t' '{printf "%s%s (%s bytes)", (NR > 1 ? ", " : ""), $1, $2}')"
+  DIFF_NOTE="
+
+NOTE: the full PR diff is ${DIFF_BYTES} bytes, over this review's
+${MAX_DIFF_BYTES}-byte budget. The per-file diff section(s) listed below
+WERE CHANGED BY THIS PR but are omitted from the diff you receive, each
+replaced with a '[phase-4b diff-budget: ...]' placeholder line. Only paths
+on the repo's operator-declared bulk-artifact allowlist
+(phase_4b_automation.diff_omit_globs) are ever omitted this way. Do NOT
+report these files as missing from the PR; treat them as
+changed-but-unreviewed bulk artifacts:
+$(printf '%s\n' "$OMITTED" | awk -F'\t' '{printf "- %s (%s bytes)\n", $1, $2}')
+If the omission of any of these prevents a sound verdict, return
+CHANGES_REQUESTED and say so in the summary."
+fi
+
 # --- run the review --------------------------------------------------------
 REQUIRED_SEVERITIES="$(p4b_required_verdict_severities_json)" \
   || p4b_die 3 "invalid feedback_policy; cannot determine required verdict severities"
@@ -127,17 +179,7 @@ pass, not just the first one. For this repository, these finding severities
 require disposition before merge: ${REQUIRED_SEVERITIES}.
 If any finding with one of those severities exists, the verdict must be
 CHANGES_REQUESTED, not APPROVED. Do not edit files. Do not post anything to
-GitHub."
-
-TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/p4b-codex.XXXXXX")"
-ERR_OUT="$(mktemp "${TMPDIR:-/tmp}/p4b-codex-stderr.XXXXXX")"
-RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/p4b-codex-run.XXXXXX")"
-RUN_HOME="$(mktemp -d "${TMPDIR:-/tmp}/p4b-codex-home.XXXXXX")"
-RUN_CODEX_HOME="$(mktemp -d "${TMPDIR:-/tmp}/p4b-codex-auth.XXXXXX")"
-cp "$CODEX_AUTH_SOURCE" "$RUN_CODEX_HOME/auth.json"
-chmod 600 "$RUN_CODEX_HOME/auth.json" 2>/dev/null || true
-# shellcheck disable=SC2064
-trap "rm -f '$TMP_OUT' '$ERR_OUT'; rm -rf '$RUN_DIR' '$RUN_HOME' '$RUN_CODEX_HOME'" EXIT
+GitHub.${DIFF_NOTE}"
 
 SAFE_ENV=(env -i
   "PATH=${PATH:-/usr/bin:/bin}"
@@ -175,10 +217,11 @@ RAW="$(
 RC=$?
 set -e
 if [ "$RC" -ne 0 ]; then
+  ERR_TAIL="$(p4b_stderr_tail "$ERR_OUT")"
   if p4b_is_timeout_rc "$RC"; then
-    p4b_die 4 "codex exec timed out after ${CLI_TIMEOUT}s — falling back to the manual handoff"
+    p4b_die 4 "codex exec timed out after ${CLI_TIMEOUT}s${ERR_TAIL:+ — last stderr: ${ERR_TAIL}} — falling back to the manual handoff"
   fi
-  p4b_die 4 "codex exec failed (rc=$RC) — ensure 'codex login' is active on a plan (child env is allowlisted for plan-only billing); falling back to the manual handoff"
+  p4b_die 4 "codex exec failed (rc=$RC)${ERR_TAIL:+ — stderr: ${ERR_TAIL}} — if this is an auth error, ensure 'codex login' is active on a plan (child env is allowlisted for plan-only billing); falling back to the manual handoff"
 fi
 
 # Prefer the --output-last-message file; fall back to captured stdout.
