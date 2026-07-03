@@ -1370,9 +1370,12 @@ echo "verdict.schema.json + lib.sh — additive nullable usage fields (#602)"
 # ===========================================================================
 # shellcheck source=../scripts/phase-4b/lib.sh
 . "$LIB"
+# #632 retired the pre-#602 4-key backward-compat shape: OpenAI strict mode
+# requires the schema to be required-complete, so the additive fields are
+# required-but-nullable and a 4-key emitter is now schema-invalid.
 if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"source":"claude-json-envelope"}}'; then
-  pass "pre-#602 4-key usage still validates (additive change is backward compatible)"
-else fail "legacy usage shape rejected"; fi
+  fail "pre-#602 4-key usage accepted despite #632 required-completeness"
+else pass "pre-#602 4-key usage rejected (#632 required-complete schema)"; fi
 if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":30,"cache_read_input_tokens":20,"reasoning_tokens":7,"total_cost_usd":0.42,"source":"claude-json-envelope"}}'; then
   pass "usage with all additive #602 fields validates"
 else fail "extended usage shape rejected"; fi
