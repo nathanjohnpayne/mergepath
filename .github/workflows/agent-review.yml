@@ -1007,21 +1007,36 @@ jobs:
               exit 1
             fi
           done
-          # #620 (automated 4b P1): if this run downgraded a CodeRabbit
-          # rate-limit stall (rc=5), re-check the propagation-lane marker at
-          # the last verify point. The rc=5-time check can race the lane —
-          # label read as present, marker posted moments later — and a marker
-          # on this head means merge-clearance exempts it (vacuous), so the
+          # #620 (automated 4b P1, rounds 1+2): if this run downgraded a
+          # CodeRabbit rate-limit stall (rc=5), re-check the propagation-lane
+          # marker at the last verify point. The rc=5-time check can race the
+          # lane — label read as present, marker posted moments later — and a
+          # marker means merge-clearance exempts the head (vacuous), so the
           # downgrade's premise (a downstream gate blocks until external
-          # clearance) is false: neither bot has reviewed. Fail closed: a
-          # marker-read error counts as marker-present and aborts.
+          # clearance) is false: neither bot has reviewed.
+          #
+          # The re-check anchors CURRENT_HEAD_SHA — the LIVE head exported by
+          # the required-check wait above and pinned by the merge command's
+          # --match-head-commit — NOT the workflow event's payload SHA
+          # (4b round-2 P1: the waits run for minutes, a push can move the
+          # branch, and a marker posted for the NEW head would be invisible
+          # to a payload-SHA grep while the merge targets that new head).
+          # And the downgrade itself anchored the event head, so if the two
+          # differ the CodeRabbit disposition is stale for the head being
+          # merged — abort. Fail closed on every read error: missing
+          # CURRENT_HEAD_SHA, drifted head, or an unreadable marker each
+          # count as unsafe and abort.
           if [ "${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true" ]; then
+            if [ -z "${CURRENT_HEAD_SHA:-}" ] || [ "$CURRENT_HEAD_SHA" != "$HEAD_SHA" ]; then
+              echo "::error::Head drifted after the rc=5 rate-limit downgrade (event=$HEAD_SHA live=${CURRENT_HEAD_SHA:-unset}) — the CodeRabbit disposition is stale for the merge head. Aborting auto-merge."
+              exit 1
+            fi
             lane_marker=1
             if lane_comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null); then
-              lane_marker=$(jq -s --arg head "$HEAD_SHA" '[add // [] | .[] | select((.user.login == "github-actions[bot]") and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))] | length' <<<"$lane_comments" 2>/dev/null || echo 1)
+              lane_marker=$(jq -s --arg head "$CURRENT_HEAD_SHA" '[add // [] | .[] | select((.user.login == "github-actions[bot]") and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))] | length' <<<"$lane_comments" 2>/dev/null || echo 1)
             fi
             if [ "${lane_marker:-1}" != "0" ]; then
-              echo "::error::Propagation-lane marker present (or unreadable) for $HEAD_SHA after an rc=5 rate-limit downgrade — merge-clearance would exempt this head with neither bot review. Aborting auto-merge."
+              echo "::error::Propagation-lane marker present (or unreadable) for $CURRENT_HEAD_SHA after an rc=5 rate-limit downgrade — merge-clearance would exempt this head with neither bot review. Aborting auto-merge."
               exit 1
             fi
           fi

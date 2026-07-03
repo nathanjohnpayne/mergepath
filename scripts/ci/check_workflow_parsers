@@ -706,16 +706,22 @@ fi
 # after the label read): the downgrade path must record itself
 # (CR_RATE_LIMIT_DOWNGRADED via GITHUB_ENV) and the FINAL blocking-label
 # re-verify must re-check the marker and abort when it is present or
-# unreadable (automated-4b P1 residual window).
+# unreadable (automated-4b round-1 P1). The re-check must anchor
+# CURRENT_HEAD_SHA — the live head the merge pins via --match-head-commit —
+# and abort on head drift, NOT the workflow event's payload SHA: a push
+# during the waits moves the merge head and a marker for the new head would
+# be invisible to a payload-SHA grep (automated-4b round-2 P1).
 if grep -Fq 'echo "CR_RATE_LIMIT_DOWNGRADED=true" >> "$GITHUB_ENV"' <<<"$auto_merge_job_block" \
   && grep -Fq '"${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true"' <<<"$auto_merge_job_block" \
-  && grep -A4 -F '"${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true"' <<<"$auto_merge_job_block" | grep -Fq 'lane_comments=$(gh api' \
+  && grep -Fq '"$CURRENT_HEAD_SHA" != "$HEAD_SHA"' <<<"$auto_merge_job_block" \
+  && grep -A2 -F '"$CURRENT_HEAD_SHA" != "$HEAD_SHA"' <<<"$auto_merge_job_block" | grep -Fq 'exit 1' \
+  && grep -Fq -- '--arg head "$CURRENT_HEAD_SHA"' <<<"$auto_merge_job_block" \
   && grep -A2 -F 'if [ "${lane_marker:-1}" != "0" ]' <<<"$auto_merge_job_block" | grep -Fq 'exit 1'; then
   pass=$((pass + 1))
-  echo "  PASS: rc=5 downgrade records itself and the final re-verify re-checks the marker, aborting fail-closed (#620)"
+  echo "  PASS: rc=5 downgrade records itself; the final re-verify re-checks the marker on the LIVE merge head and aborts on drift, fail-closed (#620)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the rc=5 downgrade must set CR_RATE_LIMIT_DOWNGRADED in GITHUB_ENV and the final blocking-label re-verify must re-run the marker check and exit 1 when the marker is present or unreadable (automated-4b P1) (#620)" >&2
+  echo "  FAIL: the rc=5 downgrade must set CR_RATE_LIMIT_DOWNGRADED in GITHUB_ENV, and the final re-verify must abort on head drift and re-run the marker check anchored to CURRENT_HEAD_SHA (the --match-head-commit head), exiting 1 when the marker is present or unreadable (automated-4b P1 r1+r2) (#620)" >&2
 fi
 
 # 2f. pr-review-policy's propagation lane removes needs-external-review; that
