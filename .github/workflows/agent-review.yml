@@ -863,9 +863,17 @@ jobs:
               # block), so an API hiccup never lets a rate-limited PR
               # through.
               if [ "${EVENT_ACTION:-}" = "unlabeled" ] && [ "${REMOVED_LABEL:-}" = "needs-external-review" ]; then
-                lane_marker=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null \
-                  | jq -s --arg head "$HEAD_SHA" '[add // [] | .[] | select((.user.login == "github-actions[bot]") and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))] | length' 2>/dev/null \
-                  || echo 1)
+                # Fetch and parse are SPLIT (Codex r10 P1): in a pipeline,
+                # a failed gh with empty output leaves jq -s slurping empty
+                # input into [] → length 0 → exit 0, so the || fallback
+                # never fires and a comments-API failure would read as
+                # "no marker" and raise. Initialized to 1 (marker-present)
+                # so gh failure, jq failure, and non-numeric garbage all
+                # keep the no-raise fail-closed default.
+                lane_marker=1
+                if lane_comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null); then
+                  lane_marker=$(jq -s --arg head "$HEAD_SHA" '[add // [] | .[] | select((.user.login == "github-actions[bot]") and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))] | length' <<<"$lane_comments" 2>/dev/null || echo 1)
+                fi
                 if [ "${lane_marker:-1}" = "0" ]; then
                   ext_required=true
                 fi

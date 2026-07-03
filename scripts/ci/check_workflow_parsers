@@ -683,13 +683,15 @@ fi
 if grep -Fq 'mergepath-propagation-lane verified-head=' <<<"$auto_merge_job_block" \
   && grep -Fq 'github-actions[bot]' <<<"$auto_merge_job_block" \
   && grep -Fq 'HEAD_SHA: ${{ github.event.pull_request.head.sha }}' <<<"$auto_merge_job_block" \
+  && grep -Fq 'lane_marker=1' <<<"$auto_merge_job_block" \
+  && grep -Fq 'if lane_comments=$(gh api' <<<"$auto_merge_job_block" \
   && grep -Fq 'echo 1' <<<"$auto_merge_job_block" \
   && grep -A1 -F '"${lane_marker:-1}" = "0"' <<<"$auto_merge_job_block" | grep -Fq 'ext_required=true'; then
   pass=$((pass + 1))
   echo "  PASS: rc=5 override excludes the propagation lane's exemption removal via the HEAD-pinned marker, fail-closed (#620)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the rc=5 ext_required override must be gated on the absence of the trusted propagation lane marker for the current head (lane_verified() contract), defaulting to no-raise on read error (#620)" >&2
+  echo "  FAIL: the rc=5 ext_required override must be gated on the absence of the trusted propagation lane marker for the current head (lane_verified() contract), with the fetch SPLIT from the parse and lane_marker initialized to 1 so a comments-API failure keeps the no-raise default (Codex r10 P1) (#620)" >&2
 fi
 
 # 2f. pr-review-policy's propagation lane removes needs-external-review; that
