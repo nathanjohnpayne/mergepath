@@ -259,10 +259,21 @@ ALLOW_LIST=(
   #     (both-absent marker SKIP, #601)
   #   - check_sync_manifest         → test_check_sync_manifest.sh (also
   #     SKIPs on consumers via the manifest-absent guard)
+  #   - check_audit_codex_latency   → test_audit_codex_latency.sh
+  #     (both-absent marker SKIP, #601; the #623 latency-study suite)
   "tests/test_eslint_policy_check.sh"
   "tests/test_check_mktemp_portability.sh"
   "tests/test_session_finalization_check.sh"
   "tests/test_check_sync_manifest.sh"
+  "tests/test_audit_codex_latency.sh"
+
+  # The #623 Codex-latency audit script — hub-only operator tooling for
+  # this pass (a consumer-repo sweep is a possible follow-up, at which
+  # point it moves onto the manifest). check_audit_codex_latency names
+  # it in a comment only; the wrapper runs the TEST, which SKIPs on
+  # consumers via the both-absent marker idiom, so neither file needs
+  # to travel.
+  "scripts/audit-codex-latency.sh"
 
   # The #601 consumer-safety net itself — hub-only BY DESIGN: it encodes
   # the hub-only removal list (this ALLOW_LIST + the bootstrap mirror

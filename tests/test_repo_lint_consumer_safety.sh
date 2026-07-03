@@ -121,6 +121,9 @@ CONSUMER_ABSENT=(
   "tests/test_session_finalization_check.sh"
   "tests/test_check_sync_manifest.sh"
   "tests/test_verify_propagation_pr_templated.sh"
+  "scripts/audit-codex-latency.sh"
+  "tests/test_audit_codex_latency.sh"
+  "tests/fixtures/audit-codex-latency"
   # Hub-only test harnesses that drive checks (not driven BY them) —
   # not in the manifest, so consumers do not have them.
   "tests/test_ci_scripts_wired.sh"
