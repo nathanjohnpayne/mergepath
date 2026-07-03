@@ -1,0 +1,27 @@
+{
+  "description": "a clean COMMENTED review with zero P0/P1 would normally clear, but issueComments fetch failed (simulated) so we cannot rule out a superseding negative verdict — codexCleared stays false (#612 Codex P2 round 4)",
+  "expected_cleared": false,
+  "authoring_agent": "claude",
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "head_committer_date": "2026-05-12T10:00:00Z",
+  "merged_at": "2026-05-12T11:00:00Z",
+  "issue_comments_fetch_failed": true,
+  "reviews": [
+    {
+      "id": 1001,
+      "state": "COMMENTED",
+      "commit_id": "deadbeefcafe1234567890abcdef1234567890ab",
+      "submitted_at": "2026-05-12T10:30:00Z",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ],
+  "inline_comments": [
+    {
+      "id": 5001,
+      "pull_request_review_id": 1001,
+      "body": "Nice work here — looks clean.",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ]
+}

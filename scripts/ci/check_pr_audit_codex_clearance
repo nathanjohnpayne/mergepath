@@ -171,18 +171,15 @@ const codexCommentedOnHead = codexReviewsOnHead.filter(
 // signals are ignored (codexCleared stays false), matching codex-review-check.sh.
 let codexCleared = false;
 
-// Latest HEAD-anchored Codex verdict comment. #612, Codex P2 rounds 1-3 on
-// #640. Latest-first, then-affirmative, #608 P1 shape, ties replace-on->=
-// matching max_by(.created_at). Merge-time bounded — a verdict posted after
-// mergedAt must not count in this retrospective audit.
-//
-// Gated ONLY on codexEnabled + issueComments availability — NOT on
-// inlineComments (round 3): the review-clearance path needs inline comments
-// for P0/P1 state, but the verdict's timestamp for staleness purposes needs
-// only the verdict comment itself. Also NOT gated on sameAgentContext
-// (round 2): the merge gate's CODEX_HEAD_VERDICT_ANY_TIME feeds the Phase 4b
-// staleness guard regardless of same-agent; that gating applies only at the
-// codexCleared assignment below.
+// Three independent signal scans (#612 rounds 1-4). Each of verdict /
+// reaction / review is scanned for its TIMESTAMP unconditionally,
+// independent of inlineComments, issueComments, and sameAgentContext
+// availability wherever the underlying data allows it. Only the
+// clearance decision below gates on same-agent-or-CLI-approval and
+// requires BOTH inlineComments and issueComments to be known.
+
+// Verdict: needs issueComments. Latest-first, then-affirmative, ties
+// replace-on->= matching max_by(.created_at). Merge-time bounded.
 let latestVerdictTime = '';
 let verdictAffirmative = false;
 if (codexEnabled && issueComments !== null) {
@@ -212,20 +209,39 @@ if (codexEnabled && issueComments !== null) {
   }
 }
 
-if (codexEnabled && inlineComments !== null) {
-  let latestCodexReview = null;
-  if (codexCommentedOnHead.length > 0) {
-    latestCodexReview = codexCommentedOnHead.reduce(
-      (latest, r) => {
-        if (!latest) return r;
-        return (r.submitted_at > latest.submitted_at) ? r : latest;
-      },
-      null
-    );
+// Reaction: needs only the reactions array. NOT gated on sameAgentContext
+// for the timestamp (round 4) — a cross-agent thumbs-up still counts as a
+// newer Codex signal even though it cannot itself substitute for gate b
+// alone.
+let latestReactionTime = '';
+if (codexEnabled) {
+  for (const x of reactions) {
+    if (x.user && x.user.login === codexBotLogin &&
+        x.content === '+1' &&
+        reactionLowerBound && x.created_at >= reactionLowerBound &&
+        mergedAt && x.created_at <= mergedAt &&
+        x.created_at > latestReactionTime) {
+      latestReactionTime = x.created_at;
+    }
   }
-  const latestReviewTime =
-    latestCodexReview ? (latestCodexReview.submitted_at || '') : '';
+}
 
+// Review: needs only codexCommentedOnHead. NOT gated on inlineComments
+// (round 4) for the timestamp — only the P0/P1 cleanliness check below
+// needs inline comments.
+let latestReviewTime = '';
+let latestCodexReview = null;
+if (codexEnabled && codexCommentedOnHead.length > 0) {
+  latestCodexReview = codexCommentedOnHead.reduce(
+    (latest, r) => (!latest || r.submitted_at > latest.submitted_at) ? r : latest,
+    null
+  );
+  latestReviewTime = latestCodexReview ? (latestCodexReview.submitted_at || '') : '';
+}
+
+// Clearance decision: requires BOTH inlineComments AND issueComments to
+// be known (round 4) — a failure on either leaves codexCleared false.
+if (codexEnabled && inlineComments !== null && issueComments !== null) {
   const p01Regex = /!\[P[01] Badge\]/;
   let reviewHasUnresolvedP01 = false;
   if (latestCodexReview) {
@@ -238,9 +254,9 @@ if (codexEnabled && inlineComments !== null) {
       reviewHasUnresolvedP01 = p01.length > 0; // fail closed
     } else {
       // Resolved counts only when bounded by merge: thread resolved AND
-      // merged_at known AND no thread comment after merged_at (#460 — no
+      // merged_at known AND no thread comment after merged_at. #460: no
       // resolvedAt exists, so post-merge activity is the proxy; fail
-      // closed on unknown merged_at).
+      // closed on unknown merged_at.
       const resolvedAtMerge = (cid) => {
         const e = resolutionByCommentId[String(cid)];
         if (!e || e.resolved !== true) return false;
@@ -252,12 +268,11 @@ if (codexEnabled && inlineComments !== null) {
     }
   }
 
-  // Same-agent context (Codex P2 on PR 460 r3): a Codex +1 substitutes for
-  // gate (b) reviewer approval only when the PR Authoring-Agent resolves to
-  // an available reviewer identity. Mirrors codex-review-check.sh
-  // AUTHORING_AGENT to SAME_AGENT_REVIEWER suffix match. A missing or non-
-  // matching authoring agent leaves sameAgentContext false, so a cross-agent
-  // +1 does not clear (the round-3 finding case).
+  // Same-agent context (Codex P2 on PR 460 r3): a Codex signal substitutes
+  // for gate (b) reviewer approval only when the PR Authoring-Agent
+  // resolves to an available reviewer identity. Mirrors
+  // codex-review-check.sh AUTHORING_AGENT to SAME_AGENT_REVIEWER suffix
+  // match.
   const reviewerAccounts = fx.available_reviewers ||
     ['nathanpayne-claude', 'nathanpayne-cursor', 'nathanpayne-codex'];
   let sameAgentContext = false;
@@ -268,23 +283,8 @@ if (codexEnabled && inlineComments !== null) {
     );
   }
 
-  // latestVerdictTime / verdictAffirmative are computed above, outside
-  // this block (#612 Codex P2 round 3) — reused here unchanged.
-
-  let latestReactionTime = '';
-  if (sameAgentContext) {
-    for (const x of reactions) {
-      if (x.user && x.user.login === codexBotLogin &&
-          x.content === '+1' &&
-          reactionLowerBound && x.created_at >= reactionLowerBound &&
-          mergedAt && x.created_at <= mergedAt &&
-          x.created_at > latestReactionTime) {
-        latestReactionTime = x.created_at;
-      }
-    }
-  }
-
-  // Latest-signal-wins among THREE signal types (#612). Ties resolve
+  // Latest-signal-wins among THREE signal types (#612), using the
+  // UNCONDITIONAL timestamps computed above (round 4). Ties resolve
   // reaction < review < verdict.
   let latestKind = '';
   let latestTime = '';
@@ -298,16 +298,17 @@ if (codexEnabled && inlineComments !== null) {
       latestTime = time;
     }
   }
+  // Both reaction and verdict clear only when same-agent OR an
+  // independent CLI approval already exists, round 3, extended to
+  // reaction in round 4. Review clearance has never required
+  // same-agent, pre-existing and out of scope.
+  const gateBSatisfied = sameAgentContext || hasIndependentCliApproval;
   if (latestKind === 'reaction') {
-    codexCleared = true;
+    codexCleared = gateBSatisfied;
   } else if (latestKind === 'review') {
     codexCleared = !reviewHasUnresolvedP01;
   } else if (latestKind === 'verdict') {
-    // "same-agent OR an independent CLI approval already exists" (round 3):
-    // the verdict only needs same-agent to substitute for gate (b) branch 2
-    // when nothing else already satisfies gate (b) via branch 1.
-    codexCleared = (sameAgentContext || hasIndependentCliApproval)
-      && verdictAffirmative && !reviewHasUnresolvedP01;
+    codexCleared = gateBSatisfied && verdictAffirmative && !reviewHasUnresolvedP01;
   }
 }
 // --- end mirrored algorithm --------------------------------------
@@ -452,17 +453,19 @@ else
   echo "  FAIL: $WORKFLOW must add the merged_at - reaction_freshness_window_seconds floor to the reaction lower bound — Codex P2 #460" >&2
 fi
 
-# Structural assertion (Codex P2 on #460): the workflow honors
-# codex.enabled before accepting any Codex bot clearance signal. When
-# codex.enabled=false, codex-review-check.sh ignores Codex reviews and
-# reactions (gate (c) clears only via a Phase 4b substitute APPROVED);
-# the retrospective audit must match, or a stray 👍 from a still-installed
-# App on a codex-disabled repo would mark a merge compliant that the merge
-# gate never cleared. Captured from policy as codexEnabled, then gated on
-# the clearance algorithm. The codex-disabled-plus1-rejected fixture
-# exercises the runtime path; this canary guards the workflow source.
+# Structural assertion (Codex P2 on #460, restructured #612 round 4): the
+# workflow honors codex.enabled before accepting any Codex bot clearance
+# signal. When codex.enabled=false, codex-review-check.sh ignores Codex
+# reviews and reactions (gate (c) clears only via a Phase 4b substitute
+# APPROVED); the retrospective audit must match, or a stray 👍 from a
+# still-installed App on a codex-disabled repo would mark a merge compliant
+# that the merge gate never cleared. Captured from policy as codexEnabled,
+# then gated on the clearance decision — which since round 4 also requires
+# issueComments (not just inlineComments) to be known before codexCleared
+# can be set. The codex-disabled-plus1-rejected fixture exercises the
+# runtime path; this canary guards the workflow source.
 if grep -qF 'config.codex.enabled === false' "$WORKFLOW" && \
-   grep -qF 'if (codexEnabled && inlineComments !== null)' "$WORKFLOW"; then
+   grep -qF 'if (codexEnabled && inlineComments !== null && issueComments !== null)' "$WORKFLOW"; then
   pass=$((pass + 1))
   echo "  PASS: $WORKFLOW honors codex.enabled before accepting Codex bot clearance (Codex P2 #460)"
 else
@@ -470,17 +473,24 @@ else
   echo "  FAIL: $WORKFLOW must gate Codex clearance on codexEnabled (codex.enabled===false → ignore bot signals) — Codex P2 #460" >&2
 fi
 
-# Structural assertion (Codex P2 on #460 round 3): the workflow gates the
-# Codex +1 reaction path on same-agent context, mirroring the merge gate
-# branch-2 (#170) rule that a 👍 substitutes for reviewer approval only when
-# the PR Authoring-Agent resolves to an available reviewer identity. Without
-# it a cross-agent / missing-Authoring-Agent PR merged with only a 👍 (which
-# codex-review-check.sh rejects) would pass the audit. The
+# Structural assertion (Codex P2 on #460 round 3, restructured #612 round
+# 4): the workflow gates +1-reaction and verdict CLEARANCE on same-agent
+# context OR an independent CLI approval, mirroring the merge gate branch-2
+# (#170) rule that a 👍/verdict substitutes for reviewer approval only when
+# the PR Authoring-Agent resolves to an available reviewer identity (unless
+# gate (b) is already independently satisfied via a real reviewer APPROVED).
+# Since round 4 the reaction's TIMESTAMP is scanned unconditionally (for the
+# Phase 4b staleness guard) and only the codexCleared assignment is gated —
+# so the canary now looks for the shared gateBSatisfied gate rather than an
+# `if (sameAgentContext)` wrapper around the reaction scan itself. Without
+# this gate a cross-agent / missing-Authoring-Agent PR merged with only a 👍
+# (which codex-review-check.sh rejects) would pass the audit. The
 # cross-agent-plus1-rejected fixture exercises the runtime path; this canary
 # guards the workflow source.
 if grep -qF 'sameAgentContext' "$WORKFLOW" && \
    grep -qF 'Authoring-Agent:' "$WORKFLOW" && \
-   grep -qF 'if (sameAgentContext)' "$WORKFLOW"; then
+   grep -qF 'const gateBSatisfied = sameAgentContext || cliApprovedReviews.length > 0;' "$WORKFLOW" && \
+   grep -qF "codexCleared = gateBSatisfied;" "$WORKFLOW"; then
   pass=$((pass + 1))
   echo "  PASS: $WORKFLOW gates the +1 reaction path on same-agent context (Codex P2 #460 r3)"
 else
