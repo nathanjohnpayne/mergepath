@@ -571,6 +571,134 @@ p4b_is_timeout_rc() {
   esac
 }
 
+# --- review-diff byte budget (#635) -----------------------------------------
+
+# A PR whose diff carries bulk artifacts (mined JSONL extracts, generated
+# datasets) can exceed the reviewer CLI's model context; the CLI then fails
+# with an opaque nonzero exit and the whole automated leg falls back to the
+# manual handoff even though the reviewable code is small (#629: a 6.4 MB
+# diff, 6.2 MB of it two committed data files). The adapters therefore bound
+# what they pipe to the reviewer CLI: when the diff exceeds the budget, the
+# LARGEST per-file sections (bulk artifacts by construction) are omitted
+# until it fits, each replaced with an explicit placeholder line, and every
+# omission is reported so the adapter can disclose it in the review prompt.
+# The reviewer must never be led to believe an omitted file is absent from
+# the PR — an undisclosed manual trim on #629 produced exactly that
+# false-positive P1.
+
+P4B_DEFAULT_DIFF_MAX_BYTES=600000   # ~150k tokens: fits every current
+                                    # reviewer CLI context with headroom
+P4B_MIN_DIFF_MAX_BYTES=4096
+P4B_MAX_DIFF_MAX_BYTES=10485760
+
+# p4b_resolve_diff_max_bytes
+# Resolve the review-diff byte budget: P4B_DIFF_MAX_BYTES env override
+# (tests/manual escape hatch — integer-validated but not range-bounded,
+# mirroring the P4B_*_TIMEOUT_SECONDS envs) → the
+# phase_4b_automation.diff_max_bytes policy knob (bounded fail-closed, like
+# adapter_timeout_seconds) → P4B_DEFAULT_DIFF_MAX_BYTES. Prints the budget
+# on success; returns non-zero (no output) on an invalid configured value
+# so the caller fails closed instead of running the CLI mis-bounded.
+p4b_resolve_diff_max_bytes() {
+  local val
+  if [ -n "${P4B_DIFF_MAX_BYTES:-}" ]; then
+    case "$P4B_DIFF_MAX_BYTES" in
+      *[!0-9]*) return 1 ;;
+    esac
+    printf '%s' "$P4B_DIFF_MAX_BYTES"
+    return 0
+  fi
+  val="$(p4b_automation_field diff_max_bytes)"
+  [ -n "$val" ] || { printf '%s' "$P4B_DEFAULT_DIFF_MAX_BYTES"; return 0; }
+  case "$val" in
+    *[!0-9]*) return 1 ;;
+  esac
+  if [ "$val" -lt "$P4B_MIN_DIFF_MAX_BYTES" ] \
+     || [ "$val" -gt "$P4B_MAX_DIFF_MAX_BYTES" ]; then
+    return 1
+  fi
+  printf '%s' "$val"
+}
+
+# p4b_trim_review_diff <in_file> <out_file> <max_bytes>
+# Byte-bound a unified diff for reviewer-CLI consumption. Under-budget input
+# is copied through verbatim (empty stdout). Over-budget input has its
+# largest per-file sections omitted — largest first, only as many as needed —
+# each replaced in the output with a single
+#   [phase-4b diff-budget: <path> omitted - oversized diff section]
+# placeholder line, and one "<path><TAB><bytes>" line per omission printed
+# on stdout for the caller's disclosure note. Returns non-zero (fail-closed)
+# when even full omission cannot meet the budget or when no reviewable file
+# section survives — the caller must fall back rather than review a husk.
+p4b_trim_review_diff() {
+  local in="$1" out="$2" max="$3" total sizes omit="" omitted=0 b i p
+  [ -r "$in" ] || return 1
+  case "$max" in ''|*[!0-9]*) return 1 ;; esac
+  total="$(wc -c < "$in" | tr -d '[:space:]')"
+  if [ "$total" -le "$max" ]; then
+    cp "$in" "$out" || return 1
+    return 0
+  fi
+  # Per-section sizes as "bytes<TAB>index<TAB>path", largest first. Sections
+  # are keyed by INDEX (omission never depends on path parsing; the b/-side
+  # path is display-only). LC_ALL=C keeps length() byte-exact on multibyte
+  # content.
+  sizes="$(LC_ALL=C awk '
+    /^diff --git /{ n++; hdr[n] = $0; bytes[n] = 0 }
+    n > 0 { bytes[n] += length($0) + 1 }
+    END {
+      for (i = 1; i <= n; i++) {
+        p = hdr[i]
+        sub(/^diff --git a\/.* b\//, "", p)
+        printf "%d\t%d\t%s\n", bytes[i], i, p
+      }
+    }
+  ' "$in" | sort -rn)"
+  [ -n "$sizes" ] || return 1
+  while IFS=$'\t' read -r b i p; do
+    [ "$((total - omitted))" -le "$max" ] && break
+    omitted=$((omitted + b))
+    omit="$omit $i"
+    printf '%s\t%s\n' "$p" "$b"
+  done <<EOF
+$sizes
+EOF
+  [ "$((total - omitted))" -le "$max" ] || return 1
+  LC_ALL=C awk -v omit_list="$omit" '
+    BEGIN { split(omit_list, parts, " "); for (k in parts) if (parts[k] != "") omit[parts[k]] = 1 }
+    /^diff --git /{
+      n++
+      skipping = ((n "") in omit) ? 1 : 0
+      if (skipping) {
+        p = $0
+        sub(/^diff --git a\/.* b\//, "", p)
+        printf "[phase-4b diff-budget: %s omitted - oversized diff section; see the prompt note]\n", p
+      } else print
+      next
+    }
+    !skipping { print }
+  ' "$in" > "$out" || return 1
+  # Placeholders add bytes the loop above does not model; assert the OUTPUT
+  # honors the budget and still carries at least one reviewable section.
+  [ "$(wc -c < "$out" | tr -d '[:space:]')" -le "$max" ] || return 1
+  grep -q '^diff --git ' "$out" || return 1
+  return 0
+}
+
+# p4b_stderr_tail <file>
+# One sanitized line (<= ~400 bytes) from the tail of a captured stderr
+# file, for embedding the reviewer CLI's actual complaint in a failure
+# message. Non-printable bytes are blanked and whitespace runs collapsed;
+# an empty or missing file prints nothing. (#635: the previous rc!=0
+# handling guessed "auth" for every failure — a context-overflow rc=1 read
+# as a login problem while the CLI's real error was discarded.)
+p4b_stderr_tail() {
+  [ -n "${1:-}" ] && [ -s "$1" ] || return 0
+  tail -c 400 "$1" \
+    | LC_ALL=C tr -c '[:print:]' ' ' \
+    | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ *//' -e 's/ *$//'
+}
+
 # --- plan-only reviewer CLI auth guards ------------------------------------
 
 p4b_codex_auth_file() {

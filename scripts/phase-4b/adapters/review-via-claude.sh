@@ -49,6 +49,13 @@
 #   P4B_CLAUDE_EFFORT  effort level for the Claude run (default: medium).
 #   P4B_REVIEW_CLI_TIMEOUT_SECONDS  default: P4B_ADAPTER_TIMEOUT_SECONDS
 #               or 900. Timeout maps to exit 4 / manual fallback.
+#   P4B_DIFF_MAX_BYTES  review-diff byte budget override (integer; tests and
+#               manual runs). Default resolution: the
+#               phase_4b_automation.diff_max_bytes policy knob, else 600000.
+#               An over-budget diff has its largest per-file sections omitted
+#               (bulk artifacts) with in-diff placeholders plus a prompt
+#               disclosure naming each omitted path+size (#635); when nothing
+#               reviewable survives the budget, exit 4 (manual fallback).
 #
 # Exit codes: identical contract to review-via-codex.sh (0/2/3/4).
 
@@ -108,6 +115,38 @@ fi
 command -v "$CLAUDE_BIN" >/dev/null 2>&1 || p4b_die 3 "claude CLI not found on PATH (set CLAUDE_BIN)"
 p4b_require_claude_plan_auth "$CLAUDE_BIN"
 
+ERR_OUT="$(mktemp "${TMPDIR:-/tmp}/p4b-claude-stderr.XXXXXX")"
+DIFF_RAW="$(mktemp "${TMPDIR:-/tmp}/p4b-claude-diff-raw.XXXXXX")"
+DIFF_FIT="$(mktemp "${TMPDIR:-/tmp}/p4b-claude-diff-fit.XXXXXX")"
+# shellcheck disable=SC2064
+trap "rm -f '$ERR_OUT' '$DIFF_RAW' '$DIFF_FIT'" EXIT
+
+# --- bound the diff to the review byte budget (#635) ------------------------
+MAX_DIFF_BYTES="$(p4b_resolve_diff_max_bytes)" \
+  || p4b_die 3 "invalid diff byte budget (P4B_DIFF_MAX_BYTES must be an integer; phase_4b_automation.diff_max_bytes must be an integer in ${P4B_MIN_DIFF_MAX_BYTES}..${P4B_MAX_DIFF_MAX_BYTES})"
+printf '%s\n' "$DIFF" > "$DIFF_RAW"
+DIFF_BYTES="$(wc -c < "$DIFF_RAW" | tr -d '[:space:]')"
+OMITTED="$(p4b_trim_review_diff "$DIFF_RAW" "$DIFF_FIT" "$MAX_DIFF_BYTES")" \
+  || p4b_die 4 "diff (${DIFF_BYTES} bytes) exceeds the ${MAX_DIFF_BYTES}-byte review budget and no reviewable content survives trimming — pass a curated --diff-file; falling back to the manual handoff"
+DIFF_NOTE=""
+if [ -n "$OMITTED" ]; then
+  DIFF="$(cat "$DIFF_FIT")"
+  OMIT_COUNT="$(printf '%s\n' "$OMITTED" | grep -c .)"
+  p4b_log "diff over budget (${DIFF_BYTES} > ${MAX_DIFF_BYTES} bytes): omitted ${OMIT_COUNT} oversized file section(s): $(printf '%s\n' "$OMITTED" | awk -F'\t' '{printf "%s%s (%s bytes)", (NR > 1 ? ", " : ""), $1, $2}')"
+  DIFF_NOTE="
+
+NOTE: the full PR diff is ${DIFF_BYTES} bytes, over this review's
+${MAX_DIFF_BYTES}-byte budget. The ${OMIT_COUNT} largest per-file diff
+section(s) listed below WERE CHANGED BY THIS PR but are omitted from the
+diff you receive, each replaced with a '[phase-4b diff-budget: ...]'
+placeholder line (such sections are typically bulk data artifacts). Do NOT
+report these files as missing from the PR; treat them as
+changed-but-unreviewed:
+$(printf '%s\n' "$OMITTED" | awk -F'\t' '{printf "- %s (%s bytes)\n", $1, $2}')
+If the omission of any of these prevents a sound verdict, return
+CHANGES_REQUESTED and say so in the summary."
+fi
+
 # --- run the review --------------------------------------------------------
 REQUIRED_SEVERITIES="$(p4b_required_verdict_severities_json)" \
   || p4b_die 3 "invalid feedback_policy; cannot determine required verdict severities"
@@ -130,7 +169,7 @@ disposition before merge: ${REQUIRED_SEVERITIES}. If any finding with one of
 those severities exists, verdict must be CHANGES_REQUESTED, not APPROVED. When
 requesting changes, list every required-severity issue you identify in this
 pass, not just the first one. Do not edit files. Do not post anything to
-GitHub."
+GitHub.${DIFF_NOTE}"
 
 SAFE_ENV=(env -i
   "PATH=${PATH:-/usr/bin:/bin}"
@@ -158,15 +197,16 @@ ENVELOPE="$(
     --disable-slash-commands \
     --tools "$TOOLS" \
     ${MODEL:+--model "$MODEL"} \
-    2>/dev/null
+    2>"$ERR_OUT"
 )"
 RC=$?
 set -e
 if [ "$RC" -ne 0 ]; then
+  ERR_TAIL="$(p4b_stderr_tail "$ERR_OUT")"
   if p4b_is_timeout_rc "$RC"; then
-    p4b_die 4 "claude -p timed out after ${CLI_TIMEOUT}s — falling back to the manual handoff"
+    p4b_die 4 "claude -p timed out after ${CLI_TIMEOUT}s${ERR_TAIL:+ — last stderr: ${ERR_TAIL}} — falling back to the manual handoff"
   fi
-  p4b_die 4 "claude -p failed (rc=$RC) — ensure claude is logged in on a plan (child env is allowlisted for plan-only billing); falling back to the manual handoff"
+  p4b_die 4 "claude -p failed (rc=$RC)${ERR_TAIL:+ — stderr: ${ERR_TAIL}} — if this is an auth error, ensure claude is logged in on a plan (child env is allowlisted for plan-only billing); falling back to the manual handoff"
 fi
 [ -n "$ENVELOPE" ] || p4b_die 4 "claude -p produced no output"
 
