@@ -672,6 +672,24 @@ else
   echo "  FAIL: the rc=5 branch must override ext_required=true when EVENT_ACTION=unlabeled and REMOVED_LABEL=needs-external-review (env-indirected), else the unlabeled re-arm re-creates the stall on a CodeRabbit rate-limit (#620)" >&2
 fi
 
+# 2f. pr-review-policy's propagation lane removes needs-external-review; that
+# removal must be PAT-driven or it fires no unlabeled settle re-arm —
+# GITHUB_TOKEN-initiated events create no workflow runs (#315/#324 auto-clear
+# lesson; #620 Codex r6), leaving an approved, settled PR CLEAN-but-unmerged.
+# The PAT must stay scoped to the removal command: the step's default token
+# remains GITHUB_TOKEN so the lane-marker comment stays
+# github-actions-authored for its #429 consumers.
+prp_workflow=".github/workflows/pr-review-policy.yml"
+if grep -Fq 'LABEL_REMOVAL_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}' "$prp_workflow" \
+  && grep -Fq 'GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh pr edit' "$prp_workflow" \
+  && awk '/- name: Propagation PR review lane/{f=1} f && /GH_TOKEN: \$\{\{ secrets\.GITHUB_TOKEN \}\}/{found=1} f && /- name:/ && !/Propagation PR review lane/{exit} END{exit found ? 0 : 1}' "$prp_workflow"; then
+  pass=$((pass + 1))
+  echo "  PASS: propagation-lane label removal is PAT-driven (fires the settle re-arm) while the step default stays GITHUB_TOKEN (#620)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: pr-review-policy's needs-external-review removal must run under LABEL_REMOVAL_TOKEN (REVIEWER_ASSIGNMENT_TOKEN) with the step default left as GITHUB_TOKEN — a GITHUB_TOKEN removal fires no unlabeled re-arm (#620)" >&2
+fi
+
 # 3. A dedicated approval gate runs on the pull_request (re-arm) path and,
 #    since #544, the direct pull_request_review approval path too — so an
 #    unregistered non-author approval arms auto-merge on neither path.

@@ -338,6 +338,15 @@ jobs:
         if: steps.check.outputs.propagation_lane == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # #620 (Codex r6): the needs-external-review removal below must fire
+          # agent-review.yml's `unlabeled` settle re-arm, and GITHUB_TOKEN-driven
+          # events create no workflow runs (the #315/#324 auto-clear lesson) —
+          # a GITHUB_TOKEN removal here leaves an approved, settled PR
+          # CLEAN-but-unmerged. PAT-scoped to the removal command ONLY: the
+          # lane-marker comment below stays github-actions-authored for its
+          # #429 consumers, and every other command keeps the restricted
+          # default token.
+          LABEL_REMOVAL_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           # Embedded in the lane marker so the signal is HEAD-PINNED — a
           # consumer (merge-clearance-gate.sh's propagation exemption, #429)
@@ -365,7 +374,9 @@ jobs:
           # a sanctioned automation alongside auto-clear-blocking-labels.yml.
           EXISTING=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name' | grep '^needs-external-review$' || true)
           if [ -n "$EXISTING" ]; then
-            gh pr edit "$PR_NUMBER" --remove-label "needs-external-review" \
+            # PAT-driven so the removal fires the #620 unlabeled settle
+            # re-arm (see LABEL_REMOVAL_TOKEN above).
+            GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh pr edit "$PR_NUMBER" --remove-label "needs-external-review" \
               --repo "${{ github.repository }}"
             echo "Removed needs-external-review — PR qualifies for the propagation review lane."
           fi

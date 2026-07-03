@@ -624,19 +624,34 @@ absent, the workflow stops after validation and leaves manual author
 merge as the default. Reviewer tokens such as
 `REVIEWER_ASSIGNMENT_TOKEN` must not be used for PR merges.
 
-Arming is not one-shot on the approval event. The job arms on two
-triggers (#495): the original `pull_request_review` + `approved`
-event, and a `pull_request` `synchronize` / `reopened` **re-arm**
-path. The re-arm path retries `gh pr merge --auto` after a fix-commit
-— the common case where a late Codex finding lands at or after the
-author's approval and the fix push would otherwise never re-arm — but
-only when the PR already carries a valid non-author latest-state
-`APPROVED` review (the same latest-state-per-reviewer collapse the
-merge gate uses, so a withdrawn approval does not re-arm). A push with
-no existing approval does NOT arm. Every gate (CodeRabbit wait,
-`AUTHOR_MERGE_TOKEN` identity, blocking-label re-verify) re-applies on
-the new HEAD, and the call is idempotent when `--auto` is already
-enabled.
+Arming is not one-shot on the approval event. The job arms on three
+triggers: the original `pull_request_review` + `approved` event; a
+`pull_request` `synchronize` / `reopened` **re-arm** path (#495); and
+a `pull_request` `unlabeled` **settle re-arm** path (#620), which
+fires when a removed label is one of the four blocking names
+(`needs-external-review`, `needs-human-review`, `policy-violation`,
+`human-hold`) — the state-settled signal for the label race where a
+synchronize-time arming run hard-fails on a transient label that
+auto-clear removes moments later. Triage deliberately does not run on
+`unlabeled` (it would re-apply the label just removed), so the arming
+job accepts a skipped triage result on that path only; and because
+the `needs-external-review` removal IS the trigger there, the
+CodeRabbit rate-limit branch derives external-review applicability
+from the removal event rather than the now-absent label. Label
+removals fire this trigger only when performed with a PAT —
+GITHUB_TOKEN-driven events create no workflow runs (#315/#324) — so
+`auto-clear-blocking-labels.yml` and `pr-review-policy.yml`'s
+propagation lane both remove blocking labels under a PAT. The
+synchronize/reopened path retries `gh pr merge --auto` after a
+fix-commit — the common case where a late Codex finding lands at or
+after the author's approval and the fix push would otherwise never
+re-arm. Every re-arm path acts only when the PR already carries a
+valid non-author latest-state `APPROVED` review (the same
+latest-state-per-reviewer collapse the merge gate uses, so a
+withdrawn approval does not re-arm). A push with no existing approval
+does NOT arm. Every gate (CodeRabbit wait, `AUTHOR_MERGE_TOKEN`
+identity, blocking-label re-verify) re-applies on the new HEAD, and
+the call is idempotent when `--auto` is already enabled.
 
 #### Phase 4b: Manual CLI Fallback (Human Handoff)
 
