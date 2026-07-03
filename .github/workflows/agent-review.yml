@@ -774,6 +774,8 @@ jobs:
           # guards treat as "no override".
           EVENT_ACTION: ${{ github.event.action }}
           REMOVED_LABEL: ${{ github.event.label.name }}
+          # For the propagation-exemption exclusion in the rc=5 override.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           # Delegate to scripts/coderabbit-wait.sh so auto-merge honors the
           # same semantics the agent-driven flow uses: HEAD-anchored
@@ -840,16 +842,33 @@ jobs:
               # construction and would misclassify this above-threshold PR as
               # under-threshold, blocking the failover disposition and
               # re-creating the exact clean-but-unmerged stall the unlabeled
-              # trigger was added to fix. The removal event is the durable
-              # above-threshold signal: triage applies the label only above
-              # threshold, and merge-clearance's external gate passed
-              # non-vacuously before auto-clear removed it. Raising false→true
-              # only here is monotonic-safe — the blocking-label re-verifies
-              # and the current-head required-check wait (merge-clearance-gate
-              # included) still gate the actual merge, so a label stripped
-              # WITHOUT clearance still cannot merge.
+              # trigger was added to fix. Raising false→true only here is
+              # safe because merge-clearance's external gate evaluated
+              # non-vacuously on this PR and the current-head required-check
+              # wait still gates the actual merge.
+              #
+              # #620 (Codex r7): EXCEPT when the removal was the propagation
+              # lane's — that lane removes the label as an EXEMPTION, not as
+              # clearance (pr-review-policy.yml), so merge-clearance passes
+              # vacuously downstream and CodeRabbit was the only bot eye;
+              # proceeding would arm auto-merge with neither bot review (the
+              # #512 r3 hazard). The lane is detected by its HEAD-pinned
+              # trusted marker — contract shared with pr-review-policy.yml
+              # and merge-clearance-gate.sh's lane_verified(): keep the
+              # `mergepath-propagation-lane verified-head=<sha>` form in
+              # sync. The marker is posted seconds after the removal by the
+              # same lane step, well inside coderabbit-wait's runtime, so it
+              # is present by the time this branch evaluates. Fail-closed:
+              # if the marker read errors, treat it as present (no raise →
+              # block), so an API hiccup never lets a rate-limited PR
+              # through.
               if [ "${EVENT_ACTION:-}" = "unlabeled" ] && [ "${REMOVED_LABEL:-}" = "needs-external-review" ]; then
-                ext_required=true
+                lane_marker=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null \
+                  | jq -s --arg head "$HEAD_SHA" '[add // [] | .[] | select((.user.login == "github-actions[bot]") and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))] | length' 2>/dev/null \
+                  || echo 1)
+                if [ "${lane_marker:-1}" = "0" ]; then
+                  ext_required=true
+                fi
               fi
               if bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_required"; then
                 echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged on an above-threshold PR — proceeding. merge-clearance's external-review gate blocks the merge until Codex/external clearance lands."

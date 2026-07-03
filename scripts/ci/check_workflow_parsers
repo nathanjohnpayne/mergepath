@@ -664,12 +664,32 @@ fi
 if grep -Fq 'EVENT_ACTION: ${{ github.event.action }}' <<<"$auto_merge_job_block" \
   && grep -Fq 'REMOVED_LABEL: ${{ github.event.label.name }}' <<<"$auto_merge_job_block" \
   && grep -Fq '[ "${EVENT_ACTION:-}" = "unlabeled" ] && [ "${REMOVED_LABEL:-}" = "needs-external-review" ]' <<<"$auto_merge_job_block" \
-  && grep -A1 -F '"${REMOVED_LABEL:-}" = "needs-external-review"' <<<"$auto_merge_job_block" | grep -Fq 'ext_required=true'; then
+  && grep -A1 -F '"${lane_marker:-1}" = "0"' <<<"$auto_merge_job_block" | grep -Fq 'ext_required=true'; then
   pass=$((pass + 1))
   echo "  PASS: rc=5 rate-limit branch honors the unlabeled removal event as the above-threshold signal (#620)"
 else
   fail=$((fail + 1))
   echo "  FAIL: the rc=5 branch must override ext_required=true when EVENT_ACTION=unlabeled and REMOVED_LABEL=needs-external-review (env-indirected), else the unlabeled re-arm re-creates the stall on a CodeRabbit rate-limit (#620)" >&2
+fi
+
+# 2e-bis. The override must EXCLUDE the propagation lane's removal (Codex r7):
+# that lane removes needs-external-review as an EXEMPTION, not clearance, so
+# merge-clearance passes vacuously downstream — raising ext_required there
+# would let a CodeRabbit-rate-limited propagation PR arm auto-merge with
+# neither bot review (#512 r3 hazard). Detection mirrors
+# merge-clearance-gate.sh's lane_verified() (trusted github-actions[bot]
+# HEAD-pinned marker), and the raise must be gated on marker COUNT == 0 with
+# a fail-closed (treat-as-present) default on read error.
+if grep -Fq 'mergepath-propagation-lane verified-head=' <<<"$auto_merge_job_block" \
+  && grep -Fq 'github-actions[bot]' <<<"$auto_merge_job_block" \
+  && grep -Fq 'HEAD_SHA: ${{ github.event.pull_request.head.sha }}' <<<"$auto_merge_job_block" \
+  && grep -Fq 'echo 1' <<<"$auto_merge_job_block" \
+  && grep -A1 -F '"${lane_marker:-1}" = "0"' <<<"$auto_merge_job_block" | grep -Fq 'ext_required=true'; then
+  pass=$((pass + 1))
+  echo "  PASS: rc=5 override excludes the propagation lane's exemption removal via the HEAD-pinned marker, fail-closed (#620)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: the rc=5 ext_required override must be gated on the absence of the trusted propagation lane marker for the current head (lane_verified() contract), defaulting to no-raise on read error (#620)" >&2
 fi
 
 # 2f. pr-review-policy's propagation lane removes needs-external-review; that

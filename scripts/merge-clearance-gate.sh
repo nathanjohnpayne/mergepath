@@ -276,7 +276,8 @@ fetch_api_array() {  # <endpoint> <label>
 # same-agent guard disqualifies their normal internal approval) — into Phase
 # 4/Codex clearance, breaking the documented under-threshold lane.
 #
-# Marker contract is shared with pr-review-policy.yml — keep the
+# Marker contract is shared with pr-review-policy.yml and agent-review.yml's
+# rc=5 propagation-exemption exclusion (#620) — keep the
 # `mergepath-propagation-lane verified-head=<sha>` form in sync.
 lane_verified() {
   local comments

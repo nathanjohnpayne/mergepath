@@ -392,8 +392,10 @@ jobs:
           # don't re-comment; a faithful re-push to a NEW head posts a fresh
           # marker; a DIVERGED push never reaches this step (propagation_lane
           # is false), so no marker is ever posted for an unverified head.
-          # Marker contract is shared with merge-clearance-gate.sh — keep the
-          # `mergepath-propagation-lane verified-head=<sha>` form in sync.
+          # Marker contract is shared with merge-clearance-gate.sh and
+          # agent-review.yml's rc=5 propagation-exemption exclusion (#620) —
+          # keep the `mergepath-propagation-lane verified-head=<sha>` form
+          # in sync.
           MARKER="<!-- mergepath-propagation-lane verified-head=$HEAD_SHA -->"
           ALREADY=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -F "$MARKER" || true)
           if [ -z "$ALREADY" ]; then
