@@ -83,6 +83,12 @@ if [ "$1" = "api" ]; then
       exit 0
       ;;
     repos/*/issues/*/comments)
+      # FIXTURE_COMMENTS_FAIL=1 simulates a transient comments-API failure
+      # (the indeterminate marker-read case, automated-4b round-5 P1).
+      if [ "${FIXTURE_COMMENTS_FAIL:-0}" = "1" ]; then
+        echo "STUB gh: simulated comments API failure" >&2
+        exit 1
+      fi
       cat "${FIXTURE_COMMENTS:-/dev/null}"
       exit 0
       ;;
@@ -896,6 +902,24 @@ if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
   pass "query: lane-exempt verified head → prints exactly 'false' (vacuous downstream)"
 else
   fail "query: lane-exempt expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Query 5b: indeterminate marker read → nonzero, NOT 'true' (automated-4b r5 P1)"
+# An over-threshold PR (would derive true from threshold if it fell through)
+# whose comments API fails: query mode must fail closed (nonzero) rather than
+# print the unsafe 'true' that would authorize the rc=5 CodeRabbit downgrade.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":500,"deletions":0}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS_FAIL=1 \
+  run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" != 0 ] && [ "$OUT" != "true" ]; then
+  pass "query: indeterminate marker read → nonzero exit and no 'true' (caller fails closed → rc=5 blocks)"
+else
+  fail "query: indeterminate marker read expected nonzero and not 'true'; got rc=$RC out='$OUT'"
 fi
 
 echo; echo "--- Query 6: external gate disabled → false"
