@@ -87,7 +87,7 @@ expect_pair() {
 # --- classification ----------------------------------------------------------
 
 n_triggers=$(jq -s '[ .[] | select(.kind == "trigger") ] | length' "$EVENTS")
-[ "$n_triggers" = "3" ] && pass "classifies 3 triggers" || fail "triggers: got $n_triggers, want 3"
+[ "$n_triggers" = "4" ] && pass "classifies 4 triggers" || fail "triggers: got $n_triggers, want 4"
 
 n_verdicts=$(jq -s '[ .[] | select(.kind == "verdict") ] | length' "$EVENTS")
 [ "$n_verdicts" = "5" ] && pass "classifies 5 verdicts (incl. sha extraction)" || fail "verdicts: got $n_verdicts, want 5"
@@ -107,6 +107,17 @@ expect_pair "pair 1: trigger→👀 ack = 30s, round 1" \
 expect_pair "pair 2: trigger→first inline finding = 300s" \
   '.pair == "2_trigger_to_first_finding" and .pr == 10' \
   '.seconds == 300 and .round == 1'
+
+# PR 15's review is CLEAN (no inline comments): it must not register as a
+# pair-2 finding (Codex P2 on #629) — only as the pair-2b first-response
+# proxy.
+n_pr15_p2=$(jq -s '[ .[] | select(.pair == "2_trigger_to_first_finding" and .pr == 15) ] | length' "$PAIRS")
+[ "$n_pr15_p2" = "0" ] && pass "pair 2: clean (inline-less) review is not a finding" \
+  || fail "PR 15 pair-2 records: got $n_pr15_p2, want 0"
+
+expect_pair "pair 2b: clean review still counts as first review response = 300s" \
+  '.pair == "2b_trigger_to_first_review_response" and .pr == 15' \
+  '.seconds == 300'
 
 # Round 2's rate-limit marker (12:06) falls INSIDE round 1's 2h window but
 # AFTER round 2's trigger (12:05): the round-bounded rule must keep round 1

@@ -1,4 +1,4 @@
-## 2_trigger_to_first_finding
+## 2b_trigger_to_first_review_response
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|

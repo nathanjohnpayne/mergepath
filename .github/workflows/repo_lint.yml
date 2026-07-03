@@ -154,6 +154,13 @@ jobs:
       - name: check_session_finalization
         run: ./scripts/ci/check_session_finalization
 
+      # Offline fixture suite for the #623 Codex-latency audit script —
+      # guards the published, replayable analysis (normalize + pairing +
+      # events-only replay). Hub-only; SKIPs on consumer checkouts via
+      # the standard sync-to-downstream marker idiom.
+      - name: check_audit_codex_latency
+        run: ./scripts/ci/check_audit_codex_latency
+
       # check_verify_propagation_pr exercises the faithful-mirror
       # verifier (scripts/workflow/verify-propagation-pr.sh) that is
       # the security teeth of the propagation-PR review lane — it is

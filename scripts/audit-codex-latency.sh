@@ -265,8 +265,12 @@ fetch_all() {
              and ((.body // "") | test("@codex review"; "i")))
       | [.pr, .id] | @tsv' "$RAW_DIR/issue_comments.jsonl")
 
-  # 5. Committer dates for reviewed shas that are not in pr_commits (force-
-  #    pushed-away round heads are unreachable from the final head).
+  # 5. Committer dates for anchor shas that are not in pr_commits (force-
+  #    pushed-away round heads are unreachable from the final head). The
+  #    wanted set is the union of verdict-comment "Reviewed commit" shas
+  #    AND bot review commit_ids — pair 5 consumes review-object-only
+  #    auto-reviews too, and dropping their anchors would silently censor
+  #    them (Codex P2 on #629).
   local sha
   while IFS= read -r sha; do
     with_gh_retry gh api "repos/$REPO/commits/$sha" \
@@ -274,14 +278,18 @@ fetch_all() {
       | jq -c '.' >> "$RAW_DIR/pr_commits.jsonl" \
       || log "WARN: commit $sha not fetchable (deleted branch?) — pair-5 anchor unavailable for it"
   done < <(
-    jq -rs --arg bot "$BOT_LOGIN" '
-      (map(select((.login | startswith($bot))
-                  and ((.body // "") | test("(?i)codex review"))
-                  and ((.body // "") | test("(?i)reviewed commit"))))
-       | map((.body | ascii_downcase
-              | [scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")]
-              | (last // [])[0]) // empty)) as $want
-      | $want[]' "$RAW_DIR/issue_comments.jsonl" \
+    {
+      jq -rs --arg bot "$BOT_LOGIN" '
+        (map(select((.login | startswith($bot))
+                    and ((.body // "") | test("(?i)codex review"))
+                    and ((.body // "") | test("(?i)reviewed commit"))))
+         | map((.body | ascii_downcase
+                | [scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")]
+                | (last // [])[0]) // empty)) as $want
+        | $want[]' "$RAW_DIR/issue_comments.jsonl"
+      jq -r 'select(.commit_id != null) | .commit_id | ascii_downcase' \
+        "$RAW_DIR/reviews.jsonl"
+    } \
     | sort -u \
     | grep -vxF -f <(jq -r '.sha' "$RAW_DIR/pr_commits.jsonl" | sort -u) || true
   )
@@ -467,10 +475,17 @@ analyze() {
            seconds:((.created_at | ts) - ($t.created_at | ts))}
           + seg($t.pr; $t.created_at) ),
 
-      # pair 2: trigger → earliest bot inline comment (or review submission)
+      # pair 2: trigger → earliest bot inline FINDING. A review submission
+      # only counts when it carries at least one inline comment — a clean /
+      # summary-only review is not a finding and would inflate the sample
+      # (Codex P2 on #629). The unrestricted first-response time is emitted
+      # separately as pair 2b (a useful proxy when inline comments were not
+      # mined), never conflated with pair 2.
       ( $triggers[] as $t
         | ([ ($rcs[] | select(.pr == $t.pr) | {at:.created_at}),
-             ($reviews[] | select(.pr == $t.pr) | {at:.submitted_at}) ]
+             ($reviews[] | select(.pr == $t.pr) as $rv
+              | select(([ $rcs[] | select(.review_id == $rv.review_id) ] | length) > 0)
+              | {at:$rv.submitted_at}) ]
            | map(select(.at > $t.created_at)) | sort_by(.at) | first) as $f
         | select($f != null)
         # attribute to this round only if no later trigger precedes it
@@ -483,6 +498,23 @@ analyze() {
         | select(([ $verdicts[] | select(.pr == $t.pr and .created_at > $t.created_at
                                          and .created_at < $f.at) ] | length) == 0)
         | {pair:"2_trigger_to_first_finding", pr:$t.pr, round:$t.round,
+           t0:$t.created_at, t1:$f.at,
+           seconds:(($f.at | ts) - ($t.created_at | ts))}
+          + seg($t.pr; $t.created_at) ),
+
+      # pair 2b: trigger → first review response of ANY kind (clean or
+      # findings-bearing review submission, or inline comment). This is the
+      # proxy an extract without mined inline comments can still measure.
+      ( $triggers[] as $t
+        | ([ ($rcs[] | select(.pr == $t.pr) | {at:.created_at}),
+             ($reviews[] | select(.pr == $t.pr) | {at:.submitted_at}) ]
+           | map(select(.at > $t.created_at)) | sort_by(.at) | first) as $f
+        | select($f != null)
+        | select(([ $triggers[] | select(.pr == $t.pr and .created_at > $t.created_at
+                                         and .created_at < $f.at) ] | length) == 0)
+        | select(([ $verdicts[] | select(.pr == $t.pr and .created_at > $t.created_at
+                                         and .created_at < $f.at) ] | length) == 0)
+        | {pair:"2b_trigger_to_first_review_response", pr:$t.pr, round:$t.round,
            t0:$t.created_at, t1:$f.at,
            seconds:(($f.at | ts) - ($t.created_at | ts))}
           + seg($t.pr; $t.created_at) ),

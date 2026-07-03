@@ -86,16 +86,22 @@ rate-limit markers all correspond to rounds that ended in a marker, not a
 slow verdict) — the tail risk `review_timeout_seconds` guards against is
 non-response, not slow response.
 
-### Pair 2 — trigger → first inline finding
+### Pair 2 — trigger → first inline finding: pending backfill; proxy measured
 
-| segment | n | p50 | p90 | p99 | max |
+Rigorous pair 2 requires the bot's inline review comments, which this
+pass did not mine — a clean, inline-less review submission is not a
+finding and must not count (the script enforces that: a review only
+qualifies when it carries ≥1 inline comment). The committed script
+fetches the inline-comment endpoint, so the same local run that
+backfills pairs 1/4 fills this table too.
+
+What this pass CAN measure rigorously is **pair 2b — trigger → first
+review response of any kind** (findings-bearing or clean review
+submission), a strict upper-bound-free proxy:
+
+| segment (pair 2b) | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
 | ALL | 206 | 4m42s | 13m46s | 19m57s | 30m39s |
-
-Measured from bot review submissions (inline findings become visible at
-review submission; this session's access exposes review `submitted_at`
-rather than per-inline-comment `created_at` — the committed script fetches
-the inline-comment endpoint too when run with `gh api` access).
 
 ### Pair 5 — push → auto-review (no trigger)
 
@@ -163,9 +169,13 @@ Split by what triggered the sweeping run (merge-clearance-gate):
 
 Two structural results:
 
-1. **Queue delay is zero.** `run_started_at == created_at` on every one of
-   the 10,664 mined runs. The #613 "cron queued ~27 min" observation was
-   not queueing after creation — it was the cron *firing late* (below).
+1. **Queue delay is near-zero, and zero on every paired gate run.** All 75
+   runs paired in the tables above started the second they were created.
+   Across the full 10,664 retained runs, 11 (0.1%, all event-triggered)
+   had non-zero `run_started_at − created_at`, max 35m29s — so runner
+   queueing exists but is rare; the dominant dead-time mechanism behind
+   the #613 "cron queued ~27 min" observation is the cron *firing late*
+   (below), not post-creation queueing.
 2. **The crons do not run at their spec.** Measured gaps between
    consecutive scheduled runs:
 
