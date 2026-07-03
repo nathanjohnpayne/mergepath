@@ -8,3 +8,7 @@
 {"pr":13,"id":131,"login":"chatgpt-codex-connector[bot]","created_at":"2026-06-04T09:05:00Z","body":"Codex Review: Here are some findings.\n\nReviewed commit: eee5555555555555555555555555555555555555"}
 {"pr":14,"id":140,"login":"chatgpt-codex-connector[bot]","created_at":"2026-06-01T12:35:00Z","body":"Codex Review: Didn't find any major issues.\n\nReviewed commit: fff6666666666666666666666666666666666666"}
 {"pr":15,"id":150,"login":"nathanjohnpayne","created_at":"2026-06-05T08:00:00Z","body":"@codex review"}
+{"pr":16,"id":160,"login":"nathanjohnpayne","created_at":"2026-06-01T14:00:00Z","body":"@codex review"}
+{"pr":16,"id":161,"login":"chatgpt-codex-connector[bot]","created_at":"2026-06-01T14:10:00Z","body":"Codex Review: Here are some findings.\n\nReviewed commit: jjj9999999999999999999999999999999999999"}
+{"pr":16,"id":162,"login":"chatgpt-codex-connector[bot]","created_at":"2026-06-01T14:20:00Z","body":"You have reached your Codex usage limits for code reviews."}
+{"pr":17,"id":170,"login":"chatgpt-codex-connector[bot]","created_at":"2026-06-01T14:30:00Z","body":"Codex Review: Didn't find any major issues.\n\nReviewed commit: bbb2222222222222222222222222222222222222"}

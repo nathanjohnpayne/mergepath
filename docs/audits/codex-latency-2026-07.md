@@ -107,11 +107,14 @@ submission), a strict upper-bound-free proxy:
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 119 | 4m12s | 11m22s | 33m1s | 36m1s |
+| ALL | 128 | 4m12s | 11m10s | 33m1s | 36m1s |
 
 Auto-reviews (Codex reviewing a push/open without an explicit trigger) run
 at the same p50 as triggered rounds, with a fatter tail (~36 min worst
-case). Anchor is the reviewed commit's committer date; rounds whose
+case). Responses arriving after a failed trigger (a rate-limit or
+not-connected marker consumed it) count here, not as trigger→verdict —
+binding them to the dead trigger would inflate pair 3 with exactly the
+non-response cases this audit measures. Anchor is the reviewed commit's committer date; rounds whose
 verdict carries no `Reviewed commit:` line (the older verdict format) are
 excluded for lack of a recorded push anchor.
 
@@ -143,29 +146,50 @@ Of 400 historical trigger comments:
 Clearance anchor: the last affirmative verdict comment before `merged_at`
 (👍-reaction clearance times are pending the pair-4 backfill; PRs whose
 only clearance signal was a 👍 or a findings-free review object are
-conservatively excluded rather than approximated). A paired gate run must
+conservatively excluded rather than approximated). The verdict must be
+ANCHORED ON THE MERGE HEAD (`Reviewed commit` sha prefixes the PR's final
+head) — the merge gate treats a pre-push verdict as stale (#567/#600), so
+sha-mismatched and sha-less old-format verdicts are excluded fail-closed.
+That exclusion is itself a finding: only 17 of 66 merges carried a
+head-anchored affirmative verdict comment as their recorded clearance;
+the rest cleared via 👍 reactions or review-object paths whose
+timestamps are pending the pairs-1/4 backfill. A paired gate run must
 have concluded `success` (a skipped/failed run cannot clear labels or
 satisfy the required check) and have been created before `merged_at` —
 clearances whose first eligible run postdates the merge are censored,
 not mis-paired.
 
+These rows measure clearance → next **eligible sweep run** (a successful,
+pre-merge run that could have evaluated this PR) — an opportunity-to-clear
+time. Whether that specific sweep actually cleared THIS PR's gate is not
+derivable from run records alone (the auto-clear workflow exits 0 even
+when it leaves the label in place; scheduled merge-clearance can post a
+per-PR failure while the workflow stays green) — per-PR check-run mining
+is a follow-up.
+
 | metric | n | p50 | p90 | max |
 |---|---|---|---|---|
-| clearance → next `merge-clearance-gate` run that could sweep the PR | 27 | 59s | 25m39s | 1h1m |
-| clearance → next `auto-clear-blocking-labels` run | 48 | 1m17s | 30m1s | 1h35m |
-| gate run queue delay (`run_started_at − created_at`) | 75 | 0s | 0s | 0s |
-| gate run duration (`updated_at − run_started_at`), merge-clearance | 27 | 13s | 19s | 43s |
-| gate run duration, auto-clear | 48 | 15s | 25s | 27s |
-| clearance → `merged_at` | 66 | 4m56s | 7h39m | 118h50m |
+| clearance → next eligible `merge-clearance-gate` sweep | 13 | 30s | 1m3s | 1m16s |
+| clearance → next eligible `auto-clear-blocking-labels` sweep | 14 | 30s | 1m16s | 28m52s |
+| gate run queue delay (`run_started_at − created_at`) | 27 | 0s | 0s | 0s |
+| gate run duration (`updated_at − run_started_at`), merge-clearance | 13 | 12s | 17s | 19s |
+| gate run duration, auto-clear | 14 | 15s | 25s | 26s |
+| clearance → `merged_at` | 17 | 1m43s | 9m26s | 39m57s |
+
+(Head-anchoring shrank these tables sharply AND cleaned them: the previous
+7h39m p90 / 118h50m max on clearance→merge was stale-verdict noise —
+verdicts from long-superseded pushes mis-anchoring the clock.)
 
 Split by what triggered the sweeping run (merge-clearance-gate):
 
 | gate run trigger | n | p50 | max |
 |---|---|---|---|
-| `pull_request_review` (the nudge pattern) | 19 | 37s | 5m13s |
-| `pull_request` (label events etc.) | 4 | 1m34s | 25m39s |
-| `pull_request_review_comment` | 2 | 47s | 4m3s |
-| `schedule` (the `*/15` cron) | 2 | 42m32s | 61m36s |
+| `pull_request_review` (the nudge pattern) | 12 | 28s | 1m16s |
+| `pull_request_review_comment` | 1 | 47s | 47s |
+| `schedule` (the `*/15` cron) | 0 | — | — |
+
+Not one head-anchored clearance was swept by the cron: all 13 were
+picked up by event-triggered runs within ~1 minute.
 
 Two structural results:
 
@@ -187,8 +211,8 @@ Two structural results:
 GitHub throttles `schedule` events severely; both crons deliver a median
 effective cadence of ~1.6 hours regardless of whether the spec says 5 or
 15 minutes. Clearances get swept fast **only because event-triggered runs
-(review submissions, label changes) fire within ~1 minute** — 25 of the 27
-paired clearances were swept by an event run, not the cron.
+(review submissions, label changes) fire within ~1 minute** — every one of the 13
+paired head-anchored clearances was swept by an event run, not the cron.
 
 ### Actions cost split
 
@@ -209,8 +233,8 @@ more.
 |---|---|---|---|
 | `codex.review_timeout_seconds` | 600s | verdict p90 = 426s, p99 = 630s, max = 830s; 2/100 rounds over 600s | **Confirm ~600s, or raise to 900s to cover the recorded max (830s).** The foreground wait is nearly right-sized for rounds that complete; timeouts are dominated by rounds that will *never* complete (dropped/rate-limited triggers, ~21% historically), so `--trigger-only` + event-driven pickup remains the right escape path, not a longer wait. |
 | `codex.ack_wait_seconds` × `max_ack_retries` | 60s × 1 | pair-1 ack distribution pending the reactions backfill (one local script run) | **Deferred, with a concrete backfill step.** Bounding context from measured pairs: verdicts land p50 3m37s after the trigger; not-connected markers land within ~10–60s. The "~4 min no-👀 = dropped" runbook heuristic sits right at p50(verdict) and is almost certainly too slow as an ack test — but the retune must cite p99(ack), which requires the backfill. |
-| `codex.reaction_freshness_window_seconds` | 1800s | 25/27 clearances were swept inside 1800s — but only because event runs land p50 ≈ 37s; the schedule-only path lands p50 ≈ 43m (n=2 after censoring), far outside the window | **The window is only viable because of the event-driven path.** Widening it to cover the cron path would need ≥ ~5400s (cron p50+) and weakens staleness protection; the data supports finishing the event-driven re-arm (#620) so the window's role keeps shrinking, and otherwise leaving 1800s in place. |
-| Sweep cadences (`*/15`, `*/5`) | cron | effective median cadence ~96–98 min for BOTH specs; scheduled runs are ~10% of run-minutes; 25/27 clearances swept by event runs | **The cadence knob barely does anything.** GitHub throttling makes `*/5` and `*/15` deliver the same ~1.6h median; the replay for candidate cadences should model the measured firing behavior, not the spec. Slowing to `*/30` would cut a small, mostly-idle cost slice with negligible latency impact *given the event triggers stay*; the higher-leverage retune is event-trigger dedup. |
+| `codex.reaction_freshness_window_seconds` | 1800s | 13/13 head-anchored clearances were swept inside 1800s — all by event runs (p50 ≈ 28s); no cron sweep ever carried one, and the measured cron gap (p50 ≈ 96m) sits far outside the window | **The window is only viable because of the event-driven path.** Widening it to cover the cron path would need ≥ ~5400s (cron p50+) and weakens staleness protection; the data supports finishing the event-driven re-arm (#620) so the window's role keeps shrinking, and otherwise leaving 1800s in place. |
+| Sweep cadences (`*/15`, `*/5`) | cron | effective median cadence ~96–98 min for BOTH specs; scheduled runs are ~10% of run-minutes; 13/13 head-anchored clearances swept by event runs | **The cadence knob barely does anything.** GitHub throttling makes `*/5` and `*/15` deliver the same ~1.6h median; the replay for candidate cadences should model the measured firing behavior, not the spec. Slowing to `*/30` would cut a small, mostly-idle cost slice with negligible latency impact *given the event triggers stay*; the higher-leverage retune is event-trigger dedup. |
 
 Runbook/docs references to the folklore numbers ("15–40 min", "~4 min
 no-👀") should be replaced with the measured ones (p50 3m37s / p90 7m6s /

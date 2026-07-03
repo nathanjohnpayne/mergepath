@@ -407,16 +407,27 @@ analyze() {
        | flatten) as $triggers
     | ($ev | map(select(.kind=="verdict")) | sort_by(.created_at)) as $verdicts
 
+    # Failure markers (rate-limit / not-connected) CONSUME the trigger they
+    # answer: a later bot response belongs to a new implicit round, not to
+    # the failed trigger — binding it would inflate trigger→verdict with
+    # exactly the non-response cases this audit measures (Codex P2 on #629).
+    | ($ev | map(select(.kind == "rate_limit" or .kind == "dropped_trigger_marker"))) as $failmarkers
+
     # verdict → owning trigger: latest trigger in the same PR at or before
-    # the verdict with no earlier verdict in between (re-reviews of a new
-    # push without a fresh trigger classify as auto-review, pair 5).
+    # the verdict with no earlier verdict OR failure marker in between
+    # (re-reviews of a new push without a fresh trigger, and responses
+    # after a failed trigger, classify as auto-review, pair 5).
     | ($verdicts | map(. as $v
         | ([ $triggers[] | select(.pr == $v.pr and .created_at <= $v.created_at) ]
            | sort_by(.created_at) | last) as $t
         | ([ $verdicts[] | select(.pr == $v.pr and .created_at < $v.created_at
                                   and ($t != null) and .created_at >= $t.created_at) ]
            | length) as $stolen
-        | if $t == null or $stolen > 0
+        | ([ $failmarkers[] | select(.pr == $v.pr and ($t != null)
+                                     and .created_at >= $t.created_at
+                                     and .created_at < $v.created_at) ]
+           | length) as $consumed
+        | if $t == null or $stolen > 0 or $consumed > 0
           then $v + {matched:false}
           else $v + {matched:true, trigger:$t} end)) as $mverdicts
 
@@ -438,7 +449,9 @@ analyze() {
                                        and .created_at < $r.submitted_at) ] | length) > 0
             or ([ $reviews[] | select(.pr == $r.pr and .review_id != $r.review_id
                                       and .submitted_at >= $t.created_at
-                                      and .submitted_at < $r.submitted_at) ] | length) > 0)
+                                      and .submitted_at < $r.submitted_at) ] | length) > 0
+            or ([ $failmarkers[] | select(.pr == $r.pr and .created_at >= $t.created_at
+                                          and .created_at < $r.submitted_at) ] | length) > 0)
         | select(([ $verdicts[] | select(.pr == $r.pr
                      and (((.created_at | ts) - ($r.submitted_at | ts)) | fabs) <= 300) ] | length) == 0)
         | $r)) as $auto_reviews
@@ -543,12 +556,20 @@ analyze() {
 
       # pair 6: clearance → gate run → merge, per gate workflow.
       # Clearance = the operative (last-before-merge) 👍 reaction on a
-      # trigger when recorded, else the last affirmative verdict comment.
+      # trigger when recorded, else the last affirmative verdict comment
+      # ANCHORED ON THE MERGE HEAD — the merge gate treats a verdict on a
+      # pre-push commit as stale (#567/#600), so a sha-mismatched (or
+      # sha-less old-format) verdict is not the operative clearance and is
+      # excluded fail-closed rather than mis-anchored (Codex P2 on #629).
       ( $prs[] | select(.merged_at != null) as $p
         | ([ ( $reactions[] | select(.content == "+1")
                | . as $r | select(([ $triggers[] | select(.pr == $p.pr and .comment_id == $r.comment_id) ] | length) > 0)
                | select(.pr == $p.pr) | .created_at ),
-             ( $mverdicts[] | select(.pr == $p.pr and .affirmative == true) | .created_at ) ]
+             ( $mverdicts[] | . as $mv
+               | select($mv.pr == $p.pr and $mv.affirmative == true
+                        and $mv.reviewed_sha != null
+                        and (($p.head_sha // "") | startswith($mv.reviewed_sha)))
+               | $mv.created_at ) ]
            | map(select(. <= $p.merged_at)) | sort | last) as $clear
         | select($clear != null)
         | (

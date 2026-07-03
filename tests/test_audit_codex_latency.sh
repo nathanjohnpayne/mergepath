@@ -87,13 +87,13 @@ expect_pair() {
 # --- classification ----------------------------------------------------------
 
 n_triggers=$(jq -s '[ .[] | select(.kind == "trigger") ] | length' "$EVENTS")
-[ "$n_triggers" = "4" ] && pass "classifies 4 triggers" || fail "triggers: got $n_triggers, want 4"
+[ "$n_triggers" = "5" ] && pass "classifies 5 triggers" || fail "triggers: got $n_triggers, want 5"
 
 n_verdicts=$(jq -s '[ .[] | select(.kind == "verdict") ] | length' "$EVENTS")
-[ "$n_verdicts" = "5" ] && pass "classifies 5 verdicts (incl. sha extraction)" || fail "verdicts: got $n_verdicts, want 5"
+[ "$n_verdicts" = "7" ] && pass "classifies 7 verdicts (incl. sha extraction)" || fail "verdicts: got $n_verdicts, want 7"
 
 n_rl=$(jq -s '[ .[] | select(.kind == "rate_limit") ] | length' "$EVENTS")
-[ "$n_rl" = "1" ] && pass "classifies the rate-limit marker comment" || fail "rate_limit: got $n_rl, want 1"
+[ "$n_rl" = "2" ] && pass "classifies the rate-limit marker comments" || fail "rate_limit: got $n_rl, want 2"
 
 aff=$(jq -s '[ .[] | select(.kind == "verdict" and .pr == 11) ] | .[0].affirmative' "$EVENTS")
 [ "$aff" = "false" ] && pass "findings verdict is non-affirmative" || fail "PR 11 verdict affirmative: got $aff"
@@ -121,14 +121,27 @@ expect_pair "pair 2b: clean review still counts as first review response = 300s"
 
 # Round 2's rate-limit marker (12:06) falls INSIDE round 1's 2h window but
 # AFTER round 2's trigger (12:05): the round-bounded rule must keep round 1
-# clean while still tainting round 2 (Codex P2 on #629).
+# clean (Codex P2 on #629).
 expect_pair "pair 3 round 1: trigger→verdict = 540s, NOT tainted by round 2's marker" \
   '.pair == "3_trigger_to_verdict" and .round == 1 and .pr == 10' \
   '.seconds == 540 and .rate_limited == false'
 
-expect_pair "pair 3 round 2: trigger→verdict = 2100s, rate-limited segment" \
-  '.pair == "3_trigger_to_verdict" and .round == 2' \
-  '.seconds == 2100 and .rate_limited == true'
+# ...and the same marker CONSUMES round 2's trigger: the 12:40 verdict is
+# not that trigger's response — it re-classifies as an auto-review
+# anchored on the reviewed commit's push time (Codex P2 round 3 on #629).
+n_r2_p3=$(jq -s '[ .[] | select(.pair == "3_trigger_to_verdict" and .pr == 10 and .round == 2) ] | length' "$PAIRS")
+[ "$n_r2_p3" = "0" ] && pass "pair 3: failure marker consumes the trigger (no round-2 pairing)" \
+  || fail "PR 10 round-2 pair-3 records: got $n_r2_p3, want 0"
+
+expect_pair "pair 5: post-marker verdict re-classifies as auto-review (9900s from push)" \
+  '.pair == "5_push_to_auto_review" and .pr == 10' \
+  '.seconds == 9900'
+
+# PR 16: a marker AFTER the verdict does not consume the round — the pair-3
+# record survives and carries the rate_limited segment tag.
+expect_pair "pair 3: post-verdict marker tags the segment without consuming the round" \
+  '.pair == "3_trigger_to_verdict" and .pr == 16' \
+  '.seconds == 600 and .rate_limited == true'
 
 expect_pair "pair 4: trigger→👍 clearance = 600s" \
   '.pair == "4_trigger_to_thumbs_clearance"' \
@@ -190,6 +203,13 @@ n_pr14_gate=$(jq -s '[ .[] | select((.pair | startswith("6_clearance_to_gate")) 
 [ "$n_pr14_gate" = "0" ] && pass "pair 6: post-merge-only gate runs are censored, not paired" \
   || fail "PR 14 gate pairings: got $n_pr14_gate, want 0"
 
+# PR 17 merged with an affirmative verdict whose reviewed sha does NOT
+# prefix the merge head: the merge gate treats that verdict as stale, so
+# it is not the operative clearance — no pair-6 records (Codex P2 round 3).
+n_pr17_p6=$(jq -s '[ .[] | select((.pair | startswith("6_")) and .pr == 17) ] | length' "$PAIRS")
+[ "$n_pr17_p6" = "0" ] && pass "pair 6: stale (non-head) affirmative verdict is not a clearance" \
+  || fail "PR 17 pair-6 records: got $n_pr17_p6, want 0"
+
 # --- events-only replay mode (reproducibility after retention) ---------------
 REPLAY="$WORKDIR/replay"
 mkdir -p "$REPLAY"
@@ -226,9 +246,9 @@ grep -q '^## 3_trigger_to_verdict' "$WORKDIR/summary.md" \
   && pass "summary.md has per-pair sections" \
   || fail "summary.md missing 3_trigger_to_verdict section"
 
-grep -q '| rate_limited=true | 1 | 35m0s |' "$WORKDIR/summary.md" \
+grep -q '| rate_limited=true | 1 | 10m0s |' "$WORKDIR/summary.md" \
   && pass "summary.md segments rate-limited rounds (n/p50 rendered)" \
-  || fail "summary.md missing rate_limited=true row with 35m0s p50"
+  || fail "summary.md missing rate_limited=true row with 10m0s p50"
 
 grep -q '^## Appendix: unclassified bot comments' "$WORKDIR/summary.md" \
   && pass "summary.md carries the unclassified-bot-comment diagnostics appendix" \
