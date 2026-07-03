@@ -4,11 +4,16 @@ Reference implementation for automating the Phase 4b external-review
 handoff (REVIEW_POLICY.md § Phase 4b). Design and diagrams:
 [`plans/automated-phase-4b-handoff.md`](../../plans/automated-phase-4b-handoff.md).
 
-This ships as a disabled reference implementation: runnable, fail-closed,
+This started as a disabled reference implementation: runnable, fail-closed,
 unit-tested with fake CLIs, and accompanied by real plan-backed `codex` /
-`claude` validation evidence in PR #580's review thread. Re-run the live adapter
-validation from the enablement environment before flipping
-`phase_4b_automation.enabled: true` in a repo.
+`claude` validation evidence in PR #580's review thread. **Mergepath itself
+runs it ENABLED since 2026-07-02 (#628: `phase_4b_automation.enabled: true`,
+xhigh effort on both adapters, accounting live)** — the bootstrap template
+mirror resets the switch to `false`, so any OTHER repo still opts in
+explicitly and should re-run the live adapter validation from its own
+enablement environment before flipping `phase_4b_automation.enabled: true`.
+Invocation and the trusted-path rule (run from a main-ref checkout, never
+the PR-under-review's checkout) live in REVIEW_POLICY.md and AGENTS.md.
 
 ## Components
 
@@ -51,7 +56,8 @@ validation from the enablement environment before flipping
 ### Approval-loop accounting (#602)
 
 When `phase_4b_automation.accounting.enabled` is not `false` (the default is
-`true`, but the parent `enabled: false` still gates everything), the
+`true`; with mergepath's parent switch now on, the block is live — on a repo
+whose parent `enabled` is false it still gates everything), the
 orchestrator sources `accounting.sh` and:
 
 1. **Records every loop.** Each invocation appends one loop record to a
