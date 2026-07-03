@@ -121,15 +121,17 @@ done
 # --derive-external-requiredness (#620/#630): QUERY mode. Runs the same
 # class dispatch + external-review applicability derivation as the gate and
 # prints exactly `true` or `false` on stdout (exit 0) instead of evaluating
-# clearance. `true` iff a NON-VACUOUS downstream review gate protects this
-# PR's CURRENT head: the external arm applies (intrinsic threshold /
-# protected paths / label force-on), or the Dependabot reviewer gate is
-# enabled for a Dependabot PR. `false` when this gate would pass vacuously:
-# under threshold with no protected paths and no label, a lane-exempt
-# verified head, or the relevant gate disabled. Every error keeps the
-# die()/exit-2 paths so callers MUST fail closed on nonzero. Consumer:
-# agent-review.yml's rc=5 CodeRabbit rate-limit branch (#489/#620) — it
-# needs requiredness, not clearance, and deriving it from label events was
+# clearance. `true` iff a NON-VACUOUS downstream CODEX/external *bot*-review
+# gate protects this PR's CURRENT head: the external arm applies (intrinsic
+# threshold / protected paths / label force-on). `false` when no such gate
+# holds the merge until bot review: under threshold with no protected paths
+# and no label, a lane-exempt verified head, external gate disabled, OR a
+# Dependabot PR (its reviewer gate blocks on a reviewer-identity APPROVED,
+# not on Codex — and Codex does not review Dependabot PRs, so it is never a
+# bot-review gate; automated-4b P1). Every error keeps the die()/exit-2
+# paths so callers MUST fail closed on nonzero. Consumer: agent-review.yml's
+# rc=5 CodeRabbit rate-limit branch (#489/#620) — it needs Codex-review
+# requiredness, not clearance, and deriving it from label events was
 # rejected repeatedly in review (label removal is not head-pinned proof).
 DERIVE_ONLY=false
 _positional=()
@@ -339,11 +341,20 @@ log "HEAD = $HEAD_SHA    author = $PR_AUTHOR    needs-external-review = $HAS_EXT
 
 if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
   if [ "$DERIVE_ONLY" = "true" ]; then
-    # Query mode: the Dependabot reviewer gate (when enabled) blocks the
-    # merge until a reviewer-identity APPROVED lands on HEAD — a real,
-    # non-vacuous downstream gate. Disabled means this gate passes
-    # vacuously for the PR.
-    if [ "$DEPENDABOT_GATE_ENABLED" = "true" ]; then printf 'true\n'; else printf 'false\n'; fi
+    # Query mode always returns FALSE for a Dependabot PR (automated-4b P1).
+    # The sole consumer — agent-review.yml's rc=5 CodeRabbit rate-limit
+    # branch — asks a NARROW question: will a downstream gate hold this
+    # merge until CODEX / external *bot* review? The Dependabot reviewer
+    # gate is NOT such a gate: when enabled it blocks until a
+    # reviewer-identity APPROVED (a human/CLI approval, which
+    # dependabot-auto-merge supplies automatically), and Codex does not
+    # review Dependabot PRs at all. So neither gate state guarantees a bot
+    # reviewed the head. Returning true here would let the rc=5 branch
+    # downgrade a CodeRabbit rate-limit stall on an approved Dependabot PR
+    # and merge it with NEITHER bot having reviewed (the #512 r3 hazard).
+    # The FULL gate below still enforces the reviewer-APPROVED requirement
+    # for the actual merge; only this Codex-requiredness query is false.
+    printf 'false\n'
     exit 0
   fi
   if [ "$DEPENDABOT_GATE_ENABLED" != "true" ]; then

@@ -911,7 +911,12 @@ else
   fail "query: gate-disabled expected false/0; got rc=$RC out='$OUT'"
 fi
 
-echo; echo "--- Query 7: Dependabot author follows the reviewer-gate knob"
+echo; echo "--- Query 7: Dependabot author → always false (reviewer gate is not a Codex gate; automated-4b P1)"
+# The Dependabot reviewer gate blocks on a reviewer-identity APPROVED, not on
+# Codex, and Codex does not review Dependabot PRs — so for the rc=5 branch's
+# Codex-requiredness question the answer is false regardless of the knob.
+# (The FULL gate still enforces the reviewer-APPROVED requirement; that is
+# covered by the non-query Dependabot tests above.)
 SCRATCH=$(make_scratch true false)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
 set +e
@@ -923,10 +928,10 @@ set +e
 OUT2=$(FIXTURE_PR="$FIXTURE_PR" run_gate "$SCRATCH2" --derive-external-requiredness 99 owner/repo 2>/dev/null)
 RC2=$?
 set -e
-if [ "$RC" = 0 ] && [ "$OUT" = "true" ] && [ "$RC2" = 0 ] && [ "$OUT2" = "false" ]; then
-  pass "query: dependabot → true when reviewer gate enabled, false when disabled"
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ] && [ "$RC2" = 0 ] && [ "$OUT2" = "false" ]; then
+  pass "query: dependabot → false whether the reviewer gate is enabled or disabled (not a Codex gate)"
 else
-  fail "query: dependabot expected true/0 then false/0; got rc=$RC out='$OUT' rc2=$RC2 out2='$OUT2'"
+  fail "query: dependabot expected false/0 both ways; got rc=$RC out='$OUT' rc2=$RC2 out2='$OUT2'"
 fi
 
 echo; echo "--- Query 8: PR fetch failure → nonzero (caller fails closed)"
