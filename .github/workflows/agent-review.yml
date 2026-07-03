@@ -765,6 +765,15 @@ jobs:
           OP_PREFLIGHT_AUTHOR_PAT: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          # #620: the rc=5 branch derives external-review applicability; on the
+          # unlabeled re-arm path the blocking label is absent by construction,
+          # so the removal event itself carries the signal. Env-indirected
+          # rather than interpolated into run: per the workflow's
+          # injection-safety idiom. github.event.label exists only on
+          # labeled/unlabeled payloads — empty elsewhere, which the run-block
+          # guards treat as "no override".
+          EVENT_ACTION: ${{ github.event.action }}
+          REMOVED_LABEL: ${{ github.event.label.name }}
         run: |
           # Delegate to scripts/coderabbit-wait.sh so auto-merge honors the
           # same semantics the agent-driven flow uses: HEAD-anchored
@@ -825,6 +834,23 @@ jobs:
               # external clearance removes it).
               ext_required=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels \
                 --jq 'any(.labels[]; .name=="needs-external-review")' 2>/dev/null || echo "false")
+              # #620 (Codex r4): on the unlabeled re-arm path this run exists
+              # BECAUSE auto-clear just removed needs-external-review after
+              # external clearance — the current-label read above is false by
+              # construction and would misclassify this above-threshold PR as
+              # under-threshold, blocking the failover disposition and
+              # re-creating the exact clean-but-unmerged stall the unlabeled
+              # trigger was added to fix. The removal event is the durable
+              # above-threshold signal: triage applies the label only above
+              # threshold, and merge-clearance's external gate passed
+              # non-vacuously before auto-clear removed it. Raising false→true
+              # only here is monotonic-safe — the blocking-label re-verifies
+              # and the current-head required-check wait (merge-clearance-gate
+              # included) still gate the actual merge, so a label stripped
+              # WITHOUT clearance still cannot merge.
+              if [ "${EVENT_ACTION:-}" = "unlabeled" ] && [ "${REMOVED_LABEL:-}" = "needs-external-review" ]; then
+                ext_required=true
+              fi
               if bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_required"; then
                 echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged on an above-threshold PR — proceeding. merge-clearance's external-review gate blocks the merge until Codex/external clearance lands."
               else
