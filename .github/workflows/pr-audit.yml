@@ -929,8 +929,16 @@ jobs:
                 // fresh, hiding exactly the newer-negative-verdict staleness
                 // this guard exists to catch. A failed fetch must not be
                 // treated as equivalent to a verified clean signal.
+                //
+                // Gated on codexEnabled (Codex P2 round 7): when
+                // codex.enabled is false, Codex signals never participate in
+                // clearance at all (all three signal computations above are
+                // already codexEnabled-gated, so latestAnyCodexSignalTime is
+                // always empty in that config) — a transient issueComments
+                // fetch failure must not invalidate an otherwise-fresh CLI
+                // approval over a signal source the repo doesn't use.
                 const hasFreshCliApproval = cliApprovedReviews.length > 0 &&
-                  issueComments !== null &&
+                  (!codexEnabled || issueComments !== null) &&
                   (!latestAnyCodexSignalTime || latestCliApprovedTime > latestAnyCodexSignalTime);
 
                 if (hadExternalLabel &&
