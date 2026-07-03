@@ -52,10 +52,15 @@
 #   P4B_DIFF_MAX_BYTES  review-diff byte budget override (integer; tests and
 #               manual runs). Default resolution: the
 #               phase_4b_automation.diff_max_bytes policy knob, else 600000.
-#               An over-budget diff has its largest per-file sections omitted
-#               (bulk artifacts) with in-diff placeholders plus a prompt
+#               An over-budget diff has its largest ALLOWLISTED per-file
+#               sections omitted with in-diff placeholders plus a prompt
 #               disclosure naming each omitted path+size (#635); when nothing
 #               reviewable survives the budget, exit 4 (manual fallback).
+#   P4B_DIFF_OMIT_GLOBS  comma-separated override of the omission allowlist
+#               (phase_4b_automation.diff_omit_globs). Only matching paths
+#               are ever omitted from an over-budget diff — a non-matching
+#               oversized section fails closed to the manual handoff so an
+#               APPROVED can never post around unreviewed code (#636 P1).
 #
 # Exit codes: identical contract to review-via-codex.sh (0/2/3/4).
 
@@ -126,22 +131,24 @@ MAX_DIFF_BYTES="$(p4b_resolve_diff_max_bytes)" \
   || p4b_die 3 "invalid diff byte budget (P4B_DIFF_MAX_BYTES must be an integer; phase_4b_automation.diff_max_bytes must be an integer in ${P4B_MIN_DIFF_MAX_BYTES}..${P4B_MAX_DIFF_MAX_BYTES})"
 printf '%s\n' "$DIFF" > "$DIFF_RAW"
 DIFF_BYTES="$(wc -c < "$DIFF_RAW" | tr -d '[:space:]')"
-OMITTED="$(p4b_trim_review_diff "$DIFF_RAW" "$DIFF_FIT" "$MAX_DIFF_BYTES")" \
-  || p4b_die 4 "diff (${DIFF_BYTES} bytes) exceeds the ${MAX_DIFF_BYTES}-byte review budget and no reviewable content survives trimming — pass a curated --diff-file; falling back to the manual handoff"
+OMIT_GLOBS="$(p4b_diff_omit_globs)"
+OMITTED="$(p4b_trim_review_diff "$DIFF_RAW" "$DIFF_FIT" "$MAX_DIFF_BYTES" "$OMIT_GLOBS")" \
+  || p4b_die 4 "diff (${DIFF_BYTES} bytes) exceeds the ${MAX_DIFF_BYTES}-byte review budget and cannot be reduced by omitting policy-allowlisted bulk sections (phase_4b_automation.diff_omit_globs) — refusing to omit unreviewed code (#636); pass a curated --diff-file or extend the allowlist; falling back to the manual handoff"
 DIFF_NOTE=""
 if [ -n "$OMITTED" ]; then
   DIFF="$(cat "$DIFF_FIT")"
   OMIT_COUNT="$(printf '%s\n' "$OMITTED" | grep -c .)"
-  p4b_log "diff over budget (${DIFF_BYTES} > ${MAX_DIFF_BYTES} bytes): omitted ${OMIT_COUNT} oversized file section(s): $(printf '%s\n' "$OMITTED" | awk -F'\t' '{printf "%s%s (%s bytes)", (NR > 1 ? ", " : ""), $1, $2}')"
+  p4b_log "diff over budget (${DIFF_BYTES} > ${MAX_DIFF_BYTES} bytes): omitted ${OMIT_COUNT} allowlisted file section(s): $(printf '%s\n' "$OMITTED" | awk -F'\t' '{printf "%s%s (%s bytes)", (NR > 1 ? ", " : ""), $1, $2}')"
   DIFF_NOTE="
 
 NOTE: the full PR diff is ${DIFF_BYTES} bytes, over this review's
-${MAX_DIFF_BYTES}-byte budget. The ${OMIT_COUNT} largest per-file diff
-section(s) listed below WERE CHANGED BY THIS PR but are omitted from the
-diff you receive, each replaced with a '[phase-4b diff-budget: ...]'
-placeholder line (such sections are typically bulk data artifacts). Do NOT
+${MAX_DIFF_BYTES}-byte budget. The per-file diff section(s) listed below
+WERE CHANGED BY THIS PR but are omitted from the diff you receive, each
+replaced with a '[phase-4b diff-budget: ...]' placeholder line. Only paths
+on the repo's operator-declared bulk-artifact allowlist
+(phase_4b_automation.diff_omit_globs) are ever omitted this way. Do NOT
 report these files as missing from the PR; treat them as
-changed-but-unreviewed:
+changed-but-unreviewed bulk artifacts:
 $(printf '%s\n' "$OMITTED" | awk -F'\t' '{printf "- %s (%s bytes)\n", $1, $2}')
 If the omission of any of these prevents a sound verdict, return
 CHANGES_REQUESTED and say so in the summary."
