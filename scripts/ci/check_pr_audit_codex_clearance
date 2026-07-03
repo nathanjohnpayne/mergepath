@@ -96,7 +96,18 @@ const reviews = fx.reviews || [];
 // stray quotes while scanning for the closing paren.
 const inlineComments = (fx.inline_comments === undefined) ? [] : fx.inline_comments;
 const reactions = fx.reactions || [];
-const issueComments = fx.issue_comments || [];
+// null (not []) on a simulated fetch failure — fail closed (#612 Codex P2
+// round 3), mirroring inlineComments above. issue_comments_fetch_failed
+// simulates the workflow's catch-block outcome.
+const issueComments = (fx.issue_comments_fetch_failed === true)
+  ? null
+  : (fx.issue_comments || []);
+// Simplified stand-in for the workflow's cliApprovedReviews array (#612
+// Codex P2 round 3): the mirror only covers codexCleared, not the outer
+// violation-check section cliApprovedReviews lives in, so fixtures set this
+// boolean directly to exercise the "independent CLI approval already
+// satisfies gate (b)" branch.
+const hasIndependentCliApproval = fx.has_cli_approval === true;
 const headCommitterDate = fx.head_committer_date || '';
 const mergedAt = fx.merged_at || '';
 // Only force-pushes at or before merged_at are merge-time state; a
@@ -159,6 +170,48 @@ const codexCommentedOnHead = codexReviewsOnHead.filter(
 // Gate on codexEnabled (#460 Codex P2): codex.enabled=false → Codex bot
 // signals are ignored (codexCleared stays false), matching codex-review-check.sh.
 let codexCleared = false;
+
+// Latest HEAD-anchored Codex verdict comment. #612, Codex P2 rounds 1-3 on
+// #640. Latest-first, then-affirmative, #608 P1 shape, ties replace-on->=
+// matching max_by(.created_at). Merge-time bounded — a verdict posted after
+// mergedAt must not count in this retrospective audit.
+//
+// Gated ONLY on codexEnabled + issueComments availability — NOT on
+// inlineComments (round 3): the review-clearance path needs inline comments
+// for P0/P1 state, but the verdict's timestamp for staleness purposes needs
+// only the verdict comment itself. Also NOT gated on sameAgentContext
+// (round 2): the merge gate's CODEX_HEAD_VERDICT_ANY_TIME feeds the Phase 4b
+// staleness guard regardless of same-agent; that gating applies only at the
+// codexCleared assignment below.
+let latestVerdictTime = '';
+let verdictAffirmative = false;
+if (codexEnabled && issueComments !== null) {
+  const headLower = (headSha || '').toLowerCase();
+  if (headLower) {
+    let latestVerdict = null;
+    for (const c of issueComments) {
+      if (!c.user || c.user.login !== codexBotLogin) continue;
+      if (!(mergedAt && c.created_at && c.created_at <= mergedAt)) continue;
+      const body = (c.body || '').toLowerCase();
+      const shaMatches = [
+        ...body.matchAll(/reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})/g),
+      ].map(m => m[1]);
+      if (!shaMatches.some(s => headLower.startsWith(s))) continue;
+      if (!latestVerdict || c.created_at >= latestVerdict.created_at) {
+        latestVerdict = {
+          created_at: c.created_at,
+          affirmative: /^\s*codex review:\s*didn.?t find any major issues\b/im
+            .test(c.body || ''),
+        };
+      }
+    }
+    if (latestVerdict) {
+      latestVerdictTime = latestVerdict.created_at || '';
+      verdictAffirmative = latestVerdict.affirmative === true;
+    }
+  }
+}
+
 if (codexEnabled && inlineComments !== null) {
   let latestCodexReview = null;
   if (codexCommentedOnHead.length > 0) {
@@ -215,44 +268,8 @@ if (codexEnabled && inlineComments !== null) {
     );
   }
 
-  // Latest HEAD-anchored Codex verdict comment. #612, Codex P2 rounds 1-2
-  // on #640. Latest-first, then-affirmative, #608 P1 shape, ties
-  // replace-on->= matching max_by(.created_at). Computed UNCONDITIONALLY,
-  // not gated on sameAgentContext: the merge gate CODEX_HEAD_VERDICT_ANY_TIME
-  // feeds the Phase 4b substitute staleness guard regardless of same-agent,
-  // so a cross-agent verdict must still count as a newer Codex signal even
-  // though it cannot itself clear. Same-agent gating applies instead at the
-  // codexCleared assignment below, mirroring the reaction path for
-  // clearance purposes only. Also merge-time bounded — a verdict posted
-  // after mergedAt must not count in this retrospective audit.
-  let latestVerdictTime = '';
-  let verdictAffirmative = false;
-  {
-    const headLower = (headSha || '').toLowerCase();
-    if (headLower) {
-      let latestVerdict = null;
-      for (const c of issueComments) {
-        if (!c.user || c.user.login !== codexBotLogin) continue;
-        if (!(mergedAt && c.created_at && c.created_at <= mergedAt)) continue;
-        const body = (c.body || '').toLowerCase();
-        const shaMatches = [
-          ...body.matchAll(/reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})/g),
-        ].map(m => m[1]);
-        if (!shaMatches.some(s => headLower.startsWith(s))) continue;
-        if (!latestVerdict || c.created_at >= latestVerdict.created_at) {
-          latestVerdict = {
-            created_at: c.created_at,
-            affirmative: /^\s*codex review:\s*didn.?t find any major issues\b/im
-              .test(c.body || ''),
-          };
-        }
-      }
-      if (latestVerdict) {
-        latestVerdictTime = latestVerdict.created_at || '';
-        verdictAffirmative = latestVerdict.affirmative === true;
-      }
-    }
-  }
+  // latestVerdictTime / verdictAffirmative are computed above, outside
+  // this block (#612 Codex P2 round 3) — reused here unchanged.
 
   let latestReactionTime = '';
   if (sameAgentContext) {
@@ -286,7 +303,11 @@ if (codexEnabled && inlineComments !== null) {
   } else if (latestKind === 'review') {
     codexCleared = !reviewHasUnresolvedP01;
   } else if (latestKind === 'verdict') {
-    codexCleared = sameAgentContext && verdictAffirmative && !reviewHasUnresolvedP01;
+    // "same-agent OR an independent CLI approval already exists" (round 3):
+    // the verdict only needs same-agent to substitute for gate (b) branch 2
+    // when nothing else already satisfies gate (b) via branch 1.
+    codexCleared = (sameAgentContext || hasIndependentCliApproval)
+      && verdictAffirmative && !reviewHasUnresolvedP01;
   }
 }
 // --- end mirrored algorithm --------------------------------------
