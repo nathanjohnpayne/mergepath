@@ -720,7 +720,22 @@ jobs:
                 // codexCommentedOnHead (always computed) — NOT inlineComments
                 // (#612 round 4); only the P0/P1 CLEANLINESS check below
                 // needs inline comments, not the timestamp itself.
+                //
+                // latestReviewTime (used below for the CLEARANCE decision) is
+                // deliberately left UNBOUNDED by mergedAt, preserving
+                // pre-#612 behavior across the many existing fixtures that
+                // clear via a review with no merged_at set at all. A separate
+                // latestReviewTimeForStaleness IS merge-time bounded (#612
+                // round 5): without it, a post-merge Codex re-review (e.g. a
+                // late/retried bot run on the closed PR) could inflate the
+                // Phase 4b staleness guard's `latestAnyCodexSignalTime` past
+                // `merged_at`, making a genuinely valid pre-merge CLI
+                // approval look stale relative to a signal that postdates
+                // the merge and is irrelevant to whether that merge was
+                // compliant. Mirrors the merge-time bound already applied to
+                // the verdict and reaction paths.
                 let latestReviewTime = '';
+                let latestReviewTimeForStaleness = '';
                 let latestCodexReview = null;
                 if (codexEnabled && codexCommentedOnHead.length > 0) {
                   latestCodexReview = codexCommentedOnHead.reduce(
@@ -728,14 +743,17 @@ jobs:
                     null
                   );
                   latestReviewTime = latestCodexReview ? (latestCodexReview.submitted_at || '') : '';
+                  if (mergedAt && latestReviewTime && latestReviewTime <= mergedAt) {
+                    latestReviewTimeForStaleness = latestReviewTime;
+                  }
                 }
 
-                // Staleness baseline: the max of all three UNCONDITIONAL
-                // timestamps — correct regardless of inlineComments/
-                // issueComments availability or same-agent context. The
-                // clearance block below does not need to (and does not)
-                // recompute this; it is already complete.
-                for (const t of [latestVerdictTime, latestReactionTime, latestReviewTime]) {
+                // Staleness baseline: the max of all three UNCONDITIONAL,
+                // merge-time-bounded timestamps — correct regardless of
+                // inlineComments/issueComments availability or same-agent
+                // context. The clearance block below does not need to (and
+                // does not) recompute this; it is already complete.
+                for (const t of [latestVerdictTime, latestReactionTime, latestReviewTimeForStaleness]) {
                   if (t && t > latestAnyCodexSignalTime) latestAnyCodexSignalTime = t;
                 }
 
@@ -900,7 +918,19 @@ jobs:
                 // "$LATEST_CODEX_SIGNAL_TIME" ]]` exactly — GitHub API
                 // timestamps are second-granular, so a same-second tie must
                 // fail closed to the Codex signal, not the approval.
+                //
+                // `issueComments !== null` is a separate, additional
+                // requirement (Codex P2 round 5): an empty
+                // latestAnyCodexSignalTime normally means "no Codex signal
+                // exists at all," but when the issue-comments fetch failed it
+                // instead means "we could not check for a verdict comment" —
+                // an unknown, not a verified absence. Equating the two let a
+                // fetch failure make a stale CLI approval look trivially
+                // fresh, hiding exactly the newer-negative-verdict staleness
+                // this guard exists to catch. A failed fetch must not be
+                // treated as equivalent to a verified clean signal.
                 const hasFreshCliApproval = cliApprovedReviews.length > 0 &&
+                  issueComments !== null &&
                   (!latestAnyCodexSignalTime || latestCliApprovedTime > latestAnyCodexSignalTime);
 
                 if (hadExternalLabel &&
