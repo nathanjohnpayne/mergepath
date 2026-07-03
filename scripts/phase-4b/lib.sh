@@ -453,9 +453,12 @@ p4b_validate_verdict() {
       and ((.verdict != "APPROVED")
            or all(.findings[]?; (.severity as $s2 | ($required_severities | index($s2) | not))))
       # usage: the schema-required keys must all be present, any other key
-      # must be one the schema DECLARES (the additive optional #602 fields),
-      # and every field must type-check. This mirrors the JSON Schema exactly:
-      # required ⊆ keys ⊆ properties, additionalProperties: false.
+      # must be one the schema DECLARES, and every field must type-check.
+      # This mirrors the JSON Schema exactly: required ⊆ keys ⊆ properties,
+      # additionalProperties: false. Since #632 the schema is
+      # required-COMPLETE (OpenAI strict mode demands required == all
+      # properties), so the #602 additive fields are required-but-nullable
+      # and this derived check tightens with it automatically.
       and ((.usage == null)
            or ((.usage | type == "object")
                and ((.usage | keys_unsorted | sort) as $uk
@@ -463,10 +466,10 @@ p4b_validate_verdict() {
                and (.usage.token_count | okintnull)
                and (.usage.input_tokens | okintnull)
                and (.usage.output_tokens | okintnull)
-               # Optional #602 fields: plain `.usage.X` yields null for an
-               # ABSENT key (accepted), while a PRESENT wrong-typed value must
-               # fail the type check. Never `// null` here — the jq alternative
-               # operator treats `false` as absent, so a boolean field
+               # #602 additive fields (required-but-nullable since #632; the
+               # key-set equality above already rejects an absent key). Plain
+               # `.usage.X`, never `// null` — the jq alternative operator
+               # treats `false` as absent, so a boolean field
                # (cache_read_input_tokens:false) would silently pass (#615
                # Codex; the known repo `//`-vs-false footgun).
                and (.usage.cache_creation_input_tokens | okintnull)

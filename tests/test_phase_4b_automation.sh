@@ -442,10 +442,14 @@ if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usa
   fail "top-level extra property accepted"; else pass "top-level extra property rejected"; fi
 if p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P1","path":"x.js","line":2,"body":"y","extra":true}],"usage":null}'; then
   fail "finding extra property accepted"; else pass "finding extra property rejected"; fi
-if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":120,"output_tokens":30,"source":"claude-json-envelope"}}'; then
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":120,"output_tokens":30,"cache_creation_input_tokens":null,"cache_read_input_tokens":null,"reasoning_tokens":null,"total_cost_usd":null,"source":"claude-json-envelope"}}'; then
   pass "valid usage metadata accepted"; else fail "valid usage metadata rejected"; fi
 if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150}}'; then
   fail "partial usage metadata accepted"; else pass "partial usage metadata rejected"; fi
+# #632: the pre-strict four-key emitter shape omits the additive #602 keys;
+# required-completeness (OpenAI strict mode) must reject it.
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":120,"output_tokens":30,"source":"codex-cli-stderr"}}'; then
+  fail "legacy four-key usage accepted"; else pass "legacy four-key usage rejected (#632 required-complete)"; fi
 if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[]}'; then
   fail "missing usage accepted"; else pass "missing usage rejected"; fi
 if p4b_validate_verdict 'not json'; then
@@ -615,8 +619,10 @@ out="$(CODEX_BIN="$BIN/fake-codex-usage" bash "$AD_CODEX" --pr 1 --repo o/r --di
 set -e
 if [ "$rc" = 0 ] \
    && [ "$(printf '%s' "$out" | jq -r '.usage.token_count')" = "1234" ] \
-   && [ "$(printf '%s' "$out" | jq -r '.usage.source')" = "codex-cli-stderr" ]; then
-  pass "codex adapter records token usage when CLI exposes it"
+   && [ "$(printf '%s' "$out" | jq -r '.usage.source')" = "codex-cli-stderr" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.usage | keys | length')" = "8" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.usage.cache_read_input_tokens')" = "null" ]; then
+  pass "codex adapter records token usage when CLI exposes it (all eight keys, additive null-filled, #632)"
 else fail "codex adapter token usage (rc=$rc, out=$out)"; fi
 
 set +e
