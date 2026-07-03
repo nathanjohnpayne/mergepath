@@ -28,6 +28,13 @@
 #                              under the pre-#486 behavior. Unset/false ⇒ the
 #                              PR is treated as under-threshold.
 #
+# IMPORTANT: a plain push (`synchronize`) never re-triggers a Codex review —
+# the Codex GitHub App reviews only on PR-open, ready-for-review, or an
+# explicit `@codex review` comment. Every fix-push must re-run this script
+# (or otherwise re-post the trigger) to re-arm HEAD-anchored clearance;
+# nothing does it automatically, and a stale prior-HEAD verdict does not
+# satisfy the merge gate (#631).
+#
 # Behavior:
 #   0. Reads codex.enabled (default true) and codex.request_by_default
 #      (default true, #486) and decides whether to request a Codex review
