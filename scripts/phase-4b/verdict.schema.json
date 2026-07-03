@@ -47,10 +47,10 @@
       }
     },
     "usage": {
-      "description": "Optional adapter-populated usage metadata. Null means the reviewer CLI did not expose a reliable token count; adapters must not ask the model to guess it. The cache/reasoning/cost fields (#602) are ADDITIVE and OPTIONAL — deliberately NOT listed in `required`, so pre-#602 emitters stay valid and this file remains usable via `codex exec --output-schema` (the Codex prompt pins usage to null; only the adapters' own post-run extraction populates the optional fields, and only when the CLI envelope exposes them — never estimated).",
+      "description": "Optional adapter-populated usage metadata. Null means the reviewer CLI did not expose a reliable token count; adapters must not ask the model to guess it. STRICT-MODE CONTRACT (#632): OpenAI's structured-output validator requires `required` to list EVERY key in `properties` (this file is passed to `codex exec --output-schema`, and the first live run was rejected with invalid_json_schema while the #602 fields were omitted), so the additive cache/reasoning/cost fields are required-but-NULLABLE — an emitter without a value MUST emit the key with null, never omit it (the Codex prompt pins usage to null; only the adapters' own post-run extraction populates the fields, and only when the CLI envelope exposes them — never estimated).",
       "type": ["object", "null"],
       "additionalProperties": false,
-      "required": ["token_count", "input_tokens", "output_tokens", "source"],
+      "required": ["token_count", "input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "reasoning_tokens", "total_cost_usd", "source"],
       "properties": {
         "token_count": {
           "type": ["integer", "null"],

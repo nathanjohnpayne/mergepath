@@ -207,8 +207,11 @@ TOKEN_COUNT="$(awk '
 ' "$ERR_OUT" 2>/dev/null || true)"
 
 if [ -n "$TOKEN_COUNT" ]; then
+  # All eight usage keys, null-filled: verdict.schema.json is
+  # required-complete for OpenAI strict mode (#632), so an emitter must
+  # never omit a key it lacks a value for.
   USAGE="$(jq -n --argjson token "$TOKEN_COUNT" \
-    '{token_count:$token,input_tokens:null,output_tokens:null,source:"codex-cli-stderr"}')"
+    '{token_count:$token,input_tokens:null,output_tokens:null,cache_creation_input_tokens:null,cache_read_input_tokens:null,reasoning_tokens:null,total_cost_usd:null,source:"codex-cli-stderr"}')"
 else
   USAGE="null"
 fi
