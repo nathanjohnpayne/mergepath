@@ -2,26 +2,26 @@
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 209 | 4m44s | 13m51s | 19m57s | 30m39s |
+| ALL | 206 | 4m42s | 13m46s | 19m57s | 30m39s |
 | additions_bucket=additions<=50 | 17 | 2m53s | 3m39s | 4m17s | 4m17s |
 | additions_bucket=additions=151-300 | 20 | 3m46s | 6m57s | 8m35s | 8m35s |
-| additions_bucket=additions=301-1000 | 66 | 4m21s | 9m11s | 30m39s | 30m39s |
-| additions_bucket=additions=51-150 | 15 | 4m6s | 8m48s | 10m46s | 10m46s |
-| additions_bucket=additions>1000 | 91 | 6m42s | 16m14s | 21m13s | 21m13s |
-| round=1 | 60 | 3m49s | 9m32s | 17m35s | 17m35s |
+| additions_bucket=additions=301-1000 | 65 | 4m21s | 9m5s | 30m39s | 30m39s |
+| additions_bucket=additions=51-150 | 14 | 3m48s | 8m1s | 8m48s | 8m48s |
+| additions_bucket=additions>1000 | 90 | 6m10s | 15m46s | 21m13s | 21m13s |
+| round=1 | 57 | 3m48s | 8m48s | 15m12s | 15m12s |
 | round=2 | 44 | 4m19s | 10m35s | 30m39s | 30m39s |
 | round=3+ | 105 | 5m28s | 15m20s | 19m57s | 21m13s |
 | weekday=Fri | 9 | 4m51s | 10m28s | 10m28s | 10m28s |
-| weekday=Mon | 10 | 5m11s | 8m29s | 17m35s | 17m35s |
+| weekday=Mon | 9 | 5m11s | 8m29s | 8m29s | 8m29s |
 | weekday=Sat | 11 | 4m37s | 8m12s | 8m18s | 8m18s |
 | weekday=Sun | 26 | 4m11s | 7m0s | 8m35s | 8m35s |
-| weekday=Thu | 56 | 10m22s | 17m50s | 21m13s | 21m13s |
+| weekday=Thu | 54 | 10m22s | 17m50s | 21m13s | 21m13s |
 | weekday=Tue | 27 | 3m42s | 5m58s | 9m0s | 9m0s |
 | weekday=Wed | 70 | 4m19s | 10m6s | 30m39s | 30m39s |
-| hour=00 | 12 | 4m17s | 21m13s | 30m39s | 30m39s |
+| hour=00 | 11 | 4m17s | 21m13s | 30m39s | 30m39s |
 | hour=01 | 8 | 3m28s | 11m53s | 11m53s | 11m53s |
 | hour=02 | 9 | 4m10s | 14m5s | 14m5s | 14m5s |
-| hour=03 | 11 | 4m7s | 10m46s | 16m40s | 16m40s |
+| hour=03 | 10 | 3m38s | 6m25s | 16m40s | 16m40s |
 | hour=04 | 18 | 4m11s | 12m53s | 15m19s | 15m19s |
 | hour=05 | 17 | 6m1s | 11m27s | 17m50s | 17m50s |
 | hour=06 | 4 | 10m22s | 14m55s | 14m55s | 14m55s |
@@ -37,11 +37,11 @@
 | hour=18 | 16 | 4m6s | 7m15s | 8m12s | 8m12s |
 | hour=19 | 13 | 6m7s | 9m5s | 9m32s | 9m32s |
 | hour=20 | 4 | 6m9s | 9m13s | 9m13s | 9m13s |
-| hour=21 | 13 | 5m1s | 7m54s | 17m35s | 17m35s |
+| hour=21 | 12 | 4m27s | 7m20s | 7m54s | 7m54s |
 | hour=22 | 19 | 4m42s | 10m28s | 11m7s | 11m7s |
 | hour=23 | 11 | 4m8s | 5m36s | 10m6s | 10m6s |
-| rate_limited=false | 202 | 4m42s | 13m51s | 19m57s | 30m39s |
-| rate_limited=true | 7 | 7m54s | 8m29s | 8m29s | 8m29s |
+| rate_limited=false | 205 | 4m43s | 13m46s | 19m57s | 30m39s |
+| rate_limited=true | 1 | 3m9s | 3m9s | 3m9s | 3m9s |
 
 ## 3_trigger_to_verdict
 
@@ -121,30 +121,30 @@
 | hour=21 | 7 | 3m3s | 20m6s | 20m6s | 20m6s |
 | hour=22 | 8 | 4m26s | 23m30s | 23m30s | 23m30s |
 | hour=23 | 7 | 3m54s | 7m59s | 7m59s | 7m59s |
-| rate_limited=false | 117 | 4m13s | 11m22s | 33m1s | 36m1s |
-| rate_limited=true | 2 | 3m14s | 3m29s | 3m29s | 3m29s |
+| rate_limited=false | 118 | 4m12s | 11m22s | 33m1s | 36m1s |
+| rate_limited=true | 1 | 3m14s | 3m14s | 3m14s | 3m14s |
 
 ## 6_clearance_to_gate:auto-clear-blocking-labels.yml
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 57 | 2m18s | 49m32s | 5h10m | 5h10m |
-| additions_bucket=additions<=50 | 8 | 6m43s | 5h10m | 5h10m | 5h10m |
+| ALL | 48 | 1m17s | 30m1s | 1h35m | 1h35m |
+| additions_bucket=additions<=50 | 3 | 1m33s | 6m43s | 6m43s | 6m43s |
 | additions_bucket=additions=151-300 | 7 | 1m17s | 10m5s | 10m5s | 10m5s |
-| additions_bucket=additions=301-1000 | 23 | 2m56s | 49m32s | 1h35m | 1h35m |
-| additions_bucket=additions=51-150 | 8 | 2m11s | 2h15m | 2h15m | 2h15m |
-| additions_bucket=additions>1000 | 11 | 58s | 4m48s | 11m38s | 11m38s |
-| weekday=Fri | 7 | 2m18s | 2h15m | 2h15m | 2h15m |
+| additions_bucket=additions=301-1000 | 23 | 3m2s | 49m32s | 1h35m | 1h35m |
+| additions_bucket=additions=51-150 | 5 | 1m4s | 28m52s | 28m52s | 28m52s |
+| additions_bucket=additions>1000 | 10 | 54s | 4m30s | 11m38s | 11m38s |
+| weekday=Fri | 6 | 54s | 17m38s | 17m38s | 17m38s |
 | weekday=Mon | 1 | 1m17s | 1m17s | 1m17s | 1m17s |
 | weekday=Sat | 2 | 2m4s | 5m13s | 5m13s | 5m13s |
-| weekday=Sun | 5 | 2m26s | 1h22m | 1h22m | 1h22m |
-| weekday=Thu | 16 | 1m16s | 14m18s | 49m32s | 49m32s |
-| weekday=Tue | 9 | 10m5s | 5h10m | 5h10m | 5h10m |
-| weekday=Wed | 17 | 1m3s | 28m52s | 1h10m | 1h10m |
-| hour=00 | 3 | 4m48s | 1h22m | 1h22m | 1h22m |
-| hour=01 | 3 | 19s | 1m9s | 1m9s | 1m9s |
+| weekday=Sun | 3 | 2m11s | 4m15s | 4m15s | 4m15s |
+| weekday=Thu | 13 | 1m9s | 14m18s | 49m32s | 49m32s |
+| weekday=Tue | 6 | 6m43s | 1h35m | 1h35m | 1h35m |
+| weekday=Wed | 17 | 1m3s | 38m42s | 1h10m | 1h10m |
+| hour=00 | 1 | 27s | 27s | 27s | 27s |
+| hour=01 | 2 | 19s | 1m9s | 1m9s | 1m9s |
 | hour=02 | 5 | 54s | 17m38s | 17m38s | 17m38s |
-| hour=03 | 8 | 4m2s | 2h15m | 2h15m | 2h15m |
+| hour=03 | 5 | 4m2s | 10m5s | 10m5s | 10m5s |
 | hour=04 | 3 | 1m4s | 49m32s | 49m32s | 49m32s |
 | hour=06 | 1 | 58s | 58s | 58s | 58s |
 | hour=07 | 1 | 28m52s | 28m52s | 28m52s | 28m52s |
@@ -154,43 +154,40 @@
 | hour=15 | 2 | 4m18s | 14m18s | 14m18s | 14m18s |
 | hour=17 | 2 | 1m3s | 1m16s | 1m16s | 1m16s |
 | hour=18 | 6 | 2m4s | 1h35m | 1h35m | 1h35m |
-| hour=19 | 5 | 1m17s | 10m3s | 10m3s | 10m3s |
+| hour=19 | 4 | 55s | 1m33s | 1m33s | 1m33s |
 | hour=21 | 1 | 2m18s | 2m18s | 2m18s | 2m18s |
-| hour=22 | 5 | 27s | 44m23s | 44m23s | 44m23s |
-| hour=23 | 6 | 5m13s | 5h10m | 5h10m | 5h10m |
-| rate_limited=false | 57 | 2m18s | 49m32s | 5h10m | 5h10m |
+| hour=22 | 4 | 21s | 54s | 54s | 54s |
+| hour=23 | 5 | 5m13s | 30m1s | 30m1s | 30m1s |
+| rate_limited=false | 48 | 1m17s | 30m1s | 1h35m | 1h35m |
 
 ## 6_clearance_to_gate:merge-clearance-gate.yml
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 33 | 1m16s | 42m32s | 1h29m | 1h29m |
-| additions_bucket=additions<=50 | 5 | 8m15s | 1h29m | 1h29m | 1h29m |
+| ALL | 27 | 59s | 25m39s | 1h1m | 1h1m |
+| additions_bucket=additions<=50 | 2 | 19s | 1m34s | 1m34s | 1m34s |
 | additions_bucket=additions=151-300 | 2 | 1m18s | 4m3s | 4m3s | 4m3s |
 | additions_bucket=additions=301-1000 | 12 | 1m3s | 42m32s | 1h1m | 1h1m |
-| additions_bucket=additions=51-150 | 4 | 59s | 1h23m | 1h23m | 1h23m |
-| additions_bucket=additions>1000 | 10 | 54s | 4m48s | 12m1s | 12m1s |
+| additions_bucket=additions=51-150 | 3 | 59s | 1m4s | 1m4s | 1m4s |
+| additions_bucket=additions>1000 | 8 | 37s | 12m1s | 12m1s | 12m1s |
 | weekday=Mon | 1 | 1m18s | 1m18s | 1m18s | 1m18s |
 | weekday=Sat | 1 | 5m13s | 5m13s | 5m13s | 5m13s |
-| weekday=Sun | 1 | 1h29m | 1h29m | 1h29m | 1h29m |
-| weekday=Thu | 9 | 58s | 10m58s | 10m58s | 10m58s |
-| weekday=Tue | 4 | 4m18s | 1h1m | 1h1m | 1h1m |
-| weekday=Wed | 17 | 1m3s | 42m32s | 1h23m | 1h23m |
-| hour=00 | 3 | 4m48s | 1h29m | 1h29m | 1h29m |
+| weekday=Thu | 7 | 37s | 1m34s | 1m34s | 1m34s |
+| weekday=Tue | 2 | 1s | 1h1m | 1h1m | 1h1m |
+| weekday=Wed | 16 | 59s | 25m39s | 42m32s | 42m32s |
+| hour=00 | 1 | 27s | 27s | 27s | 27s |
 | hour=01 | 1 | 19s | 19s | 19s | 19s |
 | hour=03 | 3 | 4m2s | 4m3s | 4m3s | 4m3s |
 | hour=04 | 1 | 1m4s | 1m4s | 1m4s | 1m4s |
 | hour=06 | 1 | 58s | 58s | 58s | 58s |
-| hour=07 | 1 | 1h23m | 1h23m | 1h23m | 1h23m |
 | hour=08 | 3 | 12m1s | 42m32s | 42m32s | 42m32s |
 | hour=09 | 2 | 13s | 25m39s | 25m39s | 25m39s |
-| hour=15 | 1 | 4m18s | 4m18s | 4m18s | 4m18s |
 | hour=17 | 2 | 1m3s | 1m16s | 1m16s | 1m16s |
 | hour=18 | 4 | 59s | 1h1m | 1h1m | 1h1m |
-| hour=19 | 4 | 1m18s | 10m58s | 10m58s | 10m58s |
-| hour=22 | 5 | 28s | 8m15s | 8m15s | 8m15s |
+| hour=19 | 3 | 1m18s | 1m34s | 1m34s | 1m34s |
+| hour=22 | 4 | 21s | 54s | 54s | 54s |
 | hour=23 | 2 | 30s | 5m13s | 5m13s | 5m13s |
-| rate_limited=false | 33 | 1m16s | 42m32s | 1h29m | 1h29m |
+| rate_limited=false | 27 | 59s | 25m39s | 1h1m | 1h1m |
 
 ## 6_clearance_to_merge
 
@@ -233,23 +230,23 @@
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 57 | 0s | 0s | 0s | 0s |
-| additions_bucket=additions<=50 | 8 | 0s | 0s | 0s | 0s |
+| ALL | 48 | 0s | 0s | 0s | 0s |
+| additions_bucket=additions<=50 | 3 | 0s | 0s | 0s | 0s |
 | additions_bucket=additions=151-300 | 7 | 0s | 0s | 0s | 0s |
 | additions_bucket=additions=301-1000 | 23 | 0s | 0s | 0s | 0s |
-| additions_bucket=additions=51-150 | 8 | 0s | 0s | 0s | 0s |
-| additions_bucket=additions>1000 | 11 | 0s | 0s | 0s | 0s |
-| weekday=Fri | 7 | 0s | 0s | 0s | 0s |
+| additions_bucket=additions=51-150 | 5 | 0s | 0s | 0s | 0s |
+| additions_bucket=additions>1000 | 10 | 0s | 0s | 0s | 0s |
+| weekday=Fri | 6 | 0s | 0s | 0s | 0s |
 | weekday=Mon | 1 | 0s | 0s | 0s | 0s |
 | weekday=Sat | 2 | 0s | 0s | 0s | 0s |
-| weekday=Sun | 5 | 0s | 0s | 0s | 0s |
-| weekday=Thu | 16 | 0s | 0s | 0s | 0s |
-| weekday=Tue | 9 | 0s | 0s | 0s | 0s |
+| weekday=Sun | 3 | 0s | 0s | 0s | 0s |
+| weekday=Thu | 13 | 0s | 0s | 0s | 0s |
+| weekday=Tue | 6 | 0s | 0s | 0s | 0s |
 | weekday=Wed | 17 | 0s | 0s | 0s | 0s |
-| hour=00 | 3 | 0s | 0s | 0s | 0s |
-| hour=01 | 3 | 0s | 0s | 0s | 0s |
+| hour=00 | 1 | 0s | 0s | 0s | 0s |
+| hour=01 | 2 | 0s | 0s | 0s | 0s |
 | hour=02 | 5 | 0s | 0s | 0s | 0s |
-| hour=03 | 8 | 0s | 0s | 0s | 0s |
+| hour=03 | 5 | 0s | 0s | 0s | 0s |
 | hour=04 | 3 | 0s | 0s | 0s | 0s |
 | hour=06 | 1 | 0s | 0s | 0s | 0s |
 | hour=07 | 1 | 0s | 0s | 0s | 0s |
@@ -259,65 +256,62 @@
 | hour=15 | 2 | 0s | 0s | 0s | 0s |
 | hour=17 | 2 | 0s | 0s | 0s | 0s |
 | hour=18 | 6 | 0s | 0s | 0s | 0s |
-| hour=19 | 5 | 0s | 0s | 0s | 0s |
+| hour=19 | 4 | 0s | 0s | 0s | 0s |
 | hour=21 | 1 | 0s | 0s | 0s | 0s |
-| hour=22 | 5 | 0s | 0s | 0s | 0s |
-| hour=23 | 6 | 0s | 0s | 0s | 0s |
-| rate_limited=false | 57 | 0s | 0s | 0s | 0s |
+| hour=22 | 4 | 0s | 0s | 0s | 0s |
+| hour=23 | 5 | 0s | 0s | 0s | 0s |
+| rate_limited=false | 48 | 0s | 0s | 0s | 0s |
 
 ## 6_gate_queue:merge-clearance-gate.yml
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 33 | 0s | 0s | 0s | 0s |
-| additions_bucket=additions<=50 | 5 | 0s | 0s | 0s | 0s |
+| ALL | 27 | 0s | 0s | 0s | 0s |
+| additions_bucket=additions<=50 | 2 | 0s | 0s | 0s | 0s |
 | additions_bucket=additions=151-300 | 2 | 0s | 0s | 0s | 0s |
 | additions_bucket=additions=301-1000 | 12 | 0s | 0s | 0s | 0s |
-| additions_bucket=additions=51-150 | 4 | 0s | 0s | 0s | 0s |
-| additions_bucket=additions>1000 | 10 | 0s | 0s | 0s | 0s |
+| additions_bucket=additions=51-150 | 3 | 0s | 0s | 0s | 0s |
+| additions_bucket=additions>1000 | 8 | 0s | 0s | 0s | 0s |
 | weekday=Mon | 1 | 0s | 0s | 0s | 0s |
 | weekday=Sat | 1 | 0s | 0s | 0s | 0s |
-| weekday=Sun | 1 | 0s | 0s | 0s | 0s |
-| weekday=Thu | 9 | 0s | 0s | 0s | 0s |
-| weekday=Tue | 4 | 0s | 0s | 0s | 0s |
-| weekday=Wed | 17 | 0s | 0s | 0s | 0s |
-| hour=00 | 3 | 0s | 0s | 0s | 0s |
+| weekday=Thu | 7 | 0s | 0s | 0s | 0s |
+| weekday=Tue | 2 | 0s | 0s | 0s | 0s |
+| weekday=Wed | 16 | 0s | 0s | 0s | 0s |
+| hour=00 | 1 | 0s | 0s | 0s | 0s |
 | hour=01 | 1 | 0s | 0s | 0s | 0s |
 | hour=03 | 3 | 0s | 0s | 0s | 0s |
 | hour=04 | 1 | 0s | 0s | 0s | 0s |
 | hour=06 | 1 | 0s | 0s | 0s | 0s |
-| hour=07 | 1 | 0s | 0s | 0s | 0s |
 | hour=08 | 3 | 0s | 0s | 0s | 0s |
 | hour=09 | 2 | 0s | 0s | 0s | 0s |
-| hour=15 | 1 | 0s | 0s | 0s | 0s |
 | hour=17 | 2 | 0s | 0s | 0s | 0s |
 | hour=18 | 4 | 0s | 0s | 0s | 0s |
-| hour=19 | 4 | 0s | 0s | 0s | 0s |
-| hour=22 | 5 | 0s | 0s | 0s | 0s |
+| hour=19 | 3 | 0s | 0s | 0s | 0s |
+| hour=22 | 4 | 0s | 0s | 0s | 0s |
 | hour=23 | 2 | 0s | 0s | 0s | 0s |
-| rate_limited=false | 33 | 0s | 0s | 0s | 0s |
+| rate_limited=false | 27 | 0s | 0s | 0s | 0s |
 
 ## 6_gate_run:auto-clear-blocking-labels.yml
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 57 | 14s | 25s | 1m17s | 1m17s |
-| additions_bucket=additions<=50 | 8 | 10s | 20s | 20s | 20s |
+| ALL | 48 | 15s | 25s | 27s | 27s |
+| additions_bucket=additions<=50 | 3 | 9s | 14s | 14s | 14s |
 | additions_bucket=additions=151-300 | 7 | 12s | 19s | 19s | 19s |
-| additions_bucket=additions=301-1000 | 23 | 16s | 27s | 1m17s | 1m17s |
-| additions_bucket=additions=51-150 | 8 | 11s | 26s | 26s | 26s |
-| additions_bucket=additions>1000 | 11 | 15s | 19s | 25s | 25s |
-| weekday=Fri | 7 | 12s | 19s | 19s | 19s |
+| additions_bucket=additions=301-1000 | 23 | 16s | 25s | 27s | 27s |
+| additions_bucket=additions=51-150 | 5 | 20s | 26s | 26s | 26s |
+| additions_bucket=additions>1000 | 10 | 15s | 19s | 25s | 25s |
+| weekday=Fri | 6 | 12s | 19s | 19s | 19s |
 | weekday=Mon | 1 | 9s | 9s | 9s | 9s |
 | weekday=Sat | 2 | 14s | 15s | 15s | 15s |
-| weekday=Sun | 5 | 9s | 12s | 12s | 12s |
-| weekday=Thu | 16 | 14s | 19s | 25s | 25s |
-| weekday=Tue | 9 | 10s | 21s | 21s | 21s |
-| weekday=Wed | 17 | 18s | 27s | 1m17s | 1m17s |
-| hour=00 | 3 | 12s | 13s | 13s | 13s |
-| hour=01 | 3 | 14s | 16s | 16s | 16s |
+| weekday=Sun | 3 | 11s | 12s | 12s | 12s |
+| weekday=Thu | 13 | 16s | 19s | 25s | 25s |
+| weekday=Tue | 6 | 12s | 21s | 21s | 21s |
+| weekday=Wed | 17 | 16s | 27s | 27s | 27s |
+| hour=00 | 1 | 13s | 13s | 13s | 13s |
+| hour=01 | 2 | 14s | 16s | 16s | 16s |
 | hour=02 | 5 | 12s | 14s | 14s | 14s |
-| hour=03 | 8 | 9s | 18s | 18s | 18s |
+| hour=03 | 5 | 12s | 18s | 18s | 18s |
 | hour=04 | 3 | 19s | 20s | 20s | 20s |
 | hour=06 | 1 | 14s | 14s | 14s | 14s |
 | hour=07 | 1 | 25s | 25s | 25s | 25s |
@@ -326,44 +320,41 @@
 | hour=14 | 1 | 19s | 19s | 19s | 19s |
 | hour=15 | 2 | 18s | 25s | 25s | 25s |
 | hour=17 | 2 | 14s | 19s | 19s | 19s |
-| hour=18 | 6 | 17s | 1m17s | 1m17s | 1m17s |
-| hour=19 | 5 | 13s | 17s | 17s | 17s |
+| hour=18 | 6 | 16s | 26s | 26s | 26s |
+| hour=19 | 4 | 9s | 17s | 17s | 17s |
 | hour=21 | 1 | 17s | 17s | 17s | 17s |
-| hour=22 | 5 | 15s | 20s | 20s | 20s |
-| hour=23 | 6 | 10s | 16s | 16s | 16s |
-| rate_limited=false | 57 | 14s | 25s | 1m17s | 1m17s |
+| hour=22 | 4 | 14s | 18s | 18s | 18s |
+| hour=23 | 5 | 14s | 16s | 16s | 16s |
+| rate_limited=false | 48 | 15s | 25s | 27s | 27s |
 
 ## 6_gate_run:merge-clearance-gate.yml
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 33 | 13s | 30s | 43s | 43s |
-| additions_bucket=additions<=50 | 5 | 13s | 27s | 27s | 27s |
+| ALL | 27 | 13s | 19s | 43s | 43s |
+| additions_bucket=additions<=50 | 2 | 12s | 13s | 13s | 13s |
 | additions_bucket=additions=151-300 | 2 | 9s | 13s | 13s | 13s |
 | additions_bucket=additions=301-1000 | 12 | 12s | 30s | 43s | 43s |
-| additions_bucket=additions=51-150 | 4 | 12s | 30s | 30s | 30s |
-| additions_bucket=additions>1000 | 10 | 14s | 18s | 42s | 42s |
+| additions_bucket=additions=51-150 | 3 | 12s | 19s | 19s | 19s |
+| additions_bucket=additions>1000 | 8 | 13s | 18s | 18s | 18s |
 | weekday=Mon | 1 | 9s | 9s | 9s | 9s |
 | weekday=Sat | 1 | 12s | 12s | 12s | 12s |
-| weekday=Sun | 1 | 9s | 9s | 9s | 9s |
-| weekday=Thu | 9 | 13s | 17s | 17s | 17s |
-| weekday=Tue | 4 | 27s | 43s | 43s | 43s |
-| weekday=Wed | 17 | 13s | 30s | 30s | 30s |
-| hour=00 | 3 | 14s | 15s | 15s | 15s |
+| weekday=Thu | 7 | 13s | 17s | 17s | 17s |
+| weekday=Tue | 2 | 18s | 43s | 43s | 43s |
+| weekday=Wed | 16 | 12s | 19s | 30s | 30s |
+| hour=00 | 1 | 14s | 14s | 14s | 14s |
 | hour=01 | 1 | 13s | 13s | 13s | 13s |
 | hour=03 | 3 | 13s | 18s | 18s | 18s |
 | hour=04 | 1 | 11s | 11s | 11s | 11s |
 | hour=06 | 1 | 11s | 11s | 11s | 11s |
-| hour=07 | 1 | 30s | 30s | 30s | 30s |
 | hour=08 | 3 | 12s | 30s | 30s | 30s |
 | hour=09 | 2 | 16s | 16s | 16s | 16s |
-| hour=15 | 1 | 42s | 42s | 42s | 42s |
 | hour=17 | 2 | 14s | 17s | 17s | 17s |
 | hour=18 | 4 | 18s | 43s | 43s | 43s |
-| hour=19 | 4 | 12s | 13s | 13s | 13s |
-| hour=22 | 5 | 12s | 27s | 27s | 27s |
+| hour=19 | 3 | 12s | 12s | 12s | 12s |
+| hour=22 | 4 | 11s | 13s | 13s | 13s |
 | hour=23 | 2 | 10s | 12s | 12s | 12s |
-| rate_limited=false | 33 | 13s | 30s | 43s | 43s |
+| rate_limited=false | 27 | 13s | 19s | 43s | 43s |
 
 ## Appendix: unclassified bot comments (top 20 shapes)
 

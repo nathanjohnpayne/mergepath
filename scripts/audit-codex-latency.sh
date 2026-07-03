@@ -295,7 +295,19 @@ fetch_all() {
 # codex-review-check.sh's verdict matcher (#567/#600).
 
 normalize() {
-  [ -d "$RAW_DIR" ] || { echo "ERROR: no raw extract at $RAW_DIR (run without --analyze-only first)" >&2; exit 1; }
+  # Events/pairs-only replay mode: when no raw extract is present but a
+  # normalized events.jsonl already exists (e.g. the committed
+  # docs/audits/data/ extract copied into --out-dir), reuse it — this is
+  # what keeps the published summary recomputable after GitHub retention
+  # ages the live records out (Codex P2 on #629).
+  if [ ! -d "$RAW_DIR" ]; then
+    if [ -s "$OUT_DIR/events.jsonl" ]; then
+      log "no raw extract at $RAW_DIR — replaying existing events.jsonl"
+      return 0
+    fi
+    echo "ERROR: no raw extract at $RAW_DIR and no $OUT_DIR/events.jsonl to replay" >&2
+    exit 1
+  fi
   log "normalizing raw records → events.jsonl"
   {
     jq -c '. + {kind:"pr"}' "$RAW_DIR/pr_meta.jsonl"
@@ -426,16 +438,23 @@ analyze() {
     | (reduce $rls[] as $rl ({};
         .[($rl.pr | tostring)] = ((.[($rl.pr | tostring)] // []) + [$rl.created_at]))) as $rl_by_pr
 
+    # rate_limited is bounded to the ACTIVE round: a marker only taints the
+    # segment if it lands before the next trigger in the PR — otherwise a
+    # rate-limit marker from a later round would mislabel an earlier,
+    # healthy round (Codex P2 on #629; observed shape on PRs 507/565).
     | def seg($pr; $t0):
         ($prs[$pr | tostring] // {}) as $p
         | ($t0 | ts) as $e
+        | ([ $triggers[] | select(.pr == $pr and .created_at > $t0) ]
+           | sort_by(.created_at) | first) as $nt
         | {additions:($p.additions // null),
            additions_bucket:(($p.additions // null) | addbucket),
            hour:($e | gmtime | strftime("%H")),
            weekday:($e | gmtime | strftime("%a")),
            rate_limited:(
              [ ($rl_by_pr[$pr | tostring] // [])[]
-               | select(. >= $t0 and ((. | ts) - $e) <= 7200) ] | length > 0)};
+               | select(. >= $t0 and ((. | ts) - $e) <= 7200
+                        and ($nt == null or . < $nt.created_at)) ] | length > 0)};
 
     [
       # pairs 1 & 4: reactions on the trigger comment
@@ -456,6 +475,12 @@ analyze() {
         | select($f != null)
         # attribute to this round only if no later trigger precedes it
         | select(([ $triggers[] | select(.pr == $t.pr and .created_at > $t.created_at
+                                         and .created_at < $f.at) ] | length) == 0)
+        # ...and the round is still open: a verdict before the finding
+        # closes the round, so a later review submission belongs to a
+        # subsequent (auto-review) round, not to this trigger (Codex P2
+        # on #629; observed shape on PRs 358/416/565).
+        | select(([ $verdicts[] | select(.pr == $t.pr and .created_at > $t.created_at
                                          and .created_at < $f.at) ] | length) == 0)
         | {pair:"2_trigger_to_first_finding", pr:$t.pr, round:$t.round,
            t0:$t.created_at, t1:$f.at,
@@ -501,10 +526,18 @@ analyze() {
               + seg($p.pr; $clear) ),
             # Only runs that could have swept THIS PR count: schedule /
             # workflow_dispatch runs are repo-wide sweeps; event-triggered
-            # runs only touch the PR whose head branch they ran on.
+            # runs only touch the PR whose head branch they ran on. Two
+            # further guards (Codex P2s on #629): the run must have
+            # CONCLUDED SUCCESS (a skipped/failed run cannot clear labels
+            # or satisfy the required check), and it must have been created
+            # BEFORE the merge — a post-merge sweep cannot be the gate leg
+            # of clearance→gate→merge; clearances whose first eligible run
+            # postdates the merge are censored (skipped), not mis-paired.
             ( $workflows[] as $w
               | select(($oldest_run[$w] // null) != null and $clear >= $oldest_run[$w])
               | ([ $runs[] | select(.workflow == $w and .created_at >= $clear
+                                    and .created_at <= $p.merged_at
+                                    and .conclusion == "success"
                                     and (.event == "schedule" or .event == "workflow_dispatch"
                                          or .head_branch == $p.head_ref)) ] | first) as $r
               | select($r != null)

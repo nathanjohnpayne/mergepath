@@ -90,7 +90,7 @@ n_triggers=$(jq -s '[ .[] | select(.kind == "trigger") ] | length' "$EVENTS")
 [ "$n_triggers" = "3" ] && pass "classifies 3 triggers" || fail "triggers: got $n_triggers, want 3"
 
 n_verdicts=$(jq -s '[ .[] | select(.kind == "verdict") ] | length' "$EVENTS")
-[ "$n_verdicts" = "4" ] && pass "classifies 4 verdicts (incl. sha extraction)" || fail "verdicts: got $n_verdicts, want 4"
+[ "$n_verdicts" = "5" ] && pass "classifies 5 verdicts (incl. sha extraction)" || fail "verdicts: got $n_verdicts, want 5"
 
 n_rl=$(jq -s '[ .[] | select(.kind == "rate_limit") ] | length' "$EVENTS")
 [ "$n_rl" = "1" ] && pass "classifies the rate-limit marker comment" || fail "rate_limit: got $n_rl, want 1"
@@ -108,13 +108,16 @@ expect_pair "pair 2: trigger→first inline finding = 300s" \
   '.pair == "2_trigger_to_first_finding" and .pr == 10' \
   '.seconds == 300 and .round == 1'
 
-expect_pair "pair 3 round 1: trigger→verdict = 540s, not rate-limited" \
+# Round 2's rate-limit marker (12:06) falls INSIDE round 1's 2h window but
+# AFTER round 2's trigger (12:05): the round-bounded rule must keep round 1
+# clean while still tainting round 2 (Codex P2 on #629).
+expect_pair "pair 3 round 1: trigger→verdict = 540s, NOT tainted by round 2's marker" \
   '.pair == "3_trigger_to_verdict" and .round == 1 and .pr == 10' \
   '.seconds == 540 and .rate_limited == false'
 
-expect_pair "pair 3 round 2: trigger→verdict = 1800s, rate-limited segment" \
+expect_pair "pair 3 round 2: trigger→verdict = 2100s, rate-limited segment" \
   '.pair == "3_trigger_to_verdict" and .round == 2' \
-  '.seconds == 1800 and .rate_limited == true'
+  '.seconds == 2100 and .rate_limited == true'
 
 expect_pair "pair 4: trigger→👍 clearance = 600s" \
   '.pair == "4_trigger_to_thumbs_clearance"' \
@@ -141,10 +144,13 @@ expect_pair "pair 5: review-only round after an already-answered trigger counts"
   '.seconds == 600'
 
 expect_pair "pair 6: clearance→merge dead time = 1200s" \
-  '.pair == "6_clearance_to_merge"' \
-  '.seconds == 1200 and .pr == 10'
+  '.pair == "6_clearance_to_merge" and .pr == 10' \
+  '.seconds == 1200'
 
-expect_pair "pair 6: clearance→next merge-clearance-gate run = 300s" \
+# The 12:42:30 FAILED schedule run sits between PR 10's clearance (12:40)
+# and the paired run: a non-success run cannot clear labels or satisfy the
+# required check, so pairing must skip it (Codex P2 on #629).
+expect_pair "pair 6: clearance→next SUCCESSFUL merge-clearance-gate run = 300s" \
   '.pair == "6_clearance_to_gate:merge-clearance-gate.yml"' \
   '.seconds == 300 and .gate_event == "schedule"'
 
@@ -155,6 +161,34 @@ expect_pair "pair 6: gate queue delay = 420s (the #613 class of dead time)" \
 expect_pair "pair 6: gate run duration = 90s" \
   '.pair == "6_gate_run:merge-clearance-gate.yml"' \
   '.seconds == 90'
+
+# PR 13's later review (09:40) came after the round was already closed by
+# the 09:05 verdict: it must NOT be attributed as this trigger's first
+# finding (Codex P2 on #629 — pair-2 windows stop at the verdict).
+n_pr13_p2=$(jq -s '[ .[] | select(.pair == "2_trigger_to_first_finding" and .pr == 13) ] | length' "$PAIRS")
+[ "$n_pr13_p2" = "0" ] && pass "pair 2: window stops at the round-closing verdict" \
+  || fail "PR 13 pair-2 records: got $n_pr13_p2, want 0"
+
+# PR 14: clearance @12:35, merged @12:40, first eligible success run @12:45
+# postdates the merge — the gate leg is censored (skipped), never paired
+# with a post-merge run (Codex P2 on #629); clearance→merge still measures.
+expect_pair "pair 6: clearance→merge for PR 14 = 300s" \
+  '.pair == "6_clearance_to_merge" and .pr == 14' \
+  '.seconds == 300'
+n_pr14_gate=$(jq -s '[ .[] | select((.pair | startswith("6_clearance_to_gate")) and .pr == 14) ] | length' "$PAIRS")
+[ "$n_pr14_gate" = "0" ] && pass "pair 6: post-merge-only gate runs are censored, not paired" \
+  || fail "PR 14 gate pairings: got $n_pr14_gate, want 0"
+
+# --- events-only replay mode (reproducibility after retention) ---------------
+REPLAY="$WORKDIR/replay"
+mkdir -p "$REPLAY"
+cp "$EVENTS" "$REPLAY/events.jsonl"
+if bash "$SCRIPT" --analyze-only --out-dir "$REPLAY" >/dev/null 2>&1 \
+   && diff -q "$REPLAY/pairs.jsonl" "$PAIRS" >/dev/null 2>&1; then
+  pass "replay mode: --analyze-only reproduces pairs.jsonl from events.jsonl alone (no raw/)"
+else
+  fail "replay mode: events-only --analyze-only failed or diverged from the raw-dir run"
+fi
 
 # --- retention guard ---------------------------------------------------------
 # auto-clear-blocking-labels' oldest retained run (12:42) postdates the
@@ -181,9 +215,9 @@ grep -q '^## 3_trigger_to_verdict' "$WORKDIR/summary.md" \
   && pass "summary.md has per-pair sections" \
   || fail "summary.md missing 3_trigger_to_verdict section"
 
-grep -q '| rate_limited=true | 1 | 30m0s |' "$WORKDIR/summary.md" \
+grep -q '| rate_limited=true | 1 | 35m0s |' "$WORKDIR/summary.md" \
   && pass "summary.md segments rate-limited rounds (n/p50 rendered)" \
-  || fail "summary.md missing rate_limited=true row with 30m0s p50"
+  || fail "summary.md missing rate_limited=true row with 35m0s p50"
 
 grep -q '^## Appendix: unclassified bot comments' "$WORKDIR/summary.md" \
   && pass "summary.md carries the unclassified-bot-comment diagnostics appendix" \

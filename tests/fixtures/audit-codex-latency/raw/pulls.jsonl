@@ -2,3 +2,4 @@
 {"pr":11,"created_at":"2026-06-02T09:00:00Z","state":"open","head_ref":"feat/y"}
 {"pr":12,"created_at":"2026-06-03T09:00:00Z","state":"open","head_ref":"feat/z"}
 {"pr":13,"created_at":"2026-06-04T08:00:00Z","state":"open","head_ref":"feat/w"}
+{"pr":14,"created_at":"2026-06-01T12:00:00Z","state":"closed","head_ref":"fix/v"}
