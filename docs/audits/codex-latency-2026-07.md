@@ -101,7 +101,12 @@ submission), a strict upper-bound-free proxy:
 
 | segment (pair 2b) | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 206 | 4m42s | 13m46s | 19m57s | 30m39s |
+| ALL | 197 | 4m45s | 13m51s | 21m13s | 30m39s |
+
+Pair-2/2b windows close at failure markers exactly as verdict pairing
+does (a rate-limited or not-connected round produces no first-response
+sample; the later response is a new round's auto-review) — the 9 rounds
+this excludes are the same 9 pair 5 recovered above.
 
 ### Pair 5 — push → auto-review (no trigger)
 
@@ -150,6 +155,11 @@ conservatively excluded rather than approximated). The verdict must be
 ANCHORED ON THE MERGE HEAD (`Reviewed commit` sha prefixes the PR's final
 head) — the merge gate treats a pre-push verdict as stale (#567/#600), so
 sha-mismatched and sha-less old-format verdicts are excluded fail-closed.
+The same head anchor applies to 👍-reaction clearances once the backfill
+supplies their timestamps: a reaction older than the merge-head committer
+date is stale by the gate's own `reaction_threshold` rule, so it is
+excluded fail-closed rather than mis-anchored (inert in this pass — the
+extract carries no reaction timestamps — but load-bearing post-backfill).
 That exclusion is itself a finding: only 17 of 66 merges carried a
 head-anchored affirmative verdict comment as their recorded clearance;
 the rest cleared via 👍 reactions or review-object paths whose

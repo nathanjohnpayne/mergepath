@@ -2,28 +2,28 @@
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 206 | 4m42s | 13m46s | 19m57s | 30m39s |
+| ALL | 197 | 4m45s | 13m51s | 21m13s | 30m39s |
 | additions_bucket=additions<=50 | 17 | 2m53s | 3m39s | 4m17s | 4m17s |
-| additions_bucket=additions=151-300 | 20 | 3m46s | 6m57s | 8m35s | 8m35s |
-| additions_bucket=additions=301-1000 | 65 | 4m21s | 9m5s | 30m39s | 30m39s |
+| additions_bucket=additions=151-300 | 17 | 4m17s | 7m0s | 8m35s | 8m35s |
+| additions_bucket=additions=301-1000 | 60 | 4m24s | 9m5s | 30m39s | 30m39s |
 | additions_bucket=additions=51-150 | 14 | 3m48s | 8m1s | 8m48s | 8m48s |
-| additions_bucket=additions>1000 | 90 | 6m10s | 15m46s | 21m13s | 21m13s |
-| round=1 | 57 | 3m48s | 8m48s | 15m12s | 15m12s |
-| round=2 | 44 | 4m19s | 10m35s | 30m39s | 30m39s |
-| round=3+ | 105 | 5m28s | 15m20s | 19m57s | 21m13s |
+| additions_bucket=additions>1000 | 89 | 6m42s | 16m14s | 21m13s | 21m13s |
+| round=1 | 50 | 4m6s | 8m48s | 15m12s | 15m12s |
+| round=2 | 43 | 4m21s | 10m35s | 30m39s | 30m39s |
+| round=3+ | 104 | 5m26s | 15m20s | 19m57s | 21m13s |
 | weekday=Fri | 9 | 4m51s | 10m28s | 10m28s | 10m28s |
-| weekday=Mon | 9 | 5m11s | 8m29s | 8m29s | 8m29s |
-| weekday=Sat | 11 | 4m37s | 8m12s | 8m18s | 8m18s |
+| weekday=Mon | 8 | 5m11s | 8m29s | 8m29s | 8m29s |
+| weekday=Sat | 8 | 4m54s | 8m18s | 8m18s | 8m18s |
 | weekday=Sun | 26 | 4m11s | 7m0s | 8m35s | 8m35s |
-| weekday=Thu | 54 | 10m22s | 17m50s | 21m13s | 21m13s |
+| weekday=Thu | 50 | 11m1s | 17m50s | 21m13s | 21m13s |
 | weekday=Tue | 27 | 3m42s | 5m58s | 9m0s | 9m0s |
-| weekday=Wed | 70 | 4m19s | 10m6s | 30m39s | 30m39s |
+| weekday=Wed | 69 | 4m27s | 10m35s | 30m39s | 30m39s |
 | hour=00 | 11 | 4m17s | 21m13s | 30m39s | 30m39s |
-| hour=01 | 8 | 3m28s | 11m53s | 11m53s | 11m53s |
-| hour=02 | 9 | 4m10s | 14m5s | 14m5s | 14m5s |
+| hour=01 | 7 | 4m24s | 11m53s | 11m53s | 11m53s |
+| hour=02 | 8 | 4m10s | 14m5s | 14m5s | 14m5s |
 | hour=03 | 10 | 3m38s | 6m25s | 16m40s | 16m40s |
-| hour=04 | 18 | 4m11s | 12m53s | 15m19s | 15m19s |
-| hour=05 | 17 | 6m1s | 11m27s | 17m50s | 17m50s |
+| hour=04 | 17 | 5m16s | 12m53s | 15m19s | 15m19s |
+| hour=05 | 16 | 6m1s | 11m27s | 17m50s | 17m50s |
 | hour=06 | 4 | 10m22s | 14m55s | 14m55s | 14m55s |
 | hour=07 | 3 | 13m28s | 19m57s | 19m57s | 19m57s |
 | hour=08 | 3 | 12m47s | 14m34s | 14m34s | 14m34s |
@@ -32,15 +32,15 @@
 | hour=12 | 2 | 13m46s | 15m46s | 15m46s | 15m46s |
 | hour=14 | 6 | 3m48s | 7m24s | 7m24s | 7m24s |
 | hour=15 | 12 | 3m37s | 15m8s | 17m5s | 17m5s |
-| hour=16 | 17 | 3m45s | 6m25s | 15m20s | 15m20s |
+| hour=16 | 15 | 3m45s | 6m25s | 15m20s | 15m20s |
 | hour=17 | 6 | 4m36s | 15m12s | 15m12s | 15m12s |
-| hour=18 | 16 | 4m6s | 7m15s | 8m12s | 8m12s |
+| hour=18 | 15 | 4m37s | 7m15s | 8m12s | 8m12s |
 | hour=19 | 13 | 6m7s | 9m5s | 9m32s | 9m32s |
 | hour=20 | 4 | 6m9s | 9m13s | 9m13s | 9m13s |
-| hour=21 | 12 | 4m27s | 7m20s | 7m54s | 7m54s |
-| hour=22 | 19 | 4m42s | 10m28s | 11m7s | 11m7s |
+| hour=21 | 11 | 5m1s | 7m20s | 7m54s | 7m54s |
+| hour=22 | 18 | 4m42s | 10m28s | 11m7s | 11m7s |
 | hour=23 | 11 | 4m8s | 5m36s | 10m6s | 10m6s |
-| rate_limited=false | 205 | 4m43s | 13m46s | 19m57s | 30m39s |
+| rate_limited=false | 196 | 4m45s | 13m51s | 21m13s | 30m39s |
 | rate_limited=true | 1 | 3m9s | 3m9s | 3m9s | 3m9s |
 
 ## 3_trigger_to_verdict

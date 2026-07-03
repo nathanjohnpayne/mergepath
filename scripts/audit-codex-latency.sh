@@ -510,6 +510,12 @@ analyze() {
         # on #629; observed shape on PRs 358/416/565).
         | select(([ $verdicts[] | select(.pr == $t.pr and .created_at > $t.created_at
                                          and .created_at < $f.at) ] | length) == 0)
+        # ...and no failure marker consumed the trigger first: a rate-limited
+        # or not-connected round produces NO finding sample — a later response
+        # belongs to a later round (4b P1 + Codex P2 on #629; symmetric with
+        # the verdict matcher, which already treats markers as consuming).
+        | select(([ $failmarkers[] | select(.pr == $t.pr and .created_at >= $t.created_at
+                                            and .created_at < $f.at) ] | length) == 0)
         | {pair:"2_trigger_to_first_finding", pr:$t.pr, round:$t.round,
            t0:$t.created_at, t1:$f.at,
            seconds:(($f.at | ts) - ($t.created_at | ts))}
@@ -527,6 +533,9 @@ analyze() {
                                          and .created_at < $f.at) ] | length) == 0)
         | select(([ $verdicts[] | select(.pr == $t.pr and .created_at > $t.created_at
                                          and .created_at < $f.at) ] | length) == 0)
+        # same failure-marker cutoff as pair 2 (4b P1 on #629).
+        | select(([ $failmarkers[] | select(.pr == $t.pr and .created_at >= $t.created_at
+                                            and .created_at < $f.at) ] | length) == 0)
         | {pair:"2b_trigger_to_first_review_response", pr:$t.pr, round:$t.round,
            t0:$t.created_at, t1:$f.at,
            seconds:(($f.at | ts) - ($t.created_at | ts))}
@@ -562,9 +571,18 @@ analyze() {
       # sha-less old-format) verdict is not the operative clearance and is
       # excluded fail-closed rather than mis-anchored (Codex P2 on #629).
       ( $prs[] | select(.merged_at != null) as $p
+        # merge-head commit record, for anchoring reaction clearances: the
+        # gate treats a 👍 older than the merge-head push as stale (its
+        # reaction_threshold is the HEAD committer date, #567/#600), so a
+        # thumbs-up on a superseded push is not the operative clearance.
+        # Fail-closed when the head commit is missing from the extract
+        # (4b P1 on #629; mirrors the sha-anchored verdict rule below).
+        | ($commits[$p.head_sha // ""] // null) as $hc
         | ([ ( $reactions[] | select(.content == "+1")
                | . as $r | select(([ $triggers[] | select(.pr == $p.pr and .comment_id == $r.comment_id) ] | length) > 0)
-               | select(.pr == $p.pr) | .created_at ),
+               | select(.pr == $p.pr)
+               | select($hc != null and (.created_at >= $hc.committer_date))
+               | .created_at ),
              ( $mverdicts[] | . as $mv
                | select($mv.pr == $p.pr and $mv.affirmative == true
                         and $mv.reviewed_sha != null

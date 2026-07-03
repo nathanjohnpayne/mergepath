@@ -14,7 +14,7 @@ Produced by the committed read-only `scripts/audit-codex-latency.sh` over 270 PR
 |---|---|---|---|---|---|
 | 1. trigger → 👀 ack | — pending reactions backfill (see below) | | | | |
 | 2. trigger → first inline finding | — pending inline-comment backfill (same run as pairs 1/4) | | | | |
-| 2b. trigger → first review response (proxy: clean or findings) | 206 | 4m42s | 13m46s | 19m57s | 30m39s |
+| 2b. trigger → first review response (proxy: clean or findings) | 197 | 4m45s | 13m51s | 21m13s | 30m39s |
 | 3. trigger → verdict comment | 100 | 3m37s | 7m6s | 10m30s | 13m50s |
 | 4. trigger → 👍 clearance | — pending reactions backfill | | | | |
 | 5. push → auto-review | 128 | 4m12s | 11m10s | 33m1s | 36m1s |

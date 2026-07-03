@@ -87,7 +87,7 @@ expect_pair() {
 # --- classification ----------------------------------------------------------
 
 n_triggers=$(jq -s '[ .[] | select(.kind == "trigger") ] | length' "$EVENTS")
-[ "$n_triggers" = "5" ] && pass "classifies 5 triggers" || fail "triggers: got $n_triggers, want 5"
+[ "$n_triggers" = "8" ] && pass "classifies 8 triggers" || fail "triggers: got $n_triggers, want 8"
 
 n_verdicts=$(jq -s '[ .[] | select(.kind == "verdict") ] | length' "$EVENTS")
 [ "$n_verdicts" = "7" ] && pass "classifies 7 verdicts (incl. sha extraction)" || fail "verdicts: got $n_verdicts, want 7"
@@ -144,7 +144,7 @@ expect_pair "pair 3: post-verdict marker tags the segment without consuming the 
   '.seconds == 600 and .rate_limited == true'
 
 expect_pair "pair 4: trigger→👍 clearance = 600s" \
-  '.pair == "4_trigger_to_thumbs_clearance"' \
+  '.pair == "4_trigger_to_thumbs_clearance" and .pr == 10' \
   '.seconds == 600'
 
 expect_pair "pair 5: push→auto-review = 1500s (verdict with no owning trigger)" \
@@ -209,6 +209,31 @@ n_pr14_gate=$(jq -s '[ .[] | select((.pair | startswith("6_clearance_to_gate")) 
 n_pr17_p6=$(jq -s '[ .[] | select((.pair | startswith("6_")) and .pr == 17) ] | length' "$PAIRS")
 [ "$n_pr17_p6" = "0" ] && pass "pair 6: stale (non-head) affirmative verdict is not a clearance" \
   || fail "PR 17 pair-6 records: got $n_pr17_p6, want 0"
+
+# PR 18: the trigger draws a not-connected marker (09:11) before the later
+# review (09:40): the marker consumes the trigger for pair 2/2b exactly as
+# it does for verdict pairing (4b P1 on #629) — no trigger-attributed
+# rows; the review re-classifies as a push-anchored auto-review.
+n_pr18_p2=$(jq -s '[ .[] | select((.pair == "2_trigger_to_first_finding"
+  or .pair == "2b_trigger_to_first_review_response") and .pr == 18) ] | length' "$PAIRS")
+[ "$n_pr18_p2" = "0" ] && pass "pair 2/2b: failure marker consumes the trigger (no pairing)" \
+  || fail "PR 18 pair-2/2b records: got $n_pr18_p2, want 0"
+expect_pair "pair 5: post-marker review re-classifies as auto-review (2400s)" \
+  '.pair == "5_push_to_auto_review" and .pr == 18' \
+  '.seconds == 2400'
+
+# PR 19: the only 👍 (08:20) predates the merge-head push (10:00) — the
+# gate treats it as stale (reaction_threshold = HEAD committer date), so
+# it is not the operative clearance and pair 6 must fail closed (4b P1).
+n_pr19_p6=$(jq -s '[ .[] | select((.pair | startswith("6_")) and .pr == 19) ] | length' "$PAIRS")
+[ "$n_pr19_p6" = "0" ] && pass "pair 6: stale (pre-head-push) 👍 reaction is not a clearance" \
+  || fail "PR 19 pair-6 records: got $n_pr19_p6, want 0"
+
+# ...and PR 20's 👍 (09:30) postdates its head push (09:00): it IS the
+# clearance — the head anchor must not over-exclude fresh reactions.
+expect_pair "pair 6: post-head-push 👍 is the operative clearance (9000s to merge)" \
+  '.pair == "6_clearance_to_merge" and .pr == 20' \
+  '.seconds == 9000'
 
 # --- events-only replay mode (reproducibility after retention) ---------------
 REPLAY="$WORKDIR/replay"

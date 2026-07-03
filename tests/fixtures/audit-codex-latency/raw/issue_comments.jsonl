@@ -12,3 +12,7 @@
 {"pr":16,"id":161,"login":"chatgpt-codex-connector[bot]","created_at":"2026-06-01T14:10:00Z","body":"Codex Review: Here are some findings.\n\nReviewed commit: jjj9999999999999999999999999999999999999"}
 {"pr":16,"id":162,"login":"chatgpt-codex-connector[bot]","created_at":"2026-06-01T14:20:00Z","body":"You have reached your Codex usage limits for code reviews."}
 {"pr":17,"id":170,"login":"chatgpt-codex-connector[bot]","created_at":"2026-06-01T14:30:00Z","body":"Codex Review: Didn't find any major issues.\n\nReviewed commit: bbb2222222222222222222222222222222222222"}
+{"pr":18,"id":180,"login":"nathanjohnpayne","created_at":"2026-06-05T09:10:00Z","body":"@codex review"}
+{"pr":18,"id":181,"login":"chatgpt-codex-connector[bot]","created_at":"2026-06-05T09:11:00Z","body":"To use Codex here, connect your GitHub account at chatgpt.com."}
+{"pr":19,"id":190,"login":"nathanjohnpayne","created_at":"2026-06-06T08:10:00Z","body":"@codex review"}
+{"pr":20,"id":200,"login":"nathanjohnpayne","created_at":"2026-06-07T09:10:00Z","body":"@codex review"}
