@@ -630,8 +630,9 @@ p4b_resolve_diff_max_bytes() {
 # needs (#636 Codex P1): trimming by size alone could silently drop a large
 # APPLICATION-CODE section and let the posted APPROVED clear a merge on code
 # no reviewer saw — only operator-declared bulk-artifact paths are ever
-# omitted. Patterns are bash `case` globs matched against the b/-side repo
-# path (`*` crosses `/`).
+# omitted. Patterns are bash `case` globs (`*` crosses `/`); a section is
+# eligible only when EVERY repo path it touches — b/-side, a/-side, and any
+# rename/copy source — matches (see p4b_trim_review_diff).
 p4b_diff_omit_globs() {
   local cfg
   if [ -n "${P4B_DIFF_OMIT_GLOBS:-}" ]; then
@@ -682,18 +683,28 @@ EOF
 # p4b_trim_review_diff <in_file> <out_file> <max_bytes> [<omit_globs>]
 # Byte-bound a unified diff for reviewer-CLI consumption. Under-budget input
 # is copied through verbatim (empty stdout). Over-budget input has its
-# largest OMISSION-ELIGIBLE per-file sections omitted — eligible means the
-# section's path matches <omit_globs> (newline-separated shell globs; see
-# p4b_diff_omit_globs) — each replaced in the output with a single
+# largest OMISSION-ELIGIBLE per-file sections omitted, each replaced in the
+# output with a single
 #   [phase-4b diff-budget: <path> omitted - oversized diff section]
 # placeholder line, and one "<path><TAB><bytes>" line per omission printed
 # on stdout for the caller's disclosure note. Returns non-zero (fail-closed)
 # when omitting every eligible section still cannot meet the budget (never
-# omits a non-allowlisted section — #636 Codex P1), or when no reviewable
-# file section survives — the caller must fall back rather than review a
-# husk or approve around unreviewed code.
+# omits a non-eligible section), or when no reviewable file section survives
+# — the caller must fall back rather than review a husk or approve around
+# unreviewed code.
+#
+# Eligible = EVERY repo path the section touches matches <omit_globs>
+# (newline-separated shell globs; see p4b_diff_omit_globs). A section touches
+# its b/-side path, its a/-side path, AND — for a rename or copy — the
+# `rename from` / `copy from` source. Checking only the b/-side (the #636
+# round-1 shape) let a large rename FROM a non-allowlisted application path
+# (`src/foo.sh`) TO an allowlisted artifact path (`docs/audits/data/foo.sh`)
+# be omitted, hiding the removal of application code while an APPROVED could
+# still post (#636 round-2 P1). Requiring the a/-side and rename source to be
+# allowlisted too fails such a section closed.
 p4b_trim_review_diff() {
-  local in="$1" out="$2" max="$3" globs="${4:-}" total sizes omit="" omitted=0 b i p
+  local in="$1" out="$2" max="$3" globs="${4:-}" total sizes omit="" projected
+  local b i bside aside rfrom plh plen
   [ -r "$in" ] || return 1
   case "$max" in ''|*[!0-9]*) return 1 ;; esac
   total="$(wc -c < "$in" | tr -d '[:space:]')"
@@ -701,32 +712,49 @@ p4b_trim_review_diff() {
     cp "$in" "$out" || return 1
     return 0
   fi
-  # Per-section sizes as "bytes<TAB>index<TAB>path", largest first. Sections
-  # are keyed by INDEX (omission never depends on path parsing; the b/-side
-  # path is used for allowlist matching and display). LC_ALL=C keeps
-  # length() byte-exact on multibyte content.
+  # Per-section metadata as "bytes<TAB>index<TAB>bside<TAB>aside<TAB>rename_from",
+  # largest first. Sections are keyed by INDEX (omission never depends on path
+  # parsing); the b/-side is the display path, and a/-side + rename source are
+  # carried so the caller can require EVERY touched path to be allowlisted.
+  # a/-side is derived by stripping the parsed " b/<bside>" suffix, so it uses
+  # the same split point as the b/-side. LC_ALL=C keeps length() byte-exact.
   sizes="$(LC_ALL=C awk '
-    /^diff --git /{ n++; hdr[n] = $0; bytes[n] = 0 }
+    /^diff --git /{ n++; hdr[n] = $0; bytes[n] = 0; rfrom[n] = "" }
     n > 0 { bytes[n] += length($0) + 1 }
+    /^rename from /{ if (n > 0 && rfrom[n] == "") rfrom[n] = substr($0, 13) }
+    /^copy from /  { if (n > 0 && rfrom[n] == "") rfrom[n] = substr($0, 11) }
     END {
       for (i = 1; i <= n; i++) {
-        p = hdr[i]
-        sub(/^diff --git a\/.* b\//, "", p)
-        printf "%d\t%d\t%s\n", bytes[i], i, p
+        b = hdr[i]; sub(/^diff --git a\/.* b\//, "", b)
+        a = hdr[i]; sub(/^diff --git a\//, "", a)
+        suf = " b/" b
+        if (substr(a, length(a) - length(suf) + 1) == suf) a = substr(a, 1, length(a) - length(suf))
+        printf "%d\t%d\t%s\t%s\t%s\n", bytes[i], i, b, a, rfrom[i]
       }
     }
   ' "$in" | sort -rn)"
   [ -n "$sizes" ] || return 1
-  while IFS=$'\t' read -r b i p; do
-    [ "$((total - omitted))" -le "$max" ] && break
-    p4b_path_matches_any_glob "$p" "$globs" || continue
-    omitted=$((omitted + b))
+  # Omit largest-first until the PROJECTED output size fits. `projected` models
+  # the exact output byte count — each omission removes the section's bytes and
+  # adds its placeholder line — so a placeholder can no longer push the final
+  # output back over budget after the loop stops (#636 round-2 P2).
+  projected="$total"
+  while IFS=$'\t' read -r b i bside aside rfrom; do
+    [ "$projected" -le "$max" ] && break
+    p4b_path_matches_any_glob "$bside" "$globs" || continue
+    p4b_path_matches_any_glob "$aside" "$globs" || continue
+    if [ -n "$rfrom" ]; then
+      p4b_path_matches_any_glob "$rfrom" "$globs" || continue
+    fi
+    plh="[phase-4b diff-budget: ${bside} omitted - oversized diff section; see the prompt note]"
+    plen="$(printf '%s\n' "$plh" | LC_ALL=C wc -c | tr -d '[:space:]')"
+    projected=$(( projected - b + plen ))
     omit="$omit $i"
-    printf '%s\t%s\n' "$p" "$b"
+    printf '%s\t%s\n' "$bside" "$b"
   done <<EOF
 $sizes
 EOF
-  [ "$((total - omitted))" -le "$max" ] || return 1
+  [ "$projected" -le "$max" ] || return 1
   LC_ALL=C awk -v omit_list="$omit" '
     BEGIN { split(omit_list, parts, " "); for (k in parts) if (parts[k] != "") omit[parts[k]] = 1 }
     /^diff --git /{

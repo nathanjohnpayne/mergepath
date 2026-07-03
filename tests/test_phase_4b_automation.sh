@@ -738,6 +738,89 @@ set -e
   && pass "trim: fails closed when no reviewable section survives the budget" \
   || fail "trim nothing-reviewable should fail (rc=$rc)"
 
+# #636 round-2 P1: a large RENAME from a non-allowlisted application path into
+# an allowlisted artifact path must fail closed — checking only the b/-side
+# would omit the section and hide the moved-away application code from review
+# while an APPROVED could still post.
+TRIM_RENAME_IN="$WORK/trim-rename-in.diff"
+{
+  printf 'diff --git a/small.js b/small.js\n+ok\n'
+  printf 'diff --git a/src/app.sh b/data/app.sh\n'
+  printf 'similarity index 40%%\nrename from src/app.sh\nrename to data/app.sh\n'
+  awk 'BEGIN { for (i = 0; i < 200; i++) printf "+MOVED-CODE-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$TRIM_RENAME_IN"
+set +e
+p4b_trim_review_diff "$TRIM_RENAME_IN" "$TRIM_OUT" 2000 'data/*' >/dev/null; rc=$?
+set -e
+[ "$rc" != 0 ] \
+  && pass "trim: rename from non-allowlisted app path into allowlist fails closed (a/-side checked, #636 P1)" \
+  || fail "trim rename-into-allowlist should fail closed (rc=$rc)"
+
+# ...and a COPY into the allowlist is caught the same way (copy from source).
+TRIM_COPY_IN="$WORK/trim-copy-in.diff"
+{
+  printf 'diff --git a/small.js b/small.js\n+ok\n'
+  printf 'diff --git a/src/lib.sh b/data/lib.sh\ncopy from src/lib.sh\ncopy to data/lib.sh\n'
+  awk 'BEGIN { for (i = 0; i < 200; i++) printf "+COPIED-CODE-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$TRIM_COPY_IN"
+set +e
+p4b_trim_review_diff "$TRIM_COPY_IN" "$TRIM_OUT" 2000 'data/*' >/dev/null; rc=$?
+set -e
+[ "$rc" != 0 ] \
+  && pass "trim: copy from non-allowlisted app path into allowlist fails closed (#636 P1)" \
+  || fail "trim copy-into-allowlist should fail closed (rc=$rc)"
+
+# ...but a rename WITHIN the allowlist (both sides + source allowlisted) is
+# still eligible and gets omitted — the guard tightens without over-blocking.
+TRIM_RENAME_OK="$WORK/trim-rename-ok.diff"
+{
+  printf 'diff --git a/small.js b/small.js\n+ok\n'
+  printf 'diff --git a/data/old.jsonl b/data/new.jsonl\nrename from data/old.jsonl\nrename to data/new.jsonl\n'
+  awk 'BEGIN { for (i = 0; i < 200; i++) printf "+DATA-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$TRIM_RENAME_OK"
+set +e
+rep="$(p4b_trim_review_diff "$TRIM_RENAME_OK" "$TRIM_OUT" 2000 'data/*')"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && printf '%s\n' "$rep" | grep -q '^data/new.jsonl' \
+   && grep -q '^\[phase-4b diff-budget: data/new.jsonl omitted' "$TRIM_OUT" \
+   && ! grep -q 'DATA-' "$TRIM_OUT"; then
+  pass "trim: rename within the allowlist stays eligible (omitted with placeholder)"
+else fail "trim rename-within-allowlist (rc=$rc, report='${rep:-}')"; fi
+
+# #636 round-2 P2: the omission loop must account for placeholder bytes.
+# Construct two allowlisted sections so that omitting only the largest gets
+# input-minus-omitted under budget, but the placeholder it adds pushes the
+# OUTPUT back over — the old size-only loop stopped there and the final
+# assertion failed (avoidable manual fallback). The fix keeps omitting.
+TRIM_P2="$WORK/trim-p2.diff"
+{
+  printf 'diff --git a/keep.js b/keep.js\n+ok\n'
+  # S1: long allowlisted path (=> long placeholder) + large body
+  printf 'diff --git a/data/very/long/artifact/path/segment/one/two/three/big.jsonl b/data/very/long/artifact/path/segment/one/two/three/big.jsonl\n'
+  awk 'BEGIN { for (i = 0; i < 120; i++) printf "+S1-%06d-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", i }'
+  # S2: medium allowlisted section, comfortably larger than the two placeholders
+  printf 'diff --git a/data/mid.jsonl b/data/mid.jsonl\n'
+  awk 'BEGIN { for (i = 0; i < 60; i++) printf "+S2-%06d-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n", i }'
+} > "$TRIM_P2"
+# Measure total and the largest section's bytes with the same accounting.
+p2_total="$(wc -c < "$TRIM_P2" | tr -d '[:space:]')"
+p2_s1="$(LC_ALL=C awk '
+  /^diff --git /{ n++; bytes[n] = 0 } n > 0 { bytes[n] += length($0) + 1 }
+  END { m = 0; for (i = 1; i <= n; i++) if (bytes[i] > m) m = bytes[i]; print m }' "$TRIM_P2")"
+# max = total - bytes(S1): the OLD loop stops after omitting S1 alone
+# (total-omitted == max), but S1's placeholder then pushes output over max.
+p2_max=$(( p2_total - p2_s1 ))
+set +e
+rep="$(p4b_trim_review_diff "$TRIM_P2" "$TRIM_OUT" "$p2_max" 'data/*')"; rc=$?
+set -e
+p2_out="$(wc -c < "$TRIM_OUT" 2>/dev/null | tr -d '[:space:]' || echo 999999999)"
+if [ "$rc" = 0 ] \
+   && [ "$p2_out" -le "$p2_max" ] \
+   && [ "$(printf '%s\n' "$rep" | grep -c .)" = "2" ]; then
+  pass "trim: placeholder-aware loop keeps omitting so a fit-able diff isn't spuriously rejected (#636 P2)"
+else fail "trim placeholder accounting (rc=$rc, out=$p2_out, max=$p2_max, omitted=$(printf '%s\n' "$rep" | grep -c .))"; fi
+
 # stderr tail: sanitized single line; empty for a missing/empty file
 ERRF="$WORK/stderr-sample.txt"
 printf 'line one\nstream error: exceeded context window\n' > "$ERRF"
