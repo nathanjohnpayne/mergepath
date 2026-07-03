@@ -410,39 +410,39 @@ export P4B_CODEX_AUTH_FILE CODEX_HOME
 # ===========================================================================
 echo "lib.sh — verdict validation (fail-closed)"
 # ===========================================================================
-if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":null}'; then
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":null,"cli_version":null}'; then
   pass "valid APPROVED accepted"; else fail "valid APPROVED rejected"; fi
-if p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P0","path":null,"line":null,"body":"y"}],"usage":null}'; then
+if p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P0","path":null,"line":null,"body":"y"}],"usage":null,"cli_version":null}'; then
   pass "valid CHANGES_REQUESTED accepted"; else fail "valid CHANGES_REQUESTED rejected"; fi
-if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[{"severity":"P2","path":"x.js","line":2,"body":"follow-up"}],"usage":null}'; then
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[{"severity":"P2","path":"x.js","line":2,"body":"follow-up"}],"usage":null,"cli_version":null}'; then
   pass "APPROVED with advisory finding accepted"; else fail "APPROVED with advisory finding rejected"; fi
-if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[{"severity":"P1","path":"x.js","line":2,"body":"blocks merge"}],"usage":null}'; then
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[{"severity":"P1","path":"x.js","line":2,"body":"blocks merge"}],"usage":null,"cli_version":null}'; then
   fail "APPROVED with blocking finding accepted"; else pass "APPROVED with blocking finding rejected"; fi
 export MERGEPATH_REVIEW_POLICY_PATH="$POLICY_P2_REQUIRED"
-if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[{"severity":"P2","path":"x.js","line":2,"body":"policy-required"}],"usage":null}'; then
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[{"severity":"P2","path":"x.js","line":2,"body":"policy-required"}],"usage":null,"cli_version":null}'; then
   fail "APPROVED with policy-required P2 finding accepted"; else pass "APPROVED with policy-required P2 finding rejected"; fi
 export MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ADDRESS_ALL"
-if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[{"severity":"P3","path":"x.js","line":2,"body":"address all"}],"usage":null}'; then
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[{"severity":"P3","path":"x.js","line":2,"body":"address all"}],"usage":null,"cli_version":null}'; then
   fail "APPROVED with address-all finding accepted"; else pass "APPROVED with address-all finding rejected"; fi
 export MERGEPATH_REVIEW_POLICY_PATH="$POLICY_BAD_FEEDBACK"
-if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":null}'; then
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":null,"cli_version":null}'; then
   fail "invalid feedback_policy mode accepted"; else pass "invalid feedback_policy mode rejected"; fi
 export MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON"
-if p4b_validate_verdict '{"verdict":"MAYBE","summary":"x","findings":[],"usage":null}'; then
+if p4b_validate_verdict '{"verdict":"MAYBE","summary":"x","findings":[],"usage":null,"cli_version":null}'; then
   fail "bogus verdict value accepted"; else pass "bogus verdict value rejected"; fi
-if p4b_validate_verdict '{"verdict":"APPROVED","findings":[],"usage":null}'; then
+if p4b_validate_verdict '{"verdict":"APPROVED","findings":[],"usage":null,"cli_version":null}'; then
   fail "missing summary accepted"; else pass "missing summary rejected"; fi
-if p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P9","body":"y"}],"usage":null}'; then
+if p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P9","body":"y"}],"usage":null,"cli_version":null}'; then
   fail "bad severity accepted"; else pass "bad severity rejected"; fi
-if p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P1","body":"y"}],"usage":null}'; then
+if p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P1","body":"y"}],"usage":null,"cli_version":null}'; then
   fail "finding missing path/line accepted"; else pass "finding missing path/line rejected"; fi
-if p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P1","path":"x.js","line":0,"body":"y"}],"usage":null}'; then
+if p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P1","path":"x.js","line":0,"body":"y"}],"usage":null,"cli_version":null}'; then
   fail "non-positive line accepted"; else pass "non-positive line rejected"; fi
 if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":null,"extra":true}'; then
   fail "top-level extra property accepted"; else pass "top-level extra property rejected"; fi
-if p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P1","path":"x.js","line":2,"body":"y","extra":true}],"usage":null}'; then
+if p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P1","path":"x.js","line":2,"body":"y","extra":true}],"usage":null,"cli_version":null}'; then
   fail "finding extra property accepted"; else pass "finding extra property rejected"; fi
-if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":120,"output_tokens":30,"cache_creation_input_tokens":null,"cache_read_input_tokens":null,"reasoning_tokens":null,"total_cost_usd":null,"source":"claude-json-envelope"}}'; then
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":120,"output_tokens":30,"cache_creation_input_tokens":null,"cache_read_input_tokens":null,"reasoning_tokens":null,"total_cost_usd":null,"source":"claude-json-envelope"},"cli_version":null}'; then
   pass "valid usage metadata accepted"; else fail "valid usage metadata rejected"; fi
 if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150}}'; then
   fail "partial usage metadata accepted"; else pass "partial usage metadata rejected"; fi
@@ -452,6 +452,13 @@ if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usa
   fail "legacy four-key usage accepted"; else pass "legacy four-key usage rejected (#632 required-complete)"; fi
 if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[]}'; then
   fail "missing usage accepted"; else pass "missing usage rejected"; fi
+# #622: cli_version follows the same required-but-nullable contract as usage.
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":null,"cli_version":"codex-cli 0.137.0"}'; then
+  pass "populated cli_version accepted"; else fail "populated cli_version rejected"; fi
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":null}'; then
+  fail "missing cli_version accepted"; else pass "missing cli_version rejected (#622 required-complete)"; fi
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":null,"cli_version":123}'; then
+  fail "non-string cli_version accepted"; else pass "non-string cli_version rejected"; fi
 if p4b_validate_verdict 'not json'; then
   fail "non-JSON accepted"; else pass "non-JSON rejected"; fi
 unset MERGEPATH_REVIEW_POLICY_PATH
@@ -530,22 +537,22 @@ done < "$FIXTURES"
 # and required-key sets. If a future edit changes the schema but not the
 # validator (or vice versa), one of these fails.
 while IFS= read -r sev; do
-  v="$(jq -nc --arg s "$sev" '{verdict:"CHANGES_REQUESTED",summary:"x",findings:[{severity:$s,path:"a",line:1,body:"b"}],usage:null}')"
+  v="$(jq -nc --arg s "$sev" '{verdict:"CHANGES_REQUESTED",summary:"x",findings:[{severity:$s,path:"a",line:1,body:"b"}],usage:null,cli_version:null}')"
   p4b_validate_verdict "$v" && pass "schema severity enum member accepted: $sev" \
     || fail "schema declares severity $sev but validator rejects it (drift)"
 done < <(jq -r '.properties.findings.items.properties.severity.enum[]' "$SCHEMA_FILE")
 for bogus in P4 PX p1 P; do
-  v="$(jq -nc --arg s "$bogus" '{verdict:"CHANGES_REQUESTED",summary:"x",findings:[{severity:$s,path:"a",line:1,body:"b"}],usage:null}')"
+  v="$(jq -nc --arg s "$bogus" '{verdict:"CHANGES_REQUESTED",summary:"x",findings:[{severity:$s,path:"a",line:1,body:"b"}],usage:null,cli_version:null}')"
   p4b_validate_verdict "$v" && fail "severity outside schema enum accepted: $bogus" \
     || pass "severity outside schema enum rejected: $bogus"
 done
 while IFS= read -r vd; do
-  v="$(jq -nc --arg v "$vd" '{verdict:$v,summary:"x",findings:[],usage:null}')"
+  v="$(jq -nc --arg v "$vd" '{verdict:$v,summary:"x",findings:[],usage:null,cli_version:null}')"
   p4b_validate_verdict "$v" && pass "schema verdict enum member accepted: $vd" \
     || fail "schema declares verdict $vd but validator rejects it (drift)"
 done < <(jq -r '.properties.verdict.enum[]' "$SCHEMA_FILE")
 while IFS= read -r key; do
-  v="$(jq -c --arg k "$key" 'del(.[$k])' <<<'{"verdict":"APPROVED","summary":"x","findings":[],"usage":null}')"
+  v="$(jq -c --arg k "$key" 'del(.[$k])' <<<'{"verdict":"APPROVED","summary":"x","findings":[],"usage":null,"cli_version":null}')"
   p4b_validate_verdict "$v" && fail "verdict missing schema-required key accepted: $key" \
     || pass "verdict missing schema-required key rejected: $key"
 done < <(jq -r '.required[]' "$SCHEMA_FILE")
@@ -556,11 +563,11 @@ done < <(jq -r '.required[]' "$SCHEMA_FILE")
 # otherwise-valid verdict is rejected.
 BAD_SCHEMA="$WORK/bad-schema.json"
 jq '.properties.verdict.enum = "APPROVED"' "$SCHEMA_FILE" > "$BAD_SCHEMA"
-if P4B_VERDICT_SCHEMA_PATH="$BAD_SCHEMA" p4b_validate_verdict '{"verdict":"APPROVED","summary":"x","findings":[],"usage":null}'; then
+if P4B_VERDICT_SCHEMA_PATH="$BAD_SCHEMA" p4b_validate_verdict '{"verdict":"APPROVED","summary":"x","findings":[],"usage":null,"cli_version":null}'; then
   fail "scalar verdict enum in a malformed schema accepted (should fail closed)"
 else pass "malformed schema (verdict enum as scalar) fails closed"; fi
 jq '.properties.findings.items.properties.severity.enum = "P1"' "$SCHEMA_FILE" > "$BAD_SCHEMA"
-if P4B_VERDICT_SCHEMA_PATH="$BAD_SCHEMA" p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P1","path":"a","line":1,"body":"b"}],"usage":null}'; then
+if P4B_VERDICT_SCHEMA_PATH="$BAD_SCHEMA" p4b_validate_verdict '{"verdict":"CHANGES_REQUESTED","summary":"x","findings":[{"severity":"P1","path":"a","line":1,"body":"b"}],"usage":null,"cli_version":null}'; then
   fail "scalar severity enum in a malformed schema accepted (should fail closed)"
 else pass "malformed schema (severity enum as scalar) fails closed"; fi
 

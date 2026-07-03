@@ -1609,6 +1609,13 @@ p4b_acct_hook_record_loop() {
   else
     effort_json="null"
   fi
+  # cli_version (#622): map the adapter envelope's own field through instead
+  # of fabricating one. VERDICT_JSON is the adapter's raw stdout — an older
+  # adapter that predates #622, or a capture failure inside the adapter,
+  # leaves the key absent/null here too; that is the honest "unavailable"
+  # value under the accounting contract, never guessed.
+  cli_version_json="$(printf '%s' "${VERDICT_JSON:-null}" | jq -c '.cli_version // null' 2>/dev/null)" \
+    || cli_version_json="null"
   # plan_auth: only recorded for a loop whose adapter actually ran to a
   # verdict — the adapters' own plan-auth gates (auth_mode=chatgpt /
   # apiProvider=firstParty) are what enforce it, so a completed verdict IS
@@ -1643,6 +1650,7 @@ p4b_acct_hook_record_loop() {
     --argjson timeout "$timeout_json" \
     --argjson effort "$effort_json" \
     --argjson plan_auth "$plan_auth_json" \
+    --argjson cli_version "$cli_version_json" \
     --argjson fc "$fc" \
     --argjson details "$details_json" '
     {
@@ -1660,7 +1668,7 @@ p4b_acct_hook_record_loop() {
         elapsed_seconds: $elapsed,
         tokens: $tokens,
         findings: $findings,
-        cli_version: null,
+        cli_version: $cli_version,
         timeout_seconds: $timeout,
         effort: $effort,
         throttle_events: null,
