@@ -664,7 +664,7 @@ fi
 if grep -Fq 'EVENT_ACTION: ${{ github.event.action }}' <<<"$auto_merge_job_block" \
   && grep -Fq 'REMOVED_LABEL: ${{ github.event.label.name }}' <<<"$auto_merge_job_block" \
   && grep -Fq '[ "${EVENT_ACTION:-}" = "unlabeled" ] && [ "${REMOVED_LABEL:-}" = "needs-external-review" ]' <<<"$auto_merge_job_block" \
-  && grep -A1 -F '"${lane_marker:-1}" = "0"' <<<"$auto_merge_job_block" | grep -Fq 'ext_required=true'; then
+  && grep -A2 -F 'if [ "${lane_marker:-1}" = "0" ]' <<<"$auto_merge_job_block" | grep -Fq 'ext_required=true'; then
   pass=$((pass + 1))
   echo "  PASS: rc=5 rate-limit branch honors the unlabeled removal event as the above-threshold signal (#620)"
 else
@@ -672,26 +672,50 @@ else
   echo "  FAIL: the rc=5 branch must override ext_required=true when EVENT_ACTION=unlabeled and REMOVED_LABEL=needs-external-review (env-indirected), else the unlabeled re-arm re-creates the stall on a CodeRabbit rate-limit (#620)" >&2
 fi
 
-# 2e-bis. The override must EXCLUDE the propagation lane's removal (Codex r7):
-# that lane removes needs-external-review as an EXEMPTION, not clearance, so
-# merge-clearance passes vacuously downstream — raising ext_required there
-# would let a CodeRabbit-rate-limited propagation PR arm auto-merge with
-# neither bot review (#512 r3 hazard). Detection mirrors
+# 2e-bis. The marker check must be UNCONDITIONAL and marker-present must
+# FORCE ext_required=false (Codex r7; widened by the automated-4b P1): the
+# propagation lane removes needs-external-review as an EXEMPTION, not
+# clearance, so merge-clearance passes vacuously downstream — and a
+# synchronize-time arming run can read the label as present while the lane
+# concurrently posts the marker and removes it, so scoping the check to the
+# unlabeled event leaves the race open. Detection mirrors
 # merge-clearance-gate.sh's lane_verified() (trusted github-actions[bot]
-# HEAD-pinned marker), and the raise must be gated on marker COUNT == 0 with
-# a fail-closed (treat-as-present) default on read error.
+# HEAD-pinned marker), fetch SPLIT from parse with lane_marker initialized
+# to 1 (fail-closed on read error, Codex r10 P1); the unlabeled raise lives
+# INSIDE the marker==0 branch and the else branch forces false.
 if grep -Fq 'mergepath-propagation-lane verified-head=' <<<"$auto_merge_job_block" \
   && grep -Fq 'github-actions[bot]' <<<"$auto_merge_job_block" \
   && grep -Fq 'HEAD_SHA: ${{ github.event.pull_request.head.sha }}' <<<"$auto_merge_job_block" \
   && grep -Fq 'lane_marker=1' <<<"$auto_merge_job_block" \
   && grep -Fq 'if lane_comments=$(gh api' <<<"$auto_merge_job_block" \
   && grep -Fq 'echo 1' <<<"$auto_merge_job_block" \
-  && grep -A1 -F '"${lane_marker:-1}" = "0"' <<<"$auto_merge_job_block" | grep -Fq 'ext_required=true'; then
+  && grep -A5 -F 'if [ "${lane_marker:-1}" = "0" ]' <<<"$auto_merge_job_block" | grep -Fq 'ext_required=false' \
+  && awk '
+       index($0, "if lane_comments=$(gh api") && !m {m=NR}
+       index($0, "\"${EVENT_ACTION:-}\" = \"unlabeled\"") && !e {e=NR}
+       END {exit (m && e && m < e) ? 0 : 1}
+     ' <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: rc=5 override excludes the propagation lane's exemption removal via the HEAD-pinned marker, fail-closed (#620)"
+  echo "  PASS: rc=5 marker check is unconditional and marker-present forces ext_required=false, fail-closed (#620)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the rc=5 ext_required override must be gated on the absence of the trusted propagation lane marker for the current head (lane_verified() contract), with the fetch SPLIT from the parse and lane_marker initialized to 1 so a comments-API failure keeps the no-raise default (Codex r10 P1) (#620)" >&2
+  echo "  FAIL: the rc=5 lane-marker check must run on EVERY path (not only unlabeled), force ext_required=false when the marker is present or unreadable, and keep the split fetch/parse fail-closed shape (Codex r7/r10, automated-4b P1) (#620)" >&2
+fi
+
+# 2e-ter. The rc=5-time marker check can race the lane (marker posted moments
+# after the label read): the downgrade path must record itself
+# (CR_RATE_LIMIT_DOWNGRADED via GITHUB_ENV) and the FINAL blocking-label
+# re-verify must re-check the marker and abort when it is present or
+# unreadable (automated-4b P1 residual window).
+if grep -Fq 'echo "CR_RATE_LIMIT_DOWNGRADED=true" >> "$GITHUB_ENV"' <<<"$auto_merge_job_block" \
+  && grep -Fq '"${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true"' <<<"$auto_merge_job_block" \
+  && grep -A4 -F '"${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true"' <<<"$auto_merge_job_block" | grep -Fq 'lane_comments=$(gh api' \
+  && grep -A2 -F 'if [ "${lane_marker:-1}" != "0" ]' <<<"$auto_merge_job_block" | grep -Fq 'exit 1'; then
+  pass=$((pass + 1))
+  echo "  PASS: rc=5 downgrade records itself and the final re-verify re-checks the marker, aborting fail-closed (#620)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: the rc=5 downgrade must set CR_RATE_LIMIT_DOWNGRADED in GITHUB_ENV and the final blocking-label re-verify must re-run the marker check and exit 1 when the marker is present or unreadable (automated-4b P1) (#620)" >&2
 fi
 
 # 2f. pr-review-policy's propagation lane removes needs-external-review; that

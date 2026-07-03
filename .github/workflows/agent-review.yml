@@ -847,39 +847,53 @@ jobs:
               # non-vacuously on this PR and the current-head required-check
               # wait still gates the actual merge.
               #
-              # #620 (Codex r7): EXCEPT when the removal was the propagation
-              # lane's — that lane removes the label as an EXEMPTION, not as
-              # clearance (pr-review-policy.yml), so merge-clearance passes
-              # vacuously downstream and CodeRabbit was the only bot eye;
-              # proceeding would arm auto-merge with neither bot review (the
-              # #512 r3 hazard). The lane is detected by its HEAD-pinned
-              # trusted marker — contract shared with pr-review-policy.yml
-              # and merge-clearance-gate.sh's lane_verified(): keep the
+              # #620 (Codex r7): EXCEPT when the head carries the propagation
+              # lane's verified-head marker — that lane removes the label as
+              # an EXEMPTION, not as clearance (pr-review-policy.yml), so
+              # merge-clearance passes vacuously downstream and CodeRabbit
+              # was the only bot eye; proceeding would arm auto-merge with
+              # neither bot review (the #512 r3 hazard). The marker check is
+              # UNCONDITIONAL, not scoped to the unlabeled event (automated
+              # 4b P1): a synchronize/reopened/approval arming run can read
+              # the label as present here while the lane concurrently posts
+              # the marker and removes the label before the later re-verify —
+              # so a marker on this head forces ext_required=false regardless
+              # of the current label. Marker contract is shared with
+              # pr-review-policy.yml and merge-clearance-gate.sh's
+              # lane_verified(): keep the
               # `mergepath-propagation-lane verified-head=<sha>` form in
               # sync. The lane posts the marker BEFORE removing the label
               # (ordering pinned by check_workflow_parsers), so the marker
-              # exists before any unlabeled run the removal fires. Fail-closed:
-              # if the marker read errors, treat it as present (no raise →
-              # block), so an API hiccup never lets a rate-limited PR
-              # through.
-              if [ "${EVENT_ACTION:-}" = "unlabeled" ] && [ "${REMOVED_LABEL:-}" = "needs-external-review" ]; then
-                # Fetch and parse are SPLIT (Codex r10 P1): in a pipeline,
-                # a failed gh with empty output leaves jq -s slurping empty
-                # input into [] → length 0 → exit 0, so the || fallback
-                # never fires and a comments-API failure would read as
-                # "no marker" and raise. Initialized to 1 (marker-present)
-                # so gh failure, jq failure, and non-numeric garbage all
-                # keep the no-raise fail-closed default.
-                lane_marker=1
-                if lane_comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null); then
-                  lane_marker=$(jq -s --arg head "$HEAD_SHA" '[add // [] | .[] | select((.user.login == "github-actions[bot]") and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))] | length' <<<"$lane_comments" 2>/dev/null || echo 1)
-                fi
-                if [ "${lane_marker:-1}" = "0" ]; then
+              # exists before any unlabeled run the removal fires; the
+              # residual window where the marker lands only AFTER this read
+              # is closed by the downgrade re-check in the final
+              # blocking-label re-verify step. Fail-closed: a marker-read
+              # error counts as marker-present (forces false → block), so an
+              # API hiccup never lets a rate-limited PR through.
+              #
+              # Fetch and parse are SPLIT (Codex r10 P1): in a pipeline, a
+              # failed gh with empty output leaves jq -s slurping empty
+              # input into [] → length 0 → exit 0, so the || fallback never
+              # fires and a comments-API failure would read as "no marker".
+              # Initialized to 1 (marker-present) so gh failure, jq failure,
+              # and non-numeric garbage all keep the fail-closed default.
+              lane_marker=1
+              if lane_comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null); then
+                lane_marker=$(jq -s --arg head "$HEAD_SHA" '[add // [] | .[] | select((.user.login == "github-actions[bot]") and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))] | length' <<<"$lane_comments" 2>/dev/null || echo 1)
+              fi
+              if [ "${lane_marker:-1}" = "0" ]; then
+                if [ "${EVENT_ACTION:-}" = "unlabeled" ] && [ "${REMOVED_LABEL:-}" = "needs-external-review" ]; then
                   ext_required=true
                 fi
+              else
+                ext_required=false
               fi
               if bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_required"; then
                 echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged on an above-threshold PR — proceeding. merge-clearance's external-review gate blocks the merge until Codex/external clearance lands."
+                # Record the downgrade for the final re-verify step: a
+                # propagation marker that lands AFTER the check above must
+                # abort the merge (automated 4b P1 residual window).
+                echo "CR_RATE_LIMIT_DOWNGRADED=true" >> "$GITHUB_ENV"
               else
                 echo "::error::CodeRabbit rate-limit retry budget exhausted — blocking auto-merge. Either the failover did not engage (codex_failover_requested=false) or the PR is under-threshold (no downstream Codex gate, so it must not auto-merge bot-unreviewed). Human must re-trigger or merge manually."
                 exit 1
@@ -982,6 +996,8 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           LABELS=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name')
           printf 'Labels after test wait:\n%s\n' "$LABELS"
@@ -991,6 +1007,24 @@ jobs:
               exit 1
             fi
           done
+          # #620 (automated 4b P1): if this run downgraded a CodeRabbit
+          # rate-limit stall (rc=5), re-check the propagation-lane marker at
+          # the last verify point. The rc=5-time check can race the lane —
+          # label read as present, marker posted moments later — and a marker
+          # on this head means merge-clearance exempts it (vacuous), so the
+          # downgrade's premise (a downstream gate blocks until external
+          # clearance) is false: neither bot has reviewed. Fail closed: a
+          # marker-read error counts as marker-present and aborts.
+          if [ "${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true" ]; then
+            lane_marker=1
+            if lane_comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null); then
+              lane_marker=$(jq -s --arg head "$HEAD_SHA" '[add // [] | .[] | select((.user.login == "github-actions[bot]") and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))] | length' <<<"$lane_comments" 2>/dev/null || echo 1)
+            fi
+            if [ "${lane_marker:-1}" != "0" ]; then
+              echo "::error::Propagation-lane marker present (or unreadable) for $HEAD_SHA after an rc=5 rate-limit downgrade — merge-clearance would exempt this head with neither bot review. Aborting auto-merge."
+              exit 1
+            fi
+          fi
           echo "No blocking labels present after test wait — proceeding to merge."
 
       - name: Enable auto-merge

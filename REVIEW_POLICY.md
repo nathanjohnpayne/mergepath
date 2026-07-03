@@ -637,11 +637,12 @@ auto-clear removes moments later. Triage deliberately does not run on
 job accepts a skipped triage result on that path only; and because
 the `needs-external-review` removal IS the trigger there, the
 CodeRabbit rate-limit branch derives external-review applicability
-from the removal event rather than the now-absent label — except when
-the current head carries the propagation lane's trusted verified-head
-marker: that lane removes the label as an exemption, not clearance,
-so a CodeRabbit rate-limit stall keeps blocking there (neither bot
-has reviewed such a PR, and merge clearance passes vacuously). Label
+from the removal event rather than the now-absent label. A trusted
+verified-head propagation marker on the current head always blocks
+the rate-limit downgrade — on every arming path, not just unlabeled,
+and re-checked just before merge — because that lane removes the
+label as an exemption, not clearance: merge clearance passes
+vacuously and neither bot has reviewed such a PR. Label
 removals fire this trigger only when performed with a PAT —
 GITHUB_TOKEN-driven events create no workflow runs (#315/#324) — so
 `auto-clear-blocking-labels.yml` and `pr-review-policy.yml`'s
