@@ -64,11 +64,12 @@
 #          ages out of the window.
 #      See codex-review-check.sh for the iteration history behind this
 #      design and the residual hole it does NOT fully close.
-#   3. Scans existing reviews, inline comments, and issue reactions for
-#      a Codex signal already present on the current HEAD. If found,
-#      skips the trigger comment and goes straight to emitting JSON —
-#      re-posting `@codex review` when Codex has already responded can
-#      cause double-processing or rate-limit pushback.
+#   3. Scans existing reviews, inline comments, issue reactions, and issue
+#      comments (for a HEAD-anchored verdict, #609) for a Codex signal
+#      already present on the current HEAD. If found, skips the trigger
+#      comment and goes straight to emitting JSON — re-posting `@codex
+#      review` when Codex has already responded can cause double-processing
+#      or rate-limit pushback.
 #   4. Otherwise posts `@codex review` as a PR comment, waits a short
 #      bounded window for Codex's documented `eyes` acknowledgment on
 #      that trigger comment, and re-posts the trigger up to
@@ -76,10 +77,14 @@
 #      acknowledgment is never treated as clearance.
 #   5. Polls every 15 seconds for up to `review_timeout_seconds`
 #      measured from the latest trigger comment, while accepting a
-#      terminal response to any trigger posted in this run, for either:
+#      terminal response to any trigger posted in this run, for any of:
 #        - a review from the Codex bot on the current HEAD, OR
 #        - a +1 reaction from the Codex bot on the PR issue dated after
-#          the current HEAD committer date.
+#          the current HEAD committer date, OR
+#        - a HEAD-anchored Codex issue-comment verdict ("Codex Review:
+#          Didn't find any major issues" + "Reviewed commit: <sha>") of
+#          EITHER disposition — a non-affirmative verdict still ends the
+#          poll (it is a real response), it just does not clear (#609).
 #   6. Emits a JSON object to stdout summarizing what Codex produced.
 #      The JSON shape is the contract with the caller; do not change
 #      field names without also updating scripts/codex-review-check.sh
@@ -113,6 +118,16 @@
 #       "created_at": "<iso-8601>",
 #       "reaction_id": N
 #     },
+#     "verdict": null | {
+#       "created_at": "<iso-8601>",
+#       "affirmative": true | false
+#     },
+#     # HEAD-anchored Codex issue-comment verdict (#600/#567), recognized by
+#     # this poller as of #609. "affirmative" mirrors codex-review-check.sh's
+#     # CODEX_HEAD_VERDICT_TIME matcher: true only for the stable "Codex
+#     # Review: Didn't find any major issues" phrasing. A non-null,
+#     # non-affirmative verdict is still a real Codex response (has_signal
+#     # true) but does not clear (has_cleared_signal false) — fails closed.
 #     "trigger_posted": true | false,
 #     "trigger_requested": true | false,
 #     "rounds_waited_seconds": N
@@ -444,6 +459,7 @@ if ! should_request_codex; then
       review: null,
       findings: [],
       reaction: null,
+      verdict: null,
       trigger_posted: false,
       trigger_requested: false,
       rounds_waited_seconds: 0
@@ -523,11 +539,12 @@ log "ack_wait = ${ACK_WAIT_SECONDS}s    max_ack_retries = $MAX_ACK_RETRIES"
 # success. Emits empty object { "review": null, "findings": [], "reaction": null }
 # if nothing matches yet.
 scan_codex_state() {
-  local reviews comments reactions review findings reaction
+  local reviews comments reactions issue_comments review findings reaction verdict
 
   reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
   comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
   reactions=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/reactions" "reactions")
+  issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
 
   # Latest review from the Codex bot on the current HEAD commit, if any.
   # Codex always uses COMMENTED state regardless of findings. We also
@@ -604,27 +621,61 @@ scan_codex_state() {
       end
   ')
 
-  jq -n --argjson review "$review" --argjson findings "$findings" --argjson reaction "$reaction" '
-    { review: $review, findings: $findings, reaction: $reaction }
+  # HEAD-anchored Codex issue-comment verdict (#600/#567/#608, mirrored here
+  # per #609). Codex can clear a round purely via this "Codex Review: Didn't
+  # find any major issues" + "Reviewed commit: <sha>" ISSUE comment, with no
+  # review object and no fresh reaction — codex-review-check.sh (the merge
+  # gate) has recognized this since #600, but until #609 this poller did not,
+  # so a verdict-only response ran the poll to timeout (exit 4) instead of
+  # terminating on it. Select the LATEST HEAD-anchored verdict FIRST (any
+  # disposition), THEN check whether that latest one is affirmative — so a
+  # newer non-affirmative verdict on the same HEAD supersedes an older clean
+  # one and fails closed (same #608 P1 shape as the merge gate). KEEP THIS
+  # FILTER IN SYNC with CODEX_VERDICT_JSON in scripts/codex-review-check.sh.
+  verdict=$(echo "$issue_comments" | jq -c \
+    --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
+    ($sha | ascii_downcase) as $head
+    | [ .[]
+        | select(.user.login == $bot)
+        | . as $c
+        | ( [ $c.body
+              | ascii_downcase
+              | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
+              | .[0]
+            ] ) as $shas
+        | select( ($shas | length) > 0
+                  and ($shas | any(. as $s | $head | startswith($s))) )
+        | { created_at: .created_at,
+            affirmative: (.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b")) }
+      ]
+    | max_by(.created_at) // null
+  ')
+
+  jq -n --argjson review "$review" --argjson findings "$findings" --argjson reaction "$reaction" --argjson verdict "$verdict" '
+    { review: $review, findings: $findings, reaction: $reaction, verdict: $verdict }
   '
 }
 
-# Returns 0 iff the scan produced ANY signal (review or reaction).
-# Used by the poll loop, which stops as soon as Codex has produced
-# any response — even a review with P0/P1 findings counts because
-# the caller will then process the findings and decide what to do.
+# Returns 0 iff the scan produced ANY signal (review, reaction, or
+# HEAD-anchored issue-comment verdict). Used by the poll loop, which stops
+# as soon as Codex has produced any response — even a review with P0/P1
+# findings, or a non-affirmative verdict, counts because the caller will
+# then process the response and decide what to do (#609: a verdict-only
+# response must end the poll instead of running to timeout).
 has_signal() {
   local scan=$1
-  [ "$(echo "$scan" | jq -r '.review != null or .reaction != null')" = "true" ]
+  [ "$(echo "$scan" | jq -r '.review != null or .reaction != null or .verdict != null')" = "true" ]
 }
 
 # Returns 0 iff the scan produced a signal that should be treated as
-# CLEARED (no further @codex review trigger needed). Cleared means
-# EITHER:
+# CLEARED (no further @codex review trigger needed). Cleared means one of:
 #   - any +1 reaction on the PR issue (the no-findings happy path), OR
 #   - a review on HEAD with zero blocking (required-tier) inline findings
 #     (the reviewed-and-clean path; "blocking" reflects the resolved
-#     feedback_policy required set, so this is P0/P1 by default)
+#     feedback_policy required set, so this is P0/P1 by default), OR
+#   - a HEAD-anchored AFFIRMATIVE issue-comment verdict AND zero blocking
+#     findings on HEAD (#600/#609) — a NON-affirmative latest verdict does
+#     NOT clear (fails closed, mirroring #608 P1 on codex-review-check.sh).
 #
 # A review with blocking findings does NOT count as cleared — the caller
 # may have replied to the findings with a rebuttal and want Codex to
@@ -637,40 +688,41 @@ has_signal() {
 # #73 during dry-run C.
 has_cleared_signal() {
   local scan=$1
-  # Latest-signal-wins: when both a reaction and a review exist on
-  # HEAD, the more recent one is authoritative. Otherwise an older
-  # 👍 from a prior round can mask a later P1-bearing review and
-  # skip a needed retrigger. nathanpayne-codex caught this on
-  # nathanpaynedotcom propagation PR #180 round 2 — same shape as
-  # PR #65 round 1's gate (c) latest-state rule on
-  # codex-review-check.sh.
-  #
-  # Cleared iff EITHER:
-  #   - reaction exists AND (review is null OR reaction is newer
-  #     than review), OR
-  #   - review exists AND review is newer than (or only signal vs)
-  #     reaction AND review has zero blocking findings (the findings
-  #     array is already scoped to the latest review's id by the
-  #     pull_request_review_id filter in scan_codex_state)
+  # Latest-signal-wins among THREE signal types — 👍 reaction, COMMENTED
+  # review, and issue-comment verdict — not whichever this function checks
+  # first (#64, extended for the verdict in #609, mirroring the merge gate's
+  # #600/#608 LATEST_SIGNAL_KIND decision in codex-review-check.sh). An older
+  # 👍 or clean review must not mask a NEWER negative verdict, and a stale
+  # verdict must not override a newer P1-bearing review — nathanpayne-codex
+  # caught the two-way version of this bug on nathanpaynedotcom propagation
+  # PR #180 round 2 (same shape as PR #65 round 1's gate (c) latest-state
+  # rule). Ties resolve reaction < review < verdict (iteration order,
+  # replace-on->=), matching the merge gate's tie-break so an ambiguous
+  # same-second tie fails closed when the verdict is negative.
   [ "$(echo "$scan" | jq -r '
     def review_time: if .review == null then "" else .review.submitted_at end;
     def reaction_time: if .reaction == null then "" else .reaction.created_at end;
+    def verdict_time: if .verdict == null then "" else .verdict.created_at end;
     # P0 ALWAYS blocks clearance (the absent-policy disposition default is
     # P0/P1), regardless of the resolved gate set — otherwise a consumer with
     # no feedback_policy block (resolve_required_tiers -> {p1}) would emit a
     # P0-only review as blocking:false and prematurely clear it, skipping the
     # re-request (Codex P2 round 2 on #590). On top of the always-blocking P0,
     # anything in the resolved `required` set (the `blocking` flag) also blocks.
+    # findings is already HEAD-scoped (scan_codex_state), independent of
+    # which signal is latest, so it gates the verdict path too.
     def review_clean: ([.findings[] | select(.priority == "P0" or .blocking == true)] | length) == 0;
 
-    if .reaction == null and .review == null then "false"
-    elif .reaction != null and .review == null then "true"
-    elif .reaction == null and .review != null then
-      (review_clean | tostring)
-    elif (reaction_time > review_time) then "true"
-    else
-      (review_clean | tostring)
-    end
+    ( reduce ( [["reaction", reaction_time], ["review", review_time], ["verdict", verdict_time]] | .[] ) as $sig
+        ({kind: "", time: ""};
+         if ($sig[1] != "" and ($sig[1] >= .time)) then {kind: $sig[0], time: $sig[1]} else . end)
+    ) as $latest
+    | if $latest.kind == "reaction" then "true"
+      elif $latest.kind == "review" then (review_clean | tostring)
+      elif $latest.kind == "verdict" then
+        ((.verdict.affirmative == true and review_clean) | tostring)
+      else "false"
+      end
   ')" = "true" ]
 }
 
@@ -689,7 +741,8 @@ has_post_trigger_signal() {
   local after=${TRIGGER_SIGNAL_THRESHOLD:-$TRIGGER_POST_TIME}
   [ "$(echo "$scan" | jq -r --arg after "$after" '
     ((.review != null and .review.submitted_at >= $after)
-     or (.reaction != null and .reaction.created_at >= $after))
+     or (.reaction != null and .reaction.created_at >= $after)
+     or (.verdict != null and .verdict.created_at >= $after))
   ')" = "true" ]
 }
 
@@ -936,7 +989,7 @@ TRIGGER_POST_TIME=""
 TRIGGER_SIGNAL_THRESHOLD=""
 
 if has_cleared_signal "$INITIAL_SCAN"; then
-  log "Codex has already cleared on HEAD (reaction or no-blocking-tier review) — skipping trigger comment"
+  log "Codex has already cleared on HEAD (reaction, no-blocking-tier review, or affirmative verdict comment) — skipping trigger comment"
 elif [ "$TRIGGER_ONLY" = "true" ] && existing_codex_trigger_on_head; then
   log "trigger-only: @codex review already requested on HEAD — skipping duplicate trigger (idempotent, #489)"
 else
@@ -967,6 +1020,7 @@ if [ "$TRIGGER_ONLY" = "true" ]; then
       review: null,
       findings: [],
       reaction: null,
+      verdict: null,
       trigger_posted: $trigger_posted,
       trigger_requested: true,
       trigger_only: true,
@@ -979,7 +1033,7 @@ if [ "$TRIGGER_POSTED" = "true" ]; then
   # We just posted a trigger. The INITIAL_SCAN data is now stale by
   # definition — Codex will respond with something new. Skip the
   # initial has_signal check; force the loop to actually poll.
-  FINAL_SCAN='{"review":null,"findings":[],"reaction":null}'
+  FINAL_SCAN='{"review":null,"findings":[],"reaction":null,"verdict":null}'
   run_trigger_ack_gate
 else
   FINAL_SCAN=$INITIAL_SCAN
@@ -1045,6 +1099,7 @@ jq -n \
     review: $scan.review,
     findings: $scan.findings,
     reaction: $scan.reaction,
+    verdict: $scan.verdict,
     trigger_posted: $trigger_posted,
     trigger_requested: true,
     rounds_waited_seconds: $elapsed

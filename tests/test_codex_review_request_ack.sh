@@ -142,6 +142,9 @@ case "$endpoint" in
       printf '[]\n'
     fi
     ;;
+  repos/owner/repo/issues/999/comments)
+    printf '[]\n'
+    ;;
   repos/owner/repo/issues/comments/*/reactions)
     printf '%s\n' "$endpoint" >>"$state_dir/ack-endpoints"
     comment_id=${endpoint#repos/owner/repo/issues/comments/}

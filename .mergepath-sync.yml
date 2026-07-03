@@ -646,6 +646,13 @@ paths:
   - path: tests/test_codex_review_request_entry.sh
     type: canonical
     consumers: all
+  # HEAD-anchored Codex issue-comment verdict recognition in the request
+  # poller (#609). check_codex_scripts hard-runs it (same `No such file`
+  # exit-127 coupling class as the ack suite above), so it must travel to
+  # every consumer.
+  - path: tests/test_codex_review_request_verdict.sh
+    type: canonical
+    consumers: all
   # Resolution-aware gate (c) regression (#460 Option B). check_codex_scripts
   # (scripts/ci kit) hard-runs it, so it must travel to every consumer.
   - path: tests/test_codex_review_check_resolution.sh
@@ -1022,6 +1029,7 @@ paths:
       - "tests/test_codex_review_request_ack.sh"  # check_codex_scripts
       - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)
       - "tests/test_codex_review_request_entry.sh"  # check_codex_scripts (#486)
+      - "tests/test_codex_review_request_verdict.sh"  # check_codex_scripts (#609)
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
       - "tests/test_codex_review_check_verdict.sh"  # check_codex_scripts (#600/#567)
       - "tests/test_465_fail_closed.sh"        # check_codex_scripts (#465)

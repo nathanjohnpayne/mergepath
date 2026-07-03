@@ -73,6 +73,7 @@ case "$endpoint" in
   repos/owner/repo/pulls/999/reviews)        printf '[]\n' ;;
   repos/owner/repo/pulls/999/comments)       printf '[]\n' ;;
   repos/owner/repo/issues/999/reactions)     printf '[]\n' ;;
+  repos/owner/repo/issues/999/comments)      printf '[]\n' ;;
   repos/owner/repo/issues/comments/*/reactions) printf '[]\n' ;;
   repos/owner/repo/issues/comments/*)        printf '%s\n' "$now" ;;
   *) echo "unexpected gh api endpoint: $endpoint" >&2; exit 99 ;;
