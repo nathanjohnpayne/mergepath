@@ -375,20 +375,22 @@ jobs:
           # don't re-comment; a faithful re-push to a NEW head posts a fresh
           # marker; a DIVERGED push never reaches this step (propagation_lane
           # is false), so no marker is ever posted for an unverified head.
-          # Marker contract is shared with merge-clearance-gate.sh and
-          # agent-review.yml's rc=5 propagation-exemption exclusion (#620) —
-          # keep the `mergepath-propagation-lane verified-head=<sha>` form
-          # in sync.
+          # Marker contract is shared with merge-clearance-gate.sh
+          # (lane_verified(), also consumed indirectly by agent-review.yml's
+          # rc=5 branch via --derive-external-requiredness, #620) — keep the
+          # `mergepath-propagation-lane verified-head=<sha>` form in sync.
           #
           # ORDER MATTERS (#620 Codex r9): the marker MUST be posted before
           # the label removal below. The removal fires agent-review.yml's
-          # unlabeled re-arm, whose rc=5 branch reads this marker to tell
-          # exemption apart from clearance — marker-after-removal would open
-          # a window where the re-arm treats the exemption as ordinary
-          # external clearance. Marker-then-removal is safe in the failure
-          # direction: if the marker posts and the removal then fails, the
-          # still-present label keeps merge-clearance-gate blocking (a
-          # present label is never subject to the propagation exemption).
+          # unlabeled re-arm, whose rc=5 branch derives external
+          # requiredness via merge-clearance-gate.sh — whose lane_verified()
+          # reads this marker to tell exemption apart from clearance.
+          # Marker-after-removal would open a window where that derivation
+          # treats the exemption as an ordinary above-threshold arm.
+          # Marker-then-removal is safe in the failure direction: if the
+          # marker posts and the removal then fails, the still-present label
+          # keeps merge-clearance-gate blocking (a present label is never
+          # subject to the propagation exemption).
           MARKER="<!-- mergepath-propagation-lane verified-head=$HEAD_SHA -->"
           ALREADY=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -F "$MARKER" || true)
           if [ -z "$ALREADY" ]; then

@@ -654,74 +654,49 @@ else
 fi
 
 # 2e. The rc=5 CodeRabbit rate-limit branch derives external-review
-# applicability for coderabbit-automerge-rate-limit-gate.sh; on the unlabeled
-# re-arm path the blocking label is absent by construction (its removal IS
-# the trigger), so without a removal-event override an above-threshold,
-# externally-cleared PR misclassifies as under-threshold and the rate-limit
-# gate re-creates the clean-but-unmerged stall (#620 Codex r4). The override
-# must be env-indirected (EVENT_ACTION / REMOVED_LABEL), not interpolated
-# into the run: block.
-if grep -Fq 'EVENT_ACTION: ${{ github.event.action }}' <<<"$auto_merge_job_block" \
-  && grep -Fq 'REMOVED_LABEL: ${{ github.event.label.name }}' <<<"$auto_merge_job_block" \
-  && grep -Fq '[ "${EVENT_ACTION:-}" = "unlabeled" ] && [ "${REMOVED_LABEL:-}" = "needs-external-review" ]' <<<"$auto_merge_job_block" \
-  && grep -A2 -F 'if [ "${lane_marker:-1}" = "0" ]' <<<"$auto_merge_job_block" | grep -Fq 'ext_required=true'; then
+# applicability for coderabbit-automerge-rate-limit-gate.sh by asking
+# merge-clearance-gate.sh ITSELF (--derive-external-requiredness): the same
+# intrinsic threshold/protected-paths computation the required check runs,
+# with the label as force-on and the propagation lane's HEAD-pinned marker
+# as the exemption, evaluated on the LIVE head. Label-event proxies
+# (current-label reads, unlabeled-removal overrides, workflow-local marker
+# greps) were rejected across five review rounds — a label event is not
+# head-pinned proof of a downstream gate (#620 4a r4-r10, 4b r1-r3).
+# ext_required initializes false and only a clean `true`/`false` from the
+# query is accepted (fail-closed on error or garbage).
+if grep -Fq 'ext_required=false' <<<"$auto_merge_job_block" \
+  && grep -Fq -- 'merge-clearance-gate.sh --derive-external-requiredness' <<<"$auto_merge_job_block" \
+  && grep -A2 -F 'if req=$(bash scripts/merge-clearance-gate.sh --derive-external-requiredness "$PR_NUMBER" "$REPO"); then' <<<"$auto_merge_job_block" | grep -Fq 'true|false) ext_required=$req' \
+  && ! grep -Fq "any(.labels[]; .name==\"needs-external-review\")" <<<"$auto_merge_job_block" \
+  && ! grep -Fq 'EVENT_ACTION' <<<"$auto_merge_job_block" \
+  && ! grep -Fq 'mergepath-propagation-lane verified-head=' <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: rc=5 rate-limit branch honors the unlabeled removal event as the above-threshold signal (#620)"
+  echo "  PASS: rc=5 derives ext_required from merge-clearance-gate.sh requiredness (live head, fail-closed), with no label/marker proxies left (#620)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the rc=5 branch must override ext_required=true when EVENT_ACTION=unlabeled and REMOVED_LABEL=needs-external-review (env-indirected), else the unlabeled re-arm re-creates the stall on a CodeRabbit rate-limit (#620)" >&2
+  echo "  FAIL: the rc=5 branch must derive ext_required via scripts/merge-clearance-gate.sh --derive-external-requiredness (init false, accept only literal true/false) and must not read labels, unlabeled events, or lane markers directly (#620)" >&2
 fi
 
-# 2e-bis. The marker check must be UNCONDITIONAL and marker-present must
-# FORCE ext_required=false (Codex r7; widened by the automated-4b P1): the
-# propagation lane removes needs-external-review as an EXEMPTION, not
-# clearance, so merge-clearance passes vacuously downstream — and a
-# synchronize-time arming run can read the label as present while the lane
-# concurrently posts the marker and removes it, so scoping the check to the
-# unlabeled event leaves the race open. Detection mirrors
-# merge-clearance-gate.sh's lane_verified() (trusted github-actions[bot]
-# HEAD-pinned marker), fetch SPLIT from parse with lane_marker initialized
-# to 1 (fail-closed on read error, Codex r10 P1); the unlabeled raise lives
-# INSIDE the marker==0 branch and the else branch forces false.
-if grep -Fq 'mergepath-propagation-lane verified-head=' <<<"$auto_merge_job_block" \
-  && grep -Fq 'github-actions[bot]' <<<"$auto_merge_job_block" \
-  && grep -Fq 'HEAD_SHA: ${{ github.event.pull_request.head.sha }}' <<<"$auto_merge_job_block" \
-  && grep -Fq 'lane_marker=1' <<<"$auto_merge_job_block" \
-  && grep -Fq 'if lane_comments=$(gh api' <<<"$auto_merge_job_block" \
-  && grep -Fq 'echo 1' <<<"$auto_merge_job_block" \
-  && grep -A5 -F 'if [ "${lane_marker:-1}" = "0" ]' <<<"$auto_merge_job_block" | grep -Fq 'ext_required=false' \
-  && awk '
-       index($0, "if lane_comments=$(gh api") && !m {m=NR}
-       index($0, "\"${EVENT_ACTION:-}\" = \"unlabeled\"") && !e {e=NR}
-       END {exit (m && e && m < e) ? 0 : 1}
-     ' <<<"$auto_merge_job_block"; then
-  pass=$((pass + 1))
-  echo "  PASS: rc=5 marker check is unconditional and marker-present forces ext_required=false, fail-closed (#620)"
-else
-  fail=$((fail + 1))
-  echo "  FAIL: the rc=5 lane-marker check must run on EVERY path (not only unlabeled), force ext_required=false when the marker is present or unreadable, and keep the split fetch/parse fail-closed shape (Codex r7/r10, automated-4b P1) (#620)" >&2
-fi
-
-# 2e-ter. The rc=5-time marker check can race the lane (marker posted moments
-# after the label read): the downgrade path must record itself
-# (CR_RATE_LIMIT_DOWNGRADED via GITHUB_ENV) and the FINAL blocking-label
-# re-verify must re-check the marker and abort when it is present or
-# unreadable (automated-4b round-1 P1). The re-check must anchor
-# CURRENT_HEAD_SHA — the live head the merge pins via --match-head-commit —
-# and abort on head drift, NOT the workflow event's payload SHA: a push
-# during the waits moves the merge head and a marker for the new head would
-# be invisible to a payload-SHA grep (automated-4b round-2 P1).
+# 2e-bis. The rc=5-time derivation runs minutes before the merge and state
+# can change during the waits (a push, a propagation-lane verification
+# landing): the downgrade path must record itself (CR_RATE_LIMIT_DOWNGRADED
+# via GITHUB_ENV) and the FINAL blocking-label re-verify must abort on head
+# drift (the downgrade anchored the event head; the merge pins
+# CURRENT_HEAD_SHA via --match-head-commit) and RE-RUN the requiredness
+# derivation, requiring literal `true` (automated-4b P1 rounds 1+2).
 if grep -Fq 'echo "CR_RATE_LIMIT_DOWNGRADED=true" >> "$GITHUB_ENV"' <<<"$auto_merge_job_block" \
   && grep -Fq '"${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true"' <<<"$auto_merge_job_block" \
   && grep -Fq '"$CURRENT_HEAD_SHA" != "$HEAD_SHA"' <<<"$auto_merge_job_block" \
   && grep -A2 -F '"$CURRENT_HEAD_SHA" != "$HEAD_SHA"' <<<"$auto_merge_job_block" | grep -Fq 'exit 1' \
-  && grep -Fq -- '--arg head "$CURRENT_HEAD_SHA"' <<<"$auto_merge_job_block" \
-  && grep -A2 -F 'if [ "${lane_marker:-1}" != "0" ]' <<<"$auto_merge_job_block" | grep -Fq 'exit 1'; then
+  && grep -Fq 're_required=false' <<<"$auto_merge_job_block" \
+  && grep -A2 -F 'true) re_required=true' <<<"$auto_merge_job_block" | grep -Fq 'esac' \
+  && grep -A2 -F 'if [ "$re_required" != "true" ]' <<<"$auto_merge_job_block" | grep -Fq 'exit 1' \
+  && [ "$(grep -c -- 'merge-clearance-gate.sh --derive-external-requiredness' <<<"$auto_merge_job_block")" -ge 2 ]; then
   pass=$((pass + 1))
-  echo "  PASS: rc=5 downgrade records itself; the final re-verify re-checks the marker on the LIVE merge head and aborts on drift, fail-closed (#620)"
+  echo "  PASS: rc=5 downgrade records itself; the final re-verify aborts on head drift and re-derives requiredness, requiring true (#620)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the rc=5 downgrade must set CR_RATE_LIMIT_DOWNGRADED in GITHUB_ENV, and the final re-verify must abort on head drift and re-run the marker check anchored to CURRENT_HEAD_SHA (the --match-head-commit head), exiting 1 when the marker is present or unreadable (automated-4b P1 r1+r2) (#620)" >&2
+  echo "  FAIL: the rc=5 downgrade must set CR_RATE_LIMIT_DOWNGRADED in GITHUB_ENV, and the final re-verify must abort on head drift and re-run merge-clearance-gate.sh --derive-external-requiredness, exiting 1 unless it prints true (automated-4b P1 r1+r2) (#620)" >&2
 fi
 
 # 2f. pr-review-policy's propagation lane removes needs-external-review; that
@@ -744,10 +719,10 @@ fi
 
 # 2f-bis. Within the propagation lane step, the verified-head marker MUST be
 # posted BEFORE the label removal (Codex r9): the removal fires the unlabeled
-# re-arm whose rc=5 branch reads the marker to tell exemption apart from
-# clearance — marker-after-removal opens a window where the re-arm treats the
-# exemption as ordinary external clearance and downgrades a CodeRabbit
-# rate-limit stall with neither bot having reviewed.
+# re-arm, whose rc=5 branch derives requiredness via merge-clearance-gate.sh's
+# lane_verified() marker read — marker-after-removal opens a window where the
+# derivation treats the exemption as an ordinary above-threshold arm and
+# downgrades a CodeRabbit rate-limit stall with neither bot having reviewed.
 if awk '
   /- name: Propagation PR review lane/ {f=1}
   f && /gh pr comment/ && !m {m=NR}

@@ -118,8 +118,31 @@ done
 
 # --- argument parsing -------------------------------------------------------
 
+# --derive-external-requiredness (#620/#630): QUERY mode. Runs the same
+# class dispatch + external-review applicability derivation as the gate and
+# prints exactly `true` or `false` on stdout (exit 0) instead of evaluating
+# clearance. `true` iff a NON-VACUOUS downstream review gate protects this
+# PR's CURRENT head: the external arm applies (intrinsic threshold /
+# protected paths / label force-on), or the Dependabot reviewer gate is
+# enabled for a Dependabot PR. `false` when this gate would pass vacuously:
+# under threshold with no protected paths and no label, a lane-exempt
+# verified head, or the relevant gate disabled. Every error keeps the
+# die()/exit-2 paths so callers MUST fail closed on nonzero. Consumer:
+# agent-review.yml's rc=5 CodeRabbit rate-limit branch (#489/#620) — it
+# needs requiredness, not clearance, and deriving it from label events was
+# rejected repeatedly in review (label removal is not head-pinned proof).
+DERIVE_ONLY=false
+_positional=()
+for _arg in "$@"; do
+  case "$_arg" in
+    --derive-external-requiredness) DERIVE_ONLY=true ;;
+    *) _positional+=("$_arg") ;;
+  esac
+done
+set -- ${_positional[@]+"${_positional[@]}"}
+
 if [ $# -gt 2 ]; then
-  echo "Usage: $0 [PR_NUMBER] [REPO]" >&2
+  echo "Usage: $0 [--derive-external-requiredness] [PR_NUMBER] [REPO]" >&2
   echo "       PR_NUMBER and REPO may also be set via env." >&2
   exit 2
 fi
@@ -276,9 +299,10 @@ fetch_api_array() {  # <endpoint> <label>
 # same-agent guard disqualifies their normal internal approval) — into Phase
 # 4/Codex clearance, breaking the documented under-threshold lane.
 #
-# Marker contract is shared with pr-review-policy.yml and agent-review.yml's
-# rc=5 propagation-exemption exclusion (#620) — keep the
+# Marker contract is shared with pr-review-policy.yml — keep the
 # `mergepath-propagation-lane verified-head=<sha>` form in sync.
+# agent-review.yml's rc=5 branch consumes it indirectly through this
+# script's --derive-external-requiredness query (#620).
 lane_verified() {
   local comments
   comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null) || return 1
@@ -314,6 +338,14 @@ log "HEAD = $HEAD_SHA    author = $PR_AUTHOR    needs-external-review = $HAS_EXT
 # carries needs-external-review is still judged by the Dependabot rule.
 
 if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
+  if [ "$DERIVE_ONLY" = "true" ]; then
+    # Query mode: the Dependabot reviewer gate (when enabled) blocks the
+    # merge until a reviewer-identity APPROVED lands on HEAD — a real,
+    # non-vacuous downstream gate. Disabled means this gate passes
+    # vacuously for the PR.
+    if [ "$DEPENDABOT_GATE_ENABLED" = "true" ]; then printf 'true\n'; else printf 'false\n'; fi
+    exit 0
+  fi
   if [ "$DEPENDABOT_GATE_ENABLED" != "true" ]; then
     clear_pass "Dependabot PR and dependabot.reviewer_gate.enabled=false (gate disabled)"
   fi
@@ -377,6 +409,13 @@ fi
 # codex-review-check.sh's internal-reviewer-APPROVED-on-HEAD (Phase-4b
 # substitute) path, consistent with the lane's standard "internal
 # reviewer-identity APPROVED required" rule.
+
+# Query mode with the external arm disabled: nothing downstream gates the
+# merge on review state — report vacuous.
+if [ "$DERIVE_ONLY" = "true" ] && [ "$EXTERNAL_GATE_ENABLED" != "true" ]; then
+  printf 'false\n'
+  exit 0
+fi
 
 if [ "$EXTERNAL_GATE_ENABLED" = "true" ]; then
   REQUIRES_EXTERNAL=false
@@ -470,6 +509,12 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ]; then
         fi
       fi
     fi
+  fi
+
+  if [ "$DERIVE_ONLY" = "true" ]; then
+    log "query mode: external requiredness on HEAD $HEAD_SHA = $REQUIRES_EXTERNAL${REQUIRES_REASON:+ ($REQUIRES_REASON)}"
+    printf '%s\n' "$REQUIRES_EXTERNAL"
+    exit 0
   fi
 
   if [ "$REQUIRES_EXTERNAL" = "true" ]; then

@@ -765,17 +765,6 @@ jobs:
           OP_PREFLIGHT_AUTHOR_PAT: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-          # #620: the rc=5 branch derives external-review applicability; on the
-          # unlabeled re-arm path the blocking label is absent by construction,
-          # so the removal event itself carries the signal. Env-indirected
-          # rather than interpolated into run: per the workflow's
-          # injection-safety idiom. github.event.label exists only on
-          # labeled/unlabeled payloads — empty elsewhere, which the run-block
-          # guards treat as "no override".
-          EVENT_ACTION: ${{ github.event.action }}
-          REMOVED_LABEL: ${{ github.event.label.name }}
-          # For the propagation-exemption exclusion in the rc=5 override.
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           # Delegate to scripts/coderabbit-wait.sh so auto-merge honors the
           # same semantics the agent-driven flow uses: HEAD-anchored
@@ -823,76 +812,42 @@ jobs:
             5)
               # #489: a rate_limit_stalled is non-blocking ONLY when the Codex
               # failover engaged AND an external-review gate will actually gate
-              # the merge on Codex — i.e. the PR is above-threshold, where
-              # merge-clearance-gate.sh's external_review_gate blocks until
-              # Codex/external clearance. For UNDER-threshold PRs that gate
-              # passes vacuously and --trigger-only does not wait for Codex, so
-              # proceeding would let a rate-limited PR merge with neither bot
-              # having reviewed it — those keep BLOCKING (Codex P2 on #512 r3).
-              # The disposition lives in the unit-tested, fail-closed
-              # scripts/coderabbit-automerge-rate-limit-gate.sh; the
-              # above-threshold signal is the `needs-external-review` label
-              # (present for above-threshold PRs through Phase 2.5, before
-              # external clearance removes it).
-              ext_required=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels \
-                --jq 'any(.labels[]; .name=="needs-external-review")' 2>/dev/null || echo "false")
-              # #620 (Codex r4): on the unlabeled re-arm path this run exists
-              # BECAUSE auto-clear just removed needs-external-review after
-              # external clearance — the current-label read above is false by
-              # construction and would misclassify this above-threshold PR as
-              # under-threshold, blocking the failover disposition and
-              # re-creating the exact clean-but-unmerged stall the unlabeled
-              # trigger was added to fix. Raising false→true only here is
-              # safe because merge-clearance's external gate evaluated
-              # non-vacuously on this PR and the current-head required-check
-              # wait still gates the actual merge.
+              # the merge on Codex — i.e. merge-clearance-gate.sh's external
+              # arm applies NON-vacuously to this PR's current head. For PRs
+              # where that gate passes vacuously, --trigger-only does not wait
+              # for Codex, so proceeding would let a rate-limited PR merge
+              # with neither bot having reviewed it — those keep BLOCKING
+              # (Codex P2 on #512 r3). The disposition lives in the
+              # unit-tested, fail-closed
+              # scripts/coderabbit-automerge-rate-limit-gate.sh.
               #
-              # #620 (Codex r7): EXCEPT when the head carries the propagation
-              # lane's verified-head marker — that lane removes the label as
-              # an EXEMPTION, not as clearance (pr-review-policy.yml), so
-              # merge-clearance passes vacuously downstream and CodeRabbit
-              # was the only bot eye; proceeding would arm auto-merge with
-              # neither bot review (the #512 r3 hazard). The marker check is
-              # UNCONDITIONAL, not scoped to the unlabeled event (automated
-              # 4b P1): a synchronize/reopened/approval arming run can read
-              # the label as present here while the lane concurrently posts
-              # the marker and removes the label before the later re-verify —
-              # so a marker on this head forces ext_required=false regardless
-              # of the current label. Marker contract is shared with
-              # pr-review-policy.yml and merge-clearance-gate.sh's
-              # lane_verified(): keep the
-              # `mergepath-propagation-lane verified-head=<sha>` form in
-              # sync. The lane posts the marker BEFORE removing the label
-              # (ordering pinned by check_workflow_parsers), so the marker
-              # exists before any unlabeled run the removal fires; the
-              # residual window where the marker lands only AFTER this read
-              # is closed by the downgrade re-check in the final
-              # blocking-label re-verify step. Fail-closed: a marker-read
-              # error counts as marker-present (forces false → block), so an
-              # API hiccup never lets a rate-limited PR through.
-              #
-              # Fetch and parse are SPLIT (Codex r10 P1): in a pipeline, a
-              # failed gh with empty output leaves jq -s slurping empty
-              # input into [] → length 0 → exit 0, so the || fallback never
-              # fires and a comments-API failure would read as "no marker".
-              # Initialized to 1 (marker-present) so gh failure, jq failure,
-              # and non-numeric garbage all keep the fail-closed default.
-              lane_marker=1
-              if lane_comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null); then
-                lane_marker=$(jq -s --arg head "$HEAD_SHA" '[add // [] | .[] | select((.user.login == "github-actions[bot]") and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))] | length' <<<"$lane_comments" 2>/dev/null || echo 1)
-              fi
-              if [ "${lane_marker:-1}" = "0" ]; then
-                if [ "${EVENT_ACTION:-}" = "unlabeled" ] && [ "${REMOVED_LABEL:-}" = "needs-external-review" ]; then
-                  ext_required=true
-                fi
-              else
-                ext_required=false
+              # #620: requiredness is asked of merge-clearance-gate.sh ITSELF
+              # (--derive-external-requiredness): the same intrinsic
+              # threshold + protected-paths computation the required check
+              # runs, with the label as a force-on signal and the
+              # propagation lane's HEAD-pinned verified marker as the
+              # exemption, all evaluated on the LIVE head. Label-event
+              # proxies (current-label reads, unlabeled-removal overrides)
+              # were rejected across five review rounds — a label event is
+              # not head-pinned proof of a downstream gate; this derivation
+              # is. It also un-stalls the settle re-arm for EVERY blocking
+              # label removal on an intrinsically above-threshold PR, not
+              # just needs-external-review. Fail closed: any nonzero exit or
+              # unexpected output from the query reads as false (block).
+              # stderr streams to the step log for diagnosability (#633);
+              # only stdout (exactly `true` or `false`) is consumed.
+              ext_required=false
+              if req=$(bash scripts/merge-clearance-gate.sh --derive-external-requiredness "$PR_NUMBER" "$REPO"); then
+                case "$req" in
+                  true|false) ext_required=$req ;;
+                esac
               fi
               if bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_required"; then
-                echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged on an above-threshold PR — proceeding. merge-clearance's external-review gate blocks the merge until Codex/external clearance lands."
-                # Record the downgrade for the final re-verify step: a
-                # propagation marker that lands AFTER the check above must
-                # abort the merge (automated 4b P1 residual window).
+                echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged and merge-clearance's external arm applies non-vacuously to the current head — proceeding; that gate blocks the merge until Codex/external clearance lands."
+                # Record the downgrade for the final re-verify step: the
+                # requiredness derivation is re-run there against the live
+                # merge head, so state that changes during the waits (e.g.
+                # a propagation-lane verification landing) aborts the merge.
                 echo "CR_RATE_LIMIT_DOWNGRADED=true" >> "$GITHUB_ENV"
               else
                 echo "::error::CodeRabbit rate-limit retry budget exhausted — blocking auto-merge. Either the failover did not engage (codex_failover_requested=false) or the PR is under-threshold (no downstream Codex gate, so it must not auto-merge bot-unreviewed). Human must re-trigger or merge manually."
@@ -1008,35 +963,36 @@ jobs:
             fi
           done
           # #620 (automated 4b P1, rounds 1+2): if this run downgraded a
-          # CodeRabbit rate-limit stall (rc=5), re-check the propagation-lane
-          # marker at the last verify point. The rc=5-time check can race the
-          # lane — label read as present, marker posted moments later — and a
-          # marker means merge-clearance exempts the head (vacuous), so the
-          # downgrade's premise (a downstream gate blocks until external
-          # clearance) is false: neither bot has reviewed.
+          # CodeRabbit rate-limit stall (rc=5), re-validate the downgrade's
+          # premise at the last verify point. The rc=5-time derivation ran
+          # minutes earlier; state can change during the waits (a push, a
+          # propagation-lane verification landing), and merge-clearance
+          # passing vacuously for the head being merged would mean neither
+          # bot reviewed it.
           #
-          # The re-check anchors CURRENT_HEAD_SHA — the LIVE head exported by
-          # the required-check wait above and pinned by the merge command's
-          # --match-head-commit — NOT the workflow event's payload SHA
-          # (4b round-2 P1: the waits run for minutes, a push can move the
-          # branch, and a marker posted for the NEW head would be invisible
-          # to a payload-SHA grep while the merge targets that new head).
-          # And the downgrade itself anchored the event head, so if the two
-          # differ the CodeRabbit disposition is stale for the head being
-          # merged — abort. Fail closed on every read error: missing
-          # CURRENT_HEAD_SHA, drifted head, or an unreadable marker each
-          # count as unsafe and abort.
+          # Two fail-closed checks, scoped to downgraded runs only:
+          # 1. Head drift: the downgrade anchored the event head, and the
+          #    merge pins CURRENT_HEAD_SHA (the live head the required-check
+          #    wait exported) via --match-head-commit — if they differ, the
+          #    CodeRabbit disposition is stale for the merge head. Abort.
+          # 2. Re-run merge-clearance-gate.sh --derive-external-requiredness
+          #    against the (now-pinned) live head and require `true`: the
+          #    same intrinsic threshold/protected-paths/label/lane-exemption
+          #    derivation the required check uses. Any error or non-true
+          #    output aborts.
           if [ "${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true" ]; then
             if [ -z "${CURRENT_HEAD_SHA:-}" ] || [ "$CURRENT_HEAD_SHA" != "$HEAD_SHA" ]; then
               echo "::error::Head drifted after the rc=5 rate-limit downgrade (event=$HEAD_SHA live=${CURRENT_HEAD_SHA:-unset}) — the CodeRabbit disposition is stale for the merge head. Aborting auto-merge."
               exit 1
             fi
-            lane_marker=1
-            if lane_comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null); then
-              lane_marker=$(jq -s --arg head "$CURRENT_HEAD_SHA" '[add // [] | .[] | select((.user.login == "github-actions[bot]") and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))] | length' <<<"$lane_comments" 2>/dev/null || echo 1)
+            re_required=false
+            if req=$(bash scripts/merge-clearance-gate.sh --derive-external-requiredness "$PR_NUMBER" "$REPO"); then
+              case "$req" in
+                true) re_required=true ;;
+              esac
             fi
-            if [ "${lane_marker:-1}" != "0" ]; then
-              echo "::error::Propagation-lane marker present (or unreadable) for $CURRENT_HEAD_SHA after an rc=5 rate-limit downgrade — merge-clearance would exempt this head with neither bot review. Aborting auto-merge."
+            if [ "$re_required" != "true" ]; then
+              echo "::error::merge-clearance external requiredness is no longer true (or underivable) for $CURRENT_HEAD_SHA after an rc=5 rate-limit downgrade — the gate would pass vacuously with neither bot review. Aborting auto-merge."
               exit 1
             fi
           fi
