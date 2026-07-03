@@ -620,18 +620,80 @@ p4b_resolve_diff_max_bytes() {
   printf '%s' "$val"
 }
 
-# p4b_trim_review_diff <in_file> <out_file> <max_bytes>
+# p4b_diff_omit_globs
+# Newline-separated shell-glob allowlist of paths whose diff sections MAY be
+# omitted from an over-budget review diff. Resolution: P4B_DIFF_OMIT_GLOBS
+# env override (comma-separated; tests/manual runs) → the
+# phase_4b_automation.diff_omit_globs policy list → EMPTY. Empty means no
+# section is omission-eligible, so an over-budget diff fails closed to the
+# manual handoff. This is the structural guard the Phase 4b substitute gate
+# needs (#636 Codex P1): trimming by size alone could silently drop a large
+# APPLICATION-CODE section and let the posted APPROVED clear a merge on code
+# no reviewer saw — only operator-declared bulk-artifact paths are ever
+# omitted. Patterns are bash `case` globs matched against the b/-side repo
+# path (`*` crosses `/`).
+p4b_diff_omit_globs() {
+  local cfg
+  if [ -n "${P4B_DIFF_OMIT_GLOBS:-}" ]; then
+    printf '%s\n' "$P4B_DIFF_OMIT_GLOBS" | tr ',' '\n' \
+      | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' || true
+    return 0
+  fi
+  cfg="$(p4b_config)"
+  [ -f "$cfg" ] || return 0
+  awk '
+    /^phase_4b_automation:/ { inblk=1; inlist=0; next }
+    inblk && /^[^[:space:]#]/ { inblk=0; inlist=0 }
+    inblk {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      if ($0 ~ /^[[:space:]]*diff_omit_globs:[[:space:]]*$/) { inlist=1; next }
+      if (inlist) {
+        if ($0 ~ /^[[:space:]]*-[[:space:]]*/) {
+          line = $0
+          sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+          gsub(/[[:space:]]*#.*$/, "", line)
+          gsub(/^["\047]/, "", line); gsub(/["\047][[:space:]]*$/, "", line)
+          sub(/[[:space:]]+$/, "", line)
+          if (line != "") print line
+          next
+        }
+        inlist = 0
+      }
+    }
+  ' "$cfg"
+}
+
+# p4b_path_matches_any_glob <path> <globs-newline-separated>
+p4b_path_matches_any_glob() {
+  local path="$1" g
+  while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    # $g is intentionally unquoted: it is the glob pattern itself.
+    # shellcheck disable=SC2254
+    case "$path" in
+      $g) return 0 ;;
+    esac
+  done <<EOF
+$2
+EOF
+  return 1
+}
+
+# p4b_trim_review_diff <in_file> <out_file> <max_bytes> [<omit_globs>]
 # Byte-bound a unified diff for reviewer-CLI consumption. Under-budget input
 # is copied through verbatim (empty stdout). Over-budget input has its
-# largest per-file sections omitted — largest first, only as many as needed —
-# each replaced in the output with a single
+# largest OMISSION-ELIGIBLE per-file sections omitted — eligible means the
+# section's path matches <omit_globs> (newline-separated shell globs; see
+# p4b_diff_omit_globs) — each replaced in the output with a single
 #   [phase-4b diff-budget: <path> omitted - oversized diff section]
 # placeholder line, and one "<path><TAB><bytes>" line per omission printed
 # on stdout for the caller's disclosure note. Returns non-zero (fail-closed)
-# when even full omission cannot meet the budget or when no reviewable file
-# section survives — the caller must fall back rather than review a husk.
+# when omitting every eligible section still cannot meet the budget (never
+# omits a non-allowlisted section — #636 Codex P1), or when no reviewable
+# file section survives — the caller must fall back rather than review a
+# husk or approve around unreviewed code.
 p4b_trim_review_diff() {
-  local in="$1" out="$2" max="$3" total sizes omit="" omitted=0 b i p
+  local in="$1" out="$2" max="$3" globs="${4:-}" total sizes omit="" omitted=0 b i p
   [ -r "$in" ] || return 1
   case "$max" in ''|*[!0-9]*) return 1 ;; esac
   total="$(wc -c < "$in" | tr -d '[:space:]')"
@@ -641,8 +703,8 @@ p4b_trim_review_diff() {
   fi
   # Per-section sizes as "bytes<TAB>index<TAB>path", largest first. Sections
   # are keyed by INDEX (omission never depends on path parsing; the b/-side
-  # path is display-only). LC_ALL=C keeps length() byte-exact on multibyte
-  # content.
+  # path is used for allowlist matching and display). LC_ALL=C keeps
+  # length() byte-exact on multibyte content.
   sizes="$(LC_ALL=C awk '
     /^diff --git /{ n++; hdr[n] = $0; bytes[n] = 0 }
     n > 0 { bytes[n] += length($0) + 1 }
@@ -657,6 +719,7 @@ p4b_trim_review_diff() {
   [ -n "$sizes" ] || return 1
   while IFS=$'\t' read -r b i p; do
     [ "$((total - omitted))" -le "$max" ] && break
+    p4b_path_matches_any_glob "$p" "$globs" || continue
     omitted=$((omitted + b))
     omit="$omit $i"
     printf '%s\t%s\n' "$p" "$b"

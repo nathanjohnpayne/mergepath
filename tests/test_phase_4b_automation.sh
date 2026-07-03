@@ -655,6 +655,28 @@ set -e
   && pass "diff budget fails closed on a non-integer env override" \
   || fail "diff budget non-integer env (rc=$rc, got '${got:-}')"
 
+# omission allowlist resolution: absent ⇒ empty, policy list read, env
+# override comma-split (#636 Codex P1)
+got="$(p4b_diff_omit_globs)"
+[ -z "$got" ] && pass "omit allowlist defaults to empty (nothing omission-eligible)" \
+  || fail "omit allowlist default (got '${got:-}')"
+POLICY_OMIT_GLOBS="$WORK/policy-omit-globs.yml"
+cat > "$POLICY_OMIT_GLOBS" <<'YAML'
+phase_4b_automation:
+  enabled: true
+  diff_omit_globs:
+    - "docs/audits/data/*"
+    - "*.jsonl"   # trailing comment
+YAML
+got="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_OMIT_GLOBS" p4b_diff_omit_globs)"
+[ "$got" = "$(printf 'docs/audits/data/*\n*.jsonl')" ] \
+  && pass "omit allowlist reads phase_4b_automation.diff_omit_globs list items" \
+  || fail "omit allowlist policy read (got '${got:-}')"
+got="$(P4B_DIFF_OMIT_GLOBS='data/*, extra/*' p4b_diff_omit_globs)"
+[ "$got" = "$(printf 'data/*\nextra/*')" ] \
+  && pass "omit allowlist env escape hatch comma-splits" \
+  || fail "omit allowlist env override (got '${got:-}')"
+
 # trimming: under-budget passthrough, largest-first omission + placeholder +
 # report, fail-closed when nothing reviewable survives
 TRIM_IN="$WORK/trim-in.diff"
@@ -671,7 +693,7 @@ rep="$(p4b_trim_review_diff "$TRIM_IN" "$TRIM_OUT" 1000000)" && cmp -s "$TRIM_IN
   || fail "trim under-budget passthrough"
 
 set +e
-rep="$(p4b_trim_review_diff "$TRIM_IN" "$TRIM_OUT" 2000)"; rc=$?
+rep="$(p4b_trim_review_diff "$TRIM_IN" "$TRIM_OUT" 2000 'data/*')"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
    && ! grep -q 'HUGE-ARTIFACT' "$TRIM_OUT" \
@@ -679,8 +701,30 @@ if [ "$rc" = 0 ] \
    && grep -q '^\[phase-4b diff-budget: data/huge.jsonl omitted' "$TRIM_OUT" \
    && printf '%s\n' "$rep" | grep -q "^data/huge.jsonl$(printf '\t')" \
    && [ "$(wc -c < "$TRIM_OUT" | tr -d '[:space:]')" -le 2000 ]; then
-  pass "trim: over-budget diff drops the largest section, keeps code, placeholder + report emitted"
+  pass "trim: over-budget diff drops the largest allowlisted section, keeps code, placeholder + report emitted"
 else fail "trim over-budget (rc=$rc, report='${rep:-}')"; fi
+
+# fail-closed guards (#636 Codex P1): no allowlist ⇒ nothing omission-
+# eligible; an oversized NON-allowlisted (code) section is never omitted.
+set +e
+p4b_trim_review_diff "$TRIM_IN" "$TRIM_OUT" 2000 >/dev/null; rc=$?
+set -e
+[ "$rc" != 0 ] \
+  && pass "trim: fails closed with an empty omission allowlist" \
+  || fail "trim empty-allowlist should fail (rc=$rc)"
+
+TRIM_CODE="$WORK/trim-code.diff"
+{
+  printf 'diff --git a/src/small.sh b/src/small.sh\n+echo small\n'
+  printf 'diff --git a/src/big-refactor.sh b/src/big-refactor.sh\n'
+  awk 'BEGIN { for (i = 0; i < 200; i++) printf "+CODE-CHANGE-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$TRIM_CODE"
+set +e
+p4b_trim_review_diff "$TRIM_CODE" "$TRIM_OUT" 2000 'data/*' >/dev/null; rc=$?
+set -e
+[ "$rc" != 0 ] \
+  && pass "trim: never omits an oversized non-allowlisted (code) section — fails closed" \
+  || fail "trim non-allowlisted code section should fail (rc=$rc)"
 
 TRIM_ONLY_HUGE="$WORK/trim-only-huge.diff"
 {
@@ -688,7 +732,7 @@ TRIM_ONLY_HUGE="$WORK/trim-only-huge.diff"
   awk 'BEGIN { for (i = 0; i < 200; i++) printf "+ONLY-ARTIFACT-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
 } > "$TRIM_ONLY_HUGE"
 set +e
-p4b_trim_review_diff "$TRIM_ONLY_HUGE" "$TRIM_OUT" 500 >/dev/null; rc=$?
+p4b_trim_review_diff "$TRIM_ONLY_HUGE" "$TRIM_OUT" 500 'data/*' >/dev/null; rc=$?
 set -e
 [ "$rc" != 0 ] \
   && pass "trim: fails closed when no reviewable section survives the budget" \
@@ -830,27 +874,54 @@ SH
 chmod +x "$BIN/fake-claude-trim-assert"
 
 set +e
-out="$(P4B_DIFF_MAX_BYTES=2000 CODEX_BIN="$BIN/fake-codex-trim-assert" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$HUGE_DIFF" 2>/dev/null)"; rc=$?
+out="$(P4B_DIFF_MAX_BYTES=2000 P4B_DIFF_OMIT_GLOBS='data/*' CODEX_BIN="$BIN/fake-codex-trim-assert" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$HUGE_DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
-  pass "codex adapter trims an over-budget diff and discloses omissions in the prompt"
+  pass "codex adapter trims an over-budget allowlisted diff and discloses omissions in the prompt"
 else fail "codex adapter oversized-diff trim (rc=$rc, out=$out)"; fi
 
 set +e
-out="$(P4B_DIFF_MAX_BYTES=2000 CLAUDE_BIN="$BIN/fake-claude-trim-assert" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$HUGE_DIFF" 2>/dev/null)"; rc=$?
+out="$(P4B_DIFF_MAX_BYTES=2000 P4B_DIFF_OMIT_GLOBS='data/*' CLAUDE_BIN="$BIN/fake-claude-trim-assert" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$HUGE_DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
-  pass "claude adapter trims an over-budget diff and discloses omissions in the prompt"
+  pass "claude adapter trims an over-budget allowlisted diff and discloses omissions in the prompt"
 else fail "claude adapter oversized-diff trim (rc=$rc, out=$out)"; fi
 
+# Without an allowlist entry the SAME over-budget diff must fail closed to
+# the manual handoff, never silently omit (#636 Codex P1) — and an
+# oversized CODE section is never omission-eligible regardless of budget.
 set +e
-P4B_DIFF_MAX_BYTES=200 CODEX_BIN="$BIN/fake-codex-approve" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$HUGE_ONLY_DIFF" >/dev/null 2>&1; rc=$?
+P4B_DIFF_MAX_BYTES=2000 CODEX_BIN="$BIN/fake-codex-approve" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$HUGE_DIFF" >/dev/null 2>&1; rc=$?
+set -e
+[ "$rc" = 4 ] && pass "codex adapter fails closed (exit 4) on an over-budget diff with no omission allowlist" \
+  || fail "codex adapter no-allowlist over-budget should exit 4 (got $rc)"
+
+HUGE_CODE_DIFF="$WORK/huge-code.diff"
+{
+  printf 'diff --git a/x.js b/x.js\n+const x = 1;\n'
+  printf 'diff --git a/src/big-refactor.sh b/src/big-refactor.sh\n'
+  awk 'BEGIN { for (i = 0; i < 500; i++) printf "+CODE-CHANGE-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$HUGE_CODE_DIFF"
+set +e
+P4B_DIFF_MAX_BYTES=2000 P4B_DIFF_OMIT_GLOBS='data/*' CODEX_BIN="$BIN/fake-codex-approve" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$HUGE_CODE_DIFF" >/dev/null 2>&1; rc=$?
+set -e
+[ "$rc" = 4 ] && pass "codex adapter fails closed (exit 4) rather than omit an oversized non-allowlisted code section" \
+  || fail "codex adapter code-section omission should exit 4 (got $rc)"
+
+set +e
+P4B_DIFF_MAX_BYTES=2000 P4B_DIFF_OMIT_GLOBS='data/*' CLAUDE_BIN="$BIN/fake-claude-approve-usage" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$HUGE_CODE_DIFF" >/dev/null 2>&1; rc=$?
+set -e
+[ "$rc" = 4 ] && pass "claude adapter fails closed (exit 4) rather than omit an oversized non-allowlisted code section" \
+  || fail "claude adapter code-section omission should exit 4 (got $rc)"
+
+set +e
+P4B_DIFF_MAX_BYTES=200 P4B_DIFF_OMIT_GLOBS='data/*' CODEX_BIN="$BIN/fake-codex-approve" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$HUGE_ONLY_DIFF" >/dev/null 2>&1; rc=$?
 set -e
 [ "$rc" = 4 ] && pass "codex adapter fails closed (exit 4) when nothing reviewable survives the budget" \
   || fail "codex adapter untrimmable diff should exit 4 (got $rc)"
 
 set +e
-P4B_DIFF_MAX_BYTES=200 CLAUDE_BIN="$BIN/fake-claude-approve-usage" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$HUGE_ONLY_DIFF" >/dev/null 2>&1; rc=$?
+P4B_DIFF_MAX_BYTES=200 P4B_DIFF_OMIT_GLOBS='data/*' CLAUDE_BIN="$BIN/fake-claude-approve-usage" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$HUGE_ONLY_DIFF" >/dev/null 2>&1; rc=$?
 set -e
 [ "$rc" = 4 ] && pass "claude adapter fails closed (exit 4) when nothing reviewable survives the budget" \
   || fail "claude adapter untrimmable diff should exit 4 (got $rc)"
