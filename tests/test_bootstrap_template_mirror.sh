@@ -159,6 +159,18 @@ echo "" >"$FAKE_MP/.claude/.gitkeep"
 # --- normal files that SHOULD propagate ---
 echo "real script" >"$FAKE_MP/scripts/normal-helper.sh"
 echo "real workflow" >"$FAKE_MP/.github/workflows/lint.yml"
+# Hub policy with phase_4b_automation ENABLED (#628): the mirror must reset
+# the parent switch to false in the target while leaving nested enabled
+# keys (accounting) and sibling blocks untouched.
+cat >"$FAKE_MP/.github/review-policy.yml" <<'YAML'
+coderabbit:
+  enabled: true
+phase_4b_automation:
+  enabled: true
+  mode: local
+  accounting:
+    enabled: true
+YAML
 echo "real hook" >"$FAKE_MP/scripts/hooks/some-hook.sh"
 echo "real ci check" >"$FAKE_MP/scripts/ci/check_thing"
 
@@ -428,6 +440,17 @@ echo "$fixture_branches" | grep -q "^bootstrap/" \
   && grep -q "^template-mirror$" "$TARGET/.bootstrap-state" \
   && pass "state file records template-mirror completion" \
   || fail "state file missing template-mirror entry"
+
+# --- assertion 8b: phase_4b_automation.enabled reset to false in target (#628) ---
+mirrored_policy="$TARGET/.github/review-policy.yml"
+if [ -f "$mirrored_policy" ] \
+   && awk '/^phase_4b_automation:/{b=1;next} b&&/^[^ #]/{b=0} b&&/^  enabled:/{print $2; exit}' "$mirrored_policy" | grep -qx "false" \
+   && awk '/^  accounting:/{a=1;next} a&&/^    enabled:/{print $2; exit}' "$mirrored_policy" | grep -qx "true" \
+   && awk '/^coderabbit:/{c=1;next} c&&/^[^ #]/{c=0} c&&/^  enabled:/{print $2; exit}' "$mirrored_policy" | grep -qx "true"; then
+  pass "mirrored review-policy resets phase_4b_automation.enabled to false; accounting + coderabbit enables untouched (#628)"
+else
+  fail "phase-4b default reset wrong: $(grep -n 'enabled:' "$mirrored_policy" 2>/dev/null | head -5)"
+fi
 
 # --- assertion 9: --dry-run path produces no on-disk side effects ---
 dry_target="$WORKDIR/dry-target"

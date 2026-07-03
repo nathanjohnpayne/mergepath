@@ -198,6 +198,18 @@ bootstrap::stage_template_mirror() {
     return "$step_rc"
   fi
 
+  # Step 5: reset opt-in policy defaults the hub has flipped for itself.
+  # phase_4b_automation.enabled: true on the hub (#628) must NOT opt every
+  # future bootstrapped repo into local reviewer-CLI automation - a new
+  # repo opts in explicitly after validating plan-logins on its operator
+  # machine (Codex P2 on #628). Scoped to the parent block's direct child
+  # so codex.enabled / accounting.enabled are untouched.
+  bootstrap::_reset_phase_4b_enabled "$target" || step_rc=$?
+  if [ "$step_rc" -ne 0 ]; then
+    bootstrap::err "template-mirror: phase-4b default reset failed (rc=$step_rc); aborting stage"
+    return "$step_rc"
+  fi
+
   # Step 5: initialize git history.
   bootstrap::_init_target_git "$target" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
@@ -243,6 +255,44 @@ bootstrap::_resolve_source_root() {
   fi
   # Last resort: walk up from this stage file.
   (cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+}
+
+bootstrap::_reset_phase_4b_enabled() {
+  local target=$1
+  local policy="$target/.github/review-policy.yml"
+  [ -f "$policy" ] || return 0
+  # Dry-run contract (#628 Codex P2): every mirror step is a no-op under
+  # --dry-run; this rewrite must not mutate an existing target policy.
+  if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
+    bootstrap::log "dry-run: would reset phase_4b_automation.enabled to false in $policy"
+    return 0
+  fi
+  # FAIL CLOSED (#628 CodeRabbit Major): if the block exists but the awk
+  # never rewrites its direct-child enabled key (key renamed, re-indented,
+  # block reshaped upstream), a silent pass-through would ship
+  # enabled: true downstream - the one outcome this helper exists to
+  # prevent. A policy with NO phase_4b_automation block passes: an absent
+  # parent key reads as disabled (the documented default). A block whose
+  # enabled key is absent also fails here - over-strict, but fail-closed:
+  # a reshape upstream must be looked at, not guessed about.
+  if ! awk '
+    /^phase_4b_automation:/ { sawblk=1; inblk=1; print; next }
+    inblk && /^[^[:space:]#]/ { inblk=0 }
+    inblk && !done && /^  enabled:/ {
+      print "  # Reset to the manual-handoff default by the bootstrap mirror"
+      print "  # (#628): a new repo opts in to local reviewer-CLI automation"
+      print "  # explicitly, after validating plan-logins on its own machine."
+      print "  enabled: false"
+      done=1; next
+    }
+    { print }
+    END { exit (sawblk && !done) ? 1 : 0 }
+  ' "$policy" > "$policy.bootstrap-tmp"; then
+    rm -f "$policy.bootstrap-tmp"
+    bootstrap::err "phase-4b reset: phase_4b_automation block present but its enabled key was not found/reset in $policy (reshaped upstream?); failing closed rather than mirroring an opted-in policy"
+    return 1
+  fi
+  mv "$policy.bootstrap-tmp" "$policy"
 }
 
 bootstrap::_rsync_template() {
