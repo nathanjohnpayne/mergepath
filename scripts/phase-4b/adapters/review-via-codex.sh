@@ -172,8 +172,9 @@ finding new issues.
 The unified diff is provided on stdin. Return ONLY a JSON object conforming
 to the provided output schema: a 'verdict' of APPROVED or CHANGES_REQUESTED,
 a short 'summary', and a 'findings' array ({severity P0-P3, path, line, body}).
-Set usage to null; the adapter records CLI usage only when it is exposed outside
-the model response. Approve only if you would stake a merge on it; otherwise
+Set usage to null and cli_version to null; the adapter records CLI usage and
+version only from outside the model response, never from a self-report.
+Approve only if you would stake a merge on it; otherwise
 request changes and list every required-severity issue you identify in this
 pass, not just the first one. For this repository, these finding severities
 require disposition before merge: ${REQUIRED_SEVERITIES}.
@@ -233,7 +234,10 @@ else
 fi
 
 VERDICT_JSON="$(p4b_extract_json_block "$CANDIDATE")"
-VERDICT_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c 'if has("usage") then . else . + {usage: null} end' 2>/dev/null || true)"
+VERDICT_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c '
+  (if has("usage") then . else . + {usage: null} end)
+  | (if has("cli_version") then . else . + {cli_version: null} end)
+' 2>/dev/null || true)"
 if ! p4b_validate_verdict "$VERDICT_JSON"; then
   p4b_warn "codex output did not conform to verdict.schema.json (fail-closed)"
   exit 4
@@ -259,5 +263,24 @@ else
   USAGE="null"
 fi
 
-printf '%s' "$VERDICT_JSON" | jq -c --argjson usage "$USAGE" '. + {usage: $usage}'
+# Reviewer CLI version (#622): best-effort, CLI-sourced only — never the
+# model's self-report (the prompt pins cli_version to null for exactly this
+# reason). A separate `--version` invocation, not parsed from the review run
+# itself, so a malformed or JSON-shaped response (e.g. a misbehaving/fake
+# CLI) is rejected rather than surfacing as a bogus version string.
+CLI_VERSION_JSON="null"
+if CLI_VERSION_RAW="$("$CODEX_BIN" --version 2>/dev/null)"; then
+  CLI_VERSION_RAW="$(printf '%s' "$CLI_VERSION_RAW" | head -1 | tr -d '\r')"
+  case "$CLI_VERSION_RAW" in
+    ''|'{'*|'['*) : ;; # empty, or JSON-shaped — leave null
+    *)
+      if [ "${#CLI_VERSION_RAW}" -le 200 ]; then
+        CLI_VERSION_JSON="$(jq -Rn --arg v "$CLI_VERSION_RAW" '$v')"
+      fi
+      ;;
+  esac
+fi
+
+printf '%s' "$VERDICT_JSON" | jq -c --argjson usage "$USAGE" --argjson cli_version "$CLI_VERSION_JSON" \
+  '. + {usage: $usage, cli_version: $cli_version}'
 exit 0

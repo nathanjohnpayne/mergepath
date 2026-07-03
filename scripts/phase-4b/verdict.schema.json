@@ -2,10 +2,10 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://nathanjohnpayne.dev/mergepath/phase-4b/verdict.schema.json",
   "title": "Mergepath Phase 4b automated-review verdict",
-  "description": "Normalized verdict object that every Phase 4b reviewer adapter (codex / claude) must emit on stdout. Also passed to `codex exec --output-schema` so the Codex CLI constrains its final message to this shape. `usage` is required for OpenAI structured-output compatibility but may be null; adapters populate it only when the CLI exposes token counts.",
+  "description": "Normalized verdict object that every Phase 4b reviewer adapter (codex / claude) must emit on stdout. Also passed to `codex exec --output-schema` so the Codex CLI constrains its final message to this shape. `usage` is required for OpenAI structured-output compatibility but may be null; adapters populate it only when the CLI exposes token counts. `cli_version` is likewise required-but-nullable (#622): the model is prompted to emit it as null, and the adapter overwrites it post-hoc with the reviewer CLI's own `--version` output (never a guessed or estimated value).",
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "summary", "findings", "usage"],
+  "required": ["verdict", "summary", "findings", "usage", "cli_version"],
   "properties": {
     "verdict": {
       "description": "The reviewer's merge decision. APPROVED becomes a GitHub APPROVED review (the Phase 4b substitute clearance the merge gate accepts); CHANGES_REQUESTED becomes a GitHub changes-requested review. APPROVED must not be paired with findings whose severity is required by feedback_policy (P0/P1 by default); adapters and the orchestrator reject that combination fail-closed. There is deliberately no COMMENTED/abstain value: an adapter that cannot reach one of these two decisions must exit non-zero so the orchestrator fails closed to the manual handoff rather than posting an ambiguous review.",

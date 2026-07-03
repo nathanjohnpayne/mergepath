@@ -168,7 +168,8 @@ prose, no code fence, and no extra keys:
   \"findings\": [
     {\"severity\":\"P0|P1|P2|P3\",\"path\":\"repo-relative path or null\", \"line\": 123, \"body\":\"finding text\"}
   ],
-  \"usage\": null
+  \"usage\": null,
+  \"cli_version\": null
 }
 Use an empty findings array for a clean approval. path and line must be null
 for PR-level findings. For this repository, these finding severities require
@@ -224,7 +225,10 @@ RESULT="$(printf '%s' "$ENVELOPE" | jq -r '.result // empty' 2>/dev/null || true
 [ -n "$RESULT" ] || RESULT="$ENVELOPE"
 
 VERDICT_JSON="$(p4b_extract_json_block "$RESULT")"
-VERDICT_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c 'if has("usage") then . else . + {usage: null} end' 2>/dev/null || true)"
+VERDICT_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c '
+  (if has("usage") then . else . + {usage: null} end)
+  | (if has("cli_version") then . else . + {cli_version: null} end)
+' 2>/dev/null || true)"
 if ! p4b_validate_verdict "$VERDICT_JSON"; then
   p4b_warn "claude output did not conform to verdict.schema.json (fail-closed)"
   exit 4
@@ -273,5 +277,24 @@ USAGE="$(printf '%s' "$ENVELOPE" | jq -c '
   end
 ' 2>/dev/null || printf 'null')"
 
-printf '%s' "$VERDICT_JSON" | jq -c --argjson usage "$USAGE" '. + {usage: $usage}'
+# Reviewer CLI version (#622): best-effort, CLI-sourced only — never the
+# model's self-report (the prompt pins cli_version to null for exactly this
+# reason). A separate `--version` invocation, not parsed from the review run
+# itself, so a malformed or JSON-shaped response (e.g. a misbehaving/fake
+# CLI) is rejected rather than surfacing as a bogus version string.
+CLI_VERSION_JSON="null"
+if CLI_VERSION_RAW="$("$CLAUDE_BIN" --version 2>/dev/null)"; then
+  CLI_VERSION_RAW="$(printf '%s' "$CLI_VERSION_RAW" | head -1 | tr -d '\r')"
+  case "$CLI_VERSION_RAW" in
+    ''|'{'*|'['*) : ;; # empty, or JSON-shaped — leave null
+    *)
+      if [ "${#CLI_VERSION_RAW}" -le 200 ]; then
+        CLI_VERSION_JSON="$(jq -Rn --arg v "$CLI_VERSION_RAW" '$v')"
+      fi
+      ;;
+  esac
+fi
+
+printf '%s' "$VERDICT_JSON" | jq -c --argjson usage "$USAGE" --argjson cli_version "$CLI_VERSION_JSON" \
+  '. + {usage: $usage, cli_version: $cli_version}'
 exit 0

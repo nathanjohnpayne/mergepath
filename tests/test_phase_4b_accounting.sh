@@ -1376,10 +1376,10 @@ echo "verdict.schema.json + lib.sh — additive nullable usage fields (#602)"
 if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"source":"claude-json-envelope"}}'; then
   fail "pre-#602 4-key usage accepted despite #632 required-completeness"
 else pass "pre-#602 4-key usage rejected (#632 required-complete schema)"; fi
-if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":30,"cache_read_input_tokens":20,"reasoning_tokens":7,"total_cost_usd":0.42,"source":"claude-json-envelope"}}'; then
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":30,"cache_read_input_tokens":20,"reasoning_tokens":7,"total_cost_usd":0.42,"source":"claude-json-envelope"},"cli_version":null}'; then
   pass "usage with all additive #602 fields validates"
 else fail "extended usage shape rejected"; fi
-if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":null,"cache_read_input_tokens":null,"reasoning_tokens":null,"total_cost_usd":null,"source":"x"}}'; then
+if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":null,"cache_read_input_tokens":null,"reasoning_tokens":null,"total_cost_usd":null,"source":"x"},"cli_version":null}'; then
   pass "additive fields accept explicit null (nullable, never required)"
 else fail "null additive fields rejected"; fi
 if p4b_validate_verdict '{"verdict":"APPROVED","summary":"ok","findings":[],"usage":{"token_count":150,"input_tokens":100,"output_tokens":50,"bogus_key":1,"source":"x"}}'; then
@@ -1518,6 +1518,51 @@ if (
 ); then
   pass "loop numbering counts JSON objects: a multi-line record cannot inflate the next loop ID (#615 round 4)"
 else fail "object-count loop numbering (log=$(cat "$WORK/state-prettylog/phase-4b-loops/"*.jsonl 2>/dev/null | tail -3))"; fi
+
+# ===========================================================================
+echo "accounting.sh — cli_version threading (#622)"
+# ===========================================================================
+# p4b_acct_hook_record_loop maps VERDICT_JSON.cli_version through to the
+# built record instead of hard-coding null. Three cases: populated,
+# explicit null, and absent (an older adapter that predates #622) — all
+# must round-trip honestly, never fabricating a value.
+# shellcheck disable=SC2034  # orchestrator globals read by the sourced hook functions
+if (
+  P4B_ACCT_STATE_DIR="$WORK/state-cliversion-present"; export P4B_ACCT_STATE_DIR
+  REPO="o/r"; PR=310; REVIEWER=nathanpayne-codex; ADAPTER=codex
+  DIRECTION="claude->codex"; HEAD=cliver1
+  VERDICT_JSON='{"verdict":"APPROVED","summary":"ok","findings":[],"usage":null,"cli_version":"codex-cli 0.137.0"}'
+  p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
+  log="$(p4b_acct_hook_loop_log)"
+  jq -e '.loop.cli_version == "codex-cli 0.137.0"' "$log" >/dev/null || exit 1
+); then
+  pass "populated VERDICT_JSON.cli_version threads through to the built record"
+else fail "populated cli_version did not thread through"; fi
+# shellcheck disable=SC2034  # orchestrator globals read by the sourced hook functions
+if (
+  P4B_ACCT_STATE_DIR="$WORK/state-cliversion-null"; export P4B_ACCT_STATE_DIR
+  REPO="o/r"; PR=311; REVIEWER=nathanpayne-codex; ADAPTER=codex
+  DIRECTION="claude->codex"; HEAD=cliver2
+  VERDICT_JSON='{"verdict":"APPROVED","summary":"ok","findings":[],"usage":null,"cli_version":null}'
+  p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
+  log="$(p4b_acct_hook_loop_log)"
+  jq -e '.loop.cli_version == null' "$log" >/dev/null || exit 1
+); then
+  pass "explicit null VERDICT_JSON.cli_version records as null (never fabricated)"
+else fail "explicit null cli_version did not record as null"; fi
+# shellcheck disable=SC2034  # orchestrator globals read by the sourced hook functions
+if (
+  P4B_ACCT_STATE_DIR="$WORK/state-cliversion-absent"; export P4B_ACCT_STATE_DIR
+  REPO="o/r"; PR=312; REVIEWER=nathanpayne-codex; ADAPTER=codex
+  DIRECTION="claude->codex"; HEAD=cliver3
+  # Pre-#622 adapter envelope shape: no cli_version key at all.
+  VERDICT_JSON='{"verdict":"APPROVED","summary":"ok","findings":[],"usage":null}'
+  p4b_acct_hook_record_loop APPROVED posted false "" || exit 1
+  log="$(p4b_acct_hook_loop_log)"
+  jq -e '.loop.cli_version == null' "$log" >/dev/null || exit 1
+); then
+  pass "an envelope predating #622 (no cli_version key) records as null, not an error"
+else fail "absent cli_version key was not handled as null"; fi
 
 # Approval-time same-head gate at the HOOK level (#615 round 9, CodeRabbit;
 # fails pre-fix): a live log holding ONLY a prior CR-P1 loop, current loop

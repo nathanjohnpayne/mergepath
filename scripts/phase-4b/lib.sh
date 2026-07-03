@@ -452,6 +452,10 @@ p4b_validate_verdict() {
             and (.body | okstr))
       and ((.verdict != "APPROVED")
            or all(.findings[]?; (.severity as $s2 | ($required_severities | index($s2) | not))))
+      # cli_version (#622): required-but-nullable, same contract as usage —
+      # a string when the adapter captured `--version` output, null when it
+      # did not (never a guessed value).
+      and ((.cli_version == null) or (.cli_version | type == "string"))
       # usage: the schema-required keys must all be present, any other key
       # must be one the schema DECLARES, and every field must type-check.
       # This mirrors the JSON Schema exactly: required ⊆ keys ⊆ properties,
