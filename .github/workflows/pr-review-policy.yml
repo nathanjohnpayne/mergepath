@@ -338,6 +338,15 @@ jobs:
         if: steps.check.outputs.propagation_lane == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # #620 (Codex r6): the needs-external-review removal below must fire
+          # agent-review.yml's `unlabeled` settle re-arm, and GITHUB_TOKEN-driven
+          # events create no workflow runs (the #315/#324 auto-clear lesson) —
+          # a GITHUB_TOKEN removal here leaves an approved, settled PR
+          # CLEAN-but-unmerged. PAT-scoped to the removal command ONLY: the
+          # lane-marker comment below stays github-actions-authored for its
+          # #429 consumers, and every other command keeps the restricted
+          # default token.
+          LABEL_REMOVAL_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           # Embedded in the lane marker so the signal is HEAD-PINNED — a
           # consumer (merge-clearance-gate.sh's propagation exemption, #429)
@@ -355,21 +364,6 @@ jobs:
           # and an internal reviewer-identity APPROVED (the standard
           # under-threshold path).
           #
-          # If a prior run (or a stale label-prefixed edit) applied
-          # needs-external-review before this PR qualified, remove it so
-          # the Label Gate stops blocking. The workflow REMOVING a label
-          # it is responsible for applying is not an agent override — the
-          # human-action-label prohibition (REVIEW_POLICY.md § Agent
-          # prohibitions) is about agents clearing labels, not about the
-          # policy automation reconciling its own decision. This lane is
-          # a sanctioned automation alongside auto-clear-blocking-labels.yml.
-          EXISTING=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name' | grep '^needs-external-review$' || true)
-          if [ -n "$EXISTING" ]; then
-            gh pr edit "$PR_NUMBER" --remove-label "needs-external-review" \
-              --repo "${{ github.repository }}"
-            echo "Removed needs-external-review — PR qualifies for the propagation review lane."
-          fi
-
           # Post a HEAD-PINNED, machine-readable lane marker. The marker
           # embeds the verified head SHA, so a consumer of this signal
           # (scripts/merge-clearance-gate.sh's propagation exemption, #429)
@@ -381,8 +375,22 @@ jobs:
           # don't re-comment; a faithful re-push to a NEW head posts a fresh
           # marker; a DIVERGED push never reaches this step (propagation_lane
           # is false), so no marker is ever posted for an unverified head.
-          # Marker contract is shared with merge-clearance-gate.sh — keep the
+          # Marker contract is shared with merge-clearance-gate.sh
+          # (lane_verified(), also consumed indirectly by agent-review.yml's
+          # rc=5 branch via --derive-external-requiredness, #620) — keep the
           # `mergepath-propagation-lane verified-head=<sha>` form in sync.
+          #
+          # ORDER MATTERS (#620 Codex r9): the marker MUST be posted before
+          # the label removal below. The removal fires agent-review.yml's
+          # unlabeled re-arm, whose rc=5 branch derives external
+          # requiredness via merge-clearance-gate.sh — whose lane_verified()
+          # reads this marker to tell exemption apart from clearance.
+          # Marker-after-removal would open a window where that derivation
+          # treats the exemption as an ordinary above-threshold arm.
+          # Marker-then-removal is safe in the failure direction: if the
+          # marker posts and the removal then fails, the still-present label
+          # keeps merge-clearance-gate blocking (a present label is never
+          # subject to the propagation exemption).
           MARKER="<!-- mergepath-propagation-lane verified-head=$HEAD_SHA -->"
           ALREADY=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -F "$MARKER" || true)
           if [ -z "$ALREADY" ]; then
@@ -397,4 +405,22 @@ jobs:
           > Automated check per .github/review-policy.yml
           EOF
           )"
+          fi
+
+          # If a prior run (or a stale label-prefixed edit) applied
+          # needs-external-review before this PR qualified, remove it so
+          # the Label Gate stops blocking. The workflow REMOVING a label
+          # it is responsible for applying is not an agent override — the
+          # human-action-label prohibition (REVIEW_POLICY.md § Agent
+          # prohibitions) is about agents clearing labels, not about the
+          # policy automation reconciling its own decision. This lane is
+          # a sanctioned automation alongside auto-clear-blocking-labels.yml.
+          # Runs AFTER the marker post above — see ORDER MATTERS.
+          EXISTING=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name' | grep '^needs-external-review$' || true)
+          if [ -n "$EXISTING" ]; then
+            # PAT-driven so the removal fires the #620 unlabeled settle
+            # re-arm (see LABEL_REMOVAL_TOKEN above).
+            GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh pr edit "$PR_NUMBER" --remove-label "needs-external-review" \
+              --repo "${{ github.repository }}"
+            echo "Removed needs-external-review — PR qualifies for the propagation review lane."
           fi

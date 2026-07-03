@@ -83,6 +83,12 @@ if [ "$1" = "api" ]; then
       exit 0
       ;;
     repos/*/issues/*/comments)
+      # FIXTURE_COMMENTS_FAIL=1 simulates a transient comments-API failure
+      # (the indeterminate marker-read case, automated-4b round-5 P1).
+      if [ "${FIXTURE_COMMENTS_FAIL:-0}" = "1" ]; then
+        echo "STUB gh: simulated comments API failure" >&2
+        exit 1
+      fi
       cat "${FIXTURE_COMMENTS:-/dev/null}"
       exit 0
       ;;
@@ -811,6 +817,159 @@ else
   fail "expected job-name assertion to pass on a correct job name (#533); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 fi  # end re-entrancy guard (MCG_SKIP_FIX3_SELFTEST)
+
+# ---------------------------------------------------------------------------
+# --derive-external-requiredness query mode (#620/#630): prints exactly
+# true/false on stdout, exit 0; errors keep the die() exit codes so the
+# consumer (agent-review.yml rc=5) fails closed. Semantics: true iff a
+# NON-vacuous downstream review gate protects the current head.
+# ---------------------------------------------------------------------------
+
+echo; echo "--- Query 1: label present forces requiredness true"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone" "$EXT_LABEL")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "query: label present → prints exactly 'true'"
+else
+  fail "query: label present expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Query 2: under threshold, no label, no marker → false"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"README.md","additions":3,"deletions":1}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "query: under-threshold plain PR → prints exactly 'false'"
+else
+  fail "query: under-threshold expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Query 3: over threshold → true"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"big.txt","additions":400,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "query: over-threshold → prints exactly 'true'"
+else
+  fail "query: over-threshold expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Query 4: protected path under threshold → true"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "query: protected path → prints exactly 'true'"
+else
+  fail "query: protected path expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Query 5: verified lane marker for HEAD, label absent → false"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":500,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" '
+  [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane verified-head=" + $sha + " -->") }]
+')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "query: lane-exempt verified head → prints exactly 'false' (vacuous downstream)"
+else
+  fail "query: lane-exempt expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Query 5b: indeterminate marker read → nonzero, NOT 'true' (automated-4b r5 P1)"
+# An over-threshold PR (would derive true from threshold if it fell through)
+# whose comments API fails: query mode must fail closed (nonzero) rather than
+# print the unsafe 'true' that would authorize the rc=5 CodeRabbit downgrade.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":500,"deletions":0}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS_FAIL=1 \
+  run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" != 0 ] && [ "$OUT" != "true" ]; then
+  pass "query: indeterminate marker read → nonzero exit and no 'true' (caller fails closed → rc=5 blocks)"
+else
+  fail "query: indeterminate marker read expected nonzero and not 'true'; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Query 6: external gate disabled → false"
+SCRATCH=$(make_scratch false false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone" "$EXT_LABEL")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "query: external gate disabled → prints exactly 'false' (even with the label present)"
+else
+  fail "query: gate-disabled expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Query 7: Dependabot author → always false (reviewer gate is not a Codex gate; automated-4b P1)"
+# The Dependabot reviewer gate blocks on a reviewer-identity APPROVED, not on
+# Codex, and Codex does not review Dependabot PRs — so for the rc=5 branch's
+# Codex-requiredness question the answer is false regardless of the knob.
+# (The FULL gate still enforces the reviewer-APPROVED requirement; that is
+# covered by the non-query Dependabot tests above.)
+SCRATCH=$(make_scratch true false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+SCRATCH2=$(make_scratch false false)
+set +e
+OUT2=$(FIXTURE_PR="$FIXTURE_PR" run_gate "$SCRATCH2" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC2=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ] && [ "$RC2" = 0 ] && [ "$OUT2" = "false" ]; then
+  pass "query: dependabot → false whether the reviewer gate is enabled or disabled (not a Codex gate)"
+else
+  fail "query: dependabot expected false/0 both ways; got rc=$RC out='$OUT' rc2=$RC2 out2='$OUT2'"
+fi
+
+echo; echo "--- Query 8: PR fetch failure → nonzero (caller fails closed)"
+SCRATCH=$(make_scratch false true)
+set +e
+OUT=$(FIXTURE_PR="/nonexistent-fixture" run_gate "$SCRATCH" --derive-external-requiredness 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" != 0 ]; then
+  pass "query: unfetchable PR metadata → nonzero exit (fail-closed contract)"
+else
+  fail "query: expected nonzero on PR fetch failure; got rc=0 out='$OUT'"
+fi
+
 # ---------------------------------------------------------------------------
 echo
 echo "============================================"

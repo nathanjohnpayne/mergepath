@@ -13,7 +13,13 @@ on:
     # `reopened` is included so the auto-merge re-arm path (#495) actually
     # fires: the job `if:` matches `synchronize || reopened`, but a reopened
     # event only reaches this workflow if it is subscribed here.
-    types: [opened, ready_for_review, labeled, synchronize, reopened]
+    # `unlabeled` is the #620 re-arm: on an over-threshold PR with a
+    # carried-over approval, update-branch makes triage re-apply
+    # needs-external-review, the label re-verify inside auto-merge sees it
+    # and hard-fails (correctly), and auto-clear removes the label moments
+    # later once the clearance gate passes — with no trigger on the removal,
+    # the PR sat CLEAN-but-unmerged until a human reran the failed job.
+    types: [opened, ready_for_review, labeled, synchronize, reopened, unlabeled]
   pull_request_review:
     types: [submitted]
 
@@ -57,7 +63,8 @@ jobs:
        (github.event.action == 'opened' ||
         github.event.action == 'ready_for_review' ||
         github.event.action == 'synchronize' ||
-        github.event.action == 'reopened')) ||
+        github.event.action == 'reopened' ||
+        github.event.action == 'unlabeled')) ||
       (github.event_name == 'pull_request_review' &&
        github.event.review.state == 'approved')
     runs-on: ubuntu-latest
@@ -484,7 +491,7 @@ jobs:
   # auto-merge arm. See #61 for the cross-event race and this PR for the
   # same-workflow races nathanpayne-codex caught during review.
   #
-  # Two triggers arm auto-merge (#495):
+  # Three triggers arm auto-merge (#495, #620):
   #
   #   1. `pull_request_review` + `approved` — the original path. The
   #      approval event IS the signal, so no API approval re-check is
@@ -505,11 +512,31 @@ jobs:
   #      identity, blocking-label re-verify) re-applies on the NEW HEAD,
   #      and `gh pr merge --auto` is idempotent when --auto is already
   #      enabled.
+  #   3. `pull_request` + `unlabeled` for a BLOCKING label (#620) — the
+  #      settle path. On an over-threshold PR with a carried-over
+  #      approval, update-branch makes triage re-apply
+  #      needs-external-review; the re-verify inside a concurrent arming
+  #      run reads that transient state and hard-fails (correct in
+  #      isolation — anti-#61); auto-clear then removes the label once
+  #      the clearance gate passes on the new head — and nothing
+  #      re-armed. The label REMOVAL is the state-settled signal, so it
+  #      re-runs the same fully-gated arming logic: the approval gate
+  #      re-confirms a registered non-author APPROVED via the API (same
+  #      as path 2), and every downstream guard re-applies unchanged.
+  #      The job `if:` additionally requires the REMOVED label to be one
+  #      of the four blocking names (the full Label Gate blocking set,
+  #      including policy-violation - Codex P2 on the #620 PR), so unrelated label churn does not spend
+  #      runner minutes. triage deliberately does NOT run on `unlabeled`
+  #      (its action filter excludes it — re-applying labels here would
+  #      flap against auto-clear), so the triage-success requirement
+  #      accepts `skipped` on this path: no sibling job can apply a
+  #      label in an unlabeled run, and the two in-job label re-verifies
+  #      still read the live API state fail-closed before any merge.
   #
   # The job body references only `github.event.pull_request.*` (number,
-  # html_url, labels) — both event types carry that object — so the steps
-  # are event-shape-agnostic. Only the `if:` and the approval-gate step
-  # branch on event name.
+  # html_url, labels) — all trigger shapes carry that object — so the
+  # steps are event-shape-agnostic. Only the `if:` and the approval-gate
+  # step branch on event name.
   auto-merge-on-approval:
     needs: [load-config, detect-disagreement, block-self-approval, triage]
     if: >
@@ -518,9 +545,13 @@ jobs:
         github.event.review.state == 'approved') ||
        (github.event_name == 'pull_request' &&
         (github.event.action == 'synchronize' ||
-         github.event.action == 'reopened'))) &&
+         github.event.action == 'reopened' ||
+         (github.event.action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))))) &&
       (github.event_name != 'pull_request' ||
-       needs.triage.result == 'success') &&
+       needs.triage.result == 'success' ||
+       (github.event.action == 'unlabeled' &&
+        needs.triage.result == 'skipped')) &&
       !contains(github.event.pull_request.labels.*.name, 'needs-external-review') &&
       !contains(github.event.pull_request.labels.*.name, 'needs-human-review') &&
       !contains(github.event.pull_request.labels.*.name, 'human-hold')
@@ -781,21 +812,43 @@ jobs:
             5)
               # #489: a rate_limit_stalled is non-blocking ONLY when the Codex
               # failover engaged AND an external-review gate will actually gate
-              # the merge on Codex — i.e. the PR is above-threshold, where
-              # merge-clearance-gate.sh's external_review_gate blocks until
-              # Codex/external clearance. For UNDER-threshold PRs that gate
-              # passes vacuously and --trigger-only does not wait for Codex, so
-              # proceeding would let a rate-limited PR merge with neither bot
-              # having reviewed it — those keep BLOCKING (Codex P2 on #512 r3).
-              # The disposition lives in the unit-tested, fail-closed
-              # scripts/coderabbit-automerge-rate-limit-gate.sh; the
-              # above-threshold signal is the `needs-external-review` label
-              # (present for above-threshold PRs through Phase 2.5, before
-              # external clearance removes it).
-              ext_required=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels \
-                --jq 'any(.labels[]; .name=="needs-external-review")' 2>/dev/null || echo "false")
+              # the merge on Codex — i.e. merge-clearance-gate.sh's external
+              # arm applies NON-vacuously to this PR's current head. For PRs
+              # where that gate passes vacuously, --trigger-only does not wait
+              # for Codex, so proceeding would let a rate-limited PR merge
+              # with neither bot having reviewed it — those keep BLOCKING
+              # (Codex P2 on #512 r3). The disposition lives in the
+              # unit-tested, fail-closed
+              # scripts/coderabbit-automerge-rate-limit-gate.sh.
+              #
+              # #620: requiredness is asked of merge-clearance-gate.sh ITSELF
+              # (--derive-external-requiredness): the same intrinsic
+              # threshold + protected-paths computation the required check
+              # runs, with the label as a force-on signal and the
+              # propagation lane's HEAD-pinned verified marker as the
+              # exemption, all evaluated on the LIVE head. Label-event
+              # proxies (current-label reads, unlabeled-removal overrides)
+              # were rejected across five review rounds — a label event is
+              # not head-pinned proof of a downstream gate; this derivation
+              # is. It also un-stalls the settle re-arm for EVERY blocking
+              # label removal on an intrinsically above-threshold PR, not
+              # just needs-external-review. Fail closed: any nonzero exit or
+              # unexpected output from the query reads as false (block).
+              # stderr streams to the step log for diagnosability (#633);
+              # only stdout (exactly `true` or `false`) is consumed.
+              ext_required=false
+              if req=$(bash scripts/merge-clearance-gate.sh --derive-external-requiredness "$PR_NUMBER" "$REPO"); then
+                case "$req" in
+                  true|false) ext_required=$req ;;
+                esac
+              fi
               if bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_required"; then
-                echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged on an above-threshold PR — proceeding. merge-clearance's external-review gate blocks the merge until Codex/external clearance lands."
+                echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged and merge-clearance's external arm applies non-vacuously to the current head — proceeding; that gate blocks the merge until Codex/external clearance lands."
+                # Record the downgrade for the final re-verify step: the
+                # requiredness derivation is re-run there against the live
+                # merge head, so state that changes during the waits (e.g.
+                # a propagation-lane verification landing) aborts the merge.
+                echo "CR_RATE_LIMIT_DOWNGRADED=true" >> "$GITHUB_ENV"
               else
                 echo "::error::CodeRabbit rate-limit retry budget exhausted — blocking auto-merge. Either the failover did not engage (codex_failover_requested=false) or the PR is under-threshold (no downstream Codex gate, so it must not auto-merge bot-unreviewed). Human must re-trigger or merge manually."
                 exit 1
@@ -898,6 +951,8 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           LABELS=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name')
           printf 'Labels after test wait:\n%s\n' "$LABELS"
@@ -907,6 +962,40 @@ jobs:
               exit 1
             fi
           done
+          # #620 (automated 4b P1, rounds 1+2): if this run downgraded a
+          # CodeRabbit rate-limit stall (rc=5), re-validate the downgrade's
+          # premise at the last verify point. The rc=5-time derivation ran
+          # minutes earlier; state can change during the waits (a push, a
+          # propagation-lane verification landing), and merge-clearance
+          # passing vacuously for the head being merged would mean neither
+          # bot reviewed it.
+          #
+          # Two fail-closed checks, scoped to downgraded runs only:
+          # 1. Head drift: the downgrade anchored the event head, and the
+          #    merge pins CURRENT_HEAD_SHA (the live head the required-check
+          #    wait exported) via --match-head-commit — if they differ, the
+          #    CodeRabbit disposition is stale for the merge head. Abort.
+          # 2. Re-run merge-clearance-gate.sh --derive-external-requiredness
+          #    against the (now-pinned) live head and require `true`: the
+          #    same intrinsic threshold/protected-paths/label/lane-exemption
+          #    derivation the required check uses. Any error or non-true
+          #    output aborts.
+          if [ "${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true" ]; then
+            if [ -z "${CURRENT_HEAD_SHA:-}" ] || [ "$CURRENT_HEAD_SHA" != "$HEAD_SHA" ]; then
+              echo "::error::Head drifted after the rc=5 rate-limit downgrade (event=$HEAD_SHA live=${CURRENT_HEAD_SHA:-unset}) — the CodeRabbit disposition is stale for the merge head. Aborting auto-merge."
+              exit 1
+            fi
+            re_required=false
+            if req=$(bash scripts/merge-clearance-gate.sh --derive-external-requiredness "$PR_NUMBER" "$REPO"); then
+              case "$req" in
+                true) re_required=true ;;
+              esac
+            fi
+            if [ "$re_required" != "true" ]; then
+              echo "::error::merge-clearance external requiredness is no longer true (or underivable) for $CURRENT_HEAD_SHA after an rc=5 rate-limit downgrade — the gate would pass vacuously with neither bot review. Aborting auto-merge."
+              exit 1
+            fi
+          fi
           echo "No blocking labels present after test wait — proceeding to merge."
 
       - name: Enable auto-merge

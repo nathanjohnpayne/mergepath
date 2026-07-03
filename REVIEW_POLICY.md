@@ -361,7 +361,7 @@ After internal review passes (Phase 2), CodeRabbit provides an independent autom
 
    **Auto-pause and other skips (exit `6`, #490).** CodeRabbit auto-pauses incremental review after `reviews.auto_review.auto_pause_after_reviewed_commits` reviewed commits (we set this deliberately in `.coderabbit.yml`; the upstream default is 5) and posts a durable "Reviews paused" NOTE that it does NOT auto-resume. Our long agent-loop PRs cross that threshold, so the helper detects the pause via the stable `review paused by coderabbit.ai` marker, posts **`@coderabbitai resume`** (a one-shot `@coderabbitai review` would re-pause after the next push), and resumes polling — bounded by `coderabbit.max_resume_retries`. The `paused` state is distinct from `rate_limit` (#489) and `in_progress`. If resume retries are exhausted, the helper exits `6` with `status: "paused"` and `skip_reason: "paused"`; raise `auto_pause_after_reviewed_commits` or intervene. The helper also surfaces — without re-invoking — the static skips where auto-review will never fire: a PR whose base branch is not in `reviews.auto_review.base_branches` (`skip_reason: "non-base-branch"`) and a draft PR when `drafts: false` (`skip_reason: "draft"`). All exit-`6` cases set the JSON `skip_reason` field so the caller can act (retarget the base, mark the PR ready, or escalate) rather than waiting out a full timeout.
 
-   **Rate-limit → Codex failover (exit `5`, #489).** When CodeRabbit reports rate-limited and `coderabbit.codex_failover_on_rate_limit` is true (the default), the helper requests `@codex review` once — HEAD-pinned and idempotent — by invoking `scripts/codex-review-request.sh --trigger-only` with `MERGEPATH_PHASE_4A_GATED=true`, so the PR advances via Codex (the real blocking gate) instead of idling on CodeRabbit's hourly allowance. It composes with `codex.request_by_default` (#486) but fires regardless of it, and it is time-boxed/self-reverting: a single trigger per run with no permanent Codex pin, so once CodeRabbit recovers the steady-state posture returns. The failover is recorded in the output JSON as `codex_failover_requested: true`. Its effect on the exit-`5` contract: a `rate_limit_stalled` that engaged the failover is a **non-blocking note**, not a hard human-alert — Codex was requested and the normal Phase 4a flow + `Merge clearance gate` carry the merge. Only an exit `5` with `codex_failover_requested: false` (the knob off, or `codex.enabled: false` so there is nothing to fail over to) still requires alerting the human. In the **agent-driven wait**, the agent (in-session) then proceeds via the normal Phase 4a flow. In the **auto-merge workflow** (`agent-review.yml`'s `Wait for CodeRabbit` step), which bridges the author token to the failover (`OP_PREFLIGHT_AUTHOR_PAT` ← `AUTHOR_MERGE_TOKEN`, so the author-attributed `@codex review` can post in CI), the exit-`5` downgrade is **scoped to above-threshold PRs** — the unit-tested, fail-closed `scripts/coderabbit-automerge-rate-limit-gate.sh` proceeds only when `codex_failover_requested: true` **and** the PR carries `needs-external-review` (so `Merge clearance gate`'s external-review gate still blocks the merge until Codex/external clearance lands). **Under-threshold** rate-limit stalls keep blocking the auto-merge job, exactly as before this feature: that gate passes vacuously for them and `--trigger-only` does not wait for Codex, so proceeding would let a small PR auto-merge with neither bot having reviewed it (#512 round-3 Codex finding). Opt out per repo with `coderabbit.codex_failover_on_rate_limit: false`.
+   **Rate-limit → Codex failover (exit `5`, #489).** When CodeRabbit reports rate-limited and `coderabbit.codex_failover_on_rate_limit` is true (the default), the helper requests `@codex review` once — HEAD-pinned and idempotent — by invoking `scripts/codex-review-request.sh --trigger-only` with `MERGEPATH_PHASE_4A_GATED=true`, so the PR advances via Codex (the real blocking gate) instead of idling on CodeRabbit's hourly allowance. It composes with `codex.request_by_default` (#486) but fires regardless of it, and it is time-boxed/self-reverting: a single trigger per run with no permanent Codex pin, so once CodeRabbit recovers the steady-state posture returns. The failover is recorded in the output JSON as `codex_failover_requested: true`. Its effect on the exit-`5` contract: a `rate_limit_stalled` that engaged the failover is a **non-blocking note**, not a hard human-alert — Codex was requested and the normal Phase 4a flow + `Merge clearance gate` carry the merge. Only an exit `5` with `codex_failover_requested: false` (the knob off, or `codex.enabled: false` so there is nothing to fail over to) still requires alerting the human. In the **agent-driven wait**, the agent (in-session) then proceeds via the normal Phase 4a flow. In the **auto-merge workflow** (`agent-review.yml`'s `Wait for CodeRabbit` step), which bridges the author token to the failover (`OP_PREFLIGHT_AUTHOR_PAT` ← `AUTHOR_MERGE_TOKEN`, so the author-attributed `@codex review` can post in CI), the exit-`5` downgrade is **scoped to externally-gated PRs** — the unit-tested, fail-closed `scripts/coderabbit-automerge-rate-limit-gate.sh` proceeds only when `codex_failover_requested: true` **and** `scripts/merge-clearance-gate.sh --derive-external-requiredness` reports that the `Merge clearance gate`'s external arm applies non-vacuously to the live head (intrinsic threshold/protected paths, label force-on, propagation-lane exemption — #620; label events alone are never trusted), so that gate still blocks the merge until Codex/external clearance lands. **Vacuously-gated** rate-limit stalls (under threshold, no protected paths, no label, or a lane-exempt verified head) keep blocking the auto-merge job, exactly as before this feature: merge clearance passes vacuously for them and `--trigger-only` does not wait for Codex, so proceeding would let such a PR auto-merge with neither bot having reviewed it (#512 round-3 Codex finding). Opt out per repo with `coderabbit.codex_failover_on_rate_limit: false`.
 2. **Read both API endpoints.** CodeRabbit posts two types of comments that must both be checked:
    - **PR-level summary:** `gh api repos/{owner}/{repo}/issues/{pr_number}/comments` — contains the high-level walkthrough and summary.
    - **Inline review comments on the diff:** `gh api repos/{owner}/{repo}/pulls/{pr_number}/comments` — contains line-by-line findings anchored to specific code.
@@ -624,19 +624,43 @@ absent, the workflow stops after validation and leaves manual author
 merge as the default. Reviewer tokens such as
 `REVIEWER_ASSIGNMENT_TOKEN` must not be used for PR merges.
 
-Arming is not one-shot on the approval event. The job arms on two
-triggers (#495): the original `pull_request_review` + `approved`
-event, and a `pull_request` `synchronize` / `reopened` **re-arm**
-path. The re-arm path retries `gh pr merge --auto` after a fix-commit
-— the common case where a late Codex finding lands at or after the
-author's approval and the fix push would otherwise never re-arm — but
-only when the PR already carries a valid non-author latest-state
-`APPROVED` review (the same latest-state-per-reviewer collapse the
-merge gate uses, so a withdrawn approval does not re-arm). A push with
-no existing approval does NOT arm. Every gate (CodeRabbit wait,
-`AUTHOR_MERGE_TOKEN` identity, blocking-label re-verify) re-applies on
-the new HEAD, and the call is idempotent when `--auto` is already
-enabled.
+Arming is not one-shot on the approval event. The job arms on three
+triggers: the original `pull_request_review` + `approved` event; a
+`pull_request` `synchronize` / `reopened` **re-arm** path (#495); and
+a `pull_request` `unlabeled` **settle re-arm** path (#620), which
+fires when a removed label is one of the four blocking names
+(`needs-external-review`, `needs-human-review`, `policy-violation`,
+`human-hold`) — the state-settled signal for the label race where a
+synchronize-time arming run hard-fails on a transient label that
+auto-clear removes moments later. Triage deliberately does not run on
+`unlabeled` (it would re-apply the label just removed), so the arming
+job accepts a skipped triage result on that path only; and because
+the `needs-external-review` removal IS the trigger there, the
+CodeRabbit rate-limit branch derives external-review applicability
+by asking `scripts/merge-clearance-gate.sh
+--derive-external-requiredness` — the same intrinsic
+threshold/protected-paths computation the required check runs, with
+the label as a force-on signal and the propagation lane's
+verified-head marker as the exemption, evaluated on the live head —
+never from label events, which are not head-pinned proof of a
+downstream gate. Downgraded runs re-run that derivation just before
+merge and abort on head drift, so state that changes during the
+waits (a push, a lane verification landing) cannot ride an earlier
+disposition. Label
+removals fire this trigger only when performed with a PAT —
+GITHUB_TOKEN-driven events create no workflow runs (#315/#324) — so
+`auto-clear-blocking-labels.yml` and `pr-review-policy.yml`'s
+propagation lane both remove blocking labels under a PAT. The
+synchronize/reopened path retries `gh pr merge --auto` after a
+fix-commit — the common case where a late Codex finding lands at or
+after the author's approval and the fix push would otherwise never
+re-arm. Every re-arm path acts only when the PR already carries a
+valid non-author latest-state `APPROVED` review (the same
+latest-state-per-reviewer collapse the merge gate uses, so a
+withdrawn approval does not re-arm). A push with no existing approval
+does NOT arm. Every gate (CodeRabbit wait, `AUTHOR_MERGE_TOKEN`
+identity, blocking-label re-verify) re-applies on the new HEAD, and
+the call is idempotent when `--auto` is already enabled.
 
 #### Phase 4b: Manual CLI Fallback (Human Handoff)
 
