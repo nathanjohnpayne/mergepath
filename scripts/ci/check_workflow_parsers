@@ -710,6 +710,26 @@ else
   echo "  FAIL: pr-review-policy's needs-external-review removal must run under LABEL_REMOVAL_TOKEN (REVIEWER_ASSIGNMENT_TOKEN) with the step default left as GITHUB_TOKEN — a GITHUB_TOKEN removal fires no unlabeled re-arm (#620)" >&2
 fi
 
+# 2f-bis. Within the propagation lane step, the verified-head marker MUST be
+# posted BEFORE the label removal (Codex r9): the removal fires the unlabeled
+# re-arm whose rc=5 branch reads the marker to tell exemption apart from
+# clearance — marker-after-removal opens a window where the re-arm treats the
+# exemption as ordinary external clearance and downgrades a CodeRabbit
+# rate-limit stall with neither bot having reviewed.
+if awk '
+  /- name: Propagation PR review lane/ {f=1}
+  f && /gh pr comment/ && !m {m=NR}
+  f && /--remove-label "needs-external-review"/ && !r {r=NR}
+  f && /^      - name:/ && !/Propagation PR review lane/ {exit}
+  END {exit (m && r && m < r) ? 0 : 1}
+' "$prp_workflow"; then
+  pass=$((pass + 1))
+  echo "  PASS: propagation lane posts the verified-head marker before removing the label (#620)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: the propagation lane must post the verified-head marker BEFORE the needs-external-review removal — the removal-fired re-arm reads the marker, so marker-after-removal races the rc=5 exemption exclusion (#620)" >&2
+fi
+
 # 3. A dedicated approval gate runs on the pull_request (re-arm) path and,
 #    since #544, the direct pull_request_review approval path too — so an
 #    unregistered non-author approval arms auto-merge on neither path.

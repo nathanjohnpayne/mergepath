@@ -856,9 +856,9 @@ jobs:
               # trusted marker — contract shared with pr-review-policy.yml
               # and merge-clearance-gate.sh's lane_verified(): keep the
               # `mergepath-propagation-lane verified-head=<sha>` form in
-              # sync. The marker is posted seconds after the removal by the
-              # same lane step, well inside coderabbit-wait's runtime, so it
-              # is present by the time this branch evaluates. Fail-closed:
+              # sync. The lane posts the marker BEFORE removing the label
+              # (ordering pinned by check_workflow_parsers), so the marker
+              # exists before any unlabeled run the removal fires. Fail-closed:
               # if the marker read errors, treat it as present (no raise →
               # block), so an API hiccup never lets a rate-limited PR
               # through.

@@ -364,23 +364,6 @@ jobs:
           # and an internal reviewer-identity APPROVED (the standard
           # under-threshold path).
           #
-          # If a prior run (or a stale label-prefixed edit) applied
-          # needs-external-review before this PR qualified, remove it so
-          # the Label Gate stops blocking. The workflow REMOVING a label
-          # it is responsible for applying is not an agent override — the
-          # human-action-label prohibition (REVIEW_POLICY.md § Agent
-          # prohibitions) is about agents clearing labels, not about the
-          # policy automation reconciling its own decision. This lane is
-          # a sanctioned automation alongside auto-clear-blocking-labels.yml.
-          EXISTING=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name' | grep '^needs-external-review$' || true)
-          if [ -n "$EXISTING" ]; then
-            # PAT-driven so the removal fires the #620 unlabeled settle
-            # re-arm (see LABEL_REMOVAL_TOKEN above).
-            GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh pr edit "$PR_NUMBER" --remove-label "needs-external-review" \
-              --repo "${{ github.repository }}"
-            echo "Removed needs-external-review — PR qualifies for the propagation review lane."
-          fi
-
           # Post a HEAD-PINNED, machine-readable lane marker. The marker
           # embeds the verified head SHA, so a consumer of this signal
           # (scripts/merge-clearance-gate.sh's propagation exemption, #429)
@@ -396,6 +379,16 @@ jobs:
           # agent-review.yml's rc=5 propagation-exemption exclusion (#620) —
           # keep the `mergepath-propagation-lane verified-head=<sha>` form
           # in sync.
+          #
+          # ORDER MATTERS (#620 Codex r9): the marker MUST be posted before
+          # the label removal below. The removal fires agent-review.yml's
+          # unlabeled re-arm, whose rc=5 branch reads this marker to tell
+          # exemption apart from clearance — marker-after-removal would open
+          # a window where the re-arm treats the exemption as ordinary
+          # external clearance. Marker-then-removal is safe in the failure
+          # direction: if the marker posts and the removal then fails, the
+          # still-present label keeps merge-clearance-gate blocking (a
+          # present label is never subject to the propagation exemption).
           MARKER="<!-- mergepath-propagation-lane verified-head=$HEAD_SHA -->"
           ALREADY=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -F "$MARKER" || true)
           if [ -z "$ALREADY" ]; then
@@ -410,4 +403,22 @@ jobs:
           > Automated check per .github/review-policy.yml
           EOF
           )"
+          fi
+
+          # If a prior run (or a stale label-prefixed edit) applied
+          # needs-external-review before this PR qualified, remove it so
+          # the Label Gate stops blocking. The workflow REMOVING a label
+          # it is responsible for applying is not an agent override — the
+          # human-action-label prohibition (REVIEW_POLICY.md § Agent
+          # prohibitions) is about agents clearing labels, not about the
+          # policy automation reconciling its own decision. This lane is
+          # a sanctioned automation alongside auto-clear-blocking-labels.yml.
+          # Runs AFTER the marker post above — see ORDER MATTERS.
+          EXISTING=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json labels --jq '.labels[].name' | grep '^needs-external-review$' || true)
+          if [ -n "$EXISTING" ]; then
+            # PAT-driven so the removal fires the #620 unlabeled settle
+            # re-arm (see LABEL_REMOVAL_TOKEN above).
+            GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh pr edit "$PR_NUMBER" --remove-label "needs-external-review" \
+              --repo "${{ github.repository }}"
+            echo "Removed needs-external-review — PR qualifies for the propagation review lane."
           fi
