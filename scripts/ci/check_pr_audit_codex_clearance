@@ -215,16 +215,19 @@ if (codexEnabled && inlineComments !== null) {
     );
   }
 
-  // Latest HEAD-anchored Codex verdict comment. #612, Codex P2 round 1 on
-  // #640. Latest-first, then-affirmative, #608 P1 shape. Same-agent gated,
-  // mirroring the reaction path below — a verdict only substitutes for
-  // gate b through codex-review-check.sh branch 2, which requires
-  // same-agent. Also merge-time bounded, mirroring the reaction path
-  // mergedAt upper bound — a verdict posted after mergedAt must not count
-  // in this retrospective audit.
+  // Latest HEAD-anchored Codex verdict comment. #612, Codex P2 rounds 1-2
+  // on #640. Latest-first, then-affirmative, #608 P1 shape, ties
+  // replace-on->= matching max_by(.created_at). Computed UNCONDITIONALLY,
+  // not gated on sameAgentContext: the merge gate CODEX_HEAD_VERDICT_ANY_TIME
+  // feeds the Phase 4b substitute staleness guard regardless of same-agent,
+  // so a cross-agent verdict must still count as a newer Codex signal even
+  // though it cannot itself clear. Same-agent gating applies instead at the
+  // codexCleared assignment below, mirroring the reaction path for
+  // clearance purposes only. Also merge-time bounded — a verdict posted
+  // after mergedAt must not count in this retrospective audit.
   let latestVerdictTime = '';
   let verdictAffirmative = false;
-  if (sameAgentContext) {
+  {
     const headLower = (headSha || '').toLowerCase();
     if (headLower) {
       let latestVerdict = null;
@@ -236,7 +239,7 @@ if (codexEnabled && inlineComments !== null) {
           ...body.matchAll(/reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})/g),
         ].map(m => m[1]);
         if (!shaMatches.some(s => headLower.startsWith(s))) continue;
-        if (!latestVerdict || c.created_at > latestVerdict.created_at) {
+        if (!latestVerdict || c.created_at >= latestVerdict.created_at) {
           latestVerdict = {
             created_at: c.created_at,
             affirmative: /^\s*codex review:\s*didn.?t find any major issues\b/im
@@ -283,7 +286,7 @@ if (codexEnabled && inlineComments !== null) {
   } else if (latestKind === 'review') {
     codexCleared = !reviewHasUnresolvedP01;
   } else if (latestKind === 'verdict') {
-    codexCleared = verdictAffirmative && !reviewHasUnresolvedP01;
+    codexCleared = sameAgentContext && verdictAffirmative && !reviewHasUnresolvedP01;
   }
 }
 // --- end mirrored algorithm --------------------------------------

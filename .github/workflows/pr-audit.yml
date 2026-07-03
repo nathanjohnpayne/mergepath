@@ -717,26 +717,31 @@ jobs:
                   // clears the same way the review path does: affirmative AND
                   // zero unresolved P0/P1 on HEAD (reviewHasUnresolvedP01 is
                   // already HEAD-scoped, independent of which signal is
-                  // latest). Two guards mirror the review/reaction paths
-                  // exactly, both flagged by Codex on the original PR:
-                  //   - Same-agent gated: a verdict comment substitutes for
-                  //     gate (b) reviewer approval ONLY through
-                  //     codex-review-check.sh's branch 2 (#170), which
-                  //     requires same-agent — identical to why the reaction
-                  //     path (above) is gated. Without this, a cross-agent /
-                  //     missing-Authoring-Agent PR merged on a bare verdict
-                  //     comment (which the merge gate would reject) would
-                  //     pass this audit.
-                  //   - Merge-time bounded: this is a RETROSPECTIVE audit, so
-                  //     a verdict posted AFTER merged_at must not participate
-                  //     — a late negative verdict would falsely flag a merge
-                  //     that was clean at merge time, and a late affirmative
-                  //     verdict could hide a merge that had no pre-merge
-                  //     clearance. Mirrors the reaction path's
-                  //     `mergedAt && x.created_at <= mergedAt` bound.
+                  // latest). Computed UNCONDITIONALLY — not gated on
+                  // sameAgentContext (Codex P2 round 2 on #640): the merge
+                  // gate's CODEX_HEAD_VERDICT_ANY_TIME feeds the Phase 4b
+                  // substitute staleness guard regardless of same-agent
+                  // context, so a cross-agent PR's verdict must still count
+                  // as "a newer Codex signal exists" even though it cannot
+                  // itself clear the audit. Same-agent gating is applied
+                  // instead at the codexCleared assignment below — a verdict
+                  // comment substitutes for gate (b) reviewer approval ONLY
+                  // through codex-review-check.sh's branch 2 (#170), which
+                  // requires same-agent, identical to why the reaction path
+                  // (below) is gated for clearance purposes. Merge-time
+                  // bounded regardless of same-agent: this is a
+                  // RETROSPECTIVE audit, so a verdict posted AFTER merged_at
+                  // must not participate at all — a late negative verdict
+                  // would falsely flag a merge that was clean at merge time,
+                  // and a late affirmative verdict could hide a merge that
+                  // had no pre-merge clearance. Mirrors the reaction path
+                  // `mergedAt && x.created_at <= mergedAt` bound. Ties
+                  // replace-on->=, matching the merge gate's
+                  // `max_by(.created_at)` (Codex P3 on #640): on a same-
+                  // second tie the LATER array element wins, not the first.
                   let latestVerdictTime = '';
                   let verdictAffirmative = false;
-                  if (sameAgentContext) {
+                  {
                     const headLower = (headSha || '').toLowerCase();
                     if (headLower) {
                       let latestVerdict = null;
@@ -748,7 +753,7 @@ jobs:
                           ...body.matchAll(/reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})/g),
                         ].map(m => m[1]);
                         if (!shaMatches.some(s => headLower.startsWith(s))) continue;
-                        if (!latestVerdict || c.created_at > latestVerdict.created_at) {
+                        if (!latestVerdict || c.created_at >= latestVerdict.created_at) {
                           latestVerdict = {
                             created_at: c.created_at,
                             affirmative: /^\s*codex review:\s*didn.?t find any major issues\b/im
@@ -805,7 +810,12 @@ jobs:
                   } else if (latestKind === 'review') {
                     codexCleared = !reviewHasUnresolvedP01;
                   } else if (latestKind === 'verdict') {
-                    codexCleared = verdictAffirmative && !reviewHasUnresolvedP01;
+                    // Same-agent gated at the CLEARANCE decision, not at scan
+                    // time (Codex P2 round 2 on #640) — see the scan comment
+                    // above for why latestVerdictTime/latestAnyCodexSignalTime
+                    // must stay unconditional while only the "does this
+                    // clear" question is same-agent gated.
+                    codexCleared = sameAgentContext && verdictAffirmative && !reviewHasUnresolvedP01;
                   }
                   latestAnyCodexSignalTime = latestTime;
                 }
@@ -856,8 +866,13 @@ jobs:
                     latestCliApprovedTime = r.submitted_at;
                   }
                 }
+                // Strict > (Codex P2 round 2 on #640), matching
+                // codex-review-check.sh's `[[ "$PHASE_4B_TIME" >
+                // "$LATEST_CODEX_SIGNAL_TIME" ]]` exactly — GitHub API
+                // timestamps are second-granular, so a same-second tie must
+                // fail closed to the Codex signal, not the approval.
                 const hasFreshCliApproval = cliApprovedReviews.length > 0 &&
-                  (!latestAnyCodexSignalTime || latestCliApprovedTime >= latestAnyCodexSignalTime);
+                  (!latestAnyCodexSignalTime || latestCliApprovedTime > latestAnyCodexSignalTime);
 
                 if (hadExternalLabel &&
                     !hasFreshCliApproval &&
