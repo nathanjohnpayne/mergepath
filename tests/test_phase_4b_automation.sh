@@ -598,6 +598,117 @@ fi
 unset MERGEPATH_REVIEW_POLICY_PATH
 
 # ===========================================================================
+echo "lib.sh — review-diff byte budget (#635)"
+# ===========================================================================
+export MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON"
+
+# budget resolution: default, policy knob, bounds, env escape hatch
+got="$(p4b_resolve_diff_max_bytes)" && [ "$got" = "$P4B_DEFAULT_DIFF_MAX_BYTES" ] \
+  && pass "diff budget defaults to $P4B_DEFAULT_DIFF_MAX_BYTES when unconfigured" \
+  || fail "diff budget default (got '${got:-}')"
+
+POLICY_DIFF_BUDGET="$WORK/policy-diff-budget.yml"
+cat > "$POLICY_DIFF_BUDGET" <<'YAML'
+phase_4b_automation:
+  enabled: true
+  mode: local
+  diff_max_bytes: 8192
+YAML
+got="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_DIFF_BUDGET" p4b_resolve_diff_max_bytes)" \
+  && [ "$got" = "8192" ] \
+  && pass "diff budget reads phase_4b_automation.diff_max_bytes" \
+  || fail "diff budget policy read (got '${got:-}')"
+
+POLICY_DIFF_BUDGET_BAD="$WORK/policy-diff-budget-bad.yml"
+cat > "$POLICY_DIFF_BUDGET_BAD" <<'YAML'
+phase_4b_automation:
+  enabled: true
+  diff_max_bytes: banana
+YAML
+set +e
+got="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_DIFF_BUDGET_BAD" p4b_resolve_diff_max_bytes)"; rc=$?
+set -e
+[ "$rc" != 0 ] && [ -z "$got" ] \
+  && pass "diff budget fails closed on a non-integer policy value" \
+  || fail "diff budget non-integer policy (rc=$rc, got '${got:-}')"
+
+POLICY_DIFF_BUDGET_RANGE="$WORK/policy-diff-budget-range.yml"
+cat > "$POLICY_DIFF_BUDGET_RANGE" <<'YAML'
+phase_4b_automation:
+  enabled: true
+  diff_max_bytes: 10
+YAML
+set +e
+got="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_DIFF_BUDGET_RANGE" p4b_resolve_diff_max_bytes)"; rc=$?
+set -e
+[ "$rc" != 0 ] && [ -z "$got" ] \
+  && pass "diff budget fails closed on an out-of-range policy value" \
+  || fail "diff budget out-of-range policy (rc=$rc, got '${got:-}')"
+
+got="$(P4B_DIFF_MAX_BYTES=2000 p4b_resolve_diff_max_bytes)" && [ "$got" = "2000" ] \
+  && pass "diff budget env escape hatch overrides policy (unbounded)" \
+  || fail "diff budget env override (got '${got:-}')"
+set +e
+got="$(P4B_DIFF_MAX_BYTES=not-a-number p4b_resolve_diff_max_bytes)"; rc=$?
+set -e
+[ "$rc" != 0 ] && [ -z "$got" ] \
+  && pass "diff budget fails closed on a non-integer env override" \
+  || fail "diff budget non-integer env (rc=$rc, got '${got:-}')"
+
+# trimming: under-budget passthrough, largest-first omission + placeholder +
+# report, fail-closed when nothing reviewable survives
+TRIM_IN="$WORK/trim-in.diff"
+TRIM_OUT="$WORK/trim-out.diff"
+{
+  printf 'diff --git a/src/code.sh b/src/code.sh\n'
+  printf '+echo real-code-change\n'
+  printf 'diff --git a/data/huge.jsonl b/data/huge.jsonl\n'
+  awk 'BEGIN { for (i = 0; i < 200; i++) printf "+HUGE-ARTIFACT-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$TRIM_IN"
+
+rep="$(p4b_trim_review_diff "$TRIM_IN" "$TRIM_OUT" 1000000)" && cmp -s "$TRIM_IN" "$TRIM_OUT" && [ -z "$rep" ] \
+  && pass "trim: under-budget diff passes through byte-identical, no report" \
+  || fail "trim under-budget passthrough"
+
+set +e
+rep="$(p4b_trim_review_diff "$TRIM_IN" "$TRIM_OUT" 2000)"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && ! grep -q 'HUGE-ARTIFACT' "$TRIM_OUT" \
+   && grep -q 'real-code-change' "$TRIM_OUT" \
+   && grep -q '^\[phase-4b diff-budget: data/huge.jsonl omitted' "$TRIM_OUT" \
+   && printf '%s\n' "$rep" | grep -q "^data/huge.jsonl$(printf '\t')" \
+   && [ "$(wc -c < "$TRIM_OUT" | tr -d '[:space:]')" -le 2000 ]; then
+  pass "trim: over-budget diff drops the largest section, keeps code, placeholder + report emitted"
+else fail "trim over-budget (rc=$rc, report='${rep:-}')"; fi
+
+TRIM_ONLY_HUGE="$WORK/trim-only-huge.diff"
+{
+  printf 'diff --git a/data/only.jsonl b/data/only.jsonl\n'
+  awk 'BEGIN { for (i = 0; i < 200; i++) printf "+ONLY-ARTIFACT-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$TRIM_ONLY_HUGE"
+set +e
+p4b_trim_review_diff "$TRIM_ONLY_HUGE" "$TRIM_OUT" 500 >/dev/null; rc=$?
+set -e
+[ "$rc" != 0 ] \
+  && pass "trim: fails closed when no reviewable section survives the budget" \
+  || fail "trim nothing-reviewable should fail (rc=$rc)"
+
+# stderr tail: sanitized single line; empty for a missing/empty file
+ERRF="$WORK/stderr-sample.txt"
+printf 'line one\nstream error: exceeded context window\n' > "$ERRF"
+got="$(p4b_stderr_tail "$ERRF")"
+[ "$got" = "line one stream error: exceeded context window" ] \
+  && pass "stderr tail collapses to one sanitized line" \
+  || fail "stderr tail (got '${got:-}')"
+: > "$ERRF"
+got="$(p4b_stderr_tail "$ERRF")"
+[ -z "$got" ] && pass "stderr tail is empty for an empty file" \
+  || fail "stderr tail empty-file (got '${got:-}')"
+
+unset MERGEPATH_REVIEW_POLICY_PATH
+
+# ===========================================================================
 echo "adapters — normalized verdict output + fail-closed"
 # ===========================================================================
 set +e
@@ -669,6 +780,104 @@ CLAUDE_BIN="$BIN/fake-claude-junk" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-fi
 set -e
 [ "$rc" = 4 ] && pass "claude adapter fails closed (exit 4) on junk result" \
   || fail "claude adapter junk should exit 4 (got $rc)"
+
+# ===========================================================================
+echo "adapters — oversized-diff budget + CLI stderr surfacing (#635)"
+# ===========================================================================
+HUGE_DIFF="$WORK/huge.diff"
+{
+  printf 'diff --git a/x.js b/x.js\n+const x = 1;\n'
+  printf 'diff --git a/data/bulk.jsonl b/data/bulk.jsonl\n'
+  awk 'BEGIN { for (i = 0; i < 500; i++) printf "+BULK-MARKER-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$HUGE_DIFF"
+HUGE_ONLY_DIFF="$WORK/huge-only.diff"
+{
+  printf 'diff --git a/data/bulk.jsonl b/data/bulk.jsonl\n'
+  awk 'BEGIN { for (i = 0; i < 500; i++) printf "+BULK-MARKER-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$HUGE_ONLY_DIFF"
+
+# Trim-asserting fakes: fail loudly if the bulk section reached the CLI, if
+# the code section was lost, if the in-diff placeholder is missing (codex),
+# or if no argument (the PROMPT) discloses the omitted path. These prove the
+# reviewer is told an omitted file was CHANGED, not led to call it missing
+# (the #629 false-positive P1 an undisclosed manual trim produced).
+cat > "$BIN/fake-codex-trim-assert" <<'SH'
+#!/usr/bin/env bash
+stdin="$(cat)"
+case "$stdin" in *BULK-MARKER-*) echo TRIM-FAILED-BULK-PRESENT >&2; exit 8 ;; esac
+case "$stdin" in *'const x = 1;'*) : ;; *) echo TRIM-LOST-CODE >&2; exit 8 ;; esac
+case "$stdin" in *'[phase-4b diff-budget: data/bulk.jsonl omitted'*) : ;; *) echo TRIM-NO-PLACEHOLDER >&2; exit 8 ;; esac
+disclosed=false
+for arg in "$@"; do
+  case "$arg" in *'report these files as missing'*'data/bulk.jsonl'*) disclosed=true ;; esac
+done
+[ "$disclosed" = true ] || { echo PROMPT-NO-DISCLOSURE >&2; exit 8; }
+printf '%s' '{"verdict":"APPROVED","summary":"looks good","findings":[]}'
+SH
+chmod +x "$BIN/fake-codex-trim-assert"
+cat > "$BIN/fake-claude-trim-assert" <<'SH'
+#!/usr/bin/env bash
+stdin="$(cat)"
+case "$stdin" in *BULK-MARKER-*) echo TRIM-FAILED-BULK-PRESENT >&2; exit 8 ;; esac
+case "$stdin" in *'const x = 1;'*) : ;; *) echo TRIM-LOST-CODE >&2; exit 8 ;; esac
+disclosed=false
+for arg in "$@"; do
+  case "$arg" in *'report these files as missing'*'data/bulk.jsonl'*) disclosed=true ;; esac
+done
+[ "$disclosed" = true ] || { echo PROMPT-NO-DISCLOSURE >&2; exit 8; }
+jq -n --arg r '{"verdict":"APPROVED","summary":"ok","findings":[]}' '{type:"result",subtype:"success",result:$r,session_id:"t"}'
+SH
+chmod +x "$BIN/fake-claude-trim-assert"
+
+set +e
+out="$(P4B_DIFF_MAX_BYTES=2000 CODEX_BIN="$BIN/fake-codex-trim-assert" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$HUGE_DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
+  pass "codex adapter trims an over-budget diff and discloses omissions in the prompt"
+else fail "codex adapter oversized-diff trim (rc=$rc, out=$out)"; fi
+
+set +e
+out="$(P4B_DIFF_MAX_BYTES=2000 CLAUDE_BIN="$BIN/fake-claude-trim-assert" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$HUGE_DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
+  pass "claude adapter trims an over-budget diff and discloses omissions in the prompt"
+else fail "claude adapter oversized-diff trim (rc=$rc, out=$out)"; fi
+
+set +e
+P4B_DIFF_MAX_BYTES=200 CODEX_BIN="$BIN/fake-codex-approve" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$HUGE_ONLY_DIFF" >/dev/null 2>&1; rc=$?
+set -e
+[ "$rc" = 4 ] && pass "codex adapter fails closed (exit 4) when nothing reviewable survives the budget" \
+  || fail "codex adapter untrimmable diff should exit 4 (got $rc)"
+
+set +e
+P4B_DIFF_MAX_BYTES=200 CLAUDE_BIN="$BIN/fake-claude-approve-usage" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$HUGE_ONLY_DIFF" >/dev/null 2>&1; rc=$?
+set -e
+[ "$rc" = 4 ] && pass "claude adapter fails closed (exit 4) when nothing reviewable survives the budget" \
+  || fail "claude adapter untrimmable diff should exit 4 (got $rc)"
+
+# CLI stderr must reach the failure message (#635: every nonzero rc used to
+# be reported as a plan-login problem; a context-overflow rc=1 read as an
+# auth error while the CLI's real complaint was discarded).
+mk_fake fake-codex-stderr-fail \
+  "echo 'stream error: request exceeds the model context window' >&2
+exit 1"
+mk_fake fake-claude-stderr-fail \
+  "echo 'API Error: 529 overloaded_error upstream' >&2
+exit 1"
+
+set +e
+errout="$(CODEX_BIN="$BIN/fake-codex-stderr-fail" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$DIFF" 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] && printf '%s' "$errout" | grep -q 'exceeds the model context window'; then
+  pass "codex adapter surfaces the CLI stderr tail on failure"
+else fail "codex adapter stderr surfacing (rc=$rc, err=$errout)"; fi
+
+set +e
+errout="$(CLAUDE_BIN="$BIN/fake-claude-stderr-fail" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF" 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] && printf '%s' "$errout" | grep -q '529 overloaded_error'; then
+  pass "claude adapter surfaces the CLI stderr tail on failure"
+else fail "claude adapter stderr surfacing (rc=$rc, err=$errout)"; fi
 
 # ===========================================================================
 echo "adapters — plan-only billing (child env allowlist before the CLI runs)"
