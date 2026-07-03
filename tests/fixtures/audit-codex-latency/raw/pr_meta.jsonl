@@ -1,3 +1,4 @@
 {"pr":10,"created_at":"2026-06-01T10:00:00Z","merged_at":"2026-06-01T13:00:00Z","closed_at":"2026-06-01T13:00:00Z","state":"closed","additions":120,"head_ref":"feat/x","head_sha":"aaa1111111111111111111111111111111111111"}
 {"pr":11,"created_at":"2026-06-02T09:00:00Z","merged_at":null,"closed_at":null,"state":"open","additions":40,"head_ref":"feat/y","head_sha":"bbb2222222222222222222222222222222222222"}
 {"pr":12,"created_at":"2026-06-03T09:00:00Z","merged_at":null,"closed_at":null,"state":"open","additions":800,"head_ref":"feat/z","head_sha":"ccc3333333333333333333333333333333333333"}
+{"pr":13,"created_at":"2026-06-04T08:00:00Z","merged_at":null,"closed_at":null,"state":"open","additions":30,"head_ref":"feat/w","head_sha":"ddd4444444444444444444444444444444444444"}

@@ -28,6 +28,13 @@
 #     auto-review: reviewed-commit push @09:05 → verdict @09:30, no
 #              trigger → pair 5, and a non-affirmative verdict must NOT
 #              become a clearance.
+#   PR #12 (open, 800 additions):
+#     review-object-only auto-review (no trigger, no verdict comment).
+#   PR #13 (open, 30 additions) — the owning-trigger regression case:
+#     trigger @09:00 consumed by a verdict @09:05; a LATER push @09:30
+#     answered by a review-only auto-review @09:40 with no fresh trigger
+#     must still count as pair 5 (a prior-but-already-answered trigger
+#     does not disqualify it).
 
 set -euo pipefail
 
@@ -80,10 +87,10 @@ expect_pair() {
 # --- classification ----------------------------------------------------------
 
 n_triggers=$(jq -s '[ .[] | select(.kind == "trigger") ] | length' "$EVENTS")
-[ "$n_triggers" = "2" ] && pass "classifies 2 triggers" || fail "triggers: got $n_triggers, want 2"
+[ "$n_triggers" = "3" ] && pass "classifies 3 triggers" || fail "triggers: got $n_triggers, want 3"
 
 n_verdicts=$(jq -s '[ .[] | select(.kind == "verdict") ] | length' "$EVENTS")
-[ "$n_verdicts" = "3" ] && pass "classifies 3 verdicts (incl. sha extraction)" || fail "verdicts: got $n_verdicts, want 3"
+[ "$n_verdicts" = "4" ] && pass "classifies 4 verdicts (incl. sha extraction)" || fail "verdicts: got $n_verdicts, want 4"
 
 n_rl=$(jq -s '[ .[] | select(.kind == "rate_limit") ] | length' "$EVENTS")
 [ "$n_rl" = "1" ] && pass "classifies the rate-limit marker comment" || fail "rate_limit: got $n_rl, want 1"
@@ -98,11 +105,11 @@ expect_pair "pair 1: trigger→👀 ack = 30s, round 1" \
   '.seconds == 30 and .round == 1 and .pr == 10'
 
 expect_pair "pair 2: trigger→first inline finding = 300s" \
-  '.pair == "2_trigger_to_first_finding"' \
+  '.pair == "2_trigger_to_first_finding" and .pr == 10' \
   '.seconds == 300 and .round == 1'
 
 expect_pair "pair 3 round 1: trigger→verdict = 540s, not rate-limited" \
-  '.pair == "3_trigger_to_verdict" and .round == 1' \
+  '.pair == "3_trigger_to_verdict" and .round == 1 and .pr == 10' \
   '.seconds == 540 and .rate_limited == false'
 
 expect_pair "pair 3 round 2: trigger→verdict = 1800s, rate-limited segment" \
@@ -124,6 +131,14 @@ expect_pair "pair 5: push→auto-review = 1500s (verdict with no owning trigger)
 expect_pair "pair 5: trigger-less review object counts as auto-review" \
   '.pair == "5_push_to_auto_review" and .pr == 12' \
   '.seconds == 1200'
+
+# PR 13: the owning-trigger rule. Its 09:00 trigger was already answered
+# by the 09:05 verdict, so the later review-only response to the 09:30
+# push is an auto-review — a prior-but-consumed trigger must not
+# disqualify it (CodeRabbit finding on #629).
+expect_pair "pair 5: review-only round after an already-answered trigger counts" \
+  '.pair == "5_push_to_auto_review" and .pr == 13' \
+  '.seconds == 600'
 
 expect_pair "pair 6: clearance→merge dead time = 1200s" \
   '.pair == "6_clearance_to_merge"' \

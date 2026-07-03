@@ -9,7 +9,7 @@ changed here.
 
 **Headline: the folklore is wrong in both directions.**
 
-- "Codex takes 15–40+ minutes" — measured trigger→verdict is **p50 3m38s,
+- "Codex takes 15–40+ minutes" — measured trigger→verdict is **p50 3m37s,
   p90 7m6s, p99 10m30s, max 13m50s** (n=100). No completed round in the
   entire history took 15 minutes.
 - The real failure mode is not slowness but **non-response**: ~19% of all
@@ -76,7 +76,7 @@ the live records expire.
 
 | segment | n | p50 | p90 | p95 | p99 | max |
 |---|---|---|---|---|---|---|
-| ALL | 100 | 3m38s | 7m6s | 8m35s | 10m30s | 13m50s |
+| ALL | 100 | 3m37s | 7m6s | 8m35s | 10m30s | 13m50s |
 
 Only 2 of 100 completed rounds exceeded the 600s in-script wait. The
 "15–40+ min" folk belief is contradicted by the entire recorded history.
@@ -101,10 +101,10 @@ the inline-comment endpoint too when run with `gh api` access).
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 104 | 4m6s | 8m34s | 32m56s | 33m1s |
+| ALL | 119 | 4m12s | 11m22s | 33m1s | 36m1s |
 
 Auto-reviews (Codex reviewing a push/open without an explicit trigger) run
-at the same p50 as triggered rounds, with a fatter tail (~33 min worst
+at the same p50 as triggered rounds, with a fatter tail (~36 min worst
 case). Anchor is the reviewed commit's committer date; rounds whose
 verdict carries no `Reviewed commit:` line (the older verdict format) are
 excluded for lack of a recorded push anchor.
@@ -194,12 +194,12 @@ more.
 | Knob | Default | Measured | Disposition |
 |---|---|---|---|
 | `codex.review_timeout_seconds` | 600s | verdict p90 = 426s, p99 = 630s, max = 830s; 2/100 rounds over 600s | **Confirm ~600s, or raise to 900s to cover the recorded max (830s).** The foreground wait is nearly right-sized for rounds that complete; timeouts are dominated by rounds that will *never* complete (dropped/rate-limited triggers, ~21% historically), so `--trigger-only` + event-driven pickup remains the right escape path, not a longer wait. |
-| `codex.ack_wait_seconds` × `max_ack_retries` | 60s × 1 | pair-1 ack distribution pending the reactions backfill (one local script run) | **Deferred, with a concrete backfill step.** Bounding context from measured pairs: verdicts land p50 3m38s after the trigger; not-connected markers land within ~10–60s. The "~4 min no-👀 = dropped" runbook heuristic sits right at p50(verdict) and is almost certainly too slow as an ack test — but the retune must cite p99(ack), which requires the backfill. |
+| `codex.ack_wait_seconds` × `max_ack_retries` | 60s × 1 | pair-1 ack distribution pending the reactions backfill (one local script run) | **Deferred, with a concrete backfill step.** Bounding context from measured pairs: verdicts land p50 3m37s after the trigger; not-connected markers land within ~10–60s. The "~4 min no-👀 = dropped" runbook heuristic sits right at p50(verdict) and is almost certainly too slow as an ack test — but the retune must cite p99(ack), which requires the backfill. |
 | `codex.reaction_freshness_window_seconds` | 1800s | 29/33 clearances were swept inside 1800s — but only because event runs land p50 ≈ 54s; the cron path alone lands p50 ≈ 62m, far outside the window | **The window is only viable because of the event-driven path.** Widening it to cover the cron path would need ≥ ~5400s (cron p50+) and weakens staleness protection; the data supports finishing the event-driven re-arm (#620) so the window's role keeps shrinking, and otherwise leaving 1800s in place. |
 | Sweep cadences (`*/15`, `*/5`) | cron | effective median cadence ~96–98 min for BOTH specs; scheduled runs are ~10% of run-minutes; 27/33 clearances swept by event runs | **The cadence knob barely does anything.** GitHub throttling makes `*/5` and `*/15` deliver the same ~1.6h median; the replay for candidate cadences should model the measured firing behavior, not the spec. Slowing to `*/30` would cut a small, mostly-idle cost slice with negligible latency impact *given the event triggers stay*; the higher-leverage retune is event-trigger dedup. |
 
 Runbook/docs references to the folklore numbers ("15–40 min", "~4 min
-no-👀") should be replaced with the measured ones (p50 3m38s / p90 7m6s /
+no-👀") should be replaced with the measured ones (p50 3m37s / p90 7m6s /
 p99 10m30s verdict; ack pending backfill) — that lands with the retune PRs.
 
 ## Known gaps and exclusions (all fail-closed)

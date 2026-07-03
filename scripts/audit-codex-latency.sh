@@ -182,8 +182,9 @@ fetch_all() {
   # 1. Actions workflow runs FIRST (#623: retention ages these out — persist
   #    before anything else so an interrupted fetch still banks them).
   : > "$RAW_DIR/runs.jsonl"
-  local wf
-  for wf in $(echo "$GATE_WORKFLOWS" | tr ',' ' '); do
+  local wf __wfs
+  IFS=',' read -ra __wfs <<< "$GATE_WORKFLOWS"
+  for wf in "${__wfs[@]}"; do
     log "fetching Actions runs for $wf (paginated — this is the long one)"
     api_get "repos/$REPO/actions/workflows/$wf/runs?per_page=100" \
       --jq '.workflow_runs[]' \
@@ -401,10 +402,23 @@ analyze() {
 
     # Trigger-less bot REVIEW objects are auto-reviews too: on some rounds
     # Codex leaves only a review submission (no verdict issue comment, no
-    # trigger). Count them for pair 5, deduped against verdict comments
-    # posted alongside the same review (within 300s in the same PR).
+    # trigger). A review is an auto-review when it has no OWNING trigger —
+    # same rule as $mverdicts: the latest prior trigger only owns the
+    # review if no other bot response (verdict or earlier review) already
+    # answered it in between. "Any prior trigger disqualifies" would drop
+    # later review-only rounds on PRs that were triggered once early on.
+    # Deduped against verdict comments posted alongside the same review
+    # (within 300s in the same PR).
     | ($reviews | map(. as $r
-        | select(([ $triggers[] | select(.pr == $r.pr and .created_at <= $r.submitted_at) ] | length) == 0)
+        | ([ $triggers[] | select(.pr == $r.pr and .created_at <= $r.submitted_at) ]
+           | sort_by(.created_at) | last) as $t
+        | select(
+            $t == null
+            or ([ $verdicts[] | select(.pr == $r.pr and .created_at >= $t.created_at
+                                       and .created_at < $r.submitted_at) ] | length) > 0
+            or ([ $reviews[] | select(.pr == $r.pr and .review_id != $r.review_id
+                                      and .submitted_at >= $t.created_at
+                                      and .submitted_at < $r.submitted_at) ] | length) > 0)
         | select(([ $verdicts[] | select(.pr == $r.pr
                      and (((.created_at | ts) - ($r.submitted_at | ts)) | fabs) <= 300) ] | length) == 0)
         | $r)) as $auto_reviews
@@ -553,7 +567,9 @@ summarize() {
     jq -rs '
       map(select(.kind == "bot_comment_other") | .excerpt)
       | group_by(.) | map({excerpt:.[0], n:length}) | sort_by(-.n) | .[:20][]
-      | "- (n=\(.n)) \(.excerpt | gsub("\n"; " ") | .[0:140])"
+      # Escape markdown emphasis/code markers from the raw bot text so a
+      # stray */_/` in an excerpt cannot garble the rendered appendix.
+      | "- (n=\(.n)) \(.excerpt | gsub("\n"; " ") | gsub("(?<c>[*_`])"; "\\\(.c)") | .[0:140])"
     ' "$OUT_DIR/events.jsonl"
   } >> "$OUT_DIR/summary.md"
 

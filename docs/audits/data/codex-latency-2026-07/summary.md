@@ -90,39 +90,39 @@
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 104 | 4m5s | 8m34s | 32m56s | 33m1s |
+| ALL | 119 | 4m12s | 11m22s | 33m1s | 36m1s |
 | additions_bucket=additions<=50 | 13 | 3m15s | 6m14s | 7m59s | 7m59s |
 | additions_bucket=additions=151-300 | 14 | 4m9s | 7m17s | 9m40s | 9m40s |
-| additions_bucket=additions=301-1000 | 35 | 4m35s | 29m20s | 33m1s | 33m1s |
-| additions_bucket=additions=51-150 | 24 | 3m10s | 4m45s | 7m21s | 7m21s |
-| additions_bucket=additions>1000 | 18 | 4m13s | 11m22s | 22m13s | 22m13s |
-| weekday=Fri | 18 | 4m34s | 32m40s | 33m1s | 33m1s |
-| weekday=Mon | 3 | 3m50s | 11m22s | 11m22s | 11m22s |
+| additions_bucket=additions=301-1000 | 46 | 4m35s | 29m20s | 36m1s | 36m1s |
+| additions_bucket=additions=51-150 | 25 | 3m17s | 5m21s | 7m21s | 7m21s |
+| additions_bucket=additions>1000 | 21 | 4m26s | 12m54s | 22m13s | 22m13s |
+| weekday=Fri | 19 | 4m45s | 32m40s | 33m1s | 33m1s |
+| weekday=Mon | 4 | 3m50s | 20m6s | 20m6s | 20m6s |
 | weekday=Sat | 14 | 3m52s | 7m13s | 7m17s | 7m17s |
 | weekday=Sun | 16 | 3m23s | 5m21s | 8m15s | 8m15s |
-| weekday=Thu | 8 | 3m19s | 6m51s | 6m51s | 6m51s |
-| weekday=Tue | 12 | 3m41s | 6m14s | 7m59s | 7m59s |
-| weekday=Wed | 33 | 4m35s | 9m53s | 32m56s | 32m56s |
+| weekday=Thu | 14 | 3m58s | 7m9s | 8m1s | 8m1s |
+| weekday=Tue | 15 | 4m9s | 20m10s | 23m30s | 23m30s |
+| weekday=Wed | 37 | 4m35s | 28m48s | 36m1s | 36m1s |
 | hour=00 | 6 | 4m12s | 7m17s | 7m17s | 7m17s |
-| hour=01 | 7 | 3m56s | 5m21s | 5m21s | 5m21s |
+| hour=01 | 8 | 3m56s | 5m21s | 5m21s | 5m21s |
 | hour=02 | 7 | 3m52s | 6m12s | 6m12s | 6m12s |
-| hour=03 | 8 | 5m41s | 7m40s | 7m40s | 7m40s |
-| hour=04 | 10 | 4m5s | 5m17s | 5m46s | 5m46s |
-| hour=05 | 5 | 4m40s | 9m40s | 9m40s | 9m40s |
+| hour=03 | 11 | 5m47s | 7m40s | 8m1s | 8m1s |
+| hour=04 | 11 | 4m6s | 5m46s | 6m11s | 6m11s |
+| hour=05 | 6 | 3m58s | 9m40s | 9m40s | 9m40s |
 | hour=06 | 1 | 3m25s | 3m25s | 3m25s | 3m25s |
 | hour=12 | 1 | 5m0s | 5m0s | 5m0s | 5m0s |
-| hour=14 | 2 | 3m15s | 5m16s | 5m16s | 5m16s |
+| hour=14 | 3 | 5m16s | 12m54s | 12m54s | 12m54s |
 | hour=15 | 8 | 3m7s | 6m51s | 6m51s | 6m51s |
 | hour=16 | 7 | 4m5s | 9m53s | 9m53s | 9m53s |
-| hour=17 | 11 | 5m26s | 32m40s | 33m1s | 33m1s |
-| hour=18 | 7 | 6m32s | 32m56s | 32m56s | 32m56s |
+| hour=17 | 12 | 5m26s | 33m1s | 36m1s | 36m1s |
+| hour=18 | 10 | 5m3s | 29m20s | 32m56s | 32m56s |
 | hour=19 | 2 | 3m30s | 3m50s | 3m50s | 3m50s |
 | hour=20 | 4 | 2m18s | 11m22s | 11m22s | 11m22s |
-| hour=21 | 6 | 3m0s | 6m27s | 6m27s | 6m27s |
-| hour=22 | 5 | 4m16s | 5m13s | 5m13s | 5m13s |
+| hour=21 | 7 | 3m3s | 20m6s | 20m6s | 20m6s |
+| hour=22 | 8 | 4m26s | 23m30s | 23m30s | 23m30s |
 | hour=23 | 7 | 3m54s | 7m59s | 7m59s | 7m59s |
-| rate_limited=false | 103 | 4m6s | 8m34s | 32m56s | 33m1s |
-| rate_limited=true | 1 | 3m29s | 3m29s | 3m29s | 3m29s |
+| rate_limited=false | 117 | 4m13s | 11m22s | 33m1s | 36m1s |
+| rate_limited=true | 2 | 3m14s | 3m29s | 3m29s | 3m29s |
 
 ## 6_clearance_to_gate:auto-clear-blocking-labels.yml
 
@@ -367,8 +367,8 @@
 
 ## Appendix: unclassified bot comments (top 20 shapes)
 
-- (n=1) ### Review Result  * Reviewed the current PR head (`c2c2f0d`) and found no additional follow-up code changes necessary. * The major dev-grou
-- (n=1) ### Summary  * No follow-up code changes were needed: the PR branch already contains the Codex eyes-acknowledgment gate, including polling t
-- (n=1) ### Summary * I reviewed the trigger and PR context. The trigger content is a PR description/self-review, and the PR comments indicate this 
-- (n=1) **Summary** * Added Phase 4a workflow guidance that callers must export `MERGEPATH_PHASE_4A_GATED=true` when `codex.request_by_default: fals
-- (n=1) **Summary** * Updated `scripts/codex-review-request.sh` usage docs to include `--trigger-only`. [scripts/codex-review-request.shL9-L17](http
+- (n=1) ### Review Result  \* Reviewed the current PR head (\`c2c2f0d\`) and found no additional follow-up code changes necessary. \* The major dev-
+- (n=1) ### Summary  \* No follow-up code changes were needed: the PR branch already contains the Codex eyes-acknowledgment gate, including polling 
+- (n=1) ### Summary \* I reviewed the trigger and PR context. The trigger content is a PR description/self-review, and the PR comments indicate this
+- (n=1) \*\*Summary\*\* \* Added Phase 4a workflow guidance that callers must export \`MERGEPATH\_PHASE\_4A\_GATED=true\` when \`codex.request\_by\_
+- (n=1) \*\*Summary\*\* \* Updated \`scripts/codex-review-request.sh\` usage docs to include \`--trigger-only\`. [scripts/codex-review-request.shL9-
