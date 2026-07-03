@@ -57,6 +57,9 @@ echo "check_codex_scripts: running codex-review-request --trigger-only tests (#4
 echo "check_codex_scripts: running codex-review-request Phase 4a entry-decision tests"
 "$REPO_ROOT/tests/test_codex_review_request_entry.sh"
 
+echo "check_codex_scripts: running codex-review-request verdict-comment clearance tests (#609)"
+"$REPO_ROOT/tests/test_codex_review_request_verdict.sh"
+
 echo "check_codex_scripts: running codex-review-check gate (c) resolution tests"
 "$REPO_ROOT/tests/test_codex_review_check_resolution.sh"
 
