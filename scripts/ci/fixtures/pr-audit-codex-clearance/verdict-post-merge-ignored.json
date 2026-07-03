@@ -1,0 +1,18 @@
+{
+  "description": "affirmative HEAD-anchored verdict posted AFTER merged_at → ignored entirely, NOT cleared (retrospective audit must not count post-merge signals, #612)",
+  "expected_cleared": false,
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "authoring_agent": "claude",
+  "merged_at": "2026-05-12T10:00:00Z",
+  "reviews": [],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "id": 9006,
+      "body": "Codex Review: Didn't find any major issues.\nReviewed commit: deadbeefcafe",
+      "created_at": "2026-05-12T12:00:00Z",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ]
+}

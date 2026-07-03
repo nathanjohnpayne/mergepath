@@ -4,6 +4,7 @@
   "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
   "codex_bot_login": "chatgpt-codex-connector[bot]",
   "authoring_agent": "claude",
+  "merged_at": "2026-05-12T13:00:00Z",
   "reviews": [
     {
       "id": 1001,

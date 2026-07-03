@@ -629,6 +629,13 @@ jobs:
                 // codexCleared stays false, so the audit falls through to the
                 // CLI-APPROVED requirement below.
                 let codexCleared = false;
+                // Latest Codex signal on HEAD, any disposition/kind (#612,
+                // Codex P2 round 1 on #640) — feeds the Phase 4b/CLI-approval
+                // staleness guard below. Populated even when codexCleared
+                // stays false, mirroring codex-review-check.sh's
+                // CODEX_HEAD_VERDICT_ANY_TIME carrying into its Phase 4b
+                // substitute guard regardless of clearance disposition.
+                let latestAnyCodexSignalTime = '';
                 if (codexEnabled && inlineComments !== null) {
                   // Latest Codex COMMENTED review on HEAD (max submitted_at).
                   let latestCodexReview = null;
@@ -681,42 +688,6 @@ jobs:
                     }
                   }
 
-                  // Latest HEAD-anchored Codex verdict comment (#612).
-                  // Select the LATEST HEAD-anchored verdict FIRST (any
-                  // disposition), THEN check whether it is affirmative — a
-                  // newer non-affirmative verdict on the same HEAD must
-                  // supersede an older clean one (same #608 P1 shape as the
-                  // merge gate and the #609 poller). The verdict clears the
-                  // same way the review path does: affirmative AND zero
-                  // unresolved P0/P1 on HEAD (reviewHasUnresolvedP01 is
-                  // already HEAD-scoped, independent of which signal is
-                  // latest).
-                  let latestVerdictTime = '';
-                  let verdictAffirmative = false;
-                  const headLower = (headSha || '').toLowerCase();
-                  if (headLower) {
-                    let latestVerdict = null;
-                    for (const c of issueComments) {
-                      if (!c.user || c.user.login !== codexBotLogin) continue;
-                      const body = (c.body || '').toLowerCase();
-                      const shaMatches = [
-                        ...body.matchAll(/reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})/g),
-                      ].map(m => m[1]);
-                      if (!shaMatches.some(s => headLower.startsWith(s))) continue;
-                      if (!latestVerdict || c.created_at > latestVerdict.created_at) {
-                        latestVerdict = {
-                          created_at: c.created_at,
-                          affirmative: /^\s*codex review:\s*didn.?t find any major issues\b/im
-                            .test(c.body || ''),
-                        };
-                      }
-                    }
-                    if (latestVerdict) {
-                      latestVerdictTime = latestVerdict.created_at || '';
-                      verdictAffirmative = latestVerdict.affirmative === true;
-                    }
-                  }
-
                   // Same-agent context (Codex P2 on #460 r3): a Codex +1
                   // substitutes for gate (b)'s reviewer approval ONLY when the
                   // PR's Authoring-Agent resolves to an available reviewer
@@ -735,6 +706,61 @@ jobs:
                     sameAgentContext = reviewerAccounts.some(
                       r => String(r).toLowerCase().endsWith('-' + authoringAgent)
                     );
+                  }
+
+                  // Latest HEAD-anchored Codex verdict comment (#612, Codex
+                  // P2 round 1 on #640). Select the LATEST HEAD-anchored
+                  // verdict FIRST (any disposition), THEN check whether it is
+                  // affirmative — a newer non-affirmative verdict on the same
+                  // HEAD must supersede an older clean one (same #608 P1
+                  // shape as the merge gate and the #609 poller). The verdict
+                  // clears the same way the review path does: affirmative AND
+                  // zero unresolved P0/P1 on HEAD (reviewHasUnresolvedP01 is
+                  // already HEAD-scoped, independent of which signal is
+                  // latest). Two guards mirror the review/reaction paths
+                  // exactly, both flagged by Codex on the original PR:
+                  //   - Same-agent gated: a verdict comment substitutes for
+                  //     gate (b) reviewer approval ONLY through
+                  //     codex-review-check.sh's branch 2 (#170), which
+                  //     requires same-agent — identical to why the reaction
+                  //     path (above) is gated. Without this, a cross-agent /
+                  //     missing-Authoring-Agent PR merged on a bare verdict
+                  //     comment (which the merge gate would reject) would
+                  //     pass this audit.
+                  //   - Merge-time bounded: this is a RETROSPECTIVE audit, so
+                  //     a verdict posted AFTER merged_at must not participate
+                  //     — a late negative verdict would falsely flag a merge
+                  //     that was clean at merge time, and a late affirmative
+                  //     verdict could hide a merge that had no pre-merge
+                  //     clearance. Mirrors the reaction path's
+                  //     `mergedAt && x.created_at <= mergedAt` bound.
+                  let latestVerdictTime = '';
+                  let verdictAffirmative = false;
+                  if (sameAgentContext) {
+                    const headLower = (headSha || '').toLowerCase();
+                    if (headLower) {
+                      let latestVerdict = null;
+                      for (const c of issueComments) {
+                        if (!c.user || c.user.login !== codexBotLogin) continue;
+                        if (!(mergedAt && c.created_at && c.created_at <= mergedAt)) continue;
+                        const body = (c.body || '').toLowerCase();
+                        const shaMatches = [
+                          ...body.matchAll(/reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})/g),
+                        ].map(m => m[1]);
+                        if (!shaMatches.some(s => headLower.startsWith(s))) continue;
+                        if (!latestVerdict || c.created_at > latestVerdict.created_at) {
+                          latestVerdict = {
+                            created_at: c.created_at,
+                            affirmative: /^\s*codex review:\s*didn.?t find any major issues\b/im
+                              .test(c.body || ''),
+                          };
+                        }
+                      }
+                      if (latestVerdict) {
+                        latestVerdictTime = latestVerdict.created_at || '';
+                        verdictAffirmative = latestVerdict.affirmative === true;
+                      }
+                    }
                   }
 
                   // Latest qualifying Codex +1 reaction in the merge-time
@@ -781,6 +807,7 @@ jobs:
                   } else if (latestKind === 'verdict') {
                     codexCleared = verdictAffirmative && !reviewHasUnresolvedP01;
                   }
+                  latestAnyCodexSignalTime = latestTime;
                 }
 
                 // ─────────────────────────────────────────────────
@@ -809,8 +836,31 @@ jobs:
                 // surfaces both — collapsing them into a single line
                 // would hide which gate the merge bypassed.
                 // ─────────────────────────────────────────────────
+
+                // Phase 4b / CLI-approval staleness guard (#612, Codex P2
+                // round 1 on #640): a CLI reviewer-identity APPROVED review
+                // does not excuse the external-review requirement when a
+                // NEWER Codex signal (reaction / review / verdict, any
+                // disposition) exists on the current HEAD — mirrors
+                // codex-review-check.sh's Phase 4b substitute latest-
+                // signal-wins guard. We only reach this check when
+                // codexCleared is false, so any Codex signal newer than the
+                // latest CLI approval is, by construction, a non-clearing
+                // one; without this guard an early stale APPROVED could mask
+                // a later Codex verdict that actually disqualified the
+                // merge. No Codex signal at all (latestAnyCodexSignalTime
+                // empty) preserves the pre-#612 behavior exactly.
+                let latestCliApprovedTime = '';
+                for (const r of cliApprovedReviews) {
+                  if (r.submitted_at && r.submitted_at > latestCliApprovedTime) {
+                    latestCliApprovedTime = r.submitted_at;
+                  }
+                }
+                const hasFreshCliApproval = cliApprovedReviews.length > 0 &&
+                  (!latestAnyCodexSignalTime || latestCliApprovedTime >= latestAnyCodexSignalTime);
+
                 if (hadExternalLabel &&
-                    cliApprovedReviews.length === 0 &&
+                    !hasFreshCliApproval &&
                     !codexCleared &&
                     !isMergepathSyncPR) {
                   // Distinguish the two failure modes so the audit
