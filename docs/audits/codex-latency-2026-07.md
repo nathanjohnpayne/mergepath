@@ -35,30 +35,30 @@ inline-comment access (window 2026-05-01 → 2026-07-04, 293 PRs); the
 supplementary extract is `docs/audits/data/codex-latency-2026-07/summary-backfill-2026-07-04.md`
 with the load-bearing ack samples under `backfill-2026-07-04/`. This resolves
 pair 1 (ack) and pair 2 (first finding) and completes the `ack_wait_seconds`
-disposition; pair 4 (👍 clearance) turned out to be measured against the
-wrong endpoint and stays open (see below). The pair-2 and pairs-1/4 sections
-further down have been updated in place to match:
+disposition. Pair 4 (👍 clearance) needed an endpoint fix — the first backfill
+read the trigger comment, not the PR issue; #645 corrected the audit and
+re-measured it (n=60, p99 13m49s). The pair-2 and pairs-1/4 sections further
+down are updated to match:
 
 | Event pair | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
 | 1. trigger → 👀 ack | 14 | 9s | 11s | 13s | 13s |
 | 2. trigger → first inline finding | 208 | 5m16s | 13m46s | 19m57s | 30m39s |
-| 4. trigger → 👍 clearance | — | **unmeasured — wrong endpoint (see below)** | | | |
+| 4. trigger → 👍 clearance | 60 | 3m35s | 7m26s | 13m49s | 13m49s |
 
 - **Ack is fast and extremely tight** — every healthy ack landed in 6–13s
   (p99 13s, max 13s). The "~4 min no-👀 = dropped" heuristic is ~18× the
   measured p99, far too slow as a dropped-trigger test.
-- **Pair 4 (👍 clearance) is NOT resolved by this backfill — the audit measures
-  the wrong object.** The script defines pair 4 as a `+1` reaction on the
-  *trigger comment* (`issues/comments/{id}/reactions`), but the merge gate
-  (`scripts/codex-review-check.sh`) reads the clearance 👍 from the *PR issue*
-  (`repos/$REPO/issues/$PR_NUMBER/reactions`). So the 0 trigger-comment `+1`s
-  this pass found is an artifact of looking in the wrong place, **not**
-  evidence that 👍 clearance does not happen (it does — gate (b) branch 2
-  relies on it, and those 👍s expire after 30 min). 👍-clearance latency is
-  therefore genuinely UNMEASURED here. Follow-up: fix the audit script's
-  pair-4 definition to read `issues/$PR_NUMBER/reactions` and re-measure
-  (filed separately). Do **not** read this as "clearance is verdict-only."
+- **Pair 4 (👍 clearance) — measured after the #645 fix**: n=60, p50 3m35s,
+  p90 7m26s, p99 13m49s, max 13m49s. The first backfill read `+1` on the
+  *trigger comment* (`issues/comments/{id}/reactions`) and found 0 — an
+  endpoint bug, since the merge gate (`scripts/codex-review-check.sh`) reads
+  the clearance 👍 from the *PR issue* (`repos/$REPO/issues/$PR_NUMBER/
+  reactions`). #645 fixed the audit to read that endpoint (fix in #646).
+  The 👍-clearance distribution tracks the verdict latency (pair 3) closely,
+  as expected — the 👍 IS Codex's clean-verdict signal. Gate (b) branch 2
+  relies on these PR-issue 👍s (they expire after 30 min), so 👍 clearance is
+  real and now measured — NOT verdict-only.
 - **Completed `ack_wait_seconds` disposition** — with p99(ack)=13s, the ack
   gate's per-wait budget of 60s is already 4.6× p99, and the full failover
   path (one 60s wait, one repost, a second 60s wait) is up to 120s. A healthy
@@ -173,16 +173,15 @@ excluded for lack of a recorded push anchor.
 The ack lands on the trigger comment, and the script measures it there
 correctly — this pair is now sound and drives the `ack_wait_seconds` retune.
 
-**Pair 4 (👍 clearance) is measured against the wrong object and remains
-open.** The script defines pair 4 as a `+1` on the *trigger comment*
-(`issues/comments/{id}/reactions`), but the merge gate
-(`scripts/codex-review-check.sh`, lines ~933/1081) reads the clearance 👍
-from the *PR issue* (`repos/$REPO/issues/$PR_NUMBER/reactions`). The backfill
-therefore found 0 trigger-comment `+1`s — an artifact of the endpoint, not
-evidence that 👍 clearance is unused (gate (b) branch 2 depends on it).
-Fixing the script's pair-4 definition to read the PR-issue reactions and
-re-measuring is tracked as a follow-up; 👍-clearance latency is unmeasured
-until then.
+**Pair 4 (👍 clearance) — fixed in #645.** The script originally read a `+1`
+on the *trigger comment* (`issues/comments/{id}/reactions`), but the merge
+gate (`scripts/codex-review-check.sh`, lines ~933/1081) reads the clearance 👍
+from the *PR issue* (`repos/$REPO/issues/$PR_NUMBER/reactions`). The first
+backfill therefore found 0 trigger-comment `+1`s — an endpoint artifact, not
+evidence that 👍 clearance is unused (gate (b) branch 2 depends on it). #645
+corrected the audit to read that endpoint (fix in #646) and re-measured:
+**n=60, p50 3m35s, p90 7m26s, p99 13m49s, max 13m49s** — tracking the verdict
+latency (pair 3) closely, since the 👍 is Codex's clean-verdict signal.
 
 ### Trigger health (the #570 dropped-trigger class)
 
@@ -303,9 +302,8 @@ no-👀") should be replaced with the measured ones (verdict p50 3m37s / p90
 ## Known gaps and exclusions (all fail-closed)
 
 - **Pair 1 (👀 ack)**: backfilled 2026-07-04 (n=14, p99 13s). **Pair 4 (👍
-  clearance)**: the script reads trigger-comment reactions, but the gate
-  reads PR-issue reactions — pair 4 is measured against the wrong object and
-  stays open pending the script fix (see Follow-ups).
+  clearance)**: fixed in #645 to read the PR-issue reactions (the gate's
+  endpoint); re-measured n=60, p50 3m35s, p99 13m49s.
 - **👍-only and review-object-only clearances** are excluded from pair 6
   rather than approximated (COMMENTED review state carries no
   affirmative/negative signal without finding-tier evaluation).
@@ -320,10 +318,9 @@ no-👀") should be replaced with the measured ones (verdict p50 3m37s / p90
 
 ## Follow-ups
 
-- **Fix pair 4's endpoint**: the script measures a `+1` on the trigger
-  comment, but the gate reads `repos/$REPO/issues/$PR_NUMBER/reactions` (the
-  PR issue) — correct the pair-4 definition and re-measure 👍-clearance
-  latency. (Pair 1 ack is done: p99 13s → the `ack_wait_seconds` retune above.)
+- **Fix pair 4's endpoint — DONE (#645 / #646)**: the audit now reads the
+  clearance 👍 from `repos/$REPO/issues/$PR_NUMBER/reactions` (the PR issue,
+  the gate's endpoint); re-measured n=60, p50 3m35s, p99 13m49s.
 - Retune PRs for the four knob rows above, each citing this document.
 - Cadence replay over the recorded clearance timestamps using the measured
   (throttled) cron firing behavior — never live trials.

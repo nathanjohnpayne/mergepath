@@ -17,7 +17,9 @@
 # Fixture shape (2 PRs):
 #   PR #10 (merged, 120 additions):
 #     round 1: trigger @10:10 → 👀 ack +30s → inline finding +5m →
-#              affirmative verdict +9m → 👍 clearance +10m
+#              affirmative verdict +9m → 👍 clearance +10m (a PR-ISSUE
+#              reaction, #645; a trigger-comment +1 distractor at +5m is
+#              ignored — the gate reads 👍 from the PR issue, not the trigger)
 #     round 2: trigger @12:10 → bot rate-limit marker +1m →
 #              affirmative verdict +30m (round is rate-limited)
 #     clearance @12:40 → merge-clearance-gate run created @12:45
@@ -146,6 +148,14 @@ expect_pair "pair 3: post-verdict marker tags the segment without consuming the 
 expect_pair "pair 4: trigger→👍 clearance = 600s" \
   '.pair == "4_trigger_to_thumbs_clearance" and .pr == 10' \
   '.seconds == 600'
+
+# #645: the clearance 👍 is read from the PR ISSUE (pr_reactions.jsonl, +1
+# @10:20 → 600s), NOT the trigger comment. reactions.jsonl carries a distractor
+# +1 on the trigger comment @10:15; the OLD trigger-comment logic would have
+# paired that (300s), so PR 10 must have exactly ONE pair-4 record at 600s.
+n_pr10_p4=$(jq -s '[ .[] | select(.pair == "4_trigger_to_thumbs_clearance" and .pr == 10) ] | length' "$PAIRS")
+[ "$n_pr10_p4" = "1" ] && pass "pair 4: trigger-comment +1 is ignored; only the PR-issue 👍 clears (#645)" \
+  || fail "PR 10 pair-4 records: got $n_pr10_p4, want 1 (trigger-comment +1 must not count)"
 
 expect_pair "pair 5: push→auto-review = 1500s (verdict with no owning trigger)" \
   '.pair == "5_push_to_auto_review" and .pr == 11' \
