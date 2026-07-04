@@ -26,6 +26,50 @@ changed here.
   they are 9% of run volume and ~10% of billed run-minutes; event-triggered
   runs are the other ~90%.
 
+## Backfill addendum (2026-07-04)
+
+The original pass deferred pairs 1 and 4 (👀 ack / 👍 clearance reactions)
+because that session could not read the per-comment reactions endpoint. The
+committed `scripts/audit-codex-latency.sh` was re-run with reaction +
+inline-comment access (window 2026-05-01 → 2026-07-04, 293 PRs); the
+supplementary extract is `docs/audits/data/codex-latency-2026-07/summary-backfill-2026-07-04.md`
+with the load-bearing ack samples under `backfill-2026-07-04/`. This resolves
+pair 1 (ack) and pair 2 (first finding) and completes the `ack_wait_seconds`
+disposition; pair 4 (👍 clearance) turned out to be measured against the
+wrong endpoint and stays open (see below). The pair-2 and pairs-1/4 sections
+further down have been updated in place to match:
+
+| Event pair | n | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| 1. trigger → 👀 ack | 14 | 9s | 11s | 13s | 13s |
+| 2. trigger → first inline finding | 208 | 5m16s | 13m46s | 19m57s | 30m39s |
+| 4. trigger → 👍 clearance | — | **unmeasured — wrong endpoint (see below)** | | | |
+
+- **Ack is fast and extremely tight** — every healthy ack landed in 6–13s
+  (p99 13s, max 13s). The "~4 min no-👀 = dropped" heuristic is ~18× the
+  measured p99, far too slow as a dropped-trigger test.
+- **Pair 4 (👍 clearance) is NOT resolved by this backfill — the audit measures
+  the wrong object.** The script defines pair 4 as a `+1` reaction on the
+  *trigger comment* (`issues/comments/{id}/reactions`), but the merge gate
+  (`scripts/codex-review-check.sh`) reads the clearance 👍 from the *PR issue*
+  (`repos/$REPO/issues/$PR_NUMBER/reactions`). So the 0 trigger-comment `+1`s
+  this pass found is an artifact of looking in the wrong place, **not**
+  evidence that 👍 clearance does not happen (it does — gate (b) branch 2
+  relies on it, and those 👍s expire after 30 min). 👍-clearance latency is
+  therefore genuinely UNMEASURED here. Follow-up: fix the audit script's
+  pair-4 definition to read `issues/$PR_NUMBER/reactions` and re-measure
+  (filed separately). Do **not** read this as "clearance is verdict-only."
+- **Completed `ack_wait_seconds` disposition** — with p99(ack)=13s, the ack
+  gate's per-wait budget of 60s is already 4.6× p99, and the full failover
+  path (one 60s wait, one repost, a second 60s wait) is up to 120s. A healthy
+  ack always lands inside the first wait (13s ≪ 30s), so **retune ack_wait
+  → 30s**: still 2.3× p99 per wait with no misfire risk, halving dropped/
+  rate-limited failover from ≤120s to ≤60s. Replace the runbook "~4 min no-👀"
+  with "healthy ack p99=13s; treat >30s with no 👀 as dropped." Lands as a
+  separate PR per the guardrail below.
+
+Study results were posted to #623 on 2026-07-04.
+
 ## Method
 
 Fully retrospective, per the #623 hard constraint: every number below comes
@@ -86,14 +130,14 @@ rate-limit markers all correspond to rounds that ended in a marker, not a
 slow verdict) — the tail risk `review_timeout_seconds` guards against is
 non-response, not slow response.
 
-### Pair 2 — trigger → first inline finding: pending backfill; proxy measured
+### Pair 2 — trigger → first inline finding
 
-Rigorous pair 2 requires the bot's inline review comments, which this
-pass did not mine — a clean, inline-less review submission is not a
-finding and must not count (the script enforces that: a review only
-qualifies when it carries ≥1 inline comment). The committed script
-fetches the inline-comment endpoint, so the same local run that
-backfills pairs 1/4 fills this table too.
+Backfilled 2026-07-04 (see the addendum above): **n=208, p50 5m16s, p90
+13m46s, p99 19m57s, max 30m39s.** Rigorous pair 2 requires the bot's inline
+review comments — a clean, inline-less review submission is not a finding
+and must not count (the script enforces that: a review only qualifies when
+it carries ≥1 inline comment). The pair 2b proxy below (any first review
+response) remains a useful strict upper bound.
 
 What this pass CAN measure rigorously is **pair 2b — trigger → first
 review response of any kind** (findings-bearing or clean review
@@ -123,16 +167,22 @@ non-response cases this audit measures. Anchor is the reviewed commit's committe
 verdict carries no `Reviewed commit:` line (the older verdict format) are
 excluded for lack of a recorded push anchor.
 
-### Pairs 1 and 4 — 👀 ack and 👍 clearance reactions: not measurable in this pass
+### Pairs 1 and 4 — 👀 ack and 👍 clearance reactions
 
-Reaction **timestamps** live only on the per-comment reactions endpoint
-(`/issues/comments/{id}/reactions`), which this session's GitHub access
-does not expose. The committed script implements both pairs (it fetches
-reactions for every trigger comment, paginated); **one run of
-`scripts/audit-codex-latency.sh --repo nathanjohnpayne/mergepath` from any
-environment with a normal PAT backfills both distributions** into the same
-tables. The `ack_wait_seconds` disposition below is deferred on that
-backfill rather than guessed.
+**Pair 1 (👀 ack) backfilled 2026-07-04**: n=14, p50 9s, p99 13s, max 13s.
+The ack lands on the trigger comment, and the script measures it there
+correctly — this pair is now sound and drives the `ack_wait_seconds` retune.
+
+**Pair 4 (👍 clearance) is measured against the wrong object and remains
+open.** The script defines pair 4 as a `+1` on the *trigger comment*
+(`issues/comments/{id}/reactions`), but the merge gate
+(`scripts/codex-review-check.sh`, lines ~933/1081) reads the clearance 👍
+from the *PR issue* (`repos/$REPO/issues/$PR_NUMBER/reactions`). The backfill
+therefore found 0 trigger-comment `+1`s — an artifact of the endpoint, not
+evidence that 👍 clearance is unused (gate (b) branch 2 depends on it).
+Fixing the script's pair-4 definition to read the PR-issue reactions and
+re-measuring is tracked as a follow-up; 👍-clearance latency is unmeasured
+until then.
 
 ### Trigger health (the #570 dropped-trigger class)
 
@@ -242,18 +292,20 @@ more.
 | Knob | Default | Measured | Disposition |
 |---|---|---|---|
 | `codex.review_timeout_seconds` | 600s | verdict p90 = 426s, p99 = 630s, max = 830s; 2/100 rounds over 600s | **Confirm ~600s, or raise to 900s to cover the recorded max (830s).** The foreground wait is nearly right-sized for rounds that complete; timeouts are dominated by rounds that will *never* complete (dropped/rate-limited triggers, ~21% historically), so `--trigger-only` + event-driven pickup remains the right escape path, not a longer wait. |
-| `codex.ack_wait_seconds` × `max_ack_retries` | 60s × 1 | pair-1 ack distribution pending the reactions backfill (one local script run) | **Deferred, with a concrete backfill step.** Bounding context from measured pairs: verdicts land p50 3m37s after the trigger; not-connected markers land within ~10–60s. The "~4 min no-👀 = dropped" runbook heuristic sits right at p50(verdict) and is almost certainly too slow as an ack test — but the retune must cite p99(ack), which requires the backfill. |
+| `codex.ack_wait_seconds` × `max_ack_retries` | 60s × 1 | **ack p99 = 13s** (backfilled 2026-07-04, n=14; see addendum) | **Retune → 30s.** Healthy acks land in 6–13s, so 60s × 1 (120s) is 4.6× p99 — safe but slow to fail over on the ~19% dropped/rate-limited class. 30s stays 2.3× p99 with no misfire risk and cuts dropped-trigger failover from 120s to ~30s. Replace the "~4 min no-👀" runbook heuristic with "healthy ack p99=13s; treat >30s with no 👀 as dropped." Separate PR citing p99(ack)=13s. |
 | `codex.reaction_freshness_window_seconds` | 1800s | 13/13 head-anchored clearances were swept inside 1800s — all by event runs (p50 ≈ 28s); no cron sweep ever carried one, and the measured cron gap (p50 ≈ 96m) sits far outside the window | **The window is only viable because of the event-driven path.** Widening it to cover the cron path would need ≥ ~5400s (cron p50+) and weakens staleness protection; the data supports finishing the event-driven re-arm (#620) so the window's role keeps shrinking, and otherwise leaving 1800s in place. |
 | Sweep cadences (`*/15`, `*/5`) | cron | effective median cadence ~96–98 min for BOTH specs; scheduled runs are ~10% of run-minutes; 13/13 head-anchored clearances swept by event runs | **The cadence knob barely does anything.** GitHub throttling makes `*/5` and `*/15` deliver the same ~1.6h median; the replay for candidate cadences should model the measured firing behavior, not the spec. Slowing to `*/30` would cut a small, mostly-idle cost slice with negligible latency impact *given the event triggers stay*; the higher-leverage retune is event-trigger dedup. |
 
 Runbook/docs references to the folklore numbers ("15–40 min", "~4 min
-no-👀") should be replaced with the measured ones (p50 3m37s / p90 7m6s /
-p99 10m30s verdict; ack pending backfill) — that lands with the retune PRs.
+no-👀") should be replaced with the measured ones (verdict p50 3m37s / p90
+7m6s / p99 10m30s; ack p99 13s) — that lands with the retune PRs.
 
 ## Known gaps and exclusions (all fail-closed)
 
-- **Pairs 1/4** (reaction timestamps): not exposed to this session's GitHub
-  access; the committed script fetches them; one local run backfills.
+- **Pair 1 (👀 ack)**: backfilled 2026-07-04 (n=14, p99 13s). **Pair 4 (👍
+  clearance)**: the script reads trigger-comment reactions, but the gate
+  reads PR-issue reactions — pair 4 is measured against the wrong object and
+  stays open pending the script fix (see Follow-ups).
 - **👍-only and review-object-only clearances** are excluded from pair 6
   rather than approximated (COMMENTED review state carries no
   affirmative/negative signal without finding-tier evaluation).
@@ -268,8 +320,10 @@ p99 10m30s verdict; ack pending backfill) — that lands with the retune PRs.
 
 ## Follow-ups
 
-- Backfill pairs 1 and 4 by running the script with normal `gh` access;
-  then retune `ack_wait_seconds`/`max_ack_retries` citing p99(ack).
+- **Fix pair 4's endpoint**: the script measures a `+1` on the trigger
+  comment, but the gate reads `repos/$REPO/issues/$PR_NUMBER/reactions` (the
+  PR issue) — correct the pair-4 definition and re-measure 👍-clearance
+  latency. (Pair 1 ack is done: p99 13s → the `ack_wait_seconds` retune above.)
 - Retune PRs for the four knob rows above, each citing this document.
 - Cadence replay over the recorded clearance timestamps using the measured
   (throttled) cron firing behavior — never live trials.
