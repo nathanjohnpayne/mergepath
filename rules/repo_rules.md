@@ -1,59 +1,34 @@
 # Repository Rules
 
-Agents must treat every entry here as a binding constraint, not a
-suggestion. If a proposed change would violate a rule below, stop and
-flag the conflict before proceeding.
+Agents must treat every entry here as a binding constraint, not a suggestion. If a proposed change would violate a rule below, stop and flag the conflict before proceeding.
 
 ## Structure Invariants
 
-- Canonical root files must always exist:
-  README.md, AGENTS.md, CLAUDE.md, DEPLOYMENT.md, CONTRIBUTING.md, .ai_context.md
-- `CLAUDE.md` must contain only a reading-order pointer to `AGENTS.md`.
-  It must never duplicate instructions from AGENTS.md or any other file.
-- `AGENTS.md` is a lightweight index pointing to `docs/agents/`. Agent
-  instructions live in focused sub-files under `docs/agents/`.
-- Tool folders (.cursor/, .claude/, .vscode/) must contain
-  configuration only—no instructions, no behavioral rules.
-- No new top-level directories without justification documented in
-  AGENTS.md or a plans/ entry.
+- Canonical root files must always exist: README.md, AGENTS.md, CLAUDE.md, DEPLOYMENT.md, CONTRIBUTING.md, .ai_context.md
+- `CLAUDE.md` must contain only a reading-order pointer to `AGENTS.md`. It must never duplicate instructions from AGENTS.md or any other file.
+- `AGENTS.md` is a lightweight index pointing to `docs/agents/`. Agent instructions live in focused sub-files under `docs/agents/`.
+- Tool folders (.cursor/, .claude/, .vscode/) must contain configuration only—no instructions, no behavioral rules.
+- No new top-level directories without justification documented in AGENTS.md or a plans/ entry.
 
 ## ESLint policy
 
-Any repo with a root `package.json` MUST ship an `eslint.config.js`
-flat config at the repo root with at least the `@eslint/js`
-recommended ruleset, plus framework plugins appropriate to the stack
-(e.g., `typescript-eslint` for TypeScript, `eslint-plugin-astro` for
-Astro, `eslint-plugin-react` + `eslint-plugin-react-hooks` for React).
+Any repo with a root `package.json` MUST ship an `eslint.config.js` flat config at the repo root with at least the `@eslint/js` recommended ruleset, plus framework plugins appropriate to the stack (e.g., `typescript-eslint` for TypeScript, `eslint-plugin-astro` for Astro, `eslint-plugin-react` + `eslint-plugin-react-hooks` for React).
 
-Repos without a root `package.json` (Mergepath itself is shell-only,
-for example) are exempt. The CI check
-(`scripts/ci/check_eslint_config_present`) early-outs with a
-not-applicable log line in that case.
+Repos without a root `package.json` (Mergepath itself is shell-only, for example) are exempt. The CI check (`scripts/ci/check_eslint_config_present`) early-outs with a not-applicable log line in that case.
 
-Use the flat config format (`eslint.config.js`); legacy
-`.eslintrc.*` formats do not satisfy this rule. A starter config that
-covers JS + TS + Astro + React lives at `examples/eslint.config.js`.
-See `docs/agents/code-modification-rules.md` § ESLint flat-config
-policy for the rationale and the per-framework setup notes.
+Use the flat config format (`eslint.config.js`); legacy `.eslintrc.*` formats do not satisfy this rule. A starter config that covers JS + TS + Astro + React lives at `examples/eslint.config.js`. See `docs/agents/code-modification-rules.md` § ESLint flat-config policy for the rationale and the per-framework setup notes.
 
 ## Forbidden Patterns
 
-- Never push directly to `main`. All changes must go through a
-  pull request—even single-line fixes and documentation updates.
-  The only exception is if the human explicitly authorizes a
-  direct push in chat as a break-glass override.
-- Instructions must not be duplicated between root files and
-  tool folders.
-- `dist/` must not be edited manually. Regenerate through the
-  build system only.
+- Never push directly to `main`. All changes must go through a pull request—even single-line fixes and documentation updates. The only exception is if the human explicitly authorizes a direct push in chat as a break-glass override.
+- Instructions must not be duplicated between root files and tool folders.
+- `dist/` must not be edited manually. Regenerate through the build system only.
 - Tests must not be deleted to force a build to pass.
-- Secrets must never be committed. Use environment variables or
-  a secrets manager.
+- Secrets must never be committed. Use environment variables or a secrets manager.
 
 ## CI Enforcement
 
-The following checks run from `scripts/ci/` locally and via `.github/workflows/repo_lint.yml` in CI.
-All checks must pass before merge.
+The following checks run from `scripts/ci/` locally and via `.github/workflows/repo_lint.yml` in CI. All checks must pass before merge.
 
 - check_required_root_files
 - check_no_tool_folder_instructions
@@ -74,43 +49,4 @@ All checks must pass before merge.
 - check_verify_propagation_pr: `scripts/workflow/verify-propagation-pr.sh` + `tests/test_verify_propagation_pr.sh` must exist and the fixture-driven suite must pass. The verifier is the security-load-bearing teeth of the propagation-PR review lane (#264 / #268, REVIEW_POLICY.md § Phase 3.5): it byte-compares every file a sync PR changes against `mergepath@<sha>`'s content + manifest, so the lane only ever skips Phase 4 external review for a PR that is *provably* a verbatim mirror of already-reviewed content. A path-confinement-only check would be a hole — `.github/workflows/*` is itself propagation surface — so the check is a real content comparison sourced entirely from the immutable public `mergepath@<sha>` the PR's branch name points at.
 - check_propagation_closure: the INVERSE of check_sync_manifest (#519/#521). Where check_sync_manifest validates every *declared* `requires:` is covered, this scans references *out of* every propagated `scripts/ci/check_*` + canonical `.github/workflows/*` file and fails if any on-disk `tests/`+`scripts/` reference is undeclared (not an exact manifest path, not inside a kit, not in any `requires:`). An undeclared, on-disk, propagated dependency does not travel to consumers, so the referencing tool fails closed at consumer lint time — the 3rd-occurrence drift class fixed reactively in #526. Skips refs that do not resolve to a real file (fixture strings, doc examples) and an explicit allow-list of orchestrator/mergepath-internal paths (the propagation engine, bootstrap seeders, the weekly-sweep pipeline, and self-tests of checks never wired into a consumer's repo_lint.yml). Requires `yq` (mikefarah/yq v4+); runs `tests/test_check_propagation_closure.sh` as its regression net. SKIPs on a consumer checkout (manifest absent + `scripts/sync-to-downstream.sh` absent), same posture as check_sync_manifest.
 - check_session_finalization: `scripts/session-finalization-check.sh` + `tests/test_session_finalization_check.sh` must exist and pass. Guards the session-closeout workflow against orphaned local implementation work, stale stashes, and dirty auxiliary worktrees.
-- check_ci_scripts_wired: every `scripts/ci/check_*` file (executable
-  or not — see r5 below) must be invoked as an explicit
-  `run: ./scripts/ci/check_X` step in `.github/workflows/repo_lint.yml`
-  OR in the optional consumer-local annex
-  `.github/workflows/repo_lint_local.yml` (#601), OR carry a documented
-  exemption on a `# WIRED-EXEMPT: check_X — reason` line in either
-  file. The guard scans the UNION of the two files; the annex absent →
-  identical to the single-file scan. Comment-only mentions of a check
-  (e.g. inside a comment block) do NOT count as wiring — only real
-  `run:` lines. Pure-bash so it can run before the yq install. Catches
-  the #269 failure mode where a check ships on disk and passes review
-  under its own tests yet never actually executes in CI because the
-  matching workflow step was never added. The check itself must be
-  wired into repo_lint.yml.
-  Fleet enforcement (#601): `repo_lint.yml` is a canonical,
-  consumers-all entry in `.mergepath-sync.yml` (previously it was
-  seeded exactly once by the bootstrap template-mirror and never
-  updated, so this wiring contract was enforced on mergepath only —
-  consumers ran a bootstrap-era step subset against the full,
-  kit-propagated `scripts/ci/`). A new check and its `run:` step land
-  in the same PR and travel to consumers in the same sync PR
-  (atomicity), so the contract holds on every repo at every sync
-  point; `check_sync_manifest` asserts the manifest keeps the entry
-  (canonical, consumers: all) and the `scripts/ci/` kit `requires:` it.
-  Consumers wire their own repo-local checks (and record consumer-local
-  exemptions) in `repo_lint_local.yml` — never by editing the canonical
-  `repo_lint.yml`, which the next sync wave overwrites. Every step in
-  `repo_lint.yml` must be consumer-safe: SKIP-guard hub-only checks via
-  the `scripts/sync-to-downstream.sh` marker idiom, depend only on
-  manifest-propagated files, or soft-pass when the backing script is
-  absent (#590); the hub-only
-  `tests/test_repo_lint_consumer_safety.sh` net runs every wired check
-  against a consumer-shaped fixture tree and asserts each exits 0.
-  Note (#269 r5): the guard counts ALL `check_*` files regardless of
-  executable bit. The earlier r3-r4 spec carved out non-executable
-  files as "WIP skip", but repo_lint.yml runs
-  `chmod +x scripts/ci/*` BEFORE this guard, so on CI every check_*
-  is executable regardless of pre-chmod permission. Aligning the
-  guard with production reality is more honest than enforcing a
-  contract the workflow order silently breaks.
+- check_ci_scripts_wired: every `scripts/ci/check_*` file (executable or not — see r5 below) must be invoked as an explicit `run: ./scripts/ci/check_X` step in `.github/workflows/repo_lint.yml` OR in the optional consumer-local annex `.github/workflows/repo_lint_local.yml` (#601), OR carry a documented exemption on a `# WIRED-EXEMPT: check_X — reason` line in either file. The guard scans the UNION of the two files; the annex absent → identical to the single-file scan. Comment-only mentions of a check (e.g. inside a comment block) do NOT count as wiring — only real `run:` lines. Pure-bash so it can run before the yq install. Catches the #269 failure mode where a check ships on disk and passes review under its own tests yet never actually executes in CI because the matching workflow step was never added. The check itself must be wired into repo_lint.yml. Fleet enforcement (#601): `repo_lint.yml` is a canonical, consumers-all entry in `.mergepath-sync.yml` (previously it was seeded exactly once by the bootstrap template-mirror and never updated, so this wiring contract was enforced on mergepath only — consumers ran a bootstrap-era step subset against the full, kit-propagated `scripts/ci/`). A new check and its `run:` step land in the same PR and travel to consumers in the same sync PR (atomicity), so the contract holds on every repo at every sync point; `check_sync_manifest` asserts the manifest keeps the entry (canonical, consumers: all) and the `scripts/ci/` kit `requires:` it. Consumers wire their own repo-local checks (and record consumer-local exemptions) in `repo_lint_local.yml` — never by editing the canonical `repo_lint.yml`, which the next sync wave overwrites. Every step in `repo_lint.yml` must be consumer-safe: SKIP-guard hub-only checks via the `scripts/sync-to-downstream.sh` marker idiom, depend only on manifest-propagated files, or soft-pass when the backing script is absent (#590); the hub-only `tests/test_repo_lint_consumer_safety.sh` net runs every wired check against a consumer-shaped fixture tree and asserts each exits 0. Note (#269 r5): the guard counts ALL `check_*` files regardless of executable bit. The earlier r3-r4 spec carved out non-executable files as "WIP skip", but repo_lint.yml runs `chmod +x scripts/ci/*` BEFORE this guard, so on CI every check_* is executable regardless of pre-chmod permission. Aligning the guard with production reality is more honest than enforcing a contract the workflow order silently breaks.

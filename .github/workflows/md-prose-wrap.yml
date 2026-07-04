@@ -1,0 +1,40 @@
+name: Markdown prose wrap
+
+# Mergepath-LOCAL gate: repo-owned Markdown prose must be soft-wrapped (one
+# physical line per paragraph; the renderer wraps). Fixed-column hard-wrapping
+# is invisible in rendered GFM, enforced by nothing, and churns on every edit.
+#
+# Deliberately standalone and NOT in .mergepath-sync.yml: it is not a
+# scripts/ci/check_* (those propagate to every consumer via the scripts/ci/
+# kit) and is not wired into the propagated repo_lint.yml. So it runs ONLY in
+# mergepath and touches no consumer CI. Policy (which files are in scope) lives
+# in scripts/lint-md-prose-wrap.sh; the render-preserving transform lives in
+# scripts/lib/md_reflow.py. See docs/agents/documentation-rules.md
+# § Prose line-wrapping.
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  md-prose-wrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      # Pinned, isolated dependency — the repo ships no package.json /
+      # node_modules and pins a single Python package for this gate only.
+      - name: Install markdown-it-py (pinned)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mdvenv"
+          "$RUNNER_TEMP/mdvenv/bin/pip" install --quiet 'markdown-it-py==4.2.0'
+
+      - name: md_reflow behavior tests
+        run: MD_REFLOW_PYTHON="$RUNNER_TEMP/mdvenv/bin/python" ./tests/test_md_reflow.sh
+
+      - name: Check Markdown prose is soft-wrapped
+        # Enforcing: fails CI on any fixed-column-wrapped in-scope prose or any
+        # file that fails the fail-closed render check. Run
+        # `scripts/lint-md-prose-wrap.sh --write` to fix locally.
+        run: MD_REFLOW_PYTHON="$RUNNER_TEMP/mdvenv/bin/python" ./scripts/lint-md-prose-wrap.sh --check

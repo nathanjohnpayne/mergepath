@@ -47,43 +47,17 @@ To add a new agent, register a GitHub account following the pattern `nathanpayne
 
 ### Reviewer PAT Quick Start
 
-For repo work, `GH_TOKEN` is now the per-command attribution source for
-the guarded `gh` writes. Do not rely on the machine-global gh keyring
-selected account for author/reviewer bylines.
+For repo work, `GH_TOKEN` is now the per-command attribution source for the guarded `gh` writes. Do not rely on the machine-global gh keyring selected account for author/reviewer bylines.
 
-- **Read paths** (`gh api user`, `gh api ...` GETs, `gh pr view`,
-  `gh pr checks`) honor `GH_TOKEN`. Pass it inline per command.
-- **Guarded write paths** (`gh pr create`, `gh pr merge`,
-  `gh pr edit`, `gh pr comment`, `gh pr review`, `gh issue comment`)
-  MUST go through `scripts/gh-as-author.sh` or
-  `scripts/gh-as-reviewer.sh`. The wrapper resolves the expected token,
-  verifies its effective login with `scripts/identity-check.sh
-  --expect-token-identity`, and runs exactly the wrapped command with
-  `GH_TOKEN` set and `GITHUB_TOKEN` cleared. The wrappers never change
-  stored gh account selection.
-- **Bare and inline-token guarded writes** fail closed in
-  `scripts/hooks/gh-pr-guard.sh`. `GH_TOKEN=... gh pr review ...` is not
-  an approved substitute for the wrapper because it does not prove the
-  token belongs to the expected identity.
+- **Read paths** (`gh api user`, `gh api ...` GETs, `gh pr view`, `gh pr checks`) honor `GH_TOKEN`. Pass it inline per command.
+- **Guarded write paths** (`gh pr create`, `gh pr merge`, `gh pr edit`, `gh pr comment`, `gh pr review`, `gh issue comment`) MUST go through `scripts/gh-as-author.sh` or `scripts/gh-as-reviewer.sh`. The wrapper resolves the expected token, verifies its effective login with `scripts/identity-check.sh --expect-token-identity`, and runs exactly the wrapped command with `GH_TOKEN` set and `GITHUB_TOKEN` cleared. The wrappers never change stored gh account selection.
+- **Bare and inline-token guarded writes** fail closed in `scripts/hooks/gh-pr-guard.sh`. `GH_TOKEN=... gh pr review ...` is not an approved substitute for the wrapper because it does not prove the token belongs to the expected identity.
 
-`codex-review-request.sh` posts the load-bearing `@codex review`
-trigger through `scripts/gh-as-author.sh`. The Codex GitHub App only
-monitors trigger comments authored by `nathanjohnpayne` (#405), so this
-trigger is an author-identity write even though the polling reads use the
-reviewer PAT. `coderabbit-wait.sh` and other long-tail helpers continue
-to use the cached PATs they load from preflight; the wrapper-mandatory
-contract in this section covers the core guarded `gh` write surface.
+`codex-review-request.sh` posts the load-bearing `@codex review` trigger through `scripts/gh-as-author.sh`. The Codex GitHub App only monitors trigger comments authored by `nathanjohnpayne` (#405), so this trigger is an author-identity write even though the polling reads use the reviewer PAT. `coderabbit-wait.sh` and other long-tail helpers continue to use the cached PATs they load from preflight; the wrapper-mandatory contract in this section covers the core guarded `gh` write surface.
 
 #### PAT lookup table
 
-> This is the **canonical source** for PAT lookups across the
-> mergepath ecosystem. `CLAUDE.md` (project), `AGENTS.md`, and
-> `DEPLOYMENT.md` all reference this section instead of duplicating
-> the table. Machine-level `~/GitHub/CLAUDE.md` mirrors the same
-> rows for cross-repo work. The same four identities also have SSH
-> signing keys uploaded to GitHub — see the
-> [SSH Signing Keys](#ssh-signing-keys) section below for the
-> inventory + verify/re-upload commands.
+> This is the **canonical source** for PAT lookups across the mergepath ecosystem. `CLAUDE.md` (project), `AGENTS.md`, and `DEPLOYMENT.md` all reference this section instead of duplicating the table. Machine-level `~/GitHub/CLAUDE.md` mirrors the same rows for cross-repo work. The same four identities also have SSH signing keys uploaded to GitHub — see the [SSH Signing Keys](#ssh-signing-keys) section below for the inventory + verify/re-upload commands.
 
 | Agent | Reviewer Identity | 1Password Item ID | Cached env var (primary) | `op read` path (setup-only fallback) |
 |-------|-------------------|-------------------|--------------------------|--------------------------------------|
@@ -92,10 +66,7 @@ contract in this section covers the core guarded `gh` write surface.
 | Codex | `nathanpayne-codex` | `o6ekjxjjl5gq6rmcneomrjahpu` | `$OP_PREFLIGHT_REVIEWER_PAT` | `op://Private/o6ekjxjjl5gq6rmcneomrjahpu/token` |
 | Human | `nathanjohnpayne` | `sm5kopwk6t6p3xmu2igesndzhe` | `$OP_PREFLIGHT_AUTHOR_PAT` | `op://Private/sm5kopwk6t6p3xmu2igesndzhe/token` |
 
-**Cached-variable usage is the primary pattern.** After a single
-`eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"` at
-session start, all subsequent API calls use the env var directly —
-no biometric burned per call:
+**Cached-variable usage is the primary pattern.** After a single `eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"` at session start, all subsequent API calls use the env var directly — no biometric burned per call:
 
 ```bash
 # Read-path identity check (PRIMARY — uses cached PAT, no biometric).
@@ -115,12 +86,7 @@ scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
 
 ##### Fallback / setup-only: inline `op read`
 
-> **⚠️ This triggers a biometric prompt every call. Use only when
-> `op-preflight.sh` is unavailable** — for example, during the
-> initial bootstrap of a new machine before the cache directory
-> exists, or in a CI runner that has not been wired through
-> preflight. Routine agent work should always use the cached
-> `$OP_PREFLIGHT_*_PAT` env vars above.
+> **⚠️ This triggers a biometric prompt every call. Use only when `op-preflight.sh` is unavailable** — for example, during the initial bootstrap of a new machine before the cache directory exists, or in a CI runner that has not been wired through preflight. Routine agent work should always use the cached `$OP_PREFLIGHT_*_PAT` env vars above.
 
 ```bash
 # Setup-only — every invocation prompts for Touch ID.
@@ -129,40 +95,15 @@ GH_TOKEN="$(op read 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token')" \
 ```
 
 - Use the item ID from the lookup table above for your agent identity. Do not use the 1Password item title.
-- To verify a cached PAT, use `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login`
-  or let the wrapper perform the same check before the write. Do not use
-  `gh auth status` as an attribution proof; it is affected by env tokens
-  and does not replace the wrapper's effective-login check.
-- If `op whoami` says you are not signed in, still run the `op read ...`
-  command in an interactive TTY. That is what triggers the 1Password biometric
-  prompt on local machines.
-- If GitHub returns `Review Can not approve your own pull request`, you
-  either the PR author is not `nathanjohnpayne`, the reviewer token
-  resolved to the author identity, or the no-self-approve scoping rule
-  below applies. Confirm with `gh pr view <PR#> --json author` and
-  `GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- gh api user --jq .login`
-  before retrying. If you intentionally skipped `--approve` under the
-  no-self-approve scoping rule below (Phase 4 / above-threshold PRs),
-  post `--comment` instead and let Phase 4 carry the gate.
+- To verify a cached PAT, use `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login` or let the wrapper perform the same check before the write. Do not use `gh auth status` as an attribution proof; it is affected by env tokens and does not replace the wrapper's effective-login check.
+- If `op whoami` says you are not signed in, still run the `op read ...` command in an interactive TTY. That is what triggers the 1Password biometric prompt on local machines.
+- If GitHub returns `Review Can not approve your own pull request`, you either the PR author is not `nathanjohnpayne`, the reviewer token resolved to the author identity, or the no-self-approve scoping rule below applies. Confirm with `gh pr view <PR#> --json author` and `GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> scripts/gh-as-reviewer.sh -- gh api user --jq .login` before retrying. If you intentionally skipped `--approve` under the no-self-approve scoping rule below (Phase 4 / above-threshold PRs), post `--comment` instead and let Phase 4 carry the gate.
 
 ### SSH Signing Keys
 
-> This is the **canonical source** for SSH signing key inventory
-> across the mergepath ecosystem. Machine-level `~/GitHub/CLAUDE.md`
-> mirrors the same rows for cross-repo work. Sister-table to the
-> [PAT lookup table](#pat-lookup-table) above: both inventory the
-> same four identities, just for different per-identity artifacts.
+> This is the **canonical source** for SSH signing key inventory across the mergepath ecosystem. Machine-level `~/GitHub/CLAUDE.md` mirrors the same rows for cross-repo work. Sister-table to the [PAT lookup table](#pat-lookup-table) above: both inventory the same four identities, just for different per-identity artifacts.
 
-Every identity in the [PAT lookup table](#pat-lookup-table) above also
-has an SSH signing key uploaded to its GitHub account so commits and
-tags attributed to that login render as **Verified** instead of the
-"this user has not yet uploaded their public signing key" notice. By
-convention every key on a given machine shares the title
-`<machine-name>-signing-key` (currently `mergepath-mac signing key`
-for the first Mac in the rotation; titles get per-machine suffixes
-once a second machine joins). The local pub keys live in
-`~/.ssh/keys/` and are referenced (for auth, not signing) by
-`~/.ssh/config`.
+Every identity in the [PAT lookup table](#pat-lookup-table) above also has an SSH signing key uploaded to its GitHub account so commits and tags attributed to that login render as **Verified** instead of the "this user has not yet uploaded their public signing key" notice. By convention every key on a given machine shares the title `<machine-name>-signing-key` (currently `mergepath-mac signing key` for the first Mac in the rotation; titles get per-machine suffixes once a second machine joins). The local pub keys live in `~/.ssh/keys/` and are referenced (for auth, not signing) by `~/.ssh/config`.
 
 | Account             | Local pub key                            | GitHub signing key id (mergepath-mac) |
 |---------------------|------------------------------------------|---------------------------------------|
@@ -171,20 +112,9 @@ once a second machine joins). The local pub keys live in
 | nathanpayne-cursor  | `~/.ssh/keys/github_cursor.pub`          | 949666                                |
 | nathanpayne-codex   | `~/.ssh/keys/github_codex.pub`           | 949667                                |
 
-**Why all four — including the bot accounts.** Local `git commit` only
-ever signs as `nathanjohnpayne` (`git config --global user.signingkey`
-is the human identity per the active-account convention above), so the
-human's key is the one git invokes day-to-day. The bot accounts need
-keys uploaded so that GitHub-attributed activity verifies correctly
-under their logins: web-flow commits a bot makes via the GitHub UI,
-future API-authored commits via `PUT /repos/:owner/:repo/contents/:path`,
-or any other surface where GitHub does the signing on behalf of the
-bot identity. Without the upload, every such commit renders with the
-"this user has not yet uploaded their public signing key" notice and
-a yellow "Partial Verified" badge.
+**Why all four — including the bot accounts.** Local `git commit` only ever signs as `nathanjohnpayne` (`git config --global user.signingkey` is the human identity per the active-account convention above), so the human's key is the one git invokes day-to-day. The bot accounts need keys uploaded so that GitHub-attributed activity verifies correctly under their logins: web-flow commits a bot makes via the GitHub UI, future API-authored commits via `PUT /repos/:owner/:repo/contents/:path`, or any other surface where GitHub does the signing on behalf of the bot identity. Without the upload, every such commit renders with the "this user has not yet uploaded their public signing key" notice and a yellow "Partial Verified" badge.
 
-**Verify** — read-only check, should return exactly one entry per
-account (titled `mergepath-mac signing key` on this Mac):
+**Verify** — read-only check, should return exactly one entry per account (titled `mergepath-mac signing key` on this Mac):
 
 ```bash
 for acct in nathanpayne-claude nathanpayne-cursor nathanpayne-codex nathanjohnpayne; do
@@ -204,45 +134,19 @@ GH_TOKEN="$(gh auth token --user "$acct")" gh api -X POST /user/ssh_signing_keys
   -f "key=$(cat "$pub")"
 ```
 
-The bot PATs already carry the `admin:ssh_signing_key` scope, so no
-re-auth is required for routine uploads. The `/user/ssh_signing_keys`
-endpoint operates on the authenticated user, so `GH_TOKEN` is honored
-directly — no author wrapper or stored-account selection step is
-needed (unlike core guarded reviewer writes covered by the wrapper
-contract above).
+The bot PATs already carry the `admin:ssh_signing_key` scope, so no re-auth is required for routine uploads. The `/user/ssh_signing_keys` endpoint operates on the authenticated user, so `GH_TOKEN` is honored directly — no author wrapper or stored-account selection step is needed (unlike core guarded reviewer writes covered by the wrapper contract above).
 
-**On a new machine.** The key-id column above is per-machine; a second
-machine joining the rotation will have its own ids and should use a
-distinguishing title (e.g. `mergepath-linux-signing-key`). The
-verification + re-upload commands above are machine-agnostic.
+**On a new machine.** The key-id column above is per-machine; a second machine joining the rotation will have its own ids and should use a distinguishing title (e.g. `mergepath-linux-signing-key`). The verification + re-upload commands above are machine-agnostic.
 
 ### No-self-approve scoping
 
-The no-self-approve rule applies **only** to PRs that meet
-`external_review_threshold` or match `external_review_paths` (the Phase 4
-PRs). For those, the agent's own reviewer identity posts `--comment`
-only — the merge gate is the external reviewer (Phase 4a Codex 👍 via
-gate (b) branch 2, or Phase 4b CLI handoff `APPROVED`). Posting
-`--approve` from your reviewer identity on a Phase 4 PR would short-
-circuit the cross-agent gate the threshold exists to enforce.
+The no-self-approve rule applies **only** to PRs that meet `external_review_threshold` or match `external_review_paths` (the Phase 4 PRs). For those, the agent's own reviewer identity posts `--comment` only — the merge gate is the external reviewer (Phase 4a Codex 👍 via gate (b) branch 2, or Phase 4b CLI handoff `APPROVED`). Posting `--approve` from your reviewer identity on a Phase 4 PR would short- circuit the cross-agent gate the threshold exists to enforce.
 
-For PRs that do **not** meet the threshold (no Phase 4 step in the
-flow), the reviewer identity posting `gh pr review --approve` once
-CodeRabbit has cleared the current HEAD with no unaddressed
-`Potential issue` / `⚠️` findings is the **intended** path: it
-satisfies branch protection's required-approving-review requirement
-without bouncing the change to an external agent for a
-process-overkill approve on a small, self-contained PR. This matches
-the Phase 2 "Steps 4–6 repeat until the reviewer identity approves"
-text below.
+For PRs that do **not** meet the threshold (no Phase 4 step in the flow), the reviewer identity posting `gh pr review --approve` once CodeRabbit has cleared the current HEAD with no unaddressed `Potential issue` / `⚠️` findings is the **intended** path: it satisfies branch protection's required-approving-review requirement without bouncing the change to an external agent for a process-overkill approve on a small, self-contained PR. This matches the Phase 2 "Steps 4–6 repeat until the reviewer identity approves" text below.
 
 ### Operation-to-Identity Matrix
 
-The current contract is token-attributed for the guarded core `gh`
-write surface. The #410 spike verified that tested `gh pr` / `gh issue`
-writes attribute to the process-local `GH_TOKEN` when it is set; #411
-makes that the enforced path by requiring wrappers that verify the token
-before the write.
+The current contract is token-attributed for the guarded core `gh` write surface. The #410 spike verified that tested `gh pr` / `gh issue` writes attribute to the process-local `GH_TOKEN` when it is set; #411 makes that the enforced path by requiring wrappers that verify the token before the write.
 
 | Operation | Required path | Effective identity |
 |-----------|---------------|--------------------|
@@ -266,23 +170,11 @@ before the write.
 
 Notes on the token-wrapper contract:
 
-- **Wrapper-mandatory writes.** `scripts/hooks/gh-pr-guard.sh` blocks
-  bare and inline-token forms of the guarded write commands before they
-  can run. Use the author wrapper for author operations and the reviewer
-  wrapper for reviewer comments/reviews. The hook checks command
-  structure, including wrapper spoofing such as a wrapper path in an
-  `echo` before a bare `gh pr create`.
+- **Wrapper-mandatory writes.** `scripts/hooks/gh-pr-guard.sh` blocks bare and inline-token forms of the guarded write commands before they can run. Use the author wrapper for author operations and the reviewer wrapper for reviewer comments/reviews. The hook checks command structure, including wrapper spoofing such as a wrapper path in an `echo` before a bare `gh pr create`.
 
-- **Token verification.** `scripts/lib/gh-token-resolver.sh` selects a
-  token from the expected preflight env var or `gh auth token --user
-  <login>`, then verifies it with `scripts/identity-check.sh
-  --expect-token-identity <login>`. No token material is printed. A
-  mismatch exits before the wrapped write starts.
+- **Token verification.** `scripts/lib/gh-token-resolver.sh` selects a token from the expected preflight env var or `gh auth token --user <login>`, then verifies it with `scripts/identity-check.sh --expect-token-identity <login>`. No token material is printed. A mismatch exits before the wrapped write starts.
 
-- **Legacy keyring assertions.** `scripts/identity-check.sh` still has
-  keyring assertion modes for helper paths that have not moved to the
-  wrapper contract yet. Those modes are compatibility checks, not the
-  canonical path for the core guarded `gh` writes listed above.
+- **Legacy keyring assertions.** `scripts/identity-check.sh` still has keyring assertion modes for helper paths that have not moved to the wrapper contract yet. Those modes are compatibility checks, not the canonical path for the core guarded `gh` writes listed above.
 
 ## Workflow
 
@@ -300,14 +192,7 @@ eval "$(scripts/op-preflight.sh --agent claude --mode review)"
 eval "$(scripts/op-preflight.sh --agent claude --check)"
 ```
 
-The `--check` (alias `--status`) mode is the lightweight idempotent re-
-validation pattern: it loads the cached export statements without
-invoking `op`, without warming SSH, and without reading ADC. On a
-missing or stale cache it exits non-zero with a remediation message
-pointing back at `--mode review`. Combined with `OP_PREFLIGHT_QUIET=1`
-the cache-hit path collapses to a single stderr line, so noisy agent
-sessions don't accumulate a verbose preflight block on every tool call.
-See nathanjohnpayne/mergepath#282.
+The `--check` (alias `--status`) mode is the lightweight idempotent re- validation pattern: it loads the cached export statements without invoking `op`, without warming SSH, and without reading ADC. On a missing or stale cache it exits non-zero with a remediation message pointing back at `--mode review`. Combined with `OP_PREFLIGHT_QUIET=1` the cache-hit path collapses to a single stderr line, so noisy agent sessions don't accumulate a verbose preflight block on every tool call. See nathanjohnpayne/mergepath#282.
 
 Replace `claude` with `cursor` or `codex` depending on which agent is running. The `--mode` flag controls what is loaded:
 
@@ -383,20 +268,11 @@ After internal review passes (Phase 2), CodeRabbit provides an independent autom
    This step is disposition-tracking, not a merge gate — CodeRabbit remains advisory. It records the same fix/rebuttal decisions the agent already made in step 4; skipping it leaves the CodeRabbit ledger empty but does not block the merge.
 7. CodeRabbit review is advisory. It does not block merge via CI and does not submit a "Changes Requested" review state.
 
-CodeRabbit's advisory status does **not** override GitHub branch
-protection's `required_conversation_resolution` gate. A CodeRabbit
-comment may be left unfixed only when it is not an unresolved GitHub
-review conversation, or when the agent has posted an explicit rationale
-and used the allowed bot-thread resolution path in the
-[Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate).
+CodeRabbit's advisory status does **not** override GitHub branch protection's `required_conversation_resolution` gate. A CodeRabbit comment may be left unfixed only when it is not an unresolved GitHub review conversation, or when the agent has posted an explicit rationale and used the allowed bot-thread resolution path in the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate).
 
 **CodeRabbit runs on ALL PRs** in enabled repos, regardless of size or whether the external review threshold is met. It provides a consistent automated second opinion on every change.
 
-The agent proceeds to Phase 3 (Threshold Check) after addressing
-CodeRabbit comments, even if some non-blocking comments remain open.
-CodeRabbit is an additional review layer, not a replacement for the
-existing threshold-based external agent handoff or the pre-merge
-conversation-resolution gate.
+The agent proceeds to Phase 3 (Threshold Check) after addressing CodeRabbit comments, even if some non-blocking comments remain open. CodeRabbit is an additional review layer, not a replacement for the existing threshold-based external agent handoff or the pre-merge conversation-resolution gate.
 
 #### CodeRabbit Review Checklist
 
@@ -413,96 +289,20 @@ Before moving past Phase 2.5, confirm all of the following:
 
 ### Pre-Merge Review Conversation Gate
 
-Every merge path must pass this gate immediately before calling
-`gh pr merge`, and must repeat it after any push or review-thread reply
-that can change GitHub conversation state.
+Every merge path must pass this gate immediately before calling `gh pr merge`, and must repeat it after any push or review-thread reply that can change GitHub conversation state.
 
-1. Query GitHub's review-thread state, not just flat PR comments. Use
-   `scripts/resolve-pr-threads.sh <PR#> --list` or an equivalent GraphQL
-   `reviewThreads` readback that reports each thread's `isResolved`
-   value.
-2. Confirm there are **zero unresolved review conversations**. GitHub's
-   branch-protection error "All comments must be resolved" is driven by
-   this review-thread state; `gh pr checks`, issue comments, and pull
-   request review comments alone are not sufficient readback.
-3. For bot-authored current-head threads only, if the finding has
-   already been fixed or rebutted on-thread, resolve it. **Fixing review
-   feedback includes resolving the associated review thread, not just
-   pushing a code commit** — a fix that leaves its thread open still
-   blocks the conversation-resolution gate and still surfaces in the
-   weekly unresolved-feedback sweep. The two resolve paths are split by
-   **disposition** — each records a different `[mergepath-resolve:<class>]`
-   tag, and the daily rollup / weekly sweep read that tag as the
-   disposition of record, so pick the mode that matches what actually
-   happened to the feedback (#575):
-   - `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` is the tool
-     for **fixed or rebutted** feedback — the default on a PR you pushed
-     fixes to. It resolves **only** threads whose fix or rebuttal is
-     demonstrable from the current PR state, tagging the truthful classes —
-     `addressed-elsewhere` (an agent commit touching the anchored file,
-     after the latest re-raise) or `rebuttal-recorded` (a substantive agent
-     rebuttal after the latest re-raise). Routing-only classes
-     (`canonical-coverage`, `templated-render`) are deliberately
-     **not** treated as actioned here: they indicate where a durable fix
-     belongs, not that one happened, so a fresh finding on a canonical path
-     is left unresolved rather than auto-resolved by routing alone. The gate
-     evaluates action **independently of routing**, so a canonical/templated
-     thread that *does* carry action evidence (a fix commit touching it, or
-     a rebuttal) is still resolved. Every non-actioned thread is left for the
-     weekly sweep.
-   - `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots` is the tool
-     for **explicit deferral** — current-HEAD bot threads deliberately left
-     unfixed on this PR because they are tracked elsewhere (the standard
-     case: canonical-coverage findings on sync mirrors, deferred to a
-     follow-up issue via `--rationale`). It resolves **every** current-HEAD
-     bot thread, which is what clears the `required_conversation_resolution`
-     gate to merge, and tags each thread `deferred-to-followup` so the daily
-     rollup re-surfaces it. It is **not** the tool for fixed or rebutted
-     findings — that mis-records them as deferred (#571). As a guard, a
-     thread that is demonstrably actioned (per the same evidence gate
-     `--resolve-actioned` uses) is auto-upgraded to its truthful
-     `addressed-elsewhere`/`rebuttal-recorded` tag with an INFO line.
-   - `scripts/resolve-pr-threads.sh <PR#> --resolve-verified-propagation`
-     is the tool for **verified canonical propagation** — routing-class
-     threads (`canonical-coverage`, `templated-render`) whose durable fix
-     already landed in mergepath and demonstrably reached this consumer.
-     It resolves a thread only when the consumer file at the compared
-     ref — the PR's own head while the PR is open (so a pre-merge run
-     never resolves over drift the PR itself carries), the
-     default-branch HEAD once it is closed/merged — byte-matches the
-     mergepath canonical source (or, for templated entries, the rendered
-     template output for that consumer), the consumer tree entry's
-     mode/type matches the source (chmod flip / symlink swap rejection),
-     and the mergepath source has a fix commit strictly newer than the
-     finding (upstream-fix evidence; a pre-dating fix skips
-     conservatively — resolve manually with evidence), tagging
-     `verified-propagation` (#572, #616). Any lookup, fetch,
-     or render failure is a fail-closed skip, never a resolve. A thread
-     with action evidence is auto-upgraded to its truthful actioned class
-     first (#575); unverifiable threads are left for the weekly sweep.
+1. Query GitHub's review-thread state, not just flat PR comments. Use `scripts/resolve-pr-threads.sh <PR#> --list` or an equivalent GraphQL `reviewThreads` readback that reports each thread's `isResolved` value.
+2. Confirm there are **zero unresolved review conversations**. GitHub's branch-protection error "All comments must be resolved" is driven by this review-thread state; `gh pr checks`, issue comments, and pull request review comments alone are not sufficient readback.
+3. For bot-authored current-head threads only, if the finding has already been fixed or rebutted on-thread, resolve it. **Fixing review feedback includes resolving the associated review thread, not just pushing a code commit** — a fix that leaves its thread open still blocks the conversation-resolution gate and still surfaces in the weekly unresolved-feedback sweep. The two resolve paths are split by **disposition** — each records a different `[mergepath-resolve:<class>]` tag, and the daily rollup / weekly sweep read that tag as the disposition of record, so pick the mode that matches what actually happened to the feedback (#575):
+   - `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` is the tool for **fixed or rebutted** feedback — the default on a PR you pushed fixes to. It resolves **only** threads whose fix or rebuttal is demonstrable from the current PR state, tagging the truthful classes — `addressed-elsewhere` (an agent commit touching the anchored file, after the latest re-raise) or `rebuttal-recorded` (a substantive agent rebuttal after the latest re-raise). Routing-only classes (`canonical-coverage`, `templated-render`) are deliberately **not** treated as actioned here: they indicate where a durable fix belongs, not that one happened, so a fresh finding on a canonical path is left unresolved rather than auto-resolved by routing alone. The gate evaluates action **independently of routing**, so a canonical/templated thread that *does* carry action evidence (a fix commit touching it, or a rebuttal) is still resolved. Every non-actioned thread is left for the weekly sweep.
+   - `scripts/resolve-pr-threads.sh <PR#> --auto-resolve-bots` is the tool for **explicit deferral** — current-HEAD bot threads deliberately left unfixed on this PR because they are tracked elsewhere (the standard case: canonical-coverage findings on sync mirrors, deferred to a follow-up issue via `--rationale`). It resolves **every** current-HEAD bot thread, which is what clears the `required_conversation_resolution` gate to merge, and tags each thread `deferred-to-followup` so the daily rollup re-surfaces it. It is **not** the tool for fixed or rebutted findings — that mis-records them as deferred (#571). As a guard, a thread that is demonstrably actioned (per the same evidence gate `--resolve-actioned` uses) is auto-upgraded to its truthful `addressed-elsewhere`/`rebuttal-recorded` tag with an INFO line.
+   - `scripts/resolve-pr-threads.sh <PR#> --resolve-verified-propagation` is the tool for **verified canonical propagation** — routing-class threads (`canonical-coverage`, `templated-render`) whose durable fix already landed in mergepath and demonstrably reached this consumer. It resolves a thread only when the consumer file at the compared ref — the PR's own head while the PR is open (so a pre-merge run never resolves over drift the PR itself carries), the default-branch HEAD once it is closed/merged — byte-matches the mergepath canonical source (or, for templated entries, the rendered template output for that consumer), the consumer tree entry's mode/type matches the source (chmod flip / symlink swap rejection), and the mergepath source has a fix commit strictly newer than the finding (upstream-fix evidence; a pre-dating fix skips conservatively — resolve manually with evidence), tagging `verified-propagation` (#572, #616). Any lookup, fetch, or render failure is a fail-closed skip, never a resolve. A thread with action evidence is auto-upgraded to its truthful actioned class first (#575); unverifiable threads are left for the weekly sweep.
 
-   Each path runs an identity-checked `resolveReviewThread` followed by
-   a `reviewThreads`/`nodes(ids:)` readback confirming `isResolved: true`,
-   and exits non-zero (fail closed) if any resolve cannot be confirmed.
-   Then query `reviewThreads` again. For stale bot-authored threads whose
-   finding was fixed by a later commit, use the identity-checked
-   `resolveReviewThread` path directly. If the resolution is not
-   demonstrable from the current HEAD or on-thread rebuttal, request a
-   fresh bot review instead of resolving the thread.
-4. Registered agent-reviewer threads (`available_reviewers`, for example
-   `nathanpayne-claude`, `nathanpayne-cursor`, and `nathanpayne-codex`)
-   are agent-authored, not real-human-authored. Resolve them only with an
-   identity-checked `resolveReviewThread` path after the finding has been
-   fixed or rebutted and the reviewer identity has accepted the fix,
-   approved the current HEAD, or posted an on-thread acknowledgment.
-5. Never auto-resolve real human-authored threads. If a thread authored
-   by `nathanjohnpayne` or another non-agent human account remains
-   unresolved, stop before merge and wait for the human to resolve it or
-   give explicit direction.
+   Each path runs an identity-checked `resolveReviewThread` followed by a `reviewThreads`/`nodes(ids:)` readback confirming `isResolved: true`, and exits non-zero (fail closed) if any resolve cannot be confirmed. Then query `reviewThreads` again. For stale bot-authored threads whose finding was fixed by a later commit, use the identity-checked `resolveReviewThread` path directly. If the resolution is not demonstrable from the current HEAD or on-thread rebuttal, request a fresh bot review instead of resolving the thread.
+4. Registered agent-reviewer threads (`available_reviewers`, for example `nathanpayne-claude`, `nathanpayne-cursor`, and `nathanpayne-codex`) are agent-authored, not real-human-authored. Resolve them only with an identity-checked `resolveReviewThread` path after the finding has been fixed or rebutted and the reviewer identity has accepted the fix, approved the current HEAD, or posted an on-thread acknowledgment.
+5. Never auto-resolve real human-authored threads. If a thread authored by `nathanjohnpayne` or another non-agent human account remains unresolved, stop before merge and wait for the human to resolve it or give explicit direction.
 
-This gate is a branch-protection requirement, not a review-disposition
-choice. It applies to under-threshold PRs, Phase 4a, Phase 4b, and
-propagation-lane PRs.
+This gate is a branch-protection requirement, not a review-disposition choice. It applies to under-threshold PRs, Phase 4a, Phase 4b, and propagation-lane PRs.
 
 ### Phase 3: External Review Threshold Check
 
@@ -554,15 +354,7 @@ An agent proceeds to 4a first. If 4a escalates, times out, or is disabled, the a
 
 > **The `@codex review` trigger MUST be authored by `nathanjohnpayne`.** The Codex GitHub App only monitors trigger comments from the repo's author/human identity; a trigger posted by a reviewer/bot identity (`nathanpayne-claude`/`-codex`/`-cursor`) is silently ignored and the poll runs to timeout (observed empirically on #405: a reviewer-authored trigger drew no response in 600s, an author-authored one drew a review in ~20s). `codex-review-request.sh` posts the trigger through `gh-as-author.sh` for exactly this reason — do not bypass that wrapper with a reviewer-token write.
 
-After posting a trigger, `codex-review-request.sh` waits a short,
-bounded window for Codex's documented 👀 acknowledgment on that exact
-trigger comment. In GitHub's REST reactions payload the content value is
-`eyes`. If the acknowledgment is absent, the helper re-posts the exact
-`@codex review` trigger through the same author wrapper up to
-`codex.max_ack_retries`, then continues the normal review wait. The
-acknowledgment is not clearance: only a Codex review on HEAD with no
-unaddressed required-tier findings (P0/P1 by default), or a fresh 👍 /
-`+1` reaction on the PR issue, can satisfy the Phase 4a signal.
+After posting a trigger, `codex-review-request.sh` waits a short, bounded window for Codex's documented 👀 acknowledgment on that exact trigger comment. In GitHub's REST reactions payload the content value is `eyes`. If the acknowledgment is absent, the helper re-posts the exact `@codex review` trigger through the same author wrapper up to `codex.max_ack_retries`, then continues the normal review wait. The acknowledgment is not clearance: only a Codex review on HEAD with no unaddressed required-tier findings (P0/P1 by default), or a fresh 👍 / `+1` reaction on the PR issue, can satisfy the Phase 4a signal.
 
 12a. `codex-review-request.sh` polls the PR until one of the following:
 
@@ -620,51 +412,9 @@ unaddressed required-tier findings (P0/P1 by default), or a fresh 👍 /
 
 18a. After the merge gate and review-conversation gate are both clean, `nathanjohnpayne` merges the PR with `gh pr merge <n> --squash --delete-branch`. Never `--admin` unless the human explicitly authorizes a break-glass override in chat.
 
-The non-Dependabot `auto-merge-on-approval` workflow is opt-in only:
-it may call `gh pr merge` only when the repo has an
-`AUTHOR_MERGE_TOKEN` Actions secret and that token resolves to
-`author_identity` (normally `nathanjohnpayne`). If the secret is
-absent, the workflow stops after validation and leaves manual author
-merge as the default. Reviewer tokens such as
-`REVIEWER_ASSIGNMENT_TOKEN` must not be used for PR merges.
+The non-Dependabot `auto-merge-on-approval` workflow is opt-in only: it may call `gh pr merge` only when the repo has an `AUTHOR_MERGE_TOKEN` Actions secret and that token resolves to `author_identity` (normally `nathanjohnpayne`). If the secret is absent, the workflow stops after validation and leaves manual author merge as the default. Reviewer tokens such as `REVIEWER_ASSIGNMENT_TOKEN` must not be used for PR merges.
 
-Arming is not one-shot on the approval event. The job arms on three
-triggers: the original `pull_request_review` + `approved` event; a
-`pull_request` `synchronize` / `reopened` **re-arm** path (#495); and
-a `pull_request` `unlabeled` **settle re-arm** path (#620), which
-fires when a removed label is one of the four blocking names
-(`needs-external-review`, `needs-human-review`, `policy-violation`,
-`human-hold`) — the state-settled signal for the label race where a
-synchronize-time arming run hard-fails on a transient label that
-auto-clear removes moments later. Triage deliberately does not run on
-`unlabeled` (it would re-apply the label just removed), so the arming
-job accepts a skipped triage result on that path only; and because
-the `needs-external-review` removal IS the trigger there, the
-CodeRabbit rate-limit branch derives external-review applicability
-by asking `scripts/merge-clearance-gate.sh
---derive-external-requiredness` — the same intrinsic
-threshold/protected-paths computation the required check runs, with
-the label as a force-on signal and the propagation lane's
-verified-head marker as the exemption, evaluated on the live head —
-never from label events, which are not head-pinned proof of a
-downstream gate. Downgraded runs re-run that derivation just before
-merge and abort on head drift, so state that changes during the
-waits (a push, a lane verification landing) cannot ride an earlier
-disposition. Label
-removals fire this trigger only when performed with a PAT —
-GITHUB_TOKEN-driven events create no workflow runs (#315/#324) — so
-`auto-clear-blocking-labels.yml` and `pr-review-policy.yml`'s
-propagation lane both remove blocking labels under a PAT. The
-synchronize/reopened path retries `gh pr merge --auto` after a
-fix-commit — the common case where a late Codex finding lands at or
-after the author's approval and the fix push would otherwise never
-re-arm. Every re-arm path acts only when the PR already carries a
-valid non-author latest-state `APPROVED` review (the same
-latest-state-per-reviewer collapse the merge gate uses, so a
-withdrawn approval does not re-arm). A push with no existing approval
-does NOT arm. Every gate (CodeRabbit wait, `AUTHOR_MERGE_TOKEN`
-identity, blocking-label re-verify) re-applies on the new HEAD, and
-the call is idempotent when `--auto` is already enabled.
+Arming is not one-shot on the approval event. The job arms on three triggers: the original `pull_request_review` + `approved` event; a `pull_request` `synchronize` / `reopened` **re-arm** path (#495); and a `pull_request` `unlabeled` **settle re-arm** path (#620), which fires when a removed label is one of the four blocking names (`needs-external-review`, `needs-human-review`, `policy-violation`, `human-hold`) — the state-settled signal for the label race where a synchronize-time arming run hard-fails on a transient label that auto-clear removes moments later. Triage deliberately does not run on `unlabeled` (it would re-apply the label just removed), so the arming job accepts a skipped triage result on that path only; and because the `needs-external-review` removal IS the trigger there, the CodeRabbit rate-limit branch derives external-review applicability by asking `scripts/merge-clearance-gate.sh --derive-external-requiredness` — the same intrinsic threshold/protected-paths computation the required check runs, with the label as a force-on signal and the propagation lane's verified-head marker as the exemption, evaluated on the live head — never from label events, which are not head-pinned proof of a downstream gate. Downgraded runs re-run that derivation just before merge and abort on head drift, so state that changes during the waits (a push, a lane verification landing) cannot ride an earlier disposition. Label removals fire this trigger only when performed with a PAT — GITHUB_TOKEN-driven events create no workflow runs (#315/#324) — so `auto-clear-blocking-labels.yml` and `pr-review-policy.yml`'s propagation lane both remove blocking labels under a PAT. The synchronize/reopened path retries `gh pr merge --auto` after a fix-commit — the common case where a late Codex finding lands at or after the author's approval and the fix push would otherwise never re-arm. Every re-arm path acts only when the PR already carries a valid non-author latest-state `APPROVED` review (the same latest-state-per-reviewer collapse the merge gate uses, so a withdrawn approval does not re-arm). A push with no existing approval does NOT arm. Every gate (CodeRabbit wait, `AUTHOR_MERGE_TOKEN` identity, blocking-label re-verify) re-applies on the new HEAD, and the call is idempotent when `--auto` is already enabled.
 
 #### Phase 4b: Manual CLI Fallback (Human Handoff)
 
@@ -840,12 +590,7 @@ When you pull this template change into an existing repo, the new `phase_4b_defa
 
 ## Feedback Disposition Policy
 
-The `feedback_policy` block in `.github/review-policy.yml` controls **which
-bot-review findings the authoring agent must disposition before merge**. A
-*disposition* is one of: **fix** the code, **or** post a **rebuttal** reply
-explaining why the finding does not apply — and then **resolve the thread**.
-It governs disposition *requirements* only; it does not change who reviews or
-the external-review threshold.
+The `feedback_policy` block in `.github/review-policy.yml` controls **which bot-review findings the authoring agent must disposition before merge**. A *disposition* is one of: **fix** the code, **or** post a **rebuttal** reply explaining why the finding does not apply — and then **resolve the thread**. It governs disposition *requirements* only; it does not change who reviews or the external-review threshold.
 
 ### Normalized severity ladder
 
@@ -861,10 +606,7 @@ Both reviewers are mapped onto one ladder so a single policy covers them:
 
 The CodeRabbit column mirrors `classify_severity` (`scripts/lib/daily-feedback-rollup-helpers.sh`), the repo's canonical badge parser: CodeRabbit findings are keyed off the severity badge, top out at `p1` (Major / Potential issue / ⚠️), and never map to `p0` — `p0` is Codex-only. A Refactor suggestion or a stray "security" mention carries no severity badge, so it is unclassified (discretionary).
 
-Codex emits an explicit machine-readable badge per finding; CodeRabbit has no
-numeric scale, so its tier is derived heuristically (category + a
-`Critical`/`Major`/`Minor` qualifier) by `coderabbit_tier_of` in
-`scripts/lib/feedback-policy-helpers.sh`.
+Codex emits an explicit machine-readable badge per finding; CodeRabbit has no numeric scale, so its tier is derived heuristically (category + a `Critical`/`Major`/`Minor` qualifier) by `coderabbit_tier_of` in `scripts/lib/feedback-policy-helpers.sh`.
 
 ### Schema
 
@@ -879,64 +621,27 @@ feedback_policy:
     nitpick: discretionary
 ```
 
-- **`mode: by-priority`** (default) — each tier is independently `required`
-  (must fix-or-rebut + resolve; merge-blocking), `discretionary` (agent's
-  judgment; never blocks), or `ignore` (never surfaced).
-- **`mode: address-all`** — every finding at every tier is `required`; the
-  `priorities:` map is ignored. This is "address or rebut all feedback."
+- **`mode: by-priority`** (default) — each tier is independently `required` (must fix-or-rebut + resolve; merge-blocking), `discretionary` (agent's judgment; never blocks), or `ignore` (never surfaced).
+- **`mode: address-all`** — every finding at every tier is `required`; the `priorities:` map is ignored. This is "address or rebut all feedback."
 
 ### Defaults & backward compatibility
 
-An **absent** `feedback_policy` block reproduces today's behavior exactly:
-disposition defaults of **P0/P1 required, P2/P3 discretionary**, and the merge
-gates enforce **P1 only**. The default lives in the parser
-(`resolve_required_tiers`), not just in this file, because
-`.github/review-policy.yml` is not synced to consumers — the same
-default-on-absent posture as `phase_4b_default` and `propagation_prs`.
+An **absent** `feedback_policy` block reproduces today's behavior exactly: disposition defaults of **P0/P1 required, P2/P3 discretionary**, and the merge gates enforce **P1 only**. The default lives in the parser (`resolve_required_tiers`), not just in this file, because `.github/review-policy.yml` is not synced to consumers — the same default-on-absent posture as `phase_4b_default` and `propagation_prs`.
 
 ### Enforcement (two symmetric gates)
 
-The blocking tier set resolved from this block is enforced by two
-required-check gates that share `scripts/lib/feedback-policy-helpers.sh`, so
-the two reviewers' blocking sets cannot drift apart:
+The blocking tier set resolved from this block is enforced by two required-check gates that share `scripts/lib/feedback-policy-helpers.sh`, so the two reviewers' blocking sets cannot drift apart:
 
-- **Codex** — `scripts/codex-p1-gate.sh` (required check `Codex P1 Gate /
-  Codex P1 unresolved threads`), gated by `codex.p1_gate.enabled`. It
-  classifies each Codex inline finding with `codex_tier_of` and blocks merge
-  on any unresolved thread whose tier is in the resolved `required` set. The
-  required-check **name is unchanged** (branch protection depends on it) even
-  though the gate now spans the full tier set rather than only P1.
-- **CodeRabbit** — `scripts/coderabbit-severity-gate.sh` (required check
-  `CodeRabbit Severity Gate / CodeRabbit unresolved blocking findings`), gated
-  by `coderabbit.severity_gate.enabled`. It classifies each CodeRabbit inline
-  finding with `coderabbit_tier_of` and blocks on the same `required`-tier
-  set. Default `false` everywhere (today CodeRabbit has no gate) — a clean
-  no-op when off, so it is safe to add to required checks ahead of enabling.
+- **Codex** — `scripts/codex-p1-gate.sh` (required check `Codex P1 Gate / Codex P1 unresolved threads`), gated by `codex.p1_gate.enabled`. It classifies each Codex inline finding with `codex_tier_of` and blocks merge on any unresolved thread whose tier is in the resolved `required` set. The required-check **name is unchanged** (branch protection depends on it) even though the gate now spans the full tier set rather than only P1.
+- **CodeRabbit** — `scripts/coderabbit-severity-gate.sh` (required check `CodeRabbit Severity Gate / CodeRabbit unresolved blocking findings`), gated by `coderabbit.severity_gate.enabled`. It classifies each CodeRabbit inline finding with `coderabbit_tier_of` and blocks on the same `required`-tier set. Default `false` everywhere (today CodeRabbit has no gate) — a clean no-op when off, so it is safe to add to required checks ahead of enabling.
 
-Both gates clear a finding the same way: **resolve the thread** (the GitHub
-UI "Resolve conversation" button or the `resolveReviewThread` mutation) once
-it is fixed or rebutted. An absent `feedback_policy` block resolves to `{p1}`,
-so the Codex gate stays byte-identical to its pre-#574 P1-only behavior.
+Both gates clear a finding the same way: **resolve the thread** (the GitHub UI "Resolve conversation" button or the `resolveReviewThread` mutation) once it is fixed or rebutted. An absent `feedback_policy` block resolves to `{p1}`, so the Codex gate stays byte-identical to its pre-#574 P1-only behavior.
 
-The same tier resolution also drives the **agent-facing surfacing** (advisory,
-never merge-blocking): `scripts/codex-review-request.sh` tags each emitted
-finding with `blocking: true|false`, and `scripts/coderabbit-wait.sh` reports
-a `blocking_tier_unresolved` count in its JSON when the block is present.
+The same tier resolution also drives the **agent-facing surfacing** (advisory, never merge-blocking): `scripts/codex-review-request.sh` tags each emitted finding with `blocking: true|false`, and `scripts/coderabbit-wait.sh` reports a `blocking_tier_unresolved` count in its JSON when the block is present.
 
-> **Rollout note (#574).** Sub-issue #576 shipped the schema above and the
-> shared parser/classifier library. Sub-issue #577 makes the gates **act**:
-> `codex-p1-gate.sh` is generalized beyond P1 and `coderabbit-severity-gate.sh`
-> is added, both honoring the resolved `required` tiers, plus the agent-facing
-> `blocking` surfacing above. `feedback_policy` is therefore now enforced, not
-> just documentary (an absent block still reproduces the prior Codex-P1-only
-> behavior exactly).
+> **Rollout note (#574).** Sub-issue #576 shipped the schema above and the shared parser/classifier library. Sub-issue #577 makes the gates **act**: `codex-p1-gate.sh` is generalized beyond P1 and `coderabbit-severity-gate.sh` is added, both honoring the resolved `required` tiers, plus the agent-facing `blocking` surfacing above. `feedback_policy` is therefore now enforced, not just documentary (an absent block still reproduces the prior Codex-P1-only behavior exactly).
 
-> **CodeRabbit profile dependency.** `nitpick: required` only has teeth when
-> `.coderabbit.yml` uses `reviews.profile: assertive`; the shipped `chill`
-> profile suppresses the 🧹 Nitpick category entirely, so the requirement is a
-> no-op there. `coderabbit-severity-gate.sh` emits a non-fatal warning when it
-> sees `nitpick: required` under a chill profile. See
-> [`docs/agents/coderabbit-audit.md`](docs/agents/coderabbit-audit.md).
+> **CodeRabbit profile dependency.** `nitpick: required` only has teeth when `.coderabbit.yml` uses `reviews.profile: assertive`; the shipped `chill` profile suppresses the 🧹 Nitpick category entirely, so the requirement is a no-op there. `coderabbit-severity-gate.sh` emits a non-fatal warning when it sees `nitpick: required` under a chill profile. See [`docs/agents/coderabbit-audit.md`](docs/agents/coderabbit-audit.md).
 
 ## Handoff Message Format
 
@@ -1078,12 +783,7 @@ Agents must never modify the `needs-external-review`, `needs-human-review`, or `
 
 These exceptions apply ONLY to those two workflows. An interactive agent session (claude / cursor / codex) calling `gh pr edit --remove-label` for any of the four protected labels remains forbidden — the `scripts/hooks/label-removal-guard.sh` PreToolUse hook enforces this independently. The hook intentionally only fires for `Bash` tool calls from agent sessions; a workflow's `gh` call inside a GitHub Actions runner does not pass through that surface, so the hook does not (and should not) block CI workflows. `needs-human-review`, `policy-violation`, and `human-hold` remain manual-only by design.
 
-**Automated merge identity.** Non-Dependabot automatic PR merge is not a
-sanctioned reviewer-identity exception. If enabled, it must use an
-author-owned `AUTHOR_MERGE_TOKEN` Actions secret and verify the token
-resolves to `author_identity` immediately before the merge path. Repos
-without that secret keep the normal manual merge flow under
-`scripts/gh-as-author.sh`.
+**Automated merge identity.** Non-Dependabot automatic PR merge is not a sanctioned reviewer-identity exception. If enabled, it must use an author-owned `AUTHOR_MERGE_TOKEN` Actions secret and verify the token resolves to `author_identity` immediately before the merge path. Repos without that secret keep the normal manual merge flow under `scripts/gh-as-author.sh`.
 
 **Disabling the scheduled sweep.** The 5-minute cron is opt-out via `auto_clear_labels.scheduled_sweep_enabled: false` in `.github/review-policy.yml`. Default is `true`. Set to `false` if your repo has high PR volume and the event-driven path is reliably fast enough that the cron becomes pure noise — but expect occasional stuck `needs-external-review` labels on the 👍-after-last-push case (which the sweep would otherwise catch). The event-driven path remains active regardless of this setting.
 
@@ -1110,9 +810,7 @@ The audit reads `GET /repos/{owner}/{repo}/branches/{branch}/protection` and fal
 The GitHub GraphQL `resolveReviewThread` mutation may be used by agents **only** when both:
 
 - The agent has demonstrably addressed the inline finding (a fix is on the current HEAD, or a rebuttal is posted on the thread), AND
-- The bot author has not auto-resolved within a reasonable window, OR the
-  registered agent-reviewer author has accepted the fix, approved the
-  current HEAD, or posted an on-thread acknowledgment.
+- The bot author has not auto-resolved within a reasonable window, OR the registered agent-reviewer author has accepted the fix, approved the current HEAD, or posted an on-thread acknowledgment.
 
 It is the clean-up mechanism used by the [Pre-Merge Review Conversation Gate](#pre-merge-review-conversation-gate) for the `required_conversation_resolution: true` branch-protection gate, NOT a policy override. It does not authorize removing blocking labels, bypassing required reviews, or merging past unaddressed findings. **If the thread author is a real human (not a bot and not a registered agent-reviewer identity), agents must not call this mutation regardless of state.**
 
@@ -1271,16 +969,10 @@ git remote set-url origin git@github.com:nathanjohnpayne/repo-name.git
 
 ### GitHub API authentication (gh CLI)
 
-The canonical convention is documented in
-[Reviewer PAT Quick Start](#reviewer-pat-quick-start). Short form:
+The canonical convention is documented in [Reviewer PAT Quick Start](#reviewer-pat-quick-start). Short form:
 
-- **Read paths** (`gh api user`, GETs, `gh pr view`, `gh pr checks`)
-  use an explicit `GH_TOKEN` for the command.
-- **Core guarded writes** (`gh pr create`, `gh pr merge`,
-  `gh pr edit`, `gh pr comment`, `gh pr review`, `gh issue comment`)
-  use the author/reviewer wrappers. The wrappers select and verify the
-  effective token immediately before the write and do not mutate the gh
-  keyring.
+- **Read paths** (`gh api user`, GETs, `gh pr view`, `gh pr checks`) use an explicit `GH_TOKEN` for the command.
+- **Core guarded writes** (`gh pr create`, `gh pr merge`, `gh pr edit`, `gh pr comment`, `gh pr review`, `gh issue comment`) use the author/reviewer wrappers. The wrappers select and verify the effective token immediately before the write and do not mutate the gh keyring.
 
 ```bash
 # ── Read-path: explicit GH_TOKEN ──
@@ -1311,17 +1003,9 @@ scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
 ```
 
 - Use the item ID from the [PAT lookup table](#pat-lookup-table) for your agent identity. Do not use the 1Password item title.
-- Verify token identity with `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login`
-  or by letting the wrapper call `identity-check.sh
-  --expect-token-identity` before the write. Do not use `gh auth
-  status` as an attribution proof.
-- If `op whoami` says you are not signed in, still run the `op read ...`
-  command in an interactive TTY. That is what triggers the 1Password biometric
-  prompt on local machines.
-- If GitHub returns `Review Can not approve your own pull request`, you
-  either the PR author is wrong, the reviewer token resolved to the
-  author identity, or the [No-self-approve scoping](#no-self-approve-scoping)
-  rule applies. Confirm the PR author and token identity before retrying.
+- Verify token identity with `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login` or by letting the wrapper call `identity-check.sh --expect-token-identity` before the write. Do not use `gh auth status` as an attribution proof.
+- If `op whoami` says you are not signed in, still run the `op read ...` command in an interactive TTY. That is what triggers the 1Password biometric prompt on local machines.
+- If GitHub returns `Review Can not approve your own pull request`, you either the PR author is wrong, the reviewer token resolved to the author identity, or the [No-self-approve scoping](#no-self-approve-scoping) rule applies. Confirm the PR author and token identity before retrying.
 
 > **If `op read` fails with a sign-in or biometric error here**, follow the pause-and-prompt procedure in `docs/agents/operating-rules.md` under "1Password CLI authentication failures." Do not hardcode tokens, skip review, or retry in a loop.
 
@@ -1388,14 +1072,7 @@ done
 
 ## Recovery: PR created under the wrong identity
 
-If `gh pr create` lands a PR under the wrong account, the PR is
-unrecoverable in place: any review attempt under the same account that
-authored the PR returns `Can not approve your own pull request`, and the
-`Authoring-Agent:` fingerprint in the body now disagrees with
-`author.login`, breaking downstream audit. See #241 for the historical
-keyring-switch bug and `nathanjohnpayne/friends-and-family-billing#262`
-for the canonical incident. Under the current wrapper contract, the
-equivalent failure is a wrong effective token.
+If `gh pr create` lands a PR under the wrong account, the PR is unrecoverable in place: any review attempt under the same account that authored the PR returns `Can not approve your own pull request`, and the `Authoring-Agent:` fingerprint in the body now disagrees with `author.login`, breaking downstream audit. See #241 for the historical keyring-switch bug and `nathanjohnpayne/friends-and-family-billing#262` for the canonical incident. Under the current wrapper contract, the equivalent failure is a wrong effective token.
 
 ### Prevention (the primary path)
 
@@ -1405,36 +1082,21 @@ Always wrap author-identity writes in `scripts/gh-as-author.sh`:
 scripts/gh-as-author.sh -- gh pr create --title "..." --body "..."
 ```
 
-The wrapper resolves a token for `nathanjohnpayne`, verifies that token
-with `scripts/identity-check.sh --expect-token-identity`, runs the
-wrapped command with process-local `GH_TOKEN`, and never changes the gh
-keyring. For `gh pr create` specifically, it also runs a post-create
-`gh pr view --json author` verification using the same token and exits
-non-zero (code 5) if `author.login` does not match the expected identity.
-The `gh-pr-guard.sh` PreToolUse hook independently blocks bare
-`gh pr create` and inline-token substitutes before they can run.
+The wrapper resolves a token for `nathanjohnpayne`, verifies that token with `scripts/identity-check.sh --expect-token-identity`, runs the wrapped command with process-local `GH_TOKEN`, and never changes the gh keyring. For `gh pr create` specifically, it also runs a post-create `gh pr view --json author` verification using the same token and exits non-zero (code 5) if `author.login` does not match the expected identity. The `gh-pr-guard.sh` PreToolUse hook independently blocks bare `gh pr create` and inline-token substitutes before they can run.
 
 ### Detection
 
-If you suspect the wrong-identity failure (e.g., the PR was just created
-and review attempts return `Can not approve your own pull request`), confirm
-with:
+If you suspect the wrong-identity failure (e.g., the PR was just created and review attempts return `Can not approve your own pull request`), confirm with:
 
 ```bash
 gh pr view <PR#> --repo <owner>/<repo> --json author --jq .author.login
 ```
 
-Expected: `nathanjohnpayne`. If the output is your agent identity (e.g.
-`nathanpayne-claude`) or another reviewer identity, close and recreate
-the PR from the same branch.
+Expected: `nathanjohnpayne`. If the output is your agent identity (e.g. `nathanpayne-claude`) or another reviewer identity, close and recreate the PR from the same branch.
 
 ### Recovery procedure
 
-Close the wrong PR and recreate from the same branch. The commits and the
-branch survive the close — what's lost is the PR's review thread history,
-prior CI results, and any `chatgpt-codex-connector[bot]` / CodeRabbit
-comments. There is no in-place fix: GitHub does not expose an API to change
-`author.login` on an existing PR.
+Close the wrong PR and recreate from the same branch. The commits and the branch survive the close — what's lost is the PR's review thread history, prior CI results, and any `chatgpt-codex-connector[bot]` / CodeRabbit comments. There is no in-place fix: GitHub does not expose an API to change `author.login` on an existing PR.
 
 ```bash
 # 1. Close the wrong-author PR with a comment explaining the recreate.
@@ -1455,9 +1117,7 @@ gh pr view <NEW_PR#> --repo <owner>/<repo> --json author --jq .author.login
 # expected: nathanjohnpayne
 ```
 
-The fresh shell in step 2 is belt-and-suspenders: any `GH_TOKEN` /
-`GH_HOST` / `GITHUB_TOKEN` env vars exported earlier in the session are
-gone, and the wrapper selects the author token again before the create.
+The fresh shell in step 2 is belt-and-suspenders: any `GH_TOKEN` / `GH_HOST` / `GITHUB_TOKEN` env vars exported earlier in the session are gone, and the wrapper selects the author token again before the create.
 
 ### What's lost vs. what survives
 
@@ -1472,9 +1132,7 @@ gone, and the wrapper selects the author token again before the create.
 | PR number | new one assigned |
 | Authoring-Agent fingerprint | regenerated (now matches `author.login`) |
 
-Filing a post-merge issue noting the recreated-PR situation is optional but
-helpful for audit trails — link both the closed PR and the new one so a
-later reader can follow the thread.
+Filing a post-merge issue noting the recreated-PR situation is optional but helpful for audit trails — link both the closed PR and the new one so a later reader can follow the thread.
 
 ## Adding a New Agent
 

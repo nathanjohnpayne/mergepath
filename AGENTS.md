@@ -13,19 +13,9 @@ Agent instructions are organized into focused sub-files under `docs/agents/`. Re
 
 ## Repository Layout
 
-Most top-level directories are described by the `docs/agents/` files above or
-are self-evident. One carries its justification out-of-line, per the
-[Code Modification Rules](docs/agents/code-modification-rules.md) requirement
-that new top-level directories document their justification here or in a
-`plans/` entry:
+Most top-level directories are described by the `docs/agents/` files above or are self-evident. One carries its justification out-of-line, per the [Code Modification Rules](docs/agents/code-modification-rules.md) requirement that new top-level directories document their justification here or in a `plans/` entry:
 
-- **`packaging/`** --- placeholder package scaffolds that reserve the
-  `mergepath` name on the npm and PyPI registries (name-squatting
-  prevention). Rationale and publish steps live in
-  [`packaging/README.md`](packaging/README.md); see issues
-  [#92](https://github.com/nathanjohnpayne/mergepath/issues/92) (npm) and
-  [#93](https://github.com/nathanjohnpayne/mergepath/issues/93) (PyPI). The
-  directory is whitelisted in `.repo-template.yml`.
+- **`packaging/`** --- placeholder package scaffolds that reserve the `mergepath` name on the npm and PyPI registries (name-squatting prevention). Rationale and publish steps live in [`packaging/README.md`](packaging/README.md); see issues [#92](https://github.com/nathanjohnpayne/mergepath/issues/92) (npm) and [#93](https://github.com/nathanjohnpayne/mergepath/issues/93) (PyPI). The directory is whitelisted in `.repo-template.yml`.
 
 ## Code Review Policy
 
@@ -41,25 +31,9 @@ This repository uses a multi-identity AI agent code review system. The full poli
 
 ### Workflow Summary
 
-**Default disposition — favor automation.** Drive every PR all the way through
-(author → review → merge) without pausing to ask the human for merge
-permission. For under-threshold PRs, that means reviewer-identity approval →
-merge; for above-threshold or protected-path PRs, that means Phase 4 external
-clearance → merge. It defers to a human for only two reasons: (a) the human
-says otherwise — an explicit instruction or a `human-hold` /
-`needs-human-review` / `policy-violation` label — or (b) a human handoff or
-escalation is required — a Phase 4b handoff or a Phase 4a disagreement /
-runaway escalation. (A stuck required gate — a red check, or a CodeRabbit
-rate-limit stall, `scripts/coderabbit-wait.sh` exit `5` *without* the #489
-Codex failover (`codex_failover_requested: false`) — blocks merge until
-resolved; that is a blocked gate, not a disposition prompt.) Do not present a
-"how far should I take this PR?" prompt on the happy path. See REVIEW_POLICY.md
-§ Default disposition.
+**Default disposition — favor automation.** Drive every PR all the way through (author → review → merge) without pausing to ask the human for merge permission. For under-threshold PRs, that means reviewer-identity approval → merge; for above-threshold or protected-path PRs, that means Phase 4 external clearance → merge. It defers to a human for only two reasons: (a) the human says otherwise — an explicit instruction or a `human-hold` / `needs-human-review` / `policy-violation` label — or (b) a human handoff or escalation is required — a Phase 4b handoff or a Phase 4a disagreement / runaway escalation. (A stuck required gate — a red check, or a CodeRabbit rate-limit stall, `scripts/coderabbit-wait.sh` exit `5` *without* the #489 Codex failover (`codex_failover_requested: false`) — blocks merge until resolved; that is a blocked gate, not a disposition prompt.) Do not present a "how far should I take this PR?" prompt on the happy path. See REVIEW_POLICY.md § Default disposition.
 
-0. Run credential preflight at the start of every PR session. The
-   canonical session-loop snippet (read-path GH_TOKEN, token-verified
-   write wrappers — full details in REVIEW_POLICY.md
-   § Phase 0 and § PAT lookup table):
+0. Run credential preflight at the start of every PR session. The canonical session-loop snippet (read-path GH_TOKEN, token-verified write wrappers — full details in REVIEW_POLICY.md § Phase 0 and § PAT lookup table):
 
    ```bash
    # Session start (one biometric burst). Default --mode is `review`.
@@ -79,102 +53,24 @@ resolved; that is a blocked gate, not a disposition prompt.) Do not present a
    scripts/gh-as-author.sh -- gh pr create ...
    ```
 
-   `--check` (alias `--status`) is the lightweight re-validator: never
-   invokes `op`, never warms SSH, exits non-zero on missing/stale
-   cache. Set `OP_PREFLIGHT_QUIET=1` to collapse the cache-hit stderr
-   block. It does not read or repair gh account selection. The helper
-   scripts (`coderabbit-wait.sh`, `codex-review-request.sh`,
-   `codex-review-check.sh`, `resolve-pr-threads.sh`,
-   `request-label-removal.sh`) auto-source
-   the cache when `GH_TOKEN` is unset (#282), so the explicit
-   `GH_TOKEN=...` prefix is optional once preflight has run.
+   `--check` (alias `--status`) is the lightweight re-validator: never invokes `op`, never warms SSH, exits non-zero on missing/stale cache. Set `OP_PREFLIGHT_QUIET=1` to collapse the cache-hit stderr block. It does not read or repair gh account selection. The helper scripts (`coderabbit-wait.sh`, `codex-review-request.sh`, `codex-review-check.sh`, `resolve-pr-threads.sh`, `request-label-removal.sh`) auto-source the cache when `GH_TOKEN` is unset (#282), so the explicit `GH_TOKEN=...` prefix is optional once preflight has run.
 
-   Do not use bare guarded writes. The `gh-pr-guard.sh` PreToolUse hook
-   blocks direct or inline-token `gh pr create|merge|review|comment|edit`
-   and `gh issue comment` because the hook cannot verify shell-expanded
-   `GH_TOKEN=...` before execution. Use `scripts/gh-as-author.sh` for
-   author writes (`gh pr create`, `gh pr merge`, `gh pr edit`, and the
-   author-attributed `@codex review` trigger), and
-   `scripts/gh-as-reviewer.sh` for reviewer writes (`gh pr review`,
-   `gh pr comment`, `gh issue comment`). The wrappers verify the
-   effective token with `identity-check.sh --expect-token-identity` and
-   never mutate machine-global gh account selection.
+   Do not use bare guarded writes. The `gh-pr-guard.sh` PreToolUse hook blocks direct or inline-token `gh pr create|merge|review|comment|edit` and `gh issue comment` because the hook cannot verify shell-expanded `GH_TOKEN=...` before execution. Use `scripts/gh-as-author.sh` for author writes (`gh pr create`, `gh pr merge`, `gh pr edit`, and the author-attributed `@codex review` trigger), and `scripts/gh-as-reviewer.sh` for reviewer writes (`gh pr review`, `gh pr comment`, `gh issue comment`). The wrappers verify the effective token with `identity-check.sh --expect-token-identity` and never mutate machine-global gh account selection.
 
-   Run `scripts/op-preflight.sh --agent {your-agent} --purge` (or
-   `--purge-all`) at end of session to delete the cached PATs.
+   Run `scripts/op-preflight.sh --agent {your-agent} --purge` (or `--purge-all`) at end of session to delete the cached PATs.
 1. Author code as nathanjohnpayne. File a PR.
 2. Review the PR under your reviewer identity using `GH_AS_REVIEWER_IDENTITY=nathanpayne-{your-agent} scripts/gh-as-reviewer.sh -- gh pr review ...`. Post comments.
 3. Address each comment via fix commits (commits use git config, no gh auth involved — byline stays nathanjohnpayne). Addressing feedback **includes resolving the associated review thread** once the fix or rebuttal is on the PR — a code commit alone does not close the conversation, and an unresolved-but-fixed thread both blocks the conversation-resolution gate and resurfaces in the weekly sweep. Resolve demonstrably-actioned **bot-authored** threads with `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` (see step 6 and REVIEW_POLICY.md § Pre-Merge Review Conversation Gate); that helper handles bot logins only. Resolve registered agent-reviewer threads (`nathanpayne-*`) via the direct identity-checked `resolveReviewThread` path after the reviewer identity has accepted the fix, and never resolve real human-authored threads.
 4. Repeat steps 2–3 until the reviewer identity approves with no outstanding issues. The mechanism: for under-threshold PRs, `gh pr review --approve` from your reviewer identity is the intended path — it satisfies branch protection without bouncing a small PR to an external agent. For above-threshold or protected-path PRs, post `gh pr review --comment` only; Phase 4 carries the cross-agent gate. See REVIEW_POLICY.md § No-self-approve scoping.
-5. If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`:
-   a. **Wait** for CodeRabbit to post its review on the current HEAD. Prefer `scripts/coderabbit-wait.sh <PR#>` over an ad-hoc poll — it anchors "cleared" on the HEAD committer date (closing the race that let auto-merge fire pre-CodeRabbit; see #136), handles CodeRabbit's non-auto-retrying rate-limit state by parsing the published window and posting `@coderabbitai, try again.` itself (see #138), and recovers from CodeRabbit's auto-pause state by posting `@coderabbitai resume` (see #490). Exit codes: `0` cleared, `2` findings, `4` grace-window timeout (advisory — log the `status_probe` reply if present, then skip), `5` rate-limit stalled — alert the human, do not proceed, *unless* `codex_failover_requested: true` in the JSON (the #489 Codex failover requested `@codex review`, so the PR proceeds via Phase 4a and `5` is a non-blocking note), `6` auto-review skipped and not re-invocable (the JSON `skip_reason` names the cause — `paused` / `non-base-branch` / `draft`; resolve it rather than treating it as a clean clearance).
-   b. **Read both endpoints:** PR-level comments (`gh api repos/{owner}/{repo}/issues/{pr}/comments`) and inline diff comments (`gh api repos/{owner}/{repo}/pulls/{pr}/comments`).
-   c. **Grep inline comments** for `Potential issue` or `⚠️` — these must each be explicitly addressed (fixed or dismissed with reasoning).
-   d. Address other substantive findings. CodeRabbit review is advisory and does not block merge.
-   e. Advisory handling does not override GitHub's branch-protection
-      conversation-resolution gate. Any unresolved CodeRabbit review
-      conversation still blocks merge until it is fixed or rebutted and
-      resolved through the pre-merge review conversation gate.
-   f. **Record each finding's disposition (#584)** via
-      `scripts/coderabbit-record-feedback.sh <PR#> [--scan | --findings-json
-      <FILE|->] --verdict <comment_id>=<verdict>[:<reason>]` — fixed →
-      `<id>=fixed`, false-positive/rebutted → `<id>=false-positive[:<reason>]`,
-      each written to a durable JSONL ledger
-      (`.mergepath/coderabbit-feedback-ledger.jsonl`) so CodeRabbit review
-      precision is trackable, symmetric with the Codex ledger (#487). Unlike
-      `scripts/codex-record-feedback.sh`, this is **disposition-logging only**:
-      CodeRabbit solicits no per-finding reaction, so the helper NEVER posts to
-      GitHub (every call is a read — REST GETs plus the read-only `reviewThreads`
-      query). It is HEAD-pinned (`--scan` scopes to current-HEAD bot findings,
-      the severity-gate scope), tier-classified via the shared
-      `coderabbit_tier_of`, and idempotent/append-only. This tracks the fix/
-      rebuttal decisions from step 5.d; it is not a merge gate.
-6. Before any merge attempt, query GitHub review-thread state, not just flat
-   PR comments: run `scripts/resolve-pr-threads.sh <PR#> --list` or an
-   equivalent GraphQL `reviewThreads` readback. Confirm there are zero
-   unresolved review conversations. For bot-authored threads, pick the
-   resolve mode by **disposition** — each mode records a different
-   `[mergepath-resolve:<class>]` tag, and the daily rollup / weekly sweep
-   read that tag as the disposition of record (#575):
-   `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` is the tool for
-   **fixed or rebutted** feedback — the default on a PR you pushed fixes
-   to. It resolves only threads whose fix/rebuttal is demonstrable, tags
-   the truthful `addressed-elsewhere`/`rebuttal-recorded` classes, and
-   leaves the rest for the weekly sweep. `--auto-resolve-bots` is the tool
-   for **explicit deferral** — current-HEAD bot threads you are
-   deliberately not fixing here (the standard case: canonical-coverage
-   findings on sync mirrors tracked in a follow-up issue, recorded via
-   `--rationale`); it clears the conversation-resolution gate and tags
-   `deferred-to-followup`, auto-upgrading any demonstrably-actioned thread
-   to its truthful class. Do not use it on findings you fixed or rebutted —
-   that mis-records them as deferred (the #571 failure).
-   `--resolve-verified-propagation` is the tool for **verified canonical
-   propagation** — routing-class threads (canonical-coverage /
-   templated-render) resolved only when the consumer file at the compared
-   ref (the PR head while the PR is open; the default-branch HEAD once
-   closed/merged) byte-matches the mergepath canonical source (or
-   rendered template output) with a matching tree-entry mode/type, and
-   the mergepath source carries a fix commit newer than the finding
-   (#616), tagging `verified-propagation`; any lookup,
-   fetch, or render failure is a fail-closed skip (#572). All modes run an
-   identity-checked `resolveReviewThread` plus a readback confirming
-   `isResolved: true` and fail closed otherwise. For stale bot-authored
-   threads fixed by a later commit, use the identity-checked
-   `resolveReviewThread` path directly, then list again. Registered
-   agent-reviewer threads (`nathanpayne-*` in `available_reviewers`) are
-   agent-authored, not real-human threads; resolve them only after the fix
-   is accepted or approved by that reviewer identity. Never auto-resolve
-   real human-authored threads.
+5. If this repo has `coderabbit.enabled: true` in `.github/review-policy.yml`: a. **Wait** for CodeRabbit to post its review on the current HEAD. Prefer `scripts/coderabbit-wait.sh <PR#>` over an ad-hoc poll — it anchors "cleared" on the HEAD committer date (closing the race that let auto-merge fire pre-CodeRabbit; see #136), handles CodeRabbit's non-auto-retrying rate-limit state by parsing the published window and posting `@coderabbitai, try again.` itself (see #138), and recovers from CodeRabbit's auto-pause state by posting `@coderabbitai resume` (see #490). Exit codes: `0` cleared, `2` findings, `4` grace-window timeout (advisory — log the `status_probe` reply if present, then skip), `5` rate-limit stalled — alert the human, do not proceed, *unless* `codex_failover_requested: true` in the JSON (the #489 Codex failover requested `@codex review`, so the PR proceeds via Phase 4a and `5` is a non-blocking note), `6` auto-review skipped and not re-invocable (the JSON `skip_reason` names the cause — `paused` / `non-base-branch` / `draft`; resolve it rather than treating it as a clean clearance). b. **Read both endpoints:** PR-level comments (`gh api repos/{owner}/{repo}/issues/{pr}/comments`) and inline diff comments (`gh api repos/{owner}/{repo}/pulls/{pr}/comments`). c. **Grep inline comments** for `Potential issue` or `⚠️` — these must each be explicitly addressed (fixed or dismissed with reasoning). d. Address other substantive findings. CodeRabbit review is advisory and does not block merge. e. Advisory handling does not override GitHub's branch-protection    conversation-resolution gate. Any unresolved CodeRabbit review    conversation still blocks merge until it is fixed or rebutted and    resolved through the pre-merge review conversation gate. f. **Record each finding's disposition (#584)** via    `scripts/coderabbit-record-feedback.sh <PR#> [--scan | --findings-json    <FILE|->] --verdict <comment_id>=<verdict>[:<reason>]` — fixed →    `<id>=fixed`, false-positive/rebutted → `<id>=false-positive[:<reason>]`,    each written to a durable JSONL ledger    (`.mergepath/coderabbit-feedback-ledger.jsonl`) so CodeRabbit review    precision is trackable, symmetric with the Codex ledger (#487). Unlike    `scripts/codex-record-feedback.sh`, this is **disposition-logging only**:    CodeRabbit solicits no per-finding reaction, so the helper NEVER posts to    GitHub (every call is a read — REST GETs plus the read-only `reviewThreads`    query). It is HEAD-pinned (`--scan` scopes to current-HEAD bot findings,    the severity-gate scope), tier-classified via the shared    `coderabbit_tier_of`, and idempotent/append-only. This tracks the fix/    rebuttal decisions from step 5.d; it is not a merge gate.
+6. Before any merge attempt, query GitHub review-thread state, not just flat PR comments: run `scripts/resolve-pr-threads.sh <PR#> --list` or an equivalent GraphQL `reviewThreads` readback. Confirm there are zero unresolved review conversations. For bot-authored threads, pick the resolve mode by **disposition** — each mode records a different `[mergepath-resolve:<class>]` tag, and the daily rollup / weekly sweep read that tag as the disposition of record (#575): `scripts/resolve-pr-threads.sh <PR#> --resolve-actioned` is the tool for **fixed or rebutted** feedback — the default on a PR you pushed fixes to. It resolves only threads whose fix/rebuttal is demonstrable, tags the truthful `addressed-elsewhere`/`rebuttal-recorded` classes, and leaves the rest for the weekly sweep. `--auto-resolve-bots` is the tool for **explicit deferral** — current-HEAD bot threads you are deliberately not fixing here (the standard case: canonical-coverage findings on sync mirrors tracked in a follow-up issue, recorded via `--rationale`); it clears the conversation-resolution gate and tags `deferred-to-followup`, auto-upgrading any demonstrably-actioned thread to its truthful class. Do not use it on findings you fixed or rebutted — that mis-records them as deferred (the #571 failure). `--resolve-verified-propagation` is the tool for **verified canonical propagation** — routing-class threads (canonical-coverage / templated-render) resolved only when the consumer file at the compared ref (the PR head while the PR is open; the default-branch HEAD once closed/merged) byte-matches the mergepath canonical source (or rendered template output) with a matching tree-entry mode/type, and the mergepath source carries a fix commit newer than the finding (#616), tagging `verified-propagation`; any lookup, fetch, or render failure is a fail-closed skip (#572). All modes run an identity-checked `resolveReviewThread` plus a readback confirming `isResolved: true` and fail closed otherwise. For stale bot-authored threads fixed by a later commit, use the identity-checked `resolveReviewThread` path directly, then list again. Registered agent-reviewer threads (`nathanpayne-*` in `available_reviewers`) are agent-authored, not real-human threads; resolve them only after the fix is accepted or approved by that reviewer identity. Never auto-resolve real human-authored threads.
 7. Check .github/review-policy.yml for the external review threshold. If the PR does NOT meet it (lines changed < external_review_threshold AND no file matches external_review_paths): if `codex.request_by_default` is true (the default) and `codex.enabled` is not false, the agent first posts `@codex review` by running `scripts/codex-review-request.sh <PR#>` (no `MERGEPATH_PHASE_4A_GATED`), because `request_by_default` makes the AGENT the caller that requests Codex on every PR — there is no separate workflow auto-caller. The under-threshold trigger is advisory: it does NOT gate the merge (the threshold governs the merge gate, not `request_by_default`), so an exit `4` timeout or `5` skip does not block. Then merge as nathanjohnpayne after the pre-merge review conversation gate is clean. Done.
 8. If the PR meets the threshold, proceed to Phase 4 (see REVIEW_POLICY.md § Phase 4). Before Phase 4a, consult `phase_4b_default` from `.github/review-policy.yml` (parsed and exported as `PHASE_4B_DEFAULT` by `scripts/codex-review-check.sh`). When set to `always`, post the Phase 4b handoff for every threshold PR after 4a clearance. When set to `complex-changes`, run `scripts/phase-4b-classifier.sh <PR#>` between 4a clearance and merge — exit 1 means post the Phase 4b handoff and wait for an external CLI review; exit 0 means merge after the pre-merge review conversation gate is clean. Full detail lives in REVIEW_POLICY.md § Phase 4b Triggers. Phase 4 has two legs:
    - **Phase 4a — Automated (preferred)** when ALL of: `codex.enabled: true` in `.github/review-policy.yml`, `scripts/codex-review-request.sh`, `scripts/codex-review-check.sh`, AND `scripts/codex-record-feedback.sh` exist on disk, AND the **ChatGPT Codex Connector GitHub App is review-ready on this repo**. "Review-ready" means installed, Code Review enabled at [chatgpt.com/codex/cloud/settings/code-review](https://chatgpt.com/codex/cloud/settings/code-review), AND a Codex environment configured at [chatgpt.com/codex/cloud/settings/environments](https://chatgpt.com/codex/cloud/settings/environments). Verify only by observation: did a recent PR in this repo receive a Codex review from `chatgpt-codex-connector[bot]` (whether auto-posted or in response to an explicit `@codex review`)? That is the only reliable check from a reviewer PAT — `gh api repos/{owner}/{repo}/installation` requires a GitHub App JWT and returns 401 for normal tokens. Drive the Codex GitHub App review loop: post `@codex review` via the request script, address findings in a **`required`** tier (P0/P1 by default; configurable per repo via `feedback_policy` — see REVIEW_POLICY.md § Feedback Disposition Policy — fixed by code or rebuttal reply; `discretionary` tiers do NOT block clearance), then **record the validated 👍/👎 feedback** each finding solicits ("Useful? React with 👍 / 👎.") via `scripts/codex-record-feedback.sh` — fixed → `+1`, false-positive/rebutted → `-1`, posted under the reviewer identity through `gh-as-reviewer.sh`, idempotent and HEAD-pinned, with each verdict written to a durable ledger (#487). Loop up to `codex.max_review_rounds`. **Codex must be explicitly invoked, and a fix push never re-triggers it** — the Codex GitHub App only reliably reviews in response to an explicit `@codex review` comment. Its on-open / ready-for-review auto-review is best-effort and frequently does NOT fire (observed: an opened PR drew zero Codex activity until an explicit `@codex review` was posted, #648), and a plain push (`synchronize`) never triggers it. So running `scripts/codex-review-request.sh` to post the trigger is mandatory on EVERY round — the first one included, not only after a push — not an optional retry heuristic (#631). When checking whether Codex has reviewed the current HEAD, read the PR **issue comments** (`gh api repos/{owner}/{repo}/issues/{pr}/comments`) for a `chatgpt-codex-connector[bot]` summary that names the reviewed commit (a `Reviewed commit: <sha>` line) — not only review objects (`pulls/{pr}/reviews`) and reactions. Codex posts its verdict ("Codex Review: …") as an **issue comment**, so a reviews-only check can wrongly conclude Codex has not re-reviewed (#567). Treat the verdict as current only when its `Reviewed commit` sha equals the PR HEAD. On clearance (a Codex verdict / COMMENTED review with no unaddressed `required`-tier findings — P0/P1 by default — on the current HEAD, OR 👍 reaction from `chatgpt-codex-connector[bot]`), run `scripts/codex-review-check.sh` to verify the merge gate and merge. On exit code 4 (timeout), drop to Phase 4b. On repeat-after-rebuttal or round > `max_review_rounds`, escalate per § Disagreements below. If any of the conditions is false (Codex App not review-ready, partial script rollout, or Codex disabled in config), fall back to Phase 4b directly rather than entering 4a and stalling.
    - **Phase 4b — Automated first (#628):** when `phase_4b_automation.enabled: true` in `.github/review-policy.yml`, do NOT post the manual handoff — run `scripts/phase-4b-review.sh <PR#> --repo <owner/repo>` yourself **from a trusted main-ref checkout (never from the PR-under-review's checkout — trusted-path rule, Codex P1 on #628)**; exit 0 means the cross-agent APPROVED posted (accounting block included); exit 1 means a CHANGES_REQUESTED review POSTED — that is a completed review round, not a failure: address the findings, push, and rerun the automation (up to `max_review_rounds`). Only OTHER nonzero exits (2/3 config or infra error, 4 manual-fallback, 5 disabled) fall through to the manual handoff below.
    - **Phase 4b — Manual CLI fallback** when 4a is unavailable, 4a fell back, or the automated leg above exited nonzero (or `phase_4b_automation.enabled` is false/absent). When `codex.enabled: false`, `scripts/codex-review-check.sh` ignores Codex bot reviews/reactions and requires this Phase 4b substitute path for gate (c). Post the handoff message (see REVIEW_POLICY.md § Handoff Message Format) as a PR comment, emit the chat-side handoff block per REVIEW_POLICY.md § Handoff Message Format § Chat-side handoff block before alerting the human, and wait for an external reviewer identity (e.g., nathanpayne-codex) to post an `APPROVED` review via a separate agent CLI session. Address feedback via back-and-forth.
 9. If the external reviewer flags observations or risks while approving, create a GitHub Issue for each one assigned to nathanjohnpayne with labels "post-review" and "observation" or "risk" before merging.
-10. Merge as nathanjohnpayne only after the merge gate and pre-merge review conversation gate are clean. Non-Dependabot auto-merge is opt-in only:
-   it may merge PRs only with an `AUTHOR_MERGE_TOKEN` Actions secret
-   that resolves to `nathanjohnpayne`; absent that secret, use
-   `scripts/gh-as-author.sh -- gh pr merge ...`.
+10. Merge as nathanjohnpayne only after the merge gate and pre-merge review conversation gate are clean. Non-Dependabot auto-merge is opt-in only: it may merge PRs only with an `AUTHOR_MERGE_TOKEN` Actions secret that resolves to `nathanjohnpayne`; absent that secret, use `scripts/gh-as-author.sh -- gh pr merge ...`.
 
 ### Disagreements
 

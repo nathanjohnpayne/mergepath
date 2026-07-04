@@ -89,12 +89,26 @@ case "${STUB_RESOLVE_MODE:-ok}" in
     # closed on the exit code alone.
     echo "resolve: boom (no parseable summary)" >&2
     exit 2 ;;
-  *)
+  skip_only)
+    # A PR that verifies NOTHING but leaves skips behind (drifted / unverified).
+    # would-resolve/resolved is 0; skipped is non-zero. Proves skipped-only PRs
+    # are still printed per-PR (Codex P3 on #666).
     if [ "$dry" -eq 1 ]; then
-      echo "(dry-run; no threads modified) — would-resolve: 1, skipped (human): 0, skipped (stale-HEAD): 0, skipped (not-actioned): 1"
+      echo "(dry-run; no threads modified) — would-resolve: 0, skipped (human): 0, skipped (stale-HEAD): 0, skipped (not-actioned): 0, skipped (drift): 2"
       exit 3
     else
-      echo "Resolved: 1  Skipped (human): 0  Skipped (stale-HEAD): 0  Skipped (not-actioned): 1  Failed: 0  Readback-failed: 0"
+      echo "Resolved: 0  Skipped (human): 0  Skipped (stale-HEAD): 0  Skipped (not-actioned): 0  Skipped (drift): 2  Failed: 0  Readback-failed: 0"
+      exit 3
+    fi ;;
+  *)
+    if [ "$dry" -eq 1 ]; then
+      # Emit a non-not-actioned skip category (drift) too, so the backfill's
+      # sum-all-skips parse is exercised (would read 0 if it only parsed
+      # not-actioned). Per-PR skipped = 0+0+1+2 = 3.
+      echo "(dry-run; no threads modified) — would-resolve: 1, skipped (human): 0, skipped (stale-HEAD): 0, skipped (not-actioned): 1, skipped (drift): 2"
+      exit 3
+    else
+      echo "Resolved: 1  Skipped (human): 0  Skipped (stale-HEAD): 0  Skipped (not-actioned): 1  Skipped (drift): 2  Failed: 0  Readback-failed: 0"
       exit 3
     fi ;;
 esac
@@ -114,6 +128,9 @@ cat > "$FR/bin/gh" <<'STUB'
 # unauthorized repo — the real empty-success `gh pr list` case that enumerate
 # cannot distinguish. All other gh calls are no-ops (enumerate + resolve are
 # stubbed, and the dependency check only does `command -v gh`).
+# Record every gh invocation when STUB_GH_LOG is set, so a test can assert which
+# API the trusted-ref guard queries (the canonical commits API, not local git).
+[ -n "${STUB_GH_LOG:-}" ] && printf '%s\n' "$*" >> "$STUB_GH_LOG"
 if [ "${1:-}" = "repo" ] && [ "${2:-}" = "view" ] && [ "${STUB_GH_REPO_VIEW_FAIL:-0}" = "1" ]; then
   exit 1
 fi
@@ -128,7 +145,10 @@ run_bf() { # mode, extra-args... → sets OUT/RC, fresh resolve log
   STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"
   export STUB_RESOLVE_LOG
   set +e
-  OUT=$(PATH="$SHIM_PATH" STUB_RESOLVE_MODE="$1" GH_TOKEN=dummy bash "$BF" "${@:2}" --repo owner/alpha 2>&1)
+  # MERGEPATH_BACKFILL_TRUSTED_REF_OK=1: the fixture tree is not a git checkout,
+  # so the verified-propagation trusted-ref guard would fail closed; the guard
+  # itself is exercised separately (see the dedicated test below).
+  OUT=$(PATH="$SHIM_PATH" STUB_RESOLVE_MODE="$1" GH_TOKEN=dummy MERGEPATH_BACKFILL_TRUSTED_REF_OK=1 bash "$BF" "${@:2}" --repo owner/alpha 2>&1)
   RC=$?
   set -e
 }
@@ -282,6 +302,137 @@ if [ "$RC" -ne 0 ] && grep -qi 'not resolvable' <<<"$OUT" && [ ! -s "$STUB_RESOL
   pass=$((pass+1)); echo "PASS: no-trailing-newline targets file — final entry validated, fails closed (not dropped)"
 else
   fail=$((fail+1)); echo "FAIL: no-newline targets final entry should not be dropped (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 13: --mode resolve-verified-propagation delegates the verified mode
+#    to the resolver (never --resolve-actioned) — the Track-C drain path.
+run_bf ok --mode resolve-verified-propagation
+if [ "$RC" -eq 0 ] \
+   && [ "$(grep -c 'RESOLVE_ARGV:.*--resolve-verified-propagation' "$STUB_RESOLVE_LOG")" -eq 2 ] \
+   && ! grep -q -- '--resolve-actioned' "$STUB_RESOLVE_LOG"; then
+  pass=$((pass+1)); echo "PASS: --mode resolve-verified-propagation delegates the verified mode"
+else
+  fail=$((fail+1)); echo "FAIL: verified-propagation mode not delegated (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 14: an invalid --mode is rejected up front (exit 1), no resolver call.
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --mode bogus --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 1 ] && grep -qi 'mode must be' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: invalid --mode rejected up front (exit 1, no resolver call)"
+else
+  fail=$((fail+1)); echo "FAIL: invalid --mode should exit 1 (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 15: --mode resolve-verified-propagation SKIPS the canonical repo — on
+#    the hub, verified-propagation compares a file to itself (self-match → false
+#    "propagation verified"). Override the canonical slug to the fixture repo via
+#    MERGEPATH_CANONICAL_REPO; every owner/alpha PR is skipped, no resolver call,
+#    clean exit.
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=owner/alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy MERGEPATH_BACKFILL_TRUSTED_REF_OK=1 bash "$BF" --mode resolve-verified-propagation --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 0 ] && grep -qi 'SKIP (verified-propagation N/A' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: verified-propagation skips the canonical repo (no self-match resolve)"
+else
+  fail=$((fail+1)); echo "FAIL: canonical repo should be skipped in verified mode (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 16: the exclusion is MODE-SCOPED — under the default --resolve-actioned
+#    the same canonical repo IS drained (resolver called), proving verified-mode's
+#    skip does not leak into the actioned drain.
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=owner/alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 0 ] \
+   && [ "$(grep -c 'RESOLVE_ARGV:.*--resolve-actioned' "$STUB_RESOLVE_LOG")" -eq 2 ] \
+   && ! grep -qi 'SKIP (verified-propagation' <<<"$OUT"; then
+  pass=$((pass+1)); echo "PASS: canonical-repo exclusion is mode-scoped (actioned drain unaffected)"
+else
+  fail=$((fail+1)); echo "FAIL: actioned mode should still drain the canonical repo (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 17: the canonical self-match is case-INSENSITIVE (GitHub slugs are).
+#    A case-variant MERGEPATH_CANONICAL_REPO still skips owner/alpha; a raw
+#    string compare would miss the mismatch and resolve canonical PRs
+#    (CodeRabbit Functional Correctness on #666).
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=Owner/Alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy MERGEPATH_BACKFILL_TRUSTED_REF_OK=1 bash "$BF" --mode resolve-verified-propagation --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 0 ] && grep -qi 'SKIP (verified-propagation N/A' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: canonical self-match is case-insensitive (case-variant slug still skips)"
+else
+  fail=$((fail+1)); echo "FAIL: case-variant canonical slug should still skip (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 18: skip counters SUM all categories, not just not-actioned. The stub
+#    reports skipped (not-actioned):1 + skipped (drift):2 = 3 per PR; across the
+#    2 PRs the dry-run summary must show skipped=6, so verified-propagation
+#    drift / verify-error / no-upstream-evidence skips are not hidden from the
+#    operator's scope review (Codex P2 on #666).
+run_bf ok
+if [ "$RC" -eq 0 ] && grep -q 'skipped=6' <<<"$OUT"; then
+  pass=$((pass+1)); echo "PASS: summary sums ALL skip categories (skipped=6, not just not-actioned)"
+else
+  fail=$((fail+1)); echo "FAIL: skip counters should sum all categories (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 19: verified-propagation drops the canonical repo from the target set
+#    BEFORE enumerate, so a canonical-only enumerate WARN cannot fail-close the
+#    consumer drain (Codex P2 on #666). The exclusion notice fires in verified
+#    mode and NOT in the default actioned mode.
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=owner/alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy MERGEPATH_BACKFILL_TRUSTED_REF_OK=1 bash "$BF" --mode resolve-verified-propagation --repo owner/alpha 2>&1)
+OUT_ACTIONED=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=owner/alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --repo owner/alpha 2>&1)
+set -e
+if grep -qi 'excluded canonical repo' <<<"$OUT" && ! grep -qi 'excluded canonical repo' <<<"$OUT_ACTIONED"; then
+  pass=$((pass+1)); echo "PASS: verified-propagation filters canonical before enumerate; actioned does not"
+else
+  fail=$((fail+1)); echo "FAIL: canonical pre-enumerate filter should fire only in verified mode" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 20: the verified-propagation trusted-ref guard fails closed when the
+#    checkout cannot be proven to sit at the canonical default-branch tip. The
+#    fixture tree is not a git repo, so without MERGEPATH_BACKFILL_TRUSTED_REF_OK
+#    the guard refuses to run (exit 1) before any enumerate/resolve (Codex P2 on
+#    #666). Actioned mode is exempt (it never reads canonical) — Tests 1-2 run
+#    without the override.
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+STUB_GH_LOG="$SCRATCH/gh.log"; : > "$STUB_GH_LOG"; export STUB_GH_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --mode resolve-verified-propagation --repo owner/beta 2>&1)
+RC=$?
+set -e
+# The guard must read the trusted OID from the CANONICAL repo's commits API
+# ($CANONICAL_REPO, default nathanjohnpayne/mergepath), NOT a local origin/
+# tracking ref. Assert it hit `api repos/<canonical>/commits/<branch>` (Codex P2
+# on #666); an origin-based guard would leave no such call.
+if [ "$RC" -eq 1 ] && grep -qi 'non-trusted ref' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ] \
+   && grep -q 'api repos/.*/commits/' "$STUB_GH_LOG"; then
+  pass=$((pass+1)); echo "PASS: verified-propagation fails closed from a non-trusted checkout, via the canonical commits API"
+else
+  fail=$((fail+1)); echo "FAIL: trusted-ref guard should fail closed via the canonical commits API (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+unset STUB_GH_LOG
+
+# ── Test 21: a skipped-only PR (0 resolves, non-zero skips) is still printed
+#    per-PR, not just folded into the summary total, so the operator sees WHICH
+#    PRs carry unverified/drifted threads (Codex P3 on #666).
+run_bf skip_only
+if [ "$RC" -eq 0 ] && grep -q 'would-resolve=0 skipped=2' <<<"$OUT"; then
+  pass=$((pass+1)); echo "PASS: skipped-only PR is printed per-PR (not hidden when would-resolve=0)"
+else
+  fail=$((fail+1)); echo "FAIL: skipped-only PR should still print per-PR (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
 echo

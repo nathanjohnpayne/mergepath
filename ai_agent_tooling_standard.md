@@ -2,17 +2,11 @@
 
 ## Purpose
 
-This document defines a **deterministic repository standard** for AI
-coding agents and human developers. It governs structure, documentation
-placement, and agent behavior to prevent configuration drift and
-cross-tool inconsistency.
+This document defines a **deterministic repository standard** for AI coding agents and human developers. It governs structure, documentation placement, and agent behavior to prevent configuration drift and cross-tool inconsistency.
 
-The reference implementation is **Mergepath** (`mergepath`).
-When in doubt about structure or file placement, that repository is
-canonical.
+The reference implementation is **Mergepath** (`mergepath`). When in doubt about structure or file placement, that repository is canonical.
 
-Supported environments: Cursor, Claude Code, VS Code, Codex-style
-agents, and other editor or automation systems.
+Supported environments: Cursor, Claude Code, VS Code, Codex-style agents, and other editor or automation systems.
 
 ---
 
@@ -21,24 +15,18 @@ agents, and other editor or automation systems.
 Before reading further, internalize this priority order:
 
 1. **Canonical root files** are the authoritative source of truth.
-2. **Tool folders** (`.cursor/`, `.claude/`, `.vscode/`) contain
-   configuration only—never instructions.
-3. **Supporting directories** (`rules/`, `plans/`, `specs/`) extend
-   canonical docs with structured detail.
-4. **`rules/`** entries are binding constraints. They override agent
-   judgment.
-5. **`specs/`** entries define intended behavior. Code must not diverge
-   from specs without an explicit update cycle.
+2. **Tool folders** (`.cursor/`, `.claude/`, `.vscode/`) contain configuration only—never instructions.
+3. **Supporting directories** (`rules/`, `plans/`, `specs/`) extend canonical docs with structured detail.
+4. **`rules/`** entries are binding constraints. They override agent judgment.
+5. **`specs/`** entries define intended behavior. Code must not diverge from specs without an explicit update cycle.
 
-If any instruction in a tool folder conflicts with a canonical root
-file, the root file wins.
+If any instruction in a tool folder conflicts with a canonical root file, the root file wins.
 
 ---
 
 ## Canonical Files
 
-These files must exist at the repository root and must not be
-duplicated or redefined anywhere else:
+These files must exist at the repository root and must not be duplicated or redefined anywhere else:
 
 | File | Purpose |
 |---|---|
@@ -49,19 +37,15 @@ duplicated or redefined anywhere else:
 | `CONTRIBUTING.md` | Contribution guidelines |
 | `.ai_context.md` | Supplemental context for AI agents |
 
-`CLAUDE.md` must contain only a reading-order pointer to `AGENTS.md` and other
-canonical files. It must never duplicate instructions from `AGENTS.md`.
+`CLAUDE.md` must contain only a reading-order pointer to `AGENTS.md` and other canonical files. It must never duplicate instructions from `AGENTS.md`.
 
-AI agents must read these files before taking any action in an
-unfamiliar repository.
+AI agents must read these files before taking any action in an unfamiliar repository.
 
 ---
 
 ## AGENTS.md Required Structure
 
-Every `AGENTS.md` in a repository following this standard must contain
-these sections in this order. Omitting sections causes inconsistent
-agent behavior across repos.
+Every `AGENTS.md` in a repository following this standard must contain these sections in this order. Omitting sections causes inconsistent agent behavior across repos.
 
 ```
 # AGENTS.md
@@ -90,8 +74,7 @@ Reference to DEPLOYMENT.md. Any environment-specific notes relevant
 to agent behavior.
 ```
 
-Agents encountering an `AGENTS.md` that is missing sections must flag
-the gap rather than silently proceeding with assumed behavior.
+Agents encountering an `AGENTS.md` that is missing sections must flag the gap rather than silently proceeding with assumed behavior.
 
 ---
 
@@ -127,8 +110,7 @@ repo/
     └── architecture/       ← for larger repos; optional but recommended
 ```
 
-Do not introduce new top-level directories without explicit
-justification documented in `AGENTS.md` or a `plans/` entry.
+Do not introduce new top-level directories without explicit justification documented in `AGENTS.md` or a `plans/` entry.
 
 ---
 
@@ -136,8 +118,7 @@ justification documented in `AGENTS.md` or a `plans/` entry.
 
 ### `rules/`
 
-Hard repository constraints. Agents must treat every file here as a
-**binding rule**, not a suggestion.
+Hard repository constraints. Agents must treat every file here as a **binding rule**, not a suggestion.
 
 Typical contents:
 - Architecture constraints
@@ -146,14 +127,11 @@ Typical contents:
 - AI behavioral guardrails
 - `repo_rules.md`—repository-level structural invariants (see below)
 
-**Agent rule:** If a proposed change would violate a rule in `rules/`,
-stop. Flag the conflict before proceeding.
+**Agent rule:** If a proposed change would violate a rule in `rules/`, stop. Flag the conflict before proceeding.
 
 #### `rules/repo_rules.md`
 
-This file defines the structural invariants for the repository itself.
-It is the machine-readable enforcement companion to this standard. Every
-repository following this standard should include it.
+This file defines the structural invariants for the repository itself. It is the machine-readable enforcement companion to this standard. Every repository following this standard should include it.
 
 Required contents:
 
@@ -186,8 +164,7 @@ The following checks must pass on every commit (see scripts/ci/):
 
 ### `plans/`
 
-Execution and migration plans. These guide sequencing and rollout but
-do not define runtime behavior.
+Execution and migration plans. These guide sequencing and rollout but do not define runtime behavior.
 
 Typical contents:
 - Feature rollout plans
@@ -198,72 +175,56 @@ Typical contents:
 
 ### `specs/`
 
-Defines intended system behavior. These are the ground truth for what
-the system is supposed to do.
+Defines intended system behavior. These are the ground truth for what the system is supposed to do.
 
 Typical contents:
 - Feature specifications
 - API contracts
 - Acceptance criteria
 
-**Agent rule:** If code conflicts with a spec, do not silently update
-the code. Flag the conflict, then update either the spec or the tests
-before modifying behavior. The order of operations matters.
+**Agent rule:** If code conflicts with a spec, do not silently update the code. Flag the conflict, then update either the spec or the tests before modifying behavior. The order of operations matters.
 
 ---
 
 ### `tests/`
 
-Automated validation. Agents must update tests when behavior changes.
-Tests must not be deleted to make a build pass.
+Automated validation. Agents must update tests when behavior changes. Tests must not be deleted to make a build pass.
 
 ---
 
 ### `functions/`
 
-Serverless functions and backend handlers (API endpoints, event
-handlers, cloud functions).
+Serverless functions and backend handlers (API endpoints, event handlers, cloud functions).
 
 ---
 
 ### `scripts/`
 
-Automation and developer tooling. This directory contains scripts
-that support development, CI, and maintenance workflows. It is not
-application code.
+Automation and developer tooling. This directory contains scripts that support development, CI, and maintenance workflows. It is not application code.
 
 Typical contents:
 - `scripts/ci/` — CI enforcement checks (see below)
 - `scripts/build/` — build and compile helpers
 - `scripts/migrate/` — data or structure migration utilities
-- `scripts/gh-projects/` — multi-phase GitHub Projects v2 driver kit
-  (parent + native sub-issue tree, body-file placeholders, swimlane
-  helpers). Standard tooling for tracking phased initiatives.
+- `scripts/gh-projects/` — multi-phase GitHub Projects v2 driver kit (parent + native sub-issue tree, body-file placeholders, swimlane helpers). Standard tooling for tracking phased initiatives.
 
-Agents should not modify files in `scripts/ci/` without explicit
-instruction, as those scripts enforce this standard.
+Agents should not modify files in `scripts/ci/` without explicit instruction, as those scripts enforce this standard.
 
 ---
 
 ### `dist/`
 
-Generated build artifacts. Never edit manually. Regenerate through the
-build system only.
+Generated build artifacts. Never edit manually. Regenerate through the build system only.
 
-`dist/` must be listed in `.gitignore` unless the repository has an
-explicit, documented reason to version build artifacts. If versioned,
-that decision must be noted in `AGENTS.md`.
+`dist/` must be listed in `.gitignore` unless the repository has an explicit, documented reason to version build artifacts. If versioned, that decision must be noted in `AGENTS.md`.
 
 ---
 
 ### `docs/architecture/`
 
-Optional but recommended for larger repositories. Contains architecture
-decision records (ADRs), system diagrams, and high-level design
-documents.
+Optional but recommended for larger repositories. Contains architecture decision records (ADRs), system diagrams, and high-level design documents.
 
-Agents should consult this directory before making structural or
-architectural changes.
+Agents should consult this directory before making structural or architectural changes.
 
 ---
 
@@ -295,8 +256,7 @@ The following directories are configuration containers—nothing more:
 
 **`.claude/`**
 - Minimal configuration only.
-- Claude agents must read `AGENTS.md`, `rules/`, and `specs/` for all
-  behavioral instructions.
+- Claude agents must read `AGENTS.md`, `rules/`, and `specs/` for all behavioral instructions.
 
 **`.vscode/`**
 - `settings.json` and `extensions.json` only.
@@ -327,8 +287,7 @@ When starting work in a repository, agents must read in this order:
 
 - Use existing directories before introducing new ones.
 - Do not create new top-level directories without justification.
-- Place new canonical instructions only in root files or the
-  appropriate supporting directory—never in tool folders.
+- Place new canonical instructions only in root files or the appropriate supporting directory—never in tool folders.
 
 ### Handling conflicts
 
@@ -351,8 +310,7 @@ Agents must update documentation when any of the following change:
 
 ## CI Enforcement
 
-Vague enforcement is no enforcement. The following checks must be
-implemented in `scripts/ci/` and run on every commit.
+Vague enforcement is no enforcement. The following checks must be implemented in `scripts/ci/` and run on every commit.
 
 | Check | What it validates |
 |---|---|
@@ -363,19 +321,16 @@ implemented in `scripts/ci/` and run on every commit.
 | `check_spec_test_alignment` | Every spec file has a corresponding test file or documented exception |
 | `check_duplicate_docs` | No instruction content is duplicated between root files and tool folders |
 
-Agents must not disable or modify CI checks without explicit
-instruction and a documented justification in `plans/`.
+Agents must not disable or modify CI checks without explicit instruction and a documented justification in `plans/`.
 
 ---
 
 ## Drift Prevention
 
-Repository drift occurs when instructions fragment across multiple
-locations. To prevent it:
+Repository drift occurs when instructions fragment across multiple locations. To prevent it:
 
 - Keep canonical docs authoritative and up to date.
-- Remove duplicated instructions when found—do not leave them as
-  "backup" copies.
+- Remove duplicated instructions when found—do not leave them as "backup" copies.
 - Keep tool folders minimal.
 - Run CI enforcement checks on every commit.
 
@@ -387,8 +342,7 @@ To bring an existing repository into compliance:
 
 1. Audit the full repository structure.
 2. Identify all duplicated or fragmented instructions.
-3. Consolidate instructions into the appropriate canonical root file or
-   supporting directory.
+3. Consolidate instructions into the appropriate canonical root file or supporting directory.
 4. Simplify tool folders—remove anything that is not configuration.
 5. Add any missing directories from the standard layout.
 6. Create `rules/repo_rules.md` with structural invariants.
@@ -409,5 +363,4 @@ To bring an existing repository into compliance:
 - Example `AGENTS.md` with all required sections
 - Example CI scripts in `scripts/ci/`
 
-Agents must reference this template when uncertain how to structure
-changes or where to place new files.
+Agents must reference this template when uncertain how to structure changes or where to place new files.
