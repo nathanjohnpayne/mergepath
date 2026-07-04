@@ -44,45 +44,47 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # ---------------------------------------------------------------------------
-# In-scope = repo-owned, local, prose Markdown. Everything excluded below is
-# excluded for a specific, durable reason — keep the reasons with the globs so
-# a future reader knows why a path is out of scope (and does not "helpfully"
-# re-include a propagated mirror).
+# Scope is an ALLOWLIST (fail-safe): only the repo-owned prose roots below are
+# in scope, and any path NOT matched is out of scope by default. A future
+# directory — a generated/build tree, a vendored dependency, a new code area —
+# is therefore NEVER swept in until it is added here on purpose. This is the
+# opposite of a denylist, which would reflow everything except a hand-kept
+# blocklist and silently pull in an unrelated tree the day it appears.
 #
-# EXCLUDED — generated mirror (edit the canonical source, never the mirror):
-#   docs/projects/*/prds/*            central-to-repo PRD mirror (do_not_edit)
-#
-# EXCLUDED — propagated to ~8 consumers via .mergepath-sync.yml (reflowing the
-# source changes byte-identical downstream output; needs a coordinated sync
-# wave, deliberately deferred):
-#   .github/pull_request_template.md  canonical, consumers: all
-#   .github/ISSUE_TEMPLATE/*          kit, consumers: all (front-matter bodies)
-#   scripts/ci/*                      kit
-#   scripts/phase-4b/*                kit
-#   scripts/gh-projects/*             kit (README + examples/** fixtures)
-#   scripts/workflow/*                kit (no .md today; excluded defensively)
-#
-# EXCLUDED — fixtures / generated data where bytes are load-bearing:
-#   docs/audits/data/*                generated stat tables + raw-data descriptors
-#   (scripts/gh-projects/examples/**  already covered by the kit exclusion)
+# The allowlist mirrors docs/agents/documentation-rules.md § Prose
+# line-wrapping. Within an in-scope root a few paths are still carved out
+# (they are matched FIRST, before the broad includes):
+#   docs/projects/*/prds/*   generated PRD mirror (do_not_edit; central->repo)
+#   docs/audits/data/*       generated stat tables / raw-data descriptors
+#   .github/pull_request_template.md, .github/ISSUE_TEMPLATE/*
+#                            propagated to ~8 consumers via .mergepath-sync.yml
+#                            (reflowing the source changes byte-identical
+#                            downstream output; deferred to a sync wave)
+# Kit READMEs under scripts/{ci,phase-4b,gh-projects,workflow}/ are propagated
+# too, but scripts/ is simply not an in-scope root, so they fall out by
+# omission (the fail-safe default) with no explicit carve-out.
 # ---------------------------------------------------------------------------
-is_excluded() {
+is_in_scope() {
   case "$1" in
-    docs/projects/*/prds/*) return 0 ;;
-    .github/pull_request_template.md) return 0 ;;
-    .github/ISSUE_TEMPLATE/*) return 0 ;;
-    scripts/ci/*) return 0 ;;
-    scripts/phase-4b/*) return 0 ;;
-    scripts/gh-projects/*) return 0 ;;
-    scripts/workflow/*) return 0 ;;
-    docs/audits/data/*) return 0 ;;
-    *) return 1 ;;
+    # Carve-outs inside an in-scope root (generated mirror / propagated) win.
+    docs/projects/*/prds/*) return 1 ;;
+    docs/audits/data/*) return 1 ;;
+    .github/pull_request_template.md | .github/ISSUE_TEMPLATE/*) return 1 ;;
+    # Allowlisted repo-owned prose roots.
+    docs/* | rules/* | plans/* | specs/* | packaging/*) return 0 ;;
+    .github/copilot-instructions.md | .github/templates/* | .github/screenshots/*) return 0 ;;
+    functions/README.md | mergepath/README.md | tests/README.md) return 0 ;;
+    scripts/build/README.md | bugs/screenshots/README.md | artifacts/*) return 0 ;;
+    # A repo-root doc (a top-level *.md with no directory component) is in
+    # scope; any OTHER nested path is out of scope by default (fail-safe).
+    */*) return 1 ;;
+    *) return 0 ;;
   esac
 }
 
 FILES=()
 while IFS= read -r f; do
-  is_excluded "$f" && continue
+  is_in_scope "$f" || continue
   FILES+=("$f")
 done < <(git ls-files '*.md')
 

@@ -130,5 +130,12 @@ check "GitHub alert marker kept on its own line" \
 check "GitHub alert not collapsed (still 3 quoted lines)" \
   "$([ "$(grep -c '^>' "$WORK/a.md")" -eq 3 ] && echo 0 || echo 1)"
 
+# 10. A GFM footnote definition is left intact — the CommonMark render check
+# cannot model footnotes, so the marker line is guarded at the source.
+printf 'Ref.[^1]\n\n[^1]: A footnote that\nwraps here.\n' >"$WORK/fn.md"
+reflow "$WORK/fn.md"
+check "footnote definition marker not joined" \
+  "$(has_line "$WORK/fn.md" '[^1]: A footnote that' && echo 0 || echo 1)"
+
 echo "md_reflow: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

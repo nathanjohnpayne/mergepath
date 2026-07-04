@@ -15,8 +15,9 @@ intra-paragraph soft-break newlines. It does not touch:
   - YAML front matter (stripped and re-attached byte-for-byte),
   - link reference definitions,
   - list / block-quote markers and structure,
-  - GitHub alert blockquotes (``> [!NOTE]`` …) — the marker must stay on its
-    own line, so an alert paragraph is left verbatim (see ``_GH_ALERT``),
+  - GitHub alert blockquotes (``> [!NOTE]`` …) and GFM footnote definitions
+    (``[^label]:``) — left verbatim so their markers keep their own line
+    (see ``_SKIP_JOIN_FIRST_LINE``),
   - HTML blocks,
   - thematic breaks, headings, inline emphasis/code/link markup.
 
@@ -28,9 +29,10 @@ How it stays safe
    Only ``paragraph`` blocks are rewritten; every other source line is
    copied byte-for-byte. The parser is CommonMark + tables, so GFM-only
    *block* extensions it cannot model are guarded at the source rather than
-   relied on the render check to catch: GitHub alerts are skipped by
-   ``_GH_ALERT`` (footnote definitions and task lists reflow without changing
-   their GitHub rendering, so they need no special case).
+   relied on the render check to catch: GitHub alerts and footnote
+   definitions are skipped by ``_SKIP_JOIN_FIRST_LINE``. (Task lists are
+   list items and reflow safely; ``$$`` math and ``:::`` containers are
+   absent from the in-scope files — add a guard if one is introduced.)
 2. Fail-closed render check: after reflow, the original and reflowed bodies
    are each rendered to HTML and compared with intra-text whitespace
    normalized. If the render differs in any way other than the intended
@@ -84,18 +86,35 @@ _MD = MarkdownIt("commonmark").enable("table")
 
 _WS_RUN = re.compile(r"\s+")
 
-# GitHub alert blockquotes (`> [!NOTE]`, `> [!WARNING]`, …) are a GFM block
-# extension the CommonMark parser above does NOT model: it sees the marker as
-# ordinary blockquote text. Joining `[!NOTE]\n<body>` into one line moves the
-# marker off its own line, so GitHub stops rendering the alert — and because
-# the render check is also CommonMark, it would not catch the regression. The
-# marker MUST stay on its own line, so any paragraph whose first line is an
-# alert marker is left exactly as written (never joined). The type is matched
-# case-insensitively and the marker must be alone on the line, per the GFM
-# alert syntax. (A blank line after the marker already splits it into its own
-# single-line paragraph, which is never joined; only the no-blank-line form —
-# marker and body in one paragraph — is at risk, and this guard covers it.)
-_GH_ALERT = re.compile(r"^\[!(?:NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*$", re.IGNORECASE)
+# Source guards for GitHub-flavored *block* extensions the CommonMark parser
+# above cannot model — so the render check (also CommonMark) cannot be relied
+# on to catch their corruption. Rather than trust the check, any paragraph
+# whose FIRST line is one of these markers is left exactly as written (never
+# joined). Two constructs qualify:
+#
+#   * GitHub alert blockquotes — `> [!NOTE]`, `> [!WARNING]`, … The `[!TYPE]`
+#     marker MUST stay on its own line; joining `[!NOTE]\n<body>` onto one line
+#     silently downgrades the alert to a plain blockquote on GitHub. (A blank
+#     line after the marker already splits it into its own single-line
+#     paragraph, which is never joined; only the no-blank-line form is at risk,
+#     and this guard covers it.)
+#   * GFM footnote definitions — `[^label]:` …  Joining a footnote definition
+#     is in fact render-preserving under a footnote-aware parser, but the
+#     CommonMark check does not model footnotes, so it is guarded here too:
+#     defensively leaving the definition intact keeps the tool correct without
+#     depending on the check to model an extension it cannot see.
+#
+# The alert type is matched case-insensitively and the marker must be alone on
+# its line, per GFM alert syntax. `$$` math blocks and `:::` containers are not
+# GitHub-rendered in this repo's prose and are absent from the in-scope files;
+# if one is ever added, add its marker here (or model it in the render check).
+_SKIP_JOIN_FIRST_LINE = re.compile(
+    r"^(?:"
+    r"\[!(?:NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*$"  # GitHub alert marker
+    r"|\[\^[^\]]+\]:"                                    # GFM footnote definition
+    r")",
+    re.IGNORECASE,
+)
 
 
 def split_front_matter(text: str) -> tuple[str, str]:
@@ -168,9 +187,9 @@ def _paragraph_replacements(body: str) -> dict[int, tuple[int, str]]:
             continue
         segs = content.split("\n")
         first_seg = segs[0]
-        # A GitHub alert marker must stay on its own line — never join it into
-        # the following body (that silently breaks the alert on GitHub).
-        if _GH_ALERT.match(first_seg):
+        # A GitHub-only block-extension marker (alert / footnote definition)
+        # must stay on its own line; never join it into the following body.
+        if _SKIP_JOIN_FIRST_LINE.match(first_seg):
             continue
         first_line = lines[start]
         # Anchor the block prefix: the paragraph text is the tail of the first
