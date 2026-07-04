@@ -245,7 +245,17 @@
 #                           Run from a mergepath checkout with
 #                           --repo <owner/consumer-repo>; on a checkout
 #                           without .mergepath-sync.yml every thread skips
-#                           fail-closed.
+#                           fail-closed. CANONICAL-REPO SELF-GUARD: this mode
+#                           is CONSUMER-only. When --repo names the canonical
+#                           mergepath repo ITSELF (the repo the local checkout
+#                           is a clone of), the byte-compare's two sides are
+#                           one file — a vacuous self-match — so every thread
+#                           skips as not-propagation-routed. A canonical
+#                           finding actioned by a later commit is
+#                           addressed-elsewhere (use --resolve-actioned). The
+#                           canonical repo is detected from the checkout's
+#                           origin remote, overridable via
+#                           MERGEPATH_CANONICAL_REPO.
 #   --dry-run               With any resolve mode, print what would
 #                           be resolved or skipped without mutating.
 #   --rationale <text>      With --auto-resolve-bots, override the
@@ -1506,6 +1516,75 @@ REPO_ROOT_FOR_MANIFEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # never resolve on partial evidence. The byte-compare is the resolution
 # evidence; routing (path membership) alone never resolves (#565).
 
+# --- canonical-repo self-guard (found sizing the #562 Track C drain) --------
+#
+# --resolve-verified-propagation proves a CONSUMER's content byte-matches the
+# mergepath canonical source: it reads that source from REPO_ROOT_FOR_MANIFEST
+# (the local checkout) via `git show HEAD:<path>` and the "consumer" content
+# from the --repo target via the contents API, then byte-compares. When --repo
+# names the canonical repo ITSELF — the repository REPO_ROOT_FOR_MANIFEST is a
+# clone of — both sides are the SAME file: the compare is a vacuous self-match
+# and the #616 upstream-fix gate is trivially satisfied by any later commit
+# touching the path, so a finding on the canonical source would be resolved
+# under a semantically-false verified-propagation tag (nothing propagated).
+# The mode must NOT apply there. The correct disposition for a canonical
+# finding fixed by a later commit is addressed-elsewhere, which
+# --resolve-actioned already handles; the mode gate below skips these threads
+# as not-propagation-routed.
+#
+# The guard keys off the SAME identifier the byte-compare's SOURCE side uses —
+# REPO_ROOT_FOR_MANIFEST's own repository — not a hardcoded slug: the
+# checkout's `origin` remote, normalized to owner/name. An explicit
+# MERGEPATH_CANONICAL_REPO overrides it (fork checkouts, a non-origin remote,
+# and the tests). When it cannot be resolved (no remote, or a non-git fixture
+# tree) the slug is empty and the guard does NOT fire — preserving the
+# consumer happy path and every fixture that has no remote.
+CANONICAL_REPO_SLUG=""
+CANONICAL_REPO_SLUG_FETCHED=false
+canonical_repo_slug() {
+  if ! $CANONICAL_REPO_SLUG_FETCHED; then
+    CANONICAL_REPO_SLUG_FETCHED=true
+    local url="${MERGEPATH_CANONICAL_REPO:-}"
+    if [ -z "$url" ]; then
+      url=$(git -C "$REPO_ROOT_FOR_MANIFEST" remote get-url origin 2>/dev/null) || url=""
+    fi
+    if [ -n "$url" ]; then
+      # Normalize any git URL form to owner/name: drop a trailing .git and
+      # slash, take the last path segment as the name, and the segment before
+      # it (after the last `/` or `:`) as the owner. Covers
+      # https://host/owner/name(.git), git@host:owner/name(.git), and
+      # ssh://git@host/owner/name. A value with no owner/name split (a bare
+      # word) leaves the slug empty (owner == whole string) — safe: an empty
+      # slug never equals $REPO, so the guard stays off.
+      url="${url%.git}"
+      url="${url%/}"
+      local name="${url##*/}"
+      local rest="${url%/*}"
+      local owner="${rest##*[:/]}"
+      if [ -n "$owner" ] && [ -n "$name" ] && [ "$owner" != "$url" ]; then
+        CANONICAL_REPO_SLUG="$owner/$name"
+      fi
+    fi
+  fi
+  printf '%s' "$CANONICAL_REPO_SLUG"
+}
+
+# repo_is_canonical_source — exit 0 when $REPO (the --repo target) names the
+# same repository as REPO_ROOT_FOR_MANIFEST (the canonical source checkout),
+# compared case-insensitively (GitHub owner/name are case-insensitive). True
+# means --resolve-verified-propagation's byte-compare would self-match, so the
+# mode does not apply. An unresolvable canonical slug reads as "not canonical"
+# (guard off) — deliberately fail-open here, because the only thing it lets
+# through is the existing byte-compare, which itself fails closed.
+repo_is_canonical_source() {
+  local canon repo_lc canon_lc
+  canon=$(canonical_repo_slug)
+  [ -n "$canon" ] || return 1
+  repo_lc=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')
+  canon_lc=$(printf '%s' "$canon" | tr '[:upper:]' '[:lower:]')
+  [ "$repo_lc" = "$canon_lc" ]
+}
+
 # The templated arm REUSES the exact render engine
 # scripts/workflow/verify-propagation-pr.sh uses — the same
 # template-substitution lib + manifest-fact-helpers pair, sourced in a
@@ -2593,7 +2672,10 @@ SKIPPED_COMMENTS_INCOMPLETE=0
 #   SKIPPED_NOT_PROPAGATION  the thread's class is not canonical-coverage /
 #                            templated-render — this mode only handles
 #                            routing-class threads (surface + actioned
-#                            classes have their own modes).
+#                            classes have their own modes) — OR --repo names
+#                            the canonical repo itself, where the byte-compare
+#                            would self-match (the canonical-repo self-guard;
+#                            use --resolve-actioned there).
 #   SKIPPED_DRIFT            the byte-compare RAN and MISMATCHED — the
 #                            consumer content drifted or the upstream fix
 #                            has not propagated; left unresolved on purpose.
@@ -2733,6 +2815,28 @@ while IFS= read -r thread; do
   # first is the operating contract.
   VERIFIED_RATIONALE=""
   if [ "$MODE" = "resolve-verified-propagation" ]; then
+    # Canonical-repo self-guard (found sizing the #562 Track C drain): this
+    # mode proves a CONSUMER's content byte-matches the mergepath canonical
+    # source. When --repo names the canonical repo ITSELF (the repository
+    # REPO_ROOT_FOR_MANIFEST is a clone of — the same source the byte-compare
+    # reads via `git show HEAD`), the two compare sides are ONE file: the
+    # byte-compare is a vacuous self-match and the #616 upstream-fix gate is
+    # trivially satisfied by any later commit touching the path, so a finding
+    # on the canonical source would be resolved under a semantically-false
+    # verified-propagation tag. Skip as not-propagation-routed BEFORE any read
+    # or byte-compare; on the canonical repo a later-commit fix is
+    # addressed-elsewhere, which --resolve-actioned handles.
+    if repo_is_canonical_source; then
+      echo "  SKIP (canonical repo — verified-propagation does not apply): [$AUTHOR] $PATH_"
+      echo "    $EXCERPT"
+      echo "    $REPO is the mergepath canonical source itself, so there is nothing"
+      echo "    to verify propagation AGAINST — the byte-compare would self-match."
+      echo "    Use --resolve-actioned for a canonical finding fixed by a later"
+      echo "    commit (addressed-elsewhere), or --auto-resolve-bots --rationale"
+      echo "    for an explicit deferral."
+      SKIPPED_NOT_PROPAGATION=$((SKIPPED_NOT_PROPAGATION + 1))
+      continue
+    fi
     # Same complete-thread precondition as --resolve-actioned (#573 item 2 /
     # #614): never classify on a truncated comment window — a hidden
     # re-raise or marker must not be invisible to the ladder. Fail closed.

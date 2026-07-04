@@ -183,6 +183,18 @@ while IFS=$'\t' read -r repo pr; do
     break
   fi
   PRS_DONE=$((PRS_DONE + 1))
+  # Mode is INTENTIONALLY --resolve-actioned for every target, INCLUDING the
+  # canonical repo (nathanjohnpayne/mergepath, present in target-repos.txt):
+  # actioned resolution — a fix commit touching the anchored file, or a
+  # rebuttal — is legitimate on the canonical source itself. Do NOT switch
+  # this backfill to --resolve-verified-propagation across the default target
+  # list: that mode byte-compares a CONSUMER's content against the canonical
+  # source, so on the canonical repo the two sides are ONE file and every
+  # thread self-matches. resolve-pr-threads.sh already fails those closed via
+  # its canonical-repo self-guard (skipped as not-propagation-routed), so this
+  # is fail-safe, not a correctness hole — but the pass would be wasted. If a
+  # verified-propagation backfill mode is ever added here, it MUST exclude the
+  # canonical repo from ITS target list (the actioned mode keeps draining it).
   args=("$pr" --repo "$repo" --resolve-actioned)
   $DRY_RUN && args+=(--dry-run)
   set +e
