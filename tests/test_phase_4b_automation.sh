@@ -571,6 +571,31 @@ if P4B_VERDICT_SCHEMA_PATH="$BAD_SCHEMA" p4b_validate_verdict '{"verdict":"CHANG
   fail "scalar severity enum in a malformed schema accepted (should fail closed)"
 else pass "malformed schema (severity enum as scalar) fails closed"; fi
 
+# (b'') Strict-mode required/properties parity (#660): the schema is passed
+# to `codex exec --output-schema`, and OpenAI strict structured outputs
+# require `required` to be an array listing EVERY key in `properties` (#632)
+# AND reject a `required` key absent from `properties` (the #641 regression:
+# `cli_version` added to required only → invalid_json_schema → every
+# claude→codex adapter run failed closed to the manual handoff). The unit
+# validator derives its key sets FROM the schema, so a schema-internal
+# inconsistency is invisible to every other test here — pin exact set
+# equality, and the strict-mode `additionalProperties: false` posture, at
+# every object node so neither direction can drift again.
+parity_violations="$(jq -r '
+  [ .. | objects | select(has("properties"))
+    | select(((.required // []) | sort) != (.properties | keys | sort)) ]
+  | length' "$SCHEMA_FILE")"
+[ "$parity_violations" = "0" ] \
+  && pass "strict-mode parity: required == properties keys at every object node" \
+  || fail "strict-mode parity: $parity_violations node(s) with required != properties keys (OpenAI rejects the whole schema)"
+addprops_violations="$(jq -r '
+  [ .. | objects | select(has("properties"))
+    | select(.additionalProperties != false) ]
+  | length' "$SCHEMA_FILE")"
+[ "$addprops_violations" = "0" ] \
+  && pass "strict-mode parity: additionalProperties is false at every object node" \
+  || fail "strict-mode parity: $addprops_violations node(s) missing additionalProperties: false"
+
 # (c) Optional independent cross-check against the JSON Schema itself. The
 # validator is a superset of the schema (it adds the feedback_policy gate), so
 # every fixture the validator ACCEPTS must also be schema-valid. Runs only when
