@@ -377,6 +377,27 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 1a2: gate disabled via a SINGLE-QUOTED value (enabled: 'false', #651).
+# The parser must strip single quotes like it strips double quotes, or the
+# later `case` rejects the value and the disabled gate never no-ops.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 1a2: gate disabled (enabled: 'false' — single-quoted, #651)"
+SCRATCH=$(make_scratch_with_config "'false'")
+: > "$WORKDIR/gh-calls.log"
+set +e
+OUT=$(run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && ! grep -q "^gh" "$WORKDIR/gh-calls.log"; then
+  pass "single-quoted enabled: 'false' parses as disabled (exits 0)"
+else
+  fail "single-quoted enabled: 'false' should disable the gate; got rc=$RC, output:"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Test 1b: gate disabled + NO env. The off-state short-circuit must run
 # BEFORE the PR-context requirements.
 # ---------------------------------------------------------------------------

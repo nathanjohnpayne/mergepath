@@ -60,6 +60,19 @@ assert_clean   "gh api GET not flagged"       'gh api repos/o/r/pulls/1 --jq .st
 
 # Exemption marker hardening — bare marker no longer bypasses.
 assert_flagged "bare exemption marker rejected" 'gh pr merge 1 --squash  # NO_BARE_GH_WRITE_EXEMPT:'
+
+# examples/ scripts are exempt (#455 wave): a consumer's stray illustrative
+# example under scripts/*/examples/ must not break the required lint.
+# run_check_on writes to scripts/fixture.sh, so build the examples/ layout here.
+examples_rc=0
+et="$(mktemp -d "${TMPDIR:-/tmp}/no-bare-gh-ex.XXXXXX")"
+mkdir -p "$et/scripts/ci" "$et/scripts/gh-projects/examples/matchline"
+cp "$CHECK" "$et/scripts/ci/check_no_bare_gh_writes"
+chmod +x "$et/scripts/ci/check_no_bare_gh_writes"
+printf 'gh issue edit "$n" --repo "$R" --add-assignee me\n' > "$et/scripts/gh-projects/examples/matchline/create-issues.sh"
+( cd "$et" && ./scripts/ci/check_no_bare_gh_writes ) >/dev/null 2>&1 || examples_rc=$?
+rm -rf "$et"
+if [ "$examples_rc" -eq 0 ]; then pass "bare gh write under examples/ is exempt (clean)"; else fail "examples/ exemption: expected clean (rc 0), got rc=$examples_rc"; fi
 assert_clean   "exemption WITH reason honored"  'gh pr merge 1 --squash  # NO_BARE_GH_WRITE_EXEMPT: covered by gh-as-author in caller'
 
 # echo/printf substitution masking — the #533 gap. A gh WRITE hidden in an

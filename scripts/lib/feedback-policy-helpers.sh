@@ -146,7 +146,11 @@ codex_tier_of() {
 # Anything else (Refactor suggestion, plain Note, bare titlecase prose) → empty.
 coderabbit_tier_of() {
   local head
-  head=$(printf '%s' "${1:-}" | head -c 600)
+  # Truncate via parameter expansion (not `printf | head -c`): under
+  # `set -euo pipefail` a large body makes head close the pipe early and
+  # printf exits 141 (SIGPIPE), which aborts every caller. The badge markers
+  # matched below are near the start, so a 600-char cut is more than enough.
+  head="${1:-}"; head="${head:0:600}"
   case "$head" in
     *"🟠 Major"*|*"Potential issue"*|*"⚠️"*)  echo p1; return 0 ;;
     *"🧹 Nitpick"*)                            echo nitpick; return 0 ;;
