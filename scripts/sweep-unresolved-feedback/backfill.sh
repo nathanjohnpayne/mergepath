@@ -4,28 +4,42 @@
 # One-time backfill (#566) that drains the standing unresolved-feedback
 # backlog (#562). It enumerates closed PRs that still carry unresolved bot
 # review threads — via enumerate.sh, the same enumerator the weekly sweep
-# uses — and runs `scripts/resolve-pr-threads.sh --resolve-actioned` on each
-# distinct PR.
+# uses — and runs resolve-pr-threads.sh on each distinct PR in one of two
+# demonstrability modes (--mode, default resolve-actioned).
 #
-# Because it delegates to --resolve-actioned, ONLY demonstrably-actioned
-# bot-authored threads are resolved: a fix commit that touches the anchored
-# file after the latest bot/reviewer comment (addressed-elsewhere), or a
-# substantive agent rebuttal after the bot's last word (rebuttal-recorded).
-# Routing-only (canonical/templated), surface (nitpick/deferred), and any
-# human-authored threads are LEFT UNRESOLVED for the weekly sweep, and every
-# resolve is readback-confirmed (isResolved:true) and fails closed otherwise.
-# The forward fix (#564/#565) prevents the backlog from growing; this drains
-# the part that is already, demonstrably handled.
+# --mode resolve-actioned (default) resolves ONLY demonstrably-actioned
+# bot-authored threads: a fix commit that touches the anchored file after the
+# latest bot/reviewer comment (addressed-elsewhere), or a substantive agent
+# rebuttal after the bot's last word (rebuttal-recorded). Routing-only
+# (canonical/templated), surface (nitpick/deferred), and human-authored
+# threads are LEFT UNRESOLVED.
+#
+# --mode resolve-verified-propagation drains the OTHER half: the routing
+# classes (canonical-coverage / templated-render) that the actioned gate
+# leaves behind — but ONLY where the consumer file at the compared ref
+# byte-matches the mergepath canonical/rendered source AND the upstream
+# carries a fix commit newer than the finding (#572/#616). It is the
+# Track-C drain, valid once the sync wave has landed so consumers match
+# canonical. It EXCLUDES the canonical repo itself (see CANONICAL_REPO):
+# verified-propagation is a consumer→canonical compare and would self-match
+# there.
+#
+# Both modes readback-confirm every resolve (isResolved:true) and fail closed
+# otherwise. The forward fix (#564/#565) prevents the backlog from growing;
+# this drains the parts already demonstrably handled or verifiably propagated.
 #
 # SAFETY: dry-run by DEFAULT. It mutates only with --execute. The dry-run
-# previews per-PR would-resolve / skipped-not-actioned counts so the operator
-# can review the scope before any write.
+# previews per-PR would-resolve / skipped counts so the operator can review
+# the scope before any write.
 #
 # Usage:
 #   scripts/sweep-unresolved-feedback/backfill.sh [--execute]
+#       [--mode resolve-actioned|resolve-verified-propagation]
 #       [--repo owner/name] [targets-file]
 #
 #   --execute        Actually resolve (default: dry-run, no mutations).
+#   --mode M         Resolve mode delegated to resolve-pr-threads.sh:
+#                    resolve-actioned (default) or resolve-verified-propagation.
 #   --repo o/n       Restrict to a single repo (default: every repo in the
 #                    targets file).
 #   targets-file     Path to the target-repos list (default:
@@ -63,6 +77,22 @@ RESOLVE="$ROOT/scripts/resolve-pr-threads.sh"
 DRY_RUN=true
 ONLY_REPO=""
 TARGETS_FILE=""
+# Which resolve-pr-threads.sh mode each PR is run through. The shipped #566
+# backfill only drained the actioned classes (addressed-elsewhere /
+# rebuttal-recorded); resolve-verified-propagation (#572/#616) drains the
+# routing classes (canonical-coverage / templated-render) that the actioned
+# gate deliberately leaves behind — but ONLY when the consumer file at the
+# compared ref byte-matches canonical AND the upstream carries a newer fix
+# commit. That mode is the Track-C drain enabled once the sync wave lands.
+MODE="resolve-actioned"
+# The canonical (hub) repo. verified-propagation is a CONSUMER→canonical
+# byte-compare; run against the canonical repo itself it would compare a file
+# to itself, self-match, and resolve with a semantically-false "propagation
+# verified" tag. So --mode resolve-verified-propagation SKIPS this repo (the
+# per-PR loop below); --resolve-actioned still drains its actioned threads
+# normally. Env-overridable for tests, mirroring
+# scripts/ci/check_op_firebase_deploy_integration.
+CANONICAL_REPO="${MERGEPATH_CANONICAL_REPO:-nathanjohnpayne/mergepath}"
 
 usage() { sed -n '2,40p' "$0" >&2; exit 1; }
 
@@ -70,6 +100,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --execute) DRY_RUN=false; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
+    --mode)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then echo "backfill: --mode needs a value" >&2; exit 1; fi
+      MODE="$2"; shift 2 ;;
     --repo)
       if [ $# -lt 2 ] || [ -z "$2" ]; then echo "backfill: --repo needs a value" >&2; exit 1; fi
       ONLY_REPO="$2"; shift 2 ;;
@@ -82,6 +115,11 @@ while [ $# -gt 0 ]; do
 done
 
 TARGETS_FILE="${TARGETS_FILE:-$SCRIPT_DIR/target-repos.txt}"
+
+case "$MODE" in
+  resolve-actioned|resolve-verified-propagation) : ;;
+  *) echo "backfill: --mode must be resolve-actioned or resolve-verified-propagation (got: '$MODE')" >&2; exit 1 ;;
+esac
 
 for f in "$ENUMERATE" "$RESOLVE"; do
   [ -x "$f" ] || { echo "backfill: missing or non-executable: $f" >&2; exit 1; }
@@ -131,7 +169,7 @@ while IFS= read -r _trepo || [ -n "$_trepo" ]; do
   fi
 done < "$ENUM_TARGETS"
 
-echo "backfill: $($DRY_RUN && echo 'DRY-RUN (no mutations)' || echo 'EXECUTE (will resolve)') — enumerating unresolved threads" >&2
+echo "backfill: mode=$MODE — $($DRY_RUN && echo 'DRY-RUN (no mutations)' || echo 'EXECUTE (will resolve)') — enumerating unresolved threads" >&2
 
 FINDINGS="$WORK/findings.ndjson"
 ENUM_STDERR="$WORK/enumerate.stderr"
@@ -178,24 +216,29 @@ ANY_FAILURE=0
 # (threads left unresolved) — for a backfill, 3 is expected and NOT a failure.
 while IFS=$'\t' read -r repo pr; do
   [ -z "$repo" ] && continue
+  # verified-propagation self-matches on the canonical repo (compares its own
+  # source to itself → false "propagation verified"). Skip it in that mode;
+  # --resolve-actioned still drains the canonical repo's actioned threads.
+  if [ "$MODE" = "resolve-verified-propagation" ] && [ "$repo" = "$CANONICAL_REPO" ]; then
+    echo "  $repo#$pr: SKIP (verified-propagation N/A on the canonical repo $CANONICAL_REPO)" >&2
+    continue
+  fi
   if [ "$MAX" -gt 0 ] && [ "$PRS_DONE" -ge "$MAX" ]; then
     echo "backfill: BACKFILL_MAX_PRS=$MAX reached; stopping (remaining PRs not processed)" >&2
     break
   fi
   PRS_DONE=$((PRS_DONE + 1))
-  # Mode is INTENTIONALLY --resolve-actioned for every target, INCLUDING the
-  # canonical repo (nathanjohnpayne/mergepath, present in target-repos.txt):
-  # actioned resolution — a fix commit touching the anchored file, or a
-  # rebuttal — is legitimate on the canonical source itself. Do NOT switch
-  # this backfill to --resolve-verified-propagation across the default target
-  # list: that mode byte-compares a CONSUMER's content against the canonical
-  # source, so on the canonical repo the two sides are ONE file and every
-  # thread self-matches. resolve-pr-threads.sh already fails those closed via
-  # its canonical-repo self-guard (skipped as not-propagation-routed), so this
-  # is fail-safe, not a correctness hole — but the pass would be wasted. If a
-  # verified-propagation backfill mode is ever added here, it MUST exclude the
-  # canonical repo from ITS target list (the actioned mode keeps draining it).
-  args=("$pr" --repo "$repo" --resolve-actioned)
+  # The DEFAULT mode (--resolve-actioned) legitimately drains EVERY target,
+  # INCLUDING the canonical repo (nathanjohnpayne/mergepath, present in
+  # target-repos.txt): an actioned resolution — a fix commit touching the
+  # anchored file, or a rebuttal — is valid on the canonical source itself.
+  # --mode resolve-verified-propagation is the exception (#664): it
+  # byte-compares a CONSUMER's content against the canonical source, so on the
+  # canonical repo the two sides are ONE file and every thread self-matches.
+  # That mode SKIPS the canonical repo above (CANONICAL_REPO), and
+  # resolve-pr-threads.sh ALSO self-guards it (#664, skipped as
+  # not-propagation-routed) — fail-safe on both layers.
+  args=("$pr" --repo "$repo" "--$MODE")
   $DRY_RUN && args+=(--dry-run)
   set +e
   out=$("$RESOLVE" "${args[@]}" 2>&1)

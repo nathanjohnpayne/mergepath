@@ -284,6 +284,61 @@ else
   fail=$((fail+1)); echo "FAIL: no-newline targets final entry should not be dropped (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
+# ── Test 13: --mode resolve-verified-propagation delegates the verified mode
+#    to the resolver (never --resolve-actioned) — the Track-C drain path.
+run_bf ok --mode resolve-verified-propagation
+if [ "$RC" -eq 0 ] \
+   && [ "$(grep -c 'RESOLVE_ARGV:.*--resolve-verified-propagation' "$STUB_RESOLVE_LOG")" -eq 2 ] \
+   && ! grep -q -- '--resolve-actioned' "$STUB_RESOLVE_LOG"; then
+  pass=$((pass+1)); echo "PASS: --mode resolve-verified-propagation delegates the verified mode"
+else
+  fail=$((fail+1)); echo "FAIL: verified-propagation mode not delegated (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 14: an invalid --mode is rejected up front (exit 1), no resolver call.
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --mode bogus --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 1 ] && grep -qi 'mode must be' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: invalid --mode rejected up front (exit 1, no resolver call)"
+else
+  fail=$((fail+1)); echo "FAIL: invalid --mode should exit 1 (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 15: --mode resolve-verified-propagation SKIPS the canonical repo — on
+#    the hub, verified-propagation compares a file to itself (self-match → false
+#    "propagation verified"). Override the canonical slug to the fixture repo via
+#    MERGEPATH_CANONICAL_REPO; every owner/alpha PR is skipped, no resolver call,
+#    clean exit.
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=owner/alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --mode resolve-verified-propagation --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 0 ] && grep -qi 'SKIP (verified-propagation N/A' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: verified-propagation skips the canonical repo (no self-match resolve)"
+else
+  fail=$((fail+1)); echo "FAIL: canonical repo should be skipped in verified mode (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 16: the exclusion is MODE-SCOPED — under the default --resolve-actioned
+#    the same canonical repo IS drained (resolver called), proving verified-mode's
+#    skip does not leak into the actioned drain.
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=owner/alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 0 ] \
+   && [ "$(grep -c 'RESOLVE_ARGV:.*--resolve-actioned' "$STUB_RESOLVE_LOG")" -eq 2 ] \
+   && ! grep -qi 'SKIP (verified-propagation' <<<"$OUT"; then
+  pass=$((pass+1)); echo "PASS: canonical-repo exclusion is mode-scoped (actioned drain unaffected)"
+else
+  fail=$((fail+1)); echo "FAIL: actioned mode should still drain the canonical repo (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_backfill_unresolved_feedback: PASS ($pass tests)"; exit 0
