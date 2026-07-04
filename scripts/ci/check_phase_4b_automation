@@ -61,6 +61,29 @@ else
   echo "WARN: jq not available — skipping schema JSON validation"
 fi
 
+# STRICT-MODE CONTRACT (#632): verdict.schema.json is fed to `codex exec
+# --output-schema`, and OpenAI's structured-output validator rejects
+# (invalid_json_schema) any object with `additionalProperties: false` whose
+# `required` array is not EXACTLY the set of keys in `properties`. This guards
+# the whole schema tree (top-level + usage + findings.items) so a key added to
+# one but not the other fails here, not at the first live Phase 4b run — the
+# gap that shipped a `cli_version` in `required` but not `properties`.
+if command -v jq >/dev/null 2>&1 \
+   && [ -f "$REPO_ROOT/scripts/phase-4b/verdict.schema.json" ]; then
+  strict_mismatch="$(jq -r '
+    [ .. | objects
+      | select(.additionalProperties == false and has("properties"))
+      | { req: ((.required // []) | sort), props: (.properties | keys | sort) }
+      | select(.req != .props)
+      | "required=\(.req) properties=\(.props)" ]
+    | .[]' "$REPO_ROOT/scripts/phase-4b/verdict.schema.json" 2>/dev/null)"
+  if [ -n "$strict_mismatch" ]; then
+    echo "FAIL: verdict.schema.json violates OpenAI strict mode (required must equal properties keys):"
+    printf '  %s\n' "$strict_mismatch"
+    FAILED=1
+  fi
+fi
+
 # Optional static analysis: run shellcheck when present (CI has it).
 # --severity=warning fails on warnings + errors but tolerates info/style
 # (e.g. SC1091 unfollowed `source`, the intentional &&/|| test idiom). No

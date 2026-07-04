@@ -89,6 +89,10 @@
           "minLength": 1
         }
       }
+    },
+    "cli_version": {
+      "description": "The reviewer CLI's own `--version` string (e.g. `codex-cli 0.137.0`), populated post-run by the adapter from the CLI's real `--version` output — never guessed. Null means the version was not captured. Required-but-nullable per the strict-mode contract documented on `usage` above (#622/#632): OpenAI's structured-output validator requires `required` to list every key in `properties`, so this key MUST appear here as well as in `required`; the Codex prompt pins it to null and the adapter overwrites it post-run.",
+      "type": ["string", "null"]
     }
   }
 }
