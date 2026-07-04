@@ -716,6 +716,44 @@ phase_4b_automation:
     # claude_price_key: anthropic.claude-sonnet-4.6.standard
 
 # ---------------------------------------------------------------------------
+# Propagation-wave audit (#662)
+# ---------------------------------------------------------------------------
+# Posture for scripts/wave-audit.sh: ONE scoped automated Phase 4b review per
+# --sync-all wave, run against the canary sync PR over the canonical range
+# since the last wave-audit-pass/<sha> watermark tag, instead of per-consumer
+# bot review of N verbatim mirrors. Fan-out mirrors then merge on consumer CI
+# + propagation-lane byte-verification only (open them with
+# `sync-to-downstream.sh --coderabbit-ignore`, post no @codex trigger).
+#
+# Read by scripts/wave-audit.sh only, exported to the orchestrator as
+# P4B_CODEX_EFFORT / P4B_ADAPTER_TIMEOUT_SECONDS / P4B_DIFF_MAX_BYTES — the
+# external env wins over the phase_4b_automation gating-lane values for that
+# run, so the audit posture never touches the gating lane. This block and the
+# script are hub-side only: deliberately NOT in .mergepath-sync.yml.
+#
+# Defaults when a field (or the whole block) is absent are exactly the values
+# below. Invalid values fail closed (wave-audit exit 3).
+propagation_audit:
+  # Reviewer effort for the audit run. Measured (#662): xhigh DNFs the 900s
+  # adapter cap on a catch-up-sized wave diff (745 KB) and burns the tokens
+  # anyway; high cleared the same diff in 231s with a full verdict.
+  # Steady-state wave ranges (~70 KB) fit any setting trivially.
+  effort: high
+  # Adapter timeout for the audit run. high fits 900s with ~4x margin on the
+  # worst observed wave diff; raise toward 3600 only if a catch-up wave at a
+  # higher effort starts timing out.
+  timeout_seconds: 900
+  # Review-diff byte budget for the audit run. Catch-up waves exceed the
+  # 600000 gating-lane default; steady-state ranges sit far below it.
+  diff_max_bytes: 800000
+  # Manifest path prefixes excluded from the AUDIT diff (risk-weighting).
+  # Excluded content is still delivered and still CI-validated on every
+  # consumer; it is only out of audit scope.
+  scope_exclude_prefixes:
+    - tests/
+    - docs/
+
+# ---------------------------------------------------------------------------
 # Auto-clear blocking labels (#195/#197)
 # ---------------------------------------------------------------------------
 # Knobs for .github/workflows/auto-clear-blocking-labels.yml. The

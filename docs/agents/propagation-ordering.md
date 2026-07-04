@@ -49,9 +49,53 @@ Pick the canary by the **dominant risk of this change**:
   (`nathanpaynedotcom` / `overridebroadway`), which then doubles as canary +
   first wave.
 
-Only fan out (`--sync-all`) once the canary's `lint` is green; the remaining
+Only fan out (`--sync-all`) once the canary's `lint` is green **and the wave
+audit below has cleared (or is recorded as unavailable)**; the remaining
 consumers re-use the cleared invariant instead of each re-discovering the
 problem.
+
+## Wave audit (one scoped review per wave, #662)
+
+A verified mirror carries nothing unreviewed: every line already passed
+review on its upstream mergepath PR, and the propagation lane byte-verifies
+the mirror. So the wave's external review runs **once**, against the canary
+PR, scoped to the canonical range that has not been audited before — instead
+of CodeRabbit + Codex re-reading the same bytes on all 8 consumers:
+
+```bash
+# After the canary PR is open and lane-verified:
+scripts/wave-audit.sh <canary-pr> --repo <owner>/<canary-repo>
+# First audited wave only (no watermark yet): add --base <last-reviewed-sha>
+```
+
+The helper resolves base = the newest `wave-audit-pass/<sha>` watermark tag
+that is an ancestor of the wave head, head = the mergepath sha in the canary
+title, builds a curated diff over manifest paths (minus
+`propagation_audit.scope_exclude_prefixes` — default `tests/`, `docs/`), and
+dispatches `scripts/phase-4b-review.sh --diff-file` under the
+`propagation_audit:` posture in `.github/review-policy.yml`. The curated diff
+is load-bearing, not just cheaper: `gh pr diff` refuses wave-sized sync PRs
+outright (HTTP 406 above 20k lines).
+
+Verdict contract — same golden rule as below, fix at the SOURCE:
+
+- **APPROVED (exit 0):** the watermark advances (tag pushed to origin). Fan
+  out with `sync-to-downstream.sh --sync-all --coderabbit-ignore` and post
+  **no** `@codex review` on the mirrors — fan-out PRs merge on consumer CI +
+  the lane byte-verification + the required reviewer approval only.
+- **CHANGES_REQUESTED (exit 1):** fix at the mergepath source, re-cut the
+  wave (`--recreate-existing`), re-run the audit on the fresh canary. The
+  superseded canary takes its blocking review with it — no dismissal
+  choreography. (This is the #651/#652 → #653 → re-cut cycle, minus the
+  manual per-consumer triage.)
+- **Reviewer unavailable (exit 4/5 — quota, timeout, automation off):** no
+  watermark. The wave MAY proceed on CI + lane (fail-open, record it in the
+  wave tracker); the un-audited range chains into the next wave audit
+  automatically, because the watermark only advances on a posted APPROVED
+  (or a scope-empty range).
+
+The canary keeps the full advisory CodeRabbit pass — open it **without**
+`--coderabbit-ignore`.
 
 ## Procedure when changes are required
 

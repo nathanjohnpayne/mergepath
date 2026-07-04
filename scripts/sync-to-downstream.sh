@@ -40,8 +40,10 @@
 #   scripts/sync-to-downstream.sh --audit [--use-local-tree] [--repos r1,r2] [--paths glob]
 #   scripts/sync-to-downstream.sh <commit-ish> [--dry-run] [--repos r1,r2] [--paths glob]
 #                                 [--no-pr] [--skip-existing|--recreate-existing] [--verbose]
+#                                 [--coderabbit-ignore]
 #   scripts/sync-to-downstream.sh --sync-all [--dry-run] [--repos r1,r2] [--paths glob]
 #                                 [--no-pr] [--skip-existing|--recreate-existing] [--verbose]
+#                                 [--coderabbit-ignore]
 #   scripts/sync-to-downstream.sh --help
 #   scripts/sync-to-downstream.sh --version
 #
@@ -92,6 +94,13 @@
 #                        the pushed branches before deciding whether to
 #                        open PRs (manually or by re-running without
 #                        --no-pr).
+#   --coderabbit-ignore  Sync mode only. Stamp `@coderabbitai ignore` into
+#                        the generated PR bodies so CodeRabbit skips its
+#                        auto-review on these mirrors (#662). Fan-out use
+#                        only: open the wave CANARY without this flag so one
+#                        PR per wave keeps the full advisory review, then
+#                        fan out with it. Also removes CodeRabbit rate-limit
+#                        stalls from the mirrors' auto-merge path.
 #   --skip-existing      Sync mode only. Explicit form of the default
 #                        behavior: skip any consumer where a PR already
 #                        exists for the commit oid. Mutually exclusive
@@ -1862,7 +1871,7 @@ EOF
   pr_url=$(sync_author_gh pr create --repo "$consumer_repo" --base main --head "$branch" \
     --title "sync: ${commit_subject} (mergepath@${short_sha})" \
     --body "$(cat <<EOF
-Auto-propagated from [mergepath@${short_sha}](https://github.com/nathanjohnpayne/mergepath/commit/${sha}) by \`scripts/sync-to-downstream.sh\` (v${SCRIPT_VERSION}, see [#168](https://github.com/nathanjohnpayne/mergepath/issues/168)).
+Auto-propagated from [mergepath@${short_sha}](https://github.com/nathanjohnpayne/mergepath/commit/${sha}) by \`scripts/sync-to-downstream.sh\` (v${SCRIPT_VERSION}, see [#168](https://github.com/nathanjohnpayne/mergepath/issues/168)).$(sync_coderabbit_ignore_block)
 
 ## Files synced
 ${target_lines}
@@ -1887,6 +1896,16 @@ EOF
     return 1
   }
   printf "  ✓ %s — opened %s\n" "$consumer_name" "$pr_url"
+}
+
+# sync_coderabbit_ignore_block — the CodeRabbit auto-review opt-out directive
+# for fan-out mirror PR bodies when --coderabbit-ignore was given (#662).
+# CodeRabbit reads the directive from the PR description and skips its
+# auto-review for that PR, which also removes its rate-limit stall from the
+# mirrors' auto-merge path. Empty (and body-neutral) when the flag is off.
+sync_coderabbit_ignore_block() {
+  [ "${SYNC_CODERABBIT_IGNORE:-0}" = "1" ] || return 0
+  printf '\n\n@coderabbitai ignore'
 }
 
 # --- sync-all live PR-open --------------------------------------------------
@@ -2287,7 +2306,7 @@ EOF
     --body "$(cat <<EOF
 Bulk sync to [mergepath@${short_sha}](https://github.com/nathanjohnpayne/mergepath/commit/${sha}) — verbatim canonical/kit mirror per \`.mergepath-sync.yml\`.
 
-Opened by \`scripts/sync-to-downstream.sh --sync-all\` (v${SCRIPT_VERSION}, see [#168](https://github.com/nathanjohnpayne/mergepath/issues/168)). Unlike a per-commit propagation PR, this replays the **current HEAD state of every canonical + kit path** so a consumer that has fallen behind reaches a clean steady state in one shot.
+Opened by \`scripts/sync-to-downstream.sh --sync-all\` (v${SCRIPT_VERSION}, see [#168](https://github.com/nathanjohnpayne/mergepath/issues/168)). Unlike a per-commit propagation PR, this replays the **current HEAD state of every canonical + kit path** so a consumer that has fallen behind reaches a clean steady state in one shot.$(sync_coderabbit_ignore_block)
 
 ## Canonical paths synced
 ${canonical_lines}
@@ -2623,6 +2642,7 @@ SAW_SYNC_ALL=0
 SAW_COMMIT_ISH=0
 SYNC_DRY_RUN=0
 SYNC_NO_PR=0
+SYNC_CODERABBIT_IGNORE=0
 SYNC_SKIP_EXISTING=0
 SYNC_RECREATE_EXISTING=0
 SYNC_VERBOSE=0
@@ -2680,6 +2700,13 @@ while [ $# -gt 0 ]; do
       # (or open PRs against manually) before committing to PR
       # creation across N consumers.
       SYNC_NO_PR=1
+      shift
+      ;;
+    --coderabbit-ignore)
+      # Stamp the CodeRabbit auto-review opt-out into generated PR bodies
+      # (#662). Fan-out mirrors only — the canary is opened WITHOUT this
+      # flag so one PR per wave keeps the full advisory review.
+      SYNC_CODERABBIT_IGNORE=1
       shift
       ;;
     --skip-existing)
