@@ -89,6 +89,10 @@
           "minLength": 1
         }
       }
+    },
+    "cli_version": {
+      "description": "Reviewer CLI version string (#622). Required-but-NULLABLE per the #632 strict-mode contract (OpenAI's structured-output validator rejects a `required` key absent from `properties`): the model is prompted to emit null; the adapter overwrites it post-hoc with the reviewer CLI's own `--version` output — never a model-guessed value.",
+      "type": ["string", "null"]
     }
   }
 }
