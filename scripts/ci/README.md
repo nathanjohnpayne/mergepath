@@ -26,6 +26,7 @@ Local scripts:
 - `check_eslint_config_policy` — runs `tests/test_eslint_policy_check.sh` (unit tests for the policy check).
 - `check_sweep_unresolved_feedback` — runs unit tests for the #236 weekly feedback sweep pipeline (`scripts/sweep-unresolved-feedback/enumerate.sh`, `render.sh`). PATH-shims `gh` against synthetic fixtures; hermetic.
 - `check_disagreement_detector` — runs `tests/test_disagreement_detector.sh` against fixtures under `scripts/ci/fixtures/disagreement-detector/`. Exercises `scripts/disagreement-detector.cjs`, the decision function extracted from `.github/workflows/agent-review.yml`'s `detect-disagreement` job so the workflow and the test share one implementation. Asserts the workflow still `require()`s the module. See #259.
+- `check_agent_review_triage_defers` — structural guard that `.github/workflows/agent-review.yml`'s `triage` job DEFERS the `needs-external-review` labeling decision to `pr-review-policy.yml`'s byte-verifying propagation lane on `mergepath-sync/` branches, instead of re-adding the label the lane just removed. Asserts the `AUTHOR_IDENTITY` wiring, the `PROPAGATION-LANE-DEFER (#656)` marker, the branch-prefix recognition, and that the label-add is guarded by the defer. Anti-regression canary for the tadlockpsychiatry#93 flap; reads only the propagated workflow (no yq, no network). See #656.
 
 Inline in `repo_lint.yml` (no local script):
 

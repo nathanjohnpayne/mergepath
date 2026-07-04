@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# check_agent_review_triage_defers — structural guard for #656.
+#
+# `.github/workflows/agent-review.yml`'s `triage` job recomputes
+# `needsExternal = totalChanges >= threshold || touchesProtected` on
+# every synchronize and applies the `needs-external-review` label. It
+# is a second, LANE-BLIND implementation of the labeling decision that
+# `pr-review-policy.yml`'s External Review Check owns — the latter
+# BYTE-VERIFIES a propagation (sync) PR against mergepath@<sha> and
+# exempts a faithful mirror (removing the label). Before #656 the two
+# raced on every synchronize and triage re-added the label the lane had
+# just removed, stranding approved, byte-verified sync PRs on Label Gate
+# (observed on tadlockpsychiatry#93 — re-labeled 51 min after approval).
+#
+# The fix makes triage DEFER the sync-branch labeling decision to the
+# lane. This guard is the anti-regression canary: it fails first if the
+# defer is removed or re-inlined away, before the flap can silently
+# return. The decision predicate is trivial (branch prefix + author
+# identity), so — unlike the disagreement-detector extraction (#259) —
+# a structural assertion is proportionate; there is no separate module
+# or fixture suite to run.
+#
+# Consumer-safe: reads only the (propagated) agent-review.yml, no yq,
+# no network. Travels with the fix in the same sync wave (both are
+# manifest-canonical / kit paths), so a consumer never has this guard
+# without the fixed workflow.
+#
+# Issue: #656. Cross-reference: pr-review-policy.yml § Propagation PR
+# review lane; scripts/merge-clearance-gate.sh lane_verified() (#620).
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+WORKFLOW=".github/workflows/agent-review.yml"
+
+if [ ! -f "$WORKFLOW" ]; then
+  echo "check_agent_review_triage_defers: missing required path: $WORKFLOW" >&2
+  exit 1
+fi
+
+fail() {
+  echo "check_agent_review_triage_defers: $1" >&2
+  echo "  The triage job must DEFER needs-external-review labeling to" >&2
+  echo "  pr-review-policy.yml's byte-verifying lane on propagation" >&2
+  echo "  branches (see #656). Re-inlining the unconditional label-add" >&2
+  echo "  reintroduces the flap that stranded tadlockpsychiatry#93." >&2
+  exit 1
+}
+
+# 1. The triage step wires the configured author identity, needed to
+#    fingerprint sync PRs by author (not just branch name).
+# shellcheck disable=SC2016  # grepping for the LITERAL ${{ ... }} Actions
+# expression — single quotes are intentional (no shell expansion wanted).
+grep -qF 'AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}' "$WORKFLOW" \
+  || fail "$WORKFLOW no longer wires AUTHOR_IDENTITY into the triage step"
+
+# 2. The defer marker + rationale is present (traceability + the anchor
+#    every other assertion hangs off).
+grep -qF 'PROPAGATION-LANE-DEFER (#656)' "$WORKFLOW" \
+  || fail "$WORKFLOW is missing the PROPAGATION-LANE-DEFER (#656) marker"
+
+# 3. Recognition mirrors the lane's branch fingerprint (SYNC_BRANCH_PREFIX
+#    in scripts/sync-to-downstream.sh).
+grep -qF "startsWith('mergepath-sync/')" "$WORKFLOW" \
+  || fail "$WORKFLOW no longer recognizes propagation branches by the mergepath-sync/ prefix"
+
+# 4. The needs-external-review add is GUARDED by the defer — i.e. the
+#    label is applied only when the PR does NOT defer to the lane. This
+#    is the actual teeth: it fails if the guard is dropped and the
+#    unconditional add returns.
+grep -qF 'needsExternal && defersToLane' "$WORKFLOW" \
+  || fail "$WORKFLOW no longer guards the needs-external-review add with the propagation-lane defer"
+
+echo "check_agent_review_triage_defers: PASS"

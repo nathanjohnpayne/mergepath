@@ -148,6 +148,10 @@ jobs:
         env:
           THRESHOLD: ${{ needs.load-config.outputs.threshold }}
           PROTECTED_PATHS: ${{ needs.load-config.outputs.paths }}
+          # #656: the propagation-lane defer below needs the configured author
+          # identity to fingerprint sync PRs (mirrors the `assign` job's use of
+          # the same load-config output).
+          AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}
         with:
           github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
@@ -194,7 +198,41 @@ jobs:
             // Use >= to match REVIEW_POLICY.md definition
             const needsExternal = totalChanges >= threshold || touchesProtected;
 
-            if (needsExternal) {
+            // PROPAGATION-LANE-DEFER (#656): a sync PR opened by
+            // scripts/sync-to-downstream.sh is authoritatively labeled by
+            // pr-review-policy.yml's External Review Check, which BYTE-VERIFIES
+            // the mirror against mergepath@<sha> and either exempts it (removes
+            // needs-external-review) or, on divergence, applies the label. This
+            // triage job runs the same intrinsic threshold/protected-paths
+            // computation but WITHOUT that byte-level verification or the lane
+            // exemption — so on a verified faithful mirror it re-adds the label
+            // the lane just removed, racing the lane on the same synchronize and
+            // winning (observed on tadlockpsychiatry#93: approved + lane-verified,
+            // re-labeled 51 min later and stuck on Label Gate).
+            //
+            // Defer: for a propagation-branch PR authored by the author identity,
+            // leave the needs-external-review decision entirely to the lane. This
+            // grants NO exemption — the lane's byte-verify stays the sole teeth:
+            // a faithful mirror is exempted by the lane; a diverged sync PR is
+            // labeled by the lane's own pr-review-policy.yml path and still
+            // blocked by merge-clearance-gate.sh. Recognition mirrors the lane's
+            // branch/author fingerprint (SYNC_BRANCH_PREFIX in
+            // scripts/sync-to-downstream.sh + author_identity), so it only ROUTES
+            // the decision and a loose match can never weaken review — at worst
+            // pr-review-policy.yml labels it. Race-free: triage never adds the
+            // label for these branches, so there is nothing for the lane to undo.
+            const authorIdentity = process.env.AUTHOR_IDENTITY || 'nathanjohnpayne';
+            const defersToLane =
+              ((pr.head && pr.head.ref) || '').startsWith('mergepath-sync/') &&
+              (pr.user && pr.user.login === authorIdentity);
+
+            if (needsExternal && defersToLane) {
+              console.log(
+                `Propagation-branch PR (head=${pr.head.ref}, author=${pr.user.login}): ` +
+                `deferring needs-external-review to pr-review-policy.yml's byte-verifying ` +
+                `lane; triage will not apply the label.`
+              );
+            } else if (needsExternal) {
               await github.rest.issues.addLabels({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
