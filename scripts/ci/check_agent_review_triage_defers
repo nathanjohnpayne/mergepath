@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# check_agent_review_triage_defers — structural guard for #656.
+#
+# `.github/workflows/agent-review.yml`'s `triage` job and
+# `pr-review-policy.yml`'s External Review Check both decide
+# `needs-external-review`, but only the latter BYTE-VERIFIES a
+# `mergepath-sync/` PR against mergepath@<sha> and exempts a faithful
+# mirror (removing the label + posting the head-pinned
+# `mergepath-propagation-lane verified-head=<sha>` marker as
+# github-actions[bot]). Pre-#656, triage never consulted that verdict and
+# re-added the label on any later event, stranding approved, byte-verified
+# sync PRs on Label Gate (tadlockpsychiatry#93: lane-cleared 14:55, triage
+# re-added 15:46, stuck until a human intervened).
+#
+# The fix keeps triage FAIL-CLOSED (every unverified sync head is still
+# labeled — fresh push, diverged hand-edit, reopened-with-new-head) and
+# skips the add ONLY when a github-actions[bot] comment pins the marker to
+# the current head — mirroring scripts/merge-clearance-gate.sh
+# lane_verified()'s matching semantics and trust model (#620). The naive
+# alternative (skip by branch name) was rejected as fail-OPEN: Codex P1 on
+# the closed first-attempt PR showed a diverged sync PR could ride an
+# unlabeled window to auto-merge on consumers where
+# codex.external_review_gate defaults off.
+#
+# This guard is the anti-regression canary: it fails first if the
+# marker-gated skip is removed, de-scoped to branch-name-only, or drifts
+# out of lockstep with the marker string the lane posts and the merge gate
+# greps. The decision predicate is small, so — unlike the
+# disagreement-detector extraction (#259) — structural assertions are
+# proportionate; there is no separate module or fixture suite to run.
+#
+# Consumer-safe: reads only propagated files, no yq, no network. Travels
+# with the fix in the same sync wave (all three asserted files are
+# manifest-canonical), so a consumer never has this guard without the
+# fixed workflow.
+#
+# Issue: #656. Cross-reference: pr-review-policy.yml § Propagation PR
+# review lane; scripts/merge-clearance-gate.sh lane_verified() (#620).
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+WORKFLOW=".github/workflows/agent-review.yml"
+LANE_WORKFLOW=".github/workflows/pr-review-policy.yml"
+MERGE_GATE="scripts/merge-clearance-gate.sh"
+MARKER_LITERAL="mergepath-propagation-lane verified-head="
+
+for f in "$WORKFLOW" "$LANE_WORKFLOW" "$MERGE_GATE"; do
+  if [ ! -f "$f" ]; then
+    echo "check_agent_review_triage_defers: missing required path: $f" >&2
+    exit 1
+  fi
+done
+
+fail() {
+  echo "check_agent_review_triage_defers: $1" >&2
+  echo "  The triage job must skip its needs-external-review add ONLY for" >&2
+  echo "  a head the propagation lane has byte-verified (github-actions[bot]" >&2
+  echo "  marker pinned to the current head), and stay fail-closed for" >&2
+  echo "  every other sync head (see #656). Dropping the marker gate" >&2
+  echo "  reintroduces the tadlockpsychiatry#93 flap; widening the skip" >&2
+  echo "  beyond the marker reintroduces the fail-open Codex P1 that" >&2
+  echo "  closed the first-attempt PR." >&2
+  exit 1
+}
+
+# 1. The defer marker + rationale anchor is present.
+grep -qF 'PROPAGATION-LANE-DEFER (#656)' "$WORKFLOW" \
+  || fail "$WORKFLOW is missing the PROPAGATION-LANE-DEFER (#656) anchor"
+
+# 2. Three-file marker lockstep: triage greps for the SAME literal the
+#    lane posts and lane_verified() matches. A drift in any copy silently
+#    breaks either the exemption (triage/merge-gate miss real markers) or
+#    the flap fix.
+for f in "$WORKFLOW" "$LANE_WORKFLOW" "$MERGE_GATE"; do
+  grep -qF "$MARKER_LITERAL" "$f" \
+    || fail "$f no longer carries the shared marker literal '$MARKER_LITERAL' (three-file lockstep broken)"
+done
+
+# 3. The skip is HEAD-PINNED: triage must interpolate the event head SHA
+#    into the marker it looks for, not accept any stale marker.
+# shellcheck disable=SC2016  # grepping for the LITERAL JS template
+# `${pr.head.sha}` — single quotes are intentional (no shell expansion).
+grep -qF 'verified-head=${pr.head.sha}' "$WORKFLOW" \
+  || fail "$WORKFLOW no longer pins the marker lookup to pr.head.sha (a stale-head marker must not skip labeling)"
+
+# 4. The skip is TRUST-SCOPED: only github-actions[bot]-authored comments
+#    count, mirroring lane_verified(). A PR author posting the marker text
+#    themselves must not suppress labeling.
+grep -qF "c.user.login === 'github-actions[bot]'" "$WORKFLOW" \
+  || fail "$WORKFLOW no longer scopes the marker to github-actions[bot]-authored comments"
+
+# 5. FAIL-CLOSED on an indeterminate read: the catch path must reset the
+#    verified flag so an API error labels rather than skips.
+grep -A6 'catch (e)' "$WORKFLOW" | grep -qF 'laneVerifiedHead = false' \
+  || fail "$WORKFLOW no longer forces laneVerifiedHead=false on a failed marker read (must label fail-closed)"
+
+# 6. The label add still exists and the skip is conditioned on the
+#    verified flag — i.e. the guard shape is `needsExternal &&
+#    laneVerifiedHead` (skip) vs `else if (needsExternal)` (add). This is
+#    the actual teeth against both regressions: dropping the skip (flap
+#    returns) or dropping the add (fail-open returns).
+grep -qF 'needsExternal && laneVerifiedHead' "$WORKFLOW" \
+  || fail "$WORKFLOW no longer gates the skip on the lane-verified marker"
+grep -qF 'else if (needsExternal)' "$WORKFLOW" \
+  || fail "$WORKFLOW no longer retains the fail-closed needs-external-review add"
+
+echo "check_agent_review_triage_defers: PASS"
