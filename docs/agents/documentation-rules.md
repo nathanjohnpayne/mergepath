@@ -46,9 +46,11 @@ Edit the canonical source and let the sync re-materialize it.
 
 - `docs/projects/<project>/prds/**` --- generated PRD mirrors
   (`sync_direction: central-to-repo`, header `do_not_edit: true`). Edit
-  the canonical PRD in `nathanjohnpayne/docs/projects/<project>/prds/`.
-  The mirrored paths are declared in `.mergepath-project-docs.yml`;
-  `scripts/project-doc-sync.sh` materializes and `--audit`s them.
+  the canonical PRD in the `nathanjohnpayne/docs` repo at its `source:`
+  path --- `projects/<project>/prds/<project>.md` (note: no `docs/`
+  prefix on the central side), declared alongside the `mirror:` in
+  `.mergepath-project-docs.yml`. `scripts/project-doc-sync.sh`
+  materializes and `--audit`s these mirrors.
 - Template-propagated / canonical surfaces declared in
   `.mergepath-sync.yml` (scripts, workflows, and any propagated docs). On
   a consumer these are verbatim mirrors of Mergepath --- fix at the
