@@ -381,14 +381,17 @@ codex:
   # that invoked the review; in the REST reactions payload that content
   # is `eyes`. `codex-review-request.sh` polls the just-posted trigger
   # comment for this acknowledgment before entering the normal review
-  # wait. 60s is intentionally generous for a short ACK path and avoids
-  # tight duplicate triggers; terminal reviews may still take much
-  # longer and remain governed by `review_timeout_seconds`.
+  # wait. 30s is set from the measured ack latency (#623): healthy 👀 acks
+  # land in 6–13s (p99 13s, n=14 over 2026-05→07), so 30s is ~2.3× p99 —
+  # no misfire risk on a healthy ack — while halving dropped/rate-limited-
+  # trigger failover (one repost + a second wait) from ≤120s to ≤60s.
+  # Terminal reviews may still take much longer and remain governed by
+  # `review_timeout_seconds`.
   #
   # Eyes is ACKNOWLEDGMENT ONLY. It is never treated as clearance and it
   # never populates the output JSON's `reaction` field, which remains
   # reserved for Codex's +1 / 👍 no-findings signal.
-  ack_wait_seconds: 60
+  ack_wait_seconds: 30
 
   # Maximum number of bounded re-posts when the trigger comment does not
   # receive the `eyes` acknowledgment. After this cap, the script keeps
