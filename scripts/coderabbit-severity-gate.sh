@@ -129,8 +129,8 @@ coderabbit_severity_gate_field() {
     in_sg && /^[[:space:]]{0,3}[^[:space:]#]/ { in_sg=0 }
     in_sg && $1 == field":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^"/, "", $0)
-      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      gsub(/^["\047]/, "", $0)
+      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
       gsub(/[[:space:]]*#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)
       print
@@ -149,8 +149,8 @@ coderabbit_field() {
     in_block && /^[^[:space:]#]/ {in_block=0}
     in_block && $1 == field":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^"/, "", $0)
-      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      gsub(/^["\047]/, "", $0)
+      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
       gsub(/[[:space:]]*#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)
       print
@@ -278,8 +278,8 @@ coderabbit_yml_profile() {
     in_rev && /^[^[:space:]#]/ { in_rev=0 }
     in_rev && $1 == "profile:" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^"/, "", $0)
-      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      gsub(/^["\047]/, "", $0)
+      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
       gsub(/[[:space:]]*#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)
       print

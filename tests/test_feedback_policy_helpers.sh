@@ -186,6 +186,12 @@ if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "codex_tier_of: markerless is rc0
 rc=0; out=$(coderabbit_tier_of 'plain comment, no CodeRabbit badge here') || rc=$?
 if [ "$rc" -eq 0 ] && [ -z "$out" ]; then pass "coderabbit_tier_of: markerless is rc0+empty under set -e"; else fail "coderabbit_tier_of: markerless rc=$rc out=[$out]"; fi
 
+# #652: a body larger than the pipe buffer must not SIGPIPE-abort the
+# classifier under set -e (the old `printf | head -c 600` exited 141 when
+# head closed the pipe early).
+rc=0; big=$(head -c 100000 /dev/zero | tr '\0' 'x'); out=$(coderabbit_tier_of "🟠 Major $big") || rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "p1" ]; then pass "coderabbit_tier_of: large body classifies without SIGPIPE abort (#652)"; else fail "coderabbit_tier_of: large body rc=$rc out=[$out]"; fi
+
 # ---------------------------------------------------------------------------
 echo
 echo "feedback-policy-helpers: $PASS passed, $FAIL failed"
