@@ -708,6 +708,17 @@ TEMPLATE_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ESM_TEMPLATE="$TEMPLATE_REPO_ROOT/examples/eslint.config.js"
 CJS_TEMPLATE="$TEMPLATE_REPO_ROOT/examples/eslint.config.cjs.js"
 
+# A consumer checkout carries only its own profile's example template
+# (CJS consumers get examples/eslint.config.cjs.js; ESM consumers get
+# examples/eslint.config.js). The ESM/CJS parity checks below (13-14) require
+# BOTH files and are a mergepath-canonical concern, so skip them cleanly when
+# both are not present rather than hard-failing on the absent file under
+# `set -e` (this test breaks `check_template_substitution` on every
+# single-profile consumer during --sync-all otherwise).
+if [ ! -f "$ESM_TEMPLATE" ] || [ ! -f "$CJS_TEMPLATE" ]; then
+  echo "SKIP: 13-14 ESM/CJS template parity (this checkout lacks both examples/eslint.config.{js,cjs.js})"
+else
+
 # Quick parse-level guard: marker counts must match within each file AND
 # between the two files. This is the cheapest check that catches the
 # orphan-`<<<` bug class without needing a renderer.
@@ -797,6 +808,7 @@ for tpl in "$ESM_TEMPLATE" "$CJS_TEMPLATE"; do
     PASS=$((PASS + 1))
   fi
 done
+fi  # end 13-14 ESM/CJS parity presence guard
 
 # ---------------------------------------------------------------------------
 # 15. Strict-mode conditional existence-check regression (#555)
