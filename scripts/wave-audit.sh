@@ -194,8 +194,16 @@ EXCLUDES="$(audit_list scope_exclude_prefixes)"
 # commits the lane never verified (#663 round-3 P1). The branch is the
 # source of truth; a parseable title must agree with it.
 PR_HEAD_OID=""
-if [ -z "$HEAD_SHA" ]; then
-  command -v gh >/dev/null 2>&1 || die 3 "gh is required to resolve the canary head (or pass --head-sha)"
+# Branch metadata is resolved whenever the run is OPERATIONAL (lane check
+# active) — even under --head-sha (#663 round-4 P2): a typo or stale manual
+# sha would otherwise dispatch and watermark a review for a different
+# canonical range while the APPROVED lands on the lane-verified canary.
+# Only the hermetic-test escape skips it (alongside the lane check).
+need_meta=false
+[ -z "$HEAD_SHA" ] && need_meta=true
+[ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ] && need_meta=true
+if [ "$need_meta" = true ]; then
+  command -v gh >/dev/null 2>&1 || die 3 "gh is required to resolve the canary metadata (or pass --head-sha with WAVE_AUDIT_LANE_VERIFIED_OK=1 in hermetic tests)"
   meta="$(gh pr view "$PR" --repo "$REPO" --json title,headRefName,headRefOid --jq '[.title, .headRefName, .headRefOid] | @tsv' 2>/dev/null)" \
     || die 3 "could not read PR $REPO#$PR metadata"
   title="$(printf '%s' "$meta" | cut -f1)"
@@ -203,13 +211,23 @@ if [ -z "$HEAD_SHA" ]; then
   PR_HEAD_OID="$(printf '%s' "$meta" | cut -f3)"
   branch_sha="$(printf '%s\n' "$branch" | sed -n 's|.*/\(sync-all-\)\{0,1\}\([0-9a-f]\{7,40\}\)$|\2|p')"
   [ -n "$branch_sha" ] || die 3 "canary branch '$branch' does not carry the mergepath-sync/<sha> shape — not a lane-verifiable sync canary"
-  HEAD_SHA="$branch_sha"
-  title_sha="$(parse_title "$title" || true)"
-  if [ -n "$title_sha" ]; then
-    t_full="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${title_sha}^{commit}" || true)"
+  if [ -z "$HEAD_SHA" ]; then
+    HEAD_SHA="$branch_sha"
+    # The lane derives + verifies against the BRANCH sha; a parseable
+    # title must agree with it (#663 round-3 P1).
+    title_sha="$(parse_title "$title" || true)"
+    if [ -n "$title_sha" ]; then
+      t_full="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${title_sha}^{commit}" || true)"
+      b_full="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${branch_sha}^{commit}" || true)"
+      if [ -n "$t_full" ] && [ -n "$b_full" ] && [ "$t_full" != "$b_full" ]; then
+        die 3 "canary title names mergepath@$title_sha but the lane-verified branch names $branch_sha — refusing to audit a mismatched wave"
+      fi
+    fi
+  else
+    h_full="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${HEAD_SHA}^{commit}" || true)"
     b_full="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${branch_sha}^{commit}" || true)"
-    if [ -n "$t_full" ] && [ -n "$b_full" ] && [ "$t_full" != "$b_full" ]; then
-      die 3 "canary title names mergepath@$title_sha but the lane-verified branch names $branch_sha — refusing to audit a mismatched wave"
+    if [ -z "$h_full" ] || [ -z "$b_full" ] || [ "$h_full" != "$b_full" ]; then
+      die 3 "--head-sha $HEAD_SHA does not match the canary branch sha $branch_sha — refusing to audit a range the lane did not verify"
     fi
   fi
 fi
@@ -247,6 +265,13 @@ fi
 
 # --- resolve the audit base (chaining watermark) ------------------------------
 if [ -z "$BASE" ]; then
+  # The pushed tag is what lets EVERY checkout resolve the same base, so
+  # refresh the namespace from origin before selecting (#663 round-4 P2):
+  # a fresh clone or another machine otherwise picks an older base
+  # (re-reviewing cleared ranges), finds none, or mints a conflicting
+  # local tag object on rerun. Remote wins (forced refspec).
+  git -C "$REPO_DIR" fetch -q origin "+refs/tags/${TAG_PREFIX}/*:refs/tags/${TAG_PREFIX}/*" 2>/dev/null \
+    || die 3 "could not fetch ${TAG_PREFIX}/* tags from origin — the audit base must resolve against the shared watermark namespace (pass --base to pin explicitly)"
   # Newest = maximal in ancestry order, not newest by commit time: on a
   # candidate set where A is an ancestor of B, rev-list --count(B) is
   # strictly greater, and commit timestamps can tie (or even invert under

@@ -170,6 +170,7 @@ run_wa_lane() { # run_wa_lane <FAKE_LANE 0|1> <args...> — lane check ACTIVE, f
   local lane="$1"; shift
   rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"
   PATH="$FAKEBIN:$PATH" FAKE_LANE="$lane" \
+  FAKE_TITLE_SHA="${FAKE_TITLE_SHA:-$C2}" FAKE_BRANCH_SHA="${FAKE_BRANCH_SHA:-$C2}" \
   WAVE_AUDIT_REPO_DIR="$CANON" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   WAVE_AUDIT_LANE_VERIFIED_OK=0 \
@@ -304,6 +305,15 @@ else
 fi
 [ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched on a mismatched wave" || fail "dispatched despite title/branch mismatch"
 
+# Round-4 P2: an operational --head-sha must still match the lane-verified
+# branch sha.
+if FAKE_BRANCH_SHA="$C2" run_wa_lane 1 64 --repo owner/consumer --base "$C1" --head-sha "$C3" --dry-run >/dev/null 2>&1; then
+  fail "mismatched --head-sha was accepted on an operational run"
+else
+  [ $? -eq 3 ] && pass "operational --head-sha mismatch fails closed (exit 3)" || fail "wrong exit for --head-sha mismatch"
+fi
+[ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched on --head-sha mismatch" || fail "dispatched despite --head-sha mismatch"
+
 # ===========================================================================
 echo "wave-audit.sh — exit-3 fail-closed + newly-manifested paths"
 # ===========================================================================
@@ -328,9 +338,17 @@ run_wa "$POLICY_BAD" reset 45 --repo owner/consumer --head-sha "$C5" >/dev/null 
   && fail "invalid effort accepted" || { [ $? -eq 3 ] && pass "invalid effort fails closed (exit 3)" || fail "wrong exit for invalid effort"; }
 [ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched on invalid config" || fail "orchestrator dispatched despite invalid config"
 
+# Round-4 P2: a checkout missing local tags recovers them from origin —
+# the shared watermark namespace, not local state, resolves the base.
 for t in $(git -C "$CANON" tag -l 'wave-audit-pass/*'); do git -C "$CANON" tag -d "$t" >/dev/null; done
+run_wa "$POLICY_GOOD" reset 65 --repo owner/consumer --head-sha "$C6" >/dev/null \
+  && pass "local-tagless checkout resolves the base from origin (multi-machine)" \
+  || fail "base not recovered from remote watermark namespace"
+
+for t in $(git -C "$CANON" tag -l 'wave-audit-pass/*'); do git -C "$CANON" tag -d "$t" >/dev/null; done
+git -C "$REMOTE" tag -l 'wave-audit-pass/*' | while IFS= read -r t; do git -C "$REMOTE" tag -d "$t" >/dev/null; done
 run_wa "$POLICY_GOOD" reset 46 --repo owner/consumer --head-sha "$C2" >/dev/null 2>&1 \
-  && fail "run without watermark or --base accepted" || { [ $? -eq 3 ] && pass "no watermark + no --base fails closed (exit 3)" || fail "wrong exit for missing base"; }
+  && fail "run without watermark or --base accepted" || { [ $? -eq 3 ] && pass "no watermark anywhere + no --base fails closed (exit 3)" || fail "wrong exit for missing base"; }
 
 echo
 echo "Summary: $PASS passed, $FAIL failed"

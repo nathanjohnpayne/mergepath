@@ -116,6 +116,15 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   # Mergepath-internal policy simulation tool
   'scripts/policy-sim.sh'
 
+  # Wave-audit surface (#662/#663) - hub-only BY DESIGN, excluded as a
+  # pair like the engines above: the driver runs one scoped automated
+  # review per propagation wave FROM the hub, and its suite exercises
+  # watermark tags a consumer never mints. A bootstrapped repo carrying
+  # them would run the hub-only suite instead of the intended
+  # check_wave_audit consumer SKIP path.
+  'scripts/wave-audit.sh'
+  'tests/test_wave_audit.sh'
+
   # Screenshots — internal evidence, not template content
   'bugs/screenshots/'
   '.github/screenshots/'
