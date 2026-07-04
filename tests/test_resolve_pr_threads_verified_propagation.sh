@@ -139,6 +139,18 @@
 #      updated 14b/18 trees-URL asserts (both fail pre-fix); 21: a
 #      peel failure skips fail-closed (verification error) with no
 #      trees fetch.
+#  22. Canonical-repo self-guard (found sizing the #562 Track C drain):
+#      --repo names the canonical repo ITSELF (origin remote resolves to the
+#      SAME slug REPO_ROOT_FOR_MANIFEST is a clone of), so the byte-compare
+#      would self-match → skip not-propagation-routed BEFORE any read/compare,
+#      exit 3, no contents/trees fetch, no mutations.
+#  23. Negative control: the guard is NARROW. With the canonical origin remote
+#      present, a REAL consumer target (≠ the origin slug) is NOT guarded and
+#      still byte-verifies + resolves (the guard fires only on the self-match,
+#      not on every run from a canonical checkout).
+#  24. MERGEPATH_CANONICAL_REPO override wins over the origin remote — pins the
+#      canonical slug so a matching --repo self-matches and skips (the
+#      documented escape hatch for fork checkouts / non-origin remotes).
 
 set -euo pipefail
 
@@ -502,6 +514,11 @@ make_thread_fixture_with_reply() {
 #                              entry (default 100644, matching the
 #                              fixture repo's committed modes)
 #   RUN_TREE_FILE=...          full override of the tree listing
+#   RUN_REPO=owner/name        --repo target (default test/consumer)
+#   RUN_CANONICAL_REPO=o/n     MERGEPATH_CANONICAL_REPO override — pins the
+#                              canonical repo slug the self-guard compares
+#                              --repo against (default: unset → resolved from
+#                              the fixture's origin remote, normally absent)
 run_mode() {
   local threads_file="$1" content_file="$2"
   shift 2
@@ -528,11 +545,12 @@ run_mode() {
     GH_STUB_FAIL_REF="${RUN_FAIL_REF:-}" \
     GH_STUB_FAIL_COMMIT_TREE="${RUN_FAIL_COMMIT_TREE:-}" \
     GH_STUB_PR_STATE="${RUN_PR_STATE:-closed}" \
+    MERGEPATH_CANONICAL_REPO="${RUN_CANONICAL_REPO:-}" \
     RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
     PATH="$SCRATCH:$PATH" \
     env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
     bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
-      --repo test/consumer --resolve-verified-propagation "$@" 2>&1
+      --repo "${RUN_REPO:-test/consumer}" --resolve-verified-propagation "$@" 2>&1
   )
   rc=$?
   set -e
@@ -1551,6 +1569,101 @@ if [ "$rc" -eq 3 ] \
 else
   fail=$((fail + 1))
   echo "  FAIL: commit-to-tree peel failure did not fail closed (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Tests 22–24: canonical-repo self-guard (found sizing the #562 Track C
+# drain). --resolve-verified-propagation byte-compares a CONSUMER's content
+# against the mergepath canonical source read from REPO_ROOT_FOR_MANIFEST.
+# When --repo names the canonical repo ITSELF, the two sides are ONE file — a
+# vacuous self-match that would resolve a canonical finding under a false
+# verified-propagation tag (and the #616 upstream-fix gate is trivially met by
+# any later commit touching the path). The guard keys off the local checkout's
+# OWN repo slug (its origin remote, or the MERGEPATH_CANONICAL_REPO override)
+# and skips those threads as not-propagation-routed BEFORE any read/compare.
+#
+# Give the fixture tree an origin remote so canonical_repo_slug resolves to a
+# real slug. Earlier tests ran with NO remote (guard off, correctly); adding it
+# now is safe — they all used --repo test/consumer, which never equals
+# test/canonical, so the guard would have stayed off regardless.
+# ─────────────────────────────────────────────────────────────────────
+git -C "$FIXTURE_ROOT" remote add origin https://github.com/test/canonical.git
+
+echo
+echo "Test 22: --repo IS the canonical repo (origin remote) → self-guard skips the self-match"
+
+GH_ARGV_LOG="$SCRATCH/t22.log"; : > "$GH_ARGV_LOG"
+RUN_REPO=test/canonical run_mode "$SCRATCH/threads_vp1.json" "$CONSUMER_MATCH_CANONICAL"
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (canonical repo' <<<"$out" \
+   && grep -q 'test/canonical is the mergepath canonical source itself' <<<"$out" \
+   && ! grep -q '/contents/' "$GH_ARGV_LOG" \
+   && ! grep -q 'git/trees/' "$GH_ARGV_LOG" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: canonical-repo target skipped not-propagation-routed (no read, no byte-compare, no mutations), exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: canonical-repo self-guard did not skip (rc=$rc) — a self-match would have resolved a canonical finding?" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 23 (negative control): the guard is NARROW. With the SAME canonical
+# origin remote present, a REAL consumer target (test/consumer ≠ the origin
+# slug test/canonical) is NOT self-guarded — the byte-matched canonical thread
+# still resolves as verified-propagation. Proves the guard fires only on the
+# self-match, not on every run from a canonical checkout.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 23: real consumer target still verifies with a canonical origin remote present"
+
+GH_ARGV_LOG="$SCRATCH/t23.log"; : > "$GH_ARGV_LOG"
+run_mode "$SCRATCH/threads_vp1.json" "$CONSUMER_MATCH_CANONICAL"
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: verified-propagation\] consumer content at docs/canonical.md byte-matches the mergepath canonical source' "$GH_ARGV_LOG" \
+   && grep -q 'contents/docs/canonical.md' "$GH_ARGV_LOG" \
+   && ! grep -q 'SKIP (canonical repo' <<<"$out" \
+   && grep -q 'Readback: all 1 resolved thread(s) confirmed isResolved:true' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: consumer target verified + resolved; the self-guard stayed off (narrow to the self-match)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: consumer target was wrongly guarded or did not resolve (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 24: the MERGEPATH_CANONICAL_REPO override wins over the origin remote.
+# The remote says test/canonical, but the override pins test/consumer, so a
+# --repo test/consumer run is now the self-match and skips. Locks the
+# documented escape hatch (fork checkouts / non-origin remotes).
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 24: MERGEPATH_CANONICAL_REPO override pins the canonical slug → self-guard skips"
+
+GH_ARGV_LOG="$SCRATCH/t24.log"; : > "$GH_ARGV_LOG"
+RUN_CANONICAL_REPO=test/consumer run_mode "$SCRATCH/threads_vp1.json" "$CONSUMER_MATCH_CANONICAL"
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (canonical repo' <<<"$out" \
+   && grep -q 'test/consumer is the mergepath canonical source itself' <<<"$out" \
+   && ! grep -q '/contents/' "$GH_ARGV_LOG" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: override pinned the canonical slug and the self-guard skipped, exit 3, no mutations"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: MERGEPATH_CANONICAL_REPO override did not drive the self-guard (rc=$rc)" >&2
   echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
   echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
 fi
