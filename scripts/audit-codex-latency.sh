@@ -24,7 +24,10 @@
 #   3. trigger → verdict         → the bot's "Codex Review: … Reviewed
 #                                commit: <sha>" ISSUE COMMENT (#567 — not a
 #                                review object) for that round.
-#   4. trigger → 👍 clearance    → the bot's `+1` reaction on the trigger.
+#   4. trigger → 👍 clearance    → the bot's `+1` reaction on the PR ISSUE
+#                                (issues/{pr}/reactions — the gate's endpoint,
+#                                NOT the trigger comment; #645), paired with
+#                                the most recent trigger at or before it.
 #   5. push → auto-review        reviewed-commit committer date → verdict,
 #                                for verdicts with no preceding trigger in
 #                                the round window (Codex auto-reviews).
@@ -74,7 +77,9 @@
 #   raw/reviews.jsonl          trimmed bot reviews
 #   raw/review_comments.jsonl  trimmed bot inline review comments
 #   raw/pr_commits.jsonl       sha → committer_date map
-#   raw/reactions.jsonl        bot reactions on trigger comments
+#   raw/reactions.jsonl        bot reactions on trigger comments (👀 ack, pair 1)
+#   raw/pr_reactions.jsonl     bot reactions on the PR issue (👍 clearance,
+#                              pairs 4 & 6 — the gate's endpoint, #645)
 #   raw/runs.jsonl             trimmed Actions run records (PERSIST THIS —
 #                              GitHub ages runs out after ~90 days)
 #   events.jsonl               normalized event stream
@@ -209,6 +214,7 @@ fetch_all() {
   : > "$RAW_DIR/reviews.jsonl"
   : > "$RAW_DIR/review_comments.jsonl"
   : > "$RAW_DIR/pr_commits.jsonl"
+  : > "$RAW_DIR/pr_reactions.jsonl"
   local n
   for n in $(jq -r --arg since "$SINCE" \
       'select($since == "" or .created_at >= $since) | .pr' "$RAW_DIR/pulls.jsonl"); do
@@ -247,6 +253,17 @@ fetch_all() {
     api_get "repos/$REPO/pulls/$n/commits?per_page=100" --jq '.[]' \
       | jq -c '{sha, committer_date:.commit.committer.date}' \
       >> "$RAW_DIR/pr_commits.jsonl" || { echo "ERROR: PR #$n commits fetch failed" >&2; exit 3; }
+
+    # PR-issue reactions (pair 4 👍 clearance + pair 6 reaction clearance).
+    # The clearance 👍 lives on the PR ISSUE, not the trigger comment — the
+    # merge gate reads repos/$REPO/issues/$PR/reactions (codex-review-check.sh),
+    # so that is the endpoint the audit must mine for it too (#645). The 👀
+    # ack, by contrast, IS on the trigger comment and stays in reactions.jsonl.
+    api_get "repos/$REPO/issues/$n/reactions?per_page=100" --jq '.[]' \
+      | jq -c --argjson pr "$n" --arg bot "$BOT_LOGIN" '
+          select(.user.login | startswith($bot))
+          | {pr:$pr, content, created_at, login:.user.login}' \
+      >> "$RAW_DIR/pr_reactions.jsonl" || { echo "ERROR: PR #$n issue reactions fetch failed" >&2; exit 3; }
   done
 
   # 4. Reactions on every trigger comment (pairs 1 and 4). Trigger ids come
@@ -367,6 +384,13 @@ normalize() {
         "$RAW_DIR/reactions.jsonl"
     fi
 
+    if [ -s "$RAW_DIR/pr_reactions.jsonl" ]; then
+      jq -c --arg bot "$BOT_LOGIN" '
+        select(.login | startswith($bot))
+        | {kind:"pr_reaction", pr, content, created_at}' \
+        "$RAW_DIR/pr_reactions.jsonl"
+    fi
+
     jq -c '{kind:"run", workflow, run_id:.id, event, conclusion,
             created_at, run_started_at, updated_at, head_branch}' \
       "$RAW_DIR/runs.jsonl"
@@ -390,6 +414,7 @@ analyze() {
     | ($ev | map(select(.kind=="pr")) | INDEX(.pr | tostring)) as $prs
     | ($ev | map(select(.kind=="commit")) | INDEX(.sha)) as $commits
     | ($ev | map(select(.kind=="reaction"))) as $reactions
+    | ($ev | map(select(.kind=="pr_reaction"))) as $pr_reactions
     | ($ev | map(select(.kind=="review_comment"))) as $rcs
     | ($ev | map(select(.kind=="review"))) as $reviews
     | ($ev | map(select(.kind=="rate_limit"))) as $rls
@@ -478,15 +503,31 @@ analyze() {
                         and ($nt == null or . < $nt.created_at)) ] | length > 0)};
 
     [
-      # pairs 1 & 4: reactions on the trigger comment
+      # pair 1: 👀 ack — a reaction on the TRIGGER COMMENT (correct endpoint;
+      # Codex acks the trigger it was mentioned in).
       ( $triggers[] as $t
         | $reactions[]
         | select(.comment_id == $t.comment_id and .created_at >= $t.created_at)
-        | select(.content == "eyes" or .content == "+1")
-        | {pair:(if .content == "eyes" then "1_trigger_to_ack" else "4_trigger_to_thumbs_clearance" end),
+        | select(.content == "eyes")
+        | {pair:"1_trigger_to_ack",
            pr:$t.pr, round:$t.round, t0:$t.created_at, t1:.created_at,
            seconds:((.created_at | ts) - ($t.created_at | ts))}
           + seg($t.pr; $t.created_at) ),
+
+      # pair 4: trigger → 👍 clearance. The clearance 👍 is on the PR ISSUE
+      # (repos/$REPO/issues/$PR/reactions), where the merge gate reads it —
+      # NOT the trigger comment (#645). Pair each PR-issue +1 with the most
+      # recent trigger at or before it (the round that 👍 cleared).
+      ( $pr_reactions[]
+        | select(.content == "+1") as $r
+        | ([ $triggers[]
+             | select(.pr == $r.pr and .created_at <= $r.created_at) ]
+           | sort_by(.created_at) | last) as $t
+        | select($t != null)
+        | {pair:"4_trigger_to_thumbs_clearance",
+           pr:$r.pr, round:$t.round, t0:$t.created_at, t1:$r.created_at,
+           seconds:(($r.created_at | ts) - ($t.created_at | ts))}
+          + seg($r.pr; $t.created_at) ),
 
       # pair 2: trigger → earliest bot inline FINDING. A review submission
       # only counts when it carries at least one inline comment — a clean /
@@ -564,8 +605,9 @@ analyze() {
           + seg($v.pr; $c.committer_date) ),
 
       # pair 6: clearance → gate run → merge, per gate workflow.
-      # Clearance = the operative (last-before-merge) 👍 reaction on a
-      # trigger when recorded, else the last affirmative verdict comment
+      # Clearance = the operative (last-before-merge) 👍 reaction on the PR
+      # ISSUE when recorded (the gate endpoint, #645), else the last
+      # affirmative verdict comment
       # ANCHORED ON THE MERGE HEAD — the merge gate treats a verdict on a
       # pre-push commit as stale (#567/#600), so a sha-mismatched (or
       # sha-less old-format) verdict is not the operative clearance and is
@@ -578,8 +620,7 @@ analyze() {
         # Fail-closed when the head commit is missing from the extract
         # (4b P1 on #629; mirrors the sha-anchored verdict rule below).
         | ($commits[$p.head_sha // ""] // null) as $hc
-        | ([ ( $reactions[] | select(.content == "+1")
-               | . as $r | select(([ $triggers[] | select(.pr == $p.pr and .comment_id == $r.comment_id) ] | length) > 0)
+        | ([ ( $pr_reactions[] | select(.content == "+1")
                | select(.pr == $p.pr)
                | select($hc != null and (.created_at >= $hc.committer_date))
                | .created_at ),
