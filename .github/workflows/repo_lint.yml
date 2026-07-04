@@ -309,6 +309,9 @@ jobs:
       - name: check_disagreement_detector
         run: ./scripts/ci/check_disagreement_detector
 
+      - name: check_agent_review_triage_defers
+        run: ./scripts/ci/check_agent_review_triage_defers
+
       - name: check_sync_manifest
         # Requires mikefarah/yq — installed by install_yq_for_sync_manifest,
         # which now runs earlier (before check_resolve_pr_threads, the
