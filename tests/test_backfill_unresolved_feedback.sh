@@ -339,6 +339,21 @@ else
   fail=$((fail+1)); echo "FAIL: actioned mode should still drain the canonical repo (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
+# ── Test 17: the canonical self-match is case-INSENSITIVE (GitHub slugs are).
+#    A case-variant MERGEPATH_CANONICAL_REPO still skips owner/alpha; a raw
+#    string compare would miss the mismatch and resolve canonical PRs
+#    (CodeRabbit Functional Correctness on #666).
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=Owner/Alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --mode resolve-verified-propagation --repo owner/alpha 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 0 ] && grep -qi 'SKIP (verified-propagation N/A' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: canonical self-match is case-insensitive (case-variant slug still skips)"
+else
+  fail=$((fail+1)); echo "FAIL: case-variant canonical slug should still skip (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_backfill_unresolved_feedback: PASS ($pass tests)"; exit 0

@@ -93,8 +93,12 @@ MODE="resolve-actioned"
 # normally. Env-overridable for tests, mirroring
 # scripts/ci/check_op_firebase_deploy_integration.
 CANONICAL_REPO="${MERGEPATH_CANONICAL_REPO:-nathanjohnpayne/mergepath}"
+# GitHub repo slugs are case-insensitive, so match case-insensitively — a
+# case-variant override (or an enumerated slug in different case) must not
+# bypass the skip. Bash 3.2 has no ${var,,}; normalize with tr, once.
+CANONICAL_REPO_LC="$(printf '%s' "$CANONICAL_REPO" | tr '[:upper:]' '[:lower:]')"
 
-usage() { sed -n '2,40p' "$0" >&2; exit 1; }
+usage() { sed -n '2,46p' "$0" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -218,8 +222,11 @@ while IFS=$'\t' read -r repo pr; do
   [ -z "$repo" ] && continue
   # verified-propagation self-matches on the canonical repo (compares its own
   # source to itself → false "propagation verified"). Skip it in that mode;
-  # --resolve-actioned still drains the canonical repo's actioned threads.
-  if [ "$MODE" = "resolve-verified-propagation" ] && [ "$repo" = "$CANONICAL_REPO" ]; then
+  # --resolve-actioned still drains the canonical repo's actioned threads. Match
+  # case-insensitively (GitHub slugs are case-insensitive); the tr only runs in
+  # verified mode via the short-circuit.
+  if [ "$MODE" = "resolve-verified-propagation" ] \
+     && [ "$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')" = "$CANONICAL_REPO_LC" ]; then
     echo "  $repo#$pr: SKIP (verified-propagation N/A on the canonical repo $CANONICAL_REPO)" >&2
     continue
   fi
