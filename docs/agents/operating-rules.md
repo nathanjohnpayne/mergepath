@@ -9,11 +9,11 @@ Read in this order before taking any action:
 5. `.ai_context.md` — load supplemental context
 
 If `docs/projects/<project>/prds/` exists in the repo, read the
-generated PRD mirror as product context. Do not edit that mirror
-directly; edit the canonical PRD in
-`nathanjohnpayne/docs/projects/<project>/prds/`. Implementation
-behavior changes still belong in the owning repo's `specs/`, policy
-files, scripts, and tests.
+generated PRD mirror as product context. It is a generated mirror --- do
+not edit it directly; see `docs/agents/documentation-rules.md`
+§ "Direct writes to documentation" for the repo-owned-vs-mirror boundary
+and the canonical edit path. Implementation behavior changes still belong
+in the owning repo's `specs/`, policy files, scripts, and tests.
 
 Conflict resolution:
 
