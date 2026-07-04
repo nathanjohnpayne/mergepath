@@ -17,14 +17,14 @@ Two passes are reported: the original study window (2026-04-15 → 2026-07-02, 2
 | 1. trigger → 👀 ack | 14 | 9s | 11s | 13s | 13s |
 | 2. trigger → first inline finding | 208 | 5m16s | 13m46s | 19m57s | 30m39s |
 | 3. trigger → verdict comment | 100 | 3m37s | 7m6s | 10m30s | 13m50s |
-| 4. trigger → 👍 clearance | 0 | — | — | — | — |
+| 4. trigger → 👍 clearance | — | unmeasured — wrong endpoint (see below) | | | |
 | 5. push → auto-review | 128 | 4m12s | 11m10s | 33m1s | 36m1s |
 | 6a. clearance → next merge-clearance-gate sweep | 13 | 30s | 1m3s | — | 1m16s |
 | 6b. clearance → next auto-clear-blocking-labels sweep | 14 | 30s | 1m16s | — | 28m52s |
 | 6c. gate run queue delay (created→started) | 27 | 0s | 0s | 0s | 0s |
 | 6d. clearance → merged (head-anchored verdicts) | 17 | 1m43s | 9m26s | — | 39m57s |
 
-Segmented tables (diff size, round, hour, weekday, rate-limited) are in `data/codex-latency-2026-07/summary.md` (original) and `data/codex-latency-2026-07/summary-backfill-2026-07-04.md` (backfill run).
+Segmented tables (diff size, round, hour, weekday, rate-limited) are in `docs/audits/data/codex-latency-2026-07/summary.md` (original) and `docs/audits/data/codex-latency-2026-07/summary-backfill-2026-07-04.md` (backfill run).
 
 ### The folklore vs the record
 
@@ -37,7 +37,7 @@ Segmented tables (diff size, round, hour, weekday, rate-limited) are in `data/co
 
 - **Ack is fast and extremely tight**: every healthy ack in the record landed in 6–13s (p50 9s, p99 13s, max 13s, n=14). The "~4 min no-👀 = dropped" runbook heuristic is ~18× the measured p99 — far too slow as a dropped-trigger test.
 - **First inline finding** (n=208): p50 5m16s, p90 13m46s, p99 19m57s, max 30m39s — the longer tail vs the verdict comment is expected (inline findings only exist on rounds that *have* findings, which skew to larger diffs / later rounds).
-- **Pair 4 (👍 clearance) is empty by design**: only 14 reactions exist in the whole corpus, all 👀 acks. Codex signals clearance via the `Codex Review:` **issue-comment verdict** (#567), not a 👍 reaction — so there is no meaningfully-populated 👍-clearance distribution. Gate (b) branch 2 should read the verdict comment, not wait on a 👍.
+- **Pair 4 (👍 clearance) is NOT resolved — the audit measures the wrong object.** The script reads a `+1` on the *trigger comment*, but the merge gate (`codex-review-check.sh`) reads the clearance 👍 from the *PR issue* (`repos/$REPO/issues/$PR_NUMBER/reactions`). The 0 trigger-comment `+1`s found is an endpoint artifact, **not** evidence that 👍 clearance is unused — gate (b) branch 2 depends on those 👍s (they expire after 30 min). 👍-clearance latency is therefore unmeasured; a follow-up fixes the script's pair-4 definition and re-measures.
 
 ### Knob dispositions
 
