@@ -91,11 +91,7 @@ The bootstrap script for each repo:
 - Runs `npm install`
 - Runs `npm run build` (if applicable)
 
-For new runtime application secrets, prefer the current 1Password
-Environments model described in [Runtime 1Password secrets and AI
-agents](#runtime-1password-secrets-and-ai-agents). Keep
-`.env.tpl`/`op inject` for repos that still need a generated,
-gitignored file on disk.
+For new runtime application secrets, prefer the current 1Password Environments model described in [Runtime 1Password secrets and AI agents](#runtime-1password-secrets-and-ai-agents). Keep `.env.tpl`/`op inject` for repos that still need a generated, gitignored file on disk.
 
 ### 5. Verify
 
@@ -155,16 +151,11 @@ for repo in $repos; do
 done
 ```
 
-The `--force` flag overwrites existing generated env files with freshly
-resolved values from 1Password. This ensures you pick up any secret values
-that were updated directly in 1Password.
+The `--force` flag overwrites existing generated env files with freshly resolved values from 1Password. This ensures you pick up any secret values that were updated directly in 1Password.
 
 ### Conflict resolution
 
-If two machines need different template structure, resolve it like normal
-source code: commit the `.env.tpl` change on one branch and merge/rebase.
-Secret values themselves should be edited directly in 1Password, not synced
-from generated local files.
+If two machines need different template structure, resolve it like normal source code: commit the `.env.tpl` change on one branch and merge/rebase. Secret values themselves should be edited directly in 1Password, not synced from generated local files.
 
 ---
 
@@ -319,38 +310,13 @@ gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo} --body "$(op read 
 gh secret set AUTHOR_MERGE_TOKEN --repo {owner}/{repo} --body "$(op read 'op://Private/sm5kopwk6t6p3xmu2igesndzhe/token')"   # nathanjohnpayne (author identity)
 ```
 
-`AUTHOR_MERGE_TOKEN` is **required** wherever Dependabot auto-merge is
-enabled: as of nathanjohnpayne/mergepath#426 the workflow uses it for the
-`gh pr merge` step (recording `mergedBy` as `author_identity`) and
-hard-fails if it is empty or resolves to anything other than
-`author_identity`. It is the author-identity counterpart to
-`REVIEWER_ASSIGNMENT_TOKEN`, and the Agent Review Pipeline's auto-merge
-step uses it too.
+`AUTHOR_MERGE_TOKEN` is **required** wherever Dependabot auto-merge is enabled: as of nathanjohnpayne/mergepath#426 the workflow uses it for the `gh pr merge` step (recording `mergedBy` as `author_identity`) and hard-fails if it is empty or resolves to anything other than `author_identity`. It is the author-identity counterpart to `REVIEWER_ASSIGNMENT_TOKEN`, and the Agent Review Pipeline's auto-merge step uses it too.
 
-**`REVIEWER_ASSIGNMENT_TOKEN` is the only reviewer-identity PAT
-stored as a repo CI secret.** It exists specifically because the
-Dependabot auto-merge + Agent Review Pipeline workflows run inside
-GitHub Actions where there's no interactive `op read`. Pick ONE of
-the reviewer identities (claude / cursor / codex) and use its PAT
-for this slot — the workflow validates the resolved identity against
-`available_reviewers` and rejects anything else.
+**`REVIEWER_ASSIGNMENT_TOKEN` is the only reviewer-identity PAT stored as a repo CI secret.** It exists specifically because the Dependabot auto-merge + Agent Review Pipeline workflows run inside GitHub Actions where there's no interactive `op read`. Pick ONE of the reviewer identities (claude / cursor / codex) and use its PAT for this slot — the workflow validates the resolved identity against `available_reviewers` and rejects anything else.
 
-For Phase 2 internal self-peer review (the back-and-forth that
-happens during a review session), the OTHER two reviewer-identity
-PATs are NOT stored as repo CI secrets. Phase 2 runs in the agent's
-own session: the agent switches its Git identity to its reviewer
-account with a PAT read directly from 1Password
-(`op read 'op://Private/<item-id>/token'`) and posts the review with
-that PAT. See REVIEW_POLICY.md § Phase 2 and each repo's `CLAUDE.md`
-/ `AGENTS.md` for the identity-switch procedure.
+For Phase 2 internal self-peer review (the back-and-forth that happens during a review session), the OTHER two reviewer-identity PATs are NOT stored as repo CI secrets. Phase 2 runs in the agent's own session: the agent switches its Git identity to its reviewer account with a PAT read directly from 1Password (`op read 'op://Private/<item-id>/token'`) and posts the review with that PAT. See REVIEW_POLICY.md § Phase 2 and each repo's `CLAUDE.md` / `AGENTS.md` for the identity-switch procedure.
 
-**Do NOT add `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `CLAUDE_PAT` /
-`CODEX_PAT` / `CURSOR_PAT` as repo secrets.** An earlier iteration of
-`agent-review.yml` had an `invoke-reviewer` job that ran the Claude
-Code CLI headlessly as a CI-side reviewer; this was the wrong flow
-(parallel to the authoring session, stale-API-key failure surface,
-duplicate work) and was removed. Phase 2 now lives entirely inside
-the authoring agent's session.
+**Do NOT add `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `CLAUDE_PAT` / `CODEX_PAT` / `CURSOR_PAT` as repo secrets.** An earlier iteration of `agent-review.yml` had an `invoke-reviewer` job that ran the Claude Code CLI headlessly as a CI-side reviewer; this was the wrong flow (parallel to the authoring session, stale-API-key failure surface, duplicate work) and was removed. Phase 2 now lives entirely inside the authoring agent's session.
 
 ### 4. Configure branch protection
 
@@ -389,16 +355,11 @@ EOF
 
 **Note:** Branch protection requires the repo to be public, or requires GitHub Pro/Team for private repos.
 
-**Known issue:** The `Self-Review Required` and `Label Gate` status checks are
-configured as required but may never report if the CI workflows that post them
-(`pr-review-policy.yml`) fail silently due to misconfigured repository secrets.
-This blocks all merges. Workarounds:
+**Known issue:** The `Self-Review Required` and `Label Gate` status checks are configured as required but may never report if the CI workflows that post them (`pr-review-policy.yml`) fail silently due to misconfigured repository secrets. This blocks all merges. Workarounds:
 - Fix the CI secrets so status checks report, **or**
 - Use the GitHub web UI "Merge without waiting for requirements" bypass checkbox
 
-The `--admin` flag on `gh pr merge` does **not** bypass required status checks —
-it only bypasses review requirements. The break-glass hook (`BREAK_GLASS_ADMIN=1`)
-only bypasses the Claude Code PreToolUse guard, not GitHub's branch protection API.
+The `--admin` flag on `gh pr merge` does **not** bypass required status checks — it only bypasses review requirements. The break-glass hook (`BREAK_GLASS_ADMIN=1`) only bypasses the Claude Code PreToolUse guard, not GitHub's branch protection API.
 
 ### 5. Create required labels
 
@@ -440,38 +401,22 @@ gh label list --repo "$REPO" --search "policy-violation"
 
 ### Token type: classic PATs required
 
-Machine user reviewer identities (nathanpayne-claude, etc.) are **collaborators**,
-not repo owners. GitHub fine-grained PATs on personal accounts only cover repos
-owned by the token account — they cannot access collaborator repos. The "All
-repositories" scope in fine-grained PATs means all repos the account *owns* (zero
-for collaborators), not repos they collaborate on.
+Machine user reviewer identities (nathanpayne-claude, etc.) are **collaborators**, not repo owners. GitHub fine-grained PATs on personal accounts only cover repos owned by the token account — they cannot access collaborator repos. The "All repositories" scope in fine-grained PATs means all repos the account *owns* (zero for collaborators), not repos they collaborate on.
 
-**Use classic PATs with `repo` scope for all reviewer identities.** This is stored
-in 1Password with the field name `token` (not `credential` or `password`).
+**Use classic PATs with `repo` scope for all reviewer identities.** This is stored in 1Password with the field name `token` (not `credential` or `password`).
 
-**Canonical PAT lookup table:** see [REVIEW_POLICY.md § PAT lookup
-table](REVIEW_POLICY.md#pat-lookup-table). The single source of truth
-for agent-to-item-ID mappings lives there, alongside the cached
-`$OP_PREFLIGHT_*_PAT` env-var conventions. Routine work should use the
-cached env vars (no biometric per call); the inline `op read` form is
-a setup-only fallback documented in the same section.
+**Canonical PAT lookup table:** see [REVIEW_POLICY.md § PAT lookup table](REVIEW_POLICY.md#pat-lookup-table). The single source of truth for agent-to-item-ID mappings lives there, alongside the cached `$OP_PREFLIGHT_*_PAT` env-var conventions. Routine work should use the cached env vars (no biometric per call); the inline `op read` form is a setup-only fallback documented in the same section.
 
-All 1Password items in that table are classic PATs with the `ghp_`
-prefix, stored with field name `token` in the `Private` vault.
+All 1Password items in that table are classic PATs with the `ghp_` prefix, stored with field name `token` in the `Private` vault.
 
-Use the item ID (not the item title) to avoid shell issues with parentheses in
-1Password item names like `GitHub PAT (pr-review-claude)`.
+Use the item ID (not the item title) to avoid shell issues with parentheses in 1Password item names like `GitHub PAT (pr-review-claude)`.
 
 ### Reviewer PAT quick check
 
-The canonical convention is in `REVIEW_POLICY.md` § Reviewer PAT Quick
-Start. Short form:
+The canonical convention is in `REVIEW_POLICY.md` § Reviewer PAT Quick Start. Short form:
 
 - **Read paths** (`gh api user`, GETs, `gh pr view`) honor `GH_TOKEN`.
-- **Core guarded writes** (`gh pr create`, `gh pr merge`, `gh pr edit`,
-  `gh pr comment`, `gh pr review`, `gh issue comment`) use
-  `scripts/gh-as-author.sh` or `scripts/gh-as-reviewer.sh`, which verify
-  the effective token before the write.
+- **Core guarded writes** (`gh pr create`, `gh pr merge`, `gh pr edit`, `gh pr comment`, `gh pr review`, `gh issue comment`) use `scripts/gh-as-author.sh` or `scripts/gh-as-reviewer.sh`, which verify the effective token before the write.
 
 ```bash
 # Read-path identity check (PRIMARY — uses cached PAT, no biometric).
@@ -486,51 +431,25 @@ GH_AS_REVIEWER_IDENTITY=nathanpayne-<agent> \
 scripts/gh-as-author.sh -- gh pr merge <PR#> --squash --delete-branch
 ```
 
-> **⚠️ Fallback / setup-only:** the inline `GH_TOKEN="$(op read
-> 'op://Private/<item-id>/token')"` form triggers a biometric prompt
-> on **every** invocation. Use only when `op-preflight.sh` is
-> unavailable. Routine agent work should always use the cached
-> `$OP_PREFLIGHT_REVIEWER_PAT` env var after a one-time
-> `eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"`.
+> **⚠️ Fallback / setup-only:** the inline `GH_TOKEN="$(op read 'op://Private/<item-id>/token')"` form triggers a biometric prompt on **every** invocation. Use only when `op-preflight.sh` is unavailable. Routine agent work should always use the cached `$OP_PREFLIGHT_REVIEWER_PAT` env var after a one-time `eval "$(scripts/op-preflight.sh --agent <agent> --mode review)"`.
 
 - Use the item ID from the table above for your agent identity. Do not use the 1Password item title.
-- Verify token identity with `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login`
-  or by letting the wrappers call `identity-check.sh
-  --expect-token-identity` before the write.
-- On local interactive machines, the `op read` command itself may trigger the
-  1Password biometric prompt even if `op whoami` says you are not signed in.
-- `Review Can not approve your own pull request` means the PR author is
-  wrong, the reviewer token resolved to the author identity, or the
-  no-self-approve scoping rule applies (Phase 4 / above-threshold PRs
-  only — see REVIEW_POLICY.md § No-self-approve scoping). For
-  under-threshold PRs the reviewer identity is allowed and expected to
-  `--approve`.
+- Verify token identity with `GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api user --jq .login` or by letting the wrappers call `identity-check.sh --expect-token-identity` before the write.
+- On local interactive machines, the `op read` command itself may trigger the 1Password biometric prompt even if `op whoami` says you are not signed in.
+- `Review Can not approve your own pull request` means the PR author is wrong, the reviewer token resolved to the author identity, or the no-self-approve scoping rule applies (Phase 4 / above-threshold PRs only — see REVIEW_POLICY.md § No-self-approve scoping). For under-threshold PRs the reviewer identity is allowed and expected to `--approve`.
 
 ### Token rotation (as needed)
 
-The current PATs are set to never expire. If you ever need to rotate
-a reviewer identity PAT (`nathanpayne-claude`, `nathanpayne-codex`,
-`nathanpayne-cursor`):
+The current PATs are set to never expire. If you ever need to rotate a reviewer identity PAT (`nathanpayne-claude`, `nathanpayne-codex`, `nathanpayne-cursor`):
 
 1. Generate a new **classic** PAT with `repo` scope for the machine user account
 2. Update the `token` field on the corresponding 1Password item
 3. Revoke the old token in GitHub
 4. Verify agent access still works: `GH_TOKEN="$(op read 'op://Private/<item-id>/token')" gh api user`
 
-Note: reviewer identity PATs are NOT stored as repo CI secrets. They are
-read from 1Password per-session by the authoring agent for the in-session
-identity switch, so rotation does not require updating any repo secrets.
+Note: reviewer identity PATs are NOT stored as repo CI secrets. They are read from 1Password per-session by the authoring agent for the in-session identity switch, so rotation does not require updating any repo secrets.
 
-The `REVIEWER_ASSIGNMENT_TOKEN` repo secret (a **reviewer-identity**
-PAT used by the Dependabot auto-merge approval + Agent Review Pipeline
-workflows; see "Add `REVIEWER_ASSIGNMENT_TOKEN` to repo secrets" above)
-follows a similar process but also needs a `gh secret set
-REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo}` call on every repo
-after rotating the 1Password item. The `AUTHOR_MERGE_TOKEN` repo secret
-(an **author-identity** PAT used by the Dependabot auto-merge `gh pr
-merge` step + the Agent Review Pipeline auto-merge) follows the same
-process with a `gh secret set AUTHOR_MERGE_TOKEN --repo {owner}/{repo}`
-call after rotating its 1Password item.
+The `REVIEWER_ASSIGNMENT_TOKEN` repo secret (a **reviewer-identity** PAT used by the Dependabot auto-merge approval + Agent Review Pipeline workflows; see "Add `REVIEWER_ASSIGNMENT_TOKEN` to repo secrets" above) follows a similar process but also needs a `gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo {owner}/{repo}` call on every repo after rotating the 1Password item. The `AUTHOR_MERGE_TOKEN` repo secret (an **author-identity** PAT used by the Dependabot auto-merge `gh pr merge` step + the Agent Review Pipeline auto-merge) follows the same process with a `gh secret set AUTHOR_MERGE_TOKEN --repo {owner}/{repo}` call after rotating its 1Password item.
 
 ---
 
@@ -609,9 +528,7 @@ op-firebase-deploy --only functions
 2. Reads source credentials per [Deploy credential precedence (canonical)](#deploy-credential-precedence-canonical) above. Logs the selected source on stderr (`[op-firebase-deploy] source credential: ...`) so deploy auth debugging is no longer opaque.
 3. If the source credential is a `service_account` key matching the target `firebase-deployer@{project-id}.iam.gserviceaccount.com`, uses it directly (no impersonation wrapper needed — faster, no `serviceAccountTokenCreator` required).
 4. Otherwise, unwraps nested impersonated credentials if needed, stamps the target project into `quota_project_id`, and writes a temporary `impersonated_service_account` credential file.
-5. Runs `firebase deploy --non-interactive` with an isolated Firebase CLI
-   configstore, so stale `firebase login` user tokens cannot override the
-   selected Application Default Credential.
+5. Runs `firebase deploy --non-interactive` with an isolated Firebase CLI configstore, so stale `firebase login` user tokens cannot override the selected Application Default Credential.
 6. Cleans up the temp credentials and Firebase CLI configstore on exit.
 
 No browser prompt is needed for routine use once a valid credential exists in the resolution chain and the 1Password CLI is unlocked.
@@ -686,8 +603,7 @@ When connecting CI, the recommended source credential is the same per-project Fi
 
 ### CI/CD & Headless Deploy
 
-For headless environments (Claude Code cloud tasks, GitHub Actions, etc.) where
-1Password biometric auth is unavailable, use the project SA key directly:
+For headless environments (Claude Code cloud tasks, GitHub Actions, etc.) where 1Password biometric auth is unavailable, use the project SA key directly:
 
 ```bash
 # Pull the SA key from 1Password (one-time, requires biometric on an interactive machine)
@@ -721,51 +637,19 @@ Each project's SA key is stored in the 1Password **Firebase** vault with the nam
 
 ### Runtime 1Password secrets and AI agents
 
-Reconciled against 1Password Environments / MCP Server for Codex docs
-as of 2026-05-21. This section is descriptive; adoption decisions for
-the new access model live in the 1Password audit ADR workstream
-(#347/#355/#356/#357).
+Reconciled against 1Password Environments / MCP Server for Codex docs as of 2026-05-21. This section is descriptive; adoption decisions for the new access model live in the 1Password audit ADR workstream (#347/#355/#356/#357).
 
-Reference docs:
-[1Password Environments](https://www.1password.dev/environments),
-[MCP Server for Codex](https://www.1password.dev/environments/mcp-codex-server),
-[local `.env` validation hook](https://www.1password.dev/environments/agent-hook-validate),
-and [`op run` secret loading](https://www.1password.dev/cli/secrets-environment-variables).
+Reference docs: [1Password Environments](https://www.1password.dev/environments), [MCP Server for Codex](https://www.1password.dev/environments/mcp-codex-server), [local `.env` validation hook](https://www.1password.dev/environments/agent-hook-validate), and [`op run` secret loading](https://www.1password.dev/cli/secrets-environment-variables).
 
-> **Beta / platform caveat (#469):** 1Password Environments, the MCP
-> Server for Codex, and the local `.env` validation hook are early-access
-> (beta) 1Password features at the time of writing (2026-05-21) and carry
-> platform constraints — the MCP Server for Codex is a Codex-specific
-> adapter, and the validation hook depends on the 1Password desktop
-> app + CLI integration on the developer's machine. Treat the model below
-> as descriptive and forward-looking: gate adoption on the 1Password
-> audit ADR workstream (#347/#355/#356/#357) and re-check the upstream
-> docs, since beta surfaces change without notice. The portable-core
-> primitives (`op://` references, `op run`, `op inject`, scoped service
-> accounts) are GA and are the safe baseline.
+> **Beta / platform caveat (#469):** 1Password Environments, the MCP Server for Codex, and the local `.env` validation hook are early-access (beta) 1Password features at the time of writing (2026-05-21) and carry platform constraints — the MCP Server for Codex is a Codex-specific adapter, and the validation hook depends on the 1Password desktop app + CLI integration on the developer's machine. Treat the model below as descriptive and forward-looking: gate adoption on the 1Password audit ADR workstream (#347/#355/#356/#357) and re-check the upstream docs, since beta surfaces change without notice. The portable-core primitives (`op://` references, `op run`, `op inject`, scoped service accounts) are GA and are the safe baseline.
 
 Mergepath uses a portable core with per-client adapters:
 
-- **Portable core:** 1Password Environments, `op://` secret
-  references, `op run --environment <environment_id> -- <command>`,
-  `op inject` for generated config files, and scoped service-account
-  tokens for non-interactive runners. These primitives are useful to
-  any shell-capable agent or CI system.
-- **Attended Codex:** the 1Password Environments MCP Server for Codex
-  is the documented adapter for Codex. It lets Codex create and manage
-  Environments, list variable names, and run applications with runtime
-  injection while 1Password keeps raw secret values out of the model
-  context and off disk.
-- **Other attended agents:** Claude Code, Cursor, GitHub Copilot, and
-  Windsurf can use the 1Password local `.env` validation hook when a
-  repo relies on mounted 1Password Environment files.
-- **CI/headless:** use a scoped 1Password service account or
-  pre-materialized CI secret only after a ticket explicitly approves
-  the scope. Do not hand `OP_SERVICE_ACCOUNT_TOKEN` to local attended
-  agents as a convenience fallback.
-- **Existing shell scripts:** keep `op read`, `op run`, and
-  `op inject` shell-outs for repo automation. There is no current
-  requirement to migrate these scripts to a language SDK.
+- **Portable core:** 1Password Environments, `op://` secret references, `op run --environment <environment_id> -- <command>`, `op inject` for generated config files, and scoped service-account tokens for non-interactive runners. These primitives are useful to any shell-capable agent or CI system.
+- **Attended Codex:** the 1Password Environments MCP Server for Codex is the documented adapter for Codex. It lets Codex create and manage Environments, list variable names, and run applications with runtime injection while 1Password keeps raw secret values out of the model context and off disk.
+- **Other attended agents:** Claude Code, Cursor, GitHub Copilot, and Windsurf can use the 1Password local `.env` validation hook when a repo relies on mounted 1Password Environment files.
+- **CI/headless:** use a scoped 1Password service account or pre-materialized CI secret only after a ticket explicitly approves the scope. Do not hand `OP_SERVICE_ACCOUNT_TOKEN` to local attended agents as a convenience fallback.
+- **Existing shell scripts:** keep `op read`, `op run`, and `op inject` shell-outs for repo automation. There is no current requirement to migrate these scripts to a language SDK.
 
 Compatibility matrix:
 
@@ -780,53 +664,25 @@ Compatibility matrix:
 Operational guardrails:
 
 - Never ask a human to paste raw secrets into an agent chat or issue.
-- Never print resolved secret values in logs, PR bodies, or review
-  comments.
-- Use 1Password Environments for sets of runtime variables that need
-  to move across developers, stages, or agents.
-- Use `.env.tpl` plus `op inject` only when the application or tool
-  truly requires a materialized config file.
-- Secure Note `notesPlain` whole-file bootstrap has been retired. Use
-  `.env.tpl` plus `op inject` when a generated file is required.
+- Never print resolved secret values in logs, PR bodies, or review comments.
+- Use 1Password Environments for sets of runtime variables that need to move across developers, stages, or agents.
+- Use `.env.tpl` plus `op inject` only when the application or tool truly requires a materialized config file.
+- Secure Note `notesPlain` whole-file bootstrap has been retired. Use `.env.tpl` plus `op inject` when a generated file is required.
 
 #### Headless `op-preflight` proof workflow
 
-`scripts/op-preflight.sh` has an explicit CI/headless lane for review
-credentials. When `OP_SERVICE_ACCOUNT_TOKEN` is present, review mode
-uses the 1Password CLI service-account path instead of biometric
-desktop approval, writes only `OP_PREFLIGHT_REVIEWER_PAT`, marks the
-cache with `OP_PREFLIGHT_TOKEN_MODE=1`, and skips SSH warming plus
-GitHub keyring repair. This mode is not an implicit fallback for local
-attended agents.
+`scripts/op-preflight.sh` has an explicit CI/headless lane for review credentials. When `OP_SERVICE_ACCOUNT_TOKEN` is present, review mode uses the 1Password CLI service-account path instead of biometric desktop approval, writes only `OP_PREFLIGHT_REVIEWER_PAT`, marks the cache with `OP_PREFLIGHT_TOKEN_MODE=1`, and skips SSH warming plus GitHub keyring repair. This mode is not an implicit fallback for local attended agents.
 
-The manual workflow
-`.github/workflows/onepassword-headless-proof.yml` proves the lane
-without exposing raw values in logs. Before dispatching it, configure:
+The manual workflow `.github/workflows/onepassword-headless-proof.yml` proves the lane without exposing raw values in logs. Before dispatching it, configure:
 
-- `OP_SERVICE_ACCOUNT_TOKEN` as an encrypted GitHub Actions secret.
-  Scope the service account to the approved reviewer PAT items and
-  the dedicated canary item only.
-- `OP_PREFLIGHT_REVIEWER_PAT_REF` as a GitHub Actions variable
-  containing the `op://` reference for the reviewer PAT field in the
-  service-account-accessible proof vault. Do not point token mode at a
-  built-in `Private`/`Personal` vault; 1Password service accounts
-  cannot access those vaults.
-- `OP_PREFLIGHT_CANARY_REF` as a GitHub Actions variable containing a
-  non-sensitive `op://` reference to the proof canary field.
-- `OP_PREFLIGHT_CANARY_SHA256` as an encrypted GitHub Actions secret
-  containing the SHA-256 digest of the canary value.
+- `OP_SERVICE_ACCOUNT_TOKEN` as an encrypted GitHub Actions secret. Scope the service account to the approved reviewer PAT items and the dedicated canary item only.
+- `OP_PREFLIGHT_REVIEWER_PAT_REF` as a GitHub Actions variable containing the `op://` reference for the reviewer PAT field in the service-account-accessible proof vault. Do not point token mode at a built-in `Private`/`Personal` vault; 1Password service accounts cannot access those vaults.
+- `OP_PREFLIGHT_CANARY_REF` as a GitHub Actions variable containing a non-sensitive `op://` reference to the proof canary field.
+- `OP_PREFLIGHT_CANARY_SHA256` as an encrypted GitHub Actions secret containing the SHA-256 digest of the canary value.
 
-When using `scripts/onepassword-headless-proof-setup.sh`, also pass
-`OP_PREFLIGHT_NEGATIVE_SCOPE_REF` or `--negative-scope-ref` pointing to
-an `op://` sentinel in a shared vault outside the service account's
-approved scope. Do not use `Private`/`Personal` for this sentinel; the
-point is to detect accidental access to another service-account-capable
-vault. The setup helper first confirms the local 1Password account can
-read the sentinel, then confirms the service account cannot.
+When using `scripts/onepassword-headless-proof-setup.sh`, also pass `OP_PREFLIGHT_NEGATIVE_SCOPE_REF` or `--negative-scope-ref` pointing to an `op://` sentinel in a shared vault outside the service account's approved scope. Do not use `Private`/`Personal` for this sentinel; the point is to detect accidental access to another service-account-capable vault. The setup helper first confirms the local 1Password account can read the sentinel, then confirms the service account cannot.
 
-The workflow installs the 1Password CLI, reads the canary, compares
-only its digest, verifies the reviewer PAT resolves to
-`nathanpayne-codex`, then runs:
+The workflow installs the 1Password CLI, reads the canary, compares only its digest, verifies the reviewer PAT resolves to `nathanpayne-codex`, then runs:
 
 ```bash
 eval "$(scripts/op-preflight.sh --agent codex --mode review)"
@@ -834,10 +690,7 @@ export OP_PREFLIGHT_QUIET=1
 eval "$(scripts/op-preflight.sh --agent codex --check)"
 ```
 
-The workflow is `workflow_dispatch` only. Run it after provisioning or
-rotating the service-account token; do not enable it as an automatic
-PR or push workflow unless the proof secrets are intentionally
-available to that event class.
+The workflow is `workflow_dispatch` only. Run it after provisioning or rotating the service-account token; do not enable it as an automatic PR or push workflow unless the proof secrets are intentionally available to that event class.
 
 ### Provisioning the Firebase-vault SA key
 
@@ -979,11 +832,7 @@ op-firebase-setup {project-id}
 
 ### Firebase CLI "Authentication Error: credentials are no longer valid" (daily reauth)
 
-Current `op-firebase-deploy` isolates Firebase CLI's configstore for the
-deploy subprocess, so stale `firebase login` user tokens should no longer
-override the selected 1Password-backed Application Default Credential. This
-keeps routine deploys on the project Firebase-vault SA key and avoids the
-daily `firebase login --reauth` loop.
+Current `op-firebase-deploy` isolates Firebase CLI's configstore for the deploy subprocess, so stale `firebase login` user tokens should no longer override the selected 1Password-backed Application Default Credential. This keeps routine deploys on the project Firebase-vault SA key and avoids the daily `firebase login --reauth` loop.
 
 If an older helper is still installed, deploys can fail mid-deploy with:
 
@@ -991,36 +840,19 @@ If an older helper is still installed, deploys can fail mid-deploy with:
 Authentication Error: Your credentials are no longer valid. Please run firebase login --reauth
 ```
 
-The 1Password source-credential chain may still be healthy when this fires.
-The failure is inside Firebase CLI, which checks cached user-login state at
-`~/.config/configstore/firebase-tools.json` before using ADC. That cache's
-access token expires roughly daily and is not refreshed by the 1Password flow.
+The 1Password source-credential chain may still be healthy when this fires. The failure is inside Firebase CLI, which checks cached user-login state at `~/.config/configstore/firebase-tools.json` before using ADC. That cache's access token expires roughly daily and is not refreshed by the 1Password flow.
 
-**Fix:** install the current `op-firebase-deploy` helper and re-run the same
-`scripts/deploy.sh` (or `op-firebase-deploy`) command. The expected source log
-is the project Firebase-vault SA key, and the command should complete without
-prompting for `firebase login --reauth`.
+**Fix:** install the current `op-firebase-deploy` helper and re-run the same `scripts/deploy.sh` (or `op-firebase-deploy`) command. The expected source log is the project Firebase-vault SA key, and the command should complete without prompting for `firebase login --reauth`.
 
 ### 1Password ADC item refresh token expired (#137 failure mode B)
 
-A closely-related but distinct failure can fire immediately after the
-reauth above. If `scripts/op-preflight.sh` materializes a 1Password ADC
-item whose underlying `refresh_token` has been revoked or expired by
-Google, `op-firebase-deploy` will refuse the credential with:
+A closely-related but distinct failure can fire immediately after the reauth above. If `scripts/op-preflight.sh` materializes a 1Password ADC item whose underlying `refresh_token` has been revoked or expired by Google, `op-firebase-deploy` will refuse the credential with:
 
 ```
 Error: GOOGLE_APPLICATION_CREDENTIALS points to an unusable credential file: /var/folders/.../op-preflight-adc-*
 ```
 
-Starting with the #137 fix, `op-preflight.sh` validates the materialized
-ADC against the OAuth2 `/token` endpoint before exporting
-`GOOGLE_APPLICATION_CREDENTIALS`. In Firebase repos, deploy preflight
-tries the project Firebase-vault SA key before this shared ADC path, so
-a provisioned project key avoids the RAPT-prone credential entirely.
-When the shared ADC is still needed and is stale, preflight prints an
-actionable warning and skips the export — downstream callers
-(`op-firebase-deploy`, `gcloud` wrappers) then fall back to the next
-available credential.
+Starting with the #137 fix, `op-preflight.sh` validates the materialized ADC against the OAuth2 `/token` endpoint before exporting `GOOGLE_APPLICATION_CREDENTIALS`. In Firebase repos, deploy preflight tries the project Firebase-vault SA key before this shared ADC path, so a provisioned project key avoids the RAPT-prone credential entirely. When the shared ADC is still needed and is stale, preflight prints an actionable warning and skips the export — downstream callers (`op-firebase-deploy`, `gcloud` wrappers) then fall back to the next available credential.
 
 **Fix permanently** by refreshing the 1Password item:
 
@@ -1032,29 +864,14 @@ op document edit 'GCP ADC' --vault=Private \
 # (or `op item edit` if stored as an item field)
 ```
 
-After that, the next preflight run will materialize a usable credential
-and the `GOOGLE_APPLICATION_CREDENTIALS` export resumes normally.
+After that, the next preflight run will materialize a usable credential and the `GOOGLE_APPLICATION_CREDENTIALS` export resumes normally.
 
-For routine Firebase deploys, the preferred permanent fix is to
-provision or rotate the project Firebase-vault SA key instead of
-depending on the shared human ADC. The shared ADC remains a fallback for
-projects that have not provisioned the key and for non-Firebase `gcloud`
-operations.
+For routine Firebase deploys, the preferred permanent fix is to provision or rotate the project Firebase-vault SA key instead of depending on the shared human ADC. The shared ADC remains a fallback for projects that have not provisioned the key and for non-Firebase `gcloud` operations.
 
 ## Changelog
 
-**2026-05-15: Deploy credential precedence updated.** Project Firebase-vault SA keys
-are now the default for `op-firebase-deploy`. See #154 / #211 for implementation
-history; live consumer verification on matchline pending (#211 close-out).
+**2026-05-15: Deploy credential precedence updated.** Project Firebase-vault SA keys are now the default for `op-firebase-deploy`. See #154 / #211 for implementation history; live consumer verification on matchline pending (#211 close-out).
 
-**2026-05-22: Deploy preflight caches the project SA key first.** In Firebase repos,
-`op-preflight.sh --mode deploy|all` now materializes the project Firebase-vault SA
-key before trying the shared GCP ADC. This removes the routine stale-ADC/RAPT probe
-from attended deploy sessions when the durable project key exists.
+**2026-05-22: Deploy preflight caches the project SA key first.** In Firebase repos, `op-preflight.sh --mode deploy|all` now materializes the project Firebase-vault SA key before trying the shared GCP ADC. This removes the routine stale-ADC/RAPT probe from attended deploy sessions when the durable project key exists.
 
-**2026-05-15: `op-firebase-setup --provision-sa-key` flag added.** The setup script
-now optionally mints the deployer SA key and uploads it to
-`op://Firebase/{project-id} — Firebase Deployer SA Key` as part of the same
-attended invocation, folding the previously-manual DEPLOYMENT.md procedure into
-the script. Opt-in to preserve the prior impersonation-only behavior contract.
-See #154 close-out.
+**2026-05-15: `op-firebase-setup --provision-sa-key` flag added.** The setup script now optionally mints the deployer SA key and uploads it to `op://Firebase/{project-id} — Firebase Deployer SA Key` as part of the same attended invocation, folding the previously-manual DEPLOYMENT.md procedure into the script. Opt-in to preserve the prior impersonation-only behavior contract. See #154 close-out.

@@ -2,10 +2,7 @@
 
 **Reference implementation of the AI Agent Tooling Standard.**
 
-The goal is to allow multiple AI coding agents and development tools to operate
-consistently without configuration drift. See [`BRAND.md`](BRAND.md) for
-the umbrella vocabulary (Playground, Cockpit, Tiebreaker, Checks) and
-naming history.
+The goal is to allow multiple AI coding agents and development tools to operate consistently without configuration drift. See [`BRAND.md`](BRAND.md) for the umbrella vocabulary (Playground, Cockpit, Tiebreaker, Checks) and naming history.
 
 ## For AI Agents
 
@@ -18,11 +15,7 @@ Read these files in order before taking any action:
 
 ## Code Review Policy
 
-Every change in this repository goes through the policy in `REVIEW_POLICY.md`,
-including a self-peer review by the authoring agent's reviewer identity and,
-for changes that cross the threshold or touch protected paths, automated
-external review via the OpenAI Codex GitHub app (Phase 4a) or a manual CLI
-fallback (Phase 4b).
+Every change in this repository goes through the policy in `REVIEW_POLICY.md`, including a self-peer review by the authoring agent's reviewer identity and, for changes that cross the threshold or touch protected paths, automated external review via the OpenAI Codex GitHub app (Phase 4a) or a manual CLI fallback (Phase 4b).
 
 ## Key Files
 
