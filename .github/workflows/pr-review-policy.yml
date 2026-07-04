@@ -377,8 +377,13 @@ jobs:
           # is false), so no marker is ever posted for an unverified head.
           # Marker contract is shared with merge-clearance-gate.sh
           # (lane_verified(), also consumed indirectly by agent-review.yml's
-          # rc=5 branch via --derive-external-requiredness, #620) — keep the
-          # `mergepath-propagation-lane verified-head=<sha>` form in sync.
+          # rc=5 branch via --derive-external-requiredness, #620) AND with
+          # agent-review.yml's triage job (#656: triage skips its
+          # needs-external-review add only for a head this marker pins) —
+          # keep the `mergepath-propagation-lane verified-head=<sha>` form
+          # in sync across the three files
+          # (scripts/ci/check_agent_review_triage_defers asserts the
+          # lockstep).
           #
           # ORDER MATTERS (#620 Codex r9): the marker MUST be posted before
           # the label removal below. The removal fires agent-review.yml's
