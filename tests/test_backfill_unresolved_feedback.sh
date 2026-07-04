@@ -89,6 +89,17 @@ case "${STUB_RESOLVE_MODE:-ok}" in
     # closed on the exit code alone.
     echo "resolve: boom (no parseable summary)" >&2
     exit 2 ;;
+  skip_only)
+    # A PR that verifies NOTHING but leaves skips behind (drifted / unverified).
+    # would-resolve/resolved is 0; skipped is non-zero. Proves skipped-only PRs
+    # are still printed per-PR (Codex P3 on #666).
+    if [ "$dry" -eq 1 ]; then
+      echo "(dry-run; no threads modified) — would-resolve: 0, skipped (human): 0, skipped (stale-HEAD): 0, skipped (not-actioned): 0, skipped (drift): 2"
+      exit 3
+    else
+      echo "Resolved: 0  Skipped (human): 0  Skipped (stale-HEAD): 0  Skipped (not-actioned): 0  Skipped (drift): 2  Failed: 0  Readback-failed: 0"
+      exit 3
+    fi ;;
   *)
     if [ "$dry" -eq 1 ]; then
       # Emit a non-not-actioned skip category (drift) too, so the backfill's
@@ -402,6 +413,16 @@ if [ "$RC" -eq 1 ] && grep -qi 'non-trusted ref' <<<"$OUT" && [ ! -s "$STUB_RESO
   pass=$((pass+1)); echo "PASS: verified-propagation fails closed from a non-trusted checkout (no resolver call)"
 else
   fail=$((fail+1)); echo "FAIL: trusted-ref guard should fail closed without override (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 21: a skipped-only PR (0 resolves, non-zero skips) is still printed
+#    per-PR, not just folded into the summary total, so the operator sees WHICH
+#    PRs carry unverified/drifted threads (Codex P3 on #666).
+run_bf skip_only
+if [ "$RC" -eq 0 ] && grep -q 'would-resolve=0 skipped=2' <<<"$OUT"; then
+  pass=$((pass+1)); echo "PASS: skipped-only PR is printed per-PR (not hidden when would-resolve=0)"
+else
+  fail=$((fail+1)); echo "FAIL: skipped-only PR should still print per-PR (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
 echo

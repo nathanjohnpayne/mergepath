@@ -341,10 +341,13 @@ while IFS=$'\t' read -r repo pr; do
     echo "  $repo#$pr: FAILED (exit=$resolve_rc failed=$failed readback-failed=$readback_failed)" >&2
     printf '%s\n' "$rc_line" | sed 's/^/    /' >&2
   fi
+  # Print any PR with resolves OR leftover skips, so a skipped-only PR (nothing
+  # verified, but drifted / unverified threads remain) is visible per-PR, not
+  # just folded into the summary total (Codex P3 on #666).
   if $DRY_RUN; then
-    [ "$would" -gt 0 ] && echo "  $repo#$pr: would-resolve=$would skipped=$skipped"
+    if [ "$would" -gt 0 ] || [ "$skipped" -gt 0 ]; then echo "  $repo#$pr: would-resolve=$would skipped=$skipped"; fi
   else
-    [ "$resolved" -gt 0 ] && echo "  $repo#$pr: resolved=$resolved skipped=$skipped"
+    if [ "$resolved" -gt 0 ] || [ "$skipped" -gt 0 ]; then echo "  $repo#$pr: resolved=$resolved skipped=$skipped"; fi
   fi
 done <<< "$PAIRS"
 
