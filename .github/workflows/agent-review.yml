@@ -194,7 +194,76 @@ jobs:
             // Use >= to match REVIEW_POLICY.md definition
             const needsExternal = totalChanges >= threshold || touchesProtected;
 
-            if (needsExternal) {
+            // PROPAGATION-LANE-DEFER (#656): this job and pr-review-policy.yml's
+            // External Review Check both decide needs-external-review, but only
+            // the latter BYTE-VERIFIES a mergepath-sync/ PR against
+            // mergepath@<sha> and exempts a faithful mirror (removing the
+            // label + posting a github-actions[bot] comment with the
+            // HEAD-PINNED marker `mergepath-propagation-lane
+            // verified-head=<sha>`). Pre-#656, this job re-added the label on
+            // any later event because it never consulted that verdict —
+            // stranding approved, byte-verified sync PRs on Label Gate
+            // (tadlockpsychiatry#93: lane-cleared 14:55, triage re-added
+            // 15:46, stuck).
+            //
+            // Fix: SKIP the label add ONLY when the lane has already verified
+            // THIS exact head — i.e. a github-actions[bot]-authored comment
+            // carries the marker pinned to pr.head.sha. Everything else stays
+            // FAIL-CLOSED: an unverified sync head (fresh push, diverged
+            // hand-edit, reopened-with-new-head) is labeled here exactly as
+            // before, and the lane later removes the label if and only if the
+            // byte-compare passes. This preserves the PAT-driven label
+            // add/remove events that re-arm the downstream gates, and it
+            // grants no exemption this job derives itself — the lane's
+            // byte-verify remains the sole teeth. (The naive alternative —
+            // skipping by branch name — was rejected as fail-OPEN in the
+            // closed first attempt: Codex P1 on the #657 PR.)
+            //
+            // Marker contract + trust model are shared with
+            // scripts/merge-clearance-gate.sh lane_verified() (#620): only
+            // repo workflows author github-actions[bot] comments, and only
+            // pr-review-policy.yml posts this marker, only after
+            // verify-propagation-pr.sh byte-confirms the head. Keep the
+            // marker string in lockstep across the three files
+            // (scripts/ci/check_agent_review_triage_defers asserts it).
+            // The branch-prefix pre-filter must match SYNC_BRANCH_PREFIX in
+            // scripts/sync-to-downstream.sh; it only bounds the extra API
+            // read to sync branches — the marker, not the branch name, is
+            // what authorizes the skip.
+            let laneVerifiedHead = false;
+            if (needsExternal &&
+                ((pr.head && pr.head.ref) || '').startsWith('mergepath-sync/')) {
+              try {
+                const comments = await github.paginate(
+                  github.rest.issues.listComments,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                );
+                const marker = `mergepath-propagation-lane verified-head=${pr.head.sha}`;
+                laneVerifiedHead = comments.some(
+                  c => c.user && c.user.login === 'github-actions[bot]' &&
+                       (c.body || '').includes(marker)
+                );
+              } catch (e) {
+                // Indeterminate marker read must not skip labeling — mirror
+                // lane_verified()'s fail-safe direction (external review can
+                // only be ADDED by an uncertain read, never removed).
+                core.warning(`Propagation-lane marker read failed (${e.message}); labeling fail-closed.`);
+                laneVerifiedHead = false;
+              }
+            }
+
+            if (needsExternal && laneVerifiedHead) {
+              console.log(
+                `Propagation lane already byte-verified head ${pr.head.sha} ` +
+                `(github-actions[bot] verified-head marker present) — skipping ` +
+                `needs-external-review add; the lane owns this PR's labeling.`
+              );
+            } else if (needsExternal) {
               await github.rest.issues.addLabels({
                 owner: context.repo.owner,
                 repo: context.repo.repo,

@@ -1,33 +1,19 @@
 # Mergepath — surfaces
 
-This directory holds Mergepath's static, single-file surfaces.
-Currently only the **Playground** lives here; Cockpit, Tiebreaker, and
-Checks are reserved names for future surfaces — see
-[`BRAND.md`](../BRAND.md) at repo root. Nothing here is wired to a
-backend or a build system. Open the HTML in a browser and it works.
+This directory holds Mergepath's static, single-file surfaces. Currently only the **Playground** lives here; Cockpit, Tiebreaker, and Checks are reserved names for future surfaces — see [`BRAND.md`](../BRAND.md) at repo root. Nothing here is wired to a backend or a build system. Open the HTML in a browser and it works.
 
 ## Mergepath Playground
 
-`playground/index.html` is the current Playground. It lets you tune the
-policy knobs from `.github/review-policy.yml` and replay recent PRs
-against the draft policy so you can feel the shape of the change before
-committing the YAML.
+`playground/index.html` is the current Playground. It lets you tune the policy knobs from `.github/review-policy.yml` and replay recent PRs against the draft policy so you can feel the shape of the change before committing the YAML.
 
 ### What you can change
 
-- **External review threshold.** Lines changed at or above this value
-  escalate a PR to Phase 4.
-- **Protected paths.** Glob patterns (`*`, `**`, `?`). Any match forces
-  Phase 4 regardless of size.
+- **External review threshold.** Lines changed at or above this value escalate a PR to Phase 4.
+- **Protected paths.** Glob patterns (`*`, `**`, `?`). Any match forces Phase 4 regardless of size.
 - **CodeRabbit.** Toggles the Phase 2.5 advisory auto-review.
-- **Codex GitHub App.** Toggles Phase 4a automated external review,
-  with a max-rounds cap.
+- **Codex GitHub App.** Toggles Phase 4a automated external review, with a max-rounds cap.
 - **Reviewers.** The identities eligible to serve as internal reviewer.
-- **Feedback policy.** Which bot-review findings the agent must
-  disposition (fix or rebut + resolve) before merge — either "address
-  or rebut all feedback" (`mode: address-all`) or a per-priority
-  checkbox group (P0–P3) that marks each tier `required` or
-  `discretionary`.
+- **Feedback policy.** Which bot-review findings the agent must disposition (fix or rebut + resolve) before merge — either "address or rebut all feedback" (`mode: address-all`) or a per-priority checkbox group (P0–P3) that marks each tier `required` or `discretionary`.
 - **Presets.** Strict / Standard / Loose starting points.
 
 ### How to run it
@@ -39,8 +25,7 @@ xdg-open mergepath/playground/index.html         # Linux
 start mergepath\playground\index.html            # Windows
 ```
 
-It opens with a synthetic set of sample PRs so the page demos without
-any setup. The header badge reads **synthetic · 8**.
+It opens with a synthetic set of sample PRs so the page demos without any setup. The header badge reads **synthetic · 8**.
 
 ### Replaying your real PRs
 
@@ -49,15 +34,9 @@ any setup. The header badge reads **synthetic · 8**.
 ./scripts/policy-sim.sh 50     # custom limit
 ```
 
-The helper runs `gh pr list --state merged`, shapes the JSON into the
-`window.__PRS` format, injects it into a temporary copy of
-`playground/index.html`, and opens that copy in a new tab. The header badge
-flips to **live · N** and the routing simulation replays each PR
-against whichever policy draft you have loaded.
+The helper runs `gh pr list --state merged`, shapes the JSON into the `window.__PRS` format, injects it into a temporary copy of `playground/index.html`, and opens that copy in a new tab. The header badge flips to **live · N** and the routing simulation replays each PR against whichever policy draft you have loaded.
 
-Requirements: `gh`, `jq`, and `python3` on `PATH`; `gh auth status`
-must show you're signed in. Nothing is written back to the repo — the
-baked copy lives in a temp file.
+Requirements: `gh`, `jq`, and `python3` on `PATH`; `gh auth status` must show you're signed in. Nothing is written back to the repo — the baked copy lives in a temp file.
 
 ### Contract for `scripts/policy-sim.sh`
 
@@ -73,21 +52,12 @@ The script rewrites it to:
 <script>window.__PRS = [ ... ];</script>
 ```
 
-Each entry in the array must be `{ id, title, author, lines, paths }`.
-The page tolerates missing fields but expects those keys.
+Each entry in the array must be `{ id, title, author, lines, paths }`. The page tolerates missing fields but expects those keys.
 
-The legacy marker `<!-- RUBRIC_INJECT -->` is still recognized for
-scripts carried over from earlier versions of this Playground; new
-tooling should target `MERGEPATH_INJECT`.
+The legacy marker `<!-- RUBRIC_INJECT -->` is still recognized for scripts carried over from earlier versions of this Playground; new tooling should target `MERGEPATH_INJECT`.
 
 ### What this isn't
 
-- **Not a backend.** No network calls, no auth, no server. Everything
-  renders from the static file plus whatever the injection script
-  bakes in.
-- **Not a generator.** The draft YAML panel shows what the current
-  knob configuration would look like as `.github/review-policy.yml`.
-  It does not write to disk. Copy it yourself if you want to apply.
-- **Not canonical.** The spec for this page is
-  `specs/mergepath_playground.md`. If the spec and the page disagree,
-  the spec wins.
+- **Not a backend.** No network calls, no auth, no server. Everything renders from the static file plus whatever the injection script bakes in.
+- **Not a generator.** The draft YAML panel shows what the current knob configuration would look like as `.github/review-policy.yml`. It does not write to disk. Copy it yourself if you want to apply.
+- **Not canonical.** The spec for this page is `specs/mergepath_playground.md`. If the spec and the page disagree, the spec wins.

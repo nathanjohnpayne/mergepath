@@ -20,30 +20,13 @@ related_issues:
 
 ## 1. Summary
 
-Phase 4b—Mergepath's manual CLI fallback for cross-agent external review—is the
-last human-in-the-loop step on the merge path. Today the originating agent emits
-a handoff block into chat, a human pastes it into a second agent's CLI session,
-that agent reviews, and the human shuttles feedback back and forth until an
-`APPROVED` review lands. This ticket replaces the human shuttle with an
-**orchestrated, headless CLI invocation** of the external reviewer—the OpenAI
-**Codex CLI** (`codex exec`) when the reviewer is `nathanpayne-codex`, and the
-**Claude Code CLI** (`claude -p`) when the reviewer is `nathanpayne-claude`—so a
-4b review is requested, produced, posted, and (on approval) merged with little or
-no human intervention.
+Phase 4b—Mergepath's manual CLI fallback for cross-agent external review—is the last human-in-the-loop step on the merge path. Today the originating agent emits a handoff block into chat, a human pastes it into a second agent's CLI session, that agent reviews, and the human shuttles feedback back and forth until an `APPROVED` review lands. This ticket replaces the human shuttle with an **orchestrated, headless CLI invocation** of the external reviewer—the OpenAI **Codex CLI** (`codex exec`) when the reviewer is `nathanpayne-codex`, and the **Claude Code CLI** (`claude -p`) when the reviewer is `nathanpayne-claude`—so a 4b review is requested, produced, posted, and (on approval) merged with little or no human intervention.
 
-The design's load-bearing observation: **the merge gate already accepts the exact
-artifact we are automating.** `scripts/codex-review-check.sh` gate (c) treats an
-`APPROVED` review on the current HEAD from a non-author identity in
-`available_reviewers` as a valid "Phase 4b substitute" clearance (governed by
-`codex.allow_phase_4b_substitute`, default `true`, #218). So this feature does
-**not** modify the merge gate, the auto-clear workflow, or the HEAD-pinned
-merge-clearance gate (#427/#428). It automates only the *production and posting*
-of that review.
+The design's load-bearing observation: **the merge gate already accepts the exact artifact we are automating.** `scripts/codex-review-check.sh` gate (c) treats an `APPROVED` review on the current HEAD from a non-author identity in `available_reviewers` as a valid "Phase 4b substitute" clearance (governed by `codex.allow_phase_4b_substitute`, default `true`, #218). So this feature does **not** modify the merge gate, the auto-clear workflow, or the HEAD-pinned merge-clearance gate (#427/#428). It automates only the *production and posting* of that review.
 
 ## 2. Background: what a 4b handoff is today
 
-The canonical flow is in `REVIEW_POLICY.md` § Phase 4b (steps 11b–20b) and
-summarized in `AGENTS.md` step 8. Phase 4b fires when:
+The canonical flow is in `REVIEW_POLICY.md` § Phase 4b (steps 11b–20b) and summarized in `AGENTS.md` step 8. Phase 4b fires when:
 
 - Phase 4a (the ChatGPT Codex Connector GitHub App) times out (`codex-review-request.sh` exit `4`), escalates, or is unavailable (`codex.enabled: false`); or
 - `phase_4b_default` routes proactively—`always`, or `complex-changes` when `scripts/phase-4b-classifier.sh` exits `1` (#158/#186/#187).
@@ -59,9 +42,7 @@ The current mechanics are deliberately human-mediated:
 | Fix + re-review | Originating agent → **Human** → external agent | Loop until `APPROVED` |
 | Merge | `nathanjohnpayne` | After pre-merge conversation gate is clean |
 
-The two **Human** rows are the cost this ticket removes. `REVIEW_POLICY.md`
-§ Phase 4b Triggers notes the human-mediated handoff "typically adds 30 minutes
-to a few hours per PR."
+The two **Human** rows are the cost this ticket removes. `REVIEW_POLICY.md` § Phase 4b Triggers notes the human-mediated handoff "typically adds 30 minutes to a few hours per PR."
 
 ## 3. Goals, non-goals, success criteria
 
@@ -80,18 +61,11 @@ to a few hours per PR."
 - Running the reviewer CLIs in GitHub Actions CI. This ticket is **local-first** (see § 11). A CI execution mode is deferred to a follow-up.
 - Automating the Cursor reviewer (`nathanpayne-cursor`); the adapter interface is built to admit it later.
 
-**Success criteria.** For a threshold PR routed to 4b, the system requests the
-review, the reviewer CLI produces a verdict, an `APPROVED` (or
-`CHANGES_REQUESTED`) review is posted under the correct reviewer identity on the
-current HEAD, and—on approval—the existing gates clear and the PR merges, with
-zero human keystrokes on the happy path. The feature is "successful if the 4b
-handoff occurs automatically with little or no human intervention"; full
-hands-off operation is the target, not a hard gate.
+**Success criteria.** For a threshold PR routed to 4b, the system requests the review, the reviewer CLI produces a verdict, an `APPROVED` (or `CHANGES_REQUESTED`) review is posted under the correct reviewer identity on the current HEAD, and—on approval—the existing gates clear and the PR merges, with zero human keystrokes on the happy path. The feature is "successful if the 4b handoff occurs automatically with little or no human intervention"; full hands-off operation is the target, not a hard gate.
 
 ## 4. Where this sits in the review pipeline
 
-The automated handoff is a drop-in for the manual 4b leg only. Everything
-upstream (Phases 1–3, 4a) and the merge gate downstream are unchanged.
+The automated handoff is a drop-in for the manual 4b leg only. Everything upstream (Phases 1–3, 4a) and the merge gate downstream are unchanged.
 
 ```mermaid
 flowchart TD
@@ -115,13 +89,7 @@ flowchart TD
 
 ## 5. Architecture overview
 
-A single **orchestrator** owns the round loop and identity/attribution. It
-delegates the actual review reasoning to a direction-specific **adapter** that
-wraps the reviewer's CLI. The adapter is read-only and never posts to GitHub; the
-orchestrator posts the verdict under the reviewer PAT. This separation is what
-keeps the multi-identity model intact (the CLI authenticates to its LLM provider;
-the GitHub write authenticates as the reviewer identity—two different planes,
-§ 11).
+A single **orchestrator** owns the round loop and identity/attribution. It delegates the actual review reasoning to a direction-specific **adapter** that wraps the reviewer's CLI. The adapter is read-only and never posts to GitHub; the orchestrator posts the verdict under the reviewer PAT. This separation is what keeps the multi-identity model intact (the CLI authenticates to its LLM provider; the GitHub write authenticates as the reviewer identity—two different planes, § 11).
 
 ```mermaid
 graph TD
@@ -148,16 +116,11 @@ graph TD
     ORCH -.->|"error / timeout / ambiguous verdict"| FB["post-phase-4b-handoff.sh<br/>(manual fallback, today's flow)"]
 ```
 
-The orchestrator mirrors the JSON-contract and exit-code discipline of the
-existing `scripts/codex-review-request.sh` (HEAD-pinned, idempotent, emits a
-machine-parseable summary), so callers reason over it the same way.
+The orchestrator mirrors the JSON-contract and exit-code discipline of the existing `scripts/codex-review-request.sh` (HEAD-pinned, idempotent, emits a machine-parseable summary), so callers reason over it the same way.
 
 ## 6. Reviewer selection and why direction matters
 
-The reviewer identity is chosen the same way the policy already implies: a member
-of `available_reviewers` that is **not** the PR's `Authoring-Agent`, defaulting to
-`default_external_reviewer` (`nathanpayne-codex`) and rotating off it when the
-author *is* codex.
+The reviewer identity is chosen the same way the policy already implies: a member of `available_reviewers` that is **not** the PR's `Authoring-Agent`, defaulting to `default_external_reviewer` (`nathanpayne-codex`) and rotating off it when the author *is* codex.
 
 ```mermaid
 flowchart TD
@@ -170,18 +133,11 @@ flowchart TD
     E -->|claude| G["Direction B: Codex→Claude<br/>claude -p adapter"]
 ```
 
-Direction is not cosmetic. It selects the adapter, the credential, the
-sandbox/permission model, the prompt shape, and how a verdict is derived—because
-the two CLIs expose review very differently (§ 9). It also keeps the cross-agent
-guarantee: the reviewer identity differs from the author, so the posted
-`APPROVED` is a genuine cross-agent signal and does **not** trip the no-self-approve
-rule (`REVIEW_POLICY.md` § No-self-approve scoping) or the `gh-pr-guard.sh` block
-on same-agent over-threshold approvals.
+Direction is not cosmetic. It selects the adapter, the credential, the sandbox/permission model, the prompt shape, and how a verdict is derived—because the two CLIs expose review very differently (§ 9). It also keeps the cross-agent guarantee: the reviewer identity differs from the author, so the posted `APPROVED` is a genuine cross-agent signal and does **not** trip the no-self-approve rule (`REVIEW_POLICY.md` § No-self-approve scoping) or the `gh-pr-guard.sh` block on same-agent over-threshold approvals.
 
 ## 7. Direction A — Claude → Codex (`codex exec`)
 
-The authoring agent is Claude; the external reviewer is `nathanpayne-codex`,
-driven by the Codex CLI in non-interactive mode.
+The authoring agent is Claude; the external reviewer is `nathanpayne-codex`, driven by the Codex CLI in non-interactive mode.
 
 ```mermaid
 sequenceDiagram
@@ -207,18 +163,9 @@ sequenceDiagram
     end
 ```
 
-**Why Codex needs more scaffolding.** Per the Codex CLI docs there is **no
-`codex review` subcommand and no `/review` slash command**; a review is just a
-prompted `codex exec` run, and Codex CLI emits free-form text with **no native
-`APPROVED`/`CHANGES_REQUESTED` review state**
-([non-interactive mode](https://developers.openai.com/codex/noninteractive),
-[CLI reference](https://developers.openai.com/codex/cli/reference)). The adapter
-therefore imposes structure and the orchestrator maps it to a GitHub review
-state. `codex exec` already defaults to a **read-only sandbox**; we set it
-explicitly and disable approvals for unattended runs.
+**Why Codex needs more scaffolding.** Per the Codex CLI docs there is **no `codex review` subcommand and no `/review` slash command**; a review is just a prompted `codex exec` run, and Codex CLI emits free-form text with **no native `APPROVED`/`CHANGES_REQUESTED` review state** ([non-interactive mode](https://developers.openai.com/codex/noninteractive), [CLI reference](https://developers.openai.com/codex/cli/reference)). The adapter therefore imposes structure and the orchestrator maps it to a GitHub review state. `codex exec` already defaults to a **read-only sandbox**; we set it explicitly and disable approvals for unattended runs.
 
-Illustrative adapter invocation (flags verbatim from the Codex CLI reference;
-`git diff`/`gh` are standard tooling):
+Illustrative adapter invocation (flags verbatim from the Codex CLI reference; `git diff`/`gh` are standard tooling):
 
 ```bash
 # Read-only, never blocks on approval; final message also written to out.json.
@@ -236,16 +183,9 @@ git diff "origin/${BASE}...${HEAD_SHA}" \
 
 - `--output-schema <file>` forces the final response to conform to a JSON Schema (`{verdict, findings[]}`), which the orchestrator parses deterministically—this is how we recover a review *state* the CLI does not natively emit.
 - `-o, --output-last-message <file>` writes the final message to a file (and stdout) for capture.
-- Auth is the operator's persisted ChatGPT/Codex plan login via `codex login`.
-  The adapter launches Codex under a tightly allowlisted child environment and
-  an empty scratch review root. Its copied `CODEX_HOME/auth.json` lives outside
-  that root, so a stray metered API key, GitHub token, deploy/cloud credential,
-  SSH agent socket, or user-home file cannot become available to
-  prompt-injected review commands.
+- Auth is the operator's persisted ChatGPT/Codex plan login via `codex login`. The adapter launches Codex under a tightly allowlisted child environment and an empty scratch review root. Its copied `CODEX_HOME/auth.json` lives outside that root, so a stray metered API key, GitHub token, deploy/cloud credential, SSH agent socket, or user-home file cannot become available to prompt-injected review commands.
 
-The orchestrator then posts the verdict as a GitHub review under the reviewer PAT
-(never from inside the sandboxed CLI), using the pull-review API so the created
-review is pinned to the exact reviewed SHA:
+The orchestrator then posts the verdict as a GitHub review under the reviewer PAT (never from inside the sandboxed CLI), using the pull-review API so the created review is pinned to the exact reviewed SHA:
 
 ```bash
 GH_AS_REVIEWER_IDENTITY=nathanpayne-codex \
@@ -255,8 +195,7 @@ GH_AS_REVIEWER_IDENTITY=nathanpayne-codex \
 
 ## 8. Direction B — Codex → Claude (`claude -p`)
 
-The authoring agent is Codex; the external reviewer is `nathanpayne-claude`,
-driven by Claude Code in print/headless mode.
+The authoring agent is Codex; the external reviewer is `nathanpayne-claude`, driven by Claude Code in print/headless mode.
 
 ```mermaid
 sequenceDiagram
@@ -282,13 +221,7 @@ sequenceDiagram
     end
 ```
 
-**Why Claude still uses a wrapper prompt.** Claude Code has built-in review
-slash commands, but the reference adapter does not let the CLI post GitHub
-reviews directly. It runs `claude -p` in plan mode with a replacement
-text-only structured-output system prompt, asks for the same verdict contract
-the Codex direction uses, validates the response against the shared schema
-after parsing the print-mode JSON envelope, and leaves GitHub attribution to
-`scripts/gh-as-reviewer.sh`.
+**Why Claude still uses a wrapper prompt.** Claude Code has built-in review slash commands, but the reference adapter does not let the CLI post GitHub reviews directly. It runs `claude -p` in plan mode with a replacement text-only structured-output system prompt, asks for the same verdict contract the Codex direction uses, validates the response against the shared schema after parsing the print-mode JSON envelope, and leaves GitHub attribution to `scripts/gh-as-reviewer.sh`.
 
 Illustrative adapter invocation:
 
@@ -306,20 +239,12 @@ claude -p "$PROMPT_WITH_VERDICT_SCHEMA" \
 # Parse: jq -r '.result' out.json
 ```
 
-- The replacement `--system-prompt` keeps Claude Code in text-review mode
-  instead of returning an implementation-planning transcript; the shared
-  verdict contract still lives in the user prompt and the adapter validates the
-  parsed object against `verdict.schema.json`.
+- The replacement `--system-prompt` keeps Claude Code in text-review mode instead of returning an implementation-planning transcript; the shared verdict contract still lives in the user prompt and the adapter validates the parsed object against `verdict.schema.json`.
 - `--permission-mode plan` keeps the run read-only (research/propose, no edits)—the appropriate posture for an unattended reviewer ([permission modes](https://code.claude.com/docs/en/permission-modes)).
-- `--effort medium` keeps the large-diff review bounded enough for the adapter
-  timeout while still doing a full review pass.
+- `--effort medium` keeps the large-diff review bounded enough for the adapter timeout while still doing a full review pass.
 - `--tools ""` disables Claude Code tools entirely. The diff is already on stdin, so the reviewer does not need `Read` or `Bash`; this prevents prompt-injected diffs from steering the CLI into reading local files or environment state.
 - `--output-format json` yields a structured result (result text, `session_id`, cost) for the orchestrator to parse ([headless mode](https://code.claude.com/docs/en/headless)).
-- Headless auth uses the operator's Claude Code subscription login, preserving
-  `CLAUDE_CODE_OAUTH_TOKEN` when present. The adapter launches Claude under a
-  tightly allowlisted child environment, so a stray metered API token, GitHub
-  token, deploy/cloud credential, or SSH agent socket cannot become available
-  to prompt-injected review commands.
+- Headless auth uses the operator's Claude Code subscription login, preserving `CLAUDE_CODE_OAUTH_TOKEN` when present. The adapter launches Claude under a tightly allowlisted child environment, so a stray metered API token, GitHub token, deploy/cloud credential, or SSH agent socket cannot become available to prompt-injected review commands.
 
 As in Direction A, attribution is the orchestrator's job:
 
@@ -343,31 +268,11 @@ GH_AS_REVIEWER_IDENTITY=nathanpayne-claude \
 | Session continuation | `codex exec resume --last "..."` | `--resume <id>` / `--continue` / `--session-id` |
 | CI option (deferred) | `openai/codex-action@v1` | `anthropics/claude-code-action` |
 
-The single most consequential difference: **Codex gives you reasoning text and
-nothing structural, so the Codex adapter must manufacture a review state via an
-output schema and fail closed when the schema is not satisfied; the Claude
-adapter gets a JSON envelope but still relies on the shared verdict schema in
-`.result`.** Both converge on the same
-output—an `APPROVED`/`CHANGES_REQUESTED` review posted under the reviewer PAT—so
-the orchestrator and the merge gate stay direction-agnostic.
+The single most consequential difference: **Codex gives you reasoning text and nothing structural, so the Codex adapter must manufacture a review state via an output schema and fail closed when the schema is not satisfied; the Claude adapter gets a JSON envelope but still relies on the shared verdict schema in `.result`.** Both converge on the same output—an `APPROVED`/`CHANGES_REQUESTED` review posted under the reviewer PAT—so the orchestrator and the merge gate stay direction-agnostic.
 
 ## 10. Review round loop and fail-closed degradation
 
-The reference orchestrator performs one exhaustive adapter pass per invocation:
-the prompt uses "Exhaustive code review" and asks the reviewer to keep looking
-for additional findings until it stops finding new issues, then return the full
-verdict object. `max_review_rounds` is a declarative cap for the outer review
-flow that re-runs this helper after `CHANGES_REQUESTED`; this first ship does
-not persist round state inside the
-helper itself.
-The key safety property: **the system only ever posts `APPROVED` when an adapter
-returns an unambiguous approval with no findings at all.** The shared validator
-still reads the repo's `feedback_policy` (#574; absent policy defaults to P0/P1
-required) so blocking findings cannot masquerade as approvals, and the
-orchestrator adds a stricter posting rule: advisory findings on an approving
-verdict route to the manual handoff until the required post-review issue filing
-path has been handled. A parse failure, adapter error, or approval that still
-carries any finding never becomes an automated approval.
+The reference orchestrator performs one exhaustive adapter pass per invocation: the prompt uses "Exhaustive code review" and asks the reviewer to keep looking for additional findings until it stops finding new issues, then return the full verdict object. `max_review_rounds` is a declarative cap for the outer review flow that re-runs this helper after `CHANGES_REQUESTED`; this first ship does not persist round state inside the helper itself. The key safety property: **the system only ever posts `APPROVED` when an adapter returns an unambiguous approval with no findings at all.** The shared validator still reads the repo's `feedback_policy` (#574; absent policy defaults to P0/P1 required) so blocking findings cannot masquerade as approvals, and the orchestrator adds a stricter posting rule: advisory findings on an approving verdict route to the manual handoff until the required post-review issue filing path has been handled. A parse failure, adapter error, or approval that still carries any finding never becomes an automated approval.
 
 ```mermaid
 stateDiagram-v2
@@ -385,37 +290,22 @@ stateDiagram-v2
     HumanEscalation --> [*]: surface both positions, await human (Disagreements)
 ```
 
-This maps onto existing doctrine: runaway rounds and repeat-after-rebuttal route
-to `REVIEW_POLICY.md` § Disagreements and Tiebreaking; timeout/unavailability
-routes to the existing manual handoff via `scripts/post-phase-4b-handoff.sh`.
+This maps onto existing doctrine: runaway rounds and repeat-after-rebuttal route to `REVIEW_POLICY.md` § Disagreements and Tiebreaking; timeout/unavailability routes to the existing manual handoff via `scripts/post-phase-4b-handoff.sh`.
 
 ## 11. Identity, auth, and secrets (two separate planes)
 
-There are two independent authentication planes, and conflating them is the main
-footgun:
+There are two independent authentication planes, and conflating them is the main footgun:
 
 1. **Reasoning plane (LLM provider).** The reviewer CLI authenticates to OpenAI or Anthropic to think, on the operator's **individual subscription plan** — Codex via `codex login` (ChatGPT account, `~/.codex/auth.json` with `auth_mode=chatgpt`); Claude via its subscription login (`claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`, or the OS keychain, with `claude auth status --json` reporting `apiProvider=firstParty` and either `authMethod=claude.ai` plus a `subscriptionType`, or `authMethod=oauth_token` for the headless subscription-token path). **Plan-only billing is enforced, not assumed:** the adapters reject persisted API-key auth modes and launch the reviewer CLI under an allowlisted environment, so neither a configured API-key login nor a stray env key can silently divert a handoff review to metered API billing. If the CLI is not plan-logged-in, the read-only call fails and the orchestrator falls back to the manual handoff (fail-closed) — it never bills the API.
 2. **Attribution plane (GitHub).** The review must be posted as `nathanpayne-codex` / `nathanpayne-claude` using the reviewer PAT through `scripts/gh-as-reviewer.sh`, which verifies the effective token identity before the write (`REVIEW_POLICY.md` § PAT lookup table; Operation-to-Identity Matrix). GitHub tokens stay in the parent orchestrator process only; the reviewer CLI child process receives only a minimal allowlist (`PATH`, `HOME`, locale/tmp basics, and `CODEX_HOME` or `CLAUDE_CODE_OAUTH_TOKEN` when needed), so prompt-injected diffs cannot use the reasoning CLI to read GitHub tokens, deploy/cloud credentials, or SSH-agent state from the parent session. Before the final GitHub write, the orchestrator sets `GH_AS_REVIEWER_IDENTITY` and clears a stale `OP_PREFLIGHT_REVIEWER_PAT` from the authoring agent session so `gh-as-reviewer.sh` resolves and verifies the selected external reviewer rather than the current agent.
 
-Because the sandboxed/plan-mode CLI runs read-only, it **cannot** post the GitHub
-review itself; the orchestrator does, on the reasoning plane's behalf. This is a
-feature, not a limitation: it guarantees the posted review carries verified
-reviewer-identity attribution rather than whatever ambient token the CLI happened
-to hold.
+Because the sandboxed/plan-mode CLI runs read-only, it **cannot** post the GitHub review itself; the orchestrator does, on the reasoning plane's behalf. This is a feature, not a limitation: it guarantees the posted review carries verified reviewer-identity attribution rather than whatever ambient token the CLI happened to hold.
 
-Secrets follow the existing 1Password + `op-preflight` model (local-first; this
-is why CI execution is out of scope here). Two new credential items are
-introduced—a Codex CLI credential and a Claude OAuth token—resolved at session
-start via `scripts/op-preflight.sh` alongside the reviewer PATs, never written to
-disk in plaintext beyond the existing chmod-600 session cache, and never exported
-as job-level env vars around repo-controlled code (per the Codex docs' explicit
-warning).
+Secrets follow the existing 1Password + `op-preflight` model (local-first; this is why CI execution is out of scope here). Two new credential items are introduced—a Codex CLI credential and a Claude OAuth token—resolved at session start via `scripts/op-preflight.sh` alongside the reviewer PATs, never written to disk in plaintext beyond the existing chmod-600 session cache, and never exported as job-level env vars around repo-controlled code (per the Codex docs' explicit warning).
 
 ## 12. Configuration (new `review-policy.yml` knobs)
 
-Illustrative additions to `.github/review-policy.yml`. Defaults preserve today's
-behavior (`enabled: false` → manual handoff), so existing consumers see no change
-until they opt in—mirroring the `phase_4b_default` migration posture.
+Illustrative additions to `.github/review-policy.yml`. Defaults preserve today's behavior (`enabled: false` → manual handoff), so existing consumers see no change until they opt in—mirroring the `phase_4b_default` migration posture.
 
 ```yaml
 phase_4b_automation:
@@ -426,16 +316,7 @@ phase_4b_automation:
   fallback_on_error: manual-handoff
 ```
 
-The reference implementation ships this exact block (disabled) in
-`.github/review-policy.yml`. A flat top-level key is used rather than a nested
-`phase_4b.automation` to avoid colliding with the existing `phase_4b_default`
-scalar and to keep the awk policy reader shallow. Non-security adapter knobs
-(for example reviewer model and timeout) are read from environment variables /
-flags with safe defaults in the reference; read-only sandbox, permission mode,
-and allowed tools are pinned in code and cannot be widened by env override.
-Promoting safe knobs into the YAML block is a follow-up. The block is additive
-and does not alter the existing
-`codex:`, `dependabot:`, or top-level keys the merge gate reads.
+The reference implementation ships this exact block (disabled) in `.github/review-policy.yml`. A flat top-level key is used rather than a nested `phase_4b.automation` to avoid colliding with the existing `phase_4b_default` scalar and to keep the awk policy reader shallow. Non-security adapter knobs (for example reviewer model and timeout) are read from environment variables / flags with safe defaults in the reference; read-only sandbox, permission mode, and allowed tools are pinned in code and cannot be widened by env override. Promoting safe knobs into the YAML block is a follow-up. The block is additive and does not alter the existing `codex:`, `dependabot:`, or top-level keys the merge gate reads.
 
 ## 13. New and changed components
 
@@ -489,55 +370,14 @@ and does not alter the existing
 
 ## 17. Approval-loop accounting (#602)
 
-Every automated Phase 4b approval now carries its own rigor / cost / time /
-quality story so an operator never reconstructs it after the fact (as had to
-happen on #580). The reconciled source of truth is
-[`plans/issue-602-phase-4b-accounting-SPEC.md`](issue-602-phase-4b-accounting-SPEC.md);
-this section is the design summary.
+Every automated Phase 4b approval now carries its own rigor / cost / time / quality story so an operator never reconstructs it after the fact (as had to happen on #580). The reconciled source of truth is [`plans/issue-602-phase-4b-accounting-SPEC.md`](issue-602-phase-4b-accounting-SPEC.md); this section is the design summary.
 
-- **Where it lives.** `scripts/phase-4b/accounting.sh` (sourced by the
-  orchestrator; pure functions over JSON, unit-testable offline via
-  `tests/test_phase_4b_accounting.sh` / `scripts/ci/check_phase_4b_accounting`)
-  renders a `## Phase 4b Approval Accounting` block that the orchestrator
-  appends to the **body of the automated `APPROVED` review** — the same
-  HEAD-pinned pull-review POST as today, no separate comment. The block embeds
-  a machine-readable `<!-- p4b-accounting:v1 ... -->` record validated by
-  `scripts/phase-4b/accounting.schema.json`.
-- **Loop-centric.** Each orchestrator invocation appends one loop record to a
-  per-PR loop log (`.mergepath/phase-4b-loops/…`, gitignored runtime state),
-  including CHANGES_REQUESTED rounds and fail-closed fallbacks (recorded as
-  positive safety evidence: reason + duration), so the final approval renders
-  the whole changes-requested-then-fixed history, the findings lifecycle
-  (first/last loop, disposition, fix-commit/issue links), and a rigor
-  proof-of-work table whose rows are green only when the backing signal was
-  captured (else `n/a — reason`).
-- **Advisory to safety, fail-closed for integrity.** Report-generation failure
-  ⇒ the orchestrator posts its existing plain-summary approval (exit codes
-  unchanged); accounting can never block or fabricate an approval. Conversely
-  the builder/renderer refuse (fail closed) any record whose loop history
-  would pair a posted `APPROVED` with a required-tier (P0/P1 by default)
-  finding, tokens are never estimated (`unavailable` with source/reason), and
-  running totals degrade to `unavailable` rather than guessing.
-- **Cost model.** Billed marginal cost is `$0.00` (plan-only auth); the block
-  additionally reports wall-clock, CLI-exposed tokens (the additive nullable
-  `usage` fields in `verdict.schema.json` carry cache/reasoning/cost when the
-  CLI envelope exposes them), plan-capacity throttle events, a **notional**
-  metered-API equivalent priced from the versioned
-  `scripts/phase-4b/prices.json` (`price_table_version` stamped into every
-  record; missing price ⇒ `n/a`, record still posts), and the cited
-  human-shuttle-avoided range from REVIEW_POLICY.md § Phase 4b Triggers.
-- **Running totals.** Aggregated at post time from prior `p4b-accounting:v1`
-  records — an injected GitHub-derived record file
-  (`P4B_ACCT_PRIOR_RECORDS_JSONL`, produced by piping prior review bodies
-  through `p4b_acct_extract_records`) wins; the append-only
-  `.mergepath/phase-4b-ledger.jsonl` cache is the fallback; neither ⇒ the
-  section says `unavailable` with the reason. The totals source is always
-  named in the block footer.
-- **Toggles.** `phase_4b_automation.accounting.enabled` (default `true` under
-  the disabled-by-default parent) plus opt-in
-  `accounting.{codex,claude}_price_key` mappings for the notional figure —
-  the adapters do not capture exact model IDs yet, so pricing is never
-  inferred.
+- **Where it lives.** `scripts/phase-4b/accounting.sh` (sourced by the orchestrator; pure functions over JSON, unit-testable offline via `tests/test_phase_4b_accounting.sh` / `scripts/ci/check_phase_4b_accounting`) renders a `## Phase 4b Approval Accounting` block that the orchestrator appends to the **body of the automated `APPROVED` review** — the same HEAD-pinned pull-review POST as today, no separate comment. The block embeds a machine-readable `<!-- p4b-accounting:v1 ... -->` record validated by `scripts/phase-4b/accounting.schema.json`.
+- **Loop-centric.** Each orchestrator invocation appends one loop record to a per-PR loop log (`.mergepath/phase-4b-loops/…`, gitignored runtime state), including CHANGES_REQUESTED rounds and fail-closed fallbacks (recorded as positive safety evidence: reason + duration), so the final approval renders the whole changes-requested-then-fixed history, the findings lifecycle (first/last loop, disposition, fix-commit/issue links), and a rigor proof-of-work table whose rows are green only when the backing signal was captured (else `n/a — reason`).
+- **Advisory to safety, fail-closed for integrity.** Report-generation failure ⇒ the orchestrator posts its existing plain-summary approval (exit codes unchanged); accounting can never block or fabricate an approval. Conversely the builder/renderer refuse (fail closed) any record whose loop history would pair a posted `APPROVED` with a required-tier (P0/P1 by default) finding, tokens are never estimated (`unavailable` with source/reason), and running totals degrade to `unavailable` rather than guessing.
+- **Cost model.** Billed marginal cost is `$0.00` (plan-only auth); the block additionally reports wall-clock, CLI-exposed tokens (the additive nullable `usage` fields in `verdict.schema.json` carry cache/reasoning/cost when the CLI envelope exposes them), plan-capacity throttle events, a **notional** metered-API equivalent priced from the versioned `scripts/phase-4b/prices.json` (`price_table_version` stamped into every record; missing price ⇒ `n/a`, record still posts), and the cited human-shuttle-avoided range from REVIEW_POLICY.md § Phase 4b Triggers.
+- **Running totals.** Aggregated at post time from prior `p4b-accounting:v1` records — an injected GitHub-derived record file (`P4B_ACCT_PRIOR_RECORDS_JSONL`, produced by piping prior review bodies through `p4b_acct_extract_records`) wins; the append-only `.mergepath/phase-4b-ledger.jsonl` cache is the fallback; neither ⇒ the section says `unavailable` with the reason. The totals source is always named in the block footer.
+- **Toggles.** `phase_4b_automation.accounting.enabled` (default `true` under the disabled-by-default parent) plus opt-in `accounting.{codex,claude}_price_key` mappings for the notional figure — the adapters do not capture exact model IDs yet, so pricing is never inferred.
 
 ## 18. Open questions
 
