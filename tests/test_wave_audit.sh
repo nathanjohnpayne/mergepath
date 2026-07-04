@@ -140,7 +140,20 @@ FAKEBIN="$WORK/fakebin"
 mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/gh" <<'GH'
 #!/usr/bin/env bash
-if [ "$1" = "pr" ]; then printf 'canaryhead1230000000000000000000000000000\n'; exit 0; fi
+if [ "$1" = "pr" ]; then
+  case "$*" in
+    *"title,headRefName,headRefOid"*)
+      # meta fetch: title / branch / head oid as tsv. FAKE_TITLE_SHA and
+      # FAKE_BRANCH_SHA drive the round-3 title-vs-branch validation tests.
+      printf 'sync: bulk reconcile to mergepath@%s\tmergepath-sync/sync-all-%s\tcanaryhead1230000000000000000000000000000\n' \
+        "${FAKE_TITLE_SHA:?}" "${FAKE_BRANCH_SHA:?}"
+      ;;
+    *)
+      printf 'canaryhead1230000000000000000000000000000\n'
+      ;;
+  esac
+  exit 0
+fi
 if [ "$1" = "api" ]; then
   if [ "${FAKE_LANE:-1}" = "1" ]; then
     printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane verified-head=canaryhead1230000000000000000000000000000 -->"}]\n'
@@ -267,12 +280,29 @@ echo "wave-audit.sh — canary lane precondition (#663 P1)"
 run_wa_lane 1 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null \
   && pass "lane-verified canary dispatches" || fail "lane-verified canary refused"
 [ -e "$CAPTURE/args" ] && pass "orchestrator dispatched under a verified lane" || fail "no dispatch under verified lane"
+grep -q "canaryhead1230000000000000000000000000000" "$CAPTURE/args" \
+  && pass "review pinned to the lane-verified head (--head passed through)" \
+  || fail "lane-verified head not pinned on dispatch (round-3 P1)"
 if run_wa_lane 0 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null 2>&1; then
   fail "un-lane-verified canary was dispatched"
 else
   [ $? -eq 3 ] && pass "un-lane-verified canary fails closed (exit 3)" || fail "wrong exit for unverified lane"
 fi
 [ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched without the lane marker" || fail "dispatched despite missing lane marker"
+
+# Round-3 P1: the head is resolved from the lane-verified BRANCH sha, and a
+# parseable title must agree with it.
+FAKE_TITLE_SHA="$C2" FAKE_BRANCH_SHA="$C2" run_wa_lane 1 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null \
+  && pass "branch-derived head with agreeing title dispatches" \
+  || fail "branch-derived head resolution failed"
+grep -q "scripts/b.sh" "$CAPTURE/diff" \
+  && pass "audit range keyed off the branch sha" || fail "branch-derived range wrong"
+if FAKE_TITLE_SHA="$C3" FAKE_BRANCH_SHA="$C2" run_wa_lane 1 64 --repo owner/consumer --base "$C1" --dry-run >/dev/null 2>&1; then
+  fail "title/branch sha mismatch was accepted"
+else
+  [ $? -eq 3 ] && pass "title/branch sha mismatch fails closed (exit 3)" || fail "wrong exit for title/branch mismatch"
+fi
+[ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched on a mismatched wave" || fail "dispatched despite title/branch mismatch"
 
 # ===========================================================================
 echo "wave-audit.sh — exit-3 fail-closed + newly-manifested paths"

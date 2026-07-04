@@ -12,8 +12,9 @@
 #
 #   base = newest wave-audit-pass/<sha> tag that is an ancestor of the wave
 #          head (--base <sha> on the first audited wave)
-#   head = the mergepath sha the canary PR title names ("sync: bulk
-#          reconcile to mergepath@<sha>"), or --head-sha
+#   head = the mergepath sha in the canary PR BRANCH name
+#          (mergepath-sync/[sync-all-]<sha> — what the lane verifies; a
+#          parseable title must agree or the run fails closed), or --head-sha
 #   diff = git diff base..head -- <manifest paths minus excluded prefixes>
 #
 # dispatched through scripts/phase-4b-review.sh with --diff-file. A curated
@@ -187,12 +188,30 @@ EXCLUDES="$(audit_list scope_exclude_prefixes)"
 [ -n "$EXCLUDES" ] || EXCLUDES="$(printf 'tests/\ndocs/')"
 
 # --- resolve the wave head ----------------------------------------------------
+# The propagation lane derives and byte-verifies against the sha in the
+# BRANCH NAME (mergepath-sync/[sync-all-]<sha>), not the title — an edited
+# or stale title could point the audit (and the watermark) at canonical
+# commits the lane never verified (#663 round-3 P1). The branch is the
+# source of truth; a parseable title must agree with it.
+PR_HEAD_OID=""
 if [ -z "$HEAD_SHA" ]; then
-  command -v gh >/dev/null 2>&1 || die 3 "gh is required to read the canary title (or pass --head-sha)"
-  title="$(gh pr view "$PR" --repo "$REPO" --json title --jq .title 2>/dev/null)" \
-    || die 3 "could not read PR $REPO#$PR title"
-  HEAD_SHA="$(parse_title "$title")" \
-    || die 3 "canary title does not name mergepath@<sha>: $title"
+  command -v gh >/dev/null 2>&1 || die 3 "gh is required to resolve the canary head (or pass --head-sha)"
+  meta="$(gh pr view "$PR" --repo "$REPO" --json title,headRefName,headRefOid --jq '[.title, .headRefName, .headRefOid] | @tsv' 2>/dev/null)" \
+    || die 3 "could not read PR $REPO#$PR metadata"
+  title="$(printf '%s' "$meta" | cut -f1)"
+  branch="$(printf '%s' "$meta" | cut -f2)"
+  PR_HEAD_OID="$(printf '%s' "$meta" | cut -f3)"
+  branch_sha="$(printf '%s\n' "$branch" | sed -n 's|.*/\(sync-all-\)\{0,1\}\([0-9a-f]\{7,40\}\)$|\2|p')"
+  [ -n "$branch_sha" ] || die 3 "canary branch '$branch' does not carry the mergepath-sync/<sha> shape — not a lane-verifiable sync canary"
+  HEAD_SHA="$branch_sha"
+  title_sha="$(parse_title "$title" || true)"
+  if [ -n "$title_sha" ]; then
+    t_full="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${title_sha}^{commit}" || true)"
+    b_full="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${branch_sha}^{commit}" || true)"
+    if [ -n "$t_full" ] && [ -n "$b_full" ] && [ "$t_full" != "$b_full" ]; then
+      die 3 "canary title names mergepath@$title_sha but the lane-verified branch names $branch_sha — refusing to audit a mismatched wave"
+    fi
+  fi
 fi
 HEAD_FULL="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${HEAD_SHA}^{commit}")" \
   || die 3 "wave head $HEAD_SHA not found in $REPO_DIR — git fetch first"
@@ -207,10 +226,15 @@ HEAD_FULL="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${HEAD_SHA}^{commit}
 # Fail closed unless the canary head carries the head-pinned trusted lane
 # marker (the same github-actions[bot] marker merge-clearance-gate.sh keys
 # on). WAVE_AUDIT_LANE_VERIFIED_OK=1 overrides — hermetic tests only.
+pr_head=""
 if [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ]; then
   command -v gh >/dev/null 2>&1 || die 3 "gh is required for the lane-verification precondition"
-  pr_head="$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null)" \
-    || die 3 "could not read PR $REPO#$PR head for lane verification"
+  if [ -n "$PR_HEAD_OID" ]; then
+    pr_head="$PR_HEAD_OID"
+  else
+    pr_head="$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null)" \
+      || die 3 "could not read PR $REPO#$PR head for lane verification"
+  fi
   [ -n "$pr_head" ] || die 3 "empty PR head reading $REPO#$PR for lane verification"
   lane_comments="$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null)" \
     || die 3 "could not read canary PR comments for lane verification"
@@ -367,6 +391,15 @@ fi
 # there the claude direction falls back to its configured gating-lane effort
 # rather than failing closed on an invalid value.
 orch_args=("$PR" --repo "$REPO" --diff-file "$DIFF_FILE")
+# Pin the review to the lane-verified head (#663 round-3 P1): without
+# --head, the orchestrator resolves the LIVE PR head at dispatch time, so a
+# canary push racing the lane check above could get an APPROVED on a head
+# the lane never verified. With the pin, the orchestrator's own live-head
+# recheck fails closed on any drift.
+if [ -n "$pr_head" ]; then
+  orch_args[${#orch_args[@]}]="--head"
+  orch_args[${#orch_args[@]}]="$pr_head"
+fi
 [ "$DRY_RUN" = true ] && orch_args[${#orch_args[@]}]="--dry-run"
 if [ "$EFFORT" != "minimal" ]; then
   export P4B_CLAUDE_EFFORT="$EFFORT"
