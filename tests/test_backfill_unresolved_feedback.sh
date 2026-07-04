@@ -91,10 +91,13 @@ case "${STUB_RESOLVE_MODE:-ok}" in
     exit 2 ;;
   *)
     if [ "$dry" -eq 1 ]; then
-      echo "(dry-run; no threads modified) — would-resolve: 1, skipped (human): 0, skipped (stale-HEAD): 0, skipped (not-actioned): 1"
+      # Emit a non-not-actioned skip category (drift) too, so the backfill's
+      # sum-all-skips parse is exercised (would read 0 if it only parsed
+      # not-actioned). Per-PR skipped = 0+0+1+2 = 3.
+      echo "(dry-run; no threads modified) — would-resolve: 1, skipped (human): 0, skipped (stale-HEAD): 0, skipped (not-actioned): 1, skipped (drift): 2"
       exit 3
     else
-      echo "Resolved: 1  Skipped (human): 0  Skipped (stale-HEAD): 0  Skipped (not-actioned): 1  Failed: 0  Readback-failed: 0"
+      echo "Resolved: 1  Skipped (human): 0  Skipped (stale-HEAD): 0  Skipped (not-actioned): 1  Skipped (drift): 2  Failed: 0  Readback-failed: 0"
       exit 3
     fi ;;
 esac
@@ -352,6 +355,33 @@ if [ "$RC" -eq 0 ] && grep -qi 'SKIP (verified-propagation N/A' <<<"$OUT" && [ !
   pass=$((pass+1)); echo "PASS: canonical self-match is case-insensitive (case-variant slug still skips)"
 else
   fail=$((fail+1)); echo "FAIL: case-variant canonical slug should still skip (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 18: skip counters SUM all categories, not just not-actioned. The stub
+#    reports skipped (not-actioned):1 + skipped (drift):2 = 3 per PR; across the
+#    2 PRs the dry-run summary must show skipped=6, so verified-propagation
+#    drift / verify-error / no-upstream-evidence skips are not hidden from the
+#    operator's scope review (Codex P2 on #666).
+run_bf ok
+if [ "$RC" -eq 0 ] && grep -q 'skipped=6' <<<"$OUT"; then
+  pass=$((pass+1)); echo "PASS: summary sums ALL skip categories (skipped=6, not just not-actioned)"
+else
+  fail=$((fail+1)); echo "FAIL: skip counters should sum all categories (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 19: verified-propagation drops the canonical repo from the target set
+#    BEFORE enumerate, so a canonical-only enumerate WARN cannot fail-close the
+#    consumer drain (Codex P2 on #666). The exclusion notice fires in verified
+#    mode and NOT in the default actioned mode.
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=owner/alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --mode resolve-verified-propagation --repo owner/alpha 2>&1)
+OUT_ACTIONED=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=owner/alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --repo owner/alpha 2>&1)
+set -e
+if grep -qi 'excluded canonical repo' <<<"$OUT" && ! grep -qi 'excluded canonical repo' <<<"$OUT_ACTIONED"; then
+  pass=$((pass+1)); echo "PASS: verified-propagation filters canonical before enumerate; actioned does not"
+else
+  fail=$((fail+1)); echo "FAIL: canonical pre-enumerate filter should fire only in verified mode" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
 echo

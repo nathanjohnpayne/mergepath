@@ -155,6 +155,29 @@ else
   { cat "$TARGETS_FILE"; printf '\n'; } > "$ENUM_TARGETS"
 fi
 
+# verified-propagation is N/A on the canonical repo (self-match). Drop it from
+# the target set BEFORE validation + enumeration, so a transient canonical-only
+# enumerate WARN (e.g. a >100-thread hub PR, or a flaky thread fetch) cannot
+# fail-close the whole consumer drain before any consumer PR is processed
+# (Codex P2 on #666). The per-PR loop skip below stays as a backstop for a
+# direct --repo <canonical>. Comments/blank lines are preserved; the match is
+# case-insensitive (GitHub slugs are).
+if [ "$MODE" = "resolve-verified-propagation" ]; then
+  _cf="$WORK/targets.no-canonical.txt"; : > "$_cf"
+  _cf_dropped=0
+  while IFS= read -r _cf_line || [ -n "$_cf_line" ]; do
+    _cf_slug=$(printf '%s' "$_cf_line" | sed -E 's/[[:space:]]+$//')
+    case "$_cf_slug" in ''|\#*) printf '%s\n' "$_cf_line" >> "$_cf"; continue ;; esac
+    if [ "$(printf '%s' "$_cf_slug" | tr '[:upper:]' '[:lower:]')" = "$CANONICAL_REPO_LC" ]; then
+      _cf_dropped=1; continue
+    fi
+    printf '%s\n' "$_cf_line" >> "$_cf"
+  done < "$ENUM_TARGETS"
+  mv "$_cf" "$ENUM_TARGETS"
+  [ "$_cf_dropped" -eq 1 ] && \
+    echo "backfill: excluded canonical repo $CANONICAL_REPO from verified-propagation targets (N/A for this mode)" >&2
+fi
+
 # Verify every target repo RESOLVES with the current token before draining.
 # gh pr list returns an empty SUCCESSFUL list (exit 0, no error) for a
 # nonexistent / renamed / unauthorized repo, so a typo'd or inaccessible
@@ -255,7 +278,22 @@ while IFS=$'\t' read -r repo pr; do
   # Pull the summary counters from resolve-pr-threads.sh output.
   resolved=$(printf '%s\n' "$out" | sed -n 's/.*Resolved: \([0-9]*\) .*/\1/p' | tail -1)
   would=$(printf '%s\n' "$out" | sed -n 's/.*would-resolve: \([0-9]*\).*/\1/p' | tail -1)
-  skipped=$(printf '%s\n' "$out" | sed -n 's/.*[Ss]kipped (not-actioned): \([0-9]*\).*/\1/p' | tail -1)
+  # Sum EVERY skipped(*) category the resolver reports, not just not-actioned:
+  # verified-propagation also emits skipped (not-propagation|drift|verify-error|
+  # no-upstream-evidence), and counting only not-actioned would let a dry-run
+  # read "skipped=0" while drifted/unverified threads remain, hiding them from
+  # the operator's scope review (Codex P2 on #666). Only the resolver's summary
+  # line uses the "skipped (label): N" shape (per-thread lines say "SKIP (...)").
+  # Single awk (no grep) so a no-match output exits 0 — a grep here would exit 1
+  # under `set -o pipefail` and abort the fail-closed exit path on a crashed
+  # resolver (the summary-less "die" case).
+  skipped=$(printf '%s\n' "$out" | awk '
+    { line=$0
+      while (match(line, /[Ss]kipped \([A-Za-z-]+\): [0-9]+/)) {
+        seg=substr(line, RSTART, RLENGTH); sub(/.*: /, "", seg); s+=seg
+        line=substr(line, RSTART+RLENGTH)
+      } }
+    END { print s+0 }')
   failed=$(printf '%s\n' "$out" | sed -n 's/.*Failed: \([0-9]*\) .*/\1/p' | tail -1)
   readback_failed=$(printf '%s\n' "$out" | sed -n 's/.*Readback-failed: \([0-9]*\).*/\1/p' | tail -1)
   resolved=${resolved:-0}; would=${would:-0}; skipped=${skipped:-0}
@@ -282,17 +320,17 @@ while IFS=$'\t' read -r repo pr; do
     printf '%s\n' "$rc_line" | sed 's/^/    /' >&2
   fi
   if $DRY_RUN; then
-    [ "$would" -gt 0 ] && echo "  $repo#$pr: would-resolve=$would skipped-not-actioned=$skipped"
+    [ "$would" -gt 0 ] && echo "  $repo#$pr: would-resolve=$would skipped=$skipped"
   else
-    [ "$resolved" -gt 0 ] && echo "  $repo#$pr: resolved=$resolved skipped-not-actioned=$skipped"
+    [ "$resolved" -gt 0 ] && echo "  $repo#$pr: resolved=$resolved skipped=$skipped"
   fi
 done <<< "$PAIRS"
 
 echo "" >&2
 if $DRY_RUN; then
-  echo "backfill DRY-RUN summary: $PRS_DONE PR(s) scanned — would-resolve=$TOTAL_WOULD, skipped-not-actioned=$TOTAL_SKIPPED. Re-run with --execute to resolve." >&2
+  echo "backfill DRY-RUN summary: $PRS_DONE PR(s) scanned — would-resolve=$TOTAL_WOULD, skipped=$TOTAL_SKIPPED. Re-run with --execute to resolve." >&2
 else
-  echo "backfill EXECUTE summary: $PRS_DONE PR(s) — resolved=$TOTAL_RESOLVED, skipped-not-actioned=$TOTAL_SKIPPED, failed=$TOTAL_FAILED." >&2
+  echo "backfill EXECUTE summary: $PRS_DONE PR(s) — resolved=$TOTAL_RESOLVED, skipped=$TOTAL_SKIPPED, failed=$TOTAL_FAILED." >&2
 fi
 
 [ "$ANY_FAILURE" -eq 1 ] && exit 2
