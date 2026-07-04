@@ -64,3 +64,13 @@ generated-mirror markers above are the guard:
 `tests/test_project_doc_sync.sh` asserts every materialized mirror
 carries them, and the mirror's own `do_not_edit:` header routes an editor
 to the canonical source.
+
+## Prose line-wrapping
+
+Soft-wrap Markdown prose: write one physical line per paragraph and let the renderer wrap it. Do not hard-wrap prose at a fixed column (roughly 72 to 80 characters). GitHub-flavored Markdown collapses single newlines inside a paragraph to spaces, so fixed-column wrapping is invisible in the rendered output, is enforced by nothing, is applied inconsistently, and creates reflow churn on every edit.
+
+This governs intra-paragraph line breaks only. Leave tables, fenced or indented code, YAML front matter, link reference definitions, and list or block-quote structure exactly as written, so the rendered output is unchanged.
+
+Scope is an explicit allowlist of repo-owned prose, and it is fail-safe: any path not on the list is out of scope, so a future generated tree, vendored dependency, or new code area is never swept in until it is added on purpose. In scope: the repo-root docs, `docs/**`, `rules/**`, `plans/**`, `specs/**`, `packaging/**`, the `.github/` agent docs (`copilot-instructions.md`, `templates/`, `screenshots/`), and a few repo-owned component READMEs (`functions/`, `mergepath/`, `tests/`, `scripts/build/`, `bugs/screenshots/`, `artifacts/`). Out of scope: generated mirrors (`docs/projects/*/prds/`, `docs/audits/data/`), propagated surfaces (`.github/pull_request_template.md`, `.github/ISSUE_TEMPLATE/`, and the `scripts/` kit READMEs), and fixtures. Do not reflow those; fix wrapping at their canonical source instead. The gate script `scripts/lint-md-prose-wrap.sh` is the executable form of this allowlist.
+
+The `md-prose-wrap` gate enforces this. `.github/workflows/md-prose-wrap.yml` runs `scripts/lint-md-prose-wrap.sh --check`, and the render-preserving transform lives in `scripts/lib/md_reflow.py`. Run `scripts/lint-md-prose-wrap.sh --write` to reflow the in-scope tree and `--list` to see it. The gate is mergepath-local and is intentionally not propagated to consumers.
