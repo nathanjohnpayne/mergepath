@@ -131,7 +131,10 @@ run_bf() { # mode, extra-args... → sets OUT/RC, fresh resolve log
   STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"
   export STUB_RESOLVE_LOG
   set +e
-  OUT=$(PATH="$SHIM_PATH" STUB_RESOLVE_MODE="$1" GH_TOKEN=dummy bash "$BF" "${@:2}" --repo owner/alpha 2>&1)
+  # MERGEPATH_BACKFILL_TRUSTED_REF_OK=1: the fixture tree is not a git checkout,
+  # so the verified-propagation trusted-ref guard would fail closed; the guard
+  # itself is exercised separately (see the dedicated test below).
+  OUT=$(PATH="$SHIM_PATH" STUB_RESOLVE_MODE="$1" GH_TOKEN=dummy MERGEPATH_BACKFILL_TRUSTED_REF_OK=1 bash "$BF" "${@:2}" --repo owner/alpha 2>&1)
   RC=$?
   set -e
 }
@@ -317,7 +320,7 @@ fi
 #    clean exit.
 STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
 set +e
-OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=owner/alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --mode resolve-verified-propagation --repo owner/alpha 2>&1)
+OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=owner/alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy MERGEPATH_BACKFILL_TRUSTED_REF_OK=1 bash "$BF" --mode resolve-verified-propagation --repo owner/alpha 2>&1)
 RC=$?
 set -e
 if [ "$RC" -eq 0 ] && grep -qi 'SKIP (verified-propagation N/A' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
@@ -348,7 +351,7 @@ fi
 #    (CodeRabbit Functional Correctness on #666).
 STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
 set +e
-OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=Owner/Alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --mode resolve-verified-propagation --repo owner/alpha 2>&1)
+OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=Owner/Alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy MERGEPATH_BACKFILL_TRUSTED_REF_OK=1 bash "$BF" --mode resolve-verified-propagation --repo owner/alpha 2>&1)
 RC=$?
 set -e
 if [ "$RC" -eq 0 ] && grep -qi 'SKIP (verified-propagation N/A' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
@@ -375,13 +378,30 @@ fi
 #    mode and NOT in the default actioned mode.
 STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
 set +e
-OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=owner/alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --mode resolve-verified-propagation --repo owner/alpha 2>&1)
+OUT=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=owner/alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy MERGEPATH_BACKFILL_TRUSTED_REF_OK=1 bash "$BF" --mode resolve-verified-propagation --repo owner/alpha 2>&1)
 OUT_ACTIONED=$(PATH="$SHIM_PATH" MERGEPATH_CANONICAL_REPO=owner/alpha STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --repo owner/alpha 2>&1)
 set -e
 if grep -qi 'excluded canonical repo' <<<"$OUT" && ! grep -qi 'excluded canonical repo' <<<"$OUT_ACTIONED"; then
   pass=$((pass+1)); echo "PASS: verified-propagation filters canonical before enumerate; actioned does not"
 else
   fail=$((fail+1)); echo "FAIL: canonical pre-enumerate filter should fire only in verified mode" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+fi
+
+# ── Test 20: the verified-propagation trusted-ref guard fails closed when the
+#    checkout cannot be proven to sit at the canonical default-branch tip. The
+#    fixture tree is not a git repo, so without MERGEPATH_BACKFILL_TRUSTED_REF_OK
+#    the guard refuses to run (exit 1) before any enumerate/resolve (Codex P2 on
+#    #666). Actioned mode is exempt (it never reads canonical) — Tests 1-2 run
+#    without the override.
+STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+set +e
+OUT=$(PATH="$SHIM_PATH" STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --mode resolve-verified-propagation --repo owner/beta 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 1 ] && grep -qi 'non-trusted ref' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
+  pass=$((pass+1)); echo "PASS: verified-propagation fails closed from a non-trusted checkout (no resolver call)"
+else
+  fail=$((fail+1)); echo "FAIL: trusted-ref guard should fail closed without override (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
 
 echo

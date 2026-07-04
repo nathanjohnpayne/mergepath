@@ -135,6 +135,28 @@ if [ -z "${GH_TOKEN:-}" ]; then
   echo "backfill: GH_TOKEN not set." >&2; exit 1
 fi
 
+# verified-propagation verifies against the mergepath canonical source + manifest
+# read from the LOCAL committed HEAD (resolve-pr-threads.sh). A bulk drain from a
+# stale or feature-branch checkout would byte-compare consumers against a non-main
+# snapshot and tag verified-propagation against untrusted state (Codex P2 on
+# #666). Require the checkout to sit at the canonical repo's current
+# default-branch tip for THIS mode (actioned resolution does not read canonical,
+# so it is exempt). MERGEPATH_BACKFILL_TRUSTED_REF_OK=1 overrides — for the
+# hermetic tests, or an intentional pinned-SHA run the operator has vetted.
+if [ "$MODE" = "resolve-verified-propagation" ] && [ "${MERGEPATH_BACKFILL_TRUSTED_REF_OK:-0}" != "1" ]; then
+  trusted_branch=$(gh repo view "$CANONICAL_REPO" --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null)
+  [ -n "$trusted_branch" ] || trusted_branch=main
+  git -C "$ROOT" fetch --quiet origin "$trusted_branch" 2>/dev/null || true
+  local_head=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)
+  trusted_head=$(git -C "$ROOT" rev-parse "origin/$trusted_branch" 2>/dev/null || true)
+  if [ -z "$local_head" ] || [ -z "$trusted_head" ] || [ "$local_head" != "$trusted_head" ]; then
+    echo "backfill: --mode resolve-verified-propagation verifies against the LOCAL checkout's canonical source." >&2
+    echo "         Refusing to run from a non-trusted ref (HEAD=${local_head:-none} vs origin/$trusted_branch=${trusted_head:-none})." >&2
+    echo "         Run from a fresh $CANONICAL_REPO $trusted_branch checkout, or set MERGEPATH_BACKFILL_TRUSTED_REF_OK=1 after vetting the pinned SHA." >&2
+    exit 1
+  fi
+fi
+
 # Build the targets file enumerate.sh reads. With --repo we hand it a
 # one-line temp file so a single repo can be drained without editing the
 # shipped list.
