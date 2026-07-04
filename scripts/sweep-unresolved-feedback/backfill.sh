@@ -146,12 +146,17 @@ fi
 if [ "$MODE" = "resolve-verified-propagation" ] && [ "${MERGEPATH_BACKFILL_TRUSTED_REF_OK:-0}" != "1" ]; then
   trusted_branch=$(gh repo view "$CANONICAL_REPO" --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null)
   [ -n "$trusted_branch" ] || trusted_branch=main
-  git -C "$ROOT" fetch --quiet origin "$trusted_branch" 2>/dev/null || true
+  # Compare local HEAD against the canonical repo's AUTHORITATIVE default-branch
+  # OID from GitHub, NOT a local origin/ tracking ref (Codex P2 on #666): this
+  # checkout's origin may point at a fork/mirror, and a failed fetch can leave a
+  # stale origin/<branch> that still equals HEAD — either would pass a local
+  # comparison while the verifier byte-compares consumers against non-canonical
+  # source. gh api reads the true tip regardless of local remote config.
+  trusted_head=$(gh api "repos/$CANONICAL_REPO/commits/$trusted_branch" --jq '.sha' 2>/dev/null || true)
   local_head=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)
-  trusted_head=$(git -C "$ROOT" rev-parse "origin/$trusted_branch" 2>/dev/null || true)
   if [ -z "$local_head" ] || [ -z "$trusted_head" ] || [ "$local_head" != "$trusted_head" ]; then
     echo "backfill: --mode resolve-verified-propagation verifies against the LOCAL checkout's canonical source." >&2
-    echo "         Refusing to run from a non-trusted ref (HEAD=${local_head:-none} vs origin/$trusted_branch=${trusted_head:-none})." >&2
+    echo "         Refusing to run from a non-trusted ref (HEAD=${local_head:-none} vs $CANONICAL_REPO@$trusted_branch=${trusted_head:-none})." >&2
     echo "         Run from a fresh $CANONICAL_REPO $trusted_branch checkout, or set MERGEPATH_BACKFILL_TRUSTED_REF_OK=1 after vetting the pinned SHA." >&2
     exit 1
   fi

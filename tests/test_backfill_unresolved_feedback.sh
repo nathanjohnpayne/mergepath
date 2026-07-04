@@ -128,6 +128,9 @@ cat > "$FR/bin/gh" <<'STUB'
 # unauthorized repo — the real empty-success `gh pr list` case that enumerate
 # cannot distinguish. All other gh calls are no-ops (enumerate + resolve are
 # stubbed, and the dependency check only does `command -v gh`).
+# Record every gh invocation when STUB_GH_LOG is set, so a test can assert which
+# API the trusted-ref guard queries (the canonical commits API, not local git).
+[ -n "${STUB_GH_LOG:-}" ] && printf '%s\n' "$*" >> "$STUB_GH_LOG"
 if [ "${1:-}" = "repo" ] && [ "${2:-}" = "view" ] && [ "${STUB_GH_REPO_VIEW_FAIL:-0}" = "1" ]; then
   exit 1
 fi
@@ -405,15 +408,22 @@ fi
 #    #666). Actioned mode is exempt (it never reads canonical) — Tests 1-2 run
 #    without the override.
 STUB_RESOLVE_LOG="$SCRATCH/resolve.log"; : > "$STUB_RESOLVE_LOG"; export STUB_RESOLVE_LOG
+STUB_GH_LOG="$SCRATCH/gh.log"; : > "$STUB_GH_LOG"; export STUB_GH_LOG
 set +e
 OUT=$(PATH="$SHIM_PATH" STUB_RESOLVE_MODE=ok GH_TOKEN=dummy bash "$BF" --mode resolve-verified-propagation --repo owner/beta 2>&1)
 RC=$?
 set -e
-if [ "$RC" -eq 1 ] && grep -qi 'non-trusted ref' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ]; then
-  pass=$((pass+1)); echo "PASS: verified-propagation fails closed from a non-trusted checkout (no resolver call)"
+# The guard must read the trusted OID from the CANONICAL repo's commits API
+# ($CANONICAL_REPO, default nathanjohnpayne/mergepath), NOT a local origin/
+# tracking ref. Assert it hit `api repos/<canonical>/commits/<branch>` (Codex P2
+# on #666); an origin-based guard would leave no such call.
+if [ "$RC" -eq 1 ] && grep -qi 'non-trusted ref' <<<"$OUT" && [ ! -s "$STUB_RESOLVE_LOG" ] \
+   && grep -q 'api repos/.*/commits/' "$STUB_GH_LOG"; then
+  pass=$((pass+1)); echo "PASS: verified-propagation fails closed from a non-trusted checkout, via the canonical commits API"
 else
-  fail=$((fail+1)); echo "FAIL: trusted-ref guard should fail closed without override (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
+  fail=$((fail+1)); echo "FAIL: trusted-ref guard should fail closed via the canonical commits API (rc=$RC)" >&2; awk '{print "  " $0}' <<<"$OUT" >&2
 fi
+unset STUB_GH_LOG
 
 # ── Test 21: a skipped-only PR (0 resolves, non-zero skips) is still printed
 #    per-PR, not just folded into the summary total, so the operator sees WHICH
