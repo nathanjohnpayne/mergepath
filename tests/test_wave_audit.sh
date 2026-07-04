@@ -116,7 +116,6 @@ run_wa() { # run_wa <policy> <capture-reset> <args...>; FAKE_ORCH_EXIT via env
   local policy="$1" reset="$2"; shift 2
   [ "$reset" = keep ] || { rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"; }
   WAVE_AUDIT_REPO_DIR="$CANON" \
-  WAVE_AUDIT_MANIFEST="$CANON/.mergepath-sync.yml" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
   MERGEPATH_REVIEW_POLICY_PATH="$policy" \
   CAPTURE="$CAPTURE" \
@@ -143,6 +142,7 @@ printf '%s' "$out" | jq -e '.orchestrator_exit == 0 and .watermark_advanced == t
   || fail "summary JSON wrong: $out"
 grep -q -- "--diff-file" "$CAPTURE/args" && pass "orchestrator got --diff-file" || fail "no --diff-file in args"
 grep -q "^P4B_CODEX_EFFORT=high$" "$CAPTURE/env" && pass "effort=high exported" || fail "effort env missing"
+grep -q "^P4B_CLAUDE_EFFORT=high$" "$CAPTURE/env" && pass "claude-direction effort exported too" || fail "P4B_CLAUDE_EFFORT missing (codex-authored waves would fall back to gating-lane effort)"
 grep -q "^P4B_ADAPTER_TIMEOUT_SECONDS=900$" "$CAPTURE/env" && pass "timeout=900 exported" || fail "timeout env missing"
 grep -q "^P4B_DIFF_MAX_BYTES=800000$" "$CAPTURE/env" && pass "diff budget exported" || fail "diff budget env missing"
 grep -q "scripts/b.sh" "$CAPTURE/diff" && pass "curated diff includes in-scope scripts/" || fail "scripts/ change missing from diff"
@@ -192,6 +192,31 @@ remote_has_tag "$C5" && fail "dry-run advanced the watermark" || pass "dry-run n
 run_wa "$POLICY_GOOD" reset 44 --repo owner/consumer --head-sha "$C5" >/dev/null \
   && pass "real APPROVED run exits 0" || fail "approved run exited nonzero"
 remote_has_tag "$C5" && pass "watermark advanced on APPROVED" || fail "watermark tag for c5 missing"
+
+# ===========================================================================
+echo "wave-audit.sh — #663 review regressions (manifest provenance, push recovery)"
+# ===========================================================================
+# Manifest scope comes from the AUDITED HEAD commit, not the working tree:
+# scribbling the checkout's manifest must not change the audit scope for a
+# head whose committed manifest still lists scripts/.
+printf 'paths: []\n' > "$CANON/.mergepath-sync.yml"
+run_wa "$POLICY_GOOD" reset 47 --repo owner/consumer --base "$C4" --head-sha "$C5" --dry-run >/dev/null \
+  && pass "run succeeds under a scribbled working-tree manifest" \
+  || fail "run failed under scribbled working-tree manifest"
+grep -q "a v5" "$CAPTURE/diff" \
+  && pass "scope read from the audited-head manifest, not the working tree" \
+  || fail "working-tree manifest leaked into audit scope"
+git -C "$CANON" checkout -q -- .mergepath-sync.yml
+
+# A locally-present tag whose PUSH failed is not success: a rerun must still
+# push it to origin (previously the early-return skipped the push).
+git -C "$REMOTE" tag -d "wave-audit-pass/$C5" >/dev/null
+remote_has_tag "$C5" && fail "precondition: remote c5 tag should be deleted" || :
+run_wa "$POLICY_GOOD" reset 48 --repo owner/consumer --head-sha "$C5" >/dev/null \
+  && pass "rerun with a local-only watermark exits 0" \
+  || fail "rerun with a local-only watermark failed"
+remote_has_tag "$C5" && pass "rerun pushed the local-only watermark to origin" \
+  || fail "local-only watermark still absent on origin after rerun"
 
 # ===========================================================================
 echo "wave-audit.sh — fail-closed config + missing watermark"

@@ -59,7 +59,9 @@
 #
 # Env (tests / manual runs):
 #   WAVE_AUDIT_REPO_DIR       canonical repo to diff/tag (default: this repo)
-#   WAVE_AUDIT_MANIFEST       manifest path (default: <repo>/.mergepath-sync.yml)
+#   WAVE_AUDIT_MANIFEST_RELPATH  manifest path relative to the repo root,
+#                             read from the AUDITED HEAD commit, never the
+#                             working tree (default: .mergepath-sync.yml)
 #   WAVE_AUDIT_ORCHESTRATOR   orchestrator (default: scripts/phase-4b-review.sh)
 #   MERGEPATH_REVIEW_POLICY_PATH  policy file override (p4b convention)
 
@@ -67,7 +69,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_DIR="${WAVE_AUDIT_REPO_DIR:-$ROOT}"
-MANIFEST="${WAVE_AUDIT_MANIFEST:-$REPO_DIR/.mergepath-sync.yml}"
+MANIFEST_RELPATH="${WAVE_AUDIT_MANIFEST_RELPATH:-.mergepath-sync.yml}"
 POLICY="${MERGEPATH_REVIEW_POLICY_PATH:-$REPO_DIR/.github/review-policy.yml}"
 ORCH="${WAVE_AUDIT_ORCHESTRATOR:-$ROOT/scripts/phase-4b-review.sh}"
 TAG_PREFIX="wave-audit-pass"
@@ -160,7 +162,6 @@ done
 [ -n "$PR" ] || { usage >&2; die 3 "canary PR number is required"; }
 case "$PR" in ''|*[!0-9]*) die 3 "canary PR must be a number: $PR" ;; esac
 [ -n "$REPO" ] || die 3 "--repo <owner/repo> is required"
-[ -f "$MANIFEST" ] || die 3 "manifest not found: $MANIFEST"
 [ -x "$ORCH" ] || [ -f "$ORCH" ] || die 3 "orchestrator not found: $ORCH"
 
 # --- config (fail-closed validation) ----------------------------------------
@@ -214,8 +215,11 @@ git -C "$REPO_DIR" merge-base --is-ancestor "$BASE_FULL" "$HEAD_FULL" 2>/dev/nul
 
 # --- build the curated diff ---------------------------------------------------
 # Manifest source paths (two-space `- path:` entries), minus excluded
-# prefixes. Excluded content is still delivered and still CI-validated on
-# every consumer; it is only out of AUDIT scope.
+# prefixes. The manifest is read from the AUDITED HEAD commit — never the
+# working tree — so the scope matches what the canary actually propagated
+# even when the local checkout has moved past (or has uncommitted edits to)
+# the manifest (Codex P2 on #663). Excluded content is still delivered and
+# still CI-validated on every consumer; it is only out of AUDIT scope.
 paths=()
 while IFS= read -r p; do
   [ -n "$p" ] || continue
@@ -227,8 +231,8 @@ while IFS= read -r p; do
 $EXCLUDES
 EOF
   [ "$skip" = true ] || paths[${#paths[@]}]="$p"
-done < <(awk '/^  - path: /{print $3}' "$MANIFEST" | sort -u)
-[ "${#paths[@]}" -gt 0 ] || die 3 "no manifest paths remain in audit scope (check scope_exclude_prefixes)"
+done < <(git -C "$REPO_DIR" show "${HEAD_FULL}:${MANIFEST_RELPATH}" 2>/dev/null | awk '/^  - path: /{print $3}' | sort -u)
+[ "${#paths[@]}" -gt 0 ] || die 3 "no manifest paths remain in audit scope at ${HEAD_SHA} (check ${MANIFEST_RELPATH} at that commit and scope_exclude_prefixes)"
 
 DIFF_FILE="$(mktemp "${TMPDIR:-/tmp}/wave-audit-diff.XXXXXX")"
 trap 'rm -f "$DIFF_FILE"' EXIT
@@ -238,19 +242,23 @@ FILES="$(git -C "$REPO_DIR" diff --name-only "${BASE_FULL}..${HEAD_FULL}" -- "${
 
 # advance_watermark — annotated (unsigned) tag on the audited head, pushed to
 # origin so every checkout resolves the same base next wave. Only called on a
-# posted APPROVED or a scope-empty range, never on --dry-run.
+# posted APPROVED or a scope-empty range, never on --dry-run. A tag that
+# already exists locally (e.g. a prior run whose PUSH failed) is not treated
+# as success — the push runs unconditionally, so the documented rerun
+# recovery actually recovers (Codex P2 on #663); pushing an already-present
+# remote tag with the same object is a no-op success.
 advance_watermark() {
   local tag="${TAG_PREFIX}/${HEAD_FULL}"
   if git -C "$REPO_DIR" rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
-    log "watermark $tag already present"
-    return 0
+    log "watermark $tag already present locally — ensuring it is on origin"
+  else
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=false \
+      git -C "$REPO_DIR" tag -a "$tag" \
+        -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${FILES} bytes=${BYTES}" \
+        "$HEAD_FULL"
   fi
-  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=tag.gpgsign GIT_CONFIG_VALUE_0=false \
-    git -C "$REPO_DIR" tag -a "$tag" \
-      -m "wave-audit: base=${BASE_FULL} canary=${REPO}#${PR} effort=${EFFORT} files=${FILES} bytes=${BYTES}" \
-      "$HEAD_FULL"
   git -C "$REPO_DIR" push -q origin "refs/tags/$tag" \
-    || die 3 "watermark tag $tag created locally but the push failed — push it manually or rerun, or the next audit re-covers this range"
+    || die 3 "watermark tag $tag exists locally but the push failed — push it manually or rerun, or the next audit re-covers this range"
   log "watermark advanced: $tag"
 }
 
@@ -285,11 +293,16 @@ fi
 # --- dispatch the scoped review ----------------------------------------------
 # External P4B_* env wins over policy in the orchestrator (`:=` fill), so the
 # audit profile applies without touching the phase_4b_automation gating lane.
-# Only the codex effort is pinned: the wave direction is claude-authored →
-# codex reviews; a codex-authored wave falls back to the claude adapter's own
-# configured effort.
+# Both adapter directions get the audit effort (Codex P2 on #663: a
+# codex-authored wave selects the Claude adapter, which reads
+# P4B_CLAUDE_EFFORT) — except `minimal`, which only the codex CLI accepts;
+# there the claude direction falls back to its configured gating-lane effort
+# rather than failing closed on an invalid value.
 orch_args=("$PR" --repo "$REPO" --diff-file "$DIFF_FILE")
 [ "$DRY_RUN" = true ] && orch_args[${#orch_args[@]}]="--dry-run"
+if [ "$EFFORT" != "minimal" ]; then
+  export P4B_CLAUDE_EFFORT="$EFFORT"
+fi
 set +e
 P4B_CODEX_EFFORT="$EFFORT" \
 P4B_ADAPTER_TIMEOUT_SECONDS="$TIMEOUT" \
