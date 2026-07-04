@@ -221,7 +221,15 @@ jobs:
             // the decision and a loose match can never weaken review — at worst
             // pr-review-policy.yml labels it. Race-free: triage never adds the
             // label for these branches, so there is nothing for the lane to undo.
-            const authorIdentity = process.env.AUTHOR_IDENTITY || 'nathanjohnpayne';
+            // Strip surrounding YAML quotes: load-config extracts
+            // author_identity with `awk '{print $2}'`, which passes quotes
+            // through for a valid quoted scalar (author_identity:
+            // "nathanjohnpayne"). The lane and its audit strip quotes for the
+            // same fingerprint (pr-review-policy.yml top_field), so match that
+            // here — otherwise a quoted config makes this compare false for real
+            // sync PRs and the label flap returns. (#656, Codex 4a.)
+            const authorIdentity = (process.env.AUTHOR_IDENTITY || 'nathanjohnpayne')
+              .trim().replace(/^["']|["']$/g, '');
             const defersToLane =
               ((pr.head && pr.head.ref) || '').startsWith('mergepath-sync/') &&
               (pr.user && pr.user.login === authorIdentity);
