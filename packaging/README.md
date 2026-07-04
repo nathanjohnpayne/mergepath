@@ -1,13 +1,8 @@
 # packaging/
 
-Placeholder package scaffolds reserving the `mergepath` name on public
-registries. See issues
-[#92](https://github.com/nathanjohnpayne/mergepath/issues/92) (npm) and
-[#93](https://github.com/nathanjohnpayne/mergepath/issues/93) (PyPI) for the
-squatting-prevention rationale.
+Placeholder package scaffolds reserving the `mergepath` name on public registries. See issues [#92](https://github.com/nathanjohnpayne/mergepath/issues/92) (npm) and [#93](https://github.com/nathanjohnpayne/mergepath/issues/93) (PyPI) for the squatting-prevention rationale.
 
-Both packages publish at version `0.0.0` and carry nothing but a README. They
-will be replaced with real artifacts when the project cuts a first release.
+Both packages publish at version `0.0.0` and carry nothing but a README. They will be replaced with real artifacts when the project cuts a first release.
 
 ## Publish — npm (`packaging/npm/`)
 
@@ -28,11 +23,8 @@ python3 -m build             # produces dist/mergepath-0.0.0.tar.gz + .whl
 python3 -m twine upload dist/*   # auth as nathanjohnpayne
 ```
 
-Verify at https://pypi.org/project/mergepath/ or `pip show mergepath` after
-install.
+Verify at https://pypi.org/project/mergepath/ or `pip show mergepath` after install.
 
 ## Re-publishing
 
-Registries forbid overwriting an existing version. To update the placeholder
-README, bump to `0.0.1` (or whatever's next) in `package.json` /
-`pyproject.toml` before re-publishing.
+Registries forbid overwriting an existing version. To update the placeholder README, bump to `0.0.1` (or whatever's next) in `package.json` / `pyproject.toml` before re-publishing.
