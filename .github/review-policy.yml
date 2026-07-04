@@ -647,13 +647,27 @@ phase_4b_automation:
   #                   the key it is a harmless no-op because --strict-config is
   #                   not used.)
   # An invalid value here is rejected fail-closed (orchestrator exits).
-  # xhigh on both adapters (2026-07-02 operator request: maximum reviewer
-  # rigor now that automation is on). xhigh is in both validated sets;
-  # for Codex it is model-dependent and degrades to a harmless no-op on a
-  # CLI that drops the knob (no --strict-config). Timeout stays 900s —
-  # raise adapter_timeout_seconds if xhigh rounds start hitting it.
-  claude_effort: xhigh
-  codex_effort: xhigh
+  # high on both adapters (2026-07-04, #669 — revisits the 2026-07-02
+  # "maximum rigor" xhigh choice with production measurements):
+  #   - The 8 posted xhigh rounds (#627/#629/#636 loop logs) ran a median
+  #     ~630s against the 900s adapter cap (worst 782s — two rounds within
+  #     15% of DNF) at a median ~180k tokens/round; #627's single approval
+  #     loop consumed ~1.1M tokens of the plan pool the Codex App gate
+  #     shares, and a DNF'd round burns its tokens and posts nothing.
+  #   - Same-diff calibration (#636's 37 KB diff): xhigh 626s / 147,235
+  #     tokens vs high 172s / 52,242 tokens with an equivalent verdict and
+  #     P1-class findings intact (#668 was found at high).
+  #   - high also cleared a 745 KB wave diff in 231s; xhigh DNF'd it.
+  # xhigh remains available as a PER-RUN escalation, not a default — set the
+  # override for the adapter the review DIRECTION selects (reviewer != author:
+  # claude-authored PR -> codex adapter -> P4B_CODEX_EFFORT=xhigh;
+  # codex-authored PR -> claude adapter -> P4B_CLAUDE_EFFORT=xhigh; set both
+  # when unsure), plus P4B_ADAPTER_TIMEOUT_SECONDS=1800 (external env wins
+  # over these values). Escalate for protected-path/security-sensitive
+  # diffs, a phase-4b-classifier cross-cutting hit, or a re-round after a
+  # disputed rebuttal. Timeout stays 900s — high fits it with ~4x margin.
+  claude_effort: high
+  codex_effort: high
 
   # --- Review-diff byte budget (#635/#636) ---------------------------------
   # A PR whose diff carries bulk committed artifacts can exceed the reviewer

@@ -8,7 +8,8 @@ This started as a disabled reference implementation: runnable, fail-closed,
 unit-tested with fake CLIs, and accompanied by real plan-backed `codex` /
 `claude` validation evidence in PR #580's review thread. **Mergepath itself
 runs it ENABLED since 2026-07-02 (#628: `phase_4b_automation.enabled: true`,
-xhigh effort on both adapters, accounting live)** — the bootstrap template
+accounting live; `high` effort on both adapters since #669, with xhigh as
+the per-run, per-adapter env escalation)** — the bootstrap template
 mirror resets the switch to `false`, so any OTHER repo still opts in
 explicitly and should re-run the live adapter validation from its own
 enablement environment before flipping `phase_4b_automation.enabled: true`.
