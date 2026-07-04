@@ -120,5 +120,15 @@ reflow "$WORK/b.md"
 check "hard line break preserved (not joined)" \
   "$(has_line "$WORK/b.md" 'Line one with a break  ' && echo 0 || echo 1)"
 
+# 9. A GitHub alert marker (`> [!NOTE]`) must never be joined into its body —
+# that silently breaks the alert on GitHub, and the CommonMark render check
+# cannot see the difference. The marker+body-in-one-paragraph form is the risk.
+printf '> [!NOTE]\n> Pay close\n> attention here.\n' >"$WORK/a.md"
+reflow "$WORK/a.md"
+check "GitHub alert marker kept on its own line" \
+  "$(has_line "$WORK/a.md" '> [!NOTE]' && echo 0 || echo 1)"
+check "GitHub alert not collapsed (still 3 quoted lines)" \
+  "$([ "$(grep -c '^>' "$WORK/a.md")" -eq 3 ] && echo 0 || echo 1)"
+
 echo "md_reflow: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
