@@ -1,0 +1,17 @@
+{
+  "description": "affirmative HEAD-anchored verdict but no matching Authoring-Agent (cross-agent) → NOT cleared (verdict cannot substitute for gate (b) outside branch 2, #612)",
+  "expected_cleared": false,
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "merged_at": "2026-05-12T11:00:00Z",
+  "reviews": [],
+  "inline_comments": [],
+  "issue_comments": [
+    {
+      "id": 9005,
+      "body": "Codex Review: Didn't find any major issues.\nReviewed commit: deadbeefcafe",
+      "created_at": "2026-05-12T10:00:00Z",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "description": "verdict-only affirmative but a review round on the same HEAD carries an unresolved P1 → NOT cleared (verdict does not override a live finding, #612)",
+  "expected_cleared": false,
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "authoring_agent": "claude",
+  "merged_at": "2026-05-12T11:00:00Z",
+  "reviews": [
+    {
+      "id": 1001,
+      "state": "COMMENTED",
+      "commit_id": "deadbeefcafe1234567890abcdef1234567890ab",
+      "submitted_at": "2026-05-12T09:00:00Z",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ],
+  "inline_comments": [
+    {
+      "id": 5002,
+      "pull_request_review_id": 1001,
+      "body": "![P1 Badge] Missing null check here.",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ],
+  "issue_comments": [
+    {
+      "id": 9004,
+      "body": "Codex Review: Didn't find any major issues.\nReviewed commit: deadbeefcafe",
+      "created_at": "2026-05-12T10:00:00Z",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ]
+}

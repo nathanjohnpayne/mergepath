@@ -1,0 +1,11 @@
+{
+  "description": "issue comments fetch failed (simulated) → verdict path disabled fail-closed (null, not an empty array), same as inline_comments; no false clear (#612 Codex P2 round 3)",
+  "expected_cleared": false,
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "authoring_agent": "claude",
+  "merged_at": "2026-05-12T11:00:00Z",
+  "issue_comments_fetch_failed": true,
+  "reviews": [],
+  "inline_comments": []
+}

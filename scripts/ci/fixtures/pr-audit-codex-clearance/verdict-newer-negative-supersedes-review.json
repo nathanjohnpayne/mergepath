@@ -1,0 +1,33 @@
+{
+  "description": "older clean review + NEWER non-affirmative verdict comment on HEAD → NOT cleared, fails closed (#608 P1 shape, #612)",
+  "expected_cleared": false,
+  "head_sha": "deadbeefcafe1234567890abcdef1234567890ab",
+  "codex_bot_login": "chatgpt-codex-connector[bot]",
+  "authoring_agent": "claude",
+  "merged_at": "2026-05-12T13:00:00Z",
+  "reviews": [
+    {
+      "id": 1001,
+      "state": "COMMENTED",
+      "commit_id": "deadbeefcafe1234567890abcdef1234567890ab",
+      "submitted_at": "2026-05-12T10:00:00Z",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ],
+  "inline_comments": [
+    {
+      "id": 5001,
+      "pull_request_review_id": 1001,
+      "body": "Nice work here — looks clean.",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ],
+  "issue_comments": [
+    {
+      "id": 9002,
+      "body": "Codex Review: Found a regression.\nReviewed commit: deadbeefcafe",
+      "created_at": "2026-05-12T12:00:00Z",
+      "user": { "login": "chatgpt-codex-connector[bot]" }
+    }
+  ]
+}

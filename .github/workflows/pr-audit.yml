@@ -586,7 +586,43 @@ jobs:
                   if (mergedAtFloor > reactionLowerBound) reactionLowerBound = mergedAtFloor;
                 }
 
-                // ── Clearance algorithm (#249/#449/#450) ──────────────
+                // HEAD-anchored Codex issue-comment verdict ("Codex Review:
+                // Didn't find any major issues" + "Reviewed commit: <sha>"),
+                // mirrored from scripts/codex-review-check.sh's
+                // CODEX_VERDICT_JSON (#600/#567) and its #609 poller
+                // counterpart (#612). Sha-anchored like a review object
+                // (commit_id === headSha), not time-window-anchored like a
+                // reaction — the sha binding IS the provenance, so no
+                // merge-time freshness bound applies here, matching how the
+                // review path (above) carries no mergedAt upper bound either.
+                // KEEP IN SYNC with the mirrored runner in
+                // scripts/ci/check_pr_audit_codex_clearance.
+                // null (not []) on fetch failure — fail closed (Codex P2 round
+                // 3 on #640), mirroring inlineComments below. An empty-array
+                // fallback silently treated a fetch failure as "no verdict
+                // comments exist," which could let a stale/missing signal
+                // wrongly clear (or wrongly fail to flag) a PR the merge gate
+                // would have decided differently.
+                let issueComments = null;
+                try {
+                  issueComments = await github.paginate(
+                    github.rest.issues.listComments,
+                    {
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: pr.number,
+                      per_page: 100,
+                    }
+                  );
+                } catch (e) {
+                  console.log(
+                    `WARNING: could not fetch issue comments for PR #${pr.number}; ` +
+                    `verdict-comment clearance path disabled (fail closed). Error: ${e.message}`
+                  );
+                  issueComments = null;
+                }
+
+                // ── Clearance algorithm (#249/#449/#450/#612) ─────────
                 // KEEP IN SYNC with the mirrored runner in
                 // scripts/ci/check_pr_audit_codex_clearance.
                 //
@@ -599,21 +635,136 @@ jobs:
                 // codexCleared stays false, so the audit falls through to the
                 // CLI-APPROVED requirement below.
                 let codexCleared = false;
-                if (codexEnabled && inlineComments !== null) {
-                  // Latest Codex COMMENTED review on HEAD (max submitted_at).
-                  let latestCodexReview = null;
-                  if (codexCommentedOnHead.length > 0) {
-                    latestCodexReview = codexCommentedOnHead.reduce(
-                      (latest, r) => {
-                        if (!latest) return r;
-                        return (r.submitted_at > latest.submitted_at) ? r : latest;
-                      },
-                      null
-                    );
-                  }
-                  const latestReviewTime =
-                    latestCodexReview ? (latestCodexReview.submitted_at || '') : '';
+                // Latest Codex signal on HEAD, any disposition/kind (#612)
+                // — feeds the Phase 4b/CLI-approval staleness guard below.
+                // Populated even when codexCleared stays false, mirroring
+                // codex-review-check.sh's CODEX_HEAD_VERDICT_ANY_TIME
+                // carrying into its Phase 4b substitute guard regardless of
+                // clearance disposition.
+                let latestAnyCodexSignalTime = '';
 
+                // ── Three independent signal scans (#612 rounds 1-4) ──────
+                // Each of verdict / reaction / review is scanned for its
+                // TIMESTAMP unconditionally — independent of inlineComments,
+                // issueComments, and sameAgentContext availability wherever
+                // the underlying data allows it. Only the CLEARANCE decision
+                // (below) gates on same-agent-or-CLI-approval and requires
+                // BOTH inlineComments and issueComments to be known. This
+                // split exists because four rounds of review kept finding
+                // the same bug shape: nesting a signal's timestamp inside an
+                // availability/gating check for one PURPOSE (clearance)
+                // silently also hid it from a DIFFERENT purpose (the Phase
+                // 4b staleness guard, which needs "is there a newer Codex
+                // signal at all" regardless of whether that signal clears
+                // anything or who authored the PR).
+
+                // Verdict: HEAD-anchored issue-comment ("Codex Review:
+                // Didn't find any major issues" + "Reviewed commit: <sha>").
+                // Needs issueComments (#612 round 3). Latest-first,
+                // then-affirmative — a newer non-affirmative verdict
+                // supersedes an older clean one (#608 P1 shape). Ties
+                // replace-on->=, matching max_by(.created_at) (round 3).
+                // Merge-time bounded: a verdict posted after merged_at must
+                // not participate in this retrospective audit at all.
+                let latestVerdictTime = '';
+                let verdictAffirmative = false;
+                if (codexEnabled && issueComments !== null) {
+                  const headLower = (headSha || '').toLowerCase();
+                  if (headLower) {
+                    let latestVerdict = null;
+                    for (const c of issueComments) {
+                      if (!c.user || c.user.login !== codexBotLogin) continue;
+                      if (!(mergedAt && c.created_at && c.created_at <= mergedAt)) continue;
+                      const body = (c.body || '').toLowerCase();
+                      const shaMatches = [
+                        ...body.matchAll(/reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})/g),
+                      ].map(m => m[1]);
+                      if (!shaMatches.some(s => headLower.startsWith(s))) continue;
+                      if (!latestVerdict || c.created_at >= latestVerdict.created_at) {
+                        latestVerdict = {
+                          created_at: c.created_at,
+                          affirmative: /^\s*codex review:\s*didn.?t find any major issues\b/im
+                            .test(c.body || ''),
+                        };
+                      }
+                    }
+                    if (latestVerdict) {
+                      latestVerdictTime = latestVerdict.created_at || '';
+                      verdictAffirmative = latestVerdict.affirmative === true;
+                    }
+                  }
+                }
+
+                // Reaction: Codex bot 👍/+1 in the merge-time window. Needs
+                // only `reactions` (always fetched, no fail-closed sentinel)
+                // — NOT gated on sameAgentContext (#612 round 4): a
+                // cross-agent PR's 👍 must still count as "a newer Codex
+                // signal exists" for the staleness guard, even though it
+                // cannot itself substitute for gate (b) without an
+                // independent CLI approval (mirrors the verdict fix).
+                let latestReactionTime = '';
+                if (codexEnabled) {
+                  for (const x of reactions) {
+                    if (x.user && x.user.login === codexBotLogin &&
+                        x.content === '+1' &&
+                        reactionLowerBound && x.created_at >= reactionLowerBound &&
+                        mergedAt && x.created_at <= mergedAt &&
+                        x.created_at > latestReactionTime) {
+                      latestReactionTime = x.created_at;
+                    }
+                  }
+                }
+
+                // Review: latest Codex COMMENTED review on HEAD. The
+                // review's own existence/timestamp needs only
+                // codexCommentedOnHead (always computed) — NOT inlineComments
+                // (#612 round 4); only the P0/P1 CLEANLINESS check below
+                // needs inline comments, not the timestamp itself.
+                //
+                // latestReviewTime (used below for the CLEARANCE decision) is
+                // deliberately left UNBOUNDED by mergedAt, preserving
+                // pre-#612 behavior across the many existing fixtures that
+                // clear via a review with no merged_at set at all. A separate
+                // latestReviewTimeForStaleness IS merge-time bounded (#612
+                // round 5): without it, a post-merge Codex re-review (e.g. a
+                // late/retried bot run on the closed PR) could inflate the
+                // Phase 4b staleness guard's `latestAnyCodexSignalTime` past
+                // `merged_at`, making a genuinely valid pre-merge CLI
+                // approval look stale relative to a signal that postdates
+                // the merge and is irrelevant to whether that merge was
+                // compliant. Mirrors the merge-time bound already applied to
+                // the verdict and reaction paths.
+                let latestReviewTime = '';
+                let latestReviewTimeForStaleness = '';
+                let latestCodexReview = null;
+                if (codexEnabled && codexCommentedOnHead.length > 0) {
+                  latestCodexReview = codexCommentedOnHead.reduce(
+                    (latest, r) => (!latest || r.submitted_at > latest.submitted_at) ? r : latest,
+                    null
+                  );
+                  latestReviewTime = latestCodexReview ? (latestCodexReview.submitted_at || '') : '';
+                  if (mergedAt && latestReviewTime && latestReviewTime <= mergedAt) {
+                    latestReviewTimeForStaleness = latestReviewTime;
+                  }
+                }
+
+                // Staleness baseline: the max of all three UNCONDITIONAL,
+                // merge-time-bounded timestamps — correct regardless of
+                // inlineComments/issueComments availability or same-agent
+                // context. The clearance block below does not need to (and
+                // does not) recompute this; it is already complete.
+                for (const t of [latestVerdictTime, latestReactionTime, latestReviewTimeForStaleness]) {
+                  if (t && t > latestAnyCodexSignalTime) latestAnyCodexSignalTime = t;
+                }
+
+                // ── Clearance decision (#612) ──────────────────────────────
+                // Requires BOTH inlineComments (P0/P1 state) AND issueComments
+                // (verdict supersession) to be known (#612 round 4): a
+                // failure on EITHER leaves codexCleared false — we cannot
+                // rule out a signal we failed to fetch (an unresolved P0/P1,
+                // or a superseding negative verdict) that the merge gate
+                // would have seen and that a partial-data audit cannot.
+                if (codexEnabled && inlineComments !== null && issueComments !== null) {
                   // Unresolved P0/P1 findings on the latest review. P0/P1
                   // markers are the `![P0 Badge]` / `![P1 Badge]` images
                   // Codex embeds; scope to the bot author so an author
@@ -651,15 +802,16 @@ jobs:
                     }
                   }
 
-                  // Same-agent context (Codex P2 on #460 r3): a Codex +1
-                  // substitutes for gate (b)'s reviewer approval ONLY when the
-                  // PR's Authoring-Agent resolves to an available reviewer
-                  // identity (e.g. `Authoring-Agent: claude` → nathanpayne-
-                  // claude). codex-review-check.sh gates branch 2 (#170) on
-                  // this; the audit must too, or a cross-agent / missing-
-                  // Authoring-Agent PR merged with only a 👍 (which the merge
-                  // gate rejects) would pass this audit. Mirrors the shell's
-                  // AUTHORING_AGENT → SAME_AGENT_REVIEWER suffix match.
+                  // Same-agent context (Codex P2 on #460 r3): a Codex signal
+                  // substitutes for gate (b)'s reviewer approval ONLY when
+                  // the PR's Authoring-Agent resolves to an available
+                  // reviewer identity (e.g. `Authoring-Agent: claude` →
+                  // nathanpayne-claude). codex-review-check.sh gates branch 2
+                  // (#170) on this; the audit must too, or a cross-agent /
+                  // missing-Authoring-Agent PR merged on Codex's signal alone
+                  // (which the merge gate rejects) would pass this audit.
+                  // Mirrors the shell's AUTHORING_AGENT →
+                  // SAME_AGENT_REVIEWER suffix match.
                   let sameAgentContext = false;
                   const agentMatch = (pr.body || '').match(
                     /^Authoring-Agent:[ \t]*([A-Za-z0-9_-]+)/im
@@ -671,35 +823,47 @@ jobs:
                     );
                   }
 
-                  // Latest qualifying Codex +1 reaction in the merge-time
-                  // window [reactionLowerBound, merged_at]. Empty
-                  // latestReactionTime sorts below any ISO timestamp, so the
-                  // first qualifier always sets it. Gated on sameAgentContext:
-                  // a +1 from a non-same-agent PR does not clear gate (b).
-                  let latestReactionTime = '';
-                  if (sameAgentContext) {
-                    for (const x of reactions) {
-                      if (x.user && x.user.login === codexBotLogin &&
-                          x.content === '+1' &&
-                          reactionLowerBound && x.created_at >= reactionLowerBound &&
-                          mergedAt && x.created_at <= mergedAt &&
-                          x.created_at > latestReactionTime) {
-                        latestReactionTime = x.created_at;
-                      }
+                  // Latest-signal-wins among THREE signal types — reaction /
+                  // review / verdict (#612) — mirrors codex-review-check.sh's
+                  // #600/#608 LATEST_SIGNAL_KIND decision and the #609
+                  // poller's has_cleared_signal exactly. Uses the
+                  // UNCONDITIONAL timestamps computed above (round 4) — a
+                  // cross-agent PR's reaction/verdict can still be the
+                  // "latest signal" even though it may not itself be
+                  // clearance-eligible below; per the #608 P1 shape, a real
+                  // newer signal that doesn't clear must not let an older
+                  // signal clear by default. Ties resolve reaction < review <
+                  // verdict (iteration order, replace-on->=).
+                  let latestKind = '';
+                  let latestTime = '';
+                  for (const [kind, time] of [
+                    ['reaction', latestReactionTime],
+                    ['review', latestReviewTime],
+                    ['verdict', latestVerdictTime],
+                  ]) {
+                    if (time && time >= latestTime) {
+                      latestKind = kind;
+                      latestTime = time;
                     }
                   }
-
-                  // Latest-signal-wins — mirrors codex-review-check.sh:
-                  // a newer +1 clears an older review-with-findings; a
-                  // newer review-with-findings blocks an older +1.
-                  if (latestReactionTime && latestReviewTime) {
-                    codexCleared = (latestReactionTime > latestReviewTime)
-                      ? true
-                      : !reviewHasUnresolvedP01;
-                  } else if (latestReactionTime) {
-                    codexCleared = true;
-                  } else if (latestReviewTime) {
+                  // Both reaction and verdict clear only when "same-agent OR
+                  // an independent CLI approval already exists" (#612 round
+                  // 3, extended to reaction in round 4): either signal only
+                  // NEEDS to prove it can substitute for gate (b) — via
+                  // branch 2, which requires same-agent — when nothing else
+                  // already satisfies gate (b). When a genuinely different
+                  // reviewer identity has already approved (branch 1,
+                  // independent of same-agent), the signal only needs to
+                  // satisfy gate (c), which never requires same-agent for any
+                  // signal type. Review's clearance has never required
+                  // same-agent (pre-existing, out of scope for this PR).
+                  const gateBSatisfied = sameAgentContext || cliApprovedReviews.length > 0;
+                  if (latestKind === 'reaction') {
+                    codexCleared = gateBSatisfied;
+                  } else if (latestKind === 'review') {
                     codexCleared = !reviewHasUnresolvedP01;
+                  } else if (latestKind === 'verdict') {
+                    codexCleared = gateBSatisfied && verdictAffirmative && !reviewHasUnresolvedP01;
                   }
                 }
 
@@ -729,8 +893,56 @@ jobs:
                 // surfaces both — collapsing them into a single line
                 // would hide which gate the merge bypassed.
                 // ─────────────────────────────────────────────────
+
+                // Phase 4b / CLI-approval staleness guard (#612, Codex P2
+                // round 1 on #640): a CLI reviewer-identity APPROVED review
+                // does not excuse the external-review requirement when a
+                // NEWER Codex signal (reaction / review / verdict, any
+                // disposition) exists on the current HEAD — mirrors
+                // codex-review-check.sh's Phase 4b substitute latest-
+                // signal-wins guard. We only reach this check when
+                // codexCleared is false, so any Codex signal newer than the
+                // latest CLI approval is, by construction, a non-clearing
+                // one; without this guard an early stale APPROVED could mask
+                // a later Codex verdict that actually disqualified the
+                // merge. No Codex signal at all (latestAnyCodexSignalTime
+                // empty) preserves the pre-#612 behavior exactly.
+                let latestCliApprovedTime = '';
+                for (const r of cliApprovedReviews) {
+                  if (r.submitted_at && r.submitted_at > latestCliApprovedTime) {
+                    latestCliApprovedTime = r.submitted_at;
+                  }
+                }
+                // Strict > (Codex P2 round 2 on #640), matching
+                // codex-review-check.sh's `[[ "$PHASE_4B_TIME" >
+                // "$LATEST_CODEX_SIGNAL_TIME" ]]` exactly — GitHub API
+                // timestamps are second-granular, so a same-second tie must
+                // fail closed to the Codex signal, not the approval.
+                //
+                // `issueComments !== null` is a separate, additional
+                // requirement (Codex P2 round 5): an empty
+                // latestAnyCodexSignalTime normally means "no Codex signal
+                // exists at all," but when the issue-comments fetch failed it
+                // instead means "we could not check for a verdict comment" —
+                // an unknown, not a verified absence. Equating the two let a
+                // fetch failure make a stale CLI approval look trivially
+                // fresh, hiding exactly the newer-negative-verdict staleness
+                // this guard exists to catch. A failed fetch must not be
+                // treated as equivalent to a verified clean signal.
+                //
+                // Gated on codexEnabled (Codex P2 round 7): when
+                // codex.enabled is false, Codex signals never participate in
+                // clearance at all (all three signal computations above are
+                // already codexEnabled-gated, so latestAnyCodexSignalTime is
+                // always empty in that config) — a transient issueComments
+                // fetch failure must not invalidate an otherwise-fresh CLI
+                // approval over a signal source the repo doesn't use.
+                const hasFreshCliApproval = cliApprovedReviews.length > 0 &&
+                  (!codexEnabled || issueComments !== null) &&
+                  (!latestAnyCodexSignalTime || latestCliApprovedTime > latestAnyCodexSignalTime);
+
                 if (hadExternalLabel &&
-                    cliApprovedReviews.length === 0 &&
+                    !hasFreshCliApproval &&
                     !codexCleared &&
                     !isMergepathSyncPR) {
                   // Distinguish the two failure modes so the audit
