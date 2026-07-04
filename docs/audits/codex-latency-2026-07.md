@@ -26,6 +26,39 @@ changed here.
   they are 9% of run volume and ~10% of billed run-minutes; event-triggered
   runs are the other ~90%.
 
+## Backfill addendum (2026-07-04)
+
+The original pass deferred pairs 1 and 4 (👀 ack / 👍 clearance reactions)
+because that session could not read the per-comment reactions endpoint. The
+committed `scripts/audit-codex-latency.sh` was re-run with reaction +
+inline-comment access (window 2026-05-01 → 2026-07-04, 293 PRs); the
+supplementary extract is `data/codex-latency-2026-07/summary-backfill-2026-07-04.md`.
+This resolves the two deferred pairs and completes the `ack_wait_seconds`
+disposition. Every "pending backfill" placeholder below is superseded by
+these measured values:
+
+| Event pair | n | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| 1. trigger → 👀 ack | 14 | 9s | 11s | 13s | 13s |
+| 2. trigger → first inline finding | 208 | 5m16s | 13m46s | 19m57s | 30m39s |
+| 4. trigger → 👍 clearance | 0 | — | — | — | — |
+
+- **Ack is fast and extremely tight** — every healthy ack landed in 6–13s
+  (p99 13s, max 13s). The "~4 min no-👀 = dropped" heuristic is ~18× the
+  measured p99, far too slow as a dropped-trigger test.
+- **Pair 4 is empty by design** — the whole corpus holds only 14 reactions,
+  all 👀 acks. Codex signals clearance via the `Codex Review:` issue-comment
+  verdict (#567), not a 👍 reaction, so there is no 👍-clearance distribution
+  to tune against; gate (b) branch 2 should read the verdict comment.
+- **Completed `ack_wait_seconds` disposition** — with p99(ack)=13s, the
+  current 60s × 1 retry (120s) is 4.6× p99: safe but slow to fail over on the
+  ~19% dropped/rate-limited class. **Retune → 30s** (2.3× p99, no misfire risk
+  on healthy acks), and replace the runbook "~4 min no-👀" with "healthy ack
+  p99=13s; treat >30s with no 👀 as dropped." Lands as a separate PR per the
+  guardrail below.
+
+Study results were posted to #623 on 2026-07-04.
+
 ## Method
 
 Fully retrospective, per the #623 hard constraint: every number below comes
@@ -242,7 +275,7 @@ more.
 | Knob | Default | Measured | Disposition |
 |---|---|---|---|
 | `codex.review_timeout_seconds` | 600s | verdict p90 = 426s, p99 = 630s, max = 830s; 2/100 rounds over 600s | **Confirm ~600s, or raise to 900s to cover the recorded max (830s).** The foreground wait is nearly right-sized for rounds that complete; timeouts are dominated by rounds that will *never* complete (dropped/rate-limited triggers, ~21% historically), so `--trigger-only` + event-driven pickup remains the right escape path, not a longer wait. |
-| `codex.ack_wait_seconds` × `max_ack_retries` | 60s × 1 | pair-1 ack distribution pending the reactions backfill (one local script run) | **Deferred, with a concrete backfill step.** Bounding context from measured pairs: verdicts land p50 3m37s after the trigger; not-connected markers land within ~10–60s. The "~4 min no-👀 = dropped" runbook heuristic sits right at p50(verdict) and is almost certainly too slow as an ack test — but the retune must cite p99(ack), which requires the backfill. |
+| `codex.ack_wait_seconds` × `max_ack_retries` | 60s × 1 | **ack p99 = 13s** (backfilled 2026-07-04, n=14; see addendum) | **Retune → 30s.** Healthy acks land in 6–13s, so 60s × 1 (120s) is 4.6× p99 — safe but slow to fail over on the ~19% dropped/rate-limited class. 30s stays 2.3× p99 with no misfire risk and cuts dropped-trigger failover from 120s to ~30s. Replace the "~4 min no-👀" runbook heuristic with "healthy ack p99=13s; treat >30s with no 👀 as dropped." Separate PR citing p99(ack)=13s. |
 | `codex.reaction_freshness_window_seconds` | 1800s | 13/13 head-anchored clearances were swept inside 1800s — all by event runs (p50 ≈ 28s); no cron sweep ever carried one, and the measured cron gap (p50 ≈ 96m) sits far outside the window | **The window is only viable because of the event-driven path.** Widening it to cover the cron path would need ≥ ~5400s (cron p50+) and weakens staleness protection; the data supports finishing the event-driven re-arm (#620) so the window's role keeps shrinking, and otherwise leaving 1800s in place. |
 | Sweep cadences (`*/15`, `*/5`) | cron | effective median cadence ~96–98 min for BOTH specs; scheduled runs are ~10% of run-minutes; 13/13 head-anchored clearances swept by event runs | **The cadence knob barely does anything.** GitHub throttling makes `*/5` and `*/15` deliver the same ~1.6h median; the replay for candidate cadences should model the measured firing behavior, not the spec. Slowing to `*/30` would cut a small, mostly-idle cost slice with negligible latency impact *given the event triggers stay*; the higher-leverage retune is event-trigger dedup. |
 
