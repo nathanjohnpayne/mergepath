@@ -33,7 +33,7 @@ git -C "$CANON" config user.email test@example.invalid
 git -C "$CANON" config user.name "wave-audit-test"
 git -C "$CANON" config commit.gpgsign false
 git -C "$CANON" config tag.gpgsign false
-mkdir -p "$CANON/scripts" "$CANON/tests" "$CANON/docs"
+mkdir -p "$CANON/scripts" "$CANON/tests" "$CANON/docs" "$CANON/newdir"
 cat > "$CANON/.mergepath-sync.yml" <<'YAML'
 consumers: []
 paths:
@@ -50,6 +50,7 @@ YAML
 printf 'a v1\n' > "$CANON/scripts/a.sh"
 printf 't v1\n' > "$CANON/tests/t.sh"
 printf 'd v1\n' > "$CANON/docs/d.md"
+printf 'legacy v1 predates every audit range\n' > "$CANON/newdir/legacy.txt"
 git -C "$CANON" add -A && git -C "$CANON" commit -qm c1
 C1="$(git -C "$CANON" rev-parse HEAD)"
 printf 'a v2\n' > "$CANON/scripts/a.sh"
@@ -67,6 +68,15 @@ C4="$(git -C "$CANON" rev-parse HEAD)"
 printf 'a v5\n' > "$CANON/scripts/a.sh"
 git -C "$CANON" add -A && git -C "$CANON" commit -qm c5
 C5="$(git -C "$CANON" rev-parse HEAD)"
+# c6: manifest gains newdir/ — a PRE-EXISTING path newly put in scope
+# (nothing under newdir/ changes in any range; only the manifest does).
+cat >> "$CANON/.mergepath-sync.yml" <<'YAML'
+  - path: newdir/
+    type: kit
+    consumers: all
+YAML
+git -C "$CANON" add -A && git -C "$CANON" commit -qm c6
+C6="$(git -C "$CANON" rev-parse HEAD)"
 
 REMOTE="$WORK/remote.git"
 git init -q --bare "$REMOTE"
@@ -117,7 +127,40 @@ run_wa() { # run_wa <policy> <capture-reset> <args...>; FAKE_ORCH_EXIT via env
   [ "$reset" = keep ] || { rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"; }
   WAVE_AUDIT_REPO_DIR="$CANON" \
   WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
+  WAVE_AUDIT_LANE_VERIFIED_OK=1 \
   MERGEPATH_REVIEW_POLICY_PATH="$policy" \
+  CAPTURE="$CAPTURE" \
+    bash "$WA" "$@"
+}
+
+# fake gh for the lane-precondition tests: serves the canary PR head and the
+# issue-comments feed (with or without the head-pinned lane marker per
+# FAKE_LANE).
+FAKEBIN="$WORK/fakebin"
+mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/gh" <<'GH'
+#!/usr/bin/env bash
+if [ "$1" = "pr" ]; then printf 'canaryhead1230000000000000000000000000000\n'; exit 0; fi
+if [ "$1" = "api" ]; then
+  if [ "${FAKE_LANE:-1}" = "1" ]; then
+    printf '[{"user":{"login":"github-actions[bot]"},"body":"<!-- mergepath-propagation-lane verified-head=canaryhead1230000000000000000000000000000 -->"}]\n'
+  else
+    printf '[]\n'
+  fi
+  exit 0
+fi
+exit 1
+GH
+chmod +x "$FAKEBIN/gh"
+
+run_wa_lane() { # run_wa_lane <FAKE_LANE 0|1> <args...> — lane check ACTIVE, fake gh
+  local lane="$1"; shift
+  rm -rf "$CAPTURE"; mkdir -p "$CAPTURE"
+  PATH="$FAKEBIN:$PATH" FAKE_LANE="$lane" \
+  WAVE_AUDIT_REPO_DIR="$CANON" \
+  WAVE_AUDIT_ORCHESTRATOR="$FAKE_ORCH" \
+  WAVE_AUDIT_LANE_VERIFIED_OK=0 \
+  MERGEPATH_REVIEW_POLICY_PATH="$POLICY_GOOD" \
   CAPTURE="$CAPTURE" \
     bash "$WA" "$@"
 }
@@ -217,6 +260,36 @@ run_wa "$POLICY_GOOD" reset 48 --repo owner/consumer --head-sha "$C5" >/dev/null
   || fail "rerun with a local-only watermark failed"
 remote_has_tag "$C5" && pass "rerun pushed the local-only watermark to origin" \
   || fail "local-only watermark still absent on origin after rerun"
+
+# ===========================================================================
+echo "wave-audit.sh — canary lane precondition (#663 P1)"
+# ===========================================================================
+run_wa_lane 1 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null \
+  && pass "lane-verified canary dispatches" || fail "lane-verified canary refused"
+[ -e "$CAPTURE/args" ] && pass "orchestrator dispatched under a verified lane" || fail "no dispatch under verified lane"
+if run_wa_lane 0 61 --repo owner/consumer --base "$C1" --head-sha "$C2" --dry-run >/dev/null 2>&1; then
+  fail "un-lane-verified canary was dispatched"
+else
+  [ $? -eq 3 ] && pass "un-lane-verified canary fails closed (exit 3)" || fail "wrong exit for unverified lane"
+fi
+[ ! -e "$CAPTURE/args" ] && pass "orchestrator NOT dispatched without the lane marker" || fail "dispatched despite missing lane marker"
+
+# ===========================================================================
+echo "wave-audit.sh — exit-3 fail-closed + newly-manifested paths"
+# ===========================================================================
+FAKE_ORCH_EXIT=3 run_wa "$POLICY_GOOD" reset 62 --repo owner/consumer --base "$C5" --head-sha "$C6" >/dev/null 2>"$WORK/err62" \
+  && fail "orchestrator exit 3 treated as success" \
+  || { [ $? -eq 3 ] && pass "orchestrator infra failure passes exit 3 through" || fail "wrong exit for orchestrator exit 3"; }
+grep -q "fix the configuration" "$WORK/err62" \
+  && pass "exit-3 messaging is fail-closed (no fan-out suggestion)" || fail "exit-3 fail-closed message missing"
+remote_has_tag "$C6" && fail "infra failure advanced the watermark" || pass "no watermark on orchestrator infra failure"
+
+run_wa "$POLICY_GOOD" reset 63 --repo owner/consumer --head-sha "$C6" >/dev/null \
+  && pass "newly-manifested wave (c5..c6) exits 0" || fail "newly-manifested wave run failed"
+grep -q "legacy v1" "$CAPTURE/diff" \
+  && pass "pre-existing newly-manifested bytes audited via empty-tree diff" \
+  || fail "newly-manifested content missing from audit diff"
+remote_has_tag "$C6" && pass "watermark advanced past newly-manifested wave" || fail "watermark tag for c6 missing"
 
 # ===========================================================================
 echo "wave-audit.sh — fail-closed config + missing watermark"

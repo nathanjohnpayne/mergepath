@@ -214,6 +214,13 @@ jobs:
       - name: check_codex_p1_gate
         run: ./scripts/ci/check_codex_p1_gate
 
+      - name: check_wave_audit
+        # Hub-only wave-audit regression suite (#662/#663): watermark/tag
+        # rules, curated-diff scope (incl. newly-manifested paths), canary
+        # lane precondition, config fail-closed validation. Consumer
+        # checkouts SKIP inside the wrapper (script + suite are hub-only).
+        run: ./scripts/ci/check_wave_audit
+
       - name: check_coderabbit_severity_gate
         # CodeRabbit twin of check_codex_p1_gate (#577). Verifies
         # scripts/coderabbit-severity-gate.sh +

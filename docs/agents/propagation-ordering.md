@@ -70,12 +70,20 @@ scripts/wave-audit.sh <canary-pr> --repo <owner>/<canary-repo>
 
 The helper resolves base = the newest `wave-audit-pass/<sha>` watermark tag
 that is an ancestor of the wave head, head = the mergepath sha in the canary
-title, builds a curated diff over manifest paths (minus
+title, builds a curated diff over the audited-head manifest paths (minus
 `propagation_audit.scope_exclude_prefixes` — default `tests/`, `docs/`), and
 dispatches `scripts/phase-4b-review.sh --diff-file` under the
-`propagation_audit:` posture in `.github/review-policy.yml`. The curated diff
-is load-bearing, not just cheaper: `gh pr diff` refuses wave-sized sync PRs
-outright (HTTP 406 above 20k lines).
+`propagation_audit:` posture in `.github/review-policy.yml`. Paths **newly
+added to the manifest** in the range are diffed against the empty tree, so
+pre-existing bytes a wave newly delivers are audited in full rather than
+escaping as "unchanged". The curated diff is load-bearing, not just cheaper:
+`gh pr diff` refuses wave-sized sync PRs outright (HTTP 406 above 20k lines).
+
+**Precondition (fail-closed):** the helper refuses to dispatch unless the
+canary's current head carries the head-pinned propagation-lane marker. The
+audit reviews canonical content and its APPROVED clears the canary via the
+Phase 4b substitute path — sound only over a byte-verified mirror, so an
+unverified or diverged canary exits 3 before any review runs.
 
 Verdict contract — same golden rule as below, fix at the SOURCE:
 
@@ -93,6 +101,10 @@ Verdict contract — same golden rule as below, fix at the SOURCE:
   wave tracker); the un-audited range chains into the next wave audit
   automatically, because the watermark only advances on a posted APPROVED
   (or a scope-empty range).
+- **Infrastructure/config failure (exit 3 — including a failed review
+  POST):** hard stop, not a proceedable audit miss. No reliable verdict
+  exists and the local setup or the GitHub write path is broken — fix it
+  and rerun before fanning out.
 
 The canary keeps the full advisory CodeRabbit pass — open it **without**
 `--coderabbit-ignore`.

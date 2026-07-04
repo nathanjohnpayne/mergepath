@@ -36,7 +36,11 @@
 #           fail-open on CI + lane; the un-audited range chains into the
 #           NEXT wave audit automatically, because the watermark only
 #           advances on a posted APPROVED (or a scope-empty range).
-#   exit 3  usage / config error, fail-closed before any dispatch.
+#   exit 3  fail-closed, never fan out on this: usage/config error, a canary
+#           whose head is not lane-verified (#663 P1 — the range-scoped
+#           APPROVED is only sound over a byte-verified mirror), or an
+#           orchestrator infrastructure failure (its exit 3, which includes
+#           a failed review POST — no reliable verdict exists).
 #
 # Usage:
 #   scripts/wave-audit.sh <canary-pr> --repo <owner/repo>
@@ -60,9 +64,12 @@
 # Env (tests / manual runs):
 #   WAVE_AUDIT_REPO_DIR       canonical repo to diff/tag (default: this repo)
 #   WAVE_AUDIT_MANIFEST_RELPATH  manifest path relative to the repo root,
-#                             read from the AUDITED HEAD commit, never the
-#                             working tree (default: .mergepath-sync.yml)
+#                             read from committed trees (audited head +
+#                             audit base), never the working tree
+#                             (default: .mergepath-sync.yml)
 #   WAVE_AUDIT_ORCHESTRATOR   orchestrator (default: scripts/phase-4b-review.sh)
+#   WAVE_AUDIT_LANE_VERIFIED_OK=1  skip the canary lane precondition —
+#                             hermetic tests only, never operational runs
 #   MERGEPATH_REVIEW_POLICY_PATH  policy file override (p4b convention)
 
 set -euo pipefail
@@ -190,6 +197,30 @@ fi
 HEAD_FULL="$(git -C "$REPO_DIR" rev-parse --verify --quiet "${HEAD_SHA}^{commit}")" \
   || die 3 "wave head $HEAD_SHA not found in $REPO_DIR — git fetch first"
 
+# --- canary lane precondition (#663 Codex P1) ----------------------------------
+# The audit reviews the curated CANONICAL range, and the APPROVED it posts
+# clears the canary via the Phase 4b substitute path (codex-review-check
+# gate). That is sound ONLY because the propagation lane has byte-verified
+# the canary PR content == mergepath@head — dispatching against a canary
+# whose current head is NOT lane-verified would let a non-faithful sync PR
+# clear external review without its actual PR diff ever being reviewed.
+# Fail closed unless the canary head carries the head-pinned trusted lane
+# marker (the same github-actions[bot] marker merge-clearance-gate.sh keys
+# on). WAVE_AUDIT_LANE_VERIFIED_OK=1 overrides — hermetic tests only.
+if [ "${WAVE_AUDIT_LANE_VERIFIED_OK:-0}" != "1" ]; then
+  command -v gh >/dev/null 2>&1 || die 3 "gh is required for the lane-verification precondition"
+  pr_head="$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null)" \
+    || die 3 "could not read PR $REPO#$PR head for lane verification"
+  [ -n "$pr_head" ] || die 3 "empty PR head reading $REPO#$PR for lane verification"
+  lane_comments="$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null)" \
+    || die 3 "could not read canary PR comments for lane verification"
+  printf '%s' "$lane_comments" | jq -e --arg head "$pr_head" '
+    any(.[]; (.user.login == "github-actions[bot]")
+         and ((.body // "") | contains("mergepath-propagation-lane verified-head=" + $head)))' >/dev/null 2>&1 \
+    || die 3 "canary $REPO#$PR head $pr_head is not lane-verified (no head-pinned mergepath-propagation-lane marker) — wait for the External Review Check lane run or investigate a diverged canary; refusing to dispatch"
+  log "canary lane verified for PR head $pr_head"
+fi
+
 # --- resolve the audit base (chaining watermark) ------------------------------
 if [ -z "$BASE" ]; then
   # Newest = maximal in ancestry order, not newest by commit time: on a
@@ -215,30 +246,67 @@ git -C "$REPO_DIR" merge-base --is-ancestor "$BASE_FULL" "$HEAD_FULL" 2>/dev/nul
 
 # --- build the curated diff ---------------------------------------------------
 # Manifest source paths (two-space `- path:` entries), minus excluded
-# prefixes. The manifest is read from the AUDITED HEAD commit — never the
-# working tree — so the scope matches what the canary actually propagated
+# prefixes. The manifest is read from COMMITTED TREES — the audited head for
+# the authoritative scope, the audit base for the scope-delta — never the
+# working tree, so the scope matches what the canary actually propagated
 # even when the local checkout has moved past (or has uncommitted edits to)
 # the manifest (Codex P2 on #663). Excluded content is still delivered and
 # still CI-validated on every consumer; it is only out of AUDIT scope.
-paths=()
-while IFS= read -r p; do
-  [ -n "$p" ] || continue
-  skip=false
-  while IFS= read -r ex; do
-    [ -n "$ex" ] || continue
-    case "$p" in "$ex"*) skip=true; break ;; esac
-  done <<EOF
+manifest_paths_at() { # manifest_paths_at <commit> — raw manifest source paths
+  git -C "$REPO_DIR" show "${1}:${MANIFEST_RELPATH}" 2>/dev/null \
+    | awk '/^  - path: /{print $3}' | sort -u
+}
+in_scope() { # filter stdin paths through scope_exclude_prefixes
+  local p ex skip
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    skip=false
+    while IFS= read -r ex; do
+      [ -n "$ex" ] || continue
+      case "$p" in "$ex"*) skip=true; break ;; esac
+    done <<EOF
 $EXCLUDES
 EOF
-  [ "$skip" = true ] || paths[${#paths[@]}]="$p"
-done < <(git -C "$REPO_DIR" show "${HEAD_FULL}:${MANIFEST_RELPATH}" 2>/dev/null | awk '/^  - path: /{print $3}' | sort -u)
-[ "${#paths[@]}" -gt 0 ] || die 3 "no manifest paths remain in audit scope at ${HEAD_SHA} (check ${MANIFEST_RELPATH} at that commit and scope_exclude_prefixes)"
+    [ "$skip" = true ] || printf '%s\n' "$p"
+  done
+}
+head_scope="$(manifest_paths_at "$HEAD_FULL" | in_scope)"
+base_scope="$(manifest_paths_at "$BASE_FULL" | in_scope || true)"
+
+# Split head scope into paths already manifested at base (range-diffed) and
+# NEWLY-MANIFESTED paths (Codex P2 on #663): a wave that adds a pre-existing
+# file/dir to the manifest newly delivers those bytes to consumers, but
+# `git diff base..head` is empty for content that predates the range — so
+# newly in-scope paths are diffed against the EMPTY TREE for full-content
+# review. Paths REMOVED from the manifest deliver nothing new and are not
+# audited. A manifest absent at base makes every head path newly in scope.
+common=(); added=()
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  if printf '%s\n' "$base_scope" | grep -Fxq "$p"; then
+    common[${#common[@]}]="$p"
+  else
+    added[${#added[@]}]="$p"
+  fi
+done <<EOF
+$head_scope
+EOF
+[ $(( ${#common[@]} + ${#added[@]} )) -gt 0 ] \
+  || die 3 "no manifest paths remain in audit scope at ${HEAD_SHA} (check ${MANIFEST_RELPATH} at that commit and scope_exclude_prefixes)"
 
 DIFF_FILE="$(mktemp "${TMPDIR:-/tmp}/wave-audit-diff.XXXXXX")"
 trap 'rm -f "$DIFF_FILE"' EXIT
-git -C "$REPO_DIR" diff "${BASE_FULL}..${HEAD_FULL}" -- "${paths[@]}" > "$DIFF_FILE"
+: > "$DIFF_FILE"
+if [ "${#common[@]}" -gt 0 ]; then
+  git -C "$REPO_DIR" diff "${BASE_FULL}..${HEAD_FULL}" -- "${common[@]}" >> "$DIFF_FILE"
+fi
+if [ "${#added[@]}" -gt 0 ]; then
+  EMPTY_TREE="$(git -C "$REPO_DIR" hash-object -t tree /dev/null)"
+  log "newly-manifested path(s) audited in full: ${added[*]}"
+  git -C "$REPO_DIR" diff "$EMPTY_TREE" "$HEAD_FULL" -- "${added[@]}" >> "$DIFF_FILE"
+fi
 BYTES="$(wc -c < "$DIFF_FILE" | tr -d ' ')"
-FILES="$(git -C "$REPO_DIR" diff --name-only "${BASE_FULL}..${HEAD_FULL}" -- "${paths[@]}" | wc -l | tr -d ' ')"
+FILES="$(grep -c '^diff --git ' "$DIFF_FILE" || true)"
 
 # advance_watermark — annotated (unsigned) tag on the audited head, pushed to
 # origin so every checkout resolves the same base next wave. Only called on a
@@ -325,6 +393,14 @@ case "$orc" in
   1)
     emit_json 1 false null
     log "CHANGES_REQUESTED posted on ${REPO}#${PR} — fix at the mergepath source, re-cut the wave, re-run the audit on the fresh canary"
+    ;;
+  3)
+    # Config/usage/infrastructure error — including a failed review POST
+    # (Codex P2 on #663). No reliable verdict exists and the local setup or
+    # the GitHub write path is broken: this is NOT a proceedable audit
+    # miss, so do not suggest fanning out on it.
+    emit_json 3 false null
+    log "ERROR: orchestrator infrastructure/config failure (exit 3) — no verdict exists; fix the configuration or write path and rerun the audit before fanning out"
     ;;
   *)
     emit_json "$orc" false null
