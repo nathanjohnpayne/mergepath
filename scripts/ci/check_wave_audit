@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# scripts/ci/check_wave_audit — run the wave-audit regression suite (#662, #663).
+#
+# Wraps tests/test_wave_audit.sh, the hermetic suite for
+# scripts/wave-audit.sh: watermark chaining + tag rules (APPROVED and
+# scope-empty advance; findings/unavailable/dry-run never advance; push
+# recovery), curated-diff scope (audited-head manifest provenance,
+# newly-manifested paths against the empty tree), the canary lane
+# precondition, config fail-closed validation, and orchestrator dispatch
+# env. Both the script and the suite are HUB-ONLY (deliberately not in
+# .mergepath-sync.yml), so a consumer checkout SKIPs via the same marker
+# disambiguation check_bootstrap_board_and_summary uses (#624): wrapped
+# test absent + scripts/sync-to-downstream.sh absent → consumer checkout →
+# SKIP; test absent but the hub marker present → the hub lost the suite →
+# hard error; test present → run it regardless of the marker.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_wave_audit.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+    echo "check_wave_audit: SKIP (consumer checkout: wrapped test + scripts/sync-to-downstream.sh both absent; hub-only wave-audit suite)"
+    exit 0
+  fi
+  echo "check_wave_audit: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
