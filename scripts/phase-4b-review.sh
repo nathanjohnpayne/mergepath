@@ -397,6 +397,19 @@ p4b_file_post_review_issues() {
     if printf '%s' "$fbody" | grep -qiE '(^|[^[:alpha:]])risk(s|y)?([^[:alpha:]]|$)'; then
       kind="risk"
     fi
+    # Rerun idempotency (#674 CodeRabbit): a mid-loop failure leaves earlier
+    # issues behind, and a straight rerun of the same verdict would file
+    # them again. Every issue body embeds a stable head-pinned marker, and
+    # the loop reuses a marker match instead of re-creating. Search-index
+    # lag can miss a JUST-created issue; the worst case is one duplicate —
+    # exactly the pre-marker status quo — never a lost filing.
+    marker="p4b-post-review ${REPO}#${PR} head=${HEAD:-unknown} finding=${i}"
+    existing="$(GH_TOKEN="$token" GITHUB_TOKEN='' gh search issues --repo "$REPO" "\"$marker\"" --json url --jq '.[0].url // empty' 2>/dev/null || true)"
+    if [ -n "$existing" ]; then
+      refs="${refs:+$refs, }#${existing##*/}"
+      i=$((i + 1))
+      continue
+    fi
     title="$(printf '%.120s' "post-review ${kind} (${REPO}#${PR}): ${sev} ${fpath}${fline:+:$fline}")"
     bfile="$(mktemp "${TMPDIR:-/tmp}/p4b-issue.XXXXXX")"
     {
@@ -404,8 +417,9 @@ p4b_file_post_review_issues() {
       printf 'Anchor: `%s`%s\n\n' "$fpath" "${fline:+ line $fline}"
       printf '%s\n' "$fbody"
       printf '\nReviewer: %s (%s adapter). Reviewed head: `%s`.\n' "$REVIEWER" "$ADAPTER" "${HEAD:-unknown}"
+      printf '\n<!-- %s -->\n' "$marker"
     } > "$bfile"
-    url="$(GH_TOKEN="$token" GITHUB_TOKEN= gh issue create --repo "$REPO" \
+    url="$(GH_TOKEN="$token" GITHUB_TOKEN='' gh issue create --repo "$REPO" \
       --title "$title" --body-file "$bfile" \
       --label post-review --label "$kind" \
       --assignee "$author_login" 2>/dev/null)" || { rm -f "$bfile"; return 1; }
@@ -428,9 +442,20 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
   # caller without the findings it needed to comply). Opt out with
   # phase_4b_automation.post_review_issues: false (restores the pre-#672
   # refusal); dry-run prints intent and files nothing.
-  if [ "$(p4b_automation_field post_review_issues)" = "false" ]; then
-    fall_back_to_manual "approved verdict included findings and phase_4b_automation.post_review_issues is false; post-review issue filing is required before Phase 4b clearance"
-  fi
+  # Opt-out is validated fail-closed (#674 CodeRabbit): only the literal
+  # true/false (or absent ⇒ true) are accepted — a typo like `False`, `no`,
+  # or `0` must not silently fail OPEN into auto-filing issues under the
+  # author PAT.
+  _pri_knob="$(p4b_automation_field post_review_issues)"
+  case "${_pri_knob:-true}" in
+    true) : ;;
+    false)
+      fall_back_to_manual "approved verdict included findings and phase_4b_automation.post_review_issues is false; post-review issue filing is required before Phase 4b clearance"
+      ;;
+    *)
+      fall_back_to_manual "invalid phase_4b_automation.post_review_issues value '${_pri_knob}' (expected true or false) — refusing fail-closed"
+      ;;
+  esac
   # Tiers the feedback policy marks `ignore` are never surfaced (#674 Codex
   # P2): drop them from the FILE set. The review body still lists every
   # verdict finding — it is the faithful record of what the reviewer said —

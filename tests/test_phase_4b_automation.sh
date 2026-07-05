@@ -324,6 +324,12 @@ if [ "${1:-}" = "auth" ] && [ "${2:-}" = "token" ]; then
   printf 'fake-keyring-author-token\n'
   exit 0
 fi
+# dedup lookup (#674 CodeRabbit): empty by default; P4B_FAKE_EXISTING_ISSUE
+# simulates a marker match from a prior partially-failed run.
+if [ "${1:-}" = "search" ] && [ "${2:-}" = "issues" ]; then
+  [ -n "${P4B_FAKE_EXISTING_ISSUE:-}" ] && printf 'https://github.com/o/r/issues/777\n'
+  exit 0
+fi
 # post-review issue filing (#672): record argv + effective token + body,
 # fail when P4B_FAKE_ISSUE_FAIL is set, else mint an incrementing issue URL.
 if [ "${1:-}" = "issue" ] && [ "${2:-}" = "create" ]; then
@@ -1347,6 +1353,47 @@ grep -q "^GH_TOKEN=fake-author-pat$" "$ISSUE_LOG" \
   && pass "#672: issue filed under the author token" || fail "#672: wrong token for issue create"
 grep -q "post-review issue" "$P4B672_BODY" && grep -q "#901" "$P4B672_BODY" \
   && pass "#672: posted APPROVED body carries the issue reference" || fail "#672: issue reference missing from review body"
+grep -q "p4b-post-review o/r#134 head=abc123 finding=0" "${ISSUE_LOG}.body.1" \
+  && pass "#674: filed issue body embeds the head-pinned dedup marker" || fail "#674: dedup marker missing from issue body"
+
+# #674 CodeRabbit: a marker match from a prior partially-failed run is
+# REUSED — no duplicate issue is created and the reference still lands.
+DEDUP_ISSUE_LOG="$WORK/issue-dedup.log"; : > "$DEDUP_ISSUE_LOG"
+DEDUP_BODY="$WORK/p4b674-dedup-body.txt"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$DEDUP_ISSUE_LOG" P4B_FAKE_EXISTING_ISSUE=1 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/p4b674-dedup-wrapper.log" \
+  P4B_WRAPPER_BODY="$DEDUP_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  bash "$ORCH" 140 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ ! -s "$DEDUP_ISSUE_LOG" ] && grep -q "#777" "$DEDUP_BODY"; then
+  pass "#674: existing marker match reused (no duplicate issue; reference carried)"
+else fail "#674 dedup reuse (rc=$rc)"; fi
+
+# #674 CodeRabbit: an unrecognized post_review_issues value fails CLOSED
+# instead of silently failing open into auto-filing.
+POLICY_BAD_KNOB="$WORK/policy-bad-knob.yml"
+cat > "$POLICY_BAD_KNOB" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-cursor
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+author_identity: nathanjohnpayne
+phase_4b_automation:
+  enabled: true
+  mode: local
+  post_review_issues: nope
+YAML
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_BAD_KNOB" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  bash "$ORCH" 141 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "invalid phase_4b_automation.post_review_issues"; then
+  pass "#674: invalid post_review_issues value fails closed"
+else fail "#674 bad-knob fail-closed (rc=$rc): $out"; fi
 
 # #672 fail-closed: an issue-create failure refuses the approval (no review
 # POST is attempted) and falls back to the manual handoff.
