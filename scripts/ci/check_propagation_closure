@@ -261,6 +261,9 @@ ALLOW_LIST=(
   #     SKIPs on consumers via the manifest-absent guard)
   #   - check_audit_codex_latency   → test_audit_codex_latency.sh
   #     (both-absent marker SKIP, #601; the #623 latency-study suite)
+  #   - check_audit_review_latency  → test_audit_review_latency.sh
+  #     (both-absent marker SKIP, #601; the #623 CodeRabbit + phase-4b
+  #     latency-retune suite; scripts/audit-review-latency.sh is hub-only)
   #   - check_wave_audit            → test_wave_audit.sh
   #     (both-absent marker SKIP; the #662/#663 wave-audit suite —
   #     scripts/wave-audit.sh is hub-only, so the suite cannot run on a
@@ -274,6 +277,7 @@ ALLOW_LIST=(
   "tests/test_session_finalization_check.sh"
   "tests/test_check_sync_manifest.sh"
   "tests/test_audit_codex_latency.sh"
+  "tests/test_audit_review_latency.sh"
   "tests/test_wave_audit.sh"
   "tests/test_project_doc_sync.sh"
 
@@ -284,6 +288,13 @@ ALLOW_LIST=(
   # consumers via the both-absent marker idiom, so neither file needs
   # to travel.
   "scripts/audit-codex-latency.sh"
+
+  # The #623 CodeRabbit + phase-4b latency-retune audit — hub-only operator
+  # tooling that mines CodeRabbit review latency across the consumer fleet
+  # (reads only) and the local phase-4b loop logs. Same posture as
+  # audit-codex-latency.sh: check_audit_review_latency runs the hermetic
+  # TEST, which SKIPs on consumers via the both-absent marker idiom.
+  "scripts/audit-review-latency.sh"
 
   # The #662/#663 wave-audit driver — hub-only operator tooling (one
   # scoped automated review per propagation wave, run from the hub

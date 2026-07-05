@@ -124,6 +124,8 @@ CONSUMER_ABSENT=(
   "scripts/audit-codex-latency.sh"
   "tests/test_audit_codex_latency.sh"
   "tests/fixtures/audit-codex-latency"
+  "scripts/audit-review-latency.sh"
+  "tests/test_audit_review_latency.sh"
   "scripts/wave-audit.sh"
   "tests/test_wave_audit.sh"
   # Hub-only test harnesses that drive checks (not driven BY them) —

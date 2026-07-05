@@ -365,7 +365,7 @@ After posting a trigger, `codex-review-request.sh` waits a short, bounded window
      - **Codex posts a review.** Always in `COMMENTED` state — the Codex GitHub App never uses `APPROVED` or `CHANGES_REQUESTED`. The review body itself carries a `Reviewed commit: <sha>` line (in addition to the review's structured `commit_id` field), and findings appear as **inline comments on the diff** (`/pulls/{pr}/comments` endpoint), not in the top-level review body. Inline findings carry priority markers: `![P0 Badge]`, `![P1 Badge]`, `![P2 Badge]`, or `![P3 Badge]`. This is the ONLY shape a findings round takes — it never also produces an issue comment.
      - **Codex reacts 👍 / `+1`** on the PR issue with no review body. This is Codex's no-findings clearance signal per the ChatGPT Codex Connector documentation.
      - **Codex posts a summary issue comment** — "Codex Review: …" with a `Reviewed commit: <sha>` line — on the PR conversation (`issues/{pr}/comments`), NOT a review object. When that sha prefixes the current HEAD and there are no unaddressed required-tier (P0/P1 by default) inline findings on HEAD, the verdict is a clearance signal too. Check issue comments, not only review objects and reactions: Codex routes its verdict here, so a `pulls/{pr}/reviews`-only check can miss a completed re-review (#567). The automated merge gate `scripts/codex-review-check.sh` **honors** this HEAD-anchored issue-comment verdict for gate (b) branch 2 and gate (c) as of #600 (in addition to review objects and 👍 reactions): a `chatgpt-codex-connector[bot]` comment matching Codex's stable affirmative phrasing (`Didn't find any major issues`) whose `Reviewed commit: <sha>` **prefixes** the current HEAD, with zero unaddressed required-tier findings on HEAD, is accepted as clearance. It **fails closed** on a stale-HEAD, findings-bearing, changes-requested, or unrecognized verdict — so an ambiguous comment never clears the gate. `codex-review-request.sh`'s automated poll recognizes the same HEAD-anchored issue-comment verdict as a terminal signal (#609): a verdict of either disposition ends the poll instead of running to `review_timeout_seconds`, and an affirmative verdict with zero unaddressed required-tier findings on HEAD clears it, via the same latest-signal-wins (reaction / review / verdict) decision the merge gate uses.
-     - **Timeout.** No review and no reaction within `codex.review_timeout_seconds` (default: 600s / 10 min). The script exits with code `4` (`FALLBACK_REQUIRED`).
+     - **Timeout.** No review and no reaction within `codex.review_timeout_seconds` (default: 840s / 14 min, retuned from the measured verdict p99 in #623). The script exits with code `4` (`FALLBACK_REQUIRED`).
 
 13a. If Codex posted inline findings, the agent dispositions each finding in a **`required`** tier by either:
 
@@ -865,7 +865,7 @@ author_identity: nathanjohnpayne
 coderabbit:
   enabled: false
   bot_login: "coderabbitai[bot]"
-  max_wait_seconds: 300                    # grace window for scripts/coderabbit-wait.sh
+  max_wait_seconds: 1245                   # grace window for scripts/coderabbit-wait.sh (measured full-fleet max + one poll interval, #623)
   status_probe_enabled: true               # ask CodeRabbit for narrative status before exit-4 timeout
   status_probe_wait_seconds: 60            # bounded extra wait for the status-probe reply
   max_rate_limit_retries: 2                # retries after CodeRabbit posts "Rate limit exceeded"
@@ -882,7 +882,7 @@ codex:
   bot_login: "chatgpt-codex-connector[bot]"   # REST API form, with [bot] suffix
   cli_login: nathanpayne-codex                # manual CLI fallback (Phase 4b)
   max_review_rounds: 2                        # runaway guard; 3rd round escalates
-  review_timeout_seconds: 600                 # per-round poll timeout
+  review_timeout_seconds: 840                 # per-round poll timeout (measured verdict p99/max, #623)
   require_ci_green: true                      # merge gate
   allow_phase_4b_substitute: true             # accept Phase 4b APPROVED on HEAD as gate (c) clearance (#218)
   p1_gate:

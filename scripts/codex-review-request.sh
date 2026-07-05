@@ -46,8 +46,10 @@
 #      the trigger is posted, never WHETHER Codex participates.
 #   1. Reads codex.review_timeout_seconds, codex.ack_wait_seconds,
 #      codex.max_ack_retries, and codex.bot_login from
-#      .github/review-policy.yml (defaults: 600 / 60 / 1 /
-#      chatgpt-codex-connector[bot]).
+#      .github/review-policy.yml (defaults: 840 / 30 / 1 /
+#      chatgpt-codex-connector[bot]; the 840s review_timeout and 30s
+#      ack_wait are measured retunes — see #623 and the per-constant
+#      comments below).
 #   2. Fetches the PR's current HEAD commit SHA and committer date. Any
 #      Codex review is only considered "current" if it is anchored on
 #      this commit (commit_id == HEAD_SHA). Any Codex +1 reaction is
@@ -284,8 +286,21 @@ policy_top_field() {
 AUTHOR_IDENTITY=$(policy_top_field author_identity)
 AUTHOR_IDENTITY=${AUTHOR_IDENTITY:-nathanjohnpayne}
 
+# review_timeout_seconds: foreground poll budget for a Codex terminal signal
+# on HEAD. Default 840s is measured, not folklore (#623): the trigger→verdict
+# distribution is p50 217s / p90 426s / p99 630s / max 830s (n=100), and the
+# 👍-clearance endpoint this poll also breaks on is p99 829s (n=60, #646) —
+# both from the committed extract docs/audits/data/codex-latency-2026-07/. The
+# prior 600s sat BELOW p99(verdict)=630s, so the slowest ~1% of clean rounds
+# (and the 830s max) timed out and routed to Phase 4b needlessly. 840s
+# (= 56 × the 15s POLL_INTERVAL, so the final poll lands exactly on the
+# deadline) covers the full observed clean-verdict tail and stays under the
+# 900s phase-4b adapter ceiling. It is deliberately NOT sized to the
+# dropped/rate-limited non-response tail (~19–21% of triggers, #570): that is
+# not a slow verdict and no foreground wait can catch it — --trigger-only +
+# event-driven pickup remains its escape path (#489).
 TIMEOUT_SECONDS=$(codex_field review_timeout_seconds)
-TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-600}
+TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-840}
 if ! [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "ERROR: codex.review_timeout_seconds must be an integer; got '$TIMEOUT_SECONDS'" >&2
   exit 3
@@ -388,8 +403,16 @@ if ! [[ "$REACTION_FRESHNESS_SECONDS" =~ ^[0-9]+$ ]]; then
   exit 3
 fi
 
+# ack_wait_seconds: the 👀 eyes-ack window (#419). Default 30s aligned to the
+# shipped policy value (#647) from the measured ack latency (#623): healthy
+# acks land in p50 9s / p99 13s / max 13s (n=14, the full recorded ack
+# corpus), so 30s is ~2.3× p99 — it clears every observed healthy ack with
+# margin yet fails over fast on a dropped/rate-limited trigger. The measurement
+# sizes the WINDOW; the retry COUNT (max_ack_retries) is unchanged, so the full
+# failover budget is 30s × (1 + max_ack_retries) = 60s, halved from the prior
+# 60s × 2 = 120s. Was 60s folklore.
 ACK_WAIT_SECONDS=$(codex_field ack_wait_seconds)
-ACK_WAIT_SECONDS=${ACK_WAIT_SECONDS:-60}
+ACK_WAIT_SECONDS=${ACK_WAIT_SECONDS:-30}
 if ! [[ "$ACK_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "ERROR: codex.ack_wait_seconds must be an integer; got '$ACK_WAIT_SECONDS'" >&2
   exit 3
