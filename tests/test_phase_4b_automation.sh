@@ -176,6 +176,8 @@ mk_fake fake-codex-approve-risk \
   "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P2\",\"path\":\"x.js\",\"line\":2,\"body\":\"residual risk of stale cache reads after failover\"}]}'"
 mk_fake fake-codex-approve-p3 \
   "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P3\",\"path\":\"x.js\",\"line\":2,\"body\":\"cosmetic nit only\"}]}'"
+mk_fake fake-codex-approve-2p2 \
+  "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P2\",\"path\":\"x.js\",\"line\":2,\"body\":\"first advisory\"},{\"severity\":\"P2\",\"path\":\"y.js\",\"line\":9,\"body\":\"second advisory\"}]}'"
 mk_fake fake-codex-junk \
   "printf '%s' 'this is not json at all'"
 mk_fake fake-codex-usage \
@@ -321,6 +323,9 @@ if [ "${1:-}" = "api" ]; then
   esac
 fi
 if [ "${1:-}" = "auth" ] && [ "${2:-}" = "token" ]; then
+  # #674 round 2: the keyring lookup must strip ambient GH_TOKEN so a
+  # session reviewer token cannot win the author resolution.
+  printf 'AUTH_GH_TOKEN=%s\n' "${GH_TOKEN:-}" >> "${P4B_ISSUE_LOG:-/dev/null}"
   printf 'fake-keyring-author-token\n'
   exit 0
 fi
@@ -343,6 +348,11 @@ if [ "${1:-}" = "issue" ] && [ "${2:-}" = "create" ]; then
     prev="$a"
   done
   [ -n "${P4B_FAKE_ISSUE_FAIL:-}" ] && exit 1
+  # #674 round 2: fail only from the SECOND create on, to exercise the
+  # partial-filing orphan surfacing.
+  if [ -n "${P4B_FAKE_ISSUE_FAIL_AFTER_1:-}" ] && [ "$(grep -c '^ARGV ' "$log")" -ge 2 ]; then
+    exit 1
+  fi
   printf 'https://github.com/o/r/issues/%s\n' "$((900 + $(grep -c '^ARGV ' "$log")))"
   exit 0
 fi
@@ -1476,6 +1486,40 @@ set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = "true" ] && [ ! -s "$IGNORE_ISSUE_LOG" ]; then
   pass "#674: ignore-tier findings file nothing and the approval still posts"
 else fail "#674 ignore-tier filter (rc=$rc): $out"; fi
+
+# #674 round 2: with no OP_PREFLIGHT_AUTHOR_PAT, the keyring lookup runs
+# with ambient GH_TOKEN stripped (a session reviewer token must not win the
+# author resolution), and the create uses the keyring-resolved token.
+KEYRING_ISSUE_LOG="$WORK/issue-keyring.log"; : > "$KEYRING_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  GH_TOKEN=ambient-reviewer-token P4B_ISSUE_LOG="$KEYRING_ISSUE_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/p4b674-keyring-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  bash "$ORCH" 142 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && grep -q "^AUTH_GH_TOKEN=$" "$KEYRING_ISSUE_LOG" \
+   && grep -q "^GH_TOKEN=fake-keyring-author-token$" "$KEYRING_ISSUE_LOG"; then
+  pass "#674: keyring author lookup strips ambient GH_TOKEN; create uses the keyring token"
+else fail "#674 keyring token isolation (rc=$rc)"; fi
+
+# #674 round 2: a partial filing failure surfaces the already-filed refs in
+# the fallback reason (the dedup marker makes a rerun reuse them).
+PARTIAL_ISSUE_LOG="$WORK/issue-partial.log"; : > "$PARTIAL_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-2p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$PARTIAL_ISSUE_LOG" P4B_FAKE_ISSUE_FAIL_AFTER_1=1 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/p4b674-partial-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=abc123 \
+  bash "$ORCH" 143 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "partial refs: #901"; then
+  pass "#674: partial filing failure surfaces the orphan refs in the fallback"
+else fail "#674 partial-orphan surfacing (rc=$rc): $out"; fi
+[ ! -s "$WORK/p4b674-partial-wrapper.log" ] \
+  && pass "#674: no review POST after a partial filing failure" || fail "#674: review POST attempted after partial failure"
 
 # #672 opt-out: post_review_issues: false restores the pre-#672 refusal.
 POLICY_NO_ISSUES="$WORK/policy-no-issues.yml"

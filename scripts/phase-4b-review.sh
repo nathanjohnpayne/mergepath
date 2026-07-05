@@ -377,7 +377,11 @@ p4b_file_post_review_issues() {
   author_login="$(p4b_top_field author_identity)"; author_login="${author_login:-nathanjohnpayne}"
   token="${OP_PREFLIGHT_AUTHOR_PAT:-}"
   if [ -z "$token" ]; then
-    token="$(gh auth token --user "$author_login" 2>/dev/null || true)"
+    # Ambient GH_TOKEN takes precedence over stored credentials in gh
+    # (#674 Codex P2): a reviewer token loaded into the session environment
+    # would win the lookup and file the issues under the WRONG identity.
+    # Strip both ambient token vars for the keyring read.
+    token="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$author_login" 2>/dev/null || true)"
   fi
   [ -n "$token" ] || { p4b_warn "post-review issues: no author token resolvable (OP_PREFLIGHT_AUTHOR_PAT unset and gh keyring has no $author_login)"; return 1; }
   total="$(printf '%s' "$vjson" | jq -r '.findings | length')"
@@ -422,9 +426,10 @@ p4b_file_post_review_issues() {
     url="$(GH_TOKEN="$token" GITHUB_TOKEN='' gh issue create --repo "$REPO" \
       --title "$title" --body-file "$bfile" \
       --label post-review --label "$kind" \
-      --assignee "$author_login" 2>/dev/null)" || { rm -f "$bfile"; return 1; }
+      --assignee "$author_login" 2>/dev/null)" \
+      || { rm -f "$bfile"; printf '%s' "$refs"; return 1; }
     rm -f "$bfile"
-    [ -n "$url" ] || return 1
+    [ -n "$url" ] || { printf '%s' "$refs"; return 1; }
     refs="${refs:+$refs, }#${url##*/}"
     i=$((i + 1))
   done
@@ -488,8 +493,27 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
     if [ "$live_head_pre" != "$HEAD" ]; then
       fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head_pre) — refusing to file post-review issues for an approval that will not post"
     fi
-    if ! POST_REVIEW_ISSUE_REFS="$(p4b_file_post_review_issues "$FILE_JSON")"; then
-      fall_back_to_manual "approved verdict included findings and post-review issue filing failed; refusing to post an approval with unfiled observations"
+    # Same-head laundering gate, hoisted ahead of the side effects (#674
+    # Codex round-2 P2): the authoritative gate below still guards the
+    # POST, but by then the issues would already exist for an approval
+    # that gets refused. Same guards as the authoritative copy (module
+    # loaded; hook consults the loop log keyed to the current HEAD).
+    if [ "$P4B_ACCT_AVAILABLE" = true ] && ! p4b_acct_hook_same_head_required_block; then
+      fall_back_to_manual "an unresolved required-tier finding was recorded on the current head ($HEAD) in a prior Phase 4b loop — refusing to file post-review issues for an approval that will not post"
+    fi
+    set +e
+    POST_REVIEW_ISSUE_REFS="$(p4b_file_post_review_issues "$FILE_JSON")"
+    _pri_rc=$?
+    set -e
+    if [ "$_pri_rc" -ne 0 ]; then
+      # Partial-failure orphans (#674 Codex round-2 P2): surface any refs
+      # that DID file before the failure — the head-pinned dedup marker
+      # makes a rerun REUSE them, so the orphan window self-heals; the
+      # operator sees them here rather than discovering strays later.
+      if [ -n "$POST_REVIEW_ISSUE_REFS" ]; then
+        p4b_warn "post-review issue filing failed partway; already filed (a rerun reuses these via the dedup marker): $POST_REVIEW_ISSUE_REFS"
+      fi
+      fall_back_to_manual "approved verdict included findings and post-review issue filing failed${POST_REVIEW_ISSUE_REFS:+ (partial refs: $POST_REVIEW_ISSUE_REFS)}; refusing to post an approval with unfiled observations"
     fi
     [ -n "$POST_REVIEW_ISSUE_REFS" ] \
       || fall_back_to_manual "approved verdict included findings but post-review issue filing produced no references"
