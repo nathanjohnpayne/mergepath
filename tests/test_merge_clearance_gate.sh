@@ -933,11 +933,18 @@ set +e
 OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$WF_RD_OK" "$CHECK_BIN" 2>&1)
 RC=$?
 set -e
-if ! echo "$OUT" | grep -q "missing the repository_dispatch trigger" \
-   && ! echo "$OUT" | grep -q "not wired for the marker re-trigger"; then
-  pass "repository_dispatch trigger + merge-clearance-recheck wiring present → #658 assertions pass"
+# Assert the check RAN to completion AND its pre-flight PASSED. A pre-flight
+# failure for ANY reason (the #658 assertions or otherwise) emits
+# "FAIL (pre-flight)", so this catches a checker that fails for a different
+# reason (CodeRabbit) — stronger than only checking the two #658 lines are
+# absent. RC is deliberately NOT asserted: the check also runs the nested
+# fixture suite, whose unrelated failures must not couple this positive control
+# (#556, same rationale as the job-name Case C above).
+if echo "$OUT" | grep -q "check_merge_clearance_gate:" \
+   && ! echo "$OUT" | grep -q "FAIL (pre-flight)"; then
+  pass "repository_dispatch trigger + merge-clearance-recheck wiring present → check pre-flight (incl. #658 assertions) passes"
 else
-  fail "expected #658 assertions to pass on the wired header; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+  fail "expected the check pre-flight to pass on the wired header; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 fi  # end re-entrancy guard (MCG_SKIP_FIX3_SELFTEST)
 
