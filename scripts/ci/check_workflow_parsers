@@ -994,12 +994,13 @@ else
 fi
 
 echo
-echo "agent-review.yml required-check wait: workflow-disambiguated check matching (#655 Codex P2 round 4)"
+echo "agent-review.yml required-check wait: workflow-disambiguated check matching (#655 Codex P2 rounds 4-5)"
 if grep -Fq 'select($workflow == "" or (.workflowName // "") == $workflow)' .github/workflows/agent-review.yml && \
    grep -Fq 'gh pr view "$PR_NUMBER" --repo "$REPO" --json statusCheckRollup' .github/workflows/agent-review.yml && \
-   grep -Fq 'sort_by(.startedAt // .completedAt // "")' .github/workflows/agent-review.yml; then
+   grep -Fq 'group_by(.workflowName // "")' .github/workflows/agent-review.yml && \
+   grep -Fq 'sort_by(.completedAt // .startedAt // "")' .github/workflows/agent-review.yml; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review required-check wait matches by (name, workflow) via statusCheckRollup, picking the latest run per check (#655)"
+  echo "  PASS: agent-review required-check wait matches by (name, workflow) via statusCheckRollup, grouping by workflow and picking the latest completed run per group when nothing is pending (#655)"
 else
   fail=$((fail + 1))
   echo "  FAIL: agent-review required-check wait must disambiguate by workflow via statusCheckRollup and pick the latest run per check (#655)" >&2

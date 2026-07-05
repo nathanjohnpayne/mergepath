@@ -1097,36 +1097,73 @@ jobs:
             for ((i = 0; i < check_count; i++)); do
               check_name=$(echo "$required_checks_json" | jq -r ".[$i].name")
               check_workflow=$(echo "$required_checks_json" | jq -r ".[$i].workflow")
-              run=$(echo "$rollup_json" | jq -c --arg name "$check_name" --arg workflow "$check_workflow" '
+              # #655 (Codex P2 round 5): group matching entries by workflow
+              # identity, not just by name, before deciding "is this check
+              # done". Two failure modes this closes:
+              #   - Stale-vs-pending (a same-name/same-workflow rerun): a
+              #     completed success from an earlier trigger (e.g. push)
+              #     alongside a still-QUEUED rerun from a later trigger
+              #     (e.g. pull_request synchronize) has NEITHER startedAt
+              #     nor completedAt on the queued entry, so a naive
+              #     sort_by(...) | last ranked the queued entry BEFORE the
+              #     completed one (empty string sorts first) and this loop
+              #     could wrongly report the stale success. Any
+              #     non-completed entry in a workflow's group is now
+              #     treated as "still pending" regardless of timestamps.
+              #   - Same-name collision (a consumer's local job also called
+              #     "lint", allowed by the annex contract): for the
+              #     workflow=="" (name-only) canonical `lint` requirement,
+              #     the name-only select matches EITHER workflow's "lint"
+              #     runs. Without grouping, picking one "winner" by
+              #     timestamp could let a newer successful annex "lint"
+              #     mask an older FAILED canonical "lint", arming auto-merge
+              #     without canonical lint actually being green. Grouping by
+              #     workflow and requiring EVERY group's winner to be green
+              #     means a same-named annex job can never stand in for the
+              #     canonical check.
+              winners=$(echo "$rollup_json" | jq -c --arg name "$check_name" --arg workflow "$check_workflow" '
                 [.statusCheckRollup[]
                   | select((.name // .context // "") == $name)
                   | select($workflow == "" or (.workflowName // "") == $workflow)
-                ] | sort_by(.startedAt // .completedAt // "") | last // empty')
-              if [ -n "$run" ]; then
-                status=$(printf '%s' "$run" | jq -r '.status // ""')
-                conclusion=$(printf '%s' "$run" | jq -r '.conclusion // .state // ""')
-                if [ "$status" = "COMPLETED" ] || [ -z "$status" ]; then
-                  # success/skipped/neutral are all non-blocking conclusions
-                  # (#655 Codex P2 round 2): a conditional annex job GitHub
-                  # completes as skipped is not a failure, and neutral is a
-                  # passing conclusion for required checks too. Mirrors the
-                  # same acceptance set codex-review-check.sh's BAD_CHECKS
-                  # filter already uses; this loop only checked `lint`
-                  # before #655, which never legitimately skips, so the
-                  # stricter exact-success check never mattered until the
-                  # annex checks (which can be conditional) joined the list.
-                  if [ "$conclusion" != "SUCCESS" ] && [ "$conclusion" != "SKIPPED" ] && [ "$conclusion" != "NEUTRAL" ]; then
-                    echo "::error::Required check run '$check_name' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
-                    exit 1
-                  fi
-                  echo "Required check run '$check_name' is $conclusion on current HEAD $sha."
-                  continue
-                fi
-                echo "::notice::Required check run '$check_name' is $status on current HEAD $sha; waiting for completion."
-              else
+                ] as $matches
+                | ($matches | group_by(.workflowName // "")) as $groups
+                | [
+                    $groups[]
+                    | (map(select(.status != "COMPLETED"))) as $pending
+                    | if ($pending | length) > 0
+                      then $pending[0]
+                      else (sort_by(.completedAt // .startedAt // "") | last)
+                      end
+                  ]')
+              winner_count=$(echo "$winners" | jq 'length')
+              if [ "$winner_count" -eq 0 ]; then
                 echo "::notice::Required check run '$check_name' is absent on current HEAD $sha; waiting for it to start."
+                all_done=0
+                continue
               fi
-              all_done=0
+              pending_count=$(echo "$winners" | jq '[.[] | select(.status != "COMPLETED")] | length')
+              if [ "$pending_count" -gt 0 ]; then
+                pending_status=$(echo "$winners" | jq -r '[.[] | select(.status != "COMPLETED")][0].status // ""')
+                echo "::notice::Required check run '$check_name' is $pending_status on current HEAD $sha; waiting for completion."
+                all_done=0
+                continue
+              fi
+              # success/skipped/neutral are all non-blocking conclusions
+              # (#655 Codex P2 round 2): a conditional annex job GitHub
+              # completes as skipped is not a failure, and neutral is a
+              # passing conclusion for required checks too. Mirrors the
+              # same acceptance set codex-review-check.sh's BAD_CHECKS
+              # filter already uses. Every group's winner must be green
+              # (#655 round 5) -- see the comment above the query.
+              bad=$(echo "$winners" | jq -c '[.[] | select((.conclusion // .state // "") as $r | ($r != "SUCCESS" and $r != "SKIPPED" and $r != "NEUTRAL"))]')
+              bad_count=$(echo "$bad" | jq 'length')
+              if [ "$bad_count" -gt 0 ]; then
+                bad_summary=$(echo "$bad" | jq -r '[.[] | (.conclusion // .state // "none")] | join(", ")')
+                echo "::error::Required check run '$check_name' failed on current HEAD $sha (conclusion=$bad_summary); refusing auto-merge."
+                exit 1
+              fi
+              conclusion_summary=$(echo "$winners" | jq -r '[.[] | (.conclusion // .state // "none")] | join(", ")')
+              echo "Required check run '$check_name' is $conclusion_summary on current HEAD $sha."
             done
             if [ "$all_done" -eq 1 ]; then
               echo "CURRENT_HEAD_SHA=$sha" >> "$GITHUB_ENV"

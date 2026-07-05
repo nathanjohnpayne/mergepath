@@ -69,8 +69,11 @@ assert_grep "agent-review: derives the annex job name(s) from its YAML rather th
 # BAD_CHECKS acceptance set) -- a conditional annex job GitHub completes as
 # skipped must not time out or abort native auto-merge. Values are the
 # GraphQL statusCheckRollup enum casing (#655 round 4 data-source switch).
-assert_grep "agent-review: accepts SKIPPED and NEUTRAL annex-job conclusions, not just SUCCESS" \
-  "$W/agent-review.yml" '[ "$conclusion" != "SUCCESS" ] && [ "$conclusion" != "SKIPPED" ] && [ "$conclusion" != "NEUTRAL" ]'
+# Round 5 moved this from a per-run bash if-check to a jq computation over
+# every matched workflow group's winner (see the group-by-workflow
+# assertions below), so the acceptance set now lives in that jq filter.
+assert_grep "agent-review: accepts SUCCESS, SKIPPED, and NEUTRAL conclusions across every matched workflow group" \
+  "$W/agent-review.yml" '($r != "SUCCESS" and $r != "SKIPPED" and $r != "NEUTRAL")'
 
 # Codex P2 (#655 round 3): a matrix-strategy annex job expands into check-run
 # names this static YAML read cannot reproduce -- skip it during derivation
@@ -102,8 +105,24 @@ assert_grep "agent-review: distinguishes genuine YAML-parse failure from a valid
 # field), picking the latest run per (name, workflow) pair.
 assert_grep "agent-review: disambiguates required checks by (name, workflow) via statusCheckRollup" \
   "$W/agent-review.yml" 'select($workflow == "" or (.workflowName // "") == $workflow)'
-assert_grep "agent-review: picks the latest run per check (duplicate push+synchronize triggers can both report)" \
-  "$W/agent-review.yml" 'sort_by(.startedAt // .completedAt // "")'
+
+# Codex P2 (#655 round 5, superseding round 4's plain sort_by|last): matches
+# are grouped by workflow identity before picking a winner. Within a group,
+# any NON-COMPLETED entry (e.g. a queued rerun with neither startedAt nor
+# completedAt set) takes priority over a stale completed one -- a naive
+# sort_by(startedAt // completedAt) ranked an empty-timestamp queued entry
+# BEFORE an older completed one, so `last` picked the stale result. Across
+# groups, EVERY group's winner must be green -- so a same-named annex job
+# (allowed by the annex contract, workflow=="" matches any workflow) can
+# never stand in for a failing canonical `lint`.
+assert_grep "agent-review: groups matching checks by workflow before picking a winner (not a bare sort_by | last)" \
+  "$W/agent-review.yml" 'group_by(.workflowName // "")'
+assert_grep "agent-review: treats any non-completed entry as still pending, ahead of a stale completed result" \
+  "$W/agent-review.yml" '(map(select(.status != "COMPLETED"))) as $pending'
+assert_grep "agent-review: picks the latest COMPLETED run within a workflow group when nothing is pending" \
+  "$W/agent-review.yml" 'sort_by(.completedAt // .startedAt // "")'
+assert_grep "agent-review: requires every matched workflow group to be green, not just one arbitrary winner" \
+  "$W/agent-review.yml" 'Every group'"'"'s winner must be green'
 
 # auto-clear-blocking-labels.yml: the workflow_run trigger list observes the
 # annex's completion too (verified against a live consumer's repo_lint_local.yml
