@@ -331,8 +331,19 @@ fi
 
 # Exact feedback solicitation Codex appends to every finding it wants graded.
 # Detection is substring-based so surrounding markdown/whitespace does not
-# defeat the match, but the phrase itself must appear verbatim.
+# defeat the match, but the phrase itself must appear verbatim once BODY is
+# whitespace-normalized below.
 SOLICITATION='Useful? React with 👍 / 👎.'
+
+# #682: the live chatgpt-codex-connector[bot] comment renders the space
+# immediately before the slash as U+00A0 (NO-BREAK SPACE, UTF-8 bytes c2 a0),
+# not the regular space (0x20) SOLICITATION uses above -- byte-verified via
+# `gh api repos/OWNER/REPO/pulls/comments/<id>` on a real finding (PR #680,
+# comment 3525276576). Rather than hard-code the NBSP into SOLICITATION
+# (which would silently re-break if Codex ever reverts to a plain space),
+# normalize NBSP to a regular space in BODY before the match so either form
+# is accepted.
+NBSP=$'\xc2\xa0'
 
 # --- collect findings -------------------------------------------------------
 
@@ -575,7 +586,10 @@ while IFS= read -r finding; do
   BODY=$(echo "$finding" | jq -r '.body // ""')
 
   # Solicitation gate — never react on a finding that does not ask for it.
-  case "$BODY" in
+  # #682: normalize NBSP to a regular space before matching (see the NBSP
+  # note above SOLICITATION) so the gate tolerates either whitespace form.
+  BODY_NORMALIZED=${BODY//$NBSP/ }
+  case "$BODY_NORMALIZED" in
     *"$SOLICITATION"*) : ;;
     *)
       log "comment $CID does not solicit feedback — skipping"

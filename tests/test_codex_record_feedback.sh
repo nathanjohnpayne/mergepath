@@ -23,6 +23,11 @@ pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
 SOLICIT='Useful? React with 👍 / 👎.'
+# #682: byte-faithful fixture matching what chatgpt-codex-connector[bot]
+# actually posts -- U+00A0 (NBSP, UTF-8 c2 a0) immediately before the slash,
+# not the regular space (0x20) in $SOLICIT above.
+NBSP=$'\xc2\xa0'
+SOLICIT_NBSP="Useful? React with 👍${NBSP}/ 👎."
 
 # make_case <name> — scaffolds a temp repo with the real script + lib resolver,
 # a recording gh-as-reviewer.sh stub, and a configurable gh stub. Echoes the
@@ -264,6 +269,35 @@ EOF
     fail "no-verdict: skip reason was $(jq -r '.skipped[0].why' "$dir/out.json"), expected no-verdict"
   else
     pass "a soliciting finding with no --verdict is skipped (no blanket reaction)"
+  fi
+}
+
+test_nbsp_solicitation_is_matched() {
+  # #682: the live Codex comment uses U+00A0 (NBSP) immediately before the
+  # slash instead of a regular space. A byte-faithful fixture (not a
+  # hand-typed ASCII approximation) must still be recognized as soliciting
+  # feedback and reacted to, exactly like the plain-space form.
+  local dir rc
+  dir=$(make_case "nbsp-solicit")
+  write_gh_readonly "$dir"
+  cat >"$dir/findings.json" <<EOF
+{ "findings": [
+  { "path": "scripts/ci/check_z", "line": 7, "priority": "P1", "comment_id": 5101,
+    "body": "NBSP-solicitation finding.\n\n$SOLICIT_NBSP" }
+] }
+EOF
+  rc=$(run_case "$dir" -- 999 owner/repo --findings-json findings.json --verdict 5101=fixed)
+
+  if [ "$rc" != "0" ]; then
+    fail "nbsp-solicit: exit $rc, expected 0; stderr=$(cat "$dir/err.log")"
+  elif ! grep -q 'gh api -X POST repos/owner/repo/pulls/comments/5101/reactions -f content=+1' "$(posts_file "$dir")"; then
+    fail "nbsp-solicit: did not POST +1 for an NBSP-solicitation finding; posts=$(cat "$(posts_file "$dir")" 2>/dev/null)"
+  elif [ "$(jq -r '.skipped | length' "$dir/out.json")" != "0" ]; then
+    fail "nbsp-solicit: finding was skipped; out=$(cat "$dir/out.json")"
+  elif [ "$(ledger_lines "$dir")" != "1" ]; then
+    fail "nbsp-solicit: ledger has $(ledger_lines "$dir") lines, expected 1"
+  else
+    pass "a solicitation using U+00A0 (NBSP) before the slash is matched and reacted to, same as the plain-space form (#682)"
   fi
 }
 
@@ -643,6 +677,7 @@ test_string_id_coerced_no_double_report
 test_fixed_reacts_plus1_via_reviewer
 test_rebuttal_reacts_minus1
 test_no_solicitation_is_never_reacted
+test_nbsp_solicitation_is_matched
 test_solicits_but_no_verdict_is_skipped
 test_idempotent_existing_reviewer_reaction
 test_dry_run_posts_nothing
