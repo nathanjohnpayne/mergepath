@@ -31,6 +31,8 @@
 #   GH_TOKEN / op-preflight cache   reviewer-scoped token (auto-sourced).
 #   CODEX_BIN / CLAUDE_BIN          adapter CLI overrides (tests).
 #   P4B_GH_AS_REVIEWER              reviewer wrapper override (tests).
+#   P4B_GH_AS_AUTHOR                author wrapper override (tests) — used
+#                                   for the step-9 post-review issue writes.
 #   P4B_HANDOFF                     manual handoff renderer override (tests).
 #   P4B_ADAPTER_TIMEOUT_SECONDS     env override for the outer adapter-call
 #                                   timeout; default is resolved per-adapter
@@ -108,6 +110,10 @@ p4b_acct_mark_unposted() {
 ADAPTER_DIR="$ROOT/phase-4b/adapters"
 HANDOFF="${P4B_HANDOFF:-$ROOT/post-phase-4b-handoff.sh}"
 GH_AS_REVIEWER="${P4B_GH_AS_REVIEWER:-$ROOT/gh-as-reviewer.sh}"
+# Author wrapper for the step-9 issue writes (#672/#674): resolves AND
+# identity-verifies the author PAT before each write, replacing manual
+# token resolution (test override: P4B_GH_AS_AUTHOR).
+GH_AS_AUTHOR="${P4B_GH_AS_AUTHOR:-$ROOT/gh-as-author.sh}"
 # Outer adapter-call timeout. An explicit env override wins (tests/manual);
 # otherwise it is resolved per-adapter from policy after the reviewer is chosen
 # (see p4b_resolve_adapter_timeout). Captured here so the env override is not
@@ -362,8 +368,217 @@ TOKEN_COUNT="$(printf '%s' "$VERDICT_JSON" | jq -r '.usage.token_count // empty'
 USAGE_SOURCE="$(printf '%s' "$VERDICT_JSON" | jq -r '.usage.source // empty')"
 ADAPTER_RUNS=1
 
+# p4b_file_post_review_issues <verdict-json>
+# Policy step 9 executor (#672): one `post-review` + `observation` issue per
+# discretionary finding on an APPROVED verdict, filed in $REPO under the
+# AUTHOR identity and assigned to it. Writes go through gh-as-author.sh —
+# the wrapper resolves the author PAT (OP_PREFLIGHT_AUTHOR_PAT or keyring)
+# AND identity-verifies it before the write, which both satisfies the
+# no-bare-gh-writes contract and closes the wrong-identity risk from the
+# round-2 finding more strongly than manual token resolution did.
+# Prints TWO lines: line 1 = comma-separated `#N` references (reused +
+# created, for the review body), line 2 = the subset CREATED by this
+# invocation (for cleanup — a reused prior-run issue must never be closed
+# by this run's failure paths, #674 round-5 P2). ANY single failure —
+# wrapper/token verification, a missing label on the target repo, an API
+# error, or a DEDUP SEARCH error (#674 CodeRabbit Major: a swallowed search
+# failure would read as "no existing issue" and mint duplicates) — returns
+# non-zero so the caller refuses the approval (fail-closed: an APPROVED may
+# never post with its observations unfiled; that failure mode degrades
+# exactly to the pre-#672 refusal).
+p4b_file_post_review_issues() {
+  local vjson="$1" author_login refs="" created="" i total sev fpath fline fbody title bfile url existing
+  author_login="$(p4b_top_field author_identity)"; author_login="${author_login:-nathanjohnpayne}"
+  total="$(printf '%s' "$vjson" | jq -r '.findings | length')"
+  i=0
+  while [ "$i" -lt "$total" ]; do
+    sev="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].severity')"
+    fpath="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].path // "PR"')"
+    fline="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].line // empty')"
+    fbody="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].body')"
+    # Policy step 9 labels are `post-review` plus `observation` OR `risk`
+    # (#674 Codex P2): the verdict schema carries no risk flag, so classify
+    # by the reviewer's own wording — a finding that talks about risk files
+    # as one. Mislabels are trivially editable after the fact; the load-
+    # bearing part is that risk follow-ups stay visible to `risk`-keyed
+    # triage instead of being hard-coded observations.
+    kind="observation"
+    if printf '%s' "$fbody" | grep -qiE '(^|[^[:alpha:]])risk(s|y)?([^[:alpha:]]|$)'; then
+      kind="risk"
+    fi
+    # Rerun idempotency (#674 CodeRabbit): a mid-loop failure leaves earlier
+    # issues behind, and a straight rerun of the same verdict would file
+    # them again. Every issue body embeds a stable head-pinned marker, and
+    # the loop reuses a marker match instead of re-creating. Search-index
+    # lag can miss a JUST-created issue; the worst case is one duplicate —
+    # exactly the pre-marker status quo — never a lost filing. The marker
+    # keys on a CONTENT fingerprint, not the array index (#674 round-3 P2):
+    # a rerun that returns the same findings reordered or reworded must not
+    # bind an old issue to whatever now occupies the same slot — changed
+    # content mints a fresh issue (the superseded one stays open and
+    # visible, never silently rebound).
+    fp="$(printf '%s|%s|%s|%s' "$sev" "$fpath" "$fline" "$fbody" | cksum | cut -d' ' -f1)"
+    marker="p4b-post-review ${REPO}#${PR} head=${HEAD:-unknown} finding=${fp}"
+    if ! existing="$(gh search issues --repo "$REPO" --state open "\"$marker\"" --json url --jq '.[0].url // empty' 2>/dev/null)"; then
+      # Dedup search ERROR ≠ dedup search EMPTY (#674 CodeRabbit Major):
+      # an API/auth/rate-limit failure here must not read as "no existing
+      # issue" and mint duplicates — fail closed like any other step.
+      p4b_warn "post-review dedup search failed for fingerprint ${fp} — failing closed rather than risking duplicate issues"
+      printf '%s\n%s' "$refs" "$created"
+      return 1
+    fi
+    if [ -n "$existing" ]; then
+      refs="${refs:+$refs, }#${existing##*/}"
+      i=$((i + 1))
+      continue
+    fi
+    # Title follows the documented step-9 convention (`[Post-Review] {brief
+    # description}`, REVIEW_POLICY.md § post-merge issue creation — #674
+    # round-3 P2) so title-shape triage and searches see auto-filed
+    # follow-ups exactly like manual ones.
+    title="$(printf '%.120s' "[Post-Review] ${kind} from ${REPO}#${PR}: ${sev} ${fpath}${fline:+:$fline}")"
+    bfile="$(mktemp "${TMPDIR:-/tmp}/p4b-issue.XXXXXX")"
+    {
+      printf 'Advisory %s %s flagged by the automated Phase 4b APPROVED review of %s#%s. Filed by scripts/phase-4b-review.sh BEFORE the approval posted (policy step 9, #672).\n\n' "$sev" "$kind" "$REPO" "$PR"
+      printf 'Anchor: `%s`%s\n\n' "$fpath" "${fline:+ line $fline}"
+      printf '%s\n' "$fbody"
+      printf '\nReviewer: %s (%s adapter). Reviewed head: `%s`.\n' "$REVIEWER" "$ADAPTER" "${HEAD:-unknown}"
+      printf '\n<!-- %s -->\n' "$marker"
+    } > "$bfile"
+    url="$("$GH_AS_AUTHOR" -- gh issue create --repo "$REPO" \
+      --title "$title" --body-file "$bfile" \
+      --label post-review --label "$kind" \
+      --assignee "$author_login" 2>/dev/null)" \
+      || { rm -f "$bfile"; printf '%s\n%s' "$refs" "$created"; return 1; }
+    rm -f "$bfile"
+    [ -n "$url" ] || { printf '%s\n%s' "$refs" "$created"; return 1; }
+    refs="${refs:+$refs, }#${url##*/}"
+    created="${created:+$created, }#${url##*/}"
+    i=$((i + 1))
+  done
+  printf '%s\n%s' "$refs" "$created"
+}
+
+# p4b_close_post_review_issues <refs "#1, #2"> <reason>
+# Self-cleanup for the filing side effect (#674 round-4 P2): when an
+# approval is refused AFTER issues were filed (head drift, partial filing
+# failure), the filed issues are closed as superseded rather than left
+# orphaned — the dedup search is open-state-scoped, so a rerun files fresh
+# follow-ups instead of resurrecting closed refs. Best-effort: a close
+# failure warns with the ref so the operator can close manually; it never
+# changes the refusal outcome.
+p4b_close_post_review_issues() {
+  local refs="$1" reason="$2" n
+  for n in $(printf '%s' "$refs" | tr ',' ' '); do
+    n="${n##*#}"
+    [ -n "$n" ] || continue
+    "$GH_AS_AUTHOR" -- gh issue close "$n" --repo "$REPO" --comment "$reason" >/dev/null 2>&1 \
+      || p4b_warn "could not close superseded post-review issue #$n — close it manually"
+  done
+  return 0
+}
+
+POST_REVIEW_ISSUE_REFS=""
+P4B_CREATED_ISSUE_REFS=""
 if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
-  fall_back_to_manual "approved verdict included findings; post-review issue filing is required before Phase 4b clearance"
+  # Policy step 9 (#672): observations/risks from an approving external
+  # reviewer become post-review issues BEFORE the approval clears the merge
+  # gate. The validator has already rejected APPROVED carrying any
+  # policy-REQUIRED tier, so every finding here is discretionary — file the
+  # issues mechanically and post the APPROVED with the references, instead
+  # of discarding the verdict into the manual handoff (which stranded the
+  # caller without the findings it needed to comply). Opt out with
+  # phase_4b_automation.post_review_issues: false (restores the pre-#672
+  # refusal); dry-run prints intent and files nothing.
+  # Opt-out is validated fail-closed (#674 CodeRabbit): only the literal
+  # true/false (or absent ⇒ true) are accepted — a typo like `False`, `no`,
+  # or `0` must not silently fail OPEN into auto-filing issues under the
+  # author PAT.
+  _pri_knob="$(p4b_automation_field post_review_issues)"
+  case "${_pri_knob:-true}" in
+    true) : ;;
+    false)
+      fall_back_to_manual "approved verdict included findings and phase_4b_automation.post_review_issues is false; post-review issue filing is required before Phase 4b clearance"
+      ;;
+    *)
+      fall_back_to_manual "invalid phase_4b_automation.post_review_issues value '${_pri_knob}' (expected true or false) — refusing fail-closed"
+      ;;
+  esac
+  # Tiers the feedback policy marks `ignore` are never surfaced (#674 Codex
+  # P2): drop them from the FILE set. The review body still lists every
+  # verdict finding — it is the faithful record of what the reviewer said —
+  # but no follow-up issue is opened for suppressed tiers.
+  IGNORED_SEVS='[]'; _ig_first=true
+  for _tier in p0 p1 p2 p3; do
+    if [ "$(p4b_feedback_priority_value "$_tier")" = "ignore" ]; then
+      if [ "$_ig_first" = true ]; then IGNORED_SEVS='['; _ig_first=false; else IGNORED_SEVS="$IGNORED_SEVS,"; fi
+      IGNORED_SEVS="$IGNORED_SEVS\"$(printf '%s' "$_tier" | tr '[:lower:]' '[:upper:]')\""
+    fi
+  done
+  [ "$_ig_first" = true ] || IGNORED_SEVS="$IGNORED_SEVS]"
+  FILE_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c --argjson ig "$IGNORED_SEVS" \
+    '{findings: [.findings[] | . as $f | select(($ig | index($f.severity)) | not)]}')"
+  FILE_COUNT="$(printf '%s' "$FILE_JSON" | jq -r '.findings | length')"
+  if [ "$FILE_COUNT" -eq 0 ]; then
+    p4b_log "all $FINDINGS_COUNT APPROVED finding(s) fall in feedback_policy ignore tiers — never surfaced, nothing to file"
+  elif [ "$DRY_RUN" = true ]; then
+    p4b_log "[dry-run] would file $FILE_COUNT post-review issue(s) in $REPO ($FINDINGS_COUNT finding(s) total; ignored tiers filtered), then post APPROVED with the references"
+    POST_REVIEW_ISSUE_REFS="(dry-run: $FILE_COUNT issue(s) would be filed)"
+  else
+    # Side-effect ordering (#674 Codex P2): re-read the live head BEFORE
+    # filing anything. post_review re-checks again at POST time, but by
+    # then the issues would already exist — a head that drifted during the
+    # adapter run must refuse here, with zero issues claiming an approval
+    # that will never post.
+    live_head_pre="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
+    [ -n "$live_head_pre" ] \
+      || fall_back_to_manual "could not re-read the live PR head before filing post-review issues"
+    if [ "$live_head_pre" != "$HEAD" ]; then
+      fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head_pre) — refusing to file post-review issues for an approval that will not post"
+    fi
+    # Same-head laundering gate, hoisted ahead of the side effects (#674
+    # Codex round-2 P2): the authoritative gate below still guards the
+    # POST, but by then the issues would already exist for an approval
+    # that gets refused. Same guards as the authoritative copy (module
+    # loaded; hook consults the loop log keyed to the current HEAD).
+    if [ "$P4B_ACCT_AVAILABLE" = true ] && ! p4b_acct_hook_same_head_required_block; then
+      fall_back_to_manual "an unresolved required-tier finding was recorded on the current head ($HEAD) in a prior Phase 4b loop — refusing to file post-review issues for an approval that will not post"
+    fi
+    set +e
+    _pri_out="$(p4b_file_post_review_issues "$FILE_JSON")"
+    _pri_rc=$?
+    set -e
+    POST_REVIEW_ISSUE_REFS="$(printf '%s\n' "$_pri_out" | sed -n 1p)"
+    # Cleanup operates ONLY on refs this invocation created (#674 round-5
+    # P2): a reused prior-run issue in the body refs must never be closed
+    # because a later step of THIS run failed.
+    P4B_CREATED_ISSUE_REFS="$(printf '%s\n' "$_pri_out" | sed -n 2p)"
+    if [ "$_pri_rc" -ne 0 ]; then
+      # Partial-failure orphans (#674 round-2 + round-4 P2s): surface any
+      # refs that DID file, close this run's creations as superseded
+      # (self-cleanup), and refuse. The dedup search is open-scoped, so a
+      # rerun files fresh follow-ups instead of resurrecting the closed
+      # ones.
+      if [ -n "$P4B_CREATED_ISSUE_REFS" ]; then
+        p4b_warn "post-review issue filing failed partway; closing this run's created refs as superseded: $P4B_CREATED_ISSUE_REFS"
+        p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: post-review filing for ${REPO}#${PR} failed partway and the Phase 4b approval was refused; a rerun files fresh follow-ups."
+      fi
+      fall_back_to_manual "approved verdict included findings and post-review issue filing failed${POST_REVIEW_ISSUE_REFS:+ (partial refs: $POST_REVIEW_ISSUE_REFS, created subset closed as superseded)}; refusing to post an approval with unfiled observations"
+    fi
+    [ -n "$POST_REVIEW_ISSUE_REFS" ] \
+      || fall_back_to_manual "approved verdict included findings but post-review issue filing produced no references"
+    # Post-file head recheck (#674 round-4 P2): a head that drifted DURING
+    # filing pins the just-filed issues to a head whose approval will be
+    # refused at post_review, and a new-head rerun cannot reuse the old
+    # head-pinned markers. Close this run's creations and refuse now.
+    live_head_post="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
+    if [ -z "$live_head_post" ] || [ "$live_head_post" != "$HEAD" ]; then
+      p4b_warn "PR head drifted during issue filing (reviewed $HEAD, live ${live_head_post:-unreadable}) — closing this run's filed issues as superseded"
+      p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
+      fall_back_to_manual "PR head changed while filing post-review issues (reviewed $HEAD, live ${live_head_post:-unreadable}); the filed issues were closed as superseded"
+    fi
+    p4b_log "filed $FILE_COUNT post-review issue(s): $POST_REVIEW_ISSUE_REFS"
+  fi
 fi
 
 # Render the PR review body (summary + findings list).
@@ -392,6 +607,20 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
     printf '%s' "$VERDICT_JSON" | jq -r '
       .findings[]
       | "- **\(.severity)** \((.path // "PR") + (if .line then ":\(.line)" else "" end)): \(.body)"'
+    if [ "$VERDICT" = "APPROVED" ]; then
+      # Accurate audit trail (#674 round-3 P3): only claim filing for the
+      # subset that actually filed; ignored-tier findings are listed above
+      # as the faithful verdict record but are deliberately not surfaced
+      # as issues.
+      _ign_count=$(( FINDINGS_COUNT - ${FILE_COUNT:-$FINDINGS_COUNT} ))
+      if [ -n "$POST_REVIEW_ISSUE_REFS" ] && [ "$_ign_count" -eq 0 ]; then
+        printf '\nEach finding above is an advisory follow-up filed as a post-review issue before this approval posted (policy step 9, #672): %s\n' "$POST_REVIEW_ISSUE_REFS"
+      elif [ -n "$POST_REVIEW_ISSUE_REFS" ]; then
+        printf '\n%s of the findings above were filed as post-review issues before this approval posted (policy step 9, #672): %s. The other %s fall in feedback_policy ignore tiers and were deliberately not surfaced as issues.\n' "${FILE_COUNT:-0}" "$POST_REVIEW_ISSUE_REFS" "$_ign_count"
+      elif [ "$_ign_count" -gt 0 ]; then
+        printf '\nAll %s finding(s) above fall in feedback_policy ignore tiers — listed as the faithful verdict record, deliberately not surfaced as post-review issues.\n' "$_ign_count"
+      fi
+    fi
   fi
   printf '\n\n_Posted by scripts/phase-4b-review.sh under the reviewer identity. See plans/automated-phase-4b-handoff.md._\n'
 } > "$BODY_FILE"
@@ -573,6 +802,15 @@ post_review() {
   live_head="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
   [ -n "$live_head" ] || { p4b_acct_mark_unposted "could not re-read live PR head before posting review"; p4b_die 3 "could not re-read live PR head before posting review"; }
   if [ "$live_head" != "$HEAD" ]; then
+    # Late-window drift (#674 round-5 P2): a push landing during body or
+    # accounting rendering reaches this final check with the step-9 issues
+    # already filed — close this run's creations before refusing, same as
+    # the post-file recheck, so no orphan claims an approval that never
+    # posted.
+    if [ "$event" = "APPROVE" ] && [ -n "${P4B_CREATED_ISSUE_REFS:-}" ]; then
+      p4b_warn "PR head drifted before the approval POST — closing this run's filed post-review issues as superseded: $P4B_CREATED_ISSUE_REFS"
+      p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
+    fi
     fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head)"
   fi
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"

@@ -618,6 +618,18 @@ phase_4b_automation:
   # handoff instead. (Documentary; the reference always fails closed.)
   fail_closed: true
 
+  # Policy step 9 executor (#672). On an APPROVED verdict carrying
+  # discretionary-tier findings (the validator already rejects APPROVED +
+  # any policy-REQUIRED tier), the orchestrator files one `post-review` +
+  # `observation` issue per finding (author identity, assigned to it) and
+  # posts the APPROVED with the references appended — instead of the
+  # pre-#672 behavior of refusing AND discarding the verdict, which
+  # stranded the caller without the findings step 9 needs. Absent ⇒ true.
+  # Set false to restore the refusal (e.g. a consumer repo without the
+  # post-review/observation labels; note any issue-filing failure already
+  # degrades to the refusal fail-closed).
+  post_review_issues: true
+
   # What to do on adapter error/timeout: emit the manual chat-side handoff
   # block and alert the human. (Documentary; the only implemented behavior.)
   fallback_on_error: manual-handoff

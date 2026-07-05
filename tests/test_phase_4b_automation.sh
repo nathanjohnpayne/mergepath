@@ -172,6 +172,14 @@ mk_fake fake-codex-approve \
   "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[]}'"
 mk_fake fake-codex-approve-p2 \
   "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P2\",\"path\":\"x.js\",\"line\":2,\"body\":\"should be handled under stricter policy\"}]}'"
+mk_fake fake-codex-approve-risk \
+  "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P2\",\"path\":\"x.js\",\"line\":2,\"body\":\"residual risk of stale cache reads after failover\"}]}'"
+mk_fake fake-codex-approve-p3 \
+  "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P3\",\"path\":\"x.js\",\"line\":2,\"body\":\"cosmetic nit only\"}]}'"
+mk_fake fake-codex-approve-2p2 \
+  "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P2\",\"path\":\"x.js\",\"line\":2,\"body\":\"first advisory\"},{\"severity\":\"P2\",\"path\":\"y.js\",\"line\":9,\"body\":\"second advisory\"}]}'"
+mk_fake fake-codex-approve-p2p3 \
+  "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P2\",\"path\":\"x.js\",\"line\":2,\"body\":\"filed advisory\"},{\"severity\":\"P3\",\"path\":\"y.js\",\"line\":9,\"body\":\"suppressed nit\"}]}'"
 mk_fake fake-codex-junk \
   "printf '%s' 'this is not json at all'"
 mk_fake fake-codex-usage \
@@ -311,11 +319,38 @@ cat > "$BIN/gh" <<'SH'
 if [ "${1:-}" = "api" ]; then
   case "${2:-}" in
     repos/o/r/pulls/*)
-      printf '%s\n' "${P4B_FAKE_LIVE_HEAD:-abc123}"
+      # #674 round 4: P4B_FAKE_LIVE_HEAD2 simulates a head that drifts
+      # between reads — served from the SECOND live-head read on.
+      cnt_file="${P4B_ISSUE_LOG:-${TMPDIR:-/tmp}/p4b-fake}.headreads"
+      cnt=$(( $( [ -f "$cnt_file" ] && cat "$cnt_file" || echo 0 ) + 1 ))
+      printf '%s\n' "$cnt" > "$cnt_file"
+      if [ -n "${P4B_FAKE_LIVE_HEAD2:-}" ] && [ "$cnt" -ge "${P4B_FAKE_LIVE_HEAD2_FROM:-2}" ]; then
+        printf '%s\n' "$P4B_FAKE_LIVE_HEAD2"
+      else
+        printf '%s\n' "${P4B_FAKE_LIVE_HEAD:-abc123}"
+      fi
       exit 0
       ;;
   esac
 fi
+
+
+# dedup lookup (#674 CodeRabbit): empty by default; P4B_FAKE_EXISTING_ISSUE
+# simulates a marker match from a prior partially-failed run.
+if [ "${1:-}" = "search" ] && [ "${2:-}" = "issues" ]; then
+  # #674 CodeRabbit Major: a search ERROR must fail the filing closed.
+  [ -n "${P4B_FAKE_SEARCH_FAIL:-}" ] && exit 1
+  if [ -n "${P4B_FAKE_EXISTING_ISSUE_ONCE:-}" ]; then
+    scnt_file="${P4B_ISSUE_LOG:-${TMPDIR:-/tmp}/p4b-fake}.searches"
+    scnt=$(( $( [ -f "$scnt_file" ] && cat "$scnt_file" || echo 0 ) + 1 ))
+    printf '%s\n' "$scnt" > "$scnt_file"
+    [ "$scnt" -eq 1 ] && printf 'https://github.com/o/r/issues/777\n'
+    exit 0
+  fi
+  [ -n "${P4B_FAKE_EXISTING_ISSUE:-}" ] && printf 'https://github.com/o/r/issues/777\n'
+  exit 0
+fi
+
 echo "unexpected fake gh invocation: $*" >&2
 exit 127
 SH
@@ -350,6 +385,42 @@ done
 printf '{"id":1,"commit_id":"%s"}\n' "${P4B_FAKE_CREATED_REVIEW_HEAD:-abc123}"
 SH
 chmod +x "$BIN/fake-gh-as-reviewer"
+
+# Author wrapper fake (#674): the step-9 issue writes route through
+# gh-as-author.sh. Logs to P4B_ISSUE_LOG with the same record shapes the
+# assertions key on (VIA / ARGV / CLOSE / body copies), mints incrementing
+# issue URLs, honors the failure knobs.
+cat > "$BIN/fake-gh-as-author" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = "--" ] || { echo "expected wrapper separator" >&2; exit 64; }
+shift
+[ "${1:-}" = "gh" ] || { echo "expected gh command" >&2; exit 64; }
+shift
+log="${P4B_ISSUE_LOG:-/dev/null}"
+if [ "${1:-}" = "issue" ] && [ "${2:-}" = "create" ]; then
+  { printf 'VIA gh-as-author\n'; printf 'ARGV gh %s\n' "$*"; } >> "$log"
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--body-file" ] && [ -n "${P4B_ISSUE_LOG:-}" ]; then
+      cp "$a" "${log}.body.$(grep -c '^ARGV ' "$log")"
+    fi
+    prev="$a"
+  done
+  [ -n "${P4B_FAKE_ISSUE_FAIL:-}" ] && exit 1
+  if [ -n "${P4B_FAKE_ISSUE_FAIL_AFTER_1:-}" ] && [ "$(grep -c '^ARGV ' "$log")" -ge 2 ]; then
+    exit 1
+  fi
+  printf 'https://github.com/o/r/issues/%s\n' "$((900 + $(grep -c '^ARGV ' "$log")))"
+  exit 0
+fi
+if [ "${1:-}" = "issue" ] && [ "${2:-}" = "close" ]; then
+  printf 'CLOSE #%s\n' "${3:-}" >> "$log"
+  exit 0
+fi
+echo "unexpected fake gh-as-author invocation: $*" >&2
+exit 64
+SH
+chmod +x "$BIN/fake-gh-as-author"
 
 # ===========================================================================
 echo "lib.sh — reviewer selection"
@@ -1287,25 +1358,324 @@ if [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "
   pass "policy-required finding in APPROVED verdict → manual fallback, no auto-approve"
 else fail "policy-required finding fallback (rc=$rc): $out"; fi
 
-# Repo policy requires post-review issues for observations/risks flagged while
-# approving. The schema can carry advisory findings, but the automated poster
-# cannot clear the merge gate until that follow-up path has been handled.
+# Policy step 9 executor (#672): an APPROVED carrying discretionary findings
+# now FILES the post-review issues and posts, instead of discarding the
+# verdict into the manual handoff. Dry-run prints intent, files nothing, and
+# still reports a dry-run APPROVED.
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   bash "$ORCH" 133 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
+if [ "$rc" = 0 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.dry_run')" = "true" ]; then
+  pass "APPROVED with advisory findings dry-run → would file issues, no fallback (#672)"
+else fail "approved-with-advisory dry-run (rc=$rc): $out"; fi
+
+# #672 happy path: issues filed under the author token with the step-9 labels
+# and assignee, references appended to the posted APPROVED body.
+ISSUE_LOG="$WORK/issue-create.log"; : > "$ISSUE_LOG"
+P4B672_BODY="$WORK/p4b672-body.txt"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$ISSUE_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b672-wrapper.log" \
+  P4B_WRAPPER_BODY="$P4B672_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = "true" ]; then
+  pass "#672: APPROVED with advisory findings posts after filing issues"
+else fail "#672 happy path (rc=$rc): $out"; fi
+grep -q -- "--label post-review" "$ISSUE_LOG" && grep -q -- "--label observation" "$ISSUE_LOG" \
+  && pass "#672: filed issue carries the step-9 labels" || fail "#672: labels missing from issue create argv"
+grep -q -- "--assignee nathanjohnpayne" "$ISSUE_LOG" \
+  && pass "#672: filed issue assigned to the author identity" || fail "#672: assignee missing"
+grep -q "^VIA gh-as-author$" "$ISSUE_LOG" \
+  && pass "#672: issue writes routed through the author wrapper" || fail "#672: issue create not wrapper-routed"
+grep -q "post-review issue" "$P4B672_BODY" && grep -q "#901" "$P4B672_BODY" \
+  && pass "#672: posted APPROVED body carries the issue reference" || fail "#672: issue reference missing from review body"
+P2_FP="$(printf '%s|%s|%s|%s' P2 x.js 2 "should be handled under stricter policy" | cksum | cut -d' ' -f1)"
+grep -q "p4b-post-review o/r#134 head=abc123 finding=${P2_FP}" "${ISSUE_LOG}.body.1" \
+  && pass "#674: filed issue body embeds the content-fingerprinted dedup marker" || fail "#674: content-fingerprint marker missing from issue body"
+grep -q -- "--title \[Post-Review\]" "$ISSUE_LOG" || grep -q "\[Post-Review\]" "$ISSUE_LOG" \
+  && pass "#674: issue title follows the documented Post-Review convention" || fail "#674: Post-Review title prefix missing"
+
+# #674 CodeRabbit: a marker match from a prior partially-failed run is
+# REUSED — no duplicate issue is created and the reference still lands.
+DEDUP_ISSUE_LOG="$WORK/issue-dedup.log"; : > "$DEDUP_ISSUE_LOG"
+DEDUP_BODY="$WORK/p4b674-dedup-body.txt"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$DEDUP_ISSUE_LOG" P4B_FAKE_EXISTING_ISSUE=1 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-dedup-wrapper.log" \
+  P4B_WRAPPER_BODY="$DEDUP_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  bash "$ORCH" 140 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ ! -s "$DEDUP_ISSUE_LOG" ] && grep -q "#777" "$DEDUP_BODY"; then
+  pass "#674: existing marker match reused (no duplicate issue; reference carried)"
+else fail "#674 dedup reuse (rc=$rc)"; fi
+
+# #674 CodeRabbit: an unrecognized post_review_issues value fails CLOSED
+# instead of silently failing open into auto-filing.
+POLICY_BAD_KNOB="$WORK/policy-bad-knob.yml"
+cat > "$POLICY_BAD_KNOB" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-cursor
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+author_identity: nathanjohnpayne
+phase_4b_automation:
+  enabled: true
+  mode: local
+  post_review_issues: nope
+YAML
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_BAD_KNOB" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  bash "$ORCH" 141 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "invalid phase_4b_automation.post_review_issues"; then
+  pass "#674: invalid post_review_issues value fails closed"
+else fail "#674 bad-knob fail-closed (rc=$rc): $out"; fi
+
+# #672 fail-closed: an issue-create failure refuses the approval (no review
+# POST is attempted) and falls back to the manual handoff.
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$WORK/issue-fail.log" P4B_FAKE_ISSUE_FAIL=1 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b672-fail-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=abc123 \
+  bash "$ORCH" 135 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
 if [ "$rc" = 4 ] \
    && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ] \
-   && [ "$(printf '%s' "$out" | jq -r '.reason')" = "approved verdict included findings; post-review issue filing is required before Phase 4b clearance" ]; then
-  pass "APPROVED with advisory findings → manual fallback until post-review issues exist"
-else fail "approved-with-advisory fallback (rc=$rc): $out"; fi
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "issue filing failed"; then
+  pass "#672: issue-create failure refuses the approval (fail-closed)"
+else fail "#672 fail-closed (rc=$rc): $out"; fi
+[ ! -s "$WORK/p4b672-fail-wrapper.log" ] \
+  && pass "#672: no review POST attempted after filing failure" || fail "#672: review POST attempted despite filing failure"
+
+# #674 round 1: a head that drifted during the adapter run must refuse
+# BEFORE any side-effecting issue creation (post_review would refuse the
+# POST later, but by then the issues would already exist).
+DRIFT_ISSUE_LOG="$WORK/issue-drift.log"; : > "$DRIFT_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$DRIFT_ISSUE_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-drift-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=def456 \
+  bash "$ORCH" 137 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "refusing to file post-review issues"; then
+  pass "#674: head drift refuses BEFORE issue filing"
+else fail "#674 head-drift pre-check (rc=$rc): $out"; fi
+[ ! -s "$DRIFT_ISSUE_LOG" ] \
+  && pass "#674: no issues created for a drifted head" || fail "#674: issues created despite head drift"
+
+# #674 round 1: a finding whose wording flags a RISK files under the `risk`
+# label per policy step 9, not a hard-coded `observation`.
+RISK_ISSUE_LOG="$WORK/issue-risk.log"; : > "$RISK_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-risk" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$RISK_ISSUE_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-risk-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  bash "$ORCH" 138 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && grep -q -- "--label risk" "$RISK_ISSUE_LOG" && ! grep -q -- "--label observation" "$RISK_ISSUE_LOG"; then
+  pass "#674: risk-worded finding files under the risk label"
+else fail "#674 risk classification (rc=$rc)"; fi
+
+# #674 round 1: feedback_policy `ignore` tiers are never surfaced — no issue
+# is filed for them, and the approval still posts.
+POLICY_P3_IGNORE="$WORK/policy-p3-ignore.yml"
+cat > "$POLICY_P3_IGNORE" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-cursor
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+author_identity: nathanjohnpayne
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p0: required
+    p1: required
+    p2: discretionary
+    p3: ignore
+phase_4b_automation:
+  enabled: true
+  mode: local
+YAML
+IGNORE_ISSUE_LOG="$WORK/issue-ignore.log"; : > "$IGNORE_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_P3_IGNORE" CODEX_BIN="$BIN/fake-codex-approve-p3" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$IGNORE_ISSUE_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-ignore-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  bash "$ORCH" 139 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = "true" ] && [ ! -s "$IGNORE_ISSUE_LOG" ]; then
+  pass "#674: ignore-tier findings file nothing and the approval still posts"
+else fail "#674 ignore-tier filter (rc=$rc): $out"; fi
+
+# #674: token ownership lives in the identity-verifying author wrapper —
+# filing succeeds with an ambient reviewer token in the environment and no
+# preflight author PAT, and every write routes through gh-as-author.
+KEYRING_ISSUE_LOG="$WORK/issue-keyring.log"; : > "$KEYRING_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  GH_TOKEN=ambient-reviewer-token P4B_ISSUE_LOG="$KEYRING_ISSUE_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
+  P4B_WRAPPER_LOG="$WORK/p4b674-keyring-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  bash "$ORCH" 142 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && grep -q "^VIA gh-as-author$" "$KEYRING_ISSUE_LOG" \
+   && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = "true" ]; then
+  pass "#674: filing under an ambient reviewer token routes through the author wrapper"
+else fail "#674 wrapper token ownership (rc=$rc)"; fi
+
+# #674 CodeRabbit Major: a dedup search ERROR fails the filing closed —
+# never read as "no existing issue".
+SEARCHFAIL_LOG="$WORK/issue-searchfail.log"; : > "$SEARCHFAIL_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$SEARCHFAIL_LOG" P4B_FAKE_SEARCH_FAIL=1 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" \
+  P4B_WRAPPER_LOG="$WORK/p4b674-searchfail-wrapper.log" P4B_FAKE_LIVE_HEAD=abc123 \
+  bash "$ORCH" 148 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "issue filing failed" \
+   && ! grep -q "^ARGV " "$SEARCHFAIL_LOG"; then
+  pass "#674: dedup search error fails closed with no issue created"
+else fail "#674 search-error fail-closed (rc=$rc): $out"; fi
+[ ! -s "$WORK/p4b674-searchfail-wrapper.log" ] \
+  && pass "#674: no review POST after a search error" || fail "#674: review POST attempted after search error"
+
+# #674 round 2: a partial filing failure surfaces the already-filed refs in
+# the fallback reason (the dedup marker makes a rerun reuse them).
+PARTIAL_ISSUE_LOG="$WORK/issue-partial.log"; : > "$PARTIAL_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-2p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$PARTIAL_ISSUE_LOG" P4B_FAKE_ISSUE_FAIL_AFTER_1=1 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-partial-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=abc123 \
+  bash "$ORCH" 143 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "partial refs: #901"; then
+  pass "#674: partial filing failure surfaces the orphan refs in the fallback"
+else fail "#674 partial-orphan surfacing (rc=$rc): $out"; fi
+grep -q "^CLOSE #901$" "$PARTIAL_ISSUE_LOG" \
+  && pass "#674: partial orphans closed as superseded (round-4 self-cleanup)" || fail "#674: partial orphan not closed"
+[ ! -s "$WORK/p4b674-partial-wrapper.log" ] \
+  && pass "#674: no review POST after a partial filing failure" || fail "#674: review POST attempted after partial failure"
+
+# #674 round 4: a head that drifts DURING filing refuses at the post-file
+# recheck, and the just-filed issues are closed as superseded.
+DRIFT2_ISSUE_LOG="$WORK/issue-drift2.log"; : > "$DRIFT2_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$DRIFT2_ISSUE_LOG" \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-drift2-wrapper.log" \
+  bash "$ORCH" 145 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "changed while filing post-review issues" \
+   && grep -q "^ARGV " "$DRIFT2_ISSUE_LOG" \
+   && grep -q "^CLOSE #901$" "$DRIFT2_ISSUE_LOG"; then
+  pass "#674: mid-filing head drift refuses and closes the filed issues"
+else fail "#674 mid-filing drift cleanup (rc=$rc): $out"; fi
+[ ! -s "$WORK/p4b674-drift2-wrapper.log" ] \
+  && pass "#674: no review POST after mid-filing drift" || fail "#674: review POST attempted after mid-filing drift"
+
+# #674 round 3: a mixed filed+ignored approval body claims filing only for
+# the filed subset and names the suppressed remainder.
+MIXED_ISSUE_LOG="$WORK/issue-mixed.log"; : > "$MIXED_ISSUE_LOG"
+MIXED_BODY="$WORK/p4b674-mixed-body.txt"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_P3_IGNORE" CODEX_BIN="$BIN/fake-codex-approve-p2p3" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$MIXED_ISSUE_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-mixed-wrapper.log" \
+  P4B_WRAPPER_BODY="$MIXED_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  bash "$ORCH" 144 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && [ "$(grep -c '^ARGV ' "$MIXED_ISSUE_LOG")" = "1" ] \
+   && grep -q "1 of the findings above were filed" "$MIXED_BODY" \
+   && grep -q "ignore tiers and were deliberately not surfaced" "$MIXED_BODY"; then
+  pass "#674: mixed approval body claims filing only for the filed subset"
+else fail "#674 mixed filed/ignored body wording (rc=$rc)"; fi
+
+# #674 round 5: a REUSED prior-run issue is never closed by this run's
+# failure cleanup — only refs this invocation created are.
+REUSE_ISSUE_LOG="$WORK/issue-reuse-fail.log"; : > "$REUSE_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-2p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$REUSE_ISSUE_LOG" \
+  P4B_FAKE_EXISTING_ISSUE_ONCE=1 P4B_FAKE_ISSUE_FAIL=1 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-reuse-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=abc123 \
+  bash "$ORCH" 146 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] && ! grep -q "^CLOSE #777$" "$REUSE_ISSUE_LOG"; then
+  pass "#674: reused prior-run issue is NOT closed by this run's failure cleanup"
+else fail "#674 reused-ref protection (rc=$rc)"; fi
+
+# #674 round 5: drift landing in the render window (after the post-file
+# recheck, before the POST) still closes this run's filed issues.
+LATE_ISSUE_LOG="$WORK/issue-late-drift.log"; : > "$LATE_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$LATE_ISSUE_LOG" \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=3 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/p4b674-late-wrapper.log" \
+  bash "$ORCH" 147 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "changed during review" \
+   && grep -q "^CLOSE #901$" "$LATE_ISSUE_LOG"; then
+  pass "#674: render-window drift closes this run's filed issues before refusing"
+else fail "#674 late-drift cleanup (rc=$rc): $out"; fi
+[ ! -s "$WORK/p4b674-late-wrapper.log" ] \
+  && pass "#674: no review POST after render-window drift" || fail "#674: review POST attempted after late drift"
+
+# #672 opt-out: post_review_issues: false restores the pre-#672 refusal.
+POLICY_NO_ISSUES="$WORK/policy-no-issues.yml"
+cat > "$POLICY_NO_ISSUES" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-cursor
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+author_identity: nathanjohnpayne
+phase_4b_automation:
+  enabled: true
+  mode: local
+  post_review_issues: false
+YAML
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_NO_ISSUES" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  bash "$ORCH" 136 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "post_review_issues is false"; then
+  pass "#672: post_review_issues: false restores the refusal"
+else fail "#672 opt-out (rc=$rc): $out"; fi
 
 # Stale-head guard: a non-dry-run APPROVED must re-read the live head and
 # fall back before the wrapper writes if the reviewed SHA is no longer live.
 WRAPPER_LOG="$WORK/wrapper.log"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
-  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_FAKE_LIVE_HEAD=def456 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_FAKE_LIVE_HEAD=def456 \
   bash "$ORCH" 127 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 4 ] \
@@ -1320,7 +1690,7 @@ WRAPPER_BODY="$WORK/wrapper-success-body.md"
 WRAPPER_PAYLOAD="$WORK/wrapper-success-payload.json"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
-  OP_PREFLIGHT_REVIEWER_PAT=wrong-current-agent-token P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=abc123 \
+  OP_PREFLIGHT_REVIEWER_PAT=wrong-current-agent-token P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=abc123 \
   bash "$ORCH" 129 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
@@ -1341,7 +1711,7 @@ WRAPPER_BODY="$WORK/wrapper-mismatch-body.md"
 WRAPPER_PAYLOAD="$WORK/wrapper-mismatch-payload.json"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve" \
-  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=def456 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=def456 \
   bash "$ORCH" 132 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 3 ] && jq -e '.commit_id == "abc123" and .event == "APPROVE"' "$WRAPPER_PAYLOAD" >/dev/null; then
@@ -1353,7 +1723,7 @@ WRAPPER_BODY="$WORK/wrapper-usage-body.md"
 WRAPPER_PAYLOAD="$WORK/wrapper-usage-payload.json"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CLAUDE_BIN="$BIN/fake-claude-approve-usage" \
-  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=abc123 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WRAPPER_LOG" P4B_WRAPPER_BODY="$WRAPPER_BODY" P4B_WRAPPER_PAYLOAD="$WRAPPER_PAYLOAD" P4B_FAKE_LIVE_HEAD=abc123 \
   bash "$ORCH" 130 --repo o/r --author codex --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
@@ -1543,7 +1913,7 @@ echo "orchestrator — policy-driven timeout/effort (#589)"
 EFFORT_BODY="$WORK/orch-effort-body.md"
 set +e
 out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-te.yml" CODEX_BIN="$BIN/fake-codex-effort" \
-  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/orch-effort-wrapper.log" P4B_WRAPPER_BODY="$EFFORT_BODY" P4B_FAKE_LIVE_HEAD=abc123 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_GH_AS_AUTHOR="$BIN/fake-gh-as-author" P4B_WRAPPER_LOG="$WORK/orch-effort-wrapper.log" P4B_WRAPPER_BODY="$EFFORT_BODY" P4B_FAKE_LIVE_HEAD=abc123 \
   bash "$ORCH" 140 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 0 ] \
