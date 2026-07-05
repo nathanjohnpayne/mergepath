@@ -316,6 +316,26 @@ if [ "${1:-}" = "api" ]; then
       ;;
   esac
 fi
+if [ "${1:-}" = "auth" ] && [ "${2:-}" = "token" ]; then
+  printf 'fake-keyring-author-token\n'
+  exit 0
+fi
+# post-review issue filing (#672): record argv + effective token + body,
+# fail when P4B_FAKE_ISSUE_FAIL is set, else mint an incrementing issue URL.
+if [ "${1:-}" = "issue" ] && [ "${2:-}" = "create" ]; then
+  log="${P4B_ISSUE_LOG:-/dev/null}"
+  { printf 'GH_TOKEN=%s\n' "${GH_TOKEN:-}"; printf 'ARGV %s\n' "$*"; } >> "$log"
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--body-file" ] && [ -n "${P4B_ISSUE_LOG:-}" ]; then
+      cp "$a" "${log}.body.$(grep -c '^ARGV ' "$log")"
+    fi
+    prev="$a"
+  done
+  [ -n "${P4B_FAKE_ISSUE_FAIL:-}" ] && exit 1
+  printf 'https://github.com/o/r/issues/%s\n' "$((900 + $(grep -c '^ARGV ' "$log")))"
+  exit 0
+fi
 echo "unexpected fake gh invocation: $*" >&2
 exit 127
 SH
@@ -1287,18 +1307,83 @@ if [ "$rc" = 4 ] && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "
   pass "policy-required finding in APPROVED verdict → manual fallback, no auto-approve"
 else fail "policy-required finding fallback (rc=$rc): $out"; fi
 
-# Repo policy requires post-review issues for observations/risks flagged while
-# approving. The schema can carry advisory findings, but the automated poster
-# cannot clear the merge gate until that follow-up path has been handled.
+# Policy step 9 executor (#672): an APPROVED carrying discretionary findings
+# now FILES the post-review issues and posts, instead of discarding the
+# verdict into the manual handoff. Dry-run prints intent, files nothing, and
+# still reports a dry-run APPROVED.
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
   bash "$ORCH" 133 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
 set -e
+if [ "$rc" = 0 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.dry_run')" = "true" ]; then
+  pass "APPROVED with advisory findings dry-run → would file issues, no fallback (#672)"
+else fail "approved-with-advisory dry-run (rc=$rc): $out"; fi
+
+# #672 happy path: issues filed under the author token with the step-9 labels
+# and assignee, references appended to the posted APPROVED body.
+ISSUE_LOG="$WORK/issue-create.log"; : > "$ISSUE_LOG"
+P4B672_BODY="$WORK/p4b672-body.txt"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$ISSUE_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/p4b672-wrapper.log" \
+  P4B_WRAPPER_BODY="$P4B672_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  bash "$ORCH" 134 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = "true" ]; then
+  pass "#672: APPROVED with advisory findings posts after filing issues"
+else fail "#672 happy path (rc=$rc): $out"; fi
+grep -q -- "--label post-review" "$ISSUE_LOG" && grep -q -- "--label observation" "$ISSUE_LOG" \
+  && pass "#672: filed issue carries the step-9 labels" || fail "#672: labels missing from issue create argv"
+grep -q -- "--assignee nathanjohnpayne" "$ISSUE_LOG" \
+  && pass "#672: filed issue assigned to the author identity" || fail "#672: assignee missing"
+grep -q "^GH_TOKEN=fake-author-pat$" "$ISSUE_LOG" \
+  && pass "#672: issue filed under the author token" || fail "#672: wrong token for issue create"
+grep -q "post-review issue" "$P4B672_BODY" && grep -q "#901" "$P4B672_BODY" \
+  && pass "#672: posted APPROVED body carries the issue reference" || fail "#672: issue reference missing from review body"
+
+# #672 fail-closed: an issue-create failure refuses the approval (no review
+# POST is attempted) and falls back to the manual handoff.
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$WORK/issue-fail.log" P4B_FAKE_ISSUE_FAIL=1 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/p4b672-fail-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=abc123 \
+  bash "$ORCH" 135 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
 if [ "$rc" = 4 ] \
    && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ] \
-   && [ "$(printf '%s' "$out" | jq -r '.reason')" = "approved verdict included findings; post-review issue filing is required before Phase 4b clearance" ]; then
-  pass "APPROVED with advisory findings → manual fallback until post-review issues exist"
-else fail "approved-with-advisory fallback (rc=$rc): $out"; fi
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "issue filing failed"; then
+  pass "#672: issue-create failure refuses the approval (fail-closed)"
+else fail "#672 fail-closed (rc=$rc): $out"; fi
+[ ! -s "$WORK/p4b672-fail-wrapper.log" ] \
+  && pass "#672: no review POST attempted after filing failure" || fail "#672: review POST attempted despite filing failure"
+
+# #672 opt-out: post_review_issues: false restores the pre-#672 refusal.
+POLICY_NO_ISSUES="$WORK/policy-no-issues.yml"
+cat > "$POLICY_NO_ISSUES" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-cursor
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+author_identity: nathanjohnpayne
+phase_4b_automation:
+  enabled: true
+  mode: local
+  post_review_issues: false
+YAML
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_NO_ISSUES" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  bash "$ORCH" 136 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "true" ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "post_review_issues is false"; then
+  pass "#672: post_review_issues: false restores the refusal"
+else fail "#672 opt-out (rc=$rc): $out"; fi
 
 # Stale-head guard: a non-dry-run APPROVED must re-read the live head and
 # fall back before the wrapper writes if the reviewed SHA is no longer live.

@@ -193,10 +193,14 @@ phase-4b-classifier.sh (is 4b needed?) ─▶ phase-4b-review.sh
   `feedback_policy` when present (#574). `APPROVED` may not carry findings in
   any policy-required severity tier; absent `feedback_policy` defaults to
   P0/P1 required and P2/P3 discretionary. `mode: address-all` makes every
-  finding block an automated approval. Separately, the orchestrator refuses to
-  post any `APPROVED` verdict that still carries findings, because repo policy
-  requires observations/risks from an approving external reviewer to become
-  post-review issues before that approval clears the merge gate.
+  finding block an automated approval. Separately, an `APPROVED` verdict that
+  carries discretionary findings triggers the policy step-9 executor (#672):
+  the orchestrator files one `post-review` + `observation` issue per finding
+  (author identity, assigned to it) and posts the approval with the issue
+  references appended — observations become issues BEFORE the approval clears
+  the merge gate. Any filing failure refuses the approval fail-closed (the
+  pre-#672 behavior); `phase_4b_automation.post_review_issues: false` opts a
+  repo back into the plain refusal.
 - **Attribution-plane auth:** the selected reviewer's PAT is resolved through
   `scripts/gh-as-reviewer.sh`. The orchestrator sets
   `GH_AS_REVIEWER_IDENTITY` and deliberately clears a stale

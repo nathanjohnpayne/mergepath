@@ -362,8 +362,76 @@ TOKEN_COUNT="$(printf '%s' "$VERDICT_JSON" | jq -r '.usage.token_count // empty'
 USAGE_SOURCE="$(printf '%s' "$VERDICT_JSON" | jq -r '.usage.source // empty')"
 ADAPTER_RUNS=1
 
+# p4b_file_post_review_issues <verdict-json>
+# Policy step 9 executor (#672): one `post-review` + `observation` issue per
+# discretionary finding on an APPROVED verdict, filed in $REPO under the
+# AUTHOR identity (the owner files issues per house convention; `gh issue
+# create` is deliberately not byline-guarded, #317/#342) and assigned to it.
+# Prints comma-separated `#N` references on success. ANY single failure —
+# token unresolvable, a missing label on the target repo, an API error —
+# returns non-zero so the caller refuses the approval (fail-closed: an
+# APPROVED may never post with its observations unfiled; that failure mode
+# degrades exactly to the pre-#672 refusal).
+p4b_file_post_review_issues() {
+  local vjson="$1" author_login token refs="" i total sev fpath fline fbody title bfile url
+  author_login="$(p4b_top_field author_identity)"; author_login="${author_login:-nathanjohnpayne}"
+  token="${OP_PREFLIGHT_AUTHOR_PAT:-}"
+  if [ -z "$token" ]; then
+    token="$(gh auth token --user "$author_login" 2>/dev/null || true)"
+  fi
+  [ -n "$token" ] || { p4b_warn "post-review issues: no author token resolvable (OP_PREFLIGHT_AUTHOR_PAT unset and gh keyring has no $author_login)"; return 1; }
+  total="$(printf '%s' "$vjson" | jq -r '.findings | length')"
+  i=0
+  while [ "$i" -lt "$total" ]; do
+    sev="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].severity')"
+    fpath="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].path // "PR"')"
+    fline="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].line // empty')"
+    fbody="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].body')"
+    title="$(printf '%.120s' "post-review observation (${REPO}#${PR}): ${sev} ${fpath}${fline:+:$fline}")"
+    bfile="$(mktemp "${TMPDIR:-/tmp}/p4b-issue.XXXXXX")"
+    {
+      printf 'Advisory %s observation flagged by the automated Phase 4b APPROVED review of %s#%s. Filed by scripts/phase-4b-review.sh BEFORE the approval posted (policy step 9, #672).\n\n' "$sev" "$REPO" "$PR"
+      printf 'Anchor: `%s`%s\n\n' "$fpath" "${fline:+ line $fline}"
+      printf '%s\n' "$fbody"
+      printf '\nReviewer: %s (%s adapter). Reviewed head: `%s`.\n' "$REVIEWER" "$ADAPTER" "${HEAD:-unknown}"
+    } > "$bfile"
+    url="$(GH_TOKEN="$token" GITHUB_TOKEN= gh issue create --repo "$REPO" \
+      --title "$title" --body-file "$bfile" \
+      --label post-review --label observation \
+      --assignee "$author_login" 2>/dev/null)" || { rm -f "$bfile"; return 1; }
+    rm -f "$bfile"
+    [ -n "$url" ] || return 1
+    refs="${refs:+$refs, }#${url##*/}"
+    i=$((i + 1))
+  done
+  printf '%s' "$refs"
+}
+
+POST_REVIEW_ISSUE_REFS=""
 if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
-  fall_back_to_manual "approved verdict included findings; post-review issue filing is required before Phase 4b clearance"
+  # Policy step 9 (#672): observations/risks from an approving external
+  # reviewer become post-review issues BEFORE the approval clears the merge
+  # gate. The validator has already rejected APPROVED carrying any
+  # policy-REQUIRED tier, so every finding here is discretionary — file the
+  # issues mechanically and post the APPROVED with the references, instead
+  # of discarding the verdict into the manual handoff (which stranded the
+  # caller without the findings it needed to comply). Opt out with
+  # phase_4b_automation.post_review_issues: false (restores the pre-#672
+  # refusal); dry-run prints intent and files nothing.
+  if [ "$(p4b_automation_field post_review_issues)" = "false" ]; then
+    fall_back_to_manual "approved verdict included findings and phase_4b_automation.post_review_issues is false; post-review issue filing is required before Phase 4b clearance"
+  fi
+  if [ "$DRY_RUN" = true ]; then
+    p4b_log "[dry-run] would file $FINDINGS_COUNT post-review observation issue(s) in $REPO, then post APPROVED with the references"
+    POST_REVIEW_ISSUE_REFS="(dry-run: $FINDINGS_COUNT observation issue(s) would be filed)"
+  else
+    if ! POST_REVIEW_ISSUE_REFS="$(p4b_file_post_review_issues "$VERDICT_JSON")"; then
+      fall_back_to_manual "approved verdict included findings and post-review issue filing failed; refusing to post an approval with unfiled observations"
+    fi
+    [ -n "$POST_REVIEW_ISSUE_REFS" ] \
+      || fall_back_to_manual "approved verdict included findings but post-review issue filing produced no references"
+    p4b_log "filed $FINDINGS_COUNT post-review observation issue(s): $POST_REVIEW_ISSUE_REFS"
+  fi
 fi
 
 # Render the PR review body (summary + findings list).
@@ -392,6 +460,9 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
     printf '%s' "$VERDICT_JSON" | jq -r '
       .findings[]
       | "- **\(.severity)** \((.path // "PR") + (if .line then ":\(.line)" else "" end)): \(.body)"'
+    if [ "$VERDICT" = "APPROVED" ] && [ -n "$POST_REVIEW_ISSUE_REFS" ]; then
+      printf '\nEach finding above is an advisory observation filed as a post-review issue before this approval posted (policy step 9, #672): %s\n' "$POST_REVIEW_ISSUE_REFS"
+    fi
   fi
   printf '\n\n_Posted by scripts/phase-4b-review.sh under the reviewer identity. See plans/automated-phase-4b-handoff.md._\n'
 } > "$BODY_FILE"
