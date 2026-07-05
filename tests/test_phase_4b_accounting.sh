@@ -605,6 +605,50 @@ if printf '%s' "$tt_filed" | jq -e '.advisory_issues_filed == [701,702]' >/dev/n
   pass "advisory_issues_filed derives from the filed-issues-enriched unique findings (#675)"
 else fail "advisory_issues_filed derivation: $tt_filed"; fi
 
+# Explicit F-id issue override respects an explicit null (#675 Codex round 1):
+# key-presence, not null-coalescing — a {"disposition":"fixed","issue":null}
+# override keeps issue null instead of reattaching the filed follow-up.
+uf="$(printf '%s\n' '{"loop":1,"severity":"P2","path":"a.js","line":3,"body":"dup"}' \
+  | p4b_acct_unique_findings \
+      '{"F1":{"disposition":"fixed","fix_commit":"abc123","issue":null}}' \
+      '[{"severity":"P2","path":"a.js","line":3,"body":"dup","issue":585}]')"
+if printf '%s' "$uf" | jq -e '.[0].disposition == "fixed" and .[0].fix_commit == "abc123" and .[0].issue == null' >/dev/null; then
+  pass "explicit F-id issue:null wins over the filed channel (key-presence, not null-coalescing) (#675)"
+else fail "explicit-null issue override: $uf"; fi
+# An F-id entry that OMITS the issue key still inherits the filed issue link.
+uf="$(printf '%s\n' '{"loop":1,"severity":"P2","path":"a.js","line":3,"body":"dup"}' \
+  | p4b_acct_unique_findings '{"F1":{"disposition":"rebutted"}}' \
+      '[{"severity":"P2","path":"a.js","line":3,"body":"dup","issue":585}]')"
+if printf '%s' "$uf" | jq -e '.[0].disposition == "rebutted" and .[0].issue == 585' >/dev/null; then
+  pass "an F-id entry that omits issue still inherits the filed issue link (#675)"
+else fail "F-id omits issue fallback: $uf"; fi
+
+# p4b_acct_filed_issues_from_refs — the orchestrator's ref→filed-issues zip,
+# extracted for testability (#675 Codex round 1). Numeric issues, 1:1 with
+# FILE_JSON.findings in filing order.
+FILE3='{"findings":[{"severity":"P2","path":"a","line":1,"body":"one"},{"severity":"P3","path":"b","line":2,"body":"two"},{"severity":"P2","path":"c","line":3,"body":"three"}]}'
+fi_out="$(p4b_acct_filed_issues_from_refs "#901, #902, #903" "$FILE3")"
+if printf '%s' "$fi_out" | jq -e '
+    length == 3
+    and .[0] == {severity:"P2",path:"a",line:1,body:"one",issue:901}
+    and .[1] == {severity:"P3",path:"b",line:2,body:"two",issue:902}
+    and .[2] == {severity:"P2",path:"c",line:3,body:"three",issue:903}' >/dev/null; then
+  pass "filed_issues_from_refs zips numeric refs onto findings in filing order (#675)"
+else fail "filed_issues_from_refs normal: $fi_out"; fi
+# Position preservation: a malformed MIDDLE ref maps to a null placeholder so a
+# later issue number never shifts onto the wrong finding — the malformed one is
+# dropped (unlinked), the others keep their correct issue.
+fi_out="$(p4b_acct_filed_issues_from_refs "#101, #bad, #103" "$FILE3")"
+if printf '%s' "$fi_out" | jq -e '
+    length == 2
+    and (.[0] | .path == "a" and .issue == 101)
+    and (.[1] | .path == "c" and .issue == 103)' >/dev/null; then
+  pass "filed_issues_from_refs preserves ref positions (malformed middle ref dropped, not compacted) (#675)"
+else fail "filed_issues_from_refs position preservation: $fi_out"; fi
+# Empty ref list → empty filed-issues array (nothing linked).
+fi_out="$(p4b_acct_filed_issues_from_refs "" "$FILE3")"
+[ "$fi_out" = "[]" ] && pass "filed_issues_from_refs with no refs → [] (#675)" || fail "filed_issues_from_refs empty: $fi_out"
+
 # ===========================================================================
 echo "accounting.sh — notional-cost math (versioned price table)"
 # ===========================================================================

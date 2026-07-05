@@ -885,7 +885,11 @@ p4b_acct_finding_details_from_verdict() {
 #      below and sets disposition "deferred-to-follow-up" + the issue link on
 #      the matching finding.
 # On a per-finding conflict the explicit F-id map (channel 1) wins field by
-# field — its disposition/fix_commit/issue override the filed channel's.
+# field — its disposition/fix_commit override the filed channel's, and an
+# explicit F-id `issue` KEY (even an explicit null) wins over the filed
+# channel's issue (#675 Codex round 1: key-presence, not null-coalescing — a
+# `{"disposition":"fixed","issue":null}` override keeps issue null instead of
+# reattaching the filed follow-up). Only an ABSENT F-id issue key falls back.
 p4b_acct_unique_findings() {
   local disp="${1:-}" filed="${2:-}"
   [ -n "$disp" ] || disp='{}'
@@ -942,7 +946,47 @@ p4b_acct_unique_findings() {
             last_loop: $st.map[$k].last_loop,
             disposition: ($o.disposition // $fo.disposition // "unresolved"),
             fix_commit: ($o.fix_commit // null),
-            issue: ($o.issue // $fo.issue // null) } ]' 2>/dev/null
+            # Key-presence, not null-coalescing (#675 Codex round 1): an
+            # explicit F-id `issue` (even null) wins over the filed channel;
+            # only an ABSENT F-id issue key falls back to the filed issue, so a
+            # `{"disposition":"fixed","issue":null}` override is not silently
+            # re-linked to the filed follow-up.
+            issue: (if ($o | has("issue")) then $o.issue
+                    else ($fo.issue // null) end) } ]' 2>/dev/null
+}
+
+# p4b_acct_filed_issues_from_refs <refs-csv> <file-json>
+# Build the tuple-keyed filed-issues payload (P4B_ACCT_FILED_ISSUES_JSON) the
+# render hook consumes, by zipping a comma-separated "#N" ref list — line 1 of
+# scripts/phase-4b-review.sh's p4b_file_post_review_issues, aligned 1:1 with
+# <file-json>.findings in filing order (reused + created alike) — onto those
+# findings. Emits a JSON array of {severity, path, line, body, issue} with a
+# NUMERIC issue (schema: unique_finding.issue is integer|null).
+#
+# Position-preserving (#675 Codex round 1): a ref token that is not a bare
+# "#<digits>" maps to a NULL placeholder rather than being dropped, so an
+# unparseable middle ref never shifts a later issue number onto the wrong
+# finding — e.g. "#101, #bad, #103" keeps 103 on finding index 2, not index 1.
+# A finding whose ref is null/absent is then dropped (left unlinked), so the
+# enrichment never fabricates a finding→issue association. Prints "[]" on a
+# malformed <file-json> (the enrichment is advisory — never a hard failure).
+p4b_acct_filed_issues_from_refs() {
+  local refs="$1" file_json="$2" refs_json out
+  refs_json="$(printf '%s' "$refs" | jq -Rc '
+    [ splits(", *")
+      | ltrimstr("#")
+      | (if test("^[0-9]+$") then tonumber else null end) ]' 2>/dev/null)" || refs_json='[]'
+  [ -n "$refs_json" ] || refs_json='[]'
+  out="$(printf '%s' "$file_json" | jq -c --argjson refs "$refs_json" '
+    [ .findings | to_entries[]
+      | {severity: .value.severity,
+         path: (.value.path // null),
+         line: (.value.line // null),
+         body: (.value.body // ""),
+         issue: ($refs[.key] // null)}
+      | select(.issue != null) ]' 2>/dev/null)" || out=''
+  [ -n "$out" ] || out='[]'
+  printf '%s' "$out"
 }
 
 # --- record assembly -------------------------------------------------------

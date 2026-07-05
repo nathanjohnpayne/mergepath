@@ -579,30 +579,21 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
     fi
     p4b_log "filed $FILE_COUNT post-review issue(s): $POST_REVIEW_ISSUE_REFS"
     # Enrich the accounting record (#675): the line-1 refs align 1:1 with
-    # FILE_JSON.findings (reused + created alike, in filing order), so zip them
+    # FILE_JSON.findings (reused + created alike, in filing order). Zip them
     # into the tuple-keyed filed-issues channel accounting.sh joins in
-    # p4b_acct_unique_findings. That flips each filed finding's record entry
-    # from unresolved/null to disposition "deferred-to-follow-up" + its issue
-    # link (advisory_issues_filed then derives from those links), so the
-    # machine-readable record matches the prose "filed as #N" reference instead
-    # of contradicting it. Issue numbers are numeric (schema:
-    # unique_finding.issue is integer|null); a ref that fails to parse, or a
-    # finding with no matching ref, is dropped so the enrichment never
-    # fabricates a link. Exported BEFORE the accounting render block reads it.
-    _p4b_filed_refs_json="$(printf '%s' "$POST_REVIEW_ISSUE_REFS" \
-      | jq -Rc '[ splits(", *") | ltrimstr("#") | select(test("^[0-9]+$")) | tonumber ]' 2>/dev/null || printf '[]')"
-    [ -n "$_p4b_filed_refs_json" ] || _p4b_filed_refs_json='[]'
-    P4B_ACCT_FILED_ISSUES_JSON="$(printf '%s' "$FILE_JSON" \
-      | jq -c --argjson refs "$_p4b_filed_refs_json" '
-          [ .findings | to_entries[]
-            | {severity: .value.severity,
-               path: (.value.path // null),
-               line: (.value.line // null),
-               body: (.value.body // ""),
-               issue: ($refs[.key] // null)}
-            | select(.issue != null) ]' 2>/dev/null || printf '[]')"
-    [ -n "$P4B_ACCT_FILED_ISSUES_JSON" ] || P4B_ACCT_FILED_ISSUES_JSON='[]'
-    export P4B_ACCT_FILED_ISSUES_JSON
+    # p4b_acct_unique_findings, flipping each filed finding's record entry from
+    # unresolved/null to disposition "deferred-to-follow-up" + its issue link
+    # (advisory_issues_filed then derives), so the machine-readable record
+    # matches the prose "filed as #N" reference instead of contradicting it.
+    # Built via p4b_acct_filed_issues_from_refs (numeric, position-preserving
+    # parse — a malformed middle ref never shifts a later issue onto the wrong
+    # finding, #675 Codex round 1), and ONLY when accounting is loaded (its sole
+    # consumer). Exported BEFORE the accounting render block reads it.
+    if [ "$P4B_ACCT_AVAILABLE" = true ]; then
+      P4B_ACCT_FILED_ISSUES_JSON="$(p4b_acct_filed_issues_from_refs "$POST_REVIEW_ISSUE_REFS" "$FILE_JSON")"
+      [ -n "$P4B_ACCT_FILED_ISSUES_JSON" ] || P4B_ACCT_FILED_ISSUES_JSON='[]'
+      export P4B_ACCT_FILED_ISSUES_JSON
+    fi
   fi
 fi
 
