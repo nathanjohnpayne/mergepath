@@ -44,9 +44,9 @@ W=.github/workflows
 assert_grep "agent-review: probes for the repo_lint_local.yml annex at the PR HEAD commit (#655)" \
   "$W/agent-review.yml" 'repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$sha'
 assert_grep "agent-review: conditionally adds repo-lint-local to the required-check set (#655)" \
-  "$W/agent-review.yml" 'required_checks+=("repo-lint-local")'
-assert_grep "agent-review: the wait loop iterates over the required_checks array, not one hardcoded name" \
-  "$W/agent-review.yml" 'for check in "${required_checks[@]}"; do'
+  "$W/agent-review.yml" 'name: "repo-lint-local", workflow: ""'
+assert_grep "agent-review: the wait loop iterates over the required_checks_json array, not one hardcoded name" \
+  "$W/agent-review.yml" 'for ((i = 0; i < check_count; i++)); do'
 
 # Codex P1 (#655 round 1): an indeterminate annex-probe read (token scope,
 # rate limit, transient error) must fail closed (assume present), not be
@@ -63,15 +63,14 @@ assert_grep "agent-review: fails closed (requires the conventional check name) o
 # could be parsed.
 assert_grep "agent-review: derives the annex job name(s) from its YAML rather than assuming the filename" \
   "$W/agent-review.yml" 'doc["jobs"].each do |id, job|'
-assert_grep "agent-review: falls back to the conventional name only when no job names parse" \
-  "$W/agent-review.yml" 'no job names could be parsed from it'
 
 # Codex P2 (#655 round 2): success/skipped/neutral are all non-blocking
 # conclusions for a required check (matching codex-review-check.sh's own
 # BAD_CHECKS acceptance set) -- a conditional annex job GitHub completes as
-# skipped must not time out or abort native auto-merge.
-assert_grep "agent-review: accepts skipped and neutral annex-job conclusions, not just success" \
-  "$W/agent-review.yml" '[ "$conclusion" != "success" ] && [ "$conclusion" != "skipped" ] && [ "$conclusion" != "neutral" ]'
+# skipped must not time out or abort native auto-merge. Values are the
+# GraphQL statusCheckRollup enum casing (#655 round 4 data-source switch).
+assert_grep "agent-review: accepts SKIPPED and NEUTRAL annex-job conclusions, not just SUCCESS" \
+  "$W/agent-review.yml" '[ "$conclusion" != "SUCCESS" ] && [ "$conclusion" != "SKIPPED" ] && [ "$conclusion" != "NEUTRAL" ]'
 
 # Codex P2 (#655 round 3): a matrix-strategy annex job expands into check-run
 # names this static YAML read cannot reproduce -- skip it during derivation
@@ -79,6 +78,32 @@ assert_grep "agent-review: accepts skipped and neutral annex-job conclusions, no
 # observing that job at all) instead of guessing the unexpanded name.
 assert_grep "agent-review: skips matrix-strategy annex jobs during derivation instead of guessing their expanded name(s)" \
   "$W/agent-review.yml" 'job["strategy"].is_a?(Hash) && job["strategy"]["matrix"]'
+
+# Codex P2 (#655 round 4): a 403 (token lacks Contents: read) is usually
+# persistent, unlike other indeterminate errors -- forcing the synthetic
+# fallback here would permanently block native auto-merge on every future
+# PR, not just annex-having ones. Do not fail closed on a confirmed 403.
+assert_grep "agent-review: does not fail closed on a confirmed 403 (likely a persistent token-scope gap, not transient)" \
+  "$W/agent-review.yml" "grep -q 'HTTP 403' \"\$annex_probe_err\""
+
+# Codex P2 (#655 round 4): "could not parse the YAML at all" (ruby exits
+# before its `puts` line -- empty output) is a different failure mode from
+# "parsed fine but every job was matrix-strategy and skipped" (ruby emits
+# the literal empty array "[]") -- only the former falls back to the
+# conventional name; the latter must not, since that name will never exist
+# for a matrix-only annex and would permanently block auto-merge.
+assert_grep "agent-review: distinguishes genuine YAML-parse failure from a valid parse where every job was matrix-skipped" \
+  "$W/agent-review.yml" 'every job is matrix-strategy (skipped)'
+
+# Codex P2 (#655 round 4): the annex contract does not require unique job
+# names, so matching must disambiguate by workflow (not name alone) via the
+# same statusCheckRollup data source codex-review-check.sh's gate (a) uses
+# (switched from the check-runs REST endpoint, which has no workflow-name
+# field), picking the latest run per (name, workflow) pair.
+assert_grep "agent-review: disambiguates required checks by (name, workflow) via statusCheckRollup" \
+  "$W/agent-review.yml" 'select($workflow == "" or (.workflowName // "") == $workflow)'
+assert_grep "agent-review: picks the latest run per check (duplicate push+synchronize triggers can both report)" \
+  "$W/agent-review.yml" 'sort_by(.startedAt // .completedAt // "")'
 
 # auto-clear-blocking-labels.yml: the workflow_run trigger list observes the
 # annex's completion too (verified against a live consumer's repo_lint_local.yml

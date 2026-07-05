@@ -998,17 +998,31 @@ jobs:
           # its check run(s) too when present. Absent (the common case,
           # including mergepath itself) is a no-op: only `lint` is required,
           # unchanged from before.
-          required_checks=("$required_check_name")
+          #
+          # required_checks_json is an array of {name, workflow} pairs, not
+          # bare names (#655 Codex P2 round 4): the annex contract does not
+          # require unique job names, so a consumer whose local job shares a
+          # name with an unrelated check (e.g. both named "lint") could
+          # otherwise let that unrelated check's success wrongly satisfy the
+          # annex requirement. workflow=="" means "match by name alone" (the
+          # canonical `lint` check, and the parse-failure fallback, where the
+          # annex's own name could not be determined either) -- same
+          # disambiguation codex-review-check.sh's gate (a) already applies,
+          # via the same statusCheckRollup data source (switched from the
+          # check-runs REST endpoint, which has no workflow-name field) so
+          # both scripts share one matching semantic.
+          required_checks_json=$(jq -n --arg name "$required_check_name" '[{name: $name, workflow: ""}]')
           annex_probe_err=$(mktemp)
           if annex_content=$(gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$sha" --jq .content 2>"$annex_probe_err"); then
             # The annex contract (scripts/ci/check_ci_scripts_wired) only requires
             # a real push/pull_request-triggered workflow that wires local
             # checks — it does NOT require the job (and therefore check-run)
             # name to be `repo-lint-local` (Codex P2 on #655). Derive the
-            # actual job name(s) from the annex YAML the same way
+            # actual (name, workflow) pair(s) from the annex YAML the same way
             # check_ci_scripts_wired parses its `on:` trigger (safe_load +
             # rescue), rather than assuming the filename convention. A job's
-            # check-run name is its `name:` override if set, else its job id.
+            # check-run name is its `name:` override if set, else its job id;
+            # workflow is the annex's own top-level `name:`.
             #
             # Matrix-strategy jobs are skipped, not guessed at (#655 Codex P2
             # round 3): GitHub expands a matrix job into one check run per
@@ -1018,52 +1032,80 @@ jobs:
             # timing out auto-merge even after every real matrix check run
             # passes. ruby's stderr is NOT redirected here (unlike the base64
             # decode) so the skip notice surfaces in the workflow log.
-            annex_job_names=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ruby -ryaml -e '
+            annex_checks_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ruby -ryaml -rjson -e '
               begin
                 doc = YAML.safe_load(STDIN.read, aliases: false)
               rescue Psych::Exception
                 exit
               end
               exit unless doc.is_a?(Hash) && doc["jobs"].is_a?(Hash)
+              workflow_name = doc["name"].to_s
+              results = []
               doc["jobs"].each do |id, job|
                 if job.is_a?(Hash) && job["strategy"].is_a?(Hash) && job["strategy"]["matrix"]
                   STDERR.puts "skipping matrix-strategy job #{id} -- its expanded check-run name(s) cannot be derived from the static job definition (#655)"
                   next
                 end
                 name = (job.is_a?(Hash) && job["name"]) ? job["name"] : id
-                puts name.to_s
+                results << { "name" => name.to_s, "workflow" => workflow_name }
               end
+              puts JSON.generate(results)
             ' || true)
-            if [ -n "$annex_job_names" ]; then
-              echo "::notice::repo_lint_local.yml annex present at $sha — also requiring its check run(s): $(printf '%s' "$annex_job_names" | tr '\n' ' ')(#655)."
-              while IFS= read -r annex_job; do
-                [ -n "$annex_job" ] && required_checks+=("$annex_job")
-              done <<<"$annex_job_names"
+            if [ -z "$annex_checks_raw" ]; then
+              # ruby never reached its `puts` line: the YAML itself did not
+              # parse or had no `jobs:` hash -- genuinely unparseable, not
+              # just empty. Fall back to the conventional name as a
+              # defensive guess (#655 Codex P2 round 4).
+              echo "::warning::repo_lint_local.yml annex present at $sha but could not be parsed as a workflow (invalid YAML or no jobs) — falling back to the conventional repo-lint-local check name (#655)."
+              required_checks_json=$(echo "$required_checks_json" | jq '. + [{name: "repo-lint-local", workflow: ""}]')
+            elif [ "$(echo "$annex_checks_raw" | jq 'length')" -eq 0 ]; then
+              # ruby parsed a valid jobs hash but every job was matrix-strategy
+              # and skipped (#655 Codex P2 round 4): NOT the same as "could
+              # not parse" above. Falling back to "repo-lint-local" here would
+              # be actively wrong -- that name will never exist for a
+              # matrix-only annex, permanently blocking native auto-merge. Do
+              # not force any specific check for it.
+              echo "::warning::repo_lint_local.yml annex present at $sha but every job is matrix-strategy (skipped) — its expanded check-run name(s) cannot be derived, so no specific check is force-required for it (#655)."
             else
-              echo "::warning::repo_lint_local.yml annex present at $sha but no job names could be parsed from it — falling back to the conventional repo-lint-local check name (#655)."
-              required_checks+=("repo-lint-local")
+              echo "::notice::repo_lint_local.yml annex present at $sha — also requiring its check run(s): $(echo "$annex_checks_raw" | jq -r '[.[].name] | join(" ")') (#655)."
+              required_checks_json=$(echo "$required_checks_json" | jq --argjson annex "$annex_checks_raw" '. + $annex')
             fi
           elif grep -q 'HTTP 404' "$annex_probe_err"; then
             : # genuinely absent (confirmed 404) — no annex, no-op, unchanged from before.
+          elif grep -q 'HTTP 403' "$annex_probe_err"; then
+            # #655 Codex P2 round 4: a 403 (token lacks Contents: read) is
+            # USUALLY persistent, not transient -- forcing a synthetic
+            # repo-lint-local requirement here would permanently block
+            # native auto-merge on EVERY future PR too (the same 403 recurs
+            # every time), not just ones with an actual annex. Do not
+            # enforce; warn loudly so the token's scope gets fixed instead.
+            echo "::warning::repo_lint_local.yml probe at $sha got HTTP 403 (AUTHOR_MERGE_TOKEN likely lacks Contents: read) — NOT failing closed, since a persistent 403 would otherwise force an unresolvable synthetic check on every future PR too. Grant the token Contents: read to restore annex enforcement (#655)."
           else
-            # Fail closed (Codex P1 on #655): an indeterminate read (token
-            # scope, rate limit, transient API error) must NOT be treated the
-            # same as a confirmed absence — that would let native auto-merge
-            # arm without observing a real annex on a mere read failure.
+            # Fail closed (Codex P1 on #655): an indeterminate but plausibly-
+            # transient read failure (rate limit, 5xx, network) must NOT be
+            # treated the same as a confirmed absence -- unlike a 403 above,
+            # this is likely to resolve on a re-run of this same workflow.
             echo "::warning::Could not determine whether repo_lint_local.yml exists at $sha (API error, not a confirmed 404) — failing closed by also requiring the conventional repo-lint-local check name (#655): $(cat "$annex_probe_err")"
-            required_checks+=("repo-lint-local")
+            required_checks_json=$(echo "$required_checks_json" | jq '. + [{name: "repo-lint-local", workflow: ""}]')
           fi
           rm -f "$annex_probe_err"
 
           while :; do
             all_done=1
-            for check in "${required_checks[@]}"; do
-              run=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
-                | jq -c --arg check "$check" '[.check_runs[] | select(.name == $check)] | sort_by(.started_at // .created_at) | last // empty')
+            check_count=$(echo "$required_checks_json" | jq 'length')
+            rollup_json=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json statusCheckRollup)
+            for ((i = 0; i < check_count; i++)); do
+              check_name=$(echo "$required_checks_json" | jq -r ".[$i].name")
+              check_workflow=$(echo "$required_checks_json" | jq -r ".[$i].workflow")
+              run=$(echo "$rollup_json" | jq -c --arg name "$check_name" --arg workflow "$check_workflow" '
+                [.statusCheckRollup[]
+                  | select((.name // .context // "") == $name)
+                  | select($workflow == "" or (.workflowName // "") == $workflow)
+                ] | sort_by(.startedAt // .completedAt // "") | last // empty')
               if [ -n "$run" ]; then
-                status=$(printf '%s' "$run" | jq -r '.status')
-                conclusion=$(printf '%s' "$run" | jq -r '.conclusion // ""')
-                if [ "$status" = "completed" ]; then
+                status=$(printf '%s' "$run" | jq -r '.status // ""')
+                conclusion=$(printf '%s' "$run" | jq -r '.conclusion // .state // ""')
+                if [ "$status" = "COMPLETED" ] || [ -z "$status" ]; then
                   # success/skipped/neutral are all non-blocking conclusions
                   # (#655 Codex P2 round 2): a conditional annex job GitHub
                   # completes as skipped is not a failure, and neutral is a
@@ -1073,26 +1115,26 @@ jobs:
                   # before #655, which never legitimately skips, so the
                   # stricter exact-success check never mattered until the
                   # annex checks (which can be conditional) joined the list.
-                  if [ "$conclusion" != "success" ] && [ "$conclusion" != "skipped" ] && [ "$conclusion" != "neutral" ]; then
-                    echo "::error::Required check run '$check' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
+                  if [ "$conclusion" != "SUCCESS" ] && [ "$conclusion" != "SKIPPED" ] && [ "$conclusion" != "NEUTRAL" ]; then
+                    echo "::error::Required check run '$check_name' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
                     exit 1
                   fi
-                  echo "Required check run '$check' is $conclusion on current HEAD $sha."
+                  echo "Required check run '$check_name' is $conclusion on current HEAD $sha."
                   continue
                 fi
-                echo "::notice::Required check run '$check' is $status on current HEAD $sha; waiting for completion."
+                echo "::notice::Required check run '$check_name' is $status on current HEAD $sha; waiting for completion."
               else
-                echo "::notice::Required check run '$check' is absent on current HEAD $sha; waiting for it to start."
+                echo "::notice::Required check run '$check_name' is absent on current HEAD $sha; waiting for it to start."
               fi
               all_done=0
             done
             if [ "$all_done" -eq 1 ]; then
               echo "CURRENT_HEAD_SHA=$sha" >> "$GITHUB_ENV"
-              echo "All required check run(s) (${required_checks[*]}) are successful on current HEAD $sha."
+              echo "All required check run(s) are successful on current HEAD $sha."
               exit 0
             fi
             if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::Required check run(s) (${required_checks[*]}) did not all complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
+              echo "::error::Required check run(s) did not all complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
               exit 1
             fi
             sleep "$poll_seconds"

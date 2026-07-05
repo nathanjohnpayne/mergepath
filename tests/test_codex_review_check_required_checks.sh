@@ -88,6 +88,29 @@ else
   fail "codex-review-check.sh does not distinguish a confirmed 404 from other annex-probe errors"
 fi
 
+# Codex P2 (#655 round 4): a 403 (token lacks Contents: read) is usually
+# persistent, not transient -- forcing the synthetic fallback would
+# permanently block Phase 4 label-clearing / merge-gate checks on every
+# future PR, not just annex-having ones. Do not fail closed on a confirmed
+# 403 the way the generic indeterminate-error branch does.
+if grep -q "grep -q 'HTTP 403' \"\$annex_probe_err\"" "$SCRIPT"; then
+  pass "codex-review-check.sh does not fail closed on a confirmed 403 (likely a persistent token-scope gap, not transient)"
+else
+  fail "codex-review-check.sh does not distinguish a confirmed 403 from other (plausibly transient) annex-probe errors"
+fi
+
+# Codex P2 (#655 round 4): "could not parse the YAML at all" (ruby exits
+# before its `puts` line -- empty output) is a different failure mode from
+# "parsed fine but every job was matrix-strategy and skipped" (ruby emits
+# the literal empty array "[]") -- only the former falls back to the
+# conventional name; the latter must not, since that name will never exist
+# for a matrix-only annex and would permanently block the merge gate.
+if grep -q 'every job is matrix-strategy (skipped)' "$SCRIPT"; then
+  pass "codex-review-check.sh distinguishes genuine YAML-parse failure from a valid parse where every job was matrix-skipped"
+else
+  fail "codex-review-check.sh does not distinguish genuine parse failure from an all-matrix-jobs annex"
+fi
+
 # ── 2. Inline logic: the three REQUIRED_JSON branches, parameterized on
 #      ANNEX_CHECK_NAMES_JSON (bare names derived from ANNEX_CHECKS_JSON)
 #      instead of a hard-coded "repo-lint-local" string. Required-set

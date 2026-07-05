@@ -679,18 +679,48 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
       end
       puts JSON.generate(results)
     ' || true)
-    if [ -n "$annex_checks_raw" ] && echo "$annex_checks_raw" | jq -e 'length > 0' >/dev/null 2>&1; then
+    if [ -z "$annex_checks_raw" ]; then
+      # ruby never reached its `puts` line at all: the YAML itself did not
+      # parse (Psych exception) or had no `jobs:` hash -- genuinely
+      # unparseable, not just empty. Fall back to the conventional name as
+      # a defensive guess (better than requiring nothing for a file that
+      # unambiguously exists but could not be read as a workflow).
+      log "gate (a): repo_lint_local.yml annex present at $HEAD_SHA_FOR_ANNEX but could not be parsed as a workflow (invalid YAML or no jobs) — falling back to the conventional repo-lint-local check name (#655)."
+      ANNEX_CHECKS_JSON='[{"name":"repo-lint-local","workflow":""}]'
+    elif [ "$(echo "$annex_checks_raw" | jq 'length')" -eq 0 ]; then
+      # ruby parsed a valid jobs hash but every job was matrix-strategy and
+      # skipped (#655 Codex P2 round 4): this is NOT the same as "could not
+      # parse" above -- the annex genuinely exists and has jobs, we simply
+      # cannot derive any of their expanded check-run names. Falling back to
+      # "repo-lint-local" here would be actively WRONG, not just imprecise:
+      # that name will never exist for a matrix-only annex, so it would
+      # inject a permanent, unresolvable MISSING requirement. Do not force
+      # any specific check for it; the annex is present but unobservable
+      # through this mechanism.
+      log "gate (a): repo_lint_local.yml annex present at $HEAD_SHA_FOR_ANNEX but every job is matrix-strategy (skipped) — its expanded check-run name(s) cannot be derived, so no specific check is force-required for it (#655)."
+    else
       ANNEX_CHECKS_JSON="$annex_checks_raw"
       log "gate (a): repo_lint_local.yml annex present at $HEAD_SHA_FOR_ANNEX (#655) — check run(s): $(echo "$ANNEX_CHECKS_JSON" | jq -r '[.[].name] | join(" ")')"
-    else
-      log "gate (a): repo_lint_local.yml annex present at $HEAD_SHA_FOR_ANNEX but no job names could be parsed from it — falling back to the conventional repo-lint-local check name (#655)."
-      ANNEX_CHECKS_JSON='[{"name":"repo-lint-local","workflow":""}]'
     fi
   elif grep -q 'HTTP 404' "$annex_probe_err"; then
     : # genuinely absent (confirmed 404) — no annex, ANNEX_CHECKS_JSON stays [].
+  elif grep -q 'HTTP 403' "$annex_probe_err"; then
+    # #655 Codex P2 round 4: a 403 (token lacks Contents: read) is USUALLY a
+    # persistent, systemic condition, not a transient blip -- unlike the
+    # other-error branch below. Forcing a synthetic repo-lint-local
+    # requirement here would inject a check name that can NEVER exist on
+    # THIS repo (the same 403 recurs on every future evaluation too),
+    # permanently blocking Phase 4 label-clearing and merge-gate checks on
+    # every PR, not just ones with an actual annex. Do not enforce; warn
+    # loudly so the token's scope gets fixed instead of masking the gap.
+    log "gate (a): WARNING — repo_lint_local.yml probe at $HEAD_SHA_FOR_ANNEX got HTTP 403 (token likely lacks Contents: read) — NOT failing closed, since a persistent 403 would otherwise force an unresolvable synthetic check on every future PR too. Grant the merge-gate token Contents: read to restore annex enforcement (#655)."
   else
-    # Fail closed: an indeterminate read (token scope, rate limit,
-    # transient error) must not be treated the same as a confirmed absence.
+    # Fail closed: an indeterminate but plausibly-transient read failure
+    # (rate limit, 5xx, network) must not be treated the same as a
+    # confirmed absence -- unlike a 403 above, this is likely to resolve on
+    # the next gate evaluation (this script runs on every relevant event
+    # plus a 5-minute sweep), so the fallback's "wait for a check that may
+    # not really exist" cost is bounded rather than permanent.
     log "gate (a): WARNING — could not determine whether repo_lint_local.yml exists at $HEAD_SHA_FOR_ANNEX (API error, not a confirmed 404) — failing closed by also requiring the conventional repo-lint-local check name (#655)."
     ANNEX_CHECKS_JSON='[{"name":"repo-lint-local","workflow":""}]'
   fi

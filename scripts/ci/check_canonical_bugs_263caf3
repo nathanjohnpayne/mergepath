@@ -927,6 +927,20 @@ JSON
       repos/nathanjohnpayne/mergepath/branches/main/protection/required_status_checks)
         exit 1
         ;;
+      repos/nathanjohnpayne/mergepath/contents/.github/workflows/repo_lint_local.yml?ref=headsha)
+        # #655: this fixture repo carries no repo_lint_local.yml annex --
+        # simulate the real gh CLI's 404 shape (a genuine "Not Found" HTTP
+        # response) so codex-review-check.sh's gate (a) annex probe takes
+        # its "genuinely absent" branch instead of its indeterminate-error
+        # fail-closed branch, matching what a real repo without the annex
+        # returns. Without this the probe's own catch-all "unexpected
+        # endpoint" response (exit 9, no "HTTP 404" text) was
+        # misinterpreted as an indeterminate error, injecting a synthetic
+        # repo-lint-local=MISSING requirement these Bug 4 fixtures never
+        # intended to exercise.
+        echo 'gh: Not Found (HTTP 404)' >&2
+        exit 1
+        ;;
       *) printf 'unexpected endpoint: %s\n' "${1:-}" >&2; exit 9 ;;
     esac
     ;;
