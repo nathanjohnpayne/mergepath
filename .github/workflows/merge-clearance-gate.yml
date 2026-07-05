@@ -27,7 +27,10 @@ name: Merge Clearance Gate
 #
 # Re-runs on every push to a PR AND on review-related events, so a
 # dismissed approval (rebase push), a fresh reviewer approval, or a Codex
-# clearance flips the check without manual intervention.
+# clearance flips the check without manual intervention. It also re-runs on
+# the propagation lane's head-pinned verified-head marker (an issue comment)
+# so a verified sync PR clears promptly instead of waiting for the sweep
+# (#658 — see the issue_comment trigger + marker-retrigger job below).
 #
 # Trigger shape note: identical to codex-p1-gate.yml. GitHub Actions does
 # NOT support pull_request_review_thread as a workflow trigger, so we
@@ -50,6 +53,21 @@ on:
   # review-submission event (external-review path).
   pull_request_review_comment:
     types: [created, edited, deleted]
+  # #658: the propagation lane posts its head-pinned verified-head marker as
+  # an ISSUE comment (github-actions[bot]-authored). That fires no
+  # pull_request / review event, so after #657 stopped the label add/remove
+  # dance there was nothing to re-run this gate when the marker landed, and a
+  # verified sync PR sat on a fail-closed spurious-red Merge clearance gate
+  # until the */15 sweep. Re-run on the marker comment so the gate
+  # re-evaluates promptly. The marker's TRUST is unchanged — it is trusted
+  # only because it is github-actions[bot]-authored and head-pinned, verified
+  # in scripts/merge-clearance-gate.sh lane_verified(); this trigger only
+  # schedules a re-evaluation, it never asserts clearance. The marker-retrigger
+  # job below is guarded to the marker so an ordinary PR comment never spins up
+  # a run, and (like the sweep, not the native-check job) it POSTs a check_run
+  # to the PR head — an issue_comment run has no PR-head commit association.
+  issue_comment:
+    types: [created]
   # Periodic sweep — the only backstop for transitions that fire no
   # Actions event (👍 reaction, UI label resolve, GITHUB_TOKEN relabel).
   # 15-min cadence mirrors codex-p1-gate.yml.
@@ -57,9 +75,9 @@ on:
     - cron: "*/15 * * * *"
 
 # Least-privilege default for the whole workflow: read-only. `checks: write`
-# is granted ONLY to the scheduled-sweep job below (it POSTs check_runs);
-# the event-driven job produces its check natively and needs no write scope
-# (CodeRabbit ⚠️ on PR #429).
+# is granted ONLY to the jobs that POST check_runs (the scheduled-sweep and
+# the #658 marker-retrigger job); the event-driven job produces its check
+# natively and needs no write scope (CodeRabbit ⚠️ on PR #429).
 #
 # `issues: read` is required (Codex P2 on PR #429): the gate reads
 # /issues/{pr}/comments for the propagation-lane marker, and the delegated
@@ -77,10 +95,15 @@ jobs:
   merge-clearance-gate:
     name: Merge clearance gate
     runs-on: ubuntu-latest
-    # Event-driven path. The scheduled sweep below runs the same gate but
-    # on every open PR via the Checks API; gating this job to non-schedule
-    # events avoids paying for an empty no-op run.
-    if: github.event_name != 'schedule'
+    # Event-driven path (native check on the PR head). The scheduled sweep
+    # and the #658 marker-retrigger job run the same gate via the Checks API;
+    # gating this job to the PR/review events avoids paying for an empty
+    # no-op run AND keeps its native check correct — an issue_comment run has
+    # no PR-head commit association, so that path is handled by
+    # marker-retrigger (Checks API POST), never here.
+    if: >-
+      github.event_name != 'schedule'
+      && github.event_name != 'issue_comment'
     steps:
       - name: Checkout repo (default branch — trusted gate scripts)
         # Pin to the default branch, NOT the PR HEAD. This is a REQUIRED
@@ -297,5 +320,109 @@ jobs:
           done <<<"$PRS"
           if [ "$had_infra_error" -ne 0 ]; then
             echo "::error::Sweep finished with one or more infra errors"
+            exit 1
+          fi
+
+  marker-retrigger:
+    name: Merge clearance marker re-evaluation
+    # #658: re-evaluate promptly when the propagation lane posts its
+    # head-pinned verified-head marker as an issue comment — that comment
+    # fires no pull_request / review event, so without this the gate rides
+    # its pre-marker (fail-closed spurious-red) state until the */15 sweep.
+    # Guarded to the TRUSTED marker ONLY: a github-actions[bot] author + the
+    # head-pinned `mergepath-propagation-lane verified-head=` marker body, on
+    # a PR (the issue carries a pull_request). This job guard is a cheap
+    # pre-filter, NOT a trust decision: scripts/merge-clearance-gate.sh
+    # lane_verified() still re-derives clearance and pins the exemption to the
+    # CURRENT head, so a stale-head or spoofed marker never clears here. Label
+    # events are NOT a trigger (they are not head-pinned proof — #429 round-3
+    # P1); the marker prefix match cannot be forged by a PR author (a PR author
+    # cannot post as github-actions[bot]).
+    if: >-
+      github.event_name == 'issue_comment'
+      && github.event.issue.pull_request != null
+      && github.event.comment.user.login == 'github-actions[bot]'
+      && contains(github.event.comment.body, 'mergepath-propagation-lane verified-head=')
+    runs-on: ubuntu-latest
+    # checks:write to POST the check_run (same as the sweep). issues:read for
+    # the gate script's /issues/{pr}/comments marker read + the delegated
+    # codex-review-check.sh /issues/{pr}/reactions read.
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: write
+    steps:
+      - name: Checkout repo (default branch — trusted gate scripts)
+        # Same trusted-checkout posture as the other jobs: run the gate script
+        # from the DEFAULT branch, never the PR head, so a PR cannot edit the
+        # script to satisfy its own required check.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Re-evaluate gate for the marked PR and post check_run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # issue_comment has no github.event.pull_request; the PR number is
+          # the issue number (the job `if:` already required issue.pull_request
+          # so the issue IS a PR).
+          PR: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          # Check name MUST match the event-driven job name above AND the
+          # sweep CHECK_NAME so branch protection resolves every source as the
+          # same required check (GitHub keys required checks on (head_sha,
+          # name); a fresh check_run with the same name supersedes the stale
+          # one).
+          CHECK_NAME: "Merge clearance gate"
+        run: |
+          set -euo pipefail
+          # Resolve the PR head SHA — the check_run must pin to it (required
+          # checks key on (head_sha, name)). An issue_comment run checks out
+          # the default branch and has NO PR-head commit association, so a
+          # native job check would attach to the default-branch commit and
+          # never refresh the PR's required check; POST explicitly to the head
+          # SHA like the scheduled sweep.
+          head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)
+          if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
+            echo "::error::Could not resolve head SHA for PR #$PR; cannot refresh its Merge clearance gate."
+            exit 1
+          fi
+          set +e
+          output=$(scripts/merge-clearance-gate.sh "$PR" "$REPO" 2>&1)
+          rc=$?
+          set -e
+          echo "$output"
+          check_title="Merge clearance gate (propagation-lane marker re-evaluation)"
+          case "$rc" in
+            0) conclusion="success" ;;
+            1) conclusion="failure" ;;
+            *)
+              echo "::error::merge-clearance-gate.sh rc=$rc on PR #$PR (config/usage/infra error)"
+              conclusion="failure"
+              check_title="Merge clearance gate — infra/config error (rc=$rc)"
+              ;;
+          esac
+          # Truncate to stay under GitHub's 65535-char summary limit. Bash
+          # slice, NOT `printf | head -c`: under `set -euo pipefail` a >60KB
+          # output makes head close the pipe early, printf takes SIGPIPE, and
+          # the command substitution aborts the job before the POST (Codex P2
+          # on the sweep). Slicing is pipefail-safe + char-based.
+          summary="${output:0:60000}"
+          # Posting the check_run IS this job's whole purpose — it supersedes
+          # the stale required check on the PR head after the marker lands
+          # (or pins a fail-closed red on infra error). A failed POST means the
+          # job did not do its job; that's an infra error.
+          if ! gh api -X POST "repos/$REPO/check-runs" \
+            -f name="$CHECK_NAME" \
+            -f head_sha="$head_sha" \
+            -f status="completed" \
+            -f conclusion="$conclusion" \
+            -f "output[title]=$check_title" \
+            -f "output[summary]=$summary" \
+            >/dev/null; then
+            echo "::error::Failed to post check_run for PR #$PR — stale required check not refreshed."
             exit 1
           fi
