@@ -66,8 +66,14 @@ echo "check_codex_scripts: running codex-review-check gate (c) resolution tests"
 echo "check_codex_scripts: running codex-review-check verdict-comment clearance tests (#600)"
 "$REPO_ROOT/tests/test_codex_review_check_verdict.sh"
 
+echo "check_codex_scripts: running codex-review-check gate (a) required-check scoping tests (#655)"
+"$REPO_ROOT/tests/test_codex_review_check_required_checks.sh"
+
 echo "check_codex_scripts: running #465 fail-closed structural guards"
 "$REPO_ROOT/tests/test_465_fail_closed.sh"
+
+echo "check_codex_scripts: running #655 repo-lint-local observation structural guards"
+"$REPO_ROOT/tests/test_655_repo_lint_local_observed.sh"
 
 echo "check_codex_scripts: running codex-record-feedback tests"
 "$REPO_ROOT/tests/test_codex_record_feedback.sh"

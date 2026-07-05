@@ -987,32 +987,57 @@ jobs:
           poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
           deadline=$((SECONDS + wait_seconds))
           sha=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)
+
+          # #655: a consumer's optional, never-propagated repo_lint_local.yml
+          # annex (#601) produces a `repo-lint-local` check run that branch
+          # protection does not require, and this step — before this fix —
+          # did not observe either, so native auto-merge could arm with a red
+          # repo-lint-local. Probe the PR HEAD commit for the annex file via
+          # the Contents API (not this job's own checkout — its ref is not
+          # guaranteed to be the PR head on every trigger shape this workflow
+          # handles) and require its check run too when present. Absent (the
+          # common case, including mergepath itself) is a no-op: only `lint`
+          # is required, unchanged from before.
+          required_checks=("$required_check_name")
+          if gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$sha" >/dev/null 2>&1; then
+            echo "::notice::repo_lint_local.yml annex present at $sha — also requiring the repo-lint-local check run (#655)."
+            required_checks+=("repo-lint-local")
+          fi
+
           while :; do
-            run=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
-              | jq -c --arg check "$required_check_name" '[.check_runs[] | select(.name == $check)] | sort_by(.started_at // .created_at) | last // empty')
-            if [ -n "$run" ]; then
-              status=$(printf '%s' "$run" | jq -r '.status')
-              conclusion=$(printf '%s' "$run" | jq -r '.conclusion // ""')
-              if [ "$status" = "completed" ]; then
-                if [ "$conclusion" = "success" ]; then
-                  echo "CURRENT_HEAD_SHA=$sha" >> "$GITHUB_ENV"
-                  echo "Required check run '$required_check_name' is successful on current HEAD $sha."
-                  exit 0
+            all_done=1
+            for check in "${required_checks[@]}"; do
+              run=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
+                | jq -c --arg check "$check" '[.check_runs[] | select(.name == $check)] | sort_by(.started_at // .created_at) | last // empty')
+              if [ -n "$run" ]; then
+                status=$(printf '%s' "$run" | jq -r '.status')
+                conclusion=$(printf '%s' "$run" | jq -r '.conclusion // ""')
+                if [ "$status" = "completed" ]; then
+                  if [ "$conclusion" != "success" ]; then
+                    echo "::error::Required check run '$check' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
+                    exit 1
+                  fi
+                  echo "Required check run '$check' is successful on current HEAD $sha."
+                  continue
                 fi
-                echo "::error::Required check run '$required_check_name' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
-                exit 1
+                echo "::notice::Required check run '$check' is $status on current HEAD $sha; waiting for completion."
+              else
+                echo "::notice::Required check run '$check' is absent on current HEAD $sha; waiting for it to start."
               fi
-              echo "::notice::Required check run '$required_check_name' is $status on current HEAD $sha; waiting for completion."
-            else
-              echo "::notice::Required check run '$required_check_name' is absent on current HEAD $sha; waiting for it to start."
+              all_done=0
+            done
+            if [ "$all_done" -eq 1 ]; then
+              echo "CURRENT_HEAD_SHA=$sha" >> "$GITHUB_ENV"
+              echo "All required check run(s) (${required_checks[*]}) are successful on current HEAD $sha."
+              exit 0
             fi
             if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::Required check run '$required_check_name' did not complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
+              echo "::error::Required check run(s) (${required_checks[*]}) did not all complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
               exit 1
             fi
             sleep "$poll_seconds"
           done
-          echo "::error::Required check run '$required_check_name' wait loop ended unexpectedly; refusing auto-merge."
+          echo "::error::Required check run wait loop ended unexpectedly; refusing auto-merge."
           exit 1
 
       - name: Re-verify blocking labels after test wait

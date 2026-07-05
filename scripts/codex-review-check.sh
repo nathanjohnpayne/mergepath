@@ -691,8 +691,23 @@ elif [ -z "$REQUIRED_CHECK_NAMES" ]; then
   ROLLUP_JSON='{"statusCheckRollup":[]}'
   REQUIRED_JSON='[]'
 else
-  # Build a jq array of required check names.
-  REQUIRED_JSON=$(echo "$REQUIRED_CHECK_NAMES" | jq -R . | jq -s .)
+  # Build a jq array of required check names, then force-include
+  # `repo-lint-local` (#655) whenever the rollup actually reports it,
+  # regardless of whether branch protection lists it. The consumer-local
+  # repo_lint_local.yml annex (#601) is per-consumer and never propagated,
+  # so there is no canonical PR that could add its check run to branch
+  # protection fleet-wide. Without this, a consumer that migrated local
+  # checks into the annex has them silently excluded from gate (a): a red
+  # repo-lint-local would not block the needs-external-review label-clear
+  # (auto-clear-blocking-labels.yml, which evaluates this same gate) or an
+  # agent's manual merge-gate check. Absent from the rollup (no annex,
+  # including mergepath itself) is a no-op — unchanged from before.
+  REQUIRED_JSON=$(echo "$REQUIRED_CHECK_NAMES" | jq -R . | jq -s . | jq --argjson rollup "$ROLLUP_JSON" '
+    if ([$rollup.statusCheckRollup[]? | (.name // .context // "")] | index("repo-lint-local")) != null
+    then . + ["repo-lint-local"] | unique
+    else .
+    end
+  ')
 fi
 
 BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq --argjson required_names "${REQUIRED_JSON:-[]}" '
