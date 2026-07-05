@@ -112,7 +112,7 @@ verdict distribution below.
 | `codex.ack_wait_seconds` (script default) | 60 | **30** | ack p99=13s (n=14); 30s ≈ 2.3× p99. Aligns the script fallback to the policy value already shipped in #647. |
 | `codex.max_ack_retries` | 1 | **1** (confirmed) | Ack latency sizes the *window*, not the retry *count*; unchanged. |
 | `codex.review_timeout_seconds` | 600 | **840** | verdict p99=630s / max=830s (n=100); 👍-clearance p99=829s (n=60, #646). 600 sat below p99. 840 = 56×15s poll intervals, covers the full clean-verdict tail, < the 900s phase-4b ceiling. |
-| `coderabbit.max_wait_seconds` | 300 | **1140** | review p50=365s / p90=799s / p99=1136s (n=92). 300 sat below even p50 → >50% of PRs raced past CodeRabbit (#136). 1140 = 76×15s poll intervals, covers the observed tail; it is a ceiling (returns when the review lands). |
+| `coderabbit.max_wait_seconds` | 300 | **1155** | review p50=365s / p90=799s / p99=1136s (n=92). 300 sat below even p50 → >50% of PRs raced past CodeRabbit (#136). 1155 = 77×15s poll intervals = one interval beyond the measured max (1136s), so a tail review still gets a poll scan before the top-of-loop timeout check (#688); it is a ceiling (returns when the review lands). Consumer per-repo `max_wait_seconds: 300` overrides are migrated in a sync-wave follow-up. |
 | `coderabbit.status_probe_wait_seconds` / `wallclock_freshness_window_seconds` / rate-limit + status-flip grace | — | unchanged (confirmed) | Not review-latency constants; the review-latency data does not contradict them (review p99 1136s < the 1800s freshness floor). |
 
 No gate is weakened: every retune only lengthens an advisory/foreground wait or

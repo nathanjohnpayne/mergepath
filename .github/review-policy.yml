@@ -141,8 +141,8 @@ feedback_policy:
 #
 # When enabled, the agent MUST:
 #   1. Wait for CodeRabbit to post before proceeding — prefer
-#      scripts/coderabbit-wait.sh, whose max_wait_seconds ceiling (1140s,
-#      the measured review p99; #623) covers the real CodeRabbit latency
+#      scripts/coderabbit-wait.sh, whose max_wait_seconds ceiling (1155s,
+#      the measured review p99 + one poll interval; #623) covers the real latency
 #      (p50 ~6 min, p99 ~19 min). Do NOT hand-wait a folkloric ~3 min and
 #      escalate early: that reopens the #136 pre-review-merge race.
 #   2. Read BOTH API endpoints:
@@ -166,23 +166,33 @@ coderabbit:
   # workflow that blocks merge until CodeRabbit has reviewed the current
   # HEAD (the #136 race).
   #
-  # 1140s is measured, not folklore (#623). The "typical ~2–3 min" belief
+  # 1155s is measured, not folklore (#623). The "typical ~2–3 min" belief
   # was wrong: the mined CodeRabbit review latency (commit → the first
   # body-bearing review on it, across the CodeRabbit-active consumer fleet,
   # rate-limited rounds excluded) is p50 365s / p90 799s / p99 1136s
   # (n=92) — committed extract docs/audits/data/review-latency-2026-07/.
   # The prior 300s sat below even the p50, so on MORE THAN HALF of PRs the
   # wait timed out before CodeRabbit reviewed, reopening the #136
-  # pre-review-merge race it exists to close. 1140s = 76 × the 15s poll
-  # interval, covering the full observed review-latency tail (max 1136s).
-  # It is a CEILING, not a fixed wait: the poll returns the moment the
-  # review lands (typically ~p50 6 min), so the full 19 min is paid only
+  # pre-review-merge race it exists to close. 1155s = 77 × the 15s poll
+  # interval = one full interval BEYOND the measured max (1136s): coderabbit-
+  # wait.sh checks ELAPSED >= this ceiling at the top of the poll loop and
+  # times out with no final scan, so a ceiling set exactly at the tail's next
+  # tick would miss a review landing in the final window — one interval of
+  # headroom guarantees the tail commit still gets a poll scan (Codex P2 on
+  # #688). It is a CEILING, not a fixed wait: the poll returns the moment the
+  # review lands (typically ~p50 6 min), so the full ~19 min is paid only
   # when CodeRabbit is slow-but-reviewing — exactly the case worth waiting
   # for. Genuinely-stuck rounds (paused / rate-limited / non-base-branch /
   # draft) short-circuit earlier via their own fast-paths, and timeout
   # stays advisory (the caller proceeds). Rate-limited rounds are handled
   # by max_rate_limit_retries below, not this budget.
-  max_wait_seconds: 1140
+  #
+  # NOTE: consumers bootstrapped with an explicit max_wait_seconds override
+  # (e.g. the pre-retune 300) keep it — review-policy.yml is per-consumer
+  # config (three-way-merged, not a propagated surface), so the script
+  # default alone does not migrate them; that migration is a sync-wave
+  # follow-up tracked separately (Codex P2 on #688).
+  max_wait_seconds: 1155
 
   # On the timeout path, ask CodeRabbit for a narrative status update
   # before returning exit 4. This does NOT change the exit-code

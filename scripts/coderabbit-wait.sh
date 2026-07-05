@@ -60,7 +60,7 @@
 #              $OP_PREFLIGHT_REVIEWER_PAT after preflight.
 #
 # Behavior:
-#   1. Reads coderabbit.max_wait_seconds (default 1140; measured p99, #623) and
+#   1. Reads coderabbit.max_wait_seconds (default 1155; measured p99 + one poll interval, #623) and
 #      coderabbit.max_rate_limit_retries (default 2) from
 #      .github/review-policy.yml.
 #   2. Fetches PR HEAD SHA + committer date.
@@ -364,17 +364,22 @@ coderabbit_yml_drafts() {
   ' "$CODERABBIT_YML"
 }
 
-# max_wait_seconds: the poll ceiling before an advisory exit 4. Default 1140s
+# max_wait_seconds: the poll ceiling before an advisory exit 4. Default 1155s
 # is measured (#623): the mined CodeRabbit review latency (commit → first
 # body-bearing review, fleet-wide, rate-limited rounds excluded) is p50 365s /
 # p90 799s / p99 1136s (n=92, docs/audits/data/review-latency-2026-07/). The
 # prior 300s sat below even the p50, so >50% of PRs timed the wait out before
-# CodeRabbit reviewed — reopening the #136 pre-review-merge race. 1140s = 76 ×
-# POLL_INTERVAL_SECONDS covers the full observed tail (max 1136s); it is a
-# CEILING (the poll returns as soon as the review lands, ~p50 6 min), and the
-# paused/rate-limit/skip fast-paths short-circuit genuinely-stuck rounds.
+# CodeRabbit reviewed — reopening the #136 pre-review-merge race. 1155s = 77 ×
+# POLL_INTERVAL_SECONDS = one full poll interval BEYOND the measured max
+# (1136s): the loop below checks ELAPSED >= MAX_WAIT_SECONDS at the TOP of each
+# iteration and times out with no final scan, so a review landing in the last
+# poll window would be missed by a ceiling set exactly at the tail's next tick
+# (Codex P2 on #688). One interval of headroom guarantees the tail commit still
+# gets a poll scan before the timeout. It is a CEILING (the poll returns as
+# soon as the review lands, ~p50 6 min); paused/rate-limit/skip fast-paths
+# short-circuit genuinely-stuck rounds.
 MAX_WAIT_SECONDS=$(coderabbit_field max_wait_seconds)
-MAX_WAIT_SECONDS=${MAX_WAIT_SECONDS:-1140}
+MAX_WAIT_SECONDS=${MAX_WAIT_SECONDS:-1155}
 if ! [[ "$MAX_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "ERROR: coderabbit.max_wait_seconds must be an integer; got '$MAX_WAIT_SECONDS'" >&2
   exit 3
