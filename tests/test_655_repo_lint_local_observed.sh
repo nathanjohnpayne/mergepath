@@ -73,6 +73,13 @@ assert_grep "agent-review: falls back to the conventional name only when no job 
 assert_grep "agent-review: accepts skipped and neutral annex-job conclusions, not just success" \
   "$W/agent-review.yml" '[ "$conclusion" != "success" ] && [ "$conclusion" != "skipped" ] && [ "$conclusion" != "neutral" ]'
 
+# Codex P2 (#655 round 3): a matrix-strategy annex job expands into check-run
+# names this static YAML read cannot reproduce -- skip it during derivation
+# (permanently waiting on a name that will never report is worse than not
+# observing that job at all) instead of guessing the unexpanded name.
+assert_grep "agent-review: skips matrix-strategy annex jobs during derivation instead of guessing their expanded name(s)" \
+  "$W/agent-review.yml" 'job["strategy"].is_a?(Hash) && job["strategy"]["matrix"]'
+
 # auto-clear-blocking-labels.yml: the workflow_run trigger list observes the
 # annex's completion too (verified against a live consumer's repo_lint_local.yml
 # workflow name, per #655).

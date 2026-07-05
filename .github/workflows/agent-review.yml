@@ -1009,6 +1009,15 @@ jobs:
             # check_ci_scripts_wired parses its `on:` trigger (safe_load +
             # rescue), rather than assuming the filename convention. A job's
             # check-run name is its `name:` override if set, else its job id.
+            #
+            # Matrix-strategy jobs are skipped, not guessed at (#655 Codex P2
+            # round 3): GitHub expands a matrix job into one check run per
+            # combination with a name this static YAML read cannot reproduce,
+            # so treating the unexpanded job id/name as "the" check would wait
+            # forever for a check that will never report under that name —
+            # timing out auto-merge even after every real matrix check run
+            # passes. ruby's stderr is NOT redirected here (unlike the base64
+            # decode) so the skip notice surfaces in the workflow log.
             annex_job_names=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ruby -ryaml -e '
               begin
                 doc = YAML.safe_load(STDIN.read, aliases: false)
@@ -1017,10 +1026,14 @@ jobs:
               end
               exit unless doc.is_a?(Hash) && doc["jobs"].is_a?(Hash)
               doc["jobs"].each do |id, job|
+                if job.is_a?(Hash) && job["strategy"].is_a?(Hash) && job["strategy"]["matrix"]
+                  STDERR.puts "skipping matrix-strategy job #{id} -- its expanded check-run name(s) cannot be derived from the static job definition (#655)"
+                  next
+                end
                 name = (job.is_a?(Hash) && job["name"]) ? job["name"] : id
                 puts name.to_s
               end
-            ' 2>/dev/null || true)
+            ' || true)
             if [ -n "$annex_job_names" ]; then
               echo "::notice::repo_lint_local.yml annex present at $sha — also requiring its check run(s): $(printf '%s' "$annex_job_names" | tr '\n' ' ')(#655)."
               while IFS= read -r annex_job; do

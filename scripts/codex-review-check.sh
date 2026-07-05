@@ -634,44 +634,69 @@ ROLLUP_JSON=$(with_gh_retry gh pr view "$PR_NUMBER" --repo "$REPO" --json status
 # derive its job name(s) so both gaps close uniformly in every branch below,
 # rather than only when the check happens to already be sitting in the
 # rollup under the literal name "repo-lint-local".
+#
+# ANNEX_CHECKS_JSON carries { name, workflow } pairs, not bare names (#655
+# round 3 P2): the annex contract does not require unique job names, so a
+# consumer whose local job happens to share a name with an unrelated check
+# (e.g. "lint") would otherwise let that unrelated check's success silently
+# satisfy the annex requirement. workflow is the annex's own top-level
+# `name:` (statusCheckRollup's .workflowName for CheckRun entries), used
+# below to disambiguate the MISSING-injection by (name, workflow) rather
+# than name alone. ANNEX_CHECK_NAMES_JSON (bare names only) is still derived
+# for the required-set merge, which stays name-only like every other
+# required-check match in this script and in GitHub's own native
+# required-status-checks feature (neither disambiguates by workflow).
+#
+# Matrix-strategy jobs (#655 round 3 P2) are skipped during derivation, not
+# guessed at: GitHub expands a matrix job into one check run per combination
+# with a name this static YAML read cannot reproduce, so treating the
+# unexpanded job id/name as "the" check would inject a permanent synthetic
+# MISSING entry even after every real matrix check run passes -- a
+# consumer-triggered deadlock is worse than the pre-#655 status quo of
+# simply not observing that job. ruby's own stderr (not redirected here,
+# unlike the base64 decode) surfaces the skip notice in the workflow log.
 HEAD_SHA_FOR_ANNEX=$(echo "$PR_JSON" | jq -r '.head.sha')
-ANNEX_CHECK_NAMES_JSON='[]'
+ANNEX_CHECKS_JSON='[]'
 if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
   annex_probe_err=$(mktemp)
   if annex_content=$(gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$HEAD_SHA_FOR_ANNEX" --jq .content 2>"$annex_probe_err"); then
-    # Derive the actual job name(s) (a job's `name:` override if set, else
-    # its job id) rather than assuming the filename convention -- same
-    # ruby-yaml technique as agent-review.yml's #655 probe and
-    # check_ci_scripts_wired's existing `on:` trigger parser.
-    annex_job_names=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ruby -ryaml -e '
+    annex_checks_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ruby -ryaml -rjson -e '
       begin
         doc = YAML.safe_load(STDIN.read, aliases: false)
       rescue Psych::Exception
         exit
       end
       exit unless doc.is_a?(Hash) && doc["jobs"].is_a?(Hash)
+      workflow_name = doc["name"].to_s
+      results = []
       doc["jobs"].each do |id, job|
+        if job.is_a?(Hash) && job["strategy"].is_a?(Hash) && job["strategy"]["matrix"]
+          STDERR.puts "skipping matrix-strategy job #{id} -- its expanded check-run name(s) cannot be derived from the static job definition (#655)"
+          next
+        end
         name = (job.is_a?(Hash) && job["name"]) ? job["name"] : id
-        puts name.to_s
+        results << { "name" => name.to_s, "workflow" => workflow_name }
       end
-    ' 2>/dev/null || true)
-    if [ -n "$annex_job_names" ]; then
-      ANNEX_CHECK_NAMES_JSON=$(printf '%s' "$annex_job_names" | jq -R . | jq -s .)
-      log "gate (a): repo_lint_local.yml annex present at $HEAD_SHA_FOR_ANNEX (#655) — check run(s): $(printf '%s' "$annex_job_names" | tr '\n' ' ')"
+      puts JSON.generate(results)
+    ' || true)
+    if [ -n "$annex_checks_raw" ] && echo "$annex_checks_raw" | jq -e 'length > 0' >/dev/null 2>&1; then
+      ANNEX_CHECKS_JSON="$annex_checks_raw"
+      log "gate (a): repo_lint_local.yml annex present at $HEAD_SHA_FOR_ANNEX (#655) — check run(s): $(echo "$ANNEX_CHECKS_JSON" | jq -r '[.[].name] | join(" ")')"
     else
       log "gate (a): repo_lint_local.yml annex present at $HEAD_SHA_FOR_ANNEX but no job names could be parsed from it — falling back to the conventional repo-lint-local check name (#655)."
-      ANNEX_CHECK_NAMES_JSON='["repo-lint-local"]'
+      ANNEX_CHECKS_JSON='[{"name":"repo-lint-local","workflow":""}]'
     fi
   elif grep -q 'HTTP 404' "$annex_probe_err"; then
-    : # genuinely absent (confirmed 404) — no annex, ANNEX_CHECK_NAMES_JSON stays [].
+    : # genuinely absent (confirmed 404) — no annex, ANNEX_CHECKS_JSON stays [].
   else
     # Fail closed: an indeterminate read (token scope, rate limit,
     # transient error) must not be treated the same as a confirmed absence.
     log "gate (a): WARNING — could not determine whether repo_lint_local.yml exists at $HEAD_SHA_FOR_ANNEX (API error, not a confirmed 404) — failing closed by also requiring the conventional repo-lint-local check name (#655)."
-    ANNEX_CHECK_NAMES_JSON='["repo-lint-local"]'
+    ANNEX_CHECKS_JSON='[{"name":"repo-lint-local","workflow":""}]'
   fi
   rm -f "$annex_probe_err"
 fi
+ANNEX_CHECK_NAMES_JSON=$(echo "$ANNEX_CHECKS_JSON" | jq '[.[].name] | unique')
 
 # statusCheckRollup mixes two entry types:
 #   - CheckRun (GitHub Actions jobs): uses .name, .workflowName,
@@ -778,13 +803,29 @@ fi
 # evaluate, so gate (a) would clear as if the check did not exist. Inject a
 # synthetic MISSING entry for each such name so "required but absent" is
 # treated as non-green (blocking) rather than indistinguishable from "not
-# required at all". A no-op when the annex is absent (ANNEX_CHECK_NAMES_JSON
-# is `[]`) or every derived name already has a rollup entry.
-ROLLUP_JSON=$(echo "$ROLLUP_JSON" | jq --argjson annex "$ANNEX_CHECK_NAMES_JSON" '
+# required at all". A no-op when the annex is absent (ANNEX_CHECKS_JSON is
+# `[]`) or every derived name already has a matching rollup entry.
+#
+# Disambiguated by (name, workflow) when the annex's own workflow name is
+# known (#655 round 3 P2): a rollup entry only satisfies an annex check if
+# its .workflowName ALSO matches the annex's own top-level `name:` --
+# otherwise an unrelated check that happens to share the annex job's name
+# (e.g. a consumer-local job also called "lint") would wrongly count as
+# satisfying it. workflow=="" (the parse-failure fallback, where the
+# annex's own name could not be determined either) degrades to a name-only
+# match, same as before this disambiguation existed.
+ROLLUP_JSON=$(echo "$ROLLUP_JSON" | jq --argjson annex "$ANNEX_CHECKS_JSON" '
   (.statusCheckRollup // []) as $existing
-  | ($existing | map(.name // .context // "")) as $present
   | .statusCheckRollup = ($existing + [
-      $annex[] | select(. as $n | ($present | index($n)) == null) | { name: ., conclusion: "MISSING" }
+      $annex[]
+      | . as $a
+      | select(
+          ($existing | map(select(
+            (.name // .context // "") == $a.name
+            and (($a.workflow == "") or ((.workflowName // "") == $a.workflow))
+          )) | length) == 0
+        )
+      | { name: $a.name, conclusion: "MISSING" }
     ])
 ')
 
