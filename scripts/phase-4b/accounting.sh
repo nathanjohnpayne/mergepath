@@ -617,7 +617,7 @@ p4b_acct_running_totals_for_post() {
 
 # --- per-approval totals ---------------------------------------------------
 
-# p4b_acct_compute_totals <loops-json-array> <price_table_version> <notional_usd|null> [unique-findings-json]
+# p4b_acct_compute_totals <loops-json-array> <price_table_version> <notional_usd|null> [unique-findings-json] [filed-issues-json]
 # Compute the per-approval `totals` object from the loop array. Token/elapsed
 # totals sum only the loops that exposed a value; when NO loop exposed one the
 # total is null (explicitly unavailable, never a fabricated 0). notional_usd
@@ -627,9 +627,14 @@ p4b_acct_running_totals_for_post() {
 # every loop with measured usage also reported a cost — a token-bearing loop
 # without one would make the sum a silent underreport (never a partial
 # figure); loops with nothing measured contribute nothing and do not block.
-# advisory_issues_filed is derived from the unique-finding issue links.
+# advisory_issues_filed is the union of the unique-finding issue links AND the
+# optional raw filed-issues list ([filed-issues-json], P4B_ACCT_FILED_ISSUES_JSON)
+# — so EVERY issue actually filed is recorded even when duplicate (identical
+# severity/path/line/body) findings collapse to one unique_findings entry whose
+# single per-finding issue holds only one of the refs (#675 Codex round 2).
 p4b_acct_compute_totals() {
-  local loops_json="$1" ptv="$2" notional="$3" uf_json="${4:-[]}"
+  local loops_json="$1" ptv="$2" notional="$3" uf_json="${4:-[]}" filed_json="${5:-[]}"
+  [ -n "$filed_json" ] || filed_json='[]'
   local ptv_json notional_json
   if [ -n "$ptv" ]; then
     ptv_json="$(jq -nc --arg v "$ptv" '$v' 2>/dev/null)" || return 1
@@ -644,7 +649,8 @@ p4b_acct_compute_totals() {
   printf '%s' "$loops_json" | jq -c \
     --argjson ptv "$ptv_json" \
     --argjson notional "$notional_json" \
-    --argjson uf "$uf_json" '
+    --argjson uf "$uf_json" \
+    --argjson filed "$filed_json" '
     {
       adapter_invocations: length,
       tokens_total: ([ .[] | .tokens.total // empty ]
@@ -675,7 +681,8 @@ p4b_acct_compute_totals() {
       ),
       price_table_version: $ptv,
       fail_closed_events: ([ .[] | select(.fail_closed.happened == true) ] | length),
-      advisory_issues_filed: ([ $uf[] | .issue | select(. != null) ] | unique)
+      advisory_issues_filed: (([ $uf[] | .issue ] + [ $filed[] | .issue ])
+                              | map(select(. != null)) | unique)
     }' 2>/dev/null
 }
 
@@ -862,7 +869,7 @@ p4b_acct_finding_details_from_verdict() {
         body: (.body // "") }' 2>/dev/null
 }
 
-# p4b_acct_unique_findings [dispositions-json]
+# p4b_acct_unique_findings [dispositions-json] [filed-issues-json]
 # Read finding-detail JSONL on stdin (the concatenated output of
 # p4b_acct_finding_details_from_verdict across loops) and emit the
 # unique_findings array: de-duplicated by (severity, path, line, body),
@@ -871,18 +878,45 @@ p4b_acct_finding_details_from_verdict() {
 # single-line title (first body line, truncated to 80 chars) — so a GitHub
 # reader can tell what was fixed/deferred from the posted record alone
 # (#615 Codex); full bodies stay in the local loop log, never in the posted
-# block. Dispositions come ONLY from the optional dispositions map
-# ({"F1":{"disposition":"fixed","fix_commit":"abc","issue":null}, ...});
-# the default is "unresolved" with null links — the accounting never GUESSES
-# a disposition.
+# block.
+#
+# Dispositions arrive on two optional channels; both default to "unresolved"
+# with null links, because the accounting never GUESSES a disposition:
+#   1. [dispositions-json] — the F-id-keyed map
+#      ({"F1":{"disposition":"fixed","fix_commit":"abc","issue":null}, ...}).
+#      Requires the caller to know each finding's first-appearance F-id.
+#   2. [filed-issues-json] — a TUPLE-keyed list the orchestrator can populate
+#      WITHOUT replaying the F-id reduce (#675):
+#      [{severity, path, line, body, issue}, ...]. Each entry is joined on the
+#      SAME collision-proof [severity, path, line, body] | tojson key computed
+#      below and sets disposition "deferred-to-follow-up" + the issue link on
+#      the matching finding.
+# On a per-finding conflict the explicit F-id map (channel 1) wins field by
+# field — its disposition/fix_commit override the filed channel's, and an
+# explicit F-id `issue` KEY (even an explicit null) wins over the filed
+# channel's issue (#675 Codex round 1: key-presence, not null-coalescing — a
+# `{"disposition":"fixed","issue":null}` override keeps issue null instead of
+# reattaching the filed follow-up). Only an ABSENT F-id issue key falls back.
 p4b_acct_unique_findings() {
-  local disp="${1:-}"
+  local disp="${1:-}" filed="${2:-}"
   [ -n "$disp" ] || disp='{}'
-  jq -cs --argjson disp "$disp" '
+  [ -n "$filed" ] || filed='[]'
+  jq -cs --argjson disp "$disp" --argjson filed "$filed" '
     def title_of: (. // "") | split("\n")[0]
       | (if length > 80 then .[0:79] + "…" else . end)
       | (if . == "" then null else . end);
-    reduce .[] as $d ( {order: [], map: {}} ;
+    # Filed-issue tuple map (#675): key each filed post-review issue by the
+    # same collision-proof [severity, path, line, body] | tojson tuple the
+    # dedupe below computes, normalized with the finding-detail defaults
+    # (severity→"unknown", path/line→null, body→"") so a caller need not
+    # reshape its list. Value: the deferred-to-follow-up disposition + issue;
+    # the explicit F-id map overrides it per field in the final build.
+    (reduce ($filed[]?) as $fi ({};
+       ( [ ($fi.severity // "unknown"), ($fi.path // null),
+           ($fi.line // null), ($fi.body // "") ] | tojson ) as $fk
+       | .[$fk] = {disposition: "deferred-to-follow-up",
+                   issue: ($fi.issue // null)} )) as $filedmap
+    | reduce .[] as $d ( {order: [], map: {}} ;
       # Collision-proof de-dupe key (#615 Codex round 9, finding 3): JSON-encode
       # the (severity, path, line, body) tuple as an ARRAY so structural
       # boundaries can never be forged by content. The prior `severity | path |
@@ -909,6 +943,7 @@ p4b_acct_unique_findings() {
         | $st.order[$i] as $k
         | ("F" + (($i + 1) | tostring)) as $id
         | ($disp[$id] // {}) as $o
+        | ($filedmap[$k] // {}) as $fo
         | { id: $id,
             severity: $st.map[$k].severity,
             path: $st.map[$k].path,
@@ -916,9 +951,49 @@ p4b_acct_unique_findings() {
             title: $st.map[$k].title,
             first_loop: $st.map[$k].first_loop,
             last_loop: $st.map[$k].last_loop,
-            disposition: ($o.disposition // "unresolved"),
+            disposition: ($o.disposition // $fo.disposition // "unresolved"),
             fix_commit: ($o.fix_commit // null),
-            issue: ($o.issue // null) } ]' 2>/dev/null
+            # Key-presence, not null-coalescing (#675 Codex round 1): an
+            # explicit F-id `issue` (even null) wins over the filed channel;
+            # only an ABSENT F-id issue key falls back to the filed issue, so a
+            # `{"disposition":"fixed","issue":null}` override is not silently
+            # re-linked to the filed follow-up.
+            issue: (if ($o | has("issue")) then $o.issue
+                    else ($fo.issue // null) end) } ]' 2>/dev/null
+}
+
+# p4b_acct_filed_issues_from_refs <refs-csv> <file-json>
+# Build the tuple-keyed filed-issues payload (P4B_ACCT_FILED_ISSUES_JSON) the
+# render hook consumes, by zipping a comma-separated "#N" ref list — line 1 of
+# scripts/phase-4b-review.sh's p4b_file_post_review_issues, aligned 1:1 with
+# <file-json>.findings in filing order (reused + created alike) — onto those
+# findings. Emits a JSON array of {severity, path, line, body, issue} with a
+# NUMERIC issue (schema: unique_finding.issue is integer|null).
+#
+# Position-preserving (#675 Codex round 1): a ref token that is not a bare
+# "#<digits>" maps to a NULL placeholder rather than being dropped, so an
+# unparseable middle ref never shifts a later issue number onto the wrong
+# finding — e.g. "#101, #bad, #103" keeps 103 on finding index 2, not index 1.
+# A finding whose ref is null/absent is then dropped (left unlinked), so the
+# enrichment never fabricates a finding→issue association. Prints "[]" on a
+# malformed <file-json> (the enrichment is advisory — never a hard failure).
+p4b_acct_filed_issues_from_refs() {
+  local refs="$1" file_json="$2" refs_json out
+  refs_json="$(printf '%s' "$refs" | jq -Rc '
+    [ splits(", *")
+      | ltrimstr("#")
+      | (if test("^[0-9]+$") then tonumber else null end) ]' 2>/dev/null)" || refs_json='[]'
+  [ -n "$refs_json" ] || refs_json='[]'
+  out="$(printf '%s' "$file_json" | jq -c --argjson refs "$refs_json" '
+    [ .findings | to_entries[]
+      | {severity: .value.severity,
+         path: (.value.path // null),
+         line: (.value.line // null),
+         body: (.value.body // ""),
+         issue: ($refs[.key] // null)}
+      | select(.issue != null) ]' 2>/dev/null)" || out=''
+  [ -n "$out" ] || out='[]'
+  printf '%s' "$out"
 }
 
 # --- record assembly -------------------------------------------------------
@@ -1959,13 +2034,13 @@ p4b_acct_hook_render_approval_block() {
   loops="$(jq -cs '[ .[] | .loop ]' "$log" 2>/dev/null)" || return 1
   [ -n "$loops" ] && [ "$loops" != "[]" ] || return 1
   details="$(jq -c '.details[]?' "$log" 2>/dev/null)" || return 1
-  uf="$(printf '%s\n' "$details" | p4b_acct_unique_findings "${P4B_ACCT_DISPOSITIONS_JSON:-}")" || return 1
+  uf="$(printf '%s\n' "$details" | p4b_acct_unique_findings "${P4B_ACCT_DISPOSITIONS_JSON:-}" "${P4B_ACCT_FILED_ISSUES_JSON:-}")" || return 1
   [ -n "$uf" ] || return 1
   ptv="$(p4b_acct_price_table_version)"
   if ! notional="$(p4b_acct_notional_for_loops "$loops")"; then
     notional="null"
   fi
-  totals="$(p4b_acct_compute_totals "$loops" "$ptv" "$notional" "$uf")" || return 1
+  totals="$(p4b_acct_compute_totals "$loops" "$ptv" "$notional" "$uf" "${P4B_ACCT_FILED_ISSUES_JSON:-[]}")" || return 1
   [ -n "$totals" ] || return 1
   # GitHub-derived prior records are fetched here (#615 Codex round 2) so
   # the rendered totals are repo-wide by default, not local-ledger-only.
