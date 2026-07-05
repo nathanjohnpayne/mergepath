@@ -432,7 +432,6 @@ jobs:
               "repos/${{ github.repository }}/dispatches" \
               -f event_type=merge-clearance-recheck \
               -F "client_payload[pr]=$PR_NUMBER" \
-              -f "client_payload[head_sha]=$HEAD_SHA" \
               || echo "note: merge-clearance-recheck dispatch failed (#658); the */15 scheduled sweep will recover the Merge clearance gate."
           fi
 

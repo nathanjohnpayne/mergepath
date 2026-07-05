@@ -371,12 +371,6 @@ jobs:
           # (not interpolated into the script) and validated as a positive
           # integer below, so an arbitrary client_payload cannot inject shell.
           PR: ${{ github.event.client_payload.pr }}
-          # The verified head SHA the lane put in the dispatch payload. Taken
-          # from the payload, NOT a per-PR `gh api pulls/$PR` resolve — #465 D1
-          # forbids that fragile pattern in this workflow (a failed resolve
-          # would fail-open), and the lane already holds the exact head it just
-          # verified. Validated as a hex object name below.
-          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
           REPO: ${{ github.repository }}
           # Check name MUST match the event-driven job name above AND the
           # sweep CHECK_NAME so branch protection resolves every source as the
@@ -397,19 +391,23 @@ jobs:
           esac
           # The check_run must pin to the PR head (required checks key on
           # (head_sha, name)). A repository_dispatch run checks out the default
-          # branch and has NO PR-head commit association, so a native job check
-          # would attach to the default-branch commit and never refresh the
-          # PR's required check; POST explicitly to the head SHA like the
-          # scheduled sweep. The head comes from the dispatch payload (the head
-          # the lane just verified), NOT a per-PR gh api resolve (#465 D1);
-          # validate it is a hex object name so a hostile payload cannot inject.
-          head_sha="$HEAD_SHA"
-          case "$head_sha" in
-            '' | *[!0-9a-f]* )
-              echo "::error::repository_dispatch client_payload.head_sha is not a hex sha: '$head_sha'"
-              exit 1
-              ;;
-          esac
+          # branch and has NO PR-head commit association, so POST explicitly to
+          # the head SHA like the scheduled sweep. Resolve that head
+          # AUTHORITATIVELY from the open-PR list query — the same list source
+          # the sweep uses (#465 D1), never the attacker-influenceable dispatch
+          # payload (#658 P1): binding the posted head to the dispatched PR's
+          # own current state means a hostile dispatch cannot reuse a passing
+          # PR's evaluation to post a green check onto a different, blocked PR
+          # head. $PR is validated as a positive integer above, so
+          # interpolating it into the jq filter is injection-safe. Fail closed
+          # if the PR is not in the open list.
+          head_sha=$(gh pr list --repo "$REPO" --state open --limit 500 \
+            --json number,headRefOid \
+            --jq ".[] | select(.number == $PR) | .headRefOid" 2>/dev/null || true)
+          if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
+            echo "::error::PR #$PR not found in the open-PR list; cannot resolve its head to refresh the Merge clearance gate (fail closed, #658/#465)."
+            exit 1
+          fi
           set +e
           output=$(scripts/merge-clearance-gate.sh "$PR" "$REPO" 2>&1)
           rc=$?
