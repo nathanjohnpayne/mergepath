@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# check_audit_review_latency
+#
+# Runs tests/test_audit_review_latency.sh — the offline fixture suite for
+# scripts/audit-review-latency.sh's normalize + pairing + replay phases
+# (the #623 CodeRabbit + phase-4b latency retune). Without this wiring,
+# edits to the audit script could break the published, replayable
+# analysis without CI noticing — the same gap check_audit_codex_latency
+# closes for the Codex half of the study.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_audit_review_latency.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  # Consumer-safety guard (#601): repo_lint.yml is manifest-canonical, so
+  # consumers run this wrapper too — but the audit script + suite are
+  # hub-only (not manifest-propagated). scripts/sync-to-downstream.sh is
+  # the standard hub marker: both absent → consumer checkout → SKIP.
+  # Marker present → hub lost the test (accidental delete/rename) → hard
+  # error, preserving fail-closed hub behavior.
+  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+    echo "check_audit_review_latency: SKIP (consumer checkout: tests/test_audit_review_latency.sh + scripts/sync-to-downstream.sh both absent)"
+    exit 0
+  fi
+  echo "check_audit_review_latency: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
+echo "check_audit_review_latency: PASS"

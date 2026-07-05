@@ -29,10 +29,11 @@
 #
 #   3. **HEAD freshness.** Auto-merge-on-approval workflows in downstream
 #      repos race CodeRabbit: an internal reviewer can post APPROVED before
-#      CodeRabbit's ~2–3 minute review lands, and the PR auto-merges
-#      pre-review. The script only returns "cleared" when CodeRabbit has
-#      posted a non-rate-limited, non-in-progress comment on or after the
-#      HEAD committer date. See nathanjohnpayne/mergepath#136.
+#      CodeRabbit's review lands (measured p50 ~6 min, p99 ~19 min — #623,
+#      not the old "~2–3 min" folklore), and the PR auto-merges pre-review.
+#      The script only returns "cleared" when CodeRabbit has posted a
+#      non-rate-limited, non-in-progress comment on or after the HEAD
+#      committer date. See nathanjohnpayne/mergepath#136.
 #
 # It also surfaces — without re-invoking — the other detectable reasons
 # CodeRabbit auto-review never fires: a PR base branch matched by none of
@@ -363,8 +364,17 @@ coderabbit_yml_drafts() {
   ' "$CODERABBIT_YML"
 }
 
+# max_wait_seconds: the poll ceiling before an advisory exit 4. Default 1140s
+# is measured (#623): the mined CodeRabbit review latency (commit → first
+# body-bearing review, fleet-wide, rate-limited rounds excluded) is p50 365s /
+# p90 799s / p99 1136s (n=92, docs/audits/data/review-latency-2026-07/). The
+# prior 300s sat below even the p50, so >50% of PRs timed the wait out before
+# CodeRabbit reviewed — reopening the #136 pre-review-merge race. 1140s = 76 ×
+# POLL_INTERVAL_SECONDS covers the full observed tail (max 1136s); it is a
+# CEILING (the poll returns as soon as the review lands, ~p50 6 min), and the
+# paused/rate-limit/skip fast-paths short-circuit genuinely-stuck rounds.
 MAX_WAIT_SECONDS=$(coderabbit_field max_wait_seconds)
-MAX_WAIT_SECONDS=${MAX_WAIT_SECONDS:-300}
+MAX_WAIT_SECONDS=${MAX_WAIT_SECONDS:-1140}
 if ! [[ "$MAX_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "ERROR: coderabbit.max_wait_seconds must be an integer; got '$MAX_WAIT_SECONDS'" >&2
   exit 3
