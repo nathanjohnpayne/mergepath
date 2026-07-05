@@ -406,15 +406,25 @@ p4b_file_post_review_issues() {
     # them again. Every issue body embeds a stable head-pinned marker, and
     # the loop reuses a marker match instead of re-creating. Search-index
     # lag can miss a JUST-created issue; the worst case is one duplicate —
-    # exactly the pre-marker status quo — never a lost filing.
-    marker="p4b-post-review ${REPO}#${PR} head=${HEAD:-unknown} finding=${i}"
+    # exactly the pre-marker status quo — never a lost filing. The marker
+    # keys on a CONTENT fingerprint, not the array index (#674 round-3 P2):
+    # a rerun that returns the same findings reordered or reworded must not
+    # bind an old issue to whatever now occupies the same slot — changed
+    # content mints a fresh issue (the superseded one stays open and
+    # visible, never silently rebound).
+    fp="$(printf '%s|%s|%s|%s' "$sev" "$fpath" "$fline" "$fbody" | cksum | cut -d' ' -f1)"
+    marker="p4b-post-review ${REPO}#${PR} head=${HEAD:-unknown} finding=${fp}"
     existing="$(GH_TOKEN="$token" GITHUB_TOKEN='' gh search issues --repo "$REPO" "\"$marker\"" --json url --jq '.[0].url // empty' 2>/dev/null || true)"
     if [ -n "$existing" ]; then
       refs="${refs:+$refs, }#${existing##*/}"
       i=$((i + 1))
       continue
     fi
-    title="$(printf '%.120s' "post-review ${kind} (${REPO}#${PR}): ${sev} ${fpath}${fline:+:$fline}")"
+    # Title follows the documented step-9 convention (`[Post-Review] {brief
+    # description}`, REVIEW_POLICY.md § post-merge issue creation — #674
+    # round-3 P2) so title-shape triage and searches see auto-filed
+    # follow-ups exactly like manual ones.
+    title="$(printf '%.120s' "[Post-Review] ${kind} from ${REPO}#${PR}: ${sev} ${fpath}${fline:+:$fline}")"
     bfile="$(mktemp "${TMPDIR:-/tmp}/p4b-issue.XXXXXX")"
     {
       printf 'Advisory %s %s flagged by the automated Phase 4b APPROVED review of %s#%s. Filed by scripts/phase-4b-review.sh BEFORE the approval posted (policy step 9, #672).\n\n' "$sev" "$kind" "$REPO" "$PR"
@@ -547,8 +557,19 @@ BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
     printf '%s' "$VERDICT_JSON" | jq -r '
       .findings[]
       | "- **\(.severity)** \((.path // "PR") + (if .line then ":\(.line)" else "" end)): \(.body)"'
-    if [ "$VERDICT" = "APPROVED" ] && [ -n "$POST_REVIEW_ISSUE_REFS" ]; then
-      printf '\nEach finding above is an advisory observation filed as a post-review issue before this approval posted (policy step 9, #672): %s\n' "$POST_REVIEW_ISSUE_REFS"
+    if [ "$VERDICT" = "APPROVED" ]; then
+      # Accurate audit trail (#674 round-3 P3): only claim filing for the
+      # subset that actually filed; ignored-tier findings are listed above
+      # as the faithful verdict record but are deliberately not surfaced
+      # as issues.
+      _ign_count=$(( FINDINGS_COUNT - ${FILE_COUNT:-$FINDINGS_COUNT} ))
+      if [ -n "$POST_REVIEW_ISSUE_REFS" ] && [ "$_ign_count" -eq 0 ]; then
+        printf '\nEach finding above is an advisory follow-up filed as a post-review issue before this approval posted (policy step 9, #672): %s\n' "$POST_REVIEW_ISSUE_REFS"
+      elif [ -n "$POST_REVIEW_ISSUE_REFS" ]; then
+        printf '\n%s of the findings above were filed as post-review issues before this approval posted (policy step 9, #672): %s. The other %s fall in feedback_policy ignore tiers and were deliberately not surfaced as issues.\n' "${FILE_COUNT:-0}" "$POST_REVIEW_ISSUE_REFS" "$_ign_count"
+      elif [ "$_ign_count" -gt 0 ]; then
+        printf '\nAll %s finding(s) above fall in feedback_policy ignore tiers — listed as the faithful verdict record, deliberately not surfaced as post-review issues.\n' "$_ign_count"
+      fi
     fi
   fi
   printf '\n\n_Posted by scripts/phase-4b-review.sh under the reviewer identity. See plans/automated-phase-4b-handoff.md._\n'

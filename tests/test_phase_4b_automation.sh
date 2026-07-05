@@ -178,6 +178,8 @@ mk_fake fake-codex-approve-p3 \
   "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P3\",\"path\":\"x.js\",\"line\":2,\"body\":\"cosmetic nit only\"}]}'"
 mk_fake fake-codex-approve-2p2 \
   "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P2\",\"path\":\"x.js\",\"line\":2,\"body\":\"first advisory\"},{\"severity\":\"P2\",\"path\":\"y.js\",\"line\":9,\"body\":\"second advisory\"}]}'"
+mk_fake fake-codex-approve-p2p3 \
+  "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P2\",\"path\":\"x.js\",\"line\":2,\"body\":\"filed advisory\"},{\"severity\":\"P3\",\"path\":\"y.js\",\"line\":9,\"body\":\"suppressed nit\"}]}'"
 mk_fake fake-codex-junk \
   "printf '%s' 'this is not json at all'"
 mk_fake fake-codex-usage \
@@ -1363,8 +1365,11 @@ grep -q "^GH_TOKEN=fake-author-pat$" "$ISSUE_LOG" \
   && pass "#672: issue filed under the author token" || fail "#672: wrong token for issue create"
 grep -q "post-review issue" "$P4B672_BODY" && grep -q "#901" "$P4B672_BODY" \
   && pass "#672: posted APPROVED body carries the issue reference" || fail "#672: issue reference missing from review body"
-grep -q "p4b-post-review o/r#134 head=abc123 finding=0" "${ISSUE_LOG}.body.1" \
-  && pass "#674: filed issue body embeds the head-pinned dedup marker" || fail "#674: dedup marker missing from issue body"
+P2_FP="$(printf '%s|%s|%s|%s' P2 x.js 2 "should be handled under stricter policy" | cksum | cut -d' ' -f1)"
+grep -q "p4b-post-review o/r#134 head=abc123 finding=${P2_FP}" "${ISSUE_LOG}.body.1" \
+  && pass "#674: filed issue body embeds the content-fingerprinted dedup marker" || fail "#674: content-fingerprint marker missing from issue body"
+grep -q -- "--title \[Post-Review\]" "$ISSUE_LOG" || grep -q "\[Post-Review\]" "$ISSUE_LOG" \
+  && pass "#674: issue title follows the documented Post-Review convention" || fail "#674: Post-Review title prefix missing"
 
 # #674 CodeRabbit: a marker match from a prior partially-failed run is
 # REUSED — no duplicate issue is created and the reference still lands.
@@ -1520,6 +1525,24 @@ if [ "$rc" = 4 ] \
 else fail "#674 partial-orphan surfacing (rc=$rc): $out"; fi
 [ ! -s "$WORK/p4b674-partial-wrapper.log" ] \
   && pass "#674: no review POST after a partial filing failure" || fail "#674: review POST attempted after partial failure"
+
+# #674 round 3: a mixed filed+ignored approval body claims filing only for
+# the filed subset and names the suppressed remainder.
+MIXED_ISSUE_LOG="$WORK/issue-mixed.log"; : > "$MIXED_ISSUE_LOG"
+MIXED_BODY="$WORK/p4b674-mixed-body.txt"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_P3_IGNORE" CODEX_BIN="$BIN/fake-codex-approve-p2p3" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$MIXED_ISSUE_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/p4b674-mixed-wrapper.log" \
+  P4B_WRAPPER_BODY="$MIXED_BODY" P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  bash "$ORCH" 144 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && [ "$(grep -c '^ARGV ' "$MIXED_ISSUE_LOG")" = "1" ] \
+   && grep -q "1 of the findings above were filed" "$MIXED_BODY" \
+   && grep -q "ignore tiers and were deliberately not surfaced" "$MIXED_BODY"; then
+  pass "#674: mixed approval body claims filing only for the filed subset"
+else fail "#674 mixed filed/ignored body wording (rc=$rc)"; fi
 
 # #672 opt-out: post_review_issues: false restores the pre-#672 refusal.
 POLICY_NO_ISSUES="$WORK/policy-no-issues.yml"
