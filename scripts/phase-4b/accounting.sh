@@ -862,7 +862,7 @@ p4b_acct_finding_details_from_verdict() {
         body: (.body // "") }' 2>/dev/null
 }
 
-# p4b_acct_unique_findings [dispositions-json]
+# p4b_acct_unique_findings [dispositions-json] [filed-issues-json]
 # Read finding-detail JSONL on stdin (the concatenated output of
 # p4b_acct_finding_details_from_verdict across loops) and emit the
 # unique_findings array: de-duplicated by (severity, path, line, body),
@@ -871,18 +871,41 @@ p4b_acct_finding_details_from_verdict() {
 # single-line title (first body line, truncated to 80 chars) — so a GitHub
 # reader can tell what was fixed/deferred from the posted record alone
 # (#615 Codex); full bodies stay in the local loop log, never in the posted
-# block. Dispositions come ONLY from the optional dispositions map
-# ({"F1":{"disposition":"fixed","fix_commit":"abc","issue":null}, ...});
-# the default is "unresolved" with null links — the accounting never GUESSES
-# a disposition.
+# block.
+#
+# Dispositions arrive on two optional channels; both default to "unresolved"
+# with null links, because the accounting never GUESSES a disposition:
+#   1. [dispositions-json] — the F-id-keyed map
+#      ({"F1":{"disposition":"fixed","fix_commit":"abc","issue":null}, ...}).
+#      Requires the caller to know each finding's first-appearance F-id.
+#   2. [filed-issues-json] — a TUPLE-keyed list the orchestrator can populate
+#      WITHOUT replaying the F-id reduce (#675):
+#      [{severity, path, line, body, issue}, ...]. Each entry is joined on the
+#      SAME collision-proof [severity, path, line, body] | tojson key computed
+#      below and sets disposition "deferred-to-follow-up" + the issue link on
+#      the matching finding.
+# On a per-finding conflict the explicit F-id map (channel 1) wins field by
+# field — its disposition/fix_commit/issue override the filed channel's.
 p4b_acct_unique_findings() {
-  local disp="${1:-}"
+  local disp="${1:-}" filed="${2:-}"
   [ -n "$disp" ] || disp='{}'
-  jq -cs --argjson disp "$disp" '
+  [ -n "$filed" ] || filed='[]'
+  jq -cs --argjson disp "$disp" --argjson filed "$filed" '
     def title_of: (. // "") | split("\n")[0]
       | (if length > 80 then .[0:79] + "…" else . end)
       | (if . == "" then null else . end);
-    reduce .[] as $d ( {order: [], map: {}} ;
+    # Filed-issue tuple map (#675): key each filed post-review issue by the
+    # same collision-proof [severity, path, line, body] | tojson tuple the
+    # dedupe below computes, normalized with the finding-detail defaults
+    # (severity→"unknown", path/line→null, body→"") so a caller need not
+    # reshape its list. Value: the deferred-to-follow-up disposition + issue;
+    # the explicit F-id map overrides it per field in the final build.
+    (reduce ($filed[]?) as $fi ({};
+       ( [ ($fi.severity // "unknown"), ($fi.path // null),
+           ($fi.line // null), ($fi.body // "") ] | tojson ) as $fk
+       | .[$fk] = {disposition: "deferred-to-follow-up",
+                   issue: ($fi.issue // null)} )) as $filedmap
+    | reduce .[] as $d ( {order: [], map: {}} ;
       # Collision-proof de-dupe key (#615 Codex round 9, finding 3): JSON-encode
       # the (severity, path, line, body) tuple as an ARRAY so structural
       # boundaries can never be forged by content. The prior `severity | path |
@@ -909,6 +932,7 @@ p4b_acct_unique_findings() {
         | $st.order[$i] as $k
         | ("F" + (($i + 1) | tostring)) as $id
         | ($disp[$id] // {}) as $o
+        | ($filedmap[$k] // {}) as $fo
         | { id: $id,
             severity: $st.map[$k].severity,
             path: $st.map[$k].path,
@@ -916,9 +940,9 @@ p4b_acct_unique_findings() {
             title: $st.map[$k].title,
             first_loop: $st.map[$k].first_loop,
             last_loop: $st.map[$k].last_loop,
-            disposition: ($o.disposition // "unresolved"),
+            disposition: ($o.disposition // $fo.disposition // "unresolved"),
             fix_commit: ($o.fix_commit // null),
-            issue: ($o.issue // null) } ]' 2>/dev/null
+            issue: ($o.issue // $fo.issue // null) } ]' 2>/dev/null
 }
 
 # --- record assembly -------------------------------------------------------
@@ -1959,7 +1983,7 @@ p4b_acct_hook_render_approval_block() {
   loops="$(jq -cs '[ .[] | .loop ]' "$log" 2>/dev/null)" || return 1
   [ -n "$loops" ] && [ "$loops" != "[]" ] || return 1
   details="$(jq -c '.details[]?' "$log" 2>/dev/null)" || return 1
-  uf="$(printf '%s\n' "$details" | p4b_acct_unique_findings "${P4B_ACCT_DISPOSITIONS_JSON:-}")" || return 1
+  uf="$(printf '%s\n' "$details" | p4b_acct_unique_findings "${P4B_ACCT_DISPOSITIONS_JSON:-}" "${P4B_ACCT_FILED_ISSUES_JSON:-}")" || return 1
   [ -n "$uf" ] || return 1
   ptv="$(p4b_acct_price_table_version)"
   if ! notional="$(p4b_acct_notional_for_loops "$loops")"; then

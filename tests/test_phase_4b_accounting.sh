@@ -544,6 +544,67 @@ if printf '%s' "$uf" | jq -e 'length == 1
   pass "an identical finding (pipe-bearing content) across loops still dedupes to one lifecycle entry (finding 3)"
 else fail "pipe-bearing repeat dedup: $uf"; fi
 
+# ---------------------------------------------------------------------------
+# Filed-issues tuple-keyed injection channel (#675). The step-9 executor files
+# post-review issues for an APPROVED-with-advisories verdict, then injects the
+# filed list WITHOUT knowing F-ids; unique_findings joins it on the SAME
+# collision-proof [severity, path, line, body] tuple and records
+# disposition=deferred-to-follow-up + the issue link on the matched finding.
+FILED='[{"severity":"P2","path":"a.js","line":3,"body":"dup","issue":701}]'
+uf="$(printf '%s\n%s\n' \
+  '{"loop":1,"severity":"P2","path":"a.js","line":3,"body":"dup"}' \
+  '{"loop":2,"severity":"P3","path":null,"line":null,"body":"solo"}' \
+  | p4b_acct_unique_findings '' "$FILED")"
+if printf '%s' "$uf" | jq -e '
+    (.[0].id == "F1" and .[0].disposition == "deferred-to-follow-up" and .[0].issue == 701)
+    and (.[1].id == "F2" and .[1].disposition == "unresolved" and .[1].issue == null)' >/dev/null; then
+  pass "filed-issues tuple join sets deferred-to-follow-up + issue on the matched finding only (#675)"
+else fail "filed-issues tuple join: $uf"; fi
+
+# A filed entry matching no recorded finding is ignored — the join only
+# enriches existing dedup entries, never mints a phantom unique finding.
+uf="$(printf '%s\n' '{"loop":1,"severity":"P2","path":"a.js","line":3,"body":"dup"}' \
+  | p4b_acct_unique_findings '' '[{"severity":"P1","path":"z.js","line":9,"body":"never-recorded","issue":702}]')"
+if printf '%s' "$uf" | jq -e 'length == 1
+    and .[0].disposition == "unresolved" and .[0].issue == null' >/dev/null; then
+  pass "filed entry matching no recorded finding is ignored — no phantom entry (#675)"
+else fail "filed no-match phantom: $uf"; fi
+
+# The filed join keys on the collision-proof tuple, not a '|'-joined string, so
+# a body containing '|' cannot cross-match a different finding's issue link.
+uf="$(printf '%s\n%s\n' \
+  '{"loop":1,"severity":"P2","path":"a","line":1,"body":"b|2|c"}' \
+  '{"loop":2,"severity":"P2","path":"a|1|b","line":2,"body":"c"}' \
+  | p4b_acct_unique_findings '' '[{"severity":"P2","path":"a","line":1,"body":"b|2|c","issue":703}]')"
+if printf '%s' "$uf" | jq -e '
+    (.[0].issue == 703 and .[0].disposition == "deferred-to-follow-up")
+    and (.[1].issue == null and .[1].disposition == "unresolved")' >/dev/null; then
+  pass "filed join respects the collision-proof tuple key ('|'-bearing content) (#675)"
+else fail "filed join collision: $uf"; fi
+
+# Explicit F-id dispositions map wins per finding over the filed channel: a
+# fully specified F-id entry overrides disposition, fix_commit, AND issue.
+uf="$(printf '%s\n' '{"loop":1,"severity":"P2","path":"a.js","line":3,"body":"dup"}' \
+  | p4b_acct_unique_findings \
+      '{"F1":{"disposition":"fixed","fix_commit":"abc123","issue":999}}' \
+      '[{"severity":"P2","path":"a.js","line":3,"body":"dup","issue":701}]')"
+if printf '%s' "$uf" | jq -e '
+    .[0].disposition == "fixed" and .[0].fix_commit == "abc123" and .[0].issue == 999' >/dev/null; then
+  pass "explicit F-id dispositions map wins per finding over the filed-issues channel (#675)"
+else fail "F-id precedence over filed channel: $uf"; fi
+
+# advisory_issues_filed derives automatically from the filed-enriched unique
+# findings — no explicit F-id map, just the tuple-keyed filed channel (#675).
+UF_FILED="$(printf '%s\n%s\n' \
+  '{"loop":1,"severity":"P2","path":"a.js","line":3,"body":"one"}' \
+  '{"loop":1,"severity":"P3","path":"b.js","line":9,"body":"two"}' \
+  | p4b_acct_unique_findings '' \
+      '[{"severity":"P2","path":"a.js","line":3,"body":"one","issue":701},{"severity":"P3","path":"b.js","line":9,"body":"two","issue":702}]')"
+tt_filed="$(p4b_acct_compute_totals '[{"loop":1,"reviewer":"nathanpayne-codex","adapter":"a","direction":"claude->codex","elapsed_seconds":null,"tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"unavailable"},"fail_closed":{"happened":false,"reason":null,"duration_seconds":null}}]' "" "null" "$UF_FILED")"
+if printf '%s' "$tt_filed" | jq -e '.advisory_issues_filed == [701,702]' >/dev/null; then
+  pass "advisory_issues_filed derives from the filed-issues-enriched unique findings (#675)"
+else fail "advisory_issues_filed derivation: $tt_filed"; fi
+
 # ===========================================================================
 echo "accounting.sh — notional-cost math (versioned price table)"
 # ===========================================================================
