@@ -1,27 +1,41 @@
 #!/usr/bin/env bash
 # tests/test_codex_review_check_required_checks.sh
 #
-# Regression coverage for gate (a)'s required-check scoping in
+# Regression coverage for gate (a)'s annex-awareness in
 # scripts/codex-review-check.sh (#655): when branch protection lists SOME
 # required checks (the common case), gate (a) narrows its "must be green"
-# scrutiny to that list — so a check present in the rollup but NOT in the
-# required list (e.g. a consumer's optional, never-propagated #601
-# repo_lint_local.yml annex, whose check run is named `repo-lint-local`) is
-# silently excluded, even when it is red. Branch protection cannot require
-# it centrally — the annex is per-consumer and never propagated, so there is
-# no canonical PR to add it fleet-wide (that half is a human branch-
-# protection change; see #655). This closes the agent-doable half: force
-# `repo-lint-local` into the required set whenever the rollup actually
-# reports it, independent of what branch protection lists.
+# scrutiny to that list — so a consumer's optional, never-propagated #601
+# repo_lint_local.yml annex check is silently excluded, even when it is red
+# or entirely missing. Branch protection cannot require it centrally — the
+# annex is per-consumer and never propagated, so there is no canonical PR to
+# add it fleet-wide (that half is a human branch-protection change; see
+# #655). This closes the agent-doable half across three rounds of Codex
+# findings:
+#
+#   Round 1 P1: force-include the annex's check into gate (a)'s scrutiny
+#   regardless of branch protection's required-check list, including the
+#   "no required checks configured" branch, which used to wipe the whole
+#   rollup unconditionally.
+#
+#   Round 2 P2 x2: (a) the annex's job (and therefore check-run) name is not
+#   guaranteed to be literally "repo-lint-local" — derive it from the annex
+#   YAML instead of assuming the filename convention; (b) if the annex
+#   workflow has not started for this PR at all (skipped by a path/job
+#   conditional, or simply not run yet), it never appears in the rollup, so
+#   a rollup-presence-only check is blind to it — proactively probe the
+#   annex file and treat a derived-but-missing check as blocking, not absent.
 #
 # The full gate (a) needs network (statusCheckRollup + branch-protection API
-# reads); this test pins (1) the structural presence of the force-include in
-# the real script and (2) the augmentation jq logic inline — the same
-# inline-literal pattern test_codex_review_check_verdict.sh and
-# test_codex_review_check_resolution.sh use. KEEP THE INLINE FILTER BELOW IN
-# SYNC with the REQUIRED_JSON augmentation in scripts/codex-review-check.sh.
+# reads + the annex Contents API probe); this test pins (1) the structural
+# presence of each fix in the real script and (2) the jq logic inline — the
+# same inline-literal pattern test_codex_review_check_verdict.sh and
+# test_codex_review_check_resolution.sh use. KEEP THE INLINE FILTERS BELOW IN
+# SYNC with scripts/codex-review-check.sh's gate (a).
 #
-# Bash 3.2 portable. Runs without network.
+# Bash 3.2 portable. Runs without network (the annex-probe + ruby-yaml
+# derivation itself is validated by a real invocation against a live
+# consumer annex during development — see the PR/issue #655 discussion —
+# but is not re-exercised here since this suite runs offline).
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,49 +47,62 @@ PASS=0; FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
-# ── 1. Structural: the real script force-includes repo-lint-local into the
-#      required-check set, referenced to #655, inside the non-empty
-#      required-names branch (the "no required checks configured" and
-#      "protection unreadable" branches already consider every check).
-if grep -q 'repo-lint-local' "$SCRIPT" \
+# ── 1. Structural: the real script probes the annex, derives its job
+#      name(s) rather than hard-coding "repo-lint-local", and injects a
+#      synthetic MISSING entry for a derived-but-unreported check.
+if grep -q 'ANNEX_CHECK_NAMES_JSON' "$SCRIPT" \
+   && grep -q 'doc\["jobs"\].each do |id, job|' "$SCRIPT" \
+   && grep -q 'conclusion: "MISSING"' "$SCRIPT" \
    && grep -q "#655" "$SCRIPT"; then
-  pass "codex-review-check.sh gate (a) references the repo-lint-local force-include (#655)"
+  pass "codex-review-check.sh gate (a) probes the annex, derives job names, and injects MISSING for unreported checks (#655)"
 else
-  fail "codex-review-check.sh gate (a) is missing the repo-lint-local force-include (#655)"
+  fail "codex-review-check.sh gate (a) is missing the annex probe / job-name derivation / MISSING injection (#655)"
 fi
 
-# ── 2. Inline logic: the REQUIRED_JSON augmentation. KEEP IN SYNC with the
-#      jq filter in scripts/codex-review-check.sh's non-empty required-names
-#      branch. Force-includes repo-lint-local iff the rollup reports it (by
-#      .name OR .context, matching statusCheckRollup's two entry shapes),
-#      leaves the required set untouched otherwise, and never duplicates an
-#      entry branch protection already lists.
-augment() {
-  local required_names_json=$1 rollup_json=$2
-  printf '%s' "$required_names_json" | jq --argjson rollup "$rollup_json" '
-    if ([$rollup.statusCheckRollup[]? | (.name // .context // "")] | index("repo-lint-local")) != null
-    then . + ["repo-lint-local"] | unique
-    else .
-    end
+# Fail-closed on an indeterminate annex-probe error (not a confirmed 404).
+if grep -q "grep -q 'HTTP 404' \"\$annex_probe_err\"" "$SCRIPT"; then
+  pass "codex-review-check.sh distinguishes a confirmed 404 (annex absent) from other annex-probe errors"
+else
+  fail "codex-review-check.sh does not distinguish a confirmed 404 from other annex-probe errors"
+fi
+
+# ── 2. Inline logic: the three REQUIRED_JSON branches, parameterized on
+#      ANNEX_CHECK_NAMES_JSON (whatever the probe derived) instead of a
+#      hard-coded "repo-lint-local" string. KEEP IN SYNC with
+#      scripts/codex-review-check.sh's gate (a).
+
+# Non-empty required-names branch: merge in the annex's derived name(s).
+merge_required() {
+  local required_names_csv=$1 annex_json=$2
+  printf '%s' "$required_names_csv" | jq -R . | jq -s . | jq --argjson annex "$annex_json" '. + $annex | unique'
+}
+
+# Empty required-names branch: scope REQUIRED_JSON to the annex alone when
+# it is present (per the probe, not merely "already in the rollup").
+empty_branch_required_json() {
+  local annex_json=$1
+  if [ "$(printf '%s' "$annex_json" | jq 'length')" -gt 0 ]; then
+    printf '%s' "$annex_json"
+  else
+    printf '[]'
+  fi
+}
+
+# MISSING-injection: a derived annex check name with no rollup entry at all
+# gets a synthetic MISSING entry so it is not indistinguishable from "not
+# required at all".
+inject_missing() {
+  local rollup_json=$1 annex_json=$2
+  printf '%s' "$rollup_json" | jq --argjson annex "$annex_json" '
+    (.statusCheckRollup // []) as $existing
+    | ($existing | map(.name // .context // "")) as $present
+    | .statusCheckRollup = ($existing + [
+        $annex[] | select(. as $n | ($present | index($n)) == null) | { name: ., conclusion: "MISSING" }
+      ])
   '
 }
 
-ROLLUP_WITH_LOCAL='{"statusCheckRollup":[{"name":"lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","conclusion":"FAILURE"}]}'
-ROLLUP_NO_LOCAL='{"statusCheckRollup":[{"name":"lint","conclusion":"SUCCESS"}]}'
-ROLLUP_CONTEXT_SHAPE='{"statusCheckRollup":[{"context":"repo-lint-local","state":"FAILURE"}]}'
-
-# Empty-required-list branch (#655 Codex P1 r1) replica. KEEP IN SYNC with
-# the elif-branch logic in scripts/codex-review-check.sh.
-empty_branch_required_json() {
-  local rollup_json=$1
-  printf '%s' "$rollup_json" | jq -e '[.statusCheckRollup[]? | (.name // .context // "")] | index("repo-lint-local")' >/dev/null 2>&1 \
-    && printf '["repo-lint-local"]' \
-    || printf '[]'
-}
-
-# End-to-end BAD_CHECKS filter replica. KEEP IN SYNC with the BAD_CHECKS
-# filter in scripts/codex-review-check.sh (workflow/Label Gate exclusion,
-# required-names scoping, non-green selection).
+# End-to-end BAD_CHECKS filter. KEEP IN SYNC with scripts/codex-review-check.sh.
 bad_checks() {
   local rollup_json=$1 required_names_json=$2
   printf '%s' "$rollup_json" | jq --argjson required_names "$required_names_json" '
@@ -88,85 +115,121 @@ bad_checks() {
     ]'
 }
 
-GOT=$(augment '["lint"]' "$ROLLUP_WITH_LOCAL" | jq -c 'sort')
+# Round-1 shape: annex named the conventional "repo-lint-local".
+ANNEX_CONVENTIONAL='["repo-lint-local"]'
+# Round-2 shape: a consumer whose annex job uses a different name entirely.
+ANNEX_RENAMED='["my-custom-checks"]'
+ANNEX_NONE='[]'
+
+GOT=$(merge_required 'lint' "$ANNEX_CONVENTIONAL" | jq -c 'sort')
 if [ "$GOT" = '["lint","repo-lint-local"]' ]; then
-  pass "annex present (.name shape) -> repo-lint-local is force-included in the required set"
+  pass "non-empty branch: conventional annex name merges into the required set"
 else
-  fail "annex present (.name shape): expected [\"lint\",\"repo-lint-local\"], got $GOT"
+  fail "non-empty branch (conventional): expected [\"lint\",\"repo-lint-local\"], got $GOT"
 fi
 
-GOT=$(augment '["lint"]' "$ROLLUP_NO_LOCAL" | jq -c 'sort')
+GOT=$(merge_required 'lint' "$ANNEX_RENAMED" | jq -c 'sort')
+if [ "$GOT" = '["lint","my-custom-checks"]' ]; then
+  pass "non-empty branch: a renamed annex job (#655 round 2 P2) merges by its DERIVED name, not a hard-coded one"
+else
+  fail "non-empty branch (renamed): expected [\"lint\",\"my-custom-checks\"], got $GOT"
+fi
+
+GOT=$(merge_required 'lint' "$ANNEX_NONE" | jq -c 'sort')
 if [ "$GOT" = '["lint"]' ]; then
-  pass "annex absent -> required set is untouched (no consumer regression)"
+  pass "non-empty branch: no annex -> required set is untouched (no consumer regression)"
 else
-  fail "annex absent: expected [\"lint\"] unchanged, got $GOT"
+  fail "non-empty branch (no annex): expected [\"lint\"] unchanged, got $GOT"
 fi
 
-GOT=$(augment '["lint"]' "$ROLLUP_CONTEXT_SHAPE" | jq -c 'sort')
+GOT=$(merge_required "$(printf 'lint\nrepo-lint-local')" "$ANNEX_CONVENTIONAL" | jq -c 'sort')
 if [ "$GOT" = '["lint","repo-lint-local"]' ]; then
-  pass "annex present (.context shape -- commit-status entries) -> still force-included"
+  pass "non-empty branch: already-required (a future branch-protection addition) -> no duplicate entry"
 else
-  fail "annex present (.context shape): expected [\"lint\",\"repo-lint-local\"], got $GOT"
+  fail "non-empty branch (already-required): expected no duplicate, got $GOT"
 fi
 
-GOT=$(augment '["lint","repo-lint-local"]' "$ROLLUP_WITH_LOCAL" | jq -c 'sort')
+GOT=$(empty_branch_required_json "$ANNEX_CONVENTIONAL")
+if [ "$GOT" = '["repo-lint-local"]' ]; then
+  pass "empty-required branch: annex present (probe-confirmed) -> scopes REQUIRED_JSON to it alone (#655 round 1)"
+else
+  fail "empty-required branch (annex present): expected [\"repo-lint-local\"], got $GOT"
+fi
+
+GOT=$(empty_branch_required_json "$ANNEX_NONE")
+if [ "$GOT" = '[]' ]; then
+  pass "empty-required branch: no annex -> unchanged (empty required, no enforcement)"
+else
+  fail "empty-required branch (no annex): expected [], got $GOT"
+fi
+
+# ── 3. Inline logic: MISSING injection (#655 round 2 P2 — annex workflow
+#      never started / was skipped for this PR).
+ROLLUP_NO_ANNEX_ENTRY='{"statusCheckRollup":[{"name":"lint","conclusion":"SUCCESS"}]}'
+GOT=$(inject_missing "$ROLLUP_NO_ANNEX_ENTRY" "$ANNEX_CONVENTIONAL" | jq -c '.statusCheckRollup | map(.name) | sort')
 if [ "$GOT" = '["lint","repo-lint-local"]' ]; then
-  pass "already-required (a future branch-protection addition) -> no duplicate entry"
+  pass "MISSING injection: an annex check absent from the rollup gets a synthetic entry"
 else
-  fail "already-required: expected no duplicate, got $GOT"
+  fail "MISSING injection: expected [lint, repo-lint-local], got $GOT"
 fi
 
-# ── 2b. Inline logic: the EMPTY-required-list branch (#655 Codex P1 r1). A
-#      repo whose branch protection has NO required checks configured (404,
-#      e.g. ruleset-only branch protection with no classic
-#      required_status_checks resource) previously wiped the rollup to
-#      empty unconditionally -- silently hiding repo-lint-local too.
-GOT=$(empty_branch_required_json "$ROLLUP_WITH_LOCAL")
+ROLLUP_ANNEX_ALREADY_REPORTED='{"statusCheckRollup":[{"name":"lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","conclusion":"SUCCESS"}]}'
+GOT=$(inject_missing "$ROLLUP_ANNEX_ALREADY_REPORTED" "$ANNEX_CONVENTIONAL" | jq -c '.statusCheckRollup | length')
+if [ "$GOT" = "2" ]; then
+  pass "MISSING injection: an annex check already in the rollup is not duplicated"
+else
+  fail "MISSING injection: expected 2 rollup entries (no duplicate), got $GOT"
+fi
+
+GOT=$(inject_missing "$ROLLUP_NO_ANNEX_ENTRY" "$ANNEX_NONE" | jq -c .)
+if [ "$GOT" = "$ROLLUP_NO_ANNEX_ENTRY" ]; then
+  pass "MISSING injection: no annex -> the rollup is untouched (no consumer regression)"
+else
+  fail "MISSING injection: no-annex case should be a no-op, got $GOT"
+fi
+
+# ── 4. End-to-end BAD_CHECKS: every #655 scenario in one pass.
+ROLLUP_RED_ANNEX='{"statusCheckRollup":[{"name":"lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","conclusion":"FAILURE"}]}'
+AUGMENTED=$(merge_required 'lint' "$ANNEX_CONVENTIONAL")
+GOT=$(bad_checks "$ROLLUP_RED_ANNEX" "$AUGMENTED" | jq -c '[.[].label]')
 if [ "$GOT" = '["repo-lint-local"]' ]; then
-  pass "empty required-list branch: annex present -> scopes REQUIRED_JSON to repo-lint-local alone (#655)"
+  pass "end-to-end: a red conventional-named annex check blocks (round 1)"
 else
-  fail "empty required-list branch: annex present expected [\"repo-lint-local\"], got $GOT"
+  fail "end-to-end (red conventional): expected [\"repo-lint-local\"], got $GOT"
 fi
 
-GOT=$(empty_branch_required_json "$ROLLUP_NO_LOCAL")
+ROLLUP_RED_RENAMED='{"statusCheckRollup":[{"name":"lint","conclusion":"SUCCESS"},{"name":"my-custom-checks","conclusion":"FAILURE"}]}'
+AUGMENTED_RENAMED=$(merge_required 'lint' "$ANNEX_RENAMED")
+GOT=$(bad_checks "$ROLLUP_RED_RENAMED" "$AUGMENTED_RENAMED" | jq -c '[.[].label]')
+if [ "$GOT" = '["my-custom-checks"]' ]; then
+  pass "end-to-end: a red RENAMED annex check blocks too (round 2 P2 — no longer invisible to a hard-coded name match)"
+else
+  fail "end-to-end (red renamed): expected [\"my-custom-checks\"], got $GOT"
+fi
+
+MISSING_INJECTED=$(inject_missing "$ROLLUP_NO_ANNEX_ENTRY" "$ANNEX_CONVENTIONAL")
+GOT=$(bad_checks "$MISSING_INJECTED" "$AUGMENTED" | jq -c '[.[] | select(.label=="repo-lint-local") | .result]')
+if [ "$GOT" = '["MISSING"]' ]; then
+  pass "end-to-end: an annex check that never started blocks as MISSING, not silently passing (round 2 P2)"
+else
+  fail "end-to-end (missing annex): expected [\"MISSING\"], got $GOT"
+fi
+
+ROLLUP_SKIPPED_ANNEX='{"statusCheckRollup":[{"name":"lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","conclusion":"SKIPPED"}]}'
+GOT=$(bad_checks "$ROLLUP_SKIPPED_ANNEX" "$AUGMENTED" | jq -c '[.[].label]')
 if [ "$GOT" = '[]' ]; then
-  pass "empty required-list branch: annex absent -> unchanged (empty required, no enforcement)"
+  pass "end-to-end: a SKIPPED annex check (job-level conditional) does not block, consistent with SUCCESS/SKIPPED/NEUTRAL elsewhere"
 else
-  fail "empty required-list branch: annex absent expected [], got $GOT"
+  fail "end-to-end (skipped annex): expected [] (non-blocking), got $GOT"
 fi
 
-# End-to-end: in the empty-required-list branch, a red repo-lint-local now
-# blocks (via the scoped required list) while a red lint (not required by
-# THIS repo's protection) does not -- the inverse of the non-empty branch's
-# default, matching "no OTHER check is required" plus the #655 force-include.
-GOT=$(bad_checks "$ROLLUP_WITH_LOCAL" '["repo-lint-local"]' | jq -c '[.[].label]')
-if [ "$GOT" = '["repo-lint-local"]' ]; then
-  pass "empty required-list branch end-to-end: only repo-lint-local blocks, lint (unrequired here) does not"
-else
-  fail "empty required-list branch end-to-end: expected [\"repo-lint-local\"], got $GOT"
-fi
-
-# ── 3. End-to-end BAD_CHECKS filter: a red repo-lint-local now surfaces as a
-#      bad check even though it is absent from the required list, mirroring
-#      the exact filter shape codex-review-check.sh applies after
-#      augmentation (workflow/Label Gate exclusion, required-names scoping,
-#      non-green selection).
-AUGMENTED=$(augment '["lint"]' "$ROLLUP_WITH_LOCAL")
-GOT=$(bad_checks "$ROLLUP_WITH_LOCAL" "$AUGMENTED" | jq -c '[.[].label]')
-if [ "$GOT" = '["repo-lint-local"]' ]; then
-  pass "a red repo-lint-local surfaces in BAD_CHECKS once force-included (gate (a) now blocks on it)"
-else
-  fail "expected BAD_CHECKS=[\"repo-lint-local\"], got $GOT"
-fi
-
-# Pre-fix regression guard: WITHOUT the augmentation (required list stays
-# just branch protection's own list), the same red repo-lint-local is
-# invisible to the filter — this is the #655 bug this PR fixes.
-GOT=$(bad_checks "$ROLLUP_WITH_LOCAL" '["lint"]' | jq -c '[.[].label]')
+# Pre-round-1-fix regression guard: without any annex awareness at all, a
+# red conventional-named annex check was invisible to the filter.
+GOT=$(bad_checks "$ROLLUP_RED_ANNEX" '["lint"]' | jq -c '[.[].label]')
 if [ "$GOT" = '[]' ]; then
-  pass "confirms the #655 bug shape: without force-include, a red repo-lint-local is invisible to BAD_CHECKS"
+  pass "confirms the pre-#655 bug shape: without annex awareness, a red repo-lint-local is invisible to BAD_CHECKS"
 else
-  fail "expected the unaugmented filter to reproduce the #655 miss ([]), got $GOT"
+  fail "expected the unaugmented filter to reproduce the pre-#655 miss ([]), got $GOT"
 fi
 
 echo ""

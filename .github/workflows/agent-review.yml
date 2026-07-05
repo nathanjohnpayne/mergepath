@@ -1051,11 +1051,20 @@ jobs:
                 status=$(printf '%s' "$run" | jq -r '.status')
                 conclusion=$(printf '%s' "$run" | jq -r '.conclusion // ""')
                 if [ "$status" = "completed" ]; then
-                  if [ "$conclusion" != "success" ]; then
+                  # success/skipped/neutral are all non-blocking conclusions
+                  # (#655 Codex P2 round 2): a conditional annex job GitHub
+                  # completes as skipped is not a failure, and neutral is a
+                  # passing conclusion for required checks too. Mirrors the
+                  # same acceptance set codex-review-check.sh's BAD_CHECKS
+                  # filter already uses; this loop only checked `lint`
+                  # before #655, which never legitimately skips, so the
+                  # stricter exact-success check never mattered until the
+                  # annex checks (which can be conditional) joined the list.
+                  if [ "$conclusion" != "success" ] && [ "$conclusion" != "skipped" ] && [ "$conclusion" != "neutral" ]; then
                     echo "::error::Required check run '$check' failed on current HEAD $sha (conclusion=${conclusion:-none}); refusing auto-merge."
                     exit 1
                   fi
-                  echo "Required check run '$check' is successful on current HEAD $sha."
+                  echo "Required check run '$check' is $conclusion on current HEAD $sha."
                   continue
                 fi
                 echo "::notice::Required check run '$check' is $status on current HEAD $sha; waiting for completion."

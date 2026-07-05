@@ -66,6 +66,13 @@ assert_grep "agent-review: derives the annex job name(s) from its YAML rather th
 assert_grep "agent-review: falls back to the conventional name only when no job names parse" \
   "$W/agent-review.yml" 'no job names could be parsed from it'
 
+# Codex P2 (#655 round 2): success/skipped/neutral are all non-blocking
+# conclusions for a required check (matching codex-review-check.sh's own
+# BAD_CHECKS acceptance set) -- a conditional annex job GitHub completes as
+# skipped must not time out or abort native auto-merge.
+assert_grep "agent-review: accepts skipped and neutral annex-job conclusions, not just success" \
+  "$W/agent-review.yml" '[ "$conclusion" != "success" ] && [ "$conclusion" != "skipped" ] && [ "$conclusion" != "neutral" ]'
+
 # auto-clear-blocking-labels.yml: the workflow_run trigger list observes the
 # annex's completion too (verified against a live consumer's repo_lint_local.yml
 # workflow name, per #655).

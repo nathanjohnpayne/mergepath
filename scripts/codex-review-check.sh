@@ -623,6 +623,56 @@ log "gate (a): checking CI state"
 ROLLUP_JSON=$(with_gh_retry gh pr view "$PR_NUMBER" --repo "$REPO" --json statusCheckRollup) \
   || die 3 "failed to fetch statusCheckRollup (see stderr above for retry diagnostics)"
 
+# #655 (Codex P2 round 2): a consumer's repo_lint_local.yml annex's check
+# name may not be "repo-lint-local" (check_ci_scripts_wired's annex contract
+# does not require that literal), and if the annex workflow has not yet
+# started for this PR (a job/path conditional the PR happens to skip, or
+# simply not run yet), it never appears in ROLLUP_JSON at all -- a
+# rollup-presence-only check can neither find a custom-named check nor
+# notice a required annex check that is silently missing. Proactively probe
+# the annex file at the PR HEAD (mirrors agent-review.yml's #655 probe) and
+# derive its job name(s) so both gaps close uniformly in every branch below,
+# rather than only when the check happens to already be sitting in the
+# rollup under the literal name "repo-lint-local".
+HEAD_SHA_FOR_ANNEX=$(echo "$PR_JSON" | jq -r '.head.sha')
+ANNEX_CHECK_NAMES_JSON='[]'
+if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
+  annex_probe_err=$(mktemp)
+  if annex_content=$(gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$HEAD_SHA_FOR_ANNEX" --jq .content 2>"$annex_probe_err"); then
+    # Derive the actual job name(s) (a job's `name:` override if set, else
+    # its job id) rather than assuming the filename convention -- same
+    # ruby-yaml technique as agent-review.yml's #655 probe and
+    # check_ci_scripts_wired's existing `on:` trigger parser.
+    annex_job_names=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ruby -ryaml -e '
+      begin
+        doc = YAML.safe_load(STDIN.read, aliases: false)
+      rescue Psych::Exception
+        exit
+      end
+      exit unless doc.is_a?(Hash) && doc["jobs"].is_a?(Hash)
+      doc["jobs"].each do |id, job|
+        name = (job.is_a?(Hash) && job["name"]) ? job["name"] : id
+        puts name.to_s
+      end
+    ' 2>/dev/null || true)
+    if [ -n "$annex_job_names" ]; then
+      ANNEX_CHECK_NAMES_JSON=$(printf '%s' "$annex_job_names" | jq -R . | jq -s .)
+      log "gate (a): repo_lint_local.yml annex present at $HEAD_SHA_FOR_ANNEX (#655) — check run(s): $(printf '%s' "$annex_job_names" | tr '\n' ' ')"
+    else
+      log "gate (a): repo_lint_local.yml annex present at $HEAD_SHA_FOR_ANNEX but no job names could be parsed from it — falling back to the conventional repo-lint-local check name (#655)."
+      ANNEX_CHECK_NAMES_JSON='["repo-lint-local"]'
+    fi
+  elif grep -q 'HTTP 404' "$annex_probe_err"; then
+    : # genuinely absent (confirmed 404) — no annex, ANNEX_CHECK_NAMES_JSON stays [].
+  else
+    # Fail closed: an indeterminate read (token scope, rate limit,
+    # transient error) must not be treated the same as a confirmed absence.
+    log "gate (a): WARNING — could not determine whether repo_lint_local.yml exists at $HEAD_SHA_FOR_ANNEX (API error, not a confirmed 404) — failing closed by also requiring the conventional repo-lint-local check name (#655)."
+    ANNEX_CHECK_NAMES_JSON='["repo-lint-local"]'
+  fi
+  rm -f "$annex_probe_err"
+fi
+
 # statusCheckRollup mixes two entry types:
 #   - CheckRun (GitHub Actions jobs): uses .name, .workflowName,
 #     .status, .conclusion (SUCCESS/SKIPPED/FAILURE/NEUTRAL/CANCELLED/
@@ -686,45 +736,57 @@ if [ "$protection_readable" -eq 0 ]; then
 elif [ -z "$REQUIRED_CHECK_NAMES" ]; then
   # Read succeeded; branch protection lists NO required checks (404 or empty
   # contexts). Nothing to enforce for any OTHER check — gate (a) imposes no
-  # required-check filter beyond the #655 repo-lint-local force-include
-  # below (the other gates still run).
+  # required-check filter beyond the #655 annex force-include below (the
+  # other gates still run).
   #
-  # #655 (Codex P1): this branch used to wipe ROLLUP_JSON to empty
-  # unconditionally, which also hid a red repo-lint-local. That matters
-  # here specifically: a repo whose branch protection is ruleset-only (no
+  # #655 (Codex P1 round 1): this branch used to wipe ROLLUP_JSON to empty
+  # unconditionally, which also hid the annex. That matters here
+  # specifically: a repo whose branch protection is ruleset-only (no
   # classic required_status_checks resource) hits this 404 branch on every
-  # PR, so unconditionally wiping the rollup would have left gate (a) never
-  # observing repo-lint-local on such a repo, even after the else-branch
-  # fix above. Keep the full rollup and scope REQUIRED_JSON to
-  # repo-lint-local alone when the rollup reports it, so it is still
+  # PR. Keep the full rollup and scope REQUIRED_JSON to the annex's derived
+  # check name(s) alone when the annex is present (per the probe above, not
+  # merely "already sitting in the rollup" — #655 round 2), so it is still
   # force-checked; otherwise preserve the prior no-enforcement behavior.
-  if echo "$ROLLUP_JSON" | jq -e '[.statusCheckRollup[]? | (.name // .context // "")] | index("repo-lint-local")' >/dev/null 2>&1; then
-    log "gate (a): branch protection for $BASE_BRANCH lists no required checks, but the rollup reports repo-lint-local (#655) — force-checking it alone."
-    REQUIRED_JSON='["repo-lint-local"]'
+  if [ "$(echo "$ANNEX_CHECK_NAMES_JSON" | jq 'length')" -gt 0 ]; then
+    log "gate (a): branch protection for $BASE_BRANCH lists no required checks, but the repo_lint_local.yml annex is present (#655) — force-checking its check run(s) alone."
+    REQUIRED_JSON="$ANNEX_CHECK_NAMES_JSON"
   else
     log "gate (a): branch protection for $BASE_BRANCH lists no required checks; gate (a) imposes no required-check filter."
     ROLLUP_JSON='{"statusCheckRollup":[]}'
     REQUIRED_JSON='[]'
   fi
 else
-  # Build a jq array of required check names, then force-include
-  # `repo-lint-local` (#655) whenever the rollup actually reports it,
-  # regardless of whether branch protection lists it. The consumer-local
-  # repo_lint_local.yml annex (#601) is per-consumer and never propagated,
-  # so there is no canonical PR that could add its check run to branch
-  # protection fleet-wide. Without this, a consumer that migrated local
-  # checks into the annex has them silently excluded from gate (a): a red
-  # repo-lint-local would not block the needs-external-review label-clear
-  # (auto-clear-blocking-labels.yml, which evaluates this same gate) or an
-  # agent's manual merge-gate check. Absent from the rollup (no annex,
-  # including mergepath itself) is a no-op — unchanged from before.
-  REQUIRED_JSON=$(echo "$REQUIRED_CHECK_NAMES" | jq -R . | jq -s . | jq --argjson rollup "$ROLLUP_JSON" '
-    if ([$rollup.statusCheckRollup[]? | (.name // .context // "")] | index("repo-lint-local")) != null
-    then . + ["repo-lint-local"] | unique
-    else .
-    end
-  ')
+  # Build a jq array of required check names, then force-include the
+  # annex's derived check name(s) (#655) whenever the annex is present (per
+  # the probe above), regardless of whether branch protection lists them.
+  # The consumer-local repo_lint_local.yml annex (#601) is per-consumer and
+  # never propagated, so there is no canonical PR that could add its check
+  # run to branch protection fleet-wide. Without this, a consumer that
+  # migrated local checks into the annex has them silently excluded from
+  # gate (a): a red or missing annex check would not block the
+  # needs-external-review label-clear (auto-clear-blocking-labels.yml,
+  # which evaluates this same gate) or an agent's manual merge-gate check.
+  # No annex (including mergepath itself) is a no-op — unchanged from before.
+  REQUIRED_JSON=$(echo "$REQUIRED_CHECK_NAMES" | jq -R . | jq -s . | jq --argjson annex "$ANNEX_CHECK_NAMES_JSON" '. + $annex | unique')
 fi
+
+# #655 (Codex P2 round 2): if the annex is confirmed present (per the probe
+# above) but one of its derived check names has not reported into the
+# rollup at all — the workflow has not started yet, or a path/job-level
+# conditional skips it for this PR's diff — it is invisible to the
+# BAD_CHECKS filter below purely because there is no rollup entry to
+# evaluate, so gate (a) would clear as if the check did not exist. Inject a
+# synthetic MISSING entry for each such name so "required but absent" is
+# treated as non-green (blocking) rather than indistinguishable from "not
+# required at all". A no-op when the annex is absent (ANNEX_CHECK_NAMES_JSON
+# is `[]`) or every derived name already has a rollup entry.
+ROLLUP_JSON=$(echo "$ROLLUP_JSON" | jq --argjson annex "$ANNEX_CHECK_NAMES_JSON" '
+  (.statusCheckRollup // []) as $existing
+  | ($existing | map(.name // .context // "")) as $present
+  | .statusCheckRollup = ($existing + [
+      $annex[] | select(. as $n | ($present | index($n)) == null) | { name: ., conclusion: "MISSING" }
+    ])
+')
 
 BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq --argjson required_names "${REQUIRED_JSON:-[]}" '
   [.statusCheckRollup[]
