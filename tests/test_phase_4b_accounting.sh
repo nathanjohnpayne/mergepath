@@ -649,6 +649,30 @@ else fail "filed_issues_from_refs position preservation: $fi_out"; fi
 fi_out="$(p4b_acct_filed_issues_from_refs "" "$FILE3")"
 [ "$fi_out" = "[]" ] && pass "filed_issues_from_refs with no refs → [] (#675)" || fail "filed_issues_from_refs empty: $fi_out"
 
+# advisory_issues_filed captures EVERY filed issue even when duplicate findings
+# collapse (#675 Codex round 2): two identical-tuple findings can get two
+# DIFFERENT filed refs (a search-lag duplicate in p4b_file_post_review_issues);
+# the tuple-keyed filed map keeps only the last ref on the single collapsed
+# unique finding, so compute_totals unions the unique-finding issues with the
+# raw filed list to record both — matching the review prose.
+DUP_LOOP='[{"loop":1,"reviewer":"nathanpayne-codex","adapter":"a","direction":"claude->codex","elapsed_seconds":null,"tokens":{"total":null,"input":null,"output":null,"cache_creation":null,"cache_read":null,"reasoning":null,"cost_usd":null,"source":"unavailable"},"fail_closed":{"happened":false,"reason":null,"duration_seconds":null}}]'
+DUP_FILED='[{"severity":"P2","path":"x.js","line":2,"body":"dup","issue":901},{"severity":"P2","path":"x.js","line":2,"body":"dup","issue":902}]'
+UF_DUP="$(printf '%s\n%s\n' \
+  '{"loop":1,"severity":"P2","path":"x.js","line":2,"body":"dup"}' \
+  '{"loop":1,"severity":"P2","path":"x.js","line":2,"body":"dup"}' \
+  | p4b_acct_unique_findings '' "$DUP_FILED")"
+tt_dup="$(p4b_acct_compute_totals "$DUP_LOOP" "" "null" "$UF_DUP" "$DUP_FILED")"
+if printf '%s' "$UF_DUP" | jq -e 'length == 1' >/dev/null \
+   && printf '%s' "$tt_dup" | jq -e '.advisory_issues_filed == [901,902]' >/dev/null; then
+  pass "advisory_issues_filed unions the filed list so duplicate-collapsed findings keep every filed ref (#675 Codex round 2)"
+else fail "dup-collapse advisory union: uf=$UF_DUP tt=$tt_dup"; fi
+# Without a filed list, advisory_issues_filed still derives from the unique
+# findings (the F-id-map / golden path is unchanged).
+tt_nofiled="$(p4b_acct_compute_totals "$DUP_LOOP" "" "null" '[{"id":"F1","issue":701},{"id":"F2","issue":702}]')"
+if printf '%s' "$tt_nofiled" | jq -e '.advisory_issues_filed == [701,702]' >/dev/null; then
+  pass "advisory_issues_filed without a filed list derives from the unique findings (unchanged) (#675)"
+else fail "no-filed advisory derivation: $tt_nofiled"; fi
+
 # ===========================================================================
 echo "accounting.sh — notional-cost math (versioned price table)"
 # ===========================================================================

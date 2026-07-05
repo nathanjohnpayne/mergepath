@@ -617,7 +617,7 @@ p4b_acct_running_totals_for_post() {
 
 # --- per-approval totals ---------------------------------------------------
 
-# p4b_acct_compute_totals <loops-json-array> <price_table_version> <notional_usd|null> [unique-findings-json]
+# p4b_acct_compute_totals <loops-json-array> <price_table_version> <notional_usd|null> [unique-findings-json] [filed-issues-json]
 # Compute the per-approval `totals` object from the loop array. Token/elapsed
 # totals sum only the loops that exposed a value; when NO loop exposed one the
 # total is null (explicitly unavailable, never a fabricated 0). notional_usd
@@ -627,9 +627,14 @@ p4b_acct_running_totals_for_post() {
 # every loop with measured usage also reported a cost — a token-bearing loop
 # without one would make the sum a silent underreport (never a partial
 # figure); loops with nothing measured contribute nothing and do not block.
-# advisory_issues_filed is derived from the unique-finding issue links.
+# advisory_issues_filed is the union of the unique-finding issue links AND the
+# optional raw filed-issues list ([filed-issues-json], P4B_ACCT_FILED_ISSUES_JSON)
+# — so EVERY issue actually filed is recorded even when duplicate (identical
+# severity/path/line/body) findings collapse to one unique_findings entry whose
+# single per-finding issue holds only one of the refs (#675 Codex round 2).
 p4b_acct_compute_totals() {
-  local loops_json="$1" ptv="$2" notional="$3" uf_json="${4:-[]}"
+  local loops_json="$1" ptv="$2" notional="$3" uf_json="${4:-[]}" filed_json="${5:-[]}"
+  [ -n "$filed_json" ] || filed_json='[]'
   local ptv_json notional_json
   if [ -n "$ptv" ]; then
     ptv_json="$(jq -nc --arg v "$ptv" '$v' 2>/dev/null)" || return 1
@@ -644,7 +649,8 @@ p4b_acct_compute_totals() {
   printf '%s' "$loops_json" | jq -c \
     --argjson ptv "$ptv_json" \
     --argjson notional "$notional_json" \
-    --argjson uf "$uf_json" '
+    --argjson uf "$uf_json" \
+    --argjson filed "$filed_json" '
     {
       adapter_invocations: length,
       tokens_total: ([ .[] | .tokens.total // empty ]
@@ -675,7 +681,8 @@ p4b_acct_compute_totals() {
       ),
       price_table_version: $ptv,
       fail_closed_events: ([ .[] | select(.fail_closed.happened == true) ] | length),
-      advisory_issues_filed: ([ $uf[] | .issue | select(. != null) ] | unique)
+      advisory_issues_filed: (([ $uf[] | .issue ] + [ $filed[] | .issue ])
+                              | map(select(. != null)) | unique)
     }' 2>/dev/null
 }
 
@@ -2033,7 +2040,7 @@ p4b_acct_hook_render_approval_block() {
   if ! notional="$(p4b_acct_notional_for_loops "$loops")"; then
     notional="null"
   fi
-  totals="$(p4b_acct_compute_totals "$loops" "$ptv" "$notional" "$uf")" || return 1
+  totals="$(p4b_acct_compute_totals "$loops" "$ptv" "$notional" "$uf" "${P4B_ACCT_FILED_ISSUES_JSON:-[]}")" || return 1
   [ -n "$totals" ] || return 1
   # GitHub-derived prior records are fetched here (#615 Codex round 2) so
   # the rendered totals are repo-wide by default, not local-ledger-only.
