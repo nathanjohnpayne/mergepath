@@ -27,10 +27,12 @@ name: Merge Clearance Gate
 #
 # Re-runs on every push to a PR AND on review-related events, so a
 # dismissed approval (rebase push), a fresh reviewer approval, or a Codex
-# clearance flips the check without manual intervention. It also re-runs on
-# the propagation lane's head-pinned verified-head marker (an issue comment)
-# so a verified sync PR clears promptly instead of waiting for the sweep
-# (#658 — see the issue_comment trigger + marker-retrigger job below).
+# clearance flips the check without manual intervention. It also re-runs when
+# the propagation lane verifies a sync PR's head — the lane sends a
+# repository_dispatch right after posting its marker, since the GITHUB_TOKEN
+# marker comment itself creates no workflow run — so a verified sync PR clears
+# promptly instead of waiting for the sweep (#658 — see the repository_dispatch
+# trigger + dispatch-recheck job below).
 #
 # Trigger shape note: identical to codex-p1-gate.yml. GitHub Actions does
 # NOT support pull_request_review_thread as a workflow trigger, so we
@@ -54,20 +56,22 @@ on:
   pull_request_review_comment:
     types: [created, edited, deleted]
   # #658: the propagation lane posts its head-pinned verified-head marker as
-  # an ISSUE comment (github-actions[bot]-authored). That fires no
-  # pull_request / review event, so after #657 stopped the label add/remove
-  # dance there was nothing to re-run this gate when the marker landed, and a
+  # a github-actions[bot] ISSUE comment. After #657 stopped the label
+  # add/remove dance, nothing re-ran this gate when the marker landed, and a
   # verified sync PR sat on a fail-closed spurious-red Merge clearance gate
-  # until the */15 sweep. Re-run on the marker comment so the gate
-  # re-evaluates promptly. The marker's TRUST is unchanged — it is trusted
-  # only because it is github-actions[bot]-authored and head-pinned, verified
-  # in scripts/merge-clearance-gate.sh lane_verified(); this trigger only
-  # schedules a re-evaluation, it never asserts clearance. The marker-retrigger
-  # job below is guarded to the marker so an ordinary PR comment never spins up
-  # a run, and (like the sweep, not the native-check job) it POSTs a check_run
-  # to the PR head — an issue_comment run has no PR-head commit association.
-  issue_comment:
-    types: [created]
+  # until the */15 sweep. An issue_comment trigger cannot fix this: the marker
+  # is posted with the workflow's GITHUB_TOKEN, and GITHUB_TOKEN-authored
+  # events create NO workflow runs (the #315/#324 lesson) — so an issue_comment
+  # trigger would never fire for the marker. Instead pr-review-policy.yml's
+  # lane, right after posting a fresh marker, sends a repository_dispatch (PAT-
+  # driven, best-effort) that DOES create a run. The dispatch only SCHEDULES a
+  # re-evaluation — the dispatch-recheck job below re-derives clearance from the
+  # (head-pinned, github-actions[bot]) marker via lane_verified(), never trusts
+  # the dispatch payload for clearance, and POSTs a check_run to the PR head
+  # (like the sweep — a repository_dispatch run has no PR-head association).
+  # Keep the event type `merge-clearance-recheck` in sync with the lane.
+  repository_dispatch:
+    types: [merge-clearance-recheck]
   # Periodic sweep — the only backstop for transitions that fire no
   # Actions event (👍 reaction, UI label resolve, GITHUB_TOKEN relabel).
   # 15-min cadence mirrors codex-p1-gate.yml.
@@ -76,7 +80,7 @@ on:
 
 # Least-privilege default for the whole workflow: read-only. `checks: write`
 # is granted ONLY to the jobs that POST check_runs (the scheduled-sweep and
-# the #658 marker-retrigger job); the event-driven job produces its check
+# the #658 dispatch-recheck job); the event-driven job produces its check
 # natively and needs no write scope (CodeRabbit ⚠️ on PR #429).
 #
 # `issues: read` is required (Codex P2 on PR #429): the gate reads
@@ -96,14 +100,14 @@ jobs:
     name: Merge clearance gate
     runs-on: ubuntu-latest
     # Event-driven path (native check on the PR head). The scheduled sweep
-    # and the #658 marker-retrigger job run the same gate via the Checks API;
+    # and the #658 dispatch-recheck job run the same gate via the Checks API;
     # gating this job to the PR/review events avoids paying for an empty
-    # no-op run AND keeps its native check correct — an issue_comment run has
-    # no PR-head commit association, so that path is handled by
-    # marker-retrigger (Checks API POST), never here.
+    # no-op run AND keeps its native check correct — a repository_dispatch run
+    # has no PR-head commit association, so that path is handled by
+    # dispatch-recheck (Checks API POST), never here.
     if: >-
       github.event_name != 'schedule'
-      && github.event_name != 'issue_comment'
+      && github.event_name != 'repository_dispatch'
     steps:
       - name: Checkout repo (default branch — trusted gate scripts)
         # Pin to the default branch, NOT the PR HEAD. This is a REQUIRED
@@ -323,26 +327,23 @@ jobs:
             exit 1
           fi
 
-  marker-retrigger:
-    name: Merge clearance marker re-evaluation
-    # #658: re-evaluate promptly when the propagation lane posts its
-    # head-pinned verified-head marker as an issue comment — that comment
-    # fires no pull_request / review event, so without this the gate rides
-    # its pre-marker (fail-closed spurious-red) state until the */15 sweep.
-    # Guarded to the TRUSTED marker ONLY: a github-actions[bot] author + the
-    # head-pinned `mergepath-propagation-lane verified-head=` marker body, on
-    # a PR (the issue carries a pull_request). This job guard is a cheap
-    # pre-filter, NOT a trust decision: scripts/merge-clearance-gate.sh
-    # lane_verified() still re-derives clearance and pins the exemption to the
-    # CURRENT head, so a stale-head or spoofed marker never clears here. Label
-    # events are NOT a trigger (they are not head-pinned proof — #429 round-3
-    # P1); the marker prefix match cannot be forged by a PR author (a PR author
-    # cannot post as github-actions[bot]).
-    if: >-
-      github.event_name == 'issue_comment'
-      && github.event.issue.pull_request != null
-      && github.event.comment.user.login == 'github-actions[bot]'
-      && contains(github.event.comment.body, 'mergepath-propagation-lane verified-head=')
+  dispatch-recheck:
+    name: Merge clearance dispatch re-evaluation
+    # #658: re-evaluate promptly when the propagation lane sends a
+    # `merge-clearance-recheck` repository_dispatch right after posting its
+    # head-pinned verified-head marker. The marker itself is a GITHUB_TOKEN
+    # issue comment, which creates no workflow run — so the lane nudges the
+    # gate with a PAT-driven dispatch instead (best-effort; if it never
+    # arrives, the */15 sweep still recovers the gate). This job does NOT
+    # trust the dispatch for clearance: it only re-runs
+    # scripts/merge-clearance-gate.sh, which re-derives clearance from the
+    # (head-pinned, github-actions[bot]) marker via lane_verified() on the
+    # CURRENT head, then POSTs the honest result. A dispatch with any pr
+    # payload can therefore only trigger an honest re-evaluation — never force
+    # a pass — so no guard on the payload is needed beyond validating it is a
+    # PR number. Label events are still not a trigger (not head-pinned proof —
+    # #429 round-3 P1).
+    if: github.event_name == 'repository_dispatch'
     runs-on: ubuntu-latest
     # checks:write to POST the check_run (same as the sweep). issues:read for
     # the gate script's /issues/{pr}/comments marker read + the delegated
@@ -363,13 +364,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Re-evaluate gate for the marked PR and post check_run
+      - name: Re-evaluate gate for the dispatched PR and post check_run
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # issue_comment has no github.event.pull_request; the PR number is
-          # the issue number (the job `if:` already required issue.pull_request
-          # so the issue IS a PR).
-          PR: ${{ github.event.issue.number }}
+          # The PR number the lane put in the dispatch payload. Passed via env
+          # (not interpolated into the script) and validated as a positive
+          # integer below, so an arbitrary client_payload cannot inject shell.
+          PR: ${{ github.event.client_payload.pr }}
           REPO: ${{ github.repository }}
           # Check name MUST match the event-driven job name above AND the
           # sweep CHECK_NAME so branch protection resolves every source as the
@@ -379,9 +380,18 @@ jobs:
           CHECK_NAME: "Merge clearance gate"
         run: |
           set -euo pipefail
+          # Validate the dispatched PR number before it reaches any API call —
+          # the payload is attacker-influenceable (anyone with repo write can
+          # dispatch), so reject anything that is not a bare positive integer.
+          case "$PR" in
+            ''|*[!0-9]*)
+              echo "::error::repository_dispatch client_payload.pr is not a positive integer: '$PR'"
+              exit 1
+              ;;
+          esac
           # Resolve the PR head SHA — the check_run must pin to it (required
-          # checks key on (head_sha, name)). An issue_comment run checks out
-          # the default branch and has NO PR-head commit association, so a
+          # checks key on (head_sha, name)). A repository_dispatch run checks
+          # out the default branch and has NO PR-head commit association, so a
           # native job check would attach to the default-branch commit and
           # never refresh the PR's required check; POST explicitly to the head
           # SHA like the scheduled sweep.
@@ -395,7 +405,7 @@ jobs:
           rc=$?
           set -e
           echo "$output"
-          check_title="Merge clearance gate (propagation-lane marker re-evaluation)"
+          check_title="Merge clearance gate (propagation-lane dispatch re-evaluation)"
           case "$rc" in
             0) conclusion="success" ;;
             1) conclusion="failure" ;;

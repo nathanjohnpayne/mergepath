@@ -85,28 +85,30 @@ if [ -f "$WORKFLOW" ]; then
     FAILED=1
   fi
 
-  # #658: the propagation lane posts its head-pinned verified-head marker as
-  # an ISSUE comment, which fires no pull_request / review event. Require the
-  # issue_comment trigger so the gate re-evaluates promptly when the marker
-  # lands (instead of riding a fail-closed spurious-red until the */15 sweep),
-  # AND require the marker GUARD so the issue_comment path is scoped to the
-  # trusted marker only — a github-actions[bot] author + the head-pinned
-  # marker body, on a PR (issue.pull_request). The guard keeps an ordinary PR
-  # comment from spinning up a run and keeps the trust model narrow: the real
-  # head-pinned verification stays in scripts/merge-clearance-gate.sh
-  # lane_verified(). Label events are never a trigger here (#429 round-3 P1).
-  if ! grep -qE "^[[:space:]]*issue_comment:" "$WORKFLOW"; then
-    echo "FAIL: $WORKFLOW missing the issue_comment trigger."
-    echo "      The propagation-lane verified-head marker is an issue comment; without this trigger a verified sync PR rides a fail-closed spurious-red gate until the scheduled sweep (#658)."
+  # #658: the propagation lane's head-pinned verified-head marker is posted as
+  # a GITHUB_TOKEN github-actions[bot] ISSUE comment, and GITHUB_TOKEN-authored
+  # events create no workflow runs — so an issue_comment trigger could never
+  # re-run the gate for it. Instead pr-review-policy.yml's lane sends a
+  # `merge-clearance-recheck` repository_dispatch right after posting the
+  # marker. Require that trigger AND the dispatch-recheck wiring (the dispatch
+  # type + resolving the PR from github.event.client_payload.pr), so a verified
+  # sync PR clears promptly instead of riding a fail-closed spurious-red until
+  # the */15 sweep. No payload trust is added: the dispatch only schedules a
+  # re-run; the gate re-derives clearance from the head-pinned
+  # github-actions[bot] marker in scripts/merge-clearance-gate.sh
+  # lane_verified(). Keep the `merge-clearance-recheck` type in sync with the
+  # lane. Label events are never a trigger here (#429 round-3 P1).
+  if ! grep -qE "^[[:space:]]*repository_dispatch:" "$WORKFLOW"; then
+    echo "FAIL: $WORKFLOW missing the repository_dispatch trigger."
+    echo "      The propagation-lane verified-head marker is a GITHUB_TOKEN issue comment (creates no workflow run); without the merge-clearance-recheck repository_dispatch a verified sync PR rides a fail-closed spurious-red gate until the scheduled sweep (#658)."
     FAILED=1
   fi
-  marker_guard_missing=0
-  grep -qF "github.event.comment.user.login == 'github-actions[bot]'" "$WORKFLOW" || marker_guard_missing=1
-  grep -qF "contains(github.event.comment.body, 'mergepath-propagation-lane verified-head=')" "$WORKFLOW" || marker_guard_missing=1
-  grep -qF "github.event.issue.pull_request" "$WORKFLOW" || marker_guard_missing=1
-  if [ "$marker_guard_missing" -ne 0 ]; then
-    echo "FAIL: $WORKFLOW issue_comment path is not guarded to the trusted lane marker."
-    echo "      The job must gate on a github-actions[bot] comment author AND the head-pinned 'mergepath-propagation-lane verified-head=' marker body AND issue.pull_request (a PR comment), so an ordinary PR comment never triggers a run and the marker trust model is not widened (#658)."
+  dispatch_wiring_missing=0
+  grep -qF "merge-clearance-recheck" "$WORKFLOW" || dispatch_wiring_missing=1
+  grep -qF "github.event.client_payload.pr" "$WORKFLOW" || dispatch_wiring_missing=1
+  if [ "$dispatch_wiring_missing" -ne 0 ]; then
+    echo "FAIL: $WORKFLOW repository_dispatch path is not wired for the marker re-trigger."
+    echo "      It must accept the 'merge-clearance-recheck' dispatch type AND resolve the PR from github.event.client_payload.pr in a check_run-posting job (#658)."
     FAILED=1
   fi
 

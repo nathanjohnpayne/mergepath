@@ -721,9 +721,9 @@ echo; echo "--- Test 20: check_merge_clearance_gate job-name scope (#533)"
 CHECK_BIN="$ROOT/scripts/ci/check_merge_clearance_gate"
 
 # A minimal workflow that is otherwise shape-valid (all required triggers, a
-# schedule cron, AND the #658 issue_comment trigger + marker-guarded
-# marker-retrigger job) so ONLY the job-name assertion is under test. Each
-# Case appends the job under test after this header.
+# schedule cron, AND the #658 repository_dispatch trigger + dispatch-recheck
+# job) so ONLY the job-name assertion is under test. Each Case appends the job
+# under test after this header.
 write_wf_header() {
   cat <<'WF'
 name: Merge Clearance Gate
@@ -734,26 +734,24 @@ on:
     types: [submitted]
   pull_request_review_comment:
     types: [created]
-  issue_comment:
-    types: [created]
+  repository_dispatch:
+    types: [merge-clearance-recheck]
   schedule:
     - cron: "*/15 * * * *"
 permissions:
   contents: read
 jobs:
-  # #658 marker-retrigger job — present so this shape-valid header satisfies
-  # the check's issue_comment + marker-guard assertions; each Case appends the
-  # job under test after it.
-  marker-retrigger:
-    name: Merge clearance marker re-evaluation
-    if: >-
-      github.event_name == 'issue_comment'
-      && github.event.issue.pull_request != null
-      && github.event.comment.user.login == 'github-actions[bot]'
-      && contains(github.event.comment.body, 'mergepath-propagation-lane verified-head=')
+  # #658 dispatch-recheck job — present so this shape-valid header satisfies
+  # the check's repository_dispatch + dispatch-wiring assertions; each Case
+  # appends the job under test after it.
+  dispatch-recheck:
+    name: Merge clearance dispatch re-evaluation
+    if: github.event_name == 'repository_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - run: echo marker-retrigger
+      - env:
+          PR: ${{ github.event.client_payload.pr }}
+        run: echo "recheck $PR"
 WF
 }
 
@@ -835,19 +833,19 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 21 (#658): the check must require the issue_comment marker re-trigger
-# AND its trust guard. The propagation-lane verified-head marker arrives as an
-# issue comment (no pull_request / review event); without the trigger a
+# Test 21 (#658): the check must require the repository_dispatch marker
+# re-trigger + its dispatch wiring. The propagation-lane verified-head marker
+# is a GITHUB_TOKEN issue comment (creates no workflow run), so the lane sends
+# a merge-clearance-recheck repository_dispatch instead; without the trigger a
 # verified sync PR rides a fail-closed spurious-red gate until the */15 sweep.
-# The trigger must be guarded to the trusted marker only (github-actions[bot]
-# author + the head-pinned marker body on a PR) so an ordinary PR comment
-# never spins up a run and the trust model is not widened.
+# The dispatch-recheck job must accept the merge-clearance-recheck type AND
+# resolve the PR from github.event.client_payload.pr.
 # ---------------------------------------------------------------------------
-echo; echo "--- Test 21: check requires the issue_comment marker re-trigger + guard (#658)"
+echo; echo "--- Test 21: check requires the repository_dispatch marker re-trigger (#658)"
 
-# Case A (negative): issue_comment trigger absent → check FAILS.
-WF_NO_IC="$WORKDIR/wf-no-issue-comment.yml"
-cat > "$WF_NO_IC" <<'WF'
+# Case A (negative): repository_dispatch trigger absent → check FAILS.
+WF_NO_RD="$WORKDIR/wf-no-repo-dispatch.yml"
+cat > "$WF_NO_RD" <<'WF'
 name: Merge Clearance Gate
 on:
   pull_request:
@@ -869,20 +867,20 @@ jobs:
         run: echo ok
 WF
 set +e
-OUT=$(MERGE_CLEARANCE_WORKFLOW="$WF_NO_IC" "$CHECK_BIN" 2>&1)
+OUT=$(MERGE_CLEARANCE_WORKFLOW="$WF_NO_RD" "$CHECK_BIN" 2>&1)
 RC=$?
 set -e
-if [ "$RC" -ne 0 ] && echo "$OUT" | grep -q "missing the issue_comment trigger"; then
-  pass "workflow missing the issue_comment trigger → check FAILS (#658)"
+if [ "$RC" -ne 0 ] && echo "$OUT" | grep -q "missing the repository_dispatch trigger"; then
+  pass "workflow missing the repository_dispatch trigger → check FAILS (#658)"
 else
-  fail "expected check FAIL on missing issue_comment trigger (#658); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+  fail "expected check FAIL on missing repository_dispatch trigger (#658); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 
-# Case B (negative): issue_comment trigger present but the marker GUARD absent
-# (an unguarded issue_comment run spins up on every PR comment and widens the
-# trust surface) → check FAILS.
-WF_NO_GUARD="$WORKDIR/wf-no-marker-guard.yml"
-cat > "$WF_NO_GUARD" <<'WF'
+# Case B (negative): repository_dispatch present but the dispatch wiring absent
+# (no merge-clearance-recheck type / no client_payload.pr resolution) → the
+# re-trigger silently degrades to the sweep, so the check FAILS.
+WF_NO_WIRING="$WORKDIR/wf-no-dispatch-wiring.yml"
+cat > "$WF_NO_WIRING" <<'WF'
 name: Merge Clearance Gate
 on:
   pull_request:
@@ -891,19 +889,13 @@ on:
     types: [submitted]
   pull_request_review_comment:
     types: [created]
-  issue_comment:
-    types: [created]
+  repository_dispatch:
+    types: [some-other-event]
   schedule:
     - cron: "*/15 * * * *"
 permissions:
   contents: read
 jobs:
-  marker-retrigger:
-    name: Merge clearance marker re-evaluation
-    if: github.event_name == 'issue_comment'
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo unguarded
   merge-clearance-gate:
     name: Merge clearance gate
     runs-on: ubuntu-latest
@@ -912,19 +904,20 @@ jobs:
         run: echo ok
 WF
 set +e
-OUT=$(MERGE_CLEARANCE_WORKFLOW="$WF_NO_GUARD" "$CHECK_BIN" 2>&1)
+OUT=$(MERGE_CLEARANCE_WORKFLOW="$WF_NO_WIRING" "$CHECK_BIN" 2>&1)
 RC=$?
 set -e
-if [ "$RC" -ne 0 ] && echo "$OUT" | grep -q "not guarded to the trusted lane marker"; then
-  pass "issue_comment trigger without the marker guard → check FAILS (#658)"
+if [ "$RC" -ne 0 ] && echo "$OUT" | grep -q "not wired for the marker re-trigger"; then
+  pass "repository_dispatch without the merge-clearance-recheck wiring → check FAILS (#658)"
 else
-  fail "expected check FAIL on unguarded issue_comment (#658); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+  fail "expected check FAIL on unwired repository_dispatch (#658); got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 
-# Case C (positive): the canonical header (issue_comment trigger + marker
-# guard) plus a correctly-named job satisfies the #658 assertions — neither
-# the missing-trigger nor the unguarded-marker FAIL line is emitted.
-WF_IC_OK="$WORKDIR/wf-ic-ok.yml"
+# Case C (positive): the canonical header (repository_dispatch trigger +
+# merge-clearance-recheck type + client_payload.pr wiring) plus a correctly-
+# named job satisfies the #658 assertions — neither the missing-trigger nor the
+# unwired FAIL line is emitted.
+WF_RD_OK="$WORKDIR/wf-rd-ok.yml"
 {
   write_wf_header
   cat <<'WF'
@@ -935,16 +928,16 @@ WF_IC_OK="$WORKDIR/wf-ic-ok.yml"
       - name: Run gate
         run: echo ok
 WF
-} > "$WF_IC_OK"
+} > "$WF_RD_OK"
 set +e
-OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$WF_IC_OK" "$CHECK_BIN" 2>&1)
+OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$WF_RD_OK" "$CHECK_BIN" 2>&1)
 RC=$?
 set -e
-if ! echo "$OUT" | grep -q "missing the issue_comment trigger" \
-   && ! echo "$OUT" | grep -q "not guarded to the trusted lane marker"; then
-  pass "issue_comment trigger + marker guard present → #658 assertions pass"
+if ! echo "$OUT" | grep -q "missing the repository_dispatch trigger" \
+   && ! echo "$OUT" | grep -q "not wired for the marker re-trigger"; then
+  pass "repository_dispatch trigger + merge-clearance-recheck wiring present → #658 assertions pass"
 else
-  fail "expected #658 assertions to pass on the guarded header; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+  fail "expected #658 assertions to pass on the wired header; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 fi  # end re-entrancy guard (MCG_SKIP_FIX3_SELFTEST)
 
