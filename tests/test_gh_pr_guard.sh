@@ -93,6 +93,7 @@ run_hook() {
   STUB_PR_DELETIONS="$deletions" \
   STUB_PR_HEAD="$pr_head" \
   STUB_PR_AUTHOR="$pr_author" \
+  OP_PREFLIGHT_AGENT="${TEST_OP_PREFLIGHT_AGENT:-}" \
   GH_PR_GUARD_EXPECTED_REVIEWER="$expected_reviewer" \
     bash "$HOOK" <<<"$payload"
 }
@@ -278,12 +279,47 @@ assert_rc_contains "same-agent approve via inline MERGEPATH_AGENT still blocked 
 
 # ...an inline value the hook cannot resolve to a literal identity fails
 # closed: a command-substitution value and a non-slug value are both
-# blocked rather than guessed at.
-assert_rc_contains "cmdsub inline MERGEPATH_AGENT approve blocked (#671)" 2 "" \
+# blocked rather than guessed at. The flattened cmdsub form arrives as an
+# empty assignment plus an adjacent placeholder token, which the capture
+# records as the placeholder so this blocks explicitly (#679 review P2).
+assert_rc_contains "cmdsub inline MERGEPATH_AGENT approve blocked (#671)" 2 "unverifiable inline MERGEPATH_AGENT" \
   'MERGEPATH_AGENT=$(cat /tmp/agent) scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# ...including on a NON-claude-authored PR, where an empty capture falling
+# back to the claude default would have compared cursor against claude and
+# FAILED OPEN — the substitution could resolve to the authoring agent and
+# post a same-agent approval (#679 review P2 regression).
+assert_rc_contains "cmdsub inline MERGEPATH_AGENT blocked on cursor-authored PR (#679 P2)" 2 "unverifiable inline MERGEPATH_AGENT" \
+  'MERGEPATH_AGENT=$(cat /tmp/agent) scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: cursor" "5000" "0"
 
 assert_rc_contains "non-slug inline MERGEPATH_AGENT approve blocked (#671)" 2 "not a plain agent slug" \
   'MERGEPATH_AGENT="codex or claude" scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# ...but a malformed MERGEPATH_AGENT must NOT block when an explicit
+# GH_AS_REVIEWER_IDENTITY decides resolution first — the wrapper never
+# reads MERGEPATH_AGENT in that case (#679 review P3).
+assert_rc_contains "non-slug MERGEPATH_AGENT ignored when explicit reviewer identity wins (#679 P3)" 0 "" \
+  'MERGEPATH_AGENT="codex or claude" GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "Authoring-Agent: claude" "5000" "0"
+
+# --- #679 review P1: the wrapper chain's third link. A session warmed
+# with op-preflight --agent <agent> exports OP_PREFLIGHT_AGENT, and the
+# wrapper resolves nathanpayne-$OP_PREFLIGHT_AGENT when neither
+# GH_AS_REVIEWER_IDENTITY nor MERGEPATH_AGENT is set. Bottoming out at
+# the claude default instead would fail OPEN on a cursor-preflight
+# session approving a cursor-authored PR.
+TEST_OP_PREFLIGHT_AGENT=cursor \
+  assert_rc_contains "same-agent approve via OP_PREFLIGHT_AGENT session blocked (#679 P1)" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: cursor" "5000" "0"
+
+TEST_OP_PREFLIGHT_AGENT=codex \
+  assert_rc_contains "cross-agent approve via OP_PREFLIGHT_AGENT session allowed (#679 P1)" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# ...and an inline MERGEPATH_AGENT prefix still outranks the preflight
+# link, matching the wrapper chain order.
+TEST_OP_PREFLIGHT_AGENT=claude \
+  assert_rc_contains "inline MERGEPATH_AGENT outranks OP_PREFLIGHT_AGENT (#679 P1)" 0 "" \
+  'MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
 
 # ...an inline prefix scoped to an EARLIER command does not leak across
 # the separator: the wrapper never sees it, so the sub-guard must not

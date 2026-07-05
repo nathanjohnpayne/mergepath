@@ -1883,9 +1883,12 @@ STANDALONE_GH_AS_REVIEWER_IDENTITY_SET=0
 # same way the wrapper will, so the DEFINITELY-effective inline prefix is
 # captured here. Standalone / export / eval MERGEPATH_AGENT assignments
 # are deliberately NOT modeled: an unmodeled form falls back to the
-# hook-environment/default chain, i.e. the pre-#671 resolution, whose
-# failure mode is a false BLOCK (fail closed), never a false allow of a
-# same-agent approve — and the wrapper itself still token-verifies
+# hook-environment chain (env MERGEPATH_AGENT, then OP_PREFLIGHT_AGENT,
+# then the hardcoded default). For the documented workflows that residual
+# is a false BLOCK (fail closed); a false allow requires a deliberately
+# adversarial compound (e.g. a standalone export of the authoring agent in
+# the same command), which stays out of scope per this hook's best-effort
+# tokenizer posture (#619) — and the wrapper itself still token-verifies
 # whatever identity it actually resolves.
 INLINE_MERGEPATH_AGENT=""
 INLINE_MERGEPATH_AGENT_SET=0
@@ -2171,6 +2174,20 @@ for i in "${!TOKENS[@]}"; do
       MERGEPATH_AGENT=*)
         INLINE_MERGEPATH_AGENT="${tok#MERGEPATH_AGENT=}"
         INLINE_MERGEPATH_AGENT_SET=1
+        # A flattened MERGEPATH_AGENT=$(...) arrives as an EMPTY assignment
+        # token followed by the placeholder as a separate value token (the
+        # #611 r9 tokenization). Record the placeholder AS the captured
+        # value so the approve sub-guard's unverifiable-value case fires —
+        # an empty capture would fall through to the env/default chain and
+        # FAIL OPEN when the substitution resolves to the authoring agent
+        # on a non-claude-authored PR (#679 review P2).
+        if [ -z "$INLINE_MERGEPATH_AGENT" ]; then
+          case "${TOKENS[$((i+1))]:-}" in
+            __MERGEPATH_CMDSUB__|__MERGEPATH_CMDSUB_LITERAL__)
+              INLINE_MERGEPATH_AGENT="${TOKENS[$((i+1))]}"
+              ;;
+          esac
+        fi
         ;;
     esac
   fi
@@ -2662,7 +2679,8 @@ fi
 #   - reviewer wrapper identity = nathanpayne-<agent>, resolved the same
 #     way the wrapper itself will (gh_default_reviewer_identity in
 #     scripts/lib/gh-token-resolver.sh): GH_AS_REVIEWER_IDENTITY first,
-#     then nathanpayne-$MERGEPATH_AGENT, then the hardcoded default —
+#     then nathanpayne-$MERGEPATH_AGENT, then
+#     nathanpayne-$OP_PREFLIGHT_AGENT, then the hardcoded default —
 #     preferring the inline same-segment assignment captured from this
 #     command over the hook environment at each link (#671)
 #   - PR body contains `Authoring-Agent: <agent>` matching the same
@@ -2730,26 +2748,33 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
 
   if [ "$REVIEW_APPROVE" -eq 1 ] && [ "${BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
     # Resolve the reviewer identity the WRAPPER will actually run under —
-    # the same chain gh_default_reviewer_identity() walks. The previous
-    # resolution reused the consistency-loop candidate, which never honors
-    # an inline MERGEPATH_AGENT=<agent> prefix, so a legitimate cross-agent
-    # approval (MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr
-    # review --approve on a claude-authored PR — the Operation-to-Identity
-    # Matrix row for that case) was mis-resolved to the session default
-    # agent and blocked as self-approve (#671, observed on PR #663).
-    #
-    # OP_PREFLIGHT_AGENT (the wrapper chain's third link) is deliberately
-    # not modeled — same posture as the first-round consistency check; an
-    # unmodeled link falls back to the default and can only over-block,
-    # the fail-closed direction.
+    # the same chain gh_default_reviewer_identity() walks:
+    # GH_AS_REVIEWER_IDENTITY, then nathanpayne-$MERGEPATH_AGENT, then
+    # nathanpayne-$OP_PREFLIGHT_AGENT, then the hardcoded default. The
+    # previous resolution reused the consistency-loop candidate, which
+    # never honors an inline MERGEPATH_AGENT=<agent> prefix, so a
+    # legitimate cross-agent approval (MERGEPATH_AGENT=codex
+    # scripts/gh-as-reviewer.sh -- gh pr review --approve on a
+    # claude-authored PR — the Operation-to-Identity Matrix row for that
+    # case) was mis-resolved to the session default agent and blocked as
+    # self-approve (#671, observed on PR #663).
     REVIEWER_FOR_APPROVE=""
     if [ "$WRAPPER_KIND" = "reviewer" ]; then
-      if [ "$INLINE_MERGEPATH_AGENT_SET" -eq 1 ]; then
-        # Fail closed on an inline value the hook cannot map to a literal
-        # reviewer identity: a command-substitution remnant or anything
-        # that is not a plain agent slug. The wrapper might resolve such a
-        # value to ANY identity — including the authoring agent — so the
-        # sub-guard must not guess.
+      if [ "$INLINE_GH_AS_REVIEWER_IDENTITY_SET" -eq 1 ] && [ -n "$INLINE_GH_AS_REVIEWER_IDENTITY" ]; then
+        REVIEWER_FOR_APPROVE="$INLINE_GH_AS_REVIEWER_IDENTITY"
+      elif [ "$INLINE_GH_AS_REVIEWER_IDENTITY_SET" -eq 0 ] && [ -n "${GH_AS_REVIEWER_IDENTITY:-}" ] \
+           && [ "$IDENTITY_ENV_CLEARED_FOR_WRAPPER" -eq 0 ]; then
+        REVIEWER_FOR_APPROVE="$GH_AS_REVIEWER_IDENTITY"
+      elif [ "$INLINE_MERGEPATH_AGENT_SET" -eq 1 ] && [ -n "$INLINE_MERGEPATH_AGENT" ]; then
+        # Validate only when the inline value actually decides resolution:
+        # an explicit GH_AS_REVIEWER_IDENTITY above wins in the wrapper
+        # before MERGEPATH_AGENT is ever read, so a malformed agent value
+        # must not block a deterministic explicit approval (#679 review
+        # P3). Reaching this link with a value the hook cannot map to a
+        # literal identity — a command-substitution remnant or a non-slug
+        # string — fails closed: the wrapper might resolve it to ANY
+        # identity, including the authoring agent, so the sub-guard must
+        # not guess.
         case "$INLINE_MERGEPATH_AGENT" in
           *__MERGEPATH_CMDSUB__*|*__MERGEPATH_CMDSUB_LITERAL__*)
             echo "BLOCKED: unverifiable inline MERGEPATH_AGENT on a gh pr review --approve." >&2
@@ -2764,17 +2789,22 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
             exit 2
             ;;
         esac
-      fi
-      if [ "$INLINE_GH_AS_REVIEWER_IDENTITY_SET" -eq 1 ] && [ -n "$INLINE_GH_AS_REVIEWER_IDENTITY" ]; then
-        REVIEWER_FOR_APPROVE="$INLINE_GH_AS_REVIEWER_IDENTITY"
-      elif [ "$INLINE_GH_AS_REVIEWER_IDENTITY_SET" -eq 0 ] && [ -n "${GH_AS_REVIEWER_IDENTITY:-}" ] \
-           && [ "$IDENTITY_ENV_CLEARED_FOR_WRAPPER" -eq 0 ]; then
-        REVIEWER_FOR_APPROVE="$GH_AS_REVIEWER_IDENTITY"
-      elif [ "$INLINE_MERGEPATH_AGENT_SET" -eq 1 ] && [ -n "$INLINE_MERGEPATH_AGENT" ]; then
         REVIEWER_FOR_APPROVE="nathanpayne-$INLINE_MERGEPATH_AGENT"
       elif [ "$INLINE_MERGEPATH_AGENT_SET" -eq 0 ] && [ -n "${MERGEPATH_AGENT:-}" ] \
            && [ "$IDENTITY_ENV_CLEARED_FOR_WRAPPER" -eq 0 ]; then
         REVIEWER_FOR_APPROVE="nathanpayne-$MERGEPATH_AGENT"
+      elif [ -n "${OP_PREFLIGHT_AGENT:-}" ] && [ "$IDENTITY_ENV_CLEARED_FOR_WRAPPER" -eq 0 ]; then
+        # The wrapper chain's third link (#679 review P1): a session
+        # warmed with op-preflight --agent <agent> exports
+        # OP_PREFLIGHT_AGENT, and gh-as-reviewer.sh resolves
+        # nathanpayne-$OP_PREFLIGHT_AGENT when neither
+        # GH_AS_REVIEWER_IDENTITY nor MERGEPATH_AGENT is set. Skipping
+        # this link and bottoming out at the claude default would FAIL
+        # OPEN on a non-claude session: an over-threshold
+        # Authoring-Agent: cursor PR approved from a cursor-preflight
+        # session would compare cursor against claude, pass, and let the
+        # wrapper post the same-agent approval this guard exists to block.
+        REVIEWER_FOR_APPROVE="nathanpayne-$OP_PREFLIGHT_AGENT"
       else
         REVIEWER_FOR_APPROVE="nathanpayne-claude"
       fi
