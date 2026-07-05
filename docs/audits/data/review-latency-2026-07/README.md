@@ -23,12 +23,14 @@ log.
 
 ```
 scripts/audit-review-latency.sh \
-  --repos nathanjohnpayne/swipewatch,nathanjohnpayne/matchline,nathanjohnpayne/nathanpaynedotcom,nathanjohnpayne/overridebroadway,nathanjohnpayne/tadlockpsychiatry \
+  --repos nathanjohnpayne/swipewatch,nathanjohnpayne/matchline,nathanjohnpayne/nathanpaynedotcom,nathanjohnpayne/overridebroadway,nathanjohnpayne/tadlockpsychiatry,nathanjohnpayne/device-source-of-truth,nathanjohnpayne/friends-and-family-billing,nathanjohnpayne/device-platform-reporting \
   --since 2026-05-15 \
   --loops-dir .mergepath/phase-4b-loops
 ```
 
-- **CodeRabbit** is mined across the five CodeRabbit-active consumer repos
+(This is also the script's default `--repos`.)
+
+- **CodeRabbit** is mined across all eight CodeRabbit-active consumer repos
   (the hub, mergepath, does not run CodeRabbit auto-review), which is the
   sampling frame where `coderabbit-wait.sh` actually runs.
 - **Phase-4b** adapter latency is read from the local
@@ -72,11 +74,16 @@ with the commit it reviewed. Two deliberate exclusions:
 
 ## Distributions
 
-### CodeRabbit review latency (rate_limited=false, n=92)
+### CodeRabbit review latency (rate_limited=false, n=142, all 8 consumers)
 
 | p50 | p90 | p99 | max |
 |---|---|---|---|
-| 365s (6m5s) | 799s (13m19s) | 1136s (18m56s) | 1136s |
+| 414s (6m54s) | 861s (14m21s) | 1136s (18m56s) | 1219s (20m19s) |
+
+Mined across **all eight** CodeRabbit-active consumers (every consumer ships
+`coderabbit.enabled: true`; see `docs/agents/coderabbit-audit.md`). An earlier
+5-repo pass understated the max at 1136s — the slowest observed review (1219s)
+is in `device-source-of-truth`, one of the three repos that pass omitted.
 
 The "typical ~2–3 min review" folklore encoded in `coderabbit.max_wait_seconds`
 was wrong by ~2×: the real p50 is ~6 min, and the tail reaches ~19 min.
@@ -112,7 +119,7 @@ verdict distribution below.
 | `codex.ack_wait_seconds` (script default) | 60 | **30** | ack p99=13s (n=14); 30s ≈ 2.3× p99. Aligns the script fallback to the policy value already shipped in #647. |
 | `codex.max_ack_retries` | 1 | **1** (confirmed) | Ack latency sizes the *window*, not the retry *count*; unchanged. |
 | `codex.review_timeout_seconds` | 600 | **840** | verdict p99=630s / max=830s (n=100); 👍-clearance p99=829s (n=60, #646). 600 sat below p99. 840 = 56×15s poll intervals, covers the full clean-verdict tail, < the 900s phase-4b ceiling. |
-| `coderabbit.max_wait_seconds` | 300 | **1155** | review p50=365s / p90=799s / p99=1136s (n=92). 300 sat below even p50 → >50% of PRs raced past CodeRabbit (#136). 1155 = 77×15s poll intervals = one interval beyond the measured max (1136s), so a tail review still gets a poll scan before the top-of-loop timeout check (#688); it is a ceiling (returns when the review lands). Consumer per-repo `max_wait_seconds: 300` overrides are migrated in a sync-wave follow-up. |
+| `coderabbit.max_wait_seconds` | 300 | **1245** | full-fleet review p50=414s / p90=861s / p99=1136s / max=1219s (n=142, all 8 consumers). 300 sat below even p50 → >50% of PRs raced past CodeRabbit (#136). 1245 = 83×15s poll intervals = one interval beyond the observed max (1219s), so the slowest observed review still gets a poll scan before the top-of-loop timeout check (#688); it is a ceiling (returns when the review lands). Consumer per-repo `max_wait_seconds: 300` overrides are migrated in a sync-wave follow-up (#690). |
 | `coderabbit.status_probe_wait_seconds` / `wallclock_freshness_window_seconds` / rate-limit + status-flip grace | — | unchanged (confirmed) | Not review-latency constants; the review-latency data does not contradict them (review p99 1136s < the 1800s freshness floor). |
 
 No gate is weakened: every retune only lengthens an advisory/foreground wait or

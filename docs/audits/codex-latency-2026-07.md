@@ -171,7 +171,7 @@ Runbook/docs references to the folklore numbers ("15–40 min", "~4 min no-👀"
 ## Follow-ups
 
 - **Fix pair 4's endpoint — DONE (#645 / #646)**: the audit now reads the clearance 👍 from `repos/$REPO/issues/$PR_NUMBER/reactions` (the PR issue, the gate's endpoint); re-measured n=60, p50 3m35s, p99 13m49s.
-- Retune status for the four knob rows above: `ack_wait_seconds` → 30 shipped in #647 (script fallback aligned in the current retune PR); `review_timeout_seconds` → 840 in the current retune PR; `coderabbit.max_wait_seconds` → 1140 in the current retune PR (see `docs/audits/data/review-latency-2026-07/`); the sweep-cadence `*/30` retune remains a propagation-wave follow-up.
+- Retune status for the four knob rows above: `ack_wait_seconds` → 30 shipped in #647 (script fallback aligned in the current retune PR); `review_timeout_seconds` → 840 in the current retune PR; `coderabbit.max_wait_seconds` → 1155 in the current retune PR (see `docs/audits/data/review-latency-2026-07/`); the sweep-cadence `*/30` retune remains a propagation-wave follow-up.
 - Cadence replay over the recorded clearance timestamps using the measured (throttled) cron firing behavior — never live trials.
 - **Consumer-repo sweep** (same script, `--repo` per consumer) is a possible follow-up; this pass is mergepath-only by scope.
 

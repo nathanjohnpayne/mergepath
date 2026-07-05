@@ -91,10 +91,15 @@ fi
 
 # --- argument parsing -------------------------------------------------------
 
-# Default fleet: the CodeRabbit-active consumers (the hub, mergepath, does not
-# run CodeRabbit auto-review). These are the repos where coderabbit-wait.sh
-# actually runs, so they are the right sampling frame for its wait window.
-REPOS="nathanjohnpayne/swipewatch,nathanjohnpayne/matchline,nathanjohnpayne/nathanpaynedotcom,nathanjohnpayne/overridebroadway,nathanjohnpayne/tadlockpsychiatry"
+# Default fleet: ALL EIGHT CodeRabbit-active consumers (the hub, mergepath,
+# does not run CodeRabbit auto-review). Every one currently ships
+# coderabbit.enabled: true (verified 2026-07-05) and is on the covered-fleet
+# list in docs/agents/coderabbit-audit.md, so the full set is the right
+# sampling frame for coderabbit-wait.sh's wait window — a 5-repo subset would
+# derive p50/p99 from a partial fleet and miss slower reviews in the omitted
+# repos (Codex P2 on #688). Keep this in step with the coderabbit-audit.md
+# roster if the fleet changes.
+REPOS="nathanjohnpayne/swipewatch,nathanjohnpayne/matchline,nathanjohnpayne/nathanpaynedotcom,nathanjohnpayne/overridebroadway,nathanjohnpayne/tadlockpsychiatry,nathanjohnpayne/device-source-of-truth,nathanjohnpayne/friends-and-family-billing,nathanjohnpayne/device-platform-reporting"
 SINCE=""
 LOOPS_DIR=".mergepath/phase-4b-loops"
 OUT_DIR=".mergepath/review-latency-audit"
@@ -219,9 +224,17 @@ read_phase4b_rounds() {
   local f
   for f in "$LOOPS_DIR"/*.jsonl "$LOOPS_DIR"/*.jsonl.archive; do
     [ -e "$f" ] || continue
-    jq -c 'select(.schema=="p4b-loop-log/v1") | .loop
+    # jq streams valid records to stdout (→ events.jsonl) as it goes; a
+    # malformed/truncated line makes it exit non-zero AFTER the good records
+    # and drop the rest. WARN on that instead of swallowing it with `|| true`
+    # — a corrupt loop log would otherwise bias the p4b_adapter distribution
+    # invisibly (Codex P3 on #688). `2>/dev/null` hides jq's own parse message;
+    # we surface our own, which does not pollute the stdout event stream.
+    if ! jq -c 'select(.schema=="p4b-loop-log/v1") | .loop
       | {kind:"p4b_round", reviewer, adapter, direction, loop, verdict,
-         fell_back, elapsed_seconds, timeout_seconds, effort}' "$f" 2>/dev/null || true
+         fell_back, elapsed_seconds, timeout_seconds, effort}' "$f" 2>/dev/null; then
+      log "WARN: phase-4b loop log $f is not valid line-delimited JSON (malformed/truncated?) — records after the bad line are omitted from the p4b distribution"
+    fi
   done
 }
 
