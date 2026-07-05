@@ -387,17 +387,27 @@ p4b_file_post_review_issues() {
     fpath="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].path // "PR"')"
     fline="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].line // empty')"
     fbody="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].body')"
-    title="$(printf '%.120s' "post-review observation (${REPO}#${PR}): ${sev} ${fpath}${fline:+:$fline}")"
+    # Policy step 9 labels are `post-review` plus `observation` OR `risk`
+    # (#674 Codex P2): the verdict schema carries no risk flag, so classify
+    # by the reviewer's own wording — a finding that talks about risk files
+    # as one. Mislabels are trivially editable after the fact; the load-
+    # bearing part is that risk follow-ups stay visible to `risk`-keyed
+    # triage instead of being hard-coded observations.
+    kind="observation"
+    if printf '%s' "$fbody" | grep -qiE '(^|[^[:alpha:]])risk(s|y)?([^[:alpha:]]|$)'; then
+      kind="risk"
+    fi
+    title="$(printf '%.120s' "post-review ${kind} (${REPO}#${PR}): ${sev} ${fpath}${fline:+:$fline}")"
     bfile="$(mktemp "${TMPDIR:-/tmp}/p4b-issue.XXXXXX")"
     {
-      printf 'Advisory %s observation flagged by the automated Phase 4b APPROVED review of %s#%s. Filed by scripts/phase-4b-review.sh BEFORE the approval posted (policy step 9, #672).\n\n' "$sev" "$REPO" "$PR"
+      printf 'Advisory %s %s flagged by the automated Phase 4b APPROVED review of %s#%s. Filed by scripts/phase-4b-review.sh BEFORE the approval posted (policy step 9, #672).\n\n' "$sev" "$kind" "$REPO" "$PR"
       printf 'Anchor: `%s`%s\n\n' "$fpath" "${fline:+ line $fline}"
       printf '%s\n' "$fbody"
       printf '\nReviewer: %s (%s adapter). Reviewed head: `%s`.\n' "$REVIEWER" "$ADAPTER" "${HEAD:-unknown}"
     } > "$bfile"
     url="$(GH_TOKEN="$token" GITHUB_TOKEN= gh issue create --repo "$REPO" \
       --title "$title" --body-file "$bfile" \
-      --label post-review --label observation \
+      --label post-review --label "$kind" \
       --assignee "$author_login" 2>/dev/null)" || { rm -f "$bfile"; return 1; }
     rm -f "$bfile"
     [ -n "$url" ] || return 1
@@ -421,16 +431,44 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
   if [ "$(p4b_automation_field post_review_issues)" = "false" ]; then
     fall_back_to_manual "approved verdict included findings and phase_4b_automation.post_review_issues is false; post-review issue filing is required before Phase 4b clearance"
   fi
-  if [ "$DRY_RUN" = true ]; then
-    p4b_log "[dry-run] would file $FINDINGS_COUNT post-review observation issue(s) in $REPO, then post APPROVED with the references"
-    POST_REVIEW_ISSUE_REFS="(dry-run: $FINDINGS_COUNT observation issue(s) would be filed)"
+  # Tiers the feedback policy marks `ignore` are never surfaced (#674 Codex
+  # P2): drop them from the FILE set. The review body still lists every
+  # verdict finding — it is the faithful record of what the reviewer said —
+  # but no follow-up issue is opened for suppressed tiers.
+  IGNORED_SEVS='[]'; _ig_first=true
+  for _tier in p0 p1 p2 p3; do
+    if [ "$(p4b_feedback_priority_value "$_tier")" = "ignore" ]; then
+      if [ "$_ig_first" = true ]; then IGNORED_SEVS='['; _ig_first=false; else IGNORED_SEVS="$IGNORED_SEVS,"; fi
+      IGNORED_SEVS="$IGNORED_SEVS\"$(printf '%s' "$_tier" | tr '[:lower:]' '[:upper:]')\""
+    fi
+  done
+  [ "$_ig_first" = true ] || IGNORED_SEVS="$IGNORED_SEVS]"
+  FILE_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c --argjson ig "$IGNORED_SEVS" \
+    '{findings: [.findings[] | . as $f | select(($ig | index($f.severity)) | not)]}')"
+  FILE_COUNT="$(printf '%s' "$FILE_JSON" | jq -r '.findings | length')"
+  if [ "$FILE_COUNT" -eq 0 ]; then
+    p4b_log "all $FINDINGS_COUNT APPROVED finding(s) fall in feedback_policy ignore tiers — never surfaced, nothing to file"
+  elif [ "$DRY_RUN" = true ]; then
+    p4b_log "[dry-run] would file $FILE_COUNT post-review issue(s) in $REPO ($FINDINGS_COUNT finding(s) total; ignored tiers filtered), then post APPROVED with the references"
+    POST_REVIEW_ISSUE_REFS="(dry-run: $FILE_COUNT issue(s) would be filed)"
   else
-    if ! POST_REVIEW_ISSUE_REFS="$(p4b_file_post_review_issues "$VERDICT_JSON")"; then
+    # Side-effect ordering (#674 Codex P2): re-read the live head BEFORE
+    # filing anything. post_review re-checks again at POST time, but by
+    # then the issues would already exist — a head that drifted during the
+    # adapter run must refuse here, with zero issues claiming an approval
+    # that will never post.
+    live_head_pre="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
+    [ -n "$live_head_pre" ] \
+      || fall_back_to_manual "could not re-read the live PR head before filing post-review issues"
+    if [ "$live_head_pre" != "$HEAD" ]; then
+      fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head_pre) — refusing to file post-review issues for an approval that will not post"
+    fi
+    if ! POST_REVIEW_ISSUE_REFS="$(p4b_file_post_review_issues "$FILE_JSON")"; then
       fall_back_to_manual "approved verdict included findings and post-review issue filing failed; refusing to post an approval with unfiled observations"
     fi
     [ -n "$POST_REVIEW_ISSUE_REFS" ] \
       || fall_back_to_manual "approved verdict included findings but post-review issue filing produced no references"
-    p4b_log "filed $FINDINGS_COUNT post-review observation issue(s): $POST_REVIEW_ISSUE_REFS"
+    p4b_log "filed $FILE_COUNT post-review issue(s): $POST_REVIEW_ISSUE_REFS"
   fi
 fi
 

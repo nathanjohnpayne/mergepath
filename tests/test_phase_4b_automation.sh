@@ -172,6 +172,10 @@ mk_fake fake-codex-approve \
   "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[]}'"
 mk_fake fake-codex-approve-p2 \
   "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P2\",\"path\":\"x.js\",\"line\":2,\"body\":\"should be handled under stricter policy\"}]}'"
+mk_fake fake-codex-approve-risk \
+  "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P2\",\"path\":\"x.js\",\"line\":2,\"body\":\"residual risk of stale cache reads after failover\"}]}'"
+mk_fake fake-codex-approve-p3 \
+  "printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"advisory only\",\"findings\":[{\"severity\":\"P3\",\"path\":\"x.js\",\"line\":2,\"body\":\"cosmetic nit only\"}]}'"
 mk_fake fake-codex-junk \
   "printf '%s' 'this is not json at all'"
 mk_fake fake-codex-usage \
@@ -1360,6 +1364,71 @@ if [ "$rc" = 4 ] \
 else fail "#672 fail-closed (rc=$rc): $out"; fi
 [ ! -s "$WORK/p4b672-fail-wrapper.log" ] \
   && pass "#672: no review POST attempted after filing failure" || fail "#672: review POST attempted despite filing failure"
+
+# #674 round 1: a head that drifted during the adapter run must refuse
+# BEFORE any side-effecting issue creation (post_review would refuse the
+# POST later, but by then the issues would already exist).
+DRIFT_ISSUE_LOG="$WORK/issue-drift.log"; : > "$DRIFT_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$DRIFT_ISSUE_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/p4b674-drift-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=def456 \
+  bash "$ORCH" 137 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "refusing to file post-review issues"; then
+  pass "#674: head drift refuses BEFORE issue filing"
+else fail "#674 head-drift pre-check (rc=$rc): $out"; fi
+[ ! -s "$DRIFT_ISSUE_LOG" ] \
+  && pass "#674: no issues created for a drifted head" || fail "#674: issues created despite head drift"
+
+# #674 round 1: a finding whose wording flags a RISK files under the `risk`
+# label per policy step 9, not a hard-coded `observation`.
+RISK_ISSUE_LOG="$WORK/issue-risk.log"; : > "$RISK_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-risk" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$RISK_ISSUE_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/p4b674-risk-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  bash "$ORCH" 138 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && grep -q -- "--label risk" "$RISK_ISSUE_LOG" && ! grep -q -- "--label observation" "$RISK_ISSUE_LOG"; then
+  pass "#674: risk-worded finding files under the risk label"
+else fail "#674 risk classification (rc=$rc)"; fi
+
+# #674 round 1: feedback_policy `ignore` tiers are never surfaced — no issue
+# is filed for them, and the approval still posts.
+POLICY_P3_IGNORE="$WORK/policy-p3-ignore.yml"
+cat > "$POLICY_P3_IGNORE" <<'YAML'
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-cursor
+  - nathanpayne-codex
+default_external_reviewer: nathanpayne-codex
+author_identity: nathanjohnpayne
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p0: required
+    p1: required
+    p2: discretionary
+    p3: ignore
+phase_4b_automation:
+  enabled: true
+  mode: local
+YAML
+IGNORE_ISSUE_LOG="$WORK/issue-ignore.log"; : > "$IGNORE_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_P3_IGNORE" CODEX_BIN="$BIN/fake-codex-approve-p3" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$IGNORE_ISSUE_LOG" \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/p4b674-ignore-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_CREATED_REVIEW_HEAD=abc123 \
+  bash "$ORCH" 139 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.review_posted')" = "true" ] && [ ! -s "$IGNORE_ISSUE_LOG" ]; then
+  pass "#674: ignore-tier findings file nothing and the approval still posts"
+else fail "#674 ignore-tier filter (rc=$rc): $out"; fi
 
 # #672 opt-out: post_review_issues: false restores the pre-#672 refusal.
 POLICY_NO_ISSUES="$WORK/policy-no-issues.yml"
