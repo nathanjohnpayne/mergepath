@@ -319,10 +319,23 @@ cat > "$BIN/gh" <<'SH'
 if [ "${1:-}" = "api" ]; then
   case "${2:-}" in
     repos/o/r/pulls/*)
-      printf '%s\n' "${P4B_FAKE_LIVE_HEAD:-abc123}"
+      # #674 round 4: P4B_FAKE_LIVE_HEAD2 simulates a head that drifts
+      # between reads — served from the SECOND live-head read on.
+      cnt_file="${P4B_ISSUE_LOG:-${TMPDIR:-/tmp}/p4b-fake}.headreads"
+      cnt=$(( $( [ -f "$cnt_file" ] && cat "$cnt_file" || echo 0 ) + 1 ))
+      printf '%s\n' "$cnt" > "$cnt_file"
+      if [ -n "${P4B_FAKE_LIVE_HEAD2:-}" ] && [ "$cnt" -ge 2 ]; then
+        printf '%s\n' "$P4B_FAKE_LIVE_HEAD2"
+      else
+        printf '%s\n' "${P4B_FAKE_LIVE_HEAD:-abc123}"
+      fi
       exit 0
       ;;
   esac
+fi
+if [ "${1:-}" = "issue" ] && [ "${2:-}" = "close" ]; then
+  printf 'CLOSE #%s\n' "${3:-}" >> "${P4B_ISSUE_LOG:-/dev/null}"
+  exit 0
 fi
 if [ "${1:-}" = "auth" ] && [ "${2:-}" = "token" ]; then
   # #674 round 2: the keyring lookup must strip ambient GH_TOKEN so a
@@ -1523,8 +1536,29 @@ if [ "$rc" = 4 ] \
    && printf '%s' "$out" | jq -r '.reason' | grep -q "partial refs: #901"; then
   pass "#674: partial filing failure surfaces the orphan refs in the fallback"
 else fail "#674 partial-orphan surfacing (rc=$rc): $out"; fi
+grep -q "^CLOSE #901$" "$PARTIAL_ISSUE_LOG" \
+  && pass "#674: partial orphans closed as superseded (round-4 self-cleanup)" || fail "#674: partial orphan not closed"
 [ ! -s "$WORK/p4b674-partial-wrapper.log" ] \
   && pass "#674: no review POST after a partial filing failure" || fail "#674: review POST attempted after partial failure"
+
+# #674 round 4: a head that drifts DURING filing refuses at the post-file
+# recheck, and the just-filed issues are closed as superseded.
+DRIFT2_ISSUE_LOG="$WORK/issue-drift2.log"; : > "$DRIFT2_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$DRIFT2_ISSUE_LOG" \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/p4b674-drift2-wrapper.log" \
+  bash "$ORCH" 145 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "changed while filing post-review issues" \
+   && grep -q "^ARGV " "$DRIFT2_ISSUE_LOG" \
+   && grep -q "^CLOSE #901$" "$DRIFT2_ISSUE_LOG"; then
+  pass "#674: mid-filing head drift refuses and closes the filed issues"
+else fail "#674 mid-filing drift cleanup (rc=$rc): $out"; fi
+[ ! -s "$WORK/p4b674-drift2-wrapper.log" ] \
+  && pass "#674: no review POST after mid-filing drift" || fail "#674: review POST attempted after mid-filing drift"
 
 # #674 round 3: a mixed filed+ignored approval body claims filing only for
 # the filed subset and names the suppressed remainder.

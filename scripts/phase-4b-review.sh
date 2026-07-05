@@ -414,7 +414,7 @@ p4b_file_post_review_issues() {
     # visible, never silently rebound).
     fp="$(printf '%s|%s|%s|%s' "$sev" "$fpath" "$fline" "$fbody" | cksum | cut -d' ' -f1)"
     marker="p4b-post-review ${REPO}#${PR} head=${HEAD:-unknown} finding=${fp}"
-    existing="$(GH_TOKEN="$token" GITHUB_TOKEN='' gh search issues --repo "$REPO" "\"$marker\"" --json url --jq '.[0].url // empty' 2>/dev/null || true)"
+    existing="$(GH_TOKEN="$token" GITHUB_TOKEN='' gh search issues --repo "$REPO" --state open "\"$marker\"" --json url --jq '.[0].url // empty' 2>/dev/null || true)"
     if [ -n "$existing" ]; then
       refs="${refs:+$refs, }#${existing##*/}"
       i=$((i + 1))
@@ -444,6 +444,29 @@ p4b_file_post_review_issues() {
     i=$((i + 1))
   done
   printf '%s' "$refs"
+}
+
+# p4b_close_post_review_issues <refs "#1, #2"> <reason>
+# Self-cleanup for the filing side effect (#674 round-4 P2): when an
+# approval is refused AFTER issues were filed (head drift, partial filing
+# failure), the filed issues are closed as superseded rather than left
+# orphaned — the dedup search is open-state-scoped, so a rerun files fresh
+# follow-ups instead of resurrecting closed refs. Best-effort: a close
+# failure warns with the ref so the operator can close manually; it never
+# changes the refusal outcome.
+p4b_close_post_review_issues() {
+  local refs="$1" reason="$2" author_login token n
+  author_login="$(p4b_top_field author_identity)"; author_login="${author_login:-nathanjohnpayne}"
+  token="${OP_PREFLIGHT_AUTHOR_PAT:-}"
+  [ -n "$token" ] || token="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$author_login" 2>/dev/null || true)"
+  [ -n "$token" ] || { p4b_warn "could not resolve the author token to close superseded post-review issues ($refs) — close them manually"; return 0; }
+  for n in $(printf '%s' "$refs" | tr ',' ' '); do
+    n="${n##*#}"
+    [ -n "$n" ] || continue
+    GH_TOKEN="$token" GITHUB_TOKEN='' gh issue close "$n" --repo "$REPO" --comment "$reason" >/dev/null 2>&1 \
+      || p4b_warn "could not close superseded post-review issue #$n — close it manually"
+  done
+  return 0
 }
 
 POST_REVIEW_ISSUE_REFS=""
@@ -516,17 +539,28 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
     _pri_rc=$?
     set -e
     if [ "$_pri_rc" -ne 0 ]; then
-      # Partial-failure orphans (#674 Codex round-2 P2): surface any refs
-      # that DID file before the failure — the head-pinned dedup marker
-      # makes a rerun REUSE them, so the orphan window self-heals; the
-      # operator sees them here rather than discovering strays later.
+      # Partial-failure orphans (#674 round-2 + round-4 P2s): surface any
+      # refs that DID file, close them as superseded (self-cleanup), and
+      # refuse. The dedup search is open-scoped, so a rerun files fresh
+      # follow-ups instead of resurrecting the closed ones.
       if [ -n "$POST_REVIEW_ISSUE_REFS" ]; then
-        p4b_warn "post-review issue filing failed partway; already filed (a rerun reuses these via the dedup marker): $POST_REVIEW_ISSUE_REFS"
+        p4b_warn "post-review issue filing failed partway; closing the already-filed refs as superseded: $POST_REVIEW_ISSUE_REFS"
+        p4b_close_post_review_issues "$POST_REVIEW_ISSUE_REFS" "Superseded: post-review filing for ${REPO}#${PR} failed partway and the Phase 4b approval was refused; a rerun files fresh follow-ups."
       fi
-      fall_back_to_manual "approved verdict included findings and post-review issue filing failed${POST_REVIEW_ISSUE_REFS:+ (partial refs: $POST_REVIEW_ISSUE_REFS)}; refusing to post an approval with unfiled observations"
+      fall_back_to_manual "approved verdict included findings and post-review issue filing failed${POST_REVIEW_ISSUE_REFS:+ (partial refs: $POST_REVIEW_ISSUE_REFS, closed as superseded)}; refusing to post an approval with unfiled observations"
     fi
     [ -n "$POST_REVIEW_ISSUE_REFS" ] \
       || fall_back_to_manual "approved verdict included findings but post-review issue filing produced no references"
+    # Post-file head recheck (#674 round-4 P2): a head that drifted DURING
+    # filing pins the just-filed issues to a head whose approval will be
+    # refused at post_review, and a new-head rerun cannot reuse the old
+    # head-pinned markers. Close them as superseded here and refuse now.
+    live_head_post="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
+    if [ -z "$live_head_post" ] || [ "$live_head_post" != "$HEAD" ]; then
+      p4b_warn "PR head drifted during issue filing (reviewed $HEAD, live ${live_head_post:-unreadable}) — closing the just-filed issues as superseded"
+      p4b_close_post_review_issues "$POST_REVIEW_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
+      fall_back_to_manual "PR head changed while filing post-review issues (reviewed $HEAD, live ${live_head_post:-unreadable}); the filed issues were closed as superseded"
+    fi
     p4b_log "filed $FILE_COUNT post-review issue(s): $POST_REVIEW_ISSUE_REFS"
   fi
 fi
