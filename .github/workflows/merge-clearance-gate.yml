@@ -371,6 +371,12 @@ jobs:
           # (not interpolated into the script) and validated as a positive
           # integer below, so an arbitrary client_payload cannot inject shell.
           PR: ${{ github.event.client_payload.pr }}
+          # The verified head SHA the lane put in the dispatch payload. Taken
+          # from the payload, NOT a per-PR `gh api pulls/$PR` resolve — #465 D1
+          # forbids that fragile pattern in this workflow (a failed resolve
+          # would fail-open), and the lane already holds the exact head it just
+          # verified. Validated as a hex object name below.
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
           REPO: ${{ github.repository }}
           # Check name MUST match the event-driven job name above AND the
           # sweep CHECK_NAME so branch protection resolves every source as the
@@ -389,17 +395,21 @@ jobs:
               exit 1
               ;;
           esac
-          # Resolve the PR head SHA — the check_run must pin to it (required
-          # checks key on (head_sha, name)). A repository_dispatch run checks
-          # out the default branch and has NO PR-head commit association, so a
-          # native job check would attach to the default-branch commit and
-          # never refresh the PR's required check; POST explicitly to the head
-          # SHA like the scheduled sweep.
-          head_sha=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)
-          if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
-            echo "::error::Could not resolve head SHA for PR #$PR; cannot refresh its Merge clearance gate."
-            exit 1
-          fi
+          # The check_run must pin to the PR head (required checks key on
+          # (head_sha, name)). A repository_dispatch run checks out the default
+          # branch and has NO PR-head commit association, so a native job check
+          # would attach to the default-branch commit and never refresh the
+          # PR's required check; POST explicitly to the head SHA like the
+          # scheduled sweep. The head comes from the dispatch payload (the head
+          # the lane just verified), NOT a per-PR gh api resolve (#465 D1);
+          # validate it is a hex object name so a hostile payload cannot inject.
+          head_sha="$HEAD_SHA"
+          case "$head_sha" in
+            '' | *[!0-9a-f]* )
+              echo "::error::repository_dispatch client_payload.head_sha is not a hex sha: '$head_sha'"
+              exit 1
+              ;;
+          esac
           set +e
           output=$(scripts/merge-clearance-gate.sh "$PR" "$REPO" 2>&1)
           rc=$?
