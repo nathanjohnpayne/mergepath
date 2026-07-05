@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# scripts/ci/check_project_doc_sync — run the project-doc-sync regression suite (#642).
+#
+# Wraps tests/test_project_doc_sync.sh, the hermetic suite for
+# scripts/project-doc-sync.sh: PRD/spec mirror drift detection, orphan
+# mirror sweeps (both project-scoped and central-decommission sweeps),
+# manifest validation, path-traversal hardening, and the read-only-repo
+# cache-safety guards. Both the script and the suite are HUB-ONLY
+# (deliberately not in .mergepath-sync.yml; no consumer has a
+# docs/projects/ tree or its own project-doc-sync.sh), so a consumer
+# checkout SKIPs via the same marker disambiguation check_wave_audit uses
+# (#624): wrapped test absent + scripts/sync-to-downstream.sh absent →
+# consumer checkout → SKIP; test absent but the hub marker present → the
+# hub lost the suite → hard error; test present → run it regardless of
+# the marker.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_project_doc_sync.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+    echo "check_project_doc_sync: SKIP (consumer checkout: wrapped test + scripts/sync-to-downstream.sh both absent; hub-only project-doc-sync suite)"
+    exit 0
+  fi
+  echo "check_project_doc_sync: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
