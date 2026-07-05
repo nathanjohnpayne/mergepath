@@ -321,6 +321,38 @@ TEST_OP_PREFLIGHT_AGENT=claude \
   assert_rc_contains "inline MERGEPATH_AGENT outranks OP_PREFLIGHT_AGENT (#679 P1)" 0 "" \
   'MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
 
+# --- #679 round 2: env-unset OP_PREFLIGHT_AGENT must not be trusted from
+# the stale hook environment — the wrapper falls to its claude default, so
+# a codex-preflight session approving a claude-authored PR is same-agent.
+TEST_OP_PREFLIGHT_AGENT=codex \
+  assert_rc_contains "env -u OP_PREFLIGHT_AGENT approve resolves to default and blocks (#679 r2)" 2 "self-approve detected" \
+  'env -u OP_PREFLIGHT_AGENT -u OP_PREFLIGHT_REVIEWER_PAT scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# --- #679 round 2: a command-substitution GH_AS_REVIEWER_IDENTITY is the
+# wrapper chain FIRST link — it must fail closed (the substitution could
+# emit the authoring identity), not fall through to MERGEPATH_AGENT.
+assert_rc_contains "cmdsub GH_AS_REVIEWER_IDENTITY approve blocked (#679 r2)" 2 "not expected reviewer" \
+  'GH_AS_REVIEWER_IDENTITY=$(cat /tmp/id) MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# --- #679 round 2: an EMBEDDED substitution with a literal prefix
+# (MERGEPATH_AGENT=cla$(x)e) flattens into the prefix token plus an
+# adjacent placeholder; the guard must fail closed on the whole segment,
+# never trust the literal prefix as the agent slug.
+assert_rc_contains "embedded-cmdsub MERGEPATH_AGENT approve blocked (#679 r2)" 2 "unverifiable command substitution" \
+  'MERGEPATH_AGENT=cla$(cat /tmp/a)e scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: cursor" "5000" "0"
+
+# --- same adjacency hole, bare-write form: an embedded substitution in
+# ANY prefix assignment used to derail the walk (the placeholder took
+# command position, the real gh write was classified as unrelated-command
+# args) and a BARE guarded write escaped the guard entirely.
+assert_rc_contains "bare gh pr merge behind embedded-cmdsub prefix blocked (#679 r2)" 2 "unverifiable command substitution" \
+  'FOO=a$(cat /tmp/x)b gh pr merge 123 --squash'
+
+# ...while the same embedded-cmdsub prefix on a NON-gh segment stays
+# allowed — the fail-closed scope is gh/wrapper segments only.
+assert_rc_contains "embedded-cmdsub prefix on non-gh command allowed (#679 r2)" 0 "" \
+  'FOO=a$(cat /tmp/x)b make build'
+
 # ...an inline prefix scoped to an EARLIER command does not leak across
 # the separator: the wrapper never sees it, so the sub-guard must not
 # credit it as the cross-agent identity (falls back to the default →
