@@ -891,6 +891,67 @@ if [ "$rc" = 0 ] \
   pass "trim: rename within the allowlist stays eligible (omitted with placeholder)"
 else fail "trim rename-within-allowlist (rc=$rc, report='${rep:-}')"; fi
 
+# #668 finding 2 hardening: a crafted section whose explicit `rename to`
+# destination disagrees with the header-derived b/-side must fail closed —
+# eligibility may never rest solely on the header split when the section
+# carries exact rename/copy path lines.
+TRIM_RTO_IN="$WORK/trim-rto-in.diff"
+{
+  printf 'diff --git a/small.js b/small.js\n+ok\n'
+  printf 'diff --git a/data/old.jsonl b/data/new.jsonl\n'
+  printf 'similarity index 40%%\nrename from data/old.jsonl\nrename to src/evil.sh\n'
+  awk 'BEGIN { for (i = 0; i < 200; i++) printf "+RTO-CODE-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$TRIM_RTO_IN"
+set +e
+p4b_trim_review_diff "$TRIM_RTO_IN" "$TRIM_OUT" 2000 'data/*' >/dev/null; rc=$?
+set -e
+[ "$rc" != 0 ] \
+  && pass "trim: rename-to destination outside the allowlist fails closed even when the header b/-side matches (#668)" \
+  || fail "trim rename-to-outside-allowlist should fail closed (rc=$rc)"
+
+# #668 finding 1: omission-allowlist provenance. When the over-budget diff
+# ITSELF touches .github/review-policy.yml, the allowlist read from the
+# checkout is untrusted for this run — omission must be refused entirely
+# (fail closed to the manual handoff), even though the bulk section is
+# allowlisted and the budget would otherwise be met.
+TRIM_POLICY_IN="$WORK/trim-policy-in.diff"
+{
+  printf 'diff --git a/.github/review-policy.yml b/.github/review-policy.yml\n'
+  printf '+  diff_omit_globs:\n+    - "src/*"\n'
+  printf 'diff --git a/data/huge.jsonl b/data/huge.jsonl\n'
+  awk 'BEGIN { for (i = 0; i < 200; i++) printf "+POLICY-BULK-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$TRIM_POLICY_IN"
+set +e
+p4b_trim_review_diff "$TRIM_POLICY_IN" "$TRIM_OUT" 2000 'data/*' >/dev/null; rc=$?
+set -e
+[ "$rc" != 0 ] \
+  && pass "trim: refuses ALL omission when the diff touches .github/review-policy.yml (#668 provenance)" \
+  || fail "trim policy-touching diff should fail closed (rc=$rc)"
+
+# ...including when the policy file is only the SOURCE of a rename (the
+# a/-side / rename-from path) — moving it away still rewrites the policy.
+TRIM_POLICY_MV="$WORK/trim-policy-mv.diff"
+{
+  printf 'diff --git a/.github/review-policy.yml b/docs/old-policy.yml\n'
+  printf 'similarity index 90%%\nrename from .github/review-policy.yml\nrename to docs/old-policy.yml\n'
+  printf 'diff --git a/data/huge.jsonl b/data/huge.jsonl\n'
+  awk 'BEGIN { for (i = 0; i < 200; i++) printf "+POLICY-MV-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$TRIM_POLICY_MV"
+set +e
+p4b_trim_review_diff "$TRIM_POLICY_MV" "$TRIM_OUT" 2000 'data/*' >/dev/null; rc=$?
+set -e
+[ "$rc" != 0 ] \
+  && pass "trim: policy file as a rename SOURCE also refuses omission (#668 provenance)" \
+  || fail "trim policy-rename-away diff should fail closed (rc=$rc)"
+
+# ...but an UNDER-budget diff touching the policy file passes through
+# verbatim: no omission happens, so the allowlist plays no role and the
+# provenance guard must not over-block ordinary policy PRs.
+rep="$(p4b_trim_review_diff "$TRIM_POLICY_IN" "$TRIM_OUT" 1000000 'data/*')" \
+  && cmp -s "$TRIM_POLICY_IN" "$TRIM_OUT" && [ -z "$rep" ] \
+  && pass "trim: under-budget policy-touching diff still passes through verbatim (#668)" \
+  || fail "trim under-budget policy-touching passthrough"
+
 # #636 round-2 P2: the omission loop must account for placeholder bytes.
 # Construct two allowlisted sections so that omitting only the largest gets
 # input-minus-omitted under budget, but the placeholder it adds pushes the
@@ -1111,6 +1172,30 @@ P4B_DIFF_MAX_BYTES=200 P4B_DIFF_OMIT_GLOBS='data/*' CLAUDE_BIN="$BIN/fake-claude
 set -e
 [ "$rc" = 4 ] && pass "claude adapter fails closed (exit 4) when nothing reviewable survives the budget" \
   || fail "claude adapter untrimmable diff should exit 4 (got $rc)"
+
+# #668 provenance: an over-budget diff that ALSO touches
+# .github/review-policy.yml must exit 4 (manual fallback) instead of
+# trusting the checkout's allowlist — the adapters inherit the mechanical
+# guard from p4b_trim_review_diff.
+HUGE_POLICY_DIFF="$WORK/huge-policy.diff"
+{
+  printf 'diff --git a/.github/review-policy.yml b/.github/review-policy.yml\n'
+  printf '+  diff_omit_globs:\n+    - "src/*"\n'
+  cat "$HUGE_DIFF"
+} > "$HUGE_POLICY_DIFF"
+set +e
+errout="$(P4B_DIFF_MAX_BYTES=2000 P4B_DIFF_OMIT_GLOBS='data/*' CODEX_BIN="$BIN/fake-codex-approve" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$HUGE_POLICY_DIFF" 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] && printf '%s' "$errout" | grep -q 'review-policy.yml'; then
+  pass "codex adapter refuses omission on a policy-touching over-budget diff (exit 4, cause named) (#668)"
+else fail "codex adapter policy-touching diff should exit 4 naming the policy file (rc=$rc, err=$errout)"; fi
+
+set +e
+errout="$(P4B_DIFF_MAX_BYTES=2000 P4B_DIFF_OMIT_GLOBS='data/*' CLAUDE_BIN="$BIN/fake-claude-approve-usage" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$HUGE_POLICY_DIFF" 2>&1 >/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] && printf '%s' "$errout" | grep -q 'review-policy.yml'; then
+  pass "claude adapter refuses omission on a policy-touching over-budget diff (exit 4, cause named) (#668)"
+else fail "claude adapter policy-touching diff should exit 4 naming the policy file (rc=$rc, err=$errout)"; fi
 
 # CLI stderr must reach the failure message (#635: every nonzero rc used to
 # be reported as a plan-login problem; a context-overflow rc=1 read as an
@@ -1399,6 +1484,19 @@ grep -q "p4b-post-review o/r#134 head=abc123 finding=${P2_FP}" "${ISSUE_LOG}.bod
   && pass "#674: filed issue body embeds the content-fingerprinted dedup marker" || fail "#674: content-fingerprint marker missing from issue body"
 grep -q -- "--title \[Post-Review\]" "$ISSUE_LOG" || grep -q "\[Post-Review\]" "$ISSUE_LOG" \
   && pass "#674: issue title follows the documented Post-Review convention" || fail "#674: Post-Review title prefix missing"
+# #675: the posted APPROVED body's accounting block records the filed advisory
+# with disposition=deferred-to-follow-up + its issue link (not unresolved/null),
+# and totals.advisory_issues_filed derives from it — so the machine-readable
+# record matches the prose "filed as #901" reference instead of contradicting
+# it. Extract the embedded p4b-accounting:v1 record and assert the enrichment.
+P4B675_REC="$(awk '/<!-- p4b-accounting:v1/{f=1;next} /^-->/{f=0} f' "$P4B672_BODY")"
+if [ -n "$P4B675_REC" ] && printf '%s' "$P4B675_REC" | jq -e '
+    (.totals.advisory_issues_filed == [901])
+    and ([ .unique_findings[]
+           | select(.disposition == "deferred-to-follow-up" and .issue == 901) ]
+         | length) == 1' >/dev/null 2>&1; then
+  pass "#675: filed advisory enriches the posted accounting record (deferred-to-follow-up + #901)"
+else fail "#675: accounting record not enriched with the filed issue (rec=$P4B675_REC)"; fi
 
 # #674 CodeRabbit: a marker match from a prior partially-failed run is
 # REUSED — no duplicate issue is created and the reference still lands.

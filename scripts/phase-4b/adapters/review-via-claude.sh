@@ -61,6 +61,10 @@
 #               are ever omitted from an over-budget diff — a non-matching
 #               oversized section fails closed to the manual handoff so an
 #               APPROVED can never post around unreviewed code (#636 P1).
+#               Omission is refused outright (exit 4) when the diff itself
+#               touches .github/review-policy.yml — the allowlist's own
+#               source of truth — so a PR cannot broaden the allowlist it
+#               is judged by (#668).
 #
 # Exit codes: identical contract to review-via-codex.sh (0/2/3/4).
 
@@ -133,7 +137,7 @@ printf '%s\n' "$DIFF" > "$DIFF_RAW"
 DIFF_BYTES="$(wc -c < "$DIFF_RAW" | tr -d '[:space:]')"
 OMIT_GLOBS="$(p4b_diff_omit_globs)"
 OMITTED="$(p4b_trim_review_diff "$DIFF_RAW" "$DIFF_FIT" "$MAX_DIFF_BYTES" "$OMIT_GLOBS")" \
-  || p4b_die 4 "diff (${DIFF_BYTES} bytes) exceeds the ${MAX_DIFF_BYTES}-byte review budget and cannot be reduced by omitting policy-allowlisted bulk sections (phase_4b_automation.diff_omit_globs) — refusing to omit unreviewed code (#636); pass a curated --diff-file or extend the allowlist; falling back to the manual handoff"
+  || p4b_die 4 "diff (${DIFF_BYTES} bytes) exceeds the ${MAX_DIFF_BYTES}-byte review budget and cannot be reduced by omitting policy-allowlisted bulk sections (phase_4b_automation.diff_omit_globs) — refusing to omit unreviewed code (#636); omission is also refused outright when the diff touches .github/review-policy.yml, because the PR may have rewritten the very allowlist this run would trust (#668); pass a curated --diff-file or extend the allowlist; falling back to the manual handoff"
 DIFF_NOTE=""
 if [ -n "$OMITTED" ]; then
   DIFF="$(cat "$DIFF_FIT")"

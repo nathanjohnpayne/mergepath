@@ -223,7 +223,7 @@ If any `op` command fails mid-session (rare — only if 1Password locks or the 1
 
 1. The agent creates a feature branch from the target branch (e.g., `main`).
 2. The agent writes code as `nathanjohnpayne`, following all project-level rules (linting, testing, conventions).
-3. The agent files a PR from the feature branch to the target branch under `nathanjohnpayne`. The PR description must include an `Authoring-Agent:` line identifying which agent wrote the code (e.g., `Authoring-Agent: claude`). This is required because all PRs share the `nathanjohnpayne` author identity, and the workflow uses this line to assign the correct reviewer identity for internal self-peer review.
+3. The agent files a PR from the feature branch to the target branch under `nathanjohnpayne`. The PR description must include an `Authoring-Agent:` line identifying which agent wrote the code (e.g., `Authoring-Agent: claude`). This is required because all PRs share the `nathanjohnpayne` author identity, and the workflow uses this line to assign the correct reviewer identity for internal self-peer review. The title and description must describe the work itself, not the session that produced it — see `docs/agents/operating-rules.md` § "PR and issue titles/descriptions: describe the work, not the session".
 
 ### Phase 2: Internal Review (Self-Peer Review)
 

@@ -595,6 +595,14 @@ P4B_DEFAULT_DIFF_MAX_BYTES=600000   # ~150k tokens: fits every current
 P4B_MIN_DIFF_MAX_BYTES=4096
 P4B_MAX_DIFF_MAX_BYTES=10485760
 
+# The repo-relative path of the review policy file as it appears in PR
+# diffs. This is deliberately NOT derived from p4b_config():
+# MERGEPATH_REVIEW_POLICY_PATH points the CONFIG READERS at an absolute
+# (often temp) file for tests and manual runs, but the omission-provenance
+# guard below keys on the path a PR's diff sections carry, which is always
+# the canonical in-repo location.
+P4B_REVIEW_POLICY_REPO_PATH=".github/review-policy.yml"
+
 # p4b_resolve_diff_max_bytes
 # Resolve the review-diff byte budget: P4B_DIFF_MAX_BYTES env override
 # (tests/manual escape hatch — integer-validated but not range-bounded,
@@ -636,7 +644,13 @@ p4b_resolve_diff_max_bytes() {
 # no reviewer saw — only operator-declared bulk-artifact paths are ever
 # omitted. Patterns are bash `case` globs (`*` crosses `/`); a section is
 # eligible only when EVERY repo path it touches — b/-side, a/-side, and any
-# rename/copy source — matches (see p4b_trim_review_diff).
+# rename/copy source or destination — matches (see p4b_trim_review_diff).
+#
+# PROVENANCE: this reads the CURRENT CHECKOUT's policy file. The #628
+# trusted-path rule (run the orchestrator from a trusted main-ref checkout)
+# is what makes that read trustworthy operationally; the mechanical
+# backstop lives in p4b_trim_review_diff, which refuses ALL omission when
+# the diff under review itself touches the policy file (#668).
 p4b_diff_omit_globs() {
   local cfg
   if [ -n "${P4B_DIFF_OMIT_GLOBS:-}" ]; then
@@ -700,15 +714,34 @@ EOF
 # Eligible = EVERY repo path the section touches matches <omit_globs>
 # (newline-separated shell globs; see p4b_diff_omit_globs). A section touches
 # its b/-side path, its a/-side path, AND — for a rename or copy — the
-# `rename from` / `copy from` source. Checking only the b/-side (the #636
-# round-1 shape) let a large rename FROM a non-allowlisted application path
-# (`src/foo.sh`) TO an allowlisted artifact path (`docs/audits/data/foo.sh`)
-# be omitted, hiding the removal of application code while an APPROVED could
-# still post (#636 round-2 P1). Requiring the a/-side and rename source to be
-# allowlisted too fails such a section closed.
+# `rename from` / `copy from` source and `rename to` / `copy to`
+# destination. Checking only the b/-side (the #636 round-1 shape) let a
+# large rename FROM a non-allowlisted application path (`src/foo.sh`) TO an
+# allowlisted artifact path (`docs/audits/data/foo.sh`) be omitted, hiding
+# the removal of application code while an APPROVED could still post (#636
+# round-2 P1). Requiring the a/-side and rename/copy source to be
+# allowlisted too fails such a section closed; the explicit rename/copy
+# DESTINATION lines are checked as well (#668) so eligibility never rests
+# solely on the header-derived split when the section carries exact paths.
+#
+# Omission-allowlist provenance (#668, the #636 sibling): <omit_globs> is
+# read from the CURRENT CHECKOUT's .github/review-policy.yml. A PR that
+# itself edits that file could broaden the allowlist (e.g. to `src/*`),
+# pair it with an over-budget diff, and have this function omit
+# application-code sections from the reviewer input while an APPROVED still
+# posts. The #628 trusted-path rule (orchestrator runs from a trusted
+# main-ref checkout) mitigates that only operationally; the mechanical
+# guard is here: when omission is needed (the diff is over budget) and ANY
+# section touches $P4B_REVIEW_POLICY_REPO_PATH on any side, this function
+# refuses omission entirely and returns non-zero, so the run falls back to
+# the manual handoff instead of trusting an allowlist the PR under review
+# may have rewritten. Under-budget diffs are unaffected — they pass through
+# verbatim and the allowlist plays no role. The trust argument mirrors the
+# #429 head-pinned exemption: only inputs the PR author cannot influence
+# may decide what the reviewer never sees.
 p4b_trim_review_diff() {
   local in="$1" out="$2" max="$3" globs="${4:-}" total sizes omit="" projected
-  local b i bside aside rfrom plh plen
+  local b i bside aside rfrom rto p plh plen
   [ -r "$in" ] || return 1
   case "$max" in ''|*[!0-9]*) return 1 ;; esac
   total="$(wc -c < "$in" | tr -d '[:space:]')"
@@ -716,39 +749,62 @@ p4b_trim_review_diff() {
     cp "$in" "$out" || return 1
     return 0
   fi
-  # Per-section metadata as "bytes<TAB>index<TAB>bside<TAB>aside<TAB>rename_from",
+  # Per-section metadata as
+  # "bytes<TAB>index<TAB>bside<TAB>aside<TAB>rename_from<TAB>rename_to",
   # largest first. Sections are keyed by INDEX (omission never depends on path
-  # parsing); the b/-side is the display path, and a/-side + rename source are
-  # carried so the caller can require EVERY touched path to be allowlisted.
-  # a/-side is derived by stripping the parsed " b/<bside>" suffix, so it uses
-  # the same split point as the b/-side. LC_ALL=C keeps length() byte-exact.
+  # parsing); the b/-side is the display path, and a/-side + rename/copy
+  # source/destination are carried so the caller can require EVERY touched
+  # path to be allowlisted. a/-side is derived by stripping the parsed
+  # " b/<bside>" suffix, so it uses the same split point as the b/-side.
+  # LC_ALL=C keeps length() byte-exact.
   sizes="$(LC_ALL=C awk '
-    /^diff --git /{ n++; hdr[n] = $0; bytes[n] = 0; rfrom[n] = "" }
+    /^diff --git /{ n++; hdr[n] = $0; bytes[n] = 0; rfrom[n] = ""; rto[n] = "" }
     n > 0 { bytes[n] += length($0) + 1 }
     /^rename from /{ if (n > 0 && rfrom[n] == "") rfrom[n] = substr($0, 13) }
     /^copy from /  { if (n > 0 && rfrom[n] == "") rfrom[n] = substr($0, 11) }
+    /^rename to /  { if (n > 0 && rto[n]   == "") rto[n]   = substr($0, 11) }
+    /^copy to /    { if (n > 0 && rto[n]   == "") rto[n]   = substr($0, 9)  }
     END {
       for (i = 1; i <= n; i++) {
         b = hdr[i]; sub(/^diff --git a\/.* b\//, "", b)
         a = hdr[i]; sub(/^diff --git a\//, "", a)
         suf = " b/" b
         if (substr(a, length(a) - length(suf) + 1) == suf) a = substr(a, 1, length(a) - length(suf))
-        printf "%d\t%d\t%s\t%s\t%s\n", bytes[i], i, b, a, rfrom[i]
+        printf "%d\t%d\t%s\t%s\t%s\t%s\n", bytes[i], i, b, a, rfrom[i], rto[i]
       }
     }
   ' "$in" | sort -rn)"
   [ -n "$sizes" ] || return 1
+  # Omission-allowlist provenance guard (#668): omission is needed past this
+  # point, and the allowlist was read from the current checkout's policy
+  # file — the ONE repo path whose in-PR modification could have rewritten
+  # the allowlist this run is judged by. If any section touches it on any
+  # side (edit, delete, rename/copy in or out), refuse omission entirely so
+  # the caller falls back to the manual handoff. See the function comment
+  # for the trust argument.
+  while IFS=$'\t' read -r b i bside aside rfrom rto; do
+    for p in "$bside" "$aside" "$rfrom" "$rto"; do
+      if [ "$p" = "$P4B_REVIEW_POLICY_REPO_PATH" ]; then
+        return 1
+      fi
+    done
+  done <<EOF
+$sizes
+EOF
   # Omit largest-first until the PROJECTED output size fits. `projected` models
   # the exact output byte count — each omission removes the section's bytes and
   # adds its placeholder line — so a placeholder can no longer push the final
   # output back over budget after the loop stops (#636 round-2 P2).
   projected="$total"
-  while IFS=$'\t' read -r b i bside aside rfrom; do
+  while IFS=$'\t' read -r b i bside aside rfrom rto; do
     [ "$projected" -le "$max" ] && break
     p4b_path_matches_any_glob "$bside" "$globs" || continue
     p4b_path_matches_any_glob "$aside" "$globs" || continue
     if [ -n "$rfrom" ]; then
       p4b_path_matches_any_glob "$rfrom" "$globs" || continue
+    fi
+    if [ -n "$rto" ]; then
+      p4b_path_matches_any_glob "$rto" "$globs" || continue
     fi
     plh="[phase-4b diff-budget: ${bside} omitted - oversized diff section; see the prompt note]"
     plen="$(printf '%s\n' "$plh" | LC_ALL=C wc -c | tr -d '[:space:]')"
