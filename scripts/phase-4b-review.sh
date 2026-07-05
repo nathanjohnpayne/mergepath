@@ -31,6 +31,8 @@
 #   GH_TOKEN / op-preflight cache   reviewer-scoped token (auto-sourced).
 #   CODEX_BIN / CLAUDE_BIN          adapter CLI overrides (tests).
 #   P4B_GH_AS_REVIEWER              reviewer wrapper override (tests).
+#   P4B_GH_AS_AUTHOR                author wrapper override (tests) — used
+#                                   for the step-9 post-review issue writes.
 #   P4B_HANDOFF                     manual handoff renderer override (tests).
 #   P4B_ADAPTER_TIMEOUT_SECONDS     env override for the outer adapter-call
 #                                   timeout; default is resolved per-adapter
@@ -108,6 +110,10 @@ p4b_acct_mark_unposted() {
 ADAPTER_DIR="$ROOT/phase-4b/adapters"
 HANDOFF="${P4B_HANDOFF:-$ROOT/post-phase-4b-handoff.sh}"
 GH_AS_REVIEWER="${P4B_GH_AS_REVIEWER:-$ROOT/gh-as-reviewer.sh}"
+# Author wrapper for the step-9 issue writes (#672/#674): resolves AND
+# identity-verifies the author PAT before each write, replacing manual
+# token resolution (test override: P4B_GH_AS_AUTHOR).
+GH_AS_AUTHOR="${P4B_GH_AS_AUTHOR:-$ROOT/gh-as-author.sh}"
 # Outer adapter-call timeout. An explicit env override wins (tests/manual);
 # otherwise it is resolved per-adapter from policy after the reviewer is chosen
 # (see p4b_resolve_adapter_timeout). Captured here so the env override is not
@@ -365,28 +371,24 @@ ADAPTER_RUNS=1
 # p4b_file_post_review_issues <verdict-json>
 # Policy step 9 executor (#672): one `post-review` + `observation` issue per
 # discretionary finding on an APPROVED verdict, filed in $REPO under the
-# AUTHOR identity (the owner files issues per house convention; `gh issue
-# create` is deliberately not byline-guarded, #317/#342) and assigned to it.
+# AUTHOR identity and assigned to it. Writes go through gh-as-author.sh —
+# the wrapper resolves the author PAT (OP_PREFLIGHT_AUTHOR_PAT or keyring)
+# AND identity-verifies it before the write, which both satisfies the
+# no-bare-gh-writes contract and closes the wrong-identity risk from the
+# round-2 finding more strongly than manual token resolution did.
 # Prints TWO lines: line 1 = comma-separated `#N` references (reused +
 # created, for the review body), line 2 = the subset CREATED by this
 # invocation (for cleanup — a reused prior-run issue must never be closed
 # by this run's failure paths, #674 round-5 P2). ANY single failure —
-# token unresolvable, a missing label on the target repo, an API error —
-# returns non-zero so the caller refuses the approval (fail-closed: an
-# APPROVED may never post with its observations unfiled; that failure mode
-# degrades exactly to the pre-#672 refusal).
+# wrapper/token verification, a missing label on the target repo, an API
+# error, or a DEDUP SEARCH error (#674 CodeRabbit Major: a swallowed search
+# failure would read as "no existing issue" and mint duplicates) — returns
+# non-zero so the caller refuses the approval (fail-closed: an APPROVED may
+# never post with its observations unfiled; that failure mode degrades
+# exactly to the pre-#672 refusal).
 p4b_file_post_review_issues() {
-  local vjson="$1" author_login token refs="" created="" i total sev fpath fline fbody title bfile url
+  local vjson="$1" author_login refs="" created="" i total sev fpath fline fbody title bfile url existing
   author_login="$(p4b_top_field author_identity)"; author_login="${author_login:-nathanjohnpayne}"
-  token="${OP_PREFLIGHT_AUTHOR_PAT:-}"
-  if [ -z "$token" ]; then
-    # Ambient GH_TOKEN takes precedence over stored credentials in gh
-    # (#674 Codex P2): a reviewer token loaded into the session environment
-    # would win the lookup and file the issues under the WRONG identity.
-    # Strip both ambient token vars for the keyring read.
-    token="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$author_login" 2>/dev/null || true)"
-  fi
-  [ -n "$token" ] || { p4b_warn "post-review issues: no author token resolvable (OP_PREFLIGHT_AUTHOR_PAT unset and gh keyring has no $author_login)"; return 1; }
   total="$(printf '%s' "$vjson" | jq -r '.findings | length')"
   i=0
   while [ "$i" -lt "$total" ]; do
@@ -417,7 +419,14 @@ p4b_file_post_review_issues() {
     # visible, never silently rebound).
     fp="$(printf '%s|%s|%s|%s' "$sev" "$fpath" "$fline" "$fbody" | cksum | cut -d' ' -f1)"
     marker="p4b-post-review ${REPO}#${PR} head=${HEAD:-unknown} finding=${fp}"
-    existing="$(GH_TOKEN="$token" GITHUB_TOKEN='' gh search issues --repo "$REPO" --state open "\"$marker\"" --json url --jq '.[0].url // empty' 2>/dev/null || true)"
+    if ! existing="$(gh search issues --repo "$REPO" --state open "\"$marker\"" --json url --jq '.[0].url // empty' 2>/dev/null)"; then
+      # Dedup search ERROR ≠ dedup search EMPTY (#674 CodeRabbit Major):
+      # an API/auth/rate-limit failure here must not read as "no existing
+      # issue" and mint duplicates — fail closed like any other step.
+      p4b_warn "post-review dedup search failed for fingerprint ${fp} — failing closed rather than risking duplicate issues"
+      printf '%s\n%s' "$refs" "$created"
+      return 1
+    fi
     if [ -n "$existing" ]; then
       refs="${refs:+$refs, }#${existing##*/}"
       i=$((i + 1))
@@ -436,7 +445,7 @@ p4b_file_post_review_issues() {
       printf '\nReviewer: %s (%s adapter). Reviewed head: `%s`.\n' "$REVIEWER" "$ADAPTER" "${HEAD:-unknown}"
       printf '\n<!-- %s -->\n' "$marker"
     } > "$bfile"
-    url="$(GH_TOKEN="$token" GITHUB_TOKEN='' gh issue create --repo "$REPO" \
+    url="$("$GH_AS_AUTHOR" -- gh issue create --repo "$REPO" \
       --title "$title" --body-file "$bfile" \
       --label post-review --label "$kind" \
       --assignee "$author_login" 2>/dev/null)" \
@@ -459,15 +468,11 @@ p4b_file_post_review_issues() {
 # failure warns with the ref so the operator can close manually; it never
 # changes the refusal outcome.
 p4b_close_post_review_issues() {
-  local refs="$1" reason="$2" author_login token n
-  author_login="$(p4b_top_field author_identity)"; author_login="${author_login:-nathanjohnpayne}"
-  token="${OP_PREFLIGHT_AUTHOR_PAT:-}"
-  [ -n "$token" ] || token="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --user "$author_login" 2>/dev/null || true)"
-  [ -n "$token" ] || { p4b_warn "could not resolve the author token to close superseded post-review issues ($refs) — close them manually"; return 0; }
+  local refs="$1" reason="$2" n
   for n in $(printf '%s' "$refs" | tr ',' ' '); do
     n="${n##*#}"
     [ -n "$n" ] || continue
-    GH_TOKEN="$token" GITHUB_TOKEN='' gh issue close "$n" --repo "$REPO" --comment "$reason" >/dev/null 2>&1 \
+    "$GH_AS_AUTHOR" -- gh issue close "$n" --repo "$REPO" --comment "$reason" >/dev/null 2>&1 \
       || p4b_warn "could not close superseded post-review issue #$n — close it manually"
   done
   return 0
