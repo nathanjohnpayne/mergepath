@@ -265,12 +265,17 @@ ALLOW_LIST=(
   #     (both-absent marker SKIP; the #662/#663 wave-audit suite —
   #     scripts/wave-audit.sh is hub-only, so the suite cannot run on a
   #     consumer and legitimately does not travel)
+  #   - check_project_doc_sync      → test_project_doc_sync.sh
+  #     (both-absent marker SKIP; the #642 project-doc-sync suite —
+  #     scripts/project-doc-sync.sh is hub-only, so the suite cannot run
+  #     on a consumer and legitimately does not travel)
   "tests/test_eslint_policy_check.sh"
   "tests/test_check_mktemp_portability.sh"
   "tests/test_session_finalization_check.sh"
   "tests/test_check_sync_manifest.sh"
   "tests/test_audit_codex_latency.sh"
   "tests/test_wave_audit.sh"
+  "tests/test_project_doc_sync.sh"
 
   # The #623 Codex-latency audit script — hub-only operator tooling for
   # this pass (a consumer-repo sweep is a possible follow-up, at which
@@ -287,6 +292,14 @@ ALLOW_LIST=(
   # consumers via the both-absent marker idiom, so neither file needs
   # to travel.
   "scripts/wave-audit.sh"
+
+  # The #642 project-doc-sync driver — hub-only operator tooling (PRD/
+  # spec mirror audit + materialize, run against the central docs repo;
+  # no consumer has a docs/projects/ tree to audit). Referenced from
+  # wrapper/allow-list comments only; the wrapped test SKIPs on
+  # consumers via the both-absent marker idiom, so neither file needs
+  # to travel.
+  "scripts/project-doc-sync.sh"
 
   # The #601 consumer-safety net itself — hub-only BY DESIGN: it encodes
   # the hub-only removal list (this ALLOW_LIST + the bootstrap mirror
