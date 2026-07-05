@@ -221,14 +221,6 @@ jobs:
         # checkouts SKIP inside the wrapper (script + suite are hub-only).
         run: ./scripts/ci/check_wave_audit
 
-      - name: check_project_doc_sync
-        # Hub-only project-doc-sync regression suite (#642): PRD/spec
-        # mirror drift detection, orphan sweeps, manifest validation, and
-        # cache-safety guards for scripts/project-doc-sync.sh. Consumer
-        # checkouts SKIP inside the wrapper (script + suite are hub-only;
-        # no consumer has a docs/projects/ tree).
-        run: ./scripts/ci/check_project_doc_sync
-
       - name: check_coderabbit_severity_gate
         # CodeRabbit twin of check_codex_p1_gate (#577). Verifies
         # scripts/coderabbit-severity-gate.sh +
@@ -342,6 +334,20 @@ jobs:
         # travel to consumers → the referencing tool fails closed there).
         # Shares the yq install with check_sync_manifest above.
         run: ./scripts/ci/check_propagation_closure
+
+      - name: check_project_doc_sync
+        # Hub-only project-doc-sync regression suite (#642): PRD/spec
+        # mirror drift detection, orphan sweeps, manifest validation, and
+        # cache-safety guards for scripts/project-doc-sync.sh. Consumer
+        # checkouts SKIP inside the wrapper (script + suite are hub-only;
+        # no consumer has a docs/projects/ tree). Requires mikefarah/yq —
+        # installed by install_yq_for_sync_manifest above; placed after
+        # the yq-dependent checks (not immediately after check_wave_audit,
+        # which needs no yq) so this step actually exercises the suite
+        # instead of silently SKIPping on a fresh runner (Codex P2 on
+        # PR #680, the same #616-style ordering hazard already fixed for
+        # check_resolve_pr_threads / check_sync_manifest above).
+        run: ./scripts/ci/check_project_doc_sync
 
       - name: check_sync_overrides
         # Exercises tests/test_sync_overrides.sh — verifies the
