@@ -136,3 +136,14 @@ See `scripts/sweep-unresolved-feedback/enumerate.sh` + `scripts/sweep-unresolved
 - Quarterly backlog review → the weekly sweep's rollup issue. Items aged 7+ days, context decayed but pattern recognition still possible.
 
 Both surfaces are per-repo (each consumer has its own daily + weekly rollup issues). Cross-repo aggregation is explicit non-goal for v1 of both workflows; the per-repo design preserves operator focus on the repo whose context they're currently in.
+
+## PR and issue titles/descriptions: describe the work, not the session
+
+Titles and descriptions — for both pull requests and issues — must describe the final state of the change (what it does and why) for a reader who arrives with no knowledge of the session that produced it.
+
+- Do not narrate the session's path: no pivots, abandoned approaches, "originally did X, then switched to Y," or commentary on how the plan evolved.
+- When a pivot changes what the work is, update the title/description to reflect the new end state — not the fact that a pivot happened.
+- Once a title or description already describes the work accurately, treat it as read-only. Do not reword or "refresh" it to fold in later session context.
+- This bans narrating the session, not documenting the work. Design rationale, an "Alternatives considered" section, or contrasting the change with the prior committed code (e.g. "replaces the hard-coded `null` with a threaded value") all describe the end state for a cold reader and are fine. The test: would the text help someone who never saw the session? Rationale and prior-code contrast pass; "I first tried X, then switched" does not.
+
+This is advisory guidance for judgment, not a `repo_lint`/CI gate — the narration-vs-rationale distinction is not reliably lintable, and a reviewer (human or bot) should apply it as judgment rather than minting false-positive findings from words like "originally" or "instead." See #654.
