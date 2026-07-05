@@ -208,9 +208,16 @@ read_phase4b_rounds() {
   # Emit one p4b_round event per loop record. Reads .loop only — never the
   # .details finding bodies (code-review text stays local). No-op when the
   # dir is absent (e.g. --analyze-only on a clean checkout).
+  #
+  # Scan BOTH the live *.jsonl logs AND the rotated *.jsonl.archive files:
+  # p4b_acct_hook_rotate_loop_log_after_approval appends the consumed loops to
+  # <log>.archive and empties the live log once a Phase-4b approval/fallback is
+  # posted, so a live-only scan would systematically drop every completed round
+  # and bias the a_p4b_adapter_* distribution toward unrotated leftovers
+  # (Codex P2 on #688).
   [ -d "$LOOPS_DIR" ] || return 0
   local f
-  for f in "$LOOPS_DIR"/*.jsonl; do
+  for f in "$LOOPS_DIR"/*.jsonl "$LOOPS_DIR"/*.jsonl.archive; do
     [ -e "$f" ] || continue
     jq -c 'select(.schema=="p4b-loop-log/v1") | .loop
       | {kind:"p4b_round", reviewer, adapter, direction, loop, verdict,
@@ -301,8 +308,15 @@ analyze() {
     [
       # CodeRabbit review-object latency: submitted_at − committer_date(commit_id).
       # Exact commit anchor from the review object; no timeline reconstruction.
+      # Dedup key is (repo, PR, commit): the goal is only to collapse the
+      # multiple review objects CodeRabbit posts on the SAME commit in the SAME
+      # PR (empties from thread resolution + re-reviews). Keying on (repo,
+      # commit) alone would also merge reviews of a shared SHA across DIFFERENT
+      # PRs (stacked/duplicate PRs), discarding the later PR sample — but
+      # coderabbit-wait.sh waits per PR, so each PR review is its own latency
+      # event and must be kept (Codex P2 on #688).
       ( ($ev | map(select(.kind=="cr_review" and .commit_id != null and .real_review==true))
-         | group_by("\(.repo) \(.commit_id)")
+         | group_by("\(.repo) \(.pr) \(.commit_id)")
          | map(sort_by(.submitted_at) | .[0]))[] as $r
         | ($commits["\($r.repo) \($r.commit_id)"]
            // ([ $all_commits[] | select(.repo==$r.repo and (.sha | startswith($r.commit_id))) ] | first)) as $c

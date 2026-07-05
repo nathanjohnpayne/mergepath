@@ -2,14 +2,14 @@
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 3 | 2s | 8s | 8s | 8s |
+| ALL | 5 | 4s | 1m56s | 1m56s | 1m56s |
 
 
 ## a_p4b_adapter_review
 
 | segment | n | p50 | p90 | p99 | max |
 |---|---|---|---|---|---|
-| ALL | 4 | 4m56s | 10m26s | 10m26s | 10m26s |
+| ALL | 11 | 9m42s | 12m30s | 13m2s | 13m2s |
 
 
 ## d_cr_review_latency

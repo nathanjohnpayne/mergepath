@@ -85,14 +85,18 @@ was wrong by ~2×: the real p50 is ~6 min, and the tail reaches ~19 min.
 
 | pair | n | values (s) |
 |---|---|---|
-| `a_p4b_adapter_review` (verdict-producing) | 4 | 188, 296, 582, 626 |
-| `a_p4b_adapter_abort` (UNAVAILABLE — quota/connection) | 3 | 2, 2, 8 |
+| `a_p4b_adapter_review` (verdict-producing) | 11 | 188, 261, 296, 447, 547, 582, 616, 626, 699, 750, 782 |
+| `a_p4b_adapter_abort` (UNAVAILABLE — quota/connection) | 5 | 2, 2, 4, 8, 116 |
 
-Small sample (phase-4b automation is recent), reported for corroboration only.
-Every real CLI review completed in 188–626s, comfortably under the phase-4b
-adapter's own 900s timeout — an independent confirmation that a real Codex
-review takes ~3–10 min, **not** the "15–40 min" folk belief, consistent with
-the Codex App verdict distribution below.
+Both live `*.jsonl` and rotated `*.jsonl.archive` loop logs are scanned — the
+Phase-4b accounting hook empties a live log into its `.archive` sibling once an
+approval/fallback posts, so a live-only scan would drop every completed round
+(this fix lifted the review sample from 4 to 11). Still a small sample
+(phase-4b automation is recent), reported for corroboration only. Every real
+CLI review completed in 188–782s, comfortably under the phase-4b adapter's own
+900s timeout — an independent confirmation that a real Codex review takes
+~3–13 min, **not** the "15–40 min" folk belief, consistent with the Codex App
+verdict distribution below.
 
 ### Codex App pairs (by reference — `docs/audits/data/codex-latency-2026-07/`)
 

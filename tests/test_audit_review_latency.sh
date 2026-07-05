@@ -63,6 +63,11 @@ cat >"$WORKDIR/events.jsonl" <<'EOF'
 {"kind":"cr_review","repo":"o/r","pr":101,"review_id":4,"submitted_at":"2026-06-02T10:20:00Z","commit_id":"bbbb2222","state":"COMMENTED","real_review":true}
 {"kind":"cr_review","repo":"o/r","pr":102,"review_id":5,"submitted_at":"2026-06-03T10:05:00Z","commit_id":"cccc3333","state":"COMMENTED","real_review":true}
 {"kind":"cr_ratelimit","repo":"o/r","pr":102,"comment_id":12,"created_at":"2026-06-03T10:10:00Z"}
+{"kind":"pr","repo":"o/r","pr":104,"additions":100,"merged_at":null,"state":"open"}
+{"kind":"pr","repo":"o/r","pr":105,"additions":100,"merged_at":null,"state":"open"}
+{"kind":"commit","repo":"o/r","sha":"eeee5555","committer_date":"2026-06-04T10:00:00Z"}
+{"kind":"cr_review","repo":"o/r","pr":104,"review_id":6,"submitted_at":"2026-06-04T10:10:00Z","commit_id":"eeee5555","state":"COMMENTED","real_review":true}
+{"kind":"cr_review","repo":"o/r","pr":105,"review_id":7,"submitted_at":"2026-06-04T10:12:00Z","commit_id":"eeee5555","state":"COMMENTED","real_review":true}
 {"kind":"p4b_round","reviewer":"nathanpayne-codex","adapter":"review-via-codex.sh","loop":1,"verdict":"UNAVAILABLE","fell_back":true,"elapsed_seconds":8,"timeout_seconds":900,"effort":"high"}
 {"kind":"p4b_round","reviewer":"nathanpayne-codex","adapter":"review-via-codex.sh","loop":2,"verdict":"CHANGES_REQUESTED","fell_back":false,"elapsed_seconds":600,"timeout_seconds":900,"effort":"high"}
 EOF
@@ -93,8 +98,14 @@ expect_pair() {
 
 # --- CodeRabbit review-object dedup -----------------------------------------
 n_review=$(jq -s '[ .[] | select(.pair == "d_cr_review_latency") ] | length' "$PAIRS")
-[ "$n_review" = "3" ] && pass "review dedup: 3 review pairs (PR100 3 reviews->1, PR101->1, PR102->1)" \
-  || fail "d_cr_review_latency count: got $n_review, want 3 (empty + later-real must drop)"
+[ "$n_review" = "5" ] && pass "review dedup: 5 review pairs (PR100 3->1, PR101->1, PR102->1, PR104->1, PR105->1)" \
+  || fail "d_cr_review_latency count: got $n_review, want 5 (empty + later-real drop; shared SHA keeps both PRs)"
+
+# Dedup key is (repo, PR, commit): a commit SHA reviewed in TWO PRs must yield
+# TWO samples (coderabbit-wait waits per PR), not one — the #688 P2 fix.
+n_shared=$(jq -s '[ .[] | select(.pair == "d_cr_review_latency" and (.pr == 104 or .pr == 105)) ] | length' "$PAIRS")
+[ "$n_shared" = "2" ] && pass "review dedup: shared SHA across PR104+PR105 keeps BOTH PR samples" \
+  || fail "shared-SHA pairs: got $n_shared, want 2 (must not merge across PRs)"
 
 expect_pair "review: PR100 keeps earliest REAL review (+689s), not the +900s or empty one" \
   '.pair == "d_cr_review_latency" and .pr == 100' \
@@ -132,6 +143,30 @@ if [ "$(LC_ALL=C tr -cd '\000' < "$SCRIPT" | wc -c | tr -d ' ')" = "0" ]; then
   pass "audit script is NUL-free (plain text, greppable)"
 else
   fail "audit script contains NUL byte(s) — jq key separators must be printable"
+fi
+
+# --- regression: archived phase-4b loop logs are scanned (#688 P2) -----------
+# read_phase4b_rounds must glob *.jsonl.archive too — the Phase-4b accounting
+# hook rotates completed rounds out of the live *.jsonl into a .archive sibling
+# once an approval/fallback posts, so a live-only scan drops every approved
+# round. Run the full normalize path (raw/ present, so it is not the replay
+# branch) over a loops dir holding one live + one archived round; assert BOTH
+# are emitted.
+ARCH_OUT="$WORKDIR/arch"
+ARCH_LOOPS="$WORKDIR/loops"
+mkdir -p "$ARCH_OUT/raw" "$ARCH_LOOPS"
+: > "$ARCH_OUT/raw/pr_meta.jsonl"
+: > "$ARCH_OUT/raw/commits.jsonl"
+: > "$ARCH_OUT/raw/reviews.jsonl"
+: > "$ARCH_OUT/raw/issue_comments.jsonl"
+printf '%s\n' '{"schema":"p4b-loop-log/v1","started_at_epoch":1,"loop":{"reviewer":"r","adapter":"a","direction":"d","loop":1,"verdict":"CHANGES_REQUESTED","fell_back":false,"elapsed_seconds":500,"timeout_seconds":900,"effort":"high"},"details":[]}' > "$ARCH_LOOPS/live.jsonl"
+printf '%s\n' '{"schema":"p4b-loop-log/v1","started_at_epoch":2,"loop":{"reviewer":"r","adapter":"a","direction":"d","loop":2,"verdict":"APPROVED","fell_back":false,"elapsed_seconds":700,"timeout_seconds":900,"effort":"high"},"details":[]}' > "$ARCH_LOOPS/done.jsonl.archive"
+if bash "$SCRIPT" --analyze-only --loops-dir "$ARCH_LOOPS" --out-dir "$ARCH_OUT" >/dev/null 2>"$ARCH_OUT/err.log"; then
+  n_p4b=$(jq -s '[ .[] | select(.kind == "p4b_round") ] | length' "$ARCH_OUT/events.jsonl")
+  [ "$n_p4b" = "2" ] && pass "phase-4b: both live *.jsonl and *.jsonl.archive rounds are scanned" \
+    || fail "p4b_round events: got $n_p4b, want 2 (archive glob missing?)"
+else
+  fail "archive-glob scenario: --analyze-only exited non-zero: $(cat "$ARCH_OUT/err.log" 2>/dev/null)"
 fi
 
 echo

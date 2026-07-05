@@ -46,8 +46,10 @@
 #      the trigger is posted, never WHETHER Codex participates.
 #   1. Reads codex.review_timeout_seconds, codex.ack_wait_seconds,
 #      codex.max_ack_retries, and codex.bot_login from
-#      .github/review-policy.yml (defaults: 600 / 60 / 1 /
-#      chatgpt-codex-connector[bot]).
+#      .github/review-policy.yml (defaults: 840 / 30 / 1 /
+#      chatgpt-codex-connector[bot]; the 840s review_timeout and 30s
+#      ack_wait are measured retunes — see #623 and the per-constant
+#      comments below).
 #   2. Fetches the PR's current HEAD commit SHA and committer date. Any
 #      Codex review is only considered "current" if it is anchored on
 #      this commit (commit_id == HEAD_SHA). Any Codex +1 reaction is
