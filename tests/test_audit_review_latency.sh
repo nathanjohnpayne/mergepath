@@ -124,6 +124,16 @@ else
   fail "summary.md missing d_cr_review_latency section"
 fi
 
+# --- regression: the audit script must be plain text, not binary -------------
+# A NUL byte in a jq key separator (Codex P3 on #688) turned the script into a
+# binary file: `file` reported "binary data" and rg/grep silently skipped it,
+# hiding line-level matches from review and search tooling. Keep it greppable.
+if [ "$(LC_ALL=C tr -cd '\000' < "$SCRIPT" | wc -c | tr -d ' ')" = "0" ]; then
+  pass "audit script is NUL-free (plain text, greppable)"
+else
+  fail "audit script contains NUL byte(s) — jq key separators must be printable"
+fi
+
 echo
 echo "audit-review-latency: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

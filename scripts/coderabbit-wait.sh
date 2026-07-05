@@ -60,7 +60,7 @@
 #              $OP_PREFLIGHT_REVIEWER_PAT after preflight.
 #
 # Behavior:
-#   1. Reads coderabbit.max_wait_seconds (default 300) and
+#   1. Reads coderabbit.max_wait_seconds (default 1140; measured p99, #623) and
 #      coderabbit.max_rate_limit_retries (default 2) from
 #      .github/review-policy.yml.
 #   2. Fetches PR HEAD SHA + committer date.

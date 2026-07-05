@@ -276,7 +276,7 @@ analyze() {
 
     map(select(.kind != null)) as $ev
     | ($ev | map(select(.kind=="pr")) | INDEX("\(.repo)#\(.pr)")) as $prs
-    | ($ev | map(select(.kind=="commit")) | INDEX("\(.repo) \(.sha)")) as $commits
+    | ($ev | map(select(.kind=="commit")) | INDEX("\(.repo) \(.sha)")) as $commits
     | ($ev | map(select(.kind=="commit"))) as $all_commits
     | ($ev | map(select(.kind=="cr_ratelimit"))) as $ratelimits
 
@@ -304,7 +304,7 @@ analyze() {
       ( ($ev | map(select(.kind=="cr_review" and .commit_id != null and .real_review==true))
          | group_by("\(.repo) \(.commit_id)")
          | map(sort_by(.submitted_at) | .[0]))[] as $r
-        | ($commits["\($r.repo) \($r.commit_id)"]
+        | ($commits["\($r.repo) \($r.commit_id)"]
            // ([ $all_commits[] | select(.repo==$r.repo and (.sha | startswith($r.commit_id))) ] | first)) as $c
         | select($c != null)
         | (($r.submitted_at | ts) - ($c.committer_date | ts)) as $sec
