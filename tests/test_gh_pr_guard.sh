@@ -264,6 +264,40 @@ assert_rc_contains "self-approve over-threshold blocked from wrapper identity" 2
 assert_rc_contains "cross-agent approve allowed" 0 "" \
   'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "Authoring-Agent: claude" "5000" "0"
 
+# --- #671: the self-approve sub-guard resolves the reviewer the same way
+# the wrapper will (GH_AS_REVIEWER_IDENTITY, then MERGEPATH_AGENT, then
+# the default), honoring an inline same-segment MERGEPATH_AGENT prefix.
+# Session default (expected reviewer arg) stays nathanpayne-claude in all
+# of these — exactly the PR #663 incident shape.
+assert_rc_contains "cross-agent approve via inline MERGEPATH_AGENT allowed (#671)" 0 "" \
+  'MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# ...the same inline form naming the AUTHORING agent is still self-approve.
+assert_rc_contains "same-agent approve via inline MERGEPATH_AGENT still blocked (#671)" 2 "self-approve detected" \
+  'MERGEPATH_AGENT=claude scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# ...an inline value the hook cannot resolve to a literal identity fails
+# closed: a command-substitution value and a non-slug value are both
+# blocked rather than guessed at.
+assert_rc_contains "cmdsub inline MERGEPATH_AGENT approve blocked (#671)" 2 "" \
+  'MERGEPATH_AGENT=$(cat /tmp/agent) scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+assert_rc_contains "non-slug inline MERGEPATH_AGENT approve blocked (#671)" 2 "not a plain agent slug" \
+  'MERGEPATH_AGENT="codex or claude" scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# ...an inline prefix scoped to an EARLIER command does not leak across
+# the separator: the wrapper never sees it, so the sub-guard must not
+# credit it as the cross-agent identity (falls back to the default →
+# still self-approve).
+assert_rc_contains "MERGEPATH_AGENT prefix on an earlier command does not unlock approve (#671)" 2 "self-approve detected" \
+  'MERGEPATH_AGENT=codex echo ok ; scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# ...env -i strips MERGEPATH_AGENT from the wrapper environment, so an
+# earlier inline prefix must not survive it (wrapper bottoms out at its
+# hardcoded claude default → same-agent → blocked).
+assert_rc_contains "inline MERGEPATH_AGENT before env -i does not unlock approve (#671)" 2 "self-approve detected" \
+  'MERGEPATH_AGENT=codex env -i scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
 ORIG_DIR="$(pwd)"
 mkdir -p "$WORKDIR/repo-with-policy/.github"
 cat >"$WORKDIR/repo-with-policy/.github/review-policy.yml" <<'YML'

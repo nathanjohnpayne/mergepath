@@ -1874,6 +1874,21 @@ INLINE_GH_AS_AUTHOR_IDENTITY_SET=0
 INLINE_GH_AS_REVIEWER_IDENTITY_SET=0
 STANDALONE_GH_AS_AUTHOR_IDENTITY_SET=0
 STANDALONE_GH_AS_REVIEWER_IDENTITY_SET=0
+# Inline MERGEPATH_AGENT prefix (#671). The reviewer wrapper resolves its
+# identity via GH_AS_REVIEWER_IDENTITY, then nathanpayne-$MERGEPATH_AGENT,
+# then its hardcoded default — and the documented cross-agent approval
+# form passes MERGEPATH_AGENT as a same-segment prefix assignment
+# (MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr review
+# --approve ...). The self-approve sub-guard must resolve the reviewer the
+# same way the wrapper will, so the DEFINITELY-effective inline prefix is
+# captured here. Standalone / export / eval MERGEPATH_AGENT assignments
+# are deliberately NOT modeled: an unmodeled form falls back to the
+# hook-environment/default chain, i.e. the pre-#671 resolution, whose
+# failure mode is a false BLOCK (fail closed), never a false allow of a
+# same-agent approve — and the wrapper itself still token-verifies
+# whatever identity it actually resolves.
+INLINE_MERGEPATH_AGENT=""
+INLINE_MERGEPATH_AGENT_SET=0
 GLOBAL_REPO=""
 PR_SUBCOMMAND=""
 PR_SUBCOMMAND_INDEX=-1    # index in TOKENS where the gh pr subcommand was found
@@ -2027,6 +2042,10 @@ for i in "${!TOKENS[@]}"; do
           INLINE_GH_AS_REVIEWER_IDENTITY=""
           INLINE_GH_AS_REVIEWER_IDENTITY_SET=1
           ;;
+        MERGEPATH_AGENT)
+          INLINE_MERGEPATH_AGENT=""
+          INLINE_MERGEPATH_AGENT_SET=1
+          ;;
       esac
     fi
     PENDING_PREFIX_FLAG=""
@@ -2111,6 +2130,12 @@ for i in "${!TOKENS[@]}"; do
       INLINE_GH_AS_REVIEWER_IDENTITY=""
       INLINE_GH_AS_AUTHOR_IDENTITY_SET=0
       INLINE_GH_AS_REVIEWER_IDENTITY_SET=0
+      # MERGEPATH_AGENT is reset unconditionally: only a same-segment
+      # prefix (definitely in the wrapper's environment) is honored by the
+      # self-approve sub-guard; a standalone assignment falls back to the
+      # env/default chain, which can only over-block (#671).
+      INLINE_MERGEPATH_AGENT=""
+      INLINE_MERGEPATH_AGENT_SET=0
       SEGMENT_HAS_COMMAND=0
       continue
       ;;
@@ -2142,6 +2167,10 @@ for i in "${!TOKENS[@]}"; do
       GH_AS_REVIEWER_IDENTITY=*)
         INLINE_GH_AS_REVIEWER_IDENTITY="${tok#GH_AS_REVIEWER_IDENTITY=}"
         INLINE_GH_AS_REVIEWER_IDENTITY_SET=1
+        ;;
+      MERGEPATH_AGENT=*)
+        INLINE_MERGEPATH_AGENT="${tok#MERGEPATH_AGENT=}"
+        INLINE_MERGEPATH_AGENT_SET=1
         ;;
     esac
   fi
@@ -2325,11 +2354,18 @@ for i in "${!TOKENS[@]}"; do
             INLINE_GH_AS_REVIEWER_IDENTITY_SET=1
             continue
             ;;
+          --unset=MERGEPATH_AGENT|-u=MERGEPATH_AGENT|-uMERGEPATH_AGENT)
+            INLINE_MERGEPATH_AGENT=""
+            INLINE_MERGEPATH_AGENT_SET=1
+            continue
+            ;;
           -i|--ignore-environment)
             INLINE_GH_AS_AUTHOR_IDENTITY=""
             INLINE_GH_AS_AUTHOR_IDENTITY_SET=1
             INLINE_GH_AS_REVIEWER_IDENTITY=""
             INLINE_GH_AS_REVIEWER_IDENTITY_SET=1
+            INLINE_MERGEPATH_AGENT=""
+            INLINE_MERGEPATH_AGENT_SET=1
             # env -i clears EVERYTHING the wrapper would see —
             # including MERGEPATH_AGENT — so the reviewer fallback
             # must be the wrapper's bare hardcoded default, not the
@@ -2623,7 +2659,12 @@ fi
 # them, per REVIEW_POLICY.md § No-self-approve scoping. The hook
 # detects:
 #   - PR_SUBCOMMAND=review with --approve in the args
-#   - reviewer wrapper identity = nathanpayne-<agent>
+#   - reviewer wrapper identity = nathanpayne-<agent>, resolved the same
+#     way the wrapper itself will (gh_default_reviewer_identity in
+#     scripts/lib/gh-token-resolver.sh): GH_AS_REVIEWER_IDENTITY first,
+#     then nathanpayne-$MERGEPATH_AGENT, then the hardcoded default —
+#     preferring the inline same-segment assignment captured from this
+#     command over the hook environment at each link (#671)
 #   - PR body contains `Authoring-Agent: <agent>` matching the same
 #     agent suffix
 #   - PR is over-threshold (determined from .github/review-policy.yml
@@ -2688,7 +2729,56 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
   fi
 
   if [ "$REVIEW_APPROVE" -eq 1 ] && [ "${BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK:-0}" != "1" ]; then
-    REVIEWER_FOR_APPROVE="${WRAPPER_REVIEWER_IDENTITY:-}"
+    # Resolve the reviewer identity the WRAPPER will actually run under —
+    # the same chain gh_default_reviewer_identity() walks. The previous
+    # resolution reused the consistency-loop candidate, which never honors
+    # an inline MERGEPATH_AGENT=<agent> prefix, so a legitimate cross-agent
+    # approval (MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr
+    # review --approve on a claude-authored PR — the Operation-to-Identity
+    # Matrix row for that case) was mis-resolved to the session default
+    # agent and blocked as self-approve (#671, observed on PR #663).
+    #
+    # OP_PREFLIGHT_AGENT (the wrapper chain's third link) is deliberately
+    # not modeled — same posture as the first-round consistency check; an
+    # unmodeled link falls back to the default and can only over-block,
+    # the fail-closed direction.
+    REVIEWER_FOR_APPROVE=""
+    if [ "$WRAPPER_KIND" = "reviewer" ]; then
+      if [ "$INLINE_MERGEPATH_AGENT_SET" -eq 1 ]; then
+        # Fail closed on an inline value the hook cannot map to a literal
+        # reviewer identity: a command-substitution remnant or anything
+        # that is not a plain agent slug. The wrapper might resolve such a
+        # value to ANY identity — including the authoring agent — so the
+        # sub-guard must not guess.
+        case "$INLINE_MERGEPATH_AGENT" in
+          *__MERGEPATH_CMDSUB__*|*__MERGEPATH_CMDSUB_LITERAL__*)
+            echo "BLOCKED: unverifiable inline MERGEPATH_AGENT on a gh pr review --approve." >&2
+            echo "  A \$(...) or backtick value cannot be identity-checked by the hook, and the" >&2
+            echo "  self-approve sub-guard must know which reviewer the wrapper will run under (#671)." >&2
+            echo "  Use a literal agent name: MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr review ..." >&2
+            exit 2
+            ;;
+          *[!A-Za-z0-9_-]*)
+            echo "BLOCKED: inline MERGEPATH_AGENT is not a plain agent slug; cannot resolve the" >&2
+            echo "  reviewer identity for the self-approve check (#671). Use a literal agent name." >&2
+            exit 2
+            ;;
+        esac
+      fi
+      if [ "$INLINE_GH_AS_REVIEWER_IDENTITY_SET" -eq 1 ] && [ -n "$INLINE_GH_AS_REVIEWER_IDENTITY" ]; then
+        REVIEWER_FOR_APPROVE="$INLINE_GH_AS_REVIEWER_IDENTITY"
+      elif [ "$INLINE_GH_AS_REVIEWER_IDENTITY_SET" -eq 0 ] && [ -n "${GH_AS_REVIEWER_IDENTITY:-}" ] \
+           && [ "$IDENTITY_ENV_CLEARED_FOR_WRAPPER" -eq 0 ]; then
+        REVIEWER_FOR_APPROVE="$GH_AS_REVIEWER_IDENTITY"
+      elif [ "$INLINE_MERGEPATH_AGENT_SET" -eq 1 ] && [ -n "$INLINE_MERGEPATH_AGENT" ]; then
+        REVIEWER_FOR_APPROVE="nathanpayne-$INLINE_MERGEPATH_AGENT"
+      elif [ "$INLINE_MERGEPATH_AGENT_SET" -eq 0 ] && [ -n "${MERGEPATH_AGENT:-}" ] \
+           && [ "$IDENTITY_ENV_CLEARED_FOR_WRAPPER" -eq 0 ]; then
+        REVIEWER_FOR_APPROVE="nathanpayne-$MERGEPATH_AGENT"
+      else
+        REVIEWER_FOR_APPROVE="nathanpayne-claude"
+      fi
+    fi
     REVIEWER_AGENT=""
     case "$REVIEWER_FOR_APPROVE" in
       nathanpayne-*) REVIEWER_AGENT="${REVIEWER_FOR_APPROVE#nathanpayne-}" ;;
@@ -2821,6 +2911,10 @@ if [ "$PR_SUBCOMMAND" = "review" ]; then
           echo "  a Phase 4 (over-threshold) PR from approving it. Post --comment instead, and let the" >&2
           echo "  cross-agent merge gate (Codex 👍 for Phase 4a, or external CLI APPROVED for Phase 4b)" >&2
           echo "  carry the approval." >&2
+          echo "" >&2
+          echo "  For a legitimate cross-agent approval, select the other reviewer identity the way" >&2
+          echo "  the wrapper resolves it (#671):" >&2
+          echo "    MERGEPATH_AGENT=<agent> scripts/gh-as-reviewer.sh -- gh pr review ... --approve" >&2
           echo "" >&2
           echo "  If this PR is actually under-threshold and the heuristic mis-classified it, set" >&2
           echo "  BOOTSTRAP_GH_PR_GUARD_SKIP_IDENTITY_CHECK=1 for the single call (the identity check" >&2
