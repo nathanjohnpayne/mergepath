@@ -367,13 +367,16 @@ ADAPTER_RUNS=1
 # discretionary finding on an APPROVED verdict, filed in $REPO under the
 # AUTHOR identity (the owner files issues per house convention; `gh issue
 # create` is deliberately not byline-guarded, #317/#342) and assigned to it.
-# Prints comma-separated `#N` references on success. ANY single failure —
+# Prints TWO lines: line 1 = comma-separated `#N` references (reused +
+# created, for the review body), line 2 = the subset CREATED by this
+# invocation (for cleanup — a reused prior-run issue must never be closed
+# by this run's failure paths, #674 round-5 P2). ANY single failure —
 # token unresolvable, a missing label on the target repo, an API error —
 # returns non-zero so the caller refuses the approval (fail-closed: an
 # APPROVED may never post with its observations unfiled; that failure mode
 # degrades exactly to the pre-#672 refusal).
 p4b_file_post_review_issues() {
-  local vjson="$1" author_login token refs="" i total sev fpath fline fbody title bfile url
+  local vjson="$1" author_login token refs="" created="" i total sev fpath fline fbody title bfile url
   author_login="$(p4b_top_field author_identity)"; author_login="${author_login:-nathanjohnpayne}"
   token="${OP_PREFLIGHT_AUTHOR_PAT:-}"
   if [ -z "$token" ]; then
@@ -437,13 +440,14 @@ p4b_file_post_review_issues() {
       --title "$title" --body-file "$bfile" \
       --label post-review --label "$kind" \
       --assignee "$author_login" 2>/dev/null)" \
-      || { rm -f "$bfile"; printf '%s' "$refs"; return 1; }
+      || { rm -f "$bfile"; printf '%s\n%s' "$refs" "$created"; return 1; }
     rm -f "$bfile"
-    [ -n "$url" ] || { printf '%s' "$refs"; return 1; }
+    [ -n "$url" ] || { printf '%s\n%s' "$refs" "$created"; return 1; }
     refs="${refs:+$refs, }#${url##*/}"
+    created="${created:+$created, }#${url##*/}"
     i=$((i + 1))
   done
-  printf '%s' "$refs"
+  printf '%s\n%s' "$refs" "$created"
 }
 
 # p4b_close_post_review_issues <refs "#1, #2"> <reason>
@@ -470,6 +474,7 @@ p4b_close_post_review_issues() {
 }
 
 POST_REVIEW_ISSUE_REFS=""
+P4B_CREATED_ISSUE_REFS=""
 if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
   # Policy step 9 (#672): observations/risks from an approving external
   # reviewer become post-review issues BEFORE the approval clears the merge
@@ -535,30 +540,36 @@ if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
       fall_back_to_manual "an unresolved required-tier finding was recorded on the current head ($HEAD) in a prior Phase 4b loop — refusing to file post-review issues for an approval that will not post"
     fi
     set +e
-    POST_REVIEW_ISSUE_REFS="$(p4b_file_post_review_issues "$FILE_JSON")"
+    _pri_out="$(p4b_file_post_review_issues "$FILE_JSON")"
     _pri_rc=$?
     set -e
+    POST_REVIEW_ISSUE_REFS="$(printf '%s\n' "$_pri_out" | sed -n 1p)"
+    # Cleanup operates ONLY on refs this invocation created (#674 round-5
+    # P2): a reused prior-run issue in the body refs must never be closed
+    # because a later step of THIS run failed.
+    P4B_CREATED_ISSUE_REFS="$(printf '%s\n' "$_pri_out" | sed -n 2p)"
     if [ "$_pri_rc" -ne 0 ]; then
       # Partial-failure orphans (#674 round-2 + round-4 P2s): surface any
-      # refs that DID file, close them as superseded (self-cleanup), and
-      # refuse. The dedup search is open-scoped, so a rerun files fresh
-      # follow-ups instead of resurrecting the closed ones.
-      if [ -n "$POST_REVIEW_ISSUE_REFS" ]; then
-        p4b_warn "post-review issue filing failed partway; closing the already-filed refs as superseded: $POST_REVIEW_ISSUE_REFS"
-        p4b_close_post_review_issues "$POST_REVIEW_ISSUE_REFS" "Superseded: post-review filing for ${REPO}#${PR} failed partway and the Phase 4b approval was refused; a rerun files fresh follow-ups."
+      # refs that DID file, close this run's creations as superseded
+      # (self-cleanup), and refuse. The dedup search is open-scoped, so a
+      # rerun files fresh follow-ups instead of resurrecting the closed
+      # ones.
+      if [ -n "$P4B_CREATED_ISSUE_REFS" ]; then
+        p4b_warn "post-review issue filing failed partway; closing this run's created refs as superseded: $P4B_CREATED_ISSUE_REFS"
+        p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: post-review filing for ${REPO}#${PR} failed partway and the Phase 4b approval was refused; a rerun files fresh follow-ups."
       fi
-      fall_back_to_manual "approved verdict included findings and post-review issue filing failed${POST_REVIEW_ISSUE_REFS:+ (partial refs: $POST_REVIEW_ISSUE_REFS, closed as superseded)}; refusing to post an approval with unfiled observations"
+      fall_back_to_manual "approved verdict included findings and post-review issue filing failed${POST_REVIEW_ISSUE_REFS:+ (partial refs: $POST_REVIEW_ISSUE_REFS, created subset closed as superseded)}; refusing to post an approval with unfiled observations"
     fi
     [ -n "$POST_REVIEW_ISSUE_REFS" ] \
       || fall_back_to_manual "approved verdict included findings but post-review issue filing produced no references"
     # Post-file head recheck (#674 round-4 P2): a head that drifted DURING
     # filing pins the just-filed issues to a head whose approval will be
     # refused at post_review, and a new-head rerun cannot reuse the old
-    # head-pinned markers. Close them as superseded here and refuse now.
+    # head-pinned markers. Close this run's creations and refuse now.
     live_head_post="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
     if [ -z "$live_head_post" ] || [ "$live_head_post" != "$HEAD" ]; then
-      p4b_warn "PR head drifted during issue filing (reviewed $HEAD, live ${live_head_post:-unreadable}) — closing the just-filed issues as superseded"
-      p4b_close_post_review_issues "$POST_REVIEW_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
+      p4b_warn "PR head drifted during issue filing (reviewed $HEAD, live ${live_head_post:-unreadable}) — closing this run's filed issues as superseded"
+      p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
       fall_back_to_manual "PR head changed while filing post-review issues (reviewed $HEAD, live ${live_head_post:-unreadable}); the filed issues were closed as superseded"
     fi
     p4b_log "filed $FILE_COUNT post-review issue(s): $POST_REVIEW_ISSUE_REFS"
@@ -786,6 +797,15 @@ post_review() {
   live_head="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null || true)"
   [ -n "$live_head" ] || { p4b_acct_mark_unposted "could not re-read live PR head before posting review"; p4b_die 3 "could not re-read live PR head before posting review"; }
   if [ "$live_head" != "$HEAD" ]; then
+    # Late-window drift (#674 round-5 P2): a push landing during body or
+    # accounting rendering reaches this final check with the step-9 issues
+    # already filed — close this run's creations before refusing, same as
+    # the post-file recheck, so no orphan claims an approval that never
+    # posted.
+    if [ "$event" = "APPROVE" ] && [ -n "${P4B_CREATED_ISSUE_REFS:-}" ]; then
+      p4b_warn "PR head drifted before the approval POST — closing this run's filed post-review issues as superseded: $P4B_CREATED_ISSUE_REFS"
+      p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
+    fi
     fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head)"
   fi
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"

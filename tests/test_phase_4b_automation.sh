@@ -324,7 +324,7 @@ if [ "${1:-}" = "api" ]; then
       cnt_file="${P4B_ISSUE_LOG:-${TMPDIR:-/tmp}/p4b-fake}.headreads"
       cnt=$(( $( [ -f "$cnt_file" ] && cat "$cnt_file" || echo 0 ) + 1 ))
       printf '%s\n' "$cnt" > "$cnt_file"
-      if [ -n "${P4B_FAKE_LIVE_HEAD2:-}" ] && [ "$cnt" -ge 2 ]; then
+      if [ -n "${P4B_FAKE_LIVE_HEAD2:-}" ] && [ "$cnt" -ge "${P4B_FAKE_LIVE_HEAD2_FROM:-2}" ]; then
         printf '%s\n' "$P4B_FAKE_LIVE_HEAD2"
       else
         printf '%s\n' "${P4B_FAKE_LIVE_HEAD:-abc123}"
@@ -347,6 +347,13 @@ fi
 # dedup lookup (#674 CodeRabbit): empty by default; P4B_FAKE_EXISTING_ISSUE
 # simulates a marker match from a prior partially-failed run.
 if [ "${1:-}" = "search" ] && [ "${2:-}" = "issues" ]; then
+  if [ -n "${P4B_FAKE_EXISTING_ISSUE_ONCE:-}" ]; then
+    scnt_file="${P4B_ISSUE_LOG:-${TMPDIR:-/tmp}/p4b-fake}.searches"
+    scnt=$(( $( [ -f "$scnt_file" ] && cat "$scnt_file" || echo 0 ) + 1 ))
+    printf '%s\n' "$scnt" > "$scnt_file"
+    [ "$scnt" -eq 1 ] && printf 'https://github.com/o/r/issues/777\n'
+    exit 0
+  fi
   [ -n "${P4B_FAKE_EXISTING_ISSUE:-}" ] && printf 'https://github.com/o/r/issues/777\n'
   exit 0
 fi
@@ -1577,6 +1584,39 @@ if [ "$rc" = 0 ] \
    && grep -q "ignore tiers and were deliberately not surfaced" "$MIXED_BODY"; then
   pass "#674: mixed approval body claims filing only for the filed subset"
 else fail "#674 mixed filed/ignored body wording (rc=$rc)"; fi
+
+# #674 round 5: a REUSED prior-run issue is never closed by this run's
+# failure cleanup — only refs this invocation created are.
+REUSE_ISSUE_LOG="$WORK/issue-reuse-fail.log"; : > "$REUSE_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-2p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$REUSE_ISSUE_LOG" \
+  P4B_FAKE_EXISTING_ISSUE_ONCE=1 P4B_FAKE_ISSUE_FAIL=1 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/p4b674-reuse-wrapper.log" \
+  P4B_FAKE_LIVE_HEAD=abc123 \
+  bash "$ORCH" 146 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] && ! grep -q "^CLOSE #777$" "$REUSE_ISSUE_LOG"; then
+  pass "#674: reused prior-run issue is NOT closed by this run's failure cleanup"
+else fail "#674 reused-ref protection (rc=$rc)"; fi
+
+# #674 round 5: drift landing in the render window (after the post-file
+# recheck, before the POST) still closes this run's filed issues.
+LATE_ISSUE_LOG="$WORK/issue-late-drift.log"; : > "$LATE_ISSUE_LOG"
+set +e
+out="$(PATH="$BIN:$PATH" MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" CODEX_BIN="$BIN/fake-codex-approve-p2" \
+  OP_PREFLIGHT_AUTHOR_PAT=fake-author-pat P4B_ISSUE_LOG="$LATE_ISSUE_LOG" \
+  P4B_FAKE_LIVE_HEAD=abc123 P4B_FAKE_LIVE_HEAD2=def456 P4B_FAKE_LIVE_HEAD2_FROM=3 \
+  P4B_GH_AS_REVIEWER="$BIN/fake-gh-as-reviewer" P4B_WRAPPER_LOG="$WORK/p4b674-late-wrapper.log" \
+  bash "$ORCH" 147 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 4 ] \
+   && printf '%s' "$out" | jq -r '.reason' | grep -q "changed during review" \
+   && grep -q "^CLOSE #901$" "$LATE_ISSUE_LOG"; then
+  pass "#674: render-window drift closes this run's filed issues before refusing"
+else fail "#674 late-drift cleanup (rc=$rc): $out"; fi
+[ ! -s "$WORK/p4b674-late-wrapper.log" ] \
+  && pass "#674: no review POST after render-window drift" || fail "#674: review POST attempted after late drift"
 
 # #672 opt-out: post_review_issues: false restores the pre-#672 refusal.
 POLICY_NO_ISSUES="$WORK/policy-no-issues.yml"
