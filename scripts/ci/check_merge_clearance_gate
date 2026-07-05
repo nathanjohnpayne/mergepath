@@ -85,6 +85,33 @@ if [ -f "$WORKFLOW" ]; then
     FAILED=1
   fi
 
+  # #658: the propagation lane's head-pinned verified-head marker is posted as
+  # a GITHUB_TOKEN github-actions[bot] ISSUE comment, and GITHUB_TOKEN-authored
+  # events create no workflow runs — so an issue_comment trigger could never
+  # re-run the gate for it. Instead pr-review-policy.yml's lane sends a
+  # `merge-clearance-recheck` repository_dispatch right after posting the
+  # marker. Require that trigger AND the dispatch-recheck wiring (the dispatch
+  # type + resolving the PR from github.event.client_payload.pr), so a verified
+  # sync PR clears promptly instead of riding a fail-closed spurious-red until
+  # the */15 sweep. No payload trust is added: the dispatch only schedules a
+  # re-run; the gate re-derives clearance from the head-pinned
+  # github-actions[bot] marker in scripts/merge-clearance-gate.sh
+  # lane_verified(). Keep the `merge-clearance-recheck` type in sync with the
+  # lane. Label events are never a trigger here (#429 round-3 P1).
+  if ! grep -qE "^[[:space:]]*repository_dispatch:" "$WORKFLOW"; then
+    echo "FAIL: $WORKFLOW missing the repository_dispatch trigger."
+    echo "      The propagation-lane verified-head marker is a GITHUB_TOKEN issue comment (creates no workflow run); without the merge-clearance-recheck repository_dispatch a verified sync PR rides a fail-closed spurious-red gate until the scheduled sweep (#658)."
+    FAILED=1
+  fi
+  dispatch_wiring_missing=0
+  grep -qF "merge-clearance-recheck" "$WORKFLOW" || dispatch_wiring_missing=1
+  grep -qF "github.event.client_payload.pr" "$WORKFLOW" || dispatch_wiring_missing=1
+  if [ "$dispatch_wiring_missing" -ne 0 ]; then
+    echo "FAIL: $WORKFLOW repository_dispatch path is not wired for the marker re-trigger."
+    echo "      It must accept the 'merge-clearance-recheck' dispatch type AND resolve the PR from github.event.client_payload.pr in a check_run-posting job (#658)."
+    FAILED=1
+  fi
+
   # The required-check display name (job name) must match the name the
   # scheduled-sweep posts AND the entry in audit-branch-protection.sh's
   # CANONICAL_REQUIRED_CHECKS. Branch protection keys on the job name, so

@@ -342,9 +342,13 @@ jobs:
           # agent-review.yml's `unlabeled` settle re-arm, and GITHUB_TOKEN-driven
           # events create no workflow runs (the #315/#324 auto-clear lesson) —
           # a GITHUB_TOKEN removal here leaves an approved, settled PR
-          # CLEAN-but-unmerged. PAT-scoped to the removal command ONLY: the
-          # lane-marker comment below stays github-actions-authored for its
-          # #429 consumers, and every other command keeps the restricted
+          # CLEAN-but-unmerged. The PAT is scoped to the two commands that must
+          # create workflow runs GITHUB_TOKEN cannot: the label removal below,
+          # and the #658 merge-clearance-recheck repository_dispatch. The
+          # lane-marker comment itself deliberately stays on GITHUB_TOKEN so it
+          # remains github-actions-authored for its #429 consumers — but that is
+          # exactly why it fires no run, hence the PAT dispatch that nudges
+          # merge-clearance-gate. Every other command keeps the restricted
           # default token.
           LABEL_REMOVAL_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -410,6 +414,25 @@ jobs:
           > Automated check per .github/review-policy.yml
           EOF
           )"
+            # #658: the marker just posted is a GITHUB_TOKEN github-actions[bot]
+            # issue comment, and GITHUB_TOKEN-authored events create no workflow
+            # runs — so merge-clearance-gate.yml cannot re-run via issue_comment
+            # for this freshly verified head. Nudge it directly with a
+            # repository_dispatch (its `merge-clearance-recheck` trigger) so a
+            # verified sync PR clears the Merge clearance gate promptly instead
+            # of waiting up to 15 min for the scheduled sweep. PAT-driven: the
+            # workflow token is contents:read (cannot POST /dispatches), and
+            # keeping the dispatch on the PAT avoids widening the GITHUB_TOKEN
+            # scope. Best-effort — the gate re-derives clearance from THIS marker
+            # (lane_verified, head-pinned) and never trusts the dispatch payload,
+            # so on any failure the */15 sweep still recovers the gate; a failed
+            # dispatch must never fail the lane. Keep the event type in sync with
+            # merge-clearance-gate.yml's repository_dispatch trigger.
+            GH_TOKEN="$LABEL_REMOVAL_TOKEN" gh api -X POST \
+              "repos/${{ github.repository }}/dispatches" \
+              -f event_type=merge-clearance-recheck \
+              -F "client_payload[pr]=$PR_NUMBER" \
+              || echo "note: merge-clearance-recheck dispatch failed (#658); the */15 scheduled sweep will recover the Merge clearance gate."
           fi
 
           # If a prior run (or a stale label-prefixed edit) applied
