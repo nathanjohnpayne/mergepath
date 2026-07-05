@@ -64,6 +64,30 @@ ROLLUP_WITH_LOCAL='{"statusCheckRollup":[{"name":"lint","conclusion":"SUCCESS"},
 ROLLUP_NO_LOCAL='{"statusCheckRollup":[{"name":"lint","conclusion":"SUCCESS"}]}'
 ROLLUP_CONTEXT_SHAPE='{"statusCheckRollup":[{"context":"repo-lint-local","state":"FAILURE"}]}'
 
+# Empty-required-list branch (#655 Codex P1 r1) replica. KEEP IN SYNC with
+# the elif-branch logic in scripts/codex-review-check.sh.
+empty_branch_required_json() {
+  local rollup_json=$1
+  printf '%s' "$rollup_json" | jq -e '[.statusCheckRollup[]? | (.name // .context // "")] | index("repo-lint-local")' >/dev/null 2>&1 \
+    && printf '["repo-lint-local"]' \
+    || printf '[]'
+}
+
+# End-to-end BAD_CHECKS filter replica. KEEP IN SYNC with the BAD_CHECKS
+# filter in scripts/codex-review-check.sh (workflow/Label Gate exclusion,
+# required-names scoping, non-green selection).
+bad_checks() {
+  local rollup_json=$1 required_names_json=$2
+  printf '%s' "$rollup_json" | jq --argjson required_names "$required_names_json" '
+    [.statusCheckRollup[]
+      | { label: (.name // .context // "?"), workflow: (.workflowName // ""), result: (.conclusion // .state // "") }
+      | select((.workflow != "PR Review Policy") or (.label != "Label Gate"))
+      | (.label) as $label_name
+      | select(($required_names | length) == 0 or ($required_names | index($label_name)) != null)
+      | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
+    ]'
+}
+
 GOT=$(augment '["lint"]' "$ROLLUP_WITH_LOCAL" | jq -c 'sort')
 if [ "$GOT" = '["lint","repo-lint-local"]' ]; then
   pass "annex present (.name shape) -> repo-lint-local is force-included in the required set"
@@ -92,24 +116,41 @@ else
   fail "already-required: expected no duplicate, got $GOT"
 fi
 
+# ── 2b. Inline logic: the EMPTY-required-list branch (#655 Codex P1 r1). A
+#      repo whose branch protection has NO required checks configured (404,
+#      e.g. ruleset-only branch protection with no classic
+#      required_status_checks resource) previously wiped the rollup to
+#      empty unconditionally -- silently hiding repo-lint-local too.
+GOT=$(empty_branch_required_json "$ROLLUP_WITH_LOCAL")
+if [ "$GOT" = '["repo-lint-local"]' ]; then
+  pass "empty required-list branch: annex present -> scopes REQUIRED_JSON to repo-lint-local alone (#655)"
+else
+  fail "empty required-list branch: annex present expected [\"repo-lint-local\"], got $GOT"
+fi
+
+GOT=$(empty_branch_required_json "$ROLLUP_NO_LOCAL")
+if [ "$GOT" = '[]' ]; then
+  pass "empty required-list branch: annex absent -> unchanged (empty required, no enforcement)"
+else
+  fail "empty required-list branch: annex absent expected [], got $GOT"
+fi
+
+# End-to-end: in the empty-required-list branch, a red repo-lint-local now
+# blocks (via the scoped required list) while a red lint (not required by
+# THIS repo's protection) does not -- the inverse of the non-empty branch's
+# default, matching "no OTHER check is required" plus the #655 force-include.
+GOT=$(bad_checks "$ROLLUP_WITH_LOCAL" '["repo-lint-local"]' | jq -c '[.[].label]')
+if [ "$GOT" = '["repo-lint-local"]' ]; then
+  pass "empty required-list branch end-to-end: only repo-lint-local blocks, lint (unrequired here) does not"
+else
+  fail "empty required-list branch end-to-end: expected [\"repo-lint-local\"], got $GOT"
+fi
+
 # ── 3. End-to-end BAD_CHECKS filter: a red repo-lint-local now surfaces as a
 #      bad check even though it is absent from the required list, mirroring
 #      the exact filter shape codex-review-check.sh applies after
 #      augmentation (workflow/Label Gate exclusion, required-names scoping,
-#      non-green selection). KEEP IN SYNC with the BAD_CHECKS filter in the
-#      real script.
-bad_checks() {
-  local rollup_json=$1 required_names_json=$2
-  printf '%s' "$rollup_json" | jq --argjson required_names "$required_names_json" '
-    [.statusCheckRollup[]
-      | { label: (.name // .context // "?"), workflow: (.workflowName // ""), result: (.conclusion // .state // "") }
-      | select((.workflow != "PR Review Policy") or (.label != "Label Gate"))
-      | (.label) as $label_name
-      | select(($required_names | length) == 0 or ($required_names | index($label_name)) != null)
-      | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
-    ]'
-}
-
+#      non-green selection).
 AUGMENTED=$(augment '["lint"]' "$ROLLUP_WITH_LOCAL")
 GOT=$(bad_checks "$ROLLUP_WITH_LOCAL" "$AUGMENTED" | jq -c '[.[].label]')
 if [ "$GOT" = '["repo-lint-local"]' ]; then

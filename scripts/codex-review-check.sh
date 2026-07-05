@@ -685,11 +685,27 @@ if [ "$protection_readable" -eq 0 ]; then
   REQUIRED_JSON='[]'
 elif [ -z "$REQUIRED_CHECK_NAMES" ]; then
   # Read succeeded; branch protection lists NO required checks (404 or empty
-  # contexts). Nothing to enforce — gate (a) imposes no required-check
-  # filter (the other gates still run).
-  log "gate (a): branch protection for $BASE_BRANCH lists no required checks; gate (a) imposes no required-check filter."
-  ROLLUP_JSON='{"statusCheckRollup":[]}'
-  REQUIRED_JSON='[]'
+  # contexts). Nothing to enforce for any OTHER check — gate (a) imposes no
+  # required-check filter beyond the #655 repo-lint-local force-include
+  # below (the other gates still run).
+  #
+  # #655 (Codex P1): this branch used to wipe ROLLUP_JSON to empty
+  # unconditionally, which also hid a red repo-lint-local. That matters
+  # here specifically: a repo whose branch protection is ruleset-only (no
+  # classic required_status_checks resource) hits this 404 branch on every
+  # PR, so unconditionally wiping the rollup would have left gate (a) never
+  # observing repo-lint-local on such a repo, even after the else-branch
+  # fix above. Keep the full rollup and scope REQUIRED_JSON to
+  # repo-lint-local alone when the rollup reports it, so it is still
+  # force-checked; otherwise preserve the prior no-enforcement behavior.
+  if echo "$ROLLUP_JSON" | jq -e '[.statusCheckRollup[]? | (.name // .context // "")] | index("repo-lint-local")' >/dev/null 2>&1; then
+    log "gate (a): branch protection for $BASE_BRANCH lists no required checks, but the rollup reports repo-lint-local (#655) — force-checking it alone."
+    REQUIRED_JSON='["repo-lint-local"]'
+  else
+    log "gate (a): branch protection for $BASE_BRANCH lists no required checks; gate (a) imposes no required-check filter."
+    ROLLUP_JSON='{"statusCheckRollup":[]}'
+    REQUIRED_JSON='[]'
+  fi
 else
   # Build a jq array of required check names, then force-include
   # `repo-lint-local` (#655) whenever the rollup actually reports it,

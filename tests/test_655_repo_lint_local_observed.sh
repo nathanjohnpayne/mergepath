@@ -48,6 +48,24 @@ assert_grep "agent-review: conditionally adds repo-lint-local to the required-ch
 assert_grep "agent-review: the wait loop iterates over the required_checks array, not one hardcoded name" \
   "$W/agent-review.yml" 'for check in "${required_checks[@]}"; do'
 
+# Codex P1 (#655 round 1): an indeterminate annex-probe read (token scope,
+# rate limit, transient error) must fail closed (assume present), not be
+# treated the same as a confirmed 404 absence.
+assert_grep "agent-review: distinguishes a confirmed 404 (annex genuinely absent) from other errors" \
+  "$W/agent-review.yml" "grep -q 'HTTP 404' \"\$annex_probe_err\""
+assert_grep "agent-review: fails closed (requires the conventional check name) on a non-404 annex-probe error" \
+  "$W/agent-review.yml" 'Could not determine whether repo_lint_local.yml exists'
+
+# Codex P2 (#655 round 1): the annex contract does not mandate the job (and
+# therefore check-run) name be literally repo-lint-local, so the probe
+# derives the actual job name(s) from the annex YAML instead of assuming
+# the filename convention, falling back to the convention only when nothing
+# could be parsed.
+assert_grep "agent-review: derives the annex job name(s) from its YAML rather than assuming the filename" \
+  "$W/agent-review.yml" 'doc["jobs"].each do |id, job|'
+assert_grep "agent-review: falls back to the conventional name only when no job names parse" \
+  "$W/agent-review.yml" 'no job names could be parsed from it'
+
 # auto-clear-blocking-labels.yml: the workflow_run trigger list observes the
 # annex's completion too (verified against a live consumer's repo_lint_local.yml
 # workflow name, per #655).
