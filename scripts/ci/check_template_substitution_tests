@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# scripts/ci/check_template_substitution_tests — CI entry point for the
+# check_template_substitution WRAPPER unit tests (#710).
+#
+# Wraps tests/test_check_template_substitution_wrapper.sh so the
+# repo_lint workflow picks it up alongside the other check_* scripts.
+# That suite exercises the wrapper's hub-vs-consumer disambiguation
+# (the #703 fail-closed keyed on the HUB-ONLY sync-to-downstream.sh
+# marker, and the #710 consumer-must-run-the-test invariant) via
+# self-contained fixture repos — so it is consumer-safe and travels
+# with the kit. Missing test script is a hard error (matches the other
+# check_* CI entry points, e.g. check_coderabbit_config_tests).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_check_template_substitution_wrapper.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_template_substitution_tests: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"

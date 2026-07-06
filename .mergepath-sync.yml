@@ -823,6 +823,17 @@ paths:
   - path: tests/test_template_substitution.sh
     type: canonical
     consumers: all
+  # Pairs with scripts/ci/check_template_substitution_tests (#710) —
+  # the wrapper-behavior suite for check_template_substitution. The
+  # check hard-fails (exit 1) on a missing test file, so the test MUST
+  # travel with the check. The suite itself is self-contained (it
+  # copies the check into a scratch repo and builds fixture markers),
+  # so it is consumer-safe. Same #264 paired-test closure class as the
+  # entries above; guards the #703 hub-marker fail-closed against the
+  # #710 regression (consumer state must run the propagated test).
+  - path: tests/test_check_template_substitution_wrapper.sh
+    type: canonical
+    consumers: all
   # Pairs with scripts/sync-to-downstream.sh's export_consumer_facts +
   # scripts/ci/check_export_consumer_facts. Same coupling class as
   # above — the check wrapper hard-fails on missing test file. Filed
@@ -1037,6 +1048,7 @@ paths:
       - "tests/test_resolve_pr_threads_staleness_pagination.sh"  # check_resolve_pr_threads (delegated test, #573)
       - "tests/test_resolve_pr_threads_verified_propagation.sh"  # check_resolve_pr_threads (delegated test, #572)
       - "tests/test_template_substitution.sh"  # check_template_substitution
+      - "tests/test_check_template_substitution_wrapper.sh"  # check_template_substitution_tests (#710)
       - "tests/test_export_consumer_facts.sh"  # check_export_consumer_facts
       - "tests/test_check_coderabbit_config.sh"  # check_coderabbit_config_tests (#481/#482)
       - "tests/test_check_propagation_closure.sh"  # check_propagation_closure (#521)
