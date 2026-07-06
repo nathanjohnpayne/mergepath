@@ -30,7 +30,7 @@ if [ "$#" -gt 0 ]; then
   case "$1" in
     --check | --write | --diff | --list) MODE="$1"; shift ;;
     -h | --help)
-      sed -n '2,26p' "$0"
+      sed -n '2,24p' "$0"
       exit 0
       ;;
     *)
@@ -81,6 +81,11 @@ is_in_scope() {
     *) return 0 ;;
   esac
 }
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "lint-md-prose-wrap.sh: not inside a git work tree" >&2
+  exit 2
+fi
 
 FILES=()
 while IFS= read -r f; do
