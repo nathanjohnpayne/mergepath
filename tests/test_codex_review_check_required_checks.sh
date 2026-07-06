@@ -81,12 +81,24 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 if grep -q 'ANNEX_CHECKS_JSON' "$SCRIPT" \
    && grep -q 'ANNEX_WORKFLOW_NAME' "$SCRIPT" \
    && grep -q 'doc\["jobs"\].each do |id, job|' "$SCRIPT" \
-   && grep -q 'workflow_name = doc\["name"\].to_s' "$SCRIPT" \
+   && grep -q 'workflow_name = doc\["name"\] ? doc\["name"\].to_s : "\.github/workflows/repo_lint_local\.yml"' "$SCRIPT" \
    && grep -q 'ANNEX_WORKFLOW_BAD' "$SCRIPT" \
    && grep -q "#655" "$SCRIPT"; then
   pass "codex-review-check.sh gate (a) probes the annex, derives (name, workflow) pairs plus the annex workflow name, and scans it for reported failures (#655)"
 else
   fail "codex-review-check.sh gate (a) is missing the annex probe / (name, workflow) derivation / workflow-wide bad-conclusion scan (#655)"
+fi
+
+# Codex P2 (#655 round 6, "use the file path when the annex omits name"):
+# an all-matrix annex with no top-level `name:` used to yield an EMPTY
+# workflow name, disabling the workflow-wide scan entirely even though the
+# annex genuinely exists and reports real check runs under GitHub's own
+# file-path display fallback. Verify the fallback and its trigger condition
+# (doc["name"] falsy) are both present, not just a change to some other line.
+if grep -q 'doc\["name"\] ? doc\["name"\].to_s : "\.github/workflows/repo_lint_local\.yml"' "$SCRIPT"; then
+  pass "codex-review-check.sh falls back to the workflow file path when the annex omits a top-level name: key (#655 round 6)"
+else
+  fail "codex-review-check.sh does not fall back to the workflow file path when the annex's name: key is absent (#655 round 6)"
 fi
 
 if grep -q 'job\["strategy"\].is_a?(Hash) && job\["strategy"\]\["matrix"\]' "$SCRIPT" \

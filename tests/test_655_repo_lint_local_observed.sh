@@ -13,6 +13,15 @@
 # these ultimately rely on for "is CI green" — has its own execution-level
 # test in test_codex_review_check_required_checks.sh.)
 #
+# Round 6 (Codex P1/P2) rewrote how agent-review.yml enforces the annex:
+# rather than forcing its derived check name(s) into the hard-required
+# required_checks_json list (which deadlocked the wait loop forever on a
+# path-filtered or all-matrix annex that would never report under any
+# derivable name), it now captures the annex's own workflow name
+# (annex_workflow) and runs a separate workflow-wide bad/pending scan each
+# poll iteration — the same design codex-review-check.sh gate (a) already
+# uses for the identical reason.
+#
 # The workflow files here cannot be unit-executed without a full Actions
 # runner (same posture as test_465_fail_closed.sh), so this suite asserts
 # each invariant is present in source, plus a bash-syntax check on every
@@ -35,34 +44,64 @@ assert_grep() {  # <label> <file> <fixed-string>
   if [ ! -f "$2" ]; then echo "SKIP: $1 ($2 absent)"; SKIP=$((SKIP + 1)); return; fi
   if grep -qF -- "$3" "$2"; then pass "$1"; else fail "$1 (missing in $2: $3)"; fi
 }
+# Inverse of assert_grep: asserts a string is ABSENT, for regressions that
+# are fixed by removing a dangerous pattern rather than adding a new one.
+assert_not_grep() {  # <label> <file> <fixed-string>
+  if [ ! -f "$2" ]; then echo "SKIP: $1 ($2 absent)"; SKIP=$((SKIP + 1)); return; fi
+  if grep -qF -- "$3" "$2"; then fail "$1 (unexpectedly present in $2: $3)"; else pass "$1"; fi
+}
 
 W=.github/workflows
 
 # agent-review.yml: the required-check wait probes the PR HEAD commit for
 # the annex file via the Contents API (not the job's own checkout) and
-# conditionally requires the repo-lint-local check run alongside lint.
+# conditionally scans its check run(s) alongside lint.
 assert_grep "agent-review: probes for the repo_lint_local.yml annex at the PR HEAD commit (#655)" \
   "$W/agent-review.yml" 'repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$sha'
-assert_grep "agent-review: conditionally adds repo-lint-local to the required-check set (#655)" \
-  "$W/agent-review.yml" 'name: "repo-lint-local", workflow: ""'
 assert_grep "agent-review: the wait loop iterates over the required_checks_json array, not one hardcoded name" \
   "$W/agent-review.yml" 'for ((i = 0; i < check_count; i++)); do'
 
+# Codex P2 (#655 round 6, "avoid forcing path-filtered annex jobs to
+# start"): a consumer annex scoped by workflow-level paths/paths-ignore
+# legitimately never reports under ANY derived name for an out-of-scope
+# PR, so forcing one into required_checks_json (rounds 4-5's approach)
+# made this loop wait out the full deadline and refuse auto-merge forever.
+# required_checks_json must stay scoped to only the canonical check;
+# annex enforcement moves to a name-free workflow-wide scan instead.
+assert_grep "agent-review: required_checks_json stays scoped to only the canonical check (#655 round 6)" \
+  "$W/agent-review.yml" 'required_checks_json stays scoped to ONLY the canonical'
+assert_not_grep "agent-review: no longer force-injects a derived/fallback name into required_checks_json (#655 round 6)" \
+  "$W/agent-review.yml" 'repo-lint-local", workflow: ""'
+assert_grep "agent-review: captures the annex's own workflow name for the separate workflow-wide scan" \
+  "$W/agent-review.yml" 'annex_workflow=$(echo "$annex_probe_raw" | jq -r '"'"'.workflow'"'"')'
+
 # Codex P1 (#655 round 1): an indeterminate annex-probe read (token scope,
-# rate limit, transient error) must fail closed (assume present), not be
-# treated the same as a confirmed 404 absence.
+# rate limit, transient error) must not be silently treated the same as a
+# confirmed 404 absence. Round 6 narrowed HOW this is handled (see above:
+# forcing a guessed name here would risk the same deadlock removed from
+# required_checks_json), but it must still be logged distinctly from a
+# confirmed 404, and codex-review-check.sh's gate (a) remains the
+# fail-closed backstop for this same annex on its own re-evaluation
+# schedule.
 assert_grep "agent-review: distinguishes a confirmed 404 (annex genuinely absent) from other errors" \
   "$W/agent-review.yml" "grep -q 'HTTP 404' \"\$annex_probe_err\""
-assert_grep "agent-review: fails closed (requires the conventional check name) on a non-404 annex-probe error" \
+assert_grep "agent-review: logs (but no longer force-enforces) an indeterminate non-404 annex-probe error, deferring to gate (a) (#655 round 6)" \
   "$W/agent-review.yml" 'Could not determine whether repo_lint_local.yml exists'
 
 # Codex P2 (#655 round 1): the annex contract does not mandate the job (and
 # therefore check-run) name be literally repo-lint-local, so the probe
 # derives the actual job name(s) from the annex YAML instead of assuming
-# the filename convention, falling back to the convention only when nothing
-# could be parsed.
+# the filename convention.
 assert_grep "agent-review: derives the annex job name(s) from its YAML rather than assuming the filename" \
   "$W/agent-review.yml" 'doc["jobs"].each do |id, job|'
+
+# Codex P2 (#655 round 6, "use the file path when the annex omits name"):
+# GitHub displays (and reports into statusCheckRollup .workflowName as) the
+# workflow FILE PATH when the top-level `name:` key is omitted, not an
+# empty string. An empty workflow_name would disable the workflow-wide
+# scan below entirely, even for a valid annex with reported job failures.
+assert_grep "agent-review: falls back to the workflow file path when the annex omits a top-level name: key (#655 round 6)" \
+  "$W/agent-review.yml" 'doc["name"] ? doc["name"].to_s : ".github/workflows/repo_lint_local.yml"'
 
 # Codex P2 (#655 round 2): success/skipped/neutral are all non-blocking
 # conclusions for a required check (matching codex-review-check.sh's own
@@ -82,6 +121,18 @@ assert_grep "agent-review: accepts SUCCESS, SKIPPED, and NEUTRAL conclusions acr
 assert_grep "agent-review: skips matrix-strategy annex jobs during derivation instead of guessing their expanded name(s)" \
   "$W/agent-review.yml" 'job["strategy"].is_a?(Hash) && job["strategy"]["matrix"]'
 
+# Codex P1 (#655 round 6, "observe matrix annex jobs before auto-merge"): a
+# matrix job is excluded from NAME derivation above, but its annex_workflow
+# is still captured, so a reported failing matrix leg (under an expanded
+# name this static read could never predict) is still caught by the
+# workflow-wide scan matching on .workflowName alone.
+assert_grep "agent-review: workflow-wide annex scan matches by .workflowName, catching a matrix-leg failure without its expanded name" \
+  "$W/agent-review.yml" '[.statusCheckRollup[] | select((.workflowName // "") == $workflow)]'
+assert_grep "agent-review: a bad conclusion reported anywhere in the annex's workflow refuses auto-merge immediately (#655 round 6)" \
+  "$W/agent-review.yml" 'non-passing reported check-run(s) on current HEAD $sha (conclusion=$annex_bad_summary); refusing auto-merge (#655)'
+assert_grep "agent-review: a still-in-progress annex entry is treated as pending (keeps polling), not as a failure (#655 round 6)" \
+  "$W/agent-review.yml" 'check-run(s) still in progress on current HEAD $sha; waiting for completion (#655)'
+
 # Codex P2 (#655 round 4): a 403 (token lacks Contents: read) is usually
 # persistent, unlike other indeterminate errors -- forcing the synthetic
 # fallback here would permanently block native auto-merge on every future
@@ -91,10 +142,13 @@ assert_grep "agent-review: does not fail closed on a confirmed 403 (likely a per
 
 # Codex P2 (#655 round 4): "could not parse the YAML at all" (ruby exits
 # before its `puts` line -- empty output) is a different failure mode from
-# "parsed fine but every job was matrix-strategy and skipped" (ruby emits
-# the literal empty array "[]") -- only the former falls back to the
-# conventional name; the latter must not, since that name will never exist
-# for a matrix-only annex and would permanently block auto-merge.
+# "parsed fine but every job was matrix-strategy and skipped" (ruby emits a
+# jobs: [] with the workflow name still populated). Round 6 stopped forcing
+# a conventional-name fallback for EITHER case (see the required_checks_json
+# assertions above) -- the distinction still matters because the
+# matrix-skipped case still yields a usable annex_workflow for the
+# workflow-wide scan, while the genuine parse failure yields nothing to
+# scan at all.
 assert_grep "agent-review: distinguishes genuine YAML-parse failure from a valid parse where every job was matrix-skipped" \
   "$W/agent-review.yml" 'every job is matrix-strategy (skipped)'
 
@@ -117,12 +171,21 @@ assert_grep "agent-review: disambiguates required checks by (name, workflow) via
 # never stand in for a failing canonical `lint`.
 assert_grep "agent-review: groups matching checks by workflow before picking a winner (not a bare sort_by | last)" \
   "$W/agent-review.yml" 'group_by(.workflowName // "")'
-assert_grep "agent-review: treats any non-completed entry as still pending, ahead of a stale completed result" \
-  "$W/agent-review.yml" '(map(select(.status != "COMPLETED"))) as $pending'
 assert_grep "agent-review: picks the latest COMPLETED run within a workflow group when nothing is pending" \
   "$W/agent-review.yml" 'sort_by(.completedAt // .startedAt // "")'
 assert_grep "agent-review: requires every matched workflow group to be green, not just one arbitrary winner" \
   "$W/agent-review.yml" 'Every group'"'"'s winner must be green'
+
+# Codex P2 (#655 round 6, "treat successful status contexts as complete"):
+# a StatusContext entry (e.g. a legacy commit status, no .status field at
+# all -- only CheckRun has one) was treated as pending FOREVER by a bare
+# `.status != "COMPLETED"` check, since null != "COMPLETED" is true
+# regardless of .state. A StatusContext is non-terminal only when .state is
+# literally "PENDING"; a CheckRun is non-terminal whenever .status is
+# present and not "COMPLETED". This predicate is shared by the winner
+# selection, the pending-count check, and the new annex workflow-wide scan.
+assert_grep "agent-review: a status-context entry is pending only when .state is literally PENDING, not merely lacking .status (#655 round 6)" \
+  "$W/agent-review.yml" 'if (.status != null) then (.status != "COMPLETED") else ((.state // "") == "PENDING") end'
 
 # auto-clear-blocking-labels.yml: the workflow_run trigger list observes the
 # annex's completion too (verified against a live consumer's repo_lint_local.yml

@@ -668,7 +668,12 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
         exit
       end
       exit unless doc.is_a?(Hash) && doc["jobs"].is_a?(Hash)
-      workflow_name = doc["name"].to_s
+      # #655 Codex P2 round 6: when the annex omits a top-level `name:`,
+      # GitHub displays (and reports into statusCheckRollup .workflowName
+      # as) the workflow FILE PATH, not an empty string -- an empty
+      # workflow_name would disable the entire workflow-wide scan below,
+      # even for a valid annex with reported job failures.
+      workflow_name = doc["name"] ? doc["name"].to_s : ".github/workflows/repo_lint_local.yml"
       jobs = []
       doc["jobs"].each do |id, job|
         if job.is_a?(Hash) && job["strategy"].is_a?(Hash) && job["strategy"]["matrix"]
@@ -888,6 +893,23 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq --argjson required_names "${REQUIRED_JSON:
 # re-evaluates on every relevant event plus a 5-minute sweep, so a brief
 # "hasn't started yet" window self-resolves on the next evaluation; unlike
 # the failure modes above, it never turns into a permanent block.
+#
+# A still-IN_PROGRESS entry is deliberately INCLUDED, not filtered out: its
+# .conclusion is empty (result=="" falls through to "not SUCCESS/SKIPPED/
+# NEUTRAL"), so a running-but-unfinished annex job counts as not-yet-clear
+# here, same as the canonical required-check filter above already treats an
+# in-progress entry. This is intentional (#655 Codex P1 round 6, "wait for
+# annex checks before clearing the label"): once the annex workflow has
+# actually appeared in the rollup (queued or running), gate (a) must not
+# report clean until it finishes, so a fast-completing sibling workflow
+# (e.g. the canonical lint/review-policy checks) cannot let
+# auto-clear-blocking-labels.yml clear needs-external-review while the
+# slower local annex is still in flight and might yet fail. The remaining
+# gap this does NOT close is the narrower window before the annex workflow
+# has been scheduled at all (zero rollup entries) -- indistinguishable from
+# a path-filtered annex that will never run for this diff without
+# replicating GitHub's own path-matching against the annex's `on:`
+# triggers; see the PR discussion for why that is tracked separately.
 if [ -n "$ANNEX_WORKFLOW_NAME" ]; then
   ANNEX_WORKFLOW_BAD=$(echo "$ROLLUP_JSON" | jq --arg workflow "$ANNEX_WORKFLOW_NAME" '
     [.statusCheckRollup[]
