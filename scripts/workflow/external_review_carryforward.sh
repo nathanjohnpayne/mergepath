@@ -61,6 +61,23 @@ done
 [ -f "$CONFIG" ] || { echo "external_review_carryforward.sh: config not found: $CONFIG" >&2; exit 2; }
 command -v jq >/dev/null 2>&1 || { echo "external_review_carryforward.sh: jq is required" >&2; exit 2; }
 
+codex_enabled=$(awk '
+  /^codex:/ { in_codex = 1; next }
+  in_codex && /^[^[:space:]#]/ { in_codex = 0 }
+  in_codex && $1 == "enabled:" {
+    sub(/^[[:space:]]*enabled:[[:space:]]*/, "", $0)
+    sub(/[[:space:]]*#.*$/, "", $0)
+    gsub(/^["'\'']|["'\'']$/, "", $0)
+    print
+    exit
+  }
+' "$CONFIG")
+codex_enabled=${codex_enabled:-true}
+if [ "$codex_enabled" = "false" ]; then
+  jq -n '{carried:false, reason:"codex.enabled is false; Codex verdict carry-forward is disabled"}'
+  exit 0
+fi
+
 FINGERPRINT_BIN="$SCRIPT_DIR/external_review_fingerprint.sh"
 [ -x "$FINGERPRINT_BIN" ] || { echo "external_review_carryforward.sh: missing executable helper: $FINGERPRINT_BIN" >&2; exit 2; }
 
@@ -281,14 +298,24 @@ while IFS=$'\t' read -r source_time source_sha; do
     if [ -z "$signal_resolved" ]; then
       signal_resolved=$(gh api "repos/$REPO/commits/$signal_sha" --jq .sha 2>/dev/null || true)
     fi
-    [ -n "$signal_resolved" ] || continue
+    if [ -z "$signal_resolved" ]; then
+      echo "external_review_carryforward.sh: newer $signal_kind Codex signal at $signal_time references unresolvable commit $signal_sha; refusing carry-forward" >&2
+      exit 2
+    fi
 
     set +e
     SIGNAL_JSON=$(bash "$FINGERPRINT_BIN" --repo "$REPO" --pr "$PR_NUMBER" --ref "$signal_resolved" --config "$CONFIG" --files-json "$FILES_JSON_PATH" 2>/dev/null)
     signal_fp_rc=$?
     set -e
-    [ "$signal_fp_rc" -eq 0 ] || continue
+    if [ "$signal_fp_rc" -ne 0 ]; then
+      echo "external_review_carryforward.sh: failed to fingerprint newer $signal_kind Codex signal at $signal_time on $signal_resolved; refusing carry-forward" >&2
+      exit 2
+    fi
     SIGNAL_FINGERPRINT=$(printf '%s' "$SIGNAL_JSON" | jq -r '.fingerprint // ""')
+    if [ -z "$SIGNAL_FINGERPRINT" ]; then
+      echo "external_review_carryforward.sh: newer $signal_kind Codex signal at $signal_time produced no fingerprint; refusing carry-forward" >&2
+      exit 2
+    fi
     if [ "$SIGNAL_FINGERPRINT" = "$CURRENT_FINGERPRINT" ]; then
       blocked_by_newer_same_fingerprint=true
       break

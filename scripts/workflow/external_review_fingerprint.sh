@@ -4,7 +4,7 @@ set -euo pipefail
 # Compute a stable fingerprint for the content that makes a PR require
 # external review. The fingerprint is intentionally based on tree object IDs at
 # a chosen ref, not on the head SHA, so a pure base-merge/update-branch that
-# leaves the reviewed files byte-identical keeps the same fingerprint.
+# leaves the reviewed diff byte-identical keeps the same fingerprint.
 #
 # Inputs:
 #   --repo owner/repo
@@ -16,7 +16,7 @@ set -euo pipefail
 # Output: JSON:
 #   {
 #     "requires_review": true|false,
-#     "fingerprint": "external-review:v1:<sha256>" | "",
+#     "fingerprint": "external-review:v2:<sha256>" | "",
 #     "fingerprint_paths": ["..."],
 #     "lines_changed": 123,
 #     "threshold": 300,
@@ -88,6 +88,50 @@ sha256() {
     echo "external_review_fingerprint.sh: sha256sum or shasum is required" >&2
     exit 2
   fi
+}
+
+tree_for_ref() {
+  local ref="$1"
+  local tree_ref="$ref"
+  local commit_json commit_rc commit_tree tree_json
+
+  set +e
+  commit_json=$(gh api "repos/$REPO/commits/$ref" 2>/dev/null)
+  commit_rc=$?
+  set -e
+  if [ "$commit_rc" -eq 0 ]; then
+    commit_tree=$(printf '%s' "$commit_json" | jq -r '.commit.tree.sha // ""')
+    [ -z "$commit_tree" ] || tree_ref="$commit_tree"
+  fi
+
+  tree_json=$(gh api "repos/$REPO/git/trees/$tree_ref?recursive=1" 2>&1) || {
+    echo "external_review_fingerprint.sh: failed to fetch tree for $ref (tree $tree_ref): $tree_json" >&2
+    return 2
+  }
+
+  if [ "$(printf '%s' "$tree_json" | jq -r '.truncated // false')" = "true" ]; then
+    echo "external_review_fingerprint.sh: tree for $ref (tree $tree_ref) is truncated; refusing to fingerprint incompletely" >&2
+    return 2
+  fi
+
+  printf '%s' "$tree_json"
+}
+
+entries_for_tree() {
+  local tree_json="$1"
+  printf '%s' "$tree_json" | jq -c --argjson paths "$FINGERPRINT_PATHS_JSON" '
+    (.tree
+      | map(select(.path as $p | $paths | index($p)))
+      | map({key: .path, value: {type: .type, mode: .mode, oid: .sha}})
+      | from_entries) as $tree
+    | [ $paths[] as $p
+        | if $tree[$p] then
+            {path: $p, state: "present", type: $tree[$p].type, mode: $tree[$p].mode, oid: $tree[$p].oid}
+          else
+            {path: $p, state: "absent", type: null, mode: null, oid: null}
+          end
+      ]
+  '
 }
 
 if [ -n "$FILES_JSON_PATH" ]; then
@@ -194,43 +238,30 @@ fi
 FINGERPRINT_INPUT="$ALL_CHANGED_FILES"$'\n'
 FINGERPRINT_PATHS_JSON=$(printf '%s\n' "$FINGERPRINT_INPUT" | LC_ALL=C sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
 
-TREE_REF="$REF"
-set +e
-COMMIT_JSON=$(gh api "repos/$REPO/commits/$REF" 2>/dev/null)
-commit_rc=$?
-set -e
-if [ "$commit_rc" -eq 0 ]; then
-  COMMIT_TREE=$(printf '%s' "$COMMIT_JSON" | jq -r '.commit.tree.sha // ""')
-  [ -z "$COMMIT_TREE" ] || TREE_REF="$COMMIT_TREE"
-fi
+HEAD_TREE_JSON=$(tree_for_ref "$REF") || exit 2
+HEAD_ENTRIES_JSON=$(entries_for_tree "$HEAD_TREE_JSON")
 
-TREE_JSON=$(gh api "repos/$REPO/git/trees/$TREE_REF?recursive=1" 2>&1) || {
-  echo "external_review_fingerprint.sh: failed to fetch tree for $REF (tree $TREE_REF): $TREE_JSON" >&2
-  exit 2
-}
-
-if [ "$(printf '%s' "$TREE_JSON" | jq -r '.truncated // false')" = "true" ]; then
-  echo "external_review_fingerprint.sh: tree for $REF (tree $TREE_REF) is truncated; refusing to fingerprint incompletely" >&2
+PR_BASE_SHA=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .base.sha 2>/dev/null || true)
+if [ -z "$PR_BASE_SHA" ]; then
+  echo "external_review_fingerprint.sh: failed to resolve PR base sha for $REPO#$PR_NUMBER" >&2
   exit 2
 fi
 
-ENTRIES_JSON=$(printf '%s' "$TREE_JSON" | jq -c --argjson paths "$FINGERPRINT_PATHS_JSON" '
-  (.tree
-    | map(select(.path as $p | $paths | index($p)))
-    | map({key: .path, value: {type: .type, mode: .mode, oid: .sha}})
-    | from_entries) as $tree
-  | [ $paths[] as $p
-      | if $tree[$p] then
-          {path: $p, state: "present", type: $tree[$p].type, mode: $tree[$p].mode, oid: $tree[$p].oid}
-        else
-          {path: $p, state: "absent", type: null, mode: null, oid: null}
-        end
-    ]
-')
+MERGE_BASE_SHA=$(gh api "repos/$REPO/compare/$PR_BASE_SHA...$REF" --jq '.merge_base_commit.sha // ""' 2>/dev/null || true)
+if [ -z "$MERGE_BASE_SHA" ]; then
+  echo "external_review_fingerprint.sh: failed to resolve merge base for $REF against PR base $PR_BASE_SHA" >&2
+  exit 2
+fi
+BASE_TREE_JSON=$(tree_for_ref "$MERGE_BASE_SHA") || exit 2
+BASE_ENTRIES_JSON=$(entries_for_tree "$BASE_TREE_JSON")
 
-CANONICAL=$(jq -S -c -n --arg version "external-review-fingerprint:v1" --argjson entries "$ENTRIES_JSON" '{version:$version, entries:$entries}')
+CANONICAL=$(jq -S -c -n \
+  --arg version "external-review-fingerprint:v2" \
+  --argjson head_entries "$HEAD_ENTRIES_JSON" \
+  --argjson base_entries "$BASE_ENTRIES_JSON" \
+  '{version:$version, head_entries:$head_entries, base_entries:$base_entries}')
 HASH=$(printf '%s' "$CANONICAL" | sha256)
-FINGERPRINT="external-review:v1:$HASH"
+FINGERPRINT="external-review:v2:$HASH"
 
 jq -n \
   --argjson requires true \
