@@ -209,8 +209,74 @@ for ref in "$@"; do
   # mergeStateStatus alone can't distinguish from a review-only block.
   # This helper's precondition is "all CI checks pass", so refuse if any
   # status check is failing or still running.
-  not_green=$(gh_ro pr view "$num" --repo "$repo" --json statusCheckRollup --jq '
-    [ .statusCheckRollup[]?
+  #
+  # Page the statusCheckRollup with a Relay cursor loop instead of
+  # `gh pr view --json statusCheckRollup`. The --json shape requests only
+  # the first 100 contexts and strips pageInfo, so on a long-lived PR whose
+  # head commit has accumulated more than 100 check-runs — repeated
+  # scheduled-sweep re-evaluations routinely push this well past 100 (194
+  # observed on #687) — a failing check beyond the first page is silently
+  # invisible, and this green-checks gate would wave an --admin merge
+  # straight past it. Same silent-truncation gap and same cursor-loop fix as
+  # codex-review-check.sh's rollup fetch (#655 round 13) and #691. Full
+  # pagination (not the fail-closed >100 refusal the reviews gate below
+  # uses) because >100 contexts is the NORMAL state for the long-lived
+  # CODEOWNERS-deadlocked PRs this helper targets — failing closed on it
+  # would make the tool unusable on exactly its intended inputs. Any page
+  # fetch/parse error, or a hasNextPage with no advancing cursor, fails
+  # closed (refuse the merge) rather than risk an undercount that masks a
+  # red check.
+  r_owner="${repo%%/*}"; r_name="${repo##*/}"
+  rollup_query='query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+    repository(owner: $owner, name: $name) {
+      pullRequest(number: $number) {
+        commits(last: 1) { nodes { commit { statusCheckRollup {
+          contexts(first: 100, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              __typename
+              ... on CheckRun { name status conclusion }
+              ... on StatusContext { context state }
+            }
+          }
+        } } } }
+      }
+    }
+  }'
+  rollup_base='.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts'
+  rollup_contexts="[]"; rollup_cursor=""; rollup_ok=1
+  while :; do
+    if [ -n "$rollup_cursor" ]; then
+      rollup_page=$(gh_ro api graphql -f owner="$r_owner" -f name="$r_name" \
+        -F number="$num" -f cursor="$rollup_cursor" -f query="$rollup_query" 2>/dev/null) \
+        || { rollup_ok=0; break; }
+    else
+      rollup_page=$(gh_ro api graphql -f owner="$r_owner" -f name="$r_name" \
+        -F number="$num" -F cursor=null -f query="$rollup_query" 2>/dev/null) \
+        || { rollup_ok=0; break; }
+    fi
+    page_nodes=$(printf '%s' "$rollup_page" | jq -c "(${rollup_base}.nodes // [])" 2>/dev/null) \
+      || { rollup_ok=0; break; }
+    rollup_contexts=$(jq -c -n --argjson a "$rollup_contexts" --argjson b "$page_nodes" '$a + $b' 2>/dev/null) \
+      || { rollup_ok=0; break; }
+    has_next=$(printf '%s' "$rollup_page" | jq -r "(${rollup_base}.pageInfo.hasNextPage // false)" 2>/dev/null) || has_next=false
+    next_cursor=$(printf '%s' "$rollup_page" | jq -r "(${rollup_base}.pageInfo.endCursor // \"\")" 2>/dev/null) || next_cursor=""
+    [ "$has_next" = "true" ] || break
+    # hasNextPage=true with no advancing cursor can't prove the walk
+    # terminates or that later pages were read — fail closed rather than
+    # loop forever or silently undercount.
+    if [ -z "$next_cursor" ] || [ "$next_cursor" = "$rollup_cursor" ]; then
+      rollup_ok=0; break
+    fi
+    rollup_cursor="$next_cursor"
+  done
+  if [ "$rollup_ok" -ne 1 ]; then
+    printf '  ✗ could not read check status (statusCheckRollup pagination failed) — refusing --admin merge\n'
+    OVERALL_RC=1
+    continue
+  fi
+  not_green=$(printf '%s' "$rollup_contexts" | jq -r '
+    [ .[]?
       | select(
           (.__typename == "CheckRun" and (
              (.status != "COMPLETED")
