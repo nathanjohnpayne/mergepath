@@ -170,14 +170,62 @@ assert_grep "D8: daily-feedback-rollup guards dispatch to the default branch (#5
 # approval-triggered auto-merge never arms (regressing #544 / #495). Job-scoped
 # (extract the load-config block) so it cannot false-match the auto-merge gate's
 # own pull_request_review branch.
+#
+# #689: match only non-comment lines. The job's own explanatory comment
+# (right above the `if:`) also says "pull_request_review", so a plain
+# substring grep over the whole block would keep passing on that prose
+# alone even if the real `if:` condition were reverted — defeating the
+# guard. Stripping full-line comments first anchors the match on the
+# live condition.
+grep_nocomment_q() {  # <text> <fixed-string>
+  printf '%s\n' "$1" | grep -v '^[[:space:]]*#' | grep -qF -- "$2"
+}
+
 if [ -f "$W/agent-review.yml" ]; then
   _lc_block=$(awk '/^  load-config:/{f=1;print;next} /^  [A-Za-z._-]+:/{f=0} f{print}' "$W/agent-review.yml")
-  if printf '%s\n' "$_lc_block" | grep -q 'pull_request_review'; then
+  if grep_nocomment_q "$_lc_block" 'pull_request_review'; then
     pass "D9: load-config runs on pull_request_review so the arming gate sees reviewers (#557)"
   else
     fail "D9: load-config must gate on pull_request_review (#557) — direct-approval arming regressed"
   fi
 else echo "SKIP: D9 agent-review (absent)"; SKIP=$((SKIP + 1)); fi
+
+# D9 self-test (#689): prove the comment-stripping actually changes the
+# outcome, so this guard cannot quietly regress back to a bare substring
+# match without a visible test failure. A block whose COMMENT mentions
+# pull_request_review but whose `if:` does not must NOT match; a block
+# whose `if:` genuinely carries the condition must still match.
+_d9_bad_block=$(cat <<'FIXTURE'
+  load-config:
+    # Historical note: this job used to run only on pull_request_review
+    # events before an earlier refactor; kept here for context.
+    if: >
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'opened')
+    runs-on: ubuntu-latest
+FIXTURE
+)
+_d9_good_block=$(cat <<'FIXTURE'
+  load-config:
+    # #557: ALSO run on approved pull_request_review events.
+    if: >
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'opened') ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.state == 'approved')
+    runs-on: ubuntu-latest
+FIXTURE
+)
+if grep_nocomment_q "$_d9_bad_block" 'pull_request_review'; then
+  fail "D9 self-test: guard must not false-pass on a comment-only mention (#689)"
+else
+  pass "D9 self-test: guard ignores a comment-only mention of pull_request_review (#689)"
+fi
+if grep_nocomment_q "$_d9_good_block" 'pull_request_review'; then
+  pass "D9 self-test: guard still matches a real if: condition (#689)"
+else
+  fail "D9 self-test: guard must match a real if: condition on pull_request_review (#689)"
+fi
 
 echo ""
 echo "test_465_fail_closed: $PASS passed, $FAIL failed, $SKIP skipped"
