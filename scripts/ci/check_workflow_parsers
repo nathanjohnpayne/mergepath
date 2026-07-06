@@ -980,7 +980,7 @@ else
 fi
 if grep -Fq "Require current-head check success" .github/workflows/agent-review.yml && \
    grep -Fq "REQUIRED_HEAD_CHECK_NAME: lint" .github/workflows/agent-review.yml && \
-   grep -Fq 'select(.name == $check)' .github/workflows/agent-review.yml && \
+   grep -Fq 'select((.name // .context // "") == $name)' .github/workflows/agent-review.yml && \
    grep -Fq "Re-verify blocking labels after test wait" .github/workflows/agent-review.yml && \
    grep -Fq 'CURRENT_HEAD_SHA=$sha' .github/workflows/agent-review.yml && \
    grep -Fq -- "--match-head-commit" .github/workflows/agent-review.yml && \
@@ -991,6 +991,43 @@ if grep -Fq "Require current-head check success" .github/workflows/agent-review.
 else
   echo "  FAIL: agent-review auto-merge must wait for configured current-head check success, recheck labels, and bind merge to the checked HEAD" >&2
   fail=$((fail + 1))
+fi
+
+echo
+echo "agent-review.yml required-check wait: workflow-disambiguated check matching (#655 Codex P2 rounds 4-5, 11)"
+if grep -Fq 'select($workflow == "" or (.workflowName // "") == $workflow)' .github/workflows/agent-review.yml && \
+   grep -Fq 'group_by(.workflowName // "")' .github/workflows/agent-review.yml && \
+   grep -Fq 'sort_by(.completedAt // .startedAt // "")' .github/workflows/agent-review.yml; then
+  pass=$((pass + 1))
+  echo "  PASS: agent-review required-check wait matches by (name, workflow) via statusCheckRollup, grouping by workflow and picking the latest completed run per group when nothing is pending (#655)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: agent-review required-check wait must disambiguate by workflow via statusCheckRollup and pick the latest run per check (#655)" >&2
+fi
+
+# #655 Codex P2 round 11 ("restrict the lint wait to the required
+# workflow"): gh pr view --json statusCheckRollup has no field for "is
+# this specific entry actually required by branch protection", so the
+# workflow=="" (canonical) match could not tell a coincidentally
+# same-named but non-required check apart from the real one. Switched to
+# a direct graphql call (gh pr view's fixed --json shape omits
+# isRequired, and it is only resolvable when queried directly, not
+# through commits.nodes.commit) so isRequired(pullRequestNumber:) can
+# additionally scope the workflow=="" match to only entries branch
+# protection actually requires when GitHub reports at least one such
+# entry. If no same-name entry reports required=true, keep the configured
+# check wait instead of treating branch-protection metadata as mandatory.
+echo
+echo "agent-review.yml required-check wait: isRequired-preferred canonical match (#655 Codex P2 round 11/15)"
+if grep -Fq 'gh api graphql -f query=' .github/workflows/agent-review.yml && \
+   grep -Fq 'isRequired(pullRequestNumber: $number)' .github/workflows/agent-review.yml && \
+   grep -Fq '([$name_matches[] | select(.isRequired == true)]) as $required_matches' .github/workflows/agent-review.yml && \
+   grep -Fq 'if $workflow == "" and ($required_matches | length) > 0' .github/workflows/agent-review.yml; then
+  pass=$((pass + 1))
+  echo "  PASS: agent-review required-check wait fetches statusCheckRollup via graphql and prefers isRequired==true entries when present (#655 round 11/15)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: agent-review required-check wait does not fetch isRequired or prefer required matches with a configured-check fallback (#655 round 11/15)" >&2
 fi
 
 echo "dependabot-auto-merge.yml author-token equality regression (#426)"

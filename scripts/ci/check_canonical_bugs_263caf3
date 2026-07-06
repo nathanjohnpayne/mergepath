@@ -906,6 +906,14 @@ case "$1" in
         # empty and the existing clearance path is unchanged).
         repos/nathanjohnpayne/mergepath/issues/99999/comments) printf '[]\n' ;;
         repos/nathanjohnpayne/mergepath/issues/99999/reactions) reactions_json ;;
+        # #655 round 16: codex-review-check.sh now fetches the PR's real
+        # changed-file list to evaluate paths/paths-ignore annex filters
+        # for real instead of blanket-disqualifying on their presence.
+        # These Bug 4 fixtures carry no annex at all (confirmed 404 further
+        # below), so the changed-files list is never actually consulted by
+        # the annex-scan branch that matters here -- an empty list is a
+        # harmless, honest stand-in.
+        repos/nathanjohnpayne/mergepath/pulls/99999/files) printf '[]\n' ;;
         *) printf 'unexpected paginated endpoint: %s\n' "${1:-}" >&2; exit 9 ;;
       esac
       exit 0
@@ -926,6 +934,33 @@ JSON
         ;;
       repos/nathanjohnpayne/mergepath/branches/main/protection/required_status_checks)
         exit 1
+        ;;
+      repos/nathanjohnpayne/mergepath/contents/.github/workflows/repo_lint_local.yml?ref=headsha)
+        # #655: this fixture repo carries no repo_lint_local.yml annex --
+        # simulate the real gh CLI's 404 shape (a genuine "Not Found" HTTP
+        # response) so codex-review-check.sh's gate (a) annex probe takes
+        # its "genuinely absent" branch instead of its indeterminate-error
+        # fail-closed branch, matching what a real repo without the annex
+        # returns. Without this the probe's own catch-all "unexpected
+        # endpoint" response (exit 9, no "HTTP 404" text) was
+        # misinterpreted as an indeterminate error, injecting a synthetic
+        # repo-lint-local=MISSING requirement these Bug 4 fixtures never
+        # intended to exercise.
+        echo 'gh: Not Found (HTTP 404)' >&2
+        exit 1
+        ;;
+      graphql)
+        # #655 round 13: codex-review-check.sh's statusCheckRollup fetch
+        # switched from `gh pr view --json statusCheckRollup` (the now-dead
+        # `pr view` stub below) to a paginated `gh api graphql` query, to
+        # fix a real bug where a PR with more than 100 status contexts
+        # silently hid every entry past the first page. These Bug 4
+        # fixtures exercise Codex bot clearance (gate c), not CI-check
+        # status (gate a), so an empty, single-page rollup preserves the
+        # same "zero reported checks" shape the old stub returned.
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}]}}}}}
+JSON
         ;;
       *) printf 'unexpected endpoint: %s\n' "${1:-}" >&2; exit 9 ;;
     esac

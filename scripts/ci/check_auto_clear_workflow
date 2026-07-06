@@ -155,7 +155,12 @@ fi
 # workflow_run must listen to the EXACT upstream workflow names. A
 # rename or typo on either side would silently break the auto-clear
 # without this test catching it. CR Trivial on PR #202 r2.
-for wf in 'PR Review Policy' 'Agent Review Pipeline' 'repo-lint'; do
+# "repo-lint-local" added for #655 — the consumer-local repo_lint_local.yml
+# annex (#601), verified against a live consumer's annex workflow name.
+# ".github/workflows/repo_lint_local.yml" added for #655 round 11 —
+# workflow_run matches by displayed name, which is the workflow FILE PATH
+# when the annex omits a top-level `name:` key (round 6's fallback case).
+for wf in 'PR Review Policy' 'Agent Review Pipeline' 'repo-lint' 'repo-lint-local' '.github/workflows/repo_lint_local.yml'; do
   if grep -qF -- "- \"$wf\"" "$WORKFLOW"; then
     pass=$((pass + 1))
     echo "  PASS: workflow_run listens to '$wf'"

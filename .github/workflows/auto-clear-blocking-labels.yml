@@ -29,11 +29,33 @@ on:
   # Actions — only for external CI providers. Without workflow_run,
   # the common path of "reviewer approves → Actions CI catches up →
   # gate now passes" produced no event and the label stayed stuck.
+  #
+  # "repo-lint-local" (#655) is a consumer's optional, never-propagated
+  # repo_lint_local.yml annex (#601) — a per-consumer workflow named
+  # exactly this (verified against a live consumer annex; mergepath
+  # itself carries no such workflow, so this entry never fires here).
+  # Without it, this workflow's re-evaluation of a consumer's
+  # needs-external-review label only learns about a repo-lint-local
+  # completion via the 5-minute scheduled sweep below, not immediately.
+  # codex-review-check.sh's gate (a) is what actually enforces a red
+  # repo-lint-local as blocking (see scripts/codex-review-check.sh);
+  # this entry only improves how promptly that re-evaluation runs.
+  #
+  # #655 Codex P3 round 11 ("include the unnamed annex workflow
+  # trigger"): workflow_run matches by the target workflow's displayed
+  # NAME, which for an annex that omits a top-level `name:` (a case the
+  # gate code has explicitly supported since round 6) is the workflow
+  # FILE PATH, not the literal "repo-lint-local" above. Listing the file
+  # path too closes that gap for this promptness-only trigger; the
+  # scheduled sweep below still covers it either way, just less
+  # immediately.
   workflow_run:
     workflows:
       - "PR Review Policy"
       - "Agent Review Pipeline"
       - "repo-lint"
+      - "repo-lint-local"
+      - ".github/workflows/repo_lint_local.yml"
     types: [completed]
   # Periodic sweep — catches the 👍-after-last-push case (codex
   # reacts on the PR issue but no synchronize / review / workflow_run

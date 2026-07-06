@@ -664,9 +664,24 @@ paths:
   - path: tests/test_codex_review_check_verdict.sh
     type: canonical
     consumers: all
+  # Gate (a) required-check scoping regression (#655): force-includes the
+  # optional repo_lint_local.yml annex's repo-lint-local check into gate
+  # (a)'s scrutiny regardless of branch protection's required-check list.
+  # check_codex_scripts (scripts/ci kit) hard-runs it, so it must travel to
+  # every consumer or the check fails pre-flight with `No such file`.
+  - path: tests/test_codex_review_check_required_checks.sh
+    type: canonical
+    consumers: all
   # #465 fail-closed structural guards. check_codex_scripts hard-runs it.
   # Propagation-safe (skips workflows/scripts a consumer does not carry).
   - path: tests/test_465_fail_closed.sh
+    type: canonical
+    consumers: all
+  # Cross-workflow structural guard for #655 (agent-review.yml's required-
+  # check wait + auto-clear-blocking-labels.yml's workflow_run trigger both
+  # observing the repo_lint_local.yml annex). check_codex_scripts hard-runs
+  # it. Propagation-safe (skips workflows a consumer does not carry).
+  - path: tests/test_655_repo_lint_local_observed.sh
     type: canonical
     consumers: all
   # Pairs with scripts/codex-record-feedback.sh (#487). check_codex_scripts
@@ -1032,7 +1047,9 @@ paths:
       - "tests/test_codex_review_request_verdict.sh"  # check_codex_scripts (#609)
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
       - "tests/test_codex_review_check_verdict.sh"  # check_codex_scripts (#600/#567)
+      - "tests/test_codex_review_check_required_checks.sh"  # check_codex_scripts (#655)
       - "tests/test_465_fail_closed.sh"        # check_codex_scripts (#465)
+      - "tests/test_655_repo_lint_local_observed.sh"  # check_codex_scripts (#655)
       - "tests/test_codex_record_feedback.sh"  # check_codex_scripts (#487)
       - "tests/test_coderabbit_record_feedback.sh"  # check_coderabbit_record_feedback (#584)
       - "tests/test_audit_propagation_lane.sh" # check_propagation_lane_audit
