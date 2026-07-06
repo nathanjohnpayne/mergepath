@@ -12,12 +12,12 @@ This is the **fan-out** order — the sequence in which consumer PRs are opened 
 
 | Wave | Pair | Why this tier |
 |---|---|---|
-| **1 (riskiest)** | `overridebroadway` + `nathanpaynedotcom` | overridebroadway: private, historically special-cased ("CodeRabbit disabled" era), most bespoke `path_instructions`. nathanpaynedotcom: only consumer with a `tools.eslint.enabled: false` override (Astro) + highest churn. |
-| **2** | `matchline` + `tadlockpsychiatry` | Both private React+TS. matchline = well-trodden reference (deepest bot history); tadlockpsychiatry = quietest / least-observed. |
-| **3** | `device-source-of-truth` + `friends-and-family-billing` | Both public (failures readable without auth), recently touched by the ESLint-floor work. |
-| **4 (safest)** | `device-platform-reporting` + `swipewatch` | Both public, simplest surfaces; swipewatch is the documented ESLint canary. |
+| **1 (riskiest)** | `overridebroadway` + `nathanpaynedotcom` | overridebroadway: historically special-cased ("CodeRabbit disabled" era), most bespoke `path_instructions`. nathanpaynedotcom: only consumer with a `tools.eslint.enabled: false` override (Astro) + highest churn. |
+| **2** | `matchline` + `tadlockpsychiatry` | Both React+TS. matchline = well-trodden reference (deepest bot history); tadlockpsychiatry = quietest / least-observed. |
+| **3** | `device-source-of-truth` + `friends-and-family-billing` | Recently touched by the ESLint-floor work. |
+| **4 (safest)** | `device-platform-reporting` + `swipewatch` | Simplest surfaces; swipewatch is the documented ESLint canary. |
 
-**Rationale:** the dominant failure mode for a wave is **per-consumer idiosyncrasy** (config divergence, local adaptations), not a uniform payload break. Front-loading the private/divergent repos surfaces any check-vs-config interaction while attention is full; fixes land once at the source and later pairs become verification. Public/simple repos last = cheap confirmation.
+**Rationale:** the dominant failure mode for a wave is **per-consumer idiosyncrasy** (config divergence, local adaptations), not a uniform payload break. Front-loading the most divergent repos surfaces any check-vs-config interaction while attention is full; fixes land once at the source and later pairs become verification. Simplest repos last = cheap confirmation. (All 8 consumers are **public** as of 2026-07-06 — visibility was once an ordering factor, since a private repo's CI failures aren't readable without auth, but it no longer distinguishes the tiers; the axis is now divergence and churn.)
 
 ## Canary selection (always do ONE first)
 
