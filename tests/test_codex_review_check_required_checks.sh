@@ -113,7 +113,7 @@ fi
 # $ROLLUP_JSON -- decoupling the two consumers entirely rather than trying
 # to special-case the wiping branch.
 if grep -q 'ANNEX_SCAN_ROLLUP_JSON="\$ROLLUP_JSON"' "$SCRIPT" \
-   && grep -q 'ANNEX_WORKFLOW_BAD=\$(echo "\$ANNEX_SCAN_ROLLUP_JSON"' "$SCRIPT"; then
+   && grep -q 'ANNEX_WORKFLOW_MATCHES=\$(echo "\$ANNEX_SCAN_ROLLUP_JSON"' "$SCRIPT"; then
   pass "codex-review-check.sh freezes a pristine rollup copy for the workflow-wide scan, immune to later required-checks-driven wiping (#655 round 7)"
 else
   fail "codex-review-check.sh's workflow-wide scan is not decoupled from ROLLUP_JSON wiping (#655 round 7)"
@@ -139,10 +139,53 @@ fi
 # actual parse (the danger is in the expansion, not the input size).
 if grep -q 'doc = YAML.safe_load(raw, aliases: true)' "$SCRIPT" \
    && grep -q 'if raw.bytesize > 100_000' "$SCRIPT" \
-   && grep -q 'if raw.scan(/\[&\*\]\[A-Za-z0-9_.-\]+/).length > 40' "$SCRIPT"; then
+   && grep -q 'if raw.scan(/(?:\\A|\[:\\-,\\\[{\])\\s\*\[&\*\]\[A-Za-z0-9_.-\]+/).length > 40' "$SCRIPT"; then
   pass "codex-review-check.sh allows YAML aliases when parsing the annex, bounded by size/token-count DoS guards (#655 round 7)"
 else
   fail "codex-review-check.sh does not allow YAML aliases with the expected DoS guards (#655 round 7)"
+fi
+
+# Codex P2 (#655 round 8, "avoid treating path globs as YAML aliases"): the
+# round-7 token-count guard's naive `[&*]word` scan also counted an
+# ordinary glob like `**/*.ts` in a paths:/paths-ignore: list, since it
+# starts with `*` too -- a legitimate annex with a longer filter list could
+# exceed the cap and be treated as too-dangerous-to-parse, disabling the
+# workflow-wide scan for a real, currently-failing local check. Verify the
+# guard now requires a structural position (start of text, or immediately
+# after `:`/`-`/`,`/`[`/`{`) before counting a token, which a quoted (or
+# otherwise validly-unquoted) glob string never satisfies.
+if grep -q 'raw.scan(/(?:\\A|\[:\\-,\\\[{\])\\s\*\[&\*\]\[A-Za-z0-9_.-\]+/)' "$SCRIPT"; then
+  pass "codex-review-check.sh's alias token-count guard requires a structural position, no longer over-counting quoted path globs (#655 round 8)"
+else
+  fail "codex-review-check.sh's alias token-count guard still uses the naive over-counting regex (#655 round 8)"
+fi
+
+# Codex P2 (#655 round 8, "wait for unreported unfiltered annex checks"):
+# gate (a)'s workflow-wide scan previously treated ANY zero-match case as
+# non-blocking, which was too lenient for an annex whose pull_request
+# trigger has no paths/paths-ignore filter -- such an annex is GUARANTEED
+# to eventually report, so zero matches there means "not scheduled yet",
+# not "may never run". A synthetic PENDING entry is unioned into
+# BAD_CHECKS in that specific case, mirroring how an in-progress entry
+# already blocks (round 6).
+if grep -q 'ANNEX_UNFILTERED' "$SCRIPT" \
+   && grep -q 'ANNEX_WORKFLOW_MATCH_COUNT' "$SCRIPT" \
+   && grep -q '(not yet reported)' "$SCRIPT"; then
+  pass "codex-review-check.sh's workflow-wide scan blocks on an unfiltered annex with zero reported entries instead of silently passing (#655 round 8)"
+else
+  fail "codex-review-check.sh does not treat an unfiltered zero-match annex as not-yet-clean (#655 round 8)"
+fi
+
+# Codex P2 (#655 round 8, "classify only pull_request filters for PR
+# waits"): "unfiltered" must be based on the pull_request trigger
+# specifically (guaranteed to fire for both same-repo and cross-fork PRs),
+# not on every event under `on:` -- an annex with `push: {paths: [...]}}`
+# but an unfiltered `pull_request:` is unfiltered for gate (a)'s purposes
+# even though push is filtered.
+if grep -q 'pr_events.include?("pull_request")' "$SCRIPT"; then
+  pass "codex-review-check.sh classifies unfiltered based on the pull_request trigger specifically, not every event under on: (#655 round 8)"
+else
+  fail "codex-review-check.sh still classifies unfiltered across all on: events, not just pull_request (#655 round 8)"
 fi
 
 if grep -q 'job\["strategy"\].is_a?(Hash) && job\["strategy"\]\["matrix"\]' "$SCRIPT" \
@@ -359,6 +402,45 @@ if [ "$(echo "$GOT" | jq 'length')" = "0" ]; then
   pass "workflow-wide scan: a SKIPPED annex report does not block, consistent with SUCCESS/SKIPPED/NEUTRAL elsewhere"
 else
   fail "workflow-wide scan (skipped): expected 0, got $GOT"
+fi
+
+# #655 round 8 Codex P2 ("wait for unreported unfiltered annex checks"):
+# refines the round-5 "never reported -> not blocking" rule above. When
+# the annex's pull_request trigger is unfiltered (guaranteed to
+# eventually report), zero matches means "not scheduled yet", not "may
+# never run" -- a synthetic PENDING entry is unioned in instead of
+# silently passing. KEEP IN SYNC with scripts/codex-review-check.sh's
+# ANNEX_WORKFLOW_MATCHES / unfiltered-zero-match branch.
+annex_workflow_bad_or_pending() {
+  local rollup_json=$1 workflow=$2 unfiltered=$3
+  local match_count
+  match_count=$(printf '%s' "$rollup_json" | jq --arg workflow "$workflow" '[.statusCheckRollup[] | select((.workflowName // "") == $workflow)] | length')
+  if [ "$match_count" -eq 0 ] && [ "$unfiltered" = "true" ]; then
+    jq -n --arg workflow "$workflow" '[{label: "(not yet reported)", workflow: $workflow, result: "PENDING"}]'
+  else
+    annex_workflow_bad "$rollup_json" "$workflow"
+  fi
+}
+
+GOT=$(annex_workflow_bad_or_pending "$ROLLUP_NEVER_REPORTED" "consumer-annex" "true" | jq -c '[.[].result]')
+if [ "$GOT" = '["PENDING"]' ]; then
+  pass "workflow-wide scan: an unfiltered annex that never reported anything is treated as not-yet-clean, not silently passed (#655 round 8 P2)"
+else
+  fail "workflow-wide scan (unfiltered, never reported): expected [\"PENDING\"], got $GOT"
+fi
+
+GOT=$(annex_workflow_bad_or_pending "$ROLLUP_NEVER_REPORTED" "consumer-annex" "false")
+if [ "$(echo "$GOT" | jq 'length')" = "0" ]; then
+  pass "workflow-wide scan: a path-filtered (unfiltered=false) annex that never reported anything is still NOT blocking, preserving round 5 (#655 round 8)"
+else
+  fail "workflow-wide scan (path-filtered, never reported): expected 0 (round-5 behavior preserved), got $GOT"
+fi
+
+GOT=$(annex_workflow_bad_or_pending "$ROLLUP_ANNEX_REPORTED_GOOD" "repo-lint-local" "true")
+if [ "$(echo "$GOT" | jq 'length')" = "0" ]; then
+  pass "workflow-wide scan: an unfiltered annex that HAS reported green is not treated as pending (real reports still win)"
+else
+  fail "workflow-wide scan (unfiltered, reported green): expected 0, got $GOT"
 fi
 
 # ── 4. End-to-end: union of the required-name-scoped BAD_CHECKS and the

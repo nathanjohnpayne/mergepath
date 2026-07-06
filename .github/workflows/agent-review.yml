@@ -1064,7 +1064,19 @@ jobs:
                 STDERR.puts "repo_lint_local.yml exceeds 100000 bytes -- refusing to parse (defensive cap, not a realistic legitimate size, #655)"
                 exit
               end
-              if raw.scan(/[&*][A-Za-z0-9_.-]+/).length > 40
+              # #655 Codex P2 round 8 ("avoid treating path globs as YAML
+              # aliases"): a naive `[&*]word` scan over-counts, since an
+              # ordinary glob like `**/*.ts` in a paths:/paths-ignore: list
+              # starts with `*` too -- inflating the count on a perfectly
+              # legitimate annex with a longer filter list past the cap. A
+              # real YAML anchor/alias can ONLY appear immediately after a
+              # structural position (start of text, `:`, `-`, `,`, `[`, or
+              # `{`), optionally followed by whitespace -- a glob string
+              # value is never in that position unquoted (a bare scalar
+              # starting with `*` is itself a YAML syntax error, confirmed
+              # empirically), and a QUOTED glob has a leading quote
+              # character that breaks the match.
+              if raw.scan(/(?:\A|[:\-,\[{])\s*[&*][A-Za-z0-9_.-]+/).length > 40
                 STDERR.puts "repo_lint_local.yml has an unusually high anchor/alias token count -- refusing to parse (defensive cap against a YAML alias-expansion DoS, #655)"
                 exit
               end
@@ -1101,14 +1113,34 @@ jobs:
               # the "Norway problem"), so doc["on"] is nil for the
               # overwhelmingly common unquoted `on:`; only a quoted "on":
               # key would ever land as the string "on".
+              #
+              # #655 Codex P2 round 8 ("classify only pull_request filters
+              # for PR waits"): this wait depends specifically on the
+              # pull_request trigger (the one guaranteed to fire for both
+              # same-repo and cross-fork PRs; a push-only trigger does NOT
+              # fire in the base repo for a fork PR), so only ITS filter
+              # configuration matters -- an annex with `push: {paths:
+              # [...]}` but an unfiltered `pull_request:` is unfiltered
+              # for this purpose even though some OTHER event is
+              # path-filtered. No pull_request trigger configured at all
+              # is conservatively NOT unfiltered (no positive evidence it
+              # will ever appear for a PR wait).
               on = doc.key?("on") ? doc["on"] : doc[true]
-              unfiltered =
+              pr_events =
                 case on
-                when String, Array then true
-                when Hash
-                  on.values.none? { |cfg| cfg.is_a?(Hash) && (cfg.key?("paths") || cfg.key?("paths-ignore")) }
-                else
+                when String then [on]
+                when Array then on
+                when Hash then on.keys
+                else []
+                end
+              unfiltered =
+                if !pr_events.include?("pull_request")
                   false
+                elsif on.is_a?(Hash)
+                  cfg = on["pull_request"]
+                  !(cfg.is_a?(Hash) && (cfg.key?("paths") || cfg.key?("paths-ignore")))
+                else
+                  true
                 end
               puts JSON.generate({ "workflow" => workflow_name, "jobs" => jobs, "unfiltered" => unfiltered })
             ' || true)

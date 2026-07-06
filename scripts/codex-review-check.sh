@@ -668,6 +668,7 @@ ANNEX_SCAN_ROLLUP_JSON="$ROLLUP_JSON"
 HEAD_SHA_FOR_ANNEX=$(echo "$PR_JSON" | jq -r '.head.sha')
 ANNEX_CHECKS_JSON='[]'
 ANNEX_WORKFLOW_NAME=""
+ANNEX_UNFILTERED="false"
 if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
   annex_probe_err=$(mktemp)
   if annex_content=$(gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$HEAD_SHA_FOR_ANNEX" --jq .content 2>"$annex_probe_err"); then
@@ -691,7 +692,23 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
         STDERR.puts "repo_lint_local.yml exceeds 100000 bytes -- refusing to parse (defensive cap, not a realistic legitimate size, #655)"
         exit
       end
-      if raw.scan(/[&*][A-Za-z0-9_.-]+/).length > 40
+      # #655 Codex P2 round 8 ("avoid treating path globs as YAML aliases"):
+      # a naive `[&*]word` scan over-counts, since an ordinary glob like
+      # `**/*.ts` in a paths:/paths-ignore: list starts with `*` too --
+      # inflating the count on a perfectly legitimate annex with a longer
+      # filter list past the cap, disabling the workflow-wide scan for a
+      # real, currently-failing local check. A real YAML anchor/alias can
+      # ONLY appear immediately after a structural position (start of
+      # text, `:`, `-`, `,`, `[`, or `{`), optionally followed by
+      # whitespace -- a glob string value is never in that position
+      # unquoted (a bare scalar starting with `*` is itself a YAML syntax
+      # error, confirmed empirically: Psych raises "did not find expected
+      # alphabetic or numeric character while scanning an alias"), and a
+      # a QUOTED glob has a leading quote character that breaks the match. Verified
+      # against quoted glob lists (0 matches), a real anchor/alias reuse
+      # (2 matches), and a synthetic billion-laughs payload (91 matches,
+      # still caught).
+      if raw.scan(/(?:\A|[:\-,\[{])\s*[&*][A-Za-z0-9_.-]+/).length > 40
         STDERR.puts "repo_lint_local.yml has an unusually high anchor/alias token count -- refusing to parse (defensive cap against a YAML alias-expansion DoS, #655)"
         exit
       end
@@ -716,7 +733,37 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
         name = (job.is_a?(Hash) && job["name"]) ? job["name"] : id
         jobs << { "name" => name.to_s, "workflow" => workflow_name }
       end
-      puts JSON.generate({ "workflow" => workflow_name, "jobs" => jobs })
+      # #655 Codex P2 round 8 ("wait for unreported unfiltered annex
+      # checks" on gate (a), mirroring agent-review.yml round 7/8): an
+      # annex whose pull_request trigger has NO paths/paths-ignore filter
+      # is GUARANTEED to eventually produce a check run for this PR, so
+      # zero reported entries means "not scheduled yet", not "will never
+      # run" -- unlike a genuinely path-filtered annex. Classification is
+      # based specifically on the pull_request trigger (the one guaranteed
+      # to fire for both same-repo and cross-fork PRs; a push-only trigger
+      # does not fire in the base repo for a fork PR), not on every event
+      # under `on:` (an unfiltered pull_request alongside a filtered push
+      # is still unfiltered for this purpose). YAML 1.1 coerces the
+      # bareword `on:` key to the boolean true (the "Norway problem"), so
+      # doc["on"] is nil for the overwhelmingly common unquoted `on:`.
+      on = doc.key?("on") ? doc["on"] : doc[true]
+      pr_events =
+        case on
+        when String then [on]
+        when Array then on
+        when Hash then on.keys
+        else []
+        end
+      unfiltered =
+        if !pr_events.include?("pull_request")
+          false
+        elsif on.is_a?(Hash)
+          cfg = on["pull_request"]
+          !(cfg.is_a?(Hash) && (cfg.key?("paths") || cfg.key?("paths-ignore")))
+        else
+          true
+        end
+      puts JSON.generate({ "workflow" => workflow_name, "jobs" => jobs, "unfiltered" => unfiltered })
     ' || true)
     if [ -z "$annex_probe_raw" ]; then
       # ruby never reached its `puts` line at all: the YAML itself did not
@@ -730,6 +777,7 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
       ANNEX_CHECKS_JSON='[{"name":"repo-lint-local","workflow":""}]'
     else
       ANNEX_WORKFLOW_NAME=$(echo "$annex_probe_raw" | jq -r '.workflow')
+      ANNEX_UNFILTERED=$(echo "$annex_probe_raw" | jq -r '.unfiltered')
       annex_jobs=$(echo "$annex_probe_raw" | jq -c '.jobs')
       if [ "$(echo "$annex_jobs" | jq 'length')" -eq 0 ]; then
         # ruby parsed a valid jobs hash but every job was matrix-strategy and
@@ -937,28 +985,43 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq --argjson required_names "${REQUIRED_JSON:
 # report clean until it finishes, so a fast-completing sibling workflow
 # (e.g. the canonical lint/review-policy checks) cannot let
 # auto-clear-blocking-labels.yml clear needs-external-review while the
-# slower local annex is still in flight and might yet fail. The remaining
-# gap this does NOT close is the narrower window before the annex workflow
-# has been scheduled at all (zero rollup entries) -- indistinguishable from
-# a path-filtered annex that will never run for this diff without
-# replicating GitHub's own path-matching against the annex's `on:`
-# triggers; see the PR discussion for why that is tracked separately.
+# slower local annex is still in flight and might yet fail.
+#
+# #655 Codex P2 round 8 ("wait for unreported unfiltered annex checks"):
+# the gap the paragraph above does NOT close is zero rollup entries at
+# all (the annex workflow has not been SCHEDULED yet) -- previously
+# indistinguishable from a path-filtered annex that will never run for
+# this diff. ANNEX_UNFILTERED (derived from the annex's pull_request
+# trigger having no paths/paths-ignore filter) now resolves that
+# ambiguity: when unfiltered, the annex is GUARANTEED to eventually
+# report, so zero entries means "not yet", not "never" -- treated as not
+# yet clean via a synthetic PENDING entry, exactly like an in-progress
+# one above. A path-filtered (or classification-unknown) annex with zero
+# entries is still non-blocking, preserving round 5/6's fix for that case.
 if [ -n "$ANNEX_WORKFLOW_NAME" ]; then
-  ANNEX_WORKFLOW_BAD=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq --arg workflow "$ANNEX_WORKFLOW_NAME" '
-    [.statusCheckRollup[]
-      | select((.workflowName // "") == $workflow)
-      | {
-          label: (.name // .context // "?"),
-          workflow: (.workflowName // ""),
-          result: (.conclusion // .state // "")
-        }
-      | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
-    ]
+  ANNEX_WORKFLOW_MATCHES=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq --arg workflow "$ANNEX_WORKFLOW_NAME" '
+    [.statusCheckRollup[] | select((.workflowName // "") == $workflow)]
   ')
-  ANNEX_WORKFLOW_BAD_COUNT=$(echo "$ANNEX_WORKFLOW_BAD" | jq 'length')
-  if [ "$ANNEX_WORKFLOW_BAD_COUNT" -gt 0 ]; then
-    log "gate (a): repo_lint_local.yml annex workflow ($ANNEX_WORKFLOW_NAME) has $ANNEX_WORKFLOW_BAD_COUNT non-passing reported check-run(s) (#655) — included below regardless of required-name scoping."
-    BAD_CHECKS=$(echo "$BAD_CHECKS" | jq --argjson extra "$ANNEX_WORKFLOW_BAD" '(. + $extra) | unique')
+  ANNEX_WORKFLOW_MATCH_COUNT=$(echo "$ANNEX_WORKFLOW_MATCHES" | jq 'length')
+  if [ "$ANNEX_WORKFLOW_MATCH_COUNT" -eq 0 ] && [ "$ANNEX_UNFILTERED" = "true" ]; then
+    log "gate (a): repo_lint_local.yml annex workflow ($ANNEX_WORKFLOW_NAME) has an unfiltered pull_request trigger but has not reported anything yet for $HEAD_SHA_FOR_ANNEX (#655 round 8) — treating as not-yet-clean rather than silently passing, since it is guaranteed to eventually run."
+    BAD_CHECKS=$(echo "$BAD_CHECKS" | jq --arg workflow "$ANNEX_WORKFLOW_NAME" '(. + [{label: "(not yet reported)", workflow: $workflow, result: "PENDING"}]) | unique')
+  else
+    ANNEX_WORKFLOW_BAD=$(echo "$ANNEX_WORKFLOW_MATCHES" | jq '
+      [.[]
+        | {
+            label: (.name // .context // "?"),
+            workflow: (.workflowName // ""),
+            result: (.conclusion // .state // "")
+          }
+        | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
+      ]
+    ')
+    ANNEX_WORKFLOW_BAD_COUNT=$(echo "$ANNEX_WORKFLOW_BAD" | jq 'length')
+    if [ "$ANNEX_WORKFLOW_BAD_COUNT" -gt 0 ]; then
+      log "gate (a): repo_lint_local.yml annex workflow ($ANNEX_WORKFLOW_NAME) has $ANNEX_WORKFLOW_BAD_COUNT non-passing reported check-run(s) (#655) — included below regardless of required-name scoping."
+      BAD_CHECKS=$(echo "$BAD_CHECKS" | jq --argjson extra "$ANNEX_WORKFLOW_BAD" '(. + $extra) | unique')
+    fi
   fi
 fi
 
