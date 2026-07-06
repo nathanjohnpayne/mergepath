@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# check_admin_merge_codeowners_blocked
+#
+# Runs tests/test_admin_merge_codeowners_blocked.sh — the offline PATH-shim
+# suite for scripts/admin-merge-codeowners-blocked.sh's Gate 2 green-checks
+# pagination (#691). Without this wiring, a regression back to the
+# truncating `gh pr view --json statusCheckRollup` read (which silently drops
+# a failing check beyond the first 100 contexts on a long-lived PR) could
+# ship without CI noticing, letting the --admin escape hatch merge past an
+# off-page red check.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_admin_merge_codeowners_blocked.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  # Consumer-safety guard (#601): repo_lint.yml is manifest-canonical, so
+  # consumers run this wrapper too — but admin-merge-codeowners-blocked.sh +
+  # its suite are hub-only (not manifest-propagated; this is a mergepath
+  # break-glass admin tool). scripts/sync-to-downstream.sh is the standard
+  # hub marker: both absent → consumer checkout → SKIP. Marker present → hub
+  # lost the test (accidental delete/rename) → hard error, preserving
+  # fail-closed hub behavior. Mirrors check_audit_codex_latency.
+  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+    echo "check_admin_merge_codeowners_blocked: SKIP (consumer checkout: tests/test_admin_merge_codeowners_blocked.sh + scripts/sync-to-downstream.sh both absent)"
+    exit 0
+  fi
+  echo "check_admin_merge_codeowners_blocked: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
+echo "check_admin_merge_codeowners_blocked: PASS"

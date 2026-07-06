@@ -169,6 +169,16 @@ jobs:
       - name: check_audit_review_latency
         run: ./scripts/ci/check_audit_review_latency
 
+      # Offline PATH-shim suite for the #691 statusCheckRollup pagination in
+      # scripts/admin-merge-codeowners-blocked.sh's Gate 2 — guards against a
+      # regression to the truncating `gh pr view --json statusCheckRollup`
+      # read that silently dropped a failing check beyond the first 100
+      # contexts, letting the --admin escape hatch merge past an off-page red
+      # check. Hub-only; SKIPs on consumer checkouts via the standard
+      # sync-to-downstream marker idiom.
+      - name: check_admin_merge_codeowners_blocked
+        run: ./scripts/ci/check_admin_merge_codeowners_blocked
+
       # check_verify_propagation_pr exercises the faithful-mirror
       # verifier (scripts/workflow/verify-propagation-pr.sh) that is
       # the security teeth of the propagation-PR review lane — it is
