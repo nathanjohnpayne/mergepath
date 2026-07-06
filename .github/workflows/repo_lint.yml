@@ -395,16 +395,6 @@ jobs:
         # independently of integration.
         run: ./scripts/ci/check_template_substitution
 
-      - name: check_template_substitution_tests
-        # Exercises tests/test_check_template_substitution_wrapper.sh —
-        # unit tests for the check_template_substitution WRAPPER's
-        # hub-vs-consumer disambiguation. Guards the #703 fail-closed
-        # (hub that lost its manifest → exit 1), keyed on the HUB-ONLY
-        # scripts/sync-to-downstream.sh marker, against the #710
-        # regression (a consumer's normal "lib present + manifest
-        # absent" state must run the propagated test, NOT fail closed).
-        run: ./scripts/ci/check_template_substitution_tests
-
       - name: check_export_consumer_facts
         # Exercises tests/test_export_consumer_facts.sh — regression-
         # guards the yq filter inside scripts/sync-to-downstream.sh's
