@@ -1024,6 +1024,32 @@ if [ "$rc" = 0 ] \
   pass "trim: header path containing \" b/\" names the correct new path in report + placeholder (#697)"
 else fail "trim spacey b/ path (rc=$rc, report='${rep:-}', placeholder=$(grep -o '\[phase-4b diff-budget:[^]]*' "$TRIM_OUT" | head -1))"; fi
 
+# #712 finding: a RENAME whose header (a != b) concatenated text carries an
+# earlier SYMMETRIC " b/" split must be disclosed as its AUTHORITATIVE rename-to
+# destination, not the synthetic header midpoint. Renaming `data/a b/data/a
+# b/data/a` -> `data/a` yields header `a/data/a b/data/a b/data/a b/data/a`,
+# whose rest `data/a b/data/a b/data/a b/data/a` has a symmetric split at the
+# middle (`data/a b/data/a` == `data/a b/data/a`) — the pre-fix heuristic would
+# name that midpoint. The `rename to data/a` line is authoritative. Both sides
+# are under data/* so the section is omission-eligible.
+TRIM_RSPLIT="$WORK/trim-rename-split.diff"
+{
+  printf 'diff --git a/keep.js b/keep.js\n+ok\n'
+  printf 'diff --git a/data/a b/data/a b/data/a b/data/a\n'
+  printf 'similarity index 95%%\nrename from data/a b/data/a b/data/a\nrename to data/a\n'
+  awk 'BEGIN { for (i = 0; i < 200; i++) printf "+RSPLIT-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$TRIM_RSPLIT"
+set +e
+rep="$(p4b_trim_review_diff "$TRIM_RSPLIT" "$TRIM_OUT" 2000 'data/*')"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && printf '%s\n' "$rep" | grep -q "^data/a$(printf '\t')" \
+   && grep -qF '[phase-4b diff-budget: data/a omitted' "$TRIM_OUT" \
+   && ! grep -qF 'data/a b/data/a omitted' "$TRIM_OUT" \
+   && ! grep -q 'RSPLIT-' "$TRIM_OUT"; then
+  pass "trim: rename header with a spurious symmetric \" b/\" split names the real rename-to path (#712)"
+else fail "trim rename-split b/ path (rc=$rc, report='${rep:-}', placeholder=$(grep -o '\[phase-4b diff-budget:[^]]*' "$TRIM_OUT" | head -1))"; fi
+
 # stderr tail: sanitized single line; empty for a missing/empty file
 ERRF="$WORK/stderr-sample.txt"
 printf 'line one\nstream error: exceeded context window\n' > "$ERRF"
@@ -1051,6 +1077,20 @@ if printf '%s' "$got" | grep -q 'REDACTED' \
    && ! printf '%s' "$got" | grep -q 'github_pat_11ABCDEZ0_taildata'; then
   pass "stderr tail redacts token/key/bearer/pat secret patterns (#696)"
 else fail "stderr tail redaction (got '${got:-}')"; fi
+
+# #712 finding: env-style UPPERCASE credential labels (PASSWORD=, TOKEN=,
+# SECRET=, API_KEY=, AUTHORIZATION=) must be redacted too — the label match is
+# fully case-insensitive, not Title/lowercase-only.
+printf 'auth error: PASSWORD=hunter2upper TOKEN=UPPERtok123 SECRET=UPPERsec456 API_KEY=UPPERkey789 AUTHORIZATION=UPPERauth012\n' > "$ERRF"
+got="$(p4b_stderr_tail "$ERRF")"
+if printf '%s' "$got" | grep -q 'REDACTED' \
+   && ! printf '%s' "$got" | grep -q 'hunter2upper' \
+   && ! printf '%s' "$got" | grep -q 'UPPERtok123' \
+   && ! printf '%s' "$got" | grep -q 'UPPERsec456' \
+   && ! printf '%s' "$got" | grep -q 'UPPERkey789' \
+   && ! printf '%s' "$got" | grep -q 'UPPERauth012'; then
+  pass "stderr tail redacts UPPERCASE env-style credential labels (#712)"
+else fail "stderr tail uppercase redaction (got '${got:-}')"; fi
 
 unset MERGEPATH_REVIEW_POLICY_PATH
 
