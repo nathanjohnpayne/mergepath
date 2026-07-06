@@ -296,11 +296,11 @@ coderabbit:
   # derived heuristically from its category + Critical/Major/Minor qualifier
   # by scripts/lib/feedback-policy-helpers.sh (coderabbit_tier_of).
   #
-  # NOTE: the gate SCRIPT shipped in #577 (scripts/coderabbit-severity-gate.sh,
-  # merged in #590) and reads this key. Narrow-start posture, identical to
-  # codex.p1_gate / external_review_gate: default false everywhere, true in
-  # mergepath first. A no-op (always green) when disabled, so it is safe to
-  # add to required checks everywhere.
+  # NOTE: the gate SCRIPT lands in #577. This key is CONFIG-ONLY until then —
+  # no consumer reads it yet, so setting it here is inert. Narrow-start
+  # posture, identical to codex.p1_gate / external_review_gate: default false
+  # everywhere, true in mergepath first. A no-op (always green) when disabled,
+  # so it is safe to add to required checks everywhere.
   severity_gate:
     enabled: true
 
