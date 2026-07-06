@@ -101,6 +101,50 @@ else
   fail "codex-review-check.sh does not fall back to the workflow file path when the annex's name: key is absent (#655 round 6)"
 fi
 
+# Codex P1 (#655 round 7, "keep rollup when annex only has matrix jobs"):
+# an all-matrix annex has an empty ANNEX_CHECK_NAMES_JSON but a populated
+# ANNEX_WORKFLOW_NAME. The empty-required-checks branch used to key ONLY on
+# ANNEX_CHECK_NAMES_JSON's length to decide whether to wipe ROLLUP_JSON to
+# `[]`, so an all-matrix annex took the "no annex" path and the workflow-
+# wide scan below lost its data source, hiding a reported matrix-leg
+# failure. Fixed by freezing a copy of the rollup BEFORE any
+# branch-protection-driven wiping can touch it, and pointing the
+# workflow-wide scan at that frozen copy instead of the (possibly wiped)
+# $ROLLUP_JSON -- decoupling the two consumers entirely rather than trying
+# to special-case the wiping branch.
+if grep -q 'ANNEX_SCAN_ROLLUP_JSON="\$ROLLUP_JSON"' "$SCRIPT" \
+   && grep -q 'ANNEX_WORKFLOW_BAD=\$(echo "\$ANNEX_SCAN_ROLLUP_JSON"' "$SCRIPT"; then
+  pass "codex-review-check.sh freezes a pristine rollup copy for the workflow-wide scan, immune to later required-checks-driven wiping (#655 round 7)"
+else
+  fail "codex-review-check.sh's workflow-wide scan is not decoupled from ROLLUP_JSON wiping (#655 round 7)"
+fi
+# The frozen copy must be taken BEFORE the empty-required-checks branch's
+# wipe, not after -- grep the line numbers to guard against a future edit
+# reordering them back into the bug.
+freeze_line=$(grep -n 'ANNEX_SCAN_ROLLUP_JSON="\$ROLLUP_JSON"' "$SCRIPT" | head -1 | cut -d: -f1)
+wipe_line=$(grep -n "ROLLUP_JSON='{\"statusCheckRollup\":\[\]}'" "$SCRIPT" | head -1 | cut -d: -f1)
+if [ -n "$freeze_line" ] && [ -n "$wipe_line" ] && [ "$freeze_line" -lt "$wipe_line" ]; then
+  pass "codex-review-check.sh freezes the annex-scan rollup copy before the empty-required-checks branch's wipe, not after (#655 round 7)"
+else
+  fail "codex-review-check.sh's frozen rollup copy is not positioned before the wipe (freeze_line=$freeze_line wipe_line=$wipe_line)"
+fi
+
+# Codex P1 (#655 round 7, "parse valid annex workflows that use YAML
+# aliases"): GitHub Actions supports YAML anchors/aliases in workflow
+# files, but Psych safe_load's aliases:false default rejected any alias
+# and treated the whole annex as unparseable. Allowing aliases outright
+# would reopen a YAML alias-expansion ("billion laughs") DoS against the
+# script parsing a PR's own branch content -- guarded here with a byte-size
+# cap and a raw anchor/alias token-count cap, both checked BEFORE the
+# actual parse (the danger is in the expansion, not the input size).
+if grep -q 'doc = YAML.safe_load(raw, aliases: true)' "$SCRIPT" \
+   && grep -q 'if raw.bytesize > 100_000' "$SCRIPT" \
+   && grep -q 'if raw.scan(/\[&\*\]\[A-Za-z0-9_.-\]+/).length > 40' "$SCRIPT"; then
+  pass "codex-review-check.sh allows YAML aliases when parsing the annex, bounded by size/token-count DoS guards (#655 round 7)"
+else
+  fail "codex-review-check.sh does not allow YAML aliases with the expected DoS guards (#655 round 7)"
+fi
+
 if grep -q 'job\["strategy"\].is_a?(Hash) && job\["strategy"\]\["matrix"\]' "$SCRIPT" \
    && grep -q 'skipping matrix-strategy job' "$SCRIPT"; then
   pass "codex-review-check.sh skips matrix-strategy annex jobs during NAME derivation instead of guessing their expanded name(s) (#655 round 3 P2)"
@@ -271,6 +315,28 @@ if [ "$GOT" = '["checks (20)"]' ]; then
   pass "workflow-wide scan: a reported matrix-leg failure is caught by workflow identity, without needing its expanded name (#655 round 5 P2)"
 else
   fail "workflow-wide scan (matrix leg): expected [\"checks (20)\"], got $GOT"
+fi
+
+# #655 round 7 Codex P1 ("keep rollup when annex only has matrix jobs"):
+# reproduces the exact bug shape -- branch protection has NO required
+# checks (empty_branch_required_json's "annex has no derivable names" path,
+# which the OLD code took as "no annex at all" and wiped ROLLUP_JSON to
+# `[]`) while the annex genuinely exists as all-matrix and has a REPORTED
+# matrix-leg failure. The fixed script scans a rollup frozen BEFORE that
+# wipe (ANNEX_SCAN_ROLLUP_JSON in the real script; simulated here by
+# passing the ORIGINAL rollup straight to annex_workflow_bad, exactly as
+# the fix does) -- confirming the failure is still caught even though
+# ANNEX_CHECK_NAMES_JSON (all-matrix) is empty and REQUIRED_JSON is `[]`.
+ANNEX_ALL_MATRIX_NAMES='[]'
+GOT=$(empty_branch_required_json "$ANNEX_ALL_MATRIX_NAMES")
+if [ "$GOT" != '[]' ]; then
+  fail "round-7 regression setup: expected empty_branch_required_json(no derivable names) = [], got $GOT"
+fi
+GOT=$(annex_workflow_bad "$ROLLUP_MATRIX_LEG_FAILED" "consumer-annex" | jq -c '[.[].label]')
+if [ "$GOT" = '["checks (20)"]' ]; then
+  pass "workflow-wide scan: an all-matrix annex's reported leg failure is still caught when branch protection has no required checks (#655 round 7 P1)"
+else
+  fail "workflow-wide scan (round-7 all-matrix + no required checks): expected [\"checks (20)\"], got $GOT"
 fi
 
 # #655 round 5 Codex P2: an annex that has not reported ANYTHING for its

@@ -1020,6 +1020,7 @@ jobs:
           # validated across #655 rounds 2-5.
           required_checks_json=$(jq -n --arg name "$required_check_name" '[{name: $name, workflow: ""}]')
           annex_workflow=""
+          annex_unfiltered="false"
           annex_probe_err=$(mktemp)
           if annex_content=$(gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$sha" --jq .content 2>"$annex_probe_err"); then
             # The annex contract (scripts/ci/check_ci_scripts_wired) only requires
@@ -1043,8 +1044,32 @@ jobs:
             # ruby's stderr is NOT redirected here (unlike the base64
             # decode) so the skip notice surfaces in the workflow log.
             annex_probe_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ruby -ryaml -rjson -e '
+              raw = STDIN.read
+              # #655 Codex P1 round 7 ("parse valid annex workflows that use
+              # YAML aliases"): GitHub Actions supports anchors/aliases in
+              # workflow files, but Psych safe_load defaults to
+              # aliases:false specifically to block the "billion laughs"
+              # DoS (a small file whose nested aliases expand
+              # exponentially at parse time). This parses a PRs OWN branch
+              # content, so any repo accepting external contributions is
+              # exposed to a crafted repo_lint_local.yml exhausting CI
+              # runner memory/CPU. Allow aliases, but bound the attack
+              # surface first: a byte-size cap (legitimate CI configs are a
+              # few KB) plus a raw anchor/alias token count cap (the
+              # exploit needs many alias references to achieve exponential
+              # blowup; a legitimate DRY job template reuses one or two) --
+              # counted on the RAW text before parsing, since the danger is
+              # in the expansion itself, not the input size.
+              if raw.bytesize > 100_000
+                STDERR.puts "repo_lint_local.yml exceeds 100000 bytes -- refusing to parse (defensive cap, not a realistic legitimate size, #655)"
+                exit
+              end
+              if raw.scan(/[&*][A-Za-z0-9_.-]+/).length > 40
+                STDERR.puts "repo_lint_local.yml has an unusually high anchor/alias token count -- refusing to parse (defensive cap against a YAML alias-expansion DoS, #655)"
+                exit
+              end
               begin
-                doc = YAML.safe_load(STDIN.read, aliases: false)
+                doc = YAML.safe_load(raw, aliases: true)
               rescue Psych::Exception
                 exit
               end
@@ -1065,7 +1090,27 @@ jobs:
                 name = (job.is_a?(Hash) && job["name"]) ? job["name"] : id
                 jobs << { "name" => name.to_s, "workflow" => workflow_name }
               end
-              puts JSON.generate({ "workflow" => workflow_name, "jobs" => jobs })
+              # #655 Codex P1 round 7 ("wait for unfiltered annex workflow
+              # to appear before merging"): distinguish an annex trigger
+              # with NO workflow-level paths/paths-ignore filter (which is
+              # GUARANTEED to eventually produce a check run for any PR --
+              # it just may not have been scheduled yet) from one that IS
+              # path-filtered (which may legitimately never run for this
+              # PRs diff). YAML 1.1 coerces the bareword `on:` key to the
+              # boolean true (yes/no/on/off/y/n are all boolean literals --
+              # the "Norway problem"), so doc["on"] is nil for the
+              # overwhelmingly common unquoted `on:`; only a quoted "on":
+              # key would ever land as the string "on".
+              on = doc.key?("on") ? doc["on"] : doc[true]
+              unfiltered =
+                case on
+                when String, Array then true
+                when Hash
+                  on.values.none? { |cfg| cfg.is_a?(Hash) && (cfg.key?("paths") || cfg.key?("paths-ignore")) }
+                else
+                  false
+                end
+              puts JSON.generate({ "workflow" => workflow_name, "jobs" => jobs, "unfiltered" => unfiltered })
             ' || true)
             if [ -z "$annex_probe_raw" ]; then
               # ruby never reached its `puts` line: the YAML itself did not
@@ -1082,11 +1127,12 @@ jobs:
               echo "::warning::repo_lint_local.yml annex present at $sha but could not be parsed as a workflow (invalid YAML or no jobs) — cannot determine its check name(s) or workflow identity, so this run cannot enforce it (gate (a) / codex-review-check.sh still will) (#655)."
             else
               annex_workflow=$(echo "$annex_probe_raw" | jq -r '.workflow')
+              annex_unfiltered=$(echo "$annex_probe_raw" | jq -r '.unfiltered')
               annex_jobs=$(echo "$annex_probe_raw" | jq -c '.jobs')
               if [ "$(echo "$annex_jobs" | jq 'length')" -eq 0 ]; then
-                echo "::warning::repo_lint_local.yml annex present at $sha but every job is matrix-strategy (skipped) — its expanded check-run name(s) cannot be derived; its workflow ($annex_workflow) is still scanned below for any reported failure (#655)."
+                echo "::warning::repo_lint_local.yml annex present at $sha but every job is matrix-strategy (skipped) — its expanded check-run name(s) cannot be derived; its workflow ($annex_workflow, unfiltered=$annex_unfiltered) is still scanned below for any reported failure (#655)."
               else
-                echo "::notice::repo_lint_local.yml annex present at $sha — its workflow ($annex_workflow) will be scanned for any reported failure (#655): $(echo "$annex_jobs" | jq -r '[.[].name] | join(" ")')."
+                echo "::notice::repo_lint_local.yml annex present at $sha — its workflow ($annex_workflow, unfiltered=$annex_unfiltered) will be scanned for any reported failure (#655): $(echo "$annex_jobs" | jq -r '[.[].name] | join(" ")')."
               fi
             fi
           elif grep -q 'HTTP 404' "$annex_probe_err"; then
@@ -1161,7 +1207,7 @@ jobs:
                 | ($matches | group_by(.workflowName // "")) as $groups
                 | [
                     $groups[]
-                    | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") == "PENDING") end))) as $pending
+                    | (map(select(if (.status != null) then (.status != "COMPLETED") else (["PENDING","EXPECTED"] | index(.state // "")) end))) as $pending
                     | if ($pending | length) > 0
                       then $pending[0]
                       else (sort_by(.completedAt // .startedAt // "") | last)
@@ -1173,9 +1219,9 @@ jobs:
                 all_done=0
                 continue
               fi
-              pending_count=$(echo "$winners" | jq '[.[] | select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") == "PENDING") end)] | length')
+              pending_count=$(echo "$winners" | jq '[.[] | select(if (.status != null) then (.status != "COMPLETED") else (["PENDING","EXPECTED"] | index(.state // "")) end)] | length')
               if [ "$pending_count" -gt 0 ]; then
-                pending_status=$(echo "$winners" | jq -r '[.[] | select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") == "PENDING") end)][0].status // .state // ""')
+                pending_status=$(echo "$winners" | jq -r '[.[] | select(if (.status != null) then (.status != "COMPLETED") else (["PENDING","EXPECTED"] | index(.state // "")) end)][0].status // .state // ""')
                 echo "::notice::Required check run '$check_name' is $pending_status on current HEAD $sha; waiting for completion."
                 all_done=0
                 continue
@@ -1217,18 +1263,35 @@ jobs:
               # auto-merge on every such PR, forever.
               annex_matches=$(echo "$rollup_json" | jq -c --arg workflow "$annex_workflow" '
                 [.statusCheckRollup[] | select((.workflowName // "") == $workflow)]')
-              annex_pending=$(echo "$annex_matches" | jq -c '[.[] | select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") == "PENDING") end)]')
-              annex_pending_count=$(echo "$annex_pending" | jq 'length')
-              if [ "$annex_pending_count" -gt 0 ]; then
-                echo "::notice::repo_lint_local.yml annex workflow '$annex_workflow' has $annex_pending_count check-run(s) still in progress on current HEAD $sha; waiting for completion (#655)."
+              annex_match_count=$(echo "$annex_matches" | jq 'length')
+              if [ "$annex_match_count" -eq 0 ] && [ "$annex_unfiltered" = "true" ]; then
+                # #655 Codex P1 round 7 ("wait for unfiltered annex workflow
+                # to appear before merging"): an annex with NO workflow-level
+                # paths/paths-ignore filter is GUARANTEED to eventually
+                # produce a check run for this PR -- zero entries right now
+                # means Actions has not scheduled it yet, not that it never
+                # will (unlike a path-filtered annex, where zero entries is
+                # genuinely ambiguous between "not yet" and "never for this
+                # diff"). Keep polling instead of treating this the same as
+                # the path-filtered case; bounded by the same shared
+                # deadline as every other required check, so this cannot
+                # deadlock forever if something is actually wrong.
+                echo "::notice::repo_lint_local.yml annex workflow '$annex_workflow' has not reported yet (unfiltered trigger, so it is expected to); waiting for it to start on current HEAD $sha (#655)."
                 all_done=0
               else
-                annex_bad=$(echo "$annex_matches" | jq -c '[.[] | select((.conclusion // .state // "") as $r | ($r != "SUCCESS" and $r != "SKIPPED" and $r != "NEUTRAL"))]')
-                annex_bad_count=$(echo "$annex_bad" | jq 'length')
-                if [ "$annex_bad_count" -gt 0 ]; then
-                  annex_bad_summary=$(echo "$annex_bad" | jq -r '[.[] | (.conclusion // .state // "none")] | join(", ")')
-                  echo "::error::repo_lint_local.yml annex workflow '$annex_workflow' has $annex_bad_count non-passing reported check-run(s) on current HEAD $sha (conclusion=$annex_bad_summary); refusing auto-merge (#655)."
-                  exit 1
+                annex_pending=$(echo "$annex_matches" | jq -c '[.[] | select(if (.status != null) then (.status != "COMPLETED") else (["PENDING","EXPECTED"] | index(.state // "")) end)]')
+                annex_pending_count=$(echo "$annex_pending" | jq 'length')
+                if [ "$annex_pending_count" -gt 0 ]; then
+                  echo "::notice::repo_lint_local.yml annex workflow '$annex_workflow' has $annex_pending_count check-run(s) still in progress on current HEAD $sha; waiting for completion (#655)."
+                  all_done=0
+                else
+                  annex_bad=$(echo "$annex_matches" | jq -c '[.[] | select((.conclusion // .state // "") as $r | ($r != "SUCCESS" and $r != "SKIPPED" and $r != "NEUTRAL"))]')
+                  annex_bad_count=$(echo "$annex_bad" | jq 'length')
+                  if [ "$annex_bad_count" -gt 0 ]; then
+                    annex_bad_summary=$(echo "$annex_bad" | jq -r '[.[] | (.conclusion // .state // "none")] | join(", ")')
+                    echo "::error::repo_lint_local.yml annex workflow '$annex_workflow' has $annex_bad_count non-passing reported check-run(s) on current HEAD $sha (conclusion=$annex_bad_summary); refusing auto-merge (#655)."
+                    exit 1
+                  fi
                 fi
               fi
             fi

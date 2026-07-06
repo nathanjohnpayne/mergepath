@@ -622,6 +622,16 @@ log "gate (a): checking CI state"
 # is zero.
 ROLLUP_JSON=$(with_gh_retry gh pr view "$PR_NUMBER" --repo "$REPO" --json statusCheckRollup) \
   || die 3 "failed to fetch statusCheckRollup (see stderr above for retry diagnostics)"
+# #655 Codex P1 round 7 ("keep rollup when annex only has matrix jobs"): a
+# frozen copy taken BEFORE any branch-protection-driven scoping/wiping below
+# can touch $ROLLUP_JSON. The annex workflow-wide scan intentionally bypasses
+# the required-name filter entirely (see its own comment further down), so it
+# must never be starved by logic that clears $ROLLUP_JSON for OTHER reasons --
+# e.g. the empty-required-checks branch wiping it to `[]` for an all-matrix
+# annex (ANNEX_CHECK_NAMES_JSON empty, so that branch took the "no annex"
+# path even though ANNEX_WORKFLOW_NAME was populated), which silently hid a
+# reported matrix-leg failure from the scan below.
+ANNEX_SCAN_ROLLUP_JSON="$ROLLUP_JSON"
 
 # #655 (Codex P2 round 2): a consumer's repo_lint_local.yml annex's check
 # name may not be "repo-lint-local" (check_ci_scripts_wired's annex contract
@@ -662,8 +672,31 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
   annex_probe_err=$(mktemp)
   if annex_content=$(gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$HEAD_SHA_FOR_ANNEX" --jq .content 2>"$annex_probe_err"); then
     annex_probe_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ruby -ryaml -rjson -e '
+      raw = STDIN.read
+      # #655 Codex P1 round 7 ("parse valid annex workflows that use YAML
+      # aliases"): GitHub Actions supports anchors/aliases in workflow
+      # files, but Psych safe_load defaults to aliases:false specifically
+      # to block the "billion laughs" DoS (a small file whose nested
+      # aliases expand exponentially at parse time). This parses a PRs
+      # OWN branch content, so any repo accepting external contributions
+      # is exposed to a crafted repo_lint_local.yml exhausting CI runner
+      # memory/CPU. Allow aliases, but bound the attack surface first: a
+      # byte-size cap (legitimate CI configs are a few KB) plus a raw
+      # anchor/alias token count cap (the exploit needs many alias
+      # references to achieve exponential blowup; a legitimate DRY job
+      # template reuses one or two) -- counted on the RAW text before
+      # parsing, since the danger is in the expansion itself, not the
+      # input size.
+      if raw.bytesize > 100_000
+        STDERR.puts "repo_lint_local.yml exceeds 100000 bytes -- refusing to parse (defensive cap, not a realistic legitimate size, #655)"
+        exit
+      end
+      if raw.scan(/[&*][A-Za-z0-9_.-]+/).length > 40
+        STDERR.puts "repo_lint_local.yml has an unusually high anchor/alias token count -- refusing to parse (defensive cap against a YAML alias-expansion DoS, #655)"
+        exit
+      end
       begin
-        doc = YAML.safe_load(STDIN.read, aliases: false)
+        doc = YAML.safe_load(raw, aliases: true)
       rescue Psych::Exception
         exit
       end
@@ -911,7 +944,7 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq --argjson required_names "${REQUIRED_JSON:
 # replicating GitHub's own path-matching against the annex's `on:`
 # triggers; see the PR discussion for why that is tracked separately.
 if [ -n "$ANNEX_WORKFLOW_NAME" ]; then
-  ANNEX_WORKFLOW_BAD=$(echo "$ROLLUP_JSON" | jq --arg workflow "$ANNEX_WORKFLOW_NAME" '
+  ANNEX_WORKFLOW_BAD=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq --arg workflow "$ANNEX_WORKFLOW_NAME" '
     [.statusCheckRollup[]
       | select((.workflowName // "") == $workflow)
       | {

@@ -181,11 +181,49 @@ assert_grep "agent-review: requires every matched workflow group to be green, no
 # all -- only CheckRun has one) was treated as pending FOREVER by a bare
 # `.status != "COMPLETED"` check, since null != "COMPLETED" is true
 # regardless of .state. A StatusContext is non-terminal only when .state is
-# literally "PENDING"; a CheckRun is non-terminal whenever .status is
-# present and not "COMPLETED". This predicate is shared by the winner
-# selection, the pending-count check, and the new annex workflow-wide scan.
-assert_grep "agent-review: a status-context entry is pending only when .state is literally PENDING, not merely lacking .status (#655 round 6)" \
-  "$W/agent-review.yml" 'if (.status != null) then (.status != "COMPLETED") else ((.state // "") == "PENDING") end'
+# literally "PENDING" -- round 7 added "EXPECTED" (GitHub's "waiting for a
+# status to be reported" state, distinct from PENDING but equally
+# non-terminal): without it, a required external status context sitting in
+# EXPECTED aborted the wait loop as a failure instead of continuing to
+# poll. A CheckRun is non-terminal whenever .status is present and not
+# "COMPLETED". This predicate is shared by the winner selection, the
+# pending-count check, and the annex workflow-wide scan.
+assert_grep "agent-review: a status-context entry is pending when .state is PENDING or EXPECTED, not merely lacking .status (#655 rounds 6-7)" \
+  "$W/agent-review.yml" 'if (.status != null) then (.status != "COMPLETED") else (["PENDING","EXPECTED"] | index(.state // "")) end'
+
+# Codex P1 (#655 round 7, "parse valid annex workflows that use YAML
+# aliases"): GitHub Actions supports YAML anchors/aliases in workflow
+# files, but Psych safe_load's aliases:false default rejected any alias
+# and treated the whole annex as unparseable. Allowing aliases outright
+# would reopen a YAML alias-expansion ("billion laughs") DoS against the
+# CI runner parsing a PR's own branch content -- guarded here with a byte-
+# size cap and a raw anchor/alias token-count cap, both checked BEFORE the
+# actual parse (the danger is in the expansion, not the input size).
+assert_grep "agent-review: allows YAML aliases when parsing the annex (#655 round 7)" \
+  "$W/agent-review.yml" 'doc = YAML.safe_load(raw, aliases: true)'
+assert_grep "agent-review: bounds annex YAML size before parsing, defending against a YAML alias-expansion DoS (#655 round 7)" \
+  "$W/agent-review.yml" 'if raw.bytesize > 100_000'
+assert_grep "agent-review: bounds annex YAML anchor/alias token count before parsing, defending against a YAML alias-expansion DoS (#655 round 7)" \
+  "$W/agent-review.yml" 'if raw.scan(/[&*][A-Za-z0-9_.-]+/).length > 40'
+
+# Codex P1 (#655 round 7, "wait for unfiltered annex workflow to appear
+# before merging"): an annex with NO workflow-level paths/paths-ignore
+# filter is guaranteed to eventually produce a check run for any PR, so
+# zero reported entries just means Actions has not scheduled it yet --
+# unlike a genuinely path-filtered annex, where zero entries is legitimately
+# ambiguous between "not yet" and "never for this diff" (Finding O, round
+# 6, which must stay non-blocking). YAML 1.1 coerces the bareword `on:` key
+# to the boolean true (the "Norway problem"), so doc["on"] is nil for the
+# overwhelmingly common unquoted `on:` and the fallback doc[true] read is
+# required, not optional.
+assert_grep "agent-review: reads the on: trigger via the true-key fallback (YAML 1.1 Norway-problem coercion) (#655 round 7)" \
+  "$W/agent-review.yml" 'on = doc.key?("on") ? doc["on"] : doc[true]'
+assert_grep "agent-review: an annex trigger with no paths/paths-ignore filter is captured as unfiltered (#655 round 7)" \
+  "$W/agent-review.yml" 'cfg.is_a?(Hash) && (cfg.key?("paths") || cfg.key?("paths-ignore"))'
+assert_grep "agent-review: keeps polling (does not silently pass) when an unfiltered annex has zero reported entries (#655 round 7)" \
+  "$W/agent-review.yml" 'if [ "$annex_match_count" -eq 0 ] && [ "$annex_unfiltered" = "true" ]; then'
+assert_grep "agent-review: a path-filtered annex with zero reported entries still does not block (Finding O, round 6, preserved)" \
+  "$W/agent-review.yml" 'has not reported yet (unfiltered trigger, so it is expected to)'
 
 # auto-clear-blocking-labels.yml: the workflow_run trigger list observes the
 # annex's completion too (verified against a live consumer's repo_lint_local.yml
