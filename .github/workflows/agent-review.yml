@@ -957,47 +957,50 @@ jobs:
               echo "::warning::CodeRabbit grace window elapsed without a review. CodeRabbit is advisory — proceeding to merge. Check coderabbit-wait.sh JSON above for status_probe details, if present."
               ;;
             5)
-              # #489: a rate_limit_stalled is non-blocking ONLY when the Codex
-              # failover engaged AND an external-review gate will actually gate
-              # the merge on Codex — i.e. merge-clearance-gate.sh's external
-              # arm applies NON-vacuously to this PR's current head. For PRs
-              # where that gate passes vacuously, --trigger-only does not wait
-              # for Codex, so proceeding would let a rate-limited PR merge
-              # with neither bot having reviewed it — those keep BLOCKING
-              # (Codex P2 on #512 r3). The disposition lives in the
-              # unit-tested, fail-closed
+              # #489/#713: a rate_limit_stalled is non-blocking ONLY when
+              # the Codex failover engaged AND this head is protected from
+              # bot-unreviewed auto-merge. Protection means either
+              # merge-clearance-gate.sh's external arm applies
+              # NON-vacuously, or the PR is intrinsically external-review
+              # and current-head Codex/Phase-4b clearance is already
+              # satisfied. For PRs where both are false, --trigger-only
+              # does not wait for Codex, so proceeding would let a
+              # rate-limited PR merge with neither bot having reviewed it —
+              # those keep BLOCKING (Codex P2 on #512 r3). The disposition
+              # lives in the unit-tested, fail-closed
               # scripts/coderabbit-automerge-rate-limit-gate.sh.
               #
-              # #620: requiredness is asked of merge-clearance-gate.sh ITSELF
-              # (--derive-external-requiredness): the same intrinsic
-              # threshold + protected-paths computation the required check
-              # runs, with the label as a force-on signal and the
-              # propagation lane's HEAD-pinned verified marker as the
-              # exemption, all evaluated on the LIVE head. Label-event
-              # proxies (current-label reads, unlabeled-removal overrides)
-              # were rejected across five review rounds — a label event is
-              # not head-pinned proof of a downstream gate; this derivation
-              # is. It also un-stalls the settle re-arm for EVERY blocking
-              # label removal on an intrinsically above-threshold PR, not
-              # just needs-external-review. Fail closed: any nonzero exit or
-              # unexpected output from the query reads as false (block).
-              # stderr streams to the step log for diagnosability (#633);
-              # only stdout (exactly `true` or `false`) is consumed.
-              ext_required=false
-              if req=$(bash scripts/merge-clearance-gate.sh --derive-external-requiredness "$PR_NUMBER" "$REPO"); then
+              # #713: ask merge-clearance-gate.sh itself for the rc=5
+              # protection predicate. It uses the same intrinsic threshold
+              # + protected-paths computation as the required check, with
+              # the label as a force-on signal and the propagation lane's
+              # HEAD-pinned verified marker as the exemption, all evaluated
+              # on the LIVE head. When the required-check gate is disabled,
+              # it additionally requires codex-review-check.sh to confirm
+              # current-head Codex/Phase-4b clearance before returning
+              # true. Label-event proxies (current-label reads,
+              # unlabeled-removal overrides) remain rejected: a label event
+              # is not head-pinned proof of a downstream gate or clearance.
+              # Fail closed: any nonzero exit or unexpected output from the
+              # query reads as false (block). stderr streams to the step log
+              # for diagnosability; only stdout (exactly `true` or `false`)
+              # is consumed.
+              ext_protected=false
+              if req=$(bash scripts/merge-clearance-gate.sh --derive-rate-limit-protection "$PR_NUMBER" "$REPO"); then
                 case "$req" in
-                  true|false) ext_required=$req ;;
+                  true|false) ext_protected=$req ;;
                 esac
               fi
-              if bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_required"; then
-                echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged and merge-clearance's external arm applies non-vacuously to the current head — proceeding; that gate blocks the merge until Codex/external clearance lands."
+              if bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_protected"; then
+                echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged and this head has active or already-satisfied external-review protection — proceeding."
                 # Record the downgrade for the final re-verify step: the
-                # requiredness derivation is re-run there against the live
-                # merge head, so state that changes during the waits (e.g.
-                # a propagation-lane verification landing) aborts the merge.
+                # protection derivation is re-run there against the live
+                # merge head, so state that changes during the waits (for
+                # example, a push or propagation-lane verification landing)
+                # aborts the merge.
                 echo "CR_RATE_LIMIT_DOWNGRADED=true" >> "$GITHUB_ENV"
               else
-                echo "::error::CodeRabbit rate-limit retry budget exhausted — blocking auto-merge. Either the failover did not engage (codex_failover_requested=false) or the PR is under-threshold (no downstream Codex gate, so it must not auto-merge bot-unreviewed). Human must re-trigger or merge manually."
+                echo "::error::CodeRabbit rate-limit retry budget exhausted — blocking auto-merge. Either the failover did not engage, or this head has neither an active merge-clearance external gate nor already-satisfied Codex/Phase-4b clearance. Human must re-trigger or merge manually."
                 exit 1
               fi
               ;;
@@ -1915,24 +1918,24 @@ jobs:
           #    merge pins CURRENT_HEAD_SHA (the live head the required-check
           #    wait exported) via --match-head-commit — if they differ, the
           #    CodeRabbit disposition is stale for the merge head. Abort.
-          # 2. Re-run merge-clearance-gate.sh --derive-external-requiredness
+          # 2. Re-run merge-clearance-gate.sh --derive-rate-limit-protection
           #    against the (now-pinned) live head and require `true`: the
-          #    same intrinsic threshold/protected-paths/label/lane-exemption
-          #    derivation the required check uses. Any error or non-true
-          #    output aborts.
+          #    same active-or-already-satisfied external-review protection
+          #    predicate used at rc=5 time. Any error or non-true output
+          #    aborts.
           if [ "${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true" ]; then
             if [ -z "${CURRENT_HEAD_SHA:-}" ] || [ "$CURRENT_HEAD_SHA" != "$HEAD_SHA" ]; then
               echo "::error::Head drifted after the rc=5 rate-limit downgrade (event=$HEAD_SHA live=${CURRENT_HEAD_SHA:-unset}) — the CodeRabbit disposition is stale for the merge head. Aborting auto-merge."
               exit 1
             fi
-            re_required=false
-            if req=$(bash scripts/merge-clearance-gate.sh --derive-external-requiredness "$PR_NUMBER" "$REPO"); then
+            re_protected=false
+            if req=$(bash scripts/merge-clearance-gate.sh --derive-rate-limit-protection "$PR_NUMBER" "$REPO"); then
               case "$req" in
-                true) re_required=true ;;
+                true) re_protected=true ;;
               esac
             fi
-            if [ "$re_required" != "true" ]; then
-              echo "::error::merge-clearance external requiredness is no longer true (or underivable) for $CURRENT_HEAD_SHA after an rc=5 rate-limit downgrade — the gate would pass vacuously with neither bot review. Aborting auto-merge."
+            if [ "$re_protected" != "true" ]; then
+              echo "::error::external-review protection is no longer true (or underivable) for $CURRENT_HEAD_SHA after an rc=5 rate-limit downgrade — this head has neither an active external gate nor already-satisfied Codex/Phase-4b clearance. Aborting auto-merge."
               exit 1
             fi
           fi

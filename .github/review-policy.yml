@@ -223,10 +223,13 @@ coderabbit:
   # `scripts/codex-review-request.sh --trigger-only` on the first rate-limit
   # notice; it is time-boxed and self-reverting (a single trigger per run, no
   # permanent Codex pin) and composes with `codex.request_by_default` (#486)
-  # without forking it. When the failover engaged, a `rate_limit_stalled`
-  # (exit 5) is a non-blocking note rather than a hard human-alert — the JSON
-  # carries `codex_failover_requested: true`. Set to false to opt out (e.g. a
-  # repo with `codex.enabled: false`, where there is nothing to fail over to).
+  # without forking it. In the auto-merge workflow, a `rate_limit_stalled`
+  # (exit 5) downgrades only when the JSON carries
+  # `codex_failover_requested: true` AND merge-clearance's rate-limit
+  # protection query proves either an active external gate or already-
+  # satisfied current-head Codex/Phase-4b clearance (#713). Set to false to
+  # opt out (e.g. a repo with `codex.enabled: false`, where there is nothing
+  # to fail over to).
   codex_failover_on_rate_limit: true
 
   # Maximum number of times `scripts/coderabbit-wait.sh` will post

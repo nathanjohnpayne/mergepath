@@ -945,27 +945,26 @@ else
 fi
 
 # 2e. The rc=5 CodeRabbit rate-limit branch derives external-review
-# applicability for coderabbit-automerge-rate-limit-gate.sh by asking
-# merge-clearance-gate.sh ITSELF (--derive-external-requiredness): the same
+# protection for coderabbit-automerge-rate-limit-gate.sh by asking
+# merge-clearance-gate.sh ITSELF (--derive-rate-limit-protection): the same
 # intrinsic threshold/protected-paths computation the required check runs,
-# with the label as force-on and the propagation lane's HEAD-pinned marker
-# as the exemption, evaluated on the LIVE head. Label-event proxies
-# (current-label reads, unlabeled-removal overrides, workflow-local marker
-# greps) were rejected across five review rounds — a label event is not
-# head-pinned proof of a downstream gate (#620 4a r4-r10, 4b r1-r3).
-# ext_required initializes false and only a clean `true`/`false` from the
+# plus current-head Codex/Phase-4b clearance when the active required check is
+# disabled (#713). Label-event proxies (current-label reads,
+# unlabeled-removal overrides, workflow-local marker greps) were rejected — a
+# label event is not head-pinned proof of a downstream gate or clearance.
+# ext_protected initializes false and only a clean `true`/`false` from the
 # query is accepted (fail-closed on error or garbage).
-if grep -Fq 'ext_required=false' <<<"$auto_merge_job_block" \
-  && grep -Fq -- 'merge-clearance-gate.sh --derive-external-requiredness' <<<"$auto_merge_job_block" \
-  && grep -A2 -F 'if req=$(bash scripts/merge-clearance-gate.sh --derive-external-requiredness "$PR_NUMBER" "$REPO"); then' <<<"$auto_merge_job_block" | grep -Fq 'true|false) ext_required=$req' \
+if grep -Fq 'ext_protected=false' <<<"$auto_merge_job_block" \
+  && grep -Fq -- 'merge-clearance-gate.sh --derive-rate-limit-protection' <<<"$auto_merge_job_block" \
+  && grep -A2 -F 'if req=$(bash scripts/merge-clearance-gate.sh --derive-rate-limit-protection "$PR_NUMBER" "$REPO"); then' <<<"$auto_merge_job_block" | grep -Fq 'true|false) ext_protected=$req' \
   && ! grep -Fq "any(.labels[]; .name==\"needs-external-review\")" <<<"$auto_merge_job_block" \
   && ! grep -Fq 'EVENT_ACTION' <<<"$auto_merge_job_block" \
   && ! grep -Fq 'mergepath-propagation-lane verified-head=' <<<"$auto_merge_job_block"; then
   pass=$((pass + 1))
-  echo "  PASS: rc=5 derives ext_required from merge-clearance-gate.sh requiredness (live head, fail-closed), with no label/marker proxies left (#620)"
+  echo "  PASS: rc=5 derives ext_protected from merge-clearance-gate.sh rate-limit protection (live head, fail-closed), with no label/marker proxies left (#713)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the rc=5 branch must derive ext_required via scripts/merge-clearance-gate.sh --derive-external-requiredness (init false, accept only literal true/false) and must not read labels, unlabeled events, or lane markers directly (#620)" >&2
+  echo "  FAIL: the rc=5 branch must derive ext_protected via scripts/merge-clearance-gate.sh --derive-rate-limit-protection (init false, accept only literal true/false) and must not read labels, unlabeled events, or lane markers directly (#713)" >&2
 fi
 
 # 2e-bis. The rc=5-time derivation runs minutes before the merge and state
@@ -973,21 +972,21 @@ fi
 # landing): the downgrade path must record itself (CR_RATE_LIMIT_DOWNGRADED
 # via GITHUB_ENV) and the FINAL blocking-label re-verify must abort on head
 # drift (the downgrade anchored the event head; the merge pins
-# CURRENT_HEAD_SHA via --match-head-commit) and RE-RUN the requiredness
-# derivation, requiring literal `true` (automated-4b P1 rounds 1+2).
+# CURRENT_HEAD_SHA via --match-head-commit) and RE-RUN the rate-limit
+# protection derivation, requiring literal `true` (#713).
 if grep -Fq 'echo "CR_RATE_LIMIT_DOWNGRADED=true" >> "$GITHUB_ENV"' <<<"$auto_merge_job_block" \
   && grep -Fq '"${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true"' <<<"$auto_merge_job_block" \
   && grep -Fq '"$CURRENT_HEAD_SHA" != "$HEAD_SHA"' <<<"$auto_merge_job_block" \
   && grep -A2 -F '"$CURRENT_HEAD_SHA" != "$HEAD_SHA"' <<<"$auto_merge_job_block" | grep -Fq 'exit 1' \
-  && grep -Fq 're_required=false' <<<"$auto_merge_job_block" \
-  && grep -A2 -F 'true) re_required=true' <<<"$auto_merge_job_block" | grep -Fq 'esac' \
-  && grep -A2 -F 'if [ "$re_required" != "true" ]' <<<"$auto_merge_job_block" | grep -Fq 'exit 1' \
-  && [ "$(grep -c -- 'merge-clearance-gate.sh --derive-external-requiredness' <<<"$auto_merge_job_block")" -ge 2 ]; then
+  && grep -Fq 're_protected=false' <<<"$auto_merge_job_block" \
+  && grep -A2 -F 'true) re_protected=true' <<<"$auto_merge_job_block" | grep -Fq 'esac' \
+  && grep -A2 -F 'if [ "$re_protected" != "true" ]' <<<"$auto_merge_job_block" | grep -Fq 'exit 1' \
+  && [ "$(grep -c -- 'merge-clearance-gate.sh --derive-rate-limit-protection' <<<"$auto_merge_job_block")" -ge 2 ]; then
   pass=$((pass + 1))
-  echo "  PASS: rc=5 downgrade records itself; the final re-verify aborts on head drift and re-derives requiredness, requiring true (#620)"
+  echo "  PASS: rc=5 downgrade records itself; the final re-verify aborts on head drift and re-derives rate-limit protection, requiring true (#713)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: the rc=5 downgrade must set CR_RATE_LIMIT_DOWNGRADED in GITHUB_ENV, and the final re-verify must abort on head drift and re-run merge-clearance-gate.sh --derive-external-requiredness, exiting 1 unless it prints true (automated-4b P1 r1+r2) (#620)" >&2
+  echo "  FAIL: the rc=5 downgrade must set CR_RATE_LIMIT_DOWNGRADED in GITHUB_ENV, and the final re-verify must abort on head drift and re-run merge-clearance-gate.sh --derive-rate-limit-protection, exiting 1 unless it prints true (#713)" >&2
 fi
 
 # 2f. pr-review-policy's propagation lane removes needs-external-review; that

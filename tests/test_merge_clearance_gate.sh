@@ -115,6 +115,7 @@ chmod +x "$STUB_DIR/gh"
 # from the gate's environment). Default 0.
 cat >"$STUB_DIR/codex-check-stub" <<'STUB'
 #!/usr/bin/env bash
+[ -z "${CODEX_STUB_STDOUT:-}" ] || printf '%s\n' "$CODEX_STUB_STDOUT"
 exit "${CODEX_STUB_RC:-0}"
 STUB
 chmod +x "$STUB_DIR/codex-check-stub"
@@ -1098,6 +1099,108 @@ if [ "$RC" != 0 ]; then
   pass "query: unfetchable PR metadata → nonzero exit (fail-closed contract)"
 else
   fail "query: expected nonzero on PR fetch failure; got rc=0 out='$OUT'"
+fi
+
+# ---------------------------------------------------------------------------
+# --derive-rate-limit-protection query mode (#713): prints exactly true/false.
+# `true` means the auto-merge rc=5 path is protected either by the active
+# merge-clearance external gate or by already-satisfied current-head
+# Codex/Phase-4b clearance when that required check is disabled.
+# ---------------------------------------------------------------------------
+
+echo; echo "--- Protection 1: active external gate + protected path → true"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "protection: active external gate + protected path → true"
+else
+  fail "protection: active external gate expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 2 (#713): gate disabled + protected path + Phase-4b/Codex cleared → true"
+SCRATCH=$(make_scratch false false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=0 CODEX_STUB_STDOUT='delegate stdout must not pollute query output' \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "protection: gate disabled + protected path + current-head external clearance → true (#713)"
+else
+  fail "protection: gate-disabled cleared expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 3: gate disabled + protected path + no external clearance → false"
+SCRATCH=$(make_scratch false false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: gate disabled + protected path + no current-head external clearance → false"
+else
+  fail "protection: gate-disabled uncleared expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 4: gate disabled + under-threshold plain PR stays false even if codex-check would pass"
+SCRATCH=$(make_scratch false false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"README.md","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=0 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: under-threshold plain PR → false (keeps #512 r3 block)"
+else
+  fail "protection: under-threshold expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 5: Dependabot author → false"
+SCRATCH=$(make_scratch true true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT" "$EXT_LABEL")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: dependabot → false"
+else
+  fail "protection: dependabot expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 6: indeterminate marker read → nonzero, NOT 'true'"
+SCRATCH=$(make_scratch false false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":500,"deletions":0}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS_FAIL=1 \
+  run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" != 0 ] && [ "$OUT" != "true" ]; then
+  pass "protection: indeterminate marker read → nonzero exit and no 'true' (caller fails closed)"
+else
+  fail "protection: indeterminate marker read expected nonzero and not 'true'; got rc=$RC out='$OUT'"
 fi
 
 # ---------------------------------------------------------------------------
