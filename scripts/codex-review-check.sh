@@ -759,27 +759,21 @@ ANNEX_SAME_REPO_PR=$(echo "$PR_JSON" | jq -r '(.head.repo.full_name // "head-unk
 # branch), not the base. Both are already on PR_JSON with no extra API call.
 ANNEX_BASE_BRANCH=$(echo "$PR_JSON" | jq -r '.base.ref // ""')
 ANNEX_HEAD_BRANCH=$(echo "$PR_JSON" | jq -r '.head.ref // ""')
-# #655 Codex P2 round 16 ("don't skip opened-only annex runs"): a
-# pull_request trigger scoped to types: [opened] (no synchronize) DOES fire
-# for the current HEAD when that HEAD is still the PR's ORIGINAL commit (no
-# push has landed since the PR was opened) -- but treating it as unfiltered
-# unconditionally would deadlock forever once a later push supersedes it
-# (opened never fires again for this PR). ANNEX_PR_CREATED_AT (already on
-# PR_JSON, no extra API call) plus HEAD_COMMITTER_DATE (already fetched
-# above) let the ruby probe distinguish "still on the opening commit" (head
-# committer date <= PR created_at) from "synchronized at least once since"
-# (head committer date is later) -- ISO-8601 UTC strings sort correctly
-# lexicographically, the same comparison style already used for
-# HEAD_PUSHED_AT/LATEST_FORCE_PUSH_TIME above.
-ANNEX_PR_CREATED_AT=$(echo "$PR_JSON" | jq -r '.created_at // ""')
-# #655 Codex P2 round 16 ("wait for path-matched annex workflows"): a
-# pull_request/push trigger scoped by paths/paths-ignore was previously
-# treated as unconditionally filtered on mere key presence, even when the
-# PR's actual changed files match the filter (GitHub schedules the workflow
-# in that case). Fetching the real changed-file list lets the ruby probe
-# evaluate the filter for real instead of guessing. Paginated like
-# TIMELINE_JSON above, since a large PR can have more than one page of
-# files.
+# #655 Codex P2 round 16 ("wait for path-matched annex workflows",
+# narrowed in round 17 -- "use the event diff when emulating path
+# filters"): a pull_request trigger scoped by paths/paths-ignore was
+# previously treated as unconditionally filtered on mere key presence,
+# even when the PR's actual changed files match the filter (GitHub
+# schedules the workflow in that case). Fetching the real changed-file
+# list lets the ruby probe evaluate the filter for real instead of
+# guessing (scoped to pull_request only -- see the ruby-side comment for
+# why push does not get the same treatment). Paginated like TIMELINE_JSON
+# above, since a large PR can have more than one page of files;
+# fetch_api_array dies on a genuine fetch failure (#655 Codex P2 round
+# 17, "fail closed when the changed-file lookup fails" / CodeRabbit,
+# "don't silently treat changed-files API failures as filtered out") so
+# ANNEX_CHANGED_FILES_JSON is never silently wrong here -- either a valid
+# array, or the whole script has already aborted.
 ANNEX_CHANGED_FILES_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/files" "PR changed files" | jq -c '[.[].filename]')
 ANNEX_CHECKS_JSON='[]'
 ANNEX_WORKFLOW_NAME=""
@@ -788,7 +782,7 @@ ANNEX_CONFIRMED_ABSENT=0
 if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
   annex_probe_err=$(mktemp)
   if annex_content=$(gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$HEAD_SHA_FOR_ANNEX" --jq .content 2>"$annex_probe_err"); then
-    annex_probe_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ANNEX_SAME_REPO_PR="$ANNEX_SAME_REPO_PR" ANNEX_BASE_BRANCH="$ANNEX_BASE_BRANCH" ANNEX_HEAD_BRANCH="$ANNEX_HEAD_BRANCH" ANNEX_PR_CREATED_AT="$ANNEX_PR_CREATED_AT" ANNEX_HEAD_COMMITTER_DATE="$HEAD_COMMITTER_DATE" ANNEX_CHANGED_FILES_JSON="$ANNEX_CHANGED_FILES_JSON" ruby -ryaml -rjson -e '
+    annex_probe_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ANNEX_SAME_REPO_PR="$ANNEX_SAME_REPO_PR" ANNEX_BASE_BRANCH="$ANNEX_BASE_BRANCH" ANNEX_HEAD_BRANCH="$ANNEX_HEAD_BRANCH" ANNEX_CHANGED_FILES_JSON="$ANNEX_CHANGED_FILES_JSON" ruby -ryaml -rjson -e '
       raw = STDIN.read
       # #655 Codex P1 round 7 ("parse valid annex workflows that use YAML
       # aliases"): GitHub Actions supports anchors/aliases in workflow
@@ -1034,52 +1028,57 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
         end
         false
       end
-      # #655 Codex P2 round 16 ("wait for path-matched annex workflows"):
-      # a paths/paths-ignore key was previously treated as unconditionally
-      # filtered on mere presence, even when the PRs actual changed files
-      # match the filter (GitHub schedules the workflow in that case, so
-      # zero reported entries means "not yet", not "never" -- exactly the
-      # ambiguity this whole unfiltered/filtered distinction exists to
-      # resolve). Path glob syntax documents the SAME tokens (*, **, ?,
-      # [...], +, \) as branch/tag patterns, so branch_matches_list? is
-      # reused verbatim rather than reimplementing path matching. `paths`
-      # requires at least one changed file to match (in order, with `!`
-      # negation); `paths-ignore` excludes only when EVERY changed file
-      # matches the ignore patterns (GitHub still runs the workflow if even
-      # one changed file falls outside them).
-      def paths_filter_excludes?(cfg, changed_files)
+      # #655 Codex P2 round 16 ("wait for path-matched annex workflows",
+      # narrowed in round 17 -- "use the event diff when emulating path
+      # filters"): a paths/paths-ignore key was previously treated as
+      # unconditionally filtered on mere presence, even when the PRs
+      # actual changed files match the filter. Path glob syntax documents
+      # the SAME tokens (*, **, ?, [...], +, \) as branch/tag patterns, so
+      # branch_matches_list? is reused rather than reimplementing path
+      # matching. `paths` requires at least one changed file to match (in
+      # order, with `!` negation); `paths-ignore` excludes only when EVERY
+      # changed file matches the ignore patterns. GitHub evaluates a PUSH
+      # triggers path filter against the two-dot diff of JUST that push,
+      # not the whole-PR three-dot diff this fetch provides -- an earlier
+      # commit already in the PR could have touched a matching path while
+      # the CURRENT push does not, wrongly keeping this "unfiltered" and
+      # injecting a PENDING entry that never resolves. The three-dot
+      # PR-wide diff genuinely matches what GitHub documents for the
+      # pull_request event, so only that event gets the real evaluation;
+      # push keeps the round-16-era always-filtered default rather than
+      # risk a diff-scope mismatch. GitHub also only considers the first
+      # 300 changed files for path-filter evaluation, so the list is
+      # capped the same way before matching.
+      def paths_filter_excludes?(event, cfg, changed_files, changed_files_known)
+        return false unless cfg.key?("paths") || cfg.key?("paths-ignore")
+        return true if event == "push"
+        return false unless changed_files_known
+        capped_files = changed_files.first(300)
         if cfg.key?("paths")
-          return true unless changed_files.any? { |f| branch_matches_list?(cfg["paths"], f) }
+          return true unless capped_files.any? { |f| branch_matches_list?(cfg["paths"], f) }
         end
         if cfg.key?("paths-ignore")
-          return true if changed_files.all? { |f| branch_matches_list?(cfg["paths-ignore"], f) }
+          return true if capped_files.all? { |f| branch_matches_list?(cfg["paths-ignore"], f) }
         end
         false
       end
+      # #655 Codex P2 round 17 (do not silently treat changed-files API
+      # failures as filtered out, CodeRabbit; "fail closed when the
+      # changed-file lookup fails", Codex): ANNEX_CHANGED_FILES_JSON is
+      # only ever empty here because fetch_api_array (bash layer above)
+      # dies on a genuine fetch failure -- but the ENV var is unset (not
+      # merely "[]") in that dead-script case, so an EXPLICITLY empty
+      # string still distinguishes "never got this far" from "genuinely
+      # parsed to []" for the (unlikely but not impossible) zero-file
+      # case. changed_files_known gates the real evaluation above:
+      # unknown data must not silently read as "paths definitely do not
+      # match" (which would wrongly filter out an annex that could
+      # actually run).
+      changed_files_known = !(ENV["ANNEX_CHANGED_FILES_JSON"] || "").empty?
       changed_files = begin
-        JSON.parse(ENV["ANNEX_CHANGED_FILES_JSON"] || "[]")
+        changed_files_known ? JSON.parse(ENV["ANNEX_CHANGED_FILES_JSON"]) : []
       rescue JSON::ParserError
         []
-      end
-      # #655 Codex P2 round 16 (do not skip opened-only annex runs): a
-      # pull_request trigger scoped to types: [opened] (no synchronize)
-      # DOES fire for the current HEAD when that HEAD is still the PRs
-      # ORIGINAL commit (no push has landed since the PR was opened), but
-      # treating it as unfiltered unconditionally would deadlock forever
-      # once a later push supersedes it (opened never fires again for this
-      # PR). ISO-8601 UTC strings sort correctly lexicographically, same
-      # comparison style as HEAD_PUSHED_AT/LATEST_FORCE_PUSH_TIME in the
-      # bash layer above -- if the annex own HEAD committer date is at or
-      # before the PRs created_at, this is plausibly still the opening
-      # commit; a clearly-later committer date means at least one push has
-      # landed since (a rebase/amend preserving an old date could fool
-      # this, but that is a narrow edge case, and the failure mode --
-      # falling through to "still filtered" -- is the existing, safe
-      # default, not a new deadlock risk).
-      head_predates_pr_creation = begin
-        created_at = ENV["ANNEX_PR_CREATED_AT"] || ""
-        committer_date = ENV["ANNEX_HEAD_COMMITTER_DATE"] || ""
-        !created_at.empty? && !committer_date.empty? && committer_date <= created_at
       end
       trigger_unfiltered = lambda do |event, relevant_branch|
         case on
@@ -1089,15 +1088,30 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
           next false unless on.key?(event)
           cfg = on[event]
           next true unless cfg.is_a?(Hash)
-          next false if paths_filter_excludes?(cfg, changed_files)
+          next false if paths_filter_excludes?(event, cfg, changed_files, changed_files_known)
           next false if event == "push" && push_tag_only_excludes?(cfg)
           next false if branch_filter_excludes?(cfg, relevant_branch)
-          if cfg.key?("types")
-            types = cfg["types"].is_a?(Array) ? cfg["types"] : []
-            next true if types.include?("synchronize")
-            next true if types.include?("opened") && head_predates_pr_creation
-            next false
-          end
+          # #655 Codex P2 round 16 (do not skip opened-only annex runs),
+          # REVERTED in round 17 ("do not infer opened-only runs from
+          # committer date"): round 16 tried to distinguish "still on the
+          # PRs opening commit" (types: [opened] would still fire) from
+          # "synchronized since" (opened will never fire again) by
+          # comparing the HEAD committer date against the PRs created_at.
+          # Confirmed live: a genuinely-new synchronize push whose commit
+          # preserves an OLDER committer date (a rebase/cherry-pick of a
+          # stale commit) still satisfies committer_date <= created_at,
+          # so the heuristic can say "unfiltered" for a trigger that will
+          # NEVER report again on this HEAD -- injecting a permanent
+          # PENDING entry via the zero-match branch below, a real
+          # deadlock. No reliable, non-spoofable signal for "has
+          # synchronize happened since open" is available from the data
+          # this script already has, and a permanent deadlock is strictly
+          # worse than the narrower gap being reopened (a brand-new PRs
+          # opened-only annex not being waited for before its first
+          # report) -- reverted to the simple, safe round-10 rule: only a
+          # types list that explicitly includes synchronize counts as
+          # unfiltered.
+          next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")
           true
         else
           false

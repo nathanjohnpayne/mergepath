@@ -215,7 +215,7 @@ fi
 # Round 16 replaced the paths/paths-ignore blanket-disqualify with a real
 # evaluation too (see the paths_filter_excludes? assertions further
 # below), which is why the standalone filter-key list variables are gone.
-if grep -qF 'def paths_filter_excludes?(cfg, changed_files)' "$SCRIPT" \
+if grep -qF 'def paths_filter_excludes?(event, cfg, changed_files, changed_files_known)' "$SCRIPT" \
    && ! grep -qF 'pr_filter_keys = ["paths", "paths-ignore"]' "$SCRIPT" \
    && ! grep -qF 'push_filter_keys = ["paths", "paths-ignore"]' "$SCRIPT"; then
   pass "codex-review-check.sh's generic filter-key lists no longer blanket-disqualify on branches/branches-ignore or paths/paths-ignore, evaluating both instead (#655 rounds 11 and 16)"
@@ -477,29 +477,49 @@ else
   fail "push_tag_only_excludes? (branches only): expected false, got $GOT"
 fi
 
-# Codex P2 (#655 round 16, "wait for path-matched annex workflows"): a
-# paths/paths-ignore key was previously treated as unconditionally
-# filtered on mere presence, even when the PRs actual changed files match
-# the filter (GitHub schedules the workflow in that case). Path glob
-# syntax documents the SAME tokens as branch/tag patterns, so
-# branch_matches_list? is reused rather than reimplementing path
-# matching. `paths` requires at least one changed file to match;
-# `paths-ignore` excludes only when EVERY changed file matches the ignore
-# patterns.
-if grep -qF 'def paths_filter_excludes?(cfg, changed_files)' "$SCRIPT" \
-   && grep -qF 'return true unless changed_files.any? { |f| branch_matches_list?(cfg["paths"], f) }' "$SCRIPT" \
-   && grep -qF 'return true if changed_files.all? { |f| branch_matches_list?(cfg["paths-ignore"], f) }' "$SCRIPT" \
+# Codex P2 (#655 round 16, "wait for path-matched annex workflows",
+# narrowed in round 17 -- "use the event diff when emulating path
+# filters"): a paths/paths-ignore key was previously treated as
+# unconditionally filtered on mere presence, even when the PRs actual
+# changed files match the filter. Path glob syntax documents the SAME
+# tokens as branch/tag patterns, so branch_matches_list? is reused.
+# `paths` requires at least one changed file to match; `paths-ignore`
+# excludes only when EVERY changed file matches the ignore patterns.
+# GitHub evaluates a push triggers path filter against the two-dot diff
+# of JUST that push, not the whole-PR three-dot diff this fetch
+# provides, so only pull_request gets the real evaluation; push keeps
+# the always-filtered default. The changed-file list is capped to
+# GitHub's own 300-file evaluation limit.
+if grep -qF 'def paths_filter_excludes?(event, cfg, changed_files, changed_files_known)' "$SCRIPT" \
+   && grep -qF 'return true if event == "push"' "$SCRIPT" \
+   && grep -qF 'capped_files = changed_files.first(300)' "$SCRIPT" \
+   && grep -qF 'return true unless capped_files.any? { |f| branch_matches_list?(cfg["paths"], f) }' "$SCRIPT" \
+   && grep -qF 'return true if capped_files.all? { |f| branch_matches_list?(cfg["paths-ignore"], f) }' "$SCRIPT" \
    && grep -qF 'ANNEX_CHANGED_FILES_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/files"' "$SCRIPT" \
-   && grep -qF 'next false if paths_filter_excludes?(cfg, changed_files)' "$SCRIPT"; then
+   && grep -qF 'next false if paths_filter_excludes?(event, cfg, changed_files, changed_files_known)' "$SCRIPT"; then
   pass "codex-review-check.sh evaluates paths/paths-ignore against the PRs real changed files instead of blanket-disqualifying on presence (#655 round 16)"
 else
   fail "codex-review-check.sh does not evaluate paths/paths-ignore against real changed files (#655 round 16)"
 fi
+# Codex P2 (#655 round 17, "fail closed when the changed-file lookup
+# fails", Codex; "don't silently treat changed-files API failures as
+# filtered out", CodeRabbit): codex-review-check.sh already used
+# fetch_api_array (dies on a genuine fetch failure), so this specific
+# script never actually reaches ruby with unknown data in practice -- but
+# changed_files_known still gates the evaluation for structural parity
+# with agent-review.yml, whose own ad hoc fetch (no fetch_api_array
+# available in a plain workflow YAML) DID have the silent-failure bug.
+if grep -qF 'changed_files_known = !(ENV["ANNEX_CHANGED_FILES_JSON"] || "").empty?' "$SCRIPT"; then
+  pass "codex-review-check.sh distinguishes an unknown changed-files fetch from a genuinely-empty one (#655 round 17)"
+else
+  fail "codex-review-check.sh does not track changed_files_known (#655 round 17)"
+fi
 # End-to-end: the exact scenarios the finding describes -- paths matching
 # vs not matching the actual diff, paths-ignore excluding only when ALL
-# files are covered, and the defensive empty-changed-files default.
+# files are covered, push never getting the real evaluation, the 300-file
+# cap, and the changed_files_known distinction.
 paths_filter_excludes_ruby() {
-  local cfg_json=$1 changed_files_json=$2
+  local event=$1 cfg_json=$2 changed_files_json=$3
   ruby -rjson -e '
     def branch_pattern_to_regex(pattern)
       tokens = []
@@ -539,55 +559,87 @@ paths_filter_excludes_ruby() {
       end
       included
     end
-    def paths_filter_excludes?(cfg, changed_files)
+    def paths_filter_excludes?(event, cfg, changed_files, changed_files_known)
+      return false unless cfg.key?("paths") || cfg.key?("paths-ignore")
+      return true if event == "push"
+      return false unless changed_files_known
+      capped_files = changed_files.first(300)
       if cfg.key?("paths")
-        return true unless changed_files.any? { |f| branch_matches_list?(cfg["paths"], f) }
+        return true unless capped_files.any? { |f| branch_matches_list?(cfg["paths"], f) }
       end
       if cfg.key?("paths-ignore")
-        return true if changed_files.all? { |f| branch_matches_list?(cfg["paths-ignore"], f) }
+        return true if capped_files.all? { |f| branch_matches_list?(cfg["paths-ignore"], f) }
       end
       false
     end
-    cfg = JSON.parse(ARGV[0])
-    changed_files = JSON.parse(ARGV[1])
-    puts paths_filter_excludes?(cfg, changed_files)
-  ' "$cfg_json" "$changed_files_json"
+    event = ARGV[0]
+    cfg = JSON.parse(ARGV[1])
+    changed_files_known = !ARGV[2].empty?
+    changed_files = changed_files_known ? JSON.parse(ARGV[2]) : []
+    puts paths_filter_excludes?(event, cfg, changed_files, changed_files_known)
+  ' "$event" "$cfg_json" "$changed_files_json"
 }
-GOT=$(paths_filter_excludes_ruby '{"paths":["src/**"]}' '["src/foo.py"]')
+GOT=$(paths_filter_excludes_ruby 'pull_request' '{"paths":["src/**"]}' '["src/foo.py"]')
 if [ "$GOT" = "false" ]; then
-  pass "paths_filter_excludes?: paths matches a changed file -> not excluded, gate (a) waits for it (#655 round 16)"
+  pass "paths_filter_excludes?: pull_request paths matches a changed file -> not excluded, gate (a) waits for it (#655 round 16)"
 else
   fail "paths_filter_excludes? (paths matches): expected false, got $GOT"
 fi
-GOT=$(paths_filter_excludes_ruby '{"paths":["src/**"]}' '["docs/readme.md"]')
+GOT=$(paths_filter_excludes_ruby 'pull_request' '{"paths":["src/**"]}' '["docs/readme.md"]')
 if [ "$GOT" = "true" ]; then
-  pass "paths_filter_excludes?: paths matches no changed file -> excluded, consistent with GitHub never scheduling the workflow (#655 round 16)"
+  pass "paths_filter_excludes?: pull_request paths matches no changed file -> excluded, consistent with GitHub never scheduling the workflow (#655 round 16)"
 else
   fail "paths_filter_excludes? (paths no match): expected true, got $GOT"
 fi
-GOT=$(paths_filter_excludes_ruby '{"paths":["src/**"]}' '["docs/readme.md","src/foo.py"]')
+GOT=$(paths_filter_excludes_ruby 'pull_request' '{"paths":["src/**"]}' '["docs/readme.md","src/foo.py"]')
 if [ "$GOT" = "false" ]; then
-  pass "paths_filter_excludes?: paths matches at least one of several changed files -> not excluded (#655 round 16)"
+  pass "paths_filter_excludes?: pull_request paths matches at least one of several changed files -> not excluded (#655 round 16)"
 else
   fail "paths_filter_excludes? (paths partial match): expected false, got $GOT"
 fi
-GOT=$(paths_filter_excludes_ruby '{"paths-ignore":["docs/**"]}' '["docs/readme.md"]')
+GOT=$(paths_filter_excludes_ruby 'pull_request' '{"paths-ignore":["docs/**"]}' '["docs/readme.md"]')
 if [ "$GOT" = "true" ]; then
-  pass "paths_filter_excludes?: paths-ignore covers every changed file -> excluded (#655 round 16)"
+  pass "paths_filter_excludes?: pull_request paths-ignore covers every changed file -> excluded (#655 round 16)"
 else
   fail "paths_filter_excludes? (paths-ignore all covered): expected true, got $GOT"
 fi
-GOT=$(paths_filter_excludes_ruby '{"paths-ignore":["docs/**"]}' '["docs/readme.md","src/foo.py"]')
+GOT=$(paths_filter_excludes_ruby 'pull_request' '{"paths-ignore":["docs/**"]}' '["docs/readme.md","src/foo.py"]')
 if [ "$GOT" = "false" ]; then
-  pass "paths_filter_excludes?: paths-ignore does not cover every changed file -> not excluded, GitHub still runs it (#655 round 16)"
+  pass "paths_filter_excludes?: pull_request paths-ignore does not cover every changed file -> not excluded, GitHub still runs it (#655 round 16)"
 else
   fail "paths_filter_excludes? (paths-ignore partial): expected false, got $GOT"
 fi
-GOT=$(paths_filter_excludes_ruby '{"paths":["src/**"]}' '[]')
+GOT=$(paths_filter_excludes_ruby 'push' '{"paths":["src/**"]}' '["src/foo.py"]')
 if [ "$GOT" = "true" ]; then
-  pass "paths_filter_excludes?: no changed-files data (e.g. fetch failed) falls back to excluded, the existing conservative default (#655 round 16)"
+  pass "paths_filter_excludes?: push never gets the real evaluation, even when the whole-PR diff would match -- avoids the two-dot-vs-three-dot diff scope mismatch (#655 round 17)"
 else
-  fail "paths_filter_excludes? (empty changed files): expected true, got $GOT"
+  fail "paths_filter_excludes? (push scoping): expected true, got $GOT"
+fi
+GOT=$(paths_filter_excludes_ruby 'pull_request' '{"paths":["src/**"]}' '')
+if [ "$GOT" = "false" ]; then
+  pass "paths_filter_excludes?: unknown changed-files data (fetch failed) is NOT excluded -- wait for it rather than silently pass (#655 round 17)"
+else
+  fail "paths_filter_excludes? (unknown changed files): expected false, got $GOT"
+fi
+GOT=$(paths_filter_excludes_ruby 'pull_request' '{"paths":["src/**"]}' '[]')
+if [ "$GOT" = "true" ]; then
+  pass "paths_filter_excludes?: a genuinely-known EMPTY changed-file list still excludes, distinct from unknown (#655 round 17)"
+else
+  fail "paths_filter_excludes? (known empty changed files): expected true, got $GOT"
+fi
+MANY_FILES=$(ruby -rjson -e 'puts JSON.generate((0...300).map { |i| "docs/file#{i}.md" } + ["src/matching.py"])')
+GOT=$(paths_filter_excludes_ruby 'pull_request' '{"paths":["src/**"]}' "$MANY_FILES")
+if [ "$GOT" = "true" ]; then
+  pass "paths_filter_excludes?: a matching file beyond the first 300 changed files is not counted, matching GitHub's own evaluation limit (#655 round 17)"
+else
+  fail "paths_filter_excludes? (300-file cap): expected true, got $GOT"
+fi
+MANY_FILES_WITHIN_CAP=$(ruby -rjson -e 'puts JSON.generate(["src/matching.py"] + (0...299).map { |i| "docs/file#{i}.md" })')
+GOT=$(paths_filter_excludes_ruby 'pull_request' '{"paths":["src/**"]}' "$MANY_FILES_WITHIN_CAP")
+if [ "$GOT" = "false" ]; then
+  pass "paths_filter_excludes?: a matching file within the first 300 changed files is still counted (#655 round 17)"
+else
+  fail "paths_filter_excludes? (within 300-file cap): expected false, got $GOT"
 fi
 
 # Codex P1 (#655 round 13, "page the rollup before scanning annex
@@ -651,79 +703,58 @@ fi
 # omitting types -- was wrongly disqualified. Only a types list that
 # EXCLUDES synchronize should disqualify, since that is the activity that
 # fires for a resynchronized PRs current HEAD.
-if grep -qF 'next true if types.include?("synchronize")' "$SCRIPT"; then
+if grep -qF 'next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")' "$SCRIPT"; then
   pass "codex-review-check.sh treats a types list that includes synchronize as unfiltered, not merely absent (#655 round 10)"
 else
   fail "codex-review-check.sh still disqualifies unfiltered on the mere presence of a types key (#655 round 10)"
 fi
 
-# Codex P2 (#655 round 16, "don't skip opened-only annex runs"): a
-# pull_request trigger scoped to types: [opened] (no synchronize) DOES
-# fire for the current HEAD when that HEAD is still the PRs ORIGINAL
-# commit (no push has landed since the PR was opened), but treating it as
-# unfiltered unconditionally would deadlock forever once a later push
-# supersedes it (opened never fires again for this PR). HEAD_COMMITTER_DATE
-# <= PR created_at (both cheaply available, no new API call beyond one
-# small commit read) distinguishes "still on the opening commit" from
-# "synchronized since" -- ISO-8601 UTC strings sort correctly
-# lexicographically.
-if grep -qF 'next true if types.include?("opened") && head_predates_pr_creation' "$SCRIPT" \
-   && grep -qF 'ANNEX_PR_CREATED_AT="$ANNEX_PR_CREATED_AT"' "$SCRIPT" \
-   && grep -qF 'ANNEX_HEAD_COMMITTER_DATE="$HEAD_COMMITTER_DATE"' "$SCRIPT" \
-   && grep -qF 'committer_date <= created_at' "$SCRIPT"; then
-  pass "codex-review-check.sh treats types: [opened] as unfiltered only when the HEAD still predates PR creation (#655 round 16)"
+# Codex P2 (#655 round 16, "don't skip opened-only annex runs"),
+# REVERTED in round 17 ("do not infer opened-only runs from committer
+# date"): round 16 tried to treat types: [opened] (no synchronize) as
+# unfiltered when the HEAD committer date predates PR creation. Confirmed
+# live: a genuinely-new synchronize push whose commit preserves an OLDER
+# committer date (a rebase/cherry-pick of a stale commit) still satisfies
+# that comparison, so the heuristic could say "unfiltered" for a trigger
+# that will NEVER report again on that HEAD -- a real, confirmed
+# permanent-wait risk, worse than the narrower gap being reopened. No
+# reliable, non-spoofable signal is available from data this script
+# already has, so the mechanism was removed entirely rather than patched
+# further.
+if ! grep -qF 'head_predates_pr_creation' "$SCRIPT" \
+   && ! grep -qF 'ANNEX_PR_CREATED_AT' "$SCRIPT" \
+   && ! grep -qF 'ANNEX_HEAD_COMMITTER_DATE' "$SCRIPT"; then
+  pass "codex-review-check.sh no longer infers an opened-only annex is unfiltered from committer date (#655 round 17)"
 else
-  fail "codex-review-check.sh does not evaluate types: [opened] against PR creation vs HEAD committer date (#655 round 16)"
+  fail "codex-review-check.sh still carries the reverted committer-date opened-only heuristic (#655 round 17)"
 fi
-# End-to-end: the exact scenarios the finding describes -- a newly opened
-# PR (HEAD still predates or equals PR creation) vs a since-synchronized
-# one (HEAD committer date clearly later), plus the round-10 regression
-# guard (types including synchronize is unaffected by any of this).
+# End-to-end: types: [opened] alone is unconditionally filtered again
+# (the deadlock scenario Codex found is empirically closed), while types
+# including synchronize is unaffected (round-10 behavior preserved).
 opened_only_unfiltered() {
-  local created_at=$1 committer_date=$2 types_json=$3
-  ruby -e '
-    types = JSON.parse(ARGV[2])
-    created_at = ARGV[0]
-    committer_date = ARGV[1]
-    head_predates_pr_creation = !created_at.empty? && !committer_date.empty? && committer_date <= created_at
-    if types.include?("synchronize")
-      puts true
-    elsif types.include?("opened") && head_predates_pr_creation
-      puts true
+  local types_json=$1
+  ruby -rjson -e '
+    types = JSON.parse(ARGV[0])
+    cfg_has_types = true
+    result = if cfg_has_types
+      (types.is_a?(Array) && types.include?("synchronize"))
     else
-      puts false
+      true
     end
-  ' -rjson "$created_at" "$committer_date" "$types_json"
+    puts result
+  ' "$types_json"
 }
-GOT=$(opened_only_unfiltered "2026-07-06T05:00:00Z" "2026-07-06T05:00:00Z" '["opened"]')
-if [ "$GOT" = "true" ]; then
-  pass "opened-only annex: HEAD committer date equals PR created_at (still the opening commit) -> unfiltered (#655 round 16)"
-else
-  fail "opened-only annex (equal timestamps): expected true, got $GOT"
-fi
-GOT=$(opened_only_unfiltered "2026-07-06T05:00:00Z" "2026-07-06T04:00:00Z" '["opened"]')
-if [ "$GOT" = "true" ]; then
-  pass "opened-only annex: HEAD committer date before PR created_at (still the opening commit) -> unfiltered (#655 round 16)"
-else
-  fail "opened-only annex (HEAD predates PR): expected true, got $GOT"
-fi
-GOT=$(opened_only_unfiltered "2026-07-06T05:00:00Z" "2026-07-06T06:00:00Z" '["opened"]')
+GOT=$(opened_only_unfiltered '["opened"]')
 if [ "$GOT" = "false" ]; then
-  pass "opened-only annex: HEAD committer date after PR created_at (synchronized since open) -> filtered, avoiding a permanent deadlock (#655 round 16)"
+  pass "opened-only annex: types: [opened] alone is unconditionally filtered, closing the deadlock Codex found (#655 round 17)"
 else
-  fail "opened-only annex (synchronized since): expected false, got $GOT"
+  fail "opened-only annex (reverted): expected false, got $GOT"
 fi
-GOT=$(opened_only_unfiltered "2026-07-06T05:00:00Z" "2026-07-06T06:00:00Z" '["opened","synchronize","reopened"]')
+GOT=$(opened_only_unfiltered '["opened","synchronize","reopened"]')
 if [ "$GOT" = "true" ]; then
-  pass "opened-only annex regression guard: types including synchronize stays unfiltered regardless of dates (#655 round 10 behavior preserved)"
+  pass "opened-only annex regression guard: types including synchronize stays unfiltered (#655 round 10 behavior preserved)"
 else
   fail "opened-only annex (synchronize regression): expected true, got $GOT"
-fi
-GOT=$(opened_only_unfiltered "" "" '["opened"]')
-if [ "$GOT" = "false" ]; then
-  pass "opened-only annex: missing timestamps (e.g. API read failed) fall back to filtered, the existing conservative default (#655 round 16)"
-else
-  fail "opened-only annex (missing timestamps): expected false, got $GOT"
 fi
 
 # Codex P1 (#655 round 10, "fail closed when the annex probe is

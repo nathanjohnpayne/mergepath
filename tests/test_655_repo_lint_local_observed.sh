@@ -289,25 +289,30 @@ assert_grep "agent-review: push_tag_only_excludes? is wired into the trigger_unf
 # list that EXCLUDES synchronize should disqualify, since that is the
 # activity that fires for a resynchronized PRs current HEAD.
 assert_grep "agent-review: treats a types list that includes synchronize as unfiltered, not merely absent (#655 round 10)" \
-  "$W/agent-review.yml" 'next true if types.include?("synchronize")'
+  "$W/agent-review.yml" 'next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")'
 
-# Codex P2 (#655 round 16, "do not skip opened-only annex runs", found on
-# the codex-review-check.sh copy and mirrored here): a types: [opened]
-# annex (no synchronize) DOES fire for the current HEAD when that HEAD is
-# still the PRs original commit (no push since the PR opened), but
-# treating it as unfiltered unconditionally would deadlock forever once a
-# later push supersedes it -- opened never fires again for this PR.
-# head_predates_pr_creation (HEAD committer date <= PR created_at, both
-# already available with no extra API call beyond one small commit read)
-# distinguishes "still on the opening commit" from "synchronized since".
-assert_grep "agent-review: types: [opened] (no synchronize) is unfiltered only when the HEAD still predates PR creation (#655 round 16)" \
-  "$W/agent-review.yml" 'next true if types.include?("opened") && head_predates_pr_creation'
-assert_grep "agent-review: head_predates_pr_creation compares HEAD committer date against PR created_at lexicographically (#655 round 16)" \
-  "$W/agent-review.yml" 'committer_date <= created_at'
-assert_grep "agent-review: fetches PR createdAt via the same pr_view_json call, no extra API call (#655 round 16)" \
-  "$W/agent-review.yml" 'gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,isCrossRepository,baseRefName,headRefName,createdAt'
-assert_grep "agent-review: fetches the annex HEAD own committer date for the opened-only comparison (#655 round 16)" \
-  "$W/agent-review.yml" 'annex_head_committer_date=$(gh api "repos/$REPO/commits/$sha"'
+# Codex P2 (#655 round 16, "do not skip opened-only annex runs"),
+# REVERTED in round 17 ("do not infer opened-only runs from committer
+# date", found on the codex-review-check.sh copy and mirrored here):
+# round 16 tried to treat types: [opened] (no synchronize) as unfiltered
+# when the HEAD committer date predates PR creation. Confirmed live: a
+# genuinely-new synchronize push whose commit preserves an OLDER
+# committer date (a rebase/cherry-pick of a stale commit) still satisfies
+# that comparison, so the heuristic could say "unfiltered" for a trigger
+# that will NEVER report again on that HEAD -- a real, confirmed
+# permanent-wait risk, worse than the narrower gap being reopened. No
+# reliable, non-spoofable signal is available from data this script
+# already has, so the mechanism was removed entirely rather than patched
+# further; only a types list that explicitly includes synchronize counts
+# as unfiltered again (the simple, safe round-10 rule).
+assert_not_grep "agent-review: no longer infers an opened-only annex is unfiltered from committer date (#655 round 17)" \
+  "$W/agent-review.yml" 'head_predates_pr_creation'
+assert_not_grep "agent-review: no longer fetches PR createdAt for the reverted opened-only heuristic (#655 round 17)" \
+  "$W/agent-review.yml" ',createdAt)'
+assert_not_grep "agent-review: no longer fetches the annex HEAD's own committer date for the reverted opened-only heuristic (#655 round 17)" \
+  "$W/agent-review.yml" 'annex_head_committer_date='
+assert_grep "agent-review: types: [opened] alone (no synchronize) is unconditionally filtered again, closing the deadlock risk (#655 round 17)" \
+  "$W/agent-review.yml" 'next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")'
 
 # Codex P2 (#655 round 11, "evaluate base-branch filters before passing",
 # found on the codex-review-check.sh copy and mirrored here):
@@ -325,23 +330,47 @@ assert_grep "agent-review: pull_request branches evaluation uses the PRs base re
 assert_grep "agent-review: push branches evaluation uses the PRs own head ref, not base (#655 round 11)" \
   "$W/agent-review.yml" 'trigger_unfiltered.call("push", ENV["ANNEX_HEAD_BRANCH"])'
 
-# Codex P2 (#655 round 16, "wait for path-matched annex workflows", found
-# on the codex-review-check.sh copy and mirrored here): a paths/
-# paths-ignore key was previously treated as unconditionally filtered on
-# mere presence, even when the PRs actual changed files match the filter
-# (GitHub schedules the workflow in that case). Path glob syntax documents
-# the SAME tokens as branch/tag patterns, so branch_matches_list? is
-# reused verbatim rather than reimplementing path matching.
+# Codex P2 (#655 round 16, "wait for path-matched annex workflows",
+# narrowed in round 17 -- "use the event diff when emulating path
+# filters", found on the codex-review-check.sh copy and mirrored here): a
+# paths/paths-ignore key was previously treated as unconditionally
+# filtered on mere presence, even when the PRs actual changed files match
+# the filter. Path glob syntax documents the SAME tokens as branch/tag
+# patterns, so branch_matches_list? is reused. GitHub evaluates a push
+# triggers path filter against the two-dot diff of JUST that push, not
+# the whole-PR three-dot diff this fetch provides, so only pull_request
+# gets the real evaluation; push keeps the always-filtered default. The
+# changed-file list is also capped to GitHub own 300-file evaluation
+# limit.
 assert_grep "agent-review: evaluates paths/paths-ignore against the PRs real changed files instead of blanket-disqualifying on presence (#655 round 16)" \
-  "$W/agent-review.yml" 'def paths_filter_excludes?(cfg, changed_files)'
+  "$W/agent-review.yml" 'def paths_filter_excludes?(event, cfg, changed_files, changed_files_known)'
+assert_grep "agent-review: push never gets the real path evaluation, avoiding a two-dot-vs-three-dot diff scope mismatch (#655 round 17)" \
+  "$W/agent-review.yml" 'return true if event == "push"'
+assert_grep "agent-review: caps the changed-file list to GitHub's own 300-file path-filter evaluation limit (#655 round 17)" \
+  "$W/agent-review.yml" 'capped_files = changed_files.first(300)'
 assert_grep "agent-review: paths requires at least one changed file to match (#655 round 16)" \
-  "$W/agent-review.yml" 'return true unless changed_files.any? { |f| branch_matches_list?(cfg["paths"], f) }'
+  "$W/agent-review.yml" 'return true unless capped_files.any? { |f| branch_matches_list?(cfg["paths"], f) }'
 assert_grep "agent-review: paths-ignore excludes only when EVERY changed file matches the ignore patterns (#655 round 16)" \
-  "$W/agent-review.yml" 'return true if changed_files.all? { |f| branch_matches_list?(cfg["paths-ignore"], f) }'
+  "$W/agent-review.yml" 'return true if capped_files.all? { |f| branch_matches_list?(cfg["paths-ignore"], f) }'
 assert_grep "agent-review: fetches the PRs real changed-file list, paginated (#655 round 16)" \
-  "$W/agent-review.yml" 'annex_changed_files_json=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files"'
+  "$W/agent-review.yml" 'annex_changed_files_raw=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files"'
 assert_grep "agent-review: paths_filter_excludes? is wired into trigger_unfiltered ahead of the tag/branch checks (#655 round 16)" \
-  "$W/agent-review.yml" 'next false if paths_filter_excludes?(cfg, changed_files)'
+  "$W/agent-review.yml" 'next false if paths_filter_excludes?(event, cfg, changed_files, changed_files_known)'
+# Codex P2 (#655 round 17, "fail closed when the changed-file lookup
+# fails", Codex; "don't silently treat changed-files API failures as
+# filtered out", CodeRabbit): the round-16 fetch piped stderr into stdout
+# with no failure check, so a failed gh api call fed an error message
+# into jq, which failed too, silently collapsing to an empty list --
+# indistinguishable from "genuinely fetched, zero files", wrongly read as
+# "paths definitely does not match". An explicit success/failure branch
+# keeps a failure as an EXPLICITLY empty string, which changed_files_known
+# treats as unresolvable rather than "no files".
+assert_grep "agent-review: explicitly branches on the changed-files fetch succeeding vs failing (#655 round 17)" \
+  "$W/agent-review.yml" 'if annex_changed_files_raw=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" 2>&1); then'
+assert_grep "agent-review: a failed changed-files fetch leaves the JSON explicitly empty rather than silently valid (#655 round 17)" \
+  "$W/agent-review.yml" 'annex_changed_files_json=""'
+assert_grep "agent-review: changed_files_known distinguishes a fetch failure from a genuinely-empty changed-file list (#655 round 17)" \
+  "$W/agent-review.yml" 'changed_files_known = !(ENV["ANNEX_CHANGED_FILES_JSON"] || "").empty?'
 assert_grep "agent-review: derives base/head branch names from the same pr_view_json call, no extra API call (#655 round 11)" \
   "$W/agent-review.yml" 'annex_base_branch=$(echo "$pr_view_json"'
 assert_grep "agent-review: gh pr view fetches baseRefName/headRefName alongside the existing fields (#655 round 11)" \
