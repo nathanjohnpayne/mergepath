@@ -257,13 +257,16 @@ fi
 # false. Replaced with a translator converting each documented glob token
 # (*, **, ?, [...], +) into an equivalent Ruby Regexp, matched via
 # Regexp#match? -- Regexp natively supports quantifiers and character
-# classes, so one mechanism now covers the full documented syntax.
+# classes, so one mechanism now covers the full documented syntax. Round
+# 14 added backslash escaping for literal special characters in branch or
+# tag names, as GitHub documents for these same patterns.
 if grep -qF 'def branch_pattern_to_regex(pattern)' "$SCRIPT" \
    && grep -qF 'branch_pattern_to_regex(pattern).match?(branch)' "$SCRIPT" \
+   && grep -qF 'result << Regexp.escape(chars[i + 1])' "$SCRIPT" \
    && ! grep -qF 'File.fnmatch(pattern, branch, flags)' "$SCRIPT"; then
-  pass "codex-review-check.sh translates branch glob patterns into a Ruby Regexp instead of using File.fnmatch (#655 round 13)"
+  pass "codex-review-check.sh translates branch glob patterns into a Ruby Regexp, including escaped literal metacharacters (#655 rounds 13-14)"
 else
-  fail "codex-review-check.sh does not use the round-13 regex translator for branch-pattern matching (#655 round 13)"
+  fail "codex-review-check.sh does not use the expected regex translator / escaped-literal handling for branch-pattern matching (#655 rounds 13-14)"
 fi
 # End-to-end: the exact semver pattern Codex cited, which fnmatch cannot
 # represent at all (it treats `+` as a literal character).
@@ -276,7 +279,10 @@ branch_pattern_matches() {
       i = 0
       while i < chars.length
         c = chars[i]
-        if c == "*" && chars[i + 1] == "*"
+        if c == "\\" && chars[i + 1]
+          result << Regexp.escape(chars[i + 1])
+          i += 2
+        elsif c == "*" && chars[i + 1] == "*"
           result << ".*"
           i += 2
         elsif c == "*"
@@ -332,6 +338,18 @@ if [ "$GOT" = "true" ]; then
   pass "regex translator: ** still crosses / (round-12 behavior preserved, #655 round 13)"
 else
   fail "regex translator (globstar-crosses regression): expected true, got $GOT"
+fi
+GOT=$(branch_pattern_matches 'literal/\*' 'literal/*')
+if [ "$GOT" = "true" ]; then
+  pass "regex translator: escaped * matches a literal * in the branch name (#655 round 14)"
+else
+  fail "regex translator (escaped literal star): expected true, got $GOT"
+fi
+GOT=$(branch_pattern_matches 'literal/\*' 'literal/foo')
+if [ "$GOT" = "false" ]; then
+  pass "regex translator: escaped * no longer behaves as a wildcard (#655 round 14)"
+else
+  fail "regex translator (escaped star wildcard regression): expected false, got $GOT"
 fi
 
 # An unresolvable/unknown branch must conservatively disqualify (treat as
@@ -413,11 +431,13 @@ fi
 # below).
 if grep -qF 'contexts(first: 100, after: $cursor)' "$SCRIPT" \
    && grep -qF 'pageInfo { hasNextPage endCursor }' "$SCRIPT" \
+   && grep -qF 'ROLLUP_CURSOR_ARGS=(-F cursor=null)' "$SCRIPT" \
+   && grep -qF 'ROLLUP_CURSOR_ARGS=(-f cursor="$ROLLUP_CURSOR")' "$SCRIPT" \
    && grep -qF 'workflow { name resourcePath }' "$SCRIPT" \
    && grep -qF 'workflowPath: (((.checkSuite.workflowRun.workflow.resourcePath // "") | split("/") | last) // "")' "$SCRIPT"; then
-  pass "codex-review-check.sh paginates statusCheckRollup via the Relay cursor and derives workflowPath from resourcePath (#655 round 13)"
+  pass "codex-review-check.sh paginates statusCheckRollup via the Relay cursor, passes null on page 1, and derives workflowPath from resourcePath (#655 round 13)"
 else
-  fail "codex-review-check.sh does not paginate the rollup / derive workflowPath as expected (#655 round 13)"
+  fail "codex-review-check.sh does not paginate the rollup, pass a null first-page cursor, or derive workflowPath as expected (#655 round 13)"
 fi
 
 # Self-caught while writing the round-13 winner-selection below: piping a

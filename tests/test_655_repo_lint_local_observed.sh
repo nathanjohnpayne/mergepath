@@ -373,6 +373,10 @@ assert_grep "agent-review: the canonical (workflow==\"\") match additionally req
 # since the rollup can grow without bound on a long-lived PR.
 assert_grep "agent-review: pages through statusCheckRollup contexts via the Relay cursor instead of a single fixed-size page (#655 round 12)" \
   "$W/agent-review.yml" 'contexts(first: 100, after: $cursor)'
+assert_grep "agent-review: passes a null GraphQL cursor on the first statusCheckRollup page (#655 round 14)" \
+  "$W/agent-review.yml" 'cursor_args=(-F cursor=null)'
+assert_grep "agent-review: passes the returned Relay cursor after the first statusCheckRollup page (#655 round 14)" \
+  "$W/agent-review.yml" 'cursor_args=(-f cursor="$cursor")'
 assert_grep "agent-review: the pagination loop checks hasNextPage and accumulates entries across pages (#655 round 12)" \
   "$W/agent-review.yml" 'pageInfo { hasNextPage endCursor }'
 assert_grep "agent-review: accumulates each page's contexts into the running rollup array (#655 round 12)" \
@@ -395,7 +399,8 @@ assert_grep "agent-review: evaluates branch patterns in order with ! negation, a
 # fnmatch always treats `+` as a literal character and returns false.
 # Replaced with a translator that converts each documented glob token into
 # an equivalent Ruby Regexp (which natively supports quantifiers and
-# character classes), matched via Regexp#match?.
+# character classes), matched via Regexp#match?. Round 14 added backslash
+# escaping for literal special characters in branch or tag names.
 assert_grep "agent-review: translates branch glob patterns into a Ruby Regexp instead of using File.fnmatch (#655 round 13)" \
   "$W/agent-review.yml" 'def branch_pattern_to_regex(pattern)'
 assert_grep "agent-review: a lone * translates to a single-path-segment match, not crossing / (#655 round 13)" \
@@ -404,6 +409,8 @@ assert_grep "agent-review: ** translates to a cross-segment match (#655 round 13
   "$W/agent-review.yml" 'result << ".*"'
 assert_grep "agent-review: a + quantifier is copied through verbatim, since Ruby Regexp supports it natively (#655 round 13)" \
   "$W/agent-review.yml" 'elsif c == "+"'
+assert_grep "agent-review: backslash escapes the next branch glob metacharacter into a literal match (#655 round 14)" \
+  "$W/agent-review.yml" 'result << Regexp.escape(chars[i + 1])'
 assert_grep "agent-review: branch_matches? now delegates to the regex translator instead of File.fnmatch (#655 round 13)" \
   "$W/agent-review.yml" 'branch_pattern_to_regex(pattern).match?(branch)'
 assert_not_grep "agent-review: no longer uses File.fnmatch for branch matching (#655 round 13)" \

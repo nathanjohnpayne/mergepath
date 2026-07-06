@@ -638,6 +638,10 @@ REPO_NAME="${REPO#*/}"
 ROLLUP_CONTEXTS="[]"
 ROLLUP_CURSOR=""
 while :; do
+  ROLLUP_CURSOR_ARGS=(-F cursor=null)
+  if [ -n "$ROLLUP_CURSOR" ]; then
+    ROLLUP_CURSOR_ARGS=(-f cursor="$ROLLUP_CURSOR")
+  fi
   ROLLUP_PAGE=$(with_gh_retry gh api graphql -f query='
     query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
       repository(owner: $owner, name: $name) {
@@ -671,7 +675,7 @@ while :; do
           }
         }
       }
-    }' -f owner="$REPO_OWNER" -f name="$REPO_NAME" -F number="$PR_NUMBER" -f cursor="$ROLLUP_CURSOR") \
+    }' -f owner="$REPO_OWNER" -f name="$REPO_NAME" -F number="$PR_NUMBER" "${ROLLUP_CURSOR_ARGS[@]}") \
     || die 3 "failed to fetch statusCheckRollup page (see stderr above for retry diagnostics)"
   ROLLUP_PAGE_NODES=$(echo "$ROLLUP_PAGE" | jq -c '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes')
   ROLLUP_CONTEXTS=$(jq -c -n --argjson a "$ROLLUP_CONTEXTS" --argjson b "$ROLLUP_PAGE_NODES" '$a + $b')
@@ -907,9 +911,12 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
       # `.*`); a lone `*` does not (translated to `[^/]*`); `[...]` and a
       # following `+` are copied through verbatim, since Ruby regex
       # character-class and quantifier syntax already matches the GitHub
-      # semantics; everything else is regex-escaped. Verified against the
-      # GitHub-documented single-star/double-star examples, the semver example
-      # above, and (round 12) an ordered `!`-negation case.
+      # semantics. A backslash escapes the next special character into a
+      # literal match, as GitHub documents for branch/tag names that contain
+      # glob metacharacters. Everything else is regex-escaped. Verified
+      # against the GitHub-documented single-star/double-star examples, the
+      # semver example above, an escaped literal-* case, and (round 12) an
+      # ordered `!`-negation case.
       #
       # #655 Codex P2 round 11 ("treat tag-only push annexes as
       # filtered", narrowed in round 13 -- "do not treat tag filters as
@@ -931,7 +938,10 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
         i = 0
         while i < chars.length
           c = chars[i]
-          if c == "*" && chars[i + 1] == "*"
+          if c == "\\" && chars[i + 1]
+            result << Regexp.escape(chars[i + 1])
+            i += 2
+          elsif c == "*" && chars[i + 1] == "*"
             result << ".*"
             i += 2
           elsif c == "*"

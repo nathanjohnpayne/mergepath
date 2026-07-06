@@ -1214,13 +1214,15 @@ jobs:
               # `/` (translated to `.*`); a lone `*` does not (translated to
               # `[^/]*`); `[...]` and a following `+` are copied through
               # verbatim, since Ruby regex character-class and quantifier
-              # syntax already matches the GitHub semantics; everything
-              # else is regex-escaped. Patterns are evaluated IN ORDER with
-              # an optional `!` prefix negating a prior match (a later
-              # pattern overrides an earlier one for the same ref), which a
-              # plain `any?` check ignored entirely. An unknown/unresolvable
-              # branch still conservatively disqualifies rather than
-              # guessing.
+              # syntax already matches the GitHub semantics. A backslash
+              # escapes the next special character into a literal match, as
+              # GitHub documents for branch/tag names that contain glob
+              # metacharacters. Everything else is regex-escaped. Patterns
+              # are evaluated IN ORDER with an optional `!` prefix negating a
+              # prior match (a later pattern overrides an earlier one for the
+              # same ref), which a plain `any?` check ignored entirely. An
+              # unknown/unresolvable branch still conservatively disqualifies
+              # rather than guessing.
               #
               # #655 Codex P2 round 11 ("treat tag-only push annexes as
               # filtered", narrowed in round 13 -- "do not treat tag
@@ -1246,7 +1248,10 @@ jobs:
                 i = 0
                 while i < chars.length
                   c = chars[i]
-                  if c == "*" && chars[i + 1] == "*"
+                  if c == "\\" && chars[i + 1]
+                    result << Regexp.escape(chars[i + 1])
+                    i += 2
+                  elsif c == "*" && chars[i + 1] == "*"
                     result << ".*"
                     i += 2
                   elsif c == "*"
@@ -1406,12 +1411,16 @@ jobs:
             # 1 was still red. Page through with the Relay cursor
             # (pageInfo.hasNextPage/endCursor) rather than raising the
             # page size, since the rollup can grow without bound as more
-            # checks/review rounds accumulate on a long-lived PR. An empty
-            # $cursor correctly fetches the first page (confirmed
-            # empirically), so one query template covers every page.
+            # checks/review rounds accumulate on a long-lived PR. Pass a null
+            # cursor for the first page and the returned Relay cursor for each
+            # later page.
             rollup_contexts="[]"
             cursor=""
             while :; do
+              cursor_args=(-F cursor=null)
+              if [ -n "$cursor" ]; then
+                cursor_args=(-f cursor="$cursor")
+              fi
               page_json=$(gh api graphql -f query='
                 query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
                   repository(owner: $owner, name: $name) {
@@ -1447,7 +1456,7 @@ jobs:
                       }
                     }
                   }
-                }' -f owner="$repo_owner" -f name="$repo_name" -F number="$PR_NUMBER" -f cursor="$cursor")
+                }' -f owner="$repo_owner" -f name="$repo_name" -F number="$PR_NUMBER" "${cursor_args[@]}")
               page_nodes=$(echo "$page_json" | jq -c '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes')
               rollup_contexts=$(jq -c -n --argjson a "$rollup_contexts" --argjson b "$page_nodes" '$a + $b')
               has_next=$(echo "$page_json" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage')
