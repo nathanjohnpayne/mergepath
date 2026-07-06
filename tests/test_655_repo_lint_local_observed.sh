@@ -357,12 +357,57 @@ assert_grep "agent-review: treats a push-only annex as unfiltered when (and only
 # same-named but NON-required check from an unrelated workflow would ALSO
 # become a mandatory group. isRequired(pullRequestNumber:) (ground truth,
 # only resolvable via a direct graphql query -- gh pr views fixed --json
-# shape omits it) now additionally filters the workflow=="" case to only
-# entries branch protection actually requires.
+# shape omits it) now filters the workflow=="" case to required entries
+# when any same-name entry reports required=true. If none do, the
+# configured-check wait still honors the configured check name.
 assert_grep "agent-review: fetches statusCheckRollup via a direct graphql query to access isRequired (#655 round 11)" \
   "$W/agent-review.yml" 'isRequired(pullRequestNumber: $number)'
-assert_grep "agent-review: the canonical (workflow==\"\") match additionally requires isRequired==true (#655 round 11)" \
-  "$W/agent-review.yml" 'select($workflow != "" or (.isRequired == true))'
+assert_grep "agent-review: the canonical (workflow==\"\") match builds a required=true subset when GitHub reports one (#655 round 15)" \
+  "$W/agent-review.yml" '([$name_matches[] | select(.isRequired == true)]) as $required_matches'
+assert_grep "agent-review: the canonical (workflow==\"\") match falls back to all name matches when none report required=true (#655 round 15)" \
+  "$W/agent-review.yml" 'if $workflow == "" and ($required_matches | length) > 0'
+
+if command -v jq >/dev/null 2>&1; then
+  agent_review_winners() {
+    local rollup_json=$1 check_name=$2 check_workflow=$3
+    printf '%s' "$rollup_json" | jq -c --arg name "$check_name" --arg workflow "$check_workflow" '
+      [.statusCheckRollup[]
+        | select((.name // .context // "") == $name)
+        | select($workflow == "" or (.workflowName // "") == $workflow)
+      ] as $name_matches
+      | ([$name_matches[] | select(.isRequired == true)]) as $required_matches
+      | (if $workflow == "" and ($required_matches | length) > 0
+         then $required_matches
+         else $name_matches
+         end) as $matches
+      | ($matches | group_by(.workflowName // "")) as $groups
+      | [
+          $groups[]
+          | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end))) as $pending
+          | if ($pending | length) > 0
+            then $pending[0]
+            else (sort_by(.completedAt // .startedAt // "") | last)
+            end
+        ]'
+  }
+  ROLLUP_OPTIONAL_ONLY_LINT='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","status":"COMPLETED","conclusion":"SUCCESS","isRequired":false,"completedAt":"2026-07-01T00:00:00Z"}]}'
+  GOT=$(agent_review_winners "$ROLLUP_OPTIONAL_ONLY_LINT" "lint" "" | jq -c '[.[].workflowName]')
+  if [ "$GOT" = '["repo-lint"]' ]; then
+    pass "agent-review jq: configured lint wait still observes a same-named check when no matching entry reports isRequired=true (#655 round 15)"
+  else
+    fail "agent-review jq (no required metadata fallback): expected [\"repo-lint\"], got $GOT"
+  fi
+  ROLLUP_REQUIRED_PLUS_OPTIONAL_LINT='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","status":"COMPLETED","conclusion":"SUCCESS","isRequired":true,"completedAt":"2026-07-01T00:00:00Z"},{"name":"lint","workflowName":"optional-local","status":"COMPLETED","conclusion":"FAILURE","isRequired":false,"completedAt":"2026-07-01T00:01:00Z"}]}'
+  GOT=$(agent_review_winners "$ROLLUP_REQUIRED_PLUS_OPTIONAL_LINT" "lint" "" | jq -c '[.[].workflowName]')
+  if [ "$GOT" = '["repo-lint"]' ]; then
+    pass "agent-review jq: optional same-named collisions are dropped when a required=true lint entry is present (#655 round 15)"
+  else
+    fail "agent-review jq (required metadata narrowing): expected [\"repo-lint\"], got $GOT"
+  fi
+else
+  echo "SKIP: agent-review jq winner-selection regression fixtures (jq unavailable)"
+  SKIP=$((SKIP + 1))
+fi
 
 # Codex P1 (#655 round 12, "paginate the status check rollup"): a PR with
 # more than 100 statusCheckRollup contexts (this PR itself already had
@@ -377,6 +422,12 @@ assert_grep "agent-review: passes a null GraphQL cursor on the first statusCheck
   "$W/agent-review.yml" 'cursor_args=(-F cursor=null)'
 assert_grep "agent-review: passes the returned Relay cursor after the first statusCheckRollup page (#655 round 14)" \
   "$W/agent-review.yml" 'cursor_args=(-f cursor="$cursor")'
+assert_grep "agent-review: null statusCheckRollup pages normalize to an empty contexts array (#655 round 15)" \
+  "$W/agent-review.yml" 'statusCheckRollup.contexts.nodes // []'
+assert_grep "agent-review: null statusCheckRollup pages stop pagination instead of hard-erroring (#655 round 15)" \
+  "$W/agent-review.yml" 'statusCheckRollup.contexts.pageInfo.hasNextPage // false'
+assert_grep "agent-review: null statusCheckRollup pages use an empty cursor (#655 round 15)" \
+  "$W/agent-review.yml" 'statusCheckRollup.contexts.pageInfo.endCursor // ""'
 assert_grep "agent-review: the pagination loop checks hasNextPage and accumulates entries across pages (#655 round 12)" \
   "$W/agent-review.yml" 'pageInfo { hasNextPage endCursor }'
 assert_grep "agent-review: accumulates each page's contexts into the running rollup array (#655 round 12)" \

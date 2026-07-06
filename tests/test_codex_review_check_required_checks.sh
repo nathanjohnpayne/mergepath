@@ -433,11 +433,23 @@ if grep -qF 'contexts(first: 100, after: $cursor)' "$SCRIPT" \
    && grep -qF 'pageInfo { hasNextPage endCursor }' "$SCRIPT" \
    && grep -qF 'ROLLUP_CURSOR_ARGS=(-F cursor=null)' "$SCRIPT" \
    && grep -qF 'ROLLUP_CURSOR_ARGS=(-f cursor="$ROLLUP_CURSOR")' "$SCRIPT" \
+   && grep -qF 'statusCheckRollup.contexts.nodes // []' "$SCRIPT" \
+   && grep -qF 'statusCheckRollup.contexts.pageInfo.hasNextPage // false' "$SCRIPT" \
+   && grep -qF 'statusCheckRollup.contexts.pageInfo.endCursor // ""' "$SCRIPT" \
    && grep -qF 'workflow { name resourcePath }' "$SCRIPT" \
    && grep -qF 'workflowPath: (((.checkSuite.workflowRun.workflow.resourcePath // "") | split("/") | last) // "")' "$SCRIPT"; then
-  pass "codex-review-check.sh paginates statusCheckRollup via the Relay cursor, passes null on page 1, and derives workflowPath from resourcePath (#655 round 13)"
+  pass "codex-review-check.sh paginates statusCheckRollup via the Relay cursor, passes null on page 1, null-coalesces empty rollup pages, and derives workflowPath from resourcePath (#655 round 13)"
 else
-  fail "codex-review-check.sh does not paginate the rollup, pass a null first-page cursor, or derive workflowPath as expected (#655 round 13)"
+  fail "codex-review-check.sh does not paginate the rollup, pass a null first-page cursor, null-coalesce empty pages, or derive workflowPath as expected (#655 round 13)"
+fi
+NULL_ROLLUP_PAGE='{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}}}}}'
+PAGE_NODES=$(printf '%s' "$NULL_ROLLUP_PAGE" | jq -c '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes // [])')
+HAS_NEXT=$(printf '%s' "$NULL_ROLLUP_PAGE" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage // false)')
+END_CURSOR=$(printf '%s' "$NULL_ROLLUP_PAGE" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor // "")')
+if [ "$PAGE_NODES" = "[]" ] && [ "$HAS_NEXT" = "false" ] && [ -z "$END_CURSOR" ]; then
+  pass "rollup pagination extraction treats a null statusCheckRollup as an empty final page"
+else
+  fail "rollup pagination extraction should normalize null statusCheckRollup to []/false/empty, got nodes=$PAGE_NODES has_next=$HAS_NEXT cursor=$END_CURSOR"
 fi
 
 # Self-caught while writing the round-13 winner-selection below: piping a
@@ -512,6 +524,14 @@ annex_name_fallback_bad() {
         | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
       ]'
 }
+annex_name_fallback_bad_after_probe() {
+  local confirmed_absent=$1 rollup_json=$2
+  if [ "$confirmed_absent" = "1" ]; then
+    printf '[]\n'
+  else
+    annex_name_fallback_bad "$rollup_json"
+  fi
+}
 ROLLUP_403_RED_CONVENTIONAL='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","workflowName":"Consumer Local CI","conclusion":"FAILURE"}]}'
 GOT=$(annex_name_fallback_bad "$ROLLUP_403_RED_CONVENTIONAL" | jq -c '[.[].label]')
 if [ "$GOT" = '["repo-lint-local"]' ]; then
@@ -526,10 +546,25 @@ if [ "$(echo "$GOT" | jq 'length')" = "0" ]; then
 else
   fail "conventional-name fallback scan (no annex): expected 0, got $GOT"
 fi
-if grep -qF 'ANNEX_NAME_FALLBACK_BAD=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq' "$SCRIPT"; then
-  pass "codex-review-check.sh's conventional-name fallback scan reads from the frozen ANNEX_SCAN_ROLLUP_JSON, immune to required-checks-driven wiping (#655 round 10)"
+ROLLUP_CONFIRMED_ABSENT_OPTIONAL_RED='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","workflowName":"Optional Local CI","conclusion":"FAILURE"}]}'
+GOT=$(annex_name_fallback_bad_after_probe 1 "$ROLLUP_CONFIRMED_ABSENT_OPTIONAL_RED")
+if [ "$(echo "$GOT" | jq 'length')" = "0" ]; then
+  pass "conventional-name fallback scan: a confirmed-absent annex skips the repo-lint-local fallback even if an unrelated optional same-named check is red"
 else
-  fail "codex-review-check.sh's conventional-name fallback scan is missing or reads from the wrong rollup variable (#655 round 10)"
+  fail "conventional-name fallback scan (confirmed absent): expected 0, got $GOT"
+fi
+GOT=$(annex_name_fallback_bad_after_probe 0 "$ROLLUP_CONFIRMED_ABSENT_OPTIONAL_RED" | jq -c '[.[].label]')
+if [ "$GOT" = '["repo-lint-local"]' ]; then
+  pass "conventional-name fallback scan: the same red repo-lint-local remains caught when annex identity is unknown"
+else
+  fail "conventional-name fallback scan (unknown probe state): expected [\"repo-lint-local\"], got $GOT"
+fi
+if grep -qF 'ANNEX_NAME_FALLBACK_BAD=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq' "$SCRIPT" \
+   && grep -qF 'ANNEX_CONFIRMED_ABSENT=1' "$SCRIPT" \
+   && grep -qF 'if [ "$ANNEX_CONFIRMED_ABSENT" -eq 1 ]; then' "$SCRIPT"; then
+  pass "codex-review-check.sh's conventional-name fallback reads from the frozen rollup but skips when the annex is confirmed absent (#655)"
+else
+  fail "codex-review-check.sh's conventional-name fallback scan is missing, reads from the wrong rollup variable, or lacks the confirmed-absent guard (#655)"
 fi
 # #655 round 13: the SAME stale-vs-fresh scenario, but through the
 # conventional-name fallback specifically -- a stale FAILURE superseded by

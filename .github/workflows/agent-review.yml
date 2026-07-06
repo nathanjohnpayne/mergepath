@@ -1457,10 +1457,10 @@ jobs:
                     }
                   }
                 }' -f owner="$repo_owner" -f name="$repo_name" -F number="$PR_NUMBER" "${cursor_args[@]}")
-              page_nodes=$(echo "$page_json" | jq -c '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes')
+              page_nodes=$(echo "$page_json" | jq -c '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes // [])')
               rollup_contexts=$(jq -c -n --argjson a "$rollup_contexts" --argjson b "$page_nodes" '$a + $b')
-              has_next=$(echo "$page_json" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage')
-              cursor=$(echo "$page_json" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor')
+              has_next=$(echo "$page_json" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage // false)')
+              cursor=$(echo "$page_json" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor // "")')
               [ "$has_next" = "true" ] || break
             done
             # workflowPath (#655 round 13, "disambiguate annex workflows
@@ -1530,8 +1530,11 @@ jobs:
               # ITS failure even though branch protection never required
               # it. isRequired (ground truth from the graphql query above,
               # scoped to this PR) now additionally filters the workflow==""
-              # case to only the entries branch protection actually
-              # requires; a name-scoped annex match ($workflow != "") is
+              # case to required entries when any same-name entry reports
+              # required=true. If none do, keep the configured-check wait
+              # behavior instead of treating branch-protection metadata as a
+              # hard prerequisite for this workflow to wait on its configured
+              # check name. A name-scoped annex match ($workflow != "") is
               # unaffected, since annex checks are not expected to be
               # required at all.
               #
@@ -1556,8 +1559,12 @@ jobs:
                 [.statusCheckRollup[]
                   | select((.name // .context // "") == $name)
                   | select($workflow == "" or (.workflowName // "") == $workflow)
-                  | select($workflow != "" or (.isRequired == true))
-                ] as $matches
+                ] as $name_matches
+                | ([$name_matches[] | select(.isRequired == true)]) as $required_matches
+                | (if $workflow == "" and ($required_matches | length) > 0
+                   then $required_matches
+                   else $name_matches
+                   end) as $matches
                 | ($matches | group_by(.workflowName // "")) as $groups
                 | [
                     $groups[]

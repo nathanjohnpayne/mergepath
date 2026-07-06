@@ -677,10 +677,10 @@ while :; do
       }
     }' -f owner="$REPO_OWNER" -f name="$REPO_NAME" -F number="$PR_NUMBER" "${ROLLUP_CURSOR_ARGS[@]}") \
     || die 3 "failed to fetch statusCheckRollup page (see stderr above for retry diagnostics)"
-  ROLLUP_PAGE_NODES=$(echo "$ROLLUP_PAGE" | jq -c '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes')
+  ROLLUP_PAGE_NODES=$(echo "$ROLLUP_PAGE" | jq -c '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes // [])')
   ROLLUP_CONTEXTS=$(jq -c -n --argjson a "$ROLLUP_CONTEXTS" --argjson b "$ROLLUP_PAGE_NODES" '$a + $b')
-  ROLLUP_HAS_NEXT=$(echo "$ROLLUP_PAGE" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage')
-  ROLLUP_CURSOR=$(echo "$ROLLUP_PAGE" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor')
+  ROLLUP_HAS_NEXT=$(echo "$ROLLUP_PAGE" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage // false)')
+  ROLLUP_CURSOR=$(echo "$ROLLUP_PAGE" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor // "")')
   [ "$ROLLUP_HAS_NEXT" = "true" ] || break
 done
 ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
@@ -762,6 +762,7 @@ ANNEX_HEAD_BRANCH=$(echo "$PR_JSON" | jq -r '.head.ref // ""')
 ANNEX_CHECKS_JSON='[]'
 ANNEX_WORKFLOW_NAME=""
 ANNEX_UNFILTERED="false"
+ANNEX_CONFIRMED_ABSENT=0
 if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
   annex_probe_err=$(mktemp)
   if annex_content=$(gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$HEAD_SHA_FOR_ANNEX" --jq .content 2>"$annex_probe_err"); then
@@ -1048,7 +1049,7 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
       fi
     fi
   elif grep -q 'HTTP 404' "$annex_probe_err"; then
-    : # genuinely absent (confirmed 404) — no annex, ANNEX_CHECKS_JSON stays [].
+    ANNEX_CONFIRMED_ABSENT=1 # genuinely absent (confirmed 404) — no annex, ANNEX_CHECKS_JSON stays [].
   elif grep -q 'HTTP 403' "$annex_probe_err"; then
     # #655 Codex P2 round 4: a 403 (token lacks Contents: read) is USUALLY a
     # persistent, systemic condition, not a transient blip -- unlike the
@@ -1317,52 +1318,56 @@ if [ -n "$ANNEX_WORKFLOW_NAME" ]; then
     fi
   fi
 else
-  # #655 Codex P1 round 10 ("fail closed when the annex probe is
-  # unauthorized"): ANNEX_WORKFLOW_NAME is empty here -- the probe
-  # either got a 403 (no Contents: read), a genuinely-unparseable annex,
-  # or an indeterminate error, so the REAL workflow identity is unknown
-  # and the workflow-wide scan above cannot run. Fall back to scanning
-  # for the conventional job/check name #601 documents by default
-  # ("repo-lint-local") directly by NAME rather than by workflow, since
-  # that is the only identity we can guess in these cases. Never blocks
-  # on absence (only a REPORTED bad conclusion), so a persistent 403 or
-  # a permanently-unparseable annex still cannot deadlock this gate the
-  # way requiring its presence would -- this only closes the narrower
-  # gap of an annex that already reports under the exact conventional
-  # name while we cannot confirm anything more precise.
-  #
-  # #655 Codex P2 round 13: this fallback has the same stale-vs-fresh
-  # rerun exposure the workflow-wide scan above just fixed (a name match
-  # alone doesn't dedupe multiple reported attempts), so apply the same
-  # group-by-name, pending-preferred-else-latest-completed winner
-  # selection here too -- there is exactly one possible name group
-  # ("repo-lint-local", enforced by the select() below) but group_by
-  # still resolves the zero-matches case to an empty array with no extra
-  # branching.
-  ANNEX_NAME_FALLBACK_BAD=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq '
-    [.statusCheckRollup[] | select((.name // .context // "") == "repo-lint-local")]
-    | group_by(.name // .context // "?")
-    | [
-        .[]
-        | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end))) as $pending
-        | if ($pending | length) > 0
-          then $pending[0]
-          else (sort_by(.completedAt // .startedAt // "") | last)
-          end
-      ] as $winners
-    | [$winners[]
-        | {
-            label: (.name // .context // "?"),
-            workflow: (.workflowName // ""),
-            result: (.conclusion // .state // "")
-          }
-        | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
-      ]
-  ')
-  ANNEX_NAME_FALLBACK_BAD_COUNT=$(echo "$ANNEX_NAME_FALLBACK_BAD" | jq 'length')
-  if [ "$ANNEX_NAME_FALLBACK_BAD_COUNT" -gt 0 ]; then
-    log "gate (a): a check named repo-lint-local has $ANNEX_NAME_FALLBACK_BAD_COUNT non-passing reported result(s), and the annex probe could not confirm a workflow identity to scan more precisely (403/unparseable/error) — included below as a conventional-name fallback (#655 round 10)."
-    BAD_CHECKS=$(echo "$BAD_CHECKS" | jq --argjson extra "$ANNEX_NAME_FALLBACK_BAD" '(. + $extra) | unique')
+  if [ "$ANNEX_CONFIRMED_ABSENT" -eq 1 ]; then
+    log "gate (a): repo_lint_local.yml annex is confirmed absent at $HEAD_SHA_FOR_ANNEX; skipping the conventional repo-lint-local fallback scan (#655)."
+  else
+    # #655 Codex P1 round 10 ("fail closed when the annex probe is
+    # unauthorized"): ANNEX_WORKFLOW_NAME is empty here -- the probe
+    # either got a 403 (no Contents: read), a genuinely-unparseable annex,
+    # or an indeterminate error, so the REAL workflow identity is unknown
+    # and the workflow-wide scan above cannot run. Fall back to scanning
+    # for the conventional job/check name #601 documents by default
+    # ("repo-lint-local") directly by NAME rather than by workflow, since
+    # that is the only identity we can guess in these cases. Never blocks
+    # on absence (only a REPORTED bad conclusion), so a persistent 403 or
+    # a permanently-unparseable annex still cannot deadlock this gate the
+    # way requiring its presence would -- this only closes the narrower
+    # gap of an annex that already reports under the exact conventional
+    # name while we cannot confirm anything more precise.
+    #
+    # #655 Codex P2 round 13: this fallback has the same stale-vs-fresh
+    # rerun exposure the workflow-wide scan above just fixed (a name match
+    # alone doesn't dedupe multiple reported attempts), so apply the same
+    # group-by-name, pending-preferred-else-latest-completed winner
+    # selection here too -- there is exactly one possible name group
+    # ("repo-lint-local", enforced by the select() below) but group_by
+    # still resolves the zero-matches case to an empty array with no extra
+    # branching.
+    ANNEX_NAME_FALLBACK_BAD=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq '
+      [.statusCheckRollup[] | select((.name // .context // "") == "repo-lint-local")]
+      | group_by(.name // .context // "?")
+      | [
+          .[]
+          | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end))) as $pending
+          | if ($pending | length) > 0
+            then $pending[0]
+            else (sort_by(.completedAt // .startedAt // "") | last)
+            end
+        ] as $winners
+      | [$winners[]
+          | {
+              label: (.name // .context // "?"),
+              workflow: (.workflowName // ""),
+              result: (.conclusion // .state // "")
+            }
+          | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
+        ]
+    ')
+    ANNEX_NAME_FALLBACK_BAD_COUNT=$(echo "$ANNEX_NAME_FALLBACK_BAD" | jq 'length')
+    if [ "$ANNEX_NAME_FALLBACK_BAD_COUNT" -gt 0 ]; then
+      log "gate (a): a check named repo-lint-local has $ANNEX_NAME_FALLBACK_BAD_COUNT non-passing reported result(s), and the annex probe could not confirm a workflow identity to scan more precisely (403/unparseable/error) — included below as a conventional-name fallback (#655 round 10)."
+      BAD_CHECKS=$(echo "$BAD_CHECKS" | jq --argjson extra "$ANNEX_NAME_FALLBACK_BAD" '(. + $extra) | unique')
+    fi
   fi
 fi
 BAD_COUNT=$(echo "$BAD_CHECKS" | jq 'length')

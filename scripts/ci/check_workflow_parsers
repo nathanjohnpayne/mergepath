@@ -1014,17 +1014,20 @@ fi
 # isRequired, and it is only resolvable when queried directly, not
 # through commits.nodes.commit) so isRequired(pullRequestNumber:) can
 # additionally scope the workflow=="" match to only entries branch
-# protection actually requires.
+# protection actually requires when GitHub reports at least one such
+# entry. If no same-name entry reports required=true, keep the configured
+# check wait instead of treating branch-protection metadata as mandatory.
 echo
-echo "agent-review.yml required-check wait: isRequired-scoped canonical match (#655 Codex P2 round 11)"
+echo "agent-review.yml required-check wait: isRequired-preferred canonical match (#655 Codex P2 round 11/15)"
 if grep -Fq 'gh api graphql -f query=' .github/workflows/agent-review.yml && \
    grep -Fq 'isRequired(pullRequestNumber: $number)' .github/workflows/agent-review.yml && \
-   grep -Fq 'select($workflow != "" or (.isRequired == true))' .github/workflows/agent-review.yml; then
+   grep -Fq '([$name_matches[] | select(.isRequired == true)]) as $required_matches' .github/workflows/agent-review.yml && \
+   grep -Fq 'if $workflow == "" and ($required_matches | length) > 0' .github/workflows/agent-review.yml; then
   pass=$((pass + 1))
-  echo "  PASS: agent-review required-check wait fetches statusCheckRollup via graphql and scopes the canonical match to isRequired==true entries (#655 round 11)"
+  echo "  PASS: agent-review required-check wait fetches statusCheckRollup via graphql and prefers isRequired==true entries when present (#655 round 11/15)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: agent-review required-check wait does not fetch isRequired or scope the canonical match by it (#655 round 11)" >&2
+  echo "  FAIL: agent-review required-check wait does not fetch isRequired or prefer required matches with a configured-check fallback (#655 round 11/15)" >&2
 fi
 
 echo "dependabot-auto-merge.yml author-token equality regression (#426)"
