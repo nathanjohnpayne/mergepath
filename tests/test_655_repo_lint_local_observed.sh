@@ -203,50 +203,69 @@ assert_grep "agent-review: allows YAML aliases when parsing the annex (#655 roun
   "$W/agent-review.yml" 'doc = YAML.safe_load(raw, aliases: true)'
 assert_grep "agent-review: bounds annex YAML size before parsing, defending against a YAML alias-expansion DoS (#655 round 7)" \
   "$W/agent-review.yml" 'if raw.bytesize > 100_000'
-assert_grep "agent-review: bounds annex YAML anchor/alias token count before parsing, defending against a YAML alias-expansion DoS (#655 round 7)" \
-  "$W/agent-review.yml" 'if raw.scan(/(?:\A|[:\-,\[{])\s*[&*][A-Za-z0-9_.-]+/).length > 40'
 
-# Codex P2 (#655 round 8, "avoid treating path globs as YAML aliases"): the
-# round-7 guard's naive `[&*]word` scan also counted an ordinary glob like
-# `**/*.ts` in a paths:/paths-ignore: list, since it starts with `*` too --
-# a legitimate annex with a longer filter list could exceed the cap and be
-# treated as too-dangerous-to-parse. A real anchor/alias can only appear at
-# a structural position (start of text, or right after `:`/`-`/`,`/`[`/`{`);
-# a glob string value (always quoted when it starts with `*`, since an
-# unquoted one is itself a YAML syntax error) never satisfies that.
-assert_grep "agent-review: alias token-count guard requires a structural position, no longer over-counting quoted path globs (#655 round 8)" \
-  "$W/agent-review.yml" 'raw.scan(/(?:\A|[:\-,\[{])\s*[&*][A-Za-z0-9_.-]+/)'
+# Codex P2 (#655 round 8, "avoid treating path globs as YAML aliases") and
+# round 9 ("do not count glob hyphens as YAML aliases"): the round-7
+# guard's naive `[&*]word` scan counted an ordinary glob like `**/*.ts`
+# (round 8) or a hyphenated one like `component-*.ts` (round 9, since a
+# bare trailing `-` was accepted as a structural position ANYWHERE in the
+# text) as alias tokens -- a legitimate annex with a longer or hyphenated
+# filter list could exceed the cap and be treated as too-dangerous-to-
+# parse. A real anchor/alias can only appear at a structural position:
+# start of text; a block-sequence dash anchored to the START OF ITS LINE
+# with a mandatory space before its value (round 9, excluding a mid-string
+# hyphen like a glob own); or `:`/`,`/`[`/`{` anywhere, optionally followed
+# by whitespace. A glob string value (always quoted when it starts with
+# `*`, since an unquoted one is itself a YAML syntax error) never
+# satisfies any of these.
+assert_grep "agent-review: alias token-count guard requires a line-anchored dash (or other structural position), no longer over-counting quoted or hyphenated path globs (#655 rounds 8-9)" \
+  "$W/agent-review.yml" 'if raw.scan(/(?:\A|^[ \t]*-\s+|[:,\[{]\s*)[&*][A-Za-z0-9_.-]+/).length > 40'
 
 # Codex P1 (#655 round 7, "wait for unfiltered annex workflow to appear
-# before merging"): an annex with NO workflow-level paths/paths-ignore
-# filter is guaranteed to eventually produce a check run for any PR, so
-# zero reported entries just means Actions has not scheduled it yet --
-# unlike a genuinely path-filtered annex, where zero entries is legitimately
-# ambiguous between "not yet" and "never for this diff" (Finding O, round
-# 6, which must stay non-blocking). YAML 1.1 coerces the bareword `on:` key
-# to the boolean true (the "Norway problem"), so doc["on"] is nil for the
-# overwhelmingly common unquoted `on:` and the fallback doc[true] read is
-# required, not optional.
+# before merging"): an annex with NO restricting filter is guaranteed to
+# eventually produce a check run for this PR, so zero reported entries
+# just means Actions has not scheduled it yet -- unlike a genuinely
+# filtered annex, where zero entries is legitimately ambiguous between
+# "not yet" and "never for this diff" (Finding O, round 6, which must stay
+# non-blocking). YAML 1.1 coerces the bareword `on:` key to the boolean
+# true (the "Norway problem"), so doc["on"] is nil for the overwhelmingly
+# common unquoted `on:` and the fallback doc[true] read is required, not
+# optional.
 assert_grep "agent-review: reads the on: trigger via the true-key fallback (YAML 1.1 Norway-problem coercion) (#655 round 7)" \
   "$W/agent-review.yml" 'on = doc.key?("on") ? doc["on"] : doc[true]'
-assert_grep "agent-review: an annex trigger with no paths/paths-ignore filter is captured as unfiltered (#655 round 7)" \
-  "$W/agent-review.yml" 'cfg.is_a?(Hash) && (cfg.key?("paths") || cfg.key?("paths-ignore"))'
 assert_grep "agent-review: keeps polling (does not silently pass) when an unfiltered annex has zero reported entries (#655 round 7)" \
   "$W/agent-review.yml" 'if [ "$annex_match_count" -eq 0 ] && [ "$annex_unfiltered" = "true" ]; then'
 assert_grep "agent-review: a path-filtered annex with zero reported entries still does not block (Finding O, round 6, preserved)" \
   "$W/agent-review.yml" 'has not reported yet (unfiltered trigger, so it is expected to)'
 
-# Codex P2 (#655 round 8, "classify only pull_request filters for PR
-# waits"): "unfiltered" must be based on the pull_request trigger
-# specifically (guaranteed to fire for both same-repo and cross-fork PRs;
-# a push-only trigger does not fire in the base repo for a fork PR), not
-# on every event under `on:` -- an annex with `push: {paths: [...]}}` but
-# an unfiltered `pull_request:` is unfiltered for this wait even though
-# push is filtered.
-assert_grep "agent-review: classifies unfiltered based on the pull_request trigger specifically, not every event under on: (#655 round 8)" \
-  "$W/agent-review.yml" 'pr_events.include?("pull_request")'
-assert_grep "agent-review: no pull_request trigger at all is conservatively NOT unfiltered (#655 round 8)" \
-  "$W/agent-review.yml" 'if !pr_events.include?("pull_request")'
+# Codex P2 (#655 round 9, "honor non-path pull_request filters before
+# waiting"): round 8 checked only paths/paths-ignore on the pull_request
+# config. A types list excluding synchronize (e.g. types: [opened] only)
+# means the workflow will NEVER run for a resynchronized PRs current HEAD,
+# so treating that as unfiltered would wait forever -- the exact
+# permanent-deadlock class rounds 2-5 already fought to eliminate for the
+# paths case. branches/branches-ignore/types must all disqualify
+# "unfiltered" alongside paths/paths-ignore.
+assert_grep "agent-review: disqualifies unfiltered on branches/branches-ignore/types, not just paths/paths-ignore (#655 round 9)" \
+  "$W/agent-review.yml" 'pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore", "types"]'
+
+# Codex P2 (#655 round 9, "wait for valid push-only annex workflows"):
+# check_ci_scripts_wired accepts push OR pull_request as valid annex
+# wiring, but a push-only annex (no pull_request trigger at all) was never
+# classified as unfiltered, so this wait never waited for it even though it
+# is a contractually valid annex. A push trigger only fires IN THIS REPO
+# for a same-repo PR (a fork PRs push lands in the fork, never here), so
+# this is gated on annex_same_repo_pr (derived from gh pr views own
+# isCrossRepository field, no extra API call) rather than applied
+# unconditionally.
+assert_grep "agent-review: derives same-repo-PR status via gh pr views isCrossRepository field, no extra API call (#655 round 9)" \
+  "$W/agent-review.yml" 'annex_same_repo_pr=$(echo "$pr_view_json"'
+assert_grep "agent-review: same-repo-PR determination inverts isCrossRepository (#655 round 9)" \
+  "$W/agent-review.yml" 'if .isCrossRepository then "false" else "true" end'
+assert_grep "agent-review: push_unfiltered is derived alongside pr_unfiltered via the shared trigger_unfiltered helper (#655 round 9)" \
+  "$W/agent-review.yml" 'push_unfiltered = trigger_unfiltered.call("push", push_filter_keys)'
+assert_grep "agent-review: treats a push-only annex as unfiltered when (and only when) the PR is same-repo (#655 round 9)" \
+  "$W/agent-review.yml" 'unfiltered = pr_unfiltered || (push_unfiltered && same_repo_pr)'
 
 # auto-clear-blocking-labels.yml: the workflow_run trigger list observes the
 # annex's completion too (verified against a live consumer's repo_lint_local.yml

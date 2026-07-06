@@ -138,36 +138,39 @@ fi
 # cap and a raw anchor/alias token-count cap, both checked BEFORE the
 # actual parse (the danger is in the expansion, not the input size).
 if grep -q 'doc = YAML.safe_load(raw, aliases: true)' "$SCRIPT" \
-   && grep -q 'if raw.bytesize > 100_000' "$SCRIPT" \
-   && grep -q 'if raw.scan(/(?:\\A|\[:\\-,\\\[{\])\\s\*\[&\*\]\[A-Za-z0-9_.-\]+/).length > 40' "$SCRIPT"; then
-  pass "codex-review-check.sh allows YAML aliases when parsing the annex, bounded by size/token-count DoS guards (#655 round 7)"
+   && grep -q 'if raw.bytesize > 100_000' "$SCRIPT"; then
+  pass "codex-review-check.sh allows YAML aliases when parsing the annex, bounded by a byte-size DoS guard (#655 round 7)"
 else
-  fail "codex-review-check.sh does not allow YAML aliases with the expected DoS guards (#655 round 7)"
+  fail "codex-review-check.sh does not allow YAML aliases with the expected byte-size DoS guard (#655 round 7)"
 fi
 
-# Codex P2 (#655 round 8, "avoid treating path globs as YAML aliases"): the
-# round-7 token-count guard's naive `[&*]word` scan also counted an
-# ordinary glob like `**/*.ts` in a paths:/paths-ignore: list, since it
-# starts with `*` too -- a legitimate annex with a longer filter list could
-# exceed the cap and be treated as too-dangerous-to-parse, disabling the
-# workflow-wide scan for a real, currently-failing local check. Verify the
-# guard now requires a structural position (start of text, or immediately
-# after `:`/`-`/`,`/`[`/`{`) before counting a token, which a quoted (or
-# otherwise validly-unquoted) glob string never satisfies.
-if grep -q 'raw.scan(/(?:\\A|\[:\\-,\\\[{\])\\s\*\[&\*\]\[A-Za-z0-9_.-\]+/)' "$SCRIPT"; then
-  pass "codex-review-check.sh's alias token-count guard requires a structural position, no longer over-counting quoted path globs (#655 round 8)"
+# Codex P2 (#655 round 8, "avoid treating path globs as YAML aliases") and
+# round 9 ("do not count glob hyphens as YAML aliases"): the round-7
+# token-count guard's naive `[&*]word` scan counted an ordinary glob like
+# `**/*.ts` (round 8) or a hyphenated one like `component-*.ts` (round 9,
+# since a bare trailing `-` was accepted as a structural position ANYWHERE
+# in the text) as alias tokens -- a legitimate annex with a longer or
+# hyphenated filter list could exceed the cap and be treated as
+# too-dangerous-to-parse, disabling the workflow-wide scan for a real,
+# currently-failing local check. The guard now requires a structural
+# position -- start of text; a block-sequence dash anchored to the START
+# OF ITS LINE with a mandatory space before its value (round 9's fix,
+# excluding a mid-string hyphen like a glob own); or `:`/`,`/`[`/`{`
+# anywhere, optionally followed by whitespace -- before counting a token,
+# which a quoted (or otherwise validly-unquoted) glob string never
+# satisfies.
+if grep -qF 'if raw.scan(/(?:\A|^[ \t]*-\s+|[:,\[{]\s*)[&*][A-Za-z0-9_.-]+/).length > 40' "$SCRIPT"; then
+  pass "codex-review-check.sh's alias token-count guard requires a line-anchored dash (or other structural position), no longer over-counting quoted or hyphenated path globs (#655 rounds 8-9)"
 else
-  fail "codex-review-check.sh's alias token-count guard still uses the naive over-counting regex (#655 round 8)"
+  fail "codex-review-check.sh's alias token-count guard does not use the round-9 line-anchored-dash regex (#655 round 9)"
 fi
 
 # Codex P2 (#655 round 8, "wait for unreported unfiltered annex checks"):
 # gate (a)'s workflow-wide scan previously treated ANY zero-match case as
-# non-blocking, which was too lenient for an annex whose pull_request
-# trigger has no paths/paths-ignore filter -- such an annex is GUARANTEED
-# to eventually report, so zero matches there means "not scheduled yet",
-# not "may never run". A synthetic PENDING entry is unioned into
-# BAD_CHECKS in that specific case, mirroring how an in-progress entry
-# already blocks (round 6).
+# non-blocking, which was too lenient for an annex whose trigger is
+# guaranteed to eventually report. A synthetic PENDING entry is unioned
+# into BAD_CHECKS in that specific case, mirroring how an in-progress
+# entry already blocks (round 6).
 if grep -q 'ANNEX_UNFILTERED' "$SCRIPT" \
    && grep -q 'ANNEX_WORKFLOW_MATCH_COUNT' "$SCRIPT" \
    && grep -q '(not yet reported)' "$SCRIPT"; then
@@ -176,16 +179,35 @@ else
   fail "codex-review-check.sh does not treat an unfiltered zero-match annex as not-yet-clean (#655 round 8)"
 fi
 
-# Codex P2 (#655 round 8, "classify only pull_request filters for PR
-# waits"): "unfiltered" must be based on the pull_request trigger
-# specifically (guaranteed to fire for both same-repo and cross-fork PRs),
-# not on every event under `on:` -- an annex with `push: {paths: [...]}}`
-# but an unfiltered `pull_request:` is unfiltered for gate (a)'s purposes
-# even though push is filtered.
-if grep -q 'pr_events.include?("pull_request")' "$SCRIPT"; then
-  pass "codex-review-check.sh classifies unfiltered based on the pull_request trigger specifically, not every event under on: (#655 round 8)"
+# Codex P2 (#655 round 9, "honor non-path pull_request filters before
+# waiting"): round 8 checked only paths/paths-ignore on the pull_request
+# config. A types list excluding synchronize (e.g. types: [opened] only)
+# means the workflow will NEVER run for a resynchronized PRs current HEAD,
+# so treating that as unfiltered would inject a PENDING entry that can
+# never clear -- the exact permanent-deadlock class rounds 2-5 already
+# fought to eliminate for the paths case. branches/branches-ignore/types
+# must all disqualify "unfiltered" alongside paths/paths-ignore.
+if grep -qF 'pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore", "types"]' "$SCRIPT"; then
+  pass "codex-review-check.sh disqualifies unfiltered on branches/branches-ignore/types, not just paths/paths-ignore (#655 round 9)"
 else
-  fail "codex-review-check.sh still classifies unfiltered across all on: events, not just pull_request (#655 round 8)"
+  fail "codex-review-check.sh does not check the full pull_request filter-key set (#655 round 9)"
+fi
+
+# Codex P2 (#655 round 9, "wait for valid push-only annex workflows"):
+# check_ci_scripts_wired accepts push OR pull_request as valid annex
+# wiring, but a push-only annex (no pull_request trigger at all) was never
+# classified as unfiltered, so gate (a) never waited for it even though it
+# is a contractually valid annex. A push trigger only fires IN THIS REPO
+# for a same-repo PR (a fork PRs push lands in the fork, never here), so
+# this is gated on ANNEX_SAME_REPO_PR (derived from the PR REST object
+# head/base repo full_name, no extra API call) rather than applied
+# unconditionally.
+if grep -qF 'ANNEX_SAME_REPO_PR=$(echo "$PR_JSON" | jq -r' "$SCRIPT" \
+   && grep -qF 'push_unfiltered = trigger_unfiltered.call("push", push_filter_keys)' "$SCRIPT" \
+   && grep -qF 'unfiltered = pr_unfiltered || (push_unfiltered && same_repo_pr)' "$SCRIPT"; then
+  pass "codex-review-check.sh treats a push-only annex as unfiltered when (and only when) the PR is same-repo (#655 round 9)"
+else
+  fail "codex-review-check.sh does not gate push-only annex enforcement on same-repo-PR status (#655 round 9)"
 fi
 
 if grep -q 'job\["strategy"\].is_a?(Hash) && job\["strategy"\]\["matrix"\]' "$SCRIPT" \

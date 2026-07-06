@@ -666,13 +666,21 @@ ANNEX_SCAN_ROLLUP_JSON="$ROLLUP_JSON"
 # ruby's own stderr (not redirected here, unlike the base64 decode)
 # surfaces the matrix-skip notice in the workflow log.
 HEAD_SHA_FOR_ANNEX=$(echo "$PR_JSON" | jq -r '.head.sha')
+# #655 Codex P2 round 9 ("wait for valid push-only annex workflows"): a
+# push-only annex trigger (no pull_request key at all) is a VALID wiring
+# per check_ci_scripts_wired's contract (push OR pull_request suffices),
+# but only fires "push" events IN THIS REPO for a same-repo PR -- a
+# fork-based PR's pushes land in the fork, never registering a push event
+# here. Compare head/base repo full_name (REST PR object fields) rather
+# than adding another API call.
+ANNEX_SAME_REPO_PR=$(echo "$PR_JSON" | jq -r '(.head.repo.full_name // "head-unknown") == (.base.repo.full_name // "base-unknown")')
 ANNEX_CHECKS_JSON='[]'
 ANNEX_WORKFLOW_NAME=""
 ANNEX_UNFILTERED="false"
 if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
   annex_probe_err=$(mktemp)
   if annex_content=$(gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$HEAD_SHA_FOR_ANNEX" --jq .content 2>"$annex_probe_err"); then
-    annex_probe_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ruby -ryaml -rjson -e '
+    annex_probe_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ANNEX_SAME_REPO_PR="$ANNEX_SAME_REPO_PR" ruby -ryaml -rjson -e '
       raw = STDIN.read
       # #655 Codex P1 round 7 ("parse valid annex workflows that use YAML
       # aliases"): GitHub Actions supports anchors/aliases in workflow
@@ -698,17 +706,32 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
       # inflating the count on a perfectly legitimate annex with a longer
       # filter list past the cap, disabling the workflow-wide scan for a
       # real, currently-failing local check. A real YAML anchor/alias can
-      # ONLY appear immediately after a structural position (start of
-      # text, `:`, `-`, `,`, `[`, or `{`), optionally followed by
-      # whitespace -- a glob string value is never in that position
-      # unquoted (a bare scalar starting with `*` is itself a YAML syntax
-      # error, confirmed empirically: Psych raises "did not find expected
-      # alphabetic or numeric character while scanning an alias"), and a
-      # a QUOTED glob has a leading quote character that breaks the match. Verified
-      # against quoted glob lists (0 matches), a real anchor/alias reuse
-      # (2 matches), and a synthetic billion-laughs payload (91 matches,
-      # still caught).
-      if raw.scan(/(?:\A|[:\-,\[{])\s*[&*][A-Za-z0-9_.-]+/).length > 40
+      # ONLY appear immediately after a structural position: start of
+      # text; a block-sequence dash (which requires being the first
+      # non-whitespace character on its line, with a MANDATORY space
+      # before the value -- narrowed in round 9, see below); or `:`, `,`,
+      # `[`, `{` anywhere, optionally followed by whitespace. A glob
+      # string value is never in that position unquoted (a bare scalar
+      # starting with `*` is itself a YAML syntax error, confirmed
+      # empirically: Psych raises "did not find expected alphabetic or
+      # numeric character while scanning an alias"), and a QUOTED glob has
+      # a leading quote character that breaks the match.
+      #
+      # #655 Codex P2 round 9 ("do not count glob hyphens as YAML
+      # aliases"): the round 8 version accepted a bare `-` ANYWHERE in the
+      # text (with optional trailing whitespace) as a structural position,
+      # which also matched an internal hyphen inside a glob directly before a
+      # `*` (e.g. "src/component-*.ts") with no space between them --
+      # inflating the count on a filter list using hyphenated names, a
+      # false positive round 8 did not catch. A real block-sequence dash
+      # is anchored to the start of its line (`^[ \t]*-`, i.e. only
+      # preceded by indentation) and REQUIRES at least one space before
+      # its value, unlike a mid-string hyphen. Verified against the exact
+      # round-9 false-positive case (0 matches now), a real block-sequence
+      # alias and a mapping alias (both still counted), a 20-entry
+      # hyphenated quoted glob list (0 matches), and the round-7 synthetic
+      # billion-laughs payload (91 matches, still caught).
+      if raw.scan(/(?:\A|^[ \t]*-\s+|[:,\[{]\s*)[&*][A-Za-z0-9_.-]+/).length > 40
         STDERR.puts "repo_lint_local.yml has an unusually high anchor/alias token count -- refusing to parse (defensive cap against a YAML alias-expansion DoS, #655)"
         exit
       end
@@ -735,34 +758,53 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
       end
       # #655 Codex P2 round 8 ("wait for unreported unfiltered annex
       # checks" on gate (a), mirroring agent-review.yml round 7/8): an
-      # annex whose pull_request trigger has NO paths/paths-ignore filter
-      # is GUARANTEED to eventually produce a check run for this PR, so
-      # zero reported entries means "not scheduled yet", not "will never
-      # run" -- unlike a genuinely path-filtered annex. Classification is
-      # based specifically on the pull_request trigger (the one guaranteed
-      # to fire for both same-repo and cross-fork PRs; a push-only trigger
-      # does not fire in the base repo for a fork PR), not on every event
-      # under `on:` (an unfiltered pull_request alongside a filtered push
-      # is still unfiltered for this purpose). YAML 1.1 coerces the
+      # annex whose pull_request trigger has NO restricting filter is
+      # GUARANTEED to eventually produce a check run for this PR, so zero
+      # reported entries means "not scheduled yet", not "will never run"
+      # -- unlike a genuinely filtered annex. YAML 1.1 coerces the
       # bareword `on:` key to the boolean true (the "Norway problem"), so
       # doc["on"] is nil for the overwhelmingly common unquoted `on:`.
+      #
+      # #655 Codex P2 round 9 ("honor non-path pull_request filters
+      # before waiting"): round 8 checked only paths/paths-ignore on the
+      # pull_request config. GitHub Actions pull_request triggers also
+      # support branches, branches-ignore, and types -- a types list that
+      # excludes synchronize (e.g. types: [opened] only) means this
+      # workflow will NEVER run for a resynchronized PRs current HEAD, so
+      # treating that as unfiltered would inject a synthetic PENDING entry
+      # that can never clear: the exact permanent-deadlock class rounds
+      # 2-5 already fought to eliminate for the paths case. Any of the
+      # five keys now disqualifies "unfiltered".
+      #
+      # #655 Codex P2 round 9 ("wait for valid push-only annex
+      # workflows"): check_ci_scripts_wired accepts push OR pull_request
+      # as valid wiring, but a push-only annex was never classified as
+      # unfiltered at all (no pull_request trigger present), so gate (a)
+      # never waited for it. A push trigger only fires IN THIS REPO for a
+      # same-repo PR (a fork PRs push lands in the fork, never here), so
+      # ANNEX_SAME_REPO_PR (computed in bash from the PR REST objects
+      # head/base repo full_name, passed in via env since this ruby
+      # invocation only reads the YAML over stdin) gates whether an
+      # unfiltered push trigger counts.
       on = doc.key?("on") ? doc["on"] : doc[true]
-      pr_events =
+      trigger_unfiltered = lambda do |event, filter_keys|
         case on
-        when String then [on]
-        when Array then on
-        when Hash then on.keys
-        else []
-        end
-      unfiltered =
-        if !pr_events.include?("pull_request")
-          false
-        elsif on.is_a?(Hash)
-          cfg = on["pull_request"]
-          !(cfg.is_a?(Hash) && (cfg.key?("paths") || cfg.key?("paths-ignore")))
+        when String then on == event
+        when Array then on.include?(event)
+        when Hash
+          next false unless on.key?(event)
+          cfg = on[event]
+          !(cfg.is_a?(Hash) && filter_keys.any? { |k| cfg.key?(k) })
         else
-          true
+          false
         end
+      end
+      pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore", "types"]
+      push_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore"]
+      pr_unfiltered = trigger_unfiltered.call("pull_request", pr_filter_keys)
+      push_unfiltered = trigger_unfiltered.call("push", push_filter_keys)
+      same_repo_pr = ENV["ANNEX_SAME_REPO_PR"] == "true"
+      unfiltered = pr_unfiltered || (push_unfiltered && same_repo_pr)
       puts JSON.generate({ "workflow" => workflow_name, "jobs" => jobs, "unfiltered" => unfiltered })
     ' || true)
     if [ -z "$annex_probe_raw" ]; then
