@@ -739,6 +739,46 @@ EOF
 # verbatim and the allowlist plays no role. The trust argument mirrors the
 # #429 head-pinned exemption: only inputs the PR author cannot influence
 # may decide what the reviewer never sees.
+# Shared awk function that recovers the b/-side (new) path from a `diff --git`
+# header, used by BOTH awk passes in p4b_trim_review_diff so the omit decision
+# and the omission-placeholder disclosure key off an identical path (#697).
+#
+# For a RENAME/COPY the section carries an explicit `rename to`/`copy to` line,
+# and THAT is the authoritative new path — the header split is only a heuristic.
+# So when the caller knows the destination (rto non-empty) it is returned
+# verbatim; the header is never re-parsed for renames/copies (#712). This also
+# closes the mis-split where a crafted rename header (a != b) whose concatenated
+# "A b/B" text happens to contain an earlier SYMMETRIC " b/" split — e.g.
+# `diff --git a/data/a b/data/a b/data/a b/data/a` renaming `data/a b/data/a
+# b/data/a` to `data/a` — would otherwise return the synthetic midpoint instead
+# of the real b-side.
+#
+# For a plain EDIT header `diff --git a/P b/P` no rto exists (rto empty): the
+# a/- and b/-sides are equal, so the real b-path is the value V for which the
+# remainder after stripping the leading "a/" is exactly "V b/V". This is
+# recovered even when V itself contains the literal " b/" (e.g. P = `foo b/bar`),
+# which a bare greedy `sub(/^diff --git a\/.* b\//, "", p)` mis-splits. If no
+# symmetric split exists (a modeless header with a != b and no rto — e.g. a mode
+# change with differing sides, which the pre-#712 code also handled greedily) it
+# falls back to the greedy last-" b/" tail.
+P4B_DIFF_BSIDE_AWK_FN='
+function p4b_diff_bside(hdr, rto,   rest, greedy, i, nxt, left, right) {
+  if (rto != "") return rto
+  rest = hdr; sub(/^diff --git a\//, "", rest)
+  greedy = hdr; sub(/^diff --git a\/.* b\//, "", greedy)
+  i = index(rest, " b/")
+  while (i > 0) {
+    left = substr(rest, 1, i - 1)
+    right = substr(rest, i + 3)
+    if (left == right) return left
+    nxt = index(substr(rest, i + 1), " b/")
+    if (nxt == 0) break
+    i = i + nxt
+  }
+  return greedy
+}
+'
+
 p4b_trim_review_diff() {
   local in="$1" out="$2" max="$3" globs="${4:-}" total sizes omit="" projected
   local b i bside aside rfrom rto p plh plen
@@ -758,6 +798,7 @@ p4b_trim_review_diff() {
   # " b/<bside>" suffix, so it uses the same split point as the b/-side.
   # LC_ALL=C keeps length() byte-exact.
   sizes="$(LC_ALL=C awk '
+    '"$P4B_DIFF_BSIDE_AWK_FN"'
     /^diff --git /{ n++; hdr[n] = $0; bytes[n] = 0; rfrom[n] = ""; rto[n] = "" }
     n > 0 { bytes[n] += length($0) + 1 }
     /^rename from /{ if (n > 0 && rfrom[n] == "") rfrom[n] = substr($0, 13) }
@@ -766,7 +807,7 @@ p4b_trim_review_diff() {
     /^copy to /    { if (n > 0 && rto[n]   == "") rto[n]   = substr($0, 9)  }
     END {
       for (i = 1; i <= n; i++) {
-        b = hdr[i]; sub(/^diff --git a\/.* b\//, "", b)
+        b = p4b_diff_bside(hdr[i], rto[i])
         a = hdr[i]; sub(/^diff --git a\//, "", a)
         suf = " b/" b
         if (substr(a, length(a) - length(suf) + 1) == suf) a = substr(a, 1, length(a) - length(suf))
@@ -816,18 +857,38 @@ $sizes
 EOF
   [ "$projected" -le "$max" ] || return 1
   LC_ALL=C awk -v omit_list="$omit" '
+    '"$P4B_DIFF_BSIDE_AWK_FN"'
     BEGIN { split(omit_list, parts, " "); for (k in parts) if (parts[k] != "") omit[parts[k]] = 1 }
+    # #697/#712: name the omitted file with the SAME b/-side derivation the
+    # sizes pipeline used to key the omit decision (p4b_diff_bside, defined
+    # above, with the authoritative rename/copy destination when the section
+    # carries one), so the disclosure can never name a different path than the
+    # one omission was judged on. A bare greedy `sub(/^diff --git a\/.* b\//,
+    # "", p)` mis-splits a header whose path contains the literal " b/", and the
+    # header symmetric-split heuristic mis-splits a crafted rename header — both
+    # are avoided here. The header is buffered until its `rename to`/`copy to`
+    # line (if any) is seen, so the placeholder is emitted with the true rto.
+    function p4b_flush_pending(   line) {
+      if (!pending) return
+      if (pending_skip) {
+        line = p4b_diff_bside(pending_hdr, pending_rto)
+        printf "[phase-4b diff-budget: %s omitted - oversized diff section; see the prompt note]\n", line
+      }
+      pending = 0
+    }
     /^diff --git /{
+      p4b_flush_pending()
       n++
+      pending = 1; pending_hdr = $0; pending_rto = ""
       skipping = ((n "") in omit) ? 1 : 0
-      if (skipping) {
-        p = $0
-        sub(/^diff --git a\/.* b\//, "", p)
-        printf "[phase-4b diff-budget: %s omitted - oversized diff section; see the prompt note]\n", p
-      } else print
+      pending_skip = skipping
+      if (!skipping) print
       next
     }
+    pending && /^rename to /{ if (pending_rto == "") pending_rto = substr($0, 11); if (!pending_skip) print; next }
+    pending && /^copy to /  { if (pending_rto == "") pending_rto = substr($0, 9);  if (!pending_skip) print; next }
     !skipping { print }
+    END { p4b_flush_pending() }
   ' "$in" > "$out" || return 1
   # Placeholders add bytes the loop above does not model; assert the OUTPUT
   # honors the budget and still carries at least one reviewable section.
@@ -843,11 +904,25 @@ EOF
 # an empty or missing file prints nothing. (#635: the previous rc!=0
 # handling guessed "auth" for every failure — a context-overflow rc=1 read
 # as a login problem while the CLI's real error was discarded.)
+#
+# #696: the tail is interpolated straight into p4b_die messages that can
+# surface in workflow logs and the Phase 4b manual-fallback comment. A
+# reviewer CLI that emits an auth error carrying a token/key in stderr would
+# otherwise leak it there, so mask obvious secret patterns BEFORE returning.
+# The redaction pass is intentionally over-broad (any word that looks like a
+# credential is masked) and portable: `sed -E` (ERE) is honored by both BSD
+# sed (macOS bash-3.2) and GNU sed, the same form other scripts in this repo
+# already rely on.
 p4b_stderr_tail() {
   [ -n "${1:-}" ] && [ -s "$1" ] || return 0
   tail -c 400 "$1" \
     | LC_ALL=C tr -c '[:print:]' ' ' \
-    | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ *//' -e 's/ *$//'
+    | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ *//' -e 's/ *$//' \
+    | sed -E \
+        -e 's/(gh[posru]|github_pat)_[A-Za-z0-9_]+/\1_[REDACTED]/g' \
+        -e 's/sk-[A-Za-z0-9_-]+/sk-[REDACTED]/g' \
+        -e 's/([Bb]earer )[A-Za-z0-9._~+\/-]+=*/\1[REDACTED]/g' \
+        -e 's/([Tt][Oo][Kk][Ee][Nn]|[Kk][Ee][Yy]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn])([[:space:]]*[=:][[:space:]]*)[^[:space:]]+/\1\2[REDACTED]/g'
 }
 
 # --- plan-only reviewer CLI auth guards ------------------------------------

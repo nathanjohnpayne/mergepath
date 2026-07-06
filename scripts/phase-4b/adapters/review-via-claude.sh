@@ -290,7 +290,7 @@ USAGE="$(printf '%s' "$ENVELOPE" | jq -c '
 # review path, so a hung CLI must not stall verdict emission — a stuck
 # `--version` degrades to null, same as any other capture failure.
 CLI_VERSION_JSON="null"
-if CLI_VERSION_RAW="$(p4b_run_with_timeout 10 "$CLAUDE_BIN" --version 2>/dev/null)"; then
+if CLI_VERSION_RAW="$(p4b_run_with_timeout 10 "${SAFE_ENV[@]}" "$CLAUDE_BIN" --version 2>/dev/null)"; then
   CLI_VERSION_RAW="$(printf '%s' "$CLI_VERSION_RAW" | head -1 | tr -d '\r')"
   case "$CLI_VERSION_RAW" in
     ''|'{'*|'['*) : ;; # empty, or JSON-shaped — leave null
