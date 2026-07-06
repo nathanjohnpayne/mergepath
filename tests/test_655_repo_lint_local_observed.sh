@@ -274,19 +274,6 @@ assert_grep "agent-review: a path-filtered annex with zero reported entries stil
 # (below), since GitHub schedules the workflow whenever the ref matches
 # the filter, not merely when the filter is absent (types is handled
 # separately too, since round 10 found it needs different treatment).
-assert_grep "agent-review: generic filter-key lists no longer blanket-disqualify on branches/branches-ignore (#655 round 11)" \
-  "$W/agent-review.yml" 'pr_filter_keys = ["paths", "paths-ignore"]'
-# #655 Codex P2 round 13 ("do not treat tag filters as excluding branch
-# pushes", found on the codex-review-check.sh copy and mirrored here):
-# round 11 put tags/tags-ignore into this SAME generic list, so a push
-# trigger with BOTH branches (which might match) AND tags was disqualified
-# on tags presence alone, before branches ever got evaluated -- wrongly
-# filtering an annex GitHub would actually run for a matching branch push,
-# since branches and tags are combinable on the same push trigger. tags is
-# no longer in this list at all; push_tag_only_excludes? below handles it
-# precisely (only disqualifies when branches/branches-ignore is absent).
-assert_grep "agent-review: push filter-key list no longer includes tags/tags-ignore (#655 round 13)" \
-  "$W/agent-review.yml" 'push_filter_keys = ["paths", "paths-ignore"]'
 assert_grep "agent-review: a dedicated helper disqualifies push only when tags/tags-ignore is present AND branches/branches-ignore is entirely absent (#655 round 13)" \
   "$W/agent-review.yml" 'def push_tag_only_excludes?(cfg)'
 assert_grep "agent-review: push_tag_only_excludes? is wired into the trigger_unfiltered lambda for the push event (#655 round 13)" \
@@ -302,7 +289,25 @@ assert_grep "agent-review: push_tag_only_excludes? is wired into the trigger_unf
 # list that EXCLUDES synchronize should disqualify, since that is the
 # activity that fires for a resynchronized PRs current HEAD.
 assert_grep "agent-review: treats a types list that includes synchronize as unfiltered, not merely absent (#655 round 10)" \
-  "$W/agent-review.yml" 'next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")'
+  "$W/agent-review.yml" 'next true if types.include?("synchronize")'
+
+# Codex P2 (#655 round 16, "do not skip opened-only annex runs", found on
+# the codex-review-check.sh copy and mirrored here): a types: [opened]
+# annex (no synchronize) DOES fire for the current HEAD when that HEAD is
+# still the PRs original commit (no push since the PR opened), but
+# treating it as unfiltered unconditionally would deadlock forever once a
+# later push supersedes it -- opened never fires again for this PR.
+# head_predates_pr_creation (HEAD committer date <= PR created_at, both
+# already available with no extra API call beyond one small commit read)
+# distinguishes "still on the opening commit" from "synchronized since".
+assert_grep "agent-review: types: [opened] (no synchronize) is unfiltered only when the HEAD still predates PR creation (#655 round 16)" \
+  "$W/agent-review.yml" 'next true if types.include?("opened") && head_predates_pr_creation'
+assert_grep "agent-review: head_predates_pr_creation compares HEAD committer date against PR created_at lexicographically (#655 round 16)" \
+  "$W/agent-review.yml" 'committer_date <= created_at'
+assert_grep "agent-review: fetches PR createdAt via the same pr_view_json call, no extra API call (#655 round 16)" \
+  "$W/agent-review.yml" 'gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,isCrossRepository,baseRefName,headRefName,createdAt'
+assert_grep "agent-review: fetches the annex HEAD own committer date for the opened-only comparison (#655 round 16)" \
+  "$W/agent-review.yml" 'annex_head_committer_date=$(gh api "repos/$REPO/commits/$sha"'
 
 # Codex P2 (#655 round 11, "evaluate base-branch filters before passing",
 # found on the codex-review-check.sh copy and mirrored here):
@@ -316,9 +321,27 @@ assert_grep "agent-review: treats a types list that includes synchronize as unfi
 assert_grep "agent-review: evaluates branches/branches-ignore against the real ref instead of blanket-disqualifying on presence (#655 round 11)" \
   "$W/agent-review.yml" 'def branch_filter_excludes?(cfg, branch)'
 assert_grep "agent-review: pull_request branches evaluation uses the PRs base ref, not head (#655 round 11)" \
-  "$W/agent-review.yml" 'trigger_unfiltered.call("pull_request", pr_filter_keys, ENV["ANNEX_BASE_BRANCH"])'
+  "$W/agent-review.yml" 'trigger_unfiltered.call("pull_request", ENV["ANNEX_BASE_BRANCH"])'
 assert_grep "agent-review: push branches evaluation uses the PRs own head ref, not base (#655 round 11)" \
-  "$W/agent-review.yml" 'trigger_unfiltered.call("push", push_filter_keys, ENV["ANNEX_HEAD_BRANCH"])'
+  "$W/agent-review.yml" 'trigger_unfiltered.call("push", ENV["ANNEX_HEAD_BRANCH"])'
+
+# Codex P2 (#655 round 16, "wait for path-matched annex workflows", found
+# on the codex-review-check.sh copy and mirrored here): a paths/
+# paths-ignore key was previously treated as unconditionally filtered on
+# mere presence, even when the PRs actual changed files match the filter
+# (GitHub schedules the workflow in that case). Path glob syntax documents
+# the SAME tokens as branch/tag patterns, so branch_matches_list? is
+# reused verbatim rather than reimplementing path matching.
+assert_grep "agent-review: evaluates paths/paths-ignore against the PRs real changed files instead of blanket-disqualifying on presence (#655 round 16)" \
+  "$W/agent-review.yml" 'def paths_filter_excludes?(cfg, changed_files)'
+assert_grep "agent-review: paths requires at least one changed file to match (#655 round 16)" \
+  "$W/agent-review.yml" 'return true unless changed_files.any? { |f| branch_matches_list?(cfg["paths"], f) }'
+assert_grep "agent-review: paths-ignore excludes only when EVERY changed file matches the ignore patterns (#655 round 16)" \
+  "$W/agent-review.yml" 'return true if changed_files.all? { |f| branch_matches_list?(cfg["paths-ignore"], f) }'
+assert_grep "agent-review: fetches the PRs real changed-file list, paginated (#655 round 16)" \
+  "$W/agent-review.yml" 'annex_changed_files_json=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files"'
+assert_grep "agent-review: paths_filter_excludes? is wired into trigger_unfiltered ahead of the tag/branch checks (#655 round 16)" \
+  "$W/agent-review.yml" 'next false if paths_filter_excludes?(cfg, changed_files)'
 assert_grep "agent-review: derives base/head branch names from the same pr_view_json call, no extra API call (#655 round 11)" \
   "$W/agent-review.yml" 'annex_base_branch=$(echo "$pr_view_json"'
 assert_grep "agent-review: gh pr view fetches baseRefName/headRefName alongside the existing fields (#655 round 11)" \
@@ -455,17 +478,32 @@ assert_grep "agent-review: evaluates branch patterns in order with ! negation, a
 assert_grep "agent-review: translates branch glob patterns into a Ruby Regexp instead of using File.fnmatch (#655 round 13)" \
   "$W/agent-review.yml" 'def branch_pattern_to_regex(pattern)'
 assert_grep "agent-review: a lone * translates to a single-path-segment match, not crossing / (#655 round 13)" \
-  "$W/agent-review.yml" 'result << "[^/]*"'
+  "$W/agent-review.yml" 'tokens << "[^/]*"'
 assert_grep "agent-review: ** translates to a cross-segment match (#655 round 13)" \
-  "$W/agent-review.yml" 'result << ".*"'
+  "$W/agent-review.yml" 'tokens << ".*"'
 assert_grep "agent-review: a + quantifier is copied through verbatim, since Ruby Regexp supports it natively (#655 round 13)" \
   "$W/agent-review.yml" 'elsif c == "+"'
 assert_grep "agent-review: backslash escapes the next branch glob metacharacter into a literal match (#655 round 14)" \
-  "$W/agent-review.yml" 'result << Regexp.escape(chars[i + 1])'
+  "$W/agent-review.yml" 'tokens << Regexp.escape(chars[i + 1])'
 assert_grep "agent-review: branch_matches? now delegates to the regex translator instead of File.fnmatch (#655 round 13)" \
   "$W/agent-review.yml" 'branch_pattern_to_regex(pattern).match?(branch)'
 assert_not_grep "agent-review: no longer uses File.fnmatch for branch matching (#655 round 13)" \
   "$W/agent-review.yml" 'File.fnmatch(pattern, branch, flags)'
+
+# Codex P2 (#655 round 16, "honor ? as an optional-character filter",
+# found on the codex-review-check.sh copy and mirrored here): GitHub
+# documents `?` as matching zero or one of the PRECEDING character (e.g.
+# `release?` matches base branch `release` itself), not "exactly one
+# arbitrary character" the way POSIX glob/fnmatch define it -- the
+# round-13 translator emitted an independent [^/] token for `?` instead of
+# quantifying whatever came before it. Building a token LIST (rather than
+# one flat string) lets `?` wrap the last token in `(?:...)?`.
+assert_grep "agent-review: builds a token list instead of a flat string, so ? can quantify the preceding token (#655 round 16)" \
+  "$W/agent-review.yml" 'tokens = []'
+assert_grep "agent-review: ? wraps the preceding token in an optional non-capturing group instead of emitting an independent [^/] (#655 round 16)" \
+  "$W/agent-review.yml" 'tokens[-1] = "(?:#{tokens[-1]})?" if tokens.any?'
+assert_not_grep "agent-review: no longer treats ? as an unconditional single-character wildcard (#655 round 16)" \
+  "$W/agent-review.yml" 'result << "[^/]"'
 
 # auto-clear-blocking-labels.yml: the workflow_run trigger list observes the
 # annex's completion too (verified against a live consumer's repo_lint_local.yml

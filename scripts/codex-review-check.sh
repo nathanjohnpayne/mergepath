@@ -759,6 +759,28 @@ ANNEX_SAME_REPO_PR=$(echo "$PR_JSON" | jq -r '(.head.repo.full_name // "head-unk
 # branch), not the base. Both are already on PR_JSON with no extra API call.
 ANNEX_BASE_BRANCH=$(echo "$PR_JSON" | jq -r '.base.ref // ""')
 ANNEX_HEAD_BRANCH=$(echo "$PR_JSON" | jq -r '.head.ref // ""')
+# #655 Codex P2 round 16 ("don't skip opened-only annex runs"): a
+# pull_request trigger scoped to types: [opened] (no synchronize) DOES fire
+# for the current HEAD when that HEAD is still the PR's ORIGINAL commit (no
+# push has landed since the PR was opened) -- but treating it as unfiltered
+# unconditionally would deadlock forever once a later push supersedes it
+# (opened never fires again for this PR). ANNEX_PR_CREATED_AT (already on
+# PR_JSON, no extra API call) plus HEAD_COMMITTER_DATE (already fetched
+# above) let the ruby probe distinguish "still on the opening commit" (head
+# committer date <= PR created_at) from "synchronized at least once since"
+# (head committer date is later) -- ISO-8601 UTC strings sort correctly
+# lexicographically, the same comparison style already used for
+# HEAD_PUSHED_AT/LATEST_FORCE_PUSH_TIME above.
+ANNEX_PR_CREATED_AT=$(echo "$PR_JSON" | jq -r '.created_at // ""')
+# #655 Codex P2 round 16 ("wait for path-matched annex workflows"): a
+# pull_request/push trigger scoped by paths/paths-ignore was previously
+# treated as unconditionally filtered on mere key presence, even when the
+# PR's actual changed files match the filter (GitHub schedules the workflow
+# in that case). Fetching the real changed-file list lets the ruby probe
+# evaluate the filter for real instead of guessing. Paginated like
+# TIMELINE_JSON above, since a large PR can have more than one page of
+# files.
+ANNEX_CHANGED_FILES_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/files" "PR changed files" | jq -c '[.[].filename]')
 ANNEX_CHECKS_JSON='[]'
 ANNEX_WORKFLOW_NAME=""
 ANNEX_UNFILTERED="false"
@@ -766,7 +788,7 @@ ANNEX_CONFIRMED_ABSENT=0
 if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
   annex_probe_err=$(mktemp)
   if annex_content=$(gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$HEAD_SHA_FOR_ANNEX" --jq .content 2>"$annex_probe_err"); then
-    annex_probe_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ANNEX_SAME_REPO_PR="$ANNEX_SAME_REPO_PR" ANNEX_BASE_BRANCH="$ANNEX_BASE_BRANCH" ANNEX_HEAD_BRANCH="$ANNEX_HEAD_BRANCH" ruby -ryaml -rjson -e '
+    annex_probe_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ANNEX_SAME_REPO_PR="$ANNEX_SAME_REPO_PR" ANNEX_BASE_BRANCH="$ANNEX_BASE_BRANCH" ANNEX_HEAD_BRANCH="$ANNEX_HEAD_BRANCH" ANNEX_PR_CREATED_AT="$ANNEX_PR_CREATED_AT" ANNEX_HEAD_COMMITTER_DATE="$HEAD_COMMITTER_DATE" ANNEX_CHANGED_FILES_JSON="$ANNEX_CHANGED_FILES_JSON" ruby -ryaml -rjson -e '
       raw = STDIN.read
       # #655 Codex P1 round 7 ("parse valid annex workflows that use YAML
       # aliases"): GitHub Actions supports anchors/aliases in workflow
@@ -934,37 +956,51 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
       # no branches/branches-ignore key at all to independently evaluate.
       on = doc.key?("on") ? doc["on"] : doc[true]
       def branch_pattern_to_regex(pattern)
-        result = +""
+        # #655 Codex P2 round 16 ("honor ? as an optional-character
+        # filter"): GitHub documents `?` as matching zero or one of the
+        # PRECEDING character (e.g. `release?` matches base branch
+        # `release` itself), not "exactly one arbitrary character" the way
+        # POSIX glob/fnmatch define it. Building a TOKEN LIST (one entry
+        # per translated glob unit) instead of one flat string lets `?`
+        # wrap the LAST token in `(?:...)?` -- correctly quantifying
+        # whatever unit came before it (a literal char, an escaped char, or
+        # a whole `[...]` class), not just a single output character. A
+        # leading `?` (no preceding token) is a no-op: "zero or one of
+        # nothing" contributes nothing to the match either way. `tokens.
+        # join` reconstructs the exact same concatenation the old flat-
+        # string version produced for every other case, including `+`
+        # (still a bare postfix quantifier on whatever token precedes it).
+        tokens = []
         chars = pattern.chars
         i = 0
         while i < chars.length
           c = chars[i]
           if c == "\\" && chars[i + 1]
-            result << Regexp.escape(chars[i + 1])
+            tokens << Regexp.escape(chars[i + 1])
             i += 2
           elsif c == "*" && chars[i + 1] == "*"
-            result << ".*"
+            tokens << ".*"
             i += 2
           elsif c == "*"
-            result << "[^/]*"
+            tokens << "[^/]*"
             i += 1
           elsif c == "?"
-            result << "[^/]"
+            tokens[-1] = "(?:#{tokens[-1]})?" if tokens.any?
             i += 1
           elsif c == "["
             j = i + 1
             j += 1 while j < chars.length && chars[j] != "]"
-            result << chars[i..j].join
+            tokens << chars[i..j].join
             i = j + 1
           elsif c == "+"
-            result << "+"
+            tokens << "+"
             i += 1
           else
-            result << Regexp.escape(c)
+            tokens << Regexp.escape(c)
             i += 1
           end
         end
-        Regexp.new("\\A#{result}\\z")
+        Regexp.new("\\A#{tokens.join}\\z")
       end
       def branch_matches?(pattern, branch)
         return false unless pattern.is_a?(String) && branch.is_a?(String)
@@ -998,7 +1034,54 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
         end
         false
       end
-      trigger_unfiltered = lambda do |event, filter_keys, relevant_branch|
+      # #655 Codex P2 round 16 ("wait for path-matched annex workflows"):
+      # a paths/paths-ignore key was previously treated as unconditionally
+      # filtered on mere presence, even when the PRs actual changed files
+      # match the filter (GitHub schedules the workflow in that case, so
+      # zero reported entries means "not yet", not "never" -- exactly the
+      # ambiguity this whole unfiltered/filtered distinction exists to
+      # resolve). Path glob syntax documents the SAME tokens (*, **, ?,
+      # [...], +, \) as branch/tag patterns, so branch_matches_list? is
+      # reused verbatim rather than reimplementing path matching. `paths`
+      # requires at least one changed file to match (in order, with `!`
+      # negation); `paths-ignore` excludes only when EVERY changed file
+      # matches the ignore patterns (GitHub still runs the workflow if even
+      # one changed file falls outside them).
+      def paths_filter_excludes?(cfg, changed_files)
+        if cfg.key?("paths")
+          return true unless changed_files.any? { |f| branch_matches_list?(cfg["paths"], f) }
+        end
+        if cfg.key?("paths-ignore")
+          return true if changed_files.all? { |f| branch_matches_list?(cfg["paths-ignore"], f) }
+        end
+        false
+      end
+      changed_files = begin
+        JSON.parse(ENV["ANNEX_CHANGED_FILES_JSON"] || "[]")
+      rescue JSON::ParserError
+        []
+      end
+      # #655 Codex P2 round 16 (do not skip opened-only annex runs): a
+      # pull_request trigger scoped to types: [opened] (no synchronize)
+      # DOES fire for the current HEAD when that HEAD is still the PRs
+      # ORIGINAL commit (no push has landed since the PR was opened), but
+      # treating it as unfiltered unconditionally would deadlock forever
+      # once a later push supersedes it (opened never fires again for this
+      # PR). ISO-8601 UTC strings sort correctly lexicographically, same
+      # comparison style as HEAD_PUSHED_AT/LATEST_FORCE_PUSH_TIME in the
+      # bash layer above -- if the annex own HEAD committer date is at or
+      # before the PRs created_at, this is plausibly still the opening
+      # commit; a clearly-later committer date means at least one push has
+      # landed since (a rebase/amend preserving an old date could fool
+      # this, but that is a narrow edge case, and the failure mode --
+      # falling through to "still filtered" -- is the existing, safe
+      # default, not a new deadlock risk).
+      head_predates_pr_creation = begin
+        created_at = ENV["ANNEX_PR_CREATED_AT"] || ""
+        committer_date = ENV["ANNEX_HEAD_COMMITTER_DATE"] || ""
+        !created_at.empty? && !committer_date.empty? && committer_date <= created_at
+      end
+      trigger_unfiltered = lambda do |event, relevant_branch|
         case on
         when String then on == event
         when Array then on.include?(event)
@@ -1006,19 +1089,22 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
           next false unless on.key?(event)
           cfg = on[event]
           next true unless cfg.is_a?(Hash)
-          next false if filter_keys.any? { |k| cfg.key?(k) }
+          next false if paths_filter_excludes?(cfg, changed_files)
           next false if event == "push" && push_tag_only_excludes?(cfg)
           next false if branch_filter_excludes?(cfg, relevant_branch)
-          next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")
+          if cfg.key?("types")
+            types = cfg["types"].is_a?(Array) ? cfg["types"] : []
+            next true if types.include?("synchronize")
+            next true if types.include?("opened") && head_predates_pr_creation
+            next false
+          end
           true
         else
           false
         end
       end
-      pr_filter_keys = ["paths", "paths-ignore"]
-      push_filter_keys = ["paths", "paths-ignore"]
-      pr_unfiltered = trigger_unfiltered.call("pull_request", pr_filter_keys, ENV["ANNEX_BASE_BRANCH"])
-      push_unfiltered = trigger_unfiltered.call("push", push_filter_keys, ENV["ANNEX_HEAD_BRANCH"])
+      pr_unfiltered = trigger_unfiltered.call("pull_request", ENV["ANNEX_BASE_BRANCH"])
+      push_unfiltered = trigger_unfiltered.call("push", ENV["ANNEX_HEAD_BRANCH"])
       same_repo_pr = ENV["ANNEX_SAME_REPO_PR"] == "true"
       unfiltered = pr_unfiltered || (push_unfiltered && same_repo_pr)
       puts JSON.generate({ "workflow" => workflow_name, "jobs" => jobs, "unfiltered" => unfiltered })

@@ -212,11 +212,15 @@ fi
 # presence too; round 11 replaced that blanket disqualification with an
 # actual evaluation (below), since GitHub schedules the workflow whenever
 # the real ref matches the filter, not merely when the filter is absent.
-if grep -qF 'pr_filter_keys = ["paths", "paths-ignore"]' "$SCRIPT" \
-   && grep -qF 'push_filter_keys = ["paths", "paths-ignore"]' "$SCRIPT"; then
-  pass "codex-review-check.sh's generic filter-key lists no longer blanket-disqualify on branches/branches-ignore, evaluating them instead (#655 round 11, tags removed from this list in round 13)"
+# Round 16 replaced the paths/paths-ignore blanket-disqualify with a real
+# evaluation too (see the paths_filter_excludes? assertions further
+# below), which is why the standalone filter-key list variables are gone.
+if grep -qF 'def paths_filter_excludes?(cfg, changed_files)' "$SCRIPT" \
+   && ! grep -qF 'pr_filter_keys = ["paths", "paths-ignore"]' "$SCRIPT" \
+   && ! grep -qF 'push_filter_keys = ["paths", "paths-ignore"]' "$SCRIPT"; then
+  pass "codex-review-check.sh's generic filter-key lists no longer blanket-disqualify on branches/branches-ignore or paths/paths-ignore, evaluating both instead (#655 rounds 11 and 16)"
 else
-  fail "codex-review-check.sh's filter-key lists do not match the expected round-13 shape (#655 round 13)"
+  fail "codex-review-check.sh's filter-key handling does not match the expected round-16 shape (#655 round 16)"
 fi
 
 # Codex P2 (#655 round 11, "evaluate base-branch filters before passing"):
@@ -227,10 +231,13 @@ fi
 # BASE ref; push compares the ref actually being pushed, which for a
 # same-repo PRs synchronize is its own HEAD ref, not base -- these must
 # be genuinely different variables/inputs, not the same one reused.
+# Round 16 dropped the (by-then only paths-related) filter_keys parameter
+# from trigger_unfiltered's signature entirely, since paths/paths-ignore
+# evaluation moved into paths_filter_excludes? and no other key used it.
 if grep -qF 'def branch_filter_excludes?(cfg, branch)' "$SCRIPT" \
    && grep -qF 'def branch_matches?(pattern, branch)' "$SCRIPT" \
-   && grep -qF 'pr_unfiltered = trigger_unfiltered.call("pull_request", pr_filter_keys, ENV["ANNEX_BASE_BRANCH"])' "$SCRIPT" \
-   && grep -qF 'push_unfiltered = trigger_unfiltered.call("push", push_filter_keys, ENV["ANNEX_HEAD_BRANCH"])' "$SCRIPT"; then
+   && grep -qF 'pr_unfiltered = trigger_unfiltered.call("pull_request", ENV["ANNEX_BASE_BRANCH"])' "$SCRIPT" \
+   && grep -qF 'push_unfiltered = trigger_unfiltered.call("push", ENV["ANNEX_HEAD_BRANCH"])' "$SCRIPT"; then
   pass "codex-review-check.sh evaluates branches/branches-ignore against the correct ref per event type (#655 round 11)"
 else
   fail "codex-review-check.sh does not evaluate branches/branches-ignore against the real base/head ref (#655 round 11)"
@@ -262,49 +269,64 @@ fi
 # tag names, as GitHub documents for these same patterns.
 if grep -qF 'def branch_pattern_to_regex(pattern)' "$SCRIPT" \
    && grep -qF 'branch_pattern_to_regex(pattern).match?(branch)' "$SCRIPT" \
-   && grep -qF 'result << Regexp.escape(chars[i + 1])' "$SCRIPT" \
+   && grep -qF 'tokens << Regexp.escape(chars[i + 1])' "$SCRIPT" \
    && ! grep -qF 'File.fnmatch(pattern, branch, flags)' "$SCRIPT"; then
   pass "codex-review-check.sh translates branch glob patterns into a Ruby Regexp, including escaped literal metacharacters (#655 rounds 13-14)"
 else
   fail "codex-review-check.sh does not use the expected regex translator / escaped-literal handling for branch-pattern matching (#655 rounds 13-14)"
 fi
+# Codex P2 (#655 round 16, "honor ? as an optional-character filter"):
+# GitHub documents `?` as matching zero or one of the PRECEDING character
+# (e.g. `release?` matches base branch `release` itself), not "exactly
+# one arbitrary character" the way POSIX glob/fnmatch define it -- the
+# round-13 translator emitted an independent [^/] token instead of
+# quantifying whatever came before it.
+if grep -qF 'tokens = []' "$SCRIPT" \
+   && grep -qF 'tokens[-1] = "(?:#{tokens[-1]})?" if tokens.any?' "$SCRIPT" \
+   && ! grep -qF 'result << "[^/]"' "$SCRIPT"; then
+  pass "codex-review-check.sh builds a token list so ? can quantify the preceding token instead of matching one arbitrary character (#655 round 16)"
+else
+  fail "codex-review-check.sh does not use the round-16 token-based ? handling (#655 round 16)"
+fi
 # End-to-end: the exact semver pattern Codex cited, which fnmatch cannot
-# represent at all (it treats `+` as a literal character).
+# represent at all (it treats `+` as a literal character). KEEP THIS
+# EMBEDDED RUBY IN SYNC with scripts/codex-review-check.sh's
+# branch_pattern_to_regex -- it is a verbatim copy, not a reimplementation.
 branch_pattern_matches() {
   local pattern=$1 branch=$2
   ruby -e '
     def branch_pattern_to_regex(pattern)
-      result = +""
+      tokens = []
       chars = pattern.chars
       i = 0
       while i < chars.length
         c = chars[i]
         if c == "\\" && chars[i + 1]
-          result << Regexp.escape(chars[i + 1])
+          tokens << Regexp.escape(chars[i + 1])
           i += 2
         elsif c == "*" && chars[i + 1] == "*"
-          result << ".*"
+          tokens << ".*"
           i += 2
         elsif c == "*"
-          result << "[^/]*"
+          tokens << "[^/]*"
           i += 1
         elsif c == "?"
-          result << "[^/]"
+          tokens[-1] = "(?:#{tokens[-1]})?" if tokens.any?
           i += 1
         elsif c == "["
           j = i + 1
           j += 1 while j < chars.length && chars[j] != "]"
-          result << chars[i..j].join
+          tokens << chars[i..j].join
           i = j + 1
         elsif c == "+"
-          result << "+"
+          tokens << "+"
           i += 1
         else
-          result << Regexp.escape(c)
+          tokens << Regexp.escape(c)
           i += 1
         end
       end
-      Regexp.new("\\A#{result}\\z")
+      Regexp.new("\\A#{tokens.join}\\z")
     end
     def branch_matches?(pattern, branch)
       return false unless pattern.is_a?(String) && branch.is_a?(String)
@@ -350,6 +372,41 @@ if [ "$GOT" = "false" ]; then
   pass "regex translator: escaped * no longer behaves as a wildcard (#655 round 14)"
 else
   fail "regex translator (escaped star wildcard regression): expected false, got $GOT"
+fi
+# Codex P2 (#655 round 16, "honor ? as an optional-character filter"):
+# the exact example Codex cited -- release? matches base branch release
+# itself (zero of the preceding character), and also matches release1
+# (one of the preceding character), but not release12 (no room left in
+# the pattern for a second extra character).
+GOT=$(branch_pattern_matches 'release?' 'release')
+if [ "$GOT" = "true" ]; then
+  pass "regex translator: release? matches release (zero of the preceding character) (#655 round 16)"
+else
+  fail "regex translator (? zero-match): expected true, got $GOT"
+fi
+GOT=$(branch_pattern_matches 'release?' 'releas')
+if [ "$GOT" = "true" ]; then
+  pass "regex translator: release? matches releas (the preceding character e made optional) (#655 round 16)"
+else
+  fail "regex translator (? drops preceding char): expected true, got $GOT"
+fi
+GOT=$(branch_pattern_matches 'release?' 'release1')
+if [ "$GOT" = "false" ]; then
+  pass "regex translator: release? does not match release1 (? is not a stand-in for an arbitrary extra character) (#655 round 16)"
+else
+  fail "regex translator (? not a wildcard): expected false, got $GOT"
+fi
+GOT=$(branch_pattern_matches 'v[12]?' 'v')
+if [ "$GOT" = "true" ]; then
+  pass "regex translator: ? quantifies a whole preceding [...] class, not just its last character (#655 round 16)"
+else
+  fail "regex translator (? quantifies bracket class): expected true, got $GOT"
+fi
+GOT=$(branch_pattern_matches '?main' 'main')
+if [ "$GOT" = "true" ]; then
+  pass "regex translator: a leading ? with no preceding token is a no-op, not an error (#655 round 16)"
+else
+  fail "regex translator (leading ? no-op): expected true, got $GOT"
 fi
 
 # An unresolvable/unknown branch must conservatively disqualify (treat as
@@ -420,6 +477,119 @@ else
   fail "push_tag_only_excludes? (branches only): expected false, got $GOT"
 fi
 
+# Codex P2 (#655 round 16, "wait for path-matched annex workflows"): a
+# paths/paths-ignore key was previously treated as unconditionally
+# filtered on mere presence, even when the PRs actual changed files match
+# the filter (GitHub schedules the workflow in that case). Path glob
+# syntax documents the SAME tokens as branch/tag patterns, so
+# branch_matches_list? is reused rather than reimplementing path
+# matching. `paths` requires at least one changed file to match;
+# `paths-ignore` excludes only when EVERY changed file matches the ignore
+# patterns.
+if grep -qF 'def paths_filter_excludes?(cfg, changed_files)' "$SCRIPT" \
+   && grep -qF 'return true unless changed_files.any? { |f| branch_matches_list?(cfg["paths"], f) }' "$SCRIPT" \
+   && grep -qF 'return true if changed_files.all? { |f| branch_matches_list?(cfg["paths-ignore"], f) }' "$SCRIPT" \
+   && grep -qF 'ANNEX_CHANGED_FILES_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/files"' "$SCRIPT" \
+   && grep -qF 'next false if paths_filter_excludes?(cfg, changed_files)' "$SCRIPT"; then
+  pass "codex-review-check.sh evaluates paths/paths-ignore against the PRs real changed files instead of blanket-disqualifying on presence (#655 round 16)"
+else
+  fail "codex-review-check.sh does not evaluate paths/paths-ignore against real changed files (#655 round 16)"
+fi
+# End-to-end: the exact scenarios the finding describes -- paths matching
+# vs not matching the actual diff, paths-ignore excluding only when ALL
+# files are covered, and the defensive empty-changed-files default.
+paths_filter_excludes_ruby() {
+  local cfg_json=$1 changed_files_json=$2
+  ruby -rjson -e '
+    def branch_pattern_to_regex(pattern)
+      tokens = []
+      chars = pattern.chars
+      i = 0
+      while i < chars.length
+        c = chars[i]
+        if c == "*" && chars[i + 1] == "*"
+          tokens << ".*"
+          i += 2
+        elsif c == "*"
+          tokens << "[^/]*"
+          i += 1
+        else
+          tokens << Regexp.escape(c)
+          i += 1
+        end
+      end
+      Regexp.new("\\A#{tokens.join}\\z")
+    end
+    def branch_matches?(pattern, branch)
+      return false unless pattern.is_a?(String) && branch.is_a?(String)
+      branch_pattern_to_regex(pattern).match?(branch)
+    rescue RegexpError, ArgumentError
+      false
+    end
+    def branch_matches_list?(patterns, branch)
+      return false unless patterns.is_a?(Array)
+      included = false
+      patterns.each do |raw|
+        next unless raw.is_a?(String)
+        if raw.start_with?("!")
+          included = false if branch_matches?(raw[1..], branch)
+        else
+          included = true if branch_matches?(raw, branch)
+        end
+      end
+      included
+    end
+    def paths_filter_excludes?(cfg, changed_files)
+      if cfg.key?("paths")
+        return true unless changed_files.any? { |f| branch_matches_list?(cfg["paths"], f) }
+      end
+      if cfg.key?("paths-ignore")
+        return true if changed_files.all? { |f| branch_matches_list?(cfg["paths-ignore"], f) }
+      end
+      false
+    end
+    cfg = JSON.parse(ARGV[0])
+    changed_files = JSON.parse(ARGV[1])
+    puts paths_filter_excludes?(cfg, changed_files)
+  ' "$cfg_json" "$changed_files_json"
+}
+GOT=$(paths_filter_excludes_ruby '{"paths":["src/**"]}' '["src/foo.py"]')
+if [ "$GOT" = "false" ]; then
+  pass "paths_filter_excludes?: paths matches a changed file -> not excluded, gate (a) waits for it (#655 round 16)"
+else
+  fail "paths_filter_excludes? (paths matches): expected false, got $GOT"
+fi
+GOT=$(paths_filter_excludes_ruby '{"paths":["src/**"]}' '["docs/readme.md"]')
+if [ "$GOT" = "true" ]; then
+  pass "paths_filter_excludes?: paths matches no changed file -> excluded, consistent with GitHub never scheduling the workflow (#655 round 16)"
+else
+  fail "paths_filter_excludes? (paths no match): expected true, got $GOT"
+fi
+GOT=$(paths_filter_excludes_ruby '{"paths":["src/**"]}' '["docs/readme.md","src/foo.py"]')
+if [ "$GOT" = "false" ]; then
+  pass "paths_filter_excludes?: paths matches at least one of several changed files -> not excluded (#655 round 16)"
+else
+  fail "paths_filter_excludes? (paths partial match): expected false, got $GOT"
+fi
+GOT=$(paths_filter_excludes_ruby '{"paths-ignore":["docs/**"]}' '["docs/readme.md"]')
+if [ "$GOT" = "true" ]; then
+  pass "paths_filter_excludes?: paths-ignore covers every changed file -> excluded (#655 round 16)"
+else
+  fail "paths_filter_excludes? (paths-ignore all covered): expected true, got $GOT"
+fi
+GOT=$(paths_filter_excludes_ruby '{"paths-ignore":["docs/**"]}' '["docs/readme.md","src/foo.py"]')
+if [ "$GOT" = "false" ]; then
+  pass "paths_filter_excludes?: paths-ignore does not cover every changed file -> not excluded, GitHub still runs it (#655 round 16)"
+else
+  fail "paths_filter_excludes? (paths-ignore partial): expected false, got $GOT"
+fi
+GOT=$(paths_filter_excludes_ruby '{"paths":["src/**"]}' '[]')
+if [ "$GOT" = "true" ]; then
+  pass "paths_filter_excludes?: no changed-files data (e.g. fetch failed) falls back to excluded, the existing conservative default (#655 round 16)"
+else
+  fail "paths_filter_excludes? (empty changed files): expected true, got $GOT"
+fi
+
 # Codex P1 (#655 round 13, "page the rollup before scanning annex
 # checks"): gh pr view --json statusCheckRollup only requests the first
 # 100 contexts with no pagination -- the SAME bug already fixed in
@@ -481,10 +651,79 @@ fi
 # omitting types -- was wrongly disqualified. Only a types list that
 # EXCLUDES synchronize should disqualify, since that is the activity that
 # fires for a resynchronized PRs current HEAD.
-if grep -qF 'next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")' "$SCRIPT"; then
+if grep -qF 'next true if types.include?("synchronize")' "$SCRIPT"; then
   pass "codex-review-check.sh treats a types list that includes synchronize as unfiltered, not merely absent (#655 round 10)"
 else
   fail "codex-review-check.sh still disqualifies unfiltered on the mere presence of a types key (#655 round 10)"
+fi
+
+# Codex P2 (#655 round 16, "don't skip opened-only annex runs"): a
+# pull_request trigger scoped to types: [opened] (no synchronize) DOES
+# fire for the current HEAD when that HEAD is still the PRs ORIGINAL
+# commit (no push has landed since the PR was opened), but treating it as
+# unfiltered unconditionally would deadlock forever once a later push
+# supersedes it (opened never fires again for this PR). HEAD_COMMITTER_DATE
+# <= PR created_at (both cheaply available, no new API call beyond one
+# small commit read) distinguishes "still on the opening commit" from
+# "synchronized since" -- ISO-8601 UTC strings sort correctly
+# lexicographically.
+if grep -qF 'next true if types.include?("opened") && head_predates_pr_creation' "$SCRIPT" \
+   && grep -qF 'ANNEX_PR_CREATED_AT="$ANNEX_PR_CREATED_AT"' "$SCRIPT" \
+   && grep -qF 'ANNEX_HEAD_COMMITTER_DATE="$HEAD_COMMITTER_DATE"' "$SCRIPT" \
+   && grep -qF 'committer_date <= created_at' "$SCRIPT"; then
+  pass "codex-review-check.sh treats types: [opened] as unfiltered only when the HEAD still predates PR creation (#655 round 16)"
+else
+  fail "codex-review-check.sh does not evaluate types: [opened] against PR creation vs HEAD committer date (#655 round 16)"
+fi
+# End-to-end: the exact scenarios the finding describes -- a newly opened
+# PR (HEAD still predates or equals PR creation) vs a since-synchronized
+# one (HEAD committer date clearly later), plus the round-10 regression
+# guard (types including synchronize is unaffected by any of this).
+opened_only_unfiltered() {
+  local created_at=$1 committer_date=$2 types_json=$3
+  ruby -e '
+    types = JSON.parse(ARGV[2])
+    created_at = ARGV[0]
+    committer_date = ARGV[1]
+    head_predates_pr_creation = !created_at.empty? && !committer_date.empty? && committer_date <= created_at
+    if types.include?("synchronize")
+      puts true
+    elsif types.include?("opened") && head_predates_pr_creation
+      puts true
+    else
+      puts false
+    end
+  ' -rjson "$created_at" "$committer_date" "$types_json"
+}
+GOT=$(opened_only_unfiltered "2026-07-06T05:00:00Z" "2026-07-06T05:00:00Z" '["opened"]')
+if [ "$GOT" = "true" ]; then
+  pass "opened-only annex: HEAD committer date equals PR created_at (still the opening commit) -> unfiltered (#655 round 16)"
+else
+  fail "opened-only annex (equal timestamps): expected true, got $GOT"
+fi
+GOT=$(opened_only_unfiltered "2026-07-06T05:00:00Z" "2026-07-06T04:00:00Z" '["opened"]')
+if [ "$GOT" = "true" ]; then
+  pass "opened-only annex: HEAD committer date before PR created_at (still the opening commit) -> unfiltered (#655 round 16)"
+else
+  fail "opened-only annex (HEAD predates PR): expected true, got $GOT"
+fi
+GOT=$(opened_only_unfiltered "2026-07-06T05:00:00Z" "2026-07-06T06:00:00Z" '["opened"]')
+if [ "$GOT" = "false" ]; then
+  pass "opened-only annex: HEAD committer date after PR created_at (synchronized since open) -> filtered, avoiding a permanent deadlock (#655 round 16)"
+else
+  fail "opened-only annex (synchronized since): expected false, got $GOT"
+fi
+GOT=$(opened_only_unfiltered "2026-07-06T05:00:00Z" "2026-07-06T06:00:00Z" '["opened","synchronize","reopened"]')
+if [ "$GOT" = "true" ]; then
+  pass "opened-only annex regression guard: types including synchronize stays unfiltered regardless of dates (#655 round 10 behavior preserved)"
+else
+  fail "opened-only annex (synchronize regression): expected true, got $GOT"
+fi
+GOT=$(opened_only_unfiltered "" "" '["opened"]')
+if [ "$GOT" = "false" ]; then
+  pass "opened-only annex: missing timestamps (e.g. API read failed) fall back to filtered, the existing conservative default (#655 round 16)"
+else
+  fail "opened-only annex (missing timestamps): expected false, got $GOT"
 fi
 
 # Codex P1 (#655 round 10, "fail closed when the annex probe is
@@ -587,7 +826,7 @@ fi
 # head/base repo full_name, no extra API call) rather than applied
 # unconditionally.
 if grep -qF 'ANNEX_SAME_REPO_PR=$(echo "$PR_JSON" | jq -r' "$SCRIPT" \
-   && grep -qF 'push_unfiltered = trigger_unfiltered.call("push", push_filter_keys, ENV["ANNEX_HEAD_BRANCH"])' "$SCRIPT" \
+   && grep -qF 'push_unfiltered = trigger_unfiltered.call("push", ENV["ANNEX_HEAD_BRANCH"])' "$SCRIPT" \
    && grep -qF 'unfiltered = pr_unfiltered || (push_unfiltered && same_repo_pr)' "$SCRIPT"; then
   pass "codex-review-check.sh treats a push-only annex as unfiltered when (and only when) the PR is same-repo (#655 round 9)"
 else
