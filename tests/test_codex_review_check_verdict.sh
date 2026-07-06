@@ -45,6 +45,18 @@ else
   fail "codex-review-check.sh is missing the verdict signal (CODEX_HEAD_VERDICT_TIME / issue-comments fetch / affirmative regex / reviewed-commit scan / prefix anchor / #600)"
 fi
 
+# ── 1b. Structural (#705): same-content carry-forward is present, is routed
+#       through the trusted workflow helper, and is only added as a fallback
+#       when no current-head Codex signal exists.
+if grep -q "CODEX_CARRYFORWARD_VERDICT_TIME" "$SCRIPT" \
+   && grep -q "external_review_carryforward.sh" "$SCRIPT" \
+   && grep -q 'LATEST_SIGNAL_KIND="carry_verdict"' "$SCRIPT" \
+   && grep -q "#705" "$SCRIPT"; then
+  pass "codex-review-check.sh carries forward prior clean Codex verdicts for unchanged external-review fingerprints (#705)"
+else
+  fail "codex-review-check.sh is missing same-content Codex verdict carry-forward (#705)"
+fi
+
 # ── 2. Structural: gate (b) branch 2 accepts the verdict comment as a
 #      same-agent cross-review signal (elif after the 👍 branch).
 if grep -q 'elif \[ -n "\$CODEX_HEAD_VERDICT_TIME" \]; then' "$SCRIPT" \
