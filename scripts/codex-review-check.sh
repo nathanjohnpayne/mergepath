@@ -627,10 +627,10 @@ ROLLUP_JSON=$(with_gh_retry gh pr view "$PR_NUMBER" --repo "$REPO" --json status
 # can touch $ROLLUP_JSON. The annex workflow-wide scan intentionally bypasses
 # the required-name filter entirely (see its own comment further down), so it
 # must never be starved by logic that clears $ROLLUP_JSON for OTHER reasons --
-# e.g. the empty-required-checks branch wiping it to `[]` for an all-matrix
-# annex (ANNEX_CHECK_NAMES_JSON empty, so that branch took the "no annex"
-# path even though ANNEX_WORKFLOW_NAME was populated), which silently hid a
-# reported matrix-leg failure from the scan below.
+# e.g. the empty-required-checks branch below always wipes it (branch
+# protection configured nothing, so the required-name filter has nothing to
+# enforce), which would otherwise silently hide the annex from that filter
+# too; ANNEX_SCAN_ROLLUP_JSON keeps the workflow-wide scan working regardless.
 ANNEX_SCAN_ROLLUP_JSON="$ROLLUP_JSON"
 
 # #655 (Codex P2 round 2): a consumer's repo_lint_local.yml annex's check
@@ -641,20 +641,23 @@ ANNEX_SCAN_ROLLUP_JSON="$ROLLUP_JSON"
 # rollup-presence-only check can neither find a custom-named check nor
 # notice a required annex check that is silently missing. Proactively probe
 # the annex file at the PR HEAD (mirrors agent-review.yml's #655 probe) and
-# derive its job name(s) so both gaps close uniformly in every branch below,
-# rather than only when the check happens to already be sitting in the
-# rollup under the literal name "repo-lint-local".
+# derive its job name(s) for logging/observability, so a human reading gate
+# (a)'s log can see what was derived from the annex.
 #
 # ANNEX_CHECKS_JSON carries { name, workflow } pairs, not bare names (#655
 # round 3 P2): the annex contract does not require unique job names, so a
 # consumer whose local job happens to share a name with an unrelated check
 # (e.g. "lint") would otherwise let that unrelated check's success silently
-# satisfy the annex requirement. workflow is the annex's own top-level
+# satisfy the annex requirement, or (round 10) let an unrelated check's
+# FAILURE wrongly block gate (a). workflow is the annex's own top-level
 # `name:` (statusCheckRollup's .workflowName for CheckRun entries).
-# ANNEX_CHECK_NAMES_JSON (bare names only) is still derived for the
-# required-set merge, which stays name-only like every other required-check
-# match in this script and in GitHub's own native required-status-checks
-# feature (neither disambiguates by workflow).
+# ANNEX_CHECKS_JSON is NOT merged into the required-name filter below (#655
+# round 10, "preserve workflow identity for annex checks") -- that merge
+# used to be how the annex got force-checked, but it is name-only (like
+# every other required-check match in this script), so a same-named
+# unrelated check could wrongly become "required" too. The workflow-wide
+# scan (ANNEX_WORKFLOW_BAD, further down) now independently and safely
+# enforces the annex by workflow identity instead, so no merge is needed.
 #
 # Matrix-strategy jobs are skipped during NAME derivation (#655 round 3 P2):
 # GitHub expands a matrix job into one check run per combination with a name
@@ -773,8 +776,21 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
       # workflow will NEVER run for a resynchronized PRs current HEAD, so
       # treating that as unfiltered would inject a synthetic PENDING entry
       # that can never clear: the exact permanent-deadlock class rounds
-      # 2-5 already fought to eliminate for the paths case. Any of the
-      # five keys now disqualifies "unfiltered".
+      # 2-5 already fought to eliminate for the paths case.
+      #
+      # #655 Codex P1 round 10 ("treat synchronize-enabled types as
+      # runnable"): round 9 disqualified "unfiltered" on the MERE presence
+      # of a types key, but types is not a narrowing filter the way
+      # paths/branches are -- it selects WHICH pull_request activities
+      # trigger this workflow at all, and the GitHub default (when types
+      # is omitted) is [opened, synchronize, reopened]. An explicit types
+      # list that STILL includes synchronize (the activity that fires for
+      # a resynchronized PRs current HEAD) is therefore just as unfiltered
+      # as omitting types entirely -- the common explicit form
+      # `types: [opened, synchronize, reopened]` was being wrongly
+      # disqualified. Only a types list that EXCLUDES synchronize actually
+      # means this workflow never runs for that HEAD, so types gets its
+      # own check below rather than joining the generic filter-key list.
       #
       # #655 Codex P2 round 9 ("wait for valid push-only annex
       # workflows"): check_ci_scripts_wired accepts push OR pull_request
@@ -794,12 +810,15 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
         when Hash
           next false unless on.key?(event)
           cfg = on[event]
-          !(cfg.is_a?(Hash) && filter_keys.any? { |k| cfg.key?(k) })
+          next true unless cfg.is_a?(Hash)
+          next false if filter_keys.any? { |k| cfg.key?(k) }
+          next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")
+          true
         else
           false
         end
       end
-      pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore", "types"]
+      pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore"]
       push_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore"]
       pr_unfiltered = trigger_unfiltered.call("pull_request", pr_filter_keys)
       push_unfiltered = trigger_unfiltered.call("push", push_filter_keys)
@@ -810,13 +829,12 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
     if [ -z "$annex_probe_raw" ]; then
       # ruby never reached its `puts` line at all: the YAML itself did not
       # parse (Psych exception) or had no `jobs:` hash -- genuinely
-      # unparseable, not just empty. Fall back to the conventional name as
-      # a defensive guess (better than requiring nothing for a file that
-      # unambiguously exists but could not be read as a workflow). The
-      # workflow name is unknown too (parsing never got that far), so the
-      # workflow-wide scan below has nothing to key on for this case.
-      log "gate (a): repo_lint_local.yml annex present at $HEAD_SHA_FOR_ANNEX but could not be parsed as a workflow (invalid YAML or no jobs) — falling back to the conventional repo-lint-local check name (#655)."
-      ANNEX_CHECKS_JSON='[{"name":"repo-lint-local","workflow":""}]'
+      # unparseable, not just empty. The workflow name is unknown too
+      # (parsing never got that far), so the workflow-wide scan below has
+      # nothing to key on for this case; the conventional-name fallback
+      # scan further down (#655 round 10) covers it instead, without
+      # forcing a requirement that name ever exist.
+      log "gate (a): repo_lint_local.yml annex present at $HEAD_SHA_FOR_ANNEX but could not be parsed as a workflow (invalid YAML or no jobs) — falling back to scanning for the conventional repo-lint-local check name (#655)."
     else
       ANNEX_WORKFLOW_NAME=$(echo "$annex_probe_raw" | jq -r '.workflow')
       ANNEX_UNFILTERED=$(echo "$annex_probe_raw" | jq -r '.unfiltered')
@@ -839,25 +857,34 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
     # #655 Codex P2 round 4: a 403 (token lacks Contents: read) is USUALLY a
     # persistent, systemic condition, not a transient blip -- unlike the
     # other-error branch below. Forcing a synthetic repo-lint-local
-    # requirement here would inject a check name that can NEVER exist on
+    # REQUIREMENT here would inject a check name that can NEVER exist on
     # THIS repo (the same 403 recurs on every future evaluation too),
     # permanently blocking Phase 4 label-clearing and merge-gate checks on
-    # every PR, not just ones with an actual annex. Do not enforce; warn
-    # loudly so the token's scope gets fixed instead of masking the gap.
-    log "gate (a): WARNING — repo_lint_local.yml probe at $HEAD_SHA_FOR_ANNEX got HTTP 403 (token likely lacks Contents: read) — NOT failing closed, since a persistent 403 would otherwise force an unresolvable synthetic check on every future PR too. Grant the merge-gate token Contents: read to restore annex enforcement (#655)."
+    # every PR, not just ones with an actual annex. Do not force a
+    # requirement; warn loudly so the token's scope gets fixed instead of
+    # masking the gap.
+    #
+    # #655 Codex P1 round 10 ("fail closed when the annex probe is
+    # unauthorized"): a 403 previously left BOTH the required-name filter
+    # and the workflow-wide scan blind to a red repo-lint-local outside
+    # branch protection, silently passing gate (a) regardless of the
+    # annex's real state. ANNEX_WORKFLOW_NAME stays empty here (we still
+    # cannot know the real workflow identity without Contents: read), but
+    # the conventional-name fallback scan further down now still catches a
+    # REPORTED bad conclusion under the literal name "repo-lint-local" --
+    # without requiring its presence, so a persistent 403 still cannot
+    # deadlock the gate the way a forced requirement would.
+    log "gate (a): WARNING — repo_lint_local.yml probe at $HEAD_SHA_FOR_ANNEX got HTTP 403 (token likely lacks Contents: read) — not forcing a requirement (a persistent 403 would make it unresolvable on every future PR too), but still scanning for a reported repo-lint-local failure by conventional name (#655). Grant the merge-gate token Contents: read to restore full annex enforcement."
   else
-    # Fail closed: an indeterminate but plausibly-transient read failure
-    # (rate limit, 5xx, network) must not be treated the same as a
-    # confirmed absence -- unlike a 403 above, this is likely to resolve on
-    # the next gate evaluation (this script runs on every relevant event
-    # plus a 5-minute sweep), so the fallback's "wait for a check that may
-    # not really exist" cost is bounded rather than permanent.
-    log "gate (a): WARNING — could not determine whether repo_lint_local.yml exists at $HEAD_SHA_FOR_ANNEX (API error, not a confirmed 404) — failing closed by also requiring the conventional repo-lint-local check name (#655)."
-    ANNEX_CHECKS_JSON='[{"name":"repo-lint-local","workflow":""}]'
+    # An indeterminate but plausibly-transient read failure (rate limit,
+    # 5xx, network) must not be treated the same as a confirmed absence --
+    # this is likely to resolve on the next gate evaluation (this script
+    # runs on every relevant event plus a 5-minute sweep). The
+    # conventional-name fallback scan further down covers this case too.
+    log "gate (a): WARNING — could not determine whether repo_lint_local.yml exists at $HEAD_SHA_FOR_ANNEX (API error, not a confirmed 404) — scanning for a reported repo-lint-local failure by conventional name in the meantime (#655)."
   fi
   rm -f "$annex_probe_err"
 fi
-ANNEX_CHECK_NAMES_JSON=$(echo "$ANNEX_CHECKS_JSON" | jq '[.[].name] | unique')
 
 # statusCheckRollup mixes two entry types:
 #   - CheckRun (GitHub Actions jobs): uses .name, .workflowName,
@@ -922,38 +949,31 @@ if [ "$protection_readable" -eq 0 ]; then
 elif [ -z "$REQUIRED_CHECK_NAMES" ]; then
   # Read succeeded; branch protection lists NO required checks (404 or empty
   # contexts). Nothing to enforce for any OTHER check — gate (a) imposes no
-  # required-check filter beyond the #655 annex force-include below (the
-  # other gates still run).
-  #
-  # #655 (Codex P1 round 1): this branch used to wipe ROLLUP_JSON to empty
-  # unconditionally, which also hid the annex. That matters here
-  # specifically: a repo whose branch protection is ruleset-only (no
-  # classic required_status_checks resource) hits this 404 branch on every
-  # PR. Keep the full rollup and scope REQUIRED_JSON to the annex's derived
-  # check name(s) alone when the annex is present (per the probe above, not
-  # merely "already sitting in the rollup" — #655 round 2), so it is still
-  # force-checked; otherwise preserve the prior no-enforcement behavior.
-  if [ "$(echo "$ANNEX_CHECK_NAMES_JSON" | jq 'length')" -gt 0 ]; then
-    log "gate (a): branch protection for $BASE_BRANCH lists no required checks, but the repo_lint_local.yml annex is present (#655) — force-checking its check run(s) alone."
-    REQUIRED_JSON="$ANNEX_CHECK_NAMES_JSON"
-  else
-    log "gate (a): branch protection for $BASE_BRANCH lists no required checks; gate (a) imposes no required-check filter."
-    ROLLUP_JSON='{"statusCheckRollup":[]}'
-    REQUIRED_JSON='[]'
-  fi
+  # required-check filter (the other gates still run). The repo_lint_local.yml
+  # annex (#601), when present, is enforced independently below via the
+  # workflow-wide ANNEX_WORKFLOW_BAD scan reading ANNEX_SCAN_ROLLUP_JSON (a
+  # copy frozen BEFORE this branch's own wipe, #655 round 7) -- so wiping
+  # ROLLUP_JSON here unconditionally does NOT hide the annex the way it used
+  # to before that scan existed (#655 round 1's original problem).
+  log "gate (a): branch protection for $BASE_BRANCH lists no required checks; gate (a) imposes no required-check filter beyond the independent annex workflow-wide scan."
+  ROLLUP_JSON='{"statusCheckRollup":[]}'
+  REQUIRED_JSON='[]'
 else
-  # Build a jq array of required check names, then force-include the
-  # annex's derived check name(s) (#655) whenever the annex is present (per
-  # the probe above), regardless of whether branch protection lists them.
-  # The consumer-local repo_lint_local.yml annex (#601) is per-consumer and
-  # never propagated, so there is no canonical PR that could add its check
-  # run to branch protection fleet-wide. Without this, a consumer that
-  # migrated local checks into the annex has them silently excluded from
-  # gate (a): a red or missing annex check would not block the
-  # needs-external-review label-clear (auto-clear-blocking-labels.yml,
-  # which evaluates this same gate) or an agent's manual merge-gate check.
-  # No annex (including mergepath itself) is a no-op — unchanged from before.
-  REQUIRED_JSON=$(echo "$REQUIRED_CHECK_NAMES" | jq -R . | jq -s . | jq --argjson annex "$ANNEX_CHECK_NAMES_JSON" '. + $annex | unique')
+  # #655 Codex P2 round 10 ("preserve workflow identity for annex
+  # checks"): earlier rounds merged the annex's derived bare NAME(s) into
+  # this required-name list so a red or missing annex check would not be
+  # silently excluded from gate (a) when branch protection already
+  # requires some other checks. That merge is name-only (no workflow
+  # disambiguation), so a consumer whose annex job happens to share a bare
+  # name with an unrelated, non-required check from a DIFFERENT workflow
+  # (e.g. both are called "test") would make that unrelated check
+  # mandatory too -- a failing unrelated "test" could block gate (a) even
+  # with a fully green annex. The annex is independently and safely
+  # enforced below via ANNEX_WORKFLOW_BAD, which matches by .workflowName
+  # rather than by name, so it cannot be confused by a same-named
+  # unrelated check. No annex-name merge is needed here any more; only
+  # branch protection's own required names apply to this filter.
+  REQUIRED_JSON=$(echo "$REQUIRED_CHECK_NAMES" | jq -R . | jq -s .)
 fi
 
 BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq --argjson required_names "${REQUIRED_JSON:-[]}" '
@@ -1065,8 +1085,37 @@ if [ -n "$ANNEX_WORKFLOW_NAME" ]; then
       BAD_CHECKS=$(echo "$BAD_CHECKS" | jq --argjson extra "$ANNEX_WORKFLOW_BAD" '(. + $extra) | unique')
     fi
   fi
+else
+  # #655 Codex P1 round 10 ("fail closed when the annex probe is
+  # unauthorized"): ANNEX_WORKFLOW_NAME is empty here -- the probe
+  # either got a 403 (no Contents: read), a genuinely-unparseable annex,
+  # or an indeterminate error, so the REAL workflow identity is unknown
+  # and the workflow-wide scan above cannot run. Fall back to scanning
+  # for the conventional job/check name #601 documents by default
+  # ("repo-lint-local") directly by NAME rather than by workflow, since
+  # that is the only identity we can guess in these cases. Never blocks
+  # on absence (only a REPORTED bad conclusion), so a persistent 403 or
+  # a permanently-unparseable annex still cannot deadlock this gate the
+  # way requiring its presence would -- this only closes the narrower
+  # gap of an annex that already reports under the exact conventional
+  # name while we cannot confirm anything more precise.
+  ANNEX_NAME_FALLBACK_BAD=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq '
+    [.statusCheckRollup[]
+      | select((.name // .context // "") == "repo-lint-local")
+      | {
+          label: (.name // .context // "?"),
+          workflow: (.workflowName // ""),
+          result: (.conclusion // .state // "")
+        }
+      | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
+    ]
+  ')
+  ANNEX_NAME_FALLBACK_BAD_COUNT=$(echo "$ANNEX_NAME_FALLBACK_BAD" | jq 'length')
+  if [ "$ANNEX_NAME_FALLBACK_BAD_COUNT" -gt 0 ]; then
+    log "gate (a): a check named repo-lint-local has $ANNEX_NAME_FALLBACK_BAD_COUNT non-passing reported result(s), and the annex probe could not confirm a workflow identity to scan more precisely (403/unparseable/error) — included below as a conventional-name fallback (#655 round 10)."
+    BAD_CHECKS=$(echo "$BAD_CHECKS" | jq --argjson extra "$ANNEX_NAME_FALLBACK_BAD" '(. + $extra) | unique')
+  fi
 fi
-
 BAD_COUNT=$(echo "$BAD_CHECKS" | jq 'length')
 
 if [ "$BAD_COUNT" -gt 0 ]; then

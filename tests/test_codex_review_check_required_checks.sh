@@ -10,45 +10,54 @@
 # protection cannot require it centrally — the annex is per-consumer and
 # never propagated, so there is no canonical PR to add it fleet-wide (that
 # half is a human branch-protection change; see #655). This closes the
-# agent-doable half across five rounds of Codex findings:
+# agent-doable half across ten rounds of Codex findings; only the
+# architecturally-significant ones are summarized here (see git history /
+# PR #687 for the full round-by-round detail):
 #
-#   Round 1 P1: force-include the annex's check into gate (a)'s scrutiny
-#   regardless of branch protection's required-check list, including the
-#   "no required checks configured" branch, which used to wipe the whole
-#   rollup unconditionally.
+#   Rounds 1-4: force-include the annex's check into gate (a)'s scrutiny
+#   (including when branch protection requires nothing at all), derive its
+#   real job name(s) instead of assuming the "repo-lint-local" filename
+#   convention, skip matrix-strategy jobs during name derivation (their
+#   expanded names cannot be predicted), and distinguish a persistent 403
+#   from a transient probe error.
 #
-#   Round 2 P2: the annex's job (and therefore check-run) name is not
-#   guaranteed to be literally "repo-lint-local" — derive it from the annex
-#   YAML instead of assuming the filename convention.
+#   Round 5 (superseding rounds 2-4's MISSING-injection approach): rounds
+#   2-4 forced a synthetic MISSING requirement for a derived check name
+#   that had not yet reported, which turns into a PERMANENT deadlock for a
+#   persistent 403, an all-matrix annex, or a path-filtered annex that
+#   legitimately never runs for a given diff. Replaced with a workflow-wide
+#   scan: any REPORTED entry belonging to the annex's own workflow (matched
+#   by .workflowName, not by a specific check name) that is non-green is
+#   unioned into BAD_CHECKS directly -- catching a matrix-leg failure
+#   without its expanded name, and never inventing a requirement for a
+#   check that may never report.
 #
-#   Round 3 P2: a matrix-strategy annex job expands into check-run names
-#   this static YAML read cannot reproduce — skip matrix jobs during NAME
-#   derivation instead of guessing (asserted structurally below, not via an
-#   inline jq replica, since it is ruby-level logic).
+#   Rounds 6-9: fold in an omitted top-level `name:` (falls back to the
+#   workflow file path GitHub itself displays), allow YAML aliases in the
+#   annex (bounded by size/token-count DoS guards against "billion
+#   laughs", refined twice more to stop over-counting quoted and hyphenated
+#   path globs as alias tokens), and treat an annex with no restricting
+#   trigger filter (paths/paths-ignore/branches/branches-ignore, and a
+#   pull_request `types` list that still includes synchronize) as
+#   guaranteed to eventually report -- so zero reported entries blocks
+#   (not-yet-clean) instead of silently passing, including for a
+#   same-repo-gated push-only annex (a push trigger never fires in this
+#   repo for a fork PR).
 #
-#   Round 4 P2: a 403 on the annex probe (token lacks Contents: read) is
-#   usually persistent, not transient — do not fail closed on it the way a
-#   generic indeterminate error does, since that would force an
-#   unresolvable check on every future PR on an under-scoped repo. Also: a
-#   genuine YAML-parse failure and a valid-parse-but-all-matrix annex are
-#   different failure modes and must be handled differently.
-#
-#   Round 5 P2 x2 (superseding rounds 2-4's MISSING-injection approach):
-#   rounds 2-4 forced a synthetic MISSING requirement for a derived check
-#   name that had not yet reported. Round 5 found three DISTINCT ways this
-#   turns into a PERMANENT deadlock: a persistent 403 (round 4, already
-#   fixed), an all-matrix annex whose unexpanded name will never exist
-#   (round 4), and a path-filtered annex that legitimately never runs for a
-#   given PR's diff (round 5) -- plus a blind spot in the opposite
-#   direction, where excluding matrix jobs from the name-based requirement
-#   also meant a REPORTED matrix-leg failure was never observed (round 5).
-#   The fix replaces MISSING-injection with a workflow-wide scan: any
-#   REPORTED entry belonging to the annex's own workflow (matched by
-#   .workflowName, not by a specific check name) that is non-green is
-#   unioned into BAD_CHECKS directly. This catches a reported matrix
-#   failure without needing its expanded name, and never invents a
-#   requirement for a check that has not (and may never) report, closing
-#   the deadlock class entirely.
+#   Round 10: removed the annex-derived-name merge into REQUIRED_JSON
+#   entirely (both the empty- and non-empty-required-checks branches) --
+#   that merge was name-only, so a consumer whose annex job happened to
+#   share a bare name with an unrelated, non-required check from a
+#   DIFFERENT workflow would make that unrelated check mandatory too,
+#   wrongly blocking gate (a) with a fully green annex. The workflow-wide
+#   scan (round 5) already independently and safely enforces the annex by
+#   workflow identity, immune to this collision, so no merge is needed at
+#   all any more. Also added a conventional-name (not workflow-based, since
+#   the real identity is unknown) fallback scan for when the annex probe
+#   cannot determine a workflow identity at all (403 / unparseable /
+#   indeterminate error) -- catching a REPORTED bad conclusion under the
+#   literal name "repo-lint-local" without requiring its presence, so a
+#   persistent 403 still cannot deadlock the gate.
 #
 # The full gate (a) needs network (statusCheckRollup + branch-protection API
 # reads + the annex Contents API probe); this test pins (1) the structural
@@ -181,16 +190,67 @@ fi
 
 # Codex P2 (#655 round 9, "honor non-path pull_request filters before
 # waiting"): round 8 checked only paths/paths-ignore on the pull_request
-# config. A types list excluding synchronize (e.g. types: [opened] only)
-# means the workflow will NEVER run for a resynchronized PRs current HEAD,
-# so treating that as unfiltered would inject a PENDING entry that can
-# never clear -- the exact permanent-deadlock class rounds 2-5 already
-# fought to eliminate for the paths case. branches/branches-ignore/types
-# must all disqualify "unfiltered" alongside paths/paths-ignore.
-if grep -qF 'pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore", "types"]' "$SCRIPT"; then
-  pass "codex-review-check.sh disqualifies unfiltered on branches/branches-ignore/types, not just paths/paths-ignore (#655 round 9)"
+# config. branches/branches-ignore must also disqualify "unfiltered"
+# alongside paths/paths-ignore (types is handled separately below, since
+# round 10 found it needs different treatment).
+if grep -qF 'pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore"]' "$SCRIPT"; then
+  pass "codex-review-check.sh disqualifies unfiltered on branches/branches-ignore, alongside paths/paths-ignore (#655 round 9)"
 else
-  fail "codex-review-check.sh does not check the full pull_request filter-key set (#655 round 9)"
+  fail "codex-review-check.sh does not check the branches/branches-ignore filter keys (#655 round 9)"
+fi
+
+# Codex P1 (#655 round 10, "treat synchronize-enabled types as runnable"):
+# round 9 disqualified "unfiltered" on the MERE PRESENCE of a types key,
+# but types selects WHICH pull_request activities trigger the workflow at
+# all (GitHub own default when omitted is [opened, synchronize,
+# reopened]) rather than narrowing by path/branch. An explicit
+# `types: [opened, synchronize, reopened]` -- functionally identical to
+# omitting types -- was wrongly disqualified. Only a types list that
+# EXCLUDES synchronize should disqualify, since that is the activity that
+# fires for a resynchronized PRs current HEAD.
+if grep -qF 'next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")' "$SCRIPT"; then
+  pass "codex-review-check.sh treats a types list that includes synchronize as unfiltered, not merely absent (#655 round 10)"
+else
+  fail "codex-review-check.sh still disqualifies unfiltered on the mere presence of a types key (#655 round 10)"
+fi
+
+# Codex P1 (#655 round 10, "fail closed when the annex probe is
+# unauthorized"): a 403 (or genuinely-unparseable annex, or indeterminate
+# error) leaves ANNEX_WORKFLOW_NAME empty, so the workflow-wide scan above
+# cannot run at all -- silently passing gate (a) regardless of the
+# annex's real state, even for a check already reporting red under the
+# conventional name outside branch protection. A name-based (not
+# workflow-based, since the real identity is unknown) fallback scan now
+# catches a REPORTED bad conclusion under the literal name
+# "repo-lint-local" in these cases, without requiring its presence (so a
+# persistent 403 still cannot deadlock the gate).
+annex_name_fallback_bad() {
+  local rollup_json=$1
+  printf '%s' "$rollup_json" | jq '
+    [.statusCheckRollup[]
+      | select((.name // .context // "") == "repo-lint-local")
+      | { label: (.name // .context // "?"), workflow: (.workflowName // ""), result: (.conclusion // .state // "") }
+      | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
+    ]'
+}
+ROLLUP_403_RED_CONVENTIONAL='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","workflowName":"Consumer Local CI","conclusion":"FAILURE"}]}'
+GOT=$(annex_name_fallback_bad "$ROLLUP_403_RED_CONVENTIONAL" | jq -c '[.[].label]')
+if [ "$GOT" = '["repo-lint-local"]' ]; then
+  pass "conventional-name fallback scan: a red repo-lint-local is caught even when the workflow identity is unknown (#655 round 10 P1)"
+else
+  fail "conventional-name fallback scan (403 case): expected [\"repo-lint-local\"], got $GOT"
+fi
+ROLLUP_403_NO_ANNEX='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"}]}'
+GOT=$(annex_name_fallback_bad "$ROLLUP_403_NO_ANNEX")
+if [ "$(echo "$GOT" | jq 'length')" = "0" ]; then
+  pass "conventional-name fallback scan: a genuinely absent annex is not falsely flagged (no repo-lint-local entry to find)"
+else
+  fail "conventional-name fallback scan (no annex): expected 0, got $GOT"
+fi
+if grep -qF 'ANNEX_NAME_FALLBACK_BAD=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq' "$SCRIPT"; then
+  pass "codex-review-check.sh's conventional-name fallback scan reads from the frozen ANNEX_SCAN_ROLLUP_JSON, immune to required-checks-driven wiping (#655 round 10)"
+else
+  fail "codex-review-check.sh's conventional-name fallback scan is missing or reads from the wrong rollup variable (#655 round 10)"
 fi
 
 # Codex P2 (#655 round 9, "wait for valid push-only annex workflows"):
@@ -247,31 +307,53 @@ else
   fail "codex-review-check.sh does not distinguish genuine parse failure from an all-matrix-jobs annex"
 fi
 
-# ── 2. Inline logic: the three REQUIRED_JSON branches, parameterized on
-#      ANNEX_CHECK_NAMES_JSON (bare names derived from ANNEX_CHECKS_JSON)
-#      instead of a hard-coded "repo-lint-local" string. Required-set
-#      matching stays name-only (like every other required-check match in
-#      this script, and like GitHub's own native required-status-checks
-#      feature); workflow disambiguation happens only in the separate
-#      workflow-wide bad-conclusion scan (section 3 below).
+# ── 2. Inline logic: the REQUIRED_JSON branches. Rounds 1-9 merged the
+#      annex's derived bare name(s) into REQUIRED_JSON so it would be
+#      force-checked even when branch protection required nothing (empty
+#      branch) or required only OTHER checks (non-empty branch). Round 10
+#      Codex P2 ("preserve workflow identity for annex checks") found this
+#      merge is name-only (no workflow disambiguation, unlike the
+#      workflow-wide scan in section 3), so a consumer whose annex job
+#      shares a bare name with an unrelated, non-required check from a
+#      DIFFERENT workflow would make that unrelated check mandatory too --
+#      a failing unrelated check could block gate (a) with a fully green
+#      annex. Since the workflow-wide scan already independently and
+#      safely enforces the annex (matched by .workflowName, immune to name
+#      collisions), the merge was removed entirely in both branches: the
+#      empty branch now always wipes ROLLUP_JSON (matching the pre-#655
+#      no-annex behavior), and the non-empty branch uses branch
+#      protection's required names alone, with no annex merge.
 #      KEEP IN SYNC with scripts/codex-review-check.sh's gate (a).
 
-# Non-empty required-names branch: merge in the annex's derived name(s).
-merge_required() {
-  local required_names_csv=$1 annex_names_json=$2
-  printf '%s' "$required_names_csv" | jq -R . | jq -s . | jq --argjson annex "$annex_names_json" '. + $annex | unique'
-}
+if grep -qF 'REQUIRED_JSON=$(echo "$REQUIRED_CHECK_NAMES" | jq -R . | jq -s .)' "$SCRIPT" \
+   && ! grep -qF '. + $annex | unique' "$SCRIPT"; then
+  pass "codex-review-check.sh's non-empty-required branch no longer merges the annex bare name into REQUIRED_JSON (#655 round 10)"
+else
+  fail "codex-review-check.sh's non-empty-required branch still merges the annex name into REQUIRED_JSON, risking a same-named unrelated-check false block (#655 round 10)"
+fi
 
-# Empty required-names branch: scope REQUIRED_JSON to the annex alone when
-# it is present (per the probe, not merely "already in the rollup").
-empty_branch_required_json() {
-  local annex_names_json=$1
-  if [ "$(printf '%s' "$annex_names_json" | jq 'length')" -gt 0 ]; then
-    printf '%s' "$annex_names_json"
-  else
-    printf '[]'
-  fi
-}
+if grep -qF "gate (a) imposes no required-check filter beyond the independent annex workflow-wide scan" "$SCRIPT"; then
+  pass "codex-review-check.sh's empty-required branch always wipes the rollup now, relying on the independent workflow-wide scan for annex enforcement (#655 round 10)"
+else
+  fail "codex-review-check.sh's empty-required branch does not consistently defer to the workflow-wide scan (#655 round 10)"
+fi
+
+# End-to-end: reproduce Finding 2's exact scenario with the real
+# (post-round-10) non-empty-branch construction -- branch protection
+# already requires "lint", and the annex's OWN job is ALSO named "lint"
+# (a name collision the annex contract explicitly permits). REQUIRED_JSON
+# built the round-10 way (no annex merge) must stay ["lint"], so an
+# unrelated FAILING check sharing that name from a different workflow does
+# not matter -- only the CANONICAL lint (matched further down by BAD_CHECKS
+# using $required_names) is in scope for the name-based filter, and the
+# annex itself is separately covered by the workflow-wide scan regardless
+# of what name it happens to share.
+REQUIRED_JSON_ROUND10=$(printf 'lint' | jq -R . | jq -s .)
+if [ "$(echo "$REQUIRED_JSON_ROUND10" | jq -c 'sort')" = '["lint"]' ]; then
+  pass "non-empty branch (round 10): REQUIRED_JSON stays scoped to branch-protection names alone, even when the annex job shares one of those names"
+else
+  fail "non-empty branch (round 10): expected REQUIRED_JSON [\"lint\"] with no annex merge, got $REQUIRED_JSON_ROUND10"
+fi
 
 # End-to-end BAD_CHECKS filter (the required-name-scoped half). KEEP IN SYNC
 # with scripts/codex-review-check.sh.
@@ -304,55 +386,6 @@ annex_workflow_bad() {
     ]'
 }
 
-# Round-1 shape: annex named the conventional "repo-lint-local" (bare names,
-# for the REQUIRED_JSON-merge tests, which stay name-only).
-ANNEX_CONVENTIONAL='["repo-lint-local"]'
-# Round-2 shape: a consumer whose annex job uses a different name entirely.
-ANNEX_RENAMED='["my-custom-checks"]'
-ANNEX_NONE='[]'
-
-GOT=$(merge_required 'lint' "$ANNEX_CONVENTIONAL" | jq -c 'sort')
-if [ "$GOT" = '["lint","repo-lint-local"]' ]; then
-  pass "non-empty branch: conventional annex name merges into the required set"
-else
-  fail "non-empty branch (conventional): expected [\"lint\",\"repo-lint-local\"], got $GOT"
-fi
-
-GOT=$(merge_required 'lint' "$ANNEX_RENAMED" | jq -c 'sort')
-if [ "$GOT" = '["lint","my-custom-checks"]' ]; then
-  pass "non-empty branch: a renamed annex job (#655 round 2 P2) merges by its DERIVED name, not a hard-coded one"
-else
-  fail "non-empty branch (renamed): expected [\"lint\",\"my-custom-checks\"], got $GOT"
-fi
-
-GOT=$(merge_required 'lint' "$ANNEX_NONE" | jq -c 'sort')
-if [ "$GOT" = '["lint"]' ]; then
-  pass "non-empty branch: no annex -> required set is untouched (no consumer regression)"
-else
-  fail "non-empty branch (no annex): expected [\"lint\"] unchanged, got $GOT"
-fi
-
-GOT=$(merge_required "$(printf 'lint\nrepo-lint-local')" "$ANNEX_CONVENTIONAL" | jq -c 'sort')
-if [ "$GOT" = '["lint","repo-lint-local"]' ]; then
-  pass "non-empty branch: already-required (a future branch-protection addition) -> no duplicate entry"
-else
-  fail "non-empty branch (already-required): expected no duplicate, got $GOT"
-fi
-
-GOT=$(empty_branch_required_json "$ANNEX_CONVENTIONAL")
-if [ "$GOT" = '["repo-lint-local"]' ]; then
-  pass "empty-required branch: annex present (probe-confirmed) -> scopes REQUIRED_JSON to it alone (#655 round 1)"
-else
-  fail "empty-required branch (annex present): expected [\"repo-lint-local\"], got $GOT"
-fi
-
-GOT=$(empty_branch_required_json "$ANNEX_NONE")
-if [ "$GOT" = '[]' ]; then
-  pass "empty-required branch: no annex -> unchanged (empty required, no enforcement)"
-else
-  fail "empty-required branch (no annex): expected [], got $GOT"
-fi
-
 # ── 3. Inline logic: the workflow-wide bad-conclusion scan (#655 round 5).
 ROLLUP_ANNEX_REPORTED_GOOD='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","workflowName":"repo-lint-local","conclusion":"SUCCESS"}]}'
 GOT=$(annex_workflow_bad "$ROLLUP_ANNEX_REPORTED_GOOD" "repo-lint-local")
@@ -384,19 +417,13 @@ fi
 
 # #655 round 7 Codex P1 ("keep rollup when annex only has matrix jobs"):
 # reproduces the exact bug shape -- branch protection has NO required
-# checks (empty_branch_required_json's "annex has no derivable names" path,
-# which the OLD code took as "no annex at all" and wiped ROLLUP_JSON to
-# `[]`) while the annex genuinely exists as all-matrix and has a REPORTED
-# matrix-leg failure. The fixed script scans a rollup frozen BEFORE that
-# wipe (ANNEX_SCAN_ROLLUP_JSON in the real script; simulated here by
-# passing the ORIGINAL rollup straight to annex_workflow_bad, exactly as
-# the fix does) -- confirming the failure is still caught even though
-# ANNEX_CHECK_NAMES_JSON (all-matrix) is empty and REQUIRED_JSON is `[]`.
-ANNEX_ALL_MATRIX_NAMES='[]'
-GOT=$(empty_branch_required_json "$ANNEX_ALL_MATRIX_NAMES")
-if [ "$GOT" != '[]' ]; then
-  fail "round-7 regression setup: expected empty_branch_required_json(no derivable names) = [], got $GOT"
-fi
+# checks (which post-round-10 always wipes ROLLUP_JSON unconditionally,
+# per the section-2 assertion above) while the annex genuinely exists as
+# all-matrix and has a REPORTED matrix-leg failure. The fixed script scans
+# a rollup frozen BEFORE that wipe (ANNEX_SCAN_ROLLUP_JSON in the real
+# script; simulated here by passing the ORIGINAL rollup straight to
+# annex_workflow_bad, exactly as the fix does) -- confirming the failure
+# is still caught even with ROLLUP_JSON wiped and REQUIRED_JSON empty.
 GOT=$(annex_workflow_bad "$ROLLUP_MATRIX_LEG_FAILED" "consumer-annex" | jq -c '[.[].label]')
 if [ "$GOT" = '["checks (20)"]' ]; then
   pass "workflow-wide scan: an all-matrix annex's reported leg failure is still caught when branch protection has no required checks (#655 round 7 P1)"
@@ -466,26 +493,42 @@ else
 fi
 
 # ── 4. End-to-end: union of the required-name-scoped BAD_CHECKS and the
-#      workflow-wide scan (#655 round 5), mirroring how the real script
-#      merges them before computing BAD_COUNT.
-AUGMENTED=$(merge_required 'lint' "$ANNEX_CONVENTIONAL")
-GOT=$(bad_checks "$ROLLUP_ANNEX_REPORTED_BAD" "$AUGMENTED" | jq -c '[.[].label]')
-if [ "$GOT" = '["repo-lint-local"]' ]; then
-  pass "end-to-end: a red conventional-named annex check blocks via the name-scoped filter (round 1)"
+#      workflow-wide scan, mirroring how the real script merges them
+#      before computing BAD_COUNT. Post-round-10, REQUIRED_JSON is JUST
+#      branch protection's own required names (BRANCH_PROTECTION_NAMES
+#      below) -- the annex is no longer merged into it, so the name-scoped
+#      filter alone can no longer see the annex AT ALL (whether
+#      conventional-named or matrix-leg); the workflow-wide scan is the
+#      SOLE annex-enforcement path now, unconditionally, regardless of
+#      REQUIRED_JSON. This is the intended fix for Finding 2's
+#      name-collision risk, not a regression: it means a same-named
+#      unrelated check (allowed by the annex contract) can never stand in
+#      for -- or be wrongly blocked by -- the annex.
+BRANCH_PROTECTION_NAMES='["lint"]'
+GOT=$(bad_checks "$ROLLUP_ANNEX_REPORTED_BAD" "$BRANCH_PROTECTION_NAMES" | jq -c '[.[].label]')
+if [ "$GOT" = '[]' ]; then
+  pass "end-to-end: the name-scoped filter alone no longer sees a red conventional-named annex check post-round-10 (workflow-wide scan is the sole path now)"
 else
-  fail "end-to-end (red conventional, name-scoped): expected [\"repo-lint-local\"], got $GOT"
+  fail "end-to-end (red conventional, name-scoped alone): expected [] (annex no longer name-merged), got $GOT"
+fi
+UNIONED_CONVENTIONAL=$(echo "$(bad_checks "$ROLLUP_ANNEX_REPORTED_BAD" "$BRANCH_PROTECTION_NAMES")" | jq -c --argjson extra "$(annex_workflow_bad "$ROLLUP_ANNEX_REPORTED_BAD" "repo-lint-local")" '(. + $extra) | unique')
+GOT=$(echo "$UNIONED_CONVENTIONAL" | jq -c '[.[].label]')
+if [ "$GOT" = '["repo-lint-local"]' ]; then
+  pass "end-to-end: unioning the workflow-wide scan catches a red conventional-named annex check the name-scoped filter alone now misses (#655 round 10)"
+else
+  fail "end-to-end (red conventional, unioned): expected [\"repo-lint-local\"], got $GOT"
 fi
 
-# The matrix-leg failure is invisible to the name-scoped filter (its
-# required_names never contains the expanded "checks (20)"), but IS caught
-# once unioned with the workflow-wide scan -- exactly like the real script.
-GOT=$(bad_checks "$ROLLUP_MATRIX_LEG_FAILED" "$AUGMENTED" | jq -c '[.[].label]')
+# The matrix-leg failure was ALREADY invisible to the name-scoped filter
+# even before round 10 (its required_names never contained the expanded
+# "checks (20)"); unioning the workflow-wide scan still catches it.
+GOT=$(bad_checks "$ROLLUP_MATRIX_LEG_FAILED" "$BRANCH_PROTECTION_NAMES" | jq -c '[.[].label]')
 if [ "$GOT" = '[]' ]; then
   pass "end-to-end: confirms the matrix-leg failure is invisible to the name-scoped filter alone"
 else
   fail "end-to-end (matrix leg, name-scoped only): expected [] (invisible without the workflow scan), got $GOT"
 fi
-UNIONED=$(echo "$(bad_checks "$ROLLUP_MATRIX_LEG_FAILED" "$AUGMENTED")" | jq -c --argjson extra "$(annex_workflow_bad "$ROLLUP_MATRIX_LEG_FAILED" "consumer-annex")" '(. + $extra) | unique')
+UNIONED=$(echo "$(bad_checks "$ROLLUP_MATRIX_LEG_FAILED" "$BRANCH_PROTECTION_NAMES")" | jq -c --argjson extra "$(annex_workflow_bad "$ROLLUP_MATRIX_LEG_FAILED" "consumer-annex")" '(. + $extra) | unique')
 GOT=$(echo "$UNIONED" | jq -c '[.[].label]')
 if [ "$GOT" = '["checks (20)"]' ]; then
   pass "end-to-end: unioning the workflow-wide scan catches the matrix-leg failure the name-scoped filter alone misses (#655 round 5)"
@@ -494,20 +537,44 @@ else
 fi
 
 ROLLUP_SKIPPED_ANNEX='{"statusCheckRollup":[{"name":"lint","conclusion":"SUCCESS"},{"name":"repo-lint-local","conclusion":"SKIPPED"}]}'
-GOT=$(bad_checks "$ROLLUP_SKIPPED_ANNEX" "$AUGMENTED" | jq -c '[.[].label]')
+UNIONED_SKIPPED=$(echo "$(bad_checks "$ROLLUP_SKIPPED_ANNEX" "$BRANCH_PROTECTION_NAMES")" | jq -c --argjson extra "$(annex_workflow_bad "$ROLLUP_SKIPPED_ANNEX" "repo-lint-local")" '(. + $extra) | unique')
+GOT=$(echo "$UNIONED_SKIPPED" | jq -c '[.[].label]')
 if [ "$GOT" = '[]' ]; then
   pass "end-to-end: a SKIPPED annex check (job-level conditional) does not block, consistent with SUCCESS/SKIPPED/NEUTRAL elsewhere"
 else
   fail "end-to-end (skipped annex): expected [] (non-blocking), got $GOT"
 fi
 
-# Pre-#655 regression guard: without any annex awareness at all, a red
-# conventional-named annex check was invisible to the filter.
-GOT=$(bad_checks "$ROLLUP_ANNEX_REPORTED_BAD" '["lint"]' | jq -c '[.[].label]')
+# Finding 2's EXACT scenario reproduced end-to-end: branch protection
+# requires ONLY "lint". The annex's OWN job happens to be named "test"
+# (the annex contract does not require unique job names). An UNRELATED,
+# non-required check from a completely different workflow COINCIDENTALLY
+# also happens to be named "test" and is red -- pre-round-10, merging the
+# annex's derived name ("test") into REQUIRED_JSON would have made this
+# unrelated check "required" too, wrongly blocking gate (a) with a fully
+# green annex. Post-round-10 (no merge), required_names stays ["lint"]
+# alone, so neither "test"-named check is in scope for the name-based
+# filter at all -- but the ANNEX's own "test" job is STILL correctly
+# caught if red, via the workflow-wide scan matching by workflow identity
+# (immune to the name collision the unrelated check shares).
+ROLLUP_NAME_COLLISION='{"statusCheckRollup":[{"name":"lint","workflowName":"repo-lint","conclusion":"SUCCESS"},{"name":"test","workflowName":"Consumer Annex","conclusion":"FAILURE"},{"name":"test","workflowName":"Some Unrelated Optional Workflow","conclusion":"FAILURE"}]}'
+GOT=$(bad_checks "$ROLLUP_NAME_COLLISION" "$BRANCH_PROTECTION_NAMES" | jq -c '[.[].workflow]')
 if [ "$GOT" = '[]' ]; then
-  pass "confirms the pre-#655 bug shape: without annex awareness, a red repo-lint-local is invisible to BAD_CHECKS"
+  pass "end-to-end (Finding 2): the name-scoped filter alone does not see EITHER same-named 'test' check, since neither is in required_names post-round-10"
 else
-  fail "expected the unaugmented filter to reproduce the pre-#655 miss ([]), got $GOT"
+  fail "end-to-end (Finding 2, name-scoped alone): expected [] (no annex-name merge to widen scope), got $GOT"
+fi
+GOT=$(annex_workflow_bad "$ROLLUP_NAME_COLLISION" "Consumer Annex" | jq -c '[.[].workflow]')
+if [ "$GOT" = '["Consumer Annex"]' ]; then
+  pass "end-to-end (Finding 2): the workflow-wide scan still catches the annex's own red 'test' job, unconfused by the unrelated same-named check"
+else
+  fail "end-to-end (Finding 2, workflow-wide scan): expected [\"Consumer Annex\"] only (not the unrelated same-named check), got $GOT"
+fi
+GOT=$(annex_workflow_bad "$ROLLUP_NAME_COLLISION" "Some Unrelated Optional Workflow" | jq -c '[.[].workflow]')
+if [ "$GOT" = '["Some Unrelated Optional Workflow"]' ]; then
+  pass "end-to-end (Finding 2 sanity): the unrelated workflow's own red check would ONLY surface if IT were the scanned workflow, confirming the scan is workflow-scoped not name-scoped"
+else
+  fail "end-to-end (Finding 2 sanity): expected the unrelated workflow scan to only see its own entry, got $GOT"
 fi
 
 echo ""

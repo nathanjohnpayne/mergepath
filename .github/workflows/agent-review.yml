@@ -1145,8 +1145,25 @@ jobs:
               # workflow will NEVER run for a resynchronized PRs current
               # HEAD, so treating that as unfiltered would wait forever:
               # the exact permanent-deadlock class rounds 2-5 already
-              # fought to eliminate for the paths case. Any of the five
-              # keys now disqualifies "unfiltered".
+              # fought to eliminate for the paths case.
+              #
+              # #655 Codex P1 round 10 ("treat synchronize-enabled types
+              # as runnable", found on the codex-review-check.sh copy of
+              # this same logic and mirrored here): round 9 disqualified
+              # "unfiltered" on the MERE presence of a types key, but
+              # types is not a narrowing filter the way paths/branches
+              # are -- it selects WHICH pull_request activities trigger
+              # this workflow at all, and the GitHub default (when types
+              # is omitted) is [opened, synchronize, reopened]. An
+              # explicit types list that STILL includes synchronize (the
+              # activity that fires for a resynchronized PRs current
+              # HEAD) is therefore just as unfiltered as omitting types
+              # entirely -- the common explicit form
+              # `types: [opened, synchronize, reopened]` was being
+              # wrongly disqualified. Only a types list that EXCLUDES
+              # synchronize actually means this workflow never runs for
+              # that HEAD, so types gets its own check below rather than
+              # joining the generic filter-key list.
               #
               # #655 Codex P2 round 9 ("wait for valid push-only annex
               # workflows"): check_ci_scripts_wired accepts push OR
@@ -1166,12 +1183,15 @@ jobs:
                 when Hash
                   next false unless on.key?(event)
                   cfg = on[event]
-                  !(cfg.is_a?(Hash) && filter_keys.any? { |k| cfg.key?(k) })
+                  next true unless cfg.is_a?(Hash)
+                  next false if filter_keys.any? { |k| cfg.key?(k) }
+                  next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")
+                  true
                 else
                   false
                 end
               end
-              pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore", "types"]
+              pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore"]
               push_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore"]
               pr_unfiltered = trigger_unfiltered.call("pull_request", pr_filter_keys)
               push_unfiltered = trigger_unfiltered.call("push", push_filter_keys)

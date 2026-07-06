@@ -240,14 +240,23 @@ assert_grep "agent-review: a path-filtered annex with zero reported entries stil
 
 # Codex P2 (#655 round 9, "honor non-path pull_request filters before
 # waiting"): round 8 checked only paths/paths-ignore on the pull_request
-# config. A types list excluding synchronize (e.g. types: [opened] only)
-# means the workflow will NEVER run for a resynchronized PRs current HEAD,
-# so treating that as unfiltered would wait forever -- the exact
-# permanent-deadlock class rounds 2-5 already fought to eliminate for the
-# paths case. branches/branches-ignore/types must all disqualify
-# "unfiltered" alongside paths/paths-ignore.
-assert_grep "agent-review: disqualifies unfiltered on branches/branches-ignore/types, not just paths/paths-ignore (#655 round 9)" \
-  "$W/agent-review.yml" 'pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore", "types"]'
+# config. branches/branches-ignore must also disqualify "unfiltered"
+# alongside paths/paths-ignore (types is handled separately below, since
+# round 10 found it needs different treatment).
+assert_grep "agent-review: disqualifies unfiltered on branches/branches-ignore, alongside paths/paths-ignore (#655 round 9)" \
+  "$W/agent-review.yml" 'pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore"]'
+
+# Codex P1 (#655 round 10, found on the codex-review-check.sh copy of this
+# same logic and mirrored here): round 9 disqualified "unfiltered" on the
+# MERE PRESENCE of a types key, but types selects WHICH pull_request
+# activities trigger the workflow at all (GitHub default when omitted is
+# [opened, synchronize, reopened]) rather than narrowing by path/branch.
+# An explicit `types: [opened, synchronize, reopened]` -- functionally
+# identical to omitting types -- was wrongly disqualified. Only a types
+# list that EXCLUDES synchronize should disqualify, since that is the
+# activity that fires for a resynchronized PRs current HEAD.
+assert_grep "agent-review: treats a types list that includes synchronize as unfiltered, not merely absent (#655 round 10)" \
+  "$W/agent-review.yml" 'next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")'
 
 # Codex P2 (#655 round 9, "wait for valid push-only annex workflows"):
 # check_ci_scripts_wired accepts push OR pull_request as valid annex
