@@ -249,7 +249,7 @@ if [ "${1:-}" = "--paginate" ]; then
 fi
 endpoint="${1:-}"
 case "$endpoint" in
-  repos/example/repo/git/trees/reviewed?recursive=1|repos/example/repo/git/trees/updated?recursive=1|repos/example/repo/git/trees/updated-tree?recursive=1)
+  repos/example/repo/git/trees/reviewed?recursive=1|repos/example/repo/git/trees/updated?recursive=1|repos/example/repo/git/trees/updated-tree?recursive=1|repos/example/repo/git/trees/intermediate?recursive=1)
     cat <<'JSON'
 {"truncated":false,"tree":[
   {"path":".github/dependabot.yml","mode":"100644","type":"blob","sha":"same-dependabot-blob"},
@@ -287,6 +287,10 @@ JSON
       cat <<'JSON'
 [{"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"reviewed","submitted_at":"2026-07-06T11:00:00Z","state":"COMMENTED"}]
 JSON
+    elif [ "${STUB_INTERMEDIATE_REVIEW:-}" = "1" ]; then
+      cat <<'JSON'
+[{"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"intermediate","submitted_at":"2026-07-06T11:00:00Z","state":"COMMENTED"}]
+JSON
     else
       echo '[]'
     fi
@@ -299,6 +303,13 @@ JSON
       echo "reviewed"
     else
       echo '{"sha":"reviewed"}'
+    fi
+    ;;
+  repos/example/repo/commits/intermediate)
+    if [ "${2:-}" = "--jq" ]; then
+      echo "intermediate"
+    else
+      echo '{"sha":"intermediate"}'
     fi
     ;;
   *)
@@ -391,6 +402,15 @@ if [ "$(echo "$carry_source_review_json" | jq -r .carried)" = "false" ]; then
 else
   fail=$((fail + 1))
   echo "  FAIL: external review carry-forward ignored a newer source-commit Codex review signal" >&2
+fi
+
+carry_intermediate_review_json=$(STUB_INTERMEDIATE_REVIEW=1 PATH="$fp_stub:$PATH" bash "$CARRYFORWARD" --repo example/repo --pr 7 --head updated --current-fingerprint "$updated_fp" --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+if [ "$(echo "$carry_intermediate_review_json" | jq -r .carried)" = "false" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review carry-forward blocks newer non-affirmative Codex signals with the same fingerprint"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review carry-forward ignored a newer same-fingerprint Codex review signal" >&2
 fi
 
 rm -rf "$fp_tmp"

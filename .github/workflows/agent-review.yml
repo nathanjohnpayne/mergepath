@@ -230,8 +230,10 @@ jobs:
             } catch (e) {
               core.warning(
                 `External-review fingerprint calculation failed; ` +
-                `labeling fail-closed using threshold/protected-path result (${e.message}).`
+                `labeling fail-closed (${e.message}).`
               );
+              needsExternal = true;
+              externalReviewFingerprint = '';
             }
 
             // PROPAGATION-LANE-DEFER (#656): this job and pr-review-policy.yml's

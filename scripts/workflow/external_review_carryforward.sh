@@ -236,6 +236,68 @@ while IFS=$'\t' read -r source_time source_sha; do
     continue
   fi
 
+  NEWER_SIGNALS=$(jq -n -r \
+    --arg bot "$BOT_LOGIN" \
+    --arg source_time "$source_time" \
+    --argjson comments "$COMMENTS_JSON" \
+    --argjson reviews "$REVIEWS_JSON" '
+    def verdict_shas($body):
+      [ $body
+        | ascii_downcase
+        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
+        | .[0]
+      ];
+    ([
+      $comments[]
+      | select(.user.login == $bot)
+      | . as $c
+      | verdict_shas($c.body)[] as $sha
+      | {
+          kind: "verdict",
+          time: ($c.created_at // ""),
+          sha: $sha,
+          affirmative: ($c.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b"))
+        }
+    ] + [
+      $reviews[]
+      | select(.user.login == $bot)
+      | {kind: "review", time: (.submitted_at // ""), sha: (.commit_id // ""), affirmative: false}
+    ])
+    | map(select(.time != "" and .sha != "" and .time > $source_time and .affirmative != true))
+    | sort_by(.time)
+    | reverse
+    | .[]
+    | [.time, .sha, .kind]
+    | @tsv
+  ')
+  blocked_by_newer_same_fingerprint=false
+  while IFS=$'\t' read -r signal_time signal_sha signal_kind; do
+    [ -n "$signal_sha" ] || continue
+    signal_resolved=""
+    signal_lc=$(printf '%s' "$signal_sha" | tr '[:upper:]' '[:lower:]')
+    case "$HEAD_LC" in
+      "$signal_lc"*) signal_resolved="$HEAD_SHA" ;;
+    esac
+    if [ -z "$signal_resolved" ]; then
+      signal_resolved=$(gh api "repos/$REPO/commits/$signal_sha" --jq .sha 2>/dev/null || true)
+    fi
+    [ -n "$signal_resolved" ] || continue
+
+    set +e
+    SIGNAL_JSON=$(bash "$FINGERPRINT_BIN" --repo "$REPO" --pr "$PR_NUMBER" --ref "$signal_resolved" --config "$CONFIG" --files-json "$FILES_JSON_PATH" 2>/dev/null)
+    signal_fp_rc=$?
+    set -e
+    [ "$signal_fp_rc" -eq 0 ] || continue
+    SIGNAL_FINGERPRINT=$(printf '%s' "$SIGNAL_JSON" | jq -r '.fingerprint // ""')
+    if [ "$SIGNAL_FINGERPRINT" = "$CURRENT_FINGERPRINT" ]; then
+      blocked_by_newer_same_fingerprint=true
+      break
+    fi
+  done <<<"$NEWER_SIGNALS"
+  if [ "$blocked_by_newer_same_fingerprint" = "true" ]; then
+    continue
+  fi
+
   set +e
   SOURCE_JSON=$(bash "$FINGERPRINT_BIN" --repo "$REPO" --pr "$PR_NUMBER" --ref "$resolved_sha" --config "$CONFIG" --files-json "$FILES_JSON_PATH" 2>/dev/null)
   fp_rc=$?
