@@ -19,7 +19,7 @@ while IFS= read -r -d '' file; do
     scripts/sweep-unresolved-feedback/*) continue ;; # workflow/reporting surface, #412
     scripts/post-phase-4b-handoff.sh) continue ;;    # GraphQL read helper, #412
     scripts/ci/*) continue ;;                        # tests/checks intentionally stub gh
-    */examples/*) continue ;;                        # illustrative example scripts (e.g. gh-projects/examples/), not operational agent flow — a consumer's stray example must not break the required lint
+    scripts/gh-projects/examples/*) continue ;;      # illustrative example scripts under the ONE intended examples path, not operational agent flow. Deliberately NOT a broad */examples/* match: an operational script placed under some other examples/ dir must still get the bare-gh-write guard (#700).
   esac
   FILES+=("$file")
 done < <(find "$REPO_ROOT/scripts" -type f -print0 | LC_ALL=C sort -z)
