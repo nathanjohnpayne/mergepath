@@ -242,6 +242,23 @@ printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"looks good\",\"findings\":[
 mk_fake fake-claude-secret-leak \
   "if [ -n \"\${GOOGLE_APPLICATION_CREDENTIALS:-}\${CF_API_TOKEN:-}\${CLOUDFLARE_API_TOKEN:-}\${OP_PREFLIGHT_ADC_TMPFILE:-}\${OP_PREFLIGHT_FIREBASE_SA_TMPFILE:-}\${SSH_AUTH_SOCK:-}\${AWS_ACCESS_KEY_ID:-}\${AZURE_CLIENT_SECRET:-}\${FIREBASE_TOKEN:-}\" ]; then echo SECRET-ENV-LEAKED >&2; exit 7; fi
 printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"ok\",\"findings\":[]}'"
+# #696 finding 1: the reviewer-CLI --version probe must run through the same
+# SAFE_ENV scrub as the review call. These fakes record, into
+# \$P4B_VERSION_PROBE_LEAK, any credential env var visible DURING the --version
+# invocation; a scrubbed probe leaves the file empty. Any other invocation
+# (the review call) prints a normal verdict.
+mk_fake fake-codex-version-probe-leak \
+  "if [ \"\${1:-}\" = '--version' ]; then
+  [ -n \"\${GH_TOKEN:-}\${OP_PREFLIGHT_REVIEWER_PAT:-}\${OP_PREFLIGHT_AUTHOR_PAT:-}\${OPENAI_API_KEY:-}\${CODEX_API_KEY:-}\" ] && echo VERSION-PROBE-LEAK >> \"\${P4B_VERSION_PROBE_LEAK:-/dev/null}\"
+  echo 'codex-cli 9.9.9'; exit 0
+fi
+printf '%s' '{\"verdict\":\"APPROVED\",\"summary\":\"ok\",\"findings\":[]}'"
+mk_fake fake-claude-version-probe-leak \
+  "if [ \"\${1:-}\" = '--version' ]; then
+  [ -n \"\${GH_TOKEN:-}\${OP_PREFLIGHT_REVIEWER_PAT:-}\${OP_PREFLIGHT_AUTHOR_PAT:-}\${ANTHROPIC_API_KEY:-}\${ANTHROPIC_AUTH_TOKEN:-}\" ] && echo VERSION-PROBE-LEAK >> \"\${P4B_VERSION_PROBE_LEAK:-/dev/null}\"
+  echo 'claude 9.9.9'; exit 0
+fi
+jq -n --arg r '{\"verdict\":\"APPROVED\",\"summary\":\"ok\",\"findings\":[]}' '{type:\"result\",subtype:\"success\",result:\$r,session_id:\"t\"}'"
 mk_fake fake-codex-sandbox \
   "shift 3
 while [ \"\$#\" -gt 0 ]; do
@@ -985,6 +1002,54 @@ if [ "$rc" = 0 ] \
   pass "trim: placeholder-aware loop keeps omitting so a fit-able diff isn't spuriously rejected (#636 P2)"
 else fail "trim placeholder accounting (rc=$rc, out=$p2_out, max=$p2_max, omitted=$(printf '%s\n' "$rep" | grep -c .))"; fi
 
+# #697: a `diff --git` header whose path contains the literal " b/" (e.g.
+# `a/foo b/bar b/foo b/bar` for the edit of `foo b/bar`) must resolve to the
+# correct new path in BOTH the omit report and the placeholder disclosure, not
+# the greedy last-" b/" tail (`bar`). The omit decision is keyed by index, so
+# the section is still dropped; the finding is that the DISCLOSURE named the
+# wrong file.
+TRIM_SPACEY="$WORK/trim-spacey.diff"
+{
+  printf 'diff --git a/keep.js b/keep.js\n+ok\n'
+  printf 'diff --git a/data/foo b/bar.jsonl b/data/foo b/bar.jsonl\n'
+  awk 'BEGIN { for (i = 0; i < 200; i++) printf "+SPACEY-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$TRIM_SPACEY"
+set +e
+rep="$(p4b_trim_review_diff "$TRIM_SPACEY" "$TRIM_OUT" 2000 'data/*')"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && printf '%s\n' "$rep" | grep -q "^data/foo b/bar.jsonl$(printf '\t')" \
+   && grep -qF '[phase-4b diff-budget: data/foo b/bar.jsonl omitted' "$TRIM_OUT" \
+   && ! grep -q 'SPACEY-' "$TRIM_OUT"; then
+  pass "trim: header path containing \" b/\" names the correct new path in report + placeholder (#697)"
+else fail "trim spacey b/ path (rc=$rc, report='${rep:-}', placeholder=$(grep -o '\[phase-4b diff-budget:[^]]*' "$TRIM_OUT" | head -1))"; fi
+
+# #712 finding: a RENAME whose header (a != b) concatenated text carries an
+# earlier SYMMETRIC " b/" split must be disclosed as its AUTHORITATIVE rename-to
+# destination, not the synthetic header midpoint. Renaming `data/a b/data/a
+# b/data/a` -> `data/a` yields header `a/data/a b/data/a b/data/a b/data/a`,
+# whose rest `data/a b/data/a b/data/a b/data/a` has a symmetric split at the
+# middle (`data/a b/data/a` == `data/a b/data/a`) — the pre-fix heuristic would
+# name that midpoint. The `rename to data/a` line is authoritative. Both sides
+# are under data/* so the section is omission-eligible.
+TRIM_RSPLIT="$WORK/trim-rename-split.diff"
+{
+  printf 'diff --git a/keep.js b/keep.js\n+ok\n'
+  printf 'diff --git a/data/a b/data/a b/data/a b/data/a\n'
+  printf 'similarity index 95%%\nrename from data/a b/data/a b/data/a\nrename to data/a\n'
+  awk 'BEGIN { for (i = 0; i < 200; i++) printf "+RSPLIT-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'
+} > "$TRIM_RSPLIT"
+set +e
+rep="$(p4b_trim_review_diff "$TRIM_RSPLIT" "$TRIM_OUT" 2000 'data/*')"; rc=$?
+set -e
+if [ "$rc" = 0 ] \
+   && printf '%s\n' "$rep" | grep -q "^data/a$(printf '\t')" \
+   && grep -qF '[phase-4b diff-budget: data/a omitted' "$TRIM_OUT" \
+   && ! grep -qF 'data/a b/data/a omitted' "$TRIM_OUT" \
+   && ! grep -q 'RSPLIT-' "$TRIM_OUT"; then
+  pass "trim: rename header with a spurious symmetric \" b/\" split names the real rename-to path (#712)"
+else fail "trim rename-split b/ path (rc=$rc, report='${rep:-}', placeholder=$(grep -o '\[phase-4b diff-budget:[^]]*' "$TRIM_OUT" | head -1))"; fi
+
 # stderr tail: sanitized single line; empty for a missing/empty file
 ERRF="$WORK/stderr-sample.txt"
 printf 'line one\nstream error: exceeded context window\n' > "$ERRF"
@@ -996,6 +1061,36 @@ got="$(p4b_stderr_tail "$ERRF")"
 got="$(p4b_stderr_tail "$ERRF")"
 [ -z "$got" ] && pass "stderr tail is empty for an empty file" \
   || fail "stderr tail empty-file (got '${got:-}')"
+
+# #696 finding 2: the tail is interpolated into p4b_die messages that reach
+# logs and the manual-fallback comment, so obvious credential patterns must be
+# masked before it is returned. Feed a stderr line carrying several secret
+# shapes and assert none survive verbatim while a [REDACTED] marker appears.
+printf 'auth error: ghp_ABCdef0123456789ghijkl rejected; OPENAI sk-proj-9zXcVbNm12345 bad; Authorization: Bearer eyJhbGciOi.payload.sig; token=supersecretvalue key=anotherKey123; github_pat_11ABCDEZ0_taildata\n' > "$ERRF"
+got="$(p4b_stderr_tail "$ERRF")"
+if printf '%s' "$got" | grep -q 'REDACTED' \
+   && ! printf '%s' "$got" | grep -q 'ghp_ABCdef0123456789ghijkl' \
+   && ! printf '%s' "$got" | grep -q 'sk-proj-9zXcVbNm12345' \
+   && ! printf '%s' "$got" | grep -q 'eyJhbGciOi.payload.sig' \
+   && ! printf '%s' "$got" | grep -q 'supersecretvalue' \
+   && ! printf '%s' "$got" | grep -q 'anotherKey123' \
+   && ! printf '%s' "$got" | grep -q 'github_pat_11ABCDEZ0_taildata'; then
+  pass "stderr tail redacts token/key/bearer/pat secret patterns (#696)"
+else fail "stderr tail redaction (got '${got:-}')"; fi
+
+# #712 finding: env-style UPPERCASE credential labels (PASSWORD=, TOKEN=,
+# SECRET=, API_KEY=, AUTHORIZATION=) must be redacted too — the label match is
+# fully case-insensitive, not Title/lowercase-only.
+printf 'auth error: PASSWORD=hunter2upper TOKEN=UPPERtok123 SECRET=UPPERsec456 API_KEY=UPPERkey789 AUTHORIZATION=UPPERauth012\n' > "$ERRF"
+got="$(p4b_stderr_tail "$ERRF")"
+if printf '%s' "$got" | grep -q 'REDACTED' \
+   && ! printf '%s' "$got" | grep -q 'hunter2upper' \
+   && ! printf '%s' "$got" | grep -q 'UPPERtok123' \
+   && ! printf '%s' "$got" | grep -q 'UPPERsec456' \
+   && ! printf '%s' "$got" | grep -q 'UPPERkey789' \
+   && ! printf '%s' "$got" | grep -q 'UPPERauth012'; then
+  pass "stderr tail redacts UPPERCASE env-style credential labels (#712)"
+else fail "stderr tail uppercase redaction (got '${got:-}')"; fi
 
 unset MERGEPATH_REVIEW_POLICY_PATH
 
@@ -1304,6 +1399,30 @@ set -e
 if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ]; then
   pass "claude adapter allowlists child env and strips deploy/cloud credentials"
 else fail "claude adapter leaked deploy/cloud credential env to CLI (rc=$rc, out=$out)"; fi
+
+# #696 finding 1: the --version probe must also run under SAFE_ENV. With the
+# tokens set in the parent env, a probe that skipped the scrub would let the
+# fake see them and append to the leak file. Assert the file stays empty AND
+# the review still produces a verdict.
+VPROBE_LEAK="$WORK/version-probe-leak-codex"; : > "$VPROBE_LEAK"
+set +e
+out="$(GH_TOKEN=ghp-reviewer OP_PREFLIGHT_REVIEWER_PAT=ghp-reviewer OP_PREFLIGHT_AUTHOR_PAT=ghp-author \
+  OPENAI_API_KEY=sk-live-openai CODEX_API_KEY=codex-key P4B_VERSION_PROBE_LEAK="$VPROBE_LEAK" \
+  CODEX_BIN="$BIN/fake-codex-version-probe-leak" bash "$AD_CODEX" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ] && [ ! -s "$VPROBE_LEAK" ]; then
+  pass "codex adapter runs the --version probe through SAFE_ENV (no token leak, #696)"
+else fail "codex --version probe leaked env (rc=$rc, leak='$(cat "$VPROBE_LEAK")', out=$out)"; fi
+
+VPROBE_LEAK_CL="$WORK/version-probe-leak-claude"; : > "$VPROBE_LEAK_CL"
+set +e
+out="$(GH_TOKEN=ghp-reviewer OP_PREFLIGHT_REVIEWER_PAT=ghp-reviewer OP_PREFLIGHT_AUTHOR_PAT=ghp-author \
+  ANTHROPIC_API_KEY=sk-ant ANTHROPIC_AUTH_TOKEN=ant-tok P4B_VERSION_PROBE_LEAK="$VPROBE_LEAK_CL" \
+  CLAUDE_BIN="$BIN/fake-claude-version-probe-leak" bash "$AD_CLAUDE" --pr 1 --repo o/r --diff-file "$DIFF")"; rc=$?
+set -e
+if [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.verdict')" = "APPROVED" ] && [ ! -s "$VPROBE_LEAK_CL" ]; then
+  pass "claude adapter runs the --version probe through SAFE_ENV (no token leak, #696)"
+else fail "claude --version probe leaked env (rc=$rc, leak='$(cat "$VPROBE_LEAK_CL")', out=$out)"; fi
 
 set +e
 out="$(P4B_CODEX_SANDBOX=danger-full-access CODEX_BIN="$BIN/fake-codex-sandbox" \

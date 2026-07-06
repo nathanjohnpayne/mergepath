@@ -30,7 +30,15 @@ check() { # check <label> <condition-rc>
   fi
 }
 
-reflow() { "$PYTHON" "$REFLOW" --write "$1" >/dev/null 2>&1; }
+reflow() { # reflow <file> — runs md_reflow --write and REPORTS a non-zero
+  # exit as a FAIL via check(), instead of aborting the whole suite under
+  # set -e (the #699 fix) or silently swallowing the failure (the bug that
+  # fix introduced: `|| true` alone would let a crashed --write pass every
+  # downstream assertion that merely checks the file's post-state).
+  local rc=0
+  "$PYTHON" "$REFLOW" --write "$1" >/dev/null 2>&1 || rc=$?
+  check "reflow --write succeeded on $1" "$rc"
+}
 
 # has_line <file> <exact-line> — whole-line fixed-string match, dash-safe.
 has_line() { grep -qxF -e "$2" "$1"; }
@@ -106,8 +114,8 @@ check "list item joined, bullet kept" \
   "$(has_line "$WORK/q.md" '- A list item that continues indented.' && echo 0 || echo 1)"
 
 # 6. Idempotent: a second pass is a no-op (--check clean).
-"$PYTHON" "$REFLOW" --check "$WORK/q.md" >/dev/null 2>&1
-check "reflowed file is --check clean (idempotent)" "$?"
+"$PYTHON" "$REFLOW" --check "$WORK/q.md" >/dev/null 2>&1 && rc=0 || rc=$?
+check "reflowed file is --check clean (idempotent)" "$rc"
 
 # 7. --check flags a not-yet-reflowed file (exit 1).
 printf 'Needs\nreflow.\n' >"$WORK/n.md"
