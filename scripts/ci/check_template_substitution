@@ -37,14 +37,17 @@ if [ ! -f "$LIB" ]; then
   exit 1
 fi
 
-# lib present AND .mergepath-sync.yml absent → mergepath misconfig
-# (manifest accidentally deleted/renamed). A present guarded artifact
-# with no manifest is a real misconfiguration, not a benign consumer
-# skip → FAIL exit 1 (fail closed).
-if [ ! -f "$MANIFEST" ]; then
-  echo "FAIL: .mergepath-sync.yml is missing but scripts/lib/template-substitution.sh IS present — mergepath misconfig (manifest accidentally deleted/renamed?)" >&2
-  exit 1
-fi
+# NOTE (#703): there is deliberately NO "lib present + manifest absent → FAIL"
+# branch here, unlike check_export_consumer_facts. That check guards
+# scripts/sync-to-downstream.sh, which is HUB-ONLY (never propagated), so its
+# presence proves a mergepath checkout and a missing manifest there is a real
+# misconfig. This lib, by contrast, IS propagated to consumers
+# (.mergepath-sync.yml line ~286) while .mergepath-sync.yml is deliberately NOT
+# (line ~974) — so "lib present + manifest absent" is the NORMAL consumer
+# state. Fail-closing on it would break check_template_substitution on every
+# consumer (the propagated test is exactly what should run here). The
+# hub-lost-lib case is already covered by the lib-missing + manifest-present
+# FAIL branch above.
 
 if [ ! -f "$TEST_SCRIPT" ]; then
   echo "check_template_substitution: ERROR (missing $TEST_SCRIPT)" >&2
