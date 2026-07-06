@@ -44,6 +44,14 @@
 #           clearance can exist only as this comment. Fail-closed: a
 #           stale-HEAD, findings-bearing, changes-requested, or
 #           unrecognized verdict does not match. OR
+#         - **Same-content carry-forward (#705):** when the current HEAD
+#           has no Codex signal of its own, an older affirmative Codex
+#           issue-comment verdict whose `Reviewed commit` has the same
+#           external-review fingerprint as the current head. The
+#           fingerprint hashes the tree object IDs for the files that
+#           triggered external review, so a pure update-branch/base-only
+#           sync does not force a redundant Codex re-review. Any current
+#           HEAD Codex signal still wins and can fail closed. OR
 #         - **Phase 4b substitute (#218):** an APPROVED review on the
 #           current HEAD (`commit_id == HEAD_SHA`) from a non-author
 #           identity in `available_reviewers`, gated on
@@ -1517,6 +1525,9 @@ fi  # end REQUIRE_CI_GREEN
 # leaves disabled repos byte-identical in behavior.
 CODEX_HEAD_VERDICT_TIME=""
 CODEX_HEAD_VERDICT_ANY_TIME=""
+CODEX_CARRYFORWARD_VERDICT_TIME=""
+CODEX_CARRYFORWARD_COMMIT=""
+CODEX_CARRYFORWARD_FINGERPRINT=""
 if [ "$CODEX_ENABLED" = "true" ]; then
   ISSUE_COMMENTS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
   # Select the LATEST HEAD-anchored Codex verdict comment FIRST (any
@@ -1566,6 +1577,35 @@ if [ "$CODEX_ENABLED" = "true" ]; then
     log "codex verdict: latest HEAD-anchored verdict @ $CODEX_HEAD_VERDICT_TIME is AFFIRMATIVE (Reviewed commit prefixes $HEAD_SHA)"
   elif [ -n "$CODEX_HEAD_VERDICT_ANY_TIME" ]; then
     log "codex verdict: latest HEAD-anchored verdict @ $CODEX_HEAD_VERDICT_ANY_TIME is NON-affirmative — not a clearance signal (fail closed); carried into the Phase 4b freshness guard"
+  fi
+
+  # Same-content carry-forward (#705): a base-only update branch produces a new
+  # HEAD SHA even when the protected/threshold-triggering content is unchanged.
+  # If a prior affirmative Codex verdict reviewed that exact content
+  # fingerprint, treat it as a fallback Codex signal for this head. This is only
+  # consulted when there is NO current-head Codex signal; the latest-signal-wins
+  # block below still lets any current-head review/verdict/reaction override it.
+  CARRY_BIN="$__CODEX_CHECK_DIR/workflow/external_review_carryforward.sh"
+  if [ -x "$CARRY_BIN" ]; then
+    set +e
+    CARRY_JSON=$(bash "$CARRY_BIN" \
+      --repo "$REPO" \
+      --pr "$PR_NUMBER" \
+      --head "$HEAD_SHA" \
+      --config "$CONFIG" \
+      --bot-login "$BOT_LOGIN" 2>/dev/null)
+    carry_rc=$?
+    set -e
+    if [ "$carry_rc" -eq 0 ] && [ "$(echo "$CARRY_JSON" | jq -r '.carried // false')" = "true" ]; then
+      CODEX_CARRYFORWARD_VERDICT_TIME=$(echo "$CARRY_JSON" | jq -r '.source_time // ""')
+      CODEX_CARRYFORWARD_COMMIT=$(echo "$CARRY_JSON" | jq -r '.source_commit // ""')
+      CODEX_CARRYFORWARD_FINGERPRINT=$(echo "$CARRY_JSON" | jq -r '.fingerprint // ""')
+      log "codex verdict carry-forward: prior affirmative verdict on $CODEX_CARRYFORWARD_COMMIT @ $CODEX_CARRYFORWARD_VERDICT_TIME matches current external-review fingerprint $CODEX_CARRYFORWARD_FINGERPRINT (#705)"
+    elif [ "$carry_rc" -ne 0 ]; then
+      log "codex verdict carry-forward: helper failed rc=$carry_rc — ignoring carry-forward and requiring a current-head signal (fail closed)"
+    fi
+  else
+    log "codex verdict carry-forward: helper missing at $CARRY_BIN — requiring a current-head signal"
   fi
 fi
 
@@ -1689,6 +1729,14 @@ if [ -z "$APPROVING_REVIEWER" ]; then
       # cross-check, not the findings check.)
       log "gate (b): same-agent + Codex HEAD-anchored verdict comment @ $CODEX_HEAD_VERDICT_TIME — branch 2 cleared (#600)"
       APPROVING_REVIEWER="(branch 2: same-agent + Codex verdict comment)"
+    elif [ -n "$CODEX_CARRYFORWARD_VERDICT_TIME" ]; then
+      # #705: a pure update-branch/base-only sync can move HEAD without
+      # changing the external-review-triggering content. In the same-agent
+      # path, the prior clean Codex verdict on the identical fingerprint is
+      # still the cross-agent signal; gate (c) below separately ensures no
+      # current-head Codex signal overrides it.
+      log "gate (b): same-agent + Codex same-content verdict carry-forward @ $CODEX_CARRYFORWARD_VERDICT_TIME from $CODEX_CARRYFORWARD_COMMIT — branch 2 cleared (#705)"
+      APPROVING_REVIEWER="(branch 2: same-agent + Codex same-content verdict)"
     fi
   fi
 
@@ -1864,6 +1912,11 @@ for __sig in "thumbs|$LATEST_THUMBS_UP_TIME" "review|$CODEX_REVIEW_TIME" "verdic
   fi
 done
 
+if [ -z "$LATEST_SIGNAL_KIND" ] && [ -n "$CODEX_CARRYFORWARD_VERDICT_TIME" ]; then
+  LATEST_SIGNAL_KIND="carry_verdict"
+  LATEST_SIGNAL_TIME="$CODEX_CARRYFORWARD_VERDICT_TIME"
+fi
+
 case "$LATEST_SIGNAL_KIND" in
   thumbs)
     CLEARED=true
@@ -1882,6 +1935,10 @@ case "$LATEST_SIGNAL_KIND" in
     else
       log "gate (c): latest Codex signal is a non-affirmative or findings-bearing verdict comment @ $LATEST_SIGNAL_TIME — fail closed, does not clear (#608 P1)"
     fi
+    ;;
+  carry_verdict)
+    CLEARED=true
+    CLEARANCE_REASON="no current-head Codex signal; prior affirmative verdict @ $LATEST_SIGNAL_TIME on $CODEX_CARRYFORWARD_COMMIT carries forward because the external-review fingerprint is unchanged ($CODEX_CARRYFORWARD_FINGERPRINT) (#705)"
     ;;
 esac
 

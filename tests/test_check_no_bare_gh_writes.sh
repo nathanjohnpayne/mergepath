@@ -61,8 +61,10 @@ assert_clean   "gh api GET not flagged"       'gh api repos/o/r/pulls/1 --jq .st
 # Exemption marker hardening — bare marker no longer bypasses.
 assert_flagged "bare exemption marker rejected" 'gh pr merge 1 --squash  # NO_BARE_GH_WRITE_EXEMPT:'
 
-# examples/ scripts are exempt (#455 wave): a consumer's stray illustrative
-# example under scripts/*/examples/ must not break the required lint.
+# examples/ scripts are exempt (#455 wave), but ONLY under the intended
+# scripts/gh-projects/examples/ path (#700). A stray illustrative example there
+# must not break the required lint; an operational script under some OTHER
+# examples/ dir must still get the guard.
 # run_check_on writes to scripts/fixture.sh, so build the examples/ layout here.
 examples_rc=0
 et="$(mktemp -d "${TMPDIR:-/tmp}/no-bare-gh-ex.XXXXXX")"
@@ -72,7 +74,19 @@ chmod +x "$et/scripts/ci/check_no_bare_gh_writes"
 printf 'gh issue edit "$n" --repo "$R" --add-assignee me\n' > "$et/scripts/gh-projects/examples/matchline/create-issues.sh"
 ( cd "$et" && ./scripts/ci/check_no_bare_gh_writes ) >/dev/null 2>&1 || examples_rc=$?
 rm -rf "$et"
-if [ "$examples_rc" -eq 0 ]; then pass "bare gh write under examples/ is exempt (clean)"; else fail "examples/ exemption: expected clean (rc 0), got rc=$examples_rc"; fi
+if [ "$examples_rc" -eq 0 ]; then pass "bare gh write under gh-projects/examples/ is exempt (clean)"; else fail "examples/ exemption: expected clean (rc 0), got rc=$examples_rc"; fi
+
+# #700: the exemption is NOT a broad */examples/* match — an operational script
+# placed under a DIFFERENT examples/ dir must still be caught.
+other_ex_rc=0
+oet="$(mktemp -d "${TMPDIR:-/tmp}/no-bare-gh-otherex.XXXXXX")"
+mkdir -p "$oet/scripts/ci" "$oet/scripts/some-tool/examples"
+cp "$CHECK" "$oet/scripts/ci/check_no_bare_gh_writes"
+chmod +x "$oet/scripts/ci/check_no_bare_gh_writes"
+printf 'gh pr merge 1 --squash\n' > "$oet/scripts/some-tool/examples/operational.sh"
+( cd "$oet" && ./scripts/ci/check_no_bare_gh_writes ) >/dev/null 2>&1 || other_ex_rc=$?
+rm -rf "$oet"
+if [ "$other_ex_rc" -eq 1 ]; then pass "bare gh write under a non-allowlisted examples/ dir is caught (#700) (flagged)"; else fail "non-allowlisted examples/: expected flag (rc 1), got rc=$other_ex_rc"; fi
 assert_clean   "exemption WITH reason honored"  'gh pr merge 1 --squash  # NO_BARE_GH_WRITE_EXEMPT: covered by gh-as-author in caller'
 
 # echo/printf substitution masking — the #533 gap. A gh WRITE hidden in an

@@ -208,6 +208,297 @@ src/auth/login.ts'
 assert_eq "end-to-end: parse output piped into matcher" "$want" "$got"
 
 echo
+echo "external_review_fingerprint.sh tests (#705)"
+
+FINGERPRINT="scripts/workflow/external_review_fingerprint.sh"
+CARRYFORWARD="scripts/workflow/external_review_carryforward.sh"
+for f in "$FINGERPRINT" "$CARRYFORWARD"; do
+  if [ ! -x "$f" ]; then
+    echo "check_workflow_parsers: missing executable required file: $f" >&2
+    exit 1
+  fi
+done
+
+fp_tmp=$(mktemp -d "${TMPDIR:-/tmp}/external-review-fp.XXXXXX")
+cat >"$fp_tmp/files.json" <<'JSON'
+[
+  {"filename":".github/dependabot.yml","additions":1,"deletions":0},
+  {"filename":"README.md","additions":2,"deletions":0}
+]
+JSON
+cat >"$fp_tmp/review-policy.yml" <<'YAML'
+external_review_threshold: 300
+external_review_paths:
+  - ".github/**"
+available_reviewers:
+  - nathanpayne-codex
+author_identity: nathanjohnpayne
+YAML
+
+fp_stub="$fp_tmp/bin"
+mkdir -p "$fp_stub"
+cat >"$fp_stub/gh" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" != "api" ]; then
+  echo "stub gh: unsupported invocation: $*" >&2
+  exit 1
+fi
+shift
+if [ "${1:-}" = "--paginate" ]; then
+  shift
+fi
+endpoint="${1:-}"
+case "$endpoint" in
+  repos/example/repo/git/trees/reviewed?recursive=1|repos/example/repo/git/trees/updated?recursive=1|repos/example/repo/git/trees/updated-tree?recursive=1|repos/example/repo/git/trees/basechanged?recursive=1)
+    cat <<'JSON'
+{"truncated":false,"tree":[
+  {"path":".github/dependabot.yml","mode":"100644","type":"blob","sha":"same-dependabot-blob"},
+  {"path":"README.md","mode":"100644","type":"blob","sha":"readme-blob"}
+]}
+JSON
+    ;;
+  repos/example/repo/git/trees/intermediate?recursive=1)
+    if [ "${STUB_INTERMEDIATE_TREE_FAIL:-}" = "1" ]; then
+      echo "stub gh: forced intermediate tree failure" >&2
+      exit 1
+    fi
+    cat <<'JSON'
+{"truncated":false,"tree":[
+  {"path":".github/dependabot.yml","mode":"100644","type":"blob","sha":"same-dependabot-blob"},
+  {"path":"README.md","mode":"100644","type":"blob","sha":"readme-blob"}
+]}
+JSON
+    ;;
+  repos/example/repo/git/trees/base-reviewed?recursive=1|repos/example/repo/git/trees/base-current?recursive=1)
+    cat <<'JSON'
+{"truncated":false,"tree":[
+  {"path":".github/dependabot.yml","mode":"100644","type":"blob","sha":"base-dependabot-blob"},
+  {"path":"README.md","mode":"100644","type":"blob","sha":"base-readme-blob"}
+]}
+JSON
+    ;;
+  repos/example/repo/git/trees/base-changed?recursive=1)
+    cat <<'JSON'
+{"truncated":false,"tree":[
+  {"path":".github/dependabot.yml","mode":"100644","type":"blob","sha":"base-changed-dependabot-blob"},
+  {"path":"README.md","mode":"100644","type":"blob","sha":"base-readme-blob"}
+]}
+JSON
+    ;;
+  repos/example/repo/git/trees/changed?recursive=1)
+    cat <<'JSON'
+{"truncated":false,"tree":[
+  {"path":".github/dependabot.yml","mode":"100644","type":"blob","sha":"changed-dependabot-blob"},
+  {"path":"README.md","mode":"100644","type":"blob","sha":"changed-readme-blob"}
+]}
+JSON
+    ;;
+  repos/example/repo/git/trees/readmechanged?recursive=1)
+    cat <<'JSON'
+{"truncated":false,"tree":[
+  {"path":".github/dependabot.yml","mode":"100644","type":"blob","sha":"same-dependabot-blob"},
+  {"path":"README.md","mode":"100644","type":"blob","sha":"changed-readme-blob"}
+]}
+JSON
+    ;;
+  repos/example/repo/pulls/7)
+    if [ "${2:-}" = "--jq" ]; then
+      echo "base-current"
+    else
+      echo '{"base":{"sha":"base-current"}}'
+    fi
+    ;;
+  repos/example/repo/compare/base-current...reviewed)
+    if [ "${2:-}" = "--jq" ]; then echo "base-reviewed"; else echo '{"merge_base_commit":{"sha":"base-reviewed"}}'; fi
+    ;;
+  repos/example/repo/compare/base-current...updated|repos/example/repo/compare/base-current...changed|repos/example/repo/compare/base-current...readmechanged|repos/example/repo/compare/base-current...commit-updated|repos/example/repo/compare/base-current...intermediate)
+    if [ "${2:-}" = "--jq" ]; then echo "base-current"; else echo '{"merge_base_commit":{"sha":"base-current"}}'; fi
+    ;;
+  repos/example/repo/compare/base-current...basechanged)
+    if [ "${2:-}" = "--jq" ]; then echo "base-changed"; else echo '{"merge_base_commit":{"sha":"base-changed"}}'; fi
+    ;;
+  repos/example/repo/issues/7/comments)
+    cat <<'JSON'
+[{"user":{"login":"chatgpt-codex-connector[bot]"},"body":"Codex Review: Didn't find any major issues.\nReviewed commit: abc1234","created_at":"2026-07-06T10:00:00Z"}]
+JSON
+    ;;
+  repos/example/repo/pulls/7/reviews)
+    if [ "${STUB_CURRENT_REVIEW:-}" = "1" ]; then
+      cat <<'JSON'
+[{"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"updated","submitted_at":"2026-07-06T11:00:00Z","state":"COMMENTED"}]
+JSON
+    elif [ "${STUB_SOURCE_REVIEW:-}" = "1" ]; then
+      cat <<'JSON'
+[{"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"reviewed","submitted_at":"2026-07-06T11:00:00Z","state":"COMMENTED"}]
+JSON
+    elif [ "${STUB_INTERMEDIATE_REVIEW:-}" = "1" ]; then
+      cat <<'JSON'
+[{"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"intermediate","submitted_at":"2026-07-06T11:00:00Z","state":"COMMENTED"}]
+JSON
+    else
+      echo '[]'
+    fi
+    ;;
+  repos/example/repo/commits/commit-updated)
+    echo '{"sha":"commit-updated","commit":{"tree":{"sha":"updated-tree"}}}'
+    ;;
+  repos/example/repo/commits/abc1234)
+    if [ "${2:-}" = "--jq" ]; then
+      echo "reviewed"
+    else
+      echo '{"sha":"reviewed"}'
+    fi
+    ;;
+  repos/example/repo/commits/intermediate)
+    if [ "${2:-}" = "--jq" ]; then
+      echo "intermediate"
+    else
+      echo '{"sha":"intermediate"}'
+    fi
+    ;;
+  *)
+    echo "stub gh: unhandled endpoint: $endpoint" >&2
+    exit 1
+    ;;
+esac
+STUB
+chmod +x "$fp_stub/gh"
+
+reviewed_json=$(PATH="$fp_stub:$PATH" bash "$FINGERPRINT" --repo example/repo --pr 7 --ref reviewed --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+updated_json=$(PATH="$fp_stub:$PATH" bash "$FINGERPRINT" --repo example/repo --pr 7 --ref updated --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+changed_json=$(PATH="$fp_stub:$PATH" bash "$FINGERPRINT" --repo example/repo --pr 7 --ref changed --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+readme_changed_json=$(PATH="$fp_stub:$PATH" bash "$FINGERPRINT" --repo example/repo --pr 7 --ref readmechanged --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+base_changed_json=$(PATH="$fp_stub:$PATH" bash "$FINGERPRINT" --repo example/repo --pr 7 --ref basechanged --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+commit_ref_json=$(PATH="$fp_stub:$PATH" bash "$FINGERPRINT" --repo example/repo --pr 7 --ref commit-updated --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+reviewed_fp=$(echo "$reviewed_json" | jq -r .fingerprint)
+updated_fp=$(echo "$updated_json" | jq -r .fingerprint)
+changed_fp=$(echo "$changed_json" | jq -r .fingerprint)
+readme_changed_fp=$(echo "$readme_changed_json" | jq -r .fingerprint)
+base_changed_fp=$(echo "$base_changed_json" | jq -r .fingerprint)
+if [ "$(echo "$reviewed_json" | jq -r .requires_review)" = "true" ] \
+   && [ "$reviewed_fp" = "$updated_fp" ] \
+   && [ "$reviewed_fp" != "$changed_fp" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review fingerprint is stable across base-only sync and changes on protected-path content"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review fingerprint stability/content-change regression" >&2
+fi
+
+if [ "$reviewed_fp" != "$readme_changed_fp" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review fingerprint changes when an under-threshold non-protected file changes after protected-path review"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review fingerprint ignored a non-protected file change after protected-path review" >&2
+fi
+
+if [ "$reviewed_fp" != "$base_changed_fp" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review fingerprint changes when the reviewed merge-base blob changes"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review fingerprint ignored a merge-base-side blob change" >&2
+fi
+
+if [ "$(echo "$commit_ref_json" | jq -r .fingerprint)" = "$updated_fp" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review fingerprint resolves commit SHAs to their tree SHAs before fetching the tree"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review fingerprint did not resolve a commit SHA to its tree SHA" >&2
+fi
+
+jq -n '[range(0;3000) | {filename:("src/file" + (. | tostring) + ".ts"), additions:1, deletions:0}]' >"$fp_tmp/files-capped.json"
+capped_json=$(PATH="$fp_stub:$PATH" bash "$FINGERPRINT" --repo example/repo --pr 7 --ref updated --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files-capped.json")
+if [ "$(echo "$capped_json" | jq -r .requires_review)" = "true" ] \
+   && [ -z "$(echo "$capped_json" | jq -r .fingerprint)" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review fingerprint fails closed when the PR files API may be capped"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review fingerprint did not fail closed on a possibly capped PR files list" >&2
+fi
+
+carry_json=$(PATH="$fp_stub:$PATH" bash "$CARRYFORWARD" --repo example/repo --pr 7 --head updated --current-fingerprint "$updated_fp" --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+if [ "$(echo "$carry_json" | jq -r .carried)" = "true" ] \
+   && [ "$(echo "$carry_json" | jq -r .source_commit)" = "reviewed" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review carry-forward accepts prior Codex verdict with matching fingerprint"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review carry-forward did not accept matching prior Codex verdict" >&2
+fi
+
+carry_changed_json=$(PATH="$fp_stub:$PATH" bash "$CARRYFORWARD" --repo example/repo --pr 7 --head changed --current-fingerprint "$changed_fp" --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+if [ "$(echo "$carry_changed_json" | jq -r .carried)" = "false" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review carry-forward rejects prior Codex verdict when fingerprint changed"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review carry-forward accepted a changed protected-path fingerprint" >&2
+fi
+
+carry_current_review_json=$(STUB_CURRENT_REVIEW=1 PATH="$fp_stub:$PATH" bash "$CARRYFORWARD" --repo example/repo --pr 7 --head updated --current-fingerprint "$updated_fp" --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+if [ "$(echo "$carry_current_review_json" | jq -r .carried)" = "false" ] \
+   && [ "$(echo "$carry_current_review_json" | jq -r .current_signal.kind)" = "review" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review carry-forward does not override a current-head Codex review signal"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review carry-forward overrode a current-head Codex review signal" >&2
+fi
+
+carry_source_review_json=$(STUB_SOURCE_REVIEW=1 PATH="$fp_stub:$PATH" bash "$CARRYFORWARD" --repo example/repo --pr 7 --head updated --current-fingerprint "$updated_fp" --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+if [ "$(echo "$carry_source_review_json" | jq -r .carried)" = "false" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review carry-forward requires the source commit's latest Codex signal to be affirmative"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review carry-forward ignored a newer source-commit Codex review signal" >&2
+fi
+
+carry_intermediate_review_json=$(STUB_INTERMEDIATE_REVIEW=1 PATH="$fp_stub:$PATH" bash "$CARRYFORWARD" --repo example/repo --pr 7 --head updated --current-fingerprint "$updated_fp" --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+if [ "$(echo "$carry_intermediate_review_json" | jq -r .carried)" = "false" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review carry-forward blocks newer non-affirmative Codex signals with the same fingerprint"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review carry-forward ignored a newer same-fingerprint Codex review signal" >&2
+fi
+
+set +e
+STUB_INTERMEDIATE_REVIEW=1 STUB_INTERMEDIATE_TREE_FAIL=1 PATH="$fp_stub:$PATH" bash "$CARRYFORWARD" --repo example/repo --pr 7 --head updated --current-fingerprint "$updated_fp" --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json" >/dev/null 2>&1
+carry_signal_fail_rc=$?
+set -e
+if [ "$carry_signal_fail_rc" -ne 0 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review carry-forward fails closed when a newer non-affirmative signal cannot be fingerprinted"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review carry-forward ignored an unclassifiable newer non-affirmative signal" >&2
+fi
+
+cat >"$fp_tmp/review-policy-codex-disabled.yml" <<'YAML'
+external_review_threshold: 300
+external_review_paths:
+  - ".github/**"
+codex:
+  enabled: false
+YAML
+carry_disabled_json=$(PATH="$fp_stub:$PATH" bash "$CARRYFORWARD" --repo example/repo --pr 7 --head updated --current-fingerprint "$updated_fp" --config "$fp_tmp/review-policy-codex-disabled.yml" --files-json "$fp_tmp/files.json")
+if [ "$(echo "$carry_disabled_json" | jq -r .carried)" = "false" ] \
+   && echo "$carry_disabled_json" | jq -e '.reason | contains("codex.enabled")' >/dev/null; then
+  pass=$((pass + 1))
+  echo "  PASS: external review carry-forward is disabled when codex.enabled is false"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review carry-forward ignored codex.enabled=false" >&2
+fi
+
+rm -rf "$fp_tmp"
+
+echo
 echo "parse_manifest_paths.sh tests — propagation PR review lane (#264)"
 
 MANIFEST_PARSE="scripts/workflow/parse_manifest_paths.sh"

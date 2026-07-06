@@ -142,15 +142,28 @@ jobs:
     outputs:
       needs_external: ${{ steps.check.outputs.needs_external }}
     steps:
+      - name: Checkout trusted workflow helpers
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # This job shells out only to trusted default-branch helpers; never
+          # run helper code from the PR head under the label-writing PAT.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
       - name: Evaluate PR against review-policy.yml
         id: check
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           THRESHOLD: ${{ needs.load-config.outputs.threshold }}
           PROTECTED_PATHS: ${{ needs.load-config.outputs.paths }}
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
         with:
           github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
           script: |
+            const childProcess = require('child_process');
+            const fs = require('fs');
+            const os = require('os');
+            const path = require('path');
             const pr = context.payload.pull_request;
             const threshold = parseInt(process.env.THRESHOLD, 10);
             const protectedPaths = JSON.parse(process.env.PROTECTED_PATHS);
@@ -192,7 +205,36 @@ jobs:
             );
 
             // Use >= to match REVIEW_POLICY.md definition
-            const needsExternal = totalChanges >= threshold || touchesProtected;
+            let needsExternal = totalChanges >= threshold || touchesProtected;
+            let externalReviewFingerprint = '';
+            let filesPath = '';
+            const repo = `${context.repo.owner}/${context.repo.repo}`;
+            try {
+              filesPath = path.join(os.tmpdir(), `mergepath-pr-${pr.number}-files.json`);
+              fs.writeFileSync(filesPath, JSON.stringify(files));
+              const fingerprintRaw = childProcess.execFileSync(
+                'bash',
+                [
+                  'scripts/workflow/external_review_fingerprint.sh',
+                  '--repo', repo,
+                  '--pr', String(pr.number),
+                  '--ref', pr.head.sha,
+                  '--config', '.github/review-policy.yml',
+                  '--files-json', filesPath,
+                ],
+                {encoding: 'utf8', env: process.env}
+              );
+              const fingerprint = JSON.parse(fingerprintRaw);
+              needsExternal = Boolean(fingerprint.requires_review);
+              externalReviewFingerprint = fingerprint.fingerprint || '';
+            } catch (e) {
+              core.warning(
+                `External-review fingerprint calculation failed; ` +
+                `labeling fail-closed (${e.message}).`
+              );
+              needsExternal = true;
+              externalReviewFingerprint = '';
+            }
 
             // PROPAGATION-LANE-DEFER (#656): this job and pr-review-policy.yml's
             // External Review Check both decide needs-external-review, but only
@@ -264,12 +306,48 @@ jobs:
                 `needs-external-review add; the lane owns this PR's labeling.`
               );
             } else if (needsExternal) {
-              await github.rest.issues.addLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: pr.number,
-                labels: ['needs-external-review'],
-              });
+              let carried = false;
+              try {
+                if (needsExternal && externalReviewFingerprint && filesPath) {
+                  const carryRaw = childProcess.execFileSync(
+                    'bash',
+                    [
+                      'scripts/workflow/external_review_carryforward.sh',
+                      '--repo', repo,
+                      '--pr', String(pr.number),
+                      '--head', pr.head.sha,
+                      '--current-fingerprint', externalReviewFingerprint,
+                      '--config', '.github/review-policy.yml',
+                      '--files-json', filesPath,
+                    ],
+                    {encoding: 'utf8', env: process.env}
+                  );
+                  const carry = JSON.parse(carryRaw);
+                  carried = Boolean(carry.carried);
+                  if (carried) {
+                    needsExternal = false;
+                    console.log(
+                      `Codex already cleared the same external-review fingerprint ` +
+                      `on ${carry.source_commit} at ${carry.source_time}; skipping ` +
+                      `needs-external-review on base-only sync (#705).`
+                    );
+                  }
+                }
+              } catch (e) {
+                core.warning(
+                  `External-review fingerprint carry-forward check failed; ` +
+                  `labeling fail-closed using threshold/protected-path result (${e.message}).`
+                );
+              }
+
+              if (!carried && needsExternal) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  labels: ['needs-external-review'],
+                });
+              }
             }
 
             core.setOutput('needs_external', needsExternal.toString());
