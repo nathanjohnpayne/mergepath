@@ -114,6 +114,8 @@ if ! [[ "$THRESHOLD" =~ ^[0-9]+$ ]]; then
 fi
 
 EXCLUDE_RE='(\.lock$)|(lock\.json$)|(\.min\.js$)|(\.min\.css$)|(\.generated\.)|(\.g\.dart$)|(\.freezed\.dart$)'
+FILES_COUNT=$(printf '%s' "$FILES_JSON" | jq 'length')
+FILES_COUNT=${FILES_COUNT:-0}
 
 LINES_CHANGED=$(printf '%s' "$FILES_JSON" | jq --arg re "$EXCLUDE_RE" '
   [ .[]
@@ -123,8 +125,8 @@ LINES_CHANGED=$(printf '%s' "$FILES_JSON" | jq --arg re "$EXCLUDE_RE" '
 ')
 LINES_CHANGED=${LINES_CHANGED:-0}
 
-COUNTED_FILES=$(printf '%s' "$FILES_JSON" | jq -r --arg re "$EXCLUDE_RE" '
-  .[] | select((.filename | test($re)) | not) | .filename
+ALL_CHANGED_FILES=$(printf '%s' "$FILES_JSON" | jq -r '
+  .[] | .filename
 ')
 
 PATHS=$(bash "$PARSE" "$CONFIG" external_review_paths)
@@ -144,21 +146,37 @@ REQUIRES_REVIEW=false
 REASONS=()
 FINGERPRINT_INPUT=""
 
+if [ "$FILES_COUNT" -ge 3000 ]; then
+  REQUIRES_REVIEW=true
+  REASONS+=("PR files API returned ${FILES_COUNT} files; treating as external review required because GitHub may have capped the diff")
+fi
+
 if [ "$LINES_CHANGED" -ge "$THRESHOLD" ]; then
   REQUIRES_REVIEW=true
   REASONS+=("${LINES_CHANGED} lines changed >= threshold ${THRESHOLD}")
-  FINGERPRINT_INPUT="${FINGERPRINT_INPUT}${COUNTED_FILES}"$'\n'
 fi
 
 if [ -n "$MATCHED_FILES" ]; then
   REQUIRES_REVIEW=true
   PROTECTED_SUMMARY=$(printf '%s\n' "$MATCHED_FILES" | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')
   REASONS+=("protected paths modified: ${PROTECTED_SUMMARY}")
-  FINGERPRINT_INPUT="${FINGERPRINT_INPUT}${MATCHED_FILES}"$'\n'
 fi
 
 PROTECTED_JSON=$(printf '%s\n' "$MATCHED_FILES" | LC_ALL=C sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
 REASONS_JSON=$(printf '%s\n' "${REASONS[@]:-}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+if [ "$FILES_COUNT" -ge 3000 ]; then
+  jq -n \
+    --argjson requires true \
+    --arg fingerprint "" \
+    --argjson paths '[]' \
+    --argjson protected "$PROTECTED_JSON" \
+    --argjson reasons "$REASONS_JSON" \
+    --argjson lines "$LINES_CHANGED" \
+    --argjson threshold "$THRESHOLD" \
+    '{requires_review:$requires, fingerprint:$fingerprint, fingerprint_paths:$paths, lines_changed:$lines, threshold:$threshold, protected_paths:$protected, reasons:$reasons}'
+  exit 0
+fi
 
 if [ "$REQUIRES_REVIEW" != "true" ]; then
   jq -n \
@@ -173,15 +191,26 @@ if [ "$REQUIRES_REVIEW" != "true" ]; then
   exit 0
 fi
 
+FINGERPRINT_INPUT="$ALL_CHANGED_FILES"$'\n'
 FINGERPRINT_PATHS_JSON=$(printf '%s\n' "$FINGERPRINT_INPUT" | LC_ALL=C sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
 
-TREE_JSON=$(gh api "repos/$REPO/git/trees/$REF?recursive=1" 2>&1) || {
-  echo "external_review_fingerprint.sh: failed to fetch tree for $REF: $TREE_JSON" >&2
+TREE_REF="$REF"
+set +e
+COMMIT_JSON=$(gh api "repos/$REPO/commits/$REF" 2>/dev/null)
+commit_rc=$?
+set -e
+if [ "$commit_rc" -eq 0 ]; then
+  COMMIT_TREE=$(printf '%s' "$COMMIT_JSON" | jq -r '.commit.tree.sha // ""')
+  [ -z "$COMMIT_TREE" ] || TREE_REF="$COMMIT_TREE"
+fi
+
+TREE_JSON=$(gh api "repos/$REPO/git/trees/$TREE_REF?recursive=1" 2>&1) || {
+  echo "external_review_fingerprint.sh: failed to fetch tree for $REF (tree $TREE_REF): $TREE_JSON" >&2
   exit 2
 }
 
 if [ "$(printf '%s' "$TREE_JSON" | jq -r '.truncated // false')" = "true" ]; then
-  echo "external_review_fingerprint.sh: tree for $REF is truncated; refusing to fingerprint incompletely" >&2
+  echo "external_review_fingerprint.sh: tree for $REF (tree $TREE_REF) is truncated; refusing to fingerprint incompletely" >&2
   exit 2
 fi
 

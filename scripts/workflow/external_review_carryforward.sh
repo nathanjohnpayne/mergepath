@@ -188,15 +188,53 @@ fi
 while IFS=$'\t' read -r source_time source_sha; do
   [ -n "$source_sha" ] || continue
   resolved_sha=""
-  head_lc=$(printf '%s' "$HEAD_SHA" | tr '[:upper:]' '[:lower:]')
   source_lc=$(printf '%s' "$source_sha" | tr '[:upper:]' '[:lower:]')
-  case "$head_lc" in
+  case "$HEAD_LC" in
     "$source_lc"*) resolved_sha="$HEAD_SHA" ;;
   esac
   if [ -z "$resolved_sha" ]; then
     resolved_sha=$(gh api "repos/$REPO/commits/$source_sha" --jq .sha 2>/dev/null || true)
   fi
   [ -n "$resolved_sha" ] || continue
+
+  resolved_lc=$(printf '%s' "$resolved_sha" | tr '[:upper:]' '[:lower:]')
+  NEWER_SOURCE_SIGNAL=$(jq -n -c \
+    --arg bot "$BOT_LOGIN" \
+    --arg resolved "$resolved_lc" \
+    --arg source_time "$source_time" \
+    --argjson comments "$COMMENTS_JSON" \
+    --argjson reviews "$REVIEWS_JSON" '
+    def verdict_shas($body):
+      [ $body
+        | ascii_downcase
+        | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
+        | .[0]
+      ];
+    ([
+      $comments[]
+      | select(.user.login == $bot)
+      | . as $c
+      | verdict_shas($c.body)[] as $sha
+      | select($resolved | startswith($sha))
+      | {
+          kind: "verdict",
+          time: ($c.created_at // ""),
+          affirmative: ($c.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b"))
+        }
+    ] + [
+      $reviews[]
+      | select(.user.login == $bot)
+      | ((.commit_id // "") | ascii_downcase) as $sha
+      | select($sha != "" and ($resolved == $sha or ($resolved | startswith($sha))))
+      | {kind: "review", time: (.submitted_at // ""), affirmative: false}
+    ])
+    | map(select(.time != "" and .time > $source_time))
+    | sort_by(.time)
+    | last // empty
+  ')
+  if [ -n "$NEWER_SOURCE_SIGNAL" ]; then
+    continue
+  fi
 
   set +e
   SOURCE_JSON=$(bash "$FINGERPRINT_BIN" --repo "$REPO" --pr "$PR_NUMBER" --ref "$resolved_sha" --config "$CONFIG" --files-json "$FILES_JSON_PATH" 2>/dev/null)
