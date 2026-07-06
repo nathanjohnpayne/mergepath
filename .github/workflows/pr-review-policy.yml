@@ -7,6 +7,7 @@ on:
 permissions:
   pull-requests: write
   contents: read
+  issues: write
 
 jobs:
   self-review-check:
@@ -71,19 +72,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          CONFIG=".github/review-policy.yml"
           NEEDS_REVIEW=false
           REASONS=""
 
-          if [ ! -f "$CONFIG" ]; then
-            echo "WARNING: $CONFIG not found, skipping external review check"
+          BASE_SHA=${{ github.event.pull_request.base.sha }}
+          HEAD_SHA=${{ github.event.pull_request.head.sha }}
+
+          if ! git cat-file -e "$BASE_SHA:.github/review-policy.yml" 2>/dev/null; then
+            echo "WARNING: base commit has no .github/review-policy.yml, skipping external review check"
             echo "needs_review=false" >> "$GITHUB_OUTPUT"
             echo "propagation_lane=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          BASE_SHA=${{ github.event.pull_request.base.sha }}
-          HEAD_SHA=${{ github.event.pull_request.head.sha }}
           CHANGED_FILES=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA")
 
           # --- Propagation PR review lane (mergepath#264 / #268) ---------
@@ -246,57 +247,86 @@ jobs:
           fi
           echo "propagation_lane=false" >> "$GITHUB_OUTPUT"
 
-          # Read threshold from review-policy.yml
-          THRESHOLD=$(grep 'external_review_threshold:' "$CONFIG" | awk '{print $2}')
-          THRESHOLD=${THRESHOLD:-300}
-
-          # Count lines changed (additions + deletions), excluding lockfiles and generated files
-          LINES_CHANGED=$(git diff --stat "$BASE_SHA"..."$HEAD_SHA" -- \
-            ':!*.lock' ':!*lock.json' ':!*.min.js' ':!*.min.css' \
-            ':!*.generated.*' ':!*.g.dart' ':!*.freezed.dart' \
-            | tail -1 | awk '{print $4+$6}')
-          LINES_CHANGED=${LINES_CHANGED:-0}
-
-          # Use >= to match REVIEW_POLICY.md: "Total lines changed >= external_review_threshold"
-          if [ "$LINES_CHANGED" -ge "$THRESHOLD" ]; then
-            NEEDS_REVIEW=true
-            REASONS="$REASONS- ${LINES_CHANGED} lines changed (threshold: ${THRESHOLD})%0A"
+          # Compute the external-review trigger and same-content fingerprint
+          # from GitHub's PR file list. The helper itself must come from the
+          # trusted base tree, not the PR checkout: this job can write labels
+          # and comments, and same-repo PRs can edit scripts/workflow/**.
+          FILES_JSON=$(mktemp)
+          set +e
+          FILES_RAW=$(gh api --paginate "repos/${{ github.repository }}/pulls/$PR_NUMBER/files")
+          files_rc=$?
+          set -e
+          if [ "$files_rc" -ne 0 ] || ! printf '%s\n' "$FILES_RAW" | jq -s 'add // []' > "$FILES_JSON"; then
+            echo "External-review fail-closed: could not fetch PR files; requiring review."
+            echo "needs_review=true" >> "$GITHUB_OUTPUT"
+            echo "reasons=- Could not fetch PR files for external-review fingerprint; requiring review fail-closed" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          # Extract external_review_paths entries from review-policy.yml.
-          # Delegates to scripts/workflow/parse_policy_list.sh, which is
-          # unit-tested by scripts/ci/check_workflow_parsers (see #57).
-          # History: the earlier inline `awk '/^key:/,/^[^ ]/'` range
-          # parser silently matched only the header line because the
-          # range-start pattern also matched the range-end condition.
-          # See #54 for the post-mortem.
-          PATHS=$(bash scripts/workflow/parse_policy_list.sh "$CONFIG" external_review_paths)
-
-          # Match changed files against patterns. Delegates to
-          # scripts/workflow/match_protected_paths.sh (bash `[[ ]]`
-          # pattern matching under the hood), which is unit-tested by
-          # scripts/ci/check_workflow_parsers (see #57). History: the
-          # earlier inline glob-to-regex sed pipeline double-transformed
-          # `*` and silently missed nested paths. See #54 for the
-          # post-mortem.
-          # (CHANGED_FILES is computed once near the top of this step,
-          # before the propagation-lane check.)
-
-          PATTERNS=()
-          while IFS= read -r line; do
-            [ -n "$line" ] && PATTERNS+=("$line")
-          done <<< "$PATHS"
-
-          if [ "${#PATTERNS[@]}" -gt 0 ]; then
-            MATCHED_FILES=$(printf '%s\n' "$CHANGED_FILES" | bash scripts/workflow/match_protected_paths.sh "${PATTERNS[@]}")
-          else
-            MATCHED_FILES=""
+          TRUSTED_BASE_TREE=$(mktemp -d)
+          cleanup_trusted_base_tree() {
+            git worktree remove --force "$TRUSTED_BASE_TREE" >/dev/null 2>&1 || rm -rf "$TRUSTED_BASE_TREE"
+          }
+          trap cleanup_trusted_base_tree EXIT
+          if ! git worktree add --quiet --detach "$TRUSTED_BASE_TREE" "$BASE_SHA" 2>/dev/null; then
+            echo "External-review fail-closed: could not materialize trusted base helpers; requiring review."
+            echo "needs_review=true" >> "$GITHUB_OUTPUT"
+            echo "reasons=- Could not materialize trusted base helpers; requiring review fail-closed" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          if [ -n "$MATCHED_FILES" ]; then
-            NEEDS_REVIEW=true
-            FILE_LIST=$(echo "$MATCHED_FILES" | sort -u | grep -v '^$' | sed 's/^/  - /' | tr '\n' ',' | sed 's/,/%0A/g')
-            REASONS="${REASONS}- Protected paths modified:%0A${FILE_LIST}"
+          TRUSTED_HELPER_DIR="$TRUSTED_BASE_TREE/scripts/workflow"
+          TRUSTED_CONFIG="$TRUSTED_BASE_TREE/.github/review-policy.yml"
+          FINGERPRINT_HELPER="$TRUSTED_HELPER_DIR/external_review_fingerprint.sh"
+          CARRY_HELPER="$TRUSTED_HELPER_DIR/external_review_carryforward.sh"
+          if [ ! -x "$FINGERPRINT_HELPER" ]; then
+            echo "External-review fail-closed: trusted base helper is unavailable; requiring review."
+            echo "needs_review=true" >> "$GITHUB_OUTPUT"
+            echo "reasons=- Trusted external-review fingerprint helper is unavailable on the base tree; requiring review fail-closed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          set +e
+          FINGERPRINT_JSON=$(bash "$FINGERPRINT_HELPER" \
+            --repo "${{ github.repository }}" \
+            --pr "$PR_NUMBER" \
+            --ref "$HEAD_SHA" \
+            --config "$TRUSTED_CONFIG" \
+            --files-json "$FILES_JSON")
+          fingerprint_rc=$?
+          set -e
+          if [ "$fingerprint_rc" -ne 0 ]; then
+            echo "External-review fail-closed: fingerprint helper failed (rc=$fingerprint_rc); requiring review."
+            echo "needs_review=true" >> "$GITHUB_OUTPUT"
+            echo "reasons=- External-review fingerprint helper failed; requiring review fail-closed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          NEEDS_REVIEW=$(echo "$FINGERPRINT_JSON" | jq -r '.requires_review')
+          FINGERPRINT=$(echo "$FINGERPRINT_JSON" | jq -r '.fingerprint // ""')
+          REASONS=$(echo "$FINGERPRINT_JSON" | jq -r '.reasons | map("- " + .) | join("%0A")')
+
+          if [ "$NEEDS_REVIEW" = "true" ] && [ -n "$FINGERPRINT" ] && [ -x "$CARRY_HELPER" ]; then
+            set +e
+            CARRY_JSON=$(bash "$CARRY_HELPER" \
+              --repo "${{ github.repository }}" \
+              --pr "$PR_NUMBER" \
+              --head "$HEAD_SHA" \
+              --current-fingerprint "$FINGERPRINT" \
+              --config "$TRUSTED_CONFIG" \
+              --files-json "$FILES_JSON")
+            carry_rc=$?
+            set -e
+            if [ "$carry_rc" -eq 0 ] && [ "$(echo "$CARRY_JSON" | jq -r '.carried')" = "true" ]; then
+              SOURCE_COMMIT=$(echo "$CARRY_JSON" | jq -r '.source_commit')
+              SOURCE_TIME=$(echo "$CARRY_JSON" | jq -r '.source_time')
+              echo "External-review carry-forward: Codex already cleared the same external-review fingerprint on $SOURCE_COMMIT at $SOURCE_TIME; skipping needs-external-review on base-only sync (#705)."
+              echo "needs_review=false" >> "$GITHUB_OUTPUT"
+              echo "reasons=" >> "$GITHUB_OUTPUT"
+              exit 0
+            elif [ "$carry_rc" -ne 0 ]; then
+              echo "External-review carry-forward failed (rc=$carry_rc); requiring current-head review fail-closed."
+            fi
           fi
 
           echo "needs_review=$NEEDS_REVIEW" >> "$GITHUB_OUTPUT"
