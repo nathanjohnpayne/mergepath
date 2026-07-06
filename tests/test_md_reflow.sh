@@ -30,7 +30,15 @@ check() { # check <label> <condition-rc>
   fi
 }
 
-reflow() { "$PYTHON" "$REFLOW" --write "$1" >/dev/null 2>&1 || true; }
+reflow() { # reflow <file> — runs md_reflow --write and REPORTS a non-zero
+  # exit as a FAIL via check(), instead of aborting the whole suite under
+  # set -e (the #699 fix) or silently swallowing the failure (the bug that
+  # fix introduced: `|| true` alone would let a crashed --write pass every
+  # downstream assertion that merely checks the file's post-state).
+  local rc=0
+  "$PYTHON" "$REFLOW" --write "$1" >/dev/null 2>&1 || rc=$?
+  check "reflow --write succeeded on $1" "$rc"
+}
 
 # has_line <file> <exact-line> — whole-line fixed-string match, dash-safe.
 has_line() { grep -qxF -e "$2" "$1"; }
