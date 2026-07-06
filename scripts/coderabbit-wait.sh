@@ -29,10 +29,11 @@
 #
 #   3. **HEAD freshness.** Auto-merge-on-approval workflows in downstream
 #      repos race CodeRabbit: an internal reviewer can post APPROVED before
-#      CodeRabbit's ~2–3 minute review lands, and the PR auto-merges
-#      pre-review. The script only returns "cleared" when CodeRabbit has
-#      posted a non-rate-limited, non-in-progress comment on or after the
-#      HEAD committer date. See nathanjohnpayne/mergepath#136.
+#      CodeRabbit's review lands (measured p50 ~6 min, p99 ~19 min — #623,
+#      not the old "~2–3 min" folklore), and the PR auto-merges pre-review.
+#      The script only returns "cleared" when CodeRabbit has posted a
+#      non-rate-limited, non-in-progress comment on or after the HEAD
+#      committer date. See nathanjohnpayne/mergepath#136.
 #
 # It also surfaces — without re-invoking — the other detectable reasons
 # CodeRabbit auto-review never fires: a PR base branch matched by none of
@@ -59,7 +60,7 @@
 #              $OP_PREFLIGHT_REVIEWER_PAT after preflight.
 #
 # Behavior:
-#   1. Reads coderabbit.max_wait_seconds (default 300) and
+#   1. Reads coderabbit.max_wait_seconds (default 1245; measured full-fleet max + one poll interval, #623) and
 #      coderabbit.max_rate_limit_retries (default 2) from
 #      .github/review-policy.yml.
 #   2. Fetches PR HEAD SHA + committer date.
@@ -363,8 +364,24 @@ coderabbit_yml_drafts() {
   ' "$CODERABBIT_YML"
 }
 
+# max_wait_seconds: the poll ceiling before an advisory exit 4. Default 1245s
+# is measured (#623): the mined CodeRabbit review latency (commit → first
+# body-bearing review, rate-limited rounds excluded) across ALL EIGHT
+# CodeRabbit-active consumers is p50 414s / p90 861s / p99 1136s / max 1219s
+# (n=142, docs/audits/data/review-latency-2026-07/). The prior 300s sat below
+# even the p50, so >50% of PRs timed the wait out before CodeRabbit reviewed —
+# reopening the #136 pre-review-merge race. 1245s = 83 × POLL_INTERVAL_SECONDS
+# = one full poll interval BEYOND the observed max (1219s): the loop below
+# checks ELAPSED >= MAX_WAIT_SECONDS at the TOP of each iteration and times out
+# with no final scan, so a review landing in the last poll window would be
+# missed by a ceiling set exactly at the tail (Codex P2 on #688 caught both the
+# blind spot and that a 5-repo subset understated the max at 1136s). One
+# interval of headroom guarantees the slowest observed review still gets a poll
+# scan before the timeout. It is a CEILING (the poll returns as soon as the
+# review lands, ~p50 7 min); paused/rate-limit/skip fast-paths short-circuit
+# genuinely-stuck rounds.
 MAX_WAIT_SECONDS=$(coderabbit_field max_wait_seconds)
-MAX_WAIT_SECONDS=${MAX_WAIT_SECONDS:-300}
+MAX_WAIT_SECONDS=${MAX_WAIT_SECONDS:-1245}
 if ! [[ "$MAX_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "ERROR: coderabbit.max_wait_seconds must be an integer; got '$MAX_WAIT_SECONDS'" >&2
   exit 3
