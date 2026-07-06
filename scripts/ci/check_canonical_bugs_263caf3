@@ -941,6 +941,19 @@ JSON
         echo 'gh: Not Found (HTTP 404)' >&2
         exit 1
         ;;
+      graphql)
+        # #655 round 13: codex-review-check.sh's statusCheckRollup fetch
+        # switched from `gh pr view --json statusCheckRollup` (the now-dead
+        # `pr view` stub below) to a paginated `gh api graphql` query, to
+        # fix a real bug where a PR with more than 100 status contexts
+        # silently hid every entry past the first page. These Bug 4
+        # fixtures exercise Codex bot clearance (gate c), not CI-check
+        # status (gate a), so an empty, single-page rollup preserves the
+        # same "zero reported checks" shape the old stub returned.
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}]}}}}}
+JSON
+        ;;
       *) printf 'unexpected endpoint: %s\n' "${1:-}" >&2; exit 9 ;;
     esac
     ;;

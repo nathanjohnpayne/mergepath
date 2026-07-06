@@ -125,13 +125,27 @@ assert_grep "agent-review: skips matrix-strategy annex jobs during derivation in
 # matrix job is excluded from NAME derivation above, but its annex_workflow
 # is still captured, so a reported failing matrix leg (under an expanded
 # name this static read could never predict) is still caught by the
-# workflow-wide scan matching on .workflowName alone.
-assert_grep "agent-review: workflow-wide annex scan matches by .workflowName, catching a matrix-leg failure without its expanded name" \
-  "$W/agent-review.yml" '[.statusCheckRollup[] | select((.workflowName // "") == $workflow)]'
+# workflow-wide scan matching on its workflow identity alone.
+#
+# Codex P2 (#655 round 13, "disambiguate annex workflows beyond display
+# name", found on the codex-review-check.sh copy and mirrored here): the
+# annex contract allows any top-level workflow name:, so two workflow files
+# can share the same displayed workflowName -- matching on .workflowPath
+# (derived from the GraphQL-reported resourcePath of the workflow FILE
+# itself) instead closes that collision, since the annex's file path is
+# fixed and not consumer-editable.
+assert_grep "agent-review: workflow-wide annex scan matches by the stable .workflowPath, not the collision-prone display name (#655 round 13)" \
+  "$W/agent-review.yml" '[.statusCheckRollup[] | select((.workflowPath // "") == "repo_lint_local.yml")]'
 assert_grep "agent-review: a bad conclusion reported anywhere in the annex's workflow refuses auto-merge immediately (#655 round 6)" \
-  "$W/agent-review.yml" 'non-passing reported check-run(s) on current HEAD $sha (conclusion=$annex_bad_summary); refusing auto-merge (#655)'
+  "$W/agent-review.yml" 'non-passing reported check-run(s) after winner-selection on current HEAD $sha (conclusion=$annex_bad_summary); refusing auto-merge (#655)'
 assert_grep "agent-review: a still-in-progress annex entry is treated as pending (keeps polling), not as a failure (#655 round 6)" \
   "$W/agent-review.yml" 'check-run(s) still in progress on current HEAD $sha; waiting for completion (#655)'
+assert_grep "agent-review: workflow query requests resourcePath alongside name to derive the stable workflowPath (#655 round 13)" \
+  "$W/agent-review.yml" 'checkSuite { workflowRun { workflow { name resourcePath } } }'
+assert_grep "agent-review: rollup_json derives workflowPath from resourcePath's final path segment (#655 round 13)" \
+  "$W/agent-review.yml" 'workflowPath: (((.checkSuite.workflowRun.workflow.resourcePath // "") | split("/") | last) // "")'
+assert_grep "agent-review: annex_bad groups by check name and keeps only the latest-completed winner per name before judging bad-ness (#655 round 13)" \
+  "$W/agent-review.yml" 'group_by(.name // .context // "?")'
 
 # Codex P2 (#655 round 4): a 403 (token lacks Contents: read) is usually
 # persistent, unlike other indeterminate errors -- forcing the synthetic
@@ -189,7 +203,21 @@ assert_grep "agent-review: requires every matched workflow group to be green, no
 # "COMPLETED". This predicate is shared by the winner selection, the
 # pending-count check, and the annex workflow-wide scan.
 assert_grep "agent-review: a status-context entry is pending when .state is PENDING or EXPECTED, not merely lacking .status (#655 rounds 6-7)" \
-  "$W/agent-review.yml" 'if (.status != null) then (.status != "COMPLETED") else (["PENDING","EXPECTED"] | index(.state // "")) end'
+  "$W/agent-review.yml" 'if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end'
+
+# Self-caught while porting the pending-check above into
+# codex-review-check.sh for #655 round 13: the ORIGINAL form piped a bare
+# array literal straight into `index(.state // "")`, which rebinds `.` to
+# that array literal for the rest of the pipeline -- `.state` then tries to
+# index an array with a string and jq hard-errors, but only for a
+# StatusContext (no .status field), since a CheckRun never reaches this
+# `else` branch at all. Latent since round 6/7 (never triggered here
+# because every entry observed so far has been a CheckRun), but a classic
+# Statuses-API context reaching this branch would fail the whole jq call.
+# Fixed by binding .state to a variable BEFORE the array-literal pipe;
+# guarded here so the fix cannot silently regress back to the broken form.
+assert_not_grep "agent-review: does not regress to the pre-round-13 index(.state) expression that rebinds dot inside the array-literal pipe" \
+  "$W/agent-review.yml" '(["PENDING","EXPECTED"] | index(.state // ""))'
 
 # Codex P1 (#655 round 7, "parse valid annex workflows that use YAML
 # aliases"): GitHub Actions supports YAML anchors/aliases in workflow
@@ -248,8 +276,21 @@ assert_grep "agent-review: a path-filtered annex with zero reported entries stil
 # separately too, since round 10 found it needs different treatment).
 assert_grep "agent-review: generic filter-key lists no longer blanket-disqualify on branches/branches-ignore (#655 round 11)" \
   "$W/agent-review.yml" 'pr_filter_keys = ["paths", "paths-ignore"]'
-assert_grep "agent-review: push filter-key list disqualifies on tags/tags-ignore instead of branches/branches-ignore (#655 round 11)" \
-  "$W/agent-review.yml" 'push_filter_keys = ["paths", "paths-ignore", "tags", "tags-ignore"]'
+# #655 Codex P2 round 13 ("do not treat tag filters as excluding branch
+# pushes", found on the codex-review-check.sh copy and mirrored here):
+# round 11 put tags/tags-ignore into this SAME generic list, so a push
+# trigger with BOTH branches (which might match) AND tags was disqualified
+# on tags presence alone, before branches ever got evaluated -- wrongly
+# filtering an annex GitHub would actually run for a matching branch push,
+# since branches and tags are combinable on the same push trigger. tags is
+# no longer in this list at all; push_tag_only_excludes? below handles it
+# precisely (only disqualifies when branches/branches-ignore is absent).
+assert_grep "agent-review: push filter-key list no longer includes tags/tags-ignore (#655 round 13)" \
+  "$W/agent-review.yml" 'push_filter_keys = ["paths", "paths-ignore"]'
+assert_grep "agent-review: a dedicated helper disqualifies push only when tags/tags-ignore is present AND branches/branches-ignore is entirely absent (#655 round 13)" \
+  "$W/agent-review.yml" 'def push_tag_only_excludes?(cfg)'
+assert_grep "agent-review: push_tag_only_excludes? is wired into the trigger_unfiltered lambda for the push event (#655 round 13)" \
+  "$W/agent-review.yml" 'next false if event == "push" && push_tag_only_excludes?(cfg)'
 
 # Codex P1 (#655 round 10, found on the codex-review-check.sh copy of this
 # same logic and mirrored here): round 9 disqualified "unfiltered" on the
@@ -268,9 +309,11 @@ assert_grep "agent-review: treats a types list that includes synchronize as unfi
 # `pull_request: {branches: [main]}` still runs for every PR targeting
 # main -- evaluated against the real ref (pull_request compares the PRs
 # BASE ref; push compares the ref actually pushed, which for a same-repo
-# PRs synchronize is its own HEAD ref, not base) via File.fnmatch, with a
-# conservative disqualify when the relevant branch cannot be resolved.
-assert_grep "agent-review: evaluates branches/branches-ignore via fnmatch instead of blanket-disqualifying on presence (#655 round 11)" \
+# PRs synchronize is its own HEAD ref, not base), with a conservative
+# disqualify when the relevant branch cannot be resolved. Matching itself
+# switched from File.fnmatch to a regex translator in round 13 (see the
+# branch_pattern_to_regex assertions further below).
+assert_grep "agent-review: evaluates branches/branches-ignore against the real ref instead of blanket-disqualifying on presence (#655 round 11)" \
   "$W/agent-review.yml" 'def branch_filter_excludes?(cfg, branch)'
 assert_grep "agent-review: pull_request branches evaluation uses the PRs base ref, not head (#655 round 11)" \
   "$W/agent-review.yml" 'trigger_unfiltered.call("pull_request", pr_filter_keys, ENV["ANNEX_BASE_BRANCH"])'
@@ -282,11 +325,14 @@ assert_grep "agent-review: gh pr view fetches baseRefName/headRefName alongside 
   "$W/agent-review.yml" '--json headRefOid,isCrossRepository,baseRefName,headRefName'
 
 # Codex P2 (#655 round 11, "treat tag-only push annexes as filtered",
-# mirrored): a push trigger scoped by tags/tags-ignore only fires for TAG
-# ref pushes, never an ordinary branch push -- which is what a same-repo
-# PRs synchronize always is. There is no PR-relative tag to evaluate
-# against, so tags/tags-ignore blanket-disqualifies push (already
-# confirmed by the push_filter_keys assertion above).
+# narrowed in round 13 -- "do not treat tag filters as excluding branch
+# pushes", mirrored): a push trigger scoped ONLY by tags/tags-ignore (no
+# branches/branches-ignore at all) only fires for TAG ref pushes, never an
+# ordinary branch push -- which is what a same-repo PRs synchronize always
+# is. But GitHub documents branches and tags as combinable on the SAME push
+# trigger, so a trigger with BOTH keys must still be evaluated by its
+# branches filter (already confirmed by the push_tag_only_excludes?
+# assertions above).
 
 # Codex P2 (#655 round 9, "wait for valid push-only annex workflows"):
 # check_ci_scripts_wired accepts push OR pull_request as valid annex
@@ -336,11 +382,32 @@ assert_grep "agent-review: accumulates each page's contexts into the running rol
 # found on the codex-review-check.sh copy and mirrored here): GitHub docs
 # specify a single `*` does NOT cross a `/` while `**` DOES; patterns are
 # also evaluated IN ORDER with an optional `!` prefix negating a prior
-# match, which the round-11 `any?` check ignored entirely.
-assert_grep "agent-review: applies FNM_PATHNAME only for non-globstar patterns, so single * does not cross / while ** does (#655 round 12)" \
-  "$W/agent-review.yml" 'flags = pattern.include?("**") ? 0 : File::FNM_PATHNAME'
+# match, which the round-11 `any?` check ignored entirely. Round 12 used
+# File.fnmatch (with FNM_PATHNAME applied only for non-globstar patterns)
+# for the single-star/double-star distinction.
 assert_grep "agent-review: evaluates branch patterns in order with ! negation, a later pattern overriding an earlier one (#655 round 12)" \
   "$W/agent-review.yml" 'def branch_matches_list?(patterns, branch)'
+
+# Codex P2 (#655 round 13, "use an Actions-compatible branch glob matcher",
+# found on the codex-review-check.sh copy and mirrored here): the round-12
+# fnmatch version could not represent a `+` repetition quantifier (e.g.
+# `v[12].[0-9]+.[0-9]+`, GitHub's documented semver-branch example) --
+# fnmatch always treats `+` as a literal character and returns false.
+# Replaced with a translator that converts each documented glob token into
+# an equivalent Ruby Regexp (which natively supports quantifiers and
+# character classes), matched via Regexp#match?.
+assert_grep "agent-review: translates branch glob patterns into a Ruby Regexp instead of using File.fnmatch (#655 round 13)" \
+  "$W/agent-review.yml" 'def branch_pattern_to_regex(pattern)'
+assert_grep "agent-review: a lone * translates to a single-path-segment match, not crossing / (#655 round 13)" \
+  "$W/agent-review.yml" 'result << "[^/]*"'
+assert_grep "agent-review: ** translates to a cross-segment match (#655 round 13)" \
+  "$W/agent-review.yml" 'result << ".*"'
+assert_grep "agent-review: a + quantifier is copied through verbatim, since Ruby Regexp supports it natively (#655 round 13)" \
+  "$W/agent-review.yml" 'elsif c == "+"'
+assert_grep "agent-review: branch_matches? now delegates to the regex translator instead of File.fnmatch (#655 round 13)" \
+  "$W/agent-review.yml" 'branch_pattern_to_regex(pattern).match?(branch)'
+assert_not_grep "agent-review: no longer uses File.fnmatch for branch matching (#655 round 13)" \
+  "$W/agent-review.yml" 'File.fnmatch(pattern, branch, flags)'
 
 # auto-clear-blocking-labels.yml: the workflow_run trigger list observes the
 # annex's completion too (verified against a live consumer's repo_lint_local.yml

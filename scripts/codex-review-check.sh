@@ -620,8 +620,78 @@ log "gate (a): checking CI state"
 # recovered. Caught by codex P1 on PR #328 round 1. The retry diagnostics
 # still surface in the workflow log via stderr, so the visibility cost
 # is zero.
-ROLLUP_JSON=$(with_gh_retry gh pr view "$PR_NUMBER" --repo "$REPO" --json statusCheckRollup) \
-  || die 3 "failed to fetch statusCheckRollup (see stderr above for retry diagnostics)"
+#
+# #655 Codex P1 round 13 ("page the rollup before scanning annex
+# checks"): `gh pr view --json statusCheckRollup` only requests the first
+# 100 contexts with no pagination, exactly the bug already found and
+# fixed in agent-review.yml's wait loop (#655 round 12, verified live
+# against this PR's own 160+ contexts) -- this script has the identical
+# gap and was missed when that fix landed. Switched to the same
+# Relay-cursor-paginated graphql query, each page wrapped in
+# with_gh_retry individually so a transient failure on page 2 does not
+# discard page 1's already-fetched data. Also adds workflowPath (#655
+# round 13, "disambiguate annex workflows beyond display name" -- see
+# below) alongside the existing workflowName, since the annex contract
+# does not guarantee a unique display name across a consumer's workflows.
+REPO_OWNER="${REPO%%/*}"
+REPO_NAME="${REPO#*/}"
+ROLLUP_CONTEXTS="[]"
+ROLLUP_CURSOR=""
+while :; do
+  ROLLUP_PAGE=$(with_gh_retry gh api graphql -f query='
+    query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          commits(last: 1) {
+            nodes {
+              commit {
+                statusCheckRollup {
+                  contexts(first: 100, after: $cursor) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      __typename
+                      ... on CheckRun {
+                        name
+                        status
+                        conclusion
+                        startedAt
+                        completedAt
+                        checkSuite { workflowRun { workflow { name resourcePath } } }
+                      }
+                      ... on StatusContext {
+                        context
+                        state
+                        createdAt
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }' -f owner="$REPO_OWNER" -f name="$REPO_NAME" -F number="$PR_NUMBER" -f cursor="$ROLLUP_CURSOR") \
+    || die 3 "failed to fetch statusCheckRollup page (see stderr above for retry diagnostics)"
+  ROLLUP_PAGE_NODES=$(echo "$ROLLUP_PAGE" | jq -c '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes')
+  ROLLUP_CONTEXTS=$(jq -c -n --argjson a "$ROLLUP_CONTEXTS" --argjson b "$ROLLUP_PAGE_NODES" '$a + $b')
+  ROLLUP_HAS_NEXT=$(echo "$ROLLUP_PAGE" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage')
+  ROLLUP_CURSOR=$(echo "$ROLLUP_PAGE" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor')
+  [ "$ROLLUP_HAS_NEXT" = "true" ] || break
+done
+ROLLUP_JSON=$(echo "$ROLLUP_CONTEXTS" | jq '{
+  statusCheckRollup: (map({
+      name: .name,
+      context: .context,
+      workflowName: (.checkSuite.workflowRun.workflow.name // null),
+      workflowPath: (((.checkSuite.workflowRun.workflow.resourcePath // "") | split("/") | last) // ""),
+      status: .status,
+      conclusion: .conclusion,
+      state: .state,
+      startedAt: .startedAt,
+      completedAt: .completedAt
+    }))
+}')
 # #655 Codex P1 round 7 ("keep rollup when annex only has matrix jobs"): a
 # frozen copy taken BEFORE any branch-protection-driven scoping/wiping below
 # can touch $ROLLUP_JSON. The annex workflow-wide scan intentionally bypasses
@@ -822,33 +892,77 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
       # pull_request compares the PRs BASE ref (ANNEX_BASE_BRANCH); push
       # compares the ref actually being pushed, which for a same-repo PRs
       # synchronize is the PRs own HEAD ref (ANNEX_HEAD_BRANCH), not base.
-      # Matching uses File.fnmatch, refined per #655 round 12 ("honor
-      # GitHub Actions branch glob semantics") to correct two gaps found
-      # in the round-11 version: GitHub docs specify a single `*` does
-      # NOT cross a `/` (so `feature/*` excludes `feature/foo/bar`) while
-      # `**` DOES (Ruby fnmatch with FNM_PATHNAME correctly restricts `*`
-      # but ALSO restricts `**`, which is not the desired behavior --
-      # confirmed empirically -- so PATHNAME is applied only when the
-      # pattern has no `**`); and patterns are evaluated IN ORDER with an
-      # optional `!` prefix negating a prior match (a later pattern
-      # overrides an earlier one for the same ref), which the previous
-      # `any?` check ignored entirely. An unknown/unresolvable branch
-      # still conservatively disqualifies rather than guessing.
+      # Matching translates each pattern into an equivalent Ruby Regexp
+      # rather than using File.fnmatch, refined per #655 round 13 ("use
+      # an Actions-compatible branch glob matcher") to correct a gap
+      # found in the round-12 fnmatch version: GitHub documented branch
+      # patterns support a `+` repetition quantifier on a preceding
+      # character/class (e.g. `v[12].[0-9]+.[0-9]+`, matching semver
+      # branches) -- a real regex feature fnmatch has no equivalent for
+      # (it always treats `+` as a literal character and returns false).
+      # Regexp natively supports quantifiers AND character classes, so
+      # translating once and matching via Regexp#match? handles the full
+      # documented syntax (*, **, ?, [...], +) with one mechanism instead
+      # of patching fnmatch further. `**` crosses `/` (translated to
+      # `.*`); a lone `*` does not (translated to `[^/]*`); `[...]` and a
+      # following `+` are copied through verbatim, since Ruby regex
+      # character-class and quantifier syntax already matches the GitHub
+      # semantics; everything else is regex-escaped. Verified against the
+      # GitHub-documented single-star/double-star examples, the semver example
+      # above, and (round 12) an ordered `!`-negation case.
       #
       # #655 Codex P2 round 11 ("treat tag-only push annexes as
-      # filtered"): a push trigger scoped by tags/tags-ignore (e.g.
-      # `push: {tags: ["v*"]}`) only fires for TAG ref pushes, never for
-      # an ordinary branch push -- which is what a same-repo PRs
-      # synchronize always is. Unlike branches (evaluable against a real
-      # ref this script has), there is no PR-relative tag to evaluate
-      # against (a PR is not associated with a tag at all), so tags/
-      # tags-ignore presence blanket-disqualifies push specifically,
-      # unconditionally.
+      # filtered", narrowed in round 13 -- "do not treat tag filters as
+      # excluding branch pushes"): a push trigger scoped ONLY by tags/
+      # tags-ignore (no branches/branches-ignore at all) only fires for
+      # TAG ref pushes, never an ordinary branch push. But GitHub
+      # documents branches and tags as combinable on the SAME push
+      # trigger (runs for a matching branch push OR a matching tag
+      # push), so a trigger with BOTH keys must still be evaluated by
+      # its branches filter -- the round-11 version disqualified on tags
+      # presence alone, before branches ever got a chance to match, which
+      # wrongly filtered an annex GitHub would actually run for a
+      # matching branch push. Tags now only disqualifies when there is
+      # no branches/branches-ignore key at all to independently evaluate.
       on = doc.key?("on") ? doc["on"] : doc[true]
+      def branch_pattern_to_regex(pattern)
+        result = +""
+        chars = pattern.chars
+        i = 0
+        while i < chars.length
+          c = chars[i]
+          if c == "*" && chars[i + 1] == "*"
+            result << ".*"
+            i += 2
+          elsif c == "*"
+            result << "[^/]*"
+            i += 1
+          elsif c == "?"
+            result << "[^/]"
+            i += 1
+          elsif c == "["
+            j = i + 1
+            j += 1 while j < chars.length && chars[j] != "]"
+            result << chars[i..j].join
+            i = j + 1
+          elsif c == "+"
+            result << "+"
+            i += 1
+          else
+            result << Regexp.escape(c)
+            i += 1
+          end
+        end
+        Regexp.new("\\A#{result}\\z")
+      end
       def branch_matches?(pattern, branch)
         return false unless pattern.is_a?(String) && branch.is_a?(String)
-        flags = pattern.include?("**") ? 0 : File::FNM_PATHNAME
-        File.fnmatch(pattern, branch, flags)
+        branch_pattern_to_regex(pattern).match?(branch)
+      rescue RegexpError, ArgumentError
+        false
+      end
+      def push_tag_only_excludes?(cfg)
+        (cfg.key?("tags") || cfg.key?("tags-ignore")) && !(cfg.key?("branches") || cfg.key?("branches-ignore"))
       end
       def branch_matches_list?(patterns, branch)
         return false unless patterns.is_a?(Array)
@@ -882,6 +996,7 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
           cfg = on[event]
           next true unless cfg.is_a?(Hash)
           next false if filter_keys.any? { |k| cfg.key?(k) }
+          next false if event == "push" && push_tag_only_excludes?(cfg)
           next false if branch_filter_excludes?(cfg, relevant_branch)
           next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")
           true
@@ -890,7 +1005,7 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
         end
       end
       pr_filter_keys = ["paths", "paths-ignore"]
-      push_filter_keys = ["paths", "paths-ignore", "tags", "tags-ignore"]
+      push_filter_keys = ["paths", "paths-ignore"]
       pr_unfiltered = trigger_unfiltered.call("pull_request", pr_filter_keys, ENV["ANNEX_BASE_BRANCH"])
       push_unfiltered = trigger_unfiltered.call("push", push_filter_keys, ENV["ANNEX_HEAD_BRANCH"])
       same_repo_pr = ENV["ANNEX_SAME_REPO_PR"] == "true"
@@ -1132,27 +1247,62 @@ BAD_CHECKS=$(echo "$ROLLUP_JSON" | jq --argjson required_names "${REQUIRED_JSON:
 # one above. A path-filtered (or classification-unknown) annex with zero
 # entries is still non-blocking, preserving round 5/6's fix for that case.
 if [ -n "$ANNEX_WORKFLOW_NAME" ]; then
-  ANNEX_WORKFLOW_MATCHES=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq --arg workflow "$ANNEX_WORKFLOW_NAME" '
-    [.statusCheckRollup[] | select((.workflowName // "") == $workflow)]
+  # #655 Codex P2 round 13 ("disambiguate annex workflows beyond display
+  # name"): the annex contract lets a consumer set any top-level workflow
+  # `name:`, so matching on .workflowName risks either masking the real
+  # annex behind an unrelated same-named workflow (false clean) or blocking
+  # on an unrelated same-named workflow's failure (false red). .workflowPath
+  # (added to ROLLUP_JSON above, round 13) is derived from the
+  # GraphQL-reported resourcePath of the workflow FILE itself, not its
+  # freely-editable display name, so match on the known, fixed annex
+  # filename instead. A StatusContext (no checkSuite at all) safely
+  # resolves workflowPath to "" and can never collide with this literal.
+  ANNEX_WORKFLOW_MATCHES=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq --arg workflow_path "repo_lint_local.yml" '
+    [.statusCheckRollup[] | select((.workflowPath // "") == $workflow_path)]
   ')
   ANNEX_WORKFLOW_MATCH_COUNT=$(echo "$ANNEX_WORKFLOW_MATCHES" | jq 'length')
   if [ "$ANNEX_WORKFLOW_MATCH_COUNT" -eq 0 ] && [ "$ANNEX_UNFILTERED" = "true" ]; then
     log "gate (a): repo_lint_local.yml annex workflow ($ANNEX_WORKFLOW_NAME) has an unfiltered pull_request trigger but has not reported anything yet for $HEAD_SHA_FOR_ANNEX (#655 round 8) — treating as not-yet-clean rather than silently passing, since it is guaranteed to eventually run."
     BAD_CHECKS=$(echo "$BAD_CHECKS" | jq --arg workflow "$ANNEX_WORKFLOW_NAME" '(. + [{label: "(not yet reported)", workflow: $workflow, result: "PENDING"}]) | unique')
   else
+    # #655 Codex P2 round 13 ("ignore stale annex runs after a green
+    # rerun"): the annex's own workflow can legitimately report more than
+    # one entry per job name for the same head SHA -- a failed
+    # push-triggered attempt followed by a successful pull_request
+    # attempt, or a failed job manually rerun to a later success. Without
+    # grouping, an old superseded FAILURE never leaves the rollup and
+    # would block gate (a) forever even after the same-named job goes
+    # green. Group matches by check name and pick one winner per name
+    # before judging bad-ness, mirroring the exact pending-preferred /
+    # else-latest-completed rule agent-review.yml's required-check wait
+    # loop already uses (#655 round 5) -- a still-non-terminal entry in a
+    # name's group always wins over any completed sibling regardless of
+    # timestamps (an empty startedAt/completedAt on a freshly-queued rerun
+    # must not be outranked by an older completed one), and only when
+    # every entry in the group is terminal does the latest-completed one
+    # (by completedAt, falling back to startedAt) win.
     ANNEX_WORKFLOW_BAD=$(echo "$ANNEX_WORKFLOW_MATCHES" | jq '
-      [.[]
-        | {
-            label: (.name // .context // "?"),
-            workflow: (.workflowName // ""),
-            result: (.conclusion // .state // "")
-          }
-        | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
-      ]
+      group_by(.name // .context // "?")
+      | [
+          .[]
+          | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end))) as $pending
+          | if ($pending | length) > 0
+            then $pending[0]
+            else (sort_by(.completedAt // .startedAt // "") | last)
+            end
+        ] as $winners
+      | [$winners[]
+          | {
+              label: (.name // .context // "?"),
+              workflow: (.workflowName // ""),
+              result: (.conclusion // .state // "")
+            }
+          | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
+        ]
     ')
     ANNEX_WORKFLOW_BAD_COUNT=$(echo "$ANNEX_WORKFLOW_BAD" | jq 'length')
     if [ "$ANNEX_WORKFLOW_BAD_COUNT" -gt 0 ]; then
-      log "gate (a): repo_lint_local.yml annex workflow ($ANNEX_WORKFLOW_NAME) has $ANNEX_WORKFLOW_BAD_COUNT non-passing reported check-run(s) (#655) — included below regardless of required-name scoping."
+      log "gate (a): repo_lint_local.yml annex workflow ($ANNEX_WORKFLOW_NAME) has $ANNEX_WORKFLOW_BAD_COUNT non-passing reported check-run(s) after winner-selection (#655) — included below regardless of required-name scoping."
       BAD_CHECKS=$(echo "$BAD_CHECKS" | jq --argjson extra "$ANNEX_WORKFLOW_BAD" '(. + $extra) | unique')
     fi
   fi
@@ -1170,16 +1320,34 @@ else
   # way requiring its presence would -- this only closes the narrower
   # gap of an annex that already reports under the exact conventional
   # name while we cannot confirm anything more precise.
+  #
+  # #655 Codex P2 round 13: this fallback has the same stale-vs-fresh
+  # rerun exposure the workflow-wide scan above just fixed (a name match
+  # alone doesn't dedupe multiple reported attempts), so apply the same
+  # group-by-name, pending-preferred-else-latest-completed winner
+  # selection here too -- there is exactly one possible name group
+  # ("repo-lint-local", enforced by the select() below) but group_by
+  # still resolves the zero-matches case to an empty array with no extra
+  # branching.
   ANNEX_NAME_FALLBACK_BAD=$(echo "$ANNEX_SCAN_ROLLUP_JSON" | jq '
-    [.statusCheckRollup[]
-      | select((.name // .context // "") == "repo-lint-local")
-      | {
-          label: (.name // .context // "?"),
-          workflow: (.workflowName // ""),
-          result: (.conclusion // .state // "")
-        }
-      | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
-    ]
+    [.statusCheckRollup[] | select((.name // .context // "") == "repo-lint-local")]
+    | group_by(.name // .context // "?")
+    | [
+        .[]
+        | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end))) as $pending
+        | if ($pending | length) > 0
+          then $pending[0]
+          else (sort_by(.completedAt // .startedAt // "") | last)
+          end
+      ] as $winners
+    | [$winners[]
+        | {
+            label: (.name // .context // "?"),
+            workflow: (.workflowName // ""),
+            result: (.conclusion // .state // "")
+          }
+        | select((.result != "SUCCESS") and (.result != "SKIPPED") and (.result != "NEUTRAL"))
+      ]
   ')
   ANNEX_NAME_FALLBACK_BAD_COUNT=$(echo "$ANNEX_NAME_FALLBACK_BAD" | jq 'length')
   if [ "$ANNEX_NAME_FALLBACK_BAD_COUNT" -gt 0 ]; then

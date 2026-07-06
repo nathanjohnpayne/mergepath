@@ -1197,33 +1197,87 @@ jobs:
               # computed above); push compares the ref actually being
               # pushed, which for a same-repo PRs synchronize is the PRs
               # own HEAD ref (annex_head_branch), not base. Matching uses
-              # File.fnmatch, refined per #655 round 12 ("honor GitHub
-              # Actions branch glob semantics", found on the
-              # codex-review-check.sh copy and mirrored here): GitHub docs
-              # specify a single `*` does NOT cross a `/` (so `feature/*`
-              # excludes `feature/foo/bar`) while `**` DOES (Ruby fnmatch
-              # with FNM_PATHNAME correctly restricts `*` but ALSO
-              # restricts `**`, which is not the desired behavior --
-              # confirmed empirically -- so PATHNAME is applied only when
-              # the pattern has no `**`); and patterns are evaluated IN
-              # ORDER with an optional `!` prefix negating a prior match
-              # (a later pattern overrides an earlier one for the same
-              # ref), which a plain `any?` check ignored entirely. An
-              # unknown/unresolvable branch still conservatively
-              # disqualifies rather than guessing.
+              # Matching translates each pattern into an equivalent Ruby
+              # Regexp rather than using File.fnmatch, refined per #655
+              # round 13 ("use an Actions-compatible branch glob matcher",
+              # found on the codex-review-check.sh copy and mirrored here)
+              # to correct a gap in the round-12 fnmatch version: GitHub
+              # documented branch patterns support a `+` repetition
+              # quantifier on a preceding character/class (e.g.
+              # `v[12].[0-9]+.[0-9]+`, matching semver branches) -- a real
+              # regex feature fnmatch has no equivalent for (it always
+              # treats `+` as a literal character and returns false).
+              # Regexp natively supports quantifiers AND character classes,
+              # so translating once and matching via Regexp#match? handles
+              # the full documented syntax (*, **, ?, [...], +) with one
+              # mechanism instead of patching fnmatch further. `**` crosses
+              # `/` (translated to `.*`); a lone `*` does not (translated to
+              # `[^/]*`); `[...]` and a following `+` are copied through
+              # verbatim, since Ruby regex character-class and quantifier
+              # syntax already matches the GitHub semantics; everything
+              # else is regex-escaped. Patterns are evaluated IN ORDER with
+              # an optional `!` prefix negating a prior match (a later
+              # pattern overrides an earlier one for the same ref), which a
+              # plain `any?` check ignored entirely. An unknown/unresolvable
+              # branch still conservatively disqualifies rather than
+              # guessing.
               #
               # #655 Codex P2 round 11 ("treat tag-only push annexes as
-              # filtered", mirrored): a push trigger scoped by tags/
-              # tags-ignore only fires for TAG ref pushes, never for an
-              # ordinary branch push -- which is what a same-repo PRs
-              # synchronize always is. There is no PR-relative tag to
-              # evaluate against, so tags/tags-ignore presence blanket-
-              # disqualifies push specifically, unconditionally.
+              # filtered", narrowed in round 13 -- "do not treat tag
+              # filters as excluding branch pushes", found on the
+              # codex-review-check.sh copy and mirrored here): a push
+              # trigger scoped ONLY by tags/tags-ignore (no branches/
+              # branches-ignore at all) only fires for TAG ref pushes,
+              # never an ordinary branch push. But GitHub documents
+              # branches and tags as combinable on the SAME push trigger
+              # (runs for a matching branch push OR a matching tag push),
+              # so a trigger with BOTH keys must still be evaluated by its
+              # branches filter -- the round-11 version disqualified on
+              # tags presence alone, before branches ever got a chance to
+              # match, which wrongly filtered an annex GitHub would
+              # actually run for a matching branch push (the exact same
+              # push a same-repo PRs synchronize always is). Tags now only
+              # disqualifies when there is no branches/branches-ignore key
+              # at all to independently evaluate.
               on = doc.key?("on") ? doc["on"] : doc[true]
+              def branch_pattern_to_regex(pattern)
+                result = +""
+                chars = pattern.chars
+                i = 0
+                while i < chars.length
+                  c = chars[i]
+                  if c == "*" && chars[i + 1] == "*"
+                    result << ".*"
+                    i += 2
+                  elsif c == "*"
+                    result << "[^/]*"
+                    i += 1
+                  elsif c == "?"
+                    result << "[^/]"
+                    i += 1
+                  elsif c == "["
+                    j = i + 1
+                    j += 1 while j < chars.length && chars[j] != "]"
+                    result << chars[i..j].join
+                    i = j + 1
+                  elsif c == "+"
+                    result << "+"
+                    i += 1
+                  else
+                    result << Regexp.escape(c)
+                    i += 1
+                  end
+                end
+                Regexp.new("\\A#{result}\\z")
+              end
               def branch_matches?(pattern, branch)
                 return false unless pattern.is_a?(String) && branch.is_a?(String)
-                flags = pattern.include?("**") ? 0 : File::FNM_PATHNAME
-                File.fnmatch(pattern, branch, flags)
+                branch_pattern_to_regex(pattern).match?(branch)
+              rescue RegexpError, ArgumentError
+                false
+              end
+              def push_tag_only_excludes?(cfg)
+                (cfg.key?("tags") || cfg.key?("tags-ignore")) && !(cfg.key?("branches") || cfg.key?("branches-ignore"))
               end
               def branch_matches_list?(patterns, branch)
                 return false unless patterns.is_a?(Array)
@@ -1257,6 +1311,7 @@ jobs:
                   cfg = on[event]
                   next true unless cfg.is_a?(Hash)
                   next false if filter_keys.any? { |k| cfg.key?(k) }
+                  next false if event == "push" && push_tag_only_excludes?(cfg)
                   next false if branch_filter_excludes?(cfg, relevant_branch)
                   next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")
                   true
@@ -1265,7 +1320,7 @@ jobs:
                 end
               end
               pr_filter_keys = ["paths", "paths-ignore"]
-              push_filter_keys = ["paths", "paths-ignore", "tags", "tags-ignore"]
+              push_filter_keys = ["paths", "paths-ignore"]
               pr_unfiltered = trigger_unfiltered.call("pull_request", pr_filter_keys, ENV["ANNEX_BASE_BRANCH"])
               push_unfiltered = trigger_unfiltered.call("push", push_filter_keys, ENV["ANNEX_HEAD_BRANCH"])
               same_repo_pr = ENV["ANNEX_SAME_REPO_PR"] == "true"
@@ -1376,7 +1431,7 @@ jobs:
                                     startedAt
                                     completedAt
                                     isRequired(pullRequestNumber: $number)
-                                    checkSuite { workflowRun { workflow { name } } }
+                                    checkSuite { workflowRun { workflow { name resourcePath } } }
                                   }
                                   ... on StatusContext {
                                     context
@@ -1399,11 +1454,18 @@ jobs:
               cursor=$(echo "$page_json" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor')
               [ "$has_next" = "true" ] || break
             done
+            # workflowPath (#655 round 13, "disambiguate annex workflows
+            # beyond display name", found on the codex-review-check.sh copy
+            # and mirrored here): derived from the workflow FILE's
+            # GraphQL-reported resourcePath rather than its freely-editable
+            # display name, since the annex contract does not guarantee a
+            # unique .name across a consumer's workflows.
             rollup_json=$(echo "$rollup_contexts" | jq '{
               statusCheckRollup: (map({
                   name: .name,
                   context: .context,
                   workflowName: (.checkSuite.workflowRun.workflow.name // null),
+                  workflowPath: (((.checkSuite.workflowRun.workflow.resourcePath // "") | split("/") | last) // ""),
                   status: .status,
                   conclusion: .conclusion,
                   state: .state,
@@ -1463,6 +1525,24 @@ jobs:
               # requires; a name-scoped annex match ($workflow != "") is
               # unaffected, since annex checks are not expected to be
               # required at all.
+              #
+              # Self-caught while porting this winner-selection pattern into
+              # codex-review-check.sh for #655 round 13 ("ignore stale annex
+              # runs after a green rerun"): `["PENDING","EXPECTED"] |
+              # index(.state // "")` rebinds `.` to the piped-in array
+              # literal for the REST of that expression, so `.state` tries
+              # to index an array with a string and jq hard-errors --
+              # exactly the same "sub-pipeline rebinds dot" hazard the
+              # required-name filter in codex-review-check.sh already
+              # documents and guards against for `$label_name`. Latent since
+              # round 6/11 (never triggered here because every entry seen so
+              # far has been a CheckRun with a non-null .status, so the
+              # buggy StatusContext-only `else` branch never actually ran),
+              # but a classic Statuses-API context reaching this branch
+              # would fail the whole jq call regardless of its .state value.
+              # Fixed by binding .state to $ann_state BEFORE the array-literal
+              # pipe, verified against both CheckRun- and StatusContext-shaped
+              # entries (PENDING/EXPECTED/SUCCESS/absent .state) directly.
               winners=$(echo "$rollup_json" | jq -c --arg name "$check_name" --arg workflow "$check_workflow" '
                 [.statusCheckRollup[]
                   | select((.name // .context // "") == $name)
@@ -1472,7 +1552,7 @@ jobs:
                 | ($matches | group_by(.workflowName // "")) as $groups
                 | [
                     $groups[]
-                    | (map(select(if (.status != null) then (.status != "COMPLETED") else (["PENDING","EXPECTED"] | index(.state // "")) end))) as $pending
+                    | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end))) as $pending
                     | if ($pending | length) > 0
                       then $pending[0]
                       else (sort_by(.completedAt // .startedAt // "") | last)
@@ -1484,9 +1564,9 @@ jobs:
                 all_done=0
                 continue
               fi
-              pending_count=$(echo "$winners" | jq '[.[] | select(if (.status != null) then (.status != "COMPLETED") else (["PENDING","EXPECTED"] | index(.state // "")) end)] | length')
+              pending_count=$(echo "$winners" | jq '[.[] | select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end)] | length')
               if [ "$pending_count" -gt 0 ]; then
-                pending_status=$(echo "$winners" | jq -r '[.[] | select(if (.status != null) then (.status != "COMPLETED") else (["PENDING","EXPECTED"] | index(.state // "")) end)][0].status // .state // ""')
+                pending_status=$(echo "$winners" | jq -r '[.[] | select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end)][0].status // .state // ""')
                 echo "::notice::Required check run '$check_name' is $pending_status on current HEAD $sha; waiting for completion."
                 all_done=0
                 continue
@@ -1526,8 +1606,21 @@ jobs:
               # for one that may legitimately never exist (a path-filtered
               # annex outside this PR's diff) would time out and refuse
               # auto-merge on every such PR, forever.
-              annex_matches=$(echo "$rollup_json" | jq -c --arg workflow "$annex_workflow" '
-                [.statusCheckRollup[] | select((.workflowName // "") == $workflow)]')
+              #
+              # #655 Codex P2 round 13 ("disambiguate annex workflows beyond
+              # display name", found on the codex-review-check.sh copy and
+              # mirrored here): matching on .workflowName risked either
+              # masking the real annex behind an unrelated same-named
+              # workflow (false clean, auto-merge arms early) or blocking on
+              # an unrelated same-named workflow's failure (false red,
+              # refuses auto-merge forever). .workflowPath is derived from
+              # the GraphQL-reported resourcePath of the workflow FILE
+              # itself, not its freely-editable display name, so match on
+              # the known, fixed annex filename instead. A StatusContext
+              # (no checkSuite at all) safely resolves workflowPath to ""
+              # and can never collide with this literal.
+              annex_matches=$(echo "$rollup_json" | jq -c '
+                [.statusCheckRollup[] | select((.workflowPath // "") == "repo_lint_local.yml")]')
               annex_match_count=$(echo "$annex_matches" | jq 'length')
               if [ "$annex_match_count" -eq 0 ] && [ "$annex_unfiltered" = "true" ]; then
                 # #655 Codex P1 round 7 ("wait for unfiltered annex workflow
@@ -1544,17 +1637,36 @@ jobs:
                 echo "::notice::repo_lint_local.yml annex workflow '$annex_workflow' has not reported yet (unfiltered trigger, so it is expected to); waiting for it to start on current HEAD $sha (#655)."
                 all_done=0
               else
-                annex_pending=$(echo "$annex_matches" | jq -c '[.[] | select(if (.status != null) then (.status != "COMPLETED") else (["PENDING","EXPECTED"] | index(.state // "")) end)]')
+                annex_pending=$(echo "$annex_matches" | jq -c '[.[] | select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end)]')
                 annex_pending_count=$(echo "$annex_pending" | jq 'length')
                 if [ "$annex_pending_count" -gt 0 ]; then
                   echo "::notice::repo_lint_local.yml annex workflow '$annex_workflow' has $annex_pending_count check-run(s) still in progress on current HEAD $sha; waiting for completion (#655)."
                   all_done=0
                 else
-                  annex_bad=$(echo "$annex_matches" | jq -c '[.[] | select((.conclusion // .state // "") as $r | ($r != "SUCCESS" and $r != "SKIPPED" and $r != "NEUTRAL"))]')
+                  # #655 Codex P2 round 13 ("ignore stale annex runs after a
+                  # green rerun", found on the codex-review-check.sh copy
+                  # and mirrored here): every entry reaching this branch is
+                  # already terminal (annex_pending above is zero), but the
+                  # annex's own workflow can legitimately report more than
+                  # one TERMINAL entry per job name for the current SHA -- a
+                  # failed push-triggered run followed by a successful
+                  # pull_request run, or a failed job manually rerun to a
+                  # later success. Without grouping, an old superseded
+                  # FAILURE never leaves the rollup and would refuse
+                  # auto-merge forever even after the same-named job went
+                  # green. Group by check name and keep only the
+                  # latest-completed entry per name (mirrors the required-
+                  # check winners query above, minus the pending branch
+                  # already handled by annex_pending) before judging
+                  # bad-ness.
+                  annex_bad=$(echo "$annex_matches" | jq -c '
+                    group_by(.name // .context // "?")
+                    | [.[] | (sort_by(.completedAt // .startedAt // "") | last)]
+                    | [.[] | select((.conclusion // .state // "") as $r | ($r != "SUCCESS" and $r != "SKIPPED" and $r != "NEUTRAL"))]')
                   annex_bad_count=$(echo "$annex_bad" | jq 'length')
                   if [ "$annex_bad_count" -gt 0 ]; then
                     annex_bad_summary=$(echo "$annex_bad" | jq -r '[.[] | (.conclusion // .state // "none")] | join(", ")')
-                    echo "::error::repo_lint_local.yml annex workflow '$annex_workflow' has $annex_bad_count non-passing reported check-run(s) on current HEAD $sha (conclusion=$annex_bad_summary); refusing auto-merge (#655)."
+                    echo "::error::repo_lint_local.yml annex workflow '$annex_workflow' has $annex_bad_count non-passing reported check-run(s) after winner-selection on current HEAD $sha (conclusion=$annex_bad_summary); refusing auto-merge (#655)."
                     exit 1
                   fi
                 fi
