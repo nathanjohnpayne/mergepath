@@ -210,12 +210,32 @@ fi
 # same-repo PRs synchronize is its own HEAD ref, not base -- these must
 # be genuinely different variables/inputs, not the same one reused.
 if grep -qF 'def branch_filter_excludes?(cfg, branch)' "$SCRIPT" \
-   && grep -qF 'File.fnmatch(pattern, branch)' "$SCRIPT" \
+   && grep -qF 'def branch_matches?(pattern, branch)' "$SCRIPT" \
    && grep -qF 'pr_unfiltered = trigger_unfiltered.call("pull_request", pr_filter_keys, ENV["ANNEX_BASE_BRANCH"])' "$SCRIPT" \
    && grep -qF 'push_unfiltered = trigger_unfiltered.call("push", push_filter_keys, ENV["ANNEX_HEAD_BRANCH"])' "$SCRIPT"; then
   pass "codex-review-check.sh evaluates branches/branches-ignore via fnmatch against the correct ref per event type (#655 round 11)"
 else
   fail "codex-review-check.sh does not evaluate branches/branches-ignore against the real base/head ref (#655 round 11)"
+fi
+
+# Codex P2 (#655 round 12, "honor GitHub Actions branch glob semantics"):
+# GitHub docs specify a single `*` does NOT cross a `/` (feature/* excludes
+# feature/foo/bar) while `**` DOES -- Ruby fnmatch with FNM_PATHNAME
+# correctly restricts `*` but ALSO restricts `**`, so PATHNAME is applied
+# only when the pattern has no `**`. Patterns are also evaluated IN ORDER
+# with an optional `!` prefix negating a prior match, which the round-11
+# `any?` check ignored entirely.
+if grep -qF 'flags = pattern.include?("**") ? 0 : File::FNM_PATHNAME' "$SCRIPT"; then
+  pass "codex-review-check.sh applies FNM_PATHNAME only for non-globstar patterns, so single * does not cross / while ** does (#655 round 12)"
+else
+  fail "codex-review-check.sh does not distinguish single-star from globstar branch-pattern matching (#655 round 12)"
+fi
+if grep -qF 'def branch_matches_list?(patterns, branch)' "$SCRIPT" \
+   && grep -qF 'included = false if branch_matches?(raw[1..], branch)' "$SCRIPT" \
+   && grep -qF 'included = true if branch_matches?(raw, branch)' "$SCRIPT"; then
+  pass "codex-review-check.sh evaluates branch patterns in order with ! negation, a later pattern overriding an earlier one (#655 round 12)"
+else
+  fail "codex-review-check.sh does not evaluate branch patterns in order with ! negation support (#655 round 12)"
 fi
 
 # An unresolvable/unknown branch must conservatively disqualify (treat as

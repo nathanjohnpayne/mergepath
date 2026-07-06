@@ -822,10 +822,18 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
       # pull_request compares the PRs BASE ref (ANNEX_BASE_BRANCH); push
       # compares the ref actually being pushed, which for a same-repo PRs
       # synchronize is the PRs own HEAD ref (ANNEX_HEAD_BRANCH), not base.
-      # Matching uses File.fnmatch (glob semantics close enough to
-      # GitHubs own branch-filter globbing for the common cases; an
-      # unknown/unresolvable branch conservatively disqualifies rather
-      # than guessing).
+      # Matching uses File.fnmatch, refined per #655 round 12 ("honor
+      # GitHub Actions branch glob semantics") to correct two gaps found
+      # in the round-11 version: GitHub docs specify a single `*` does
+      # NOT cross a `/` (so `feature/*` excludes `feature/foo/bar`) while
+      # `**` DOES (Ruby fnmatch with FNM_PATHNAME correctly restricts `*`
+      # but ALSO restricts `**`, which is not the desired behavior --
+      # confirmed empirically -- so PATHNAME is applied only when the
+      # pattern has no `**`); and patterns are evaluated IN ORDER with an
+      # optional `!` prefix negating a prior match (a later pattern
+      # overrides an earlier one for the same ref), which the previous
+      # `any?` check ignored entirely. An unknown/unresolvable branch
+      # still conservatively disqualifies rather than guessing.
       #
       # #655 Codex P2 round 11 ("treat tag-only push annexes as
       # filtered"): a push trigger scoped by tags/tags-ignore (e.g.
@@ -839,17 +847,29 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
       on = doc.key?("on") ? doc["on"] : doc[true]
       def branch_matches?(pattern, branch)
         return false unless pattern.is_a?(String) && branch.is_a?(String)
-        File.fnmatch(pattern, branch)
+        flags = pattern.include?("**") ? 0 : File::FNM_PATHNAME
+        File.fnmatch(pattern, branch, flags)
+      end
+      def branch_matches_list?(patterns, branch)
+        return false unless patterns.is_a?(Array)
+        included = false
+        patterns.each do |raw|
+          next unless raw.is_a?(String)
+          if raw.start_with?("!")
+            included = false if branch_matches?(raw[1..], branch)
+          else
+            included = true if branch_matches?(raw, branch)
+          end
+        end
+        included
       end
       def branch_filter_excludes?(cfg, branch)
         return true if (cfg.key?("branches") || cfg.key?("branches-ignore")) && !(branch.is_a?(String) && !branch.empty?)
         if cfg.key?("branches")
-          patterns = cfg["branches"]
-          return true unless patterns.is_a?(Array) && patterns.any? { |p| branch_matches?(p, branch) }
+          return true unless branch_matches_list?(cfg["branches"], branch)
         end
         if cfg.key?("branches-ignore")
-          patterns = cfg["branches-ignore"]
-          return true if patterns.is_a?(Array) && patterns.any? { |p| branch_matches?(p, branch) }
+          return true if branch_matches_list?(cfg["branches-ignore"], branch)
         end
         false
       end

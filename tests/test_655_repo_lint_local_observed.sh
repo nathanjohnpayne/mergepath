@@ -318,6 +318,30 @@ assert_grep "agent-review: fetches statusCheckRollup via a direct graphql query 
 assert_grep "agent-review: the canonical (workflow==\"\") match additionally requires isRequired==true (#655 round 11)" \
   "$W/agent-review.yml" 'select($workflow != "" or (.isRequired == true))'
 
+# Codex P1 (#655 round 12, "paginate the status check rollup"): a PR with
+# more than 100 statusCheckRollup contexts (this PR itself already had
+# 160+, confirmed live) silently hid every entry past the first page from
+# both the required-check and annex workflow-wide scans -- auto-merge
+# could arm while an unobserved check past page 1 was still red. Paged
+# through with the Relay cursor rather than a bigger fixed page size,
+# since the rollup can grow without bound on a long-lived PR.
+assert_grep "agent-review: pages through statusCheckRollup contexts via the Relay cursor instead of a single fixed-size page (#655 round 12)" \
+  "$W/agent-review.yml" 'contexts(first: 100, after: $cursor)'
+assert_grep "agent-review: the pagination loop checks hasNextPage and accumulates entries across pages (#655 round 12)" \
+  "$W/agent-review.yml" 'pageInfo { hasNextPage endCursor }'
+assert_grep "agent-review: accumulates each page's contexts into the running rollup array (#655 round 12)" \
+  "$W/agent-review.yml" 'rollup_contexts=$(jq -c -n --argjson a "$rollup_contexts" --argjson b "$page_nodes"'
+
+# Codex P2 (#655 round 12, "honor GitHub Actions branch glob semantics",
+# found on the codex-review-check.sh copy and mirrored here): GitHub docs
+# specify a single `*` does NOT cross a `/` while `**` DOES; patterns are
+# also evaluated IN ORDER with an optional `!` prefix negating a prior
+# match, which the round-11 `any?` check ignored entirely.
+assert_grep "agent-review: applies FNM_PATHNAME only for non-globstar patterns, so single * does not cross / while ** does (#655 round 12)" \
+  "$W/agent-review.yml" 'flags = pattern.include?("**") ? 0 : File::FNM_PATHNAME'
+assert_grep "agent-review: evaluates branch patterns in order with ! negation, a later pattern overriding an earlier one (#655 round 12)" \
+  "$W/agent-review.yml" 'def branch_matches_list?(patterns, branch)'
+
 # auto-clear-blocking-labels.yml: the workflow_run trigger list observes the
 # annex's completion too (verified against a live consumer's repo_lint_local.yml
 # workflow name, per #655).

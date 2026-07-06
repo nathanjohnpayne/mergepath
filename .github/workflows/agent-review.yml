@@ -1197,10 +1197,20 @@ jobs:
               # computed above); push compares the ref actually being
               # pushed, which for a same-repo PRs synchronize is the PRs
               # own HEAD ref (annex_head_branch), not base. Matching uses
-              # File.fnmatch (glob semantics close enough to GitHubs own
-              # branch-filter globbing for the common cases; an unknown/
-              # unresolvable branch conservatively disqualifies rather
-              # than guessing).
+              # File.fnmatch, refined per #655 round 12 ("honor GitHub
+              # Actions branch glob semantics", found on the
+              # codex-review-check.sh copy and mirrored here): GitHub docs
+              # specify a single `*` does NOT cross a `/` (so `feature/*`
+              # excludes `feature/foo/bar`) while `**` DOES (Ruby fnmatch
+              # with FNM_PATHNAME correctly restricts `*` but ALSO
+              # restricts `**`, which is not the desired behavior --
+              # confirmed empirically -- so PATHNAME is applied only when
+              # the pattern has no `**`); and patterns are evaluated IN
+              # ORDER with an optional `!` prefix negating a prior match
+              # (a later pattern overrides an earlier one for the same
+              # ref), which a plain `any?` check ignored entirely. An
+              # unknown/unresolvable branch still conservatively
+              # disqualifies rather than guessing.
               #
               # #655 Codex P2 round 11 ("treat tag-only push annexes as
               # filtered", mirrored): a push trigger scoped by tags/
@@ -1212,17 +1222,29 @@ jobs:
               on = doc.key?("on") ? doc["on"] : doc[true]
               def branch_matches?(pattern, branch)
                 return false unless pattern.is_a?(String) && branch.is_a?(String)
-                File.fnmatch(pattern, branch)
+                flags = pattern.include?("**") ? 0 : File::FNM_PATHNAME
+                File.fnmatch(pattern, branch, flags)
+              end
+              def branch_matches_list?(patterns, branch)
+                return false unless patterns.is_a?(Array)
+                included = false
+                patterns.each do |raw|
+                  next unless raw.is_a?(String)
+                  if raw.start_with?("!")
+                    included = false if branch_matches?(raw[1..], branch)
+                  else
+                    included = true if branch_matches?(raw, branch)
+                  end
+                end
+                included
               end
               def branch_filter_excludes?(cfg, branch)
                 return true if (cfg.key?("branches") || cfg.key?("branches-ignore")) && !(branch.is_a?(String) && !branch.empty?)
                 if cfg.key?("branches")
-                  patterns = cfg["branches"]
-                  return true unless patterns.is_a?(Array) && patterns.any? { |p| branch_matches?(p, branch) }
+                  return true unless branch_matches_list?(cfg["branches"], branch)
                 end
                 if cfg.key?("branches-ignore")
-                  patterns = cfg["branches-ignore"]
-                  return true if patterns.is_a?(Array) && patterns.any? { |p| branch_matches?(p, branch) }
+                  return true if branch_matches_list?(cfg["branches-ignore"], branch)
                 end
                 false
               end
@@ -1320,31 +1342,48 @@ jobs:
           while :; do
             all_done=1
             check_count=$(echo "$required_checks_json" | jq 'length')
-            rollup_json=$(gh api graphql -f query='
-              query($owner: String!, $name: String!, $number: Int!) {
-                repository(owner: $owner, name: $name) {
-                  pullRequest(number: $number) {
-                    commits(last: 1) {
-                      nodes {
-                        commit {
-                          statusCheckRollup {
-                            contexts(first: 100) {
-                              nodes {
-                                __typename
-                                ... on CheckRun {
-                                  name
-                                  status
-                                  conclusion
-                                  startedAt
-                                  completedAt
-                                  isRequired(pullRequestNumber: $number)
-                                  checkSuite { workflowRun { workflow { name } } }
-                                }
-                                ... on StatusContext {
-                                  context
-                                  state
-                                  createdAt
-                                  isRequired(pullRequestNumber: $number)
+            # #655 Codex P1 round 12 ("paginate the status check rollup"):
+            # a PR with more than 100 statusCheckRollup contexts (this PR
+            # itself already has 160+, confirmed live while working on
+            # this fix) silently hid every entry past the first page from
+            # both the required-check and annex workflow-wide scans below
+            # -- auto-merge could arm while an unobserved check past page
+            # 1 was still red. Page through with the Relay cursor
+            # (pageInfo.hasNextPage/endCursor) rather than raising the
+            # page size, since the rollup can grow without bound as more
+            # checks/review rounds accumulate on a long-lived PR. An empty
+            # $cursor correctly fetches the first page (confirmed
+            # empirically), so one query template covers every page.
+            rollup_contexts="[]"
+            cursor=""
+            while :; do
+              page_json=$(gh api graphql -f query='
+                query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) {
+                      commits(last: 1) {
+                        nodes {
+                          commit {
+                            statusCheckRollup {
+                              contexts(first: 100, after: $cursor) {
+                                pageInfo { hasNextPage endCursor }
+                                nodes {
+                                  __typename
+                                  ... on CheckRun {
+                                    name
+                                    status
+                                    conclusion
+                                    startedAt
+                                    completedAt
+                                    isRequired(pullRequestNumber: $number)
+                                    checkSuite { workflowRun { workflow { name } } }
+                                  }
+                                  ... on StatusContext {
+                                    context
+                                    state
+                                    createdAt
+                                    isRequired(pullRequestNumber: $number)
+                                  }
                                 }
                               }
                             }
@@ -1353,22 +1392,26 @@ jobs:
                       }
                     }
                   }
-                }
-              }' -f owner="$repo_owner" -f name="$repo_name" -F number="$PR_NUMBER" \
-              --jq '{
-                statusCheckRollup: (.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes
-                  | map({
-                      name: .name,
-                      context: .context,
-                      workflowName: (.checkSuite.workflowRun.workflow.name // null),
-                      status: .status,
-                      conclusion: .conclusion,
-                      state: .state,
-                      startedAt: .startedAt,
-                      completedAt: .completedAt,
-                      isRequired: .isRequired
-                    }))
-              }')
+                }' -f owner="$repo_owner" -f name="$repo_name" -F number="$PR_NUMBER" -f cursor="$cursor")
+              page_nodes=$(echo "$page_json" | jq -c '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes')
+              rollup_contexts=$(jq -c -n --argjson a "$rollup_contexts" --argjson b "$page_nodes" '$a + $b')
+              has_next=$(echo "$page_json" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage')
+              cursor=$(echo "$page_json" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor')
+              [ "$has_next" = "true" ] || break
+            done
+            rollup_json=$(echo "$rollup_contexts" | jq '{
+              statusCheckRollup: (map({
+                  name: .name,
+                  context: .context,
+                  workflowName: (.checkSuite.workflowRun.workflow.name // null),
+                  status: .status,
+                  conclusion: .conclusion,
+                  state: .state,
+                  startedAt: .startedAt,
+                  completedAt: .completedAt,
+                  isRequired: .isRequired
+                }))
+            }')
             for ((i = 0; i < check_count; i++)); do
               check_name=$(echo "$required_checks_json" | jq -r ".[$i].name")
               check_workflow=$(echo "$required_checks_json" | jq -r ".[$i].workflow")
