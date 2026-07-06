@@ -739,6 +739,33 @@ EOF
 # verbatim and the allowlist plays no role. The trust argument mirrors the
 # #429 head-pinned exemption: only inputs the PR author cannot influence
 # may decide what the reviewer never sees.
+# Shared awk function that recovers the b/-side (new) path from a `diff --git`
+# header, used by BOTH awk passes in p4b_trim_review_diff so the omit decision
+# and the omission-placeholder disclosure key off an identical path (#697). For
+# an edit header `diff --git a/P b/P` the a/- and b/-sides are equal, so the
+# real b-path is the value V for which the remainder after stripping the
+# leading "a/" is exactly "V b/V"; this is recovered even when V itself contains
+# the literal " b/" (e.g. P = `foo b/bar`), which a bare greedy
+# `sub(/^diff --git a\/.* b\//, "", p)` mis-splits. When the two sides differ
+# (rename/copy: a != b) no symmetric split exists, so it falls back to the
+# greedy last-" b/" tail — the same value the pre-#697 code produced.
+P4B_DIFF_BSIDE_AWK_FN='
+function p4b_diff_bside(hdr,   rest, greedy, i, nxt, left, right) {
+  rest = hdr; sub(/^diff --git a\//, "", rest)
+  greedy = hdr; sub(/^diff --git a\/.* b\//, "", greedy)
+  i = index(rest, " b/")
+  while (i > 0) {
+    left = substr(rest, 1, i - 1)
+    right = substr(rest, i + 3)
+    if (left == right) return left
+    nxt = index(substr(rest, i + 1), " b/")
+    if (nxt == 0) break
+    i = i + nxt
+  }
+  return greedy
+}
+'
+
 p4b_trim_review_diff() {
   local in="$1" out="$2" max="$3" globs="${4:-}" total sizes omit="" projected
   local b i bside aside rfrom rto p plh plen
@@ -758,6 +785,7 @@ p4b_trim_review_diff() {
   # " b/<bside>" suffix, so it uses the same split point as the b/-side.
   # LC_ALL=C keeps length() byte-exact.
   sizes="$(LC_ALL=C awk '
+    '"$P4B_DIFF_BSIDE_AWK_FN"'
     /^diff --git /{ n++; hdr[n] = $0; bytes[n] = 0; rfrom[n] = ""; rto[n] = "" }
     n > 0 { bytes[n] += length($0) + 1 }
     /^rename from /{ if (n > 0 && rfrom[n] == "") rfrom[n] = substr($0, 13) }
@@ -766,7 +794,7 @@ p4b_trim_review_diff() {
     /^copy to /    { if (n > 0 && rto[n]   == "") rto[n]   = substr($0, 9)  }
     END {
       for (i = 1; i <= n; i++) {
-        b = hdr[i]; sub(/^diff --git a\/.* b\//, "", b)
+        b = p4b_diff_bside(hdr[i])
         a = hdr[i]; sub(/^diff --git a\//, "", a)
         suf = " b/" b
         if (substr(a, length(a) - length(suf) + 1) == suf) a = substr(a, 1, length(a) - length(suf))
@@ -816,14 +844,18 @@ $sizes
 EOF
   [ "$projected" -le "$max" ] || return 1
   LC_ALL=C awk -v omit_list="$omit" '
+    '"$P4B_DIFF_BSIDE_AWK_FN"'
     BEGIN { split(omit_list, parts, " "); for (k in parts) if (parts[k] != "") omit[parts[k]] = 1 }
+    # #697: name the omitted file with the SAME b/-side derivation the sizes
+    # pipeline used to key the omit decision (p4b_diff_bside, defined above),
+    # so the disclosure can never name a different path than the one omission
+    # was judged on. A bare greedy `sub(/^diff --git a\/.* b\//, "", p)`
+    # mis-splits a header whose path contains the literal " b/".
     /^diff --git /{
       n++
       skipping = ((n "") in omit) ? 1 : 0
       if (skipping) {
-        p = $0
-        sub(/^diff --git a\/.* b\//, "", p)
-        printf "[phase-4b diff-budget: %s omitted - oversized diff section; see the prompt note]\n", p
+        printf "[phase-4b diff-budget: %s omitted - oversized diff section; see the prompt note]\n", p4b_diff_bside($0)
       } else print
       next
     }
@@ -843,11 +875,25 @@ EOF
 # an empty or missing file prints nothing. (#635: the previous rc!=0
 # handling guessed "auth" for every failure — a context-overflow rc=1 read
 # as a login problem while the CLI's real error was discarded.)
+#
+# #696: the tail is interpolated straight into p4b_die messages that can
+# surface in workflow logs and the Phase 4b manual-fallback comment. A
+# reviewer CLI that emits an auth error carrying a token/key in stderr would
+# otherwise leak it there, so mask obvious secret patterns BEFORE returning.
+# The redaction pass is intentionally over-broad (any word that looks like a
+# credential is masked) and portable: `sed -E` (ERE) is honored by both BSD
+# sed (macOS bash-3.2) and GNU sed, the same form other scripts in this repo
+# already rely on.
 p4b_stderr_tail() {
   [ -n "${1:-}" ] && [ -s "$1" ] || return 0
   tail -c 400 "$1" \
     | LC_ALL=C tr -c '[:print:]' ' ' \
-    | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ *//' -e 's/ *$//'
+    | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ *//' -e 's/ *$//' \
+    | sed -E \
+        -e 's/(gh[posru]|github_pat)_[A-Za-z0-9_]+/\1_[REDACTED]/g' \
+        -e 's/sk-[A-Za-z0-9_-]+/sk-[REDACTED]/g' \
+        -e 's/([Bb]earer )[A-Za-z0-9._~+\/-]+=*/\1[REDACTED]/g' \
+        -e 's/([Tt]oken|[Kk]ey|[Ss]ecret|[Pp]assword|[Aa]uthorization)([[:space:]]*[=:][[:space:]]*)[^[:space:]]+/\1\2[REDACTED]/g'
 }
 
 # --- plan-only reviewer CLI auth guards ------------------------------------
