@@ -312,6 +312,18 @@ ALLOW_LIST=(
   # to travel.
   "scripts/project-doc-sync.sh"
 
+  # The #691 admin-merge statusCheckRollup pagination guard — hub-only
+  # break-glass operator tooling. scripts/admin-merge-codeowners-blocked.sh
+  # is the --admin CODEOWNERS-deadlock escape hatch (mergepath-only; no
+  # consumer runs it), and its offline PATH-shim suite rides with it.
+  # check_admin_merge_codeowners_blocked ships via the scripts/ci/ kit and
+  # names both in comments, but the wrapper runs the TEST, which SKIPs on
+  # consumers via the both-absent marker idiom, so neither file needs to
+  # travel. repo_lint.yml's wiring comment names the script for the same
+  # reason. Same posture as audit-codex-latency.sh above.
+  "scripts/admin-merge-codeowners-blocked.sh"
+  "tests/test_admin_merge_codeowners_blocked.sh"
+
   # The #601 consumer-safety net itself — hub-only BY DESIGN: it encodes
   # the hub-only removal list (this ALLOW_LIST + the bootstrap mirror
   # excludes) to build a consumer-shaped fixture, so it can never travel.
