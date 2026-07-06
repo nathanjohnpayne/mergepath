@@ -208,6 +208,140 @@ src/auth/login.ts'
 assert_eq "end-to-end: parse output piped into matcher" "$want" "$got"
 
 echo
+echo "external_review_fingerprint.sh tests (#705)"
+
+FINGERPRINT="scripts/workflow/external_review_fingerprint.sh"
+CARRYFORWARD="scripts/workflow/external_review_carryforward.sh"
+for f in "$FINGERPRINT" "$CARRYFORWARD"; do
+  if [ ! -x "$f" ]; then
+    echo "check_workflow_parsers: missing executable required file: $f" >&2
+    exit 1
+  fi
+done
+
+fp_tmp=$(mktemp -d "${TMPDIR:-/tmp}/external-review-fp.XXXXXX")
+cat >"$fp_tmp/files.json" <<'JSON'
+[
+  {"filename":".github/dependabot.yml","additions":1,"deletions":0},
+  {"filename":"README.md","additions":2,"deletions":0}
+]
+JSON
+cat >"$fp_tmp/review-policy.yml" <<'YAML'
+external_review_threshold: 300
+external_review_paths:
+  - ".github/**"
+available_reviewers:
+  - nathanpayne-codex
+author_identity: nathanjohnpayne
+YAML
+
+fp_stub="$fp_tmp/bin"
+mkdir -p "$fp_stub"
+cat >"$fp_stub/gh" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" != "api" ]; then
+  echo "stub gh: unsupported invocation: $*" >&2
+  exit 1
+fi
+shift
+if [ "${1:-}" = "--paginate" ]; then
+  shift
+fi
+endpoint="${1:-}"
+case "$endpoint" in
+  repos/example/repo/git/trees/reviewed?recursive=1|repos/example/repo/git/trees/updated?recursive=1)
+    cat <<'JSON'
+{"truncated":false,"tree":[
+  {"path":".github/dependabot.yml","mode":"100644","type":"blob","sha":"same-dependabot-blob"},
+  {"path":"README.md","mode":"100644","type":"blob","sha":"readme-blob"}
+]}
+JSON
+    ;;
+  repos/example/repo/git/trees/changed?recursive=1)
+    cat <<'JSON'
+{"truncated":false,"tree":[
+  {"path":".github/dependabot.yml","mode":"100644","type":"blob","sha":"changed-dependabot-blob"},
+  {"path":"README.md","mode":"100644","type":"blob","sha":"readme-blob"}
+]}
+JSON
+    ;;
+  repos/example/repo/issues/7/comments)
+    cat <<'JSON'
+[{"user":{"login":"chatgpt-codex-connector[bot]"},"body":"Codex Review: Didn't find any major issues.\nReviewed commit: abc1234","created_at":"2026-07-06T10:00:00Z"}]
+JSON
+    ;;
+  repos/example/repo/pulls/7/reviews)
+    if [ "${STUB_CURRENT_REVIEW:-}" = "1" ]; then
+      cat <<'JSON'
+[{"user":{"login":"chatgpt-codex-connector[bot]"},"commit_id":"updated","submitted_at":"2026-07-06T11:00:00Z","state":"COMMENTED"}]
+JSON
+    else
+      echo '[]'
+    fi
+    ;;
+  repos/example/repo/commits/abc1234)
+    if [ "${2:-}" = "--jq" ]; then
+      echo "reviewed"
+    else
+      echo '{"sha":"reviewed"}'
+    fi
+    ;;
+  *)
+    echo "stub gh: unhandled endpoint: $endpoint" >&2
+    exit 1
+    ;;
+esac
+STUB
+chmod +x "$fp_stub/gh"
+
+reviewed_json=$(PATH="$fp_stub:$PATH" bash "$FINGERPRINT" --repo example/repo --pr 7 --ref reviewed --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+updated_json=$(PATH="$fp_stub:$PATH" bash "$FINGERPRINT" --repo example/repo --pr 7 --ref updated --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+changed_json=$(PATH="$fp_stub:$PATH" bash "$FINGERPRINT" --repo example/repo --pr 7 --ref changed --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+reviewed_fp=$(echo "$reviewed_json" | jq -r .fingerprint)
+updated_fp=$(echo "$updated_json" | jq -r .fingerprint)
+changed_fp=$(echo "$changed_json" | jq -r .fingerprint)
+if [ "$(echo "$reviewed_json" | jq -r .requires_review)" = "true" ] \
+   && [ "$reviewed_fp" = "$updated_fp" ] \
+   && [ "$reviewed_fp" != "$changed_fp" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review fingerprint is stable across base-only sync and changes on protected-path content"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review fingerprint stability/content-change regression" >&2
+fi
+
+carry_json=$(PATH="$fp_stub:$PATH" bash "$CARRYFORWARD" --repo example/repo --pr 7 --head updated --current-fingerprint "$updated_fp" --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+if [ "$(echo "$carry_json" | jq -r .carried)" = "true" ] \
+   && [ "$(echo "$carry_json" | jq -r .source_commit)" = "reviewed" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review carry-forward accepts prior Codex verdict with matching fingerprint"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review carry-forward did not accept matching prior Codex verdict" >&2
+fi
+
+carry_changed_json=$(PATH="$fp_stub:$PATH" bash "$CARRYFORWARD" --repo example/repo --pr 7 --head changed --current-fingerprint "$changed_fp" --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+if [ "$(echo "$carry_changed_json" | jq -r .carried)" = "false" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review carry-forward rejects prior Codex verdict when fingerprint changed"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review carry-forward accepted a changed protected-path fingerprint" >&2
+fi
+
+carry_current_review_json=$(STUB_CURRENT_REVIEW=1 PATH="$fp_stub:$PATH" bash "$CARRYFORWARD" --repo example/repo --pr 7 --head updated --current-fingerprint "$updated_fp" --config "$fp_tmp/review-policy.yml" --files-json "$fp_tmp/files.json")
+if [ "$(echo "$carry_current_review_json" | jq -r .carried)" = "false" ] \
+   && [ "$(echo "$carry_current_review_json" | jq -r .current_signal.kind)" = "review" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: external review carry-forward does not override a current-head Codex review signal"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: external review carry-forward overrode a current-head Codex review signal" >&2
+fi
+
+rm -rf "$fp_tmp"
+
+echo
 echo "parse_manifest_paths.sh tests — propagation PR review lane (#264)"
 
 MANIFEST_PARSE="scripts/workflow/parse_manifest_paths.sh"

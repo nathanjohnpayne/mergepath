@@ -346,6 +346,14 @@ coderabbit:
 #              inline findings on the `/pulls/{pr}/comments` endpoint, OR
 #            - a 👍 / `+1` reaction from `chatgpt-codex-connector[bot]`
 #              on the PR issue, posted after the latest commit, OR
+#            - a prior affirmative Codex issue-comment verdict whose
+#              `Reviewed commit` has the same external-review fingerprint
+#              as the current head, but only when the current head has no
+#              Codex signal of its own (#705). The fingerprint hashes the
+#              tree object IDs for the files that triggered external review
+#              (threshold-counted files and/or protected paths), so
+#              update-branch/base-only churn does not force redundant
+#              re-review while real content changes do.
 #            - **Phase 4b substitute** (when `allow_phase_4b_substitute:
 #              true`, see below): an `APPROVED` review on the current
 #              HEAD (`commit_id == HEAD_SHA`) from a non-author identity

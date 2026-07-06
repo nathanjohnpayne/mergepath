@@ -7,6 +7,7 @@ on:
 permissions:
   pull-requests: write
   contents: read
+  issues: write
 
 jobs:
   self-review-check:
@@ -246,57 +247,43 @@ jobs:
           fi
           echo "propagation_lane=false" >> "$GITHUB_OUTPUT"
 
-          # Read threshold from review-policy.yml
-          THRESHOLD=$(grep 'external_review_threshold:' "$CONFIG" | awk '{print $2}')
-          THRESHOLD=${THRESHOLD:-300}
+          # Compute the external-review trigger and same-content fingerprint
+          # from GitHub's PR file list. The fingerprint hashes the tree object
+          # IDs for the files that actually trigger external review
+          # (threshold-counted files and/or protected paths), so a pure
+          # update-branch/base-merge that leaves those files byte-identical
+          # keeps the same fingerprint even though HEAD_SHA changes (#705).
+          FILES_JSON=$(mktemp)
+          gh api --paginate "repos/${{ github.repository }}/pulls/$PR_NUMBER/files" \
+            | jq -s 'add // []' > "$FILES_JSON"
 
-          # Count lines changed (additions + deletions), excluding lockfiles and generated files
-          LINES_CHANGED=$(git diff --stat "$BASE_SHA"..."$HEAD_SHA" -- \
-            ':!*.lock' ':!*lock.json' ':!*.min.js' ':!*.min.css' \
-            ':!*.generated.*' ':!*.g.dart' ':!*.freezed.dart' \
-            | tail -1 | awk '{print $4+$6}')
-          LINES_CHANGED=${LINES_CHANGED:-0}
+          FINGERPRINT_JSON=$(bash scripts/workflow/external_review_fingerprint.sh \
+            --repo "${{ github.repository }}" \
+            --pr "$PR_NUMBER" \
+            --ref "$HEAD_SHA" \
+            --config "$CONFIG" \
+            --files-json "$FILES_JSON")
 
-          # Use >= to match REVIEW_POLICY.md: "Total lines changed >= external_review_threshold"
-          if [ "$LINES_CHANGED" -ge "$THRESHOLD" ]; then
-            NEEDS_REVIEW=true
-            REASONS="$REASONS- ${LINES_CHANGED} lines changed (threshold: ${THRESHOLD})%0A"
-          fi
+          NEEDS_REVIEW=$(echo "$FINGERPRINT_JSON" | jq -r '.requires_review')
+          FINGERPRINT=$(echo "$FINGERPRINT_JSON" | jq -r '.fingerprint // ""')
+          REASONS=$(echo "$FINGERPRINT_JSON" | jq -r '.reasons | map("- " + .) | join("%0A")')
 
-          # Extract external_review_paths entries from review-policy.yml.
-          # Delegates to scripts/workflow/parse_policy_list.sh, which is
-          # unit-tested by scripts/ci/check_workflow_parsers (see #57).
-          # History: the earlier inline `awk '/^key:/,/^[^ ]/'` range
-          # parser silently matched only the header line because the
-          # range-start pattern also matched the range-end condition.
-          # See #54 for the post-mortem.
-          PATHS=$(bash scripts/workflow/parse_policy_list.sh "$CONFIG" external_review_paths)
-
-          # Match changed files against patterns. Delegates to
-          # scripts/workflow/match_protected_paths.sh (bash `[[ ]]`
-          # pattern matching under the hood), which is unit-tested by
-          # scripts/ci/check_workflow_parsers (see #57). History: the
-          # earlier inline glob-to-regex sed pipeline double-transformed
-          # `*` and silently missed nested paths. See #54 for the
-          # post-mortem.
-          # (CHANGED_FILES is computed once near the top of this step,
-          # before the propagation-lane check.)
-
-          PATTERNS=()
-          while IFS= read -r line; do
-            [ -n "$line" ] && PATTERNS+=("$line")
-          done <<< "$PATHS"
-
-          if [ "${#PATTERNS[@]}" -gt 0 ]; then
-            MATCHED_FILES=$(printf '%s\n' "$CHANGED_FILES" | bash scripts/workflow/match_protected_paths.sh "${PATTERNS[@]}")
-          else
-            MATCHED_FILES=""
-          fi
-
-          if [ -n "$MATCHED_FILES" ]; then
-            NEEDS_REVIEW=true
-            FILE_LIST=$(echo "$MATCHED_FILES" | sort -u | grep -v '^$' | sed 's/^/  - /' | tr '\n' ',' | sed 's/,/%0A/g')
-            REASONS="${REASONS}- Protected paths modified:%0A${FILE_LIST}"
+          if [ "$NEEDS_REVIEW" = "true" ] && [ -n "$FINGERPRINT" ]; then
+            CARRY_JSON=$(bash scripts/workflow/external_review_carryforward.sh \
+              --repo "${{ github.repository }}" \
+              --pr "$PR_NUMBER" \
+              --head "$HEAD_SHA" \
+              --current-fingerprint "$FINGERPRINT" \
+              --config "$CONFIG" \
+              --files-json "$FILES_JSON")
+            if [ "$(echo "$CARRY_JSON" | jq -r '.carried')" = "true" ]; then
+              SOURCE_COMMIT=$(echo "$CARRY_JSON" | jq -r '.source_commit')
+              SOURCE_TIME=$(echo "$CARRY_JSON" | jq -r '.source_time')
+              echo "External-review carry-forward: Codex already cleared the same external-review fingerprint on $SOURCE_COMMIT at $SOURCE_TIME; skipping needs-external-review on base-only sync (#705)."
+              echo "needs_review=false" >> "$GITHUB_OUTPUT"
+              echo "reasons=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
 
           echo "needs_review=$NEEDS_REVIEW" >> "$GITHUB_OUTPUT"
