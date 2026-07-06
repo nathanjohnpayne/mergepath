@@ -89,8 +89,9 @@
 #
 # Full procedure: the risk-ranked fan-out order (riskiest → least, in
 # pairs), the canary-selection rule, and the change-handling playbook
-# live in docs/agents/propagation-ordering.md — reviewed monthly and
-# tracked in issue #492.
+# live in docs/agents/propagation-ordering.md — reviewed monthly, with
+# the dated review log on the repo wiki page
+# `Propagation-Wave-Order-Review-Log` (issue #492 retired 2026-07-06).
 
 # Schema version. Bumped on incompatible changes; the script refuses
 # to run against an unknown version so old scripts can't silently

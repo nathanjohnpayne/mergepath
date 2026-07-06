@@ -1,6 +1,6 @@
 # Propagation wave ordering and change-handling
 
-Status: **canonical, in-repo source of truth.** The order below is reviewed monthly and tracked in [mergepath#492](https://github.com/nathanjohnpayne/mergepath/issues/492); see [§ Maintenance](#maintenance) for how the doc and that issue stay in sync.
+Status: **canonical, in-repo source of truth.** The order below is reviewed monthly; the dated review log lives on the repo wiki page [Propagation-Wave-Order-Review-Log](https://github.com/nathanjohnpayne/mergepath/wiki/Propagation-Wave-Order-Review-Log). See [§ Maintenance](#maintenance) for how the doc and that log stay in sync.
 
 This is a **hub-only** doc — it governs how a canonical change is fanned out *from* mergepath *to* the 8 consumers via `scripts/sync-to-downstream.sh`. It is intentionally **not** in `.mergepath-sync.yml` (consumers don't run propagation waves). It complements [templated-propagation.md](templated-propagation.md) (the rendering engine) and the canary-first note in `.mergepath-sync.yml`.
 
@@ -83,8 +83,8 @@ The canary keeps the full advisory CodeRabbit pass — open it **without** `--co
 
 ## Maintenance
 
-- **This doc is canonical.** [mergepath#492](https://github.com/nathanjohnpayne/mergepath/issues/492) is the **monthly review log + tracker**, not a competing source — on a material order change the two are kept in lockstep (below).
+- **This doc is canonical.** The [Propagation-Wave-Order-Review-Log](https://github.com/nathanjohnpayne/mergepath/wiki/Propagation-Wave-Order-Review-Log) wiki page is the **monthly review log**, not a competing source — on a material order change the doc and the log are kept in lockstep (below). The log lived in [mergepath#492](https://github.com/nathanjohnpayne/mergepath/issues/492) until 2026-07-06, when it moved to the wiki so the recurring review no longer needs an always-open issue.
 - **Monthly review** (`propagation-order-monthly-review`, 1st of each month): re-measure per-consumer risk signals — config divergence (overrides / unique `facts`), churn (recent PR/line volume), recent propagation failures, framework/visibility changes.
-  - **No change** → comment `no change — order holds (YYYY-MM-DD)` on #492.
-  - **Material change** → update #492 *and* open a PR re-syncing the order table above, so the canonical doc never lags the review.
+  - **No change** → append a dated `No change — order holds (YYYY-MM-DD)` entry to the wiki review log.
+  - **Material change** → update the wiki review log *and* open a PR re-syncing the order table above, so the canonical doc never lags the review.
 - The order is a **soft heuristic** — only shift it on a real, defensible signal; don't churn it cosmetically.
