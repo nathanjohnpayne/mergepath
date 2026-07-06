@@ -66,9 +66,23 @@ fail() {
   exit 1
 }
 
-# 1. The defer marker + rationale anchor is present.
-grep -qF 'PROPAGATION-LANE-DEFER (#656)' "$WORKFLOW" \
-  || fail "$WORKFLOW is missing the PROPAGATION-LANE-DEFER (#656) anchor"
+# Isolate the `triage` job block so the anchor/catch-block assertions can't
+# false-pass on an identical pattern copy-pasted into an unrelated job. The
+# block runs from the `  triage:` job header to the next top-level (2-space
+# indented) job header — the same structure agent-review.yml uses for every
+# job under `jobs:`. Fails closed if the block can't be located.
+TRIAGE_JOB="$(awk '
+  /^  triage:[[:space:]]*$/ { grab = 1; print; next }
+  grab && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit }
+  grab { print }
+' "$WORKFLOW")"
+if [ -z "$TRIAGE_JOB" ]; then
+  fail "$WORKFLOW no longer contains a locatable 'triage:' job block (cannot scope job-specific assertions)"
+fi
+
+# 1. The defer marker + rationale anchor is present IN THE TRIAGE JOB.
+printf '%s\n' "$TRIAGE_JOB" | grep -qF 'PROPAGATION-LANE-DEFER (#656)' \
+  || fail "$WORKFLOW triage job is missing the PROPAGATION-LANE-DEFER (#656) anchor"
 
 # 2. Three-file marker lockstep: triage greps for the SAME literal the
 #    lane posts and lane_verified() matches. A drift in any copy silently
@@ -93,9 +107,11 @@ grep -qF "c.user.login === 'github-actions[bot]'" "$WORKFLOW" \
   || fail "$WORKFLOW no longer scopes the marker to github-actions[bot]-authored comments"
 
 # 5. FAIL-CLOSED on an indeterminate read: the catch path must reset the
-#    verified flag so an API error labels rather than skips.
-grep -A6 'catch (e)' "$WORKFLOW" | grep -qF 'laneVerifiedHead = false' \
-  || fail "$WORKFLOW no longer forces laneVerifiedHead=false on a failed marker read (must label fail-closed)"
+#    verified flag so an API error labels rather than skips. Scoped to the
+#    triage job so an unrelated job's `catch (e)` can't satisfy the proximity
+#    match.
+printf '%s\n' "$TRIAGE_JOB" | grep -A6 'catch (e)' | grep -qF 'laneVerifiedHead = false' \
+  || fail "$WORKFLOW triage job no longer forces laneVerifiedHead=false on a failed marker read (must label fail-closed)"
 
 # 6. The label add still exists and the skip is conditioned on the
 #    verified flag — i.e. the guard shape is `needsExternal &&
