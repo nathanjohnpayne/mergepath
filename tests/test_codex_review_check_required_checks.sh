@@ -190,13 +190,55 @@ fi
 
 # Codex P2 (#655 round 9, "honor non-path pull_request filters before
 # waiting"): round 8 checked only paths/paths-ignore on the pull_request
-# config. branches/branches-ignore must also disqualify "unfiltered"
-# alongside paths/paths-ignore (types is handled separately below, since
-# round 10 found it needs different treatment).
-if grep -qF 'pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore"]' "$SCRIPT"; then
-  pass "codex-review-check.sh disqualifies unfiltered on branches/branches-ignore, alongside paths/paths-ignore (#655 round 9)"
+# config. Round 9 blanket-disqualified on branches/branches-ignore
+# presence too; round 11 replaced that blanket disqualification with an
+# actual evaluation (below), since GitHub schedules the workflow whenever
+# the real ref matches the filter, not merely when the filter is absent.
+if grep -qF 'pr_filter_keys = ["paths", "paths-ignore"]' "$SCRIPT" \
+   && grep -qF 'push_filter_keys = ["paths", "paths-ignore", "tags", "tags-ignore"]' "$SCRIPT"; then
+  pass "codex-review-check.sh's generic filter-key lists no longer blanket-disqualify on branches/branches-ignore, evaluating them instead (#655 round 11)"
 else
-  fail "codex-review-check.sh does not check the branches/branches-ignore filter keys (#655 round 9)"
+  fail "codex-review-check.sh's filter-key lists do not match the expected round-11 shape (#655 round 11)"
+fi
+
+# Codex P2 (#655 round 11, "evaluate base-branch filters before passing"):
+# `pull_request: {branches: [main]}` still runs for every PR targeting
+# main -- blanket-disqualifying "unfiltered" on mere presence (round 9-10)
+# wrongly treated a genuinely-unfiltered-for-THIS-PR annex as filtered.
+# Evaluated against the real ref instead: pull_request compares the PRs
+# BASE ref; push compares the ref actually being pushed, which for a
+# same-repo PRs synchronize is its own HEAD ref, not base -- these must
+# be genuinely different variables/inputs, not the same one reused.
+if grep -qF 'def branch_filter_excludes?(cfg, branch)' "$SCRIPT" \
+   && grep -qF 'File.fnmatch(pattern, branch)' "$SCRIPT" \
+   && grep -qF 'pr_unfiltered = trigger_unfiltered.call("pull_request", pr_filter_keys, ENV["ANNEX_BASE_BRANCH"])' "$SCRIPT" \
+   && grep -qF 'push_unfiltered = trigger_unfiltered.call("push", push_filter_keys, ENV["ANNEX_HEAD_BRANCH"])' "$SCRIPT"; then
+  pass "codex-review-check.sh evaluates branches/branches-ignore via fnmatch against the correct ref per event type (#655 round 11)"
+else
+  fail "codex-review-check.sh does not evaluate branches/branches-ignore against the real base/head ref (#655 round 11)"
+fi
+
+# An unresolvable/unknown branch must conservatively disqualify (treat as
+# filtered) rather than guess -- verified via the ruby-level fallback
+# check_ci_scripts_wired-adjacent conservative-default philosophy applied
+# throughout #655.
+if grep -qF 'return true if (cfg.key?("branches") || cfg.key?("branches-ignore")) && !(branch.is_a?(String) && !branch.empty?)' "$SCRIPT"; then
+  pass "codex-review-check.sh conservatively disqualifies unfiltered when the relevant branch cannot be resolved (#655 round 11)"
+else
+  fail "codex-review-check.sh does not conservatively handle an unresolvable branch for branches/branches-ignore evaluation (#655 round 11)"
+fi
+
+# Codex P2 (#655 round 11, "treat tag-only push annexes as filtered"): a
+# push trigger scoped by tags/tags-ignore only fires for TAG ref pushes,
+# never an ordinary branch push -- which is what a same-repo PRs
+# synchronize always is. There is no PR-relative tag to evaluate against,
+# so tags/tags-ignore blanket-disqualifies push specifically (already
+# covered by the push_filter_keys assertion above, listed here as a
+# distinct regression point since it is a DIFFERENT finding).
+if grep -qF '"tags", "tags-ignore"' "$SCRIPT"; then
+  pass "codex-review-check.sh disqualifies a tag-only push trigger as unfiltered, since a PR synchronize is always a branch push (#655 round 11)"
+else
+  fail "codex-review-check.sh does not disqualify tag-scoped push triggers (#655 round 11)"
 fi
 
 # Codex P1 (#655 round 10, "treat synchronize-enabled types as runnable"):
@@ -263,7 +305,7 @@ fi
 # head/base repo full_name, no extra API call) rather than applied
 # unconditionally.
 if grep -qF 'ANNEX_SAME_REPO_PR=$(echo "$PR_JSON" | jq -r' "$SCRIPT" \
-   && grep -qF 'push_unfiltered = trigger_unfiltered.call("push", push_filter_keys)' "$SCRIPT" \
+   && grep -qF 'push_unfiltered = trigger_unfiltered.call("push", push_filter_keys, ENV["ANNEX_HEAD_BRANCH"])' "$SCRIPT" \
    && grep -qF 'unfiltered = pr_unfiltered || (push_unfiltered && same_repo_pr)' "$SCRIPT"; then
   pass "codex-review-check.sh treats a push-only annex as unfiltered when (and only when) the PR is same-repo (#655 round 9)"
 else

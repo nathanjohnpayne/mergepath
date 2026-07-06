@@ -994,9 +994,8 @@ else
 fi
 
 echo
-echo "agent-review.yml required-check wait: workflow-disambiguated check matching (#655 Codex P2 rounds 4-5)"
+echo "agent-review.yml required-check wait: workflow-disambiguated check matching (#655 Codex P2 rounds 4-5, 11)"
 if grep -Fq 'select($workflow == "" or (.workflowName // "") == $workflow)' .github/workflows/agent-review.yml && \
-   grep -Fq 'gh pr view "$PR_NUMBER" --repo "$REPO" --json statusCheckRollup' .github/workflows/agent-review.yml && \
    grep -Fq 'group_by(.workflowName // "")' .github/workflows/agent-review.yml && \
    grep -Fq 'sort_by(.completedAt // .startedAt // "")' .github/workflows/agent-review.yml; then
   pass=$((pass + 1))
@@ -1004,6 +1003,28 @@ if grep -Fq 'select($workflow == "" or (.workflowName // "") == $workflow)' .git
 else
   fail=$((fail + 1))
   echo "  FAIL: agent-review required-check wait must disambiguate by workflow via statusCheckRollup and pick the latest run per check (#655)" >&2
+fi
+
+# #655 Codex P2 round 11 ("restrict the lint wait to the required
+# workflow"): gh pr view --json statusCheckRollup has no field for "is
+# this specific entry actually required by branch protection", so the
+# workflow=="" (canonical) match could not tell a coincidentally
+# same-named but non-required check apart from the real one. Switched to
+# a direct graphql call (gh pr view's fixed --json shape omits
+# isRequired, and it is only resolvable when queried directly, not
+# through commits.nodes.commit) so isRequired(pullRequestNumber:) can
+# additionally scope the workflow=="" match to only entries branch
+# protection actually requires.
+echo
+echo "agent-review.yml required-check wait: isRequired-scoped canonical match (#655 Codex P2 round 11)"
+if grep -Fq 'gh api graphql -f query=' .github/workflows/agent-review.yml && \
+   grep -Fq 'isRequired(pullRequestNumber: $number)' .github/workflows/agent-review.yml && \
+   grep -Fq 'select($workflow != "" or (.isRequired == true))' .github/workflows/agent-review.yml; then
+  pass=$((pass + 1))
+  echo "  PASS: agent-review required-check wait fetches statusCheckRollup via graphql and scopes the canonical match to isRequired==true entries (#655 round 11)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: agent-review required-check wait does not fetch isRequired or scope the canonical match by it (#655 round 11)" >&2
 fi
 
 echo "dependabot-auto-merge.yml author-token equality regression (#426)"

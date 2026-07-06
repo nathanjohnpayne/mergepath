@@ -677,13 +677,21 @@ HEAD_SHA_FOR_ANNEX=$(echo "$PR_JSON" | jq -r '.head.sha')
 # here. Compare head/base repo full_name (REST PR object fields) rather
 # than adding another API call.
 ANNEX_SAME_REPO_PR=$(echo "$PR_JSON" | jq -r '(.head.repo.full_name // "head-unknown") == (.base.repo.full_name // "base-unknown")')
+# #655 Codex P2 round 11 ("evaluate base-branch filters before passing"): a
+# pull_request branches/branches-ignore filter is matched against the PRs
+# BASE ref (the target branch, e.g. "main"); a push branches/branches-ignore
+# filter is matched against the ref actually being pushed, which for a
+# same-repo PRs synchronize event is the PRs own HEAD ref (the feature
+# branch), not the base. Both are already on PR_JSON with no extra API call.
+ANNEX_BASE_BRANCH=$(echo "$PR_JSON" | jq -r '.base.ref // ""')
+ANNEX_HEAD_BRANCH=$(echo "$PR_JSON" | jq -r '.head.ref // ""')
 ANNEX_CHECKS_JSON='[]'
 ANNEX_WORKFLOW_NAME=""
 ANNEX_UNFILTERED="false"
 if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
   annex_probe_err=$(mktemp)
   if annex_content=$(gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$HEAD_SHA_FOR_ANNEX" --jq .content 2>"$annex_probe_err"); then
-    annex_probe_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ANNEX_SAME_REPO_PR="$ANNEX_SAME_REPO_PR" ruby -ryaml -rjson -e '
+    annex_probe_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ANNEX_SAME_REPO_PR="$ANNEX_SAME_REPO_PR" ANNEX_BASE_BRANCH="$ANNEX_BASE_BRANCH" ANNEX_HEAD_BRANCH="$ANNEX_HEAD_BRANCH" ruby -ryaml -rjson -e '
       raw = STDIN.read
       # #655 Codex P1 round 7 ("parse valid annex workflows that use YAML
       # aliases"): GitHub Actions supports anchors/aliases in workflow
@@ -802,8 +810,50 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
       # head/base repo full_name, passed in via env since this ruby
       # invocation only reads the YAML over stdin) gates whether an
       # unfiltered push trigger counts.
+      #
+      # #655 Codex P2 round 11 ("evaluate base-branch filters before
+      # passing"): rounds 9-10 blanket-disqualified "unfiltered" on the
+      # MERE PRESENCE of branches/branches-ignore, but GitHub schedules
+      # the workflow whenever the actual ref matches -- e.g.
+      # `pull_request: {branches: [main]}` still runs for every PR
+      # targeting main, so blanket-disqualifying it for THIS PR (which
+      # may well target main) wrongly treats a genuinely-unfiltered-for-
+      # this-PR annex as filtered. Evaluated against the real ref instead:
+      # pull_request compares the PRs BASE ref (ANNEX_BASE_BRANCH); push
+      # compares the ref actually being pushed, which for a same-repo PRs
+      # synchronize is the PRs own HEAD ref (ANNEX_HEAD_BRANCH), not base.
+      # Matching uses File.fnmatch (glob semantics close enough to
+      # GitHubs own branch-filter globbing for the common cases; an
+      # unknown/unresolvable branch conservatively disqualifies rather
+      # than guessing).
+      #
+      # #655 Codex P2 round 11 ("treat tag-only push annexes as
+      # filtered"): a push trigger scoped by tags/tags-ignore (e.g.
+      # `push: {tags: ["v*"]}`) only fires for TAG ref pushes, never for
+      # an ordinary branch push -- which is what a same-repo PRs
+      # synchronize always is. Unlike branches (evaluable against a real
+      # ref this script has), there is no PR-relative tag to evaluate
+      # against (a PR is not associated with a tag at all), so tags/
+      # tags-ignore presence blanket-disqualifies push specifically,
+      # unconditionally.
       on = doc.key?("on") ? doc["on"] : doc[true]
-      trigger_unfiltered = lambda do |event, filter_keys|
+      def branch_matches?(pattern, branch)
+        return false unless pattern.is_a?(String) && branch.is_a?(String)
+        File.fnmatch(pattern, branch)
+      end
+      def branch_filter_excludes?(cfg, branch)
+        return true if (cfg.key?("branches") || cfg.key?("branches-ignore")) && !(branch.is_a?(String) && !branch.empty?)
+        if cfg.key?("branches")
+          patterns = cfg["branches"]
+          return true unless patterns.is_a?(Array) && patterns.any? { |p| branch_matches?(p, branch) }
+        end
+        if cfg.key?("branches-ignore")
+          patterns = cfg["branches-ignore"]
+          return true if patterns.is_a?(Array) && patterns.any? { |p| branch_matches?(p, branch) }
+        end
+        false
+      end
+      trigger_unfiltered = lambda do |event, filter_keys, relevant_branch|
         case on
         when String then on == event
         when Array then on.include?(event)
@@ -812,16 +862,17 @@ if [ -n "$HEAD_SHA_FOR_ANNEX" ] && [ "$HEAD_SHA_FOR_ANNEX" != "null" ]; then
           cfg = on[event]
           next true unless cfg.is_a?(Hash)
           next false if filter_keys.any? { |k| cfg.key?(k) }
+          next false if branch_filter_excludes?(cfg, relevant_branch)
           next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")
           true
         else
           false
         end
       end
-      pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore"]
-      push_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore"]
-      pr_unfiltered = trigger_unfiltered.call("pull_request", pr_filter_keys)
-      push_unfiltered = trigger_unfiltered.call("push", push_filter_keys)
+      pr_filter_keys = ["paths", "paths-ignore"]
+      push_filter_keys = ["paths", "paths-ignore", "tags", "tags-ignore"]
+      pr_unfiltered = trigger_unfiltered.call("pull_request", pr_filter_keys, ENV["ANNEX_BASE_BRANCH"])
+      push_unfiltered = trigger_unfiltered.call("push", push_filter_keys, ENV["ANNEX_HEAD_BRANCH"])
       same_repo_pr = ENV["ANNEX_SAME_REPO_PR"] == "true"
       unfiltered = pr_unfiltered || (push_unfiltered && same_repo_pr)
       puts JSON.generate({ "workflow" => workflow_name, "jobs" => jobs, "unfiltered" => unfiltered })

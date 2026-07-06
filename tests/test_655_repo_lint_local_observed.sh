@@ -239,12 +239,17 @@ assert_grep "agent-review: a path-filtered annex with zero reported entries stil
   "$W/agent-review.yml" 'has not reported yet (unfiltered trigger, so it is expected to)'
 
 # Codex P2 (#655 round 9, "honor non-path pull_request filters before
-# waiting"): round 8 checked only paths/paths-ignore on the pull_request
-# config. branches/branches-ignore must also disqualify "unfiltered"
-# alongside paths/paths-ignore (types is handled separately below, since
-# round 10 found it needs different treatment).
-assert_grep "agent-review: disqualifies unfiltered on branches/branches-ignore, alongside paths/paths-ignore (#655 round 9)" \
-  "$W/agent-review.yml" 'pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore"]'
+# waiting") and round 11 ("evaluate base-branch filters before passing"):
+# round 8 checked only paths/paths-ignore on the pull_request config.
+# Round 9 blanket-disqualified on branches/branches-ignore presence too;
+# round 11 replaced that with an actual evaluation against the real ref
+# (below), since GitHub schedules the workflow whenever the ref matches
+# the filter, not merely when the filter is absent (types is handled
+# separately too, since round 10 found it needs different treatment).
+assert_grep "agent-review: generic filter-key lists no longer blanket-disqualify on branches/branches-ignore (#655 round 11)" \
+  "$W/agent-review.yml" 'pr_filter_keys = ["paths", "paths-ignore"]'
+assert_grep "agent-review: push filter-key list disqualifies on tags/tags-ignore instead of branches/branches-ignore (#655 round 11)" \
+  "$W/agent-review.yml" 'push_filter_keys = ["paths", "paths-ignore", "tags", "tags-ignore"]'
 
 # Codex P1 (#655 round 10, found on the codex-review-check.sh copy of this
 # same logic and mirrored here): round 9 disqualified "unfiltered" on the
@@ -257,6 +262,31 @@ assert_grep "agent-review: disqualifies unfiltered on branches/branches-ignore, 
 # activity that fires for a resynchronized PRs current HEAD.
 assert_grep "agent-review: treats a types list that includes synchronize as unfiltered, not merely absent (#655 round 10)" \
   "$W/agent-review.yml" 'next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")'
+
+# Codex P2 (#655 round 11, "evaluate base-branch filters before passing",
+# found on the codex-review-check.sh copy and mirrored here):
+# `pull_request: {branches: [main]}` still runs for every PR targeting
+# main -- evaluated against the real ref (pull_request compares the PRs
+# BASE ref; push compares the ref actually pushed, which for a same-repo
+# PRs synchronize is its own HEAD ref, not base) via File.fnmatch, with a
+# conservative disqualify when the relevant branch cannot be resolved.
+assert_grep "agent-review: evaluates branches/branches-ignore via fnmatch instead of blanket-disqualifying on presence (#655 round 11)" \
+  "$W/agent-review.yml" 'def branch_filter_excludes?(cfg, branch)'
+assert_grep "agent-review: pull_request branches evaluation uses the PRs base ref, not head (#655 round 11)" \
+  "$W/agent-review.yml" 'trigger_unfiltered.call("pull_request", pr_filter_keys, ENV["ANNEX_BASE_BRANCH"])'
+assert_grep "agent-review: push branches evaluation uses the PRs own head ref, not base (#655 round 11)" \
+  "$W/agent-review.yml" 'trigger_unfiltered.call("push", push_filter_keys, ENV["ANNEX_HEAD_BRANCH"])'
+assert_grep "agent-review: derives base/head branch names from the same pr_view_json call, no extra API call (#655 round 11)" \
+  "$W/agent-review.yml" 'annex_base_branch=$(echo "$pr_view_json"'
+assert_grep "agent-review: gh pr view fetches baseRefName/headRefName alongside the existing fields (#655 round 11)" \
+  "$W/agent-review.yml" '--json headRefOid,isCrossRepository,baseRefName,headRefName'
+
+# Codex P2 (#655 round 11, "treat tag-only push annexes as filtered",
+# mirrored): a push trigger scoped by tags/tags-ignore only fires for TAG
+# ref pushes, never an ordinary branch push -- which is what a same-repo
+# PRs synchronize always is. There is no PR-relative tag to evaluate
+# against, so tags/tags-ignore blanket-disqualifies push (already
+# confirmed by the push_filter_keys assertion above).
 
 # Codex P2 (#655 round 9, "wait for valid push-only annex workflows"):
 # check_ci_scripts_wired accepts push OR pull_request as valid annex
@@ -271,16 +301,35 @@ assert_grep "agent-review: derives same-repo-PR status via gh pr views isCrossRe
   "$W/agent-review.yml" 'annex_same_repo_pr=$(echo "$pr_view_json"'
 assert_grep "agent-review: same-repo-PR determination inverts isCrossRepository (#655 round 9)" \
   "$W/agent-review.yml" 'if .isCrossRepository then "false" else "true" end'
-assert_grep "agent-review: push_unfiltered is derived alongside pr_unfiltered via the shared trigger_unfiltered helper (#655 round 9)" \
-  "$W/agent-review.yml" 'push_unfiltered = trigger_unfiltered.call("push", push_filter_keys)'
 assert_grep "agent-review: treats a push-only annex as unfiltered when (and only when) the PR is same-repo (#655 round 9)" \
   "$W/agent-review.yml" 'unfiltered = pr_unfiltered || (push_unfiltered && same_repo_pr)'
+
+# Codex P2 (#655 round 11, "restrict the lint wait to the required
+# workflow"): the round-5 "group by workflow, require every group green"
+# rule closed the mask-the-canonical-check risk, but left the OPPOSITE
+# risk open for the workflow=="" (canonical) match -- a coincidentally
+# same-named but NON-required check from an unrelated workflow would ALSO
+# become a mandatory group. isRequired(pullRequestNumber:) (ground truth,
+# only resolvable via a direct graphql query -- gh pr views fixed --json
+# shape omits it) now additionally filters the workflow=="" case to only
+# entries branch protection actually requires.
+assert_grep "agent-review: fetches statusCheckRollup via a direct graphql query to access isRequired (#655 round 11)" \
+  "$W/agent-review.yml" 'isRequired(pullRequestNumber: $number)'
+assert_grep "agent-review: the canonical (workflow==\"\") match additionally requires isRequired==true (#655 round 11)" \
+  "$W/agent-review.yml" 'select($workflow != "" or (.isRequired == true))'
 
 # auto-clear-blocking-labels.yml: the workflow_run trigger list observes the
 # annex's completion too (verified against a live consumer's repo_lint_local.yml
 # workflow name, per #655).
 assert_grep "auto-clear: workflow_run trigger list includes repo-lint-local (#655)" \
   "$W/auto-clear-blocking-labels.yml" '- "repo-lint-local"'
+
+# Codex P3 (#655 round 11, "include the unnamed annex workflow trigger"):
+# workflow_run matches by the target workflow's displayed NAME, which for
+# an annex omitting a top-level `name:` is the workflow FILE PATH (round
+# 6's fallback), not the literal "repo-lint-local" string.
+assert_grep "auto-clear: workflow_run trigger list also includes the unnamed-annex file-path fallback name (#655 round 11)" \
+  "$W/auto-clear-blocking-labels.yml" '- ".github/workflows/repo_lint_local.yml"'
 
 # ── Bash syntax check on every agent-review.yml `run:` block. Catches
 #    heredoc/subshell/loop errors the grep assertions above cannot (mirrors

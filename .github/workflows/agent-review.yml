@@ -986,7 +986,7 @@ jobs:
           wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
           poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
           deadline=$((SECONDS + wait_seconds))
-          pr_view_json=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,isCrossRepository)
+          pr_view_json=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,isCrossRepository,baseRefName,headRefName)
           sha=$(echo "$pr_view_json" | jq -r .headRefOid)
           # #655 Codex P2 round 9 ("wait for valid push-only annex
           # workflows"): a push-only annex trigger only fires IN THIS REPO
@@ -994,6 +994,15 @@ jobs:
           # registering a push event here) -- isCrossRepository is gh pr
           # view's own field for this, no extra API call needed.
           annex_same_repo_pr=$(echo "$pr_view_json" | jq -r 'if .isCrossRepository then "false" else "true" end')
+          # #655 Codex P2 round 11 ("evaluate base-branch filters before
+          # passing"): a pull_request branches/branches-ignore filter is
+          # matched against the PRs BASE ref; a push branches/branches-ignore
+          # filter is matched against the ref actually being pushed, which
+          # for a same-repo PRs synchronize event is the PRs own HEAD ref
+          # (the feature branch), not base. Both already on this same
+          # pr_view_json call, no extra API call needed.
+          annex_base_branch=$(echo "$pr_view_json" | jq -r '.baseRefName // ""')
+          annex_head_branch=$(echo "$pr_view_json" | jq -r '.headRefName // ""')
 
           # #655: a consumer's optional, never-propagated repo_lint_local.yml
           # annex (#601) produces a check run that branch protection does not
@@ -1050,7 +1059,7 @@ jobs:
             # identity, without needing to know its expanded name in advance.
             # ruby's stderr is NOT redirected here (unlike the base64
             # decode) so the skip notice surfaces in the workflow log.
-            annex_probe_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ANNEX_SAME_REPO_PR="$annex_same_repo_pr" ruby -ryaml -rjson -e '
+            annex_probe_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ANNEX_SAME_REPO_PR="$annex_same_repo_pr" ANNEX_BASE_BRANCH="$annex_base_branch" ANNEX_HEAD_BRANCH="$annex_head_branch" ruby -ryaml -rjson -e '
               raw = STDIN.read
               # #655 Codex P1 round 7 ("parse valid annex workflows that use
               # YAML aliases"): GitHub Actions supports anchors/aliases in
@@ -1175,8 +1184,49 @@ jobs:
               # annex_same_repo_pr (computed above from gh pr views own
               # isCrossRepository field) gates whether an unfiltered push
               # trigger counts.
+              #
+              # #655 Codex P2 round 11 ("evaluate base-branch filters
+              # before passing", found on the codex-review-check.sh copy
+              # of this same logic and mirrored here): rounds 9-10
+              # blanket-disqualified "unfiltered" on the MERE PRESENCE of
+              # branches/branches-ignore, but GitHub schedules the
+              # workflow whenever the actual ref matches -- e.g.
+              # `pull_request: {branches: [main]}` still runs for every PR
+              # targeting main. Evaluated against the real ref instead:
+              # pull_request compares the PRs BASE ref (annex_base_branch,
+              # computed above); push compares the ref actually being
+              # pushed, which for a same-repo PRs synchronize is the PRs
+              # own HEAD ref (annex_head_branch), not base. Matching uses
+              # File.fnmatch (glob semantics close enough to GitHubs own
+              # branch-filter globbing for the common cases; an unknown/
+              # unresolvable branch conservatively disqualifies rather
+              # than guessing).
+              #
+              # #655 Codex P2 round 11 ("treat tag-only push annexes as
+              # filtered", mirrored): a push trigger scoped by tags/
+              # tags-ignore only fires for TAG ref pushes, never for an
+              # ordinary branch push -- which is what a same-repo PRs
+              # synchronize always is. There is no PR-relative tag to
+              # evaluate against, so tags/tags-ignore presence blanket-
+              # disqualifies push specifically, unconditionally.
               on = doc.key?("on") ? doc["on"] : doc[true]
-              trigger_unfiltered = lambda do |event, filter_keys|
+              def branch_matches?(pattern, branch)
+                return false unless pattern.is_a?(String) && branch.is_a?(String)
+                File.fnmatch(pattern, branch)
+              end
+              def branch_filter_excludes?(cfg, branch)
+                return true if (cfg.key?("branches") || cfg.key?("branches-ignore")) && !(branch.is_a?(String) && !branch.empty?)
+                if cfg.key?("branches")
+                  patterns = cfg["branches"]
+                  return true unless patterns.is_a?(Array) && patterns.any? { |p| branch_matches?(p, branch) }
+                end
+                if cfg.key?("branches-ignore")
+                  patterns = cfg["branches-ignore"]
+                  return true if patterns.is_a?(Array) && patterns.any? { |p| branch_matches?(p, branch) }
+                end
+                false
+              end
+              trigger_unfiltered = lambda do |event, filter_keys, relevant_branch|
                 case on
                 when String then on == event
                 when Array then on.include?(event)
@@ -1185,16 +1235,17 @@ jobs:
                   cfg = on[event]
                   next true unless cfg.is_a?(Hash)
                   next false if filter_keys.any? { |k| cfg.key?(k) }
+                  next false if branch_filter_excludes?(cfg, relevant_branch)
                   next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")
                   true
                 else
                   false
                 end
               end
-              pr_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore"]
-              push_filter_keys = ["paths", "paths-ignore", "branches", "branches-ignore"]
-              pr_unfiltered = trigger_unfiltered.call("pull_request", pr_filter_keys)
-              push_unfiltered = trigger_unfiltered.call("push", push_filter_keys)
+              pr_filter_keys = ["paths", "paths-ignore"]
+              push_filter_keys = ["paths", "paths-ignore", "tags", "tags-ignore"]
+              pr_unfiltered = trigger_unfiltered.call("pull_request", pr_filter_keys, ENV["ANNEX_BASE_BRANCH"])
+              push_unfiltered = trigger_unfiltered.call("push", push_filter_keys, ENV["ANNEX_HEAD_BRANCH"])
               same_repo_pr = ENV["ANNEX_SAME_REPO_PR"] == "true"
               unfiltered = pr_unfiltered || (push_unfiltered && same_repo_pr)
               puts JSON.generate({ "workflow" => workflow_name, "jobs" => jobs, "unfiltered" => unfiltered })
@@ -1246,10 +1297,78 @@ jobs:
           fi
           rm -f "$annex_probe_err"
 
+          # #655 Codex P2 round 11 ("restrict the lint wait to the required
+          # workflow"): gh pr view --json statusCheckRollup has no field for
+          # "is this specific entry actually required by branch protection",
+          # so the workflow=="" (name-only) canonical-check match below could
+          # not distinguish the REAL required "lint" from an unrelated,
+          # non-required check that coincidentally shares its bare name in a
+          # different workflow (e.g. an experimental local job) -- requiring
+          # that unrelated check to ALSO be green, per the round-5 "every
+          # group must be green" rule. Both GraphQL CheckRun and
+          # StatusContext expose isRequired(pullRequestNumber:), the
+          # ground-truth answer, but only when queried directly (the fixed
+          # --json shape from gh pr view omits it,
+          # and querying it through commits.nodes.commit loses the implicit
+          # PR context, erroring "A pull request ID or pull request number is
+          # required" -- confirmed empirically), so this switches from
+          # `gh pr view --json` to a raw graphql call and reshapes the result
+          # into the same {statusCheckRollup: [...]} shape the rest of this
+          # loop already expects, adding isRequired as an extra field.
+          repo_owner="${REPO%%/*}"
+          repo_name="${REPO#*/}"
           while :; do
             all_done=1
             check_count=$(echo "$required_checks_json" | jq 'length')
-            rollup_json=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json statusCheckRollup)
+            rollup_json=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $number) {
+                    commits(last: 1) {
+                      nodes {
+                        commit {
+                          statusCheckRollup {
+                            contexts(first: 100) {
+                              nodes {
+                                __typename
+                                ... on CheckRun {
+                                  name
+                                  status
+                                  conclusion
+                                  startedAt
+                                  completedAt
+                                  isRequired(pullRequestNumber: $number)
+                                  checkSuite { workflowRun { workflow { name } } }
+                                }
+                                ... on StatusContext {
+                                  context
+                                  state
+                                  createdAt
+                                  isRequired(pullRequestNumber: $number)
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }' -f owner="$repo_owner" -f name="$repo_name" -F number="$PR_NUMBER" \
+              --jq '{
+                statusCheckRollup: (.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes
+                  | map({
+                      name: .name,
+                      context: .context,
+                      workflowName: (.checkSuite.workflowRun.workflow.name // null),
+                      status: .status,
+                      conclusion: .conclusion,
+                      state: .state,
+                      startedAt: .startedAt,
+                      completedAt: .completedAt,
+                      isRequired: .isRequired
+                    }))
+              }')
             for ((i = 0; i < check_count; i++)); do
               check_name=$(echo "$required_checks_json" | jq -r ".[$i].name")
               check_workflow=$(echo "$required_checks_json" | jq -r ".[$i].workflow")
@@ -1286,10 +1405,26 @@ jobs:
               # "PENDING"; every other .state (SUCCESS/FAILURE/ERROR/
               # EXPECTED) is terminal. A CheckRun is non-terminal whenever
               # .status is present and not "COMPLETED", unchanged.
+              #
+              # #655 Codex P2 round 11 ("restrict the lint wait to the
+              # required workflow"): the round-5 "group by workflow, require
+              # every group green" rule closed the mask-the-canonical-check
+              # risk, but left the OPPOSITE risk open for the workflow==""
+              # (canonical) match specifically -- a coincidentally same-
+              # named but NON-required check from an unrelated workflow
+              # would ALSO become a mandatory group, wrongly blocking on
+              # ITS failure even though branch protection never required
+              # it. isRequired (ground truth from the graphql query above,
+              # scoped to this PR) now additionally filters the workflow==""
+              # case to only the entries branch protection actually
+              # requires; a name-scoped annex match ($workflow != "") is
+              # unaffected, since annex checks are not expected to be
+              # required at all.
               winners=$(echo "$rollup_json" | jq -c --arg name "$check_name" --arg workflow "$check_workflow" '
                 [.statusCheckRollup[]
                   | select((.name // .context // "") == $name)
                   | select($workflow == "" or (.workflowName // "") == $workflow)
+                  | select($workflow != "" or (.isRequired == true))
                 ] as $matches
                 | ($matches | group_by(.workflowName // "")) as $groups
                 | [
