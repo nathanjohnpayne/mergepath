@@ -78,5 +78,8 @@ echo "check_codex_scripts: running #655 repo-lint-local observation structural g
 echo "check_codex_scripts: running codex-record-feedback tests"
 "$REPO_ROOT/tests/test_codex_record_feedback.sh"
 
+echo "check_codex_scripts: running Codex usage-limit / not-connected marker detection tests (#722)"
+"$REPO_ROOT/tests/test_codex_usage_limit_marker.sh"
+
 echo "check_codex_scripts: PASS"
 exit 0

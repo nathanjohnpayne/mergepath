@@ -306,6 +306,17 @@ paths:
   - path: scripts/lib/ensure-yq.sh
     type: canonical
     consumers: all
+  # Single source of truth for the Codex App failure-marker regexes (#722):
+  # the usage-limit / not-connected patterns audit-codex-latency.sh classifies
+  # retrospectively, factored out so the live Phase 4a scripts test the SAME
+  # patterns. Sourced (existence-guarded, flag-gated) by codex-review-request.sh
+  # and codex-review-check.sh — declared in each of their requires: below so the
+  # closure invariant records the coupling and the lib travels with them. A
+  # consumer missing it degrades to the pre-#722 behavior (no marker detection),
+  # so the source is soft, not fail-closed.
+  - path: scripts/lib/codex-failure-markers.sh
+    type: canonical
+    consumers: all
   - path: scripts/coderabbit-wait.sh
     type: canonical
     consumers: all
@@ -325,6 +336,12 @@ paths:
   - path: scripts/codex-review-request.sh
     type: canonical
     consumers: all
+    # Sources scripts/lib/codex-failure-markers.sh (existence-guarded) so the
+    # poll loop can short-circuit on a usage-limit / not-connected marker
+    # instead of running out the full review timeout (#722). Soft-degrades to
+    # the pre-#722 behavior if the lib is absent mid-skew.
+    requires:
+      - "scripts/lib/codex-failure-markers.sh"
   - path: scripts/codex-review-check.sh
     type: canonical
     consumers: all
@@ -337,6 +354,7 @@ paths:
     requires:
       - "scripts/lib/gh-retry-helpers.sh"
       - "scripts/lib/reviewers-helpers.sh"   # #453, hard-sourced for the gate (b)/(c) reviewer allow-list
+      - "scripts/lib/codex-failure-markers.sh"   # #722, sourced for the gate (c) usage-limit/not-connected diagnostic
   # Phase 4a feedback loop (#487): records the validated 👍/👎 reaction
   # Codex solicits on each finding. WRITE path — every reaction POST goes
   # through scripts/gh-as-reviewer.sh under the reviewer identity, so the
@@ -691,6 +709,16 @@ paths:
   # class as test_codex_review_request_ack.sh above. Fully stubbed (PATH-
   # shimmed gh + gh-as-reviewer.sh) — no live GitHub network.
   - path: tests/test_codex_record_feedback.sh
+    type: canonical
+    consumers: all
+  # Codex usage-limit / not-connected marker detection (#722): the shared
+  # scripts/lib/codex-failure-markers.sh regexes, codex-review-request.sh's
+  # `blocked` short-circuit, and codex-review-check.sh's gate (c) diagnostic.
+  # check_codex_scripts (scripts/ci kit) hard-runs it, so it must travel to
+  # every consumer or the check fails pre-flight with `No such file`. Same
+  # #264/#266 closure class as test_codex_record_feedback.sh above; fully
+  # offline (inline jq + structural greps, no live GitHub network).
+  - path: tests/test_codex_usage_limit_marker.sh
     type: canonical
     consumers: all
   # Pairs with scripts/coderabbit-record-feedback.sh (#584).
@@ -1055,6 +1083,7 @@ paths:
       - "tests/test_465_fail_closed.sh"        # check_codex_scripts (#465)
       - "tests/test_655_repo_lint_local_observed.sh"  # check_codex_scripts (#655)
       - "tests/test_codex_record_feedback.sh"  # check_codex_scripts (#487)
+      - "tests/test_codex_usage_limit_marker.sh"  # check_codex_scripts (#722)
       - "tests/test_coderabbit_record_feedback.sh"  # check_coderabbit_record_feedback (#584)
       - "tests/test_audit_propagation_lane.sh" # check_propagation_lane_audit
       - "scripts/audit-propagation-lane.sh"    # check_propagation_lane_audit

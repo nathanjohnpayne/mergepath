@@ -118,6 +118,20 @@ else
   with_gh_retry() { "$@"; }
 fi
 
+# --- shared Codex failure-marker regexes (#722) -----------------------------
+# The rate-limit / not-connected marker patterns are canonicalized in
+# scripts/lib/codex-failure-markers.sh so the live Phase 4a scripts test the
+# SAME patterns this audit classifies (proposal 1 of #722). Hard-require it:
+# without it the normalize phase cannot classify the marker events the study
+# measures, so a missing lib is a dependency error, not a silent degrade.
+if [ -r "$__AUDIT_DIR/lib/codex-failure-markers.sh" ]; then
+  # shellcheck source=lib/codex-failure-markers.sh
+  . "$__AUDIT_DIR/lib/codex-failure-markers.sh"
+else
+  echo "ERROR: missing scripts/lib/codex-failure-markers.sh (required for marker classification)" >&2
+  exit 2
+fi
+
 # --- argument parsing --------------------------------------------------------
 
 REPO=""
@@ -339,7 +353,9 @@ normalize() {
 
     jq -c '{kind:"commit", sha, committer_date}' "$RAW_DIR/pr_commits.jsonl"
 
-    jq -c --arg bot "$BOT_LOGIN" '
+    jq -c --arg bot "$BOT_LOGIN" \
+          --arg rate_re "$CODEX_USAGE_LIMIT_MARKER_RE" \
+          --arg nc_re "$CODEX_NOT_CONNECTED_MARKER_RE" '
       if (.login | startswith($bot)) then
         # Verdict = a line-anchored "Codex Review:" bot comment (#567).
         # The "**Reviewed commit:** `sha`" line only exists in the NEWER
@@ -352,11 +368,15 @@ normalize() {
              | [scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")]
              | (last // [])[0]) // null),
            affirmative:(.body | test("(?im)^\\s*codex review:\\s*didn.?t find any major issues\\b"))}
-        elif ((.body // "") | test("(?i)(rate.?limit|usage.?limit|quota|limit (was|has been) (hit|reached)|try again (later|in))")) then
+        # Rate-limit / usage-limit / quota marker. Pattern shared with the
+        # live scripts via scripts/lib/codex-failure-markers.sh (#722); the
+        # inline (?i) flag is replaced by the test() "i" flag so the stored
+        # literal is flag-free and reusable.
+        elif ((.body // "") | test($rate_re; "i")) then
           {kind:"rate_limit", pr, comment_id:.id, created_at}
         # Dropped-trigger markers (#570 class): the app was not connected /
         # had no environment, so the trigger produced no round at all.
-        elif ((.body // "") | test("(?i)to use codex here")) then
+        elif ((.body // "") | test($nc_re; "i")) then
           {kind:"dropped_trigger_marker", pr, comment_id:.id, created_at}
         else
           {kind:"bot_comment_other", pr, comment_id:.id, created_at,

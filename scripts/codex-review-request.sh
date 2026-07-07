@@ -124,6 +124,17 @@
 #       "created_at": "<iso-8601>",
 #       "affirmative": true | false
 #     },
+#     "blocked_reason": null | "usage_limit" | "not_connected",
+#     # Account-/connection-level failure marker (#722). Set when the Codex
+#     # bot answered the trigger with a quota-exhaustion ("usage_limit") or
+#     # app-not-connected ("not_connected") comment instead of a review. It
+#     # short-circuits the poll (re-polling/re-triggering cannot clear it)
+#     # and the script exits 4 (FALLBACK_REQUIRED) so the caller routes to
+#     # Phase 4b — but with the real cause named rather than a generic
+#     # timeout. Detected via the shared regexes in
+#     # scripts/lib/codex-failure-markers.sh, the same patterns
+#     # audit-codex-latency.sh classifies. null on the normal signal/timeout
+#     # paths.
 #     # HEAD-anchored Codex issue-comment verdict (#600/#567), recognized by
 #     # this poller as of #609. "affirmative" mirrors codex-review-check.sh's
 #     # CODEX_HEAD_VERDICT_TIME matcher: true only for the stable "Codex
@@ -138,9 +149,16 @@
 # Exit codes:
 #   0   Codex signal received on current HEAD. JSON on stdout.
 #   3   API / infrastructure error. Error message on stderr.
-#   4   FALLBACK_REQUIRED — timed out waiting for a Codex signal. The
-#       caller should route to REVIEW_POLICY.md § Phase 4b. See #27 for
-#       the explicit-review-required decision that mandates this path.
+#   4   FALLBACK_REQUIRED — no Codex signal on current HEAD. The caller
+#       should route to REVIEW_POLICY.md § Phase 4b. See #27 for the
+#       explicit-review-required decision that mandates this path. Two
+#       sub-cases, distinguished by the `blocked_reason` field in the JSON:
+#       a plain timeout (blocked_reason:null) waited out the full window,
+#       whereas a detected account-/connection-level block
+#       (blocked_reason:"usage_limit"|"not_connected", #722) short-circuits
+#       the wait immediately — re-polling/re-triggering cannot help until a
+#       human upgrades/connects the account, so the handoff should name the
+#       real cause rather than "wait longer."
 #   5   NO_TRIGGER_REQUESTED — the Phase 4a entry decision (#486) chose
 #       NOT to request a Codex review on this PR: either codex.enabled is
 #       false (route to Phase 4b), or codex.request_by_default is false
@@ -177,6 +195,22 @@ if [ -r "$__CODEX_REQUEST_DIR/lib/preflight-helpers.sh" ]; then
   # perform is the `@codex review` trigger, which must be authored by
   # nathanjohnpayne. The wrapper verifies that token before posting.
   preflight_require_token author || true
+fi
+
+# --- Codex failure-marker regexes (#722) ------------------------------------
+# Source the shared usage-limit / not-connected marker patterns so the poll
+# loop can recognize an account-level quota or app-not-connected comment and
+# short-circuit the wait instead of running out the full review timeout (the
+# generic-timeout failure described in #722). Existence-guarded like the
+# preflight source above: a consumer in the middle of a sync skew may not yet
+# carry the lib, in which case marker detection degrades to the pre-#722
+# behavior (run to timeout) rather than hard-erroring — the lib is declared
+# as a `requires:` of this script so the skew window is short.
+CODEX_FAILURE_MARKERS_OK=false
+if [ -r "$__CODEX_REQUEST_DIR/lib/codex-failure-markers.sh" ]; then
+  # shellcheck source=lib/codex-failure-markers.sh
+  . "$__CODEX_REQUEST_DIR/lib/codex-failure-markers.sh"
+  CODEX_FAILURE_MARKERS_OK=true
 fi
 
 # --- argument parsing -------------------------------------------------------
@@ -483,6 +517,7 @@ if ! should_request_codex; then
       findings: [],
       reaction: null,
       verdict: null,
+      blocked_reason: null,
       trigger_posted: false,
       trigger_requested: false,
       rounds_waited_seconds: 0
@@ -562,7 +597,7 @@ log "ack_wait = ${ACK_WAIT_SECONDS}s    max_ack_retries = $MAX_ACK_RETRIES"
 # success. Emits empty object { "review": null, "findings": [], "reaction": null }
 # if nothing matches yet.
 scan_codex_state() {
-  local reviews comments reactions issue_comments review findings reaction verdict
+  local reviews comments reactions issue_comments review findings reaction verdict blocked
 
   reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
   comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
@@ -674,9 +709,62 @@ scan_codex_state() {
     | max_by(.created_at) // null
   ')
 
-  jq -n --argjson review "$review" --argjson findings "$findings" --argjson reaction "$reaction" --argjson verdict "$verdict" '
-    { review: $review, findings: $findings, reaction: $reaction, verdict: $verdict }
+  # Account-/connection-level failure marker (#722). Codex answers a trigger
+  # with a plain comment — no findings, no `Reviewed commit:` anchor, no
+  # reaction — when the account is quota-exhausted ("usage_limit") or the App
+  # is not connected ("not_connected"). None of the signal kinds above match
+  # it, so without this the poll runs out the full review_timeout_seconds
+  # window and exits 4, indistinguishable from a slow review. Select the
+  # LATEST such marker (by created_at) so the poll can compare it against the
+  # trigger threshold like any other signal.
+  #
+  # Precedence mirrors audit-codex-latency.sh's normalize phase: a bot
+  # comment that is a VERDICT (its header line starts "Codex Review:") is
+  # never a marker — exclude it first — so a findings verdict whose body
+  # happens to mention e.g. "rate limit" is not misread as a quota block.
+  # usage_limit wins over not_connected on a comment matching both.
+  if [ "$CODEX_FAILURE_MARKERS_OK" = "true" ]; then
+    blocked=$(echo "$issue_comments" | jq -c \
+      --arg bot "$BOT_LOGIN" \
+      --arg usage_re "$CODEX_USAGE_LIMIT_MARKER_RE" \
+      --arg nc_re "$CODEX_NOT_CONNECTED_MARKER_RE" '
+      [ .[]
+        | select(.user.login == $bot)
+        | select(((.body // "") | test("(?im)^\\s*codex review:")) | not)
+        | ( if ((.body // "") | test($usage_re; "i")) then "usage_limit"
+            elif ((.body // "") | test($nc_re; "i")) then "not_connected"
+            else null end ) as $reason
+        | select($reason != null)
+        | { reason: $reason, created_at: .created_at, comment_id: .id }
+      ]
+      | max_by(.created_at) // null
+    ')
+  else
+    blocked='null'
+  fi
+
+  jq -n --argjson review "$review" --argjson findings "$findings" --argjson reaction "$reaction" --argjson verdict "$verdict" --argjson blocked "$blocked" '
+    { review: $review, findings: $findings, reaction: $reaction, verdict: $verdict, blocked: $blocked }
   '
+}
+
+# Echo the failure-marker reason (usage_limit|not_connected) carried by a scan
+# that should short-circuit the wait, else empty. When a trigger was posted
+# this run, the marker must be at/after the trigger threshold (a response to
+# THIS trigger, mirroring has_post_trigger_signal); otherwise any marker
+# counts. A usage_limit / not_connected block cannot be cleared by re-polling
+# or re-triggering — only a human upgrading/connecting the account resolves
+# it — so treating it as a wait-ending signal is correct (#722).
+current_blocked_reason() {
+  local scan=$1
+  if [ "$TRIGGER_POSTED" = "true" ]; then
+    local after=${TRIGGER_SIGNAL_THRESHOLD:-$TRIGGER_POST_TIME}
+    echo "$scan" | jq -r --arg after "$after" '
+      if (.blocked != null and .blocked.created_at >= $after)
+      then .blocked.reason else "" end'
+  else
+    echo "$scan" | jq -r 'if .blocked != null then .blocked.reason else "" end'
+  fi
 }
 
 # Returns 0 iff the scan produced ANY signal (review, reaction, or
@@ -952,6 +1040,14 @@ wait_for_trigger_ack() {
     if ! FINAL_SCAN=$(scan_codex_state); then
       die 3 "eyes-ack Codex scan failed"
     fi
+    # An account-/connection-level block during the ack window is terminal
+    # too (#722): re-posting `@codex review` cannot help a quota-exhausted or
+    # not-connected account, so stop the ack gate (no re-trigger) and let the
+    # poll loop short-circuit on the marker FINAL_SCAN already carries.
+    if [ -n "$(current_blocked_reason "$FINAL_SCAN")" ]; then
+      log "Codex reported '$(current_blocked_reason "$FINAL_SCAN")' during eyes-ack wait — no re-trigger (a human must resolve it); handing to the poll loop to short-circuit (#722)"
+      return 0
+    fi
     if has_post_trigger_signal "$FINAL_SCAN"; then
       log "Codex terminal signal arrived during eyes-ack wait — no re-trigger needed"
       return 0
@@ -1044,6 +1140,7 @@ if [ "$TRIGGER_ONLY" = "true" ]; then
       findings: [],
       reaction: null,
       verdict: null,
+      blocked_reason: null,
       trigger_posted: $trigger_posted,
       trigger_requested: true,
       trigger_only: true,
@@ -1056,7 +1153,7 @@ if [ "$TRIGGER_POSTED" = "true" ]; then
   # We just posted a trigger. The INITIAL_SCAN data is now stale by
   # definition — Codex will respond with something new. Skip the
   # initial has_signal check; force the loop to actually poll.
-  FINAL_SCAN='{"review":null,"findings":[],"reaction":null,"verdict":null}'
+  FINAL_SCAN='{"review":null,"findings":[],"reaction":null,"verdict":null,"blocked":null}'
   run_trigger_ack_gate
 else
   FINAL_SCAN=$INITIAL_SCAN
@@ -1076,6 +1173,20 @@ while :; do
     fi
   elif has_signal "$FINAL_SCAN"; then
     log "Codex signal received after ${ELAPSED}s"
+    break
+  fi
+
+  # Short-circuit on an account-/connection-level failure marker (#722).
+  # A usage_limit or not_connected comment is terminal: no further polling
+  # or re-triggering can produce a review until a human acts (upgrade / add
+  # credits / connect the App), so break immediately instead of burning the
+  # rest of the timeout. The exit-code logic below still exits 4
+  # (FALLBACK_REQUIRED) because no real Codex signal arrived — but now with
+  # blocked_reason in the JSON so the caller (and the Phase 4b handoff) can
+  # name the real cause instead of a generic timeout.
+  BLOCKED_REASON_NOW=$(current_blocked_reason "$FINAL_SCAN")
+  if [ -n "$BLOCKED_REASON_NOW" ]; then
+    log "Codex reported '$BLOCKED_REASON_NOW' after ${ELAPSED}s — short-circuiting the wait; re-polling/re-triggering cannot clear it. Routing to Phase 4b with blocked_reason=$BLOCKED_REASON_NOW (#722)"
     break
   fi
 
@@ -1104,6 +1215,11 @@ done
 
 # --- emit final JSON --------------------------------------------------------
 
+# Surface the account-/connection-level block (#722) on the final scan, using
+# the same post-trigger anchoring as the poll short-circuit so a stale marker
+# from a prior HEAD does not leak into this run's report. Empty ⇒ null.
+BLOCKED_REASON=$(current_blocked_reason "$FINAL_SCAN")
+
 jq -n \
   --argjson pr_number "$PR_NUMBER" \
   --arg repo "$REPO" \
@@ -1112,6 +1228,7 @@ jq -n \
   --arg bot_login "$BOT_LOGIN" \
   --argjson scan "$FINAL_SCAN" \
   --argjson trigger_posted "$TRIGGER_POSTED" \
+  --arg blocked_reason "$BLOCKED_REASON" \
   --argjson elapsed "$ELAPSED" '
   {
     pr_number: $pr_number,
@@ -1123,6 +1240,7 @@ jq -n \
     findings: $scan.findings,
     reaction: $scan.reaction,
     verdict: $scan.verdict,
+    blocked_reason: (if $blocked_reason == "" then null else $blocked_reason end),
     trigger_posted: $trigger_posted,
     trigger_requested: true,
     rounds_waited_seconds: $elapsed

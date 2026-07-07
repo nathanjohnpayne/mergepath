@@ -138,6 +138,21 @@ else
   with_gh_retry() { "$@"; }
 fi
 
+# --- Codex failure-marker regexes (#722) ------------------------------------
+# Source the shared usage-limit / not-connected marker patterns so gate (c)'s
+# failure message can name an account-level quota or app-not-connected block
+# as the real cause when Codex has not cleared — instead of the generic "no
+# Codex signal" text that reads as review latency. Diagnostic only: it never
+# changes the merge decision (the gate still fails closed). Existence-guarded
+# / flag-gated so a consumer mid-sync-skew degrades to the old message rather
+# than hard-erroring; declared as a `requires:` of this script.
+CODEX_FAILURE_MARKERS_OK=false
+if [ -r "$__CODEX_CHECK_DIR/lib/codex-failure-markers.sh" ]; then
+  # shellcheck source=lib/codex-failure-markers.sh
+  . "$__CODEX_CHECK_DIR/lib/codex-failure-markers.sh"
+  CODEX_FAILURE_MARKERS_OK=true
+fi
+
 # Shared available_reviewers reader (#453) — replaces the local
 # double-quote-only parser so coderabbit-wait.sh and this script parse the
 # allow-list identically (dash + inline comment + BOTH quote styles +
@@ -1528,6 +1543,8 @@ CODEX_HEAD_VERDICT_ANY_TIME=""
 CODEX_CARRYFORWARD_VERDICT_TIME=""
 CODEX_CARRYFORWARD_COMMIT=""
 CODEX_CARRYFORWARD_FINGERPRINT=""
+CODEX_BLOCKED_REASON=""
+CODEX_BLOCKED_TIME=""
 if [ "$CODEX_ENABLED" = "true" ]; then
   ISSUE_COMMENTS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments")
   # Select the LATEST HEAD-anchored Codex verdict comment FIRST (any
@@ -1577,6 +1594,41 @@ if [ "$CODEX_ENABLED" = "true" ]; then
     log "codex verdict: latest HEAD-anchored verdict @ $CODEX_HEAD_VERDICT_TIME is AFFIRMATIVE (Reviewed commit prefixes $HEAD_SHA)"
   elif [ -n "$CODEX_HEAD_VERDICT_ANY_TIME" ]; then
     log "codex verdict: latest HEAD-anchored verdict @ $CODEX_HEAD_VERDICT_ANY_TIME is NON-affirmative — not a clearance signal (fail closed); carried into the Phase 4b freshness guard"
+  fi
+
+  # Account-/connection-level failure marker (#722). When Codex answers a
+  # trigger with a quota-exhaustion ("usage_limit") or app-not-connected
+  # ("not_connected") comment, gate (c) will fail closed for lack of a
+  # clearance signal — same outcome as a slow/absent review — but the real
+  # cause is an account block a human must resolve, not review latency. Detect
+  # the LATEST such marker on or after REACTION_THRESHOLD (the same freshness
+  # anchor the reaction path uses, so a stale marker from a prior head is not
+  # surfaced) and, mirroring audit-codex-latency.sh's precedence, only on a
+  # NON-verdict bot comment. Diagnostic only — folded into the gate (c)
+  # failure message, never into the clearance decision. Shares the regexes
+  # with the live trigger script via scripts/lib/codex-failure-markers.sh.
+  if [ "$CODEX_FAILURE_MARKERS_OK" = "true" ]; then
+    CODEX_BLOCKED_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
+      --arg bot "$BOT_LOGIN" --arg after "$REACTION_THRESHOLD" \
+      --arg usage_re "$CODEX_USAGE_LIMIT_MARKER_RE" \
+      --arg nc_re "$CODEX_NOT_CONNECTED_MARKER_RE" '
+      [ .[]
+        | select(.user.login == $bot)
+        | select(.created_at >= $after)
+        | select(((.body // "") | test("(?im)^\\s*codex review:")) | not)
+        | ( if ((.body // "") | test($usage_re; "i")) then "usage_limit"
+            elif ((.body // "") | test($nc_re; "i")) then "not_connected"
+            else null end ) as $reason
+        | select($reason != null)
+        | { reason: $reason, created_at: .created_at }
+      ]
+      | max_by(.created_at) // null
+    ')
+    CODEX_BLOCKED_REASON=$(echo "$CODEX_BLOCKED_JSON" | jq -r 'if . == null then "" else .reason end')
+    CODEX_BLOCKED_TIME=$(echo "$CODEX_BLOCKED_JSON" | jq -r 'if . == null then "" else .created_at end')
+    if [ -n "$CODEX_BLOCKED_REASON" ]; then
+      log "codex block: Codex reported '$CODEX_BLOCKED_REASON' @ $CODEX_BLOCKED_TIME (≥ threshold $REACTION_THRESHOLD) — an account/connection block, not review latency; a human must resolve it before Codex can clear (#722)"
+    fi
   fi
 
   # Same-content carry-forward (#705): a base-only update branch produces a new
@@ -2042,6 +2094,14 @@ if [ "$CLEARED" != "true" ] && [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
 fi
 
 if [ "$CLEARED" != "true" ]; then
+  # #722: when a fresh account-/connection-level block was detected above,
+  # name it in the failure message so the human/agent reads the real cause
+  # (quota exhausted / App not connected → a human must act) instead of
+  # inferring review latency and waiting or re-triggering.
+  BLOCKED_SUFFIX=""
+  if [ -n "$CODEX_BLOCKED_REASON" ]; then
+    BLOCKED_SUFFIX=" — NOTE: Codex reported '$CODEX_BLOCKED_REASON' @ $CODEX_BLOCKED_TIME; this is an account/connection block a human must resolve (upgrade / add credits / connect the App), not review latency — route to Phase 4b (#722)"
+  fi
   if [ "$CODEX_ENABLED" != "true" ]; then
     if [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
       fail_gate "codex.enabled=false and no Phase 4b substitute APPROVED on $HEAD_SHA from a non-author identity in available_reviewers"
@@ -2050,9 +2110,9 @@ if [ "$CLEARED" != "true" ]; then
     fi
   elif [ -z "$LATEST_THUMBS_UP_TIME" ] && [ -z "$CODEX_REVIEW_TIME" ]; then
     if [ "$ALLOW_PHASE_4B_SUBSTITUTE" = "true" ]; then
-      fail_gate "Codex has not cleared current HEAD and no Phase 4b substitute APPROVED on $HEAD_SHA from a non-author identity in available_reviewers (no review on HEAD, no +1 reaction from $BOT_LOGIN on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)"
+      fail_gate "Codex has not cleared current HEAD and no Phase 4b substitute APPROVED on $HEAD_SHA from a non-author identity in available_reviewers (no review on HEAD, no +1 reaction from $BOT_LOGIN on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)$BLOCKED_SUFFIX"
     else
-      fail_gate "Codex has not cleared current HEAD (no review on $HEAD_SHA and no +1 reaction from $BOT_LOGIN on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)"
+      fail_gate "Codex has not cleared current HEAD (no review on $HEAD_SHA and no +1 reaction from $BOT_LOGIN on or after reaction threshold $REACTION_THRESHOLD: $REACTION_THRESHOLD_SOURCE)$BLOCKED_SUFFIX"
     fi
   else
     PATHS=$(echo "$UNADDRESSED_P01" | jq -r '[.[] | "\(.path):\(.line)"] | join(", ")')
