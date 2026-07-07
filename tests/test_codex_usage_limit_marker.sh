@@ -27,8 +27,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIB="$ROOT/scripts/lib/codex-failure-markers.sh"
 REQUEST="$ROOT/scripts/codex-review-request.sh"
 CHECK="$ROOT/scripts/codex-review-check.sh"
+# audit-codex-latency.sh is HUB-ONLY (not propagated); on a consumer checkout
+# it is absent, so it is required conditionally (§6 skips when it is missing).
 AUDIT="$ROOT/scripts/audit-codex-latency.sh"
-for f in "$LIB" "$REQUEST" "$CHECK" "$AUDIT"; do
+for f in "$LIB" "$REQUEST" "$CHECK"; do
   [ -r "$f" ] || { echo "missing $f" >&2; exit 1; }
 done
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
@@ -167,21 +169,27 @@ else
   fail "codex-review-check.sh is missing the gate (c) block diagnostic"
 fi
 
-# ── 6. Drift guard: the audit sources the SAME lib (proposal 1).
-if grep -q 'codex-failure-markers.sh' "$AUDIT" \
-   && grep -q 'test(\$rate_re; "i")' "$AUDIT" \
-   && grep -q 'test(\$nc_re; "i")' "$AUDIT"; then
-  pass "audit-codex-latency.sh sources the shared lib (no pattern drift)"
+# ── 6. Drift guard: the audit sources the SAME lib (proposal 1). HUB-ONLY —
+#      audit-codex-latency.sh is not propagated, so skip when absent (a
+#      consumer checkout, e.g. the check_repo_lint_consumer_safety fixture).
+if [ ! -r "$AUDIT" ]; then
+  pass "audit drift guard: SKIP (hub-only audit-codex-latency.sh absent — consumer checkout)"
 else
-  fail "audit-codex-latency.sh does not use the shared marker lib"
-fi
+  if grep -q 'codex-failure-markers.sh' "$AUDIT" \
+     && grep -q 'test(\$rate_re; "i")' "$AUDIT" \
+     && grep -q 'test(\$nc_re; "i")' "$AUDIT"; then
+    pass "audit-codex-latency.sh sources the shared lib (no pattern drift)"
+  else
+    fail "audit-codex-latency.sh does not use the shared marker lib"
+  fi
 
-# The audit must NOT still carry the old inline literal patterns (proving the
-# refactor actually removed the duplication).
-if grep -q '(?i)(rate.?limit' "$AUDIT" || grep -q '(?i)to use codex here' "$AUDIT"; then
-  fail "audit-codex-latency.sh still carries an inline marker literal (drift risk)"
-else
-  pass "audit-codex-latency.sh no longer carries the inline marker literals"
+  # The audit must NOT still carry the old inline literal patterns (proving the
+  # refactor actually removed the duplication).
+  if grep -q '(?i)(rate.?limit' "$AUDIT" || grep -q '(?i)to use codex here' "$AUDIT"; then
+    fail "audit-codex-latency.sh still carries an inline marker literal (drift risk)"
+  else
+    pass "audit-codex-latency.sh no longer carries the inline marker literals"
+  fi
 fi
 
 # ── 7. End-to-end: the real script short-circuits a blocked round to exit 4
