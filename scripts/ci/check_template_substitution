@@ -13,8 +13,27 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_template_substitution.sh"
 LIB="$REPO_ROOT/scripts/lib/template-substitution.sh"
+MANIFEST="$REPO_ROOT/.mergepath-sync.yml"
+SYNC_SCRIPT="$REPO_ROOT/scripts/sync-to-downstream.sh"
 
-# Disambiguate consumer-side vs mergepath-side misconfig using the
+# Detect a mergepath (hub) checkout via the HUB-ONLY marker
+# scripts/sync-to-downstream.sh, which is never propagated to
+# consumers — the same detection check_export_consumer_facts uses.
+# We intentionally key hub-detection on the sync script, NOT on this
+# lib: the lib IS propagated to consumers (.mergepath-sync.yml line
+# ~286), so its presence proves nothing about hub-vs-consumer, whereas
+# the sync script's presence proves a hub checkout.
+#
+# - sync script present AND .mergepath-sync.yml absent → mergepath
+#   lost its manifest (accidental deletion/rename in a PR) → FAIL
+#   (exit 1). This is the #703 fail-closed, keyed on the hub marker
+#   so it never fires on consumers.
+if [ -f "$SYNC_SCRIPT" ] && [ ! -f "$MANIFEST" ]; then
+  echo "FAIL: .mergepath-sync.yml is missing but scripts/sync-to-downstream.sh IS present — mergepath misconfig (manifest accidentally deleted/renamed?)" >&2
+  exit 1
+fi
+
+# Disambiguate consumer-side vs mergepath-side lib loss using the
 # .mergepath-sync.yml marker (intentionally not propagated to
 # consumers per the inline comment in that file).
 #
@@ -28,13 +47,24 @@ LIB="$REPO_ROOT/scripts/lib/template-substitution.sh"
 #   and the lib's regression test suite would silently stop
 #   running (Codex P2 round 2 on PR #321).
 if [ ! -f "$LIB" ]; then
-  if [ ! -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
+  if [ ! -f "$MANIFEST" ]; then
     echo "check_template_substitution: SKIP (consumer checkout: scripts/lib/template-substitution.sh + .mergepath-sync.yml both absent)"
     exit 0
   fi
   echo "FAIL: scripts/lib/template-substitution.sh is missing but .mergepath-sync.yml IS present — mergepath misconfig (lib accidentally deleted/renamed?)" >&2
   exit 1
 fi
+
+# NOTE (#703/#710): the "manifest absent → FAIL" fail-closed above is
+# deliberately keyed on the HUB-ONLY scripts/sync-to-downstream.sh
+# marker, NOT on this lib. The lib IS propagated to consumers
+# (.mergepath-sync.yml line ~286) while .mergepath-sync.yml is
+# deliberately NOT (line ~974) — so "lib present + manifest absent" is
+# the NORMAL consumer state, and keying the fail-closed on the lib
+# would break check_template_substitution on every consumer (the
+# propagated test is exactly what should run there). Keying on the
+# sync script mirrors check_export_consumer_facts and fires the
+# fail-closed only on a real hub checkout that lost its manifest.
 
 if [ ! -f "$TEST_SCRIPT" ]; then
   echo "check_template_substitution: ERROR (missing $TEST_SCRIPT)" >&2

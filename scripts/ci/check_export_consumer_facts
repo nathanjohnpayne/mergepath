@@ -13,6 +13,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_SCRIPT="$REPO_ROOT/tests/test_export_consumer_facts.sh"
 SYNC_SCRIPT="$REPO_ROOT/scripts/sync-to-downstream.sh"
+MANIFEST="$REPO_ROOT/.mergepath-sync.yml"
 
 # Disambiguate consumer-side vs mergepath-side misconfig via the
 # .mergepath-sync.yml marker (intentionally not propagated to
@@ -26,11 +27,20 @@ SYNC_SCRIPT="$REPO_ROOT/scripts/sync-to-downstream.sh"
 #   → FAIL exit 1. Codex P2 round 2 on PR #321 caught the fail-
 #   open risk on the blanket SKIP.
 if [ ! -f "$SYNC_SCRIPT" ]; then
-  if [ ! -f "$REPO_ROOT/.mergepath-sync.yml" ]; then
+  if [ ! -f "$MANIFEST" ]; then
     echo "check_export_consumer_facts: SKIP (consumer checkout: scripts/sync-to-downstream.sh + .mergepath-sync.yml both absent)"
     exit 0
   fi
   echo "FAIL: scripts/sync-to-downstream.sh is missing but .mergepath-sync.yml IS present — mergepath misconfig (sync script accidentally deleted/renamed?)" >&2
+  exit 1
+fi
+
+# sync script present AND .mergepath-sync.yml absent → mergepath
+# misconfig (manifest accidentally deleted/renamed). A present
+# guarded artifact with no manifest is a real misconfiguration, not
+# a benign consumer skip → FAIL exit 1 (fail closed).
+if [ ! -f "$MANIFEST" ]; then
+  echo "FAIL: .mergepath-sync.yml is missing but scripts/sync-to-downstream.sh IS present — mergepath misconfig (manifest accidentally deleted/renamed?)" >&2
   exit 1
 fi
 
