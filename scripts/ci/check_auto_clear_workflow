@@ -99,19 +99,25 @@ else
   echo "  FAIL: scheduled-sweep job missing or not gated to schedule events (executable line)" >&2
 fi
 
-# CR Major on PR #213: gh pr list defaults to --limit 30. The sweep
-# must use a higher limit so repos with many open needs-external-review
-# PRs get them ALL processed, not just the first 30.
-# `gh pr list` is split across multiple lines via shell continuation,
-# so the assertion is split too: `gh pr list` exists AND `--limit
-# <≥100>` appears within 5 lines after it.
-if grep -qE -- 'gh pr list' "$WORKFLOW" && \
-   awk '/gh pr list/,/[^\\\\]$/' "$WORKFLOW" | grep -qE -- '--limit [1-9][0-9]{2,}'; then
+# CR Major on PR #213: gh pr list defaults to --limit 30. The scheduled
+# sweep must use a higher limit so repos with many open
+# needs-external-review PRs get them ALL processed, not just the first 30.
+#
+# #730/#731 (Codex P3): anchor this to the sweep's LABEL-FILTERED query
+# specifically, not "the first gh pr list". The #730 head_sha fallback added
+# a SECOND, intentionally-unlabeled `gh pr list` that appears EARLIER in the
+# file — a bare first-match assertion (the old `awk '/gh pr list/,/…/'`
+# range) could pass against that fallback's --limit and keep printing the
+# "handles >30-PR repos" pass even if the sweep later lost its own --limit.
+# The sweep query is the one carrying `--label needs-external-review`; require
+# --limit ≥100 on that same query line. (The #730 fallback is intentionally
+# unlabeled — it matches a single head SHA, not the label queue.)
+if grep -E -- '--label needs-external-review' "$WORKFLOW" | grep -qE -- '--limit [1-9][0-9]{2,}'; then
   pass=$((pass + 1))
-  echo "  PASS: gh pr list uses --limit ≥100 (handles >30-PR repos)"
+  echo "  PASS: scheduled-sweep label-filtered query uses --limit ≥100 (handles >30-PR repos; #730-anchored)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: gh pr list must use --limit ≥100 to override default of 30 (CR Major on PR #213)" >&2
+  echo "  FAIL: sweep 'gh pr list --label needs-external-review' must use --limit ≥100 (CR Major #213; anchored per #730 Codex P3)" >&2
 fi
 
 # CR Major on PR #213: opt-out parser must strip trailing YAML
