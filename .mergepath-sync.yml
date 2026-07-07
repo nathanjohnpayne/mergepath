@@ -597,6 +597,14 @@ paths:
   - path: tests/test_coderabbit_wait_statuscontext_ratelimit.sh
     type: canonical
     consumers: all
+  # #727 rate-limit remaining-window sleep suite. Hard-required (exit 1 if
+  # missing) by scripts/ci/check_coderabbit_wait, so it must travel to every
+  # consumer. Locks that a rate-limit notice whose published window already
+  # elapsed sleeps only the remainder (0s when expired) instead of re-waiting
+  # a fresh full window, while a genuinely-fresh notice still sleeps it.
+  - path: tests/test_coderabbit_wait_ratelimit_window.sh
+    type: canonical
+    consumers: all
   # Pairs with scripts/workflow/verify-propagation-pr.sh (under the
   # scripts/workflow/ kit below). The verifier is security-load-bearing
   # for the propagation-PR review lane; its test travels with it so a
