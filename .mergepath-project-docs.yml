@@ -97,3 +97,13 @@ projects:
     specs:
       - source: specs/
         mirror: projects/swipewatch/specs/
+
+  - slug: gaycruisebingo
+    owner:
+      name: gaycruisebingo
+      repo: nathanjohnpayne/gaycruisebingo
+      path_hint: ../gaycruisebingo
+    prds:
+      - slug: gaycruisebingo
+        source: projects/gaycruisebingo/prds/gaycruisebingo.md
+        mirror: docs/projects/gaycruisebingo/prds/gaycruisebingo.md
