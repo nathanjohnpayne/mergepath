@@ -1990,6 +1990,31 @@ jobs:
                 true) re_protected=true ;;
               esac
             fi
+            # #727 (Codex P2 on #729): the rc=5 downgrade can be granted via the
+            # post-clearance signal (CODEX_CLEARED folded into ext_protected),
+            # but --derive-rate-limit-protection returns false for an
+            # under-threshold PR even when Codex cleared HEAD — so re-deriving
+            # only that predicate here would abort a VALID under-threshold
+            # post-clearance downgrade at the last step. Re-evaluate the SAME
+            # post-clearance predicate on the (now head-pinned) live head:
+            # codex-review-check.sh gate (b)+(c), SKIP_CI + REQUIRE_APPROVAL_ON_HEAD,
+            # exactly as the rc=5 arm derived CODEX_CLEARED. Re-run (not a
+            # persisted flag) so state that changed during the waits is caught,
+            # matching this block's fail-closed intent. Either predicate holding
+            # on the live head upholds the downgrade.
+            if [ "$re_protected" != "true" ]; then
+              set +e
+              CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+                bash scripts/codex-review-check.sh "$PR_NUMBER" "$REPO" >&2
+              crc=$?
+              set -e
+              if [ "$crc" = "0" ]; then
+                re_protected=true
+                echo "::notice::rc=5 re-verify: post-clearance predicate still holds on $CURRENT_HEAD_SHA (verified Codex/Phase-4b clearance + reviewer APPROVED) — downgrade upheld (#727)."
+              elif [ "$crc" != "1" ]; then
+                echo "::warning::codex-review-check.sh returned rc=$crc re-deriving the post-clearance predicate at final re-verify; treating as not-protected (fail closed)."
+              fi
+            fi
             if [ "$re_protected" != "true" ]; then
               echo "::error::external-review protection is no longer true (or underivable) for $CURRENT_HEAD_SHA after an rc=5 rate-limit downgrade — this head has neither an active external gate nor already-satisfied Codex/Phase-4b clearance. Aborting auto-merge."
               exit 1
