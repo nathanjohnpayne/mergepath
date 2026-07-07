@@ -99,19 +99,25 @@ else
   echo "  FAIL: scheduled-sweep job missing or not gated to schedule events (executable line)" >&2
 fi
 
-# CR Major on PR #213: gh pr list defaults to --limit 30. The sweep
-# must use a higher limit so repos with many open needs-external-review
-# PRs get them ALL processed, not just the first 30.
-# `gh pr list` is split across multiple lines via shell continuation,
-# so the assertion is split too: `gh pr list` exists AND `--limit
-# <≥100>` appears within 5 lines after it.
-if grep -qE -- 'gh pr list' "$WORKFLOW" && \
-   awk '/gh pr list/,/[^\\\\]$/' "$WORKFLOW" | grep -qE -- '--limit [1-9][0-9]{2,}'; then
+# CR Major on PR #213: gh pr list defaults to --limit 30. The scheduled
+# sweep must use a higher limit so repos with many open
+# needs-external-review PRs get them ALL processed, not just the first 30.
+#
+# #730/#731 (Codex P3): anchor this to the sweep's LABEL-FILTERED query
+# specifically, not "the first gh pr list". The #730 head_sha fallback added
+# a SECOND, intentionally-unlabeled `gh pr list` that appears EARLIER in the
+# file — a bare first-match assertion (the old `awk '/gh pr list/,/…/'`
+# range) could pass against that fallback's --limit and keep printing the
+# "handles >30-PR repos" pass even if the sweep later lost its own --limit.
+# The sweep query is the one carrying `--label needs-external-review`; require
+# --limit ≥100 on that same query line. (The #730 fallback is intentionally
+# unlabeled — it matches a single head SHA, not the label queue.)
+if grep -E -- '--label needs-external-review' "$WORKFLOW" | grep -qE -- '--limit [1-9][0-9]{2,}'; then
   pass=$((pass + 1))
-  echo "  PASS: gh pr list uses --limit ≥100 (handles >30-PR repos)"
+  echo "  PASS: scheduled-sweep label-filtered query uses --limit ≥100 (handles >30-PR repos; #730-anchored)"
 else
   fail=$((fail + 1))
-  echo "  FAIL: gh pr list must use --limit ≥100 to override default of 30 (CR Major on PR #213)" >&2
+  echo "  FAIL: sweep 'gh pr list --label needs-external-review' must use --limit ≥100 (CR Major #213; anchored per #730 Codex P3)" >&2
 fi
 
 # CR Major on PR #213: opt-out parser must strip trailing YAML
@@ -160,7 +166,11 @@ fi
 # ".github/workflows/repo_lint_local.yml" added for #655 round 11 —
 # workflow_run matches by displayed name, which is the workflow FILE PATH
 # when the annex omits a top-level `name:` key (round 6's fallback case).
-for wf in 'PR Review Policy' 'Agent Review Pipeline' 'repo-lint' 'repo-lint-local' '.github/workflows/repo_lint_local.yml'; do
+# "Merge Clearance Gate" added for #730 — its SUCCESS is the direct clearance
+# signal, and unlike "PR Review Policy" it actually reaches conclusion=success
+# when the gate clears (PR Review Policy's Label Gate is red while the label is
+# present, so it never triggers auto-clear via workflow_run).
+for wf in 'PR Review Policy' 'Agent Review Pipeline' 'Merge Clearance Gate' 'repo-lint' 'repo-lint-local' '.github/workflows/repo_lint_local.yml'; do
   if grep -qF -- "- \"$wf\"" "$WORKFLOW"; then
     pass=$((pass + 1))
     echo "  PASS: workflow_run listens to '$wf'"
@@ -169,6 +179,30 @@ for wf in 'PR Review Policy' 'Agent Review Pipeline' 'repo-lint' 'repo-lint-loca
     echo "  FAIL: workflow_run missing '$wf'" >&2
   fi
 done
+
+# #730: the pull_request_target trigger must include `edited` so a body-edit
+# nudge (the reliable re-fire for a claude-authored Phase-4 PR after a late
+# Codex clearance) re-evaluates auto-clear on the PR head. Anchor to the
+# pull_request_target types line specifically.
+if awk '/^[[:space:]]+pull_request_target:/{f=1} f&&/types:/{print; exit}' "$WORKFLOW" | grep -qE '\bedited\b'; then
+  pass=$((pass + 1))
+  echo "  PASS: pull_request_target listens to 'edited' (#730 body-edit nudge)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: pull_request_target missing 'edited' trigger (#730)" >&2
+fi
+
+# #730: the workflow_run resolver must fall back to head_sha when
+# pull_requests[] is empty, else a Merge Clearance Gate success on the PR head
+# resolves no PR and the label stays stuck.
+if grep -qE 'workflow_run\.pull_requests empty; resolving open PRs by head_sha' "$WORKFLOW" && \
+   grep -qE 'select\(\.headRefOid == \$sha\)' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: workflow_run resolver falls back to head_sha when pull_requests[] is empty (#730)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow_run resolver missing the head_sha fallback (#730)" >&2
+fi
 
 # SECURITY: checkout MUST pin to default branch ref for
 # pull_request_review safety. CR Critical on PR #202 r2 — without
@@ -365,6 +399,18 @@ fi
 echo
 echo "auto-clear-blocking-labels.yml PR-number resolution tests"
 
+# Stub `gh` for the #730 head_sha fallback below. GH_STUB_PRS is a JSON array
+# of {number, headRefOid}; the stub returns it for `gh pr list --json ...`.
+# Empty/unset ⇒ `[]` (models "no open PR matches", e.g. a main-branch sha).
+gh() {
+  if [ "${1:-}" = "pr" ] && [ "${2:-}" = "list" ]; then
+    printf '%s' "${GH_STUB_PRS:-[]}"
+    return 0
+  fi
+  echo "unexpected gh call in test: $*" >&2
+  return 1
+}
+
 dispatch() {
   # Mirrors the workflow's case statement. Args: event_name,
   # event_json. Unsupported events return 0 (matching the workflow's
@@ -376,12 +422,22 @@ dispatch() {
       jq -r '.pull_request.number' <<<"$event_json"
       ;;
     workflow_run)
-      local conclusion
+      local conclusion prs
       conclusion=$(jq -r '.workflow_run.conclusion' <<<"$event_json")
       if [ "$conclusion" != "success" ]; then
         return 0  # workflow's "skip on non-success" path
       fi
-      jq -r '.workflow_run.pull_requests[].number' <<<"$event_json"
+      prs=$(jq -r '.workflow_run.pull_requests[].number' <<<"$event_json")
+      # #730 head_sha fallback — mirrors the workflow's resolve step.
+      if [ -z "$prs" ]; then
+        local head_sha
+        head_sha=$(jq -r '.workflow_run.head_sha // empty' <<<"$event_json")
+        if [ -n "$head_sha" ]; then
+          prs=$(gh pr list --repo x --state open --limit 500 --json number,headRefOid 2>/dev/null \
+            | jq -r --arg sha "$head_sha" '.[] | select(.headRefOid == $sha) | .number' 2>/dev/null || true)
+        fi
+      fi
+      printf '%s' "$prs"
       ;;
     *)
       echo "Unsupported event: $event_name" >&2
@@ -432,16 +488,40 @@ else
   echo "  FAIL: workflow_run failure should produce empty (got: $out)" >&2
 fi
 
-# workflow_run with empty pull_requests → empty (script then skips
-# per the `if [ -z "$prs" ]` guard upstream)
+# workflow_run with empty pull_requests AND no head_sha → empty (fallback
+# skipped for lack of a SHA to match on)
 out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"success","pull_requests":[]}}')
 if [ -z "$out" ]; then
   pass=$((pass + 1))
-  echo "  PASS: workflow_run with no PRs produces empty output (will be skipped)"
+  echo "  PASS: workflow_run with no PRs and no head_sha produces empty output"
 else
   fail=$((fail + 1))
-  echo "  FAIL: workflow_run empty PRs should yield empty (got: $out)" >&2
+  echo "  FAIL: workflow_run empty PRs (no head_sha) should yield empty (got: $out)" >&2
 fi
+
+# #730: empty pull_requests but head_sha matches an OPEN PR → resolves it via
+# the fallback (the Merge-Clearance-Gate-success-on-PR-head case).
+GH_STUB_PRS='[{"number":11,"headRefOid":"df809ae"},{"number":22,"headRefOid":"cafe00"}]'
+out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"success","pull_requests":[],"head_sha":"df809ae"}}')
+if [ "$out" = "11" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: #730 — empty pull_requests + matching head_sha resolves the PR via the fallback"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: #730 head_sha fallback should resolve PR 11 (got: $out)" >&2
+fi
+
+# #730: empty pull_requests + head_sha that matches NO open PR (a default-branch
+# commit — the concurrent-main-merge case) → empty → correct no-op.
+out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"success","pull_requests":[],"head_sha":"4852bc74main"}}')
+if [ -z "$out" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: #730 — empty pull_requests + non-PR head_sha (main) yields empty (no-op)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: #730 non-matching head_sha should yield empty (got: $out)" >&2
+fi
+unset GH_STUB_PRS
 
 # Unsupported event → exit 0 with stderr message (matches workflow
 # behavior; CR Minor on PR #202 r1 fixed the prior return-1 mismatch)
