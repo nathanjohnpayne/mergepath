@@ -15,8 +15,18 @@ name: Auto-clear blocking labels
 # this workflow ships in #196.
 
 on:
+  # `edited` + `reopened` (#730): a body/title edit is the reliable way to
+  # re-fire the merge-clearance gate for a claude-authored Phase-4 PR after a
+  # LATE Codex clearance — an `issue_comment` (Codex's verdict) does not fire
+  # `pull_request` workflows, but a body edit does. Before #730 that nudge
+  # re-evaluated the gate yet never prompted auto-clear on the PR head, so
+  # `needs-external-review` stayed stuck until the 5-min sweep or a human
+  # removed it (observed on #729). This trigger gives DIRECT PR context
+  # (`.pull_request.number`) with no dependency on the flaky
+  # `workflow_run.pull_requests` array. `reopened` covers a reopen with the
+  # label still present. The `unlabeled`-self-fire guard below still applies.
   pull_request_target:
-    types: [synchronize, labeled, unlabeled]
+    types: [synchronize, edited, reopened, labeled, unlabeled]
   pull_request_review:
     types: [submitted]
   # workflow_run fires on completion of OTHER workflows. We target
@@ -49,10 +59,21 @@ on:
   # path too closes that gap for this promptness-only trigger; the
   # scheduled sweep below still covers it either way, just less
   # immediately.
+  # "Merge Clearance Gate" (#730): its SUCCESS is the most direct signal that
+  # clearance state changed, and — unlike "PR Review Policy" — it actually
+  # REACHES `conclusion: success` when the gate clears. PR Review Policy's
+  # Label Gate job is red for as long as `needs-external-review` is present, so
+  # that workflow can never complete `success` while the label is up; the
+  # `conclusion != success` skip in the resolve step below therefore means it
+  # never triggers auto-clear (a chicken-and-egg the gate workflow avoids
+  # because it is not itself gated on the label). Adding the gate closes the
+  # gap where a late Codex clearance flips the gate green but no listened
+  # workflow fires auto-clear on the PR head (observed on #729).
   workflow_run:
     workflows:
       - "PR Review Policy"
       - "Agent Review Pipeline"
+      - "Merge Clearance Gate"
       - "repo-lint"
       - "repo-lint-local"
       - ".github/workflows/repo_lint_local.yml"
@@ -156,6 +177,13 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_JSON: ${{ toJSON(github.event) }}
+          # #730: read-only `gh pr list` fallback when workflow_run.pull_requests
+          # is empty. GITHUB_TOKEN suffices (pull-requests: read is covered by
+          # the workflow's pull-requests: write). No PR-controlled input reaches
+          # a shell eval here — HEAD_SHA comes from the trusted event payload and
+          # is only used in a jq `select`.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           # Each event surfaces PR number(s) differently. Emit a
           # newline-separated list (most events have exactly one PR).
@@ -176,6 +204,26 @@ jobs:
                 exit 0
               fi
               prs=$(jq -r '.workflow_run.pull_requests[].number' <<<"$EVENT_JSON")
+              # #730: `workflow_run.pull_requests` is frequently EMPTY even for a
+              # run whose head IS a PR head (a documented GitHub quirk for
+              # same-repo PR runs, and always empty for push / issue_comment /
+              # schedule-triggered runs). Without a fallback, a listened workflow
+              # (notably the newly-added "Merge Clearance Gate") completing
+              # SUCCESS on the PR head resolves NO PR here and the label stays
+              # stuck. Fall back to the open PR whose head SHA == the run's
+              # head_sha. When head_sha is a default-branch commit (the
+              # concurrent-main-merge case that stole the events on #729), no
+              # open PR matches → empty → correct no-op.
+              if [ -z "$prs" ]; then
+                HEAD_SHA=$(jq -r '.workflow_run.head_sha // empty' <<<"$EVENT_JSON")
+                if [ -n "$HEAD_SHA" ]; then
+                  echo "workflow_run.pull_requests empty; resolving open PRs by head_sha=$HEAD_SHA (#730)." >&2
+                  # --limit 500 (mirrors the scheduled sweep) so a match beyond
+                  # gh's default 30 open PRs isn't missed.
+                  prs=$(gh pr list --repo "$REPO" --state open --limit 500 --json number,headRefOid 2>/dev/null \
+                    | jq -r --arg sha "$HEAD_SHA" '.[] | select(.headRefOid == $sha) | .number' 2>/dev/null || true)
+                fi
+              fi
               ;;
             *)
               echo "Unsupported event: $EVENT_NAME" >&2
