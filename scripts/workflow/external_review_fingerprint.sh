@@ -90,6 +90,31 @@ sha256() {
   fi
 }
 
+# Run a gh invocation with stdout and stderr captured separately, so a
+# stderr warning/notice on an otherwise-successful call can't leak into
+# the stdout stream that callers parse as JSON with jq (#715). On
+# failure, stdout+stderr are combined into the returned text (for the
+# caller's error message) and the real gh exit code is preserved — a
+# genuine gh failure still fails closed. Same fix applied to
+# external_review_carryforward.sh (#716); kept as a small duplicated
+# helper since the two scripts run as separate processes (same pattern
+# as fetch_api_array in codex-review-check.sh / codex-review-request.sh).
+gh_api_capture() {
+  local err_file rc=0 out
+  err_file=$(mktemp "${TMPDIR:-/tmp}/external-review-gh-err.XXXXXX") || {
+    "$@" 2>&1
+    return $?
+  }
+  out=$("$@" 2>"$err_file") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    out="$out
+$(cat "$err_file" 2>/dev/null)"
+  fi
+  rm -f "$err_file"
+  printf '%s' "$out"
+  return "$rc"
+}
+
 tree_for_ref() {
   local ref="$1"
   local tree_ref="$ref"
@@ -104,7 +129,7 @@ tree_for_ref() {
     [ -z "$commit_tree" ] || tree_ref="$commit_tree"
   fi
 
-  tree_json=$(gh api "repos/$REPO/git/trees/$tree_ref?recursive=1" 2>&1) || {
+  tree_json=$(gh_api_capture gh api "repos/$REPO/git/trees/$tree_ref?recursive=1") || {
     echo "external_review_fingerprint.sh: failed to fetch tree for $ref (tree $tree_ref): $tree_json" >&2
     return 2
   }
@@ -141,7 +166,7 @@ if [ -n "$FILES_JSON_PATH" ]; then
     exit 2
   }
 else
-  RAW_FILES=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" 2>&1) || {
+  RAW_FILES=$(gh_api_capture gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files") || {
     echo "external_review_fingerprint.sh: failed to fetch PR files: $RAW_FILES" >&2
     exit 2
   }

@@ -81,6 +81,31 @@ fi
 FINGERPRINT_BIN="$SCRIPT_DIR/external_review_fingerprint.sh"
 [ -x "$FINGERPRINT_BIN" ] || { echo "external_review_carryforward.sh: missing executable helper: $FINGERPRINT_BIN" >&2; exit 2; }
 
+# Run a gh invocation with stdout and stderr captured separately, so a
+# stderr warning/notice on an otherwise-successful call can't leak into
+# the stdout stream that callers parse as JSON with jq (#716). On
+# failure, stdout+stderr are combined into the returned text (for the
+# caller's error message) and the real gh exit code is preserved — a
+# genuine gh failure still fails closed. Same fix applied to
+# external_review_fingerprint.sh (#715); kept as a small duplicated
+# helper since the two scripts run as separate processes (same pattern
+# as fetch_api_array in codex-review-check.sh / codex-review-request.sh).
+gh_api_capture() {
+  local err_file rc=0 out
+  err_file=$(mktemp "${TMPDIR:-/tmp}/external-review-gh-err.XXXXXX") || {
+    "$@" 2>&1
+    return $?
+  }
+  out=$("$@" 2>"$err_file") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    out="$out
+$(cat "$err_file" 2>/dev/null)"
+  fi
+  rm -f "$err_file"
+  printf '%s' "$out"
+  return "$rc"
+}
+
 TMP_FILES=""
 cleanup() {
   [ -z "$TMP_FILES" ] || rm -f "$TMP_FILES"
@@ -89,7 +114,7 @@ trap cleanup EXIT
 
 if [ -z "$FILES_JSON_PATH" ]; then
   TMP_FILES=$(mktemp "${TMPDIR:-/tmp}/external-review-files.XXXXXX")
-  RAW_FILES=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" 2>&1) || {
+  RAW_FILES=$(gh_api_capture gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files") || {
     echo "external_review_carryforward.sh: failed to fetch PR files: $RAW_FILES" >&2
     exit 2
   }
@@ -110,7 +135,7 @@ if [ -z "$CURRENT_FINGERPRINT" ]; then
   exit 0
 fi
 
-COMMENTS_JSON=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>&1) || {
+COMMENTS_JSON=$(gh_api_capture gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments") || {
   echo "external_review_carryforward.sh: failed to fetch issue comments: $COMMENTS_JSON" >&2
   exit 2
 }
@@ -119,7 +144,7 @@ COMMENTS_JSON=$(printf '%s\n' "$COMMENTS_JSON" | jq -s 'add // []') || {
   exit 2
 }
 
-REVIEWS_JSON=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" 2>&1) || {
+REVIEWS_JSON=$(gh_api_capture gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews") || {
   echo "external_review_carryforward.sh: failed to fetch reviews: $REVIEWS_JSON" >&2
   exit 2
 }
@@ -174,6 +199,16 @@ if [ -n "$CURRENT_SIGNAL" ]; then
       '{carried:false, reason:"current-head Codex signal exists and must not be overridden by carry-forward", current_signal:{kind:$kind, time:$time}}'
     exit 0
   fi
+  # (#718) The current HEAD already carries a direct affirmative Codex
+  # signal — callers already prefer that over a carry-forward result
+  # (see codex-review-check.sh's latest-signal-wins comment), so there is
+  # nothing for the historical-candidate scan below to add. Return early
+  # instead of paying for the candidate + newer-signal fingerprint scan.
+  jq -n \
+    --arg kind "$current_kind" \
+    --arg time "$current_time" \
+    '{carried:false, reason:"current-head Codex signal is already affirmative; carry-forward scan skipped", current_signal:{kind:$kind, time:$time}}'
+  exit 0
 fi
 
 CANDIDATES=$(printf '%s' "$COMMENTS_JSON" | jq -r \
