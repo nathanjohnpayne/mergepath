@@ -129,10 +129,11 @@ done
 # Dependabot PR (its reviewer gate blocks on a reviewer-identity APPROVED,
 # not on Codex — and Codex does not review Dependabot PRs, so it is never a
 # bot-review gate; automated-4b P1). Every error keeps the die()/exit-2
-# paths so callers MUST fail closed on nonzero. Consumer: agent-review.yml's
-# rc=5 CodeRabbit rate-limit branch (#489/#620) — it needs Codex-review
-# requiredness, not clearance, and deriving it from label events was
-# rejected repeatedly in review (label removal is not head-pinned proof).
+# paths so callers MUST fail closed on nonzero. Retained as a narrow
+# diagnostic/back-compat query for callers that need only intrinsic external
+# applicability, not clearance. The production CodeRabbit rc=5 branch now uses
+# --derive-rate-limit-protection below because Phase-4b-cleared protected PRs
+# can be safe to auto-merge even after the removable label is gone (#713).
 #
 # --derive-rate-limit-protection (#713): QUERY mode for
 # agent-review.yml's CodeRabbit rc=5 branch. It prints `true` when a
@@ -594,6 +595,9 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
       bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO" >&2
     crc=$?
     set -e
+    # codex-review-check.sh's public contract is 0 clear, 1 gate-fail,
+    # 3 infrastructure/config. It has no "pending" success-adjacent code, so
+    # every other rc is treated as infrastructure and fails closed.
     case "$crc" in
       0)
         log "rate-limit protection query: current-head Codex/Phase-4b clearance is already satisfied"

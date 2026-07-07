@@ -112,9 +112,15 @@ STUB
 chmod +x "$STUB_DIR/gh"
 
 # A stub codex-review-check.sh that exits with $CODEX_STUB_RC (inherited
-# from the gate's environment). Default 0.
+# from the gate's environment). Default 0. Tests can set
+# CODEX_STUB_REQUIRE_HEAD_PIN=1 to assert the caller passed the real
+# delegate's HEAD-pinning override.
 cat >"$STUB_DIR/codex-check-stub" <<'STUB'
 #!/usr/bin/env bash
+if [ "${CODEX_STUB_REQUIRE_HEAD_PIN:-0}" = "1" ] && [ "${CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD:-}" != "1" ]; then
+  echo "codex-check-stub: expected CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1" >&2
+  exit 42
+fi
 [ -z "${CODEX_STUB_STDOUT:-}" ] || printf '%s\n' "$CODEX_STUB_STDOUT"
 exit "${CODEX_STUB_RC:-0}"
 STUB
@@ -1131,12 +1137,12 @@ FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions"
 FIXTURE_COMMENTS=$(make_comments_fixture '[]')
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
-      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=0 CODEX_STUB_STDOUT='delegate stdout must not pollute query output' \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=0 CODEX_STUB_STDOUT='delegate stdout must not pollute query output' \
       run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
 RC=$?
 set -e
 if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
-  pass "protection: gate disabled + protected path + current-head external clearance → true (#713)"
+  pass "protection: gate disabled + protected path + head-pinned current-head external clearance → true (#713)"
 else
   fail "protection: gate-disabled cleared expected true/0; got rc=$RC out='$OUT'"
 fi
@@ -1148,7 +1154,7 @@ FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions"
 FIXTURE_COMMENTS=$(make_comments_fixture '[]')
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
-      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_RC=1 \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
       run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
 RC=$?
 set -e
