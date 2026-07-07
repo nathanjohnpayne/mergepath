@@ -91,15 +91,17 @@ knowledge_base:
   # across the whole org/owner), auto (= local for PUBLIC repos, global for
   # PRIVATE repos).
   #
-  # We keep `auto` deliberately. Consequence to be aware of: this template
-  # repo is PUBLIC, so HERE `auto` resolves to `local`. But .coderabbit.yml
-  # is NOT propagated (.mergepath-sync.yml), so each consumer ships its own
-  # copy — and for the three PRIVATE consumers (matchline, overridebroadway,
-  # tadlockpsychiatry) `auto` resolves to GLOBAL: their
-  # learnings are shared org-wide. That is acceptable for a single-owner
-  # fleet under one account (nathanjohnpayne) where cross-repo review
-  # conventions SHOULD carry over. A repo that wants its learnings firewalled
-  # (e.g. a sensitive private repo) should override to `scope: local` in its
-  # own .coderabbit.yml. See docs/agents/coderabbit-audit.md § learnings.scope.
+  # We keep `auto` deliberately. As of 2026-07-06 the ENTIRE fleet is
+  # PUBLIC (matchline, overridebroadway, and tadlockpsychiatry were
+  # private earlier and have since been made public), so `auto` resolves
+  # to `local` everywhere — this template repo and every consumer alike.
+  # No consumer shares learnings org-wide; each repo's learnings stay
+  # local to that repo. (.coderabbit.yml is NOT propagated —
+  # .mergepath-sync.yml — so each consumer ships its own copy, but the
+  # resolution is the same `local` for all now the fleet is uniformly
+  # public.) If cross-repo convention sharing is ever wanted again across
+  # the public fleet, it would take an explicit `scope: global` override —
+  # `auto` will not grant `global` to a public repo. See
+  # docs/agents/coderabbit-audit.md § learnings.scope.
   learnings:
     scope: auto

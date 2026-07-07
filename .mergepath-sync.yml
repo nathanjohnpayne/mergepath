@@ -101,12 +101,12 @@ version: 1
 consumers:
   - name: matchline
     repo: nathanjohnpayne/matchline
-    visibility: private
+    visibility: public
     facts:
       frameworks: [react, typescript]
   - name: nathanpaynedotcom
     repo: nathanjohnpayne/nathanpaynedotcom
-    visibility: private
+    visibility: public
     facts:
       frameworks: [astro, typescript]
   # overridebroadway is CJS + TypeScript (React 19 + TypeScript, root
@@ -117,7 +117,7 @@ consumers:
   # is supported. First CJS + TS consumer of the canonical floor.
   - name: overridebroadway
     repo: nathanjohnpayne/overridebroadway
-    visibility: private
+    visibility: public
     facts:
       frameworks: [react, typescript]
   # device-source-of-truth is a React 19 + TypeScript + Vite SPA with a
@@ -162,7 +162,7 @@ consumers:
       frameworks: []
   - name: tadlockpsychiatry
     repo: nathanjohnpayne/tadlockpsychiatry
-    visibility: private
+    visibility: public
     facts:
       frameworks: [react, typescript]
 
@@ -225,7 +225,7 @@ consumers:
 #     consumers:
 #       - name: matchline
 #         repo: nathanjohnpayne/matchline
-#         visibility: private
+#         visibility: public
 #         facts:
 #           frameworks: [react, typescript]
 #           node_version: "20"
@@ -976,9 +976,12 @@ paths:
   # would read it in-repo — but the lane's redesign (after the Codex
   # P1 on #268) runs verify-propagation-pr.sh from the CLONED
   # mergepath@<sha>, which carries its own authoritative manifest.
-  # The consumer's copy would be unused — and worse, this file lists
-  # every consumer including private repo names, so propagating it to
-  # a PUBLIC consumer leaks the private inventory. Keep it
+  # The consumer's copy would be unused — and this file enumerates the
+  # full fleet inventory (every consumer repo name + facts), which there
+  # is no reason to mirror into each consumer. (It historically also
+  # avoided leaking then-private repo names to a public consumer; the
+  # fleet is uniformly public as of 2026-07-06, so that specific concern
+  # is now moot, but the file stays mergepath-only regardless.) Keep it
   # mergepath-only. (CodeRabbit Major, #271.)
 
   # Kit directories — Mergepath-canonical files are required;
