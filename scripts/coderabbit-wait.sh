@@ -403,13 +403,18 @@ fi
 # non-truthy flag leaves the full budget untouched.
 POST_CLEARANCE_MAX_WAIT_SECONDS=$(coderabbit_field post_clearance_max_wait_seconds)
 POST_CLEARANCE_MAX_WAIT_SECONDS=${POST_CLEARANCE_MAX_WAIT_SECONDS:-240}
-if ! [[ "$POST_CLEARANCE_MAX_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
-  echo "ERROR: coderabbit.post_clearance_max_wait_seconds must be an integer; got '$POST_CLEARANCE_MAX_WAIT_SECONDS'" >&2
-  exit 3
-fi
 case "${CODERABBIT_WAIT_POST_CLEARANCE:-}" in
   1|true|TRUE|True|yes|YES)
-    if [ "$POST_CLEARANCE_MAX_WAIT_SECONDS" -lt "$MAX_WAIT_SECONDS" ]; then
+    # Validate ONLY when the fast path is actually engaged (#727, CodeRabbit
+    # Major on #729). This knob is a fail-safe opt-in latency trim, so its
+    # config must never break an UNRELATED wait: validating it unconditionally
+    # would exit 3 fleet-wide on a typo in a policy that never even uses the
+    # feature. And even when armed, a bad value DISARMS the cap (full budget =
+    # the pre-#727 behavior) with a warning rather than aborting — consistent
+    # with the feature's "only ever shortens, never breaks the wait" invariant.
+    if ! [[ "$POST_CLEARANCE_MAX_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
+      echo "[coderabbit-wait] WARNING: coderabbit.post_clearance_max_wait_seconds must be an integer; got '$POST_CLEARANCE_MAX_WAIT_SECONDS' — ignoring the post-clearance fast path and using the full max_wait budget (#727)" >&2
+    elif [ "$POST_CLEARANCE_MAX_WAIT_SECONDS" -lt "$MAX_WAIT_SECONDS" ]; then
       echo "[coderabbit-wait] post-clearance fast path: HEAD already has verified Codex/Phase-4b clearance + reviewer APPROVED; capping max_wait ${MAX_WAIT_SECONDS}s -> ${POST_CLEARANCE_MAX_WAIT_SECONDS}s (#727)" >&2
       MAX_WAIT_SECONDS=$POST_CLEARANCE_MAX_WAIT_SECONDS
     fi

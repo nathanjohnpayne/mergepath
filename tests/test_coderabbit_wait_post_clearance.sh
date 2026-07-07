@@ -177,9 +177,42 @@ test_cap_noop_when_larger() {
   [ "$FAIL" -ne "$before" ] || pass "3: the fast path only ever SHORTENS — a cap >= max_wait is a no-op"
 }
 
+# --- Test 4: a bad value with the flag UNSET must NOT break the wait ---------
+# The core of the #729 CodeRabbit Major: unconditional validation would exit 3
+# on a typo'd post_clearance_max_wait_seconds even in a policy that never
+# engages the fast path, blocking auto-merge fleet-wide. The wait must run
+# normally (exit 4) and never emit the exit-3 ERROR.
+test_bad_value_unset_flag_does_not_break() {
+  local dir rc before=$FAIL
+  dir=$(make_case "badunset" 30 banana)
+  rc=$(run_case "$dir" "")
+  [ "$rc" = "4" ] || fail "4: a bad post_clearance value with the flag unset broke the wait (got rc=$rc, expected 4); err=$(tail -4 "$dir/err.log")"
+  ! grep -q 'must be an integer' "$dir/err.log" \
+    || fail "4: post_clearance validation ran even though the fast path was never engaged"
+  ! grep -q 'capping max_wait' "$dir/err.log" || fail "4: unexpected cap with the flag unset"
+  [ "$FAIL" -ne "$before" ] || pass "4: #729 — a bad post_clearance_max_wait_seconds does NOT break unrelated waits when the fast path is unused"
+}
+
+# --- Test 5: a bad value WITH the flag set disarms (full budget), never aborts -
+# Even when armed, a non-integer must fail safe to the full budget with a
+# warning, per the feature's "only ever shortens, never breaks the wait" invariant.
+test_bad_value_set_flag_disarms() {
+  local dir rc before=$FAIL
+  dir=$(make_case "badset" 30 banana)
+  rc=$(run_case "$dir" 1)
+  [ "$rc" = "4" ] || fail "5: a bad post_clearance value with the flag set aborted (got rc=$rc, expected 4/full-budget); err=$(tail -4 "$dir/err.log")"
+  grep -q 'WARNING: coderabbit.post_clearance_max_wait_seconds must be an integer' "$dir/err.log" \
+    || fail "5: expected the disarm WARNING; log=$(grep -i post_clearance "$dir/err.log" | head -2)"
+  ! grep -q 'capping max_wait' "$dir/err.log" || fail "5: capped on a bad value instead of disarming"
+  grep -q 'max_wait = 30s' "$dir/err.log" || fail "5: expected the full 'max_wait = 30s' budget after disarm"
+  [ "$FAIL" -ne "$before" ] || pass "5: a bad post_clearance value with the flag set disarms to the full budget (warning), never aborts"
+}
+
 test_post_clearance_caps
 test_no_flag_full_budget
 test_cap_noop_when_larger
+test_bad_value_unset_flag_does_not_break
+test_bad_value_set_flag_disarms
 
 echo "----"
 echo "test_coderabbit_wait_post_clearance: $PASS passed, $FAIL failed"
