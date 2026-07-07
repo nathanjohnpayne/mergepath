@@ -77,9 +77,12 @@
 #                        auto-generated marker (the #485 auto-pause NOTE)
 #        - in_progress — body matches /review in progress|currently reviewing/i
 #        - review      — anything else authored by coderabbitai[bot]
-#   4. On rate_limit: parse "X minutes and Y seconds" (or "X seconds"),
-#      sleep that duration + 30s buffer, post `@coderabbitai, try again.`,
-#      increment retry counter, continue polling.
+#   4. On rate_limit: parse "X minutes and Y seconds" (or "X seconds") into a
+#      window, sleep the portion of it that REMAINS after subtracting the time
+#      already elapsed since the notice was posted (#727 — the window runs from
+#      the notice's post time, not from when this helper first sees it), + 30s
+#      buffer, then post `@coderabbitai, try again.`, increment the retry
+#      counter, and continue polling. An already-expired window sleeps 0.
 #   4b. On paused: post `@coderabbitai resume` (a one-shot `review`
 #      re-pauses after the next push, so resume is the correct verb),
 #      increment a resume-retry counter, and continue polling. If
@@ -1128,6 +1131,33 @@ iso_within_seconds_after() {
   esac
 }
 
+# #727: how many seconds of a CodeRabbit rate-limit window have ALREADY
+# elapsed between when CodeRabbit posted the notice (fresh_at = max of
+# created_at/updated_at) and now. The published "try again in N" window is
+# measured from the notice's post time, NOT from when this helper first
+# observes it — auto-merge-on-approval routinely starts this wait minutes
+# after the notice landed (the reviewer approval that ARMS the job can post
+# long after CodeRabbit rate-limited), so the sleep should cover only the
+# window that REMAINS, not a fresh full copy of it. Emits max(0, now -
+# fresh_at) on stdout. Fails SAFE to 0 (⇒ the caller sleeps the full window,
+# the pre-#727 behavior) on empty/unparseable input, so a bad timestamp can
+# never SHORTEN a genuine rate-limit wait — only a parseable, already-elapsed
+# window trims the sleep.
+rate_limit_window_elapsed_seconds() {
+  local fresh_at=$1 now_epoch=$2 elapsed
+  if [ -z "$fresh_at" ] || [ "$fresh_at" = "null" ]; then
+    echo 0
+    return 0
+  fi
+  elapsed=$(jq -rn --arg t "$fresh_at" --argjson now "$now_epoch" \
+    '($now - ($t | fromdateiso8601)) | floor' 2>/dev/null) || { echo 0; return 0; }
+  case "$elapsed" in
+    ''|*[!0-9-]*) echo 0; return 0 ;;
+  esac
+  if [ "$elapsed" -lt 0 ]; then elapsed=0; fi
+  echo "$elapsed"
+}
+
 status_context_fast_path_blocked_by_comment() {
   local status_created_at=$1
   local latest class comment_id comment_created_at comment_fresh_at comment_body
@@ -1837,22 +1867,35 @@ while :; do
         log "could not parse rate-limit window from comment; falling back to 60s"
         WINDOW_SECONDS=60
       fi
-      SLEEP_FOR=$((WINDOW_SECONDS + RATE_LIMIT_BUFFER_SECONDS))
-      # Clamp against remaining budget — if the published rate-limit
-      # window exceeds max_wait_seconds anyway, there's no point
-      # burning through the entire sleep. Surface it as the same hard
-      # rate-limit stalled state callers already treat as non-advisory
-      # instead of a generic timeout that auto-merge may skip past.
-      # See #140 round-2 Codex finding (P2, line 392), then #386.
+      # #727: sleep only the window that REMAINS. The published window runs
+      # from the notice's post time (COMMENT_FRESH_AT), so subtract however
+      # much of it already elapsed before we reached this point. An
+      # already-expired window ⇒ SLEEP_FOR clamps to 0 and we fall straight
+      # through to the retry + re-poll instead of re-waiting time that has
+      # already passed (auto-merge PR #725 re-waited a fresh 210s for a window
+      # that expired ~5 min earlier). A genuinely-fresh notice (elapsed≈0)
+      # still sleeps ~the full window, so the rate-limit contract is unchanged
+      # for the common case.
       NOW_EPOCH=$(date +%s)
+      WINDOW_ELAPSED=$(rate_limit_window_elapsed_seconds "$COMMENT_FRESH_AT" "$NOW_EPOCH")
+      SLEEP_FOR=$((WINDOW_SECONDS + RATE_LIMIT_BUFFER_SECONDS - WINDOW_ELAPSED))
+      if [ "$SLEEP_FOR" -lt 0 ]; then SLEEP_FOR=0; fi
+      # Clamp against remaining budget — if the (remaining) rate-limit
+      # window still exceeds max_wait_seconds, there's no point burning
+      # through the entire sleep. Surface it as the same hard rate-limit
+      # stalled state callers already treat as non-advisory instead of a
+      # generic timeout that auto-merge may skip past. See #140 round-2 Codex
+      # finding (P2, line 392), then #386. Uses the remaining SLEEP_FOR (not
+      # the full window), so a window that mostly elapsed no longer stalls a
+      # PR that can afford the small remainder (#727).
       ELAPSED=$((NOW_EPOCH - START_EPOCH))
       REMAINING=$((MAX_WAIT_SECONDS - ELAPSED))
       if [ "$SLEEP_FOR" -ge "$REMAINING" ]; then
-        log "rate-limit window (${SLEEP_FOR}s) exceeds remaining budget (${REMAINING}s) — stalling"
+        log "rate-limit window (${SLEEP_FOR}s remaining) exceeds remaining budget (${REMAINING}s) — stalling"
         RATE_LIMIT_REVIEW=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
         emit_json_and_exit "rate_limit_stalled" 5 "$RATE_LIMIT_REVIEW" 0
       fi
-      log "rate-limited; sleeping ${SLEEP_FOR}s (window=${WINDOW_SECONDS}s + ${RATE_LIMIT_BUFFER_SECONDS}s buffer)"
+      log "rate-limited; sleeping ${SLEEP_FOR}s (window=${WINDOW_SECONDS}s + ${RATE_LIMIT_BUFFER_SECONDS}s buffer, ${WINDOW_ELAPSED}s already elapsed)"
       sleep "$SLEEP_FOR"
       post_retry_trigger
       RATE_LIMIT_RETRIES=$((RATE_LIMIT_RETRIES + 1))
