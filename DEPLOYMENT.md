@@ -64,6 +64,7 @@ The full bootstrap loop runs across each consumer repo. Current consumers:
 - swipewatch
 - nathanpaynedotcom
 - overridebroadway
+- gaycruisebingo
 <!-- bootstrap-loop-list-end -->
 
 Run the bootstrap script across all of them:

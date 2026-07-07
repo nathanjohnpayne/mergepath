@@ -1057,6 +1057,7 @@ The SSH-remote-switch covers every repo on the operator's machine (template
 - overridebroadway
 - friends-and-family-billing
 - docs
+- gaycruisebingo
 <!-- bootstrap-loop-list-end -->
 
 ```bash
