@@ -140,7 +140,7 @@ final_clock() { cat "$1/state/fake-time"; }
 test_post_clearance_caps() {
   local dir rc before=$FAIL waited
   dir=$(make_case "capped" 1245 30)
-  rc=$(run_case "$dir" 1)
+  rc=$(run_case "$dir" 1 head-sha)
   [ "$rc" = "4" ] || fail "1: expected exit 4 (advisory timeout), got $rc; err=$(tail -4 "$dir/err.log")"
   grep -q 'capping max_wait 1245s -> 30s' "$dir/err.log" \
     || fail "1: expected the cap log 'capping max_wait 1245s -> 30s'; log=$(grep -i 'max_wait' "$dir/err.log" | head -3)"
@@ -170,7 +170,7 @@ test_no_flag_full_budget() {
 test_cap_noop_when_larger() {
   local dir rc before=$FAIL
   dir=$(make_case "noop" 30 240)
-  rc=$(run_case "$dir" 1)
+  rc=$(run_case "$dir" 1 head-sha)
   [ "$rc" = "4" ] || fail "3: expected exit 4, got $rc; err=$(tail -4 "$dir/err.log")"
   ! grep -q 'capping max_wait' "$dir/err.log" \
     || fail "3: cap log appeared even though post_clearance (240s) >= max_wait (30s)"
@@ -201,7 +201,7 @@ test_bad_value_unset_flag_does_not_break() {
 test_bad_value_set_flag_disarms() {
   local dir rc before=$FAIL
   dir=$(make_case "badset" 30 banana)
-  rc=$(run_case "$dir" 1)
+  rc=$(run_case "$dir" 1 head-sha)
   [ "$rc" = "4" ] || fail "5: a bad post_clearance value with the flag set aborted (got rc=$rc, expected 4/full-budget); err=$(tail -4 "$dir/err.log")"
   grep -q 'WARNING: coderabbit.post_clearance_max_wait_seconds must be an integer' "$dir/err.log" \
     || fail "5: expected the disarm WARNING; log=$(grep -i post_clearance "$dir/err.log" | head -2)"
@@ -233,13 +233,32 @@ test_head_pin_mismatch_disarms() {
   dir=$(make_case "pinmiss" 1245 30)
   rc=$(run_case "$dir" 1 stale-other-sha)
   [ "$rc" = "4" ] || fail "7: expected exit 4, got $rc; err=$(tail -4 "$dir/err.log")"
-  grep -q 'head drifted' "$dir/err.log" \
-    || fail "7: expected the head-drift disarm warning; log=$(grep -i 'post-clearance\|head' "$dir/err.log" | head -3)"
+  grep -q 'does not match the live head' "$dir/err.log" \
+    || fail "7: expected the head-pin disarm warning; log=$(grep -i 'post-clearance\|head' "$dir/err.log" | head -3)"
   ! grep -q 'capping max_wait' "$dir/err.log" \
     || fail "7: capped despite a head-pin mismatch (the #729 thread-985 race)"
   grep -q 'max_wait = 1245s' "$dir/err.log" \
     || fail "7: expected the full 'max_wait = 1245s' budget after a head-pin disarm; log=$(grep -i 'max_wait =' "$dir/err.log")"
   [ "$FAIL" -ne "$before" ] || pass "7: #729 — a post-clearance head-pin mismatch disarms the cap (stale-head clearance not honored)"
+}
+
+# --- Test 8: EMPTY head-pin fails closed (r-comment on #729) ------------------
+# If the caller could not resolve the head (transient API failure) it passes an
+# empty CODERABBIT_WAIT_POST_CLEARANCE_SHA. Treating "absent" as "no pin needed"
+# would let the cap apply to an unverified head — so an empty pin must FAIL
+# CLOSED (full budget), exactly like a mismatch.
+test_empty_head_pin_fails_closed() {
+  local dir rc before=$FAIL
+  dir=$(make_case "pinempty" 1245 30)
+  rc=$(run_case "$dir" 1 "")
+  [ "$rc" = "4" ] || fail "8: expected exit 4, got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q 'does not match the live head' "$dir/err.log" \
+    || fail "8: expected the fail-closed warning for an empty pin; log=$(grep -i 'post-clearance\|head' "$dir/err.log" | head -3)"
+  ! grep -q 'capping max_wait' "$dir/err.log" \
+    || fail "8: capped with an EMPTY head-pin (must fail closed, r-comment on #729)"
+  grep -q 'max_wait = 1245s' "$dir/err.log" \
+    || fail "8: expected the full 'max_wait = 1245s' budget after an empty-pin disarm"
+  [ "$FAIL" -ne "$before" ] || pass "8: #729 — an EMPTY post-clearance head-pin fails closed to the full budget (transient probe read failure)"
 }
 
 test_post_clearance_caps
@@ -249,6 +268,7 @@ test_bad_value_unset_flag_does_not_break
 test_bad_value_set_flag_disarms
 test_head_pin_match_caps
 test_head_pin_mismatch_disarms
+test_empty_head_pin_fails_closed
 
 echo "----"
 echo "test_coderabbit_wait_post_clearance: $PASS passed, $FAIL failed"

@@ -980,10 +980,19 @@ jobs:
               ;;
           esac
 
-          if [ "$CODEX_CLEARED" = "true" ]; then
+          # Fail closed if the head could not be resolved (Codex P2 r-comment on
+          # #729): without a non-empty PROBE_HEAD there is nothing to pin the
+          # clearance to, so a push landing before coderabbit-wait.sh resolves
+          # its own head could get the shortened budget on an un-reviewed head.
+          # coderabbit-wait.sh also fails closed on an empty pin, but disarm here
+          # too so the intent is explicit and logged.
+          if [ "$CODEX_CLEARED" = "true" ] && [ -n "$PROBE_HEAD" ]; then
             POST_CLEARANCE_FLAG=1
           else
             POST_CLEARANCE_FLAG=0
+            if [ "$CODEX_CLEARED" = "true" ] && [ -z "$PROBE_HEAD" ]; then
+              echo "::warning::Post-clearance clearance derived but the head SHA could not be resolved for the pin — failing closed to the full CodeRabbit budget (#727)."
+            fi
           fi
 
           set +e

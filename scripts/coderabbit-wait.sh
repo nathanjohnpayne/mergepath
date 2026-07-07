@@ -748,13 +748,18 @@ case "${CODERABBIT_WAIT_POST_CLEARANCE:-}" in
     POST_CLEARANCE_MAX_WAIT_SECONDS=$(coderabbit_field post_clearance_max_wait_seconds)
     POST_CLEARANCE_MAX_WAIT_SECONDS=${POST_CLEARANCE_MAX_WAIT_SECONDS:-240}
     # Head-pin (#727, Codex P2 on #729): the caller proved clearance for a
-    # specific head. If a push landed between the caller's probe and now, the
-    # live head we're about to wait on is NOT the one that was cleared, so the
-    # shortened budget would let an UN-reviewed head merge early. Disarm (full
-    # budget) unless the passed SHA matches the head we resolved. Absent SHA ⇒
-    # the caller didn't pin (older callers / direct use); fall back to flag-only.
-    if [ -n "${CODERABBIT_WAIT_POST_CLEARANCE_SHA:-}" ] && [ "${CODERABBIT_WAIT_POST_CLEARANCE_SHA}" != "$HEAD_SHA" ]; then
-      echo "[coderabbit-wait] WARNING: post-clearance was proven for ${CODERABBIT_WAIT_POST_CLEARANCE_SHA} but the live head is $HEAD_SHA — head drifted; ignoring the fast path and using the full max_wait budget (#727)" >&2
+    # specific head, passed as CODERABBIT_WAIT_POST_CLEARANCE_SHA. The cap
+    # applies ONLY when that SHA is non-empty AND equals the head we resolved.
+    # FAIL CLOSED on empty or mismatched (Codex P2 r-comment on #729): an empty
+    # SHA means the caller could not resolve/verify the cleared head (e.g. a
+    # transient API read failure during the probe) — treating "absent" as
+    # "no pin needed" would let the shortened budget apply to a head that was
+    # never cleared, reopening the very TOCTOU race the pin closes. A mismatch
+    # means a push landed after the caller's clearance check. Either way, use
+    # the full max_wait budget. HEAD_SHA is always non-empty here, so a simple
+    # `!=` covers both the empty-SHA and drifted-SHA cases.
+    if [ "${CODERABBIT_WAIT_POST_CLEARANCE_SHA:-}" != "$HEAD_SHA" ]; then
+      echo "[coderabbit-wait] WARNING: post-clearance head-pin '${CODERABBIT_WAIT_POST_CLEARANCE_SHA:-<empty>}' does not match the live head $HEAD_SHA (empty ⇒ the caller could not resolve/verify the cleared head) — failing closed: ignoring the fast path and using the full max_wait budget (#727)" >&2
     # Validate ONLY when the fast path is actually engaged (#727, CodeRabbit
     # Major on #729): a fail-safe opt-in latency knob must never break an
     # unrelated wait, so a bad value here DISARMS the cap (full budget) with a
