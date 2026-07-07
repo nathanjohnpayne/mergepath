@@ -867,6 +867,7 @@ coderabbit:
   enabled: false
   bot_login: "coderabbitai[bot]"
   max_wait_seconds: 1245                   # grace window for scripts/coderabbit-wait.sh (measured full-fleet max + one poll interval, #623)
+  post_clearance_max_wait_seconds: 240     # shortened ceiling for the #727 auto-merge post-clearance fast path (HEAD already has verified Codex/Phase-4b clearance + reviewer APPROVED); only ever shortens the wait
   status_probe_enabled: true               # ask CodeRabbit for narrative status before exit-4 timeout
   status_probe_wait_seconds: 60            # bounded extra wait for the status-probe reply
   max_rate_limit_retries: 2                # retries after CodeRabbit posts "Rate limit exceeded"

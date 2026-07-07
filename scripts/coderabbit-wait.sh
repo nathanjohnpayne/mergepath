@@ -390,6 +390,32 @@ if ! [[ "$MAX_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
   exit 3
 fi
 
+# #727: post-clearance fast path. When the caller (auto-merge-on-approval) has
+# already confirmed a verified Codex / Phase-4b clearance AND a reviewer-identity
+# APPROVED on HEAD, it sets CODERABBIT_WAIT_POST_CLEARANCE=1. The real blocking
+# bot-review signal is already in, so cap the CodeRabbit poll budget to
+# post_clearance_max_wait_seconds (default 240) instead of the full
+# max_wait_seconds — CodeRabbit still gets that window to land a clear (exit 0)
+# or a Potential issue / ⚠️ finding (exit 2), both handled exactly as before;
+# a still-pending CodeRabbit after the cap falls through to the same advisory
+# exit-4 timeout. Only ever SHORTENS the ceiling (min of the two), never
+# lengthens it, and only when the caller asserts the clearance — an unset or
+# non-truthy flag leaves the full budget untouched.
+POST_CLEARANCE_MAX_WAIT_SECONDS=$(coderabbit_field post_clearance_max_wait_seconds)
+POST_CLEARANCE_MAX_WAIT_SECONDS=${POST_CLEARANCE_MAX_WAIT_SECONDS:-240}
+if ! [[ "$POST_CLEARANCE_MAX_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: coderabbit.post_clearance_max_wait_seconds must be an integer; got '$POST_CLEARANCE_MAX_WAIT_SECONDS'" >&2
+  exit 3
+fi
+case "${CODERABBIT_WAIT_POST_CLEARANCE:-}" in
+  1|true|TRUE|True|yes|YES)
+    if [ "$POST_CLEARANCE_MAX_WAIT_SECONDS" -lt "$MAX_WAIT_SECONDS" ]; then
+      echo "[coderabbit-wait] post-clearance fast path: HEAD already has verified Codex/Phase-4b clearance + reviewer APPROVED; capping max_wait ${MAX_WAIT_SECONDS}s -> ${POST_CLEARANCE_MAX_WAIT_SECONDS}s (#727)" >&2
+      MAX_WAIT_SECONDS=$POST_CLEARANCE_MAX_WAIT_SECONDS
+    fi
+    ;;
+esac
+
 MAX_RATE_LIMIT_RETRIES=$(coderabbit_field max_rate_limit_retries)
 MAX_RATE_LIMIT_RETRIES=${MAX_RATE_LIMIT_RETRIES:-2}
 if ! [[ "$MAX_RATE_LIMIT_RETRIES" =~ ^[0-9]+$ ]]; then
