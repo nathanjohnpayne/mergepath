@@ -129,22 +129,40 @@ done
 # Dependabot PR (its reviewer gate blocks on a reviewer-identity APPROVED,
 # not on Codex — and Codex does not review Dependabot PRs, so it is never a
 # bot-review gate; automated-4b P1). Every error keeps the die()/exit-2
-# paths so callers MUST fail closed on nonzero. Consumer: agent-review.yml's
-# rc=5 CodeRabbit rate-limit branch (#489/#620) — it needs Codex-review
-# requiredness, not clearance, and deriving it from label events was
-# rejected repeatedly in review (label removal is not head-pinned proof).
+# paths so callers MUST fail closed on nonzero. Retained as a narrow
+# diagnostic/back-compat query for callers that need only intrinsic external
+# applicability, not clearance. The production CodeRabbit rc=5 branch now uses
+# --derive-rate-limit-protection below because Phase-4b-cleared protected PRs
+# can be safe to auto-merge even after the removable label is gone (#713).
+#
+# --derive-rate-limit-protection (#713): QUERY mode for
+# agent-review.yml's CodeRabbit rc=5 branch. It prints `true` when a
+# rate-limited PR is protected from bot-unreviewed auto-merge by either:
+#   1. the active merge-clearance external gate, or
+#   2. intrinsic external-review applicability plus an already-satisfied
+#      current-head Codex/Phase-4b clearance predicate.
+# This keeps under-threshold stalls blocked while allowing the common
+# Phase-4b timing case where the APPROVED review already removed
+# `needs-external-review` before the auto-merge job re-checks CodeRabbit.
 DERIVE_ONLY=false
+RATE_LIMIT_PROTECTION_ONLY=false
 _positional=()
 for _arg in "$@"; do
   case "$_arg" in
     --derive-external-requiredness) DERIVE_ONLY=true ;;
+    --derive-rate-limit-protection) RATE_LIMIT_PROTECTION_ONLY=true ;;
     *) _positional+=("$_arg") ;;
   esac
 done
 set -- ${_positional[@]+"${_positional[@]}"}
 
+if [ "$DERIVE_ONLY" = "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
+  echo "ERROR: choose only one query mode" >&2
+  exit 2
+fi
+
 if [ $# -gt 2 ]; then
-  echo "Usage: $0 [--derive-external-requiredness] [PR_NUMBER] [REPO]" >&2
+  echo "Usage: $0 [--derive-external-requiredness|--derive-rate-limit-protection] [PR_NUMBER] [REPO]" >&2
   echo "       PR_NUMBER and REPO may also be set via env." >&2
   exit 2
 fi
@@ -310,12 +328,12 @@ lane_verified() {
   # matching comment); 2 = INDETERMINATE (comments API fetch or JSON parse
   # failed). The full-gate callsite treats 1 and 2 alike — no exemption,
   # fail-safe, since external review can only be ADDED. The
-  # --derive-external-requiredness query MUST tell 2 apart (automated-4b
-  # round-5 P1): there `true` is the UNSAFE value (it authorizes the rc=5
-  # CodeRabbit downgrade), and a verified propagation PR's real Merge
-  # clearance gate is green via the exemption — so an unknowable marker
-  # state must fail closed to the caller, not fall through to threshold
-  # derivation (which would return true for a large propagation PR).
+  # The query modes MUST tell 2 apart (automated-4b round-5 P1): there
+  # `true` is the UNSAFE value (it authorizes the rc=5 CodeRabbit
+  # downgrade), and a verified propagation PR's real Merge clearance gate
+  # is green via the exemption — so an unknowable marker state must fail
+  # closed to the caller, not fall through to threshold derivation (which
+  # would return true for a large propagation PR).
   local comments rc=0
   comments=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null) || return 2
   # `|| rc=$?` keeps the capture correct under `set -e` regardless of call
@@ -355,20 +373,19 @@ log "HEAD = $HEAD_SHA    author = $PR_AUTHOR    needs-external-review = $HAS_EXT
 # carries needs-external-review is still judged by the Dependabot rule.
 
 if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
-  if [ "$DERIVE_ONLY" = "true" ]; then
+  if [ "$DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
     # Query mode always returns FALSE for a Dependabot PR (automated-4b P1).
-    # The sole consumer — agent-review.yml's rc=5 CodeRabbit rate-limit
-    # branch — asks a NARROW question: will a downstream gate hold this
-    # merge until CODEX / external *bot* review? The Dependabot reviewer
-    # gate is NOT such a gate: when enabled it blocks until a
-    # reviewer-identity APPROVED (a human/CLI approval, which
+    # The query consumers ask a NARROW question: will this PR be protected
+    # from bot-unreviewed auto-merge after CodeRabbit rate-limits? The
+    # Dependabot reviewer gate is NOT such a gate: when enabled it blocks
+    # until a reviewer-identity APPROVED (a human/CLI approval, which
     # dependabot-auto-merge supplies automatically), and Codex does not
     # review Dependabot PRs at all. So neither gate state guarantees a bot
     # reviewed the head. Returning true here would let the rc=5 branch
     # downgrade a CodeRabbit rate-limit stall on an approved Dependabot PR
     # and merge it with NEITHER bot having reviewed (the #512 r3 hazard).
     # The FULL gate below still enforces the reviewer-APPROVED requirement
-    # for the actual merge; only this Codex-requiredness query is false.
+    # for the actual merge.
     printf 'false\n'
     exit 0
   fi
@@ -443,7 +460,7 @@ if [ "$DERIVE_ONLY" = "true" ] && [ "$EXTERNAL_GATE_ENABLED" != "true" ]; then
   exit 0
 fi
 
-if [ "$EXTERNAL_GATE_ENABLED" = "true" ]; then
+if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
   REQUIRES_EXTERNAL=false
   REQUIRES_REASON=""
 
@@ -465,14 +482,14 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ]; then
     # Indeterminate marker read (rc 2): in the FULL gate, falling through to
     # threshold/paths derivation is fail-safe (external review can only be
     # ADDED, never removed, so an uncertain read at worst over-requires and
-    # blocks). But in --derive-external-requiredness, `true` is the value
-    # that authorizes the rc=5 CodeRabbit downgrade, and a verified
-    # propagation PR's real Merge clearance gate is already green via the
-    # exemption — so an unknowable exemption state here must NOT assert
-    # requiredness. Fail closed to the caller instead (the rc=5 branch reads
-    # a nonzero query as false → block). automated-4b round-5 P1.
-    if [ "${lane_rc:-0}" -eq 2 ] && [ "$DERIVE_ONLY" = "true" ]; then
-      die 2 "propagation-lane marker read was indeterminate (comments API fetch/parse failed) in --derive-external-requiredness for $HEAD_SHA; refusing to assert external-review requiredness (fail-closed)"
+    # blocks). But in the query modes, `true` is the value that authorizes
+    # the rc=5 CodeRabbit downgrade, and a verified propagation PR's real
+    # Merge clearance gate is already green via the exemption — so an
+    # unknowable exemption state here must NOT assert requiredness or
+    # protection. Fail closed to the caller instead (the rc=5 branch reads a
+    # nonzero query as false → block). automated-4b round-5 P1.
+    if [ "${lane_rc:-0}" -eq 2 ] && { [ "$DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; }; then
+      die 2 "propagation-lane marker read was indeterminate (comments API fetch/parse failed) in query mode for $HEAD_SHA; refusing to assert external-review requiredness/protection (fail-closed)"
     fi
     # `|| true` so a missing key (grep no-match → pipeline non-zero under
     # pipefail) does NOT abort the script before the `:-300` fallback runs
@@ -554,6 +571,46 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ]; then
     log "query mode: external requiredness on HEAD $HEAD_SHA = $REQUIRES_EXTERNAL${REQUIRES_REASON:+ ($REQUIRES_REASON)}"
     printf '%s\n' "$REQUIRES_EXTERNAL"
     exit 0
+  fi
+
+  if [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
+    if [ "$REQUIRES_EXTERNAL" != "true" ]; then
+      log "rate-limit protection query: external review does not apply on HEAD $HEAD_SHA"
+      printf 'false\n'
+      exit 0
+    fi
+    if [ "$EXTERNAL_GATE_ENABLED" = "true" ]; then
+      log "rate-limit protection query: active merge-clearance external gate applies on HEAD $HEAD_SHA ($REQUIRES_REASON)"
+      printf 'true\n'
+      exit 0
+    fi
+
+    log "rate-limit protection query: external review applies on HEAD $HEAD_SHA ($REQUIRES_REASON), but merge-clearance external gate is disabled; checking current-head Codex/Phase-4b clearance"
+    CODEX_CHECK_BIN="${MERGE_CLEARANCE_CODEX_CHECK_BIN:-$SCRIPT_DIR/codex-review-check.sh}"
+    if [ ! -f "$CODEX_CHECK_BIN" ]; then
+      die 2 "codex-review-check.sh not found at $CODEX_CHECK_BIN (required for rate-limit protection query)"
+    fi
+    set +e
+    CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+      bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO" >&2
+    crc=$?
+    set -e
+    # codex-review-check.sh's public contract is 0 clear, 1 gate-fail,
+    # 3 infrastructure/config. It has no "pending" success-adjacent code, so
+    # every other rc is treated as infrastructure and fails closed.
+    case "$crc" in
+      0)
+        log "rate-limit protection query: current-head Codex/Phase-4b clearance is already satisfied"
+        printf 'true\n'
+        exit 0
+        ;;
+      1)
+        log "rate-limit protection query: external review applies but current-head Codex/Phase-4b clearance is not satisfied"
+        printf 'false\n'
+        exit 0
+        ;;
+      *) die 2 "codex-review-check.sh returned rc=$crc (config/infrastructure error) in rate-limit protection query on PR #$PR_NUMBER" ;;
+    esac
   fi
 
   if [ "$REQUIRES_EXTERNAL" = "true" ]; then

@@ -10,10 +10,10 @@
 #
 #   1. The Codex failover engaged — coderabbit-wait.sh's JSON reports
 #      `codex_failover_requested: true` (it requested `@codex review`).
-#   2. An external-review gate will ACTUALLY gate the merge on Codex —
-#      i.e. the PR is ABOVE the external-review threshold, where
-#      merge-clearance-gate.sh's external_review_gate blocks until Codex /
-#      external clearance lands. (Passed in as the second arg.)
+#   2. External-review protection exists for this head — either an active
+#      merge-clearance external gate will hold the merge until Codex /
+#      external clearance lands, or current-head Codex/Phase-4b clearance
+#      is already satisfied. (Passed in as the second arg.)
 #
 # Why condition 2 (Codex P2 on #512 round 3): for UNDER-threshold PRs the
 # merge-clearance gate passes *vacuously* (no Codex requirement), and the
@@ -21,24 +21,25 @@
 # review). So downgrading exit 5 on an under-threshold PR would let a
 # rate-limited PR auto-merge with NEITHER CodeRabbit nor Codex having reviewed
 # it. Under-threshold rate-limit stalls therefore keep BLOCKING, exactly as
-# before this feature. Above-threshold PRs are safe to proceed because the
-# external-review gate still blocks the merge until Codex/external clears.
+# before this feature. Above-threshold/protected-path PRs are safe to
+# proceed only when the external-review gate is active or the stronger
+# external review has already cleared on this head (#713).
 #
 # Usage:
-#   coderabbit-automerge-rate-limit-gate.sh '<coderabbit-wait-json>' <external-review-required>
+#   coderabbit-automerge-rate-limit-gate.sh '<coderabbit-wait-json>' <external-review-protected>
 #
-#     external-review-required: "true" if the PR is above the external-review
-#       threshold (the workflow derives this from the `needs-external-review`
-#       label). Anything other than "true" is treated as under-threshold.
+#     external-review-protected: "true" if the auto-merge workflow proved
+#       either active downstream gate protection or already-satisfied
+#       current-head external clearance. Anything else blocks.
 #
 # Exit 0 = PROCEED; exit 1 = BLOCK. Fail-closed: a missing flag, missing
-# threshold arg, or unparseable JSON BLOCKS, so a malformed input never
+# protection arg, or unparseable JSON BLOCKS, so a malformed input never
 # silently lets a rate-limited PR through.
 
 set -euo pipefail
 
 WAIT_JSON="${1:-}"
-EXTERNAL_REVIEW_REQUIRED="${2:-false}"
+EXTERNAL_REVIEW_PROTECTED="${2:-false}"
 
 if [ -z "$WAIT_JSON" ]; then
   echo "rate-limit-gate: no coderabbit-wait JSON provided — blocking (fail-closed)" >&2
@@ -62,10 +63,10 @@ if ! printf '%s' "$WAIT_JSON" | jq -e '.codex_failover_requested == true' >/dev/
   exit 1
 fi
 
-if [ "$EXTERNAL_REVIEW_REQUIRED" != "true" ]; then
-  echo "rate-limit-gate: rate-limit stall + failover engaged but PR is under-threshold (external_review_required=${EXTERNAL_REVIEW_REQUIRED}) — no downstream Codex gate; block (#512 r3)" >&2
+if [ "$EXTERNAL_REVIEW_PROTECTED" != "true" ]; then
+  echo "rate-limit-gate: rate-limit stall + failover engaged but no active or already-satisfied external-review protection (external_review_protected=${EXTERNAL_REVIEW_PROTECTED}) — block (#512 r3, #713)" >&2
   exit 1
 fi
 
-echo "rate-limit-gate: rate-limit stall + failover engaged + external review required — merge-clearance gates Codex; proceed" >&2
+echo "rate-limit-gate: rate-limit stall + failover engaged + external-review protection present — proceed" >&2
 exit 0
