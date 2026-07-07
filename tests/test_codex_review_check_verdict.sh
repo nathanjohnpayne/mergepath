@@ -91,6 +91,19 @@ else
   fail "codex-review-check.sh is missing the latest-verdict-first restructure (max_by / CODEX_HEAD_VERDICT_ANY_TIME / #608)"
 fi
 
+# ── 3c. Structural (#727, Codex P2 on #729): the CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE
+#      env var overrides the policy value, taking precedence over
+#      `codex_field allow_phase_4b_substitute`. The post-clearance fast-path
+#      probe sets it to false so gate (c) requires an ACTUAL Codex bot signal and
+#      is NOT satisfied by the same reviewer APPROVED that clears gate (b) — the
+#      env override must win, else a bare under-threshold approval would arm the
+#      shortened CodeRabbit wait and reopen the pre-review merge race.
+if grep -Eq 'ALLOW_PHASE_4B_SUBSTITUTE=\$\{CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-\$\(codex_field allow_phase_4b_substitute\)\}' "$SCRIPT"; then
+  pass "gate (c) honors the CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE env override, precedence over policy (#727 fast-path probe requires an actual Codex signal)"
+else
+  fail "codex-review-check.sh does not let CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE override the policy value (#727)"
+fi
+
 # ── 4. Inline logic: the verdict-matching jq filter. KEEP IN SYNC with
 #      scripts/codex-review-check.sh CODEX_VERDICT_JSON. The filter selects the
 #      LATEST HEAD-anchored verdict FIRST (any disposition), then requires that

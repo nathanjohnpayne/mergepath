@@ -937,35 +937,43 @@ jobs:
           #       Codex failover engaged (codex_failover_requested:true in the
           #       JSON) — Codex was requested, so the PR advances via the Codex
           #       gates; otherwise block and let the human intervene.
-          # #727 post-clearance fast path. If the current HEAD already carries a
-          # verified Codex / Phase-4b clearance AND a reviewer-identity APPROVED
-          # (scripts/codex-review-check.sh gate (b)+(c) — the SAME predicate the
-          # merge-clearance gate trusts), the real blocking bot-review signal is
-          # already in and CodeRabbit is advisory on top of it. Signal
-          # coderabbit-wait.sh to cap its poll budget to
+          # #727 post-clearance fast path. If the current HEAD already carries an
+          # ACTUAL Codex/Phase-4b clearance AND a reviewer-identity APPROVED, the
+          # real blocking bot-review signal is already in and CodeRabbit is
+          # advisory on top of it — so cap coderabbit-wait.sh's poll budget to
           # coderabbit.post_clearance_max_wait_seconds instead of the full
-          # max_wait_seconds. Read-only probe; fail SAFE — any non-zero rc (gate
-          # unmet, or an infra/config error) leaves the fast path DISARMED so the
-          # full budget is used and CodeRabbit still gets its normal window.
-          # CODEX_REVIEW_CHECK_SKIP_CI=1 keeps the probe independent of CI state;
-          # CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 HEAD-pins gate (b) so a
-          # stale earlier-head approval cannot arm the fast path. Under-threshold
-          # PRs reach this script only as a read-only probe here — it evaluates
-          # gate (b)+(c) on HEAD regardless of threshold, so a Codex verdict on an
-          # under-threshold PR is honored (that is the #725/#727 common case).
+          # max_wait_seconds. Read-only probe; fail SAFE — any non-zero rc leaves
+          # the fast path DISARMED so the full budget is used.
+          #
+          # CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false is load-bearing
+          # (#727, Codex P2 on #729): WITHOUT it, gate (c) accepts the same
+          # reviewer APPROVED that clears gate (b) as a Phase-4b substitute, so an
+          # ordinary under-threshold approval with NO Codex review would arm the
+          # cap and reopen the pre-review merge race. With it, gate (c) requires
+          # an actual Codex bot signal (👍 / affirmative verdict / clean review).
+          # SKIP_CI keeps the probe independent of CI; REQUIRE_APPROVAL_ON_HEAD
+          # HEAD-pins gate (b).
+          #
+          # PROBE_HEAD pins the clearance to the head we evaluated (#727, Codex P2
+          # on #729): a push landing between here and coderabbit-wait.sh's own
+          # head fetch would otherwise let the shortened budget apply to a head
+          # that was never cleared. coderabbit-wait.sh disarms if its live head
+          # differs from this SHA.
+          PROBE_HEAD=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha 2>/dev/null || echo "")
           CODEX_CLEARED=false
           set +e
           CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+            CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
             bash scripts/codex-review-check.sh "$PR_NUMBER" "$REPO" >&2
           crc=$?
           set -e
           case "$crc" in
             0)
               CODEX_CLEARED=true
-              echo "::notice::Post-clearance fast path armed (#727): HEAD has verified Codex/Phase-4b clearance + reviewer APPROVED — CodeRabbit wait capped to coderabbit.post_clearance_max_wait_seconds."
+              echo "::notice::Post-clearance fast path armed (#727): HEAD $PROBE_HEAD has an actual Codex/Phase-4b clearance + reviewer APPROVED — CodeRabbit wait capped to coderabbit.post_clearance_max_wait_seconds."
               ;;
             1)
-              echo "::notice::Post-clearance fast path not armed: Codex/Phase-4b clearance or reviewer APPROVED not satisfied on HEAD — using the full CodeRabbit budget."
+              echo "::notice::Post-clearance fast path not armed: no actual Codex/Phase-4b clearance (or no reviewer APPROVED) on HEAD — using the full CodeRabbit budget."
               ;;
             *)
               echo "::warning::codex-review-check.sh returned rc=$crc while deriving post-clearance state; failing safe to the full CodeRabbit budget."
@@ -982,7 +990,7 @@ jobs:
           # Capture the helper's JSON (stdout) so the rc=5 branch can read the
           # #489 codex_failover_requested flag. Its human-readable diagnostics —
           # and the failover child's own JSON — go to stderr and stream to the log.
-          WAIT_JSON=$(CODERABBIT_WAIT_POST_CLEARANCE="$POST_CLEARANCE_FLAG" bash scripts/coderabbit-wait.sh "$PR_NUMBER" "$REPO")
+          WAIT_JSON=$(CODERABBIT_WAIT_POST_CLEARANCE="$POST_CLEARANCE_FLAG" CODERABBIT_WAIT_POST_CLEARANCE_SHA="$PROBE_HEAD" bash scripts/coderabbit-wait.sh "$PR_NUMBER" "$REPO")
           rc=$?
           set -e
           printf '%s\n' "$WAIT_JSON"
@@ -1998,13 +2006,15 @@ jobs:
             # post-clearance downgrade at the last step. Re-evaluate the SAME
             # post-clearance predicate on the (now head-pinned) live head:
             # codex-review-check.sh gate (b)+(c), SKIP_CI + REQUIRE_APPROVAL_ON_HEAD,
-            # exactly as the rc=5 arm derived CODEX_CLEARED. Re-run (not a
-            # persisted flag) so state that changed during the waits is caught,
-            # matching this block's fail-closed intent. Either predicate holding
-            # on the live head upholds the downgrade.
+            # and ALLOW_PHASE_4B_SUBSTITUTE=false (require an actual Codex bot
+            # signal, not the arming approval — same as the fast-path probe,
+            # Codex P2 on #729). Re-run (not a persisted flag) so state that
+            # changed during the waits is caught, matching this block's
+            # fail-closed intent. Either predicate holding upholds the downgrade.
             if [ "$re_protected" != "true" ]; then
               set +e
               CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+                CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
                 bash scripts/codex-review-check.sh "$PR_NUMBER" "$REPO" >&2
               crc=$?
               set -e

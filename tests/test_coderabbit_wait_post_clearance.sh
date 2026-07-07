@@ -114,10 +114,11 @@ EOF
   printf '%s\n' "$dir"
 }
 
-# run_case <dir> <post_clearance_env>
+# run_case <dir> <post_clearance_env> [post_clearance_sha]
 #   post_clearance_env: value for CODERABBIT_WAIT_POST_CLEARANCE ("" = unset).
+#   post_clearance_sha: value for CODERABBIT_WAIT_POST_CLEARANCE_SHA ("" = unset).
 run_case() {
-  local dir=$1 pc=${2:-} rc=0
+  local dir=$1 pc=${2:-} sha=${3:-} rc=0
   (
     cd "$dir"
     export PATH="$dir/bin:$PATH"
@@ -125,6 +126,7 @@ run_case() {
     export CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1
     export CODERABBIT_TEST_STATE_DIR="$dir/state"
     [ -n "$pc" ] && export CODERABBIT_WAIT_POST_CLEARANCE="$pc"
+    [ -n "$sha" ] && export CODERABBIT_WAIT_POST_CLEARANCE_SHA="$sha"
     ./scripts/coderabbit-wait.sh 999 owner/repo \
       >"$dir/out.json" 2>"$dir/err.log"
   ) || rc=$?
@@ -208,11 +210,45 @@ test_bad_value_set_flag_disarms() {
   [ "$FAIL" -ne "$before" ] || pass "5: a bad post_clearance value with the flag set disarms to the full budget (warning), never aborts"
 }
 
+# --- Test 6: head-pin match caps ---------------------------------------------
+# The caller pins the head it cleared. When it matches the live head (the gh
+# stub serves head-sha), the cap applies.
+test_head_pin_match_caps() {
+  local dir rc before=$FAIL
+  dir=$(make_case "pinmatch" 1245 30)
+  rc=$(run_case "$dir" 1 head-sha)
+  [ "$rc" = "4" ] || fail "6: expected exit 4, got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q 'capping max_wait 1245s -> 30s' "$dir/err.log" \
+    || fail "6: expected the cap log with a matching head-pin; log=$(grep -i 'max_wait' "$dir/err.log" | head -3)"
+  [ "$FAIL" -ne "$before" ] || pass "6: #729 — a matching post-clearance head-pin still caps the budget"
+}
+
+# --- Test 7: head-pin MISMATCH disarms (thread 985) --------------------------
+# If a push landed between the caller's clearance probe and here, the pinned SHA
+# no longer matches the live head — the clearance was for a stale head, so the
+# cap must disarm to the full budget (the un-reviewed live head keeps the full
+# CodeRabbit wait).
+test_head_pin_mismatch_disarms() {
+  local dir rc before=$FAIL
+  dir=$(make_case "pinmiss" 1245 30)
+  rc=$(run_case "$dir" 1 stale-other-sha)
+  [ "$rc" = "4" ] || fail "7: expected exit 4, got $rc; err=$(tail -4 "$dir/err.log")"
+  grep -q 'head drifted' "$dir/err.log" \
+    || fail "7: expected the head-drift disarm warning; log=$(grep -i 'post-clearance\|head' "$dir/err.log" | head -3)"
+  ! grep -q 'capping max_wait' "$dir/err.log" \
+    || fail "7: capped despite a head-pin mismatch (the #729 thread-985 race)"
+  grep -q 'max_wait = 1245s' "$dir/err.log" \
+    || fail "7: expected the full 'max_wait = 1245s' budget after a head-pin disarm; log=$(grep -i 'max_wait =' "$dir/err.log")"
+  [ "$FAIL" -ne "$before" ] || pass "7: #729 — a post-clearance head-pin mismatch disarms the cap (stale-head clearance not honored)"
+}
+
 test_post_clearance_caps
 test_no_flag_full_budget
 test_cap_noop_when_larger
 test_bad_value_unset_flag_does_not_break
 test_bad_value_set_flag_disarms
+test_head_pin_match_caps
+test_head_pin_mismatch_disarms
 
 echo "----"
 echo "test_coderabbit_wait_post_clearance: $PASS passed, $FAIL failed"

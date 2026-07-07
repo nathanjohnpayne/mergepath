@@ -341,7 +341,15 @@ fi
 # `needs-external-review` label by hand. Set to false for repos that
 # genuinely require Codex clearance and not a substitute Phase 4b
 # reviewer. See nathanjohnpayne/mergepath#218.
-ALLOW_PHASE_4B_SUBSTITUTE=$(codex_field allow_phase_4b_substitute)
+#
+# CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE overrides the policy value for a
+# single invocation (#727, Codex P2 on #729). The post-clearance fast-path probe
+# sets it to `false` so gate (c) requires an ACTUAL Codex bot signal (👍 /
+# affirmative verdict / clean review) and is NOT satisfied by the same
+# reviewer APPROVED that already clears gate (b) — otherwise an ordinary
+# under-threshold approval with no Codex review would arm the shortened
+# CodeRabbit wait and reopen the pre-review merge race. Unset ⇒ policy value.
+ALLOW_PHASE_4B_SUBSTITUTE=${CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-$(codex_field allow_phase_4b_substitute)}
 ALLOW_PHASE_4B_SUBSTITUTE=${ALLOW_PHASE_4B_SUBSTITUTE:-true}
 case "$ALLOW_PHASE_4B_SUBSTITUTE" in
   true|false) ;;
