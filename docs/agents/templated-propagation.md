@@ -140,7 +140,7 @@ The follow-up integration PR landed:
 consumers:
   - name: matchline
     repo: nathanjohnpayne/matchline
-    visibility: private
+    visibility: public
     facts:
       frameworks: [react, typescript]
       node_version: "20"
