@@ -732,6 +732,48 @@ fi
 
 log "HEAD = $HEAD_SHA committed at $HEAD_COMMITTER_DATE"
 log "anchor = $HEAD_ANCHOR (source: $ANCHOR_SOURCE)"
+
+# #727: post-clearance fast path. When the caller (auto-merge-on-approval) has
+# already confirmed — on THIS head — a verified ACTUAL Codex/Phase-4b clearance
+# AND a reviewer-identity APPROVED, it sets CODERABBIT_WAIT_POST_CLEARANCE=1.
+# The real blocking bot-review signal is already in, so cap the CodeRabbit poll
+# budget to post_clearance_max_wait_seconds (default 240) instead of the full
+# max_wait_seconds — CodeRabbit still gets that window to land a clear (exit 0)
+# or a Potential issue / ⚠️ finding (exit 2), both handled exactly as before; a
+# still-pending CodeRabbit after the cap falls through to the same advisory
+# exit-4 timeout. Only ever SHORTENS the ceiling (min of the two), never
+# lengthens it. Placed AFTER head resolution so it can head-pin the clearance.
+case "${CODERABBIT_WAIT_POST_CLEARANCE:-}" in
+  1|true|TRUE|True|yes|YES)
+    POST_CLEARANCE_MAX_WAIT_SECONDS=$(coderabbit_field post_clearance_max_wait_seconds)
+    POST_CLEARANCE_MAX_WAIT_SECONDS=${POST_CLEARANCE_MAX_WAIT_SECONDS:-240}
+    # Head-pin (#727, Codex P2 on #729): the caller proved clearance for a
+    # specific head, passed as CODERABBIT_WAIT_POST_CLEARANCE_SHA. The cap
+    # applies ONLY when that SHA is non-empty AND equals the head we resolved.
+    # FAIL CLOSED on empty or mismatched (Codex P2 r-comment on #729): an empty
+    # SHA means the caller could not resolve/verify the cleared head (e.g. a
+    # transient API read failure during the probe) — treating "absent" as
+    # "no pin needed" would let the shortened budget apply to a head that was
+    # never cleared, reopening the very TOCTOU race the pin closes. A mismatch
+    # means a push landed after the caller's clearance check. Either way, use
+    # the full max_wait budget. HEAD_SHA is always non-empty here, so a simple
+    # `!=` covers both the empty-SHA and drifted-SHA cases.
+    if [ "${CODERABBIT_WAIT_POST_CLEARANCE_SHA:-}" != "$HEAD_SHA" ]; then
+      echo "[coderabbit-wait] WARNING: post-clearance head-pin '${CODERABBIT_WAIT_POST_CLEARANCE_SHA:-<empty>}' does not match the live head $HEAD_SHA (empty ⇒ the caller could not resolve/verify the cleared head) — failing closed: ignoring the fast path and using the full max_wait budget (#727)" >&2
+    # Validate ONLY when the fast path is actually engaged (#727, CodeRabbit
+    # Major on #729): a fail-safe opt-in latency knob must never break an
+    # unrelated wait, so a bad value here DISARMS the cap (full budget) with a
+    # warning rather than aborting — the "only ever shortens, never breaks the
+    # wait" invariant.
+    elif ! [[ "$POST_CLEARANCE_MAX_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
+      echo "[coderabbit-wait] WARNING: coderabbit.post_clearance_max_wait_seconds must be an integer; got '$POST_CLEARANCE_MAX_WAIT_SECONDS' — ignoring the post-clearance fast path and using the full max_wait budget (#727)" >&2
+    elif [ "$POST_CLEARANCE_MAX_WAIT_SECONDS" -lt "$MAX_WAIT_SECONDS" ]; then
+      echo "[coderabbit-wait] post-clearance fast path: HEAD $HEAD_SHA has verified Codex/Phase-4b clearance + reviewer APPROVED; capping max_wait ${MAX_WAIT_SECONDS}s -> ${POST_CLEARANCE_MAX_WAIT_SECONDS}s (#727)" >&2
+      MAX_WAIT_SECONDS=$POST_CLEARANCE_MAX_WAIT_SECONDS
+    fi
+    ;;
+esac
+
 log "max_wait = ${MAX_WAIT_SECONDS}s   max_rate_limit_retries = $MAX_RATE_LIMIT_RETRIES   freshness_window = ${WALLCLOCK_FRESHNESS_WINDOW_SECONDS}s"
 log "status_probe_enabled = $STATUS_PROBE_ENABLED   status_probe_wait = ${STATUS_PROBE_WAIT_SECONDS}s"
 

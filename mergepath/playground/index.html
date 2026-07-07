@@ -864,6 +864,13 @@
             <span class="track"></span>
           </label>
         </div>
+        <div class="nested shown" id="coderabbitNested">
+          <div class="slider-row">
+            <input type="range" id="postClearanceWait" min="60" max="1245" step="30" value="240" aria-label="Post-clearance CodeRabbit wait cap (seconds)" />
+            <span class="val">cap <span id="postClearanceWaitVal">240</span>s once cleared</span>
+          </div>
+          <p class="hint">Once Codex/Phase&nbsp;4b has cleared HEAD and a reviewer has approved, auto-merge caps the advisory CodeRabbit wait to this window instead of the full budget. Set it to the max to disable the fast path.</p>
+        </div>
 
         <div class="switch-row">
           <div class="switch-copy">
@@ -1041,6 +1048,11 @@
     // two in sync (#470). Drift here misrepresents how the real gate routes.
     protectedPaths: ['src/auth/**', 'src/payments/**', '**/*secret*', '**/*credential*', '.github/**'],
     coderabbit: true,
+    // #727 post-clearance fast path. Mirrors coderabbit.post_clearance_max_wait_seconds
+    // in review-policy.yml: once HEAD has a verified Codex/Phase-4b clearance AND a
+    // reviewer APPROVED, auto-merge caps the advisory CodeRabbit wait to this window
+    // instead of the full max_wait_seconds. The owner-decided default is 240.
+    postClearanceWait: 240,
     codex: true,
     codexRounds: 2,
     // Request `@codex review` on every PR, not only above-threshold ones
@@ -1057,9 +1069,9 @@
   };
 
   const PRESETS = {
-    strict:   { threshold: 100, coderabbit: true,  codex: true,  codexRounds: 3, codexRequestByDefault: true,  feedbackMode: 'address-all', feedbackPriorities: { p0: true, p1: true, p2: true,  p3: true  } },
-    standard: { threshold: 300, coderabbit: true,  codex: true,  codexRounds: 2, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: true, p2: false, p3: false } },
-    loose:    { threshold: 800, coderabbit: false, codex: false, codexRounds: 1, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: false, p2: false, p3: false } },
+    strict:   { threshold: 100, coderabbit: true,  postClearanceWait: 240, codex: true,  codexRounds: 3, codexRequestByDefault: true,  feedbackMode: 'address-all', feedbackPriorities: { p0: true, p1: true, p2: true,  p3: true  } },
+    standard: { threshold: 300, coderabbit: true,  postClearanceWait: 240, codex: true,  codexRounds: 2, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: true, p2: false, p3: false } },
+    loose:    { threshold: 800, coderabbit: false, postClearanceWait: 240, codex: false, codexRounds: 1, codexRequestByDefault: true,  feedbackMode: 'by-priority', feedbackPriorities: { p0: true, p1: false, p2: false, p3: false } },
   };
 
   const LIMITS = {
@@ -1317,6 +1329,12 @@
     yaml.appendChild(document.createTextNode('    '));
     add('k', 'enabled'); yaml.appendChild(document.createTextNode(': '));
     add('v', String(state.coderabbit)); nl();
+    // #727 post-clearance fast path. Mirrors coderabbit.post_clearance_max_wait_seconds
+    // in the real policy file. Emitted AFTER severity_gate so the enabled→severity_gate
+    // nesting the YAML-preview test asserts stays intact.
+    yaml.appendChild(document.createTextNode('  '));
+    add('k', 'post_clearance_max_wait_seconds'); yaml.appendChild(document.createTextNode(': '));
+    add('v', String(state.postClearanceWait)); nl();
     add('k', 'codex'); yaml.appendChild(document.createTextNode(':')); nl();
     yaml.appendChild(document.createTextNode('  '));
     add('k', 'enabled'); yaml.appendChild(document.createTextNode(': '));
@@ -1423,6 +1441,12 @@
     renderAll();
   });
 
+  $('postClearanceWait').addEventListener('input', e => {
+    state.postClearanceWait = +e.target.value;
+    $('postClearanceWaitVal').textContent = state.postClearanceWait;
+    renderAll();
+  });
+
   function validatePath(raw) {
     const v = (raw || '').trim();
     if (!v) return { ok: false, reason: 'Path is empty.' };
@@ -1495,6 +1519,9 @@
       if (key === 'codex') {
         $('codexNested').classList.toggle('shown', state.codex);
       }
+      if (key === 'coderabbit') {
+        $('coderabbitNested').classList.toggle('shown', state.coderabbit);
+      }
       renderAll();
     });
   });
@@ -1538,10 +1565,13 @@
     $('thresholdVal').textContent = state.threshold;
     $('codexRounds').value = state.codexRounds;
     $('codexRoundsVal').textContent = state.codexRounds;
+    $('postClearanceWait').value = state.postClearanceWait;
+    $('postClearanceWaitVal').textContent = state.postClearanceWait;
     document.querySelector('[data-toggle="coderabbit"]').checked = state.coderabbit;
     document.querySelector('[data-toggle="codex"]').checked = state.codex;
     document.querySelector('[data-toggle="codexRequestByDefault"]').checked = state.codexRequestByDefault;
     $('codexNested').classList.toggle('shown', state.codex);
+    $('coderabbitNested').classList.toggle('shown', state.coderabbit);
     document.querySelectorAll('[data-reviewer]').forEach(cb => {
       cb.checked = !!state.reviewers[cb.dataset.reviewer];
     });

@@ -39,6 +39,7 @@ grep -q "RUBRIC_INJECT"                          "$PAGE" || { echo "legacy marke
 grep -q 'id="threshold"'                         "$PAGE" || { echo "threshold slider missing"; exit 1; }
 grep -q 'id="pathChips"'                         "$PAGE" || { echo "path chips container missing"; exit 1; }
 grep -q 'id="codexRounds"'                       "$PAGE" || { echo "codex rounds slider missing"; exit 1; }
+grep -q 'id="postClearanceWait"'                 "$PAGE" || { echo "post-clearance wait slider missing (#727)"; exit 1; }
 grep -q 'data-preset="strict"'                   "$PAGE" || { echo "strict preset missing"; exit 1; }
 grep -q 'data-preset="standard"'                 "$PAGE" || { echo "standard preset missing"; exit 1; }
 grep -q 'data-preset="loose"'                    "$PAGE" || { echo "loose preset missing"; exit 1; }
@@ -220,6 +221,10 @@ const addressAll = emit();
 
 if (!/coderabbit:\s*\n\s+enabled:.*\n\s+severity_gate:\s*\n\s+enabled:/.test(byPriority))
   fail("coderabbit.severity_gate.enabled missing or misnested");
+// #727: post_clearance_max_wait_seconds nested under coderabbit, emitted after
+// the severity_gate block (so the enabled→severity_gate chain above stays intact).
+if (!/coderabbit:[\s\S]*?\n\s+post_clearance_max_wait_seconds: \d+/.test(byPriority))
+  fail("coderabbit.post_clearance_max_wait_seconds missing (#727)");
 if (!/codex:[\s\S]*?\n\s+p1_gate:\s*\n\s+enabled:/.test(byPriority))
   fail("codex.p1_gate.enabled missing or misnested");
 if (!/feedback_policy:\s*\n\s+mode: by-priority\s*\n\s+priorities:\s*\n\s+p0: required\s*\n\s+p1: required\s*\n\s+p2: discretionary\s*\n\s+p3: discretionary/.test(byPriority))

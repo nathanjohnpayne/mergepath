@@ -937,11 +937,69 @@ jobs:
           #       Codex failover engaged (codex_failover_requested:true in the
           #       JSON) — Codex was requested, so the PR advances via the Codex
           #       gates; otherwise block and let the human intervene.
+          # #727 post-clearance fast path. If the current HEAD already carries an
+          # ACTUAL Codex/Phase-4b clearance AND a reviewer-identity APPROVED, the
+          # real blocking bot-review signal is already in and CodeRabbit is
+          # advisory on top of it — so cap coderabbit-wait.sh's poll budget to
+          # coderabbit.post_clearance_max_wait_seconds instead of the full
+          # max_wait_seconds. Read-only probe; fail SAFE — any non-zero rc leaves
+          # the fast path DISARMED so the full budget is used.
+          #
+          # CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false is load-bearing
+          # (#727, Codex P2 on #729): WITHOUT it, gate (c) accepts the same
+          # reviewer APPROVED that clears gate (b) as a Phase-4b substitute, so an
+          # ordinary under-threshold approval with NO Codex review would arm the
+          # cap and reopen the pre-review merge race. With it, gate (c) requires
+          # an actual Codex bot signal (👍 / affirmative verdict / clean review).
+          # SKIP_CI keeps the probe independent of CI; REQUIRE_APPROVAL_ON_HEAD
+          # HEAD-pins gate (b).
+          #
+          # PROBE_HEAD pins the clearance to the head we evaluated (#727, Codex P2
+          # on #729): a push landing between here and coderabbit-wait.sh's own
+          # head fetch would otherwise let the shortened budget apply to a head
+          # that was never cleared. coderabbit-wait.sh disarms if its live head
+          # differs from this SHA.
+          PROBE_HEAD=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha 2>/dev/null || echo "")
+          CODEX_CLEARED=false
+          set +e
+          CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+            CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
+            bash scripts/codex-review-check.sh "$PR_NUMBER" "$REPO" >&2
+          crc=$?
+          set -e
+          case "$crc" in
+            0)
+              CODEX_CLEARED=true
+              echo "::notice::Post-clearance fast path armed (#727): HEAD $PROBE_HEAD has an actual Codex/Phase-4b clearance + reviewer APPROVED — CodeRabbit wait capped to coderabbit.post_clearance_max_wait_seconds."
+              ;;
+            1)
+              echo "::notice::Post-clearance fast path not armed: no actual Codex/Phase-4b clearance (or no reviewer APPROVED) on HEAD — using the full CodeRabbit budget."
+              ;;
+            *)
+              echo "::warning::codex-review-check.sh returned rc=$crc while deriving post-clearance state; failing safe to the full CodeRabbit budget."
+              ;;
+          esac
+
+          # Fail closed if the head could not be resolved (Codex P2 r-comment on
+          # #729): without a non-empty PROBE_HEAD there is nothing to pin the
+          # clearance to, so a push landing before coderabbit-wait.sh resolves
+          # its own head could get the shortened budget on an un-reviewed head.
+          # coderabbit-wait.sh also fails closed on an empty pin, but disarm here
+          # too so the intent is explicit and logged.
+          if [ "$CODEX_CLEARED" = "true" ] && [ -n "$PROBE_HEAD" ]; then
+            POST_CLEARANCE_FLAG=1
+          else
+            POST_CLEARANCE_FLAG=0
+            if [ "$CODEX_CLEARED" = "true" ] && [ -z "$PROBE_HEAD" ]; then
+              echo "::warning::Post-clearance clearance derived but the head SHA could not be resolved for the pin — failing closed to the full CodeRabbit budget (#727)."
+            fi
+          fi
+
           set +e
           # Capture the helper's JSON (stdout) so the rc=5 branch can read the
           # #489 codex_failover_requested flag. Its human-readable diagnostics —
           # and the failover child's own JSON — go to stderr and stream to the log.
-          WAIT_JSON=$(bash scripts/coderabbit-wait.sh "$PR_NUMBER" "$REPO")
+          WAIT_JSON=$(CODERABBIT_WAIT_POST_CLEARANCE="$POST_CLEARANCE_FLAG" CODERABBIT_WAIT_POST_CLEARANCE_SHA="$PROBE_HEAD" bash scripts/coderabbit-wait.sh "$PR_NUMBER" "$REPO")
           rc=$?
           set -e
           printf '%s\n' "$WAIT_JSON"
@@ -990,6 +1048,21 @@ jobs:
                 case "$req" in
                   true|false) ext_protected=$req ;;
                 esac
+              fi
+              # #727: the post-clearance derivation above (CODEX_CLEARED) is the
+              # threshold-INDEPENDENT counterpart of --derive-rate-limit-protection,
+              # which only asserts protection when external review APPLIES (it
+              # returns false for an under-threshold PR even when Codex has
+              # cleared HEAD). A verified Codex/Phase-4b clearance + reviewer
+              # APPROVED on HEAD is exactly the "a real bot reviewed this head"
+              # signal the rate-limit gate protects against merging without — so
+              # fold it in. This lets a rate-limit stall inside the shortened
+              # post-clearance window resolve as advisory (proceed) rather than
+              # blocking an already-cleared PR, matching the #489/#713 intent
+              # that only bot-UNREVIEWED heads stay blocked.
+              if [ "$CODEX_CLEARED" = "true" ]; then
+                ext_protected=true
+                echo "::notice::rc=5 protection folds in the #727 post-clearance signal: HEAD has verified Codex/Phase-4b clearance + reviewer APPROVED — the CodeRabbit rate-limit stall is advisory here."
               fi
               if bash scripts/coderabbit-automerge-rate-limit-gate.sh "$WAIT_JSON" "$ext_protected"; then
                 echo "::notice::CodeRabbit rate-limited, but the #489 Codex failover engaged and this head has active or already-satisfied external-review protection — proceeding."
@@ -1933,6 +2006,33 @@ jobs:
               case "$req" in
                 true) re_protected=true ;;
               esac
+            fi
+            # #727 (Codex P2 on #729): the rc=5 downgrade can be granted via the
+            # post-clearance signal (CODEX_CLEARED folded into ext_protected),
+            # but --derive-rate-limit-protection returns false for an
+            # under-threshold PR even when Codex cleared HEAD — so re-deriving
+            # only that predicate here would abort a VALID under-threshold
+            # post-clearance downgrade at the last step. Re-evaluate the SAME
+            # post-clearance predicate on the (now head-pinned) live head:
+            # codex-review-check.sh gate (b)+(c), SKIP_CI + REQUIRE_APPROVAL_ON_HEAD,
+            # and ALLOW_PHASE_4B_SUBSTITUTE=false (require an actual Codex bot
+            # signal, not the arming approval — same as the fast-path probe,
+            # Codex P2 on #729). Re-run (not a persisted flag) so state that
+            # changed during the waits is caught, matching this block's
+            # fail-closed intent. Either predicate holding upholds the downgrade.
+            if [ "$re_protected" != "true" ]; then
+              set +e
+              CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+                CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
+                bash scripts/codex-review-check.sh "$PR_NUMBER" "$REPO" >&2
+              crc=$?
+              set -e
+              if [ "$crc" = "0" ]; then
+                re_protected=true
+                echo "::notice::rc=5 re-verify: post-clearance predicate still holds on $CURRENT_HEAD_SHA (verified Codex/Phase-4b clearance + reviewer APPROVED) — downgrade upheld (#727)."
+              elif [ "$crc" != "1" ]; then
+                echo "::warning::codex-review-check.sh returned rc=$crc re-deriving the post-clearance predicate at final re-verify; treating as not-protected (fail closed)."
+              fi
             fi
             if [ "$re_protected" != "true" ]; then
               echo "::error::external-review protection is no longer true (or underivable) for $CURRENT_HEAD_SHA after an rc=5 rate-limit downgrade — this head has neither an active external gate nor already-satisfied Codex/Phase-4b clearance. Aborting auto-merge."

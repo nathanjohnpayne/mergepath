@@ -195,6 +195,25 @@ coderabbit:
   # follow-up tracked separately (Codex P2 on #688).
   max_wait_seconds: 1245
 
+  # #727: shortened CodeRabbit poll ceiling for the auto-merge-on-approval
+  # POST-CLEARANCE fast path. When the current HEAD already carries a verified
+  # Codex / Phase-4b clearance AND a reviewer-identity APPROVED (i.e.
+  # scripts/codex-review-check.sh clears gate (b)+(c) on HEAD), the real
+  # blocking bot-review signal is already in. CodeRabbit is advisory on top of
+  # it, so the workflow sets CODERABBIT_WAIT_POST_CLEARANCE=1 and
+  # scripts/coderabbit-wait.sh caps its budget to this value instead of the
+  # full max_wait_seconds. CodeRabbit still gets this window to land a review:
+  # a clear (exit 0) or a Potential issue / ⚠️ finding (exit 2) inside it is
+  # handled exactly as today; only a still-pending CodeRabbit after the cap
+  # proceeds via the existing advisory-timeout (exit 4) path. The fast path
+  # does NOT engage when Codex / Phase-4b has not cleared HEAD — then CodeRabbit
+  # is the only bot-review signal and keeps the full max_wait_seconds. 240s ≈
+  # 16 poll intervals, comfortably above the measured CodeRabbit review p50
+  # (414s is the full budget's basis; here we only need a courtesy window since
+  # the merge is already cleared to proceed). Set >= max_wait_seconds to make
+  # the fast path a no-op.
+  post_clearance_max_wait_seconds: 240
+
   # On the timeout path, ask CodeRabbit for a narrative status update
   # before returning exit 4. This does NOT change the exit-code
   # contract: timeout remains advisory and callers still decide whether

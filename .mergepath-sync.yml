@@ -605,6 +605,14 @@ paths:
   - path: tests/test_coderabbit_wait_ratelimit_window.sh
     type: canonical
     consumers: all
+  # #727 post-clearance fast-path cap suite. Hard-required (exit 1 if missing)
+  # by scripts/ci/check_coderabbit_wait, so it must travel to every consumer.
+  # Locks that CODERABBIT_WAIT_POST_CLEARANCE=1 caps the poll budget to
+  # coderabbit.post_clearance_max_wait_seconds (only ever shortening it), and
+  # that the cap is a no-op when unset or >= max_wait_seconds.
+  - path: tests/test_coderabbit_wait_post_clearance.sh
+    type: canonical
+    consumers: all
   # Pairs with scripts/workflow/verify-propagation-pr.sh (under the
   # scripts/workflow/ kit below). The verifier is security-load-bearing
   # for the propagation-PR review lane; its test travels with it so a
