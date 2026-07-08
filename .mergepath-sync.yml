@@ -688,6 +688,14 @@ paths:
   - path: tests/test_codex_review_request_verdict.sh
     type: canonical
     consumers: all
+  # Write-token / keyring-fallback regression (#737): the `@codex review`
+  # trigger must resolve a token from the gh keyring when the op-preflight
+  # cache has lapsed, and fail loud (never silently no-op) when it cannot.
+  # check_codex_scripts hard-runs it (same `No such file` exit-127 coupling
+  # class as the ack suite above), so it must travel to every consumer.
+  - path: tests/test_codex_review_request_token_fallback.sh
+    type: canonical
+    consumers: all
   # Resolution-aware gate (c) regression (#460 Option B). check_codex_scripts
   # (scripts/ci kit) hard-runs it, so it must travel to every consumer.
   - path: tests/test_codex_review_check_resolution.sh
@@ -1093,6 +1101,7 @@ paths:
       - "tests/test_codex_review_request_trigger_only.sh"  # check_codex_scripts (#489)
       - "tests/test_codex_review_request_entry.sh"  # check_codex_scripts (#486)
       - "tests/test_codex_review_request_verdict.sh"  # check_codex_scripts (#609)
+      - "tests/test_codex_review_request_token_fallback.sh"  # check_codex_scripts (#737)
       - "tests/test_codex_review_check_resolution.sh"  # check_codex_scripts (#460 Option B)
       - "tests/test_codex_review_check_verdict.sh"  # check_codex_scripts (#600/#567)
       - "tests/test_codex_review_check_required_checks.sh"  # check_codex_scripts (#655)

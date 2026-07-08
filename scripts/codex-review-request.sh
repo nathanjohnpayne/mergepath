@@ -252,13 +252,11 @@ if [ -z "$REPO" ]; then
   fi
 fi
 
-if [ -z "${GH_TOKEN:-}" ]; then
-  echo "ERROR: GH_TOKEN is required. Either:" >&2
-  echo "  - Run: eval \"\$(scripts/op-preflight.sh --agent <agent> --mode review)\"" >&2
-  echo "    so this helper auto-sources OP_PREFLIGHT_AUTHOR_PAT, OR" >&2
-  echo "  - Set GH_TOKEN inline per REVIEW_POLICY.md § PAT lookup table." >&2
-  exit 3
-fi
+# GH_TOKEN write-token resolution is DEFERRED to just after author_identity
+# is parsed from review-policy.yml (below). That ordering lets the #737
+# keyring fallback resolve `gh auth token --user <author_identity>` when the
+# op-preflight cache has lapsed — the author identity must be known first.
+# See the "write-token resolution (#737)" block after AUTHOR_IDENTITY.
 
 # --- config readers ---------------------------------------------------------
 
@@ -319,6 +317,50 @@ policy_top_field() {
 # whether an ambient GH_TOKEN may be bridged into gh-as-author.sh.
 AUTHOR_IDENTITY=$(policy_top_field author_identity)
 AUTHOR_IDENTITY=${AUTHOR_IDENTITY:-nathanjohnpayne}
+
+# --- write-token resolution (#737) ------------------------------------------
+# Resolve a GitHub token for this helper's API reads and its one write (the
+# `@codex review` trigger, posted through gh-as-author.sh). Two independent
+# sources satisfy it, tried in order:
+#
+#   1. GH_TOKEN already in the environment — exported inline by the caller,
+#      or auto-sourced from a FRESH op-preflight cache by
+#      preflight_require_token above.
+#   2. The gh keyring's stored author account: `gh auth token --user
+#      <author_identity>`. This fallback closes the #737 gap. In a
+#      long-running session the op-preflight cache TTL (14400s) can lapse,
+#      leaving GH_TOKEN unset even though the keyring still has the author
+#      account authenticated. Before #737 the hard guard here exited 3
+#      WITHOUT ever posting the trigger, so `@codex review` silently no-op'd;
+#      callers that pipe `| tail -1` and ignore the exit code then proceeded
+#      to merge as if Codex had been asked (observed on gaycruisebingo PRs
+#      #78/#79 — 0 triggers posted). The keyring fallback lets the trigger
+#      succeed whenever EITHER source is available.
+#
+# author_identity (parsed from review-policy.yml above) is the account the
+# trigger must be attributed to — Codex ignores non-author triggers — and is
+# the identity post_codex_trigger writes as via gh-as-author.sh, so a keyring
+# token for it also bridges cleanly into that write (#438).
+if [ -z "${GH_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
+  GH_TOKEN=$(gh auth token --user "$AUTHOR_IDENTITY" 2>/dev/null || true)
+  if [ -n "$GH_TOKEN" ]; then
+    export GH_TOKEN
+    echo "[codex-review-request] GH_TOKEN was unset and no fresh op-preflight cache was found — resolved the author token from the gh keyring for '$AUTHOR_IDENTITY' (#737)" >&2
+  fi
+fi
+if [ -z "${GH_TOKEN:-}" ]; then
+  # Fail LOUD (#737): a caller that pipes `| tail -1` and ignores the exit
+  # code must NOT mistake a non-post for a completed request. Non-zero exit
+  # plus an unmissable stderr banner naming the two exhausted sources.
+  echo "ERROR: could not resolve a GitHub token to post the '@codex review' trigger." >&2
+  echo "       The '@codex review' trigger was NOT posted — do NOT treat Codex as requested (#737)." >&2
+  echo "       Tried, in order:" >&2
+  echo "         1. an already-exported GH_TOKEN / fresh op-preflight cache" >&2
+  echo "            (run: eval \"\$(scripts/op-preflight.sh --agent <agent> --mode review)\")" >&2
+  echo "         2. the gh keyring author account '$AUTHOR_IDENTITY'" >&2
+  echo "            (authenticate once with: gh auth login)" >&2
+  exit 3
+fi
 
 # review_timeout_seconds: foreground poll budget for a Codex terminal signal
 # on HEAD. Default 840s is measured, not folklore (#623): the trigger→verdict
@@ -986,6 +1028,20 @@ post_codex_trigger() {
       TRIGGER_POST_TIME=$(date -u -d "@$EPOCH_BUFFER" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
         || die 3 "could not compute fallback TRIGGER_POST_TIME")
     fi
+  fi
+
+  # Post-write readback (#737): a genuinely-posted trigger yields an
+  # `issuecomment-<id>` reference in gh's output (TRIGGER_COMMENT_ID above).
+  # If gh-as-author reported success but produced no identifiable comment, do
+  # NOT let the caller treat Codex as requested on the strength of a post we
+  # cannot confirm landed — surface it as a LOUD, unmissable warning. (A hard
+  # write failure already exited 3 in the branches above; this catches the
+  # rarer "success with nothing to show for it" case, e.g. a gh output-format
+  # change.)
+  if [ -n "$TRIGGER_COMMENT_ID" ]; then
+    log "confirmed '@codex review' trigger posted as comment $TRIGGER_COMMENT_ID (post-write readback, #737)"
+  else
+    echo "[codex-review-request] WARNING: '@codex review' write returned success but yielded no comment id — cannot confirm the trigger landed; verify before treating Codex as requested (#737)" >&2
   fi
 
   # Terminal Codex signals should be accepted if they respond to any

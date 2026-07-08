@@ -60,6 +60,9 @@ echo "check_codex_scripts: running codex-review-request Phase 4a entry-decision 
 echo "check_codex_scripts: running codex-review-request verdict-comment clearance tests (#609)"
 "$REPO_ROOT/tests/test_codex_review_request_verdict.sh"
 
+echo "check_codex_scripts: running codex-review-request write-token / keyring-fallback tests (#737)"
+"$REPO_ROOT/tests/test_codex_review_request_token_fallback.sh"
+
 echo "check_codex_scripts: running codex-review-check gate (c) resolution tests"
 "$REPO_ROOT/tests/test_codex_review_check_resolution.sh"
 
