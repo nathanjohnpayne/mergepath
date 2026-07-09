@@ -55,7 +55,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
 
 ### 4. Clone and bootstrap all repos
 
-The full bootstrap loop runs across each consumer repo. Current consumers:
+The full bootstrap loop runs across each repo the bootstrap wizard has provisioned. This list is maintained by the wizard's cross-repo loop step and is **not** the same population as `.mergepath-sync.yml`'s `consumers:` — a repo appears here once it is bootstrapped, but ongoing propagation requires a separate enrollment as a sync consumer (see mergepath#741; the two lists genuinely differ, e.g. sync consumers `matchline` / `tadlockpsychiatry` are not in this bootstrap loop). Being listed here does **not** mean a repo receives mergepath's post-bootstrap fixes. Bootstrapped repos:
 
 <!-- bootstrap-loop-list-start -->
 - friends-and-family-billing
