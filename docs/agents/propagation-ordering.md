@@ -2,7 +2,7 @@
 
 Status: **canonical, in-repo source of truth.** The order below is reviewed monthly; the dated review log lives on the repo wiki page [Propagation-Wave-Order-Review-Log](https://github.com/nathanjohnpayne/mergepath/wiki/Propagation-Wave-Order-Review-Log). See [§ Maintenance](#maintenance) for how the doc and that log stay in sync.
 
-This is a **hub-only** doc — it governs how a canonical change is fanned out *from* mergepath *to* the 8 consumers via `scripts/sync-to-downstream.sh`. It is intentionally **not** in `.mergepath-sync.yml` (consumers don't run propagation waves). It complements [templated-propagation.md](templated-propagation.md) (the rendering engine) and the canary-first note in `.mergepath-sync.yml`.
+This is a **hub-only** doc — it governs how a canonical change is fanned out *from* mergepath *to* the 9 consumers via `scripts/sync-to-downstream.sh`. It is intentionally **not** in `.mergepath-sync.yml` (consumers don't run propagation waves). It complements [templated-propagation.md](templated-propagation.md) (the rendering engine) and the canary-first note in `.mergepath-sync.yml`.
 
 Treat this as the default for every propagation wave unless a specific wave documents a reason to deviate in its own tracking issue.
 
@@ -12,12 +12,13 @@ This is the **fan-out** order — the sequence in which consumer PRs are opened 
 
 | Wave | Pair | Why this tier |
 |---|---|---|
+| **0 (newly enrolled)** | `gaycruisebingo` (single) | Enrolled #741 after a long bootstrap gap during which it received **no** post-bootstrap propagation, so it carries the largest unaudited accumulated drift (React+TS+Vite ESM, vitest). Until its first sync reconciles that drift it is the most divergent consumer by definition; its first wave PR must be read carefully for real local modifications vs missed upstream fixes (per the manifest's first-sync-risk note). Drops out of this tier once its backlog is synced and it settles into the steady-state ranking below. |
 | **1 (riskiest)** | `overridebroadway` + `nathanpaynedotcom` | overridebroadway: historically special-cased ("CodeRabbit disabled" era), most bespoke `path_instructions`. nathanpaynedotcom: only consumer with a `tools.eslint.enabled: false` override (Astro) + highest churn. |
 | **2** | `matchline` + `tadlockpsychiatry` | Both React+TS. matchline = well-trodden reference (deepest bot history); tadlockpsychiatry = quietest / least-observed. |
 | **3** | `device-source-of-truth` + `friends-and-family-billing` | Recently touched by the ESLint-floor work. |
 | **4 (safest)** | `device-platform-reporting` + `swipewatch` | Simplest surfaces; swipewatch is the documented ESLint canary. |
 
-**Rationale:** the dominant failure mode for a wave is **per-consumer idiosyncrasy** (config divergence, local adaptations), not a uniform payload break. Front-loading the most divergent repos surfaces any check-vs-config interaction while attention is full; fixes land once at the source and later pairs become verification. Simplest repos last = cheap confirmation. (All 8 consumers are **public** as of 2026-07-06 — visibility was once an ordering factor, since a private repo's CI failures aren't readable without auth, but it no longer distinguishes the tiers; the axis is now divergence and churn.)
+**Rationale:** the dominant failure mode for a wave is **per-consumer idiosyncrasy** (config divergence, local adaptations), not a uniform payload break. Front-loading the most divergent repos surfaces any check-vs-config interaction while attention is full; fixes land once at the source and later pairs become verification. Simplest repos last = cheap confirmation. (All 9 consumers are **public** — visibility was once an ordering factor, since a private repo's CI failures aren't readable without auth, but it no longer distinguishes the tiers; the axis is now divergence and churn.)
 
 ## Canary selection (always do ONE first)
 
@@ -30,6 +31,7 @@ scripts/sync-to-downstream.sh --sync-all --repos <canary>
 
 Pick the canary by the **dominant risk of this change**:
 
+- **A consumer still in the wave-0 (newly enrolled) tier** (currently `gaycruisebingo`, #741) → make it the canary for its own first sync. It carries the largest unaudited accumulated drift, so it is the highest-risk repo to exercise first; do not fan out to the steady-state tiers until this repo's backlog has synced green and dropped out of wave 0.
 - **Uniform manifest/payload gap** (the #264 class — a missing test / fixture / script the kit hard-requires) → cheapest to catch on the **simplest public** repo (`swipewatch`).
 - **Per-consumer config idiosyncrasy** → the **most-divergent** repo (`nathanpaynedotcom` / `overridebroadway`), which then doubles as canary + first wave.
 
@@ -37,7 +39,7 @@ Only fan out (`--sync-all`) once the canary's `lint` is green **and the wave aud
 
 ## Wave audit (one scoped review per wave, #662)
 
-A verified mirror carries nothing unreviewed: every line already passed review on its upstream mergepath PR, and the propagation lane byte-verifies the mirror. So the wave's external review runs **once**, against the canary PR, scoped to the canonical range that has not been audited before — instead of CodeRabbit + Codex re-reading the same bytes on all 8 consumers:
+A verified mirror carries nothing unreviewed: every line already passed review on its upstream mergepath PR, and the propagation lane byte-verifies the mirror. So the wave's external review runs **once**, against the canary PR, scoped to the canonical range that has not been audited before — instead of CodeRabbit + Codex re-reading the same bytes on all 9 consumers:
 
 ```bash
 # After the canary PR is open and lane-verified:

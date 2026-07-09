@@ -21,6 +21,20 @@
 # it writes to mergepath itself, not to the target. Without
 # BOOTSTRAP_AUTO_CONFIRM=1 the operator must say yes.
 #
+# IMPORTANT — this stage does NOT enroll the new repo as a
+# .mergepath-sync.yml consumer. The one-time template rsync (step 1)
+# and ongoing sync-consumer enrollment are two genuinely separate
+# steps; the cross-repo loop update touches only the loop docs. A repo
+# that gets only the rsync + loop-doc registration receives none of
+# mergepath's post-bootstrap propagation (script/policy fixes, new
+# gates, security hardening) and never shows up in the weekly
+# propagation-drift sweep. Enrollment requires a facts: block verified
+# against the repo's own package.json (frameworks / testing / jsx_in_js
+# / ESM-vs-CJS eslint variant) and a canary-first first sync, so it is
+# left as an explicit human NEXT STEP emitted by the board-and-summary
+# stage rather than auto-performed here. See mergepath#741 (the
+# gaycruisebingo gap) and the .mergepath-sync.yml header.
+#
 # Reads (set by the wizard before dispatch):
 #   $TARGET_DIR                Path to the new repo's target dir.
 #   $BOOTSTRAP_MERGEPATH_ROOT  Path to mergepath's worktree (the

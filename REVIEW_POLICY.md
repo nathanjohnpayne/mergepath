@@ -1045,8 +1045,7 @@ ssh -T git@github-claude        # → Hi nathanpayne-claude!
 
 ### Switching all repos to SSH remotes
 
-The SSH-remote-switch covers every repo on the operator's machine (template
-+ consumers + docs). Current set:
+The SSH-remote-switch covers every repo on the operator's machine (template, consumers, and docs). This is a machine-level checkout list, **not** the `.mergepath-sync.yml` `consumers:` set — membership here says nothing about whether a repo receives ongoing propagation (see mergepath#741). Current set:
 
 <!-- bootstrap-loop-list-start -->
 - mergepath
