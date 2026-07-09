@@ -169,15 +169,21 @@ consumers:
   # gh-as-author.sh, registered in the loop docs) but was never enrolled
   # as an ongoing sync consumer, so it missed every post-bootstrap fix
   # (#741). React 18 + TypeScript + Vite SPA, `"type": "module"` (ESM),
-  # vitest, root package.json. No JSX in `.js` files (pure `.tsx`), so no
-  # `jsx_in_js`; vitest is the default so no `testing:` override — the
-  # same shape as matchline. First sync will be large (long bootstrap gap);
-  # drive it canary-first per this manifest's header, not a big-bang PR.
+  # root package.json. No JSX in `.js` files (pure `.tsx`), so no
+  # `jsx_in_js`. It runs vitest with globals (its test files use bare
+  # `describe`/`it`/`expect`/`vi`), and the eslint template emits the
+  # vitest globals block ONLY when `testing: vitest` is set (an unset
+  # `testing` renders NO testing globals — verified against
+  # examples/eslint.config.js § `>>> if testing contains vitest`), so the
+  # fact is REQUIRED here to avoid stripping the block on first sync and
+  # regressing `no-undef` on the test globals. First sync is small (audit:
+  # 100 paths in sync); drive it canary-first per this manifest's header.
   - name: gaycruisebingo
     repo: nathanjohnpayne/gaycruisebingo
     visibility: public
     facts:
       frameworks: [react, typescript]
+      testing: vitest
 
 # Path types:
 #   canonical  — byte-for-byte mirror. Any difference is drift.
