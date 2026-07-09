@@ -89,6 +89,8 @@ Implementation: `scripts/bootstrap/template-mirror.sh`.
 5. Initialize the new repo's git history with a single `"Initial commit (bootstrapped from mergepath)"` commit.
 6. Open a PR on Mergepath itself to add the new repo to the cross-repo loop lists in `DEPLOYMENT.md` and `REVIEW_POLICY.md` (gated on anchor presence — if the anchors aren't there, the step warns and skips).
 
+> **This stage does NOT enroll the repo as a `.mergepath-sync.yml` consumer.** The one-time template rsync (step 1) and ongoing sync-consumer enrollment are separate steps — a repo that gets only the rsync + loop-doc registration receives none of mergepath's post-bootstrap propagation and never appears in the weekly `propagation-drift` sweep. Enrollment is a human NEXT STEP (see below), not an automated part of this stage, because it needs a `facts:` block verified against the repo's own `package.json` and a canary-first first sync. This gap is what stranded `gaycruisebingo` (mergepath#741).
+
 **Failure recovery.** Each step captures its rc and short-circuits. On failure, the state file does NOT carry a `template-mirror` entry; re-run with `--resume` to retry. The cross-repo loop step has a "return to main on failure" recovery so a half-applied loop change doesn't strand mergepath's worktree on the throwaway branch.
 
 ### Stage C: github-infra (#205 / sub-C)
@@ -147,7 +149,7 @@ Implementation: `scripts/bootstrap/board-and-summary.sh`.
    - `SKIPPED` — stages NOT in the state file (or whose sub-steps were explicitly skipped, e.g., Firebase under `--skip-firebase`).
    - `WARNINGS` — things the wizard couldn't automate (e.g., `.env.local` from Firebase web console; collaborator invite acceptance).
    - `CROSS-REPO LOOP UPDATE` — pointer to the Mergepath PR opened in stage B (or a manual-action note if anchors were absent).
-   - `NEXT STEPS (human-action)` — the explicit checklist of things the operator owns: accept invites, write the canonical PRD in `nathanjohnpayne/docs/projects/<repo>/prds/`, fill the repo-local implementation spec, populate issues, set spend caps, drive Sprint 0.
+   - `NEXT STEPS (human-action)` — the explicit checklist of things the operator owns: accept invites, **enroll the repo as a `.mergepath-sync.yml` consumer** (so it receives ongoing propagation, not just the one-time rsync — mergepath#741), write the canonical PRD in `nathanjohnpayne/docs/projects/<repo>/prds/`, fill the repo-local implementation spec, populate issues, set spend caps, drive Sprint 0.
 
 The project-board calls are `gh` write paths and run under the same token-verified author helper as stage C. The scaffold writes are direct shell redirects (no gh involved) and don't need the wrapper.
 
@@ -261,6 +263,8 @@ And on GitHub:
 And on Mergepath:
 
 - A PR adding `<repo>` to the cross-repo loop lists in `DEPLOYMENT.md` and `REVIEW_POLICY.md` (when the anchors are present).
+
+**Not** produced by the wizard (still owed as a human NEXT STEP): a `.mergepath-sync.yml` consumer entry. Until that lands, the repo is bootstrapped but not enrolled for ongoing sync (mergepath#741).
 
 ## See also
 

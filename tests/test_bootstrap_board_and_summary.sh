@@ -250,6 +250,13 @@ echo "$out" | grep -q "^CROSS-REPO LOOP UPDATE:" \
   || fail "summary missing CROSS-REPO LOOP UPDATE"
 echo "$out" | grep -q "^NEXT STEPS" \
   && pass "summary has NEXT STEPS section" || fail "summary missing NEXT STEPS"
+# Regression guard for the gaycruisebingo gap (mergepath#741): the
+# summary must steer the operator to enroll the repo as a
+# .mergepath-sync.yml consumer, since the bootstrap does the one-time
+# rsync + loop-doc registration but NOT ongoing sync enrollment.
+echo "$out" | grep -q ".mergepath-sync.yml consumer" \
+  && pass "summary reminds operator to enroll as a sync consumer (#741)" \
+  || fail "summary missing .mergepath-sync.yml enrollment reminder (#741)"
 echo "$out" | grep -q "docs/agents/bootstrap-runbook.md" \
   && pass "summary cross-links to docs/agents/bootstrap-runbook.md" \
   || fail "summary missing runbook cross-link"

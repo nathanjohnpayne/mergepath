@@ -165,6 +165,19 @@ consumers:
     visibility: public
     facts:
       frameworks: [react, typescript]
+  # gaycruisebingo was bootstrapped from mergepath (byte-identical
+  # gh-as-author.sh, registered in the loop docs) but was never enrolled
+  # as an ongoing sync consumer, so it missed every post-bootstrap fix
+  # (#741). React 18 + TypeScript + Vite SPA, `"type": "module"` (ESM),
+  # vitest, root package.json. No JSX in `.js` files (pure `.tsx`), so no
+  # `jsx_in_js`; vitest is the default so no `testing:` override — the
+  # same shape as matchline. First sync will be large (long bootstrap gap);
+  # drive it canary-first per this manifest's header, not a big-bang PR.
+  - name: gaycruisebingo
+    repo: nathanjohnpayne/gaycruisebingo
+    visibility: public
+    facts:
+      frameworks: [react, typescript]
 
 # Path types:
 #   canonical  — byte-for-byte mirror. Any difference is drift.
@@ -1188,6 +1201,7 @@ paths:
   #   nathanpaynedotcom (ESM)          → JS + TS + Astro
   #   tadlockpsychiatry (ESM)          → JS + TS + React + react-hooks
   #   device-source-of-truth (ESM)     → JS + TS + React + react-hooks
+  #   gaycruisebingo (ESM)             → JS + TS + React + react-hooks
   #   friends-and-family-billing (CJS) → JS + React + react-hooks
   #   device-platform-reporting (CJS)  → JS + React + react-hooks
   #   overridebroadway (CJS)           → JS + TS + React + react-hooks
@@ -1203,6 +1217,7 @@ paths:
       - nathanpaynedotcom
       - tadlockpsychiatry
       - device-source-of-truth
+      - gaycruisebingo
 
   # CJS variant — consumers without `"type": "module"` (default
   # CJS resolution). Same body as the ESM variant; only the
