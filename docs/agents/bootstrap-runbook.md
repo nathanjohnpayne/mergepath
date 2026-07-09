@@ -205,13 +205,14 @@ Per stage, the most common failures and their recovery paths:
 These items require human attention AFTER the wizard completes. The summary block enumerates them; this section is the canonical reference:
 
 1. **Accept reviewer collaborator invites.** Each invited agent identity (`nathanpayne-claude`, `-cursor`, `-codex`) must sign into the new repo's invitations page and accept. Wizard invokes the invite but cannot accept it.
-2. **Populate `.env.local` from Firebase web console.** When Firebase is enabled, the deployer SA key handles deploys but the web app config (`firebaseConfig`) requires manual copy-paste from console.firebase.google.com.
-3. **Install the Codex App.** The wizard prints the install URL; the human must accept on github.com/apps/codex AND configure a Codex environment at chatgpt.com/codex/cloud/settings/environments. "Code Review enabled" is not sufficient — both pieces are required for review-readiness.
-4. **Install the CodeRabbit App.** Same shape: wizard prints the URL, human accepts.
-5. **Write the PRD and implementation spec.** The canonical PRD belongs in `nathanjohnpayne/docs/projects/<repo>/prds/`; the wizard-created `specs/<repo>.md` placeholder is the repo-local implementation spec. `scripts/project-doc-sync.sh` is responsible for generated PRD/spec mirrors once the project is added to `.mergepath-project-docs.yml`.
-6. **Populate Phase 0 / Phase 1 issues.** The wizard creates the `scripts/gh-projects/examples/<repo>/create-issues.sh` skeleton. The human fills it in and runs it.
-7. **Set provider-level spend caps.** Before pasting LLM API keys (Anthropic, OpenAI), the human sets account-level spend caps at `platform.openai.com/account/limits` and `console.anthropic.com/settings/limits`.
-8. **Drive Sprint 0 PR #1.** The first end-to-end PR through the review flow (CodeRabbit advisory + reviewer identity + Phase 4 external review) validates the bootstrap.
+2. **Enroll the repo as a `.mergepath-sync.yml` consumer.** The wizard does the one-time template rsync and the loop-doc registration, but NOT ongoing-sync enrollment — a repo left unenrolled receives none of mergepath's post-bootstrap propagation and never appears in the weekly `propagation-drift` sweep (the mergepath#741 gap). Add it to `consumers:` with a `facts:` block verified against its own `package.json` (`frameworks` / `testing` / `jsx_in_js` / ESM-vs-CJS eslint variant), run `scripts/sync-to-downstream.sh --audit --repos <repo>`, and drive the first sync canary-first (it also joins the wave-0 tier in [propagation-ordering.md](propagation-ordering.md) until that backlog clears).
+3. **Populate `.env.local` from Firebase web console.** When Firebase is enabled, the deployer SA key handles deploys but the web app config (`firebaseConfig`) requires manual copy-paste from console.firebase.google.com.
+4. **Install the Codex App.** The wizard prints the install URL; the human must accept on github.com/apps/codex AND configure a Codex environment at chatgpt.com/codex/cloud/settings/environments. "Code Review enabled" is not sufficient — both pieces are required for review-readiness.
+5. **Install the CodeRabbit App.** Same shape: wizard prints the URL, human accepts.
+6. **Write the PRD and implementation spec.** The canonical PRD belongs in `nathanjohnpayne/docs/projects/<repo>/prds/`; the wizard-created `specs/<repo>.md` placeholder is the repo-local implementation spec. `scripts/project-doc-sync.sh` is responsible for generated PRD/spec mirrors once the project is added to `.mergepath-project-docs.yml`.
+7. **Populate Phase 0 / Phase 1 issues.** The wizard creates the `scripts/gh-projects/examples/<repo>/create-issues.sh` skeleton. The human fills it in and runs it.
+8. **Set provider-level spend caps.** Before pasting LLM API keys (Anthropic, OpenAI), the human sets account-level spend caps at `platform.openai.com/account/limits` and `console.anthropic.com/settings/limits`.
+9. **Drive Sprint 0 PR #1.** The first end-to-end PR through the review flow (CodeRabbit advisory + reviewer identity + Phase 4 external review) validates the bootstrap.
 
 ## Environment variables
 

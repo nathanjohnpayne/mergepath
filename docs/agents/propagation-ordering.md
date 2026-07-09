@@ -31,6 +31,7 @@ scripts/sync-to-downstream.sh --sync-all --repos <canary>
 
 Pick the canary by the **dominant risk of this change**:
 
+- **A consumer still in the wave-0 (newly enrolled) tier** (currently `gaycruisebingo`, #741) → make it the canary for its own first sync. It carries the largest unaudited accumulated drift, so it is the highest-risk repo to exercise first; do not fan out to the steady-state tiers until this repo's backlog has synced green and dropped out of wave 0.
 - **Uniform manifest/payload gap** (the #264 class — a missing test / fixture / script the kit hard-requires) → cheapest to catch on the **simplest public** repo (`swipewatch`).
 - **Per-consumer config idiosyncrasy** → the **most-divergent** repo (`nathanpaynedotcom` / `overridebroadway`), which then doubles as canary + first wave.
 

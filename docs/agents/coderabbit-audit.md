@@ -111,7 +111,7 @@ Our entire fleet authors as the single shared identity **`nathanjohnpayne`**. So
    command -v brew >/dev/null 2>&1 && eval "$(brew shellenv)"
    for r in matchline nathanpaynedotcom overridebroadway tadlockpsychiatry \
             device-source-of-truth friends-and-family-billing \
-            device-platform-reporting swipewatch; do
+            device-platform-reporting swipewatch gaycruisebingo; do
      echo "=== $r ==="
      GH_TOKEN="$OP_PREFLIGHT_REVIEWER_PAT" gh api \
        "repos/nathanjohnpayne/$r/issues/comments?per_page=100&sort=created&direction=desc" \
