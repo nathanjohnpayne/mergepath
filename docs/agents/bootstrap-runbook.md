@@ -82,12 +82,13 @@ The wizard itself — argument parsing, preflight, prompts, dispatch, resume. No
 
 Implementation: `scripts/bootstrap/template-mirror.sh`.
 
-1. `rsync` the mergepath worktree into the target dir, honoring the exclude list (mergepath-only files, packaging dirs, screenshots, etc.).
+1. `rsync` the mergepath worktree into the target dir, honoring the exclude list (mergepath-only files, packaging dirs, screenshots, the hub-only docs, and the pure-identity `BRAND.md` / `docs/agents/repository-overview.md` — see step 4b).
 2. Remove post-rsync orphans the exclude list can't catch (e.g., `tests/test_mergepath_playground.sh`).
 3. Drop mergepath-specific entries from the new repo's `.repo-template.yml` (the `mergepath_playground` spec_test_map key + the `extra_top_level_dirs` guard).
-4. Apply name substitutions across the documented 6 name-bearing files (via `scripts/bootstrap/substitute.sh`).
-5. Initialize the new repo's git history with a single `"Initial commit (bootstrapped from mergepath)"` commit.
-6. Open a PR on Mergepath itself to add the new repo to the cross-repo loop lists in `DEPLOYMENT.md` and `REVIEW_POLICY.md` (gated on anchor presence — if the anchors aren't there, the step warns and skips).
+4. Apply name substitutions across the documented name-bearing files (via `scripts/bootstrap/substitute.sh`).
+5. **Scaffold neutral consumer identity docs (#744).** A lexical `mergepath → <repo>` swap leaves mergepath's self-referential hub identity intact and false, so `BRAND.md` and `docs/agents/repository-overview.md` (100% identity) are excluded from the mirror and replaced with honest "downstream consumer" stubs; the four hub-only docs (`ai_agent_tooling_standard.md`, `docs/agents/{bootstrap-runbook,propagation-ordering,templated-propagation}.md`) are excluded (they describe machinery a consumer doesn't run); and the `AGENTS.md` "Repository Layout" section documenting the mergepath-only `packaging/` dir is scrubbed. The mixed doc `.ai_context.md` keeps its shared content — its one false line is fixed at the mergepath source so it flows through substitution honestly.
+6. Initialize the new repo's git history with a single `"Initial commit (bootstrapped from mergepath)"` commit.
+7. Open a PR on Mergepath itself to add the new repo to the cross-repo loop lists in `DEPLOYMENT.md` and `REVIEW_POLICY.md` (gated on anchor presence — if the anchors aren't there, the step warns and skips).
 
 > **This stage does NOT enroll the repo as a `.mergepath-sync.yml` consumer.** The one-time template rsync (step 1) and ongoing sync-consumer enrollment are separate steps — a repo that gets only the rsync + loop-doc registration receives none of mergepath's post-bootstrap propagation and never appears in the weekly `propagation-drift` sweep. Enrollment is a human NEXT STEP (see below), not an automated part of this stage, because it needs a `facts:` block verified against the repo's own `package.json` and a canary-first first sync. This gap is what stranded `gaycruisebingo` (mergepath#741).
 

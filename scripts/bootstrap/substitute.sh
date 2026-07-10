@@ -46,12 +46,15 @@
 set -euo pipefail
 
 # Files that get name substitution. Each path is relative to the
-# target repo root. Mirrors #204's "6 name-bearing files" list.
+# target repo root. Started as #204's "6 name-bearing files" list;
+# BRAND.md and docs/agents/repository-overview.md were removed in #744
+# because a lexical mergepath→<repo> swap leaves their self-referential
+# hub identity ("the reference implementation", the Playground) intact
+# and FALSE. They are excluded from the mirror and replaced by neutral
+# consumer stubs in bootstrap::_scaffold_consumer_identity instead.
 BOOTSTRAP_NAME_BEARING_FILES=(
   README.md
-  BRAND.md
   .ai_context.md
-  docs/agents/repository-overview.md
   .repo-template.yml
   SECURITY.md
 )

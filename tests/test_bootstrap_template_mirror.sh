@@ -9,9 +9,13 @@
 #   1. Every documented exclude path is absent from the target.
 #   2. The orphan playground test is removed post-rsync.
 #   3. Empty post-rsync dirs (e.g., bugs/) are tombstoned.
-#   4. The 6 name-bearing files have their mergepath references
+#   4. The name-bearing files have their mergepath references
 #      substituted to the new repo name in all three case forms
 #      (lowercase / Titlecased / UPPERCASE) + URL.
+#   4b. Consumer identity is scaffolded neutrally (#744): BRAND.md +
+#      docs/agents/repository-overview.md become "downstream consumer"
+#      stubs, the hub-only docs are excluded, and the AGENTS.md
+#      packaging/Repository-Layout section is scrubbed.
 #   5. .repo-template.yml has the playground spec_test_map entry
 #      and extra_top_level_dirs dropped.
 #   6. The target has a single initial git commit.
@@ -114,6 +118,31 @@ cat >"$FAKE_MP/SECURITY.md" <<'EOF'
 # Security
 Report issues to security@mergepath.example.
 EOF
+
+# AGENTS.md with the mergepath-only "Repository Layout" / packaging note
+# that the #744 scrub must remove in the consumer copy.
+cat >"$FAKE_MP/AGENTS.md" <<'EOF'
+# AGENTS.md
+
+Read the docs before acting.
+
+## Repository Layout
+
+One directory carries its justification here:
+
+- **`packaging/`** --- placeholder package scaffolds that reserve the `mergepath` name on npm and PyPI (name-squatting prevention). See `packaging/README.md`.
+
+## Code Review Policy
+
+Every change goes through REVIEW_POLICY.md.
+EOF
+
+# Hub-only docs (#744) — copied verbatim they describe machinery a
+# consumer doesn't run; the mirror must EXCLUDE them.
+echo "# The AI Agent Tooling Standard" >"$FAKE_MP/ai_agent_tooling_standard.md"
+echo "# Bootstrap runbook (hub-only)" >"$FAKE_MP/docs/agents/bootstrap-runbook.md"
+echo "# Propagation ordering (hub-only)" >"$FAKE_MP/docs/agents/propagation-ordering.md"
+echo "# Templated propagation (hub-only)" >"$FAKE_MP/docs/agents/templated-propagation.md"
 
 # --- excluded paths (must NOT propagate) ---
 echo "playground spec" >"$FAKE_MP/specs/mergepath_playground.md"
@@ -359,24 +388,60 @@ grep -q "MY_NEW_REPO_ROOT" "$TARGET/README.md" \
   && pass "uppercase env-var form 'MY_NEW_REPO_ROOT' present" \
   || fail "expected 'MY_NEW_REPO_ROOT' in README; got: $(grep _ROOT "$TARGET/README.md")"
 
-# BRAND.md exercises all 3 forms.
-grep -q "Brand: My-new-repo" "$TARGET/BRAND.md" \
-  && pass "BRAND Titlecase 'Mergepath' → 'My-new-repo'" \
-  || fail "BRAND Titlecase not substituted; got: $(grep -i brand "$TARGET/BRAND.md")"
-grep -q "MY_NEW_REPO" "$TARGET/BRAND.md" \
-  && pass "BRAND uppercase form present" \
-  || fail "BRAND uppercase missing"
-grep -q "my-new-repo" "$TARGET/BRAND.md" \
-  && pass "BRAND lowercase form present" \
-  || fail "BRAND lowercase missing"
+# BRAND.md + repository-overview.md are SCAFFOLDED as neutral consumer
+# stubs (#744), NOT substituted from mergepath's identity narrative.
+grep -q "downstream consumer of the \[mergepath\]" "$TARGET/BRAND.md" \
+  && pass "BRAND.md scaffolded with neutral consumer framing (#744)" \
+  || fail "BRAND.md not scaffolded; got: $(head -3 "$TARGET/BRAND.md")"
+grep -q "My-new-repo is not" "$TARGET/BRAND.md" \
+  && pass "BRAND.md disclaims reference-implementation status" \
+  || fail "BRAND.md missing the 'is not the reference impl' disclaimer"
+grep -qi "Playground\|Cockpit\|Tiebreaker" "$TARGET/BRAND.md" \
+  && fail "BRAND.md still carries mergepath's Playground/Cockpit surfaces" \
+  || pass "BRAND.md dropped the mergepath surface list"
+# The fixture BRAND.md content ("Brand: Mergepath") must NOT survive.
+grep -q "Brand: My-new-repo\|Brand: Mergepath" "$TARGET/BRAND.md" \
+  && fail "BRAND.md still carries the substituted fixture content" \
+  || pass "BRAND.md fixture content replaced by the scaffold"
+grep -q "downstream \*\*consumer\*\* of the \[mergepath\]" "$TARGET/docs/agents/repository-overview.md" \
+  && pass "repository-overview.md scaffolded with neutral consumer framing (#744)" \
+  || fail "repository-overview.md not scaffolded; got: $(head -3 "$TARGET/docs/agents/repository-overview.md")"
 
-# No remaining 'mergepath' references in name-bearing files.
-remaining=$(grep -h -i "mergepath" "$TARGET/README.md" "$TARGET/BRAND.md" \
-            "$TARGET/docs/agents/repository-overview.md" "$TARGET/SECURITY.md" \
+# No residual 'mergepath' in the STILL-SUBSTITUTED name-bearing files
+# (README.md, SECURITY.md). BRAND.md + repository-overview.md are
+# excluded here: their scaffolds intentionally reference the mergepath
+# hub (URL + "mergepath is the reference implementation").
+remaining=$(grep -h -i "mergepath" "$TARGET/README.md" "$TARGET/SECURITY.md" \
             2>/dev/null || true)
 [ -z "$remaining" ] \
-  && pass "no residual 'mergepath' references in name-bearing files" \
+  && pass "no residual 'mergepath' references in substituted name-bearing files" \
   || fail "residual 'mergepath' references found: $remaining"
+
+# --- assertion 4b: hub-only docs excluded (#744) ---
+hub_leak=""
+for d in ai_agent_tooling_standard.md docs/agents/bootstrap-runbook.md \
+         docs/agents/propagation-ordering.md docs/agents/templated-propagation.md; do
+  [ -e "$TARGET/$d" ] && hub_leak="$hub_leak $d"
+done
+[ -z "$hub_leak" ] \
+  && pass "hub-only docs excluded from the consumer mirror (#744)" \
+  || fail "hub-only docs leaked into consumer:$hub_leak"
+
+# --- assertion 4c: AGENTS.md packaging/Repository-Layout scrub (#744) ---
+if [ -f "$TARGET/AGENTS.md" ]; then
+  grep -q "placeholder package scaffolds that reserve" "$TARGET/AGENTS.md" \
+    && fail "AGENTS.md still documents the mergepath-only packaging/ dir" \
+    || pass "AGENTS.md packaging note scrubbed (#744)"
+  grep -q "^## Repository Layout" "$TARGET/AGENTS.md" \
+    && fail "AGENTS.md still carries the Repository Layout section" \
+    || pass "AGENTS.md Repository Layout section removed"
+  # Sections on either side must survive the scrub.
+  grep -q "^## Code Review Policy" "$TARGET/AGENTS.md" \
+    && pass "AGENTS.md scrub left adjacent sections intact" \
+    || fail "AGENTS.md scrub over-removed (Code Review Policy section gone)"
+else
+  fail "AGENTS.md missing from consumer mirror"
+fi
 
 # .ai_context.md has no mergepath refs to begin with — substitution
 # should produce a byte-identical file (warning logged but no error).
