@@ -2,17 +2,29 @@
 # scripts/bootstrap/template-mirror.sh — bootstrap wizard stage B.
 # Per #156 sub-B / #204.
 #
-# Responsibilities (in order):
+# Responsibilities (in dispatch order — matches the numbered Step
+# comments in bootstrap::stage_template_mirror):
 #   1. rsync mergepath's worktree into the new repo's target dir,
 #      honoring a curated exclude list that drops mergepath-only files
-#      (the playground spec, packaging/, internal screenshots, etc.).
+#      (the playground spec, packaging/, internal screenshots, the
+#      hub-only machinery docs, and the pure-identity BRAND.md /
+#      repository-overview.md, etc.).
 #   2. Remove post-rsync orphans the exclude list can't catch.
-#   3. Apply name substitutions across the documented 6 name-bearing
-#      files (via scripts/bootstrap/substitute.sh).
-#   4. Drop mergepath-specific entries from the new repo's
+#   3. Drop mergepath-specific entries from the new repo's
 #      .repo-template.yml (the playground spec_test_map + the
-#      extra_top_level_dirs guard for mergepath/packaging).
-#   5. Initialize the new repo's git history with a single
+#      extra_top_level_dirs guard for mergepath/packaging). Runs BEFORE
+#      substitution so the literal `mergepath_playground` key is still
+#      findable for yq's delete (#233).
+#   4. Apply name substitutions across the documented name-bearing
+#      files (via scripts/bootstrap/substitute.sh).
+#   5. Scaffold neutral consumer identity docs (#744): write honest
+#      "downstream consumer" stubs for the excluded BRAND.md +
+#      docs/agents/repository-overview.md, and scrub the AGENTS.md
+#      "Repository Layout" section that documents the mergepath-only
+#      packaging/ dir. Runs after substitution (dispatched as "Step 5b").
+#   6. Reset opt-in policy defaults the hub flipped for itself
+#      (phase_4b_automation.enabled → false, #628).
+#   7. Initialize the new repo's git history with a single
 #      "Initial commit (bootstrapped from mergepath)" commit.
 #
 # The cross-repo loop update (open a Mergepath-side PR adding the
@@ -139,6 +151,35 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   'scripts/wave-audit.sh'
   'tests/test_wave_audit.sh'
 
+  # Hub identity docs — do NOT duplicate mergepath's self-referential
+  # hub identity into a consumer (#744). Two groups:
+  #
+  #   * Hub-only MACHINERY docs describe processes a consumer does not
+  #     run (the propagation wave, the bootstrap wizard, the templated-
+  #     render engine — sync-to-downstream.sh / .mergepath-sync.yml
+  #     aren't even present in a consumer, per the orchestrator excludes
+  #     above). Copied verbatim they'd read as if the consumer were the
+  #     hub. NB: ai_agent_tooling_standard.md is deliberately NOT here —
+  #     it is the methodology-neutral Standard the consumer FOLLOWS (it
+  #     correctly names mergepath as the reference implementation and is
+  #     not name-substituted, so it stays true in a consumer), and
+  #     README.md / .ai_context.md still link to it (Codex #746).
+  #   * BRAND.md + docs/agents/repository-overview.md are 100% mergepath
+  #     identity ("the reference implementation", the Playground/Cockpit/
+  #     Tiebreaker/Checks surfaces). A lexical mergepath→<repo> swap
+  #     leaves the self-referential claims intact and FALSE. These are
+  #     excluded here and replaced by neutral consumer stubs in
+  #     bootstrap::_scaffold_consumer_identity (step 5b below), so they
+  #     are also dropped from BOOTSTRAP_NAME_BEARING_FILES in
+  #     substitute.sh. (The mixed doc .ai_context.md keeps its shared
+  #     content and is fixed at the mergepath source, not here; the
+  #     AGENTS.md packaging note is scrubbed in step 5b.)
+  'docs/agents/bootstrap-runbook.md'
+  'docs/agents/propagation-ordering.md'
+  'docs/agents/templated-propagation.md'
+  'BRAND.md'
+  'docs/agents/repository-overview.md'
+
   # Screenshots — internal evidence, not template content
   'bugs/screenshots/'
   '.github/screenshots/'
@@ -213,11 +254,23 @@ bootstrap::stage_template_mirror() {
     return "$step_rc"
   fi
 
-  # Step 4: apply name substitutions across the 6 name-bearing files
+  # Step 4: apply name substitutions across the name-bearing files
   # (now that the playground key is gone from .repo-template.yml).
   bootstrap::apply_name_substitutions "$target" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
     bootstrap::err "template-mirror: substitution step failed (rc=$step_rc); aborting stage"
+    return "$step_rc"
+  fi
+
+  # Step 5b: scaffold neutral consumer identity docs (#744). The rsync
+  # excluded BRAND.md + docs/agents/repository-overview.md (pure
+  # mergepath identity) and the four hub-only docs; this writes honest
+  # consumer stubs for the former and scrubs the AGENTS.md packaging
+  # note (packaging/ is a mergepath-only dir, also excluded). Runs AFTER
+  # substitution so the AGENTS.md scrub sees the substituted text.
+  bootstrap::_scaffold_consumer_identity "$target" || step_rc=$?
+  if [ "$step_rc" -ne 0 ]; then
+    bootstrap::err "template-mirror: consumer-identity scaffold failed (rc=$step_rc); aborting stage"
     return "$step_rc"
   fi
 
@@ -316,6 +369,82 @@ bootstrap::_reset_phase_4b_enabled() {
     return 1
   fi
   mv "$policy.bootstrap-tmp" "$policy"
+}
+
+# Scaffold neutral consumer identity docs and scrub mergepath-only
+# identity from shared docs (#744). The rsync excluded BRAND.md +
+# docs/agents/repository-overview.md (pure mergepath identity) and the
+# four hub-only docs; this writes honest consumer stubs for the two
+# excluded identity docs and removes the AGENTS.md "Repository Layout"
+# section that documents the mergepath-only `packaging/` dir. The mixed
+# doc .ai_context.md keeps its shared content — its one false line is
+# fixed at the mergepath source, so it flows through substitution
+# honestly and needs no consumer-side edit here.
+bootstrap::_scaffold_consumer_identity() {
+  local target=$1
+  local repo_name Repo_Name
+  repo_name=$(bootstrap_input repo_name)
+  Repo_Name=$(bootstrap::_titlecase_first "$repo_name")
+  local hub_url="https://github.com/nathanjohnpayne/mergepath"
+
+  if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
+    bootstrap::log "dry-run: would scaffold neutral BRAND.md + docs/agents/repository-overview.md and scrub the AGENTS.md 'Repository Layout' (packaging/) section in $target"
+    return 0
+  fi
+
+  # Neutral BRAND.md — a consumer's brand is its own product, not
+  # mergepath's hub surfaces. Frame the repo as a downstream consumer
+  # and invite the operator to replace this stub.
+  mkdir -p "$target"
+  cat > "$target/BRAND.md" <<EOF
+# $Repo_Name — brand vocabulary
+
+**$Repo_Name** is a downstream consumer of the [mergepath]($hub_url) AI-agent tooling template. mergepath is the reference implementation of the AI Agent Tooling Standard; **$Repo_Name is not** — it inherits mergepath's agent tooling (the review policy, CI checks, and bootstrap-provisioned workflows) via a one-time template bootstrap and, once enrolled as a sync consumer, ongoing propagation.
+
+This file is a stub. Replace it with $Repo_Name's own brand vocabulary — the product surfaces, naming, and terminology specific to this project.
+EOF
+
+  # Neutral repository overview — honest "consumer of mergepath" framing,
+  # no Playground / "reference implementation" claims.
+  mkdir -p "$target/docs/agents"
+  cat > "$target/docs/agents/repository-overview.md" <<EOF
+# Repository Overview
+
+**$Repo_Name** is a downstream **consumer** of the [mergepath]($hub_url) AI-agent tooling template. It inherits mergepath's agent tooling — the review policy, CI checks, and bootstrap-provisioned workflows — and is **not** the reference implementation of the AI Agent Tooling Standard (that is mergepath).
+
+Replace this section with a project-specific overview of $Repo_Name: its purpose, primary stack, and the agent's role in maintaining it. See \`BRAND.md\` for repo vocabulary.
+EOF
+
+  # Scrub the AGENTS.md "## Repository Layout" section: it exists solely
+  # to justify the mergepath-only `packaging/` dir (excluded from every
+  # consumer), so in a consumer it documents a directory that isn't
+  # there. Only act when the packaging marker is present, so an AGENTS.md
+  # that has legitimately reshaped this section is left untouched.
+  local agents="$target/AGENTS.md"
+  if [ -f "$agents" ] && grep -q "placeholder package scaffolds that reserve" "$agents"; then
+    if ! awk '
+      # Drop lines from the "## Repository Layout" heading up to (but not
+      # including) the next top-level "## " heading or EOF.
+      /^## Repository Layout[[:space:]]*$/ { drop=1; next }
+      drop && /^## / { drop=0 }
+      drop { next }
+      { print }
+    ' "$agents" > "$agents.bootstrap-tmp"; then
+      rm -f "$agents.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: failed to scrub the AGENTS.md Repository Layout section in $agents"
+      return 1
+    fi
+    # Fail closed if the packaging marker survived the scrub (the
+    # section was reshaped so the heading match missed it) — better to
+    # halt than ship an AGENTS.md documenting a non-existent dir.
+    if grep -q "placeholder package scaffolds that reserve" "$agents.bootstrap-tmp"; then
+      rm -f "$agents.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: AGENTS.md packaging note survived the Repository-Layout scrub (section reshaped upstream?); failing closed"
+      return 1
+    fi
+    mv "$agents.bootstrap-tmp" "$agents"
+    bootstrap::log "scrubbed the mergepath-only Repository Layout (packaging/) section from AGENTS.md"
+  fi
 }
 
 bootstrap::_rsync_template() {
