@@ -30,7 +30,7 @@ Repo-owned documentation is directly editable; generated and synced mirrors are 
 A direct edit here is overwritten on the next sync and breaks the mirror. Edit the canonical source and let the sync re-materialize it.
 
 - `docs/projects/<project>/prds/**` --- generated PRD mirrors (`sync_direction: central-to-repo`, header `do_not_edit: true`). Edit the canonical PRD in the `nathanjohnpayne/docs` repo at its `source:` path --- `projects/<project>/prds/<project>.md` (note: no `docs/` prefix on the central side), declared alongside the `mirror:` in `.mergepath-project-docs.yml`. `scripts/project-doc-sync.sh` materializes and `--audit`s these mirrors.
-- Template-propagated / canonical surfaces declared in `.mergepath-sync.yml` (scripts, workflows, and any propagated docs). On a consumer these are verbatim mirrors of Mergepath --- fix at the Mergepath source, never the consumer copy. See `docs/agents/templated-propagation.md`.
+- Template-propagated / canonical surfaces declared in Mergepath's propagation manifest (scripts, workflows, and any propagated docs). On a consumer these are verbatim mirrors of Mergepath --- fix at the Mergepath source, never the consumer copy. (The manifest `.mergepath-sync.yml` and the rendering engine `docs/agents/templated-propagation.md` live on Mergepath, not the consumer.)
 
 No CI check rejects a direct edit to a repo-owned `docs/**` file, and CodeRabbit's `docs/**` path review is advisory --- so a normal docs-only change to a repo-owned path is allowed and unblocked. The generated-mirror markers above are the guard: `tests/test_project_doc_sync.sh` asserts every materialized mirror carries them, and the mirror's own `do_not_edit:` header routes an editor to the canonical source.
 

@@ -417,15 +417,21 @@ remaining=$(grep -h -i "mergepath" "$TARGET/README.md" "$TARGET/SECURITY.md" \
   && pass "no residual 'mergepath' references in substituted name-bearing files" \
   || fail "residual 'mergepath' references found: $remaining"
 
-# --- assertion 4b: hub-only docs excluded (#744) ---
+# --- assertion 4b: hub-only MACHINERY docs excluded (#744) ---
 hub_leak=""
-for d in ai_agent_tooling_standard.md docs/agents/bootstrap-runbook.md \
+for d in docs/agents/bootstrap-runbook.md \
          docs/agents/propagation-ordering.md docs/agents/templated-propagation.md; do
   [ -e "$TARGET/$d" ] && hub_leak="$hub_leak $d"
 done
 [ -z "$hub_leak" ] \
-  && pass "hub-only docs excluded from the consumer mirror (#744)" \
-  || fail "hub-only docs leaked into consumer:$hub_leak"
+  && pass "hub-only machinery docs excluded from the consumer mirror (#744)" \
+  || fail "hub-only machinery docs leaked into consumer:$hub_leak"
+# ai_agent_tooling_standard.md is the methodology-neutral Standard the
+# consumer follows (not machinery, not name-substituted) — it must be
+# KEPT so README.md / .ai_context.md links stay live (Codex #746).
+[ -f "$TARGET/ai_agent_tooling_standard.md" ] \
+  && pass "ai_agent_tooling_standard.md kept in the consumer (Standard, not machinery)" \
+  || fail "ai_agent_tooling_standard.md was wrongly excluded from the consumer"
 
 # --- assertion 4c: AGENTS.md packaging/Repository-Layout scrub (#744) ---
 if [ -f "$TARGET/AGENTS.md" ]; then

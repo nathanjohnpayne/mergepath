@@ -149,10 +149,16 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   # Hub identity docs — do NOT duplicate mergepath's self-referential
   # hub identity into a consumer (#744). Two groups:
   #
-  #   * Hub-only docs describe machinery a consumer does not run
-  #     (sync-to-downstream.sh / .mergepath-sync.yml aren't even present
-  #     in a consumer, per the orchestrator excludes above). Copied
-  #     verbatim they'd read as if the consumer were the hub.
+  #   * Hub-only MACHINERY docs describe processes a consumer does not
+  #     run (the propagation wave, the bootstrap wizard, the templated-
+  #     render engine — sync-to-downstream.sh / .mergepath-sync.yml
+  #     aren't even present in a consumer, per the orchestrator excludes
+  #     above). Copied verbatim they'd read as if the consumer were the
+  #     hub. NB: ai_agent_tooling_standard.md is deliberately NOT here —
+  #     it is the methodology-neutral Standard the consumer FOLLOWS (it
+  #     correctly names mergepath as the reference implementation and is
+  #     not name-substituted, so it stays true in a consumer), and
+  #     README.md / .ai_context.md still link to it (Codex #746).
   #   * BRAND.md + docs/agents/repository-overview.md are 100% mergepath
   #     identity ("the reference implementation", the Playground/Cockpit/
   #     Tiebreaker/Checks surfaces). A lexical mergepath→<repo> swap
@@ -163,7 +169,6 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   #     substitute.sh. (The mixed doc .ai_context.md keeps its shared
   #     content and is fixed at the mergepath source, not here; the
   #     AGENTS.md packaging note is scrubbed in step 5b.)
-  'ai_agent_tooling_standard.md'
   'docs/agents/bootstrap-runbook.md'
   'docs/agents/propagation-ordering.md'
   'docs/agents/templated-propagation.md'
