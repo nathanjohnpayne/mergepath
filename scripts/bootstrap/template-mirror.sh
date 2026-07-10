@@ -2,24 +2,29 @@
 # scripts/bootstrap/template-mirror.sh — bootstrap wizard stage B.
 # Per #156 sub-B / #204.
 #
-# Responsibilities (in order):
+# Responsibilities (in dispatch order — matches the numbered Step
+# comments in bootstrap::stage_template_mirror):
 #   1. rsync mergepath's worktree into the new repo's target dir,
 #      honoring a curated exclude list that drops mergepath-only files
 #      (the playground spec, packaging/, internal screenshots, the
-#      hub-only docs, and the pure-identity BRAND.md / repository-
-#      overview.md, etc.).
+#      hub-only machinery docs, and the pure-identity BRAND.md /
+#      repository-overview.md, etc.).
 #   2. Remove post-rsync orphans the exclude list can't catch.
-#   3. Apply name substitutions across the documented name-bearing
-#      files (via scripts/bootstrap/substitute.sh).
-#   4. Drop mergepath-specific entries from the new repo's
+#   3. Drop mergepath-specific entries from the new repo's
 #      .repo-template.yml (the playground spec_test_map + the
-#      extra_top_level_dirs guard for mergepath/packaging).
-#   4b. Scaffold neutral consumer identity docs (#744): write honest
+#      extra_top_level_dirs guard for mergepath/packaging). Runs BEFORE
+#      substitution so the literal `mergepath_playground` key is still
+#      findable for yq's delete (#233).
+#   4. Apply name substitutions across the documented name-bearing
+#      files (via scripts/bootstrap/substitute.sh).
+#   5. Scaffold neutral consumer identity docs (#744): write honest
 #      "downstream consumer" stubs for the excluded BRAND.md +
 #      docs/agents/repository-overview.md, and scrub the AGENTS.md
 #      "Repository Layout" section that documents the mergepath-only
-#      packaging/ dir. Runs after substitution.
-#   5. Initialize the new repo's git history with a single
+#      packaging/ dir. Runs after substitution (dispatched as "Step 5b").
+#   6. Reset opt-in policy defaults the hub flipped for itself
+#      (phase_4b_automation.enabled → false, #628).
+#   7. Initialize the new repo's git history with a single
 #      "Initial commit (bootstrapped from mergepath)" commit.
 #
 # The cross-repo loop update (open a Mergepath-side PR adding the
