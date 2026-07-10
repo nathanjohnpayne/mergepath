@@ -896,6 +896,63 @@ else
   fail "Case 29 unexpected (rc=$rc): $out"
 fi
 
+# --- denylist bypass hardening (#745 Codex P2 ×3) -------------------
+
+# Case 30: "./BRAND.md" spelling must not slip past the raw compare —
+# normalization folds it to BRAND.md → FAIL.
+MANIFEST_ID_DOTSLASH="$MIN_HEADER
+  - path: ./BRAND.md
+    type: canonical
+    consumers: all
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_ID_DOTSLASH" "BRAND.md"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "'BRAND.md' is a per-repo-owned identity/hub-only doc" && \
+   echo "$out" | grep -q "#743"; then
+  pass "Case 30: './BRAND.md' spelling normalized + fails closed (#745)"
+else
+  fail "Case 30 unexpected (rc=$rc): $out"
+fi
+
+# Case 31: a templated entry whose SOURCE is the denied doc itself
+# (path: BRAND.md, no dest → renders .dest//.path = BRAND.md from
+# mergepath's own BRAND.md) must FAIL — it is not the escape hatch.
+MANIFEST_ID_TPL_SRC="$MIN_HEADER
+  - path: BRAND.md
+    type: templated
+    consumers: all
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_ID_TPL_SRC" "BRAND.md"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "templated entry uses the identity/hub-only doc 'BRAND.md' as its source" && \
+   echo "$out" | grep -q "#743"; then
+  pass "Case 31: templated-from-the-identity-doc-itself fails closed (#745)"
+else
+  fail "Case 31 unexpected (rc=$rc): $out"
+fi
+
+# Case 32: a repo-root kit (path: .) mirrors every tracked file, so it
+# carries every denied doc → FAIL (repo-root-kit).
+MANIFEST_ID_ROOTKIT="$MIN_HEADER
+  - path: .
+    type: kit
+    consumers: all
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_ID_ROOTKIT" "."); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "repo-root-kit" && \
+   echo "$out" | grep -q "#743"; then
+  pass "Case 32: repo-root kit (path: .) fails closed as containing every denied doc (#745)"
+else
+  fail "Case 32 unexpected (rc=$rc): $out"
+fi
+
 echo
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -gt 0 ]; then
