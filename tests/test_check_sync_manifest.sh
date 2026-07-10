@@ -818,6 +818,84 @@ else
   fail "Case 25 unexpected (rc=$rc): $out"
 fi
 
+# --- identity/hub-only-doc denylist (#743) --------------------------
+# A per-repo-owned identity doc or hub-only doc must never be a verbatim
+# canonical/kit manifest entry — directly, via dest:, or inside a kit
+# dir. templated is the one exempt escape hatch.
+
+# Case 26: canonical BRAND.md → FAIL citing #743.
+MANIFEST_ID_CANON="$MIN_HEADER
+  - path: BRAND.md
+    type: canonical
+    consumers: all
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_ID_CANON" "BRAND.md"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "'BRAND.md' is a per-repo-owned identity/hub-only doc" && \
+   echo "$out" | grep -q "#743"; then
+  pass "Case 26: canonical identity doc (BRAND.md) fails closed citing #743"
+else
+  fail "Case 26 unexpected (rc=$rc): $out"
+fi
+
+# Case 27: kit dir CONTAINING a denied doc → FAIL (kit-contains).
+MANIFEST_ID_KIT="$MIN_HEADER
+  - path: docs/agents/
+    type: kit
+    consumers: all
+"
+PATHS_ID_KIT="docs/agents/
+docs/agents/repository-overview.md"
+set +e
+out=$(run_with_fixture "$MANIFEST_ID_KIT" "$PATHS_ID_KIT"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "'docs/agents/repository-overview.md' is a per-repo-owned identity/hub-only doc" && \
+   echo "$out" | grep -q "kit-contains" && \
+   echo "$out" | grep -q "#743"; then
+  pass "Case 27: kit dir containing an identity doc fails closed (kit-contains, #743)"
+else
+  fail "Case 27 unexpected (rc=$rc): $out"
+fi
+
+# Case 28: templated dest onto a denied doc → PASS (escape hatch).
+MANIFEST_ID_TPL="$MIN_HEADER
+  - path: examples/brand.md
+    source: examples/brand.md
+    dest: BRAND.md
+    type: templated
+    consumers: all
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_ID_TPL" "examples/brand.md"); rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "check_sync_manifest: PASS"; then
+  pass "Case 28: templated render onto an identity doc is exempt (escape hatch)"
+else
+  fail "Case 28 unexpected (rc=$rc): $out"
+fi
+
+# Case 29: canonical entry that REMAPS its dest onto a denied doc → FAIL
+# (direct match on the effective dest, not the source path).
+MANIFEST_ID_DEST="$MIN_HEADER
+  - path: docs/brand-source.md
+    dest: BRAND.md
+    type: canonical
+    consumers: all
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_ID_DEST" "docs/brand-source.md"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "'BRAND.md' is a per-repo-owned identity/hub-only doc" && \
+   echo "$out" | grep -q "#743"; then
+  pass "Case 29: canonical dest remapped onto an identity doc fails closed (#743)"
+else
+  fail "Case 29 unexpected (rc=$rc): $out"
+fi
+
 echo
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -gt 0 ]; then

@@ -23,6 +23,13 @@
 #      surfaced as #264 on the original wave (check_gh_as_author
 #      hard-required tests/test_gh_pr_guard.sh, which was not in
 #      the manifest, so every consumer's lint job failed in pre-flight).
+#   8. No per-repo-owned identity doc or hub-only doc appears as a
+#      verbatim `type: canonical` or `type: kit` entry (#743) —
+#      directly, via a remapped `dest:`, or by sitting inside a kit
+#      directory. These are customized by every consumer (or describe
+#      hub machinery a consumer doesn't run), so a verbatim mirror
+#      would clobber the consumer's copy on the next wave.
+#      `type: templated` is the one exempt escape hatch.
 #
 # This check is read-only and does NOT contact downstream repos —
 # that's the audit script's job and is too slow for CI.
@@ -223,6 +230,41 @@ fi
 # Build a set of valid consumer names for cross-check
 valid_consumers=$(yq -r '.consumers[].name' "$MANIFEST" | tr '\n' ',')
 
+# 8. Per-repo-owned identity / hub-only docs must never be verbatim
+#    canonical/kit manifest entries (#743). Two categories, one rule:
+#
+#    * Per-repo-owned identity/agent docs — every consumer customizes
+#      these at bootstrap (BRAND.md's brand narrative, .ai_context.md's
+#      system overview, repository-overview.md, the AGENTS.md
+#      repository-layout section, README/SECURITY, and the two "Replace
+#      this section" stub docs). A verbatim mirror would clobber a
+#      consumer's own identity on the next wave — exactly the content
+#      the gaycruisebingo scrub had to remove (#744).
+#    * Hub-only docs — describe machinery a consumer does not run
+#      (`sync-to-downstream.sh` / `.mergepath-sync.yml` aren't even
+#      present in a consumer). They must not be verbatim-mirrored either.
+#
+#    The rule: none of these may appear as a `type: canonical` or
+#    `type: kit` entry — directly, via a remapped `dest:`, or by sitting
+#    inside a kit directory. If one ever genuinely must be shared, it
+#    MUST be `type: templated` (rendered per-consumer with facts), never
+#    verbatim. This is the propagation-side invariant; bootstrap-time
+#    scaffolding of neutral consumer copies is the separate #744 concern.
+IDENTITY_DOCS_DENYLIST=(
+  README.md
+  BRAND.md
+  .ai_context.md
+  SECURITY.md
+  AGENTS.md
+  docs/agents/repository-overview.md
+  docs/agents/testing-requirements.md
+  docs/agents/code-modification-rules.md
+  ai_agent_tooling_standard.md
+  docs/agents/bootstrap-runbook.md
+  docs/agents/propagation-ordering.md
+  docs/agents/templated-propagation.md
+)
+
 # 4-6. path entries.
 # Same fail-closed treatment as the consumers extraction above:
 # assert `.paths` is a sequence (a scalar `paths:` value would let
@@ -391,6 +433,32 @@ while IFS='|' read -r path type consumers dest source has_dest has_source has_pa
       FAILED=1
       ;;
   esac
+
+  # 8: identity/hub-only-doc denylist (#743). A `canonical` or `kit`
+  #    entry must not mirror a per-repo-owned identity doc or a hub-only
+  #    doc — directly, via `dest:`, or by containing it in a kit dir.
+  #    `templated` is the only acceptable shared form and is exempt.
+  if [ "$type" = "canonical" ] || [ "$type" = "kit" ]; then
+    effective_dest="${dest:-$path}"
+    for denied in "${IDENTITY_DOCS_DENYLIST[@]}"; do
+      denied_hit=""
+      if [ "$path" = "$denied" ] || [ "$effective_dest" = "$denied" ]; then
+        denied_hit="direct"
+      elif [ "$type" = "kit" ]; then
+        # A kit propagates the whole directory, so a denied file living
+        # inside the kit's source dir (or its remapped dest dir) travels
+        # too and would clobber the consumer's copy. Match by prefix.
+        case "$denied/" in
+          "${path%/}/"* | "${effective_dest%/}/"*) denied_hit="kit-contains" ;;
+        esac
+      fi
+      if [ -n "$denied_hit" ]; then
+        echo "FAIL: '$denied' is a per-repo-owned identity/hub-only doc and must not be a verbatim '$type' manifest entry ($denied_hit match on '$path'; #743) — every consumer customizes it, so a canonical/kit mirror would clobber the consumer's copy on the next propagation wave. If it genuinely must be shared, use 'type: templated'."
+        FAILED=1
+        break
+      fi
+    done
+  fi
 
   # 4c: existence-check source override. If `source:` is set
   # (currently only meaningful for templated entries with source ≠
