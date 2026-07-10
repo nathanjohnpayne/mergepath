@@ -11,6 +11,27 @@
 # substitution rules for templated docs) land in later layers.
 #
 # ─────────────────────────────────────────────────────────────────────
+# Per-repo identity / hub-only docs are OUT (invariant, #743)
+# ─────────────────────────────────────────────────────────────────────
+#
+# Per-repo-owned identity/agent docs — README.md, BRAND.md,
+# .ai_context.md, SECURITY.md, AGENTS.md, and docs/agents/{repository-
+# overview,testing-requirements,code-modification-rules}.md — and the
+# hub-only docs (ai_agent_tooling_standard.md, docs/agents/{bootstrap-
+# runbook,propagation-ordering,templated-propagation}.md) are
+# DELIBERATELY absent from this manifest, and must STAY absent as
+# verbatim `type: canonical`/`type: kit` entries. Every consumer
+# customizes the identity docs (its own brand narrative, system
+# overview, repo-layout section); the hub-only docs describe machinery
+# a consumer doesn't run. A verbatim mirror would clobber a consumer's
+# corrected copy on the next wave — the exact content the gaycruisebingo
+# scrub had to remove (#744). If one of these ever genuinely must be
+# shared, it MUST be `type: templated` (rendered per-consumer with
+# facts), never verbatim. This invariant is ENFORCED by
+# scripts/ci/check_sync_manifest (check 8) — a canonical/kit entry for
+# any denylisted path fails the check.
+#
+# ─────────────────────────────────────────────────────────────────────
 # `requires:` — propagation closure invariant (#264)
 # ─────────────────────────────────────────────────────────────────────
 #
