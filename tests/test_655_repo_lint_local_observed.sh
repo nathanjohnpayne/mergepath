@@ -482,8 +482,21 @@ assert_grep "agent-review: null statusCheckRollup pages use an empty cursor (#65
   "$W/agent-review.yml" 'statusCheckRollup.contexts.pageInfo.endCursor // ""'
 assert_grep "agent-review: the pagination loop checks hasNextPage and accumulates entries across pages (#655 round 12)" \
   "$W/agent-review.yml" 'pageInfo { hasNextPage endCursor }'
-assert_grep "agent-review: accumulates each page's contexts into the running rollup array (#655 round 12)" \
-  "$W/agent-review.yml" 'rollup_contexts=$(jq -c -n --argjson a "$rollup_contexts" --argjson b "$page_nodes"'
+# The accumulator still folds each page into the running rollup array
+# (the #655 round 12 intent), but #752 changed HOW: the running total used
+# to be handed back to jq as an ARGV value (`--argjson a
+# "$rollup_contexts"`), and Linux caps a SINGLE execve argument at
+# MAX_ARG_STRLEN (~128KB) independently of the much larger total ARG_MAX.
+# Once the accumulator crossed that ceiling on a later page jq never
+# started: rc=126, "Argument list too long" (#750, reproduced downstream on
+# gaycruisebingo PR #495). This job runs on ubuntu-latest, exactly where
+# that bites. The pin below tracks the stdin-slurp form, and the paired
+# absence assertion is the revert-net — the same shape #750 used for the
+# codex-review-check.sh and admin-merge-codeowners-blocked.sh copies.
+assert_grep "agent-review: accumulates each page's contexts into the running rollup array (#655 round 12, #752)" \
+  "$W/agent-review.yml" "rollup_contexts=\$(printf '%s\\n%s\\n' \"\$rollup_contexts\" \"\$page_nodes\" | jq -c -s 'add')"
+assert_not_grep "agent-review: does not accumulate the rollup through an unbounded --argjson argv value (#752)" \
+  "$W/agent-review.yml" 'rollup_contexts=$(jq -c -n --argjson a "$rollup_contexts"'
 
 # Codex P2 (#655 round 12, "honor GitHub Actions branch glob semantics",
 # found on the codex-review-check.sh copy and mirrored here): GitHub docs
