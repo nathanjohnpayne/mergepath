@@ -709,7 +709,16 @@ while :; do
     }' -f owner="$REPO_OWNER" -f name="$REPO_NAME" -F number="$PR_NUMBER" "${ROLLUP_CURSOR_ARGS[@]}") \
     || die 3 "failed to fetch statusCheckRollup page (see stderr above for retry diagnostics)"
   ROLLUP_PAGE_NODES=$(echo "$ROLLUP_PAGE" | jq -c '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes // [])')
-  ROLLUP_CONTEXTS=$(jq -c -n --argjson a "$ROLLUP_CONTEXTS" --argjson b "$ROLLUP_PAGE_NODES" '$a + $b')
+  # #497: concatenate via stdin, not argv. ROLLUP_CONTEXTS accumulates
+  # every check-run across all pages, and a Phase 4 PR's check-run set
+  # (many workflow jobs / matrix runs) is large enough that the running
+  # total, passed as a --argjson VALUE, exceeds the ubuntu-runner
+  # single-argument length ceiling (MAX_ARG_STRLEN, ~128KB) on a later
+  # page — jq then dies rc=126 "Argument list too long" (observed
+  # deterministically on PR #495; macOS's much larger ARG_MAX masked it
+  # locally). `jq -s` slurps both JSON arrays from stdin instead, which
+  # has no such ceiling.
+  ROLLUP_CONTEXTS=$(printf '%s\n%s\n' "$ROLLUP_CONTEXTS" "$ROLLUP_PAGE_NODES" | jq -c -s 'add')
   ROLLUP_HAS_NEXT=$(echo "$ROLLUP_PAGE" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage // false)')
   ROLLUP_CURSOR=$(echo "$ROLLUP_PAGE" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor // "")')
   [ "$ROLLUP_HAS_NEXT" = "true" ] || break

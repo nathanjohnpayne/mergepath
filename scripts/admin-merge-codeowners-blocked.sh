@@ -257,7 +257,13 @@ for ref in "$@"; do
     fi
     page_nodes=$(printf '%s' "$rollup_page" | jq -c "(${rollup_base}.nodes // [])" 2>/dev/null) \
       || { rollup_ok=0; break; }
-    rollup_contexts=$(jq -c -n --argjson a "$rollup_contexts" --argjson b "$page_nodes" '$a + $b' 2>/dev/null) \
+    # #497: concatenate via stdin, not argv — same unbounded-argv-JSON bug
+    # as codex-review-check.sh's rollup fetch, and this loop is MORE
+    # exposed to it: >100 contexts is the NORMAL state for the long-lived
+    # CODEOWNERS-deadlocked PRs this helper targets, so rollup_contexts
+    # routinely grows past the ubuntu-runner single-argument length
+    # ceiling (MAX_ARG_STRLEN, ~128KB) that a --argjson VALUE hits.
+    rollup_contexts=$(printf '%s\n%s\n' "$rollup_contexts" "$page_nodes" | jq -c -s 'add' 2>/dev/null) \
       || { rollup_ok=0; break; }
     has_next=$(printf '%s' "$rollup_page" | jq -r "(${rollup_base}.pageInfo.hasNextPage // false)" 2>/dev/null) || has_next=false
     next_cursor=$(printf '%s' "$rollup_page" | jq -r "(${rollup_base}.pageInfo.endCursor // \"\")" 2>/dev/null) || next_cursor=""
