@@ -1254,6 +1254,78 @@ else
   fail "end-to-end (Finding 2 sanity): expected the unrelated workflow scan to only see its own entry, got $GOT"
 fi
 
+# ── Oversized rollup accumulation (#750) ────────────────────────────
+#
+# Gate (a)'s Relay pagination loop folds each page of statusCheckRollup
+# contexts into a running total. It used to do that by handing the total
+# back to jq as an ARGV value (`--argjson a "$ROLLUP_CONTEXTS"`). Linux
+# caps a SINGLE execve argument at MAX_ARG_STRLEN (~128KB), independently
+# of the much larger total ARG_MAX, so once the accumulator crossed that
+# ceiling on a later page jq never started: rc=126, "Argument list too
+# long", and gate (a) hard-failed. Observed deterministically downstream
+# on gaycruisebingo PR #495; macOS's ~1MB per-argument ceiling masked it
+# on every local run, which is exactly why fixture-sized tests missed it.
+#
+# The tests below are deliberately BEHAVIORAL rather than a copy of the
+# fixed line: the accumulator statement is EXTRACTED from the real script
+# and executed against a payload an order of magnitude past the ceiling.
+# A revert to the argv form is therefore caught by actually reproducing
+# rc=126 on Linux, not merely by a text match. The structural assertion
+# that follows adds a portable second net so the same revert also fails
+# on a macOS dev machine, where the behavioral half cannot fail.
+echo ""
+echo "Oversized rollup accumulation — gate (a) survives a >128KB running total (#750)"
+
+# Deliberately form-AGNOSTIC (`ROLLUP_CONTEXTS=$(` rather than the fixed
+# `printf` form): the point is to execute whatever the script actually does
+# today, so a revert to the argv form is run and reproduces rc=126 on Linux
+# rather than silently skipping the behavioral case. `|| ACC_STMT=""` keeps
+# a no-match from aborting the suite, so it reports as a normal FAIL.
+ACC_STMT=$(grep -E '^[[:space:]]*ROLLUP_CONTEXTS=\$\(' "$SCRIPT" | head -1) || ACC_STMT=""
+if [ -z "$ACC_STMT" ]; then
+  fail "oversized rollup: could not extract the gate (a) accumulator statement from $SCRIPT"
+else
+  ACC_SCRATCH=$(mktemp -d)
+  # Build both operands INSIDE the harness. Passing a >128KB payload in as
+  # an argument would hit the very ceiling under test and fail the harness
+  # rather than the code.
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo "ROLLUP_CONTEXTS=\$(jq -cn '[range(6000) | {name: \"check-\\(.)\", workflowName: \"workflow-name-padding-\\(.)\", status: \"COMPLETED\", conclusion: \"SUCCESS\"}]')"
+    echo "ROLLUP_PAGE_NODES=\$(jq -cn '[range(3) | {name: \"page2-check-\\(.)\", status: \"COMPLETED\", conclusion: \"SUCCESS\"}]')"
+    # Self-validating: if the fixture ever shrinks below the ceiling this
+    # test silently stops covering the bug, so assert the precondition.
+    echo 'if [ "${#ROLLUP_CONTEXTS}" -le 131072 ]; then echo "FIXTURE-TOO-SMALL:${#ROLLUP_CONTEXTS}"; exit 9; fi'
+    echo "$ACC_STMT"
+    echo 'printf "%s" "$ROLLUP_CONTEXTS" | jq -r "length"'
+  } > "$ACC_SCRATCH/acc.sh"
+
+  ACC_OUT=$(bash "$ACC_SCRATCH/acc.sh" 2>&1) && ACC_RC=0 || ACC_RC=$?
+  rm -rf "$ACC_SCRATCH"
+
+  if [ "$ACC_RC" -eq 0 ] && [ "$ACC_OUT" = "6003" ]; then
+    pass "oversized rollup: the real gate (a) accumulator folds a >128KB running total plus a new page into 6003 contexts (no rc=126)"
+  elif [ "$ACC_RC" -eq 126 ] || grep -q 'Argument list too long' <<<"$ACC_OUT"; then
+    fail "oversized rollup: the gate (a) accumulator died with the #750 'Argument list too long' failure (rc=$ACC_RC) — the argv form is back"
+  else
+    fail "oversized rollup: gate (a) accumulator did not produce 6003 contexts (rc=$ACC_RC, output: $ACC_OUT)"
+  fi
+fi
+
+# Portable revert-net: pins the stdin-slurp form and forbids the argv form
+# on the accumulator line, so a regression is caught on macOS too (where
+# the behavioral test above passes either way). Comments are stripped
+# first — the fix's own explanatory comment names the old --argjson form,
+# and that mention must not read as the code still using it.
+SCRIPT_CODE=$(grep -vE '^[[:space:]]*#' "$SCRIPT")
+if grep -Eq "ROLLUP_CONTEXTS=\\\$\(printf .* \| jq -c -s 'add'\)" <<<"$SCRIPT_CODE" \
+   && ! grep -Eq 'ROLLUP_CONTEXTS=\$\(jq .*--argjson' <<<"$SCRIPT_CODE"; then
+  pass "oversized rollup: gate (a) concatenates pages over stdin (jq -s), not through an unbounded --argjson argv value"
+else
+  fail "oversized rollup: gate (a)'s accumulator is not the stdin-slurp form — an argv --argjson accumulator reintroduces #750"
+fi
+
 echo ""
 echo "test_codex_review_check_required_checks: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

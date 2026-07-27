@@ -246,6 +246,86 @@ else
   echo "  FAIL: Gate 2 still uses (or no longer pages away from) the truncating rollup read" >&2
 fi
 
+# ─────────────────────────────────────────────────────────────────────
+# Test 4: oversized rollup accumulation (#750) — Gate 2's pagination
+# loop survives a running total past Linux's single-argument ceiling.
+#
+# The #691 loop above folded each page into the running total by handing
+# that total back to jq as an ARGV value (`--argjson a "$rollup_contexts"`).
+# Linux caps a SINGLE execve argument at MAX_ARG_STRLEN (~128KB),
+# independently of the far larger total ARG_MAX, so once the accumulator
+# crossed the ceiling on a later page jq never started: rc=126, "Argument
+# list too long", and Gate 2 fell to its fail-closed `rollup_ok=0` path —
+# refusing every merge it was built to unblock. This helper is the MOST
+# exposed of the three copies of that accumulator: >100 rollup contexts is
+# the NORMAL state for the long-lived CODEOWNERS-deadlocked PRs it targets,
+# so the total routinely grows past the ceiling. Observed deterministically
+# downstream on gaycruisebingo PR #495; macOS's ~1MB per-argument ceiling
+# masked it locally, which is why the fixture-sized cases above missed it.
+#
+# Behavioral, not a copy of the fixed line: the accumulator statement is
+# EXTRACTED from the real script and run against a payload an order of
+# magnitude past the ceiling, so a revert reproduces rc=126 on Linux. The
+# structural half adds a portable net for macOS dev machines, where the
+# behavioral half cannot fail.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 4: oversized rollup accumulation — Gate 2 survives a >128KB running total (#750)"
+
+# Deliberately form-AGNOSTIC (`rollup_contexts=$(` rather than the fixed
+# `printf` form): the point is to execute whatever the script actually does
+# today, so a revert to the argv form is run and reproduces rc=126 on Linux
+# rather than silently skipping the behavioral case. Take only the
+# assignment itself; the real statement continues onto a
+# `|| { rollup_ok=0; break; }` line whose `break` is invalid outside a loop.
+# `|| ACC_STMT=""` keeps a no-match from aborting the suite under `set -e`
+# (pipefail makes the failed grep fail the whole assignment) so the
+# extraction failure reports as a normal FAIL below.
+ACC_STMT=$(grep -E '^[[:space:]]*rollup_contexts=\$\(' "$SCRIPT" | head -1 | sed 's/[[:space:]]*\\$//') || ACC_STMT=""
+if [ -z "$ACC_STMT" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: could not extract the Gate 2 accumulator statement from $SCRIPT" >&2
+else
+  # Both operands are built INSIDE the harness: passing a >128KB payload in
+  # as an argument would hit the very ceiling under test and fail the
+  # harness rather than the code.
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -euo pipefail'
+    echo "rollup_contexts=\$(jq -cn '[range(6000) | {name: \"check-\\(.)\", workflowName: \"workflow-name-padding-\\(.)\", status: \"COMPLETED\", conclusion: \"SUCCESS\"}]')"
+    echo "page_nodes=\$(jq -cn '[range(3) | {name: \"page2-check-\\(.)\", status: \"COMPLETED\", conclusion: \"SUCCESS\"}]')"
+    # Self-validating: if the fixture ever shrinks below the ceiling this
+    # test silently stops covering the bug, so assert the precondition.
+    echo 'if [ "${#rollup_contexts}" -le 131072 ]; then echo "FIXTURE-TOO-SMALL:${#rollup_contexts}"; exit 9; fi'
+    echo "$ACC_STMT"
+    echo 'printf "%s" "$rollup_contexts" | jq -r "length"'
+  } > "$SCRATCH/acc.sh"
+
+  ACC_OUT=$(bash "$SCRATCH/acc.sh" 2>&1) && ACC_RC=0 || ACC_RC=$?
+  if [ "$ACC_RC" -eq 0 ] && [ "$ACC_OUT" = "6003" ]; then
+    pass=$((pass + 1))
+    echo "  PASS: the real Gate 2 accumulator folds a >128KB running total plus a new page into 6003 contexts (no rc=126)"
+  elif [ "$ACC_RC" -eq 126 ] || grep -q 'Argument list too long' <<<"$ACC_OUT"; then
+    fail=$((fail + 1))
+    echo "  FAIL: Gate 2's accumulator died with the #750 'Argument list too long' failure (rc=$ACC_RC) — the argv form is back" >&2
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: Gate 2's accumulator did not produce 6003 contexts (rc=$ACC_RC, output: $ACC_OUT)" >&2
+  fi
+fi
+
+# Portable revert-net. SCRIPT_CODE (comment-stripped) is reused from Test 3
+# so the fix's own explanatory comment, which names the old --argjson form,
+# does not read as the code still using it.
+if grep -Eq "rollup_contexts=\\\$\(printf .* \| jq -c -s 'add'" <<<"$SCRIPT_CODE" \
+   && ! grep -Eq 'rollup_contexts=\$\(jq .*--argjson' <<<"$SCRIPT_CODE"; then
+  pass=$((pass + 1))
+  echo "  PASS: Gate 2 concatenates pages over stdin (jq -s), not through an unbounded --argjson argv value"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: Gate 2's accumulator is not the stdin-slurp form — an argv --argjson accumulator reintroduces #750" >&2
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "test_admin_merge_codeowners_blocked: PASS ($pass tests)"
