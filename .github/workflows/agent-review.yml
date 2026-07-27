@@ -1718,7 +1718,20 @@ jobs:
                   }
                 }' -f owner="$repo_owner" -f name="$repo_name" -F number="$PR_NUMBER" "${cursor_args[@]}")
               page_nodes=$(echo "$page_json" | jq -c '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes // [])')
-              rollup_contexts=$(jq -c -n --argjson a "$rollup_contexts" --argjson b "$page_nodes" '$a + $b')
+              # #752 (follow-up to #497/#750, same fix as the
+              # codex-review-check.sh and admin-merge-codeowners-blocked.sh
+              # copies): concatenate via stdin, not argv. rollup_contexts
+              # accumulates every check-run across all pages, and a Phase 4
+              # PR's check-run set (many workflow jobs / matrix runs) is
+              # large enough that the running total, passed as a --argjson
+              # VALUE, exceeds the ubuntu-runner single-argument length
+              # ceiling (MAX_ARG_STRLEN, ~128KB) on a later page — jq then
+              # dies rc=126 "Argument list too long" (observed
+              # deterministically on PR #495; macOS's much larger ARG_MAX
+              # masked it locally). This job runs on ubuntu-latest, which is
+              # exactly where that ceiling bites. `jq -s` slurps both JSON
+              # arrays from stdin instead, which has no such ceiling.
+              rollup_contexts=$(printf '%s\n%s\n' "$rollup_contexts" "$page_nodes" | jq -c -s 'add')
               has_next=$(echo "$page_json" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage // false)')
               cursor=$(echo "$page_json" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor // "")')
               [ "$has_next" = "true" ] || break
