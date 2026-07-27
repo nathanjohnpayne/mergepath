@@ -74,7 +74,7 @@ jobs:
       reviewers: ${{ steps.config.outputs.reviewers }}
       author_identity: ${{ steps.config.outputs.author_identity }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Explicit-token gh / github-script only, no authenticated git, so
           # don't leave the checkout token in .git/config (#548 / Codex #550).
@@ -143,7 +143,7 @@ jobs:
       needs_external: ${{ steps.check.outputs.needs_external }}
     steps:
       - name: Checkout trusted workflow helpers
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This job shells out only to trusted default-branch helpers; never
           # run helper code from the PR head under the label-writing PAT.
@@ -447,7 +447,7 @@ jobs:
     if: github.event_name == 'pull_request_review'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Explicit-token gh / github-script only, no authenticated git, so
           # don't leave the checkout token in .git/config (#548 / Codex #550).
@@ -558,7 +558,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Dismiss self-approval from reviewer bot accounts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Explicit-token github-script only, no authenticated git, so don't
           # leave the checkout token in .git/config (#548 / Codex #550).
@@ -704,7 +704,7 @@ jobs:
       !contains(github.event.pull_request.labels.*.name, 'human-hold')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Explicit-token gh merge path only, no authenticated git, so don't
           # leave the checkout token in .git/config (#548 / Codex #550).

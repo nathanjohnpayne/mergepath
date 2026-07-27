@@ -153,7 +153,7 @@ jobs:
       )
     steps:
       - name: Checkout repo (for codex-review-check.sh)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # SECURITY: pin to the default branch so we always run the
           # TRUSTED copy of scripts/codex-review-check.sh — never the
@@ -465,7 +465,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo (for codex-review-check.sh)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # Schedule events have no PR context, so default GITHUB_REF
           # is the default branch already — pin explicitly for
