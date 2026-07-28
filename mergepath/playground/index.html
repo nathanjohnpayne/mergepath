@@ -640,6 +640,11 @@
     border-radius: var(--radius-xl);
     width: 560px;
     max-width: calc(100vw - 48px);
+    /* Short/mobile viewports: cap the dialog and let .m-body scroll so the
+       hint and Close/Copy actions stay reachable. */
+    max-height: calc(100vh - 48px);
+    display: flex;
+    flex-direction: column;
     box-shadow: 0 24px 60px rgba(0, 0, 0, 0.2);
     overflow: hidden;
   }
@@ -653,7 +658,14 @@
     padding: 8px 24px 6px;
     color: var(--muted);
     font-size: 13px;
+    /* The one flexible child of the flex-column dialog: shrink and scroll
+       when the viewport is shorter than the content. */
+    min-height: 0;
+    overflow-y: auto;
   }
+  .modal h3,
+  .modal .hint,
+  .modal .m-actions { flex-shrink: 0; }
   .modal .m-body p { margin: 8px 0; }
   .modal .m-body ol.m-steps {
     margin: 14px 0 4px;
@@ -707,14 +719,17 @@
     cursor: pointer;
   }
   .modal pre.cmd .copy:hover { background: rgba(255, 255, 255, 0.18); }
-  /* Public-repo loader row (#732) */
+  /* Public-repo loader row (#732). minmax(0, 1fr) + min-width: 0 let the
+     slug track shrink below its intrinsic width so the count/Load controls
+     never get clipped by the dialog's overflow on narrow viewports. */
   .modal .repo-row {
     display: grid;
-    grid-template-columns: 1fr 72px auto;
+    grid-template-columns: minmax(0, 1fr) 72px auto;
     gap: 8px;
     margin: 12px 0 4px;
   }
   .modal .repo-row input {
+    min-width: 0;
     min-height: 38px;
     padding: 8px 12px;
     border-radius: var(--radius-sm);
@@ -1526,23 +1541,35 @@
     const headers = { Accept: 'application/vnd.github+json' };
 
     // 1 request: recent closed PRs (the list endpoint has no additions/paths).
+    // state=closed includes closed-unmerged PRs, so a page of exactly n can
+    // yield fewer than n merged even when older merged PRs exist. Over-fetch
+    // candidates (3n, capped at 100 — still ONE list request) and slice the
+    // merged results to n, keeping the 1 + at-most-n /files request budget.
+    const perPage = Math.min(100, 3 * n);
     const listRes = await fetch(
-      base + '/repos/' + owner + '/' + repo + '/pulls?state=closed&per_page=' + n +
+      base + '/repos/' + owner + '/' + repo + '/pulls?state=closed&per_page=' + perPage +
       '&sort=updated&direction=desc',
       { headers });
     if (listRes.status === 404) throw new Error('Repo not found or private');
     if (listRes.status === 403) throw new Error(rateLimitMsg(listRes));
     if (!listRes.ok) throw new Error('GitHub ' + listRes.status);
     const listBody = await listRes.json();
-    const merged = (Array.isArray(listBody) ? listBody : []).filter(pr => pr && pr.merged_at);
+    const merged = (Array.isArray(listBody) ? listBody : [])
+      .filter(pr => pr && pr.merged_at)
+      .slice(0, n);
 
-    // N requests: /files yields BOTH paths and additions/deletions.
+    // N requests: /files yields BOTH paths and additions/deletions. A /files
+    // failure mid-sequence (e.g. the rate limit exhausting partway through)
+    // ABORTS the whole load — the caller keeps the existing view rather than
+    // silently replacing it with a partial subset that would misrepresent
+    // the repo's routing mix.
     const prs = [];
     for (const pr of merged) {
       const filesRes = await fetch(
         base + '/repos/' + owner + '/' + repo + '/pulls/' + pr.number + '/files?per_page=100',
         { headers });
-      if (!filesRes.ok) continue;               // skip a PR we can't size
+      if (filesRes.status === 403) throw new Error(rateLimitMsg(filesRes));
+      if (!filesRes.ok) throw new Error('GitHub ' + filesRes.status + ' on #' + pr.number + ' files');
       const filesBody = await filesRes.json();  // one page; >100-file PRs truncate
       const files = Array.isArray(filesBody) ? filesBody : [];
       // Author detection mirrors scripts/policy-sim.sh: Authoring-Agent:

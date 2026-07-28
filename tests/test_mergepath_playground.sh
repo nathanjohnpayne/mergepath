@@ -355,7 +355,8 @@ let msg403 = '';
 try { await loadPublicRepo('octo/limited', 5); } catch (e) { msg403 = String(e.message); }
 if (!/rate limit/i.test(msg403)) fail('403 rate-limit message wrong: ' + msg403);
 
-// 4. Happy path: merged filter, /files aggregation, author precedence.
+// 4. Happy path: merged filter, /files aggregation, author precedence. The
+//    list request over-fetches 3×n candidates (closed ≠ merged) in ONE call.
 __queue(200, [
   { number: 7, title: 'Fix a', merged_at: '2026-01-01T00:00:00Z',
     body: 'Body\nAuthoring-Agent: claude\n', user: { login: 'someone' } },
@@ -370,7 +371,7 @@ __queue(200, [{ filename: 'docs/readme.md', additions: 10, deletions: 5 }]);
 const mark = __fetchLog.length;
 const got = await loadPublicRepo('octo/demo', 5);
 if (__fetchLog.length - mark !== 3) fail('expected 1 list + 2 /files requests, got ' + (__fetchLog.length - mark));
-if (!/\/repos\/octo\/demo\/pulls\?state=closed&per_page=5&sort=updated&direction=desc$/.test(__fetchLog[mark]))
+if (!/\/repos\/octo\/demo\/pulls\?state=closed&per_page=15&sort=updated&direction=desc$/.test(__fetchLog[mark]))
   fail('list URL wrong: ' + __fetchLog[mark]);
 if (!/\/repos\/octo\/demo\/pulls\/7\/files\?per_page=100$/.test(__fetchLog[mark + 1]))
   fail('files URL wrong: ' + __fetchLog[mark + 1]);
@@ -380,6 +381,21 @@ if (got[0].lines !== 6) fail('lines must sum additions+deletions across files (g
 if (got[0].paths.join(',') !== 'src/a.ts,src/b.ts') fail('paths must be /files filenames: ' + JSON.stringify(got[0].paths));
 if (got[1].author !== 'octocat') fail('author must fall back to user.login: ' + got[1].author);
 if (got[1].lines !== 15) fail('second PR lines wrong: ' + got[1].lines);
+
+// 4b. Merged-count shortfall: the candidate page can hold more merged PRs
+//     than requested — the merged results must slice to n, and the /files
+//     budget must stay bounded by n (here: n=1 → exactly 1 /files request).
+__queue(200, [
+  { number: 21, title: 'm1', merged_at: '2026-01-05T00:00:00Z', body: '', user: { login: 'u' } },
+  { number: 20, title: 'closed, never merged', merged_at: null, body: '', user: { login: 'u' } },
+  { number: 19, title: 'm2', merged_at: '2026-01-04T00:00:00Z', body: '', user: { login: 'u' } },
+]);
+__queue(200, [{ filename: 'x.txt', additions: 1, deletions: 0 }]);
+const markSlice = __fetchLog.length;
+const sliced = await loadPublicRepo('octo/slice', 1);
+if (!/per_page=3&/.test(__fetchLog[markSlice])) fail('n=1 must over-fetch a 3-candidate closed page: ' + __fetchLog[markSlice]);
+if (sliced.length !== 1 || sliced[0].id !== '#21') fail('merged results must slice to n: ' + JSON.stringify(sliced));
+if (__fetchLog.length - markSlice !== 2) fail('slice must bound /files requests to n, got ' + (__fetchLog.length - markSlice));
 
 // 5. pullPublicRepo network failure: announces, leaves the view intact.
 await pullPublicRepo('octo/down', 5);       // queue empty → network failure
@@ -395,7 +411,25 @@ if (_store['livePill'].textContent !== 'live · 1')
   fail('header pill must read "live · 1", got: ' + JSON.stringify(_store['livePill'].textContent));
 if (!/Loaded 1 merged PRs from octo\/demo/.test(_store['live'].textContent)) fail('success not announced');
 
-console.error('public-repo loader OK (validation, error surfaces, /files aggregation, accessor wiring)');
+// 7. Mid-sequence /files failure: a 403 partway through the /files fan-out
+//    must abort the WHOLE load — the previously loaded view (step 6) stays
+//    rendered untouched (no partial replacement) and the rate-limit error is
+//    announced.
+__queue(200, [
+  { number: 31, title: 'ok', merged_at: '2026-01-06T00:00:00Z', body: '', user: { login: 'u' } },
+  { number: 30, title: 'doomed', merged_at: '2026-01-06T00:00:00Z', body: '', user: { login: 'u' } },
+]);
+__queue(200, [{ filename: 'ok.txt', additions: 1, deletions: 0 }]);
+__queue(403, {}, { 'X-RateLimit-Remaining': '0' });
+await pullPublicRepo('octo/partial', 5);
+if (!Array.isArray(livePRs) || livePRs.length !== 1 || livePRs[0].id !== '#9')
+  fail('mid-load /files failure must not replace livePRs with partial data: ' + JSON.stringify(livePRs));
+if (_store['livePill'].textContent !== 'live · 1')
+  fail('mid-load /files failure must not touch the header pill: ' + JSON.stringify(_store['livePill'].textContent));
+if (!/Could not load octo\/partial/.test(_store['live'].textContent) || !/rate limit/i.test(_store['live'].textContent))
+  fail('mid-load /files 403 must announce the rate-limit error: ' + JSON.stringify(_store['live'].textContent));
+
+console.error('public-repo loader OK (validation, error surfaces, /files aggregation, slice + mid-load abort, accessor wiring)');
 '''
 
 open(sys.argv[2], 'w').write(open(sys.argv[3]).read() + fetch_stub + body + footer)
