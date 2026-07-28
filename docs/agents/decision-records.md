@@ -15,7 +15,7 @@ The reader who arrives later — human or agent — then cannot tell whether an 
 | Granularity | Unit | Recorded where | Vocabulary |
 | --- | --- | --- | --- |
 | **Finding** | one review comment | the resolved review thread, tagged by the resolve tooling | `addressed-elsewhere` / `canonical-coverage` / `deferred-to-followup` / `nitpick-noted` / `rebuttal-recorded` / `templated-render` / `verified-propagation` |
-| **Change** | one pull request | a `## Path taken` section in the PR body, plus a title marker | prose chronology — what survived, what was discarded, why |
+| **Change** | one pull request | a `## Path taken` section in the PR body | prose chronology — what survived, what was discarded, why |
 | **Issue** | one issue | an `[!IMPORTANT]` callout at the top of the issue body, linked to a dated decision comment | `Decision` / `Decision recommendation` |
 
 The finding level already has tooling behind it: `scripts/resolve-pr-threads.sh` writes a `[mergepath-resolve:<class>]` tag on every thread it resolves, and that tag — not the bare fact that the thread is now closed — is the disposition of record the follow-up automation reads. That script is the authority on the vocabulary: the seven classes above are the complete set it emits, so a record carrying any other class is non-conformant, and a record carrying a routing class (`canonical-coverage`, `templated-render`) or `verified-propagation` is as conformant as a fixed-or-rebutted one. Which resolve mode records which class is documented in your repo's `REVIEW_POLICY.md` § Pre-Merge Review Conversation Gate; it is not restated here.
@@ -64,7 +64,7 @@ Strike a criterion in place, keeping the checkbox, and append the reason and dat
 
 ### Where the record goes
 
-Four placements, each doing a different job. Use all four that apply.
+Three placements, each doing a different job. Use all three that apply.
 
 **1. A `## Path taken` section in the PR body.** This is the record itself. Heading exactly:
 
@@ -74,15 +74,9 @@ Four placements, each doing a different job. Use all four that apply.
 
 Repos that receive the shared pull-request template already carry this heading as an optional stub, with a hint to delete it when the PR did not reverse direction. Deleting it is the expected outcome on most PRs.
 
-**2. A marker in the PR title,** so the pivot is visible in a list view without opening the PR. Append a parenthetical to the title:
+**Not the title.** A PR title describes the change's end state for a reader who never saw the session that produced it; "pivoted from X" describes the session, and X is a phrase only that session's participants can decode. A pivot marker in the title would also outlive its usefulness in the worst place — on a squash merge the title becomes the permanent commit subject, so every future reader of `git log --oneline` pays for a note that helps almost none of them. The record belongs in the PR body, where it has room to be intelligible, and `git log` still reaches it: the squash subject carries the `(#NN)` PR reference, and searching merged PR bodies for `## Path taken` enumerates the pivots directly. Retitle a PR when a pivot changes *what the change is* — to describe the new end state, never to announce that a pivot happened.
 
-```
-<original title> (pivoted from <one-phrase description of the abandoned approach>)
-```
-
-For example: `fix(769): single shared resolution of the governing review policy (pivoted from revert-and-defer)`. On a squash merge the PR title becomes the commit subject, so the marker survives into `git log` — which is where a reader tracing a file's history will look. Where your repo's operating rules otherwise require a title to describe the end state and not narrate the session's pivots, this marker is the defined exception to that rule, and the only one: the rest of the title still describes the end state, and the pivot is recorded in a fixed, greppable form rather than narrated in prose.
-
-**3. A comment on the driving issue,** so the pivot is discoverable from the issue rather than only from the PR. Use the same shape as the issue-level decision callout below — a hidden idempotency marker, then a dated heading:
+**2. A comment on the driving issue,** so the pivot is discoverable from the issue rather than only from the PR. Use the same shape as the issue-level decision callout below — a hidden idempotency marker, then a dated heading:
 
 ```markdown
 <!-- path-taken-ISSUE-YYYY-MM-DD-SLUG -->
@@ -91,9 +85,9 @@ For example: `fix(769): single shared resolution of the governing review policy 
 <chronology, what survived and what was discarded, who arbitrated>
 ```
 
-`ISSUE` is the issue number, `YYYY-MM-DD` the date the pivot was recorded, and `SLUG` a short kebab-case phrase naming the abandoned approach — the same phrase the title marker above carries. The marker matches the decision-comment marker below, and `SLUG` is there for the same reason: a date alone does not separate two pivots recorded on one day.
+`ISSUE` is the issue number, `YYYY-MM-DD` the date the pivot was recorded, and `SLUG` a short kebab-case phrase naming the abandoned approach. The marker matches the decision-comment marker below, and `SLUG` is there for the same reason: a date alone does not separate two pivots recorded on one day.
 
-**4. A retitle of the driving issue,** when its framing is now stale — an issue titled "Defer X" that ended up doing X is actively misleading in a list view.
+**3. A retitle of the driving issue,** when its framing is now stale — an issue titled "Defer X" that ended up doing X is actively misleading in a list view.
 
 Retitling and re-editing churn notifications for everyone watching. **Do it once, at the end**, when the direction has actually settled — not incrementally as the work moves. One correct retitle is cheap and high-value; five successive ones train people to mute the repo.
 
@@ -130,7 +124,7 @@ Do not rewrite the historical problem statement — the body's original framing 
 
 Match the status language to the comment: use `**Decision recommendation recorded:**` and link text `full recommendation and implementation guardrails` when the comment is a recommendation.
 
-In both markers, `ISSUE` is the issue number, `YYYY-MM-DD` is the decision date, and `SLUG` is a short kebab-case phrase naming the decision itself — the same shape the PR-title pivot marker uses, for example `revert-and-defer` or `accept-recommendation`. The two markers for one decision then differ only by the `-comment` infix, and the pair is greppable. Reproduce the formats above byte-for-byte; a paraphrased callout defeats the point of a fleet-wide convention, because the marker is what later tooling and later agents match on.
+In both markers, `ISSUE` is the issue number, `YYYY-MM-DD` is the decision date, and `SLUG` is a short kebab-case phrase naming the decision itself — the same shape the change-level `path-taken-` marker uses, for example `revert-and-defer` or `accept-recommendation`. The two markers for one decision then differ only by the `-comment` infix, and the pair is greppable. Reproduce the formats above byte-for-byte; a paraphrased callout defeats the point of a fleet-wide convention, because the marker is what later tooling and later agents match on.
 
 The slug is not decoration: the date alone is not a unique key. An issue can carry two material decisions in one day, and a recommendation is very often accepted on the day it was posted — which § 5 counts as a supersession. Without the slug both records expand to the identical marker, and § 4's "if the marker is present, edit in place" would then treat the second decision as a retry of the first and overwrite the rationale that § 5 requires be preserved. Derive the slug from the decision you are about to write, never from a counter: a counter cannot be recomputed by an agent retrying after a crash, so it would post a duplicate instead of matching its own earlier write.
 
@@ -173,4 +167,4 @@ The reasoning:
 - **Enforcement would manufacture the ceremony the convention is designed to avoid.** A required section is satisfied by pasting an empty heading. That trains every agent to paste the heading, at which point the section's presence carries no information and its absence carries none either — strictly worse than the unenforced version, where the section appears only when someone had something to say.
 - **The real enforcement point is review.** A reviewer who can see the PR's history is the only reader positioned to judge whether a reversal happened, and flagging a missing path record is a normal review comment. This is the same enforcement posture as `docs/agents/worktree-placement.md`, which is likewise explicit that it has no CI gate and should not acquire one.
 
-**When to revisit.** If the PR-title marker above becomes universal enough to be a reliable signal, an **advisory** check — one that comments "this PR's title marks a pivot but the body has no `## Path taken` section" and blocks nothing — becomes defensible. That is the only form worth reconsidering; a required gate is not.
+**When to revisit.** The objection above is to *inferring* a pivot from mechanical noise, not to checking a record against itself. The `<!-- path-taken-ISSUE-YYYY-MM-DD-SLUG -->` comment marker is a deliberate artifact — nothing emits it by accident — so once it is in routine use an **advisory** check becomes defensible: one that comments "the driving issue carries a path-taken record but this PR body has no `## Path taken` section" and blocks nothing. It reads a positive signal someone chose to write rather than guessing intent from a force-push. That is the only form worth reconsidering; a required gate is not.

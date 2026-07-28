@@ -21,7 +21,7 @@ Authoring-Agent: <!-- claude | codex | cursor -->
 - Call out any user-visible behavior or deployment notes.
 
 ## Path taken
-<!-- Optional — delete this heading if this PR did not reverse direction; fixing a review finding and pushing again is NOT a reversal. Triggers, required content, and the title marker: docs/agents/decision-records.md -->
+<!-- Optional — delete this heading if this PR did not reverse direction; fixing a review finding and pushing again is NOT a reversal. Triggers and required content: docs/agents/decision-records.md -->
 
 
 ## Testing
