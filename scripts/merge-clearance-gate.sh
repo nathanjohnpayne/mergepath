@@ -371,6 +371,25 @@ merge_clearance_check_enforced() {
     return 1
   fi
 
+  local base_ref_enc
+  base_ref_enc=$(printf '%s' "$BASE_REF" | LC_ALL=C awk '
+    BEGIN { for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i }
+    {
+      out = ""
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (c ~ /[A-Za-z0-9._~\/-]/) out = out c
+        else out = out sprintf("%%%02X", ord[c])
+      }
+      printf "%s", out
+    }')
+  if [ -z "$base_ref_enc" ]; then
+    log "enforcement probe: could not encode base ref '$BASE_REF' for the ruleset URL — treating '$MERGE_CLEARANCE_CHECK_NAME' as NOT enforced"
+    rm -f "$err"
+    return 1
+  fi
+
   # Surface 1 — classic branch protection.
   set +e
   # shellcheck disable=SC2016  # $owner/$name/$qref are GraphQL variables, bound by the -f flags below
@@ -390,7 +409,42 @@ merge_clearance_check_enforced() {
     if [ "$rc" -ne 0 ]; then
       log "enforcement probe: could not parse the classic branch-protection response for '$BASE_REF': $(tr '\n' ' ' <"$err")"
     elif [ -n "$parsed" ]; then
-      contexts="$contexts$parsed"$'\n'
+      # A required context is not proof that the MERGING identity is bound by
+      # it. Classic protection exempts repo admins unless `enforce_admins` is
+      # on, and this probe runs under the reviewer/CI token while the final
+      # `gh pr merge` runs under the author token — so a context merely
+      # VISIBLE to the reviewer would let an admin author merge on a
+      # downgraded rate-limit stall with no bot review. Same defect class as
+      # the ruleset bypass_actors case below (#772 r3 P1).
+      #
+      # `enforce_admins` is exposed only on the admin-scoped REST endpoint;
+      # GraphQL's refUpdateRule does not carry it (verified: it offers
+      # requiredStatusCheckContexts / viewerCanPush / viewerAllowedToDismiss-
+      # Reviews and nothing about admin exemption). That endpoint 404s for the
+      # write-scoped reviewer PAT this query runs under, so on the normal CI
+      # path enforcement is NOT provable here and the classic surface
+      # contributes nothing — the probe falls through to arm 2's positive-proof
+      # clearance check. Where the token IS admin-scoped, the read succeeds and
+      # the classic arm still works. Availability degrades, safety does not.
+      set +e
+      prot_out=$(gh api "repos/$REPO/branches/$base_ref_enc/protection" 2>"$err")
+      prot_rc=$?
+      set -e
+      if [ "$prot_rc" -ne 0 ]; then
+        log "enforcement probe: classic protection lists required contexts on '$BASE_REF' but admin-exemption state is unreadable with this token (gh rc=$prot_rc) — not counting the classic surface: $(tr '\n' ' ' <"$err")"
+      else
+        set +e
+        enforce_admins=$(printf '%s' "$prot_out" | jq -r '.enforce_admins.enabled // "unknown"' 2>"$err")
+        prot_rc=$?
+        set -e
+        if [ "$prot_rc" -ne 0 ] || [ "$enforce_admins" = "unknown" ]; then
+          log "enforcement probe: could not determine enforce_admins on '$BASE_REF' — not counting the classic surface: $(tr '\n' ' ' <"$err")"
+        elif [ "$enforce_admins" != "true" ]; then
+          log "enforcement probe: classic protection on '$BASE_REF' requires contexts but enforce_admins=false, so an admin merger is not bound by them — not counting the classic surface"
+        else
+          contexts="$contexts$parsed"$'\n'
+        fi
+      fi
     fi
   fi
 
@@ -426,24 +480,6 @@ merge_clearance_check_enforced() {
   # (`release/1.0`) with literal slashes in this endpoint's `{branch}`
   # parameter, so encoding it as %2F would break the common case to guard the
   # rare one (#772 r1 P2).
-  local base_ref_enc
-  base_ref_enc=$(printf '%s' "$BASE_REF" | LC_ALL=C awk '
-    BEGIN { for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i }
-    {
-      out = ""
-      n = length($0)
-      for (i = 1; i <= n; i++) {
-        c = substr($0, i, 1)
-        if (c ~ /[A-Za-z0-9._~\/-]/) out = out c
-        else out = out sprintf("%%%02X", ord[c])
-      }
-      printf "%s", out
-    }')
-  if [ -z "$base_ref_enc" ]; then
-    log "enforcement probe: could not encode base ref '$BASE_REF' for the ruleset URL — treating '$MERGE_CLEARANCE_CHECK_NAME' as NOT enforced"
-    rm -f "$err"
-    return 1
-  fi
   set +e
   out=$(gh api --paginate "repos/$REPO/rules/branches/$base_ref_enc" 2>"$err")
   rc=$?

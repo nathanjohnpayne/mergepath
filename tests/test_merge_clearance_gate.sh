@@ -111,6 +111,17 @@ if [ "$1" = "api" ]; then
       cat "${FIXTURE_PROTECTION:-/dev/null}"
       exit 0
       ;;
+    repos/*/branches/*/protection)
+      # #772 r3 P1: enforce_admins lookup. Absent fixture == the CI reality
+      # (admin-only endpoint, 404 for the reviewer PAT), which must make the
+      # classic surface contribute nothing.
+      if [ -z "${FIXTURE_ADMIN_ENFORCE:-}" ]; then
+        echo "gh: Not Found (HTTP 404)" >&2
+        exit 1
+      fi
+      printf '{"enforce_admins":{"enabled":%s}}\n' "$FIXTURE_ADMIN_ENFORCE"
+      exit 0
+      ;;
     repos/*/rulesets/*)
       # #772 r2 P1: bypass-actor lookup for a candidate ruleset.
       if [ "${FIXTURE_RULESET_OBJ_FAIL:-0}" = "1" ]; then
@@ -300,6 +311,12 @@ run_gate() {  # <scratch> [args...]   (env: FIXTURE_PR, FIXTURE_REVIEWS, CODEX_S
 # it with its own prefix assignment.
 FIXTURE_RULESET_OBJ=$(make_ruleset_object_fixture "[]")
 export FIXTURE_RULESET_OBJ
+
+# Default for the #772 classic-protection arm: enforce_admins ON, so a
+# required context genuinely binds every merger. Tests override to "false" or
+# unset it to exercise the unprovable/CI case.
+FIXTURE_ADMIN_ENFORCE=true
+export FIXTURE_ADMIN_ENFORCE
 
 HEAD_SHA="head000aaa"
 OLD_SHA="old111bbb"
@@ -1541,6 +1558,51 @@ if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
   pass "protection: enforced gate on a URL-significant base ref still resolves to true"
 else
   fail "protection: URL-significant base ref expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1k (#772 r3 P1): classic protection with enforce_admins=false is not enforcement"
+# A required context does not bind the MERGING identity if admins are exempt.
+# This probe runs under the reviewer/CI token; the final `gh pr merge` runs
+# under the author token, so a context merely visible here would let an admin
+# author merge on a downgraded rate-limit stall with no bot review.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_ADMIN_ENFORCE=false \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: classic required context with enforce_admins=false → not counted → false"
+else
+  fail "protection: enforce_admins=false expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1l (#772 r3 P1): unreadable admin-exemption state (the CI reality) is not proof"
+# The admin-only protection endpoint 404s for the write-scoped reviewer PAT
+# this query actually runs under, so on the normal CI path the classic surface
+# must contribute nothing rather than being trusted.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_ADMIN_ENFORCE= \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: unreadable enforce_admins → classic surface not counted → false"
+else
+  fail "protection: unreadable enforce_admins expected false/0; got rc=$RC out='$OUT'"
 fi
 
 echo; echo "--- Protection 1i (#772 r2 P1): a ruleset the merging identity can BYPASS is not enforcement"
