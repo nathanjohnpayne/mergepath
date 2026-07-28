@@ -88,6 +88,18 @@ BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT="op://Private/pvbq24vl2h6gl7yjclxy2hbote/t
 BOOTSTRAP_REVIEWER_PAT_OP_REF="${BOOTSTRAP_REVIEWER_PAT_OP_REF:-$BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT}"
 BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY="reviewer-assignment-token"
 
+# Out-parameter of bootstrap::_provision_reviewer_assignment_token: the
+# SPECIFIC failure message it recorded under
+# $BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY during the CURRENT call, or
+# "" when the path it took recorded nothing of its own. The stage-level
+# caller reads it through bootstrap::_record_reviewer_token_stage_failure
+# so its own keyed record does not clobber the specific reason (#761).
+#
+# Reset unconditionally on entry to that function — never trusted across
+# calls. That reset is what keeps the two required behaviours from
+# fighting each other; see the helper below.
+BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON=""
+
 # Message-field prefix stamped onto a recorded warning once a later
 # attempt in the same bootstrap fixes it (#761). This is the WIRE FORMAT
 # of the "${BOOTSTRAP_STATE_FILE}.warnings" sidecar, not a private
@@ -187,11 +199,13 @@ bootstrap::stage_github_infra() {
         # `.bootstrap-state.warnings` the moment the stage aborts —
         # a later --resume (or a human auditing the sidecar) has no
         # record the failure ever happened.
-        bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$step_rc); BOOTSTRAP_STRICT_SECRETS=1 failed the stage — fix and re-run with --resume template-mirror"
+        bootstrap::_record_reviewer_token_stage_failure "$step_rc" \
+          "BOOTSTRAP_STRICT_SECRETS=1 failed the stage — fix and re-run with --resume template-mirror"
         bootstrap::_restore_active_if_needed
         return "$step_rc"
       fi
-      bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$step_rc); workflows will require manual secret-set on first PR"
+      bootstrap::_record_reviewer_token_stage_failure "$step_rc" \
+        "workflows will require manual secret-set on first PR"
       step_rc=0
     fi
 
@@ -342,6 +356,47 @@ bootstrap::_reviewer_selected() {
   esac
 }
 
+# Record the stage-level REVIEWER_ASSIGNMENT_TOKEN provisioning failure,
+# keeping the callee's specific reason when it had one (#761).
+#
+# The stage and the provisioning helper both write under the SAME warning
+# key, and bootstrap::record_warning is replace-by-key: it clears every
+# line for the key before appending. A bare stage-level record therefore
+# overwrote the specific reason the helper had just written ("no PAT
+# available, prompts skipped" / "human declined to provide a PAT") with a
+# generic "provisioning failed (rc=N)" — and since the resolver preserves
+# whatever text is outstanding at resolution time, the audit trail this
+# whole change exists for could no longer say WHICH failure happened.
+#
+# The fix carries the reason forward rather than declining to overwrite.
+# "Don't overwrite an existing record for this key" looks equivalent but
+# is wrong: the sidecar survives --resume and carries no run marker or
+# timestamp, so a stale line written by an EARLIER attempt is
+# byte-indistinguishable from one this attempt just wrote. A blanket
+# no-overwrite guard would pin the stale reason in place and silently
+# drop the current failure — breaking record_warning's replacement
+# contract exactly when the sidecar most needs to be current.
+#
+# $BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON is positive proof instead:
+# the helper resets it on entry and sets it only on the paths where it
+# actually recorded something, so it describes THIS call and nothing else.
+# A later attempt that fails on a path recording no reason of its own
+# leaves it empty, falls back to the generic message here, and replaces
+# the stale record as before.
+#
+# $1 is the provisioning rc (only used by the generic fallback — the
+# specific reasons already name their own cause); $2 is the stage-level
+# consequence appended to whichever headline is used.
+bootstrap::_record_reviewer_token_stage_failure() {
+  local rc=$1 tail_note=$2
+  local headline="${BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON:-}"
+  if [ -z "$headline" ]; then
+    headline="github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$rc)"
+  fi
+  bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" \
+    "$headline; $tail_note"
+}
+
 # Retire a recorded warning once a later attempt in the same bootstrap
 # fixed the underlying problem — WITHOUT erasing the fact that it
 # happened (#761). bootstrap::clear_warning on its own deletes the line,
@@ -461,6 +516,14 @@ bootstrap::_provision_reviewer_assignment_token() {
   local full_repo=$1 reviewers_csv=$2
   local pat=""
 
+  # Reset the out-parameter FIRST, before any path can return. Deliberately
+  # not `local`: the stage-level caller reads it after this function
+  # returns. Clearing it on entry is what makes it describe THIS call — a
+  # --resume attempt that fails on a path recording no specific reason must
+  # NOT inherit the reason a previous attempt set, or the stage would
+  # re-record a stale cause as if it were the current one.
+  BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON=""
+
   # Path c (tests / explicit override): caller supplied the PAT
   # inline via env var.
   if [ -n "${BOOTSTRAP_REVIEWER_PAT_VALUE:-}" ]; then
@@ -541,7 +604,12 @@ bootstrap::_provision_reviewer_assignment_token() {
       bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: NO PAT available and prompts are skipped — secret NOT set on $full_repo"
       bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: reviewer-assignment / agent-review workflows WILL FAIL on the first PR until it is set"
       bootstrap::_emit_reviewer_token_remediation "$full_repo" "$reviewers_csv"
-      bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (no PAT available, prompts skipped) — set it manually before the first PR"
+      # Publish the reason as well as recording it: under
+      # BOOTSTRAP_STRICT_SECRETS=1 this returns non-zero and the stage's
+      # own keyed record would otherwise replace this line with a generic
+      # one (#761).
+      BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON="REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (no PAT available, prompts skipped) — set it manually before the first PR"
+      bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON"
       if [ "${BOOTSTRAP_STRICT_SECRETS:-0}" = "1" ]; then
         return 1
       fi
@@ -556,7 +624,9 @@ bootstrap::_provision_reviewer_assignment_token() {
     echo
     if [ -z "$pat" ]; then
       bootstrap::_emit_reviewer_token_remediation "$full_repo" "$reviewers_csv"
-      bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (human declined to provide a PAT) — set it manually before the first PR"
+      # Same carry-forward as the prompts-skipped path above (#761).
+      BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON="REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (human declined to provide a PAT) — set it manually before the first PR"
+      bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON"
       if [ "${BOOTSTRAP_STRICT_SECRETS:-0}" = "1" ]; then
         return 1
       fi
