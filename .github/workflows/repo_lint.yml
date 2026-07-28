@@ -169,6 +169,18 @@ jobs:
       - name: check_audit_review_latency
         run: ./scripts/ci/check_audit_review_latency
 
+      # Hermetic regression suite for the #739 canonical-mirror drift
+      # triage aid (scripts/audit-canonical-mirrors.sh) — guards the
+      # vendor-file section parser (fence nesting per the CommonMark
+      # closing-fence run-length rule, annotation/pin extraction,
+      # classification counters). Only the parser suite runs here; the
+      # audit run itself stays local-only (the machine files it audits
+      # are outside every repo checkout, unreachable from CI). Hub-only;
+      # SKIPs on consumer checkouts via the standard sync-to-downstream
+      # marker idiom.
+      - name: check_audit_canonical_mirrors
+        run: ./scripts/ci/check_audit_canonical_mirrors
+
       # Offline PATH-shim suite for the #691 statusCheckRollup pagination in
       # scripts/admin-merge-codeowners-blocked.sh's Gate 2 — guards against a
       # regression to the truncating `gh pr view --json statusCheckRollup`
