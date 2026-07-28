@@ -96,6 +96,16 @@ BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY="reviewer-assignment-token"
 # pins the two spellings equal.
 BOOTSTRAP_WARNING_RESOLVED_MARKER="RESOLVED: "
 
+# Agent names scripts/op-preflight.sh will accept for `--agent`. MUST
+# stay equal to the set its reviewer_pat_item_for() knows — anything
+# else exits 1 with "unknown agent". The wizard's --reviewers flag takes
+# an unvalidated CSV, so a remediation hint that echoes a selection back
+# as `--agent <name>` has to filter it through this list or it can print
+# a command that cannot run (#761).
+# tests/test_bootstrap_github_infra.sh pins this equal to op-preflight's
+# own list so a new agent added there can't silently go missing here.
+BOOTSTRAP_REVIEWER_PREFLIGHT_AGENTS="claude cursor codex"
+
 bootstrap::stage_github_infra() {
   bootstrap::stage_banner "github-infra"
 
@@ -347,21 +357,37 @@ bootstrap::_reviewer_selected() {
 # clear_warning matches on the "@<key><TAB>" prefix, which this record
 # preserves).
 #
-# No-op unless there is an outstanding line for the key: a first-attempt
-# success must not manufacture a resolution record for a failure that
-# never happened.
+# The ORIGINAL failure message is preserved verbatim and merely prefixed
+# with the marker; $2 is a short resolution note appended in brackets.
+# Substituting a generic "something failed earlier" string would defeat
+# the audit trail this record exists for: several distinct failures share
+# the reviewer-assignment-token key (no PAT + prompts skipped, human
+# declined to paste one, `gh secret set` itself failed), and an operator
+# reading the sidecar weeks later has to be able to tell WHICH one
+# happened.
+#
+# No-op unless there is an OUTSTANDING line for the key. "Outstanding"
+# means a line for the key whose message does NOT already carry the
+# resolved marker — two separate guards in one:
+#   - a first-attempt success must not manufacture a resolution record
+#     for a failure that never happened (no line for the key at all);
+#   - a second successful attempt must not re-resolve a record the first
+#     one already resolved, which would double-prefix the marker and
+#     bury the original message one bracket deeper each time.
 bootstrap::_resolve_recorded_warning() {
-  local key=$1 msg=$2
+  local key=$1 note=$2
   if [ -z "${BOOTSTRAP_STATE_FILE:-}" ] || [ ! -f "${BOOTSTRAP_STATE_FILE}.warnings" ]; then
     return 0
   fi
 
   local warnings_file="${BOOTSTRAP_STATE_FILE}.warnings"
   local prefix="@${key}	"
-  local line found=0
+  local line original="" found=0
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
-      "$prefix"*) found=1; break ;;
+      # Already resolved on an earlier attempt — leave it exactly as is.
+      "${prefix}${BOOTSTRAP_WARNING_RESOLVED_MARKER}"*) ;;
+      "$prefix"*) original=${line#"$prefix"}; found=1; break ;;
     esac
   done <"$warnings_file"
   if [ "$found" != "1" ]; then
@@ -370,7 +396,8 @@ bootstrap::_resolve_recorded_warning() {
 
   bootstrap::clear_warning "$key"
   mkdir -p "$(dirname "$warnings_file")"
-  printf '@%s\t%s%s\n' "$key" "$BOOTSTRAP_WARNING_RESOLVED_MARKER" "$msg" >>"$warnings_file"
+  printf '@%s\t%s%s [%s]\n' \
+    "$key" "$BOOTSTRAP_WARNING_RESOLVED_MARKER" "$original" "$note" >>"$warnings_file"
   bootstrap::log "recorded warning '$key' marked resolved in the end-of-run summary"
 }
 
@@ -391,10 +418,21 @@ bootstrap::_emit_reviewer_token_remediation() {
   local full_repo=$1 reviewers_csv=$2
 
   # Name a concrete selected reviewer so the preflight line is
-  # copy-pasteable. Fall back to a placeholder only when the selection
-  # is empty (no reviewer to name).
-  local agent
-  agent=$(printf '%s' "$reviewers_csv" | tr -d ' ' | cut -d, -f1)
+  # copy-pasteable. It must be an agent scripts/op-preflight.sh actually
+  # accepts: that script hard-rejects any --agent outside the set its
+  # reviewer_pat_item_for() knows (see $BOOTSTRAP_REVIEWER_PREFLIGHT_AGENTS
+  # below), and the wizard does NOT validate --reviewers at parse time, so
+  # the first CSV field can be a name preflight refuses. Emitting it
+  # verbatim would hand the operator a remediation that exits 1 — a
+  # dead end at exactly the moment they need a working command. Pick the
+  # first field preflight accepts; fall back to a placeholder only when
+  # the selection names none.
+  local agent="" candidate
+  for candidate in $(printf '%s' "$reviewers_csv" | tr -d ' ' | tr ',' ' '); do
+    case " $BOOTSTRAP_REVIEWER_PREFLIGHT_AGENTS " in
+      *" $candidate "*) agent="$candidate"; break ;;
+    esac
+  done
   if [ -z "$agent" ]; then
     agent="<selected-reviewer>"
   fi
@@ -406,9 +444,16 @@ bootstrap::_emit_reviewer_token_remediation() {
       bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: do NOT install the PAT currently in \$OP_PREFLIGHT_REVIEWER_PAT — \$OP_PREFLIGHT_AGENT is unset, so its owning identity could not be verified"
     fi
   fi
-  bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: fix: re-run credential preflight for a SELECTED reviewer, then set the secret from that agent's cache:"
-  bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN:   eval \"\$(scripts/op-preflight.sh --agent $agent --mode review)\""
-  bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN:   printf '%s' \"\$OP_PREFLIGHT_REVIEWER_PAT\" | scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo $full_repo" # NO_BARE_GH_WRITE_EXEMPT: remediation hint echoed to the operator (routed through the token-verifying author wrapper), not an executed gh write
+  # ONE `&&`-chained command on purpose. Emitting the re-preflight and
+  # the `gh secret set` as two independent lines makes the mitigation
+  # advisory prose: an operator who transcribes only the line that
+  # performs the action — in a shell where preflight last ran for a
+  # NON-selected agent — installs that rejected PAT, and nothing
+  # downstream catches it (gh-as-author.sh verifies the author
+  # performing the write, never the token on its stdin). Chaining makes
+  # skipping the re-preflight impossible without editing the command.
+  bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: fix: re-run credential preflight for a SELECTED reviewer and set the secret from that agent's cache — run as ONE command, the preflight is not optional:"
+  bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN:   eval \"\$(scripts/op-preflight.sh --agent $agent --mode review)\" && printf '%s' \"\$OP_PREFLIGHT_REVIEWER_PAT\" | scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo $full_repo" # NO_BARE_GH_WRITE_EXEMPT: remediation hint echoed to the operator (routed through the token-verifying author wrapper), not an executed gh write
   bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: the stored secret must belong to one of the invited reviewers ($reviewers_csv) — the author wrapper verifies the account performing the write, NOT the token on its stdin, so a wrong-identity PAT installs silently and fails on the first PR"
 }
 
@@ -556,8 +601,10 @@ bootstrap::_provision_reviewer_assignment_token() {
     bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: secret set failed (rc=$set_rc)"
     return "$set_rc"
   fi
+  # Note only — the original failure message is kept verbatim by the
+  # resolver, so the sidecar still says WHICH failure this fixed.
   bootstrap::_resolve_recorded_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" \
-    "REVIEWER_ASSIGNMENT_TOKEN provisioning failed earlier in this bootstrap and was fixed on a later attempt — the secret is now set on $full_repo; no action needed"
+    "fixed on a later attempt in this bootstrap: the secret is now set on $full_repo; no action needed"
   bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN set on $full_repo (len=${#pat})"
 }
 

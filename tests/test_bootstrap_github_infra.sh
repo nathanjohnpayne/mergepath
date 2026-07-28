@@ -642,16 +642,52 @@ echo "$retry_out" | grep -q "RC=0" \
 grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/retry-repo$" "$SHIM_LOG" \
   && pass "successful retry invoked gh secret set" \
   || fail "successful retry did not invoke gh secret set; log: $(cat "$SHIM_LOG")"
-grep -q "was NOT provisioned" "$TARGET9B/.bootstrap-state.warnings" \
+# No line for the key may remain OUTSTANDING — i.e. every surviving
+# reviewer-assignment-token line must carry the RESOLVED marker. (The
+# original message is deliberately preserved inside that line, so
+# grepping for the failure text alone would match the resolved record.)
+grep '^@reviewer-assignment-token	' "$TARGET9B/.bootstrap-state.warnings" \
+  | grep -qv '	RESOLVED: ' \
   && fail "successful retry left the outstanding REVIEWER_ASSIGNMENT_TOKEN failure: $(cat "$TARGET9B/.bootstrap-state.warnings")" \
   || pass "successful retry retires the outstanding REVIEWER_ASSIGNMENT_TOKEN failure line"
 grep -q "^@reviewer-assignment-token" "$TARGET9B/.bootstrap-state.warnings" \
   && pass "resolution record keeps the original warning key (a later re-failure still replaces it)" \
   || fail "resolution record lost the warning key: $(cat "$TARGET9B/.bootstrap-state.warnings" 2>/dev/null)"
-grep -q "RESOLVED: REVIEWER_ASSIGNMENT_TOKEN provisioning failed earlier in this bootstrap" \
-     "$TARGET9B/.bootstrap-state.warnings" \
+grep -q "RESOLVED: " "$TARGET9B/.bootstrap-state.warnings" \
   && pass "successful retry records the miss as RESOLVED instead of erasing it (#761)" \
   || fail "sidecar lost the record that the first attempt failed: $(cat "$TARGET9B/.bootstrap-state.warnings" 2>/dev/null)"
+# The ORIGINAL failure message must survive verbatim. Several distinct
+# failures share the reviewer-assignment-token key (no PAT + prompts
+# skipped / human declined / gh secret set failed); substituting a
+# generic "provisioning failed earlier" string would make the audit
+# trail unable to answer the question it is kept for.
+grep -qF "RESOLVED: REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on nathanjohnpayne/retry-repo (no PAT available, prompts skipped)" \
+     "$TARGET9B/.bootstrap-state.warnings" \
+  && pass "resolution record preserves WHICH failure occurred, not a generic message" \
+  || fail "resolution record discarded the original failure message: $(cat "$TARGET9B/.bootstrap-state.warnings" 2>/dev/null)"
+grep -qF "[fixed on a later attempt in this bootstrap: the secret is now set on nathanjohnpayne/retry-repo" \
+     "$TARGET9B/.bootstrap-state.warnings" \
+  && pass "resolution record appends the caller's resolution note" \
+  || fail "resolution record dropped the resolution note: $(cat "$TARGET9B/.bootstrap-state.warnings" 2>/dev/null)"
+# Resolving twice (operator re-runs --resume a second time) must be
+# idempotent: the guard is "outstanding line", not "any line for the
+# key", so the marker must not stack and the original must not sink one
+# bracket deeper per attempt.
+set +e
+reresolve_out=$(bash -c '
+  ROOT="'"$ROOT"'"
+  TARGET="'"$TARGET9B"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/github-infra.sh"
+  BOOTSTRAP_STATE_FILE="$TARGET/.bootstrap-state"
+  BOOTSTRAP_LOG_FILE=""
+  bootstrap::_resolve_recorded_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "second pass note"
+' 2>&1)
+set -e
+[ "$(grep -c 'RESOLVED: ' "$TARGET9B/.bootstrap-state.warnings")" = "1" ] \
+  && ! grep -qF "second pass note" "$TARGET9B/.bootstrap-state.warnings" \
+  && pass "re-resolving an already-RESOLVED record is a no-op (no marker stacking)" \
+  || fail "second resolve pass rewrote the resolved record: $(cat "$TARGET9B/.bootstrap-state.warnings"); out: $reresolve_out"
 echo "template-mirror" >"$TARGET9B/.bootstrap-state"
 echo "github-infra" >>"$TARGET9B/.bootstrap-state"
 set +e
@@ -676,8 +712,8 @@ echo "$summary_out" | grep -q "RECORDED FAILURES" \
 echo "$summary_out" | grep -qF "ok RESOLVED (recorded earlier in this bootstrap" \
   && pass "summary reports the resolved warning in its own RESOLVED block (#761)" \
   || fail "summary dropped the resolved warning entirely; out: $summary_out"
-echo "$summary_out" | grep -qF "ok - REVIEWER_ASSIGNMENT_TOKEN provisioning failed earlier in this bootstrap" \
-  && pass "RESOLVED block strips the wire-format marker and shows the record" \
+echo "$summary_out" | grep -qF "ok - REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on nathanjohnpayne/retry-repo (no PAT available, prompts skipped)" \
+  && pass "RESOLVED block strips the wire-format marker and shows the original failure" \
   || fail "resolved line rendered wrong; out: $summary_out"
 
 # --- assertion 15c: producer and renderer agree on the sidecar marker ---
@@ -723,6 +759,51 @@ set -e
   && fail "clean first attempt manufactured a resolution record: $(cat "$TARGET9C/.bootstrap-state.warnings")" \
   || pass "clean first attempt writes no resolution record"
 
+# The no-sidecar case above short-circuits at the file-existence guard,
+# so it never reaches the "no OUTSTANDING line for this key" early
+# return. Exercise that branch directly: a sidecar that exists but holds
+# only OTHER keys must come through a clean first-attempt success
+# untouched. Without this fixture, dropping the found-guard would let a
+# clean run manufacture a RESOLVED record for a token failure that never
+# happened and the suite would still pass.
+: >"$SHIM_LOG"
+TARGET9C2="$WORKDIR/new-repo-first-try-other-warnings"
+rm -rf "$TARGET9C2"
+mkdir -p "$TARGET9C2"
+printf '@llm-secrets\tANTHROPIC_API_KEY was NOT provisioned — set it manually\n' \
+  >"$TARGET9C2/.bootstrap-state.warnings"
+printf 'collaborator invite for nathanpayne-codex failed\n' \
+  >>"$TARGET9C2/.bootstrap-state.warnings"
+set +e
+clean2_out=$(PATH="$SHIM_PATH" SHIM_LOG="$SHIM_LOG" bash -c '
+  ROOT="'"$ROOT"'"
+  TARGET="'"$TARGET9C2"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/github-infra.sh"
+  BOOTSTRAP_STATE_FILE="$TARGET/.bootstrap-state"
+  BOOTSTRAP_LOG_FILE=""
+  BOOTSTRAP_DRY_RUN=0
+  BOOTSTRAP_SKIP_AUTHOR_TOKEN=1
+  BOOTSTRAP_REVIEWER_PAT_VALUE="first-try-fake-pat"
+  bootstrap::_provision_reviewer_assignment_token "nathanjohnpayne/clean2-repo" "claude"
+' 2>&1)
+clean2_ec=$?
+set -e
+[ "$clean2_ec" -eq 0 ] \
+  && pass "first-attempt success succeeds with unrelated warnings already in the sidecar" \
+  || fail "first-attempt provisioning failed with a pre-existing sidecar; rc=$clean2_ec; out: $clean2_out"
+grep -q "RESOLVED" "$TARGET9C2/.bootstrap-state.warnings" \
+  && fail "clean first attempt manufactured a RESOLVED record over unrelated warnings: $(cat "$TARGET9C2/.bootstrap-state.warnings")" \
+  || pass "clean first attempt writes no RESOLVED record when only OTHER keys are recorded"
+grep -q "^@reviewer-assignment-token" "$TARGET9C2/.bootstrap-state.warnings" \
+  && fail "clean first attempt invented a reviewer-assignment-token record: $(cat "$TARGET9C2/.bootstrap-state.warnings")" \
+  || pass "clean first attempt adds no record under the token key"
+[ "$(wc -l <"$TARGET9C2/.bootstrap-state.warnings" | tr -d ' ')" = "2" ] \
+  && grep -q "ANTHROPIC_API_KEY was NOT provisioned" "$TARGET9C2/.bootstrap-state.warnings" \
+  && grep -q "collaborator invite for nathanpayne-codex failed" "$TARGET9C2/.bootstrap-state.warnings" \
+  && pass "unrelated recorded warnings survive a clean token provisioning untouched" \
+  || fail "unrelated warnings were disturbed: $(cat "$TARGET9C2/.bootstrap-state.warnings")"
+
 # --- assertion 15e: the interactive decline path emits the same
 # actionable remediation (#761). A human who declines the paste prompt
 # is in exactly the position the hint is written for; leaving that path
@@ -762,6 +843,69 @@ echo "$declined_out" | grep -qF 'eval "$(scripts/op-preflight.sh --agent cursor 
 grep -q "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned" "$TARGET9D/.bootstrap-state.warnings" \
   && pass "declined-PAT path still records the miss in the warnings sidecar" \
   || fail "declined-PAT path recorded no warning: $(cat "$TARGET9D/.bootstrap-state.warnings" 2>/dev/null)"
+
+# --- assertion 15f: the remediation is ONE `&&`-chained command ---
+# Emitting the re-preflight and the `gh secret set` as two independent
+# lines makes the mitigation advisory prose: an operator who copies only
+# the line that performs the action, in a shell whose preflight cache
+# belongs to a NON-selected agent, installs that rejected PAT — and
+# gh-as-author.sh verifies the author performing the write, never the
+# token on its stdin, so nothing downstream catches it. Chaining is what
+# makes skipping the preflight impossible (#761).
+# ---------------------------------------------------------------------------
+echo "$declined_out" \
+  | grep -qF 'eval "$(scripts/op-preflight.sh --agent cursor --mode review)" && printf '"'"'%s'"'"' "$OP_PREFLIGHT_REVIEWER_PAT" | scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/declined-repo' \
+  && pass "remediation chains the re-preflight and the secret write into one command" \
+  || fail "remediation emitted the preflight and the gh write as separable lines; out: $declined_out"
+echo "$declined_out" | grep -F 'gh secret set REVIEWER_ASSIGNMENT_TOKEN' | grep -qv 'op-preflight.sh' \
+  && fail "a gh secret set line is transcribable without the preflight; out: $declined_out" \
+  || pass "no gh secret set line appears without its preflight prefix"
+
+# --- assertion 15g: the hinted --agent is one op-preflight accepts ---
+# The wizard does NOT validate --reviewers at parse time
+# (scripts/bootstrap-new-repo.sh only checks the argument is non-empty),
+# while scripts/op-preflight.sh hard-rejects any --agent outside
+# claude/cursor/codex. Echoing the first CSV field back verbatim can
+# therefore print a remediation that exits 1 — a dead end at exactly the
+# moment the operator needs a working command (#761).
+# ---------------------------------------------------------------------------
+emit_remediation() {
+  bash -c '
+    ROOT="'"$ROOT"'"
+    . "$ROOT/scripts/bootstrap/_lib.sh"
+    . "$ROOT/scripts/bootstrap/github-infra.sh"
+    BOOTSTRAP_LOG_FILE=""
+    OP_PREFLIGHT_REVIEWER_PAT=""
+    bootstrap::_emit_reviewer_token_remediation "nathanjohnpayne/hint-repo" "'"$1"'"
+  ' 2>&1
+}
+hint_out=$(emit_remediation "copilot,claude")
+echo "$hint_out" | grep -qF -- "--agent claude --mode review" \
+  && pass "remediation skips an unsupported reviewer name and picks the first preflight-valid one" \
+  || fail "remediation named an agent op-preflight rejects; out: $hint_out"
+echo "$hint_out" | grep -qF -- "--agent copilot" \
+  && fail "remediation emitted 'copilot', which op-preflight exits 1 on; out: $hint_out" \
+  || pass "remediation never emits an --agent op-preflight would reject"
+hint_out=$(emit_remediation "copilot")
+echo "$hint_out" | grep -qF -- "--agent <selected-reviewer> --mode review" \
+  && pass "remediation falls back to the placeholder when no selection is preflight-valid" \
+  || fail "remediation did not fall back to a placeholder; out: $hint_out"
+hint_out=$(emit_remediation "")
+echo "$hint_out" | grep -qF -- "--agent <selected-reviewer> --mode review" \
+  && pass "remediation falls back to the placeholder on an empty reviewer selection" \
+  || fail "empty selection did not produce a placeholder; out: $hint_out"
+
+# The known-agent list is a local mirror of op-preflight's. Pin the two
+# equal so an agent added there cannot silently go missing here (the
+# same drift guard assertion 15c applies to the RESOLVED: marker).
+preflight_agents=$(sed -n '/^reviewer_pat_item_for()/,/^}/p' "$ROOT/scripts/op-preflight.sh" \
+  | sed -n 's/^[[:space:]]*\([a-z][a-z]*\))[[:space:]]*echo.*/\1/p' | tr '\n' ' ' | sed 's/ *$//')
+infra_agents=$(sed -n 's/^BOOTSTRAP_REVIEWER_PREFLIGHT_AGENTS="\(.*\)"$/\1/p' \
+  "$ROOT/scripts/bootstrap/github-infra.sh")
+[ -n "$preflight_agents" ] \
+  && [ "$preflight_agents" = "$infra_agents" ] \
+  && pass "BOOTSTRAP_REVIEWER_PREFLIGHT_AGENTS matches op-preflight's accepted agent set" \
+  || fail "agent set drifted: op-preflight='$preflight_agents' github-infra='$infra_agents'"
 
 # --- assertion 16: dry-run PAT miss is pure (#755 round 2) ---
 # A dry run carries no credentials, so a PAT miss there is EXPECTED:
