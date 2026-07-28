@@ -6,7 +6,7 @@
 #
 # Background: the script used to hard-guard on GH_TOKEN and exit 3 BEFORE ever
 # posting the trigger. The op-preflight auto-source only sets GH_TOKEN from a
-# FRESH cache (TTL 14400s); on a long session the cache lapses, GH_TOKEN
+# FRESH cache (TTL 36000s = 10h since #765); on a long session it lapses, GH_TOKEN
 # unsets, the guard trips, and `@codex review` silently no-ops even though
 # `gh auth token --user nathanjohnpayne` resolves fine. Callers pipe the script
 # through `| tail -1` and ignore the exit code, so the no-op is invisible and
