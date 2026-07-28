@@ -3,6 +3,10 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- Defense-in-depth (#732): pin fetch/XHR to the GitHub REST API only.
+     The policy constrains ONLY connect-src, so the inline script/styles and
+     the static zero-network base behavior are untouched. -->
+<meta http-equiv="Content-Security-Policy" content="connect-src 'self' https://api.github.com" />
 <title>Mergepath</title>
 <!-- Live-data injection marker. scripts/policy-sim.sh replaces this with
      <script>window.__PRS = [...]</script>. Do not remove. -->
@@ -636,6 +640,11 @@
     border-radius: var(--radius-xl);
     width: 560px;
     max-width: calc(100vw - 48px);
+    /* Short/mobile viewports: cap the dialog and let .m-body scroll so the
+       hint and Close/Copy actions stay reachable. */
+    max-height: calc(100vh - 48px);
+    display: flex;
+    flex-direction: column;
     box-shadow: 0 24px 60px rgba(0, 0, 0, 0.2);
     overflow: hidden;
   }
@@ -649,7 +658,14 @@
     padding: 8px 24px 6px;
     color: var(--muted);
     font-size: 13px;
+    /* The one flexible child of the flex-column dialog: shrink and scroll
+       when the viewport is shorter than the content. */
+    min-height: 0;
+    overflow-y: auto;
   }
+  .modal h3,
+  .modal .hint,
+  .modal .m-actions { flex-shrink: 0; }
   .modal .m-body p { margin: 8px 0; }
   .modal .m-body ol.m-steps {
     margin: 14px 0 4px;
@@ -703,6 +719,46 @@
     cursor: pointer;
   }
   .modal pre.cmd .copy:hover { background: rgba(255, 255, 255, 0.18); }
+  /* Public-repo loader row (#732). minmax(0, 1fr) + min-width: 0 let the
+     slug track shrink below its intrinsic width so the count/Load controls
+     never get clipped by the dialog's overflow on narrow viewports. */
+  .modal .repo-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 72px auto;
+    gap: 8px;
+    margin: 12px 0 4px;
+  }
+  .modal .repo-row input {
+    min-width: 0;
+    min-height: 38px;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.9);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .modal .repo-row input:focus {
+    outline: none;
+    border-color: rgba(31, 98, 87, 0.55);
+    box-shadow: 0 0 0 4px rgba(31, 98, 87, 0.12);
+  }
+  .modal .repo-row button {
+    padding: 0 16px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .modal .repo-row button:hover { background: #165045; border-color: #165045; }
+  .modal .m-sub {
+    margin: 6px 0 14px;
+    font-size: 12px;
+    color: var(--soft);
+  }
   .modal .hint {
     font-size: 12px;
     color: var(--soft);
@@ -1003,7 +1059,7 @@
   </div>
 
   <footer>
-    <span>Mergepath Playground · static · no network, no auth</span>
+    <span>Mergepath Playground · static · no network on load, no auth</span>
     <span class="mono">v0.2</span>
   </footer>
 </div>
@@ -1015,7 +1071,18 @@
        aria-labelledby="refreshTitle" aria-describedby="refreshDesc">
     <h3 id="refreshTitle">Replay your real PRs</h3>
     <div class="m-body" id="refreshDesc">
-      <p>This page is static HTML&mdash;it can't shell out to <code>gh</code> from the browser. A tiny helper script does it for you: it lists your repo's recent merged PRs, bakes the data into a copy of this file, and opens the copy in a new tab.</p>
+      <p><strong>Public repo?</strong> Load it right here. The page fetches the repo's recent merged PRs straight from the GitHub REST API&mdash;unauthenticated, read-only, nothing stored.</p>
+      <div class="repo-row">
+        <label for="repoSlugInput" class="sr-only">Public repository, owner/repo</label>
+        <input type="text" id="repoSlugInput" placeholder="owner/repo"
+               autocomplete="off" spellcheck="false" maxlength="140" />
+        <label for="repoLimit" class="sr-only">Merged PRs to load, 1 to 15</label>
+        <input type="number" id="repoLimit" min="1" max="15" step="1" value="12"
+               title="Merged PRs to load (max 15)" />
+        <button id="repoLoadBtn" type="button">Load</button>
+      </div>
+      <p class="m-sub">Unauthenticated GitHub allows 60 requests/hr per IP; one load costs 1&nbsp;+&nbsp;one request per PR. PRs with more than 100 changed files are counted from their first 100 files only.</p>
+      <p><strong>Private repo, or a bigger pull?</strong> The browser can't shell out to <code>gh</code>&mdash;a tiny helper script does it for you: it lists your repo's recent merged PRs with your authenticated <code>gh</code>, bakes the data into a copy of this file, and opens the copy in a new tab.</p>
       <ol class="m-steps">
         <li><strong>Open a terminal</strong> at your repo root (the folder with <code>.github/review-policy.yml</code>).</li>
         <li><strong>Run the helper.</strong> Default pulls the last 20 merged PRs:
@@ -1079,6 +1146,17 @@
     pathMaxCount: 25,
     // Allow POSIX-ish paths + glob wildcards. Rejects <>, quotes, control chars.
     pathAllowed: /^[A-Za-z0-9_.\-/*?[\]{}:@+,!~$^=]+$/,
+    // Public-repo loader (#732). GitHub owners cap at 39 chars and repos at
+    // 100, so 140 comfortably bounds `owner/repo` before URL interpolation.
+    // The PR count is capped low on purpose: one load costs 1 + N requests
+    // against GitHub's 60/hr-per-IP unauthenticated budget.
+    repoSlugMaxLen: 140,
+    repoFetchDefault: 12,
+    repoFetchMax: 15,
+    // Per-request timeout (list + each /files call). A hung unauthenticated
+    // request would otherwise leave repoLoadInFlight true forever, wedging
+    // the Load button for the rest of the session.
+    repoFetchTimeoutMs: 10000,
   };
 
   const state = typeof structuredClone === 'function'
@@ -1114,10 +1192,17 @@
 
   // Any injected array counts as live, including an empty one — a repo with
   // zero merged PRs should show the empty state, not the synthetic sample.
-  const isLive = Array.isArray(window.__PRS);
-  const samplePRs = (isLive ? window.__PRS : SYNTHETIC_PRS)
-    .map(normalizePR)
-    .filter(Boolean);
+  //
+  // Rendering routes through an accessor rather than an init-time const so a
+  // runtime public-repo fetch (#732) can re-render without a reload. The
+  // precedence chain: an in-page load (livePRs) beats the policy-sim.sh
+  // injected global (window.__PRS), which beats the synthetic sample.
+  let livePRs = null;
+  function currentPRs() {
+    const source = livePRs ?? (Array.isArray(window.__PRS) ? window.__PRS : SYNTHETIC_PRS);
+    return source.map(normalizePR).filter(Boolean);
+  }
+  const isLiveData = () => livePRs !== null || Array.isArray(window.__PRS);
 
   // ---------------------------------------------------------------------
   // DOM helpers
@@ -1238,7 +1323,8 @@
     const list = $('prList');
     list.textContent = '';
 
-    if (samplePRs.length === 0) {
+    const prs = currentPRs();
+    if (prs.length === 0) {
       list.appendChild(el('div', { class: 'empty-state', text: 'No PRs to simulate. Pull live PRs or edit the synthetic set.' }));
       $('stats').textContent = '';
       return;
@@ -1246,7 +1332,7 @@
 
     const stats = { merged: 0, gated: 0, codexTouched: 0, handoff: 0 };
 
-    samplePRs.forEach(pr => {
+    prs.forEach(pr => {
       const s = simulate(pr);
       if (s.phases.some(p => p.key === 'merge')) stats.merged++;
       if (s.gated) stats.gated++;
@@ -1289,7 +1375,7 @@
     const statsEl = $('stats');
     statsEl.textContent = '';
     [
-      [stats.merged, 'of ' + samplePRs.length + ' merge'],
+      [stats.merged, 'of ' + prs.length + ' merge'],
       [stats.gated, 'hit phase-4 gate'],
       [stats.codexTouched, 'routed to codex'],
       [stats.handoff, 'manual handoff'],
@@ -1406,12 +1492,12 @@
   }
 
   // ---------------------------------------------------------------------
-  // Header pill + sim hint
+  // Header pill + sim hint — a function (not a run-once block) so a runtime
+  // public-repo load can flip synthetic → live without a reload (#732).
   // ---------------------------------------------------------------------
-  {
+  function renderHeaderPill(isLive, n) {
     const pill = $('livePill');
     const hint = $('simHint');
-    const n = samplePRs.length;
     if (isLive) {
       pill.textContent = 'live · ' + n;
       pill.classList.remove('synthetic');
@@ -1419,10 +1505,135 @@
       hint.textContent = 'Replaying last ' + n + ' merged PRs from your repo.';
     } else {
       pill.textContent = 'synthetic · ' + n;
+      pill.classList.add('synthetic');
       pill.setAttribute('aria-label', 'Synthetic sample data, ' + n + ' pull requests');
       hint.textContent = n > 0
         ? 'Replaying a synthetic set. Pull live PRs to use your repo.'
         : 'No PRs loaded. Pull live PRs to populate.';
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Public-repo loader (#732) — unauthenticated GitHub REST, user-initiated.
+  //
+  // The list endpoint carries neither line counts nor changed paths, so a
+  // load costs 1 list request + one /pulls/{n}/files request per merged PR
+  // against GitHub's 60 req/hr/IP unauthenticated budget. /files is read as
+  // a single page (per_page=100): PRs with >100 changed files undercount
+  // `lines` and drop the overflow paths — documented, acceptable for a
+  // playground. No PAT/token field, ever: private repos and larger pulls
+  // stay on the authenticated scripts/policy-sim.sh path.
+  // ---------------------------------------------------------------------
+  // Each segment must contain at least one non-dot character: a segment made
+  // only of dots (e.g. "..", ".") lets a slug like "../.." pass the charset
+  // check and normalize to an unintended GitHub API path once interpolated.
+  // The negative lookaheads reject a dot-only run up to the "/" (owner) or
+  // end of string (repo) before the charset class is allowed to match it.
+  const REPO_RE = /^(?!\.+\/)[A-Za-z0-9_.-]+\/(?!\.+$)[A-Za-z0-9_.-]+$/;
+
+  function rateLimitMsg(res) {
+    return res.headers.get('X-RateLimit-Remaining') === '0'
+      ? 'GitHub rate limit hit (60/hr unauthenticated). Try later or use policy-sim.sh.'
+      : 'GitHub returned 403.';
+  }
+
+  // Wraps fetch with a client-side timeout so a request that never settles
+  // can't wedge repoLoadInFlight (and the Load button) for the rest of the
+  // session. Plain AbortController + setTimeout — no dependency needed. The
+  // timer is always cleared, on both the success and the abort/error path.
+  async function fetchWithTimeout(url, opts) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LIMITS.repoFetchTimeoutMs);
+    try {
+      return await fetch(url, Object.assign({}, opts, { signal: controller.signal }));
+    } catch (e) {
+      if (e && e.name === 'AbortError') {
+        throw new Error('Request timed out after ' + (LIMITS.repoFetchTimeoutMs / 1000) + 's.');
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function loadPublicRepo(slug, limit) {
+    // Validate + length-cap BEFORE any URL interpolation.
+    if (typeof slug !== 'string' || slug.length > LIMITS.repoSlugMaxLen || !REPO_RE.test(slug)) {
+      throw new Error('Expected owner/repo');
+    }
+    const n = Math.max(1, Math.min(LIMITS.repoFetchMax,
+      Number.isFinite(+limit) ? Math.trunc(+limit) : LIMITS.repoFetchDefault));
+    const parts = slug.split('/');
+    // Percent-encode before URL interpolation, defense-in-depth alongside
+    // REPO_RE (the charset REPO_RE allows needs no encoding today, but this
+    // keeps the interpolation safe independent of the validation regex).
+    const owner = encodeURIComponent(parts[0]), repo = encodeURIComponent(parts[1]);
+    const base = 'https://api.github.com';
+    const headers = { Accept: 'application/vnd.github+json' };
+
+    // 1 request: recent closed PRs (the list endpoint has no additions/paths).
+    // state=closed includes closed-unmerged PRs, so a page of exactly n can
+    // yield fewer than n merged even when older merged PRs exist. Over-fetch
+    // candidates (3n, capped at 100 — still ONE list request) and slice the
+    // merged results to n, keeping the 1 + at-most-n /files request budget.
+    const perPage = Math.min(100, 3 * n);
+    const listRes = await fetchWithTimeout(
+      base + '/repos/' + owner + '/' + repo + '/pulls?state=closed&per_page=' + perPage +
+      '&sort=updated&direction=desc',
+      { headers });
+    if (listRes.status === 404) throw new Error('Repo not found or private');
+    if (listRes.status === 403) throw new Error(rateLimitMsg(listRes));
+    if (!listRes.ok) throw new Error('GitHub ' + listRes.status);
+    const listBody = await listRes.json();
+    const merged = (Array.isArray(listBody) ? listBody : [])
+      .filter(pr => pr && pr.merged_at)
+      .slice(0, n);
+
+    // N requests: /files yields BOTH paths and additions/deletions. A /files
+    // failure mid-sequence (e.g. the rate limit exhausting partway through)
+    // ABORTS the whole load — the caller keeps the existing view rather than
+    // silently replacing it with a partial subset that would misrepresent
+    // the repo's routing mix.
+    const prs = [];
+    for (const pr of merged) {
+      const filesRes = await fetchWithTimeout(
+        base + '/repos/' + owner + '/' + repo + '/pulls/' + pr.number + '/files?per_page=100',
+        { headers });
+      if (filesRes.status === 403) throw new Error(rateLimitMsg(filesRes));
+      if (!filesRes.ok) throw new Error('GitHub ' + filesRes.status + ' on #' + pr.number + ' files');
+      const filesBody = await filesRes.json();  // one page; >100-file PRs truncate
+      const files = Array.isArray(filesBody) ? filesBody : [];
+      // Author detection mirrors scripts/policy-sim.sh: Authoring-Agent:
+      // trailer in the PR body first, then the GitHub login.
+      const m = String(pr.body || '').match(/Authoring-Agent:\s*([A-Za-z0-9_-]+)/);
+      prs.push({
+        id: '#' + pr.number,
+        title: pr.title,
+        author: m ? m[1] : (pr.user && pr.user.login) || 'unknown',
+        lines: files.reduce((t, f) => t + (+f.additions || 0) + (+f.deletions || 0), 0),
+        paths: files.map(f => f.filename),
+      });
+    }
+    return prs;
+  }
+
+  let repoLoadInFlight = false;
+  async function pullPublicRepo(slug, limit) {
+    if (repoLoadInFlight) return;
+    repoLoadInFlight = true;
+    announce('Loading ' + slug + '…');
+    try {
+      livePRs = await loadPublicRepo(slug, limit);
+      renderHeaderPill(true, livePRs.length);
+      renderAll();
+      announce('Loaded ' + livePRs.length + ' merged PRs from ' + slug + '.');
+      closeModal();
+    } catch (e) {
+      // Every failure — invalid slug, 404, 403 rate limit, network error —
+      // only announces; the current view stays intact.
+      announce('Could not load ' + slug + ': ' + ((e && e.message) || 'network error'));
+    } finally {
+      repoLoadInFlight = false;
     }
   }
 
@@ -1693,6 +1904,17 @@
     closeModal();
   });
 
+  // Public-repo loader controls (#732).
+  function submitRepoLoad() {
+    const slug = ($('repoSlugInput').value || '').trim();
+    const limit = parseInt($('repoLimit').value, 10);
+    pullPublicRepo(slug, Number.isFinite(limit) ? limit : LIMITS.repoFetchDefault);
+  }
+  $('repoLoadBtn').addEventListener('click', submitRepoLoad);
+  $('repoSlugInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); submitRepoLoad(); }
+  });
+
   // ---------------------------------------------------------------------
   // Sync scroll between the rail and the workspace
   //
@@ -1739,6 +1961,7 @@
   // Go
   // ---------------------------------------------------------------------
   syncFeedbackControls();  // make the feedback-policy controls authoritative on load
+  renderHeaderPill(isLiveData(), currentPRs().length);
   renderAll();
   initSyncScroll();
 </script>
