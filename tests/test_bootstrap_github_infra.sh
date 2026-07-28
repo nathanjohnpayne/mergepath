@@ -378,7 +378,13 @@ grep -rq 'op://Private/REVIEWER_ASSIGNMENT_PAT' "$ROOT/scripts/bootstrap/" \
   || pass "no title-based op://…/REVIEWER_ASSIGNMENT_PAT/… reference remains"
 
 # Variant runner without the inline PAT so the cached-env / miss paths
-# are reachable (run_wizard pins BOOTSTRAP_REVIEWER_PAT_VALUE).
+# are reachable (run_wizard pins BOOTSTRAP_REVIEWER_PAT_VALUE). The
+# earlier `unset BOOTSTRAP_REVIEWER_PAT_VALUE` (assertion 7) already
+# clears it in-process, but pin it to empty here too so this runner
+# is self-contained and doesn't depend on ordering against an unset
+# ~120 lines earlier — an inherited/exported value from the invoking
+# shell would otherwise take precedence and invalidate assertions
+# 12-14.
 run_wizard_nopat() {
   PATH="$SHIM_PATH" \
   SHIM_LOG="$SHIM_LOG" \
@@ -391,6 +397,7 @@ run_wizard_nopat() {
   BOOTSTRAP_AUTHOR_EMAIL="t@t" \
   BOOTSTRAP_SKIP_AUTHOR_TOKEN=1 \
   BOOTSTRAP_SKIP_INVITE_PAUSE=1 \
+  BOOTSTRAP_REVIEWER_PAT_VALUE="" \
   BOOTSTRAP_SKIP_STAGES=board-and-summary \
   "$SCRIPT" "$@"
 }
@@ -470,6 +477,39 @@ if [ -f "$TARGET8/.bootstrap-state" ] && grep -q "^github-infra\$" "$TARGET8/.bo
 else
   pass "github-infra NOT recorded under strict-secrets PAT miss (resume can retry)"
 fi
+
+# --- assertion 15: BOOTSTRAP_STRICT_SECRETS=1 + a `gh secret set`
+# failure AFTER a PAT was obtained (as opposed to the "no PAT
+# available" miss covered by assertion 14) still fails the stage
+# AND persists the failure to the warnings sidecar. Before this fix
+# the strict branch returned before bootstrap::record_warning ran,
+# so the failure vanished from `.bootstrap-state.warnings` the
+# moment the stage aborted, leaving no trail for a later --resume
+# or a human auditing the sidecar.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET9="$WORKDIR/new-repo-strict-secretset-fail"
+rm -rf "$TARGET9"
+set +e
+out=$(SHIM_EXIT_SECRET=1 BOOTSTRAP_STRICT_SECRETS=1 BOOTSTRAP_REVIEWER_PAT_VALUE="fake-pat" \
+        run_wizard strictsecretfail-repo \
+        --target-dir "$TARGET9" \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new 2>&1)
+ec=$?
+set -e
+[ "$ec" -ne 0 ] \
+  && pass "BOOTSTRAP_STRICT_SECRETS=1 fails the run when gh secret set fails after a PAT was obtained (rc=$ec)" \
+  || fail "strict-secrets run should fail on a gh-secret-set failure; rc=$ec, out: $out"
+if [ -f "$TARGET9/.bootstrap-state" ] && grep -q "^github-infra\$" "$TARGET9/.bootstrap-state"; then
+  fail "github-infra recorded despite strict-secrets gh-secret-set failure"
+else
+  pass "github-infra NOT recorded under strict-secrets gh-secret-set failure (resume can retry)"
+fi
+[ -s "$TARGET9/.bootstrap-state.warnings" ] \
+  && grep -q "REVIEWER_ASSIGNMENT_TOKEN provisioning failed" "$TARGET9/.bootstrap-state.warnings" \
+  && pass "strict-secrets gh-secret-set failure recorded in .bootstrap-state.warnings sidecar" \
+  || fail "warnings sidecar missing the strict-mode secret-set failure: $(cat "$TARGET9/.bootstrap-state.warnings" 2>/dev/null)"
 
 # --- summary --------------------------------------------------------------
 echo

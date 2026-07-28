@@ -154,6 +154,15 @@ bootstrap::stage_github_infra() {
       # to a stage failure for callers that must not ship without it.
       if [ "${BOOTSTRAP_STRICT_SECRETS:-0}" = "1" ]; then
         bootstrap::err "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$step_rc) and BOOTSTRAP_STRICT_SECRETS=1 — failing the stage"
+        # Persist the failure to the warnings sidecar even though the
+        # stage is about to fail fatally. Without this, a `gh secret
+        # set` failure that happens AFTER a PAT was obtained (as
+        # opposed to the "no PAT available" sub-path, which already
+        # records its own warning before returning) vanishes from
+        # `.bootstrap-state.warnings` the moment the stage aborts —
+        # a later --resume (or a human auditing the sidecar) has no
+        # record the failure ever happened.
+        bootstrap::record_warning "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$step_rc); BOOTSTRAP_STRICT_SECRETS=1 failed the stage — fix and re-run with --resume template-mirror"
         bootstrap::_restore_active_if_needed
         return "$step_rc"
       fi

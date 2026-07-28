@@ -111,7 +111,7 @@ For runtime application secrets in newly bootstrapped repos, do not add Secure N
 
 All write-path `gh` calls run under the author identity (`nathanjohnpayne`) through token-verifying helpers. Stage B/C/E live writes use `scripts/gh-as-author.sh` per command, so the machine-global gh account selection is not read or changed for attribution.
 
-**Failure recovery.** Hard failures on `gh repo create` are fatal (stage returns non-zero, state file omits the entry). Secret-provision failures are warned-but-not-fatal: workflows will fail loudly on the first PR if the token isn't set, surfacing the gap.
+**Failure recovery.** Hard failures on `gh repo create` are fatal (stage returns non-zero, state file omits the entry). Secret-provision failures are recorded-but-not-fatal by default: workflows will fail loudly on the first PR if the token isn't set, and the miss is persisted to `<target>/.bootstrap-state.warnings` and re-surfaced in the end-of-run summary's `!! RECORDED FAILURES` block so it can't ship unnoticed (#734). Set `BOOTSTRAP_STRICT_SECRETS=1` to upgrade the miss to a fatal stage failure instead — the failure is still recorded to the warnings sidecar before the stage aborts.
 
 ### Stage D: firebase-and-codereview (#206 / sub-D)
 
@@ -149,7 +149,7 @@ Implementation: `scripts/bootstrap/board-and-summary.sh`.
    - `REPO` / `PROJECT` / `LOCAL DIR` header.
    - `DONE` — stages found in the state file at summary time.
    - `SKIPPED` — stages NOT in the state file (or whose sub-steps were explicitly skipped, e.g., Firebase under `--skip-firebase`).
-   - `WARNINGS` — things the wizard couldn't automate (e.g., `.env.local` from Firebase web console; collaborator invite acceptance).
+   - `WARNINGS` — things the wizard couldn't automate (e.g., `.env.local` from Firebase web console; collaborator invite acceptance), plus a `!! RECORDED FAILURES` sub-block when `<target>/.bootstrap-state.warnings` is non-empty (e.g., a missed `REVIEWER_ASSIGNMENT_TOKEN` provisioning — #734), so a recorded miss can't ship unnoticed.
    - `CROSS-REPO LOOP UPDATE` — pointer to the Mergepath PR opened in stage B (or a manual-action note if anchors were absent).
    - `NEXT STEPS (human-action)` — the explicit checklist of things the operator owns: accept invites, **enroll the repo as a `.mergepath-sync.yml` consumer** (so it receives ongoing propagation, not just the one-time rsync — mergepath#741), write the canonical PRD in `nathanjohnpayne/docs/projects/<repo>/prds/`, fill the repo-local implementation spec, populate issues, set spend caps, drive Sprint 0.
 
