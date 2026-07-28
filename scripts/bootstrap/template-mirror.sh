@@ -144,6 +144,12 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   'specs/mergepath_playground.md'
   'plans/mergepath-playground.md'
 
+  # Bootstrap consumer-identity spec (#747): describes hub-only bootstrap
+  # machinery and maps to the hub-only tests/test_bootstrap_template_mirror.sh
+  # in spec_test_map - shipping it without the test reds a consumer's
+  # check_spec_test_alignment.
+  'specs/bootstrap_consumer_identity.md'
+
   # Mergepath-internal policy simulation tool
   'scripts/policy-sim.sh'
 
