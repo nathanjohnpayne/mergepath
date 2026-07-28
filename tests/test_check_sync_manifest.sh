@@ -953,6 +953,62 @@ else
   fail "Case 32 unexpected (rc=$rc): $out"
 fi
 
+# Case 33: a CANONICAL entry whose explicit `source:` is a denied identity
+# doc, with an innocuous path/dest, must FAIL (#763). The denylist compared
+# only norm_path/norm_dest, so this verbatim-mirrored BRAND.md into every
+# consumer under a harmless-looking destination.
+MANIFEST_ID_CANON_SRC="$MIN_HEADER
+  - path: docs/brand-mirror.md
+    source: BRAND.md
+    type: canonical
+    consumers: all
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_ID_CANON_SRC" "$(printf 'docs/brand-mirror.md\nBRAND.md')"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "BRAND.md" && \
+   echo "$out" | grep -q "#743"; then
+  pass "Case 33: canonical entry sourced FROM an identity doc fails closed (#763)"
+else
+  fail "Case 33 unexpected (rc=$rc): $out"
+fi
+
+# Case 34: same for a KIT entry.
+MANIFEST_ID_KIT_SRC="$MIN_HEADER
+  - path: docs/mirrored/
+    source: BRAND.md
+    type: kit
+    consumers: all
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_ID_KIT_SRC" "$(printf 'docs/mirrored/\nBRAND.md')"); rc=$?
+set -e
+if [ "$rc" = "1" ] && \
+   echo "$out" | grep -q "BRAND.md" && \
+   echo "$out" | grep -q "#743"; then
+  pass "Case 34: kit entry sourced FROM an identity doc fails closed (#763)"
+else
+  fail "Case 34 unexpected (rc=$rc): $out"
+fi
+
+# Case 35: CONTROL — a canonical entry with a non-denied explicit source must
+# still PASS, so Cases 33/34 are not just "any source: fails".
+MANIFEST_OK_SRC="$MIN_HEADER
+  - path: docs/ordinary-mirror.md
+    source: docs/ordinary.md
+    type: canonical
+    consumers: all
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_OK_SRC" "$(printf 'docs/ordinary-mirror.md\ndocs/ordinary.md')"); rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 35: canonical entry with a non-denied source still passes (#763 control)"
+else
+  fail "Case 35 unexpected (rc=$rc): $out"
+fi
+
 echo
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -gt 0 ]; then

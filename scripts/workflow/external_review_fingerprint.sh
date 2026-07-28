@@ -212,9 +212,12 @@ if [ -n "$PATHS" ]; then
     [ -n "$line" ] && PATTERNS+=("$line")
   done <<<"$PATHS"
   if [ "${#PATTERNS[@]}" -gt 0 ]; then
-    # Both sides of a rename — see the .previous_filename note above.
-    ALL_FILES=$(printf '%s' "$FILES_JSON" | jq -r '.[] | (.filename, (.previous_filename // empty))')
-    MATCHED_FILES=$(printf '%s\n' "$ALL_FILES" | bash "$MATCH" "${PATTERNS[@]}")
+    # Reuse ALL_CHANGED_FILES rather than re-deriving the rename expansion
+    # (#763). Two independent copies of that jq could drift, and then
+    # protected-path matching and fingerprint construction would silently
+    # disagree about which paths the PR touches — one deciding whether review
+    # is required, the other deciding whether a prior verdict still applies.
+    MATCHED_FILES=$(printf '%s\n' "$ALL_CHANGED_FILES" | bash "$MATCH" "${PATTERNS[@]}")
   fi
 fi
 
