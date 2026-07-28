@@ -555,19 +555,37 @@ EOF
   # reshaped policy is left untouched; inside the gate, fail closed if
   # either edit missed (heading or paragraph reshaped without the
   # marker moving). The replacement consumes the whole paragraph
-  # through its terminating blank line, so a hard-wrapped upstream
-  # variant cannot leak continuation lines past the marker check
-  # (which only sees the marker's own line).
+  # through its terminating blank line OR the next heading line,
+  # whichever comes first — a heading immediately following the
+  # paragraph with no blank-line separator is still valid Markdown,
+  # and consuming only up to the blank line would swallow it too. A
+  # hard-wrapped upstream variant cannot leak continuation lines past
+  # the marker check either way (which only sees the marker's own
+  # line), and the post-transform Phase 4 heading assertion below
+  # fails closed if the heading itself ever got swallowed.
   local policy_doc="$target/REVIEW_POLICY.md"
   local wave_marker='**Wave audit (#662).**'
+  local phase4_marker='### Phase 4: External Review'
   if [ -f "$policy_doc" ] && grep -qF "$wave_marker" "$policy_doc"; then
+    # Recorded pre-transform so the post-transform assertion below only
+    # fires when the heading was actually there to lose — it's the
+    # concrete regression check for the paragraph-consumer swallowing a
+    # heading that follows with no blank-line separator.
+    local had_phase4_heading=0
+    if grep -qF "$phase4_marker" "$policy_doc"; then
+      had_phase4_heading=1
+    fi
     if ! awk -v hub_url="$hub_url" '
       in_wave_para {
         # Consume the wave-audit paragraph through its terminating
         # blank line. The repo enforces soft-wrap (one physical line
         # per paragraph), so this is normally a single next; it exists
         # so a hard-wrapped variant cannot leak continuation lines.
-        if ($0 ~ /^[[:space:]]*$/) { in_wave_para = 0; print }
+        if ($0 ~ /^[[:space:]]*$/) { in_wave_para = 0; print; next }
+        # A heading immediately following the paragraph (no blank
+        # line before it) also terminates consumption — print it and
+        # stop, rather than swallowing it as a "continuation line".
+        if ($0 ~ /^#/) { in_wave_para = 0; print; next }
         next
       }
       /^### Phase 3\.5: Propagation PR review lane[[:space:]]*$/ {
@@ -595,6 +613,11 @@ EOF
     if ! grep -qF 'Consumer note (hub-side machinery)' "$policy_doc.bootstrap-tmp"; then
       rm -f "$policy_doc.bootstrap-tmp"
       bootstrap::err "consumer-identity scaffold: REVIEW_POLICY.md Phase 3.5 heading not found for the consumer note (section reshaped upstream?); failing closed"
+      return 1
+    fi
+    if [ "$had_phase4_heading" -eq 1 ] && ! grep -qF "$phase4_marker" "$policy_doc.bootstrap-tmp"; then
+      rm -f "$policy_doc.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: REVIEW_POLICY.md '$phase4_marker' heading vanished after the wave-audit reframe (swallowed by the paragraph consumer, or section reshaped upstream?); failing closed"
       return 1
     fi
     mv "$policy_doc.bootstrap-tmp" "$policy_doc"

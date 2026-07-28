@@ -18,7 +18,9 @@
 #      packaging/Repository-Layout section is scrubbed, the README.md
 #      hub identity + dead Key-Files rows are scrubbed (#747), and the
 #      REVIEW_POLICY.md wave-audit passage is reframed as hub-side
-#      machinery (#747).
+#      machinery (#747), stopping at a hard-wrap continuation line OR a
+#      heading with no blank line before it, whichever comes first
+#      (round-2 #3662388686).
 #   5. .repo-template.yml has the playground spec_test_map entry
 #      and extra_top_level_dirs dropped.
 #   6. The target has a single initial git commit.
@@ -639,6 +641,58 @@ grep -qF "Lane intro survives." "$hw_target/REVIEW_POLICY.md" \
   && grep -qF "Phase 4 body survives." "$hw_target/REVIEW_POLICY.md" \
   && pass "hard-wrapped consume stopped at the paragraph boundary (neighbors intact)" \
   || fail "hard-wrapped consume over-ran the paragraph boundary"
+
+# --- assertion 4g: wave-audit reframe stops at a heading with NO blank
+#     line before it (Codex round-2 #3662388686) ---
+# Valid Markdown does not require a blank line between a paragraph and
+# the heading that follows it. The paragraph consumer must stop at the
+# heading rather than swallowing it as a "continuation line" of the
+# hard-wrap case above.
+nb_target="$WORKDIR/noblank-target"
+mkdir -p "$nb_target"
+cat >"$nb_target/REVIEW_POLICY.md" <<'EOF'
+# Policy
+
+### Phase 3.5: Propagation PR review lane
+
+Lane intro survives.
+
+**Wave audit (#662).** `scripts/wave-audit.sh` dispatches a scoped automated Phase 4b review against the wave canary.
+### Phase 4: External Review
+
+Phase 4 body survives.
+EOF
+set +e
+nb_out=$(bash -c '
+  ROOT="'"$ROOT"'"
+  TARGET="'"$nb_target"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/substitute.sh"
+  . "$ROOT/scripts/bootstrap/template-mirror.sh"
+  set +e
+  bootstrap_input() { echo "my-new-repo"; }
+  BOOTSTRAP_DRY_RUN=0
+  BOOTSTRAP_LOG_FILE=""
+  bootstrap::_scaffold_consumer_identity "$TARGET"
+  echo "RC=$?"
+' 2>&1)
+nb_ec=$?
+set -e
+echo "$nb_out" | grep -q "RC=0" \
+  && pass "scaffold helper handles the no-blank-line-before-heading fixture (rc=0)" \
+  || fail "scaffold helper failed on no-blank-line-before-heading fixture; out: $nb_out"
+grep -q "^### Phase 4: External Review" "$nb_target/REVIEW_POLICY.md" \
+  && pass "Phase 4 heading survives when it directly follows the wave-audit paragraph (no blank line)" \
+  || fail "Phase 4 heading was swallowed by the wave-audit paragraph consumer"
+grep -qF "Phase 4 body survives." "$nb_target/REVIEW_POLICY.md" \
+  && pass "Phase 4 body survives the no-blank-line-before-heading reframe" \
+  || fail "Phase 4 body lost in the no-blank-line-before-heading reframe"
+grep -qF "**Wave audit (hub-side).**" "$nb_target/REVIEW_POLICY.md" \
+  && pass "no-blank-line-before-heading fixture got the hub-side wave-audit pointer" \
+  || fail "hub-side wave-audit pointer missing from no-blank-line-before-heading fixture"
+grep -qF "Lane intro survives." "$nb_target/REVIEW_POLICY.md" \
+  && pass "no-blank-line-before-heading consume stopped at the paragraph boundary (neighbors intact)" \
+  || fail "no-blank-line-before-heading consume over-ran the paragraph boundary"
 
 # .ai_context.md has no mergepath refs to begin with — substitution
 # should produce a byte-identical file (warning logged but no error).
