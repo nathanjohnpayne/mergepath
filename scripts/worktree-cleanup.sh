@@ -245,13 +245,22 @@ worktree_pr_num() {
 # `*.key`, `.claude/settings.local.json` or `node_modules/` reads as clean and
 # `git worktree remove` destroys it (verified: this happens with AND without
 # `--force`, so git's own dirty check is no backstop) — #762 r2 P2.
+#
+# Both listing flags are passed EXPLICITLY so operator configuration cannot
+# weaken a safety check. `status.showUntrackedFiles=no` (repo or global)
+# suppresses `??` records, so plain `git status --porcelain` reports an empty
+# status for a worktree full of untracked work and this helper would call it
+# `clean` — `--apply` then deletes it. `--untracked-files=all` overrides that
+# config, and also expands directories so an untracked directory cannot hide
+# its contents behind a single summary entry. `--ignored` covers the separate
+# gitignored case above. Neither flag implies the other (#762 r3 P1).
 worktree_content_state() {
   local path="$1" status
   if [ ! -d "$path" ]; then
     echo "missing"
     return 1
   fi
-  if ! status=$(git -C "$path" status --porcelain --ignored 2>/dev/null); then
+  if ! status=$(git -C "$path" status --porcelain --ignored --untracked-files=all 2>/dev/null); then
     echo "dirty"
     return 1
   fi

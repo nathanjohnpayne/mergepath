@@ -255,6 +255,33 @@ if [ -n "$(git -C "$IGNORED_PR_WT" status --porcelain)" ]; then
   fail "fixture setup: expected plain --porcelain to be EMPTY for the ignored-only worktree"
 fi
 
+# ── Case 18b (#762 r3 P1): UNTRACKED-only worktree, `status.showUntrackedFiles=no`
+# A safety check must not be defeatable by operator configuration. With that
+# setting (repo- or user-global), `git status --porcelain` suppresses `??`
+# records entirely, so a worktree full of untracked work reports an EMPTY
+# status and reads as `clean` — and `--apply` deletes it. `--ignored` does NOT
+# restore them; only an explicit `--untracked-files=all` overrides the config.
+UNTRACKED_PR_NUM=55555
+UNTRACKED_PR_BRANCH="pr-branch-untracked"
+git branch "$UNTRACKED_PR_BRANCH"
+git push -q -u origin "$UNTRACKED_PR_BRANCH"
+UNTRACKED_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${UNTRACKED_PR_NUM}-untracked"
+git worktree add -q "$UNTRACKED_PR_WT" "$UNTRACKED_PR_BRANCH"
+git -C "$UNTRACKED_PR_WT" config status.showUntrackedFiles no
+UNTRACKED_CANARY="$UNTRACKED_PR_WT/draft-notes.md"
+echo "hours of uncommitted analysis" > "$UNTRACKED_CANARY"
+mkdir -p "$UNTRACKED_PR_WT/scratch"
+echo "more unsaved work" > "$UNTRACKED_PR_WT/scratch/wip.txt"
+# Sanity-check the premise the same way the ignored fixture does: BOTH the
+# plain form and the `--ignored` form must be silent here, or this fixture
+# proves nothing about the new flag.
+if [ -n "$(git -C "$UNTRACKED_PR_WT" status --porcelain)" ]; then
+  fail "fixture setup: expected plain --porcelain to be EMPTY under status.showUntrackedFiles=no"
+fi
+if [ -n "$(git -C "$UNTRACKED_PR_WT" status --porcelain --ignored)" ]; then
+  fail "fixture setup: expected --ignored alone to be EMPTY under status.showUntrackedFiles=no"
+fi
+
 # ── Case 18 (#762 r2 P3): same shape, registered dir DELETED ──────────
 # `git worktree list --porcelain` still carries the entry (with a `prunable`
 # line the record parser ignores), and the branch/HEAD fields make it look
@@ -948,6 +975,30 @@ if [ -f "$IGNORED_PR_WT/node_modules/pkg/index.js" ]; then
   pass "gitignored node_modules/ survived --apply"
 else
   fail "DATA LOSS: --apply deleted node_modules/ in $IGNORED_PR_WT"
+  echo "$OUT2" >&2
+fi
+
+# Case 18b (#762 r3 P1): the UNTRACKED-only worktree under
+# `status.showUntrackedFiles=no` survives --apply. Pre-fix the status probe
+# returned empty for it, the helper reported `clean`, and --apply removed the
+# directory with every untracked file in it — a safety check silently disabled
+# by a config setting the operator may not even know is inherited.
+if [ -d "$UNTRACKED_PR_WT" ]; then
+  pass "untracked-only worktree retained by --apply under status.showUntrackedFiles=no"
+else
+  fail "untracked-only worktree was removed by --apply despite untracked content"
+  echo "$OUT2" >&2
+fi
+if [ -f "$UNTRACKED_CANARY" ] && grep -q "uncommitted analysis" "$UNTRACKED_CANARY"; then
+  pass "untracked canary survived --apply under status.showUntrackedFiles=no"
+else
+  fail "DATA LOSS: --apply deleted untracked content in $UNTRACKED_PR_WT"
+  echo "$OUT2" >&2
+fi
+if [ -f "$UNTRACKED_PR_WT/scratch/wip.txt" ]; then
+  pass "untracked scratch/ directory survived --apply"
+else
+  fail "DATA LOSS: --apply deleted untracked scratch/ in $UNTRACKED_PR_WT"
   echo "$OUT2" >&2
 fi
 
