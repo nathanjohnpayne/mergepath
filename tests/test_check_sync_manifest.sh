@@ -1084,8 +1084,8 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   #
   # Fence tracking follows CommonMark, the same delimiter rules the
   # fence-aware section scan in scripts/audit-canonical-mirrors.sh
-  # applies. A naive unconditional toggle is
-  # not merely imprecise here, it is a BYPASS: a four-backtick fence
+  # applies. A naive unconditional toggle is not merely imprecise
+  # here, it is a BYPASS: a four-backtick fence
   # wrapping a literal ``` line (the standard way to show a fence inside
   # a fence, which a doc that prescribes markdown formats will reach
   # for) has its content line close the fence and its real closing
@@ -1101,16 +1101,25 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   #   * a closing fence carries no info string, so a literal ```bash
   #     shown inside an open block is content, not the closer.
   #
-  # Inline code spans are stripped by the SAME delimiter-run rule: a
-  # span opens on a run of N backticks and closes on a run of exactly
-  # N. A naive gsub(/`[^`]*`/) instead matches the two OPENING
-  # backticks of a ``#NN`` span as an empty single-backtick span,
-  # deletes them, and leaves the bare #NN exposed to BARE_ISSUE_RE — a
-  # FALSE POSITIVE that fails a required check on a doc whose #NN is
-  # code, not an issue reference. That form is reachable, not
-  # theoretical: a doc reaches for a multi-backtick span exactly when
-  # the span's content itself holds a backtick, which a doc prescribing
-  # markdown formats does.
+  # Inline code spans are matched by delimiter RUN LENGTH for the same
+  # reason fences are, but note the closing rule DIFFERS by design and
+  # the two must not be "unified": a fence closes on a run at least as
+  # long as the opener (>= fence_len, above), whereas a code span
+  # closes only on a run of EXACTLY the opening length. That is
+  # CommonMark, and it is what lets ``a`b`` hold a lone backtick.
+  #
+  # A naive gsub(/`[^`]*`/) instead matches the two OPENING backticks
+  # of a ``#NN`` span as an empty single-backtick span, deletes them,
+  # and leaves the bare #NN exposed to BARE_ISSUE_RE — a FALSE
+  # POSITIVE that fails a required check on a doc whose #NN is code,
+  # not an issue reference. That form is reachable, not theoretical: a
+  # doc reaches for a multi-backtick span exactly when the span's
+  # content itself holds a backtick, which a doc prescribing markdown
+  # formats does.
+  #
+  # An opening run with no equal-length closer is NOT a span — it stays
+  # literal, exactly as CommonMark renders it, so prose after it is
+  # still scanned rather than being swallowed to end of line.
   #
   # Every branch prints exactly one line per input line, preserving the
   # `grep -n` line numbering the diagnostics depend on.
