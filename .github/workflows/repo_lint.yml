@@ -252,12 +252,13 @@ jobs:
         run: ./scripts/ci/check_wave_audit
 
       - name: check_external_review_helpers
-        # Hub-only regression suites for the external-review helpers
-        # (#715/#716/#718 gh stdout-stderr separation + current-head short
-        # circuit; #763 base-only delta predicate). These helpers gate
-        # external review, and both suites were previously unwired.
-        # Consumer checkouts SKIP inside the wrapper (suites are hub-only;
-        # the helpers themselves travel under the scripts/workflow/ kit).
+        # Hub-only regression suite for the external-review helpers
+        # (#715/#716 gh stdout-stderr separation, #718 current-head short
+        # circuit). These helpers gate whether external review is required
+        # at all, and the suite was previously unwired and never ran —
+        # wired in #763. Consumer checkouts SKIP inside the wrapper (the
+        # suite is hub-only; the helpers themselves travel under the
+        # scripts/workflow/ kit entry).
         run: ./scripts/ci/check_external_review_helpers
 
       - name: check_coderabbit_severity_gate

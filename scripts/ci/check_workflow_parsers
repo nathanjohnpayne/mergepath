@@ -317,16 +317,6 @@ JSON
   repos/example/repo/compare/base-current...basechanged)
     if [ "${2:-}" = "--jq" ]; then echo "base-changed"; else echo '{"merge_base_commit":{"sha":"base-changed"}}'; fi
     ;;
-  repos/example/repo/compare/reviewed...*|repos/example/repo/compare/intermediate...*|repos/example/repo/compare/commit-updated...*)
-    # #763 base-only delta probe. Distinguished from the merge-base
-    # lookups above by the LEFT side being a reviewed-commit sha rather
-    # than base-current/base-changed; the predicate calls this without
-    # --jq and reads .files itself. Every path that changed since the
-    # reviewed commit here is base-derived — none is in this PR's own net
-    # diff (.github/dependabot.yml, README.md) — so carry-forward is
-    # allowed to proceed to its fingerprint comparison.
-    echo '{"files":[{"filename":"vendor/base-only.txt"}]}'
-    ;;
   repos/example/repo/issues/7/comments)
     cat <<'JSON'
 [{"user":{"login":"chatgpt-codex-connector[bot]"},"body":"Codex Review: Didn't find any major issues.\nReviewed commit: abc1234","created_at":"2026-07-06T10:00:00Z"}]
