@@ -53,10 +53,12 @@
 #   --purge-all      Delete ALL session files + ADC tempfiles under the cache dir
 #
 # Environment:
-#   OP_PREFLIGHT_TTL_SECONDS  Override default TTL (14400s = 4h). Age is
-#                             measured against the session file's embedded
-#                             timestamp, not file mtime, so `touch`-ing the
-#                             file does NOT extend its effective lifetime.
+#   OP_PREFLIGHT_TTL_SECONDS  Override default TTL (36000s = 10h; raised
+#                             from 4h in #765). Shortens or lengthens the
+#                             window. Age is measured against the session
+#                             file's embedded timestamp, not file mtime,
+#                             so `touch`-ing the file does NOT extend its
+#                             effective lifetime.
 #   OP_PREFLIGHT_CACHE_DIR    Override cache dir (default
 #                             $XDG_CACHE_HOME/mergepath or $HOME/.cache/mergepath).
 #   OP_PREFLIGHT_SSH_WARM_TTL_SECONDS
@@ -64,7 +66,8 @@
 #                             1800s = 30 min). Independent of the PAT
 #                             cache TTL because the 1Password SSH agent
 #                             has its own session lifetime, typically
-#                             shorter than 4h. Skipping re-warm within
+#                             much shorter than 10h — it does NOT move
+#                             with the PAT TTL. Skipping re-warm within
 #                             this window prevents a biometric prompt on
 #                             every cache-hit invocation. See #163.
 #   OP_PREFLIGHT_QUIET        When set to 1, suppress the verbose
@@ -172,7 +175,7 @@ ssh_host_for() {
 # biometric burst across repos for no security gain.
 DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/mergepath"
 CACHE_DIR="${OP_PREFLIGHT_CACHE_DIR:-$DEFAULT_CACHE_DIR}"
-DEFAULT_TTL_SECONDS=14400  # 4 hours
+DEFAULT_TTL_SECONDS=36000  # 10 hours
 TTL_SECONDS="${OP_PREFLIGHT_TTL_SECONDS:-$DEFAULT_TTL_SECONDS}"
 
 # ── GCP ADC ───────────────────────────────────────────────────────────
@@ -825,7 +828,7 @@ emit_from_session_file() (
 # session TTL — independent of the chmod-600 PAT cache. Re-warming
 # on every cache-hit invocation re-prompts biometric whenever the
 # 1Password agent's own session has expired (typically much shorter
-# than the 4h PAT TTL). Track an SSH-warm marker file and skip the
+# than the 10h PAT TTL). Track an SSH-warm marker file and skip the
 # warm if it's recent enough. The marker's age is the only thing
 # that matters here — if the 1Password agent expires inside our
 # SSH_WARM_TTL window, the next git push/pull still triggers

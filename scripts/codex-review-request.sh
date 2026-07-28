@@ -328,9 +328,9 @@ AUTHOR_IDENTITY=${AUTHOR_IDENTITY:-nathanjohnpayne}
 #      preflight_require_token above.
 #   2. The gh keyring's stored author account: `gh auth token --user
 #      <author_identity>`. This fallback closes the #737 gap. In a
-#      long-running session the op-preflight cache TTL (14400s) can lapse,
-#      leaving GH_TOKEN unset even though the keyring still has the author
-#      account authenticated. Before #737 the hard guard here exited 3
+#      long-running session the op-preflight cache TTL (36000s = 10h since
+#      #765) can lapse, leaving GH_TOKEN unset even though the keyring still
+#      has the author account authenticated. Before #737 the hard guard exited 3
 #      WITHOUT ever posting the trigger, so `@codex review` silently no-op'd;
 #      callers that pipe `| tail -1` and ignore the exit code then proceeded
 #      to merge as if Codex had been asked (observed on gaycruisebingo PRs

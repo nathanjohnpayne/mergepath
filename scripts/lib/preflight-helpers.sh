@@ -87,6 +87,25 @@ preflight_agent() {
   return 0
 }
 
+# Default cache TTL, used when OP_PREFLIGHT_TTL_SECONDS is unset or
+# malformed. This is the SECOND implementation of the freshness rule:
+# op-preflight.sh decides whether `--check` re-emits the cached PATs, and
+# this library decides whether the very same file auto-sources into a
+# helper. The two therefore MUST agree — a mismatch splits the verdict in
+# two, so a cache in the gap reads fresh to `op-preflight.sh --check`
+# while every auto-sourcing helper treats it as stale, silently degrading
+# reviewer-pinned `gh` calls to the ambient token (the #554 regression).
+#
+# MUST stay in lockstep with DEFAULT_TTL_SECONDS in scripts/op-preflight.sh
+# (#765: 14400 = 4h -> 36000 = 10h). tests/test_helper_autosource.sh's
+# test_lib_default_ttl_matches_script pins the two literals together so a
+# future bump to one cannot silently desynchronize from the other.
+#
+# Assigned unconditionally (not `:=`) so an ambient env var of the same
+# name cannot lengthen the window a helper considers fresh; the supported
+# per-invocation override is OP_PREFLIGHT_TTL_SECONDS, applied below.
+PREFLIGHT_DEFAULT_TTL_SECONDS=36000  # 10 hours
+
 # Internal: returns 0 if the session file is fresh per its embedded
 # OP_PREFLIGHT_CREATED_AT_EPOCH (NOT mtime) and the active TTL.
 preflight_session_is_fresh() {
@@ -97,8 +116,8 @@ preflight_session_is_fresh() {
     | cut -d= -f2- | tr -d "'\"" || true)
   [[ -z "$created_at" ]] && return 1
   [[ "$created_at" =~ ^[0-9]+$ ]] || return 1
-  ttl="${OP_PREFLIGHT_TTL_SECONDS:-14400}"
-  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=14400
+  ttl="${OP_PREFLIGHT_TTL_SECONDS:-$PREFLIGHT_DEFAULT_TTL_SECONDS}"
+  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl="$PREFLIGHT_DEFAULT_TTL_SECONDS"
   now=$(date +%s)
   age=$((now - created_at))
   [[ "$age" -lt "$ttl" ]]
