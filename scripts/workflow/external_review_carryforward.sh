@@ -106,6 +106,68 @@ $(cat "$err_file" 2>/dev/null)"
   return "$rc"
 }
 
+# (#763) Base-only delta predicate — an invariant on the RANGE, independent
+# of the fingerprint's invariant on the CONTENT.
+#
+# A fingerprint match proves the PR's net content over its CURRENT changed-path
+# set is byte-identical to what the candidate verdict reviewed. This adds a
+# second, independent requirement: every path whose content differs between the
+# reviewed commit and the current head must be base-derived — that is, it must
+# not still be part of this PR's own net diff against its merge base.
+#
+# A path that changed since the review AND is still one of the PR's own changed
+# files carries content the candidate verdict never saw, so carry-forward is
+# refused and a current-head review is required. This is the "prove the delta
+# since the reviewed commit is base-only" half of the carry-forward predicate;
+# the fingerprint alone constrains endpoints, not the path between them.
+#
+# Fails CLOSED: an unreadable or truncated comparison refuses the carry-forward
+# rather than assuming the range is clean.
+delta_is_base_only() {
+  local candidate_sha="$1"
+  local compare_json rc=0 offending
+
+  compare_json=$(gh_api_capture gh api "repos/$REPO/compare/$candidate_sha...$HEAD_SHA") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "external_review_carryforward.sh: could not compare $candidate_sha...$HEAD_SHA; refusing carry-forward" >&2
+    return 1
+  fi
+
+  # The compare endpoint caps .files at 300 entries; a truncated list cannot
+  # prove the range is base-only.
+  local file_count
+  file_count=$(printf '%s' "$compare_json" | jq -r '(.files // []) | length' 2>/dev/null) || file_count=""
+  case "$file_count" in
+    ''|*[!0-9]*)
+      echo "external_review_carryforward.sh: could not read the $candidate_sha...$HEAD_SHA file list; refusing carry-forward" >&2
+      return 1 ;;
+  esac
+  if [ "$file_count" -ge 300 ]; then
+    echo "external_review_carryforward.sh: $candidate_sha...$HEAD_SHA comparison is truncated (>=300 files); refusing carry-forward" >&2
+    return 1
+  fi
+
+  # NOTE: bind the element to $p BEFORE indexing into $pr_paths — a bare
+  # `$pr_paths | index(.filename)` would rebind `.` to the array and error.
+  offending=$(jq -r -n \
+    --argjson compare "$compare_json" \
+    --slurpfile pr_files "$FILES_JSON_PATH" '
+    ([$pr_files[0][]? | .filename]) as $pr_paths
+    | [ $compare.files[]? | .filename ]
+    | map(select(. as $p | $pr_paths | index($p)))
+    | .[]
+  ' 2>/dev/null) || {
+    echo "external_review_carryforward.sh: could not evaluate the $candidate_sha...$HEAD_SHA delta; refusing carry-forward" >&2
+    return 1
+  }
+
+  if [ -n "$offending" ]; then
+    echo "external_review_carryforward.sh: paths changed since reviewed commit $candidate_sha are still part of this PR's net diff; refusing carry-forward: $(printf '%s' "$offending" | tr '\n' ' ')" >&2
+    return 1
+  fi
+  return 0
+}
+
 TMP_FILES=""
 cleanup() {
   [ -z "$TMP_FILES" ] || rm -f "$TMP_FILES"
@@ -367,6 +429,10 @@ while IFS=$'\t' read -r source_time source_sha; do
   [ "$fp_rc" -eq 0 ] || continue
   SOURCE_FINGERPRINT=$(printf '%s' "$SOURCE_JSON" | jq -r '.fingerprint // ""')
   if [ "$SOURCE_FINGERPRINT" = "$CURRENT_FINGERPRINT" ]; then
+    # Content matches; now require the range itself to be base-only (#763).
+    if ! delta_is_base_only "$resolved_sha"; then
+      continue
+    fi
     jq -n \
       --arg kind "codex-verdict" \
       --arg source_commit "$resolved_sha" \

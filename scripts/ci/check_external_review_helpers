@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# scripts/ci/check_external_review_helpers — run the external-review helper
+# regression suites (#715, #716, #718, #763).
+#
+# Wraps the hermetic suites for scripts/workflow/external_review_fingerprint.sh
+# and scripts/workflow/external_review_carryforward.sh:
+#
+#   tests/test_external_review_gh_stderr.sh      — stdout/stderr separation on
+#       every gh call (#715/#716) and the affirmative current-head short
+#       circuit (#718).
+#   tests/test_external_review_base_only_delta.sh — the base-only delta
+#       predicate that gates carry-forward on the RANGE, not just the
+#       endpoints (#763), including its fail-closed paths.
+#
+# Both suites were previously unwired — the helpers gate external review, so
+# an unrun suite is a real coverage gap; this wrapper closes it.
+#
+# The two suites are HUB-ONLY (deliberately not in .mergepath-sync.yml) even
+# though the helpers they exercise are propagated under the scripts/workflow/
+# kit entry. A consumer checkout therefore SKIPs, using the same marker
+# disambiguation check_wave_audit / check_bootstrap_board_and_summary use
+# (#624): wrapped tests absent + scripts/sync-to-downstream.sh absent →
+# consumer checkout → SKIP; tests absent but the hub marker present → the hub
+# lost the suites → hard error; tests present → run them regardless.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SUITES="
+tests/test_external_review_gh_stderr.sh
+tests/test_external_review_base_only_delta.sh
+"
+
+missing=""
+for suite in $SUITES; do
+  [ -f "$REPO_ROOT/$suite" ] || missing="$missing $suite"
+done
+
+if [ -n "$missing" ]; then
+  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+    echo "check_external_review_helpers: SKIP (consumer checkout: wrapped tests + scripts/sync-to-downstream.sh both absent; hub-only external-review suites)"
+    exit 0
+  fi
+  echo "check_external_review_helpers: ERROR (missing:$missing)" >&2
+  exit 1
+fi
+
+for suite in $SUITES; do
+  echo "── $suite"
+  bash "$REPO_ROOT/$suite"
+done
