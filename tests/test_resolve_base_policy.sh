@@ -59,6 +59,7 @@ done
 case "$PATHARG" in
   repos/*/pulls/*)
     if [ "${STUB_PR_FAIL:-0}" = "1" ]; then echo "gh: server error" >&2; exit 1; fi
+    [ -z "${STUB_PR_STDERR:-}" ] || echo "$STUB_PR_STDERR" >&2
     cat "${STUB_PR_JSON:-/dev/null}"
     exit 0 ;;
   repos/*/commits/*)
@@ -80,7 +81,7 @@ chmod +x "$GH_STUB"
 export PATH="$WORK:$PATH" GH_CALLS_LOG="$CALLS_LOG"
 hash -r 2>/dev/null || true
 
-reset_env() { unset STUB_PR_FAIL STUB_CONTENTS_MODE STUB_PR_JSON STUB_CONTENTS_STDERR STUB_COMMIT_FAIL; : > "$CALLS_LOG"; }
+reset_env() { unset STUB_PR_FAIL STUB_CONTENTS_MODE STUB_PR_JSON STUB_CONTENTS_STDERR STUB_COMMIT_FAIL STUB_PR_STDERR; : > "$CALLS_LOG"; }
 
 run_meta() {  # <base_ref> <default_branch>
   OUT=$(bash "$RESOLVE" --repo "$REPO" --base-ref "$1" --base-sha "basesha1" \
@@ -209,6 +210,24 @@ if [ "$RC" -eq 2 ] && grep -q "does not resolve" "$WORK/err.txt"; then
   pass "contents 404 + unresolvable base commit fails closed (#768 P1)"
 else
   fail "unresolvable base commit should fail closed (rc=$RC out=$OUT)"
+fi
+
+# 11. The same stderr-contamination guarantee for the PR-METADATA fetch. Case 8
+#     covers the contents response; this covers the other gh call, whose stdout
+#     is parsed as JSON — merged stderr would break the parse and silently
+#     erase base.ref, which now means "cannot prove default base" and a hard
+#     fail rather than a wrong answer, but either way it must not happen.
+reset_env
+STUB_PR_JSON="$WORK/pr-noise.json"
+jq -n '{base:{ref:"release/1.x", sha:"basesha1", repo:{default_branch:"main"}}}' > "$STUB_PR_JSON"
+export STUB_PR_JSON STUB_CONTENTS_MODE=ok
+export STUB_PR_STDERR="gh: another non-fatal notice on stderr"
+OUT=$(bash "$RESOLVE" --repo "$REPO" --pr 42 --default-config "$DEFAULT_CONFIG" 2>/dev/null) && RC=0 || RC=$?
+if [ "$RC" -eq 0 ] && [ -f "$OUT" ] && grep -q "external_review_threshold: 1" "$OUT"; then
+  pass "stderr noise on the PR-metadata fetch does not corrupt base resolution (#715/#716 class)"
+  rm -f "$OUT"
+else
+  fail "PR-metadata stderr broke resolution (rc=$RC out=$OUT)"
 fi
 
 echo
