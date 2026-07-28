@@ -139,6 +139,8 @@ cat >"$FAKE_MP/.repo-template.yml" <<'EOF'
 spec_test_map:
   mergepath_playground:
     - tests/test_mergepath_playground.sh
+  bootstrap_consumer_identity:
+    - tests/test_bootstrap_template_mirror.sh
   some_other_spec:
     - tests/test_some_other.sh
 test_globs:
@@ -729,7 +731,16 @@ if yq 'has("extra_top_level_dirs")' "$TARGET/.repo-template.yml" 2>/dev/null \
 else
   pass "extra_top_level_dirs key removed"
 fi
-# But some_other_spec entry should remain (we only dropped the playground one).
+# The bootstrap consumer-identity entry must be gone too (#747: its
+# spec and mapped hub-only test are both mirror-excluded, so a
+# surviving map entry is stale hub metadata in the consumer).
+if yq '.spec_test_map.bootstrap_consumer_identity' "$TARGET/.repo-template.yml" 2>/dev/null \
+     | grep -q "tests/test_bootstrap_template_mirror"; then
+  fail "bootstrap_consumer_identity spec_test_map entry not removed"
+else
+  pass "bootstrap_consumer_identity spec_test_map entry removed"
+fi
+# But some_other_spec entry should remain (we only dropped the hub-only ones).
 yq '.spec_test_map.some_other_spec' "$TARGET/.repo-template.yml" 2>/dev/null \
   | grep -q "tests/test_some_other" \
   && pass "unrelated spec_test_map entries preserved" \

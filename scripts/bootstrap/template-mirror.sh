@@ -737,6 +737,11 @@ bootstrap::_yq_clean_repo_template() {
   # by removing any entry whose value list contains the playground
   # test path).
   yq -i 'del(.spec_test_map.mergepath_playground)' "$f"
+  # Drop the bootstrap consumer-identity spec_test_map entry (#747):
+  # the spec AND its mapped hub-only test are both mirror-excluded, so
+  # a surviving map entry is stale hub metadata in the consumer (and
+  # this key is not name-bearing, so it survives substitution as-is).
+  yq -i 'del(.spec_test_map.bootstrap_consumer_identity)' "$f"
   # Drop extra_top_level_dirs entirely — the new repo has no
   # mergepath/ or packaging/ dirs.
   yq -i 'del(.extra_top_level_dirs)' "$f"
