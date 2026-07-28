@@ -498,6 +498,71 @@ assert_grep "agent-review: accumulates each page's contexts into the running rol
 assert_not_grep "agent-review: does not accumulate the rollup through an unbounded --argjson argv value (#752)" \
   "$W/agent-review.yml" 'rollup_contexts=$(jq -c -n --argjson a "$rollup_contexts"'
 
+# ── Oversized rollup accumulation, behavioral half (#754, follow-up to
+#    #752) ─────────────────────────────────────────────────────────────
+#
+# The two pins above are source-TEXT assertions; neither actually runs the
+# fold. This test closes the asymmetry with the two script copies of the
+# same accumulator (tests/test_codex_review_check_required_checks.sh and
+# tests/test_admin_merge_codeowners_blocked.sh, the #750 reference shape):
+# the accumulator statement is EXTRACTED from the real workflow and
+# executed against a payload an order of magnitude past Linux's
+# single-argument ceiling (MAX_ARG_STRLEN, ~128KB). A revert to the argv
+# `--argjson` form is therefore caught by actually reproducing rc=126
+# "Argument list too long" on Linux, not merely by a text match. The
+# assert_grep pin / assert_not_grep revert-net above stay as the portable
+# macOS-side second net, where the ~1MB per-argument ceiling means the
+# behavioral half cannot fail — the explicit two-net lesson recorded in
+# the #750 test comments.
+echo ""
+echo "agent-review.yml oversized rollup accumulation — the wait loop survives a >128KB running total (#752/#754)"
+
+if [ ! -f "$W/agent-review.yml" ]; then
+  echo "SKIP: agent-review.yml oversized rollup behavioral test (file absent)"; SKIP=$((SKIP + 1))
+elif ! command -v jq >/dev/null 2>&1; then
+  echo "SKIP: agent-review.yml oversized rollup behavioral test (jq unavailable)"; SKIP=$((SKIP + 1))
+else
+  # Deliberately form-AGNOSTIC (`rollup_contexts=$(` rather than the fixed
+  # `printf` form): the point is to execute whatever the workflow actually
+  # does today, so a revert to the argv form is run and reproduces rc=126
+  # on Linux rather than silently skipping the behavioral case. The
+  # statement lives 14 spaces deep inside a `run: |` block scalar, so it is
+  # grepped straight out of the YAML (the leading indentation is harmless
+  # to bash). `|| ACC_STMT=""` keeps a no-match from aborting the suite
+  # under `set -euo pipefail`, so it reports as a normal FAIL below.
+  ACC_STMT=$(grep -E '^[[:space:]]*rollup_contexts=\$\(' "$W/agent-review.yml" | head -1) || ACC_STMT=""
+  if [ -z "$ACC_STMT" ]; then
+    fail "oversized rollup: could not extract the wait-loop accumulator statement from $W/agent-review.yml"
+  else
+    ACC_SCRATCH=$(mktemp -d)
+    # Build both operands INSIDE the harness. Passing a >128KB payload in
+    # as an argument would hit the very ceiling under test and fail the
+    # harness rather than the code.
+    {
+      echo '#!/usr/bin/env bash'
+      echo 'set -euo pipefail'
+      echo "rollup_contexts=\$(jq -cn '[range(6000) | {name: \"check-\\(.)\", workflowName: \"workflow-name-padding-\\(.)\", status: \"COMPLETED\", conclusion: \"SUCCESS\"}]')"
+      echo "page_nodes=\$(jq -cn '[range(3) | {name: \"page2-check-\\(.)\", status: \"COMPLETED\", conclusion: \"SUCCESS\"}]')"
+      # Self-validating: if the fixture ever shrinks below the ceiling this
+      # test silently stops covering the bug, so assert the precondition.
+      echo 'if [ "${#rollup_contexts}" -le 131072 ]; then echo "FIXTURE-TOO-SMALL:${#rollup_contexts}"; exit 9; fi'
+      echo "$ACC_STMT"
+      echo 'printf "%s" "$rollup_contexts" | jq -r "length"'
+    } > "$ACC_SCRATCH/acc.sh"
+
+    ACC_OUT=$(bash "$ACC_SCRATCH/acc.sh" 2>&1) && ACC_RC=0 || ACC_RC=$?
+    rm -rf "$ACC_SCRATCH"
+
+    if [ "$ACC_RC" -eq 0 ] && [ "$ACC_OUT" = "6003" ]; then
+      pass "oversized rollup: the real agent-review.yml accumulator folds a >128KB running total plus a new page into 6003 contexts (no rc=126)"
+    elif [ "$ACC_RC" -eq 126 ] || grep -q 'Argument list too long' <<<"$ACC_OUT"; then
+      fail "oversized rollup: the agent-review.yml accumulator died with the #750 'Argument list too long' failure (rc=$ACC_RC) — the argv form is back"
+    else
+      fail "oversized rollup: agent-review.yml accumulator did not produce 6003 contexts (rc=$ACC_RC, output: $ACC_OUT)"
+    fi
+  fi
+fi
+
 # Codex P2 (#655 round 12, "honor GitHub Actions branch glob semantics",
 # found on the codex-review-check.sh copy and mirrored here): GitHub docs
 # specify a single `*` does NOT cross a `/` while `**` DOES; patterns are
