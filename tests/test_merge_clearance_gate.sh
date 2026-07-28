@@ -65,6 +65,11 @@ fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 STUB_DIR="$WORKDIR/stub-bin"
 mkdir -p "$STUB_DIR"
 
+# Defined before the gh stub heredoc: the stub interpolates it when emitting
+# per-check producer data for the #772 r5 producer verification.
+GATE_CHECK_NAME="Merge clearance gate"
+export GATE_CHECK_NAME  # the gh stub interpolates it at RUN time (quoted heredoc)
+
 cat >"$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 LOG="${GH_CALLS_LOG:-/dev/null}"
@@ -119,7 +124,11 @@ if [ "$1" = "api" ]; then
         echo "gh: Not Found (HTTP 404)" >&2
         exit 1
       fi
-      printf '{"enforce_admins":{"enabled":%s}}\n' "$FIXTURE_ADMIN_ENFORCE"
+      # #772 r5: the same response carries per-check producer data. Default to
+      # the trusted Actions app id; FIXTURE_CLASSIC_APP_ID overrides it so a
+      # foreign-producer case can be exercised.
+      printf '{"enforce_admins":{"enabled":%s},"required_status_checks":{"checks":[{"context":"%s","app_id":%s}]}}\n' \
+        "$FIXTURE_ADMIN_ENFORCE" "$GATE_CHECK_NAME" "${FIXTURE_CLASSIC_APP_ID:-15368}"
       exit 0
       ;;
     repos/*/rulesets/*)
@@ -269,10 +278,11 @@ make_protection_fixture() {  # <contexts_json_array>  GraphQL refUpdateRule shap
 make_rulesets_fixture() {  # <contexts_json_array> [ruleset_id]  rules/branches/<branch> shape
   local contexts=$1 rs_id=${2:-101}
   local file="$WORKDIR/rulesets.$$.$RANDOM.json"
-  jq -n --argjson contexts "$contexts" --argjson rs_id "$rs_id" '
+  jq -n --argjson contexts "$contexts" --argjson rs_id "$rs_id" \
+        --argjson app "${FIXTURE_RULESET_APP_ID:-15368}" '
     [ { type: "required_status_checks",
         ruleset_id: $rs_id,
-        parameters: { required_status_checks: [ $contexts[] | { context: . } ] } } ]
+        parameters: { required_status_checks: [ $contexts[] | { context: ., integration_id: $app } ] } } ]
   ' >"$file"
   echo "$file"
 }
@@ -1350,7 +1360,6 @@ fi
 # is absent from base-branch protection.
 # ---------------------------------------------------------------------------
 
-GATE_CHECK_NAME="Merge clearance gate"
 
 echo; echo "--- Protection 1 (#772): enforced required check (classic protection) + protected path → true"
 SCRATCH=$(make_scratch false true)
@@ -1644,6 +1653,49 @@ if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
   pass "protection: ruleset with bypass actors is NOT counted as enforcement → false"
 else
   fail "protection: bypassable ruleset expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1n (#772 r5 P1): a same-named check from ANOTHER producer is not proof (classic)"
+# A context is just a string. If the branch rule requires our name from a
+# different integration, some other app satisfying it must not read as the
+# trusted Actions gate being enforced.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '["lint", $n]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_CLASSIC_APP_ID=99999 \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: classic required check from a foreign app_id → not counted → false"
+else
+  fail "protection: foreign classic producer expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1o (#772 r5 P1): a ruleset rule with no integration pin is not proof"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+NOPIN_RULES="$WORKDIR/rulesets-nopin.$$.json"
+jq -n --arg n "$GATE_CHECK_NAME" '[{type:"required_status_checks",ruleset_id:101,parameters:{required_status_checks:[{context:$n}]}}]' >"$NOPIN_RULES"
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$NOPIN_RULES" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: ruleset rule accepting ANY producer (no integration_id) → not counted → false"
+else
+  fail "protection: unpinned ruleset rule expected false/0; got rc=$RC out='$OUT'"
 fi
 
 echo; echo "--- Protection 1m (#772 r4): a ruleset payload OMITTING bypass_actors is not proof"

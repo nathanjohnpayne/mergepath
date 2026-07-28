@@ -325,6 +325,22 @@ fetch_api_array() {  # <endpoint> <label>
 # without CI saying so.
 MERGE_CLEARANCE_CHECK_NAME="Merge clearance gate"
 
+# The app that must PRODUCE the required check for it to count as proof.
+# A context is just a string: a branch rule that requires
+# `Merge clearance gate` from a different integration — or from ANY source —
+# is satisfied by some other producer emitting that name, while this script
+# would conclude the trusted Actions job is enforced (#772 r5 P1). Both
+# surfaces carry the producer, so it is checkable: classic protection exposes
+# `required_status_checks.checks[].app_id`, rulesets expose
+# `parameters.required_status_checks[].integration_id`.
+#
+# 15368 is github.com's `github-actions` app. Verified live rather than looked
+# up: every check run on this repo's head reports `app.slug=github-actions`
+# with `app.id=15368`, and mergepath's own three required contexts are
+# recorded under that same app_id. Overridable for GitHub Enterprise Server,
+# where the id differs.
+MERGE_CLEARANCE_EXPECTED_APP_ID="${MERGE_CLEARANCE_EXPECTED_APP_ID:-15368}"
+
 # Positive proof that $MERGE_CLEARANCE_CHECK_NAME is an ENFORCED required
 # status check on the PR's base branch. Returns 0 ONLY when the context is
 # observed in a required-status-check list for $BASE_REF; returns 1 for
@@ -450,7 +466,27 @@ merge_clearance_check_enforced() {
         elif [ "$enforce_admins" != "true" ]; then
           log "enforcement probe: classic protection on '$BASE_REF' requires contexts but enforce_admins=false, so an admin merger is not bound by them — not counting the classic surface"
         else
-          contexts="$contexts$parsed"$'\n'
+          # Producer check (#772 r5 P1). The same admin response carries
+          # `required_status_checks.checks[] = {context, app_id}`, so the
+          # producer is verifiable from a call already made. A context-only
+          # match would accept the required check being satisfied by some
+          # other app emitting that name.
+          set +e
+          classic_app=$(printf '%s' "$prot_out" | jq -r --arg ctx "$MERGE_CLEARANCE_CHECK_NAME" '
+            if (.required_status_checks.checks | type) == "array"
+            then ([ .required_status_checks.checks[] | select(.context == $ctx) | .app_id ] | if length > 0 then .[0] else "absent" end)
+            else "unknown" end' 2>"$err")
+          prot_rc=$?
+          set -e
+          if [ "$prot_rc" -ne 0 ] || [ "$classic_app" = "unknown" ]; then
+            log "enforcement probe: classic protection on '$BASE_REF' does not expose per-check producer data (no checks[] array) — cannot prove '$MERGE_CLEARANCE_CHECK_NAME' comes from the trusted workflow; not counting the classic surface"
+          elif [ "$classic_app" = "absent" ]; then
+            log "enforcement probe: '$MERGE_CLEARANCE_CHECK_NAME' is not among the classic required checks on '$BASE_REF' — not counting the classic surface"
+          elif [ "$classic_app" != "$MERGE_CLEARANCE_EXPECTED_APP_ID" ]; then
+            log "enforcement probe: classic protection on '$BASE_REF' requires '$MERGE_CLEARANCE_CHECK_NAME' from app_id=$classic_app, not the expected $MERGE_CLEARANCE_EXPECTED_APP_ID — a same-named check from another producer is not proof; not counting the classic surface"
+          else
+            contexts="$contexts$parsed"$'\n'
+          fi
         fi
       fi
     fi
@@ -509,12 +545,18 @@ merge_clearance_check_enforced() {
     # cannot be read, or that has any, is not proof — drop it and fall through
     # to arm 2 (#772 r2 P1).
     set +e
+    # A rule counts only when it requires OUR context FROM the trusted app.
+    # `integration_id` absent means the rule accepts the context from ANY
+    # producer, so an untrusted workflow emitting that name would satisfy it —
+    # not proof, and dropped here rather than trusted (#772 r5 P1).
     ruleset_ids=$(printf '%s' "$out" \
-      | jq -r -s --arg ctx "$MERGE_CLEARANCE_CHECK_NAME" '
+      | jq -r -s --arg ctx "$MERGE_CLEARANCE_CHECK_NAME" --arg app "$MERGE_CLEARANCE_EXPECTED_APP_ID" '
           add // []
           | [ .[]? | objects
               | select(.type == "required_status_checks")
-              | select([ .parameters.required_status_checks[]?.context ] | index($ctx))
+              | select([ .parameters.required_status_checks[]?
+                         | select(.context == $ctx)
+                         | select((.integration_id | tostring) == $app) ] | length > 0)
               | .ruleset_id ]
           | map(select(. != null)) | unique | .[]' 2>"$err")
     rc=$?
