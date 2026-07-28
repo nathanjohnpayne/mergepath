@@ -521,6 +521,93 @@ echo "$out7" | grep -q "Firebase + CodeRabbit + Codex posture (not in state file
   || fail "summary should flag firebase-and-codereview as skipped (not in state); got: $out7"
 
 # ---------------------------------------------------------------------------
+# Test 7: WARNINGS block splits outstanding failures from resolved ones.
+#
+# The `${BOOTSTRAP_STATE_FILE}.warnings` sidecar carries two kinds of
+# record: still-outstanding failures, and ones a later attempt in the
+# same bootstrap fixed (rewritten in place by github-infra.sh with the
+# `RESOLVED: ` marker — #761). A resolved record must not read as
+# outstanding work, and must not vanish either. Classification is by
+# POSITIVE match on the marker, so an unrecognized line shape stays a
+# failure.
+#
+# Drive the renderer directly with a hand-seeded sidecar covering all
+# three shapes: keyed outstanding, keyed resolved, unkeyed outstanding.
+# ---------------------------------------------------------------------------
+TARGET8="$WORKDIR/warn-split"
+rm -rf "$TARGET8"
+mkdir -p "$TARGET8"
+cat >"$TARGET8/.bootstrap-state" <<'EOF'
+template-mirror
+github-infra
+EOF
+printf '@reviewer-assignment-token\tRESOLVED: token provisioning failed earlier and was fixed on a later attempt\n' \
+  >"$TARGET8/.bootstrap-state.warnings"
+printf '@some-other-key\tsomething else is still broken\n' \
+  >>"$TARGET8/.bootstrap-state.warnings"
+printf 'an unkeyed recorded failure\n' \
+  >>"$TARGET8/.bootstrap-state.warnings"
+set +e
+out8=$(bash -c '
+  ROOT="'"$ROOT"'"
+  TARGET="'"$TARGET8"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/board-and-summary.sh"
+  BOOTSTRAP_STATE_FILE="$TARGET/.bootstrap-state"
+  BOOTSTRAP_LOG_FILE=""
+  BOOTSTRAP_INPUT_FIREBASE=none
+  bootstrap::_print_summary "nathanjohnpayne/warnsplit-repo" "$TARGET" "private" "" "project=skip"
+' 2>&1)
+ec8=$?
+set -e
+[ "$ec8" -eq 0 ] \
+  && pass "summary renders a mixed outstanding/resolved warnings sidecar (rc=0)" \
+  || fail "mixed-sidecar summary failed; rc=$ec8; out: $out8"
+echo "$out8" | grep -qF "  !! - something else is still broken" \
+  && pass "keyed outstanding failure stays in RECORDED FAILURES" \
+  || fail "keyed outstanding failure missing from RECORDED FAILURES; out: $out8"
+echo "$out8" | grep -qF "  !! - an unkeyed recorded failure" \
+  && pass "unkeyed record stays in RECORDED FAILURES (fail-closed default)" \
+  || fail "unkeyed record missing from RECORDED FAILURES; out: $out8"
+echo "$out8" | grep -qF "  ok - token provisioning failed earlier and was fixed on a later attempt" \
+  && pass "resolved record renders under RESOLVED with the marker stripped" \
+  || fail "resolved record not rendered under RESOLVED; out: $out8"
+echo "$out8" | grep -qF "  !! - RESOLVED:" \
+  && fail "resolved record leaked into RECORDED FAILURES; out: $out8" \
+  || pass "resolved record does not appear as an outstanding failure"
+
+# A sidecar holding ONLY resolved records must print the RESOLVED block
+# and NO RECORDED FAILURES header — nothing is outstanding.
+TARGET9="$WORKDIR/warn-all-resolved"
+rm -rf "$TARGET9"
+mkdir -p "$TARGET9"
+cp "$TARGET8/.bootstrap-state" "$TARGET9/.bootstrap-state"
+printf '@reviewer-assignment-token\tRESOLVED: fixed on the retry\n' \
+  >"$TARGET9/.bootstrap-state.warnings"
+set +e
+out9=$(bash -c '
+  ROOT="'"$ROOT"'"
+  TARGET="'"$TARGET9"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/board-and-summary.sh"
+  BOOTSTRAP_STATE_FILE="$TARGET/.bootstrap-state"
+  BOOTSTRAP_LOG_FILE=""
+  BOOTSTRAP_INPUT_FIREBASE=none
+  bootstrap::_print_summary "nathanjohnpayne/allresolved-repo" "$TARGET" "private" "" "project=skip"
+' 2>&1)
+ec9=$?
+set -e
+[ "$ec9" -eq 0 ] \
+  && pass "summary renders an all-resolved warnings sidecar (rc=0)" \
+  || fail "all-resolved summary failed; rc=$ec9; out: $out9"
+echo "$out9" | grep -q "RECORDED FAILURES" \
+  && fail "all-resolved sidecar still printed a RECORDED FAILURES header; out: $out9" \
+  || pass "all-resolved sidecar prints no RECORDED FAILURES header"
+echo "$out9" | grep -qF "  ok - fixed on the retry" \
+  && pass "all-resolved sidecar still surfaces the record under RESOLVED" \
+  || fail "all-resolved sidecar dropped the record; out: $out9"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo

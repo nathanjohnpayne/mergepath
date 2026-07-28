@@ -1012,6 +1012,345 @@ else
   fail "Case 35 unexpected (rc=$rc): $out"
 fi
 
+# --- canonical agent-docs propagation contract (#770/#771) -----------
+#
+# Unlike every case above, these two read the LIVE manifest and the LIVE
+# docs. They guard a contract no fixture can express: that the canonical
+# `docs/agents/*.md` convention docs are actually declared, and that each
+# one stays TRUE verbatim on a consumer.
+#
+# Gated on POSITIVE proof that this is a mergepath checkout — the live
+# manifest AND the never-propagated sync engine both present, the same
+# marker pair check_sync_manifest itself uses. Anything else skips: the
+# suite is hub-only (it is on check_propagation_closure's ALLOW_LIST),
+# so a checkout without both markers cannot satisfy these assertions and
+# must not be failed for it.
+LIVE_MANIFEST="$ROOT/.mergepath-sync.yml"
+LIVE_MARKER="$ROOT/scripts/sync-to-downstream.sh"
+if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
+
+  # Case 36: docs/agents/decision-records.md is declared canonical/all.
+  # The decision-records convention (#770 change-level "## Path taken"
+  # records + #771 issue-level decision callouts) is only a fleet
+  # convention if it actually travels; a silent manifest drop would
+  # leave mergepath following a rule no consumer ever receives.
+  DR_PATH="docs/agents/decision-records.md"
+  set +e
+  dr_rows=$(yq -r "
+    .paths[]
+    | select(.path == \"$DR_PATH\")
+    | (.type // \"null\") + \"|\" + (.consumers | (select(tag == \"!!str\") // (join(\",\"))) | tostring)
+  " "$LIVE_MANIFEST"); rc=$?
+  set -e
+  if [ "$rc" = "0" ] && [ "$dr_rows" = "canonical|all" ]; then
+    pass "Case 36: live manifest declares $DR_PATH canonical/all (#770/#771)"
+  else
+    fail "Case 36: expected 'canonical|all' for $DR_PATH, got (rc=$rc) '$dr_rows'"
+  fi
+
+  # Case 37: every canonical docs/agents/*.md entry is consumer-truthful.
+  #
+  # A canonical doc is copied VERBATIM, so a sentence that is true on
+  # mergepath and false downstream ships as a false claim to every
+  # consumer — the #744/#746 trap. Two mechanical tells:
+  #
+  #   (a) a bare `#NN` issue reference. GitHub resolves it against the
+  #       repo it is rendered in, so on a consumer it silently points at
+  #       that repo's own issue #NN. The cross-repo `owner/repo#NN` form
+  #       (already used in REVIEW_POLICY.md and bootstrap-runbook.md) and
+  #       full URLs are unambiguous everywhere; the pattern below
+  #       deliberately does not match them, nor `#issuecomment-<id>`.
+  #   (b) a reference to hub-only machinery — the propagation manifest,
+  #       the sync engine, the wave audit, the bootstrap seeders, the
+  #       weekly sweep, or the three hub-only machinery docs. None of
+  #       these exist in a consumer checkout, so naming them as
+  #       something the reader can run or read is false there.
+  BARE_ISSUE_RE='(^|[^A-Za-z0-9_/-])#[0-9]+'
+  HUB_ONLY_RE='\.mergepath-sync\.yml|sync-to-downstream\.sh|wave-audit\.sh|scripts/bootstrap/|sweep-unresolved-feedback|docs/agents/(bootstrap-runbook|propagation-ordering|templated-propagation)\.md'
+
+  # Tell (a) scans PROSE ONLY. `#<digits>` is not an issue reference
+  # inside a fenced code block (a CSS hex colour `#336699`, a literal in
+  # a shell example), inside an inline code span, or in a markdown
+  # in-page anchor target — `](#1-post-a-structured-decision-comment)`,
+  # which is what a table of contents over this doc's own numbered
+  # headings would emit. Blanking those out keeps the guard from
+  # failing a required check with the misleading "bare issue reference"
+  # diagnostic. One output line per input line, so `grep -n` still
+  # reports the true line number.
+  #
+  # Deliberately NOT applied to tell (b): "run `wave-audit.sh`" is false
+  # downstream wherever it appears, including inside a fenced example,
+  # so the hub-only scan reads the raw file.
+  #
+  # Fence tracking follows CommonMark, the same delimiter rules the
+  # fence-aware section scan in scripts/audit-canonical-mirrors.sh
+  # applies. A naive unconditional toggle is not merely imprecise
+  # here, it is a BYPASS: a four-backtick fence
+  # wrapping a literal ``` line (the standard way to show a fence inside
+  # a fence, which a doc that prescribes markdown formats will reach
+  # for) has its content line close the fence and its real closing
+  # delimiter open a new one. Every line after that is blanked as
+  # "fence", so a bare #NN later in the file is never scanned and tell
+  # (a) silently passes a doc it should fail. Three rules prevent that:
+  #
+  #   * at most THREE spaces of indent before a delimiter — at four or
+  #     more columns the line is indented CODE, not a delimiter, and a
+  #     tab already advances past the limit;
+  #   * a fence closes only on a run of the SAME character at least as
+  #     LONG as the opening run, so ``` cannot close ````;
+  #   * a closing fence carries no info string, so a literal ```bash
+  #     shown inside an open block is content, not the closer.
+  #
+  # Inline code spans are matched by delimiter RUN LENGTH for the same
+  # reason fences are, but note the closing rule DIFFERS by design and
+  # the two must not be "unified": a fence closes on a run at least as
+  # long as the opener (>= fence_len, above), whereas a code span
+  # closes only on a run of EXACTLY the opening length. That is
+  # CommonMark, and it is what lets ``a`b`` hold a lone backtick.
+  #
+  # A naive gsub(/`[^`]*`/) instead matches the two OPENING backticks
+  # of a ``#NN`` span as an empty single-backtick span, deletes them,
+  # and leaves the bare #NN exposed to BARE_ISSUE_RE — a FALSE
+  # POSITIVE that fails a required check on a doc whose #NN is code,
+  # not an issue reference. That form is reachable, not theoretical: a
+  # doc reaches for a multi-backtick span exactly when the span's
+  # content itself holds a backtick, which a doc prescribing markdown
+  # formats does.
+  #
+  # An opening run with no equal-length closer is NOT a span — it stays
+  # literal, exactly as CommonMark renders it, so prose after it is
+  # still scanned rather than being swallowed to end of line.
+  #
+  # Every branch prints exactly one line per input line, preserving the
+  # `grep -n` line numbering the diagnostics depend on.
+  md_prose_only() {
+    awk '
+      {
+        line = $0
+        indent = line
+        sub(/[^ \t].*$/, "", indent)
+        rest = substr(line, length(indent) + 1)
+
+        is_delim = 0
+        if (length(indent) < 4 && index(indent, "\t") == 0) {
+          ch = substr(rest, 1, 1)
+          if (ch == "`" || ch == "~") {
+            run = 0
+            while (substr(rest, run + 1, 1) == ch) run++
+            if (run >= 3) is_delim = 1
+          }
+        }
+
+        if (is_delim) {
+          if (!fence) {
+            fence = 1; fence_char = ch; fence_len = run
+          } else if (ch == fence_char && run >= fence_len &&
+                     substr(rest, run + 1) !~ /[^ \t]/) {
+            fence = 0; fence_char = ""; fence_len = 0
+          }
+          print ""; next
+        }
+        if (fence) { print ""; next }
+
+        line = strip_code_spans(line)
+        gsub(/\]\(#[^)]*\)/, "]()", line)
+        print line
+      }
+
+      # Remove inline code spans, matching opening and closing backtick
+      # runs by LENGTH (CommonMark). An opening run with no closing run
+      # of equal length is not a span at all — it stays as literal
+      # text, which is what CommonMark renders.
+      function strip_code_spans(s,   out, i, n, c, run, j, r2, found) {
+        out = ""
+        i = 1
+        n = length(s)
+        while (i <= n) {
+          c = substr(s, i, 1)
+          if (c != "`") { out = out c; i++; continue }
+          run = 0
+          while (i + run <= n && substr(s, i + run, 1) == "`") run++
+          j = i + run
+          found = 0
+          while (j <= n) {
+            if (substr(s, j, 1) == "`") {
+              r2 = 0
+              while (j + r2 <= n && substr(s, j + r2, 1) == "`") r2++
+              if (r2 == run) { found = 1; break }
+              j += r2
+            } else {
+              j++
+            }
+          }
+          if (found) {
+            i = j + run
+          } else {
+            out = out substr(s, i, run)
+            i += run
+          }
+        }
+        return out
+      }
+    ' "$1"
+  }
+
+  set +e
+  canon_docs=$(yq -r '.paths[] | select(.type == "canonical") | .path' "$LIVE_MANIFEST" \
+    | grep -E '^docs/agents/.*\.md$'); rc=$?
+  set -e
+  docs_bad=""
+  docs_seen=0
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    docs_seen=$((docs_seen + 1))
+    if [ ! -f "$ROOT/$d" ]; then
+      docs_bad="$docs_bad
+  $d: declared canonical but missing on disk"
+      continue
+    fi
+    prose=$(md_prose_only "$ROOT/$d")
+    if hits=$(printf '%s\n' "$prose" | grep -nE "$BARE_ISSUE_RE"); then
+      docs_bad="$docs_bad
+  $d: bare issue reference (use owner/repo#NN or a full URL):
+$hits"
+    fi
+    if hits=$(grep -nE "$HUB_ONLY_RE" "$ROOT/$d"); then
+      docs_bad="$docs_bad
+  $d: names hub-only machinery a consumer does not have:
+$hits"
+    fi
+  done <<< "$canon_docs"
+  if [ "$rc" != "0" ] || [ "$docs_seen" -eq 0 ]; then
+    fail "Case 37: no canonical docs/agents/*.md entries found in the live manifest (rc=$rc)"
+  elif [ -n "$docs_bad" ]; then
+    fail "Case 37: canonical agent doc(s) not true verbatim downstream (#744/#746):$docs_bad"
+  else
+    pass "Case 37: all $docs_seen canonical docs/agents/*.md entries are consumer-truthful"
+  fi
+
+  # Case 38: self-test of the tell-(a) predicate, in BOTH directions.
+  #
+  # Case 37 reads the live tree, where every canonical agent doc happens
+  # to be clean — so on its own it never exercises the predicate's
+  # positive branch, and never proves the negative branch either. This
+  # fixture pins both: one real bare ref in prose must be flagged, and
+  # the four forms that legitimately carry `#<digits>` must not be.
+  FP_DOC="$WORKDIR/consumer-truth-fixture.md"
+  cat > "$FP_DOC" <<'FIXTURE_EOF'
+# Doc
+
+## Contents
+- [Post a structured decision comment](#1-post-a-structured-decision-comment)
+
+Cross-repo owner/repo#702 and permalink #issuecomment-5104563868 are fine.
+
+```css
+a { color: #336699; }
+```
+
+An inline hex `#1a2b3c` is not an issue reference.
+
+But a bare #740 in prose is.
+FIXTURE_EOF
+  set +e
+  fp_hits=$(md_prose_only "$FP_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  set -e
+  if [ "$fp_hits" = "14," ]; then
+    pass "Case 38: bare-issue predicate flags the prose ref on line 14 only (not anchors, fences, or code spans)"
+  else
+    fail "Case 38: expected only line 14 flagged, got '$fp_hits'"
+  fi
+
+  # Case 39: fence tracking is CommonMark-compatible, not a naive toggle.
+  #
+  # Case 38's fixture only ever opens and closes plain ``` fences, so it
+  # passes under an unconditional toggle too and proves nothing about
+  # the delimiter rules. This fixture pins all three rules AND the
+  # bypass they prevent. Under the naive toggle this replaced, the
+  # ```bash and ``` and ~~~ lines nested inside the ````text block each
+  # flip fence state, so #111 and #444 leak into prose as false
+  # positives; the run of flips leaves state INVERTED at the
+  # four-space-indented ``` on line 18, which then opens a fence that
+  # never closes and swallows the rest of the file — so the real bare
+  # #333 on line 20 goes unscanned and tell (a) passes a doc it must
+  # fail. Correct behavior: line 20 is the only hit.
+  FENCE_DOC="$WORKDIR/consumer-truth-fences.md"
+  cat > "$FENCE_DOC" <<'FENCE_EOF'
+# Doc
+
+````text
+```bash
+echo "#111 not a ref"
+```
+~~~
+still #444 inside the same block
+~~~
+````
+
+~~~
+A tilde fence holds #222 as content.
+~~~
+
+Four spaces of indent makes this code, not a delimiter:
+
+    ```
+
+But a bare #333 in prose is.
+FENCE_EOF
+  set +e
+  fence_hits=$(md_prose_only "$FENCE_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  fence_lines=$(md_prose_only "$FENCE_DOC" | wc -l | tr -d ' ')
+  raw_lines=$(wc -l < "$FENCE_DOC" | tr -d ' ')
+  set -e
+  if [ "$fence_hits" != "20," ]; then
+    fail "Case 39: expected only line 20 flagged (nested/tilde/indented fences), got '$fence_hits'"
+  elif [ "$fence_lines" != "$raw_lines" ]; then
+    fail "Case 39: md_prose_only must emit one line per input line, got $fence_lines for $raw_lines"
+  else
+    pass "Case 39: fence tracking honors delimiter char, run length, info string, and the 3-space indent limit"
+  fi
+
+  # Case 40: inline code spans strip by delimiter RUN LENGTH.
+  #
+  # Cases 38-39 only ever use single-backtick spans, so they pass under
+  # the naive gsub too and prove nothing about multi-backtick spans.
+  # Under that gsub the ``#222`` line leaked a bare #222 into prose —
+  # a FALSE POSITIVE failing a required check on a doc whose #NN is
+  # code — and the ``a`b #333`` line was mangled into `a` + trailing
+  # backtick rather than removed whole. The last line pins the other
+  # direction: an unmatched run is literal per CommonMark, so the #555
+  # beside it is real prose and MUST still be flagged.
+  SPAN_DOC="$WORKDIR/consumer-truth-spans.md"
+  cat > "$SPAN_DOC" <<'SPAN_EOF'
+# Doc
+
+A single-backtick span `#111` is code.
+
+A double-backtick span ``#222`` is code.
+
+A double-backtick span holding a backtick ``a`b #333`` is code.
+
+A triple-backtick inline span ```#444``` is code.
+
+An unmatched ``run stays literal, so this bare #555 is a real ref.
+SPAN_EOF
+  set +e
+  span_hits=$(md_prose_only "$SPAN_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  span_lines=$(md_prose_only "$SPAN_DOC" | wc -l | tr -d ' ')
+  span_raw=$(wc -l < "$SPAN_DOC" | tr -d ' ')
+  set -e
+  if [ "$span_hits" != "11," ]; then
+    fail "Case 40: expected only line 11 flagged (multi-backtick spans are code), got '$span_hits'"
+  elif [ "$span_lines" != "$span_raw" ]; then
+    fail "Case 40: md_prose_only must emit one line per input line, got $span_lines for $span_raw"
+  else
+    pass "Case 40: inline code spans strip by delimiter run length (``#NN`` is code, unmatched run is prose)"
+  fi
+
+else
+  echo "SKIP: Cases 36-40 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+fi
+
 echo
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -gt 0 ]; then
