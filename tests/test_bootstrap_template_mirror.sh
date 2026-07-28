@@ -856,6 +856,77 @@ awk '
   && pass "_cross_repo_loop_update routes gh pr create through author-token helper" \
   || fail "author-token helper invariant violated"
 
+# --- assertion 17: _anchor_insert must not leak a RETURN trap (#733) ---
+# Pre-fix, bootstrap::_anchor_insert installed `trap 'rm -f "$tmp"' RETURN`.
+# Bash does not scope a RETURN trap to the function that set it, so the
+# trap stayed installed and re-fired when the CALLER (bootstrap::run)
+# returned — in a frame where $tmp is unbound — and under `set -u` the
+# whole wizard died with "tmp: unbound variable". Drive a LIVE
+# (non-dry-run) insert through bootstrap::run under `set -euo pipefail`
+# and assert: the shell survives past bootstrap::run's return, the line
+# lands above the anchor, and no orphan bootstrap-loop.* tmpfiles remain.
+# ---------------------------------------------------------------------------
+ANCHOR_TMPDIR="$WORKDIR/anchor-tmp"
+mkdir -p "$ANCHOR_TMPDIR"
+ANCHOR_DOC="$WORKDIR/anchor-doc.md"
+printf 'header\n<!-- bootstrap-loop-list-end -->\nfooter\n' >"$ANCHOR_DOC"
+set +e
+trap_out=$(
+  TMPDIR="$ANCHOR_TMPDIR" BOOTSTRAP_DRY_RUN=0 BOOTSTRAP_LOG_FILE="" bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    . "$1/scripts/bootstrap/_lib.sh"
+    # shellcheck disable=SC1091
+    . "$1/scripts/bootstrap/template-mirror.sh"
+    bootstrap::run "insert test-repo above anchor (set -u regression #733)" \
+      bootstrap::_anchor_insert "$2" "<!-- bootstrap-loop-list-end -->" "- test-repo"
+    echo "SURVIVED-RETURN"
+  ' _ "$ROOT" "$ANCHOR_DOC" 2>&1
+)
+trap_ec=$?
+set -e
+if [ "$trap_ec" -eq 0 ] && echo "$trap_out" | grep -q "SURVIVED-RETURN"; then
+  pass "live _anchor_insert + bootstrap::run return survives under set -u (#733)"
+else
+  fail "leaked RETURN trap regression: rc=$trap_ec, out: $trap_out"
+fi
+awk '
+  /- test-repo/ { line_at = NR }
+  /<!-- bootstrap-loop-list-end -->/ { anchor_at = NR }
+  END { exit !(line_at && anchor_at && line_at < anchor_at) }
+' "$ANCHOR_DOC" \
+  && pass "_anchor_insert placed the line above the anchor" \
+  || fail "anchor insert content wrong: $(cat "$ANCHOR_DOC")"
+orphans=$(find "$ANCHOR_TMPDIR" -name 'bootstrap-loop.*' | wc -l | tr -d ' ')
+[ "$orphans" -eq 0 ] \
+  && pass "no orphan bootstrap-loop.* tmpfiles after successful insert" \
+  || fail "$orphans orphan tmpfile(s) left in $ANCHOR_TMPDIR"
+
+# --- assertion 18: _anchor_insert failure path still cleans its tmpfile ---
+# The RETURN trap existed to guarantee orphan-tmpfile cleanup (CodeRabbit
+# on #233 round 2). The #733 fix replaces it with inline `rm -f` on each
+# exit path — verify the guarantee held by forcing the awk read to fail
+# (missing doc) and asserting no tmpfile is left behind.
+# ---------------------------------------------------------------------------
+set +e
+TMPDIR="$ANCHOR_TMPDIR" bash -c '
+  set -uo pipefail
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/_lib.sh"
+  # shellcheck disable=SC1091
+  . "$1/scripts/bootstrap/template-mirror.sh"
+  bootstrap::_anchor_insert "$2/does-not-exist.md" "anchor" "- x"
+' _ "$ROOT" "$WORKDIR" >/dev/null 2>&1
+fail_ec=$?
+set -e
+[ "$fail_ec" -ne 0 ] \
+  && pass "_anchor_insert returns non-zero when the doc is unreadable" \
+  || fail "_anchor_insert should fail on a missing doc"
+orphans=$(find "$ANCHOR_TMPDIR" -name 'bootstrap-loop.*' | wc -l | tr -d ' ')
+[ "$orphans" -eq 0 ] \
+  && pass "failure path cleaned up its tmpfile (no orphans, #233 guarantee kept)" \
+  || fail "$orphans orphan tmpfile(s) left after failure path"
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_template_mirror: $PASS passed, $FAIL failed"

@@ -402,10 +402,14 @@ preflight() {
   #    an existing tree.
   if [ -d "$TARGET_DIR" ]; then
     # Allow the dir if it's empty OR contains only resume bookkeeping
-    # (.bootstrap-state, .bootstrap-log).
+    # (.bootstrap-state, its .warnings sidecar written by
+    # bootstrap::record_warning, and .bootstrap-log). Omitting the
+    # warnings sidecar here made any run that recorded a warning
+    # poison its own --resume (#755 round 2).
     local extra
     extra=$(find "$TARGET_DIR" -mindepth 1 -maxdepth 1 \
               ! -name '.bootstrap-state' \
+              ! -name '.bootstrap-state.warnings' \
               ! -name '.bootstrap-log' 2>/dev/null | head -1)
     if [ -n "$extra" ]; then
       bootstrap::wizard_err "target dir $TARGET_DIR is not empty (contains: $extra ...). Refusing to overwrite."
