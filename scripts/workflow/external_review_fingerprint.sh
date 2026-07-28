@@ -194,8 +194,14 @@ LINES_CHANGED=$(printf '%s' "$FILES_JSON" | jq --arg re "$EXCLUDE_RE" '
 ')
 LINES_CHANGED=${LINES_CHANGED:-0}
 
+# Renames report the DESTINATION in .filename and the SOURCE in
+# .previous_filename (#763). Considering only .filename let a PR move a
+# protected file (say .github/workflows/foo.yml) to an unprotected path
+# without tripping protected-path matching — the protected path vanished from
+# the branch and nothing required external review. Emit BOTH sides everywhere
+# the changed-path set is derived; downstream consumers sort -u.
 ALL_CHANGED_FILES=$(printf '%s' "$FILES_JSON" | jq -r '
-  .[] | .filename
+  .[] | (.filename, (.previous_filename // empty))
 ')
 
 PATHS=$(bash "$PARSE" "$CONFIG" external_review_paths)
@@ -206,8 +212,12 @@ if [ -n "$PATHS" ]; then
     [ -n "$line" ] && PATTERNS+=("$line")
   done <<<"$PATHS"
   if [ "${#PATTERNS[@]}" -gt 0 ]; then
-    ALL_FILES=$(printf '%s' "$FILES_JSON" | jq -r '.[].filename')
-    MATCHED_FILES=$(printf '%s\n' "$ALL_FILES" | bash "$MATCH" "${PATTERNS[@]}")
+    # Reuse ALL_CHANGED_FILES rather than re-deriving the rename expansion
+    # (#763). Two independent copies of that jq could drift, and then
+    # protected-path matching and fingerprint construction would silently
+    # disagree about which paths the PR touches — one deciding whether review
+    # is required, the other deciding whether a prior verdict still applies.
+    MATCHED_FILES=$(printf '%s\n' "$ALL_CHANGED_FILES" | bash "$MATCH" "${PATTERNS[@]}")
   fi
 fi
 

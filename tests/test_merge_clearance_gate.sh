@@ -92,6 +92,17 @@ if [ "$1" = "api" ]; then
       cat "${FIXTURE_COMMENTS:-/dev/null}"
       exit 0
       ;;
+    repos/*/contents/*)
+      # #763: PR-base review policy. Served only when a fixture sets it;
+      # otherwise emit a 404 shape so the script takes its documented
+      # "base predates the policy file" fallback.
+      if [ -n "${FIXTURE_BASE_POLICY:-}" ]; then
+        cat "$FIXTURE_BASE_POLICY"
+        exit 0
+      fi
+      echo "gh: Not Found (HTTP 404)" >&2
+      exit 1
+      ;;
     repos/*/pulls/*)
       cat "${FIXTURE_PR:-/dev/null}"
       exit 0
@@ -172,11 +183,20 @@ make_comments_fixture() {  # <json_array_literal>  issue comments
   echo "$file"
 }
 
-make_pr_fixture() {  # <sha> <author> <labels_json_array>
+make_pr_fixture() {  # <sha> <author> <labels_json_array> [base_ref] [default_branch]
   local sha=$1 author=$2 labels=${3:-'[]'}
+  # Default to base_ref == default_branch: the ordinary case, in which the
+  # #763 base-policy fetch is deliberately skipped entirely.
+  local base_ref=${4:-main} default_branch=${5:-main}
   local file="$WORKDIR/pr.$$.$RANDOM.json"
-  jq -n --arg sha "$sha" --arg author "$author" --argjson labels "$labels" '
-    { number: 99, head: { sha: $sha }, user: { login: $author }, labels: $labels }
+  jq -n --arg sha "$sha" --arg author "$author" --argjson labels "$labels" \
+        --arg base_ref "$base_ref" --arg default_branch "$default_branch" '
+    { number: 99,
+      head: { sha: $sha },
+      user: { login: $author },
+      labels: $labels,
+      base: { sha: "base000aaa", ref: $base_ref,
+              repo: { default_branch: $default_branch } } }
   ' >"$file"
   echo "$file"
 }
@@ -414,6 +434,69 @@ if [ "$RC" = 0 ] && echo "$OUT" | grep -qi "not applicable"; then
   pass "normal PR → exit 0 (not applicable)"
 else
   fail "expected rc=0 not-applicable; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 11e (#763 Codex P1): NON-DEFAULT base whose policy ENABLES the external
+# gate, while the default-branch policy DISABLES it. Parsing the switch from
+# the default-branch checkout made the whole external arm vacuous, so the
+# required check passed a PR the base policy requires it to gate — the
+# non-default-base bypass. The gate must read the switch (and the threshold)
+# from the PR BASE policy and therefore delegate.
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 11e: non-default base enables the gate the default branch disables (#763)"
+SCRATCH=$(make_scratch true false)          # default-branch policy: gate OFF
+BASE_POLICY="$WORKDIR/base-policy-on.yml"
+cat >"$BASE_POLICY" <<'YAML'
+external_review_threshold: 1
+external_review_paths:
+  - ".github/**"
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+codex:
+  bot_login: "chatgpt-codex-connector[bot]"
+  external_review_gate:
+    enabled: true
+dependabot:
+  reviewer_gate:
+    enabled: false
+YAML
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]' release/1.x main)
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/app.ts","additions":5,"deletions":1}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" \
+      FIXTURE_BASE_POLICY="$BASE_POLICY" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" \
+      CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -qi "external review applies"; then
+  pass "non-default base policy enables the gate the default branch disables (#763)"
+else
+  fail "expected rc=1 via base-policy gate-enable; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 11f (#763): a PR onto the DEFAULT branch must not consult the contents
+# API at all — the base policy IS the checked-out default-branch policy. This
+# pins the scoping that keeps a new contents-API dependency off the path every
+# consumer PR takes.
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 11f: default-base PR does not fetch the base policy (#763)"
+SCRATCH=$(make_scratch true true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "nathanjohnpayne" '[]' main main)
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"README.md","additions":3,"deletions":1}]')
+: > "$WORKDIR/gh-calls.log"
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && ! grep -q "contents/" "$WORKDIR/gh-calls.log"; then
+  pass "default-base PR skips the base-policy contents fetch entirely (#763)"
+else
+  fail "expected rc=0 with no contents API call; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
 
 # ---------------------------------------------------------------------------

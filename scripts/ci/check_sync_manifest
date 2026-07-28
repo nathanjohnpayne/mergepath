@@ -471,16 +471,26 @@ while IFS='|' read -r path type consumers dest source has_dest has_source has_pa
   if [ "$type" = "canonical" ] || [ "$type" = "kit" ]; then
     for denied in "${IDENTITY_DOCS_DENYLIST[@]}"; do
       denied_hit=""
-      if [ "$norm_path" = "$denied" ] || [ "$norm_dest" = "$denied" ]; then
+      # norm_source too (#763): the comment above always promised "source path
+      # OR effective dest", but the implementation only compared norm_path /
+      # norm_dest. An entry carrying an explicit `source:` pointing at a denied
+      # identity doc, with an innocuous path/dest, would still verbatim-mirror
+      # that doc.
+      if [ "$norm_path" = "$denied" ] || [ "$norm_dest" = "$denied" ] || [ "$norm_source" = "$denied" ]; then
         denied_hit="direct"
       elif [ "$type" = "kit" ]; then
-        if [ "$norm_path" = "." ] || [ "$norm_dest" = "." ]; then
+        # norm_source participates in the CONTAINMENT branches too (#763):
+        # equality alone misses a kit whose explicit `source:` is a DIRECTORY
+        # containing a denied doc (`source: .`, `source: docs/agents/`) while
+        # path/dest look innocuous. A kit mirrors its source directory, so such
+        # an entry carries the denied doc just as surely as a denied path does.
+        if [ "$norm_path" = "." ] || [ "$norm_dest" = "." ] || [ "$norm_source" = "." ]; then
           # A repo-root kit mirrors every tracked file, so it carries
           # every denied doc.
           denied_hit="repo-root-kit"
         else
           case "$denied/" in
-            "$norm_path/"* | "$norm_dest/"*) denied_hit="kit-contains" ;;
+            "$norm_path/"* | "$norm_dest/"* | "$norm_source/"*) denied_hit="kit-contains" ;;
           esac
         fi
       fi

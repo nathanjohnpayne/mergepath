@@ -273,15 +273,16 @@ ALLOW_LIST=(
   #     scripts/project-doc-sync.sh is hub-only, so the suite cannot run
   #     on a consumer and legitimately does not travel)
   #   - check_external_review_helpers → test_external_review_gh_stderr.sh
-  #     (both-absent marker SKIP; the #715/#716/#718 helper suite, wired
-  #     into CI in #763). NOTE this entry differs from the ones above: the
-  #     helpers under test (scripts/workflow/external_review_*.sh) DO
-  #     travel, under the scripts/workflow/ kit entry. The SUITE is kept
-  #     hub-only because it stubs `gh` wholesale and asserts on
-  #     mergepath's own review policy semantics, which a consumer's
-  #     repo_lint.yml does not wire; the wrapper SKIPs there. If a
-  #     consumer ever needs this coverage, move it onto the manifest
-  #     rather than widening this entry.
+  #     + test_external_review_rename_protection.sh (both-absent marker
+  #     SKIP; the #715/#716/#718 helper suite and the #763 rename-protection
+  #     suite, both wired into CI in #763). NOTE this entry differs from the
+  #     ones above: the helpers under test
+  #     (scripts/workflow/external_review_*.sh) DO travel, under the
+  #     scripts/workflow/ kit entry. The SUITES are kept hub-only because
+  #     they stub `gh` wholesale and assert on mergepath's own review
+  #     policy semantics, which a consumer's repo_lint.yml does not wire;
+  #     the wrapper SKIPs there. If a consumer ever needs this coverage,
+  #     move them onto the manifest rather than widening this entry.
   "tests/test_eslint_policy_check.sh"
   "tests/test_check_mktemp_portability.sh"
   "tests/test_session_finalization_check.sh"
@@ -291,6 +292,7 @@ ALLOW_LIST=(
   "tests/test_wave_audit.sh"
   "tests/test_project_doc_sync.sh"
   "tests/test_external_review_gh_stderr.sh"
+  "tests/test_external_review_rename_protection.sh"
 
   # The #623 Codex-latency audit script — hub-only operator tooling for
   # this pass (a consumer-repo sweep is a possible follow-up, at which

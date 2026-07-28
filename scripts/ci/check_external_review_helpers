@@ -29,14 +29,22 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TEST_SCRIPT="$REPO_ROOT/tests/test_external_review_gh_stderr.sh"
+SUITES="
+tests/test_external_review_gh_stderr.sh
+tests/test_external_review_rename_protection.sh
+"
 
-if [ ! -f "$TEST_SCRIPT" ]; then
+missing=""
+for suite in $SUITES; do
+  [ -f "$REPO_ROOT/$suite" ] || missing="$missing $suite"
+done
+
+if [ -n "$missing" ]; then
   if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
-    echo "check_external_review_helpers: SKIP (consumer checkout: wrapped test + scripts/sync-to-downstream.sh both absent; hub-only external-review suite)"
+    echo "check_external_review_helpers: SKIP (consumer checkout: wrapped tests + scripts/sync-to-downstream.sh both absent; hub-only external-review suites)"
     exit 0
   fi
-  echo "check_external_review_helpers: ERROR (missing $TEST_SCRIPT)" >&2
+  echo "check_external_review_helpers: ERROR (missing:$missing)" >&2
   exit 1
 fi
 
@@ -45,4 +53,7 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-bash "$TEST_SCRIPT"
+for suite in $SUITES; do
+  echo "── $suite"
+  bash "$REPO_ROOT/$suite"
+done

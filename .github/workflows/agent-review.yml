@@ -177,6 +177,59 @@ jobs:
               }
             );
 
+            // Config must come from the PR BASE, not this default-branch
+            // checkout (#763). This job checks out the default branch so the
+            // HELPER code is trusted — correct, and unchanged — but the helper
+            // was then handed the default branch's .github/review-policy.yml.
+            // A PR targeting a stricter non-default base (a release branch with
+            // a lower threshold or extra protected paths) was therefore judged
+            // by the LOOSER default-branch policy, and since `needsExternal` is
+            // overwritten by the helper result below, that could flip it to
+            // false and skip the external-review label entirely. Same bypass
+            // pr-review-policy.yml fixes; the PR cannot edit its own base, so
+            // reading config from there is equally trusted.
+            // Only a CONFIRMED 404 may fall back to the default-branch copy: a
+            // base with no review-policy.yml predates the policy entirely, so
+            // there is nothing stricter to miss. Any other failure (transient,
+            // auth, rate-limit) leaves the base policy UNKNOWN, and silently
+            // evaluating against the looser default-branch copy would
+            // reproduce the very bypass this fetch exists to close. Unknown
+            // policy therefore fails closed: require external review.
+            let policyConfigPath = null;
+            let policyReadFailed = false;
+            try {
+              const baseCfg = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path: '.github/review-policy.yml',
+                ref: pr.base.sha,
+              });
+              const baseCfgText = Buffer.from(baseCfg.data.content, 'base64').toString('utf8');
+              const baseCfgPath = path.join(
+                os.tmpdir(), `mergepath-pr-${pr.number}-base-review-policy.yml`
+              );
+              fs.writeFileSync(baseCfgPath, baseCfgText);
+              policyConfigPath = baseCfgPath;
+              console.log(`Using base-branch review policy from ${pr.base.sha}.`);
+            } catch (e) {
+              if (e.status === 404) {
+                policyConfigPath = '.github/review-policy.yml';
+                core.warning(
+                  `PR base ${pr.base.sha} has no .github/review-policy.yml ` +
+                  `(predates the policy file); falling back to the ` +
+                  `default-branch copy.`
+                );
+              } else {
+                policyReadFailed = true;
+                core.warning(
+                  `Could not read .github/review-policy.yml from PR base ` +
+                  `${pr.base.sha} (${e.status || 'no status'}: ${e.message}); ` +
+                  `requiring external review fail-closed rather than judging ` +
+                  `this PR by the default-branch policy.`
+                );
+              }
+            }
+
             // Exclude lockfiles, minified, and generated files from line count
             // to match REVIEW_POLICY.md threshold definition
             const excludePatterns = [
@@ -200,8 +253,15 @@ jobs:
               return new RegExp('^' + re + '$');
             }
 
+            // Both sides of a rename (#763): GitHub reports the destination in
+            // .filename and the source in .previous_filename, so matching only
+            // .filename would let a PR move a protected file to an unprotected
+            // path without tripping this. Same fix as
+            // external_review_fingerprint.sh, applied to this inline twin.
             const touchesProtected = files.some(f =>
-              protectedPaths.some(p => globToRegex(p).test(f.filename))
+              [f.filename, f.previous_filename]
+                .filter(Boolean)
+                .some(name => protectedPaths.some(p => globToRegex(p).test(name)))
             );
 
             // Use >= to match REVIEW_POLICY.md definition
@@ -209,31 +269,44 @@ jobs:
             let externalReviewFingerprint = '';
             let filesPath = '';
             const repo = `${context.repo.owner}/${context.repo.repo}`;
-            try {
-              filesPath = path.join(os.tmpdir(), `mergepath-pr-${pr.number}-files.json`);
-              fs.writeFileSync(filesPath, JSON.stringify(files));
-              const fingerprintRaw = childProcess.execFileSync(
-                'bash',
-                [
-                  'scripts/workflow/external_review_fingerprint.sh',
-                  '--repo', repo,
-                  '--pr', String(pr.number),
-                  '--ref', pr.head.sha,
-                  '--config', '.github/review-policy.yml',
-                  '--files-json', filesPath,
-                ],
-                {encoding: 'utf8', env: process.env}
-              );
-              const fingerprint = JSON.parse(fingerprintRaw);
-              needsExternal = Boolean(fingerprint.requires_review);
-              externalReviewFingerprint = fingerprint.fingerprint || '';
-            } catch (e) {
-              core.warning(
-                `External-review fingerprint calculation failed; ` +
-                `labeling fail-closed (${e.message}).`
-              );
+            if (policyReadFailed) {
+              // Base policy unknown — see the fail-closed note above. Skip the
+              // helper entirely: running it against the default-branch config
+              // is exactly the bypass being closed, and its result would
+              // OVERWRITE needsExternal.
               needsExternal = true;
               externalReviewFingerprint = '';
+              console.log(
+                'External-review fail-closed: base review policy unreadable; ' +
+                'requiring review and skipping the fingerprint calculation.'
+              );
+            } else {
+              try {
+                filesPath = path.join(os.tmpdir(), `mergepath-pr-${pr.number}-files.json`);
+                fs.writeFileSync(filesPath, JSON.stringify(files));
+                const fingerprintRaw = childProcess.execFileSync(
+                  'bash',
+                  [
+                    'scripts/workflow/external_review_fingerprint.sh',
+                    '--repo', repo,
+                    '--pr', String(pr.number),
+                    '--ref', pr.head.sha,
+                    '--config', policyConfigPath,
+                    '--files-json', filesPath,
+                  ],
+                  {encoding: 'utf8', env: process.env}
+                );
+                const fingerprint = JSON.parse(fingerprintRaw);
+                needsExternal = Boolean(fingerprint.requires_review);
+                externalReviewFingerprint = fingerprint.fingerprint || '';
+              } catch (e) {
+                core.warning(
+                  `External-review fingerprint calculation failed; ` +
+                  `labeling fail-closed (${e.message}).`
+                );
+                needsExternal = true;
+                externalReviewFingerprint = '';
+              }
             }
 
             // PROPAGATION-LANE-DEFER (#656): this job and pr-review-policy.yml's
@@ -317,7 +390,7 @@ jobs:
                       '--pr', String(pr.number),
                       '--head', pr.head.sha,
                       '--current-fingerprint', externalReviewFingerprint,
-                      '--config', '.github/review-policy.yml',
+                      '--config', policyConfigPath,
                       '--files-json', filesPath,
                     ],
                     {encoding: 'utf8', env: process.env}
