@@ -69,11 +69,25 @@
 #      must NOT be reported as "dirty ... commit, stash, or discard it
 #      by hand" (there is nothing there to commit), and `--apply`'s
 #      trailing `git worktree prune` must clear it.
+#  18c. #762 r3 P2: the same shape holding an INITIALIZED SUBMODULE with
+#      untracked work inside it, under `diff.ignoreSubmodules=all`. That
+#      config (repo- or user-global, and inherited by every worktree)
+#      suppresses the ` M <sub>` record, so the probe reported EMPTY and
+#      --apply removed the worktree — `git worktree remove --force` is
+#      what the helper runs, and --force bypasses git's own "working
+#      trees containing submodules cannot be moved or removed" refusal.
+#      The gate must pass `--ignore-submodules=none`.
 #  19. #762 r2 P3: a LOCKED, clean, closed-PR branch-attached worktree
 #      is listed as locked and SKIPPED by a bare `--apply`, then
 #      removed by `--apply --force-locked`. (The pre-existing
 #      --force-locked fixture is a gone-upstream DETACHED-arm case and
 #      never reaches this code.)
+#  19b. #762 r3 P2: LOCKED *and* directory-MISSING. `git worktree prune`
+#      SKIPS locked entries, so calling this "prunable — --apply's prune
+#      clears it" was false: the entry survived every --apply and the
+#      audit re-reported the same self-clearing candidate forever while
+#      --apply exited 0. It must route to the LOCKED bucket (skipped by
+#      a bare --apply, cleared by `--apply --force-locked`).
 #  20. #762 r2 P3: a branch-attached pr-<n> worktree whose PR state is
 #      UNVERIFIABLE is never removed, and DOES count toward the dry-run
 #      exit 2 — the deliberate difference from the SUMMARY_LOOKUP_UNKNOWN
@@ -282,6 +296,46 @@ if [ -n "$(git -C "$UNTRACKED_PR_WT" status --porcelain --ignored)" ]; then
   fail "fixture setup: expected --ignored alone to be EMPTY under status.showUntrackedFiles=no"
 fi
 
+# ── Case 18c (#762 r3 P2): SUBMODULE content, `diff.ignoreSubmodules=all`
+# Third independent way an operator setting turns the safety probe into a
+# lie. With `diff.ignoreSubmodules=all` (repo or user-global — and worktrees
+# inherit repo config), git omits the ` M <sub>` record for an initialized
+# submodule carrying untracked or uncommitted work, so a worktree with real
+# work in it reports an EMPTY status. Only `--ignore-submodules=none`
+# overrides it; neither `--ignored` nor `--untracked-files=all` does.
+#
+# The submodule is added FROM INSIDE the PR worktree so no other fixture in
+# this suite ever sees a gitlink. `-c protocol.file.allow=always` is required
+# because git refuses `file://` submodule clones by default (CVE-2022-39253).
+SUBMOD_PR_NUM=66666
+SUBMOD_PR_BRANCH="pr-branch-submodule"
+SUBMOD_SRC="$WORKDIR/submodule-src"
+git init -q -b main "$SUBMOD_SRC"
+git -C "$SUBMOD_SRC" config user.email "test@example.com"
+git -C "$SUBMOD_SRC" config user.name "Test"
+git -C "$SUBMOD_SRC" config commit.gpgsign false
+echo "vendored library" > "$SUBMOD_SRC/lib.txt"
+git -C "$SUBMOD_SRC" add -A
+git -C "$SUBMOD_SRC" commit -q -m "initial"
+git branch "$SUBMOD_PR_BRANCH"
+git push -q -u origin "$SUBMOD_PR_BRANCH"
+SUBMOD_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${SUBMOD_PR_NUM}-submodule"
+git worktree add -q "$SUBMOD_PR_WT" "$SUBMOD_PR_BRANCH"
+git -c protocol.file.allow=always -C "$SUBMOD_PR_WT" submodule add -q "$SUBMOD_SRC" vendor/sub
+git -C "$SUBMOD_PR_WT" commit -q -m "add submodule"
+git -C "$SUBMOD_PR_WT" config diff.ignoreSubmodules all
+SUBMOD_CANARY="$SUBMOD_PR_WT/vendor/sub/precious.md"
+echo "hours of uncommitted vendor patching" > "$SUBMOD_CANARY"
+# Assert the fixture's own premise: with the two flags the helper already
+# passed BEFORE this fix, the status is still empty. Without this the case
+# could pass while testing nothing.
+if [ -n "$(git -C "$SUBMOD_PR_WT" status --porcelain --ignored --untracked-files=all)" ]; then
+  fail "fixture setup: expected --ignored --untracked-files=all to be EMPTY under diff.ignoreSubmodules=all"
+fi
+if [ -z "$(git -C "$SUBMOD_PR_WT" status --porcelain --ignored --untracked-files=all --ignore-submodules=none)" ]; then
+  fail "fixture setup: expected --ignore-submodules=none to REPORT the dirty submodule"
+fi
+
 # ── Case 18 (#762 r2 P3): same shape, registered dir DELETED ──────────
 # `git worktree list --porcelain` still carries the entry (with a `prunable`
 # line the record parser ignores), and the branch/HEAD fields make it look
@@ -305,6 +359,27 @@ git push -q -u origin "$LOCKED_PR_BRANCH"
 LOCKED_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${LOCKED_PR_NUM}-locked"
 git worktree add -q "$LOCKED_PR_WT" "$LOCKED_PR_BRANCH"
 git worktree lock --reason "branch-attached lock" "$LOCKED_PR_WT"
+
+# ── Case 19b (#762 r3 P2): LOCKED *and* directory MISSING ─────────────
+# Case 18's "prunable, --apply clears it" claim is only true for UNLOCKED
+# entries: `git worktree prune` skips locked ones outright (verified —
+# `prune -v` prints nothing and the entry stays registered), and `git
+# worktree remove --force` refuses too ("use 'remove -f -f' to override or
+# unlock first"). Routing this shape to the prunable bucket therefore
+# produced a candidate that reappeared in every audit forever while --apply
+# kept exiting 0. It belongs in the LOCKED bucket, behind --force-locked.
+LOCKMISS_PR_NUM=44444
+LOCKMISS_PR_BRANCH="pr-branch-locked-missing"
+git branch "$LOCKMISS_PR_BRANCH"
+git push -q -u origin "$LOCKMISS_PR_BRANCH"
+LOCKMISS_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${LOCKMISS_PR_NUM}-locked-missing"
+git worktree add -q "$LOCKMISS_PR_WT" "$LOCKMISS_PR_BRANCH"
+git worktree lock --reason "locked then vanished" "$LOCKMISS_PR_WT"
+rm -rf "$LOCKMISS_PR_WT"
+# Premise: git still registers the entry, and it is still marked locked.
+if ! git worktree list --porcelain | grep -Fq -- "$LOCKMISS_PR_WT"; then
+  fail "fixture setup: expected the locked+missing worktree to stay registered"
+fi
 
 # ── Case 20 (#762 r2 P3): branch-attached pr-<n>, PR state UNKNOWN ────
 # The stub does not know this PR number, so `gh pr view` fails and the
@@ -449,12 +524,20 @@ if [ "\$1" = "pr" ] && [ "\$2" = "view" ]; then
     echo "MERGED"
     exit 0
   fi
+  if [ "\$num" = "$SUBMOD_PR_NUM" ]; then
+    echo "CLOSED"
+    exit 0
+  fi
   if [ "\$num" = "$PRUNE_PR_NUM" ]; then
     echo "MERGED"
     exit 0
   fi
   if [ "\$num" = "$LOCKED_PR_NUM" ]; then
     echo "CLOSED"
+    exit 0
+  fi
+  if [ "\$num" = "$LOCKMISS_PR_NUM" ]; then
+    echo "MERGED"
     exit 0
   fi
   # $UNKNOWN_PR_NUM is deliberately absent: the call falls through to the
@@ -664,6 +747,21 @@ else
   show_out_on_fail
 fi
 
+# Case 18c (#762 r3 P2): the submodule-carrying worktree under
+# `diff.ignoreSubmodules=all` is reported NOT CLEAN. Pre-fix the probe saw an
+# empty status and this record read `[STALE PR #66666 (CLOSED) branch
+# worktree] -> removing`.
+SUBMOD_PR_LABEL=$(echo "$OUT" | awk -v p="$SUBMOD_PR_WT" '
+  /^  \[/            { label = $0 }
+  $1 == "path:" && $2 == p { print label; exit }
+')
+if echo "$SUBMOD_PR_LABEL" | grep -q "working tree is not clean"; then
+  pass "submodule-dirty worktree reported not-clean despite diff.ignoreSubmodules=all"
+else
+  fail "submodule-dirty worktree mislabeled (label='$SUBMOD_PR_LABEL')"
+  show_out_on_fail
+fi
+
 # Case 18 (#762 r2 P3): the missing-directory worktree is PRUNABLE, not
 # dirty. Assert BOTH the label and the absence of the false remediation.
 PRUNE_PR_LABEL=$(echo "$OUT" | awk -v p="$PRUNE_PR_WT" '
@@ -682,11 +780,33 @@ if echo "$PRUNE_PR_LABEL" | grep -q "not clean"; then
 else
   pass "missing-directory worktree does NOT claim there is work to preserve"
 fi
-if echo "$OUT" | grep -qE "prunable PR worktrees: +[1-9]"; then
-  pass "summary shows ≥1 prunable PR worktree"
+# Exactly ONE prunable entry — the unlocked Case 18 fixture. Case 19b is
+# locked, and prune cannot clear a locked entry, so counting it here would
+# advertise a self-clearing candidate that never clears (#762 r3 P2).
+if echo "$OUT" | grep -qE "prunable PR worktrees: +1$"; then
+  pass "summary counts exactly 1 prunable PR worktree (the UNLOCKED one)"
 else
-  fail "summary prunable-PR-worktree count missing/zero"
+  fail "summary prunable-PR-worktree count wrong: $(echo "$OUT" | grep -E 'prunable PR worktrees:')"
   show_out_on_fail
+fi
+
+# Case 19b (#762 r3 P2): the LOCKED + directory-MISSING worktree is reported
+# as LOCKED, never as prunable.
+LOCKMISS_PR_LABEL=$(echo "$OUT" | awk -v p="$LOCKMISS_PR_WT" '
+  /^  \[/            { label = $0 }
+  $1 == "path:" && $2 == p { print label; exit }
+')
+if echo "$LOCKMISS_PR_LABEL" | grep -q "LOCKED PR #${LOCKMISS_PR_NUM} (MERGED) worktree directory is MISSING"; then
+  pass "locked+missing branch worktree listed under the LOCKED record"
+else
+  fail "locked+missing branch worktree mislabeled (label='$LOCKMISS_PR_LABEL')"
+  show_out_on_fail
+fi
+if echo "$LOCKMISS_PR_LABEL" | grep -q "prunable"; then
+  fail "locked+missing worktree wrongly advertised as prunable (git worktree prune skips locked entries)"
+  show_out_on_fail
+else
+  pass "locked+missing worktree does NOT claim prune will clear it"
 fi
 
 # Case 19 (#762 r2 P3): the LOCKED clean closed-PR branch worktree is
@@ -1006,6 +1126,26 @@ else
   echo "$OUT2" >&2
 fi
 
+# Case 18c (#762 r3 P2): the SUBMODULE-carrying worktree survives --apply
+# under `diff.ignoreSubmodules=all`. Pre-fix the status probe returned empty,
+# the helper reported `clean`, and try_remove()'s `git worktree remove
+# --force` deleted the worktree together with the submodule's untracked work.
+# The --force is load-bearing in that failure: without it git refuses outright
+# ("working trees containing submodules cannot be moved or removed"), so git's
+# own guard is no backstop for the form this helper actually runs.
+if [ -d "$SUBMOD_PR_WT" ]; then
+  pass "submodule-carrying worktree retained by --apply under diff.ignoreSubmodules=all"
+else
+  fail "submodule-carrying worktree was removed by --apply despite dirty submodule content"
+  echo "$OUT2" >&2
+fi
+if [ -f "$SUBMOD_CANARY" ] && grep -q "uncommitted vendor patching" "$SUBMOD_CANARY"; then
+  pass "submodule canary survived --apply under diff.ignoreSubmodules=all"
+else
+  fail "DATA LOSS: --apply deleted untracked submodule content in $SUBMOD_PR_WT"
+  echo "$OUT2" >&2
+fi
+
 # Case 18 (#762 r2 P3): --apply's trailing `git worktree prune` clears the
 # stale administrative entry, so the missing-directory worktree is gone from
 # the follow-up dry-run. This is what makes the prunable bucket self-clearing
@@ -1022,6 +1162,41 @@ if [ -d "$LOCKED_PR_WT" ]; then
   pass "locked closed-PR branch worktree retained by bare --apply"
 else
   fail "locked closed-PR branch worktree removed without --force-locked"
+  echo "$OUT2" >&2
+fi
+
+# Case 19b (#762 r3 P2): a bare --apply SKIPS the locked+missing entry and
+# says so. Pre-fix it claimed the trailing prune would clear the entry — which
+# prune silently declines to do for a locked worktree, so the very next audit
+# reported the identical "self-clearing" candidate again.
+#
+# Scope the grep to THIS record's own block: two other locked fixtures emit
+# the same "skipped (locked...)" line, so an unscoped `grep -q` over all of
+# OUT2 would pass against the pre-fix code and assert nothing. Accumulate
+# lines from the record label that precedes `path: $LOCKMISS_PR_WT` up to the
+# next record label.
+LOCKMISS_APPLY_BLOCK=$(echo "$OUT2" | awk -v p="$LOCKMISS_PR_WT" '
+  /^  \[/ { if (want) exit; buf = $0; next }
+           { buf = buf "\n" $0 }
+  $1 == "path:" && $2 == p { want = 1 }
+  END      { if (want) print buf }
+')
+if echo "$LOCKMISS_APPLY_BLOCK" | grep -q "skipped (locked; pass --force-locked to remove)"; then
+  pass "locked+missing entry reported as skipped-locked by bare --apply"
+else
+  fail "locked+missing entry not reported as skipped-locked by bare --apply (block='$LOCKMISS_APPLY_BLOCK')"
+  echo "$OUT2" >&2
+fi
+# Premise pin, not a regression assertion: this holds before AND after the
+# fix, and it is the git behavior the whole fix rests on. `git worktree prune`
+# — which --apply just ran unconditionally — leaves a LOCKED entry registered,
+# so the pre-fix "prune clears it" remediation was simply false. If a future
+# git ever makes prune drop locked entries, this fails and the routing above
+# should be revisited.
+if git worktree list --porcelain | grep -Fq -- "$LOCKMISS_PR_WT"; then
+  pass "premise: --apply's git worktree prune does NOT clear a LOCKED entry"
+else
+  fail "premise broken: git worktree prune cleared a locked entry — revisit the locked+missing routing"
   echo "$OUT2" >&2
 fi
 
@@ -1158,6 +1333,18 @@ else
   echo "$OUT4" >&2
 fi
 
+# Case 19b (#762 r3 P2): --force-locked is the ONLY thing that clears a
+# locked+missing entry — try_remove() unlocks first, then removes. This is the
+# assertion the pre-fix code cannot satisfy: routed to the prunable bucket it
+# was never handed to try_remove at all, and the trailing `git worktree prune`
+# skips locked entries, so the stale registration outlived every --apply.
+if git worktree list --porcelain | grep -Fq -- "$LOCKMISS_PR_WT"; then
+  fail "locked+missing entry survived --apply --force-locked (still registered)"
+  echo "$OUT4" >&2
+else
+  pass "locked+missing entry cleared by --apply --force-locked"
+fi
+
 # Final dry-run: the diverged merged branch is still present (kept for manual
 # review — --apply never touches it), and a review-needed branch counts as
 # actionable, so the audit stays exit 2 until a human resolves it (Codex P2:
@@ -1182,6 +1369,7 @@ git branch -D "$DIVERGED_BRANCH" >/dev/null 2>&1 || true
 git worktree remove --force "$DIRTY_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$IGNORED_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$UNTRACKED_PR_WT" >/dev/null 2>&1 || true
+git worktree remove --force "$SUBMOD_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$UNKNOWN_PR_WT" >/dev/null 2>&1 || true
 set +e
 OUT6=$(PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1)
