@@ -974,10 +974,13 @@ else
   fail "Case 33 unexpected (rc=$rc): $out"
 fi
 
-# Case 34: same for a KIT entry.
+# Case 34: same for a KIT entry whose source DIRECTORY contains a denied doc.
+# A file source (source: BRAND.md) would trip the later -d validation anyway,
+# so the meaningful kit case is a directory that CONTAINS the denied doc — the
+# containment branch, not the equality branch (#763).
 MANIFEST_ID_KIT_SRC="$MIN_HEADER
   - path: docs/mirrored/
-    source: BRAND.md
+    source: .
     type: kit
     consumers: all
 "
@@ -985,9 +988,9 @@ set +e
 out=$(run_with_fixture "$MANIFEST_ID_KIT_SRC" "$(printf 'docs/mirrored/\nBRAND.md')"); rc=$?
 set -e
 if [ "$rc" = "1" ] && \
-   echo "$out" | grep -q "BRAND.md" && \
+   echo "$out" | grep -q "repo-root-kit" && \
    echo "$out" | grep -q "#743"; then
-  pass "Case 34: kit entry sourced FROM an identity doc fails closed (#763)"
+  pass "Case 34: kit whose source DIRECTORY contains an identity doc fails closed (#763)"
 else
   fail "Case 34 unexpected (rc=$rc): $out"
 fi

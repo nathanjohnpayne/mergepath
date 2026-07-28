@@ -195,6 +195,14 @@ fi
 
 CONFIG=".github/review-policy.yml"
 
+# Scratch file for the PR-base review policy (#763; see the derivation block).
+BASE_POLICY_TMP=""
+# shellcheck disable=SC2329  # invoked via the EXIT trap below
+cleanup_base_policy() {
+  [ -z "$BASE_POLICY_TMP" ] || rm -f "$BASE_POLICY_TMP"
+}
+trap cleanup_base_policy EXIT
+
 # Read a scalar field nested two levels deep: `<block>:` `<sub>:` `<field>:`.
 # Same state-machine awk pattern as codex-p1-gate.sh's
 # codex_p1_gate_field, generalized over the top block + sub-block names so
@@ -355,6 +363,7 @@ PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) \
   || die 2 "failed to fetch PR metadata: $PR_JSON"
 
 HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
+BASE_SHA=$(echo "$PR_JSON" | jq -r '.base.sha // ""')
 PR_AUTHOR=$(echo "$PR_JSON" | jq -r '.user.login')
 if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
   die 2 "could not determine HEAD sha for PR #$PR_NUMBER"
@@ -491,10 +500,44 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
     if [ "${lane_rc:-0}" -eq 2 ] && { [ "$DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; }; then
       die 2 "propagation-lane marker read was indeterminate (comments API fetch/parse failed) in query mode for $HEAD_SHA; refusing to assert external-review requiredness/protection (fail-closed)"
     fi
+    # Requiredness config comes from the PR BASE, not this trusted
+    # default-branch checkout (#763). This gate runs on `synchronize` BEFORE
+    # the labelers may re-add needs-external-review, so it can publish a GREEN
+    # required check for the head. Deriving that from the default branch's
+    # threshold/paths means a PR onto a stricter non-default base (a release
+    # branch with a lower threshold or extra protected paths) gets cleared by
+    # the LOOSER policy — the same stale-label merge window this gate exists to
+    # close. The PR cannot edit its own base, so base config is equally
+    # trusted. Same fix as agent-review.yml and pr-review-policy.yml.
+    #
+    # Fail CLOSED unless the base is a confirmed 404 (a base with no
+    # review-policy.yml predates the policy, so nothing stricter can be
+    # missed). A transient/auth/rate-limit failure must NOT silently fall back
+    # to the looser default-branch policy.
+    POLICY_CONFIG="$CONFIG"
+    if [ -n "$BASE_SHA" ]; then
+      set +e
+      base_policy_out=$(gh api "repos/$REPO/contents/.github/review-policy.yml?ref=$BASE_SHA" \
+        -H "Accept: application/vnd.github.raw" 2>&1)
+      base_policy_rc=$?
+      set -e
+      if [ "$base_policy_rc" -eq 0 ] && [ -n "$base_policy_out" ]; then
+        BASE_POLICY_TMP=$(mktemp "${TMPDIR:-/tmp}/mcg-base-policy.XXXXXX")
+        printf '%s\n' "$base_policy_out" > "$BASE_POLICY_TMP"
+        POLICY_CONFIG="$BASE_POLICY_TMP"
+        log "external-review derivation using the PR base policy at $BASE_SHA"
+      elif printf '%s' "$base_policy_out" | grep -qiE '(^|[^0-9])404([^0-9]|$)|not found'; then
+        log "PR base $BASE_SHA has no .github/review-policy.yml (predates it) — deriving from the default-branch policy"
+      else
+        REQUIRES_EXTERNAL=true
+        REQUIRES_REASON="could not read the PR base review policy at $BASE_SHA (rc=$base_policy_rc) — failing closed rather than deriving from the default-branch policy"
+      fi
+    fi
+
     # `|| true` so a missing key (grep no-match → pipeline non-zero under
     # pipefail) does NOT abort the script before the `:-300` fallback runs
     # (CodeRabbit ⚠️ on PR #429).
-    THRESHOLD=$(grep -E '^external_review_threshold:' "$CONFIG" 2>/dev/null | awk '{print $2}' || true)
+    THRESHOLD=$(grep -E '^external_review_threshold:' "$POLICY_CONFIG" 2>/dev/null | awk '{print $2}' || true)
     THRESHOLD=${THRESHOLD:-300}
     if ! [[ "$THRESHOLD" =~ ^[0-9]+$ ]]; then THRESHOLD=300; fi
 
@@ -510,7 +553,12 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
       | add // 0')
     LINES_CHANGED=${LINES_CHANGED:-0}
 
-    if [ "$LINES_CHANGED" -ge "$THRESHOLD" ]; then
+    if [ "$REQUIRES_EXTERNAL" = "true" ]; then
+      # Already forced on by the base-policy fail-closed above; keep that
+      # reason rather than overwriting it with a threshold/paths verdict
+      # computed from a policy we could not read.
+      :
+    elif [ "$LINES_CHANGED" -ge "$THRESHOLD" ]; then
       REQUIRES_EXTERNAL=true
       REQUIRES_REASON="$LINES_CHANGED lines changed >= threshold $THRESHOLD"
     else
@@ -537,7 +585,7 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
         REQUIRES_REASON="protected-paths check unavailable (parser/matcher missing under $WF_DIR) — failing closed"
       else
         set +e
-        PATHS=$(bash "$PARSE" "$CONFIG" external_review_paths)
+        PATHS=$(bash "$PARSE" "$POLICY_CONFIG" external_review_paths)
         parse_rc=$?
         set -e
         if [ "$parse_rc" -ne 0 ]; then
@@ -549,7 +597,14 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
             [ -n "$pline" ] && PATTERNS+=("$pline")
           done <<<"$PATHS"
           if [ "${#PATTERNS[@]}" -gt 0 ]; then
-            CHANGED_FILES=$(echo "$FILES_JSON" | jq -r '.[].filename')
+            # Both sides of a rename (#763): GitHub reports the
+            # destination in .filename and the source in
+            # .previous_filename. Matching only .filename let a
+            # below-threshold PR MOVE a protected file to an unprotected
+            # path and still get a green required check here — this gate
+            # runs on `synchronize` before the labelers can re-add
+            # needs-external-review, so that green permits auto-merge.
+            CHANGED_FILES=$(echo "$FILES_JSON" | jq -r '.[] | (.filename, (.previous_filename // empty))')
             set +e
             MATCHED=$(printf '%s\n' "$CHANGED_FILES" | bash "$MATCH" "${PATTERNS[@]}")
             match_rc=$?
