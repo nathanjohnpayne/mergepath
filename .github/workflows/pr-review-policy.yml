@@ -78,11 +78,25 @@ jobs:
           BASE_SHA=${{ github.event.pull_request.base.sha }}
           HEAD_SHA=${{ github.event.pull_request.head.sha }}
 
+          # A base with no .github/review-policy.yml predates the policy file.
+          # This used to SKIP the whole check (needs_review=false), which let a
+          # large or protected-path PR targeting such a base pass the label gate
+          # with no external review at all — flagged by the wave audit on the
+          # 4a8f804 wave. It now falls back to the DEFAULT-BRANCH policy, the
+          # same rule scripts/workflow/resolve_base_policy.sh applies for a
+          # confirmed 404, so every site treats "base predates the policy"
+          # identically instead of one of them opting out.
+          #
+          # Trade-off, stated because it is a real behaviour change: a consumer
+          # mid-bootstrap can have PRs whose base predates its policy file, and
+          # those PRs now get evaluated against the policy the repo actually has
+          # rather than waved through. That is the intended direction — the
+          # policy exists on the default branch by then — but it can newly label
+          # such a PR.
+          BASE_HAS_POLICY=true
           if ! git cat-file -e "$BASE_SHA:.github/review-policy.yml" 2>/dev/null; then
-            echo "WARNING: base commit has no .github/review-policy.yml, skipping external review check"
-            echo "needs_review=false" >> "$GITHUB_OUTPUT"
-            echo "propagation_lane=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            BASE_HAS_POLICY=false
+            echo "NOTE: base commit has no .github/review-policy.yml (predates it) — falling back to the default-branch policy rather than skipping the external review check."
           fi
 
           CHANGED_FILES=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA")
@@ -310,7 +324,14 @@ jobs:
             echo "reasons=- Could not materialize the PR base tree for the external-review calculation; requiring review fail-closed" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          TRUSTED_CONFIG="$TRUSTED_BASE_TREE/.github/review-policy.yml"
+          # Pair the config with the base tree, EXCEPT when the base predates
+          # the policy file — then the default-branch copy is the only policy
+          # that exists (see BASE_HAS_POLICY above).
+          if [ "$BASE_HAS_POLICY" = "true" ]; then
+            TRUSTED_CONFIG="$TRUSTED_BASE_TREE/.github/review-policy.yml"
+          else
+            TRUSTED_CONFIG=".github/review-policy.yml"
+          fi
 
           TRUSTED_SOURCE=""
           if [ -x "$TRUSTED_BASE_TREE/scripts/workflow/external_review_fingerprint.sh" ]; then

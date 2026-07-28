@@ -32,6 +32,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SUITES="
 tests/test_external_review_gh_stderr.sh
 tests/test_external_review_rename_protection.sh
+tests/test_resolve_base_policy.sh
 "
 
 missing=""

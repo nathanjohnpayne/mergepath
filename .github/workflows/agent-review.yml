@@ -178,56 +178,45 @@ jobs:
             );
 
             // Config must come from the PR BASE, not this default-branch
-            // checkout (#763). This job checks out the default branch so the
-            // HELPER code is trusted — correct, and unchanged — but the helper
-            // was then handed the default branch's .github/review-policy.yml.
-            // A PR targeting a stricter non-default base (a release branch with
-            // a lower threshold or extra protected paths) was therefore judged
-            // by the LOOSER default-branch policy, and since `needsExternal` is
-            // overwritten by the helper result below, that could flip it to
-            // false and skip the external-review label entirely. Same bypass
-            // pr-review-policy.yml fixes; the PR cannot edit its own base, so
-            // reading config from there is equally trusted.
-            // Only a CONFIRMED 404 may fall back to the default-branch copy: a
-            // base with no review-policy.yml predates the policy entirely, so
-            // there is nothing stricter to miss. Any other failure (transient,
-            // auth, rate-limit) leaves the base policy UNKNOWN, and silently
-            // evaluating against the looser default-branch copy would
-            // reproduce the very bypass this fetch exists to close. Unknown
-            // policy therefore fails closed: require external review.
-            let policyConfigPath = null;
+            // checkout (#763/#769). This job checks out the default branch so
+            // the HELPER code is trusted — correct, and unchanged — but the
+            // helper was then handed the default branch's review-policy.yml. A
+            // PR targeting a stricter non-default base was therefore judged by
+            // the LOOSER policy, and since `needsExternal` is overwritten by
+            // the helper result below, that could flip it to false and skip the
+            // external-review label entirely.
+            //
+            // Resolution goes through the SHARED helper that
+            // merge-clearance-gate.sh and codex-review-check.sh also use, so
+            // every policy decision in the fleet reads one implementation
+            // rather than four near-copies. For a default-base PR it returns
+            // the checked-out path and makes no API call; it fails (exit 2)
+            // only for a positively-identified non-default base whose policy
+            // cannot be read, which is the one case where silently using the
+            // default-branch copy would be the bypass.
+            let policyConfigPath = '.github/review-policy.yml';
             let policyReadFailed = false;
             try {
-              const baseCfg = await github.rest.repos.getContent({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                path: '.github/review-policy.yml',
-                ref: pr.base.sha,
-              });
-              const baseCfgText = Buffer.from(baseCfg.data.content, 'base64').toString('utf8');
-              const baseCfgPath = path.join(
-                os.tmpdir(), `mergepath-pr-${pr.number}-base-review-policy.yml`
-              );
-              fs.writeFileSync(baseCfgPath, baseCfgText);
-              policyConfigPath = baseCfgPath;
-              console.log(`Using base-branch review policy from ${pr.base.sha}.`);
+              policyConfigPath = childProcess.execFileSync(
+                'bash',
+                [
+                  'scripts/workflow/resolve_base_policy.sh',
+                  '--repo', `${context.repo.owner}/${context.repo.repo}`,
+                  '--base-ref', pr.base.ref,
+                  '--base-sha', pr.base.sha,
+                  '--default-branch', context.payload.repository.default_branch,
+                  '--default-config', '.github/review-policy.yml',
+                ],
+                {encoding: 'utf8', env: process.env}
+              ).trim();
+              console.log(`Governing review policy: ${policyConfigPath}`);
             } catch (e) {
-              if (e.status === 404) {
-                policyConfigPath = '.github/review-policy.yml';
-                core.warning(
-                  `PR base ${pr.base.sha} has no .github/review-policy.yml ` +
-                  `(predates the policy file); falling back to the ` +
-                  `default-branch copy.`
-                );
-              } else {
-                policyReadFailed = true;
-                core.warning(
-                  `Could not read .github/review-policy.yml from PR base ` +
-                  `${pr.base.sha} (${e.status || 'no status'}: ${e.message}); ` +
-                  `requiring external review fail-closed rather than judging ` +
-                  `this PR by the default-branch policy.`
-                );
-              }
+              policyReadFailed = true;
+              core.warning(
+                `Could not resolve the governing review policy ` +
+                `(${e.message}); requiring external review fail-closed rather ` +
+                `than judging this PR by the default-branch policy.`
+              );
             }
 
             // Exclude lockfiles, minified, and generated files from line count

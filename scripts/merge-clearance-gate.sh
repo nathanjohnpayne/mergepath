@@ -243,12 +243,16 @@ nested_field() {  # <top_block> <sub_block> <field>
 # Read the available_reviewers list (one login per line). Identical parser
 # to scripts/codex-review-check.sh read_available_reviewers.
 read_available_reviewers() {
-  [ -f "$CONFIG" ] || return 0
+  # $POLICY_CONFIG, not $CONFIG (#769): the reviewer allow-list must come from
+  # the SAME policy as the gate-enable switch and the threshold. Reading it
+  # from the default branch while the switch came from the base was the
+  # half-threaded state the #767 review flagged.
+  [ -f "$POLICY_CONFIG" ] || return 0
   awk '
     /^available_reviewers:/ {in_block=1; next}
     in_block && /^[^[:space:]#]/ {in_block=0}
     in_block && /^ *-/ {print}
-  ' "$CONFIG" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/'
+  ' "$POLICY_CONFIG" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/'
 }
 
 # --- logging helpers --------------------------------------------------------
@@ -375,24 +379,42 @@ BASE_SHA=$(echo "$PR_JSON" | jq -r '.base.sha // ""')
 # Silently substituting the default-branch policy there is the bypass itself.
 BASE_REF=$(echo "$PR_JSON" | jq -r '.base.ref // ""')
 DEFAULT_BRANCH=$(echo "$PR_JSON" | jq -r '.base.repo.default_branch // ""')
-if [ -n "$BASE_SHA" ] && [ -n "$BASE_REF" ] && [ -n "$DEFAULT_BRANCH" ] \
-   && [ "$BASE_REF" != "$DEFAULT_BRANCH" ]; then
-  set +e
-  base_policy_out=$(gh api "repos/$REPO/contents/.github/review-policy.yml?ref=$BASE_SHA" \
-    -H "Accept: application/vnd.github.raw" 2>&1)
-  base_policy_rc=$?
-  set -e
-  if [ "$base_policy_rc" -eq 0 ] && [ -n "$base_policy_out" ]; then
-    BASE_POLICY_TMP=$(mktemp "${TMPDIR:-/tmp}/mcg-base-policy.XXXXXX")
-    printf '%s\n' "$base_policy_out" > "$BASE_POLICY_TMP"
-    POLICY_CONFIG="$BASE_POLICY_TMP"
-  elif printf '%s' "$base_policy_out" | grep -qiE '(^|[^0-9])404([^0-9]|$)|not found'; then
-    : # base predates the policy file — the default-branch copy is all there is
-  else
-    echo "ERROR: could not read .github/review-policy.yml from non-default base $BASE_REF@$BASE_SHA (rc=$base_policy_rc): $base_policy_out" >&2
-    exit 2
-  fi
+RESOLVE_POLICY_BIN="${MERGE_CLEARANCE_WORKFLOW_DIR:-$SCRIPT_DIR/workflow}/resolve_base_policy.sh"
+if [ ! -f "$RESOLVE_POLICY_BIN" ]; then
+  # Broken install (the resolver ships with this gate via .mergepath-sync.yml).
+  # Keep the default-branch policy rather than exiting 2: this runs BEFORE the
+  # external arm is derived, so there is no "require review" to fail closed
+  # into yet, and turning a missing propagated file into a hard error here
+  # would convert a mid-sync consumer into a red required check. The separate
+  # protected-paths helper check further down still fails closed on its own
+  # missing helpers, which is where that behaviour belongs.
+  echo "WARNING: policy resolver missing ($RESOLVE_POLICY_BIN); using the default-branch policy" >&2
+  RESOLVED_POLICY="$CONFIG"
+  resolve_rc=0
+else
+# stdout is the policy PATH, stderr is diagnostics — keep them separate so a
+# warning cannot be concatenated into the path (#715/#716 class).
+RESOLVE_ERR=$(mktemp "${TMPDIR:-/tmp}/mcg-resolve-err.XXXXXX")
+set +e
+RESOLVED_POLICY=$(bash "$RESOLVE_POLICY_BIN" \
+  --repo "$REPO" --base-ref "$BASE_REF" --base-sha "$BASE_SHA" \
+  --default-branch "$DEFAULT_BRANCH" --default-config "$CONFIG" 2>"$RESOLVE_ERR")
+resolve_rc=$?
+set -e
+RESOLVE_MSG=$(cat "$RESOLVE_ERR" 2>/dev/null || true)
+rm -f "$RESOLVE_ERR"
+if [ "$resolve_rc" -ne 0 ]; then
+  echo "ERROR: could not resolve the governing review policy: $RESOLVE_MSG" >&2
+  exit 2
 fi
+fi
+POLICY_CONFIG="$RESOLVED_POLICY"
+# Only a fetched base policy lives in TMPDIR and needs cleanup; the
+# default-config path is the repo checkout.
+case "$POLICY_CONFIG" in
+  "$CONFIG") ;;
+  *) BASE_POLICY_TMP="$POLICY_CONFIG" ;;
+esac
 
 DEPENDABOT_GATE_ENABLED=$(nested_field dependabot reviewer_gate enabled)
 DEPENDABOT_GATE_ENABLED=${DEPENDABOT_GATE_ENABLED:-false}
@@ -658,7 +680,7 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
     fi
     set +e
     CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
-      bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO" >&2
+      MERGEPATH_REVIEW_POLICY_PATH="$POLICY_CONFIG" bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO" >&2
     crc=$?
     set -e
     # codex-review-check.sh's public contract is 0 clear, 1 gate-fail,
@@ -696,7 +718,7 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
     # 0 clear, 1 gate fail, 3 infra. Map 3 → 2 (config/infra error).
     set +e
     CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
-      bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO"
+      MERGEPATH_REVIEW_POLICY_PATH="$POLICY_CONFIG" bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO"
     crc=$?
     set -e
     case "$crc" in
