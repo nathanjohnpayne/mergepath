@@ -76,7 +76,8 @@ LOG="${GH_CALLS_LOG:-/dev/null}"
 
 if [ "$1" = "api" ]; then
   shift
-  if [ "${1:-}" = "--paginate" ]; then shift; fi
+  paginate=0
+  if [ "${1:-}" = "--paginate" ]; then paginate=1; shift; fi
   endpoint="${1:-}"
   case "$endpoint" in
     repos/*/pulls/*/reviews)
@@ -117,6 +118,13 @@ if [ "$1" = "api" ]; then
         exit 1
       fi
       cat "${FIXTURE_RULESETS:-/dev/null}"
+      # Page 2 is emitted ONLY for a caller that actually passed --paginate,
+      # mirroring the real endpoint's 30-rule page cap. This is what makes
+      # Protection 1g a genuine regression test for the truncation finding:
+      # without --paginate the gate sees page 1 only, exactly as in production.
+      if [ "$paginate" = "1" ] && [ -n "${FIXTURE_RULESETS_PAGE2:-}" ]; then
+        cat "$FIXTURE_RULESETS_PAGE2"
+      fi
       exit 0
       ;;
     repos/*/contents/*)
@@ -1349,17 +1357,29 @@ FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
 FIXTURE_FILES=$(make_files_fixture '[{"filename":"big.txt","additions":400,"deletions":0}]')
 FIXTURE_COMMENTS=$(make_comments_fixture '[]')
 FIXTURE_PROTECTION=$(make_protection_fixture '["Label Gate","Self-Review Required","lint"]')
+: > "$WORKDIR/protection-1c-stderr.log"
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
       FIXTURE_PROTECTION="$FIXTURE_PROTECTION" \
       MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
-  run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+  run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>"$WORKDIR/protection-1c-stderr.log")
 RC=$?
 set -e
 if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
   pass "protection: config-enabled but unenforced gate + no current-head clearance → false (#772)"
 else
   fail "protection: unenforced gate expected false/0; got rc=$RC out='$OUT'"
+fi
+
+# The not-enforced diagnostic must render each observed context QUOTED: these
+# are multi-word names, and a space-joined list cannot express whether
+# `Merge clearance gate` is present as one entry or as fragments of its
+# neighbours — the one thing the line exists to let an operator check.
+if grep -qF "observed: ['Label Gate', 'Self-Review Required', 'lint']" "$WORKDIR/protection-1c-stderr.log"; then
+  pass "protection: not-enforced diagnostic quotes each observed context (multi-word names stay parseable)"
+else
+  fail "protection: expected a quoted, comma-separated observed-context list on stderr"
+  sed 's/^/      /' "$WORKDIR/protection-1c-stderr.log" >&2
 fi
 
 echo; echo "--- Protection 1d (#772): config-enabled but unenforced + current-head clearance satisfied → true (#714 survives)"
@@ -1426,6 +1446,34 @@ if [ "$RC" = 0 ] && [ "$OUT" = "false" ] && ! grep -q "graphql" "$WORKDIR/gh-cal
 else
   fail "protection: lane-exempt expected false/0 and no enforcement probe; got rc=$RC out='$OUT'"
   sed 's/^/      /' "$WORKDIR/gh-calls.log" >&2
+fi
+
+echo; echo "--- Protection 1g (#772 review): a required_status_checks rule on ruleset PAGE 2 is still seen"
+# repos/{o}/{r}/rules/branches/{b} pages at 30 applicable rules. Stacked
+# rulesets can push the rule carrying `Merge clearance gate` past page 1, and a
+# truncated page is indistinguishable from an absent rule — same empty match,
+# same log line — so the probe would silently report "not enforced" forever on
+# such a repo. The stub emits page 2 ONLY when --paginate was passed, so this
+# case fails (false, via the arm-2 stub's rc=1) against an unpaginated read.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture '["some-other-check"]')
+FIXTURE_RULESETS_PAGE2=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESETS_PAGE2="$FIXTURE_RULESETS_PAGE2" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+  run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "protection: ruleset rule on page 2 → true (surface 2 paginates; multi-page output slurped)"
+else
+  fail "protection: paginated ruleset expected true/0; got rc=$RC out='$OUT'"
 fi
 
 echo; echo "--- Protection 2 (#713): gate disabled + protected path + Phase-4b/Codex cleared → true"

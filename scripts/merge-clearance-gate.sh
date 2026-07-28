@@ -42,6 +42,23 @@
 # Environment:
 #   GH_TOKEN   Required. Needs pull_requests:read (+ the read scopes
 #              codex-review-check.sh needs for the external-review path).
+#              The #772 enforcement probe (reached only from
+#              --derive-rate-limit-protection) reads two ADDITIONAL surfaces
+#              whose access pull_requests:read does NOT imply: GraphQL
+#              `ref.refUpdateRule` (classic branch protection — null for a
+#              viewer without push access) and REST
+#              `repos/{owner}/{repo}/rules/branches/{branch}` (rulesets —
+#              needs repo metadata read). A plain write-scoped classic PAT,
+#              which is what agent-review.yml runs this query under, reads
+#              both. A fine-grained PAT scoped to pull-requests only still
+#              satisfies the line above but gets null/403 on BOTH: the probe
+#              then reports "not enforced" (the conservative direction, so
+#              nothing unsafe happens) and arm 1 is permanently unavailable on
+#              that repo — every answer comes from the arm-2 current-head
+#              clearance probe. That state is indistinguishable from a
+#              genuinely unprotected base branch in the true/false output, so
+#              grep the job log for `enforcement probe:` lines to tell them
+#              apart before concluding a repo is unprotected.
 #   MERGE_CLEARANCE_CODEX_CHECK_BIN
 #              Optional. Path to codex-review-check.sh. Defaults to the
 #              sibling script next to this one. Tests override it to a
@@ -335,7 +352,7 @@ MERGE_CLEARANCE_CHECK_NAME="Merge clearance gate"
 # HIDE a rule, never invent one — it can push this probe toward "not enforced"
 # (the conservative direction) and never toward a false "enforced".
 merge_clearance_check_enforced() {
-  local owner name contexts="" out err rc parsed
+  local owner name contexts="" out err rc parsed observed
   owner=${REPO%%/*}
   name=${REPO##*/}
 
@@ -378,8 +395,26 @@ merge_clearance_check_enforced() {
   fi
 
   # Surface 2 — repository rulesets.
+  #
+  # --paginate is load-bearing: this endpoint pages at 30 applicable rules, and
+  # stacked rulesets can push the `required_status_checks` rule carrying
+  # $MERGE_CLEARANCE_CHECK_NAME onto page 2. A truncated first page is
+  # INDISTINGUISHABLE from an absent rule — same empty match, same log line —
+  # so the omission would silently and permanently disable arm 1 on such a repo
+  # instead of announcing itself.
+  #
+  # fetch_api_array() (which also paginates) is deliberately NOT reused here:
+  # it die()s with exit 2 on a failed fetch or flatten, which would turn an
+  # unreadable rulesets endpoint into a hard failure of the entire query
+  # instead of the conservative fall-through to arm 2 that this probe's
+  # contract promises. Hence the local set +e / rc capture.
+  #
+  # --paginate emits one JSON array per page, so the filter slurps (`-s`) and
+  # concatenates with `add`; `objects` keeps a non-object page element (an
+  # error envelope on a partial-failure page) from hard-erroring the filter
+  # mid-stream.
   set +e
-  out=$(gh api "repos/$REPO/rules/branches/$BASE_REF" 2>"$err")
+  out=$(gh api --paginate "repos/$REPO/rules/branches/$BASE_REF" 2>"$err")
   rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then
@@ -387,7 +422,7 @@ merge_clearance_check_enforced() {
   else
     set +e
     parsed=$(printf '%s' "$out" \
-      | jq -r '[ .[]? | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context ] | .[]' 2>"$err")
+      | jq -r -s 'add // [] | [ .[]? | objects | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context ] | .[]' 2>"$err")
     rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then
@@ -402,7 +437,18 @@ merge_clearance_check_enforced() {
   if printf '%s' "$contexts" | grep -Fxq -- "$MERGE_CLEARANCE_CHECK_NAME"; then
     return 0
   fi
-  log "enforcement probe: '$MERGE_CLEARANCE_CHECK_NAME' is NOT among the required status checks observable on base '$BASE_REF' (observed: [$(printf '%s' "$contexts" | tr '\n' ' ' | sed 's/[[:space:]]*$//')])"
+  # Render the observed contexts QUOTED and comma-separated. Every name this
+  # probe compares against contains spaces — `Merge clearance gate`,
+  # `Self-Review Required` — so a space-joined list is ambiguous exactly where
+  # it matters: in `[Label Gate Self-Review Required lint]` a reader cannot
+  # tell three contexts from five, nor whether `Merge clearance gate` is
+  # present as one entry or only as fragments of its neighbours — which is
+  # the one thing this log line exists to let an operator check.
+  # awk (already required by the preflight) formats it; \047 is the octal
+  # escape for a single quote, same idiom as nested_field above. NF skips the
+  # blank line left by the trailing newline on $contexts.
+  observed=$(printf '%s' "$contexts" | awk 'NF { printf "%s\047%s\047", sep, $0; sep=", " }' || true)
+  log "enforcement probe: '$MERGE_CLEARANCE_CHECK_NAME' is NOT among the required status checks observable on base '$BASE_REF' (observed: [$observed])"
   return 1
 }
 
