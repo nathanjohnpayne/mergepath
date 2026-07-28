@@ -559,6 +559,18 @@ if [ -f "$TARGET/REVIEW_POLICY.md" ]; then
       | grep -qF "Consumer note (hub-side machinery)" \
     && pass "REVIEW_POLICY.md consumer note inserted after the Phase 3.5 heading" \
     || fail "REVIEW_POLICY.md consumer note missing or misplaced"
+  # audit-propagation-lane.sh IS synced to every consumer (manifest
+  # consumers: all) — the note must frame it as a local synced copy
+  # whose live mode runs from the hub, never as absent from this repo.
+  grep -qF '(`scripts/audit-propagation-lane.sh` is different: this repo carries a synced copy' "$TARGET/REVIEW_POLICY.md" \
+    && pass "REVIEW_POLICY.md note distinguishes the synced audit-propagation-lane.sh copy" \
+    || fail "REVIEW_POLICY.md note misframes audit-propagation-lane.sh (it IS synced to consumers)"
+  # A fresh bootstrap is NOT yet an enrolled sync consumer — both the
+  # note and the wave pointer must qualify fan-out receipt.
+  grep -qF "once enrolled as a sync consumer" "$TARGET/REVIEW_POLICY.md" \
+    && grep -qF "once this repository is enrolled as a sync consumer" "$TARGET/REVIEW_POLICY.md" \
+    && pass "REVIEW_POLICY.md qualifies fan-out receipt with 'once enrolled' (#747 r1)" \
+    || fail "REVIEW_POLICY.md claims unconditional fan-out receipt (enrollment is a later step)"
   # Adjacent sections and the in-section cross-ref must survive.
   grep -q "^### Phase 4: External Review" "$TARGET/REVIEW_POLICY.md" \
     && grep -qF "see Wave audit below" "$TARGET/REVIEW_POLICY.md" \
@@ -567,6 +579,66 @@ if [ -f "$TARGET/REVIEW_POLICY.md" ]; then
 else
   fail "REVIEW_POLICY.md missing from consumer mirror"
 fi
+
+# --- assertion 4f: wave-audit reframe consumes a HARD-WRAPPED paragraph ---
+# The repo enforces soft-wrap, so the real wave-audit paragraph is one
+# physical line — but the replacement must not silently leak
+# continuation lines if the paragraph ever arrives hard-wrapped (the
+# fail-closed marker check only sees the marker's own line). Invoke the
+# scaffold helper directly against a fixture whose paragraph spans
+# three lines and assert every line of it is consumed.
+hw_target="$WORKDIR/hardwrap-target"
+mkdir -p "$hw_target"
+cat >"$hw_target/REVIEW_POLICY.md" <<'EOF'
+# Policy
+
+### Phase 3.5: Propagation PR review lane
+
+Lane intro survives.
+
+**Wave audit (#662).** `scripts/wave-audit.sh` dispatches a scoped
+automated Phase 4b review against the wave canary, over the range
+since the last `wave-audit-pass/<sha>` watermark tag.
+Full procedure: `docs/agents/propagation-ordering.md` § Wave audit.
+
+### Phase 4: External Review
+
+Phase 4 body survives.
+EOF
+set +e
+hw_out=$(bash -c '
+  ROOT="'"$ROOT"'"
+  TARGET="'"$hw_target"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/substitute.sh"
+  . "$ROOT/scripts/bootstrap/template-mirror.sh"
+  set +e
+  bootstrap_input() { echo "my-new-repo"; }
+  BOOTSTRAP_DRY_RUN=0
+  BOOTSTRAP_LOG_FILE=""
+  bootstrap::_scaffold_consumer_identity "$TARGET"
+  echo "RC=$?"
+' 2>&1)
+hw_ec=$?
+set -e
+echo "$hw_out" | grep -q "RC=0" \
+  && pass "scaffold helper handles the hard-wrapped fixture (rc=0)" \
+  || fail "scaffold helper failed on hard-wrapped fixture; out: $hw_out"
+hw_leak=""
+for remnant in "dispatches a scoped" "watermark tag" \
+               "Full procedure: \`docs/agents/propagation-ordering.md\`"; do
+  grep -qF "$remnant" "$hw_target/REVIEW_POLICY.md" && hw_leak="$hw_leak '$remnant'"
+done
+[ -z "$hw_leak" ] \
+  && pass "hard-wrapped wave-audit paragraph fully consumed (no continuation-line leak)" \
+  || fail "hard-wrapped wave-audit continuation lines survived:$hw_leak"
+grep -qF "**Wave audit (hub-side).**" "$hw_target/REVIEW_POLICY.md" \
+  && pass "hard-wrapped fixture got the hub-side wave-audit pointer" \
+  || fail "hub-side wave-audit pointer missing from hard-wrapped fixture"
+grep -qF "Lane intro survives." "$hw_target/REVIEW_POLICY.md" \
+  && grep -qF "Phase 4 body survives." "$hw_target/REVIEW_POLICY.md" \
+  && pass "hard-wrapped consume stopped at the paragraph boundary (neighbors intact)" \
+  || fail "hard-wrapped consume over-ran the paragraph boundary"
 
 # .ai_context.md has no mergepath refs to begin with — substitution
 # should produce a byte-identical file (warning logged but no error).

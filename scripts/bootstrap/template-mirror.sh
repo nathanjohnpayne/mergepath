@@ -547,22 +547,38 @@ EOF
   # consumer (#744). Replace that paragraph with a hub-side pointer and
   # insert a consumer note after the Phase 3.5 heading framing the
   # remaining hub-script references (sync-to-downstream.sh, the
-  # manifest) as living on mergepath. Marker-gated: only act when the
-  # wave-audit paragraph is present, so a legitimately reshaped policy
-  # is left untouched; inside the gate, fail closed if either edit
-  # missed (heading or paragraph reshaped without the marker moving).
+  # manifest) as living on mergepath — while distinguishing
+  # scripts/audit-propagation-lane.sh, which IS synced into every
+  # consumer (its check_propagation_lane_audit wrapper hard-requires
+  # it); only its live fleet-audit mode is hub-side. Marker-gated: only
+  # act when the wave-audit paragraph is present, so a legitimately
+  # reshaped policy is left untouched; inside the gate, fail closed if
+  # either edit missed (heading or paragraph reshaped without the
+  # marker moving). The replacement consumes the whole paragraph
+  # through its terminating blank line, so a hard-wrapped upstream
+  # variant cannot leak continuation lines past the marker check
+  # (which only sees the marker's own line).
   local policy_doc="$target/REVIEW_POLICY.md"
   local wave_marker='**Wave audit (#662).**'
   if [ -f "$policy_doc" ] && grep -qF "$wave_marker" "$policy_doc"; then
     if ! awk -v hub_url="$hub_url" '
+      in_wave_para {
+        # Consume the wave-audit paragraph through its terminating
+        # blank line. The repo enforces soft-wrap (one physical line
+        # per paragraph), so this is normally a single next; it exists
+        # so a hard-wrapped variant cannot leak continuation lines.
+        if ($0 ~ /^[[:space:]]*$/) { in_wave_para = 0; print }
+        next
+      }
       /^### Phase 3\.5: Propagation PR review lane[[:space:]]*$/ {
         print
         print ""
-        print "> **Consumer note (hub-side machinery):** the propagation tooling this section references — `scripts/sync-to-downstream.sh`, the `.mergepath-sync.yml` manifest, `scripts/wave-audit.sh`, `scripts/audit-propagation-lane.sh`, and `docs/agents/propagation-ordering.md` — lives in the [mergepath hub repo](" hub_url "), not in this repository. This repo is on the receiving end: the hub opens propagation PRs here, and the lane recognition below runs in this repo\047s synced `pr-review-policy.yml`."
+        print "> **Consumer note (hub-side machinery):** the propagation tooling this section references — `scripts/sync-to-downstream.sh`, the `.mergepath-sync.yml` manifest, `scripts/wave-audit.sh`, and `docs/agents/propagation-ordering.md` — lives in the [mergepath hub repo](" hub_url "), not in this repository. (`scripts/audit-propagation-lane.sh` is different: this repo carries a synced copy for its CI checks, while the live fleet-audit mode runs from the hub.) This repo is on the receiving end: once enrolled as a sync consumer — enrollment in the hub\047s manifest is a separate post-bootstrap step — the hub opens propagation PRs here, and the lane recognition below runs in this repo\047s synced `pr-review-policy.yml`."
         next
       }
       /^\*\*Wave audit \(#662\)\.\*\*/ {
-        print "**Wave audit (hub-side).** The wave-level fresh-eyes audit is mergepath hub machinery: `scripts/wave-audit.sh` runs from the mergepath repo against the wave canary, not in this consumer — this repository only receives the resulting fan-out mirror PRs, which merge on consumer CI plus the lane\047s byte-verification. The full procedure lives in mergepath\047s `docs/agents/propagation-ordering.md` § Wave audit."
+        print "**Wave audit (hub-side).** The wave-level fresh-eyes audit is mergepath hub machinery: `scripts/wave-audit.sh` runs from the mergepath repo against the wave canary, not in this consumer — once this repository is enrolled as a sync consumer it receives the resulting fan-out mirror PRs, which merge on consumer CI plus the lane\047s byte-verification. The full procedure lives in mergepath\047s `docs/agents/propagation-ordering.md` § Wave audit."
+        in_wave_para = 1
         next
       }
       { print }
