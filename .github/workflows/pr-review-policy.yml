@@ -305,12 +305,15 @@ jobs:
           DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
           TRUSTED_BASE_TREE=""
           TRUSTED_HELPER_TREE=""
+          TRUSTED_CONFIG_TREE=""
           cleanup_trusted_trees() {
             # The helper tree IS the base tree in the common case; only remove
             # it once so the second pass can't log a spurious failure.
-            for _t in "$TRUSTED_HELPER_TREE" "$TRUSTED_BASE_TREE"; do
+            for _t in "$TRUSTED_CONFIG_TREE" "$TRUSTED_HELPER_TREE" "$TRUSTED_BASE_TREE"; do
               [ -n "$_t" ] || continue
               git worktree remove --force "$_t" >/dev/null 2>&1 || rm -rf "$_t"
+              # Stop after the base tree: in the common case the helper tree
+              # IS the base tree, so a second pass would log a spurious failure.
               [ "$_t" != "$TRUSTED_BASE_TREE" ] || break
             done
           }
@@ -327,10 +330,35 @@ jobs:
           # Pair the config with the base tree, EXCEPT when the base predates
           # the policy file — then the default-branch copy is the only policy
           # that exists (see BASE_HAS_POLICY above).
+          #
+          # The fallback MUST come from a trusted origin/$DEFAULT_BRANCH
+          # worktree, never a bare `.github/review-policy.yml` path: this job
+          # is checked out at the PR MERGE COMMIT, so a bare path resolves
+          # against the PR's own content and would let a PR whose base predates
+          # the policy file supply the policy that judges it (CodeRabbit
+          # Major on #768 — a regression introduced by this PR's earlier draft).
+          # If neither the base nor the default branch yields a policy, fail
+          # closed rather than fall back to anything the PR can write.
           if [ "$BASE_HAS_POLICY" = "true" ]; then
             TRUSTED_CONFIG="$TRUSTED_BASE_TREE/.github/review-policy.yml"
           else
-            TRUSTED_CONFIG=".github/review-policy.yml"
+            if git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH^{commit}" >/dev/null 2>&1; then
+              TRUSTED_CONFIG_TREE=$(mktemp -d)
+              rmdir "$TRUSTED_CONFIG_TREE" 2>/dev/null || true
+              if ! git worktree add --quiet --detach "$TRUSTED_CONFIG_TREE" "origin/$DEFAULT_BRANCH" 2>/dev/null \
+                 || [ ! -f "$TRUSTED_CONFIG_TREE/.github/review-policy.yml" ]; then
+                git worktree remove --force "$TRUSTED_CONFIG_TREE" >/dev/null 2>&1 || rm -rf "$TRUSTED_CONFIG_TREE"
+                TRUSTED_CONFIG_TREE=""
+              fi
+            fi
+            if [ -z "$TRUSTED_CONFIG_TREE" ]; then
+              echo "External-review fail-closed: PR base has no .github/review-policy.yml and no trusted origin/$DEFAULT_BRANCH copy is available; requiring review."
+              echo "needs_review=true" >> "$GITHUB_OUTPUT"
+              echo "reasons=- No trusted review-policy.yml on the PR base or the default branch; requiring review fail-closed" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            TRUSTED_CONFIG="$TRUSTED_CONFIG_TREE/.github/review-policy.yml"
+            echo "NOTE: using the trusted origin/$DEFAULT_BRANCH review policy (the PR base predates the policy file)."
           fi
 
           TRUSTED_SOURCE=""

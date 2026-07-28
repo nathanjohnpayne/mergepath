@@ -207,6 +207,12 @@ fi
 CONFIG="${MERGEPATH_REVIEW_POLICY_PATH:-.github/review-policy.yml}"
 if [ -z "${MERGEPATH_REVIEW_POLICY_PATH:-}" ]; then
   __RESOLVE_POLICY_BIN="$__CODEX_CHECK_DIR/workflow/resolve_base_policy.sh"
+  if [ ! -f "$__RESOLVE_POLICY_BIN" ]; then
+    # Parity with merge-clearance-gate.sh: say so rather than silently leaving
+    # CONFIG at the unresolved default, which is indistinguishable in the logs
+    # from a deliberate default-base resolution (CodeRabbit on #768).
+    echo "WARNING: policy resolver missing ($__RESOLVE_POLICY_BIN); using $CONFIG unresolved" >&2
+  fi
   if [ -f "$__RESOLVE_POLICY_BIN" ]; then
     # Capture stdout and stderr SEPARATELY: the resolver prints the policy
     # PATH on stdout and warnings on stderr, so merging them (2>&1) would
