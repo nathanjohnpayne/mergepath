@@ -38,15 +38,28 @@ FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
-make_fresh_cache() {
-  local dir="$1" agent="$2" reviewer_pat="$3" author_pat="$4"
+# The library's compiled-in PREFLIGHT_DEFAULT_TTL_SECONDS (#765: 4h -> 10h).
+# Fixtures that must read as fresh or stale with NO OP_PREFLIGHT_TTL_SECONDS
+# in the environment are anchored on this value, so a future default bump
+# moves them together instead of silently inverting test_lib_stale_cache_noop
+# (which used a fixed 5h age — fresh, not stale, once the default passed 5h).
+#
+# The OP_PREFLIGHT_TTL_SECONDS lines written INTO the fixture files below are
+# inert for the freshness comparison: preflight_session_is_fresh resolves the
+# TTL from the environment or this default and never reads the file's copy.
+LIB_DEFAULT_TTL_SECONDS=36000
+
+# Synthesize a cache file whose embedded CREATED_AT epoch is <age_seconds>
+# in the past.
+make_aged_cache() {
+  local dir="$1" agent="$2" age_seconds="$3" reviewer_pat="$4" author_pat="$5"
   mkdir -p "$dir"
   chmod 700 "$dir"
   local epoch
-  epoch=$(date +%s)
+  epoch=$(( $(date +%s) - age_seconds ))
   cat > "$dir/op-preflight-$agent.env" <<EOF
 OP_PREFLIGHT_CREATED_AT_EPOCH=$epoch
-OP_PREFLIGHT_TTL_SECONDS=14400
+OP_PREFLIGHT_TTL_SECONDS=$LIB_DEFAULT_TTL_SECONDS
 OP_PREFLIGHT_AGENT=$agent
 OP_PREFLIGHT_MODE=review
 OP_PREFLIGHT_DONE=1
@@ -56,22 +69,18 @@ EOF
   chmod 600 "$dir/op-preflight-$agent.env"
 }
 
+make_fresh_cache() {
+  local dir="$1" agent="$2" reviewer_pat="$3" author_pat="$4"
+  make_aged_cache "$dir" "$agent" 0 "$reviewer_pat" "$author_pat"
+}
+
+# A STALE cache — one hour older than the library's default TTL, so it reads
+# as stale with no OP_PREFLIGHT_TTL_SECONDS override regardless of what that
+# default is bumped to.
 make_stale_cache() {
   local dir="$1" agent="$2"
-  mkdir -p "$dir"
-  chmod 700 "$dir"
-  local epoch
-  epoch=$(( $(date +%s) - 18000 ))
-  cat > "$dir/op-preflight-$agent.env" <<EOF
-OP_PREFLIGHT_CREATED_AT_EPOCH=$epoch
-OP_PREFLIGHT_TTL_SECONDS=14400
-OP_PREFLIGHT_AGENT=$agent
-OP_PREFLIGHT_MODE=review
-OP_PREFLIGHT_DONE=1
-OP_PREFLIGHT_REVIEWER_PAT=stale-rev
-OP_PREFLIGHT_AUTHOR_PAT=stale-auth
-EOF
-  chmod 600 "$dir/op-preflight-$agent.env"
+  make_aged_cache "$dir" "$agent" \
+    $(( LIB_DEFAULT_TTL_SECONDS + 3600 )) stale-rev stale-auth
 }
 
 # A fresh cache whose PATs are computed FROM the ambient GH_TOKEN / GITHUB_TOKEN
@@ -187,6 +196,104 @@ test_lib_stale_cache_noop() {
     return
   fi
   pass "test_lib_stale_cache_noop: stale cache is not loaded"
+}
+
+# ---------------------------------------------------------------------------
+# Test 3c (#765): the library's OWN default TTL is 10h. A cache created 5h
+# ago — stale under the previous 4h default — must auto-source with NO
+# OP_PREFLIGHT_TTL_SECONDS in the environment. Without this, the library's
+# default is untested: every other fixture here is either brand new or
+# deliberately past the default, so a default that disagrees with
+# op-preflight.sh's ships green.
+#
+# The 5h age is the exact window #765 opened. When the two defaults
+# disagreed, `op-preflight.sh --check` reported this file fresh and emitted
+# its PATs while auto_source_preflight treated it as stale, leaving
+# reviewer-pinned `gh` calls in phase-4b-classifier.sh / phase-4b-review.sh
+# to fall back to the ambient token (the #554 regression) and
+# coderabbit-wait.sh / codex-review-check.sh to exit 3 on "GH_TOKEN is
+# required" despite a warm cache on disk.
+# ---------------------------------------------------------------------------
+test_lib_default_ttl_is_ten_hours() {
+  # `|| rc=$?` (not a bare `local rc=$?` after the subshell) so a failure
+  # here records FAIL and lets the remaining tests run instead of tripping
+  # `set -e` and aborting the suite mid-way.
+  local rc=0
+  (
+    local case_dir="$WORKDIR/lib3c"
+    make_aged_cache "$case_dir" claude 18000 "rev-3c" "auth-3c"
+    unset GH_TOKEN OP_PREFLIGHT_TTL_SECONDS
+    unset OP_PREFLIGHT_REVIEWER_PAT OP_PREFLIGHT_AUTHOR_PAT
+    export OP_PREFLIGHT_CACHE_DIR="$case_dir"
+    export MERGEPATH_AGENT=claude
+    # shellcheck source=../scripts/lib/preflight-helpers.sh
+    . "$LIB"
+    auto_source_preflight
+    if [ "${OP_PREFLIGHT_REVIEWER_PAT:-}" != "rev-3c" ]; then
+      echo "5h-old cache did not auto-source under the 10h default (REVIEWER_PAT='${OP_PREFLIGHT_REVIEWER_PAT:-}')" >&2
+      exit 1
+    fi
+    if ! preflight_require_token reviewer; then
+      echo "preflight_require_token reviewer failed on a 5h-old cache" >&2
+      exit 1
+    fi
+    if [ "${GH_TOKEN:-}" != "rev-3c" ]; then
+      echo "require_token did not export the cached reviewer PAT (got '${GH_TOKEN:-}')" >&2
+      exit 1
+    fi
+    # load_preflight_env_vars gates on the same freshness check, so it must
+    # populate the PAT too — that is what the phase-4b reviewer pins read.
+    unset OP_PREFLIGHT_REVIEWER_PAT
+    load_preflight_env_vars
+    if [ "${OP_PREFLIGHT_REVIEWER_PAT:-}" != "rev-3c" ]; then
+      echo "load_preflight_env_vars did not populate REVIEWER_PAT from a 5h-old cache" >&2
+      exit 1
+    fi
+  ) >"$WORKDIR/lib3c.out" 2>"$WORKDIR/lib3c.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "test_lib_default_ttl_is_ten_hours: rc=$rc stderr=$(cat "$WORKDIR/lib3c.err")"
+    return
+  fi
+  pass "test_lib_default_ttl_is_ten_hours: library default TTL is 36000s (10h)"
+}
+
+# ---------------------------------------------------------------------------
+# Test 3d (#765): the library's default TTL and op-preflight.sh's
+# DEFAULT_TTL_SECONDS are two independent literals implementing ONE
+# freshness rule against the SAME cache file. Pin them together so a future
+# bump to one cannot silently desynchronize from the other — the failure
+# mode this test exists for is invisible to every behavioral test that does
+# not happen to use a fixture aged into the gap between them.
+# ---------------------------------------------------------------------------
+test_lib_default_ttl_matches_script() {
+  local script="$ROOT/scripts/op-preflight.sh"
+  if [ ! -r "$script" ]; then
+    fail "test_lib_default_ttl_matches_script: missing $script"
+    return
+  fi
+  # Match the leading digits ONLY — both declarations carry a trailing
+  # `# N hours` comment, and a digit-squeeze like `tr -cd '0-9'` would
+  # splice that N onto the value (36000 + "10 hours" -> 3600010).
+  local script_ttl lib_ttl
+  script_ttl=$(sed -n 's/^DEFAULT_TTL_SECONDS=\([0-9][0-9]*\).*/\1/p' "$script" | head -1)
+  lib_ttl=$(sed -n 's/^PREFLIGHT_DEFAULT_TTL_SECONDS=\([0-9][0-9]*\).*/\1/p' "$LIB" | head -1)
+  if [ -z "$script_ttl" ]; then
+    fail "test_lib_default_ttl_matches_script: could not parse DEFAULT_TTL_SECONDS from $script"
+    return
+  fi
+  if [ -z "$lib_ttl" ]; then
+    fail "test_lib_default_ttl_matches_script: could not parse PREFLIGHT_DEFAULT_TTL_SECONDS from $LIB"
+    return
+  fi
+  if [ "$script_ttl" != "$lib_ttl" ]; then
+    fail "test_lib_default_ttl_matches_script: default TTL split-brain — op-preflight.sh=$script_ttl vs preflight-helpers.sh=$lib_ttl; a cache aged between them reads fresh to --check but stale to every auto-sourcing helper"
+    return
+  fi
+  if [ "$lib_ttl" != "$LIB_DEFAULT_TTL_SECONDS" ]; then
+    fail "test_lib_default_ttl_matches_script: fixtures are anchored on $LIB_DEFAULT_TTL_SECONDS but the implementations use $lib_ttl; update LIB_DEFAULT_TTL_SECONDS"
+    return
+  fi
+  pass "test_lib_default_ttl_matches_script: both default TTL literals agree ($lib_ttl)"
 }
 
 # ---------------------------------------------------------------------------
@@ -555,6 +662,8 @@ EOF
 test_lib_auto_source_basic
 test_lib_gh_token_passthrough
 test_lib_stale_cache_noop
+test_lib_default_ttl_is_ten_hours
+test_lib_default_ttl_matches_script
 test_lib_auto_source_scrubs_ambient_github_token
 test_lib_auto_source_preserves_ambient_when_cache_has_no_pat
 test_lib_auto_source_preserves_ambient_when_cache_missing_author
