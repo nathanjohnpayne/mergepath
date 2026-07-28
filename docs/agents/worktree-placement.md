@@ -17,6 +17,7 @@ Any git worktree or additional checkout an agent creates for PR/branch work live
 - **Never** create agent checkouts in `/tmp` (or any system temp directory). Temp-dir checkouts are invisible to worktree audits, survive as untracked clutter after reboots on some platforms, and detach the work from the machine's per-repo hygiene tooling.
 - **Never** create visible sibling directories (e.g. `~/GitHub/<repo>-pr3`). They make the parent folder look like it is full of stray repos.
 - This covers **every** agent-created checkout, including review-side ones: a Phase 4b external-reviewer session and any trusted main-ref checkout used to run review tooling (the trusted-path rule constrains which *ref* you run from; this convention constrains *where on disk* that checkout lives — both apply at once).
+- **Slug naming.** For a checkout tied to a specific PR, start the slug with a parseable PR number: `pr-<number>` or `pr-<number>-<short-desc>` (e.g. `.mergepath-worktrees/pr-123-fix-login`). Audit/cleanup tooling that cross-checks PR state (where a repo carries it — mergepath's `scripts/worktree-cleanup.sh` does) parses the PR number from that prefix, so a stale checkout for a closed/merged PR becomes automatically removable. Free-form slugs are fine for checkouts not tied to a single PR, but tooling then cannot PR-state-check them and will only list, never auto-remove, such checkouts.
 
 ```bash
 # Correct — worktree lands in the hidden per-repo folder

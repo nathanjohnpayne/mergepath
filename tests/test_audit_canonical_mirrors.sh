@@ -35,6 +35,13 @@
 #      outer fence are ignored, and a real section AFTER the 4-backtick
 #      closer is still parsed (CommonMark closing-fence run-length rule;
 #      round-1 Codex regression).
+#  11. An opener-LOOKING line with an info string (a literal ```bash
+#      shown inside an open triple-backtick block) is fence CONTENT, not
+#      a closer: per CommonMark a closing fence may carry only
+#      whitespace after the delimiter run. The fake `##` heading and
+#      annotation after it stay inside the fence, and the real section
+#      after the true (bare) closer is still parsed (round-2 Codex
+#      regression).
 
 set -euo pipefail
 
@@ -113,6 +120,20 @@ Genuinely machine-local content, no annotation.
 ## After Nested Fence
 
 Real section after the 4-backtick closer, no annotation.
+
+## Info String Closer Mirror
+
+> Canonical source: mergepath/docs/agents/worktree-placement.md
+
+\`\`\`text
+\`\`\`bash
+## fake heading after an opener-like info-string line
+# Canonical source: mergepath/inside/info-string/fence.md
+\`\`\`
+
+## After Info String Closer
+
+Real section after the whitespace-only closer, no annotation.
 EOF
 
 cp "$VENDOR" "$WORKDIR/CLAUDE.md.orig"
@@ -206,8 +227,32 @@ else
   fail "After Nested Fence section swallowed — 4-backtick closer did not close the fence"
 fi
 
-# summary line counts match the fixture (7 real sections)
-if grep -q '7 section(s) scanned — ok: 1, ok-unpinned: 2, missing-annotation: 2, source-missing: 1, drift: 1' <<<"$OUT"; then
+# 11a. an opener-looking ```bash line inside an open ``` fence is fence
+# CONTENT, not a closer: the fake heading + annotation after it must
+# never surface in the report.
+if grep -q 'info-string' <<<"$OUT"; then
+  fail "content after an opener-like \`\`\`bash line inside an open fence leaked into the report (info-string line treated as a closer)"
+else
+  pass "opener-like info-string line inside an open fence not treated as a closer"
+fi
+
+# 11b. the section owning that fence keeps its pre-fence annotation.
+if grep -q '\[ok-unpinned\] *## Info String Closer Mirror' <<<"$OUT"; then
+  pass "section containing the info-string fence classified from its real annotation"
+else
+  fail "Info String Closer Mirror not classified ok-unpinned; output: $OUT"
+fi
+
+# 11c. the bare ``` line after it really closes the fence: the next real
+# section is parsed.
+if grep -q '\[missing-annotation\] ## After Info String Closer' <<<"$OUT"; then
+  pass "real section after the whitespace-only closer still parsed"
+else
+  fail "After Info String Closer section swallowed — bare closer did not close the fence"
+fi
+
+# summary line counts match the fixture (9 real sections)
+if grep -q '9 section(s) scanned — ok: 1, ok-unpinned: 3, missing-annotation: 3, source-missing: 1, drift: 1' <<<"$OUT"; then
   pass "summary counters match fixture"
 else
   fail "summary counters wrong; output: $OUT"

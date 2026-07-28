@@ -196,16 +196,21 @@ audit_file() {
 
   local in_fence=0 fence_char="" fence_len=0
   local cur_heading="" cur_annotation="" cur_pin="" seen_section=0
-  local line stripped run_char run_len
+  local line stripped run_char run_len remainder
 
   while IFS= read -r line || [ -n "$line" ]; do
     # Fence tracking so a `##` inside a code block is never a heading
     # and an annotation-looking line inside one is never an annotation.
     # Per the CommonMark closing-fence rule, a fence closes only on a
-    # run of the SAME character at least as LONG as the opening run —
-    # tracking the char and full run length (not a truncated 3-char
-    # marker) keeps a 4+-backtick outer fence (the standard way to nest
-    # a triple-backtick example) from being closed by an inner ``` line.
+    # run of the SAME character at least as LONG as the opening run,
+    # followed by NOTHING but whitespace — a closing fence may not
+    # carry an info string. Tracking the char and full run length (not
+    # a truncated 3-char marker) keeps a 4+-backtick outer fence (the
+    # standard way to nest a triple-backtick example) from being closed
+    # by an inner ``` line, and the whitespace-only-remainder check
+    # keeps an opener-LOOKING line with an info string (e.g. a literal
+    # ```bash shown inside an open triple-backtick block) from being
+    # misread as the closer — such a line is fence CONTENT.
     stripped="${line#"${line%%[![:space:]]*}"}"
     case "$stripped" in
       '```'*|'~~~'*)
@@ -214,14 +219,23 @@ audit_file() {
         while [ "${stripped:$run_len:1}" = "$run_char" ]; do
           run_len=$((run_len + 1))
         done
+        remainder="${stripped:$run_len}"
         if [ "$in_fence" -eq 0 ]; then
           in_fence=1
           fence_char="$run_char"
           fence_len="$run_len"
         elif [ "$run_char" = "$fence_char" ] && [ "$run_len" -ge "$fence_len" ]; then
-          in_fence=0
-          fence_char=""
-          fence_len=0
+          case "$remainder" in
+            *[![:space:]]*)
+              # Non-whitespace after the delimiter run: not a valid
+              # closing fence (CommonMark) — treat as fence content.
+              ;;
+            *)
+              in_fence=0
+              fence_char=""
+              fence_len=0
+              ;;
+          esac
         fi
         continue
         ;;
