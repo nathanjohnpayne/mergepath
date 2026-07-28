@@ -31,10 +31,12 @@
 #   --dry-run        Default. List candidates with branch/HEAD/state. No
 #                    side effects.
 #   --apply          Run `git worktree remove <path>` on safe candidates
-#                    (gone-upstream worktrees + detached closed-PR
-#                    worktrees that are NOT locked). Without further flags,
-#                    locked worktrees and orphaned .claude/worktrees/*
-#                    directories are listed but skipped.
+#                    (gone-upstream worktrees + closed/merged-PR
+#                    worktrees that are NOT locked; a branch-attached
+#                    PR worktree must also have a clean working tree).
+#                    Without further flags, locked worktrees and orphaned
+#                    .claude/worktrees/* directories are listed but
+#                    skipped.
 #   --force-locked   With --apply, also `git worktree remove --force` on
 #                    LOCKED worktrees. Locked worktrees may correspond to
 #                    in-progress agent sessions, so this flag is opt-in.
@@ -51,8 +53,8 @@
 #      `[origin/<branch>: gone]` for the branch checked out at the
 #      worktree. Safe to remove (the remote tracking branch was deleted,
 #      typically after a squash-merge + branch delete).
-#   2. Detached PR worktree. Worktree path carries a parseable PR
-#      number in one of two recognized shapes AND HEAD is detached:
+#   2. PR worktree. Worktree path carries a parseable PR number in one
+#      of two recognized shapes:
 #        a. legacy visible-sibling / temp-dir shape:
 #           ^(/private/tmp|/tmp|/Users/.*/GitHub)/mergepath-pr-([0-9]+)$
 #        b. the hidden-folder convention from
@@ -62,10 +64,30 @@
 #           (e.g. ~/GitHub/.mergepath-worktrees/pr-123-fix-login).
 #      Cross-check PR state via `gh pr view <num> --json state`; flag as
 #      removable if state is CLOSED or MERGED. Worktrees for OPEN PRs
-#      are listed but flagged as still-active. Detached hidden-folder
-#      worktrees whose slug does NOT start with `pr-<n>` are listed as
-#      detached non-PR (no PR number to cross-check) and never
-#      auto-removed.
+#      are listed but flagged as still-active. Hidden-folder worktrees
+#      whose slug does NOT start with `pr-<n>` carry no PR number to
+#      cross-check and are never auto-removed (detached ones are listed
+#      as detached non-PR; branch-attached ones fall through to rule 1).
+#      The slug check applies to BOTH detached and branch-ATTACHED
+#      worktrees (#762): the documented `git worktree add <path>
+#      <branch>` form creates a branch-attached worktree, so scoping the
+#      check to detached HEADs left every convention-following checkout
+#      unmatched whenever its remote branch outlived the PR. On the
+#      branch-attached side the check is purely ADDITIVE — rule 1 is
+#      evaluated first, so nothing that was removable before becomes
+#      retained — and removal additionally requires a CLEAN working
+#      tree: `git worktree remove` deletes the directory but never the
+#      branch ref, so every COMMIT survives regardless, and an EMPTY
+#      status is the positive proof that nothing else is lost. "Empty"
+#      is measured by worktree_content_state() below, which passes
+#      every listing flag EXPLICITLY (see its header): a bare `git
+#      status --porcelain` silently omits gitignored paths, omits
+#      untracked ones under `status.showUntrackedFiles=no`, and omits
+#      dirty submodules under `diff.ignoreSubmodules` — each of which
+#      makes a worktree holding real work read as clean while `git
+#      worktree remove --force` deletes it all. Anything git reports
+#      (tracked, untracked, ignored, or in a submodule), plus an
+#      unreadable status, is surfaced for a human and kept.
 #   3. Orphaned .claude/worktrees/ directory. Subdirectory under
 #      .claude/worktrees/ that is NOT in `git worktree list --porcelain`
 #      output. These are residue from a `--force` remove that didn't
@@ -181,6 +203,136 @@ gh_pr_state() {
     fi
   fi
   echo "unknown"
+}
+
+# Print the PR number carried by a worktree PATH, or nothing when the path
+# carries none. Recognizes both shapes named in Detection rule 2: the legacy
+# `<root>/mergepath-pr-<n>` sibling/temp shape, and the hidden-folder
+# `.mergepath-worktrees/pr-<n>[-<desc>]` convention. The hidden folder is
+# matched by its directory NAME rather than a hardcoded ~/GitHub prefix so
+# the matcher follows the folder wherever the operator keeps repos.
+# Shared by the detached and branch-attached paths so the two cannot drift.
+worktree_pr_num() {
+  local path="$1"
+  if [[ "$path" =~ ^(/private/tmp|/tmp|/Users/[^/]+/GitHub)/mergepath-pr-([0-9]+)$ ]]; then
+    printf '%s' "${BASH_REMATCH[2]}"
+  elif [[ "$path" =~ /\.mergepath-worktrees/pr-([0-9]+)(-[A-Za-z0-9._-]+)?$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  fi
+}
+
+# Positive-evidence gate for removing a BRANCH-ATTACHED worktree. Prints one
+# of four states and exits 0 ONLY for `clean`:
+#
+#   clean    git reports NOTHING for the directory — no tracked modifications,
+#            no untracked files, and no gitignored content.
+#   dirty    git reports something: tracked modifications, untracked files,
+#            and/or gitignored content. Also covers an unreadable status (a
+#            path git will not report on) — fail closed.
+#   ignored  git reports ONLY gitignored entries (`!!`). Split out from
+#            `dirty` purely so the operator gets a TRUE remediation: you
+#            cannot commit or stash a gitignored file.
+#   missing  the registered directory does not exist. Nothing to preserve —
+#            this is a PRUNABLE administrative entry, not lost work. Split
+#            out so it never inherits `dirty`'s "commit, stash, or discard
+#            it by hand" advice, which would be nonsense for a path that is
+#            not there (#762 r2 P3).
+#
+# `git worktree remove` deletes the directory but never the branch ref, so
+# every COMMIT the branch holds survives the removal whether or not it is
+# merged; the only content that would be destroyed is what lives solely in
+# the working tree. An EMPTY status is therefore the proof that removal loses
+# nothing — but only when the status includes IGNORED paths. Plain `git status
+# --porcelain` omits them, so a worktree whose only content is `.env`,
+# `*.key`, `.claude/settings.local.json` or `node_modules/` reads as clean and
+# `git worktree remove` destroys it (verified: this happens with AND without
+# `--force`, so git's own dirty check is no backstop) — #762 r2 P2.
+#
+# All THREE listing flags are passed EXPLICITLY so operator configuration
+# cannot weaken a safety check. They are mutually independent — none implies
+# any other — and each closes a distinct "reports empty, is not empty" hole:
+#
+#   --ignored                 gitignored content, per the paragraph above.
+#   --untracked-files=all     `status.showUntrackedFiles=no` (repo or global)
+#                             suppresses `??` records, so a worktree full of
+#                             untracked work reports an EMPTY status and this
+#                             helper would call it `clean` — `--apply` then
+#                             deletes it. The `all` form additionally expands
+#                             directories, so an untracked directory cannot
+#                             hide its contents behind one summary entry
+#                             (#762 r3 P1).
+#   --ignore-submodules=none  `diff.ignoreSubmodules=all` (or `=dirty`, or a
+#                             per-submodule `submodule.<name>.ignore=all`)
+#                             suppresses the ` M <sub>` record for an
+#                             INITIALIZED submodule holding untracked or
+#                             uncommitted work, so the same empty-status
+#                             false-clean applies. Verified end to end: with
+#                             `diff.ignoreSubmodules=all` the probe returned
+#                             empty, and `git worktree remove --force` — the
+#                             exact form try_remove() runs — deleted the
+#                             worktree and the submodule's untracked files
+#                             with it. git's own "working trees containing
+#                             submodules cannot be moved or removed" refusal
+#                             is NOT a backstop: it only fires WITHOUT
+#                             `--force` (#762 r3 P2).
+#
+# `--ignore-submodules=none` costs nothing on a submodule-free checkout (this
+# repo has none) and does not manufacture false positives: a genuinely clean
+# worktree with an initialized submodule still reports empty with the flag.
+worktree_content_state() {
+  local path="$1" status
+  if [ ! -d "$path" ]; then
+    echo "missing"
+    return 1
+  fi
+  if ! status=$(git -C "$path" status --porcelain --ignored --untracked-files=all --ignore-submodules=none 2>/dev/null); then
+    echo "dirty"
+    return 1
+  fi
+
+  # Index flags defeat porcelain entirely (#762 r4 P1). A tracked file marked
+  # `assume-unchanged` (ls-files -v tag: any LOWERCASE letter) or
+  # `skip-worktree` (tag `S`) is skipped by the status walk, so an edited file
+  # reports nothing and `git worktree remove` deletes it — verified directly,
+  # including without --force, because git consults the same flags. There is no
+  # status flag that overrides this, so the flags themselves are the signal:
+  # any flagged path means the comprehensive status CANNOT be trusted as proof.
+  local flagged
+  if flagged=$(git -C "$path" ls-files -v 2>/dev/null); then
+    if printf '%s\n' "$flagged" | grep -qE '^([a-z]|S) '; then
+      echo "dirty"
+      return 1
+    fi
+  else
+    # Unreadable index — no proof available, so do not claim clean.
+    echo "dirty"
+    return 1
+  fi
+
+  # A submodule's OWN .gitignore hides its ignored files from the superproject
+  # walk even with --ignored --ignore-submodules=none, so probe inside each
+  # initialized submodule with the same comprehensive flags (#762 r4 P1).
+  # `submodule foreach` is a no-op (exit 0, no output) on the submodule-free
+  # checkouts this tool actually runs against, so this costs nothing here.
+  local sub_status
+  if sub_status=$(git -C "$path" submodule foreach --recursive --quiet \
+      'git status --porcelain --ignored --untracked-files=all' 2>/dev/null); then
+    if [ -n "$sub_status" ]; then
+      echo "dirty"
+      return 1
+    fi
+  fi
+  if [ -z "$status" ]; then
+    echo "clean"
+    return 0
+  fi
+  # Only `!!` records → gitignored content and nothing else.
+  if ! printf '%s\n' "$status" | grep -qv '^!! '; then
+    echo "ignored"
+    return 1
+  fi
+  echo "dirty"
+  return 1
 }
 
 # Classify a local branch against its merged PRs by HEAD *name* (not by an
@@ -340,6 +492,22 @@ branch_checked_out() {
 # ── Classify and act ──────────────────────────────────────────────────
 SUMMARY_GONE=()
 SUMMARY_DETACHED=()
+# Branch-ATTACHED worktrees whose path carries a `pr-<n>` slug for a
+# CLOSED/MERGED PR while the remote branch is still alive — the case the
+# detached-only slug check missed entirely (#762).
+SUMMARY_PR_BRANCH=()
+# Branch-attached closed/merged-PR worktrees retained because their working
+# tree is NOT clean — uncommitted edits, untracked files, gitignored content
+# (`.env`, `node_modules/`, …), or an unreadable status. Removing them would
+# destroy content that exists nowhere else. Surfaced for a human, never
+# auto-removed.
+SUMMARY_UNCLEAN_KEPT=()
+# Branch-attached closed/merged-PR worktrees whose registered DIRECTORY no
+# longer exists. Nothing to preserve; the stale administrative entry is
+# cleared by `git worktree prune` (which --apply runs unconditionally).
+# UNLOCKED entries only — prune skips locked ones, so a locked+missing entry
+# is NOT self-clearing and goes to SUMMARY_LOCKED instead (#762 r3 P2).
+SUMMARY_PRUNABLE=()
 SUMMARY_LOCKED=()
 SUMMARY_LOCAL_BRANCH=()
 SUMMARY_OPEN_PR=()
@@ -386,9 +554,35 @@ try_remove() {
   if [ "$locked" = "1" ]; then
     (cd "$MAIN_WORKTREE" && git worktree unlock "$path") >/dev/null 2>&1 || true
   fi
-  if (cd "$MAIN_WORKTREE" && git worktree remove --force "$path") >/dev/null 2>&1; then
+  # Try the NON-force removal first. git refuses to remove a worktree it
+  # considers dirty, or one containing submodules — an INDEPENDENT second
+  # opinion that does not share our status probe's blind spots.
+  #
+  # Scope of that backstop, measured rather than assumed: it catches the
+  # SUBMODULE case (git refuses "working trees containing submodules cannot be
+  # moved or removed" unless forced). It does NOT catch index-flag blindness —
+  # verified directly: a tracked file marked `assume-unchanged` and then
+  # edited leaves `git status --porcelain --ignored --untracked-files=all
+  # --ignore-submodules=none` EMPTY, and a plain `git worktree remove` deletes
+  # the edit anyway, because git consults the same flags our probe does. So
+  # this is a second line of defence, not a general one; the index-flag and
+  # submodule-internal cases are detected explicitly in
+  # worktree_content_state() instead.
+  #
+  # --force is now reached ONLY on the locked path the operator explicitly
+  # opted into with --force-locked, which is the one case where "remove it
+  # anyway" is the stated intent. A non-force refusal elsewhere surfaces as
+  # FAILED rather than deleting: the conservative direction for a tool whose
+  # mistakes are unrecoverable.
+  if (cd "$MAIN_WORKTREE" && git worktree remove "$path") >/dev/null 2>&1; then
     SUMMARY_REMOVED+=("$path")
     return 0
+  fi
+  if [ "$locked" = "1" ] && [ "$FORCE_LOCKED" = "1" ]; then
+    if (cd "$MAIN_WORKTREE" && git worktree remove --force "$path") >/dev/null 2>&1; then
+      SUMMARY_REMOVED+=("$path")
+      return 0
+    fi
   fi
   SUMMARY_FAILED+=("$path")
   return 1
@@ -404,20 +598,11 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
     continue
   fi
 
+  # Path-carried PR number, parsed for BOTH the detached and the
+  # branch-attached case (#762).
+  pr_num=$(worktree_pr_num "$WT_PATH")
+
   if [ "$WT_DETACHED" = "1" ]; then
-    # Detached. Check if the path carries a parseable PR number: either
-    # the legacy mergepath-pr-<num> shape, or the hidden-folder
-    # convention (docs/agents/worktree-placement.md) with a
-    # PR-number-bearing slug `pr-<n>` / `pr-<n>-<desc>`. The hidden
-    # folder is matched by its directory NAME (.mergepath-worktrees)
-    # rather than a hardcoded ~/GitHub prefix so the matcher follows the
-    # folder wherever the operator keeps repos.
-    pr_num=""
-    if [[ "$WT_PATH" =~ ^(/private/tmp|/tmp|/Users/[^/]+/GitHub)/mergepath-pr-([0-9]+)$ ]]; then
-      pr_num="${BASH_REMATCH[2]}"
-    elif [[ "$WT_PATH" =~ /\.mergepath-worktrees/pr-([0-9]+)(-[A-Za-z0-9._-]+)?$ ]]; then
-      pr_num="${BASH_REMATCH[1]}"
-    fi
     if [ -n "$pr_num" ]; then
       pr_state=$(gh_pr_state "$pr_num")
       case "$pr_state" in
@@ -469,6 +654,31 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
 
   # Branch-attached worktree.
   if is_gone_branch "$WT_BRANCH"; then
+    # A PR-slug worktree must clear the comprehensive content gate before ANY
+    # removal, including this gone-upstream fast path. Without this the
+    # invariant is only half-real: rule 1 runs FIRST and `continue`s, so a
+    # `.mergepath-worktrees/pr-N-*` checkout whose upstream is already [gone]
+    # never reached worktree_content_state and `--apply` deleted uncommitted,
+    # untracked, gitignored or submodule content outright — the very loss the
+    # gate below was added to prevent (#762 r3 P1).
+    #
+    # Scoped to PR-slug paths on purpose: those are the ones this tool's
+    # convention says it owns and may delete unattended. A non-slug
+    # gone-upstream worktree keeps its long-standing behaviour.
+    if [ -n "$pr_num" ]; then
+      wt_state=$(worktree_content_state "$WT_PATH") || true
+      if [ "$wt_state" != "clean" ] && [ "$wt_state" != "missing" ]; then
+        print_record "[PR #${pr_num} gone-upstream but working tree is ${wt_state} — review manually, keeping]" "$C_YELLOW" \
+          "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[gone]" "" "$WT_LOCK_REASON"
+        if [ "$wt_state" = "ignored" ]; then
+          echo "    reason:   gitignored content only (e.g. .env, *.key, node_modules/) — \`git worktree remove\` deletes it with or without --force, and it exists nowhere else; move or delete it by hand first"
+        else
+          echo "    reason:   uncommitted or untracked content (or an unreadable status) — removing the worktree would destroy work that exists nowhere else; commit, stash, or discard it by hand first"
+        fi
+        SUMMARY_UNCLEAN_KEPT+=("$WT_PATH ($WT_BRANCH [gone], $wt_state)")
+        continue
+      fi
+    fi
     if [ "$WT_LOCKED" = "1" ]; then
       print_record "[LOCKED gone-upstream]" "$C_YELLOW" \
         "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[gone]" "" "$WT_LOCK_REASON"
@@ -489,7 +699,118 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
         try_remove "$WT_PATH" "0"
       fi
     fi
+    continue
   fi
+
+  # Branch-attached, upstream still ALIVE. This is where the documented
+  # `git worktree add <path> <branch>` form lands, so it is where a
+  # convention-slugged checkout for a closed/merged PR has to be caught —
+  # the gone-upstream rule above misses it whenever the remote branch
+  # outlives the PR, and the slug check used to live only in the detached
+  # arm (#762). Strictly additive: rule 1 already `continue`d above, so no
+  # previously-removable worktree becomes retained here.
+  [ -n "$pr_num" ] || continue
+  pr_state=$(gh_pr_state "$pr_num")
+  case "$pr_state" in
+    CLOSED|MERGED)
+      # Removal requires positive proof that nothing is lost: an EMPTY
+      # status per worktree_content_state() (which forces the ignored,
+      # untracked and submodule listings on so operator config cannot turn
+      # the proof into a lie). The branch ref survives `git
+      # worktree remove`, so commits are safe either way; working-tree-only
+      # content is not. Anything git reports → surface and keep. This runs
+      # BEFORE the locked check on purpose: a locked AND unclean worktree
+      # must stay put even under --force-locked. `|| true` because the
+      # helper returns non-zero for every non-clean verdict and `set -e`
+      # would otherwise abort on the assignment.
+      wt_state=$(worktree_content_state "$WT_PATH") || true
+      if [ "$wt_state" = "missing" ]; then
+        # The registered directory is gone: nothing to preserve, only git's
+        # administrative entry is stale. Never route it through the unclean
+        # bucket, whose "commit, stash, or discard it by hand" remediation is
+        # nonsense for a path that does not exist (#762 r2 P3).
+        #
+        # But "stale entry" does NOT imply "prunable": `git worktree prune`
+        # SKIPS locked entries. Verified — with the directory deleted and the
+        # entry locked, `git worktree prune -v` printed nothing and the entry
+        # stayed registered; `git worktree remove --force` also refused
+        # ("cannot remove a locked working tree ... use 'remove -f -f' to
+        # override or unlock first"). Claiming self-clearing prunability for a
+        # LOCKED entry therefore produced a candidate that reappeared in every
+        # subsequent audit forever while --apply kept exiting 0. It belongs in
+        # the locked bucket instead, behind the same explicit --force-locked
+        # gate as every other locked entry — a lock is an operator statement
+        # that this entry is not to be touched, and a vanished directory is no
+        # reason to override it silently. try_remove() unlocks first and then
+        # removes, which does clear a locked+missing entry (verified rc=0,
+        # entry gone) (#762 r3 P2).
+        if [ "$WT_LOCKED" = "1" ]; then
+          print_record "[LOCKED PR #${pr_num} (${pr_state}) worktree directory is MISSING]" "$C_YELLOW" \
+            "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[alive]" "$pr_state" "$WT_LOCK_REASON"
+          echo "    reason:   the registered directory does not exist, so there is nothing to preserve — but the entry is LOCKED and \`git worktree prune\` skips locked entries, so this does NOT clear itself; pass --force-locked to unlock and drop it"
+          SUMMARY_LOCKED+=("$WT_PATH ($WT_BRANCH, PR #${pr_num} ${pr_state}, directory missing)")
+          if [ "$MODE" = "apply" ] && [ "$FORCE_LOCKED" = "1" ]; then
+            echo "    -> removing (forced)"
+            try_remove "$WT_PATH" "1"
+          elif [ "$MODE" = "apply" ]; then
+            echo "    -> skipped (locked; pass --force-locked to remove)"
+            SUMMARY_SKIPPED+=("$WT_PATH (locked)")
+          fi
+          continue
+        fi
+        print_record "[PR #${pr_num} (${pr_state}) worktree directory is MISSING — prunable]" "$C_YELLOW" \
+          "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[alive]" "$pr_state" "$WT_LOCK_REASON"
+        echo "    reason:   the registered directory does not exist, so there is nothing to preserve — only git's administrative entry is stale; \`git worktree prune\` clears it (--apply runs prune unconditionally)"
+        SUMMARY_PRUNABLE+=("$WT_PATH ($WT_BRANCH, PR #${pr_num} ${pr_state})")
+        continue
+      fi
+      if [ "$wt_state" != "clean" ]; then
+        print_record "[PR #${pr_num} (${pr_state}) but the working tree is not clean — review manually, keeping]" "$C_YELLOW" \
+          "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[alive]" "$pr_state" "$WT_LOCK_REASON"
+        if [ "$wt_state" = "ignored" ]; then
+          echo "    reason:   gitignored content only (e.g. .env, *.key, node_modules/) — \`git worktree remove\` deletes it with or without --force, and it exists nowhere else; move or delete it by hand first"
+        else
+          echo "    reason:   uncommitted or untracked content (or an unreadable status) — removing the worktree would destroy work that exists nowhere else; commit, stash, or discard it by hand first"
+        fi
+        SUMMARY_UNCLEAN_KEPT+=("$WT_PATH ($WT_BRANCH, PR #${pr_num} ${pr_state}, ${wt_state})")
+        continue
+      fi
+      if [ "$WT_LOCKED" = "1" ]; then
+        print_record "[LOCKED PR #${pr_num} (${pr_state}) branch worktree]" "$C_YELLOW" \
+          "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[alive]" "$pr_state" "$WT_LOCK_REASON"
+        SUMMARY_LOCKED+=("$WT_PATH ($WT_BRANCH, PR #${pr_num} ${pr_state})")
+        if [ "$MODE" = "apply" ] && [ "$FORCE_LOCKED" = "1" ]; then
+          echo "    -> removing (forced)"
+          try_remove "$WT_PATH" "1"
+        elif [ "$MODE" = "apply" ]; then
+          echo "    -> skipped (locked; pass --force-locked to remove)"
+          SUMMARY_SKIPPED+=("$WT_PATH (locked)")
+        fi
+      else
+        print_record "[STALE PR #${pr_num} (${pr_state}) branch worktree]" "$C_RED" \
+          "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[alive]" "$pr_state" ""
+        SUMMARY_PR_BRANCH+=("$WT_PATH ($WT_BRANCH, PR #${pr_num} ${pr_state})")
+        if [ "$MODE" = "apply" ]; then
+          echo "    -> removing (working tree clean; branch ref $WT_BRANCH is kept)"
+          try_remove "$WT_PATH" "0"
+        fi
+      fi
+      ;;
+    OPEN)
+      print_record "[OPEN PR #${pr_num} — keeping]" "$C_GREEN" \
+        "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[alive]" "OPEN" ""
+      SUMMARY_OPEN_PR+=("$WT_PATH ($WT_BRANCH, PR #${pr_num})")
+      ;;
+    *)
+      print_record "[PR #${pr_num} state unknown — branch worktree]" "$C_YELLOW" \
+        "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[alive]" "$pr_state" ""
+      SUMMARY_PR_BRANCH+=("$WT_PATH ($WT_BRANCH, PR #${pr_num} unknown)")
+      if [ "$MODE" = "apply" ]; then
+        echo "    -> skipped (PR state unknown; rerun after \`gh auth\` setup)"
+        SUMMARY_SKIPPED+=("$WT_PATH (PR state unknown)")
+      fi
+      ;;
+  esac
 done <"$REC_FILE"
 
 # ── Re-snapshot worktree records (#605 root cause 1) ───────────────────
@@ -666,6 +987,17 @@ echo ""
 echo "${C_BOLD}Summary${C_RESET}"
 printf "  gone-upstream:    %d\n" "${#SUMMARY_GONE[@]}"
 printf "  detached stale:   %d\n" "${#SUMMARY_DETACHED[@]}"
+# Branch-attached worktrees whose PR-slug path names a CLOSED/MERGED (or
+# unverifiable) PR while the remote branch is still alive (#762).
+printf "  PR-slug branch stale: %d\n" "${#SUMMARY_PR_BRANCH[@]}"
+# Closed/merged-PR branch worktrees kept because their working tree is not
+# clean — the removal would destroy content that exists nowhere else.
+printf "  unclean PR worktrees (review): %d\n" "${#SUMMARY_UNCLEAN_KEPT[@]}"
+# Closed/merged-PR branch worktrees whose directory is already gone and whose
+# entry is UNLOCKED — only git's administrative entry is stale, and the
+# trailing `git worktree prune` clears it. Locked+missing entries are counted
+# under `locked` instead: prune skips them (#762 r3 P2).
+printf "  prunable PR worktrees: %d\n" "${#SUMMARY_PRUNABLE[@]}"
 printf "  locked:           %d\n" "${#SUMMARY_LOCKED[@]}"
 printf "  merged branches:  %d\n" "${#SUMMARY_LOCAL_BRANCH[@]}"
 # Gone-upstream branches examined by the merged-branch sweep but kept because
@@ -711,7 +1043,31 @@ fi
 # unauthenticated machine EVERY gone branch is unknown, and hard-failing the
 # audit there would make it unusable exactly where it can verify least; the
 # summary line + per-branch records carry the visibility instead.
-total_candidates=$(( ${#SUMMARY_GONE[@]} + ${#SUMMARY_DETACHED[@]} + ${#SUMMARY_LOCKED[@]} + ${#SUMMARY_LOCAL_BRANCH[@]} + ${#SUMMARY_ORPHAN[@]} + ${#SUMMARY_DIVERGED_KEPT[@]} ))
+#
+# SUMMARY_UNCLEAN_KEPT counts as actionable for the same reason as
+# SUMMARY_DIVERGED_KEPT: a closed/merged-PR worktree holding working-tree-only
+# content needs a HUMAN decision (commit, stash, discard, or move), and --apply
+# deliberately never touches it, so the exit-2 persists until the human
+# resolves it.
+#
+# SUMMARY_PRUNABLE counts too, but it is the one bucket here that --apply
+# genuinely CLEARS on its own: the trailing `git worktree prune` drops the
+# stale administrative entry, so the next dry-run is quiet. It is reported
+# rather than silently swallowed because a registered worktree whose directory
+# vanished is worth one line of visibility. That self-clearing claim is only
+# true because the bucket is now UNLOCKED-only — prune skips locked entries,
+# so a locked+missing worktree routed here would have re-reported forever
+# while --apply exited 0 (#762 r3 P2).
+#
+# SUMMARY_PR_BRANCH IS counted even for its PR-state-unknown entries, matching
+# how the detached arm counts its own unknown entries under SUMMARY_DETACHED.
+# That is not in tension with the SUMMARY_LOOKUP_UNKNOWN carve-out above: that
+# carve-out exists because the merged-branch sweep evaluates EVERY gone-upstream
+# branch, so on a gh-less machine it would turn dozens of unverifiable branches
+# into a permanent exit 2. This bucket only ever holds worktrees the operator
+# deliberately slugged `pr-<n>` — a small, hand-created population where an
+# unverifiable PR state really is something to go look at.
+total_candidates=$(( ${#SUMMARY_GONE[@]} + ${#SUMMARY_DETACHED[@]} + ${#SUMMARY_PR_BRANCH[@]} + ${#SUMMARY_UNCLEAN_KEPT[@]} + ${#SUMMARY_PRUNABLE[@]} + ${#SUMMARY_LOCKED[@]} + ${#SUMMARY_LOCAL_BRANCH[@]} + ${#SUMMARY_ORPHAN[@]} + ${#SUMMARY_DIVERGED_KEPT[@]} ))
 if [ "$total_candidates" -gt 0 ]; then
   echo ""
   echo "${C_DIM}Dry run. Re-run with --apply to remove safe candidates.${C_RESET}"
