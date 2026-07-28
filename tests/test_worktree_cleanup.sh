@@ -167,6 +167,25 @@ if ! git branch -vv | grep -q ': gone\]'; then
   fail "fixture setup: expected [gone] marker on gone-branch"
 fi
 
+# ── Case 2b (#762 r3 P1): PR-slug worktree, upstream GONE, dirty ─────
+# The gone-upstream rule runs FIRST and `continue`s, so before this fix a
+# .mergepath-worktrees/pr-N-* checkout whose upstream had been pruned was
+# force-removed without ever reaching the content gate — deleting uncommitted
+# work that the tool's own documented invariant says it protects.
+GONE_PR_NUM=88888
+GONE_PR_BRANCH="pr-branch-gone-dirty"
+git branch "$GONE_PR_BRANCH"
+git push -q -u origin "$GONE_PR_BRANCH"
+GONE_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${GONE_PR_NUM}-gone-dirty"
+git worktree add -q "$GONE_PR_WT" "$GONE_PR_BRANCH"
+GONE_PR_CANARY="$GONE_PR_WT/unsaved.md"
+echo "work that exists nowhere else" > "$GONE_PR_CANARY"
+git push -q origin --delete "$GONE_PR_BRANCH"
+git fetch -q --prune
+if ! git branch -vv | grep -q "$GONE_PR_BRANCH.*: gone\]"; then
+  fail "fixture setup: expected [gone] marker on $GONE_PR_BRANCH"
+fi
+
 # ── Case 3: detached mergepath-pr-<num> worktree (PR closed) ────────
 # We need the worktree path to match the helper's regex
 # /tmp|/private/tmp|/Users/.../GitHub|...mergepath-pr-<num>. On macOS,
@@ -1126,6 +1145,21 @@ else
   echo "$OUT2" >&2
 fi
 
+# Case 2b (#762 r3 P1): the gone-upstream fast path must not bypass the
+# content gate for a PR-slug worktree.
+if [ -d "$GONE_PR_WT" ]; then
+  pass "gone-upstream PR-slug worktree with dirty content retained by --apply"
+else
+  fail "gone-upstream PR-slug worktree was removed by --apply despite dirty content"
+  echo "$OUT2" >&2
+fi
+if [ -f "$GONE_PR_CANARY" ] && grep -q "nowhere else" "$GONE_PR_CANARY"; then
+  pass "gone-upstream PR-slug canary survived --apply"
+else
+  fail "DATA LOSS: --apply deleted uncommitted work in $GONE_PR_WT via the gone-upstream fast path"
+  echo "$OUT2" >&2
+fi
+
 # Case 18c (#762 r3 P2): the SUBMODULE-carrying worktree survives --apply
 # under `diff.ignoreSubmodules=all`. Pre-fix the status probe returned empty,
 # the helper reported `clean`, and try_remove()'s `git worktree remove
@@ -1369,6 +1403,7 @@ git branch -D "$DIVERGED_BRANCH" >/dev/null 2>&1 || true
 git worktree remove --force "$DIRTY_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$IGNORED_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$UNTRACKED_PR_WT" >/dev/null 2>&1 || true
+git worktree remove --force "$GONE_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$SUBMOD_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$UNKNOWN_PR_WT" >/dev/null 2>&1 || true
 set +e

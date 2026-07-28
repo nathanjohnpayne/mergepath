@@ -595,6 +595,31 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
 
   # Branch-attached worktree.
   if is_gone_branch "$WT_BRANCH"; then
+    # A PR-slug worktree must clear the comprehensive content gate before ANY
+    # removal, including this gone-upstream fast path. Without this the
+    # invariant is only half-real: rule 1 runs FIRST and `continue`s, so a
+    # `.mergepath-worktrees/pr-N-*` checkout whose upstream is already [gone]
+    # never reached worktree_content_state and `--apply` deleted uncommitted,
+    # untracked, gitignored or submodule content outright — the very loss the
+    # gate below was added to prevent (#762 r3 P1).
+    #
+    # Scoped to PR-slug paths on purpose: those are the ones this tool's
+    # convention says it owns and may delete unattended. A non-slug
+    # gone-upstream worktree keeps its long-standing behaviour.
+    if [ -n "$pr_num" ]; then
+      wt_state=$(worktree_content_state "$WT_PATH") || true
+      if [ "$wt_state" != "clean" ] && [ "$wt_state" != "missing" ]; then
+        print_record "[PR #${pr_num} gone-upstream but working tree is ${wt_state} — review manually, keeping]" "$C_YELLOW" \
+          "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[gone]" "" "$WT_LOCK_REASON"
+        if [ "$wt_state" = "ignored" ]; then
+          echo "    reason:   gitignored content only (e.g. .env, *.key, node_modules/) — \`git worktree remove\` deletes it with or without --force, and it exists nowhere else; move or delete it by hand first"
+        else
+          echo "    reason:   uncommitted or untracked content (or an unreadable status) — removing the worktree would destroy work that exists nowhere else; commit, stash, or discard it by hand first"
+        fi
+        SUMMARY_DIRTY_KEPT+=("$WT_PATH ($WT_BRANCH [gone], $wt_state)")
+        continue
+      fi
+    fi
     if [ "$WT_LOCKED" = "1" ]; then
       print_record "[LOCKED gone-upstream]" "$C_YELLOW" \
         "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[gone]" "" "$WT_LOCK_REASON"
