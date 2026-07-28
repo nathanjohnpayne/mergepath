@@ -831,6 +831,15 @@ fi
 # SUMMARY_DIVERGED_KEPT: a closed/merged-PR worktree holding uncommitted work
 # needs a HUMAN decision (commit, stash, or discard), and --apply deliberately
 # never touches it, so the exit-2 persists until the human resolves it.
+#
+# SUMMARY_PR_BRANCH IS counted even for its PR-state-unknown entries, matching
+# how the detached arm counts its own unknown entries under SUMMARY_DETACHED.
+# That is not in tension with the SUMMARY_LOOKUP_UNKNOWN carve-out above: that
+# carve-out exists because the merged-branch sweep evaluates EVERY gone-upstream
+# branch, so on a gh-less machine it would turn dozens of unverifiable branches
+# into a permanent exit 2. This bucket only ever holds worktrees the operator
+# deliberately slugged `pr-<n>` — a small, hand-created population where an
+# unverifiable PR state really is something to go look at.
 total_candidates=$(( ${#SUMMARY_GONE[@]} + ${#SUMMARY_DETACHED[@]} + ${#SUMMARY_PR_BRANCH[@]} + ${#SUMMARY_DIRTY_KEPT[@]} + ${#SUMMARY_LOCKED[@]} + ${#SUMMARY_LOCAL_BRANCH[@]} + ${#SUMMARY_ORPHAN[@]} + ${#SUMMARY_DIVERGED_KEPT[@]} ))
 if [ "$total_candidates" -gt 0 ]; then
   echo ""
