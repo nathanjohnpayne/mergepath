@@ -215,6 +215,24 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   '.bootstrap-state'
 )
 
+# Canonical agent docs a NEW repo must come out of bootstrap carrying
+# (#780). These are `class: canonical` in .mergepath-sync.yml's
+# doc_ownership inventory: one source of truth on the hub, mirrored
+# verbatim, written to be true in every repo that receives them. The
+# rsync above already copies them (they are not excluded), so this list
+# is a POSITIVE assertion, not a delivery mechanism — it exists so a
+# future exclude-pattern change cannot silently strip a shared rulebook
+# out of every repo bootstrapped afterwards. The failure it guards
+# against is invisible at bootstrap time and only shows up as an agent
+# in a new repo that has never read the shared rules.
+#
+# Keep in sync with the `class: canonical` entries in the manifest's
+# doc_ownership block.
+BOOTSTRAP_REQUIRED_CANONICAL_AGENT_DOCS=(
+  'docs/agents/shared-operating-rules.md'
+  'docs/agents/worktree-placement.md'
+)
+
 # Files that rsync leaves behind because they don't match an exclude
 # pattern but shouldn't ship to a new repo. Post-mirror cleanup.
 BOOTSTRAP_POST_MIRROR_REMOVE=(
@@ -298,6 +316,16 @@ bootstrap::stage_template_mirror() {
   bootstrap::_scaffold_consumer_identity "$target" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
     bootstrap::err "template-mirror: consumer-identity scaffold failed (rc=$step_rc); aborting stage"
+    return "$step_rc"
+  fi
+
+  # Step 5c: verify the new repo actually carries the canonical agent
+  # docs and reads the shared rules ahead of its local overlay (#780).
+  # Runs AFTER the identity scaffold because that step rewrites
+  # AGENTS.md, and the ordering assertion must see the final file.
+  bootstrap::_verify_canonical_agent_docs "$target" || step_rc=$?
+  if [ "$step_rc" -ne 0 ]; then
+    bootstrap::err "template-mirror: canonical agent-doc verification failed (rc=$step_rc); aborting stage"
     return "$step_rc"
   fi
 
@@ -660,6 +688,66 @@ EOF
     fi
     bootstrap::log "reframed the REVIEW_POLICY.md wave-audit passage as hub-side machinery"
   fi
+}
+
+# Verify the bootstrapped repo carries the canonical agent docs and
+# reads the shared rules BEFORE its local operating-rules overlay (#780).
+#
+# Two assertions, both fail-closed:
+#
+#   1. Every BOOTSTRAP_REQUIRED_CANONICAL_AGENT_DOCS file landed. The
+#      rsync copies them by default, so a failure here means someone
+#      added an exclude pattern that swallows a canonical doc.
+#   2. AGENTS.md references docs/agents/shared-operating-rules.md, and
+#      does so BEFORE its reference to docs/agents/operating-rules.md.
+#      The order is the point: the shared file is the fleet-wide core
+#      and the local file is the per-repo overlay, so an agent that
+#      reads the index top-down must meet the shared rules first. An
+#      AGENTS.md that links the shared file only after (or not at all)
+#      leaves the new repo's agents on the overlay alone.
+#
+# The two path strings do not overlap as substrings
+# ("docs/agents/shared-operating-rules.md" does not contain
+# "docs/agents/operating-rules.md"), so a fixed-string line match is
+# unambiguous.
+bootstrap::_verify_canonical_agent_docs() {
+  local target=$1
+
+  if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
+    bootstrap::log "dry-run: would verify the canonical agent docs landed in $target and that AGENTS.md reads the shared operating rules before the local overlay"
+    return 0
+  fi
+
+  local missing="" doc
+  for doc in "${BOOTSTRAP_REQUIRED_CANONICAL_AGENT_DOCS[@]}"; do
+    [ -f "$target/$doc" ] || missing="$missing $doc"
+  done
+  if [ -n "$missing" ]; then
+    bootstrap::err "canonical agent docs missing from the mirrored repo:$missing — these are 'class: canonical' in .mergepath-sync.yml's doc_ownership inventory and every new repo must carry them. Check BOOTSTRAP_MIRROR_EXCLUDES for a pattern that swallows them."
+    return 1
+  fi
+
+  local agents_md="$target/AGENTS.md"
+  if [ ! -f "$agents_md" ]; then
+    bootstrap::err "AGENTS.md missing from the mirrored repo; cannot verify the agent-docs reading order"
+    return 1
+  fi
+
+  local shared_line local_line
+  shared_line=$(grep -n -F -m1 'docs/agents/shared-operating-rules.md' "$agents_md" | cut -d: -f1 || true)
+  local_line=$(grep -n -F -m1 'docs/agents/operating-rules.md' "$agents_md" | cut -d: -f1 || true)
+
+  if [ -z "$shared_line" ]; then
+    bootstrap::err "AGENTS.md does not reference docs/agents/shared-operating-rules.md — the new repo would ship the shared rulebook with nothing pointing at it. Add it to the AGENTS.md reading order at the mergepath source."
+    return 1
+  fi
+  if [ -n "$local_line" ] && [ "$shared_line" -gt "$local_line" ]; then
+    bootstrap::err "AGENTS.md lists docs/agents/operating-rules.md (line $local_line) BEFORE docs/agents/shared-operating-rules.md (line $shared_line) — the shared canonical rules must come first, with the per-repo overlay after. Fix the ordering at the mergepath source."
+    return 1
+  fi
+
+  bootstrap::log "canonical agent docs present and AGENTS.md reads the shared operating rules before the local overlay"
+  return 0
 }
 
 bootstrap::_rsync_template() {

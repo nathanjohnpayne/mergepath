@@ -154,11 +154,18 @@ Report issues to security@mergepath.example.
 EOF
 
 # AGENTS.md with the mergepath-only "Repository Layout" / packaging note
-# that the #744 scrub must remove in the consumer copy.
+# that the #744 scrub must remove in the consumer copy. The Sections
+# list carries the #780 reading order: the canonical shared operating
+# rules BEFORE the per-repo local overlay.
 cat >"$FAKE_MP/AGENTS.md" <<'EOF'
 # AGENTS.md
 
 Read the docs before acting.
+
+## Sections
+
+1. **[Shared Agent Operating Rules](docs/agents/shared-operating-rules.md)** --- fleet-wide canonical core
+2. **[Agent Operating Rules](docs/agents/operating-rules.md)** --- this repo's local overlay
 
 ## Repository Layout
 
@@ -170,6 +177,13 @@ One directory carries its justification here:
 
 Every change goes through REVIEW_POLICY.md.
 EOF
+
+# Canonical agent docs (#780) — mirrored verbatim to every new repo,
+# and asserted present by bootstrap::_verify_canonical_agent_docs.
+echo "# Shared Agent Operating Rules (canonical core)" >"$FAKE_MP/docs/agents/shared-operating-rules.md"
+echo "# Worktree Placement (canonical convention)" >"$FAKE_MP/docs/agents/worktree-placement.md"
+# The per-repo-owned local overlay it must be read BEFORE.
+echo "# Agent Operating Rules (local overlay)" >"$FAKE_MP/docs/agents/operating-rules.md"
 
 # REVIEW_POLICY.md with the hub-only wave-audit passage the #747
 # reframe must replace in the consumer copy. Deliberately carries NO
@@ -526,6 +540,85 @@ if [ -f "$TARGET/AGENTS.md" ]; then
     || fail "AGENTS.md scrub over-removed (Code Review Policy section gone)"
 else
   fail "AGENTS.md missing from consumer mirror"
+fi
+
+# --- assertion 4c2: canonical agent docs land + shared-before-local (#780) ---
+# A new repo must come out of bootstrap already carrying the canonical
+# shared rulebook, with AGENTS.md pointing at it BEFORE the per-repo
+# operating-rules overlay. Both halves are enforced in-stage by
+# bootstrap::_verify_canonical_agent_docs; assert the observable result.
+canon_missing=""
+for d in docs/agents/shared-operating-rules.md docs/agents/worktree-placement.md; do
+  [ -f "$TARGET/$d" ] || canon_missing="$canon_missing $d"
+done
+[ -z "$canon_missing" ] \
+  && pass "canonical agent docs seeded into the new repo (#780)" \
+  || fail "canonical agent docs missing from the new repo:$canon_missing"
+[ -f "$TARGET/docs/agents/operating-rules.md" ] \
+  && pass "per-repo operating-rules overlay still seeded alongside the shared core" \
+  || fail "docs/agents/operating-rules.md missing from the new repo"
+if [ -f "$TARGET/AGENTS.md" ]; then
+  shared_ln=$(grep -n -F -m1 'docs/agents/shared-operating-rules.md' "$TARGET/AGENTS.md" | cut -d: -f1 || true)
+  local_ln=$(grep -n -F -m1 'docs/agents/operating-rules.md' "$TARGET/AGENTS.md" | cut -d: -f1 || true)
+  if [ -n "$shared_ln" ] && [ -n "$local_ln" ] && [ "$shared_ln" -lt "$local_ln" ]; then
+    pass "AGENTS.md reads the shared operating rules before the local overlay (#780)"
+  else
+    fail "AGENTS.md reading order wrong (shared=${shared_ln:-none}, local=${local_ln:-none})"
+  fi
+fi
+
+# --- assertion 4c3: the in-stage verifier actually fails closed (#780) ---
+# The assertions above prove the happy path. Drive
+# bootstrap::_verify_canonical_agent_docs directly against deliberately
+# broken trees so a future exclude-pattern or index regression cannot
+# pass silently — a verifier that never returns non-zero is not a guard.
+VERIFY_LIB="$ROOT/scripts/bootstrap/template-mirror.sh"
+verify_case() {
+  # $1 = scenario label, $2 = mutation shell snippet run against $vt
+  local label="$1" mutate="$2" vt rc out
+  vt="$(mktemp -d "$WORKDIR/verify.XXXXXX")"
+  mkdir -p "$vt/docs/agents"
+  : > "$vt/docs/agents/shared-operating-rules.md"
+  : > "$vt/docs/agents/worktree-placement.md"
+  : > "$vt/docs/agents/operating-rules.md"
+  printf '1. [Shared](docs/agents/shared-operating-rules.md)\n2. [Local](docs/agents/operating-rules.md)\n' > "$vt/AGENTS.md"
+  ( cd "$vt" && eval "$mutate" )
+  set +e
+  out=$(bash -c '
+    bootstrap::log() { :; }
+    bootstrap::err() { echo "ERR: $*"; }
+    source "$1"
+    bootstrap::_verify_canonical_agent_docs "$2"
+  ' _ "$VERIFY_LIB" "$vt" 2>&1)
+  rc=$?
+  set -e
+  printf '%s|%s' "$rc" "$out"
+}
+
+res=$(verify_case "control" ":")
+[ "${res%%|*}" = "0" ] \
+  && pass "verifier control: an intact tree passes (#780)" \
+  || fail "verifier control unexpectedly failed: ${res#*|}"
+
+res=$(verify_case "missing-doc" 'rm docs/agents/shared-operating-rules.md')
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "canonical agent docs missing"; then
+  pass "verifier fails closed when a canonical agent doc is absent (#780)"
+else
+  fail "verifier should fail on a missing canonical doc; got: $res"
+fi
+
+res=$(verify_case "wrong-order" 'printf "1. [Local](docs/agents/operating-rules.md)\n2. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "BEFORE docs/agents/shared-operating-rules.md"; then
+  pass "verifier fails closed when AGENTS.md lists the local overlay first (#780)"
+else
+  fail "verifier should fail on a shared-after-local AGENTS.md; got: $res"
+fi
+
+res=$(verify_case "unlinked" 'printf "1. [Local](docs/agents/operating-rules.md)\n" > AGENTS.md')
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "does not reference docs/agents/shared-operating-rules.md"; then
+  pass "verifier fails closed when AGENTS.md never links the shared rules (#780)"
+else
+  fail "verifier should fail on an AGENTS.md with no shared-rules link; got: $res"
 fi
 
 # --- assertion 4d: README.md hub-identity scrub (#747) ---

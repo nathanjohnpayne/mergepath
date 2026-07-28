@@ -1,5 +1,7 @@
 # Agent Operating Rules
 
+> This file is mergepath's **local overlay**. The fleet-wide shared core lives in [`docs/agents/shared-operating-rules.md`](shared-operating-rules.md) — read that first (`AGENTS.md` § Sections orders them). Several sections below are still duplicated there verbatim while the split lands; removing the duplicates from this overlay is tracked in #780 and happens after the canary consumer migration validates the split.
+
 Read in this order before taking any action:
 
 1. `README.md` — understand the project
