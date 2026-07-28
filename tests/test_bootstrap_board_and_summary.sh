@@ -68,6 +68,16 @@ echo "decision records" >"$FAKE_MP/docs/agents/decision-records.md"
 echo "shared rules" >"$FAKE_MP/docs/agents/shared-operating-rules.md"
 echo "worktree placement" >"$FAKE_MP/docs/agents/worktree-placement.md"
 echo "local overlay" >"$FAKE_MP/docs/agents/operating-rules.md"
+cat >"$FAKE_MP/.mergepath-sync.yml" <<'EOF'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/shared-operating-rules.md
+    class: canonical
+  - path: docs/agents/worktree-placement.md
+    class: canonical
+EOF
 cat >"$FAKE_MP/AGENTS.md" <<'AGENTSEOF'
 # Agent Instructions
 
