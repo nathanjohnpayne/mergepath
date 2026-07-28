@@ -2,7 +2,7 @@
 
 > Canonical source: `mergepath/docs/agents/decision-records.md`. This file is propagated verbatim to consumer repos via the propagation manifest; edit it at the canonical source, never in a consumer copy. Machine-local vendor files (e.g. a `~/GitHub/CLAUDE.md`, `~/.codex/AGENTS.md`) that mirror this convention must carry a `> Canonical source:` annotation pointing back here — see the canonical-source discipline rule in `docs/agents/documentation-rules.md`.
 >
-> Consumer maintainers: the sync delivers this file but does not announce it. Link it from your repo's own agent-docs index (your `AGENTS.md` reading order or operating-rules equivalent) so agents actually discover it — this file is its own landing page, and nothing else in a consumer repo references it until you add that link.
+> Consumer maintainers: the sync delivers this file but does not announce it. Your repo does already carry one pointer to it — the shared pull-request template's `## Path taken` stub — but that pointer sits inside an HTML comment, reaches only PR authors at the moment they open a PR, and covers only the change-level half. Link this file from your repo's own agent-docs index (your `AGENTS.md` reading order or operating-rules equivalent) so agents discover both halves deliberately.
 
 This convention is deliberately tech-stack-independent: it says nothing about languages, frameworks, or build tooling, only about where a decision gets written down so the next reader finds it. It applies identically in every repo that receives it.
 
@@ -140,7 +140,7 @@ In both markers, `ISSUE` is the issue number and `YYYY-MM-DD` is the decision da
 
 Both writes are retried by agents that crash, time out, or run twice. The hidden markers are what make a retry safe:
 
-- **Before writing, search for the marker.** If `<!-- decision-comment-ISSUE-YYYY-MM-DD -->` is already in the body, edit that callout in place; do not prepend a second one. Same for the comment marker.
+- **Before writing, search for the marker — and search the body by the *undated* prefix.** The body search key is `<!-- decision-comment-ISSUE-`, trailing hyphen included so that issue 702 does not match a callout for issue 7020. Any hit means this issue already carries a callout, whatever date it bears: edit it in place when you are retrying the same decision, replace it when you are superseding one (§ 5). Never prepend a second. Searching for the full **dated** body marker is the bug to avoid — on a superseding write it matches nothing, and § 2's "prepend, above everything else" then produces exactly the two-callout state § 5 forbids. The **comment** search key is the opposite: the full dated `<!-- decision-ISSUE-YYYY-MM-DD -->`, because a superseding decision is a *new* comment and the earlier one stays untouched as history, so only a same-day retry should match.
 - **After writing, verify by positive readback.** Re-read the live issue body and the live comment through the API and confirm all four: the comment exists under the expected author identity and carries its marker; the permalink in the callout resolves to that comment's id; the body carries the callout marker exactly once; and the callout's wording states the current decision. A write call that returned without an error is not verification — a body edit racing another writer can be silently lost, and only a readback catches it.
 
 ### 5. Supersession

@@ -1067,6 +1067,33 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   #       something the reader can run or read is false there.
   BARE_ISSUE_RE='(^|[^A-Za-z0-9_/-])#[0-9]+'
   HUB_ONLY_RE='\.mergepath-sync\.yml|sync-to-downstream\.sh|wave-audit\.sh|scripts/bootstrap/|sweep-unresolved-feedback|docs/agents/(bootstrap-runbook|propagation-ordering|templated-propagation)\.md'
+
+  # Tell (a) scans PROSE ONLY. `#<digits>` is not an issue reference
+  # inside a fenced code block (a CSS hex colour `#336699`, a literal in
+  # a shell example), inside an inline code span, or in a markdown
+  # in-page anchor target — `](#1-post-a-structured-decision-comment)`,
+  # which is what a table of contents over this doc's own numbered
+  # headings would emit. Blanking those out keeps the guard from
+  # failing a required check with the misleading "bare issue reference"
+  # diagnostic. One output line per input line, so `grep -n` still
+  # reports the true line number.
+  #
+  # Deliberately NOT applied to tell (b): "run `wave-audit.sh`" is false
+  # downstream wherever it appears, including inside a fenced example,
+  # so the hub-only scan reads the raw file.
+  md_prose_only() {
+    awk '
+      /^[[:space:]]*(```|~~~)/ { fence = !fence; print ""; next }
+      fence                    { print ""; next }
+      {
+        line = $0
+        gsub(/`[^`]*`/, "", line)
+        gsub(/\]\(#[^)]*\)/, "]()", line)
+        print line
+      }
+    ' "$1"
+  }
+
   set +e
   canon_docs=$(yq -r '.paths[] | select(.type == "canonical") | .path' "$LIVE_MANIFEST" \
     | grep -E '^docs/agents/.*\.md$'); rc=$?
@@ -1081,7 +1108,8 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   $d: declared canonical but missing on disk"
       continue
     fi
-    if hits=$(grep -nE "$BARE_ISSUE_RE" "$ROOT/$d"); then
+    prose=$(md_prose_only "$ROOT/$d")
+    if hits=$(printf '%s\n' "$prose" | grep -nE "$BARE_ISSUE_RE"); then
       docs_bad="$docs_bad
   $d: bare issue reference (use owner/repo#NN or a full URL):
 $hits"
@@ -1100,8 +1128,41 @@ $hits"
     pass "Case 37: all $docs_seen canonical docs/agents/*.md entries are consumer-truthful"
   fi
 
+  # Case 38: self-test of the tell-(a) predicate, in BOTH directions.
+  #
+  # Case 37 reads the live tree, where every canonical agent doc happens
+  # to be clean — so on its own it never exercises the predicate's
+  # positive branch, and never proves the negative branch either. This
+  # fixture pins both: one real bare ref in prose must be flagged, and
+  # the four forms that legitimately carry `#<digits>` must not be.
+  FP_DOC="$WORKDIR/consumer-truth-fixture.md"
+  cat > "$FP_DOC" <<'FIXTURE_EOF'
+# Doc
+
+## Contents
+- [Post a structured decision comment](#1-post-a-structured-decision-comment)
+
+Cross-repo owner/repo#702 and permalink #issuecomment-5104563868 are fine.
+
+```css
+a { color: #336699; }
+```
+
+An inline hex `#1a2b3c` is not an issue reference.
+
+But a bare #740 in prose is.
+FIXTURE_EOF
+  set +e
+  fp_hits=$(md_prose_only "$FP_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  set -e
+  if [ "$fp_hits" = "14," ]; then
+    pass "Case 38: bare-issue predicate flags the prose ref on line 14 only (not anchors, fences, or code spans)"
+  else
+    fail "Case 38: expected only line 14 flagged, got '$fp_hits'"
+  fi
+
 else
-  echo "SKIP: Cases 36-37 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-38 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
