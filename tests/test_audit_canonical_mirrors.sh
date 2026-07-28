@@ -42,6 +42,34 @@
 #      annotation after it stay inside the fence, and the real section
 #      after the true (bare) closer is still parsed (round-2 Codex
 #      regression).
+#  12. A 4-space-INDENTED ``` inside an open fence is indented CODE, not
+#      a fence delimiter (CommonMark allows at most 3 leading spaces).
+#      A pair of them used to close and re-open the fence, fabricating a
+#      whole section out of the `##` line between them; both must now be
+#      ignored so nothing inside the outer fence leaks into the report
+#      (#762 finding 2).
+#  13. An annotation whose path escapes MERGEPATH_ROOT via `..`
+#      (`mergepath/../outside.md`) is rejected as [invalid-source] and
+#      never hashed — even when the pin matches the outside file, which
+#      is exactly what used to make it report [ok] (#762 finding 3).
+#  14. An ABSOLUTE annotated path is rejected as [invalid-source] rather
+#      than silently concatenated onto MERGEPATH_ROOT.
+#  15. An in-checkout path whose final component is a SYMLINK pointing
+#      outside MERGEPATH_ROOT is rejected as [invalid-source]: lexical
+#      normalization cannot see it, so the physical containment check
+#      has to.
+#  16. A symlink whose target is ALSO inside MERGEPATH_ROOT is rejected
+#      as [invalid-source] as well. The containment check refuses every
+#      symlink final component, escaping or not, because lexical
+#      normalization cannot follow a link and therefore cannot prove
+#      the target is safe. Test 15 alone passes under either reading;
+#      this fixture pins the intended one (#762 r2 P3).
+#  17. `--help` emits the COMPLETE header comment block. usage() used a
+#      hardcoded `sed -n '2,73p'` range that the header outgrew, so the
+#      output stopped mid-sentence and dropped MERGEPATH_ROOT plus the
+#      entire exit-code section. The assertion derives the expected last
+#      line from the script source rather than hardcoding one, so any
+#      future short range fails here too (#762 r3 P2).
 
 set -euo pipefail
 
@@ -72,6 +100,35 @@ sha256_of() {
 }
 FRESH_PIN="$(sha256_of "$MP/docs/agents/worktree-placement.md")"
 FRESH_PIN="${FRESH_PIN:0:12}"
+
+# ── Fixture file OUTSIDE the fixture checkout (#762 finding 3) ────────
+# Sibling of $MP, so `mergepath/../outside-the-checkout.md` resolves to
+# it. Pinned with its REAL sha256 so the unfixed parser reports [ok] on
+# a file it had no business hashing; the fixed parser must reject the
+# annotation before it ever gets there.
+OUTSIDE="$WORKDIR/outside-the-checkout.md"
+printf 'content that lives outside the canonical checkout\n' > "$OUTSIDE"
+OUTSIDE_PIN="$(sha256_of "$OUTSIDE")"
+OUTSIDE_PIN="${OUTSIDE_PIN:0:12}"
+
+# Absolute-path fixture: a real file, named by absolute path, which must
+# still be rejected rather than concatenated onto MERGEPATH_ROOT.
+ABSOLUTE_TARGET="$WORKDIR/absolute-target.md"
+printf 'absolute-path target\n' > "$ABSOLUTE_TARGET"
+
+# Symlink INSIDE the checkout whose target is outside it. Lexical
+# normalization sees a clean `docs/agents/...` path; only the physical
+# containment check catches the escape.
+ln -s "$OUTSIDE" "$MP/docs/agents/symlinked-outside.md"
+
+# Symlink inside the checkout whose target is ALSO inside it. The
+# containment check rejects ANY symlink final component, escaping or not
+# (`[ -L "$abs" ]`), so this must be [invalid-source] too. Without this
+# fixture the escaping symlink alone cannot distinguish "rejects symlinks
+# unconditionally" from "rejects symlinks that escape" — test 15 passes
+# under both readings (#762 r2 P3).
+printf 'canonical content that lives INSIDE the checkout\n' > "$MP/docs/agents/inside-target.md"
+ln -s "inside-target.md" "$MP/docs/agents/symlinked-inside.md"
 
 # ── Fixture vendor file ───────────────────────────────────────────────
 VENDOR="$WORKDIR/CLAUDE.md"
@@ -134,6 +191,39 @@ Real section after the 4-backtick closer, no annotation.
 ## After Info String Closer
 
 Real section after the whitespace-only closer, no annotation.
+
+## Indented Fence Mirror
+
+> Canonical source: mergepath/docs/agents/worktree-placement.md
+
+\`\`\`markdown
+A doc example that shows a fence indented four spaces:
+
+    \`\`\`
+## fake heading between two 4-space-indented delimiters
+# Canonical source: mergepath/inside/indented/fence.md
+    \`\`\`
+\`\`\`
+
+## After Indented Fence
+
+Real section after the true closer, no annotation.
+
+## Escaping Source Mirror
+
+> Canonical source: \`mergepath/../outside-the-checkout.md\` (canonical-sha256: $OUTSIDE_PIN)
+
+## Absolute Source Mirror
+
+> Canonical source: \`$ABSOLUTE_TARGET\`
+
+## Symlinked Source Mirror
+
+> Canonical source: \`mergepath/docs/agents/symlinked-outside.md\`
+
+## Symlinked Inside Source Mirror
+
+> Canonical source: \`mergepath/docs/agents/symlinked-inside.md\`
 EOF
 
 cp "$VENDOR" "$WORKDIR/CLAUDE.md.orig"
@@ -251,8 +341,73 @@ else
   fail "After Info String Closer section swallowed — bare closer did not close the fence"
 fi
 
-# summary line counts match the fixture (9 real sections)
-if grep -q '9 section(s) scanned — ok: 1, ok-unpinned: 3, missing-annotation: 3, source-missing: 1, drift: 1' <<<"$OUT"; then
+# 12a. a 4-space-indented ``` is indented CODE, not a fence delimiter:
+# nothing between the two indented delimiters may reach the report. With
+# the whitespace-stripping parser the first one CLOSED the outer fence,
+# so the `##` line below it became a fabricated real section.
+if grep -q 'between two 4-space-indented delimiters' <<<"$OUT" \
+  || grep -q 'indented/fence.md' <<<"$OUT"; then
+  fail "a 4-space-indented \`\`\` toggled fence state and leaked in-fence content into the report"
+else
+  pass "4-space-indented \`\`\` inside a fence ignored (CommonMark 3-space limit)"
+fi
+
+# 12b. the section owning that fence keeps its pre-fence annotation.
+if grep -q '\[ok-unpinned\] *## Indented Fence Mirror' <<<"$OUT"; then
+  pass "section containing the indented fence classified from its real annotation"
+else
+  fail "Indented Fence Mirror not classified ok-unpinned; output: $OUT"
+fi
+
+# 12c. the real (unindented) closer still closes the fence.
+if grep -q '\[missing-annotation\] ## After Indented Fence' <<<"$OUT"; then
+  pass "real section after the unindented closer still parsed"
+else
+  fail "After Indented Fence section swallowed — the unindented closer did not close the fence"
+fi
+
+# 13. a `..` escape is rejected before hashing. The fixture pin MATCHES the
+# outside file, so the unfixed parser reported [ok] on it.
+ESCAPE_LABEL=$(grep -o '\[[a-z-]*\] *## Escaping Source Mirror' <<<"$OUT" | head -n1)
+if grep -q '\[invalid-source\] *## Escaping Source Mirror' <<<"$OUT"; then
+  pass "annotation escaping MERGEPATH_ROOT via .. classified invalid-source"
+else
+  fail "escaping annotation not rejected (label='$ESCAPE_LABEL'); output: $OUT"
+fi
+if grep -q "pin $OUTSIDE_PIN matches" <<<"$OUT"; then
+  fail "SECURITY: the escaping annotation was hashed and reported as a pin match"
+else
+  pass "escaping annotation was never hashed (no pin-match line for the outside file)"
+fi
+
+# 14. an absolute annotated path is rejected, not concatenated.
+if grep -q '\[invalid-source\] *## Absolute Source Mirror' <<<"$OUT"; then
+  pass "absolute annotated path classified invalid-source"
+else
+  fail "absolute annotated path not rejected; output: $OUT"
+fi
+
+# 15. a symlink inside the checkout pointing outside it is rejected by the
+# physical containment check (lexical normalization cannot see it).
+if grep -q '\[invalid-source\] *## Symlinked Source Mirror' <<<"$OUT"; then
+  pass "in-checkout symlink resolving outside MERGEPATH_ROOT classified invalid-source"
+else
+  fail "symlink escaping MERGEPATH_ROOT not rejected; output: $OUT"
+fi
+
+# 16 (#762 r2 P3). a symlink whose target is INSIDE the checkout is rejected
+# too — the containment check refuses every symlink final component, because
+# lexical normalization cannot follow a link and so cannot PROVE the target is
+# safe. Pins the intended semantics, which test 15 alone cannot distinguish
+# from "reject only escaping symlinks".
+if grep -q '\[invalid-source\] *## Symlinked Inside Source Mirror' <<<"$OUT"; then
+  pass "symlink pointing INSIDE MERGEPATH_ROOT also classified invalid-source (unconditional)"
+else
+  fail "inside-pointing symlink not rejected — containment check is not unconditional; output: $OUT"
+fi
+
+# summary line counts match the fixture (15 real sections)
+if grep -q '15 section(s) scanned — ok: 1, ok-unpinned: 4, missing-annotation: 4, source-missing: 1, invalid-source: 4, drift: 1' <<<"$OUT"; then
   pass "summary counters match fixture"
 else
   fail "summary counters wrong; output: $OUT"
@@ -286,6 +441,49 @@ if [ "$RC" -eq 0 ] && grep -q 'absent — skipped' <<<"$OUT2" \
   pass "absent default-list file skipped; remaining files still audited; exit 0"
 else
   fail "env-override default list handling wrong (rc=$RC); output: $OUT2"
+fi
+
+# ── 17. `--help` emits the COMPLETE header block (#762 r3 P2) ─────────
+# usage() used to be `sed -n '2,73p'`. The header outgrew the hardcoded end
+# line, so --help stopped mid-sentence at "whitespace-separated file list
+# that" and silently dropped the MERGEPATH_ROOT entry and the ENTIRE "Exit
+# codes" section — the part a caller wiring this into a script most needs.
+set +e
+HELP="$("$SCRIPT" --help)"
+RC=$?
+set -e
+if [ "$RC" -eq 0 ]; then
+  pass "--help exits 0"
+else
+  fail "--help exited $RC, expected 0"
+fi
+if grep -q '^Exit codes:' <<<"$HELP" && grep -q '^  MERGEPATH_ROOT ' <<<"$HELP"; then
+  pass "--help includes the MERGEPATH_ROOT entry and the Exit codes section"
+else
+  fail "--help truncated; tail was: $(tail -3 <<<"$HELP")"
+fi
+
+# The anti-rot assertion: --help must run to the LAST line of the header
+# comment block, whatever that line happens to be. Derived independently from
+# the script source, so a range that stops short — for any reason, including a
+# future hardcoded one — fails here rather than shipping a truncated --help.
+HEADER_LAST="$(awk '
+  NR == 1 { next }
+  /^#/    { line = $0; sub(/^# ?/, "", line); last = line; next }
+            { exit }
+  END     { print last }
+' "$SCRIPT")"
+if [ "$(tail -1 <<<"$HELP")" = "$HEADER_LAST" ]; then
+  pass "--help runs to the last header-comment line (no truncation)"
+else
+  fail "--help ends at '$(tail -1 <<<"$HELP")', expected '$HEADER_LAST'"
+fi
+
+# ...and must not run PAST it into executable code.
+if grep -q 'set -euo pipefail' <<<"$HELP"; then
+  fail "--help leaked script body past the header comment block"
+else
+  pass "--help stops at the header block (no script body leaked)"
 fi
 
 echo
