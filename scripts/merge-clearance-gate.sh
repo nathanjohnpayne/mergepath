@@ -434,7 +434,15 @@ merge_clearance_check_enforced() {
         log "enforcement probe: classic protection lists required contexts on '$BASE_REF' but admin-exemption state is unreadable with this token (gh rc=$prot_rc) — not counting the classic surface: $(tr '\n' ' ' <"$err")"
       else
         set +e
-        enforce_admins=$(printf '%s' "$prot_out" | jq -r '.enforce_admins.enabled // "unknown"' 2>"$err")
+        # Type-check rather than `// "unknown"`: jq's alternative operator
+        # treats `false` as empty, so an explicit enforce_admins=false would
+        # collapse into the undeterminable state. The verdict is the same
+        # either way (classic surface not counted), but the two are different
+        # facts — "admins are exempt" vs "we could not look" — and the
+        # `enforcement probe:` log lines are what an operator greps to tell a
+        # deliberately-unprotected base branch from a token-scope problem.
+        enforce_admins=$(printf '%s' "$prot_out" \
+          | jq -r 'if (.enforce_admins.enabled | type) == "boolean" then (.enforce_admins.enabled | tostring) else "unknown" end' 2>"$err")
         prot_rc=$?
         set -e
         if [ "$prot_rc" -ne 0 ] || [ "$enforce_admins" = "unknown" ]; then

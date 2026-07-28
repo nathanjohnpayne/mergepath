@@ -1574,13 +1574,21 @@ set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
       FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_ADMIN_ENFORCE=false \
       MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
-      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>"$WORKDIR/p1k.err")
 RC=$?
 set -e
 if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
   pass "protection: classic required context with enforce_admins=false → not counted → false"
 else
   fail "protection: enforce_admins=false expected false/0; got rc=$RC out='$OUT'"
+fi
+# jq's `//` treats false as empty, so without an explicit boolean type check
+# this case silently takes the "could not determine" path and 1k/1l become the
+# same test. Assert the DISTINCT diagnostic so they stay separable.
+if grep -q "enforce_admins=false" "$WORKDIR/p1k.err"; then
+  pass "protection: enforce_admins=false emits its own diagnostic (not the undeterminable one)"
+else
+  fail "protection: expected an enforce_admins=false diagnostic; got: $(tr '\n' ' ' <"$WORKDIR/p1k.err" | tail -c 300)"
 fi
 
 echo; echo "--- Protection 1l (#772 r3 P1): unreadable admin-exemption state (the CI reality) is not proof"
@@ -1596,13 +1604,18 @@ set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
       FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_ADMIN_ENFORCE= \
       MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
-      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>"$WORKDIR/p1l.err")
 RC=$?
 set -e
 if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
   pass "protection: unreadable enforce_admins → classic surface not counted → false"
 else
   fail "protection: unreadable enforce_admins expected false/0; got rc=$RC out='$OUT'"
+fi
+if grep -q "unreadable with this token" "$WORKDIR/p1l.err"; then
+  pass "protection: unreadable admin-exemption emits the token-scope diagnostic"
+else
+  fail "protection: expected an unreadable-token diagnostic; got: $(tr '\n' ' ' <"$WORKDIR/p1l.err" | tail -c 300)"
 fi
 
 echo; echo "--- Protection 1i (#772 r2 P1): a ruleset the merging identity can BYPASS is not enforcement"
