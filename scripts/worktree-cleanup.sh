@@ -297,9 +297,17 @@ worktree_content_state() {
   # including without --force, because git consults the same flags. There is no
   # status flag that overrides this, so the flags themselves are the signal:
   # any flagged path means the comprehensive status CANNOT be trusted as proof.
+  #
+  # The scan uses a HERE-STRING, not `printf … | grep -q`. Under this script's
+  # `pipefail`, `grep -q` exits on its first match, `printf` then dies of
+  # SIGPIPE (141), and the pipeline reports failure — so the `if` reads FALSE
+  # exactly when a flag WAS found. The inversion needs the listing to exceed a
+  # pipe buffer, which a large worktree easily does. Measured: with a flagged
+  # entry first in a ~3.5 MB listing, the pipeline form returns 141 and misses
+  # it while the here-string form detects it.
   local flagged
   if flagged=$(git -C "$path" ls-files -v 2>/dev/null); then
-    if printf '%s\n' "$flagged" | grep -qE '^([a-z]|S) '; then
+    if grep -qE '^([a-z]|S) ' <<<"$flagged"; then
       echo "dirty"
       return 1
     fi
@@ -314,20 +322,48 @@ worktree_content_state() {
   # initialized submodule with the same comprehensive flags (#762 r4 P1).
   # `submodule foreach` is a no-op (exit 0, no output) on the submodule-free
   # checkouts this tool actually runs against, so this costs nothing here.
-  local sub_status
-  if sub_status=$(git -C "$path" submodule foreach --recursive --quiet \
-      'git status --porcelain --ignored --untracked-files=all' 2>/dev/null); then
-    if [ -n "$sub_status" ]; then
-      echo "dirty"
-      return 1
-    fi
+  # The submodule probe mirrors the TOP-LEVEL one exactly, index flags
+  # included. A file inside a submodule marked `assume-unchanged` /
+  # `skip-worktree` and then edited is invisible to both the outer status walk
+  # AND the recursive one, so the worktree read as clean; with
+  # `--apply --force-locked` the non-force attempt refuses (submodules), the
+  # force fallback then deletes the worktree and the hidden edit with it, and
+  # the run exits successfully. Same blind spot as the top level, one level
+  # down (#762 post-merge P1).
+  #
+  # It also fails CLOSED now: a submodule whose status or index cannot be read
+  # exits non-zero from `foreach`, which is treated as dirty rather than
+  # skipped. The inner `grep` deliberately omits `-q` so it consumes all input
+  # — the same SIGPIPE trap as above, and `foreach` runs under `sh`, where
+  # pipefail is not inherited, so a silent miss there would be even harder to
+  # spot.
+  local sub_probe sub_rc
+  set +e
+  sub_probe=$(git -C "$path" submodule foreach --recursive --quiet '
+    st=$(git status --porcelain --ignored --untracked-files=all) || exit 1
+    fl=$(git ls-files -v) || exit 1
+    printf %s "$st"
+    printf %s "$fl" | grep -E "^([a-z]|S) "
+    exit 0
+  ' 2>/dev/null)
+  sub_rc=$?
+  set -e
+  if [ "$sub_rc" -ne 0 ] || [ -n "$sub_probe" ]; then
+    echo "dirty"
+    return 1
   fi
   if [ -z "$status" ]; then
     echo "clean"
     return 0
   fi
-  # Only `!!` records → gitignored content and nothing else.
-  if ! printf '%s\n' "$status" | grep -qv '^!! '; then
+  # Only `!!` records → gitignored content and nothing else. Here-string for
+  # the same SIGPIPE reason as the index-flag scan: `grep -qv` stops at the
+  # first non-`!!` line, and under pipefail the resulting 141 would flip this
+  # negated test, reporting `ignored` for a genuinely dirty worktree. Both
+  # states are retained, so this is a wrong REMEDIATION rather than data loss —
+  # it would tell an operator "gitignored content only, move it by hand" about
+  # a worktree holding uncommitted work.
+  if ! grep -qv '^!! ' <<<"$status"; then
     echo "ignored"
     return 1
   fi
