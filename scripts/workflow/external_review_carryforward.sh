@@ -247,6 +247,27 @@ while IFS=$'\t' read -r source_time source_sha; do
   if [ -z "$resolved_sha" ]; then
     resolved_sha=$(gh api "repos/$REPO/commits/$source_sha" --jq .sha 2>/dev/null || true)
   fi
+  # DELIBERATE ASYMMETRY — `continue` here, but `exit 2` for an unresolvable
+  # NEWER signal below (#763). Both have been flagged as a fail-open hole; both
+  # times it was a false positive, so the invariant is recorded here rather than
+  # re-derived:
+  #
+  #   Skipping a CANDIDATE is conservative. A candidate is a prior AFFIRMATIVE
+  #   verdict; dropping one can only ever REDUCE the chance of carrying forward,
+  #   never clear review that should have been required.
+  #
+  #   The "older clean verdict slips through past a newer CHANGES_REQUESTED"
+  #   scenario is NOT reachable from here. Candidate anchors are matched against
+  #   one resolved commit, but every newer non-affirmative signal — whatever
+  #   commit it anchors to — is re-examined for EVERY surviving candidate in the
+  #   NEWER_SIGNALS loop below, and an unresolvable one there exits 2. That loop,
+  #   not this line, is the latest-signal-wins guard.
+  #
+  #   The asymmetry is load-bearing: candidate anchors are scanned out of
+  #   arbitrary comment text and can legitimately be junk (a malformed or
+  #   truncated sha), so failing closed here would let one bad string in any old
+  #   comment permanently disable carry-forward for the PR. NEWER_SIGNALS is a
+  #   small, safety-critical, machine-generated set where failing closed is right.
   [ -n "$resolved_sha" ] || continue
 
   resolved_lc=$(printf '%s' "$resolved_sha" | tr '[:upper:]' '[:lower:]')
