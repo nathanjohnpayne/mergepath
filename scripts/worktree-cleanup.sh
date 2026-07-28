@@ -339,6 +339,7 @@ worktree_content_state() {
   # spot.
   local sub_probe sub_rc
   set +e
+  # shellcheck disable=SC2016  # intentional: $st/$fl are expanded by the `sh` that `submodule foreach` runs, not here
   sub_probe=$(git -C "$path" submodule foreach --recursive --quiet '
     st=$(git status --porcelain --ignored --untracked-files=all) || exit 1
     fl=$(git ls-files -v) || exit 1
