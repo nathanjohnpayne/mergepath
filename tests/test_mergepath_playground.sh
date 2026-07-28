@@ -143,7 +143,7 @@ node --check "$CHECK_FILE"
 # wiring that lets a runtime fetch re-render without a reload. (The
 # no-new-innerHTML stance is already enforced by the innerHTML scan above.)
 # ---------------------------------------------------------------------------
-grep -qF 'const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/' "$CHECK_FILE" \
+grep -qF 'const REPO_RE = /^(?!\.+\/)[A-Za-z0-9_.-]+\/(?!\.+$)[A-Za-z0-9_.-]+$/' "$CHECK_FILE" \
   || { echo "REPO_RE slug pattern missing/changed (#732)"; exit 1; }
 grep -qF 'repoSlugMaxLen' "$CHECK_FILE" || { echo "slug length cap missing (#732)"; exit 1; }
 grep -qF 'state=closed&per_page=' "$CHECK_FILE" || { echo "PR list request shape missing (#732)"; exit 1; }
@@ -157,6 +157,16 @@ grep -qF 'livePRs ?? (Array.isArray(window.__PRS)' "$CHECK_FILE" \
   || { echo "currentPRs accessor fallback chain missing (#732)"; exit 1; }
 grep -qF 'const prs = currentPRs()' "$CHECK_FILE" \
   || { echo "renderPRs must route through currentPRs() (#732)"; exit 1; }
+grep -qF 'encodeURIComponent(parts[0])' "$CHECK_FILE" && grep -qF 'encodeURIComponent(parts[1])' "$CHECK_FILE" \
+  || { echo "owner/repo must be encodeURIComponent'd before URL interpolation (#732)"; exit 1; }
+# Request timeout (#732 round 2): both the list fetch and the /files fetch
+# must route through the AbortController-backed helper so a hung request
+# can't wedge repoLoadInFlight for the rest of the session.
+grep -qF 'new AbortController()' "$CHECK_FILE" || { echo "AbortController timeout missing (#732)"; exit 1; }
+grep -qF 'signal: controller.signal' "$CHECK_FILE" || { echo "abort signal not wired to fetch (#732)"; exit 1; }
+grep -qF 'repoFetchTimeoutMs' "$CHECK_FILE" || { echo "per-request timeout constant missing (#732)"; exit 1; }
+[[ "$(grep -c 'await fetchWithTimeout(' "$CHECK_FILE")" -eq 2 ]] \
+  || { echo "both list and /files fetches must use fetchWithTimeout (#732)"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Injection round-trip: inject a fake PR payload, confirm marker is consumed
@@ -294,6 +304,7 @@ node "$YAML_HARNESS"
 # pullPublicRepo under the same minimal DOM with a scripted fetch stub:
 #   - slug validation (incl. the length cap) rejects BEFORE any network call
 #   - 404 / rate-limited 403 / network failure surface distinct messages
+#   - dot-only slug segments (../.., ./x, x/., ...) are rejected pre-network
 #   - the happy path filters unmerged PRs, sums additions+deletions across
 #     /files, maps filenames to paths, and honors Authoring-Agent > user.login
 #   - pullPublicRepo announces failures via the live region and leaves the
@@ -301,6 +312,10 @@ node "$YAML_HARNESS"
 # The stub also proves the zero-network base behavior: the page body executes
 # to completion before any response is queued, so an on-load fetch would have
 # thrown and failed the harness.
+# The stub's setTimeout is a no-op (DOM_PRELUDE), so it cannot itself trigger
+# an AbortController timeout cheaply; the request-timeout fix is instead
+# pinned as a source shape above (fetchWithTimeout/AbortController/signal/
+# repoFetchTimeoutMs, both fetch call sites routed through the helper).
 # ---------------------------------------------------------------------------
 LOADER_HARNESS="$TMPDIR_SAFE/loader_harness.mjs"
 
@@ -334,8 +349,14 @@ footer = r'''
 function fail(m){ console.error('public-repo loader: ' + m); process.exit(1); }
 
 // 1. Validation rejects bad slugs BEFORE any network call. The over-long
-//    slug passes REPO_RE, so it exercises the length cap specifically.
-const badSlugs = ['no-slash', 'a b/c', 'own/rep/extra', '../../evil', 'x'.repeat(200) + '/y'];
+//    slug passes REPO_RE, so it exercises the length cap specifically. The
+//    dot-only-segment forms (../.., ./x, x/., a dot-only owner) probe the
+//    traversal fix: a segment made only of dots must be rejected even
+//    though every character in it is individually charset-allowed.
+const badSlugs = [
+  'no-slash', 'a b/c', 'own/rep/extra', '../../evil', 'x'.repeat(200) + '/y',
+  '../..', './x', 'x/.', '.../..', 'x/...',
+];
 for (const bad of badSlugs) {
   let rejected = false;
   try { await loadPublicRepo(bad, 5); } catch (e) { rejected = /owner\/repo/.test(String(e.message)); }

@@ -1153,6 +1153,10 @@
     repoSlugMaxLen: 140,
     repoFetchDefault: 12,
     repoFetchMax: 15,
+    // Per-request timeout (list + each /files call). A hung unauthenticated
+    // request would otherwise leave repoLoadInFlight true forever, wedging
+    // the Load button for the rest of the session.
+    repoFetchTimeoutMs: 10000,
   };
 
   const state = typeof structuredClone === 'function'
@@ -1520,12 +1524,36 @@
   // playground. No PAT/token field, ever: private repos and larger pulls
   // stay on the authenticated scripts/policy-sim.sh path.
   // ---------------------------------------------------------------------
-  const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+  // Each segment must contain at least one non-dot character: a segment made
+  // only of dots (e.g. "..", ".") lets a slug like "../.." pass the charset
+  // check and normalize to an unintended GitHub API path once interpolated.
+  // The negative lookaheads reject a dot-only run up to the "/" (owner) or
+  // end of string (repo) before the charset class is allowed to match it.
+  const REPO_RE = /^(?!\.+\/)[A-Za-z0-9_.-]+\/(?!\.+$)[A-Za-z0-9_.-]+$/;
 
   function rateLimitMsg(res) {
     return res.headers.get('X-RateLimit-Remaining') === '0'
       ? 'GitHub rate limit hit (60/hr unauthenticated). Try later or use policy-sim.sh.'
       : 'GitHub returned 403.';
+  }
+
+  // Wraps fetch with a client-side timeout so a request that never settles
+  // can't wedge repoLoadInFlight (and the Load button) for the rest of the
+  // session. Plain AbortController + setTimeout — no dependency needed. The
+  // timer is always cleared, on both the success and the abort/error path.
+  async function fetchWithTimeout(url, opts) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LIMITS.repoFetchTimeoutMs);
+    try {
+      return await fetch(url, Object.assign({}, opts, { signal: controller.signal }));
+    } catch (e) {
+      if (e && e.name === 'AbortError') {
+        throw new Error('Request timed out after ' + (LIMITS.repoFetchTimeoutMs / 1000) + 's.');
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async function loadPublicRepo(slug, limit) {
@@ -1536,7 +1564,10 @@
     const n = Math.max(1, Math.min(LIMITS.repoFetchMax,
       Number.isFinite(+limit) ? Math.trunc(+limit) : LIMITS.repoFetchDefault));
     const parts = slug.split('/');
-    const owner = parts[0], repo = parts[1];
+    // Percent-encode before URL interpolation, defense-in-depth alongside
+    // REPO_RE (the charset REPO_RE allows needs no encoding today, but this
+    // keeps the interpolation safe independent of the validation regex).
+    const owner = encodeURIComponent(parts[0]), repo = encodeURIComponent(parts[1]);
     const base = 'https://api.github.com';
     const headers = { Accept: 'application/vnd.github+json' };
 
@@ -1546,7 +1577,7 @@
     // candidates (3n, capped at 100 — still ONE list request) and slice the
     // merged results to n, keeping the 1 + at-most-n /files request budget.
     const perPage = Math.min(100, 3 * n);
-    const listRes = await fetch(
+    const listRes = await fetchWithTimeout(
       base + '/repos/' + owner + '/' + repo + '/pulls?state=closed&per_page=' + perPage +
       '&sort=updated&direction=desc',
       { headers });
@@ -1565,7 +1596,7 @@
     // the repo's routing mix.
     const prs = [];
     for (const pr of merged) {
-      const filesRes = await fetch(
+      const filesRes = await fetchWithTimeout(
         base + '/repos/' + owner + '/' + repo + '/pulls/' + pr.number + '/files?per_page=100',
         { headers });
       if (filesRes.status === 403) throw new Error(rateLimitMsg(filesRes));
