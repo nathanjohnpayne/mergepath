@@ -37,7 +37,7 @@ Then follow this procedure:
 
 1. **Stop immediately.** Do not retry the command, do not attempt workarounds (manual token entry, environment variable overrides, fallback credential paths, or skipping the credential step).
 2. **Check if preflight was run.** If `OP_PREFLIGHT_DONE` is not set, suggest running the preflight script:
-   > "1Password auth failed. Would you like to run credential preflight to cache all credentials at once? `eval \"$(scripts/op-preflight.sh --agent claude --mode review)\"`"
+   > "1Password auth failed. Would you like to run credential preflight to cache all credentials at once? `eval \"$(scripts/op-preflight.sh --agent {your-agent} --mode review)\"`"
    >
    > (Use `--mode deploy` or `--mode all` instead if a deploy is in scope; the default is now `review` per nathanjohnpayne/mergepath#282.)
 3. **If preflight was already run** but credentials expired (rare — only after 1Password locks or the 12-hour hard limit), prompt the human and suggest re-running preflight:

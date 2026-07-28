@@ -2,7 +2,8 @@
 # check_doc_ownership
 #
 # Validates the `doc_ownership:` inventory in .mergepath-sync.yml — the
-# exhaustive ownership classification for every docs/agents/*.md file.
+# exhaustive ownership classification for every Markdown file under
+# docs/agents/, including nested instruction directories.
 # See #780 for the design and the decision record it implements.
 #
 # ─────────────────────────────────────────────────────────────────────
@@ -18,7 +19,7 @@
 # name its class. A file with no recorded class cannot be audited, and a
 # file with two implied classes is a contradiction nobody sees.
 #
-# So: every docs/agents/*.md belongs to EXACTLY ONE of canonical /
+# So: every Markdown file under docs/agents/ belongs to EXACTLY ONE of canonical /
 # per-repo-owned / hub-only, declared in `doc_ownership:`. Zero classes
 # and more than one class both fail.
 #
@@ -29,19 +30,20 @@
 #   1. `doc_ownership:` exists and is a YAML list.
 #   2. Every entry has a non-empty `path` and a `class` in the closed set
 #      {canonical, per-repo-owned, hub-only}.
-#   3. Every entry's `path` is a docs/agents/*.md path that EXISTS on
+#   3. Every entry's `path` is a Markdown path under docs/agents/ that EXISTS on
 #      disk (no stale entries for deleted/renamed docs).
 #   4. No path is declared twice — a duplicate is the "more than one
 #      class" case, and two entries agreeing on the class is still an
 #      ambiguity waiting to diverge.
-#   5. Every docs/agents/*.md on disk is declared — the "zero classes"
+#   5. Every Markdown file under docs/agents/ on disk is declared — the "zero classes"
 #      case, and the one that actually happened.
 #   6. `pending_manifest: true` appears only on a `canonical` entry, and
 #      only alongside a non-empty `note:` naming the follow-up.
-#   7. A `canonical` doc is BACKED: it has a `paths:` entry in the same
-#      manifest, or it declares `pending_manifest: true`. A canonical
-#      class with neither is an unbacked claim — the doc never travels,
-#      so consumers silently do not have it.
+#   7. A `canonical` doc is BACKED: it has a fleet-wide (`consumers: all`)
+#      `paths:` entry in the same manifest, or it declares
+#      `pending_manifest: true`. A canonical class with neither is an
+#      unbacked claim — the doc does not travel to the full fleet, so
+#      consumers silently do not have it.
 #   8. A `per-repo-owned` or `hub-only` doc is NOT verbatim-mirrored:
 #      it must not be the path/dest/source of a `type: canonical` or
 #      `type: kit` entry, nor sit inside a kit directory. This is the
@@ -178,6 +180,7 @@ canonical_exact=","
 verbatim_exact=","
 verbatim_kit_dirs=""
 verbatim_repo_root_kit=0
+templated_self_source_exact=","
 if [ -n "$path_rows" ]; then
   while IFS= read -r path_row; do
     [ -z "$path_row" ] && continue
@@ -185,12 +188,16 @@ if [ -n "$path_rows" ]; then
     p_path=$(yq -r '.path // ""' <<< "$path_row")
     p_dest=$(yq -r '.dest // ""' <<< "$path_row")
     p_source=$(yq -r '.source // ""' <<< "$path_row")
+    p_consumers=$(yq -r '(.consumers // "") | tostring' <<< "$path_row")
     [ -z "$p_type$p_path" ] && continue
     n_path=$(mp_normalize_path "$p_path")
     n_dest=$(mp_normalize_path "${p_dest:-$p_path}")
     n_source=$(mp_normalize_path "${p_source:-$p_path}")
-    if [ "$p_type" = "canonical" ]; then
+    if [ "$p_type" = "canonical" ] && [ "$p_consumers" = "all" ]; then
       canonical_exact="${canonical_exact}${n_path},"
+    fi
+    if [ "$p_type" = "templated" ] && [ "$n_source" = "$n_dest" ]; then
+      templated_self_source_exact="${templated_self_source_exact}${n_dest},"
     fi
     if [ "$p_type" = "canonical" ] || [ "$p_type" = "kit" ]; then
       verbatim_exact="${verbatim_exact}${n_path},${n_dest},${n_source},"
@@ -263,9 +270,9 @@ if [ -n "$ownership_rows" ]; then
 
     norm_doc=$(mp_normalize_path "$doc_path")
 
-    # 3a: scope. The inventory is defined over docs/agents/*.md; a path
-    # outside it would create the illusion of coverage the on-disk scan
-    # below never cross-checks.
+    # 3a: scope. The inventory is defined over Markdown files anywhere
+    # under docs/agents/; a path outside it would create the illusion of
+    # coverage the on-disk scan below never cross-checks.
     case "$norm_doc" in
       docs/agents/*.md) ;;
       *)
@@ -309,12 +316,18 @@ if [ -n "$ownership_rows" ]; then
         *",$norm_doc,"*) ;;
         *)
           if [ "$doc_pending" != "true" ]; then
-            echo "FAIL: '$norm_doc' is classified canonical but has no 'type: canonical' paths entry in the manifest — an unbacked canonical claim never propagates verbatim, so consumers silently do not have it. Add a 'type: canonical' paths entry, or declare 'pending_manifest: true' with a note naming the follow-up."
+            echo "FAIL: '$norm_doc' is classified canonical but has no 'type: canonical' paths entry with 'consumers: all' in the manifest — an unbacked or subset-only canonical claim does not propagate verbatim to the full fleet, so consumers silently do not have it. Add a fleet-wide 'type: canonical' paths entry, or declare 'pending_manifest: true' with a note naming the follow-up."
             FAILED=1
           fi
           ;;
       esac
     else
+      case "$templated_self_source_exact" in
+        *",$norm_doc,"*)
+          echo "FAIL: '$norm_doc' is classified $doc_class but is the effective source and destination of a templated manifest entry — rendering a noncanonical document from itself still clobbers each repo's own copy. Use a purpose-built template source outside the destination path, or drop the templated entry."
+          FAILED=1
+          ;;
+      esac
       if hit=$(verbatim_hit "$norm_doc"); then
         echo "FAIL: '$norm_doc' is classified $doc_class but is VERBATIM-mirrored by a canonical/kit manifest entry ($hit) — a verbatim mirror clobbers each repo's own copy on the next propagation wave (the #744 failure). Drop the mirror, or reclassify the doc."
         FAILED=1
@@ -324,13 +337,13 @@ if [ -n "$ownership_rows" ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────
-# 5: every docs/agents/*.md on disk is declared (the "zero classes" case).
+# 5: every Markdown file under docs/agents/ is declared (the "zero classes" case).
 # ─────────────────────────────────────────────────────────────────────
 DOCS_DIR="$REPO_ROOT/docs/agents"
 if [ -d "$DOCS_DIR" ]; then
   while IFS= read -r f; do
     [ -z "$f" ] && continue
-    rel="docs/agents/$(basename "$f")"
+    rel="${f#"$REPO_ROOT"/}"
     case "$declared" in
       *",$rel,"*) ;;
       *)
@@ -341,7 +354,7 @@ if [ -d "$DOCS_DIR" ]; then
     # `find -print` + read is intentional over a glob: it tolerates a
     # missing dir and does not silently yield the literal pattern when
     # nothing matches.
-  done < <(find "$DOCS_DIR" -maxdepth 1 -type f -name '*.md' | LC_ALL=C sort)
+  done < <(find "$DOCS_DIR" -type f -name '*.md' | LC_ALL=C sort)
 fi
 
 # ─────────────────────────────────────────────────────────────────────

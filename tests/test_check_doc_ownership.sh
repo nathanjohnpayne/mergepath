@@ -151,6 +151,22 @@ else
   fail "Case 3 unexpected (rc=$rc): $out"
 fi
 
+# --- Case 2b: nested docs are part of the exhaustive inventory ------
+MANIFEST_NESTED_ZERO="$MIN_HEADER
+paths: []
+doc_ownership:
+  - path: docs/agents/local.md
+    class: per-repo-owned
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_NESTED_ZERO" "$(printf 'docs/agents/local.md\ndocs/agents/security/rules.md')"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "'docs/agents/security/rules.md' has NO ownership class"; then
+  pass "Case 2b: unclassified nested agent doc fails closed"
+else
+  fail "Case 2b unexpected (rc=$rc): $out"
+fi
+
 # --- Case 3b: duplicate with the SAME class still fails -------------
 # Two agreeing entries are an ambiguity waiting to diverge, not a no-op.
 MANIFEST_DUP_SAME="$MIN_HEADER
@@ -234,6 +250,25 @@ if [ "$rc" = "0" ]; then
   pass "Case 7: pending_manifest + note records the debt and passes"
 else
   fail "Case 7 unexpected (rc=$rc): $out"
+fi
+
+# --- Case 6b: subset propagation cannot back canonical ownership ----
+MANIFEST_SUBSET_CANONICAL="$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    type: canonical
+    consumers: [example]
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_SUBSET_CANONICAL" "docs/agents/shared.md"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "has no 'type: canonical' paths entry with 'consumers: all'"; then
+  pass "Case 6b: subset-only path cannot back a fleet-wide canonical doc"
+else
+  fail "Case 6b unexpected (rc=$rc): $out"
 fi
 
 # --- Case 7a2: multiline pending note stays a single ownership row ---
@@ -413,6 +448,46 @@ if [ "$rc" = "1" ] && echo "$out" | grep -q "has no 'type: canonical' paths entr
   pass "Case 8f: canonical doc is not backed by a templated paths entry"
 else
   fail "Case 8f unexpected (rc=$rc): $out"
+fi
+
+# --- Case 8e2: a default self-sourced template still clobbers -------
+MANIFEST_TEMPLATED_SELF_DEFAULT="$MIN_HEADER
+paths:
+  - path: docs/agents/local.md
+    type: templated
+    consumers: all
+doc_ownership:
+  - path: docs/agents/local.md
+    class: per-repo-owned
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_TEMPLATED_SELF_DEFAULT" "docs/agents/local.md"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "effective source and destination of a templated manifest entry"; then
+  pass "Case 8e2: default self-sourced template cannot clobber a per-repo doc"
+else
+  fail "Case 8e2 unexpected (rc=$rc): $out"
+fi
+
+# --- Case 8e3: explicit equivalent self-source is normalized --------
+MANIFEST_TEMPLATED_SELF_EXPLICIT="$MIN_HEADER
+paths:
+  - path: ./docs/agents/local.md
+    dest: docs/agents/local.md
+    source: ./docs/agents/local.md
+    type: templated
+    consumers: all
+doc_ownership:
+  - path: docs/agents/local.md
+    class: hub-only
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_TEMPLATED_SELF_EXPLICIT" "docs/agents/local.md"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "effective source and destination of a templated manifest entry"; then
+  pass "Case 8e3: normalized explicit self-source cannot clobber a hub-only doc"
+else
+  fail "Case 8e3 unexpected (rc=$rc): $out"
 fi
 
 # --- Case 9: entry outside the docs/agents/ scope -------------------

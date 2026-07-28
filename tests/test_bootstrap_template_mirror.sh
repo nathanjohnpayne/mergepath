@@ -616,6 +616,20 @@ else
   fail "verifier should fail on a shared-after-local AGENTS.md; got: $res"
 fi
 
+res=$(verify_case "same-line-wrong-order" 'printf "Read [Local](docs/agents/operating-rules.md), then [Shared](docs/agents/shared-operating-rules.md).\n" > AGENTS.md')
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "BEFORE docs/agents/shared-operating-rules.md"; then
+  pass "verifier compares columns when both AGENTS.md links share a line (#780)"
+else
+  fail "verifier should fail when the local link precedes shared on one line; got: $res"
+fi
+
+res=$(verify_case "same-line-right-order" 'printf "Read [Shared](docs/agents/shared-operating-rules.md), then [Local](docs/agents/operating-rules.md).\n" > AGENTS.md')
+if [ "${res%%|*}" = "0" ]; then
+  pass "verifier accepts shared-before-local links on the same line (#780)"
+else
+  fail "verifier should accept shared-before-local links on one line; got: $res"
+fi
+
 res=$(verify_case "unlinked" 'printf "1. [Local](docs/agents/operating-rules.md)\n" > AGENTS.md')
 if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "does not reference docs/agents/shared-operating-rules.md"; then
   pass "verifier fails closed when AGENTS.md never links the shared rules (#780)"

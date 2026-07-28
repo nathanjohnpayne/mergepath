@@ -734,20 +734,24 @@ bootstrap::_verify_canonical_agent_docs() {
     return 1
   fi
 
-  local shared_line local_line
-  shared_line=$(grep -n -F -m1 'docs/agents/shared-operating-rules.md' "$agents_md" | cut -d: -f1 || true)
-  local_line=$(grep -n -F -m1 'docs/agents/operating-rules.md' "$agents_md" | cut -d: -f1 || true)
+  local shared_pos local_pos shared_line shared_col local_line local_col
+  shared_pos=$(awk -v needle='docs/agents/shared-operating-rules.md' 'index($0, needle) { printf "%d:%d\n", NR, index($0, needle); exit }' "$agents_md" || true)
+  local_pos=$(awk -v needle='docs/agents/operating-rules.md' 'index($0, needle) { printf "%d:%d\n", NR, index($0, needle); exit }' "$agents_md" || true)
 
-  if [ -z "$shared_line" ]; then
+  if [ -z "$shared_pos" ]; then
     bootstrap::err "AGENTS.md does not reference docs/agents/shared-operating-rules.md — the new repo would ship the shared rulebook with nothing pointing at it. Add it to the AGENTS.md reading order at the mergepath source."
     return 1
   fi
-  if [ -z "$local_line" ]; then
+  if [ -z "$local_pos" ]; then
     bootstrap::err "AGENTS.md does not reference docs/agents/operating-rules.md — the new repo would ship the repo-local overlay with nothing pointing at it. Add it to the AGENTS.md reading order after docs/agents/shared-operating-rules.md at the mergepath source."
     return 1
   fi
-  if [ -n "$local_line" ] && [ "$shared_line" -gt "$local_line" ]; then
-    bootstrap::err "AGENTS.md lists docs/agents/operating-rules.md (line $local_line) BEFORE docs/agents/shared-operating-rules.md (line $shared_line) — the shared canonical rules must come first, with the per-repo overlay after. Fix the ordering at the mergepath source."
+  shared_line=${shared_pos%%:*}
+  shared_col=${shared_pos#*:}
+  local_line=${local_pos%%:*}
+  local_col=${local_pos#*:}
+  if [ "$shared_line" -gt "$local_line" ] || { [ "$shared_line" -eq "$local_line" ] && [ "$shared_col" -ge "$local_col" ]; }; then
+    bootstrap::err "AGENTS.md lists docs/agents/operating-rules.md (line $local_line, column $local_col) BEFORE docs/agents/shared-operating-rules.md (line $shared_line, column $shared_col) — the shared canonical rules must come first, with the per-repo overlay after. Fix the ordering at the mergepath source."
     return 1
   fi
 
