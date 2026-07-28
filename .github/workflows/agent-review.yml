@@ -1095,10 +1095,14 @@ jobs:
               # + protected-paths computation as the required check, with
               # the label as a force-on signal and the propagation lane's
               # HEAD-pinned verified marker as the exemption, all evaluated
-              # on the LIVE head. When the required-check gate is disabled,
-              # it additionally requires codex-review-check.sh to confirm
-              # current-head Codex/Phase-4b clearance before returning
-              # true. Label-event proxies (current-label reads,
+              # on the LIVE head. It returns true on the strength of the
+              # merge-clearance gate only when that gate is ENFORCED —
+              # enabled in the governing policy AND observably a required
+              # status check on the PR's base branch (#772; config-enabled
+              # alone is not evidence the gate can hold a merge). Otherwise
+              # — including when enforcement is undeterminable — it requires
+              # codex-review-check.sh to confirm current-head Codex/Phase-4b
+              # clearance before returning true. Label-event proxies (current-label reads,
               # unlabeled-removal overrides) remain rejected: a label event
               # is not head-pinned proof of a downstream gate or clearance.
               # Fail closed: any nonzero exit or unexpected output from the
@@ -2068,9 +2072,10 @@ jobs:
           #    CodeRabbit disposition is stale for the merge head. Abort.
           # 2. Re-run merge-clearance-gate.sh --derive-rate-limit-protection
           #    against the (now-pinned) live head and require `true`: the
-          #    same active-or-already-satisfied external-review protection
-          #    predicate used at rc=5 time. Any error or non-true output
-          #    aborts.
+          #    same enforced-gate-or-already-satisfied external-review
+          #    protection predicate used at rc=5 time (#772 — an ENFORCED
+          #    required check on the base branch, not merely one enabled in
+          #    config). Any error or non-true output aborts.
           if [ "${CR_RATE_LIMIT_DOWNGRADED:-false}" = "true" ]; then
             if [ -z "${CURRENT_HEAD_SHA:-}" ] || [ "$CURRENT_HEAD_SHA" != "$HEAD_SHA" ]; then
               echo "::error::Head drifted after the rc=5 rate-limit downgrade (event=$HEAD_SHA live=${CURRENT_HEAD_SHA:-unset}) — the CodeRabbit disposition is stale for the merge head. Aborting auto-merge."
