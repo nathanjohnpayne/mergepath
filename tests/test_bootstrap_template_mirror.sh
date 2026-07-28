@@ -547,7 +547,8 @@ grep -qF "Project brand vocabulary (bootstrap stub" "$TARGET/README.md" \
   || fail "README.md BRAND.md Key-Files row not rewritten"
 readme_dead=""
 for marker in "playground/index.html" "policy-sim.sh" "Propagation manifest" \
-              "Playground" "umbrella vocabulary"; do
+              "Mergepath Playground" "Playground and reserved slots" \
+              "umbrella vocabulary"; do
   grep -qF "$marker" "$TARGET/README.md" && readme_dead="$readme_dead '$marker'"
 done
 [ -z "$readme_dead" ] \
@@ -559,6 +560,62 @@ grep -qF '| `AGENTS.md` | Instructions for AI agents |' "$TARGET/README.md" \
   && grep -qF '| `ai_agent_tooling_standard.md` | Full repository standard (reference) |' "$TARGET/README.md" \
   && pass "README.md scrub left the shared Key-Files/Directory rows intact" \
   || fail "README.md scrub over-removed shared rows"
+
+# A consumer is allowed to be named "Playground"; the fail-closed marker
+# check must reject hub-only README content, not the consumer's own name.
+pg_target="$WORKDIR/playground-target"
+mkdir -p "$pg_target"
+cat >"$pg_target/README.md" <<'EOF'
+# Playground
+
+**Reference implementation of the AI Agent Tooling Standard.**
+
+Playground is this repository's chosen product name. See [`BRAND.md`](BRAND.md) for the umbrella vocabulary (Playground, Cockpit, Tiebreaker, Checks) and naming history.
+
+## Key Files
+
+| File | Purpose |
+|---|---|
+| `BRAND.md` | Mergepath umbrella vocabulary (surfaces, reserved names, naming history) |
+| `mergepath/playground/index.html` | Mergepath Playground — tune the review policy and replay recent PRs against the draft |
+| `scripts/policy-sim.sh` | Bakes real `gh` PR data into a temp copy of the Mergepath Playground for local replay |
+
+## Directory Structure
+
+| Directory | Purpose |
+|---|---|
+| `mergepath/` | Mergepath Playground and reserved slots for future Mergepath surfaces (see `BRAND.md`) |
+EOF
+set +e
+pg_out=$(bash -c '
+  ROOT="'"$ROOT"'"
+  TARGET="'"$pg_target"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/substitute.sh"
+  . "$ROOT/scripts/bootstrap/template-mirror.sh"
+  set +e
+  bootstrap_input() { echo "playground"; }
+  BOOTSTRAP_DRY_RUN=0
+  BOOTSTRAP_LOG_FILE=""
+  bootstrap::_scaffold_consumer_identity "$TARGET"
+  echo "RC=$?"
+' 2>&1)
+set -e
+echo "$pg_out" | grep -q "RC=0" \
+  && pass "README.md scrub allows a consumer-owned Playground name (rc=0)" \
+  || fail "README.md scrub rejected a consumer-owned Playground name; out: $pg_out"
+grep -qF "# Playground" "$pg_target/README.md" \
+  && grep -qF "Playground is this repository's chosen product name." "$pg_target/README.md" \
+  && pass "README.md scrub preserves consumer-owned Playground text" \
+  || fail "README.md scrub removed consumer-owned Playground text"
+pg_dead=""
+for marker in "playground/index.html" "policy-sim.sh" "Mergepath Playground" \
+              "Playground and reserved slots" "umbrella vocabulary"; do
+  grep -qF "$marker" "$pg_target/README.md" && pg_dead="$pg_dead '$marker'"
+done
+[ -z "$pg_dead" ] \
+  && pass "README.md scrub still removes hub-only Playground markers" \
+  || fail "README.md scrub left hub-only Playground markers:$pg_dead"
 
 # --- assertion 4e: REVIEW_POLICY.md wave-audit reframe (#747) ---
 # The verbatim-copied policy must have the hub-only wave-audit
@@ -638,7 +695,6 @@ hw_out=$(bash -c '
   bootstrap::_scaffold_consumer_identity "$TARGET"
   echo "RC=$?"
 ' 2>&1)
-hw_ec=$?
 set -e
 echo "$hw_out" | grep -q "RC=0" \
   && pass "scaffold helper handles the hard-wrapped fixture (rc=0)" \
@@ -693,7 +749,6 @@ nb_out=$(bash -c '
   bootstrap::_scaffold_consumer_identity "$TARGET"
   echo "RC=$?"
 ' 2>&1)
-nb_ec=$?
 set -e
 echo "$nb_out" | grep -q "RC=0" \
   && pass "scaffold helper handles the no-blank-line-before-heading fixture (rc=0)" \
@@ -994,7 +1049,6 @@ EOF
     bootstrap::_clean_repo_template_yml "$TARGET"
     echo "RC=$?"
   ' 2>&1)
-  no_yq_ec=$?
   set -e
   # The helper should return non-zero (rc=2 per the impl) AND emit a
   # diagnostic mentioning yq.

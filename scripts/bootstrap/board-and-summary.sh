@@ -455,7 +455,7 @@ bootstrap::_print_summary() {
     if [ -n "${BOOTSTRAP_STATE_FILE:-}" ] && [ -s "${BOOTSTRAP_STATE_FILE}.warnings" ]; then
       echo
       echo "  !! RECORDED FAILURES (fix before the first PR):"
-      sed 's/^/  !! - /' "${BOOTSTRAP_STATE_FILE}.warnings"
+      sed 's/^@[^	]*	//; s/^/  !! - /' "${BOOTSTRAP_STATE_FILE}.warnings"
     fi
     echo
     echo "CROSS-REPO LOOP UPDATE:"

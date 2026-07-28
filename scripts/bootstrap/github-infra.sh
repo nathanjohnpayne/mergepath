@@ -86,6 +86,7 @@ BOOTSTRAP_LABELS=(
 # caller vouching for the identity behind it.
 BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT="op://Private/pvbq24vl2h6gl7yjclxy2hbote/token"
 BOOTSTRAP_REVIEWER_PAT_OP_REF="${BOOTSTRAP_REVIEWER_PAT_OP_REF:-$BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT}"
+BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY="reviewer-assignment-token"
 
 bootstrap::stage_github_infra() {
   bootstrap::stage_banner "github-infra"
@@ -168,11 +169,11 @@ bootstrap::stage_github_infra() {
         # `.bootstrap-state.warnings` the moment the stage aborts —
         # a later --resume (or a human auditing the sidecar) has no
         # record the failure ever happened.
-        bootstrap::record_warning "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$step_rc); BOOTSTRAP_STRICT_SECRETS=1 failed the stage — fix and re-run with --resume template-mirror"
+        bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$step_rc); BOOTSTRAP_STRICT_SECRETS=1 failed the stage — fix and re-run with --resume template-mirror"
         bootstrap::_restore_active_if_needed
         return "$step_rc"
       fi
-      bootstrap::record_warning "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$step_rc); workflows will require manual secret-set on first PR"
+      bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$step_rc); workflows will require manual secret-set on first PR"
       step_rc=0
     fi
 
@@ -407,7 +408,7 @@ bootstrap::_provision_reviewer_assignment_token() {
       bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: NO PAT available and prompts are skipped — secret NOT set on $full_repo"
       bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: reviewer-assignment / agent-review workflows WILL FAIL on the first PR until it is set"
       bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: fix: printf '%s' \"\$OP_PREFLIGHT_REVIEWER_PAT\" | scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo $full_repo" # NO_BARE_GH_WRITE_EXEMPT: remediation hint echoed to the operator (routed through the token-verifying author wrapper), not an executed gh write
-      bootstrap::record_warning "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (no PAT available, prompts skipped) — set it manually before the first PR"
+      bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (no PAT available, prompts skipped) — set it manually before the first PR"
       if [ "${BOOTSTRAP_STRICT_SECRETS:-0}" = "1" ]; then
         return 1
       fi
@@ -421,7 +422,7 @@ bootstrap::_provision_reviewer_assignment_token() {
     read -r -s -p "Paste the PAT (input hidden, blank to skip): " pat
     echo
     if [ -z "$pat" ]; then
-      bootstrap::record_warning "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (human declined to provide a PAT) — set it manually before the first PR"
+      bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (human declined to provide a PAT) — set it manually before the first PR"
       if [ "${BOOTSTRAP_STRICT_SECRETS:-0}" = "1" ]; then
         return 1
       fi
@@ -466,6 +467,7 @@ bootstrap::_provision_reviewer_assignment_token() {
     bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: secret set failed (rc=$set_rc)"
     return "$set_rc"
   fi
+  bootstrap::clear_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY"
   bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN set on $full_repo (len=${#pat})"
 }
 

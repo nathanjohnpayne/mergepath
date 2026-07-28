@@ -111,7 +111,7 @@ For runtime application secrets in newly bootstrapped repos, do not add Secure N
 
 All write-path `gh` calls run under the author identity (`nathanjohnpayne`) through token-verifying helpers. Stage B/C/E live writes use `scripts/gh-as-author.sh` per command, so the machine-global gh account selection is not read or changed for attribution.
 
-**Failure recovery.** Hard failures on `gh repo create` are fatal (stage returns non-zero, state file omits the entry). Secret-provision failures are recorded-but-not-fatal by default: workflows will fail loudly on the first PR if the token isn't set, and the miss is persisted to `<target>/.bootstrap-state.warnings` and re-surfaced in the end-of-run summary's `!! RECORDED FAILURES` block so it can't ship unnoticed (#734). Set `BOOTSTRAP_STRICT_SECRETS=1` to upgrade the miss to a fatal stage failure instead — the failure is still recorded to the warnings sidecar before the stage aborts.
+**Failure recovery.** Hard failures on `gh repo create` are fatal (stage returns non-zero, state file omits the entry). Secret-provision failures are recorded-but-not-fatal by default: workflows will fail loudly on the first PR if the token isn't set, and the miss is persisted to `<target>/.bootstrap-state.warnings` and re-surfaced in the end-of-run summary's `!! RECORDED FAILURES` block so it can't ship unnoticed (#734). Set `BOOTSTRAP_STRICT_SECRETS=1` to upgrade the miss to a fatal stage failure instead — the failure is still recorded to the warnings sidecar before the stage aborts. A later successful `REVIEWER_ASSIGNMENT_TOKEN` retry clears that token-specific recorded failure before the final summary, while unrelated recorded failures remain visible.
 
 ### Stage D: firebase-and-codereview (#206 / sub-D)
 
@@ -189,7 +189,7 @@ Per stage, the most common failures and their recovery paths:
 
 - **`gh repo create` fails**: usually a name collision or auth scope issue. Stage fails, state file omits the entry. Re-run with `--resume template-mirror` after fixing.
 - **Label / invite failures**: per-label / per-invite are warn-not- fatal; the loop continues. The summary surfaces the gaps.
-- **Secret-set failures**: recorded-but-not-fatal by default. The miss is logged at ERROR level with the remediation command, persisted to `<target>/.bootstrap-state.warnings`, and re-surfaced in the end-of-run summary's `!! RECORDED FAILURES` block so it cannot ship unnoticed (#734). Set `BOOTSTRAP_STRICT_SECRETS=1` to fail the stage instead.
+- **Secret-set failures**: recorded-but-not-fatal by default. The miss is logged at ERROR level with the remediation command, persisted to `<target>/.bootstrap-state.warnings`, and re-surfaced in the end-of-run summary's `!! RECORDED FAILURES` block so it cannot ship unnoticed (#734). Set `BOOTSTRAP_STRICT_SECRETS=1` to fail the stage instead. A successful later `REVIEWER_ASSIGNMENT_TOKEN` setup resolves the prior token warning so the summary does not report a fixed failure.
 
 ### Stage D (firebase-and-codereview)
 

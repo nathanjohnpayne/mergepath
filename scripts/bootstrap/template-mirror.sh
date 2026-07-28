@@ -553,7 +553,8 @@ EOF
       'Reference implementation of the AI Agent Tooling Standard' \
       'playground/index.html' \
       'policy-sim.sh' \
-      'Playground' \
+      'Mergepath Playground' \
+      'Playground and reserved slots' \
       'umbrella vocabulary' \
       'Propagation manifest'; do
       if grep -qF "$readme_marker" "$readme.bootstrap-tmp"; then
