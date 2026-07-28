@@ -1012,6 +1012,98 @@ else
   fail "Case 35 unexpected (rc=$rc): $out"
 fi
 
+# --- canonical agent-docs propagation contract (#770/#771) -----------
+#
+# Unlike every case above, these two read the LIVE manifest and the LIVE
+# docs. They guard a contract no fixture can express: that the canonical
+# `docs/agents/*.md` convention docs are actually declared, and that each
+# one stays TRUE verbatim on a consumer.
+#
+# Gated on POSITIVE proof that this is a mergepath checkout — the live
+# manifest AND the never-propagated sync engine both present, the same
+# marker pair check_sync_manifest itself uses. Anything else skips: the
+# suite is hub-only (it is on check_propagation_closure's ALLOW_LIST),
+# so a checkout without both markers cannot satisfy these assertions and
+# must not be failed for it.
+LIVE_MANIFEST="$ROOT/.mergepath-sync.yml"
+LIVE_MARKER="$ROOT/scripts/sync-to-downstream.sh"
+if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
+
+  # Case 36: docs/agents/decision-records.md is declared canonical/all.
+  # The decision-records convention (#770 change-level "## Path taken"
+  # records + #771 issue-level decision callouts) is only a fleet
+  # convention if it actually travels; a silent manifest drop would
+  # leave mergepath following a rule no consumer ever receives.
+  DR_PATH="docs/agents/decision-records.md"
+  set +e
+  dr_rows=$(yq -r "
+    .paths[]
+    | select(.path == \"$DR_PATH\")
+    | (.type // \"null\") + \"|\" + (.consumers | (select(tag == \"!!str\") // (join(\",\"))) | tostring)
+  " "$LIVE_MANIFEST"); rc=$?
+  set -e
+  if [ "$rc" = "0" ] && [ "$dr_rows" = "canonical|all" ]; then
+    pass "Case 36: live manifest declares $DR_PATH canonical/all (#770/#771)"
+  else
+    fail "Case 36: expected 'canonical|all' for $DR_PATH, got (rc=$rc) '$dr_rows'"
+  fi
+
+  # Case 37: every canonical docs/agents/*.md entry is consumer-truthful.
+  #
+  # A canonical doc is copied VERBATIM, so a sentence that is true on
+  # mergepath and false downstream ships as a false claim to every
+  # consumer — the #744/#746 trap. Two mechanical tells:
+  #
+  #   (a) a bare `#NN` issue reference. GitHub resolves it against the
+  #       repo it is rendered in, so on a consumer it silently points at
+  #       that repo's own issue #NN. The cross-repo `owner/repo#NN` form
+  #       (already used in REVIEW_POLICY.md and bootstrap-runbook.md) and
+  #       full URLs are unambiguous everywhere; the pattern below
+  #       deliberately does not match them, nor `#issuecomment-<id>`.
+  #   (b) a reference to hub-only machinery — the propagation manifest,
+  #       the sync engine, the wave audit, the bootstrap seeders, the
+  #       weekly sweep, or the three hub-only machinery docs. None of
+  #       these exist in a consumer checkout, so naming them as
+  #       something the reader can run or read is false there.
+  BARE_ISSUE_RE='(^|[^A-Za-z0-9_/-])#[0-9]+'
+  HUB_ONLY_RE='\.mergepath-sync\.yml|sync-to-downstream\.sh|wave-audit\.sh|scripts/bootstrap/|sweep-unresolved-feedback|docs/agents/(bootstrap-runbook|propagation-ordering|templated-propagation)\.md'
+  set +e
+  canon_docs=$(yq -r '.paths[] | select(.type == "canonical") | .path' "$LIVE_MANIFEST" \
+    | grep -E '^docs/agents/.*\.md$'); rc=$?
+  set -e
+  docs_bad=""
+  docs_seen=0
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    docs_seen=$((docs_seen + 1))
+    if [ ! -f "$ROOT/$d" ]; then
+      docs_bad="$docs_bad
+  $d: declared canonical but missing on disk"
+      continue
+    fi
+    if hits=$(grep -nE "$BARE_ISSUE_RE" "$ROOT/$d"); then
+      docs_bad="$docs_bad
+  $d: bare issue reference (use owner/repo#NN or a full URL):
+$hits"
+    fi
+    if hits=$(grep -nE "$HUB_ONLY_RE" "$ROOT/$d"); then
+      docs_bad="$docs_bad
+  $d: names hub-only machinery a consumer does not have:
+$hits"
+    fi
+  done <<< "$canon_docs"
+  if [ "$rc" != "0" ] || [ "$docs_seen" -eq 0 ]; then
+    fail "Case 37: no canonical docs/agents/*.md entries found in the live manifest (rc=$rc)"
+  elif [ -n "$docs_bad" ]; then
+    fail "Case 37: canonical agent doc(s) not true verbatim downstream (#744/#746):$docs_bad"
+  else
+    pass "Case 37: all $docs_seen canonical docs/agents/*.md entries are consumer-truthful"
+  fi
+
+else
+  echo "SKIP: Cases 36-37 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+fi
+
 echo
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -gt 0 ]; then

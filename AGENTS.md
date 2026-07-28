@@ -11,6 +11,7 @@ Agent instructions are organized into focused sub-files under `docs/agents/`. Re
 5. **[Testing Requirements](docs/agents/testing-requirements.md)** --- Coverage expectations, test deletion policy
 6. **[Deployment Process](docs/agents/deployment-process.md)** --- Build/deploy flow, 1Password-backed auth
 7. **[Worktree Placement](docs/agents/worktree-placement.md)** --- Where agent-created worktrees/checkouts live on disk (synced canonical convention)
+8. **[Decision Records](docs/agents/decision-records.md)** --- Recording the path taken when a PR reverses direction, and surfacing a comment-recorded decision from the issue body (synced canonical convention)
 
 ## Repository Layout
 
