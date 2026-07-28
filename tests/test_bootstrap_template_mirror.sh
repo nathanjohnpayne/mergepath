@@ -242,7 +242,20 @@ echo "canonical-mirror audit test (hub-only)" >"$FAKE_MP/tests/test_audit_canoni
 # cron driver) - mergepath-only; the engine + manifest are also the
 # consumer-vs-mergepath markers the propagated scripts/ci/check_* wrappers key
 # off, and weekly-drift-audit.yml is the hub-only cron that runs the engine.
-echo "version: 1" >"$FAKE_MP/.mergepath-sync.yml"
+cat >"$FAKE_MP/.mergepath-sync.yml" <<'EOF'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/shared-operating-rules.md
+    class: canonical
+  - path: docs/agents/worktree-placement.md
+    class: canonical
+  - path: docs/agents/future-rule.md
+    class: canonical
+    pending_manifest: true
+    note: deliberately not required until its backing path lands
+EOF
 echo "sync engine" >"$FAKE_MP/scripts/sync-to-downstream.sh"
 echo "sync engine test" >"$FAKE_MP/tests/test_sync_to_downstream.sh"
 echo "name: weekly-drift-audit" >"$FAKE_MP/.github/workflows/weekly-drift-audit.yml"
@@ -575,9 +588,11 @@ fi
 # pass silently — a verifier that never returns non-zero is not a guard.
 VERIFY_LIB="$ROOT/scripts/bootstrap/template-mirror.sh"
 verify_case() {
-  # $1 = scenario label, $2 = mutation shell snippet run against $vt
-  local mutate="$2" vt rc out
+  # $1 = scenario label, $2 = target mutation, $3 = optional source-manifest mutation
+  local mutate="$2" source_mutate="${3:-:}" vt source rc out
   vt="$(mktemp -d "$WORKDIR/verify.XXXXXX")"
+  source="$(mktemp -d "$WORKDIR/verify-source.XXXXXX")"
+  cp "$FAKE_MP/.mergepath-sync.yml" "$source/.mergepath-sync.yml"
   mkdir -p "$vt/docs/agents"
   : > "$vt/docs/agents/decision-records.md"
   : > "$vt/docs/agents/shared-operating-rules.md"
@@ -585,13 +600,14 @@ verify_case() {
   : > "$vt/docs/agents/operating-rules.md"
   printf '1. [Shared](docs/agents/shared-operating-rules.md)\n2. [Local](docs/agents/operating-rules.md)\n' > "$vt/AGENTS.md"
   ( cd "$vt" && eval "$mutate" )
+  ( cd "$source" && eval "$source_mutate" )
   set +e
   out=$(bash -c '
     bootstrap::log() { :; }
     bootstrap::err() { echo "ERR: $*"; }
     source "$1"
-    bootstrap::_verify_canonical_agent_docs "$2"
-  ' _ "$VERIFY_LIB" "$vt" 2>&1)
+    bootstrap::_verify_canonical_agent_docs "$2" "$3"
+  ' _ "$VERIFY_LIB" "$vt" "$source" 2>&1)
   rc=$?
   set -e
   printf '%s|%s' "$rc" "$out"
@@ -601,6 +617,13 @@ res=$(verify_case "control" ":")
 [ "${res%%|*}" = "0" ] \
   && pass "verifier control: an intact tree passes (#780)" \
   || fail "verifier control unexpectedly failed: ${res#*|}"
+
+res=$(verify_case "derived-required-set" ":" 'yq -i '\''.doc_ownership += [{"path":"docs/agents/new-canonical.md","class":"canonical"}]'\'' .mergepath-sync.yml')
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "docs/agents/new-canonical.md"; then
+  pass "verifier derives newly backed canonical docs from the source manifest (#780)"
+else
+  fail "verifier should require a newly backed canonical doc without a copied array update; got: $res"
+fi
 
 res=$(verify_case "missing-doc" 'rm docs/agents/shared-operating-rules.md')
 if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "canonical agent docs missing"; then

@@ -194,7 +194,10 @@ if [ -n "$path_rows" ]; then
     n_dest=$(mp_normalize_path "${p_dest:-$p_path}")
     n_source=$(mp_normalize_path "${p_source:-$p_path}")
     if [ "$p_type" = "canonical" ] && [ "$p_consumers" = "all" ]; then
-      canonical_exact="${canonical_exact}${n_path},"
+      # Ownership names the document path that exists in each consumer.
+      # Propagation writes to the effective destination (`dest // path`),
+      # so a remapped entry backs that destination, never its source path.
+      canonical_exact="${canonical_exact}${n_dest},"
     fi
     if [ "$p_type" = "templated" ] && [ "$n_source" = "$n_dest" ]; then
       templated_self_source_exact="${templated_self_source_exact}${n_dest},"

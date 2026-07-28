@@ -11,6 +11,12 @@ Feature: honest consumer identity in bootstrapped repos. Stage B of `scripts/boo
 - `ai_agent_tooling_standard.md` is kept: it is the methodology-neutral Standard the consumer follows, correctly names mergepath as the reference implementation, is not name-substituted, and is link-targeted by `README.md` / `.ai_context.md`.
 - The `AGENTS.md` "## Repository Layout" section — which exists solely to justify the mergepath-only `packaging/` dir, excluded from every consumer — is removed; the sections on either side of it survive.
 
+### Canonical agent docs delivered and ordered (#780)
+
+- After the identity scaffold finishes, Stage B derives the complete required agent-doc set from the source `.mergepath-sync.yml`: every `doc_ownership` entry with `class: canonical` whose `pending_manifest` flag is not true. The required set is not duplicated in bootstrap code, so backing a pending canonical doc makes it required on the next bootstrap run automatically.
+- Every derived canonical agent doc must exist in the mirrored target. This is a positive post-rsync assertion that a future exclude pattern cannot silently strip a fleet-wide rulebook.
+- The target `AGENTS.md` must reference `docs/agents/shared-operating-rules.md` before `docs/agents/operating-rules.md`. Ordering compares both line and column, so two links on one physical line cannot bypass the shared-before-local invariant.
+
 ### README.md hub-identity scrub (#747)
 
 - The name-substituted `README.md` has its "Reference implementation of the AI Agent Tooling Standard" tagline replaced with honest downstream-consumer framing that links the hub (the file's single intentional `mergepath` reference).
@@ -33,6 +39,7 @@ Feature: honest consumer identity in bootstrapped repos. Stage B of `scripts/boo
 
 - Every scrub is marker-gated: when the doc no longer carries the expected marker (reshaped upstream, or absent from the target), the transform is a no-op and the file is left untouched — no blind edits.
 - Inside a gate, the step fails closed (non-zero return; stage B aborts and the stage is NOT recorded as completed, so `--resume` retries it) whenever a hub marker survives the transform in a form it no longer matches: the `AGENTS.md` packaging note, any `README.md` hub marker (reference-implementation claim, playground / policy-sim / Playground / umbrella-vocabulary / propagation-manifest strings), the `REVIEW_POLICY.md` wave-audit marker, a missed consumer-note insertion, or (when the source doc had one) a vanished adjacent Phase 4 heading — the concrete check that the wave-audit paragraph consumer didn't over-consume into the next section.
+- Stage B also fails closed when the source manifest cannot supply a valid, non-empty canonical agent-doc set, when any required canonical agent doc is absent from the target, or when the target `AGENTS.md` omits or misorders the shared and local operating-rule links.
 - All rewrites go through a temp file that is discarded on failure — a failed scrub never leaves a half-written doc in the target.
 
 ## Non-goals

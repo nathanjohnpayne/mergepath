@@ -215,25 +215,6 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   '.bootstrap-state'
 )
 
-# Canonical agent docs a NEW repo must come out of bootstrap carrying
-# (#780). These are `class: canonical` in .mergepath-sync.yml's
-# doc_ownership inventory: one source of truth on the hub, mirrored
-# verbatim, written to be true in every repo that receives them. The
-# rsync above already copies them (they are not excluded), so this list
-# is a POSITIVE assertion, not a delivery mechanism — it exists so a
-# future exclude-pattern change cannot silently strip a shared rulebook
-# out of every repo bootstrapped afterwards. The failure it guards
-# against is invisible at bootstrap time and only shows up as an agent
-# in a new repo that has never read the shared rules.
-#
-# Keep in sync with the `class: canonical` entries in the manifest's
-# doc_ownership block.
-BOOTSTRAP_REQUIRED_CANONICAL_AGENT_DOCS=(
-  'docs/agents/decision-records.md'
-  'docs/agents/shared-operating-rules.md'
-  'docs/agents/worktree-placement.md'
-)
-
 # Files that rsync leaves behind because they don't match an exclude
 # pattern but shouldn't ship to a new repo. Post-mirror cleanup.
 BOOTSTRAP_POST_MIRROR_REMOVE=(
@@ -324,7 +305,7 @@ bootstrap::stage_template_mirror() {
   # docs and reads the shared rules ahead of its local overlay (#780).
   # Runs AFTER the identity scaffold because that step rewrites
   # AGENTS.md, and the ordering assertion must see the final file.
-  bootstrap::_verify_canonical_agent_docs "$target" || step_rc=$?
+  bootstrap::_verify_canonical_agent_docs "$target" "$source_root" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
     bootstrap::err "template-mirror: canonical agent-doc verification failed (rc=$step_rc); aborting stage"
     return "$step_rc"
@@ -696,9 +677,12 @@ EOF
 #
 # Two assertions, both fail-closed:
 #
-#   1. Every BOOTSTRAP_REQUIRED_CANONICAL_AGENT_DOCS file landed. The
-#      rsync copies them by default, so a failure here means someone
-#      added an exclude pattern that swallows a canonical doc.
+#   1. Every backed `class: canonical` agent doc in the SOURCE manifest
+#      landed. The required set is derived on every run rather than
+#      copied into this script, so backing a pending document expands the
+#      bootstrap assertion automatically. The rsync copies them by
+#      default, so a failure here means someone added an exclude pattern
+#      that swallows a canonical doc.
 #   2. AGENTS.md references docs/agents/shared-operating-rules.md, and
 #      does so BEFORE its reference to docs/agents/operating-rules.md.
 #      The order is the point: the shared file is the fleet-wide core
@@ -713,16 +697,42 @@ EOF
 # unambiguous.
 bootstrap::_verify_canonical_agent_docs() {
   local target=$1
+  local source_root=${2:-${BOOTSTRAP_MERGEPATH_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}
 
   if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
     bootstrap::log "dry-run: would verify the canonical agent docs landed in $target and that AGENTS.md reads the shared operating rules before the local overlay"
     return 0
   fi
 
+  local manifest="$source_root/.mergepath-sync.yml"
+  if [ ! -f "$manifest" ]; then
+    bootstrap::err "source .mergepath-sync.yml missing; cannot derive the canonical agent-doc set"
+    return 1
+  fi
+  if ! command -v yq >/dev/null 2>&1; then
+    bootstrap::err "yq is required to derive canonical agent docs from .mergepath-sync.yml"
+    return 2
+  fi
+  if ! yq -e '.doc_ownership | tag == "!!seq"' "$manifest" >/dev/null 2>&1; then
+    bootstrap::err "source .mergepath-sync.yml has no valid doc_ownership list; cannot verify canonical agent docs"
+    return 1
+  fi
+
+  local canonical_docs
+  if ! canonical_docs=$(yq -r '.doc_ownership[] | select(.class == "canonical" and ((.pending_manifest // false) != true)) | .path' "$manifest" 2>&1); then
+    bootstrap::err "could not derive canonical agent docs from source .mergepath-sync.yml: $canonical_docs"
+    return 1
+  fi
+  if [ -z "$canonical_docs" ]; then
+    bootstrap::err "source .mergepath-sync.yml declares no backed canonical agent docs; refusing a vacuous bootstrap verification"
+    return 1
+  fi
+
   local missing="" doc
-  for doc in "${BOOTSTRAP_REQUIRED_CANONICAL_AGENT_DOCS[@]}"; do
+  while IFS= read -r doc; do
+    [ -n "$doc" ] || continue
     [ -f "$target/$doc" ] || missing="$missing $doc"
-  done
+  done <<< "$canonical_docs"
   if [ -n "$missing" ]; then
     bootstrap::err "canonical agent docs missing from the mirrored repo:$missing — these are 'class: canonical' in .mergepath-sync.yml's doc_ownership inventory and every new repo must carry them. Check BOOTSTRAP_MIRROR_EXCLUDES for a pattern that swallows them."
     return 1

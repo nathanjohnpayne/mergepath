@@ -271,6 +271,26 @@ else
   fail "Case 6b unexpected (rc=$rc): $out"
 fi
 
+# --- Case 6c: backing follows the effective destination -------------
+MANIFEST_CANONICAL_WRONG_DEST="$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    dest: docs/shared.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_CANONICAL_WRONG_DEST" "$(printf 'docs/agents/shared.md\ndocs/shared.md')"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "has no 'type: canonical' paths entry with 'consumers: all'"; then
+  pass "Case 6c: canonical source remapped elsewhere does not back the owned destination"
+else
+  fail "Case 6c unexpected (rc=$rc): $out"
+fi
+
 # --- Case 7a2: multiline pending note stays a single ownership row ---
 MANIFEST_PENDING_MULTILINE="$MIN_HEADER
 paths: []
