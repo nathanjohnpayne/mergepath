@@ -1381,6 +1381,40 @@ for workflow in .github/workflows/agent-review.yml .github/workflows/pr-audit.ym
 done
 
 echo
+echo "agent-review.yml whole-file YAML parse (#754)"
+
+# Everything above exercises agent-review.yml's CONTENT (extracted blocks,
+# greps), and every `run:` block already gets a bash -n sweep in
+# tests/test_655_repo_lint_local_observed.sh — but nothing asserted the
+# file parses as YAML at all. GitHub Actions rejects an unparseable
+# workflow only at schedule time, so a syntactically-broken edit would land
+# green and surface on the next PR. Same tiered-parser idiom as
+# scripts/ci/check_auto_clear_workflow: yq (present on GitHub-hosted
+# runners) → python3+PyYAML → graceful skip, never a hard dependency.
+agent_review_yaml=".github/workflows/agent-review.yml"
+if command -v yq >/dev/null 2>&1; then
+  if yq eval '.' "$agent_review_yaml" >/dev/null 2>&1; then
+    pass=$((pass + 1))
+    echo "  PASS: agent-review.yml parses as YAML (via yq)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: agent-review.yml is not valid YAML (per yq)" >&2
+  fi
+elif python3 -c "import yaml" >/dev/null 2>&1; then
+  # Path passed via argv, not interpolated into the Python source literal
+  # (same hardening as check_auto_clear_workflow).
+  if python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$agent_review_yaml" 2>/dev/null; then
+    pass=$((pass + 1))
+    echo "  PASS: agent-review.yml parses as YAML (via python+PyYAML)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: agent-review.yml is not valid YAML (per python+PyYAML)" >&2
+  fi
+else
+  echo "  SKIP: no YAML parser available (install yq or PyYAML for this check)"
+fi
+
+echo
 if [ "$fail" -gt 0 ]; then
   echo "check_workflow_parsers: $fail FAIL / $pass PASS" >&2
   exit 1
