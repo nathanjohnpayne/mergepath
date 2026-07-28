@@ -413,8 +413,39 @@ merge_clearance_check_enforced() {
   # concatenates with `add`; `objects` keeps a non-object page element (an
   # error envelope on a partial-failure page) from hard-erroring the filter
   # mid-stream.
+  #
+  # $BASE_REF is percent-encoded before interpolation. A branch name is far
+  # more permissive than a URL path segment: `#` truncates the request at a
+  # fragment (querying `.../rules/branches/feat` for a base ref `feat#2`), `%`
+  # can form an accidental escape, and `?` starts a query string — each
+  # silently reads a DIFFERENT branch's rules, or none, and an empty result is
+  # indistinguishable from "not enforced". On a ruleset-only repo the classic
+  # GraphQL surface cannot compensate, so a genuinely enforced gate would be
+  # reported unproven and the rate-limit path would block unnecessarily.
+  # `/` is deliberately left RAW: GitHub addresses nested branch names
+  # (`release/1.0`) with literal slashes in this endpoint's `{branch}`
+  # parameter, so encoding it as %2F would break the common case to guard the
+  # rare one (#772 r1 P2).
+  local base_ref_enc
+  base_ref_enc=$(printf '%s' "$BASE_REF" | LC_ALL=C awk '
+    BEGIN { for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i }
+    {
+      out = ""
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (c ~ /[A-Za-z0-9._~\/-]/) out = out c
+        else out = out sprintf("%%%02X", ord[c])
+      }
+      printf "%s", out
+    }')
+  if [ -z "$base_ref_enc" ]; then
+    log "enforcement probe: could not encode base ref '$BASE_REF' for the ruleset URL — treating '$MERGE_CLEARANCE_CHECK_NAME' as NOT enforced"
+    rm -f "$err"
+    return 1
+  fi
   set +e
-  out=$(gh api --paginate "repos/$REPO/rules/branches/$BASE_REF" 2>"$err")
+  out=$(gh api --paginate "repos/$REPO/rules/branches/$base_ref_enc" 2>"$err")
   rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then

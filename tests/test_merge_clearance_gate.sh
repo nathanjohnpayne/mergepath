@@ -1476,6 +1476,46 @@ else
   fail "protection: paginated ruleset expected true/0; got rc=$RC out='$OUT'"
 fi
 
+echo; echo "--- Protection 1h (#772 review): a URL-significant base ref is percent-encoded in the ruleset URL"
+# A branch name permits characters a URL path segment does not. `#` truncates
+# the request at a fragment, so `feat#2` would query `.../rules/branches/feat`
+# — a DIFFERENT branch, whose empty result is indistinguishable from "not
+# enforced". On a ruleset-only repo the classic surface cannot compensate, so
+# a genuinely enforced gate reads as unproven. `/` must stay raw: GitHub
+# addresses nested branch names with literal slashes in this endpoint.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone" '[]' 'feat#2' 'feat#2')
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+# run_gate pins GH_CALLS_LOG to this path, so truncate it and read it back
+# rather than trying to override the variable from out here.
+ENC_LOG="$WORKDIR/gh-calls.log"
+: >"$ENC_LOG"
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if grep -q 'rules/branches/feat%232' "$ENC_LOG"; then
+  pass "protection: URL-significant base ref percent-encoded in the ruleset path (feat#2 → feat%232)"
+else
+  fail "protection: ruleset URL not percent-encoded; log had: $(grep -o 'rules/branches/[^[:space:]]*' "$ENC_LOG" | head -1)"
+fi
+if grep -q 'rules/branches/feat[^%]' "$ENC_LOG"; then
+  fail "protection: raw '#' reached the ruleset URL — the request would truncate at a fragment"
+else
+  pass "protection: no raw fragment-truncating base ref reached the ruleset URL"
+fi
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "protection: enforced gate on a URL-significant base ref still resolves to true"
+else
+  fail "protection: URL-significant base ref expected true/0; got rc=$RC out='$OUT'"
+fi
+
 echo; echo "--- Protection 2 (#713): gate disabled + protected path + Phase-4b/Codex cleared → true"
 SCRATCH=$(make_scratch false false)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
