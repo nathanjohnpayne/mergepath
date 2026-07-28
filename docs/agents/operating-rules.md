@@ -105,7 +105,7 @@ Before an agent session goes idle, implementation-ready work must end in one of 
 
 Worktrees created for a task must be removed immediately after the corresponding branch is merged or deleted from the remote. Never leave a worktree checked out for a branch that is `[gone]` on the remote. Stale worktrees confuse branch/HEAD reasoning, leave dead generated artifacts around, and increase the chance an agent validates or runs commands from a dead branch.
 
-**After a merge or branch delete**, run `scripts/worktree-cleanup.sh` (dry-run) to audit stale worktrees and `scripts/worktree-cleanup.sh --apply` to remove safe candidates. The helper identifies four classes of stale state:
+**After a merge or branch delete**, run `scripts/worktree-cleanup.sh` (dry-run) to audit stale worktrees and `scripts/worktree-cleanup.sh --apply` to remove safe candidates. It is mergepath's implementation of the PR-state-aware cleanup tooling the placement convention anticipates: it parses the `pr-<number>` slug prefix from hidden-folder checkouts (`~/GitHub/.mergepath-worktrees/pr-<n>[-desc]`) to cross-check PR state, so correctly-slugged stale checkouts for closed/merged PRs become auto-removable. The helper identifies four classes of stale state:
 
 - worktrees whose branch upstream is `[gone]` (the branch was deleted upstream);
 - detached `mergepath-pr-*` worktrees whose corresponding PR is closed/merged (cross-checked via `gh pr view`);
