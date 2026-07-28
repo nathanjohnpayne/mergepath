@@ -675,7 +675,7 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
         else
           echo "    reason:   uncommitted or untracked content (or an unreadable status) — removing the worktree would destroy work that exists nowhere else; commit, stash, or discard it by hand first"
         fi
-        SUMMARY_DIRTY_KEPT+=("$WT_PATH ($WT_BRANCH [gone], $wt_state)")
+        SUMMARY_UNCLEAN_KEPT+=("$WT_PATH ($WT_BRANCH [gone], $wt_state)")
         continue
       fi
     fi

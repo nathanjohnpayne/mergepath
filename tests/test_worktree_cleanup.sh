@@ -1185,6 +1185,17 @@ else
   fail "DATA LOSS: --apply deleted an edit hidden by assume-unchanged in $FLAG_PR_WT"
   echo "$OUT2" >&2
 fi
+# The retained gone-upstream worktree must also be COUNTED. It previously
+# appended to an undeclared SUMMARY_DIRTY_KEPT while the summary and
+# total_candidates accounting read SUMMARY_UNCLEAN_KEPT, so the record was
+# printed but the audit exited as if nothing needed a human (Phase 4b P1).
+UNCLEAN_N=$(echo "$OUT3" | sed -n 's/.*unclean PR worktrees (review): *\([0-9][0-9]*\).*/\1/p' | head -1)
+if [ "${UNCLEAN_N:-0}" -eq 6 ]; then
+  pass "retained gone-upstream PR-slug worktree is counted in the unclean bucket"
+else
+  fail "unclean-bucket count is ${UNCLEAN_N:-unset}, expected 6 (every retained-unclean fixture, including the gone-upstream PR-slug one) — a retained worktree is landing in an uncounted bucket"
+  echo "$OUT3" | grep -E "unclean PR worktrees" >&2
+fi
 if [ -f "$GONE_PR_CANARY" ] && grep -q "nowhere else" "$GONE_PR_CANARY"; then
   pass "gone-upstream PR-slug canary survived --apply"
 else
