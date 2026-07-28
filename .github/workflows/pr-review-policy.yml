@@ -263,28 +263,82 @@ jobs:
             exit 0
           fi
 
-          TRUSTED_BASE_TREE=$(mktemp -d)
-          cleanup_trusted_base_tree() {
-            git worktree remove --force "$TRUSTED_BASE_TREE" >/dev/null 2>&1 || rm -rf "$TRUSTED_BASE_TREE"
+          # Materialize the trusted trees. Neither the helper nor the config may
+          # come from the PR checkout: this job can write labels and comments,
+          # and same-repo PRs can edit scripts/workflow/** (#531 / #545).
+          #
+          # CONFIG always comes from the PR BASE tree, never the default branch
+          # (#763, Codex P1). The policy that governs a PR is the policy of the
+          # branch it targets: a PR onto a stricter non-default branch (a
+          # release branch with a lower threshold or extra protected paths) must
+          # be judged by THAT branch's .github/review-policy.yml. Reading config
+          # from the default branch would silently ignore it. The earlier guard
+          # in this job already proved BASE_SHA carries a review-policy.yml, so
+          # this source is always available.
+          #
+          # HELPER prefers the PR base too, and falls back to the default branch
+          # ONLY when the base predates the helper (#763). Pinning the helper to
+          # the base alone made POLICY a function of the base's age: a PR opened
+          # against any base predating these helpers forced needs_review=true for
+          # every PR in this workflow, bypassing the threshold logic entirely and
+          # staying stuck until the branch was rebased. Both trees are equally
+          # untouchable by the PR, so the #531 trust property holds either way.
+          #
+          # The fallback can pair a NEWER helper with an OLDER config. That is
+          # the safe skew direction — a current helper tolerates an older config
+          # (missing keys take documented defaults); the reverse, an old helper
+          # against a newer config, is the unsafe one and cannot arise here.
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          TRUSTED_BASE_TREE=""
+          TRUSTED_HELPER_TREE=""
+          cleanup_trusted_trees() {
+            # The helper tree IS the base tree in the common case; only remove
+            # it once so the second pass can't log a spurious failure.
+            for _t in "$TRUSTED_HELPER_TREE" "$TRUSTED_BASE_TREE"; do
+              [ -n "$_t" ] || continue
+              git worktree remove --force "$_t" >/dev/null 2>&1 || rm -rf "$_t"
+              [ "$_t" != "$TRUSTED_BASE_TREE" ] || break
+            done
           }
-          trap cleanup_trusted_base_tree EXIT
+          trap cleanup_trusted_trees EXIT
+
+          TRUSTED_BASE_TREE=$(mktemp -d)
+          rmdir "$TRUSTED_BASE_TREE" 2>/dev/null || true
           if ! git worktree add --quiet --detach "$TRUSTED_BASE_TREE" "$BASE_SHA" 2>/dev/null; then
-            echo "External-review fail-closed: could not materialize trusted base helpers; requiring review."
+            echo "External-review fail-closed: could not materialize the PR base tree; requiring review."
             echo "needs_review=true" >> "$GITHUB_OUTPUT"
-            echo "reasons=- Could not materialize trusted base helpers; requiring review fail-closed" >> "$GITHUB_OUTPUT"
+            echo "reasons=- Could not materialize the PR base tree for the external-review calculation; requiring review fail-closed" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+          TRUSTED_CONFIG="$TRUSTED_BASE_TREE/.github/review-policy.yml"
+
+          TRUSTED_SOURCE=""
+          if [ -x "$TRUSTED_BASE_TREE/scripts/workflow/external_review_fingerprint.sh" ]; then
+            TRUSTED_HELPER_TREE="$TRUSTED_BASE_TREE"
+            TRUSTED_SOURCE="the PR base ($BASE_SHA)"
+          elif git rev-parse --verify --quiet "origin/$DEFAULT_BRANCH^{commit}" >/dev/null 2>&1; then
+            TRUSTED_HELPER_TREE=$(mktemp -d)
+            rmdir "$TRUSTED_HELPER_TREE" 2>/dev/null || true
+            if git worktree add --quiet --detach "$TRUSTED_HELPER_TREE" "origin/$DEFAULT_BRANCH" 2>/dev/null \
+               && [ -x "$TRUSTED_HELPER_TREE/scripts/workflow/external_review_fingerprint.sh" ]; then
+              TRUSTED_SOURCE="origin/$DEFAULT_BRANCH (fallback: the PR base predates the helper)"
+            else
+              git worktree remove --force "$TRUSTED_HELPER_TREE" >/dev/null 2>&1 || rm -rf "$TRUSTED_HELPER_TREE"
+              TRUSTED_HELPER_TREE=""
+            fi
           fi
 
-          TRUSTED_HELPER_DIR="$TRUSTED_BASE_TREE/scripts/workflow"
-          TRUSTED_CONFIG="$TRUSTED_BASE_TREE/.github/review-policy.yml"
-          FINGERPRINT_HELPER="$TRUSTED_HELPER_DIR/external_review_fingerprint.sh"
-          CARRY_HELPER="$TRUSTED_HELPER_DIR/external_review_carryforward.sh"
-          if [ ! -x "$FINGERPRINT_HELPER" ]; then
-            echo "External-review fail-closed: trusted base helper is unavailable; requiring review."
+          if [ -z "$TRUSTED_SOURCE" ]; then
+            echo "External-review fail-closed: neither the PR base nor origin/$DEFAULT_BRANCH carries an executable fingerprint helper; requiring review."
             echo "needs_review=true" >> "$GITHUB_OUTPUT"
-            echo "reasons=- Trusted external-review fingerprint helper is unavailable on the base tree; requiring review fail-closed" >> "$GITHUB_OUTPUT"
+            echo "reasons=- Trusted external-review fingerprint helper is unavailable on the PR base and the default branch; requiring review fail-closed" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          echo "External-review: config from the PR base; helpers from $TRUSTED_SOURCE."
+
+          TRUSTED_HELPER_DIR="$TRUSTED_HELPER_TREE/scripts/workflow"
+          FINGERPRINT_HELPER="$TRUSTED_HELPER_DIR/external_review_fingerprint.sh"
+          CARRY_HELPER="$TRUSTED_HELPER_DIR/external_review_carryforward.sh"
 
           set +e
           FINGERPRINT_JSON=$(bash "$FINGERPRINT_HELPER" \

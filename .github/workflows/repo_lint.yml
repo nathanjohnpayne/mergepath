@@ -251,6 +251,16 @@ jobs:
         # checkouts SKIP inside the wrapper (script + suite are hub-only).
         run: ./scripts/ci/check_wave_audit
 
+      - name: check_external_review_helpers
+        # Hub-only regression suite for the external-review helpers
+        # (#715/#716 gh stdout-stderr separation, #718 current-head short
+        # circuit). These helpers gate whether external review is required
+        # at all, and the suite was previously unwired and never ran —
+        # wired in #763. Consumer checkouts SKIP inside the wrapper (the
+        # suite is hub-only; the helpers themselves travel under the
+        # scripts/workflow/ kit entry).
+        run: ./scripts/ci/check_external_review_helpers
+
       - name: check_coderabbit_severity_gate
         # CodeRabbit twin of check_codex_p1_gate (#577). Verifies
         # scripts/coderabbit-severity-gate.sh +

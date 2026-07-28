@@ -367,6 +367,31 @@ while IFS=$'\t' read -r source_time source_sha; do
   [ "$fp_rc" -eq 0 ] || continue
   SOURCE_FINGERPRINT=$(printf '%s' "$SOURCE_JSON" | jq -r '.fingerprint // ""')
   if [ "$SOURCE_FINGERPRINT" = "$CURRENT_FINGERPRINT" ]; then
+    # (#763) A fingerprint match is SUFFICIENT here — deliberately no
+    # additional "prove the delta since the reviewed commit is base-only"
+    # predicate. That was implemented and then removed; the reasoning is
+    # recorded so it is not re-litigated:
+    #
+    #   1. The fingerprint hashes tree entries for the PR's CURRENT changed-path
+    #      set at both the head and that head's merge base. A match therefore
+    #      already proves entry(candidate, p) == entry(HEAD, p) for EVERY path p
+    #      the PR changes. A base-only predicate restricted to those paths is
+    #      vacuously true — it can never fire.
+    #   2. A path NOT in the PR's changed set has, by definition of that set,
+    #      content(HEAD, p) == content(merge_base, p). It contributes nothing to
+    #      the merged result, so it needs no review.
+    #   3. (1) and (2) exhaust the paths, so given a fingerprint match no
+    #      path-based predicate can catch content that would actually merge
+    #      unreviewed. The only residual is HISTORY ("was every intermediate
+    #      state reviewed"), which is not what this gate protects — it gates
+    #      merged content, and an add-then-remove of a file mid-PR merges
+    #      nothing.
+    #
+    # An attempted implementation using the compare API was worse than useless:
+    # GitHub's compare is THREE-DOT (merge-base) semantics, so after a rebase
+    # candidate...HEAD includes the PR's own already-reviewed files and the
+    # predicate refused precisely the base-only carry-forward this feature
+    # exists to serve. It could only ever produce false negatives.
     jq -n \
       --arg kind "codex-verdict" \
       --arg source_commit "$resolved_sha" \
