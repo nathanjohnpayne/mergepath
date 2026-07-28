@@ -209,11 +209,12 @@ if [ -n "$(git -C "$FLAG_PR_WT" status --porcelain --ignored --untracked-files=a
 fi
 
 # ── Case 2d (#762 post-merge P1): index-flag scan must not SIGPIPE ────
-# `printf … | grep -q` under pipefail loses the match when the listing exceeds
-# a pipe buffer: grep exits at the first hit, printf dies of SIGPIPE (141), and
-# the pipeline reports failure — so the guard reads "no flags" precisely when a
-# flag WAS found. The padding below pushes `ls-files -v` past 64 KiB and the
-# flagged file sorts FIRST, which is the combination that triggers it.
+# `printf … | grep -q` under pipefail can lose the match when grep exits at the
+# first hit and printf then writes to the closed pipe. Listing size alone does
+# not force that schedule, so this fixture also injects a printf wrapper into
+# helper child shells: it writes the first matching line, pauses for grep to
+# exit, then writes the remainder. The vulnerable pipeline therefore returns
+# 141 deterministically while the fixed here-string never calls that wrapper.
 SIGPIPE_PR_NUM=77222
 SIGPIPE_PR_BRANCH="pr-branch-sigpipe"
 git branch "$SIGPIPE_PR_BRANCH"
@@ -237,6 +238,35 @@ SIGPIPE_BYTES=$(git -C "$SIGPIPE_PR_WT" ls-files -v | wc -c | tr -d ' ')
 if [ "$SIGPIPE_BYTES" -lt 65536 ]; then
   fail "fixture setup: ls-files -v is only ${SIGPIPE_BYTES}B — too small to trigger SIGPIPE; increase the padding"
 fi
+SIGPIPE_BASH_ENV="$WORKDIR/sigpipe-bash-env"
+cat >"$SIGPIPE_BASH_ENV" <<'EOF'
+printf() {
+  if [ "$#" -eq 2 ] && [ "$1" = '%s\n' ] && [ "${#2}" -ge 65536 ]; then
+    first=${2%%$'\n'*}
+    rest=${2#*$'\n'}
+    builtin printf '%s\n' "$first"
+    sleep 0.05
+    builtin printf '%s\n' "$rest"
+    return $?
+  fi
+  builtin printf "$@"
+}
+EOF
+set +e
+BASH_ENV="$SIGPIPE_BASH_ENV" bash -o pipefail -c '
+  flagged=$(git -C "$1" ls-files -v) || exit 2
+  printf "%s\n" "$flagged" | grep -qE "^([a-z]|S) "
+' _ "$SIGPIPE_PR_WT"
+SIGPIPE_PROBE_RC=$?
+set -e
+if [ "$SIGPIPE_PROBE_RC" -eq 141 ]; then
+  pass "fixture premise: instrumented vulnerable printf|grep -q pipeline returns SIGPIPE (141)"
+else
+  fail "fixture setup: instrumented vulnerable pipeline returned $SIGPIPE_PROBE_RC, expected 141"
+fi
+# Non-interactive helper shells source this instrumentation. It is inert for
+# every normal printf call and for the fixed here-string index probe.
+export BASH_ENV="$SIGPIPE_BASH_ENV"
 
 # ── Case 2e (#762 post-merge P1): index flags INSIDE a submodule ──────
 # A submodule file marked assume-unchanged and then edited is invisible to the
@@ -1270,10 +1300,11 @@ fi
 # total_candidates accounting read SUMMARY_UNCLEAN_KEPT, so the record was
 # printed but the audit exited as if nothing needed a human (Phase 4b P1).
 UNCLEAN_N=$(echo "$OUT3" | sed -n 's/.*unclean PR worktrees (review): *\([0-9][0-9]*\).*/\1/p' | head -1)
-if [ "${UNCLEAN_N:-0}" -eq 8 ]; then
+EXPECTED_UNCLEAN=$((7 + SUB_OK))
+if [ "${UNCLEAN_N:-0}" -eq "$EXPECTED_UNCLEAN" ]; then
   pass "retained gone-upstream PR-slug worktree is counted in the unclean bucket"
 else
-  fail "unclean-bucket count is ${UNCLEAN_N:-unset}, expected 8 (every retained-unclean fixture, including the gone-upstream, SIGPIPE and submodule index-flag ones) — a retained worktree is landing in an uncounted bucket"
+  fail "unclean-bucket count is ${UNCLEAN_N:-unset}, expected $EXPECTED_UNCLEAN (seven required retained-unclean fixtures plus the optional submodule index-flag fixture when available) — a retained worktree is landing in an uncounted bucket"
   echo "$OUT3" | grep -E "unclean PR worktrees" >&2
 fi
 if [ -f "$GONE_PR_CANARY" ] && grep -q "nowhere else" "$GONE_PR_CANARY"; then
@@ -1464,6 +1495,7 @@ fi
 # ── Apply with both escalations: locked + orphan removed. ──────────────
 set +e
 OUT4=$(PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply --force-locked --orphan-clean 2>&1)
+RC4=$?
 
 # Case 2e (#762 post-merge P1): a LOCKED submodule worktree whose only dirt is
 # hidden behind a submodule-internal index flag must survive even the force
@@ -1478,7 +1510,6 @@ if [ "${SUB_OK:-0}" = "1" ]; then
     echo "$OUT4" >&2
   fi
 fi
-RC4=$?
 set -e
 
 if [ "$RC4" -eq 0 ]; then
