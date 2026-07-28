@@ -212,9 +212,10 @@ fi
 # `printf … | grep -q` under pipefail can lose the match when grep exits at the
 # first hit and printf then writes to the closed pipe. Listing size alone does
 # not force that schedule, so this fixture also injects a printf wrapper into
-# helper child shells: it writes the first matching line, pauses for grep to
-# exit, then writes the remainder. The vulnerable pipeline therefore returns
-# 141 deterministically while the fixed here-string never calls that wrapper.
+# helper child shells: it writes the first matching line, then keeps filling
+# the pipe until grep exits and the writer receives SIGPIPE. The vulnerable
+# pipeline therefore returns 141 without a scheduler-timing assumption, while
+# the fixed here-string never calls that wrapper.
 SIGPIPE_PR_NUM=77222
 SIGPIPE_PR_BRANCH="pr-branch-sigpipe"
 git branch "$SIGPIPE_PR_BRANCH"
@@ -245,9 +246,9 @@ printf() {
     first=${2%%$'\n'*}
     rest=${2#*$'\n'}
     builtin printf '%s\n' "$first"
-    sleep 0.05
-    builtin printf '%s\n' "$rest"
-    return $?
+    while :; do
+      builtin printf '%s\n' "$rest"
+    done
   fi
   builtin printf "$@"
 }
@@ -299,7 +300,17 @@ if [ "$SUB_OK" = "1" ] && [ -f "$SUB_CANARY" ]; then
   # probe said — the assertion would pass vacuously. Locking it routes the
   # --force-locked run into the force fallback, which is the exact path the
   # reviewer described, and the only one where the probe's verdict decides.
-  git worktree lock "$SUB_PR_WT" >/dev/null 2>&1 || true
+  if ! git worktree lock "$SUB_PR_WT" >/dev/null 2>&1; then
+    fail "fixture setup: could not lock the submodule worktree required for the force-fallback path"
+    SUB_OK=0
+  elif ! git worktree list --porcelain | awk -v p="$SUB_PR_WT" '
+    /^worktree / { hit = (substr($0, 10) == p); next }
+    hit && /^locked/ { found = 1 }
+    END { exit found ? 0 : 1 }
+  '; then
+    fail "fixture setup: git worktree lock returned success but the submodule worktree does not read back locked"
+    SUB_OK=0
+  fi
 else
   echo "NOTE: submodule fixture unavailable (git submodule add failed); Case 2e assertions will be skipped" >&2
 fi
