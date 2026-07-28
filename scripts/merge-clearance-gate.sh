@@ -382,13 +382,23 @@ DEFAULT_BRANCH=$(echo "$PR_JSON" | jq -r '.base.repo.default_branch // ""')
 RESOLVE_POLICY_BIN="${MERGE_CLEARANCE_WORKFLOW_DIR:-$SCRIPT_DIR/workflow}/resolve_base_policy.sh"
 if [ ! -f "$RESOLVE_POLICY_BIN" ]; then
   # Broken install (the resolver ships with this gate via .mergepath-sync.yml).
-  # Keep the default-branch policy rather than exiting 2: this runs BEFORE the
-  # external arm is derived, so there is no "require review" to fail closed
-  # into yet, and turning a missing propagated file into a hard error here
-  # would convert a mid-sync consumer into a red required check. The separate
-  # protected-paths helper check further down still fails closed on its own
-  # missing helpers, which is where that behaviour belongs.
-  echo "WARNING: policy resolver missing ($RESOLVE_POLICY_BIN); using the default-branch policy" >&2
+  # Degrade ONLY where the degradation is provably a no-op — a PR targeting the
+  # DEFAULT branch, where the checked-out config IS the governing policy. There,
+  # a missing resolver changes nothing, and hard-failing would turn a mid-sync
+  # consumer into a red required check for no safety gain.
+  #
+  # For a NON-DEFAULT base the same fallback is the unsafe downgrade this whole
+  # change exists to prevent: the gate would evaluate the threshold, protected
+  # paths, reviewer allow-list, and enable switches from a looser default-branch
+  # policy and could clear a PR the base policy would block. That is an
+  # infrastructure failure in a required merge gate — fail closed (Codex P1 on
+  # #768). BASE_REF/DEFAULT_BRANCH come from PR_JSON, so this decision does not
+  # itself need the resolver.
+  if [ -n "$BASE_REF" ] && [ -n "$DEFAULT_BRANCH" ] && [ "$BASE_REF" != "$DEFAULT_BRANCH" ]; then
+    echo "ERROR: policy resolver missing ($RESOLVE_POLICY_BIN) and this PR targets non-default base '$BASE_REF' — refusing to evaluate it against the default-branch policy" >&2
+    exit 2
+  fi
+  echo "WARNING: policy resolver missing ($RESOLVE_POLICY_BIN); PR targets the default branch, so the checked-out policy already governs" >&2
   RESOLVED_POLICY="$CONFIG"
   resolve_rc=0
 else
