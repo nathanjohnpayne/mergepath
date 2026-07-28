@@ -46,6 +46,17 @@
 #  13. #739: a detached hidden-folder worktree with a free-form (non
 #      pr-<n>) slug carries no parseable PR number — listed as detached
 #      non-PR and never auto-removed.
+#  14. #762: a BRANCH-ATTACHED hidden-folder pr-<n>-<desc> worktree whose
+#      remote branch is still alive (so the gone-upstream rule never
+#      fires) but whose PR is MERGED is PR-state checked and removed by
+#      --apply. This is the documented `git worktree add <path> <branch>`
+#      shape, which the detached-only slug check missed entirely.
+#  15. #762: the same shape with a DIRTY working tree (an untracked file)
+#      is surfaced for manual review and KEPT — `git worktree remove`
+#      would destroy content that exists nowhere else, so a clean status
+#      is the required positive evidence for removal.
+#  16. #762: a branch-attached pr-<n> worktree whose PR is OPEN is
+#      reported as still-active and never removed.
 #
 # `gh` is stubbed via a PATH shim that returns CLOSED for our test PR
 # number and "unknown" for anything else, so the test does not touch
@@ -162,6 +173,40 @@ git worktree add -q --detach "$HIDDEN_PR_WT" "$DETACHED_SHA"
 HIDDEN_NONPR_WT="$WORKDIR/.mergepath-worktrees/charming-freeform-slug"
 git worktree add -q --detach "$HIDDEN_NONPR_WT" "$DETACHED_SHA"
 
+# ── Case 14 (#762): BRANCH-ATTACHED hidden-folder PR worktree ─────────
+# The documented `git worktree add <path> <branch>` form. Its upstream
+# stays ALIVE (we never delete the remote ref), so the gone-upstream rule
+# cannot fire and the PR-slug check is the only thing that can catch it.
+# The stub reports PR 77777 MERGED, and the working tree is clean, so
+# --apply must remove it.
+BRANCH_PR_NUM=77777
+BRANCH_PR_BRANCH="pr-branch-merged"
+git branch "$BRANCH_PR_BRANCH"
+git push -q -u origin "$BRANCH_PR_BRANCH"
+BRANCH_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${BRANCH_PR_NUM}-branch-attached"
+git worktree add -q "$BRANCH_PR_WT" "$BRANCH_PR_BRANCH"
+
+# ── Case 15 (#762): same shape, DIRTY working tree ────────────────────
+# An untracked file that exists nowhere else. `git worktree remove
+# --force` would delete it, so the helper must retain the worktree and
+# surface it for a human instead.
+DIRTY_PR_NUM=66666
+DIRTY_PR_BRANCH="pr-branch-dirty"
+git branch "$DIRTY_PR_BRANCH"
+git push -q -u origin "$DIRTY_PR_BRANCH"
+DIRTY_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${DIRTY_PR_NUM}-dirty"
+git worktree add -q "$DIRTY_PR_WT" "$DIRTY_PR_BRANCH"
+DIRTY_CANARY="$DIRTY_PR_WT/precious-untracked.txt"
+echo "uncommitted work that MUST survive --apply" > "$DIRTY_CANARY"
+
+# ── Case 16 (#762): branch-attached pr-<n> worktree, PR still OPEN ────
+OPEN_PR_NUM=55555
+OPEN_PR_BRANCH="pr-branch-open"
+git branch "$OPEN_PR_BRANCH"
+git push -q -u origin "$OPEN_PR_BRANCH"
+OPEN_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${OPEN_PR_NUM}-still-open"
+git worktree add -q "$OPEN_PR_WT" "$OPEN_PR_BRANCH"
+
 # ── Case 4: locked worktree (use a gone-upstream branch so it ALSO
 #    falls into a removal-eligible bucket; the helper must skip it
 #    in --apply without --force-locked).
@@ -274,6 +319,18 @@ if [ "\$1" = "pr" ] && [ "\$2" = "view" ]; then
     echo "MERGED"
     exit 0
   fi
+  if [ "\$num" = "$BRANCH_PR_NUM" ]; then
+    echo "MERGED"
+    exit 0
+  fi
+  if [ "\$num" = "$DIRTY_PR_NUM" ]; then
+    echo "CLOSED"
+    exit 0
+  fi
+  if [ "\$num" = "$OPEN_PR_NUM" ]; then
+    echo "OPEN"
+    exit 0
+  fi
 fi
 if [ "\$1" = "pr" ] && [ "\$2" = "list" ]; then
   head=""
@@ -384,6 +441,63 @@ if echo "$NONPR_WT_LABEL" | grep -q "detached non-PR"; then
   pass "free-form hidden-folder slug listed as detached non-PR (no PR number parsed)"
 else
   fail "free-form hidden-folder slug mislabeled (label='$NONPR_WT_LABEL')"
+  show_out_on_fail
+fi
+
+# Case 14 (#762): the branch-ATTACHED pr-<n>-<desc> worktree with a live
+# upstream is PR-state checked and flagged stale. Correlate path→label via
+# awk so this cannot pass on some unrelated record.
+BRANCH_PR_LABEL=$(echo "$OUT" | awk -v p="$BRANCH_PR_WT" '
+  /^  \[/            { label = $0 }
+  $1 == "path:" && $2 == p { print label; exit }
+')
+if echo "$BRANCH_PR_LABEL" | grep -q "STALE PR #${BRANCH_PR_NUM} (MERGED) branch worktree"; then
+  pass "branch-attached pr-<n> worktree (live upstream, MERGED PR) flagged stale"
+else
+  fail "branch-attached pr-<n> worktree not PR-state checked (label='$BRANCH_PR_LABEL')"
+  show_out_on_fail
+fi
+if echo "$OUT" | grep -qE "PR-slug branch stale: +[1-9]"; then
+  pass "summary shows ≥1 PR-slug branch stale"
+else
+  fail "summary PR-slug-branch-stale count missing/zero"
+  show_out_on_fail
+fi
+
+# Case 15 (#762): the DIRTY one is surfaced for review, not as a removal
+# candidate.
+DIRTY_PR_LABEL=$(echo "$OUT" | awk -v p="$DIRTY_PR_WT" '
+  /^  \[/            { label = $0 }
+  $1 == "path:" && $2 == p { print label; exit }
+')
+if echo "$DIRTY_PR_LABEL" | grep -q "working tree is dirty — review manually, keeping"; then
+  pass "dirty closed-PR branch worktree surfaced under a review-manually record"
+else
+  fail "dirty closed-PR branch worktree not surfaced for review (label='$DIRTY_PR_LABEL')"
+  show_out_on_fail
+fi
+if echo "$DIRTY_PR_LABEL" | grep -q "STALE PR"; then
+  fail "dirty closed-PR branch worktree wrongly flagged as a removal candidate"
+  show_out_on_fail
+else
+  pass "dirty closed-PR branch worktree is NOT a removal candidate"
+fi
+if echo "$OUT" | grep -qE "dirty PR worktrees \(review\): +[1-9]"; then
+  pass "summary shows ≥1 dirty PR worktree awaiting review"
+else
+  fail "summary dirty-PR-worktree count missing/zero"
+  show_out_on_fail
+fi
+
+# Case 16 (#762): the OPEN-PR branch worktree is reported still-active.
+OPEN_PR_LABEL=$(echo "$OUT" | awk -v p="$OPEN_PR_WT" '
+  /^  \[/            { label = $0 }
+  $1 == "path:" && $2 == p { print label; exit }
+')
+if echo "$OPEN_PR_LABEL" | grep -q "OPEN PR #${OPEN_PR_NUM} — keeping"; then
+  pass "branch-attached worktree for an OPEN PR reported still-active"
+else
+  fail "branch-attached OPEN-PR worktree mislabeled (label='$OPEN_PR_LABEL')"
   show_out_on_fail
 fi
 
@@ -582,6 +696,45 @@ else
   fail "free-form hidden-folder detached worktree was removed by --apply"
   echo "$OUT2" >&2
 fi
+# Case 14 (#762): the clean branch-attached merged-PR worktree is removed —
+# and the BRANCH REF it was attached to survives (worktree removal never
+# deletes a ref, which is exactly why a clean working tree is sufficient
+# evidence that nothing is lost).
+if [ -d "$BRANCH_PR_WT" ] || echo "$OUT3" | grep -q -- "$BRANCH_PR_WT"; then
+  fail "branch-attached merged-PR worktree still present after --apply"
+  echo "$OUT2" >&2
+else
+  pass "branch-attached merged-PR worktree removed by --apply"
+fi
+if git rev-parse --verify -q "refs/heads/$BRANCH_PR_BRANCH" >/dev/null; then
+  pass "branch ref survived the branch-attached worktree removal"
+else
+  fail "branch ref $BRANCH_PR_BRANCH was destroyed by the worktree removal"
+  echo "$OUT2" >&2
+fi
+
+# Case 15 (#762): the DIRTY worktree and its untracked canary both survive.
+if [ -d "$DIRTY_PR_WT" ]; then
+  pass "dirty closed-PR branch worktree retained by --apply"
+else
+  fail "dirty closed-PR branch worktree was removed by --apply"
+  echo "$OUT2" >&2
+fi
+if [ -f "$DIRTY_CANARY" ]; then
+  pass "untracked canary in the dirty worktree survived --apply"
+else
+  fail "DATA LOSS: --apply deleted uncommitted work in $DIRTY_PR_WT"
+  echo "$OUT2" >&2
+fi
+
+# Case 16 (#762): the OPEN-PR branch worktree survives.
+if [ -d "$OPEN_PR_WT" ]; then
+  pass "branch-attached OPEN-PR worktree retained by --apply"
+else
+  fail "branch-attached OPEN-PR worktree was removed by --apply"
+  echo "$OUT2" >&2
+fi
+
 if echo "$OUT3" | grep -q -- "$LOCKED_WT"; then
   pass "locked worktree retained after --apply (no --force-locked)"
 else
@@ -707,9 +860,10 @@ else
   echo "$OUT5" >&2
 fi
 
-# Hand-resolve the diverged branch (the human decision the audit is asking
-# for), then the audit is genuinely clean.
+# Hand-resolve the diverged branch and the dirty PR worktree (the human
+# decisions the audit is asking for), then the audit is genuinely clean.
 git branch -D "$DIVERGED_BRANCH" >/dev/null 2>&1 || true
+git worktree remove --force "$DIRTY_PR_WT" >/dev/null 2>&1 || true
 set +e
 OUT6=$(PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1)
 RC6=$?

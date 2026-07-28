@@ -42,6 +42,22 @@
 #      annotation after it stay inside the fence, and the real section
 #      after the true (bare) closer is still parsed (round-2 Codex
 #      regression).
+#  12. A 4-space-INDENTED ``` inside an open fence is indented CODE, not
+#      a fence delimiter (CommonMark allows at most 3 leading spaces).
+#      A pair of them used to close and re-open the fence, fabricating a
+#      whole section out of the `##` line between them; both must now be
+#      ignored so nothing inside the outer fence leaks into the report
+#      (#762 finding 2).
+#  13. An annotation whose path escapes MERGEPATH_ROOT via `..`
+#      (`mergepath/../outside.md`) is rejected as [invalid-source] and
+#      never hashed — even when the pin matches the outside file, which
+#      is exactly what used to make it report [ok] (#762 finding 3).
+#  14. An ABSOLUTE annotated path is rejected as [invalid-source] rather
+#      than silently concatenated onto MERGEPATH_ROOT.
+#  15. An in-checkout path whose final component is a SYMLINK pointing
+#      outside MERGEPATH_ROOT is rejected as [invalid-source]: lexical
+#      normalization cannot see it, so the physical containment check
+#      has to.
 
 set -euo pipefail
 
@@ -72,6 +88,26 @@ sha256_of() {
 }
 FRESH_PIN="$(sha256_of "$MP/docs/agents/worktree-placement.md")"
 FRESH_PIN="${FRESH_PIN:0:12}"
+
+# ── Fixture file OUTSIDE the fixture checkout (#762 finding 3) ────────
+# Sibling of $MP, so `mergepath/../outside-the-checkout.md` resolves to
+# it. Pinned with its REAL sha256 so the unfixed parser reports [ok] on
+# a file it had no business hashing; the fixed parser must reject the
+# annotation before it ever gets there.
+OUTSIDE="$WORKDIR/outside-the-checkout.md"
+printf 'content that lives outside the canonical checkout\n' > "$OUTSIDE"
+OUTSIDE_PIN="$(sha256_of "$OUTSIDE")"
+OUTSIDE_PIN="${OUTSIDE_PIN:0:12}"
+
+# Absolute-path fixture: a real file, named by absolute path, which must
+# still be rejected rather than concatenated onto MERGEPATH_ROOT.
+ABSOLUTE_TARGET="$WORKDIR/absolute-target.md"
+printf 'absolute-path target\n' > "$ABSOLUTE_TARGET"
+
+# Symlink INSIDE the checkout whose target is outside it. Lexical
+# normalization sees a clean `docs/agents/...` path; only the physical
+# containment check catches the escape.
+ln -s "$OUTSIDE" "$MP/docs/agents/symlinked-outside.md"
 
 # ── Fixture vendor file ───────────────────────────────────────────────
 VENDOR="$WORKDIR/CLAUDE.md"
@@ -134,6 +170,35 @@ Real section after the 4-backtick closer, no annotation.
 ## After Info String Closer
 
 Real section after the whitespace-only closer, no annotation.
+
+## Indented Fence Mirror
+
+> Canonical source: mergepath/docs/agents/worktree-placement.md
+
+\`\`\`markdown
+A doc example that shows a fence indented four spaces:
+
+    \`\`\`
+## fake heading between two 4-space-indented delimiters
+# Canonical source: mergepath/inside/indented/fence.md
+    \`\`\`
+\`\`\`
+
+## After Indented Fence
+
+Real section after the true closer, no annotation.
+
+## Escaping Source Mirror
+
+> Canonical source: \`mergepath/../outside-the-checkout.md\` (canonical-sha256: $OUTSIDE_PIN)
+
+## Absolute Source Mirror
+
+> Canonical source: \`$ABSOLUTE_TARGET\`
+
+## Symlinked Source Mirror
+
+> Canonical source: \`mergepath/docs/agents/symlinked-outside.md\`
 EOF
 
 cp "$VENDOR" "$WORKDIR/CLAUDE.md.orig"
@@ -251,8 +316,62 @@ else
   fail "After Info String Closer section swallowed — bare closer did not close the fence"
 fi
 
-# summary line counts match the fixture (9 real sections)
-if grep -q '9 section(s) scanned — ok: 1, ok-unpinned: 3, missing-annotation: 3, source-missing: 1, drift: 1' <<<"$OUT"; then
+# 12a. a 4-space-indented ``` is indented CODE, not a fence delimiter:
+# nothing between the two indented delimiters may reach the report. With
+# the whitespace-stripping parser the first one CLOSED the outer fence,
+# so the `##` line below it became a fabricated real section.
+if grep -q 'between two 4-space-indented delimiters' <<<"$OUT" \
+  || grep -q 'indented/fence.md' <<<"$OUT"; then
+  fail "a 4-space-indented \`\`\` toggled fence state and leaked in-fence content into the report"
+else
+  pass "4-space-indented \`\`\` inside a fence ignored (CommonMark 3-space limit)"
+fi
+
+# 12b. the section owning that fence keeps its pre-fence annotation.
+if grep -q '\[ok-unpinned\] *## Indented Fence Mirror' <<<"$OUT"; then
+  pass "section containing the indented fence classified from its real annotation"
+else
+  fail "Indented Fence Mirror not classified ok-unpinned; output: $OUT"
+fi
+
+# 12c. the real (unindented) closer still closes the fence.
+if grep -q '\[missing-annotation\] ## After Indented Fence' <<<"$OUT"; then
+  pass "real section after the unindented closer still parsed"
+else
+  fail "After Indented Fence section swallowed — the unindented closer did not close the fence"
+fi
+
+# 13. a `..` escape is rejected before hashing. The fixture pin MATCHES the
+# outside file, so the unfixed parser reported [ok] on it.
+ESCAPE_LABEL=$(grep -o '\[[a-z-]*\] *## Escaping Source Mirror' <<<"$OUT" | head -n1)
+if grep -q '\[invalid-source\] *## Escaping Source Mirror' <<<"$OUT"; then
+  pass "annotation escaping MERGEPATH_ROOT via .. classified invalid-source"
+else
+  fail "escaping annotation not rejected (label='$ESCAPE_LABEL'); output: $OUT"
+fi
+if grep -q "pin $OUTSIDE_PIN matches" <<<"$OUT"; then
+  fail "SECURITY: the escaping annotation was hashed and reported as a pin match"
+else
+  pass "escaping annotation was never hashed (no pin-match line for the outside file)"
+fi
+
+# 14. an absolute annotated path is rejected, not concatenated.
+if grep -q '\[invalid-source\] *## Absolute Source Mirror' <<<"$OUT"; then
+  pass "absolute annotated path classified invalid-source"
+else
+  fail "absolute annotated path not rejected; output: $OUT"
+fi
+
+# 15. a symlink inside the checkout pointing outside it is rejected by the
+# physical containment check (lexical normalization cannot see it).
+if grep -q '\[invalid-source\] *## Symlinked Source Mirror' <<<"$OUT"; then
+  pass "in-checkout symlink resolving outside MERGEPATH_ROOT classified invalid-source"
+else
+  fail "symlink escaping MERGEPATH_ROOT not rejected; output: $OUT"
+fi
+
+# summary line counts match the fixture (14 real sections)
+if grep -q '14 section(s) scanned — ok: 1, ok-unpinned: 4, missing-annotation: 4, source-missing: 1, invalid-source: 3, drift: 1' <<<"$OUT"; then
   pass "summary counters match fixture"
 else
   fail "summary counters wrong; output: $OUT"

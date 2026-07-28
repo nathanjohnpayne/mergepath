@@ -31,10 +31,12 @@
 #   --dry-run        Default. List candidates with branch/HEAD/state. No
 #                    side effects.
 #   --apply          Run `git worktree remove <path>` on safe candidates
-#                    (gone-upstream worktrees + detached closed-PR
-#                    worktrees that are NOT locked). Without further flags,
-#                    locked worktrees and orphaned .claude/worktrees/*
-#                    directories are listed but skipped.
+#                    (gone-upstream worktrees + closed/merged-PR
+#                    worktrees that are NOT locked; a branch-attached
+#                    PR worktree must also have a clean working tree).
+#                    Without further flags, locked worktrees and orphaned
+#                    .claude/worktrees/* directories are listed but
+#                    skipped.
 #   --force-locked   With --apply, also `git worktree remove --force` on
 #                    LOCKED worktrees. Locked worktrees may correspond to
 #                    in-progress agent sessions, so this flag is opt-in.
@@ -51,8 +53,8 @@
 #      `[origin/<branch>: gone]` for the branch checked out at the
 #      worktree. Safe to remove (the remote tracking branch was deleted,
 #      typically after a squash-merge + branch delete).
-#   2. Detached PR worktree. Worktree path carries a parseable PR
-#      number in one of two recognized shapes AND HEAD is detached:
+#   2. PR worktree. Worktree path carries a parseable PR number in one
+#      of two recognized shapes:
 #        a. legacy visible-sibling / temp-dir shape:
 #           ^(/private/tmp|/tmp|/Users/.*/GitHub)/mergepath-pr-([0-9]+)$
 #        b. the hidden-folder convention from
@@ -62,10 +64,22 @@
 #           (e.g. ~/GitHub/.mergepath-worktrees/pr-123-fix-login).
 #      Cross-check PR state via `gh pr view <num> --json state`; flag as
 #      removable if state is CLOSED or MERGED. Worktrees for OPEN PRs
-#      are listed but flagged as still-active. Detached hidden-folder
-#      worktrees whose slug does NOT start with `pr-<n>` are listed as
-#      detached non-PR (no PR number to cross-check) and never
-#      auto-removed.
+#      are listed but flagged as still-active. Hidden-folder worktrees
+#      whose slug does NOT start with `pr-<n>` carry no PR number to
+#      cross-check and are never auto-removed (detached ones are listed
+#      as detached non-PR; branch-attached ones fall through to rule 1).
+#      The slug check applies to BOTH detached and branch-ATTACHED
+#      worktrees (#762): the documented `git worktree add <path>
+#      <branch>` form creates a branch-attached worktree, so scoping the
+#      check to detached HEADs left every convention-following checkout
+#      unmatched whenever its remote branch outlived the PR. On the
+#      branch-attached side the check is purely ADDITIVE — rule 1 is
+#      evaluated first, so nothing that was removable before becomes
+#      retained — and removal additionally requires a CLEAN working
+#      tree: `git worktree remove` deletes the directory but never the
+#      branch ref, so every COMMIT survives regardless, and a clean
+#      status is positive proof that nothing else is lost. A dirty or
+#      unreadable working tree is surfaced for a human and kept.
 #   3. Orphaned .claude/worktrees/ directory. Subdirectory under
 #      .claude/worktrees/ that is NOT in `git worktree list --porcelain`
 #      output. These are residue from a `--force` remove that didn't
@@ -181,6 +195,39 @@ gh_pr_state() {
     fi
   fi
   echo "unknown"
+}
+
+# Print the PR number carried by a worktree PATH, or nothing when the path
+# carries none. Recognizes both shapes named in Detection rule 2: the legacy
+# `<root>/mergepath-pr-<n>` sibling/temp shape, and the hidden-folder
+# `.mergepath-worktrees/pr-<n>[-<desc>]` convention. The hidden folder is
+# matched by its directory NAME rather than a hardcoded ~/GitHub prefix so
+# the matcher follows the folder wherever the operator keeps repos.
+# Shared by the detached and branch-attached paths so the two cannot drift.
+worktree_pr_num() {
+  local path="$1"
+  if [[ "$path" =~ ^(/private/tmp|/tmp|/Users/[^/]+/GitHub)/mergepath-pr-([0-9]+)$ ]]; then
+    printf '%s' "${BASH_REMATCH[2]}"
+  elif [[ "$path" =~ /\.mergepath-worktrees/pr-([0-9]+)(-[A-Za-z0-9._-]+)?$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  fi
+}
+
+# Positive-evidence gate for removing a BRANCH-ATTACHED worktree: exit 0 only
+# when the working tree is provably CLEAN (no tracked modifications, no
+# untracked files). `git worktree remove` deletes the directory but never the
+# branch ref, so every COMMIT the branch holds survives the removal whether or
+# not it is merged; the only content that would be destroyed is what lives
+# solely in the working tree. A clean status is therefore the proof that
+# removal loses nothing. A missing directory, a path git will not report on,
+# or any dirty status exits 1 — fail closed, retain, and let a human decide.
+worktree_is_clean() {
+  local path="$1" status
+  if [ ! -d "$path" ]; then
+    return 1
+  fi
+  status=$(git -C "$path" status --porcelain 2>/dev/null) || return 1
+  [ -z "$status" ]
 }
 
 # Classify a local branch against its merged PRs by HEAD *name* (not by an
@@ -340,6 +387,15 @@ branch_checked_out() {
 # ── Classify and act ──────────────────────────────────────────────────
 SUMMARY_GONE=()
 SUMMARY_DETACHED=()
+# Branch-ATTACHED worktrees whose path carries a `pr-<n>` slug for a
+# CLOSED/MERGED PR while the remote branch is still alive — the case the
+# detached-only slug check missed entirely (#762).
+SUMMARY_PR_BRANCH=()
+# Branch-attached closed/merged-PR worktrees retained because their working
+# tree is dirty (or unreadable): removing them would destroy uncommitted or
+# untracked content that exists nowhere else. Surfaced for a human, never
+# auto-removed.
+SUMMARY_DIRTY_KEPT=()
 SUMMARY_LOCKED=()
 SUMMARY_LOCAL_BRANCH=()
 SUMMARY_OPEN_PR=()
@@ -404,20 +460,11 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
     continue
   fi
 
+  # Path-carried PR number, parsed for BOTH the detached and the
+  # branch-attached case (#762).
+  pr_num=$(worktree_pr_num "$WT_PATH")
+
   if [ "$WT_DETACHED" = "1" ]; then
-    # Detached. Check if the path carries a parseable PR number: either
-    # the legacy mergepath-pr-<num> shape, or the hidden-folder
-    # convention (docs/agents/worktree-placement.md) with a
-    # PR-number-bearing slug `pr-<n>` / `pr-<n>-<desc>`. The hidden
-    # folder is matched by its directory NAME (.mergepath-worktrees)
-    # rather than a hardcoded ~/GitHub prefix so the matcher follows the
-    # folder wherever the operator keeps repos.
-    pr_num=""
-    if [[ "$WT_PATH" =~ ^(/private/tmp|/tmp|/Users/[^/]+/GitHub)/mergepath-pr-([0-9]+)$ ]]; then
-      pr_num="${BASH_REMATCH[2]}"
-    elif [[ "$WT_PATH" =~ /\.mergepath-worktrees/pr-([0-9]+)(-[A-Za-z0-9._-]+)?$ ]]; then
-      pr_num="${BASH_REMATCH[1]}"
-    fi
     if [ -n "$pr_num" ]; then
       pr_state=$(gh_pr_state "$pr_num")
       case "$pr_state" in
@@ -489,7 +536,69 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
         try_remove "$WT_PATH" "0"
       fi
     fi
+    continue
   fi
+
+  # Branch-attached, upstream still ALIVE. This is where the documented
+  # `git worktree add <path> <branch>` form lands, so it is where a
+  # convention-slugged checkout for a closed/merged PR has to be caught —
+  # the gone-upstream rule above misses it whenever the remote branch
+  # outlives the PR, and the slug check used to live only in the detached
+  # arm (#762). Strictly additive: rule 1 already `continue`d above, so no
+  # previously-removable worktree becomes retained here.
+  [ -n "$pr_num" ] || continue
+  pr_state=$(gh_pr_state "$pr_num")
+  case "$pr_state" in
+    CLOSED|MERGED)
+      # Removal requires positive proof that nothing is lost: a clean
+      # working tree. The branch ref survives `git worktree remove`, so
+      # commits are safe either way; uncommitted edits and untracked files
+      # are not. Dirty (or unreadable) → surface and keep. This runs BEFORE
+      # the locked check on purpose: a locked AND dirty worktree must stay
+      # put even under --force-locked.
+      if ! worktree_is_clean "$WT_PATH"; then
+        print_record "[PR #${pr_num} (${pr_state}) but working tree is dirty — review manually, keeping]" "$C_YELLOW" \
+          "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[alive]" "$pr_state" "$WT_LOCK_REASON"
+        echo "    reason:   uncommitted or untracked content (or an unreadable status) — removing the worktree would destroy work that exists nowhere else; commit, stash, or discard it by hand first"
+        SUMMARY_DIRTY_KEPT+=("$WT_PATH ($WT_BRANCH, PR #${pr_num} ${pr_state})")
+        continue
+      fi
+      if [ "$WT_LOCKED" = "1" ]; then
+        print_record "[LOCKED PR #${pr_num} (${pr_state}) branch worktree]" "$C_YELLOW" \
+          "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[alive]" "$pr_state" "$WT_LOCK_REASON"
+        SUMMARY_LOCKED+=("$WT_PATH ($WT_BRANCH, PR #${pr_num} ${pr_state})")
+        if [ "$MODE" = "apply" ] && [ "$FORCE_LOCKED" = "1" ]; then
+          echo "    -> removing (forced)"
+          try_remove "$WT_PATH" "1"
+        elif [ "$MODE" = "apply" ]; then
+          echo "    -> skipped (locked; pass --force-locked to remove)"
+          SUMMARY_SKIPPED+=("$WT_PATH (locked)")
+        fi
+      else
+        print_record "[STALE PR #${pr_num} (${pr_state}) branch worktree]" "$C_RED" \
+          "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[alive]" "$pr_state" ""
+        SUMMARY_PR_BRANCH+=("$WT_PATH ($WT_BRANCH, PR #${pr_num} ${pr_state})")
+        if [ "$MODE" = "apply" ]; then
+          echo "    -> removing (working tree clean; branch ref $WT_BRANCH is kept)"
+          try_remove "$WT_PATH" "0"
+        fi
+      fi
+      ;;
+    OPEN)
+      print_record "[OPEN PR #${pr_num} — keeping]" "$C_GREEN" \
+        "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[alive]" "OPEN" ""
+      SUMMARY_OPEN_PR+=("$WT_PATH ($WT_BRANCH, PR #${pr_num})")
+      ;;
+    *)
+      print_record "[PR #${pr_num} state unknown — branch worktree]" "$C_YELLOW" \
+        "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[alive]" "$pr_state" ""
+      SUMMARY_PR_BRANCH+=("$WT_PATH ($WT_BRANCH, PR #${pr_num} unknown)")
+      if [ "$MODE" = "apply" ]; then
+        echo "    -> skipped (PR state unknown; rerun after \`gh auth\` setup)"
+        SUMMARY_SKIPPED+=("$WT_PATH (PR state unknown)")
+      fi
+      ;;
+  esac
 done <"$REC_FILE"
 
 # ── Re-snapshot worktree records (#605 root cause 1) ───────────────────
@@ -666,6 +775,12 @@ echo ""
 echo "${C_BOLD}Summary${C_RESET}"
 printf "  gone-upstream:    %d\n" "${#SUMMARY_GONE[@]}"
 printf "  detached stale:   %d\n" "${#SUMMARY_DETACHED[@]}"
+# Branch-attached worktrees whose PR-slug path names a CLOSED/MERGED (or
+# unverifiable) PR while the remote branch is still alive (#762).
+printf "  PR-slug branch stale: %d\n" "${#SUMMARY_PR_BRANCH[@]}"
+# Closed/merged-PR branch worktrees kept because their working tree is dirty
+# — the removal would destroy content that exists nowhere else.
+printf "  dirty PR worktrees (review): %d\n" "${#SUMMARY_DIRTY_KEPT[@]}"
 printf "  locked:           %d\n" "${#SUMMARY_LOCKED[@]}"
 printf "  merged branches:  %d\n" "${#SUMMARY_LOCAL_BRANCH[@]}"
 # Gone-upstream branches examined by the merged-branch sweep but kept because
@@ -711,7 +826,12 @@ fi
 # unauthenticated machine EVERY gone branch is unknown, and hard-failing the
 # audit there would make it unusable exactly where it can verify least; the
 # summary line + per-branch records carry the visibility instead.
-total_candidates=$(( ${#SUMMARY_GONE[@]} + ${#SUMMARY_DETACHED[@]} + ${#SUMMARY_LOCKED[@]} + ${#SUMMARY_LOCAL_BRANCH[@]} + ${#SUMMARY_ORPHAN[@]} + ${#SUMMARY_DIVERGED_KEPT[@]} ))
+#
+# SUMMARY_DIRTY_KEPT counts as actionable for the same reason as
+# SUMMARY_DIVERGED_KEPT: a closed/merged-PR worktree holding uncommitted work
+# needs a HUMAN decision (commit, stash, or discard), and --apply deliberately
+# never touches it, so the exit-2 persists until the human resolves it.
+total_candidates=$(( ${#SUMMARY_GONE[@]} + ${#SUMMARY_DETACHED[@]} + ${#SUMMARY_PR_BRANCH[@]} + ${#SUMMARY_DIRTY_KEPT[@]} + ${#SUMMARY_LOCKED[@]} + ${#SUMMARY_LOCAL_BRANCH[@]} + ${#SUMMARY_ORPHAN[@]} + ${#SUMMARY_DIVERGED_KEPT[@]} ))
 if [ "$total_candidates" -gt 0 ]; then
   echo ""
   echo "${C_DIM}Dry run. Re-run with --apply to remove safe candidates.${C_RESET}"
