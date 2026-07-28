@@ -42,6 +42,23 @@
 # Environment:
 #   GH_TOKEN   Required. Needs pull_requests:read (+ the read scopes
 #              codex-review-check.sh needs for the external-review path).
+#              The #772 enforcement probe (reached only from
+#              --derive-rate-limit-protection) reads two ADDITIONAL surfaces
+#              whose access pull_requests:read does NOT imply: GraphQL
+#              `ref.refUpdateRule` (classic branch protection — null for a
+#              viewer without push access) and REST
+#              `repos/{owner}/{repo}/rules/branches/{branch}` (rulesets —
+#              needs repo metadata read). A plain write-scoped classic PAT,
+#              which is what agent-review.yml runs this query under, reads
+#              both. A fine-grained PAT scoped to pull-requests only still
+#              satisfies the line above but gets null/403 on BOTH: the probe
+#              then reports "not enforced" (the conservative direction, so
+#              nothing unsafe happens) and arm 1 is permanently unavailable on
+#              that repo — every answer comes from the arm-2 current-head
+#              clearance probe. That state is indistinguishable from a
+#              genuinely unprotected base branch in the true/false output, so
+#              grep the job log for `enforcement probe:` lines to tell them
+#              apart before concluding a repo is unprotected.
 #   MERGE_CLEARANCE_CODEX_CHECK_BIN
 #              Optional. Path to codex-review-check.sh. Defaults to the
 #              sibling script next to this one. Tests override it to a
@@ -135,12 +152,21 @@ done
 # --derive-rate-limit-protection below because Phase-4b-cleared protected PRs
 # can be safe to auto-merge even after the removable label is gone (#713).
 #
-# --derive-rate-limit-protection (#713): QUERY mode for
+# --derive-rate-limit-protection (#713, tightened by #772): QUERY mode for
 # agent-review.yml's CodeRabbit rc=5 branch. It prints `true` when a
 # rate-limited PR is protected from bot-unreviewed auto-merge by either:
-#   1. the active merge-clearance external gate, or
+#   1. the merge-clearance external gate being ENFORCED — enabled in the
+#      governing policy AND observably a required status check on the PR's
+#      base branch (#772) — or
 #   2. intrinsic external-review applicability plus an already-satisfied
 #      current-head Codex/Phase-4b clearance predicate.
+# Arm 1 previously asked only whether the gate was enabled in CONFIG. That is
+# not evidence the gate can hold a merge: mergepath itself runs with the switch
+# on while `Merge clearance gate` is absent from base-branch protection, so the
+# query claimed protection on a repo where the gate blocks nothing. Enforcement
+# that cannot be determined is treated as NOT enforced and falls through to arm
+# 2, which is positive proof — so an undeterminable read costs availability, not
+# safety.
 # This keeps under-threshold stalls blocked while allowing the common
 # Phase-4b timing case where the APPROVED review already removed
 # `needs-external-review` before the auto-merge job re-checks CodeRabbit.
@@ -284,6 +310,323 @@ fetch_api_array() {  # <endpoint> <label>
   raw=$(gh api --paginate "$endpoint" 2>&1) || die 2 "failed to fetch $label: $raw"
   echo "$raw" | jq -s 'add // []' 2>/dev/null \
     || die 2 "failed to flatten $label pagination output"
+}
+
+# --- merge-clearance required-check enforcement probe (#772) ----------------
+#
+# The required-status-check CONTEXT this gate reports. Branch protection and
+# rulesets both key on the workflow JOB name, and
+# .github/workflows/merge-clearance-gate.yml names that job `Merge clearance
+# gate` (its scheduled-sweep and dispatch-recheck jobs POST check_runs under the
+# same CHECK_NAME so every source resolves as one context).
+# scripts/ci/check_merge_clearance_gate asserts that job name verbatim and
+# scripts/audit-branch-protection.sh carries the same string in
+# CANONICAL_REQUIRED_CHECKS, so this constant cannot drift from the workflow
+# without CI saying so.
+MERGE_CLEARANCE_CHECK_NAME="Merge clearance gate"
+
+# The app that must PRODUCE the required check for it to count as proof.
+# A context is just a string: a branch rule that requires
+# `Merge clearance gate` from a different integration — or from ANY source —
+# is satisfied by some other producer emitting that name, while this script
+# would conclude the trusted Actions job is enforced (#772 r5 P1). Both
+# surfaces carry the producer, so it is checkable: classic protection exposes
+# `required_status_checks.checks[].app_id`, rulesets expose
+# `parameters.required_status_checks[].integration_id`.
+#
+# 15368 is github.com's `github-actions` app. Verified live rather than looked
+# up: every check run on this repo's head reports `app.slug=github-actions`
+# with `app.id=15368`, and mergepath's own three required contexts are
+# recorded under that same app_id. Overridable for GitHub Enterprise Server,
+# where the id differs.
+MERGE_CLEARANCE_EXPECTED_APP_ID="${MERGE_CLEARANCE_EXPECTED_APP_ID:-15368}"
+
+# Positive proof that $MERGE_CLEARANCE_CHECK_NAME is an ENFORCED required
+# status check on the PR's base branch. Returns 0 ONLY when the context is
+# observed in a required-status-check list for $BASE_REF; returns 1 for
+# everything else — definitively absent, unknown base ref, API failure, or an
+# unparseable payload. "Undeterminable" is deliberately NOT distinguished from
+# "absent": the only caller's next step is the positive-proof current-head
+# clearance probe, so treating an unknown as not-enforced costs availability,
+# never safety (#768's positive-proof rule). Prints nothing; every diagnostic
+# goes to stderr via log() so the query's stdout stays exactly true/false.
+#
+# Why two surfaces, and why not the obvious REST endpoint: reading
+# repos/{owner}/{repo}/branches/{branch}/protection[/required_status_checks]
+# needs Administration:read and 404s for the write-scoped reviewer PAT this
+# query runs under in agent-review.yml (verified live against
+# nathanjohnpayne/mergepath). The two below are readable by a plain
+# write-scoped token and together cover both protection models:
+#   1. GraphQL ref.refUpdateRule.requiredStatusCheckContexts — CLASSIC branch
+#      protection, which is what the whole fleet uses today.
+#   2. REST repos/{owner}/{repo}/rules/branches/{branch} — repository RULESETS,
+#      the modern model. Classic protection does NOT surface there: verified
+#      live on mergepath@main, whose classic contexts are
+#      ["Label Gate","Self-Review Required","lint"] while that endpoint returns
+#      []. So neither surface alone is sufficient and the two lists are unioned.
+# Both are scoped to rules enforced on the VIEWER, so bypass filtering can only
+# HIDE a rule, never invent one — it can push this probe toward "not enforced"
+# (the conservative direction) and never toward a false "enforced".
+merge_clearance_check_enforced() {
+  local owner name contexts="" out err rc parsed observed
+  owner=${REPO%%/*}
+  name=${REPO##*/}
+
+  if [ -z "$BASE_REF" ]; then
+    log "enforcement probe: PR base ref is unknown — treating '$MERGE_CLEARANCE_CHECK_NAME' as NOT enforced"
+    return 1
+  fi
+
+  # errexit is suppressed inside a function called as an `if` condition, so an
+  # unguarded mktemp failure would leave $err empty and turn every redirect
+  # below into a confusing "no such file" — check it explicitly and take the
+  # conservative branch instead.
+  err=$(mktemp "${TMPDIR:-/tmp}/mcg-enforcement-err.XXXXXX" 2>/dev/null) || err=""
+  if [ -z "$err" ]; then
+    log "enforcement probe: could not create a scratch file for API diagnostics — treating '$MERGE_CLEARANCE_CHECK_NAME' as NOT enforced"
+    return 1
+  fi
+
+  local base_ref_enc
+  base_ref_enc=$(printf '%s' "$BASE_REF" | LC_ALL=C awk '
+    BEGIN { for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i }
+    {
+      out = ""
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (c ~ /[A-Za-z0-9._~\/-]/) out = out c
+        else out = out sprintf("%%%02X", ord[c])
+      }
+      printf "%s", out
+    }')
+  if [ -z "$base_ref_enc" ]; then
+    log "enforcement probe: could not encode base ref '$BASE_REF' for the ruleset URL — treating '$MERGE_CLEARANCE_CHECK_NAME' as NOT enforced"
+    rm -f "$err"
+    return 1
+  fi
+
+  # Surface 1 — classic branch protection.
+  set +e
+  # shellcheck disable=SC2016  # $owner/$name/$qref are GraphQL variables, bound by the -f flags below
+  out=$(gh api graphql \
+    -f query='query($owner:String!,$name:String!,$qref:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qref){refUpdateRule{requiredStatusCheckContexts}}}}' \
+    -f owner="$owner" -f name="$name" -f qref="refs/heads/$BASE_REF" 2>"$err")
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    log "enforcement probe: classic branch-protection read failed on '$BASE_REF' (gh rc=$rc): $(tr '\n' ' ' <"$err")"
+  else
+    set +e
+    parsed=$(printf '%s' "$out" \
+      | jq -r '.data.repository.ref.refUpdateRule.requiredStatusCheckContexts // [] | .[]' 2>"$err")
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+      log "enforcement probe: could not parse the classic branch-protection response for '$BASE_REF': $(tr '\n' ' ' <"$err")"
+    elif [ -n "$parsed" ]; then
+      # A required context is not proof that the MERGING identity is bound by
+      # it. Classic protection exempts repo admins unless `enforce_admins` is
+      # on, and this probe runs under the reviewer/CI token while the final
+      # `gh pr merge` runs under the author token — so a context merely
+      # VISIBLE to the reviewer would let an admin author merge on a
+      # downgraded rate-limit stall with no bot review. Same defect class as
+      # the ruleset bypass_actors case below (#772 r3 P1).
+      #
+      # `enforce_admins` is exposed only on the admin-scoped REST endpoint;
+      # GraphQL's refUpdateRule does not carry it (verified: it offers
+      # requiredStatusCheckContexts / viewerCanPush / viewerAllowedToDismiss-
+      # Reviews and nothing about admin exemption). That endpoint 404s for the
+      # write-scoped reviewer PAT this query runs under, so on the normal CI
+      # path enforcement is NOT provable here and the classic surface
+      # contributes nothing — the probe falls through to arm 2's positive-proof
+      # clearance check. Where the token IS admin-scoped, the read succeeds and
+      # the classic arm still works. Availability degrades, safety does not.
+      set +e
+      prot_out=$(gh api "repos/$REPO/branches/$base_ref_enc/protection" 2>"$err")
+      prot_rc=$?
+      set -e
+      if [ "$prot_rc" -ne 0 ]; then
+        log "enforcement probe: classic protection lists required contexts on '$BASE_REF' but admin-exemption state is unreadable with this token (gh rc=$prot_rc) — not counting the classic surface: $(tr '\n' ' ' <"$err")"
+      else
+        set +e
+        # Type-check rather than `// "unknown"`: jq's alternative operator
+        # treats `false` as empty, so an explicit enforce_admins=false would
+        # collapse into the undeterminable state. The verdict is the same
+        # either way (classic surface not counted), but the two are different
+        # facts — "admins are exempt" vs "we could not look" — and the
+        # `enforcement probe:` log lines are what an operator greps to tell a
+        # deliberately-unprotected base branch from a token-scope problem.
+        enforce_admins=$(printf '%s' "$prot_out" \
+          | jq -r 'if (.enforce_admins.enabled | type) == "boolean" then (.enforce_admins.enabled | tostring) else "unknown" end' 2>"$err")
+        prot_rc=$?
+        set -e
+        if [ "$prot_rc" -ne 0 ] || [ "$enforce_admins" = "unknown" ]; then
+          log "enforcement probe: could not determine enforce_admins on '$BASE_REF' — not counting the classic surface: $(tr '\n' ' ' <"$err")"
+        elif [ "$enforce_admins" != "true" ]; then
+          log "enforcement probe: classic protection on '$BASE_REF' requires contexts but enforce_admins=false, so an admin merger is not bound by them — not counting the classic surface"
+        else
+          # Producer check (#772 r5 P1). The same admin response carries
+          # `required_status_checks.checks[] = {context, app_id}`, so the
+          # producer is verifiable from a call already made. A context-only
+          # match would accept the required check being satisfied by some
+          # other app emitting that name.
+          set +e
+          # ANY matching entry with the trusted app is enough. Classic
+          # protection may list the same context more than once under
+          # different producers; taking `.[0]` would report not-enforced
+          # whenever a foreign entry happened to sort first, even though the
+          # expected producer IS explicitly required (#772 r6 P2).
+          classic_app=$(printf '%s' "$prot_out" | jq -r --arg ctx "$MERGE_CLEARANCE_CHECK_NAME" --arg app "$MERGE_CLEARANCE_EXPECTED_APP_ID" '
+            if (.required_status_checks.checks | type) == "array"
+            then ([ .required_status_checks.checks[] | select(.context == $ctx) | .app_id | tostring ]) as $ids
+                 | if   ($ids | length) == 0 then "absent"
+                   elif ($ids | index($app)) then $app
+                   else ($ids | join(","))
+                   end
+            else "unknown" end' 2>"$err")
+          prot_rc=$?
+          set -e
+          if [ "$prot_rc" -ne 0 ] || [ "$classic_app" = "unknown" ]; then
+            log "enforcement probe: classic protection on '$BASE_REF' does not expose per-check producer data (no checks[] array) — cannot prove '$MERGE_CLEARANCE_CHECK_NAME' comes from the trusted workflow; not counting the classic surface"
+          elif [ "$classic_app" = "absent" ]; then
+            log "enforcement probe: '$MERGE_CLEARANCE_CHECK_NAME' is not among the classic required checks on '$BASE_REF' — not counting the classic surface"
+          elif [ "$classic_app" != "$MERGE_CLEARANCE_EXPECTED_APP_ID" ]; then
+            log "enforcement probe: classic protection on '$BASE_REF' requires '$MERGE_CLEARANCE_CHECK_NAME' from app_id=$classic_app, not the expected $MERGE_CLEARANCE_EXPECTED_APP_ID — a same-named check from another producer is not proof; not counting the classic surface"
+          else
+            contexts="$contexts$parsed"$'\n'
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  # Surface 2 — repository rulesets.
+  #
+  # --paginate is load-bearing: this endpoint pages at 30 applicable rules, and
+  # stacked rulesets can push the `required_status_checks` rule carrying
+  # $MERGE_CLEARANCE_CHECK_NAME onto page 2. A truncated first page is
+  # INDISTINGUISHABLE from an absent rule — same empty match, same log line —
+  # so the omission would silently and permanently disable arm 1 on such a repo
+  # instead of announcing itself.
+  #
+  # fetch_api_array() (which also paginates) is deliberately NOT reused here:
+  # it die()s with exit 2 on a failed fetch or flatten, which would turn an
+  # unreadable rulesets endpoint into a hard failure of the entire query
+  # instead of the conservative fall-through to arm 2 that this probe's
+  # contract promises. Hence the local set +e / rc capture.
+  #
+  # --paginate emits one JSON array per page, so the filter slurps (`-s`) and
+  # concatenates with `add`; `objects` keeps a non-object page element (an
+  # error envelope on a partial-failure page) from hard-erroring the filter
+  # mid-stream.
+  #
+  # $BASE_REF is percent-encoded before interpolation. A branch name is far
+  # more permissive than a URL path segment: `#` truncates the request at a
+  # fragment (querying `.../rules/branches/feat` for a base ref `feat#2`), `%`
+  # can form an accidental escape, and `?` starts a query string — each
+  # silently reads a DIFFERENT branch's rules, or none, and an empty result is
+  # indistinguishable from "not enforced". On a ruleset-only repo the classic
+  # GraphQL surface cannot compensate, so a genuinely enforced gate would be
+  # reported unproven and the rate-limit path would block unnecessarily.
+  # `/` is deliberately left RAW: GitHub addresses nested branch names
+  # (`release/1.0`) with literal slashes in this endpoint's `{branch}`
+  # parameter, so encoding it as %2F would break the common case to guard the
+  # rare one (#772 r1 P2).
+  set +e
+  out=$(gh api --paginate "repos/$REPO/rules/branches/$base_ref_enc" 2>"$err")
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    log "enforcement probe: ruleset read failed on '$BASE_REF' (gh rc=$rc): $(tr '\n' ' ' <"$err")"
+  else
+    # Only rules that carry OUR context matter, and each is kept only if its
+    # owning ruleset provably constrains the identity that will merge.
+    #
+    # `rules/branches` filters to rules enforced on the REQUESTING identity —
+    # here the CI reviewer token — but the account that runs the final
+    # `gh pr merge` is the AUTHOR identity. A ruleset whose `bypass_actors`
+    # lists that author therefore still appears in this response while not
+    # constraining the merge at all, and counting it would reproduce the exact
+    # defect this PR exists to remove: treating configuration as enforcement.
+    # `bypass_actors` is not returned by this endpoint, so each candidate
+    # ruleset is fetched and required to have NO bypass actors. A ruleset that
+    # cannot be read, or that has any, is not proof — drop it and fall through
+    # to arm 2 (#772 r2 P1).
+    set +e
+    # A rule counts only when it requires OUR context FROM the trusted app.
+    # `integration_id` absent means the rule accepts the context from ANY
+    # producer, so an untrusted workflow emitting that name would satisfy it —
+    # not proof, and dropped here rather than trusted (#772 r5 P1).
+    ruleset_ids=$(printf '%s' "$out" \
+      | jq -r -s --arg ctx "$MERGE_CLEARANCE_CHECK_NAME" --arg app "$MERGE_CLEARANCE_EXPECTED_APP_ID" '
+          add // []
+          | [ .[]? | objects
+              | select(.type == "required_status_checks")
+              | select([ .parameters.required_status_checks[]?
+                         | select(.context == $ctx)
+                         | select((.integration_id | tostring) == $app) ] | length > 0)
+              | .ruleset_id ]
+          | map(select(. != null)) | unique | .[]' 2>"$err")
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+      log "enforcement probe: could not parse the ruleset response for '$BASE_REF': $(tr '\n' ' ' <"$err")"
+    elif [ -n "$ruleset_ids" ]; then
+      while IFS= read -r rs_id; do
+        [ -n "$rs_id" ] || continue
+        set +e
+        rs_out=$(gh api "repos/$REPO/rulesets/$rs_id" 2>"$err")
+        rs_rc=$?
+        set -e
+        if [ "$rs_rc" -ne 0 ]; then
+          log "enforcement probe: ruleset $rs_id carries '$MERGE_CLEARANCE_CHECK_NAME' on '$BASE_REF' but could not be read for bypass actors (gh rc=$rs_rc) — not counting it: $(tr '\n' ' ' <"$err")"
+          continue
+        fi
+        set +e
+        # The key must be PRESENT and an ARRAY. `[ .bypass_actors[]? ] | length`
+        # yields 0 for a genuinely empty list AND for an absent key or a null /
+        # non-array value — so an unknown payload shape would have been recorded
+        # as positive proof of "no bypass actors". That is the one direction
+        # this probe must never move in; every other unknown here falls back
+        # conservatively. Flagged independently by both reviewers.
+        bypass_count=$(printf '%s' "$rs_out" \
+          | jq -r 'if (.bypass_actors | type) == "array" then (.bypass_actors | length) else "unknown" end' 2>"$err")
+        rs_rc=$?
+        set -e
+        # An empty or non-numeric count means the payload was not the ruleset
+        # object we expected; that is not proof of zero bypass actors.
+        if [ "$rs_rc" -ne 0 ] || ! [[ "$bypass_count" =~ ^[0-9]+$ ]]; then
+          log "enforcement probe: could not read bypass actors for ruleset $rs_id (got '${bypass_count:-}') — not counting it: $(tr '\n' ' ' <"$err")"
+        elif [ "$bypass_count" -gt 0 ]; then
+          log "enforcement probe: ruleset $rs_id requires '$MERGE_CLEARANCE_CHECK_NAME' but declares $bypass_count bypass actor(s), so it does not provably constrain the merging identity — not counting it"
+        else
+          contexts="$contexts$MERGE_CLEARANCE_CHECK_NAME"$'\n'
+        fi
+      done <<EOF
+$ruleset_ids
+EOF
+    fi
+  fi
+
+  rm -f "$err"
+
+  if printf '%s' "$contexts" | grep -Fxq -- "$MERGE_CLEARANCE_CHECK_NAME"; then
+    return 0
+  fi
+  # Render the observed contexts QUOTED and comma-separated. Every name this
+  # probe compares against contains spaces — `Merge clearance gate`,
+  # `Self-Review Required` — so a space-joined list is ambiguous exactly where
+  # it matters: in `[Label Gate Self-Review Required lint]` a reader cannot
+  # tell three contexts from five, nor whether `Merge clearance gate` is
+  # present as one entry or only as fragments of its neighbours — which is
+  # the one thing this log line exists to let an operator check.
+  # awk (already required by the preflight) formats it; \047 is the octal
+  # escape for a single quote, same idiom as nested_field above. NF skips the
+  # blank line left by the trailing newline on $contexts.
+  observed=$(printf '%s' "$contexts" | awk 'NF { printf "%s\047%s\047", sep, $0; sep=", " }' || true)
+  log "enforcement probe: '$MERGE_CLEARANCE_CHECK_NAME' is NOT among the required status checks observable on base '$BASE_REF' (observed: [$observed])"
+  return 1
 }
 
 # Propagation-lane exemption (#429), HEAD-PINNED. Returns 0 (true) iff a PR
@@ -682,13 +1025,28 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
       printf 'false\n'
       exit 0
     fi
-    if [ "$EXTERNAL_GATE_ENABLED" = "true" ]; then
-      log "rate-limit protection query: active merge-clearance external gate applies on HEAD $HEAD_SHA ($REQUIRES_REASON)"
+    # Arm 1 (#713, tightened by #772): the merge-clearance gate will really
+    # hold this merge. That needs BOTH the config switch AND positive proof the
+    # check is ENFORCED on the PR's base branch. `codex.external_review_gate.
+    # enabled` alone is CONFIGURATION, not enforcement — on
+    # nathanjohnpayne/mergepath that switch is true while base `main` requires
+    # only ["Label Gate","Self-Review Required","lint"], so the pre-#772
+    # short-circuit reported protected:true on a repo where this gate cannot
+    # block anything, and agent-review.yml's rc=5 branch downgraded a
+    # CodeRabbit rate-limit stall on that strength. Enforcement that cannot be
+    # DETERMINED counts as not-enforced and falls through to arm 2, which is a
+    # positive-proof probe — so nothing is lost but availability.
+    if [ "$EXTERNAL_GATE_ENABLED" = "true" ] && merge_clearance_check_enforced; then
+      log "rate-limit protection query: '$MERGE_CLEARANCE_CHECK_NAME' is an ENFORCED required check on base '$BASE_REF' and its external arm applies on HEAD $HEAD_SHA ($REQUIRES_REASON)"
       printf 'true\n'
       exit 0
     fi
 
-    log "rate-limit protection query: external review applies on HEAD $HEAD_SHA ($REQUIRES_REASON), but merge-clearance external gate is disabled; checking current-head Codex/Phase-4b clearance"
+    # Arm 2 (#714, unchanged): no provably-enforced gate — the switch is off,
+    # the check is not required on the base branch, or enforcement was
+    # undeterminable — so fall back to proving clearance is already satisfied
+    # on THIS head.
+    log "rate-limit protection query: external review applies on HEAD $HEAD_SHA ($REQUIRES_REASON), but '$MERGE_CLEARANCE_CHECK_NAME' is not a proven-enforced required check on base '$BASE_REF' (external_review_gate.enabled=$EXTERNAL_GATE_ENABLED); checking current-head Codex/Phase-4b clearance"
     CODEX_CHECK_BIN="${MERGE_CLEARANCE_CODEX_CHECK_BIN:-$SCRIPT_DIR/codex-review-check.sh}"
     if [ ! -f "$CODEX_CHECK_BIN" ]; then
       die 2 "codex-review-check.sh not found at $CODEX_CHECK_BIN (required for rate-limit protection query)"
