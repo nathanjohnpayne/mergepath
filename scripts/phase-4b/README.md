@@ -14,7 +14,8 @@ mirror resets the switch to `false`, so any OTHER repo still opts in
 explicitly and should re-run the live adapter validation from its own
 enablement environment before flipping `phase_4b_automation.enabled: true`.
 Invocation and the trusted-path rule (run from a main-ref checkout, never
-the PR-under-review's checkout) live in REVIEW_POLICY.md and AGENTS.md.
+the PR-under-review's checkout) live in REVIEW_POLICY.md and AGENTS.md; the
+checkout's on-disk location follows `docs/agents/worktree-placement.md`.
 
 ## Components
 

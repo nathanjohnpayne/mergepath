@@ -101,6 +101,8 @@ Before an agent session goes idle, implementation-ready work must end in one of 
 
 ## Worktree lifecycle
 
+**Placement.** Where an agent-created worktree or checkout lives on disk is governed by `docs/agents/worktree-placement.md`: a hidden per-repo folder (`~/GitHub/.<repo>-worktrees/<slug>`), never `/tmp` and never a visible sibling directory. That convention covers the creation half of the lifecycle (including Phase 4b trusted main-ref checkouts); this section covers the cleanup half.
+
 Worktrees created for a task must be removed immediately after the corresponding branch is merged or deleted from the remote. Never leave a worktree checked out for a branch that is `[gone]` on the remote. Stale worktrees confuse branch/HEAD reasoning, leave dead generated artifacts around, and increase the chance an agent validates or runs commands from a dead branch.
 
 **After a merge or branch delete**, run `scripts/worktree-cleanup.sh` (dry-run) to audit stale worktrees and `scripts/worktree-cleanup.sh --apply` to remove safe candidates. The helper identifies four classes of stale state:
