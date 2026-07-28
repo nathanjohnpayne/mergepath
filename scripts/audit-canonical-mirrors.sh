@@ -35,9 +35,13 @@
 # judgment stays with whoever reviews the report. Expect false
 # positives on genuinely machine-local sections — that is by design.
 #
-# This is an on-demand / session-finalization-style LOCAL check. It is
-# deliberately NOT wired into any GitHub Actions workflow: the files it
-# audits live outside every git repo, so repository CI cannot see them.
+# This is an on-demand / session-finalization-style LOCAL check. The
+# audit RUN is deliberately not wired into any GitHub Actions workflow:
+# the files it audits live outside every git repo, so repository CI
+# cannot see them. Its hermetic parser regression suite
+# (tests/test_audit_canonical_mirrors.sh) DOES run in CI via
+# scripts/ci/check_audit_canonical_mirrors — CI guards the parser,
+# never the machine-local audit itself.
 #
 # Usage:
 #   scripts/audit-canonical-mirrors.sh [FILE ...]
@@ -63,7 +67,7 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,62p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,65p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -190,22 +194,34 @@ audit_file() {
   local file="$1"
   printf '== %s\n' "$file"
 
-  local in_fence=0 fence_marker=""
+  local in_fence=0 fence_char="" fence_len=0
   local cur_heading="" cur_annotation="" cur_pin="" seen_section=0
-  local line stripped
+  local line stripped run_char run_len
 
   while IFS= read -r line || [ -n "$line" ]; do
     # Fence tracking so a `##` inside a code block is never a heading
     # and an annotation-looking line inside one is never an annotation.
+    # Per the CommonMark closing-fence rule, a fence closes only on a
+    # run of the SAME character at least as LONG as the opening run —
+    # tracking the char and full run length (not a truncated 3-char
+    # marker) keeps a 4+-backtick outer fence (the standard way to nest
+    # a triple-backtick example) from being closed by an inner ``` line.
     stripped="${line#"${line%%[![:space:]]*}"}"
     case "$stripped" in
       '```'*|'~~~'*)
+        run_char="${stripped:0:1}"
+        run_len=0
+        while [ "${stripped:$run_len:1}" = "$run_char" ]; do
+          run_len=$((run_len + 1))
+        done
         if [ "$in_fence" -eq 0 ]; then
           in_fence=1
-          fence_marker="${stripped:0:3}"
-        elif [ "${stripped:0:3}" = "$fence_marker" ]; then
+          fence_char="$run_char"
+          fence_len="$run_len"
+        elif [ "$run_char" = "$fence_char" ] && [ "$run_len" -ge "$fence_len" ]; then
           in_fence=0
-          fence_marker=""
+          fence_char=""
+          fence_len=0
         fi
         continue
         ;;

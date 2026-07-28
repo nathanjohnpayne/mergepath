@@ -1,6 +1,8 @@
 # Worktree Placement
 
 > Canonical source: `mergepath/docs/agents/worktree-placement.md`. This file is propagated verbatim to consumer repos via the propagation manifest; edit it at the canonical source, never in a consumer copy. Machine-local vendor files (e.g. a `~/GitHub/CLAUDE.md`, `~/.codex/AGENTS.md`) that mirror this convention must carry a `> Canonical source:` annotation pointing back here — see the canonical-source discipline rule in `docs/agents/documentation-rules.md`.
+>
+> Consumer maintainers: the sync delivers this file but does not announce it. Link it from your repo's own agent-docs index (your `AGENTS.md` reading order or operating-rules equivalent) so agents actually discover it — this file is its own landing page, and nothing else in a consumer repo references it until you add that link.
 
 This convention is deliberately tech-stack-independent: it says nothing about languages, frameworks, or build tooling, only where agent-created git checkouts live on disk. It applies identically in every repo that receives it.
 

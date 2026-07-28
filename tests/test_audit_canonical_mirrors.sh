@@ -29,6 +29,12 @@
 #      with exit 0.
 #   9. Bold `> **Canonical source:**` annotation form (the style the
 #      real machine file uses) is recognized.
+#  10. A 4-backtick outer fence containing a triple-backtick inner fence
+#      (the standard way to nest a fenced example) is NOT closed by the
+#      inner ``` lines: a fake `##` heading and annotation inside the
+#      outer fence are ignored, and a real section AFTER the 4-backtick
+#      closer is still parsed (CommonMark closing-fence run-length rule;
+#      round-1 Codex regression).
 
 set -euo pipefail
 
@@ -91,6 +97,22 @@ Genuinely machine-local content, no annotation.
 ## Dangling Mirror
 
 > Canonical source: \`mergepath/docs/agents/does-not-exist.md\`
+
+## Nested Fence Mirror
+
+> Canonical source: mergepath/docs/agents/worktree-placement.md
+
+\`\`\`\`markdown
+\`\`\`bash
+## fake heading inside a nested fence
+\`\`\`
+## still inside the 4-backtick outer fence
+# Canonical source: mergepath/inside/nested/fence.md
+\`\`\`\`
+
+## After Nested Fence
+
+Real section after the 4-backtick closer, no annotation.
 EOF
 
 cp "$VENDOR" "$WORKDIR/CLAUDE.md.orig"
@@ -160,8 +182,32 @@ else
   pass "fenced-block ## heading and annotation line ignored"
 fi
 
-# summary line counts match the fixture (5 real sections)
-if grep -q '5 section(s) scanned — ok: 1, ok-unpinned: 1, missing-annotation: 1, source-missing: 1, drift: 1' <<<"$OUT"; then
+# 10a. inner ``` lines do not close the 4-backtick outer fence: the fake
+# heading and annotation inside it must never surface in the report.
+if grep -q 'inside a nested fence' <<<"$OUT" || grep -q '4-backtick outer fence' <<<"$OUT"; then
+  fail "content inside a 4-backtick outer fence leaked into the report (inner \`\`\` closed it)"
+else
+  pass "4-backtick outer fence not closed by inner triple-backtick lines"
+fi
+
+# 10b. the section owning the nested fence keeps its pre-fence annotation.
+if grep -q '\[ok-unpinned\] *## Nested Fence Mirror' <<<"$OUT"; then
+  pass "section containing a nested fence classified from its real annotation"
+else
+  fail "Nested Fence Mirror not classified ok-unpinned; output: $OUT"
+fi
+
+# 10c. the 4-backtick closer really closes the fence: the next real
+# section is parsed (with old truncated-marker tracking the closer
+# re-opened a fence and swallowed it).
+if grep -q '\[missing-annotation\] ## After Nested Fence' <<<"$OUT"; then
+  pass "real section after the 4-backtick closer still parsed"
+else
+  fail "After Nested Fence section swallowed — 4-backtick closer did not close the fence"
+fi
+
+# summary line counts match the fixture (7 real sections)
+if grep -q '7 section(s) scanned — ok: 1, ok-unpinned: 2, missing-annotation: 2, source-missing: 1, drift: 1' <<<"$OUT"; then
   pass "summary counters match fixture"
 else
   fail "summary counters wrong; output: $OUT"

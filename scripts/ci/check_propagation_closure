@@ -296,6 +296,17 @@ ALLOW_LIST=(
   # TEST, which SKIPs on consumers via the both-absent marker idiom.
   "scripts/audit-review-latency.sh"
 
+  # The #739 canonical-mirror drift triage aid — hub-only operator
+  # tooling that audits MACHINE-LOCAL vendor files (a machine's
+  # ~/GitHub/CLAUDE.md, a global ~/.codex/AGENTS.md); those files live
+  # outside every repo checkout, so no consumer ever runs it and it
+  # legitimately does not travel. check_audit_canonical_mirrors (ships
+  # via the scripts/ci/ kit) runs the hermetic TEST, which the wrapper
+  # SKIPs on consumers via the both-absent marker idiom. The paired
+  # tests/test_audit_canonical_mirrors.sh is already covered by the
+  # "tests/test_audit*" pattern above.
+  "scripts/audit-canonical-mirrors.sh"
+
   # The #662/#663 wave-audit driver — hub-only operator tooling (one
   # scoped automated review per propagation wave, run from the hub
   # against the canary; consumers never run wave audits). Referenced
