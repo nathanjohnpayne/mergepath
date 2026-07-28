@@ -599,6 +599,38 @@ echo "$out" | grep -q "ERROR: REVIEWER_ASSIGNMENT_TOKEN: NO PAT available" \
   && fail "dry-run PAT miss invoked gh; log: $(cat "$SHIM_LOG")" \
   || pass "dry-run PAT miss invokes no gh commands"
 
+# --- assertion 16b: dry-run never probes 1Password (#755 round 3) ---
+# With op ON the PATH and claude among the selected reviewers, the
+# path-a2 probe used to run BEFORE the dry-run early return — a dry
+# run could trigger biometric auth and retrieve the real reviewer PAT.
+# Shim op, re-run the dry-run miss, and assert zero op invocations.
+# ---------------------------------------------------------------------------
+OP_SHIM_LOG="$WORKDIR/op-shim.log"
+: >"$OP_SHIM_LOG"
+cat >"$SHIM_DIR/op" <<OP_EOF
+#!/bin/sh
+echo "op \$*" >>"$OP_SHIM_LOG"
+echo "fake-pat-from-op"
+OP_EOF
+chmod +x "$SHIM_DIR/op"
+TARGET10B="$WORKDIR/new-repo-dry-op-probe"
+rm -rf "$TARGET10B"
+set +e
+out=$(OP_PREFLIGHT_REVIEWER_PAT="" BOOTSTRAP_STRICT_SECRETS=1 \
+        run_wizard_nopat dryopprobe-repo \
+        --target-dir "$TARGET10B" \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new --dry-run 2>&1)
+ec=$?
+set -e
+rm -f "$SHIM_DIR/op"
+[ "$ec" -eq 0 ] \
+  && pass "dry-run with op on PATH still exits 0" \
+  || fail "dry-run with op shim failed: rc=$ec, out: $out"
+[ -s "$OP_SHIM_LOG" ] \
+  && fail "dry-run probed 1Password (op invoked): $(cat "$OP_SHIM_LOG")" \
+  || pass "dry-run never invokes op (no biometric / PAT retrieval in dry-run)"
+
 # --- assertion 17: resume preflight accepts the warnings sidecar ---
 # The preflight's bookkeeping allowlist must treat .bootstrap-state.warnings
 # (written by bootstrap::record_warning) like the other resume

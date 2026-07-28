@@ -360,8 +360,11 @@ bootstrap::_provision_reviewer_assignment_token() {
   # reference resolves the nathanpayne-claude reviewer PAT, so it is
   # only valid when claude is among the selected reviewers; a custom
   # BOOTSTRAP_REVIEWER_PAT_OP_REF override is the caller vouching for
-  # the identity behind it (#755 round 2).
-  if [ -z "$pat" ] && command -v op >/dev/null 2>&1; then
+  # the identity behind it (#755 round 2). Never probed in dry-run:
+  # the documented contract promises zero `op` side effects, and a
+  # live probe can trigger biometric auth and retrieve the real PAT
+  # (#755 round 3) — the dry-run branch below prints the plan instead.
+  if [ -z "$pat" ] && [ "${BOOTSTRAP_DRY_RUN:-0}" != "1" ] && command -v op >/dev/null 2>&1; then
     if [ "$BOOTSTRAP_REVIEWER_PAT_OP_REF" = "$BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT" ] \
        && ! bootstrap::_reviewer_selected claude "$reviewers_csv"; then
       bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN: skipping the default 1Password probe — it resolves the claude reviewer PAT and claude is not one of the selected reviewers ($reviewers_csv)"
