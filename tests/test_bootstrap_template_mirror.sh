@@ -12,10 +12,13 @@
 #   4. The name-bearing files have their mergepath references
 #      substituted to the new repo name in all three case forms
 #      (lowercase / Titlecased / UPPERCASE) + URL.
-#   4b. Consumer identity is scaffolded neutrally (#744): BRAND.md +
-#      docs/agents/repository-overview.md become "downstream consumer"
-#      stubs, the hub-only docs are excluded, and the AGENTS.md
-#      packaging/Repository-Layout section is scrubbed.
+#   4b. Consumer identity is scaffolded neutrally (#744/#747): BRAND.md
+#      + docs/agents/repository-overview.md become "downstream consumer"
+#      stubs, the hub-only docs are excluded, the AGENTS.md
+#      packaging/Repository-Layout section is scrubbed, the README.md
+#      hub identity + dead Key-Files rows are scrubbed (#747), and the
+#      REVIEW_POLICY.md wave-audit passage is reframed as hub-side
+#      machinery (#747).
 #   5. .repo-template.yml has the playground spec_test_map entry
 #      and extra_top_level_dirs dropped.
 #   6. The target has a single initial git commit.
@@ -80,12 +83,39 @@ mkdir -p \
   "$FAKE_MP/docs/agents"
 
 # --- name-bearing files (the substitution targets) ---
+# README.md mirrors the real hub README's identity shape (#747): the
+# reference-implementation tagline, the BRAND umbrella-vocabulary intro,
+# and Key-Files/Directory rows for consumer-excluded surfaces. The
+# scaffold step must scrub those AFTER substitution while leaving the
+# genuinely-shared rows and prose intact.
 cat >"$FAKE_MP/README.md" <<'EOF'
 # mergepath
+
+**Reference implementation of the AI Agent Tooling Standard.**
+
+The goal is consistent multi-agent tooling. See [`BRAND.md`](BRAND.md) for the umbrella vocabulary (Playground, Cockpit, Tiebreaker, Checks) and naming history.
 
 A template repo. See https://github.com/nathanjohnpayne/mergepath for the source.
 
 Set `MERGEPATH_ROOT=/path` then run scripts. Mergepath itself is the canonical source.
+
+## Key Files
+
+| File | Purpose |
+|---|---|
+| `AGENTS.md` | Instructions for AI agents |
+| `BRAND.md` | Mergepath umbrella vocabulary (surfaces, reserved names, naming history) |
+| `mergepath/playground/index.html` | Mergepath Playground — tune the review policy and replay recent PRs against the draft |
+| `scripts/policy-sim.sh` | Bakes real `gh` PR data into a temp copy of the Mergepath Playground for local replay |
+| `.mergepath-sync.yml` | Propagation manifest for synced canonical, kit, and templated surfaces |
+| `ai_agent_tooling_standard.md` | Full repository standard (reference) |
+
+## Directory Structure
+
+| Directory | Purpose |
+|---|---|
+| `mergepath/` | Mergepath Playground and reserved slots for future Mergepath surfaces (see `BRAND.md`) |
+| `tests/` | Automated validation |
 EOF
 
 cat >"$FAKE_MP/BRAND.md" <<'EOF'
@@ -135,6 +165,30 @@ One directory carries its justification here:
 ## Code Review Policy
 
 Every change goes through REVIEW_POLICY.md.
+EOF
+
+# REVIEW_POLICY.md with the hub-only wave-audit passage the #747
+# reframe must replace in the consumer copy. Deliberately carries NO
+# '<!-- bootstrap-loop-list-end -->' anchor, so the cross-repo loop
+# step still bails without touching the fixture (assertion 7).
+cat >"$FAKE_MP/REVIEW_POLICY.md" <<'EOF'
+# AI Agent Code Review Policy
+
+## Overview
+
+Multi-identity review policy body.
+
+### Phase 3.5: Propagation PR review lane
+
+A **propagation PR** — one opened by `scripts/sync-to-downstream.sh` to mirror canonical/kit paths from `mergepath` into a downstream consumer — is a special case of the threshold check.
+
+A lane PR is still subject to CodeRabbit advisory review (on the wave canary; see Wave audit below) and an internal reviewer-identity `APPROVED`.
+
+**Wave audit (#662).** `scripts/wave-audit.sh` dispatches a scoped automated Phase 4b review against the wave canary. Full procedure: `docs/agents/propagation-ordering.md` § Wave audit.
+
+### Phase 4: External Review
+
+Phase 4 body.
 EOF
 
 # Hub-only docs (#744) — copied verbatim they describe machinery a
@@ -407,15 +461,21 @@ grep -q "downstream \*\*consumer\*\* of the \[mergepath\]" "$TARGET/docs/agents/
   && pass "repository-overview.md scaffolded with neutral consumer framing (#744)" \
   || fail "repository-overview.md not scaffolded; got: $(head -3 "$TARGET/docs/agents/repository-overview.md")"
 
-# No residual 'mergepath' in the STILL-SUBSTITUTED name-bearing files
-# (README.md, SECURITY.md). BRAND.md + repository-overview.md are
-# excluded here: their scaffolds intentionally reference the mergepath
-# hub (URL + "mergepath is the reference implementation").
-remaining=$(grep -h -i "mergepath" "$TARGET/README.md" "$TARGET/SECURITY.md" \
-            2>/dev/null || true)
+# No residual 'mergepath' in the STILL-SUBSTITUTED name-bearing files.
+# BRAND.md + repository-overview.md are excluded here: their scaffolds
+# intentionally reference the mergepath hub (URL + "mergepath is the
+# reference implementation"). Since #747, README.md carries exactly ONE
+# intentional hub reference too — the scaffold-written tagline — so it
+# is checked with that line filtered out rather than blanket-excluded.
+remaining=$(grep -h -i "mergepath" "$TARGET/SECURITY.md" 2>/dev/null || true)
 [ -z "$remaining" ] \
   && pass "no residual 'mergepath' references in substituted name-bearing files" \
   || fail "residual 'mergepath' references found: $remaining"
+readme_residual=$(grep -i "mergepath" "$TARGET/README.md" 2>/dev/null \
+  | grep -vF "downstream consumer of the [mergepath](https://github.com/nathanjohnpayne/mergepath)" || true)
+[ -z "$readme_residual" ] \
+  && pass "README.md's only 'mergepath' reference is the intentional hub tagline (#747)" \
+  || fail "unexpected 'mergepath' references in README.md: $readme_residual"
 
 # --- assertion 4b: hub-only MACHINERY docs excluded (#744) ---
 hub_leak=""
@@ -447,6 +507,65 @@ if [ -f "$TARGET/AGENTS.md" ]; then
     || fail "AGENTS.md scrub over-removed (Code Review Policy section gone)"
 else
   fail "AGENTS.md missing from consumer mirror"
+fi
+
+# --- assertion 4d: README.md hub-identity scrub (#747) ---
+# The substituted README must have the hub tagline replaced by honest
+# downstream framing, the BRAND umbrella-vocabulary framing rewritten,
+# and the Key-Files/Directory rows for consumer-excluded surfaces
+# dropped — while the genuinely-shared rows and prose flow through.
+grep -qF "**A downstream consumer of the [mergepath](https://github.com/nathanjohnpayne/mergepath) AI-agent tooling template.**" "$TARGET/README.md" \
+  && pass "README.md tagline replaced with downstream-consumer framing (#747)" \
+  || fail "README.md tagline not replaced; got: $(sed -n 3p "$TARGET/README.md")"
+grep -qF "Reference implementation of the AI Agent Tooling Standard" "$TARGET/README.md" \
+  && fail "README.md still claims reference-implementation status" \
+  || pass "README.md reference-implementation claim scrubbed"
+grep -qF "for this repo's brand vocabulary (a bootstrap stub until replaced)" "$TARGET/README.md" \
+  && pass "README.md BRAND intro sentence rewritten to point at the stub" \
+  || fail "README.md BRAND intro sentence not rewritten"
+grep -qF "Project brand vocabulary (bootstrap stub" "$TARGET/README.md" \
+  && pass "README.md BRAND.md Key-Files row rewritten to the stub description" \
+  || fail "README.md BRAND.md Key-Files row not rewritten"
+readme_dead=""
+for marker in "playground/index.html" "policy-sim.sh" "Propagation manifest" \
+              "Playground" "umbrella vocabulary"; do
+  grep -qF "$marker" "$TARGET/README.md" && readme_dead="$readme_dead '$marker'"
+done
+[ -z "$readme_dead" ] \
+  && pass "README.md dead Key-Files/Directory rows for excluded surfaces dropped (#747)" \
+  || fail "README.md still carries hub markers:$readme_dead"
+# Shared content must survive the scrub.
+grep -qF '| `AGENTS.md` | Instructions for AI agents |' "$TARGET/README.md" \
+  && grep -qF '| `tests/` | Automated validation |' "$TARGET/README.md" \
+  && grep -qF '| `ai_agent_tooling_standard.md` | Full repository standard (reference) |' "$TARGET/README.md" \
+  && pass "README.md scrub left the shared Key-Files/Directory rows intact" \
+  || fail "README.md scrub over-removed shared rows"
+
+# --- assertion 4e: REVIEW_POLICY.md wave-audit reframe (#747) ---
+# The verbatim-copied policy must have the hub-only wave-audit
+# paragraph replaced with a hub-side pointer, plus a consumer note
+# right after the Phase 3.5 heading framing the hub-script references.
+if [ -f "$TARGET/REVIEW_POLICY.md" ]; then
+  grep -qF "**Wave audit (#662).**" "$TARGET/REVIEW_POLICY.md" \
+    && fail "REVIEW_POLICY.md still carries the hub-only wave-audit paragraph" \
+    || pass "REVIEW_POLICY.md hub-only wave-audit paragraph replaced (#747)"
+  grep -qF "**Wave audit (hub-side).**" "$TARGET/REVIEW_POLICY.md" \
+    && pass "REVIEW_POLICY.md carries the hub-side wave-audit pointer" \
+    || fail "REVIEW_POLICY.md missing the hub-side wave-audit pointer"
+  grep -qF "Full procedure: \`docs/agents/propagation-ordering.md\`" "$TARGET/REVIEW_POLICY.md" \
+    && fail "REVIEW_POLICY.md still hard-links the excluded propagation-ordering.md as a local doc" \
+    || pass "REVIEW_POLICY.md no longer hard-links propagation-ordering.md locally"
+  grep -A2 "^### Phase 3.5: Propagation PR review lane" "$TARGET/REVIEW_POLICY.md" \
+      | grep -qF "Consumer note (hub-side machinery)" \
+    && pass "REVIEW_POLICY.md consumer note inserted after the Phase 3.5 heading" \
+    || fail "REVIEW_POLICY.md consumer note missing or misplaced"
+  # Adjacent sections and the in-section cross-ref must survive.
+  grep -q "^### Phase 4: External Review" "$TARGET/REVIEW_POLICY.md" \
+    && grep -qF "see Wave audit below" "$TARGET/REVIEW_POLICY.md" \
+    && pass "REVIEW_POLICY.md reframe left adjacent sections + cross-ref intact" \
+    || fail "REVIEW_POLICY.md reframe over-removed (Phase 4 heading or cross-ref gone)"
+else
+  fail "REVIEW_POLICY.md missing from consumer mirror"
 fi
 
 # .ai_context.md has no mergepath refs to begin with — substitution
@@ -488,8 +607,9 @@ git -C "$TARGET" log -1 --format=%s | grep -q "Initial commit (bootstrapped from
   || fail "initial commit subject wrong: $(git -C "$TARGET" log -1 --format=%s)"
 
 # --- assertion 7: cross-repo loop step skipped (no anchors) ---
-# The fixture's DEPLOYMENT.md and REVIEW_POLICY.md don't even exist,
-# so the step should warn and bail without modifying the source.
+# The fixture has no DEPLOYMENT.md, and its REVIEW_POLICY.md carries no
+# '<!-- bootstrap-loop-list-end -->' anchor, so the step should warn
+# and bail without modifying the source.
 # After running, mergepath fixture's worktree should still be clean
 # on main with only the initial fixture commit.
 fixture_commits=$(git -C "$FAKE_MP" rev-list --count HEAD 2>/dev/null || echo 0)
@@ -552,17 +672,22 @@ echo "$dry_out" | grep -q "DRY-RUN" \
 
 # --- assertion 10: substitute.sh idempotent ---
 # Re-substituting an already-substituted file should be a no-op.
-cp "$TARGET/README.md" "$WORKDIR/readme-once.md"
+# SECURITY.md is the probe since #747: the scrubbed README.md now
+# intentionally carries a literal hub reference ("[mergepath](...)"
+# in the scaffold-written tagline), so it is no longer a substitution
+# fixed point — and never re-enters substitution in the real flow,
+# because the scaffold step runs after it.
+cp "$TARGET/SECURITY.md" "$WORKDIR/security-once.md"
 # Source the substitute lib + invoke directly.
 . "$ROOT/scripts/bootstrap/_lib.sh"
 . "$ROOT/scripts/bootstrap/substitute.sh"
 BOOTSTRAP_DRY_RUN=0 BOOTSTRAP_LOG_FILE="" \
   bootstrap::_substitute_one_file \
-    "$WORKDIR/readme-once.md" \
+    "$WORKDIR/security-once.md" \
     "my-new-repo" \
     "https://github.com/nathanjohnpayne/my-new-repo" \
     "a test repo" >/dev/null 2>&1
-diff -q "$TARGET/README.md" "$WORKDIR/readme-once.md" >/dev/null \
+diff -q "$TARGET/SECURITY.md" "$WORKDIR/security-once.md" >/dev/null \
   && pass "substitute_one_file is idempotent on already-substituted content" \
   || fail "substitute_one_file is not idempotent"
 
