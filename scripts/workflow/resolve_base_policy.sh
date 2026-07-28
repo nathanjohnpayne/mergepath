@@ -147,10 +147,32 @@ if [ "$policy_rc" -eq 0 ] && [ -n "$base_policy" ]; then
   exit 0
 fi
 
-if printf '%s' "$policy_msg" | grep -qiE '(^|[^0-9])404([^0-9]|$)|not found'; then
-  # Base predates the policy file — nothing stricter can be missed.
-  printf '%s\n' "$DEFAULT_CONFIG"
-  exit 0
+# Fall back ONLY on a positively identified MISSING-FILE 404. Two steps, because
+# either alone is unsound (Codex P1 on #768):
+#
+#   1. Match gh's status suffix `(HTTP 404)`, not prose. The earlier test also
+#      accepted any stderr containing "not found" or a bare "404", which
+#      matches repository-not-found, ref-not-found, and several auth errors —
+#      any of which would have downgraded a non-default-base PR to the
+#      default-branch policy, reopening exactly what this helper prevents.
+#   2. Confirm the BASE COMMIT itself resolves. A 404 for a missing repo or an
+#      unreadable ref also carries `(HTTP 404)`, so the status alone cannot
+#      tell "this repo/ref is unreadable" from "this repo/ref is fine and the
+#      file simply is not there". Only the latter proves the base predates the
+#      policy file. If the commit probe does not cleanly succeed, fail closed.
+if printf '%s' "$policy_msg" | grep -q 'HTTP 404'; then
+  set +e
+  gh api "repos/$REPO/commits/$BASE_SHA" --jq .sha >/dev/null 2>&1
+  commit_rc=$?
+  set -e
+  if [ "$commit_rc" -eq 0 ]; then
+    # Repo and ref are readable, the file is not there: the base predates the
+    # policy file, so no stricter policy can exist to miss.
+    printf '%s\n' "$DEFAULT_CONFIG"
+    exit 0
+  fi
+  echo "resolve_base_policy.sh: contents 404 for $BASE_REF@$BASE_SHA but the base commit itself does not resolve — treating as unreadable, not as a missing policy file" >&2
+  exit 2
 fi
 
 echo "resolve_base_policy.sh: could not read .github/review-policy.yml from non-default base $BASE_REF@$BASE_SHA (rc=$policy_rc): $policy_msg" >&2

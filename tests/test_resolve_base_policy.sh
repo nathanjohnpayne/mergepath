@@ -61,12 +61,17 @@ case "$PATHARG" in
     if [ "${STUB_PR_FAIL:-0}" = "1" ]; then echo "gh: server error" >&2; exit 1; fi
     cat "${STUB_PR_JSON:-/dev/null}"
     exit 0 ;;
+  repos/*/commits/*)
+    if [ "${STUB_COMMIT_FAIL:-0}" = "1" ]; then echo "gh: Not Found (HTTP 404)" >&2; exit 1; fi
+    echo '{"sha":"basesha1"}'
+    exit 0 ;;
   repos/*/contents/*)
     case "${STUB_CONTENTS_MODE:-ok}" in
       ok)    [ -z "${STUB_CONTENTS_STDERR:-}" ] || echo "$STUB_CONTENTS_STDERR" >&2
              printf 'external_review_threshold: 1\n'; exit 0 ;;
       404)   echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
       error) echo "gh: API rate limit exceeded (HTTP 403)" >&2; exit 1 ;;
+      prose) echo "gh: repository not found" >&2; exit 1 ;;
     esac ;;
 esac
 echo "{}"
@@ -75,7 +80,7 @@ chmod +x "$GH_STUB"
 export PATH="$WORK:$PATH" GH_CALLS_LOG="$CALLS_LOG"
 hash -r 2>/dev/null || true
 
-reset_env() { unset STUB_PR_FAIL STUB_CONTENTS_MODE STUB_PR_JSON STUB_CONTENTS_STDERR; : > "$CALLS_LOG"; }
+reset_env() { unset STUB_PR_FAIL STUB_CONTENTS_MODE STUB_PR_JSON STUB_CONTENTS_STDERR STUB_COMMIT_FAIL; : > "$CALLS_LOG"; }
 
 run_meta() {  # <base_ref> <default_branch>
   OUT=$(bash "$RESOLVE" --repo "$REPO" --base-ref "$1" --base-sha "basesha1" \
@@ -179,6 +184,31 @@ if [ "$RC" -eq 0 ] && [ -f "$OUT" ] \
   rm -f "$OUT"
 else
   fail "policy file was contaminated by stderr: $(cat "$OUT" 2>/dev/null)"
+fi
+
+# 9. A non-404 failure whose stderr merely CONTAINS "not found" must NOT be
+#    treated as a missing policy file. The earlier test grepped prose, so
+#    "repository not found", ref errors, and some auth failures all downgraded
+#    a non-default-base PR to the default-branch policy (#768 P1).
+reset_env
+export STUB_CONTENTS_MODE=prose
+run_meta release/1.x main
+if [ "$RC" -eq 2 ]; then
+  pass "a non-404 error containing 'not found' fails closed, not falls back (#768 P1)"
+else
+  fail "prose 'not found' should not trigger the fallback (rc=$RC out=$OUT)"
+fi
+
+# 10. A contents 404 whose BASE COMMIT does not resolve is an unreadable
+#     repo/ref, not a missing file — repo-404 and file-404 carry the same
+#     status, so the commit probe is what distinguishes them.
+reset_env
+export STUB_CONTENTS_MODE=404 STUB_COMMIT_FAIL=1
+run_meta release/1.x main
+if [ "$RC" -eq 2 ] && grep -q "does not resolve" "$WORK/err.txt"; then
+  pass "contents 404 + unresolvable base commit fails closed (#768 P1)"
+else
+  fail "unresolvable base commit should fail closed (rc=$RC out=$OUT)"
 fi
 
 echo
