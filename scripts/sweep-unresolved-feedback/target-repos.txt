@@ -4,7 +4,10 @@
 # are ignored. Read by enumerate.sh and render.sh.
 #
 # Seed list is the 9 repos surveyed by the 2026-05-13 manual sweep
-# that produced the 209-item rollup in #234.
+# that produced the 209-item rollup in #234. gaycruisebingo was added
+# in #740 after #137 showed unresolved bot threads + unrecorded
+# dispositions on an under-threshold PR there going untracked because
+# the repo was absent from this list.
 #
 # To onboard a new repo: add a line. No code changes required.
 
@@ -17,3 +20,4 @@ nathanjohnpayne/overridebroadway
 nathanjohnpayne/matchline
 nathanjohnpayne/tadlockpsychiatry
 nathanjohnpayne/mergepath
+nathanjohnpayne/gaycruisebingo
