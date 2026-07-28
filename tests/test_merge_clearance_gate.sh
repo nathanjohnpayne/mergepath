@@ -1646,6 +1646,33 @@ else
   fail "protection: bypassable ruleset expected false/0; got rc=$RC out='$OUT'"
 fi
 
+echo; echo "--- Protection 1m (#772 r4): a ruleset payload OMITTING bypass_actors is not proof"
+# `[ .bypass_actors[]? ] | length` is 0 both for an empty list and for an
+# ABSENT key, so an unknown payload shape would have been recorded as positive
+# proof of "no bypass actors" — the one direction this probe must never move
+# in. Flagged independently by CodeRabbit (Major) and Codex (P1).
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+NOKEY_OBJ="$WORKDIR/ruleset-nokey.$$.json"
+jq -n '{ id: 101, name: "no-bypass-key" }' >"$NOKEY_OBJ"
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESET_OBJ="$NOKEY_OBJ" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: ruleset payload without a bypass_actors key → not counted → false"
+else
+  fail "protection: missing bypass_actors key expected false/0; got rc=$RC out='$OUT'"
+fi
+
 echo; echo "--- Protection 1j (#772 r2 P1): an unreadable ruleset object is not proof of enforcement"
 SCRATCH=$(make_scratch false true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")

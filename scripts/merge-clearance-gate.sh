@@ -533,7 +533,14 @@ merge_clearance_check_enforced() {
           continue
         fi
         set +e
-        bypass_count=$(printf '%s' "$rs_out" | jq -r '[ .bypass_actors[]? ] | length' 2>"$err")
+        # The key must be PRESENT and an ARRAY. `[ .bypass_actors[]? ] | length`
+        # yields 0 for a genuinely empty list AND for an absent key or a null /
+        # non-array value — so an unknown payload shape would have been recorded
+        # as positive proof of "no bypass actors". That is the one direction
+        # this probe must never move in; every other unknown here falls back
+        # conservatively. Flagged independently by both reviewers.
+        bypass_count=$(printf '%s' "$rs_out" \
+          | jq -r 'if (.bypass_actors | type) == "array" then (.bypass_actors | length) else "unknown" end' 2>"$err")
         rs_rc=$?
         set -e
         # An empty or non-numeric count means the payload was not the ruleset
