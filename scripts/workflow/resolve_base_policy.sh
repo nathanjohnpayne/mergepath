@@ -85,15 +85,22 @@ command -v jq >/dev/null 2>&1 || { echo "resolve_base_policy.sh: jq is required"
 if [ -z "$BASE_REF" ] || [ -z "$BASE_SHA" ] || [ -z "$DEFAULT_BRANCH" ]; then
   [ -n "$PR_NUMBER" ] || usage
   [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "resolve_base_policy.sh: --pr must be an integer" >&2; exit 2; }
+  # Keep stdout and stderr SEPARATE. Merging them (2>&1) would let a gh
+  # warning on an otherwise-successful call land inside the JSON, and inside
+  # the POLICY CONTENT on the fetch below — the #715/#716 failure class, which
+  # is why this repo already has gh_api_capture elsewhere.
+  pr_err=$(mktemp "${TMPDIR:-/tmp}/resolve-policy-pr-err.XXXXXX")
   set +e
-  pr_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1)
+  pr_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>"$pr_err")
   pr_rc=$?
   set -e
+  pr_msg=$(cat "$pr_err" 2>/dev/null || true)
+  rm -f "$pr_err"
   if [ "$pr_rc" -ne 0 ]; then
     # Could not determine the base at all. See the asymmetry note below: an
     # UNKNOWN base is not evidence of a non-default one, so fall back rather
     # than manufacture a blocking failure in every caller.
-    echo "resolve_base_policy.sh: could not fetch PR metadata for $REPO#$PR_NUMBER ($pr_json); assuming the default-branch policy governs" >&2
+    echo "resolve_base_policy.sh: could not fetch PR metadata for $REPO#$PR_NUMBER ($pr_msg); assuming the default-branch policy governs" >&2
     printf '%s\n' "$DEFAULT_CONFIG"
     exit 0
   fi
@@ -129,11 +136,17 @@ fi
 
 [ -n "$BASE_SHA" ] || { echo "resolve_base_policy.sh: non-default base $BASE_REF has no base sha" >&2; exit 2; }
 
+# Separate streams: stdout is the raw policy FILE, so a stderr warning merged
+# into it would be written into the temp policy verbatim and silently corrupt
+# every threshold/path/reviewer decision made from it.
+policy_err=$(mktemp "${TMPDIR:-/tmp}/resolve-policy-err.XXXXXX")
 set +e
 base_policy=$(gh api "repos/$REPO/contents/.github/review-policy.yml?ref=$BASE_SHA" \
-  -H "Accept: application/vnd.github.raw" 2>&1)
+  -H "Accept: application/vnd.github.raw" 2>"$policy_err")
 policy_rc=$?
 set -e
+policy_msg=$(cat "$policy_err" 2>/dev/null || true)
+rm -f "$policy_err"
 
 if [ "$policy_rc" -eq 0 ] && [ -n "$base_policy" ]; then
   tmp=$(mktemp "${TMPDIR:-/tmp}/base-review-policy.XXXXXX")
@@ -142,11 +155,11 @@ if [ "$policy_rc" -eq 0 ] && [ -n "$base_policy" ]; then
   exit 0
 fi
 
-if printf '%s' "$base_policy" | grep -qiE '(^|[^0-9])404([^0-9]|$)|not found'; then
+if printf '%s' "$policy_msg" | grep -qiE '(^|[^0-9])404([^0-9]|$)|not found'; then
   # Base predates the policy file — nothing stricter can be missed.
   printf '%s\n' "$DEFAULT_CONFIG"
   exit 0
 fi
 
-echo "resolve_base_policy.sh: could not read .github/review-policy.yml from non-default base $BASE_REF@$BASE_SHA (rc=$policy_rc): $base_policy" >&2
+echo "resolve_base_policy.sh: could not read .github/review-policy.yml from non-default base $BASE_REF@$BASE_SHA (rc=$policy_rc): $policy_msg" >&2
 exit 2

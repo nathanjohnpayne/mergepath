@@ -64,7 +64,8 @@ case "$PATHARG" in
     exit 0 ;;
   repos/*/contents/*)
     case "${STUB_CONTENTS_MODE:-ok}" in
-      ok)    printf 'external_review_threshold: 1\n'; exit 0 ;;
+      ok)    [ -z "${STUB_CONTENTS_STDERR:-}" ] || echo "$STUB_CONTENTS_STDERR" >&2
+             printf 'external_review_threshold: 1\n'; exit 0 ;;
       404)   echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
       error) echo "gh: API rate limit exceeded (HTTP 403)" >&2; exit 1 ;;
     esac ;;
@@ -75,7 +76,7 @@ chmod +x "$GH_STUB"
 export PATH="$WORK:$PATH" GH_CALLS_LOG="$CALLS_LOG"
 hash -r 2>/dev/null || true
 
-reset_env() { unset STUB_PR_FAIL STUB_CONTENTS_MODE STUB_PR_JSON; : > "$CALLS_LOG"; }
+reset_env() { unset STUB_PR_FAIL STUB_CONTENTS_MODE STUB_PR_JSON STUB_CONTENTS_STDERR; : > "$CALLS_LOG"; }
 
 run_meta() {  # <base_ref> <default_branch>
   OUT=$(bash "$RESOLVE" --repo "$REPO" --base-ref "$1" --base-sha "basesha1" \
@@ -156,6 +157,25 @@ if [ "$RC" -eq 0 ] && [ -f "$OUT" ] && grep -q "external_review_threshold: 1" "$
   rm -f "$OUT"
 else
   fail "--pr form (rc=$RC out=$OUT)"
+fi
+
+# 8. A gh warning on an otherwise-SUCCESSFUL contents fetch must not end up
+#    inside the policy file. stdout here is the raw policy, so merging streams
+#    would write the warning into it verbatim and silently corrupt every
+#    threshold/path/reviewer decision made from it (#715/#716 class, caught by
+#    CodeRabbit on #768 — this suite originally missed it because the stub only
+#    emitted stderr on FAILURE).
+reset_env
+export STUB_CONTENTS_MODE=ok
+export STUB_CONTENTS_STDERR="gh: a non-fatal informational notice on stderr"
+run_meta release/1.x main
+if [ "$RC" -eq 0 ] && [ -f "$OUT" ] \
+   && grep -q "external_review_threshold: 1" "$OUT" \
+   && ! grep -q "informational notice" "$OUT"; then
+  pass "stderr noise on a successful fetch never reaches the policy file (#715/#716 class)"
+  rm -f "$OUT"
+else
+  fail "policy file was contaminated by stderr: $(cat "$OUT" 2>/dev/null)"
 fi
 
 echo
