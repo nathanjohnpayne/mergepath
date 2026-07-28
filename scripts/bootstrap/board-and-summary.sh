@@ -448,6 +448,15 @@ bootstrap::_print_summary() {
     echo "  - Population of .env.local from Firebase web console is manual."
     echo "  - Reviewer-identity collaborator invites must be accepted by each"
     echo "    agent account at https://github.com/$full_repo/invitations."
+    # Recorded per-run failures (bootstrap::record_warning) — e.g. a
+    # missed REVIEWER_ASSIGNMENT_TOKEN provisioning (#734). Persisted
+    # in the state-file sidecar so they survive --resume; surfacing
+    # them here makes a miss impossible to ship unnoticed.
+    if [ -n "${BOOTSTRAP_STATE_FILE:-}" ] && [ -s "${BOOTSTRAP_STATE_FILE}.warnings" ]; then
+      echo
+      echo "  !! RECORDED FAILURES (fix before the first PR):"
+      sed 's/^/  !! - /' "${BOOTSTRAP_STATE_FILE}.warnings"
+    fi
     echo
     echo "CROSS-REPO LOOP UPDATE:"
     echo "  See template-mirror stage output above for the PR (if anchors"

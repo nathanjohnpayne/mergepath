@@ -39,6 +39,9 @@
 #
 # Env overrides for tests:
 #   BOOTSTRAP_SKIP_SECRETS=1            skip steps 4+5 (no live PAT lookup)
+#   BOOTSTRAP_STRICT_SECRETS=1          fail the stage when REVIEWER_ASSIGNMENT_TOKEN
+#                                       cannot be provisioned (default: record the
+#                                       miss + continue; summary surfaces it)
 #   BOOTSTRAP_REVIEWER_PAT_VALUE=...    supply the PAT inline (path c) for tests
 #   BOOTSTRAP_SKIP_INVITE_PAUSE=1       don't wait for "press enter to continue"
 #   BOOTSTRAP_SKIP_AUTHOR_TOKEN=1       tests only: run gh shim directly instead
@@ -67,10 +70,16 @@ BOOTSTRAP_LABELS=(
   "phase-4:bfd4f2:Phase 4"
 )
 
-# 1Password item ID for the REVIEWER_ASSIGNMENT_TOKEN PAT. If this
-# item exists in the operator's vault, sub-step 4 reuses it. Override
+# 1Password reference for the REVIEWER_ASSIGNMENT_TOKEN PAT (the
+# nathanpayne-claude reviewer PAT). MUST be an item-UUID path, never a
+# title path — title lookups don't reliably resolve, and the old
+# title-based default (the item titled REVIEWER_ASSIGNMENT_PAT)
+# silently shipped repos without the secret (#734; CLAUDE.md § 1Password Reviewer PAT
+# Lookup: "Always look a PAT up by 1Password item ID, never by item
+# title"). Sub-step 4 prefers the session-cached
+# $OP_PREFLIGHT_REVIEWER_PAT before probing this reference. Override
 # via BOOTSTRAP_REVIEWER_PAT_OP_REF for tests / alternate vaults.
-BOOTSTRAP_REVIEWER_PAT_OP_REF="${BOOTSTRAP_REVIEWER_PAT_OP_REF:-op://Private/REVIEWER_ASSIGNMENT_PAT/token}"
+BOOTSTRAP_REVIEWER_PAT_OP_REF="${BOOTSTRAP_REVIEWER_PAT_OP_REF:-op://Private/pvbq24vl2h6gl7yjclxy2hbote/token}"
 
 bootstrap::stage_github_infra() {
   bootstrap::stage_banner "github-infra"
@@ -137,11 +146,18 @@ bootstrap::stage_github_infra() {
   else
     bootstrap::_provision_reviewer_assignment_token "$full_repo" || step_rc=$?
     if [ "$step_rc" -ne 0 ]; then
-      # Secret failures are warned-but-not-fatal — workflows will
-      # fail loudly on the first PR if the token isn't set, surfacing
-      # the issue. We don't want to block the bootstrap on the human
-      # finding a PAT.
-      bootstrap::warn "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$step_rc); workflows will require manual secret-set on first PR"
+      # By default secret failures are recorded-but-not-fatal —
+      # workflows will fail loudly on the first PR if the token isn't
+      # set, and the end-of-run summary carries the recorded warning
+      # (#734). We don't want to block the bootstrap on the human
+      # finding a PAT. BOOTSTRAP_STRICT_SECRETS=1 upgrades the miss
+      # to a stage failure for callers that must not ship without it.
+      if [ "${BOOTSTRAP_STRICT_SECRETS:-0}" = "1" ]; then
+        bootstrap::err "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$step_rc) and BOOTSTRAP_STRICT_SECRETS=1 — failing the stage"
+        bootstrap::_restore_active_if_needed
+        return "$step_rc"
+      fi
+      bootstrap::record_warning "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$step_rc); workflows will require manual secret-set on first PR"
       step_rc=0
     fi
 
@@ -291,7 +307,16 @@ bootstrap::_provision_reviewer_assignment_token() {
     bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN: using inline value from BOOTSTRAP_REVIEWER_PAT_VALUE"
   fi
 
-  # Path a (preferred): look up an existing PAT in 1Password.
+  # Path a (preferred): reuse the reviewer PAT already cached by
+  # scripts/op-preflight.sh in this session. No op call, no biometric
+  # prompt, and it's the same nathanpayne-claude PAT the op reference
+  # below resolves (#734).
+  if [ -z "$pat" ] && [ -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]; then
+    pat="$OP_PREFLIGHT_REVIEWER_PAT"
+    bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN: reusing session-cached \$OP_PREFLIGHT_REVIEWER_PAT"
+  fi
+
+  # Path a2: look up the PAT in 1Password by item UUID.
   if [ -z "$pat" ] && command -v op >/dev/null 2>&1; then
     bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN: probing 1Password at $BOOTSTRAP_REVIEWER_PAT_OP_REF"
     # Tolerate op timeouts — fall through to the prompt path if
@@ -307,7 +332,18 @@ bootstrap::_provision_reviewer_assignment_token() {
   if [ -z "$pat" ]; then
     if [ "${BOOTSTRAP_AUTO_PROMPT:-prompt}" = "skip" ] \
        || [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
-      bootstrap::warn "REVIEWER_ASSIGNMENT_TOKEN: no PAT available + prompts skipped; not setting secret"
+      # Loud miss (#734): the old warn-and-continue made a broken op
+      # reference ship unnoticed — the repo looked fully bootstrapped
+      # but its first PR's reviewer-assignment workflows failed. Emit
+      # ERROR-level lines with the remediation command, record the
+      # miss for the end-of-run summary, and honor the strict knob.
+      bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: NO PAT available and prompts are skipped — secret NOT set on $full_repo"
+      bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: reviewer-assignment / agent-review workflows WILL FAIL on the first PR until it is set"
+      bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: fix: printf '%s' \"\$OP_PREFLIGHT_REVIEWER_PAT\" | gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo $full_repo"
+      bootstrap::record_warning "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (no PAT available, prompts skipped) — set it manually before the first PR"
+      if [ "${BOOTSTRAP_STRICT_SECRETS:-0}" = "1" ]; then
+        return 1
+      fi
       return 0
     fi
     echo
@@ -318,7 +354,10 @@ bootstrap::_provision_reviewer_assignment_token() {
     read -r -s -p "Paste the PAT (input hidden, blank to skip): " pat
     echo
     if [ -z "$pat" ]; then
-      bootstrap::warn "REVIEWER_ASSIGNMENT_TOKEN: human declined to provide a PAT; first PR will fail until manually set"
+      bootstrap::record_warning "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (human declined to provide a PAT) — set it manually before the first PR"
+      if [ "${BOOTSTRAP_STRICT_SECRETS:-0}" = "1" ]; then
+        return 1
+      fi
       return 0
     fi
   fi

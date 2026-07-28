@@ -364,6 +364,113 @@ awk '
   && pass "_provision_reviewer_assignment_token uses '|| set_rc=\$?' inline on gh secret set pipeline" \
   || fail "rc-capture-inline invariant violated (regression of nathanpayne-claude #239 r2 P1)"
 
+# --- assertion 11: reviewer-PAT op reference defaults (#734) ---
+# The default BOOTSTRAP_REVIEWER_PAT_OP_REF must be the item-UUID path;
+# title-based op://…/<title>/… paths don't reliably resolve and silently
+# shipped repos without REVIEWER_ASSIGNMENT_TOKEN. Guard against the
+# stale title path reappearing anywhere in the bootstrap scripts.
+# ---------------------------------------------------------------------------
+grep -q 'op://Private/pvbq24vl2h6gl7yjclxy2hbote/token' "$ROOT/scripts/bootstrap/github-infra.sh" \
+  && pass "default reviewer-PAT op ref is the item-UUID path (#734)" \
+  || fail "UUID op ref missing from github-infra.sh"
+grep -rq 'op://Private/REVIEWER_ASSIGNMENT_PAT' "$ROOT/scripts/bootstrap/" \
+  && fail "stale title-based op ref still present in scripts/bootstrap/ (#734 regression)" \
+  || pass "no title-based op://…/REVIEWER_ASSIGNMENT_PAT/… reference remains"
+
+# Variant runner without the inline PAT so the cached-env / miss paths
+# are reachable (run_wizard pins BOOTSTRAP_REVIEWER_PAT_VALUE).
+run_wizard_nopat() {
+  PATH="$SHIM_PATH" \
+  SHIM_LOG="$SHIM_LOG" \
+  BOOTSTRAP_MERGEPATH_ROOT="$FAKE_MP" \
+  BOOTSTRAP_SKIP_TOOL_CHECK=1 \
+  BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+  BOOTSTRAP_AUTO_CONFIRM=1 \
+  BOOTSTRAP_AUTO_PROMPT=skip \
+  BOOTSTRAP_AUTHOR_NAME="test" \
+  BOOTSTRAP_AUTHOR_EMAIL="t@t" \
+  BOOTSTRAP_SKIP_AUTHOR_TOKEN=1 \
+  BOOTSTRAP_SKIP_INVITE_PAUSE=1 \
+  BOOTSTRAP_SKIP_STAGES=board-and-summary \
+  "$SCRIPT" "$@"
+}
+
+# --- assertion 12: session-cached OP_PREFLIGHT_REVIEWER_PAT is preferred ---
+# With no inline PAT, the provisioning step must reuse the cached
+# reviewer PAT (no op probe needed) and set the secret (#734).
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET6="$WORKDIR/new-repo-cached-pat"
+rm -rf "$TARGET6"
+set +e
+out=$(OP_PREFLIGHT_REVIEWER_PAT="cached-fake-pat" run_wizard_nopat cachedpat-repo \
+        --target-dir "$TARGET6" \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new 2>&1)
+ec=$?
+set -e
+[ "$ec" -eq 0 ] \
+  && pass "cached-PAT run completes (rc=0)" \
+  || fail "cached-PAT run failed: rc=$ec, out: $out"
+grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/cachedpat-repo\$" "$SHIM_LOG" \
+  && pass "REVIEWER_ASSIGNMENT_TOKEN set from cached \$OP_PREFLIGHT_REVIEWER_PAT" \
+  || fail "secret not set from cached PAT; log: $(grep secret "$SHIM_LOG" || true)"
+echo "$out" | grep -q "reusing session-cached" \
+  && pass "provisioning logs the cached-PAT path" \
+  || fail "missing cached-PAT log line; out: $out"
+
+# --- assertion 13: PAT miss is LOUD + recorded, but non-fatal by default ---
+# No inline PAT, no cached PAT, no op on the shim PATH, prompts skipped:
+# the run must still exit 0 (default soft-fail) but emit ERROR-level
+# lines and persist the miss to the .bootstrap-state.warnings sidecar
+# the summary re-surfaces (#734).
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET7="$WORKDIR/new-repo-pat-miss"
+rm -rf "$TARGET7"
+set +e
+out=$(OP_PREFLIGHT_REVIEWER_PAT="" run_wizard_nopat patmiss-repo \
+        --target-dir "$TARGET7" \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new 2>&1)
+ec=$?
+set -e
+[ "$ec" -eq 0 ] \
+  && pass "PAT-miss run still exits 0 by default (soft-fail)" \
+  || fail "PAT-miss run failed: rc=$ec, out: $out"
+grep -qF "gh secret set REVIEWER_ASSIGNMENT_TOKEN" "$SHIM_LOG" \
+  && fail "secret set invoked despite no PAT available" \
+  || pass "no secret-set call on the miss path"
+echo "$out" | grep -q "ERROR: REVIEWER_ASSIGNMENT_TOKEN: NO PAT available" \
+  && pass "PAT miss emits ERROR-level lines (loud, #734)" \
+  || fail "missing loud ERROR on PAT miss; out: $out"
+[ -s "$TARGET7/.bootstrap-state.warnings" ] \
+  && grep -q "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned" "$TARGET7/.bootstrap-state.warnings" \
+  && pass "PAT miss recorded in .bootstrap-state.warnings sidecar" \
+  || fail "warnings sidecar missing or empty: $(cat "$TARGET7/.bootstrap-state.warnings" 2>/dev/null)"
+
+# --- assertion 14: BOOTSTRAP_STRICT_SECRETS=1 upgrades the miss to a
+# stage failure (nonzero exit; github-infra not recorded). ---
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET8="$WORKDIR/new-repo-strict-miss"
+rm -rf "$TARGET8"
+set +e
+out=$(OP_PREFLIGHT_REVIEWER_PAT="" BOOTSTRAP_STRICT_SECRETS=1 run_wizard_nopat strictmiss-repo \
+        --target-dir "$TARGET8" \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new 2>&1)
+ec=$?
+set -e
+[ "$ec" -ne 0 ] \
+  && pass "BOOTSTRAP_STRICT_SECRETS=1 fails the run on a PAT miss (rc=$ec)" \
+  || fail "strict-secrets run should fail on a PAT miss; rc=$ec, out: $out"
+if [ -f "$TARGET8/.bootstrap-state" ] && grep -q "^github-infra\$" "$TARGET8/.bootstrap-state"; then
+  fail "github-infra recorded despite strict-secrets PAT miss"
+else
+  pass "github-infra NOT recorded under strict-secrets PAT miss (resume can retry)"
+fi
+
 # --- summary --------------------------------------------------------------
 echo
 echo "test_bootstrap_github_infra: $PASS passed, $FAIL failed"
