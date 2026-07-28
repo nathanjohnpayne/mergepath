@@ -947,6 +947,18 @@ paths:
     type: canonical
     consumers: all
 
+  # Canonical docs — small, dedicated, tech-stack-independent policy
+  # files that are universal enough to mirror verbatim (#739 Option B).
+  # Unlike the identity/hub-only docs denylisted above (check 8), these
+  # files are written to be TRUE verbatim in every consumer: no hub
+  # identity claims, no repo-specific tech-stack content, no references
+  # to machinery a consumer doesn't run. Keep each one single-purpose;
+  # a universal rule that needs repo-specific prose around it belongs
+  # in the consumer's own docs with a cross-link, not here.
+  - path: docs/agents/worktree-placement.md
+    type: canonical
+    consumers: all
+
   # Canonical workflows — review policy + automation surfaces that
   # should be lockstep across all consumers.
   - path: .github/pull_request_template.md

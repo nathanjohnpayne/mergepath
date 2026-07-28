@@ -162,6 +162,20 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   'scripts/wave-audit.sh'
   'tests/test_wave_audit.sh'
 
+  # #739 canonical-mirror drift triage aid - hub-only, excluded like the
+  # wave-audit pair above: the audit reads MACHINE-LOCAL vendor files
+  # (~/GitHub/CLAUDE.md, ~/.codex/AGENTS.md) against the mergepath
+  # checkout, and its default MERGEPATH_ROOT is the script's own repo
+  # root - shipped to a consumer it would resolve the CONSUMER checkout
+  # as the canonical source and misreport every annotation. The paired
+  # hermetic suite goes with it. scripts/ci/check_audit_canonical_mirrors
+  # is deliberately NOT excluded: the mirrored repo_lint.yml wires it as
+  # a step, so the wrapper must ship and take its consumer-SKIP path
+  # (test + sync-to-downstream marker both absent) - same shape as
+  # check_wave_audit.
+  'scripts/audit-canonical-mirrors.sh'
+  'tests/test_audit_canonical_mirrors.sh'
+
   # Hub identity docs — do NOT duplicate mergepath's self-referential
   # hub identity into a consumer (#744). Two groups:
   #
