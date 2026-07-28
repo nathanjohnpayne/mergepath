@@ -404,13 +404,16 @@ run_wizard_nopat() {
 
 # --- assertion 12: session-cached OP_PREFLIGHT_REVIEWER_PAT is preferred ---
 # With no inline PAT, the provisioning step must reuse the cached
-# reviewer PAT (no op probe needed) and set the secret (#734).
+# reviewer PAT (no op probe needed) and set the secret (#734) —
+# provided the cache's owning agent ($OP_PREFLIGHT_AGENT, exported by
+# op-preflight.sh) is among the selected reviewers (#755 round 2).
 # ---------------------------------------------------------------------------
 : >"$SHIM_LOG"
 TARGET6="$WORKDIR/new-repo-cached-pat"
 rm -rf "$TARGET6"
 set +e
-out=$(OP_PREFLIGHT_REVIEWER_PAT="cached-fake-pat" run_wizard_nopat cachedpat-repo \
+out=$(OP_PREFLIGHT_REVIEWER_PAT="cached-fake-pat" OP_PREFLIGHT_AGENT="claude" \
+        run_wizard_nopat cachedpat-repo \
         --target-dir "$TARGET6" \
         --description d --visibility private \
         --firebase none --codex-app n --project new 2>&1)
@@ -425,6 +428,58 @@ grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/cachedp
 echo "$out" | grep -q "reusing session-cached" \
   && pass "provisioning logs the cached-PAT path" \
   || fail "missing cached-PAT log line; out: $out"
+
+# --- assertion 12b: cached-PAT identity mismatch falls through ---
+# The cached PAT belongs to $OP_PREFLIGHT_AGENT, which may not be in
+# the wizard's --reviewers selection. Installing it anyway would make
+# the secret authenticate as an uninvited account (#755 round 2,
+# Codex P2 x2). With agent=codex but reviewers=claude,cursor (and no
+# op on the shim PATH), provisioning must NOT reuse the cache and
+# must land on the loud-miss path instead.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET6B="$WORKDIR/new-repo-cached-pat-mismatch"
+rm -rf "$TARGET6B"
+set +e
+out=$(OP_PREFLIGHT_REVIEWER_PAT="cached-fake-pat" OP_PREFLIGHT_AGENT="codex" \
+        run_wizard_nopat cachedmismatch-repo \
+        --target-dir "$TARGET6B" \
+        --reviewers claude,cursor \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new 2>&1)
+ec=$?
+set -e
+[ "$ec" -eq 0 ] \
+  && pass "mismatched cached-PAT run still completes (rc=0, default soft-fail)" \
+  || fail "mismatched cached-PAT run failed: rc=$ec, out: $out"
+grep -qF "gh secret set REVIEWER_ASSIGNMENT_TOKEN" "$SHIM_LOG" \
+  && fail "secret set from a cached PAT whose agent is not a selected reviewer" \
+  || pass "mismatched cached PAT is NOT installed as the secret"
+echo "$out" | grep -q "NOT reusing session-cached" \
+  && pass "mismatch fall-through is logged" \
+  || fail "missing mismatch log line; out: $out"
+echo "$out" | grep -q "ERROR: REVIEWER_ASSIGNMENT_TOKEN: NO PAT available" \
+  && pass "mismatch falls through to the loud-miss path" \
+  || fail "expected loud miss after mismatch fall-through; out: $out"
+
+# --- assertion 12c: unverifiable cached-PAT identity also falls through ---
+# OP_PREFLIGHT_REVIEWER_PAT set but OP_PREFLIGHT_AGENT unset: identity
+# cannot be verified, so the cache must not be installed (fail closed).
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET6C="$WORKDIR/new-repo-cached-pat-noagent"
+rm -rf "$TARGET6C"
+set +e
+out=$(OP_PREFLIGHT_REVIEWER_PAT="cached-fake-pat" OP_PREFLIGHT_AGENT="" \
+        run_wizard_nopat cachednoagent-repo \
+        --target-dir "$TARGET6C" \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new 2>&1)
+ec=$?
+set -e
+grep -qF "gh secret set REVIEWER_ASSIGNMENT_TOKEN" "$SHIM_LOG" \
+  && fail "secret set from a cached PAT with unverifiable agent identity" \
+  || pass "cached PAT with unset \$OP_PREFLIGHT_AGENT is NOT installed (fail closed)"
 
 # --- assertion 13: PAT miss is LOUD + recorded, but non-fatal by default ---
 # No inline PAT, no cached PAT, no op on the shim PATH, prompts skipped:
@@ -510,6 +565,77 @@ fi
   && grep -q "REVIEWER_ASSIGNMENT_TOKEN provisioning failed" "$TARGET9/.bootstrap-state.warnings" \
   && pass "strict-secrets gh-secret-set failure recorded in .bootstrap-state.warnings sidecar" \
   || fail "warnings sidecar missing the strict-mode secret-set failure: $(cat "$TARGET9/.bootstrap-state.warnings" 2>/dev/null)"
+
+# --- assertion 16: dry-run PAT miss is pure (#755 round 2) ---
+# A dry run carries no credentials, so a PAT miss there is EXPECTED:
+# it must print [DRY-RUN] plan lines, write NO .bootstrap-state.warnings
+# sidecar, emit no ERROR-level loud-miss lines about a repo that was
+# never created, and NOT fail under BOOTSTRAP_STRICT_SECRETS=1.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET10="$WORKDIR/new-repo-dry-pat-miss"
+rm -rf "$TARGET10"
+set +e
+out=$(OP_PREFLIGHT_REVIEWER_PAT="" BOOTSTRAP_STRICT_SECRETS=1 \
+        run_wizard_nopat drypatmiss-repo \
+        --target-dir "$TARGET10" \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new --dry-run 2>&1)
+ec=$?
+set -e
+[ "$ec" -eq 0 ] \
+  && pass "dry-run PAT miss exits 0 even under BOOTSTRAP_STRICT_SECRETS=1" \
+  || fail "dry-run PAT miss failed under strict-secrets: rc=$ec, out: $out"
+echo "$out" | grep -q "\[DRY-RUN\] REVIEWER_ASSIGNMENT_TOKEN" \
+  && pass "dry-run PAT miss prints [DRY-RUN] plan lines" \
+  || fail "missing [DRY-RUN] REVIEWER_ASSIGNMENT_TOKEN plan lines; out: $out"
+echo "$out" | grep -q "ERROR: REVIEWER_ASSIGNMENT_TOKEN: NO PAT available" \
+  && fail "dry-run PAT miss emitted the live-run loud-miss ERROR lines" \
+  || pass "dry-run PAT miss emits no loud-miss ERROR lines"
+[ -f "$TARGET10/.bootstrap-state.warnings" ] \
+  && fail "dry-run PAT miss wrote the warnings sidecar: $(cat "$TARGET10/.bootstrap-state.warnings")" \
+  || pass "dry-run PAT miss writes no .bootstrap-state.warnings sidecar"
+[ -s "$SHIM_LOG" ] \
+  && fail "dry-run PAT miss invoked gh; log: $(cat "$SHIM_LOG")" \
+  || pass "dry-run PAT miss invokes no gh commands"
+
+# --- assertion 17: resume preflight accepts the warnings sidecar ---
+# The preflight's bookkeeping allowlist must treat .bootstrap-state.warnings
+# (written by bootstrap::record_warning) like the other resume
+# bookkeeping files; before this fix any run that recorded a warning
+# poisoned its own --resume with "target dir is not empty" (#755
+# round 2). Record a warning through the real helper, then assert a
+# resume run gets past preflight.
+# ---------------------------------------------------------------------------
+TARGET11="$WORKDIR/new-repo-resume-warn"
+rm -rf "$TARGET11"
+mkdir -p "$TARGET11"
+(
+  export BOOTSTRAP_STATE_FILE="$TARGET11/.bootstrap-state"
+  # shellcheck disable=SC1091
+  . "$FAKE_MP/scripts/bootstrap/_lib.sh"
+  bootstrap::record_warning "seeded warning for the resume-allowlist regression test"
+) >/dev/null 2>&1
+[ -s "$TARGET11/.bootstrap-state.warnings" ] \
+  || fail "test setup: record_warning did not write the warnings sidecar"
+echo "template-mirror" >"$TARGET11/.bootstrap-state"
+: >"$TARGET11/.bootstrap-log"
+set +e
+out=$(run_wizard_nopat resumewarn-repo \
+        --target-dir "$TARGET11" \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new --dry-run --resume 2>&1)
+ec=$?
+set -e
+echo "$out" | grep -q "is not empty" \
+  && fail "resume preflight rejected a dir containing only bookkeeping + warnings sidecar; out: $out" \
+  || pass "resume preflight accepts the .bootstrap-state.warnings sidecar"
+[ "$ec" -eq 0 ] \
+  && pass "resume run with a warnings sidecar completes (rc=$ec)" \
+  || fail "resume run with a warnings sidecar failed: rc=$ec, out: $out"
+echo "$out" | grep -q "resume: skip template-mirror" \
+  && pass "resume actually skipped the recorded template-mirror stage" \
+  || fail "resume did not skip template-mirror; out: $out"
 
 # --- summary --------------------------------------------------------------
 echo

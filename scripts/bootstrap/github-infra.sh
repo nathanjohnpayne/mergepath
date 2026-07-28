@@ -77,9 +77,15 @@ BOOTSTRAP_LABELS=(
 # silently shipped repos without the secret (#734; CLAUDE.md § 1Password Reviewer PAT
 # Lookup: "Always look a PAT up by 1Password item ID, never by item
 # title"). Sub-step 4 prefers the session-cached
-# $OP_PREFLIGHT_REVIEWER_PAT before probing this reference. Override
-# via BOOTSTRAP_REVIEWER_PAT_OP_REF for tests / alternate vaults.
-BOOTSTRAP_REVIEWER_PAT_OP_REF="${BOOTSTRAP_REVIEWER_PAT_OP_REF:-op://Private/pvbq24vl2h6gl7yjclxy2hbote/token}"
+# $OP_PREFLIGHT_REVIEWER_PAT before probing this reference — but only
+# when the cached PAT's owning agent ($OP_PREFLIGHT_AGENT) is among the
+# wizard's selected reviewers; likewise the default reference below is
+# the claude reviewer PAT and is only probed when claude is a selected
+# reviewer (#755 round 2). Override via BOOTSTRAP_REVIEWER_PAT_OP_REF
+# for tests / alternate vaults; an explicit override is taken as the
+# caller vouching for the identity behind it.
+BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT="op://Private/pvbq24vl2h6gl7yjclxy2hbote/token"
+BOOTSTRAP_REVIEWER_PAT_OP_REF="${BOOTSTRAP_REVIEWER_PAT_OP_REF:-$BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT}"
 
 bootstrap::stage_github_infra() {
   bootstrap::stage_banner "github-infra"
@@ -144,7 +150,7 @@ bootstrap::stage_github_infra() {
   if [ "${BOOTSTRAP_SKIP_SECRETS:-0}" = "1" ]; then
     bootstrap::log "secret provisioning skipped (BOOTSTRAP_SKIP_SECRETS=1)"
   else
-    bootstrap::_provision_reviewer_assignment_token "$full_repo" || step_rc=$?
+    bootstrap::_provision_reviewer_assignment_token "$full_repo" "$reviewers" || step_rc=$?
     if [ "$step_rc" -ne 0 ]; then
       # By default secret failures are recorded-but-not-fatal —
       # workflows will fail loudly on the first PR if the token isn't
@@ -305,8 +311,20 @@ bootstrap::_invite_reviewers() {
   fi
 }
 
+# True iff agent name $1 (e.g. "claude") appears in the wizard's
+# comma-separated reviewers selection $2. Spaces are stripped the same
+# way _invite_reviewers strips them, so "claude, cursor" matches.
+bootstrap::_reviewer_selected() {
+  local agent=$1 reviewers_csv
+  reviewers_csv=$(printf '%s' "$2" | tr -d ' ')
+  case ",$reviewers_csv," in
+    *",$agent,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 bootstrap::_provision_reviewer_assignment_token() {
-  local full_repo=$1
+  local full_repo=$1 reviewers_csv=$2
   local pat=""
 
   # Path c (tests / explicit override): caller supplied the PAT
@@ -318,29 +336,66 @@ bootstrap::_provision_reviewer_assignment_token() {
 
   # Path a (preferred): reuse the reviewer PAT already cached by
   # scripts/op-preflight.sh in this session. No op call, no biometric
-  # prompt, and it's the same nathanpayne-claude PAT the op reference
-  # below resolves (#734).
+  # prompt (#734). The cached PAT belongs to whichever agent preflight
+  # ran for — exported as $OP_PREFLIGHT_AGENT — which is NOT
+  # necessarily one of the wizard's --reviewers selections. Installing
+  # a mismatched PAT would make the secret authenticate as an
+  # uninvited account and fail the reviewer-assignment workflows on
+  # the first PR (#755 round 2). Reuse the cache only when its owning
+  # agent is verifiably among the invited reviewers; otherwise fall
+  # through to the op:// / prompt paths. An unset $OP_PREFLIGHT_AGENT
+  # counts as a mismatch — identity we cannot verify is identity we
+  # do not install.
   if [ -z "$pat" ] && [ -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]; then
-    pat="$OP_PREFLIGHT_REVIEWER_PAT"
-    bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN: reusing session-cached \$OP_PREFLIGHT_REVIEWER_PAT"
-  fi
-
-  # Path a2: look up the PAT in 1Password by item UUID.
-  if [ -z "$pat" ] && command -v op >/dev/null 2>&1; then
-    bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN: probing 1Password at $BOOTSTRAP_REVIEWER_PAT_OP_REF"
-    # Tolerate op timeouts — fall through to the prompt path if
-    # 1Password is locked or the item doesn't exist.
-    pat=$(op read "$BOOTSTRAP_REVIEWER_PAT_OP_REF" 2>/dev/null || true)
-    if [ -n "$pat" ]; then
-      bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN: reusing existing 1Password item"
+    if [ -n "${OP_PREFLIGHT_AGENT:-}" ] \
+       && bootstrap::_reviewer_selected "$OP_PREFLIGHT_AGENT" "$reviewers_csv"; then
+      pat="$OP_PREFLIGHT_REVIEWER_PAT"
+      bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN: reusing session-cached \$OP_PREFLIGHT_REVIEWER_PAT (agent '$OP_PREFLIGHT_AGENT' is a selected reviewer)"
+    else
+      bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN: NOT reusing session-cached \$OP_PREFLIGHT_REVIEWER_PAT — it belongs to agent '${OP_PREFLIGHT_AGENT:-unknown}', not one of the selected reviewers ($reviewers_csv)"
     fi
   fi
 
+  # Path a2: look up the PAT in 1Password by item UUID. The DEFAULT
+  # reference resolves the nathanpayne-claude reviewer PAT, so it is
+  # only valid when claude is among the selected reviewers; a custom
+  # BOOTSTRAP_REVIEWER_PAT_OP_REF override is the caller vouching for
+  # the identity behind it (#755 round 2).
+  if [ -z "$pat" ] && command -v op >/dev/null 2>&1; then
+    if [ "$BOOTSTRAP_REVIEWER_PAT_OP_REF" = "$BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT" ] \
+       && ! bootstrap::_reviewer_selected claude "$reviewers_csv"; then
+      bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN: skipping the default 1Password probe — it resolves the claude reviewer PAT and claude is not one of the selected reviewers ($reviewers_csv)"
+    else
+      bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN: probing 1Password at $BOOTSTRAP_REVIEWER_PAT_OP_REF"
+      # Tolerate op timeouts — fall through to the prompt path if
+      # 1Password is locked or the item doesn't exist.
+      pat=$(op read "$BOOTSTRAP_REVIEWER_PAT_OP_REF" 2>/dev/null || true)
+      if [ -n "$pat" ]; then
+        bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN: reusing existing 1Password item"
+      fi
+    fi
+  fi
+
+  # Dry-run purity (#755 round 2): a dry run intentionally carries no
+  # credentials, so failing to resolve a PAT here is EXPECTED — it is
+  # not the #734 "shipped without the secret" failure, and the target
+  # repo does not even exist yet. Per the documented --dry-run
+  # contract, print the would-happen plan under [DRY-RUN] markers,
+  # write NO warnings sidecar, and do NOT fail BOOTSTRAP_STRICT_SECRETS.
+  # (bootstrap::record_warning itself still mirrors
+  # bootstrap::record_stage — both write when called in dry-run; this
+  # path simply never calls it, because a credential miss in a
+  # credential-free dry run is not a real warning.)
+  if [ -z "$pat" ] && [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
+    echo "[DRY-RUN] REVIEWER_ASSIGNMENT_TOKEN: no PAT resolvable in this dry run (expected — dry runs carry no credentials)"
+    echo "[DRY-RUN] REVIEWER_ASSIGNMENT_TOKEN: a live run would resolve the reviewer PAT (session cache -> 1Password -> interactive prompt) and pipe it via stdin to: scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo $full_repo" # NO_BARE_GH_WRITE_EXEMPT: dry-run plan line echoed to the operator, not an executed gh write
+    return 0
+  fi
+
   # Path b: prompt the human to paste a fine-grained PAT. Skipped in
-  # auto-prompt=skip mode + dry-run.
+  # auto-prompt=skip mode (dry-run already returned above).
   if [ -z "$pat" ]; then
-    if [ "${BOOTSTRAP_AUTO_PROMPT:-prompt}" = "skip" ] \
-       || [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
+    if [ "${BOOTSTRAP_AUTO_PROMPT:-prompt}" = "skip" ]; then
       # Loud miss (#734): the old warn-and-continue made a broken op
       # reference ship unnoticed — the repo looked fully bootstrapped
       # but its first PR's reviewer-assignment workflows failed. Emit
@@ -348,7 +403,7 @@ bootstrap::_provision_reviewer_assignment_token() {
       # miss for the end-of-run summary, and honor the strict knob.
       bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: NO PAT available and prompts are skipped — secret NOT set on $full_repo"
       bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: reviewer-assignment / agent-review workflows WILL FAIL on the first PR until it is set"
-      bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: fix: printf '%s' \"\$OP_PREFLIGHT_REVIEWER_PAT\" | gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo $full_repo" # NO_BARE_GH_WRITE_EXEMPT: remediation hint echoed to the operator, not an executed gh write
+      bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: fix: printf '%s' \"\$OP_PREFLIGHT_REVIEWER_PAT\" | scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo $full_repo" # NO_BARE_GH_WRITE_EXEMPT: remediation hint echoed to the operator (routed through the token-verifying author wrapper), not an executed gh write
       bootstrap::record_warning "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (no PAT available, prompts skipped) — set it manually before the first PR"
       if [ "${BOOTSTRAP_STRICT_SECRETS:-0}" = "1" ]; then
         return 1
