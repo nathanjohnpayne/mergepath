@@ -261,7 +261,7 @@ fi
 # records entirely, so a worktree full of untracked work reports an EMPTY
 # status and reads as `clean` — and `--apply` deletes it. `--ignored` does NOT
 # restore them; only an explicit `--untracked-files=all` overrides the config.
-UNTRACKED_PR_NUM=55555
+UNTRACKED_PR_NUM=77777
 UNTRACKED_PR_BRANCH="pr-branch-untracked"
 git branch "$UNTRACKED_PR_BRANCH"
 git push -q -u origin "$UNTRACKED_PR_BRANCH"
@@ -439,6 +439,10 @@ if [ "\$1" = "pr" ] && [ "\$2" = "view" ]; then
   fi
   if [ "\$num" = "$OPEN_PR_NUM" ]; then
     echo "OPEN"
+    exit 0
+  fi
+  if [ "\$num" = "$UNTRACKED_PR_NUM" ]; then
+    echo "CLOSED"
     exit 0
   fi
   if [ "\$num" = "$IGNORED_PR_NUM" ]; then
@@ -1177,6 +1181,7 @@ fi
 git branch -D "$DIVERGED_BRANCH" >/dev/null 2>&1 || true
 git worktree remove --force "$DIRTY_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$IGNORED_PR_WT" >/dev/null 2>&1 || true
+git worktree remove --force "$UNTRACKED_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$UNKNOWN_PR_WT" >/dev/null 2>&1 || true
 set +e
 OUT6=$(PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1)
