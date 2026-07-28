@@ -208,10 +208,17 @@ CONFIG="${MERGEPATH_REVIEW_POLICY_PATH:-.github/review-policy.yml}"
 if [ -z "${MERGEPATH_REVIEW_POLICY_PATH:-}" ]; then
   __RESOLVE_POLICY_BIN="$__CODEX_CHECK_DIR/workflow/resolve_base_policy.sh"
   if [ ! -f "$__RESOLVE_POLICY_BIN" ]; then
-    # Parity with merge-clearance-gate.sh: say so rather than silently leaving
-    # CONFIG at the unresolved default, which is indistinguishable in the logs
-    # from a deliberate default-base resolution (CodeRabbit on #768).
-    echo "WARNING: policy resolver missing ($__RESOLVE_POLICY_BIN); using $CONFIG unresolved" >&2
+    # FAIL CLOSED, not warn-and-continue (Codex P1 on #768). Without the
+    # resolver this script cannot prove the PR targets the default branch, so
+    # continuing would silently check a non-default-base PR against the
+    # default-branch policy — the downgrade this whole change removes.
+    #
+    # Safe to be strict: the resolver travels in the SAME scripts/workflow/ kit
+    # entry as this script, so they arrive together in one sync PR. A checkout
+    # holding this version of codex-review-check.sh without the resolver is a
+    # broken install, not a mid-sync state.
+    echo "ERROR: policy resolver missing ($__RESOLVE_POLICY_BIN); cannot determine the governing review policy" >&2
+    exit 3
   fi
   if [ -f "$__RESOLVE_POLICY_BIN" ]; then
     # Capture stdout and stderr SEPARATELY: the resolver prints the policy

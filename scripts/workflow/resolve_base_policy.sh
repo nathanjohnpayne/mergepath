@@ -97,35 +97,27 @@ if [ -z "$BASE_REF" ] || [ -z "$BASE_SHA" ] || [ -z "$DEFAULT_BRANCH" ]; then
   pr_msg=$(cat "$pr_err" 2>/dev/null || true)
   rm -f "$pr_err"
   if [ "$pr_rc" -ne 0 ]; then
-    # Could not determine the base at all. See the asymmetry note below: an
-    # UNKNOWN base is not evidence of a non-default one, so fall back rather
-    # than manufacture a blocking failure in every caller.
-    echo "resolve_base_policy.sh: could not fetch PR metadata for $REPO#$PR_NUMBER ($pr_msg); assuming the default-branch policy governs" >&2
-    printf '%s\n' "$DEFAULT_CONFIG"
-    exit 0
+    echo "resolve_base_policy.sh: could not fetch PR metadata for $REPO#$PR_NUMBER ($pr_msg) — cannot prove the base is the default branch; refusing to fall back" >&2
+    exit 2
   fi
   BASE_REF=$(printf '%s' "$pr_json" | jq -r '.base.ref // ""')
   BASE_SHA=$(printf '%s' "$pr_json" | jq -r '.base.sha // ""')
   DEFAULT_BRANCH=$(printf '%s' "$pr_json" | jq -r '.base.repo.default_branch // ""')
 fi
 
-# ASYMMETRY, deliberate: we fail closed only when we KNOW the governing policy
-# is one we cannot read — a positively-identified non-default base whose
-# review-policy.yml does not come back. We do NOT fail closed merely because
-# the base could not be determined.
+# THE RULE: fall back to the default config only when we can POSITIVELY PROVE
+# the base IS the default branch. An undetermined base is not proof, so it fails
+# closed (Codex P1 on #768).
 #
-# The difference matters because this resolver runs inside codex-review-check.sh,
-# which the merge gate (twice), the auto-clear workflow, and direct invocations
-# all use. Turning "metadata unavailable" into a hard error would let a
-# transient API failure block merges across the fleet — the same failure mode
-# that broke five tests when an earlier draft fetched unconditionally. It is
-# also not an exploitable downgrade: nobody can choose to make their own PR
-# metadata unreadable, and callers that DO hold the metadata (merge-clearance-gate.sh
-# passes --base-ref/--base-sha/--default-branch) get the strict path.
+# An earlier draft let "undetermined" fall back, reasoning that a hard error
+# would block merges fleet-wide on a transient API failure. That reasoning was
+# wrong for the caller it was protecting: codex-review-check.sh ALREADY dies 3
+# when its own `gh api repos/.../pulls/N` fetch fails, so the same transient
+# failure blocks that script moments later regardless. Falling back here bought
+# no availability and cost the guarantee.
 if [ -z "$BASE_REF" ] || [ -z "$DEFAULT_BRANCH" ]; then
-  echo "resolve_base_policy.sh: base ref / default branch undetermined for $REPO; assuming the default-branch policy governs" >&2
-  printf '%s\n' "$DEFAULT_CONFIG"
-  exit 0
+  echo "resolve_base_policy.sh: base ref / default branch undetermined for $REPO — cannot prove the base is the default branch; refusing to fall back" >&2
+  exit 2
 fi
 
 # Default base: the caller's config already IS the governing policy.

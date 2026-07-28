@@ -922,7 +922,7 @@ case "$1" in
     case "${1:-}" in
       repos/nathanjohnpayne/mergepath/pulls/99999)
         cat <<'JSON'
-{"head":{"sha":"headsha"},"user":{"login":"nathanjohnpayne"},"body":"Authoring-Agent: codex","base":{"ref":"main"},"labels":[]}
+{"head":{"sha":"headsha"},"user":{"login":"nathanjohnpayne"},"body":"Authoring-Agent: codex","base":{"ref":"main","sha":"basesha","repo":{"default_branch":"main"}},"labels":[]}
 JSON
         ;;
       repos/nathanjohnpayne/mergepath/commits/headsha)

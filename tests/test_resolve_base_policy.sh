@@ -11,10 +11,9 @@
 #   non-default + readable  -> print a temp file holding the BASE policy
 #   non-default + 404       -> print the default config (base predates policy)
 #   non-default + other err -> exit 2 (caller must fail closed)
-#   base undeterminable     -> print the default config, exit 0 (NOT a hard
-#                              error — this runs inside codex-review-check.sh,
-#                              which the merge gate, auto-clear, and direct
-#                              invocations all use)
+#   base undeterminable     -> exit 2. Falling back is allowed ONLY when the
+#                              default base is POSITIVELY PROVEN; "unknown" is
+#                              not proof.
 #
 # Also pins that stdout carries ONLY the path: the callers capture stdout as a
 # filename, so a diagnostic leaking into it would produce a garbage config path
@@ -125,21 +124,25 @@ else
   fail "non-default error should exit 2 (rc=$RC out=$OUT)"
 fi
 
-# 5. Base undeterminable: falls back rather than hard-failing every caller.
+# 5. Base undeterminable: FAILS CLOSED. Falling back is permitted only on
+#    positive proof that the base is the default branch; "unknown" is not
+#    proof, and codex-review-check.sh already dies on the same failed fetch
+#    moments later, so falling back bought no availability.
 reset_env
 export STUB_PR_FAIL=1
 OUT=$(bash "$RESOLVE" --repo "$REPO" --pr 42 --default-config "$DEFAULT_CONFIG" 2>"$WORK/err.txt") && RC=0 || RC=$?
-if [ "$RC" -eq 0 ] && [ "$OUT" = "$DEFAULT_CONFIG" ]; then
-  pass "undeterminable base falls back instead of blocking every caller (#769)"
+if [ "$RC" -eq 2 ] && grep -q "refusing to fall back" "$WORK/err.txt"; then
+  pass "undeterminable base fails closed rather than assuming the default (#768 P1)"
 else
-  fail "undeterminable base (rc=$RC out=$OUT)"
+  fail "undeterminable base should exit 2 (rc=$RC out=$OUT)"
 fi
 
 # 6. stdout carries ONLY the path, even when a diagnostic is emitted. Callers
 #    use stdout as a filename; a leaked warning becomes a garbage config path.
 reset_env
-export STUB_PR_FAIL=1
-OUT=$(bash "$RESOLVE" --repo "$REPO" --pr 42 --default-config "$DEFAULT_CONFIG" 2>/dev/null) && RC=0 || RC=$?
+export STUB_CONTENTS_MODE=404
+OUT=$(bash "$RESOLVE" --repo "$REPO" --base-ref release/1.x --base-sha basesha1 \
+      --default-branch main --default-config "$DEFAULT_CONFIG" 2>/dev/null) && RC=0 || RC=$?
 if [ "$RC" -eq 0 ] && [ "$OUT" = "$DEFAULT_CONFIG" ] && [ "$(printf '%s' "$OUT" | wc -l | tr -d ' ')" = "0" ]; then
   pass "stdout is the path alone; diagnostics stay on stderr (#715/#716 class)"
 else
