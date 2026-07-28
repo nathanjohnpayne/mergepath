@@ -269,7 +269,7 @@ bootstrap::stage_template_mirror() {
 
   # Step 5b: scaffold neutral consumer identity docs (#744/#747). The
   # rsync excluded BRAND.md + docs/agents/repository-overview.md (pure
-  # mergepath identity) and the four hub-only docs; this writes honest
+  # mergepath identity) and the three hub-only docs; this writes honest
   # consumer stubs for the former, scrubs the AGENTS.md packaging
   # note (packaging/ is a mergepath-only dir, also excluded), scrubs
   # the README.md hub identity + dead Key-Files rows (#747), and
@@ -375,13 +375,17 @@ bootstrap::_reset_phase_4b_enabled() {
     bootstrap::err "phase-4b reset: phase_4b_automation block present but its enabled key was not found/reset in $policy (reshaped upstream?); failing closed rather than mirroring an opted-in policy"
     return 1
   fi
-  mv "$policy.bootstrap-tmp" "$policy"
+  if ! mv "$policy.bootstrap-tmp" "$policy"; then
+    rm -f "$policy.bootstrap-tmp"
+    bootstrap::err "phase-4b reset: failed to move the scrubbed copy over $policy; failing closed"
+    return 1
+  fi
 }
 
 # Scaffold neutral consumer identity docs and scrub mergepath-only
 # identity from shared docs (#744/#747). The rsync excluded BRAND.md +
 # docs/agents/repository-overview.md (pure mergepath identity) and the
-# four hub-only docs; this writes honest consumer stubs for the two
+# three hub-only docs; this writes honest consumer stubs for the two
 # excluded identity docs and removes the AGENTS.md "Repository Layout"
 # section that documents the mergepath-only `packaging/` dir. The mixed
 # doc .ai_context.md keeps its shared content — its one false line is
@@ -469,7 +473,11 @@ EOF
       bootstrap::err "consumer-identity scaffold: AGENTS.md packaging note survived the Repository-Layout scrub (section reshaped upstream?); failing closed"
       return 1
     fi
-    mv "$agents.bootstrap-tmp" "$agents"
+    if ! mv "$agents.bootstrap-tmp" "$agents"; then
+      rm -f "$agents.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: failed to move the scrubbed copy over $agents; failing closed"
+      return 1
+    fi
     bootstrap::log "scrubbed the mergepath-only Repository Layout (packaging/) section from AGENTS.md"
   fi
 
@@ -534,7 +542,11 @@ EOF
         return 1
       fi
     done
-    mv "$readme.bootstrap-tmp" "$readme"
+    if ! mv "$readme.bootstrap-tmp" "$readme"; then
+      rm -f "$readme.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: failed to move the scrubbed copy over $readme; failing closed"
+      return 1
+    fi
     bootstrap::log "scrubbed the mergepath hub identity + dead Key-Files rows from README.md"
   fi
 
@@ -620,7 +632,11 @@ EOF
       bootstrap::err "consumer-identity scaffold: REVIEW_POLICY.md '$phase4_marker' heading vanished after the wave-audit reframe (swallowed by the paragraph consumer, or section reshaped upstream?); failing closed"
       return 1
     fi
-    mv "$policy_doc.bootstrap-tmp" "$policy_doc"
+    if ! mv "$policy_doc.bootstrap-tmp" "$policy_doc"; then
+      rm -f "$policy_doc.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: failed to move the reframed copy over $policy_doc; failing closed"
+      return 1
+    fi
     bootstrap::log "reframed the REVIEW_POLICY.md wave-audit passage as hub-side machinery"
   fi
 }
