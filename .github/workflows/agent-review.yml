@@ -195,39 +195,57 @@ jobs:
             // evaluating against the looser default-branch copy would
             // reproduce the very bypass this fetch exists to close. Unknown
             // policy therefore fails closed: require external review.
-            let policyConfigPath = null;
+            //
+            // SCOPED to non-default bases. When a PR targets the default
+            // branch — nearly all of them, including every propagation sync
+            // PR — the base policy IS the default-branch policy this job has
+            // checked out, so there is nothing to fetch. Restricting the call
+            // keeps a new contents-API dependency (and a fail-closed label on
+            // a transient error) off the path every consumer PR takes, rather
+            // than making the whole fleet depend on it for a configuration
+            // that only arises on a non-default base.
+            let policyConfigPath = '.github/review-policy.yml';
             let policyReadFailed = false;
-            try {
-              const baseCfg = await github.rest.repos.getContent({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                path: '.github/review-policy.yml',
-                ref: pr.base.sha,
-              });
-              const baseCfgText = Buffer.from(baseCfg.data.content, 'base64').toString('utf8');
-              const baseCfgPath = path.join(
-                os.tmpdir(), `mergepath-pr-${pr.number}-base-review-policy.yml`
+            const baseIsDefault =
+              pr.base.ref === context.payload.repository.default_branch;
+            if (baseIsDefault) {
+              console.log(
+                'PR targets the default branch — base policy is the ' +
+                'checked-out policy; no base fetch needed.'
               );
-              fs.writeFileSync(baseCfgPath, baseCfgText);
-              policyConfigPath = baseCfgPath;
-              console.log(`Using base-branch review policy from ${pr.base.sha}.`);
-            } catch (e) {
-              if (e.status === 404) {
-                policyConfigPath = '.github/review-policy.yml';
-                core.warning(
-                  `PR base ${pr.base.sha} has no .github/review-policy.yml ` +
-                  `(predates the policy file); falling back to the ` +
-                  `default-branch copy.`
+            } else {
+              try {
+                const baseCfg = await github.rest.repos.getContent({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  path: '.github/review-policy.yml',
+                  ref: pr.base.sha,
+                });
+                const baseCfgText = Buffer.from(baseCfg.data.content, 'base64').toString('utf8');
+                const baseCfgPath = path.join(
+                  os.tmpdir(), `mergepath-pr-${pr.number}-base-review-policy.yml`
                 );
-              } else {
-                policyReadFailed = true;
-                core.warning(
-                  `Could not read .github/review-policy.yml from PR base ` +
-                  `${pr.base.sha} (${e.status || 'no status'}: ${e.message}); ` +
-                  `requiring external review fail-closed rather than judging ` +
-                  `this PR by the default-branch policy.`
-                );
-              }
+                fs.writeFileSync(baseCfgPath, baseCfgText);
+                policyConfigPath = baseCfgPath;
+                console.log(`Using base-branch review policy from ${pr.base.sha}.`);
+              } catch (e) {
+                if (e.status === 404) {
+                  policyConfigPath = '.github/review-policy.yml';
+                  core.warning(
+                    `PR base ${pr.base.sha} has no .github/review-policy.yml ` +
+                    `(predates the policy file); falling back to the ` +
+                    `default-branch copy.`
+                  );
+                } else {
+                  policyReadFailed = true;
+                  core.warning(
+                    `Could not read .github/review-policy.yml from PR base ` +
+                    `${pr.base.sha} (${e.status || 'no status'}: ${e.message}); ` +
+                    `requiring external review fail-closed rather than judging ` +
+                    `this PR by the default-branch policy.`
+                  );
+                }
+                }
             }
 
             // Exclude lockfiles, minified, and generated files from line count

@@ -195,18 +195,6 @@ fi
 
 CONFIG=".github/review-policy.yml"
 
-# Scratch file for the PR-base review policy (#763; see the derivation block).
-BASE_POLICY_TMP=""
-# Policy source for every gating decision. Defaults to the trusted
-# default-branch checkout and is redirected to the PR base tree only for a
-# non-default base (see the #763 block after the PR metadata fetch).
-POLICY_CONFIG="$CONFIG"
-# shellcheck disable=SC2329  # invoked via the EXIT trap below
-cleanup_base_policy() {
-  [ -z "$BASE_POLICY_TMP" ] || rm -f "$BASE_POLICY_TMP"
-}
-trap cleanup_base_policy EXIT
-
 # Read a scalar field nested two levels deep: `<block>:` `<sub>:` `<field>:`.
 # Same state-machine awk pattern as codex-p1-gate.sh's
 # codex_p1_gate_field, generalized over the top block + sub-block names so
@@ -237,7 +225,7 @@ nested_field() {  # <top_block> <sub_block> <field>
       print
       exit
     }
-  ' "$POLICY_CONFIG"
+  ' "$CONFIG"
 }
 
 # Read the available_reviewers list (one login per line). Identical parser
@@ -250,6 +238,26 @@ read_available_reviewers() {
     in_block && /^ *-/ {print}
   ' "$CONFIG" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/'
 }
+
+DEPENDABOT_GATE_ENABLED=$(nested_field dependabot reviewer_gate enabled)
+DEPENDABOT_GATE_ENABLED=${DEPENDABOT_GATE_ENABLED:-false}
+case "$DEPENDABOT_GATE_ENABLED" in
+  true|false) ;;
+  *)
+    echo "ERROR: dependabot.reviewer_gate.enabled must be true|false; got '$DEPENDABOT_GATE_ENABLED'" >&2
+    exit 2
+    ;;
+esac
+
+EXTERNAL_GATE_ENABLED=$(nested_field codex external_review_gate enabled)
+EXTERNAL_GATE_ENABLED=${EXTERNAL_GATE_ENABLED:-false}
+case "$EXTERNAL_GATE_ENABLED" in
+  true|false) ;;
+  *)
+    echo "ERROR: codex.external_review_gate.enabled must be true|false; got '$EXTERNAL_GATE_ENABLED'" >&2
+    exit 2
+    ;;
+esac
 
 # --- logging helpers --------------------------------------------------------
 
@@ -347,73 +355,6 @@ PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) \
   || die 2 "failed to fetch PR metadata: $PR_JSON"
 
 HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
-BASE_SHA=$(echo "$PR_JSON" | jq -r '.base.sha // ""')
-
-# --- PR-base review policy (#763) -------------------------------------------
-#
-# Every policy decision this gate makes must be judged by the policy of the
-# branch the PR TARGETS, not by this trusted default-branch checkout. That
-# includes the gate-enable switches, not just threshold/paths: if the default
-# branch has codex.external_review_gate.enabled:false while the PR base
-# enables it, parsing the switch from the default branch makes the whole
-# external arm vacuous and the required check passes a PR the base policy
-# requires it to gate (Codex P1 on #767). So the base policy is resolved HERE,
-# before any switch is read, and POLICY_CONFIG then feeds nested_field.
-#
-# SCOPED DELIBERATELY to non-default bases. When a PR targets the default
-# branch — the overwhelming majority, including every propagation sync PR —
-# the base policy IS the default-branch policy this job already has checked
-# out, so there is nothing to fetch and behaviour is byte-identical to before.
-# Restricting the call this way keeps a new contents-API dependency (and its
-# rate-limit / token-scope exposure) off the path that every consumer PR takes,
-# instead of making the whole fleet depend on an endpoint this gate never
-# needed before.
-#
-# On a NON-default base the fetch is load-bearing, so a failure other than a
-# confirmed 404 (a base predating the policy file) is an infrastructure error:
-# die 2, exactly as this script already does for a failed PR-metadata fetch.
-# Silently substituting the default-branch policy there is the bypass itself.
-BASE_REF=$(echo "$PR_JSON" | jq -r '.base.ref // ""')
-DEFAULT_BRANCH=$(echo "$PR_JSON" | jq -r '.base.repo.default_branch // ""')
-if [ -n "$BASE_SHA" ] && [ -n "$BASE_REF" ] && [ -n "$DEFAULT_BRANCH" ] \
-   && [ "$BASE_REF" != "$DEFAULT_BRANCH" ]; then
-  set +e
-  base_policy_out=$(gh api "repos/$REPO/contents/.github/review-policy.yml?ref=$BASE_SHA" \
-    -H "Accept: application/vnd.github.raw" 2>&1)
-  base_policy_rc=$?
-  set -e
-  if [ "$base_policy_rc" -eq 0 ] && [ -n "$base_policy_out" ]; then
-    BASE_POLICY_TMP=$(mktemp "${TMPDIR:-/tmp}/mcg-base-policy.XXXXXX")
-    printf '%s\n' "$base_policy_out" > "$BASE_POLICY_TMP"
-    POLICY_CONFIG="$BASE_POLICY_TMP"
-  elif printf '%s' "$base_policy_out" | grep -qiE '(^|[^0-9])404([^0-9]|$)|not found'; then
-    : # base predates the policy file — the default-branch copy is all there is
-  else
-    echo "ERROR: could not read .github/review-policy.yml from non-default base $BASE_REF@$BASE_SHA (rc=$base_policy_rc): $base_policy_out" >&2
-    exit 2
-  fi
-fi
-
-DEPENDABOT_GATE_ENABLED=$(nested_field dependabot reviewer_gate enabled)
-DEPENDABOT_GATE_ENABLED=${DEPENDABOT_GATE_ENABLED:-false}
-case "$DEPENDABOT_GATE_ENABLED" in
-  true|false) ;;
-  *)
-    echo "ERROR: dependabot.reviewer_gate.enabled must be true|false; got '$DEPENDABOT_GATE_ENABLED'" >&2
-    exit 2
-    ;;
-esac
-
-EXTERNAL_GATE_ENABLED=$(nested_field codex external_review_gate enabled)
-EXTERNAL_GATE_ENABLED=${EXTERNAL_GATE_ENABLED:-false}
-case "$EXTERNAL_GATE_ENABLED" in
-  true|false) ;;
-  *)
-    echo "ERROR: codex.external_review_gate.enabled must be true|false; got '$EXTERNAL_GATE_ENABLED'" >&2
-    exit 2
-    ;;
-esac
-
 PR_AUTHOR=$(echo "$PR_JSON" | jq -r '.user.login')
 if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
   die 2 "could not determine HEAD sha for PR #$PR_NUMBER"
@@ -553,7 +494,7 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
     # `|| true` so a missing key (grep no-match → pipeline non-zero under
     # pipefail) does NOT abort the script before the `:-300` fallback runs
     # (CodeRabbit ⚠️ on PR #429).
-    THRESHOLD=$(grep -E '^external_review_threshold:' "$POLICY_CONFIG" 2>/dev/null | awk '{print $2}' || true)
+    THRESHOLD=$(grep -E '^external_review_threshold:' "$CONFIG" 2>/dev/null | awk '{print $2}' || true)
     THRESHOLD=${THRESHOLD:-300}
     if ! [[ "$THRESHOLD" =~ ^[0-9]+$ ]]; then THRESHOLD=300; fi
 
@@ -596,7 +537,7 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
         REQUIRES_REASON="protected-paths check unavailable (parser/matcher missing under $WF_DIR) — failing closed"
       else
         set +e
-        PATHS=$(bash "$PARSE" "$POLICY_CONFIG" external_review_paths)
+        PATHS=$(bash "$PARSE" "$CONFIG" external_review_paths)
         parse_rc=$?
         set -e
         if [ "$parse_rc" -ne 0 ]; then
@@ -612,8 +553,8 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
             # destination in .filename and the source in
             # .previous_filename. Matching only .filename let a
             # below-threshold PR MOVE a protected file to an unprotected
-            # path and still get a green required check here — this gate
-            # runs on `synchronize` before the labelers can re-add
+            # path and still get a green required check here — and this
+            # gate runs on `synchronize` before the labelers can re-add
             # needs-external-review, so that green permits auto-merge.
             CHANGED_FILES=$(echo "$FILES_JSON" | jq -r '.[] | (.filename, (.previous_filename // empty))')
             set +e
