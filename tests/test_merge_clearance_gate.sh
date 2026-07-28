@@ -703,6 +703,32 @@ fi
 
 
 # ---------------------------------------------------------------------------
+# Test 16c (#768 CodeRabbit Major): missing resolver + UNDETERMINABLE base must
+# also fail closed. Test 16b covers a known non-default base; this covers the
+# case where the base cannot be established at all. Degrading there is an
+# assumption, not proof — the same "unknown is not proof" rule the resolver
+# applies.
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 16c: missing resolver + undeterminable base -> fail closed (#768)"
+SCRATCH=$(make_scratch true true)
+EMPTY_WF_16C=$(mktemp -d "$WORKDIR/emptywf16c.XXXXXX")
+FIXTURE_PR_16C="$WORKDIR/pr-nobase.json"
+jq -n --arg sha "$HEAD_SHA" '{number:99, head:{sha:$sha}, user:{login:"nathanjohnpayne"}, labels:[]}' >"$FIXTURE_PR_16C"
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/app.ts","additions":5,"deletions":1}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR_16C" FIXTURE_FILES="$FIXTURE_FILES" \
+      MERGE_CLEARANCE_WORKFLOW_DIR="$EMPTY_WF_16C" \
+      run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 2 ] && echo "$OUT" | grep -q "not provably against the default branch"; then
+  pass "missing resolver + undeterminable base -> exit 2 (unknown is not proof)"
+else
+  fail "expected rc=2 fail-closed; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+
+# ---------------------------------------------------------------------------
 # Test 17 (#429): verified propagation PR — over-threshold, NO
 # needs-external-review label, with a github-actions[bot] lane marker scoped
 # to the CURRENT head → EXEMPT (not applicable), must NOT delegate.

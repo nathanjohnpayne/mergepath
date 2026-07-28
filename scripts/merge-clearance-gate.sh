@@ -394,11 +394,16 @@ if [ ! -f "$RESOLVE_POLICY_BIN" ]; then
   # infrastructure failure in a required merge gate — fail closed (Codex P1 on
   # #768). BASE_REF/DEFAULT_BRANCH come from PR_JSON, so this decision does not
   # itself need the resolver.
-  if [ -n "$BASE_REF" ] && [ -n "$DEFAULT_BRANCH" ] && [ "$BASE_REF" != "$DEFAULT_BRANCH" ]; then
-    echo "ERROR: policy resolver missing ($RESOLVE_POLICY_BIN) and this PR targets non-default base '$BASE_REF' — refusing to evaluate it against the default-branch policy" >&2
+  # POSITIVE proof required, phrased as such: degrade only when both fields are
+  # present AND equal. The earlier form tested `!=`, so EMPTY metadata — an
+  # undeterminable base — fell through to the degrade branch, which is an
+  # assumption, not proof (CodeRabbit Major on #768). Same rule the resolver
+  # applies: "unknown" is not proof.
+  if [ -z "$BASE_REF" ] || [ -z "$DEFAULT_BRANCH" ] || [ "$BASE_REF" != "$DEFAULT_BRANCH" ]; then
+    echo "ERROR: policy resolver missing ($RESOLVE_POLICY_BIN) and this PR is not provably against the default branch (base='$BASE_REF' default='$DEFAULT_BRANCH') — refusing to evaluate it against the default-branch policy" >&2
     exit 2
   fi
-  echo "WARNING: policy resolver missing ($RESOLVE_POLICY_BIN); PR targets the default branch, so the checked-out policy already governs" >&2
+  echo "WARNING: policy resolver missing ($RESOLVE_POLICY_BIN); PR provably targets the default branch, so the checked-out policy already governs" >&2
   RESOLVED_POLICY="$CONFIG"
   resolve_rc=0
 else
