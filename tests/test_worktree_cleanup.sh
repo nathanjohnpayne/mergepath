@@ -186,6 +186,28 @@ if ! git branch -vv | grep -q "$GONE_PR_BRANCH.*: gone\]"; then
   fail "fixture setup: expected [gone] marker on $GONE_PR_BRANCH"
 fi
 
+# ── Case 2c (#762 r4 P1): PR-slug worktree hidden by an index flag ───
+# `assume-unchanged` makes git skip the file in the status walk, so an edited
+# tracked file reports NOTHING even with the comprehensive flags — and plain
+# `git worktree remove` deletes it too, because git consults the same flag.
+# Verified by hand before writing this: porcelain is empty, `ls-files -v`
+# reports `h f.txt`. The index flags themselves are the only signal.
+FLAG_PR_NUM=99111
+FLAG_PR_BRANCH="pr-branch-index-flag"
+git branch "$FLAG_PR_BRANCH"
+git push -q -u origin "$FLAG_PR_BRANCH"
+FLAG_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${FLAG_PR_NUM}-index-flag"
+git worktree add -q "$FLAG_PR_WT" "$FLAG_PR_BRANCH"
+FLAG_CANARY="$FLAG_PR_WT/seed.txt"
+echo "seed" > "$FLAG_CANARY"
+git -C "$FLAG_PR_WT" add seed.txt
+git -C "$FLAG_PR_WT" -c user.email=t@t -c user.name=t commit -qm "seed for index-flag fixture"
+git -C "$FLAG_PR_WT" update-index --assume-unchanged seed.txt
+echo "edited behind an index flag" > "$FLAG_CANARY"
+if [ -n "$(git -C "$FLAG_PR_WT" status --porcelain --ignored --untracked-files=all --ignore-submodules=none)" ]; then
+  fail "fixture setup: expected comprehensive porcelain to be EMPTY under assume-unchanged"
+fi
+
 # ── Case 3: detached mergepath-pr-<num> worktree (PR closed) ────────
 # We need the worktree path to match the helper's regex
 # /tmp|/private/tmp|/Users/.../GitHub|...mergepath-pr-<num>. On macOS,
@@ -536,6 +558,10 @@ if [ "\$1" = "pr" ] && [ "\$2" = "view" ]; then
     exit 0
   fi
   if [ "\$num" = "$UNTRACKED_PR_NUM" ]; then
+    echo "CLOSED"
+    exit 0
+  fi
+  if [ "\$num" = "$FLAG_PR_NUM" ]; then
     echo "CLOSED"
     exit 0
   fi
@@ -1153,6 +1179,12 @@ else
   fail "gone-upstream PR-slug worktree was removed by --apply despite dirty content"
   echo "$OUT2" >&2
 fi
+if [ -f "$FLAG_CANARY" ] && grep -q "behind an index flag" "$FLAG_CANARY"; then
+  pass "index-flag-hidden edit survived --apply (assume-unchanged)"
+else
+  fail "DATA LOSS: --apply deleted an edit hidden by assume-unchanged in $FLAG_PR_WT"
+  echo "$OUT2" >&2
+fi
 if [ -f "$GONE_PR_CANARY" ] && grep -q "nowhere else" "$GONE_PR_CANARY"; then
   pass "gone-upstream PR-slug canary survived --apply"
 else
@@ -1404,6 +1436,7 @@ git worktree remove --force "$DIRTY_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$IGNORED_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$UNTRACKED_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$GONE_PR_WT" >/dev/null 2>&1 || true
+git worktree remove --force "$FLAG_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$SUBMOD_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$UNKNOWN_PR_WT" >/dev/null 2>&1 || true
 set +e

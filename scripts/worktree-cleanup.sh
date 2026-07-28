@@ -289,6 +289,39 @@ worktree_content_state() {
     echo "dirty"
     return 1
   fi
+
+  # Index flags defeat porcelain entirely (#762 r4 P1). A tracked file marked
+  # `assume-unchanged` (ls-files -v tag: any LOWERCASE letter) or
+  # `skip-worktree` (tag `S`) is skipped by the status walk, so an edited file
+  # reports nothing and `git worktree remove` deletes it — verified directly,
+  # including without --force, because git consults the same flags. There is no
+  # status flag that overrides this, so the flags themselves are the signal:
+  # any flagged path means the comprehensive status CANNOT be trusted as proof.
+  local flagged
+  if flagged=$(git -C "$path" ls-files -v 2>/dev/null); then
+    if printf '%s\n' "$flagged" | grep -qE '^([a-z]|S) '; then
+      echo "dirty"
+      return 1
+    fi
+  else
+    # Unreadable index — no proof available, so do not claim clean.
+    echo "dirty"
+    return 1
+  fi
+
+  # A submodule's OWN .gitignore hides its ignored files from the superproject
+  # walk even with --ignored --ignore-submodules=none, so probe inside each
+  # initialized submodule with the same comprehensive flags (#762 r4 P1).
+  # `submodule foreach` is a no-op (exit 0, no output) on the submodule-free
+  # checkouts this tool actually runs against, so this costs nothing here.
+  local sub_status
+  if sub_status=$(git -C "$path" submodule foreach --recursive --quiet \
+      'git status --porcelain --ignored --untracked-files=all' 2>/dev/null); then
+    if [ -n "$sub_status" ]; then
+      echo "dirty"
+      return 1
+    fi
+  fi
   if [ -z "$status" ]; then
     echo "clean"
     return 0
@@ -521,9 +554,35 @@ try_remove() {
   if [ "$locked" = "1" ]; then
     (cd "$MAIN_WORKTREE" && git worktree unlock "$path") >/dev/null 2>&1 || true
   fi
-  if (cd "$MAIN_WORKTREE" && git worktree remove --force "$path") >/dev/null 2>&1; then
+  # Try the NON-force removal first. git refuses to remove a worktree it
+  # considers dirty, or one containing submodules — an INDEPENDENT second
+  # opinion that does not share our status probe's blind spots.
+  #
+  # Scope of that backstop, measured rather than assumed: it catches the
+  # SUBMODULE case (git refuses "working trees containing submodules cannot be
+  # moved or removed" unless forced). It does NOT catch index-flag blindness —
+  # verified directly: a tracked file marked `assume-unchanged` and then
+  # edited leaves `git status --porcelain --ignored --untracked-files=all
+  # --ignore-submodules=none` EMPTY, and a plain `git worktree remove` deletes
+  # the edit anyway, because git consults the same flags our probe does. So
+  # this is a second line of defence, not a general one; the index-flag and
+  # submodule-internal cases are detected explicitly in
+  # worktree_content_state() instead.
+  #
+  # --force is now reached ONLY on the locked path the operator explicitly
+  # opted into with --force-locked, which is the one case where "remove it
+  # anyway" is the stated intent. A non-force refusal elsewhere surfaces as
+  # FAILED rather than deleting: the conservative direction for a tool whose
+  # mistakes are unrecoverable.
+  if (cd "$MAIN_WORKTREE" && git worktree remove "$path") >/dev/null 2>&1; then
     SUMMARY_REMOVED+=("$path")
     return 0
+  fi
+  if [ "$locked" = "1" ] && [ "$FORCE_LOCKED" = "1" ]; then
+    if (cd "$MAIN_WORKTREE" && git worktree remove --force "$path") >/dev/null 2>&1; then
+      SUMMARY_REMOVED+=("$path")
+      return 0
+    fi
   fi
   SUMMARY_FAILED+=("$path")
   return 1
