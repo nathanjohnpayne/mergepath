@@ -14,11 +14,11 @@ The reader who arrives later — human or agent — then cannot tell whether an 
 
 | Granularity | Unit | Recorded where | Vocabulary |
 | --- | --- | --- | --- |
-| **Finding** | one review comment | the resolved review thread, tagged by the resolve tooling | `addressed-elsewhere` / `deferred-to-followup` / `rebuttal-recorded` |
+| **Finding** | one review comment | the resolved review thread, tagged by the resolve tooling | `addressed-elsewhere` / `canonical-coverage` / `deferred-to-followup` / `nitpick-noted` / `rebuttal-recorded` / `templated-render` / `verified-propagation` |
 | **Change** | one pull request | a `## Path taken` section in the PR body, plus a title marker | prose chronology — what survived, what was discarded, why |
 | **Issue** | one issue | an `[!IMPORTANT]` callout at the top of the issue body, linked to a dated decision comment | `Decision` / `Decision recommendation` |
 
-The finding level already has tooling behind it: `scripts/resolve-pr-threads.sh` writes a `[mergepath-resolve:<class>]` tag on every thread it resolves, and that tag — not the bare fact that the thread is now closed — is the disposition of record the follow-up automation reads. Which resolve mode records which class is documented in your repo's `REVIEW_POLICY.md` § Pre-Merge Review Conversation Gate; it is not restated here.
+The finding level already has tooling behind it: `scripts/resolve-pr-threads.sh` writes a `[mergepath-resolve:<class>]` tag on every thread it resolves, and that tag — not the bare fact that the thread is now closed — is the disposition of record the follow-up automation reads. That script is the authority on the vocabulary: the seven classes above are the complete set it emits, so a record carrying any other class is non-conformant, and a record carrying a routing class (`canonical-coverage`, `templated-render`) or `verified-propagation` is as conformant as a fixed-or-rebutted one. Which resolve mode records which class is documented in your repo's `REVIEW_POLICY.md` § Pre-Merge Review Conversation Gate; it is not restated here.
 
 The two coarser levels below are that same rule applied to a whole change and to a whole issue: **record the disposition truthfully, at the place a later reader will actually look, and never by deleting the state it replaced.**
 
@@ -85,13 +85,13 @@ For example: `fix(769): single shared resolution of the governing review policy 
 **3. A comment on the driving issue,** so the pivot is discoverable from the issue rather than only from the PR. Use the same shape as the issue-level decision callout below — a hidden idempotency marker, then a dated heading:
 
 ```markdown
-<!-- path-taken-ISSUE-YYYY-MM-DD -->
+<!-- path-taken-ISSUE-YYYY-MM-DD-SLUG -->
 ## Path taken — YYYY-MM-DD
 
 <chronology, what survived and what was discarded, who arbitrated>
 ```
 
-`ISSUE` is the issue number and `YYYY-MM-DD` the date the pivot was recorded, matching the decision-comment marker below.
+`ISSUE` is the issue number, `YYYY-MM-DD` the date the pivot was recorded, and `SLUG` a short kebab-case phrase naming the abandoned approach — the same phrase the title marker above carries. The marker matches the decision-comment marker below, and `SLUG` is there for the same reason: a date alone does not separate two pivots recorded on one day.
 
 **4. A retitle of the driving issue,** when its framing is now stale — an issue titled "Defer X" that ended up doing X is actively misleading in a list view.
 
@@ -110,7 +110,7 @@ A material decision or recommendation is recorded in an issue comment. "Material
 Preserve the full rationale in the comment. Hidden marker first, then a dated heading:
 
 ```markdown
-<!-- decision-ISSUE-YYYY-MM-DD -->
+<!-- decision-ISSUE-YYYY-MM-DD-SLUG -->
 ## Decision — YYYY-MM-DD
 
 <decision, rationale, and implementation guardrails>
@@ -123,14 +123,16 @@ Use `Decision recommendation` in the heading when the comment records a recommen
 Do not rewrite the historical problem statement — the body's original framing is part of the record. Prepend, above everything else:
 
 ```markdown
-<!-- decision-comment-ISSUE-YYYY-MM-DD -->
+<!-- decision-comment-ISSUE-YYYY-MM-DD-SLUG -->
 > [!IMPORTANT]
 > **Decision recorded:** <one-sentence decision summary>. See the [full decision and implementation guardrails](COMMENT_PERMALINK).
 ```
 
 Match the status language to the comment: use `**Decision recommendation recorded:**` and link text `full recommendation and implementation guardrails` when the comment is a recommendation.
 
-In both markers, `ISSUE` is the issue number and `YYYY-MM-DD` is the decision date — so the two markers for one decision differ only by the `-comment` infix, and the pair is greppable. Reproduce the formats above byte-for-byte; a paraphrased callout defeats the point of a fleet-wide convention, because the marker is what later tooling and later agents match on.
+In both markers, `ISSUE` is the issue number, `YYYY-MM-DD` is the decision date, and `SLUG` is a short kebab-case phrase naming the decision itself — the same shape the PR-title pivot marker uses, for example `revert-and-defer` or `accept-recommendation`. The two markers for one decision then differ only by the `-comment` infix, and the pair is greppable. Reproduce the formats above byte-for-byte; a paraphrased callout defeats the point of a fleet-wide convention, because the marker is what later tooling and later agents match on.
+
+The slug is not decoration: the date alone is not a unique key. An issue can carry two material decisions in one day, and a recommendation is very often accepted on the day it was posted — which § 5 counts as a supersession. Without the slug both records expand to the identical marker, and § 4's "if the marker is present, edit in place" would then treat the second decision as a retry of the first and overwrite the rationale that § 5 requires be preserved. Derive the slug from the decision you are about to write, never from a counter: a counter cannot be recomputed by an agent retrying after a crash, so it would post a duplicate instead of matching its own earlier write.
 
 ### 3. Link the exact comment, not the issue
 
@@ -140,14 +142,16 @@ In both markers, `ISSUE` is the issue number and `YYYY-MM-DD` is the decision da
 
 Both writes are retried by agents that crash, time out, or run twice. The hidden markers are what make a retry safe:
 
-- **Before writing, search for the marker — and search the body by the *undated* prefix.** The body search key is `<!-- decision-comment-ISSUE-`, trailing hyphen included so that issue 702 does not match a callout for issue 7020. Any hit means this issue already carries a callout, whatever date it bears: edit it in place when you are retrying the same decision, replace it when you are superseding one (§ 5). Never prepend a second. Searching for the full **dated** body marker is the bug to avoid — on a superseding write it matches nothing, and § 2's "prepend, above everything else" then produces exactly the two-callout state § 5 forbids. The **comment** search key is the opposite: the full dated `<!-- decision-ISSUE-YYYY-MM-DD -->`, because a superseding decision is a *new* comment and the earlier one stays untouched as history, so only a same-day retry should match.
-- **After writing, verify by positive readback.** Re-read the live issue body and the live comment through the API and confirm all four: the comment exists under the expected author identity and carries its marker; the permalink in the callout resolves to that comment's id; the body carries the callout marker exactly once; and the callout's wording states the current decision. A write call that returned without an error is not verification — a body edit racing another writer can be silently lost, and only a readback catches it.
+- **Before writing, search for the marker — and search the body by the *undated* prefix.** The body search key is `<!-- decision-comment-ISSUE-`, trailing hyphen included so that issue 702 does not match a callout for issue 7020. Any hit means this issue already carries a callout, whatever date and slug it bears: edit it in place when you are retrying the same decision, replace it when you are superseding one (§ 5). Never prepend a second. Searching for the full **dated and slugged** body marker is the bug to avoid — on a superseding write it matches nothing, and § 2's "prepend, above everything else" then produces exactly the two-callout state § 5 forbids. The **comment** search key is the opposite: the full `<!-- decision-ISSUE-YYYY-MM-DD-SLUG -->`, slug included, because a superseding decision is a *new* comment and the earlier one stays untouched as history. The slug is what makes the two rules agree: matching on the whole key means only a retry of *this* decision matches, so a same-day supersession posts its own comment instead of overwriting the one it supersedes.
+- **Build the body you write from a read taken immediately before writing it.** The API replaces the entire body and offers no compare-and-swap, so a write assembled from a copy read earlier in the run silently erases everything another actor changed in between. Re-read, apply the callout to *that* text, and send it back as the very next call; if the fresh read differs from the text your callout was drafted against, rebuild against the fresh one rather than writing the stale copy. This narrows the exposure to a single round trip — it does not close it, and nothing available here does.
+- **After writing, verify by positive readback.** Re-read the live issue body and the live comment through the API and confirm all four: the comment exists under the expected author identity and carries its marker; the permalink in the callout resolves to that comment's id; the body carries exactly one marker under the `<!-- decision-comment-ISSUE-` prefix — counted by that prefix, so a second callout bearing a different date or slug is caught; and the callout's wording states the current decision. A write call that returned without an error is not verification: it does not prove the comment is reachable at the permalink you published, nor that the body came out with exactly one callout rather than two.
+- **Know what the readback does not prove.** It does not detect a lost update. All four checks run against the body *you* just wrote, so if your write clobbered a concurrent edit to unrelated content, every check still passes and the overwritten text leaves no trace in any of them. Treat the readback as proof that your own write landed intact and unduplicated, and the fresh-read-then-write discipline above — not the readback — as the mitigation for the race.
 
 ### 5. Supersession
 
 The body carries **exactly one active callout**. When a decision is superseded:
 
-- post the new decision comment (new marker, new date) — the old comment stays exactly where it is, as history;
+- post the new decision comment — the old comment stays exactly where it is, as history. Its marker carries a new slug, and a new date only if the day has in fact changed; the slug is what keeps the two markers distinct when the supersession happens on the same day as the decision it replaces, which is the ordinary case when a pending recommendation is accepted in the same working session;
 - **replace** the existing callout in the body with one pointing at the new comment, rather than adding a second. Two callouts leave the reader to guess which is current, which is the failure this convention exists to prevent;
 - if the new decision **changes direction** rather than refining the previous one, also record a path taken per the change-level half above. Accepting a pending recommendation is a supersession of the recommendation callout, not a direction change.
 

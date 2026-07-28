@@ -1081,12 +1081,56 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   # Deliberately NOT applied to tell (b): "run `wave-audit.sh`" is false
   # downstream wherever it appears, including inside a fenced example,
   # so the hub-only scan reads the raw file.
+  #
+  # Fence tracking follows CommonMark, matching the parser in
+  # scripts/audit-canonical-mirrors.sh. A naive unconditional toggle is
+  # not merely imprecise here, it is a BYPASS: a four-backtick fence
+  # wrapping a literal ``` line (the standard way to show a fence inside
+  # a fence, which a doc that prescribes markdown formats will reach
+  # for) has its content line close the fence and its real closing
+  # delimiter open a new one. Every line after that is blanked as
+  # "fence", so a bare #NN later in the file is never scanned and tell
+  # (a) silently passes a doc it should fail. Three rules prevent that:
+  #
+  #   * at most THREE spaces of indent before a delimiter — at four or
+  #     more columns the line is indented CODE, not a delimiter, and a
+  #     tab already advances past the limit;
+  #   * a fence closes only on a run of the SAME character at least as
+  #     LONG as the opening run, so ``` cannot close ````;
+  #   * a closing fence carries no info string, so a literal ```bash
+  #     shown inside an open block is content, not the closer.
+  #
+  # Every branch prints exactly one line per input line, preserving the
+  # `grep -n` line numbering the diagnostics depend on.
   md_prose_only() {
     awk '
-      /^[[:space:]]*(```|~~~)/ { fence = !fence; print ""; next }
-      fence                    { print ""; next }
       {
         line = $0
+        indent = line
+        sub(/[^ \t].*$/, "", indent)
+        rest = substr(line, length(indent) + 1)
+
+        is_delim = 0
+        if (length(indent) < 4 && index(indent, "\t") == 0) {
+          ch = substr(rest, 1, 1)
+          if (ch == "`" || ch == "~") {
+            run = 0
+            while (substr(rest, run + 1, 1) == ch) run++
+            if (run >= 3) is_delim = 1
+          }
+        }
+
+        if (is_delim) {
+          if (!fence) {
+            fence = 1; fence_char = ch; fence_len = run
+          } else if (ch == fence_char && run >= fence_len &&
+                     substr(rest, run + 1) !~ /[^ \t]/) {
+            fence = 0; fence_char = ""; fence_len = 0
+          }
+          print ""; next
+        }
+        if (fence) { print ""; next }
+
         gsub(/`[^`]*`/, "", line)
         gsub(/\]\(#[^)]*\)/, "]()", line)
         print line
@@ -1161,8 +1205,57 @@ FIXTURE_EOF
     fail "Case 38: expected only line 14 flagged, got '$fp_hits'"
   fi
 
+  # Case 39: fence tracking is CommonMark-compatible, not a naive toggle.
+  #
+  # Case 38's fixture only ever opens and closes plain ``` fences, so it
+  # passes under an unconditional toggle too and proves nothing about
+  # the delimiter rules. This fixture pins all three rules AND the
+  # bypass they prevent. Under the naive toggle this replaced, the
+  # ```bash and ``` and ~~~ lines nested inside the ````text block each
+  # flip fence state, so #111 and #444 leak into prose as false
+  # positives; the run of flips leaves state INVERTED at the
+  # four-space-indented ``` on line 18, which then opens a fence that
+  # never closes and swallows the rest of the file — so the real bare
+  # #333 on line 20 goes unscanned and tell (a) passes a doc it must
+  # fail. Correct behavior: line 20 is the only hit.
+  FENCE_DOC="$WORKDIR/consumer-truth-fences.md"
+  cat > "$FENCE_DOC" <<'FENCE_EOF'
+# Doc
+
+````text
+```bash
+echo "#111 not a ref"
+```
+~~~
+still #444 inside the same block
+~~~
+````
+
+~~~
+A tilde fence holds #222 as content.
+~~~
+
+Four spaces of indent makes this code, not a delimiter:
+
+    ```
+
+But a bare #333 in prose is.
+FENCE_EOF
+  set +e
+  fence_hits=$(md_prose_only "$FENCE_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  fence_lines=$(md_prose_only "$FENCE_DOC" | wc -l | tr -d ' ')
+  raw_lines=$(wc -l < "$FENCE_DOC" | tr -d ' ')
+  set -e
+  if [ "$fence_hits" != "20," ]; then
+    fail "Case 39: expected only line 20 flagged (nested/tilde/indented fences), got '$fence_hits'"
+  elif [ "$fence_lines" != "$raw_lines" ]; then
+    fail "Case 39: md_prose_only must emit one line per input line, got $fence_lines for $raw_lines"
+  else
+    pass "Case 39: fence tracking honors delimiter char, run length, info string, and the 3-space indent limit"
+  fi
+
 else
-  echo "SKIP: Cases 36-38 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-39 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
