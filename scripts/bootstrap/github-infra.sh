@@ -88,6 +88,36 @@ BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT="op://Private/pvbq24vl2h6gl7yjclxy2hbote/t
 BOOTSTRAP_REVIEWER_PAT_OP_REF="${BOOTSTRAP_REVIEWER_PAT_OP_REF:-$BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT}"
 BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY="reviewer-assignment-token"
 
+# Out-parameter of bootstrap::_provision_reviewer_assignment_token: the
+# SPECIFIC failure message it recorded under
+# $BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY during the CURRENT call, or
+# "" when the path it took recorded nothing of its own. The stage-level
+# caller reads it through bootstrap::_record_reviewer_token_stage_failure
+# so its own keyed record does not clobber the specific reason (#761).
+#
+# Reset unconditionally on entry to that function — never trusted across
+# calls. That reset is what keeps the two required behaviours from
+# fighting each other; see the helper below.
+BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON=""
+
+# Message-field prefix stamped onto a recorded warning once a later
+# attempt in the same bootstrap fixes it (#761). This is the WIRE FORMAT
+# of the "${BOOTSTRAP_STATE_FILE}.warnings" sidecar, not a private
+# constant: board-and-summary.sh's summary renderer keys its RESOLVED
+# block off the same literal, and tests/test_bootstrap_github_infra.sh
+# pins the two spellings equal.
+BOOTSTRAP_WARNING_RESOLVED_MARKER="RESOLVED: "
+
+# Agent names scripts/op-preflight.sh will accept for `--agent`. MUST
+# stay equal to the set its reviewer_pat_item_for() knows — anything
+# else exits 1 with "unknown agent". The wizard's --reviewers flag takes
+# an unvalidated CSV, so a remediation hint that echoes a selection back
+# as `--agent <name>` has to filter it through this list or it can print
+# a command that cannot run (#761).
+# tests/test_bootstrap_github_infra.sh pins this equal to op-preflight's
+# own list so a new agent added there can't silently go missing here.
+BOOTSTRAP_REVIEWER_PREFLIGHT_AGENTS="claude cursor codex"
+
 bootstrap::stage_github_infra() {
   bootstrap::stage_banner "github-infra"
 
@@ -169,11 +199,13 @@ bootstrap::stage_github_infra() {
         # `.bootstrap-state.warnings` the moment the stage aborts —
         # a later --resume (or a human auditing the sidecar) has no
         # record the failure ever happened.
-        bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$step_rc); BOOTSTRAP_STRICT_SECRETS=1 failed the stage — fix and re-run with --resume template-mirror"
+        bootstrap::_record_reviewer_token_stage_failure "$step_rc" \
+          "BOOTSTRAP_STRICT_SECRETS=1 failed the stage — fix and re-run with --resume template-mirror"
         bootstrap::_restore_active_if_needed
         return "$step_rc"
       fi
-      bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$step_rc); workflows will require manual secret-set on first PR"
+      bootstrap::_record_reviewer_token_stage_failure "$step_rc" \
+        "workflows will require manual secret-set on first PR"
       step_rc=0
     fi
 
@@ -324,9 +356,173 @@ bootstrap::_reviewer_selected() {
   esac
 }
 
+# Record the stage-level REVIEWER_ASSIGNMENT_TOKEN provisioning failure,
+# keeping the callee's specific reason when it had one (#761).
+#
+# The stage and the provisioning helper both write under the SAME warning
+# key, and bootstrap::record_warning is replace-by-key: it clears every
+# line for the key before appending. A bare stage-level record therefore
+# overwrote the specific reason the helper had just written ("no PAT
+# available, prompts skipped" / "human declined to provide a PAT") with a
+# generic "provisioning failed (rc=N)" — and since the resolver preserves
+# whatever text is outstanding at resolution time, the audit trail this
+# whole change exists for could no longer say WHICH failure happened.
+#
+# The fix carries the reason forward rather than declining to overwrite.
+# "Don't overwrite an existing record for this key" looks equivalent but
+# is wrong: the sidecar survives --resume and carries no run marker or
+# timestamp, so a stale line written by an EARLIER attempt is
+# byte-indistinguishable from one this attempt just wrote. A blanket
+# no-overwrite guard would pin the stale reason in place and silently
+# drop the current failure — breaking record_warning's replacement
+# contract exactly when the sidecar most needs to be current.
+#
+# $BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON is positive proof instead:
+# the helper resets it on entry and sets it only on the paths where it
+# actually recorded something, so it describes THIS call and nothing else.
+# A later attempt that fails on a path recording no reason of its own
+# leaves it empty, falls back to the generic message here, and replaces
+# the stale record as before.
+#
+# $1 is the provisioning rc (only used by the generic fallback — the
+# specific reasons already name their own cause); $2 is the stage-level
+# consequence appended to whichever headline is used.
+bootstrap::_record_reviewer_token_stage_failure() {
+  local rc=$1 tail_note=$2
+  local headline="${BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON:-}"
+  if [ -z "$headline" ]; then
+    headline="github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=$rc)"
+  fi
+  bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" \
+    "$headline; $tail_note"
+}
+
+# Retire a recorded warning once a later attempt in the same bootstrap
+# fixed the underlying problem — WITHOUT erasing the fact that it
+# happened (#761). bootstrap::clear_warning on its own deletes the line,
+# so an operator who hit a BOOTSTRAP_STRICT_SECRETS=1 abort and then
+# fixed it via --resume loses every trace that the first attempt failed;
+# the sidecar is also the audit trail a human reads weeks later. Replace
+# the outstanding line for this key with a resolution record instead,
+# stamped with $BOOTSTRAP_WARNING_RESOLVED_MARKER so the summary lists it
+# under RESOLVED rather than RECORDED FAILURES.
+#
+# Keyed by the SAME key as the original warning, so a later
+# bootstrap::record_warning for that key still replaces it cleanly (its
+# clear_warning matches on the "@<key><TAB>" prefix, which this record
+# preserves).
+#
+# The ORIGINAL failure message is preserved verbatim and merely prefixed
+# with the marker; $2 is a short resolution note appended in brackets.
+# Substituting a generic "something failed earlier" string would defeat
+# the audit trail this record exists for: several distinct failures share
+# the reviewer-assignment-token key (no PAT + prompts skipped, human
+# declined to paste one, `gh secret set` itself failed), and an operator
+# reading the sidecar weeks later has to be able to tell WHICH one
+# happened.
+#
+# No-op unless there is an OUTSTANDING line for the key. "Outstanding"
+# means a line for the key whose message does NOT already carry the
+# resolved marker — two separate guards in one:
+#   - a first-attempt success must not manufacture a resolution record
+#     for a failure that never happened (no line for the key at all);
+#   - a second successful attempt must not re-resolve a record the first
+#     one already resolved, which would double-prefix the marker and
+#     bury the original message one bracket deeper each time.
+bootstrap::_resolve_recorded_warning() {
+  local key=$1 note=$2
+  if [ -z "${BOOTSTRAP_STATE_FILE:-}" ] || [ ! -f "${BOOTSTRAP_STATE_FILE}.warnings" ]; then
+    return 0
+  fi
+
+  local warnings_file="${BOOTSTRAP_STATE_FILE}.warnings"
+  local prefix="@${key}	"
+  local line original="" found=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      # Already resolved on an earlier attempt — leave it exactly as is.
+      "${prefix}${BOOTSTRAP_WARNING_RESOLVED_MARKER}"*) ;;
+      "$prefix"*) original=${line#"$prefix"}; found=1; break ;;
+    esac
+  done <"$warnings_file"
+  if [ "$found" != "1" ]; then
+    return 0
+  fi
+
+  bootstrap::clear_warning "$key"
+  mkdir -p "$(dirname "$warnings_file")"
+  printf '@%s\t%s%s [%s]\n' \
+    "$key" "$BOOTSTRAP_WARNING_RESOLVED_MARKER" "$original" "$note" >>"$warnings_file"
+  bootstrap::log "recorded warning '$key' marked resolved in the end-of-run summary"
+}
+
+# Emit the operator-facing remediation for a REVIEWER_ASSIGNMENT_TOKEN
+# miss. The secret has to hold a PAT belonging to one of the SELECTED
+# reviewers: scripts/gh-as-author.sh verifies the identity of the author
+# performing the write, never the token piped on its stdin, so nothing
+# downstream catches a wrong-identity payload (#761). Naming the right
+# token is therefore this hint's job.
+#
+# $OP_PREFLIGHT_REVIEWER_PAT is deliberately never recommended as-is.
+# Reaching this path with that variable set is positive proof it was
+# rejected — path a above installs the cached PAT whenever its owning
+# agent is a selected reviewer, so a surviving miss means the identity
+# check said no. Echoing it back would hand the operator the very token
+# the stage just refused.
+bootstrap::_emit_reviewer_token_remediation() {
+  local full_repo=$1 reviewers_csv=$2
+
+  # Name a concrete selected reviewer so the preflight line is
+  # copy-pasteable. It must be an agent scripts/op-preflight.sh actually
+  # accepts: that script hard-rejects any --agent outside the set its
+  # reviewer_pat_item_for() knows (see $BOOTSTRAP_REVIEWER_PREFLIGHT_AGENTS
+  # below), and the wizard does NOT validate --reviewers at parse time, so
+  # the first CSV field can be a name preflight refuses. Emitting it
+  # verbatim would hand the operator a remediation that exits 1 — a
+  # dead end at exactly the moment they need a working command. Pick the
+  # first field preflight accepts; fall back to a placeholder only when
+  # the selection names none.
+  local agent="" candidate
+  for candidate in $(printf '%s' "$reviewers_csv" | tr -d ' ' | tr ',' ' '); do
+    case " $BOOTSTRAP_REVIEWER_PREFLIGHT_AGENTS " in
+      *" $candidate "*) agent="$candidate"; break ;;
+    esac
+  done
+  if [ -z "$agent" ]; then
+    agent="<selected-reviewer>"
+  fi
+
+  if [ -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]; then
+    if [ -n "${OP_PREFLIGHT_AGENT:-}" ]; then
+      bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: do NOT install the PAT currently in \$OP_PREFLIGHT_REVIEWER_PAT — it belongs to agent '$OP_PREFLIGHT_AGENT', which is not one of the selected reviewers ($reviewers_csv)"
+    else
+      bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: do NOT install the PAT currently in \$OP_PREFLIGHT_REVIEWER_PAT — \$OP_PREFLIGHT_AGENT is unset, so its owning identity could not be verified"
+    fi
+  fi
+  # ONE `&&`-chained command on purpose. Emitting the re-preflight and
+  # the `gh secret set` as two independent lines makes the mitigation
+  # advisory prose: an operator who transcribes only the line that
+  # performs the action — in a shell where preflight last ran for a
+  # NON-selected agent — installs that rejected PAT, and nothing
+  # downstream catches it (gh-as-author.sh verifies the author
+  # performing the write, never the token on its stdin). Chaining makes
+  # skipping the re-preflight impossible without editing the command.
+  bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: fix: re-run credential preflight for a SELECTED reviewer and set the secret from that agent's cache — run as ONE command, the preflight is not optional:"
+  bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN:   eval \"\$(scripts/op-preflight.sh --agent $agent --mode review)\" && printf '%s' \"\$OP_PREFLIGHT_REVIEWER_PAT\" | scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo $full_repo" # NO_BARE_GH_WRITE_EXEMPT: remediation hint echoed to the operator (routed through the token-verifying author wrapper), not an executed gh write
+  bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: the stored secret must belong to one of the invited reviewers ($reviewers_csv) — the author wrapper verifies the account performing the write, NOT the token on its stdin, so a wrong-identity PAT installs silently and fails on the first PR"
+}
+
 bootstrap::_provision_reviewer_assignment_token() {
   local full_repo=$1 reviewers_csv=$2
   local pat=""
+
+  # Reset the out-parameter FIRST, before any path can return. Deliberately
+  # not `local`: the stage-level caller reads it after this function
+  # returns. Clearing it on entry is what makes it describe THIS call — a
+  # --resume attempt that fails on a path recording no specific reason must
+  # NOT inherit the reason a previous attempt set, or the stage would
+  # re-record a stale cause as if it were the current one.
+  BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON=""
 
   # Path c (tests / explicit override): caller supplied the PAT
   # inline via env var.
@@ -407,8 +603,13 @@ bootstrap::_provision_reviewer_assignment_token() {
       # miss for the end-of-run summary, and honor the strict knob.
       bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: NO PAT available and prompts are skipped — secret NOT set on $full_repo"
       bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: reviewer-assignment / agent-review workflows WILL FAIL on the first PR until it is set"
-      bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: fix: printf '%s' \"\$OP_PREFLIGHT_REVIEWER_PAT\" | scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo $full_repo" # NO_BARE_GH_WRITE_EXEMPT: remediation hint echoed to the operator (routed through the token-verifying author wrapper), not an executed gh write
-      bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (no PAT available, prompts skipped) — set it manually before the first PR"
+      bootstrap::_emit_reviewer_token_remediation "$full_repo" "$reviewers_csv"
+      # Publish the reason as well as recording it: under
+      # BOOTSTRAP_STRICT_SECRETS=1 this returns non-zero and the stage's
+      # own keyed record would otherwise replace this line with a generic
+      # one (#761).
+      BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON="REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (no PAT available, prompts skipped) — set it manually before the first PR"
+      bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON"
       if [ "${BOOTSTRAP_STRICT_SECRETS:-0}" = "1" ]; then
         return 1
       fi
@@ -422,7 +623,10 @@ bootstrap::_provision_reviewer_assignment_token() {
     read -r -s -p "Paste the PAT (input hidden, blank to skip): " pat
     echo
     if [ -z "$pat" ]; then
-      bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (human declined to provide a PAT) — set it manually before the first PR"
+      bootstrap::_emit_reviewer_token_remediation "$full_repo" "$reviewers_csv"
+      # Same carry-forward as the prompts-skipped path above (#761).
+      BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON="REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (human declined to provide a PAT) — set it manually before the first PR"
+      bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON"
       if [ "${BOOTSTRAP_STRICT_SECRETS:-0}" = "1" ]; then
         return 1
       fi
@@ -467,7 +671,10 @@ bootstrap::_provision_reviewer_assignment_token() {
     bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: secret set failed (rc=$set_rc)"
     return "$set_rc"
   fi
-  bootstrap::clear_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY"
+  # Note only — the original failure message is kept verbatim by the
+  # resolver, so the sidecar still says WHICH failure this fixed.
+  bootstrap::_resolve_recorded_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" \
+    "fixed on a later attempt in this bootstrap: the secret is now set on $full_repo; no action needed"
   bootstrap::log "REVIEWER_ASSIGNMENT_TOKEN set on $full_repo (len=${#pat})"
 }
 

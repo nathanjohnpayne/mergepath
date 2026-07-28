@@ -432,6 +432,27 @@ bootstrap::_print_summary() {
     esac
   done
 
+  # Split the recorded-warnings sidecar into failures that are still
+  # outstanding and ones a later attempt in the same bootstrap fixed
+  # (#761). The sidecar stays the audit trail — a resolved warning is
+  # rewritten in place, never deleted, so the operator can still see the
+  # first attempt failed. github-infra.sh stamps the resolution marker;
+  # this literal is the shared wire format (see its
+  # $BOOTSTRAP_WARNING_RESOLVED_MARKER).
+  #
+  # Classification is by POSITIVE match on that marker: only a line whose
+  # message starts with it is downgraded. Everything else — including any
+  # future or unrecognized line shape — stays a RECORDED FAILURE.
+  local warnings_outstanding="" warnings_resolved=""
+  if [ -n "$state_file" ] && [ -s "${state_file}.warnings" ]; then
+    # Strip the "@<key><TAB>" prefix first so the marker test sees the
+    # message field for keyed and unkeyed records alike.
+    local warnings_messages
+    warnings_messages=$(sed 's/^@[^	]*	//' "${state_file}.warnings")
+    warnings_outstanding=$(printf '%s\n' "$warnings_messages" | grep -v '^RESOLVED: ' || true)
+    warnings_resolved=$(printf '%s\n' "$warnings_messages" | grep '^RESOLVED: ' || true)
+  fi
+
   {
     echo "DONE:"
     # Strip trailing newline from `printf %s` to avoid a blank line.
@@ -452,10 +473,19 @@ bootstrap::_print_summary() {
     # missed REVIEWER_ASSIGNMENT_TOKEN provisioning (#734). Persisted
     # in the state-file sidecar so they survive --resume; surfacing
     # them here makes a miss impossible to ship unnoticed.
-    if [ -n "${BOOTSTRAP_STATE_FILE:-}" ] && [ -s "${BOOTSTRAP_STATE_FILE}.warnings" ]; then
+    if [ -n "$warnings_outstanding" ]; then
       echo
       echo "  !! RECORDED FAILURES (fix before the first PR):"
-      sed 's/^@[^	]*	//; s/^/  !! - /' "${BOOTSTRAP_STATE_FILE}.warnings"
+      printf '%s\n' "$warnings_outstanding" | sed 's/^/  !! - /'
+    fi
+    # Failures a later attempt in this same bootstrap fixed. Reported
+    # separately rather than dropped (#761): the operator still wants to
+    # know a strict-mode abort happened and what fixed it, but it must
+    # not read as outstanding work.
+    if [ -n "$warnings_resolved" ]; then
+      echo
+      echo "  ok RESOLVED (recorded earlier in this bootstrap, fixed on a later attempt — no action needed):"
+      printf '%s\n' "$warnings_resolved" | sed 's/^RESOLVED: //; s/^/  ok - /'
     fi
     echo
     echo "CROSS-REPO LOOP UPDATE:"
