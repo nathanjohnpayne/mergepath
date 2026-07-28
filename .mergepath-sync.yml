@@ -1373,6 +1373,12 @@ doc_ownership:
     class: canonical
   - path: docs/agents/worktree-placement.md
     class: canonical
+  # Landed in #776 while this inventory was in flight. Canonical by the same
+  # reasoning as worktree-placement.md: a single-purpose, tech-stack-independent
+  # convention that is true verbatim in every consumer, already carried as a
+  # `type: canonical` path entry above.
+  - path: docs/agents/decision-records.md
+    class: canonical
   - path: docs/agents/code-review-requirements.md
     class: canonical
     pending_manifest: true
