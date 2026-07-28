@@ -958,6 +958,18 @@ paths:
   - path: docs/agents/worktree-placement.md
     type: canonical
     consumers: all
+  # Decision records (#770 + #771) — the change-level "## Path taken"
+  # record and the issue-level linked decision callout, written as one
+  # doc because they are the same discipline at two granularities.
+  # Consumer-truth checked: no bare `#NN` issue refs (they would
+  # resolve to the CONSUMER's own issues — the #744/#746 trap), no
+  # references to hub-only machinery (the sync engine, the manifest,
+  # the weekly sweep). The scripts and docs it does name —
+  # scripts/resolve-pr-threads.sh, docs/agents/worktree-placement.md,
+  # REVIEW_POLICY.md — are all present on every consumer.
+  - path: docs/agents/decision-records.md
+    type: canonical
+    consumers: all
 
   # Canonical workflows — review policy + automation surfaces that
   # should be lockstep across all consumers.
