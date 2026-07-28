@@ -472,9 +472,18 @@ merge_clearance_check_enforced() {
           # match would accept the required check being satisfied by some
           # other app emitting that name.
           set +e
-          classic_app=$(printf '%s' "$prot_out" | jq -r --arg ctx "$MERGE_CLEARANCE_CHECK_NAME" '
+          # ANY matching entry with the trusted app is enough. Classic
+          # protection may list the same context more than once under
+          # different producers; taking `.[0]` would report not-enforced
+          # whenever a foreign entry happened to sort first, even though the
+          # expected producer IS explicitly required (#772 r6 P2).
+          classic_app=$(printf '%s' "$prot_out" | jq -r --arg ctx "$MERGE_CLEARANCE_CHECK_NAME" --arg app "$MERGE_CLEARANCE_EXPECTED_APP_ID" '
             if (.required_status_checks.checks | type) == "array"
-            then ([ .required_status_checks.checks[] | select(.context == $ctx) | .app_id ] | if length > 0 then .[0] else "absent" end)
+            then ([ .required_status_checks.checks[] | select(.context == $ctx) | .app_id | tostring ]) as $ids
+                 | if   ($ids | length) == 0 then "absent"
+                   elif ($ids | index($app)) then $app
+                   else ($ids | join(","))
+                   end
             else "unknown" end' 2>"$err")
           prot_rc=$?
           set -e

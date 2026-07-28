@@ -127,8 +127,15 @@ if [ "$1" = "api" ]; then
       # #772 r5: the same response carries per-check producer data. Default to
       # the trusted Actions app id; FIXTURE_CLASSIC_APP_ID overrides it so a
       # foreign-producer case can be exercised.
-      printf '{"enforce_admins":{"enabled":%s},"required_status_checks":{"checks":[{"context":"%s","app_id":%s}]}}\n' \
-        "$FIXTURE_ADMIN_ENFORCE" "$GATE_CHECK_NAME" "${FIXTURE_CLASSIC_APP_ID:-15368}"
+      if [ "${FIXTURE_CLASSIC_DUP_FIRST:-0}" = "1" ]; then
+        # Same context listed twice, foreign producer FIRST — the ordering that
+        # a `.[0]`-based match would misread as not-enforced (#772 r6 P2).
+        printf '{"enforce_admins":{"enabled":%s},"required_status_checks":{"checks":[{"context":"%s","app_id":99999},{"context":"%s","app_id":15368}]}}\n' \
+          "$FIXTURE_ADMIN_ENFORCE" "$GATE_CHECK_NAME" "$GATE_CHECK_NAME"
+      else
+        printf '{"enforce_admins":{"enabled":%s},"required_status_checks":{"checks":[{"context":"%s","app_id":%s}]}}\n' \
+          "$FIXTURE_ADMIN_ENFORCE" "$GATE_CHECK_NAME" "${FIXTURE_CLASSIC_APP_ID:-15368}"
+      fi
       exit 0
       ;;
     repos/*/rulesets/*)
@@ -1675,6 +1682,28 @@ if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
   pass "protection: classic required check from a foreign app_id → not counted → false"
 else
   fail "protection: foreign classic producer expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1p (#772 r6 P2): duplicate contexts — ANY trusted producer entry counts"
+# Classic protection can list one context more than once under different
+# producers. Matching only the FIRST entry reports not-enforced whenever a
+# foreign entry sorts ahead of the Actions one, even though the expected
+# producer is explicitly required.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '["lint", $n]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_CLASSIC_DUP_FIRST=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "protection: duplicate context with a foreign entry first still matches the trusted producer → true"
+else
+  fail "protection: duplicate-context ordering expected true/0; got rc=$RC out='$OUT'"
 fi
 
 echo; echo "--- Protection 1o (#772 r5 P1): a ruleset rule with no integration pin is not proof"
