@@ -135,12 +135,21 @@ done
 # --derive-rate-limit-protection below because Phase-4b-cleared protected PRs
 # can be safe to auto-merge even after the removable label is gone (#713).
 #
-# --derive-rate-limit-protection (#713): QUERY mode for
+# --derive-rate-limit-protection (#713, tightened by #772): QUERY mode for
 # agent-review.yml's CodeRabbit rc=5 branch. It prints `true` when a
 # rate-limited PR is protected from bot-unreviewed auto-merge by either:
-#   1. the active merge-clearance external gate, or
+#   1. the merge-clearance external gate being ENFORCED — enabled in the
+#      governing policy AND observably a required status check on the PR's
+#      base branch (#772) — or
 #   2. intrinsic external-review applicability plus an already-satisfied
 #      current-head Codex/Phase-4b clearance predicate.
+# Arm 1 previously asked only whether the gate was enabled in CONFIG. That is
+# not evidence the gate can hold a merge: mergepath itself runs with the switch
+# on while `Merge clearance gate` is absent from base-branch protection, so the
+# query claimed protection on a repo where the gate blocks nothing. Enforcement
+# that cannot be determined is treated as NOT enforced and falls through to arm
+# 2, which is positive proof — so an undeterminable read costs availability, not
+# safety.
 # This keeps under-threshold stalls blocked while allowing the common
 # Phase-4b timing case where the APPROVED review already removed
 # `needs-external-review` before the auto-merge job re-checks CodeRabbit.
@@ -284,6 +293,117 @@ fetch_api_array() {  # <endpoint> <label>
   raw=$(gh api --paginate "$endpoint" 2>&1) || die 2 "failed to fetch $label: $raw"
   echo "$raw" | jq -s 'add // []' 2>/dev/null \
     || die 2 "failed to flatten $label pagination output"
+}
+
+# --- merge-clearance required-check enforcement probe (#772) ----------------
+#
+# The required-status-check CONTEXT this gate reports. Branch protection and
+# rulesets both key on the workflow JOB name, and
+# .github/workflows/merge-clearance-gate.yml names that job `Merge clearance
+# gate` (its scheduled-sweep and dispatch-recheck jobs POST check_runs under the
+# same CHECK_NAME so every source resolves as one context).
+# scripts/ci/check_merge_clearance_gate asserts that job name verbatim and
+# scripts/audit-branch-protection.sh carries the same string in
+# CANONICAL_REQUIRED_CHECKS, so this constant cannot drift from the workflow
+# without CI saying so.
+MERGE_CLEARANCE_CHECK_NAME="Merge clearance gate"
+
+# Positive proof that $MERGE_CLEARANCE_CHECK_NAME is an ENFORCED required
+# status check on the PR's base branch. Returns 0 ONLY when the context is
+# observed in a required-status-check list for $BASE_REF; returns 1 for
+# everything else — definitively absent, unknown base ref, API failure, or an
+# unparseable payload. "Undeterminable" is deliberately NOT distinguished from
+# "absent": the only caller's next step is the positive-proof current-head
+# clearance probe, so treating an unknown as not-enforced costs availability,
+# never safety (#768's positive-proof rule). Prints nothing; every diagnostic
+# goes to stderr via log() so the query's stdout stays exactly true/false.
+#
+# Why two surfaces, and why not the obvious REST endpoint: reading
+# repos/{owner}/{repo}/branches/{branch}/protection[/required_status_checks]
+# needs Administration:read and 404s for the write-scoped reviewer PAT this
+# query runs under in agent-review.yml (verified live against
+# nathanjohnpayne/mergepath). The two below are readable by a plain
+# write-scoped token and together cover both protection models:
+#   1. GraphQL ref.refUpdateRule.requiredStatusCheckContexts — CLASSIC branch
+#      protection, which is what the whole fleet uses today.
+#   2. REST repos/{owner}/{repo}/rules/branches/{branch} — repository RULESETS,
+#      the modern model. Classic protection does NOT surface there: verified
+#      live on mergepath@main, whose classic contexts are
+#      ["Label Gate","Self-Review Required","lint"] while that endpoint returns
+#      []. So neither surface alone is sufficient and the two lists are unioned.
+# Both are scoped to rules enforced on the VIEWER, so bypass filtering can only
+# HIDE a rule, never invent one — it can push this probe toward "not enforced"
+# (the conservative direction) and never toward a false "enforced".
+merge_clearance_check_enforced() {
+  local owner name contexts="" out err rc parsed
+  owner=${REPO%%/*}
+  name=${REPO##*/}
+
+  if [ -z "$BASE_REF" ]; then
+    log "enforcement probe: PR base ref is unknown — treating '$MERGE_CLEARANCE_CHECK_NAME' as NOT enforced"
+    return 1
+  fi
+
+  # errexit is suppressed inside a function called as an `if` condition, so an
+  # unguarded mktemp failure would leave $err empty and turn every redirect
+  # below into a confusing "no such file" — check it explicitly and take the
+  # conservative branch instead.
+  err=$(mktemp "${TMPDIR:-/tmp}/mcg-enforcement-err.XXXXXX" 2>/dev/null) || err=""
+  if [ -z "$err" ]; then
+    log "enforcement probe: could not create a scratch file for API diagnostics — treating '$MERGE_CLEARANCE_CHECK_NAME' as NOT enforced"
+    return 1
+  fi
+
+  # Surface 1 — classic branch protection.
+  set +e
+  # shellcheck disable=SC2016  # $owner/$name/$qref are GraphQL variables, bound by the -f flags below
+  out=$(gh api graphql \
+    -f query='query($owner:String!,$name:String!,$qref:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qref){refUpdateRule{requiredStatusCheckContexts}}}}' \
+    -f owner="$owner" -f name="$name" -f qref="refs/heads/$BASE_REF" 2>"$err")
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    log "enforcement probe: classic branch-protection read failed on '$BASE_REF' (gh rc=$rc): $(tr '\n' ' ' <"$err")"
+  else
+    set +e
+    parsed=$(printf '%s' "$out" \
+      | jq -r '.data.repository.ref.refUpdateRule.requiredStatusCheckContexts // [] | .[]' 2>"$err")
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+      log "enforcement probe: could not parse the classic branch-protection response for '$BASE_REF': $(tr '\n' ' ' <"$err")"
+    elif [ -n "$parsed" ]; then
+      contexts="$contexts$parsed"$'\n'
+    fi
+  fi
+
+  # Surface 2 — repository rulesets.
+  set +e
+  out=$(gh api "repos/$REPO/rules/branches/$BASE_REF" 2>"$err")
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    log "enforcement probe: ruleset read failed on '$BASE_REF' (gh rc=$rc): $(tr '\n' ' ' <"$err")"
+  else
+    set +e
+    parsed=$(printf '%s' "$out" \
+      | jq -r '[ .[]? | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context ] | .[]' 2>"$err")
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+      log "enforcement probe: could not parse the ruleset response for '$BASE_REF': $(tr '\n' ' ' <"$err")"
+    elif [ -n "$parsed" ]; then
+      contexts="$contexts$parsed"$'\n'
+    fi
+  fi
+
+  rm -f "$err"
+
+  if printf '%s' "$contexts" | grep -Fxq -- "$MERGE_CLEARANCE_CHECK_NAME"; then
+    return 0
+  fi
+  log "enforcement probe: '$MERGE_CLEARANCE_CHECK_NAME' is NOT among the required status checks observable on base '$BASE_REF' (observed: [$(printf '%s' "$contexts" | tr '\n' ' ' | sed 's/[[:space:]]*$//')])"
+  return 1
 }
 
 # Propagation-lane exemption (#429), HEAD-PINNED. Returns 0 (true) iff a PR
@@ -682,13 +802,28 @@ if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "t
       printf 'false\n'
       exit 0
     fi
-    if [ "$EXTERNAL_GATE_ENABLED" = "true" ]; then
-      log "rate-limit protection query: active merge-clearance external gate applies on HEAD $HEAD_SHA ($REQUIRES_REASON)"
+    # Arm 1 (#713, tightened by #772): the merge-clearance gate will really
+    # hold this merge. That needs BOTH the config switch AND positive proof the
+    # check is ENFORCED on the PR's base branch. `codex.external_review_gate.
+    # enabled` alone is CONFIGURATION, not enforcement — on
+    # nathanjohnpayne/mergepath that switch is true while base `main` requires
+    # only ["Label Gate","Self-Review Required","lint"], so the pre-#772
+    # short-circuit reported protected:true on a repo where this gate cannot
+    # block anything, and agent-review.yml's rc=5 branch downgraded a
+    # CodeRabbit rate-limit stall on that strength. Enforcement that cannot be
+    # DETERMINED counts as not-enforced and falls through to arm 2, which is a
+    # positive-proof probe — so nothing is lost but availability.
+    if [ "$EXTERNAL_GATE_ENABLED" = "true" ] && merge_clearance_check_enforced; then
+      log "rate-limit protection query: '$MERGE_CLEARANCE_CHECK_NAME' is an ENFORCED required check on base '$BASE_REF' and its external arm applies on HEAD $HEAD_SHA ($REQUIRES_REASON)"
       printf 'true\n'
       exit 0
     fi
 
-    log "rate-limit protection query: external review applies on HEAD $HEAD_SHA ($REQUIRES_REASON), but merge-clearance external gate is disabled; checking current-head Codex/Phase-4b clearance"
+    # Arm 2 (#714, unchanged): no provably-enforced gate — the switch is off,
+    # the check is not required on the base branch, or enforcement was
+    # undeterminable — so fall back to proving clearance is already satisfied
+    # on THIS head.
+    log "rate-limit protection query: external review applies on HEAD $HEAD_SHA ($REQUIRES_REASON), but '$MERGE_CLEARANCE_CHECK_NAME' is not a proven-enforced required check on base '$BASE_REF' (external_review_gate.enabled=$EXTERNAL_GATE_ENABLED); checking current-head Codex/Phase-4b clearance"
     CODEX_CHECK_BIN="${MERGE_CLEARANCE_CODEX_CHECK_BIN:-$SCRIPT_DIR/codex-review-check.sh}"
     if [ ! -f "$CODEX_CHECK_BIN" ]; then
       die 2 "codex-review-check.sh not found at $CODEX_CHECK_BIN (required for rate-limit protection query)"

@@ -31,6 +31,11 @@
 #     12. malformed PR_NUMBER → exit 2.
 #     13. missing GH_TOKEN → exit 2.
 #     14. env-only PR_NUMBER + REPO → same behavior as positional.
+#   Query modes (--derive-external-requiredness, --derive-rate-limit-protection)
+#     Query 1–8 / Protection 1–6, at the bottom of this file. The Protection
+#     block carries the #772 enforcement cases: arm 1 now demands positive
+#     proof that `Merge clearance gate` is a REQUIRED status check on the PR's
+#     base branch, not just `codex.external_review_gate.enabled: true`.
 #
 # Bash 3.2 portable.
 
@@ -90,6 +95,28 @@ if [ "$1" = "api" ]; then
         exit 1
       fi
       cat "${FIXTURE_COMMENTS:-/dev/null}"
+      exit 0
+      ;;
+    graphql)
+      # #772 enforcement probe, surface 1 (classic branch protection via
+      # ref.refUpdateRule). FIXTURE_PROTECTION_FAIL=1 simulates an API failure
+      # so the "enforcement undeterminable" path can be exercised. Unset
+      # FIXTURE_PROTECTION means "no observable protection" — the fleet-wide
+      # reality today, where `Merge clearance gate` is required nowhere.
+      if [ "${FIXTURE_PROTECTION_FAIL:-0}" = "1" ]; then
+        echo "STUB gh: simulated branch-protection GraphQL failure" >&2
+        exit 1
+      fi
+      cat "${FIXTURE_PROTECTION:-/dev/null}"
+      exit 0
+      ;;
+    repos/*/rules/branches/*)
+      # #772 enforcement probe, surface 2 (repository rulesets).
+      if [ "${FIXTURE_RULESETS_FAIL:-0}" = "1" ]; then
+        echo "STUB gh: simulated rulesets API failure" >&2
+        exit 1
+      fi
+      cat "${FIXTURE_RULESETS:-/dev/null}"
       exit 0
       ;;
     repos/*/contents/*)
@@ -197,6 +224,26 @@ make_pr_fixture() {  # <sha> <author> <labels_json_array> [base_ref] [default_br
       labels: $labels,
       base: { sha: "base000aaa", ref: $base_ref,
               repo: { default_branch: $default_branch } } }
+  ' >"$file"
+  echo "$file"
+}
+
+make_protection_fixture() {  # <contexts_json_array>  GraphQL refUpdateRule shape
+  local contexts=$1
+  local file="$WORKDIR/protection.$$.$RANDOM.json"
+  jq -n --argjson contexts "$contexts" '
+    { data: { repository: { ref: { refUpdateRule: {
+        requiredStatusCheckContexts: $contexts } } } } }
+  ' >"$file"
+  echo "$file"
+}
+
+make_rulesets_fixture() {  # <contexts_json_array>  rules/branches/<branch> shape
+  local contexts=$1
+  local file="$WORKDIR/rulesets.$$.$RANDOM.json"
+  jq -n --argjson contexts "$contexts" '
+    [ { type: "required_status_checks",
+        parameters: { required_status_checks: [ $contexts[] | { context: . } ] } } ]
   ' >"$file"
   echo "$file"
 }
@@ -1242,26 +1289,143 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# --derive-rate-limit-protection query mode (#713): prints exactly true/false.
-# `true` means the auto-merge rc=5 path is protected either by the active
-# merge-clearance external gate or by already-satisfied current-head
-# Codex/Phase-4b clearance when that required check is disabled.
+# --derive-rate-limit-protection query mode (#713, tightened by #772): prints
+# exactly true/false. `true` means the auto-merge rc=5 path is protected either
+# by an ENFORCED merge-clearance external gate — enabled in policy AND observably
+# a required status check on the PR's base branch — or by already-satisfied
+# current-head Codex/Phase-4b clearance. Config-enabled alone is not enforcement
+# (#772): mergepath itself runs with the switch on while `Merge clearance gate`
+# is absent from base-branch protection.
 # ---------------------------------------------------------------------------
 
-echo; echo "--- Protection 1: active external gate + protected path → true"
+GATE_CHECK_NAME="Merge clearance gate"
+
+echo; echo "--- Protection 1 (#772): enforced required check (classic protection) + protected path → true"
 SCRATCH=$(make_scratch false true)
 FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
 FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
 FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '["lint", $n]')")
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" \
   run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
 RC=$?
 set -e
 if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
-  pass "protection: active external gate + protected path → true"
+  pass "protection: enforced required check + protected path → true (arm 1)"
 else
-  fail "protection: active external gate expected true/0; got rc=$RC out='$OUT'"
+  fail "protection: enforced gate expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1b (#772): enforced via a repository RULESET (no classic protection) → true"
+# Classic protection does not surface on repos/{o}/{r}/rules/branches/{branch}
+# and rulesets do not surface on ref.refUpdateRule, so the probe unions both.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+  run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "protection: ruleset-enforced required check → true (both surfaces unioned)"
+else
+  fail "protection: ruleset-enforced gate expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1c (#772 REPRO): config-enabled but NOT an enforced required check, above threshold, no clearance → false"
+# The #772 bug: EXTERNAL_GATE_ENABLED=true short-circuited to `true` without
+# checking whether `Merge clearance gate` can actually block the merge. Base
+# protection here requires only the mergepath-real contexts, so the gate is
+# vacuous and the rc=5 CodeRabbit downgrade must NOT be authorized.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"big.txt","additions":400,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["Label Gate","Self-Review Required","lint"]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+  run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: config-enabled but unenforced gate + no current-head clearance → false (#772)"
+else
+  fail "protection: unenforced gate expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1d (#772): config-enabled but unenforced + current-head clearance satisfied → true (#714 survives)"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"big.txt","additions":400,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["Label Gate","Self-Review Required","lint"]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=0 \
+      CODEX_STUB_STDOUT='delegate stdout must not pollute query output' \
+  run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "protection: unenforced gate but satisfied current-head clearance → true (arm 2, #714 preserved)"
+else
+  fail "protection: unenforced-but-cleared expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1e (#772): enforcement undeterminable (both API surfaces fail) + no clearance → false, error on stderr only"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"big.txt","additions":400,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+: > "$WORKDIR/protection-stderr.log"
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION_FAIL=1 FIXTURE_RULESETS_FAIL=1 \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+  run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>"$WORKDIR/protection-stderr.log")
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ] \
+    && grep -q "enforcement probe: classic branch-protection read failed" "$WORKDIR/protection-stderr.log" \
+    && grep -q "enforcement probe: ruleset read failed" "$WORKDIR/protection-stderr.log"; then
+  pass "protection: undeterminable enforcement → false, both API errors on stderr (stdout stays pure)"
+else
+  fail "protection: undeterminable enforcement expected false/0 with stderr diagnostics; got rc=$RC out='$OUT'"
+  sed 's/^/      /' "$WORKDIR/protection-stderr.log" >&2
+fi
+
+echo; echo "--- Protection 1f (#772): propagation-lane-exempt head short-circuits to false before the enforcement probe"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":".github/workflows/x.yml","additions":500,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture "$(jq -n --arg sha "$HEAD_SHA" '
+  [{ user:{login:"github-actions[bot]"}, body:("<!-- mergepath-propagation-lane verified-head=" + $sha + " -->") }]
+')")
+# Enforced-gate fixture on purpose: if the lane exemption did NOT short-circuit,
+# arm 1 would find the context and wrongly print true.
+FIXTURE_PROTECTION=$(make_protection_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+: > "$WORKDIR/gh-calls.log"
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" \
+  run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ] && ! grep -q "graphql" "$WORKDIR/gh-calls.log"; then
+  pass "protection: lane-exempt verified head → false without consulting the enforcement probe"
+else
+  fail "protection: lane-exempt expected false/0 and no enforcement probe; got rc=$RC out='$OUT'"
+  sed 's/^/      /' "$WORKDIR/gh-calls.log" >&2
 fi
 
 echo; echo "--- Protection 2 (#713): gate disabled + protected path + Phase-4b/Codex cleared → true"
