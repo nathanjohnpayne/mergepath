@@ -14,6 +14,9 @@
 #                                      bootstrap::author_gh for gh side-effects.
 #   bootstrap::record_stage <name>     Append a completed stage name to the
 #                                      state file at $BOOTSTRAP_STATE_FILE.
+#   bootstrap::record_warning <msg>    Warn now AND persist the message to
+#                                      "${BOOTSTRAP_STATE_FILE}.warnings" for
+#                                      the end-of-run summary's warnings block.
 #   bootstrap::last_completed_stage    Echo the last recorded stage name,
 #                                      or empty if no state file.
 #
@@ -183,6 +186,21 @@ bootstrap::record_stage() {
   fi
   mkdir -p "$(dirname "$BOOTSTRAP_STATE_FILE")"
   echo "$stage_name" >>"$BOOTSTRAP_STATE_FILE"
+}
+
+# Record a must-not-miss warning for the end-of-run summary. Emits the
+# message via bootstrap::warn immediately AND appends it to
+# "${BOOTSTRAP_STATE_FILE}.warnings" so it survives --resume and is
+# printed prominently by board-and-summary's summary block (#734 —
+# warn-only console lines scrolled past unnoticed and broken secret
+# provisioning shipped silently).
+bootstrap::record_warning() {
+  local msg=$1
+  bootstrap::warn "$msg"
+  if [ -n "${BOOTSTRAP_STATE_FILE:-}" ]; then
+    mkdir -p "$(dirname "$BOOTSTRAP_STATE_FILE")"
+    printf '%s\n' "$msg" >>"${BOOTSTRAP_STATE_FILE}.warnings"
+  fi
 }
 
 # Echo the last recorded stage name, or empty string if the state

@@ -1030,20 +1030,29 @@ bootstrap::_anchor_insert() {
   local doc=$1 anchor=$2 line=$3
   local tmp
   tmp=$(mktemp "${TMPDIR:-/tmp}/bootstrap-loop.XXXXXX")
-  # Ensure the tmpfile is cleaned up on any error path. Without the
-  # trap, a failed awk or mv left orphan files in $TMPDIR.
-  # CodeRabbit caught this on #233 round 2.
-  trap 'rm -f "$tmp"' RETURN
+  # Ensure the tmpfile is cleaned up on any error path — without
+  # cleanup, a failed awk or mv left orphan files in $TMPDIR
+  # (CodeRabbit caught this on #233 round 2). Do NOT use a
+  # `trap ... RETURN` for it: bash does not scope a RETURN trap to
+  # the function that set it, so it stays installed after this
+  # function returns and re-fires when the CALLER (bootstrap::run)
+  # returns — in a frame where $tmp is unbound — and under the
+  # file-top `set -u` that aborts the whole wizard with
+  # "tmp: unbound variable" (#733). Explicit `rm -f` on each exit
+  # path preserves the orphan-cleanup guarantee without the leak
+  # (same idiom as bootstrap::_print_summary in
+  # board-and-summary.sh).
   # awk: when we hit the anchor line, emit $line first, then the anchor.
   if ! awk -v anchor="$anchor" -v line="$line" '
     $0 ~ anchor && !inserted { print line; inserted = 1 }
     { print }
   ' "$doc" > "$tmp"; then
+    rm -f "$tmp"
     return 1
   fi
   if ! mv "$tmp" "$doc"; then
+    rm -f "$tmp"
     return 1
   fi
-  # mv succeeded so $tmp no longer exists; the trap's rm -f is a
-  # harmless no-op on the now-absent path.
+  # mv succeeded so $tmp no longer exists; nothing to clean up.
 }

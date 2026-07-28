@@ -102,7 +102,7 @@ Implementation: `scripts/bootstrap/github-infra.sh`.
 1. `gh repo create --source=. --push` against the target dir — creates the remote and pushes the bootstrap commit. Legitimate push to main on a greenfield remote (no `main` to protect yet).
 2. Seed the 12 canonical labels (`needs-external-review`, `needs-human-review`, `policy-violation`, `human-hold`, `human-action`, `decision-needed`, `agent-action`, `phase-0` through `phase-4`).
 3. Invite reviewer-identity collaborators (`nathanpayne-claude`, `-cursor`, `-codex` per `--reviewers`). Each invite is async; the wizard pauses for the human to accept each in the agent account's GitHub session.
-4. Provision the `REVIEWER_ASSIGNMENT_TOKEN` repo secret. Path order: inline (`BOOTSTRAP_REVIEWER_PAT_VALUE` env, tests only) → 1Password item → interactive prompt for a fine-grained PAT.
+4. Provision the `REVIEWER_ASSIGNMENT_TOKEN` repo secret. Path order: inline (`BOOTSTRAP_REVIEWER_PAT_VALUE` env, tests only) → session-cached `$OP_PREFLIGHT_REVIEWER_PAT` → 1Password item-UUID reference (`op://Private/pvbq24vl2h6gl7yjclxy2hbote/token`; never a title path, per #734) → interactive prompt for a fine-grained PAT.
 5. Prompt for and provision optional LLM secrets (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) with skip option.
 
 The wizard does not provision `AUTHOR_MERGE_TOKEN` by default, but `dependabot-auto-merge.yml` **requires it** as of nathanjohnpayne/mergepath#426: the Dependabot auto-merge workflow uses `AUTHOR_MERGE_TOKEN` for the `gh pr merge` step (so the merge is recorded under `author_identity`) and hard-fails if it is unset or resolves to anything other than `author_identity`. Provision it on any repo where Dependabot auto-merge is enabled. The same secret independently gates non-Dependabot auto-merge, which otherwise stays disabled with PRs merged manually as `nathanjohnpayne`. In both cases the workflow verifies the token resolves to the configured `author_identity` before calling `gh pr merge`.
@@ -111,7 +111,7 @@ For runtime application secrets in newly bootstrapped repos, do not add Secure N
 
 All write-path `gh` calls run under the author identity (`nathanjohnpayne`) through token-verifying helpers. Stage B/C/E live writes use `scripts/gh-as-author.sh` per command, so the machine-global gh account selection is not read or changed for attribution.
 
-**Failure recovery.** Hard failures on `gh repo create` are fatal (stage returns non-zero, state file omits the entry). Secret-provision failures are warned-but-not-fatal: workflows will fail loudly on the first PR if the token isn't set, surfacing the gap.
+**Failure recovery.** Hard failures on `gh repo create` are fatal (stage returns non-zero, state file omits the entry). Secret-provision failures are recorded-but-not-fatal by default: workflows will fail loudly on the first PR if the token isn't set, and the miss is persisted to `<target>/.bootstrap-state.warnings` and re-surfaced in the end-of-run summary's `!! RECORDED FAILURES` block so it can't ship unnoticed (#734). Set `BOOTSTRAP_STRICT_SECRETS=1` to upgrade the miss to a fatal stage failure instead — the failure is still recorded to the warnings sidecar before the stage aborts.
 
 ### Stage D: firebase-and-codereview (#206 / sub-D)
 
@@ -149,7 +149,7 @@ Implementation: `scripts/bootstrap/board-and-summary.sh`.
    - `REPO` / `PROJECT` / `LOCAL DIR` header.
    - `DONE` — stages found in the state file at summary time.
    - `SKIPPED` — stages NOT in the state file (or whose sub-steps were explicitly skipped, e.g., Firebase under `--skip-firebase`).
-   - `WARNINGS` — things the wizard couldn't automate (e.g., `.env.local` from Firebase web console; collaborator invite acceptance).
+   - `WARNINGS` — things the wizard couldn't automate (e.g., `.env.local` from Firebase web console; collaborator invite acceptance), plus a `!! RECORDED FAILURES` sub-block when `<target>/.bootstrap-state.warnings` is non-empty (e.g., a missed `REVIEWER_ASSIGNMENT_TOKEN` provisioning — #734), so a recorded miss can't ship unnoticed.
    - `CROSS-REPO LOOP UPDATE` — pointer to the Mergepath PR opened in stage B (or a manual-action note if anchors were absent).
    - `NEXT STEPS (human-action)` — the explicit checklist of things the operator owns: accept invites, **enroll the repo as a `.mergepath-sync.yml` consumer** (so it receives ongoing propagation, not just the one-time rsync — mergepath#741), write the canonical PRD in `nathanjohnpayne/docs/projects/<repo>/prds/`, fill the repo-local implementation spec, populate issues, set spend caps, drive Sprint 0.
 
@@ -189,7 +189,7 @@ Per stage, the most common failures and their recovery paths:
 
 - **`gh repo create` fails**: usually a name collision or auth scope issue. Stage fails, state file omits the entry. Re-run with `--resume template-mirror` after fixing.
 - **Label / invite failures**: per-label / per-invite are warn-not- fatal; the loop continues. The summary surfaces the gaps.
-- **Secret-set failures**: warn-not-fatal. Workflows will fail loudly on the first PR; set the secret manually then.
+- **Secret-set failures**: recorded-but-not-fatal by default. The miss is logged at ERROR level with the remediation command, persisted to `<target>/.bootstrap-state.warnings`, and re-surfaced in the end-of-run summary's `!! RECORDED FAILURES` block so it cannot ship unnoticed (#734). Set `BOOTSTRAP_STRICT_SECRETS=1` to fail the stage instead.
 
 ### Stage D (firebase-and-codereview)
 
@@ -238,7 +238,8 @@ Most operators don't need these. Documented for the test fixtures and edge-case 
 | `BOOTSTRAP_AUTHOR_IDENTITY` | Override the target identity for author-token verification. Default: `nathanjohnpayne`. |
 | `BOOTSTRAP_AUTHOR_NAME` / `BOOTSTRAP_AUTHOR_EMAIL` | Override the git identity for the initial commit. |
 | `BOOTSTRAP_REVIEWER_PAT_VALUE` | Inline `REVIEWER_ASSIGNMENT_TOKEN` value (tests). |
-| `BOOTSTRAP_REVIEWER_PAT_OP_REF` | Override the 1Password reference for the reviewer PAT. |
+| `BOOTSTRAP_REVIEWER_PAT_OP_REF` | Override the 1Password reference for the reviewer PAT. Default is the item-UUID path `op://Private/pvbq24vl2h6gl7yjclxy2hbote/token`; use UUID paths only (#734). |
+| `BOOTSTRAP_STRICT_SECRETS=1` | Fail stage C when `REVIEWER_ASSIGNMENT_TOKEN` cannot be provisioned (default: record the miss and continue). |
 | `BOOTSTRAP_INPUT_*` | Pre-set any input via env (bypasses both flag and prompt). |
 
 ## Files produced
