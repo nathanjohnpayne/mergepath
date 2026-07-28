@@ -17,11 +17,16 @@
 #      findable for yq's delete (#233).
 #   4. Apply name substitutions across the documented name-bearing
 #      files (via scripts/bootstrap/substitute.sh).
-#   5. Scaffold neutral consumer identity docs (#744): write honest
-#      "downstream consumer" stubs for the excluded BRAND.md +
-#      docs/agents/repository-overview.md, and scrub the AGENTS.md
+#   5. Scaffold neutral consumer identity docs (#744/#747): write
+#      honest "downstream consumer" stubs for the excluded BRAND.md +
+#      docs/agents/repository-overview.md, scrub the AGENTS.md
 #      "Repository Layout" section that documents the mergepath-only
-#      packaging/ dir. Runs after substitution (dispatched as "Step 5b").
+#      packaging/ dir, scrub the README.md hub identity (the
+#      "Reference implementation" tagline + the Key-Files/Directory
+#      rows for consumer-excluded surfaces, #747), and reframe the
+#      REVIEW_POLICY.md propagation/wave-audit passages as hub-side
+#      machinery (#747). Runs after substitution (dispatched as
+#      "Step 5b").
 #   6. Reset opt-in policy defaults the hub flipped for itself
 #      (phase_4b_automation.enabled → false, #628).
 #   7. Initialize the new repo's git history with a single
@@ -138,6 +143,12 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   # Playground spec + test (mergepath-only sandbox)
   'specs/mergepath_playground.md'
   'plans/mergepath-playground.md'
+
+  # Bootstrap consumer-identity spec (#747): describes hub-only bootstrap
+  # machinery and maps to the hub-only tests/test_bootstrap_template_mirror.sh
+  # in spec_test_map - shipping it without the test reds a consumer's
+  # check_spec_test_alignment.
+  'specs/bootstrap_consumer_identity.md'
 
   # Mergepath-internal policy simulation tool
   'scripts/policy-sim.sh'
@@ -276,12 +287,14 @@ bootstrap::stage_template_mirror() {
     return "$step_rc"
   fi
 
-  # Step 5b: scaffold neutral consumer identity docs (#744). The rsync
-  # excluded BRAND.md + docs/agents/repository-overview.md (pure
-  # mergepath identity) and the four hub-only docs; this writes honest
-  # consumer stubs for the former and scrubs the AGENTS.md packaging
-  # note (packaging/ is a mergepath-only dir, also excluded). Runs AFTER
-  # substitution so the AGENTS.md scrub sees the substituted text.
+  # Step 5b: scaffold neutral consumer identity docs (#744/#747). The
+  # rsync excluded BRAND.md + docs/agents/repository-overview.md (pure
+  # mergepath identity) and the three hub-only docs; this writes honest
+  # consumer stubs for the former, scrubs the AGENTS.md packaging
+  # note (packaging/ is a mergepath-only dir, also excluded), scrubs
+  # the README.md hub identity + dead Key-Files rows (#747), and
+  # reframes REVIEW_POLICY.md's wave-audit passage as hub-side (#747).
+  # Runs AFTER substitution so the scrubs see the substituted text.
   bootstrap::_scaffold_consumer_identity "$target" || step_rc=$?
   if [ "$step_rc" -ne 0 ]; then
     bootstrap::err "template-mirror: consumer-identity scaffold failed (rc=$step_rc); aborting stage"
@@ -382,18 +395,42 @@ bootstrap::_reset_phase_4b_enabled() {
     bootstrap::err "phase-4b reset: phase_4b_automation block present but its enabled key was not found/reset in $policy (reshaped upstream?); failing closed rather than mirroring an opted-in policy"
     return 1
   fi
-  mv "$policy.bootstrap-tmp" "$policy"
+  if ! mv "$policy.bootstrap-tmp" "$policy"; then
+    rm -f "$policy.bootstrap-tmp"
+    bootstrap::err "phase-4b reset: failed to move the scrubbed copy over $policy; failing closed"
+    return 1
+  fi
 }
 
 # Scaffold neutral consumer identity docs and scrub mergepath-only
-# identity from shared docs (#744). The rsync excluded BRAND.md +
+# identity from shared docs (#744/#747). The rsync excluded BRAND.md +
 # docs/agents/repository-overview.md (pure mergepath identity) and the
-# four hub-only docs; this writes honest consumer stubs for the two
+# three hub-only docs; this writes honest consumer stubs for the two
 # excluded identity docs and removes the AGENTS.md "Repository Layout"
 # section that documents the mergepath-only `packaging/` dir. The mixed
 # doc .ai_context.md keeps its shared content — its one false line is
 # fixed at the mergepath source, so it flows through substitution
 # honestly and needs no consumer-side edit here.
+#
+# #747 extends the same pass to the two remaining mixed docs:
+#   * README.md IS name-substituted, but the substituted copy still
+#     carries the hub tagline ("Reference implementation of the AI
+#     Agent Tooling Standard"), the BRAND umbrella-vocabulary framing
+#     (Playground/Cockpit/Tiebreaker/Checks), and Key-Files/Directory
+#     rows for surfaces excluded from every consumer (the playground,
+#     scripts/policy-sim.sh, the sync manifest). Those are rewritten or
+#     dropped in place; the genuinely-shared content (agent reading
+#     order, review-policy pointer, Firebase auth, directory table)
+#     flows through untouched. Fails closed if a hub marker survives.
+#   * REVIEW_POLICY.md is copied verbatim (not name-substituted). Its
+#     § Phase 3.5 wave-audit paragraph describes hub-only machinery
+#     (scripts/wave-audit.sh, the watermark tags) and hard-links
+#     docs/agents/propagation-ordering.md — excluded from consumers.
+#     The paragraph is replaced by a short hub-side pointer, and a
+#     consumer note after the Phase 3.5 heading frames the remaining
+#     hub-script references (sync-to-downstream.sh, the manifest) as
+#     living on mergepath, per the #746 "true after substitution"
+#     lesson. Marker-gated and fail-closed, like the AGENTS.md scrub.
 bootstrap::_scaffold_consumer_identity() {
   local target=$1
   local repo_name Repo_Name
@@ -402,7 +439,7 @@ bootstrap::_scaffold_consumer_identity() {
   local hub_url="https://github.com/nathanjohnpayne/mergepath"
 
   if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
-    bootstrap::log "dry-run: would scaffold neutral BRAND.md + docs/agents/repository-overview.md and scrub the AGENTS.md 'Repository Layout' (packaging/) section in $target"
+    bootstrap::log "dry-run: would scaffold neutral BRAND.md + docs/agents/repository-overview.md, scrub the AGENTS.md 'Repository Layout' (packaging/) section, scrub the README.md hub identity + dead Key-Files rows, and reframe the REVIEW_POLICY.md wave-audit passage as hub-side in $target"
     return 0
   fi
 
@@ -456,8 +493,172 @@ EOF
       bootstrap::err "consumer-identity scaffold: AGENTS.md packaging note survived the Repository-Layout scrub (section reshaped upstream?); failing closed"
       return 1
     fi
-    mv "$agents.bootstrap-tmp" "$agents"
+    if ! mv "$agents.bootstrap-tmp" "$agents"; then
+      rm -f "$agents.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: failed to move the scrubbed copy over $agents; failing closed"
+      return 1
+    fi
     bootstrap::log "scrubbed the mergepath-only Repository Layout (packaging/) section from AGENTS.md"
+  fi
+
+  # Scrub the README.md hub identity (#747). README.md IS
+  # name-substituted (so this runs post-substitution and every pattern
+  # below is substitution-safe: none contains a `mergepath` token), but
+  # the substituted copy still asserts the hub's identity. Rewrite the
+  # false claims and drop the Key-Files/Directory rows that point at
+  # consumer-excluded surfaces; everything else flows through. The
+  # transform is a per-line no-op when a marker is absent, and the
+  # forbidden-marker check below fails closed if a hub claim survives
+  # in a form the transform no longer matches (README reshaped
+  # upstream) — better to halt than mint a false consumer README.
+  local readme="$target/README.md"
+  if [ -f "$readme" ]; then
+    if ! awk -v hub_url="$hub_url" '
+      # Tagline: the reference-implementation claim is false for a
+      # consumer; replace with honest downstream framing.
+      /Reference implementation of the AI Agent Tooling Standard/ {
+        print "**A downstream consumer of the [mergepath](" hub_url ") AI-agent tooling template.**"
+        next
+      }
+      # Intro paragraph: the consumer BRAND.md is a neutral stub, not
+      # the hub surface vocabulary. Keep the leading sentence(s) and
+      # rewrite the "See BRAND.md ..." tail; if the tail moved, the
+      # marker survives and the forbidden check fails closed.
+      /umbrella vocabulary \(Playground, Cockpit, Tiebreaker, Checks\)/ {
+        sub(/ See \[`BRAND\.md`\]\(BRAND\.md\).*$/, " See [`BRAND.md`](BRAND.md) for this repo\047s brand vocabulary (a bootstrap stub until replaced).")
+        print
+        next
+      }
+      # Key-Files row for BRAND.md: point at the stub, not the hub
+      # umbrella vocabulary.
+      /umbrella vocabulary \(surfaces, reserved names, naming history\)/ {
+        print "| `BRAND.md` | Project brand vocabulary (bootstrap stub — replace with this repo\047s own) |"
+        next
+      }
+      # Key-Files / Directory-Structure rows for consumer-excluded hub
+      # surfaces: the playground, policy-sim.sh, the sync manifest, and
+      # the reserved-surfaces directory. Dead rows in a consumer.
+      /playground\/index\.html/ { next }
+      /scripts\/policy-sim\.sh/ { next }
+      /Propagation manifest for synced/ { next }
+      /Playground and reserved slots/ { next }
+      { print }
+    ' "$readme" > "$readme.bootstrap-tmp"; then
+      rm -f "$readme.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: failed to scrub the README.md hub identity in $readme"
+      return 1
+    fi
+    local readme_marker
+    for readme_marker in \
+      'Reference implementation of the AI Agent Tooling Standard' \
+      'playground/index.html' \
+      'policy-sim.sh' \
+      'Mergepath Playground' \
+      'Playground and reserved slots' \
+      'umbrella vocabulary' \
+      'Propagation manifest'; do
+      if grep -qF "$readme_marker" "$readme.bootstrap-tmp"; then
+        rm -f "$readme.bootstrap-tmp"
+        bootstrap::err "consumer-identity scaffold: README.md hub marker '$readme_marker' survived the scrub (README reshaped upstream?); failing closed"
+        return 1
+      fi
+    done
+    if ! mv "$readme.bootstrap-tmp" "$readme"; then
+      rm -f "$readme.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: failed to move the scrubbed copy over $readme; failing closed"
+      return 1
+    fi
+    bootstrap::log "scrubbed the mergepath hub identity + dead Key-Files rows from README.md"
+  fi
+
+  # Reframe REVIEW_POLICY.md's propagation/wave passages as hub-side
+  # machinery (#747). REVIEW_POLICY.md is copied verbatim (NOT
+  # name-substituted), so its mergepath references stay true — but the
+  # § Phase 3.5 wave-audit paragraph describes machinery only the hub
+  # runs (scripts/wave-audit.sh, the watermark tags) and hard-links
+  # docs/agents/propagation-ordering.md, which is excluded from every
+  # consumer (#744). Replace that paragraph with a hub-side pointer and
+  # insert a consumer note after the Phase 3.5 heading framing the
+  # remaining hub-script references (sync-to-downstream.sh, the
+  # manifest) as living on mergepath — while distinguishing
+  # scripts/audit-propagation-lane.sh, which IS synced into every
+  # consumer (its check_propagation_lane_audit wrapper hard-requires
+  # it); only its live fleet-audit mode is hub-side. Marker-gated: only
+  # act when the wave-audit paragraph is present, so a legitimately
+  # reshaped policy is left untouched; inside the gate, fail closed if
+  # either edit missed (heading or paragraph reshaped without the
+  # marker moving). The replacement consumes the whole paragraph
+  # through its terminating blank line OR the next heading line,
+  # whichever comes first — a heading immediately following the
+  # paragraph with no blank-line separator is still valid Markdown,
+  # and consuming only up to the blank line would swallow it too. A
+  # hard-wrapped upstream variant cannot leak continuation lines past
+  # the marker check either way (which only sees the marker's own
+  # line), and the post-transform Phase 4 heading assertion below
+  # fails closed if the heading itself ever got swallowed.
+  local policy_doc="$target/REVIEW_POLICY.md"
+  local wave_marker='**Wave audit (#662).**'
+  local phase4_marker='### Phase 4: External Review'
+  if [ -f "$policy_doc" ] && grep -qF "$wave_marker" "$policy_doc"; then
+    # Recorded pre-transform so the post-transform assertion below only
+    # fires when the heading was actually there to lose — it's the
+    # concrete regression check for the paragraph-consumer swallowing a
+    # heading that follows with no blank-line separator.
+    local had_phase4_heading=0
+    if grep -qF "$phase4_marker" "$policy_doc"; then
+      had_phase4_heading=1
+    fi
+    if ! awk -v hub_url="$hub_url" '
+      in_wave_para {
+        # Consume the wave-audit paragraph through its terminating
+        # blank line. The repo enforces soft-wrap (one physical line
+        # per paragraph), so this is normally a single next; it exists
+        # so a hard-wrapped variant cannot leak continuation lines.
+        if ($0 ~ /^[[:space:]]*$/) { in_wave_para = 0; print; next }
+        # A heading immediately following the paragraph (no blank
+        # line before it) also terminates consumption — print it and
+        # stop, rather than swallowing it as a "continuation line".
+        if ($0 ~ /^#/) { in_wave_para = 0; print; next }
+        next
+      }
+      /^### Phase 3\.5: Propagation PR review lane[[:space:]]*$/ {
+        print
+        print ""
+        print "> **Consumer note (hub-side machinery):** the propagation tooling this section references — `scripts/sync-to-downstream.sh`, the `.mergepath-sync.yml` manifest, `scripts/wave-audit.sh`, and `docs/agents/propagation-ordering.md` — lives in the [mergepath hub repo](" hub_url "), not in this repository. (`scripts/audit-propagation-lane.sh` is different: this repo carries a synced copy for its CI checks, while the live fleet-audit mode runs from the hub.) This repo is on the receiving end: once enrolled as a sync consumer — enrollment in the hub\047s manifest is a separate post-bootstrap step — the hub opens propagation PRs here, and the lane recognition below runs in this repo\047s synced `pr-review-policy.yml`."
+        next
+      }
+      /^\*\*Wave audit \(#662\)\.\*\*/ {
+        print "**Wave audit (hub-side).** The wave-level fresh-eyes audit is mergepath hub machinery: `scripts/wave-audit.sh` runs from the mergepath repo against the wave canary, not in this consumer — once this repository is enrolled as a sync consumer it receives the resulting fan-out mirror PRs, which merge on consumer CI plus the lane\047s byte-verification. The full procedure lives in mergepath\047s `docs/agents/propagation-ordering.md` § Wave audit."
+        in_wave_para = 1
+        next
+      }
+      { print }
+    ' "$policy_doc" > "$policy_doc.bootstrap-tmp"; then
+      rm -f "$policy_doc.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: failed to reframe the REVIEW_POLICY.md wave-audit passage in $policy_doc"
+      return 1
+    fi
+    if grep -qF "$wave_marker" "$policy_doc.bootstrap-tmp"; then
+      rm -f "$policy_doc.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: REVIEW_POLICY.md wave-audit paragraph survived the reframe (paragraph reshaped upstream?); failing closed"
+      return 1
+    fi
+    if ! grep -qF 'Consumer note (hub-side machinery)' "$policy_doc.bootstrap-tmp"; then
+      rm -f "$policy_doc.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: REVIEW_POLICY.md Phase 3.5 heading not found for the consumer note (section reshaped upstream?); failing closed"
+      return 1
+    fi
+    if [ "$had_phase4_heading" -eq 1 ] && ! grep -qF "$phase4_marker" "$policy_doc.bootstrap-tmp"; then
+      rm -f "$policy_doc.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: REVIEW_POLICY.md '$phase4_marker' heading vanished after the wave-audit reframe (swallowed by the paragraph consumer, or section reshaped upstream?); failing closed"
+      return 1
+    fi
+    if ! mv "$policy_doc.bootstrap-tmp" "$policy_doc"; then
+      rm -f "$policy_doc.bootstrap-tmp"
+      bootstrap::err "consumer-identity scaffold: failed to move the reframed copy over $policy_doc; failing closed"
+      return 1
+    fi
+    bootstrap::log "reframed the REVIEW_POLICY.md wave-audit passage as hub-side machinery"
   fi
 }
 
@@ -537,6 +738,11 @@ bootstrap::_yq_clean_repo_template() {
   # by removing any entry whose value list contains the playground
   # test path).
   yq -i 'del(.spec_test_map.mergepath_playground)' "$f"
+  # Drop the bootstrap consumer-identity spec_test_map entry (#747):
+  # the spec AND its mapped hub-only test are both mirror-excluded, so
+  # a surviving map entry is stale hub metadata in the consumer (and
+  # this key is not name-bearing, so it survives substitution as-is).
+  yq -i 'del(.spec_test_map.bootstrap_consumer_identity)' "$f"
   # Drop extra_top_level_dirs entirely — the new repo has no
   # mergepath/ or packaging/ dirs.
   yq -i 'del(.extra_top_level_dirs)' "$f"

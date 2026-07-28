@@ -100,6 +100,7 @@ CONSUMER_ABSENT=(
   "specs/mergepath_playground.md"
   "plans/mergepath-playground.md"
   "tests/test_mergepath_playground.sh"
+  "specs/bootstrap_consumer_identity.md"
   "bugs/screenshots"
   ".github/screenshots"
   # (b) hub-only per check_propagation_closure ALLOW_LIST — absent from

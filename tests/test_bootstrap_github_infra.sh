@@ -566,6 +566,68 @@ fi
   && pass "strict-secrets gh-secret-set failure recorded in .bootstrap-state.warnings sidecar" \
   || fail "warnings sidecar missing the strict-mode secret-set failure: $(cat "$TARGET9/.bootstrap-state.warnings" 2>/dev/null)"
 
+# --- assertion 15b: successful retry resolves the prior token warning ---
+# A strict failure records a must-not-miss REVIEWER_ASSIGNMENT_TOKEN
+# warning before returning. When the operator fixes credentials and the
+# retry successfully sets the secret, that token-specific recorded
+# failure must disappear before the final summary prints.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET9B="$WORKDIR/new-repo-strict-secretset-retry"
+rm -rf "$TARGET9B"
+mkdir -p "$TARGET9B"
+set +e
+retry_out=$(PATH="$SHIM_PATH" SHIM_LOG="$SHIM_LOG" bash -c '
+  ROOT="'"$ROOT"'"
+  TARGET="'"$TARGET9B"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/github-infra.sh"
+  BOOTSTRAP_STATE_FILE="$TARGET/.bootstrap-state"
+  BOOTSTRAP_LOG_FILE=""
+  BOOTSTRAP_DRY_RUN=0
+  BOOTSTRAP_SKIP_AUTHOR_TOKEN=1
+  BOOTSTRAP_REVIEWER_PAT_VALUE="fixed-fake-pat"
+  bootstrap::record_warning "$BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY" "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on nathanjohnpayne/retry-repo (no PAT available, prompts skipped) — set it manually before the first PR"
+  bootstrap::_provision_reviewer_assignment_token "nathanjohnpayne/retry-repo" "claude"
+  echo "RC=$?"
+' 2>&1)
+retry_ec=$?
+set -e
+echo "$retry_out" | grep -q "RC=0" \
+  && [ "$retry_ec" -eq 0 ] \
+  && pass "successful retry sets REVIEWER_ASSIGNMENT_TOKEN after a recorded failure" \
+  || fail "token retry helper failed; rc=$retry_ec; out: $retry_out"
+grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/retry-repo$" "$SHIM_LOG" \
+  && pass "successful retry invoked gh secret set" \
+  || fail "successful retry did not invoke gh secret set; log: $(cat "$SHIM_LOG")"
+if [ -f "$TARGET9B/.bootstrap-state.warnings" ] \
+     && grep -q "REVIEWER_ASSIGNMENT_TOKEN" "$TARGET9B/.bootstrap-state.warnings"; then
+  fail "successful retry left stale REVIEWER_ASSIGNMENT_TOKEN warning: $(cat "$TARGET9B/.bootstrap-state.warnings")"
+else
+  pass "successful retry clears the recorded REVIEWER_ASSIGNMENT_TOKEN warning"
+fi
+echo "template-mirror" >"$TARGET9B/.bootstrap-state"
+echo "github-infra" >>"$TARGET9B/.bootstrap-state"
+set +e
+summary_out=$(bash -c '
+  ROOT="'"$ROOT"'"
+  TARGET="'"$TARGET9B"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/board-and-summary.sh"
+  BOOTSTRAP_STATE_FILE="$TARGET/.bootstrap-state"
+  BOOTSTRAP_LOG_FILE=""
+  BOOTSTRAP_INPUT_FIREBASE=none
+  bootstrap::_print_summary "nathanjohnpayne/retry-repo" "$TARGET" "private" "" "project=skip"
+' 2>&1)
+summary_ec=$?
+set -e
+[ "$summary_ec" -eq 0 ] \
+  && pass "summary renders after token warning is cleared" \
+  || fail "summary render failed after token warning clear; rc=$summary_ec; out: $summary_out"
+echo "$summary_out" | grep -q "RECORDED FAILURES" \
+  && fail "summary printed stale recorded failures after successful token retry: $summary_out" \
+  || pass "summary omits cleared token warning after successful retry"
+
 # --- assertion 16: dry-run PAT miss is pure (#755 round 2) ---
 # A dry run carries no credentials, so a PAT miss there is EXPECTED:
 # it must print [DRY-RUN] plan lines, write NO .bootstrap-state.warnings

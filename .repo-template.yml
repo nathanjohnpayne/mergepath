@@ -12,6 +12,8 @@
 spec_test_map:
   mergepath_playground:
     - tests/test_mergepath_playground.sh
+  bootstrap_consumer_identity:
+    - tests/test_bootstrap_template_mirror.sh
 
 # Glob patterns that identify test files. Supplements the default
 # ("tests/**/*.test.*") which doesn't cover shell-based tests.

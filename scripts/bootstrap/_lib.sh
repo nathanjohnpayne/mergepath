@@ -14,9 +14,12 @@
 #                                      bootstrap::author_gh for gh side-effects.
 #   bootstrap::record_stage <name>     Append a completed stage name to the
 #                                      state file at $BOOTSTRAP_STATE_FILE.
-#   bootstrap::record_warning <msg>    Warn now AND persist the message to
+#   bootstrap::record_warning [key] <msg>
+#                                      Warn now AND persist the message to
 #                                      "${BOOTSTRAP_STATE_FILE}.warnings" for
 #                                      the end-of-run summary's warnings block.
+#   bootstrap::clear_warning <key>      Resolve keyed recorded warnings after a
+#                                      later retry fixes the underlying issue.
 #   bootstrap::last_completed_stage    Echo the last recorded stage name,
 #                                      or empty if no state file.
 #
@@ -195,11 +198,47 @@ bootstrap::record_stage() {
 # warn-only console lines scrolled past unnoticed and broken secret
 # provisioning shipped silently).
 bootstrap::record_warning() {
-  local msg=$1
+  local key="" msg
+  if [ "$#" -eq 2 ]; then
+    key=$1
+    msg=$2
+  else
+    msg=$1
+  fi
   bootstrap::warn "$msg"
   if [ -n "${BOOTSTRAP_STATE_FILE:-}" ]; then
     mkdir -p "$(dirname "$BOOTSTRAP_STATE_FILE")"
-    printf '%s\n' "$msg" >>"${BOOTSTRAP_STATE_FILE}.warnings"
+    if [ -n "$key" ]; then
+      bootstrap::clear_warning "$key"
+      printf '@%s\t%s\n' "$key" "$msg" >>"${BOOTSTRAP_STATE_FILE}.warnings"
+    else
+      printf '%s\n' "$msg" >>"${BOOTSTRAP_STATE_FILE}.warnings"
+    fi
+  fi
+}
+
+bootstrap::clear_warning() {
+  local key=$1
+  if [ -z "${BOOTSTRAP_STATE_FILE:-}" ] || [ ! -f "${BOOTSTRAP_STATE_FILE}.warnings" ]; then
+    return 0
+  fi
+
+  local warnings_file="${BOOTSTRAP_STATE_FILE}.warnings"
+  local tmp prefix
+  tmp=$(mktemp "${TMPDIR:-/tmp}/bootstrap-warnings.XXXXXX")
+  prefix="@${key}	"
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$prefix"*) ;;
+      *) printf '%s\n' "$line" >>"$tmp" ;;
+    esac
+  done <"$warnings_file"
+
+  if [ -s "$tmp" ]; then
+    mv "$tmp" "$warnings_file"
+  else
+    rm -f "$tmp" "$warnings_file"
   fi
 }
 
