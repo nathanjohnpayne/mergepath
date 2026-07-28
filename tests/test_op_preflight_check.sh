@@ -23,6 +23,12 @@ SCRIPT="$ROOT/scripts/op-preflight.sh"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/op-preflight-check-test.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 
+# The script's compiled-in DEFAULT_TTL_SECONDS (#765: 4h -> 10h). Fixtures
+# that must read as fresh or stale with NO OP_PREFLIGHT_TTL_SECONDS in the
+# environment are anchored on this value, so a future default bump moves
+# them together instead of silently flipping test_check_stale_cache.
+SCRIPT_DEFAULT_TTL_SECONDS=36000
+
 PASS=0
 FAIL=0
 pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
@@ -71,17 +77,22 @@ esac
 EOF
 chmod +x "$STUB_DIR/gh"
 
-# Helper: synthesize a fresh cache file.
-make_fresh_cache() {
-  local dir="$1" agent="$2" reviewer_pat="$3" author_pat="$4"
+# Helper: synthesize a cache file whose embedded CREATED_AT epoch is
+# <age_seconds> in the past. Freshness is compared against that epoch and
+# the TTL the SCRIPT resolves (OP_PREFLIGHT_TTL_SECONDS in the environment,
+# else its own default) — the OP_PREFLIGHT_TTL_SECONDS line written into
+# the file is inert for that comparison, so fixtures elsewhere in this file
+# that still carry a 14400 line are unaffected by the #765 default bump.
+make_aged_cache() {
+  local dir="$1" agent="$2" age_seconds="$3" reviewer_pat="$4" author_pat="$5"
   mkdir -p "$dir"
   chmod 700 "$dir"
   local epoch
-  epoch=$(date +%s)
+  epoch=$(( $(date +%s) - age_seconds ))
   cat > "$dir/op-preflight-$agent.env" <<EOF
 # synthetic test cache
 OP_PREFLIGHT_CREATED_AT_EPOCH=$epoch
-OP_PREFLIGHT_TTL_SECONDS=14400
+OP_PREFLIGHT_TTL_SECONDS=$SCRIPT_DEFAULT_TTL_SECONDS
 OP_PREFLIGHT_AGENT=$agent
 OP_PREFLIGHT_MODE=review
 OP_PREFLIGHT_DONE=1
@@ -91,24 +102,19 @@ EOF
   chmod 600 "$dir/op-preflight-$agent.env"
 }
 
-# Helper: synthesize a STALE cache file (CREATED_AT older than TTL).
+# Helper: synthesize a fresh cache file.
+make_fresh_cache() {
+  local dir="$1" agent="$2" reviewer_pat="$3" author_pat="$4"
+  make_aged_cache "$dir" "$agent" 0 "$reviewer_pat" "$author_pat"
+}
+
+# Helper: synthesize a STALE cache file — one hour older than the script's
+# default TTL, so it reads as stale without an OP_PREFLIGHT_TTL_SECONDS
+# override.
 make_stale_cache() {
   local dir="$1" agent="$2"
-  mkdir -p "$dir"
-  chmod 700 "$dir"
-  # 5h ago, TTL is 4h
-  local epoch
-  epoch=$(( $(date +%s) - 18000 ))
-  cat > "$dir/op-preflight-$agent.env" <<EOF
-OP_PREFLIGHT_CREATED_AT_EPOCH=$epoch
-OP_PREFLIGHT_TTL_SECONDS=14400
-OP_PREFLIGHT_AGENT=$agent
-OP_PREFLIGHT_MODE=review
-OP_PREFLIGHT_DONE=1
-OP_PREFLIGHT_REVIEWER_PAT=stale-rev
-OP_PREFLIGHT_AUTHOR_PAT=stale-auth
-EOF
-  chmod 600 "$dir/op-preflight-$agent.env"
+  make_aged_cache "$dir" "$agent" \
+    $(( SCRIPT_DEFAULT_TTL_SECONDS + 3600 )) stale-rev stale-auth
 }
 
 # ---------------------------------------------------------------------------
@@ -287,6 +293,85 @@ test_default_mode_is_review() {
     return
   fi
   pass "test_default_mode_is_review: default --mode is review (no ADC)"
+}
+
+# ---------------------------------------------------------------------------
+# Test 8 (#765): the compiled-in default TTL is 10h. A cache created 5h ago
+# — stale under the previous 4h default — is a HIT with no
+# OP_PREFLIGHT_TTL_SECONDS in the environment, and the cache-hit line
+# reports the 36000s window.
+# ---------------------------------------------------------------------------
+test_default_ttl_is_ten_hours() {
+  local case_dir="$WORKDIR/case8"
+  make_aged_cache "$case_dir" claude 18000 "rev-pat-8" "author-pat-8"
+
+  local out err rc=0
+  out=$(PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$case_dir" \
+    "$SCRIPT" --agent claude --check 2>"$WORKDIR/case8.err") || rc=$?
+  err=$(cat "$WORKDIR/case8.err")
+
+  if [ "$rc" -ne 0 ]; then
+    fail "test_default_ttl_is_ten_hours: 5h-old cache should be fresh under the 10h default; rc=$rc stderr=$err"
+    return
+  fi
+  if ! echo "$out" | grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-8"; then
+    fail "test_default_ttl_is_ten_hours: stdout missing reviewer PAT export; got $out"
+    return
+  fi
+  if ! echo "$err" | grep -q "TTL 36000s"; then
+    fail "test_default_ttl_is_ten_hours: stderr should report the 36000s default TTL; got $err"
+    return
+  fi
+  pass "test_default_ttl_is_ten_hours: default TTL is 36000s (10h)"
+}
+
+# ---------------------------------------------------------------------------
+# Test 9 (#765): OP_PREFLIGHT_TTL_SECONDS still overrides the default in
+# BOTH directions — shortening it expires an otherwise-fresh cache, and
+# lengthening it revives a cache older than the default.
+# ---------------------------------------------------------------------------
+test_ttl_override_both_directions() {
+  # Shorten: a 5h-old cache is fresh by default, stale under a 60s TTL.
+  local short_dir="$WORKDIR/case9-short"
+  make_aged_cache "$short_dir" claude 18000 "rev-pat-9a" "author-pat-9a"
+
+  local err rc=0
+  PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$short_dir" \
+    OP_PREFLIGHT_TTL_SECONDS=60 \
+    "$SCRIPT" --agent claude --check >"$WORKDIR/case9a.out" 2>"$WORKDIR/case9a.err" || rc=$?
+  err=$(cat "$WORKDIR/case9a.err")
+  if [ "$rc" -eq 0 ]; then
+    fail "test_ttl_override_both_directions: OP_PREFLIGHT_TTL_SECONDS=60 should expire a 5h-old cache, got rc=0"
+    return
+  fi
+  if ! echo "$err" | grep -q "cache missing or stale"; then
+    fail "test_ttl_override_both_directions: shortened TTL missing remediation; got $err"
+    return
+  fi
+
+  # Lengthen: an 11h-old cache is stale by default, fresh under a 24h TTL.
+  local long_dir="$WORKDIR/case9-long"
+  make_aged_cache "$long_dir" claude 39600 "rev-pat-9b" "author-pat-9b"
+
+  local out
+  rc=0
+  out=$(PATH="$STUB_DIR:$PATH" OP_PREFLIGHT_CACHE_DIR="$long_dir" \
+    OP_PREFLIGHT_TTL_SECONDS=86400 \
+    "$SCRIPT" --agent claude --check 2>"$WORKDIR/case9b.err") || rc=$?
+  err=$(cat "$WORKDIR/case9b.err")
+  if [ "$rc" -ne 0 ]; then
+    fail "test_ttl_override_both_directions: OP_PREFLIGHT_TTL_SECONDS=86400 should revive an 11h-old cache; rc=$rc stderr=$err"
+    return
+  fi
+  if ! echo "$out" | grep -q "OP_PREFLIGHT_REVIEWER_PAT=rev-pat-9b"; then
+    fail "test_ttl_override_both_directions: lengthened TTL missing reviewer PAT export; got $out"
+    return
+  fi
+  if ! echo "$err" | grep -q "TTL 86400s"; then
+    fail "test_ttl_override_both_directions: stderr should report the overridden TTL; got $err"
+    return
+  fi
+  pass "test_ttl_override_both_directions: OP_PREFLIGHT_TTL_SECONDS shortens and lengthens the window"
 }
 
 # ---------------------------------------------------------------------------
@@ -1265,6 +1350,8 @@ test_check_mutex
 test_status_alias
 test_quiet_mode
 test_default_mode_is_review
+test_default_ttl_is_ten_hours
+test_ttl_override_both_directions
 test_check_deploy_no_python3_probe
 test_check_deploy_firebase_sa_no_python3_probe
 test_check_deploy_firebase_sa_project_mismatch_fails_closed
