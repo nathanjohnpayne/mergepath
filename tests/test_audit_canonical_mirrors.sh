@@ -58,6 +58,12 @@
 #      outside MERGEPATH_ROOT is rejected as [invalid-source]: lexical
 #      normalization cannot see it, so the physical containment check
 #      has to.
+#  16. A symlink whose target is ALSO inside MERGEPATH_ROOT is rejected
+#      as [invalid-source] as well. The containment check refuses every
+#      symlink final component, escaping or not, because lexical
+#      normalization cannot follow a link and therefore cannot prove
+#      the target is safe. Test 15 alone passes under either reading;
+#      this fixture pins the intended one (#762 r2 P3).
 
 set -euo pipefail
 
@@ -108,6 +114,15 @@ printf 'absolute-path target\n' > "$ABSOLUTE_TARGET"
 # normalization sees a clean `docs/agents/...` path; only the physical
 # containment check catches the escape.
 ln -s "$OUTSIDE" "$MP/docs/agents/symlinked-outside.md"
+
+# Symlink inside the checkout whose target is ALSO inside it. The
+# containment check rejects ANY symlink final component, escaping or not
+# (`[ -L "$abs" ]`), so this must be [invalid-source] too. Without this
+# fixture the escaping symlink alone cannot distinguish "rejects symlinks
+# unconditionally" from "rejects symlinks that escape" — test 15 passes
+# under both readings (#762 r2 P3).
+printf 'canonical content that lives INSIDE the checkout\n' > "$MP/docs/agents/inside-target.md"
+ln -s "inside-target.md" "$MP/docs/agents/symlinked-inside.md"
 
 # ── Fixture vendor file ───────────────────────────────────────────────
 VENDOR="$WORKDIR/CLAUDE.md"
@@ -199,6 +214,10 @@ Real section after the true closer, no annotation.
 ## Symlinked Source Mirror
 
 > Canonical source: \`mergepath/docs/agents/symlinked-outside.md\`
+
+## Symlinked Inside Source Mirror
+
+> Canonical source: \`mergepath/docs/agents/symlinked-inside.md\`
 EOF
 
 cp "$VENDOR" "$WORKDIR/CLAUDE.md.orig"
@@ -370,8 +389,19 @@ else
   fail "symlink escaping MERGEPATH_ROOT not rejected; output: $OUT"
 fi
 
-# summary line counts match the fixture (14 real sections)
-if grep -q '14 section(s) scanned — ok: 1, ok-unpinned: 4, missing-annotation: 4, source-missing: 1, invalid-source: 3, drift: 1' <<<"$OUT"; then
+# 16 (#762 r2 P3). a symlink whose target is INSIDE the checkout is rejected
+# too — the containment check refuses every symlink final component, because
+# lexical normalization cannot follow a link and so cannot PROVE the target is
+# safe. Pins the intended semantics, which test 15 alone cannot distinguish
+# from "reject only escaping symlinks".
+if grep -q '\[invalid-source\] *## Symlinked Inside Source Mirror' <<<"$OUT"; then
+  pass "symlink pointing INSIDE MERGEPATH_ROOT also classified invalid-source (unconditional)"
+else
+  fail "inside-pointing symlink not rejected — containment check is not unconditional; output: $OUT"
+fi
+
+# summary line counts match the fixture (15 real sections)
+if grep -q '15 section(s) scanned — ok: 1, ok-unpinned: 4, missing-annotation: 4, source-missing: 1, invalid-source: 4, drift: 1' <<<"$OUT"; then
   pass "summary counters match fixture"
 else
   fail "summary counters wrong; output: $OUT"

@@ -108,9 +108,11 @@ Worktrees created for a task must be removed immediately after the corresponding
 **After a merge or branch delete**, run `scripts/worktree-cleanup.sh` (dry-run) to audit stale worktrees and `scripts/worktree-cleanup.sh --apply` to remove safe candidates. It is mergepath's implementation of the PR-state-aware cleanup tooling the placement convention anticipates: it parses the `pr-<number>` slug prefix from hidden-folder checkouts (`~/GitHub/.mergepath-worktrees/pr-<n>[-desc]`) to cross-check PR state, so correctly-slugged stale checkouts for closed/merged PRs become auto-removable. The helper identifies four classes of stale state:
 
 - worktrees whose branch upstream is `[gone]` (the branch was deleted upstream);
-- detached `mergepath-pr-*` worktrees whose corresponding PR is closed/merged (cross-checked via `gh pr view`);
+- PR-slug worktrees — legacy `mergepath-pr-<n>` or hidden-folder `.mergepath-worktrees/pr-<n>[-desc]` — whose corresponding PR is closed/merged (cross-checked via `gh pr view`). The cross-check covers BOTH detached and branch-ATTACHED checkouts: the documented `git worktree add <path> <branch>` form produces a branch-attached worktree, and its upstream frequently outlives the PR, so a detached-only check missed exactly the shape the convention tells you to create (#762);
 - local branches whose upstream is `[gone]` and whose PR is verified merged (cross-checked via `gh pr list --head <branch> --state merged`);
 - orphaned directories under `.claude/worktrees/` that have no matching entry in `git worktree list --porcelain`.
+
+A branch-attached PR-slug worktree is removed only when `git status --porcelain --ignored` is EMPTY. Removing a worktree never deletes its branch ref, so committed work is safe regardless; an empty status is what proves nothing else is lost. Ignored paths are included deliberately — plain `git status --porcelain` hides `.env`, `*.key` and `node_modules/`, and `git worktree remove` deletes them with or without `--force`. Anything else (uncommitted edits, untracked files, ignored content, or an unreadable status) is listed for a human and kept, and keeps the dry-run at exit 2 until the human resolves it.
 
 ```bash
 scripts/worktree-cleanup.sh                       # dry-run audit (default)

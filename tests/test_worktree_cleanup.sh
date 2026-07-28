@@ -57,6 +57,28 @@
 #      is the required positive evidence for removal.
 #  16. #762: a branch-attached pr-<n> worktree whose PR is OPEN is
 #      reported as still-active and never removed.
+#  17. #762 r2 P2: the same shape whose ONLY content is GITIGNORED
+#      (`.env` + `node_modules/`) is likewise kept. Plain `git status
+#      --porcelain` reports nothing for it, so the pre-fix cleanliness
+#      gate called it clean and `--apply` deleted the secrets — and
+#      that happens with AND without `--force`, so git's own dirty
+#      check is no backstop. The gate must read
+#      `--porcelain --ignored`.
+#  18. #762 r2 P3: the same shape whose registered DIRECTORY no longer
+#      exists is a PRUNABLE administrative entry, not lost work. It
+#      must NOT be reported as "dirty ... commit, stash, or discard it
+#      by hand" (there is nothing there to commit), and `--apply`'s
+#      trailing `git worktree prune` must clear it.
+#  19. #762 r2 P3: a LOCKED, clean, closed-PR branch-attached worktree
+#      is listed as locked and SKIPPED by a bare `--apply`, then
+#      removed by `--apply --force-locked`. (The pre-existing
+#      --force-locked fixture is a gone-upstream DETACHED-arm case and
+#      never reaches this code.)
+#  20. #762 r2 P3: a branch-attached pr-<n> worktree whose PR state is
+#      UNVERIFIABLE is never removed, and DOES count toward the dry-run
+#      exit 2 — the deliberate difference from the SUMMARY_LOOKUP_UNKNOWN
+#      carve-out, which only exists because that sweep evaluates every
+#      gone-upstream branch.
 #
 # `gh` is stubbed via a PATH shim that returns CLOSED for our test PR
 # number and "unknown" for anything else, so the test does not touch
@@ -101,7 +123,11 @@ git config commit.gpgsign false
 git config tag.gpgsign false
 git remote add origin "$REMOTE"
 echo "hello" > README.md
-git add README.md
+# A committed .gitignore so case 17 can exercise the IGNORED-content class.
+# It has to land in the INITIAL commit so every branch/worktree the fixture
+# creates below inherits it.
+printf '.env\nnode_modules/\n' > .gitignore
+git add README.md .gitignore
 git commit -q -m "initial"
 git push -q -u origin main
 
@@ -206,6 +232,63 @@ git branch "$OPEN_PR_BRANCH"
 git push -q -u origin "$OPEN_PR_BRANCH"
 OPEN_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${OPEN_PR_NUM}-still-open"
 git worktree add -q "$OPEN_PR_WT" "$OPEN_PR_BRANCH"
+
+# ── Case 17 (#762 r2 P2): same shape, GITIGNORED-ONLY content ─────────
+# `git status --porcelain` reports NOTHING here — `.env` and node_modules/
+# are both matched by the committed .gitignore — so the pre-fix gate saw a
+# "clean" worktree and `--apply` deleted the lot. Verified out-of-band that
+# `git worktree remove` destroys ignored content with AND without --force,
+# so the helper's own check is the only defense.
+IGNORED_PR_NUM=44444
+IGNORED_PR_BRANCH="pr-branch-ignored"
+git branch "$IGNORED_PR_BRANCH"
+git push -q -u origin "$IGNORED_PR_BRANCH"
+IGNORED_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${IGNORED_PR_NUM}-ignored"
+git worktree add -q "$IGNORED_PR_WT" "$IGNORED_PR_BRANCH"
+IGNORED_CANARY="$IGNORED_PR_WT/.env"
+echo "SECRET=hunter2" > "$IGNORED_CANARY"
+mkdir -p "$IGNORED_PR_WT/node_modules/pkg"
+echo "module.exports = {}" > "$IGNORED_PR_WT/node_modules/pkg/index.js"
+# Sanity-check the premise: plain --porcelain must be silent here, otherwise
+# the fixture proves nothing.
+if [ -n "$(git -C "$IGNORED_PR_WT" status --porcelain)" ]; then
+  fail "fixture setup: expected plain --porcelain to be EMPTY for the ignored-only worktree"
+fi
+
+# ── Case 18 (#762 r2 P3): same shape, registered dir DELETED ──────────
+# `git worktree list --porcelain` still carries the entry (with a `prunable`
+# line the record parser ignores), and the branch/HEAD fields make it look
+# like an ordinary branch-attached worktree. There is nothing to preserve,
+# so it must be reported as prunable — never as dirty-with-work-to-save.
+PRUNE_PR_NUM=33333
+PRUNE_PR_BRANCH="pr-branch-prunable"
+git branch "$PRUNE_PR_BRANCH"
+git push -q -u origin "$PRUNE_PR_BRANCH"
+PRUNE_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${PRUNE_PR_NUM}-prunable"
+git worktree add -q "$PRUNE_PR_WT" "$PRUNE_PR_BRANCH"
+rm -rf "$PRUNE_PR_WT"
+
+# ── Case 19 (#762 r2 P3): LOCKED, clean, closed-PR branch worktree ────
+# The destructive branch-attached path under --force-locked. The existing
+# LOCKED_WT fixture is a gone-upstream case and never reaches this code.
+LOCKED_PR_NUM=22222
+LOCKED_PR_BRANCH="pr-branch-locked"
+git branch "$LOCKED_PR_BRANCH"
+git push -q -u origin "$LOCKED_PR_BRANCH"
+LOCKED_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${LOCKED_PR_NUM}-locked"
+git worktree add -q "$LOCKED_PR_WT" "$LOCKED_PR_BRANCH"
+git worktree lock --reason "branch-attached lock" "$LOCKED_PR_WT"
+
+# ── Case 20 (#762 r2 P3): branch-attached pr-<n>, PR state UNKNOWN ────
+# The stub does not know this PR number, so `gh pr view` fails and the
+# helper cannot verify the state. Must be kept AND counted toward the
+# dry-run exit 2 (see the exit-code rationale in the helper).
+UNKNOWN_PR_NUM=11111
+UNKNOWN_PR_BRANCH="pr-branch-unknown-state"
+git branch "$UNKNOWN_PR_BRANCH"
+git push -q -u origin "$UNKNOWN_PR_BRANCH"
+UNKNOWN_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${UNKNOWN_PR_NUM}-unknown"
+git worktree add -q "$UNKNOWN_PR_WT" "$UNKNOWN_PR_BRANCH"
 
 # ── Case 4: locked worktree (use a gone-upstream branch so it ALSO
 #    falls into a removal-eligible bucket; the helper must skip it
@@ -331,6 +414,20 @@ if [ "\$1" = "pr" ] && [ "\$2" = "view" ]; then
     echo "OPEN"
     exit 0
   fi
+  if [ "\$num" = "$IGNORED_PR_NUM" ]; then
+    echo "MERGED"
+    exit 0
+  fi
+  if [ "\$num" = "$PRUNE_PR_NUM" ]; then
+    echo "MERGED"
+    exit 0
+  fi
+  if [ "\$num" = "$LOCKED_PR_NUM" ]; then
+    echo "CLOSED"
+    exit 0
+  fi
+  # $UNKNOWN_PR_NUM is deliberately absent: the call falls through to the
+  # trailing \`exit 1\`, so gh_pr_state yields "unknown" (case 20).
 fi
 if [ "\$1" = "pr" ] && [ "\$2" = "list" ]; then
   head=""
@@ -470,7 +567,7 @@ DIRTY_PR_LABEL=$(echo "$OUT" | awk -v p="$DIRTY_PR_WT" '
   /^  \[/            { label = $0 }
   $1 == "path:" && $2 == p { print label; exit }
 ')
-if echo "$DIRTY_PR_LABEL" | grep -q "working tree is dirty — review manually, keeping"; then
+if echo "$DIRTY_PR_LABEL" | grep -q "working tree is not clean — review manually, keeping"; then
   pass "dirty closed-PR branch worktree surfaced under a review-manually record"
 else
   fail "dirty closed-PR branch worktree not surfaced for review (label='$DIRTY_PR_LABEL')"
@@ -482,10 +579,16 @@ if echo "$DIRTY_PR_LABEL" | grep -q "STALE PR"; then
 else
   pass "dirty closed-PR branch worktree is NOT a removal candidate"
 fi
-if echo "$OUT" | grep -qE "dirty PR worktrees \(review\): +[1-9]"; then
-  pass "summary shows ≥1 dirty PR worktree awaiting review"
+if echo "$OUT" | grep -qE "unclean PR worktrees \(review\): +[1-9]"; then
+  pass "summary shows ≥1 unclean PR worktree awaiting review"
 else
-  fail "summary dirty-PR-worktree count missing/zero"
+  fail "summary unclean-PR-worktree count missing/zero"
+  show_out_on_fail
+fi
+if echo "$OUT" | grep -q "uncommitted or untracked content"; then
+  pass "dirty worktree carries the uncommitted/untracked remediation line"
+else
+  fail "dirty worktree missing its uncommitted/untracked remediation line"
   show_out_on_fail
 fi
 
@@ -498,6 +601,97 @@ if echo "$OPEN_PR_LABEL" | grep -q "OPEN PR #${OPEN_PR_NUM} — keeping"; then
   pass "branch-attached worktree for an OPEN PR reported still-active"
 else
   fail "branch-attached OPEN-PR worktree mislabeled (label='$OPEN_PR_LABEL')"
+  show_out_on_fail
+fi
+
+# Case 17 (#762 r2 P2): the GITIGNORED-ONLY worktree is retained, NOT
+# classified as a removal candidate. This is the assertion the pre-fix
+# `git status --porcelain` gate fails: it reports nothing for `.env` /
+# node_modules/, so the worktree was labeled STALE and removed.
+IGNORED_PR_LABEL=$(echo "$OUT" | awk -v p="$IGNORED_PR_WT" '
+  /^  \[/            { label = $0 }
+  $1 == "path:" && $2 == p { print label; exit }
+')
+if echo "$IGNORED_PR_LABEL" | grep -q "working tree is not clean — review manually, keeping"; then
+  pass "gitignored-only closed-PR branch worktree surfaced under a review-manually record"
+else
+  fail "gitignored-only worktree not surfaced for review (label='$IGNORED_PR_LABEL')"
+  show_out_on_fail
+fi
+if echo "$IGNORED_PR_LABEL" | grep -q "STALE PR"; then
+  fail "gitignored-only worktree wrongly flagged as a removal candidate"
+  show_out_on_fail
+else
+  pass "gitignored-only worktree is NOT a removal candidate"
+fi
+# The remediation must be TRUE for ignored content: you cannot commit or
+# stash a gitignored file, so the dirty-path wording would be wrong advice.
+if echo "$OUT" | grep -q "gitignored content only"; then
+  pass "gitignored-only worktree carries an ignored-specific remediation line"
+else
+  fail "gitignored-only worktree missing its ignored-specific remediation line"
+  show_out_on_fail
+fi
+
+# Case 18 (#762 r2 P3): the missing-directory worktree is PRUNABLE, not
+# dirty. Assert BOTH the label and the absence of the false remediation.
+PRUNE_PR_LABEL=$(echo "$OUT" | awk -v p="$PRUNE_PR_WT" '
+  /^  \[/            { label = $0 }
+  $1 == "path:" && $2 == p { print label; exit }
+')
+if echo "$PRUNE_PR_LABEL" | grep -q "worktree directory is MISSING — prunable"; then
+  pass "missing-directory branch worktree classified prunable"
+else
+  fail "missing-directory branch worktree mislabeled (label='$PRUNE_PR_LABEL')"
+  show_out_on_fail
+fi
+if echo "$PRUNE_PR_LABEL" | grep -q "not clean"; then
+  fail "missing-directory worktree wrongly reported as unclean (nothing exists to commit/stash)"
+  show_out_on_fail
+else
+  pass "missing-directory worktree does NOT claim there is work to preserve"
+fi
+if echo "$OUT" | grep -qE "prunable PR worktrees: +[1-9]"; then
+  pass "summary shows ≥1 prunable PR worktree"
+else
+  fail "summary prunable-PR-worktree count missing/zero"
+  show_out_on_fail
+fi
+
+# Case 19 (#762 r2 P3): the LOCKED clean closed-PR branch worktree is
+# listed as locked (destructive branch-attached path, previously untested).
+LOCKED_PR_LABEL=$(echo "$OUT" | awk -v p="$LOCKED_PR_WT" '
+  /^  \[/            { label = $0 }
+  $1 == "path:" && $2 == p { print label; exit }
+')
+if echo "$LOCKED_PR_LABEL" | grep -q "LOCKED PR #${LOCKED_PR_NUM} (CLOSED) branch worktree"; then
+  pass "locked clean closed-PR branch worktree listed under the LOCKED record"
+else
+  fail "locked closed-PR branch worktree mislabeled (label='$LOCKED_PR_LABEL')"
+  show_out_on_fail
+fi
+
+# Case 20 (#762 r2 P3): the PR-state-UNKNOWN branch worktree is surfaced
+# and — per the helper's documented rationale — counted toward the
+# actionable total, unlike the gone-branch lookup-unknown carve-out.
+UNKNOWN_PR_LABEL=$(echo "$OUT" | awk -v p="$UNKNOWN_PR_WT" '
+  /^  \[/            { label = $0 }
+  $1 == "path:" && $2 == p { print label; exit }
+')
+if echo "$UNKNOWN_PR_LABEL" | grep -q "PR #${UNKNOWN_PR_NUM} state unknown — branch worktree"; then
+  pass "PR-state-unknown branch worktree surfaced under its own record"
+else
+  fail "PR-state-unknown branch worktree mislabeled (label='$UNKNOWN_PR_LABEL')"
+  show_out_on_fail
+fi
+# Pin the counting rule itself: two PR-slug-branch entries (the MERGED
+# case-14 worktree and this unknown one) must both land in the bucket that
+# feeds the dry-run exit 2. A refactor that moves unknowns out of the
+# bucket drops this to 1 and fails here.
+if echo "$OUT" | grep -qE "PR-slug branch stale: +2$"; then
+  pass "PR-state-unknown branch worktree IS counted in the exit-2 bucket (count is 2)"
+else
+  fail "PR-slug-branch bucket does not hold both the MERGED and the unknown entry"
   show_out_on_fail
 fi
 
@@ -735,6 +929,55 @@ else
   echo "$OUT2" >&2
 fi
 
+# Case 17 (#762 r2 P2): the GITIGNORED-ONLY worktree and its secrets both
+# survive --apply. This is the data-loss regression: pre-fix, `--apply`
+# deleted $IGNORED_PR_WT outright and $IGNORED_CANARY with it.
+if [ -d "$IGNORED_PR_WT" ]; then
+  pass "gitignored-only closed-PR branch worktree retained by --apply"
+else
+  fail "gitignored-only closed-PR branch worktree was removed by --apply"
+  echo "$OUT2" >&2
+fi
+if [ -f "$IGNORED_CANARY" ] && grep -q "hunter2" "$IGNORED_CANARY"; then
+  pass "gitignored .env canary survived --apply"
+else
+  fail "DATA LOSS: --apply deleted gitignored content in $IGNORED_PR_WT"
+  echo "$OUT2" >&2
+fi
+if [ -f "$IGNORED_PR_WT/node_modules/pkg/index.js" ]; then
+  pass "gitignored node_modules/ survived --apply"
+else
+  fail "DATA LOSS: --apply deleted node_modules/ in $IGNORED_PR_WT"
+  echo "$OUT2" >&2
+fi
+
+# Case 18 (#762 r2 P3): --apply's trailing `git worktree prune` clears the
+# stale administrative entry, so the missing-directory worktree is gone from
+# the follow-up dry-run. This is what makes the prunable bucket self-clearing
+# (unlike the unclean bucket, which waits on a human).
+if echo "$OUT3" | grep -q -- "$PRUNE_PR_WT"; then
+  fail "prunable branch worktree entry still registered after --apply"
+  echo "$OUT3" >&2
+else
+  pass "prunable branch worktree entry cleared by --apply's git worktree prune"
+fi
+
+# Case 19 (#762 r2 P3): a bare --apply must SKIP the locked branch worktree.
+if [ -d "$LOCKED_PR_WT" ]; then
+  pass "locked closed-PR branch worktree retained by bare --apply"
+else
+  fail "locked closed-PR branch worktree removed without --force-locked"
+  echo "$OUT2" >&2
+fi
+
+# Case 20 (#762 r2 P3): the PR-state-unknown branch worktree is never removed.
+if [ -d "$UNKNOWN_PR_WT" ]; then
+  pass "PR-state-unknown branch worktree retained by --apply"
+else
+  fail "PR-state-unknown branch worktree was removed despite an unverifiable PR state"
+  echo "$OUT2" >&2
+fi
+
 if echo "$OUT3" | grep -q -- "$LOCKED_WT"; then
   pass "locked worktree retained after --apply (no --force-locked)"
 else
@@ -844,6 +1087,22 @@ else
   echo "$OUT4" >&2
 fi
 
+# Case 19 (#762 r2 P3): --force-locked reaches the branch-attached locked
+# path (try_remove "$WT_PATH" "1") and removes it — while the branch ref it
+# was attached to survives, same contract as the unlocked case.
+if [ -d "$LOCKED_PR_WT" ]; then
+  fail "locked closed-PR branch worktree survived --apply --force-locked"
+  echo "$OUT4" >&2
+else
+  pass "locked closed-PR branch worktree removed by --apply --force-locked"
+fi
+if git rev-parse --verify -q "refs/heads/$LOCKED_PR_BRANCH" >/dev/null; then
+  pass "branch ref survived the forced locked branch-worktree removal"
+else
+  fail "branch ref $LOCKED_PR_BRANCH was destroyed by the forced removal"
+  echo "$OUT4" >&2
+fi
+
 # Final dry-run: the diverged merged branch is still present (kept for manual
 # review — --apply never touches it), and a review-needed branch counts as
 # actionable, so the audit stays exit 2 until a human resolves it (Codex P2:
@@ -860,10 +1119,14 @@ else
   echo "$OUT5" >&2
 fi
 
-# Hand-resolve the diverged branch and the dirty PR worktree (the human
-# decisions the audit is asking for), then the audit is genuinely clean.
+# Hand-resolve everything the audit asked a HUMAN to decide — the diverged
+# branch, the two retained-not-clean worktrees, and the unverifiable-PR one —
+# then the audit is genuinely clean. Each of these is deliberately untouched
+# by --apply, which is why the exit 2 persists until this point.
 git branch -D "$DIVERGED_BRANCH" >/dev/null 2>&1 || true
 git worktree remove --force "$DIRTY_PR_WT" >/dev/null 2>&1 || true
+git worktree remove --force "$IGNORED_PR_WT" >/dev/null 2>&1 || true
+git worktree remove --force "$UNKNOWN_PR_WT" >/dev/null 2>&1 || true
 set +e
 OUT6=$(PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --dry-run 2>&1)
 RC6=$?

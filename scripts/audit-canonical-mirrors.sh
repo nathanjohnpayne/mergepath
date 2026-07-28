@@ -20,14 +20,24 @@
 #                       genuinely machine-local (fine; annotation-free
 #                       by design) or it was authored downstream-first
 #                       and needs a canonical home in mergepath.
-#   invalid-source      annotated path is absolute, or normalizes /
-#                       resolves to a location OUTSIDE MERGEPATH_ROOT
-#                       (e.g. `mergepath/../outside/file.md`, or a
-#                       symlink whose target leaves the checkout). The
-#                       path is rejected BEFORE it is stat'd or hashed,
-#                       so a file outside the canonical checkout can
-#                       never be reported as a matching canonical
-#                       source.
+#   invalid-source      annotated path is absolute, normalizes to a
+#                       location OUTSIDE MERGEPATH_ROOT (e.g.
+#                       `mergepath/../outside/file.md`), or is a
+#                       SYMLINK. The symlink rejection is
+#                       unconditional — including a symlink whose
+#                       target is itself inside the checkout — because
+#                       lexical normalization cannot follow a link, so
+#                       "points somewhere safe" is not something this
+#                       script can prove; it refuses instead. The path
+#                       is rejected BEFORE it is HASHED, so a file
+#                       outside the canonical checkout can never be
+#                       reported as a matching canonical source. (Only
+#                       the lexical proof runs before the path is
+#                       stat'd; the physical/symlink proof runs after
+#                       the existence check, so a DANGLING escaping
+#                       symlink reports as source-missing rather than
+#                       invalid-source. Both refuse to hash, which is
+#                       the property that matters.)
 #   source-missing      annotated path does not exist in the local
 #                       mergepath checkout (moved/renamed/typo).
 #   drift               annotation carries a canonical-sha256 pin and
