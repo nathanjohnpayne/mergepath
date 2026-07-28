@@ -80,7 +80,7 @@ Repos that receive the shared pull-request template already carry this heading a
 <original title> (pivoted from <one-phrase description of the abandoned approach>)
 ```
 
-For example: `fix(769): single shared resolution of the governing review policy (pivoted from revert-and-defer)`. On a squash merge the PR title becomes the commit subject, so the marker survives into `git log` — which is where a reader tracing a file's history will look.
+For example: `fix(769): single shared resolution of the governing review policy (pivoted from revert-and-defer)`. On a squash merge the PR title becomes the commit subject, so the marker survives into `git log` — which is where a reader tracing a file's history will look. Where your repo's operating rules otherwise require a title to describe the end state and not narrate the session's pivots, this marker is the defined exception to that rule, and the only one: the rest of the title still describes the end state, and the pivot is recorded in a fixed, greppable form rather than narrated in prose.
 
 **3. A comment on the driving issue,** so the pivot is discoverable from the issue rather than only from the PR. Use the same shape as the issue-level decision callout below — a hidden idempotency marker, then a dated heading:
 

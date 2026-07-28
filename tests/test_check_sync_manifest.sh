@@ -1082,8 +1082,9 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   # downstream wherever it appears, including inside a fenced example,
   # so the hub-only scan reads the raw file.
   #
-  # Fence tracking follows CommonMark, matching the parser in
-  # scripts/audit-canonical-mirrors.sh. A naive unconditional toggle is
+  # Fence tracking follows CommonMark, the same delimiter rules the
+  # fence-aware section scan in scripts/audit-canonical-mirrors.sh
+  # applies. A naive unconditional toggle is
   # not merely imprecise here, it is a BYPASS: a four-backtick fence
   # wrapping a literal ``` line (the standard way to show a fence inside
   # a fence, which a doc that prescribes markdown formats will reach
@@ -1099,6 +1100,17 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   #     LONG as the opening run, so ``` cannot close ````;
   #   * a closing fence carries no info string, so a literal ```bash
   #     shown inside an open block is content, not the closer.
+  #
+  # Inline code spans are stripped by the SAME delimiter-run rule: a
+  # span opens on a run of N backticks and closes on a run of exactly
+  # N. A naive gsub(/`[^`]*`/) instead matches the two OPENING
+  # backticks of a ``#NN`` span as an empty single-backtick span,
+  # deletes them, and leaves the bare #NN exposed to BARE_ISSUE_RE — a
+  # FALSE POSITIVE that fails a required check on a doc whose #NN is
+  # code, not an issue reference. That form is reachable, not
+  # theoretical: a doc reaches for a multi-backtick span exactly when
+  # the span's content itself holds a backtick, which a doc prescribing
+  # markdown formats does.
   #
   # Every branch prints exactly one line per input line, preserving the
   # `grep -n` line numbering the diagnostics depend on.
@@ -1131,9 +1143,44 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         }
         if (fence) { print ""; next }
 
-        gsub(/`[^`]*`/, "", line)
+        line = strip_code_spans(line)
         gsub(/\]\(#[^)]*\)/, "]()", line)
         print line
+      }
+
+      # Remove inline code spans, matching opening and closing backtick
+      # runs by LENGTH (CommonMark). An opening run with no closing run
+      # of equal length is not a span at all — it stays as literal
+      # text, which is what CommonMark renders.
+      function strip_code_spans(s,   out, i, n, c, run, j, r2, found) {
+        out = ""
+        i = 1
+        n = length(s)
+        while (i <= n) {
+          c = substr(s, i, 1)
+          if (c != "`") { out = out c; i++; continue }
+          run = 0
+          while (i + run <= n && substr(s, i + run, 1) == "`") run++
+          j = i + run
+          found = 0
+          while (j <= n) {
+            if (substr(s, j, 1) == "`") {
+              r2 = 0
+              while (j + r2 <= n && substr(s, j + r2, 1) == "`") r2++
+              if (r2 == run) { found = 1; break }
+              j += r2
+            } else {
+              j++
+            }
+          }
+          if (found) {
+            i = j + run
+          } else {
+            out = out substr(s, i, run)
+            i += run
+          }
+        }
+        return out
       }
     ' "$1"
   }
@@ -1254,8 +1301,45 @@ FENCE_EOF
     pass "Case 39: fence tracking honors delimiter char, run length, info string, and the 3-space indent limit"
   fi
 
+  # Case 40: inline code spans strip by delimiter RUN LENGTH.
+  #
+  # Cases 38-39 only ever use single-backtick spans, so they pass under
+  # the naive gsub too and prove nothing about multi-backtick spans.
+  # Under that gsub the ``#222`` line leaked a bare #222 into prose —
+  # a FALSE POSITIVE failing a required check on a doc whose #NN is
+  # code — and the ``a`b #333`` line was mangled into `a` + trailing
+  # backtick rather than removed whole. The last line pins the other
+  # direction: an unmatched run is literal per CommonMark, so the #555
+  # beside it is real prose and MUST still be flagged.
+  SPAN_DOC="$WORKDIR/consumer-truth-spans.md"
+  cat > "$SPAN_DOC" <<'SPAN_EOF'
+# Doc
+
+A single-backtick span `#111` is code.
+
+A double-backtick span ``#222`` is code.
+
+A double-backtick span holding a backtick ``a`b #333`` is code.
+
+A triple-backtick inline span ```#444``` is code.
+
+An unmatched ``run stays literal, so this bare #555 is a real ref.
+SPAN_EOF
+  set +e
+  span_hits=$(md_prose_only "$SPAN_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  span_lines=$(md_prose_only "$SPAN_DOC" | wc -l | tr -d ' ')
+  span_raw=$(wc -l < "$SPAN_DOC" | tr -d ' ')
+  set -e
+  if [ "$span_hits" != "11," ]; then
+    fail "Case 40: expected only line 11 flagged (multi-backtick spans are code), got '$span_hits'"
+  elif [ "$span_lines" != "$span_raw" ]; then
+    fail "Case 40: md_prose_only must emit one line per input line, got $span_lines for $span_raw"
+  else
+    pass "Case 40: inline code spans strip by delimiter run length (``#NN`` is code, unmatched run is prose)"
+  fi
+
 else
-  echo "SKIP: Cases 36-39 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-40 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
