@@ -64,6 +64,12 @@
 #      normalization cannot follow a link and therefore cannot prove
 #      the target is safe. Test 15 alone passes under either reading;
 #      this fixture pins the intended one (#762 r2 P3).
+#  17. `--help` emits the COMPLETE header comment block. usage() used a
+#      hardcoded `sed -n '2,73p'` range that the header outgrew, so the
+#      output stopped mid-sentence and dropped MERGEPATH_ROOT plus the
+#      entire exit-code section. The assertion derives the expected last
+#      line from the script source rather than hardcoding one, so any
+#      future short range fails here too (#762 r3 P2).
 
 set -euo pipefail
 
@@ -435,6 +441,49 @@ if [ "$RC" -eq 0 ] && grep -q 'absent — skipped' <<<"$OUT2" \
   pass "absent default-list file skipped; remaining files still audited; exit 0"
 else
   fail "env-override default list handling wrong (rc=$RC); output: $OUT2"
+fi
+
+# ── 17. `--help` emits the COMPLETE header block (#762 r3 P2) ─────────
+# usage() used to be `sed -n '2,73p'`. The header outgrew the hardcoded end
+# line, so --help stopped mid-sentence at "whitespace-separated file list
+# that" and silently dropped the MERGEPATH_ROOT entry and the ENTIRE "Exit
+# codes" section — the part a caller wiring this into a script most needs.
+set +e
+HELP="$("$SCRIPT" --help)"
+RC=$?
+set -e
+if [ "$RC" -eq 0 ]; then
+  pass "--help exits 0"
+else
+  fail "--help exited $RC, expected 0"
+fi
+if grep -q '^Exit codes:' <<<"$HELP" && grep -q '^  MERGEPATH_ROOT ' <<<"$HELP"; then
+  pass "--help includes the MERGEPATH_ROOT entry and the Exit codes section"
+else
+  fail "--help truncated; tail was: $(tail -3 <<<"$HELP")"
+fi
+
+# The anti-rot assertion: --help must run to the LAST line of the header
+# comment block, whatever that line happens to be. Derived independently from
+# the script source, so a range that stops short — for any reason, including a
+# future hardcoded one — fails here rather than shipping a truncated --help.
+HEADER_LAST="$(awk '
+  NR == 1 { next }
+  /^#/    { line = $0; sub(/^# ?/, "", line); last = line; next }
+            { exit }
+  END     { print last }
+' "$SCRIPT")"
+if [ "$(tail -1 <<<"$HELP")" = "$HEADER_LAST" ]; then
+  pass "--help runs to the last header-comment line (no truncation)"
+else
+  fail "--help ends at '$(tail -1 <<<"$HELP")', expected '$HEADER_LAST'"
+fi
+
+# ...and must not run PAST it into executable code.
+if grep -q 'set -euo pipefail' <<<"$HELP"; then
+  fail "--help leaked script body past the header comment block"
+else
+  pass "--help stops at the header block (no script body leaked)"
 fi
 
 echo

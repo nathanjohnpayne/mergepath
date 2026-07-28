@@ -84,8 +84,22 @@
 
 set -euo pipefail
 
+# Print the file's own header comment block as the usage text.
+#
+# The bound is DYNAMIC — everything from line 2 up to the first line that is
+# not a `#` comment — rather than a hardcoded end line. The previous form was
+# `sed -n '2,73p'`, and the header outgrew it: `--help` stopped mid-sentence
+# at "whitespace-separated file list that", silently dropping MERGEPATH_ROOT
+# and the entire "Exit codes" section. A literal line number cannot survive
+# edits above it, so it is not used at all here (#762 r3 P2). Line 1 is the
+# shebang and is skipped; `# ` (or a bare `#`) is stripped from each line, the
+# same normalization the old second `sed` did.
 usage() {
-  sed -n '2,73p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  awk '
+    NR == 1 { next }
+    /^#/    { sub(/^# ?/, ""); print; next }
+              { exit }
+  ' "${BASH_SOURCE[0]}"
 }
 
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
