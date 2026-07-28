@@ -197,7 +197,56 @@ fi
 
 # --- config readers ---------------------------------------------------------
 
-CONFIG=".github/review-policy.yml"
+# The policy that governs a PR is the policy of the branch it TARGETS, not
+# this trusted default-branch checkout (#769). Callers that have already
+# resolved it (merge-clearance-gate.sh) pass it in via
+# MERGEPATH_REVIEW_POLICY_PATH to avoid a second API round-trip; callers that
+# have not (the auto-clear workflow, direct invocations) get it resolved below
+# by the same shared helper, so every consumer of this predicate reads ONE
+# policy. Same env-override idiom as scripts/wave-audit.sh.
+CONFIG="${MERGEPATH_REVIEW_POLICY_PATH:-.github/review-policy.yml}"
+if [ -z "${MERGEPATH_REVIEW_POLICY_PATH:-}" ]; then
+  __RESOLVE_POLICY_BIN="$__CODEX_CHECK_DIR/workflow/resolve_base_policy.sh"
+  if [ ! -f "$__RESOLVE_POLICY_BIN" ]; then
+    # FAIL CLOSED, not warn-and-continue (Codex P1 on #768). Without the
+    # resolver this script cannot prove the PR targets the default branch, so
+    # continuing would silently check a non-default-base PR against the
+    # default-branch policy — the downgrade this whole change removes.
+    #
+    # Safe to be strict: the resolver travels in the SAME scripts/workflow/ kit
+    # entry as this script, so they arrive together in one sync PR. A checkout
+    # holding this version of codex-review-check.sh without the resolver is a
+    # broken install, not a mid-sync state.
+    echo "ERROR: policy resolver missing ($__RESOLVE_POLICY_BIN); cannot determine the governing review policy" >&2
+    exit 3
+  fi
+  if [ -f "$__RESOLVE_POLICY_BIN" ]; then
+    # Capture stdout and stderr SEPARATELY: the resolver prints the policy
+    # PATH on stdout and warnings on stderr, so merging them (2>&1) would
+    # concatenate a warning into the path. Same failure class as #715/#716.
+    __resolve_err=$(mktemp "${TMPDIR:-/tmp}/resolve-policy-err.XXXXXX")
+    set +e
+    __resolved=$(bash "$__RESOLVE_POLICY_BIN" --repo "$REPO" --pr "$PR_NUMBER" \
+      --default-config "$CONFIG" 2>"$__resolve_err")
+    __resolve_rc=$?
+    set -e
+    __resolved_msg=$(cat "$__resolve_err" 2>/dev/null || true)
+    rm -f "$__resolve_err"
+    if [ "$__resolve_rc" -ne 0 ]; then
+      # Unknown governing policy — fail closed (exit 3 is this script's
+      # config/infrastructure code; callers already fail closed on nonzero).
+      echo "ERROR: could not resolve the governing review policy: $__resolved_msg" >&2
+      exit 3
+    fi
+    CONFIG="$__resolved"
+    if [ "$CONFIG" != ".github/review-policy.yml" ]; then
+      # Capture the temp path in its own variable so cleanup cannot be
+      # affected by any later reassignment of CONFIG.
+      __POLICY_TMP="$CONFIG"
+      trap 'rm -f "$__POLICY_TMP"' EXIT
+    fi
+  fi
+fi
 
 # Read a scalar field from the codex: block. See agent-review.yml
 # post-#54 for the rationale on the state-machine awk parser.

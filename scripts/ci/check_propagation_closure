@@ -283,6 +283,9 @@ ALLOW_LIST=(
   #     policy semantics, which a consumer's repo_lint.yml does not wire;
   #     the wrapper SKIPs there. If a consumer ever needs this coverage,
   #     move them onto the manifest rather than widening this entry.
+  #     test_resolve_base_policy.sh joins them for the same reason: the
+  #     resolver itself DOES travel (scripts/workflow/ kit), but its suite
+  #     stubs `gh` and asserts mergepath's own policy semantics.
   "tests/test_eslint_policy_check.sh"
   "tests/test_check_mktemp_portability.sh"
   "tests/test_session_finalization_check.sh"
@@ -293,6 +296,7 @@ ALLOW_LIST=(
   "tests/test_project_doc_sync.sh"
   "tests/test_external_review_gh_stderr.sh"
   "tests/test_external_review_rename_protection.sh"
+  "tests/test_resolve_base_policy.sh"
 
   # The #623 Codex-latency audit script — hub-only operator tooling for
   # this pass (a consumer-repo sweep is a possible follow-up, at which
