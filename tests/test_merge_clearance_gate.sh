@@ -111,6 +111,15 @@ if [ "$1" = "api" ]; then
       cat "${FIXTURE_PROTECTION:-/dev/null}"
       exit 0
       ;;
+    repos/*/rulesets/*)
+      # #772 r2 P1: bypass-actor lookup for a candidate ruleset.
+      if [ "${FIXTURE_RULESET_OBJ_FAIL:-0}" = "1" ]; then
+        echo "STUB gh: simulated ruleset object read failure" >&2
+        exit 1
+      fi
+      cat "${FIXTURE_RULESET_OBJ:-/dev/null}"
+      exit 0
+      ;;
     repos/*/rules/branches/*)
       # #772 enforcement probe, surface 2 (repository rulesets).
       if [ "${FIXTURE_RULESETS_FAIL:-0}" = "1" ]; then
@@ -246,13 +255,24 @@ make_protection_fixture() {  # <contexts_json_array>  GraphQL refUpdateRule shap
   echo "$file"
 }
 
-make_rulesets_fixture() {  # <contexts_json_array>  rules/branches/<branch> shape
-  local contexts=$1
+make_rulesets_fixture() {  # <contexts_json_array> [ruleset_id]  rules/branches/<branch> shape
+  local contexts=$1 rs_id=${2:-101}
   local file="$WORKDIR/rulesets.$$.$RANDOM.json"
-  jq -n --argjson contexts "$contexts" '
+  jq -n --argjson contexts "$contexts" --argjson rs_id "$rs_id" '
     [ { type: "required_status_checks",
+        ruleset_id: $rs_id,
         parameters: { required_status_checks: [ $contexts[] | { context: . } ] } } ]
   ' >"$file"
+  echo "$file"
+}
+
+# The ruleset OBJECT behind a rules/branches entry. `rules/branches` does not
+# return bypass_actors, so the #772 probe fetches this to prove the ruleset
+# actually constrains the merging identity.
+make_ruleset_object_fixture() {  # <bypass_actors_json_array>
+  local bypass=$1
+  local file="$WORKDIR/ruleset-obj.$$.$RANDOM.json"
+  jq -n --argjson bypass "$bypass" '{ id: 101, name: "test-ruleset", bypass_actors: $bypass }' >"$file"
   echo "$file"
 }
 
@@ -273,6 +293,13 @@ run_gate() {  # <scratch> [args...]   (env: FIXTURE_PR, FIXTURE_REVIEWS, CODEX_S
       "$SCRIPT" "$@"
   )
 }
+
+# Default ruleset OBJECT for the #772 bypass-actor probe: a ruleset with NO
+# bypass actors, i.e. one that genuinely constrains every identity. Exported
+# so every stub invocation sees it; a test that needs bypass actors overrides
+# it with its own prefix assignment.
+FIXTURE_RULESET_OBJ=$(make_ruleset_object_fixture "[]")
+export FIXTURE_RULESET_OBJ
 
 HEAD_SHA="head000aaa"
 OLD_SHA="old111bbb"
@@ -1514,6 +1541,55 @@ if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
   pass "protection: enforced gate on a URL-significant base ref still resolves to true"
 else
   fail "protection: URL-significant base ref expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1i (#772 r2 P1): a ruleset the merging identity can BYPASS is not enforcement"
+# `rules/branches` filters to rules enforced on the REQUESTING identity (the CI
+# reviewer token), but the account that runs the final `gh pr merge` is the
+# AUTHOR identity. A ruleset listing that author in bypass_actors still appears
+# here while constraining nothing — counting it would reproduce the exact
+# defect this PR removes. bypass_actors is not on this endpoint, so the ruleset
+# object is fetched and required to have none.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+BYPASS_OBJ=$(make_ruleset_object_fixture '[{"actor_id":1,"actor_type":"OrganizationAdmin","bypass_mode":"always"}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESET_OBJ="$BYPASS_OBJ" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: ruleset with bypass actors is NOT counted as enforcement → false"
+else
+  fail "protection: bypassable ruleset expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1j (#772 r2 P1): an unreadable ruleset object is not proof of enforcement"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESET_OBJ_FAIL=1 \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: unreadable ruleset object → not counted, falls through to arm 2 → false"
+else
+  fail "protection: unreadable ruleset object expected false/0; got rc=$RC out='$OUT'"
 fi
 
 echo; echo "--- Protection 2 (#713): gate disabled + protected path + Phase-4b/Codex cleared → true"

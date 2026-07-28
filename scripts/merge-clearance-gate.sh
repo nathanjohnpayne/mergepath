@@ -451,15 +451,59 @@ merge_clearance_check_enforced() {
   if [ "$rc" -ne 0 ]; then
     log "enforcement probe: ruleset read failed on '$BASE_REF' (gh rc=$rc): $(tr '\n' ' ' <"$err")"
   else
+    # Only rules that carry OUR context matter, and each is kept only if its
+    # owning ruleset provably constrains the identity that will merge.
+    #
+    # `rules/branches` filters to rules enforced on the REQUESTING identity —
+    # here the CI reviewer token — but the account that runs the final
+    # `gh pr merge` is the AUTHOR identity. A ruleset whose `bypass_actors`
+    # lists that author therefore still appears in this response while not
+    # constraining the merge at all, and counting it would reproduce the exact
+    # defect this PR exists to remove: treating configuration as enforcement.
+    # `bypass_actors` is not returned by this endpoint, so each candidate
+    # ruleset is fetched and required to have NO bypass actors. A ruleset that
+    # cannot be read, or that has any, is not proof — drop it and fall through
+    # to arm 2 (#772 r2 P1).
     set +e
-    parsed=$(printf '%s' "$out" \
-      | jq -r -s 'add // [] | [ .[]? | objects | select(.type == "required_status_checks") | .parameters.required_status_checks[]?.context ] | .[]' 2>"$err")
+    ruleset_ids=$(printf '%s' "$out" \
+      | jq -r -s --arg ctx "$MERGE_CLEARANCE_CHECK_NAME" '
+          add // []
+          | [ .[]? | objects
+              | select(.type == "required_status_checks")
+              | select([ .parameters.required_status_checks[]?.context ] | index($ctx))
+              | .ruleset_id ]
+          | map(select(. != null)) | unique | .[]' 2>"$err")
     rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then
       log "enforcement probe: could not parse the ruleset response for '$BASE_REF': $(tr '\n' ' ' <"$err")"
-    elif [ -n "$parsed" ]; then
-      contexts="$contexts$parsed"$'\n'
+    elif [ -n "$ruleset_ids" ]; then
+      while IFS= read -r rs_id; do
+        [ -n "$rs_id" ] || continue
+        set +e
+        rs_out=$(gh api "repos/$REPO/rulesets/$rs_id" 2>"$err")
+        rs_rc=$?
+        set -e
+        if [ "$rs_rc" -ne 0 ]; then
+          log "enforcement probe: ruleset $rs_id carries '$MERGE_CLEARANCE_CHECK_NAME' on '$BASE_REF' but could not be read for bypass actors (gh rc=$rs_rc) — not counting it: $(tr '\n' ' ' <"$err")"
+          continue
+        fi
+        set +e
+        bypass_count=$(printf '%s' "$rs_out" | jq -r '[ .bypass_actors[]? ] | length' 2>"$err")
+        rs_rc=$?
+        set -e
+        # An empty or non-numeric count means the payload was not the ruleset
+        # object we expected; that is not proof of zero bypass actors.
+        if [ "$rs_rc" -ne 0 ] || ! [[ "$bypass_count" =~ ^[0-9]+$ ]]; then
+          log "enforcement probe: could not read bypass actors for ruleset $rs_id (got '${bypass_count:-}') — not counting it: $(tr '\n' ' ' <"$err")"
+        elif [ "$bypass_count" -gt 0 ]; then
+          log "enforcement probe: ruleset $rs_id requires '$MERGE_CLEARANCE_CHECK_NAME' but declares $bypass_count bypass actor(s), so it does not provably constrain the merging identity — not counting it"
+        else
+          contexts="$contexts$MERGE_CLEARANCE_CHECK_NAME"$'\n'
+        fi
+      done <<EOF
+$ruleset_ids
+EOF
     fi
   fi
 
