@@ -177,6 +177,42 @@ jobs:
               }
             );
 
+            // Config must come from the PR BASE, not this default-branch
+            // checkout (#763). This job checks out the default branch so the
+            // HELPER code is trusted — correct, and unchanged — but the helper
+            // was then handed the default branch's .github/review-policy.yml.
+            // A PR targeting a stricter non-default base (a release branch with
+            // a lower threshold or extra protected paths) was therefore judged
+            // by the LOOSER default-branch policy, and since `needsExternal` is
+            // overwritten by the helper result below, that could flip it to
+            // false and skip the external-review label entirely. Same bypass
+            // pr-review-policy.yml fixes; the PR cannot edit its own base, so
+            // reading config from there is equally trusted.
+            let policyConfigPath = '.github/review-policy.yml';
+            try {
+              const baseCfg = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path: '.github/review-policy.yml',
+                ref: pr.base.sha,
+              });
+              const baseCfgText = Buffer.from(baseCfg.data.content, 'base64').toString('utf8');
+              const baseCfgPath = path.join(
+                os.tmpdir(), `mergepath-pr-${pr.number}-base-review-policy.yml`
+              );
+              fs.writeFileSync(baseCfgPath, baseCfgText);
+              policyConfigPath = baseCfgPath;
+              console.log(`Using base-branch review policy from ${pr.base.sha}.`);
+            } catch (e) {
+              // A base with no review-policy.yml predates the policy entirely;
+              // the default-branch copy is the only thing to fall back to.
+              core.warning(
+                `Could not read .github/review-policy.yml from PR base ` +
+                `${pr.base.sha}; falling back to the default-branch copy ` +
+                `(${e.message}).`
+              );
+            }
+
             // Exclude lockfiles, minified, and generated files from line count
             // to match REVIEW_POLICY.md threshold definition
             const excludePatterns = [
@@ -219,7 +255,7 @@ jobs:
                   '--repo', repo,
                   '--pr', String(pr.number),
                   '--ref', pr.head.sha,
-                  '--config', '.github/review-policy.yml',
+                  '--config', policyConfigPath,
                   '--files-json', filesPath,
                 ],
                 {encoding: 'utf8', env: process.env}
@@ -317,7 +353,7 @@ jobs:
                       '--pr', String(pr.number),
                       '--head', pr.head.sha,
                       '--current-fingerprint', externalReviewFingerprint,
-                      '--config', '.github/review-policy.yml',
+                      '--config', policyConfigPath,
                       '--files-json', filesPath,
                     ],
                     {encoding: 'utf8', env: process.env}
