@@ -180,6 +180,7 @@ EOF
 
 # Canonical agent docs (#780) — mirrored verbatim to every new repo,
 # and asserted present by bootstrap::_verify_canonical_agent_docs.
+echo "# Decision Records (canonical convention)" >"$FAKE_MP/docs/agents/decision-records.md"
 echo "# Shared Agent Operating Rules (canonical core)" >"$FAKE_MP/docs/agents/shared-operating-rules.md"
 echo "# Worktree Placement (canonical convention)" >"$FAKE_MP/docs/agents/worktree-placement.md"
 # The per-repo-owned local overlay it must be read BEFORE.
@@ -548,7 +549,7 @@ fi
 # operating-rules overlay. Both halves are enforced in-stage by
 # bootstrap::_verify_canonical_agent_docs; assert the observable result.
 canon_missing=""
-for d in docs/agents/shared-operating-rules.md docs/agents/worktree-placement.md; do
+for d in docs/agents/decision-records.md docs/agents/shared-operating-rules.md docs/agents/worktree-placement.md; do
   [ -f "$TARGET/$d" ] || canon_missing="$canon_missing $d"
 done
 [ -z "$canon_missing" ] \
@@ -575,9 +576,10 @@ fi
 VERIFY_LIB="$ROOT/scripts/bootstrap/template-mirror.sh"
 verify_case() {
   # $1 = scenario label, $2 = mutation shell snippet run against $vt
-  local label="$1" mutate="$2" vt rc out
+  local mutate="$2" vt rc out
   vt="$(mktemp -d "$WORKDIR/verify.XXXXXX")"
   mkdir -p "$vt/docs/agents"
+  : > "$vt/docs/agents/decision-records.md"
   : > "$vt/docs/agents/shared-operating-rules.md"
   : > "$vt/docs/agents/worktree-placement.md"
   : > "$vt/docs/agents/operating-rules.md"
@@ -619,6 +621,13 @@ if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "does not refere
   pass "verifier fails closed when AGENTS.md never links the shared rules (#780)"
 else
   fail "verifier should fail on an AGENTS.md with no shared-rules link; got: $res"
+fi
+
+res=$(verify_case "local-unlinked" 'printf "1. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "does not reference docs/agents/operating-rules.md"; then
+  pass "verifier fails closed when AGENTS.md never links the local overlay (#780)"
+else
+  fail "verifier should fail on an AGENTS.md with no local-overlay link; got: $res"
 fi
 
 # --- assertion 4d: README.md hub-identity scrub (#747) ---

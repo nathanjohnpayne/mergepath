@@ -117,6 +117,14 @@ mp_normalize_path() {
   printf '%s' "$p"
 }
 
+mp_path_is_unsafe() {
+  local p="$1"
+  case "$p" in
+    /*|..|../*|*/..|*/../*) return 0 ;;
+  esac
+  return 1
+}
+
 # ─────────────────────────────────────────────────────────────────────
 # 1. `doc_ownership:` shape.
 # ─────────────────────────────────────────────────────────────────────
@@ -138,16 +146,11 @@ if [ "$ownership_tag" != "!!seq" ]; then
   exit 1
 fi
 
-# Field order: path|class|pending_manifest|note. `//` defaults keep the
-# field count stable so `read` never shifts a value into the wrong slot.
-# IFS='|' (not a tab) for the same reason as check_sync_manifest: bash
-# `read` with a whitespace IFS collapses runs and eats empty fields.
-if ! ownership_rows=$(yq -r '
-  .doc_ownership[]
-  | ((.path // "") + "|" + (.class // "") + "|"
-     + ((.pending_manifest // false) | tostring) + "|"
-     + ((.note // "") | tostring))
-' "$MANIFEST" 2>&1); then
+# One compact JSON object per entry. Do not use newline-delimited field
+# joins here: `note:` is free text and YAML literal/folded style may
+# contain embedded newlines, which would split one inventory row into
+# multiple bogus shell loop records.
+if ! ownership_rows=$(yq -o=json -I=0 '.doc_ownership[]' "$MANIFEST" 2>&1); then
   echo "FAIL: could not extract .doc_ownership from the manifest (yq error):"
   printf '%s\n' "$ownership_rows"
   echo "check_doc_ownership: FAIL"
@@ -162,11 +165,7 @@ fi
 # (check_sync_manifest owns that failure); the effect is an empty
 # snapshot, which makes check 7 flag every non-pending canonical doc —
 # fail-closed in the right direction.
-if ! path_rows=$(yq -r '
-  (.paths // [])[]
-  | ((.type // "") + "|" + (.path // "") + "|"
-     + (.dest // "") + "|" + (.source // ""))
-' "$MANIFEST" 2>&1); then
+if ! path_rows=$(yq -o=json -I=0 '(.paths // [])[]' "$MANIFEST" 2>&1); then
   echo "FAIL: could not extract .paths from the manifest (yq error):"
   printf '%s\n' "$path_rows"
   echo "check_doc_ownership: FAIL"
@@ -175,17 +174,24 @@ fi
 
 # Comma-joined, sentinel-padded sets so a substring lookup cannot
 # false-match a path prefix (",a/b," never matches inside ",a/bc,").
-manifest_exact=","
+canonical_exact=","
 verbatim_exact=","
 verbatim_kit_dirs=""
 verbatim_repo_root_kit=0
 if [ -n "$path_rows" ]; then
-  while IFS='|' read -r p_type p_path p_dest p_source; do
+  while IFS= read -r path_row; do
+    [ -z "$path_row" ] && continue
+    p_type=$(yq -r '.type // ""' <<< "$path_row")
+    p_path=$(yq -r '.path // ""' <<< "$path_row")
+    p_dest=$(yq -r '.dest // ""' <<< "$path_row")
+    p_source=$(yq -r '.source // ""' <<< "$path_row")
     [ -z "$p_type$p_path" ] && continue
     n_path=$(mp_normalize_path "$p_path")
     n_dest=$(mp_normalize_path "${p_dest:-$p_path}")
     n_source=$(mp_normalize_path "${p_source:-$p_path}")
-    manifest_exact="${manifest_exact}${n_path},"
+    if [ "$p_type" = "canonical" ]; then
+      canonical_exact="${canonical_exact}${n_path},"
+    fi
     if [ "$p_type" = "canonical" ] || [ "$p_type" = "kit" ]; then
       verbatim_exact="${verbatim_exact}${n_path},${n_dest},${n_source},"
       if [ "$p_type" = "kit" ]; then
@@ -225,11 +231,21 @@ verbatim_hit() {
 # ─────────────────────────────────────────────────────────────────────
 declared=","
 if [ -n "$ownership_rows" ]; then
-  while IFS='|' read -r doc_path doc_class doc_pending doc_note; do
-    [ -z "$doc_path$doc_class" ] && continue
+  while IFS= read -r ownership_row; do
+    [ -z "$ownership_row" ] && continue
+    doc_path=$(yq -r '.path // ""' <<< "$ownership_row")
+    doc_class=$(yq -r '.class // ""' <<< "$ownership_row")
+    doc_pending=$(yq -r '(.pending_manifest // false) | tostring' <<< "$ownership_row")
+    doc_note=$(yq -r '(.note // "") | tostring' <<< "$ownership_row")
 
     if [ -z "$doc_path" ]; then
-      echo "FAIL: doc_ownership entry with class '$doc_class' has an empty 'path'"
+      echo "FAIL: doc_ownership entry has an empty 'path'"
+      FAILED=1
+      continue
+    fi
+
+    if mp_path_is_unsafe "$doc_path"; then
+      echo "FAIL: doc_ownership entry '$doc_path' is unsafe — absolute paths and '..' segments are not allowed"
       FAILED=1
       continue
     fi
@@ -289,11 +305,11 @@ if [ -n "$ownership_rows" ]; then
 
     # 7 / 8: class ↔ manifest consistency.
     if [ "$doc_class" = "canonical" ]; then
-      case "$manifest_exact" in
+      case "$canonical_exact" in
         *",$norm_doc,"*) ;;
         *)
           if [ "$doc_pending" != "true" ]; then
-            echo "FAIL: '$norm_doc' is classified canonical but has no 'paths:' entry in the manifest — an unbacked canonical claim never propagates, so consumers silently do not have it. Add a 'type: canonical' paths entry, or declare 'pending_manifest: true' with a note naming the follow-up."
+            echo "FAIL: '$norm_doc' is classified canonical but has no 'type: canonical' paths entry in the manifest — an unbacked canonical claim never propagates verbatim, so consumers silently do not have it. Add a 'type: canonical' paths entry, or declare 'pending_manifest: true' with a note naming the follow-up."
             FAILED=1
           fi
           ;;
@@ -359,11 +375,22 @@ if [ -f "$SIBLING" ]; then
       esac
       # Only meaningful for docs that exist here; a denylist entry for a
       # deleted doc is check_sync_manifest's problem, not this one.
-      [ -f "$REPO_ROOT/$denied" ] || continue
-      declared_class=$(printf '%s\n' "$ownership_rows" \
-        | awk -F'|' -v d="$denied" '$1 == d { print $2; exit }')
+      norm_denied=$(mp_normalize_path "$denied")
+      [ -f "$REPO_ROOT/$norm_denied" ] || continue
+      declared_class=""
+      while IFS= read -r ownership_row; do
+        [ -z "$ownership_row" ] && continue
+        doc_path=$(yq -r '.path // ""' <<< "$ownership_row")
+        if mp_path_is_unsafe "$doc_path"; then
+          continue
+        fi
+        if [ "$(mp_normalize_path "$doc_path")" = "$norm_denied" ]; then
+          declared_class=$(yq -r '.class // ""' <<< "$ownership_row")
+          break
+        fi
+      done <<< "$ownership_rows"
       if [ "$declared_class" = "canonical" ]; then
-        echo "FAIL: '$denied' is on check_sync_manifest's IDENTITY_DOCS_DENYLIST (must never be verbatim-mirrored) but doc_ownership classifies it 'canonical' — the two declarations contradict each other. Reclassify it per-repo-owned or hub-only, or remove it from the denylist."
+        echo "FAIL: '$norm_denied' is on check_sync_manifest's IDENTITY_DOCS_DENYLIST (must never be verbatim-mirrored) but doc_ownership classifies it 'canonical' — the two declarations contradict each other. Reclassify it per-repo-owned or hub-only, or remove it from the denylist."
         FAILED=1
       fi
     done <<< "$denylist"

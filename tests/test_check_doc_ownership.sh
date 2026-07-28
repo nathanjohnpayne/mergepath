@@ -212,7 +212,7 @@ doc_ownership:
 set +e
 out=$(run_with_fixture "$MANIFEST_UNBACKED" "docs/agents/shared.md"); rc=$?
 set -e
-if [ "$rc" = "1" ] && echo "$out" | grep -q "classified canonical but has no 'paths:' entry"; then
+if [ "$rc" = "1" ] && echo "$out" | grep -q "has no 'type: canonical' paths entry"; then
   pass "Case 6: unbacked canonical claim fails closed"
 else
   fail "Case 6 unexpected (rc=$rc): $out"
@@ -234,6 +234,27 @@ if [ "$rc" = "0" ]; then
   pass "Case 7: pending_manifest + note records the debt and passes"
 else
   fail "Case 7 unexpected (rc=$rc): $out"
+fi
+
+# --- Case 7a2: multiline pending note stays a single ownership row ---
+MANIFEST_PENDING_MULTILINE="$MIN_HEADER
+paths: []
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+    pending_manifest: true
+    note: |
+      first paragraph
+
+      second paragraph
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_PENDING_MULTILINE" "docs/agents/shared.md"); rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 7a2: multiline pending_manifest note is parsed as one row"
+else
+  fail "Case 7a2 unexpected (rc=$rc): $out"
 fi
 
 # --- Case 7b: pending_manifest WITHOUT a note fails ------------------
@@ -373,6 +394,27 @@ else
   fail "Case 8e unexpected (rc=$rc): $out"
 fi
 
+# --- Case 8f: canonical ownership requires a canonical paths entry --
+# A same-path templated entry does not back a verbatim canonical class.
+MANIFEST_CANONICAL_TEMPLATED="$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    source: examples/shared-template.md
+    type: templated
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_CANONICAL_TEMPLATED" "$(printf 'docs/agents/shared.md\nexamples/shared-template.md')"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "has no 'type: canonical' paths entry"; then
+  pass "Case 8f: canonical doc is not backed by a templated paths entry"
+else
+  fail "Case 8f unexpected (rc=$rc): $out"
+fi
+
 # --- Case 9: entry outside the docs/agents/ scope -------------------
 MANIFEST_OUTSCOPE="$MIN_HEADER
 paths: []
@@ -389,6 +431,38 @@ else
   fail "Case 9 unexpected (rc=$rc): $out"
 fi
 
+# --- Case 9b: parent traversal is rejected before filesystem probes --
+MANIFEST_PARENT_TRAVERSAL="$MIN_HEADER
+paths: []
+doc_ownership:
+  - path: docs/agents/../sync-overrides.md
+    class: per-repo-owned
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_PARENT_TRAVERSAL" "docs/sync-overrides.md"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "absolute paths and '..' segments are not allowed"; then
+  pass "Case 9b: parent traversal in ownership path fails closed"
+else
+  fail "Case 9b unexpected (rc=$rc): $out"
+fi
+
+# --- Case 9c: absolute paths are rejected before scope checks -------
+MANIFEST_ABSOLUTE="$MIN_HEADER
+paths: []
+doc_ownership:
+  - path: /docs/agents/local.md
+    class: per-repo-owned
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_ABSOLUTE" "docs/agents/local.md"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "absolute paths and '..' segments are not allowed"; then
+  pass "Case 9c: absolute ownership path fails closed"
+else
+  fail "Case 9c unexpected (rc=$rc): $out"
+fi
+
 # --- Case 10: missing doc_ownership block ---------------------------
 MANIFEST_NOBLOCK="$MIN_HEADER
 paths: []
@@ -400,6 +474,21 @@ if [ "$rc" = "1" ] && echo "$out" | grep -q "has no 'doc_ownership:' block"; the
   pass "Case 10: a manifest with no doc_ownership block fails closed"
 else
   fail "Case 10 unexpected (rc=$rc): $out"
+fi
+
+# --- Case 10c: empty mapping row is malformed, not skipped ----------
+MANIFEST_EMPTY_ENTRY="$MIN_HEADER
+paths: []
+doc_ownership:
+  - {}
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_EMPTY_ENTRY" "docs/agents/"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "doc_ownership entry has an empty 'path'"; then
+  pass "Case 10c: empty doc_ownership mapping fails closed"
+else
+  fail "Case 10c unexpected (rc=$rc): $out"
 fi
 
 # --- Case 10b: doc_ownership present but a SCALAR -------------------
@@ -451,7 +540,7 @@ fi
 MANIFEST_DRIFT="$MIN_HEADER
 paths: []
 doc_ownership:
-  - path: docs/agents/identity.md
+  - path: ./docs/agents/identity.md
     class: canonical
     pending_manifest: true
     note: deliberately contradictory fixture
@@ -463,7 +552,7 @@ out=$(run_with_denylist "$MANIFEST_DRIFT" "docs/agents/identity.md" \
 rc=$?
 set -e
 if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
-  pass "Case 12: denylisted doc classified canonical fails closed (drift guard)"
+  pass "Case 12: denylisted doc classified canonical fails closed after path normalization (drift guard)"
 else
   fail "Case 12 unexpected (rc=$rc): $out"
 fi

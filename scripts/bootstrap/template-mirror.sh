@@ -229,6 +229,7 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
 # Keep in sync with the `class: canonical` entries in the manifest's
 # doc_ownership block.
 BOOTSTRAP_REQUIRED_CANONICAL_AGENT_DOCS=(
+  'docs/agents/decision-records.md'
   'docs/agents/shared-operating-rules.md'
   'docs/agents/worktree-placement.md'
 )
@@ -739,6 +740,10 @@ bootstrap::_verify_canonical_agent_docs() {
 
   if [ -z "$shared_line" ]; then
     bootstrap::err "AGENTS.md does not reference docs/agents/shared-operating-rules.md — the new repo would ship the shared rulebook with nothing pointing at it. Add it to the AGENTS.md reading order at the mergepath source."
+    return 1
+  fi
+  if [ -z "$local_line" ]; then
+    bootstrap::err "AGENTS.md does not reference docs/agents/operating-rules.md — the new repo would ship the repo-local overlay with nothing pointing at it. Add it to the AGENTS.md reading order after docs/agents/shared-operating-rules.md at the mergepath source."
     return 1
   fi
   if [ -n "$local_line" ] && [ "$shared_line" -gt "$local_line" ]; then

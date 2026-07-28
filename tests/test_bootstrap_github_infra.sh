@@ -56,6 +56,7 @@ echo "overview" >"$FAKE_MP/docs/agents/repository-overview.md"
 # landed in the new repo, and that AGENTS.md reads the shared operating rules
 # before the local overlay. Seed both docs and a conforming index so this
 # fixture exercises the real bootstrap path instead of tripping the guard.
+echo "decision records" >"$FAKE_MP/docs/agents/decision-records.md"
 echo "shared rules" >"$FAKE_MP/docs/agents/shared-operating-rules.md"
 echo "worktree placement" >"$FAKE_MP/docs/agents/worktree-placement.md"
 echo "local overlay" >"$FAKE_MP/docs/agents/operating-rules.md"
