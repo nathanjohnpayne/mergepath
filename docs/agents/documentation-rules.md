@@ -34,6 +34,18 @@ A direct edit here is overwritten on the next sync and breaks the mirror. Edit t
 
 No CI check rejects a direct edit to a repo-owned `docs/**` file, and CodeRabbit's `docs/**` path review is advisory --- so a normal docs-only change to a repo-owned path is allowed and unblocked. The generated-mirror markers above are the guard: `tests/test_project_doc_sync.sh` asserts every materialized mirror carries them, and the mirror's own `do_not_edit:` header routes an editor to the canonical source.
 
+## Canonical-source discipline
+
+A new cross-repo or agent-agnostic convention is authored in mergepath **first** — in a small dedicated `docs/agents/*.md` file when it is universal enough to sync as a `canonical` manifest entry (the pattern `docs/agents/worktree-placement.md` establishes; see #739), otherwise in the appropriate existing `docs/agents/` sub-file. Only then is it mirrored into vendor-specific or machine-local files — a machine's `~/GitHub/CLAUDE.md`, a global `~/.codex/AGENTS.md`, a consumer repo's own docs — and every such mirror carries a `> Canonical source: mergepath/<path>` annotation pointing back at the authored source. Never author a convention downstream-first: content added directly to one vendor file is invisible to every other agent CLI and to every other machine, and nothing catches the omission (the worktree-placement convention lived only in one machine's `~/GitHub/CLAUDE.md` for months — the #739 gap).
+
+Annotation format for mirrored sections:
+
+```markdown
+> Canonical source: `mergepath/docs/agents/<file>.md` (canonical-sha256: <hex-prefix>)
+```
+
+The `canonical-sha256:` pin is optional but recommended: it records a prefix (12+ hex chars) of the SHA-256 of the canonical file at the time the mirror was taken, which lets `scripts/audit-canonical-mirrors.sh` detect that the canonical source has moved on since the mirror was written. The audit script is a read-only, on-demand triage aid (run it locally, e.g. at session finalization) — it reports top-level sections lacking an annotation and pinned sections whose canonical source has drifted, and it never edits or migrates anything. Its audit run is deliberately not wired into any GitHub Actions workflow: machine-local files are outside every repo, so CI cannot see them — honesty about that scope is part of the rule. (The script's hermetic parser regression suite does run in CI, via `scripts/ci/check_audit_canonical_mirrors`; what stays out of CI is the audit of machine-local files itself.)
+
 ## Prose line-wrapping
 
 Soft-wrap Markdown prose: write one physical line per paragraph and let the renderer wrap it. Do not hard-wrap prose at a fixed column (roughly 72 to 80 characters). GitHub-flavored Markdown collapses single newlines inside a paragraph to spaces, so fixed-column wrapping is invisible in the rendered output, is enforced by nothing, is applied inconsistently, and creates reflow churn on every edit.

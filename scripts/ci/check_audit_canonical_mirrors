@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# check_audit_canonical_mirrors
+#
+# Runs the hermetic regression suite for the #739 canonical-mirror
+# drift triage aid (scripts/audit-canonical-mirrors.sh):
+# tests/test_audit_canonical_mirrors.sh builds a fixture mergepath
+# checkout + fixture vendor files under a temp dir and asserts on the
+# section parser (fence tracking incl. the CommonMark closing-fence
+# run-length rule, annotation/pin extraction) and the report
+# classifications. CI guards the PARSER only — the audit run itself
+# stays a local-only tool because the files it audits (a machine's
+# ~/GitHub/CLAUDE.md, a global ~/.codex/AGENTS.md) live outside every
+# repo checkout, where repository CI cannot see them.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_audit_canonical_mirrors.sh"
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  # Consumer-safety guard (#601): repo_lint.yml is manifest-canonical,
+  # so consumers run this wrapper too — but the suite it wraps is
+  # hub-only (not manifest-propagated; live consumers do not carry it).
+  # scripts/sync-to-downstream.sh is the standard hub marker
+  # (intentionally NOT propagated; same disambiguator as
+  # check_sync_manifest): both absent → consumer checkout → SKIP.
+  # Marker present → hub lost the test (accidental delete/rename) →
+  # hard error, preserving the fail-closed hub behavior.
+  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+    echo "check_audit_canonical_mirrors: SKIP (consumer checkout: tests/test_audit_canonical_mirrors.sh + scripts/sync-to-downstream.sh both absent)"
+    exit 0
+  fi
+  echo "check_audit_canonical_mirrors: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"

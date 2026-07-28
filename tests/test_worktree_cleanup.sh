@@ -38,6 +38,14 @@
 #      NO merged PR is EXAMINED and kept, emitting an explicit "no merged PR"
 #      line + a "gone kept (unmerged)" summary counter, so a non-candidate is
 #      never a silent omission.
+#  12. #739 hidden-folder convention: a detached worktree under
+#      .mergepath-worktrees/ with a PR-number-bearing slug pr-<n>-<desc>
+#      (docs/agents/worktree-placement.md § Slug naming) is PR-state
+#      checked like the legacy mergepath-pr-<n> shape and removed by
+#      --apply when the PR is CLOSED/MERGED.
+#  13. #739: a detached hidden-folder worktree with a free-form (non
+#      pr-<n>) slug carries no parseable PR number — listed as detached
+#      non-PR and never auto-removed.
 #
 # `gh` is stubbed via a PATH shim that returns CLOSED for our test PR
 # number and "unknown" for anything else, so the test does not touch
@@ -137,6 +145,22 @@ PR_WT="/tmp/mergepath-pr-${PR_NUM}"
 # Clean up any stale leftover from a previous failed test run.
 rm -rf "$PR_WT"
 git worktree add -q --detach "$PR_WT" "$DETACHED_SHA"
+
+# ── Case 12 (#739): detached hidden-folder PR worktree ────────────────
+# The worktree-placement convention (~/GitHub/.<repo>-worktrees/<slug>)
+# with a PR-number-bearing slug pr-<n>-<desc>. The helper matches the
+# hidden folder by its directory NAME (.mergepath-worktrees), not a
+# hardcoded ~/GitHub prefix, so the fixture can live under WORKDIR.
+HIDDEN_PR_NUM=88888
+HIDDEN_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${HIDDEN_PR_NUM}-review-slug"
+mkdir -p "$WORKDIR/.mergepath-worktrees"
+git worktree add -q --detach "$HIDDEN_PR_WT" "$DETACHED_SHA"
+
+# ── Case 13 (#739): detached hidden-folder worktree, free-form slug ───
+# No parseable pr-<n> prefix → no PR number to cross-check; must be
+# listed as detached non-PR and never auto-removed.
+HIDDEN_NONPR_WT="$WORKDIR/.mergepath-worktrees/charming-freeform-slug"
+git worktree add -q --detach "$HIDDEN_NONPR_WT" "$DETACHED_SHA"
 
 # ── Case 4: locked worktree (use a gone-upstream branch so it ALSO
 #    falls into a removal-eligible bucket; the helper must skip it
@@ -246,6 +270,10 @@ if [ "\$1" = "pr" ] && [ "\$2" = "view" ]; then
     echo "CLOSED"
     exit 0
   fi
+  if [ "\$num" = "$HIDDEN_PR_NUM" ]; then
+    echo "MERGED"
+    exit 0
+  fi
 fi
 if [ "\$1" = "pr" ] && [ "\$2" = "list" ]; then
   head=""
@@ -332,6 +360,30 @@ if echo "$OUT" | grep -q "STALE detached PR #${PR_NUM}" \
   pass "detached closed-PR worktree listed as STALE detached"
 else
   fail "detached closed-PR worktree not listed correctly"
+  show_out_on_fail
+fi
+
+# Case 12 (#739): hidden-folder pr-<n>-<desc> worktree is PR-state checked
+# and flagged STALE detached (the stub reports the PR MERGED).
+if echo "$OUT" | grep -q "STALE detached PR #${HIDDEN_PR_NUM}" \
+   && echo "$OUT" | grep -q -- "$HIDDEN_PR_WT"; then
+  pass "hidden-folder pr-<n>-<desc> detached worktree PR-state checked + flagged STALE"
+else
+  fail "hidden-folder detached PR worktree not recognized by the matcher"
+  show_out_on_fail
+fi
+
+# Case 13 (#739): free-form hidden-folder slug carries no parseable PR
+# number → listed as detached non-PR (correlate path→label via awk, as
+# elsewhere in this file).
+NONPR_WT_LABEL=$(echo "$OUT" | awk -v p="$HIDDEN_NONPR_WT" '
+  /^  \[/            { label = $0 }
+  $1 == "path:" && $2 == p { print label; exit }
+')
+if echo "$NONPR_WT_LABEL" | grep -q "detached non-PR"; then
+  pass "free-form hidden-folder slug listed as detached non-PR (no PR number parsed)"
+else
+  fail "free-form hidden-folder slug mislabeled (label='$NONPR_WT_LABEL')"
   show_out_on_fail
 fi
 
@@ -513,6 +565,22 @@ if echo "$OUT3" | grep -q -- "$PR_WT"; then
   echo "$OUT3" >&2
 else
   pass "detached closed-PR worktree removed by --apply"
+fi
+# Case 12 (#739): the hidden-folder merged-PR worktree is removed by the
+# same --apply pass as the legacy shape.
+if [ -d "$HIDDEN_PR_WT" ] || echo "$OUT3" | grep -q -- "$HIDDEN_PR_WT"; then
+  fail "hidden-folder detached merged-PR worktree still present after --apply"
+  echo "$OUT3" >&2
+else
+  pass "hidden-folder detached merged-PR worktree removed by --apply"
+fi
+# Case 13 (#739): the free-form-slug detached worktree is never
+# auto-removed (no PR number to verify against).
+if [ -d "$HIDDEN_NONPR_WT" ]; then
+  pass "free-form hidden-folder detached worktree retained by --apply (never auto-removed)"
+else
+  fail "free-form hidden-folder detached worktree was removed by --apply"
+  echo "$OUT2" >&2
 fi
 if echo "$OUT3" | grep -q -- "$LOCKED_WT"; then
   pass "locked worktree retained after --apply (no --force-locked)"

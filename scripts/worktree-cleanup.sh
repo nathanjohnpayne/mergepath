@@ -51,11 +51,21 @@
 #      `[origin/<branch>: gone]` for the branch checked out at the
 #      worktree. Safe to remove (the remote tracking branch was deleted,
 #      typically after a squash-merge + branch delete).
-#   2. Detached `mergepath-pr-*` worktree. Worktree path matches
-#      ^(/private/tmp|/Users/.*/GitHub)/mergepath-pr-([0-9]+)$ AND HEAD
-#      is detached. Cross-check PR state via `gh pr view <num> --json
-#      state`; flag as removable if state is CLOSED or MERGED.
-#      Worktrees for OPEN PRs are listed but flagged as still-active.
+#   2. Detached PR worktree. Worktree path carries a parseable PR
+#      number in one of two recognized shapes AND HEAD is detached:
+#        a. legacy visible-sibling / temp-dir shape:
+#           ^(/private/tmp|/tmp|/Users/.*/GitHub)/mergepath-pr-([0-9]+)$
+#        b. the hidden-folder convention from
+#           docs/agents/worktree-placement.md — any path whose parent
+#           directory is `.mergepath-worktrees` and whose last component
+#           is a PR-number-bearing slug `pr-<n>` or `pr-<n>-<desc>`
+#           (e.g. ~/GitHub/.mergepath-worktrees/pr-123-fix-login).
+#      Cross-check PR state via `gh pr view <num> --json state`; flag as
+#      removable if state is CLOSED or MERGED. Worktrees for OPEN PRs
+#      are listed but flagged as still-active. Detached hidden-folder
+#      worktrees whose slug does NOT start with `pr-<n>` are listed as
+#      detached non-PR (no PR number to cross-check) and never
+#      auto-removed.
 #   3. Orphaned .claude/worktrees/ directory. Subdirectory under
 #      .claude/worktrees/ that is NOT in `git worktree list --porcelain`
 #      output. These are residue from a `--force` remove that didn't
@@ -395,10 +405,18 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
   fi
 
   if [ "$WT_DETACHED" = "1" ]; then
-    # Detached. Check if path matches mergepath-pr-<num>.
+    # Detached. Check if the path carries a parseable PR number: either
+    # the legacy mergepath-pr-<num> shape, or the hidden-folder
+    # convention (docs/agents/worktree-placement.md) with a
+    # PR-number-bearing slug `pr-<n>` / `pr-<n>-<desc>`. The hidden
+    # folder is matched by its directory NAME (.mergepath-worktrees)
+    # rather than a hardcoded ~/GitHub prefix so the matcher follows the
+    # folder wherever the operator keeps repos.
     pr_num=""
     if [[ "$WT_PATH" =~ ^(/private/tmp|/tmp|/Users/[^/]+/GitHub)/mergepath-pr-([0-9]+)$ ]]; then
       pr_num="${BASH_REMATCH[2]}"
+    elif [[ "$WT_PATH" =~ /\.mergepath-worktrees/pr-([0-9]+)(-[A-Za-z0-9._-]+)?$ ]]; then
+      pr_num="${BASH_REMATCH[1]}"
     fi
     if [ -n "$pr_num" ]; then
       pr_state=$(gh_pr_state "$pr_num")

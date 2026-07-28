@@ -157,6 +157,14 @@ echo "dist artifact" >"$FAKE_MP/dist/output.tgz"
 echo "mergepath internal" >"$FAKE_MP/mergepath/internal.md"
 echo "packaging metadata" >"$FAKE_MP/packaging/meta.json"
 echo "policy sim" >"$FAKE_MP/scripts/policy-sim.sh"
+# #739 canonical-mirror audit pair - hub-only; the mirror must EXCLUDE
+# both (shipped to a consumer, the audit's default MERGEPATH_ROOT would
+# resolve the CONSUMER checkout as the canonical source). The scripts/ci
+# wrapper deliberately stays: the mirrored repo_lint.yml wires it as a
+# step, and it consumer-SKIPs via the both-absent marker idiom (asserted
+# in 1c below).
+echo "canonical-mirror audit (hub-only)" >"$FAKE_MP/scripts/audit-canonical-mirrors.sh"
+echo "canonical-mirror audit test (hub-only)" >"$FAKE_MP/tests/test_audit_canonical_mirrors.sh"
 # Sync-to-downstream orchestrator surface (engine + manifest + paired test +
 # cron driver) - mergepath-only; the engine + manifest are also the
 # consumer-vs-mergepath markers the propagated scripts/ci/check_* wrappers key
@@ -222,6 +230,7 @@ cp "$ROOT/scripts/bootstrap-new-repo.sh"            "$FAKE_MP/scripts/bootstrap-
 cp "$ROOT/scripts/ci/check_sync_manifest"         "$FAKE_MP/scripts/ci/check_sync_manifest"
 cp "$ROOT/scripts/ci/check_sync_to_downstream"    "$FAKE_MP/scripts/ci/check_sync_to_downstream"
 cp "$ROOT/scripts/ci/check_export_consumer_facts" "$FAKE_MP/scripts/ci/check_export_consumer_facts"
+cp "$ROOT/scripts/ci/check_audit_canonical_mirrors" "$FAKE_MP/scripts/ci/check_audit_canonical_mirrors"
 
 # git init so preflight check 6 (clean mergepath) passes.
 git -C "$FAKE_MP" init -q
@@ -287,6 +296,8 @@ for excluded in \
   'specs/mergepath_playground.md' \
   'plans/mergepath-playground.md' \
   'scripts/policy-sim.sh' \
+  'scripts/audit-canonical-mirrors.sh' \
+  'tests/test_audit_canonical_mirrors.sh' \
   '.mergepath-sync.yml' \
   'scripts/sync-to-downstream.sh' \
   'tests/test_sync_to_downstream.sh' \
@@ -329,7 +340,11 @@ done
 #   - check_sync_manifest:         .mergepath-sync.yml absent + engine absent
 #   - check_sync_to_downstream:    test_sync_to_downstream.sh absent + manifest absent
 #   - check_export_consumer_facts: engine absent + manifest absent
-for chk in check_sync_manifest check_sync_to_downstream check_export_consumer_facts; do
+#   - check_audit_canonical_mirrors: test_audit_canonical_mirrors.sh absent
+#                                    + engine absent (#739 — the wrapper
+#                                    ships because repo_lint.yml wires it,
+#                                    while its script + test are excluded)
+for chk in check_sync_manifest check_sync_to_downstream check_export_consumer_facts check_audit_canonical_mirrors; do
   if [ ! -f "$TARGET/scripts/ci/$chk" ]; then
     fail "$chk wrapper did not propagate into TARGET (scripts/ci/ kit)"
     continue
