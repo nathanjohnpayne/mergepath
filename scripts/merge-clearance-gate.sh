@@ -48,7 +48,14 @@
 #              `ref.refUpdateRule` (classic branch protection — null for a
 #              viewer without push access) and REST
 #              `repos/{owner}/{repo}/rules/branches/{branch}` (rulesets —
-#              needs repo metadata read). A plain write-scoped classic PAT,
+#              needs repo metadata read). Verifying a candidate ruleset's
+#              bypass actors then reads the ruleset in ITS OWN scope —
+#              `repos/{owner}/{repo}/rulesets/{id}` for a repository ruleset,
+#              `orgs/{org}/rulesets/{id}` for an org ruleset inherited by the
+#              repo (which does NOT exist under the repository path). The org
+#              read needs an org-scoped token; without one the ruleset is
+#              unreadable, hence unproven, hence not counted — availability,
+#              not safety. A plain write-scoped classic PAT,
 #              which is what agent-review.yml runs this query under, reads
 #              both. A fine-grained PAT scoped to pull-requests only still
 #              satisfies the line above but gets null/403 on BOTH: the probe
@@ -341,6 +348,13 @@ MERGE_CLEARANCE_CHECK_NAME="Merge clearance gate"
 # where the id differs.
 MERGE_CLEARANCE_EXPECTED_APP_ID="${MERGE_CLEARANCE_EXPECTED_APP_ID:-15368}"
 
+# The login that will run the final `gh pr merge`, read from the GOVERNING
+# review policy's `author_identity` after POLICY_CONFIG resolves. Empty means
+# "the merging identity is unknown", which disables every bypass-actor
+# rule-out below (see the applicability model). Declared here so the probe
+# function can reference it; assigned once the base policy is resolved.
+MERGE_CLEARANCE_AUTHOR_IDENTITY=""
+
 # Positive proof that $MERGE_CLEARANCE_CHECK_NAME is an ENFORCED required
 # status check on the PR's base branch. Returns 0 ONLY when the context is
 # observed in a required-status-check list for $BASE_REF; returns 1 for
@@ -369,6 +383,7 @@ MERGE_CLEARANCE_EXPECTED_APP_ID="${MERGE_CLEARANCE_EXPECTED_APP_ID:-15368}"
 # (the conservative direction) and never toward a false "enforced".
 merge_clearance_check_enforced() {
   local owner name contexts="" out err rc parsed observed
+  local ruleset_recs rs_rec rs_id rs_rest rs_src_type rs_src rs_endpoint rs_out rs_rc rs_blocking
   owner=${REPO%%/*}
   name=${REPO##*/}
 
@@ -550,15 +565,24 @@ merge_clearance_check_enforced() {
     # constraining the merge at all, and counting it would reproduce the exact
     # defect this PR exists to remove: treating configuration as enforcement.
     # `bypass_actors` is not returned by this endpoint, so each candidate
-    # ruleset is fetched and required to have NO bypass actors. A ruleset that
-    # cannot be read, or that has any, is not proof — drop it and fall through
-    # to arm 2 (#772 r2 P1).
+    # ruleset is fetched and its bypass actors evaluated against the merging
+    # identity. A ruleset that cannot be read, or one carrying an actor whose
+    # applicability cannot be ruled out, is not proof — drop it and fall
+    # through to arm 2 (#772 r2 P1, refined by #781 item 11).
     set +e
     # A rule counts only when it requires OUR context FROM the trusted app.
     # `integration_id` absent means the rule accepts the context from ANY
     # producer, so an untrusted workflow emitting that name would satisfy it —
     # not proof, and dropped here rather than trusted (#772 r5 P1).
-    ruleset_ids=$(printf '%s' "$out" \
+    #
+    # Each surviving rule is emitted as `<ruleset_id>|<source_type>|<source>`.
+    # The source metadata is load-bearing (#781 item 1): an ORG-level ruleset
+    # inherited by this repo appears in this response but does NOT exist at
+    # `repos/{owner}/{repo}/rulesets/{id}`, so a repo-only lookup 404s, the
+    # ruleset is discarded as unreadable, and arm 1 returns false permanently
+    # on every centrally governed repo. The endpoint is selected from
+    # `ruleset_source_type` / `ruleset_source` below.
+    ruleset_recs=$(printf '%s' "$out" \
       | jq -r -s --arg ctx "$MERGE_CLEARANCE_CHECK_NAME" --arg app "$MERGE_CLEARANCE_EXPECTED_APP_ID" '
           add // []
           | [ .[]? | objects
@@ -566,45 +590,147 @@ merge_clearance_check_enforced() {
               | select([ .parameters.required_status_checks[]?
                          | select(.context == $ctx)
                          | select((.integration_id | tostring) == $app) ] | length > 0)
-              | .ruleset_id ]
-          | map(select(. != null)) | unique | .[]' 2>"$err")
+              | { id: .ruleset_id,
+                  src_type: (.ruleset_source_type // "" | tostring),
+                  src: (.ruleset_source // "" | tostring) } ]
+          | map(select(.id != null)) | unique
+          | .[] | [ (.id | tostring), .src_type, .src ] | join("|")' 2>"$err")
     rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then
       log "enforcement probe: could not parse the ruleset response for '$BASE_REF': $(tr '\n' ' ' <"$err")"
-    elif [ -n "$ruleset_ids" ]; then
-      while IFS= read -r rs_id; do
-        [ -n "$rs_id" ] || continue
+    elif [ -n "$ruleset_recs" ]; then
+      while IFS= read -r rs_rec; do
+        [ -n "$rs_rec" ] || continue
+        # Split on the first two `|`. Field-splitting via IFS is deliberately
+        # avoided: a tab/space IFS collapses adjacent empty fields, which would
+        # silently shift `ruleset_source` into the `ruleset_source_type` slot
+        # when the type is absent.
+        rs_id=${rs_rec%%|*}
+        rs_rest=${rs_rec#*|}
+        rs_src_type=${rs_rest%%|*}
+        rs_src=${rs_rest#*|}
+        if ! [[ "$rs_id" =~ ^[0-9]+$ ]]; then
+          log "enforcement probe: ruleset entry on '$BASE_REF' has a non-numeric id ('$rs_id') — not counting it"
+          continue
+        fi
+
+        # Endpoint selection from the OWNING scope (#781 item 1). Anything
+        # other than a repository or organization ruleset is not counted:
+        # an Enterprise ruleset is readable only through an enterprise-admin
+        # endpoint this token does not have, and an absent/unrecognized
+        # source type means the payload is not the shape this probe knows how
+        # to verify. Both are "cannot rule out" → conservative drop.
+        case "$rs_src_type" in
+          Repository)
+            rs_endpoint="repos/$REPO/rulesets/$rs_id"
+            ;;
+          Organization)
+            # $rs_src is interpolated into a URL path, so require a bare
+            # GitHub login shape — no slashes, no percent-escapes, nothing
+            # that could redirect the read at a different resource.
+            if ! [[ "$rs_src" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
+              log "enforcement probe: ruleset $rs_id on '$BASE_REF' is organization-owned but its ruleset_source ('$rs_src') is not a bare org login — not counting it"
+              continue
+            fi
+            rs_endpoint="orgs/$rs_src/rulesets/$rs_id"
+            ;;
+          *)
+            log "enforcement probe: ruleset $rs_id carries '$MERGE_CLEARANCE_CHECK_NAME' on '$BASE_REF' but its owning scope is '${rs_src_type:-<absent>}' (source '${rs_src:-<absent>}'), which this probe cannot read to verify bypass actors — not counting it"
+            continue
+            ;;
+        esac
+
         set +e
-        rs_out=$(gh api "repos/$REPO/rulesets/$rs_id" 2>"$err")
+        rs_out=$(gh api "$rs_endpoint" 2>"$err")
         rs_rc=$?
         set -e
         if [ "$rs_rc" -ne 0 ]; then
-          log "enforcement probe: ruleset $rs_id carries '$MERGE_CLEARANCE_CHECK_NAME' on '$BASE_REF' but could not be read for bypass actors (gh rc=$rs_rc) — not counting it: $(tr '\n' ' ' <"$err")"
+          log "enforcement probe: ruleset $rs_id carries '$MERGE_CLEARANCE_CHECK_NAME' on '$BASE_REF' but $rs_endpoint could not be read for bypass actors (gh rc=$rs_rc) — not counting it: $(tr '\n' ' ' <"$err")"
           continue
         fi
         set +e
-        # The key must be PRESENT and an ARRAY. `[ .bypass_actors[]? ] | length`
-        # yields 0 for a genuinely empty list AND for an absent key or a null /
-        # non-array value — so an unknown payload shape would have been recorded
-        # as positive proof of "no bypass actors". That is the one direction
-        # this probe must never move in; every other unknown here falls back
-        # conservatively. Flagged independently by both reviewers.
-        bypass_count=$(printf '%s' "$rs_out" \
-          | jq -r 'if (.bypass_actors | type) == "array" then (.bypass_actors | length) else "unknown" end' 2>"$err")
+        # Bypass-actor applicability (#781 item 11, refining #772 r2 P1).
+        #
+        # #772 r2 established that a bypass-capable ruleset must not count as
+        # enforcement, and implemented that as "ANY bypass actor disqualifies".
+        # That is sound but over-broad: a deployment App or a release Team in
+        # `bypass_actors` says nothing about whether the AUTHOR token running
+        # `gh pr merge` is unconstrained, so a genuinely protected merge was
+        # blocked. This narrows the rule to actors that provably cannot BE the
+        # merging identity, and leaves every other case exactly where #772 r2
+        # put it. The full decision, including the alternatives weighed, is
+        # recorded in
+        # docs/architecture/0002-merge-clearance-bypass-actor-applicability.md.
+        #
+        # The list is an ALLOWLIST of provably-inapplicable forms, never a
+        # blocklist: anything not named here — including an actor_type GitHub
+        # adds after this was written — falls through to "cannot rule out" and
+        # disqualifies the ruleset. Per actor type:
+        #
+        #   DeployKey       — RULED OUT. Deploy keys authenticate git transport
+        #                     only; the REST/GraphQL API rejects them, so a
+        #                     deploy key can never perform the PR merge whose
+        #                     protection this probe is asserting.
+        #   Integration     — RULED OUT when actor_id is a number other than
+        #                     $MERGE_CLEARANCE_EXPECTED_APP_ID. A GitHub App is
+        #                     a different principal from the user account
+        #                     `author_identity`, and REVIEW_POLICY.md §
+        #                     Automated merge identity requires the merge to run
+        #                     under an AUTHOR_MERGE_TOKEN verified to resolve to
+        #                     that user. The trusted Actions app is EXCLUDED
+        #                     from the rule-out because workflow steps in this
+        #                     repo do authenticate as it.
+        #   OrganizationAdmin, RepositoryRole, Team
+        #                   — NOT ruled out. Each is a SET of accounts that can
+        #                     contain `author_identity`, and deciding membership
+        #                     needs org/collaborator/team reads this token is not
+        #                     guaranteed to have — and membership can change
+        #                     between this probe and the merge. Fail closed.
+        #   anything else / missing actor_type
+        #                   — NOT ruled out.
+        #
+        # Every rule-out additionally requires the merging identity to be KNOWN
+        # and to be a user account: with `author_identity` absent from the
+        # governing policy, or set to a `[bot]` login, the "an App is not the
+        # merger" premise does not hold, so nothing is ruled out and behaviour
+        # is byte-identical to #772 r2.
+        #
+        # The `bypass_actors` key must still be PRESENT and an ARRAY.
+        # `[ .bypass_actors[]? ]` yields an empty list for an absent key or a
+        # null / non-array value too, so an unknown payload shape would be
+        # recorded as positive proof of "no bypass actors" — the one direction
+        # this probe must never move in (#772 r4).
+        rs_blocking=$(printf '%s' "$rs_out" \
+          | jq -r --arg app "$MERGE_CLEARANCE_EXPECTED_APP_ID" \
+                  --arg author "$MERGE_CLEARANCE_AUTHOR_IDENTITY" '
+            if (.bypass_actors | type) != "array" then "__unknown_shape__"
+            else
+              (($author | length) > 0 and (($author | test("\\[bot\\]$")) | not)) as $merger_known
+              | [ .bypass_actors[]
+                  | (.actor_type // "" | tostring) as $t
+                  | .actor_id as $id
+                  | if $merger_known and $t == "DeployKey" then empty
+                    elif $merger_known and $t == "Integration"
+                         and ($id | type) == "number"
+                         and (($id | tostring) != $app) then empty
+                    else (if $t == "" then "<no actor_type>" else $t end)
+                    end ]
+              | if length == 0 then "__none__" else (unique | join(", ")) end
+            end' 2>"$err")
         rs_rc=$?
         set -e
-        # An empty or non-numeric count means the payload was not the ruleset
-        # object we expected; that is not proof of zero bypass actors.
-        if [ "$rs_rc" -ne 0 ] || ! [[ "$bypass_count" =~ ^[0-9]+$ ]]; then
-          log "enforcement probe: could not read bypass actors for ruleset $rs_id (got '${bypass_count:-}') — not counting it: $(tr '\n' ' ' <"$err")"
-        elif [ "$bypass_count" -gt 0 ]; then
-          log "enforcement probe: ruleset $rs_id requires '$MERGE_CLEARANCE_CHECK_NAME' but declares $bypass_count bypass actor(s), so it does not provably constrain the merging identity — not counting it"
+        if [ "$rs_rc" -ne 0 ] || [ -z "$rs_blocking" ]; then
+          log "enforcement probe: could not evaluate bypass actors for ruleset $rs_id — not counting it: $(tr '\n' ' ' <"$err")"
+        elif [ "$rs_blocking" = "__unknown_shape__" ]; then
+          log "enforcement probe: ruleset $rs_id does not expose a bypass_actors array — not counting it"
+        elif [ "$rs_blocking" != "__none__" ]; then
+          log "enforcement probe: ruleset $rs_id requires '$MERGE_CLEARANCE_CHECK_NAME' but declares bypass actor(s) whose applicability to the merging identity '${MERGE_CLEARANCE_AUTHOR_IDENTITY:-<unknown>}' cannot be ruled out ($rs_blocking) — not counting it"
         else
           contexts="$contexts$MERGE_CLEARANCE_CHECK_NAME"$'\n'
         fi
       done <<EOF
-$ruleset_ids
+$ruleset_recs
 EOF
     fi
   fi
@@ -773,6 +899,18 @@ case "$POLICY_CONFIG" in
   "$CONFIG") ;;
   *) BASE_POLICY_TMP="$POLICY_CONFIG" ;;
 esac
+
+# The account that runs the final `gh pr merge` (#781 item 11). Read from the
+# GOVERNING policy, same as every other gating input, because that is the value
+# REVIEW_POLICY.md § Automated merge identity requires AUTHOR_MERGE_TOKEN to
+# resolve to before any automated merge, and the value gh-pr-guard.sh enforces
+# on manual author writes. It is used ONLY to rule bypass actors OUT in the
+# enforcement probe; absent or unparseable, nothing is ruled out and the probe
+# keeps the stricter #772 r2 behaviour. Quote-tolerant, matching the sibling
+# policy parsers.
+MERGE_CLEARANCE_AUTHOR_IDENTITY=$(grep -m1 '^author_identity:' "$POLICY_CONFIG" 2>/dev/null \
+  | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)
+MERGE_CLEARANCE_AUTHOR_IDENTITY=${MERGE_CLEARANCE_AUTHOR_IDENTITY:-}
 
 DEPENDABOT_GATE_ENABLED=$(nested_field dependabot reviewer_gate enabled)
 DEPENDABOT_GATE_ENABLED=${DEPENDABOT_GATE_ENABLED:-false}
