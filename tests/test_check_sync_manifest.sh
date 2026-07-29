@@ -1136,7 +1136,10 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   # block surfaces as prose — a required check failing on a `#NN` that is
   # code. Containers are therefore tracked as a stack and popped at block
   # boundaries, so identical markdown classifies identically wherever it
-  # sits in the nesting.
+  # sits in the nesting. An EMPTY item closes on its own rule: CommonMark
+  # lets a list item begin with at most one blank line, so a bare marker
+  # followed by a blank ends the list and the base indent returns to the
+  # ENCLOSING container — one level, not all the way to column zero.
   #
   # Inline code spans are matched by delimiter RUN LENGTH for the same
   # reason fences are, but note the closing rule DIFFERS by design and
@@ -1168,6 +1171,14 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         sub(/[^ \t].*$/, "", indent)
         rest = substr(line, length(indent) + 1)
         ind = visual_indent(indent)
+
+        # An empty item is decided by the line AFTER the marker, so the
+        # flag the marker branch sets is read here, one line later, and
+        # cleared unconditionally: any non-blank line — prose, a fence, an
+        # indented line, anything — means the item HAS content and stays
+        # open. Only the blank-line branch below acts on it.
+        opened_empty_item = empty_item
+        empty_item = 0
 
         is_delim = 0
         if (ind < 4) {
@@ -1202,7 +1213,24 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
 
         # A blank line closes an open paragraph but NOT an indented code
         # block: a blank inside one is part of the block.
-        if (rest == "") { para = 0; print ""; next }
+        #
+        # It DOES close an empty list item. Per CommonMark a list item may
+        # begin with at most one blank line, so a marker with nothing after
+        # it followed by a blank ends the list, and the base indent returns
+        # to the enclosing container. Opening that item without ever
+        # closing it leaves the threshold too deep, and the indented code
+        # block that follows is emitted as prose — the same false-positive
+        # direction the stack above exists to prevent, on the very
+        # construct that introduced it.
+        if (rest == "") {
+          para = 0
+          if (opened_empty_item && depth > 0) {
+            depth--
+            list_indent = 0
+            if (depth > 0) list_indent = stack[depth]
+          }
+          print ""; next
+        }
 
         if (indented_code) {
           if (ind >= indented_code_min) { print ""; next }
@@ -1260,13 +1288,31 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         # awk program has to behave the same under every awk CI runs on.
         # A marker with a non-blank hard against it (`-x`, `1.5`) is not
         # a list marker at all and leaves the container untouched.
-        if (ind < list_indent + 4 && match(rest, /^([-*+]|[0-9]+[.)])/)) {
+        #
+        # The four columns are counted from the container the line is
+        # actually INSIDE, which is not always the innermost OPEN one:
+        # popping is deferred inside a paragraph, so a lazy continuation
+        # line can sit left of a container that is still on the stack.
+        # Measuring from that stale-deep container admits a marker
+        # CommonMark does not see — four or more columns past the
+        # container the line is really in, the text is indented-code
+        # shaped, and indented code cannot interrupt a paragraph, so the
+        # line is continuation TEXT. Rewriting the stack from a line that
+        # is not a marker leaves every later threshold measured from the
+        # wrong place. At a block boundary the loop above has already
+        # popped, so this is the same number `list_indent` holds.
+        marker_base = 0
+        base_depth = depth
+        while (base_depth > 0 && stack[base_depth] > ind) base_depth--
+        if (base_depth > 0) marker_base = stack[base_depth]
+        if (ind < marker_base + 4 && match(rest, /^([-*+]|[0-9]+[.)])/)) {
           marker_width = RLENGTH
           tail = substr(rest, RLENGTH + 1)
           gap = tail
           sub(/[^ \t].*$/, "", gap)
           if (tail == gap) {
             marker_width = marker_width + 1
+            empty_item = 1
           } else if (gap != "") {
             marker_width = marker_width + length(gap)
           } else {
@@ -1712,8 +1758,101 @@ OUTDENT_EOF
     pass "Case 45: a nested list closes on outdent, so the outer item's indented code is still excluded"
   fi
 
+  # Case 46: an EMPTY list item closes at the next blank line.
+  #
+  # Case 44 pins that a bare marker OPENS a container; nothing pinned that
+  # it ever closes, and an item that is opened but never closed leaves the
+  # threshold permanently too deep. Per CommonMark a list item may begin
+  # with at most one blank line, so a bare marker followed by a blank ENDS
+  # the list and the base indent returns to the enclosing container.
+  #
+  # Both directions of "enclosing" are pinned, because a close that
+  # over-shoots to column zero is as wrong as no close at all. Line 3 is
+  # at the top level, so line 5 is a top-level indented code block four
+  # columns in. Line 9 is nested inside `- outer`, so closing it must
+  # return to that item's content indent of 2 and NOT to zero, which is
+  # what makes the six-space line 11 that item's code and leaves the
+  # two-space line 13 its prose.
+  #
+  # Keeping the empty item open instead puts the cut-off at 4 and 8, both
+  # short of those lines, and each is emitted as prose — a FALSE POSITIVE
+  # failing a required check on a `#NN` that is code. Expected
+  # classifications come from markdown-it-py in commonmark mode, which
+  # renders lines 5 and 11 inside `<pre><code>`.
+  CLOSE_DOC="$WORKDIR/consumer-truth-empty-close.md"
+  cat > "$CLOSE_DOC" <<'CLOSE_EOF'
+# Doc
+
+-
+
+    Code after the empty item mentioning #111.
+
+- outer
+
+  -
+
+      Code back in the outer item mentioning #222.
+
+  Outer continuation mentioning #333.
+
+And a bare #444 in prose is.
+CLOSE_EOF
+  set +e
+  close_hits=$(md_prose_only "$CLOSE_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  close_lines=$(md_prose_only "$CLOSE_DOC" | wc -l | tr -d ' ')
+  close_raw=$(wc -l < "$CLOSE_DOC" | tr -d ' ')
+  set -e
+  if [ "$close_hits" != "13,15," ]; then
+    fail "Case 46: expected lines 13,15 flagged (a blank closes the empty item, so lines 5 and 9 open no lasting container), got '$close_hits'"
+  elif [ "$close_lines" != "$close_raw" ]; then
+    fail "Case 46: md_prose_only must emit one line per input line, got $close_lines for $close_raw"
+  else
+    pass "Case 46: an empty list item closes at the next blank line, so the code that follows is still excluded"
+  fi
+
+  # Case 47: a marker is measured from the container the line is IN.
+  #
+  # Line 4 looks like a marker but is not one. The item opened on line 3
+  # has its content indent at 5, so a line at 4 columns is outdented back
+  # out of that item, and against the enclosing container — the document —
+  # four columns is indented-code shaped. Indented code cannot interrupt a
+  # paragraph, so CommonMark reads line 4 as continuation TEXT of line 3's
+  # paragraph, which is why it renders inside the same `<p>`.
+  #
+  # Measuring the marker allowance against the innermost OPEN container
+  # instead accepts it, and a line that is not a marker then rewrites the
+  # container stack: it discards the real item at 5 and opens its own. Once
+  # closing is honest — case 46 — the phantom is closed at line 5 too, and
+  # the stack is left empty. Line 6 is then four columns past nothing
+  # rather than three columns inside the item, blanked as code, and its
+  # `#222` ships unflagged. That is the UNDER-reporting direction, the one
+  # this parser must never take, so the allowance is counted from the
+  # container the line is actually inside. At a block boundary the two are
+  # the same number, which is why cases 41 and 43 are unmoved.
+  BASE_DOC="$WORKDIR/consumer-truth-marker-base.md"
+  cat > "$BASE_DOC" <<'BASE_EOF'
+# Doc
+
+   * item mentioning #111
+    10.
+
+        Prose in that item mentioning #222.
+BASE_EOF
+  set +e
+  base_hits=$(md_prose_only "$BASE_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  base_lines=$(md_prose_only "$BASE_DOC" | wc -l | tr -d ' ')
+  base_raw=$(wc -l < "$BASE_DOC" | tr -d ' ')
+  set -e
+  if [ "$base_hits" != "3,6," ]; then
+    fail "Case 47: expected lines 3,6 flagged (line 4 is continuation text, not a marker, so the item stays open), got '$base_hits'"
+  elif [ "$base_lines" != "$base_raw" ]; then
+    fail "Case 47: md_prose_only must emit one line per input line, got $base_lines for $base_raw"
+  else
+    pass "Case 47: the marker allowance is measured from the container the line is inside, so a lazy continuation cannot rewrite the stack"
+  fi
+
 else
-  echo "SKIP: Cases 36-45 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-47 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
