@@ -344,13 +344,50 @@ else
   fail "separators inventing a hit: rc=$RC out=$OUT"
 fi
 
+# Case 21: a value that starts with a PATH character. Recognising the
+# value token by an allow-list of letters, digits, quotes and `$` waves
+# through every value the list forgot — and `user.signingkey`, the key
+# that decides which key signs every commit this repo makes, is
+# overwhelmingly given a path. All three of these are ordinary
+# repo-local writes of a checked key.
+run_on_fixture "tests/path-value.sh" '#!/usr/bin/env bash
+git config user.signingkey ~/.ssh/id_ed25519.pub
+git config user.signingkey /tmp/key.pub
+git config user.signingkey ./key.pub
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/path-value.sh:2" \
+  && printf '%s' "$OUT" | grep -q "tests/path-value.sh:3" \
+  && printf '%s' "$OUT" | grep -q "tests/path-value.sh:4"; then
+  pass "path-valued signingkey writes: caught"
+else
+  fail "path-valued signingkey writes: rc=$RC out=$OUT"
+fi
+
+# Case 22: the converse of case 21 — widening the value token must not
+# turn reads into hits. What follows the key on each of these lines is
+# an option, a comment, a redirection or a closing substitution, and
+# none of them is a value being written.
+run_on_fixture "tests/not-values.sh" '#!/usr/bin/env bash
+git config user.email --show-origin
+git config user.email  # which address is this repo using?
+git config user.email > /tmp/who
+who=$( git config user.email )
+echo "$who"
+'
+if [ "$RC" = "0" ]; then
+  pass "option / comment / redirection after the key: no false hit"
+else
+  fail "non-value token after the key: rc=$RC out=$OUT"
+fi
+
 # ── Part A: the live-repo identity assertion ──────────────────────────
 
 IDREPO="$WORKDIR/idrepo"
 git init -q -b main "$IDREPO"
 printf '#!/usr/bin/env bash\n' > "$IDREPO/marker.sh"
 
-# Case 21: a clean fixture repo passes.
+# Case 23: a clean fixture repo passes.
 set +e
 OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$IDREPO" bash "$CHECK" 2>&1)"
 RC=$?
@@ -361,7 +398,7 @@ else
   fail "fixture repo with no local identity: rc=$RC out=$OUT"
 fi
 
-# Case 22: the exact #777 corruption — a repo-local user block plus a
+# Case 24: the exact #777 corruption — a repo-local user block plus a
 # disabled gpgsign — must fail, naming every offending key.
 git -C "$IDREPO" config --local user.name "nathanjohnpayne"
 git -C "$IDREPO" config --local user.email "nathan@nathanjohnpayne.example"
@@ -380,7 +417,7 @@ else
   fail "repo-local identity override: rc=$RC out=$OUT"
 fi
 
-# Case 23: the remediation must clear the offenders it just reported.
+# Case 25: the remediation must clear the offenders it just reported.
 # `user.signingkey` and `tag.gpgsign` are checked keys, and `--worktree`
 # is a checked scope, so a fixed three-command `--local` block would
 # print instructions that clear nothing and leave the next run failing
@@ -419,7 +456,7 @@ else
   fail "remediation did not clear the failure: rc=$RC out=$OUT"
 fi
 
-# Case 24: the remediation must act on the repository that produced the
+# Case 26: the remediation must act on the repository that produced the
 # finding, not on wherever the operator is standing. The check is invoked
 # by absolute path and MERGEPATH_GIT_IDENTITY_ROOT repoints it, so the
 # inspected repo and the caller's cwd are routinely different — and a
@@ -453,7 +490,7 @@ else
   fail "remediation targeted the caller's repo: remedy='$REMEDY' offender='$OFF_LEFT' caller='$CALLER_LEFT'"
 fi
 
-# Case 25: a key explicitly set to the EMPTY string is an override too.
+# Case 27: a key explicitly set to the EMPTY string is an override too.
 # It is not "unset": it MASKS the machine's global value, after which
 # `git var GIT_AUTHOR_IDENT` fails outright with "empty ident name", so
 # treating an empty captured value as "nothing configured" would wave
@@ -473,7 +510,7 @@ else
   fail "empty-string local identity value: rc=$RC out=$OUT"
 fi
 
-# Case 26: an identity key reached through an `include.path`. A
+# Case 28: an identity key reached through an `include.path`. A
 # scope-restricted read has includes OFF by default, so
 # `--local --get-all user.email` reports nothing here — while ordinary
 # lookup, and therefore every commit this repo makes, uses the included
@@ -514,7 +551,94 @@ else
   fail "include.path remediation: remedy='$REMEDY' rc=$RC out=$OUT"
 fi
 
-# Case 27: the documented opt-out for a checkout that wants its own
+# Case 29: a CONDITIONAL include whose condition does not match this
+# checkout. `--includes` evaluates `includeIf` against the current
+# branch, so an `includeIf "onbranch:release"` target that sets
+# user.email reads as absent while the check runs on `main` — and takes
+# effect in full the moment someone checks `release` out. Nothing is
+# written at that moment, so there is no later event for the guard to
+# catch and the next commit is simply misattributed. The entry sits in
+# the repository's own config either way, which is the invariant the
+# check states: no local identity override, not "none active right now".
+CONDREPO="$WORKDIR/condrepo"
+git init -q -b main "$CONDREPO"
+printf '[user]\n\temail = release@example.com\n' > "$CONDREPO/.git/release-identity"
+git -C "$CONDREPO" config --local includeIf.onbranch:release.path release-identity
+# `|| true`: a scope-restricted lookup exits 1 when the key is absent,
+# which is exactly the state being asserted.
+ACTIVE="$(git -C "$CONDREPO" config --local --includes --get user.email || true)"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$CONDREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ -z "$ACTIVE" ] \
+  && [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "local: user.email = release@example.com" \
+  && printf '%s' "$OUT" | grep -q "via inactive include:"; then
+  pass "identity behind an inactive includeIf: caught while its condition is off"
+else
+  fail "inactive includeIf identity: active='$ACTIVE' rc=$RC out=$OUT"
+fi
+
+# ... and the printed command must clear it, the same as for an active
+# include: `--local --unset-all` does not reach into an include target.
+REMEDY="$(printf '%s\n' "$OUT" | grep -E '^[[:space:]]+git .*--unset-all' | head -1 || true)"
+set +e
+eval "$REMEDY" >/dev/null 2>&1
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$CONDREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ -n "$REMEDY" ] && [ "$RC" = "0" ]; then
+  pass "inactive includeIf remediation: the printed command clears the failure"
+else
+  fail "inactive includeIf remediation: remedy='$REMEDY' rc=$RC out=$OUT"
+fi
+
+# Case 30: the identity sits one hop further down. The conditional
+# target only pulls in a third file, and that file carries the keys —
+# so a walk that stopped at the first hop would report nothing.
+NESTREPO="$WORKDIR/nestrepo"
+git init -q -b main "$NESTREPO"
+printf '[user]\n\temail = nested@example.com\n' > "$NESTREPO/.git/nested-identity"
+printf '[include]\n\tpath = nested-identity\n' > "$NESTREPO/.git/release-identity"
+git -C "$NESTREPO" config --local includeIf.onbranch:release.path release-identity
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NESTREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "local: user.email = nested@example.com" \
+  && printf '%s' "$OUT" | grep -q "nested-identity"; then
+  pass "identity two hops behind an inactive includeIf: caught"
+else
+  fail "nested inactive include: rc=$RC out=$OUT"
+fi
+
+# Case 31: the unconditional walk must not double-report. An `includeIf`
+# whose condition DOES match is found by the ordinary `--includes`
+# lookup and reached a second time by the walk, so the same value would
+# be listed twice — once as active, once as inactive — and the operator
+# would be handed a duplicate remediation for a single override.
+ACTREPO="$WORKDIR/actrepo"
+git init -q -b release "$ACTREPO"
+printf '[user]\n\temail = active@example.com\n' > "$ACTREPO/.git/release-identity"
+git -C "$ACTREPO" config --local includeIf.onbranch:release.path release-identity
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$ACTREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+N_ENTRIES="$(printf '%s\n' "$OUT" | grep -c "user.email = active@example.com" || true)"
+N_REMEDIES="$(printf '%s\n' "$OUT" | grep -c -- "--unset-all user.email" || true)"
+if [ "$RC" = "1" ] \
+  && [ "$N_ENTRIES" -eq 1 ] \
+  && [ "$N_REMEDIES" -eq 1 ] \
+  && ! printf '%s' "$OUT" | grep -q "via inactive include:"; then
+  pass "active includeIf: reported once, as an active include"
+else
+  fail "active includeIf double-reported: entries=$N_ENTRIES remedies=$N_REMEDIES rc=$RC out=$OUT"
+fi
+
+# Case 32: the documented opt-out for a checkout that wants its own
 # identity on purpose.
 set +e
 OUT="$(MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 MERGEPATH_GIT_IDENTITY_ROOT="$IDREPO" bash "$CHECK" 2>&1)"
@@ -526,7 +650,7 @@ else
   fail "MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1: rc=$RC out=$OUT"
 fi
 
-# Case 28: clearing the override restores a clean result — the guard
+# Case 33: clearing the override restores a clean result — the guard
 # tracks live state rather than latching.
 git -C "$IDREPO" config --local --unset-all user.name
 git -C "$IDREPO" config --local --unset-all user.email
@@ -543,7 +667,7 @@ fi
 
 # ── Part B: the .git/config baseline comparison ────────────────────────
 
-# Case 29: --snapshot records a baseline and a later run confirms the
+# Case 34: --snapshot records a baseline and a later run confirms the
 # config has not moved. This is the assertion that "running the suite
 # leaves .git/config byte-identical" once the snapshot is taken before
 # the suite and the plain run after it.
@@ -567,7 +691,7 @@ else
   fail "unmodified .git/config: rc=$RC out=$OUT"
 fi
 
-# Case 30: any write to .git/config between snapshot and check fails,
+# Case 35: any write to .git/config between snapshot and check fails,
 # including one the identity assertion would not catch on its own.
 git -C "$IDREPO" config --local core.bigFileThreshold 123m
 set +e
@@ -599,7 +723,7 @@ echo "stub suite: ok"
 exit 0
 EOF
 
-# Case 31: a suite that writes a non-identity key is caught by the
+# Case 36: a suite that writes a non-identity key is caught by the
 # post-suite baseline comparison.
 PAGERREPO="$WORKDIR/pagerrepo"
 git init -q -b main "$PAGERREPO"
@@ -617,7 +741,7 @@ else
   fail "post-suite baseline comparison: rc=$RC out=$OUT"
 fi
 
-# Case 32: a suite that writes an identity key is caught by the
+# Case 37: a suite that writes an identity key is caught by the
 # post-suite live-repo assertion, even with no baseline recorded.
 IDENTSTUB="$WORKDIR/stub-suite-identity.sh"
 cat > "$IDENTSTUB" <<'EOF'
@@ -640,7 +764,7 @@ else
   fail "post-suite identity assertion: rc=$RC out=$OUT"
 fi
 
-# Case 33: the post-suite pass must not turn a clean suite red.
+# Case 38: the post-suite pass must not turn a clean suite red.
 CLEANSTUB="$WORKDIR/stub-suite-clean.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$CLEANSTUB"
 CLEANREPO="$WORKDIR/cleanrepo"

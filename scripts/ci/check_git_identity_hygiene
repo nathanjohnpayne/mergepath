@@ -32,13 +32,19 @@
 #      GIT_AUTHOR_IDENT` then fails with "empty ident name". The lookup
 #      passes --includes, because a scope-restricted read has includes
 #      OFF by default and an `include.path` that sets user.email is a
-#      local-scope override that every commit obeys. The failure names
-#      each offender and prints the exact unset command for it — aimed
-#      at the repository that was inspected (`git -C <repo>`, which is
-#      not necessarily the caller's cwd) and at the file that actually
-#      holds the value, which for an included value is that file rather
-#      than the parent config. Set MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1
-#      to opt out on a checkout that genuinely wants a per-repo identity.
+#      local-scope override that every commit obeys. It then walks the
+#      scope's include graph a SECOND time ignoring the conditions,
+#      because --includes evaluates an `includeIf` against the current
+#      checkout: an `includeIf "onbranch:release"` target that sets
+#      user.email reads as absent on `main` and applies the moment that
+#      branch is checked out, with no write at that moment for a later
+#      run to catch. The failure names each offender and prints the exact
+#      unset command for it — aimed at the repository that was inspected
+#      (`git -C <repo>`, which is not necessarily the caller's cwd) and
+#      at the file that actually holds the value, which for an included
+#      value is that file rather than the parent config. Set
+#      MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 to opt out on a checkout that
+#      genuinely wants a per-repo identity.
 #
 #   B. Baseline comparison (`--snapshot`, then a later plain run).
 #      `--snapshot` copies .git/config to a scratch path inside the git
@@ -205,6 +211,64 @@ scope_file() {
   esac
 }
 
+# Resolve an include target the way git does: `~/…` against the
+# operator's home, a RELATIVE path against the directory of the file that
+# declared the include (not the repo root and not the caller's cwd), an
+# absolute path unchanged. An unresolvable spelling (`~user/…`) yields a
+# path that fails the `-f` test below and is skipped rather than guessed.
+resolve_include_path() {
+  local raw="$1" parent="$2"
+  case "$raw" in
+    '~/'*)
+      [ -n "${HOME:-}" ] || return 1
+      raw="$HOME/${raw#\~/}"
+      ;;
+  esac
+  case "$raw" in
+    /*) printf '%s\n' "$raw" ;;
+    *) printf '%s\n' "$(dirname -- "$parent")/$raw" ;;
+  esac
+}
+
+# Every file a config file can pull values in from, following BOTH
+# `include.path` and `includeIf.<condition>.path`, and IGNORING the
+# conditions. Canonical paths are appended to INCLUDE_FILES, one per line.
+#
+# Ignoring the conditions is the point. `git config --includes` evaluates
+# an `includeIf` against the CURRENT checkout — its branch, its gitdir,
+# its remote URL — so an `includeIf "onbranch:release"` whose target sets
+# user.email reports nothing while the check runs on `main`, and applies
+# the instant someone checks `release` out. No further write happens at
+# that moment, so there is no later event for this guard to catch: the
+# next commit is simply misattributed. The entry lives in the
+# repository's own config either way, and that is the invariant being
+# asserted — this repository carries no local identity override, not
+# "none of them is active this second".
+INCLUDE_FILES=""
+collect_include_targets() {
+  local file="$1" depth="$2" rec raw target
+  # git's own include-recursion cap; with the already-collected test
+  # below it is also the brake on an include cycle.
+  [ "$depth" -lt 10 ] || return 0
+  [ -f "$file" ] || return 0
+  while IFS= read -r -d '' rec; do
+    # A `-z` record is "<key>\n<value>". A record with no newline is a
+    # valueless key, which names no file.
+    [ "$rec" != "${rec#*$'\n'}" ] || continue
+    raw="${rec#*$'\n'}"
+    [ -n "$raw" ] || continue
+    target="$(resolve_include_path "$raw" "$file")" || continue
+    target="$(canonical_path "$target")"
+    [ -f "$target" ] || continue
+    case $'\n'"$INCLUDE_FILES" in
+      *$'\n'"$target"$'\n'*) continue ;;
+    esac
+    INCLUDE_FILES+="$target"$'\n'
+    collect_include_targets "$target" "$((depth + 1))"
+  done < <(git -C "$REPO_ROOT" config --file "$file" -z \
+             --get-regexp '^(include|includeif\..*)\.path$' 2>/dev/null)
+}
+
 if [ "$MODE" = "snapshot" ]; then
   if ! CFG="$(config_path)" || [ ! -f "$CFG" ]; then
     echo "check_git_identity_hygiene: SKIP (--snapshot: no git config at $REPO_ROOT)"
@@ -233,7 +297,8 @@ assert_no_local_identity() {
   fi
 
   local offenders="" remedies="" scope key line origin originfile value
-  local entry remedy scopefile scopes via_include=0
+  local entry remedy scopefile scopes via_include=0 via_conditional=0
+  local seen_values="" dedupe incfile
   # `--worktree` is a DISTINCT scope only when extensions.worktreeConfig
   # is enabled; with the extension off git treats it as an alias for
   # `--local`, so probing both would report every local setting twice and
@@ -316,13 +381,48 @@ assert_no_local_identity() {
           *$'\n'"$remedy"$'\n'*) ;;
           *) remedies+="$remedy"$'\n' ;;
         esac
+        # What the conditional-include pass below compares against, so an
+        # include whose condition IS active is not reported twice.
+        seen_values+="$key"$'\037'"${originfile:-$scopefile}"$'\037'"$value"$'\n'
       done < <(git -C "$REPO_ROOT" config "--$scope" --includes --show-origin \
                  --get-all "$key" 2>/dev/null)
     done
+
+    # Everything the pass above cannot see: the targets of conditional
+    # includes whose condition does not match this checkout right now.
+    # Each file is read with `--file` and WITHOUT `--includes`, so it
+    # contributes only its own values and the walk supplies the rest.
+    INCLUDE_FILES=""
+    [ -z "$scopefile" ] || collect_include_targets "$scopefile" 0
+    while IFS= read -r incfile; do
+      [ -n "$incfile" ] || continue
+      for key in $IDENTITY_KEYS; do
+        while IFS= read -r value; do
+          dedupe="$key"$'\037'"$incfile"$'\037'"$value"
+          case $'\n'"$seen_values" in
+            *$'\n'"$dedupe"$'\n'*) continue ;;
+          esac
+          seen_values+="$dedupe"$'\n'
+          if [ -n "$value" ]; then
+            entry="  $scope: $key = $value (via inactive include: $incfile)"
+          else
+            entry="  $scope: $key = (set to the empty string) (via inactive include: $incfile)"
+          fi
+          remedy="    git -C \"$REPO_ROOT\" config --file \"$incfile\" --unset-all $key"
+          via_conditional=1
+          offenders+="$entry"$'\n'
+          case $'\n'"$remedies" in
+            *$'\n'"$remedy"$'\n'*) ;;
+            *) remedies+="$remedy"$'\n' ;;
+          esac
+        done < <(git -C "$REPO_ROOT" config --file "$incfile" \
+                   --get-all "$key" 2>/dev/null)
+      done
+    done <<< "$INCLUDE_FILES"
   done
   [ -n "$offenders" ] || return 0
 
-  local preamble="" include_note=""
+  local preamble="" include_note="" conditional_note=""
   if [ "$phase" = "post-suite" ]; then
     preamble="These were NOT present before the regression suite ran, so the suite
 itself wrote them into this repository's config.
@@ -336,6 +436,18 @@ this repository's config. A scope-level \`--unset-all\` does not edit an
 include target, which is why their command names the included file with
 \`--file\`. If that file is shared with other repositories, drop the
 \`include.path\` entry here instead of emptying the file they all read.
+"
+  fi
+  if [ "$via_conditional" -eq 1 ]; then
+    conditional_note="
+Values marked \`via inactive include\` sit in a file this repository's
+config pulls in through a conditional \`includeIf\`. \`git config
+--includes\` evaluates that condition against the CURRENT checkout, so
+the override reads as absent today and applies the moment the condition
+matches — checking a branch out is enough. Nothing is written at that
+moment, so there is no later event for this check to catch: the next
+commit is simply misattributed. Clear the file as printed, or drop the
+\`includeIf\` entry from this repository's config.
 "
   fi
   cat >&2 <<EOF
@@ -353,7 +465,7 @@ $offenders
 Clear them (the values are not recoverable afterwards, so read them
 first if one was deliberate):
 
-$remedies${include_note}
+$remedies${include_note}${conditional_note}
 If this checkout genuinely wants a per-repo identity, set
 MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 for the check.
 EOF
@@ -464,8 +576,28 @@ else
     # followed by whitespace and a value token. `-c user.email=t@t` uses
     # `=` and never matches; `$(git config user.email)` has no following
     # token and never matches.
+    #
+    # The token is defined by what it is NOT, because an allow-list of
+    # value-opening characters silently exempts every value that starts
+    # with something the list forgot: `git config user.signingkey
+    # ~/.ssh/id_ed25519.pub` and `git config user.signingkey /tmp/key.pub`
+    # are ordinary repo-local writes of a checked key, and a list of
+    # letters, digits, quotes and `$` recognises neither. So a value is
+    # anything except the five tokens that mean "no value here":
+    #   -    an option, not a value (`--global`, `--get`, `--show-origin`,
+    #        `--type=bool`); the ones that actually suppress are handled
+    #        by targeted() and not_a_write() below;
+    #   #    a shell comment — the command ended at the key, so it was
+    #        a read;
+    #   ` )  a closing command substitution or Markdown code span;
+    #   < >  a redirection, whose target is not a value for the key;
+    #   \    a line continuation — the value is on the NEXT physical line
+    #        and the join below already covers it. Reading the backslash
+    #        as a value would report the FIRST physical line of a
+    #        continued command, which is precisely the line that cannot
+    #        carry the trailing `#` exemption marker.
     function writes_identity(s) {
-      return (s ~ /(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)[[:space:]]+["'"'"'$A-Za-z0-9]/)
+      return (s ~ /(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)[[:space:]]+[^-[:space:]#`)<>\\]/)
     }
     # Explicitly targets some other repository or an out-of-repo scope.
     function targeted(s) {
