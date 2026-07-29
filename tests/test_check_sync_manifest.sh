@@ -1375,7 +1375,527 @@ SPAN_EOF
     pass "Case 40: inline code spans strip by delimiter run length (``#NN`` is code, unmatched run is prose)"
   fi
 
-  # Case 41: tell (b)'s hub-only doc set tracks the live manifest.
+  # Case 41: the `## Path taken` carve-out is stated in a PROPAGATED doc.
+  #
+  # Two canonical docs travel to every consumer and, read together, used
+  # to contradict each other: decision-records.md MANDATES a
+  # `## Path taken` section in the PR body when a change reverses
+  # direction, while the shared operating rules ban narrating the
+  # session's path in a description — a ban whose own wording covers
+  # descriptions, not just titles. The reconciliation is a carve-out
+  # naming that section explicitly, and it only helps a consumer if it
+  # rides along with the halves it reconciles.
+  #
+  # docs/agents/operating-rules.md is per-repo-owned (see the
+  # doc_ownership block) and carries its own copy of the same narration
+  # rule, so a carve-out written only there reaches nobody: every
+  # consumer would receive both halves of the contradiction and none of
+  # the resolution. This case pins the carve-out to the canonical file
+  # AND to the section it qualifies, so a later edit cannot quietly move
+  # it back into the un-propagated overlay
+  # (nathanjohnpayne/mergepath#788).
+  SOR_PATH="docs/agents/shared-operating-rules.md"
+  NARRATION_HEADING="## PR and issue titles/descriptions: describe the work, not the session"
+  set +e
+  sor_rows=$(yq -r "
+    .paths[]
+    | select(.path == \"$SOR_PATH\")
+    | (.type // \"null\") + \"|\" + (.consumers | (select(tag == \"!!str\") // (join(\",\"))) | tostring)
+  " "$LIVE_MANIFEST"); rc=$?
+  set -e
+  if [ ! -f "$ROOT/$SOR_PATH" ]; then
+    fail "Case 41: $SOR_PATH missing on disk"
+  elif [ "$rc" != "0" ] || [ "$sor_rows" != "canonical|all" ]; then
+    fail "Case 41: expected 'canonical|all' for $SOR_PATH, got (rc=$rc) '$sor_rows'"
+  else
+    # Extract the narration section only — heading line exclusive, up to
+    # the next level-2 heading — so a mention anywhere else in the file
+    # cannot satisfy the assertion.
+    #
+    # BOTH tokens are required, and the conjunction is the point: the
+    # heading alone can be named in passing (a "see also" line), and the
+    # doc path alone does not say which of its rules is exempt. A
+    # section that carries only one of them has lost the carve-out even
+    # though it still mentions its vocabulary.
+    narration_sec=$(awk -v h="$NARRATION_HEADING" '
+      index($0, h) == 1 { in_sec = 1; next }
+      in_sec && /^## / { exit }
+      in_sec { print }
+    ' "$ROOT/$SOR_PATH")
+    set +e
+    carve_heading=$(printf '%s\n' "$narration_sec" | grep -cF '## Path taken')
+    carve_doc=$(printf '%s\n' "$narration_sec" | grep -cF 'docs/agents/decision-records.md')
+    set -e
+    if [ -z "$narration_sec" ]; then
+      fail "Case 41: $SOR_PATH has no '$NARRATION_HEADING' section"
+    elif [ "${carve_heading:-0}" -lt 1 ] || [ "${carve_doc:-0}" -lt 1 ]; then
+      fail "Case 41: $SOR_PATH § narration rule does not carve out '## Path taken' per docs/agents/decision-records.md (heading hits=${carve_heading:-0}, doc hits=${carve_doc:-0}) — the reconciliation would be unreachable by consumers (nathanjohnpayne/mergepath#788)"
+    else
+      pass "Case 41: the '## Path taken' narration carve-out is stated in the propagated shared rules"
+    fi
+  fi
+
+  # Case 42: the carve-out has exactly ONE authored source, and the hub
+  # overlay reaches it by pointer rather than by copy.
+  #
+  # The narration ban itself still exists twice on the hub: once in the
+  # canonical shared core (propagated to every consumer) and once in
+  # docs/agents/operating-rules.md, the per-repo-owned LOCAL OVERLAY that
+  # carries its own copy pending the #780 split. That duplication is
+  # tracked debt with a sequenced removal (#780 steps 4-5, canary-first).
+  # The carve-out is NOT allowed to join it.
+  #
+  # An earlier revision of this case did the opposite: it hand-mirrored
+  # the carve-out into the overlay and then required the two copies to
+  # stay byte-identical. That is two authored sources for one rule,
+  # against `docs/agents/code-modification-rules.md` § "Never duplicate
+  # logic or instructions", and it enforces by test exactly the hand
+  # synchronization the #780 ownership split exists to end — nothing
+  # propagates between the two files, so the only thing holding them
+  # together would be a byte-compare no consumer benefits from.
+  #
+  # The right shape, and what this case pins: the overlay POINTS at the
+  # canonical carve-out. `AGENTS.md` orders the shared core (entry 2)
+  # ahead of the overlay (entry 3), so an agent reaching the overlay has
+  # already read the carve-out; the pointer is what stops the overlay's
+  # remaining ban bullets reading as a flat ban on their own. Three
+  # assertions, and the conjunction is the point:
+  #
+  #   (1) the canonical file still authors BOTH halves — the carve-out
+  #       bullet and the struck-criterion annotation it exempts outside
+  #       the heading — so "delete the overlay copy" cannot be satisfied
+  #       by deleting the rule from both files;
+  #   (2) the overlay restates NEITHER half, anywhere in the file, so a
+  #       future edit cannot re-mirror it under a different heading;
+  #   (3) the overlay's narration section names the canonical file AND
+  #       the carved-out heading, so what remains is a working pointer
+  #       rather than a silent deletion that leaves the ban flat
+  #       (nathanjohnpayne/mergepath#794).
+  CARVE_MARKER="- One narration-shaped section is carved out by name:"
+  CRIT_MARKER='- [ ] ~~<criterion>~~ — Discarded YYYY-MM-DD: <reason>'
+  SOR_DOC="$ROOT/docs/agents/shared-operating-rules.md"
+  OVERLAY_DOC="$ROOT/docs/agents/operating-rules.md"
+  set +e
+  overlay_class=$(yq -r '
+    .doc_ownership[]
+    | select(.path == "docs/agents/operating-rules.md")
+    | .class
+  ' "$LIVE_MANIFEST"); overlay_rc=$?
+  set -e
+  if [ ! -f "$SOR_DOC" ] || [ ! -f "$OVERLAY_DOC" ]; then
+    fail "Case 42: shared-operating-rules.md and/or operating-rules.md missing on disk"
+  elif [ "$overlay_rc" != "0" ] || [ "$overlay_class" != "per-repo-owned" ]; then
+    # If the overlay ever becomes canonical the pointer premise is gone —
+    # the sync would then rewrite it — and this case should be rewritten,
+    # not silently passed.
+    fail "Case 42: expected docs/agents/operating-rules.md class 'per-repo-owned', got (rc=$overlay_rc) '$overlay_class'"
+  else
+    # The overlay's narration section only — heading exclusive, up to the
+    # next level-2 heading — so a pointer parked elsewhere in the file
+    # does not satisfy (3).
+    ov_narration=$(awk -v h="$NARRATION_HEADING" '
+      index($0, h) == 1 { in_sec = 1; next }
+      in_sec && /^## / { exit }
+      in_sec { print }
+    ' "$OVERLAY_DOC")
+    set +e
+    sor_carve=$(grep -cF -- "$CARVE_MARKER" "$SOR_DOC")
+    sor_crit=$(grep -cF -- "$CRIT_MARKER" "$SOR_DOC")
+    # (2) scans the WHOLE overlay, not just the narration section.
+    ov_carve=$(grep -cF -- "$CARVE_MARKER" "$OVERLAY_DOC")
+    ov_crit=$(grep -cF -- "$CRIT_MARKER" "$OVERLAY_DOC")
+    ov_ptr_file=$(printf '%s\n' "$ov_narration" | grep -cF 'shared-operating-rules.md')
+    ov_ptr_heading=$(printf '%s\n' "$ov_narration" | grep -cF '## Path taken')
+    set -e
+    if [ -z "$ov_narration" ]; then
+      fail "Case 42: $OVERLAY_DOC has no '$NARRATION_HEADING' section"
+    elif [ "${sor_carve:-0}" -lt 1 ] || [ "${sor_crit:-0}" -lt 1 ]; then
+      fail "Case 42: docs/agents/shared-operating-rules.md no longer authors both halves of the carve-out (bullet hits=${sor_carve:-0}, struck-criterion hits=${sor_crit:-0}) — the overlay's pointer would aim at nothing (nathanjohnpayne/mergepath#794)"
+    elif [ "${ov_carve:-0}" -gt 0 ] || [ "${ov_crit:-0}" -gt 0 ]; then
+      fail "Case 42: docs/agents/operating-rules.md restates the carve-out (bullet hits=${ov_carve:-0}, struck-criterion hits=${ov_crit:-0}) — a per-repo-owned overlay that nothing syncs cannot hold a second authored copy of a canonical rule; point at it instead (nathanjohnpayne/mergepath#794)"
+    elif [ "${ov_ptr_file:-0}" -lt 1 ] || [ "${ov_ptr_heading:-0}" -lt 1 ]; then
+      fail "Case 42: docs/agents/operating-rules.md § narration rule does not point at the canonical carve-out (file hits=${ov_ptr_file:-0}, heading hits=${ov_ptr_heading:-0}) — with the copy removed and no pointer, the hub overlay reads as a flat narration ban (nathanjohnpayne/mergepath#788)"
+    else
+      pass "Case 42: the narration carve-out is authored once in the canonical shared rules, and the hub overlay points at it instead of mirroring it"
+    fi
+  fi
+
+  # Case 43: § 4's self-recognition rule is neither over- nor
+  # under-scoped.
+  #
+  # docs/agents/decision-records.md is canonical/all (Case 36), so § 4
+  # is the fleet-wide instruction every agent follows before it writes
+  # a decision comment. Its job is to tell a retry of your own crashed
+  # write apart from a re-adoption of a decision the issue superseded,
+  # and a rule that gets that wrong posts a duplicate comment — the one
+  # failure the hidden markers exist to prevent.
+  #
+  # Two ways to get it wrong, and this case pins both:
+  #
+  #   (1) OVER-CLAIM. Deciding it purely by comment ordering rests on
+  #       "a crashed run's own write is always the newest, because
+  #       nothing has been posted after it" — false the moment a second
+  #       agent writes to the same issue. Its record is newer, your own
+  #       unfinished write then reads as a superseded earlier adoption,
+  #       and you post a second comment for a decision you already
+  #       posted. So § 4 must not assert the premise unconditionally,
+  #       and must name the concurrent-writer case it fails on.
+  #
+  #   (2) UNDER-SCOPE. A supersession check scoped to the `decision-`
+  #       family alone misses a pivot recorded ONLY as a change-level
+  #       `path-taken-` comment (placement 2 emits no decision comment
+  #       for that case). The superseded decision then still reads as
+  #       the issue's latest `decision-` record, and a later re-adoption
+  #       inherits the pre-supersession date and edits the first
+  #       adoption's rationale away. So § 4 must require the scan across
+  #       BOTH marker families.
+  #
+  #   (3) DO NOT STOP AT AUTHORSHIP. Whatever § 4 says about whose
+  #       write a matched record is, it has settled nothing about
+  #       whether that record is still current. A retry that crashed
+  #       between the comment and the body still owes the body callout,
+  #       and the writer that got in between may have superseded the
+  #       very record the retry matched. Finishing the retry then
+  #       replaces the newer decision's active callout with the older
+  #       record's and records no return to it, so the chronology and
+  #       the current disposition disagree. So the bullet that deals in
+  #       authorship must carry the retry on to currency and to what
+  #       becomes of the standing callout. (Whether authorship is
+  #       decidable at all is Case 45's business; this case asserts only
+  #       that the three are addressed together.)
+  #
+  # Assertions run against § 4 only — heading exclusive, up to the next
+  # `###` — so wording elsewhere in the file cannot satisfy or trip
+  # them (nathanjohnpayne/mergepath#794).
+  DR_PATH="docs/agents/decision-records.md"
+  if [ ! -f "$ROOT/$DR_PATH" ]; then
+    fail "Case 43: $DR_PATH missing on disk"
+  else
+    idem_sec=$(awk '
+      index($0, "### 4. Idempotency") == 1 { in_sec = 1; next }
+      in_sec && /^### / { exit }
+      in_sec { print }
+    ' "$ROOT/$DR_PATH")
+    set +e
+    # (1) the unconditional premise, and the single-family scoping it
+    #     was written with, must both be gone.
+    over_claim=$(printf '%s\n' "$idem_sec" | grep -cF 'always the newest')
+    family_scoped=$(printf '%s\n' "$idem_sec" | grep -cF 'marker of that family')
+    # (1) the limitation must be stated, not merely implied.
+    concurrency=$(printf '%s\n' "$idem_sec" | grep -cF 'concurrent writer')
+    # (2) one bullet must require BOTH families in the same breath —
+    #     naming them separately is what the under-scoped version
+    #     already did.
+    both_families=$(printf '%s\n' "$idem_sec" \
+      | grep -F 'decision-' | grep -F 'path-taken-' | grep -c 'both')
+    # (3) the SAME bullet that settles authorship must go on to say the
+    #     match does not make the record current and to rule on the
+    #     standing callout. The conjunction is the assertion: a bullet
+    #     that names authorship alone is the version that restores an
+    #     older callout over a newer decision. Prose is soft-wrapped
+    #     one line per paragraph, so a bullet is one physical line and
+    #     the per-line conjunction really does pin one claim.
+    self_currency=$(printf '%s\n' "$idem_sec" \
+      | grep -F 'authorship' | grep -F 'currency' | grep -cF 'callout')
+    set -e
+    if [ -z "$idem_sec" ]; then
+      fail "Case 43: $DR_PATH has no '### 4. Idempotency' section"
+    elif [ "${over_claim:-0}" -gt 0 ] || [ "${family_scoped:-0}" -gt 0 ]; then
+      fail "Case 43: $DR_PATH § 4 still decides retry-vs-re-adoption by comment ordering within one marker family (over-claim hits=${over_claim:-0}, single-family hits=${family_scoped:-0}) — a concurrent writer's comment is newer than your crashed write, so your own record reads as superseded and the retry posts a duplicate (nathanjohnpayne/mergepath#794)"
+    elif [ "${concurrency:-0}" -lt 1 ]; then
+      fail "Case 43: $DR_PATH § 4 does not name the concurrent-writer case that inverts comment ordering — the limitation has to be stated, not left for the reader to discover (nathanjohnpayne/mergepath#794)"
+    elif [ "${both_families:-0}" -lt 1 ]; then
+      fail "Case 43: $DR_PATH § 4 has no bullet requiring the supersession scan across BOTH the 'decision-' and 'path-taken-' families — a decision superseded only by a change-level path record still reads as current, and the re-adoption edits the first adoption's rationale away (nathanjohnpayne/mergepath#794)"
+    elif [ "${self_currency:-0}" -lt 1 ]; then
+      fail "Case 43: $DR_PATH § 4 deals in authorship but never says the match leaves currency open, nor what becomes of the standing callout — a retry that matches its own crashed comment then finishes the body write and swaps a newer decision's active callout for its own older record, with no return to that record recorded anywhere (nathanjohnpayne/mergepath#794)"
+    else
+      pass "Case 43: § 4 self-recognition states its concurrent-writer limit, scans both marker families, and stops short of the body when the record it matched has been superseded"
+    fi
+  fi
+
+  # Case 44: the `path-taken-` slug-qualification condition is keyed to
+  # the end of the pivot its slug actually names.
+  #
+  # Placement 2 hands the change-level marker to § 4 wholesale ("§ 4
+  # below governs this marker as well"), but the two slug families name
+  # OPPOSITE ends of a pivot: a `decision-` slug names the decision
+  # ADOPTED, a `path-taken-` slug names the approach ABANDONED. § 4's
+  # condition — a return to something the issue once superseded — is
+  # therefore the wrong test for a path record, and transcribing it
+  # here misses in both directions:
+  #
+  #   away from `use-postgres`  → slug `use-postgres`
+  #   back to `use-postgres`    → slug `use-dynamo`
+  #   away from `use-postgres`  → slug `use-postgres` REPEATS
+  #
+  # Read against the adopted end it qualifies the middle pivot, whose
+  # slug never repeated. Read against the approach the slug names it
+  # says nothing about the third pivot — the only one that collides —
+  # which then keeps the bare `use-postgres`, matches the FIRST pivot's
+  # record on § 4's undated search, and gets that record's date and an
+  # edit-in-place: the first pivot's chronology overwritten by the
+  # third's, which is precisely the loss § 4 exists to prevent.
+  #
+  # The condition that actually tracks the collision is "an earlier
+  # `path-taken-` record already names the approach this pivot is
+  # abandoning" — the approach was recorded as abandoned, re-adopted,
+  # and is being abandoned again. Pinned three ways: the old
+  # adopted-end condition must be gone, one paragraph must state the
+  # abandoned-end one, and the qualified-slug derivation must be spelled
+  # out for this family rather than left to be inferred from § 4's
+  # decision-family example.
+  #
+  # Assertions run against `### Where the record goes` only — heading
+  # exclusive, up to the next level-2 heading, fenced blocks skipped so
+  # the `## Path taken` sample inside them does not end the section
+  # early (nathanjohnpayne/mergepath#794).
+  if [ ! -f "$ROOT/$DR_PATH" ]; then
+    fail "Case 44: $DR_PATH missing on disk"
+  else
+    placement_sec=$(awk '
+      index($0, "### Where the record goes") == 1 { in_sec = 1; next }
+      in_sec && /^```/ { fence = !fence }
+      in_sec && !fence && /^## / { exit }
+      in_sec { print }
+    ' "$ROOT/$DR_PATH")
+    set +e
+    # The adopted-end condition, transcribed from § 4, must be gone.
+    adopted_end=$(printf '%s\n' "$placement_sec" \
+      | grep -cF 'returning to an approach it pivoted away from')
+    # One paragraph must key qualification to the abandoned end. Same
+    # soft-wrap reasoning as Case 43: one paragraph, one physical line.
+    abandoned_end=$(printf '%s\n' "$placement_sec" \
+      | grep -F 'path-taken-' | grep -F 'abandon' | grep -c 'twice')
+    # …and must show what the qualified slug looks like for a family
+    # whose slug names the abandoned approach.
+    qualified_slug=$(printf '%s\n' "$placement_sec" \
+      | grep -cF 'use-postgres-after-dynamo')
+    set -e
+    if [ -z "$placement_sec" ]; then
+      fail "Case 44: $DR_PATH has no '### Where the record goes' section"
+    elif [ "${adopted_end:-0}" -gt 0 ]; then
+      fail "Case 44: $DR_PATH placement 2 still qualifies the 'path-taken-' slug on a RETURN to an abandoned approach — that is the 'decision-' family's condition, and it names the wrong pivot: the repeat happens when the same approach is abandoned twice (nathanjohnpayne/mergepath#794)"
+    elif [ "${abandoned_end:-0}" -lt 1 ]; then
+      fail "Case 44: $DR_PATH placement 2 does not key 'path-taken-' slug qualification to abandoning the same approach twice — the third pivot keeps the bare slug, § 4's family search hits the FIRST pivot's record, and the second pivot having superseded it sends an ordinary third pivot to § 4's halt instead of recording it (nathanjohnpayne/mergepath#794)"
+    elif [ "${qualified_slug:-0}" -lt 1 ]; then
+      fail "Case 44: $DR_PATH placement 2 states the condition but never shows the qualified 'path-taken-' slug it produces — § 4's only worked example is a decision-family re-adoption, so the derivation is left to be inferred across the very asymmetry this paragraph exists to flag (nathanjohnpayne/mergepath#794)"
+    else
+      pass "Case 44: the 'path-taken-' slug is qualified on the abandoned end of the pivot, with its derivation spelled out"
+    fi
+  fi
+
+  # Case 45: § 4 does not infer authorship from matching content, and
+  # routes the case no local read can decide to the halt.
+  #
+  # § 4's self-recognition rule has been rewritten three times, each
+  # round swapping one insufficient signal for another: the marker's
+  # date, then comment recency, then the CONTENT of the matched record.
+  # Content is the one that looks sound and is not. It refutes — a
+  # record stating some other decision cannot be the write you are
+  # retrying — but it cannot confirm, because a legitimate re-adoption
+  # reproduces the earlier adoption's content exactly whenever the
+  # reasons for returning have not changed:
+  #
+  #   adopt use-postgres        → comment A, bare slug
+  #   supersede with use-dynamo → comment B
+  #   re-adopt use-postgres     → keys away from A, and A already states
+  #                               the very decision being re-adopted
+  #
+  # Read as proof of authorship, A is "your own unfinished write"; the
+  # currency scan then finds B and the procedure halts, so the qualified
+  # `use-postgres-after-dynamo` comment and the callout replacement that
+  # §§ 4-5 require are never written. A valid third pivot is suppressed
+  # by a test that was never entitled to decide the question.
+  #
+  # Nothing local can decide it. A per-write identifier would have to be
+  # unique to one write AND recomputable by a retry holding no local
+  # state, and the comments API offers no compare-and-swap to arbitrate.
+  # So the honest rule states the limit and sends the undecidable case
+  # to the branch that cannot duplicate — leave the record standing,
+  # write nothing, surface the conflict — instead of acquiring a fifth
+  # inference. Pinned four ways: the two sentences that asserted
+  # authorship from content must be gone; the refutes-but-cannot-confirm
+  # asymmetry must be stated, so content is not silently promoted back
+  # to a proof; the reason no per-write identifier is available must be
+  # given, so the next round does not "fix" this by inventing one; and
+  # the halt must be keyed to the two readings coming apart rather than
+  # to any finding about whose write it was
+  # (nathanjohnpayne/mergepath#794).
+  if [ ! -f "$ROOT/$DR_PATH" ]; then
+    fail "Case 45: $DR_PATH missing on disk"
+  else
+    idem45_sec=$(awk '
+      index($0, "### 4. Idempotency") == 1 { in_sec = 1; next }
+      in_sec && /^### / { exit }
+      in_sec { print }
+    ' "$ROOT/$DR_PATH")
+    set +e
+    # The two sentences that carried the authorship claim.
+    authorship_claim=$(printf '%s\n' "$idem45_sec" \
+      | grep -cF -e 'Content is the anchor' -e 'settles *authorship*')
+    # The asymmetry itself, in one breath — "it refutes" alone reads as
+    # an endorsement of the content test.
+    refute_only=$(printf '%s\n' "$idem45_sec" \
+      | grep -F 'refutes' | grep -cF 'confirm')
+    # Why the identifier Codex proposed cannot exist, not merely that it
+    # does not: uniqueness and recomputability-after-a-crash pull apart.
+    no_identifier=$(printf '%s\n' "$idem45_sec" \
+      | grep -F 'identifier' | grep -cF 'recomputable')
+    # The halt, justified by the readings diverging rather than by an
+    # authorship verdict. Same soft-wrap reasoning as Case 43: one
+    # bullet is one physical line, so the conjunction pins one claim.
+    halt_readings=$(printf '%s\n' "$idem45_sec" \
+      | grep -F 'cannot duplicate' | grep -F 'readings' | grep -cF 'write nothing')
+    set -e
+    if [ -z "$idem45_sec" ]; then
+      fail "Case 45: $DR_PATH has no '### 4. Idempotency' section"
+    elif [ "${authorship_claim:-0}" -gt 0 ]; then
+      fail "Case 45: $DR_PATH § 4 still reads a content match as proof that the record is your own write (hits=${authorship_claim:-0}) — an issue re-adopting a decision whose reasons have not changed reproduces the earlier adoption's content exactly, so the re-adoption is misread as a retry and the qualified comment §§ 4-5 require is never written (nathanjohnpayne/mergepath#794)"
+    elif [ "${refute_only:-0}" -lt 1 ]; then
+      fail "Case 45: $DR_PATH § 4 does not state that content refutes authorship without confirming it — a reader left with 'check the content' applies it in the direction it cannot support (nathanjohnpayne/mergepath#794)"
+    elif [ "${no_identifier:-0}" -lt 1 ]; then
+      fail "Case 45: $DR_PATH § 4 does not say why no durable per-write identifier is available — unique-per-write and recomputable-by-a-stateless-retry pull apart, and without that the next round closes the gap by inventing the identifier § 2 already rejected as a counter (nathanjohnpayne/mergepath#794)"
+    elif [ "${halt_readings:-0}" -lt 1 ]; then
+      fail "Case 45: $DR_PATH § 4 does not route the undecidable case to the branch that cannot duplicate on the grounds that the two readings diverge — a halt justified by an authorship verdict is the same over-claim wearing a safer outcome (nathanjohnpayne/mergepath#794)"
+    else
+      pass "Case 45: § 4 treats content as refuting but never confirming authorship, says why no per-write identifier can settle it, and halts on the undecidable case"
+    fi
+  fi
+
+  # Case 46: § 4 searches the slug family BEFORE it decides on a
+  # qualifier, so the safeguards that run on a match are actually
+  # reachable.
+  #
+  # An earlier revision had the agent classify itself before searching:
+  # read the issue's recorded history, decide retry-vs-re-adoption from
+  # it, and search under the key that classification implies. That
+  # ordering is unsound because the classification is drawn from history
+  # a concurrent writer can change:
+  #
+  #   run posts `use-postgres`, crashes before the body write
+  #   another writer records `use-dynamo`
+  #   the retry re-derives → "the issue moved off use-postgres, so this
+  #     is a re-adoption" → searches ONLY `use-postgres-after-dynamo`
+  #
+  # No write has ever used that key, so the search misses the retry's
+  # OWN comment and it posts a duplicate — and every safeguard § 4 added
+  # for exactly this case (content refutation, the currency scan, the
+  # halt) is skipped, because all of them run only once something has
+  # matched. The pre-search classification is one more inference about
+  # whose write a record is, which Case 45 established § 4 cannot make.
+  #
+  # The fix is an ordering, not a sharper inference: search a key that
+  # spans the base slug AND every qualification of it, then let the
+  # bullets disposition what comes back. Pinned three ways: the old
+  # pre-search wording must be gone; the comment key must wildcard the
+  # qualifier rather than compute it; and one bullet must state that
+  # qualification is an output of the search while naming the
+  # skipped-safeguards consequence of getting it backwards
+  # (nathanjohnpayne/mergepath#794).
+  if [ ! -f "$ROOT/$DR_PATH" ]; then
+    fail "Case 46: $DR_PATH missing on disk"
+  else
+    idem46_sec=$(awk '
+      index($0, "### 4. Idempotency") == 1 { in_sec = 1; next }
+      in_sec && /^### / { exit }
+      in_sec { print }
+    ' "$ROOT/$DR_PATH")
+    set +e
+    # The two phrasings that carried the pre-search classification.
+    pre_search=$(printf '%s\n' "$idem46_sec" \
+      | grep -cF -e 'qualify it *before* you search' -e 'readable before you search')
+    # The key itself must admit an unknown qualifier. This is the
+    # concrete artifact, not a paraphrase: a key without it cannot match
+    # a qualified write the retry did not predict.
+    family_key=$(printf '%s\n' "$idem46_sec" | grep -cF '(-[a-z0-9-]+)?')
+    # Ordering stated as a rule, in the same breath as what breaks
+    # without it. Prose is soft-wrapped one line per paragraph, so a
+    # bullet is one physical line and the conjunction pins one claim.
+    output_not_input=$(printf '%s\n' "$idem46_sec" \
+      | grep -F 'chosen after the search' | grep -cF 'run only on a match')
+    set -e
+    if [ -z "$idem46_sec" ]; then
+      fail "Case 46: $DR_PATH has no '### 4. Idempotency' section"
+    elif [ "${pre_search:-0}" -gt 0 ]; then
+      fail "Case 46: $DR_PATH § 4 still settles the qualifier before searching (hits=${pre_search:-0}) — a concurrent writer between the crash and the retry makes the retry key on a slug no write ever used, so it misses its own comment and duplicates it (nathanjohnpayne/mergepath#794)"
+    elif [ "${family_key:-0}" -lt 1 ]; then
+      fail "Case 46: $DR_PATH § 4's comment search key does not wildcard the qualifier — a key built from a computed qualifier cannot match a qualified write the retry did not predict, and a key built from the bare slug alone cannot match one it did (nathanjohnpayne/mergepath#794)"
+    elif [ "${output_not_input:-0}" -lt 1 ]; then
+      fail "Case 46: $DR_PATH § 4 does not state that the qualifier is chosen after the search, nor that getting it backwards skips the safeguards that only run on a match — the ordering is the whole fix, so leaving it implicit invites the next round to re-derive the key up front (nathanjohnpayne/mergepath#794)"
+    else
+      pass "Case 46: § 4 searches the base slug and every qualification of it, then chooses the qualifier from what came back"
+    fi
+  fi
+
+  # Case 47: accepting a recommendation is a supersession § 4 must not
+  # swallow as a retry.
+  #
+  # §§ 1-2 give a pending recommendation its own heading and its own
+  # callout wording; § 5 says accepting one is a supersession. But the
+  # acceptance adopts the SAME decision, so it derives the same base
+  # slug and § 4's search matches the recommendation's own comment:
+  #
+  #   recommend use-postgres → comment, callout reads
+  #                            "**Decision recommendation recorded:**"
+  #   accept it unchanged    → same base slug → matches that comment,
+  #                            nothing posted after it supersedes it
+  #
+  # § 4's currency bullet then reads the pair of readings as coinciding
+  # and has the writer finish under the matched record and post no new
+  # comment. The acceptance is never recorded: the issue keeps a body
+  # callout announcing a recommendation for a decision that has actually
+  # been settled, which is the entrypoint-misstates-the-disposition
+  # failure this whole convention exists to prevent — reached through
+  # the machinery meant to prevent it.
+  #
+  # Status is the discriminator, and unlike authorship it IS decidable
+  # from a local read: the matched comment's own heading says whether it
+  # stands as a recommendation or a decision. So this case is not a
+  # sixth inference — it is a fact § 4 was ignoring. Pinned three ways:
+  # one bullet must tie status to the recommendation/acceptance pair and
+  # name the stale callout it produces; the currency bullet's
+  # finish-and-post-nothing branch must be gated on status so it cannot
+  # swallow an acceptance; and the acceptance must get a qualified slug
+  # of its own rather than colliding with the recommendation's
+  # (nathanjohnpayne/mergepath#794).
+  if [ ! -f "$ROOT/$DR_PATH" ]; then
+    fail "Case 47: $DR_PATH missing on disk"
+  else
+    idem47_sec=$(awk '
+      index($0, "### 4. Idempotency") == 1 { in_sec = 1; next }
+      in_sec && /^### / { exit }
+      in_sec { print }
+    ' "$ROOT/$DR_PATH")
+    set +e
+    # One bullet, all three terms — naming them in separate paragraphs
+    # is what the version this case replaces already did.
+    status_bullet=$(printf '%s\n' "$idem47_sec" \
+      | grep -F 'recommendation' | grep -F 'acceptance' | grep -c 'status')
+    # …and it must name the observable failure, not just the rule.
+    stale_callout=$(printf '%s\n' "$idem47_sec" \
+      | grep -cF 'Decision recommendation recorded')
+    # The currency branch that posts nothing must be status-gated.
+    currency_gated=$(printf '%s\n' "$idem47_sec" \
+      | grep -F 'same status' | grep -cF 'post no second comment')
+    # The acceptance's own key, spelled out — the re-adoption
+    # derivation ("the slug of the record it supersedes") degenerates
+    # here, because the record it supersedes carries the same slug.
+    accept_slug=$(printf '%s\n' "$idem47_sec" | grep -cF 'use-postgres-accepted')
+    set -e
+    if [ -z "$idem47_sec" ]; then
+      fail "Case 47: $DR_PATH has no '### 4. Idempotency' section"
+    elif [ "${status_bullet:-0}" -lt 1 ] || [ "${stale_callout:-0}" -lt 1 ]; then
+      fail "Case 47: $DR_PATH § 4 does not make status part of what a record states (status hits=${status_bullet:-0}, stale-callout hits=${stale_callout:-0}) — an acceptance derives the recommendation's own base slug, so § 4 matches its comment and § 5's supersession never happens (nathanjohnpayne/mergepath#794)"
+    elif [ "${currency_gated:-0}" -lt 1 ]; then
+      fail "Case 47: $DR_PATH § 4's finish-under-the-matched-record branch is not gated on status — it fires on the recommendation an acceptance matches, so the acceptance posts nothing and the issue keeps a callout labelling a settled decision a recommendation (nathanjohnpayne/mergepath#794)"
+    elif [ "${accept_slug:-0}" -lt 1 ]; then
+      fail "Case 47: $DR_PATH § 4 never shows the acceptance's qualified slug — the re-adoption derivation degenerates here because the record being superseded carries the same base slug, so leaving it to be inferred produces a collision or a counter (nathanjohnpayne/mergepath#794)"
+    else
+      pass "Case 47: § 4 treats a recommendation and its acceptance as two records, and gives the acceptance its own key"
+    fi
+  fi
+
+  # Case 48: tell (b)'s hub-only doc set tracks the live manifest.
   #
   # Case 37 only ever exercises the NEGATIVE branch of the doc half of
   # tell (b) — no canonical agent doc in the live tree names a hub-only
@@ -1403,15 +1923,15 @@ SPAN_EOF
   done <<< "$canon_docs"
   hub_declared=$(printf '%s\n' "$hub_only_docs" | grep -c . || true)
   if [ -n "$hub_unmatched" ]; then
-    fail "Case 41: HUB_ONLY_RE does not match hub-only doc(s) the manifest declares (the alternation has drifted behind doc_ownership):$hub_unmatched"
+    fail "Case 48: HUB_ONLY_RE does not match hub-only doc(s) the manifest declares (the alternation has drifted behind doc_ownership):$hub_unmatched"
   elif [ -n "$canon_false_pos" ]; then
-    fail "Case 41: HUB_ONLY_RE matches canonical doc path(s) it must not:$canon_false_pos"
+    fail "Case 48: HUB_ONLY_RE matches canonical doc path(s) it must not:$canon_false_pos"
   else
-    pass "Case 41: tell-(b) hub-only alternation covers all $hub_declared manifest-declared hub-only docs and no canonical sibling"
+    pass "Case 48: tell-(b) hub-only alternation covers all $hub_declared manifest-declared hub-only docs and no canonical sibling"
   fi
 
 else
-  echo "SKIP: Cases 36-41 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-48 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
