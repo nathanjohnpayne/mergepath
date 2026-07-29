@@ -102,7 +102,28 @@ BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY="reviewer-assignment-token"
 # the pre-existing remote on a --resume run when it is set. It is
 # consulted by scripts/bootstrap-new-repo.sh, so it is stage-module
 # surface, not a private constant.
-BOOTSTRAP_GITHUB_INFRA_REMOTE_CHECKPOINT="github-infra:remote-created"
+#
+# The recorded name is BOUND TO THE REPOSITORY it records — the bare
+# prefix below is never written or matched on its own. A checkpoint that
+# said only "this bootstrap created a remote" would relax both guards for
+# ANY owner/name, and the target dir is not proof of the name: a resume
+# picks the repo up from the positional argument and $BOOTSTRAP_REPO_OWNER,
+# while --target-dir can hold the tree constant across both runs. A
+# mistyped resume (`bootstrap-new-repo.sh other-repo --target-dir <same>
+# --resume template-mirror`) would then sail past preflight, skip the
+# create because "a" remote was created, and go on to seed labels, invite
+# reviewers and write REVIEWER_ASSIGNMENT_TOKEN into a repository this
+# bootstrap never touched. Binding the name makes the relaxation
+# unreachable for any repo other than the one actually created, which is
+# what docs/agents/bootstrap-runbook.md promises.
+BOOTSTRAP_GITHUB_INFRA_REMOTE_CHECKPOINT_PREFIX="github-infra:remote-created"
+
+# The repo-bound checkpoint name for <owner>/<name>. Both consumers (the
+# stage's step 1 and the wizard's preflight) MUST build the name through
+# this helper so the two can never drift apart into a false match.
+bootstrap::github_infra_remote_checkpoint() {
+  printf '%s:%s\n' "$BOOTSTRAP_GITHUB_INFRA_REMOTE_CHECKPOINT_PREFIX" "$1"
+}
 
 # Out-parameter of bootstrap::_provision_reviewer_assignment_token: the
 # SPECIFIC failure message for the path it took on the CURRENT call, or
@@ -112,9 +133,12 @@ BOOTSTRAP_GITHUB_INFRA_REMOTE_CHECKPOINT="github-infra:remote-created"
 # the specific reason (#761).
 #
 # Every failing path now publishes one — no PAT available with prompts
-# skipped, human declined to paste one, and `gh secret set` itself failing
-# (#782). The generic fallback in the recorder is therefore defence in
-# depth for a future path that forgets to, not a live branch.
+# skipped, human declined to paste one, `gh secret set` itself failing,
+# and the author write path failing before `gh secret set` ever ran
+# (#782). The last two are told apart by positive proof that gh was
+# reached, never by the rc, which both layers can return alike. The
+# generic fallback in the recorder is therefore defence in depth for a
+# future path that forgets to publish, not a live branch.
 #
 # Reset unconditionally on entry to that function — never trusted across
 # calls. That reset is what keeps the two required behaviours from
@@ -271,7 +295,12 @@ bootstrap::_create_remote_and_push() {
   # remote, the subsequent label / invite / secret calls fail loudly
   # against the missing repo — remove the .bootstrap-state.checkpoints
   # sidecar to force a fresh create.)
-  if bootstrap::has_checkpoint "$BOOTSTRAP_GITHUB_INFRA_REMOTE_CHECKPOINT"; then
+  #
+  # The lookup is for THIS $full_repo, not for "a remote was created":
+  # a resume that names a different repo in the same target dir must
+  # still create its own remote rather than inherit the earlier run's
+  # skip and operate on somebody else's repository.
+  if bootstrap::has_checkpoint "$(bootstrap::github_infra_remote_checkpoint "$full_repo")"; then
     bootstrap::log "github-infra: remote $full_repo was already created and pushed by an earlier attempt in this bootstrap (resume checkpoint) — skipping gh repo create"
     return 0
   fi
@@ -305,8 +334,9 @@ bootstrap::_create_remote_and_push() {
 
   # Record the irreversible half BEFORE anything downstream can abort the
   # stage. bootstrap::record_checkpoint is a no-op under --dry-run, so a
-  # dry run never claims a remote it did not create.
-  bootstrap::record_checkpoint "$BOOTSTRAP_GITHUB_INFRA_REMOTE_CHECKPOINT"
+  # dry run never claims a remote it did not create. The record names the
+  # repo that was actually created, which is what both consumers match on.
+  bootstrap::record_checkpoint "$(bootstrap::github_infra_remote_checkpoint "$full_repo")"
 }
 
 bootstrap::_seed_labels() {
@@ -731,25 +761,48 @@ bootstrap::_provision_reviewer_assignment_token() {
   # set -e at the call. The inline `|| set_rc=$?` mirrors the
   # _provision_llm_secrets pattern + closes the gap nathanpayne-claude
   # caught on #239 round 2.
-  local set_rc=0
-  printf '%s' "$pat" | bootstrap::author_gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo" >&2 || set_rc=$?
+  #
+  # The call is traced (bootstrap::author_gh_traced) because the rc alone
+  # does not say WHICH layer failed. bootstrap::author_gh returns non-zero
+  # both when `gh secret set` runs and fails and when the write never got
+  # that far — scripts/gh-as-author.sh refusing on its byline pin or
+  # failing to look up an author token, or the wrapper being missing
+  # entirely. Recording the former's message for the latter points the
+  # operator at the reviewer PAT they just supplied when the thing to
+  # repair is AUTHOR authentication. The marker is the positive proof:
+  # present only when gh itself was reached.
+  local set_rc=0 reached_dir reached_marker gh_was_reached=0
+  reached_dir=$(mktemp -d "${TMPDIR:-/tmp}/bootstrap-secret-set.XXXXXX")
+  reached_marker="$reached_dir/gh-reached"
+  printf '%s' "$pat" | bootstrap::author_gh_traced "$reached_marker" secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo" >&2 || set_rc=$?
+  if [ -e "$reached_marker" ]; then
+    gh_was_reached=1
+  fi
+  rm -rf "$reached_dir"
   if [ "$set_rc" -ne 0 ]; then
-    bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: secret set failed (rc=$set_rc)"
     # Publish the specific reason, exactly as the no-PAT and declined
     # paths above do. This path always returns non-zero, so the stage
     # ALWAYS records under the shared key — and without a reason the
     # record fell back to the generic "provisioning failed (rc=N)",
-    # leaving the sidecar unable to say which of the three causes sharing
+    # leaving the sidecar unable to say which of the causes sharing
     # this key actually happened. That is the one question the audit
-    # trail exists to answer, and the runbook already documents that it
-    # names `gh secret set` itself failing (#782).
+    # trail exists to answer, and the runbook documents that it names
+    # `gh secret set` itself failing (#782) — which it may only claim
+    # when `gh secret set` actually ran.
     #
     # Unlike those paths this one records nothing itself: they return 0
     # under default (non-strict) semantics, so they must persist their
     # own warning or it is lost. A secret-set failure is always
     # propagated, so a self-record would only be overwritten moments
     # later by the stage's keyed record.
-    BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON="REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (the gh secret-set call itself failed, rc=$set_rc) — set it manually before the first PR"
+    if [ "$gh_was_reached" = "1" ]; then
+      bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: secret set failed (rc=$set_rc)"
+      BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON="REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (the gh secret-set call itself failed, rc=$set_rc) — set it manually before the first PR"
+    else
+      bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: the author-identity write path failed BEFORE gh ran (rc=$set_rc) — no secret-set call was attempted"
+      bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: this is an AUTHOR-authentication failure ($(bootstrap::author_identity) token lookup / verification, or a missing $(bootstrap::author_wrapper)), NOT a problem with the reviewer PAT — see the lines above from the wrapper"
+      BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON="REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (the author write path failed before the gh secret-set call ran, rc=$set_rc — typically the author wrapper failing to resolve or verify a $(bootstrap::author_identity) token; the wrapper's own error is in the run log) — repair author authentication, then set the secret manually before the first PR"
+    fi
     return "$set_rc"
   fi
   # Note only — the original failure message is kept verbatim by the

@@ -10,6 +10,10 @@
 #   bootstrap::run <label> <cmd> [...] Execute (or dry-run echo) a side-effect.
 #   bootstrap::author_gh [...]         Run gh through the verified author wrapper
 #                                      unless dry-run/test bypass is active.
+#   bootstrap::author_gh_traced <marker> [...]
+#                                      bootstrap::author_gh that additionally
+#                                      creates <marker> iff the wrapped `gh`
+#                                      was actually reached.
 #   bootstrap::run_author_gh <label> [...]  Logged bootstrap::run wrapper around
 #                                      bootstrap::author_gh for gh side-effects.
 #   bootstrap::record_stage <name>     Append a completed stage name to the
@@ -155,6 +159,67 @@ bootstrap::author_gh() {
   fi
 
   GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- gh "$@"
+}
+
+# bootstrap::author_gh with positive proof of how far the call got.
+#
+# A non-zero rc from bootstrap::author_gh is ambiguous: it can come from
+# `gh` itself, or from the pre-`gh` half of the write — this file's
+# wrapper-executable check, or scripts/gh-as-author.sh refusing on its
+# byline pin (exit 2) / failing to look up an author token (exit 3),
+# neither of which ever starts `gh`. Those are different failures with
+# different remediations, and a caller that records "the gh call failed"
+# for a token-lookup failure sends the operator to fix the wrong thing.
+# The rc alone cannot separate them (gh exits 1/2/4 for its own reasons),
+# so this variant reports the boundary directly.
+#
+# $1 is a marker path, removed on entry and created by the wrapped
+# command immediately before it exec's gh. After the call: marker present
+# => gh ran (and the rc is gh's); marker absent with a non-zero rc => the
+# write never reached gh. The caller owns the path and its cleanup.
+#
+# The marker is written INSIDE the wrapper's process tree, after every
+# guard the wrapper applies, because scripts/gh-as-author.sh runs
+# whatever follows `--` and this passes it a one-line shim that touches
+# the marker and then `exec`s gh. Nothing about the gh invocation
+# changes: argv is identical, stdin passes straight through (the
+# secret-set path pipes its PAT), and the wrapper's GH_TOKEN is
+# inherited across the exec.
+bootstrap::author_gh_traced() {
+  local reached_marker=$1
+  shift
+
+  rm -f "$reached_marker"
+
+  if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ] || [ "${BOOTSTRAP_SKIP_AUTHOR_TOKEN:-0}" = "1" ]; then
+    # No wrapper in the path, so gh is reached unconditionally.
+    : >"$reached_marker"
+    gh "$@"
+    return $?
+  fi
+
+  local wrapper author_identity
+  wrapper="$(bootstrap::author_wrapper)"
+  author_identity="$(bootstrap::author_identity)"
+  if [ ! -x "$wrapper" ]; then
+    bootstrap::err "author gh wrapper missing or non-executable: $wrapper"
+    bootstrap::err "refusing to run GitHub write without token verification"
+    return 2
+  fi
+
+  # The shim refuses to exec gh if it cannot write the marker, which is
+  # what makes "marker absent" mean "gh did not run" unconditionally
+  # rather than "gh did not run, probably". A caller that could not
+  # record the boundary must not perform an unattributable write.
+  GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- \
+    sh -c '
+      if ! : >"$1"; then
+        echo "bootstrap: cannot write the author-gh trace marker $1 — refusing to run the write unrecorded" >&2
+        exit 70
+      fi
+      shift
+      exec gh "$@"
+    ' bootstrap-author-gh-traced "$reached_marker" "$@"
 }
 
 bootstrap::run_author_gh() {

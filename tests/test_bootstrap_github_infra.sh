@@ -380,11 +380,15 @@ grep -q "^gh auth switch -u" "$SHIM_LOG" \
   || pass "secret failure path performs zero gh auth switches"
 # The pipeline-rc-capture pattern in scripts/bootstrap/github-infra.sh
 # must use `|| set_rc=$?` on the same line as the pipeline so set -e
-# doesn't kill the function before the rc handler can run.
+# doesn't kill the function before the rc handler can run. The match is
+# anchored on the `secret set REVIEWER_ASSIGNMENT_TOKEN` argv rather than
+# on a `gh secret set` literal: the helper carrying it is the caller's
+# choice (bootstrap::author_gh, bootstrap::author_gh_traced), the inline
+# rc capture is the invariant.
 awk '
   /^bootstrap::_provision_reviewer_assignment_token\(\)/ { in_fn = 1 }
   in_fn && /^}/ { in_fn = 0 }
-  in_fn && /gh secret set REVIEWER_ASSIGNMENT_TOKEN.*\|\| set_rc=\$\?/ { saw = 1 }
+  in_fn && /secret set REVIEWER_ASSIGNMENT_TOKEN.*\|\| set_rc=\$\?/ { saw = 1 }
   END { if (!saw) { print "no `|| set_rc=$?` inline on gh secret set pipeline"; exit 1 } }
 ' "$ROOT/scripts/bootstrap/github-infra.sh" \
   && pass "_provision_reviewer_assignment_token uses '|| set_rc=\$?' inline on gh secret set pipeline" \
@@ -1119,6 +1123,107 @@ set -e
   && pass "recorder still falls back to the generic headline when no reason is published" \
   || fail "generic fallback broke; rc=$fallback_ec; out: $fallback_out; sidecar: $(cat "$TARGET9H2/.bootstrap-state.warnings" 2>/dev/null)"
 
+# --- assertion 15i: a wrapper failure is NOT recorded as a gh failure ---
+# scripts/gh-as-author.sh can fail BEFORE it ever starts gh — byline pin
+# refusal (exit 2), author token lookup failure (exit 3) — and the rc
+# alone cannot be told from `gh secret set` running and failing. Recording
+# "the gh secret-set call itself failed" for a token-lookup failure sends
+# the operator to replace the reviewer PAT when the thing to repair is
+# AUTHOR authentication. bootstrap::author_gh_traced settles it with
+# positive proof: a marker the wrapped command writes immediately before
+# it exec's gh.
+#
+# Both directions run through a REAL wrapper (BOOTSTRAP_SKIP_AUTHOR_TOKEN
+# is deliberately unset, so the traced call takes its wrapper branch):
+#   (a) a wrapper that exits 3 without running the wrapped command;
+#   (b) a wrapper that forwards the wrapped command, whose gh then fails.
+# ---------------------------------------------------------------------------
+run_secret_set_failure_case() {
+  # $1 = fake-root dir holding scripts/gh-as-author.sh, $2 = target dir
+  PATH="$SHIM_PATH" SHIM_LOG="$SHIM_LOG" SHIM_EXIT_SECRET=1 bash -c '
+    ROOT="'"$ROOT"'"
+    . "$ROOT/scripts/bootstrap/_lib.sh"
+    . "$ROOT/scripts/bootstrap/github-infra.sh"
+    BOOTSTRAP_MERGEPATH_ROOT="'"$1"'"
+    BOOTSTRAP_STATE_FILE="'"$2"'/.bootstrap-state"
+    BOOTSTRAP_LOG_FILE=""
+    BOOTSTRAP_DRY_RUN=0
+    BOOTSTRAP_SKIP_AUTHOR_TOKEN=0
+    BOOTSTRAP_AUTO_PROMPT=skip
+    BOOTSTRAP_STRICT_SECRETS=1
+    BOOTSTRAP_REVIEWER_PAT_VALUE="fake-pat"
+    OP_PREFLIGHT_REVIEWER_PAT=""
+    rc=0
+    bootstrap::_provision_reviewer_assignment_token "nathanjohnpayne/wrapperfail-repo" "claude" || rc=$?
+    bootstrap::_record_reviewer_token_stage_failure "$rc" "tail note"
+    echo "RC=$rc"
+  ' 2>&1
+}
+
+# (a) wrapper refuses before running anything.
+: >"$SHIM_LOG"
+FAKE_ROOT_REFUSE="$WORKDIR/fake-root-wrapper-refuse"
+TARGET9I="$WORKDIR/new-repo-wrapper-refuse"
+rm -rf "$FAKE_ROOT_REFUSE" "$TARGET9I"
+mkdir -p "$FAKE_ROOT_REFUSE/scripts" "$TARGET9I"
+cat >"$FAKE_ROOT_REFUSE/scripts/gh-as-author.sh" <<'REFUSE_EOF'
+#!/bin/sh
+# Stand-in for scripts/gh-as-author.sh's pre-`gh` failure modes: it
+# never runs the wrapped command (exit 3 = author token lookup failed).
+echo "gh-as-author: could not read a token for nathanjohnpayne via gh auth token --user." >&2
+exit 3
+REFUSE_EOF
+chmod +x "$FAKE_ROOT_REFUSE/scripts/gh-as-author.sh"
+set +e
+refuse_out=$(run_secret_set_failure_case "$FAKE_ROOT_REFUSE" "$TARGET9I")
+refuse_ec=$?
+set -e
+echo "$refuse_out" | grep -q "RC=3" && [ "$refuse_ec" -eq 0 ] \
+  && pass "wrapper pre-gh failure propagates its rc (3) out of provisioning" \
+  || fail "wrapper-refusal harness misbehaved; rc=$refuse_ec; out: $refuse_out"
+grep -q "secret set" "$SHIM_LOG" \
+  && fail "gh was invoked even though the wrapper refused; log: $(cat "$SHIM_LOG")" \
+  || pass "the refusing wrapper never reached gh (no secret-set in the shim log)"
+grep -qF "the gh secret-set call itself failed" "$TARGET9I/.bootstrap-state.warnings" \
+  && fail "wrapper failure recorded as a gh secret-set failure: $(cat "$TARGET9I/.bootstrap-state.warnings")" \
+  || pass "wrapper failure is NOT recorded as 'the gh secret-set call itself failed'"
+grep -qF "the author write path failed before the gh secret-set call ran, rc=3" \
+     "$TARGET9I/.bootstrap-state.warnings" \
+  && pass "wrapper failure records an author-authentication cause instead" \
+  || fail "sidecar does not name the author write path: $(cat "$TARGET9I/.bootstrap-state.warnings" 2>/dev/null)"
+echo "$refuse_out" | grep -q "this is an AUTHOR-authentication failure" \
+  && pass "the operator-facing ERROR lines point at author auth, not the reviewer PAT" \
+  || fail "no author-auth ERROR line emitted; out: $refuse_out"
+
+# (b) wrapper forwards the wrapped command; gh itself fails. This also
+# proves the marker survives the real wrapper's exec path.
+: >"$SHIM_LOG"
+FAKE_ROOT_FORWARD="$WORKDIR/fake-root-wrapper-forward"
+TARGET9I2="$WORKDIR/new-repo-wrapper-forward"
+rm -rf "$FAKE_ROOT_FORWARD" "$TARGET9I2"
+mkdir -p "$FAKE_ROOT_FORWARD/scripts" "$TARGET9I2"
+cat >"$FAKE_ROOT_FORWARD/scripts/gh-as-author.sh" <<'FWD_EOF'
+#!/bin/sh
+# Stand-in for a wrapper whose token resolution SUCCEEDS: it runs
+# whatever follows `--`, exactly as scripts/gh-as-author.sh does.
+[ "$1" = "--" ] && shift
+exec "$@"
+FWD_EOF
+chmod +x "$FAKE_ROOT_FORWARD/scripts/gh-as-author.sh"
+set +e
+fwd_out=$(run_secret_set_failure_case "$FAKE_ROOT_FORWARD" "$TARGET9I2")
+fwd_ec=$?
+set -e
+echo "$fwd_out" | grep -q "RC=1" && [ "$fwd_ec" -eq 0 ] \
+  && pass "a forwarded secret-set propagates gh's own rc (1)" \
+  || fail "wrapper-forward harness misbehaved; rc=$fwd_ec; out: $fwd_out"
+grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/wrapperfail-repo\$" "$SHIM_LOG" \
+  && pass "the forwarding wrapper reaches gh with argv unchanged by the trace shim" \
+  || fail "gh argv changed or gh was not reached; log: $(cat "$SHIM_LOG")"
+grep -qF "the gh secret-set call itself failed, rc=1" "$TARGET9I2/.bootstrap-state.warnings" \
+  && pass "a real gh failure is still recorded as a gh secret-set failure" \
+  || fail "gh failure lost its specific cause: $(cat "$TARGET9I2/.bootstrap-state.warnings" 2>/dev/null)"
+
 # --- assertion 16: dry-run PAT miss is pure (#755 round 2) ---
 # A dry run carries no credentials, so a PAT miss there is EXPECTED:
 # it must print [DRY-RUN] plan lines, write NO .bootstrap-state.warnings
@@ -1283,9 +1388,12 @@ grep -q "^gh repo create nathanjohnpayne/strictresume-repo " "$SHIM_LOG" \
   && pass "strict-secrets run 1 did create the remote before aborting" \
   || fail "run 1 never reached gh repo create; log: $(cat "$SHIM_LOG")"
 [ -f "$TARGET12/.bootstrap-state.checkpoints" ] \
-  && grep -qxF "github-infra:remote-created" "$TARGET12/.bootstrap-state.checkpoints" \
-  && pass "the created remote is recorded in .bootstrap-state.checkpoints" \
+  && grep -qxF "github-infra:remote-created:nathanjohnpayne/strictresume-repo" "$TARGET12/.bootstrap-state.checkpoints" \
+  && pass "the created remote is recorded in .bootstrap-state.checkpoints, bound to its owner/name" \
   || fail "no remote-created checkpoint after run 1: $(cat "$TARGET12/.bootstrap-state.checkpoints" 2>/dev/null)"
+grep -qxF "github-infra:remote-created" "$TARGET12/.bootstrap-state.checkpoints" \
+  && fail "a repo-less checkpoint was recorded; it would match any remote: $(cat "$TARGET12/.bootstrap-state.checkpoints")" \
+  || pass "no bare step-only checkpoint is recorded"
 grep -q "^github-infra\$" "$TARGET12/.bootstrap-state" \
   && fail "github-infra recorded despite the strict abort" \
   || pass "github-infra still NOT recorded (the stage did not finish)"
@@ -1323,7 +1431,60 @@ grep -q "^github-infra\$" "$TARGET12/.bootstrap-state" \
   && pass "resume records github-infra completion" \
   || fail "state file still missing github-infra: $(cat "$TARGET12/.bootstrap-state" 2>/dev/null)"
 
-# --- assertion 18b: the existing-remote relaxation is checkpoint-gated ---
+# --- assertion 18b: the checkpoint is bound to the repo it created ---
+# The sidecar lives in the target dir, but the repository comes from the
+# positional argument + $BOOTSTRAP_REPO_OWNER, and --target-dir lets a
+# second run reuse the same tree under a DIFFERENT name. A step-only
+# checkpoint ("this bootstrap created a remote") would therefore relax
+# both guards for any owner/name: a mistyped resume would pass preflight
+# against an unrelated existing repo, skip the create, and go on to seed
+# labels, invite reviewers and write REVIEWER_ASSIGNMENT_TOKEN into it.
+# TARGET12 still holds run 1's checkpoint for strictresume-repo; both
+# layers are pinned against a resume that names hijack-repo instead.
+# ---------------------------------------------------------------------------
+# Layer 1 — preflight refuses the unrelated existing remote.
+: >"$SHIM_LOG"
+set +e
+hijack_out=$(run_wizard_toolcheck hijack-repo \
+               --target-dir "$TARGET12" \
+               --description d --visibility private \
+               --firebase none --codex-app n --project new \
+               --resume template-mirror 2>&1)
+hijack_ec=$?
+set -e
+[ "$hijack_ec" -eq 2 ] \
+  && pass "a resume naming a different repo in the same target dir fails preflight (rc=2)" \
+  || fail "resume onto an unrelated repo should exit 2; rc=$hijack_ec; out: $hijack_out"
+echo "$hijack_out" | grep -q "remote already exists: nathanjohnpayne/hijack-repo" \
+  && pass "preflight refuses the unrelated remote despite a checkpoint for another repo" \
+  || fail "existing-remote guard did not fire for the unnamed repo; out: $hijack_out"
+grep -q -- "--repo nathanjohnpayne/hijack-repo" "$SHIM_LOG" \
+  && fail "the refused resume still wrote to the unrelated repo; log: $(cat "$SHIM_LOG")" \
+  || pass "the refused resume performed no writes against the unrelated repo"
+
+# Layer 2 — with preflight's remote probe suppressed (BOOTSTRAP_SKIP_TOOL_CHECK=1,
+# as run_wizard sets), the stage itself must still not adopt the earlier
+# run's create: it creates hijack-repo's OWN remote.
+: >"$SHIM_LOG"
+set +e
+hijack2_out=$(run_wizard hijack-repo \
+                --target-dir "$TARGET12" \
+                --description d --visibility private \
+                --firebase none --codex-app n --project new \
+                --resume template-mirror 2>&1)
+hijack2_ec=$?
+set -e
+[ "$hijack2_ec" -eq 0 ] \
+  && pass "stage-level hijack probe ran to completion (rc=0)" \
+  || fail "stage-level hijack probe failed; rc=$hijack2_ec; out: $hijack2_out"
+grep -q "^gh repo create nathanjohnpayne/hijack-repo " "$SHIM_LOG" \
+  && pass "step 1 creates the named repo's own remote instead of inheriting the checkpointed skip" \
+  || fail "gh repo create for hijack-repo was skipped by another repo's checkpoint; log: $(cat "$SHIM_LOG")"
+grep -qxF "github-infra:remote-created:nathanjohnpayne/hijack-repo" "$TARGET12/.bootstrap-state.checkpoints" \
+  && pass "the second create records its own repo-bound checkpoint" \
+  || fail "hijack-repo create recorded no bound checkpoint: $(cat "$TARGET12/.bootstrap-state.checkpoints" 2>/dev/null)"
+
+# --- assertion 18c: the existing-remote relaxation is checkpoint-gated ---
 # Positive proof only. Without the checkpoint an existing remote still
 # fails preflight closed, so `--resume` can never be used to bootstrap
 # over a repo this run did not create.
@@ -1349,7 +1510,7 @@ echo "$nocp_out" | grep -q "remote already exists" \
   && pass "the refused resume never reached gh repo create" \
   || fail "refused resume behaved unexpectedly; log: $(cat "$SHIM_LOG")"
 
-# --- assertion 18c: a dry run never writes a checkpoint ---
+# --- assertion 18d: a dry run never writes a checkpoint ---
 # bootstrap::record_checkpoint records what the wizard DID, not what it
 # said it would do. A dry-run checkpoint would make a LATER live run skip
 # a `gh repo create` that never happened, against a remote that does not

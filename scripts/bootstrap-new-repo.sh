@@ -68,7 +68,11 @@
 #     inside a stage (`gh repo create`) additionally record a
 #     checkpoint in $TARGET_DIR/.bootstrap-state.checkpoints, which is
 #     what lets both the re-entry and this file's preflight tell "this
-#     bootstrap already did that" from "somebody else's repo".
+#     bootstrap already did that" from "somebody else's repo". The
+#     checkpoint name carries the owner/name it created, because the
+#     sidecar is per-target-dir while the repo comes from the
+#     positional argument — a resume that reuses --target-dir under a
+#     different name must not inherit the earlier run's create.
 #   - Preflight runs BEFORE prompts; we don't want to ask the human
 #     six questions and then fail on a missing `gh`.
 
@@ -459,9 +463,18 @@ preflight() {
       # `gh repo create`, never in dry-run, and never for a remote this
       # bootstrap did not create. Without it, an existing remote still
       # fails closed even under --resume.
+      #
+      # The checkpoint is looked up for THIS $full_name. The sidecar
+      # lives in the target dir but the repo name comes from the
+      # positional argument and $BOOTSTRAP_REPO_OWNER, so a resume that
+      # holds --target-dir constant while naming a different repo must
+      # not be waved through on the strength of the earlier run's
+      # create — that repo is somebody else's, and everything after
+      # preflight (labels, invites, REVIEWER_ASSIGNMENT_TOKEN) would be
+      # written into it.
       if [ "$BOOTSTRAP_RESUME_REQUESTED" = "1" ] \
-         && bootstrap::has_checkpoint "$BOOTSTRAP_GITHUB_INFRA_REMOTE_CHECKPOINT"; then
-        bootstrap::wizard_log "resume: remote $full_name exists and this bootstrap's checkpoint records that it created it — continuing"
+         && bootstrap::has_checkpoint "$(bootstrap::github_infra_remote_checkpoint "$full_name")"; then
+        bootstrap::wizard_log "resume: remote $full_name exists and this bootstrap's checkpoint records that it created that exact repo — continuing"
       else
         bootstrap::wizard_err "remote already exists: $full_name. Refusing to bootstrap over an existing repo."
         violations=$((violations + 1))
