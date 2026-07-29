@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# scripts/workflow/load_review_config.sh — emit agent-review.yml's
+# `load-config` job outputs from the review policy that GOVERNS the pull
+# request, not from whichever copy happens to be in the checkout (#788).
+#
+# WHY THIS EXISTS
+#
+# `load-config` exports four values — threshold, protected paths,
+# available_reviewers, author_identity — and they feed decisions that other
+# tools re-derive from the BASE policy:
+#
+#   reviewers        -> the `assign` job's reviewer lookup, AND the
+#                       auto-merge-on-approval registered-reviewer gate, which
+#                       mirrors scripts/codex-review-check.sh gate (b) and the
+#                       required merge-clearance-gate.
+#   author_identity  -> the `assign` job's author check.
+#   threshold/paths  -> the `triage` job's preliminary requires-review calc.
+#
+# scripts/merge-clearance-gate.sh and scripts/codex-review-check.sh already
+# read the base policy, and #769 moved the `triage` job onto it too. The
+# `load-config` step was the one surface left reading its own checkout, so on a
+# PR targeting a non-default branch whose policy names different identities the
+# pipeline could assign a reviewer who can never satisfy the base-policy gates,
+# or arm auto-merge from an identity the base policy does not permit. That is
+# the partially-threaded policy source #768/#769 set out to remove — the fix
+# here is the one those issues established, not a new mechanism: resolve once
+# through the shared resolver, then parse everything from what it returns.
+#
+# The inline step also read whatever `actions/checkout` had materialized, which
+# on a `pull_request` event is `refs/pull/N/merge` — the PR's OWN policy file,
+# including any modification the PR makes to it — and on a `pull_request_review`
+# event is the default branch. Two different policies for the same PR depending
+# on which event woke the job. Both are wrong for the same reason: the governing
+# policy is the policy of the branch the PR TARGETS.
+#
+# SCOPING — deliberate, and load-bearing
+#
+# Resolution goes through scripts/workflow/resolve_base_policy.sh, whose
+# default-base short circuit makes NO API call. That property is why it was
+# written that way (#769) and it must survive here: `load-config` runs on every
+# push to every open PR across the fleet, so an unconditional contents fetch
+# would put a new API dependency on the busiest path in the pipeline. Callers
+# must therefore pass --base-ref/--base-sha/--default-branch from the event
+# payload rather than the `--pr` form, which would fetch PR metadata even for a
+# default-base PR.
+#
+# FAILURE HANDLING
+#
+# A resolver failure means the governing policy is UNKNOWN. This script then
+# emits FAIL-CLOSED outputs and exits 0:
+#
+#   reviewers=[]        no account matches the reviewer allow-list, so `assign`
+#                       assigns nobody and the auto-merge arming gate refuses
+#                       every approval (both already default to [] and treat an
+#                       empty list as "no match" — this feeds them the same).
+#   threshold=0         every PR is at or over threshold, so `triage`'s
+#                       preliminary calculation requires external review.
+#   paths=[]            no path claims to be unprotected on evidence we do not
+#                       have; `triage` fails closed on its own resolver failure
+#                       moments later and skips the fingerprint helper entirely.
+#   author_identity=    unproven, so left empty.
+#
+# Exiting 0 is the point: `triage` declares `needs: [load-config]` without
+# `always()`, so a hard failure here SKIPS triage, and a skipped labeling job
+# is fail-OPEN (#59's SKIPPED-as-SUCCESS class). Staying green with fail-closed
+# values keeps every downstream guard armed.
+#
+# Usage:
+#   load_review_config.sh --repo owner/repo --base-ref REF --base-sha SHA \
+#                         --default-branch BRANCH [--default-config PATH] \
+#                         [--output FILE]
+#
+# --output defaults to $GITHUB_OUTPUT. Exit 2 on usage error.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+REPO=""
+BASE_REF=""
+BASE_SHA=""
+DEFAULT_BRANCH=""
+DEFAULT_CONFIG=".github/review-policy.yml"
+OUTPUT="${GITHUB_OUTPUT:-}"
+
+usage() {
+  cat >&2 <<'EOF'
+usage: load_review_config.sh --repo owner/repo --base-ref REF --base-sha SHA --default-branch BRANCH [--default-config PATH] [--output FILE]
+EOF
+  exit 2
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)           [ $# -ge 2 ] || usage; REPO="$2"; shift 2 ;;
+    --base-ref)       [ $# -ge 2 ] || usage; BASE_REF="$2"; shift 2 ;;
+    --base-sha)       [ $# -ge 2 ] || usage; BASE_SHA="$2"; shift 2 ;;
+    --default-branch) [ $# -ge 2 ] || usage; DEFAULT_BRANCH="$2"; shift 2 ;;
+    --default-config) [ $# -ge 2 ] || usage; DEFAULT_CONFIG="$2"; shift 2 ;;
+    --output)         [ $# -ge 2 ] || usage; OUTPUT="$2"; shift 2 ;;
+    -h|--help)        usage ;;
+    *) echo "load_review_config.sh: unknown arg: $1" >&2; usage ;;
+  esac
+done
+
+[ -n "$REPO" ] || usage
+[ -n "$BASE_REF" ] || usage
+[ -n "$DEFAULT_BRANCH" ] || usage
+[ -n "$OUTPUT" ] || {
+  echo "load_review_config.sh: no --output given and GITHUB_OUTPUT is unset" >&2
+  exit 2
+}
+command -v jq >/dev/null 2>&1 || { echo "load_review_config.sh: jq is required" >&2; exit 2; }
+
+emit() { printf '%s=%s\n' "$1" "$2" >> "$OUTPUT"; }
+
+# Resolve the governing policy. stderr is left attached to the caller so the
+# resolver's diagnostics land in the job log; only stdout is captured, because
+# stdout is the policy PATH and merging the streams would turn a warning into a
+# garbage filename (the #715/#716 failure class the resolver documents).
+set +e
+CONFIG=$(bash "$SCRIPT_DIR/resolve_base_policy.sh" \
+  --repo "$REPO" \
+  --base-ref "$BASE_REF" \
+  --base-sha "$BASE_SHA" \
+  --default-branch "$DEFAULT_BRANCH" \
+  --default-config "$DEFAULT_CONFIG")
+resolve_rc=$?
+set -e
+
+if [ "$resolve_rc" -ne 0 ] || [ -z "$CONFIG" ] || [ ! -f "$CONFIG" ]; then
+  echo "::warning::Could not resolve the review policy governing base '$BASE_REF' (rc=$resolve_rc); emitting fail-closed load-config outputs — empty reviewer allow-list, threshold 0 — rather than exporting identities from a policy that may not govern this PR (#788)."
+  emit threshold "0"
+  emit paths "[]"
+  emit reviewers "[]"
+  emit author_identity ""
+  exit 0
+fi
+
+if [ "$CONFIG" = "$DEFAULT_CONFIG" ]; then
+  echo "Governing review policy: $CONFIG (base '$BASE_REF' is the default branch, or predates the policy file)"
+else
+  echo "Governing review policy: $CONFIG (fetched from non-default base '$BASE_REF' at $BASE_SHA)"
+fi
+
+# The extraction expressions below are byte-for-byte the ones the inline
+# `load-config` step used, so a default-base PR — every PR in the fleet today —
+# produces identical outputs. Only the FILE they read changed.
+#
+# `parse_policy_list.sh` rather than an inline `awk '/^key:/,/^[^ ]/'` range
+# parser: the range-start pattern also matches the range-end condition, so the
+# naive form silently dropped every list entry and left `paths`/`reviewers`
+# permanently `[]` (#54, documented in #57).
+#
+# `jq -c` (compact) is required: multi-line JSON cannot be written through the
+# `key=value` GITHUB_OUTPUT format (#30/#58).
+#
+# `|| true` on the greps because this script runs under `pipefail` (the inline
+# step did not): a policy missing the key would otherwise abort the step, and a
+# failed load-config SKIPS triage — see FAILURE HANDLING above. An empty value
+# is what the inline step produced, and it is what the callers already handle.
+THRESHOLD=$({ grep 'external_review_threshold:' "$CONFIG" || true; } | awk '{print $2}')
+PATHS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" external_review_paths \
+  | jq -R -s -c 'split("\n") | map(select(length > 0))')
+REVIEWERS=$(bash "$SCRIPT_DIR/parse_policy_list.sh" "$CONFIG" available_reviewers \
+  | jq -R -s -c 'split("\n") | map(select(length > 0))')
+AUTHOR=$({ grep 'author_identity:' "$CONFIG" || true; } | awk '{print $2}')
+
+# A GITHUB_OUTPUT entry is a single `key=value` LINE. A policy that repeated a
+# scalar key would emit a second bare line that Actions then parses as its own
+# output entry — a shape newly reachable now that the policy can be fetched
+# from a non-default branch rather than only ever being the checked-out file.
+# Reduce each scalar to its first line; PATHS/REVIEWERS are single-line by
+# construction because `jq -c` compacts them.
+THRESHOLD=$(printf '%s' "$THRESHOLD" | head -n 1)
+AUTHOR=$(printf '%s' "$AUTHOR" | head -n 1)
+
+# The resolver's contract: a non-default base returns a TEMP file and the
+# caller owns cleanup. The default-config path is the caller's own checkout and
+# must never be deleted.
+[ "$CONFIG" = "$DEFAULT_CONFIG" ] || rm -f "$CONFIG"
+
+emit threshold "$THRESHOLD"
+emit paths "$PATHS"
+emit reviewers "$REVIEWERS"
+emit author_identity "${AUTHOR:-nathanjohnpayne}"

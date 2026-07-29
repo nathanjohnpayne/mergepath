@@ -12,6 +12,12 @@
 # gap, since these helpers gate whether external review is required at all.
 # This wrapper closes it.
 #
+# tests/test_resolve_base_policy.sh (#769) and tests/test_load_review_config.sh
+# (#788) join it because they cover the other half of the same decision: WHICH
+# policy the requires-review calculation is made from. The loader suite pins
+# agent-review.yml's `load-config` step to the base policy and pins the
+# default-base no-API-call short circuit that shaped the resolver.
+#
 # jq is REQUIRED, not optional (CodeRabbit, #764): the wrapped suite skips
 # itself with exit 0 when jq is absent, which this wrapper would otherwise
 # report as a pass — a green check over zero executed assertions. Fail loudly
@@ -33,6 +39,7 @@ SUITES="
 tests/test_external_review_gh_stderr.sh
 tests/test_external_review_rename_protection.sh
 tests/test_resolve_base_policy.sh
+tests/test_load_review_config.sh
 "
 
 missing=""

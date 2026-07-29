@@ -76,12 +76,35 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Trusted default-branch checkout (#788). This step now shells out to
+          # scripts/workflow/ helpers with a token in the environment, so the
+          # HELPER CODE must come from the default branch and never from the PR
+          # head — the same trust rule the triage job below states. The default
+          # checkout ref made this the PR's own merge ref on `pull_request`
+          # events and the default branch on `pull_request_review` events, so
+          # the same PR was parsed from two different files depending on which
+          # event woke the job.
+          #
+          # The POLICY the helpers read is a separate decision, resolved from
+          # the PR base by scripts/workflow/resolve_base_policy.sh below.
+          ref: ${{ github.event.repository.default_branch }}
           # Explicit-token gh / github-script only, no authenticated git, so
           # don't leave the checkout token in .git/config (#548 / Codex #550).
           persist-credentials: false
 
-      - name: Parse review-policy.yml
+      - name: Parse the governing review-policy.yml
         id: config
+        env:
+          # Only consumed on the non-default-base path, where the resolver
+          # fetches the base branch's policy. A default-base PR — every PR in
+          # the fleet today — makes no API call at all, so an unset secret is
+          # harmless there and fails closed (empty reviewer allow-list)
+          # everywhere else. Mirrors the triage job's resolver invocation.
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           CONFIG=".github/review-policy.yml"
           if [ ! -f "$CONFIG" ]; then
@@ -89,33 +112,25 @@ jobs:
             exit 1
           fi
 
-          THRESHOLD=$(grep 'external_review_threshold:' "$CONFIG" | awk '{print $2}')
-          echo "threshold=$THRESHOLD" >> "$GITHUB_OUTPUT"
-
-          # Extract external_review_paths as a JSON array. Delegates to
-          # scripts/workflow/parse_policy_list.sh (unit-tested by
-          # scripts/ci/check_workflow_parsers — see #57). History: the
-          # earlier inline `awk '/^key:/,/^[^ ]/'` range parser silently
-          # dropped all list entries because the range-start pattern
-          # also matched the range-end condition; see #54.
+          # Parsing lives in scripts/workflow/load_review_config.sh so it can
+          # be exercised hermetically (tests/test_load_review_config.sh, run by
+          # scripts/ci/check_external_review_helpers) — the same extraction
+          # this repo applied to parse_policy_list.sh after #54/#57.
           #
-          # `jq -c` (compact) is required here: multi-line JSON cannot
-          # be written via the `key=value` GITHUB_OUTPUT format. Before
-          # #54 fixed the awk extractor, PATHS was always `[]` (single-
-          # line) so this latent bug was hidden; PR #58 / #30 tripped it.
-          PATHS=$(bash scripts/workflow/parse_policy_list.sh "$CONFIG" external_review_paths \
-            | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "paths=$PATHS" >> "$GITHUB_OUTPUT"
-
-          # Extract available_reviewers as a JSON array via the same
-          # extracted parser. Before #54 this was always `[]`, which
-          # silently broke the assign step's reviewer lookup.
-          REVIEWERS=$(bash scripts/workflow/parse_policy_list.sh "$CONFIG" available_reviewers \
-            | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "reviewers=$REVIEWERS" >> "$GITHUB_OUTPUT"
-
-          AUTHOR=$(grep 'author_identity:' "$CONFIG" | awk '{print $2}')
-          echo "author_identity=${AUTHOR:-nathanjohnpayne}" >> "$GITHUB_OUTPUT"
+          # It resolves the policy that GOVERNS this PR (the base branch's)
+          # through the shared resolver that merge-clearance-gate.sh,
+          # codex-review-check.sh and the triage job also use, then emits
+          # threshold / paths / reviewers / author_identity from it. Passing
+          # --base-ref/--base-sha/--default-branch rather than --pr is
+          # load-bearing: it keeps the default-base short circuit free of any
+          # API call (#769), which matters because this job runs on every push
+          # to every open PR in the fleet.
+          bash scripts/workflow/load_review_config.sh \
+            --repo "$REPO" \
+            --base-ref "$BASE_REF" \
+            --base-sha "$BASE_SHA" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --default-config "$CONFIG"
 
   # ──────────────────────────────────────────────
   # Job 2: Auto-label PRs that need external review
