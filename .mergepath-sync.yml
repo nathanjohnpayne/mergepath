@@ -1348,7 +1348,9 @@ exclusions: []
 # The split itself is separate follow-up work.
 #
 # FIELDS:
-#   path              (required) repo-relative path, must exist on disk.
+#   path              (required) repo-relative path, must exist on disk. Paths
+#                     must be canonical spellings: no absolute paths, parent
+#                     traversal, embedded dot/empty segments, or commas.
 #   class             (required) canonical | per-repo-owned | hub-only.
 #   pending_manifest  (optional, canonical only) `true` when the class is
 #                     decided but the `paths:` entry has not landed yet.
@@ -1359,9 +1361,9 @@ exclusions: []
 #                     text: the transitional-debt record.
 #
 # ENFORCED by scripts/ci/check_doc_ownership: zero classes, two classes,
-# an unknown class, a stale path, an unbacked canonical claim, or a
-# per-repo-owned/hub-only doc sitting in a verbatim canonical/kit entry
-# all fail the check.
+# an unknown class, an unsafe/stale path, an unbacked canonical claim, an
+# unsupported canonical `dest:` remap, or a per-repo-owned/hub-only doc sitting
+# in a verbatim canonical/kit entry all fail the check.
 #
 # ADDING A DOC. A PR that adds a docs/agents/*.md file MUST add its
 # `doc_ownership:` entry in the SAME PR — the check fails closed on an

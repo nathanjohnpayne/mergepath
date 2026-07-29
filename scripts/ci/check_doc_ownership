@@ -121,8 +121,13 @@ mp_normalize_path() {
 
 mp_path_is_unsafe() {
   local p="$1"
+  local stripped="$p"
+  while [ "${stripped#./}" != "$stripped" ]; do stripped="${stripped#./}"; done
   case "$p" in
     /*|..|../*|*/..|*/../*) return 0 ;;
+  esac
+  case "$stripped" in
+    *,*|*//*|*/.|*/./*) return 0 ;;
   esac
   return 1
 }
@@ -190,14 +195,40 @@ if [ -n "$path_rows" ]; then
     p_source=$(yq -r '.source // ""' <<< "$path_row")
     p_consumers=$(yq -r '(.consumers // "") | tostring' <<< "$path_row")
     [ -z "$p_type$p_path" ] && continue
+
+    unsafe_field=""
+    unsafe_value=""
+    for field in path dest source; do
+      case "$field" in
+        path) value="$p_path" ;;
+        dest) value="$p_dest" ;;
+        source) value="$p_source" ;;
+      esac
+      if [ -n "$value" ] && mp_path_is_unsafe "$value"; then
+        unsafe_field="$field"
+        unsafe_value="$value"
+        break
+      fi
+    done
+    if [ -n "$unsafe_field" ]; then
+      echo "FAIL: paths entry '$p_path' has unsafe $unsafe_field '$unsafe_value' — absolute paths and '..' segments are not allowed; embedded '.'/empty segments and commas are also rejected"
+      FAILED=1
+      continue
+    fi
+
     n_path=$(mp_normalize_path "$p_path")
     n_dest=$(mp_normalize_path "${p_dest:-$p_path}")
     n_source=$(mp_normalize_path "${p_source:-$p_path}")
     if [ "$p_type" = "canonical" ] && [ "$p_consumers" = "all" ]; then
-      # Ownership names the document path that exists in each consumer.
-      # Propagation writes to the effective destination (`dest // path`),
-      # so a remapped entry backs that destination, never its source path.
-      canonical_exact="${canonical_exact}${n_dest},"
+      # The canonical propagation engine enumerates and materializes `.path`;
+      # it does not honor `dest`. Reject a real remap instead of recording a
+      # destination the engine will never write.
+      if [ -n "$p_dest" ] && [ "$n_dest" != "$n_path" ]; then
+        echo "FAIL: canonical manifest entry '$p_path' remaps dest to '$p_dest', but canonical propagation writes only the entry path — remove the unsupported dest remap"
+        FAILED=1
+      else
+        canonical_exact="${canonical_exact}${n_path},"
+      fi
     fi
     if [ "$p_type" = "templated" ] && [ "$n_source" = "$n_dest" ]; then
       templated_self_source_exact="${templated_self_source_exact}${n_dest},"
@@ -255,7 +286,7 @@ if [ -n "$ownership_rows" ]; then
     fi
 
     if mp_path_is_unsafe "$doc_path"; then
-      echo "FAIL: doc_ownership entry '$doc_path' is unsafe — absolute paths and '..' segments are not allowed"
+      echo "FAIL: doc_ownership entry '$doc_path' is unsafe — absolute paths and '..' segments are not allowed; embedded '.'/empty segments and commas are also rejected"
       FAILED=1
       continue
     fi

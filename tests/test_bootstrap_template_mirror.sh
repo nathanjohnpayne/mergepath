@@ -571,6 +571,13 @@ done
 [ -f "$TARGET/docs/agents/operating-rules.md" ] \
   && pass "per-repo operating-rules overlay still seeded alongside the shared core" \
   || fail "docs/agents/operating-rules.md missing from the new repo"
+
+live_overlay_banner=$(sed -n '/^>/,/^$/p' "$ROOT/docs/agents/operating-rules.md")
+if printf '%s\n' "$live_overlay_banner" | grep -Eiq "mergepath|#[0-9]+"; then
+  fail "live operating-rules banner is not consumer-neutral"
+else
+  pass "live operating-rules banner is consumer-neutral for bootstrap seeding"
+fi
 if [ -f "$TARGET/AGENTS.md" ]; then
   shared_ln=$(grep -n -F -m1 'docs/agents/shared-operating-rules.md' "$TARGET/AGENTS.md" | cut -d: -f1 || true)
   local_ln=$(grep -n -F -m1 'docs/agents/operating-rules.md' "$TARGET/AGENTS.md" | cut -d: -f1 || true)

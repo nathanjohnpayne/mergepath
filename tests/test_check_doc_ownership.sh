@@ -291,6 +291,26 @@ else
   fail "Case 6c unexpected (rc=$rc): $out"
 fi
 
+# --- Case 6d: canonical propagation does not support dest remaps ----
+MANIFEST_CANONICAL_DEST_REMAP="$MIN_HEADER
+paths:
+  - path: templates/shared.md
+    dest: docs/agents/shared.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_CANONICAL_DEST_REMAP" "$(printf 'templates/shared.md\ndocs/agents/shared.md')"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "remove the unsupported dest remap"; then
+  pass "Case 6d: canonical destination remap fails closed"
+else
+  fail "Case 6d unexpected (rc=$rc): $out"
+fi
+
 # --- Case 7a2: multiline pending note stays a single ownership row ---
 MANIFEST_PENDING_MULTILINE="$MIN_HEADER
 paths: []
@@ -556,6 +576,44 @@ if [ "$rc" = "1" ] && echo "$out" | grep -q "absolute paths and '..' segments ar
   pass "Case 9c: absolute ownership path fails closed"
 else
   fail "Case 9c unexpected (rc=$rc): $out"
+fi
+
+# --- Case 9d: embedded dot segments in paths entries are rejected ---
+MANIFEST_EMBEDDED_DOT="$MIN_HEADER
+paths:
+  - path: docs/agents/./local.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/local.md
+    class: per-repo-owned
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_EMBEDDED_DOT" "docs/agents/local.md"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "embedded '.'/empty segments"; then
+  pass "Case 9d: embedded dot segment in a manifest path fails closed"
+else
+  fail "Case 9d unexpected (rc=$rc): $out"
+fi
+
+# --- Case 9e: comma paths cannot corrupt the shell membership sets --
+MANIFEST_COMMA_PATH="$MIN_HEADER
+paths:
+  - path: docs/agents/rules.md,backup.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/rules.md,backup.md
+    class: canonical
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_COMMA_PATH" "$(printf 'docs/agents/rules.md,backup.md\ndocs/agents/rules.md')"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "commas are also rejected"; then
+  pass "Case 9e: comma-delimited path cannot corrupt ownership membership checks"
+else
+  fail "Case 9e unexpected (rc=$rc): $out"
 fi
 
 # --- Case 10: missing doc_ownership block ---------------------------
