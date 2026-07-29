@@ -34,6 +34,11 @@
 #                                including <stage>. Without, read the
 #                                last completed stage from
 #                                $TARGET_DIR/.bootstrap-state.
+#                                The explicit form may only REWIND: the
+#                                stage it names must appear in the state
+#                                file, so a resume can never skip a stage
+#                                that never completed (use
+#                                BOOTSTRAP_SKIP_STAGES for that).
 #   --target-dir <path>          Override the new repo's local working
 #                                tree path. Default: $HOME/GitHub/<name>.
 #   --help, -h                   Show this help.
@@ -63,6 +68,16 @@
 #   - The state file is append-only; --resume reads the last line.
 #     This keeps the resume semantics simple (last-wins) and
 #     auditable (the file is the full stage-completion log).
+#   - A stage records completion only when it finishes, so an abort
+#     part-way through is re-entered from the top. Irreversible steps
+#     inside a stage (`gh repo create`) additionally record a
+#     checkpoint in $TARGET_DIR/.bootstrap-state.checkpoints, which is
+#     what lets both the re-entry and this file's preflight tell "this
+#     bootstrap already did that" from "somebody else's repo". The
+#     checkpoint name carries the owner/name it created, because the
+#     sidecar is per-target-dir while the repo comes from the
+#     positional argument — a resume that reuses --target-dir under a
+#     different name must not inherit the earlier run's create.
 #   - Preflight runs BEFORE prompts; we don't want to ask the human
 #     six questions and then fail on a missing `gh`.
 
@@ -402,18 +417,32 @@ preflight() {
   #    an existing tree.
   if [ -d "$TARGET_DIR" ]; then
     # Allow the dir if it's empty OR contains only resume bookkeeping
-    # (.bootstrap-state, its .warnings sidecar written by
-    # bootstrap::record_warning, and .bootstrap-log). Omitting the
+    # (.bootstrap-state, the .warnings sidecar written by
+    # bootstrap::record_warning, the .checkpoints sidecar written by
+    # bootstrap::record_checkpoint, and .bootstrap-log). Omitting the
     # warnings sidecar here made any run that recorded a warning
     # poison its own --resume (#755 round 2).
     local extra
     extra=$(find "$TARGET_DIR" -mindepth 1 -maxdepth 1 \
               ! -name '.bootstrap-state' \
               ! -name '.bootstrap-state.warnings' \
+              ! -name '.bootstrap-state.checkpoints' \
               ! -name '.bootstrap-log' 2>/dev/null | head -1)
     if [ -n "$extra" ]; then
-      bootstrap::wizard_err "target dir $TARGET_DIR is not empty (contains: $extra ...). Refusing to overwrite."
-      violations=$((violations + 1))
+      # A --resume run re-enters a target the earlier stages already
+      # populated, so the emptiness rule cannot apply to it: once
+      # template-mirror has rsynced the template in, EVERY resume past
+      # that stage was rejected here before dispatch ever ran (#761
+      # item 3). The relaxation is gated on the state file so --resume
+      # still cannot be used to overwrite a directory this wizard never
+      # bootstrapped — a populated dir with no .bootstrap-state is
+      # somebody else's tree and is still refused.
+      if [ "$BOOTSTRAP_RESUME_REQUESTED" = "1" ] && [ -f "$BOOTSTRAP_STATE_FILE" ]; then
+        bootstrap::wizard_log "resume: target dir $TARGET_DIR is already populated by earlier stages ($BOOTSTRAP_STATE_FILE present) — emptiness check relaxed"
+      else
+        bootstrap::wizard_err "target dir $TARGET_DIR is not empty (contains: $extra ...). Refusing to overwrite."
+        violations=$((violations + 1))
+      fi
     fi
   fi
 
@@ -428,8 +457,33 @@ preflight() {
     GH_TOKEN="${OP_PREFLIGHT_AUTHOR_PAT:-${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}}" \
       gh repo view "$full_name" >/dev/null 2>&1 || _gh_repo_view_rc=$?
     if [ "$_gh_repo_view_rc" -eq 0 ]; then
-      bootstrap::wizard_err "remote already exists: $full_name. Refusing to bootstrap over an existing repo."
-      violations=$((violations + 1))
+      # An existing remote is normally proof this repo is not greenfield.
+      # It is NOT when this bootstrap created it itself: stage C creates
+      # the remote first and records stage completion last, so any abort
+      # in between (a BOOTSTRAP_STRICT_SECRETS=1 secret failure, above
+      # all) leaves a remote the operator is then told to retry past with
+      # `--resume template-mirror` — and this check refused every such
+      # retry (#761 item 3). Positive proof only: the checkpoint sidecar
+      # is written by bootstrap::record_checkpoint after a successful
+      # `gh repo create`, never in dry-run, and never for a remote this
+      # bootstrap did not create. Without it, an existing remote still
+      # fails closed even under --resume.
+      #
+      # The checkpoint is looked up for THIS $full_name. The sidecar
+      # lives in the target dir but the repo name comes from the
+      # positional argument and $BOOTSTRAP_REPO_OWNER, so a resume that
+      # holds --target-dir constant while naming a different repo must
+      # not be waved through on the strength of the earlier run's
+      # create — that repo is somebody else's, and everything after
+      # preflight (labels, invites, REVIEWER_ASSIGNMENT_TOKEN) would be
+      # written into it.
+      if [ "$BOOTSTRAP_RESUME_REQUESTED" = "1" ] \
+         && bootstrap::has_checkpoint "$(bootstrap::github_infra_remote_checkpoint "$full_name")"; then
+        bootstrap::wizard_log "resume: remote $full_name exists and this bootstrap's checkpoint records that it created that exact repo — continuing"
+      else
+        bootstrap::wizard_err "remote already exists: $full_name. Refusing to bootstrap over an existing repo."
+        violations=$((violations + 1))
+      fi
     fi
   fi
 
@@ -620,6 +674,38 @@ dispatch() {
         bootstrap::wizard_err "If the state file is the source: edit or remove $BOOTSTRAP_STATE_FILE and re-run."
         return 1
       fi
+      # An EXPLICIT --resume <stage> may rewind, never fast-forward.
+      # `--resume X` skips every stage up to and including X, so naming a
+      # stage the state file never recorded as completed skips work that
+      # never happened — and the remaining stages can then run green,
+      # exiting 0 over a bootstrap that is missing a whole stage. The
+      # same silent false-success the unknown-stage guard above closes,
+      # reached with a stage name that happens to be spelled right.
+      #
+      # Naming an EARLIER stage than the last recorded one stays allowed:
+      # that redoes completed work, which is the flag's real job (the
+      # stages are idempotent, and `gh repo create` is checkpointed).
+      # The state-file lookup is skipped only for the explicit form —
+      # bare `--resume` reads the last recorded stage, so it can never
+      # name an unrecorded one.
+      #
+      # This is what makes the wizard's own printed remediation
+      # trustworthy: it names a recorded stage (see the failure branch
+      # below), and anything a human types instead is held to the same
+      # rule rather than silently skipping the stage that just failed.
+      if [ -n "$BOOTSTRAP_RESUME_STAGE" ] \
+         && ! bootstrap::stage_recorded "$resume_after"; then
+        bootstrap::wizard_err "refusing --resume $resume_after: $BOOTSTRAP_STATE_FILE does not record '$resume_after' as completed, so resuming past it would skip a stage that never ran"
+        local _last_done
+        _last_done=$(bootstrap::last_completed_stage)
+        if [ -n "$_last_done" ]; then
+          bootstrap::wizard_err "last completed stage per the state file: '$_last_done' — use --resume $_last_done (or plain --resume) to re-enter everything after it."
+        else
+          bootstrap::wizard_err "the state file records no completed stage — drop --resume entirely and re-run from the top."
+        fi
+        bootstrap::wizard_err "To skip a stage you completed by hand, set BOOTSTRAP_SKIP_STAGES=$resume_after (or add the stage to $BOOTSTRAP_STATE_FILE) — --resume is not a stage-skip flag."
+        return 1
+      fi
       bootstrap::wizard_log "resume: skipping stages up to and including '$resume_after'"
     fi
   fi
@@ -675,7 +761,40 @@ dispatch() {
     local stage_rc=0
     "$fn" || stage_rc=$?
     if [ "$stage_rc" -ne 0 ]; then
-      bootstrap::wizard_err "stage '$stage' failed (rc=$stage_rc). Resume with: $0 ${BOOTSTRAP_INPUT_REPO_NAME} --resume $stage"
+      # The resume command must name the stage BEFORE the one that
+      # failed. `--resume X` skips up to AND INCLUDING X, so printing the
+      # FAILED stage's own name told the operator to skip precisely the
+      # work that did not happen: after a strict-secrets abort,
+      # `--resume github-infra` skipped the token retry; after a stage D
+      # failure, `--resume firebase-and-codereview` skipped Firebase
+      # entirely — and the remaining stages then completed with exit 0
+      # over a half-bootstrapped repo. Harmless only while preflight
+      # refused to start on the existing remote at all; the resume
+      # checkpoint removed that accidental backstop, which is what turned
+      # a wrong hint into a live false-success path (#790).
+      #
+      # Pick the LAST RECORDED stage strictly before the failed one, not
+      # simply its positional predecessor: a predecessor that was skipped
+      # via BOOTSTRAP_SKIP_STAGES is not in the state file, and naming it
+      # would print a command the rewind-only guard above rejects. Under
+      # a rewind (state file already holds later stages) the same walk
+      # still names the predecessor rather than the file's last line, so
+      # the failed stage is never skipped. Nothing recorded before it
+      # means there is nothing to resume past — say so instead of
+      # printing a --resume the wizard would refuse.
+      local _resume_hint="" _candidate
+      for _candidate in "${STAGES[@]}"; do
+        [ "$_candidate" = "$stage" ] && break
+        if bootstrap::stage_recorded "$_candidate"; then
+          _resume_hint="$_candidate"
+        fi
+      done
+      if [ -n "$_resume_hint" ]; then
+        bootstrap::wizard_err "stage '$stage' failed (rc=$stage_rc). Resume with: $0 ${BOOTSTRAP_INPUT_REPO_NAME} --target-dir $TARGET_DIR --resume $_resume_hint"
+        bootstrap::wizard_err "(--resume skips up to AND INCLUDING the stage it names, so '$_resume_hint' is what re-enters the failed '$stage'.)"
+      else
+        bootstrap::wizard_err "stage '$stage' failed (rc=$stage_rc). No earlier stage completed, so there is nothing to resume past — fix the cause and re-run the same command WITHOUT --resume."
+      fi
       return 3
     fi
   done

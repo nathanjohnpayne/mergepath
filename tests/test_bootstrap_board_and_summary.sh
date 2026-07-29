@@ -134,7 +134,27 @@ case "$1" in
       *) exit 0 ;;
     esac
     ;;
-  repo|label|api|secret|pr)
+  repo)
+    # Stage C creates the remote and then pushes separately (#790), so
+    # the shim has to leave behind an `origin` the real `git push` can
+    # reach: a bare repo beside the shim log.
+    if [ "$2" = "create" ]; then
+      remote_root="$(dirname "$LOG")/remotes"
+      src=""
+      for arg in "$@"; do
+        case "$arg" in --source=*) src="${arg#--source=}" ;; esac
+      done
+      bare="$remote_root/${3##*/}.git"
+      mkdir -p "$remote_root"
+      git init -q --bare "$bare" 2>/dev/null
+      if [ -n "$src" ] && [ -d "$src/.git" ]; then
+        git -C "$src" remote remove origin >/dev/null 2>&1 || true
+        git -C "$src" remote add origin "$bare"
+      fi
+    fi
+    exit 0
+    ;;
+  label|api|secret|pr)
     if [ "$1" = "secret" ] && [ "$2" = "set" ]; then
       cat >/dev/null 2>&1 || true
     fi
@@ -632,6 +652,56 @@ echo "$out9" | grep -q "RECORDED FAILURES" \
 echo "$out9" | grep -qF "  ok - fixed on the retry" \
   && pass "all-resolved sidecar still surfaces the record under RESOLVED" \
   || fail "all-resolved sidecar dropped the record; out: $out9"
+
+# ---------------------------------------------------------------------------
+# Test 7b: only a KEYED record can be classified resolved (#781 item 3).
+#
+# bootstrap::_resolve_recorded_warning is the only producer of the
+# RESOLVED: marker and it always writes "@<key><TAB>RESOLVED: …" — it
+# exists to replace the keyed line it just read. bootstrap::record_warning
+# persists an UNKEYED message verbatim, so an unkeyed record whose text
+# merely starts with "RESOLVED: " is not a resolution record at all. When
+# the renderer tested the message field alone, such a record was silently
+# downgraded out of the one block that tells the operator a miss must be
+# fixed before the first PR.
+#
+# Both directions are pinned: the unkeyed look-alike stays outstanding,
+# and a genuinely keyed resolved record in the SAME sidecar is still
+# downgraded (so the narrowing didn't just disable the RESOLVED block).
+# ---------------------------------------------------------------------------
+TARGET10="$WORKDIR/warn-unkeyed-lookalike"
+rm -rf "$TARGET10"
+mkdir -p "$TARGET10"
+cp "$TARGET8/.bootstrap-state" "$TARGET10/.bootstrap-state"
+printf 'RESOLVED: an unkeyed record that merely starts with the marker text\n' \
+  >"$TARGET10/.bootstrap-state.warnings"
+printf '@reviewer-assignment-token\tRESOLVED: a genuinely keyed resolution record\n' \
+  >>"$TARGET10/.bootstrap-state.warnings"
+set +e
+out10=$(bash -c '
+  ROOT="'"$ROOT"'"
+  TARGET="'"$TARGET10"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/board-and-summary.sh"
+  BOOTSTRAP_STATE_FILE="$TARGET/.bootstrap-state"
+  BOOTSTRAP_LOG_FILE=""
+  BOOTSTRAP_INPUT_FIREBASE=none
+  bootstrap::_print_summary "nathanjohnpayne/unkeyed-repo" "$TARGET" "private" "" "project=skip"
+' 2>&1)
+ec10=$?
+set -e
+[ "$ec10" -eq 0 ] \
+  && pass "summary renders an unkeyed marker-lookalike sidecar (rc=0)" \
+  || fail "unkeyed-lookalike summary failed; rc=$ec10; out: $out10"
+echo "$out10" | grep -qF "  !! - RESOLVED: an unkeyed record that merely starts with the marker text" \
+  && pass "unkeyed record starting with the marker stays in RECORDED FAILURES (#781 item 3)" \
+  || fail "unkeyed marker-lookalike was misclassified as resolved; out: $out10"
+echo "$out10" | grep -qF "  ok - an unkeyed record that merely starts with the marker text" \
+  && fail "unkeyed marker-lookalike rendered under RESOLVED; out: $out10" \
+  || pass "unkeyed marker-lookalike does not appear under RESOLVED"
+echo "$out10" | grep -qF "  ok - a genuinely keyed resolution record" \
+  && pass "a keyed resolution record in the same sidecar is still downgraded" \
+  || fail "narrowing disabled the RESOLVED block for keyed records; out: $out10"
 
 # ---------------------------------------------------------------------------
 # Summary
