@@ -27,8 +27,13 @@
 #      commit.gpgsign / tag.gpgsign override. Commit identity belongs in
 #      the machine's --global config; a repo-local copy is either the #777
 #      corruption or an undeclared per-repo identity, and both are worth
-#      a failure. Set MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 to opt out on a
-#      checkout that genuinely wants a per-repo identity.
+#      a failure. A key set to the EMPTY string counts: it does not fall
+#      back to the global value, it MASKS it, and `git var
+#      GIT_AUTHOR_IDENT` then fails with "empty ident name". The failure
+#      names each offender and prints the exact unset command for it, in
+#      the scope it is actually set in. Set
+#      MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 to opt out on a checkout that
+#      genuinely wants a per-repo identity.
 #
 #   B. Baseline comparison (`--snapshot`, then a later plain run).
 #      `--snapshot` copies .git/config to a scratch path inside the git
@@ -51,6 +56,13 @@
 #      not writes and are never flagged; neither is the ephemeral
 #      `git -c key=value <cmd>` form, which mutates no file.
 #
+#      The scan works on LOGICAL commands, not physical lines:
+#      backslash-continued lines are joined first. A command split as
+#      `git \` + `config user.email …` puts the verb and the subcommand
+#      on different lines, and each half alone matches nothing — so a
+#      line-at-a-time scan would wave through the precise write this
+#      check exists to reject.
+#
 #      Markdown is IN scope on purpose. The #777 writer was not a test —
 #      it was REVIEW_POLICY.md § Git Identity Switching, which instructed
 #      agents to run exactly `git config user.email "nathan@…example"`
@@ -71,7 +83,18 @@
 # enables the `--worktree` SCOPE; an unscoped or `--local` write still
 # lands in the shared .git/config that every worktree reads. It is worth
 # having for other reasons, but it is not a mitigation for #777 — Part A
-# is, which is why Part A inspects the worktree scope too.
+# is, which is why Part A inspects the worktree scope too. It probes that
+# scope only where the extension makes it a distinct file: with the
+# extension off, `--worktree` resolves to `--local`, so probing both would
+# report one override twice under two names.
+#
+# Parts A and B run TWICE: once before the paired regression suite and
+# again after it. The suite is a tracked test that the static scan
+# deliberately excludes (it carries the forbidden idiom as fixtures), and
+# it is the last thing this check runs — so without the second pass, a
+# suite that wrote the live .git/config would still leave the check
+# reporting PASS, and the "the whole job leaves .git/config untouched"
+# guarantee would stop one step short of the job's actual end.
 #
 # Env overrides (used by tests/test_git_identity_hygiene.sh):
 #   MERGEPATH_GIT_IDENTITY_ROOT — point the check at a fixture tree
@@ -79,6 +102,11 @@
 #     to `find`, the live-repo assertion probes the fixture, and the
 #     paired test suite is not re-run (recursion guard).
 #   MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 — skip Part A.
+#   MERGEPATH_GIT_IDENTITY_SUITE — run this script as the paired suite
+#     instead of tests/test_git_identity_hygiene.sh, and run it even
+#     under a fixture root. Exists so the post-suite re-assertion can be
+#     tested with a stub suite that mutates the fixture's config. Never
+#     set it to something that re-invokes this check, which would recurse.
 #
 # Exit codes:
 #   0 — pass (or a documented skip).
@@ -101,6 +129,10 @@ esac
 # short: this guard is about WHO a commit claims to be, not about general
 # git config hygiene.
 IDENTITY_KEYS="user.name user.email user.signingkey commit.gpgsign tag.gpgsign"
+
+# Declared here rather than at the call site so the post-suite failure
+# message can name it under `set -u`.
+TEST_SUITE="${MERGEPATH_GIT_IDENTITY_SUITE:-$SELF_ROOT/tests/test_git_identity_hygiene.sh}"
 
 FAILED=0
 
@@ -139,31 +171,73 @@ if [ "$MODE" = "snapshot" ]; then
 fi
 
 # ── Part A: live-repo identity assertion ──────────────────────────────
-if [ "${MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY:-}" = "1" ]; then
-  echo "check_git_identity_hygiene: Part A skipped (MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1)"
-elif ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-  echo "check_git_identity_hygiene: Part A skipped (not a git repository: $REPO_ROOT)"
-else
-  OFFENDERS=""
-  for scope in local worktree; do
+# $1 is the phase label: "pre-suite" on the first pass, "post-suite" on
+# the re-run after the paired regression suite. Skip notices print once.
+assert_no_local_identity() {
+  local phase="$1"
+  if [ "${MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY:-}" = "1" ]; then
+    [ "$phase" = "post-suite" ] \
+      || echo "check_git_identity_hygiene: Part A skipped (MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1)"
+    return 0
+  fi
+  if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    [ "$phase" = "post-suite" ] \
+      || echo "check_git_identity_hygiene: Part A skipped (not a git repository: $REPO_ROOT)"
+    return 0
+  fi
+
+  local offenders="" remedies="" scope key v found scopes
+  # `--worktree` is a DISTINCT scope only when extensions.worktreeConfig
+  # is enabled; with the extension off git treats it as an alias for
+  # `--local`, so probing both would report every local setting twice and
+  # print two remediation commands for one override. Probe the worktree
+  # scope only where it is real, and each offender is then named once, in
+  # the scope that actually holds it.
+  scopes="local"
+  if [ "$(git -C "$REPO_ROOT" config --local --get --type=bool \
+            extensions.worktreeConfig 2>/dev/null || true)" = "true" ]; then
+    scopes="local worktree"
+  fi
+  for scope in $scopes; do
     for key in $IDENTITY_KEYS; do
-      # `--worktree` errors out when extensions.worktreeConfig is unset;
-      # a missing key exits 1. Both are "nothing set", hence the guard.
-      values="$(git -C "$REPO_ROOT" config "--$scope" --get-all "$key" 2>/dev/null || true)"
-      [ -n "$values" ] || continue
+      # Absence is "no output": a missing key exits 1, and `--worktree`
+      # errors out when extensions.worktreeConfig is unset. A key set to
+      # the EMPTY string is a different thing entirely — it exits 0 and
+      # prints an empty line, and it is an override like any other: an
+      # empty repo-local user.email MASKS the global one, after which
+      # `git var GIT_AUTHOR_IDENT` fails with "empty ident name". Reading
+      # values off the command's stdout, rather than testing a captured
+      # string for emptiness, keeps that case visible.
+      found=0
       while IFS= read -r v; do
-        [ -n "$v" ] || continue
-        OFFENDERS+="  $scope: $key = $v"$'\n'
-      done <<EOF
-$values
-EOF
+        found=1
+        if [ -n "$v" ]; then
+          offenders+="  $scope: $key = $v"$'\n'
+        else
+          offenders+="  $scope: $key = (set to the empty string)"$'\n'
+        fi
+      done < <(git -C "$REPO_ROOT" config "--$scope" --get-all "$key" 2>/dev/null)
+      [ "$found" -eq 1 ] || continue
+      # One unset command per key that is ACTUALLY set, in the scope it
+      # is actually set in. A fixed list would omit keys and name the
+      # wrong scope, leaving the operator to run commands that clear
+      # nothing and a check that fails again identically.
+      remedies+="    git config --$scope --unset-all $key"$'\n'
     done
   done
-  if [ -n "$OFFENDERS" ]; then
-    cat >&2 <<EOF
+  [ -n "$offenders" ] || return 0
+
+  local origin=""
+  if [ "$phase" = "post-suite" ]; then
+    origin="These were NOT present before the regression suite ran, so the suite
+itself wrote them into this repository's config.
+
+"
+  fi
+  cat >&2 <<EOF
 check_git_identity_hygiene: FAIL (repo-local git identity override)
 
-This checkout's git config overrides the machine's global commit
+${origin}This checkout's git config overrides the machine's global commit
 identity. Every worktree of this repository shares that config, so every
 commit made from any of them is attributed — and signed — under the
 override rather than the operator's real identity. This is the
@@ -171,29 +245,41 @@ mergepath#777 corruption; it reached main twice before it was noticed.
 
 Offending settings:
 
-$OFFENDERS
+$offenders
 Clear them (the values are not recoverable afterwards, so read them
 first if one was deliberate):
 
-    git config --local --unset-all user.name
-    git config --local --unset-all user.email
-    git config --local --unset-all commit.gpgsign
-
+$remedies
 If this checkout genuinely wants a per-repo identity, set
 MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 for the check.
 EOF
-    FAILED=1
-  fi
-fi
+  return 1
+}
 
 # ── Part B: .git/config byte-comparison against a recorded baseline ───
-if BASE="$(baseline_path 2>/dev/null)" && [ -f "$BASE" ]; then
-  CFG="$(config_path)"
-  if ! cmp -s "$BASE" "$CFG"; then
-    cat >&2 <<EOF
+# Same two-phase contract as Part A: $1 is "pre-suite" or "post-suite".
+assert_config_unchanged() {
+  local phase="$1" base cfg culprit
+  base="$(baseline_path 2>/dev/null)" || return 0
+  [ -f "$base" ] || return 0
+  cfg="$(config_path)"
+  if cmp -s "$base" "$cfg"; then
+    if [ "$phase" = "post-suite" ]; then
+      echo "check_git_identity_hygiene: .git/config unchanged by the regression suite"
+    else
+      echo "check_git_identity_hygiene: .git/config unchanged since snapshot"
+    fi
+    return 0
+  fi
+  if [ "$phase" = "post-suite" ]; then
+    culprit="The regression suite just run by this check ($TEST_SUITE) wrote to"
+  else
+    culprit="Something between the \`--snapshot\` call and now wrote to"
+  fi
+  cat >&2 <<EOF
 check_git_identity_hygiene: FAIL (.git/config changed since the snapshot)
 
-Something between the \`--snapshot\` call and now wrote to this
+$culprit this
 repository's own .git/config. A test that builds a fixture repo must
 target it explicitly (\`git -C "\$FIXTURE" config …\`); an unscoped
 \`git config\` resolves against whatever repository the process is
@@ -201,12 +287,12 @@ standing in, which in a test run is this one.
 
 Diff (baseline → current):
 EOF
-    diff -u "$BASE" "$CFG" >&2 || true
-    FAILED=1
-  else
-    echo "check_git_identity_hygiene: .git/config unchanged since snapshot"
-  fi
-fi
+  diff -u "$base" "$cfg" >&2 || true
+  return 1
+}
+
+assert_no_local_identity pre-suite || FAILED=1
+assert_config_unchanged pre-suite || FAILED=1
 
 # ── Part C: static scan for the unscoped-write idiom (hub-only) ───────
 HUB_MARKER="$REPO_ROOT/scripts/sync-to-downstream.sh"
@@ -295,18 +381,66 @@ else
       if (s ~ /--rename-section/) return 1
       return 0
     }
-    {
-      if ($0 ~ /GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/) next
-      if (!is_git_config($0)) next
-      if (!writes_identity($0)) next
-      if (targeted($0)) next
-      if (not_a_write($0)) next
-      rel = FILENAME
-      sub("^" root, "", rel)
-      print rel ":" FNR ":" $0
-      found = 1
+    function offending(s) {
+      if (!is_git_config(s)) return 0
+      if (!writes_identity(s)) return 0
+      if (targeted(s)) return 0
+      if (not_a_write(s)) return 0
+      return 1
     }
-    END { exit found ? 1 : 0 }
+    # A backslash-continued line is HALF a command, and neither half
+    # matches the patterns above: `git \` carries no `config`, and
+    # `config user.email leak@example.com` carries no `git`. Scanning
+    # physical lines therefore misses exactly the write this check
+    # exists to reject, so lines are joined into logical commands first.
+    # A trailing run of backslashes continues the command only when the
+    # run is ODD — an even run is escaped backslashes, and the command
+    # ends there.
+    function continued(s,   i, n) {
+      n = 0
+      for (i = length(s); i > 0; i--) {
+        if (substr(s, i, 1) != "\\") break
+        n++
+      }
+      return n % 2
+    }
+    # Both the exemption marker and the suppressors (`-C`, `--global`,
+    # `--unset`, …) are read off the JOINED command, because they belong
+    # to the same invocation wherever in it they appear — and because a
+    # shell command cannot carry a trailing `#` comment on any physical
+    # line but its last, so a multi-line command has nowhere else to put
+    # its GIT_IDENTITY_SCOPE_EXEMPT marker. The per-physical-line hit is
+    # kept as well so a Markdown hard break (a prose line ending in `\`)
+    # cannot mask a self-contained write on the following line.
+    function flush(   rel, hitline, hittext) {
+      if (nbuf == 0) return
+      if (buf !~ /GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/) {
+        hitline = 0
+        if (physline > 0)        { hitline = physline; hittext = phystext }
+        else if (offending(buf)) { hitline = start;    hittext = buf }
+        if (hitline > 0) {
+          rel = grpfile
+          sub("^" root, "", rel)
+          print rel ":" hitline ":" hittext
+          found = 1
+        }
+      }
+      buf = ""; nbuf = 0; physline = 0; phystext = ""
+    }
+    # A group left dangling by a file whose last line ends in `\` must
+    # not absorb the first line of the next file.
+    FNR == 1 { flush() }
+    {
+      if (nbuf == 0) { start = FNR; grpfile = FILENAME }
+      nbuf++
+      if (physline == 0 && offending($0)) { physline = FNR; phystext = $0 }
+      piece = $0
+      if (continued($0)) piece = substr(piece, 1, length(piece) - 1)
+      buf = (nbuf == 1 ? "" : buf " ") piece
+      if (continued($0)) next
+      flush()
+    }
+    END { flush(); exit found ? 1 : 0 }
     ' "${SCAN_FILES[@]}" > "$HITS" 2>/dev/null
     scan_rc=$?
     set -e
@@ -344,12 +478,25 @@ fi
 # ── Paired regression suite ───────────────────────────────────────────
 # Skipped under the fixture-root override so the suite's own invocations
 # do not recurse (the check_mktemp_portability / check_sync_manifest
-# recursion-guard pattern).
-TEST_SUITE="$SELF_ROOT/tests/test_git_identity_hygiene.sh"
-if [ -z "$FIXTURE_ROOT" ] && [ -f "$TEST_SUITE" ]; then
+# recursion-guard pattern). An explicit MERGEPATH_GIT_IDENTITY_SUITE
+# names a stub suite and overrides the recursion guard, which is how the
+# post-suite re-assertion below is itself tested.
+if { [ -n "${MERGEPATH_GIT_IDENTITY_SUITE:-}" ] || [ -z "$FIXTURE_ROOT" ]; } \
+  && [ -f "$TEST_SUITE" ]; then
   echo "check_git_identity_hygiene: running regression test suite"
   if ! bash "$TEST_SUITE"; then
     echo "check_git_identity_hygiene: FAIL (regression test suite failed)" >&2
+    exit 1
+  fi
+
+  # The suite is the LAST thing this check runs, it is a tracked file the
+  # static scan deliberately excludes, and the assertions above already
+  # finished before it started. Re-running them is what makes the
+  # "nothing in this job moved .git/config" guarantee cover the whole job
+  # rather than everything-except-its-final-step.
+  assert_no_local_identity post-suite || FAILED=1
+  assert_config_unchanged post-suite || FAILED=1
+  if [ "$FAILED" -ne 0 ]; then
     exit 1
   fi
 fi

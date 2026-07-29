@@ -11,6 +11,10 @@
 #      while the suite runs);
 #   C. the static scan for unscoped `git config <identity-key> <value>`.
 #
+# Plus the re-run of A and B AFTER the paired regression suite, which is
+# what extends the "nothing moved .git/config" guarantee to the end of
+# the CI job rather than to the step before its last one.
+#
 # Every case pivots the check onto a fixture tree via
 # MERGEPATH_GIT_IDENTITY_ROOT, so nothing here touches the real repo.
 
@@ -190,13 +194,71 @@ else
   fail "consumer checkout: rc=$RC out=$OUT"
 fi
 
+# Case 11: a backslash continuation between `git` and `config`. Neither
+# physical line matches on its own — the first carries no `config`, the
+# second no `git` — so a line-at-a-time scan waves through exactly the
+# write this check exists to reject. The command is reported at the line
+# the logical command STARTS on.
+run_on_fixture "tests/split-verb.sh" '#!/usr/bin/env bash
+git \
+config user.email "leak@example.com"
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "unscoped git identity write" \
+  && printf '%s' "$OUT" | grep -q "tests/split-verb.sh:2"; then
+  pass "continuation between git and config: caught"
+else
+  fail "continuation between git and config: rc=$RC out=$OUT"
+fi
+
+# Case 12: the other split — the value moves to the next physical line,
+# so the key is followed by a line continuation rather than a value token.
+run_on_fixture "tests/split-value.sh" '#!/usr/bin/env bash
+git config user.email \
+  "leak@example.com"
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/split-value.sh:2"; then
+  pass "continuation between key and value: caught"
+else
+  fail "continuation between key and value: rc=$RC out=$OUT"
+fi
+
+# Case 13: joining must not invent hits. A continued command whose scope
+# flag sits on its own physical line is correctly scoped and must pass —
+# the suppressors are read off the whole logical command, not one line.
+run_on_fixture "tests/split-global.sh" '#!/usr/bin/env bash
+git config \
+  --global \
+  user.email "you@example.com"
+'
+if [ "$RC" = "0" ]; then
+  pass "continued --global write: allowed"
+else
+  fail "continued --global write: rc=$RC out=$OUT"
+fi
+
+# Case 14: a shell command cannot carry a trailing `#` comment on any
+# physical line but its last, so a multi-line command has nowhere else
+# to put its exemption marker. The marker must therefore exempt the
+# whole logical command, not just the physical line it sits on.
+run_on_fixture "tests/split-exempt.sh" '#!/usr/bin/env bash
+git config user.email \
+  "t@t"  # GIT_IDENTITY_SCOPE_EXEMPT: deliberate, runs only in a container
+'
+if [ "$RC" = "0" ]; then
+  pass "exemption marker on the last line of a continued command: allowed"
+else
+  fail "exemption marker on a continued command: rc=$RC out=$OUT"
+fi
+
 # ── Part A: the live-repo identity assertion ──────────────────────────
 
 IDREPO="$WORKDIR/idrepo"
 git init -q -b main "$IDREPO"
 printf '#!/usr/bin/env bash\n' > "$IDREPO/marker.sh"
 
-# Case 11: a clean fixture repo passes.
+# Case 15: a clean fixture repo passes.
 set +e
 OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$IDREPO" bash "$CHECK" 2>&1)"
 RC=$?
@@ -207,7 +269,7 @@ else
   fail "fixture repo with no local identity: rc=$RC out=$OUT"
 fi
 
-# Case 12: the exact #777 corruption — a repo-local user block plus a
+# Case 16: the exact #777 corruption — a repo-local user block plus a
 # disabled gpgsign — must fail, naming every offending key.
 git -C "$IDREPO" config --local user.name "nathanjohnpayne"
 git -C "$IDREPO" config --local user.email "nathan@nathanjohnpayne.example"
@@ -226,7 +288,65 @@ else
   fail "repo-local identity override: rc=$RC out=$OUT"
 fi
 
-# Case 13: the documented opt-out for a checkout that wants its own
+# Case 17: the remediation must clear the offenders it just reported.
+# `user.signingkey` and `tag.gpgsign` are checked keys, and `--worktree`
+# is a checked scope, so a fixed three-command `--local` block would
+# print instructions that clear nothing and leave the next run failing
+# identically. Each command is generated from a real offender.
+SIGREPO="$WORKDIR/sigrepo"
+git init -q -b main "$SIGREPO"
+git -C "$SIGREPO" config --local extensions.worktreeConfig true
+git -C "$SIGREPO" config --local user.signingkey ABC123
+git -C "$SIGREPO" config --local tag.gpgsign false
+git -C "$SIGREPO" config --worktree user.email "wt@example.com"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SIGREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q -- "git config --local --unset-all user.signingkey" \
+  && printf '%s' "$OUT" | grep -q -- "git config --local --unset-all tag.gpgsign" \
+  && printf '%s' "$OUT" | grep -q -- "git config --worktree --unset-all user.email"; then
+  pass "remediation: one unset command per offender, in its own scope"
+else
+  fail "remediation commands: rc=$RC out=$OUT"
+fi
+
+# ... and running exactly those commands must actually clear the repo.
+git -C "$SIGREPO" config --local --unset-all user.signingkey
+git -C "$SIGREPO" config --local --unset-all tag.gpgsign
+git -C "$SIGREPO" config --worktree --unset-all user.email
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SIGREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ]; then
+  pass "remediation: following the printed commands clears the failure"
+else
+  fail "remediation did not clear the failure: rc=$RC out=$OUT"
+fi
+
+# Case 18: a key explicitly set to the EMPTY string is an override too.
+# It is not "unset": it MASKS the machine's global value, after which
+# `git var GIT_AUTHOR_IDENT` fails outright with "empty ident name", so
+# treating an empty captured value as "nothing configured" would wave
+# through a checkout that cannot commit at all.
+EMPTYREPO="$WORKDIR/emptyrepo"
+git init -q -b main "$EMPTYREPO"
+git -C "$EMPTYREPO" config --local user.email ""
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$EMPTYREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "local: user.email = (set to the empty string)" \
+  && printf '%s' "$OUT" | grep -q -- "git config --local --unset-all user.email"; then
+  pass "empty-string local identity value: caught as an override"
+else
+  fail "empty-string local identity value: rc=$RC out=$OUT"
+fi
+
+# Case 19: the documented opt-out for a checkout that wants its own
 # identity on purpose.
 set +e
 OUT="$(MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 MERGEPATH_GIT_IDENTITY_ROOT="$IDREPO" bash "$CHECK" 2>&1)"
@@ -238,7 +358,7 @@ else
   fail "MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1: rc=$RC out=$OUT"
 fi
 
-# Case 14: clearing the override restores a clean result — the guard
+# Case 20: clearing the override restores a clean result — the guard
 # tracks live state rather than latching.
 git -C "$IDREPO" config --local --unset-all user.name
 git -C "$IDREPO" config --local --unset-all user.email
@@ -255,7 +375,7 @@ fi
 
 # ── Part B: the .git/config baseline comparison ────────────────────────
 
-# Case 15: --snapshot records a baseline and a later run confirms the
+# Case 21: --snapshot records a baseline and a later run confirms the
 # config has not moved. This is the assertion that "running the suite
 # leaves .git/config byte-identical" once the snapshot is taken before
 # the suite and the plain run after it.
@@ -279,7 +399,7 @@ else
   fail "unmodified .git/config: rc=$RC out=$OUT"
 fi
 
-# Case 16: any write to .git/config between snapshot and check fails,
+# Case 22: any write to .git/config between snapshot and check fails,
 # including one the identity assertion would not catch on its own.
 git -C "$IDREPO" config --local core.bigFileThreshold 123m
 set +e
@@ -292,6 +412,82 @@ if [ "$RC" = "1" ] \
   pass "mutated .git/config: caught, with the diff"
 else
   fail "mutated .git/config: rc=$RC out=$OUT"
+fi
+
+# ── Post-suite re-assertion ───────────────────────────────────────────
+# Parts A and B finish before the paired regression suite runs, and the
+# static scan deliberately excludes that suite's own file — so a suite
+# that writes the live .git/config would leave the LAST step of the CI
+# job reporting PASS, one step short of the job boundary the check
+# claims to cover. MERGEPATH_GIT_IDENTITY_SUITE substitutes a stub suite
+# that does exactly that.
+
+STUB_SUITE="$WORKDIR/stub-suite.sh"
+cat > "$STUB_SUITE" <<'EOF'
+#!/usr/bin/env bash
+# A "regression suite" that mutates the repository it is run against.
+git -C "$MERGEPATH_GIT_IDENTITY_ROOT" config --local core.pager cat
+echo "stub suite: ok"
+exit 0
+EOF
+
+# Case 23: a suite that writes a non-identity key is caught by the
+# post-suite baseline comparison.
+PAGERREPO="$WORKDIR/pagerrepo"
+git init -q -b main "$PAGERREPO"
+set +e
+MERGEPATH_GIT_IDENTITY_ROOT="$PAGERREPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$PAGERREPO" MERGEPATH_GIT_IDENTITY_SUITE="$STUB_SUITE" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "changed since the snapshot" \
+  && printf '%s' "$OUT" | grep -q "pager" \
+  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  pass "suite that writes .git/config: caught after it runs, not reported PASS"
+else
+  fail "post-suite baseline comparison: rc=$RC out=$OUT"
+fi
+
+# Case 24: a suite that writes an identity key is caught by the
+# post-suite live-repo assertion, even with no baseline recorded.
+IDENTSTUB="$WORKDIR/stub-suite-identity.sh"
+cat > "$IDENTSTUB" <<'EOF'
+#!/usr/bin/env bash
+git -C "$MERGEPATH_GIT_IDENTITY_ROOT" config --local user.email "nathan@nathanjohnpayne.example"
+exit 0
+EOF
+LEAKREPO="$WORKDIR/leakrepo"
+git init -q -b main "$LEAKREPO"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$LEAKREPO" MERGEPATH_GIT_IDENTITY_SUITE="$IDENTSTUB" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "local: user.email = nathan@nathanjohnpayne.example" \
+  && printf '%s' "$OUT" | grep -q "the suite" \
+  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  pass "suite that writes an identity key: caught after it runs"
+else
+  fail "post-suite identity assertion: rc=$RC out=$OUT"
+fi
+
+# Case 25: the post-suite pass must not turn a clean suite red.
+CLEANSTUB="$WORKDIR/stub-suite-clean.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$CLEANSTUB"
+CLEANREPO="$WORKDIR/cleanrepo"
+git init -q -b main "$CLEANREPO"
+set +e
+MERGEPATH_GIT_IDENTITY_ROOT="$CLEANREPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$CLEANREPO" MERGEPATH_GIT_IDENTITY_SUITE="$CLEANSTUB" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | grep -q "unchanged by the regression suite" \
+  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  pass "clean suite: post-suite re-assertion passes"
+else
+  fail "clean suite post-suite re-assertion: rc=$RC out=$OUT"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────
