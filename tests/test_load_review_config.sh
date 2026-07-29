@@ -151,6 +151,10 @@ out_value() {  # <key>
   grep "^$1=" "$OUT_FILE" | tail -n 1 | sed "s/^$1=//"
 }
 
+val_in() {  # <output-file> <key>
+  grep "^$2=" "$1" | tail -n 1 | sed "s/^$2=//"
+}
+
 # ---------------------------------------------------------------------------
 # 1. Non-default base: every identity comes from the BASE policy, not the
 #    checked-out default-branch one. This is the #788 defect.
@@ -258,6 +262,98 @@ if [ "$(out_value reviewers)" != '["nathanpayne-claude","nathanpayne-cursor"]' ]
   pass "an unreadable base policy never silently falls back to the default-branch identities (#768 P1)"
 else
   fail "unreadable base policy fell back to the default-branch reviewer list"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. The `load-config` STEP as the runner executes it — bootstrap skew.
+#
+#    The step's `actions/checkout` is pinned to the DEFAULT branch so the
+#    helper code is trusted. That makes the helper's own absence a reachable
+#    state twice: on the PR that introduces it, and on each consumer's first
+#    sync wave (.mergepath-sync.yml makes agent-review.yml and
+#    scripts/workflow/ travel together, but they land IN that PR, not on the
+#    consumer's default branch before it runs). An unguarded `bash <missing
+#    file>` exits 127 and hard-fails the job, which SKIPS `triage`
+#    (`needs: [load-config]`, no `always()`) and `auto-merge-on-approval` —
+#    the fail-OPEN outcome the loader's own fail-closed handling exists to
+#    prevent.
+#
+#    The step's shell is LIFTED VERBATIM out of the workflow rather than
+#    retyped here, so this executes the bytes the runner would execute; a copy
+#    would keep passing while the workflow itself was broken.
+# ---------------------------------------------------------------------------
+WORKFLOW="$ROOT/.github/workflows/agent-review.yml"
+STEP="$WORK/load-config-step.sh"
+
+awk '
+  /^  load-config:/            { injob = 1; next }
+  injob && /^  [A-Za-z._-]+:/  { injob = 0 }
+  injob && /^        run: \|$/ { inrun = 1; next }
+  inrun && /^          /       { print substr($0, 11); next }
+  inrun && /^[[:space:]]*$/    { print ""; next }
+  inrun                        { inrun = 0 }
+' "$WORKFLOW" > "$STEP"
+
+if [ -s "$STEP" ] && grep -q 'load_review_config.sh' "$STEP"; then
+  pass "lifted the load-config run block out of agent-review.yml"
+else
+  fail "could not lift the load-config run block out of $WORKFLOW — sections 5a/5b assert nothing"
+fi
+
+# The Actions default shell for a `run:` block is `bash -e {0}`.
+run_step() {  # <tree> <base_ref> <default_branch> ; sets SRC / STEP_OUT / STEP_LOG
+  STEP_OUT="$WORK/step-output.txt"
+  : > "$STEP_OUT"
+  : > "$CALLS_LOG"
+  STEP_LOG=$(cd "$1" && GITHUB_OUTPUT="$STEP_OUT" REPO="$REPO" BASE_REF="$2" \
+    BASE_SHA="basesha1" DEFAULT_BRANCH="$3" bash -e "$STEP" 2>&1) && SRC=0 || SRC=$?
+}
+
+# 5a. Default-branch tree that predates the helper: soft-pass, fail-closed.
+BOOT_TREE="$WORK/bootstrap-tree"
+mkdir -p "$BOOT_TREE/.github"
+cp "$DEFAULT_CONFIG" "$BOOT_TREE/.github/review-policy.yml"
+
+run_step "$BOOT_TREE" main main
+if [ "$SRC" -eq 0 ] \
+   && [ "$(val_in "$STEP_OUT" reviewers)" = "[]" ] \
+   && [ "$(val_in "$STEP_OUT" paths)" = "[]" ] \
+   && [ "$(val_in "$STEP_OUT" threshold)" = "0" ] \
+   && [ "$(val_in "$STEP_OUT" author_identity)" = "" ]; then
+  pass "a default-branch tree without the helper soft-passes with fail-closed outputs, so triage is not skipped (#788 bootstrap)"
+else
+  fail "bootstrap skew (rc=$SRC threshold=$(val_in "$STEP_OUT" threshold) paths=$(val_in "$STEP_OUT" paths) reviewers=$(val_in "$STEP_OUT" reviewers) author=$(val_in "$STEP_OUT" author_identity)): $STEP_LOG"
+fi
+
+if [ "$(grep -c '' "$STEP_OUT" | tr -d ' ')" = "4" ]; then
+  pass "the bootstrap soft-pass emits exactly the four load-config outputs"
+else
+  fail "bootstrap soft-pass output shape: $(cat "$STEP_OUT")"
+fi
+
+# 5b. Positive control. The same lifted step against a tree that DOES carry the
+#     helper must run it and export the real policy values — otherwise 5a would
+#     pass just as well against a step that always short-circuits.
+LIVE_TREE="$WORK/live-tree"
+mkdir -p "$LIVE_TREE/.github" "$LIVE_TREE/scripts"
+cp "$DEFAULT_CONFIG" "$LIVE_TREE/.github/review-policy.yml"
+cp -R "$ROOT/scripts/workflow" "$LIVE_TREE/scripts/workflow"
+
+run_step "$LIVE_TREE" main main
+if [ "$SRC" -eq 0 ] \
+   && [ "$(val_in "$STEP_OUT" threshold)" = "300" ] \
+   && [ "$(val_in "$STEP_OUT" paths)" = '["src/auth/**",".github/**"]' ] \
+   && [ "$(val_in "$STEP_OUT" reviewers)" = '["nathanpayne-claude","nathanpayne-cursor"]' ] \
+   && [ "$(val_in "$STEP_OUT" author_identity)" = "nathanjohnpayne" ]; then
+  pass "the same step against a tree carrying the helper exports the real policy values (the guard is not an unconditional short circuit)"
+else
+  fail "positive control (rc=$SRC threshold=$(val_in "$STEP_OUT" threshold) paths=$(val_in "$STEP_OUT" paths) reviewers=$(val_in "$STEP_OUT" reviewers) author=$(val_in "$STEP_OUT" author_identity)): $STEP_LOG"
+fi
+
+if ! grep -q . "$CALLS_LOG"; then
+  pass "the step's default-base path makes ZERO gh API calls end to end (#769 short circuit preserved through the workflow)"
+else
+  fail "the step made API calls on a default-base PR: $(cat "$CALLS_LOG")"
 fi
 
 echo
