@@ -1503,7 +1503,11 @@ doc_ownership:
       fleet-wide seat-coverage sweep, so a verbatim consumer copy reads
       as if the consumer were the hub. #780 step 6 made the class
       enforceable: it is now on check_sync_manifest's
-      IDENTITY_DOCS_DENYLIST and in BOOTSTRAP_MIRROR_EXCLUDES, and
+      IDENTITY_DOCS_DENYLIST, the bootstrap mirror derives its exclude
+      pattern from this very class entry (see
+      bootstrap::_derive_hub_only_excludes in
+      scripts/bootstrap/template-mirror.sh, so there is no second list
+      to keep in step), and
       REVIEW_POLICY.md's two links to it were rewritten as absolute
       hub URLs so excluding it strands no dead relative link in a newly
       bootstrapped repo. Residual: gaycruisebingo still carries the

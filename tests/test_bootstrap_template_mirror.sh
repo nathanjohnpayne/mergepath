@@ -246,6 +246,15 @@ echo "canonical-mirror audit test (hub-only)" >"$FAKE_MP/tests/test_audit_canoni
 # cron driver) - mergepath-only; the engine + manifest are also the
 # consumer-vs-mergepath markers the propagated scripts/ci/check_* wrappers key
 # off, and weekly-drift-audit.yml is the hub-only cron that runs the engine.
+# The doc_ownership inventory drives two derivations in the stage:
+# bootstrap::_verify_canonical_agent_docs reads `class: canonical`, and
+# bootstrap::_derive_hub_only_excludes reads `class: hub-only` to build
+# the mirror exclusions. The hub-only entries below are therefore NOT
+# decoration — they are what drops the machinery docs created above
+# from the mirror, and assertion 4b1 fails without them. They also keep
+# the fixture faithful to the real manifest, where every docs/agents
+# doc carries exactly one class (check_doc_ownership check 5) and these
+# machinery docs carry hub-only.
 cat >"$FAKE_MP/.mergepath-sync.yml" <<'EOF'
 version: 1
 doc_ownership:
@@ -259,6 +268,18 @@ doc_ownership:
     class: canonical
     pending_manifest: true
     note: deliberately not required until its backing path lands
+  - path: docs/agents/operating-rules.md
+    class: per-repo-owned
+  - path: docs/agents/repository-overview.md
+    class: per-repo-owned
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+  - path: docs/agents/propagation-ordering.md
+    class: hub-only
+  - path: docs/agents/templated-propagation.md
+    class: hub-only
+  - path: docs/agents/coderabbit-audit.md
+    class: hub-only
 EOF
 echo "sync engine" >"$FAKE_MP/scripts/sync-to-downstream.sh"
 echo "sync engine test" >"$FAKE_MP/tests/test_sync_to_downstream.sh"
@@ -560,23 +581,50 @@ done
 # a consumer-side doc linking a file the mirror never delivered, and the
 # link 404s.
 #
-# Read the exclude list from the implementation rather than restating
+# Read the exclude set from the implementation rather than restating
 # it: a second hard-coded copy is the drift this guard exists to catch.
+#
+# The mirror now drops a docs/agents/ file by one of TWO routes, so the
+# set this compares against prose is the UNION of both. Checking only
+# the array would have quietly narrowed this guard to
+# repository-overview.md the moment the hub-only docs moved out of it:
+#
+#   * BOOTSTRAP_MIRROR_EXCLUDES — what the inventory does not imply
+#     (docs/agents/repository-overview.md, excluded while staying
+#     per-repo-owned).
+#   * doc_ownership's `class: hub-only` entries — derived into
+#     exclusions at rsync time by
+#     bootstrap::_derive_hub_only_excludes.
+#
+# Each side must yield something; an empty derivation means the shape
+# it reads has moved and this guard has gone blind, which fails rather
+# than passes.
 MIRROR_LIB="$ROOT/scripts/bootstrap/template-mirror.sh"
+LIVE_MANIFEST="$ROOT/.mergepath-sync.yml"
 EXCLUSION_PROSE_SURFACES=(
   specs/bootstrap_consumer_identity.md
   docs/agents/bootstrap-runbook.md
 )
 if [ -f "$MIRROR_LIB" ]; then
-  excluded_docs=$(awk '
+  array_docs=$(awk '
     /^BOOTSTRAP_MIRROR_EXCLUDES=\(/ { inside = 1; next }
     inside && /^\)/                 { inside = 0 }
     inside                          { print }
   ' "$MIRROR_LIB" \
     | sed -E "s/^[[:space:]]+//; s/[[:space:]]+\$//; s/^'//; s/'\$//" \
     | grep -E '^docs/agents/.+\.md$' || true)
-  if [ -z "$excluded_docs" ]; then
+  hub_only_docs=$(yq -r '.doc_ownership[] | select(.class == "hub-only") | .path' "$LIVE_MANIFEST" 2>/dev/null || true)
+  if [ -z "$array_docs" ]; then
     fail "could not read any docs/agents/ entry out of BOOTSTRAP_MIRROR_EXCLUDES — the array shape changed and this guard is now blind"
+    excluded_docs=""
+  elif [ -z "$hub_only_docs" ]; then
+    fail "could not derive any 'class: hub-only' doc from $LIVE_MANIFEST — the class name moved and this guard is now blind"
+    excluded_docs=""
+  else
+    excluded_docs=$(printf '%s\n%s\n' "$array_docs" "$hub_only_docs" | grep -v '^$' | LC_ALL=C sort -u)
+  fi
+  if [ -z "$excluded_docs" ]; then
+    :
   else
     for surface in "${EXCLUSION_PROSE_SURFACES[@]}"; do
       if [ ! -f "$ROOT/$surface" ]; then
@@ -747,145 +795,211 @@ $arr_count_prose"
   fi
 fi
 
-# --- assertion 4b4: ownership class → mirror exclusion ---------------
-# `doc_ownership:` in .mergepath-sync.yml and BOOTSTRAP_MIRROR_EXCLUDES
-# are two hand-maintained lists that have to agree, and nothing compared
-# them in this direction. specs/bootstrap_consumer_identity.md and the
-# runbook now both promise that the mirror excludes EVERY
-# `class: hub-only` entry in the manifest, so classifying the next doc
-# hub-only without touching the array would make two live documents
-# false AND rsync hub-only content into the next bootstrapped repo,
-# silently. Assertion 4b2 checks exclusions → prose;
-# check_doc_ownership's check 9 checks denylist → class; this is the
-# class → exclusion edge neither of them covers (#797 review).
+# --- assertion 4b4: hub-only exclusions are DERIVED, not restated -----
+# `doc_ownership:` and BOOTSTRAP_MIRROR_EXCLUDES used to be two
+# hand-maintained lists that had to agree, and classifying the next doc
+# hub-only without also editing the array would have rsynced hub-only
+# content into the next new repo (#797 review). The array no longer
+# carries those paths at all: bootstrap::_derive_hub_only_excludes
+# reads `class: hub-only` out of the SOURCE manifest on every run and
+# bootstrap::_rsync_template appends the result to the rsync patterns,
+# so the inventory is the only place the set is written down and the
+# two cannot disagree.
 #
-# The REVERSE containment is deliberately not asserted: BRAND.md and
-# docs/agents/repository-overview.md are excluded and replaced with
-# consumer stubs while staying per-repo-owned, so the excluded set is a
-# superset of the hub-only set by design.
+# That makes the old "do the lists agree?" comparison meaningless — it
+# would be asserting a property of one list against itself. What has to
+# be proven instead is that the derivation actually happens, covers the
+# inventory, and fails CLOSED. A derivation that silently yields
+# nothing is worse than the hand-maintained array it replaced, because
+# rsync with no hub-only excludes copies every one of them.
 #
-# Print the hub-only docs no exclude pattern covers, one per line;
-# print nothing when the set is fully covered. Both inputs are DERIVED
-# (yq over the manifest, awk over the array), and a derivation that
-# comes back empty returns 2 with an `ERROR:` line rather than "no
-# gaps" — a guard that cannot read its inputs must not report success.
-mirror_excludes_gaps() {
-  local manifest="$1" lib="$2"
-  local hub_only excludes doc exc covered
-  if [ ! -f "$manifest" ]; then
-    echo "ERROR: manifest not readable: $manifest"
-    return 2
-  fi
-  if [ ! -f "$lib" ]; then
-    echo "ERROR: mirror lib not readable: $lib"
-    return 2
-  fi
-  if ! yq -e '.doc_ownership | tag == "!!seq"' "$manifest" >/dev/null 2>&1; then
-    echo "ERROR: $manifest carries no doc_ownership list to derive from"
-    return 2
-  fi
-  hub_only=$(yq -r '.doc_ownership[] | select(.class == "hub-only") | .path' "$manifest" 2>/dev/null || true)
-  if [ -z "$hub_only" ]; then
-    echo "ERROR: no 'class: hub-only' entry derived from $manifest — the class name moved and this comparison is blind"
-    return 2
-  fi
-  excludes=$(awk '
-    /^BOOTSTRAP_MIRROR_EXCLUDES=\(/ { inside = 1; next }
-    inside && /^\)/                 { inside = 0 }
-    inside                          { print }
-  ' "$lib" \
-    | sed -E "s/^[[:space:]]+//; s/[[:space:]]+\$//; s/^'//; s/'\$//" \
-    | grep -Ev '^(#|$)' || true)
-  if [ -z "$excludes" ]; then
-    echo "ERROR: could not read any entry out of BOOTSTRAP_MIRROR_EXCLUDES in $lib"
-    return 2
-  fi
-  while IFS= read -r doc; do
-    [ -n "$doc" ] || continue
-    covered=0
-    while IFS= read -r exc; do
-      [ -n "$exc" ] || continue
-      case "$exc" in
-        # A directory pattern covers everything beneath it; every other
-        # entry has to name the file outright.
-        */) case "$doc" in "$exc"*) covered=1 ;; esac ;;
-        *)  if [ "$exc" = "$doc" ]; then covered=1; fi ;;
-      esac
-      if [ "$covered" = "1" ]; then break; fi
-    done <<< "$excludes"
-    [ "$covered" = "1" ] || printf '%s\n' "$doc"
-  done <<< "$hub_only"
-  return 0
+# Note this asserts nothing about the REVERSE containment: BRAND.md and
+# docs/agents/repository-overview.md are excluded via the array while
+# staying per-repo-owned, so the excluded set stays a superset of the
+# hub-only set by design.
+
+# Call bootstrap::_derive_hub_only_excludes against a synthetic source
+# root, with the logging helpers stubbed the way verify_case does.
+# Sets DERIVE_RC / DERIVE_OUT / DERIVE_ERR.
+#
+# stdout and stderr are captured SEPARATELY, and the bootstrap::err
+# stub writes to stderr exactly as scripts/bootstrap/_lib.sh does. That
+# fidelity is load-bearing rather than tidiness: the caller consumes
+# this function's stdout as the exclude-pattern list, so a stub that
+# echoed diagnostics to stdout would model a tool that cannot exist and
+# would hide the failure mode where an error message becomes an rsync
+# --exclude argument.
+derive_case() {
+  # $1 = mutation applied inside a copy of the fixture source root
+  local mutate="${1:-:}" source rc
+  source="$(mktemp -d "$WORKDIR/derive-source.XXXXXX")"
+  cp "$FAKE_MP/.mergepath-sync.yml" "$source/.mergepath-sync.yml"
+  ( cd "$source" && eval "$mutate" )
+  set +e
+  bash -c '
+    bootstrap::log() { :; }
+    bootstrap::err() { echo "ERR: $*" >&2; }
+    source "$1"
+    bootstrap::_derive_hub_only_excludes "$2"
+  ' _ "$MIRROR_LIB" "$source" >"$WORKDIR/derive.out" 2>"$WORKDIR/derive.err"
+  rc=$?
+  set -e
+  DERIVE_RC=$rc
+  DERIVE_OUT=$(cat "$WORKDIR/derive.out")
+  DERIVE_ERR=$(cat "$WORKDIR/derive.err")
 }
 
-LIVE_MANIFEST="$ROOT/.mergepath-sync.yml"
-set +e
-live_gaps=$(mirror_excludes_gaps "$LIVE_MANIFEST" "$MIRROR_LIB")
-gaps_rc=$?
-set -e
-if [ "$gaps_rc" != "0" ]; then
-  fail "assertion 4b4 could not compare the ownership inventory against BOOTSTRAP_MIRROR_EXCLUDES: $live_gaps"
-elif [ -n "$live_gaps" ]; then
-  fail "doc_ownership classifies these docs hub-only but BOOTSTRAP_MIRROR_EXCLUDES does not drop them, so the bootstrap rsync would copy them into the next new repo:
-$live_gaps"
+# Control: the fixture's hub-only entries come back, in full, on stdout
+# and with nothing on stderr.
+derive_case
+expected_derived=$(yq -r '.doc_ownership[] | select(.class == "hub-only") | .path' "$FAKE_MP/.mergepath-sync.yml" | LC_ALL=C sort)
+actual_derived=$(printf '%s\n' "$DERIVE_OUT" | grep -v '^$' | LC_ALL=C sort || true)
+if [ "$DERIVE_RC" = "0" ] && [ -n "$expected_derived" ] && [ "$actual_derived" = "$expected_derived" ] && [ -z "$DERIVE_ERR" ]; then
+  pass "hub-only mirror exclusions are derived from the source manifest's doc_ownership (#797 review)"
 else
-  pass "every 'class: hub-only' doc in .mergepath-sync.yml is excluded from the bootstrap mirror (#780)"
+  fail "derivation did not return the manifest's hub-only set (rc=$DERIVE_RC, stderr='$DERIVE_ERR'); expected:
+$expected_derived
+got:
+$actual_derived"
 fi
 
-# The live comparison above passes today by construction, so prove the
-# comparison is not vacuous: drive it against a manifest that classifies
-# one more doc hub-only without touching the array — the exact mistake
-# it exists to catch — and against inputs it cannot read.
-if [ -f "$LIVE_MANIFEST" ]; then
-  gap_manifest="$WORKDIR/gap-manifest.yml"
-  cp "$LIVE_MANIFEST" "$gap_manifest"
-  yq -i '.doc_ownership += [{"path": "docs/agents/newly-hub-only.md", "class": "hub-only"}]' "$gap_manifest"
-  set +e
-  synth_gaps=$(mirror_excludes_gaps "$gap_manifest" "$MIRROR_LIB")
-  synth_rc=$?
-  set -e
-  if [ "$synth_rc" = "0" ] && [ "$synth_gaps" = "docs/agents/newly-hub-only.md" ]; then
-    pass "assertion 4b4 reports a newly classified hub-only doc that no exclude pattern covers"
-  else
-    fail "assertion 4b4 missed an unexcluded hub-only doc (rc=$synth_rc): $synth_gaps"
-  fi
+# The finding's exact scenario: classify one more doc hub-only and touch
+# NOTHING else. Under the old hand-maintained array this leaked; the
+# derived set has to pick it up with no code edit at all.
+derive_case 'yq -i '\''.doc_ownership += [{"path":"docs/agents/newly-hub-only.md","class":"hub-only"}]'\'' .mergepath-sync.yml'
+if [ "$DERIVE_RC" = "0" ] && printf '%s\n' "$DERIVE_OUT" | grep -qx 'docs/agents/newly-hub-only.md'; then
+  pass "a newly classified hub-only doc is excluded with no edit to BOOTSTRAP_MIRROR_EXCLUDES (#797 review)"
+else
+  fail "derivation missed a newly classified hub-only doc (rc=$DERIVE_RC): $DERIVE_OUT $DERIVE_ERR"
+fi
+# ... and the array genuinely does not name it, so the line above cannot
+# be passing for the old reason.
+if grep -qF 'docs/agents/newly-hub-only.md' "$MIRROR_LIB"; then
+  fail "BOOTSTRAP_MIRROR_EXCLUDES names the synthetic doc — the assertion above proves nothing"
+else
+  pass "the synthetic hub-only doc appears nowhere in $MIRROR_LIB (derivation, not restatement)"
+fi
 
-  # A directory pattern legitimately covers the files beneath it.
-  dir_lib="$WORKDIR/dir-excludes.sh"
-  printf 'BOOTSTRAP_MIRROR_EXCLUDES=(\n  %s\n)\n' "'docs/agents/'" > "$dir_lib"
-  set +e
-  dir_gaps=$(mirror_excludes_gaps "$LIVE_MANIFEST" "$dir_lib")
-  dir_rc=$?
-  set -e
-  if [ "$dir_rc" = "0" ] && [ -z "$dir_gaps" ]; then
-    pass "assertion 4b4 accepts a directory exclude pattern that covers the hub-only docs"
-  else
-    fail "assertion 4b4 mis-read a directory exclude pattern (rc=$dir_rc): $dir_gaps"
-  fi
+# Fail-closed branches. Each must return non-zero AND say why; a
+# derivation that returns 0 with an empty set would mirror hub-only
+# content into the new repo silently, which is the whole hazard.
+derive_case 'rm .mergepath-sync.yml'
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q 'source .mergepath-sync.yml missing'; then
+  pass "derivation fails closed when the source manifest is absent"
+else
+  fail "derivation should fail closed without a source manifest (rc=$DERIVE_RC): $DERIVE_ERR"
+fi
 
-  blind_lib="$WORKDIR/blind-excludes.sh"
-  printf '#!/usr/bin/env bash\n# the array was renamed\n' > "$blind_lib"
-  set +e
-  blind_out=$(mirror_excludes_gaps "$LIVE_MANIFEST" "$blind_lib")
-  blind_rc=$?
-  set -e
-  if [ "$blind_rc" = "2" ] && printf '%s' "$blind_out" | grep -q '^ERROR:'; then
-    pass "assertion 4b4 fails closed when BOOTSTRAP_MIRROR_EXCLUDES cannot be read"
-  else
-    fail "assertion 4b4 should fail closed on an unreadable exclude array (rc=$blind_rc): $blind_out"
-  fi
+derive_case 'printf "version: 1\n" > .mergepath-sync.yml'
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q 'no valid doc_ownership list'; then
+  pass "derivation fails closed when doc_ownership is absent"
+else
+  fail "derivation should fail closed without a doc_ownership list (rc=$DERIVE_RC): $DERIVE_ERR"
+fi
 
-  classless_manifest="$WORKDIR/classless-manifest.yml"
-  printf 'doc_ownership:\n  - path: docs/agents/x.md\n    class: canonical\n' > "$classless_manifest"
-  set +e
-  classless_out=$(mirror_excludes_gaps "$classless_manifest" "$MIRROR_LIB")
-  classless_rc=$?
-  set -e
-  if [ "$classless_rc" = "2" ] && printf '%s' "$classless_out" | grep -q '^ERROR:'; then
-    pass "assertion 4b4 fails closed when no hub-only entry can be derived"
+derive_case 'printf "doc_ownership:\n  - path: docs/agents/x.md\n    class: canonical\n" > .mergepath-sync.yml'
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q 'no .class: hub-only. doc'; then
+  pass "derivation fails closed when the inventory yields no hub-only doc (the class name moved)"
+else
+  fail "derivation should refuse an empty hub-only set (rc=$DERIVE_RC): $DERIVE_ERR"
+fi
+
+# A wildcard would be honored by rsync: `docs/agents/*.md` strips every
+# canonical agent doc from the new repo. Reject it at the source.
+derive_case 'yq -i '\''.doc_ownership += [{"path":"docs/agents/*.md","class":"hub-only"}]'\'' .mergepath-sync.yml'
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q 'wildcard metacharacter'; then
+  pass "derivation rejects a wildcard hub-only path before it reaches rsync"
+else
+  fail "derivation should reject a wildcard hub-only path (rc=$DERIVE_RC): $DERIVE_ERR"
+fi
+# ...and it emits NOTHING on the way out. The rejected entry is appended
+# AFTER the fixture's valid hub-only paths, so a function that streamed
+# each path as it validated it would have already written those valid
+# ones to stdout before reaching the bad one. A caller reading stdout
+# would then mirror with a partial exclusion set. Diagnostics go to
+# stderr and the path list is buffered until the whole inventory checks
+# out, so a failed derivation yields no patterns at all.
+[ -z "$DERIVE_OUT" ] \
+  && pass "a rejected derivation emits no partial exclude list on stdout" \
+  || fail "a rejected derivation left patterns on stdout that a caller could mirror with: $DERIVE_OUT"
+
+derive_case 'yq -i '\''.doc_ownership += [{"path":"scripts/secret.sh","class":"hub-only"}]'\'' .mergepath-sync.yml'
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q "only for 'docs/agents/\*\.md' paths"; then
+  pass "derivation fails closed on a hub-only path outside the inventory's documented scope"
+else
+  fail "derivation should refuse an out-of-scope hub-only path (rc=$DERIVE_RC): $DERIVE_ERR"
+fi
+
+# --- assertion 4b5: the derivation is actually WIRED into the rsync ---
+# Everything above tests the helper. This drives
+# bootstrap::_rsync_template end to end against a miniature source tree
+# whose manifest classifies a doc hub-only that BOOTSTRAP_MIRROR_EXCLUDES
+# has never heard of, and asserts the file does not land — the property
+# an operator actually depends on. A helper that derives perfectly but
+# is never called would pass every assertion above and still leak.
+rsync_src="$(mktemp -d "$WORKDIR/rsync-src.XXXXXX")"
+rsync_dst="$(mktemp -d "$WORKDIR/rsync-dst.XXXXXX")"
+mkdir -p "$rsync_src/docs/agents"
+printf 'hub only\n'  > "$rsync_src/docs/agents/newly-hub-only.md"
+printf 'canonical\n' > "$rsync_src/docs/agents/decision-records.md"
+printf 'readme\n'    > "$rsync_src/README.md"
+cat >"$rsync_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/newly-hub-only.md
+    class: hub-only
+YAML
+set +e
+rsync_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$rsync_src" "$rsync_dst" 2>&1)
+rsync_rc=$?
+set -e
+if [ "$rsync_rc" != "0" ]; then
+  fail "end-to-end rsync with a derived hub-only exclude failed (rc=$rsync_rc): $rsync_out"
+else
+  if [ -e "$rsync_dst/docs/agents/newly-hub-only.md" ]; then
+    fail "a 'class: hub-only' doc that BOOTSTRAP_MIRROR_EXCLUDES never names was copied into the mirror — the derivation is not wired into bootstrap::_rsync_template"
   else
-    fail "assertion 4b4 should fail closed on a manifest with no hub-only class (rc=$classless_rc): $classless_out"
+    pass "bootstrap::_rsync_template drops a hub-only doc named only by doc_ownership (#797 review)"
   fi
+  [ -f "$rsync_dst/docs/agents/decision-records.md" ] && [ -f "$rsync_dst/README.md" ] \
+    && pass "the derived exclude is scoped: canonical docs and ordinary files still mirror" \
+    || fail "the derived exclude over-matched — canonical/ordinary files missing from the mirror"
+fi
+
+# And the wiring fails closed: an unreadable inventory must abort the
+# rsync rather than mirror everything. Assert the destination stays
+# EMPTY, not merely that the rc is non-zero — "it errored" and "it
+# copied nothing" are different claims, and only the second is the one
+# that keeps hub-only content out of the new repo.
+blind_src="$(mktemp -d "$WORKDIR/blind-src.XXXXXX")"
+blind_dst="$(mktemp -d "$WORKDIR/blind-dst.XXXXXX")"
+mkdir -p "$blind_src/docs/agents"
+printf 'hub only\n' > "$blind_src/docs/agents/some-machinery.md"
+printf 'version: 1\n' > "$blind_src/.mergepath-sync.yml"
+set +e
+blind_rsync_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$blind_src" "$blind_dst" 2>&1)
+blind_rsync_rc=$?
+set -e
+blind_copied=$(find "$blind_dst" -type f | head -1)
+if [ "$blind_rsync_rc" != "0" ] && [ -z "$blind_copied" ] \
+   && printf '%s' "$blind_rsync_out" | grep -q 'refusing to rsync without the hub-only exclusions'; then
+  pass "bootstrap::_rsync_template aborts, copying nothing, when the hub-only exclusions cannot be derived"
+else
+  fail "rsync should abort with an empty destination on an underivable inventory (rc=$blind_rsync_rc, copied='$blind_copied'): $blind_rsync_out"
 fi
 
 # --- assertion 4c: AGENTS.md packaging/Repository-Layout scrub (#744) ---
