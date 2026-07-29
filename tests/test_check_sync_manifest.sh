@@ -1099,7 +1099,31 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   #   * a fence closes only on a run of the SAME character at least as
   #     LONG as the opening run, so ``` cannot close ````;
   #   * a closing fence carries no info string, so a literal ```bash
-  #     shown inside an open block is content, not the closer.
+  #     shown inside an open block is content, not the closer;
+  #   * a BACKTICK fence opener's info string may not itself contain a
+  #     backtick (a TILDE fence's may). A line like ```js `x` is
+  #     therefore not a delimiter at all, it is an ordinary paragraph
+  #     line. Accepting it opened a fence that the doc never intended,
+  #     and the mis-tracked state then ran both ways: prose after it was
+  #     blanked (a real bare #NN goes unscanned) until the doc's NEXT
+  #     genuine opener was consumed as the closer, at which point that
+  #     block's real fenced content was scanned as prose — a false
+  #     positive failing a required check on a #NN that is code.
+  #
+  # INDENTED code blocks are excluded too, on the same grounds as fenced
+  # ones: `#NN` four columns in is code, not an issue reference. Two
+  # CommonMark rules keep the exclusion from swinging into UNDER-
+  # reporting, which would be the dangerous direction here — a bare ref
+  # silently shipped to every consumer:
+  #
+  #   * an indented code block cannot interrupt a paragraph, so a
+  #     wrapped prose line that happens to be indented is still prose;
+  #   * the four columns are measured from the CONTENT indent of the
+  #     innermost open list item, not from column zero, so the
+  #     continuation paragraph of a `1. ` item — indented four spaces,
+  #     three of which are the marker — stays prose and is still
+  #     scanned. Where the container is ambiguous the threshold is left
+  #     HIGH, which errs toward scanning.
   #
   # Inline code spans are matched by delimiter RUN LENGTH for the same
   # reason fences are, but note the closing rule DIFFERS by design and
@@ -1130,9 +1154,10 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         indent = line
         sub(/[^ \t].*$/, "", indent)
         rest = substr(line, length(indent) + 1)
+        ind = visual_indent(indent)
 
         is_delim = 0
-        if (length(indent) < 4 && index(indent, "\t") == 0) {
+        if (ind < 4) {
           ch = substr(rest, 1, 1)
           if (ch == "`" || ch == "~") {
             run = 0
@@ -1140,8 +1165,18 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
             if (run >= 3) is_delim = 1
           }
         }
+        # A backtick fence OPENER may not carry a backtick in its info
+        # string; such a line is a paragraph, not a delimiter. Closers
+        # are already covered by the whitespace-only remainder rule
+        # below, and a tilde opener may hold backticks.
+        if (is_delim && !fence && ch == "`" &&
+            index(substr(rest, run + 1), "`") > 0) {
+          is_delim = 0
+        }
 
         if (is_delim) {
+          indented_code = 0
+          para = 0
           if (!fence) {
             fence = 1; fence_char = ch; fence_len = run
           } else if (ch == fence_char && run >= fence_len &&
@@ -1150,11 +1185,50 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
           }
           print ""; next
         }
-        if (fence) { print ""; next }
+        if (fence) { para = 0; print ""; next }
 
+        # A blank line closes an open paragraph but NOT an indented code
+        # block: a blank inside one is part of the block.
+        if (rest == "") { para = 0; print ""; next }
+
+        if (indented_code) {
+          if (ind >= indented_code_min) { print ""; next }
+          indented_code = 0
+        }
+
+        # Innermost open list container, tracked so the code threshold is
+        # measured from ITS content indent. A non-blank line in column
+        # zero at a block boundary that is not a marker ends the list.
+        if (ind < 4 && match(rest, /^([-*+]|[0-9]+[.)])[ \t]+/)) {
+          list_indent = ind + RLENGTH
+        } else if (ind == 0 && !para) {
+          list_indent = 0
+        }
+
+        if (!para && ind >= list_indent + 4) {
+          indented_code = 1
+          indented_code_min = list_indent + 4
+          print ""; next
+        }
+
+        para = 1
         line = strip_code_spans(line)
         gsub(/\]\(#[^)]*\)/, "]()", line)
         print line
+      }
+
+      # Column reached by a run of leading whitespace, with tabs
+      # advancing to the next four-column stop (CommonMark). Measuring
+      # columns rather than characters is what makes one leading tab
+      # count as the four columns it renders as.
+      function visual_indent(s,   i, c, col) {
+        col = 0
+        for (i = 1; i <= length(s); i++) {
+          c = substr(s, i, 1)
+          if (c == "\t") col += 4 - (col % 4)
+          else col++
+        }
+        return col
       }
 
       # Remove inline code spans, matching opening and closing backtick
@@ -1347,8 +1421,90 @@ SPAN_EOF
     pass "Case 40: inline code spans strip by delimiter run length (``#NN`` is code, unmatched run is prose)"
   fi
 
+  # Case 41: INDENTED code blocks are code too (#781 item 9).
+  #
+  # Cases 38-40 only ever fence their code, so the scan treated a
+  # four-space-indented block as prose and flagged every `#NN` in it —
+  # a false positive failing a required check on a doc whose refs are
+  # code. The second half of the fixture pins the direction that matters
+  # more: the four-space continuation paragraph of a `1. ` list item is
+  # prose (the item's content indent is 3, so code would need seven),
+  # and its bare ref MUST still be flagged. A fix that measured the four
+  # columns from column zero would silently swallow it.
+  INDENT_DOC="$WORKDIR/consumer-truth-indent.md"
+  cat > "$INDENT_DOC" <<'INDENT_EOF'
+# Doc
+
+An indented code block follows, four spaces in:
+
+    echo "#111 is not a ref"
+    grep -n '#222' file
+
+Back to prose.
+
+1. A numbered step, whose content indent is three columns.
+
+    A four-space continuation of that item mentioning #333 is prose.
+
+But a bare #444 in prose is.
+INDENT_EOF
+  set +e
+  indent_hits=$(md_prose_only "$INDENT_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  indent_lines=$(md_prose_only "$INDENT_DOC" | wc -l | tr -d ' ')
+  indent_raw=$(wc -l < "$INDENT_DOC" | tr -d ' ')
+  set -e
+  if [ "$indent_hits" != "12,14," ]; then
+    fail "Case 41: expected lines 12,14 flagged (indented code excluded, list continuation kept), got '$indent_hits'"
+  elif [ "$indent_lines" != "$indent_raw" ]; then
+    fail "Case 41: md_prose_only must emit one line per input line, got $indent_lines for $indent_raw"
+  else
+    pass "Case 41: indented code excluded, but a list item's indented continuation is still scanned"
+  fi
+
+  # Case 42: a backtick fence opener may not carry a backtick in its
+  # info string (#781 item 10).
+  #
+  # Line 3 is not a delimiter per CommonMark, it is a paragraph line.
+  # Accepting it as an opener mis-tracked fence state in BOTH harmful
+  # directions at once: the real prose ref on line 4 was blanked as
+  # fence content, and the doc's next genuine opener (line 6) was eaten
+  # as the closer, so the genuinely fenced #222 on line 7 surfaced as a
+  # false positive — and every later line, including the real ref on
+  # line 14, stayed swallowed inside a fence that was never opened. The
+  # tilde block pins the other half of the rule: a TILDE opener's info
+  # string MAY hold a backtick, so #333 must stay hidden.
+  OPENER_DOC="$WORKDIR/consumer-truth-opener.md"
+  cat > "$OPENER_DOC" <<'OPENER_EOF'
+# Doc
+
+```js `inline` example
+A bare #111 here is real prose, not fence content.
+
+```
+Genuine fenced content mentioning #222.
+```
+
+~~~js `inline`
+A tilde info string MAY hold a backtick, so #333 stays hidden.
+~~~
+
+But a bare #444 in prose is.
+OPENER_EOF
+  set +e
+  opener_hits=$(md_prose_only "$OPENER_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  opener_lines=$(md_prose_only "$OPENER_DOC" | wc -l | tr -d ' ')
+  opener_raw=$(wc -l < "$OPENER_DOC" | tr -d ' ')
+  set -e
+  if [ "$opener_hits" != "4,14," ]; then
+    fail "Case 42: expected lines 4,14 flagged (invalid backtick opener is prose; tilde opener is a fence), got '$opener_hits'"
+  elif [ "$opener_lines" != "$opener_raw" ]; then
+    fail "Case 42: md_prose_only must emit one line per input line, got $opener_lines for $opener_raw"
+  else
+    pass "Case 42: a backtick opener with a backtick in its info string is prose, not a fence"
+  fi
+
 else
-  echo "SKIP: Cases 36-40 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-42 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo

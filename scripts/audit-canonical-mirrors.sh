@@ -86,19 +86,35 @@ set -euo pipefail
 
 # Print the file's own header comment block as the usage text.
 #
-# The bound is DYNAMIC — everything from line 2 up to the first line that is
-# not a `#` comment — rather than a hardcoded end line. The previous form was
-# `sed -n '2,73p'`, and the header outgrew it: `--help` stopped mid-sentence
+# The bound is DYNAMIC — everything from line 2 up to the first line of
+# executable code — rather than a hardcoded end line. The original form was
+# `sed -n '2,65p'`, and the header outgrew it: `--help` stopped mid-sentence
 # at "whitespace-separated file list that", silently dropping MERGEPATH_ROOT
 # and the entire "Exit codes" section. A literal line number cannot survive
-# edits above it, so it is not used at all here (#762 r3 P2). Line 1 is the
-# shebang and is skipped; `# ` (or a bare `#`) is stripped from each line, the
-# same normalization the old second `sed` did.
+# edits above it, so it is not used at all here (#762 r3 P2, #781 item 5).
+#
+# Two things are deliberate. Line 1 is the shebang and is skipped, and `# `
+# (or a bare `#`) is stripped from each line — the normalization the old
+# second `sed` did. And a blank line INSIDE the header does not terminate the
+# block: blanks are buffered and flushed only when another comment line
+# follows, so a stray un-prefixed line (an editor stripping trailing
+# whitespace from a `#`-only separator, a paste that drops the marker) costs
+# nothing instead of silently truncating `--help` mid-sentence, the exact
+# failure the hardcoded range produced. Buffered blanks are never flushed at
+# the end, so the blank separating the header from the code is not printed
+# and the script body can never leak into the usage text.
 usage() {
   awk '
-    NR == 1 { next }
-    /^#/    { sub(/^# ?/, ""); print; next }
-              { exit }
+    NR == 1        { next }
+    /^#/           {
+                     for (i = 0; i < pending_blanks; i++) print ""
+                     pending_blanks = 0
+                     sub(/^# ?/, "")
+                     print
+                     next
+                   }
+    /^[ \t]*$/     { pending_blanks++; next }
+                   { exit }
   ' "${BASH_SOURCE[0]}"
 }
 
