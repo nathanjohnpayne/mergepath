@@ -1122,6 +1122,9 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   #     innermost open list item, not from column zero, so the
   #     continuation paragraph of a `1. ` item — indented four spaces,
   #     three of which are the marker — stays prose and is still
+  #     scanned. That measure is relative all the way down: a nested
+  #     list marker deepens the container rather than tripping the code
+  #     branch, so ordinary two-level indented nesting keeps its prose
   #     scanned. Where the container is ambiguous the threshold is left
   #     HIGH, which errs toward scanning.
   #
@@ -1197,9 +1200,19 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         }
 
         # Innermost open list container, tracked so the code threshold is
-        # measured from ITS content indent. A non-blank line in column
-        # zero at a block boundary that is not a marker ends the list.
-        if (ind < 4 && match(rest, /^([-*+]|[0-9]+[.)])[ \t]+/)) {
+        # measured from ITS content indent. A marker counts while it is
+        # within four columns of the CURRENT container content indent —
+        # the same relative measure the code threshold uses, so a nested
+        # marker deepens the container instead of tripping the code
+        # branch. Gating on an absolute `ind < 4` instead stops tracking
+        # at the first sub-list and blanks its prose as code, which is
+        # the UNDER-reporting direction: a bare ref shipped unflagged.
+        # At four or more columns past the container the marker really
+        # is code, and falls through to the branch below. A non-blank
+        # line in column zero at a block boundary that is not a marker
+        # ends the list.
+        if (ind < list_indent + 4 &&
+            match(rest, /^([-*+]|[0-9]+[.)])[ \t]+/)) {
           list_indent = ind + RLENGTH
         } else if (ind == 0 && !para) {
           list_indent = 0
@@ -1503,8 +1516,60 @@ OPENER_EOF
     pass "Case 42: a backtick opener with a backtick in its info string is prose, not a fence"
   fi
 
+  # Case 43: the indented-code threshold is relative ALL THE WAY DOWN
+  # (#781 item 9, nested lists).
+  #
+  # Case 41 only nests one `1. ` item at column zero, so it passes even
+  # if the list container stops being tracked at the first sub-list.
+  # This fixture pins the direction that case cannot see. Measuring a
+  # nested marker against an absolute four columns instead of against
+  # the CURRENT container leaves the threshold pinned to the OUTERMOST
+  # item, and everything below the first sub-list — its own prose, its
+  # continuation paragraph, its children — is blanked as code. That is
+  # UNDER-reporting: a bare ref silently shipped to every consumer,
+  # which is the failure direction this parser must never take. Two
+  # levels of four-space nesting is ordinary markdown, so lines 5, 7
+  # and 9 must all be flagged.
+  #
+  # The back half pins the exclusion the relative measure must NOT
+  # lose: at four columns past the innermost container (14 here, from a
+  # content indent of 10) it really is code, as is a plain four-space
+  # block once the list has ended at column zero.
+  NEST_DOC="$WORKDIR/consumer-truth-nest.md"
+  cat > "$NEST_DOC" <<'NEST_EOF'
+# Doc
+
+- a
+
+    - b mentioning #111
+
+        Continuation of b mentioning #222.
+
+        - c mentioning #333
+
+              deep code mentioning #444
+
+Back at column zero.
+
+    Plain code mentioning #555
+
+And a bare #666 in prose is.
+NEST_EOF
+  set +e
+  nest_hits=$(md_prose_only "$NEST_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  nest_lines=$(md_prose_only "$NEST_DOC" | wc -l | tr -d ' ')
+  nest_raw=$(wc -l < "$NEST_DOC" | tr -d ' ')
+  set -e
+  if [ "$nest_hits" != "5,7,9,17," ]; then
+    fail "Case 43: expected lines 5,7,9,17 flagged (nested list prose is prose; only deep code excluded), got '$nest_hits'"
+  elif [ "$nest_lines" != "$nest_raw" ]; then
+    fail "Case 43: md_prose_only must emit one line per input line, got $nest_lines for $nest_raw"
+  else
+    pass "Case 43: the code threshold follows nested list containers, so nested prose stays scanned"
+  fi
+
 else
-  echo "SKIP: Cases 36-42 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-43 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
