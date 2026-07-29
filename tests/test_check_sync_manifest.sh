@@ -1125,8 +1125,18 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   #     scanned. That measure is relative all the way down: a nested
   #     list marker deepens the container rather than tripping the code
   #     branch, so ordinary two-level indented nesting keeps its prose
-  #     scanned. Where the container is ambiguous the threshold is left
-  #     HIGH, which errs toward scanning.
+  #     scanned, and a marker with nothing after it opens an empty item
+  #     whose own prose is scanned the same way. Where the container is
+  #     ambiguous the threshold is left HIGH, which errs toward
+  #     scanning.
+  #
+  # Open containers must also CLOSE, or the relative measure stops being
+  # a measure at all: once a document outdents back to an outer item the
+  # stale inner threshold is too deep, and the outer item's indented code
+  # block surfaces as prose — a required check failing on a `#NN` that is
+  # code. Containers are therefore tracked as a stack and popped at block
+  # boundaries, so identical markdown classifies identically wherever it
+  # sits in the nesting.
   #
   # Inline code spans are matched by delimiter RUN LENGTH for the same
   # reason fences are, but note the closing rule DIFFERS by design and
@@ -1199,23 +1209,75 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
           indented_code = 0
         }
 
-        # Innermost open list container, tracked so the code threshold is
-        # measured from ITS content indent. A marker counts while it is
-        # within four columns of the CURRENT container content indent —
-        # the same relative measure the code threshold uses, so a nested
-        # marker deepens the container instead of tripping the code
-        # branch. Gating on an absolute `ind < 4` instead stops tracking
-        # at the first sub-list and blanks its prose as code, which is
-        # the UNDER-reporting direction: a bare ref shipped unflagged.
-        # At four or more columns past the container the marker really
-        # is code, and falls through to the branch below. A non-blank
-        # line in column zero at a block boundary that is not a marker
-        # ends the list.
-        if (ind < list_indent + 4 &&
-            match(rest, /^([-*+]|[0-9]+[.)])[ \t]+/)) {
-          list_indent = ind + RLENGTH
-        } else if (ind == 0 && !para) {
+        # Open list containers, held as a STACK of content indents so the
+        # code threshold is measured from the container the line is
+        # actually INSIDE. `list_indent` is the innermost open one.
+        #
+        # Popping matters as much as pushing. Only ever deepening the
+        # indent and resetting it at column zero leaves a stale INNER
+        # threshold in force once a document outdents back to the outer
+        # item, and an indented code block belonging to that outer item
+        # — four columns past the OUTER content indent but short of the
+        # inner one — is then emitted as prose. That is the false-
+        # positive direction: a required check fails on a `#NN` that is
+        # code. Identical markdown must classify identically wherever it
+        # sits, so a line at a block boundary closes every container it
+        # is no longer indented into, and a marker closes every
+        # container deeper than itself before opening its own.
+        #
+        # Popping is confined to block boundaries because a LAZY
+        # continuation line may sit left of the container it belongs to;
+        # leaving the threshold high there errs toward scanning.
+        if (!para) {
+          while (depth > 0 && ind < stack[depth]) depth--
           list_indent = 0
+          if (depth > 0) list_indent = stack[depth]
+        }
+
+        # A marker counts while it is within four columns of the CURRENT
+        # container content indent — the same relative measure the code
+        # threshold uses, so a nested marker deepens the container
+        # instead of tripping the code branch. Gating on an absolute
+        # `ind < 4` instead stops tracking at the first sub-list and
+        # blanks its prose as code, which is the UNDER-reporting
+        # direction: a bare ref shipped unflagged. At four or more
+        # columns past the container the marker really is code, and
+        # falls through to the branch below.
+        #
+        # A marker followed by nothing but blanks opens an EMPTY list
+        # item, which is a container like any other; requiring
+        # whitespace after every marker skips it and leaves the
+        # threshold pinned to the OUTER item, so prose inside the empty
+        # item is blanked as code and its bare refs go unflagged — the
+        # UNDER-reporting direction again. CommonMark puts the content
+        # indent of an empty item at the marker width plus one, no
+        # matter how much blank space trails the marker, so the gap
+        # after the marker is not counted in that case.
+        #
+        # The marker and the gap after it are measured separately rather
+        # than in one pattern: an anchor inside a subexpression, as in
+        # `([ \t]+|$)`, is implementation-defined in POSIX ERE and this
+        # awk program has to behave the same under every awk CI runs on.
+        # A marker with a non-blank hard against it (`-x`, `1.5`) is not
+        # a list marker at all and leaves the container untouched.
+        if (ind < list_indent + 4 && match(rest, /^([-*+]|[0-9]+[.)])/)) {
+          marker_width = RLENGTH
+          tail = substr(rest, RLENGTH + 1)
+          gap = tail
+          sub(/[^ \t].*$/, "", gap)
+          if (tail == gap) {
+            marker_width = marker_width + 1
+          } else if (gap != "") {
+            marker_width = marker_width + length(gap)
+          } else {
+            marker_width = 0
+          }
+          if (marker_width > 0) {
+            while (depth > 0 && stack[depth] > ind) depth--
+            depth++
+            stack[depth] = ind + marker_width
+            list_indent = stack[depth]
+          }
         }
 
         if (!para && ind >= list_indent + 4) {
@@ -1568,8 +1630,90 @@ NEST_EOF
     pass "Case 43: the code threshold follows nested list containers, so nested prose stays scanned"
   fi
 
+  # Case 44: a marker with nothing after it opens an EMPTY list item,
+  # and that item is a container like any other.
+  #
+  # Case 43 nests only markers that carry text, so it passes even if the
+  # marker pattern demands whitespace after every marker. Line 5 here is
+  # a bare `-`: CommonMark opens a nested item whose content indent is
+  # the marker width plus one (4), so the six-space paragraphs on lines
+  # 6 and 8 are its prose and the ten-space line 10 is its code. Skip
+  # the bare marker and the threshold stays pinned to the OUTER item at
+  # 2, which puts line 8 at exactly the code cut-off — blanked, and its
+  # ref shipped unflagged. That is the UNDER-reporting direction, the
+  # one this parser must never take. Line 6 is protected only because a
+  # code block cannot interrupt the paragraph the marker line opened, so
+  # a fixture with one continuation line cannot see this at all.
+  EMPTY_DOC="$WORKDIR/consumer-truth-empty-marker.md"
+  cat > "$EMPTY_DOC" <<'EMPTY_EOF'
+# Doc
+
+- outer
+
+  -
+      Prose in the empty item mentioning #111.
+
+      More of that prose mentioning #222.
+
+          Code inside that item mentioning #333.
+
+And a bare #444 in prose is.
+EMPTY_EOF
+  set +e
+  empty_hits=$(md_prose_only "$EMPTY_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  empty_lines=$(md_prose_only "$EMPTY_DOC" | wc -l | tr -d ' ')
+  empty_raw=$(wc -l < "$EMPTY_DOC" | tr -d ' ')
+  set -e
+  if [ "$empty_hits" != "6,8,12," ]; then
+    fail "Case 44: expected lines 6,8,12 flagged (empty marker opens a container; only line 10 is code), got '$empty_hits'"
+  elif [ "$empty_lines" != "$empty_raw" ]; then
+    fail "Case 44: md_prose_only must emit one line per input line, got $empty_lines for $empty_raw"
+  else
+    pass "Case 44: a bare list marker opens an empty item, so its prose is still scanned"
+  fi
+
+  # Case 45: list containers must CLOSE when the document outdents.
+  #
+  # Cases 41 and 43 only ever go deeper, so they pass even if the
+  # container indent is never popped below column zero. Here the doc
+  # returns from the four-space sublist to the outer item: line 7 sits
+  # at the outer content indent of 2, which ends the sublist, so the
+  # six-space line 9 is four columns past the OUTER item and is that
+  # item's indented code block. Carrying the sublist content indent of 6
+  # forward puts the cut-off at 10 instead, and line 9 is emitted as
+  # prose — a FALSE POSITIVE failing a required check on a `#NN` that is
+  # code. The same six-space block four columns inside a column-zero
+  # item is excluded in case 41; classification must not depend on
+  # whether a now-closed sublist happened to precede it.
+  OUTDENT_DOC="$WORKDIR/consumer-truth-outdent.md"
+  cat > "$OUTDENT_DOC" <<'OUTDENT_EOF'
+# Doc
+
+- a
+
+    - b mentioning #111
+
+  Outer continuation mentioning #222.
+
+      echo "#333 is code"
+
+And a bare #444 in prose is.
+OUTDENT_EOF
+  set +e
+  outdent_hits=$(md_prose_only "$OUTDENT_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  outdent_lines=$(md_prose_only "$OUTDENT_DOC" | wc -l | tr -d ' ')
+  outdent_raw=$(wc -l < "$OUTDENT_DOC" | tr -d ' ')
+  set -e
+  if [ "$outdent_hits" != "5,7,11," ]; then
+    fail "Case 45: expected lines 5,7,11 flagged (sublist closes on outdent, so line 9 is outer-item code), got '$outdent_hits'"
+  elif [ "$outdent_lines" != "$outdent_raw" ]; then
+    fail "Case 45: md_prose_only must emit one line per input line, got $outdent_lines for $outdent_raw"
+  else
+    pass "Case 45: a nested list closes on outdent, so the outer item's indented code is still excluded"
+  fi
+
 else
-  echo "SKIP: Cases 36-43 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-45 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
