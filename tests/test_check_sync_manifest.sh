@@ -1407,8 +1407,66 @@ SPAN_EOF
     fi
   fi
 
+  # Case 42: the carve-out is stated identically in both hub copies.
+  #
+  # The narration rule exists twice on the hub: once in the canonical
+  # shared core (propagated to every consumer) and once in
+  # docs/agents/operating-rules.md, the per-repo-owned LOCAL OVERLAY that
+  # still carries its own copy of the same rule pending the #780 split.
+  # The overlay is the copy a hub agent actually reads via the AGENTS.md
+  # reading order, so a carve-out that lands in only one of them leaves
+  # the other reading as a flat ban — which is the #788 contradiction
+  # reintroduced one file over.
+  #
+  # Nothing propagates between the two: the overlay is per-repo-owned, so
+  # sync-to-downstream.sh never rewrites it and no faithful-mirror check
+  # compares it against the canonical. The copies are hand-mirrored, and
+  # the overlay says so in prose ("a verbatim copy of the shared core's")
+  # — a claim with no enforcement behind it until this case. Compare the
+  # carve-out block byte-for-byte rather than probing for tokens, so that
+  # narrowing the exemption in one file and not the other fails here
+  # (nathanjohnpayne/mergepath#788).
+  CARVE_MARKER="- One narration-shaped section is carved out by name:"
+  SOR_DOC="$ROOT/docs/agents/shared-operating-rules.md"
+  OVERLAY_DOC="$ROOT/docs/agents/operating-rules.md"
+  # The block runs from the marker bullet to the blank line that ends the
+  # list, so a later bullet added to the exemption is compared too.
+  extract_carveout() {
+    awk -v m="$CARVE_MARKER" '
+      index($0, m) == 1 { in_blk = 1 }
+      in_blk && $0 == "" { exit }
+      in_blk { print }
+    ' "$1"
+  }
+  set +e
+  overlay_class=$(yq -r '
+    .doc_ownership[]
+    | select(.path == "docs/agents/operating-rules.md")
+    | .class
+  ' "$LIVE_MANIFEST"); overlay_rc=$?
+  set -e
+  if [ ! -f "$SOR_DOC" ] || [ ! -f "$OVERLAY_DOC" ]; then
+    fail "Case 42: shared-operating-rules.md and/or operating-rules.md missing on disk"
+  elif [ "$overlay_rc" != "0" ] || [ "$overlay_class" != "per-repo-owned" ]; then
+    # If the overlay ever becomes canonical the hand-mirror premise is
+    # gone and this case should be rewritten, not silently passed.
+    fail "Case 42: expected docs/agents/operating-rules.md class 'per-repo-owned', got (rc=$overlay_rc) '$overlay_class'"
+  else
+    sor_carveout=$(extract_carveout "$SOR_DOC")
+    overlay_carveout=$(extract_carveout "$OVERLAY_DOC")
+    if [ -z "$sor_carveout" ]; then
+      fail "Case 42: no '## Path taken' carve-out block in docs/agents/shared-operating-rules.md"
+    elif [ -z "$overlay_carveout" ]; then
+      fail "Case 42: docs/agents/operating-rules.md has no carve-out block — the hub overlay reads as a flat narration ban (nathanjohnpayne/mergepath#788)"
+    elif [ "$sor_carveout" != "$overlay_carveout" ]; then
+      fail "Case 42: the carve-out block differs between docs/agents/shared-operating-rules.md and the docs/agents/operating-rules.md overlay; they are hand-mirrored and must stay byte-identical (nathanjohnpayne/mergepath#788)"
+    else
+      pass "Case 42: the narration carve-out is byte-identical in the canonical shared rules and the hub overlay"
+    fi
+  fi
+
 else
-  echo "SKIP: Cases 36-41 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-42 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
