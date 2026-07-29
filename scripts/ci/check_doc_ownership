@@ -407,15 +407,217 @@ fi
 # prevent). Soft-skip if the sibling or its array is absent: this guard
 # is a consistency net over another check's data, and it must not be the
 # thing that reds CI when that check is mid-refactor.
+#
+# The array body is Bash source, so read it the way Bash would rather
+# than trusting today's incidental formatting. Trimming whitespace alone
+# was not enough: the moment an entry is written `"docs/agents/x.md"` —
+# ordinary, idiomatic Bash — the leading quote makes the
+# `docs/agents/*` case below miss it, and the contradiction this guard
+# advertises is silently skipped instead of reported.
+#
+# The reader below is therefore a character-level state machine over the
+# declaration rather than a set of line-shaped rules. Its state — the
+# token being built, the quote mode, and a stack of open shell
+# constructs — persists across newlines, because to Bash an array element
+# is not a line-bounded thing. Three blind spots (#786 round 2) all
+# traced back to state discarded at the end of a line, at a paren, or at
+# the end of the first declaration:
+#
+#   * `"docs/agents/iden\` + newline + `tity.md"` is ONE element to Bash,
+#     which deletes a backslash-newline inside quotes and out. Resetting
+#     at the newline split it into two fragments, neither of which names
+#     a file, so the denylisted doc was silently skipped.
+#   * `$(helper)` ends no array — that `)` closes the substitution.
+#     Taking it for the array terminator stopped the read early and
+#     handed back the truncated prefix as an all-clear, so every static
+#     entry below it went unread.
+#   * a later `IDENTITY_DOCS_DENYLIST=(...)` REPLACES the earlier value
+#     and `+=(...)` appends to it. Reading only the first declaration
+#     both missed entries a reassignment added and kept enforcing entries
+#     a reassignment removed.
+#
+# The rules the machine implements, all of them Bash's: unquoted
+# whitespace separates words; single and double quotes suppress that (and
+# are dropped, not kept); a backslash escapes the next character, and a
+# backslash before a newline joins the lines into one word; `$(`, `${`
+# and a backtick open a construct whose contents can neither split a word
+# nor end the array; the array ends at the first `)` that is unquoted and
+# outside any such construct, wherever on the line it falls; a `#` that
+# begins a word starts a comment that runs to end of line (a `#` mid-word
+# is a literal); and the last `=` assignment wins, with `+=` appending to
+# it.
+#
+# That paren rule is what scopes the read to one declaration. An earlier
+# version keyed the end of the array off `/^\)/`, which only recognizes a
+# closing paren in column 1 — so an indented `  )`, or a
+# `DENYLIST=(a b)` written on one line, left the reader "inside" for the
+# remainder of the file and turned every later token into denylist data
+# (1326 tokens read instead of 12, measured against today's sibling).
+# The same shape also silently DROPPED any element sharing the opening
+# line, because that line was consumed by the declaration match alone.
+#
+# Deliberate limits, so the guard degrades safely rather than guessing.
+# Nothing is expanded: an element spelled with a variable, a glob or a
+# command substitution is read as literal text, matches no file on disk,
+# and is skipped by the existence check below — but the reader now SAYS
+# so, because a denylist that could only be read in part must not be
+# reported as a clean one. Elements are buffered rather than streamed and
+# are printed only once the array actually closes, so a declaration left
+# open by an unbalanced quote yields a note and no denylist instead of
+# the rest of the file re-read as entries. And the reader is not a Bash
+# parser: it matches a declaration by line shape, so one written inside a
+# heredoc or a quoted string would be read as though it were code.
+#
+# The awk program emits kind-tagged lines — `t<TAB>element` and
+# `n<TAB>note` — so that a note can never be mistaken for a denylist
+# entry, whatever a future entry happens to look like.
 SIBLING="$REPO_ROOT/scripts/ci/check_sync_manifest"
 if [ -f "$SIBLING" ]; then
   denylist=$(awk '
-    /^IDENTITY_DOCS_DENYLIST=\(/ { inside = 1; next }
-    inside && /^\)/             { inside = 0 }
-    inside                       { gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 != "") print }
+    # SQ/DQ/BS/BT are built with sprintf rather than written as literals:
+    # the whole program lives inside one shell single-quoted string, so a
+    # bare apostrophe cannot appear here, and %c is portable across the
+    # awk implementations CI actually runs (mawk, gawk, BSD awk).
+    BEGIN {
+      SQ = sprintf("%c", 39); DQ = sprintf("%c", 34)
+      BS = sprintf("%c", 92); BT = sprintf("%c", 96)
+      NL = sprintf("%c", 10); TB = sprintf("%c", 9)
+    }
+
+    # --- output buffer, one declaration at a time --------------------
+    # Held until the array closes so a partial read is never printed,
+    # and dropped wholesale when a later assignment supersedes it.
+    function put(kind, payload) { nbuf++; buf[nbuf] = kind TB payload }
+    function drop_buffer() { nbuf = 0 }
+
+    # --- token assembly ----------------------------------------------
+    function keep(c) { tok = tok c; have = 1; boundary = 0 }
+    function flush() {
+      if (have) {
+        if (index(tok, NL) > 0) {
+          # A quoted literal newline is legal Bash, but it cannot survive
+          # the line-based handoff below and cannot name a doc this check
+          # compares. Say so rather than emitting half of it as an entry.
+          put("n", "a denylist element spans a literal newline and was not carried across to the comparison")
+        } else {
+          put("t", tok)
+          if (subst) {
+            put("n", "denylist element " tok " contains an unexpanded substitution; it is read literally, so this check compared a PARTIAL denylist")
+          }
+        }
+      }
+      tok = ""; have = 0; subst = 0
+    }
+
+    # --- open-construct stack ----------------------------------------
+    # One character per open construct, holding the closer it waits for.
+    function top() { return substr(stack, length(stack), 1) }
+    function push(closer) { stack = stack closer }
+    function pop() { stack = substr(stack, 1, length(stack) - 1) }
+
+    # Consume one chunk of array body (its newline included). Clears
+    # `inside` when the array closes; all other state persists.
+    function scan(s,   i, n, c, nx) {
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1); nx = substr(s, i + 1, 1)
+
+        # Single quotes are literal all the way to the closing quote --
+        # no escape, so not even a backslash can extend them.
+        if (q == SQ) { if (c == SQ) { q = "" } else { keep(c) } ; continue }
+
+        if (q == DQ) {
+          # Inside double quotes only \" and \\ escape, and a backslash
+          # before a newline is a continuation Bash deletes; every other
+          # backslash is an ordinary character to Bash as far as word
+          # splitting is concerned, so it is kept as-is.
+          if (c == BS) {
+            if (nx == DQ || nx == BS) { keep(nx); i++ }
+            else if (nx == NL) { i++ }
+            else { keep(c) }
+            continue
+          }
+          if (c == DQ) { q = ""; continue }
+          if (c == "$" || c == BT) { subst = 1 }
+          keep(c)
+          continue
+        }
+
+        if (c == BS) {
+          # Unquoted backslash escapes the next character, which is how a
+          # literal ) or # or space reaches an element without quoting.
+          # Before a newline it joins the two lines into one word.
+          if (nx == NL) { i++; continue }
+          if (nx != "") { keep(nx); i++ }
+          continue
+        }
+        if (c == SQ || c == DQ) { q = c; have = 1; boundary = 0; continue }
+
+        # $( and ${ open a construct, a backtick opens or closes one.
+        # Their contents can neither split a word nor end the array.
+        if (c == "$" && (nx == "(" || nx == "{")) {
+          if (nx == "(") { push(")") } else { push("}") }
+          subst = 1
+          keep(c); keep(nx); i++
+          continue
+        }
+        if (c == BT) {
+          if (top() == BT) { pop() } else { push(BT) }
+          subst = 1; keep(c)
+          continue
+        }
+        if (stack != "") {
+          if (c == "(") { push(")") } else if (c == top()) { pop() }
+          keep(c)
+          continue
+        }
+
+        if (c == "#" && boundary) {
+          # Comment to end of line. Stop ON the newline so the separator
+          # below still sees it.
+          while (i <= n && substr(s, i, 1) != NL) { i++ }
+          i--
+          continue
+        }
+        if (c == ")") { flush(); inside = 0; return }
+        if (c == " " || c == TB || c == NL) { flush(); boundary = 1; continue }
+        if (c == "$") { subst = 1 }
+        keep(c)
+      }
+    }
+
+    !inside {
+      if (!match($0, /^[ \t]*IDENTITY_DOCS_DENYLIST(\+=|=)\(/)) { next }
+      # `=` replaces the array, `+=` appends to it -- exactly as Bash
+      # would evaluate the file top to bottom.
+      if (index(substr($0, RSTART, RLENGTH), "+") == 0) { drop_buffer() }
+      inside = 1; tok = ""; have = 0; subst = 0; q = ""; stack = ""; boundary = 1
+      # Start after the opening paren so elements written on the
+      # declaration line are read rather than discarded with it.
+      scan(substr($0, index($0, "(") + 1) NL)
+      next
+    }
+    { scan($0 NL) }
+
+    END {
+      # An unterminated declaration is not a short denylist: Bash would
+      # reject the file outright. Report that rather than its prefix.
+      if (inside) {
+        drop_buffer()
+        put("n", "the IDENTITY_DOCS_DENYLIST declaration never closes; the denylist could not be read at all")
+      }
+      for (k = 1; k <= nbuf; k++) { print buf[k] }
+    }
   ' "$SIBLING")
   if [ -n "$denylist" ]; then
-    while IFS= read -r denied; do
+    while IFS= read -r row; do
+      # Kind-tagged: "t<TAB>element" or "n<TAB>note". A note is surfaced
+      # and never treated as an entry.
+      if [ "${row:0:1}" = "n" ]; then
+        echo "check_doc_ownership: note: ${row:2}"
+        continue
+      fi
+      denied="${row:2}"
       case "$denied" in
         docs/agents/*) ;;
         *) continue ;;
