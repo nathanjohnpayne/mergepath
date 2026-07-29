@@ -859,6 +859,170 @@ else
   fail "Case 12h unexpected (rc=$rc): $out"
 fi
 
+# --- Case 12i: a backslash-newline continuation is ONE element ------
+# Bash deletes a backslash-newline inside double quotes as much as
+# outside it, so the two physical lines below are a single element
+# spelling docs/agents/identity.md. A reader that resets its token at
+# each newline sees two fragments instead — neither names a file, the
+# existence check drops both, and the contradiction is skipped.
+set +e
+out=$(run_with_denylist "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '  "README.md"
+  "docs/agents/iden\
+tity.md"')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12i: a line-continued denylist entry is read as one element"
+else
+  fail "Case 12i unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12j: CONTROL — over-correction mirror of 12i --------------
+# Two ways a continuation-aware reader goes wrong, both landing on this
+# one assertion because either would invent `docs/agents/identity.md` and
+# fail a doc whose classification is correct:
+#
+#   * `iden\\` ends in an ESCAPED backslash, not a continuation. Bash
+#     yields `docs/agents/iden\` and `tity.md` as two elements. A reader
+#     that tests the raw line for a trailing backslash joins them into
+#     the denied path instead. The continued line starts in column 1 on
+#     purpose: Bash deletes the backslash-newline but not the next
+#     line's indentation, so an indented `tity.md` would split in both
+#     readings and the fixture would prove nothing.
+#   * the `\` after `tity.md` IS a continuation, and it must not carry
+#     the reader past the `)` on the next line — that would leave it
+#     inside the array to end of file and adopt the path in the function
+#     below as an entry nobody wrote.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT_COMMENTED" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=(
+  docs/agents/iden\\
+tity.md \
+)
+
+emit_identity_hint() {
+  echo "docs/agents/identity.md"
+}')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 12j: an escaped backslash is not a continuation, and a continuation does not outlive the array"
+else
+  fail "Case 12j unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12k: a substitution does not terminate the array ----------
+# `$(...)` owns its own closing paren. Treating that paren as the end of
+# the array stops the read on the first element and returns the truncated
+# prefix as an all-clear, so every static entry BELOW the substitution —
+# here the denylisted doc itself — goes unread. The element that cannot
+# be expanded is still reported, because a denylist read only in part
+# must not pass for a complete one.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+sibling_helper() { echo "README.md"; }
+IDENTITY_DOCS_DENYLIST=(
+  $(sibling_helper)
+  docs/agents/identity.md
+)')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST" \
+   && echo "$out" | grep -q "unexpanded substitution"; then
+  pass "Case 12k: a command substitution neither ends the array nor passes silently"
+else
+  fail "Case 12k unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12l: a later assignment REPLACES the earlier one ----------
+# Bash evaluates the file top to bottom, so the effective denylist is the
+# last assignment, not the first. A reader that stops after the first
+# declaration misses everything a reassignment added.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=(
+  "README.md"
+)
+
+IDENTITY_DOCS_DENYLIST=(
+  "README.md"
+  "docs/agents/identity.md"
+)')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12l: entries added by a later assignment are enforced"
+else
+  fail "Case 12l unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12m: the same rule in the OTHER direction -----------------
+# The mirror of 12l, and the sharper half: reading only the first
+# declaration does not merely miss entries, it keeps ENFORCING entries a
+# reassignment removed — failing a doc whose classification is correct
+# against the denylist Bash actually evaluates.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT_COMMENTED" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=(
+  "README.md"
+  "docs/agents/identity.md"
+)
+
+IDENTITY_DOCS_DENYLIST=(
+  "README.md"
+)')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 12m: entries dropped by a later assignment stop being enforced"
+else
+  fail "Case 12m unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12n: `+=` appends, wherever it is indented ----------------
+# The other half of "the effective value wins": `+=(...)` adds to the
+# array rather than replacing it, and a reassignment is most often
+# written indented inside a conditional or a function.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=("README.md")
+if true; then
+  IDENTITY_DOCS_DENYLIST+=("docs/agents/identity.md")
+fi')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12n: an indented += appends to the denylist"
+else
+  fail "Case 12n unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12o: CONTROL — an unterminated array yields NO entries ----
+# The safety property behind buffering elements instead of streaming
+# them: an array left open by an unbalanced quote is not a short
+# denylist, it is a file Bash would refuse. The reader must publish
+# nothing (so the leftover text below is never mistaken for entries) and
+# say why, rather than silently reporting a clean read.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT_COMMENTED" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=(
+  "README.md
+  "docs/agents/identity.md"')
+rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "never closes"; then
+  pass "Case 12o: an unterminated declaration reads as no denylist, with a note"
+else
+  fail "Case 12o unexpected (rc=$rc): $out"
+fi
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).
