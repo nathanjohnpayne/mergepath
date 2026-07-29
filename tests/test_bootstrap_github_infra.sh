@@ -9,7 +9,8 @@
 # we assert against the log:
 #
 #   1. `gh repo create` is invoked with the right flags (visibility,
-#      description, source, --push).
+#      description, source — and NOT --push, which is now its own
+#      command under the same verified author credential).
 #   2. All 12 canonical labels are seeded with --force (idempotency).
 #   3. Reviewer invitations land via `gh api -X PUT` to the right
 #      collaborator endpoint for each agent in BOOTSTRAP_INPUT_REVIEWERS.
@@ -118,7 +119,35 @@ echo "gh $*" >>"$LOG"
 case "$1" in
   repo)
     case "$2" in
-      create) exit "${SHIM_EXIT_REPO_CREATE:-0}" ;;
+      create)
+        rc="${SHIM_EXIT_REPO_CREATE:-0}"
+        if [ "$rc" = "0" ]; then
+          # Emulate the part of `gh repo create --source=<dir>` the stage
+          # depends on: the repository now exists and the local tree has
+          # an `origin` pointing at it. The stand-in remote is a bare repo
+          # beside the shim log, which makes the stage's own `git push` a
+          # REAL push rather than something else to fake.
+          remote_root="$(dirname "$LOG")/remotes"
+          full_name="$3"
+          src=""
+          for arg in "$@"; do
+            case "$arg" in --source=*) src="${arg#--source=}" ;; esac
+          done
+          bare="$remote_root/${full_name##*/}.git"
+          mkdir -p "$remote_root"
+          # SHIM_PUSH_BROKEN=1 wires origin up WITHOUT creating the bare
+          # repo behind it: the create succeeds and the push then fails,
+          # exactly as a transient network / credential failure would.
+          if [ "${SHIM_PUSH_BROKEN:-0}" != "1" ]; then
+            git init -q --bare "$bare" 2>/dev/null
+          fi
+          if [ -n "$src" ] && [ -d "$src/.git" ]; then
+            git -C "$src" remote remove origin >/dev/null 2>&1 || true
+            git -C "$src" remote add origin "$bare"
+          fi
+        fi
+        exit "$rc"
+        ;;
       *) exit 0 ;;
     esac
     ;;
@@ -133,6 +162,13 @@ case "$1" in
     # pipe doesn't break.
     if [ "$2" = "set" ]; then
       cat >/dev/null 2>&1 || true
+    fi
+    # A failing gh writes a diagnostic before it exits. Emitting one
+    # here is what keeps the "the gh-reached branch persists no
+    # capture" assertion honest: a silent shim would satisfy it with
+    # an empty capture no matter what the branch does.
+    if [ "${SHIM_EXIT_SECRET:-0}" != "0" ]; then
+      echo "gh: HTTP 403: Resource not accessible by personal access token (secret set)" >&2
     fi
     exit "${SHIM_EXIT_SECRET:-0}"
     ;;
@@ -204,9 +240,25 @@ set -e
   || fail "wizard failed; rc=$ec; out: $out"
 
 # --- assertion 1: gh repo create invoked correctly ---
-grep -q "^gh repo create nathanjohnpayne/test-repo --private --description a test repo --source=$TARGET --push$" "$SHIM_LOG" \
-  && pass "gh repo create invoked with --private + --source + --push" \
+# `--push` is deliberately NOT on the create: creation and push are
+# separate commands so the create can be checkpointed the moment it
+# succeeds and a failed push stays retryable (#790, assertion 18e).
+grep -q "^gh repo create nathanjohnpayne/test-repo --private --description a test repo --source=$TARGET$" "$SHIM_LOG" \
+  && pass "gh repo create invoked with --private + --source" \
   || fail "gh repo create flags wrong; log: $(grep '^gh repo create' "$SHIM_LOG")"
+grep -q "^gh repo create .* --push" "$SHIM_LOG" \
+  && fail "gh repo create still carries --push (create + push share one rc again); log: $(grep '^gh repo create' "$SHIM_LOG")" \
+  || pass "gh repo create no longer bundles --push"
+
+# --- assertion 1b: the bootstrap commit is pushed as its own step ---
+echo "$out" | grep -q "push bootstrap commit to nathanjohnpayne/test-repo" \
+  && pass "the bootstrap commit is pushed by a separate step" \
+  || fail "no separate push step logged; out: $out"
+# And it really pushed: the shim's stand-in remote has the commit.
+[ -d "$WORKDIR/remotes/test-repo.git" ] \
+  && git -C "$WORKDIR/remotes/test-repo.git" rev-parse --verify -q refs/heads/main >/dev/null \
+  && pass "the bootstrap commit landed on the remote's main" \
+  || fail "remote has no main after the push: $(git -C "$WORKDIR/remotes/test-repo.git" branch -a 2>&1)"
 
 # --- assertion 2: all 12 labels seeded with --force ---
 expected_labels=(needs-external-review needs-human-review policy-violation human-hold human-action decision-needed agent-action phase-0 phase-1 phase-2 phase-3 phase-4)
@@ -380,11 +432,15 @@ grep -q "^gh auth switch -u" "$SHIM_LOG" \
   || pass "secret failure path performs zero gh auth switches"
 # The pipeline-rc-capture pattern in scripts/bootstrap/github-infra.sh
 # must use `|| set_rc=$?` on the same line as the pipeline so set -e
-# doesn't kill the function before the rc handler can run.
+# doesn't kill the function before the rc handler can run. The match is
+# anchored on the `secret set REVIEWER_ASSIGNMENT_TOKEN` argv rather than
+# on a `gh secret set` literal: the helper carrying it is the caller's
+# choice (bootstrap::author_gh, bootstrap::author_gh_traced), the inline
+# rc capture is the invariant.
 awk '
   /^bootstrap::_provision_reviewer_assignment_token\(\)/ { in_fn = 1 }
   in_fn && /^}/ { in_fn = 0 }
-  in_fn && /gh secret set REVIEWER_ASSIGNMENT_TOKEN.*\|\| set_rc=\$\?/ { saw = 1 }
+  in_fn && /secret set REVIEWER_ASSIGNMENT_TOKEN.*\|\| set_rc=\$\?/ { saw = 1 }
   END { if (!saw) { print "no `|| set_rc=$?` inline on gh secret set pipeline"; exit 1 } }
 ' "$ROOT/scripts/bootstrap/github-infra.sh" \
   && pass "_provision_reviewer_assignment_token uses '|| set_rc=\$?' inline on gh secret set pipeline" \
@@ -650,9 +706,30 @@ else
   pass "github-infra NOT recorded under strict-secrets gh-secret-set failure (resume can retry)"
 fi
 [ -s "$TARGET9/.bootstrap-state.warnings" ] \
-  && grep -q "REVIEWER_ASSIGNMENT_TOKEN provisioning failed" "$TARGET9/.bootstrap-state.warnings" \
+  && grep -q "REVIEWER_ASSIGNMENT_TOKEN" "$TARGET9/.bootstrap-state.warnings" \
   && pass "strict-secrets gh-secret-set failure recorded in .bootstrap-state.warnings sidecar" \
   || fail "warnings sidecar missing the strict-mode secret-set failure: $(cat "$TARGET9/.bootstrap-state.warnings" 2>/dev/null)"
+# The record must name the SPECIFIC cause, not the generic
+# "provisioning failed (rc=N)" fallback (#782). Three distinct failures
+# share the reviewer-assignment-token key — no PAT with prompts skipped,
+# human declined, and `gh secret set` itself failing — and
+# docs/agents/bootstrap-runbook.md § Stage C promises the sidecar
+# distinguishes them. Before this fix the secret-set path left
+# $BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON empty and the stage's
+# keyed record fell back to the generic message.
+grep -qF "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on nathanjohnpayne/strictsecretfail-repo (the gh secret-set call itself failed, rc=1)" \
+     "$TARGET9/.bootstrap-state.warnings" \
+  && pass "strict-mode secret-set failure names 'gh secret set itself failed' in the sidecar (#782)" \
+  || fail "sidecar recorded a generic reason for the secret-set failure: $(cat "$TARGET9/.bootstrap-state.warnings" 2>/dev/null)"
+grep -qF "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=" \
+     "$TARGET9/.bootstrap-state.warnings" \
+  && fail "secret-set failure still recorded the generic fallback headline: $(cat "$TARGET9/.bootstrap-state.warnings" 2>/dev/null)" \
+  || pass "secret-set failure does not fall back to the generic provisioning-failed headline"
+# The stage-level consequence is still appended to the specific reason.
+grep -qF "BOOTSTRAP_STRICT_SECRETS=1 failed the stage — fix and re-run with --resume template-mirror" \
+     "$TARGET9/.bootstrap-state.warnings" \
+  && pass "secret-set failure record keeps the stage-level resume remediation" \
+  || fail "secret-set failure record dropped the resume remediation: $(cat "$TARGET9/.bootstrap-state.warnings" 2>/dev/null)"
 
 # --- assertion 15b: successful retry marks the prior token warning RESOLVED ---
 # A strict failure records a must-not-miss REVIEWER_ASSIGNMENT_TOKEN
@@ -770,10 +847,12 @@ echo "$summary_out" | grep -qF "ok - REVIEWER_ASSIGNMENT_TOKEN was NOT provision
 # The RESOLVED: prefix is the wire format of ${BOOTSTRAP_STATE_FILE}.warnings,
 # written by github-infra.sh and read by board-and-summary.sh. Pin the
 # two spellings equal so a rename in one file can't silently downgrade
-# every resolved record back into a RECORDED FAILURE.
+# every resolved record back into a RECORDED FAILURE. The renderer's
+# pattern also requires the "@<key><TAB>" prefix the producer always
+# writes, so the literal pinned here carries both halves (#781 item 3).
 # ---------------------------------------------------------------------------
 grep -q 'BOOTSTRAP_WARNING_RESOLVED_MARKER="RESOLVED: "' "$ROOT/scripts/bootstrap/github-infra.sh" \
-  && grep -qF "'^RESOLVED: '" "$ROOT/scripts/bootstrap/board-and-summary.sh" \
+  && grep -qF "warnings_resolved_re='^@[^	]*	RESOLVED: '" "$ROOT/scripts/bootstrap/board-and-summary.sh" \
   && pass "github-infra.sh and board-and-summary.sh agree on the RESOLVED: sidecar marker" \
   || fail "resolved-warning marker drifted between producer and renderer"
 
@@ -936,14 +1015,51 @@ echo "$hint_out" | grep -qF -- "--agent claude --mode review" \
 echo "$hint_out" | grep -qF -- "--agent copilot" \
   && fail "remediation emitted 'copilot', which op-preflight exits 1 on; out: $hint_out" \
   || pass "remediation never emits an --agent op-preflight would reject"
-hint_out=$(emit_remediation "copilot")
-echo "$hint_out" | grep -qF -- "--agent <selected-reviewer> --mode review" \
-  && pass "remediation falls back to the placeholder when no selection is preflight-valid" \
-  || fail "remediation did not fall back to a placeholder; out: $hint_out"
-hint_out=$(emit_remediation "")
-echo "$hint_out" | grep -qF -- "--agent <selected-reviewer> --mode review" \
-  && pass "remediation falls back to the placeholder on an empty reviewer selection" \
-  || fail "empty selection did not produce a placeholder; out: $hint_out"
+# --- assertion 15g-2: the unsupported-reviewer remediation is runnable ---
+# When NO selected reviewer is an agent op-preflight knows, there is no
+# cached PAT to re-preflight for. The hint used to emit the chained
+# command anyway with a literal `<selected-reviewer>` in the --agent
+# slot — a line the operator cannot run: `<` and `>` are shell
+# redirection metacharacters, so pasting it yields a redirect/syntax
+# error rather than the remediation (#781 item 4). The replacement is a
+# command with no placeholder in it at all.
+# ---------------------------------------------------------------------------
+for selection in "copilot" ""; do
+  label=${selection:-<empty>}
+  hint_out=$(emit_remediation "$selection")
+  echo "$hint_out" | grep -qF -- "<selected-reviewer>" \
+    && fail "unsupported-reviewer remediation ($label) still emits the <selected-reviewer> placeholder; out: $hint_out" \
+    || pass "unsupported-reviewer remediation ($label) emits no <selected-reviewer> placeholder"
+  # Stronger than a single-placeholder grep: the emitted command lines
+  # (the ones indented under "REVIEWER_ASSIGNMENT_TOKEN:   ") must carry
+  # no angle bracket at all. `<` / `>` are shell redirection operators,
+  # so ANY `<foo>` placeholder makes the line do something other than
+  # what it reads as when pasted — that is precisely what made the old
+  # hint unrunnable.
+  cmdlines=$(echo "$hint_out" | sed -n 's/^\[bootstrap\] ERROR: REVIEWER_ASSIGNMENT_TOKEN:   //p')
+  [ -n "$cmdlines" ] \
+    && pass "unsupported-reviewer remediation ($label) emits a command line" \
+    || fail "unsupported-reviewer remediation ($label) emitted no command line; out: $hint_out"
+  printf '%s\n' "$cmdlines" | grep -q '[<>]' \
+    && fail "unsupported-reviewer remediation ($label) command carries a shell-redirect placeholder: $cmdlines" \
+    || pass "unsupported-reviewer remediation ($label) command is free of angle-bracket placeholders"
+  echo "$hint_out" | grep -qF "none of the selected reviewers ($selection) is an agent scripts/op-preflight.sh can resolve a PAT for (it accepts: claude cursor codex)" \
+    && pass "unsupported-reviewer remediation ($label) names the unusable selection and the accepted set" \
+    || fail "unsupported-reviewer remediation ($label) did not explain why preflight cannot help; out: $hint_out"
+  echo "$hint_out" | grep -qF "scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/hint-repo" \
+    && pass "unsupported-reviewer remediation ($label) emits the direct token-verified secret-set command" \
+    || fail "unsupported-reviewer remediation ($label) emitted no runnable secret-set command; out: $hint_out"
+  # The chained preflight form must NOT appear: with no valid agent it
+  # could only name a placeholder or a non-selected agent's cache.
+  echo "$hint_out" | grep -qF "op-preflight.sh --agent" \
+    && fail "unsupported-reviewer remediation ($label) still emits an op-preflight invocation; out: $hint_out" \
+    || pass "unsupported-reviewer remediation ($label) drops the unusable op-preflight route"
+  # ...and it must not tell the operator to pipe the session cache in,
+  # which is what the && chain exists to prevent on the valid-agent path.
+  echo "$hint_out" | grep -qF 'printf '"'"'%s'"'"' "$OP_PREFLIGHT_REVIEWER_PAT" | scripts/gh-as-author.sh' \
+    && fail "unsupported-reviewer remediation ($label) pipes \$OP_PREFLIGHT_REVIEWER_PAT with no preflight; out: $hint_out" \
+    || pass "unsupported-reviewer remediation ($label) never pipes the session cache"
+done
 
 # The known-agent list is a local mirror of op-preflight's. Pin the two
 # equal so an agent added there cannot silently go missing here (the
@@ -959,17 +1075,17 @@ infra_agents=$(sed -n 's/^BOOTSTRAP_REVIEWER_PREFLIGHT_AGENTS="\(.*\)"$/\1/p' \
 
 # --- assertion 15h: the carried reason describes THIS attempt only ---
 # Two attempts in ONE process, exactly as --resume re-enters the stage.
-# Attempt 1 fails on a path that records a SPECIFIC reason; attempt 2
-# fails on a path that records NONE of its own (a PAT was obtained, then
-# `gh secret set` failed). The sidecar has no timestamp or run marker, so
-# a stale line from attempt 1 is byte-indistinguishable from a fresh one
-# — which is why the fix is a carried out-parameter reset on entry, NOT a
-# "never overwrite an existing record for this key" guard. The guard
-# would pin attempt 1's reason in place and silently drop attempt 2's
-# genuine failure. Both directions are pinned here:
+# Attempt 1 fails with "no PAT available, prompts skipped"; attempt 2
+# fails differently (a PAT was obtained, then `gh secret set` failed).
+# The sidecar has no timestamp or run marker, so a stale line from
+# attempt 1 is byte-indistinguishable from a fresh one — which is why the
+# fix is a carried out-parameter reset on entry, NOT a "never overwrite an
+# existing record for this key" guard. The guard would pin attempt 1's
+# reason in place and silently drop attempt 2's genuine failure. Both
+# directions are pinned here:
 #   forward  — attempt 1's specific reason survives the stage-level record;
-#   backward — attempt 2 falls back to the generic message AND replaces
-#              the stale record (record_warning's replace-by-key contract).
+#   backward — attempt 2 records its OWN cause and replaces the stale
+#              record (record_warning's replace-by-key contract).
 # ---------------------------------------------------------------------------
 : >"$SHIM_LOG"
 TARGET9H="$WORKDIR/new-repo-reason-carry"
@@ -1022,13 +1138,224 @@ grep -qF "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on nathanjohnpayne/carry
 grep -qF "no PAT available, prompts skipped" "$TARGET9H/.bootstrap-state.warnings" \
   && fail "attempt 2 inherited attempt 1's stale reason: $(cat "$TARGET9H/.bootstrap-state.warnings" 2>/dev/null)" \
   || pass "a later failure that records no reason of its own does not inherit the stale one"
-grep -qF "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=1); $CARRY_TAIL" \
+grep -qF "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on nathanjohnpayne/carry-repo (the gh secret-set call itself failed, rc=1) — set it manually before the first PR; $CARRY_TAIL" \
      "$TARGET9H/.bootstrap-state.warnings" \
-  && pass "attempt 2 replaces the stale record with its own generic message" \
-  || fail "attempt 2 did not record the generic failure: $(cat "$TARGET9H/.bootstrap-state.warnings" 2>/dev/null)"
+  && pass "attempt 2 replaces the stale record with its OWN specific cause" \
+  || fail "attempt 2 did not record its own cause: $(cat "$TARGET9H/.bootstrap-state.warnings" 2>/dev/null)"
 [ "$(grep -c '^@reviewer-assignment-token	' "$TARGET9H/.bootstrap-state.warnings")" = "1" ] \
   && pass "replacement leaves exactly one reviewer-assignment-token record" \
   || fail "expected one keyed record after replacement: $(cat "$TARGET9H/.bootstrap-state.warnings" 2>/dev/null)"
+
+# --- assertion 15h-2: the generic fallback is still wired ---
+# Every failing provisioning path now publishes a specific reason (#782),
+# so the recorder's generic branch is unreachable through
+# bootstrap::_provision_reviewer_assignment_token. It stays as defence in
+# depth for a future path that forgets to publish one, and that branch
+# must keep working — exercise it directly with an empty out-parameter.
+# ---------------------------------------------------------------------------
+TARGET9H2="$WORKDIR/new-repo-generic-fallback"
+rm -rf "$TARGET9H2"
+mkdir -p "$TARGET9H2"
+set +e
+fallback_out=$(bash -c '
+  ROOT="'"$ROOT"'"
+  TARGET="'"$TARGET9H2"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/github-infra.sh"
+  BOOTSTRAP_STATE_FILE="$TARGET/.bootstrap-state"
+  BOOTSTRAP_LOG_FILE=""
+  BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON=""
+  bootstrap::_record_reviewer_token_stage_failure 7 "tail note"
+' 2>&1)
+fallback_ec=$?
+set -e
+[ "$fallback_ec" -eq 0 ] \
+  && grep -qF "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=7); tail note" \
+       "$TARGET9H2/.bootstrap-state.warnings" \
+  && pass "recorder still falls back to the generic headline when no reason is published" \
+  || fail "generic fallback broke; rc=$fallback_ec; out: $fallback_out; sidecar: $(cat "$TARGET9H2/.bootstrap-state.warnings" 2>/dev/null)"
+
+# --- assertion 15i: a wrapper failure is NOT recorded as a gh failure ---
+# scripts/gh-as-author.sh can fail BEFORE it ever starts gh — byline pin
+# refusal (exit 2), author token lookup failure (exit 3) — and the rc
+# alone cannot be told from `gh secret set` running and failing. Recording
+# "the gh secret-set call itself failed" for a token-lookup failure sends
+# the operator to replace the reviewer PAT when the thing to repair is
+# AUTHOR authentication. bootstrap::author_gh_traced settles it with
+# positive proof: a marker the wrapped command writes immediately before
+# it exec's gh.
+#
+# Both directions run through a REAL wrapper (BOOTSTRAP_SKIP_AUTHOR_TOKEN
+# is deliberately unset, so the traced call takes its wrapper branch):
+#   (a) a wrapper that exits 3 without running the wrapped command;
+#   (b) a wrapper that forwards the wrapped command, whose gh then fails.
+# ---------------------------------------------------------------------------
+run_secret_set_failure_case() {
+  # $1 = fake-root dir holding scripts/gh-as-author.sh, $2 = target dir,
+  # $3 = optional $BOOTSTRAP_LOG_FILE path (default: none configured)
+  PATH="$SHIM_PATH" SHIM_LOG="$SHIM_LOG" SHIM_EXIT_SECRET=1 bash -c '
+    ROOT="'"$ROOT"'"
+    . "$ROOT/scripts/bootstrap/_lib.sh"
+    . "$ROOT/scripts/bootstrap/github-infra.sh"
+    BOOTSTRAP_MERGEPATH_ROOT="'"$1"'"
+    BOOTSTRAP_STATE_FILE="'"$2"'/.bootstrap-state"
+    BOOTSTRAP_LOG_FILE="'"${3:-}"'"
+    BOOTSTRAP_DRY_RUN=0
+    BOOTSTRAP_SKIP_AUTHOR_TOKEN=0
+    BOOTSTRAP_AUTO_PROMPT=skip
+    BOOTSTRAP_STRICT_SECRETS=1
+    BOOTSTRAP_REVIEWER_PAT_VALUE="fake-pat"
+    OP_PREFLIGHT_REVIEWER_PAT=""
+    rc=0
+    bootstrap::_provision_reviewer_assignment_token "nathanjohnpayne/wrapperfail-repo" "claude" || rc=$?
+    bootstrap::_record_reviewer_token_stage_failure "$rc" "tail note"
+    echo "RC=$rc"
+  ' 2>&1
+}
+
+# (a) wrapper refuses before running anything.
+: >"$SHIM_LOG"
+FAKE_ROOT_REFUSE="$WORKDIR/fake-root-wrapper-refuse"
+TARGET9I="$WORKDIR/new-repo-wrapper-refuse"
+rm -rf "$FAKE_ROOT_REFUSE" "$TARGET9I"
+mkdir -p "$FAKE_ROOT_REFUSE/scripts" "$TARGET9I"
+cat >"$FAKE_ROOT_REFUSE/scripts/gh-as-author.sh" <<'REFUSE_EOF'
+#!/bin/sh
+# Stand-in for scripts/gh-as-author.sh's pre-`gh` failure modes: it
+# never runs the wrapped command (exit 3 = author token lookup failed).
+echo "gh-as-author: could not read a token for nathanjohnpayne via gh auth token --user." >&2
+exit 3
+REFUSE_EOF
+chmod +x "$FAKE_ROOT_REFUSE/scripts/gh-as-author.sh"
+set +e
+refuse_out=$(run_secret_set_failure_case "$FAKE_ROOT_REFUSE" "$TARGET9I")
+refuse_ec=$?
+set -e
+echo "$refuse_out" | grep -q "RC=3" && [ "$refuse_ec" -eq 0 ] \
+  && pass "wrapper pre-gh failure propagates its rc (3) out of provisioning" \
+  || fail "wrapper-refusal harness misbehaved; rc=$refuse_ec; out: $refuse_out"
+grep -q "secret set" "$SHIM_LOG" \
+  && fail "gh was invoked even though the wrapper refused; log: $(cat "$SHIM_LOG")" \
+  || pass "the refusing wrapper never reached gh (no secret-set in the shim log)"
+grep -qF "the gh secret-set call itself failed" "$TARGET9I/.bootstrap-state.warnings" \
+  && fail "wrapper failure recorded as a gh secret-set failure: $(cat "$TARGET9I/.bootstrap-state.warnings")" \
+  || pass "wrapper failure is NOT recorded as 'the gh secret-set call itself failed'"
+grep -qF "the author write path failed before the gh secret-set call ran, rc=3" \
+     "$TARGET9I/.bootstrap-state.warnings" \
+  && pass "wrapper failure records an author-authentication cause instead" \
+  || fail "sidecar does not name the author write path: $(cat "$TARGET9I/.bootstrap-state.warnings" 2>/dev/null)"
+echo "$refuse_out" | grep -q "this is an AUTHOR-authentication failure" \
+  && pass "the operator-facing ERROR lines point at author auth, not the reviewer PAT" \
+  || fail "no author-auth ERROR line emitted; out: $refuse_out"
+
+# (b) wrapper forwards the wrapped command; gh itself fails. This also
+# proves the marker survives the real wrapper's exec path.
+: >"$SHIM_LOG"
+FAKE_ROOT_FORWARD="$WORKDIR/fake-root-wrapper-forward"
+TARGET9I2="$WORKDIR/new-repo-wrapper-forward"
+rm -rf "$FAKE_ROOT_FORWARD" "$TARGET9I2"
+mkdir -p "$FAKE_ROOT_FORWARD/scripts" "$TARGET9I2"
+cat >"$FAKE_ROOT_FORWARD/scripts/gh-as-author.sh" <<'FWD_EOF'
+#!/bin/sh
+# Stand-in for a wrapper whose token resolution SUCCEEDS: it runs
+# whatever follows `--`, exactly as scripts/gh-as-author.sh does.
+[ "$1" = "--" ] && shift
+exec "$@"
+FWD_EOF
+chmod +x "$FAKE_ROOT_FORWARD/scripts/gh-as-author.sh"
+set +e
+fwd_out=$(run_secret_set_failure_case "$FAKE_ROOT_FORWARD" "$TARGET9I2")
+fwd_ec=$?
+set -e
+echo "$fwd_out" | grep -q "RC=1" && [ "$fwd_ec" -eq 0 ] \
+  && pass "a forwarded secret-set propagates gh's own rc (1)" \
+  || fail "wrapper-forward harness misbehaved; rc=$fwd_ec; out: $fwd_out"
+grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/wrapperfail-repo\$" "$SHIM_LOG" \
+  && pass "the forwarding wrapper reaches gh with argv unchanged by the trace shim" \
+  || fail "gh argv changed or gh was not reached; log: $(cat "$SHIM_LOG")"
+grep -qF "the gh secret-set call itself failed, rc=1" "$TARGET9I2/.bootstrap-state.warnings" \
+  && pass "a real gh failure is still recorded as a gh secret-set failure" \
+  || fail "gh failure lost its specific cause: $(cat "$TARGET9I2/.bootstrap-state.warnings" 2>/dev/null)"
+
+# --- assertion 15j: the pre-gh diagnostic is where the record says ---
+# The record for the pre-gh branch names the author write path, but the
+# remediation detail — WHICH token lookup failed, which identity the
+# byline pin wanted — is the wrapper's own message, and the wizard
+# installs no global stderr tee while bootstrap::run logs command lines
+# without their output. Telling an operator the wrapper's error is in
+# .bootstrap-log while it exists only in the terminal ends the search at
+# a file that never had it. Pinned in three directions: with a log file
+# the text is really appended AND still shown live; without one the
+# record must not claim a log; and the gh-reached branch must not
+# persist a capture taken after the pipeline read the piped PAT.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET9J="$WORKDIR/new-repo-wrapper-refuse-logged"
+rm -rf "$TARGET9J"
+mkdir -p "$TARGET9J"
+LOG9J="$TARGET9J/.bootstrap-log"
+set +e
+logged_out=$(run_secret_set_failure_case "$FAKE_ROOT_REFUSE" "$TARGET9J" "$LOG9J")
+logged_ec=$?
+set -e
+echo "$logged_out" | grep -q "RC=3" && [ "$logged_ec" -eq 0 ] \
+  && pass "logged wrapper-refusal harness reproduces the pre-gh failure (rc=3)" \
+  || fail "logged harness misbehaved; rc=$logged_ec; out: $logged_out"
+# The wrapper's own words, indented under a header by
+# bootstrap::append_log_diagnostic — the indent proves the text arrived
+# through the persist path and is not some other line that happens to
+# mention the same failure.
+grep -qF "captured output follows" "$LOG9J" \
+  && pass "the run log carries a captured-output header for the pre-gh failure" \
+  || fail "no captured-output header in the run log: $(cat "$LOG9J" 2>/dev/null)"
+grep -qE '^    gh-as-author: could not read a token for nathanjohnpayne' "$LOG9J" \
+  && pass "the wrapper's own diagnostic is persisted to the run log" \
+  || fail "wrapper diagnostic missing from the run log: $(cat "$LOG9J" 2>/dev/null)"
+# Persisting must not come at the cost of the live view.
+echo "$logged_out" | grep -qF "gh-as-author: could not read a token for nathanjohnpayne" \
+  && pass "the wrapper's diagnostic is still shown on the terminal" \
+  || fail "capturing the diagnostic swallowed it; out: $logged_out"
+grep -qF "the wrapper's own error is in the run log" "$TARGET9J/.bootstrap-state.warnings" \
+  && pass "the record points at the run log, which now really holds the diagnostic" \
+  || fail "record does not point at the log: $(cat "$TARGET9J/.bootstrap-state.warnings" 2>/dev/null)"
+# Fallback: case (a) above ran with BOOTSTRAP_LOG_FILE unset, so there
+# was no log to append to and the record must not send anyone to one.
+grep -qF "the wrapper's own error is in the run log" "$TARGET9I/.bootstrap-state.warnings" \
+  && fail "record points at a run log that was never written: $(cat "$TARGET9I/.bootstrap-state.warnings")" \
+  || pass "with no log file the record makes no run-log claim"
+grep -qF "the wrapper's own error is in the terminal output above" \
+     "$TARGET9I/.bootstrap-state.warnings" \
+  && pass "with no log file the record points at the terminal instead" \
+  || fail "no terminal fallback in the record: $(cat "$TARGET9I/.bootstrap-state.warnings" 2>/dev/null)"
+# The gh-reached branch keeps its capture terminal-only: by then the
+# pipeline has read the piped PAT, and that record claims nothing about
+# a log, so there is no false pointer to repair by persisting it.
+: >"$SHIM_LOG"
+TARGET9J2="$WORKDIR/new-repo-wrapper-forward-logged"
+rm -rf "$TARGET9J2"
+mkdir -p "$TARGET9J2"
+LOG9J2="$TARGET9J2/.bootstrap-log"
+set +e
+fwdlog_out=$(run_secret_set_failure_case "$FAKE_ROOT_FORWARD" "$TARGET9J2" "$LOG9J2")
+fwdlog_ec=$?
+set -e
+echo "$fwdlog_out" | grep -q "RC=1" && [ "$fwdlog_ec" -eq 0 ] \
+  && pass "logged wrapper-forward harness reproduces the gh failure (rc=1)" \
+  || fail "logged forward harness misbehaved; rc=$fwdlog_ec; out: $fwdlog_out"
+# There IS a capture to decline here — the shim gh prints a diagnostic
+# before it exits — so the assertion below cannot pass on an empty file.
+echo "$fwdlog_out" | grep -qF "gh: HTTP 403: Resource not accessible by personal access token" \
+  && pass "the gh-reached branch captured a non-empty diagnostic and showed it" \
+  || fail "no gh diagnostic captured, so the no-persist check would be vacuous; out: $fwdlog_out"
+grep -qF "captured output follows" "$LOG9J2" 2>/dev/null \
+  && fail "post-PAT-read output was persisted on the gh-reached branch: $(cat "$LOG9J2")" \
+  || pass "the gh-reached branch persists no capture"
+grep -qF "HTTP 403" "$LOG9J2" 2>/dev/null \
+  && fail "gh's own post-PAT-read output reached the run log: $(cat "$LOG9J2")" \
+  || pass "gh's post-PAT-read output stays out of the run log"
+grep -qF "in the run log" "$TARGET9J2/.bootstrap-state.warnings" \
+  && fail "the gh-reached record claims a log entry it never wrote: $(cat "$TARGET9J2/.bootstrap-state.warnings")" \
+  || pass "the gh-reached record makes no run-log claim"
 
 # --- assertion 16: dry-run PAT miss is pure (#755 round 2) ---
 # A dry run carries no credentials, so a PAT miss there is EXPECTED:
@@ -1132,6 +1459,611 @@ echo "$out" | grep -q "is not empty" \
 echo "$out" | grep -q "resume: skip template-mirror" \
   && pass "resume actually skipped the recorded template-mirror stage" \
   || fail "resume did not skip template-mirror; out: $out"
+
+# --- assertion 18: a strict-secrets abort after repo creation is
+# resumable (#761 item 3).
+#
+# Stage C creates the remote FIRST and records stage completion LAST, so
+# a BOOTSTRAP_STRICT_SECRETS=1 abort in the secret step leaves a created
+# remote that nothing records. The stage's own remediation says to re-run
+# with `--resume template-mirror`, and that was impossible: the wizard's
+# preflight rejected the populated target dir AND the now-existing
+# remote, and had it got past both, stage C would have called
+# `gh repo create` on a name that already exists.
+#
+# The fix is a post-create checkpoint. This drives the real two-run
+# sequence end to end: run 1 aborts under strict mode after the remote is
+# created; run 2 resumes in the SAME target dir with credentials fixed.
+# Run 2 deliberately does NOT set BOOTSTRAP_SKIP_TOOL_CHECK, because the
+# existing-remote probe is one of the two gates being tested and it is
+# suppressed by that flag. That needs `op` on the shim PATH for
+# preflight's dependency check.
+# ---------------------------------------------------------------------------
+cat >"$SHIM_DIR/op" <<'OP_EOF'
+#!/bin/sh
+# op shim for the resume preflight: present on PATH for the dependency
+# check, but resolves no PAT (the resume run supplies one inline).
+exit 1
+OP_EOF
+chmod +x "$SHIM_DIR/op"
+
+run_wizard_toolcheck() {
+  PATH="$SHIM_PATH" \
+  SHIM_LOG="$SHIM_LOG" \
+  BOOTSTRAP_MERGEPATH_ROOT="$FAKE_MP" \
+  BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+  BOOTSTRAP_AUTO_CONFIRM=1 \
+  BOOTSTRAP_AUTO_PROMPT=skip \
+  BOOTSTRAP_AUTHOR_NAME="test" \
+  BOOTSTRAP_AUTHOR_EMAIL="t@t" \
+  BOOTSTRAP_SKIP_AUTHOR_TOKEN=1 \
+  BOOTSTRAP_SKIP_INVITE_PAUSE=1 \
+  BOOTSTRAP_REVIEWER_PAT_VALUE="fake-test-pat-1234567890" \
+  BOOTSTRAP_SKIP_STAGES=board-and-summary \
+  "$SCRIPT" "$@"
+}
+
+# Run 1: strict abort in the secret step, AFTER the remote was created.
+: >"$SHIM_LOG"
+TARGET12="$WORKDIR/new-repo-strict-resume"
+rm -rf "$TARGET12"
+set +e
+out=$(SHIM_EXIT_SECRET=1 BOOTSTRAP_STRICT_SECRETS=1 run_wizard strictresume-repo \
+        --target-dir "$TARGET12" \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new 2>&1)
+ec=$?
+set -e
+[ "$ec" -ne 0 ] \
+  && pass "strict-secrets run 1 aborts after the remote was created (rc=$ec)" \
+  || fail "strict-secrets run 1 should have failed; rc=$ec, out: $out"
+grep -q "^gh repo create nathanjohnpayne/strictresume-repo " "$SHIM_LOG" \
+  && pass "strict-secrets run 1 did create the remote before aborting" \
+  || fail "run 1 never reached gh repo create; log: $(cat "$SHIM_LOG")"
+[ -f "$TARGET12/.bootstrap-state.checkpoints" ] \
+  && grep -qxF "github-infra:remote-created:nathanjohnpayne/strictresume-repo" "$TARGET12/.bootstrap-state.checkpoints" \
+  && pass "the created remote is recorded in .bootstrap-state.checkpoints, bound to its owner/name" \
+  || fail "no remote-created checkpoint after run 1: $(cat "$TARGET12/.bootstrap-state.checkpoints" 2>/dev/null)"
+grep -qxF "github-infra:remote-created" "$TARGET12/.bootstrap-state.checkpoints" \
+  && fail "a repo-less checkpoint was recorded; it would match any remote: $(cat "$TARGET12/.bootstrap-state.checkpoints")" \
+  || pass "no bare step-only checkpoint is recorded"
+grep -q "^github-infra\$" "$TARGET12/.bootstrap-state" \
+  && fail "github-infra recorded despite the strict abort" \
+  || pass "github-infra still NOT recorded (the stage did not finish)"
+
+# Run 2: the operator fixes credentials and resumes, exactly as the
+# stage's own recorded remediation instructs.
+: >"$SHIM_LOG"
+set +e
+resume_out=$(run_wizard_toolcheck strictresume-repo \
+               --target-dir "$TARGET12" \
+               --description d --visibility private \
+               --firebase none --codex-app n --project new \
+               --resume template-mirror 2>&1)
+resume_ec=$?
+set -e
+echo "$resume_out" | grep -q "is not empty" \
+  && fail "resume preflight rejected the target dir the earlier stages populated; out: $resume_out" \
+  || pass "resume preflight accepts a target dir populated by earlier stages"
+echo "$resume_out" | grep -q "remote already exists" \
+  && fail "resume preflight rejected the remote this bootstrap created; out: $resume_out" \
+  || pass "resume preflight accepts the remote recorded by the checkpoint"
+[ "$resume_ec" -eq 0 ] \
+  && pass "strict-secrets abort is resumable with --resume template-mirror (rc=0)" \
+  || fail "resume run failed; rc=$resume_ec; out: $resume_out"
+grep -q "^gh repo create " "$SHIM_LOG" \
+  && fail "resume re-invoked gh repo create on an existing remote; log: $(cat "$SHIM_LOG")" \
+  || pass "resume skips gh repo create (checkpointed step is idempotent)"
+echo "$resume_out" | grep -q "skipping gh repo create" \
+  && pass "resume logs why the create was skipped" \
+  || fail "resume did not log the checkpoint skip; out: $resume_out"
+grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/strictresume-repo\$" "$SHIM_LOG" \
+  && pass "resume completes the step that failed (REVIEWER_ASSIGNMENT_TOKEN set)" \
+  || fail "resume never retried the secret; log: $(cat "$SHIM_LOG")"
+grep -q "^github-infra\$" "$TARGET12/.bootstrap-state" \
+  && pass "resume records github-infra completion" \
+  || fail "state file still missing github-infra: $(cat "$TARGET12/.bootstrap-state" 2>/dev/null)"
+
+# --- assertion 18b: the checkpoint is bound to the repo it created ---
+# The sidecar lives in the target dir, but the repository comes from the
+# positional argument + $BOOTSTRAP_REPO_OWNER, and --target-dir lets a
+# second run reuse the same tree under a DIFFERENT name. A step-only
+# checkpoint ("this bootstrap created a remote") would therefore relax
+# both guards for any owner/name: a mistyped resume would pass preflight
+# against an unrelated existing repo, skip the create, and go on to seed
+# labels, invite reviewers and write REVIEWER_ASSIGNMENT_TOKEN into it.
+# TARGET12 still holds run 1's checkpoint for strictresume-repo; both
+# layers are pinned against a resume that names hijack-repo instead.
+# ---------------------------------------------------------------------------
+# Layer 1 — preflight refuses the unrelated existing remote.
+: >"$SHIM_LOG"
+set +e
+hijack_out=$(run_wizard_toolcheck hijack-repo \
+               --target-dir "$TARGET12" \
+               --description d --visibility private \
+               --firebase none --codex-app n --project new \
+               --resume template-mirror 2>&1)
+hijack_ec=$?
+set -e
+[ "$hijack_ec" -eq 2 ] \
+  && pass "a resume naming a different repo in the same target dir fails preflight (rc=2)" \
+  || fail "resume onto an unrelated repo should exit 2; rc=$hijack_ec; out: $hijack_out"
+echo "$hijack_out" | grep -q "remote already exists: nathanjohnpayne/hijack-repo" \
+  && pass "preflight refuses the unrelated remote despite a checkpoint for another repo" \
+  || fail "existing-remote guard did not fire for the unnamed repo; out: $hijack_out"
+grep -q -- "--repo nathanjohnpayne/hijack-repo" "$SHIM_LOG" \
+  && fail "the refused resume still wrote to the unrelated repo; log: $(cat "$SHIM_LOG")" \
+  || pass "the refused resume performed no writes against the unrelated repo"
+
+# Layer 2 — with preflight's remote probe suppressed (BOOTSTRAP_SKIP_TOOL_CHECK=1,
+# as run_wizard sets), the stage itself must still not adopt the earlier
+# run's create: it creates hijack-repo's OWN remote.
+: >"$SHIM_LOG"
+set +e
+hijack2_out=$(run_wizard hijack-repo \
+                --target-dir "$TARGET12" \
+                --description d --visibility private \
+                --firebase none --codex-app n --project new \
+                --resume template-mirror 2>&1)
+hijack2_ec=$?
+set -e
+[ "$hijack2_ec" -eq 0 ] \
+  && pass "stage-level hijack probe ran to completion (rc=0)" \
+  || fail "stage-level hijack probe failed; rc=$hijack2_ec; out: $hijack2_out"
+grep -q "^gh repo create nathanjohnpayne/hijack-repo " "$SHIM_LOG" \
+  && pass "step 1 creates the named repo's own remote instead of inheriting the checkpointed skip" \
+  || fail "gh repo create for hijack-repo was skipped by another repo's checkpoint; log: $(cat "$SHIM_LOG")"
+grep -qxF "github-infra:remote-created:nathanjohnpayne/hijack-repo" "$TARGET12/.bootstrap-state.checkpoints" \
+  && pass "the second create records its own repo-bound checkpoint" \
+  || fail "hijack-repo create recorded no bound checkpoint: $(cat "$TARGET12/.bootstrap-state.checkpoints" 2>/dev/null)"
+
+# --- assertion 18c: the existing-remote relaxation is checkpoint-gated ---
+# Positive proof only. Without the checkpoint an existing remote still
+# fails preflight closed, so `--resume` can never be used to bootstrap
+# over a repo this run did not create.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+rm -f "$TARGET12/.bootstrap-state.checkpoints"
+set +e
+nocp_out=$(run_wizard_toolcheck strictresume-repo \
+             --target-dir "$TARGET12" \
+             --description d --visibility private \
+             --firebase none --codex-app n --project new \
+             --resume template-mirror 2>&1)
+nocp_ec=$?
+set -e
+[ "$nocp_ec" -eq 2 ] \
+  && pass "resume without the checkpoint fails preflight (rc=2)" \
+  || fail "resume without the checkpoint should exit 2; rc=$nocp_ec; out: $nocp_out"
+echo "$nocp_out" | grep -q "remote already exists" \
+  && pass "resume without the checkpoint still refuses the existing remote" \
+  || fail "existing-remote guard did not fire without the checkpoint; out: $nocp_out"
+[ -s "$SHIM_LOG" ] \
+  && ! grep -q "^gh repo create " "$SHIM_LOG" \
+  && pass "the refused resume never reached gh repo create" \
+  || fail "refused resume behaved unexpectedly; log: $(cat "$SHIM_LOG")"
+
+# --- assertion 18d: a dry run never writes a checkpoint ---
+# bootstrap::record_checkpoint records what the wizard DID, not what it
+# said it would do. A dry-run checkpoint would make a LATER live run skip
+# a `gh repo create` that never happened, against a remote that does not
+# exist.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET13="$WORKDIR/new-repo-dry-checkpoint"
+rm -rf "$TARGET13"
+set +e
+out=$(run_wizard drycheckpoint-repo \
+        --target-dir "$TARGET13" \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new --dry-run 2>&1)
+ec=$?
+set -e
+[ "$ec" -eq 0 ] \
+  && pass "dry run with the checkpoint machinery exits 0" \
+  || fail "dry run failed; rc=$ec, out: $out"
+[ -e "$TARGET13/.bootstrap-state.checkpoints" ] \
+  && fail "dry run wrote a remote-created checkpoint: $(cat "$TARGET13/.bootstrap-state.checkpoints")" \
+  || pass "dry run writes no .bootstrap-state.checkpoints sidecar"
+
+# --- assertion 18e: a created remote whose PUSH failed is still
+# checkpointed, and the resume retries only the push (#790).
+#
+# As one `gh repo create --source --push` the two halves shared a single
+# exit code: a push that failed on a transient network / credential error
+# returned non-zero with the repository already created, and the
+# checkpoint — written only after the whole command succeeded — was never
+# recorded. The remote existed, nothing recorded it, and the documented
+# `--resume template-mirror` retry was then refused by preflight's
+# existing-remote check. The most likely-to-be-transient failure in the
+# stage produced the one state the checkpoint exists to prevent.
+#
+# Split into two commands, the create's success is checkpointed
+# immediately and the push is an ordinary repeatable step. Driven end to
+# end: run 1 creates the remote and fails the push; the operator fixes
+# the cause; run 2 resumes and pushes.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET14="$WORKDIR/new-repo-push-fail"
+rm -rf "$TARGET14"
+set +e
+pf_out=$(SHIM_PUSH_BROKEN=1 run_wizard pushfail-repo \
+           --target-dir "$TARGET14" \
+           --description d --visibility private \
+           --firebase none --codex-app n --project new 2>&1)
+pf_ec=$?
+set -e
+[ "$pf_ec" -ne 0 ] \
+  && pass "a failed push fails the stage (rc=$pf_ec)" \
+  || fail "push-failure run should have failed; rc=$pf_ec, out: $pf_out"
+grep -q "^gh repo create nathanjohnpayne/pushfail-repo " "$SHIM_LOG" \
+  && pass "push-failure run did create the remote" \
+  || fail "run never reached gh repo create; log: $(cat "$SHIM_LOG")"
+echo "$pf_out" | grep -q "push bootstrap commit to nathanjohnpayne/pushfail-repo" \
+  && pass "push-failure run attempted the push as its own step" \
+  || fail "no push step attempted; out: $pf_out"
+[ -f "$TARGET14/.bootstrap-state.checkpoints" ] \
+  && grep -qxF "github-infra:remote-created:nathanjohnpayne/pushfail-repo" "$TARGET14/.bootstrap-state.checkpoints" \
+  && pass "the created remote is checkpointed even though the push failed" \
+  || fail "no remote-created checkpoint after a failed push: $(cat "$TARGET14/.bootstrap-state.checkpoints" 2>/dev/null)"
+grep -q "^github-infra\$" "$TARGET14/.bootstrap-state" \
+  && fail "github-infra recorded despite the failed push" \
+  || pass "github-infra still NOT recorded (the stage did not finish)"
+
+# The operator fixes the transient cause: the remote is reachable again.
+git init -q --bare "$WORKDIR/remotes/pushfail-repo.git"
+: >"$SHIM_LOG"
+set +e
+pf2_out=$(run_wizard_toolcheck pushfail-repo \
+            --target-dir "$TARGET14" \
+            --description d --visibility private \
+            --firebase none --codex-app n --project new \
+            --resume template-mirror 2>&1)
+pf2_ec=$?
+set -e
+echo "$pf2_out" | grep -q "remote already exists" \
+  && fail "preflight refused the remote created before the push failed; out: $pf2_out" \
+  || pass "preflight accepts the remote whose push failed (checkpoint present)"
+[ "$pf2_ec" -eq 0 ] \
+  && pass "a failed push is resumable with --resume template-mirror (rc=0)" \
+  || fail "push-failure resume failed; rc=$pf2_ec; out: $pf2_out"
+grep -q "^gh repo create " "$SHIM_LOG" \
+  && fail "resume re-invoked gh repo create on the existing remote; log: $(cat "$SHIM_LOG")" \
+  || pass "resume skips the create"
+echo "$pf2_out" | grep -q "push bootstrap commit to nathanjohnpayne/pushfail-repo" \
+  && pass "resume retries the push it skipped the create for" \
+  || fail "resume did not retry the push; out: $pf2_out"
+git -C "$WORKDIR/remotes/pushfail-repo.git" rev-parse --verify -q refs/heads/main >/dev/null \
+  && pass "the bootstrap commit reached the remote on the retry" \
+  || fail "remote still has no main after the resume"
+grep -q "^github-infra\$" "$TARGET14/.bootstrap-state" \
+  && pass "resume records github-infra completion" \
+  || fail "state file still missing github-infra: $(cat "$TARGET14/.bootstrap-state" 2>/dev/null)"
+rm -f "$SHIM_DIR/op"
+
+# --- assertion 18f: the split push still runs under the VERIFIED author
+# credential (#790 round 4).
+#
+# As one `gh repo create --source --push`, a single bootstrap::run_author_gh
+# call covered both halves: gh created the remote AND pushed under the
+# author token scripts/gh-as-author.sh had resolved and verified.
+# Splitting the commands must not split them off that credential. A bare
+# `git push` takes its credential from the machine's ambient
+# credential-helper state instead — it fails or prompts on a clean or
+# non-author setup, and where some OTHER configured account has access it
+# silently populates the new repo's main under the wrong identity, which
+# is the mis-attribution class this repo's author/reviewer separation
+# exists to make impossible.
+#
+# Driven through a REAL wrapper (BOOTSTRAP_SKIP_AUTHOR_TOKEN=0), so
+# nothing reaches gh or git without passing through
+# scripts/gh-as-author.sh first, and the stand-in wrapper records every
+# command it was handed.
+# ---------------------------------------------------------------------------
+# $1 = fake-root dir holding scripts/gh-as-author.sh, $2 = target dir,
+# $3 = owner/name to create, $4 = file the wrapper appends its argv to.
+run_create_and_push_case() {
+  PATH="$SHIM_PATH" SHIM_LOG="$SHIM_LOG" WRAPPER_LOG="$4" bash -c '
+    ROOT="'"$ROOT"'"
+    . "$ROOT/scripts/bootstrap/_lib.sh"
+    . "$ROOT/scripts/bootstrap/github-infra.sh"
+    BOOTSTRAP_MERGEPATH_ROOT="'"$1"'"
+    BOOTSTRAP_STATE_FILE="'"$2"'/.bootstrap-state"
+    BOOTSTRAP_DRY_RUN=0
+    BOOTSTRAP_SKIP_AUTHOR_TOKEN=0
+    rc=0
+    bootstrap::_create_remote_and_push \
+      "'"$3"'" private "a test repo" "'"$2"'" || rc=$?
+    echo "RC=$rc"
+  ' 2>&1
+}
+
+# A target tree in the state stage B leaves behind: a git repo on main
+# with one commit and no origin (the gh shim adds origin on create).
+mk_push_target() {
+  rm -rf "$1"
+  mkdir -p "$1"
+  git -C "$1" init -q -b main
+  echo seed >"$1/README.md"
+  git -C "$1" add README.md
+  git -C "$1" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+    commit -q -m "Initial commit (bootstrapped from mergepath)"
+}
+
+FAKE_ROOT_AUTHPUSH="$WORKDIR/fake-root-author-push"
+rm -rf "$FAKE_ROOT_AUTHPUSH"
+mkdir -p "$FAKE_ROOT_AUTHPUSH/scripts"
+cat >"$FAKE_ROOT_AUTHPUSH/scripts/gh-as-author.sh" <<'AUTHPUSH_EOF'
+#!/bin/sh
+# Stand-in for scripts/gh-as-author.sh. Records the command it was asked
+# to run — which is what proves a call went through the verified author
+# path at all — and then runs it the way the real wrapper does: the
+# resolved author token in GH_TOKEN, GITHUB_TOKEN cleared.
+printf '%s\n' "$*" >>"${WRAPPER_LOG:?WRAPPER_LOG not set}"
+[ "$1" = "--" ] && shift
+unset GITHUB_TOKEN
+GH_TOKEN="fake-author-token-for-the-push" exec "$@"
+AUTHPUSH_EOF
+chmod +x "$FAKE_ROOT_AUTHPUSH/scripts/gh-as-author.sh"
+
+: >"$SHIM_LOG"
+T18F="$WORKDIR/new-repo-author-push"
+WRAPPER_LOG18F="$WORKDIR/wrapper-author-push.log"
+mk_push_target "$T18F"
+: >"$WRAPPER_LOG18F"
+set +e
+ap_out=$(run_create_and_push_case "$FAKE_ROOT_AUTHPUSH" "$T18F" \
+           "nathanjohnpayne/authpush-repo" "$WRAPPER_LOG18F")
+ap_ec=$?
+set -e
+echo "$ap_out" | grep -q "RC=0" && [ "$ap_ec" -eq 0 ] \
+  && pass "author-credential harness completes step 1 end to end (rc=0)" \
+  || fail "author-credential harness misbehaved; rc=$ap_ec; out: $ap_out"
+# Sanity: the create half was always wrapped, so a wrapper log that
+# recorded nothing would mean the harness never ran, not that the push
+# is unwrapped.
+grep -qF "gh repo create nathanjohnpayne/authpush-repo" "$WRAPPER_LOG18F" \
+  && pass "the create runs through the author wrapper (harness is live)" \
+  || fail "the wrapper recorded no create; log: $(cat "$WRAPPER_LOG18F")"
+# The finding itself.
+# `|| true`: with `set -o pipefail` a no-match grep would abort the whole
+# suite on the assignment, and a regression here has to be REPORTED, not
+# turned into a silent early exit that skips every assertion after it.
+push_line=$(grep -F "push -u origin HEAD" "$WRAPPER_LOG18F" | tail -1 || true)
+[ -n "$push_line" ] \
+  && pass "the bootstrap push runs through the author wrapper too" \
+  || fail "the push never reached the author wrapper (ambient git credentials); log: $(cat "$WRAPPER_LOG18F")"
+# ...and carries the credential wiring, so the wrapper's token is what
+# git authenticates with rather than whatever helper the machine had
+# configured. The reset and the gh helper must be adjacent and in that
+# order: an appended helper without the reset leaves the inherited ones
+# ahead of it in the list.
+printf '%s\n' "$push_line" \
+  | grep -qF -- "-c credential.helper= -c credential.helper=!gh auth git-credential" \
+  && pass "the push clears inherited credential helpers and takes gh's" \
+  || fail "push carries no gh credential wiring: $push_line"
+printf '%s\n' "$push_line" | grep -qF "GIT_TERMINAL_PROMPT=0" \
+  && pass "the push disables git's terminal prompt" \
+  || fail "push can still prompt on the terminal: $push_line"
+printf '%s\n' "$push_line" | grep -qF "GIT_ASKPASS=" \
+  && pass "the push closes the askpass prompt path" \
+  || fail "push can still raise an askpass dialog: $push_line"
+# The credential travels over the helper protocol, so it must not appear
+# in the remote URL or anywhere else git wrote to disk (reflog included).
+git -C "$T18F" remote get-url origin | grep -qF "fake-author-token" \
+  && fail "the token leaked into the remote URL: $(git -C "$T18F" remote get-url origin)" \
+  || pass "the remote URL carries no token"
+grep -rqF "fake-author-token-for-the-push" "$T18F/.git" 2>/dev/null \
+  && fail "the token leaked into the local git dir (config / reflog)" \
+  || pass "the token stays out of the local git dir"
+grep -rqF "fake-author-token-for-the-push" "$WORKDIR/remotes/authpush-repo.git" 2>/dev/null \
+  && fail "the token leaked into the remote repository" \
+  || pass "the token stays out of the remote repository"
+# And it really pushed — the wiring must not have broken the transfer.
+git -C "$WORKDIR/remotes/authpush-repo.git" rev-parse --verify -q refs/heads/main >/dev/null \
+  && pass "the wrapped push still lands the bootstrap commit on the remote" \
+  || fail "remote has no main after the wrapped push"
+
+# --- assertion 18g: the credential wiring the push carries really does
+# resolve the wrapper's token — checked against the REAL git and gh.
+#
+# Asserting the flags are PRESENT only proves the shape. The flags are
+# taken straight from $BOOTSTRAP_GIT_CREDENTIAL_ARGS / the non-interactive
+# env, so this probe cannot drift from what ships, and it runs the real
+# tools: `gh auth git-credential get` answers from $GH_TOKEN with no
+# network call, so a fake token is enough to show which credential git
+# would hand the remote. Nothing here contacts GitHub.
+#
+# The probe output is never echoed. With the wiring broken the fallback
+# is the developer's own credential helper, and that answer can be a
+# REAL token.
+# ---------------------------------------------------------------------------
+if command -v gh >/dev/null 2>&1; then
+  PROBE_TOKEN="probe-token-not-a-real-credential-4f2a"
+  set +e
+  probe_out=$(
+    . "$ROOT/scripts/bootstrap/_lib.sh"
+    printf 'protocol=https\nhost=github.com\n\n' \
+      | env -u GITHUB_TOKEN GH_TOKEN="$PROBE_TOKEN" \
+            "${BOOTSTRAP_GIT_NONINTERACTIVE_ENV[@]}" \
+            git "${BOOTSTRAP_GIT_CREDENTIAL_ARGS[@]}" credential fill 2>&1
+  )
+  set -e
+  probe_pw=$(printf '%s\n' "$probe_out" | sed -n 's/^password=//p')
+  probe_rest=$(printf '%s\n' "$probe_out" | grep -v '^password=' || true)
+  [ "$probe_pw" = "$PROBE_TOKEN" ] \
+    && pass "the shipped credential wiring resolves git's password from the wrapper's GH_TOKEN" \
+    || fail "credential wiring did not yield the wrapper's token (password line redacted); other output: $probe_rest"
+  printf '%s\n' "$probe_rest" | grep -qF "username=x-access-token" \
+    && pass "gh answers the credential request as the token-bearing user" \
+    || fail "unexpected credential username; output: $probe_rest"
+else
+  echo "SKIP: gh not installed — cannot probe the real credential helper" >&2
+fi
+
+# --- assertion 18h: a checkpoint that does not get written fails the
+# stage before the push (#790 round 4).
+#
+# bootstrap::record_checkpoint is called immediately after the one
+# irreversible act in the stage, and its rc was ignored. Stage functions
+# run under `|| stage_rc=$?`, so errexit is disabled through this whole
+# call chain: an append that failed (unwritable sidecar, full disk) did
+# not stop anything. The run carried on to the push, the labels, the
+# invites and the secret — and an abort in any of them left the remote
+# created with nothing recording it, which is the state the checkpoint
+# was added to prevent: the create cannot be repeated and preflight
+# refuses the documented `--resume template-mirror`.
+#
+# The sidecar is made unwritable by putting a DIRECTORY where the append
+# expects a file. That fails for every user including root, unlike a
+# chmod a root test runner would sail straight through.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+T18H="$WORKDIR/new-repo-checkpoint-unwritable"
+WRAPPER_LOG18H="$WORKDIR/wrapper-checkpoint-fail.log"
+mk_push_target "$T18H"
+: >"$WRAPPER_LOG18H"
+mkdir -p "$T18H/.bootstrap-state.checkpoints"
+set +e
+cf_out=$(run_create_and_push_case "$FAKE_ROOT_AUTHPUSH" "$T18H" \
+           "nathanjohnpayne/checkpointfail-repo" "$WRAPPER_LOG18H")
+cf_ec=$?
+set -e
+echo "$cf_out" | grep -q "RC=0" \
+  && fail "an unrecorded create was treated as success; out: $cf_out" \
+  || pass "a checkpoint write that does not land fails the stage"
+[ "$cf_ec" -eq 0 ] \
+  && pass "checkpoint-failure harness ran to completion" \
+  || fail "checkpoint-failure harness misbehaved; rc=$cf_ec; out: $cf_out"
+# It must be the POST-create path being tested: the create really ran.
+grep -q "^gh repo create nathanjohnpayne/checkpointfail-repo " "$SHIM_LOG" \
+  && pass "the irreversible create happened before the checkpoint write" \
+  || fail "the run never reached gh repo create; log: $(cat "$SHIM_LOG")"
+# ...and the stage stopped there rather than pushing on.
+grep -qF "push -u origin HEAD" "$WRAPPER_LOG18H" \
+  && fail "the stage pushed past an unrecorded create; log: $(cat "$WRAPPER_LOG18H")" \
+  || pass "the stage does not push past an unrecorded create"
+git -C "$WORKDIR/remotes/checkpointfail-repo.git" rev-parse --verify -q refs/heads/main >/dev/null 2>&1 \
+  && fail "the bootstrap commit was pushed despite the failed checkpoint" \
+  || pass "nothing reached the remote after the failed checkpoint"
+# The operator has to be able to repair it by hand — the remote exists
+# and the create cannot be repeated.
+echo "$cf_out" | grep -qF "resume checkpoint could not be written" \
+  && pass "the failure names the checkpoint write as the cause" \
+  || fail "no checkpoint-write diagnostic; out: $cf_out"
+echo "$cf_out" | grep -qF "github-infra:remote-created:nathanjohnpayne/checkpointfail-repo" \
+  && pass "the failure prints the exact line to add by hand" \
+  || fail "no manual-repair line emitted; out: $cf_out"
+echo "$cf_out" | grep -qF -- "--resume template-mirror" \
+  && pass "the failure points at the documented resume path" \
+  || fail "no resume remediation; out: $cf_out"
+
+# --- assertion 19: a failed temp-dir allocation refuses the secret
+# write instead of misreporting it (#790).
+#
+# `set -e` is disabled inside _provision_reviewer_assignment_token (the
+# stage calls it as `... || step_rc=$?`), so an unchecked `mktemp -d`
+# failure fell through with an empty dir: the trace marker became
+# `/gh-reached` and the capture `/output`. Unprivileged, the redirect
+# alone failed with no marker written, and the "which layer failed"
+# branch reported an AUTHOR-AUTHENTICATION failure for what is really a
+# broken TMPDIR — sending the operator to re-mint tokens. Privileged, it
+# would have run the write and left root-owned files at `/`.
+# ---------------------------------------------------------------------------
+run_secret_set_with_tmpdir() {
+  # $1 = fake-root dir holding scripts/gh-as-author.sh, $2 = target dir,
+  # $3 = TMPDIR value to run under.
+  PATH="$SHIM_PATH" SHIM_LOG="$SHIM_LOG" TMPDIR="$3" bash -c '
+    ROOT="'"$ROOT"'"
+    . "$ROOT/scripts/bootstrap/_lib.sh"
+    . "$ROOT/scripts/bootstrap/github-infra.sh"
+    BOOTSTRAP_MERGEPATH_ROOT="'"$1"'"
+    BOOTSTRAP_STATE_FILE="'"$2"'/.bootstrap-state"
+    BOOTSTRAP_DRY_RUN=0
+    BOOTSTRAP_SKIP_AUTHOR_TOKEN=0
+    BOOTSTRAP_AUTO_PROMPT=skip
+    BOOTSTRAP_REVIEWER_PAT_VALUE="fake-pat"
+    OP_PREFLIGHT_REVIEWER_PAT=""
+    rc=0
+    bootstrap::_provision_reviewer_assignment_token "nathanjohnpayne/tmpfail-repo" "claude" || rc=$?
+    bootstrap::_record_reviewer_token_stage_failure "$rc" "tail note"
+    echo "RC=$rc"
+  ' 2>&1
+}
+
+: >"$SHIM_LOG"
+FAKE_ROOT_TMPFAIL="$WORKDIR/fake-root-tmpfail"
+TARGET15="$WORKDIR/new-repo-tmpfail"
+rm -rf "$FAKE_ROOT_TMPFAIL" "$TARGET15"
+mkdir -p "$FAKE_ROOT_TMPFAIL/scripts" "$TARGET15"
+# A wrapper that WOULD forward to gh, so nothing but the temp-dir guard
+# can stop the write.
+cat >"$FAKE_ROOT_TMPFAIL/scripts/gh-as-author.sh" <<'TMPFWD_EOF'
+#!/bin/sh
+[ "$1" = "--" ] && shift
+exec "$@"
+TMPFWD_EOF
+chmod +x "$FAKE_ROOT_TMPFAIL/scripts/gh-as-author.sh"
+set +e
+tmpfail_out=$(run_secret_set_with_tmpdir "$FAKE_ROOT_TMPFAIL" "$TARGET15" \
+                "$WORKDIR/no-such-tmpdir")
+set -e
+echo "$tmpfail_out" | grep -q "RC=1" \
+  && pass "an unallocatable temp dir fails provisioning (rc=1)" \
+  || fail "expected rc=1 from the temp-dir guard; out: $tmpfail_out"
+grep -q "secret set" "$SHIM_LOG" \
+  && fail "the secret write ran without its trace/capture files; log: $(cat "$SHIM_LOG")" \
+  || pass "no secret-set call is attempted when the temp dir cannot be allocated"
+echo "$tmpfail_out" | grep -q "could not allocate a temporary directory" \
+  && pass "the ERROR lines name the temp dir as the cause" \
+  || fail "no temp-dir diagnostic; out: $tmpfail_out"
+grep -qF "could not allocate a temporary directory" "$TARGET15/.bootstrap-state.warnings" \
+  && pass "the recorded cause names the temp dir" \
+  || fail "sidecar does not name the temp dir: $(cat "$TARGET15/.bootstrap-state.warnings" 2>/dev/null)"
+grep -qF "the author write path failed before the gh secret-set call ran" \
+     "$TARGET15/.bootstrap-state.warnings" \
+  && fail "a temp-dir failure was recorded as an author-authentication failure: $(cat "$TARGET15/.bootstrap-state.warnings")" \
+  || pass "a temp-dir failure is NOT misreported as an author-auth failure"
+[ -e /gh-reached ] || [ -e /output ] \
+  && fail "the guard let the empty-path fallbacks reach the filesystem root" \
+  || pass "no root-level /gh-reached or /output artifacts"
+
+# --- assertion 20: an unallocatable temp dir must not ERASE the
+# warnings sidecar (#790).
+#
+# bootstrap::clear_warning rewrites the sidecar through a tmpfile. With
+# an unchecked mktemp the tmpfile path was empty, every append failed,
+# and `[ -s "" ]` landed on the "nothing survived the filter" branch —
+# which deletes the sidecar. A full /tmp would have erased the whole
+# run's audit trail, which is the #734 silent-ship failure the sidecar
+# exists to prevent.
+# ---------------------------------------------------------------------------
+TARGET16="$WORKDIR/new-repo-clearwarn-tmpfail"
+rm -rf "$TARGET16"
+mkdir -p "$TARGET16"
+(
+  export BOOTSTRAP_STATE_FILE="$TARGET16/.bootstrap-state"
+  # shellcheck disable=SC1091
+  . "$FAKE_MP/scripts/bootstrap/_lib.sh"
+  bootstrap::record_warning "some-key" "an earlier failure worth keeping"
+  bootstrap::record_warning "an unkeyed failure worth keeping"
+  # Reproduce the REAL call shape. Stage helpers are invoked as
+  # `helper || step_rc=$?`, which disables errexit for the whole dynamic
+  # extent of the call — including the bootstrap::record_warning ->
+  # bootstrap::clear_warning chain inside them. That is what lets a
+  # failed mktemp fall through to the delete branch instead of aborting;
+  # calling clear_warning bare here would abort on the assignment and
+  # prove nothing.
+  attempt_clear() { TMPDIR="$WORKDIR/no-such-tmpdir" bootstrap::clear_warning "some-key"; }
+  clear_rc=0
+  attempt_clear || clear_rc=$?
+) >/dev/null 2>&1 || true
+[ -f "$TARGET16/.bootstrap-state.warnings" ] \
+  && pass "the warnings sidecar survives an unallocatable temp dir" \
+  || fail "clear_warning deleted the sidecar when mktemp failed"
+grep -qF "an unkeyed failure worth keeping" "$TARGET16/.bootstrap-state.warnings" \
+  && pass "unrelated records survive the failed rewrite" \
+  || fail "records lost: $(cat "$TARGET16/.bootstrap-state.warnings" 2>/dev/null)"
 
 # --- summary --------------------------------------------------------------
 echo
