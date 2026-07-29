@@ -31,8 +31,10 @@ name: Weekly branch-protection audit
 #      reporting nothing at all.
 #
 # Auth model — the trap this workflow is most likely to fall into:
-#   `GET /repos/{owner}/{repo}/branches/{branch}/protection` (and the
-#   rulesets fallback) requires the **`Administration:read`** scope. The
+#   `GET /repos/{owner}/{repo}/branches/{branch}/protection` requires the
+#   **`Administration:read`** scope (the ruleset half of the audit — GitHub
+#   enforces classic protection and rulesets together, so both are read —
+#   does not, but a token that cannot read the first is useless here). The
 #   reviewer PAT in `secrets.REVIEWER_ASSIGNMENT_TOKEN` — the token
 #   weekly-drift-audit.yml uses for its cross-repo clones — does NOT have
 #   it and 403s on every repo (#177, #285). So this workflow needs its own
@@ -85,7 +87,8 @@ name: Weekly branch-protection audit
 #   1  usage error / missing prerequisite (yq, manifest, unsupported
 #      manifest schema version, hub repo, unwritable --summary-file)
 #   2  at least one repo could not be audited (auth/API) — infrastructure
-#   3  drift — at least one readable repo is missing a canonical check
+#   3  drift — at least one readable repo is missing a canonical check, or
+#      (hub only, ADR 0002) requires one that an admin/bypass actor can skip
 # Only 3 touches the rollup issue; only 0 closes it. 1 and 2 fail the job
 # and leave the issue exactly as it was.
 
@@ -264,7 +267,7 @@ jobs:
             if [ "${RESULT}" = "clean" ]; then
               echo ":white_check_mark: **No drift.** Every repo in \`.mergepath-sync.yml\` (plus the hub) requires all canonical mergepath checks on its default branch."
             else
-              echo ":warning: **Protection drift.** At least one repo does not require the canonical checks, so the corresponding gate workflows run but their failures are advisory."
+              echo ":warning: **Protection drift.** At least one repo either does not require the canonical checks — so the corresponding gate workflows run but their failures are advisory — or requires one that an admin or bypass actor can skip. The per-repo output below says which."
               echo
               echo "A rollup issue (label \`${TRACKING_LABEL}\`) has been opened or updated. Remediation is an owner-authorised settings change; this cron only reports."
             fi
@@ -365,11 +368,25 @@ jobs:
             echo "## Fleet branch-protection drift"
             echo
             echo "\`scripts/audit-branch-protection.sh --fleet\` found at least one repo whose"
-            echo "default branch does not require the canonical mergepath status checks. Where a"
-            echo "canonical check is not required, the corresponding workflow still runs and still"
-            echo "goes red — but the PR merges anyway. \`Label Gate\` is the load-bearing one: where"
-            echo "it is not required, the whole \`needs-external-review\` / \`needs-human-review\` /"
-            echo "\`policy-violation\` / \`human-hold\` merge block is advisory (see #161, #774)."
+            echo "default branch does not enforce the canonical mergepath posture. **Read the"
+            echo "per-repo output below for the reason** — exit 3 covers two distinct findings,"
+            echo "and they have different fixes:"
+            echo
+            echo "1. **A canonical check is not required.** The corresponding workflow still runs"
+            echo "   and still goes red — but the PR merges anyway. \`Label Gate\` is the"
+            echo "   load-bearing one: where it is not required, the whole"
+            echo "   \`needs-external-review\` / \`needs-human-review\` / \`policy-violation\` /"
+            echo "   \`human-hold\` merge block is advisory (see #161, #774). The audit prints"
+            echo "   \`FAIL: N canonical mergepath check(s) NOT required\` and names them."
+            echo "2. **A required check is skippable.** Every protection source that requires it"
+            echo "   also allows a bypass — classic protection without \`enforce_admins\`, or a"
+            echo "   ruleset with a non-empty bypass list — so an admin merges past a check that"
+            echo "   IS required. The audit prints \`FAIL: every protection source that requires"
+            echo "   the following canonical check(s) … also allows a bypass\` and names the"
+            echo "   bypass entries. This is audited on the HUB only (ADR 0002); the two escapes"
+            echo "   that motivated the merge-clearance gate, #427 and #428, were both admin"
+            echo "   merges. Adding checks does NOT clear it, so a repo reported this way stays"
+            echo "   red until the bypass is removed."
             echo
             echo "- **Last audit:** ${today} (UTC)"
             echo "- **Run:** ${RUN_URL}"
@@ -395,11 +412,22 @@ jobs:
             echo
             echo "### Fixing a repo"
             echo
-            echo "Settings → Branches → branch protection rule for the default branch → Require"
-            echo "status checks to pass before merging → add the missing checks. **Ordering trap:**"
-            echo "GitHub only offers a check name in that dropdown once the workflow has run at"
-            echo "least once on the repo, so a repo with no protection at all needs a PR through"
-            echo "first before its checks can be required."
+            echo "**A missing required check** (finding 1 above): Settings → Branches → branch"
+            echo "protection rule for the default branch → Require status checks to pass before"
+            echo "merging → add the missing checks. **Ordering trap:** GitHub only offers a check"
+            echo "name in that dropdown once the workflow has run at least once on the repo, so a"
+            echo "repo with no protection at all needs a PR through first before its checks can be"
+            echo "required."
+            echo
+            echo "**A skippable required check** (finding 2 above): adding checks changes nothing"
+            echo "here — remove the bypass instead."
+            echo
+            echo "- Classic protection: Settings → Branches → branch protection rule for the"
+            echo "  default branch → tick **Do not allow bypassing the above settings**"
+            echo "  (\`enforce_admins\`)."
+            echo "- Rulesets: Settings → Rules → the ruleset named in the audit output → **Bypass"
+            echo "  list** → remove every actor. A bypass entry is the ruleset-world equivalent of"
+            echo "  \`enforce_admins: false\`."
             echo
             echo "The intended posture per repo class is recorded in"
             echo "[\`docs/architecture/0002-branch-protection-enforcement-posture.md\`](docs/architecture/0002-branch-protection-enforcement-posture.md)."

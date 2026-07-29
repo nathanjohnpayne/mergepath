@@ -57,15 +57,55 @@ cat >"$STUB_DIR/gh" <<'STUB'
 #   .../rulesets
 #   .../rulesets/<id>
 include_headers=0
+paginate=0
 args=()
 for a in "$@"; do
   case "$a" in
     -i) include_headers=1 ;;
+    --paginate) paginate=1; args+=("$a") ;;
     *)  args+=("$a") ;;
   esac
 done
-# args[0]=api, args[1]=<path>
-path="${args[1]:-}"
+
+# Extract the REST path the way gh does: the first non-flag operand after
+# the `api` subcommand, skipping any flag and any flag VALUE. A positional
+# scan (`args[1]`) breaks the moment a flag precedes the path — which is
+# exactly what `gh api --paginate <path> --jq <expr>` looks like.
+path=""
+jq_expr=""
+prev=""
+for a in "${args[@]}"; do
+  if [ "$a" = "api" ] && [ -z "$path" ] && [ -z "$prev" ]; then
+    continue
+  fi
+  case "$prev" in
+    --jq|-q) jq_expr="$a"; prev=""; continue ;;
+    -f|-F|-H|--method|-X|--input) prev=""; continue ;;
+  esac
+  case "$a" in
+    -*) prev="$a"; continue ;;
+  esac
+  [ -z "$path" ] && path="$a"
+  prev=""
+done
+# Every requested path is logged verbatim when STUB_PATH_LOG is set, so a
+# test can assert what actually went on the wire — including whether a
+# branch name was percent-encoded before being interpolated into it.
+if [ -n "${STUB_PATH_LOG:-}" ]; then
+  printf '%s\n' "$path" >>"$STUB_PATH_LOG"
+fi
+# Query strings are gh's business, not the fixture's: match on the route.
+path="${path%%\?*}"
+
+# Emulate `gh api --jq`: the filter is applied to the response body (and,
+# under --paginate, to EACH page, with the outputs concatenated).
+emit_body() {  # <json body>
+  if [ -n "$jq_expr" ]; then
+    printf '%s\n' "$1" | jq -r "$jq_expr"
+  else
+    printf '%s\n' "$1"
+  fi
+}
 
 emit_status_and_body() {
   # $1 = HTTP status (e.g. 200, 403, 404)
@@ -121,6 +161,24 @@ case "$path" in
         emit_status_and_body 200 '{"enforce_admins":{"enabled":true},"required_status_checks":{"contexts":["Label Gate","Self-Review Required","Codex P1 unresolved threads","CodeRabbit unresolved blocking findings","Merge clearance gate"]}}'
         exit $?
         ;;
+      classic_plus_ruleset)
+        # Classic protection is present but lists only FOUR canonical
+        # checks; the fifth comes from a ruleset (id 1101 below). GitHub
+        # enforces both surfaces at once, so the effective requirement is
+        # the union and this repo is fully gated. Reading classic and
+        # stopping there reports it as DRIFT.
+        emit_status_and_body 200 '{"enforce_admins":{"enabled":true},"required_status_checks":{"contexts":["Label Gate","Self-Review Required","Codex P1 unresolved threads","CodeRabbit unresolved blocking findings"]}}'
+        exit $?
+        ;;
+      classic_bypassable_plus_strict_ruleset)
+        # All five canonical checks required by classic protection with
+        # enforce_admins OFF — but an unbypassable ruleset (1102 below)
+        # requires the same five. An admin bypasses only the CLASSIC
+        # requirement; the ruleset still blocks the merge, so nothing
+        # canonical is actually skippable.
+        emit_status_and_body 200 '{"enforce_admins":{"enabled":false},"required_status_checks":{"contexts":["Label Gate","Self-Review Required","Codex P1 unresolved threads","CodeRabbit unresolved blocking findings","Merge clearance gate"]}}'
+        exit $?
+        ;;
       classic_missing_clearance_gate)
         # Classic protection present but MISSING "Merge clearance gate".
         # Regression net for #427/#428: the auditor must FAIL when the
@@ -140,111 +198,176 @@ case "$path" in
     esac
     ;;
   */rulesets)
+    # The ruleset INVENTORY. Modelled as pages, because that is what the
+    # real endpoint returns: `gh api` without --paginate reads exactly one
+    # page, and a repo's inventory can span several — `includes_parents`
+    # defaults to true, so organization- and enterprise-level rulesets are
+    # folded into this list alongside the repository's own. The fixture
+    # pins the page BOUNDARY, not a page size: page 2 is served only when
+    # --paginate is passed, exactly as gh behaves.
+    page1="[]"
+    page2=""
     case "${STUB_SCENARIO:-}" in
       no_protection)
-        printf '%s\n' "[]"
-        exit 0
+        page1="[]"
         ;;
       ruleset_all)
-        printf '%s\n' '[{"id":101,"target":"branch"}]'
-        exit 0
+        page1='[{"id":101,"target":"branch"}]'
         ;;
       ruleset_glob)
-        printf '%s\n' '[{"id":102,"target":"branch"}]'
-        exit 0
+        page1='[{"id":102,"target":"branch"}]'
         ;;
       ruleset_unrelated_only)
         # One ruleset that targets refs/heads/dev only — must NOT
         # contaminate the audit of main.
-        printf '%s\n' '[{"id":201,"target":"branch"}]'
-        exit 0
+        page1='[{"id":201,"target":"branch"}]'
         ;;
       ruleset_unrelated_plus_default)
         # Two rulesets: one targets dev with bogus checks; one targets
         # ~DEFAULT_BRANCH with the canonical checks. Audit of main must
         # see only the canonical set.
-        printf '%s\n' '[{"id":201,"target":"branch"},{"id":202,"target":"branch"}]'
-        exit 0
+        page1='[{"id":201,"target":"branch"},{"id":202,"target":"branch"}]'
         ;;
       ruleset_all_but_main_excluded)
         # ONE ruleset: include ~ALL, exclude refs/heads/main. Must NOT
         # protect main even though include matches. #285 r2.
-        printf '%s\n' '[{"id":301,"target":"branch"}]'
-        exit 0
+        page1='[{"id":301,"target":"branch"}]'
         ;;
       ruleset_bypass)
         # ~ALL include, all canonical checks, but a bypass list.
-        printf '%s\n' '[{"id":401,"target":"branch"}]'
-        exit 0
+        page1='[{"id":401,"target":"branch"}]'
         ;;
       ruleset_default_branch_twice)
         # TWO rulesets, each including ~DEFAULT_BRANCH. Resolving the
         # repo's default branch is a per-repo constant, so the audit must
         # read GET /repos/{owner}/{repo} exactly once for both.
-        printf '%s\n' '[{"id":501,"target":"branch"},{"id":502,"target":"branch"}]'
-        exit 0
+        page1='[{"id":501,"target":"branch"},{"id":502,"target":"branch"}]'
         ;;
       ruleset_bypass_unrelated_rule)
         # Two rulesets govern main: 601 enforces every canonical check
         # with NOBODY able to bypass it; 602 enforces an unrelated
         # project check and grants a bypass actor for it.
-        printf '%s\n' '[{"id":601,"target":"branch"},{"id":602,"target":"branch"}]'
-        exit 0
+        page1='[{"id":601,"target":"branch"},{"id":602,"target":"branch"}]'
         ;;
       ruleset_evaluate_only)
         # A single ruleset listing every canonical check but running in
         # `evaluate` mode — it reports, it does not block a merge.
-        printf '%s\n' '[{"id":701,"target":"branch"}]'
-        exit 0
+        page1='[{"id":701,"target":"branch"}]'
         ;;
       ruleset_bypass_actors_absent)
         # Ruleset detail payload that answers NEITHER bypass question.
-        printf '%s\n' '[{"id":801,"target":"branch"}]'
-        exit 0
+        page1='[{"id":801,"target":"branch"}]'
         ;;
       ruleset_bypass_actors_not_array)
         # Ruleset detail payload whose `bypass_actors` is an object and
         # which carries no `current_user_can_bypass` either.
-        printf '%s\n' '[{"id":802,"target":"branch"}]'
-        exit 0
+        page1='[{"id":802,"target":"branch"}]'
         ;;
       ruleset_readonly_clean)
         # The shape a READ-ONLY token actually gets from GitHub.
-        printf '%s\n' '[{"id":1001,"target":"branch"}]'
-        exit 0
+        page1='[{"id":1001,"target":"branch"}]'
         ;;
       ruleset_readonly_bypass_always)
-        printf '%s\n' '[{"id":1002,"target":"branch"}]'
-        exit 0
+        page1='[{"id":1002,"target":"branch"}]'
         ;;
       ruleset_readonly_bypass_prs_only)
-        printf '%s\n' '[{"id":1003,"target":"branch"}]'
-        exit 0
+        page1='[{"id":1003,"target":"branch"}]'
         ;;
       ruleset_write_scope_other_actor)
         # Write-access shape: the full list names a TEAM that is not the
         # auditing identity, so `current_user_can_bypass` says "never"
         # while the gate is in fact skippable.
-        printf '%s\n' '[{"id":1004,"target":"branch"}]'
-        exit 0
+        page1='[{"id":1004,"target":"branch"}]'
         ;;
       ruleset_readonly_two)
         # Two rulesets, both withholding `bypass_actors`. "Is the
         # auditing identity an admin" is a per-repo constant, so the
         # admin probe must be issued ONCE for both.
-        printf '%s\n' '[{"id":1005,"target":"branch"},{"id":1006,"target":"branch"}]'
-        exit 0
+        page1='[{"id":1005,"target":"branch"},{"id":1006,"target":"branch"}]'
+        ;;
+      classic_plus_ruleset)
+        page1='[{"id":1101,"target":"branch"}]'
+        ;;
+      classic_bypassable_plus_strict_ruleset)
+        page1='[{"id":1102,"target":"branch"}]'
+        ;;
+      ruleset_single_star_deep)
+        page1='[{"id":1201,"target":"branch"}]'
+        ;;
+      ruleset_double_star_deep)
+        page1='[{"id":1202,"target":"branch"}]'
+        ;;
+      ruleset_trailing_double_star)
+        page1='[{"id":1203,"target":"branch"}]'
+        ;;
+      ruleset_exclude_single_star_deep)
+        page1='[{"id":1204,"target":"branch"}]'
+        ;;
+      ruleset_paginated)
+        # The applicable required-check ruleset is NOT on the first page.
+        # Page 1 carries only a dev-only ruleset (which must not
+        # contaminate main); page 2 carries the ~ALL ruleset with every
+        # canonical check. A single-page read sees only page 1 and reports
+        # a fully gated repo as unprotected.
+        page1='[{"id":201,"target":"branch"}]'
+        page2='[{"id":101,"target":"branch"}]'
         ;;
       ruleset_default_branch_unreadable)
         # ~DEFAULT_BRANCH ruleset on a repo whose metadata read fails.
-        printf '%s\n' '[{"id":901,"target":"branch"}]'
-        exit 0
+        page1='[{"id":901,"target":"branch"}]'
         ;;
       *)
-        printf '%s\n' "[]"
-        exit 0
+        page1="[]"
         ;;
     esac
+    emit_body "$page1"
+    if [ -n "$page2" ] && [ "$paginate" -eq 1 ]; then
+      emit_body "$page2"
+    fi
+    exit 0
+    ;;
+  */rulesets/1101)
+    # Supplies the ONE canonical check classic protection omits. Active,
+    # nobody can bypass it.
+    printf '%s\n' '{"id":1101,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"bypass_actors":[],"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/1102)
+    # Requires all five canonical checks and nobody can bypass it, so it
+    # holds the gate shut even though classic protection's enforce_admins
+    # is off.
+    printf '%s\n' '{"id":1102,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"bypass_actors":[],"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/1201|*/rulesets/1202|*/rulesets/1203)
+    # fnmatch include patterns, all three carrying every canonical check
+    # so the ONLY thing that can decide the verdict is whether the pattern
+    # is held to match the audited ref:
+    #   1201 refs/heads/release/*    single star, must not cross `/`
+    #   1202 refs/heads/release/**/* Ruby's recursive `**/` form
+    #   1203 refs/heads/release/**   trailing `**`, NOT the recursive form
+    # Verified against real Ruby (File.fnmatch with File::FNM_PATHNAME,
+    # which GitHub's ruleset docs name explicitly) for the refs these
+    # tests audit:
+    #                          release/a   release/a/b
+    #   release/*                true        false
+    #   release/**/*             true        true
+    #   release/**               true        false
+    case "$path" in
+      */1201) inc='refs/heads/release/*' ;;
+      */1202) inc='refs/heads/release/**/*' ;;
+      *)      inc='refs/heads/release/**' ;;
+    esac
+    printf '%s\n' '{"id":'"${path##*/}"',"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["'"$inc"'"],"exclude":[]}},"bypass_actors":[],"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/1204)
+    # The exclusion mirror: governs every branch EXCEPT one level under
+    # release/. `refs/heads/release/*` does not reach `release/a/b`, so
+    # this ruleset DOES govern that branch — an over-eager exclude match
+    # would drop the only ruleset protecting it and report false DRIFT.
+    printf '%s\n' '{"id":1204,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":["refs/heads/release/*"]}},"bypass_actors":[],"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
     ;;
   */rulesets/101)
     # ~ALL include, canonical checks. `bypass_actors` is present and
@@ -397,12 +520,6 @@ case "$path" in
     # Verified against live gh on this machine:
     #   author PAT   → {"admin":true,...}
     #   reviewer PAT → {"admin":false,...}
-    jq_expr=""
-    prev=""
-    for a in "${args[@]}"; do
-      if [ "$prev" = "--jq" ]; then jq_expr="$a"; fi
-      prev="$a"
-    done
     if [ "$jq_expr" = ".permissions.admin" ]; then
       if [ -n "${STUB_ADMIN_LOG:-}" ]; then
         printf '%s\n' "$path" >>"$STUB_ADMIN_LOG"
@@ -1753,6 +1870,451 @@ elif ! echo "$out" | grep -q "could not write the fleet summary"; then
   fail "fleet summary path is a directory: diagnostic missing; output: $out"
 else
   pass "fleet exits 1 when the summary path is unwritable for any reason"
+fi
+
+# ===========================================================================
+# Classic protection ∪ rulesets (both surfaces are enforced at once)
+# ===========================================================================
+#
+# GitHub applies classic branch protection AND every applicable ruleset
+# simultaneously, so the effective requirement on a branch is the UNION of
+# the two lists. scripts/merge-clearance-gate.sh's enforcement probe already
+# unions them for exactly that reason, having verified live that
+# mergepath@main's classic contexts do not appear on the ruleset surface at
+# all. An audit that read classic protection and stopped there whenever it
+# answered 200 reported a repo whose fifth check comes from a ruleset as
+# DRIFT, every week, forever.
+
+# ---------------------------------------------------------------------------
+# Test 27: four canonical checks from classic protection, the fifth from a
+#          ruleset → PASS. Pre-fix: exit 3 naming 'Merge clearance gate'.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit classic_plus_ruleset 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "classic ∪ ruleset: exit $rc, expected 0; output: $out"
+elif ! echo "$out" | grep -q "PASS:"; then
+  fail "classic ∪ ruleset: missing PASS line; output: $out"
+elif ! echo "$out" | grep -q "Merge clearance gate"; then
+  fail "classic ∪ ruleset: the ruleset-supplied check must appear in the enforced list; output: $out"
+else
+  pass "a canonical check supplied by a ruleset counts on a classically protected branch"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 28: the admin-bypass half unions too. Classic protection lists all
+#          five with enforce_admins OFF, and an unbypassable ruleset
+#          requires the same five. An admin bypasses only the CLASSIC
+#          requirement — the ruleset still blocks the merge — so nothing
+#          canonical is skippable. Judging the two surfaces separately
+#          filed this fully gated repo as DRIFT.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit classic_bypassable_plus_strict_ruleset --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "union admin enforcement: exit $rc, expected 0; output: $out"
+elif ! echo "$out" | grep -q "Admin enforcement: OK"; then
+  fail "union admin enforcement: expected an explicit admin-enforcement OK line; output: $out"
+elif echo "$out" | grep -q "skippable"; then
+  fail "union admin enforcement: an unbypassable ruleset requiring the same checks keeps them mandatory; output: $out"
+else
+  pass "enforce_admins off is not an admin-bypass gap when an unbypassable ruleset requires the same checks"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 29: the union must not become a way to lose the enforce_admins
+#          finding. Classic-only, all five checks, enforce_admins off →
+#          still exit 3, and the diagnostic still names enforce_admins.
+#          (Test 13 asserts the same from the other direction; this pins
+#          that the unified analysis did not soften it.)
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit classic_admins_bypass --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "classic-only admin bypass under the union: exit $rc, expected 3; output: $out"
+elif ! echo "$out" | grep -q "skippable"; then
+  fail "classic-only admin bypass: expected the checks to be reported skippable; output: $out"
+elif ! echo "$out" | grep -q "enforce_admins"; then
+  fail "classic-only admin bypass: the remediation must still name enforce_admins; output: $out"
+else
+  pass "classic-only enforce_admins gap survives the unified analysis (named, and exit 3)"
+fi
+
+# ===========================================================================
+# Ruleset inventory pagination
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Test 30: the ruleset that governs the branch is on page 2. A one-page
+#          read omits it and reports a fully gated repo as unprotected.
+#          Page 2 is served by the stub ONLY when --paginate is passed,
+#          which is exactly how gh behaves.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_paginated 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "paginated ruleset inventory: exit $rc, expected 0; output: $out"
+elif ! echo "$out" | grep -q "PASS:"; then
+  fail "paginated ruleset inventory: missing PASS line; output: $out"
+elif echo "$out" | grep -q "no rulesets target main"; then
+  fail "paginated ruleset inventory: page 2 was never read; output: $out"
+else
+  pass "ruleset inventory is paginated — a governing ruleset on page 2 is still found"
+fi
+
+# ===========================================================================
+# GitHub's fnmatch semantics for conditions.ref_name (File::FNM_PATHNAME)
+# ===========================================================================
+#
+# GitHub's ruleset docs state the rule outright: "Because GitHub uses the
+# File::FNM_PATHNAME flag for the File.fnmatch syntax, the * wildcard does
+# not match directory separators (/). For example, qa/* will match all
+# branches beginning with qa/ and containing a single slash, but will not
+# match qa/foo/bar." Bash's `[[ str == pat ]]` has no such rule, so it
+# credited `refs/heads/release/*` with governing `release/a/b` (false PASS)
+# and, in an exclude list, disqualified a ruleset that does govern it
+# (false DRIFT). Every expectation below is the value real Ruby returns for
+# File.fnmatch(pat, ref, File::FNM_PATHNAME) — see the differential test at
+# the end of this section.
+
+# ---------------------------------------------------------------------------
+# Test 31: `refs/heads/release/*` governs `release/a` (one level).
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_single_star_deep --branch release/a 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "single-star include at one level: exit $rc, expected 0; output: $out"
+else
+  pass "refs/heads/release/* governs release/a"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 32: ...and does NOT govern `release/a/b`, because `*` cannot cross a
+#          `/`. Pre-fix this was a false PASS on an ungoverned branch.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_single_star_deep --branch release/a/b 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "single-star include must not cross '/': exit $rc, expected 3; output: $out"
+elif ! echo "$out" | grep -q "no rulesets target release/a/b"; then
+  fail "single-star include: expected 'no rulesets target release/a/b'; output: $out"
+else
+  pass "refs/heads/release/* does NOT govern release/a/b (* does not cross '/')"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 33: Ruby's recursive form `**/` does cross separators, so
+#          `refs/heads/release/**/*` governs `release/a/b`.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_double_star_deep --branch release/a/b 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "recursive '**/' include: exit $rc, expected 0; output: $out"
+else
+  pass "refs/heads/release/**/* governs release/a/b (the recursive '**/' form)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 34: a TRAILING `**` is not the recursive form. Ruby special-cases
+#          the literal three bytes `**/` only, so `refs/heads/release/**`
+#          behaves like `refs/heads/release/*`: it governs release/a but
+#          not release/a/b. Treating every `**` as recursive would credit
+#          a ruleset that does not govern the branch.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_trailing_double_star --branch release/a 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "trailing '**' at one level: exit $rc, expected 0; output: $out"
+else
+  set +e
+  out=$(run_audit ruleset_trailing_double_star --branch release/a/b 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -ne 3 ]; then
+    fail "trailing '**' must not cross '/': exit $rc, expected 3; output: $out"
+  else
+    pass "refs/heads/release/** governs release/a but not release/a/b (trailing ** is not '**/')"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Test 35: the exclusion mirror. `exclude: [refs/heads/release/*]` on a
+#          `~ALL` ruleset disqualifies release/a but NOT release/a/b — the
+#          same non-crossing rule, in the direction where getting it wrong
+#          drops the only ruleset protecting a branch and files false DRIFT.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_exclude_single_star_deep --branch release/a 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "exclude single-star at one level: exit $rc, expected 3 (excluded); output: $out"
+else
+  set +e
+  out=$(run_audit ruleset_exclude_single_star_deep --branch release/a/b 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    fail "exclude single-star must not cross '/': exit $rc, expected 0 (still governed); output: $out"
+  else
+    pass "an exclude of refs/heads/release/* disqualifies release/a but not release/a/b"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Test 36: DIFFERENTIAL. The matcher is extracted verbatim from the audit
+#          script and compared against the reference implementation GitHub
+#          names in its own docs — Ruby's File.fnmatch under
+#          File::FNM_PATHNAME. Every pattern/ref pair must agree.
+# ---------------------------------------------------------------------------
+FNMATCH_SNIPPET="$WORKDIR/fnmatch.sh"
+awk '/^# BEGIN fnmatch/{f=1; next} /^# END fnmatch$/{f=0} f' "$SCRIPT" > "$FNMATCH_SNIPPET"
+if ! grep -q 'fnmatch_pathname()' "$FNMATCH_SNIPPET"; then
+  fail "could not extract the fnmatch matcher from $SCRIPT (BEGIN/END fnmatch markers moved?)"
+elif ! command -v ruby >/dev/null 2>&1; then
+  # Fail rather than skip: this is the only test that pins the matcher to
+  # the semantics GitHub documents, and a silent skip would let a rewrite
+  # of it ship unchecked.
+  fail "ruby is required to differentially test the fnmatch matcher against File::FNM_PATHNAME"
+else
+  # shellcheck source=/dev/null
+  . "$FNMATCH_SNIPPET"
+  FNM_PATTERNS=(
+    'refs/heads/main'
+    'refs/heads/*'
+    'refs/heads/**'
+    'refs/heads/**/*'
+    'refs/heads/release/*'
+    'refs/heads/release/**'
+    'refs/heads/release/**/*'
+    'refs/heads/release/*/*'
+    'refs/heads/qa**/**/*'
+    'refs/heads/rel-[0-9]'
+    'refs/heads/rel-[0-9]*'
+    'refs/heads/re?ease'
+    'refs/heads/**/deep'
+    'refs/tags/*'
+  )
+  FNM_REFS=(
+    'refs/heads/main'
+    'refs/heads/release'
+    'refs/heads/release/a'
+    'refs/heads/release/a/b'
+    'refs/heads/release/a/b/c'
+    'refs/heads/qa/foo/bar'
+    'refs/heads/qafoo/x/y'
+    'refs/heads/rel-7'
+    'refs/heads/rel-77'
+    'refs/heads/relXease'
+    'refs/heads/a/b/deep'
+    'refs/heads/deep'
+  )
+  # Compared through files rather than a parallel array: this suite has to
+  # run under the bash 3.2 that ships with macOS as /bin/bash, where an
+  # array indexed under `set -u` is not portable.
+  FNM_PAIRS="$WORKDIR/fnm-pairs.tsv"
+  FNM_RUBY="$WORKDIR/fnm-ruby.tsv"
+  FNM_BASH="$WORKDIR/fnm-bash.tsv"
+  : >"$FNM_PAIRS"
+  for p in "${FNM_PATTERNS[@]}"; do
+    for r in "${FNM_REFS[@]}"; do
+      printf '%s\t%s\n' "$p" "$r" >>"$FNM_PAIRS"
+    done
+  done
+  # One ruby process for the whole matrix. Reference implementation:
+  # File.fnmatch under File::FNM_PATHNAME, the exact combination GitHub's
+  # ruleset docs name.
+  ruby -e '
+    STDIN.each_line do |line|
+      pat, ref = line.chomp.split("\t", 2)
+      puts "#{pat}\t#{ref}\t#{File.fnmatch(pat, ref, File::FNM_PATHNAME)}"
+    end
+  ' <"$FNM_PAIRS" >"$FNM_RUBY"
+  : >"$FNM_BASH"
+  while IFS=$'\t' read -r p r; do
+    if fnmatch_pathname "$p" "$r"; then got=true; else got=false; fi
+    printf '%s\t%s\t%s\n' "$p" "$r" "$got" >>"$FNM_BASH"
+  done <"$FNM_PAIRS"
+  fnm_pairs="$(wc -l < "$FNM_PAIRS" | tr -d ' ')"
+  if ! fnm_diff="$(diff "$FNM_RUBY" "$FNM_BASH")"; then
+    printf '%s\n' "$fnm_diff" | sed 's/^/  /' >&2
+    fail "fnmatch matcher disagrees with Ruby File::FNM_PATHNAME (< ruby, > bash)"
+  else
+    pass "fnmatch matcher agrees with Ruby File::FNM_PATHNAME on all $fnm_pairs pattern/ref pairs"
+  fi
+fi
+
+# ===========================================================================
+# Default-branch shape check vs. real `git check-ref-format`
+# ===========================================================================
+#
+# looks_like_branch_name is the second line of defence behind the status
+# check on the metadata read: it must reject a leaked HTTP error body while
+# accepting every name git will actually give a branch. An earlier ASCII
+# allow-list (`^[A-Za-z0-9][A-Za-z0-9._/+-]*$`) rejected legitimate names
+# — `feat#2`, `feat%2Ftwo`, anything non-ASCII — and turned those repos
+# into permanent fleet ERRORs. So the predicate is checked against the real
+# `git check-ref-format` binary, not against a re-reading of the regex.
+
+REFCHECK_SNIPPET="$WORKDIR/refcheck.sh"
+awk '/^# BEGIN looks_like_branch_name/{f=1} /^# END looks_like_branch_name$/{f=0} f' "$SCRIPT" \
+  > "$REFCHECK_SNIPPET"
+if ! grep -q 'looks_like_branch_name()' "$REFCHECK_SNIPPET"; then
+  fail "could not extract looks_like_branch_name from $SCRIPT (BEGIN/END markers moved?)"
+elif ! command -v git >/dev/null 2>&1; then
+  fail "git is required to check looks_like_branch_name against git check-ref-format"
+else
+  # shellcheck source=/dev/null
+  . "$REFCHECK_SNIPPET"
+  # Names git accepts for refs/heads/<name>. Every one MUST be accepted:
+  # rejecting any of them is an availability bug that reports a healthy
+  # repo as an infrastructure failure.
+  REF_ACCEPT=(
+    'main'
+    'master'
+    'trunk'
+    'release/1.2'
+    'feature/a/b/c'
+    'feat#2'
+    'feat%2Ftwo'
+    'fix!urgent'
+    'v1.0+build'
+    'a,b'
+    'x&y'
+    "it's"
+    'name(paren)'
+    'semi;colon'
+    'eq=sign'
+    'dollar$sign'
+    'brace{x}'
+    'ünïcode-brånch'
+    '分支'
+    'UPPER_lower-123'
+    'a.b.c'
+    '@'
+  )
+  # Values that must be REJECTED. Each is either forbidden by
+  # check-ref-format or one of the two documented extras (`null`, leading
+  # `{`, leading `-`); the loop below insists on that justification, so a
+  # rejection can never be justified by "the regex said so".
+  REF_REJECT=(
+    '{"message":"Not Found","status":"404"}'
+    '{"message":"Server Error","status":"500"}'
+    'null'
+    ''
+    'has space'
+    'has:colon'
+    'has~tilde'
+    'has^caret'
+    'has?question'
+    'has*star'
+    'has[bracket'
+    'has\backslash'
+    'dot..dot'
+    'at@{brace'
+    '/leading'
+    'trailing/'
+    'double//slash'
+    'trailing.'
+    '.hidden'
+    'nested/.hidden'
+    'foo.lock'
+    'nested/foo.lock'
+    '-leading'
+  )
+  ref_bad=0
+  for n in "${REF_ACCEPT[@]}"; do
+    if ! git check-ref-format "refs/heads/$n" >/dev/null 2>&1; then
+      echo "  fixture error: git check-ref-format REJECTS 'refs/heads/$n' — it does not belong in REF_ACCEPT" >&2
+      ref_bad=$((ref_bad + 1))
+      continue
+    fi
+    if ! looks_like_branch_name "$n"; then
+      echo "  looks_like_branch_name REJECTS '$n', which git accepts" >&2
+      ref_bad=$((ref_bad + 1))
+    fi
+  done
+  for n in "${REF_REJECT[@]}"; do
+    if looks_like_branch_name "$n"; then
+      echo "  looks_like_branch_name ACCEPTS '$n', which it must not" >&2
+      ref_bad=$((ref_bad + 1))
+      continue
+    fi
+    # A rejection is only legitimate if git rejects the name too — as a
+    # ref OR as a branch name, which is stricter — or it is one of the two
+    # documented extras (`null`, a leading `{`) or the empty string.
+    case "$n" in
+      ''|null|'{'*) continue ;;
+    esac
+    if git check-ref-format "refs/heads/$n" >/dev/null 2>&1 \
+       && git check-ref-format --branch "$n" >/dev/null 2>&1; then
+      echo "  fixture error: git ACCEPTS '$n' as a branch name, so rejecting it is an availability bug, not a defence" >&2
+      ref_bad=$((ref_bad + 1))
+    fi
+  done
+  if [ "$ref_bad" -ne 0 ]; then
+    fail "looks_like_branch_name disagrees with git check-ref-format on $ref_bad case(s)"
+  else
+    pass "looks_like_branch_name accepts every name git accepts (${#REF_ACCEPT[@]} cases) and rejects only what git forbids plus the 2 documented extras (${#REF_REJECT[@]} cases)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Test 38: end-to-end — a fleet whose repos default to a branch name the
+#          old ASCII allow-list rejected must be AUDITED, not written off
+#          as an infrastructure ERROR.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_DEFAULT_BRANCH='feat#2' run_fleet all_pass 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "fleet with a '#' in the default branch: exit $rc, expected 0; output: $out"
+elif echo "$out" | grep -q "ERROR"; then
+  fail "fleet with a '#' in the default branch: must not report an infrastructure ERROR; output: $out"
+elif ! echo "$out" | grep -qE "^PASS +rc=0 +testowner/hub@feat#2$"; then
+  fail "fleet with a '#' in the default branch: expected the repo audited on 'feat#2'; output: $out"
+else
+  pass "a default branch containing '#' is audited, not turned into a fleet ERROR"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 39: ...and the branch is percent-encoded before it is interpolated
+#          into the protection path. Unencoded, `#` starts a URL fragment
+#          and everything after it — including `/protection` — is dropped.
+#          `/` must NOT be encoded: GitHub's route takes a hierarchical
+#          branch name with literal separators.
+# ---------------------------------------------------------------------------
+PATH_LOG="$WORKDIR/paths.log"
+: >"$PATH_LOG"
+set +e
+out=$(STUB_PATH_LOG="$PATH_LOG" run_audit classic_protected --branch 'feat#2/x' 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "percent-encoded branch path: exit $rc, expected 0; output: $out"
+elif ! grep -q 'branches/feat%232/x/protection' "$PATH_LOG"; then
+  fail "the branch must be percent-encoded per segment before interpolation; requested paths: $(cat "$PATH_LOG")"
+elif grep -q 'feat#2' "$PATH_LOG"; then
+  fail "an unencoded '#' reached the API path (everything after it is a URL fragment); requested paths: $(cat "$PATH_LOG")"
+else
+  pass "a branch name is percent-encoded per segment for the protection path ('/' preserved)"
 fi
 
 # ---------------------------------------------------------------------------

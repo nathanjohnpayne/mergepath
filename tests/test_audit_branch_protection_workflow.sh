@@ -528,6 +528,26 @@ else
   fail "issue body must state the ordering trap (a check must have run once before it can be required)"
 fi
 
+# Exit 3 covers TWO findings with DIFFERENT fixes: a canonical check that is
+# not required, and one that IS required but which an admin or a ruleset
+# bypass actor can skip (the hub-only ADR 0002 posture; #427/#428 were both
+# admin merges). A body that describes only the first sends the operator to
+# add checks that are already there and leaves the audit red indefinitely,
+# so the body must name the second class AND its remediation.
+if ! grep -q "skippable" "$ISSUE_BODY"; then
+  fail "issue body must describe the skippable-required-check drift class, not just missing checks"
+elif ! grep -q "enforce_admins" "$ISSUE_BODY"; then
+  fail "issue body must give the classic-protection remediation (enforce_admins / 'Do not allow bypassing')"
+elif ! grep -qi "bypass list" "$ISSUE_BODY"; then
+  fail "issue body must give the ruleset remediation (empty the bypass list)"
+elif ! grep -q "427" "$ISSUE_BODY"; then
+  fail "issue body should say why admin bypass matters (#427/#428 were both admin merges)"
+elif ! grep -qi "adding checks" "$ISSUE_BODY"; then
+  fail "issue body must warn that adding checks does not clear a bypass finding"
+else
+  pass "issue body describes BOTH drift classes and both remediations (missing check + skippable check)"
+fi
+
 # The label is the dedupe key, and on the happy path the created issue must
 # carry it — otherwise next week's lookup opens a duplicate.
 run_issue_step "$WORKDIR/small-output.txt" "true"

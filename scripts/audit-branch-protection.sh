@@ -70,10 +70,11 @@
 #   do NOT** and will get a 403 from
 #   `GET /repos/{owner}/{repo}/branches/{branch}/protection`. The script
 #   distinguishes 403 (auth/scope failure → exit 2 with diagnostic) from
-#   404 (no classic protection → fall back to rulesets) so that running the
-#   audit under a reviewer identity does not produce a false "PR merges are
-#   completely unprotected" verdict. If you hit exit 2 with an auth-scope
-#   diagnostic, re-run with an author/admin token.
+#   404 (no classic protection — rulesets are then the only possible
+#   source) so that running the audit under a reviewer identity does not
+#   produce a false "PR merges are completely unprotected" verdict. If you
+#   hit exit 2 with an auth-scope diagnostic, re-run with an author/admin
+#   token.
 #
 # Unknown is never a verdict:
 #   Two ruleset facts are read from payloads that may not answer. A
@@ -85,10 +86,25 @@
 #   `current_user_can_bypass` (as a recognised value, from a confirmed
 #   repository admin) exits 2 under `--require-admin-enforcement` rather
 #   than counting an absent or non-array field as an empty bypass list.
+#   The same rule covers the ruleset INVENTORY: where the union is
+#   load-bearing, an unreadable `/rulesets` list exits 2 rather than
+#   reporting the classic-only picture as drift, because a missing
+#   canonical check may be supplied by a ruleset this run could not see.
+#
+# Effective protection is a UNION:
+#   GitHub enforces classic branch protection and every applicable ruleset
+#   at the same time, so the effective required-check list on a branch is
+#   the union of the two — the same reason
+#   scripts/merge-clearance-gate.sh's enforcement probe unions them. Both
+#   surfaces are therefore read, and a canonical check counts wherever it
+#   comes from. The one exception is an optimisation, not a semantic: when
+#   classic protection alone already establishes the clean posture the
+#   ruleset call is skipped, because a ruleset can only ADD requirements
+#   and a ruleset bypass weakens only its own rules.
 #
 # Ruleset enforcement:
-#   On the ruleset fallback path, only rulesets whose `enforcement` is
-#   `active` are credited with requiring a check. `evaluate` reports rule
+#   Only rulesets whose `enforcement` is `active` are credited with
+#   requiring a check. `evaluate` reports rule
 #   outcomes without blocking a merge and `disabled` does nothing at all,
 #   so counting either would report PASS on a branch nothing gates. An
 #   absent or unreadable value is treated the same way, which errs toward
@@ -97,7 +113,7 @@
 # Admin-enforcement (--require-admin-enforcement), read-only by design:
 #   GitHub returns a ruleset's `bypass_actors` list ONLY to a caller with
 #   write access to that ruleset. This audit is deliberately provisioned
-#   read-only (`Administration:read`), so on the ruleset path that list
+#   read-only (`Administration:read`), so on a ruleset payload that list
 #   is normally absent — and requiring it would strand the hub at exit 2
 #   forever. Admin bypass is therefore read from `current_user_can_bypass`,
 #   which read-only callers DO receive, after confirming from
@@ -238,12 +254,18 @@ Verifies branch protection on \$BRANCH (default: main) requires the
 canonical mergepath-shipped status checks:
   ${CANONICAL_REQUIRED_CHECKS[*]}
 
+A check counts whether it comes from classic branch protection or from a
+ruleset that governs \$BRANCH: GitHub enforces both surfaces at once, so
+the effective required-check list is their UNION.
+
 --require-admin-enforcement additionally requires that admins cannot
-bypass those checks (classic \`enforce_admins: true\`, or a governing
-ruleset with an EMPTY bypass-actor array — or, where GitHub withholds
-that array from a read-only caller, \`current_user_can_bypass: never\`
-reported to a confirmed repository admin). A payload that answers
-neither exits 2. ADR 0002 requires this on the hub.
+bypass those checks. A check is skippable only when EVERY source
+requiring it also allows a bypass — classic protection without
+\`enforce_admins: true\`, or a ruleset with a non-empty bypass-actor
+array (or, where GitHub withholds that array from a read-only caller,
+\`current_user_can_bypass\` other than \`never\` reported to a confirmed
+repository admin). A ruleset payload that answers neither bypass
+question exits 2. ADR 0002 requires this on the hub.
 
 --default-branch supplies this repo's default branch instead of reading
 it from GET /repos/{owner}/{repo}; only \`~DEFAULT_BRANCH\` ruleset
@@ -287,19 +309,85 @@ done
 # the EXIT STATUS instead of inferring failure from empty output.
 #
 # This predicate is the second line of defence behind that status check:
-# a deliberately conservative allow-list of what a git branch name may
-# look like, so any payload that ever leaks through with a zero status
-# still reads as "unresolved" rather than being audited as a branch. It
-# is intentionally fail-closed — an unresolved default branch becomes an
-# infrastructure ERROR (exit 2), never a PASS or a DRIFT verdict.
+# it rejects anything that could not be a branch name, so a payload that
+# ever leaks through with a zero status still reads as "unresolved"
+# rather than being audited as a branch. It is fail-closed — an
+# unresolved default branch becomes an infrastructure ERROR (exit 2),
+# never a PASS or a DRIFT verdict.
+#
+# The rules below are `git check-ref-format`'s rules for `refs/heads/<v>`,
+# NOT a narrower ASCII allow-list. An earlier version demanded
+# `^[A-Za-z0-9][A-Za-z0-9._/+-]*$`, which rejects branch names git accepts
+# — `feat#2`, `feat%2Ftwo`, `fix!urgent`, any non-ASCII name — and a repo
+# whose default branch is one of those became a permanent fleet ERROR
+# (exit 2, no drift issue maintained) purely because the audit could not
+# spell it. Availability lost for no safety gained: the JSON error bodies
+# this guard exists to catch are excluded by git's OWN rules, because
+# every gh error body is a JSON object and so contains a `:` — which git
+# forbids in a ref — plus, on any pretty-printed or multi-line payload,
+# whitespace and control characters git also forbids. Whether a given
+# name is accepted here is asserted against the real `git check-ref-format`
+# binary in tests/test_audit_branch_protection.sh.
+#
+# Two exclusions go beyond git, both deliberate and both documented there:
+#   - the literal string `null`, which is what `--jq` prints for an absent
+#     field (a repo whose default branch is genuinely named `null` is not
+#     a case worth admitting at the cost of that signal);
+#   - a leading `{`, which is a legal ref character but cannot begin any
+#     answer this predicate should accept, and is the first byte of every
+#     JSON object gh could leak.
+# BEGIN looks_like_branch_name — extracted VERBATIM and cross-checked
+# against the real `git check-ref-format` by
+# tests/test_audit_branch_protection.sh. Keep the markers.
 looks_like_branch_name() {
   local v="$1"
   [ -n "$v" ] || return 1
   [ "$v" != "null" ] || return 1
-  # Git forbids `..` in a ref, and every JSON error body starts with `{`.
+  case "$v" in '{'*) return 1 ;; esac
+
+  # git check-ref-format(1), rule 4: no ASCII control character (including
+  # DEL), space, `~`, `^` or `:` anywhere.
+  case "$v" in *[[:cntrl:]]*|*' '*|*'~'*|*'^'*|*:*) return 1 ;; esac
+  # Rule 5: no `?`, `*` or `[`. Rule 10: no `\`.
+  case "$v" in *'?'*|*'*'*|*'['*|*'\'*) return 1 ;; esac
+  # Rule 3: no `..` anywhere.
   case "$v" in *..*) return 1 ;; esac
-  [[ "$v" =~ ^[A-Za-z0-9][A-Za-z0-9._/+-]*$ ]] || return 1
+  # Rule 8: no `@{`. (Rule 9, "not the single character @", is about the
+  # WHOLE refname: `git check-ref-format refs/heads/@` succeeds and git
+  # will create a branch called `@`, so it is not excluded here.)
+  case "$v" in *'@{'*) return 1 ;; esac
+  # Rule 6: no leading or trailing `/`, and no `//`.
+  case "$v" in /*|*/|*//*) return 1 ;; esac
+  # Rule 7: no trailing `.`.
+  case "$v" in *.) return 1 ;; esac
+  # Rule 1: no slash-separated component may begin with `.` or end with
+  # `.lock`.
+  local IFS=/ comp
+  for comp in $v; do
+    case "$comp" in .*|*.lock) return 1 ;; esac
+  done
+  # Not a check-ref-format rule, but `git branch` cannot create a name
+  # beginning with `-` (it parses as an option), so GitHub cannot report
+  # one as a default branch.
+  case "$v" in -*) return 1 ;; esac
   return 0
+}
+# END looks_like_branch_name
+
+# Percent-encode a branch name for interpolation into an API path.
+#
+# `gh api` passes the path through verbatim, so a branch name carrying a
+# character that is legal in a git ref but structural in a URL corrupts
+# the request rather than 404ing honestly: `#` truncates everything after
+# it as a fragment, and a stray `%` is read as the start of an escape.
+# Slashes are the one thing that must NOT be encoded — GitHub's
+# `/branches/{branch}/protection` route accepts a hierarchical branch
+# name with literal separators — so each segment is encoded on its own
+# and the segments rejoined. jq's `@uri` does the per-segment work
+# (correct for UTF-8, which a hand-rolled byte loop is not), and jq is
+# already a hard dependency of this script.
+urlencode_branch_path() {
+  jq -rn --arg s "$1" '$s | split("/") | map(@uri) | join("/")'
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -618,7 +706,7 @@ resolve_repo_default_branch() {
 # per ruleset.
 #
 # Only the read-only admin-bypass fallback consults this, so the request
-# is made only on the ruleset path, only under
+# is made only when a ruleset is read at all, only under
 # --require-admin-enforcement, and only when `bypass_actors` was withheld
 # — consumer audits and every classic-protection audit pay nothing.
 #
@@ -653,16 +741,35 @@ resolve_repo_admin_permission() {
 # Fetch the branch-protection rules. Two endpoints are relevant:
 #   1. /branches/{branch}/protection — classic protection rules
 #   2. /rulesets — newer rulesets (the modern way)
-# Try (1) first; on a true 404 fall back to (2). On 403 (auth/scope
-# failure) bail with a diagnostic — falling through to rulesets would
-# produce a false "unprotected" verdict because the rulesets endpoint
-# may also be denied or empty under the same auth.
+#
+# They are not alternatives. GitHub enforces classic protection and every
+# applicable ruleset SIMULTANEOUSLY, and the effective requirement on a
+# branch is the UNION of the two lists — the repository's own enforcement
+# probe (scripts/merge-clearance-gate.sh, merge_clearance_check_enforced)
+# unions them for exactly that reason, having verified live that
+# mergepath@main's classic contexts do not appear on the ruleset surface
+# at all. Reading (1) and stopping there whenever it answered 200 filed a
+# repo whose fifth canonical check comes from a ruleset as DRIFT and
+# refreshed the weekly rollup issue for it every Monday.
+#
+# So (1) is read first, and (2) is read as well WHENEVER it could change
+# the verdict. It cannot when classic protection alone already establishes
+# the clean posture — rulesets only ADD requirements, and a ruleset bypass
+# weakens only that ruleset's own rules, so nothing in (2) can unmake a
+# classic requirement or make a non-bypassable one skippable. Skipping the
+# call in that one case keeps a fully protected repo from being turned
+# into an exit-2 infrastructure failure by a flaky second request.
+#
+# On 403 (auth/scope failure) bail with a diagnostic — falling through to
+# rulesets would produce a false "unprotected" verdict because the
+# rulesets endpoint may also be denied or empty under the same auth.
 #
 # Implementation: `gh api -i` includes the HTTP status line, which lets
 # us inspect the status code directly. We split headers from body via a
 # blank-line marker, then extract the HTTP/x.y status code from the
 # first line of the headers.
-PROT_RAW=$(gh api -i "repos/$REPO/branches/$BRANCH/protection" 2>&1) || PROT_API_RC=$?
+BRANCH_PATH="$(urlencode_branch_path "$BRANCH")"
+PROT_RAW=$(gh api -i "repos/$REPO/branches/$BRANCH_PATH/protection" 2>&1) || PROT_API_RC=$?
 PROT_API_RC=${PROT_API_RC:-0}
 
 # Extract HTTP status code from the first line ("HTTP/2 200" / "HTTP/1.1 404 Not Found")
@@ -677,15 +784,19 @@ if [ -z "$PROT_BODY" ] && [ -z "$PROT_STATUS" ]; then
   PROT_BODY="$PROT_RAW"
 fi
 
-USE_RULESETS=0
+HAVE_CLASSIC=0
 case "$PROT_STATUS" in
   200)
-    # Classic protection present — happy path.
+    # Classic protection present. Its contexts are one half of the union;
+    # the ruleset half is still read below unless classic alone settles
+    # the verdict.
+    HAVE_CLASSIC=1
     ;;
   404)
-    # No classic protection configured. Fall back to rulesets (modern path).
+    # No classic protection configured. Rulesets are the only possible
+    # source of protection here, so "no matching ruleset" really does mean
+    # "unprotected" on this path (and only on this path).
     echo "Note: classic branch protection not configured on $BRANCH — checking rulesets instead."
-    USE_RULESETS=1
     ;;
   401|403)
     # Auth/scope failure. This is the #177/#285 trap: a reviewer PAT
@@ -703,7 +814,7 @@ ERROR: GitHub API returned HTTP $PROT_STATUS reading branch protection on
          GH_TOKEN="\$OP_PREFLIGHT_AUTHOR_PAT" scripts/audit-branch-protection.sh \\
            --repo $REPO --branch $BRANCH
 
-       Refusing to fall through to the ruleset fallback because that would
+       Refusing to fall through to a ruleset-only read because that would
        produce a false "unprotected" verdict under the same auth failure.
 
        Raw API response body:
@@ -724,88 +835,237 @@ EOF
     ;;
 esac
 
-if [ "$USE_RULESETS" -eq 1 ]; then
-  RULESETS=$(gh api "repos/$REPO/rulesets" 2>&1) || {
-    echo "Could not fetch rulesets: $RULESETS" >&2; exit 2
-  }
+# ─────────────────────────────────────────────────────────────────────
+# Effective required checks = classic contexts ∪ ruleset contexts
+# ─────────────────────────────────────────────────────────────────────
+#
+# One TAB-separated "<context>\t<source>\t<0|1 source allows a bypass>"
+# row per (protection source, required context) pairing, where <source>
+# is `classic` or a ruleset id. The admin-enforcement block below needs
+# that provenance: a bypass applies ONLY to the source that grants it, so
+# "some source allows a bypass" is not evidence that any canonical check
+# is skippable.
+CHECK_SOURCES=""
+# "<source>\t<human-readable bypass entry>" rows, reported only for the
+# sources a canonical check actually depends on.
+BYPASS_LINES=""
+# Set when at least one ruleset's bypass posture was decided from
+# `current_user_can_bypass` because GitHub withheld `bypass_actors`.
+# That evidence covers the auditing admin identity, not every possible
+# bypass actor, so a clean verdict resting on it must say which
+# question it answered rather than claim the stronger one.
+BYPASS_EVIDENCE_IDENTITY_ONLY=0
+# Field separator for the accumulators above. Spelled as an escape
+# rather than an inline literal so the delimiter cannot be lost to a
+# whitespace-normalising edit — check names contain spaces, so a
+# space-delimited row would be unsplittable.
+TAB=$'\t'
 
-  # Step A: compute the set of rulesets that ACTUALLY target the
-  # audited branch. We need each ruleset's full definition to inspect
-  # its conditions.ref_name.include array, so list IDs first then
-  # fetch each one. Listing returns summaries without conditions.
-  RULESET_IDS=$(echo "$RULESETS" | jq -r '
-    .[]
-    | select(.target == "branch")
-    | .id
-  ' 2>/dev/null)
+REQUIRED_CHECKS=""
 
-  MATCHING_IDS=""
-  for rid in $RULESET_IDS; do
-    DETAIL=$(gh api "repos/$REPO/rulesets/$rid" 2>&1) || {
-      echo "Could not fetch ruleset $rid: $DETAIL" >&2; exit 2
-    }
-    # Extract include patterns for this ruleset and decide if any of
-    # them targets the audited branch. Four supported forms:
-    #   ~DEFAULT_BRANCH  — matches when BRANCH really is this repo's
-    #                      default branch, resolved once from
-    #                      GET /repos/{owner}/{repo}. The earlier
-    #                      implementation assumed main/master was the
-    #                      default, which mis-answered both ways on a
-    #                      repo with a renamed default: a `trunk` audit
-    #                      saw "no ruleset targets trunk" (false DRIFT)
-    #                      and a `main` audit on a trunk-defaulted repo
-    #                      counted a ruleset that does not govern main
-    #                      (false PASS). The main/master guess survives
-    #                      only as a fallback for when the metadata read
-    #                      itself fails.
-    #   ~ALL             — matches every branch
-    #   refs/heads/<x>   — literal match against BRANCH
-    #   refs/heads/<glob>— bash glob match against the BRANCH ref
-    INCLUDES=$(echo "$DETAIL" | jq -r '.conditions.ref_name.include[]?' 2>/dev/null)
-    [ -z "$INCLUDES" ] && continue
+# Record one protection source's required contexts: adds them to the
+# effective union AND files a provenance row per context.
+add_required_checks() {  # <contexts, one per line> <source> <bypassable 0|1>
+  local ctxs="$1" source="$2" bypassable="$3" ctx
+  [ -n "$ctxs" ] || return 0
+  if [ -n "$REQUIRED_CHECKS" ]; then
+    REQUIRED_CHECKS="$REQUIRED_CHECKS
+$ctxs"
+  else
+    REQUIRED_CHECKS="$ctxs"
+  fi
+  while IFS= read -r ctx; do
+    [ -z "$ctx" ] && continue
+    CHECK_SOURCES="${CHECK_SOURCES}${ctx}${TAB}${source}${TAB}${bypassable}
+"
+  done <<<"$ctxs"
+}
 
-    BRANCH_REF="refs/heads/$BRANCH"
-    # Reusable matcher: pattern-matches a SINGLE pattern against the
-    # audited branch ref. Answers through its EXIT STATUS (0 = match,
-    # 1 = miss) so callers can invoke it directly in an `if` instead of
-    # in a `$(...)`; that keeps `~DEFAULT_BRANCH` resolution in THIS
-    # shell, which is what makes resolve_repo_default_branch's one-shot
-    # memo survive from one pattern to the next. Used by BOTH the
-    # include scan (a match means "this ruleset could apply") and the
-    # exclude scan below (a match means "this ruleset does NOT apply to
-    # this branch"). #285 r2 — nathanpayne-codex Phase 4b finding: the
-    # original implementation only consulted
-    # `.conditions.ref_name.include`, so a ruleset that included
-    # `~ALL` but excluded `main` was incorrectly counted as
-    # protecting main.
-    match_ref_pat() {
-      local pat="$1"
-      case "$pat" in
-        "~ALL")
-          return 0 ;;
-        "~DEFAULT_BRANCH")
-          resolve_repo_default_branch
-          if [ -n "$REPO_DEFAULT_BRANCH" ]; then
-            # Authoritative answer from the repo's own metadata (or from
-            # the --default-branch fact the caller already established).
-            if [ "$BRANCH" = "$REPO_DEFAULT_BRANCH" ]; then
-              return 0
-            fi
-          elif [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
-            # Metadata unreadable — degrade to the historical guess
-            # rather than silently declaring the ruleset non-matching.
-            return 0
-          else
-            # Metadata unreadable AND the audited branch is outside what
-            # the main/master guess can speak to. Whether this ruleset
-            # governs the branch is now genuinely UNKNOWN, and returning
-            # "no match" would drop the only ruleset protecting the repo
-            # and report the resulting "nothing targets $BRANCH" as
-            # DRIFT — filing an infrastructure failure in the rollup
-            # issue as a protection gap. Same rule the fleet loop already
-            # applies to its own unresolvable default branches.
-            cat >&2 <<EOF
-ERROR: ruleset $rid targets '~DEFAULT_BRANCH' on $REPO, but this repo's
+# Does this context list carry every canonical check?
+canonical_checks_all_present() {  # <contexts, one per line>
+  local have="$1" check
+  for check in "${CANONICAL_REQUIRED_CHECKS[@]}"; do
+    printf '%s\n' "$have" | grep -Fxq "$check" || return 1
+  done
+  return 0
+}
+
+# ── Classic half ─────────────────────────────────────────────────────
+CLASSIC_CHECKS=""
+CLASSIC_BYPASSABLE=1
+if [ "$HAVE_CLASSIC" -eq 1 ]; then
+  CLASSIC_CHECKS=$(echo "$PROT_BODY" | jq -r '.required_status_checks.contexts[]? // empty')
+  # Classic protection lets every repository admin "merge without waiting
+  # for requirements" unless `enforce_admins` is on, so that flag IS the
+  # classic bypass list: off means every admin bypasses every classic
+  # requirement, on means nobody does.
+  CLASSIC_ENFORCE_ADMINS=$(echo "$PROT_BODY" | jq -r '.enforce_admins.enabled // false' 2>/dev/null)
+  if [ "$CLASSIC_ENFORCE_ADMINS" = "true" ]; then
+    CLASSIC_BYPASSABLE=0
+  else
+    CLASSIC_BYPASSABLE=1
+    BYPASS_LINES="${BYPASS_LINES}classic${TAB}classic protection: enforce_admins is not enabled, so every repository admin can 'merge without waiting for requirements'
+"
+  fi
+  add_required_checks "$CLASSIC_CHECKS" "classic" "$CLASSIC_BYPASSABLE"
+fi
+
+# ── Is the ruleset half load-bearing? ────────────────────────────────
+#
+# Always, except when classic protection alone already establishes the
+# clean posture. Rulesets can only ADD requirements and a ruleset bypass
+# weakens only that ruleset's own rules, so once classic requires every
+# canonical check — and, under --require-admin-enforcement, nobody can
+# bypass classic — no ruleset payload can change the verdict. Skipping
+# the call there is what stops a flaky second request turning a fully
+# protected repo into an exit-2 infrastructure failure.
+SCAN_RULESETS=1
+if [ "$HAVE_CLASSIC" -eq 1 ] \
+   && canonical_checks_all_present "$CLASSIC_CHECKS" \
+   && { [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 0 ] || [ "$CLASSIC_BYPASSABLE" -eq 0 ]; }; then
+  SCAN_RULESETS=0
+fi
+
+# Ruleset id whose conditions are currently being evaluated. A global
+# because match_ref_pat names it in the `~DEFAULT_BRANCH` diagnostic and
+# must stay a plain command (see below), not a subshell.
+CURRENT_RULESET_ID=""
+
+# The audited branch as a fully-qualified ref: `conditions.ref_name`
+# patterns are matched against this, not against the bare branch name.
+BRANCH_REF="refs/heads/$BRANCH"
+
+# Does a GitHub ruleset ref-name pattern match $2?
+#
+# GitHub matches `conditions.ref_name` patterns with Ruby's `File.fnmatch`
+# under the `File::FNM_PATHNAME` flag — stated outright in the ruleset
+# docs: "Because GitHub uses the File::FNM_PATHNAME flag for the
+# File.fnmatch syntax, the `*` wildcard does not match directory
+# separators (/). For example, qa/* will match all branches beginning
+# with qa/ and containing a single slash, but will not match qa/foo/bar."
+# Bash's own `[[ str == pat ]]` has no such rule — its `*` crosses `/`
+# freely — so comparing with it credited `refs/heads/release/*` with
+# governing `release/a/b` (a false PASS on an ungoverned branch) and, in
+# an `exclude` list, disqualified a ruleset that does govern it (a false
+# DRIFT).
+#
+# FNM_PATHNAME semantics are reproduced by splitting BOTH sides on `/`
+# and globbing component-against-component: within a single component
+# there is no `/` left for `*` or `?` to cross, and bash's glob engine
+# handles `[abc]` / `[a-z]` sets natively. `**` gets Ruby's exact
+# treatment, which is subtler than "`**` crosses separators":
+#   - `**` as a whole component FOLLOWED by more pattern (Ruby's `**/`
+#     form) matches ZERO OR MORE whole components, so `refs/heads/**/*`
+#     matches `refs/heads/a` and `refs/heads/a/b/c`;
+#   - `**` at the END of a pattern is NOT the recursive form in Ruby
+#     (dir.c only special-cases the literal three bytes `**/`), so
+#     `refs/heads/**` behaves like `refs/heads/*` and does NOT match
+#     `refs/heads/a/b`. Falling through to the component glob gives
+#     precisely that, because `[[ a == ** ]]` is `[[ a == * ]]`.
+# Two documented GitHub limitations need no special handling: a backslash
+# is not a quoting character, and refs cannot contain one anyway
+# (git check-ref-format rule 10); and Ruby's leading-period rule is
+# unreachable because no ref component may begin with `.` (rule 1).
+#
+# BEGIN fnmatch — the two functions below are extracted VERBATIM by
+# tests/test_audit_branch_protection.sh and differentially tested against
+# `File.fnmatch(pat, ref, File::FNM_PATHNAME)` in real Ruby. Keep the
+# markers.
+fnmatch_pathname() {  # <pattern> <ref>
+  local -a fnm_pat fnm_str
+  IFS='/' read -r -a fnm_pat <<<"$1"
+  IFS='/' read -r -a fnm_str <<<"$2"
+  fnmatch_pathname_from 0 0
+}
+
+fnmatch_pathname_from() {  # <pattern component index> <ref component index>
+  local pi="$1" si="$2" k
+  while :; do
+    if [ "$pi" -ge "${#fnm_pat[@]}" ]; then
+      [ "$si" -ge "${#fnm_str[@]}" ] && return 0
+      return 1
+    fi
+    # Ruby's `**/`: a `**` component with pattern still to come consumes
+    # zero or more whole ref components.
+    if [ "${fnm_pat[pi]}" = '**' ] && [ $((pi + 1)) -lt "${#fnm_pat[@]}" ]; then
+      for (( k = si; k <= ${#fnm_str[@]}; k++ )); do
+        if fnmatch_pathname_from $((pi + 1)) "$k"; then
+          return 0
+        fi
+      done
+      return 1
+    fi
+    [ "$si" -ge "${#fnm_str[@]}" ] && return 1
+    # Component-scoped glob: no `/` inside either side, so `*` and `?`
+    # cannot cross a separator however greedy bash would otherwise be.
+    # shellcheck disable=SC2053
+    if [[ "${fnm_str[si]}" == ${fnm_pat[pi]} ]]; then
+      pi=$((pi + 1))
+      si=$((si + 1))
+      continue
+    fi
+    return 1
+  done
+}
+# END fnmatch
+
+# Pattern-matches a SINGLE `conditions.ref_name` pattern against the
+# audited branch ref. Answers through its EXIT STATUS (0 = match,
+# 1 = miss) so callers can invoke it directly in an `if` instead of in a
+# `$(...)`; that keeps `~DEFAULT_BRANCH` resolution in THIS shell, which
+# is what makes resolve_repo_default_branch's one-shot memo survive from
+# one pattern to the next. Used by BOTH the include scan (a match means
+# "this ruleset could apply") and the exclude scan (a match means "this
+# ruleset does NOT apply to this branch"). #285 r2 — nathanpayne-codex
+# Phase 4b finding: the original implementation only consulted
+# `.conditions.ref_name.include`, so a ruleset that included `~ALL` but
+# excluded `main` was incorrectly counted as protecting main.
+#
+# Supported forms:
+#   ~DEFAULT_BRANCH  — matches when BRANCH really is this repo's default
+#                      branch, resolved once from GET /repos/{o}/{r}. The
+#                      earlier implementation assumed main/master was the
+#                      default, which mis-answered both ways on a repo
+#                      with a renamed default: a `trunk` audit saw "no
+#                      ruleset targets trunk" (false DRIFT) and a `main`
+#                      audit on a trunk-defaulted repo counted a ruleset
+#                      that does not govern main (false PASS). The
+#                      main/master guess survives only as a fallback for
+#                      when the metadata read itself fails.
+#   ~ALL             — matches every branch
+#   anything else    — a full ref, matched with GitHub's fnmatch
+#                      semantics (see fnmatch_pathname). A literal ref
+#                      name is just a pattern with no metacharacters:
+#                      git forbids `*`, `?`, `[` and `\` in a ref, so a
+#                      literal can never be misread as a glob.
+match_ref_pat() {
+  local pat="$1"
+  case "$pat" in
+    "~ALL")
+      return 0 ;;
+    "~DEFAULT_BRANCH")
+      resolve_repo_default_branch
+      if [ -n "$REPO_DEFAULT_BRANCH" ]; then
+        # Authoritative answer from the repo's own metadata (or from
+        # the --default-branch fact the caller already established).
+        if [ "$BRANCH" = "$REPO_DEFAULT_BRANCH" ]; then
+          return 0
+        fi
+      elif [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+        # Metadata unreadable — degrade to the historical guess
+        # rather than silently declaring the ruleset non-matching.
+        return 0
+      else
+        # Metadata unreadable AND the audited branch is outside what
+        # the main/master guess can speak to. Whether this ruleset
+        # governs the branch is now genuinely UNKNOWN, and returning
+        # "no match" would drop the only ruleset protecting the repo
+        # and report the resulting "nothing targets $BRANCH" as
+        # DRIFT — filing an infrastructure failure in the rollup
+        # issue as a protection gap. Same rule the fleet loop already
+        # applies to its own unresolvable default branches.
+        cat >&2 <<EOF
+ERROR: ruleset $CURRENT_RULESET_ID targets '~DEFAULT_BRANCH' on $REPO, but this repo's
        default branch could not be read from GET /repos/$REPO, and the
        audited branch '$BRANCH' is neither 'main' nor 'master' — so
        whether the ruleset governs it is unknown.
@@ -820,21 +1080,58 @@ ERROR: ruleset $rid targets '~DEFAULT_BRANCH' on $REPO, but this repo's
          scripts/audit-branch-protection.sh --repo $REPO --branch $BRANCH \\
            --default-branch <this repo's default branch>
 EOF
-            exit 2
-          fi
-          ;;
-        "$BRANCH_REF")
-          return 0 ;;
-        refs/heads/*)
-          # Bash glob match against the ref.
-          # shellcheck disable=SC2053
-          if [[ "$BRANCH_REF" == $pat ]]; then
-            return 0
-          fi
-          ;;
-      esac
-      return 1
+        exit 2
+      fi
+      ;;
+    *)
+      if fnmatch_pathname "$pat" "$BRANCH_REF"; then
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+# ── Ruleset half ─────────────────────────────────────────────────────
+MATCHING_IDS=""
+if [ "$SCAN_RULESETS" -eq 1 ]; then
+  # Step A: compute the set of rulesets that ACTUALLY target the
+  # audited branch. We need each ruleset's full definition to inspect
+  # its conditions.ref_name.include array, so list IDs first then
+  # fetch each one. Listing returns summaries without conditions.
+  #
+  # --paginate is mandatory, not a nicety: an unpaginated list read
+  # returns exactly ONE page (30 items by default), so on a repo with
+  # more rulesets than that the applicable required-check ruleset can sit
+  # on page 2, be silently omitted here, and have its checks reported as
+  # missing protection — refreshing the drift issue every week over a
+  # repo that is fully gated. `--jq` is applied per page and its output
+  # concatenated, which is why the filter runs here rather than over a
+  # slurped array (pages are separate JSON documents).
+  #
+  # Status-checked, then shape-checked: `gh api --jq` prints the HTTP
+  # error BODY to stdout, so the ids are validated as integers before
+  # being interpolated into a URL — the same second-line defence
+  # looks_like_branch_name gives the default-branch read.
+  if ! RULESET_IDS="$(gh api --paginate "repos/$REPO/rulesets?per_page=100" \
+      --jq '.[] | select(.target == "branch") | .id' 2>&1)"; then
+    echo "Could not fetch rulesets for $REPO: $RULESET_IDS" >&2; exit 2
+  fi
+  for rid in $RULESET_IDS; do
+    if ! [[ "$rid" =~ ^[0-9]+$ ]]; then
+      echo "Unexpected ruleset id '$rid' from repos/$REPO/rulesets — refusing to" >&2
+      echo "       interpolate it into an API path. Treating the repo as unreadable." >&2
+      exit 2
+    fi
+  done
+
+  for rid in $RULESET_IDS; do
+    CURRENT_RULESET_ID="$rid"
+    DETAIL=$(gh api "repos/$REPO/rulesets/$rid" 2>&1) || {
+      echo "Could not fetch ruleset $rid: $DETAIL" >&2; exit 2
     }
+    INCLUDES=$(echo "$DETAIL" | jq -r '.conditions.ref_name.include[]?' 2>/dev/null)
+    [ -z "$INCLUDES" ] && continue
 
     # Pass 1: any include pattern must match.
     MATCHED=0
@@ -876,39 +1173,17 @@ EOF
   # Strip leading/trailing whitespace for the empty check below.
   MATCHING_IDS=$(echo "$MATCHING_IDS" | awk '{$1=$1; print}')
 
-  if [ -z "$MATCHING_IDS" ]; then
+  if [ -z "$MATCHING_IDS" ] && [ "$HAVE_CLASSIC" -eq 0 ]; then
     echo "FAIL: no rulesets target $BRANCH on $REPO. PR merges are completely unprotected."
     exit 3
   fi
 
   # Step B: extract required status checks ONLY from the rulesets that
-  # target the audited branch AND actually enforce. Concatenate each
-  # qualifying ruleset's required_status_checks parameter. Previously
-  # this collected from ALL branch-target rulesets regardless of include
+  # target the audited branch AND actually enforce. Previously this
+  # collected from ALL branch-target rulesets regardless of include
   # match (#285).
-  REQUIRED_CHECKS=""
-  # One TAB-separated "<context>\t<ruleset id>\t<0|1 has bypass actors>"
-  # row per (enforcing ruleset, required context) pairing. The
-  # admin-enforcement block below needs the per-ruleset provenance: a
-  # bypass entry applies ONLY to the ruleset that grants it, so "some
-  # matching ruleset lists a bypass actor" is not evidence that any
-  # canonical check is skippable.
-  CHECK_SOURCES=""
-  # "<ruleset id>\t<human-readable bypass actor>" rows, reported only for
-  # the rulesets a canonical check actually depends on.
-  BYPASS_LINES=""
-  # Set when at least one ruleset's bypass posture was decided from
-  # `current_user_can_bypass` because GitHub withheld `bypass_actors`.
-  # That evidence covers the auditing admin identity, not every possible
-  # bypass actor, so a clean verdict resting on it must say which
-  # question it answered rather than claim the stronger one.
-  BYPASS_EVIDENCE_IDENTITY_ONLY=0
-  # Field separator for the two accumulators above. Spelled as an escape
-  # rather than an inline literal so the delimiter cannot be lost to a
-  # whitespace-normalising edit — check names contain spaces, so a
-  # space-delimited row would be unsplittable.
-  TAB=$'\t'
   for rid in $MATCHING_IDS; do
+    CURRENT_RULESET_ID="$rid"
     DETAIL=$(gh api "repos/$REPO/rulesets/$rid" 2>&1) || {
       echo "Could not fetch ruleset $rid: $DETAIL" >&2; exit 2
     }
@@ -934,13 +1209,22 @@ EOF
       continue
     fi
 
+    # Does this ruleset require any CANONICAL check? Only then can its
+    # bypass posture make a canonical gate skippable, so only then is
+    # that posture interrogated at all. Without the guard, an unrelated
+    # ruleset (a formatting rule, a project build check) whose payload
+    # answers neither bypass question would exit 2 under
+    # --require-admin-enforcement on a repo whose canonical gates are
+    # provably intact — an infrastructure failure manufactured out of a
+    # ruleset that cannot affect the verdict.
+    RS_CANONICAL_RELEVANT=0
     if [ -n "$THIS_CHECKS" ]; then
-      if [ -n "$REQUIRED_CHECKS" ]; then
-        REQUIRED_CHECKS="$REQUIRED_CHECKS
-$THIS_CHECKS"
-      else
-        REQUIRED_CHECKS="$THIS_CHECKS"
-      fi
+      for check in "${CANONICAL_REQUIRED_CHECKS[@]}"; do
+        if printf '%s\n' "$THIS_CHECKS" | grep -Fxq "$check"; then
+          RS_CANONICAL_RELEVANT=1
+          break
+        fi
+      done
     fi
 
     # Rulesets have no `enforce_admins`. Their equivalent is the
@@ -1007,7 +1291,7 @@ $THIS_CHECKS"
       if [ -n "$THIS_BYPASS" ]; then
         RS_BYPASSED=1
       fi
-    elif [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
+    elif [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ] && [ "$RS_CANONICAL_RELEVANT" -eq 1 ]; then
       # Read-only fallback. Only reached under the flag, because that is
       # the only mode in which the answer is consulted at all (ADR 0002
       # asks it of the hub, not of consumers) — an unreadable field on a
@@ -1023,10 +1307,10 @@ $THIS_CHECKS"
         never|pull_requests_only|always) ;;
         *)
           cat >&2 <<EOF
-ERROR: ruleset $rid governs $REPO@$BRANCH, but its detail payload answers
-       neither of the two questions that settle admin bypass: it carries
-       no readable 'bypass_actors' array (jq type:
-       ${RS_BYPASS_TYPE:-unreadable}) and no recognised
+ERROR: ruleset $rid governs $REPO@$BRANCH and requires at least one canonical
+       check, but its detail payload answers neither of the two questions
+       that settle admin bypass: it carries no readable 'bypass_actors'
+       array (jq type: ${RS_BYPASS_TYPE:-unreadable}) and no recognised
        'current_user_can_bypass' value (got: '${RS_CAN_BYPASS:-<absent>}',
        expected never|pull_requests_only|always).
 
@@ -1079,14 +1363,8 @@ EOF
 "
       done <<<"$THIS_BYPASS"
     fi
-    while IFS= read -r ctx; do
-      [ -z "$ctx" ] && continue
-      CHECK_SOURCES="${CHECK_SOURCES}${ctx}${TAB}${rid}${TAB}${RS_BYPASSED}
-"
-    done <<<"$THIS_CHECKS"
+    add_required_checks "$THIS_CHECKS" "$rid" "$RS_BYPASSED"
   done
-else
-  REQUIRED_CHECKS=$(echo "$PROT_BODY" | jq -r '.required_status_checks.contexts[]? // empty')
 fi
 
 if [ -z "$REQUIRED_CHECKS" ]; then
@@ -1099,7 +1377,11 @@ if [ -z "$REQUIRED_CHECKS" ]; then
 fi
 
 echo "Required status checks currently enforced:"
-echo "$REQUIRED_CHECKS" | sed 's/^/  ✓ /'
+# Deduplicated, order preserved: a context required by BOTH classic
+# protection and a ruleset appears once here. Its provenance is not lost —
+# CHECK_SOURCES keeps one row per (source, context) pairing, which is what
+# the admin-bypass analysis below reads.
+echo "$REQUIRED_CHECKS" | awk 'NF && !seen[$0]++' | sed 's/^/  ✓ /'
 echo ""
 
 # Two independent posture questions are answered below: are the canonical
@@ -1145,81 +1427,78 @@ fi
 # admin merges, so a hub that lists all five checks and leaves this open
 # must not read as PASS.
 if [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
-  if [ "$USE_RULESETS" -eq 1 ]; then
-    # A bypass entry weakens only the ruleset that grants it. So a
-    # canonical check is skippable only when EVERY enforcing ruleset that
-    # requires it also grants a bypass — one no-bypass ruleset requiring
-    # the check keeps it mandatory for everybody, and a bypass on a
-    # ruleset that requires no canonical check (a formatting rule, a
-    # non-canonical build check) cannot make a canonical gate skippable
-    # at all. Reporting "any matching ruleset has a bypass actor" filed a
-    # fully enforced hub as DRIFT and refreshed the rollup issue every
-    # week for it.
-    #
-    # Deliberately conservative where the answer is genuinely uncertain:
-    # a check required only by bypassed rulesets is reported even though
-    # the individual actor sets may not overlap, because an audit that
-    # under-reports a skippable gate recreates the #774 blind spot,
-    # whereas an over-report is a visible, checkable claim.
-    SKIPPABLE_CHECKS=""
-    CULPRIT_IDS=""
-    for check in "${CANONICAL_REQUIRED_CHECKS[@]}"; do
-      check_rows=$(printf '%s' "$CHECK_SOURCES" | awk -F'\t' -v c="$check" '$1 == c')
-      # Not required by any enforcing ruleset — already counted as a
-      # missing canonical check above; not an admin-bypass finding.
-      [ -z "$check_rows" ] && continue
-      if printf '%s\n' "$check_rows" \
-        | awk -F'\t' '$3 == "0" { found = 1 } END { if (found) exit 0; exit 1 }'; then
-        continue
-      fi
-      SKIPPABLE_CHECKS="${SKIPPABLE_CHECKS}${check}
+  # One analysis over BOTH protection surfaces, because they are enforced
+  # together. A bypass weakens only the source that grants it, so a
+  # canonical check is skippable only when EVERY source requiring it also
+  # allows a bypass:
+  #   - classic protection allows one for every requirement it carries
+  #     unless `enforce_admins` is on;
+  #   - a ruleset allows one for its own requirements when its bypass list
+  #     is non-empty (or the confirmed auditing admin can bypass it).
+  # One no-bypass source requiring the check keeps it mandatory for
+  # everybody. That is why the two surfaces cannot be judged separately:
+  # a repo whose classic rule lists all five checks with enforce_admins
+  # OFF is fully gated if an unbypassable ruleset requires the same five,
+  # and the old per-surface branches reported it as DRIFT. Symmetrically,
+  # a bypass on a source that requires no canonical check (a formatting
+  # rule, a non-canonical build check) cannot make a canonical gate
+  # skippable at all.
+  #
+  # Deliberately conservative where the answer is genuinely uncertain:
+  # a check required only by bypassed sources is reported even though
+  # the individual actor sets may not overlap, because an audit that
+  # under-reports a skippable gate recreates the #774 blind spot,
+  # whereas an over-report is a visible, checkable claim.
+  SKIPPABLE_CHECKS=""
+  CULPRIT_IDS=""
+  for check in "${CANONICAL_REQUIRED_CHECKS[@]}"; do
+    check_rows=$(printf '%s' "$CHECK_SOURCES" | awk -F'\t' -v c="$check" '$1 == c')
+    # Not required by any enforcing source — already counted as a
+    # missing canonical check above; not an admin-bypass finding.
+    [ -z "$check_rows" ] && continue
+    if printf '%s\n' "$check_rows" \
+      | awk -F'\t' '$3 == "0" { found = 1 } END { if (found) exit 0; exit 1 }'; then
+      continue
+    fi
+    SKIPPABLE_CHECKS="${SKIPPABLE_CHECKS}${check}
 "
-      CULPRIT_IDS="$CULPRIT_IDS $(printf '%s\n' "$check_rows" | cut -f2 | tr '\n' ' ')"
-    done
+    CULPRIT_IDS="$CULPRIT_IDS $(printf '%s\n' "$check_rows" | cut -f2 | tr '\n' ' ')"
+  done
 
-    if [ -n "$SKIPPABLE_CHECKS" ]; then
-      GAPS=1
-      echo "FAIL: every enforcing ruleset that requires the following canonical check(s)"
-      echo "      on $REPO@$BRANCH also grants a bypass, so the check(s) are skippable:"
-      printf '%s' "$SKIPPABLE_CHECKS" | sed 's/^/  ✗ /'
-      echo ""
-      echo "      Bypass entries responsible:"
-      for cid in $(printf '%s' "$CULPRIT_IDS" | tr ' ' '\n' | sort -u); do
-        [ -z "$cid" ] && continue
-        printf '%s' "$BYPASS_LINES" | awk -F'\t' -v r="$cid" '$1 == r { print "  ✗ " $2 }'
-      done
-      echo ""
-      echo "Fix: Settings → Rules → the ruleset(s) named above → Bypass list →"
-      echo "remove every actor. A bypass entry is the ruleset-world equivalent of"
-      echo "classic protection's 'enforce_admins: false'."
-      echo ""
-    elif [ "$BYPASS_EVIDENCE_IDENTITY_ONLY" -eq 1 ]; then
-      # Say which question the evidence answered. GitHub withheld the
-      # bypass list from this read-only caller, so the proof is "a
-      # confirmed repository admin cannot bypass" — the ADR 0002
-      # question — not "the bypass list is empty".
-      echo "Admin enforcement: OK — a confirmed repository admin cannot skip a canonical required check on $BRANCH."
-      echo "      (GitHub withheld 'bypass_actors' from this read-only token, so this rests on"
-      echo "      'current_user_can_bypass: never'; a bypass actor that is neither the auditing"
-      echo "      identity nor the admin role would not be visible to a read-only audit.)"
-    else
-      echo "Admin enforcement: OK — no bypass actor can skip a canonical required check on $BRANCH."
-    fi
+  if [ -n "$SKIPPABLE_CHECKS" ]; then
+    GAPS=1
+    echo "FAIL: every protection source that requires the following canonical check(s)"
+    echo "      on $REPO@$BRANCH also allows a bypass, so the check(s) are skippable:"
+    printf '%s' "$SKIPPABLE_CHECKS" | sed 's/^/  ✗ /'
+    echo ""
+    echo "      Bypass entries responsible:"
+    for cid in $(printf '%s' "$CULPRIT_IDS" | tr ' ' '\n' | sort -u); do
+      [ -z "$cid" ] && continue
+      printf '%s' "$BYPASS_LINES" | awk -F'\t' -v r="$cid" '$1 == r { print "  ✗ " $2 }'
+    done
+    echo ""
+    echo "The two escapes that motivated the merge-clearance gate (#427/#428) were"
+    echo "both admin merges, which is why ADR 0002 requires the closed posture."
+    echo ""
+    echo "Fix (classic protection): Settings → Branches → Branch protection rule for"
+    echo "'$BRANCH' → tick 'Do not allow bypassing the above settings' (enforce_admins)."
+    echo "Fix (rulesets): Settings → Rules → the ruleset(s) named above → Bypass list →"
+    echo "remove every actor. A bypass entry is the ruleset-world equivalent of"
+    echo "classic protection's 'enforce_admins: false'."
+    echo ""
+  elif [ "$BYPASS_EVIDENCE_IDENTITY_ONLY" -eq 1 ]; then
+    # Say which question the evidence answered. GitHub withheld the
+    # bypass list from this read-only caller, so the proof is "a
+    # confirmed repository admin cannot bypass" — the ADR 0002
+    # question — not "the bypass list is empty".
+    echo "Admin enforcement: OK — a confirmed repository admin cannot skip a canonical required check on $BRANCH."
+    echo "      (GitHub withheld 'bypass_actors' from this read-only token, so this rests on"
+    echo "      'current_user_can_bypass: never'; a bypass actor that is neither the auditing"
+    echo "      identity nor the admin role would not be visible to a read-only audit.)"
+  elif [ "$HAVE_CLASSIC" -eq 1 ] && [ "$CLASSIC_BYPASSABLE" -eq 0 ] && [ "$SCAN_RULESETS" -eq 0 ]; then
+    echo "Admin enforcement: OK — enforce_admins is enabled on $BRANCH."
   else
-    ENFORCE_ADMINS=$(echo "$PROT_BODY" | jq -r '.enforce_admins.enabled // false' 2>/dev/null)
-    if [ "$ENFORCE_ADMINS" != "true" ]; then
-      GAPS=1
-      echo "FAIL: enforce_admins is not enabled on $REPO@$BRANCH, so a repository admin"
-      echo "      can merge past every required check above ('merge without waiting for"
-      echo "      requirements'). The two escapes that motivated the merge-clearance"
-      echo "      gate (#427/#428) were both admin merges."
-      echo ""
-      echo "Fix: Settings → Branches → Branch protection rule for '$BRANCH'"
-      echo "→ tick 'Do not allow bypassing the above settings'."
-      echo ""
-    else
-      echo "Admin enforcement: OK — enforce_admins is enabled on $BRANCH."
-    fi
+    echo "Admin enforcement: OK — no bypass actor can skip a canonical required check on $BRANCH."
   fi
 fi
 
