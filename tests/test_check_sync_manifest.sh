@@ -1193,8 +1193,41 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         # the whole body of the block is emitted as prose — a required
         # check failing on a `#NN` that is code, which is the false-
         # positive direction the relative measure exists to close
-        # everywhere else. A closer is bounded the same way, relative to
-        # the container the fence was opened in (#791 review).
+        # everywhere else.
+        #
+        # A fence CLOSER is bounded relative to the container the fence
+        # was OPENED in, not to whatever container the closing line lands
+        # in, which is what the test below enforces (#791 review).
+        #
+        # A fenced code block has no lazy continuation, so a non-blank
+        # line left of the content indent of that container is not part of
+        # the item at all: the item ends there and the unclosed fence ends
+        # with it. `fence_base` records that content indent at OPEN time
+        # because by the closing line the stack no longer holds it.
+        #
+        # Recomputing the allowance from the closing line instead reads an
+        # OUTDENTED delimiter as the closer of the inner fence, and that
+        # inverts the parity of every fence after it: the top-level fence
+        # CommonMark opens on that line is scanned as prose, and the first
+        # real prose after its closer is blanked with its `#NN` inside.
+        # Leaving the fence open on the other outdenting shapes — a bare
+        # prose line, a sibling marker, a delimiter whose info string bars
+        # it from opening — swallows the rest of the file the same way.
+        # Both are the UNDER-reporting direction, a bare ref shipped past a
+        # required consumer-truthfulness check, which is the one direction
+        # this parser must never take.
+        #
+        # A BLANK line is not such a boundary: a list item survives blank
+        # lines, so only `rest != ""` closes anything here. The containers
+        # the line outdented out of are popped here rather than by the pop
+        # loop below, because a delimiter line returns before reaching it.
+        if (fence && rest != "" && ind < fence_base) {
+          fence = 0; fence_char = ""; fence_len = 0; fence_base = 0
+          while (depth > 0 && ind < stack[depth]) depth--
+          list_indent = 0
+          if (depth > 0) list_indent = stack[depth]
+        }
+
         container_base = 0
         base_depth = depth
         while (base_depth > 0 && stack[base_depth] > ind) base_depth--
@@ -1230,10 +1263,31 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
           indented_code = 0
           para = 0
           if (!fence) {
+            # A fence is not a lazy continuation either, so an OPENER
+            # closes every container it is not indented into, here rather
+            # than at the next block boundary — the pop loop below is
+            # never reached on a delimiter line.
+            #
+            # Without this the container stays on the stack for the whole
+            # block, and `container_base` on the CLOSING line is measured
+            # from a container CommonMark has already ended. A four-space
+            # delimiter inside a fence opened at column zero is then read
+            # as its closer, when CommonMark allows a closer at most three
+            # spaces past the container and reads that line as CONTENT.
+            # The result is the same inverted parity the block above
+            # exists to stop, reached from the opening end instead: the
+            # rest of the fence body is scanned, and the first real prose
+            # after the true closer is blanked with its `#NN` inside.
+            # Popping here is what makes the `fence_base` recorded below
+            # the container the fence is really in, so the two ends agree.
+            while (depth > 0 && ind < stack[depth]) depth--
+            list_indent = 0
+            if (depth > 0) list_indent = stack[depth]
             fence = 1; fence_char = ch; fence_len = run
+            fence_base = container_base
           } else if (ch == fence_char && run >= fence_len &&
                      substr(rest, run + 1) !~ /[^ \t]/) {
-            fence = 0; fence_char = ""; fence_len = 0
+            fence = 0; fence_char = ""; fence_len = 0; fence_base = 0
           }
           print ""; next
         }
@@ -3089,8 +3143,125 @@ FBASE_EOF
     pass "Case 60: a fence delimiter is bounded four columns past its container, so an indented fence opens and an over-indented one stays code"
   fi
 
+  # Case 61: a fence ENDS with the container it opened in.
+  #
+  # Case 60 made the delimiter allowance relative to the open container
+  # and stopped there, so the CLOSING test recomputed the allowance from
+  # the closing line. A fenced code block has no lazy continuation: a
+  # non-blank line left of the content indent of the item is not part of
+  # the item, so CommonMark ends the item there and the unclosed fence
+  # with it. Recomputing instead accepts an outdented delimiter as the
+  # closer of the inner fence, and every fence after it is off by one.
+  #
+  # All three halves are UNDER-reporting, the direction this parser must
+  # never take, and all three come from markdown-it-py in commonmark mode:
+  # it renders lines 4-8, 11-12 and 16-17 inside `<pre><code>` and lines
+  # 13 and 20 inside `<p>`.
+  #
+  # Lines 3-8 are the inverted parity. Line 6 outdents out of the `10. `
+  # item, so it ends both the item and the fence and then OPENS a
+  # top-level fence, which line 8 closes. Reading it as the closer of the
+  # inner fence swaps the two: the fenced `#222` on line 7 is scanned
+  # (harmless on its own) and the real prose after line 8 is blanked
+  # instead — the swap, not the over-scan, is the damage.
+  #
+  # Lines 10-13 are the plainer shape, and the one a tracked doc is far
+  # likelier to hold: nothing closes the fence at all, so line 13 and
+  # every line after it was swallowed to end of file with `#444` inside.
+  #
+  # Lines 15-20 pin the ORDER of the close against the info-string rule
+  # from case 49. Line 18 ends the item and the fence, and a backtick
+  # opener carrying a backtick in its info string cannot open a new one,
+  # so it is a paragraph and `#666` on line 20 is prose. Closing the
+  # fence after that rule is applied leaves it open on a line CommonMark
+  # says is not a delimiter at all, and `#666` ships unflagged again.
+  FEND_DOC="$WORKDIR/consumer-truth-fence-end.md"
+  cat > "$FEND_DOC" <<'FEND_EOF'
+# Doc
+
+10. item
+    ```
+    #111 is fenced
+```
+#222 is fenced too, at the top level
+```
+
+- item
+  ```
+  #333 is fenced
+A bare #444 in prose is real.
+
+- item
+  ```
+  #555 is fenced
+```a`b
+
+A bare #666 in prose is real.
+FEND_EOF
+  set +e
+  fend_hits=$(md_prose_only "$FEND_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  fend_lines=$(md_prose_only "$FEND_DOC" | wc -l | tr -d ' ')
+  fend_raw=$(wc -l < "$FEND_DOC" | tr -d ' ')
+  set -e
+  if [ "$fend_hits" != "13,20," ]; then
+    fail "Case 61: expected lines 13,20 flagged (a fence ends with the container it opened in, so an outdented delimiter opens rather than closes), got '$fend_hits'"
+  elif [ "$fend_lines" != "$fend_raw" ]; then
+    fail "Case 61: md_prose_only must emit one line per input line, got $fend_lines for $fend_raw"
+  else
+    pass "Case 61: a fence ends with the container it opened in, so no outdented line inverts the parity or swallows the prose after it"
+  fi
+
+  # Case 62: a fence OPENER closes the containers it outdents out of.
+  #
+  # The other end of case 61, and the reason `fence_base` can be trusted
+  # at all. A fence is no more a lazy continuation than a heading is, so
+  # the ``` on line 4 ends the `10. ` item opened on line 3 and opens a
+  # fence against the DOCUMENT. A delimiter line returns before the pop
+  # loop, so without popping here the item stays on the stack for the
+  # whole block and every later `container_base` is measured from a
+  # container CommonMark has already closed.
+  #
+  # Line 6 is where that shows. CommonMark lets a closer sit at most three
+  # spaces past the container of the OPENER — column zero here — so a
+  # four-space delimiter is CONTENT, which is why markdown-it-py in
+  # commonmark mode renders lines 4-8 inside one `<pre><code>` and only
+  # line 10 inside a `<p>`. Measured from the stale item at 4 it is three
+  # columns in and reads as the closer instead, and the parity inverts
+  # exactly as in case 61: the still-fenced `#222` on line 7 is scanned,
+  # line 8 opens a fence rather than closing one, and the real `#333` on
+  # line 10 is blanked — the UNDER-reporting direction.
+  #
+  # The pop uses the same predicate as the block-boundary loop, so a
+  # delimiter AT the container content indent — every fence in case 60 —
+  # pops nothing, which is what leaves case 60 unmoved.
+  FOPEN_DOC="$WORKDIR/consumer-truth-fence-open.md"
+  cat > "$FOPEN_DOC" <<'FOPEN_EOF'
+# Doc
+
+10. item
+```
+    #111 is fenced, and the four-space delimiter below is content
+    ```
+    #222 is still fenced
+```
+
+A bare #333 in prose is real.
+FOPEN_EOF
+  set +e
+  fopen_hits=$(md_prose_only "$FOPEN_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  fopen_lines=$(md_prose_only "$FOPEN_DOC" | wc -l | tr -d ' ')
+  fopen_raw=$(wc -l < "$FOPEN_DOC" | tr -d ' ')
+  set -e
+  if [ "$fopen_hits" != "10," ]; then
+    fail "Case 62: expected line 10 flagged (a fence opener closes the item, so the four-space delimiter on line 6 is content), got '$fopen_hits'"
+  elif [ "$fopen_lines" != "$fopen_raw" ]; then
+    fail "Case 62: md_prose_only must emit one line per input line, got $fopen_lines for $fopen_raw"
+  else
+    pass "Case 62: a fence opener closes the containers it outdents out of, so its closer is measured from the container it really opened in"
+  fi
+
 else
-  echo "SKIP: Cases 36-60 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-62 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
