@@ -20,6 +20,10 @@
 #                                      the end-of-run summary's warnings block.
 #   bootstrap::clear_warning <key>      Resolve keyed recorded warnings after a
 #                                      later retry fixes the underlying issue.
+#   bootstrap::record_checkpoint <name> Record that an irreversible sub-stage
+#                                      step succeeded, in
+#                                      "${BOOTSTRAP_STATE_FILE}.checkpoints".
+#   bootstrap::has_checkpoint <name>    True iff that checkpoint is recorded.
 #   bootstrap::last_completed_stage    Echo the last recorded stage name,
 #                                      or empty if no state file.
 #
@@ -240,6 +244,52 @@ bootstrap::clear_warning() {
   else
     rm -f "$tmp" "$warnings_file"
   fi
+}
+
+# --- resume checkpoints ----------------------------------------------------
+#
+# A stage records completion only when it finishes, which is correct: a
+# stage that aborted must be re-entered from the top by --resume. But a
+# stage can perform an IRREVERSIBLE step long before it finishes, and
+# re-entering then repeats a step that cannot be repeated — `gh repo
+# create` is the canonical case. A checkpoint is the missing record: it
+# says "this specific step already succeeded in this bootstrap", so the
+# re-entry can skip it and the wizard's preflight can tolerate the
+# artifact it left behind (#761 item 3).
+#
+# Checkpoints live in their own "${BOOTSTRAP_STATE_FILE}.checkpoints"
+# sidecar rather than in the state file, because bootstrap::last_completed_stage
+# reads the state file's LAST line — a checkpoint written there would be
+# mistaken for a completed stage and rejected as an unknown resume stage.
+#
+# Recording is idempotent: a repeat for the same name is a no-op, so
+# re-entering a checkpointed step never grows the file.
+#
+# NEVER written under --dry-run. A dry run performs no side effect, so a
+# checkpoint claiming otherwise would make a LATER live run skip a create
+# that never happened. (This is the one place the sidecars deliberately
+# diverge from bootstrap::record_stage / bootstrap::record_warning, which
+# both write in dry-run: those record what the wizard SAID, this records
+# what it DID.)
+bootstrap::record_checkpoint() {
+  local name=$1
+  if [ -z "${BOOTSTRAP_STATE_FILE:-}" ] || [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
+    return 0
+  fi
+  if bootstrap::has_checkpoint "$name"; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$BOOTSTRAP_STATE_FILE")"
+  printf '%s\n' "$name" >>"${BOOTSTRAP_STATE_FILE}.checkpoints"
+}
+
+bootstrap::has_checkpoint() {
+  local name=$1
+  if [ -z "${BOOTSTRAP_STATE_FILE:-}" ] \
+     || [ ! -f "${BOOTSTRAP_STATE_FILE}.checkpoints" ]; then
+    return 1
+  fi
+  grep -qxF "$name" "${BOOTSTRAP_STATE_FILE}.checkpoints"
 }
 
 # Echo the last recorded stage name, or empty string if the state

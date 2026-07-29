@@ -650,9 +650,30 @@ else
   pass "github-infra NOT recorded under strict-secrets gh-secret-set failure (resume can retry)"
 fi
 [ -s "$TARGET9/.bootstrap-state.warnings" ] \
-  && grep -q "REVIEWER_ASSIGNMENT_TOKEN provisioning failed" "$TARGET9/.bootstrap-state.warnings" \
+  && grep -q "REVIEWER_ASSIGNMENT_TOKEN" "$TARGET9/.bootstrap-state.warnings" \
   && pass "strict-secrets gh-secret-set failure recorded in .bootstrap-state.warnings sidecar" \
   || fail "warnings sidecar missing the strict-mode secret-set failure: $(cat "$TARGET9/.bootstrap-state.warnings" 2>/dev/null)"
+# The record must name the SPECIFIC cause, not the generic
+# "provisioning failed (rc=N)" fallback (#782). Three distinct failures
+# share the reviewer-assignment-token key — no PAT with prompts skipped,
+# human declined, and `gh secret set` itself failing — and
+# docs/agents/bootstrap-runbook.md § Stage C promises the sidecar
+# distinguishes them. Before this fix the secret-set path left
+# $BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON empty and the stage's
+# keyed record fell back to the generic message.
+grep -qF "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on nathanjohnpayne/strictsecretfail-repo (the gh secret-set call itself failed, rc=1)" \
+     "$TARGET9/.bootstrap-state.warnings" \
+  && pass "strict-mode secret-set failure names 'gh secret set itself failed' in the sidecar (#782)" \
+  || fail "sidecar recorded a generic reason for the secret-set failure: $(cat "$TARGET9/.bootstrap-state.warnings" 2>/dev/null)"
+grep -qF "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=" \
+     "$TARGET9/.bootstrap-state.warnings" \
+  && fail "secret-set failure still recorded the generic fallback headline: $(cat "$TARGET9/.bootstrap-state.warnings" 2>/dev/null)" \
+  || pass "secret-set failure does not fall back to the generic provisioning-failed headline"
+# The stage-level consequence is still appended to the specific reason.
+grep -qF "BOOTSTRAP_STRICT_SECRETS=1 failed the stage — fix and re-run with --resume template-mirror" \
+     "$TARGET9/.bootstrap-state.warnings" \
+  && pass "secret-set failure record keeps the stage-level resume remediation" \
+  || fail "secret-set failure record dropped the resume remediation: $(cat "$TARGET9/.bootstrap-state.warnings" 2>/dev/null)"
 
 # --- assertion 15b: successful retry marks the prior token warning RESOLVED ---
 # A strict failure records a must-not-miss REVIEWER_ASSIGNMENT_TOKEN
@@ -770,10 +791,12 @@ echo "$summary_out" | grep -qF "ok - REVIEWER_ASSIGNMENT_TOKEN was NOT provision
 # The RESOLVED: prefix is the wire format of ${BOOTSTRAP_STATE_FILE}.warnings,
 # written by github-infra.sh and read by board-and-summary.sh. Pin the
 # two spellings equal so a rename in one file can't silently downgrade
-# every resolved record back into a RECORDED FAILURE.
+# every resolved record back into a RECORDED FAILURE. The renderer's
+# pattern also requires the "@<key><TAB>" prefix the producer always
+# writes, so the literal pinned here carries both halves (#781 item 3).
 # ---------------------------------------------------------------------------
 grep -q 'BOOTSTRAP_WARNING_RESOLVED_MARKER="RESOLVED: "' "$ROOT/scripts/bootstrap/github-infra.sh" \
-  && grep -qF "'^RESOLVED: '" "$ROOT/scripts/bootstrap/board-and-summary.sh" \
+  && grep -qF "warnings_resolved_re='^@[^	]*	RESOLVED: '" "$ROOT/scripts/bootstrap/board-and-summary.sh" \
   && pass "github-infra.sh and board-and-summary.sh agree on the RESOLVED: sidecar marker" \
   || fail "resolved-warning marker drifted between producer and renderer"
 
@@ -936,14 +959,51 @@ echo "$hint_out" | grep -qF -- "--agent claude --mode review" \
 echo "$hint_out" | grep -qF -- "--agent copilot" \
   && fail "remediation emitted 'copilot', which op-preflight exits 1 on; out: $hint_out" \
   || pass "remediation never emits an --agent op-preflight would reject"
-hint_out=$(emit_remediation "copilot")
-echo "$hint_out" | grep -qF -- "--agent <selected-reviewer> --mode review" \
-  && pass "remediation falls back to the placeholder when no selection is preflight-valid" \
-  || fail "remediation did not fall back to a placeholder; out: $hint_out"
-hint_out=$(emit_remediation "")
-echo "$hint_out" | grep -qF -- "--agent <selected-reviewer> --mode review" \
-  && pass "remediation falls back to the placeholder on an empty reviewer selection" \
-  || fail "empty selection did not produce a placeholder; out: $hint_out"
+# --- assertion 15g-2: the unsupported-reviewer remediation is runnable ---
+# When NO selected reviewer is an agent op-preflight knows, there is no
+# cached PAT to re-preflight for. The hint used to emit the chained
+# command anyway with a literal `<selected-reviewer>` in the --agent
+# slot — a line the operator cannot run: `<` and `>` are shell
+# redirection metacharacters, so pasting it yields a redirect/syntax
+# error rather than the remediation (#781 item 4). The replacement is a
+# command with no placeholder in it at all.
+# ---------------------------------------------------------------------------
+for selection in "copilot" ""; do
+  label=${selection:-<empty>}
+  hint_out=$(emit_remediation "$selection")
+  echo "$hint_out" | grep -qF -- "<selected-reviewer>" \
+    && fail "unsupported-reviewer remediation ($label) still emits the <selected-reviewer> placeholder; out: $hint_out" \
+    || pass "unsupported-reviewer remediation ($label) emits no <selected-reviewer> placeholder"
+  # Stronger than a single-placeholder grep: the emitted command lines
+  # (the ones indented under "REVIEWER_ASSIGNMENT_TOKEN:   ") must carry
+  # no angle bracket at all. `<` / `>` are shell redirection operators,
+  # so ANY `<foo>` placeholder makes the line do something other than
+  # what it reads as when pasted — that is precisely what made the old
+  # hint unrunnable.
+  cmdlines=$(echo "$hint_out" | sed -n 's/^\[bootstrap\] ERROR: REVIEWER_ASSIGNMENT_TOKEN:   //p')
+  [ -n "$cmdlines" ] \
+    && pass "unsupported-reviewer remediation ($label) emits a command line" \
+    || fail "unsupported-reviewer remediation ($label) emitted no command line; out: $hint_out"
+  printf '%s\n' "$cmdlines" | grep -q '[<>]' \
+    && fail "unsupported-reviewer remediation ($label) command carries a shell-redirect placeholder: $cmdlines" \
+    || pass "unsupported-reviewer remediation ($label) command is free of angle-bracket placeholders"
+  echo "$hint_out" | grep -qF "none of the selected reviewers ($selection) is an agent scripts/op-preflight.sh can resolve a PAT for (it accepts: claude cursor codex)" \
+    && pass "unsupported-reviewer remediation ($label) names the unusable selection and the accepted set" \
+    || fail "unsupported-reviewer remediation ($label) did not explain why preflight cannot help; out: $hint_out"
+  echo "$hint_out" | grep -qF "scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/hint-repo" \
+    && pass "unsupported-reviewer remediation ($label) emits the direct token-verified secret-set command" \
+    || fail "unsupported-reviewer remediation ($label) emitted no runnable secret-set command; out: $hint_out"
+  # The chained preflight form must NOT appear: with no valid agent it
+  # could only name a placeholder or a non-selected agent's cache.
+  echo "$hint_out" | grep -qF "op-preflight.sh --agent" \
+    && fail "unsupported-reviewer remediation ($label) still emits an op-preflight invocation; out: $hint_out" \
+    || pass "unsupported-reviewer remediation ($label) drops the unusable op-preflight route"
+  # ...and it must not tell the operator to pipe the session cache in,
+  # which is what the && chain exists to prevent on the valid-agent path.
+  echo "$hint_out" | grep -qF 'printf '"'"'%s'"'"' "$OP_PREFLIGHT_REVIEWER_PAT" | scripts/gh-as-author.sh' \
+    && fail "unsupported-reviewer remediation ($label) pipes \$OP_PREFLIGHT_REVIEWER_PAT with no preflight; out: $hint_out" \
+    || pass "unsupported-reviewer remediation ($label) never pipes the session cache"
+done
 
 # The known-agent list is a local mirror of op-preflight's. Pin the two
 # equal so an agent added there cannot silently go missing here (the
@@ -959,17 +1019,17 @@ infra_agents=$(sed -n 's/^BOOTSTRAP_REVIEWER_PREFLIGHT_AGENTS="\(.*\)"$/\1/p' \
 
 # --- assertion 15h: the carried reason describes THIS attempt only ---
 # Two attempts in ONE process, exactly as --resume re-enters the stage.
-# Attempt 1 fails on a path that records a SPECIFIC reason; attempt 2
-# fails on a path that records NONE of its own (a PAT was obtained, then
-# `gh secret set` failed). The sidecar has no timestamp or run marker, so
-# a stale line from attempt 1 is byte-indistinguishable from a fresh one
-# — which is why the fix is a carried out-parameter reset on entry, NOT a
-# "never overwrite an existing record for this key" guard. The guard
-# would pin attempt 1's reason in place and silently drop attempt 2's
-# genuine failure. Both directions are pinned here:
+# Attempt 1 fails with "no PAT available, prompts skipped"; attempt 2
+# fails differently (a PAT was obtained, then `gh secret set` failed).
+# The sidecar has no timestamp or run marker, so a stale line from
+# attempt 1 is byte-indistinguishable from a fresh one — which is why the
+# fix is a carried out-parameter reset on entry, NOT a "never overwrite an
+# existing record for this key" guard. The guard would pin attempt 1's
+# reason in place and silently drop attempt 2's genuine failure. Both
+# directions are pinned here:
 #   forward  — attempt 1's specific reason survives the stage-level record;
-#   backward — attempt 2 falls back to the generic message AND replaces
-#              the stale record (record_warning's replace-by-key contract).
+#   backward — attempt 2 records its OWN cause and replaces the stale
+#              record (record_warning's replace-by-key contract).
 # ---------------------------------------------------------------------------
 : >"$SHIM_LOG"
 TARGET9H="$WORKDIR/new-repo-reason-carry"
@@ -1022,13 +1082,42 @@ grep -qF "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on nathanjohnpayne/carry
 grep -qF "no PAT available, prompts skipped" "$TARGET9H/.bootstrap-state.warnings" \
   && fail "attempt 2 inherited attempt 1's stale reason: $(cat "$TARGET9H/.bootstrap-state.warnings" 2>/dev/null)" \
   || pass "a later failure that records no reason of its own does not inherit the stale one"
-grep -qF "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=1); $CARRY_TAIL" \
+grep -qF "REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on nathanjohnpayne/carry-repo (the gh secret-set call itself failed, rc=1) — set it manually before the first PR; $CARRY_TAIL" \
      "$TARGET9H/.bootstrap-state.warnings" \
-  && pass "attempt 2 replaces the stale record with its own generic message" \
-  || fail "attempt 2 did not record the generic failure: $(cat "$TARGET9H/.bootstrap-state.warnings" 2>/dev/null)"
+  && pass "attempt 2 replaces the stale record with its OWN specific cause" \
+  || fail "attempt 2 did not record its own cause: $(cat "$TARGET9H/.bootstrap-state.warnings" 2>/dev/null)"
 [ "$(grep -c '^@reviewer-assignment-token	' "$TARGET9H/.bootstrap-state.warnings")" = "1" ] \
   && pass "replacement leaves exactly one reviewer-assignment-token record" \
   || fail "expected one keyed record after replacement: $(cat "$TARGET9H/.bootstrap-state.warnings" 2>/dev/null)"
+
+# --- assertion 15h-2: the generic fallback is still wired ---
+# Every failing provisioning path now publishes a specific reason (#782),
+# so the recorder's generic branch is unreachable through
+# bootstrap::_provision_reviewer_assignment_token. It stays as defence in
+# depth for a future path that forgets to publish one, and that branch
+# must keep working — exercise it directly with an empty out-parameter.
+# ---------------------------------------------------------------------------
+TARGET9H2="$WORKDIR/new-repo-generic-fallback"
+rm -rf "$TARGET9H2"
+mkdir -p "$TARGET9H2"
+set +e
+fallback_out=$(bash -c '
+  ROOT="'"$ROOT"'"
+  TARGET="'"$TARGET9H2"'"
+  . "$ROOT/scripts/bootstrap/_lib.sh"
+  . "$ROOT/scripts/bootstrap/github-infra.sh"
+  BOOTSTRAP_STATE_FILE="$TARGET/.bootstrap-state"
+  BOOTSTRAP_LOG_FILE=""
+  BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON=""
+  bootstrap::_record_reviewer_token_stage_failure 7 "tail note"
+' 2>&1)
+fallback_ec=$?
+set -e
+[ "$fallback_ec" -eq 0 ] \
+  && grep -qF "github-infra: REVIEWER_ASSIGNMENT_TOKEN provisioning failed (rc=7); tail note" \
+       "$TARGET9H2/.bootstrap-state.warnings" \
+  && pass "recorder still falls back to the generic headline when no reason is published" \
+  || fail "generic fallback broke; rc=$fallback_ec; out: $fallback_out; sidecar: $(cat "$TARGET9H2/.bootstrap-state.warnings" 2>/dev/null)"
 
 # --- assertion 16: dry-run PAT miss is pure (#755 round 2) ---
 # A dry run carries no credentials, so a PAT miss there is EXPECTED:
@@ -1132,6 +1221,157 @@ echo "$out" | grep -q "is not empty" \
 echo "$out" | grep -q "resume: skip template-mirror" \
   && pass "resume actually skipped the recorded template-mirror stage" \
   || fail "resume did not skip template-mirror; out: $out"
+
+# --- assertion 18: a strict-secrets abort after repo creation is
+# resumable (#761 item 3).
+#
+# Stage C creates the remote FIRST and records stage completion LAST, so
+# a BOOTSTRAP_STRICT_SECRETS=1 abort in the secret step leaves a created
+# remote that nothing records. The stage's own remediation says to re-run
+# with `--resume template-mirror`, and that was impossible: the wizard's
+# preflight rejected the populated target dir AND the now-existing
+# remote, and had it got past both, stage C would have called
+# `gh repo create` on a name that already exists.
+#
+# The fix is a post-create checkpoint. This drives the real two-run
+# sequence end to end: run 1 aborts under strict mode after the remote is
+# created; run 2 resumes in the SAME target dir with credentials fixed.
+# Run 2 deliberately does NOT set BOOTSTRAP_SKIP_TOOL_CHECK, because the
+# existing-remote probe is one of the two gates being tested and it is
+# suppressed by that flag. That needs `op` on the shim PATH for
+# preflight's dependency check.
+# ---------------------------------------------------------------------------
+cat >"$SHIM_DIR/op" <<'OP_EOF'
+#!/bin/sh
+# op shim for the resume preflight: present on PATH for the dependency
+# check, but resolves no PAT (the resume run supplies one inline).
+exit 1
+OP_EOF
+chmod +x "$SHIM_DIR/op"
+
+run_wizard_toolcheck() {
+  PATH="$SHIM_PATH" \
+  SHIM_LOG="$SHIM_LOG" \
+  BOOTSTRAP_MERGEPATH_ROOT="$FAKE_MP" \
+  BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+  BOOTSTRAP_AUTO_CONFIRM=1 \
+  BOOTSTRAP_AUTO_PROMPT=skip \
+  BOOTSTRAP_AUTHOR_NAME="test" \
+  BOOTSTRAP_AUTHOR_EMAIL="t@t" \
+  BOOTSTRAP_SKIP_AUTHOR_TOKEN=1 \
+  BOOTSTRAP_SKIP_INVITE_PAUSE=1 \
+  BOOTSTRAP_REVIEWER_PAT_VALUE="fake-test-pat-1234567890" \
+  BOOTSTRAP_SKIP_STAGES=board-and-summary \
+  "$SCRIPT" "$@"
+}
+
+# Run 1: strict abort in the secret step, AFTER the remote was created.
+: >"$SHIM_LOG"
+TARGET12="$WORKDIR/new-repo-strict-resume"
+rm -rf "$TARGET12"
+set +e
+out=$(SHIM_EXIT_SECRET=1 BOOTSTRAP_STRICT_SECRETS=1 run_wizard strictresume-repo \
+        --target-dir "$TARGET12" \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new 2>&1)
+ec=$?
+set -e
+[ "$ec" -ne 0 ] \
+  && pass "strict-secrets run 1 aborts after the remote was created (rc=$ec)" \
+  || fail "strict-secrets run 1 should have failed; rc=$ec, out: $out"
+grep -q "^gh repo create nathanjohnpayne/strictresume-repo " "$SHIM_LOG" \
+  && pass "strict-secrets run 1 did create the remote before aborting" \
+  || fail "run 1 never reached gh repo create; log: $(cat "$SHIM_LOG")"
+[ -f "$TARGET12/.bootstrap-state.checkpoints" ] \
+  && grep -qxF "github-infra:remote-created" "$TARGET12/.bootstrap-state.checkpoints" \
+  && pass "the created remote is recorded in .bootstrap-state.checkpoints" \
+  || fail "no remote-created checkpoint after run 1: $(cat "$TARGET12/.bootstrap-state.checkpoints" 2>/dev/null)"
+grep -q "^github-infra\$" "$TARGET12/.bootstrap-state" \
+  && fail "github-infra recorded despite the strict abort" \
+  || pass "github-infra still NOT recorded (the stage did not finish)"
+
+# Run 2: the operator fixes credentials and resumes, exactly as the
+# stage's own recorded remediation instructs.
+: >"$SHIM_LOG"
+set +e
+resume_out=$(run_wizard_toolcheck strictresume-repo \
+               --target-dir "$TARGET12" \
+               --description d --visibility private \
+               --firebase none --codex-app n --project new \
+               --resume template-mirror 2>&1)
+resume_ec=$?
+set -e
+echo "$resume_out" | grep -q "is not empty" \
+  && fail "resume preflight rejected the target dir the earlier stages populated; out: $resume_out" \
+  || pass "resume preflight accepts a target dir populated by earlier stages"
+echo "$resume_out" | grep -q "remote already exists" \
+  && fail "resume preflight rejected the remote this bootstrap created; out: $resume_out" \
+  || pass "resume preflight accepts the remote recorded by the checkpoint"
+[ "$resume_ec" -eq 0 ] \
+  && pass "strict-secrets abort is resumable with --resume template-mirror (rc=0)" \
+  || fail "resume run failed; rc=$resume_ec; out: $resume_out"
+grep -q "^gh repo create " "$SHIM_LOG" \
+  && fail "resume re-invoked gh repo create on an existing remote; log: $(cat "$SHIM_LOG")" \
+  || pass "resume skips gh repo create (checkpointed step is idempotent)"
+echo "$resume_out" | grep -q "skipping gh repo create" \
+  && pass "resume logs why the create was skipped" \
+  || fail "resume did not log the checkpoint skip; out: $resume_out"
+grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/strictresume-repo\$" "$SHIM_LOG" \
+  && pass "resume completes the step that failed (REVIEWER_ASSIGNMENT_TOKEN set)" \
+  || fail "resume never retried the secret; log: $(cat "$SHIM_LOG")"
+grep -q "^github-infra\$" "$TARGET12/.bootstrap-state" \
+  && pass "resume records github-infra completion" \
+  || fail "state file still missing github-infra: $(cat "$TARGET12/.bootstrap-state" 2>/dev/null)"
+
+# --- assertion 18b: the existing-remote relaxation is checkpoint-gated ---
+# Positive proof only. Without the checkpoint an existing remote still
+# fails preflight closed, so `--resume` can never be used to bootstrap
+# over a repo this run did not create.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+rm -f "$TARGET12/.bootstrap-state.checkpoints"
+set +e
+nocp_out=$(run_wizard_toolcheck strictresume-repo \
+             --target-dir "$TARGET12" \
+             --description d --visibility private \
+             --firebase none --codex-app n --project new \
+             --resume template-mirror 2>&1)
+nocp_ec=$?
+set -e
+[ "$nocp_ec" -eq 2 ] \
+  && pass "resume without the checkpoint fails preflight (rc=2)" \
+  || fail "resume without the checkpoint should exit 2; rc=$nocp_ec; out: $nocp_out"
+echo "$nocp_out" | grep -q "remote already exists" \
+  && pass "resume without the checkpoint still refuses the existing remote" \
+  || fail "existing-remote guard did not fire without the checkpoint; out: $nocp_out"
+[ -s "$SHIM_LOG" ] \
+  && ! grep -q "^gh repo create " "$SHIM_LOG" \
+  && pass "the refused resume never reached gh repo create" \
+  || fail "refused resume behaved unexpectedly; log: $(cat "$SHIM_LOG")"
+
+# --- assertion 18c: a dry run never writes a checkpoint ---
+# bootstrap::record_checkpoint records what the wizard DID, not what it
+# said it would do. A dry-run checkpoint would make a LATER live run skip
+# a `gh repo create` that never happened, against a remote that does not
+# exist.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET13="$WORKDIR/new-repo-dry-checkpoint"
+rm -rf "$TARGET13"
+set +e
+out=$(run_wizard drycheckpoint-repo \
+        --target-dir "$TARGET13" \
+        --description d --visibility private \
+        --firebase none --codex-app n --project new --dry-run 2>&1)
+ec=$?
+set -e
+[ "$ec" -eq 0 ] \
+  && pass "dry run with the checkpoint machinery exits 0" \
+  || fail "dry run failed; rc=$ec, out: $out"
+[ -e "$TARGET13/.bootstrap-state.checkpoints" ] \
+  && fail "dry run wrote a remote-created checkpoint: $(cat "$TARGET13/.bootstrap-state.checkpoints")" \
+  || pass "dry run writes no .bootstrap-state.checkpoints sidecar"
+rm -f "$SHIM_DIR/op"
 
 # --- summary --------------------------------------------------------------
 echo

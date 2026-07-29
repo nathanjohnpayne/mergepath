@@ -63,6 +63,12 @@
 #   - The state file is append-only; --resume reads the last line.
 #     This keeps the resume semantics simple (last-wins) and
 #     auditable (the file is the full stage-completion log).
+#   - A stage records completion only when it finishes, so an abort
+#     part-way through is re-entered from the top. Irreversible steps
+#     inside a stage (`gh repo create`) additionally record a
+#     checkpoint in $TARGET_DIR/.bootstrap-state.checkpoints, which is
+#     what lets both the re-entry and this file's preflight tell "this
+#     bootstrap already did that" from "somebody else's repo".
 #   - Preflight runs BEFORE prompts; we don't want to ask the human
 #     six questions and then fail on a missing `gh`.
 
@@ -402,18 +408,32 @@ preflight() {
   #    an existing tree.
   if [ -d "$TARGET_DIR" ]; then
     # Allow the dir if it's empty OR contains only resume bookkeeping
-    # (.bootstrap-state, its .warnings sidecar written by
-    # bootstrap::record_warning, and .bootstrap-log). Omitting the
+    # (.bootstrap-state, the .warnings sidecar written by
+    # bootstrap::record_warning, the .checkpoints sidecar written by
+    # bootstrap::record_checkpoint, and .bootstrap-log). Omitting the
     # warnings sidecar here made any run that recorded a warning
     # poison its own --resume (#755 round 2).
     local extra
     extra=$(find "$TARGET_DIR" -mindepth 1 -maxdepth 1 \
               ! -name '.bootstrap-state' \
               ! -name '.bootstrap-state.warnings' \
+              ! -name '.bootstrap-state.checkpoints' \
               ! -name '.bootstrap-log' 2>/dev/null | head -1)
     if [ -n "$extra" ]; then
-      bootstrap::wizard_err "target dir $TARGET_DIR is not empty (contains: $extra ...). Refusing to overwrite."
-      violations=$((violations + 1))
+      # A --resume run re-enters a target the earlier stages already
+      # populated, so the emptiness rule cannot apply to it: once
+      # template-mirror has rsynced the template in, EVERY resume past
+      # that stage was rejected here before dispatch ever ran (#761
+      # item 3). The relaxation is gated on the state file so --resume
+      # still cannot be used to overwrite a directory this wizard never
+      # bootstrapped — a populated dir with no .bootstrap-state is
+      # somebody else's tree and is still refused.
+      if [ "$BOOTSTRAP_RESUME_REQUESTED" = "1" ] && [ -f "$BOOTSTRAP_STATE_FILE" ]; then
+        bootstrap::wizard_log "resume: target dir $TARGET_DIR is already populated by earlier stages ($BOOTSTRAP_STATE_FILE present) — emptiness check relaxed"
+      else
+        bootstrap::wizard_err "target dir $TARGET_DIR is not empty (contains: $extra ...). Refusing to overwrite."
+        violations=$((violations + 1))
+      fi
     fi
   fi
 
@@ -428,8 +448,24 @@ preflight() {
     GH_TOKEN="${OP_PREFLIGHT_AUTHOR_PAT:-${OP_PREFLIGHT_REVIEWER_PAT:-${GH_TOKEN:-}}}" \
       gh repo view "$full_name" >/dev/null 2>&1 || _gh_repo_view_rc=$?
     if [ "$_gh_repo_view_rc" -eq 0 ]; then
-      bootstrap::wizard_err "remote already exists: $full_name. Refusing to bootstrap over an existing repo."
-      violations=$((violations + 1))
+      # An existing remote is normally proof this repo is not greenfield.
+      # It is NOT when this bootstrap created it itself: stage C creates
+      # the remote first and records stage completion last, so any abort
+      # in between (a BOOTSTRAP_STRICT_SECRETS=1 secret failure, above
+      # all) leaves a remote the operator is then told to retry past with
+      # `--resume template-mirror` — and this check refused every such
+      # retry (#761 item 3). Positive proof only: the checkpoint sidecar
+      # is written by bootstrap::record_checkpoint after a successful
+      # `gh repo create`, never in dry-run, and never for a remote this
+      # bootstrap did not create. Without it, an existing remote still
+      # fails closed even under --resume.
+      if [ "$BOOTSTRAP_RESUME_REQUESTED" = "1" ] \
+         && bootstrap::has_checkpoint "$BOOTSTRAP_GITHUB_INFRA_REMOTE_CHECKPOINT"; then
+        bootstrap::wizard_log "resume: remote $full_name exists and this bootstrap's checkpoint records that it created it — continuing"
+      else
+        bootstrap::wizard_err "remote already exists: $full_name. Refusing to bootstrap over an existing repo."
+        violations=$((violations + 1))
+      fi
     fi
   fi
 

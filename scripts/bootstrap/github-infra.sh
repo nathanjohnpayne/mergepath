@@ -88,12 +88,33 @@ BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT="op://Private/pvbq24vl2h6gl7yjclxy2hbote/t
 BOOTSTRAP_REVIEWER_PAT_OP_REF="${BOOTSTRAP_REVIEWER_PAT_OP_REF:-$BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT}"
 BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY="reviewer-assignment-token"
 
+# Resume checkpoint for step 1. `gh repo create --source --push` is the
+# one irreversible act in this stage, and it runs FIRST — but the stage
+# records completion only after step 5, so any later abort (the
+# BOOTSTRAP_STRICT_SECRETS=1 secret failure above all) left a created
+# remote with nothing recording that it had been created. `--resume
+# template-mirror` then re-entered the stage and would have called `gh
+# repo create` on a name that already exists, and the wizard's preflight
+# refused to start at all because the remote was there (#761 item 3).
+#
+# The checkpoint closes both halves: bootstrap::_create_remote_and_push
+# skips the create when it is set, and the wizard's preflight tolerates
+# the pre-existing remote on a --resume run when it is set. It is
+# consulted by scripts/bootstrap-new-repo.sh, so it is stage-module
+# surface, not a private constant.
+BOOTSTRAP_GITHUB_INFRA_REMOTE_CHECKPOINT="github-infra:remote-created"
+
 # Out-parameter of bootstrap::_provision_reviewer_assignment_token: the
-# SPECIFIC failure message it recorded under
-# $BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY during the CURRENT call, or
-# "" when the path it took recorded nothing of its own. The stage-level
-# caller reads it through bootstrap::_record_reviewer_token_stage_failure
-# so its own keyed record does not clobber the specific reason (#761).
+# SPECIFIC failure message for the path it took on the CURRENT call, or
+# "" when that path published none. The stage-level caller reads it
+# through bootstrap::_record_reviewer_token_stage_failure so its own keyed
+# record under $BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY does not clobber
+# the specific reason (#761).
+#
+# Every failing path now publishes one — no PAT available with prompts
+# skipped, human declined to paste one, and `gh secret set` itself failing
+# (#782). The generic fallback in the recorder is therefore defence in
+# depth for a future path that forgets to, not a live branch.
 #
 # Reset unconditionally on entry to that function — never trusted across
 # calls. That reset is what keeps the two required behaviours from
@@ -241,6 +262,20 @@ bootstrap::_create_remote_and_push() {
     return 2
   fi
 
+  # Idempotent re-entry (#761 item 3). An earlier attempt in this same
+  # bootstrap already created the remote and pushed the bootstrap commit,
+  # then the stage aborted further down. `gh repo create` cannot be
+  # repeated against an existing name, so skip it: the checkpoint is only
+  # written after the create+push command as a whole succeeded, which
+  # means both halves are done. (If the operator has since DELETED the
+  # remote, the subsequent label / invite / secret calls fail loudly
+  # against the missing repo — remove the .bootstrap-state.checkpoints
+  # sidecar to force a fresh create.)
+  if bootstrap::has_checkpoint "$BOOTSTRAP_GITHUB_INFRA_REMOTE_CHECKPOINT"; then
+    bootstrap::log "github-infra: remote $full_repo was already created and pushed by an earlier attempt in this bootstrap (resume checkpoint) — skipping gh repo create"
+    return 0
+  fi
+
   # The visibility flag maps to gh's --public / --private / --internal.
   local vis_flag
   case "$visibility" in
@@ -257,12 +292,21 @@ bootstrap::_create_remote_and_push() {
   # on a greenfield remote. gh-pr-guard.sh's "never push to main"
   # invariant doesn't apply because there's no protected main yet —
   # we're creating it. (The hook only fires on pre-existing repos.)
+  local create_rc=0
   bootstrap::run_author_gh "create remote + push" \
     repo create "$full_repo" \
       "$vis_flag" \
       --description "$description" \
       --source="$target" \
-      --push
+      --push || create_rc=$?
+  if [ "$create_rc" -ne 0 ]; then
+    return "$create_rc"
+  fi
+
+  # Record the irreversible half BEFORE anything downstream can abort the
+  # stage. bootstrap::record_checkpoint is a no-op under --dry-run, so a
+  # dry run never claims a remote it did not create.
+  bootstrap::record_checkpoint "$BOOTSTRAP_GITHUB_INFRA_REMOTE_CHECKPOINT"
 }
 
 bootstrap::_seed_labels() {
@@ -480,17 +524,15 @@ bootstrap::_emit_reviewer_token_remediation() {
   # the first CSV field can be a name preflight refuses. Emitting it
   # verbatim would hand the operator a remediation that exits 1 — a
   # dead end at exactly the moment they need a working command. Pick the
-  # first field preflight accepts; fall back to a placeholder only when
-  # the selection names none.
+  # first field preflight accepts; when the selection names none, the
+  # cached-PAT route does not exist at all and the branch below emits a
+  # different remediation rather than a placeholder.
   local agent="" candidate
   for candidate in $(printf '%s' "$reviewers_csv" | tr -d ' ' | tr ',' ' '); do
     case " $BOOTSTRAP_REVIEWER_PREFLIGHT_AGENTS " in
       *" $candidate "*) agent="$candidate"; break ;;
     esac
   done
-  if [ -z "$agent" ]; then
-    agent="<selected-reviewer>"
-  fi
 
   if [ -n "${OP_PREFLIGHT_REVIEWER_PAT:-}" ]; then
     if [ -n "${OP_PREFLIGHT_AGENT:-}" ]; then
@@ -499,16 +541,40 @@ bootstrap::_emit_reviewer_token_remediation() {
       bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: do NOT install the PAT currently in \$OP_PREFLIGHT_REVIEWER_PAT — \$OP_PREFLIGHT_AGENT is unset, so its owning identity could not be verified"
     fi
   fi
-  # ONE `&&`-chained command on purpose. Emitting the re-preflight and
-  # the `gh secret set` as two independent lines makes the mitigation
-  # advisory prose: an operator who transcribes only the line that
-  # performs the action — in a shell where preflight last ran for a
-  # NON-selected agent — installs that rejected PAT, and nothing
-  # downstream catches it (gh-as-author.sh verifies the author
-  # performing the write, never the token on its stdin). Chaining makes
-  # skipping the re-preflight impossible without editing the command.
-  bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: fix: re-run credential preflight for a SELECTED reviewer and set the secret from that agent's cache — run as ONE command, the preflight is not optional:"
-  bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN:   eval \"\$(scripts/op-preflight.sh --agent $agent --mode review)\" && printf '%s' \"\$OP_PREFLIGHT_REVIEWER_PAT\" | scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo $full_repo" # NO_BARE_GH_WRITE_EXEMPT: remediation hint echoed to the operator (routed through the token-verifying author wrapper), not an executed gh write
+  if [ -n "$agent" ]; then
+    # ONE `&&`-chained command on purpose. Emitting the re-preflight and
+    # the `gh secret set` as two independent lines makes the mitigation
+    # advisory prose: an operator who transcribes only the line that
+    # performs the action — in a shell where preflight last ran for a
+    # NON-selected agent — installs that rejected PAT, and nothing
+    # downstream catches it (gh-as-author.sh verifies the author
+    # performing the write, never the token on its stdin). Chaining makes
+    # skipping the re-preflight impossible without editing the command.
+    bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: fix: re-run credential preflight for a SELECTED reviewer and set the secret from that agent's cache — run as ONE command, the preflight is not optional:"
+    bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN:   eval \"\$(scripts/op-preflight.sh --agent $agent --mode review)\" && printf '%s' \"\$OP_PREFLIGHT_REVIEWER_PAT\" | scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo $full_repo" # NO_BARE_GH_WRITE_EXEMPT: remediation hint echoed to the operator (routed through the token-verifying author wrapper), not an executed gh write
+  else
+    # No selected reviewer is an agent scripts/op-preflight.sh knows, so
+    # there is no cached PAT to re-preflight for and the chained command
+    # above has nothing valid to name. It used to be emitted anyway with
+    # a literal `<selected-reviewer>` in the `--agent` slot, which an
+    # operator cannot run as written: `<` and `>` are shell redirection
+    # metacharacters, so pasting the line produces a redirect/syntax
+    # error rather than the remediation, and hand-substituting one of the
+    # supported agents installs a PAT belonging to an identity this repo
+    # never invited — the exact wrong-identity install this hint exists to
+    # prevent (#781 item 4).
+    #
+    # Emit the route that IS runnable verbatim instead. `gh secret set`
+    # reads the value from stdin whenever `--body` is omitted, so the
+    # operator supplies the invited reviewer's PAT directly and no
+    # environment variable can silently substitute a different token.
+    # That is also why dropping the `&&` chain is safe here: the chain
+    # exists to stop $OP_PREFLIGHT_REVIEWER_PAT from being installed
+    # without a re-preflight, and this command never reads it.
+    bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: none of the selected reviewers ($reviewers_csv) is an agent scripts/op-preflight.sh can resolve a PAT for (it accepts: $BOOTSTRAP_REVIEWER_PREFLIGHT_AGENTS), so there is no cached PAT to install"
+    bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: fix: mint a fine-grained PAT for one of the invited reviewer identities at https://github.com/settings/tokens/new (Contents:RW, Issues:RW, Pull Requests:RW, Metadata:R, scoped to $full_repo), then run this and supply that PAT when gh asks for it:"
+    bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN:   scripts/gh-as-author.sh -- gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo $full_repo" # NO_BARE_GH_WRITE_EXEMPT: remediation hint echoed to the operator (routed through the token-verifying author wrapper), not an executed gh write
+  fi
   bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: the stored secret must belong to one of the invited reviewers ($reviewers_csv) — the author wrapper verifies the account performing the write, NOT the token on its stdin, so a wrong-identity PAT installs silently and fails on the first PR"
 }
 
@@ -669,6 +735,21 @@ bootstrap::_provision_reviewer_assignment_token() {
   printf '%s' "$pat" | bootstrap::author_gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo" >&2 || set_rc=$?
   if [ "$set_rc" -ne 0 ]; then
     bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: secret set failed (rc=$set_rc)"
+    # Publish the specific reason, exactly as the no-PAT and declined
+    # paths above do. This path always returns non-zero, so the stage
+    # ALWAYS records under the shared key — and without a reason the
+    # record fell back to the generic "provisioning failed (rc=N)",
+    # leaving the sidecar unable to say which of the three causes sharing
+    # this key actually happened. That is the one question the audit
+    # trail exists to answer, and the runbook already documents that it
+    # names `gh secret set` itself failing (#782).
+    #
+    # Unlike those paths this one records nothing itself: they return 0
+    # under default (non-strict) semantics, so they must persist their
+    # own warning or it is lost. A secret-set failure is always
+    # propagated, so a self-record would only be overwritten moments
+    # later by the stage's keyed record.
+    BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON="REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (the gh secret-set call itself failed, rc=$set_rc) — set it manually before the first PR"
     return "$set_rc"
   fi
   # Note only — the original failure message is kept verbatim by the
