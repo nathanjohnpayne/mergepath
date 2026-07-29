@@ -1289,6 +1289,30 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         # A marker with a non-blank hard against it (`-x`, `1.5`) is not
         # a list marker at all and leaves the container untouched.
         #
+        # The gap is measured in COLUMNS, from where it starts. A tab is
+        # not one column wide and is not four either — it advances to
+        # the next four-column stop, so its width depends on the column
+        # the marker leaves off at. Counting characters is the
+        # UNDER-reporting direction here, because it reports the content
+        # indent as SHALLOWER than CommonMark renders it and drags the
+        # code threshold down with it; prose four or more columns past
+        # the phantom indent, but inside the item as CommonMark reads
+        # it, is blanked and its bare refs ship unflagged. Markers hold
+        # no tabs themselves, so the gap starts at `ind + marker_width`.
+        #
+        # CommonMark counts at most four columns of that gap: five or
+        # more means the item STARTS with indented code, and the content
+        # indent is the marker width plus one. The cap is not cosmetic.
+        # An over-deep container is not the harmless over-scan it looks
+        # like, because the pop loop above compares against it: a later
+        # line that CommonMark still reads as inside the item sits left
+        # of the phantom indent, closes the container, and is then
+        # measured against the DOCUMENT — four columns in is indented
+        # code there, so it is blanked. Measuring in columns without the
+        # cap makes that worse rather than better, because a tab can
+        # push a gap past four columns that a character count kept
+        # under it.
+        #
         # The four columns are counted from the container the line is
         # actually INSIDE, which is not always the innermost OPEN one:
         # popping is deferred inside a paragraph, so a lazy continuation
@@ -1314,7 +1338,9 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
             marker_width = marker_width + 1
             empty_item = 1
           } else if (gap != "") {
-            marker_width = marker_width + length(gap)
+            gap_cols = visual_span(ind + marker_width, gap)
+            if (gap_cols > 4) gap_cols = 1
+            marker_width = marker_width + gap_cols
           } else {
             marker_width = 0
           }
@@ -1342,14 +1368,25 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
       # advancing to the next four-column stop (CommonMark). Measuring
       # columns rather than characters is what makes one leading tab
       # count as the four columns it renders as.
-      function visual_indent(s,   i, c, col) {
-        col = 0
+      function visual_indent(s) {
+        return visual_span(0, s)
+      }
+
+      # Columns spanned by a run of blanks that BEGINS at column `col`.
+      # A tab is worth whatever it takes to reach the next four-column
+      # stop, which is a function of where it starts, so the same run
+      # is not the same width everywhere: a leading tab spans four
+      # columns, the tab in `-<TAB>item` spans three (column 1 to
+      # column 4). `visual_indent` is the special case that starts at
+      # column zero.
+      function visual_span(col, s,   i, c, start) {
+        start = col
         for (i = 1; i <= length(s); i++) {
           c = substr(s, i, 1)
           if (c == "\t") col += 4 - (col % 4)
           else col++
         }
-        return col
+        return col - start
       }
 
       # Remove inline code spans, matching opening and closing backtick
@@ -1851,8 +1888,65 @@ BASE_EOF
     pass "Case 47: the marker allowance is measured from the container the line is inside, so a lazy continuation cannot rewrite the stack"
   fi
 
+  # Case 48: the gap after a list marker is measured in COLUMNS, capped
+  # at four.
+  #
+  # Every marker in cases 41-47 is followed by spaces, where one
+  # character is one column, so all of them pass under a character
+  # count. A tab is not one column: it advances to the next four-column
+  # stop, so its width depends on where the marker leaves off. Both
+  # fixtures are written with `printf` rather than a heredoc so the tab
+  # is unmistakable in the source and survives any editor that would
+  # helpfully expand it.
+  #
+  # The first document is the measurement. In `-<TAB>item` the tab
+  # starts at column 1 and spans three columns, putting the item's
+  # content indent at 4 and its code threshold at 8. A character count
+  # calls the gap one column, puts the content indent at 2 and the
+  # threshold at 6, and blanks the six-column line — which CommonMark
+  # renders as a paragraph inside the item — as indented code. Its
+  # `#222` then ships unflagged, the UNDER-reporting direction this
+  # parser must never take.
+  #
+  # The second document is the cap that has to travel with the
+  # measurement. CommonMark counts at most four columns of gap; five or
+  # more means the item STARTS with indented code and the content indent
+  # is the marker width plus one. `10)<SP><TAB>` spans five columns, so
+  # measuring honestly but WITHOUT the cap sets the container at 8 —
+  # deeper than the character count's 5, and deeper than CommonMark's 4.
+  # An over-deep container is not the harmless over-scan it looks like,
+  # because the pop loop compares against it: the five-column line 5,
+  # which CommonMark reads as a nested item inside the outer one, sits
+  # left of the phantom indent, closes the container, is measured
+  # against the document instead, and is blanked as code with `#111`
+  # inside it. Honest columns without the cap are therefore WORSE than
+  # the character count they replace, not better.
+  TABGAP_DOC="$WORKDIR/consumer-truth-tab-gap.md"
+  printf '# Doc\n\n-\titem mentioning #111\n\n      Prose in that item mentioning #222.\n' \
+    > "$TABGAP_DOC"
+  set +e
+  tabgap_hits=$(md_prose_only "$TABGAP_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  tabgap_lines=$(md_prose_only "$TABGAP_DOC" | wc -l | tr -d ' ')
+  tabgap_raw=$(wc -l < "$TABGAP_DOC" | tr -d ' ')
+  set -e
+  CAPGAP_DOC="$WORKDIR/consumer-truth-wide-gap.md"
+  printf '# Doc\n\n10) \tan item whose content is indented code\n\n     10)   Nested item mentioning #111.\n' \
+    > "$CAPGAP_DOC"
+  set +e
+  capgap_hits=$(md_prose_only "$CAPGAP_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  set -e
+  if [ "$tabgap_hits" != "3,5," ]; then
+    fail "Case 48: expected lines 3,5 flagged (the tab after the marker spans three columns, so line 5 is prose inside the item), got '$tabgap_hits'"
+  elif [ "$tabgap_lines" != "$tabgap_raw" ]; then
+    fail "Case 48: md_prose_only must emit one line per input line, got $tabgap_lines for $tabgap_raw"
+  elif [ "$capgap_hits" != "5," ]; then
+    fail "Case 48: expected line 5 flagged (a five-column gap caps the content indent at the marker width plus one, so the nested item stays inside), got '$capgap_hits'"
+  else
+    pass "Case 48: the marker gap is measured in visual columns and capped at four, so tabbed list items neither under-scan nor open a phantom container"
+  fi
+
 else
-  echo "SKIP: Cases 36-47 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-48 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
