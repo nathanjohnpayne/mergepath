@@ -38,13 +38,17 @@
 #      checkout: an `includeIf "onbranch:release"` target that sets
 #      user.email reads as absent on `main` and applies the moment that
 #      branch is checked out, with no write at that moment for a later
-#      run to catch. The failure names each offender and prints the exact
-#      unset command for it — aimed at the repository that was inspected
-#      (`git -C <repo>`, which is not necessarily the caller's cwd) and
-#      at the file that actually holds the value, which for an included
-#      value is that file rather than the parent config. Set
-#      MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 to opt out on a checkout that
-#      genuinely wants a per-repo identity.
+#      run to catch. The walk resolves an include path the way git does,
+#      `~user/…` through the passwd database included, and FAILS CLOSED
+#      on a path it cannot expand: git does its own expansion and obeys
+#      whatever identity it finds, so "could not read it" must not be
+#      recorded as "there is nothing there". The failure names each
+#      offender and prints the exact unset command for it — aimed at the
+#      repository that was inspected (`git -C <repo>`, which is not
+#      necessarily the caller's cwd) and at the file that actually holds
+#      the value, which for an included value is that file rather than
+#      the parent config. Set MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 to opt
+#      out on a checkout that genuinely wants a per-repo identity.
 #
 #   B. Baseline comparison (`--snapshot`, then a later plain run).
 #      `--snapshot` copies .git/config to a scratch path inside the git
@@ -67,6 +71,23 @@
 #      not writes and are never flagged; neither is the ephemeral
 #      `git -c key=value <cmd>` form, which mutates no file.
 #
+#      "Shell script or Markdown doc" is taken at its word: the file
+#      classifier matches extensions case-insensitively, covers the
+#      Markdown spellings GitHub renders (.md, .markdown, .mdown, .mkd)
+#      and the shells scripts actually get written in, and classifies an
+#      extensionless file by shebang — including `#!/usr/bin/env sh`,
+#      which has no slash before the interpreter word and so was missed
+#      by a `/sh` substring test. A surface the classifier skips is a
+#      surface with no gate on it at all.
+#
+#      Keys are matched case-insensitively, because a git config key is
+#      case-insensitive in both its section and its name: `git config
+#      User.Email up@example.com` writes exactly the override a later
+#      `git config user.email` reads back.
+#
+#      A path-qualified executable counts. `/usr/bin/git config
+#      user.email …` writes the file a bare `git` writes.
+#
 #      The scan works on LOGICAL commands, not physical lines:
 #      backslash-continued lines are joined first. A command split as
 #      `git \` + `config user.email …` puts the verb and the subcommand
@@ -80,6 +101,16 @@
 #      commands would otherwise let one answer for the other: in
 #      `git -C "$fix" status && git config user.email leak@example.com`
 #      the `-C` belongs to the read, not to the write it precedes.
+#
+#      Inside one command, a suppressing flag is only honoured where a
+#      flag can actually be: as a whole token in the OPTION REGION, the
+#      text between the `git` word and the identity key. Searching the
+#      whole command let text that is not a flag act as one — `--get`
+#      inside the value (`git config user.email author--get@example.com`
+#      writes that address) and `--global` in the prose or the
+#      neighbouring words that no separator split off. Every form git
+#      accepts puts its options before the key, and a trailing
+#      `--global` does not scope the write at all.
 #
 #      Markdown is IN scope on purpose. The #777 writer was not a test —
 #      it was REVIEW_POLICY.md § Git Identity Switching, which instructed
@@ -101,6 +132,13 @@
 #      whole line — leaving the paragraphs whose job is to document the
 #      forbidden shape the only ones never scanned. A real Markdown
 #      marker goes in an HTML comment, outside the spans.
+#
+#      For the same reason the marker must be USED as a comment and not
+#      merely present: `# …` in either kind of file (a doc's code block
+#      included) or `<!-- … -->` in Markdown. Honouring it anywhere on
+#      the line let string data and plain prose switch the scan off —
+#      `echo "GIT_IDENTITY_SCOPE_EXEMPT: printed"` beside a live write
+#      exempted the write.
 #
 #      Part C is gated on the mergepath marker file
 #      scripts/sync-to-downstream.sh (the check_sync_manifest idiom)
@@ -129,6 +167,15 @@
 # reporting PASS, and the "the whole job leaves .git/config untouched"
 # guarantee would stop one step short of the job's actual end.
 #
+# The post-suite pass also asserts the repository METADATA survived. Both
+# of the other assertions reach the repository through `.git`, so a suite
+# that deletes the checkout it ran in — the same wrong-target mistake as
+# an unscoped `git config`, one directory up — takes the evidence with
+# the subject and each of them then falls silent. What they need is
+# therefore captured before the suite starts, and the baseline is copied
+# outside the repository: a deleted config is not byte-identical to its
+# snapshot.
+#
 # Env overrides (used by tests/test_git_identity_hygiene.sh):
 #   MERGEPATH_GIT_IDENTITY_ROOT — point the check at a fixture tree
 #     instead of the live repo. Enumeration switches from `git ls-files`
@@ -143,7 +190,9 @@
 #
 # Exit codes:
 #   0 — pass (or a documented skip).
-#   1 — a local identity override, a baseline mismatch, or a scan hit.
+#   1 — a local identity override, an include path that could not be
+#       resolved, a baseline mismatch, a scan hit, or a suite that removed
+#       this repository's metadata.
 
 set -euo pipefail
 
@@ -168,6 +217,26 @@ IDENTITY_KEYS="user.name user.email user.signingkey commit.gpgsign tag.gpgsign"
 TEST_SUITE="${MERGEPATH_GIT_IDENTITY_SUITE:-$SELF_ROOT/tests/test_git_identity_hygiene.sh}"
 
 FAILED=0
+
+# ── Scratch files ─────────────────────────────────────────────────────
+# One registry with one EXIT trap, rather than a `trap` per file: a
+# second `trap ... EXIT` REPLACES the first, so a chain of them leaks
+# every file registered before the last call.
+TMPFILES=()
+cleanup_tmpfiles() {
+  [ "${#TMPFILES[@]}" -eq 0 ] || rm -f -- "${TMPFILES[@]}"
+}
+trap cleanup_tmpfiles EXIT
+# `newtmp <label> <varname>` assigns into the NAMED variable rather than
+# printing the path. A `$(newtmp …)` form would run the whole function in
+# a subshell, so the registration would happen in a shell that exits
+# immediately and every file would leak.
+newtmp() {
+  local mp_label="$1" mp_var="$2" mp_tmp
+  mp_tmp="$(mktemp "${TMPDIR:-/tmp}/mergepath-git-identity-$mp_label.XXXXXX")"
+  TMPFILES+=("$mp_tmp")
+  printf -v "$mp_var" '%s' "$mp_tmp"
+}
 
 # ── Baseline path ─────────────────────────────────────────────────────
 # Lives inside the git common dir (untracked, shared by every worktree,
@@ -226,17 +295,65 @@ scope_file() {
   esac
 }
 
-# Resolve an include target the way git does: `~/…` against the
-# operator's home, a RELATIVE path against the directory of the file that
-# declared the include (not the repo root and not the caller's cwd), an
-# absolute path unchanged. An unresolvable spelling (`~user/…`) yields a
-# path that fails the `-f` test below and is skipped rather than guessed.
+# The home directory of a NAMED user, looked up the way git looks it up
+# (getpwnam), through whichever of the three portable front-ends this
+# machine has. Returns non-zero when the name cannot be resolved, which
+# is what lets the caller fail closed instead of guessing.
+user_home() {
+  local u="$1" h=""
+  # The name is interpolated into no shell command below, but it arrives
+  # from a config file, so it is constrained to the portable user-name
+  # character set before anything is done with it.
+  case "$u" in
+    ""|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  if command -v getent >/dev/null 2>&1; then
+    h="$(getent passwd "$u" 2>/dev/null | awk -F: 'NR == 1 { print $6 }')"
+  fi
+  if [ -z "$h" ] && command -v dscl >/dev/null 2>&1; then
+    h="$(dscl . -read "/Users/$u" NFSHomeDirectory 2>/dev/null \
+           | awk 'NR == 1 { print $2 }')"
+  fi
+  if [ -z "$h" ] && [ -r /etc/passwd ]; then
+    h="$(awk -F: -v u="$u" '$1 == u { print $6; exit }' /etc/passwd)"
+  fi
+  [ -n "$h" ] || return 1
+  printf '%s\n' "$h"
+}
+
+# Resolve an include target the way git does: `~/…` and `~` against the
+# operator's home, `~user/…` through the passwd database, a RELATIVE path
+# against the directory of the file that declared the include (not the
+# repo root and not the caller's cwd), an absolute path unchanged.
+#
+# `~user/…` is git-supported and was previously mis-resolved. Falling
+# through to the relative branch turned `~alice/config` into
+# `<parent-dir>/~alice/config`, which never exists, so the `-f` test
+# below dropped it — while git expands the same spelling against alice's
+# real home and obeys whatever identity it finds there. That is a
+# dormant repository-local override escaping the walk entirely.
+#
+# A name this machine cannot resolve returns FAILURE rather than a
+# guess, and the caller reports it. Skipping is the one outcome that can
+# hide a live override: git does its own expansion and may well succeed
+# where this lookup did not.
 resolve_include_path() {
-  local raw="$1" parent="$2"
+  local raw="$1" parent="$2" user rest home
+  # shellcheck disable=SC2088  # the tildes here are PATTERNS matching a
+  # literal `~` in config text, not paths for the shell to expand.
   case "$raw" in
-    '~/'*)
+    '~'|'~/'*)
       [ -n "${HOME:-}" ] || return 1
-      raw="$HOME/${raw#\~/}"
+      raw="$HOME${raw#\~}"
+      ;;
+    '~'*)
+      rest="${raw#\~}"
+      case "$rest" in
+        */*) user="${rest%%/*}"; rest="/${rest#*/}" ;;
+        *)   user="$rest"; rest="" ;;
+      esac
+      home="$(user_home "$user")" || return 1
+      raw="$home$rest"
       ;;
   esac
   case "$raw" in
@@ -260,8 +377,14 @@ resolve_include_path() {
 # asserted — this repository carries no local identity override, not
 # "none of them is active this second".
 INCLUDE_FILES=""
+# Include entries whose path this check could NOT resolve, one
+# "<key>\037<raw path>\037<declaring file>" record per line. Reported as
+# offenders: git resolves `~user/…` itself and obeys what it finds, so an
+# entry the walk cannot follow is precisely where a dormant override
+# would hide, and passing it over is the only outcome that hides one.
+INCLUDE_UNRESOLVED=""
 collect_include_targets() {
-  local file="$1" depth="$2" rec raw target
+  local file="$1" depth="$2" rec key raw target unres
   # git's own include-recursion cap; with the already-collected test
   # below it is also the brake on an include cycle.
   [ "$depth" -lt 10 ] || return 0
@@ -270,9 +393,17 @@ collect_include_targets() {
     # A `-z` record is "<key>\n<value>". A record with no newline is a
     # valueless key, which names no file.
     [ "$rec" != "${rec#*$'\n'}" ] || continue
+    key="${rec%%$'\n'*}"
     raw="${rec#*$'\n'}"
     [ -n "$raw" ] || continue
-    target="$(resolve_include_path "$raw" "$file")" || continue
+    if ! target="$(resolve_include_path "$raw" "$file")"; then
+      unres="$key"$'\037'"$raw"$'\037'"$file"
+      case $'\n'"$INCLUDE_UNRESOLVED" in
+        *$'\n'"$unres"$'\n'*) ;;
+        *) INCLUDE_UNRESOLVED+="$unres"$'\n' ;;
+      esac
+      continue
+    fi
     target="$(canonical_path "$target")"
     [ -f "$target" ] || continue
     case $'\n'"$INCLUDE_FILES" in
@@ -313,7 +444,8 @@ assert_no_local_identity() {
 
   local offenders="" remedies="" scope key line origin originfile value
   local entry remedy scopefile scopes via_include=0 via_conditional=0
-  local seen_values="" dedupe incfile
+  local seen_values="" dedupe incfile via_unresolved=0
+  local unres unres_key unres_rest unres_raw unres_file
   # `--worktree` is a DISTINCT scope only when extensions.worktreeConfig
   # is enabled; with the extension off git treats it as an alias for
   # `--local`, so probing both would report every local setting twice and
@@ -408,6 +540,7 @@ assert_no_local_identity() {
     # Each file is read with `--file` and WITHOUT `--includes`, so it
     # contributes only its own values and the walk supplies the rest.
     INCLUDE_FILES=""
+    INCLUDE_UNRESOLVED=""
     [ -z "$scopefile" ] || collect_include_targets "$scopefile" 0
     while IFS= read -r incfile; do
       [ -n "$incfile" ] || continue
@@ -434,10 +567,30 @@ assert_no_local_identity() {
                    --get-all "$key" 2>/dev/null)
       done
     done <<< "$INCLUDE_FILES"
+
+    # Include entries the walk could not follow. Reported rather than
+    # skipped: git performs its own expansion and obeys any identity key
+    # behind one of these paths, so "could not read it" must not read as
+    # "there is nothing there".
+    while IFS= read -r unres; do
+      [ -n "$unres" ] || continue
+      unres_key="${unres%%$'\037'*}"
+      unres_rest="${unres#*$'\037'}"
+      unres_raw="${unres_rest%%$'\037'*}"
+      unres_file="${unres_rest#*$'\037'}"
+      entry="  $scope: $unres_key = $unres_raw (unresolvable include path, declared in $unres_file)"
+      remedy="    git -C \"$REPO_ROOT\" config --file \"$unres_file\" --unset-all $unres_key"
+      via_unresolved=1
+      offenders+="$entry"$'\n'
+      case $'\n'"$remedies" in
+        *$'\n'"$remedy"$'\n'*) ;;
+        *) remedies+="$remedy"$'\n' ;;
+      esac
+    done <<< "$INCLUDE_UNRESOLVED"
   done
   [ -n "$offenders" ] || return 0
 
-  local preamble="" include_note="" conditional_note=""
+  local preamble="" include_note="" conditional_note="" unresolved_note=""
   if [ "$phase" = "post-suite" ]; then
     preamble="These were NOT present before the regression suite ran, so the suite
 itself wrote them into this repository's config.
@@ -465,6 +618,18 @@ commit is simply misattributed. Clear the file as printed, or drop the
 \`includeIf\` entry from this repository's config.
 "
   fi
+  if [ "$via_unresolved" -eq 1 ]; then
+    unresolved_note="
+Entries marked \`unresolvable include path\` are include paths this check
+could not expand — a \`~user/…\` spelling whose user this machine's
+passwd database does not know. Git expands that path itself and obeys
+any identity key behind it, so the entry is reported rather than passed
+over: whether it currently supplies an override cannot be decided from
+here, and skipping it is the one outcome that could hide a live one.
+Drop the include entry as printed, or respell the path in a form this
+check can follow — an absolute path, or \`~/…\`.
+"
+  fi
   cat >&2 <<EOF
 check_git_identity_hygiene: FAIL (repo-local git identity override)
 
@@ -480,9 +645,79 @@ $offenders
 Clear them (the values are not recoverable afterwards, so read them
 first if one was deliberate):
 
-$remedies${include_note}${conditional_note}
+$remedies${include_note}${conditional_note}${unresolved_note}
 If this checkout genuinely wants a per-repo identity, set
 MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 for the check.
+EOF
+  return 1
+}
+
+# ── Pre-suite state, remembered OUTSIDE .git ──────────────────────────
+# Everything the post-suite phase reads — the repository, its config, the
+# baseline — is reached THROUGH `.git`, so a suite that deletes the
+# checkout it ran in erases the evidence along with the subject and every
+# post-suite assertion then takes its "nothing to check here" path. That
+# is how a suite doing `rm -rf "$ROOT/.git"` could leave this check
+# printing PASS, and it is the same wrong-target mistake as an unscoped
+# `git config`: work aimed at a fixture landing on the real checkout.
+#
+# So what the post-suite phase needs to know is captured before the suite
+# starts — in this process, and for the baseline in a copy outside the
+# repository, since a deleted config is not byte-identical to its
+# snapshot and must not be read as such.
+PRE_SUITE_IS_REPO=0
+PRE_SUITE_HAS_CONFIG=0
+PRE_SUITE_BASELINE=""
+
+capture_pre_suite_state() {
+  local cfg base
+  if git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    PRE_SUITE_IS_REPO=1
+  fi
+  if cfg="$(config_path 2>/dev/null)" && [ -f "$cfg" ]; then
+    PRE_SUITE_HAS_CONFIG=1
+  fi
+  if base="$(baseline_path 2>/dev/null)" && [ -f "$base" ]; then
+    newtmp baseline PRE_SUITE_BASELINE
+    cp "$base" "$PRE_SUITE_BASELINE"
+  fi
+}
+
+assert_repo_metadata_intact() {
+  local problems="" cfg base
+  if [ "$PRE_SUITE_IS_REPO" -eq 1 ] \
+    && ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    problems+="  the repository itself — \`git rev-parse --git-dir\` no longer works in $REPO_ROOT"$'\n'
+  fi
+  if [ "$PRE_SUITE_HAS_CONFIG" -eq 1 ]; then
+    if ! cfg="$(config_path 2>/dev/null)" || [ ! -f "$cfg" ]; then
+      problems+="  this repository's .git/config"$'\n'
+    fi
+  fi
+  if [ -n "$PRE_SUITE_BASELINE" ]; then
+    if ! base="$(baseline_path 2>/dev/null)" || [ ! -f "$base" ]; then
+      problems+="  the \`--snapshot\` baseline recorded before the suite ran"$'\n'
+    fi
+  fi
+  [ -n "$problems" ] || return 0
+  cat >&2 <<EOF
+check_git_identity_hygiene: FAIL (the regression suite removed repository metadata)
+
+The suite just run by this check ($TEST_SUITE) deleted state that existed
+before it started:
+
+$problems
+Each post-suite assertion reads this repository through \`git\` and reads
+the baseline out of the git common dir, so destroying \`.git\` destroys
+the evidence together with the subject and every one of them would
+otherwise report "nothing to check here" — leaving this check printing
+PASS for a suite that deleted the checkout it ran in. A deleted config is
+not byte-identical to its snapshot.
+
+This is the same wrong-target mistake as an unscoped \`git config\`: a
+test that builds a fixture repository must create AND remove it under its
+own scratch directory (\`mktemp -d\`), never at a path derived from the
+repository it happens to be running in.
 EOF
   return 1
 }
@@ -491,9 +726,21 @@ EOF
 # Same two-phase contract as Part A: $1 is "pre-suite" or "post-suite".
 assert_config_unchanged() {
   local phase="$1" base cfg culprit
-  base="$(baseline_path 2>/dev/null)" || return 0
+  if [ "$phase" = "post-suite" ] && [ -n "$PRE_SUITE_BASELINE" ]; then
+    # The live baseline lives inside the git common dir, so a suite that
+    # deleted `.git` deleted the thing this compares against. The copy
+    # taken before the suite ran is outside the repository and survives.
+    base="$PRE_SUITE_BASELINE"
+  else
+    base="$(baseline_path 2>/dev/null)" || return 0
+  fi
   [ -f "$base" ] || return 0
-  cfg="$(config_path)"
+  # A config that is GONE rather than modified is reported by
+  # assert_repo_metadata_intact, which has the pre-suite state to say so;
+  # comparing against a path that no longer exists here would only
+  # produce a diff of nothing against nothing.
+  cfg="$(config_path 2>/dev/null)" || return 0
+  [ -f "$cfg" ] || return 0
   if cmp -s "$base" "$cfg"; then
     if [ "$phase" = "post-suite" ]; then
       echo "check_git_identity_hygiene: .git/config unchanged by the regression suite"
@@ -530,8 +777,7 @@ HUB_MARKER="$REPO_ROOT/scripts/sync-to-downstream.sh"
 if [ ! -f "$HUB_MARKER" ]; then
   echo "check_git_identity_hygiene: Part C skipped (consumer checkout: scripts/sync-to-downstream.sh absent)"
 else
-  FILES_LIST="$(mktemp "${TMPDIR:-/tmp}/mergepath-git-identity-scan.XXXXXX")"
-  trap 'rm -f "$FILES_LIST"' EXIT
+  newtmp scan FILES_LIST
 
   if [ -n "$FIXTURE_ROOT" ]; then
     # `.git` is pruned to match the default path, which enumerates with
@@ -561,36 +807,85 @@ else
     return 1
   }
 
+  # Which files are in scope, by extension or by shebang. The check
+  # claims to cover "any tracked shell script or Markdown doc", so the
+  # classification has to reach every spelling of those two things:
+  #
+  #   - extensions are matched CASE-INSENSITIVELY and cover the Markdown
+  #     spellings GitHub renders (`.md`, `.markdown`, `.mdown`, `.mkd`)
+  #     as well as the shells people write scripts in. A doc the
+  #     classifier skips is a doc that can carry the #777 writer past a
+  #     gate that never looks at it;
+  #   - a shebang classifies an EXTENSIONLESS script. `#!/usr/bin/env sh`
+  #     and `#!/usr/bin/env zsh` were both missed by the previous test
+  #     (`bash` or the substring `/sh`): there is no slash before the
+  #     interpreter word in the `env` form, and zsh, ksh, dash and ash
+  #     run `git config` exactly as bash does.
+  #
+  # The Markdown half is kept in lockstep with the awk `mdfile` test
+  # below, which decides whether a file is cut on backticks. A Markdown
+  # doc classified as a shell script would be judged a paragraph at a
+  # time, which is the fail-open shape backtick-cutting exists to close —
+  # so the two lists move together, and tests/test_git_identity_hygiene.sh
+  # asserts a `.markdown` file gets the Markdown treatment.
+  SHEBANG_RX='^#!.*[/[:space:]](sh|bash|zsh|ksh|dash|ash|mksh)([[:space:]]|$)'
   SCAN_FILES=()
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     should_skip "$rel" && continue
     abs="$REPO_ROOT/$rel"
     [ -f "$abs" ] || continue
+    in_scope=0
+    shopt -s nocasematch
     case "$rel" in
-      *.sh|*.bash|*.md) SCAN_FILES+=("$abs") ;;
-      *)
-        head -n1 -- "$abs" 2>/dev/null | grep -qE '^#!.*(bash|/sh)( |$)' \
-          && SCAN_FILES+=("$abs")
-        ;;
+      *.sh|*.bash|*.zsh|*.ksh|*.dash|*.md|*.markdown|*.mdown|*.mkd) in_scope=1 ;;
     esac
+    shopt -u nocasematch
+    if [ "$in_scope" -eq 0 ]; then
+      # `read` rather than `head`, so no pipeline and no SIGPIPE: with
+      # `pipefail` set, `head -n1 | grep -q` can fail on the WRITER and
+      # silently drop a file that does carry a shell shebang.
+      firstline=""
+      IFS= read -r firstline < "$abs" 2>/dev/null || true
+      if [[ "$firstline" =~ $SHEBANG_RX ]]; then
+        in_scope=1
+      fi
+    fi
+    if [ "$in_scope" -eq 1 ]; then
+      SCAN_FILES+=("$abs")
+    fi
   done < "$FILES_LIST"
 
   if [ "${#SCAN_FILES[@]}" -gt 0 ]; then
-    HITS="$(mktemp "${TMPDIR:-/tmp}/mergepath-git-identity-hits.XXXXXX")"
-    trap 'rm -f "$FILES_LIST" "$HITS"' EXIT
+    newtmp hits HITS
     set +e
     awk -v root="$REPO_ROOT/" '
     # A `git … config …` invocation somewhere on the line. The optional
     # middle group absorbs global options (`-C dir`, `--git-dir=…`, `-c
     # k=v`) between `git` and the `config` subcommand.
+    #
+    # The executable may be PATH-QUALIFIED, so the boundary before `git`
+    # accepts a `/`: `/usr/bin/git config user.email …` and
+    # `/opt/homebrew/bin/git config …` write exactly the file a bare
+    # `git` writes, and rejecting a leading slash waved both of them
+    # through. The word still has to BE `git` and be followed by
+    # whitespace, so `.git/config`, `github`, and `mygit` do not match.
     function is_git_config(s) {
-      return (s ~ /(^|[^-A-Za-z0-9_.\/])git[[:space:]]+([^[:space:]]+[[:space:]]+)*config([[:space:]]|$)/)
+      return (s ~ /(^|[^-A-Za-z0-9_.])git[[:space:]]+([^[:space:]]+[[:space:]]+)*config([[:space:]]|$)/)
     }
-    # A VALUE is being assigned to one of the identity keys: the key is
-    # followed by whitespace and a value token. `-c user.email=t@t` uses
-    # `=` and never matches; `$(git config user.email)` has no following
-    # token and never matches.
+    # Where a VALUE is assigned to one of the identity keys, or 0 for no
+    # assignment: the key is followed by whitespace and a value token.
+    # `-c user.email=t@t` uses `=` and never matches; `$(git config
+    # user.email)` has no following token and never matches.
+    #
+    # Matched against the LOWERCASED command, because a git config key is
+    # case-insensitive in both its section and its name: `git config
+    # User.Email up@example.com` writes `[User] Email` and a later `git
+    # config user.email` reads it straight back (verified on git 2.50.1).
+    # A lowercase-only pattern therefore let a documented `User.Email`
+    # instruction past a guard whose whole subject is the write that
+    # instruction performs. Lowercasing only ever ADDS matches: no
+    # character folds into one of the excluded value characters below.
     #
     # The token is defined by what it is NOT, because an allow-list of
     # value-opening characters silently exempts every value that starts
@@ -611,10 +906,55 @@ else
     #        as a value would report the FIRST physical line of a
     #        continued command, which is precisely the line that cannot
     #        carry the trailing `#` exemption marker.
-    function writes_identity(s) {
-      return (s ~ /(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)[[:space:]]+[^-[:space:]#`)<>\\]/)
+    function key_assign_pos(s) {
+      if (match(tolower(s), /(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)[[:space:]]+[^-[:space:]#`)<>\\]/))
+        return RSTART
+      return 0
+    }
+    # The OPTION REGION of the invocation that performs the write: the
+    # text from the `git` word that opens the command up to the identity
+    # key it assigns. The suppressors below are read from there and from
+    # nowhere else.
+    #
+    # Reading them off the whole piece let two different things stand in
+    # for a flag the command was never given:
+    #
+    #   - the VALUE. `git config user.email author--get@example.com`
+    #     writes that address (verified on git 2.50.1), while the `--get`
+    #     inside the value read as "this is a read". No amount of
+    #     splitting adjacent commands helps — the suppressor is inside
+    #     the one command;
+    #   - a NEIGHBOUR no separator cut off. Prose naming `--global`
+    #     without backticks around it covered a bare write standing after
+    #     it in the same sentence, which is the Markdown `--global` hole
+    #     one layer below the code-span cut.
+    #
+    # Every form git accepts puts its options before the key —
+    # `git -C d config k v`, `git config --global k v`, `git config
+    # --file f k v` — and a TRAILING `--global` does not scope the write
+    # at all: `git config user.email x --global` writes the LOCAL config
+    # (verified on git 2.50.1). So nothing that genuinely suppresses is
+    # lost by not looking past the key.
+    #
+    # The region starts at the LAST `git` word before the key, not at the
+    # start of the piece, for the prose case above: what precedes the
+    # command is commentary, not its flags.
+    function flag_region(s, keypos,   pre, off, last, t) {
+      pre = substr(s, 1, keypos - 1)
+      last = 0; off = 0; t = pre
+      while (match(t, /(^|[^-A-Za-z0-9_.])git[[:space:]]/)) {
+        last = off + RSTART
+        off = off + RSTART + RLENGTH - 1
+        t = substr(t, RSTART + RLENGTH)
+      }
+      # No `git` word before the key at all: keep the whole prefix, the
+      # conservative reading (more suppressors, so fewer hits).
+      if (last == 0) return pre
+      return substr(pre, last)
     }
     # Explicitly targets some other repository or an out-of-repo scope.
+    # Every pattern is anchored on a token boundary, so a word that
+    # merely CONTAINS one of these spellings is not mistaken for it.
     function targeted(s) {
       if (s ~ /(^|[[:space:]])-C([[:space:]]|=)/) return 1
       if (s ~ /(^|[[:space:]])--git-dir([[:space:]]|=)/) return 1
@@ -623,20 +963,25 @@ else
       if (s ~ /(^|[[:space:]])(-f|--file|--blob)([[:space:]]|=)/) return 1
       return 0
     }
-    # Reads and removals are not identity writes.
+    # Reads and removals are not identity writes. Anchored on token
+    # boundaries for the reason spelled out above flag_region: a bare
+    # substring search for `--get` classified `git config user.email
+    # author--get@example.com` — a write that succeeds — as a read.
     function not_a_write(s) {
-      if (s ~ /--get/) return 1
-      if (s ~ /--list/) return 1
-      if (s ~ /--unset/) return 1
-      if (s ~ /--remove-section/) return 1
-      if (s ~ /--rename-section/) return 1
+      if (s ~ /(^|[[:space:]])--get(-[a-z]+)?([[:space:]]|=|$)/) return 1
+      if (s ~ /(^|[[:space:]])--list([[:space:]]|$)/) return 1
+      if (s ~ /(^|[[:space:]])--unset(-all)?([[:space:]]|$)/) return 1
+      if (s ~ /(^|[[:space:]])--remove-section([[:space:]]|$)/) return 1
+      if (s ~ /(^|[[:space:]])--rename-section([[:space:]]|$)/) return 1
       return 0
     }
-    function offending_one(s) {
+    function offending_one(s,   keypos, flags) {
       if (!is_git_config(s)) return 0
-      if (!writes_identity(s)) return 0
-      if (targeted(s)) return 0
-      if (not_a_write(s)) return 0
+      keypos = key_assign_pos(s)
+      if (keypos == 0) return 0
+      flags = flag_region(s, keypos)
+      if (targeted(flags)) return 0
+      if (not_a_write(flags)) return 0
       return 1
     }
     # One logical line can hold SEVERAL commands: `a && b`, `a; b`,
@@ -717,12 +1062,34 @@ else
     #
     # Double-backtick spans are stripped first so that the single-span
     # pass cannot chew the delimiters off one and spill its contents.
-    function exempt(s, md) {
+    #
+    # The marker also has to be USED as a comment, not merely present.
+    # Honouring it anywhere on the line meant a marker that was string
+    # data or plain prose still switched the scan off:
+    # `echo "GIT_IDENTITY_SCOPE_EXEMPT: merely-printed"; git config
+    # user.email <addr>` exempted the write beside it, and so did a
+    # sentence that named the marker in prose and put the write in a code
+    # span. The documented spellings are a shell comment and a Markdown
+    # HTML comment, so those are what count: a `#` opening a comment
+    # (line start, or after whitespace) in either kind of file — a fenced
+    # or indented code block inside a doc is where a real Markdown
+    # exemption most often sits — or `<!-- … -->` in Markdown only.
+    #
+    # Residual, deliberately: a string that is shaped exactly like a
+    # comment (`echo "# GIT_IDENTITY_SCOPE_EXEMPT: x"`) still exempts,
+    # because telling it from a real comment needs a shell quote parser.
+    # A line that goes to that trouble is forging an exemption on
+    # purpose, not tripping over one, and the marker is reviewed where it
+    # is written.
+    function exempt(s, md,   t) {
+      t = s
       if (md) {
-        gsub(/``[^`]*``/, "", s)
-        gsub(/`[^`]*`/, "", s)
+        gsub(/``[^`]*``/, "", t)
+        gsub(/`[^`]*`/, "", t)
       }
-      return (s ~ /GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/)
+      if (t ~ /(^|[[:space:]])#.*GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/) return 1
+      if (md && t ~ /<!--.*GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/) return 1
+      return 0
     }
     function emit(ln, txt,   rel) {
       rel = grpfile
@@ -731,8 +1098,9 @@ else
       found = 1
     }
     # The suppressors (`-C`, `--global`, `--unset`, …) are read off the
-    # JOINED command, because they belong to the same invocation wherever
-    # in it they appear. The GIT_IDENTITY_SCOPE_EXEMPT marker is scoped to
+    # JOINED command — from its option region, per flag_region above —
+    # because a flag written on one physical line of a continued command
+    # belongs to the whole of it. The GIT_IDENTITY_SCOPE_EXEMPT marker is scoped to
     # whichever hit it is being tested against instead: off the joined
     # buffer for a joined-command hit — a shell command cannot carry a
     # trailing `#` comment on any physical line but its last, so a
@@ -778,7 +1146,11 @@ else
     # not absorb the first line of the next file.
     FNR == 1 { flush() }
     {
-      mdfile = (FILENAME ~ /\.md$/)
+      # Every Markdown spelling the file classifier admits, matched the
+      # same case-insensitive way. A doc that reached the scan but was
+      # judged as a shell script would not be cut on backticks, which is
+      # the fail-open shape the cut exists to close.
+      mdfile = (tolower(FILENAME) ~ /\.(md|markdown|mdown|mkd)$/)
       if (nbuf == 0) { start = FNR; grpfile = FILENAME; grpmd = mdfile }
       nbuf++
       if (offending($0, mdfile) && !exempt($0, mdfile)) {
@@ -823,10 +1195,12 @@ shipping a working command:
 
 If a line really is a deliberate exception, append a
 \`GIT_IDENTITY_SCOPE_EXEMPT: <reason>\` comment — \`# …\` in a script,
-\`<!-- … -->\` in Markdown, where it also renders invisibly. In Markdown
-the marker must sit OUTSIDE backticks: inside a code span it counts as a
-citation of the marker rather than a use of it, which is precisely how a
-doc that describes this rule writes it.
+\`<!-- … -->\` in Markdown, where it also renders invisibly. The marker
+has to BE a comment: naming it in prose, or printing it from a string,
+does not exempt anything. In Markdown it must also sit OUTSIDE backticks:
+inside a code span it counts as a citation of the marker rather than a
+use of it, which is precisely how a doc that describes this rule writes
+it.
 
 Offending lines:
 EOF
@@ -848,6 +1222,10 @@ fi
 # post-suite re-assertion below is itself tested.
 if { [ -n "${MERGEPATH_GIT_IDENTITY_SUITE:-}" ] || [ -z "$FIXTURE_ROOT" ]; } \
   && [ -f "$TEST_SUITE" ]; then
+  # Taken BEFORE the suite runs, and kept outside `.git`, so the
+  # post-suite phase can tell "this repository is clean" apart from "this
+  # repository is gone".
+  capture_pre_suite_state
   echo "check_git_identity_hygiene: running regression test suite"
   if ! bash "$TEST_SUITE"; then
     echo "check_git_identity_hygiene: FAIL (regression test suite failed)" >&2
@@ -858,7 +1236,10 @@ if { [ -n "${MERGEPATH_GIT_IDENTITY_SUITE:-}" ] || [ -z "$FIXTURE_ROOT" ]; } \
   # static scan deliberately excludes, and the assertions above already
   # finished before it started. Re-running them is what makes the
   # "nothing in this job moved .git/config" guarantee cover the whole job
-  # rather than everything-except-its-final-step.
+  # rather than everything-except-its-final-step. The metadata assertion
+  # goes FIRST because it is what keeps the other two honest: both read
+  # the repository through `.git`, and both fall silent if it is missing.
+  assert_repo_metadata_intact || FAILED=1
   assert_no_local_identity post-suite || FAILED=1
   assert_config_unchanged post-suite || FAILED=1
   if [ "$FAILED" -ne 0 ]; then

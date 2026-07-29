@@ -850,6 +850,481 @@ else
   fail "clean suite post-suite re-assertion: rc=$RC out=$OUT"
 fi
 
+# ── Precision: what counts as a command, a flag, a key, a surface ─────
+# The scan reasons about text. Everything below is a place where reading
+# the text loosely made it reason about the WRONG text: a flag that was
+# really part of a value, a key spelled in casing git accepts, an
+# executable named by path, a file the classifier never opened, a marker
+# that was never a comment. Each case pairs the missed shape with the
+# converse, so tightening the reading does not start inventing hits.
+
+# Case 43: identity keys are case-insensitive in git — in the section
+# name and in the key name alike. `git config User.Email <addr>` writes
+# `[User] Email` and a later lowercase `git config user.email` reads it
+# straight back, so a lowercase-only pattern let a documented `User.Email`
+# instruction through a guard whose entire subject is the write that
+# instruction performs. The read-back is asserted against real git, so
+# the fixture cannot be modelling a world where casing matters.
+CASEREPO="$WORKDIR/caserepo"
+git init -q -b main "$CASEREPO"
+git -C "$CASEREPO" config User.Email "Upper@example.com"
+CASE_READBACK="$(git -C "$CASEREPO" config --local --get user.email 2>/dev/null || true)"
+run_on_fixture "tests/mixed-case.sh" '#!/usr/bin/env bash
+git config User.Email "Upper@example.com"
+git config USER.NAME "Upper"
+git config Commit.GpgSign false
+'
+if [ "$CASE_READBACK" = "Upper@example.com" ] \
+  && [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/mixed-case.sh:2" \
+  && printf '%s' "$OUT" | grep -q "tests/mixed-case.sh:3" \
+  && printf '%s' "$OUT" | grep -q "tests/mixed-case.sh:4"; then
+  pass "identity keys in git-accepted casing: caught"
+else
+  fail "mixed-case identity keys: readback='$CASE_READBACK' rc=$RC out=$OUT"
+fi
+
+# Case 44: a read flag must be recognised as a flag, not as a substring.
+# `git config user.email author--get@example.com` writes that address —
+# asserted against real git below — while a bare search for `--get`
+# anywhere in the invocation classified it as a read. Cutting adjacent
+# commands cannot help here: the suppressor is inside the value of the
+# same command.
+GETVALREPO="$WORKDIR/getvalrepo"
+git init -q -b main "$GETVALREPO"
+git -C "$GETVALREPO" config user.email "author--get@example.com"
+GETVAL_READBACK="$(git -C "$GETVALREPO" config --local --get user.email 2>/dev/null || true)"
+run_on_fixture "tests/flagish-value.sh" '#!/usr/bin/env bash
+git config user.email author--get@example.com
+git config user.name no--list-here
+'
+if [ "$GETVAL_READBACK" = "author--get@example.com" ] \
+  && [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/flagish-value.sh:2" \
+  && printf '%s' "$OUT" | grep -q "tests/flagish-value.sh:3"; then
+  pass "read flag embedded in the value: no longer suppresses the write"
+else
+  fail "flag-shaped value suppressing a write: readback='$GETVAL_READBACK' rc=$RC out=$OUT"
+fi
+
+# Case 45: a scope flag AFTER the key does not scope the write, so it
+# must not suppress either. `git config user.email <addr> --global`
+# writes the LOCAL config — asserted against real git below, with
+# GIT_CONFIG_GLOBAL and HOME both pointed at scratch paths so that the
+# assertion cannot touch the operator's real global config whatever git
+# decides to do with the trailing flag.
+TRAILREPO="$WORKDIR/trailrepo"
+TRAILGLOBAL="$WORKDIR/trail-gitconfig-global"
+git init -q -b main "$TRAILREPO"
+: > "$TRAILGLOBAL"
+set +e
+HOME="$WORKDIR" GIT_CONFIG_GLOBAL="$TRAILGLOBAL" \
+  git -C "$TRAILREPO" config user.email "trailing@example.com" --global >/dev/null 2>&1
+set -e
+TRAIL_LOCAL="$(git -C "$TRAILREPO" config --local --get user.email 2>/dev/null || true)"
+TRAIL_GLOBAL_LEFT="$(grep -c . "$TRAILGLOBAL" 2>/dev/null || true)"
+run_on_fixture "tests/trailing-global.sh" '#!/usr/bin/env bash
+git config user.email trailing@example.com --global
+'
+if [ "$TRAIL_LOCAL" = "trailing@example.com" ] \
+  && [ "$TRAIL_GLOBAL_LEFT" = "0" ] \
+  && [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/trailing-global.sh:2"; then
+  pass "scope flag after the key: does not suppress the local write it is not scoping"
+else
+  fail "trailing --global suppressing a local write: local='$TRAIL_LOCAL' globalLines='$TRAIL_GLOBAL_LEFT' rc=$RC out=$OUT"
+fi
+
+# Case 46: the converse of cases 44 and 45 — reading flags only from the
+# option region must not lose a flag that IS in it. Every legitimate
+# spelling puts its target or scope between `git` and the key.
+run_on_fixture "tests/flags-before-key.sh" '#!/usr/bin/env bash
+git config --global user.email "you@example.com"
+git -C "$FIX" config user.email "t@t"
+git --git-dir="$FIX/.git" config user.email "t@t"
+git config --file "$FIX/.git/config" user.email "t@t"
+git config -f "$FIX/.git/config" user.name "t"
+git config --system user.email "root@example.com"
+'
+if [ "$RC" = "0" ]; then
+  pass "target / scope flags in the option region: still suppress"
+else
+  fail "option-region flags no longer suppressing: rc=$RC out=$OUT"
+fi
+
+# Case 46b: a flag spelling that is only PART of a longer word inside the
+# option region is not a flag either. This is case 44 one step to the
+# LEFT of the key, where restricting the search to the option region
+# cannot help: the argument of another option (here an `--exec-path`
+# under a directory whose name happens to contain `--get`) is inside the
+# region, and a bare substring search read it as a read flag and
+# suppressed the write beside it.
+run_on_fixture "tests/flagish-option-arg.sh" '#!/usr/bin/env bash
+git --exec-path=/opt/git--get/libexec config user.email leak@example.com
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/flagish-option-arg.sh:2"; then
+  pass "flag spelling inside another option argument: does not suppress"
+else
+  fail "flag-shaped option argument suppressing a write: rc=$RC out=$OUT"
+fi
+
+# Case 47: a path-qualified executable is the same command. The
+# character before `git` in `/usr/bin/git config …` is a `/`, which the
+# word boundary used to reject outright, so an absolute-path invocation
+# skipped every scope check while writing exactly the file a bare `git`
+# writes.
+run_on_fixture "tests/qualified-git.sh" '#!/usr/bin/env bash
+/usr/bin/git config user.email absolute@example.com
+/opt/homebrew/bin/git config user.name brew
+./git config user.signingkey ABC123
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/qualified-git.sh:2" \
+  && printf '%s' "$OUT" | grep -q "tests/qualified-git.sh:3" \
+  && printf '%s' "$OUT" | grep -q "tests/qualified-git.sh:4"; then
+  pass "path-qualified git executables: caught"
+else
+  fail "path-qualified git executables: rc=$RC out=$OUT"
+fi
+
+# Case 48: the converse of case 47 — accepting a `/` before `git` must
+# not turn every mention of `.git/config` into a hit, and a
+# path-qualified invocation that IS scoped stays clean.
+run_on_fixture "docs/paths.md" '# Paths
+
+An unscoped write lands in `.git/config`, which every worktree of the
+repository reads. The sanctioned form is `/usr/bin/git config --global
+user.email you@example.com`, and a fixture takes `git -C "$FIX" config
+user.email t@t`.
+'
+if [ "$RC" = "0" ]; then
+  pass "prose naming .git/config, and a scoped qualified git: no false hit"
+else
+  fail "path boundary inventing a hit: rc=$RC out=$OUT"
+fi
+
+# Case 49: Markdown is more than lowercase `.md`. A doc named
+# `*.markdown` or `*.MD` is a doc, and one the classifier skipped had no
+# gate on it at all. The body is case 23 — a sanctioned `--global`
+# example beside a forbidden one in prose — so this also proves the file
+# gets the MARKDOWN treatment (cut on backticks) and not the shell one,
+# which would judge the whole sentence as a single piece and let the
+# first example wave the second through.
+run_on_fixture "docs/prose.markdown" '# Identity
+
+Use `git config --global user.email you@example.com`, never `git config user.email you@example.com`.
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "docs/prose.markdown:3"; then
+  pass ".markdown doc: scanned, and cut on backticks like any Markdown"
+else
+  fail ".markdown doc: rc=$RC out=$OUT"
+fi
+
+run_on_fixture "docs/UPPER.MD" '# Identity
+
+Never run `git config user.email leak@example.com`.
+'
+if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "docs/UPPER.MD:3"; then
+  pass "uppercase .MD doc: scanned"
+else
+  fail "uppercase .MD doc: rc=$RC out=$OUT"
+fi
+
+# Case 50: an extensionless script is classified by its shebang, and the
+# interpreter set has to cover the shells people write. `#!/usr/bin/env
+# sh` in particular was missed by a `/sh` substring test — there is no
+# slash before the interpreter word in the `env` form — and zsh, ksh and
+# dash run `git config` exactly as bash does.
+for SHEBANG in '#!/usr/bin/env zsh' '#!/bin/dash' '#!/usr/bin/env sh' '#!/bin/ksh' '#!/bin/zsh'; do
+  run_on_fixture "tools/hook" "$SHEBANG
+git config user.email leak@example.com
+"
+  if [ "$RC" = "1" ] && printf '%s' "$OUT" | grep -q "tools/hook:2"; then
+    pass "extensionless script with shebang '$SHEBANG': scanned"
+  else
+    fail "extensionless script with shebang '$SHEBANG': rc=$RC out=$OUT"
+  fi
+done
+
+# Case 51: the converse of case 50 — the shebang widening must not pull
+# in files that are not shell. A python script naming the same command in
+# a string is not a shell writer, and the scan has no business judging it.
+run_on_fixture "tools/pyhook" '#!/usr/bin/env python3
+subprocess.run("git config user.email leak@example.com", shell=True)
+'
+if [ "$RC" = "0" ]; then
+  pass "non-shell shebang: not scanned"
+else
+  fail "non-shell shebang pulled into the scan: rc=$RC out=$OUT"
+fi
+
+# Case 52: the exemption marker has to BE a comment. Honouring it
+# anywhere on the line meant merely PRINTING it switched the scan off for
+# that line, which is the same shape as case 25 one step further out: not
+# a citation inside a code span, but string data in a live command.
+run_on_fixture "tests/printed-marker.sh" '#!/usr/bin/env bash
+echo "GIT_IDENTITY_SCOPE_EXEMPT: merely-printed"; git config user.email leak@example.com
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/printed-marker.sh:2"; then
+  pass "marker printed as string data: does not exempt the write beside it"
+else
+  fail "printed marker exempting a live write: rc=$RC out=$OUT"
+fi
+
+# Case 53: the same in Markdown. A sentence that names the marker in
+# plain prose — outside any code span, so case 25's span-stripping does
+# not reach it — is still discussing the marker, not using it. The
+# documented Markdown spelling is an HTML comment.
+run_on_fixture "docs/prose-marker.md" '# Identity
+
+A deliberate exception is marked GIT_IDENTITY_SCOPE_EXEMPT: with a reason, as in `git config user.email you@example.com`.
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "docs/prose-marker.md:3"; then
+  pass "marker named in Markdown prose: does not exempt the write beside it"
+else
+  fail "prose marker exempting a live write: rc=$RC out=$OUT"
+fi
+
+# Case 54: the converse of cases 52 and 53 — a `#` comment inside a
+# Markdown code block is a real marker. That is where an exemption in a
+# doc naturally sits: the line carries no spans to strip and a shell
+# comment is the idiom of the block it is in.
+run_on_fixture "docs/fenced-marker.md" '# Identity
+
+```bash
+git config user.email "t@t"  # GIT_IDENTITY_SCOPE_EXEMPT: fixture, container only
+```
+'
+if [ "$RC" = "0" ]; then
+  pass "shell-comment marker inside a Markdown code block: exempts the line"
+else
+  fail "marker in a Markdown code block not honoured: rc=$RC out=$OUT"
+fi
+
+# ── Fail-closed: include paths the walk cannot follow ──────────────────
+
+# Case 55: `~/…` in an include path is expanded against the operator's
+# home, exactly as git expands it. HOME is repointed at a fixture so the
+# expansion is observable without writing anything into the real one.
+HOMEREPO="$WORKDIR/homerepo"
+FAKEHOME="$WORKDIR/fakehome"
+mkdir -p "$FAKEHOME"
+printf '[user]\n\temail = tildehome@example.com\n' > "$FAKEHOME/identity"
+git init -q -b main "$HOMEREPO"
+# shellcheck disable=SC2088  # the literal `~/` IS the fixture: git
+# expands it, and expanding it here would test nothing.
+git -C "$HOMEREPO" config --local includeIf.onbranch:release.path "~/identity"
+set +e
+OUT="$(HOME="$FAKEHOME" MERGEPATH_GIT_IDENTITY_ROOT="$HOMEREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "local: user.email = tildehome@example.com" \
+  && printf '%s' "$OUT" | grep -q "via inactive include:"; then
+  pass "identity behind a ~/ include path: expanded and caught"
+else
+  fail "tilde-home include path: rc=$RC out=$OUT"
+fi
+
+# Case 56: `~user/…` is a git-supported spelling too, resolved through
+# the passwd database. Treating it as a RELATIVE path turned it into
+# `<parent-dir>/~user/…`, which never exists, so the target was dropped
+# as absent while git expands the same string against that user's real
+# home and obeys the identity it finds — a dormant repository-local
+# override escaping the walk completely.
+#
+# The path is written as a walk UP from the home directory to the fixture
+# file, so the case proves the expansion really lands on the user's home
+# without the test writing anything inside it. The number of `../` steps
+# is deliberately generous rather than counted off `$HOME`: `/..` is `/`,
+# so any home shallower than that collapses to the root and the case does
+# not depend on how deep the home directory happens to be — nor on $HOME
+# agreeing with the passwd entry, which is what the resolver reads.
+TILDEUSER="$(id -un)"
+TILDEREPO="$WORKDIR/tildeuserrepo"
+git init -q -b main "$TILDEREPO"
+printf '[user]\n\temail = tildeuser@example.com\n' > "$WORKDIR/tilde-user-identity"
+git -C "$TILDEREPO" config --local includeIf.onbranch:release.path \
+  "~$TILDEUSER/../../../../../../../../../../../../${WORKDIR#/}/tilde-user-identity"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$TILDEREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "local: user.email = tildeuser@example.com" \
+  && printf '%s' "$OUT" | grep -q "via inactive include:"; then
+  pass "identity behind a ~user/ include path: expanded and caught"
+else
+  fail "~user/ include path: user='$TILDEUSER' rc=$RC out=$OUT"
+fi
+
+# Case 57: a `~user/…` path this machine cannot resolve FAILS CLOSED
+# rather than being skipped. Git performs its own expansion and obeys
+# whatever it finds, so "this check could not read it" must not be
+# recorded as "there is nothing there" — that is the one outcome that
+# hides a live override behind a spelling the resolver does not handle.
+NOUSERREPO="$WORKDIR/nouserrepo"
+git init -q -b main "$NOUSERREPO"
+git -C "$NOUSERREPO" config --local includeIf.onbranch:release.path \
+  "~mergepath-no-such-user-777/identity"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NOUSERREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "unresolvable include path" \
+  && printf '%s' "$OUT" | grep -q "mergepath-no-such-user-777"; then
+  pass "include path this machine cannot expand: fails closed"
+else
+  fail "unresolvable include path skipped: rc=$RC out=$OUT"
+fi
+
+# ... and the printed command must clear it, like every other offender.
+REMEDY="$(printf '%s\n' "$OUT" | grep -E '^[[:space:]]+git .*--unset-all' | head -1 || true)"
+set +e
+eval "$REMEDY" >/dev/null 2>&1
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NOUSERREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ -n "$REMEDY" ] && [ "$RC" = "0" ]; then
+  pass "unresolvable include remediation: the printed command clears the failure"
+else
+  fail "unresolvable include remediation: remedy='$REMEDY' rc=$RC out=$OUT"
+fi
+
+# Case 58: the converse — an ordinary missing include target is NOT a
+# failure. Git ignores an `include.path` whose file does not exist, and
+# such an entry carries no identity, so failing on one would fire on
+# every templated config in the fleet. What fails closed is a path that
+# could not be RESOLVED, not one that resolved to nothing.
+MISSINGREPO="$WORKDIR/missingrepo"
+git init -q -b main "$MISSINGREPO"
+git -C "$MISSINGREPO" config --local includeIf.onbranch:release.path "not-created-yet"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$MISSINGREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ]; then
+  pass "include target that resolves but does not exist: not a failure"
+else
+  fail "missing include target treated as an offender: rc=$RC out=$OUT"
+fi
+
+# ── Fail-closed: a suite that removes the repository metadata ──────────
+
+# Case 59: the post-suite phase reads the repository through `.git` and
+# the baseline out of the git common dir, so a suite whose fixture
+# cleanup is aimed one directory too high — `rm -rf "$ROOT/.git"` — takes
+# the evidence with the subject and every post-suite assertion then finds
+# nothing to check. That is the same wrong-target mistake as an unscoped
+# `git config`, and a deleted config is certainly not byte-identical to
+# its snapshot, so the check must not report PASS for it.
+NUKESTUB="$WORKDIR/stub-suite-nuke.sh"
+cat > "$NUKESTUB" <<'EOF'
+#!/usr/bin/env bash
+# A "regression suite" whose cleanup targets the repository it was run
+# against instead of its own scratch tree.
+rm -rf "$MERGEPATH_GIT_IDENTITY_ROOT/.git"
+exit 0
+EOF
+NUKEREPO="$WORKDIR/nukerepo"
+git init -q -b main "$NUKEREPO"
+set +e
+MERGEPATH_GIT_IDENTITY_ROOT="$NUKEREPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NUKEREPO" MERGEPATH_GIT_IDENTITY_SUITE="$NUKESTUB" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "removed repository metadata" \
+  && printf '%s' "$OUT" | grep -q "the repository itself" \
+  && printf '%s' "$OUT" | grep -q ".git/config" \
+  && printf '%s' "$OUT" | grep -q "baseline recorded before the suite ran" \
+  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  pass "suite that deletes the repository: caught, not reported PASS"
+else
+  fail "post-suite metadata assertion: rc=$RC out=$OUT"
+fi
+
+# Case 60: a suite that deletes the baseline while also writing the
+# config must still be told WHAT it changed. The baseline lives inside
+# the git common dir, so losing it used to end the comparison — the run
+# could say the baseline was gone but not that the config had moved, and
+# the diff is the actionable half. The copy taken before the suite ran
+# sits outside the repository and carries the comparison through.
+BASEKILLSTUB="$WORKDIR/stub-suite-basekill.sh"
+cat > "$BASEKILLSTUB" <<'EOF'
+#!/usr/bin/env bash
+# Writes the repository config AND removes the recorded baseline, e.g. a
+# cleanup step sweeping stray files out of the git dir.
+git -C "$MERGEPATH_GIT_IDENTITY_ROOT" config --local core.pager cat
+# Spelled out rather than via `rev-parse --git-common-dir`, which reports
+# a path relative to the CALLER, not to the repository named by -C.
+rm -f "$MERGEPATH_GIT_IDENTITY_ROOT/.git/mergepath-gitconfig-baseline"
+exit 0
+EOF
+BASEKILLREPO="$WORKDIR/basekillrepo"
+git init -q -b main "$BASEKILLREPO"
+set +e
+MERGEPATH_GIT_IDENTITY_ROOT="$BASEKILLREPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$BASEKILLREPO" MERGEPATH_GIT_IDENTITY_SUITE="$BASEKILLSTUB" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "baseline recorded before the suite ran" \
+  && printf '%s' "$OUT" | grep -q "changed since the snapshot" \
+  && printf '%s' "$OUT" | grep -q "pager"; then
+  pass "suite that deletes the baseline: the config diff is still reported"
+else
+  fail "preserved baseline not used for the post-suite comparison: rc=$RC out=$OUT"
+fi
+
+# Case 61: the converse — the metadata assertion must not fire when the
+# repository was never there to begin with. A fixture tree that is not a
+# git repository has no `.git` to lose, and the check already skips parts
+# A and B for it.
+NOREPO="$WORKDIR/norepo"
+mkdir -p "$NOREPO"
+printf '#!/usr/bin/env bash\n' > "$NOREPO/marker.sh"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$NOREPO" MERGEPATH_GIT_IDENTITY_SUITE="$CLEANSTUB" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "0" ] \
+  && printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS" \
+  && ! printf '%s' "$OUT" | grep -q "removed repository metadata"; then
+  pass "non-repository fixture tree: metadata assertion stays quiet"
+else
+  fail "metadata assertion firing on a non-repository: rc=$RC out=$OUT"
+fi
+
+# Case 62: the check cleans up its own scratch files, on the failure path
+# as much as the passing one. They are registered in one list with one
+# EXIT trap, because a second `trap … EXIT` replaces the first rather than
+# adding to it — and because a registration performed inside `$( … )`
+# happens in a subshell that exits immediately, leaving the parent with an
+# empty list and every file on disk. TMPDIR is repointed at a scratch
+# directory so the assertion sees only this invocation's files.
+LEAKTMP="$WORKDIR/leaktmp"
+LEAKTREE="$WORKDIR/leaktree"
+mkdir -p "$LEAKTMP" "$LEAKTREE/scripts" "$LEAKTREE/tests"
+printf '#!/usr/bin/env bash\n' > "$LEAKTREE/scripts/sync-to-downstream.sh"
+printf '#!/usr/bin/env bash\ngit config user.email leak@example.com\n' \
+  > "$LEAKTREE/tests/leaky.sh"
+set +e
+TMPDIR="$LEAKTMP" MERGEPATH_GIT_IDENTITY_ROOT="$LEAKTREE" bash "$CHECK" >/dev/null 2>&1
+RC=$?
+LEFTOVER="$(find "$LEAKTMP" -type f | wc -l | tr -d ' ')"
+set -e
+if [ "$RC" = "1" ] && [ "$LEFTOVER" = "0" ]; then
+  pass "scratch files: removed on exit, including on the failure path"
+else
+  fail "scratch files left behind: rc=$RC leftover=$LEFTOVER"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────
 echo
 echo "test_git_identity_hygiene: $PASS passed, $FAIL failed"
