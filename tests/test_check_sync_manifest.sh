@@ -1329,20 +1329,98 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         base_depth = depth
         while (base_depth > 0 && stack[base_depth] > ind) base_depth--
         if (base_depth > 0) marker_base = stack[base_depth]
-        if (ind < marker_base + 4 && match(rest, /^([-*+]|[0-9]+[.)])/)) {
+
+        # Leaf blocks that are NOT paragraphs, recognised before the
+        # marker branch because both of the things below need them.
+        #
+        # They only exist within four columns of the container the line
+        # is inside; past that the line is indented-code shaped, and a
+        # `#` or `---` there is code text rather than a heading or a
+        # break. Inside a paragraph indented code cannot interrupt, so
+        # such a line is lazy continuation text and none of these fire.
+        #
+        # A setext underline is only an underline while a paragraph is
+        # open. With no paragraph to underline, `---` is a thematic
+        # break (which the test above already catches) and `===` is
+        # ordinary text, so this branch reads the INCOMING `para`.
+        #
+        # It also has to sit at or inside the container holding that
+        # paragraph. CommonMark bars a setext underline from being a
+        # LAZY continuation line, so `===` at column zero under a list
+        # item paragraph is continuation text and the paragraph stays
+        # open. Clearing `para` there would hand the following indented
+        # line to the code branch even though CommonMark reads it as
+        # more of the same paragraph — the UNDER-reporting direction.
+        # A heading and a thematic break carry no such rule: either one
+        # at column zero really does end the item.
+        atx = 0
+        tbreak = 0
+        setext = 0
+        if (ind < marker_base + 4) {
+          atx = is_atx_heading(rest)
+          tbreak = is_thematic_break(rest)
+          setext = (para && ind >= list_indent && is_setext_underline(rest))
+        }
+
+        # Because neither one can be a lazy continuation, a heading or a
+        # break also CLOSES every container it is not indented into,
+        # here rather than at the next block boundary. The pop above is
+        # skipped while a paragraph is open, so without this a heading
+        # at column zero under a list item leaves the item on the stack
+        # and the document-level code block after it is measured against
+        # a container CommonMark has already closed — four columns in is
+        # short of the stale threshold, so the block is emitted as prose.
+        if (atx || tbreak) {
+          while (depth > 0 && ind < stack[depth]) depth--
+          list_indent = 0
+          if (depth > 0) list_indent = stack[depth]
+        }
+
+        # A thematic break is never a list marker. Where both readings
+        # are possible CommonMark gives the break precedence, so `- - -`
+        # opens no container; treating it as a marker with a one-column
+        # gap invents an item at indent 2 that nothing ever closes, and
+        # the code block belonging to the real enclosing container is
+        # then measured against the phantom and emitted as prose.
+        if (ind < marker_base + 4 && !tbreak &&
+            match(rest, /^([-*+]|[0-9]+[.)])/)) {
+          marker = substr(rest, 1, RLENGTH)
           marker_width = RLENGTH
           tail = substr(rest, RLENGTH + 1)
           gap = tail
           sub(/[^ \t].*$/, "", gap)
-          if (tail == gap) {
+          empty_marker = (tail == gap)
+          if (!empty_marker && gap == "") {
+            marker_width = 0
+          } else if (para && ind >= list_indent &&
+                     (empty_marker || (marker !~ /^[-*+]$/ &&
+                                       !ordered_start_one(marker)))) {
+            # A list may only interrupt a paragraph on the terms
+            # CommonMark sets: the item must have content on the marker
+            # line, and an ORDERED item must start at 1. A line like
+            # `2. text` under an open paragraph is still paragraph text.
+            # Opening a container for it puts a phantom content indent
+            # in force, and the top-level four-space code block after
+            # the next blank is measured against the phantom instead of
+            # against the document — three columns in rather than four,
+            # so it is emitted as prose and its `#NN` fails the check.
+            #
+            # Interrupting is only what a marker does INSIDE the block
+            # holding that paragraph. A marker left of it does not
+            # interrupt anything: it closes the container and starts a
+            # fresh list, which no rule restricts. Applying the rules
+            # there instead refuses a container CommonMark opens, and
+            # the lines inside the new item are then measured against
+            # the enclosing block and blanked as code — the
+            # UNDER-reporting direction.
+            marker_width = 0
+          } else if (empty_marker) {
             marker_width = marker_width + 1
             empty_item = 1
-          } else if (gap != "") {
+          } else {
             gap_cols = visual_span(ind + marker_width, gap)
             if (gap_cols > 4) gap_cols = 1
             marker_width = marker_width + gap_cols
-          } else {
-            marker_width = 0
           }
           if (marker_width > 0) {
             while (depth > 0 && stack[depth] > ind) depth--
@@ -1358,10 +1436,84 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
           print ""; next
         }
 
+        # `para` records whether a PARAGRAPH is open, not merely whether
+        # the last line held text, because that is the only state the
+        # "indented code cannot interrupt" rule keys on. An ATX heading,
+        # a thematic break and a setext underline are leaf blocks that
+        # close (or never open) a paragraph, and an indented code block
+        # may begin on the very next line with no blank between. Leaving
+        # `para` set after them suppresses both the container pop and the
+        # code branch, so a genuine code block after a heading is emitted
+        # as prose and a `#NN` inside it fails a required check.
+        #
+        # A marker that opened an EMPTY item is the same story from the
+        # other end: it emits a line and opens a container, but there is
+        # no content on it and therefore no paragraph, so the indented
+        # code block that may follow it directly is code.
         para = 1
+        if (atx || tbreak || setext || empty_item) para = 0
         line = strip_code_spans(line)
         gsub(/\]\(#[^)]*\)/, "]()", line)
         print line
+      }
+
+      # An ATX heading opener: one to six `#`, then a space, a tab, or
+      # end of line. A seventh `#` and a `#` hard against its text are
+      # both ordinary paragraph text, which is what keeps a line
+      # opening on a bare `#123` from reading as a heading.
+      #
+      # The run is counted rather than matched with an interval like
+      # `#{1,6}`, because interval expressions are not portable across
+      # every awk CI runs on.
+      function is_atx_heading(s,   n, c) {
+        if (substr(s, 1, 1) != "#") return 0
+        n = 0
+        while (substr(s, n + 1, 1) == "#") n++
+        if (n > 6) return 0
+        c = substr(s, n + 1, 1)
+        return (c == "" || c == " " || c == "\t")
+      }
+
+      # A thematic break: three or more of the SAME `-`, `_` or `*`,
+      # with nothing but blanks anywhere else on the line.
+      function is_thematic_break(s,   c0, i, c, n) {
+        c0 = substr(s, 1, 1)
+        if (c0 != "-" && c0 != "_" && c0 != "*") return 0
+        n = 0
+        for (i = 1; i <= length(s); i++) {
+          c = substr(s, i, 1)
+          if (c == c0) n++
+          else if (c != " " && c != "\t") return 0
+        }
+        return (n >= 3)
+      }
+
+      # A setext heading underline: one unbroken run of `=` or `-`,
+      # then blanks to end of line. The caller decides whether a
+      # paragraph is open, which is the only place this shape means an
+      # underline at all.
+      function is_setext_underline(s,   c0, n, i, c) {
+        c0 = substr(s, 1, 1)
+        if (c0 != "=" && c0 != "-") return 0
+        n = 0
+        while (substr(s, n + 1, 1) == c0) n++
+        for (i = n + 1; i <= length(s); i++) {
+          c = substr(s, i, 1)
+          if (c != " " && c != "\t") return 0
+        }
+        return 1
+      }
+
+      # Whether an ordered marker starts at 1, the only start CommonMark
+      # lets interrupt a paragraph. The digits are compared with leading
+      # zeros removed, matching the integer CommonMark parses, and the
+      # result is forced to a string so a bullet marker reaching here by
+      # mistake cannot compare equal numerically.
+      function ordered_start_one(m,   d) {
+        d = m
+        sub(/[.)]$/, "", d)
+        sub(/^0+/, "", d)
+        return ((d "") == "1")
       }
 
       # Column reached by a run of leading whitespace, with tabs
@@ -1945,8 +2097,167 @@ BASE_EOF
     pass "Case 48: the marker gap is measured in visual columns and capped at four, so tabbed list items neither under-scan nor open a phantom container"
   fi
 
+  # Case 49: only a PARAGRAPH blocks an indented code block.
+  #
+  # Every fixture in cases 38-48 puts a blank line between a leaf block
+  # and the code that follows it, so all of them pass even if the parser
+  # treats "the last line held text" as "a paragraph is open". CommonMark
+  # bars indented code from interrupting a PARAGRAPH and nothing else: an
+  # ATX heading, a setext heading, a thematic break and an empty list
+  # item all leave no paragraph behind, so a code block may start on the
+  # very next line with no blank between. Reading every emitted line as a
+  # paragraph suppresses both the container pop and the code branch
+  # there, and lines 2, 6, 10, 14 and 17 — which markdown-it-py in
+  # commonmark mode renders inside `<pre><code>` — are emitted as prose
+  # with their `#NN` exposed. That is the FALSE POSITIVE direction,
+  # failing a required check on a doc whose refs are code.
+  #
+  # Line 13 pins the other half: a heading is never a lazy continuation,
+  # so it closes the item opened on line 12 as well, which is what leaves
+  # line 14 four columns past the DOCUMENT rather than short of a stale
+  # container indent of 2. Line 9 is spaced out as `* * *` so that the
+  # break is also a list-marker shape: CommonMark gives the break
+  # precedence, and reading it as a marker instead opens an item at
+  # indent 2 that nothing closes, leaving line 10 short of the threshold
+  # and emitted as prose.
+  #
+  # The second document is the one exception, and it runs the other way.
+  # A setext underline may not be a LAZY continuation line, so the `===`
+  # on line 4 — left of the item holding the paragraph — underlines
+  # nothing and the paragraph runs on. Treating it as a heading closes
+  # the paragraph, and line 5 is then four columns past the item and
+  # blanked as code with its `#222` inside — the UNDER-reporting
+  # direction. Both classifications are markdown-it-py in commonmark
+  # mode, which renders lines 3-5 as one `<li>` paragraph.
+  LEAF_DOC="$WORKDIR/consumer-truth-leaf-blocks.md"
+  cat > "$LEAF_DOC" <<'LEAF_EOF'
+# Doc
+    echo "#111 is code"
+
+Prose that a setext underline turns into a heading.
+===
+    echo "#222 is code"
+
+Prose that a thematic break interrupts.
+* * *
+    echo "#333 is code"
+
+- An item mentioning #444
+# A heading closes that item
+    echo "#555 is code"
+
+-
+      echo "#666 is code"
+
+But a bare #777 in prose is.
+LEAF_EOF
+  set +e
+  leaf_hits=$(md_prose_only "$LEAF_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  leaf_lines=$(md_prose_only "$LEAF_DOC" | wc -l | tr -d ' ')
+  leaf_raw=$(wc -l < "$LEAF_DOC" | tr -d ' ')
+  set -e
+  LAZY_DOC="$WORKDIR/consumer-truth-lazy-setext.md"
+  cat > "$LAZY_DOC" <<'LAZY_EOF'
+# Doc
+
+- An item mentioning #111
+===
+      Still that same paragraph, mentioning #222.
+
+And a bare #333 in prose is.
+LAZY_EOF
+  set +e
+  lazy_hits=$(md_prose_only "$LAZY_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  set -e
+  if [ "$leaf_hits" != "12,19," ]; then
+    fail "Case 49: expected lines 12,19 flagged (a heading, a setext underline, a break and an empty item all leave no paragraph, so the code after each is excluded), got '$leaf_hits'"
+  elif [ "$leaf_lines" != "$leaf_raw" ]; then
+    fail "Case 49: md_prose_only must emit one line per input line, got $leaf_lines for $leaf_raw"
+  elif [ "$lazy_hits" != "3,5,7," ]; then
+    fail "Case 49: expected lines 3,5,7 flagged (a setext underline cannot be a lazy continuation, so the paragraph runs on), got '$lazy_hits'"
+  else
+    pass "Case 49: an indented code block may follow a leaf block directly, so only a real paragraph keeps the scan on"
+  fi
+
+  # Case 50: a list opens only where CommonMark lets one open.
+  #
+  # The first document is the restriction. A list may interrupt a
+  # paragraph only if the item carries content AND, when ordered, starts
+  # at 1. Line 4 satisfies neither test, so it is still paragraph text;
+  # opening a container for it puts the content indent at 3 and the
+  # top-level code block on line 6 lands three columns past it rather
+  # than four, is emitted as prose, and fails a required check on the
+  # `#111` inside it. Line 14 is the same story for an empty marker,
+  # which CommonMark reads here as a setext underline. Lines 9 and 11
+  # pin that a conforming `1. ` item is unaffected.
+  #
+  # The second document is the limit on that restriction, which matters
+  # more because it runs the other way. Interrupting is what a marker
+  # does INSIDE the block holding the paragraph; a marker to the LEFT of
+  # it closes that block and starts a fresh list, which no rule
+  # restricts. Line 4 opens an item whose content indent is 6, so line 6
+  # is its paragraph. Refuse that container and line 6 is measured
+  # against the `- outer` item at 2 instead, four columns in, and its
+  # `#222` is blanked as code — the UNDER-reporting direction this
+  # parser must never take. Line 9 is the empty-marker form of the same
+  # allowance, and the six-column line 10 is then that new item's code.
+  #
+  # Every classification here is markdown-it-py in commonmark mode.
+  INTERRUPT_DOC="$WORKDIR/consumer-truth-interrupt.md"
+  cat > "$INTERRUPT_DOC" <<'INTERRUPT_EOF'
+# Doc
+
+Prose paragraph one.
+2. not a list, because an ordered list must start at 1 to interrupt
+
+    echo "#111 is code"
+
+Prose paragraph two.
+1. a real item mentioning #222
+
+    A four-space continuation of that item mentioning #333.
+
+Prose paragraph three.
+-
+    echo "#444 is code"
+
+And a bare #555 in prose is.
+INTERRUPT_EOF
+  set +e
+  interrupt_hits=$(md_prose_only "$INTERRUPT_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  interrupt_lines=$(md_prose_only "$INTERRUPT_DOC" | wc -l | tr -d ' ')
+  interrupt_raw=$(wc -l < "$INTERRUPT_DOC" | tr -d ' ')
+  set -e
+  FRESH_DOC="$WORKDIR/consumer-truth-fresh-list.md"
+  cat > "$FRESH_DOC" <<'FRESH_EOF'
+# Doc
+
+- outer item mentioning #111
+2)    a fresh list, since this marker is left of that item
+
+      Continuation of the fresh item mentioning #222.
+
+- another outer item mentioning #333
+-
+      echo "#444 is code"
+
+And a bare #555 in prose is.
+FRESH_EOF
+  set +e
+  fresh_hits=$(md_prose_only "$FRESH_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  set -e
+  if [ "$interrupt_hits" != "9,11,17," ]; then
+    fail "Case 50: expected lines 9,11,17 flagged (a non-1 ordered marker and an empty marker cannot interrupt a paragraph, so the code after each is excluded), got '$interrupt_hits'"
+  elif [ "$interrupt_lines" != "$interrupt_raw" ]; then
+    fail "Case 50: md_prose_only must emit one line per input line, got $interrupt_lines for $interrupt_raw"
+  elif [ "$fresh_hits" != "3,6,8,12," ]; then
+    fail "Case 50: expected lines 3,6,8,12 flagged (a marker left of the open paragraph starts a fresh list, so its prose is still scanned), got '$fresh_hits'"
+  else
+    pass "Case 50: the paragraph-interruption rules bind markers inside the open block and only there"
+  fi
+
 else
-  echo "SKIP: Cases 36-48 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-50 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
