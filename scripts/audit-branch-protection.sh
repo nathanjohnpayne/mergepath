@@ -37,7 +37,9 @@
 #   repos without anything going red.
 #
 #   Each repo is audited on ITS OWN default branch, resolved per repo from
-#   `GET /repos/{owner}/{repo}`. A fleet run must not assume every repo
+#   `GET /repos/{owner}/{repo}` and then handed to the child audit via
+#   `--default-branch` so the child never repeats the lookup. A fleet run
+#   must not assume every repo
 #   calls its default branch `main`: the recorded posture in
 #   docs/architecture/0002-branch-protection-enforcement-posture.md is
 #   "all five canonical checks on its default branch", and auditing a
@@ -48,7 +50,11 @@
 #   Exit codes are deliberately the SAME shape as single-repo mode, so a
 #   caller's `case "$rc"` reads identically in both:
 #     0 — every audited repo requires all canonical checks
-#     1 — bad arguments or a missing prerequisite (yq, manifest, hub repo)
+#     1 — bad arguments or a missing prerequisite: yq, a missing manifest,
+#         a manifest whose schema `version:` this reader does not support,
+#         an unresolvable hub repo, or an unwritable --summary-file (the
+#         summary is what the rollup issue is built from, so a run that
+#         cannot persist it must not return a verdict)
 #     2 — at least one repo could NOT be audited (auth/API failure). This
 #         is an INFRASTRUCTURE failure, not drift — most often a token
 #         without `Administration:read`. It takes precedence over 3
@@ -68,6 +74,16 @@
 #   audit under a reviewer identity does not produce a false "PR merges are
 #   completely unprotected" verdict. If you hit exit 2 with an auth-scope
 #   diagnostic, re-run with an author/admin token.
+#
+# Unknown is never a verdict:
+#   Two ruleset facts are read from payloads that may not answer. A
+#   `~DEFAULT_BRANCH` condition on a repo whose metadata cannot be read,
+#   audited on a branch the historical main/master guess does not cover,
+#   exits 2 rather than dropping the ruleset (which would report the
+#   branch as unprotected). Likewise a ruleset detail payload with no
+#   readable `bypass_actors` ARRAY exits 2 under
+#   `--require-admin-enforcement` rather than counting an absent or
+#   non-array field as an empty bypass list.
 #
 # Ruleset enforcement:
 #   On the ruleset fallback path, only rulesets whose `enforcement` is
@@ -117,6 +133,12 @@ CANONICAL_REQUIRED_CHECKS=(
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 
+# `.mergepath-sync.yml` schema version this reader understands. The
+# manifest documents version bumps as INCOMPATIBLE changes and requires
+# readers to refuse unknown ones; scripts/sync-to-downstream.sh and
+# scripts/project-doc-sync.sh pin the same way.
+SUPPORTED_MANIFEST_VERSION=1
+
 REPO=""
 BRANCH="main"
 # Distinguishes "caller asked for this branch" from "nobody said, so the
@@ -129,6 +151,10 @@ AUDIT_CMD=""
 HUB_REPO=""
 SUMMARY_FILE=""
 REQUIRE_ADMIN_ENFORCEMENT=0
+# Caller-supplied answer to "what is this repo's default branch". Set by
+# --fleet on each child audit, which has already resolved it from
+# GET /repos/{owner}/{repo}; see --default-branch below.
+DEFAULT_BRANCH_HINT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -142,6 +168,18 @@ while [ $# -gt 0 ]; do
         echo "Error: --branch requires a non-empty value" >&2; exit 1
       fi
       BRANCH="$2"; BRANCH_EXPLICIT=1; shift 2 ;;
+    --default-branch)
+      # Seeds this repo's default branch instead of re-reading it from
+      # GET /repos/{owner}/{repo}. --fleet passes the value it already
+      # resolved: without it every child audit repeats its parent's
+      # metadata call, and a transient failure of that redundant lookup
+      # would leave `~DEFAULT_BRANCH` unresolvable on a repo whose
+      # default is neither main nor master — turning an infrastructure
+      # failure into a DRIFT verdict.
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "Error: --default-branch requires a non-empty value" >&2; exit 1
+      fi
+      DEFAULT_BRANCH_HINT="$2"; shift 2 ;;
     --require-admin-enforcement)
       # ADR 0002 requires enforce_admins on the hub (#427/#428 were both
       # admin merges). Off by default so consumer audits keep their
@@ -174,6 +212,7 @@ while [ $# -gt 0 ]; do
     -h|--help)
       cat <<EOF
 Usage: scripts/audit-branch-protection.sh [--repo owner/name] [--branch <name>]
+                                          [--default-branch <name>]
                                           [--require-admin-enforcement]
        scripts/audit-branch-protection.sh --fleet [--branch <name>]
                                           [--hub-repo owner/name]
@@ -186,7 +225,12 @@ canonical mergepath-shipped status checks:
 
 --require-admin-enforcement additionally requires that admins cannot
 bypass those checks (classic \`enforce_admins: true\`, or a governing
-ruleset with no bypass actors). ADR 0002 requires this on the hub.
+ruleset with an EMPTY bypass-actor array — an unreadable one exits 2).
+ADR 0002 requires this on the hub.
+
+--default-branch supplies this repo's default branch instead of reading
+it from GET /repos/{owner}/{repo}; only \`~DEFAULT_BRANCH\` ruleset
+conditions consult it. --fleet passes the value it already resolved.
 
 Exit 3 if any canonical check is not required (PR-merge gating gap).
 Exit 2 on gh API auth/scope failures (use an author/admin PAT).
@@ -194,9 +238,11 @@ Exit 2 on gh API auth/scope failures (use an author/admin PAT).
 --fleet audits the hub plus every \`.consumers[].repo\` in
 .mergepath-sync.yml and prints a per-repo verdict table. Each repo is
 audited on its OWN default branch unless --branch is passed explicitly,
-and the hub is audited with --require-admin-enforcement. Same exit-code
-shape: 0 all clean, 1 usage/prerequisite, 2 at least one repo unreadable
-(infrastructure, NOT drift), 3 drift on at least one readable repo.
+and the hub is audited with --require-admin-enforcement. The manifest's
+schema \`version:\` must be $SUPPORTED_MANIFEST_VERSION. Same exit-code shape: 0 all clean,
+1 usage/prerequisite (including an unwritable --summary-file), 2 at least
+one repo unreadable (infrastructure, NOT drift), 3 drift on at least one
+readable repo.
 EOF
       exit 0
       ;;
@@ -229,6 +275,31 @@ fleet_audit() {
   if [ ! -f "$manifest" ]; then
     echo "Error: propagation manifest not found: $manifest" >&2
     echo "       Pass --manifest <path> or run from a mergepath checkout." >&2
+    return 1
+  fi
+
+  # Refuse a manifest schema this reader does not understand. The
+  # manifest reserves `version:` bumps for INCOMPATIBLE changes — "the
+  # script refuses to run against an unknown version so old scripts
+  # can't silently misinterpret a newer manifest" — and both existing
+  # readers (scripts/sync-to-downstream.sh, scripts/project-doc-sync.sh)
+  # already gate on it. Without the check a v2 manifest that still
+  # happens to parse as `.consumers[].repo` would yield a fleet verdict
+  # over a consumer list this auditor no longer reads correctly, and the
+  # scheduled run would report that partial audit as a fleet-wide
+  # all-clear. A missing key reads as yq's `null` and is rejected too.
+  local manifest_version
+  if ! manifest_version=$(yq -r '.version' "$manifest" 2>&1); then
+    echo "Error: could not read .version from $manifest:" >&2
+    printf '%s\n' "$manifest_version" | sed 's/^/  /' >&2
+    return 1
+  fi
+  if [ "$manifest_version" != "$SUPPORTED_MANIFEST_VERSION" ]; then
+    echo "Error: $manifest declares schema version '$manifest_version'; this auditor" >&2
+    echo "       supports version $SUPPORTED_MANIFEST_VERSION only. A version bump means an INCOMPATIBLE" >&2
+    echo "       change, so the consumer list may no longer mean what this script" >&2
+    echo "       reads. Refusing to emit a fleet verdict over a manifest it cannot" >&2
+    echo "       interpret — upgrade scripts/audit-branch-protection.sh." >&2
     return 1
   fi
 
@@ -277,6 +348,10 @@ fleet_audit() {
   local summary=""
   local n_pass=0 n_drift=0 n_error=0
   local out rc verdict tmp repo_branch
+  # Extra argv handed to the child audit. Carries the default-branch fact
+  # this loop established, so the child never re-issues the same
+  # GET /repos/{owner}/{repo}; see the --default-branch flag.
+  local -a child_args=()
   tmp="$(mktemp "${TMPDIR:-/tmp}/fleet-bp-audit.XXXXXX")"
 
   for r in "${repos[@]}"; do
@@ -286,6 +361,7 @@ fleet_audit() {
     # A repo whose metadata cannot be read is an ERROR (infrastructure),
     # never a PASS: guessing `main` here would audit a branch that may
     # not exist and report the resulting "unprotected" verdict as drift.
+    child_args=()
     if [ "$BRANCH_EXPLICIT" -eq 1 ]; then
       repo_branch="$BRANCH"
     else
@@ -302,14 +378,25 @@ fleet_audit() {
 "
         continue
       fi
+      # This loop just established the repo's default branch
+      # authoritatively. Hand that fact to the child instead of letting
+      # it repeat the same metadata call: the repeat is both wasteful
+      # (one extra request per repo per ~DEFAULT_BRANCH ruleset pattern
+      # would otherwise be N+1 across the fleet) and unsafe. A repo whose
+      # default is neither `main` nor `master` and whose protection comes
+      # from a `~DEFAULT_BRANCH` ruleset would, on a transient failure of
+      # that redundant lookup, fall past the main/master guess, count no
+      # ruleset as targeting the branch, and return DRIFT — reporting an
+      # infrastructure failure as a protection gap in the rollup issue.
+      child_args+=(--default-branch "$repo_branch")
     fi
 
     # ADR 0002 requires enforce_admins on the hub only, so the flag is
     # passed for the hub and withheld from consumers.
     if [ "$r" = "$hub" ]; then
-      "$audit_cmd" --repo "$r" --branch "$repo_branch" --require-admin-enforcement >"$tmp" 2>&1 || rc=$?
+      "$audit_cmd" --repo "$r" --branch "$repo_branch" "${child_args[@]}" --require-admin-enforcement >"$tmp" 2>&1 || rc=$?
     else
-      "$audit_cmd" --repo "$r" --branch "$repo_branch" >"$tmp" 2>&1 || rc=$?
+      "$audit_cmd" --repo "$r" --branch "$repo_branch" "${child_args[@]}" >"$tmp" 2>&1 || rc=$?
     fi
     out="$(cat "$tmp")"
     case "$rc" in
@@ -335,8 +422,28 @@ ${summary}${tally}"
 
   echo "$summary_block"
 
+  # The summary file is the artifact the scheduled workflow embeds
+  # VERBATIM in the rollup issue body (the verbose stdout is truncated),
+  # so an unwritten summary is a rollup built from nothing — or, worse,
+  # from a stale file left by an earlier run. `set -e` cannot catch the
+  # failure: fleet_audit is invoked on the left of `||` to capture its
+  # status, which disables errexit for the whole function, so the failed
+  # redirection would fall through to a 0/3 return with the requested
+  # file absent. Checked explicitly and reported as a prerequisite
+  # failure (exit 1), which the workflow handles by failing the job
+  # WITHOUT touching the rollup issue.
   if [ -n "$SUMMARY_FILE" ]; then
-    printf '%s\n' "$summary_block" >"$SUMMARY_FILE"
+    if ! printf '%s\n' "$summary_block" >"$SUMMARY_FILE"; then
+      echo "" >&2
+      echo "Error: could not write the fleet summary to '$SUMMARY_FILE'." >&2
+      echo "       The per-repo verdict table above is the payload the rollup" >&2
+      echo "       issue is built from, so a run that cannot persist it must not" >&2
+      echo "       return a verdict — a stale or missing summary would be" >&2
+      echo "       published as though it described this run." >&2
+      echo "       Check the path exists, is writable, and its parent directory" >&2
+      echo "       was created before the audit ran." >&2
+      return 1
+    fi
   fi
 
   if [ "$n_error" -gt 0 ]; then
@@ -360,6 +467,11 @@ ${summary}${tally}"
 # no-op #774 is about.
 if [ "$FLEET" -eq 1 ] && [ -n "$REPO" ]; then
   echo "Error: --fleet and --repo are mutually exclusive" >&2; exit 1
+fi
+if [ "$FLEET" -eq 1 ] && [ -n "$DEFAULT_BRANCH_HINT" ]; then
+  echo "Error: --default-branch is a per-repo fact that --fleet resolves for each repo itself" >&2
+  echo "       and would be silently ignored here. Drop it, or audit one repo with --repo." >&2
+  exit 1
 fi
 if [ "$FLEET" -eq 1 ] && [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
   echo "Error: --require-admin-enforcement is decided per repo by --fleet (hub only, per ADR 0002)" >&2
@@ -408,8 +520,15 @@ echo ""
 # and a transient failure on a later call could downgrade an already
 # resolved answer to the main/master guess and flip the ruleset-target
 # verdict.
+#
+# A caller that already knows the answer seeds it with --default-branch,
+# which pre-satisfies the memo so no metadata request is made at all.
 REPO_DEFAULT_BRANCH=""
 REPO_DEFAULT_BRANCH_RESOLVED=0
+if [ -n "$DEFAULT_BRANCH_HINT" ]; then
+  REPO_DEFAULT_BRANCH="$DEFAULT_BRANCH_HINT"
+  REPO_DEFAULT_BRANCH_RESOLVED=1
+fi
 resolve_repo_default_branch() {
   if [ "$REPO_DEFAULT_BRANCH_RESOLVED" -eq 0 ]; then
     REPO_DEFAULT_BRANCH_RESOLVED=1
@@ -557,7 +676,8 @@ if [ "$USE_RULESETS" -eq 1 ]; then
         "~DEFAULT_BRANCH")
           resolve_repo_default_branch
           if [ -n "$REPO_DEFAULT_BRANCH" ]; then
-            # Authoritative answer from the repo's own metadata.
+            # Authoritative answer from the repo's own metadata (or from
+            # the --default-branch fact the caller already established).
             if [ "$BRANCH" = "$REPO_DEFAULT_BRANCH" ]; then
               return 0
             fi
@@ -565,6 +685,32 @@ if [ "$USE_RULESETS" -eq 1 ]; then
             # Metadata unreadable — degrade to the historical guess
             # rather than silently declaring the ruleset non-matching.
             return 0
+          else
+            # Metadata unreadable AND the audited branch is outside what
+            # the main/master guess can speak to. Whether this ruleset
+            # governs the branch is now genuinely UNKNOWN, and returning
+            # "no match" would drop the only ruleset protecting the repo
+            # and report the resulting "nothing targets $BRANCH" as
+            # DRIFT — filing an infrastructure failure in the rollup
+            # issue as a protection gap. Same rule the fleet loop already
+            # applies to its own unresolvable default branches.
+            cat >&2 <<EOF
+ERROR: ruleset $rid targets '~DEFAULT_BRANCH' on $REPO, but this repo's
+       default branch could not be read from GET /repos/$REPO, and the
+       audited branch '$BRANCH' is neither 'main' nor 'master' — so
+       whether the ruleset governs it is unknown.
+
+       Refusing to treat the ruleset as non-matching: that would report
+       '$BRANCH' as unprotected (drift) on the strength of a failed
+       metadata read. Treating the repo as unreadable (infrastructure
+       failure) instead.
+
+       Re-run with a token that can read repository metadata, or pass
+       the branch fact directly:
+         scripts/audit-branch-protection.sh --repo $REPO --branch $BRANCH \\
+           --default-branch <this repo's default branch>
+EOF
+            exit 2
           fi
           ;;
         "$BRANCH_REF")
@@ -686,6 +832,39 @@ $THIS_CHECKS"
     # rules, so a non-empty list is the ruleset-world analogue of
     # `enforce_admins: false` — but only for the checks this same
     # ruleset requires.
+    #
+    # The key must be PRESENT and an ARRAY before its emptiness can be
+    # read as "nobody can bypass this ruleset". `.bypass_actors[]?`
+    # yields nothing for a genuinely empty list AND for an absent key,
+    # a null, or any non-array value — so an unexpected payload shape
+    # would set RS_BYPASSED=0 and be recorded as positive PROOF that the
+    # canonical checks are non-bypassable. That is the one direction an
+    # enforcement probe must never move in, and it is the same
+    # conflation scripts/merge-clearance-gate.sh's enforcement probe
+    # rejects outright.
+    #
+    # Only fatal when --require-admin-enforcement is in play: that flag
+    # is the only mode in which the answer is consulted at all (ADR 0002
+    # asks it of the hub, not of consumers), so an unreadable field on a
+    # consumer audit that never reads it is not a reason to fail a run.
+    RS_BYPASS_TYPE=$(echo "$DETAIL" | jq -r '.bypass_actors | type' 2>/dev/null || true)
+    if [ "$RS_BYPASS_TYPE" != "array" ] && [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
+      cat >&2 <<EOF
+ERROR: ruleset $rid governs $REPO@$BRANCH, but its detail payload carries
+       no readable 'bypass_actors' array (jq type: ${RS_BYPASS_TYPE:-unreadable}).
+
+       --require-admin-enforcement asks whether a canonical required
+       check is skippable, and that question is answered from this list.
+       An absent, null, or non-array field is NOT evidence of an empty
+       bypass list — crediting it as one would let the hub pass admin-
+       enforcement auditing with no proof its gates are non-bypassable,
+       and publish that as a fleet-wide all-clear.
+
+       Treating the repo as unreadable (infrastructure failure) instead.
+       Re-run with a token that can read repository rulesets in full.
+EOF
+      exit 2
+    fi
     THIS_BYPASS=$(echo "$DETAIL" | jq -r --arg rid "$rid" '
       .bypass_actors[]?
       | "ruleset \($rid): actor_type=\(.actor_type // "?") actor_id=\(.actor_id // "?") bypass_mode=\(.bypass_mode // "?")"

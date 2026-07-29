@@ -197,6 +197,21 @@ case "$path" in
         printf '%s\n' '[{"id":701,"target":"branch"}]'
         exit 0
         ;;
+      ruleset_bypass_actors_absent)
+        # Ruleset detail payload with NO `bypass_actors` key at all.
+        printf '%s\n' '[{"id":801,"target":"branch"}]'
+        exit 0
+        ;;
+      ruleset_bypass_actors_not_array)
+        # Ruleset detail payload whose `bypass_actors` is an object.
+        printf '%s\n' '[{"id":802,"target":"branch"}]'
+        exit 0
+        ;;
+      ruleset_default_branch_unreadable)
+        # ~DEFAULT_BRANCH ruleset on a repo whose metadata read fails.
+        printf '%s\n' '[{"id":901,"target":"branch"}]'
+        exit 0
+        ;;
       *)
         printf '%s\n' "[]"
         exit 0
@@ -204,8 +219,12 @@ case "$path" in
     esac
     ;;
   */rulesets/101)
-    # ~ALL include, canonical checks
-    printf '%s\n' '{"id":101,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    # ~ALL include, canonical checks. `bypass_actors` is present and
+    # EMPTY, which is what GET /repos/{o}/{r}/rulesets/{id} really
+    # returns for a ruleset nobody can bypass — the shape that is
+    # genuine proof of "no bypass". Distinct from ruleset 801 below,
+    # which omits the key entirely.
+    printf '%s\n' '{"id":101,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"bypass_actors":[],"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
     exit 0
     ;;
   */rulesets/102)
@@ -265,6 +284,31 @@ case "$path" in
     # Every canonical check listed, but enforcement is `evaluate` — the
     # ruleset reports rule outcomes and blocks nothing.
     printf '%s\n' '{"id":701,"target":"branch","enforcement":"evaluate","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/801)
+    # Every canonical check required and enforcement active, but the
+    # payload carries NO `bypass_actors` key. `.bypass_actors[]?` yields
+    # nothing here exactly as it does for a genuinely empty list, so an
+    # audit that counts rows cannot tell "nobody can bypass" apart from
+    # "the payload did not say" — and would publish the latter as the
+    # former.
+    printf '%s\n' '{"id":801,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/802)
+    # Same, but `bypass_actors` is an OBJECT rather than an array — the
+    # other shape `.bypass_actors[]?` swallows silently.
+    printf '%s\n' '{"id":802,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"bypass_actors":{"message":"unavailable"},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/901)
+    # The ONLY ruleset governing the repo, targeting ~DEFAULT_BRANCH and
+    # requiring every canonical check. Paired with a repo whose metadata
+    # read fails: if `~DEFAULT_BRANCH` silently resolves to "no match",
+    # this ruleset disappears and the audit reports the branch as
+    # completely unprotected.
+    printf '%s\n' '{"id":901,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"bypass_actors":[],"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
     exit 0
     ;;
   repos/*/*)
@@ -699,6 +743,142 @@ else
   pass "default-branch memo survives across matcher calls (one metadata read per repo)"
 fi
 
+# ---------------------------------------------------------------------------
+# Test 21: a ruleset detail payload with NO `bypass_actors` key is not
+#          proof of an empty bypass list. `.bypass_actors[]?` yields zero
+#          rows for an absent key exactly as it does for a genuinely empty
+#          array, so counting rows would let the hub PASS
+#          --require-admin-enforcement — and publish a fleet-wide
+#          all-clear — without ever seeing the list its verdict depends
+#          on. scripts/merge-clearance-gate.sh's enforcement probe rejects
+#          the same shape for the same reason.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_bypass_actors_absent --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "bypass_actors absent: exit $rc, expected 2 (unreadable, not proof of no bypass); output: $out"
+elif echo "$out" | grep -q "Admin enforcement: OK"; then
+  fail "bypass_actors absent: must NOT report admin enforcement OK on an unread list; output: $out"
+elif echo "$out" | grep -q "PASS:"; then
+  fail "bypass_actors absent: must NOT report PASS; output: $out"
+elif ! echo "$out" | grep -q "bypass_actors"; then
+  fail "bypass_actors absent: diagnostic must name the field; output: $out"
+else
+  pass "ruleset payload without a bypass_actors array: exits 2 (unknown), never a PASS"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 22: the other shape `.bypass_actors[]?` swallows — a non-array
+#          value — is classified the same way.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_bypass_actors_not_array --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "bypass_actors non-array: exit $rc, expected 2; output: $out"
+elif echo "$out" | grep -q "Admin enforcement: OK"; then
+  fail "bypass_actors non-array: must NOT report admin enforcement OK; output: $out"
+elif ! echo "$out" | grep -q "object"; then
+  fail "bypass_actors non-array: diagnostic should report the type it actually saw; output: $out"
+else
+  pass "ruleset payload with a non-array bypass_actors: exits 2 (unknown)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 23: the same unreadable payload WITHOUT --require-admin-enforcement
+#          is still a clean PASS. Consumers are not audited for admin
+#          enforcement (ADR 0002 requires it of the hub only), so a field
+#          the run never consults must not turn eight consumer audits red
+#          — the check has to be scoped to the mode that reads it.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_bypass_actors_absent 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "bypass_actors absent without the flag: exit $rc, expected 0; output: $out"
+elif echo "$out" | grep -q "bypass_actors"; then
+  fail "bypass_actors absent without the flag: must not report on a field it never reads; output: $out"
+else
+  pass "unreadable bypass_actors is only fatal when --require-admin-enforcement asks the question"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 24: a `~DEFAULT_BRANCH` ruleset on a repo whose metadata cannot be
+#          read, audited on a branch the main/master guess does not cover,
+#          is an infrastructure ERROR (exit 2) — never DRIFT. Returning
+#          "no match" drops the only ruleset protecting the repo and
+#          reports "no rulesets target trunk", i.e. files a failed
+#          metadata read in the weekly rollup issue as a protection gap.
+#          This is the shape the fleet loop produces when a child audit
+#          re-reads metadata its parent already resolved.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_DEFAULT_BRANCH_MAP="nathanjohnpayne/mergepath=fail" \
+        PATH="$STUB_DIR:$PATH" STUB_SCENARIO=ruleset_default_branch_unreadable \
+        bash "$SCRIPT" --repo nathanjohnpayne/mergepath --branch trunk 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "~DEFAULT_BRANCH unreadable on a non-main branch: exit $rc, expected 2 (infrastructure); output: $out"
+elif echo "$out" | grep -q "completely unprotected"; then
+  fail "~DEFAULT_BRANCH unreadable: must NOT report the branch unprotected on a failed metadata read; output: $out"
+elif ! echo "$out" | grep -q "unknown"; then
+  fail "~DEFAULT_BRANCH unreadable: diagnostic must say the answer is unknown; output: $out"
+else
+  pass "unresolvable ~DEFAULT_BRANCH on a non-main branch: exits 2, never a drift verdict"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 25: --default-branch supplies the fact instead, so the audit
+#          answers `~DEFAULT_BRANCH` correctly with the metadata read
+#          still failing — AND issues no metadata request at all. This is
+#          the seam --fleet uses: the parent resolved the branch once, so
+#          the child must not repeat (and can no longer be broken by) the
+#          lookup.
+# ---------------------------------------------------------------------------
+META_LOG_SEED="$WORKDIR/metadata-calls-seeded.txt"
+: >"$META_LOG_SEED"
+set +e
+out=$(STUB_DEFAULT_BRANCH_MAP="nathanjohnpayne/mergepath=fail" \
+        STUB_METADATA_LOG="$META_LOG_SEED" \
+        PATH="$STUB_DIR:$PATH" STUB_SCENARIO=ruleset_default_branch_unreadable \
+        bash "$SCRIPT" --repo nathanjohnpayne/mergepath --branch trunk \
+          --default-branch trunk 2>&1)
+rc=$?
+set -e
+seeded_calls=$(grep -c . "$META_LOG_SEED" 2>/dev/null || true)
+[ -n "$seeded_calls" ] || seeded_calls=0
+if [ "$rc" -ne 0 ]; then
+  fail "--default-branch seed: exit $rc, expected 0; output: $out"
+elif [ "$seeded_calls" -ne 0 ]; then
+  fail "--default-branch seed: made $seeded_calls metadata call(s), expected 0 (the fact was handed in)"
+elif ! echo "$out" | grep -q "PASS:"; then
+  fail "--default-branch seed: expected a PASS verdict; output: $out"
+else
+  pass "--default-branch seeds the fact: correct verdict with zero metadata reads"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 26: --default-branch is a per-repo fact --fleet computes itself, so
+#          passing it alongside --fleet is rejected rather than silently
+#          ignored.
+# ---------------------------------------------------------------------------
+set +e
+out=$(bash "$SCRIPT" --fleet --default-branch trunk 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "--fleet + --default-branch: exit $rc, expected 1; output: $out"
+elif ! echo "$out" | grep -q -- "--default-branch is a per-repo fact"; then
+  fail "--fleet + --default-branch: diagnostic missing; output: $out"
+else
+  pass "--fleet + --default-branch: rejected rather than silently ignored"
+fi
+
 # ===========================================================================
 # --fleet mode (#774)
 # ===========================================================================
@@ -725,6 +905,7 @@ fi
 
 FLEET_MANIFEST="$WORKDIR/fleet-manifest.yml"
 cat >"$FLEET_MANIFEST" <<'MANIFEST'
+version: 1
 consumers:
   - name: alpha
     repo: testowner/alpha
@@ -746,16 +927,18 @@ cat >"$FLEET_STUB" <<'STUB'
 repo=""
 branch=""
 admin_flag="no"
+default_branch="<unset>"
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) repo="$2"; shift 2 ;;
     --branch) branch="$2"; shift 2 ;;
+    --default-branch) default_branch="$2"; shift 2 ;;
     --require-admin-enforcement) admin_flag="yes"; shift ;;
     *) shift ;;
   esac
 done
 echo "stub-audit reached $repo"
-echo "stub-audit branch=$branch repo=$repo admin_enforcement=$admin_flag"
+echo "stub-audit branch=$branch repo=$repo admin_enforcement=$admin_flag default_branch=$default_branch"
 case "${FLEET_SCENARIO:-all_pass}" in
   all_pass) exit 0 ;;
   hub_drift)   case "$repo" in */hub)  exit 3 ;; *) exit 0 ;; esac ;;
@@ -1062,6 +1245,158 @@ elif ! echo "$out" | grep -q -- "--require-admin-enforcement is decided per repo
   fail "--fleet + --require-admin-enforcement: diagnostic missing; output: $out"
 else
   pass "--fleet + --require-admin-enforcement: rejected rather than silently ignored"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 14: the loop hands each child the default branch it already
+#                resolved. Without it every child repeats its parent's
+#                GET /repos/{owner}/{repo}, and a transient failure of that
+#                redundant lookup leaves `~DEFAULT_BRANCH` unresolvable on a
+#                repo whose default is neither main nor master — the child
+#                then counts no ruleset as governing the branch and returns
+#                DRIFT, filing an infrastructure failure in the rollup issue
+#                as a protection gap.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_DEFAULT_BRANCH_MAP="testowner/beta=trunk" run_fleet all_pass 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "fleet default-branch handoff: exit $rc, expected 0; output: $out"
+elif ! echo "$out" | grep -q "repo=testowner/beta admin_enforcement=no default_branch=trunk"; then
+  fail "fleet default-branch handoff: beta's child must receive --default-branch trunk; output: $out"
+elif ! echo "$out" | grep -q "repo=testowner/hub admin_enforcement=yes default_branch=main"; then
+  fail "fleet default-branch handoff: the hub's child must receive it too (alongside the admin flag); output: $out"
+else
+  pass "fleet hands each child the default branch it resolved (no redundant metadata read)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 15: with an explicit fleet-wide --branch the loop resolves no
+#                default branch at all, so it has no fact to hand down and
+#                must not invent one. Passing the PINNED branch as though
+#                it were the repo's default would make a `~DEFAULT_BRANCH`
+#                ruleset appear to govern `release/x` on every repo.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_DEFAULT_BRANCH_MAP="testowner/beta=trunk" \
+        run_fleet all_pass --branch main 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "fleet explicit --branch handoff: exit $rc, expected 0; output: $out"
+elif echo "$out" | grep -q "default_branch=main"; then
+  fail "fleet explicit --branch: must not pass the pinned branch as the repo's default; output: $out"
+elif ! echo "$out" | grep -q "repo=testowner/beta admin_enforcement=no default_branch=<unset>"; then
+  fail "fleet explicit --branch: child must be given no default-branch fact; output: $out"
+else
+  pass "fleet withholds --default-branch when --branch pinned the fleet (no invented fact)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 16: a manifest whose schema `version:` this reader does not
+#                support is a prerequisite failure (exit 1), not a fleet
+#                verdict. The manifest reserves version bumps for
+#                INCOMPATIBLE changes and requires readers to refuse
+#                unknown ones — an old auditor that still finds a parseable
+#                `.consumers[].repo` would otherwise audit a consumer list
+#                it no longer reads correctly and publish that partial run
+#                as a fleet-wide result. Both sibling readers
+#                (sync-to-downstream.sh, project-doc-sync.sh) already gate
+#                on this.
+# ---------------------------------------------------------------------------
+FLEET_MANIFEST_V2="$WORKDIR/fleet-manifest-v2.yml"
+cat >"$FLEET_MANIFEST_V2" <<'MANIFEST'
+version: 2
+consumers:
+  - name: alpha
+    repo: testowner/alpha
+MANIFEST
+set +e
+out=$(PATH="$STUB_DIR:$PATH" bash "$SCRIPT" --fleet \
+        --hub-repo testowner/hub \
+        --manifest "$FLEET_MANIFEST_V2" \
+        --audit-cmd "$FLEET_STUB" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "fleet unsupported manifest version: exit $rc, expected 1 (prerequisite); output: $out"
+elif echo "$out" | grep -q "stub-audit reached"; then
+  fail "fleet unsupported manifest version: must not audit anything from a manifest it cannot interpret; output: $out"
+elif ! echo "$out" | grep -q "version '2'"; then
+  fail "fleet unsupported manifest version: diagnostic must name the version it saw; output: $out"
+else
+  pass "fleet refuses an unsupported manifest schema version (exit 1, no verdict)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 17: a manifest with NO `version:` key is refused the same way.
+#                yq reads the absent key as `null`, which must not be
+#                waved through as "close enough to 1".
+# ---------------------------------------------------------------------------
+FLEET_MANIFEST_NOVER="$WORKDIR/fleet-manifest-noversion.yml"
+cat >"$FLEET_MANIFEST_NOVER" <<'MANIFEST'
+consumers:
+  - name: alpha
+    repo: testowner/alpha
+MANIFEST
+set +e
+out=$(PATH="$STUB_DIR:$PATH" bash "$SCRIPT" --fleet \
+        --hub-repo testowner/hub \
+        --manifest "$FLEET_MANIFEST_NOVER" \
+        --audit-cmd "$FLEET_STUB" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "fleet versionless manifest: exit $rc, expected 1; output: $out"
+elif echo "$out" | grep -q "stub-audit reached"; then
+  fail "fleet versionless manifest: must not audit anything; output: $out"
+else
+  pass "fleet refuses a manifest with no schema version at all"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 18: an unwritable --summary-file fails the run (exit 1) rather
+#                than returning a verdict with the summary missing. The
+#                workflow embeds that file VERBATIM in the rollup issue
+#                while truncating the verbose stdout, so a silent write
+#                failure publishes a rollup built from nothing — or from a
+#                stale file left by an earlier run. `set -e` cannot catch
+#                it: fleet_audit runs on the left of `||` to capture its
+#                status, which disables errexit for the whole function.
+# ---------------------------------------------------------------------------
+UNWRITABLE_SUMMARY="$WORKDIR/no-such-directory/fleet-summary.txt"
+set +e
+out=$(run_fleet one_drift --summary-file "$UNWRITABLE_SUMMARY" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "fleet unwritable --summary-file: exit $rc, expected 1 (prerequisite), not a verdict; output: $out"
+elif [ -e "$UNWRITABLE_SUMMARY" ]; then
+  fail "fleet unwritable --summary-file: the file must genuinely not exist for this test to mean anything"
+elif ! echo "$out" | grep -q "could not write the fleet summary"; then
+  fail "fleet unwritable --summary-file: diagnostic missing; output: $out"
+else
+  pass "fleet exits 1 when the summary file cannot be written (never a 0/3 with no summary)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 19: a STALE summary file from an earlier run is not left in
+#                place behind a verdict either — the failure is reported
+#                whether or not something is already at the path.
+# ---------------------------------------------------------------------------
+STALE_SUMMARY="$WORKDIR/stale-summary"
+mkdir -p "$STALE_SUMMARY"
+set +e
+out=$(run_fleet one_drift --summary-file "$STALE_SUMMARY" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "fleet summary path is a directory: exit $rc, expected 1; output: $out"
+elif ! echo "$out" | grep -q "could not write the fleet summary"; then
+  fail "fleet summary path is a directory: diagnostic missing; output: $out"
+else
+  pass "fleet exits 1 when the summary path is unwritable for any reason"
 fi
 
 # ---------------------------------------------------------------------------

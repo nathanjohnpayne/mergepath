@@ -58,7 +58,8 @@ name: Weekly branch-protection audit
 #
 # `--fleet` exit codes (see scripts/audit-branch-protection.sh header):
 #   0  clean — every audited repo requires all canonical checks
-#   1  usage error / missing prerequisite (yq, manifest, hub repo)
+#   1  usage error / missing prerequisite (yq, manifest, unsupported
+#      manifest schema version, hub repo, unwritable --summary-file)
 #   2  at least one repo could not be audited (auth/API) — infrastructure
 #   3  drift — at least one readable repo is missing a canonical check
 # Only 3 touches the rollup issue; only 0 closes it. 1 and 2 fail the job
