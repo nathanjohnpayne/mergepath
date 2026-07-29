@@ -24,6 +24,12 @@ name: Weekly branch-protection audit
 #      in place — not one issue per repo per run. On a clean audit it
 #      closes any open rollup issue.
 #
+#      The label is the dedupe key, but it is NOT allowed to gate the
+#      report: ensuring it is best-effort, and if it cannot be created the
+#      rollup issue is still opened (unlabelled) and the job fails
+#      afterwards. Reporting drift with a degraded dedupe key beats
+#      reporting nothing at all.
+#
 # Auth model — the trap this workflow is most likely to fall into:
 #   `GET /repos/{owner}/{repo}/branches/{branch}/protection` (and the
 #   rulesets fallback) requires the **`Administration:read`** scope. The
@@ -125,7 +131,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
+      # Every value below is written straight into a GitHub API field that
+      # has a documented limit, so each is kept here as a measurable YAML
+      # scalar rather than inline in a `run:` heredoc — that is what lets
+      # tests/test_audit_branch_protection_workflow.sh assert the exact
+      # bytes GitHub would receive:
+      #   TRACKING_LABEL              label name,        <= 50 characters
+      #   TRACKING_LABEL_COLOR        label color,       exactly 6 hex digits, no '#'
+      #   TRACKING_LABEL_DESCRIPTION  label description, <= 100 characters
+      #   ISSUE_TITLE                 issue title,       <= 256 characters
+      # An over-long description does not degrade — GitHub 422s the whole
+      # `POST /repos/{owner}/{repo}/labels` call, so the label is simply
+      # never created.
       TRACKING_LABEL: branch-protection-drift
+      TRACKING_LABEL_COLOR: D93F0B
+      TRACKING_LABEL_DESCRIPTION: 'Fleet repo does not require the canonical mergepath status checks (branch-protection-audit.yml)'
       ISSUE_TITLE: 'Fleet branch protection has drifted from the canonical required checks'
     steps:
       - name: Checkout mergepath
@@ -245,25 +265,55 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Ensure tracking label exists
+        id: label
         if: steps.audit.outputs.result == 'drift'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          set -euo pipefail
+          # Deliberately `set -uo pipefail` and NOT `set -e`. This step runs
+          # BEFORE the step that writes the rollup issue, and the issue is
+          # this workflow's whole deliverable — the label only exists so the
+          # NEXT run can find that issue again. Under `set -e` any label
+          # failure aborts the job here and the drift run reports nothing at
+          # all: no issue, no notification, drift signalled only by a red
+          # cron. That is the blind spot #774 exists to close, so the
+          # convenience must not be allowed to block the deliverable.
+          # Instead the outcome is published as steps.label.outputs.ready
+          # and the rollup step degrades loudly (see below) — the failure is
+          # annotated and still fails the job, just AFTER the report lands.
+          set -uo pipefail
+
+          ready=false
           # Idempotent: `gh label create` errors if the label already
           # exists, so check first. `--limit 500` overrides gh's default
           # 30-item cap — without it the existence check could miss an
-          # already-present label in a repo with >30 labels, fall into the
-          # create branch, and abort the drift path on "already exists".
+          # already-present label in a repo with >30 labels and fall into
+          # the create branch.
           if gh label list --repo "$REPO" --limit 500 --json name --jq '.[].name' | grep -qx "$TRACKING_LABEL"; then
             echo "Label '$TRACKING_LABEL' already exists."
+            ready=true
           else
             echo "Creating label '$TRACKING_LABEL'."
-            gh label create "$TRACKING_LABEL" --repo "$REPO" \
-              --color D93F0B \
-              --description "A repo in the fleet does not require the canonical mergepath status checks (branch-protection-audit.yml)"
+            if create_err="$(gh label create "$TRACKING_LABEL" --repo "$REPO" \
+                --color "$TRACKING_LABEL_COLOR" \
+                --description "$TRACKING_LABEL_DESCRIPTION" 2>&1)"; then
+              ready=true
+            elif printf '%s\n' "$create_err" | grep -qiE 'already exists|already been taken'; then
+              # Either the listing above failed outright (a failed pipeline
+              # is indistinguishable from an empty one at the `grep -qx`)
+              # or something created the label in between. Both mean the
+              # label is present and only the lookup was wrong.
+              echo "Label '$TRACKING_LABEL' is already present (create reported a duplicate)."
+              ready=true
+            else
+              printf '%s\n' "$create_err" >&2
+              echo "::warning::Could not create the '${TRACKING_LABEL}' label. The rollup issue will still be written, but it cannot be labelled — so the next run will not find it and will open a duplicate. The rollup step reports the drift first and then fails the job."
+            fi
           fi
+
+          echo "Tracking label ready: ${ready}"
+          echo "ready=${ready}" >> "$GITHUB_OUTPUT"
 
       - name: Open or update the rollup issue
         if: steps.audit.outputs.result == 'drift'
@@ -271,6 +321,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # 'true' only when the previous step proved the tracking label is
+          # present. Anything else (including an empty value, e.g. a step
+          # that never ran) is treated as "not present" — fail-safe for the
+          # report, not for the label.
+          LABEL_READY: ${{ steps.label.outputs.ready }}
         run: |
           set -euo pipefail
           today="$(date -u '+%Y-%m-%d')"
@@ -358,6 +413,9 @@ jobs:
           existing="$(gh issue list --repo "$REPO" --state open --limit 500 \
             --label "$TRACKING_LABEL" --json number --jq 'sort_by(.number) | .[0].number // ""')"
 
+          # An existing match was found BY LABEL, so on that path the label
+          # provably exists and LABEL_READY is not consulted.
+          label_degraded=0
           if [ -n "$existing" ]; then
             echo "Updating existing rollup issue #${existing}."
             gh issue edit "$existing" --repo "$REPO" \
@@ -366,12 +424,32 @@ jobs:
             gh issue comment "$existing" --repo "$REPO" \
               --body ":warning: Protection drift still present as of ${today} (UTC). Issue body refreshed — see [latest run](${RUN_URL})."
             echo "issue=${existing}" >> "$GITHUB_STEP_SUMMARY"
-          else
+          elif [ "${LABEL_READY:-false}" = "true" ]; then
             echo "No open rollup issue — opening one."
             gh issue create --repo "$REPO" \
               --title "${ISSUE_TITLE}" \
               --label "$TRACKING_LABEL" \
               --body-file issue-body.txt
+          else
+            # The label could not be ensured, so `gh issue create --label`
+            # would be rejected and take the entire report down with it.
+            # Report FIRST — unlabelled — then fail the job below. An
+            # unlabelled rollup is degraded (next week's lookup is by
+            # label, so it will not find this issue and will open a second
+            # one), but a drift run that reports NOTHING is strictly worse
+            # and is the exact failure mode this workflow exists to
+            # prevent.
+            echo "::error::Tracking label '${TRACKING_LABEL}' could not be ensured — opening the rollup issue WITHOUT it. Dedupe is degraded until the label exists: later runs will not find this issue and will open duplicates. Create the label by hand (Issues -> Labels) or fix the failure logged by the 'Ensure tracking label exists' step."
+            gh issue create --repo "$REPO" \
+              --title "${ISSUE_TITLE}" \
+              --body-file issue-body.txt
+            label_degraded=1
+          fi
+
+          if [ "$label_degraded" -eq 1 ]; then
+            echo "Fleet protection drift WAS reported, but the rollup issue is unlabelled." >&2
+            echo "Failing the job so a missing '${TRACKING_LABEL}' label is not silently tolerated." >&2
+            exit 1
           fi
 
       - name: Close stale rollup issue on a clean audit

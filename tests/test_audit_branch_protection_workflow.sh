@@ -145,6 +145,63 @@ else
   pass "audit step does not use the reviewer PAT"
 fi
 
+# ---------------------------------------------------------------------------
+# GitHub API field limits.
+#
+# Every value below is written verbatim into an API field with a documented
+# cap, and each cap is a hard 422 on the whole call rather than a silent
+# truncation — so an over-long literal does not degrade the object, it stops
+# the object being created. That is exactly how the tracking-label
+# description (104 characters against a 100-character cap) would have made
+# the FIRST drift run fail before it could report anything.
+#
+# Read as YAML scalars rather than scraped out of the `run:` bodies with a
+# regex: a regex that stops matching after an unrelated edit would silently
+# stop measuring anything, and the assertion would pass forever. Keeping the
+# values in `env:` is what makes them measurable.
+WF_LABEL_NAME="$(yq -r '.jobs.audit.env.TRACKING_LABEL' "$WORKFLOW")"
+WF_LABEL_COLOR="$(yq -r '.jobs.audit.env.TRACKING_LABEL_COLOR' "$WORKFLOW")"
+WF_LABEL_DESC="$(yq -r '.jobs.audit.env.TRACKING_LABEL_DESCRIPTION' "$WORKFLOW")"
+WF_ISSUE_TITLE="$(yq -r '.jobs.audit.env.ISSUE_TITLE' "$WORKFLOW")"
+
+for pair in "TRACKING_LABEL:$WF_LABEL_NAME" "TRACKING_LABEL_COLOR:$WF_LABEL_COLOR" \
+            "TRACKING_LABEL_DESCRIPTION:$WF_LABEL_DESC" "ISSUE_TITLE:$WF_ISSUE_TITLE"; do
+  key="${pair%%:*}"; val="${pair#*:}"
+  if [ -n "$val" ] && [ "$val" != "null" ]; then
+    continue
+  fi
+  fail "job env.$key is unset — the GitHub field-limit assertions below cannot measure a value that is not there (do not inline it in the step)"
+done
+
+# Label description: <= 100 characters.
+if [ "${#WF_LABEL_DESC}" -le 100 ] && [ "${#WF_LABEL_DESC}" -gt 0 ]; then
+  pass "tracking-label description is ${#WF_LABEL_DESC} chars (GitHub caps label descriptions at 100)"
+else
+  fail "tracking-label description is ${#WF_LABEL_DESC} chars — GitHub 422s a label description over 100, so the label is never created and the drift run reports nothing"
+fi
+
+# Label name: <= 50 characters.
+if [ "${#WF_LABEL_NAME}" -le 50 ]; then
+  pass "tracking-label name is ${#WF_LABEL_NAME} chars (GitHub caps label names at 50)"
+else
+  fail "tracking-label name is ${#WF_LABEL_NAME} chars — over GitHub's 50-character label-name cap"
+fi
+
+# Label color: exactly six hex digits, no leading '#'.
+if printf '%s' "$WF_LABEL_COLOR" | grep -qE '^[0-9a-fA-F]{6}$'; then
+  pass "tracking-label color '$WF_LABEL_COLOR' is a bare 6-digit hex value"
+else
+  fail "tracking-label color must be exactly 6 hex digits with no leading '#' — got '$WF_LABEL_COLOR'"
+fi
+
+# Issue title: <= 256 characters.
+if [ "${#WF_ISSUE_TITLE}" -le 256 ] && [ "${#WF_ISSUE_TITLE}" -gt 0 ]; then
+  pass "rollup issue title is ${#WF_ISSUE_TITLE} chars (GitHub caps issue titles at 256)"
+else
+  fail "rollup issue title is ${#WF_ISSUE_TITLE} chars — over GitHub's 256-character issue-title cap"
+fi
+
+# ---------------------------------------------------------------------------
 # Issue steps fire on the right verdicts and nothing else.
 drift_if="$(yq -r '.jobs.audit.steps[] | select(.name == "Open or update the rollup issue") | .if' "$WORKFLOW")"
 clean_if="$(yq -r '.jobs.audit.steps[] | select(.name == "Close stale rollup issue on a clean audit") | .if' "$WORKFLOW")"
@@ -284,24 +341,88 @@ GH_STUB_DIR="$WORKDIR/stub-bin"
 mkdir -p "$GH_STUB_DIR"
 cat >"$GH_STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
-# Records every invocation; `gh issue list` returns GH_STUB_EXISTING (or
-# an empty string, i.e. "no open rollup issue"), and fails outright when
-# GH_STUB_LIST_FAIL is set — the "GitHub unreachable / issues:read denied"
-# case, which must never be mistaken for "nothing is open".
+# Records every invocation and models the slice of `gh` this workflow
+# uses — INCLUDING the server-side validation GitHub applies, so a value
+# GitHub would reject is rejected here too rather than sailing through a
+# permissive stub.
+#
+#   gh issue list   returns GH_STUB_EXISTING (empty = "no open rollup
+#                   issue"); fails outright under GH_STUB_LIST_FAIL — the
+#                   "GitHub unreachable / issues:read denied" case, which
+#                   must never be mistaken for "nothing is open".
+#   gh label list   prints GH_STUB_LABELS one name per line, matching what
+#                   `--json name --jq '.[].name'` emits; fails under
+#                   GH_STUB_LABEL_LIST_FAIL.
+#   gh label create enforces GitHub's documented label limits and, like the
+#                   real command, refuses to overwrite an existing label
+#                   without --force. Errors go to stderr and exit 1, as
+#                   `gh label create` does (this is a high-level command,
+#                   not `gh api --jq`, which prints error BODIES to stdout).
 printf '%s\n' "gh $*" >> "$GH_CALL_LOG"
+
 if [ "${1:-}" = "issue" ] && [ "${2:-}" = "list" ]; then
   if [ -n "${GH_STUB_LIST_FAIL:-}" ]; then
     echo "gh: HTTP 503 Service Unavailable (stubbed)" >&2
     exit 1
   fi
   printf '%s' "${GH_STUB_EXISTING:-}"
+  exit 0
 fi
+
+if [ "${1:-}" = "label" ] && [ "${2:-}" = "list" ]; then
+  if [ -n "${GH_STUB_LABEL_LIST_FAIL:-}" ]; then
+    echo "gh: HTTP 503 Service Unavailable (stubbed)" >&2
+    exit 1
+  fi
+  [ -n "${GH_STUB_LABELS:-}" ] && printf '%s\n' "$GH_STUB_LABELS"
+  exit 0
+fi
+
+if [ "${1:-}" = "label" ] && [ "${2:-}" = "create" ]; then
+  name="${3:-}"
+  color=""
+  description=""
+  shift 3
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --color) color="$2"; shift 2 ;;
+      --description) description="$2"; shift 2 ;;
+      --repo) shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  # Refuses to clobber an existing label without --force, exactly as the
+  # real command does ("Create a new label on GitHub, or update an
+  # existing one with --force").
+  if printf '%s\n' "${GH_STUB_LABELS:-}" | grep -qx "$name"; then
+    echo "label with name \"$name\" already exists; use \`--force\` to update its color and description" >&2
+    exit 1
+  fi
+  # GitHub's documented caps on POST /repos/{owner}/{repo}/labels. Each is
+  # a hard 422 on the whole call — the label is not created at all.
+  if [ "${#name}" -gt 50 ]; then
+    echo "HTTP 422: Validation Failed (name is too long (maximum is 50 characters))" >&2
+    exit 1
+  fi
+  if [ "${#description}" -gt 100 ]; then
+    echo "HTTP 422: Validation Failed (description is too long (maximum is 100 characters))" >&2
+    exit 1
+  fi
+  if ! printf '%s' "$color" | grep -qE '^[0-9a-fA-F]{6}$'; then
+    echo "HTTP 422: Validation Failed (color is invalid: must be 6 hex digits without a leading '#')" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
 exit 0
 STUB
 chmod +x "$GH_STUB_DIR/gh"
 
-run_issue_step() {  # <audit-output file>
+run_issue_step() {  # <audit-output file> [label-ready: true|false|""]
   local output_src="$1"
+  local label_ready="${2-true}"
   ISSUE_WS="$WORKDIR/issue-ws"
   rm -rf "$ISSUE_WS"; mkdir -p "$ISSUE_WS"
   cp "$output_src" "$ISSUE_WS/audit-output.txt"
@@ -315,14 +436,19 @@ SUM
   GH_CALL_LOG="$ISSUE_WS/gh-calls.log"
   : > "$GH_CALL_LOG"
   ISSUE_RC=0
+  # The runner always defines GITHUB_STEP_SUMMARY; the step writes to it on
+  # the edit path, and under `set -u` an unset one would fail the step for a
+  # harness reason and mask the behaviour under test.
   ISSUE_TEXT="$(
     cd "$ISSUE_WS" && \
     PATH="$GH_STUB_DIR:$PATH" \
     GH_CALL_LOG="$GH_CALL_LOG" \
+    GITHUB_STEP_SUMMARY="$ISSUE_WS/step-summary.md" \
     GH_TOKEN="ghtoken" \
     REPO="owner/hub" \
     RUN_URL="https://example.invalid/run/1" \
     TRACKING_LABEL="branch-protection-drift" \
+    LABEL_READY="$label_ready" \
     ISSUE_TITLE="Fleet branch protection has drifted" \
       bash "$WORKDIR/issue-step.sh" 2>&1
   )" || ISSUE_RC=$?
@@ -402,6 +528,59 @@ else
   fail "issue body must state the ordering trap (a check must have run once before it can be required)"
 fi
 
+# The label is the dedupe key, and on the happy path the created issue must
+# carry it — otherwise next week's lookup opens a duplicate.
+run_issue_step "$WORKDIR/small-output.txt" "true"
+if [ "$ISSUE_RC" -ne 0 ]; then
+  fail "issue step failed with the label ready: $ISSUE_TEXT"
+elif grep -q -- "issue create .*--label branch-protection-drift" "$ISSUE_WS/gh-calls.log"; then
+  pass "label ready → the new rollup issue is created WITH the dedupe label"
+else
+  fail "a created rollup issue must carry the dedupe label; calls: $(cat "$ISSUE_WS/gh-calls.log")"
+fi
+
+# The load-bearing degradation: the label could NOT be ensured. The rollup
+# issue is this workflow's deliverable and the label is only how the next
+# run finds it, so the report must still be written — unlabelled — and the
+# job must then go red. Creating it WITH a label that does not exist would
+# be rejected by gh and lose the report entirely.
+run_issue_step "$WORKDIR/small-output.txt" "false"
+if [ "$ISSUE_RC" -eq 0 ]; then
+  fail "an unensured label must still fail the job after reporting, got rc=0"
+elif ! grep -q "issue create" "$ISSUE_WS/gh-calls.log"; then
+  fail "drift must be reported even when the label is missing — no issue was created; calls: $(cat "$ISSUE_WS/gh-calls.log")"
+elif grep -q -- "issue create .*--label" "$ISSUE_WS/gh-calls.log"; then
+  fail "with the label unensured the create must NOT pass --label (gh rejects an unknown label and the whole report is lost); calls: $(cat "$ISSUE_WS/gh-calls.log")"
+elif ! grep -q "short audit output line" "$ISSUE_BODY"; then
+  fail "the degraded path must still assemble a full issue body"
+elif ! echo "$ISSUE_TEXT" | grep -q "::error::"; then
+  fail "the degraded path must emit an ::error:: annotation, not degrade silently; got: $ISSUE_TEXT"
+else
+  pass "label unensured → drift is still reported (unlabelled), annotated, and the job then fails"
+fi
+
+# An UNSET LABEL_READY (e.g. the label step never ran) is treated as
+# "not ready", not as ready.
+run_issue_step "$WORKDIR/small-output.txt" ""
+if [ "$ISSUE_RC" -ne 0 ] && grep -q "issue create" "$ISSUE_WS/gh-calls.log" \
+   && ! grep -q -- "issue create .*--label" "$ISSUE_WS/gh-calls.log"; then
+  pass "empty LABEL_READY is treated as not-ready (reports, then fails)"
+else
+  fail "empty LABEL_READY must not be read as ready (rc=$ISSUE_RC calls: $(cat "$ISSUE_WS/gh-calls.log"))"
+fi
+
+# Finding an existing issue BY LABEL proves the label exists, so the edit
+# path must not inherit a stale not-ready verdict and fail a healthy run.
+GH_STUB_EXISTING="4242"
+export GH_STUB_EXISTING
+run_issue_step "$WORKDIR/small-output.txt" "false"
+unset GH_STUB_EXISTING
+if [ "$ISSUE_RC" -eq 0 ] && grep -q "issue edit 4242" "$ISSUE_WS/gh-calls.log"; then
+  pass "the edit path (issue found by label) succeeds regardless of LABEL_READY"
+else
+  fail "an existing labelled rollup issue proves the label exists; the edit path must not fail (rc=$ISSUE_RC calls: $(cat "$ISSUE_WS/gh-calls.log"))"
+fi
+
 # ===========================================================================
 # Layer 2c — behavioural: closing the rollup issue on a clean audit
 # ===========================================================================
@@ -474,6 +653,104 @@ elif echo "$CLOSE_CALLS" | grep -q "issue close"; then
   fail "a failing lookup must not close anything; calls: $CLOSE_CALLS"
 else
   pass "a failing rollup lookup fails the step instead of masquerading as an empty result"
+fi
+
+# ===========================================================================
+# Layer 2d — behavioural: ensuring the tracking label
+# ===========================================================================
+#
+# This step runs BEFORE the rollup issue is written, so anything it treats
+# as fatal is fatal to the whole report. The `gh` stub enforces GitHub's
+# real label validation, which means the workflow's OWN description literal
+# is measured against the 100-character cap by actually being submitted —
+# not just by counting it in Layer 1.
+
+step_run "Ensure tracking label exists" > "$WORKDIR/label-step.sh"
+
+run_label_step() {  # <description>  → LABEL_RC / LABEL_TEXT / LABEL_OUTPUTS / LABEL_CALLS
+  local desc="$1"
+  LABEL_WS="$WORKDIR/label-ws"
+  rm -rf "$LABEL_WS"; mkdir -p "$LABEL_WS"
+  GH_CALL_LOG="$LABEL_WS/gh-calls.log"
+  : > "$GH_CALL_LOG"
+  local outfile="$LABEL_WS/gh-output"
+  : > "$outfile"
+  LABEL_RC=0
+  LABEL_TEXT="$(
+    cd "$LABEL_WS" && \
+    PATH="$GH_STUB_DIR:$PATH" \
+    GH_CALL_LOG="$GH_CALL_LOG" \
+    GH_TOKEN="ghtoken" \
+    REPO="owner/hub" \
+    TRACKING_LABEL="$WF_LABEL_NAME" \
+    TRACKING_LABEL_COLOR="$WF_LABEL_COLOR" \
+    TRACKING_LABEL_DESCRIPTION="$desc" \
+    GITHUB_OUTPUT="$outfile" \
+      bash "$WORKDIR/label-step.sh" 2>&1
+  )" || LABEL_RC=$?
+  LABEL_OUTPUTS="$(cat "$outfile")"
+  LABEL_CALLS="$(cat "$GH_CALL_LOG")"
+}
+
+# The regression test for the 104-character description: submit the
+# workflow's own values to a stub that applies GitHub's validation. A
+# description over the cap is a 422 on the whole create call, so the label
+# is never created — and under the old `set -e` step that aborted the job
+# before the rollup issue could be written.
+run_label_step "$WF_LABEL_DESC"
+if [ "$LABEL_RC" -ne 0 ]; then
+  fail "creating the tracking label with the workflow's own values failed: $LABEL_TEXT"
+elif ! echo "$LABEL_OUTPUTS" | grep -qx "ready=true"; then
+  fail "the workflow's own label values were REJECTED by GitHub's validation — the label is never created. Output: $LABEL_TEXT"
+elif ! echo "$LABEL_CALLS" | grep -q "label create"; then
+  fail "expected a label create call; calls: $LABEL_CALLS"
+else
+  pass "the workflow's own label name/color/description pass GitHub's validation and yield ready=true"
+fi
+
+# Already present → no create attempt, still ready.
+GH_STUB_LABELS="$WF_LABEL_NAME"
+export GH_STUB_LABELS
+run_label_step "$WF_LABEL_DESC"
+unset GH_STUB_LABELS
+if [ "$LABEL_RC" -eq 0 ] && echo "$LABEL_OUTPUTS" | grep -qx "ready=true" \
+   && ! echo "$LABEL_CALLS" | grep -q "label create"; then
+  pass "existing label → ready=true with no create attempt"
+else
+  fail "an existing label must short-circuit the create (rc=$LABEL_RC outputs=[$LABEL_OUTPUTS] calls: $LABEL_CALLS)"
+fi
+
+# The listing fails while the label DOES exist. A failed `gh label list`
+# pipeline is indistinguishable from an empty one at the `grep -qx`, so the
+# step falls into the create branch and gets the real command's
+# "already exists" refusal — which is proof of presence, not a failure.
+GH_STUB_LABELS="$WF_LABEL_NAME"
+GH_STUB_LABEL_LIST_FAIL=1
+export GH_STUB_LABELS GH_STUB_LABEL_LIST_FAIL
+run_label_step "$WF_LABEL_DESC"
+unset GH_STUB_LABELS GH_STUB_LABEL_LIST_FAIL
+if [ "$LABEL_RC" -eq 0 ] && echo "$LABEL_OUTPUTS" | grep -qx "ready=true"; then
+  pass "a failed label listing + an 'already exists' create is still ready=true"
+else
+  fail "'already exists' means the label is present, not that ensuring it failed (rc=$LABEL_RC outputs=[$LABEL_OUTPUTS] text: $LABEL_TEXT)"
+fi
+
+# An unrecoverable create failure must NOT abort the job — the rollup issue
+# has not been written yet. Drive it with a description one character over
+# GitHub's cap, i.e. the exact defect this fix closes.
+overlong=""
+while [ "${#overlong}" -lt 101 ]; do overlong="${overlong}x"; done
+run_label_step "$overlong"
+if [ "$LABEL_RC" -ne 0 ]; then
+  fail "a label failure must not fail the step — the rollup issue has not been written yet (rc=$LABEL_RC, text: $LABEL_TEXT)"
+elif ! echo "$LABEL_OUTPUTS" | grep -qx "ready=false"; then
+  fail "an unrecoverable label failure must report ready=false so the rollup step degrades; outputs=[$LABEL_OUTPUTS]"
+elif ! echo "$LABEL_TEXT" | grep -q "::warning::"; then
+  fail "a label failure must be annotated, not swallowed; got: $LABEL_TEXT"
+elif ! echo "$LABEL_TEXT" | grep -qi "maximum is 100"; then
+  fail "the underlying gh/GitHub error must be surfaced in the log; got: $LABEL_TEXT"
+else
+  pass "an over-long description degrades to ready=false with a ::warning:: instead of killing the report"
 fi
 
 echo ""
