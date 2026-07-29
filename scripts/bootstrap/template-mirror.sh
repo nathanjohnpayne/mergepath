@@ -205,11 +205,11 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   # repo's own .coderabbit.yml posture in an "our value" column and a
   # fleet-wide author-seat sweep across consumers, so a verbatim copy
   # reads as if the new repo were the hub deciding fleet policy. It is
-  # also the only one of these four whose absence used to strand a
-  # relative link — REVIEW_POLICY.md now links it as an absolute hub URL
-  # (#780), so the exclusion leaves no dead reference behind. Existing
-  # consumers already lack it, except gaycruisebingo, which carries
-  # pre-exclusion residue.
+  # also the only entry in the machinery group listed below whose
+  # absence used to strand a relative link — REVIEW_POLICY.md now links
+  # it as an absolute hub URL (#780), so the exclusion leaves no dead
+  # reference behind. Existing consumers already lack it, except
+  # gaycruisebingo, which carries pre-exclusion residue.
   'docs/agents/bootstrap-runbook.md'
   'docs/agents/propagation-ordering.md'
   'docs/agents/templated-propagation.md'

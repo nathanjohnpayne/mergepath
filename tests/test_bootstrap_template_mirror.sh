@@ -606,19 +606,145 @@ fi
 # implementation, but nothing can verify a number written in prose. So
 # the convention is simply: never write one. Name the source of truth
 # (BOOTSTRAP_MIRROR_EXCLUDES, or the manifest's `class: hub-only`
-# entries) and let the enumeration guard do the rest. The pattern is
-# assembled from parts at runtime so this guard does not flag its own
-# source line.
-if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-  count_words='one|two|three|four|five|six|seven|eight|nine|ten'
-  count_subject='hub-only'
-  set +e
-  count_prose=$(git -C "$ROOT" grep -nIE "the ($count_words) $count_subject" -- .)
-  set -e
-  [ -z "$count_prose" ] \
-    && pass "no tracked file hard-codes a count of the hub-only doc set" \
-    || fail "hard-coded hub-only doc count(s) found — name BOOTSTRAP_MIRROR_EXCLUDES or the manifest's class: hub-only entries instead of a number:
-$count_prose"
+# entries) and let the enumeration guard do the rest.
+#
+# The scan must be WRAP-INSENSITIVE. Shell comments in
+# template-mirror.sh are hard-wrapped near 72 columns by local
+# convention, and the first cut of this guard was a single-line regex.
+# It caught the step-5b dispatch comment, where the stale claim happened
+# to fit on one line, and sailed straight past the identical claim in
+# the bootstrap::_scaffold_consumer_identity header, where the natural
+# wrap fell between "and the" and the count opening the next line — so
+# the guard was vacuous for one of the two comments it was written to
+# protect, and re-wording that header back would have reintroduced the
+# defect with CI fully green. Re-wrapping a comment must never change
+# what a guard sees, so each candidate file is flattened into
+# whitespace-normalised blocks first and the phrases are matched against
+# those.
+#
+# Neither pattern hard-codes the CURRENT size: a count is banned
+# whatever its value, because a stale number (three) has to fail just as
+# loudly as a fresh one (four). What IS derived is the region and the
+# file list — a fifth exclusion needs no edit here.
+#
+# Scope, stated plainly rather than implied: both patterns are
+# determiner-led. A BARE cardinal in front of the token — "two hub-only
+# docs cross-referencing each other" in tests/test_check_doc_ownership.sh
+# — is deliberately allowed, because that sentence counts a synthetic
+# two-doc fixture it defines two lines later, not this set, and banning
+# the shape would only teach the next author to reword around the guard.
+# Nor does either pattern read a count that trails its subject
+# ("the hub-only docs, all four of them"). What they do cover is the
+# shape every stale statement so far has taken: a determiner, a count,
+# and the subject, in that order, at any wrapping.
+
+# Scan $1 for the ERE in $2 over wrap-insensitive blocks. A block is a
+# maximal run of consecutive non-blank lines; each line is stripped of
+# leading whitespace and of a leading comment/list marker, its interior
+# whitespace is collapsed, and the lines are joined with single spaces —
+# so a phrase broken by a hard wrap still reads as one string. Every
+# match prints "<line>: <bounded snippet>", mapping the offset inside
+# the joined block back to the physical line the match starts on, so the
+# report stays as actionable as a plain `grep -n`. $3/$4 optionally
+# restrict the scan to a line range.
+mirror_scan_wrapped() {
+  awk -v pat="$2" -v from="${3:-1}" -v to="${4:-0}" '
+    function flush(   probe, pos, abs, i, ln, s) {
+      if (buf == "") return
+      # Prepend a space so a phrase at offset 1 still has a left
+      # boundary character: the patterns can then require a real
+      # non-word char rather than offering "^" as an alternative, which
+      # would match falsely when rescanning the tail after a hit.
+      probe = " " buf
+      pos = 1
+      while (match(substr(probe, pos), pat)) {
+        abs = pos + RSTART - 1
+        ln = start
+        for (i = 1; i <= n; i++) if (offs[i] <= abs) ln = lns[i]
+        s = abs - 40; if (s < 1) s = 1
+        print ln ": " substr(buf, s, RLENGTH + 80)
+        pos = abs + RLENGTH
+      }
+      buf = ""; n = 0
+    }
+    NR < from { next }
+    to > 0 && NR > to { flush(); exit }
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/^(#+|\/\/|\*|-|>)[[:space:]]*/, "", line)
+      gsub(/[[:space:]]+/, " ", line)
+      sub(/ $/, "", line)
+      if (line == "") { flush(); next }
+      if (buf == "") { start = NR; buf = line; n = 1; offs[1] = 1; lns[1] = NR }
+      else { n++; offs[n] = length(buf) + 2; lns[n] = NR; buf = buf " " line }
+    }
+    END { flush() }
+  ' "$1"
+}
+
+if ! command -v git >/dev/null 2>&1 \
+   || ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # Fail closed, like 4b2's empty-derivation branch and Case 37's empty
+  # alternation. This suite already requires git (assertion 6 asserts
+  # the bootstrapped target's initial commit), so a missing checkout is
+  # a broken environment rather than a supported mode — and a guard that
+  # silently skips is how a stale count gets back in unnoticed.
+  fail "assertion 4b3 cannot enumerate tracked files (git or a git checkout at $ROOT is unavailable), so the hard-coded-count scan would be blind — failing closed instead of skipping"
+elif [ ! -f "$MIRROR_LIB" ]; then
+  fail "assertion 4b3 cannot read $MIRROR_LIB — the array-scoped count scan is blind"
+else
+  # Vocabulary, assembled from parts at runtime so this guard does not
+  # match its own source text.
+  count_alt='one|two|three|four|five|six|seven|eight|nine|ten|10|[1-9]'
+  det_alt='the|these|those|all|its'
+
+  # (a) Repo-wide: a determiner + cardinal in front of the set's name
+  #     ("... and the <count> hub-only docs", "all <count> of the
+  #     hub-only docs"), in any wrapping. `hub-only` is the trailing
+  #     anchor, so `git grep -l` on that literal is a sound superset
+  #     pre-filter for the file list — a match cannot exist in a file
+  #     that never spells the token.
+  count_re="[^[:alnum:]_-](${det_alt})[[:space:]]+(${count_alt})[[:space:]]+(of[[:space:]]+(the[[:space:]]+)?)?hub-only"
+  count_files=$(git -C "$ROOT" grep -lI 'hub-only' -- . || true)
+  if [ -z "$count_files" ]; then
+    fail "assertion 4b3 found no tracked file containing the literal 'hub-only' — the anchor token moved and this scan is now blind"
+  else
+    count_prose=""
+    while IFS= read -r count_file; do
+      [ -n "$count_file" ] || continue
+      count_file_hits=$(mirror_scan_wrapped "$ROOT/$count_file" "$count_re" || true)
+      if [ -n "$count_file_hits" ]; then
+        count_prose="$count_prose
+$(printf '%s\n' "$count_file_hits" | sed -E "s|^|  $count_file:|")"
+      fi
+    done <<< "$count_files"
+    [ -z "$count_prose" ] \
+      && pass "no tracked file hard-codes a count of the hub-only doc set (wrap-insensitive)" \
+      || fail "hard-coded hub-only doc count(s) found — name BOOTSTRAP_MIRROR_EXCLUDES or the manifest's class: hub-only entries instead of a number:$count_prose"
+  fi
+
+  # (b) Array-scoped: inside BOOTSTRAP_MIRROR_EXCLUDES' own commentary a
+  #     demonstrative or definite article + cardinal states the size of
+  #     the array it sits in whatever noun follows, so (a)'s trailing
+  #     anchor never sees it — "the only one of these four whose absence
+  #     ..." named no set at all and shipped one line above the entries
+  #     it miscounted (#797 review). The extent scanned is DERIVED from
+  #     the array header and its closing paren, not a line range, and
+  #     the scan fails closed if either end cannot be located.
+  arr_start=$(awk '/^BOOTSTRAP_MIRROR_EXCLUDES=\(/ { print NR; exit }' "$MIRROR_LIB")
+  arr_end=$(awk -v s="${arr_start:-0}" 's > 0 && NR > s && /^\)/ { print NR; exit }' "$MIRROR_LIB")
+  if [ -z "$arr_start" ] || [ -z "$arr_end" ]; then
+    fail "could not locate the BOOTSTRAP_MIRROR_EXCLUDES body in $MIRROR_LIB (header=${arr_start:-?}, close=${arr_end:-?}) — assertion 4b3's array-scoped count scan is blind"
+  else
+    arr_count_re="[^[:alnum:]_-](the|these|those)[[:space:]]+(${count_alt})([^[:alnum:]_-]|$)"
+    arr_count_prose=$(mirror_scan_wrapped "$MIRROR_LIB" "$arr_count_re" "$arr_start" "$arr_end" \
+      | sed -E "s|^|  ${MIRROR_LIB#"$ROOT/"}:|" || true)
+    [ -z "$arr_count_prose" ] \
+      && pass "BOOTSTRAP_MIRROR_EXCLUDES' own commentary states no count of the set it lists" \
+      || fail "BOOTSTRAP_MIRROR_EXCLUDES' commentary hard-codes the size of the set it lists — refer to the entries below it instead of counting them:
+$arr_count_prose"
+  fi
 fi
 
 # --- assertion 4c: AGENTS.md packaging/Repository-Layout scrub (#744) ---
