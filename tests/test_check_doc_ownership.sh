@@ -57,6 +57,11 @@ run_with_fixture() {
 # 10 reads canonical docs looking for hub-only references, so an empty
 # file proves nothing.
 #
+# One row per line, so a body needing MULTIPLE lines (a reference-style
+# link definition, which must start its own line) writes them as literal
+# `\n` escapes — `printf '%b'` expands them. A raw newline inside a body
+# would be read as the next ROW and mis-parsed as a path.
+#
 # Args:
 #   $1 = manifest YAML content
 #   $2 = newline-separated "<repo-relative path>|<file content>" rows
@@ -71,7 +76,7 @@ run_with_doc_bodies() {
     [ -z "$row" ] && continue
     local p="${row%%|*}" body="${row#*|}"
     mkdir -p "$(dirname "$fix/$p")"
-    printf '%s\n' "$body" > "$fix/$p"
+    printf '%b\n' "$body" > "$fix/$p"
   done <<< "$doc_rows"
   MERGEPATH_MANIFEST_PATH="$fix/manifest.yml" MERGEPATH_REPO_ROOT="$fix" bash "$CHECK" 2>&1
 }
@@ -815,6 +820,109 @@ if [ "$rc" = "0" ]; then
   pass "Case 14c: hub-only doc referencing another hub-only doc passes (control)"
 else
   fail "Case 14c unexpected (rc=$rc): $out"
+fi
+
+# --- Case 14d: SIBLING-relative link spelling (check 10, pass b) -----
+# Canonical and hub-only docs are siblings under docs/agents/, so the
+# natural Markdown spelling carries no `docs/agents/` prefix at all. A
+# literal-substring search for the repo-relative path therefore reports
+# success on a link that 404s in every consumer. Check 10 resolves each
+# link target against the linking doc's own directory, so all three
+# sibling spellings — bare, `./`-prefixed, and a `../` round trip — are
+# caught. Regression for the #797 review finding.
+for spelling in 'hub.md' './hub.md' '../agents/hub.md'; do
+  set +e
+  out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+    "docs/agents/shared.md|Full procedure: [the audit]($spelling) § Wave audit.
+docs/agents/hub.md|# Hub-only machinery")
+  rc=$?
+  set -e
+  if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md' by a relative Markdown link"; then
+    pass "Case 14d: sibling-relative link '$spelling' to a hub-only doc fails closed"
+  else
+    fail "Case 14d ('$spelling') unexpected (rc=$rc): $out"
+  fi
+done
+
+# --- Case 14e: reference-style definition, same gap ------------------
+# `[label]: target` puts the target on its own line, well away from the
+# `[label]` use site; the resolved-target pass reads both link forms.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|Full procedure: [the audit] § Wave audit.\n\n[the audit]: hub.md "CodeRabbit audit"
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md' by a relative Markdown link"; then
+  pass "Case 14e: reference-style link definition to a hub-only doc fails closed"
+else
+  fail "Case 14e unexpected (rc=$rc): $out"
+fi
+
+# --- Case 14f: CONTROL — relative links that are NOT to hub-only -----
+# The resolved-target pass must not over-fire: a sibling link to another
+# CANONICAL doc travels fine, an anchor has no target file, and a
+# same-named file under a different directory is a different path.
+MANIFEST_TRUTH_TWO_CANON="$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    type: canonical
+    consumers: all
+  - path: docs/agents/other.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+  - path: docs/agents/other.md
+    class: canonical
+  - path: docs/agents/hub.md
+    class: hub-only
+"
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH_TWO_CANON" \
+  'docs/agents/shared.md|See [the sibling](other.md), [a section](#later), and [an unrelated file](sub/hub.md).
+docs/agents/other.md|# Another canonical doc
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 14f: canonical→canonical sibling links, anchors and same-name-different-dir pass (control)"
+else
+  fail "Case 14f unexpected (rc=$rc): $out"
+fi
+
+# --- Case 14g: CONTROL — absolute sibling-form link ------------------
+# The sanctioned escape stays sanctioned when written as a Markdown link
+# rather than a bare URL: pass (b) skips already-absolute targets, so it
+# must not double-report what pass (a) already exempts.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|See [the audit](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/hub.md) for the posture record.
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 14g: absolute github.com Markdown link to a hub-only doc passes (control)"
+else
+  fail "Case 14g unexpected (rc=$rc): $out"
+fi
+
+# --- Case 14h: one finding per pair, not one per spelling ------------
+# A doc that spells the same broken reference BOTH ways (literal path in
+# prose, sibling link in Markdown) is one defect; check 10 must report
+# it once so the diagnostic count tracks defects, not spellings.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|Full procedure: `docs/agents/hub.md`, also linked as [the audit](hub.md).
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+hits=$(echo "$out" | grep -c "references the hub-only doc 'docs/agents/hub.md'" || true)
+if [ "$rc" = "1" ] && [ "$hits" = "1" ]; then
+  pass "Case 14h: a doubly-spelled reference is reported exactly once"
+else
+  fail "Case 14h unexpected (rc=$rc, hits=$hits): $out"
 fi
 
 # --- Case 13: LIVE manifest — the real repo must be consistent ------

@@ -545,6 +545,41 @@ done
   && pass "ai_agent_tooling_standard.md kept in the consumer (Standard, not machinery)" \
   || fail "ai_agent_tooling_standard.md was wrongly excluded from the consumer"
 
+# --- assertion 4b2: the SPEC names every docs/agents/ exclusion ------
+# specs/bootstrap_consumer_identity.md is the ground-truth acceptance
+# criteria for this stage, and its preservation boundary reads
+# "everything not named above flows through the mirror untouched". A
+# docs/agents/ path added to BOOTSTRAP_MIRROR_EXCLUDES without a
+# matching spec bullet therefore makes the spec state the opposite of
+# what the code does — which is exactly what happened when
+# coderabbit-audit.md was added while the spec still said "the three
+# hub-only machinery docs" (#797 review). Read the exclude list from the
+# implementation rather than restating it: a second hard-coded copy is
+# the drift this guard exists to catch.
+SPEC_FILE="$ROOT/specs/bootstrap_consumer_identity.md"
+MIRROR_LIB="$ROOT/scripts/bootstrap/template-mirror.sh"
+if [ -f "$SPEC_FILE" ] && [ -f "$MIRROR_LIB" ]; then
+  spec_gap=""
+  excluded_docs=$(awk '
+    /^BOOTSTRAP_MIRROR_EXCLUDES=\(/ { inside = 1; next }
+    inside && /^\)/                 { inside = 0 }
+    inside                          { print }
+  ' "$MIRROR_LIB" \
+    | sed -E "s/^[[:space:]]+//; s/[[:space:]]+\$//; s/^'//; s/'\$//" \
+    | grep -E '^docs/agents/.+\.md$' || true)
+  if [ -z "$excluded_docs" ]; then
+    fail "could not read any docs/agents/ entry out of BOOTSTRAP_MIRROR_EXCLUDES — the array shape changed and this guard is now blind"
+  else
+    while IFS= read -r excluded; do
+      [ -n "$excluded" ] || continue
+      grep -qF -- "$excluded" "$SPEC_FILE" || spec_gap="$spec_gap $excluded"
+    done <<< "$excluded_docs"
+    [ -z "$spec_gap" ] \
+      && pass "specs/bootstrap_consumer_identity.md names every docs/agents/ mirror exclusion" \
+      || fail "BOOTSTRAP_MIRROR_EXCLUDES drops docs/agents docs the spec does not name (update the spec's acceptance criteria):$spec_gap"
+  fi
+fi
+
 # --- assertion 4c: AGENTS.md packaging/Repository-Layout scrub (#744) ---
 if [ -f "$TARGET/AGENTS.md" ]; then
   grep -q "placeholder package scaffolds that reserve" "$TARGET/AGENTS.md" \

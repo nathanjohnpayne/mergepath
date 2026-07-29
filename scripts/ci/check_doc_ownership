@@ -54,13 +54,17 @@
 #      per-repo-owned or hub-only here. The two declarations state the
 #      same governance fact and must not disagree.
 #  10. Consumer-truthfulness: a `canonical` doc must not reference a
-#      `hub-only` doc by repo-relative path. Canonical docs are mirrored
+#      `hub-only` doc by repo-relative path, in EITHER spelling — the
+#      literal full path anywhere in the text, or a Markdown link whose
+#      target resolves to it from that doc's own directory (the sibling
+#      forms `[x](hub-only.md)` / `[x](./hub-only.md)`, which contain no
+#      `docs/agents/` prefix to grep for). Canonical docs are mirrored
 #      verbatim; hub-only docs never travel. Such a reference is a link
 #      that resolves on the hub and 404s in all nine consumers — the
 #      #780 guardrail that a canonical doc may name only files
 #      guaranteed present downstream, enforced for the one case this
-#      inventory can actually see. An absolute URL on the same line
-#      (github.com/...) is accepted: it resolves from any repo.
+#      inventory can actually see. An absolute URL is accepted: it
+#      resolves from any repo.
 #
 # This check is read-only and does NOT contact downstream repos.
 
@@ -138,6 +142,73 @@ mp_path_is_unsafe() {
     *,*|*//*|*/.|*/./*) return 0 ;;
   esac
   return 1
+}
+
+# Emit every Markdown link/image target in a file, one per line, with
+# fragments, angle brackets and link titles stripped. Used by check 10:
+# a link's *target* is what a reader's browser resolves, and a target is
+# written relative to the document that carries it, so a raw grep for
+# the repo-relative path cannot see the sibling spellings that a doc in
+# the same directory naturally uses (`[x](coderabbit-audit.md)`).
+#
+# Covers both Markdown link forms:
+#   * inline        — `[label](target)`, `[label](<target>)`,
+#                     `[label](target "title")`, and the `!` image variant
+#   * reference def — `[label]: target "title"` at the start of a line
+#
+# Each grep carries its own `|| true`: the brace group is the left side
+# of a pipeline (so it runs in a subshell where `set -e` applies), and a
+# no-match exit 1 from the FIRST grep would otherwise abort the group
+# and silently discard the second grep's output.
+mp_doc_link_targets() {
+  local f="$1"
+  {
+    grep -oE '\]\([^)]*\)' "$f" || true
+    grep -oE '^[[:space:]]{0,3}\[[^]]+\]:[[:space:]]*[^[:space:]]+' "$f" || true
+  } | sed -E \
+        -e 's/^\]\(//' \
+        -e 's/\)$//' \
+        -e 's/^[[:space:]]*\[[^]]+\]:[[:space:]]*//' \
+    | awk '{ print $1 }' \
+    | sed -E -e 's/^<//' -e 's/>$//' -e 's/#.*$//' \
+    | grep -v '^[[:space:]]*$' || true
+}
+
+# Resolve a link target against the directory of the document carrying
+# it, collapsing '.' and '..' lexically, and print the repo-relative
+# result. A leading '/' is read as repo-root-absolute (that is how these
+# docs are written, and it is also what GitHub's blob view does for a
+# root-relative href within one repo). A target that climbs above the
+# repo root keeps its leading '..' segments, so it simply never equals a
+# declared doc path — which is the correct outcome, not a crash.
+mp_resolve_relative() {
+  local base="$1" target="$2" combined out="" seg rest
+  case "$target" in
+    /*) combined="${target#/}" ;;
+    *)
+      case "$base" in
+        ""|".") combined="$target" ;;
+        *)      combined="$base/$target" ;;
+      esac
+      ;;
+  esac
+  rest="$combined"
+  while [ -n "$rest" ]; do
+    seg="${rest%%/*}"
+    if [ "$seg" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+    case "$seg" in
+      ''|'.') continue ;;
+      '..')
+        case "$out" in
+          ''|'..'|*'/..') out="${out:+$out/}.." ;;
+          */*)            out="${out%/*}" ;;
+          *)              out="" ;;
+        esac
+        ;;
+      *) out="${out:+$out/}$seg" ;;
+    esac
+  done
+  printf '%s' "$out"
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -478,22 +549,66 @@ fi
 # escape hatch — `https://github.com/<org>/mergepath/blob/main/<path>`
 # resolves from any repo, which is exactly how REVIEW_POLICY.md links
 # the hub-only CodeRabbit audit.
+#
+# TWO passes, because one spelling of the same broken link is invisible
+# to the other:
+#
+#   (a) LITERAL — the full repo-relative path appears anywhere in the
+#       text (`see \`docs/agents/coderabbit-audit.md\``), link or prose.
+#       Line-scoped, so an absolute github.com URL on the same line
+#       exempts it: that URL *contains* the path as a substring, and a
+#       substring match cannot tell the two apart.
+#   (b) RESOLVED — every Markdown link target is resolved against the
+#       directory of the doc carrying it, then compared as a whole path.
+#       Canonical and hub-only docs are siblings under docs/agents/, so
+#       the natural spelling is `[audit](coderabbit-audit.md)` or
+#       `[audit](./coderabbit-audit.md)` — neither contains the string
+#       pass (a) looks for, so without this pass the broken link ships
+#       to all nine consumers unreported. Pass (b) needs no same-line
+#       URL exemption: it parses targets, and an `https://` target is
+#       skipped as already-absolute.
+#
+# A doc that trips both passes is reported once, naming the spelling
+# that was found first.
 if [ -n "$canonical_docs" ] && [ -n "$hub_only_docs" ]; then
   while IFS= read -r canon_doc; do
     [ -n "$canon_doc" ] || continue
     # Missing files were already reported by check 3b; skip rather than
     # emit a second, less specific failure for the same cause.
     [ -f "$REPO_ROOT/$canon_doc" ] || continue
+
+    # Resolve this doc's link targets ONCE, not once per hub-only doc.
+    canon_dir="${canon_doc%/*}"
+    [ "$canon_dir" = "$canon_doc" ] && canon_dir="."
+    resolved_targets=""
+    while IFS= read -r link_target; do
+      case "$link_target" in
+        # Empty, pure fragment, or already absolute (any scheme, plus
+        # protocol-relative `//host/...`) — nothing repo-relative to break.
+        ''|'#'*|*://*|mailto:*|//*) continue ;;
+      esac
+      resolved_targets="${resolved_targets}$(mp_resolve_relative "$canon_dir" "$link_target")"$'\n'
+    done <<< "$(mp_doc_link_targets "$REPO_ROOT/$canon_doc")"
+
     while IFS= read -r hub_doc; do
       [ -n "$hub_doc" ] || continue
+      spelling=""
+      # (a) literal path mention. `grep -v` (not -q) reads its input to
+      # completion: with `set -o pipefail`, an early-exiting `grep -q`
+      # could SIGPIPE the producer and turn a real hit into a silent pass.
       hits=$(grep -F -- "$hub_doc" "$REPO_ROOT/$canon_doc" || true)
-      [ -n "$hits" ] || continue
-      # `grep -v` (not -q) reads its input to completion: with `set -o
-      # pipefail`, an early-exiting `grep -q` could SIGPIPE the producer
-      # and turn a real hit into a silent pass.
-      bare=$(printf '%s\n' "$hits" | grep -vF 'github.com/' || true)
-      [ -n "$bare" ] || continue
-      echo "FAIL: canonical doc '$canon_doc' references the hub-only doc '$hub_doc' by repo-relative path — a canonical doc is mirrored verbatim to every consumer, a hub-only doc never travels, so that reference resolves on the hub and 404s downstream. Drop the reference, restate the content inline, or link it as an absolute https://github.com/... URL."
+      if [ -n "$hits" ]; then
+        bare=$(printf '%s\n' "$hits" | grep -vF 'github.com/' || true)
+        [ -n "$bare" ] && spelling="by repo-relative path"
+      fi
+      # (b) relative link target that resolves to it. Same `grep -q`
+      # caution as above — match with `-xF` and test the captured output.
+      if [ -z "$spelling" ] && [ -n "$resolved_targets" ]; then
+        resolved_hit=$(printf '%s' "$resolved_targets" | grep -xF -- "$hub_doc" || true)
+        [ -n "$resolved_hit" ] && spelling="by a relative Markdown link that resolves to it"
+      fi
+      [ -n "$spelling" ] || continue
+      echo "FAIL: canonical doc '$canon_doc' references the hub-only doc '$hub_doc' $spelling — a canonical doc is mirrored verbatim to every consumer, a hub-only doc never travels, so that reference resolves on the hub and 404s downstream. Drop the reference, restate the content inline, or link it as an absolute https://github.com/... URL."
       FAILED=1
     done <<< "$hub_only_docs"
   done <<< "$canonical_docs"
