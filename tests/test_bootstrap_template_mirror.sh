@@ -216,6 +216,10 @@ echo "# The AI Agent Tooling Standard" >"$FAKE_MP/ai_agent_tooling_standard.md"
 echo "# Bootstrap runbook (hub-only)" >"$FAKE_MP/docs/agents/bootstrap-runbook.md"
 echo "# Propagation ordering (hub-only)" >"$FAKE_MP/docs/agents/propagation-ordering.md"
 echo "# Templated propagation (hub-only)" >"$FAKE_MP/docs/agents/templated-propagation.md"
+# #780 class audit: the CodeRabbit config audit records the TEMPLATE
+# repo's own posture ("our value") and a fleet-wide seat sweep, so it is
+# hub-only machinery and must not land in a new repo either.
+echo "# CodeRabbit configuration audit (hub-only)" >"$FAKE_MP/docs/agents/coderabbit-audit.md"
 
 # --- excluded paths (must NOT propagate) ---
 echo "playground spec" >"$FAKE_MP/specs/mergepath_playground.md"
@@ -527,7 +531,8 @@ readme_residual=$(grep -i "mergepath" "$TARGET/README.md" 2>/dev/null \
 # --- assertion 4b: hub-only MACHINERY docs excluded (#744) ---
 hub_leak=""
 for d in docs/agents/bootstrap-runbook.md \
-         docs/agents/propagation-ordering.md docs/agents/templated-propagation.md; do
+         docs/agents/propagation-ordering.md docs/agents/templated-propagation.md \
+         docs/agents/coderabbit-audit.md; do
   [ -e "$TARGET/$d" ] && hub_leak="$hub_leak $d"
 done
 [ -z "$hub_leak" ] \

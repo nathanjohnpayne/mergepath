@@ -53,6 +53,29 @@ run_with_fixture() {
   MERGEPATH_MANIFEST_PATH="$fix/manifest.yml" MERGEPATH_REPO_ROOT="$fix" bash "$CHECK" 2>&1
 }
 
+# Same as run_with_fixture, but the fixture files carry CONTENT — check
+# 10 reads canonical docs looking for hub-only references, so an empty
+# file proves nothing.
+#
+# Args:
+#   $1 = manifest YAML content
+#   $2 = newline-separated "<repo-relative path>|<file content>" rows
+run_with_doc_bodies() {
+  local manifest_content="$1" doc_rows="$2"
+  local fix
+  fix="$(mktemp -d "$WORKDIR/fix.XXXXXX")"
+  printf '%s' "$manifest_content" > "$fix/manifest.yml"
+  mkdir -p "$fix/scripts"
+  : > "$fix/scripts/sync-to-downstream.sh"
+  while IFS= read -r row; do
+    [ -z "$row" ] && continue
+    local p="${row%%|*}" body="${row#*|}"
+    mkdir -p "$(dirname "$fix/$p")"
+    printf '%s\n' "$body" > "$fix/$p"
+  done <<< "$doc_rows"
+  MERGEPATH_MANIFEST_PATH="$fix/manifest.yml" MERGEPATH_REPO_ROOT="$fix" bash "$CHECK" 2>&1
+}
+
 # Same as run_with_fixture, but ALSO writes a stub scripts/ci/check_sync_manifest
 # carrying an IDENTITY_DOCS_DENYLIST array, so the check-9 drift guard has
 # something to read.
@@ -727,6 +750,71 @@ if [ "$rc" = "0" ]; then
   pass "Case 12b: denylisted doc classified per-repo-owned passes (control)"
 else
   fail "Case 12b unexpected (rc=$rc): $out"
+fi
+
+# --- Case 14: canonical doc links a HUB-ONLY doc (check 10) ---------
+# The #780 consumer-truthfulness guardrail: the canonical file is
+# mirrored verbatim into nine repos that will never receive the hub-only
+# file, so the link 404s everywhere but here.
+MANIFEST_TRUTH="$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+  - path: docs/agents/hub.md
+    class: hub-only
+"
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|Full procedure: `docs/agents/hub.md` § Wave audit.
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md'"; then
+  pass "Case 14: canonical doc referencing a hub-only doc fails closed (consumer-truthfulness)"
+else
+  fail "Case 14 unexpected (rc=$rc): $out"
+fi
+
+# --- Case 14b: CONTROL — same reference as an absolute hub URL ------
+# An absolute URL resolves from any repo, so it is the sanctioned way to
+# point at hub-only machinery (REVIEW_POLICY.md does exactly this).
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|See [the audit](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/hub.md).
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 14b: same reference as an absolute github.com URL passes (control)"
+else
+  fail "Case 14b unexpected (rc=$rc): $out"
+fi
+
+# --- Case 14c: CONTROL — hub-only doc may reference another ---------
+# Check 10 constrains the canonical class only; two hub-only docs
+# cross-referencing each other never leave the hub.
+MANIFEST_TRUTH_HUBHUB="$MIN_HEADER
+paths: []
+doc_ownership:
+  - path: docs/agents/hub.md
+    class: hub-only
+  - path: docs/agents/hub2.md
+    class: hub-only
+"
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH_HUBHUB" \
+  'docs/agents/hub.md|See `docs/agents/hub2.md`.
+docs/agents/hub2.md|# More hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 14c: hub-only doc referencing another hub-only doc passes (control)"
+else
+  fail "Case 14c unexpected (rc=$rc): $out"
 fi
 
 # --- Case 13: LIVE manifest — the real repo must be consistent ------

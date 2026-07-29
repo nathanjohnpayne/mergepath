@@ -53,6 +53,14 @@
 #      check_sync_manifest's IDENTITY_DOCS_DENYLIST must be classified
 #      per-repo-owned or hub-only here. The two declarations state the
 #      same governance fact and must not disagree.
+#  10. Consumer-truthfulness: a `canonical` doc must not reference a
+#      `hub-only` doc by repo-relative path. Canonical docs are mirrored
+#      verbatim; hub-only docs never travel. Such a reference is a link
+#      that resolves on the hub and 404s in all nine consumers — the
+#      #780 guardrail that a canonical doc may name only files
+#      guaranteed present downstream, enforced for the one case this
+#      inventory can actually see. An absolute URL on the same line
+#      (github.com/...) is accepted: it resolves from any repo.
 #
 # This check is read-only and does NOT contact downstream repos.
 
@@ -271,6 +279,11 @@ verbatim_hit() {
 # 2-4, 6-8: per-entry validation.
 # ─────────────────────────────────────────────────────────────────────
 declared=","
+# Newline-separated paths per class, collected only for entries that
+# survive validation above — check 10 must not reason about an entry the
+# loop already rejected.
+canonical_docs=""
+hub_only_docs=""
 if [ -n "$ownership_rows" ]; then
   while IFS= read -r ownership_row; do
     [ -z "$ownership_row" ] && continue
@@ -343,6 +356,11 @@ if [ -n "$ownership_rows" ]; then
         FAILED=1
       fi
     fi
+
+    case "$doc_class" in
+      canonical) canonical_docs="${canonical_docs}${norm_doc}"$'\n' ;;
+      hub-only)  hub_only_docs="${hub_only_docs}${norm_doc}"$'\n' ;;
+    esac
 
     # 7 / 8: class ↔ manifest consistency.
     if [ "$doc_class" = "canonical" ]; then
@@ -442,6 +460,43 @@ if [ -f "$SIBLING" ]; then
       fi
     done <<< "$denylist"
   fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# 10: consumer-truthfulness — no canonical → hub-only reference.
+# ─────────────────────────────────────────────────────────────────────
+#
+# A canonical doc is mirrored verbatim into every consumer; a hub-only
+# doc never travels. So a repo-relative reference from the former to the
+# latter is a link that works only where it was written and 404s in all
+# nine consumers — and nothing downstream would ever report it, because
+# the consumer has no manifest and no inventory to check against.
+#
+# Scope is deliberately narrow: it compares two classes this inventory
+# already declares, so there is nothing to keep in step and no guessing
+# about which OTHER hub files travel. A same-line absolute URL is the
+# escape hatch — `https://github.com/<org>/mergepath/blob/main/<path>`
+# resolves from any repo, which is exactly how REVIEW_POLICY.md links
+# the hub-only CodeRabbit audit.
+if [ -n "$canonical_docs" ] && [ -n "$hub_only_docs" ]; then
+  while IFS= read -r canon_doc; do
+    [ -n "$canon_doc" ] || continue
+    # Missing files were already reported by check 3b; skip rather than
+    # emit a second, less specific failure for the same cause.
+    [ -f "$REPO_ROOT/$canon_doc" ] || continue
+    while IFS= read -r hub_doc; do
+      [ -n "$hub_doc" ] || continue
+      hits=$(grep -F -- "$hub_doc" "$REPO_ROOT/$canon_doc" || true)
+      [ -n "$hits" ] || continue
+      # `grep -v` (not -q) reads its input to completion: with `set -o
+      # pipefail`, an early-exiting `grep -q` could SIGPIPE the producer
+      # and turn a real hit into a silent pass.
+      bare=$(printf '%s\n' "$hits" | grep -vF 'github.com/' || true)
+      [ -n "$bare" ] || continue
+      echo "FAIL: canonical doc '$canon_doc' references the hub-only doc '$hub_doc' by repo-relative path — a canonical doc is mirrored verbatim to every consumer, a hub-only doc never travels, so that reference resolves on the hub and 404s downstream. Drop the reference, restate the content inline, or link it as an absolute https://github.com/... URL."
+      FAILED=1
+    done <<< "$hub_only_docs"
+  done <<< "$canonical_docs"
 fi
 
 if [ "$FAILED" -ne 0 ]; then

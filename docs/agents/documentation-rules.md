@@ -48,9 +48,7 @@ The `canonical-sha256:` pin is optional but recommended: it records a prefix (12
 
 ## Prose line-wrapping
 
-Soft-wrap Markdown prose: write one physical line per paragraph and let the renderer wrap it. Do not hard-wrap prose at a fixed column (roughly 72 to 80 characters). GitHub-flavored Markdown collapses single newlines inside a paragraph to spaces, so fixed-column wrapping is invisible in the rendered output, is enforced by nothing, is applied inconsistently, and creates reflow churn on every edit.
-
-This governs intra-paragraph line breaks only. Leave tables, fenced or indented code, YAML front matter, link reference definitions, and list or block-quote structure exactly as written, so the rendered output is unchanged.
+The rule itself — soft-wrap prose, one physical line per paragraph, never a fixed 72-to-80-column hard wrap — is fleet-wide and lives in [`docs/agents/prose-line-wrapping.md`](prose-line-wrapping.md), the canonical file propagated to every repo. Read it there; it also carries the "never reflow someone else's file" list that applies everywhere. This section carries only what is specific to *this* repository: which paths are in scope, and how the rule is enforced here.
 
 Scope is an explicit allowlist of repo-owned prose, and it is fail-safe: any path not on the list is out of scope, so a future generated tree, vendored dependency, or new code area is never swept in until it is added on purpose. In scope: the repo-root docs, `docs/**`, `rules/**`, `plans/**`, `specs/**`, `packaging/**`, the `.github/` agent docs (`copilot-instructions.md`, `templates/`, `screenshots/`), and a few repo-owned component READMEs (`functions/`, `mergepath/`, `tests/`, `scripts/build/`, `bugs/screenshots/`), plus the entire `artifacts/` directory. Out of scope: generated mirrors (`docs/projects/*/prds/`, `docs/audits/data/`), propagated surfaces (`.github/pull_request_template.md`, `.github/ISSUE_TEMPLATE/`, and the `scripts/` kit READMEs), and fixtures. Do not reflow those; fix wrapping at their canonical source instead. The gate script `scripts/lint-md-prose-wrap.sh` is the executable form of this allowlist.
 

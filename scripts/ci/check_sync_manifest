@@ -245,6 +245,10 @@ valid_consumers=$(yq -r '.consumers[].name' "$MANIFEST" | tr '\n' ',')
 #    * Hub-only docs — describe machinery a consumer does not run
 #      (`sync-to-downstream.sh` / `.mergepath-sync.yml` aren't even
 #      present in a consumer). They must not be verbatim-mirrored either.
+#      coderabbit-audit.md joined them in #780's class audit: it records
+#      the TEMPLATE repo's own `.coderabbit.yml` posture and a fleet-wide
+#      seat sweep, so a verbatim copy reads as if the consumer were the
+#      hub.
 #
 #    The rule: none of these may appear as a `type: canonical` or
 #    `type: kit` entry — directly, via a remapped `dest:`, or by sitting
@@ -265,6 +269,7 @@ IDENTITY_DOCS_DENYLIST=(
   docs/agents/bootstrap-runbook.md
   docs/agents/propagation-ordering.md
   docs/agents/templated-propagation.md
+  docs/agents/coderabbit-audit.md
 )
 
 # Normalize a manifest path for the identity-denylist comparison (#743,

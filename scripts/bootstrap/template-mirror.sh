@@ -199,9 +199,21 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   #     substitute.sh. (The mixed doc .ai_context.md keeps its shared
   #     content and is fixed at the mergepath source, not here; the
   #     AGENTS.md packaging note is scrubbed in step 5b.)
+  #
+  # docs/agents/coderabbit-audit.md joined the machinery group in #780's
+  # class audit. It is not a shared convention: it records the TEMPLATE
+  # repo's own .coderabbit.yml posture in an "our value" column and a
+  # fleet-wide author-seat sweep across consumers, so a verbatim copy
+  # reads as if the new repo were the hub deciding fleet policy. It is
+  # also the only one of these four whose absence used to strand a
+  # relative link — REVIEW_POLICY.md now links it as an absolute hub URL
+  # (#780), so the exclusion leaves no dead reference behind. Existing
+  # consumers already lack it, except gaycruisebingo, which carries
+  # pre-exclusion residue.
   'docs/agents/bootstrap-runbook.md'
   'docs/agents/propagation-ordering.md'
   'docs/agents/templated-propagation.md'
+  'docs/agents/coderabbit-audit.md'
   'BRAND.md'
   'docs/agents/repository-overview.md'
 
