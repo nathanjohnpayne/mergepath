@@ -29,11 +29,16 @@
 #      corruption or an undeclared per-repo identity, and both are worth
 #      a failure. A key set to the EMPTY string counts: it does not fall
 #      back to the global value, it MASKS it, and `git var
-#      GIT_AUTHOR_IDENT` then fails with "empty ident name". The failure
-#      names each offender and prints the exact unset command for it, in
-#      the scope it is actually set in. Set
-#      MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 to opt out on a checkout that
-#      genuinely wants a per-repo identity.
+#      GIT_AUTHOR_IDENT` then fails with "empty ident name". The lookup
+#      passes --includes, because a scope-restricted read has includes
+#      OFF by default and an `include.path` that sets user.email is a
+#      local-scope override that every commit obeys. The failure names
+#      each offender and prints the exact unset command for it — aimed
+#      at the repository that was inspected (`git -C <repo>`, which is
+#      not necessarily the caller's cwd) and at the file that actually
+#      holds the value, which for an included value is that file rather
+#      than the parent config. Set MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1
+#      to opt out on a checkout that genuinely wants a per-repo identity.
 #
 #   B. Baseline comparison (`--snapshot`, then a later plain run).
 #      `--snapshot` copies .git/config to a scratch path inside the git
@@ -62,6 +67,13 @@
 #      on different lines, and each half alone matches nothing — so a
 #      line-at-a-time scan would wave through the precise write this
 #      check exists to reject.
+#
+#      Within a logical command the text is then cut at shell separators
+#      (`&&`, `||`, `;`, `|`) and each command is judged alone, because
+#      every predicate is a substring test and a line holding two
+#      commands would otherwise let one answer for the other: in
+#      `git -C "$fix" status && git config user.email leak@example.com`
+#      the `-C` belongs to the read, not to the write it precedes.
 #
 #      Markdown is IN scope on purpose. The #777 writer was not a test —
 #      it was REVIEW_POLICY.md § Git Identity Switching, which instructed
@@ -159,6 +171,40 @@ config_path() {
   printf '%s\n' "$common/config"
 }
 
+# Physical absolute form of a path, so two spellings of the same file
+# compare equal. `git config --show-origin` reports an origin the way the
+# lookup reached it — relative to the repository for a repo-local
+# include — while a scope's own file is derived from `rev-parse`. Without
+# normalising both, the comparison never matches and every ordinary
+# `--local` offender would be described as arriving through an include.
+canonical_path() {
+  local p="$1" d b
+  case "$p" in
+    /*) ;;
+    *) p="$REPO_ROOT/$p" ;;
+  esac
+  d="$(dirname -- "$p")"
+  b="$(basename -- "$p")"
+  ( cd "$d" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$b" ) \
+    || printf '%s\n' "$p"
+}
+
+# The file a given scope writes when it is named directly. Anything else
+# an `--includes` lookup reports is an include target, which `--unset-all
+# --<scope>` would NOT edit.
+scope_file() {
+  local gitdir
+  case "$1" in
+    local) config_path ;;
+    worktree)
+      gitdir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" \
+        || return 1
+      printf '%s\n' "$gitdir/config.worktree"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 if [ "$MODE" = "snapshot" ]; then
   if ! CFG="$(config_path)" || [ ! -f "$CFG" ]; then
     echo "check_git_identity_hygiene: SKIP (--snapshot: no git config at $REPO_ROOT)"
@@ -186,7 +232,8 @@ assert_no_local_identity() {
     return 0
   fi
 
-  local offenders="" remedies="" scope key v found scopes
+  local offenders="" remedies="" scope key line origin originfile value
+  local entry remedy scopefile scopes via_include=0
   # `--worktree` is a DISTINCT scope only when extensions.worktreeConfig
   # is enabled; with the extension off git treats it as an alias for
   # `--local`, so probing both would report every local setting twice and
@@ -199,45 +246,102 @@ assert_no_local_identity() {
     scopes="local worktree"
   fi
   for scope in $scopes; do
+    scopefile="$(canonical_path "$(scope_file "$scope")" 2>/dev/null || true)"
     for key in $IDENTITY_KEYS; do
+      # `--includes` is load-bearing. It defaults to OFF whenever a
+      # specific file is named — which `--local` and `--worktree` both
+      # do — so without it an `include.path` in .git/config pointing at a
+      # file that sets `user.email` reports NOTHING here, while ordinary
+      # lookup (and therefore `git var GIT_AUTHOR_IDENT`, and therefore
+      # every commit) uses the included value. That is the #777 leak
+      # wearing one extra layer, and it passed silently.
+      #
+      # `--show-origin` keeps the file each value actually came from, so
+      # the remediation edits THAT file. `--$scope --unset-all` does not
+      # reach into an include target: it would report an offender and
+      # hand over a command that clears nothing.
+      #
       # Absence is "no output": a missing key exits 1, and `--worktree`
       # errors out when extensions.worktreeConfig is unset. A key set to
       # the EMPTY string is a different thing entirely — it exits 0 and
-      # prints an empty line, and it is an override like any other: an
+      # prints an empty value, and it is an override like any other: an
       # empty repo-local user.email MASKS the global one, after which
       # `git var GIT_AUTHOR_IDENT` fails with "empty ident name". Reading
       # values off the command's stdout, rather than testing a captured
       # string for emptiness, keeps that case visible.
-      found=0
-      while IFS= read -r v; do
-        found=1
-        if [ -n "$v" ]; then
-          offenders+="  $scope: $key = $v"$'\n'
+      while IFS= read -r line; do
+        # `--show-origin` prints "<type>:<name><TAB><value>". A line with
+        # no tab means the format moved; keep the whole line as the value
+        # rather than silently splitting it in the wrong place.
+        if [ "$line" = "${line#*$'\t'}" ]; then
+          origin=""
+          value="$line"
         else
-          offenders+="  $scope: $key = (set to the empty string)"$'\n'
+          origin="${line%%$'\t'*}"
+          value="${line#*$'\t'}"
         fi
-      done < <(git -C "$REPO_ROOT" config "--$scope" --get-all "$key" 2>/dev/null)
-      [ "$found" -eq 1 ] || continue
-      # One unset command per key that is ACTUALLY set, in the scope it
-      # is actually set in. A fixed list would omit keys and name the
-      # wrong scope, leaving the operator to run commands that clear
-      # nothing and a check that fails again identically.
-      remedies+="    git config --$scope --unset-all $key"$'\n'
+        originfile=""
+        case "$origin" in
+          file:*) originfile="$(canonical_path "${origin#file:}")" ;;
+        esac
+
+        if [ -n "$value" ]; then
+          entry="  $scope: $key = $value"
+        else
+          entry="  $scope: $key = (set to the empty string)"
+        fi
+
+        # One unset command per offender that was ACTUALLY found, aimed
+        # at the repository this check inspected and at the file that
+        # holds the value. `$REPO_ROOT` is not necessarily the caller's
+        # current directory — the check runs by absolute path from other
+        # checkouts and MERGEPATH_GIT_IDENTITY_ROOT repoints it outright
+        # — so a bare `git config` in the remediation would edit whatever
+        # repository the operator happens to be standing in, clearing the
+        # key somewhere unrelated while the reported offender survives.
+        if [ -n "$originfile" ] && [ -n "$scopefile" ] \
+          && [ "$originfile" != "$scopefile" ]; then
+          entry+=" (via include: ${origin#file:})"
+          remedy="    git -C \"$REPO_ROOT\" config --file \"$originfile\" --unset-all $key"
+          via_include=1
+        else
+          remedy="    git -C \"$REPO_ROOT\" config --$scope --unset-all $key"
+        fi
+
+        offenders+="$entry"$'\n'
+        # A key can be set both directly and through an include, and the
+        # same include can supply several values; emit each distinct
+        # command once.
+        case $'\n'"$remedies" in
+          *$'\n'"$remedy"$'\n'*) ;;
+          *) remedies+="$remedy"$'\n' ;;
+        esac
+      done < <(git -C "$REPO_ROOT" config "--$scope" --includes --show-origin \
+                 --get-all "$key" 2>/dev/null)
     done
   done
   [ -n "$offenders" ] || return 0
 
-  local origin=""
+  local preamble="" include_note=""
   if [ "$phase" = "post-suite" ]; then
-    origin="These were NOT present before the regression suite ran, so the suite
+    preamble="These were NOT present before the regression suite ran, so the suite
 itself wrote them into this repository's config.
 
+"
+  fi
+  if [ "$via_include" -eq 1 ]; then
+    include_note="
+Values marked \`via include\` are reached through an \`include.path\` in
+this repository's config. A scope-level \`--unset-all\` does not edit an
+include target, which is why their command names the included file with
+\`--file\`. If that file is shared with other repositories, drop the
+\`include.path\` entry here instead of emptying the file they all read.
 "
   fi
   cat >&2 <<EOF
 check_git_identity_hygiene: FAIL (repo-local git identity override)
 
-${origin}This checkout's git config overrides the machine's global commit
+${preamble}This checkout's git config overrides the machine's global commit
 identity. Every worktree of this repository shares that config, so every
 commit made from any of them is attributed — and signed — under the
 override rather than the operator's real identity. This is the
@@ -249,7 +353,7 @@ $offenders
 Clear them (the values are not recoverable afterwards, so read them
 first if one was deliberate):
 
-$remedies
+$remedies${include_note}
 If this checkout genuinely wants a per-repo identity, set
 MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 for the check.
 EOF
@@ -381,12 +485,34 @@ else
       if (s ~ /--rename-section/) return 1
       return 0
     }
-    function offending(s) {
+    function offending_one(s) {
       if (!is_git_config(s)) return 0
       if (!writes_identity(s)) return 0
       if (targeted(s)) return 0
       if (not_a_write(s)) return 0
       return 1
+    }
+    # One logical line can hold SEVERAL commands: `a && b`, `a; b`,
+    # `a | b`. Every predicate above is a substring test, so judging the
+    # whole line lets one command answer for another. `git -C "$fixture"
+    # status && git config user.email leak@example.com` is a targeted
+    # read followed by an UNTARGETED write, and the `-C` waves the write
+    # through; `git config --get user.email; git config user.name leak`
+    # does the same via `--get`. Both are exactly the #777 shape with a
+    # harmless neighbour. So the text is cut at shell command separators
+    # and each command is judged on the flags it was actually given.
+    #
+    # The cut ignores quoting, which can only split a command that would
+    # otherwise be judged as one: a separator inside a quoted value
+    # leaves the `git config …` head in its own piece, still carrying its
+    # own flags. It never merges two commands into one, which is the
+    # direction that would hide a write.
+    function offending(s,   parts, n, i) {
+      gsub(/[&|;]/, "\034", s)
+      n = split(s, parts, "\034")
+      for (i = 1; i <= n; i++)
+        if (offending_one(parts[i])) return 1
+      return 0
     }
     # A backslash-continued line is HALF a command, and neither half
     # matches the patterns above: `git \` carries no `config`, and
