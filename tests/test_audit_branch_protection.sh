@@ -198,13 +198,41 @@ case "$path" in
         exit 0
         ;;
       ruleset_bypass_actors_absent)
-        # Ruleset detail payload with NO `bypass_actors` key at all.
+        # Ruleset detail payload that answers NEITHER bypass question.
         printf '%s\n' '[{"id":801,"target":"branch"}]'
         exit 0
         ;;
       ruleset_bypass_actors_not_array)
-        # Ruleset detail payload whose `bypass_actors` is an object.
+        # Ruleset detail payload whose `bypass_actors` is an object and
+        # which carries no `current_user_can_bypass` either.
         printf '%s\n' '[{"id":802,"target":"branch"}]'
+        exit 0
+        ;;
+      ruleset_readonly_clean)
+        # The shape a READ-ONLY token actually gets from GitHub.
+        printf '%s\n' '[{"id":1001,"target":"branch"}]'
+        exit 0
+        ;;
+      ruleset_readonly_bypass_always)
+        printf '%s\n' '[{"id":1002,"target":"branch"}]'
+        exit 0
+        ;;
+      ruleset_readonly_bypass_prs_only)
+        printf '%s\n' '[{"id":1003,"target":"branch"}]'
+        exit 0
+        ;;
+      ruleset_write_scope_other_actor)
+        # Write-access shape: the full list names a TEAM that is not the
+        # auditing identity, so `current_user_can_bypass` says "never"
+        # while the gate is in fact skippable.
+        printf '%s\n' '[{"id":1004,"target":"branch"}]'
+        exit 0
+        ;;
+      ruleset_readonly_two)
+        # Two rulesets, both withholding `bypass_actors`. "Is the
+        # auditing identity an admin" is a per-repo constant, so the
+        # admin probe must be issued ONCE for both.
+        printf '%s\n' '[{"id":1005,"target":"branch"},{"id":1006,"target":"branch"}]'
         exit 0
         ;;
       ruleset_default_branch_unreadable)
@@ -287,19 +315,60 @@ case "$path" in
     exit 0
     ;;
   */rulesets/801)
-    # Every canonical check required and enforcement active, but the
-    # payload carries NO `bypass_actors` key. `.bypass_actors[]?` yields
-    # nothing here exactly as it does for a genuinely empty list, so an
-    # audit that counts rows cannot tell "nobody can bypass" apart from
-    # "the payload did not say" — and would publish the latter as the
-    # former.
+    # Answers NEITHER bypass question: no `bypass_actors` key AND no
+    # `current_user_can_bypass`. `.bypass_actors[]?` yields nothing here
+    # exactly as it does for a genuinely empty list, so an audit that
+    # counts rows cannot tell "nobody can bypass" apart from "the payload
+    # did not say" — and would publish the latter as the former. Real
+    # GitHub always sends `current_user_can_bypass` on this endpoint, so
+    # this is a deliberately DEGENERATE payload: it exists to pin the
+    # doctrine that an unanswerable payload exits 2 rather than passing.
     printf '%s\n' '{"id":801,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
     exit 0
     ;;
   */rulesets/802)
     # Same, but `bypass_actors` is an OBJECT rather than an array — the
-    # other shape `.bypass_actors[]?` swallows silently.
+    # other shape `.bypass_actors[]?` swallows silently. Also degenerate:
+    # no `current_user_can_bypass` to fall back to.
     printf '%s\n' '{"id":802,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"bypass_actors":{"message":"unavailable"},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/1001|*/rulesets/1005|*/rulesets/1006)
+    # THE SHAPE A READ-ONLY TOKEN ACTUALLY GETS. GitHub returns
+    # `bypass_actors` only to a caller with write access to the ruleset,
+    # so a correctly provisioned `Administration:read` audit token never
+    # sees the key — but DOES see `current_user_can_bypass`.
+    #
+    # Captured from live GET /repos/{o}/{r}/rulesets/{id} under a token
+    # with no write access to the ruleset (cli/cli 4898070,
+    # home-assistant/core 6332198, github/docs 8039397,
+    # vercel/next.js 15412430): HTTP 200, full rules/conditions/
+    # enforcement, `current_user_can_bypass` present, `bypass_actors`
+    # absent — on Repository-, Organization- AND Enterprise-sourced
+    # rulesets alike.
+    printf '%s\n' '{"id":'"${path##*/}"',"target":"branch","source_type":"Repository","enforcement":"active","current_user_can_bypass":"never","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/1002)
+    # Read-only shape, but the auditing admin CAN bypass outright.
+    printf '%s\n' '{"id":1002,"target":"branch","source_type":"Repository","enforcement":"active","current_user_can_bypass":"always","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/1003)
+    # Read-only shape, bypass limited to pull requests. #427/#428 were
+    # both admin merges OF PULL REQUESTS, so this is the escape ADR 0002
+    # exists to stop — it must count as bypassed, not as a lesser state.
+    printf '%s\n' '{"id":1003,"target":"branch","source_type":"Repository","enforcement":"active","current_user_can_bypass":"pull_requests_only","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/1004)
+    # WRITE-ACCESS shape: both fields present, and they disagree. A team
+    # holds a bypass while the auditing identity does not, so
+    # `current_user_can_bypass: never` is true and yet the gate is
+    # skippable. The authoritative list must win over the narrower
+    # signal — otherwise adding the read-only fallback would have made
+    # the audit BLINDER for the tokens that can see the most.
+    printf '%s\n' '{"id":1004,"target":"branch","source_type":"Repository","enforcement":"active","current_user_can_bypass":"never","bypass_actors":[{"actor_id":7,"actor_type":"Team","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
     exit 0
     ;;
   */rulesets/901)
@@ -312,9 +381,47 @@ case "$path" in
     exit 0
     ;;
   repos/*/*)
-    # Repository metadata — the audit reads .default_branch from here,
-    # both to resolve `~DEFAULT_BRANCH` ruleset conditions and (in
-    # --fleet) to pick each repo's audited branch.
+    # Repository metadata. The audit reads TWO different fields from this
+    # one endpoint with two different `--jq` expressions, so the stub
+    # dispatches on the expression the way real gh does — otherwise the
+    # `.permissions.admin` probe would be answered with a branch name.
+    #
+    #   .default_branch    — resolves `~DEFAULT_BRANCH` ruleset conditions
+    #                        and (in --fleet) each repo's audited branch
+    #   .permissions.admin — is the auditing identity a repo admin? Read
+    #                        only by the read-only admin-bypass fallback
+    #
+    # `.permissions` is the AUTHENTICATED USER's permission set, which is
+    # why a read-only audit can ask it at all; a real payload returns
+    # `{"admin":false,...}` for a non-admin rather than omitting it.
+    # Verified against live gh on this machine:
+    #   author PAT   → {"admin":true,...}
+    #   reviewer PAT → {"admin":false,...}
+    jq_expr=""
+    prev=""
+    for a in "${args[@]}"; do
+      if [ "$prev" = "--jq" ]; then jq_expr="$a"; fi
+      prev="$a"
+    done
+    if [ "$jq_expr" = ".permissions.admin" ]; then
+      if [ -n "${STUB_ADMIN_LOG:-}" ]; then
+        printf '%s\n' "$path" >>"$STUB_ADMIN_LOG"
+      fi
+      # `fail` reproduces gh's real failure shape (error body on STDOUT,
+      # message on STDERR, rc=1) so the resolver's status check is what
+      # makes the "unreadable" tests non-vacuous, not an empty string.
+      case "${STUB_ADMIN_PERMISSION:-true}" in
+        fail)
+          printf '%s\n' '{"message":"Not Found","status":"404"}'
+          echo 'gh: Not Found (HTTP 404)' >&2
+          exit 1
+          ;;
+        *)
+          printf '%s\n' "${STUB_ADMIN_PERMISSION:-true}"
+          exit 0
+          ;;
+      esac
+    fi
     #
     # Every metadata read is logged when STUB_METADATA_LOG is set, so a
     # test can assert the single-repo audit resolves the default branch
@@ -828,6 +935,170 @@ elif echo "$out" | grep -q "bypass_actors"; then
   fail "bypass_actors absent without the flag: must not report on a field it never reads; output: $out"
 else
   pass "unreadable bypass_actors is only fatal when --require-admin-enforcement asks the question"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 23a: THE REGRESSION. GitHub returns `bypass_actors` only to a caller
+#           with write access to the ruleset, so the read-only
+#           `Administration:read` token this audit is provisioned with never
+#           receives it — while `current_user_can_bypass` IS returned.
+#           Requiring the list therefore made the hub ruleset path exit 2
+#           on every run: never clean, never drift, indistinguishable from a
+#           broken audit. A confirmed repository admin who cannot bypass is
+#           the ADR 0002 posture and must PASS.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_ADMIN_PERMISSION=true \
+        run_audit ruleset_readonly_clean --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "read-only clean ruleset: exit $rc, expected 0 — a read-only token must be able to reach a verdict; output: $out"
+elif ! echo "$out" | grep -q "Admin enforcement: OK"; then
+  fail "read-only clean ruleset: expected an explicit admin-enforcement OK line; output: $out"
+elif ! echo "$out" | grep -q "current_user_can_bypass"; then
+  fail "read-only clean ruleset: the OK line must disclose which signal it rests on; output: $out"
+elif ! echo "$out" | grep -q "PASS:"; then
+  fail "read-only clean ruleset: expected an overall PASS; output: $out"
+else
+  pass "read-only token (bypass_actors withheld, current_user_can_bypass=never) reaches a clean verdict"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 23b: same read-only shape, but the confirmed admin CAN bypass. That
+#           is drift (exit 3) — the fallback must be able to fail, not just
+#           to pass, or it is a rubber stamp.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_ADMIN_PERMISSION=true \
+        run_audit ruleset_readonly_bypass_always --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "read-only admin bypass: exit $rc, expected 3 (drift); output: $out"
+elif echo "$out" | grep -q "Admin enforcement: OK"; then
+  fail "read-only admin bypass: must NOT report admin enforcement OK; output: $out"
+elif ! echo "$out" | grep -q "current_user_can_bypass=always"; then
+  fail "read-only admin bypass: diagnostic must name the signal and value; output: $out"
+else
+  pass "read-only token: current_user_can_bypass=always is reported as drift"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 23c: `pull_requests_only` is a bypass too. The two escapes that
+#           motivated the merge-clearance gate (#427/#428) were both admin
+#           merges of pull requests, so treating this as anything short of
+#           bypassed would miss exactly the case ADR 0002 exists for.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_ADMIN_PERMISSION=true \
+        run_audit ruleset_readonly_bypass_prs_only --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "read-only pull_requests_only: exit $rc, expected 3 (drift); output: $out"
+elif ! echo "$out" | grep -q "current_user_can_bypass=pull_requests_only"; then
+  fail "read-only pull_requests_only: diagnostic must name the value; output: $out"
+else
+  pass "read-only token: current_user_can_bypass=pull_requests_only counts as a bypass"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 23d: `current_user_can_bypass` describes the AUDITING IDENTITY, not
+#           the bypass list, so it is evidence about admins only when that
+#           identity is an admin. A non-admin reports "never" whether or not
+#           admins can bypass — accepting it would turn "we could not tell"
+#           into an all-clear, which is the exact conflation this audit
+#           refuses everywhere else.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_ADMIN_PERMISSION=false \
+        run_audit ruleset_readonly_clean --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "read-only non-admin identity: exit $rc, expected 2 (cannot conclude); output: $out"
+elif echo "$out" | grep -q "Admin enforcement: OK"; then
+  fail "read-only non-admin identity: must NOT report admin enforcement OK; output: $out"
+elif echo "$out" | grep -q "PASS:"; then
+  fail "read-only non-admin identity: must NOT report PASS; output: $out"
+elif ! echo "$out" | grep -q "permissions.admin"; then
+  fail "read-only non-admin identity: diagnostic must say what it could not establish; output: $out"
+else
+  pass "current_user_can_bypass from a NON-admin identity exits 2, never a clean verdict"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 23e: an admin probe that fails outright is the same "unknown". gh
+#           writes the HTTP error body to STDOUT on failure, so a
+#           status-blind resolver would compare a JSON blob against "true",
+#           land in the not-admin branch, and still exit 2 — for the wrong
+#           reason. The diagnostic has to distinguish unreadable from
+#           confirmed-non-admin.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_ADMIN_PERMISSION=fail \
+        run_audit ruleset_readonly_clean --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "read-only admin probe failure: exit $rc, expected 2; output: $out"
+elif echo "$out" | grep -q "PASS:"; then
+  fail "read-only admin probe failure: must NOT report PASS; output: $out"
+elif ! echo "$out" | grep -q "permissions.admin"; then
+  fail "read-only admin probe failure: diagnostic must name the probe that failed; output: $out"
+elif ! echo "$out" | grep -q "'unreadable'"; then
+  fail "read-only admin probe failure: must report the permission as unreadable, not as 'false'; output: $out"
+else
+  pass "an unreadable .permissions.admin exits 2 and is distinguished from a confirmed non-admin"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 23f: where BOTH fields are returned (a write-scoped token), the
+#           authoritative list wins. A team holds a bypass the auditing
+#           identity does not, so `current_user_can_bypass` says "never"
+#           while the gate is genuinely skippable. Preferring the narrower
+#           signal would have made the audit blinder for the tokens that
+#           can see the most.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_ADMIN_PERMISSION=true \
+        run_audit ruleset_write_scope_other_actor --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "write-scope disagreeing signals: exit $rc, expected 3 — bypass_actors must win; output: $out"
+elif echo "$out" | grep -q "Admin enforcement: OK"; then
+  fail "write-scope disagreeing signals: must NOT report admin enforcement OK; output: $out"
+elif ! echo "$out" | grep -q "actor_type=Team"; then
+  fail "write-scope disagreeing signals: must report the actual bypass actor; output: $out"
+elif echo "$out" | grep -q "current_user_can_bypass"; then
+  fail "write-scope disagreeing signals: must not fall back when the full list was returned; output: $out"
+else
+  pass "bypass_actors outranks current_user_can_bypass when GitHub returns both"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 23g: "is the auditing identity an admin" is a per-repo constant, so
+#           the probe is memoised. Without the memo the answer is recomputed
+#           once per ruleset, and a transient failure on a later call would
+#           downgrade an already-established admin standing into exit 2.
+#           Same subshell trap as resolve_repo_default_branch.
+# ---------------------------------------------------------------------------
+ADMIN_LOG="$WORKDIR/admin-reads.log"
+: >"$ADMIN_LOG"
+set +e
+out=$(STUB_ADMIN_PERMISSION=true STUB_ADMIN_LOG="$ADMIN_LOG" \
+        run_audit ruleset_readonly_two --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+admin_reads=$(wc -l <"$ADMIN_LOG" | tr -d ' ')
+if [ "$rc" -ne 0 ]; then
+  fail "two read-only rulesets: exit $rc, expected 0; output: $out"
+elif [ "$admin_reads" -ne 1 ]; then
+  fail "two read-only rulesets: .permissions.admin read $admin_reads times, expected exactly 1 (memoised)"
+else
+  pass "the .permissions.admin probe is memoised across rulesets (1 read for 2 rulesets)"
 fi
 
 # ---------------------------------------------------------------------------

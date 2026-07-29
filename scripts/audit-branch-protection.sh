@@ -80,10 +80,11 @@
 #   `~DEFAULT_BRANCH` condition on a repo whose metadata cannot be read,
 #   audited on a branch the historical main/master guess does not cover,
 #   exits 2 rather than dropping the ruleset (which would report the
-#   branch as unprotected). Likewise a ruleset detail payload with no
-#   readable `bypass_actors` ARRAY exits 2 under
-#   `--require-admin-enforcement` rather than counting an absent or
-#   non-array field as an empty bypass list.
+#   branch as unprotected). Likewise a ruleset detail payload that
+#   answers neither `bypass_actors` (as an ARRAY) nor
+#   `current_user_can_bypass` (as a recognised value, from a confirmed
+#   repository admin) exits 2 under `--require-admin-enforcement` rather
+#   than counting an absent or non-array field as an empty bypass list.
 #
 # Ruleset enforcement:
 #   On the ruleset fallback path, only rulesets whose `enforcement` is
@@ -93,7 +94,21 @@
 #   absent or unreadable value is treated the same way, which errs toward
 #   reporting drift — the safe direction for a protection audit.
 #
-# Admin-enforcement (--require-admin-enforcement):
+# Admin-enforcement (--require-admin-enforcement), read-only by design:
+#   GitHub returns a ruleset's `bypass_actors` list ONLY to a caller with
+#   write access to that ruleset. This audit is deliberately provisioned
+#   read-only (`Administration:read`), so on the ruleset path that list
+#   is normally absent — and requiring it would strand the hub at exit 2
+#   forever. Admin bypass is therefore read from `current_user_can_bypass`,
+#   which read-only callers DO receive, after confirming from
+#   `GET /repos/{owner}/{repo}` `.permissions.admin` that the auditing
+#   identity is a repository admin. Under rulesets nobody bypasses
+#   implicitly, so `never` from a confirmed admin is genuine evidence the
+#   admin role is not in the bypass list. `bypass_actors` is still used
+#   wherever it IS returned, because it also catches a bypass actor that
+#   is not the auditing identity; the narrower read is a fallback, never
+#   a silent "no bypass". See ADR 0002 for why the token stays read-only.
+#
 #   A required status check is bypassable by a repository admin unless
 #   classic protection sets `enforce_admins: true`. Under rulesets the
 #   equivalent question is asked per CHECK, not per repo: a bypass entry
@@ -225,8 +240,10 @@ canonical mergepath-shipped status checks:
 
 --require-admin-enforcement additionally requires that admins cannot
 bypass those checks (classic \`enforce_admins: true\`, or a governing
-ruleset with an EMPTY bypass-actor array — an unreadable one exits 2).
-ADR 0002 requires this on the hub.
+ruleset with an EMPTY bypass-actor array — or, where GitHub withholds
+that array from a read-only caller, \`current_user_can_bypass: never\`
+reported to a confirmed repository admin). A payload that answers
+neither exits 2. ADR 0002 requires this on the hub.
 
 --default-branch supplies this repo's default branch instead of reading
 it from GET /repos/{owner}/{repo}; only \`~DEFAULT_BRANCH\` ruleset
@@ -592,6 +609,47 @@ resolve_repo_default_branch() {
   return 0
 }
 
+# Is the identity behind the active token a repository ADMIN on $REPO?
+#
+# Memoised in a GLOBAL and invoked as a plain command (never
+# `$(resolve_repo_admin_permission)`) for the same reason as
+# resolve_repo_default_branch above: a command substitution would write
+# the memo in a subshell and throw it away, re-issuing the request once
+# per ruleset.
+#
+# Only the read-only admin-bypass fallback consults this, so the request
+# is made only on the ruleset path, only under
+# --require-admin-enforcement, and only when `bypass_actors` was withheld
+# — consumer audits and every classic-protection audit pay nothing.
+#
+# Tri-state, and the third state is load-bearing: "yes" / "no" / ""
+# (unknown, the read failed). "Unknown" must never collapse into either
+# answer — the caller treats it as an unreadable repo and exits 2.
+# `.permissions` is the authenticated user's own permission set, so this
+# needs no scope beyond the read access the audit already has.
+REPO_ADMIN_PERMISSION=""
+REPO_ADMIN_PERMISSION_RESOLVED=0
+resolve_repo_admin_permission() {
+  if [ "$REPO_ADMIN_PERMISSION_RESOLVED" -eq 0 ]; then
+    REPO_ADMIN_PERMISSION_RESOLVED=1
+    local raw=""
+    # Status-checked first, then value-checked. A failed read writes the
+    # HTTP error BODY to stdout (see the note in tests/…: that is real gh
+    # behaviour), so a status-blind read would hand a JSON blob to the
+    # comparison below and quietly land in the "not admin" branch.
+    if raw="$(gh api "repos/$REPO" --jq '.permissions.admin' 2>/dev/null)"; then
+      case "$raw" in
+        true)  REPO_ADMIN_PERMISSION="yes" ;;
+        false) REPO_ADMIN_PERMISSION="no" ;;
+        *)     REPO_ADMIN_PERMISSION="" ;;
+      esac
+    else
+      REPO_ADMIN_PERMISSION=""
+    fi
+  fi
+  return 0
+}
+
 # Fetch the branch-protection rules. Two endpoints are relevant:
 #   1. /branches/{branch}/protection — classic protection rules
 #   2. /rulesets — newer rulesets (the modern way)
@@ -839,6 +897,12 @@ EOF
   # "<ruleset id>\t<human-readable bypass actor>" rows, reported only for
   # the rulesets a canonical check actually depends on.
   BYPASS_LINES=""
+  # Set when at least one ruleset's bypass posture was decided from
+  # `current_user_can_bypass` because GitHub withheld `bypass_actors`.
+  # That evidence covers the auditing admin identity, not every possible
+  # bypass actor, so a clean verdict resting on it must say which
+  # question it answered rather than claim the stronger one.
+  BYPASS_EVIDENCE_IDENTITY_ONLY=0
   # Field separator for the two accumulators above. Spelled as an escape
   # rather than an inline literal so the delimiter cannot be lost to a
   # whitespace-normalising edit — check names contain spaces, so a
@@ -885,45 +949,130 @@ $THIS_CHECKS"
     # `enforce_admins: false` — but only for the checks this same
     # ruleset requires.
     #
-    # The key must be PRESENT and an ARRAY before its emptiness can be
-    # read as "nobody can bypass this ruleset". `.bypass_actors[]?`
-    # yields nothing for a genuinely empty list AND for an absent key,
-    # a null, or any non-array value — so an unexpected payload shape
-    # would set RS_BYPASSED=0 and be recorded as positive PROOF that the
-    # canonical checks are non-bypassable. That is the one direction an
-    # enforcement probe must never move in, and it is the same
-    # conflation scripts/merge-clearance-gate.sh's enforcement probe
-    # rejects outright.
+    # Two payload shapes can answer that question, and which one arrives
+    # is decided by the TOKEN, not by the ruleset:
     #
-    # Only fatal when --require-admin-enforcement is in play: that flag
-    # is the only mode in which the answer is consulted at all (ADR 0002
-    # asks it of the hub, not of consumers), so an unreadable field on a
-    # consumer audit that never reads it is not a reason to fail a run.
+    #   1. `bypass_actors` — the full list, and AUTHORITATIVE: it names
+    #      every actor, including teams, apps and deploy keys that are
+    #      not the auditing identity. GitHub returns it only to a caller
+    #      with WRITE access to the ruleset ("To prevent leaking
+    #      sensitive information, the bypass_actors property is only
+    #      returned if the user making the API request has write access
+    #      to the ruleset" — REST docs, GET /repos/{o}/{r}/rulesets/{id}).
+    #
+    #   2. `current_user_can_bypass` — "never" | "pull_requests_only" |
+    #      "always", for the identity making the request. Returned to
+    #      READ-ONLY callers. Verified live against four repositories
+    #      whose rulesets this machine's token cannot write — cli/cli,
+    #      home-assistant/core, github/docs, vercel/next.js: every one
+    #      answered HTTP 200 with a complete `rules`/`conditions`/
+    #      `enforcement` payload, `current_user_can_bypass` PRESENT and
+    #      `bypass_actors` ABSENT, across Repository-, Organization- and
+    #      Enterprise-sourced rulesets alike.
+    #
+    # This audit is provisioned read-only on purpose (see the scope note
+    # at the head of .github/workflows/branch-protection-audit.yml), so
+    # shape 2 is what the scheduled run actually receives. Demanding
+    # shape 1 made the hub ruleset path exit 2 permanently — never clean,
+    # never drift, indistinguishable from a broken audit — and buying it
+    # back would mean giving a weekly, unattended, fleet-wide credential
+    # `Administration: write`: the power to rewrite the very protection
+    # it exists to audit. ADR 0002 declines that trade.
+    #
+    # Shape 2 answers a NARROWER question than shape 1 — "can the
+    # auditing identity bypass this ruleset", not "is the bypass list
+    # empty" — so it is only evidence about admins when that identity IS
+    # a repository admin, which is verified before the answer is
+    # trusted. Under rulesets nobody bypasses implicitly (unlike classic
+    # protection, where every admin does until `enforce_admins` is set),
+    # so `never` from a confirmed admin is real evidence that the admin
+    # role is absent from the bypass list — the #427/#428 question ADR
+    # 0002 actually asks. Shape 1 is still preferred wherever it is
+    # offered, because it also catches a non-admin bypass actor.
+    #
+    # What is still never conflated: `.bypass_actors[]?` yields nothing
+    # for a genuinely empty list AND for an absent key, a null, or any
+    # non-array value, so emptiness is read only from a real ARRAY. A
+    # payload with neither a readable array nor a usable
+    # `current_user_can_bypass`, or one whose admin standing cannot be
+    # established, exits 2. Unknown never becomes "no bypass".
     RS_BYPASS_TYPE=$(echo "$DETAIL" | jq -r '.bypass_actors | type' 2>/dev/null || true)
-    if [ "$RS_BYPASS_TYPE" != "array" ] && [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
-      cat >&2 <<EOF
-ERROR: ruleset $rid governs $REPO@$BRANCH, but its detail payload carries
-       no readable 'bypass_actors' array (jq type: ${RS_BYPASS_TYPE:-unreadable}).
+    RS_BYPASSED=0
+    THIS_BYPASS=""
+    if [ "$RS_BYPASS_TYPE" = "array" ]; then
+      THIS_BYPASS=$(echo "$DETAIL" | jq -r --arg rid "$rid" '
+        .bypass_actors[]?
+        | "ruleset \($rid): actor_type=\(.actor_type // "?") actor_id=\(.actor_id // "?") bypass_mode=\(.bypass_mode // "?")"
+      ' 2>/dev/null)
+      if [ -n "$THIS_BYPASS" ]; then
+        RS_BYPASSED=1
+      fi
+    elif [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
+      # Read-only fallback. Only reached under the flag, because that is
+      # the only mode in which the answer is consulted at all (ADR 0002
+      # asks it of the hub, not of consumers) — an unreadable field on a
+      # consumer audit that never reads it is not a reason to fail a run.
+      #
+      # Type-checked, not `// ""`: a null or a non-string would otherwise
+      # fall through the string comparisons below as an empty value.
+      RS_CAN_BYPASS=$(echo "$DETAIL" | jq -r '
+        if (.current_user_can_bypass | type) == "string"
+        then .current_user_can_bypass else "" end
+      ' 2>/dev/null || true)
+      case "$RS_CAN_BYPASS" in
+        never|pull_requests_only|always) ;;
+        *)
+          cat >&2 <<EOF
+ERROR: ruleset $rid governs $REPO@$BRANCH, but its detail payload answers
+       neither of the two questions that settle admin bypass: it carries
+       no readable 'bypass_actors' array (jq type:
+       ${RS_BYPASS_TYPE:-unreadable}) and no recognised
+       'current_user_can_bypass' value (got: '${RS_CAN_BYPASS:-<absent>}',
+       expected never|pull_requests_only|always).
 
        --require-admin-enforcement asks whether a canonical required
-       check is skippable, and that question is answered from this list.
-       An absent, null, or non-array field is NOT evidence of an empty
-       bypass list — crediting it as one would let the hub pass admin-
-       enforcement auditing with no proof its gates are non-bypassable,
-       and publish that as a fleet-wide all-clear.
+       check is skippable. An absent, null or unrecognised field is NOT
+       evidence that nobody can bypass — crediting it as one would let
+       the hub pass admin-enforcement auditing with no proof its gates
+       hold, and publish that as a fleet-wide all-clear.
 
        Treating the repo as unreadable (infrastructure failure) instead.
-       Re-run with a token that can read repository rulesets in full.
 EOF
-      exit 2
+          exit 2
+          ;;
+      esac
+      resolve_repo_admin_permission
+      if [ "$REPO_ADMIN_PERMISSION" != "yes" ]; then
+        cat >&2 <<EOF
+ERROR: ruleset $rid governs $REPO@$BRANCH and withheld its 'bypass_actors'
+       list (GitHub returns it only to callers with write access to the
+       ruleset), so admin bypass has to be read from
+       'current_user_can_bypass' — which describes the AUDITING IDENTITY,
+       not the bypass list.
+
+       That is evidence about admins only if the auditing identity is a
+       repository admin, and this run could not establish that:
+       GET /repos/$REPO '.permissions.admin' returned
+       '${REPO_ADMIN_PERMISSION:-unreadable}'.
+
+       A non-admin identity reports 'never' whether or not admins can
+       bypass, so accepting it here would turn "we could not tell" into
+       an all-clear.
+
+       Re-run with an identity that is an admin on $REPO — the audit's
+       own BRANCH_PROTECTION_AUDIT_TOKEN is provisioned that way:
+         GH_TOKEN="\$OP_PREFLIGHT_AUTHOR_PAT" scripts/audit-branch-protection.sh \\
+           --repo $REPO --branch $BRANCH --require-admin-enforcement
+EOF
+        exit 2
+      fi
+      BYPASS_EVIDENCE_IDENTITY_ONLY=1
+      if [ "$RS_CAN_BYPASS" != "never" ]; then
+        RS_BYPASSED=1
+        THIS_BYPASS="ruleset $rid: the auditing admin identity can bypass this ruleset (current_user_can_bypass=$RS_CAN_BYPASS; the full bypass_actors list is not readable under read-only auth)"
+      fi
     fi
-    THIS_BYPASS=$(echo "$DETAIL" | jq -r --arg rid "$rid" '
-      .bypass_actors[]?
-      | "ruleset \($rid): actor_type=\(.actor_type // "?") actor_id=\(.actor_id // "?") bypass_mode=\(.bypass_mode // "?")"
-    ' 2>/dev/null)
-    RS_BYPASSED=0
     if [ -n "$THIS_BYPASS" ]; then
-      RS_BYPASSED=1
       while IFS= read -r bline; do
         [ -z "$bline" ] && continue
         BYPASS_LINES="${BYPASS_LINES}${rid}${TAB}${bline}
@@ -1044,6 +1193,15 @@ if [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
       echo "remove every actor. A bypass entry is the ruleset-world equivalent of"
       echo "classic protection's 'enforce_admins: false'."
       echo ""
+    elif [ "$BYPASS_EVIDENCE_IDENTITY_ONLY" -eq 1 ]; then
+      # Say which question the evidence answered. GitHub withheld the
+      # bypass list from this read-only caller, so the proof is "a
+      # confirmed repository admin cannot bypass" — the ADR 0002
+      # question — not "the bypass list is empty".
+      echo "Admin enforcement: OK — a confirmed repository admin cannot skip a canonical required check on $BRANCH."
+      echo "      (GitHub withheld 'bypass_actors' from this read-only token, so this rests on"
+      echo "      'current_user_can_bypass: never'; a bypass actor that is neither the auditing"
+      echo "      identity nor the admin role would not be visible to a read-only audit.)"
     else
       echo "Admin enforcement: OK — no bypass actor can skip a canonical required check on $BRANCH."
     fi

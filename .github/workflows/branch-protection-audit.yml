@@ -40,6 +40,24 @@ name: Weekly branch-protection audit
 #   author/admin PAT with `Administration:read` on every repo in the
 #   manifest.
 #
+#   `Administration:read` — NOT write — is the whole contract, and the
+#   hub's admin-enforcement audit is built to live inside it. GitHub
+#   returns a ruleset's `bypass_actors` list only to a caller with WRITE
+#   access to that ruleset ("to prevent leaking sensitive information"),
+#   so a correctly scoped token here never sees it. The audit therefore
+#   reads admin bypass from `current_user_can_bypass`, which read-only
+#   callers do receive, after confirming the token's identity is a
+#   repository admin. Do NOT "fix" a ruleset-path exit 2 by upgrading
+#   this secret to `Administration:write`: that would hand a weekly,
+#   unattended, fleet-wide credential the power to rewrite the very
+#   protection this workflow exists to audit — a strictly worse posture
+#   than the drift it detects.
+#
+#   One consequence worth stating: because the identity must be a
+#   repository ADMIN (not merely a reader) for the hub's ruleset path to
+#   reach a verdict, a token downgraded to a non-admin identity exits 2
+#   rather than reporting clean. That is the intended direction.
+#
 #   Because a wrong or absent token produces a *uniform* failure across
 #   every repo, it could easily be mistaken for "nothing to report". Two
 #   guards prevent that:
