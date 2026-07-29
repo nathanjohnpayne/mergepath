@@ -208,6 +208,113 @@ if [ -n "$(git -C "$FLAG_PR_WT" status --porcelain --ignored --untracked-files=a
   fail "fixture setup: expected comprehensive porcelain to be EMPTY under assume-unchanged"
 fi
 
+# ── Case 2d (#762 post-merge P1): index-flag scan must not SIGPIPE ────
+# `printf … | grep -q` under pipefail can lose the match when grep exits at the
+# first hit and printf then writes to the closed pipe. Listing size alone does
+# not force that schedule, so this fixture also injects a printf wrapper into
+# helper child shells: it writes the first matching line, then keeps filling
+# the pipe until grep exits and the writer receives SIGPIPE. The vulnerable
+# pipeline therefore returns 141 without a scheduler-timing assumption, while
+# the fixed here-string never calls that wrapper.
+SIGPIPE_PR_NUM=77222
+SIGPIPE_PR_BRANCH="pr-branch-sigpipe"
+git branch "$SIGPIPE_PR_BRANCH"
+git push -q -u origin "$SIGPIPE_PR_BRANCH"
+SIGPIPE_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${SIGPIPE_PR_NUM}-sigpipe"
+git worktree add -q "$SIGPIPE_PR_WT" "$SIGPIPE_PR_BRANCH"
+PAD="padding-to-exceed-one-pipe-buffer-so-grep-q-exits-before-printf-finishes-and-pipefail-turns-the-sigpipe-into-a-false-negative"
+( cd "$SIGPIPE_PR_WT"
+  echo "hidden edit" > "0000-flagged.txt"
+  i=0; while [ "$i" -lt 600 ]; do echo x > "zz-${PAD}-${i}.txt"; i=$((i + 1)); done
+  git add -A >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -qm "sigpipe fixture" >/dev/null 2>&1
+  git update-index --assume-unchanged "0000-flagged.txt"
+  echo "EDITED BEHIND THE FLAG" > "0000-flagged.txt" )
+SIGPIPE_CANARY="$SIGPIPE_PR_WT/0000-flagged.txt"
+# Assert the premise both ways, or the fixture proves nothing.
+if [ -n "$(git -C "$SIGPIPE_PR_WT" status --porcelain --ignored --untracked-files=all --ignore-submodules=none)" ]; then
+  fail "fixture setup: expected comprehensive porcelain to be EMPTY under assume-unchanged (sigpipe fixture)"
+fi
+SIGPIPE_BYTES=$(git -C "$SIGPIPE_PR_WT" ls-files -v | wc -c | tr -d ' ')
+if [ "$SIGPIPE_BYTES" -lt 65536 ]; then
+  fail "fixture setup: ls-files -v is only ${SIGPIPE_BYTES}B — too small to trigger SIGPIPE; increase the padding"
+fi
+SIGPIPE_BASH_ENV="$WORKDIR/sigpipe-bash-env"
+cat >"$SIGPIPE_BASH_ENV" <<'EOF'
+printf() {
+  if [ "$#" -eq 2 ] && [ "$1" = '%s\n' ] && [ "${#2}" -ge 65536 ]; then
+    first=${2%%$'\n'*}
+    rest=${2#*$'\n'}
+    builtin printf '%s\n' "$first"
+    while :; do
+      builtin printf '%s\n' "$rest"
+    done
+  fi
+  builtin printf "$@"
+}
+EOF
+set +e
+BASH_ENV="$SIGPIPE_BASH_ENV" bash -o pipefail -c '
+  flagged=$(git -C "$1" ls-files -v) || exit 2
+  printf "%s\n" "$flagged" | grep -qE "^([a-z]|S) "
+' _ "$SIGPIPE_PR_WT"
+SIGPIPE_PROBE_RC=$?
+set -e
+if [ "$SIGPIPE_PROBE_RC" -eq 141 ]; then
+  pass "fixture premise: instrumented vulnerable printf|grep -q pipeline returns SIGPIPE (141)"
+else
+  fail "fixture setup: instrumented vulnerable pipeline returned $SIGPIPE_PROBE_RC, expected 141"
+fi
+# Non-interactive helper shells source this instrumentation. It is inert for
+# every normal printf call and for the fixed here-string index probe.
+export BASH_ENV="$SIGPIPE_BASH_ENV"
+
+# ── Case 2e (#762 post-merge P1): index flags INSIDE a submodule ──────
+# A submodule file marked assume-unchanged and then edited is invisible to the
+# outer status walk AND to the recursive one, so the worktree read as clean and
+# --apply deleted it.
+SUB_PR_NUM=77333
+SUB_PR_BRANCH="pr-branch-submodule-flag"
+SUBREPO="$WORKDIR/subrepo"
+git init -q "$SUBREPO"
+( cd "$SUBREPO"; echo "sub seed" > sub.txt; git add sub.txt
+  git -c user.email=t@t -c user.name=t commit -qm "sub init" >/dev/null 2>&1 )
+git branch "$SUB_PR_BRANCH"
+git push -q -u origin "$SUB_PR_BRANCH"
+SUB_PR_WT="$WORKDIR/.mergepath-worktrees/pr-${SUB_PR_NUM}-submodule-flag"
+git worktree add -q "$SUB_PR_WT" "$SUB_PR_BRANCH"
+SUB_OK=1
+( cd "$SUB_PR_WT"
+  git -c protocol.file.allow=always submodule add -q "$SUBREPO" vendor/sub >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -qm "add submodule" >/dev/null 2>&1 ) || SUB_OK=0
+SUB_CANARY="$SUB_PR_WT/vendor/sub/sub.txt"
+if [ "$SUB_OK" = "1" ] && [ -f "$SUB_CANARY" ]; then
+  ( cd "$SUB_PR_WT/vendor/sub"
+    git update-index --assume-unchanged sub.txt
+    echo "SUBMODULE EDIT HIDDEN BY INDEX FLAG" > sub.txt )
+  if [ -n "$(git -C "$SUB_PR_WT" status --porcelain --ignored --untracked-files=all --ignore-submodules=none)" ]; then
+    fail "fixture setup: expected outer porcelain to be EMPTY for the submodule index-flag case"
+  fi
+  # LOCKED on purpose. Plain `git worktree remove` refuses a worktree
+  # containing submodules, which would retain this fixture no matter what the
+  # probe said — the assertion would pass vacuously. Locking it routes the
+  # --force-locked run into the force fallback, which is the exact path the
+  # reviewer described, and the only one where the probe's verdict decides.
+  if ! git worktree lock "$SUB_PR_WT" >/dev/null 2>&1; then
+    fail "fixture setup: could not lock the submodule worktree required for the force-fallback path"
+    SUB_OK=0
+  elif ! git worktree list --porcelain | awk -v p="$SUB_PR_WT" '
+    /^worktree / { hit = (substr($0, 10) == p); next }
+    hit && /^locked/ { found = 1 }
+    END { exit found ? 0 : 1 }
+  '; then
+    fail "fixture setup: git worktree lock returned success but the submodule worktree does not read back locked"
+    SUB_OK=0
+  fi
+else
+  echo "NOTE: submodule fixture unavailable (git submodule add failed); Case 2e assertions will be skipped" >&2
+fi
+
 # ── Case 3: detached mergepath-pr-<num> worktree (PR closed) ────────
 # We need the worktree path to match the helper's regex
 # /tmp|/private/tmp|/Users/.../GitHub|...mergepath-pr-<num>. On macOS,
@@ -562,6 +669,14 @@ if [ "\$1" = "pr" ] && [ "\$2" = "view" ]; then
     exit 0
   fi
   if [ "\$num" = "$FLAG_PR_NUM" ]; then
+    echo "CLOSED"
+    exit 0
+  fi
+  if [ "\$num" = "$SIGPIPE_PR_NUM" ]; then
+    echo "CLOSED"
+    exit 0
+  fi
+  if [ "\$num" = "$SUB_PR_NUM" ]; then
     echo "CLOSED"
     exit 0
   fi
@@ -1179,6 +1294,12 @@ else
   fail "gone-upstream PR-slug worktree was removed by --apply despite dirty content"
   echo "$OUT2" >&2
 fi
+if [ -f "$SIGPIPE_CANARY" ] && grep -q "EDITED BEHIND THE FLAG" "$SIGPIPE_CANARY"; then
+  pass "index-flag edit survived --apply in a worktree whose ls-files -v exceeds a pipe buffer (${SIGPIPE_BYTES}B)"
+else
+  fail "DATA LOSS: --apply deleted an index-flag-hidden edit that the SIGPIPE-prone scan missed"
+  echo "$OUT2" >&2
+fi
 if [ -f "$FLAG_CANARY" ] && grep -q "behind an index flag" "$FLAG_CANARY"; then
   pass "index-flag-hidden edit survived --apply (assume-unchanged)"
 else
@@ -1190,10 +1311,11 @@ fi
 # total_candidates accounting read SUMMARY_UNCLEAN_KEPT, so the record was
 # printed but the audit exited as if nothing needed a human (Phase 4b P1).
 UNCLEAN_N=$(echo "$OUT3" | sed -n 's/.*unclean PR worktrees (review): *\([0-9][0-9]*\).*/\1/p' | head -1)
-if [ "${UNCLEAN_N:-0}" -eq 6 ]; then
+EXPECTED_UNCLEAN=$((7 + SUB_OK))
+if [ "${UNCLEAN_N:-0}" -eq "$EXPECTED_UNCLEAN" ]; then
   pass "retained gone-upstream PR-slug worktree is counted in the unclean bucket"
 else
-  fail "unclean-bucket count is ${UNCLEAN_N:-unset}, expected 6 (every retained-unclean fixture, including the gone-upstream PR-slug one) — a retained worktree is landing in an uncounted bucket"
+  fail "unclean-bucket count is ${UNCLEAN_N:-unset}, expected $EXPECTED_UNCLEAN (seven required retained-unclean fixtures plus the optional submodule index-flag fixture when available) — a retained worktree is landing in an uncounted bucket"
   echo "$OUT3" | grep -E "unclean PR worktrees" >&2
 fi
 if [ -f "$GONE_PR_CANARY" ] && grep -q "nowhere else" "$GONE_PR_CANARY"; then
@@ -1385,6 +1507,20 @@ fi
 set +e
 OUT4=$(PATH="$STUB_DIR:$PATH" bash "$HELPER" --no-color --apply --force-locked --orphan-clean 2>&1)
 RC4=$?
+
+# Case 2e (#762 post-merge P1): a LOCKED submodule worktree whose only dirt is
+# hidden behind a submodule-internal index flag must survive even the force
+# fallback. This is the one path where the probe's verdict is decisive: without
+# --force-locked, git's own refusal to remove a submodule worktree retains it
+# regardless, so the assertion would prove nothing.
+if [ "${SUB_OK:-0}" = "1" ]; then
+  if [ -f "$SUB_CANARY" ] && grep -q "SUBMODULE EDIT HIDDEN BY INDEX FLAG" "$SUB_CANARY"; then
+    pass "submodule index-flag edit survived --apply --force-locked"
+  else
+    fail "DATA LOSS: --apply --force-locked deleted an index-flag-hidden edit inside a submodule"
+    echo "$OUT4" >&2
+  fi
+fi
 set -e
 
 if [ "$RC4" -eq 0 ]; then
@@ -1448,6 +1584,9 @@ git worktree remove --force "$IGNORED_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$UNTRACKED_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$GONE_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$FLAG_PR_WT" >/dev/null 2>&1 || true
+git worktree remove --force "$SIGPIPE_PR_WT" >/dev/null 2>&1 || true
+git worktree unlock "$SUB_PR_WT" >/dev/null 2>&1 || true
+git worktree remove --force "$SUB_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$SUBMOD_PR_WT" >/dev/null 2>&1 || true
 git worktree remove --force "$UNKNOWN_PR_WT" >/dev/null 2>&1 || true
 set +e
