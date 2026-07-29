@@ -69,10 +69,23 @@
 #   completely unprotected" verdict. If you hit exit 2 with an auth-scope
 #   diagnostic, re-run with an author/admin token.
 #
+# Ruleset enforcement:
+#   On the ruleset fallback path, only rulesets whose `enforcement` is
+#   `active` are credited with requiring a check. `evaluate` reports rule
+#   outcomes without blocking a merge and `disabled` does nothing at all,
+#   so counting either would report PASS on a branch nothing gates. An
+#   absent or unreadable value is treated the same way, which errs toward
+#   reporting drift — the safe direction for a protection audit.
+#
 # Admin-enforcement (--require-admin-enforcement):
 #   A required status check is bypassable by a repository admin unless
-#   classic protection sets `enforce_admins: true` (or, under rulesets, the
-#   governing ruleset grants nobody a bypass). ADR 0002 requires that
+#   classic protection sets `enforce_admins: true`. Under rulesets the
+#   equivalent question is asked per CHECK, not per repo: a bypass entry
+#   weakens only the ruleset granting it, so a canonical check counts as
+#   skippable only when every ENFORCING ruleset requiring that check also
+#   grants a bypass. A bypass on a ruleset that requires no canonical
+#   check — or on one whose checks a no-bypass ruleset also requires —
+#   leaves the gate intact and is not reported. ADR 0002 requires that
 #   posture on the HUB specifically — the two escapes that motivated the
 #   merge-clearance gate (#427/#428) were both admin merges — so `--fleet`
 #   passes this flag for the hub repo and a hub that requires all five
@@ -383,17 +396,29 @@ echo ""
 
 # Lazily resolve this repo's real default branch, once. Only the
 # `~DEFAULT_BRANCH` ruleset condition needs it, so repos on the classic
-# path never pay for the extra call. Returns the empty string when the
-# metadata read fails, which callers treat as "unknown".
+# path never pay for the extra call. Leaves REPO_DEFAULT_BRANCH empty
+# when the metadata read fails, which callers treat as "unknown".
+#
+# The answer is published in a GLOBAL rather than on stdout, and callers
+# invoke this as a plain command (never `$(repo_default_branch)`): a
+# command substitution runs the body in a subshell, where the memo below
+# is written and then discarded with the subshell. That is what made the
+# cache a no-op before — every `~DEFAULT_BRANCH` pattern re-issued
+# `GET /repos/{owner}/{repo}` (fleet-wide, once per pattern per ruleset),
+# and a transient failure on a later call could downgrade an already
+# resolved answer to the main/master guess and flip the ruleset-target
+# verdict.
 REPO_DEFAULT_BRANCH=""
 REPO_DEFAULT_BRANCH_RESOLVED=0
-repo_default_branch() {
+resolve_repo_default_branch() {
   if [ "$REPO_DEFAULT_BRANCH_RESOLVED" -eq 0 ]; then
     REPO_DEFAULT_BRANCH_RESOLVED=1
     REPO_DEFAULT_BRANCH="$(gh api "repos/$REPO" --jq '.default_branch' 2>/dev/null || true)"
-    [ "$REPO_DEFAULT_BRANCH" = "null" ] && REPO_DEFAULT_BRANCH=""
+    if [ "$REPO_DEFAULT_BRANCH" = "null" ]; then
+      REPO_DEFAULT_BRANCH=""
+    fi
   fi
-  printf '%s' "$REPO_DEFAULT_BRANCH"
+  return 0
 }
 
 # Fetch the branch-protection rules. Two endpoints are relevant:
@@ -512,11 +537,15 @@ if [ "$USE_RULESETS" -eq 1 ]; then
 
     BRANCH_REF="refs/heads/$BRANCH"
     # Reusable matcher: pattern-matches a SINGLE pattern against the
-    # audited branch ref. Echoes "1" on match, "0" on miss. Used by
-    # BOTH the include scan (a match means "this ruleset could apply")
-    # and the exclude scan below (a match means "this ruleset does
-    # NOT apply to this branch"). #285 r2 — nathanpayne-codex Phase
-    # 4b finding: the original implementation only consulted
+    # audited branch ref. Answers through its EXIT STATUS (0 = match,
+    # 1 = miss) so callers can invoke it directly in an `if` instead of
+    # in a `$(...)`; that keeps `~DEFAULT_BRANCH` resolution in THIS
+    # shell, which is what makes resolve_repo_default_branch's one-shot
+    # memo survive from one pattern to the next. Used by BOTH the
+    # include scan (a match means "this ruleset could apply") and the
+    # exclude scan below (a match means "this ruleset does NOT apply to
+    # this branch"). #285 r2 — nathanpayne-codex Phase 4b finding: the
+    # original implementation only consulted
     # `.conditions.ref_name.include`, so a ruleset that included
     # `~ALL` but excluded `main` was incorrectly counted as
     # protecting main.
@@ -524,39 +553,38 @@ if [ "$USE_RULESETS" -eq 1 ]; then
       local pat="$1"
       case "$pat" in
         "~ALL")
-          echo 1; return ;;
+          return 0 ;;
         "~DEFAULT_BRANCH")
-          local def
-          def="$(repo_default_branch)"
-          if [ -n "$def" ]; then
+          resolve_repo_default_branch
+          if [ -n "$REPO_DEFAULT_BRANCH" ]; then
             # Authoritative answer from the repo's own metadata.
-            if [ "$BRANCH" = "$def" ]; then
-              echo 1; return
+            if [ "$BRANCH" = "$REPO_DEFAULT_BRANCH" ]; then
+              return 0
             fi
           elif [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
             # Metadata unreadable — degrade to the historical guess
             # rather than silently declaring the ruleset non-matching.
-            echo 1; return
+            return 0
           fi
           ;;
         "$BRANCH_REF")
-          echo 1; return ;;
+          return 0 ;;
         refs/heads/*)
           # Bash glob match against the ref.
           # shellcheck disable=SC2053
           if [[ "$BRANCH_REF" == $pat ]]; then
-            echo 1; return
+            return 0
           fi
           ;;
       esac
-      echo 0
+      return 1
     }
 
     # Pass 1: any include pattern must match.
     MATCHED=0
     while IFS= read -r pat; do
       [ -z "$pat" ] && continue
-      if [ "$(match_ref_pat "$pat")" = "1" ]; then
+      if match_ref_pat "$pat"; then
         MATCHED=1
         break
       fi
@@ -576,7 +604,7 @@ if [ "$USE_RULESETS" -eq 1 ]; then
       EXCLUDED=0
       while IFS= read -r pat; do
         [ -z "$pat" ] && continue
-        if [ "$(match_ref_pat "$pat")" = "1" ]; then
+        if match_ref_pat "$pat"; then
           EXCLUDED=1
           break
         fi
@@ -598,11 +626,26 @@ if [ "$USE_RULESETS" -eq 1 ]; then
   fi
 
   # Step B: extract required status checks ONLY from the rulesets that
-  # target the audited branch. Concatenate each matching ruleset's
-  # required_status_checks parameter. Previously this collected from
-  # ALL branch-target rulesets regardless of include match (#285).
+  # target the audited branch AND actually enforce. Concatenate each
+  # qualifying ruleset's required_status_checks parameter. Previously
+  # this collected from ALL branch-target rulesets regardless of include
+  # match (#285).
   REQUIRED_CHECKS=""
-  BYPASS_ACTORS=""
+  # One TAB-separated "<context>\t<ruleset id>\t<0|1 has bypass actors>"
+  # row per (enforcing ruleset, required context) pairing. The
+  # admin-enforcement block below needs the per-ruleset provenance: a
+  # bypass entry applies ONLY to the ruleset that grants it, so "some
+  # matching ruleset lists a bypass actor" is not evidence that any
+  # canonical check is skippable.
+  CHECK_SOURCES=""
+  # "<ruleset id>\t<human-readable bypass actor>" rows, reported only for
+  # the rulesets a canonical check actually depends on.
+  BYPASS_LINES=""
+  # Field separator for the two accumulators above. Spelled as an escape
+  # rather than an inline literal so the delimiter cannot be lost to a
+  # whitespace-normalising edit — check names contain spaces, so a
+  # space-delimited row would be unsplittable.
+  TAB=$'\t'
   for rid in $MATCHING_IDS; do
     DETAIL=$(gh api "repos/$REPO/rulesets/$rid" 2>&1) || {
       echo "Could not fetch ruleset $rid: $DETAIL" >&2; exit 2
@@ -613,6 +656,22 @@ if [ "$USE_RULESETS" -eq 1 ]; then
       | .parameters.required_status_checks[]?
       | .context
     ' 2>/dev/null)
+
+    # A ruleset gates merges only while its `enforcement` is `active`.
+    # `evaluate` reports rule outcomes without blocking anything and
+    # `disabled` does nothing at all, so crediting either with a
+    # canonical required check would report PASS on a branch nothing
+    # actually gates. An unreadable or absent value is treated as NOT
+    # enforcing: that errs toward reporting drift, which is the safe
+    # direction for a protection audit.
+    RS_ENFORCEMENT=$(echo "$DETAIL" | jq -r '.enforcement // ""' 2>/dev/null || true)
+    if [ "$RS_ENFORCEMENT" != "active" ]; then
+      if [ -n "$THIS_CHECKS" ]; then
+        echo "Note: ruleset $rid targets $BRANCH but its enforcement is '${RS_ENFORCEMENT:-unknown}', not 'active' — its required status checks do not gate merges and are not counted."
+      fi
+      continue
+    fi
+
     if [ -n "$THIS_CHECKS" ]; then
       if [ -n "$REQUIRED_CHECKS" ]; then
         REQUIRED_CHECKS="$REQUIRED_CHECKS
@@ -621,22 +680,30 @@ $THIS_CHECKS"
         REQUIRED_CHECKS="$THIS_CHECKS"
       fi
     fi
+
     # Rulesets have no `enforce_admins`. Their equivalent is the
-    # bypass list: anyone in `bypass_actors` merges past this ruleset's
-    # required checks, so a non-empty list is the ruleset-world
-    # analogue of `enforce_admins: false`.
+    # bypass list: anyone in `bypass_actors` merges past THIS ruleset's
+    # rules, so a non-empty list is the ruleset-world analogue of
+    # `enforce_admins: false` — but only for the checks this same
+    # ruleset requires.
     THIS_BYPASS=$(echo "$DETAIL" | jq -r --arg rid "$rid" '
       .bypass_actors[]?
       | "ruleset \($rid): actor_type=\(.actor_type // "?") actor_id=\(.actor_id // "?") bypass_mode=\(.bypass_mode // "?")"
     ' 2>/dev/null)
+    RS_BYPASSED=0
     if [ -n "$THIS_BYPASS" ]; then
-      if [ -n "$BYPASS_ACTORS" ]; then
-        BYPASS_ACTORS="$BYPASS_ACTORS
-$THIS_BYPASS"
-      else
-        BYPASS_ACTORS="$THIS_BYPASS"
-      fi
+      RS_BYPASSED=1
+      while IFS= read -r bline; do
+        [ -z "$bline" ] && continue
+        BYPASS_LINES="${BYPASS_LINES}${rid}${TAB}${bline}
+"
+      done <<<"$THIS_BYPASS"
     fi
+    while IFS= read -r ctx; do
+      [ -z "$ctx" ] && continue
+      CHECK_SOURCES="${CHECK_SOURCES}${ctx}${TAB}${rid}${TAB}${RS_BYPASSED}
+"
+    done <<<"$THIS_CHECKS"
   done
 else
   REQUIRED_CHECKS=$(echo "$PROT_BODY" | jq -r '.required_status_checks.contexts[]? // empty')
@@ -699,18 +766,55 @@ fi
 # must not read as PASS.
 if [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
   if [ "$USE_RULESETS" -eq 1 ]; then
-    if [ -n "$BYPASS_ACTORS" ]; then
+    # A bypass entry weakens only the ruleset that grants it. So a
+    # canonical check is skippable only when EVERY enforcing ruleset that
+    # requires it also grants a bypass — one no-bypass ruleset requiring
+    # the check keeps it mandatory for everybody, and a bypass on a
+    # ruleset that requires no canonical check (a formatting rule, a
+    # non-canonical build check) cannot make a canonical gate skippable
+    # at all. Reporting "any matching ruleset has a bypass actor" filed a
+    # fully enforced hub as DRIFT and refreshed the rollup issue every
+    # week for it.
+    #
+    # Deliberately conservative where the answer is genuinely uncertain:
+    # a check required only by bypassed rulesets is reported even though
+    # the individual actor sets may not overlap, because an audit that
+    # under-reports a skippable gate recreates the #774 blind spot,
+    # whereas an over-report is a visible, checkable claim.
+    SKIPPABLE_CHECKS=""
+    CULPRIT_IDS=""
+    for check in "${CANONICAL_REQUIRED_CHECKS[@]}"; do
+      check_rows=$(printf '%s' "$CHECK_SOURCES" | awk -F'\t' -v c="$check" '$1 == c')
+      # Not required by any enforcing ruleset — already counted as a
+      # missing canonical check above; not an admin-bypass finding.
+      [ -z "$check_rows" ] && continue
+      if printf '%s\n' "$check_rows" \
+        | awk -F'\t' '$3 == "0" { found = 1 } END { if (found) exit 0; exit 1 }'; then
+        continue
+      fi
+      SKIPPABLE_CHECKS="${SKIPPABLE_CHECKS}${check}
+"
+      CULPRIT_IDS="$CULPRIT_IDS $(printf '%s\n' "$check_rows" | cut -f2 | tr '\n' ' ')"
+    done
+
+    if [ -n "$SKIPPABLE_CHECKS" ]; then
       GAPS=1
-      echo "FAIL: the ruleset(s) governing $BRANCH on $REPO grant bypass actors, so the"
-      echo "      required checks above are skippable:"
-      printf '%s\n' "$BYPASS_ACTORS" | sed 's/^/  ✗ /'
+      echo "FAIL: every enforcing ruleset that requires the following canonical check(s)"
+      echo "      on $REPO@$BRANCH also grants a bypass, so the check(s) are skippable:"
+      printf '%s' "$SKIPPABLE_CHECKS" | sed 's/^/  ✗ /'
       echo ""
-      echo "Fix: Settings → Rules → the ruleset governing '$BRANCH' → Bypass list →"
+      echo "      Bypass entries responsible:"
+      for cid in $(printf '%s' "$CULPRIT_IDS" | tr ' ' '\n' | sort -u); do
+        [ -z "$cid" ] && continue
+        printf '%s' "$BYPASS_LINES" | awk -F'\t' -v r="$cid" '$1 == r { print "  ✗ " $2 }'
+      done
+      echo ""
+      echo "Fix: Settings → Rules → the ruleset(s) named above → Bypass list →"
       echo "remove every actor. A bypass entry is the ruleset-world equivalent of"
       echo "classic protection's 'enforce_admins: false'."
       echo ""
     else
-      echo "Admin enforcement: OK — no bypass actors on the ruleset(s) governing $BRANCH."
+      echo "Admin enforcement: OK — no bypass actor can skip a canonical required check on $BRANCH."
     fi
   else
     ENFORCE_ADMINS=$(echo "$PROT_BODY" | jq -r '.enforce_admins.enabled // false' 2>/dev/null)

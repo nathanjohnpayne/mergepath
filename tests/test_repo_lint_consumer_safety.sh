@@ -103,6 +103,15 @@ CONSUMER_ABSENT=(
   "specs/bootstrap_consumer_identity.md"
   "bugs/screenshots"
   ".github/screenshots"
+  # #774 fleet branch-protection audit — scheduled workflow + auditor +
+  # both suites, all excluded by the template mirror. The cron reads
+  # every sibling repo's protection under an admin-scoped fleet secret,
+  # so it must never land in a consumer; check_branch_protection_audit
+  # ships via the scripts/ci/ kit and has to SKIP without them.
+  ".github/workflows/branch-protection-audit.yml"
+  "scripts/audit-branch-protection.sh"
+  "tests/test_audit_branch_protection.sh"
+  "tests/test_audit_branch_protection_workflow.sh"
   # (b) hub-only per check_propagation_closure ALLOW_LIST — absent from
   # live consumers (older bootstrap snapshots; never manifest-propagated).
   "scripts/bootstrap.sh"

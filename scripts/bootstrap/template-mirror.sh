@@ -176,6 +176,26 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   'scripts/audit-canonical-mirrors.sh'
   'tests/test_audit_canonical_mirrors.sh'
 
+  # #774 fleet branch-protection audit - hub-only, excluded as a SET
+  # (scheduled workflow + auditor + both paired suites) for the same
+  # reason as the pairs above. `--fleet` iterates .mergepath-sync.yml,
+  # which the orchestrator excludes above, and reads every sibling repo's
+  # protection under BRANCH_PROTECTION_AUDIT_TOKEN - an admin-scoped
+  # fleet-wide secret a new repo does not have and must not be given.
+  # Shipped verbatim the cron would fire every Monday in a bootstrapped
+  # repo and fail forever at the missing-secret guard (or, if a
+  # same-named secret existed, at the absent manifest). Dropping the
+  # workflow without its auditor and suites would leave
+  # check_branch_protection_audit's ERROR branch reachable on the hub, so
+  # the four travel together. scripts/ci/check_branch_protection_audit is
+  # deliberately NOT excluded: the mirrored repo_lint.yml wires it as a
+  # step, so the wrapper must ship and take its consumer-SKIP path - same
+  # shape as check_wave_audit / check_audit_canonical_mirrors.
+  '.github/workflows/branch-protection-audit.yml'
+  'scripts/audit-branch-protection.sh'
+  'tests/test_audit_branch_protection.sh'
+  'tests/test_audit_branch_protection_workflow.sh'
+
   # Hub identity docs — do NOT duplicate mergepath's self-referential
   # hub identity into a consumer (#744). Two groups:
   #

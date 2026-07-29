@@ -177,6 +177,26 @@ case "$path" in
         printf '%s\n' '[{"id":401,"target":"branch"}]'
         exit 0
         ;;
+      ruleset_default_branch_twice)
+        # TWO rulesets, each including ~DEFAULT_BRANCH. Resolving the
+        # repo's default branch is a per-repo constant, so the audit must
+        # read GET /repos/{owner}/{repo} exactly once for both.
+        printf '%s\n' '[{"id":501,"target":"branch"},{"id":502,"target":"branch"}]'
+        exit 0
+        ;;
+      ruleset_bypass_unrelated_rule)
+        # Two rulesets govern main: 601 enforces every canonical check
+        # with NOBODY able to bypass it; 602 enforces an unrelated
+        # project check and grants a bypass actor for it.
+        printf '%s\n' '[{"id":601,"target":"branch"},{"id":602,"target":"branch"}]'
+        exit 0
+        ;;
+      ruleset_evaluate_only)
+        # A single ruleset listing every canonical check but running in
+        # `evaluate` mode — it reports, it does not block a merge.
+        printf '%s\n' '[{"id":701,"target":"branch"}]'
+        exit 0
+        ;;
       *)
         printf '%s\n' "[]"
         exit 0
@@ -185,12 +205,12 @@ case "$path" in
     ;;
   */rulesets/101)
     # ~ALL include, canonical checks
-    printf '%s\n' '{"id":101,"target":"branch","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    printf '%s\n' '{"id":101,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
     exit 0
     ;;
   */rulesets/102)
     # refs/heads/* glob include, canonical checks
-    printf '%s\n' '{"id":102,"target":"branch","conditions":{"ref_name":{"include":["refs/heads/*"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    printf '%s\n' '{"id":102,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/*"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
     exit 0
     ;;
   */rulesets/201)
@@ -198,12 +218,12 @@ case "$path" in
     # checks that, if leaked into the audit, would NOT include the
     # canonical set (so we can assert "FAIL: no rulesets target main"
     # rather than "FAIL: <canonical> missing").
-    printf '%s\n' '{"id":201,"target":"branch","conditions":{"ref_name":{"include":["refs/heads/dev"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"dev-only-check"}]}}]}'
+    printf '%s\n' '{"id":201,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/dev"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"dev-only-check"}]}}]}'
     exit 0
     ;;
   */rulesets/202)
     # ~DEFAULT_BRANCH with canonical checks — should match audit of main.
-    printf '%s\n' '{"id":202,"target":"branch","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    printf '%s\n' '{"id":202,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
     exit 0
     ;;
   */rulesets/301)
@@ -211,20 +231,53 @@ case "$path" in
     # rule, but the ruleset must be IGNORED for the audit of main.
     # Without exclude handling, the prior implementation would PASS
     # — which is the bug #285 r2 closes.
-    printf '%s\n' '{"id":301,"target":"branch","conditions":{"ref_name":{"include":["~ALL"],"exclude":["refs/heads/main"]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"}]}}]}'
+    printf '%s\n' '{"id":301,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":["refs/heads/main"]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"}]}}]}'
     exit 0
     ;;
   */rulesets/401)
     # ~ALL include, every canonical check required — and a bypass list.
     # The checks are all there, so this ruleset PASSES the required-checks
     # half; only the admin-enforcement half can catch it.
-    printf '%s\n' '{"id":401,"target":"branch","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    printf '%s\n' '{"id":401,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/501|*/rulesets/502)
+    # Two ~DEFAULT_BRANCH rulesets carrying the canonical checks. The
+    # `exclude` list holds a pattern that does NOT resolve the default
+    # branch, so the only ~DEFAULT_BRANCH resolutions come from the two
+    # includes — one per ruleset.
+    printf '%s\n' '{"id":'"${path##*/}"',"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":["refs/heads/dev"]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/601)
+    # Active, requires every canonical check, NO bypass actors — this
+    # ruleset alone makes all five mandatory for everybody.
+    printf '%s\n' '{"id":601,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"bypass_actors":[],"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/602)
+    # Active, grants a bypass actor — but the only check it requires is a
+    # project build check, so nobody can skip a canonical gate through it.
+    printf '%s\n' '{"id":602,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"bypass_actors":[{"actor_id":7,"actor_type":"Team","bypass_mode":"always"}],"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"project-build"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/701)
+    # Every canonical check listed, but enforcement is `evaluate` — the
+    # ruleset reports rule outcomes and blocks nothing.
+    printf '%s\n' '{"id":701,"target":"branch","enforcement":"evaluate","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
     exit 0
     ;;
   repos/*/*)
     # Repository metadata — the audit reads .default_branch from here,
     # both to resolve `~DEFAULT_BRANCH` ruleset conditions and (in
     # --fleet) to pick each repo's audited branch.
+    #
+    # Every metadata read is logged when STUB_METADATA_LOG is set, so a
+    # test can assert the single-repo audit resolves the default branch
+    # ONCE however many ~DEFAULT_BRANCH patterns it evaluates.
+    if [ -n "${STUB_METADATA_LOG:-}" ]; then
+      printf '%s\n' "$path" >>"$STUB_METADATA_LOG"
+    fi
     #
     # STUB_DEFAULT_BRANCH_MAP is a space-separated list of
     # `owner/name=branch` pairs; the sentinel branch `fail` makes the
@@ -573,6 +626,77 @@ elif ! echo "$out" | grep -q "Admin enforcement: OK"; then
   fail "ruleset without bypass actors: expected an explicit admin-enforcement OK line; output: $out"
 else
   pass "ruleset with an empty bypass list satisfies --require-admin-enforcement"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 18: a bypass entry only weakens the ruleset that grants it. Ruleset
+#          601 requires all five canonical checks with nobody able to
+#          bypass it; ruleset 602 grants a bypass but requires only an
+#          unrelated project check. Nothing canonical is skippable, so this
+#          must PASS. Treating "any matching ruleset has a bypass actor" as
+#          proof of skippability filed a fully enforced hub as DRIFT and
+#          refreshed the weekly rollup issue for it.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_bypass_unrelated_rule --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "bypass on an unrelated rule: exit $rc, expected 0 (no canonical check is skippable); output: $out"
+elif ! echo "$out" | grep -q "Admin enforcement: OK"; then
+  fail "bypass on an unrelated rule: expected an explicit admin-enforcement OK line; output: $out"
+elif echo "$out" | grep -q "are skippable"; then
+  fail "bypass on an unrelated rule: must not report the canonical checks as skippable; output: $out"
+else
+  pass "bypass on a ruleset requiring no canonical check: does not read as an admin-bypass gap"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 19: an `evaluate`-mode ruleset reports rule outcomes without
+#          blocking a merge, so its required status checks do not gate
+#          anything. Counting them would report PASS on a branch nothing
+#          actually protects — the exact false-clean verdict #774 exists to
+#          remove.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_evaluate_only 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "evaluate-only ruleset: exit $rc, expected 3 (a non-enforcing ruleset gates nothing); output: $out"
+elif ! echo "$out" | grep -q "enforcement is 'evaluate'"; then
+  fail "evaluate-only ruleset: output must say why the ruleset was not counted; output: $out"
+elif echo "$out" | grep -q "PASS:"; then
+  fail "evaluate-only ruleset: must NOT report PASS; output: $out"
+else
+  pass "evaluate-mode ruleset: its required checks are not credited as gating"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 20: the repo's default branch is resolved ONCE per audit, however
+#          many `~DEFAULT_BRANCH` patterns are evaluated. The resolver
+#          memoises, but the matcher used to be called inside a command
+#          substitution, so every memo was written in a subshell and
+#          discarded — two ~DEFAULT_BRANCH rulesets meant two
+#          GET /repos/{owner}/{repo} calls per repo (fleet-wide), and a
+#          transient failure on a later call could downgrade an already
+#          resolved answer to the main/master guess.
+# ---------------------------------------------------------------------------
+META_LOG="$WORKDIR/metadata-calls.txt"
+: >"$META_LOG"
+set +e
+out=$(STUB_METADATA_LOG="$META_LOG" STUB_DEFAULT_BRANCH=trunk \
+        run_audit ruleset_default_branch_twice --branch trunk 2>&1)
+rc=$?
+set -e
+meta_calls=$(grep -c . "$META_LOG" 2>/dev/null || true)
+[ -n "$meta_calls" ] || meta_calls=0
+if [ "$rc" -ne 0 ]; then
+  fail "default-branch memo: exit $rc, expected 0; output: $out"
+elif [ "$meta_calls" -ne 1 ]; then
+  fail "default-branch memo: GET repos/{owner}/{repo} called $meta_calls time(s), expected exactly 1 (the memo is being discarded in a subshell)"
+else
+  pass "default-branch memo survives across matcher calls (one metadata read per repo)"
 fi
 
 # ===========================================================================
