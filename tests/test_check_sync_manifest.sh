@@ -1465,8 +1465,76 @@ SPAN_EOF
     fi
   fi
 
+  # Case 43: § 4's self-recognition rule is neither over- nor
+  # under-scoped.
+  #
+  # docs/agents/decision-records.md is canonical/all (Case 36), so § 4
+  # is the fleet-wide instruction every agent follows before it writes
+  # a decision comment. Its job is to tell a retry of your own crashed
+  # write apart from a re-adoption of a decision the issue superseded,
+  # and a rule that gets that wrong posts a duplicate comment — the one
+  # failure the hidden markers exist to prevent.
+  #
+  # Two ways to get it wrong, and this case pins both:
+  #
+  #   (1) OVER-CLAIM. Deciding it purely by comment ordering rests on
+  #       "a crashed run's own write is always the newest, because
+  #       nothing has been posted after it" — false the moment a second
+  #       agent writes to the same issue. Its record is newer, your own
+  #       unfinished write then reads as a superseded earlier adoption,
+  #       and you post a second comment for a decision you already
+  #       posted. So § 4 must not assert the premise unconditionally,
+  #       and must name the concurrent-writer case it fails on.
+  #
+  #   (2) UNDER-SCOPE. A supersession check scoped to the `decision-`
+  #       family alone misses a pivot recorded ONLY as a change-level
+  #       `path-taken-` comment (placement 2 emits no decision comment
+  #       for that case). The superseded decision then still reads as
+  #       the issue's latest `decision-` record, and a later re-adoption
+  #       inherits the pre-supersession date and edits the first
+  #       adoption's rationale away. So § 4 must require the scan across
+  #       BOTH marker families.
+  #
+  # Assertions run against § 4 only — heading exclusive, up to the next
+  # `###` — so wording elsewhere in the file cannot satisfy or trip
+  # them (nathanjohnpayne/mergepath#794).
+  DR_PATH="docs/agents/decision-records.md"
+  if [ ! -f "$ROOT/$DR_PATH" ]; then
+    fail "Case 43: $DR_PATH missing on disk"
+  else
+    idem_sec=$(awk '
+      index($0, "### 4. Idempotency") == 1 { in_sec = 1; next }
+      in_sec && /^### / { exit }
+      in_sec { print }
+    ' "$ROOT/$DR_PATH")
+    set +e
+    # (1) the unconditional premise, and the single-family scoping it
+    #     was written with, must both be gone.
+    over_claim=$(printf '%s\n' "$idem_sec" | grep -cF 'always the newest')
+    family_scoped=$(printf '%s\n' "$idem_sec" | grep -cF 'marker of that family')
+    # (1) the limitation must be stated, not merely implied.
+    concurrency=$(printf '%s\n' "$idem_sec" | grep -cF 'concurrent writer')
+    # (2) one bullet must require BOTH families in the same breath —
+    #     naming them separately is what the under-scoped version
+    #     already did.
+    both_families=$(printf '%s\n' "$idem_sec" \
+      | grep -F 'decision-' | grep -F 'path-taken-' | grep -c 'both')
+    set -e
+    if [ -z "$idem_sec" ]; then
+      fail "Case 43: $DR_PATH has no '### 4. Idempotency' section"
+    elif [ "${over_claim:-0}" -gt 0 ] || [ "${family_scoped:-0}" -gt 0 ]; then
+      fail "Case 43: $DR_PATH § 4 still decides retry-vs-re-adoption by comment ordering within one marker family (over-claim hits=${over_claim:-0}, single-family hits=${family_scoped:-0}) — a concurrent writer's comment is newer than your crashed write, so your own record reads as superseded and the retry posts a duplicate (nathanjohnpayne/mergepath#794)"
+    elif [ "${concurrency:-0}" -lt 1 ]; then
+      fail "Case 43: $DR_PATH § 4 does not name the concurrent-writer case that inverts comment ordering — the limitation has to be stated, not left for the reader to discover (nathanjohnpayne/mergepath#794)"
+    elif [ "${both_families:-0}" -lt 1 ]; then
+      fail "Case 43: $DR_PATH § 4 has no bullet requiring the supersession scan across BOTH the 'decision-' and 'path-taken-' families — a decision superseded only by a change-level path record still reads as current, and the re-adoption edits the first adoption's rationale away (nathanjohnpayne/mergepath#794)"
+    else
+      pass "Case 43: § 4 self-recognition is content-anchored, states its concurrent-writer limit, and scans both marker families"
+    fi
+  fi
+
 else
-  echo "SKIP: Cases 36-42 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-43 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
