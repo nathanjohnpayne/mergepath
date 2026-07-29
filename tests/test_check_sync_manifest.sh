@@ -1330,6 +1330,42 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         while (base_depth > 0 && stack[base_depth] > ind) base_depth--
         if (base_depth > 0) marker_base = stack[base_depth]
 
+        # A BLOCK QUOTE is a container this parser does not model, and
+        # `quote_para` is the little of it the setext rule below cannot
+        # do without: whether the paragraph CURRENTLY open sits inside
+        # one.
+        #
+        # It lapses with that paragraph. The incoming `para` still holds
+        # what the line before left behind, so a paragraph closed
+        # anywhere above — by a fence line, by a blank — takes its quote
+        # with it and a fresh unquoted paragraph starts clean.
+        #
+        # A quote marker exists only within four columns of the
+        # container the line is inside, on the same terms as the leaf
+        # blocks below: past that the line is indented-code shaped and
+        # its `>` is code text, not a marker. Reading one there would
+        # suppress a setext underline that CommonMark honours.
+        #
+        # A marker with nothing but blanks after it is a BLANK LINE
+        # inside the quote, and it closes the paragraph there the way
+        # any blank closes one — so it leaves no paragraph open, inside
+        # the quote or outside it, and the line after can be neither a
+        # lazy continuation nor a setext underline. Treating it as
+        # quoted prose instead keeps `quote_para` raised over a
+        # paragraph that has already ended, and the underline CommonMark
+        # does honour after it is refused. `quote_blank` carries the
+        # other half of that to the paragraph state at the bottom.
+        quote_blank = 0
+        if (!para) quote_para = 0
+        if (ind < marker_base + 4 && substr(rest, 1, 1) == ">") {
+          if (substr(rest, 2) ~ /[^ \t]/) {
+            quote_para = 1
+          } else {
+            quote_para = 0
+            quote_blank = 1
+          }
+        }
+
         # Leaf blocks that are NOT paragraphs, recognised before the
         # marker branch because both of the things below need them.
         #
@@ -1353,13 +1389,25 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         # more of the same paragraph — the UNDER-reporting direction.
         # A heading and a thematic break carry no such rule: either one
         # at column zero really does end the item.
+        #
+        # `ind >= list_indent` asks that question of LIST containers,
+        # the only ones the stack holds. A block quote holds paragraphs
+        # just as well and is not modelled at all, so at top level
+        # inside one the test is trivially true — `ind` and
+        # `list_indent` are both zero — and an underline-shaped lazy
+        # continuation reads as a real underline. `quote_para` asks the
+        # same question of the container the stack cannot answer for.
+        # It needs no indent test of its own: a line carrying the `>`
+        # marker is never underline-shaped to this parser, so while a
+        # quoted paragraph is open EVERY underline-shaped line is lazy.
         atx = 0
         tbreak = 0
         setext = 0
         if (ind < marker_base + 4) {
           atx = is_atx_heading(rest)
           tbreak = is_thematic_break(rest)
-          setext = (para && ind >= list_indent && is_setext_underline(rest))
+          setext = (para && !quote_para && ind >= list_indent &&
+                    is_setext_underline(rest))
         }
 
         # Because neither one can be a lazy continuation, a heading or a
@@ -1406,7 +1454,7 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
             marker_width = 0
           } else if (!empty_marker && gap == "") {
             marker_width = 0
-          } else if (para && ind >= list_indent &&
+          } else if (para && !quote_para && ind >= list_indent &&
                      (empty_marker || (marker !~ /^[-*+]$/ &&
                                        !ordered_start_one(marker)))) {
             # A list may only interrupt a paragraph on the terms
@@ -1427,6 +1475,18 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
             # the lines inside the new item are then measured against
             # the enclosing block and blanked as code — the
             # UNDER-reporting direction.
+            #
+            # A marker outside the BLOCK QUOTE holding the paragraph is
+            # that same marker-left-of-the-block case, which is why
+            # `quote_para` bars the restriction as well. The line
+            # carries no `>`, so it is not inside the quote; being no
+            # more of a paragraph than it is a lazy continuation, it
+            # ends the quote and opens its list on the terms of the
+            # DOCUMENT, where nothing is being interrupted. CommonMark
+            # is explicit about the result: `-` alone under a quoted
+            # paragraph opens an empty item, and `2.` opens a list
+            # starting at two, neither of which either shape may do
+            # under a paragraph of its own block.
             marker_width = 0
           } else if (empty_marker) {
             marker_width = marker_width + 1
@@ -1463,9 +1523,13 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
         # A marker that opened an EMPTY item is the same story from the
         # other end: it emits a line and opens a container, but there is
         # no content on it and therefore no paragraph, so the indented
-        # code block that may follow it directly is code.
+        # code block that may follow it directly is code. A block quote
+        # marker with nothing after it is the same again, one container
+        # further out: the blank line it stands for closes the paragraph
+        # inside the quote, and it closes any paragraph the quote
+        # interrupted on its way in, so nothing is left open either way.
         para = 1
-        if (atx || tbreak || setext || empty_item) para = 0
+        if (atx || tbreak || setext || empty_item || quote_blank) para = 0
         line = strip_code_spans(line)
         gsub(/\]\(#[^)]*\)/, "]()", line)
         print line
@@ -2327,8 +2391,111 @@ NINE_EOF
     pass "Case 51: an ordered marker is capped at nine digits, so a longer run cannot install a phantom container"
   fi
 
+  # Case 52: a BLOCK QUOTE is a container too.
+  #
+  # Cases 49 and 50 pin the lazy-continuation rules against LIST
+  # containers, which the parser keeps on a stack, and both are written
+  # as `ind >= list_indent`. A block quote holds paragraphs just as well
+  # and is on no stack at all, so at top level inside one that test is
+  # trivially true — both numbers are zero — and every fixture above
+  # still passes with the rules silently switched off.
+  #
+  # The first document is the setext half. A setext underline may not be
+  # a LAZY continuation line, so the `===` on line 4 underlines nothing
+  # and the quoted paragraph runs on through line 5. Read it as an
+  # underline and the paragraph closes, line 5 is four columns past the
+  # document, and its `#222` is blanked as code and ships to every
+  # consumer unflagged — the UNDER-reporting direction this parser must
+  # never take. A bare `-` in place of the `===` does the same.
+  #
+  # The second document is the marker half, off the same miscount. A
+  # marker outside the quote holding the paragraph interrupts nothing:
+  # it ends the quote and opens its list against the DOCUMENT. So `-` on
+  # line 4 opens an empty item and `2.` on line 10 opens a list starting
+  # at two, neither of which either shape may do under a paragraph of
+  # its own block. Refuse those containers and lines 7 and 12 are
+  # measured against the document instead and blanked with their refs
+  # inside.
+  #
+  # The third document is the limit on all of it, and it runs the other
+  # way. A quote marker with nothing after it is a BLANK line inside the
+  # quote: it closes the paragraph there, and it closes any paragraph
+  # the quote interrupted on its way in. So line 6 IS a real underline
+  # and line 11 continues nothing. Holding the quote over a paragraph
+  # that has already ended emits lines 7 and 11 as prose and fails a
+  # required check on a `#NN` that is code.
+  #
+  # Every classification here is markdown-it-py in commonmark mode,
+  # which renders lines 3-5 of the first document as one `<p>` inside a
+  # `<blockquote>`, lines 5 and 7 and lines 10 and 12 of the second as
+  # the two paragraphs of an `<li>` apiece, and lines 7 and 11 of the
+  # third inside `<pre><code>`.
+  QUOTE_DOC="$WORKDIR/consumer-truth-lazy-quote.md"
+  cat > "$QUOTE_DOC" <<'QUOTE_EOF'
+# Doc
+
+> Canonical source: the review policy, mentioning #111.
+===
+    Then fix #222 before merging.
+
+And a bare #333 in prose is.
+QUOTE_EOF
+  set +e
+  quote_hits=$(md_prose_only "$QUOTE_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  quote_lines=$(md_prose_only "$QUOTE_DOC" | wc -l | tr -d ' ')
+  quote_raw=$(wc -l < "$QUOTE_DOC" | tr -d ' ')
+  set -e
+  QLIST_DOC="$WORKDIR/consumer-truth-quote-marker.md"
+  cat > "$QLIST_DOC" <<'QLIST_EOF'
+# Doc
+
+> A quote mentioning #111.
+-
+    An item paragraph mentioning #222.
+
+    A second paragraph of that same item, mentioning #333.
+
+> Another quote mentioning #444.
+2. A list starting at two, mentioning #555.
+
+    Its continuation, mentioning #666.
+QLIST_EOF
+  set +e
+  qlist_hits=$(md_prose_only "$QLIST_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  set -e
+  QBLANK_DOC="$WORKDIR/consumer-truth-quote-blank.md"
+  cat > "$QBLANK_DOC" <<'QBLANK_EOF'
+# Doc
+
+> A quote mentioning #111.
+>
+A real heading, since the quote closed the paragraph inside it
+===
+    echo "#222 is code"
+
+Prose the empty quote interrupts, mentioning #333.
+>
+    echo "#444 is code"
+
+And a bare #555 in prose is.
+QBLANK_EOF
+  set +e
+  qblank_hits=$(md_prose_only "$QBLANK_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  set -e
+  if [ "$quote_hits" != "3,5,7," ]; then
+    fail "Case 52: expected lines 3,5,7 flagged (a setext underline cannot lazily continue a quoted paragraph, so the paragraph runs on), got '$quote_hits'"
+  elif [ "$quote_lines" != "$quote_raw" ]; then
+    fail "Case 52: md_prose_only must emit one line per input line, got $quote_lines for $quote_raw"
+  elif [ "$qlist_hits" != "3,5,7,9,10,12," ]; then
+    fail "Case 52: expected lines 3,5,7,9,10,12 flagged (a marker outside the quote interrupts nothing, so it opens its container), got '$qlist_hits'"
+  elif [ "$qblank_hits" != "3,9,13," ]; then
+    fail "Case 52: expected lines 3,9,13 flagged (a quote marker with nothing after it leaves no paragraph open, so the code after it is excluded), got '$qblank_hits'"
+  else
+    pass "Case 52: the lazy-continuation rules follow block quotes as well as lists, so a quoted paragraph keeps its prose and a closed one is not held open"
+  fi
+
 else
-  echo "SKIP: Cases 36-51 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-52 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
