@@ -36,6 +36,11 @@
 #     block carries the #772 enforcement cases: arm 1 now demands positive
 #     proof that `Merge clearance gate` is a REQUIRED status check on the PR's
 #     base branch, not just `codex.external_review_gate.enabled: true`.
+#     Protection 1q–1s2 cover #781 item 1 (the bypass-actor lookup follows the
+#     ruleset's OWNING scope, so an inherited org ruleset is readable) and
+#     1t–1z2 cover #781 item 11 (bypass actors are evaluated against the
+#     merging identity rather than counted, allowlist-style, with every
+#     unresolvable actor still disqualifying the ruleset).
 #
 # Bash 3.2 portable.
 
@@ -139,12 +144,23 @@ if [ "$1" = "api" ]; then
       exit 0
       ;;
     repos/*/rulesets/*)
-      # #772 r2 P1: bypass-actor lookup for a candidate ruleset.
+      # #772 r2 P1: bypass-actor lookup for a candidate REPOSITORY ruleset.
       if [ "${FIXTURE_RULESET_OBJ_FAIL:-0}" = "1" ]; then
         echo "STUB gh: simulated ruleset object read failure" >&2
         exit 1
       fi
       cat "${FIXTURE_RULESET_OBJ:-/dev/null}"
+      exit 0
+      ;;
+    orgs/*/rulesets/*)
+      # #781 item 1: an ORG-level ruleset inherited by the repo lives only
+      # here. Absent fixture == the real 404 an org ruleset produces when a
+      # caller looks for it under the repository path.
+      if [ -z "${FIXTURE_ORG_RULESET_OBJ:-}" ]; then
+        echo "gh: Not Found (HTTP 404)" >&2
+        exit 1
+      fi
+      cat "$FIXTURE_ORG_RULESET_OBJ"
       exit 0
       ;;
     repos/*/rules/branches/*)
@@ -213,11 +229,18 @@ chmod +x "$STUB_DIR/codex-check-stub"
 # the available_reviewers list.
 # ---------------------------------------------------------------------------
 make_scratch() {
+  # <dependabot_enabled> <external_enabled> [author_identity]
+  # Pass "" as the third argument to OMIT author_identity entirely — the
+  # "merging identity unknown" case, in which the #781 probe must rule no
+  # bypass actor out.
   local dependabot_enabled=$1 external_enabled=$2
+  local author_identity=${3-nathanjohnpayne}
   local dir
   dir=$(mktemp -d "$WORKDIR/scratch.XXXXXX")
   mkdir -p "$dir/.github"
-  cat >"$dir/.github/review-policy.yml" <<EOF
+  [ -z "$author_identity" ] \
+    || printf 'author_identity: %s\n' "$author_identity" >"$dir/.github/review-policy.yml"
+  cat >>"$dir/.github/review-policy.yml" <<EOF
 external_review_threshold: 300
 external_review_paths:
   - ".github/**"
@@ -282,13 +305,20 @@ make_protection_fixture() {  # <contexts_json_array>  GraphQL refUpdateRule shap
   echo "$file"
 }
 
-make_rulesets_fixture() {  # <contexts_json_array> [ruleset_id]  rules/branches/<branch> shape
-  local contexts=$1 rs_id=${2:-101}
+make_rulesets_fixture() {  # <contexts_json_array> [ruleset_id] [source_type] [source]
+  # rules/branches/<branch> shape. The real endpoint always reports the OWNING
+  # scope of each rule via ruleset_source_type / ruleset_source, and the #781
+  # probe selects the repository vs organization ruleset endpoint from it, so
+  # the fixture carries them. Defaults to a repository-owned ruleset.
+  local contexts=$1 rs_id=${2:-101} src_type=${3:-Repository} src=${4:-owner/repo}
   local file="$WORKDIR/rulesets.$$.$RANDOM.json"
   jq -n --argjson contexts "$contexts" --argjson rs_id "$rs_id" \
+        --arg src_type "$src_type" --arg src "$src" \
         --argjson app "${FIXTURE_RULESET_APP_ID:-15368}" '
     [ { type: "required_status_checks",
         ruleset_id: $rs_id,
+        ruleset_source_type: $src_type,
+        ruleset_source: $src,
         parameters: { required_status_checks: [ $contexts[] | { context: ., integration_id: $app } ] } } ]
   ' >"$file"
   echo "$file"
@@ -1713,7 +1743,9 @@ FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions"
 FIXTURE_COMMENTS=$(make_comments_fixture '[]')
 FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
 NOPIN_RULES="$WORKDIR/rulesets-nopin.$$.json"
-jq -n --arg n "$GATE_CHECK_NAME" '[{type:"required_status_checks",ruleset_id:101,parameters:{required_status_checks:[{context:$n}]}}]' >"$NOPIN_RULES"
+# Carries the owning-scope metadata (#781 item 1) so the ONLY thing keeping
+# this ruleset from counting is the missing integration pin.
+jq -n --arg n "$GATE_CHECK_NAME" '[{type:"required_status_checks",ruleset_id:101,ruleset_source_type:"Repository",ruleset_source:"owner/repo",parameters:{required_status_checks:[{context:$n}]}}]' >"$NOPIN_RULES"
 set +e
 OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
       FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$NOPIN_RULES" \
@@ -1773,6 +1805,326 @@ if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
   pass "protection: unreadable ruleset object → not counted, falls through to arm 2 → false"
 else
   fail "protection: unreadable ruleset object expected false/0; got rc=$RC out='$OUT'"
+fi
+
+# ---------------------------------------------------------------------------
+# #781 item 1 — the ruleset's OWNING SCOPE selects the endpoint the bypass-actor
+# lookup reads. A repo-only lookup makes every inherited org ruleset unreadable,
+# hence unproven, hence arm 1 false forever on a centrally governed repo.
+# ---------------------------------------------------------------------------
+
+echo; echo "--- Protection 1q (#781 item 1): an INHERITED ORG ruleset is read from the org endpoint → true"
+# The repository endpoint 404s for an org-owned ruleset (FIXTURE_RULESET_OBJ_FAIL
+# models that), so this passes only if the probe follows ruleset_source_type.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')" 101 Organization acme-org)
+ORG_OBJ=$(make_ruleset_object_fixture "[]")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESET_OBJ_FAIL=1 FIXTURE_ORG_RULESET_OBJ="$ORG_OBJ" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "protection: inherited org ruleset resolved from orgs/{org}/rulesets → counted → true (#781 item 1)"
+else
+  fail "protection: inherited org ruleset expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1q2 (#781 item 1): the org lookup actually hits orgs/{org}/rulesets/{id}"
+if grep -qF "orgs/acme-org/rulesets/101" "$WORKDIR/gh-calls.log"; then
+  pass "protection: org-scoped ruleset read used the organization endpoint"
+else
+  fail "protection: expected an orgs/acme-org/rulesets/101 call in the gh log"
+fi
+
+echo; echo "--- Protection 1r (#781 item 1): an ENTERPRISE-owned ruleset is not readable here → false"
+# Enterprise rulesets live behind an enterprise-admin endpoint this token does
+# not have. Unverifiable bypass actors are not proof — drop, do not guess.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')" 101 Enterprise acme-ent)
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: enterprise-owned ruleset → not counted → false (#781 item 1)"
+else
+  fail "protection: enterprise-owned ruleset expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1s (#781 item 1): a rule with NO ruleset_source_type is not counted"
+# An unrecognized payload shape cannot be verified, so it is dropped rather
+# than assumed to be a repository ruleset.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+NOSRC_RULES="$WORKDIR/rulesets-nosrc.$$.json"
+jq -n --arg n "$GATE_CHECK_NAME" '[{type:"required_status_checks",ruleset_id:101,parameters:{required_status_checks:[{context:$n,integration_id:15368}]}}]' >"$NOSRC_RULES"
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$NOSRC_RULES" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: rule with no ruleset_source_type → not counted → false (#781 item 1)"
+else
+  fail "protection: sourceless ruleset rule expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1s2 (#781 item 1): an org ruleset_source that is not a bare login is rejected"
+# $ruleset_source is interpolated into a URL path; a value carrying a slash
+# would address a different resource entirely.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')" 101 Organization "acme/../other")
+ORG_OBJ=$(make_ruleset_object_fixture "[]")
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_ORG_RULESET_OBJ="$ORG_OBJ" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: org ruleset_source that is not a bare login → not counted → false (#781 item 1)"
+else
+  fail "protection: malformed org ruleset_source expected false/0; got rc=$RC out='$OUT'"
+fi
+
+# ---------------------------------------------------------------------------
+# #781 item 11 — bypass actors are evaluated against the MERGING identity
+# instead of counted. The allowlist of provably-inapplicable actors is
+# {DeployKey, Integration != the trusted Actions app}; every other actor type,
+# and every unknown, still disqualifies the ruleset (the #772 r2 rule).
+# Protection 1i above is the OrganizationAdmin half of the safety direction.
+# ---------------------------------------------------------------------------
+
+echo; echo "--- Protection 1t (#781 item 11): a bypass Integration that is NOT the merger → still enforcement → true"
+# A deployment App is a different principal from the user account that runs
+# `gh pr merge`, so it cannot make that merge unconstrained.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+DEPLOY_APP_OBJ=$(make_ruleset_object_fixture '[{"actor_id":40001,"actor_type":"Integration","bypass_mode":"always"}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESET_OBJ="$DEPLOY_APP_OBJ" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "protection: non-merging bypass Integration ruled out → ruleset still counts → true (#781 item 11)"
+else
+  fail "protection: non-merging bypass Integration expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1u (#781 item 11): a bypass DeployKey cannot merge a PR → still enforcement → true"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+DEPLOYKEY_OBJ=$(make_ruleset_object_fixture '[{"actor_id":null,"actor_type":"DeployKey","bypass_mode":"always"}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESET_OBJ="$DEPLOYKEY_OBJ" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "true" ]; then
+  pass "protection: bypass DeployKey ruled out (no API merge path) → ruleset still counts → true (#781 item 11)"
+else
+  fail "protection: bypass DeployKey expected true/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1v (#781 item 11): a bypass Team can contain the merger → NOT enforcement → false"
+# The #772 r2 defect must stay fixed: a Team is a set of accounts that can
+# include author_identity, and membership is not decidable from this token.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+TEAM_OBJ=$(make_ruleset_object_fixture '[{"actor_id":77,"actor_type":"Team","bypass_mode":"always"}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESET_OBJ="$TEAM_OBJ" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: bypass Team not ruled out → ruleset not counted → false (#772 r2 preserved)"
+else
+  fail "protection: bypass Team expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1v2 (#781 item 11): a bypass RepositoryRole is NOT ruled out → false"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+ROLE_OBJ=$(make_ruleset_object_fixture '[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESET_OBJ="$ROLE_OBJ" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: bypass RepositoryRole not ruled out → false (#772 r2 preserved)"
+else
+  fail "protection: bypass RepositoryRole expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1w (#781 item 11): an UNKNOWN future actor_type fails closed → false"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+FUTURE_OBJ=$(make_ruleset_object_fixture '[{"actor_id":9,"actor_type":"SomeFutureActorType","bypass_mode":"always"}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESET_OBJ="$FUTURE_OBJ" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: unknown bypass actor_type fails closed → false (allowlist, not blocklist)"
+else
+  fail "protection: unknown bypass actor_type expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1x (#781 item 11): a bypass Integration for the TRUSTED Actions app is not ruled out → false"
+# Workflow steps in this repo authenticate as github-actions, so granting that
+# app bypass is not provably outside the merge path.
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+ACTIONS_APP_OBJ=$(make_ruleset_object_fixture '[{"actor_id":15368,"actor_type":"Integration","bypass_mode":"always"}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESET_OBJ="$ACTIONS_APP_OBJ" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: bypass Integration for the trusted Actions app → not ruled out → false"
+else
+  fail "protection: trusted-app bypass Integration expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1y (#781 item 11): one rule-out-able + one not → the ruleset still fails closed"
+SCRATCH=$(make_scratch false true)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+MIXED_OBJ=$(make_ruleset_object_fixture '[{"actor_id":40001,"actor_type":"Integration","bypass_mode":"always"},{"actor_id":1,"actor_type":"OrganizationAdmin","bypass_mode":"always"}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESET_OBJ="$MIXED_OBJ" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: a single un-ruled-out bypass actor disqualifies the whole ruleset → false"
+else
+  fail "protection: mixed bypass actors expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1z (#781 item 11): merging identity UNKNOWN → nothing is ruled out → false"
+# With author_identity absent from the governing policy the "an App is not the
+# merger" premise does not hold, so the probe keeps the strict #772 r2 rule.
+SCRATCH=$(make_scratch false true "")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+DEPLOYKEY_OBJ=$(make_ruleset_object_fixture '[{"actor_id":null,"actor_type":"DeployKey","bypass_mode":"always"}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESET_OBJ="$DEPLOYKEY_OBJ" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: author_identity absent → no bypass actor ruled out → false (#772 r2 behaviour retained)"
+else
+  fail "protection: unknown merging identity expected false/0; got rc=$RC out='$OUT'"
+fi
+
+echo; echo "--- Protection 1z2 (#781 item 11): a [bot] merging identity disables the Integration rule-out → false"
+SCRATCH=$(make_scratch false true "some-app[bot]")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "someone")
+FIXTURE_FILES=$(make_files_fixture '[{"filename":"src/auth/token.js","additions":2,"deletions":0}]')
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_PROTECTION=$(make_protection_fixture '["lint"]')
+FIXTURE_RULESETS=$(make_rulesets_fixture "$(jq -n --arg n "$GATE_CHECK_NAME" '[$n]')")
+DEPLOY_APP_OBJ=$(make_ruleset_object_fixture '[{"actor_id":40001,"actor_type":"Integration","bypass_mode":"always"}]')
+set +e
+OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_FILES="$FIXTURE_FILES" FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+      FIXTURE_PROTECTION="$FIXTURE_PROTECTION" FIXTURE_RULESETS="$FIXTURE_RULESETS" \
+      FIXTURE_RULESET_OBJ="$DEPLOY_APP_OBJ" \
+      MERGE_CLEARANCE_CODEX_CHECK_BIN="$STUB_DIR/codex-check-stub" CODEX_STUB_REQUIRE_HEAD_PIN=1 CODEX_STUB_RC=1 \
+      run_gate "$SCRATCH" --derive-rate-limit-protection 99 owner/repo 2>/dev/null)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && [ "$OUT" = "false" ]; then
+  pass "protection: app-shaped author_identity → Integration rule-out disabled → false"
+else
+  fail "protection: [bot] merging identity expected false/0; got rc=$RC out='$OUT'"
 fi
 
 echo; echo "--- Protection 2 (#713): gate disabled + protected path + Phase-4b/Codex cleared → true"

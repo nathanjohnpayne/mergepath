@@ -1017,8 +1017,17 @@ paths:
     # MODULE_NOT_FOUND. Same lockstep coupling as #259 — propagate the
     # workflow without the module and every consumer's agent-review job
     # fails on the very first PR.
+    #
+    # The load-config job shells out to scripts/workflow/
+    # load_review_config.sh (which in turn calls resolve_base_policy.sh and
+    # parse_policy_list.sh) to export its identity/threshold outputs from the
+    # policy governing the PR (#788). Same lockstep coupling, and the same
+    # declaration pr-review-policy.yml already carries for the parser kit: a
+    # wave that moved the workflow without the kit would break every
+    # consumer's load-config step.
     requires:
       - "scripts/disagreement-detector.cjs"
+      - "scripts/workflow/"
   - path: .github/workflows/pr-review-policy.yml
     type: canonical
     consumers: all

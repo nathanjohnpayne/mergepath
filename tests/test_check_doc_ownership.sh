@@ -82,21 +82,17 @@ run_with_doc_bodies() {
 }
 
 # Same as run_with_fixture, but ALSO writes a stub scripts/ci/check_sync_manifest
-# carrying an IDENTITY_DOCS_DENYLIST array, so the check-9 drift guard has
-# something to read.
-run_with_denylist() {
-  local manifest_content="$1" paths="$2" denylist_body="$3"
+# whose CONTENTS are supplied verbatim ($3), so a case can pin the exact Bash
+# SHAPE of the IDENTITY_DOCS_DENYLIST declaration — a one-line array, an
+# indented closing paren, code living after the array — and not just its body.
+run_with_sibling() {
+  local manifest_content="$1" paths="$2" sibling_source="$3"
   local fix
   fix="$(mktemp -d "$WORKDIR/fix.XXXXXX")"
   printf '%s' "$manifest_content" > "$fix/manifest.yml"
   mkdir -p "$fix/scripts/ci"
   : > "$fix/scripts/sync-to-downstream.sh"
-  {
-    echo '#!/usr/bin/env bash'
-    echo 'IDENTITY_DOCS_DENYLIST=('
-    printf '%s\n' "$denylist_body"
-    echo ')'
-  } > "$fix/scripts/ci/check_sync_manifest"
+  printf '%s\n' "$sibling_source" > "$fix/scripts/ci/check_sync_manifest"
   while IFS= read -r p; do
     [ -z "$p" ] && continue
     case "$p" in
@@ -105,6 +101,13 @@ run_with_denylist() {
     esac
   done <<< "$paths"
   MERGEPATH_MANIFEST_PATH="$fix/manifest.yml" MERGEPATH_REPO_ROOT="$fix" bash "$CHECK" 2>&1
+}
+
+# The common shape: the denylist BODY ($3) wrapped in the canonical
+# multi-line declaration the live sibling uses today.
+run_with_denylist() {
+  run_with_sibling "$1" "$2" \
+    "$(printf '#!/usr/bin/env bash\nIDENTITY_DOCS_DENYLIST=(\n%s\n)\n' "$3")"
 }
 
 MIN_HEADER='version: 1
@@ -755,6 +758,297 @@ if [ "$rc" = "0" ]; then
   pass "Case 12b: denylisted doc classified per-repo-owned passes (control)"
 else
   fail "Case 12b unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12c: QUOTED denylist entries still trip the drift guard ----
+# IDENTITY_DOCS_DENYLIST is Bash source, so an entry may legitimately be
+# written `"docs/agents/x.md"`. A reader that trims whitespace only keeps
+# the leading quote, the guard's `docs/agents/*` case stops matching, and
+# a real contradiction is reported as a PASS (#785/#786). Same fixture as
+# Case 12 with the entries quoted — the verdict must not change.
+set +e
+out=$(run_with_denylist "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '  "README.md"
+  "docs/agents/identity.md"')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12c: double-quoted denylist entry still fails closed (quote stripping)"
+else
+  fail "Case 12c unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12d: single quotes + a trailing inline comment ------------
+# The other half of the real array shape: Bash allows single quotes and a
+# trailing `# ...` comment on the same line. Stripping quotes alone is
+# not enough — the comment leaves a dangling closing quote mid-token.
+set +e
+out=$(run_with_denylist "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  "  'README.md'  # repo-owned front door
+  'docs/agents/identity.md'  # per-repo identity doc")
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12d: single-quoted denylist entry with a trailing comment still fails closed"
+else
+  fail "Case 12d unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12e: CONTROL — a commented-OUT entry is not an entry -------
+# The over-correction mirror of 12c/12d, and a control in the same sense
+# as 12b: it passes both before and after the quote/comment fix. Its job
+# is to pin the tokenizer's other edge — a `#`-prefixed line inside the
+# array is Bash comment text, not an array element, so reading it as one
+# would invent a denylist entry nobody wrote and fail a doc that is
+# correctly classified canonical.
+MANIFEST_DRIFT_COMMENTED="$MIN_HEADER
+paths:
+  - path: docs/agents/identity.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/identity.md
+    class: canonical
+"
+set +e
+out=$(run_with_denylist "$MANIFEST_DRIFT_COMMENTED" "docs/agents/identity.md" \
+  '  "README.md"
+  # "docs/agents/identity.md"  <- withdrawn, see the follow-up')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 12e: a commented-out denylist line is not read as an entry"
+else
+  fail "Case 12e unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12f: the read STOPS at an indented closing paren ----------
+# The array terminator is `)` wherever it falls on the line, not `)` in
+# column 1. Keying off column 1 leaves the reader "inside" once someone
+# indents the paren, and every later line of the sibling — including any
+# quoted docs/agents/ path in ordinary code — becomes denylist data. That
+# invents a denylist entry nobody wrote and fails a doc that is correctly
+# classified canonical, so the assertion here is a PASS: identity.md is
+# NOT on this denylist, it only appears after the array closed.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT_COMMENTED" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=(
+  "README.md"
+  )
+
+emit_identity_hint() {
+  echo "docs/agents/identity.md"
+}')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 12f: an indented closing paren ends the array (no spill into later code)"
+else
+  fail "Case 12f unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12g: a SINGLE-LINE array declaration is read --------------
+# `NAME=(a b)` is ordinary Bash and the whole array can share the
+# declaration line. A reader that consumes that line to detect the
+# declaration and starts collecting on the NEXT one sees an empty
+# denylist, and check 9 skips itself — the same silent no-op as #785,
+# reached by a different route.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=("README.md" "docs/agents/identity.md")')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12g: entries on the declaration line still fail closed"
+else
+  fail "Case 12g unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12h: CONTROL — a paren inside a comment does not close ----
+# The over-correction mirror of 12f, in the same sense 12e mirrors 12c:
+# now that `)` terminates the array anywhere on the line, a `)` sitting
+# in a comment INSIDE the array must not end it early and silently drop
+# every entry below it.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=(
+  "README.md"
+  # withdrawn once (see the #786 follow-up) and then restored
+  "docs/agents/identity.md"
+)')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12h: a closing paren inside a comment does not truncate the array"
+else
+  fail "Case 12h unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12i: a backslash-newline continuation is ONE element ------
+# Bash deletes a backslash-newline inside double quotes as much as
+# outside it, so the two physical lines below are a single element
+# spelling docs/agents/identity.md. A reader that resets its token at
+# each newline sees two fragments instead — neither names a file, the
+# existence check drops both, and the contradiction is skipped.
+set +e
+out=$(run_with_denylist "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '  "README.md"
+  "docs/agents/iden\
+tity.md"')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12i: a line-continued denylist entry is read as one element"
+else
+  fail "Case 12i unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12j: CONTROL — over-correction mirror of 12i --------------
+# Two ways a continuation-aware reader goes wrong, both landing on this
+# one assertion because either would invent `docs/agents/identity.md` and
+# fail a doc whose classification is correct:
+#
+#   * `iden\\` ends in an ESCAPED backslash, not a continuation. Bash
+#     yields `docs/agents/iden\` and `tity.md` as two elements. A reader
+#     that tests the raw line for a trailing backslash joins them into
+#     the denied path instead. The continued line starts in column 1 on
+#     purpose: Bash deletes the backslash-newline but not the next
+#     line's indentation, so an indented `tity.md` would split in both
+#     readings and the fixture would prove nothing.
+#   * the `\` after `tity.md` IS a continuation, and it must not carry
+#     the reader past the `)` on the next line — that would leave it
+#     inside the array to end of file and adopt the path in the function
+#     below as an entry nobody wrote.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT_COMMENTED" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=(
+  docs/agents/iden\\
+tity.md \
+)
+
+emit_identity_hint() {
+  echo "docs/agents/identity.md"
+}')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 12j: an escaped backslash is not a continuation, and a continuation does not outlive the array"
+else
+  fail "Case 12j unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12k: a substitution does not terminate the array ----------
+# `$(...)` owns its own closing paren. Treating that paren as the end of
+# the array stops the read on the first element and returns the truncated
+# prefix as an all-clear, so every static entry BELOW the substitution —
+# here the denylisted doc itself — goes unread. The element that cannot
+# be expanded is still reported, because a denylist read only in part
+# must not pass for a complete one.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+sibling_helper() { echo "README.md"; }
+IDENTITY_DOCS_DENYLIST=(
+  $(sibling_helper)
+  docs/agents/identity.md
+)')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST" \
+   && echo "$out" | grep -q "unexpanded substitution"; then
+  pass "Case 12k: a command substitution neither ends the array nor passes silently"
+else
+  fail "Case 12k unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12l: a later assignment REPLACES the earlier one ----------
+# Bash evaluates the file top to bottom, so the effective denylist is the
+# last assignment, not the first. A reader that stops after the first
+# declaration misses everything a reassignment added.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=(
+  "README.md"
+)
+
+IDENTITY_DOCS_DENYLIST=(
+  "README.md"
+  "docs/agents/identity.md"
+)')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12l: entries added by a later assignment are enforced"
+else
+  fail "Case 12l unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12m: the same rule in the OTHER direction -----------------
+# The mirror of 12l, and the sharper half: reading only the first
+# declaration does not merely miss entries, it keeps ENFORCING entries a
+# reassignment removed — failing a doc whose classification is correct
+# against the denylist Bash actually evaluates.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT_COMMENTED" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=(
+  "README.md"
+  "docs/agents/identity.md"
+)
+
+IDENTITY_DOCS_DENYLIST=(
+  "README.md"
+)')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 12m: entries dropped by a later assignment stop being enforced"
+else
+  fail "Case 12m unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12n: `+=` appends, wherever it is indented ----------------
+# The other half of "the effective value wins": `+=(...)` adds to the
+# array rather than replacing it, and a reassignment is most often
+# written indented inside a conditional or a function.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=("README.md")
+if true; then
+  IDENTITY_DOCS_DENYLIST+=("docs/agents/identity.md")
+fi')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12n: an indented += appends to the denylist"
+else
+  fail "Case 12n unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12o: CONTROL — an unterminated array yields NO entries ----
+# The safety property behind buffering elements instead of streaming
+# them: an array left open by an unbalanced quote is not a short
+# denylist, it is a file Bash would refuse. The reader must publish
+# nothing (so the leftover text below is never mistaken for entries) and
+# say why, rather than silently reporting a clean read.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT_COMMENTED" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=(
+  "README.md
+  "docs/agents/identity.md"')
+rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "never closes"; then
+  pass "Case 12o: an unterminated declaration reads as no denylist, with a note"
+else
+  fail "Case 12o unexpected (rc=$rc): $out"
 fi
 
 # --- Case 14: canonical doc links a HUB-ONLY doc (check 10) ---------

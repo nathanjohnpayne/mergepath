@@ -291,6 +291,9 @@ ALLOW_LIST=(
   #     test_resolve_base_policy.sh joins them for the same reason: the
   #     resolver itself DOES travel (scripts/workflow/ kit), but its suite
   #     stubs `gh` and asserts mergepath's own policy semantics.
+  #     test_load_review_config.sh (#788) is the same shape again: the
+  #     loader travels under the scripts/workflow/ kit, its suite stubs
+  #     `gh` and asserts mergepath's own load-config semantics.
   "tests/test_eslint_policy_check.sh"
   "tests/test_check_mktemp_portability.sh"
   "tests/test_session_finalization_check.sh"
@@ -303,6 +306,7 @@ ALLOW_LIST=(
   "tests/test_external_review_gh_stderr.sh"
   "tests/test_external_review_rename_protection.sh"
   "tests/test_resolve_base_policy.sh"
+  "tests/test_load_review_config.sh"
 
   # The #623 Codex-latency audit script — hub-only operator tooling for
   # this pass (a consumer-repo sweep is a possible follow-up, at which
