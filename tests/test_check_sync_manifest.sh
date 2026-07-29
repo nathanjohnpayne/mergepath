@@ -1495,6 +1495,17 @@ SPAN_EOF
   #       adoption's rationale away. So § 4 must require the scan across
   #       BOTH marker families.
   #
+  #   (3) STOP AT AUTHORSHIP. Content-matching answers "is this record
+  #       mine?" and nothing else. A retry that crashed between the
+  #       comment and the body still owes the body callout, and the
+  #       writer that got in between may have superseded the very
+  #       record the retry just recognized as its own. Finishing the
+  #       retry then replaces the newer decision's active callout with
+  #       the older record's and records no return to it, so the
+  #       chronology and the current disposition disagree. So the same
+  #       bullet must carry the retry past authorship to currency and
+  #       to what happens to the standing callout.
+  #
   # Assertions run against § 4 only — heading exclusive, up to the next
   # `###` — so wording elsewhere in the file cannot satisfy or trip
   # them (nathanjohnpayne/mergepath#794).
@@ -1519,6 +1530,15 @@ SPAN_EOF
     #     already did.
     both_families=$(printf '%s\n' "$idem_sec" \
       | grep -F 'decision-' | grep -F 'path-taken-' | grep -c 'both')
+    # (3) the SAME bullet that settles authorship must go on to say the
+    #     match does not make the record current and to rule on the
+    #     standing callout. The conjunction is the assertion: a bullet
+    #     that names authorship alone is the version that restores an
+    #     older callout over a newer decision. Prose is soft-wrapped
+    #     one line per paragraph, so a bullet is one physical line and
+    #     the per-line conjunction really does pin one claim.
+    self_currency=$(printf '%s\n' "$idem_sec" \
+      | grep -F 'authorship' | grep -F 'currency' | grep -cF 'callout')
     set -e
     if [ -z "$idem_sec" ]; then
       fail "Case 43: $DR_PATH has no '### 4. Idempotency' section"
@@ -1528,13 +1548,86 @@ SPAN_EOF
       fail "Case 43: $DR_PATH § 4 does not name the concurrent-writer case that inverts comment ordering — the limitation has to be stated, not left for the reader to discover (nathanjohnpayne/mergepath#794)"
     elif [ "${both_families:-0}" -lt 1 ]; then
       fail "Case 43: $DR_PATH § 4 has no bullet requiring the supersession scan across BOTH the 'decision-' and 'path-taken-' families — a decision superseded only by a change-level path record still reads as current, and the re-adoption edits the first adoption's rationale away (nathanjohnpayne/mergepath#794)"
+    elif [ "${self_currency:-0}" -lt 1 ]; then
+      fail "Case 43: $DR_PATH § 4 settles authorship but never says the match leaves currency open, nor what becomes of the standing callout — a retry that recognizes its own crashed comment then finishes the body write and swaps a newer decision's active callout for its own older record, with no return to that record recorded anywhere (nathanjohnpayne/mergepath#794)"
     else
-      pass "Case 43: § 4 self-recognition is content-anchored, states its concurrent-writer limit, and scans both marker families"
+      pass "Case 43: § 4 self-recognition is content-anchored, states its concurrent-writer limit, scans both marker families, and stops short of the body when the record it matched has been superseded"
+    fi
+  fi
+
+  # Case 44: the `path-taken-` slug-qualification condition is keyed to
+  # the end of the pivot its slug actually names.
+  #
+  # Placement 2 hands the change-level marker to § 4 wholesale ("§ 4
+  # below governs this marker as well"), but the two slug families name
+  # OPPOSITE ends of a pivot: a `decision-` slug names the decision
+  # ADOPTED, a `path-taken-` slug names the approach ABANDONED. § 4's
+  # condition — a return to something the issue once superseded — is
+  # therefore the wrong test for a path record, and transcribing it
+  # here misses in both directions:
+  #
+  #   away from `use-postgres`  → slug `use-postgres`
+  #   back to `use-postgres`    → slug `use-dynamo`
+  #   away from `use-postgres`  → slug `use-postgres` REPEATS
+  #
+  # Read against the adopted end it qualifies the middle pivot, whose
+  # slug never repeated. Read against the approach the slug names it
+  # says nothing about the third pivot — the only one that collides —
+  # which then keeps the bare `use-postgres`, matches the FIRST pivot's
+  # record on § 4's undated search, and gets that record's date and an
+  # edit-in-place: the first pivot's chronology overwritten by the
+  # third's, which is precisely the loss § 4 exists to prevent.
+  #
+  # The condition that actually tracks the collision is "an earlier
+  # `path-taken-` record already names the approach this pivot is
+  # abandoning" — the approach was recorded as abandoned, re-adopted,
+  # and is being abandoned again. Pinned three ways: the old
+  # adopted-end condition must be gone, one paragraph must state the
+  # abandoned-end one, and the qualified-slug derivation must be spelled
+  # out for this family rather than left to be inferred from § 4's
+  # decision-family example.
+  #
+  # Assertions run against `### Where the record goes` only — heading
+  # exclusive, up to the next level-2 heading, fenced blocks skipped so
+  # the `## Path taken` sample inside them does not end the section
+  # early (nathanjohnpayne/mergepath#794).
+  if [ ! -f "$ROOT/$DR_PATH" ]; then
+    fail "Case 44: $DR_PATH missing on disk"
+  else
+    placement_sec=$(awk '
+      index($0, "### Where the record goes") == 1 { in_sec = 1; next }
+      in_sec && /^```/ { fence = !fence }
+      in_sec && !fence && /^## / { exit }
+      in_sec { print }
+    ' "$ROOT/$DR_PATH")
+    set +e
+    # The adopted-end condition, transcribed from § 4, must be gone.
+    adopted_end=$(printf '%s\n' "$placement_sec" \
+      | grep -cF 'returning to an approach it pivoted away from')
+    # One paragraph must key qualification to the abandoned end. Same
+    # soft-wrap reasoning as Case 43: one paragraph, one physical line.
+    abandoned_end=$(printf '%s\n' "$placement_sec" \
+      | grep -F 'path-taken-' | grep -F 'abandon' | grep -c 'twice')
+    # …and must show what the qualified slug looks like for a family
+    # whose slug names the abandoned approach.
+    qualified_slug=$(printf '%s\n' "$placement_sec" \
+      | grep -cF 'use-postgres-after-dynamo')
+    set -e
+    if [ -z "$placement_sec" ]; then
+      fail "Case 44: $DR_PATH has no '### Where the record goes' section"
+    elif [ "${adopted_end:-0}" -gt 0 ]; then
+      fail "Case 44: $DR_PATH placement 2 still qualifies the 'path-taken-' slug on a RETURN to an abandoned approach — that is the 'decision-' family's condition, and it names the wrong pivot: the repeat happens when the same approach is abandoned twice (nathanjohnpayne/mergepath#794)"
+    elif [ "${abandoned_end:-0}" -lt 1 ]; then
+      fail "Case 44: $DR_PATH placement 2 does not key 'path-taken-' slug qualification to abandoning the same approach twice — the third pivot keeps the bare slug, § 4's undated search hits the FIRST pivot's record, and that record is dated and edited in place (nathanjohnpayne/mergepath#794)"
+    elif [ "${qualified_slug:-0}" -lt 1 ]; then
+      fail "Case 44: $DR_PATH placement 2 states the condition but never shows the qualified 'path-taken-' slug it produces — § 4's only worked example is a decision-family re-adoption, so the derivation is left to be inferred across the very asymmetry this paragraph exists to flag (nathanjohnpayne/mergepath#794)"
+    else
+      pass "Case 44: the 'path-taken-' slug is qualified on the abandoned end of the pivot, with its derivation spelled out"
     fi
   fi
 
 else
-  echo "SKIP: Cases 36-43 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-44 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
