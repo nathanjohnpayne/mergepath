@@ -970,6 +970,16 @@ paths:
   - path: docs/agents/decision-records.md
     type: canonical
     consumers: all
+  # The shared core of the agent operating rules (#780). Every repo keeps
+  # its own docs/agents/operating-rules.md as a per-repo-owned LOCAL
+  # OVERLAY (reading order, architecture, logging, coding conventions);
+  # this file carries only the rules proven true AND usable everywhere.
+  # It is deliberately NOT a mirror of the hub's operating-rules.md — see
+  # the doc_ownership block at the end of this file for the full ownership
+  # inventory and the transitional-debt notes on the mixed docs.
+  - path: docs/agents/shared-operating-rules.md
+    type: canonical
+    consumers: all
 
   # Canonical workflows — review policy + automation surfaces that
   # should be lockstep across all consumers.
@@ -1287,3 +1297,152 @@ paths:
 # audit noise over time. Each entry must list a `reason:` so future
 # readers know whether the exclusion is still load-bearing.
 exclusions: []
+
+# ─────────────────────────────────────────────────────────────────────
+# `doc_ownership:` — exhaustive ownership inventory for docs/agents/ (#780)
+# ─────────────────────────────────────────────────────────────────────
+#
+# WHY IT LIVES HERE. This is the same governance question the rest of
+# this manifest answers — "which files travel to a consumer, and how" —
+# so it belongs in the same file as the `paths:` entries and the
+# identity-doc invariant above, not in a second declaration that can
+# drift from them. Three properties make this the right home:
+#
+#   * It is hub-only by nature. Ownership classes are decided at the
+#     canonical source; the manifest is already mergepath-internal and
+#     never propagated (#268/#271), which matches exactly.
+#   * It is adjacent to the data it constrains. A `class:` here and a
+#     `type:` in `paths:` above are two halves of one statement, and
+#     scripts/ci/check_doc_ownership cross-validates them in one read.
+#   * It inherits the existing validation harness. check_sync_manifest
+#     and check_propagation_closure already parse this file with yq
+#     behind a MERGEPATH_MANIFEST_PATH fixture override, so the new
+#     check reuses the same idiom instead of inventing a second one.
+#
+# THE THREE CLASSES. Every docs/agents/*.md file on disk MUST appear
+# below exactly once, with exactly one of:
+#
+#   canonical      — one source of truth on the hub, mirrored verbatim
+#                    to consumers. Must be true, verbatim, in EVERY repo
+#                    that receives it: no hub identity claims, no
+#                    repo-specific tech stack, no reference to tooling a
+#                    consumer lacks. Backed by a `paths:` entry above.
+#   per-repo-owned — each repo authors and owns its own copy. The hub's
+#                    copy is mergepath's, not a template. Must never be
+#                    a verbatim `canonical`/`kit` entry (it would clobber
+#                    the consumer's copy on the next wave — the #744
+#                    failure).
+#   hub-only       — describes machinery only the hub runs (the
+#                    propagation engine, the bootstrap wizard, the
+#                    templated-render engine, the CodeRabbit config
+#                    audit). Never travels; a consumer copy is bootstrap
+#                    residue to delete, not content to sync.
+#
+# `bootstrap-seeded` is deliberately NOT a class. Bootstrap describes
+# initial DELIVERY, not durable OWNERSHIP: a file seeded into a new repo
+# is afterwards owned by exactly one of the three classes above.
+#
+# MIXED DOCUMENTS. A doc whose content is partly shared and partly
+# repo-specific is TRANSITIONAL DEBT to be split, not a fourth class.
+# Classify it by its DOMINANT ownership and record the split in `note:`.
+# The split itself is separate follow-up work.
+#
+# FIELDS:
+#   path              (required) repo-relative path, must exist on disk. Paths
+#                     must be canonical spellings: no absolute paths, parent
+#                     traversal, embedded dot/empty segments, or commas.
+#   class             (required) canonical | per-repo-owned | hub-only.
+#   pending_manifest  (optional, canonical only) `true` when the class is
+#                     decided but the `paths:` entry has not landed yet.
+#                     Requires a `note:` naming the follow-up. Without
+#                     this flag a canonical class with no `paths:` entry
+#                     is a FAIL — an unbacked canonical claim.
+#   note              (optional, required with pending_manifest) free
+#                     text: the transitional-debt record.
+#
+# ENFORCED by scripts/ci/check_doc_ownership: zero classes, two classes,
+# an unknown class, an unsafe/stale path, an unbacked canonical claim, an
+# unsupported canonical `dest:` remap, or a per-repo-owned/hub-only doc sitting
+# in a verbatim canonical/kit entry all fail the check.
+#
+# ADDING A DOC. A PR that adds a docs/agents/*.md file MUST add its
+# `doc_ownership:` entry in the SAME PR — the check fails closed on an
+# unclassified doc, by design. When two branches race (one adding a doc,
+# one editing this block), whichever merges second adds the entry.
+doc_ownership:
+  # ── canonical ──────────────────────────────────────────────────────
+  - path: docs/agents/shared-operating-rules.md
+    class: canonical
+  - path: docs/agents/worktree-placement.md
+    class: canonical
+  # Landed in #776 while this inventory was in flight. Canonical by the same
+  # reasoning as worktree-placement.md: a single-purpose, tech-stack-independent
+  # convention that is true verbatim in every consumer, already carried as a
+  # `type: canonical` path entry above.
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/code-review-requirements.md
+    class: canonical
+    pending_manifest: true
+    note: >-
+      Pure thin pointer to REVIEW_POLICY.md + .github/review-policy.yml,
+      both present in every consumer. Verified byte-identical (blob
+      9c6d1c37, 515 bytes) on the hub and in 8 of 9 consumers;
+      friends-and-family-billing is the only repo missing it, so
+      canonicalizing is an ADD there and a no-op everywhere else. The
+      `paths:` entry is deliberately deferred to the #780 step-6 class
+      audit, which decides canonical-thin-pointer vs remove-if-unused —
+      no consumer AGENTS.md indexes it today.
+
+  # ── per-repo-owned ─────────────────────────────────────────────────
+  - path: docs/agents/operating-rules.md
+    class: per-repo-owned
+    note: >-
+      MIXED — the transitional debt #780 exists to split. All 9 consumer
+      copies differ from the hub and from each other; five carry large
+      repo-specific architecture, logging, and coding blocks (up to 407
+      lines in device-source-of-truth). Dominant ownership is per-repo,
+      so it stays the LOCAL OVERLAY. The shared half moved to
+      docs/agents/shared-operating-rules.md; removing the now-duplicated
+      prose from each local overlay is #780 steps 4-5 (canary first).
+  - path: docs/agents/documentation-rules.md
+    class: per-repo-owned
+    note: >-
+      MIXED. Repo-specific content dominates (each repo names its own
+      docs and generated-mirror paths), so it stays per-repo-owned. The
+      hub's universal rules — prose line-wrapping and canonical-source
+      discipline — should be extracted into focused canonical docs
+      rather than mirroring this file; that extraction is #780 step 6.
+  - path: docs/agents/deployment-process.md
+    class: per-repo-owned
+    note: >-
+      MIXED. Deploy commands, environments, and build steps are
+      repo-specific by construction, so it stays per-repo-owned. Two
+      residual issues for #780 step 6: the universal 1Password deploy-auth
+      policy is worth extracting into a focused canonical doc, and
+      gaycruisebingo's copy is still byte-identical to the hub's
+      (un-scrubbed bootstrap residue asserting a hub-only workflow it
+      does not have — the #744/#747 class).
+  - path: docs/agents/repository-overview.md
+    class: per-repo-owned
+  - path: docs/agents/testing-requirements.md
+    class: per-repo-owned
+  - path: docs/agents/code-modification-rules.md
+    class: per-repo-owned
+
+  # ── hub-only ───────────────────────────────────────────────────────
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+  - path: docs/agents/propagation-ordering.md
+    class: hub-only
+  - path: docs/agents/templated-propagation.md
+    class: hub-only
+  - path: docs/agents/coderabbit-audit.md
+    class: hub-only
+    note: >-
+      Documents the hub-side CodeRabbit configuration audit. Present in
+      no consumer except gaycruisebingo, where it is un-scrubbed
+      bootstrap residue. Unlike the three hub-only docs above it is NOT
+      yet on check_sync_manifest's IDENTITY_DOCS_DENYLIST nor on
+      bootstrap's mirror-exclude list; adding it to both, and deleting
+      the gaycruisebingo residue, is #780 step 6.

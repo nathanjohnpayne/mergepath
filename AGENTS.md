@@ -5,13 +5,16 @@ Agent instructions are organized into focused sub-files under `docs/agents/`. Re
 ## Sections
 
 1. **[Repository Overview](docs/agents/repository-overview.md)** --- Project description, tech stack, agent role
-2. **[Agent Operating Rules](docs/agents/operating-rules.md)** --- Reading order, conflict resolution
-3. **[Code Modification Rules](docs/agents/code-modification-rules.md)** --- File creation, duplication, directory constraints
-4. **[Documentation Rules](docs/agents/documentation-rules.md)** --- When and what to update; which `docs/**` paths are directly editable vs generated mirrors
-5. **[Testing Requirements](docs/agents/testing-requirements.md)** --- Coverage expectations, test deletion policy
-6. **[Deployment Process](docs/agents/deployment-process.md)** --- Build/deploy flow, 1Password-backed auth
-7. **[Worktree Placement](docs/agents/worktree-placement.md)** --- Where agent-created worktrees/checkouts live on disk (synced canonical convention)
-8. **[Decision Records](docs/agents/decision-records.md)** --- Recording the path taken when a PR reverses direction, and surfacing a comment-recorded decision from the issue body (synced canonical convention)
+2. **[Shared Agent Operating Rules](docs/agents/shared-operating-rules.md)** --- The fleet-wide operating rules, identical in every repo (synced canonical core). Read before the local operating rules below
+3. **[Agent Operating Rules](docs/agents/operating-rules.md)** --- This repo's local overlay: reading order, conflict resolution, and anything true only here
+4. **[Code Modification Rules](docs/agents/code-modification-rules.md)** --- File creation, duplication, directory constraints
+5. **[Documentation Rules](docs/agents/documentation-rules.md)** --- When and what to update; which `docs/**` paths are directly editable vs generated mirrors
+6. **[Testing Requirements](docs/agents/testing-requirements.md)** --- Coverage expectations, test deletion policy
+7. **[Deployment Process](docs/agents/deployment-process.md)** --- Build/deploy flow, 1Password-backed auth
+8. **[Worktree Placement](docs/agents/worktree-placement.md)** --- Where agent-created worktrees/checkouts live on disk (synced canonical convention)
+9. **[Decision Records](docs/agents/decision-records.md)** --- Recording the path taken when a PR reverses direction, and surfacing a comment-recorded decision from the issue body (synced canonical convention)
+
+Item 2 is the stable entrypoint for shared rules: it is one canonical file mirrored to every repo, so a new fleet-wide rule lands by editing it at the canonical source, not by editing every repo's index again.
 
 ## Repository Layout
 

@@ -1,0 +1,471 @@
+#!/usr/bin/env bash
+# check_doc_ownership
+#
+# Validates the `doc_ownership:` inventory in .mergepath-sync.yml — the
+# exhaustive ownership classification for every Markdown file under
+# docs/agents/, including nested instruction directories.
+# See #780 for the design and the decision record it implements.
+#
+# ─────────────────────────────────────────────────────────────────────
+# The gap this closes
+# ─────────────────────────────────────────────────────────────────────
+#
+# Before this check, "who owns docs/agents/<x>.md" was answerable only by
+# inference: a `paths:` entry meant canonical, an IDENTITY_DOCS_DENYLIST
+# entry in check_sync_manifest meant "not verbatim-mirrorable", and
+# anything in neither list was simply undeclared. docs/agents/
+# operating-rules.md sat in that gap for the whole life of the fleet and
+# drifted into nine mutually incompatible copies before anyone had to
+# name its class. A file with no recorded class cannot be audited, and a
+# file with two implied classes is a contradiction nobody sees.
+#
+# So: every Markdown file under docs/agents/ belongs to EXACTLY ONE of canonical /
+# per-repo-owned / hub-only, declared in `doc_ownership:`. Zero classes
+# and more than one class both fail.
+#
+# ─────────────────────────────────────────────────────────────────────
+# What it checks
+# ─────────────────────────────────────────────────────────────────────
+#
+#   1. `doc_ownership:` exists and is a YAML list.
+#   2. Every entry has a non-empty `path` and a `class` in the closed set
+#      {canonical, per-repo-owned, hub-only}.
+#   3. Every entry's `path` is a Markdown path under docs/agents/ that EXISTS on
+#      disk (no stale entries for deleted/renamed docs).
+#   4. No path is declared twice — a duplicate is the "more than one
+#      class" case, and two entries agreeing on the class is still an
+#      ambiguity waiting to diverge.
+#   5. Every Markdown file under docs/agents/ on disk is declared — the "zero classes"
+#      case, and the one that actually happened.
+#   6. `pending_manifest: true` appears only on a `canonical` entry, and
+#      only alongside a non-empty `note:` naming the follow-up.
+#   7. A `canonical` doc is BACKED: it has a fleet-wide (`consumers: all`)
+#      `paths:` entry in the same manifest, or it declares
+#      `pending_manifest: true`. A canonical class with neither is an
+#      unbacked claim — the doc does not travel to the full fleet, so
+#      consumers silently do not have it.
+#   8. A `per-repo-owned` or `hub-only` doc is NOT verbatim-mirrored:
+#      it must not be the path/dest/source of a `type: canonical` or
+#      `type: kit` entry, nor sit inside a kit directory. This is the
+#      #744 clobber invariant, extended from check_sync_manifest's
+#      hard-coded denylist to the FULL docs/agents/ inventory.
+#   9. Drift guard against that denylist: every docs/agents/ path in
+#      check_sync_manifest's IDENTITY_DOCS_DENYLIST must be classified
+#      per-repo-owned or hub-only here. The two declarations state the
+#      same governance fact and must not disagree.
+#
+# This check is read-only and does NOT contact downstream repos.
+
+set -euo pipefail
+
+# Env overrides for tests/test_check_doc_ownership.sh — same contract as
+# check_sync_manifest / check_propagation_closure:
+#   MERGEPATH_MANIFEST_PATH — point at a fixture manifest YAML
+#   MERGEPATH_REPO_ROOT     — point at a fixture repo tree (so the
+#                             docs/agents/ scan and the path-existence
+#                             probe read the fixture, not the live repo)
+REPO_ROOT="${MERGEPATH_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+MANIFEST="${MERGEPATH_MANIFEST_PATH:-$REPO_ROOT/.mergepath-sync.yml}"
+
+VALID_CLASSES="canonical per-repo-owned hub-only"
+
+# ─────────────────────────────────────────────────────────────────────
+# Consumer-side vs mergepath-side disambiguation — BEFORE the yq check.
+# ─────────────────────────────────────────────────────────────────────
+#
+# Identical posture to check_sync_manifest / check_propagation_closure.
+# This wrapper ships via the scripts/ci/ kit and runs in every consumer's
+# repo_lint.yml (#601), but the manifest is mergepath-internal by design
+# (#268/#271) and ownership classes are decided at the canonical source —
+# a consumer has nothing to validate. The marker file
+# scripts/sync-to-downstream.sh exists in mergepath and is intentionally
+# NOT propagated, so its presence distinguishes the two checkouts.
+#
+#   (a) consumer checkout (sync-to-downstream.sh ALSO absent) → SKIP exit 0.
+#   (b) mergepath checkout (sync-to-downstream.sh present)    → FAIL exit 1
+#       (the manifest was accidentally deleted/renamed).
+if [ ! -f "$MANIFEST" ]; then
+  MARKER="$REPO_ROOT/scripts/sync-to-downstream.sh"
+  if [ ! -f "$MARKER" ]; then
+    echo "check_doc_ownership: SKIP (mergepath-only: .mergepath-sync.yml not present in this checkout; scripts/sync-to-downstream.sh also absent → consumer checkout)"
+    exit 0
+  fi
+  echo "FAIL: .mergepath-sync.yml is missing at repo root (but scripts/sync-to-downstream.sh IS present — looks like mergepath itself; the manifest must not be deleted/renamed)"
+  exit 1
+fi
+
+if ! command -v yq >/dev/null 2>&1; then
+  echo "FAIL: yq is required (mikefarah/yq v4+). Install via 'brew install yq' or apt."
+  exit 2
+fi
+
+if ! yq '.' "$MANIFEST" >/dev/null 2>&1; then
+  echo "FAIL: .mergepath-sync.yml does not parse as YAML"
+  yq '.' "$MANIFEST" || true
+  exit 1
+fi
+
+FAILED=0
+
+# Normalize a manifest path the same way check_sync_manifest does: strip
+# leading "./" segments, drop a trailing slash, fold the repo-root
+# spellings to ".". Without this, "./docs/agents/x.md" or a "." kit
+# bypasses the raw string compare in check 8.
+mp_normalize_path() {
+  local p="$1"
+  while [ "${p#./}" != "$p" ]; do p="${p#./}"; done
+  p="${p%/}"
+  case "$p" in ""|".") p="." ;; esac
+  printf '%s' "$p"
+}
+
+mp_path_is_unsafe() {
+  local p="$1"
+  local stripped="$p"
+  while [ "${stripped#./}" != "$stripped" ]; do stripped="${stripped#./}"; done
+  case "$p" in
+    /*|..|../*|*/..|*/../*) return 0 ;;
+  esac
+  case "$stripped" in
+    *,*|*//*|*/.|*/./*) return 0 ;;
+  esac
+  return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# 1. `doc_ownership:` shape.
+# ─────────────────────────────────────────────────────────────────────
+#
+# Same fail-closed extraction idiom as the sibling checks: assert the
+# YAML tag is a sequence FIRST. A scalar `doc_ownership: oops` would let
+# `.doc_ownership[]` iterate garbage while yq still exits 0, so the loop
+# below would run zero times and the check would report PASS on a
+# manifest with no inventory at all.
+ownership_tag=$(yq '.doc_ownership | tag' "$MANIFEST" 2>/dev/null || echo "")
+if [ "$ownership_tag" = "!!null" ]; then
+  echo "FAIL: .mergepath-sync.yml has no 'doc_ownership:' block — every docs/agents/*.md must carry exactly one ownership class (canonical / per-repo-owned / hub-only). See the doc_ownership comment block in the manifest (#780)."
+  echo "check_doc_ownership: FAIL"
+  exit 1
+fi
+if [ "$ownership_tag" != "!!seq" ]; then
+  echo "FAIL: .doc_ownership must be a list (got YAML tag '$ownership_tag')"
+  echo "check_doc_ownership: FAIL"
+  exit 1
+fi
+
+# One compact JSON object per entry. Do not use newline-delimited field
+# joins here: `note:` is free text and YAML literal/folded style may
+# contain embedded newlines, which would split one inventory row into
+# multiple bogus shell loop records.
+if ! ownership_rows=$(yq -o=json -I=0 '.doc_ownership[]' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract .doc_ownership from the manifest (yq error):"
+  printf '%s\n' "$ownership_rows"
+  echo "check_doc_ownership: FAIL"
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Manifest `paths:` snapshot, for checks 7 and 8.
+# ─────────────────────────────────────────────────────────────────────
+#
+# type|path|dest|source per row. A missing `.paths` is tolerated here
+# (check_sync_manifest owns that failure); the effect is an empty
+# snapshot, which makes check 7 flag every non-pending canonical doc —
+# fail-closed in the right direction.
+if ! path_rows=$(yq -o=json -I=0 '(.paths // [])[]' "$MANIFEST" 2>&1); then
+  echo "FAIL: could not extract .paths from the manifest (yq error):"
+  printf '%s\n' "$path_rows"
+  echo "check_doc_ownership: FAIL"
+  exit 1
+fi
+
+# Comma-joined, sentinel-padded sets so a substring lookup cannot
+# false-match a path prefix (",a/b," never matches inside ",a/bc,").
+canonical_exact=","
+verbatim_exact=","
+verbatim_kit_dirs=""
+verbatim_repo_root_kit=0
+templated_self_source_exact=","
+if [ -n "$path_rows" ]; then
+  while IFS= read -r path_row; do
+    [ -z "$path_row" ] && continue
+    p_type=$(yq -r '.type // ""' <<< "$path_row")
+    p_path=$(yq -r '.path // ""' <<< "$path_row")
+    p_dest=$(yq -r '.dest // ""' <<< "$path_row")
+    p_source=$(yq -r '.source // ""' <<< "$path_row")
+    p_consumers=$(yq -r '(.consumers // "") | tostring' <<< "$path_row")
+    [ -z "$p_type$p_path" ] && continue
+
+    unsafe_field=""
+    unsafe_value=""
+    for field in path dest source; do
+      case "$field" in
+        path) value="$p_path" ;;
+        dest) value="$p_dest" ;;
+        source) value="$p_source" ;;
+      esac
+      if [ -n "$value" ] && mp_path_is_unsafe "$value"; then
+        unsafe_field="$field"
+        unsafe_value="$value"
+        break
+      fi
+    done
+    if [ -n "$unsafe_field" ]; then
+      echo "FAIL: paths entry '$p_path' has unsafe $unsafe_field '$unsafe_value' — absolute paths and '..' segments are not allowed; embedded '.'/empty segments and commas are also rejected"
+      FAILED=1
+      continue
+    fi
+
+    n_path=$(mp_normalize_path "$p_path")
+    n_dest=$(mp_normalize_path "${p_dest:-$p_path}")
+    n_source=$(mp_normalize_path "${p_source:-$p_path}")
+    if [ "$p_type" = "canonical" ] && [ "$p_consumers" = "all" ]; then
+      # The canonical propagation engine enumerates and materializes `.path`;
+      # it does not honor `dest`. Reject a real remap instead of recording a
+      # destination the engine will never write.
+      if [ -n "$p_dest" ] && [ "$n_dest" != "$n_path" ]; then
+        echo "FAIL: canonical manifest entry '$p_path' remaps dest to '$p_dest', but canonical propagation writes only the entry path — remove the unsupported dest remap"
+        FAILED=1
+      else
+        canonical_exact="${canonical_exact}${n_path},"
+      fi
+    fi
+    if [ "$p_type" = "templated" ] && [ "$n_source" = "$n_dest" ]; then
+      templated_self_source_exact="${templated_self_source_exact}${n_dest},"
+    fi
+    if [ "$p_type" = "canonical" ] || [ "$p_type" = "kit" ]; then
+      verbatim_exact="${verbatim_exact}${n_path},${n_dest},${n_source},"
+      if [ "$p_type" = "kit" ]; then
+        for d in "$n_path" "$n_dest" "$n_source"; do
+          if [ "$d" = "." ]; then
+            verbatim_repo_root_kit=1
+          else
+            verbatim_kit_dirs="${verbatim_kit_dirs}${d}"$'\n'
+          fi
+        done
+      fi
+    fi
+  done <<< "$path_rows"
+fi
+
+# Is $1 verbatim-mirrored by a canonical/kit entry? Echoes the reason.
+verbatim_hit() {
+  local doc="$1"
+  case "$verbatim_exact" in
+    *",$doc,"*) printf 'direct'; return 0 ;;
+  esac
+  if [ "$verbatim_repo_root_kit" = "1" ]; then
+    printf 'repo-root-kit'; return 0
+  fi
+  local d
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    case "$doc/" in
+      "$d/"*) printf 'kit-contains(%s)' "$d"; return 0 ;;
+    esac
+  done <<< "$verbatim_kit_dirs"
+  return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# 2-4, 6-8: per-entry validation.
+# ─────────────────────────────────────────────────────────────────────
+declared=","
+if [ -n "$ownership_rows" ]; then
+  while IFS= read -r ownership_row; do
+    [ -z "$ownership_row" ] && continue
+    doc_path=$(yq -r '.path // ""' <<< "$ownership_row")
+    doc_class=$(yq -r '.class // ""' <<< "$ownership_row")
+    doc_pending=$(yq -r '(.pending_manifest // false) | tostring' <<< "$ownership_row")
+    doc_note=$(yq -r '(.note // "") | tostring' <<< "$ownership_row")
+
+    if [ -z "$doc_path" ]; then
+      echo "FAIL: doc_ownership entry has an empty 'path'"
+      FAILED=1
+      continue
+    fi
+
+    if mp_path_is_unsafe "$doc_path"; then
+      echo "FAIL: doc_ownership entry '$doc_path' is unsafe — absolute paths and '..' segments are not allowed; embedded '.'/empty segments and commas are also rejected"
+      FAILED=1
+      continue
+    fi
+
+    # 2: closed class set.
+    class_ok=0
+    for c in $VALID_CLASSES; do
+      [ "$doc_class" = "$c" ] && class_ok=1 && break
+    done
+    if [ "$class_ok" != "1" ]; then
+      echo "FAIL: doc_ownership entry '$doc_path' has class '$doc_class' — must be exactly one of: $VALID_CLASSES"
+      FAILED=1
+      continue
+    fi
+
+    norm_doc=$(mp_normalize_path "$doc_path")
+
+    # 3a: scope. The inventory is defined over Markdown files anywhere
+    # under docs/agents/; a path outside it would create the illusion of
+    # coverage the on-disk scan below never cross-checks.
+    case "$norm_doc" in
+      docs/agents/*.md) ;;
+      *)
+        echo "FAIL: doc_ownership entry '$doc_path' is outside the inventory's scope — every entry must be a 'docs/agents/*.md' path"
+        FAILED=1
+        continue
+        ;;
+    esac
+
+    # 4: duplicate declaration = the "more than one class" case.
+    case "$declared" in
+      *",$norm_doc,"*)
+        echo "FAIL: '$norm_doc' is declared more than once in doc_ownership — a doc must belong to EXACTLY one class"
+        FAILED=1
+        continue
+        ;;
+    esac
+    declared="${declared}${norm_doc},"
+
+    # 3b: stale entry.
+    if [ ! -f "$REPO_ROOT/$norm_doc" ]; then
+      echo "FAIL: doc_ownership declares '$norm_doc' but that file does not exist in this repo — remove the stale entry or restore the file"
+      FAILED=1
+      continue
+    fi
+
+    # 6: pending_manifest hygiene.
+    if [ "$doc_pending" = "true" ]; then
+      if [ "$doc_class" != "canonical" ]; then
+        echo "FAIL: '$norm_doc' sets pending_manifest: true with class '$doc_class' — the flag records a canonical doc whose paths: entry has not landed yet, so it is meaningful only on class 'canonical'"
+        FAILED=1
+      elif [ -z "$doc_note" ]; then
+        echo "FAIL: '$norm_doc' sets pending_manifest: true without a 'note:' — the transitional debt must name the follow-up that lands the paths: entry"
+        FAILED=1
+      fi
+    fi
+
+    # 7 / 8: class ↔ manifest consistency.
+    if [ "$doc_class" = "canonical" ]; then
+      case "$canonical_exact" in
+        *",$norm_doc,"*) ;;
+        *)
+          if [ "$doc_pending" != "true" ]; then
+            echo "FAIL: '$norm_doc' is classified canonical but has no 'type: canonical' paths entry with 'consumers: all' in the manifest — an unbacked or subset-only canonical claim does not propagate verbatim to the full fleet, so consumers silently do not have it. Add a fleet-wide 'type: canonical' paths entry, or declare 'pending_manifest: true' with a note naming the follow-up."
+            FAILED=1
+          fi
+          ;;
+      esac
+    else
+      case "$templated_self_source_exact" in
+        *",$norm_doc,"*)
+          echo "FAIL: '$norm_doc' is classified $doc_class but is the effective source and destination of a templated manifest entry — rendering a noncanonical document from itself still clobbers each repo's own copy. Use a purpose-built template source outside the destination path, or drop the templated entry."
+          FAILED=1
+          ;;
+      esac
+      if hit=$(verbatim_hit "$norm_doc"); then
+        echo "FAIL: '$norm_doc' is classified $doc_class but is VERBATIM-mirrored by a canonical/kit manifest entry ($hit) — a verbatim mirror clobbers each repo's own copy on the next propagation wave (the #744 failure). Drop the mirror, or reclassify the doc."
+        FAILED=1
+      fi
+    fi
+  done <<< "$ownership_rows"
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# 5: every Markdown file under docs/agents/ is declared (the "zero classes" case).
+# ─────────────────────────────────────────────────────────────────────
+DOCS_DIR="$REPO_ROOT/docs/agents"
+if [ -d "$DOCS_DIR" ]; then
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    rel="${f#"$REPO_ROOT"/}"
+    case "$declared" in
+      *",$rel,"*) ;;
+      *)
+        echo "FAIL: '$rel' has NO ownership class — add a doc_ownership entry to .mergepath-sync.yml declaring exactly one of: $VALID_CLASSES (see the doc_ownership comment block for what each class means, #780)."
+        FAILED=1
+        ;;
+    esac
+    # `find -print` + read is intentional over a glob: it tolerates a
+    # missing dir and does not silently yield the literal pattern when
+    # nothing matches.
+  done < <(find "$DOCS_DIR" -type f -name '*.md' | LC_ALL=C sort)
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# 9: drift guard against check_sync_manifest's IDENTITY_DOCS_DENYLIST.
+# ─────────────────────────────────────────────────────────────────────
+#
+# The denylist and this inventory state the same governance fact from two
+# directions ("must not be verbatim-mirrored" vs "is not canonical"). If
+# a docs/agents/ path is on the denylist, classifying it canonical here
+# is a contradiction: check 7 would demand a paths: entry that
+# check_sync_manifest check 8 refuses to accept. Catch the contradiction
+# at the declaration, not two checks later.
+#
+# The denylist lives in the SIBLING check, so read it from there rather
+# than restating it (a second copy is the drift this guard exists to
+# prevent). Soft-skip if the sibling or its array is absent: this guard
+# is a consistency net over another check's data, and it must not be the
+# thing that reds CI when that check is mid-refactor.
+SIBLING="$REPO_ROOT/scripts/ci/check_sync_manifest"
+if [ -f "$SIBLING" ]; then
+  denylist=$(awk '
+    /^IDENTITY_DOCS_DENYLIST=\(/ { inside = 1; next }
+    inside && /^\)/             { inside = 0 }
+    inside                       { gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 != "") print }
+  ' "$SIBLING")
+  if [ -n "$denylist" ]; then
+    while IFS= read -r denied; do
+      case "$denied" in
+        docs/agents/*) ;;
+        *) continue ;;
+      esac
+      # Only meaningful for docs that exist here; a denylist entry for a
+      # deleted doc is check_sync_manifest's problem, not this one.
+      norm_denied=$(mp_normalize_path "$denied")
+      [ -f "$REPO_ROOT/$norm_denied" ] || continue
+      declared_class=""
+      while IFS= read -r ownership_row; do
+        [ -z "$ownership_row" ] && continue
+        doc_path=$(yq -r '.path // ""' <<< "$ownership_row")
+        if mp_path_is_unsafe "$doc_path"; then
+          continue
+        fi
+        if [ "$(mp_normalize_path "$doc_path")" = "$norm_denied" ]; then
+          declared_class=$(yq -r '.class // ""' <<< "$ownership_row")
+          break
+        fi
+      done <<< "$ownership_rows"
+      if [ "$declared_class" = "canonical" ]; then
+        echo "FAIL: '$norm_denied' is on check_sync_manifest's IDENTITY_DOCS_DENYLIST (must never be verbatim-mirrored) but doc_ownership classifies it 'canonical' — the two declarations contradict each other. Reclassify it per-repo-owned or hub-only, or remove it from the denylist."
+        FAILED=1
+      fi
+    done <<< "$denylist"
+  fi
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_doc_ownership: FAIL"
+  exit 1
+fi
+
+# Run the regression test suite if present — same convention as
+# check_sync_manifest. Suppressed when this invocation was itself driven
+# by a fixture (MERGEPATH_MANIFEST_PATH set), because that is the test
+# harness calling back into us and re-entering would recurse.
+TEST_SUITE="$REPO_ROOT/tests/test_check_doc_ownership.sh"
+if [ -z "${MERGEPATH_MANIFEST_PATH:-}" ] && [ -x "$TEST_SUITE" ]; then
+  echo "check_doc_ownership: running regression test suite"
+  if ! bash "$TEST_SUITE"; then
+    echo "check_doc_ownership: FAIL (regression test suite failed)"
+    exit 1
+  fi
+fi
+
+# `grep -c` exits 1 on a zero count, which `|| true` would turn into an
+# EMPTY declared_count rather than "0". Default it explicitly so the
+# summary line stays readable on an empty inventory.
+declared_count=$(printf '%s' "$declared" | tr ',' '\n' | grep -c . || true)
+declared_count=${declared_count:-0}
+echo "check_doc_ownership: PASS ($declared_count docs/agents doc(s) classified; classes: $VALID_CLASSES)"
+exit 0

@@ -301,6 +301,16 @@ bootstrap::stage_template_mirror() {
     return "$step_rc"
   fi
 
+  # Step 5c: verify the new repo actually carries the canonical agent
+  # docs and reads the shared rules ahead of its local overlay (#780).
+  # Runs AFTER the identity scaffold because that step rewrites
+  # AGENTS.md, and the ordering assertion must see the final file.
+  bootstrap::_verify_canonical_agent_docs "$target" "$source_root" || step_rc=$?
+  if [ "$step_rc" -ne 0 ]; then
+    bootstrap::err "template-mirror: canonical agent-doc verification failed (rc=$step_rc); aborting stage"
+    return "$step_rc"
+  fi
+
   # Step 5: reset opt-in policy defaults the hub has flipped for itself.
   # phase_4b_automation.enabled: true on the hub (#628) must NOT opt every
   # future bootstrapped repo into local reviewer-CLI automation - a new
@@ -660,6 +670,103 @@ EOF
     fi
     bootstrap::log "reframed the REVIEW_POLICY.md wave-audit passage as hub-side machinery"
   fi
+}
+
+# Verify the bootstrapped repo carries the canonical agent docs and
+# reads the shared rules BEFORE its local operating-rules overlay (#780).
+#
+# Two assertions, both fail-closed:
+#
+#   1. Every backed `class: canonical` agent doc in the SOURCE manifest
+#      landed. The required set is derived on every run rather than
+#      copied into this script, so backing a pending document expands the
+#      bootstrap assertion automatically. The rsync copies them by
+#      default, so a failure here means someone added an exclude pattern
+#      that swallows a canonical doc.
+#   2. AGENTS.md references docs/agents/shared-operating-rules.md, and
+#      does so BEFORE its reference to docs/agents/operating-rules.md.
+#      The order is the point: the shared file is the fleet-wide core
+#      and the local file is the per-repo overlay, so an agent that
+#      reads the index top-down must meet the shared rules first. An
+#      AGENTS.md that links the shared file only after (or not at all)
+#      leaves the new repo's agents on the overlay alone.
+#
+# The two path strings do not overlap as substrings
+# ("docs/agents/shared-operating-rules.md" does not contain
+# "docs/agents/operating-rules.md"), so a fixed-string line match is
+# unambiguous.
+bootstrap::_verify_canonical_agent_docs() {
+  local target=$1
+  local source_root=${2:-${BOOTSTRAP_MERGEPATH_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}
+
+  if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
+    bootstrap::log "dry-run: would verify the canonical agent docs landed in $target and that AGENTS.md reads the shared operating rules before the local overlay"
+    return 0
+  fi
+
+  local manifest="$source_root/.mergepath-sync.yml"
+  if [ ! -f "$manifest" ]; then
+    bootstrap::err "source .mergepath-sync.yml missing; cannot derive the canonical agent-doc set"
+    return 1
+  fi
+  if ! command -v yq >/dev/null 2>&1; then
+    bootstrap::err "yq is required to derive canonical agent docs from .mergepath-sync.yml"
+    return 2
+  fi
+  if ! yq -e '.doc_ownership | tag == "!!seq"' "$manifest" >/dev/null 2>&1; then
+    bootstrap::err "source .mergepath-sync.yml has no valid doc_ownership list; cannot verify canonical agent docs"
+    return 1
+  fi
+
+  local canonical_docs
+  if ! canonical_docs=$(yq -r '.doc_ownership[] | select(.class == "canonical" and ((.pending_manifest // false) != true)) | .path' "$manifest" 2>&1); then
+    bootstrap::err "could not derive canonical agent docs from source .mergepath-sync.yml: $canonical_docs"
+    return 1
+  fi
+  if [ -z "$canonical_docs" ]; then
+    bootstrap::err "source .mergepath-sync.yml declares no backed canonical agent docs; refusing a vacuous bootstrap verification"
+    return 1
+  fi
+
+  local missing="" doc
+  while IFS= read -r doc; do
+    [ -n "$doc" ] || continue
+    [ -f "$target/$doc" ] || missing="$missing $doc"
+  done <<< "$canonical_docs"
+  if [ -n "$missing" ]; then
+    bootstrap::err "canonical agent docs missing from the mirrored repo:$missing — these are 'class: canonical' in .mergepath-sync.yml's doc_ownership inventory and every new repo must carry them. Check BOOTSTRAP_MIRROR_EXCLUDES for a pattern that swallows them."
+    return 1
+  fi
+
+  local agents_md="$target/AGENTS.md"
+  if [ ! -f "$agents_md" ]; then
+    bootstrap::err "AGENTS.md missing from the mirrored repo; cannot verify the agent-docs reading order"
+    return 1
+  fi
+
+  local shared_pos local_pos shared_line shared_col local_line local_col
+  shared_pos=$(awk -v needle='docs/agents/shared-operating-rules.md' 'index($0, needle) { printf "%d:%d\n", NR, index($0, needle); exit }' "$agents_md" || true)
+  local_pos=$(awk -v needle='docs/agents/operating-rules.md' 'index($0, needle) { printf "%d:%d\n", NR, index($0, needle); exit }' "$agents_md" || true)
+
+  if [ -z "$shared_pos" ]; then
+    bootstrap::err "AGENTS.md does not reference docs/agents/shared-operating-rules.md — the new repo would ship the shared rulebook with nothing pointing at it. Add it to the AGENTS.md reading order at the mergepath source."
+    return 1
+  fi
+  if [ -z "$local_pos" ]; then
+    bootstrap::err "AGENTS.md does not reference docs/agents/operating-rules.md — the new repo would ship the repo-local overlay with nothing pointing at it. Add it to the AGENTS.md reading order after docs/agents/shared-operating-rules.md at the mergepath source."
+    return 1
+  fi
+  shared_line=${shared_pos%%:*}
+  shared_col=${shared_pos#*:}
+  local_line=${local_pos%%:*}
+  local_col=${local_pos#*:}
+  if [ "$shared_line" -gt "$local_line" ] || { [ "$shared_line" -eq "$local_line" ] && [ "$shared_col" -ge "$local_col" ]; }; then
+    bootstrap::err "AGENTS.md lists docs/agents/operating-rules.md (line $local_line, column $local_col) BEFORE docs/agents/shared-operating-rules.md (line $shared_line, column $shared_col) — the shared canonical rules must come first, with the per-repo overlay after. Fix the ordering at the mergepath source."
+    return 1
+  fi
+
+  bootstrap::log "canonical agent docs present and AGENTS.md reads the shared operating rules before the local overlay"
+  return 0
 }
 
 bootstrap::_rsync_template() {

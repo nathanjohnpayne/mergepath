@@ -375,6 +375,17 @@ jobs:
         # Shares the yq install with check_sync_manifest above.
         run: ./scripts/ci/check_propagation_closure
 
+      - name: check_doc_ownership
+        # Validates the manifest's doc_ownership: inventory (#780) —
+        # every docs/agents/*.md must carry EXACTLY ONE of canonical /
+        # per-repo-owned / hub-only, and the class must not contradict
+        # the file's paths: entry (an unbacked canonical claim, or a
+        # per-repo-owned doc sitting in a verbatim canonical/kit mirror).
+        # Reads the same manifest as the two checks above and shares
+        # their yq install; consumer checkouts SKIP inside the wrapper
+        # via the sync-to-downstream.sh marker idiom.
+        run: ./scripts/ci/check_doc_ownership
+
       - name: check_project_doc_sync
         # Hub-only project-doc-sync regression suite (#642): PRD/spec
         # mirror drift detection, orphan sweeps, manifest validation, and

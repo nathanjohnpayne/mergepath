@@ -60,6 +60,32 @@ echo "# mergepath" >"$FAKE_MP/README.md"
 echo "Mergepath brand" >"$FAKE_MP/BRAND.md"
 echo "ai ctx" >"$FAKE_MP/.ai_context.md"
 echo "overview" >"$FAKE_MP/docs/agents/repository-overview.md"
+# #780: the mirror stage VERIFIES that every `class: canonical` agent doc
+# landed in the new repo, and that AGENTS.md reads the shared operating rules
+# before the local overlay. Seed the canonical docs and a conforming index so
+# this fixture exercises the real bootstrap path instead of tripping the guard.
+echo "decision records" >"$FAKE_MP/docs/agents/decision-records.md"
+echo "shared rules" >"$FAKE_MP/docs/agents/shared-operating-rules.md"
+echo "worktree placement" >"$FAKE_MP/docs/agents/worktree-placement.md"
+echo "local overlay" >"$FAKE_MP/docs/agents/operating-rules.md"
+cat >"$FAKE_MP/.mergepath-sync.yml" <<'EOF'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/shared-operating-rules.md
+    class: canonical
+  - path: docs/agents/worktree-placement.md
+    class: canonical
+EOF
+cat >"$FAKE_MP/AGENTS.md" <<'AGENTSEOF'
+# Agent Instructions
+
+1. **[Repository Overview](docs/agents/repository-overview.md)**
+2. **[Shared Agent Operating Rules](docs/agents/shared-operating-rules.md)**
+3. **[Agent Operating Rules](docs/agents/operating-rules.md)**
+4. **[Worktree Placement](docs/agents/worktree-placement.md)**
+AGENTSEOF
 cat >"$FAKE_MP/.repo-template.yml" <<'EOF'
 spec_test_map:
   mergepath_playground:
