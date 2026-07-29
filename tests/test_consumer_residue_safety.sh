@@ -42,7 +42,10 @@
 #         verdict(W, tree + S)  ==  verdict(W, tree)
 #
 # where verdict is the pair (exit status, whether the canonical
-# "<name>: SKIP (...)" line was emitted).
+# "<name>: SKIP (...)" line was emitted), and every "tree" in that statement
+# is the SAME tree: each probe runs against a fresh restore of the committed
+# fixture baseline, so a wrapper that writes cannot make probe N depend on
+# probe N-1 (see fixture_reset).
 #
 # In words: on a consumer, the presence or absence of hub-only bootstrap
 # residue must not change a check's answer. A check may pass, and it may
@@ -114,6 +117,25 @@
 #      on knowing what any consumer happens to carry today.
 #
 # ─────────────────────────────────────────────────────────────────────
+# Reproducibility: one universe, one starting tree
+# ─────────────────────────────────────────────────────────────────────
+#
+# A ratchet is only worth as much as the reproducibility of the verdicts it
+# ratchets, so two properties are enforced rather than assumed:
+#
+#   - ONE FILE UNIVERSE. The fixture is copied from `git ls-files`, the same
+#     index H(W) and the strip loop are derived from — never from the working
+#     tree, which would smuggle untracked files into the "consumer" as paths
+#     no lattice can toggle, and would let a tracked-but-deleted path enter H
+#     and abort a probe. A working tree that disagrees with its index is
+#     refused up front, by name.
+#   - ONE STARTING TREE. Every probe begins at a fresh restore of the
+#     committed fixture baseline, so a wrapper that writes a cache, a ledger
+#     or a generated file cannot manufacture or mask a later divergence.
+#     Consumer CI runs each check once from a clean checkout; the lattice runs
+#     one check hundreds of times, which is the only reason this needs saying.
+#
+# ─────────────────────────────────────────────────────────────────────
 # Hub-only, hermetic, offline
 # ─────────────────────────────────────────────────────────────────────
 #
@@ -171,6 +193,37 @@ pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 note() { echo "NOTE: $*"; }
 
+# first_nonempty_line <newline-delimited list> → the first non-empty line.
+#
+# Deliberately NOT `printf '%s' "$list" | sed '/^$/d' | head -1`. `head`
+# closes the pipe after its first line while the writer is still writing, so
+# once the list outgrows the pipe buffer the writer takes SIGPIPE, `set -o
+# pipefail` reports 141 for the whole pipeline, and `set -e` kills the suite
+# mid-run — before a single detector self-test, the stale-ratchet sweep or
+# the summary. Measured on this machine: a 167 KB list returns 141 every
+# time, a 4-byte list returns 0, and the pipe buffer is where it flips. At
+# today's 89 hub-only paths (~3.5 KB) the defect is unreachable, which is
+# exactly what makes it worth removing rather than tolerating: it would
+# arrive as a nondeterministic abort in whichever unrelated PR pushed the
+# hub-only set past ~64 KB. Same class as the SIGPIPE trap documented in
+# run_probe — a reader that must not be a coin toss must not sit at the end
+# of a pipe.
+#
+# The heredoc is safe where a pipe is not: bash materialises it as a temp
+# file (or as a pre-filled pipe when it fits), so there is no concurrent
+# external writer to signal when this function returns early.
+first_nonempty_line() {
+  local line
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    printf '%s' "$line"
+    return 0
+  done <<EOF
+$1
+EOF
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # KNOWN_RESIDUE_VIOLATIONS — the ratchet.
 # ---------------------------------------------------------------------------
@@ -200,6 +253,16 @@ note() { echo "NOTE: $*"; }
 #     delete it, so the list can never quietly outlive the bugs)
 #   - a wrapper listed whose divergence CLASS
 #     changed                                     → FAIL (re-verify)
+#
+# The class recorded here is the WORST class anywhere in the wrapper's
+# lattice, not the class of the first divergent subset, and a listed wrapper
+# is probed in escalation mode to establish it (see probe_wrapper). Stopping
+# at the first divergence let a listed wrapper hide a NEW regression behind
+# its recorded one: a SKIP-ONLY entry whose first divergent subset still only
+# drops the SKIP line matched its record and passed even if some later subset
+# had started EXITing non-zero — which is the class that actually reds a
+# consumer's repo-lint. EXIT is the maximal class, so an entry already
+# recorded EXIT settles at its first EXIT divergence and costs nothing extra.
 #
 # DO NOT add a new check here to make CI green. If a NEW wrapper trips
 # this net, fix the wrapper: put the
@@ -399,6 +462,57 @@ is_allow_listed() {
 }
 
 # ---------------------------------------------------------------------------
+# The fixture's file universe is the INDEX, never the working tree.
+# ---------------------------------------------------------------------------
+#
+# H(W) and the strip loop are both derived from `git ls-files`, so the copy
+# that seeds the fixture has to come from the same place. An earlier draft
+# rsynced the WORKING TREE instead, which mixed the two universes and let a
+# dirty checkout break the model in both directions:
+#
+#   - An UNTRACKED file under scripts/, tests/ or .github/workflows/ survives
+#     into the "consumer" fixture as a path no lattice can toggle. It is
+#     constant across every probe, so it can never manufacture a divergence
+#     — but it can MASK one: a local scratch copy of a hub-only artifact
+#     satisfies a wrapper's required-file loop on every subset, and the
+#     wrapper then reads as residue-invariant when it is not.
+#   - A TRACKED path deleted from the working tree is the mirror image: it
+#     is still in the index, so it still enters H, and the residue `cp` for
+#     it used to abort the entire suite with a bare error.
+#
+# Copying from `git ls-files -z` fixes the first at the source and needs no
+# exclude list at all: .git (a FILE in a linked worktree, which is why the
+# '.git/' pattern was wrong and cost the #601 suite a fixture `git commit`
+# on the real branch), node_modules/ and .DS_Store are untracked by
+# construction, so none of them can reach the fixture. The second is caught
+# up front by missing_tracked_paths, which names every offending path at
+# once instead of dying on whichever one a lattice happened to reach first.
+# CI checkouts are clean, so this is about local reproducibility: a run on
+# your machine now models the same consumer CI does.
+
+# tracked_list_z <repo> <outfile> — the index, NUL-delimited.
+tracked_list_z() {
+  git -C "$1" ls-files -z > "$2"
+}
+
+# missing_tracked_paths <repo> <NUL list> → newline list of index entries
+# with nothing on disk (a `rm` without a `git rm`). -L as well as -e so a
+# deliberately broken symlink is not reported as missing.
+missing_tracked_paths() {
+  local repo="$1" list="$2" rel
+  while IFS= read -r -d '' rel; do
+    [ -e "$repo/$rel" ] || [ -L "$repo/$rel" ] || printf '%s\n' "$rel"
+  done < "$list"
+}
+
+# copy_tracked_tree <repo> <dst> <NUL list> — copy exactly the index.
+# --files-from implies --relative, so each entry lands at the same path
+# under <dst>; -a keeps modes (the executable bit matters) and times.
+copy_tracked_tree() {
+  rsync -a --from0 --files-from="$3" "$1/" "$2/"
+}
+
+# ---------------------------------------------------------------------------
 # Build the DERIVED consumer baseline once.
 # ---------------------------------------------------------------------------
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/consumer-residue-safety.XXXXXX")"
@@ -407,18 +521,29 @@ FIX="$WORKDIR/consumer"
 STAGE="$WORKDIR/stage"
 mkdir -p "$FIX" "$STAGE"
 
-# NB: exclude '.git' WITHOUT a trailing slash. In a linked git WORKTREE
-# checkout .git is a FILE (a gitdir pointer into the main repo), not a
-# directory — '.git/' would not match it, the pointer would be copied into
-# the fixture, and every fixture git command would then operate on the REAL
-# repo. (This bit the #601 suite once: a fixture `git commit` landed on the
-# real branch.)
-rsync -a \
-  --exclude='.git' \
-  --exclude='node_modules/' \
-  --exclude='.DS_Store' \
-  "$ROOT/" "$FIX/"
-rm -rf "$FIX/.git"
+TRACKED_Z="$WORKDIR/tracked.z"
+tracked_list_z "$ROOT" "$TRACKED_Z"
+if [ ! -s "$TRACKED_Z" ]; then
+  echo "FAIL: git ls-files returned nothing for $ROOT — refusing to model a consumer from an empty index" >&2
+  exit 1
+fi
+
+MISSING_TRACKED="$(missing_tracked_paths "$ROOT" "$TRACKED_Z")"
+if [ -n "$MISSING_TRACKED" ]; then
+  echo "FAIL: the working tree disagrees with the index, so the derived consumer model would be wrong." >&2
+  echo "      These paths are tracked but absent from disk:" >&2
+  while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    echo "        $m" >&2
+  done <<EOF
+$MISSING_TRACKED
+EOF
+  echo "      Restore them (git checkout -- <path>) or stage the deletion (git rm <path>), then re-run." >&2
+  echo "      Every hub-only path is materialised from disk during the lattice, so a stale index entry would abort a probe mid-run." >&2
+  exit 1
+fi
+
+copy_tracked_tree "$ROOT" "$FIX" "$TRACKED_Z"
 
 # Strip every manifest-undelivered path under the three surfaces a
 # consumer receives wholly by propagation. Derived from `git ls-files` +
@@ -435,10 +560,21 @@ rm -rf "$FIX/.git"
 # lacks.
 STRIPPED=0
 HUB_ONLY_PATHS=""
-while IFS= read -r rel; do
+NL='
+'
+while IFS= read -r -d '' rel; do
   case "$rel" in
     scripts/*|tests/*|.github/workflows/*) ;;
     *) continue ;;
+  esac
+  case "$rel" in
+    *"$NL"*)
+      # HUB_ONLY_PATHS is newline-delimited from here down (H, the lattice,
+      # every message). A path on a probed surface containing a newline would
+      # corrupt all of it silently, so refuse rather than mis-model.
+      echo "FAIL: tracked path on a probed surface contains a newline, which this suite's newline-delimited path sets cannot represent: $(printf '%q' "$rel")" >&2
+      exit 1
+      ;;
   esac
   if ! is_covered "$rel"; then
     rm -f "$FIX/$rel"
@@ -446,19 +582,17 @@ while IFS= read -r rel; do
 "
     STRIPPED=$((STRIPPED + 1))
   fi
-done <<EOF
-$(cd "$ROOT" && git ls-files)
-EOF
+done < "$TRACKED_Z"
 rm -f "$FIX/.mergepath-sync.yml"
 
-# Prune the directory skeleton the strip emptied. rsync copies the hub
-# tree wholesale and the strip loop only removes FILES, so without this
-# the "consumer" baseline still carries every hub-only DIRECTORY as an
-# empty dir and a wrapper gating on
+# Prune the directory skeleton the strip emptied. The copy creates a parent
+# directory for every tracked file including the hub-only ones, and the strip
+# loop only removes FILES, so without this the "consumer" baseline still
+# carries every hub-only DIRECTORY as an empty dir and a wrapper gating on
 # `[ -d "$REPO_ROOT/scripts/sweep-unresolved-feedback" ]` would see the
 # hub layout. (Constant across the lattice, so it could never produce a
 # false FAIL — but the baseline should be consumer-accurate for -d tests
-# too, and residue_apply/residue_off keep it that way per-probe.)
+# too, and fixture_reset's `git clean -fd` keeps it that way per-probe.)
 for surface in scripts tests .github/workflows; do
   [ -d "$FIX/$surface" ] || continue
   find "$FIX/$surface" -depth -type d -empty -exec rmdir {} \; 2>/dev/null || true
@@ -486,15 +620,65 @@ if [ "$FIX_TOPLEVEL" != "$FIX_PHYS" ]; then
   echo "FATAL: fixture git toplevel is '$FIX_TOPLEVEL', expected '$FIX_PHYS' — refusing to run git writes" >&2
   exit 1
 fi
-git -C "$FIX" add -A
-git -C "$FIX" \
-  -c user.name="consumer-fixture" \
-  -c user.email="consumer-fixture@example.invalid" \
-  -c commit.gpgsign=false \
-  commit -qm "derived consumer baseline"
 
-# Mirror the workflow's make_ci_scripts_executable step.
+# Every fixture git command is pinned twice over, because fixture_reset below
+# runs `reset --hard` and `clean -fdx`. --git-dir/--work-tree on the command
+# line outrank any core.worktree a probe could write into the fixture's
+# config, so a probe cannot redirect a destructive command at the real repo;
+# and fixture_reset re-checks that $FIX/.git is still a real repository
+# directory. The assertion above ran once, before the first write; this pair
+# holds for every write after it.
+FIX_GIT=(git --git-dir="$FIX/.git" --work-tree="$FIX" -C "$FIX")
+
+# fixture_commit <message> — stage everything and commit it as the new
+# baseline. Explicit identity + gpgsign=false so the fixture never depends on
+# (or is blocked by) the caller's git config; --allow-empty so a no-op
+# cleanup commit cannot abort the suite.
+#
+# `add -A -f` — FORCE — because the fixture's index must mirror the UPSTREAM
+# index, and this repo tracks files its own .gitignore excludes:
+# .vscode/settings.json is tracked, yet `.vscode/` is an ignore rule (and
+# git never descends into an excluded directory, so the sibling
+# `!.vscode/extensions.json` negation cannot re-include anything either).
+# Without -f such a file lands in the fixture as untracked-and-ignored, which
+# is a state no real checkout is ever in: `git ls-files` inside the fixture
+# would not list it, and fixture_reset's `clean -x` would delete it after the
+# first probe — making the baseline probe the only one that saw the file. The
+# cleanliness assertion below is what keeps this honest.
+fixture_commit() {
+  "${FIX_GIT[@]}" add -A -f
+  "${FIX_GIT[@]}" \
+    -c user.name="consumer-fixture" \
+    -c user.email="consumer-fixture@example.invalid" \
+    -c commit.gpgsign=false \
+    commit -q --allow-empty -m "$1"
+}
+
+# Mirror the workflow's make_ci_scripts_executable step — BEFORE the baseline
+# commit, so the executable bit is recorded in HEAD. After it, every mode
+# change would be a permanent diff against HEAD that fixture_reset reverts.
 chmod +x "$FIX"/scripts/ci/* 2>/dev/null || true
+
+fixture_commit "derived consumer baseline"
+
+# The fixture baseline must be a CLEAN checkout of its own index — nothing
+# modified, nothing untracked, nothing ignored-but-present. That is the
+# premise the whole lattice rests on: fixture_reset restores HEAD before
+# every probe, so any file sitting outside HEAD is a file the FIRST probe sees
+# and no later probe does. Cheap to assert, and it fails loudly on exactly the
+# class of mistake that is otherwise invisible (see fixture_commit's -f note).
+FIX_DIRT="$("${FIX_GIT[@]}" status --porcelain --ignored)"
+if [ -n "$FIX_DIRT" ]; then
+  echo "FAIL: the derived consumer baseline is not a clean checkout of its own index. These paths are present but not committed, so only the baseline probe would see them:" >&2
+  while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    echo "        $d" >&2
+  done <<EOF
+$FIX_DIRT
+EOF
+  echo "      A tracked-but-gitignored path is the usual cause — fixture_commit must stage with 'add -A -f'." >&2
+  exit 1
+fi
 
 # Offline guard: a PATH-shimmed gh that fails closed. Hermetic checks
 # prepend their own gh stubs (which win); anything reaching THIS shim was
@@ -554,70 +738,82 @@ classify() {
   fi
 }
 
-# prune_empty_parents <dir rel path> — after removing a residue file, drop
-# the directories it left empty, so "residue absent" means the same thing
-# for a `[ -d ... ]` test as it does for a `[ -f ... ]` one. Bounded to
-# $FIX and stops at the first non-empty parent (rmdir refuses those).
-prune_empty_parents() {
-  local d="$1"
-  while [ -n "$d" ] && [ "$d" != "." ] && [ "$d" != "/" ]; do
-    rmdir "$FIX/$d" 2>/dev/null || break
-    case "$d" in
-      */*) d="${d%/*}" ;;
-      *)   break ;;
-    esac
-  done
-}
-
-# residue_off <H> — remove every H path from the sandbox and restage.
-residue_off() {
-  local r changed=0
-  while IFS= read -r r; do
-    [ -z "$r" ] && continue
-    if [ -e "$FIX/$r" ]; then
-      rm -f "$FIX/$r"
-      prune_empty_parents "${r%/*}"
-      changed=1
-    fi
-  done <<EOF
-$1
-EOF
-  if [ "$changed" -eq 1 ]; then
-    git -C "$FIX" add -A >/dev/null 2>&1 || true
+# ---------------------------------------------------------------------------
+# Probe INDEPENDENCE: every probe starts from the committed baseline.
+# ---------------------------------------------------------------------------
+#
+# A wrapper is entitled to WRITE. Checks in this tree generate files, write
+# ledgers under .mergepath/, drop logs, and delete their own scratch output.
+# Real consumer CI runs each one ONCE from a fresh checkout; the lattice runs
+# one wrapper hundreds of times over the same directory, so without a reset
+# probe N inherits probe N-1's leftovers and the verdict stops being a
+# function of the residue subset:
+#
+#   - a leftover can MANUFACTURE a divergence — probe N fails on a sentinel
+#     or a half-written cache the previous probe created, and the engine
+#     reports a residue violation that no consumer would ever hit;
+#   - a leftover can MASK one — a generated artifact satisfies the very
+#     required-file loop the residue was supposed to trip, and a real
+#     violation reads as invariant.
+#
+# Either way the answer depends on enumeration order, which is exactly the
+# reproducibility the ratchet's PASS/FAIL rests on.
+#
+# Restoring the committed baseline covers all three shapes of leftover, and
+# it takes all three flags to do it: `reset --hard` reverts modifications to
+# tracked files AND removes the staged-but-uncommitted residue itself,
+# `clean -fd` removes untracked files plus the directories they created
+# (which is also what keeps `[ -d ... ]` gates consumer-accurate), and `-x`
+# extends that to gitignored output — .mergepath/, tmp/, *.log are all
+# ignored here, and a wrapper's ledger writes land exactly there.
+#
+# Corollary: anything a probe must SEE has to be COMMITTED to the fixture,
+# never left staged. That is why the self-test wrappers below are committed.
+fixture_reset() {
+  if [ ! -d "$FIX/.git" ] || [ ! -f "$FIX/.git/HEAD" ]; then
+    echo "FATAL: $FIX/.git is no longer a fixture repository — refusing to run destructive git commands" >&2
+    exit 1
   fi
+  "${FIX_GIT[@]}" reset -q --hard HEAD
+  "${FIX_GIT[@]}" clean -qfdx
 }
 
-# residue_apply <H> <mask> <src> — materialise exactly the masked subset.
-# Sets RESIDUE_SUBSET to the applied subset (space separated).
+# residue_apply <H> <mask> <src> — reset to the baseline, then materialise
+# exactly the masked subset. Sets RESIDUE_SUBSET to the applied subset (space
+# separated). The reset is what makes the "unmasked" half implicit: after it,
+# no residue and no side effect from the previous probe exists.
 #
 # Hot path: this runs once per probe over every element of H, so it uses
 # ${r%/*} rather than $(dirname) — the subshell per element dominated an
 # early profile (17k subshells on the |H|=32 wrapper alone).
 RESIDUE_SUBSET=""
 residue_apply() {
-  local H="$1" mask="$2" src="$3" i=0 r sub="" d changed=0
+  local H="$1" mask="$2" src="$3" i=0 r sub="" d
+  fixture_reset
   while IFS= read -r r; do
     [ -z "$r" ] && continue
     if [ $(( (mask >> i) & 1 )) -eq 1 ]; then
-      if [ ! -e "$FIX/$r" ]; then
-        d="${r%/*}"
-        [ -d "$FIX/$d" ] || mkdir -p "$FIX/$d"
-        cp -p "$src/$r" "$FIX/$r"
-        changed=1
+      # Named, diagnosable failure instead of a bare `cp` error killing the
+      # suite. Unreachable for the real lattice — every H path is a tracked
+      # path and missing_tracked_paths already refused a stale index entry up
+      # front — so reaching it means the source tree changed mid-run.
+      if [ ! -e "$src/$r" ]; then
+        echo "FATAL: residue source $src/$r vanished mid-run — cannot materialise the subset, and a partial subset would produce a meaningless verdict" >&2
+        exit 1
       fi
+      d="${r%/*}"
+      [ -d "$FIX/$d" ] || mkdir -p "$FIX/$d"
+      cp -p "$src/$r" "$FIX/$r"
       sub="$sub $r"
-    elif [ -e "$FIX/$r" ]; then
-      rm -f "$FIX/$r"
-      prune_empty_parents "${r%/*}"
-      changed=1
     fi
     i=$((i + 1))
   done <<EOF
 $H
 EOF
-  if [ "$changed" -eq 1 ]; then
-    git -C "$FIX" add -A >/dev/null 2>&1 || true
-  fi
+  # Stage the residue so wrappers that enumerate with `git ls-files` see it.
+  # -f for the same reason fixture_commit uses it: a residue path is tracked
+  # upstream, so it must be tracked here even if a .gitignore rule matches it.
+  "${FIX_GIT[@]}" add -A -f >/dev/null 2>&1 || true
   RESIDUE_SUBSET="${sub# }"
 }
 
@@ -632,93 +828,132 @@ popcount() {
   POPCOUNT="$c"
 }
 
-# Results of the last probe_wrapper call.
-PROBE_BASE=""
-PROBE_DIVERGED=0
-PROBE_CLASS=""
-PROBE_SUBSET=""
-PROBE_RESULT=""
-PROBE_COUNT=0
-
-# probe_wrapper <check-name> <H newline-list> <src dir>
-#
-# Enumerates the residue lattice in ascending-popcount order (so the
-# smallest, most diagnostic subset is the one reported) and stops at the
-# first divergence. Exhaustive power set when 2^|H| <= 256; otherwise all
-# singletons, then all pairs, then the full set.
-probe_wrapper() {
-  local name="$1" H="$2" src="$3"
-  local n total mask k sub res
-  n=$(printf '%s\n' "$H" | grep -c . || true)
-
-  PROBE_DIVERGED=0
-  PROBE_CLASS=""
-  PROBE_SUBSET=""
-  PROBE_RESULT=""
-  PROBE_COUNT=0
-
-  residue_off "$H"
-  PROBE_BASE="$(run_probe "$name")"
-
+# residue_masks <n> → the lattice, as a newline list of masks in
+# ascending-popcount order (so the smallest, most diagnostic subset is
+# reached first). Exhaustive power set when 2^|H| <= 256; above that cap all
+# singletons, then all pairs, then the full set — a 3-file interaction above
+# the cap would slip, recorded as a known residual gap in the header of
+# scripts/ci/check_consumer_residue_safety.
+residue_masks() {
+  local n="$1" total mask k i j out=""
   if [ "$n" -le 8 ]; then
     total=$(( (1 << n) - 1 ))
     for k in $(seq 1 "$n"); do
       for mask in $(seq 1 "$total"); do
         popcount "$mask"
         [ "$POPCOUNT" = "$k" ] || continue
-        residue_apply "$H" "$mask" "$src"; sub="$RESIDUE_SUBSET"
-        PROBE_COUNT=$((PROBE_COUNT + 1))
-        res="$(run_probe "$name")"
-        if [ "$res" != "$PROBE_BASE" ]; then
-          PROBE_DIVERGED=1
-          PROBE_SUBSET="$sub"
-          PROBE_RESULT="$res"
-          PROBE_CLASS="$(classify "$PROBE_BASE" "$res")"
-          residue_off "$H"
-          return 0
-        fi
+        out="$out$mask
+"
       done
     done
   else
-    # Above the exhaustive cap: singletons, then pairs, then the full set.
-    # A 3-file interaction above the cap would slip; recorded as a known
-    # residual gap in the header of scripts/ci/check_consumer_residue_safety.
-    local i j
     for i in $(seq 0 $((n - 1))); do
-      mask=$(( 1 << i ))
-      residue_apply "$H" "$mask" "$src"; sub="$RESIDUE_SUBSET"
-      PROBE_COUNT=$((PROBE_COUNT + 1))
-      res="$(run_probe "$name")"
-      if [ "$res" != "$PROBE_BASE" ]; then
-        PROBE_DIVERGED=1; PROBE_SUBSET="$sub"; PROBE_RESULT="$res"
-        PROBE_CLASS="$(classify "$PROBE_BASE" "$res")"
-        residue_off "$H"; return 0
-      fi
+      out="$out$(( 1 << i ))
+"
     done
     for i in $(seq 0 $((n - 2))); do
       for j in $(seq $((i + 1)) $((n - 1))); do
-        mask=$(( (1 << i) | (1 << j) ))
-        residue_apply "$H" "$mask" "$src"; sub="$RESIDUE_SUBSET"
-        PROBE_COUNT=$((PROBE_COUNT + 1))
-        res="$(run_probe "$name")"
-        if [ "$res" != "$PROBE_BASE" ]; then
-          PROBE_DIVERGED=1; PROBE_SUBSET="$sub"; PROBE_RESULT="$res"
-          PROBE_CLASS="$(classify "$PROBE_BASE" "$res")"
-          residue_off "$H"; return 0
-        fi
+        out="$out$(( (1 << i) | (1 << j) ))
+"
       done
     done
-    mask=$(( (1 << n) - 1 ))
-    residue_apply "$H" "$mask" "$src"; sub="$RESIDUE_SUBSET"
+    out="$out$(( (1 << n) - 1 ))
+"
+  fi
+  printf '%s' "$out"
+}
+
+# Results of the last probe_wrapper call. PROBE_CLASS / PROBE_SUBSET /
+# PROBE_RESULT describe the WORST divergence observed (the one the ratchet is
+# compared against); PROBE_FIRST_* describe the smallest divergent subset,
+# which is the more diagnostic one to fix first. They differ only when a
+# later, larger subset escalated the class.
+PROBE_BASE=""
+PROBE_DIVERGED=0
+PROBE_CLASS=""
+PROBE_SUBSET=""
+PROBE_RESULT=""
+PROBE_FIRST_CLASS=""
+PROBE_FIRST_SUBSET=""
+PROBE_FIRST_RESULT=""
+PROBE_COUNT=0
+
+# probe_wrapper <check-name> <H newline-list> <src dir> [stop-mode]
+#
+# stop-mode:
+#   first       (default) stop at the first divergence. For a wrapper with no
+#               KNOWN_RESIDUE_VIOLATIONS entry any divergence is a FAIL and
+#               the fix is the same marker-first move, so the smallest subset
+#               is all the caller needs.
+#   escalation  keep enumerating PAST the first divergence until the worst
+#               class (EXIT) is observed or the lattice is exhausted. Used for
+#               GRANDFATHERED wrappers, where stopping at the first divergence
+#               let a new regression hide behind the recorded one: a wrapper
+#               recorded SKIP-ONLY whose first divergent subset still only
+#               loses its SKIP line, but where some LATER subset now exits
+#               non-zero, would match its entry and pass while newly redding
+#               a real consumer's repo-lint.
+#
+# EXIT is the maximal class of the two, which is what makes the early stop in
+# escalation mode sound: once an EXIT divergence is in hand nothing worse can
+# be found, so a wrapper already recorded EXIT costs no extra probes, and the
+# exhaustive scan is paid only by the three SKIP-ONLY entries — whose lattices
+# are 1, 15 and 1 subsets wide. Today that is free: the divergence each of the
+# three reports is already the LAST subset the enumeration reaches, so the
+# suite's probe total is identical either way (596, measured before and after).
+# What escalation mode deliberately does NOT report is a second
+# divergence of the SAME class on a different subset: the recorded entry
+# already declares that failure mode, one marker-first fix removes every
+# subset at once, and the stale-entry rule fires the moment it does. Pinning
+# the exact divergent subsets instead — the other option — would tie the
+# ratchet to lattice enumeration order and to every unrelated edit that adds
+# a hub-only path, so it would churn without adding a guarantee.
+probe_wrapper() {
+  local name="$1" H="$2" src="$3" mode="${4:-first}"
+  local n mask res cls
+  n=$(printf '%s\n' "$H" | grep -c . || true)
+
+  PROBE_DIVERGED=0
+  PROBE_CLASS=""
+  PROBE_SUBSET=""
+  PROBE_RESULT=""
+  PROBE_FIRST_CLASS=""
+  PROBE_FIRST_SUBSET=""
+  PROBE_FIRST_RESULT=""
+  PROBE_COUNT=0
+
+  fixture_reset
+  PROBE_BASE="$(run_probe "$name")"
+
+  while IFS= read -r mask; do
+    [ -z "$mask" ] && continue
+    residue_apply "$H" "$mask" "$src"
     PROBE_COUNT=$((PROBE_COUNT + 1))
     res="$(run_probe "$name")"
     if [ "$res" != "$PROBE_BASE" ]; then
-      PROBE_DIVERGED=1; PROBE_SUBSET="$sub"; PROBE_RESULT="$res"
-      PROBE_CLASS="$(classify "$PROBE_BASE" "$res")"
+      cls="$(classify "$PROBE_BASE" "$res")"
+      if [ "$PROBE_DIVERGED" -eq 0 ]; then
+        PROBE_DIVERGED=1
+        PROBE_FIRST_CLASS="$cls"
+        PROBE_FIRST_SUBSET="$RESIDUE_SUBSET"
+        PROBE_FIRST_RESULT="$res"
+        PROBE_CLASS="$cls"
+        PROBE_SUBSET="$RESIDUE_SUBSET"
+        PROBE_RESULT="$res"
+      elif [ "$cls" = "EXIT" ] && [ "$PROBE_CLASS" != "EXIT" ]; then
+        PROBE_CLASS="$cls"
+        PROBE_SUBSET="$RESIDUE_SUBSET"
+        PROBE_RESULT="$res"
+      fi
+      if [ "$mode" != "escalation" ] || [ "$PROBE_CLASS" = "EXIT" ]; then
+        break
+      fi
     fi
-  fi
+  done <<EOF
+$(residue_masks "$n")
+EOF
 
-  residue_off "$H"
+  fixture_reset
   return 0
 }
 
@@ -902,9 +1137,16 @@ while IFS= read -r f; do
 $H
 EOF
 
-  probe_wrapper "$name" "$H" "$ROOT"
-  TOTAL_PROBES=$((TOTAL_PROBES + PROBE_COUNT))
+  # A grandfathered wrapper is probed in escalation mode: its recorded class
+  # must be the WORST class in its lattice, not merely the first one found,
+  # so a new EXIT divergence cannot hide behind a recorded SKIP-ONLY.
   known="$(known_class_of "$name" || true)"
+  if [ -n "$known" ]; then
+    probe_wrapper "$name" "$H" "$ROOT" escalation
+  else
+    probe_wrapper "$name" "$H" "$ROOT" first
+  fi
+  TOTAL_PROBES=$((TOTAL_PROBES + PROBE_COUNT))
 
   if [ "$PROBE_DIVERGED" -eq 1 ]; then
     SEEN_VIOLATORS="$SEEN_VIOLATORS$name
@@ -914,10 +1156,16 @@ EOF
       echo "      A consumer bootstrapped before that path was excluded still carries it (gaycruisebingo carries ~24 such paths), so this wrapper's answer depends on bootstrap accident, not on what the manifest delivered." >&2
       echo "      FIX THE WRAPPER, do not add it to KNOWN_RESIDUE_VIOLATIONS: move the scripts/sync-to-downstream.sh marker test ABOVE any test of the wrapper's own hub-only artifacts, so the consumer-SKIP decision reads only the marker." >&2
     elif [ "$known" != "$PROBE_CLASS" ]; then
-      fail "$name: known residue violation changed class ($known → $PROBE_CLASS; baseline $PROBE_BASE, residue [$PROBE_SUBSET] → $PROBE_RESULT). Re-verify and update KNOWN_RESIDUE_VIOLATIONS."
+      fail "$name: known residue violation changed class ($known → $PROBE_CLASS; baseline $PROBE_BASE, worst residue [$PROBE_SUBSET] → $PROBE_RESULT, first divergent residue [$PROBE_FIRST_SUBSET] → $PROBE_FIRST_RESULT). Re-verify and update KNOWN_RESIDUE_VIOLATIONS."
+      if [ "$PROBE_CLASS" = "EXIT" ] && [ "$known" = "SKIP-ONLY" ]; then
+        echo "      This is an ESCALATION, not a bookkeeping nit: the wrapper used to merely lose its consumer-SKIP line under residue, and now some subset makes it EXIT non-zero — that REDS a real consumer's repo-lint. Fix it marker-first rather than re-recording the class." >&2
+      fi
     else
-      note "$name: known residue violation ($PROBE_CLASS) — baseline $PROBE_BASE, residue [$PROBE_SUBSET] → $PROBE_RESULT. Grandfathered; needs its own marker-first fix."
-      pass "$name: residue behaviour matches its recorded KNOWN_RESIDUE_VIOLATIONS entry"
+      note "$name: known residue violation ($PROBE_CLASS) — baseline $PROBE_BASE, residue [$PROBE_SUBSET] → $PROBE_RESULT over $PROBE_COUNT subset(s). Grandfathered; needs its own marker-first fix."
+      if [ "$PROBE_FIRST_CLASS" != "$PROBE_CLASS" ]; then
+        note "$name: the smallest divergent subset [$PROBE_FIRST_SUBSET] → $PROBE_FIRST_RESULT is $PROBE_FIRST_CLASS; the recorded $PROBE_CLASS class comes from a larger subset."
+      fi
+      pass "$name: residue behaviour matches its recorded KNOWN_RESIDUE_VIOLATIONS entry (worst class over $PROBE_COUNT probed subset(s))"
     fi
   else
     if [ -n "$known" ]; then
@@ -935,9 +1183,37 @@ if [ "$ENTANGLED" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Engine self-test (non-vacuity, permanent).
+# Engine self-tests (non-vacuity, permanent).
 # ---------------------------------------------------------------------------
 #
+# Every planted wrapper below is COMMITTED to the fixture, not merely staged:
+# fixture_reset restores HEAD before each probe, so a staged-only wrapper
+# would be deleted out from under its own lattice.
+SELF_H="scripts/audit-branch-protection.sh
+tests/test_audit_branch_protection.sh
+tests/test_audit_branch_protection_workflow.sh
+.github/workflows/branch-protection-audit.yml"
+
+# The first two, for the cheap self-tests that only need a 3-subset lattice.
+SELF_H2="scripts/audit-branch-protection.sh
+tests/test_audit_branch_protection.sh"
+
+# Stage real-content artifacts for those four hub-only refs. The defective
+# wrapper never executes them on the diverging subset (it errors in its
+# required-file loop first), but they are real files with real modes, not
+# exit-0 stubs.
+while IFS= read -r r; do
+  [ -z "$r" ] && continue
+  mkdir -p "$STAGE/$(dirname "$r")"
+  case "$r" in
+    *.yml) printf 'name: residue-selftest\non: workflow_dispatch\njobs:\n  noop:\n    runs-on: ubuntu-latest\n    steps:\n      - run: "true"\n' > "$STAGE/$r" ;;
+    *)     printf '#!/usr/bin/env bash\nset -euo pipefail\necho "residue selftest artifact: %s"\n' "$r" > "$STAGE/$r"
+           chmod +x "$STAGE/$r" ;;
+  esac
+done <<EOF
+$SELF_H
+EOF
+
 # The #796 round-2 wrapper, frozen verbatim as a fixture. Proves the engine
 # reports a violation for the exact defect that motivated this net, and keeps
 # proving it after #796 is repaired and merged. Staged under a distinct
@@ -948,26 +1224,6 @@ if [ ! -f "$FIXTURE_CHECK" ]; then
   fail "missing regression fixture $FIXTURE_CHECK — the engine's non-vacuity proof is gone"
 else
   SELF_NAME="check_residue_selftest_defective"
-  SELF_H="scripts/audit-branch-protection.sh
-tests/test_audit_branch_protection.sh
-tests/test_audit_branch_protection_workflow.sh
-.github/workflows/branch-protection-audit.yml"
-
-  # Stage real-content artifacts for the fixture's four hub-only refs. The
-  # defective wrapper never executes them on the diverging subset (it errors
-  # in its required-file loop first), but they are real files with real
-  # modes, not exit-0 stubs.
-  while IFS= read -r r; do
-    [ -z "$r" ] && continue
-    mkdir -p "$STAGE/$(dirname "$r")"
-    case "$r" in
-      *.yml) printf 'name: residue-selftest\non: workflow_dispatch\njobs:\n  noop:\n    runs-on: ubuntu-latest\n    steps:\n      - run: "true"\n' > "$STAGE/$r" ;;
-      *)     printf '#!/usr/bin/env bash\nset -euo pipefail\necho "residue selftest artifact: %s"\n' "$r" > "$STAGE/$r"
-             chmod +x "$STAGE/$r" ;;
-    esac
-  done <<EOF
-$SELF_H
-EOF
 
   cp "$FIXTURE_CHECK" "$FIX/scripts/ci/$SELF_NAME"
   # The fixture is a verbatim copy of scripts/ci/check_branch_protection_audit
@@ -981,7 +1237,7 @@ EOF
     rm -f "$FIX/scripts/ci/$SELF_NAME.bak"
   fi
   chmod +x "$FIX/scripts/ci/$SELF_NAME"
-  git -C "$FIX" add -A >/dev/null 2>&1 || true
+  fixture_commit "stage the #796 regression fixture"
 
   probe_wrapper "$SELF_NAME" "$SELF_H" "$STAGE"
   if [ "$PROBE_DIVERGED" -eq 1 ] && [ "$PROBE_CLASS" = "EXIT" ]; then
@@ -1007,7 +1263,7 @@ EOF
     printf 'echo "%s: PASS"\n' "$SELF_OK"
   } > "$FIX/scripts/ci/$SELF_OK"
   chmod +x "$FIX/scripts/ci/$SELF_OK"
-  git -C "$FIX" add -A >/dev/null 2>&1 || true
+  fixture_commit "stage the marker-first control"
 
   probe_wrapper "$SELF_OK" "$SELF_H" "$STAGE"
   if [ "$PROBE_DIVERGED" -eq 0 ]; then
@@ -1017,8 +1273,111 @@ EOF
   fi
 
   rm -f "$FIX/scripts/ci/$SELF_NAME" "$FIX/scripts/ci/$SELF_OK"
-  git -C "$FIX" add -A >/dev/null 2>&1 || true
+  fixture_commit "drop the #796 fixture and its control"
 fi
+
+# ---------------------------------------------------------------------------
+# Engine self-test: PROBE INDEPENDENCE (non-vacuity for fixture_reset).
+# ---------------------------------------------------------------------------
+#
+# A wrapper that writes must not be able to make one probe depend on the
+# previous one. The planted wrapper below leaves one leftover per cleanup
+# mechanism — a tracked-file edit (needs `reset --hard`), an untracked file
+# (needs `clean -fd`) and a gitignored file (needs `clean -x`) — and refuses
+# to run if it finds any of them already there. It is residue-INVARIANT by
+# construction: it never looks at a single hub-only path, so its verdict can
+# only change if the harness let a leftover through.
+#
+# Drop any one of the three flags from fixture_reset (or the reset itself) and
+# this reports a divergence the residue never caused, which is precisely the
+# manufactured-verdict failure mode.
+SELF_SIDE="check_residue_selftest_sideeffect"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'set -euo pipefail\n'
+  printf 'REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"\n'
+  printf 'MARK="residue-selftest-side-effect-was-here"\n'
+  printf 'if grep -q "$MARK" "$REPO_ROOT/scripts/ci/README.md" 2>/dev/null; then\n'
+  printf '  echo "%s: leftover TRACKED edit from a previous probe" >&2\n' "$SELF_SIDE"
+  printf '  exit 1\n'
+  printf 'fi\n'
+  printf 'if [ -e "$REPO_ROOT/scripts/residue_selftest_untracked" ]; then\n'
+  printf '  echo "%s: leftover UNTRACKED file from a previous probe" >&2\n' "$SELF_SIDE"
+  printf '  exit 1\n'
+  printf 'fi\n'
+  printf 'if [ -e "$REPO_ROOT/tmp/residue_selftest_ignored" ]; then\n'
+  printf '  echo "%s: leftover GITIGNORED file from a previous probe" >&2\n' "$SELF_SIDE"
+  printf '  exit 1\n'
+  printf 'fi\n'
+  printf 'echo "$MARK" >> "$REPO_ROOT/scripts/ci/README.md"\n'
+  printf ': > "$REPO_ROOT/scripts/residue_selftest_untracked"\n'
+  printf 'mkdir -p "$REPO_ROOT/tmp"\n'
+  printf ': > "$REPO_ROOT/tmp/residue_selftest_ignored"\n'
+  printf 'echo "%s: SKIP (consumer checkout: hub marker absent)"\n' "$SELF_SIDE"
+  printf 'exit 0\n'
+} > "$FIX/scripts/ci/$SELF_SIDE"
+chmod +x "$FIX/scripts/ci/$SELF_SIDE"
+fixture_commit "stage the probe-independence self-test"
+
+probe_wrapper "$SELF_SIDE" "$SELF_H2" "$STAGE"
+if [ "$PROBE_DIVERGED" -eq 0 ]; then
+  pass "engine self-test: probes are independent — a wrapper that writes a tracked edit, an untracked file and a gitignored file every run stayed invariant across $PROBE_COUNT subset(s) (baseline $PROBE_BASE)"
+else
+  fail "engine self-test: PROBE INDEPENDENCE BROKEN — a side-effecting wrapper diverged ($PROBE_CLASS, baseline $PROBE_BASE, residue [$PROBE_SUBSET] → $PROBE_RESULT) even though it never reads a hub-only path. fixture_reset is not restoring the committed baseline between probes, so every verdict in this run depends on enumeration order."
+fi
+rm -f "$FIX/scripts/ci/$SELF_SIDE"
+fixture_commit "drop the probe-independence self-test"
+
+# ---------------------------------------------------------------------------
+# Engine self-test: CLASS ESCALATION (non-vacuity for escalation mode).
+# ---------------------------------------------------------------------------
+#
+# The ratchet compares a grandfathered wrapper's recorded class against the
+# WORST class in its lattice. The planted wrapper below has one divergence of
+# each class, arranged so the LESSER one is reached first: with only
+# scripts/audit-branch-protection.sh present it loses its SKIP line (0|RUN,
+# SKIP-ONLY), and with tests/test_audit_branch_protection.sh present it exits
+# 1 (EXIT). Ascending-popcount enumeration hits the SKIP-ONLY subset first, so
+# this is exactly the shape that used to let a new EXIT regression hide behind
+# a recorded SKIP-ONLY entry.
+#
+# Both modes are asserted: escalation mode must report EXIT, and `first` mode
+# must still report SKIP-ONLY — which is both the control for the escalation
+# claim and the proof that the old behaviour was the hiding one.
+SELF_ESC="check_residue_selftest_escalating"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'set -euo pipefail\n'
+  printf 'REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"\n'
+  printf 'if [ -f "$REPO_ROOT/tests/test_audit_branch_protection.sh" ]; then\n'
+  printf '  echo "%s: ERROR hub-only suite present on a consumer" >&2\n' "$SELF_ESC"
+  printf '  exit 1\n'
+  printf 'fi\n'
+  printf 'if [ -f "$REPO_ROOT/scripts/audit-branch-protection.sh" ]; then\n'
+  printf '  echo "%s: proceeding against hub tooling (no SKIP line)"\n' "$SELF_ESC"
+  printf '  exit 0\n'
+  printf 'fi\n'
+  printf 'echo "%s: SKIP (consumer checkout: hub marker absent)"\n' "$SELF_ESC"
+  printf 'exit 0\n'
+} > "$FIX/scripts/ci/$SELF_ESC"
+chmod +x "$FIX/scripts/ci/$SELF_ESC"
+fixture_commit "stage the class-escalation self-test"
+
+probe_wrapper "$SELF_ESC" "$SELF_H2" "$STAGE" escalation
+if [ "$PROBE_DIVERGED" -eq 1 ] && [ "$PROBE_CLASS" = "EXIT" ] && [ "$PROBE_FIRST_CLASS" = "SKIP-ONLY" ]; then
+  pass "engine self-test (escalation): a lattice whose first divergence is SKIP-ONLY [$PROBE_FIRST_SUBSET] and whose later subset EXITs [$PROBE_SUBSET] is recorded as EXIT"
+else
+  fail "engine self-test (escalation): expected first=SKIP-ONLY worst=EXIT, got first='$PROBE_FIRST_CLASS' worst='$PROBE_CLASS' (diverged=$PROBE_DIVERGED, baseline $PROBE_BASE) — escalation probing has gone vacuous and a new EXIT regression can hide behind a recorded SKIP-ONLY entry"
+fi
+
+probe_wrapper "$SELF_ESC" "$SELF_H2" "$STAGE" first
+if [ "$PROBE_DIVERGED" -eq 1 ] && [ "$PROBE_CLASS" = "SKIP-ONLY" ]; then
+  pass "engine self-test (escalation control): the same lattice under first-divergence probing reports only SKIP-ONLY — the class the escalation mode exists to correct"
+else
+  fail "engine self-test (escalation control): expected SKIP-ONLY under first-divergence probing, got '$PROBE_CLASS' (diverged=$PROBE_DIVERGED) — the two modes are no longer distinguishable, so the escalation assertion above proves nothing"
+fi
+rm -f "$FIX/scripts/ci/$SELF_ESC"
+fixture_commit "drop the class-escalation self-test"
 
 # ---------------------------------------------------------------------------
 # Detector self-tests (non-vacuity for S1 and S2, permanent).
@@ -1031,7 +1390,7 @@ fi
 DET="$WORKDIR/detectors"
 mkdir -p "$DET"
 
-DET_P="$(printf '%s' "$HUB_ONLY_PATHS" | sed '/^$/d' | head -1)"
+DET_P="$(first_nonempty_line "$HUB_ONLY_PATHS")"
 if [ -z "$DET_P" ]; then
   fail "detector self-test: HUB_ONLY_PATHS is empty — cannot plant a hub-only reference"
 else
@@ -1098,6 +1457,70 @@ else
   else
     fail "detector self-test (S2): canonical='$det_ok' (want empty), reversed='$det_bad' (want non-empty) — S2 has gone vacuous"
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Helper self-tests (non-vacuity for the two readers, permanent).
+# ---------------------------------------------------------------------------
+
+# first_nonempty_line at a scale the pipeline form cannot survive. 3,000
+# entries is ~167 KB, well past any pipe buffer, so the assertion is not a
+# tautology: swap the body back to `printf | sed | head -1` and the
+# assignment returns 141 and `set -e` kills the suite here.
+hdr_big=""
+hdr_i=0
+while [ "$hdr_i" -lt 3000 ]; do
+  hdr_big="$hdr_big/a/deliberately/long/hub-only/path/entry-$hdr_i/file.sh
+"
+  hdr_i=$((hdr_i + 1))
+done
+hdr_first="$(first_nonempty_line "$hdr_big")"
+hdr_skip="$(first_nonempty_line "
+
+scripts/second-line.sh
+scripts/third-line.sh")"
+if [ "$hdr_first" = "/a/deliberately/long/hub-only/path/entry-0/file.sh" ] && [ "$hdr_skip" = "scripts/second-line.sh" ]; then
+  pass "helper self-test: first_nonempty_line reads a ${#hdr_big}-byte list without a SIGPIPE abort and skips leading blank lines"
+else
+  fail "helper self-test: first_nonempty_line returned '$hdr_first' for a ${#hdr_big}-byte list (want the entry-0 path) and '$hdr_skip' with leading blanks (want scripts/second-line.sh)"
+fi
+
+# copy_tracked_tree / missing_tracked_paths against a throwaway repo, because
+# the real hub tree is clean and would make both assertions vacuous. This is
+# the whole reason the fixture is seeded from the index: a working-tree copy
+# carries the untracked file into the "consumer" and no lattice can toggle it.
+TRACKED_SELFTEST="$WORKDIR/tracked-selftest"
+mkdir -p "$TRACKED_SELFTEST/src/scripts" "$TRACKED_SELFTEST/dst"
+printf 'tracked\n' > "$TRACKED_SELFTEST/src/scripts/tracked.sh"
+printf 'doomed\n'  > "$TRACKED_SELFTEST/src/scripts/deleted.sh"
+git -C "$TRACKED_SELFTEST/src" init -q
+git -C "$TRACKED_SELFTEST/src" add -A
+git -C "$TRACKED_SELFTEST/src" \
+  -c user.name="tracked-selftest" \
+  -c user.email="tracked-selftest@example.invalid" \
+  -c commit.gpgsign=false \
+  commit -qm "seed"
+printf 'untracked\n' > "$TRACKED_SELFTEST/src/scripts/untracked.sh"
+
+tracked_list_z "$TRACKED_SELFTEST/src" "$TRACKED_SELFTEST/list.z"
+copy_tracked_tree "$TRACKED_SELFTEST/src" "$TRACKED_SELFTEST/dst" "$TRACKED_SELFTEST/list.z"
+if [ -f "$TRACKED_SELFTEST/dst/scripts/tracked.sh" ] && [ ! -e "$TRACKED_SELFTEST/dst/scripts/untracked.sh" ]; then
+  pass "helper self-test: copy_tracked_tree copies the index and leaves an untracked file behind"
+else
+  fail "helper self-test: copy_tracked_tree copied the working tree, not the index (tracked.sh present=$([ -f "$TRACKED_SELFTEST/dst/scripts/tracked.sh" ] && echo yes || echo no), untracked.sh present=$([ -e "$TRACKED_SELFTEST/dst/scripts/untracked.sh" ] && echo yes || echo no)) — an untracked hub-only artifact would reach the consumer fixture as a path no lattice can toggle"
+fi
+
+if [ -n "$(missing_tracked_paths "$TRACKED_SELFTEST/src" "$TRACKED_SELFTEST/list.z")" ]; then
+  fail "helper self-test (control): missing_tracked_paths reported a clean tree as dirty — it would refuse to run on every clean checkout"
+else
+  pass "helper self-test (control): missing_tracked_paths reports nothing for a clean tree"
+fi
+rm -f "$TRACKED_SELFTEST/src/scripts/deleted.sh"
+tracked_missing="$(missing_tracked_paths "$TRACKED_SELFTEST/src" "$TRACKED_SELFTEST/list.z")"
+if [ "$tracked_missing" = "scripts/deleted.sh" ]; then
+  pass "helper self-test: missing_tracked_paths names a tracked-but-deleted path, so a stale index entry fails up front instead of aborting a probe mid-lattice"
+else
+  fail "helper self-test: missing_tracked_paths returned '$tracked_missing', want 'scripts/deleted.sh' — a tracked-but-deleted path would enter H and abort the residue copy"
 fi
 
 # ---------------------------------------------------------------------------

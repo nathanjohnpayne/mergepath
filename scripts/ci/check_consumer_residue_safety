@@ -92,10 +92,23 @@
 #     strip empties them, and per-probe as residue is removed, but a
 #     directory that also holds a manifest-delivered file legitimately
 #     stays (as it would on a real consumer).
+#   - A grandfathered wrapper's ratchet entry records the WORST divergence
+#     class in its lattice, so a new EXIT divergence cannot hide behind a
+#     recorded SKIP-ONLY one. A SECOND divergence of the SAME recorded
+#     class, on a different subset, is deliberately not reported
+#     separately: the entry already declares that failure mode, one
+#     marker-first fix removes every subset of it at once, and the
+#     stale-entry rule fires the moment it does.
+#   - Probe independence is enforced by restoring the fixture to its
+#     committed baseline before every probe, which covers tracked edits,
+#     untracked files and gitignored output. A side effect a wrapper writes
+#     OUTSIDE the fixture (a real $HOME dotfile, a system temp dir) is
+#     still shared between probes.
 #
-# Runtime is ~1-2 minutes, dominated by one probe that legitimately
-# executes a nested hub suite under a timeout; still far cheaper than
-# check_repo_lint_consumer_safety, so it sits just ahead of it.
+# Runtime is ~3 minutes: about a third of it is one probe that legitimately
+# executes a nested hub suite until the per-probe timeout kills it, and
+# another third is the single |H| = 32 wrapper's 529-subset lattice. Still
+# cheaper than check_repo_lint_consumer_safety, so it sits just ahead of it.
 
 set -euo pipefail
 
