@@ -1495,16 +1495,19 @@ SPAN_EOF
   #       adoption's rationale away. So § 4 must require the scan across
   #       BOTH marker families.
   #
-  #   (3) STOP AT AUTHORSHIP. Content-matching answers "is this record
-  #       mine?" and nothing else. A retry that crashed between the
-  #       comment and the body still owes the body callout, and the
-  #       writer that got in between may have superseded the very
-  #       record the retry just recognized as its own. Finishing the
-  #       retry then replaces the newer decision's active callout with
-  #       the older record's and records no return to it, so the
-  #       chronology and the current disposition disagree. So the same
-  #       bullet must carry the retry past authorship to currency and
-  #       to what happens to the standing callout.
+  #   (3) DO NOT STOP AT AUTHORSHIP. Whatever § 4 says about whose
+  #       write a matched record is, it has settled nothing about
+  #       whether that record is still current. A retry that crashed
+  #       between the comment and the body still owes the body callout,
+  #       and the writer that got in between may have superseded the
+  #       very record the retry matched. Finishing the retry then
+  #       replaces the newer decision's active callout with the older
+  #       record's and records no return to it, so the chronology and
+  #       the current disposition disagree. So the bullet that deals in
+  #       authorship must carry the retry on to currency and to what
+  #       becomes of the standing callout. (Whether authorship is
+  #       decidable at all is Case 45's business; this case asserts only
+  #       that the three are addressed together.)
   #
   # Assertions run against § 4 only — heading exclusive, up to the next
   # `###` — so wording elsewhere in the file cannot satisfy or trip
@@ -1549,9 +1552,9 @@ SPAN_EOF
     elif [ "${both_families:-0}" -lt 1 ]; then
       fail "Case 43: $DR_PATH § 4 has no bullet requiring the supersession scan across BOTH the 'decision-' and 'path-taken-' families — a decision superseded only by a change-level path record still reads as current, and the re-adoption edits the first adoption's rationale away (nathanjohnpayne/mergepath#794)"
     elif [ "${self_currency:-0}" -lt 1 ]; then
-      fail "Case 43: $DR_PATH § 4 settles authorship but never says the match leaves currency open, nor what becomes of the standing callout — a retry that recognizes its own crashed comment then finishes the body write and swaps a newer decision's active callout for its own older record, with no return to that record recorded anywhere (nathanjohnpayne/mergepath#794)"
+      fail "Case 43: $DR_PATH § 4 deals in authorship but never says the match leaves currency open, nor what becomes of the standing callout — a retry that matches its own crashed comment then finishes the body write and swaps a newer decision's active callout for its own older record, with no return to that record recorded anywhere (nathanjohnpayne/mergepath#794)"
     else
-      pass "Case 43: § 4 self-recognition is content-anchored, states its concurrent-writer limit, scans both marker families, and stops short of the body when the record it matched has been superseded"
+      pass "Case 43: § 4 self-recognition states its concurrent-writer limit, scans both marker families, and stops short of the body when the record it matched has been superseded"
     fi
   fi
 
@@ -1626,8 +1629,86 @@ SPAN_EOF
     fi
   fi
 
+  # Case 45: § 4 does not infer authorship from matching content, and
+  # routes the case no local read can decide to the halt.
+  #
+  # § 4's self-recognition rule has been rewritten three times, each
+  # round swapping one insufficient signal for another: the marker's
+  # date, then comment recency, then the CONTENT of the matched record.
+  # Content is the one that looks sound and is not. It refutes — a
+  # record stating some other decision cannot be the write you are
+  # retrying — but it cannot confirm, because a legitimate re-adoption
+  # reproduces the earlier adoption's content exactly whenever the
+  # reasons for returning have not changed:
+  #
+  #   adopt use-postgres        → comment A, bare slug
+  #   supersede with use-dynamo → comment B
+  #   re-adopt use-postgres     → keys away from A, and A already states
+  #                               the very decision being re-adopted
+  #
+  # Read as proof of authorship, A is "your own unfinished write"; the
+  # currency scan then finds B and the procedure halts, so the qualified
+  # `use-postgres-after-dynamo` comment and the callout replacement that
+  # §§ 4-5 require are never written. A valid third pivot is suppressed
+  # by a test that was never entitled to decide the question.
+  #
+  # Nothing local can decide it. A per-write identifier would have to be
+  # unique to one write AND recomputable by a retry holding no local
+  # state, and the comments API offers no compare-and-swap to arbitrate.
+  # So the honest rule states the limit and sends the undecidable case
+  # to the branch that cannot duplicate — leave the record standing,
+  # write nothing, surface the conflict — instead of acquiring a fifth
+  # inference. Pinned four ways: the two sentences that asserted
+  # authorship from content must be gone; the refutes-but-cannot-confirm
+  # asymmetry must be stated, so content is not silently promoted back
+  # to a proof; the reason no per-write identifier is available must be
+  # given, so the next round does not "fix" this by inventing one; and
+  # the halt must be keyed to the two readings coming apart rather than
+  # to any finding about whose write it was
+  # (nathanjohnpayne/mergepath#794).
+  if [ ! -f "$ROOT/$DR_PATH" ]; then
+    fail "Case 45: $DR_PATH missing on disk"
+  else
+    idem45_sec=$(awk '
+      index($0, "### 4. Idempotency") == 1 { in_sec = 1; next }
+      in_sec && /^### / { exit }
+      in_sec { print }
+    ' "$ROOT/$DR_PATH")
+    set +e
+    # The two sentences that carried the authorship claim.
+    authorship_claim=$(printf '%s\n' "$idem45_sec" \
+      | grep -cF -e 'Content is the anchor' -e 'settles *authorship*')
+    # The asymmetry itself, in one breath — "it refutes" alone reads as
+    # an endorsement of the content test.
+    refute_only=$(printf '%s\n' "$idem45_sec" \
+      | grep -F 'refutes' | grep -cF 'confirm')
+    # Why the identifier Codex proposed cannot exist, not merely that it
+    # does not: uniqueness and recomputability-after-a-crash pull apart.
+    no_identifier=$(printf '%s\n' "$idem45_sec" \
+      | grep -F 'identifier' | grep -cF 'recomputable')
+    # The halt, justified by the readings diverging rather than by an
+    # authorship verdict. Same soft-wrap reasoning as Case 43: one
+    # bullet is one physical line, so the conjunction pins one claim.
+    halt_readings=$(printf '%s\n' "$idem45_sec" \
+      | grep -F 'cannot duplicate' | grep -F 'readings' | grep -cF 'write nothing')
+    set -e
+    if [ -z "$idem45_sec" ]; then
+      fail "Case 45: $DR_PATH has no '### 4. Idempotency' section"
+    elif [ "${authorship_claim:-0}" -gt 0 ]; then
+      fail "Case 45: $DR_PATH § 4 still reads a content match as proof that the record is your own write (hits=${authorship_claim:-0}) — an issue re-adopting a decision whose reasons have not changed reproduces the earlier adoption's content exactly, so the re-adoption is misread as a retry and the qualified comment §§ 4-5 require is never written (nathanjohnpayne/mergepath#794)"
+    elif [ "${refute_only:-0}" -lt 1 ]; then
+      fail "Case 45: $DR_PATH § 4 does not state that content refutes authorship without confirming it — a reader left with 'check the content' applies it in the direction it cannot support (nathanjohnpayne/mergepath#794)"
+    elif [ "${no_identifier:-0}" -lt 1 ]; then
+      fail "Case 45: $DR_PATH § 4 does not say why no durable per-write identifier is available — unique-per-write and recomputable-by-a-stateless-retry pull apart, and without that the next round closes the gap by inventing the identifier § 2 already rejected as a counter (nathanjohnpayne/mergepath#794)"
+    elif [ "${halt_readings:-0}" -lt 1 ]; then
+      fail "Case 45: $DR_PATH § 4 does not route the undecidable case to the branch that cannot duplicate on the grounds that the two readings diverge — a halt justified by an authorship verdict is the same over-claim wearing a safer outcome (nathanjohnpayne/mergepath#794)"
+    else
+      pass "Case 45: § 4 treats content as refuting but never confirming authorship, says why no per-write identifier can settle it, and halts on the undecidable case"
+    fi
+  fi
+
 else
-  echo "SKIP: Cases 36-44 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-45 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
