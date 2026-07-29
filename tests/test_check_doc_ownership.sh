@@ -729,6 +729,68 @@ else
   fail "Case 12b unexpected (rc=$rc): $out"
 fi
 
+# --- Case 12c: QUOTED denylist entries still trip the drift guard ----
+# IDENTITY_DOCS_DENYLIST is Bash source, so an entry may legitimately be
+# written `"docs/agents/x.md"`. A reader that trims whitespace only keeps
+# the leading quote, the guard's `docs/agents/*` case stops matching, and
+# a real contradiction is reported as a PASS (#785/#786). Same fixture as
+# Case 12 with the entries quoted — the verdict must not change.
+set +e
+out=$(run_with_denylist "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '  "README.md"
+  "docs/agents/identity.md"')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12c: double-quoted denylist entry still fails closed (quote stripping)"
+else
+  fail "Case 12c unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12d: single quotes + a trailing inline comment ------------
+# The other half of the real array shape: Bash allows single quotes and a
+# trailing `# ...` comment on the same line. Stripping quotes alone is
+# not enough — the comment leaves a dangling closing quote mid-token.
+set +e
+out=$(run_with_denylist "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  "  'README.md'  # repo-owned front door
+  'docs/agents/identity.md'  # per-repo identity doc")
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12d: single-quoted denylist entry with a trailing comment still fails closed"
+else
+  fail "Case 12d unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12e: CONTROL — a commented-OUT entry is not an entry -------
+# The over-correction mirror of 12c/12d, and a control in the same sense
+# as 12b: it passes both before and after the quote/comment fix. Its job
+# is to pin the tokenizer's other edge — a `#`-prefixed line inside the
+# array is Bash comment text, not an array element, so reading it as one
+# would invent a denylist entry nobody wrote and fail a doc that is
+# correctly classified canonical.
+MANIFEST_DRIFT_COMMENTED="$MIN_HEADER
+paths:
+  - path: docs/agents/identity.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/identity.md
+    class: canonical
+"
+set +e
+out=$(run_with_denylist "$MANIFEST_DRIFT_COMMENTED" "docs/agents/identity.md" \
+  '  "README.md"
+  # "docs/agents/identity.md"  <- withdrawn, see the follow-up')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 12e: a commented-out denylist line is not read as an entry"
+else
+  fail "Case 12e unexpected (rc=$rc): $out"
+fi
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).

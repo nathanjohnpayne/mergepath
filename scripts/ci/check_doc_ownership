@@ -407,12 +407,47 @@ fi
 # prevent). Soft-skip if the sibling or its array is absent: this guard
 # is a consistency net over another check's data, and it must not be the
 # thing that reds CI when that check is mid-refactor.
+#
+# The array body is Bash source, so read it the way Bash would rather
+# than trusting today's incidental formatting. Trimming whitespace alone
+# was not enough: the moment an entry is written `"docs/agents/x.md"` —
+# ordinary, idiomatic Bash — the leading quote makes the
+# `docs/agents/*` case below miss it, and the contradiction this guard
+# advertises is silently skipped instead of reported. The awk tokenizer
+# splits each line on UNQUOTED whitespace, drops matched surrounding
+# single/double quotes, and stops at a `#` that begins a word (Bash's own
+# comment rule — a `#` mid-word is a literal, not a comment).
 SIBLING="$REPO_ROOT/scripts/ci/check_sync_manifest"
 if [ -f "$SIBLING" ]; then
   denylist=$(awk '
+    # SQ/DQ are built with sprintf rather than written as literals: the
+    # whole program lives inside one shell single-quoted string, so a bare
+    # apostrophe cannot appear here, and %c is portable across the awk
+    # implementations CI actually runs (mawk, gawk, BSD awk).
+    BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34) }
     /^IDENTITY_DOCS_DENYLIST=\(/ { inside = 1; next }
-    inside && /^\)/             { inside = 0 }
-    inside                       { gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 != "") print }
+    inside && /^\)/             { inside = 0; next }
+    !inside                     { next }
+    {
+      tok = ""; have = 0; q = ""; boundary = 1
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (q != "") {
+          if (c == q) { q = "" } else { tok = tok c }
+          continue
+        }
+        if (c == DQ || c == SQ) { q = c; have = 1; boundary = 0; continue }
+        if (c == "#" && boundary) { break }
+        if (c == " " || c == "\t") {
+          if (have) { print tok; tok = ""; have = 0 }
+          boundary = 1
+          continue
+        }
+        tok = tok c; have = 1; boundary = 0
+      }
+      if (have) { print tok }
+    }
   ' "$SIBLING")
   if [ -n "$denylist" ]; then
     while IFS= read -r denied; do
