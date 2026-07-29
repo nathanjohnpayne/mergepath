@@ -70,21 +70,56 @@ on:
     # pr-audit.yml / the feedback sweep (09:00), so all three weekly
     # reports are already filed when the human's planning window starts.
     - cron: '30 8 * * 1'
-  workflow_dispatch:
+  # Manual runs go through repository_dispatch, NOT workflow_dispatch.
+  #
+  # workflow_dispatch lets the dispatcher pick a ref, and GitHub then runs
+  # the workflow DEFINITION from that ref. Any in-workflow guard against a
+  # non-default ref therefore lives in the very file the dispatcher can
+  # rewrite: push a branch that deletes the guard (or replaces the steps
+  # outright) and the run gets BRANCH_PROTECTION_AUDIT_TOKEN — an
+  # admin-scoped PAT with Administration:read on all ten fleet repos —
+  # before the pinned checkout can matter. Pinning `ref:` on the checkout
+  # step does not help: the step list itself came from the attacker's ref.
+  #
+  # repository_dispatch has no ref parameter at all. GitHub only ever runs
+  # the DEFAULT-BRANCH copy of a repository_dispatch workflow, so the
+  # branch-selection surface is gone rather than guarded from inside. Fire
+  # one with:
+  #
+  #   gh api repos/nathanjohnpayne/mergepath/dispatches \
+  #     -f event_type=branch-protection-audit
+  #
+  # (a PAT is required — a GITHUB_TOKEN-authored dispatch creates no
+  # workflow run.) Do NOT re-add workflow_dispatch here; the ref guard on
+  # the job below is a backstop, not a substitute, and
+  # tests/test_audit_branch_protection_workflow.sh fails if it reappears.
+  repository_dispatch:
+    types: [branch-protection-audit]
 
 permissions:
   contents: read
   issues: write
 
+# Serialize every run of this audit. The rollup-issue steps are a
+# read-then-write pair: two overlapping runs can both see "no open rollup
+# issue" and both `gh issue create`, breaking the single-rollup guarantee
+# this workflow's whole reporting model rests on; and a slow drift run
+# finishing after a fast clean run would re-open what the clean run just
+# closed. `cancel-in-progress: false` queues rather than cancels, so a
+# scheduled audit is never silently dropped in favour of a manual one.
+concurrency:
+  group: branch-protection-audit
+  cancel-in-progress: false
+
 jobs:
   audit:
     name: Audit fleet branch protection
-    # Reject manual dispatch from a non-default ref (same #550 reasoning as
-    # weekly-drift-audit.yml): on workflow_dispatch GitHub runs the workflow
-    # DEFINITION from the chosen ref, which the checkout pin cannot
-    # constrain — a feature branch could leak BRANCH_PROTECTION_AUDIT_TOKEN,
-    # an admin-scoped PAT, before checkout. Scheduled runs and
-    # default-branch dispatch pass; a feature-branch dispatch is skipped.
+    # Backstop, not the primary control. With repository_dispatch and
+    # schedule as the only triggers, github.ref_name is ALWAYS the default
+    # branch, so this condition is expected to be trivially true — it
+    # exists so that re-adding a ref-selectable trigger fails closed
+    # instead of silently handing an admin PAT to a feature branch. The
+    # real protection is the absence of workflow_dispatch above (#550).
     if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -93,12 +128,13 @@ jobs:
       ISSUE_TITLE: 'Fleet branch protection has drifted from the canonical required checks'
     steps:
       - name: Checkout mergepath
-        # Pin to the trusted default branch (#548): this workflow has a
-        # workflow_dispatch trigger and runs scripts/audit-branch-protection.sh
-        # under an admin-scoped PAT, so without an explicit ref a manually
-        # dispatched branch could run a tampered script with that token in
-        # its environment. persist-credentials:false is safe: the audit
-        # reads through `gh api`, not through the workspace git remote.
+        # Pin to the trusted default branch (#548). Belt-and-braces given
+        # the triggers above already fix the ref: it keeps the checked-out
+        # scripts/audit-branch-protection.sh trusted even if a future edit
+        # adds a ref-selectable trigger, and it makes the intent explicit
+        # rather than implicit in the trigger list.
+        # persist-credentials:false is safe: the audit reads through
+        # `gh api`, not through the workspace git remote.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -311,6 +347,13 @@ jobs:
           # if (unexpectedly) more than one exists. `--limit 500` overrides
           # gh's default 30-item cap so the lookup can't miss the rollup
           # issue behind a backlog of >30 open issues.
+          #
+          # Plain command substitution on purpose: a failing `gh issue
+          # list` makes this assignment fail, which `set -e` turns into a
+          # failed step. Do not rewrite it as `mapfile < <(gh ...)` — a
+          # process substitution's failure is invisible to mapfile, and a
+          # lookup error would then read as "no rollup issue exists" and
+          # open a duplicate.
           existing="$(gh issue list --repo "$REPO" --state open --limit 500 \
             --label "$TRACKING_LABEL" --json number --jq 'sort_by(.number) | .[0].number // ""')"
 
@@ -345,10 +388,31 @@ jobs:
           # == clean, which the exit-1/2 guards above make unreachable under
           # an auth failure, so a token that lost its scope cannot close a
           # genuine drift issue.
-          mapfile -t open_issues < <(gh issue list --repo "$REPO" --state open --limit 500 \
-            --label "$TRACKING_LABEL" --json number --jq '.[].number')
+          #
+          # The lookup is a plain command substitution, deliberately NOT
+          # `mapfile -t arr < <(gh ...)`: a process substitution's exit
+          # status is not the exit status of `mapfile`, so under
+          # `set -euo pipefail` a failing `gh issue list` still leaves
+          # mapfile succeeding with an empty array. "GitHub was
+          # unreachable" would then be indistinguishable from "no rollup
+          # issue is open", and the step would report the stale drift
+          # issue as already closed while leaving it open. Fail the job
+          # instead — the next weekly run (or a manual dispatch) closes it.
+          if ! open_issue_numbers="$(gh issue list --repo "$REPO" --state open --limit 500 \
+              --label "$TRACKING_LABEL" --json number --jq '.[].number')"; then
+            echo "::error::Could not list open '${TRACKING_LABEL}' issues — gh issue list failed. Failing the job rather than treating an unreadable list as an empty one, which would silently leave a stale drift issue open behind a clean audit."
+            exit 1
+          fi
 
-          if [ "${#open_issues[@]}" -eq 0 ]; then
+          open_count=0
+          open_issues=()
+          while IFS= read -r n; do
+            [ -z "$n" ] && continue
+            open_issues[open_count]="$n"
+            open_count=$((open_count + 1))
+          done <<<"$open_issue_numbers"
+
+          if [ "$open_count" -eq 0 ]; then
             echo "Audit clean and no open rollup issue — nothing to do."
             exit 0
           fi

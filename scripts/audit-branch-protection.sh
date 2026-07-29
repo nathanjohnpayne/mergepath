@@ -36,6 +36,15 @@
 #   is how the fleet drifted to 0-of-5 canonical gates on eight of ten
 #   repos without anything going red.
 #
+#   Each repo is audited on ITS OWN default branch, resolved per repo from
+#   `GET /repos/{owner}/{repo}`. A fleet run must not assume every repo
+#   calls its default branch `main`: the recorded posture in
+#   docs/architecture/0002-branch-protection-enforcement-posture.md is
+#   "all five canonical checks on its default branch", and auditing a
+#   renamed or `master`-defaulted repo against a hard-coded `main` would
+#   inspect a branch that may not even exist. An explicit `--branch` still
+#   overrides, and is then applied uniformly to every repo.
+#
 #   Exit codes are deliberately the SAME shape as single-repo mode, so a
 #   caller's `case "$rc"` reads identically in both:
 #     0 — every audited repo requires all canonical checks
@@ -59,6 +68,17 @@
 #   audit under a reviewer identity does not produce a false "PR merges are
 #   completely unprotected" verdict. If you hit exit 2 with an auth-scope
 #   diagnostic, re-run with an author/admin token.
+#
+# Admin-enforcement (--require-admin-enforcement):
+#   A required status check is bypassable by a repository admin unless
+#   classic protection sets `enforce_admins: true` (or, under rulesets, the
+#   governing ruleset grants nobody a bypass). ADR 0002 requires that
+#   posture on the HUB specifically — the two escapes that motivated the
+#   merge-clearance gate (#427/#428) were both admin merges — so `--fleet`
+#   passes this flag for the hub repo and a hub that requires all five
+#   canonical checks but leaves admins unconstrained is DRIFT (exit 3), not
+#   a PASS. Consumers are not audited for it: ADR 0002 does not require it
+#   of them.
 
 set -eo pipefail
 
@@ -86,11 +106,16 @@ SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 
 REPO=""
 BRANCH="main"
+# Distinguishes "caller asked for this branch" from "nobody said, so the
+# default is main". --fleet resolves each repo's own default branch unless
+# the caller was explicit, so the two cases cannot share one variable.
+BRANCH_EXPLICIT=0
 FLEET=0
 MANIFEST=""
 AUDIT_CMD=""
 HUB_REPO=""
 SUMMARY_FILE=""
+REQUIRE_ADMIN_ENFORCEMENT=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -103,7 +128,12 @@ while [ $# -gt 0 ]; do
       if [ $# -lt 2 ] || [ -z "$2" ]; then
         echo "Error: --branch requires a non-empty value" >&2; exit 1
       fi
-      BRANCH="$2"; shift 2 ;;
+      BRANCH="$2"; BRANCH_EXPLICIT=1; shift 2 ;;
+    --require-admin-enforcement)
+      # ADR 0002 requires enforce_admins on the hub (#427/#428 were both
+      # admin merges). Off by default so consumer audits keep their
+      # documented posture.
+      REQUIRE_ADMIN_ENFORCEMENT=1; shift ;;
     --fleet)
       FLEET=1; shift ;;
     --manifest)
@@ -131,6 +161,7 @@ while [ $# -gt 0 ]; do
     -h|--help)
       cat <<EOF
 Usage: scripts/audit-branch-protection.sh [--repo owner/name] [--branch <name>]
+                                          [--require-admin-enforcement]
        scripts/audit-branch-protection.sh --fleet [--branch <name>]
                                           [--hub-repo owner/name]
                                           [--manifest <path>]
@@ -140,11 +171,17 @@ Verifies branch protection on \$BRANCH (default: main) requires the
 canonical mergepath-shipped status checks:
   ${CANONICAL_REQUIRED_CHECKS[*]}
 
+--require-admin-enforcement additionally requires that admins cannot
+bypass those checks (classic \`enforce_admins: true\`, or a governing
+ruleset with no bypass actors). ADR 0002 requires this on the hub.
+
 Exit 3 if any canonical check is not required (PR-merge gating gap).
 Exit 2 on gh API auth/scope failures (use an author/admin PAT).
 
 --fleet audits the hub plus every \`.consumers[].repo\` in
-.mergepath-sync.yml and prints a per-repo verdict table. Same exit-code
+.mergepath-sync.yml and prints a per-repo verdict table. Each repo is
+audited on its OWN default branch unless --branch is passed explicitly,
+and the hub is audited with --require-admin-enforcement. Same exit-code
 shape: 0 all clean, 1 usage/prerequisite, 2 at least one repo unreadable
 (infrastructure, NOT drift), 3 drift on at least one readable repo.
 EOF
@@ -211,18 +248,56 @@ fleet_audit() {
     repos+=("$r")
   done <<<"$consumer_rows"
 
-  echo "Fleet branch-protection audit — ${#repos[@]} repo(s), branch '$BRANCH'"
+  # A fleet run audits each repo on its own default branch. Only an
+  # explicit --branch pins one branch name across the whole fleet.
+  local branch_label
+  if [ "$BRANCH_EXPLICIT" -eq 1 ]; then
+    branch_label="branch '$BRANCH' (explicit --branch, applied to every repo)"
+  else
+    branch_label="each repo's own default branch"
+  fi
+
+  echo "Fleet branch-protection audit — ${#repos[@]} repo(s), $branch_label"
   echo "Manifest: $manifest"
   echo ""
 
   local summary=""
   local n_pass=0 n_drift=0 n_error=0
-  local out rc verdict tmp
+  local out rc verdict tmp repo_branch
   tmp="$(mktemp "${TMPDIR:-/tmp}/fleet-bp-audit.XXXXXX")"
 
   for r in "${repos[@]}"; do
     rc=0
-    "$audit_cmd" --repo "$r" --branch "$BRANCH" >"$tmp" 2>&1 || rc=$?
+
+    # Resolve this repo's default branch unless the caller pinned one.
+    # A repo whose metadata cannot be read is an ERROR (infrastructure),
+    # never a PASS: guessing `main` here would audit a branch that may
+    # not exist and report the resulting "unprotected" verdict as drift.
+    if [ "$BRANCH_EXPLICIT" -eq 1 ]; then
+      repo_branch="$BRANCH"
+    else
+      repo_branch="$(gh api "repos/$r" --jq '.default_branch' 2>/dev/null || true)"
+      if [ -z "$repo_branch" ] || [ "$repo_branch" = "null" ]; then
+        n_error=$((n_error + 1))
+        echo "--- $r (rc=2, ERROR) ---"
+        echo "Could not resolve the default branch for $r via GET /repos/$r."
+        echo "Refusing to fall back to 'main': that would audit a branch this repo"
+        echo "may not have and report the miss as protection drift. Treating the"
+        echo "repo as unreadable (infrastructure failure) instead."
+        echo ""
+        summary="${summary}$(printf '%-6s rc=%-2s %s' "ERROR" "2" "$r@<unresolved>")
+"
+        continue
+      fi
+    fi
+
+    # ADR 0002 requires enforce_admins on the hub only, so the flag is
+    # passed for the hub and withheld from consumers.
+    if [ "$r" = "$hub" ]; then
+      "$audit_cmd" --repo "$r" --branch "$repo_branch" --require-admin-enforcement >"$tmp" 2>&1 || rc=$?
+    else
+      "$audit_cmd" --repo "$r" --branch "$repo_branch" >"$tmp" 2>&1 || rc=$?
+    fi
     out="$(cat "$tmp")"
     case "$rc" in
       0) verdict="PASS";  n_pass=$((n_pass + 1)) ;;
@@ -232,17 +307,17 @@ fleet_audit() {
       # unexpected code — are infrastructure, never drift.
       *) verdict="ERROR"; n_error=$((n_error + 1)) ;;
     esac
-    echo "--- $r (rc=$rc, $verdict) ---"
+    echo "--- $r@$repo_branch (rc=$rc, $verdict) ---"
     printf '%s\n' "$out"
     echo ""
-    summary="${summary}$(printf '%-6s rc=%-2s %s' "$verdict" "$rc" "$r")
+    summary="${summary}$(printf '%-6s rc=%-2s %s' "$verdict" "$rc" "$r@$repo_branch")
 "
   done
   rm -f "$tmp"
 
   local tally="Audited ${#repos[@]} repo(s): ${n_pass} pass, ${n_drift} drift, ${n_error} error."
   local summary_block
-  summary_block="=== Fleet summary (branch '$BRANCH') ===
+  summary_block="=== Fleet summary ($branch_label) ===
 ${summary}${tally}"
 
   echo "$summary_block"
@@ -273,6 +348,11 @@ ${summary}${tally}"
 if [ "$FLEET" -eq 1 ] && [ -n "$REPO" ]; then
   echo "Error: --fleet and --repo are mutually exclusive" >&2; exit 1
 fi
+if [ "$FLEET" -eq 1 ] && [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
+  echo "Error: --require-admin-enforcement is decided per repo by --fleet (hub only, per ADR 0002)" >&2
+  echo "       and would be silently ignored here. Drop it, or audit the hub directly with --repo." >&2
+  exit 1
+fi
 if [ "$FLEET" -eq 0 ]; then
   for _fleet_only in "--manifest:$MANIFEST" "--hub-repo:$HUB_REPO" \
                      "--summary-file:$SUMMARY_FILE" "--audit-cmd:$AUDIT_CMD"; do
@@ -300,6 +380,21 @@ fi
 
 echo "Auditing branch protection on $REPO@$BRANCH..."
 echo ""
+
+# Lazily resolve this repo's real default branch, once. Only the
+# `~DEFAULT_BRANCH` ruleset condition needs it, so repos on the classic
+# path never pay for the extra call. Returns the empty string when the
+# metadata read fails, which callers treat as "unknown".
+REPO_DEFAULT_BRANCH=""
+REPO_DEFAULT_BRANCH_RESOLVED=0
+repo_default_branch() {
+  if [ "$REPO_DEFAULT_BRANCH_RESOLVED" -eq 0 ]; then
+    REPO_DEFAULT_BRANCH_RESOLVED=1
+    REPO_DEFAULT_BRANCH="$(gh api "repos/$REPO" --jq '.default_branch' 2>/dev/null || true)"
+    [ "$REPO_DEFAULT_BRANCH" = "null" ] && REPO_DEFAULT_BRANCH=""
+  fi
+  printf '%s' "$REPO_DEFAULT_BRANCH"
+}
 
 # Fetch the branch-protection rules. Two endpoints are relevant:
 #   1. /branches/{branch}/protection — classic protection rules
@@ -397,16 +492,18 @@ if [ "$USE_RULESETS" -eq 1 ]; then
     }
     # Extract include patterns for this ruleset and decide if any of
     # them targets the audited branch. Four supported forms:
-    #   ~DEFAULT_BRANCH  — matches if BRANCH is the repo's default
-    #                      (we approximate: trust the include and let
-    #                      a non-default-branch audit pick this up
-    #                      only when the caller passed the actual
-    #                      default; an explicit DEFAULT_BRANCH probe
-    #                      would require an extra API call, so we
-    #                      treat ~DEFAULT_BRANCH as matching when the
-    #                      audited branch is "main" or "master" — the
-    #                      99% case — and recommend explicit
-    #                      refs/heads/<name> for non-default audits)
+    #   ~DEFAULT_BRANCH  — matches when BRANCH really is this repo's
+    #                      default branch, resolved once from
+    #                      GET /repos/{owner}/{repo}. The earlier
+    #                      implementation assumed main/master was the
+    #                      default, which mis-answered both ways on a
+    #                      repo with a renamed default: a `trunk` audit
+    #                      saw "no ruleset targets trunk" (false DRIFT)
+    #                      and a `main` audit on a trunk-defaulted repo
+    #                      counted a ruleset that does not govern main
+    #                      (false PASS). The main/master guess survives
+    #                      only as a fallback for when the metadata read
+    #                      itself fails.
     #   ~ALL             — matches every branch
     #   refs/heads/<x>   — literal match against BRANCH
     #   refs/heads/<glob>— bash glob match against the BRANCH ref
@@ -429,10 +526,16 @@ if [ "$USE_RULESETS" -eq 1 ]; then
         "~ALL")
           echo 1; return ;;
         "~DEFAULT_BRANCH")
-          # main/master treated as the assumed default; for
-          # non-default-branch audits, callers should use an explicit
-          # refs/heads/<name> form.
-          if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+          local def
+          def="$(repo_default_branch)"
+          if [ -n "$def" ]; then
+            # Authoritative answer from the repo's own metadata.
+            if [ "$BRANCH" = "$def" ]; then
+              echo 1; return
+            fi
+          elif [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+            # Metadata unreadable — degrade to the historical guess
+            # rather than silently declaring the ruleset non-matching.
             echo 1; return
           fi
           ;;
@@ -499,6 +602,7 @@ if [ "$USE_RULESETS" -eq 1 ]; then
   # required_status_checks parameter. Previously this collected from
   # ALL branch-target rulesets regardless of include match (#285).
   REQUIRED_CHECKS=""
+  BYPASS_ACTORS=""
   for rid in $MATCHING_IDS; do
     DETAIL=$(gh api "repos/$REPO/rulesets/$rid" 2>&1) || {
       echo "Could not fetch ruleset $rid: $DETAIL" >&2; exit 2
@@ -515,6 +619,22 @@ if [ "$USE_RULESETS" -eq 1 ]; then
 $THIS_CHECKS"
       else
         REQUIRED_CHECKS="$THIS_CHECKS"
+      fi
+    fi
+    # Rulesets have no `enforce_admins`. Their equivalent is the
+    # bypass list: anyone in `bypass_actors` merges past this ruleset's
+    # required checks, so a non-empty list is the ruleset-world
+    # analogue of `enforce_admins: false`.
+    THIS_BYPASS=$(echo "$DETAIL" | jq -r --arg rid "$rid" '
+      .bypass_actors[]?
+      | "ruleset \($rid): actor_type=\(.actor_type // "?") actor_id=\(.actor_id // "?") bypass_mode=\(.bypass_mode // "?")"
+    ' 2>/dev/null)
+    if [ -n "$THIS_BYPASS" ]; then
+      if [ -n "$BYPASS_ACTORS" ]; then
+        BYPASS_ACTORS="$BYPASS_ACTORS
+$THIS_BYPASS"
+      else
+        BYPASS_ACTORS="$THIS_BYPASS"
       fi
     fi
   done
@@ -535,6 +655,13 @@ echo "Required status checks currently enforced:"
 echo "$REQUIRED_CHECKS" | sed 's/^/  ✓ /'
 echo ""
 
+# Two independent posture questions are answered below: are the canonical
+# checks required, and (when asked) can an admin merge past them anyway.
+# Both are reported in one run — a repo that fixes the first and not the
+# second is still not enforcing anything, and finding that out a week
+# later is exactly the latency #774 exists to remove.
+GAPS=0
+
 MISSING=()
 for check in "${CANONICAL_REQUIRED_CHECKS[@]}"; do
   if ! echo "$REQUIRED_CHECKS" | grep -Fxq "$check"; then
@@ -542,25 +669,69 @@ for check in "${CANONICAL_REQUIRED_CHECKS[@]}"; do
   fi
 done
 
-if [ ${#MISSING[@]} -eq 0 ]; then
+if [ ${#MISSING[@]} -gt 0 ]; then
+  GAPS=1
+  echo "FAIL: ${#MISSING[@]} canonical mergepath check(s) NOT required on $BRANCH:"
+  for check in "${MISSING[@]}"; do
+    echo "  ✗ $check"
+  done
+  echo ""
+  echo "Without these as required, the corresponding workflows fire on PRs but"
+  echo "their failures are advisory — PRs merge despite the failed check."
+  echo "Specifically: 'Label Gate' enforces the prohibition on merging while"
+  echo "'needs-human-review' / 'policy-violation' / 'needs-external-review' /"
+  echo "'human-hold' is"
+  echo "present (see nathanjohnpayne/mergepath#161)."
+  echo ""
+  echo "Fix: Settings → Branches → Branch protection rule for '$BRANCH'"
+  echo "→ Require status checks to pass before merging → Add the missing"
+  echo "checks. Each workflow must have run at least once on the repo for"
+  echo "GitHub's UI to offer the check name in the dropdown."
+  echo ""
+fi
+
+# Admin-bypass posture. Required checks are only as strong as the set of
+# people who cannot skip them: classic protection lets every repo admin
+# "merge without waiting for requirements" unless `enforce_admins` is on,
+# and a ruleset lets everyone in `bypass_actors` do the same. ADR 0002
+# requires the closed posture on the hub because #427/#428 were both
+# admin merges, so a hub that lists all five checks and leaves this open
+# must not read as PASS.
+if [ "$REQUIRE_ADMIN_ENFORCEMENT" -eq 1 ]; then
+  if [ "$USE_RULESETS" -eq 1 ]; then
+    if [ -n "$BYPASS_ACTORS" ]; then
+      GAPS=1
+      echo "FAIL: the ruleset(s) governing $BRANCH on $REPO grant bypass actors, so the"
+      echo "      required checks above are skippable:"
+      printf '%s\n' "$BYPASS_ACTORS" | sed 's/^/  ✗ /'
+      echo ""
+      echo "Fix: Settings → Rules → the ruleset governing '$BRANCH' → Bypass list →"
+      echo "remove every actor. A bypass entry is the ruleset-world equivalent of"
+      echo "classic protection's 'enforce_admins: false'."
+      echo ""
+    else
+      echo "Admin enforcement: OK — no bypass actors on the ruleset(s) governing $BRANCH."
+    fi
+  else
+    ENFORCE_ADMINS=$(echo "$PROT_BODY" | jq -r '.enforce_admins.enabled // false' 2>/dev/null)
+    if [ "$ENFORCE_ADMINS" != "true" ]; then
+      GAPS=1
+      echo "FAIL: enforce_admins is not enabled on $REPO@$BRANCH, so a repository admin"
+      echo "      can merge past every required check above ('merge without waiting for"
+      echo "      requirements'). The two escapes that motivated the merge-clearance"
+      echo "      gate (#427/#428) were both admin merges."
+      echo ""
+      echo "Fix: Settings → Branches → Branch protection rule for '$BRANCH'"
+      echo "→ tick 'Do not allow bypassing the above settings'."
+      echo ""
+    else
+      echo "Admin enforcement: OK — enforce_admins is enabled on $BRANCH."
+    fi
+  fi
+fi
+
+if [ "$GAPS" -eq 0 ]; then
   echo "PASS: all canonical mergepath checks are required."
   exit 0
 fi
-
-echo "FAIL: ${#MISSING[@]} canonical mergepath check(s) NOT required on $BRANCH:"
-for check in "${MISSING[@]}"; do
-  echo "  ✗ $check"
-done
-echo ""
-echo "Without these as required, the corresponding workflows fire on PRs but"
-echo "their failures are advisory — PRs merge despite the failed check."
-echo "Specifically: 'Label Gate' enforces the prohibition on merging while"
-echo "'needs-human-review' / 'policy-violation' / 'needs-external-review' /"
-echo "'human-hold' is"
-echo "present (see nathanjohnpayne/mergepath#161)."
-echo ""
-echo "Fix: Settings → Branches → Branch protection rule for '$BRANCH'"
-echo "→ Require status checks to pass before merging → Add the missing"
-echo "checks. Each workflow must have run at least once on the repo for"
-echo "GitHub's UI to offer the check name in the dropdown."
 exit 3

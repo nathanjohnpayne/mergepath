@@ -60,25 +60,57 @@ else
   fail "workflow YAML does not parse"
 fi
 
-# Scheduled + manually dispatchable. The whole point of #774 is that the
+# Scheduled + manually triggerable. The whole point of #774 is that the
 # audit runs without anyone remembering to run it.
 if [ "$(yq -r '.on.schedule[0].cron' "$WORKFLOW")" != "null" ]; then
   pass "schedule trigger with a cron entry"
 else
   fail "no schedule cron — the audit would still be manual-only (#774)"
 fi
-if [ "$(yq -r '.on | has("workflow_dispatch")' "$WORKFLOW")" = "true" ]; then
-  pass "workflow_dispatch trigger present"
+
+# The manual trigger must NOT be ref-selectable. workflow_dispatch runs the
+# workflow DEFINITION from the dispatcher's chosen ref, so every in-file
+# guard against a non-default ref is written in the file the dispatcher can
+# rewrite — a feature branch that deletes the guard gets
+# BRANCH_PROTECTION_AUDIT_TOKEN (Administration:read across all ten fleet
+# repos) before the pinned checkout runs. repository_dispatch has no ref
+# parameter and always runs the default-branch definition, so the surface
+# is removed rather than guarded from inside.
+if [ "$(yq -r '.on | has("workflow_dispatch")' "$WORKFLOW")" = "false" ]; then
+  pass "no workflow_dispatch trigger (no ref-selectable run of an admin-PAT workflow)"
 else
-  fail "workflow_dispatch trigger missing"
+  fail "workflow_dispatch must NOT be a trigger: it runs the definition from the dispatcher's ref, so the job's own ref guard is rewritable by the attacker and an admin-scoped PAT leaks to a feature branch"
+fi
+dispatch_types="$(yq -r '.on.repository_dispatch.types[]' "$WORKFLOW" 2>/dev/null || true)"
+if printf '%s\n' "$dispatch_types" | grep -qx "branch-protection-audit"; then
+  pass "repository_dispatch trigger typed 'branch-protection-audit' (manual runs stay on the default branch)"
+else
+  fail "expected a repository_dispatch trigger with type branch-protection-audit — got: [$dispatch_types]"
 fi
 
-# Non-default-ref dispatch must be rejected: the job holds an admin-scoped
-# PAT and workflow_dispatch runs the DEFINITION from the chosen ref (#550).
+# Backstop only, now that no trigger can select a ref — but it must stay,
+# so that re-adding a ref-selectable trigger fails closed (#550).
 if [ "$(yq -r '.jobs.audit.if' "$WORKFLOW")" = "github.ref_name == github.event.repository.default_branch" ]; then
-  pass "job gated to the default ref (blocks feature-branch dispatch with an admin PAT)"
+  pass "job still gated to the default ref (fail-closed backstop if a ref-selectable trigger is ever re-added)"
 else
   fail "job must be gated to the default ref — got: $(yq -r '.jobs.audit.if' "$WORKFLOW")"
+fi
+
+# Overlapping runs would each read "no open rollup issue" before either
+# created one and open two, and a slow drift run could re-open the issue a
+# newer clean run just closed. A workflow-level concurrency group is what
+# makes the read-then-write rollup pair safe.
+conc_group="$(yq -r '.concurrency.group // "none"' "$WORKFLOW")"
+# `| tostring` rather than `// "unset"`: yq's alternative operator treats a
+# literal `false` as empty, so the well-configured value would read as
+# missing and this assertion could never pass.
+conc_cancel="$(yq -r '.concurrency."cancel-in-progress" | tostring' "$WORKFLOW")"
+if [ "$conc_group" = "none" ]; then
+  fail "workflow-level concurrency group missing — two overlapping runs can both create a rollup issue"
+elif [ "$conc_cancel" != "false" ]; then
+  fail "concurrency must set cancel-in-progress: false so a queued scheduled audit is never dropped — got: $conc_cancel"
+else
+  pass "runs are serialized by a concurrency group ('$conc_group', cancel-in-progress: false)"
 fi
 
 expected_perms=$'contents: read\nissues: write'
@@ -253,9 +285,15 @@ mkdir -p "$GH_STUB_DIR"
 cat >"$GH_STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 # Records every invocation; `gh issue list` returns GH_STUB_EXISTING (or
-# an empty string, i.e. "no open rollup issue").
+# an empty string, i.e. "no open rollup issue"), and fails outright when
+# GH_STUB_LIST_FAIL is set — the "GitHub unreachable / issues:read denied"
+# case, which must never be mistaken for "nothing is open".
 printf '%s\n' "gh $*" >> "$GH_CALL_LOG"
 if [ "${1:-}" = "issue" ] && [ "${2:-}" = "list" ]; then
+  if [ -n "${GH_STUB_LIST_FAIL:-}" ]; then
+    echo "gh: HTTP 503 Service Unavailable (stubbed)" >&2
+    exit 1
+  fi
   printf '%s' "${GH_STUB_EXISTING:-}"
 fi
 exit 0
@@ -362,6 +400,80 @@ if grep -q "run at" "$ISSUE_BODY" && grep -q "least once" "$ISSUE_BODY"; then
   pass "issue body states the run-once-before-required ordering trap"
 else
   fail "issue body must state the ordering trap (a check must have run once before it can be required)"
+fi
+
+# ===========================================================================
+# Layer 2c — behavioural: closing the rollup issue on a clean audit
+# ===========================================================================
+#
+# The close step is the only place the workflow REMOVES a finding from
+# view, so its failure modes matter more than its happy path: "the lookup
+# failed" must never be read as "there is nothing open to close".
+
+step_run "Close stale rollup issue on a clean audit" > "$WORKDIR/close-step.sh"
+
+run_close_step() {  # env: GH_STUB_EXISTING / GH_STUB_LIST_FAIL
+  CLOSE_WS="$WORKDIR/close-ws"
+  rm -rf "$CLOSE_WS"; mkdir -p "$CLOSE_WS"
+  GH_CALL_LOG="$CLOSE_WS/gh-calls.log"
+  : > "$GH_CALL_LOG"
+  CLOSE_RC=0
+  CLOSE_TEXT="$(
+    cd "$CLOSE_WS" && \
+    PATH="$GH_STUB_DIR:$PATH" \
+    GH_CALL_LOG="$GH_CALL_LOG" \
+    GH_TOKEN="ghtoken" \
+    REPO="owner/hub" \
+    RUN_URL="https://example.invalid/run/1" \
+    TRACKING_LABEL="branch-protection-drift" \
+      bash "$WORKDIR/close-step.sh" 2>&1
+  )" || CLOSE_RC=$?
+  CLOSE_CALLS="$(cat "$GH_CALL_LOG")"
+}
+
+# No open rollup issue → the steady state. Succeed, close nothing.
+run_close_step
+if [ "$CLOSE_RC" -ne 0 ]; then
+  fail "clean audit with no open rollup issue must succeed, got rc=$CLOSE_RC: $CLOSE_TEXT"
+elif echo "$CLOSE_CALLS" | grep -q "issue close"; then
+  fail "nothing was open, yet the step tried to close something: $CLOSE_CALLS"
+else
+  pass "clean audit, no open rollup issue → no-op success"
+fi
+
+# Open rollup issues → every one is closed.
+GH_STUB_EXISTING=$'77\n88'
+export GH_STUB_EXISTING
+run_close_step
+unset GH_STUB_EXISTING
+if [ "$CLOSE_RC" -ne 0 ]; then
+  fail "clean audit with open rollup issues must succeed, got rc=$CLOSE_RC: $CLOSE_TEXT"
+elif ! echo "$CLOSE_CALLS" | grep -q "issue close 77" || ! echo "$CLOSE_CALLS" | grep -q "issue close 88"; then
+  fail "clean audit must close every open rollup issue; calls: $CLOSE_CALLS"
+else
+  pass "clean audit closes every open rollup issue"
+fi
+
+# The load-bearing one: the lookup FAILS. `mapfile -t arr < <(gh ...)`
+# would swallow this — a process substitution's exit status is not
+# mapfile's, so mapfile succeeds with an empty array even under
+# `set -euo pipefail`, the step reports "nothing to do", and a genuine
+# drift issue stays open behind a green clean-audit run. The step must
+# fail loudly instead.
+GH_STUB_LIST_FAIL=1
+export GH_STUB_LIST_FAIL
+run_close_step
+unset GH_STUB_LIST_FAIL
+if [ "$CLOSE_RC" -eq 0 ]; then
+  fail "a failing 'gh issue list' must fail the step, not report an empty result (rc=0, text: $CLOSE_TEXT)"
+elif echo "$CLOSE_TEXT" | grep -q "nothing to do"; then
+  fail "a failing lookup must not be reported as 'no open rollup issue': $CLOSE_TEXT"
+elif ! echo "$CLOSE_TEXT" | grep -q "::error::"; then
+  fail "a failing lookup must emit an ::error:: annotation; got: $CLOSE_TEXT"
+elif echo "$CLOSE_CALLS" | grep -q "issue close"; then
+  fail "a failing lookup must not close anything; calls: $CLOSE_CALLS"
+else
+  pass "a failing rollup lookup fails the step instead of masquerading as an empty result"
 fi
 
 echo ""

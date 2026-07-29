@@ -109,6 +109,18 @@ case "$path" in
         emit_status_and_body 200 '{"required_status_checks":{"contexts":["Label Gate","Self-Review Required","Codex P1 unresolved threads","CodeRabbit unresolved blocking findings","Merge clearance gate","lint"]}}'
         exit $?
         ;;
+      classic_admins_bypass)
+        # All canonical checks required, but enforce_admins is OFF — a
+        # repo admin can still "merge without waiting for requirements".
+        emit_status_and_body 200 '{"enforce_admins":{"enabled":false},"required_status_checks":{"contexts":["Label Gate","Self-Review Required","Codex P1 unresolved threads","CodeRabbit unresolved blocking findings","Merge clearance gate"]}}'
+        exit $?
+        ;;
+      classic_admins_enforced)
+        # The posture ADR 0002 requires of the hub: all five canonical
+        # checks AND enforce_admins on.
+        emit_status_and_body 200 '{"enforce_admins":{"enabled":true},"required_status_checks":{"contexts":["Label Gate","Self-Review Required","Codex P1 unresolved threads","CodeRabbit unresolved blocking findings","Merge clearance gate"]}}'
+        exit $?
+        ;;
       classic_missing_clearance_gate)
         # Classic protection present but MISSING "Merge clearance gate".
         # Regression net for #427/#428: the auditor must FAIL when the
@@ -160,6 +172,11 @@ case "$path" in
         printf '%s\n' '[{"id":301,"target":"branch"}]'
         exit 0
         ;;
+      ruleset_bypass)
+        # ~ALL include, all canonical checks, but a bypass list.
+        printf '%s\n' '[{"id":401,"target":"branch"}]'
+        exit 0
+        ;;
       *)
         printf '%s\n' "[]"
         exit 0
@@ -195,6 +212,39 @@ case "$path" in
     # Without exclude handling, the prior implementation would PASS
     # — which is the bug #285 r2 closes.
     printf '%s\n' '{"id":301,"target":"branch","conditions":{"ref_name":{"include":["~ALL"],"exclude":["refs/heads/main"]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/401)
+    # ~ALL include, every canonical check required — and a bypass list.
+    # The checks are all there, so this ruleset PASSES the required-checks
+    # half; only the admin-enforcement half can catch it.
+    printf '%s\n' '{"id":401,"target":"branch","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate"},{"context":"Self-Review Required"},{"context":"Codex P1 unresolved threads"},{"context":"CodeRabbit unresolved blocking findings"},{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  repos/*/*)
+    # Repository metadata — the audit reads .default_branch from here,
+    # both to resolve `~DEFAULT_BRANCH` ruleset conditions and (in
+    # --fleet) to pick each repo's audited branch.
+    #
+    # STUB_DEFAULT_BRANCH_MAP is a space-separated list of
+    # `owner/name=branch` pairs; the sentinel branch `fail` makes the
+    # metadata read fail the way a missing repo or a scopeless token
+    # would. Anything unlisted falls back to STUB_DEFAULT_BRANCH (main).
+    stub_repo="${path#repos/}"
+    for kv in ${STUB_DEFAULT_BRANCH_MAP:-}; do
+      case "$kv" in
+        "$stub_repo="*)
+          v="${kv#*=}"
+          if [ "$v" = "fail" ]; then
+            echo '{"message":"Not Found"}' >&2
+            exit 1
+          fi
+          printf '%s\n' "$v"
+          exit 0
+          ;;
+      esac
+    done
+    printf '%s\n' "${STUB_DEFAULT_BRANCH:-main}"
     exit 0
     ;;
   *)
@@ -387,6 +437,145 @@ else
 fi
 
 # ===========================================================================
+# ~DEFAULT_BRANCH resolution
+# ===========================================================================
+#
+# `~DEFAULT_BRANCH` used to be approximated as "main or master". ADR 0002
+# states the posture as "all five checks on its DEFAULT branch", so a repo
+# whose default is renamed was answered wrongly in both directions. These
+# two cases pin the resolved behaviour.
+
+# ---------------------------------------------------------------------------
+# Test 11: a repo whose default branch is `trunk`, audited on `trunk`, with
+#          a ~DEFAULT_BRANCH ruleset carrying the canonical checks → PASS.
+#          Under the old main/master guess this was a false DRIFT ("no
+#          rulesets target trunk") on a repo that is in fact fully gated.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_DEFAULT_BRANCH=trunk run_audit ruleset_unrelated_plus_default --branch trunk 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "~DEFAULT_BRANCH on a trunk-defaulted repo: exit $rc, expected 0; output: $out"
+elif echo "$out" | grep -q "no rulesets target trunk"; then
+  fail "~DEFAULT_BRANCH must resolve to the repo's real default branch, not main/master; output: $out"
+elif ! echo "$out" | grep -q "PASS:"; then
+  fail "~DEFAULT_BRANCH on a trunk-defaulted repo: missing PASS line; output: $out"
+else
+  pass "~DEFAULT_BRANCH resolves to the repo's real default branch (trunk), not a main/master guess"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 12: the mirror image — audit `main` on a repo whose default is
+#          `trunk`. A ~DEFAULT_BRANCH ruleset does NOT govern main there,
+#          so counting it would be a false PASS on an unprotected branch.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_DEFAULT_BRANCH=trunk run_audit ruleset_unrelated_plus_default --branch main 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "~DEFAULT_BRANCH must not match main on a trunk-defaulted repo: exit $rc, expected 3; output: $out"
+elif ! echo "$out" | grep -q "no rulesets target main"; then
+  fail "~DEFAULT_BRANCH on a trunk-defaulted repo audited at main: expected 'no rulesets target main'; output: $out"
+else
+  pass "~DEFAULT_BRANCH does not falsely protect main on a repo whose default is trunk"
+fi
+
+# ===========================================================================
+# --require-admin-enforcement (ADR 0002, hub posture)
+# ===========================================================================
+#
+# A required check is only as strong as the set of people who cannot skip
+# it. ADR 0002 requires enforce_admins on the hub because #427/#428 were
+# both admin merges, so a hub with all five checks and an open admin bypass
+# must be DRIFT, not PASS.
+
+# ---------------------------------------------------------------------------
+# Test 13: all five canonical checks required, enforce_admins OFF, flag
+#          passed → exit 3 naming enforce_admins.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit classic_admins_bypass --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "admins-bypass with --require-admin-enforcement: exit $rc, expected 3; output: $out"
+elif ! echo "$out" | grep -q "enforce_admins"; then
+  fail "admins-bypass: diagnostic must name enforce_admins; output: $out"
+elif echo "$out" | grep -q "PASS:"; then
+  fail "admins-bypass: must NOT report PASS just because all five checks are listed; output: $out"
+else
+  pass "all five checks required but enforce_admins off + --require-admin-enforcement: exits 3"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 14: the same repo WITHOUT the flag is a PASS — consumers are not
+#          audited for admin enforcement (ADR 0002 requires it of the hub
+#          only), so the flag must actually gate the check.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit classic_admins_bypass 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "admins-bypass without the flag: exit $rc, expected 0 (consumers are not audited for it); output: $out"
+elif echo "$out" | grep -q "enforce_admins"; then
+  fail "admins-bypass without the flag must not report an admin-enforcement gap; output: $out"
+else
+  pass "enforce_admins is only audited when --require-admin-enforcement is passed"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 15: enforce_admins ON + flag → PASS.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit classic_admins_enforced --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "admins-enforced: exit $rc, expected 0; output: $out"
+elif ! echo "$out" | grep -q "Admin enforcement: OK"; then
+  fail "admins-enforced: expected an explicit admin-enforcement OK line; output: $out"
+else
+  pass "enforce_admins enabled + all canonical checks: exits 0"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 16: rulesets have no enforce_admins; their equivalent is the bypass
+#          list. A ruleset requiring all five checks but granting a bypass
+#          actor must fail --require-admin-enforcement.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_bypass --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "ruleset bypass actors: exit $rc, expected 3; output: $out"
+elif ! echo "$out" | grep -q "bypass"; then
+  fail "ruleset bypass actors: diagnostic must name the bypass list; output: $out"
+elif ! echo "$out" | grep -q "RepositoryRole"; then
+  fail "ruleset bypass actors: diagnostic should identify the actor; output: $out"
+else
+  pass "ruleset with bypass actors + --require-admin-enforcement: exits 3 (checks are skippable)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 17: a ruleset with no bypass list satisfies the flag.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_all --require-admin-enforcement 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "ruleset without bypass actors: exit $rc, expected 0; output: $out"
+elif ! echo "$out" | grep -q "Admin enforcement: OK"; then
+  fail "ruleset without bypass actors: expected an explicit admin-enforcement OK line; output: $out"
+else
+  pass "ruleset with an empty bypass list satisfies --require-admin-enforcement"
+fi
+
+# ===========================================================================
 # --fleet mode (#774)
 # ===========================================================================
 #
@@ -425,15 +614,24 @@ cat >"$FLEET_STUB" <<'STUB'
 # Stub single-repo auditor for the --fleet loop tests. Exits with a
 # per-repo code chosen by FLEET_SCENARIO, mirroring the real script's
 # contract: 0 pass, 2 auth/API failure, 3 canonical-check gap.
+#
+# It also echoes the branch and the admin-enforcement flag it was handed,
+# because those are the loop's job to compute: the branch must be that
+# repo's own default (not a fleet-wide `main`), and --require-admin-
+# enforcement must reach the hub and only the hub.
 repo=""
+branch=""
+admin_flag="no"
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) repo="$2"; shift 2 ;;
-    --branch) shift 2 ;;
+    --branch) branch="$2"; shift 2 ;;
+    --require-admin-enforcement) admin_flag="yes"; shift ;;
     *) shift ;;
   esac
 done
 echo "stub-audit reached $repo"
+echo "stub-audit branch=$branch repo=$repo admin_enforcement=$admin_flag"
 case "${FLEET_SCENARIO:-all_pass}" in
   all_pass) exit 0 ;;
   hub_drift)   case "$repo" in */hub)  exit 3 ;; *) exit 0 ;; esac ;;
@@ -493,7 +691,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "fleet one-drift: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +testowner/beta$"; then
+elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +testowner/beta@main$"; then
   fail "fleet one-drift: beta not marked DRIFT in the verdict table; output: $out"
 elif ! echo "$out" | grep -q "Audited 3 repo(s): 2 pass, 1 drift, 0 error."; then
   fail "fleet one-drift: tally line wrong; output: $out"
@@ -510,7 +708,7 @@ rc=$?
 set -e
 if [ "$rc" -ne 3 ]; then
   fail "fleet hub-drift: exit $rc, expected 3; output: $out"
-elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +testowner/hub$"; then
+elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +testowner/hub@main$"; then
   fail "fleet hub-drift: hub not marked DRIFT; output: $out"
 else
   pass "fleet hub-drift: hub drift alone exits 3"
@@ -531,9 +729,9 @@ rc=$?
 set -e
 if [ "$rc" -ne 2 ]; then
   fail "fleet drift+auth-error: exit $rc, expected 2 (infra beats drift); output: $out"
-elif ! echo "$out" | grep -qE "^ERROR +rc=2 +testowner/alpha$"; then
+elif ! echo "$out" | grep -qE "^ERROR +rc=2 +testowner/alpha@main$"; then
   fail "fleet drift+auth-error: alpha not marked ERROR; output: $out"
-elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +testowner/beta$"; then
+elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +testowner/beta@main$"; then
   fail "fleet drift+auth-error: beta's drift verdict must still be reported; output: $out"
 elif ! echo "$out" | grep -q "Administration:read"; then
   fail "fleet drift+auth-error: diagnostic must name the missing scope; output: $out"
@@ -562,7 +760,7 @@ else
   summary_body="$(cat "$SUMMARY_OUT")"
   missing=""
   for r in testowner/hub testowner/alpha testowner/beta; do
-    echo "$summary_body" | grep -q " $r$" || missing="$missing $r"
+    echo "$summary_body" | grep -q " $r@" || missing="$missing $r"
   done
   if [ -n "$missing" ]; then
     fail "fleet --summary-file: table missing repo(s):$missing; body: $summary_body"
@@ -626,6 +824,120 @@ elif [ -e "$WORKDIR/ignored.txt" ]; then
   fail "--summary-file without --fleet: must not write the summary file"
 else
   pass "fleet-only flag without --fleet: rejected with exit 1"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 9: each repo is audited on ITS OWN default branch. ADR 0002
+#               states the posture as "all five checks on its DEFAULT
+#               branch"; a fleet-wide hard-coded `main` would inspect a
+#               branch a renamed or master-defaulted consumer does not
+#               have and report the miss as protection drift.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_DEFAULT_BRANCH_MAP="testowner/beta=trunk testowner/alpha=master" \
+        run_fleet all_pass 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "fleet per-repo default branch: exit $rc, expected 0; output: $out"
+elif ! echo "$out" | grep -q "stub-audit branch=trunk repo=testowner/beta"; then
+  fail "fleet per-repo default branch: beta must be audited on 'trunk', not a fleet-wide 'main'; output: $out"
+elif ! echo "$out" | grep -q "stub-audit branch=master repo=testowner/alpha"; then
+  fail "fleet per-repo default branch: alpha must be audited on 'master'; output: $out"
+elif ! echo "$out" | grep -q "stub-audit branch=main repo=testowner/hub"; then
+  fail "fleet per-repo default branch: hub must be audited on its own default 'main'; output: $out"
+elif ! echo "$out" | grep -qE "^PASS +rc=0 +testowner/beta@trunk$"; then
+  fail "fleet per-repo default branch: verdict table must name the branch actually audited; output: $out"
+else
+  pass "fleet resolves and audits each repo's own default branch"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 10: an explicit --branch still pins one branch across the
+#                whole fleet — the escape hatch for "audit everything on
+#                release/x" must not be broken by per-repo resolution.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_DEFAULT_BRANCH_MAP="testowner/beta=trunk" \
+        run_fleet all_pass --branch main 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "fleet explicit --branch: exit $rc, expected 0; output: $out"
+elif echo "$out" | grep -q "branch=trunk"; then
+  fail "fleet explicit --branch must override per-repo defaults; output: $out"
+elif ! echo "$out" | grep -q "stub-audit branch=main repo=testowner/beta"; then
+  fail "fleet explicit --branch: beta must be audited on the pinned 'main'; output: $out"
+elif ! echo "$out" | grep -q "explicit --branch"; then
+  fail "fleet explicit --branch: the report should say the branch was pinned; output: $out"
+else
+  pass "fleet honours an explicit --branch across every repo"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 11: a repo whose default branch cannot be resolved is an
+#                ERROR (exit 2, infrastructure), never a silent fall back
+#                to `main`. Guessing would audit a branch that may not
+#                exist and file the resulting miss as drift — the same
+#                class of false verdict the 403-vs-404 split exists to
+#                prevent.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_DEFAULT_BRANCH_MAP="testowner/beta=fail" run_fleet all_pass 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "fleet unresolvable default branch: exit $rc, expected 2 (infrastructure); output: $out"
+elif echo "$out" | grep -q "stub-audit reached testowner/beta"; then
+  fail "fleet unresolvable default branch: must not audit beta on a guessed branch; output: $out"
+elif ! echo "$out" | grep -qE "^ERROR +rc=2 +testowner/beta@<unresolved>$"; then
+  fail "fleet unresolvable default branch: beta must be marked ERROR in the table; output: $out"
+elif ! echo "$out" | grep -q "Audited 3 repo(s): 2 pass, 0 drift, 1 error."; then
+  fail "fleet unresolvable default branch: tally wrong; output: $out"
+else
+  pass "fleet marks a repo with an unresolvable default branch ERROR, not drift"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 12: the hub — and only the hub — is audited with
+#                --require-admin-enforcement. ADR 0002 requires
+#                enforce_admins on the hub (#427/#428 were both admin
+#                merges) and does not require it of consumers, so the loop
+#                must not apply the stricter posture fleet-wide either.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_fleet all_pass 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "fleet hub admin-enforcement: exit $rc, expected 0; output: $out"
+elif ! echo "$out" | grep -q "repo=testowner/hub admin_enforcement=yes"; then
+  fail "fleet must audit the hub with --require-admin-enforcement (ADR 0002); output: $out"
+elif echo "$out" | grep -q "repo=testowner/alpha admin_enforcement=yes"; then
+  fail "fleet must NOT apply --require-admin-enforcement to consumers; output: $out"
+elif echo "$out" | grep -q "repo=testowner/beta admin_enforcement=yes"; then
+  fail "fleet must NOT apply --require-admin-enforcement to consumers; output: $out"
+else
+  pass "fleet audits the hub (and only the hub) for admin enforcement"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 13: --require-admin-enforcement is decided per repo by the
+#                fleet loop, so passing it alongside --fleet is rejected
+#                rather than silently ignored.
+# ---------------------------------------------------------------------------
+set +e
+out=$(bash "$SCRIPT" --fleet --require-admin-enforcement \
+        --hub-repo testowner/hub --manifest "$FLEET_MANIFEST" \
+        --audit-cmd "$FLEET_STUB" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "--fleet + --require-admin-enforcement: exit $rc, expected 1; output: $out"
+elif ! echo "$out" | grep -q -- "--require-admin-enforcement is decided per repo"; then
+  fail "--fleet + --require-admin-enforcement: diagnostic missing; output: $out"
+else
+  pass "--fleet + --require-admin-enforcement: rejected rather than silently ignored"
 fi
 
 # ---------------------------------------------------------------------------
