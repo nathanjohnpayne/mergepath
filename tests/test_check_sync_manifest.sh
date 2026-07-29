@@ -1347,8 +1347,68 @@ SPAN_EOF
     pass "Case 40: inline code spans strip by delimiter run length (``#NN`` is code, unmatched run is prose)"
   fi
 
+  # Case 41: the `## Path taken` carve-out is stated in a PROPAGATED doc.
+  #
+  # Two canonical docs travel to every consumer and, read together, used
+  # to contradict each other: decision-records.md MANDATES a
+  # `## Path taken` section in the PR body when a change reverses
+  # direction, while the shared operating rules ban narrating the
+  # session's path in a description — a ban whose own wording covers
+  # descriptions, not just titles. The reconciliation is a carve-out
+  # naming that section explicitly, and it only helps a consumer if it
+  # rides along with the halves it reconciles.
+  #
+  # docs/agents/operating-rules.md is per-repo-owned (see the
+  # doc_ownership block) and carries its own copy of the same narration
+  # rule, so a carve-out written only there reaches nobody: every
+  # consumer would receive both halves of the contradiction and none of
+  # the resolution. This case pins the carve-out to the canonical file
+  # AND to the section it qualifies, so a later edit cannot quietly move
+  # it back into the un-propagated overlay
+  # (nathanjohnpayne/mergepath#788).
+  SOR_PATH="docs/agents/shared-operating-rules.md"
+  NARRATION_HEADING="## PR and issue titles/descriptions: describe the work, not the session"
+  set +e
+  sor_rows=$(yq -r "
+    .paths[]
+    | select(.path == \"$SOR_PATH\")
+    | (.type // \"null\") + \"|\" + (.consumers | (select(tag == \"!!str\") // (join(\",\"))) | tostring)
+  " "$LIVE_MANIFEST"); rc=$?
+  set -e
+  if [ ! -f "$ROOT/$SOR_PATH" ]; then
+    fail "Case 41: $SOR_PATH missing on disk"
+  elif [ "$rc" != "0" ] || [ "$sor_rows" != "canonical|all" ]; then
+    fail "Case 41: expected 'canonical|all' for $SOR_PATH, got (rc=$rc) '$sor_rows'"
+  else
+    # Extract the narration section only — heading line exclusive, up to
+    # the next level-2 heading — so a mention anywhere else in the file
+    # cannot satisfy the assertion.
+    #
+    # BOTH tokens are required, and the conjunction is the point: the
+    # heading alone can be named in passing (a "see also" line), and the
+    # doc path alone does not say which of its rules is exempt. A
+    # section that carries only one of them has lost the carve-out even
+    # though it still mentions its vocabulary.
+    narration_sec=$(awk -v h="$NARRATION_HEADING" '
+      index($0, h) == 1 { in_sec = 1; next }
+      in_sec && /^## / { exit }
+      in_sec { print }
+    ' "$ROOT/$SOR_PATH")
+    set +e
+    carve_heading=$(printf '%s\n' "$narration_sec" | grep -cF '## Path taken')
+    carve_doc=$(printf '%s\n' "$narration_sec" | grep -cF 'docs/agents/decision-records.md')
+    set -e
+    if [ -z "$narration_sec" ]; then
+      fail "Case 41: $SOR_PATH has no '$NARRATION_HEADING' section"
+    elif [ "${carve_heading:-0}" -lt 1 ] || [ "${carve_doc:-0}" -lt 1 ]; then
+      fail "Case 41: $SOR_PATH § narration rule does not carve out '## Path taken' per docs/agents/decision-records.md (heading hits=${carve_heading:-0}, doc hits=${carve_doc:-0}) — the reconciliation would be unreachable by consumers (nathanjohnpayne/mergepath#788)"
+    else
+      pass "Case 41: the '## Path taken' narration carve-out is stated in the propagated shared rules"
+    fi
+  fi
+
 else
-  echo "SKIP: Cases 36-40 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-41 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
