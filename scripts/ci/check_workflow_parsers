@@ -1124,6 +1124,45 @@ else
   echo "  FAIL: triage must run on synchronize/reopened so needs-external-review is refreshed before the auto-merge re-arm evaluates (#495)" >&2
 fi
 
+# 8b. load-config must export its identities from the policy that GOVERNS the
+#     PR — the base branch's — not from whatever the checkout happens to hold
+#     (#788). Three things have to hold together, and dropping any one of them
+#     silently reopens the defect:
+#
+#       - the step delegates to scripts/workflow/load_review_config.sh, which
+#         is where tests/test_load_review_config.sh exercises the behaviour;
+#       - the checkout is pinned to the default branch, so the helper CODE is
+#         trusted (this step now runs with a token in the environment) and the
+#         same PR is not parsed from two different files depending on whether
+#         a `pull_request` or a `pull_request_review` event woke the job;
+#       - the base fields are passed rather than the resolver's `--pr` form,
+#         which would fetch PR metadata on every push to every open PR and
+#         destroy the default-base no-API-call short circuit (#769).
+#     Assert against the job block with comment lines stripped: the block's own
+#     prose explains why `--pr` is not used, and a comment must not be able to
+#     satisfy — or trip — a structural assertion about the invocation.
+load_config_code=$(grep -v '^[[:space:]]*#' <<<"$load_config_job_block")
+
+if grep -Fq "scripts/workflow/load_review_config.sh" <<<"$load_config_code" \
+  && grep -Fq 'ref: ${{ github.event.repository.default_branch }}' <<<"$load_config_code" \
+  && grep -Fq -- "--base-ref" <<<"$load_config_code" \
+  && grep -Fq -- "--base-sha" <<<"$load_config_code" \
+  && grep -Fq -- "--default-branch" <<<"$load_config_code"; then
+  pass=$((pass + 1))
+  echo "  PASS: load-config resolves the governing (base) policy from a trusted default-branch checkout, without the --pr metadata fetch (#788)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: load-config must call scripts/workflow/load_review_config.sh from a default-branch checkout and pass --base-ref/--base-sha/--default-branch, so identities come from the base policy and a default-base PR still makes no API call (#788)" >&2
+fi
+
+if grep -Eq -- '(^|[[:space:]])--pr([[:space:]]|=|$)' <<<"$load_config_code"; then
+  fail=$((fail + 1))
+  echo "  FAIL: load-config must not use the resolver's --pr form; it fetches PR metadata even for a default-base PR, on the busiest path in the pipeline (#769/#788)" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: load-config does not reintroduce the --pr metadata fetch (#769/#788)"
+fi
+
 # 9. The re-arm must not race triage: auto-merge-on-approval must `needs:`
 #    triage so triage's label refresh COMPLETES before the runtime
 #    blocking-label re-verify reads labels. Without the ordering edge,
