@@ -1390,7 +1390,21 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
           gap = tail
           sub(/[^ \t].*$/, "", gap)
           empty_marker = (tail == gap)
-          if (!empty_marker && gap == "") {
+          ordered_digits = 0
+          if (marker !~ /^[-*+]$/) ordered_digits = length(marker) - 1
+          if (ordered_digits > 9) {
+            # CommonMark caps an ordered marker at nine digits, so a
+            # longer run is not a marker at all. Accepting it is the
+            # UNDER-reporting direction: inside a list, a lazy
+            # continuation line like `1234567890. more` pops the real
+            # item and installs a deeper phantom in its place, and the
+            # prose sitting at the real content column is then measured
+            # against the phantom and blanked as code with its `#NN`
+            # inside. The digit run is measured rather than bounded in
+            # the pattern because an interval expression is not
+            # portable across every awk CI runs on.
+            marker_width = 0
+          } else if (!empty_marker && gap == "") {
             marker_width = 0
           } else if (para && ind >= list_indent &&
                      (empty_marker || (marker !~ /^[-*+]$/ &&
@@ -2256,8 +2270,65 @@ FRESH_EOF
     pass "Case 50: the paragraph-interruption rules bind markers inside the open block and only there"
   fi
 
+  # Case 51: an ordered marker stops at nine digits.
+  #
+  # Every ordered marker in cases 41-50 is one or two digits, so all of
+  # them pass under a pattern that accepts an unbounded digit run.
+  # CommonMark caps the marker at nine digits, and a longer run is not a
+  # marker at all. Line 6 of the first document is such a run: it is a
+  # lazy continuation of the paragraph opened on line 5, and treating it
+  # as a marker pops the real item at 6 and installs a phantom at 16 in
+  # its place. Case 46 then closes the phantom at the next blank and
+  # leaves the stack empty, so line 8 — which markdown-it-py in
+  # commonmark mode renders as a second paragraph inside that item — is
+  # four columns past nothing, blanked as code, and its `#222` ships
+  # unflagged. That is the UNDER-reporting direction this parser must
+  # never take.
+  #
+  # The second document is the boundary the cap must not overrun. Nine
+  # digits IS a marker, so the item opened on line 3 has its content
+  # indent at 11 and the fourteen-column line 5 is its prose. Reject it
+  # and that line is measured against the document instead, four columns
+  # in, and its `#222` is blanked the same way.
+  DIGITS_DOC="$WORKDIR/consumer-truth-long-marker.md"
+  cat > "$DIGITS_DOC" <<'DIGITS_EOF'
+# Doc
+
+- a
+
+    - b mentioning #111
+    1234567890. continuation
+
+      Prose at the inner content column mentioning #222.
+DIGITS_EOF
+  set +e
+  digits_hits=$(md_prose_only "$DIGITS_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  digits_lines=$(md_prose_only "$DIGITS_DOC" | wc -l | tr -d ' ')
+  digits_raw=$(wc -l < "$DIGITS_DOC" | tr -d ' ')
+  set -e
+  NINE_DOC="$WORKDIR/consumer-truth-nine-digit-marker.md"
+  cat > "$NINE_DOC" <<'NINE_EOF'
+# Doc
+
+123456789. an item mentioning #111
+
+              Prose in that item mentioning #222.
+NINE_EOF
+  set +e
+  nine_hits=$(md_prose_only "$NINE_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  set -e
+  if [ "$digits_hits" != "5,8," ]; then
+    fail "Case 51: expected lines 5,8 flagged (a ten-digit run is not a marker, so the real item stays open), got '$digits_hits'"
+  elif [ "$digits_lines" != "$digits_raw" ]; then
+    fail "Case 51: md_prose_only must emit one line per input line, got $digits_lines for $digits_raw"
+  elif [ "$nine_hits" != "3,5," ]; then
+    fail "Case 51: expected lines 3,5 flagged (nine digits is still a marker, so its content indent is 11), got '$nine_hits'"
+  else
+    pass "Case 51: an ordered marker is capped at nine digits, so a longer run cannot install a phantom container"
+  fi
+
 else
-  echo "SKIP: Cases 36-50 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-51 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
