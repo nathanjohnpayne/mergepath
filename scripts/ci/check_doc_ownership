@@ -413,41 +413,96 @@ fi
 # was not enough: the moment an entry is written `"docs/agents/x.md"` —
 # ordinary, idiomatic Bash — the leading quote makes the
 # `docs/agents/*` case below miss it, and the contradiction this guard
-# advertises is silently skipped instead of reported. The awk tokenizer
-# splits each line on UNQUOTED whitespace, drops matched surrounding
-# single/double quotes, and stops at a `#` that begins a word (Bash's own
-# comment rule — a `#` mid-word is a literal, not a comment).
+# advertises is silently skipped instead of reported.
+#
+# The awk tokenizer therefore scans the array body character by character
+# and reproduces the four Bash rules that decide where one element ends
+# and the next begins: unquoted whitespace separates words; single and
+# double quotes suppress that (and are dropped, not kept); a `#` that
+# begins a word starts a comment that runs to end of line (a `#` mid-word
+# is a literal); and the array ends at the first `)` that is neither
+# quoted nor escaped, wherever on the line it falls.
+#
+# That last rule is what scopes the read to this one declaration. An
+# earlier version keyed the end of the array off `/^\)/`, which only
+# recognizes a closing paren in column 1 — so an indented `  )`, or a
+# `DENYLIST=(a b)` written on one line, left the reader "inside" for the
+# remainder of the file and turned every later token into denylist data
+# (1326 tokens read instead of 12, measured against today's sibling).
+# The same shape also silently DROPPED any element sharing the opening
+# line, because that line was consumed by the declaration match alone.
+#
+# Deliberate limits, so the guard degrades safely rather than guessing:
+# quote state resets at each newline, which bounds an unbalanced quote to
+# the line that contains it instead of letting it swallow the rest of the
+# file; only the backslash escapes that MOVE a token boundary are
+# interpreted; and no expansion is performed, so an entry spelled with a
+# variable or a glob is read as literal text, matches no file on disk,
+# and is skipped by the existence check below.
 SIBLING="$REPO_ROOT/scripts/ci/check_sync_manifest"
 if [ -f "$SIBLING" ]; then
   denylist=$(awk '
-    # SQ/DQ are built with sprintf rather than written as literals: the
+    # SQ/DQ/BS are built with sprintf rather than written as literals: the
     # whole program lives inside one shell single-quoted string, so a bare
     # apostrophe cannot appear here, and %c is portable across the awk
     # implementations CI actually runs (mawk, gawk, BSD awk).
-    BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34) }
-    /^IDENTITY_DOCS_DENYLIST=\(/ { inside = 1; next }
-    inside && /^\)/             { inside = 0; next }
-    !inside                     { next }
-    {
+    BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BS = sprintf("%c", 92) }
+
+    function flush() { if (have) { print tok }; tok = ""; have = 0 }
+
+    # Tokenize one chunk of array body. Returns 1 once the array closes.
+    function scan(s,   i, n, c, nx) {
       tok = ""; have = 0; q = ""; boundary = 1
-      n = length($0)
+      n = length(s)
       for (i = 1; i <= n; i++) {
-        c = substr($0, i, 1)
-        if (q != "") {
-          if (c == q) { q = "" } else { tok = tok c }
+        c = substr(s, i, 1)
+        if (q == SQ) {
+          # Single quotes are literal all the way to the closing quote --
+          # no escape, so not even a backslash can extend them.
+          if (c == SQ) { q = "" } else { tok = tok c }
+          continue
+        }
+        if (q == DQ) {
+          # Inside double quotes only \" and \\ change where the token
+          # ends; every other backslash is an ordinary character to Bash
+          # as far as word splitting is concerned, so it is kept as-is.
+          if (c == BS) {
+            nx = substr(s, i + 1, 1)
+            if (nx == DQ || nx == BS) { tok = tok nx; i++ } else { tok = tok c }
+            continue
+          }
+          if (c == DQ) { q = "" } else { tok = tok c }
+          continue
+        }
+        if (c == BS) {
+          # Unquoted backslash escapes the next character, which is how a
+          # literal ) or # or space reaches an element without quoting.
+          # At end of line it is a continuation; we do not join lines, so
+          # drop it and let the newline end the word.
+          nx = substr(s, i + 1, 1)
+          if (nx != "") { tok = tok nx; have = 1; boundary = 0; i++ }
           continue
         }
         if (c == DQ || c == SQ) { q = c; have = 1; boundary = 0; continue }
         if (c == "#" && boundary) { break }
-        if (c == " " || c == "\t") {
-          if (have) { print tok; tok = ""; have = 0 }
-          boundary = 1
-          continue
-        }
+        if (c == ")") { flush(); return 1 }
+        if (c == " " || c == "\t") { flush(); boundary = 1; continue }
         tok = tok c; have = 1; boundary = 0
       }
-      if (have) { print tok }
+      flush()
+      return 0
     }
+
+    closed                      { next }
+    !inside {
+      if ($0 !~ /^IDENTITY_DOCS_DENYLIST=\(/) { next }
+      inside = 1
+      # Start after the opening paren so elements written on the
+      # declaration line are read rather than discarded with it.
+      if (scan(substr($0, index($0, "(") + 1))) { inside = 0; closed = 1 }
+      next
+    }
+    { if (scan($0)) { inside = 0; closed = 1 } }
   ' "$SIBLING")
   if [ -n "$denylist" ]; then
     while IFS= read -r denied; do

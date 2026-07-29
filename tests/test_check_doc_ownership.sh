@@ -54,21 +54,17 @@ run_with_fixture() {
 }
 
 # Same as run_with_fixture, but ALSO writes a stub scripts/ci/check_sync_manifest
-# carrying an IDENTITY_DOCS_DENYLIST array, so the check-9 drift guard has
-# something to read.
-run_with_denylist() {
-  local manifest_content="$1" paths="$2" denylist_body="$3"
+# whose CONTENTS are supplied verbatim ($3), so a case can pin the exact Bash
+# SHAPE of the IDENTITY_DOCS_DENYLIST declaration — a one-line array, an
+# indented closing paren, code living after the array — and not just its body.
+run_with_sibling() {
+  local manifest_content="$1" paths="$2" sibling_source="$3"
   local fix
   fix="$(mktemp -d "$WORKDIR/fix.XXXXXX")"
   printf '%s' "$manifest_content" > "$fix/manifest.yml"
   mkdir -p "$fix/scripts/ci"
   : > "$fix/scripts/sync-to-downstream.sh"
-  {
-    echo '#!/usr/bin/env bash'
-    echo 'IDENTITY_DOCS_DENYLIST=('
-    printf '%s\n' "$denylist_body"
-    echo ')'
-  } > "$fix/scripts/ci/check_sync_manifest"
+  printf '%s\n' "$sibling_source" > "$fix/scripts/ci/check_sync_manifest"
   while IFS= read -r p; do
     [ -z "$p" ] && continue
     case "$p" in
@@ -77,6 +73,13 @@ run_with_denylist() {
     esac
   done <<< "$paths"
   MERGEPATH_MANIFEST_PATH="$fix/manifest.yml" MERGEPATH_REPO_ROOT="$fix" bash "$CHECK" 2>&1
+}
+
+# The common shape: the denylist BODY ($3) wrapped in the canonical
+# multi-line declaration the live sibling uses today.
+run_with_denylist() {
+  run_with_sibling "$1" "$2" \
+    "$(printf '#!/usr/bin/env bash\nIDENTITY_DOCS_DENYLIST=(\n%s\n)\n' "$3")"
 }
 
 MIN_HEADER='version: 1
@@ -789,6 +792,71 @@ if [ "$rc" = "0" ]; then
   pass "Case 12e: a commented-out denylist line is not read as an entry"
 else
   fail "Case 12e unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12f: the read STOPS at an indented closing paren ----------
+# The array terminator is `)` wherever it falls on the line, not `)` in
+# column 1. Keying off column 1 leaves the reader "inside" once someone
+# indents the paren, and every later line of the sibling — including any
+# quoted docs/agents/ path in ordinary code — becomes denylist data. That
+# invents a denylist entry nobody wrote and fails a doc that is correctly
+# classified canonical, so the assertion here is a PASS: identity.md is
+# NOT on this denylist, it only appears after the array closed.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT_COMMENTED" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=(
+  "README.md"
+  )
+
+emit_identity_hint() {
+  echo "docs/agents/identity.md"
+}')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 12f: an indented closing paren ends the array (no spill into later code)"
+else
+  fail "Case 12f unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12g: a SINGLE-LINE array declaration is read --------------
+# `NAME=(a b)` is ordinary Bash and the whole array can share the
+# declaration line. A reader that consumes that line to detect the
+# declaration and starts collecting on the NEXT one sees an empty
+# denylist, and check 9 skips itself — the same silent no-op as #785,
+# reached by a different route.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=("README.md" "docs/agents/identity.md")')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12g: entries on the declaration line still fail closed"
+else
+  fail "Case 12g unexpected (rc=$rc): $out"
+fi
+
+# --- Case 12h: CONTROL — a paren inside a comment does not close ----
+# The over-correction mirror of 12f, in the same sense 12e mirrors 12c:
+# now that `)` terminates the array anywhere on the line, a `)` sitting
+# in a comment INSIDE the array must not end it early and silently drop
+# every entry below it.
+set +e
+out=$(run_with_sibling "$MANIFEST_DRIFT" "docs/agents/identity.md" \
+  '#!/usr/bin/env bash
+IDENTITY_DOCS_DENYLIST=(
+  "README.md"
+  # withdrawn once (see the #786 follow-up) and then restored
+  "docs/agents/identity.md"
+)')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "IDENTITY_DOCS_DENYLIST"; then
+  pass "Case 12h: a closing paren inside a comment does not truncate the array"
+else
+  fail "Case 12h unexpected (rc=$rc): $out"
 fi
 
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
