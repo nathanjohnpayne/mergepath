@@ -251,6 +251,41 @@ EOF
 done
 
 # ─────────────────────────────────────────────────────────────────────
+# Default-branch resolution
+# ─────────────────────────────────────────────────────────────────────
+#
+# `gh api ... --jq <expr>` writes the HTTP error BODY to STDOUT, not to
+# stderr, and exits non-zero. Verified against live gh:
+#
+#   $ gh api repos/<owner>/<missing> --jq .default_branch
+#   stdout: {"message":"Not Found",...,"status":"404"}
+#   stderr: gh: Not Found (HTTP 404)
+#   rc=1
+#
+# So the shape `x="$(gh api ... --jq ... 2>/dev/null || true)"` followed
+# by a test for empty does NOT detect a failed read: `2>/dev/null`
+# discards only the human-readable line, `|| true` discards the status,
+# and `x` is left holding a JSON blob that every downstream emptiness
+# guard accepts as a branch name. Both call sites below therefore capture
+# the EXIT STATUS instead of inferring failure from empty output.
+#
+# This predicate is the second line of defence behind that status check:
+# a deliberately conservative allow-list of what a git branch name may
+# look like, so any payload that ever leaks through with a zero status
+# still reads as "unresolved" rather than being audited as a branch. It
+# is intentionally fail-closed — an unresolved default branch becomes an
+# infrastructure ERROR (exit 2), never a PASS or a DRIFT verdict.
+looks_like_branch_name() {
+  local v="$1"
+  [ -n "$v" ] || return 1
+  [ "$v" != "null" ] || return 1
+  # Git forbids `..` in a ref, and every JSON error body starts with `{`.
+  case "$v" in *..*) return 1 ;; esac
+  [[ "$v" =~ ^[A-Za-z0-9][A-Za-z0-9._/+-]*$ ]] || return 1
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────
 # Fleet mode (#774)
 # ─────────────────────────────────────────────────────────────────────
 #
@@ -365,8 +400,17 @@ fleet_audit() {
     if [ "$BRANCH_EXPLICIT" -eq 1 ]; then
       repo_branch="$BRANCH"
     else
-      repo_branch="$(gh api "repos/$r" --jq '.default_branch' 2>/dev/null || true)"
-      if [ -z "$repo_branch" ] || [ "$repo_branch" = "null" ]; then
+      # Capture the STATUS — never infer failure from empty output. On an
+      # HTTP error `gh api --jq` prints the JSON error body to stdout, so
+      # the old `|| true` + emptiness test accepted
+      # `{"message":"Server Error","status":"500"}` as this repo's branch
+      # name, handed it to the child via --default-branch below, and
+      # reported the resulting audit as a PASS — a broken fleet presenting
+      # as a clean one, which closes the rollup issue.
+      if ! repo_branch="$(gh api "repos/$r" --jq '.default_branch' 2>/dev/null)"; then
+        repo_branch=""
+      fi
+      if ! looks_like_branch_name "$repo_branch"; then
         n_error=$((n_error + 1))
         echo "--- $r (rc=2, ERROR) ---"
         echo "Could not resolve the default branch for $r via GET /repos/$r."
@@ -532,8 +576,16 @@ fi
 resolve_repo_default_branch() {
   if [ "$REPO_DEFAULT_BRANCH_RESOLVED" -eq 0 ]; then
     REPO_DEFAULT_BRANCH_RESOLVED=1
-    REPO_DEFAULT_BRANCH="$(gh api "repos/$REPO" --jq '.default_branch' 2>/dev/null || true)"
-    if [ "$REPO_DEFAULT_BRANCH" = "null" ]; then
+    # Status-checked, then shape-checked — see looks_like_branch_name.
+    # A failed read must leave this EMPTY so `~DEFAULT_BRANCH` resolution
+    # takes the "unknown" path (main/master guess, else exit 2). Letting
+    # the JSON error body through instead made the branch compare unequal
+    # to every real name, dropping the only ruleset protecting the repo
+    # and reporting the failed read as DRIFT.
+    if ! REPO_DEFAULT_BRANCH="$(gh api "repos/$REPO" --jq '.default_branch' 2>/dev/null)"; then
+      REPO_DEFAULT_BRANCH=""
+    fi
+    if ! looks_like_branch_name "$REPO_DEFAULT_BRANCH"; then
       REPO_DEFAULT_BRANCH=""
     fi
   fi

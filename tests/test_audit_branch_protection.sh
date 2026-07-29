@@ -327,14 +327,38 @@ case "$path" in
     # `owner/name=branch` pairs; the sentinel branch `fail` makes the
     # metadata read fail the way a missing repo or a scopeless token
     # would. Anything unlisted falls back to STUB_DEFAULT_BRANCH (main).
+    #
+    # `fail` reproduces REAL `gh api ... --jq` failure semantics, which
+    # are the whole point of these fixtures: gh writes the HTTP error
+    # BODY to STDOUT, a human-readable line to STDERR, and exits 1.
+    # Verified against live gh:
+    #   $ gh api repos/<owner>/<missing> --jq .default_branch
+    #   stdout: {"message":"Not Found",...,"status":"404"}
+    #   stderr: gh: Not Found (HTTP 404)
+    #   rc=1
+    # An earlier version of this stub wrote the body to stderr only, so
+    # the script's `2>/dev/null` swallowed it and the caller's variable
+    # really did come back empty — every emptiness guard fired and the
+    # tests passed against a failure mode gh does not produce. Keep the
+    # body on STDOUT: it is what makes tests 24/25 and the fleet
+    # unreadable-metadata tests non-vacuous.
+    #
+    # The sentinel `leak` is the same body with a ZERO exit status — the
+    # residual case the shape check (looks_like_branch_name) defends,
+    # where a payload reaches the caller without any status to detect it.
     stub_repo="${path#repos/}"
     for kv in ${STUB_DEFAULT_BRANCH_MAP:-}; do
       case "$kv" in
         "$stub_repo="*)
           v="${kv#*=}"
           if [ "$v" = "fail" ]; then
-            echo '{"message":"Not Found"}' >&2
+            printf '%s\n' '{"message":"Not Found","status":"404"}'
+            echo 'gh: Not Found (HTTP 404)' >&2
             exit 1
+          fi
+          if [ "$v" = "leak" ]; then
+            printf '%s\n' '{"message":"Server Error","status":"500"}'
+            exit 0
           fi
           printf '%s\n' "$v"
           exit 0
@@ -833,6 +857,33 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 24b: the residual case behind the status check — an HTTP error body
+#           that reaches the caller with a ZERO exit status. `gh api
+#           ... --jq` prints error bodies to STDOUT, so a payload is only
+#           ever one dropped status away from being read as a branch name;
+#           if `{"message":"Server Error","status":"500"}` is accepted as
+#           the default branch it compares unequal to every real branch,
+#           silently drops the ~DEFAULT_BRANCH ruleset, and reports the
+#           failed read as "completely unprotected" drift. The shape check
+#           must keep this on the infrastructure path (exit 2).
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_DEFAULT_BRANCH_MAP="nathanjohnpayne/mergepath=leak" \
+        PATH="$STUB_DIR:$PATH" STUB_SCENARIO=ruleset_default_branch_unreadable \
+        bash "$SCRIPT" --repo nathanjohnpayne/mergepath --branch trunk 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "leaked error body as default branch: exit $rc, expected 2 (infrastructure); output: $out"
+elif echo "$out" | grep -q "completely unprotected"; then
+  fail "leaked error body: must NOT report the branch unprotected; output: $out"
+elif echo "$out" | grep -q '"message"'; then
+  fail "leaked error body: an API payload must never be echoed as a branch name; output: $out"
+else
+  pass "an API error body reaching the caller with rc=0 is rejected by shape, not audited as a branch"
+fi
+
+# ---------------------------------------------------------------------------
 # Test 25: --default-branch supplies the fact instead, so the audit
 #          answers `~DEFAULT_BRANCH` correctly with the metadata read
 #          still failing — AND issues no metadata request at all. This is
@@ -1203,6 +1254,40 @@ elif ! echo "$out" | grep -q "Audited 3 repo(s): 2 pass, 0 drift, 1 error."; the
   fail "fleet unresolvable default branch: tally wrong; output: $out"
 else
   pass "fleet marks a repo with an unresolvable default branch ERROR, not drift"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 11b: the serious shape of the same bug — a broken fleet
+#                 presenting as a CLEAN one. `gh api ... --jq` writes the
+#                 HTTP error body to STDOUT, so a metadata read that fails
+#                 500 used to leave the JSON payload in `repo_branch`,
+#                 which is non-empty and so passed the unresolvable-branch
+#                 guard, was handed to the child as an authoritative
+#                 `--default-branch` fact (suppressing the child's own
+#                 re-read), and came back PASS. Fleet rc=0 is what
+#                 branch-protection-audit.yml calls `result=clean`, and a
+#                 clean audit CLOSES the open drift rollup issue — the
+#                 exact outcome the workflow header promises can never
+#                 happen. Assert on the whole observable surface: the
+#                 status, the tally, and the fact that no API payload is
+#                 ever printed as a branch label.
+# ---------------------------------------------------------------------------
+set +e
+out=$(STUB_DEFAULT_BRANCH_MAP="testowner/beta=leak" run_fleet all_pass 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  fail "fleet leaked-body default branch: exit 0 — a failed metadata read presented as a CLEAN fleet audit; output: $out"
+elif [ "$rc" -ne 2 ]; then
+  fail "fleet leaked-body default branch: exit $rc, expected 2 (infrastructure); output: $out"
+elif echo "$out" | grep -q '"message"'; then
+  fail "fleet leaked-body default branch: an API payload was printed as a branch label; output: $out"
+elif ! echo "$out" | grep -qE "^ERROR +rc=2 +testowner/beta@<unresolved>$"; then
+  fail "fleet leaked-body default branch: beta must be marked ERROR in the table; output: $out"
+elif ! echo "$out" | grep -q "Audited 3 repo(s): 2 pass, 0 drift, 1 error."; then
+  fail "fleet leaked-body default branch: tally wrong; output: $out"
+else
+  pass "a leaked API error body never becomes a branch name — no broken fleet reports as clean"
 fi
 
 # ---------------------------------------------------------------------------
