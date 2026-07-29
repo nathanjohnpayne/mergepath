@@ -134,7 +134,27 @@ case "$1" in
       *) exit 0 ;;
     esac
     ;;
-  repo|label|api|secret|pr)
+  repo)
+    # Stage C creates the remote and then pushes separately (#790), so
+    # the shim has to leave behind an `origin` the real `git push` can
+    # reach: a bare repo beside the shim log.
+    if [ "$2" = "create" ]; then
+      remote_root="$(dirname "$LOG")/remotes"
+      src=""
+      for arg in "$@"; do
+        case "$arg" in --source=*) src="${arg#--source=}" ;; esac
+      done
+      bare="$remote_root/${3##*/}.git"
+      mkdir -p "$remote_root"
+      git init -q --bare "$bare" 2>/dev/null
+      if [ -n "$src" ] && [ -d "$src/.git" ]; then
+        git -C "$src" remote remove origin >/dev/null 2>&1 || true
+        git -C "$src" remote add origin "$bare"
+      fi
+    fi
+    exit 0
+    ;;
+  label|api|secret|pr)
     if [ "$1" = "secret" ] && [ "$2" = "set" ]; then
       cat >/dev/null 2>&1 || true
     fi

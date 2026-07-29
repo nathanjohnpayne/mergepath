@@ -3,12 +3,14 @@
 # Per #156 sub-C / #205.
 #
 # Responsibilities (in order):
-#   1. `gh repo create --source=. --push` against the target dir
-#      (sub-B already ran `git init` + initial commit; this step
-#      creates the remote and pushes the bootstrap commit). Legitimate
-#      push to main on a greenfield remote — the `gh-pr-guard.sh`
-#      "never push to main" hook does NOT apply because there's no
-#      `main` to protect yet.
+#   1. `gh repo create --source=.` against the target dir, then a
+#      separate `git push -u origin HEAD` (sub-B already ran `git init`
+#      + initial commit; this step creates the remote and pushes the
+#      bootstrap commit). Legitimate push to main on a greenfield
+#      remote — the `gh-pr-guard.sh` "never push to main" hook does NOT
+#      apply because there's no `main` to protect yet. The two halves
+#      are separate commands so the create can be checkpointed the
+#      moment it succeeds and a failed push stays retryable (#790).
 #   2. Seed the 12 canonical labels (needs-external-review,
 #      needs-human-review, policy-violation, human-hold,
 #      human-action, decision-needed, agent-action, phase-0..4).
@@ -88,14 +90,14 @@ BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT="op://Private/pvbq24vl2h6gl7yjclxy2hbote/t
 BOOTSTRAP_REVIEWER_PAT_OP_REF="${BOOTSTRAP_REVIEWER_PAT_OP_REF:-$BOOTSTRAP_REVIEWER_PAT_OP_REF_DEFAULT}"
 BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_KEY="reviewer-assignment-token"
 
-# Resume checkpoint for step 1. `gh repo create --source --push` is the
-# one irreversible act in this stage, and it runs FIRST — but the stage
-# records completion only after step 5, so any later abort (the
-# BOOTSTRAP_STRICT_SECRETS=1 secret failure above all) left a created
-# remote with nothing recording that it had been created. `--resume
-# template-mirror` then re-entered the stage and would have called `gh
-# repo create` on a name that already exists, and the wizard's preflight
-# refused to start at all because the remote was there (#761 item 3).
+# Resume checkpoint for step 1. `gh repo create` is the one irreversible
+# act in this stage, and it runs FIRST — but the stage records completion
+# only after step 5, so any later abort (the BOOTSTRAP_STRICT_SECRETS=1
+# secret failure above all) left a created remote with nothing recording
+# that it had been created. `--resume template-mirror` then re-entered
+# the stage and would have called `gh repo create` on a name that already
+# exists, and the wizard's preflight refused to start at all because the
+# remote was there (#761 item 3).
 #
 # The checkpoint closes both halves: bootstrap::_create_remote_and_push
 # skips the create when it is set, and the wizard's preflight tolerates
@@ -134,8 +136,10 @@ bootstrap::github_infra_remote_checkpoint() {
 #
 # Every failing path now publishes one — no PAT available with prompts
 # skipped, human declined to paste one, `gh secret set` itself failing,
-# and the author write path failing before `gh secret set` ever ran
-# (#782). The last two are told apart by positive proof that gh was
+# the author write path failing before `gh secret set` ever ran (#782),
+# and the temp dir for that call's trace + capture files failing to
+# allocate, in which case no write is attempted at all (#790). The
+# gh-failed and pre-gh cases are told apart by positive proof that gh was
 # reached, never by the rc, which both layers can return alike. The
 # generic fallback in the recorder is therefore defence in depth for a
 # future path that forgets to publish, not a live branch.
@@ -287,56 +291,89 @@ bootstrap::_create_remote_and_push() {
   fi
 
   # Idempotent re-entry (#761 item 3). An earlier attempt in this same
-  # bootstrap already created the remote and pushed the bootstrap commit,
-  # then the stage aborted further down. `gh repo create` cannot be
-  # repeated against an existing name, so skip it: the checkpoint is only
-  # written after the create+push command as a whole succeeded, which
-  # means both halves are done. (If the operator has since DELETED the
-  # remote, the subsequent label / invite / secret calls fail loudly
-  # against the missing repo — remove the .bootstrap-state.checkpoints
-  # sidecar to force a fresh create.)
+  # bootstrap already created the remote, then the stage aborted further
+  # down. `gh repo create` cannot be repeated against an existing name,
+  # so skip it — but only it. The push below still runs, because the
+  # checkpoint records the CREATE and nothing more: the abort may well
+  # have been the push itself (#790), and re-pushing a branch the remote
+  # already has is a no-op that exits 0. (If the operator has since
+  # DELETED the remote, the push and the subsequent label / invite /
+  # secret calls fail loudly against the missing repo — remove the
+  # .bootstrap-state.checkpoints sidecar to force a fresh create.)
   #
   # The lookup is for THIS $full_repo, not for "a remote was created":
   # a resume that names a different repo in the same target dir must
   # still create its own remote rather than inherit the earlier run's
   # skip and operate on somebody else's repository.
+  local create_needed=1
   if bootstrap::has_checkpoint "$(bootstrap::github_infra_remote_checkpoint "$full_repo")"; then
-    bootstrap::log "github-infra: remote $full_repo was already created and pushed by an earlier attempt in this bootstrap (resume checkpoint) — skipping gh repo create"
-    return 0
+    bootstrap::log "github-infra: remote $full_repo was already created by an earlier attempt in this bootstrap (resume checkpoint) — skipping gh repo create, retrying the push"
+    create_needed=0
   fi
 
-  # The visibility flag maps to gh's --public / --private / --internal.
-  local vis_flag
-  case "$visibility" in
-    public)   vis_flag="--public"   ;;
-    private)  vis_flag="--private"  ;;
-    internal) vis_flag="--internal" ;;
-    *)
-      bootstrap::err "github-infra: unsupported visibility '$visibility' (expected public/private/internal)"
-      return 2
-      ;;
-  esac
+  if [ "$create_needed" = "1" ]; then
+    # The visibility flag maps to gh's --public / --private / --internal.
+    local vis_flag
+    case "$visibility" in
+      public)   vis_flag="--public"   ;;
+      private)  vis_flag="--private"  ;;
+      internal) vis_flag="--internal" ;;
+      *)
+        bootstrap::err "github-infra: unsupported visibility '$visibility' (expected public/private/internal)"
+        return 2
+        ;;
+    esac
 
-  # `gh repo create --source=. --push` legitimately populates main
-  # on a greenfield remote. gh-pr-guard.sh's "never push to main"
-  # invariant doesn't apply because there's no protected main yet —
-  # we're creating it. (The hook only fires on pre-existing repos.)
-  local create_rc=0
-  bootstrap::run_author_gh "create remote + push" \
-    repo create "$full_repo" \
-      "$vis_flag" \
-      --description "$description" \
-      --source="$target" \
-      --push || create_rc=$?
-  if [ "$create_rc" -ne 0 ]; then
-    return "$create_rc"
+    # Create and push are SEPARATE commands on purpose (#790). As one
+    # `gh repo create --source --push` they share a single exit code, and
+    # a push that fails on a transient network or credential error — with
+    # the repository already created server-side — returned non-zero
+    # before any checkpoint was written. The remote existed, nothing
+    # recorded it, and the documented `--resume template-mirror` retry
+    # was then refused by preflight's existing-remote check: the exact
+    # unrecoverable state the checkpoint was added to prevent, reached
+    # through the one failure most likely to be transient.
+    #
+    # Split, each command's rc means one thing. `gh repo create --source`
+    # (no --push) creates the repository and wires it up as `origin` in
+    # the target tree; its success is the irreversible act and is
+    # checkpointed immediately, before anything else can fail. The push
+    # is then an ordinary repeatable step that any re-entry retries.
+    local create_rc=0
+    bootstrap::run_author_gh "create remote" \
+      repo create "$full_repo" \
+        "$vis_flag" \
+        --description "$description" \
+        --source="$target" || create_rc=$?
+    if [ "$create_rc" -ne 0 ]; then
+      return "$create_rc"
+    fi
+
+    # Record the irreversible half BEFORE anything downstream — the push
+    # included — can abort the stage. bootstrap::record_checkpoint is a
+    # no-op under --dry-run, so a dry run never claims a remote it did
+    # not create. The record names the repo that was actually created,
+    # which is what both consumers match on.
+    bootstrap::record_checkpoint "$(bootstrap::github_infra_remote_checkpoint "$full_repo")"
   fi
 
-  # Record the irreversible half BEFORE anything downstream can abort the
-  # stage. bootstrap::record_checkpoint is a no-op under --dry-run, so a
-  # dry run never claims a remote it did not create. The record names the
-  # repo that was actually created, which is what both consumers match on.
-  bootstrap::record_checkpoint "$(bootstrap::github_infra_remote_checkpoint "$full_repo")"
+  # Push the bootstrap commit. This legitimately populates main on a
+  # greenfield remote; gh-pr-guard.sh's "never push to main" invariant
+  # doesn't apply because there's no protected main yet — we're creating
+  # it. (The hook only fires on pre-existing repos.)
+  #
+  # `HEAD` rather than a hardcoded `main` so the push follows whatever
+  # branch stage B's `git init -b main` left checked out, and `-u` sets
+  # the upstream `gh repo create --push` used to set. Re-running against
+  # an already-pushed remote is an "Everything up-to-date" no-op.
+  local push_rc=0
+  bootstrap::run "push bootstrap commit to $full_repo" \
+    git -C "$target" push -u origin HEAD || push_rc=$?
+  if [ "$push_rc" -ne 0 ]; then
+    bootstrap::err "github-infra: the remote $full_repo EXISTS (created and checkpointed) but the bootstrap commit did not push (rc=$push_rc)"
+    bootstrap::err "github-infra: fix the push cause (network / git credentials) and re-run with --resume template-mirror — the checkpoint makes the retry skip the create and repeat only the push"
+    return "$push_rc"
+  fi
 }
 
 bootstrap::_seed_labels() {
@@ -782,7 +819,29 @@ bootstrap::_provision_reviewer_assignment_token() {
   # replayed to stderr immediately afterwards, so the live run reads
   # exactly as before (stdout folded into stderr as it already was).
   local set_rc=0 reached_dir reached_marker call_output gh_was_reached=0
-  reached_dir=$(mktemp -d "${TMPDIR:-/tmp}/bootstrap-secret-set.XXXXXX")
+  # A failed allocation must stop the write, not proceed with empty
+  # paths. `set -e` is disabled inside this function (the stage calls it
+  # as `... || step_rc=$?`), so an unchecked `mktemp -d` failure — TMPDIR
+  # missing, unwritable, or full — would fall through with `reached_dir`
+  # empty: the marker becomes `/gh-reached` and the capture `/output`. An
+  # unprivileged run then fails on the redirect alone, with no marker, and
+  # the branch below reports an AUTHOR-AUTHENTICATION failure for what is
+  # really a broken temp dir — sending the operator to re-mint tokens. A
+  # privileged run is worse: it performs the secret write and leaves
+  # root-owned files at the filesystem root.
+  #
+  # Refusing here matches what the trace shim already does when it cannot
+  # write the marker (exit 70): a caller that cannot record the boundary
+  # must not perform an unattributable write. The miss is recorded like
+  # every other cause under this key, so it is non-fatal by default and
+  # fails the stage under BOOTSTRAP_STRICT_SECRETS=1.
+  if ! reached_dir=$(mktemp -d "${TMPDIR:-/tmp}/bootstrap-secret-set.XXXXXX" 2>/dev/null) \
+     || [ -z "$reached_dir" ] || [ ! -d "$reached_dir" ]; then
+    bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: could not allocate a temporary directory under ${TMPDIR:-/tmp} (missing, unwritable, or full) — refusing to run the secret write without the trace + capture files that say which layer failed"
+    bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: no secret-set call was attempted; fix TMPDIR and re-run with --resume template-mirror"
+    BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON="REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (could not allocate a temporary directory under ${TMPDIR:-/tmp}, so the secret write was never attempted) — fix TMPDIR, then re-run or set the secret manually before the first PR"
+    return 1
+  fi
   reached_marker="$reached_dir/gh-reached"
   call_output="$reached_dir/output"
   printf '%s' "$pat" | bootstrap::author_gh_traced "$reached_marker" secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo" >"$call_output" 2>&1 || set_rc=$?

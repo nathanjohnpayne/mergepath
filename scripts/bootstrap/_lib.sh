@@ -35,6 +35,8 @@
 #   bootstrap::has_checkpoint <name>    True iff that checkpoint is recorded.
 #   bootstrap::last_completed_stage    Echo the last recorded stage name,
 #                                      or empty if no state file.
+#   bootstrap::stage_recorded <name>   True iff <name> appears in the state
+#                                      file, i.e. that stage COMPLETED.
 #
 # Globals (set by the wizard before sourcing this file):
 #   BOOTSTRAP_DRY_RUN     "1" iff --dry-run was passed; otherwise "0".
@@ -341,7 +343,24 @@ bootstrap::clear_warning() {
 
   local warnings_file="${BOOTSTRAP_STATE_FILE}.warnings"
   local tmp prefix
-  tmp=$(mktemp "${TMPDIR:-/tmp}/bootstrap-warnings.XXXXXX")
+  # An unchecked mktemp here DESTROYS the audit trail. With $TMPDIR
+  # missing, unwritable or full the assignment fails, `tmp` is empty, the
+  # rewrite loop's appends all fail, and `[ -s "" ]` is false — which
+  # lands on the "nothing survived the filter" branch and deletes
+  # $warnings_file outright. Every recorded failure in the run vanishes
+  # because a temp dir was full. Leave the sidecar untouched instead: a
+  # duplicate keyed record is a cosmetic defect in the summary, an erased
+  # one is the #734 silent-ship failure this sidecar exists to prevent.
+  #
+  # Returns 0 on that path on purpose. The two callers
+  # (bootstrap::record_warning, github-infra.sh's resolver) invoke this
+  # bare, so a non-zero return would abort them under `set -e` and lose
+  # the record they were about to write as well.
+  if ! tmp=$(mktemp "${TMPDIR:-/tmp}/bootstrap-warnings.XXXXXX" 2>/dev/null) \
+     || [ -z "$tmp" ]; then
+    bootstrap::warn "could not allocate a temp file under ${TMPDIR:-/tmp} to rewrite $warnings_file — leaving it untouched (records for key '$key' may now appear twice)"
+    return 0
+  fi
   prefix="@${key}	"
 
   while IFS= read -r line || [ -n "$line" ]; do
@@ -412,4 +431,18 @@ bootstrap::last_completed_stage() {
     return 0
   fi
   tail -n 1 "$BOOTSTRAP_STATE_FILE" 2>/dev/null || true
+}
+
+# True iff <stage> appears in the state file, i.e. that stage ran to
+# completion at some point in this bootstrap. Unlike
+# bootstrap::last_completed_stage this asks about a SPECIFIC stage, which
+# is what `--resume <stage>` needs: the flag skips everything up to and
+# including the stage it names, so a name the state file never recorded
+# would skip work that was never done.
+bootstrap::stage_recorded() {
+  local name=$1
+  if [ -z "${BOOTSTRAP_STATE_FILE:-}" ] || [ ! -f "$BOOTSTRAP_STATE_FILE" ]; then
+    return 1
+  fi
+  grep -qxF "$name" "$BOOTSTRAP_STATE_FILE"
 }

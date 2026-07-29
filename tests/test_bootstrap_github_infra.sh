@@ -118,7 +118,35 @@ echo "gh $*" >>"$LOG"
 case "$1" in
   repo)
     case "$2" in
-      create) exit "${SHIM_EXIT_REPO_CREATE:-0}" ;;
+      create)
+        rc="${SHIM_EXIT_REPO_CREATE:-0}"
+        if [ "$rc" = "0" ]; then
+          # Emulate the part of `gh repo create --source=<dir>` the stage
+          # depends on: the repository now exists and the local tree has
+          # an `origin` pointing at it. The stand-in remote is a bare repo
+          # beside the shim log, which makes the stage's own `git push` a
+          # REAL push rather than something else to fake.
+          remote_root="$(dirname "$LOG")/remotes"
+          full_name="$3"
+          src=""
+          for arg in "$@"; do
+            case "$arg" in --source=*) src="${arg#--source=}" ;; esac
+          done
+          bare="$remote_root/${full_name##*/}.git"
+          mkdir -p "$remote_root"
+          # SHIM_PUSH_BROKEN=1 wires origin up WITHOUT creating the bare
+          # repo behind it: the create succeeds and the push then fails,
+          # exactly as a transient network / credential failure would.
+          if [ "${SHIM_PUSH_BROKEN:-0}" != "1" ]; then
+            git init -q --bare "$bare" 2>/dev/null
+          fi
+          if [ -n "$src" ] && [ -d "$src/.git" ]; then
+            git -C "$src" remote remove origin >/dev/null 2>&1 || true
+            git -C "$src" remote add origin "$bare"
+          fi
+        fi
+        exit "$rc"
+        ;;
       *) exit 0 ;;
     esac
     ;;
@@ -211,9 +239,25 @@ set -e
   || fail "wizard failed; rc=$ec; out: $out"
 
 # --- assertion 1: gh repo create invoked correctly ---
-grep -q "^gh repo create nathanjohnpayne/test-repo --private --description a test repo --source=$TARGET --push$" "$SHIM_LOG" \
-  && pass "gh repo create invoked with --private + --source + --push" \
+# `--push` is deliberately NOT on the create: creation and push are
+# separate commands so the create can be checkpointed the moment it
+# succeeds and a failed push stays retryable (#790, assertion 18e).
+grep -q "^gh repo create nathanjohnpayne/test-repo --private --description a test repo --source=$TARGET$" "$SHIM_LOG" \
+  && pass "gh repo create invoked with --private + --source" \
   || fail "gh repo create flags wrong; log: $(grep '^gh repo create' "$SHIM_LOG")"
+grep -q "^gh repo create .* --push" "$SHIM_LOG" \
+  && fail "gh repo create still carries --push (create + push share one rc again); log: $(grep '^gh repo create' "$SHIM_LOG")" \
+  || pass "gh repo create no longer bundles --push"
+
+# --- assertion 1b: the bootstrap commit is pushed as its own step ---
+echo "$out" | grep -q "push bootstrap commit to nathanjohnpayne/test-repo" \
+  && pass "the bootstrap commit is pushed by a separate step" \
+  || fail "no separate push step logged; out: $out"
+# And it really pushed: the shim's stand-in remote has the commit.
+[ -d "$WORKDIR/remotes/test-repo.git" ] \
+  && git -C "$WORKDIR/remotes/test-repo.git" rev-parse --verify -q refs/heads/main >/dev/null \
+  && pass "the bootstrap commit landed on the remote's main" \
+  || fail "remote has no main after the push: $(git -C "$WORKDIR/remotes/test-repo.git" branch -a 2>&1)"
 
 # --- assertion 2: all 12 labels seeded with --force ---
 expected_labels=(needs-external-review needs-human-review policy-violation human-hold human-action decision-needed agent-action phase-0 phase-1 phase-2 phase-3 phase-4)
@@ -1620,7 +1664,188 @@ set -e
 [ -e "$TARGET13/.bootstrap-state.checkpoints" ] \
   && fail "dry run wrote a remote-created checkpoint: $(cat "$TARGET13/.bootstrap-state.checkpoints")" \
   || pass "dry run writes no .bootstrap-state.checkpoints sidecar"
+
+# --- assertion 18e: a created remote whose PUSH failed is still
+# checkpointed, and the resume retries only the push (#790).
+#
+# As one `gh repo create --source --push` the two halves shared a single
+# exit code: a push that failed on a transient network / credential error
+# returned non-zero with the repository already created, and the
+# checkpoint — written only after the whole command succeeded — was never
+# recorded. The remote existed, nothing recorded it, and the documented
+# `--resume template-mirror` retry was then refused by preflight's
+# existing-remote check. The most likely-to-be-transient failure in the
+# stage produced the one state the checkpoint exists to prevent.
+#
+# Split into two commands, the create's success is checkpointed
+# immediately and the push is an ordinary repeatable step. Driven end to
+# end: run 1 creates the remote and fails the push; the operator fixes
+# the cause; run 2 resumes and pushes.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET14="$WORKDIR/new-repo-push-fail"
+rm -rf "$TARGET14"
+set +e
+pf_out=$(SHIM_PUSH_BROKEN=1 run_wizard pushfail-repo \
+           --target-dir "$TARGET14" \
+           --description d --visibility private \
+           --firebase none --codex-app n --project new 2>&1)
+pf_ec=$?
+set -e
+[ "$pf_ec" -ne 0 ] \
+  && pass "a failed push fails the stage (rc=$pf_ec)" \
+  || fail "push-failure run should have failed; rc=$pf_ec, out: $pf_out"
+grep -q "^gh repo create nathanjohnpayne/pushfail-repo " "$SHIM_LOG" \
+  && pass "push-failure run did create the remote" \
+  || fail "run never reached gh repo create; log: $(cat "$SHIM_LOG")"
+echo "$pf_out" | grep -q "push bootstrap commit to nathanjohnpayne/pushfail-repo" \
+  && pass "push-failure run attempted the push as its own step" \
+  || fail "no push step attempted; out: $pf_out"
+[ -f "$TARGET14/.bootstrap-state.checkpoints" ] \
+  && grep -qxF "github-infra:remote-created:nathanjohnpayne/pushfail-repo" "$TARGET14/.bootstrap-state.checkpoints" \
+  && pass "the created remote is checkpointed even though the push failed" \
+  || fail "no remote-created checkpoint after a failed push: $(cat "$TARGET14/.bootstrap-state.checkpoints" 2>/dev/null)"
+grep -q "^github-infra\$" "$TARGET14/.bootstrap-state" \
+  && fail "github-infra recorded despite the failed push" \
+  || pass "github-infra still NOT recorded (the stage did not finish)"
+
+# The operator fixes the transient cause: the remote is reachable again.
+git init -q --bare "$WORKDIR/remotes/pushfail-repo.git"
+: >"$SHIM_LOG"
+set +e
+pf2_out=$(run_wizard_toolcheck pushfail-repo \
+            --target-dir "$TARGET14" \
+            --description d --visibility private \
+            --firebase none --codex-app n --project new \
+            --resume template-mirror 2>&1)
+pf2_ec=$?
+set -e
+echo "$pf2_out" | grep -q "remote already exists" \
+  && fail "preflight refused the remote created before the push failed; out: $pf2_out" \
+  || pass "preflight accepts the remote whose push failed (checkpoint present)"
+[ "$pf2_ec" -eq 0 ] \
+  && pass "a failed push is resumable with --resume template-mirror (rc=0)" \
+  || fail "push-failure resume failed; rc=$pf2_ec; out: $pf2_out"
+grep -q "^gh repo create " "$SHIM_LOG" \
+  && fail "resume re-invoked gh repo create on the existing remote; log: $(cat "$SHIM_LOG")" \
+  || pass "resume skips the create"
+echo "$pf2_out" | grep -q "push bootstrap commit to nathanjohnpayne/pushfail-repo" \
+  && pass "resume retries the push it skipped the create for" \
+  || fail "resume did not retry the push; out: $pf2_out"
+git -C "$WORKDIR/remotes/pushfail-repo.git" rev-parse --verify -q refs/heads/main >/dev/null \
+  && pass "the bootstrap commit reached the remote on the retry" \
+  || fail "remote still has no main after the resume"
+grep -q "^github-infra\$" "$TARGET14/.bootstrap-state" \
+  && pass "resume records github-infra completion" \
+  || fail "state file still missing github-infra: $(cat "$TARGET14/.bootstrap-state" 2>/dev/null)"
 rm -f "$SHIM_DIR/op"
+
+# --- assertion 19: a failed temp-dir allocation refuses the secret
+# write instead of misreporting it (#790).
+#
+# `set -e` is disabled inside _provision_reviewer_assignment_token (the
+# stage calls it as `... || step_rc=$?`), so an unchecked `mktemp -d`
+# failure fell through with an empty dir: the trace marker became
+# `/gh-reached` and the capture `/output`. Unprivileged, the redirect
+# alone failed with no marker written, and the "which layer failed"
+# branch reported an AUTHOR-AUTHENTICATION failure for what is really a
+# broken TMPDIR — sending the operator to re-mint tokens. Privileged, it
+# would have run the write and left root-owned files at `/`.
+# ---------------------------------------------------------------------------
+run_secret_set_with_tmpdir() {
+  # $1 = fake-root dir holding scripts/gh-as-author.sh, $2 = target dir,
+  # $3 = TMPDIR value to run under.
+  PATH="$SHIM_PATH" SHIM_LOG="$SHIM_LOG" TMPDIR="$3" bash -c '
+    ROOT="'"$ROOT"'"
+    . "$ROOT/scripts/bootstrap/_lib.sh"
+    . "$ROOT/scripts/bootstrap/github-infra.sh"
+    BOOTSTRAP_MERGEPATH_ROOT="'"$1"'"
+    BOOTSTRAP_STATE_FILE="'"$2"'/.bootstrap-state"
+    BOOTSTRAP_DRY_RUN=0
+    BOOTSTRAP_SKIP_AUTHOR_TOKEN=0
+    BOOTSTRAP_AUTO_PROMPT=skip
+    BOOTSTRAP_REVIEWER_PAT_VALUE="fake-pat"
+    OP_PREFLIGHT_REVIEWER_PAT=""
+    rc=0
+    bootstrap::_provision_reviewer_assignment_token "nathanjohnpayne/tmpfail-repo" "claude" || rc=$?
+    bootstrap::_record_reviewer_token_stage_failure "$rc" "tail note"
+    echo "RC=$rc"
+  ' 2>&1
+}
+
+: >"$SHIM_LOG"
+FAKE_ROOT_TMPFAIL="$WORKDIR/fake-root-tmpfail"
+TARGET15="$WORKDIR/new-repo-tmpfail"
+rm -rf "$FAKE_ROOT_TMPFAIL" "$TARGET15"
+mkdir -p "$FAKE_ROOT_TMPFAIL/scripts" "$TARGET15"
+# A wrapper that WOULD forward to gh, so nothing but the temp-dir guard
+# can stop the write.
+cat >"$FAKE_ROOT_TMPFAIL/scripts/gh-as-author.sh" <<'TMPFWD_EOF'
+#!/bin/sh
+[ "$1" = "--" ] && shift
+exec "$@"
+TMPFWD_EOF
+chmod +x "$FAKE_ROOT_TMPFAIL/scripts/gh-as-author.sh"
+set +e
+tmpfail_out=$(run_secret_set_with_tmpdir "$FAKE_ROOT_TMPFAIL" "$TARGET15" \
+                "$WORKDIR/no-such-tmpdir")
+set -e
+echo "$tmpfail_out" | grep -q "RC=1" \
+  && pass "an unallocatable temp dir fails provisioning (rc=1)" \
+  || fail "expected rc=1 from the temp-dir guard; out: $tmpfail_out"
+grep -q "secret set" "$SHIM_LOG" \
+  && fail "the secret write ran without its trace/capture files; log: $(cat "$SHIM_LOG")" \
+  || pass "no secret-set call is attempted when the temp dir cannot be allocated"
+echo "$tmpfail_out" | grep -q "could not allocate a temporary directory" \
+  && pass "the ERROR lines name the temp dir as the cause" \
+  || fail "no temp-dir diagnostic; out: $tmpfail_out"
+grep -qF "could not allocate a temporary directory" "$TARGET15/.bootstrap-state.warnings" \
+  && pass "the recorded cause names the temp dir" \
+  || fail "sidecar does not name the temp dir: $(cat "$TARGET15/.bootstrap-state.warnings" 2>/dev/null)"
+grep -qF "the author write path failed before the gh secret-set call ran" \
+     "$TARGET15/.bootstrap-state.warnings" \
+  && fail "a temp-dir failure was recorded as an author-authentication failure: $(cat "$TARGET15/.bootstrap-state.warnings")" \
+  || pass "a temp-dir failure is NOT misreported as an author-auth failure"
+[ -e /gh-reached ] || [ -e /output ] \
+  && fail "the guard let the empty-path fallbacks reach the filesystem root" \
+  || pass "no root-level /gh-reached or /output artifacts"
+
+# --- assertion 20: an unallocatable temp dir must not ERASE the
+# warnings sidecar (#790).
+#
+# bootstrap::clear_warning rewrites the sidecar through a tmpfile. With
+# an unchecked mktemp the tmpfile path was empty, every append failed,
+# and `[ -s "" ]` landed on the "nothing survived the filter" branch —
+# which deletes the sidecar. A full /tmp would have erased the whole
+# run's audit trail, which is the #734 silent-ship failure the sidecar
+# exists to prevent.
+# ---------------------------------------------------------------------------
+TARGET16="$WORKDIR/new-repo-clearwarn-tmpfail"
+rm -rf "$TARGET16"
+mkdir -p "$TARGET16"
+(
+  export BOOTSTRAP_STATE_FILE="$TARGET16/.bootstrap-state"
+  # shellcheck disable=SC1091
+  . "$FAKE_MP/scripts/bootstrap/_lib.sh"
+  bootstrap::record_warning "some-key" "an earlier failure worth keeping"
+  bootstrap::record_warning "an unkeyed failure worth keeping"
+  # Reproduce the REAL call shape. Stage helpers are invoked as
+  # `helper || step_rc=$?`, which disables errexit for the whole dynamic
+  # extent of the call — including the bootstrap::record_warning ->
+  # bootstrap::clear_warning chain inside them. That is what lets a
+  # failed mktemp fall through to the delete branch instead of aborting;
+  # calling clear_warning bare here would abort on the assignment and
+  # prove nothing.
+  attempt_clear() { TMPDIR="$WORKDIR/no-such-tmpdir" bootstrap::clear_warning "some-key"; }
+  clear_rc=0
+  attempt_clear || clear_rc=$?
+) >/dev/null 2>&1 || true
+[ -f "$TARGET16/.bootstrap-state.warnings" ] \
+  && pass "the warnings sidecar survives an unallocatable temp dir" \
+  || fail "clear_warning deleted the sidecar when mktemp failed"
+grep -qF "an unkeyed failure worth keeping" "$TARGET16/.bootstrap-state.warnings" \
+  && pass "unrelated records survive the failed rewrite" \
+  || fail "records lost: $(cat "$TARGET16/.bootstrap-state.warnings" 2>/dev/null)"
 
 # --- summary --------------------------------------------------------------
 echo
