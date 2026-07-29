@@ -83,9 +83,24 @@
 #
 #      Markdown is IN scope on purpose. The #777 writer was not a test —
 #      it was REVIEW_POLICY.md § Git Identity Switching, which instructed
-#      agents to run exactly `git config user.email "nathan@…example"`
-#      inside the repo. A documented instruction an agent executes is a
-#      writer like any other.
+#      agents to run `git config user.email` inside the repo, carrying
+#      the fixture address. A documented instruction an agent executes is
+#      a writer like any other.
+#
+#      In Markdown the cut runs on backticks as well, because a doc
+#      sentence carries no shell separators and would otherwise arrive as
+#      a single piece. Writing the rule down the natural way — the
+#      sanctioned `--global` form beside the forbidden one — then lets
+#      the first example suppress the second, so documenting the fix
+#      SILENCES the check. Each code span is a command to the reader and
+#      is judged as one here.
+#
+#      The GIT_IDENTITY_SCOPE_EXEMPT marker is read with code spans
+#      stripped, for the mirror-image reason: every doc describing this
+#      check spells the marker out, and honouring a mention exempted the
+#      whole line — leaving the paragraphs whose job is to document the
+#      forbidden shape the only ones never scanned. A real Markdown
+#      marker goes in an HTML comment, outside the spans.
 #
 #      Part C is gated on the mergepath marker file
 #      scripts/sync-to-downstream.sh (the check_sync_manifest idiom)
@@ -639,8 +654,31 @@ else
     # leaves the `git config …` head in its own piece, still carrying its
     # own flags. It never merges two commands into one, which is the
     # direction that would hide a write.
-    function offending(s,   parts, n, i) {
+    #
+    # In MARKDOWN the backtick is a command boundary too, and it has to
+    # be cut on for the same reason. A doc sentence carries no shell
+    # separators, so an entire paragraph arrives here as ONE piece and
+    # every predicate then reads the whole paragraph. The natural way to
+    # write this rule down —
+    #
+    #     Use `git config --global user.email you@example.com`,
+    #     never `git config user.email you@example.com`.
+    #
+    # — puts the sanctioned form and the forbidden one in one piece, and
+    # the `--global` belonging to the first waves the second through. The
+    # forbidden half is caught when it stands on a line alone, so the
+    # effect of documenting the correct form beside it is to SILENCE the
+    # check, which is the #777 shape exactly: prose an agent copies out
+    # of a doc and runs. Each code span is an independent command to the
+    # reader, so it is judged as one here.
+    #
+    # Cutting only shrinks pieces, so it can add hits but never hide one.
+    # It cannot orphan a value from its key either: a value opening with
+    # a backtick is already not a value (see writes_identity), so there
+    # is no `git config user.email `…`` form that this splits apart.
+    function offending(s, md,   parts, n, i) {
       gsub(/[&|;]/, "\034", s)
+      if (md) gsub(/`/, "\034", s)
       n = split(s, parts, "\034")
       for (i = 1; i <= n; i++)
         if (offending_one(parts[i])) return 1
@@ -662,7 +700,28 @@ else
       }
       return n % 2
     }
-    function exempt(s) {
+    # A marker inside a Markdown code span is a CITATION of the marker,
+    # not a use of it. Every doc that describes this check spells the
+    # marker out in prose, so reading a mention as a live marker exempts
+    # the whole line — which made the one paragraph in the tree whose job
+    # is to document the forbidden shape the one paragraph guaranteed
+    # never to be scanned, and it carried two runnable copies of the #777
+    # writer while reporting clean.
+    #
+    # Code spans are stripped before the test, and only for the test: the
+    # WRITE lives inside the span, because that is where a command goes,
+    # and a real marker sits outside it — in an HTML comment, the
+    # spelling docs/audits/git-identity-leak-2026-07.md already uses and
+    # the one that renders invisibly, or in a code block, where the line
+    # carries no spans to strip and a plain `#` comment is natural.
+    #
+    # Double-backtick spans are stripped first so that the single-span
+    # pass cannot chew the delimiters off one and spill its contents.
+    function exempt(s, md) {
+      if (md) {
+        gsub(/``[^`]*``/, "", s)
+        gsub(/`[^`]*`/, "", s)
+      }
       return (s ~ /GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/)
     }
     function emit(ln, txt,   rel) {
@@ -684,17 +743,33 @@ else
     # Markdown hard break (a prose line ending in `\`) makes easy to
     # arrange by accident.
     #
+    # The marker stays at PHYSICAL-LINE granularity in Markdown rather
+    # than following the code-span cut, so one marker covers every
+    # example on the line it terminates. That is not the `--global`
+    # problem in another dress: a marker is written deliberately and read
+    # in review, whereas the suppressor that waved the write through
+    # above was incidental to a neighbouring example nobody weighed.
+    #
     # EVERY offending physical line in a group is reported. Listing only
     # the first hands an operator one line to fix, after which the re-run
     # fails on the next one. The joined-command hit is emitted only when
     # no physical line offended by itself, so an ordinary single-line
     # write — where the line and the joined buffer are the same text — is
     # still reported exactly once.
+    #
+    # `grpmd` is captured when the group opens, not read off FILENAME at
+    # flush time: `FNR == 1` flushes a dangling group from the PREVIOUS
+    # file at a moment when FILENAME already names the next one, and a
+    # Markdown group would then be judged under the rules of the file
+    # that follows it.
+    #
+    # (Comments in here carry no apostrophes on purpose: the whole awk
+    # program is a single-quoted shell string, so one would end it.)
     function flush(   i) {
       if (nbuf == 0) return
       if (nphys > 0) {
         for (i = 1; i <= nphys; i++) emit(physline[i], phystext[i])
-      } else if (offending(buf) && !exempt(buf)) {
+      } else if (offending(buf, grpmd) && !exempt(buf, grpmd)) {
         emit(start, buf)
       }
       buf = ""; nbuf = 0; nphys = 0
@@ -703,9 +778,10 @@ else
     # not absorb the first line of the next file.
     FNR == 1 { flush() }
     {
-      if (nbuf == 0) { start = FNR; grpfile = FILENAME }
+      mdfile = (FILENAME ~ /\.md$/)
+      if (nbuf == 0) { start = FNR; grpfile = FILENAME; grpmd = mdfile }
       nbuf++
-      if (offending($0) && !exempt($0)) {
+      if (offending($0, mdfile) && !exempt($0, mdfile)) {
         nphys++
         physline[nphys] = FNR
         phystext[nphys] = $0
@@ -736,8 +812,21 @@ Target the repository explicitly, or use an ephemeral override:
     git -c user.email=t@t -c user.name=t commit  # one command, no file
     git config --global user.email you@example.com
 
-If a line is a deliberate exception, append a
-\`GIT_IDENTITY_SCOPE_EXEMPT: <reason>\` comment.
+In a DOC, prefer rewriting the example over exempting it. A snippet an
+agent can paste and run is the #777 failure itself, and an exemption
+leaves it sitting there runnable. Naming the key and its value as
+separate spans, or using a placeholder, documents the shape without
+shipping a working command:
+
+    \`git config user.email\` carrying the address \`you@example.com\`
+    \`git config user.email <addr>\`
+
+If a line really is a deliberate exception, append a
+\`GIT_IDENTITY_SCOPE_EXEMPT: <reason>\` comment — \`# …\` in a script,
+\`<!-- … -->\` in Markdown, where it also renders invisibly. In Markdown
+the marker must sit OUTSIDE backticks: inside a code span it counts as a
+citation of the marker rather than a use of it, which is precisely how a
+doc that describes this rule writes it.
 
 Offending lines:
 EOF
