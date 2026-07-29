@@ -75,6 +75,15 @@ set -euo pipefail
 # propagated to a new repo lives here. Each entry is an rsync
 # --exclude pattern (path-relative-to-source, no leading slash).
 # See #204 for the rationale on each entry.
+#
+# Every `class: hub-only` entry in .mergepath-sync.yml's doc_ownership
+# inventory must be covered here — by its own entry, or by a directory
+# pattern above it. The class says the doc never travels; this array is
+# what makes that true for the bootstrap rsync, and the spec and the
+# runbook both state the two sets as one. Assertion 4b4 in
+# tests/test_bootstrap_template_mirror.sh derives both sides and fails
+# closed on a gap, so classifying a doc hub-only without adding it here
+# reds CI instead of leaking into the next new repo (#797 review).
 BOOTSTRAP_MIRROR_EXCLUDES=(
   # Repo metadata that should never propagate
   '.git/'

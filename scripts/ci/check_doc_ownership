@@ -154,17 +154,51 @@ mp_path_is_unsafe() {
 # Covers both Markdown link forms:
 #   * inline        — `[label](target)`, `[label](<target>)`,
 #                     `[label](target "title")`, and the `!` image variant
-#   * reference def — `[label]: target "title"` at the start of a line
+#   * reference def — `[label]: target "title"` at the start of a line,
+#                     AND the CommonMark-legal wrapped spelling where the
+#                     destination sits on the FOLLOWING line:
 #
-# Each grep carries its own `|| true`: the brace group is the left side
-# of a pipeline (so it runs in a subshell where `set -e` applies), and a
-# no-match exit 1 from the FIRST grep would otherwise abort the group
-# and silently discard the second grep's output.
+#                         [the audit]:
+#                         coderabbit-audit.md
+#
+#                     "optional spaces or tabs (including up to one line
+#                     ending)" separate the colon from the destination, so
+#                     this renders as a working link — verified against
+#                     markdown-it-py's commonmark preset, the parser this
+#                     repo's prose-wrap tooling already relies on:
+#                     `<a href="coderabbit-audit.md">the audit</a>`. A
+#                     same-line-only grep emits no target for it, and the
+#                     sibling spelling carries no `docs/agents/` prefix
+#                     for the literal pass to find either — so the link
+#                     ships broken to every consumer with check 10 silent
+#                     (#797 review).
+#
+# Each producer carries its own `|| true`: the brace group is the left
+# side of a pipeline (so it runs in a subshell where `set -e` applies),
+# and a no-match exit 1 from the FIRST grep would otherwise abort the
+# group and silently discard the later producers' output.
 mp_doc_link_targets() {
   local f="$1"
   {
     grep -oE '\]\([^)]*\)' "$f" || true
     grep -oE '^[[:space:]]{0,3}\[[^]]+\]:[[:space:]]*[^[:space:]]+' "$f" || true
+    # Wrapped reference definition: a label + colon with NOTHING after it
+    # on that line, then the destination as the first token of the next
+    # non-blank line. Indentation is capped at three spaces the same way
+    # the same-line grep caps it, but measured with `match()` rather than
+    # an `{0,3}` interval, which not every awk implementation supports.
+    # A blank line after the colon ends the definition (CommonMark allows
+    # at most one line ending there), so nothing is emitted for it.
+    awk '
+      pending {
+        pending = 0
+        if (NF > 0) { print $1; next }
+      }
+      /^[[:space:]]*\[[^]]+\]:[[:space:]]*$/ {
+        indent = match($0, /[^[:space:]]/) - 1
+        if (indent >= 0 && indent <= 3) pending = 1
+      }
+    ' "$f" || true
   } | sed -E \
         -e 's/^\]\(//' \
         -e 's/\)$//' \
@@ -209,6 +243,53 @@ mp_resolve_relative() {
     esac
   done
   printf '%s' "$out"
+}
+
+# Blank out every sanctioned absolute reference on stdin, replacing each
+# with a single space. Used by check 10's literal pass.
+#
+# The sanctioned escape hatch from that check is an absolute URL —
+# `https://github.com/<org>/mergepath/blob/main/<path>` resolves from any
+# repo — but such a URL CONTAINS the repo-relative path as a substring,
+# so a literal search has to tell the two apart. Masking the reference
+# and re-testing the remainder does that per OCCURRENCE. The earlier
+# exemption did it per LINE, which is not the same thing: a sentence
+# spelling the path BOTH ways —
+#
+#     Full procedure: `docs/agents/hub.md` ([hub copy](https://github.com/.../docs/agents/hub.md))
+#
+# — was exempted wholesale by its own absolute half, so the bare
+# repo-relative mention beside it went unreported (#797 review). The
+# resolved-target pass does not recover that case, because a path in
+# prose or inline code is not a link and yields no target.
+#
+# TWO substitutions, in this order:
+#
+#   1. A whole inline link whose DESTINATION is absolute. The label is
+#      masked along with the destination, because REVIEW_POLICY.md's
+#      real spelling of the escape hatch puts the repo-relative path in
+#      the LABEL and the hub URL in the destination — a link that clicks
+#      through correctly from any repo. Masking only the destination
+#      would red the very idiom this check tells authors to use.
+#   2. Any remaining bare absolute URL, including a `<...>` autolink and
+#      the destination half of a reference definition.
+#
+# Both key on the SCHEME, not on `github.com`, so an absolute URL is
+# treated here the same way the resolved pass already treats one (it
+# skips `*://*` targets as already-absolute). A bare URL run ends at
+# whitespace or at any delimiter that cannot appear in a bare URL in
+# this prose: the autolink brackets `<`/`>`, the inline-link parens,
+# `[`/`]`, a quote, or a backtick. Replacing with a space rather than
+# nothing keeps the two sides of a mask from fusing into a path that was
+# never written.
+#
+# What is deliberately NOT masked: a link whose destination is relative.
+# Its label may spell the path too, but the destination itself is the
+# defect, and the resolved pass reports it.
+mp_mask_absolute_urls() {
+  sed -E \
+    -e 's,\[[^]]*\]\([[:space:]]*<?[a-zA-Z][a-zA-Z0-9+.-]*://[^)]*\), ,g' \
+    -e 's,[a-zA-Z][a-zA-Z0-9+.-]*://[^][:space:]<>()"'"'"'`]*, ,g'
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -555,9 +636,10 @@ fi
 #
 #   (a) LITERAL — the full repo-relative path appears anywhere in the
 #       text (`see \`docs/agents/coderabbit-audit.md\``), link or prose.
-#       Line-scoped, so an absolute github.com URL on the same line
-#       exempts it: that URL *contains* the path as a substring, and a
-#       substring match cannot tell the two apart.
+#       An absolute URL *contains* the path as a substring, so every
+#       absolute URL is MASKED OUT of the matched text first and the
+#       remainder re-tested; the exemption is therefore scoped to the
+#       URL itself, not to the whole line that carries it.
 #   (b) RESOLVED — every Markdown link target is resolved against the
 #       directory of the doc carrying it, then compared as a whole path.
 #       Canonical and hub-only docs are siblings under docs/agents/, so
@@ -598,7 +680,10 @@ if [ -n "$canonical_docs" ] && [ -n "$hub_only_docs" ]; then
       # could SIGPIPE the producer and turn a real hit into a silent pass.
       hits=$(grep -F -- "$hub_doc" "$REPO_ROOT/$canon_doc" || true)
       if [ -n "$hits" ]; then
-        bare=$(printf '%s\n' "$hits" | grep -vF 'github.com/' || true)
+        # Mask the absolute URLs OUT of each hit and re-test what is
+        # left, rather than exempting any line that contains one — see
+        # mp_mask_absolute_urls for why the difference is load-bearing.
+        bare=$(printf '%s\n' "$hits" | mp_mask_absolute_urls | grep -F -- "$hub_doc" || true)
         [ -n "$bare" ] && spelling="by repo-relative path"
       fi
       # (b) relative link target that resolves to it. Same `grep -q`

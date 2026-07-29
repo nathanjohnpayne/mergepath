@@ -925,6 +925,116 @@ else
   fail "Case 14h unexpected (rc=$rc, hits=$hits): $out"
 fi
 
+# --- Case 14i: bare mention BESIDE an absolute URL, one line ---------
+# The absolute-URL escape hatch used to be applied per LINE: any line
+# containing `github.com/` was dropped before the literal test. A
+# sentence that spells the path both ways therefore exempted its own
+# broken half, and the resolved-target pass could not recover it —
+# prose and inline code are not links, so they yield no target to
+# resolve. Masking each URL and re-testing the remainder scopes the
+# exemption to the URL itself. Regression for the #797 review finding.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|Full procedure: `docs/agents/hub.md` ([hub copy](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/hub.md)).
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md' by repo-relative path"; then
+  pass "Case 14i: a bare repo-relative mention beside an absolute URL fails closed"
+else
+  fail "Case 14i unexpected (rc=$rc): $out"
+fi
+
+# --- Case 14j: CONTROL — the path spelled as the LINK LABEL ----------
+# REVIEW_POLICY.md's real spelling of the escape hatch puts the
+# repo-relative path in the label and the absolute URL in the
+# destination. That link clicks through from any repo, so masking must
+# take the label with the destination — otherwise the check reds the one
+# idiom it tells authors to use.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|Consult [`docs/agents/hub.md`](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/hub.md) before changing the config.
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 14j: repo-relative path as the LABEL of an absolute link passes (control)"
+else
+  fail "Case 14j unexpected (rc=$rc): $out"
+fi
+
+# --- Case 14k: CONTROL — bare URL forms stay exempt ------------------
+# The mask keys on the scheme, not on `github.com`, and must swallow an
+# autolink and a reference definition's absolute destination as well as
+# a plain inline URL.
+for absolute in \
+  'See <https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/hub.md>.' \
+  'See [the audit][a].\n\n[a]: https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/hub.md "Audit"' \
+  'Posture record: https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/hub.md'
+do
+  set +e
+  out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+    "docs/agents/shared.md|$absolute
+docs/agents/hub.md|# Hub-only machinery")
+  rc=$?
+  set -e
+  if [ "$rc" = "0" ]; then
+    pass "Case 14k: absolute form '${absolute:0:24}...' passes (control)"
+  else
+    fail "Case 14k ('$absolute') unexpected (rc=$rc): $out"
+  fi
+done
+
+# --- Case 14l: WRAPPED reference definition (check 10, pass b) -------
+# CommonMark allows one line ending between a definition's colon and its
+# destination, so
+#
+#     [the audit]:
+#     hub.md
+#
+# renders as a working `<a href="hub.md">` — confirmed against
+# markdown-it-py's commonmark preset, the parser
+# scripts/lint-md-prose-wrap.sh uses. A same-line-only grep emitted no
+# target for it, and the sibling spelling carries no `docs/agents/`
+# prefix for the literal pass either, so the broken link shipped to all
+# nine consumers unreported. Regression for the #797 review finding —
+# indented and titled variants included, since the indentation cap and
+# the first-token rule are the parts most easily broken.
+for wrapped in \
+  'Full procedure: [the audit] § Wave audit.\n\n[the audit]:\nhub.md' \
+  'Full procedure: [the audit] § Wave audit.\n\n   [the audit]:\n     ./hub.md "CodeRabbit audit"' \
+  'Full procedure: [the audit] § Wave audit.\n\n[the audit]:\n<hub.md>'
+do
+  set +e
+  out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+    "docs/agents/shared.md|$wrapped
+docs/agents/hub.md|# Hub-only machinery")
+  rc=$?
+  set -e
+  if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md' by a relative Markdown link"; then
+    pass "Case 14l: wrapped reference definition to a hub-only doc fails closed"
+  else
+    fail "Case 14l ('$wrapped') unexpected (rc=$rc): $out"
+  fi
+done
+
+# --- Case 14m: CONTROL — a blank line ENDS the definition ------------
+# CommonMark allows at most one line ending after the colon, so a label
+# left dangling above a blank line defines nothing and the following
+# paragraph is just text. Emitting its first token as a link target
+# would invent a reference the document does not make.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|Prose above.\n\n[the audit]:\n\nhub.md is discussed in the hub-side runbook.\n\nMore prose.
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 14m: a blank line after the label ends the definition (control)"
+else
+  fail "Case 14m unexpected (rc=$rc): $out"
+fi
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).

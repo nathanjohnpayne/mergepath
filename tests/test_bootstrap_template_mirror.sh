@@ -747,6 +747,147 @@ $arr_count_prose"
   fi
 fi
 
+# --- assertion 4b4: ownership class → mirror exclusion ---------------
+# `doc_ownership:` in .mergepath-sync.yml and BOOTSTRAP_MIRROR_EXCLUDES
+# are two hand-maintained lists that have to agree, and nothing compared
+# them in this direction. specs/bootstrap_consumer_identity.md and the
+# runbook now both promise that the mirror excludes EVERY
+# `class: hub-only` entry in the manifest, so classifying the next doc
+# hub-only without touching the array would make two live documents
+# false AND rsync hub-only content into the next bootstrapped repo,
+# silently. Assertion 4b2 checks exclusions → prose;
+# check_doc_ownership's check 9 checks denylist → class; this is the
+# class → exclusion edge neither of them covers (#797 review).
+#
+# The REVERSE containment is deliberately not asserted: BRAND.md and
+# docs/agents/repository-overview.md are excluded and replaced with
+# consumer stubs while staying per-repo-owned, so the excluded set is a
+# superset of the hub-only set by design.
+#
+# Print the hub-only docs no exclude pattern covers, one per line;
+# print nothing when the set is fully covered. Both inputs are DERIVED
+# (yq over the manifest, awk over the array), and a derivation that
+# comes back empty returns 2 with an `ERROR:` line rather than "no
+# gaps" — a guard that cannot read its inputs must not report success.
+mirror_excludes_gaps() {
+  local manifest="$1" lib="$2"
+  local hub_only excludes doc exc covered
+  if [ ! -f "$manifest" ]; then
+    echo "ERROR: manifest not readable: $manifest"
+    return 2
+  fi
+  if [ ! -f "$lib" ]; then
+    echo "ERROR: mirror lib not readable: $lib"
+    return 2
+  fi
+  if ! yq -e '.doc_ownership | tag == "!!seq"' "$manifest" >/dev/null 2>&1; then
+    echo "ERROR: $manifest carries no doc_ownership list to derive from"
+    return 2
+  fi
+  hub_only=$(yq -r '.doc_ownership[] | select(.class == "hub-only") | .path' "$manifest" 2>/dev/null || true)
+  if [ -z "$hub_only" ]; then
+    echo "ERROR: no 'class: hub-only' entry derived from $manifest — the class name moved and this comparison is blind"
+    return 2
+  fi
+  excludes=$(awk '
+    /^BOOTSTRAP_MIRROR_EXCLUDES=\(/ { inside = 1; next }
+    inside && /^\)/                 { inside = 0 }
+    inside                          { print }
+  ' "$lib" \
+    | sed -E "s/^[[:space:]]+//; s/[[:space:]]+\$//; s/^'//; s/'\$//" \
+    | grep -Ev '^(#|$)' || true)
+  if [ -z "$excludes" ]; then
+    echo "ERROR: could not read any entry out of BOOTSTRAP_MIRROR_EXCLUDES in $lib"
+    return 2
+  fi
+  while IFS= read -r doc; do
+    [ -n "$doc" ] || continue
+    covered=0
+    while IFS= read -r exc; do
+      [ -n "$exc" ] || continue
+      case "$exc" in
+        # A directory pattern covers everything beneath it; every other
+        # entry has to name the file outright.
+        */) case "$doc" in "$exc"*) covered=1 ;; esac ;;
+        *)  if [ "$exc" = "$doc" ]; then covered=1; fi ;;
+      esac
+      if [ "$covered" = "1" ]; then break; fi
+    done <<< "$excludes"
+    [ "$covered" = "1" ] || printf '%s\n' "$doc"
+  done <<< "$hub_only"
+  return 0
+}
+
+LIVE_MANIFEST="$ROOT/.mergepath-sync.yml"
+set +e
+live_gaps=$(mirror_excludes_gaps "$LIVE_MANIFEST" "$MIRROR_LIB")
+gaps_rc=$?
+set -e
+if [ "$gaps_rc" != "0" ]; then
+  fail "assertion 4b4 could not compare the ownership inventory against BOOTSTRAP_MIRROR_EXCLUDES: $live_gaps"
+elif [ -n "$live_gaps" ]; then
+  fail "doc_ownership classifies these docs hub-only but BOOTSTRAP_MIRROR_EXCLUDES does not drop them, so the bootstrap rsync would copy them into the next new repo:
+$live_gaps"
+else
+  pass "every 'class: hub-only' doc in .mergepath-sync.yml is excluded from the bootstrap mirror (#780)"
+fi
+
+# The live comparison above passes today by construction, so prove the
+# comparison is not vacuous: drive it against a manifest that classifies
+# one more doc hub-only without touching the array — the exact mistake
+# it exists to catch — and against inputs it cannot read.
+if [ -f "$LIVE_MANIFEST" ]; then
+  gap_manifest="$WORKDIR/gap-manifest.yml"
+  cp "$LIVE_MANIFEST" "$gap_manifest"
+  yq -i '.doc_ownership += [{"path": "docs/agents/newly-hub-only.md", "class": "hub-only"}]' "$gap_manifest"
+  set +e
+  synth_gaps=$(mirror_excludes_gaps "$gap_manifest" "$MIRROR_LIB")
+  synth_rc=$?
+  set -e
+  if [ "$synth_rc" = "0" ] && [ "$synth_gaps" = "docs/agents/newly-hub-only.md" ]; then
+    pass "assertion 4b4 reports a newly classified hub-only doc that no exclude pattern covers"
+  else
+    fail "assertion 4b4 missed an unexcluded hub-only doc (rc=$synth_rc): $synth_gaps"
+  fi
+
+  # A directory pattern legitimately covers the files beneath it.
+  dir_lib="$WORKDIR/dir-excludes.sh"
+  printf 'BOOTSTRAP_MIRROR_EXCLUDES=(\n  %s\n)\n' "'docs/agents/'" > "$dir_lib"
+  set +e
+  dir_gaps=$(mirror_excludes_gaps "$LIVE_MANIFEST" "$dir_lib")
+  dir_rc=$?
+  set -e
+  if [ "$dir_rc" = "0" ] && [ -z "$dir_gaps" ]; then
+    pass "assertion 4b4 accepts a directory exclude pattern that covers the hub-only docs"
+  else
+    fail "assertion 4b4 mis-read a directory exclude pattern (rc=$dir_rc): $dir_gaps"
+  fi
+
+  blind_lib="$WORKDIR/blind-excludes.sh"
+  printf '#!/usr/bin/env bash\n# the array was renamed\n' > "$blind_lib"
+  set +e
+  blind_out=$(mirror_excludes_gaps "$LIVE_MANIFEST" "$blind_lib")
+  blind_rc=$?
+  set -e
+  if [ "$blind_rc" = "2" ] && printf '%s' "$blind_out" | grep -q '^ERROR:'; then
+    pass "assertion 4b4 fails closed when BOOTSTRAP_MIRROR_EXCLUDES cannot be read"
+  else
+    fail "assertion 4b4 should fail closed on an unreadable exclude array (rc=$blind_rc): $blind_out"
+  fi
+
+  classless_manifest="$WORKDIR/classless-manifest.yml"
+  printf 'doc_ownership:\n  - path: docs/agents/x.md\n    class: canonical\n' > "$classless_manifest"
+  set +e
+  classless_out=$(mirror_excludes_gaps "$classless_manifest" "$MIRROR_LIB")
+  classless_rc=$?
+  set -e
+  if [ "$classless_rc" = "2" ] && printf '%s' "$classless_out" | grep -q '^ERROR:'; then
+    pass "assertion 4b4 fails closed when no hub-only entry can be derived"
+  else
+    fail "assertion 4b4 should fail closed on a manifest with no hub-only class (rc=$classless_rc): $classless_out"
+  fi
+fi
+
 # --- assertion 4c: AGENTS.md packaging/Repository-Layout scrub (#744) ---
 if [ -f "$TARGET/AGENTS.md" ]; then
   grep -q "placeholder package scaffolds that reserve" "$TARGET/AGENTS.md" \
