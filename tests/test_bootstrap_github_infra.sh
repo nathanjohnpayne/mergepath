@@ -134,6 +134,13 @@ case "$1" in
     if [ "$2" = "set" ]; then
       cat >/dev/null 2>&1 || true
     fi
+    # A failing gh writes a diagnostic before it exits. Emitting one
+    # here is what keeps the "the gh-reached branch persists no
+    # capture" assertion honest: a silent shim would satisfy it with
+    # an empty capture no matter what the branch does.
+    if [ "${SHIM_EXIT_SECRET:-0}" != "0" ]; then
+      echo "gh: HTTP 403: Resource not accessible by personal access token (secret set)" >&2
+    fi
     exit "${SHIM_EXIT_SECRET:-0}"
     ;;
   config)
@@ -1139,14 +1146,15 @@ set -e
 #   (b) a wrapper that forwards the wrapped command, whose gh then fails.
 # ---------------------------------------------------------------------------
 run_secret_set_failure_case() {
-  # $1 = fake-root dir holding scripts/gh-as-author.sh, $2 = target dir
+  # $1 = fake-root dir holding scripts/gh-as-author.sh, $2 = target dir,
+  # $3 = optional $BOOTSTRAP_LOG_FILE path (default: none configured)
   PATH="$SHIM_PATH" SHIM_LOG="$SHIM_LOG" SHIM_EXIT_SECRET=1 bash -c '
     ROOT="'"$ROOT"'"
     . "$ROOT/scripts/bootstrap/_lib.sh"
     . "$ROOT/scripts/bootstrap/github-infra.sh"
     BOOTSTRAP_MERGEPATH_ROOT="'"$1"'"
     BOOTSTRAP_STATE_FILE="'"$2"'/.bootstrap-state"
-    BOOTSTRAP_LOG_FILE=""
+    BOOTSTRAP_LOG_FILE="'"${3:-}"'"
     BOOTSTRAP_DRY_RUN=0
     BOOTSTRAP_SKIP_AUTHOR_TOKEN=0
     BOOTSTRAP_AUTO_PROMPT=skip
@@ -1223,6 +1231,86 @@ grep -q "^gh secret set REVIEWER_ASSIGNMENT_TOKEN --repo nathanjohnpayne/wrapper
 grep -qF "the gh secret-set call itself failed, rc=1" "$TARGET9I2/.bootstrap-state.warnings" \
   && pass "a real gh failure is still recorded as a gh secret-set failure" \
   || fail "gh failure lost its specific cause: $(cat "$TARGET9I2/.bootstrap-state.warnings" 2>/dev/null)"
+
+# --- assertion 15j: the pre-gh diagnostic is where the record says ---
+# The record for the pre-gh branch names the author write path, but the
+# remediation detail — WHICH token lookup failed, which identity the
+# byline pin wanted — is the wrapper's own message, and the wizard
+# installs no global stderr tee while bootstrap::run logs command lines
+# without their output. Telling an operator the wrapper's error is in
+# .bootstrap-log while it exists only in the terminal ends the search at
+# a file that never had it. Pinned in three directions: with a log file
+# the text is really appended AND still shown live; without one the
+# record must not claim a log; and the gh-reached branch must not
+# persist a capture taken after the pipeline read the piped PAT.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+TARGET9J="$WORKDIR/new-repo-wrapper-refuse-logged"
+rm -rf "$TARGET9J"
+mkdir -p "$TARGET9J"
+LOG9J="$TARGET9J/.bootstrap-log"
+set +e
+logged_out=$(run_secret_set_failure_case "$FAKE_ROOT_REFUSE" "$TARGET9J" "$LOG9J")
+logged_ec=$?
+set -e
+echo "$logged_out" | grep -q "RC=3" && [ "$logged_ec" -eq 0 ] \
+  && pass "logged wrapper-refusal harness reproduces the pre-gh failure (rc=3)" \
+  || fail "logged harness misbehaved; rc=$logged_ec; out: $logged_out"
+# The wrapper's own words, indented under a header by
+# bootstrap::append_log_diagnostic — the indent proves the text arrived
+# through the persist path and is not some other line that happens to
+# mention the same failure.
+grep -qF "captured output follows" "$LOG9J" \
+  && pass "the run log carries a captured-output header for the pre-gh failure" \
+  || fail "no captured-output header in the run log: $(cat "$LOG9J" 2>/dev/null)"
+grep -qE '^    gh-as-author: could not read a token for nathanjohnpayne' "$LOG9J" \
+  && pass "the wrapper's own diagnostic is persisted to the run log" \
+  || fail "wrapper diagnostic missing from the run log: $(cat "$LOG9J" 2>/dev/null)"
+# Persisting must not come at the cost of the live view.
+echo "$logged_out" | grep -qF "gh-as-author: could not read a token for nathanjohnpayne" \
+  && pass "the wrapper's diagnostic is still shown on the terminal" \
+  || fail "capturing the diagnostic swallowed it; out: $logged_out"
+grep -qF "the wrapper's own error is in the run log" "$TARGET9J/.bootstrap-state.warnings" \
+  && pass "the record points at the run log, which now really holds the diagnostic" \
+  || fail "record does not point at the log: $(cat "$TARGET9J/.bootstrap-state.warnings" 2>/dev/null)"
+# Fallback: case (a) above ran with BOOTSTRAP_LOG_FILE unset, so there
+# was no log to append to and the record must not send anyone to one.
+grep -qF "the wrapper's own error is in the run log" "$TARGET9I/.bootstrap-state.warnings" \
+  && fail "record points at a run log that was never written: $(cat "$TARGET9I/.bootstrap-state.warnings")" \
+  || pass "with no log file the record makes no run-log claim"
+grep -qF "the wrapper's own error is in the terminal output above" \
+     "$TARGET9I/.bootstrap-state.warnings" \
+  && pass "with no log file the record points at the terminal instead" \
+  || fail "no terminal fallback in the record: $(cat "$TARGET9I/.bootstrap-state.warnings" 2>/dev/null)"
+# The gh-reached branch keeps its capture terminal-only: by then the
+# pipeline has read the piped PAT, and that record claims nothing about
+# a log, so there is no false pointer to repair by persisting it.
+: >"$SHIM_LOG"
+TARGET9J2="$WORKDIR/new-repo-wrapper-forward-logged"
+rm -rf "$TARGET9J2"
+mkdir -p "$TARGET9J2"
+LOG9J2="$TARGET9J2/.bootstrap-log"
+set +e
+fwdlog_out=$(run_secret_set_failure_case "$FAKE_ROOT_FORWARD" "$TARGET9J2" "$LOG9J2")
+fwdlog_ec=$?
+set -e
+echo "$fwdlog_out" | grep -q "RC=1" && [ "$fwdlog_ec" -eq 0 ] \
+  && pass "logged wrapper-forward harness reproduces the gh failure (rc=1)" \
+  || fail "logged forward harness misbehaved; rc=$fwdlog_ec; out: $fwdlog_out"
+# There IS a capture to decline here — the shim gh prints a diagnostic
+# before it exits — so the assertion below cannot pass on an empty file.
+echo "$fwdlog_out" | grep -qF "gh: HTTP 403: Resource not accessible by personal access token" \
+  && pass "the gh-reached branch captured a non-empty diagnostic and showed it" \
+  || fail "no gh diagnostic captured, so the no-persist check would be vacuous; out: $fwdlog_out"
+grep -qF "captured output follows" "$LOG9J2" 2>/dev/null \
+  && fail "post-PAT-read output was persisted on the gh-reached branch: $(cat "$LOG9J2")" \
+  || pass "the gh-reached branch persists no capture"
+grep -qF "HTTP 403" "$LOG9J2" 2>/dev/null \
+  && fail "gh's own post-PAT-read output reached the run log: $(cat "$LOG9J2")" \
+  || pass "gh's post-PAT-read output stays out of the run log"
+grep -qF "in the run log" "$TARGET9J2/.bootstrap-state.warnings" \
+  && fail "the gh-reached record claims a log entry it never wrote: $(cat "$TARGET9J2/.bootstrap-state.warnings")" \
+  || pass "the gh-reached record makes no run-log claim"
 
 # --- assertion 16: dry-run PAT miss is pure (#755 round 2) ---
 # A dry run carries no credentials, so a PAT miss there is EXPECTED:

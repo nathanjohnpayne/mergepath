@@ -16,6 +16,11 @@
 #                                      was actually reached.
 #   bootstrap::run_author_gh <label> [...]  Logged bootstrap::run wrapper around
 #                                      bootstrap::author_gh for gh side-effects.
+#   bootstrap::append_log_diagnostic <label> <file>
+#                                      Append captured command output to
+#                                      $BOOTSTRAP_LOG_FILE. Returns 0 only if
+#                                      it was really persisted, so a caller may
+#                                      point an operator at the log.
 #   bootstrap::record_stage <name>     Append a completed stage name to the
 #                                      state file at $BOOTSTRAP_STATE_FILE.
 #   bootstrap::record_warning [key] <msg>
@@ -245,6 +250,48 @@ bootstrap::run_author_gh() {
   fi
 
   bootstrap::run "$label" env GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- gh "$@"
+}
+
+# Append a captured diagnostic to $BOOTSTRAP_LOG_FILE, so the audit
+# trail holds the failing layer's OWN words rather than only the
+# caller's one-line summary of them.
+#
+# bootstrap::run logs the command line of every side-effect but not its
+# output, and the wizard installs no global stderr tee, so a call that
+# captured its stderr to inspect it leaves nothing behind once the
+# terminal scrollback is gone. That matters for the failures whose
+# remediation lives in the diagnostic itself (which token lookup failed,
+# which identity the byline pin expected) and which are read later, from
+# the sidecar, after a resume or during an audit.
+#
+# Usage:
+#   bootstrap::append_log_diagnostic <label> <file>
+#
+# Returns 0 iff the text was actually persisted, and non-zero otherwise
+# (no log file configured, nothing captured, or the append failed).
+# Callers MUST gate on that before telling an operator to look in the
+# log: a warning pointing at an entry that was never written is worse
+# than one that points nowhere, because it ends the search.
+#
+# Callers own what they hand over. This helper does not and cannot
+# redact, so a capture that could contain secret material must not be
+# passed to it — see the secret-set path in
+# scripts/bootstrap/github-infra.sh, which persists only the diagnostic
+# produced BEFORE anything in the pipeline could read the piped PAT.
+bootstrap::append_log_diagnostic() {
+  local label=$1 src=$2
+
+  if [ -z "${BOOTSTRAP_LOG_FILE:-}" ] || [ ! -s "$src" ]; then
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$BOOTSTRAP_LOG_FILE")" || return 1
+  {
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $label: captured output follows"
+    # Indent so the block reads as subordinate to its header and can
+    # never be mistaken for the log's own command lines.
+    sed 's/^/    /' "$src"
+  } >>"$BOOTSTRAP_LOG_FILE" || return 1
 }
 
 # Append a completed-stage name to the resume state file. Idempotent —

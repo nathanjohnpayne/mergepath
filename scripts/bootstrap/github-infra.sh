@@ -771,12 +771,47 @@ bootstrap::_provision_reviewer_assignment_token() {
   # operator at the reviewer PAT they just supplied when the thing to
   # repair is AUTHOR authentication. The marker is the positive proof:
   # present only when gh itself was reached.
-  local set_rc=0 reached_dir reached_marker gh_was_reached=0
+  #
+  # Output is captured to a file rather than written straight to the
+  # terminal so the pre-gh diagnostic can be PERSISTED as well as shown:
+  # the wizard has no global stderr tee and bootstrap::run logs command
+  # lines only, so an operator reading the sidecar after a resume or in a
+  # later audit would otherwise find the record naming the author write
+  # path with the wrapper's actual complaint — which token lookup failed,
+  # which identity the byline pin wanted — nowhere on disk. Everything is
+  # replayed to stderr immediately afterwards, so the live run reads
+  # exactly as before (stdout folded into stderr as it already was).
+  local set_rc=0 reached_dir reached_marker call_output gh_was_reached=0
   reached_dir=$(mktemp -d "${TMPDIR:-/tmp}/bootstrap-secret-set.XXXXXX")
   reached_marker="$reached_dir/gh-reached"
-  printf '%s' "$pat" | bootstrap::author_gh_traced "$reached_marker" secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo" >&2 || set_rc=$?
+  call_output="$reached_dir/output"
+  printf '%s' "$pat" | bootstrap::author_gh_traced "$reached_marker" secret set REVIEWER_ASSIGNMENT_TOKEN --repo "$full_repo" >"$call_output" 2>&1 || set_rc=$?
   if [ -e "$reached_marker" ]; then
     gh_was_reached=1
+  fi
+  cat "$call_output" >&2
+  # Persist the capture BEFORE the record is worded, because the record
+  # may only point at the log if the append actually happened: no log
+  # file configured, or nothing captured, and it did not. A warning
+  # pointing at an entry that was never written is worse than one that
+  # points nowhere, because it ends the operator's search.
+  #
+  # The pre-gh branch is the ONE that may persist. Its marker is absent,
+  # which is positive proof that nothing in the pipeline ever exec'd gh;
+  # the wrapper and the trace shim never read stdin, so no process that
+  # could have seen the piped PAT produced a byte of this text. (Nor does
+  # the wrapper chain print token material at all —
+  # scripts/lib/gh-token-resolver.sh and scripts/identity-check.sh name
+  # identities and sources, never values.) Once gh HAS run the capture
+  # stays terminal-only: that branch's record claims nothing about the
+  # log, so there is no false pointer to repair, and no reason to write
+  # post-PAT-read output to a file that outlives the run.
+  local diag_location="in the terminal output above"
+  if [ "$set_rc" -ne 0 ] && [ "$gh_was_reached" != "1" ] \
+     && bootstrap::append_log_diagnostic \
+          "REVIEWER_ASSIGNMENT_TOKEN author write path failed before gh ran (rc=$set_rc)" \
+          "$call_output"; then
+    diag_location="in the run log"
   fi
   rm -rf "$reached_dir"
   if [ "$set_rc" -ne 0 ]; then
@@ -801,7 +836,7 @@ bootstrap::_provision_reviewer_assignment_token() {
     else
       bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: the author-identity write path failed BEFORE gh ran (rc=$set_rc) — no secret-set call was attempted"
       bootstrap::err "REVIEWER_ASSIGNMENT_TOKEN: this is an AUTHOR-authentication failure ($(bootstrap::author_identity) token lookup / verification, or a missing $(bootstrap::author_wrapper)), NOT a problem with the reviewer PAT — see the lines above from the wrapper"
-      BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON="REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (the author write path failed before the gh secret-set call ran, rc=$set_rc — typically the author wrapper failing to resolve or verify a $(bootstrap::author_identity) token; the wrapper's own error is in the run log) — repair author authentication, then set the secret manually before the first PR"
+      BOOTSTRAP_REVIEWER_ASSIGNMENT_WARNING_REASON="REVIEWER_ASSIGNMENT_TOKEN was NOT provisioned on $full_repo (the author write path failed before the gh secret-set call ran, rc=$set_rc — typically the author wrapper failing to resolve or verify a $(bootstrap::author_identity) token; the wrapper's own error is $diag_location) — repair author authentication, then set the secret manually before the first PR"
     fi
     return "$set_rc"
   fi
