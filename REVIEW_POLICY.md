@@ -947,15 +947,18 @@ Agents must automate identity switching so that commits and PR activity are attr
 
 ### Git commit identity (user.name / user.email)
 
-```bash
-# Switch to author identity
-git config user.name "nathanjohnpayne"
-git config user.email "nathan@nathanjohnpayne.example"
+Commit identity is **not** switched per session, and never per repository. Every agent commits as the human author identity, which lives in the machine's **global** git config (`~/.gitconfig`) next to `user.signingkey` — so `git commit` attributes and signs correctly in every repo and every worktree with no per-session step. Reviewer identities (`nathanpayne-{agent}`) never author commits; they exist for GitHub API activity only, and that attribution comes from the PAT wrappers described below, not from git config.
 
-# Switch to reviewer identity
-git config user.name "nathanpayne-claude"
-git config user.email "claude@nathanpayne-claude.example"
+```bash
+# Read the identity a commit here would use, and where it comes from.
+git config --show-origin --get user.email
+
+# Set the author identity ONCE PER MACHINE, globally.
+git config --global user.name  "Your Name"
+git config --global user.email "you@example.com"
 ```
+
+**Never run a bare `git config user.name` / `git config user.email` inside a managed checkout.** Without `--global`, `git config` writes the *current repository's* `.git/config`, which every worktree of that repository shares. Such an override is invisible to `git config --global --get user.email`, outlives the session that made it, and silently reattributes — and, when `commit.gpgsign` is set alongside it, unsigns — every later commit from every worktree. That corruption reached `main` twice under an undeliverable `.example` fixture address before anyone noticed ([#777](https://github.com/nathanjohnpayne/mergepath/issues/777)), and an earlier revision of this very section, which instructed a bare repo-local `git config user.email`, is how it got there. `scripts/ci/check_git_identity_hygiene` now fails on both the leftover override and on the instruction shape that produces it.
 
 ### SSH identity switching (push / pull)
 

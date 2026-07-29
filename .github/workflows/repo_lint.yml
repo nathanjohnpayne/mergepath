@@ -38,6 +38,19 @@ jobs:
       - name: make_ci_scripts_executable
         run: chmod +x scripts/ci/*
 
+      # #777 part 1 of 2 — record .git/config BEFORE any step that runs a
+      # test suite. The paired verification step at the END of this job
+      # byte-compares against this snapshot, which turns "running the
+      # suite leaves .git/config untouched" into an assertion this job
+      # actually makes across every test-wrapping step in between. A test
+      # that builds a fixture repo but runs `git config` without `-C`
+      # writes the CHECKOUT's identity instead, and every worktree of that
+      # repo then inherits it. The `|| { ...; }` tail is the #590-style
+      # self-bootstrap guard: soft-pass when the check script is not in
+      # this tree yet (the #601 kit-vs-workflow skew window).
+      - name: check_git_identity_hygiene --snapshot
+        run: ./scripts/ci/check_git_identity_hygiene --snapshot || { rc=$?; if [ ! -f scripts/ci/check_git_identity_hygiene ]; then echo "check_git_identity_hygiene not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }
+
       # Structural guard added in #269: every executable
       # scripts/ci/check_* must be wired into this workflow as an
       # explicit `run: ./scripts/ci/check_X` step (or carry a
@@ -494,3 +507,14 @@ jobs:
             fi
           done
           exit $MISSING
+
+      # #777 part 2 of 2 — deliberately the LAST step in the job, so it
+      # observes the cumulative effect of every test-wrapping step above.
+      # Fails when .git/config moved since the snapshot, when this
+      # checkout carries a repo-local user.name / user.email /
+      # user.signingkey / commit.gpgsign / tag.gpgsign override, or (on
+      # mergepath only) when a tracked shell script or doc writes one of
+      # those keys through an unscoped `git config`. Same #590-style
+      # self-bootstrap tail as the snapshot step above.
+      - name: check_git_identity_hygiene
+        run: ./scripts/ci/check_git_identity_hygiene || { rc=$?; if [ ! -f scripts/ci/check_git_identity_hygiene ]; then echo "check_git_identity_hygiene not in this tree yet; soft-pass (bootstrap skew)"; else exit "$rc"; fi; }

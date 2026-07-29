@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# check_git_identity_hygiene
+#
+# Regression guard for mergepath#777: a repo-local git identity override
+# silently redirecting commit attribution and disabling commit signing.
+#
+# The observed corruption (twice on main — 5ecb10e and 2c5510e, and again
+# on 2026-07-28) was a `[user]` / `[commit]` block written into the LIVE
+# repository's .git/config:
+#
+#     [user]
+#         name = nathanjohnpayne
+#         email = nathan@nathanjohnpayne.example
+#     [commit]
+#         gpgsign = false
+#
+# `git config <key> <value>` with no scope flag writes the CURRENT
+# repository's .git/config. Every worktree of that repository shares that
+# file, so one stray write misattributes and unsigns every subsequent
+# commit in every worktree, and it survives the session that made it.
+#
+# The check has three independent parts.
+#
+#   A. Live-repo assertion (runs in EVERY repo, hub and consumer).
+#      Fails when this checkout's git config carries a local- or
+#      worktree-scoped user.name / user.email / user.signingkey /
+#      commit.gpgsign / tag.gpgsign override. Commit identity belongs in
+#      the machine's --global config; a repo-local copy is either the #777
+#      corruption or an undeclared per-repo identity, and both are worth
+#      a failure. Set MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 to opt out on a
+#      checkout that genuinely wants a per-repo identity.
+#
+#   B. Baseline comparison (`--snapshot`, then a later plain run).
+#      `--snapshot` copies .git/config to a scratch path inside the git
+#      common dir; a later plain run byte-compares against it. Wiring
+#      `--snapshot` as an early repo_lint step and the plain run as the
+#      LAST step turns "running the suite leaves .git/config byte-
+#      identical" into an assertion the CI job actually makes, spanning
+#      every test-wrapping step in between. Locally:
+#
+#          scripts/ci/check_git_identity_hygiene --snapshot
+#          bash tests/test_<suite>.sh            # ... or the whole suite
+#          scripts/ci/check_git_identity_hygiene
+#
+#   C. Static scan for the idiom that produces the corruption (HUB-ONLY).
+#      Flags any tracked shell script or Markdown doc that writes one of
+#      the five identity/signing keys through `git config` without
+#      targeting a repository other than the current one (-C, --git-dir,
+#      --file/-f, --blob) or an out-of-repo scope (--global, --system).
+#      Reads (--get*/--list) and removals (--unset*/--remove-section) are
+#      not writes and are never flagged; neither is the ephemeral
+#      `git -c key=value <cmd>` form, which mutates no file.
+#
+#      Markdown is IN scope on purpose. The #777 writer was not a test —
+#      it was REVIEW_POLICY.md § Git Identity Switching, which instructed
+#      agents to run exactly `git config user.email "nathan@…example"`
+#      inside the repo. A documented instruction an agent executes is a
+#      writer like any other.
+#
+#      Part C is gated on the mergepath marker file
+#      scripts/sync-to-downstream.sh (the check_sync_manifest idiom)
+#      because scripts/ci/ is a propagated kit: consumers carry
+#      bootstrap-frozen copies of REVIEW_POLICY.md and of the fixture
+#      tests fixed here, and nothing propagates those fixes, so a
+#      fleet-wide static scan would turn every consumer's required lint
+#      red for a defect they cannot fix locally. Parts A and B carry the
+#      guarantee that matters everywhere; Part C activates on consumers
+#      once their trees are cleaned up in a follow-up wave.
+#
+# On extensions.worktreeConfig: it does NOT prevent this class. It only
+# enables the `--worktree` SCOPE; an unscoped or `--local` write still
+# lands in the shared .git/config that every worktree reads. It is worth
+# having for other reasons, but it is not a mitigation for #777 — Part A
+# is, which is why Part A inspects the worktree scope too.
+#
+# Env overrides (used by tests/test_git_identity_hygiene.sh):
+#   MERGEPATH_GIT_IDENTITY_ROOT — point the check at a fixture tree
+#     instead of the live repo. Enumeration switches from `git ls-files`
+#     to `find`, the live-repo assertion probes the fixture, and the
+#     paired test suite is not re-run (recursion guard).
+#   MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 — skip Part A.
+#
+# Exit codes:
+#   0 — pass (or a documented skip).
+#   1 — a local identity override, a baseline mismatch, or a scan hit.
+
+set -euo pipefail
+
+SELF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FIXTURE_ROOT="${MERGEPATH_GIT_IDENTITY_ROOT:-}"
+REPO_ROOT="${FIXTURE_ROOT:-$SELF_ROOT}"
+
+MODE="report"
+case "${1:-}" in
+  --snapshot) MODE="snapshot" ;;
+  "") ;;
+  *) echo "check_git_identity_hygiene: unknown argument '$1'" >&2; exit 2 ;;
+esac
+
+# Keys that decide commit attribution and signing. Kept deliberately
+# short: this guard is about WHO a commit claims to be, not about general
+# git config hygiene.
+IDENTITY_KEYS="user.name user.email user.signingkey commit.gpgsign tag.gpgsign"
+
+FAILED=0
+
+# ── Baseline path ─────────────────────────────────────────────────────
+# Lives inside the git common dir (untracked, shared by every worktree,
+# never visible to `git status`).
+baseline_path() {
+  local common
+  common="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  case "$common" in
+    /*) ;;
+    *) common="$REPO_ROOT/$common" ;;
+  esac
+  printf '%s\n' "$common/mergepath-gitconfig-baseline"
+}
+
+config_path() {
+  local common
+  common="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  case "$common" in
+    /*) ;;
+    *) common="$REPO_ROOT/$common" ;;
+  esac
+  printf '%s\n' "$common/config"
+}
+
+if [ "$MODE" = "snapshot" ]; then
+  if ! CFG="$(config_path)" || [ ! -f "$CFG" ]; then
+    echo "check_git_identity_hygiene: SKIP (--snapshot: no git config at $REPO_ROOT)"
+    exit 0
+  fi
+  BASE="$(baseline_path)"
+  cp "$CFG" "$BASE"
+  echo "check_git_identity_hygiene: snapshot recorded ($BASE)"
+  exit 0
+fi
+
+# ── Part A: live-repo identity assertion ──────────────────────────────
+if [ "${MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY:-}" = "1" ]; then
+  echo "check_git_identity_hygiene: Part A skipped (MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1)"
+elif ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "check_git_identity_hygiene: Part A skipped (not a git repository: $REPO_ROOT)"
+else
+  OFFENDERS=""
+  for scope in local worktree; do
+    for key in $IDENTITY_KEYS; do
+      # `--worktree` errors out when extensions.worktreeConfig is unset;
+      # a missing key exits 1. Both are "nothing set", hence the guard.
+      values="$(git -C "$REPO_ROOT" config "--$scope" --get-all "$key" 2>/dev/null || true)"
+      [ -n "$values" ] || continue
+      while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        OFFENDERS+="  $scope: $key = $v"$'\n'
+      done <<EOF
+$values
+EOF
+    done
+  done
+  if [ -n "$OFFENDERS" ]; then
+    cat >&2 <<EOF
+check_git_identity_hygiene: FAIL (repo-local git identity override)
+
+This checkout's git config overrides the machine's global commit
+identity. Every worktree of this repository shares that config, so every
+commit made from any of them is attributed — and signed — under the
+override rather than the operator's real identity. This is the
+mergepath#777 corruption; it reached main twice before it was noticed.
+
+Offending settings:
+
+$OFFENDERS
+Clear them (the values are not recoverable afterwards, so read them
+first if one was deliberate):
+
+    git config --local --unset-all user.name
+    git config --local --unset-all user.email
+    git config --local --unset-all commit.gpgsign
+
+If this checkout genuinely wants a per-repo identity, set
+MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 for the check.
+EOF
+    FAILED=1
+  fi
+fi
+
+# ── Part B: .git/config byte-comparison against a recorded baseline ───
+if BASE="$(baseline_path 2>/dev/null)" && [ -f "$BASE" ]; then
+  CFG="$(config_path)"
+  if ! cmp -s "$BASE" "$CFG"; then
+    cat >&2 <<EOF
+check_git_identity_hygiene: FAIL (.git/config changed since the snapshot)
+
+Something between the \`--snapshot\` call and now wrote to this
+repository's own .git/config. A test that builds a fixture repo must
+target it explicitly (\`git -C "\$FIXTURE" config …\`); an unscoped
+\`git config\` resolves against whatever repository the process is
+standing in, which in a test run is this one.
+
+Diff (baseline → current):
+EOF
+    diff -u "$BASE" "$CFG" >&2 || true
+    FAILED=1
+  else
+    echo "check_git_identity_hygiene: .git/config unchanged since snapshot"
+  fi
+fi
+
+# ── Part C: static scan for the unscoped-write idiom (hub-only) ───────
+HUB_MARKER="$REPO_ROOT/scripts/sync-to-downstream.sh"
+if [ ! -f "$HUB_MARKER" ]; then
+  echo "check_git_identity_hygiene: Part C skipped (consumer checkout: scripts/sync-to-downstream.sh absent)"
+else
+  FILES_LIST="$(mktemp "${TMPDIR:-/tmp}/mergepath-git-identity-scan.XXXXXX")"
+  trap 'rm -f "$FILES_LIST"' EXIT
+
+  if [ -n "$FIXTURE_ROOT" ]; then
+    # `.git` is pruned to match the default path, which enumerates with
+    # `git ls-files` and therefore never sees repository internals.
+    ( cd "$REPO_ROOT" && find . -name .git -prune -o -type f -print0 ) \
+      | while IFS= read -r -d '' f; do
+          printf '%s\n' "${f#./}"
+        done > "$FILES_LIST"
+  else
+    ( cd "$REPO_ROOT" && git ls-files ) > "$FILES_LIST"
+  fi
+
+  # Paths excluded from the scan, with the reason each is excluded:
+  #   - this script and its paired test carry the forbidden form as
+  #     documentation and as fixtures (the check_mktemp_portability
+  #     self-exclusion precedent);
+  #   - docs/projects/*/prds/ are GENERATED MIRRORS of the central docs
+  #     repo (do_not_edit: true). A hit there must be fixed at the
+  #     canonical source, so failing this repo's lint on it would be
+  #     unactionable here.
+  should_skip() {
+    case "$1" in
+      scripts/ci/check_git_identity_hygiene) return 0 ;;
+      tests/test_git_identity_hygiene.sh) return 0 ;;
+      docs/projects/*/prds/*) return 0 ;;
+    esac
+    return 1
+  }
+
+  SCAN_FILES=()
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    should_skip "$rel" && continue
+    abs="$REPO_ROOT/$rel"
+    [ -f "$abs" ] || continue
+    case "$rel" in
+      *.sh|*.bash|*.md) SCAN_FILES+=("$abs") ;;
+      *)
+        head -n1 -- "$abs" 2>/dev/null | grep -qE '^#!.*(bash|/sh)( |$)' \
+          && SCAN_FILES+=("$abs")
+        ;;
+    esac
+  done < "$FILES_LIST"
+
+  if [ "${#SCAN_FILES[@]}" -gt 0 ]; then
+    HITS="$(mktemp "${TMPDIR:-/tmp}/mergepath-git-identity-hits.XXXXXX")"
+    trap 'rm -f "$FILES_LIST" "$HITS"' EXIT
+    set +e
+    awk -v root="$REPO_ROOT/" '
+    # A `git … config …` invocation somewhere on the line. The optional
+    # middle group absorbs global options (`-C dir`, `--git-dir=…`, `-c
+    # k=v`) between `git` and the `config` subcommand.
+    function is_git_config(s) {
+      return (s ~ /(^|[^-A-Za-z0-9_.\/])git[[:space:]]+([^[:space:]]+[[:space:]]+)*config([[:space:]]|$)/)
+    }
+    # A VALUE is being assigned to one of the identity keys: the key is
+    # followed by whitespace and a value token. `-c user.email=t@t` uses
+    # `=` and never matches; `$(git config user.email)` has no following
+    # token and never matches.
+    function writes_identity(s) {
+      return (s ~ /(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)[[:space:]]+["'"'"'$A-Za-z0-9]/)
+    }
+    # Explicitly targets some other repository or an out-of-repo scope.
+    function targeted(s) {
+      if (s ~ /(^|[[:space:]])-C([[:space:]]|=)/) return 1
+      if (s ~ /(^|[[:space:]])--git-dir([[:space:]]|=)/) return 1
+      if (s ~ /(^|[[:space:]])--global([[:space:]]|$)/) return 1
+      if (s ~ /(^|[[:space:]])--system([[:space:]]|$)/) return 1
+      if (s ~ /(^|[[:space:]])(-f|--file|--blob)([[:space:]]|=)/) return 1
+      return 0
+    }
+    # Reads and removals are not identity writes.
+    function not_a_write(s) {
+      if (s ~ /--get/) return 1
+      if (s ~ /--list/) return 1
+      if (s ~ /--unset/) return 1
+      if (s ~ /--remove-section/) return 1
+      if (s ~ /--rename-section/) return 1
+      return 0
+    }
+    {
+      if ($0 ~ /GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/) next
+      if (!is_git_config($0)) next
+      if (!writes_identity($0)) next
+      if (targeted($0)) next
+      if (not_a_write($0)) next
+      rel = FILENAME
+      sub("^" root, "", rel)
+      print rel ":" FNR ":" $0
+      found = 1
+    }
+    END { exit found ? 1 : 0 }
+    ' "${SCAN_FILES[@]}" > "$HITS" 2>/dev/null
+    scan_rc=$?
+    set -e
+    if [ "$scan_rc" -ne 0 ]; then
+      cat >&2 <<EOF
+check_git_identity_hygiene: FAIL (unscoped git identity write)
+
+These lines set a commit-identity or signing key through \`git config\`
+without naming the repository they mean. Run from inside a real
+checkout — which is where tests run, and where an agent following a
+documented snippet stands — they write THIS repository's .git/config and
+silently reattribute every later commit (mergepath#777).
+
+Target the repository explicitly, or use an ephemeral override:
+
+    git -C "\$FIXTURE" config user.email t@t     # fixture repo
+    git -c user.email=t@t -c user.name=t commit  # one command, no file
+    git config --global user.email you@example.com
+
+If a line is a deliberate exception, append a
+\`GIT_IDENTITY_SCOPE_EXEMPT: <reason>\` comment.
+
+Offending lines:
+EOF
+      sed 's/^/  - /' "$HITS" >&2
+      FAILED=1
+    fi
+  fi
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  exit 1
+fi
+
+# ── Paired regression suite ───────────────────────────────────────────
+# Skipped under the fixture-root override so the suite's own invocations
+# do not recurse (the check_mktemp_portability / check_sync_manifest
+# recursion-guard pattern).
+TEST_SUITE="$SELF_ROOT/tests/test_git_identity_hygiene.sh"
+if [ -z "$FIXTURE_ROOT" ] && [ -f "$TEST_SUITE" ]; then
+  echo "check_git_identity_hygiene: running regression test suite"
+  if ! bash "$TEST_SUITE"; then
+    echo "check_git_identity_hygiene: FAIL (regression test suite failed)" >&2
+    exit 1
+  fi
+fi
+
+echo "check_git_identity_hygiene: PASS"
+exit 0
