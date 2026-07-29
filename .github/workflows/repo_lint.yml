@@ -343,6 +343,23 @@ jobs:
       - name: check_sweep_unresolved_feedback
         run: ./scripts/ci/check_sweep_unresolved_feedback
 
+      - name: check_consumer_residue_safety
+        # Residue-invariance net — the direction the #601 net structurally
+        # cannot see. That suite models a consumer by STRIPPING a
+        # hand-written list, so it can only test a check against MISSING
+        # files; bootstrap residue is a hub-only file unexpectedly PRESENT
+        # on a consumer (gaycruisebingo carries ~24 such paths). This one
+        # derives the consumer shape from .mergepath-sync.yml and asserts
+        # every check_* wrapper's verdict is invariant under every subset
+        # of the hub-only paths it references. Hub-only (needs the full hub
+        # tree + the manifest); SKIPs on consumers. Runs just ahead of the
+        # #601 net — same failure class, ~1-2 minutes instead of a few.
+        # Soft-passes if the script has not landed yet (#590 pattern), so a
+        # sync wave that delivers this workflow before the scripts/ci/ kit
+        # does not 127-fail. (One line so check_ci_scripts_wired still sees
+        # the explicit `run: ./scripts/ci/check_consumer_residue_safety`.)
+        run: ./scripts/ci/check_consumer_residue_safety || { rc=$?; if [ ! -f scripts/ci/check_consumer_residue_safety ]; then echo "check_consumer_residue_safety not on this tree yet — soft pass (self-bootstrap)"; exit 0; fi; exit "$rc"; }
+
       - name: check_repo_lint_consumer_safety
         # #601 consumer-safety net (Codex P2 on #624: it existed unwired).
         # Re-runs every check_* wrapper inside a consumer-SHAPED checkout

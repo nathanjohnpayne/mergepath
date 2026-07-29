@@ -1,0 +1,81 @@
+# FROZEN REGRESSION FIXTURE — DO NOT EDIT, DO NOT WIRE.
+#
+# Verbatim copy of scripts/ci/check_branch_protection_audit as it stood at
+# mergepath commit 54d569f9 ("fix(774): keep the fleet protection audit out of
+# bootstrapped repos and scope ruleset bypass verdicts"), the round-2 head of
+# PR #796. Kept as the permanent non-vacuity proof for
+# tests/test_consumer_residue_safety.sh: the residue engine must report an EXIT
+# class violation against it. Deliberately NOT under scripts/ci/ — it is
+# fixture data, never a live check — and deliberately frozen, so the proof
+# survives #796 being repaired and merged.
+#
+# The defect: the consumer decision is the both-absent idiom over the wrapper's
+# OWN hub-only artifacts (both wrapped tests must be missing to reach the marker
+# test). gaycruisebingo carries tests/test_audit_branch_protection.sh as
+# bootstrap residue, so on that consumer the gate never fires, control falls
+# through to the required-file loop, and the check ERRORs on the missing
+# workflow.
+#!/usr/bin/env bash
+# scripts/ci/check_branch_protection_audit — branch-protection audit suite (#774).
+#
+# Wraps the two hermetic suites behind the fleet protection audit:
+#
+#   tests/test_audit_branch_protection.sh
+#     scripts/audit-branch-protection.sh itself — the #285 auth/ruleset
+#     semantics AND the #774 --fleet loop (exit-code classification,
+#     hub inclusion, summary-file completeness, fail-closed prerequisites).
+#     This suite existed unwired before #774; the scheduled workflow now
+#     depends on the exit-code contract it pins, so it runs in CI.
+#
+#   tests/test_audit_branch_protection_workflow.sh
+#     .github/workflows/branch-protection-audit.yml — structural shape plus
+#     an execution of the workflow's own extracted bash (verdict
+#     classification, missing-secret guard, rollup-issue body assembly).
+#
+# Both the audited script and the suites are HUB-ONLY (deliberately not in
+# .mergepath-sync.yml): the fleet audit reads every consumer's branch
+# protection from the hub, and no consumer runs it. A consumer checkout
+# therefore SKIPs via the same marker disambiguation check_wave_audit uses
+# (#624): wrapped test absent + scripts/sync-to-downstream.sh absent →
+# consumer checkout → SKIP; test absent but the hub marker present → the
+# hub lost the suite → hard error; test present → run it regardless.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+AUDIT_SCRIPT="$REPO_ROOT/scripts/audit-branch-protection.sh"
+WORKFLOW="$REPO_ROOT/.github/workflows/branch-protection-audit.yml"
+TESTS=(
+  "$REPO_ROOT/tests/test_audit_branch_protection.sh"
+  "$REPO_ROOT/tests/test_audit_branch_protection_workflow.sh"
+)
+
+if [ ! -f "${TESTS[0]}" ] && [ ! -f "${TESTS[1]}" ]; then
+  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+    echo "check_branch_protection_audit: SKIP (consumer checkout: wrapped tests + scripts/sync-to-downstream.sh all absent; hub-only fleet protection audit)"
+    exit 0
+  fi
+  echo "check_branch_protection_audit: ERROR (both suites missing from a mergepath checkout)" >&2
+  exit 1
+fi
+
+for f in "$AUDIT_SCRIPT" "$WORKFLOW" "${TESTS[@]}"; do
+  if [ ! -f "$f" ]; then
+    echo "check_branch_protection_audit: ERROR missing required file: $f" >&2
+    exit 1
+  fi
+done
+
+# Both suites parse YAML with mikefarah/yq and fail closed without it.
+# Self-bootstrap on CI (#616) so this check does not depend on where it
+# lands relative to repo_lint.yml's yq install step; a local run keeps the
+# suites' own "yq is required" error rather than getting a surprise install.
+if [ -f "$REPO_ROOT/scripts/lib/ensure-yq.sh" ]; then
+  bash "$REPO_ROOT/scripts/lib/ensure-yq.sh" --ci-only
+fi
+
+for t in "${TESTS[@]}"; do
+  echo "check_branch_protection_audit: running $(basename "$t")"
+  bash "$t"
+done
+
+echo "check_branch_protection_audit: PASS"

@@ -367,6 +367,17 @@ ALLOW_LIST=(
   # excludes) to build a consumer-shaped fixture, so it can never travel.
   # No propagated check runs it; it is referenced from comments only.
   "tests/test_repo_lint_consumer_safety.sh"
+
+  # The residue-invariance net. Hub-only for the same reason and one
+  # more: it derives the consumer shape by reading .mergepath-sync.yml
+  # (mergepath-internal — it names every private consumer repo), so it
+  # cannot run anywhere the manifest is absent. check_consumer_residue_safety
+  # ships via the scripts/ci/ kit and SKIPs on consumers via the
+  # scripts/sync-to-downstream.sh marker, so the suite never runs there.
+  # NB: that wrapper is marker-FIRST, not both-absent — it is itself
+  # propagated, so a consumer carrying this test as bootstrap residue must
+  # still SKIP. Its own reasoning is in the wrapper's header.
+  "tests/test_consumer_residue_safety.sh"
 )
 
 is_allow_listed() {
