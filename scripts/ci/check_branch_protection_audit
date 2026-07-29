@@ -17,11 +17,36 @@
 #
 # Both the audited script and the suites are HUB-ONLY (deliberately not in
 # .mergepath-sync.yml): the fleet audit reads every consumer's branch
-# protection from the hub, and no consumer runs it. A consumer checkout
-# therefore SKIPs via the same marker disambiguation check_wave_audit uses
-# (#624): wrapped test absent + scripts/sync-to-downstream.sh absent →
-# consumer checkout → SKIP; test absent but the hub marker present → the
-# hub lost the suite → hard error; test present → run it regardless.
+# protection from the hub, and no consumer runs it. The wrapper itself DOES
+# ship (repo_lint.yml is manifest-canonical and wires it as a step), so it
+# must SKIP cleanly on a consumer checkout.
+#
+# Consumer disambiguation keys ONLY on the hub marker
+# scripts/sync-to-downstream.sh, and it is checked FIRST — before any
+# wrapped-file requirement. The marker is the sole authoritative signal: it
+# is deliberately never propagated and never seeded at bootstrap, so its
+# absence means "consumer checkout" no matter what else is on disk.
+#
+# This is deliberately NOT the "wrapped test absent + marker absent" idiom
+# check_wave_audit / check_audit_canonical_mirrors use (#624). That idiom
+# treats the presence of a wrapped test as proof of a hub checkout, which is
+# false for any consumer bootstrapped BEFORE the path joined
+# BOOTSTRAP_MIRROR_EXCLUDES: the exclusion stops future seeding, it does not
+# retroactively scrub the repos already carrying the file. nathanjohnpayne/
+# gaycruisebingo is exactly that case — commit a2965a93 "Initial commit
+# (bootstrapped from mergepath)" (2026-07-07) left it carrying
+# scripts/audit-branch-protection.sh AND tests/test_audit_branch_protection.sh
+# while it has neither the workflow, nor the second suite, nor the marker.
+# Under the both-absent idiom that stale residue defeats the SKIP branch,
+# control reaches the required-file loop, and the check hard-fails on the
+# missing workflow — reddening repo_lint on every gaycruisebingo PR from the
+# sync wave that delivers this wrapper onward. Marker-first is immune to
+# residue in either direction and is strictly equivalent on the hub, where
+# the marker is always present.
+#
+# Hub behavior is unchanged and still fail-closed: marker present → all four
+# files are required, and any missing one is a hard error (the hub lost a
+# suite to an accidental delete/rename).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -32,13 +57,9 @@ TESTS=(
   "$REPO_ROOT/tests/test_audit_branch_protection_workflow.sh"
 )
 
-if [ ! -f "${TESTS[0]}" ] && [ ! -f "${TESTS[1]}" ]; then
-  if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
-    echo "check_branch_protection_audit: SKIP (consumer checkout: wrapped tests + scripts/sync-to-downstream.sh all absent; hub-only fleet protection audit)"
-    exit 0
-  fi
-  echo "check_branch_protection_audit: ERROR (both suites missing from a mergepath checkout)" >&2
-  exit 1
+if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  echo "check_branch_protection_audit: SKIP (consumer checkout: hub marker scripts/sync-to-downstream.sh absent; hub-only fleet protection audit)"
+  exit 0
 fi
 
 for f in "$AUDIT_SCRIPT" "$WORKFLOW" "${TESTS[@]}"; do

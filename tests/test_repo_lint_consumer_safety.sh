@@ -21,8 +21,32 @@
 #     pipeline, the 1Password headless-proof tooling, and the self-tests
 #     of hub-only checks. Live consumers were bootstrapped from older
 #     template snapshots and verifiably carry none of these.
+#   - hub-only STALE RESIDUE is PRESENT (CONSUMER_RESIDUE_PRESENT below).
+#     Adding a path to BOOTSTRAP_MIRROR_EXCLUDES stops FUTURE seeding; it
+#     does not retroactively scrub the consumers already carrying the file.
+#     A consumer bootstrapped before the exclusion therefore keeps it
+#     forever, and any wrapper that infers "hub checkout" from that file's
+#     presence misfires there. Modeling these as absent is what made #774
+#     round 2 ship a wrapper that hard-failed gaycruisebingo (see below).
 #   Everything manifest-propagated (canonical entries, kits, requires:)
 #   stays present — that is exactly what a post-#601 sync guarantees.
+#
+# ⚠ This fixture is a HAND-WRITTEN MODEL of consumer state, not an
+# observation of it. It is only as good as its last reconciliation against
+# the fleet, and a wrong model produces confident green on a check that is
+# live-broken. When adding a hub-only path here, VERIFY against live
+# consumer state rather than against this file's existing assumptions:
+#
+#   for repo in matchline nathanpaynedotcom overridebroadway \
+#               device-source-of-truth friends-and-family-billing \
+#               device-platform-reporting swipewatch tadlockpsychiatry \
+#               gaycruisebingo; do
+#     gh api "repos/nathanjohnpayne/$repo/contents/<path>" --jq .sha \
+#       >/dev/null 2>&1 && echo "$repo: PRESENT"
+#   done
+#
+# A path that comes back PRESENT anywhere belongs in
+# CONSUMER_RESIDUE_PRESENT, not in CONSUMER_ABSENT.
 #
 # Scope note: every wired check runs; there is currently no exclusion
 # list. If a future check is irreducibly hub-entangled, prefer giving it
@@ -103,14 +127,12 @@ CONSUMER_ABSENT=(
   "specs/bootstrap_consumer_identity.md"
   "bugs/screenshots"
   ".github/screenshots"
-  # #774 fleet branch-protection audit — scheduled workflow + auditor +
-  # both suites, all excluded by the template mirror. The cron reads
-  # every sibling repo's protection under an admin-scoped fleet secret,
-  # so it must never land in a consumer; check_branch_protection_audit
-  # ships via the scripts/ci/ kit and has to SKIP without them.
+  # #774 fleet branch-protection audit — the two paths NO consumer has.
+  # Both postdate every bootstrap, so they left no residue anywhere
+  # (verified against all nine consumers, 2026-07-28). The auditor and
+  # its first suite DO survive on gaycruisebingo — they are modeled in
+  # CONSUMER_RESIDUE_PRESENT below, NOT here.
   ".github/workflows/branch-protection-audit.yml"
-  "scripts/audit-branch-protection.sh"
-  "tests/test_audit_branch_protection.sh"
   "tests/test_audit_branch_protection_workflow.sh"
   # (b) hub-only per check_propagation_closure ALLOW_LIST — absent from
   # live consumers (older bootstrap snapshots; never manifest-propagated).
@@ -146,6 +168,27 @@ CONSUMER_ABSENT=(
   "tests/test_repo_lint_consumer_safety.sh"
 )
 
+# Hub-only STALE RESIDUE: excluded from the template mirror NOW, but still
+# present in at least one live consumer that was bootstrapped BEFORE the
+# exclusion landed. These must stay in the fixture — they are the shape that
+# breaks a wrapper keying on "wrapped file present ⇒ hub checkout".
+#
+# Each entry records the live evidence that put it here. Re-verify with the
+# probe loop in the header comment before removing one.
+CONSUMER_RESIDUE_PRESENT=(
+  # nathanjohnpayne/gaycruisebingo carries both, from commit a2965a93
+  # "Initial commit (bootstrapped from mergepath)" (2026-07-07) — a
+  # snapshot predating the #774 BOOTSTRAP_MIRROR_EXCLUDES entry. It has
+  # NEITHER the workflow, NOR tests/test_audit_branch_protection_workflow.sh,
+  # NOR the scripts/sync-to-downstream.sh hub marker. Verified against all
+  # nine consumers 2026-07-28: gaycruisebingo is the only one.
+  # This is the exact tree that made check_branch_protection_audit's
+  # original both-absent SKIP branch miss and hard-fail on the missing
+  # workflow; the wrapper now keys on the hub marker FIRST.
+  "scripts/audit-branch-protection.sh"
+  "tests/test_audit_branch_protection.sh"
+)
+
 for pat in "${CONSUMER_ABSENT[@]}"; do
   # Expand the glob inside the fixture; nullglob-style via compgen.
   while IFS= read -r hit; do
@@ -154,6 +197,20 @@ for pat in "${CONSUMER_ABSENT[@]}"; do
   done <<EOF
 $(compgen -G "$FIX/$pat" || true)
 EOF
+done
+
+# Guard the residue model against a future author "tidying" a residue path
+# into CONSUMER_ABSENT — that edit would silently restore the clean-bootstrap
+# assumption this suite exists to disprove, and hand back the same false
+# green. Fail loudly instead.
+for res in "${CONSUMER_RESIDUE_PRESENT[@]}"; do
+  if [ ! -e "$FIX/$res" ]; then
+    echo "FATAL: residue path '$res' is missing from the consumer fixture." >&2
+    echo "       It is PRESENT in a live consumer, so the fixture must keep it." >&2
+    echo "       Do not add CONSUMER_RESIDUE_PRESENT paths to CONSUMER_ABSENT;" >&2
+    echo "       re-verify against live consumer state before changing either list." >&2
+    exit 1
+  fi
 done
 
 # A consumer checkout is a plain git repo (several checks run

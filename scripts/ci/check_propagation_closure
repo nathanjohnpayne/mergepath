@@ -250,9 +250,12 @@ ALLOW_LIST=(
   # PAT, so it is hub-only by construction — a consumer neither has the
   # manifest to iterate nor the token to read its siblings.
   # check_branch_protection_audit ships via the scripts/ci/ kit but SKIPs on
-  # a consumer via the both-absent marker idiom, so neither the script nor
-  # its suites need to travel. The paired tests are already covered by the
-  # "tests/test_audit*" pattern above.
+  # a consumer as soon as the scripts/sync-to-downstream.sh hub marker is
+  # absent — checked FIRST, before any wrapped-file requirement, so stale
+  # pre-exclusion bootstrap residue (gaycruisebingo carries this very script)
+  # cannot defeat the SKIP. Neither the script nor its suites need to travel.
+  # The paired tests are already covered by the "tests/test_audit*" pattern
+  # above.
   "scripts/audit-branch-protection.sh"
 
   # Self-tests of hub-only CI check suites. The check wrappers ship via
