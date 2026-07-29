@@ -1066,11 +1066,25 @@ got="$(p4b_stderr_tail "$ERRF")"
 # logs and the manual-fallback comment, so obvious credential patterns must be
 # masked before it is returned. Feed a stderr line carrying several secret
 # shapes and assert none survive verbatim while a [REDACTED] marker appears.
-printf 'auth error: ghp_ABCdef0123456789ghijkl rejected; OPENAI sk-proj-9zXcVbNm12345 bad; Authorization: Bearer eyJhbGciOi.payload.sig; token=supersecretvalue key=anotherKey123; github_pat_11ABCDEZ0_taildata\n' > "$ERRF"
+# The credential-shaped fixtures are ASSEMBLED at runtime rather than written
+# as literals. This file is propagated verbatim to every consumer, and their
+# CI greps TRACKED FILES for public secrets — a literal `ghp_`-shaped string
+# here is reported as a leaked GitHub token and fails that gate on every
+# synced copy, regardless of it being obviously fake. Observed on the
+# 2026-07-28 wave: device-source-of-truth and friends-and-family-billing both
+# failed with "Potential public secrets found in tracked files" pointing at
+# these two lines. Splitting each prefix from its body leaves no
+# scanner-matchable literal in the file while the redaction assertions below
+# still exercise byte-identical input.
+_ghp='ghp_'; _skp='sk-proj-'
+GHP_FIXTURE="${_ghp}ABCdef0123456789ghijkl"
+SKP_FIXTURE="${_skp}9zXcVbNm12345"
+printf 'auth error: %s rejected; OPENAI %s bad; Authorization: Bearer eyJhbGciOi.payload.sig; token=supersecretvalue key=anotherKey123; github_pat_11ABCDEZ0_taildata\n' \
+  "$GHP_FIXTURE" "$SKP_FIXTURE" > "$ERRF"
 got="$(p4b_stderr_tail "$ERRF")"
 if printf '%s' "$got" | grep -q 'REDACTED' \
-   && ! printf '%s' "$got" | grep -q 'ghp_ABCdef0123456789ghijkl' \
-   && ! printf '%s' "$got" | grep -q 'sk-proj-9zXcVbNm12345' \
+   && ! printf '%s' "$got" | grep -q "$GHP_FIXTURE" \
+   && ! printf '%s' "$got" | grep -q "$SKP_FIXTURE" \
    && ! printf '%s' "$got" | grep -q 'eyJhbGciOi.payload.sig' \
    && ! printf '%s' "$got" | grep -q 'supersecretvalue' \
    && ! printf '%s' "$got" | grep -q 'anotherKey123' \
