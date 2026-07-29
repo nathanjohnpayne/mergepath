@@ -422,7 +422,12 @@ fi
 # is a checked scope, so a fixed three-command `--local` block would
 # print instructions that clear nothing and leave the next run failing
 # identically. Each command is generated from a real offender, and each
-# names the repository the check inspected.
+# names the repository the check inspected. The count is asserted
+# EXACTLY, so the block is neither short a key nor padded by a duplicate.
+# Two of these three offenders share one scope AND one origin file, which
+# is what makes the count per OFFENDER — per distinct key and scope and
+# origin file — rather than per scope/origin: describing it either as
+# "one per key" or as "one per scope and file" miscounts this very case.
 SIGREPO="$WORKDIR/sigrepo"
 git init -q -b main "$SIGREPO"
 git -C "$SIGREPO" config --local extensions.worktreeConfig true
@@ -433,13 +438,15 @@ set +e
 OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$SIGREPO" bash "$CHECK" 2>&1)"
 RC=$?
 set -e
+REMEDY_COUNT="$(printf '%s\n' "$OUT" | grep -cE '^[[:space:]]+git -C ' || true)"
 if [ "$RC" = "1" ] \
   && printf '%s' "$OUT" | grep -qF -- "git -C \"$SIGREPO\" config --local --unset-all user.signingkey" \
   && printf '%s' "$OUT" | grep -qF -- "git -C \"$SIGREPO\" config --local --unset-all tag.gpgsign" \
-  && printf '%s' "$OUT" | grep -qF -- "git -C \"$SIGREPO\" config --worktree --unset-all user.email"; then
+  && printf '%s' "$OUT" | grep -qF -- "git -C \"$SIGREPO\" config --worktree --unset-all user.email" \
+  && [ "$REMEDY_COUNT" = "3" ]; then
   pass "remediation: one unset command per offender, in its own scope"
 else
-  fail "remediation commands: rc=$RC out=$OUT"
+  fail "remediation commands: rc=$RC count=$REMEDY_COUNT out=$OUT"
 fi
 
 # ... and running exactly those commands must actually clear the repo.
