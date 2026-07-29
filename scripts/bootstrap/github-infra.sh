@@ -10,7 +10,10 @@
 #      remote — the `gh-pr-guard.sh` "never push to main" hook does NOT
 #      apply because there's no `main` to protect yet. The two halves
 #      are separate commands so the create can be checkpointed the
-#      moment it succeeds and a failed push stays retryable (#790).
+#      moment it succeeds and a failed push stays retryable (#790) —
+#      both run under the SAME verified author credential, the create
+#      via bootstrap::run_author_gh and the push via
+#      bootstrap::run_author_git.
 #   2. Seed the 12 canonical labels (needs-external-review,
 #      needs-human-review, policy-violation, human-hold,
 #      human-action, decision-needed, agent-action, phase-0..4).
@@ -354,7 +357,26 @@ bootstrap::_create_remote_and_push() {
     # no-op under --dry-run, so a dry run never claims a remote it did
     # not create. The record names the repo that was actually created,
     # which is what both consumers match on.
-    bootstrap::record_checkpoint "$(bootstrap::github_infra_remote_checkpoint "$full_repo")"
+    #
+    # A live write that does NOT land fails the stage right here, before
+    # the push. The stage runs under `|| stage_rc=$?`, so errexit is
+    # disabled through this call chain and an unchecked append would
+    # simply carry on — straight into the state this whole checkpoint
+    # exists to prevent. The remote is already created; if anything
+    # later aborts with nothing recording it, preflight refuses the
+    # documented `--resume template-mirror` retry and the create cannot
+    # be repeated either. Stopping on the spot leaves one unrecorded
+    # remote and a message naming it, which is recoverable; carrying on
+    # gambles the whole run on nothing else failing.
+    local checkpoint_name checkpoint_file
+    checkpoint_name="$(bootstrap::github_infra_remote_checkpoint "$full_repo")"
+    checkpoint_file="${BOOTSTRAP_STATE_FILE:-}.checkpoints"
+    if ! bootstrap::record_checkpoint "$checkpoint_name"; then
+      bootstrap::err "github-infra: the remote $full_repo was CREATED, but the resume checkpoint could not be written to $checkpoint_file"
+      bootstrap::err "github-infra: failing the stage here rather than pushing on — an abort later with no checkpoint leaves a remote that exists, a create that cannot be repeated, and a --resume that preflight refuses"
+      bootstrap::err "github-infra: fix the sidecar (unwritable path / full disk) or append the line '$checkpoint_name' to $checkpoint_file by hand, then re-run with --resume template-mirror"
+      return 1
+    fi
   fi
 
   # Push the bootstrap commit. This legitimately populates main on a
@@ -366,9 +388,22 @@ bootstrap::_create_remote_and_push() {
   # branch stage B's `git init -b main` left checked out, and `-u` sets
   # the upstream `gh repo create --push` used to set. Re-running against
   # an already-pushed remote is an "Everything up-to-date" no-op.
+  #
+  # bootstrap::run_author_git, NOT bootstrap::run: splitting the create
+  # from the push must not split them off the author credential. As one
+  # `gh repo create --source --push`, the single bootstrap::run_author_gh
+  # call covered both halves — gh pushed under the author token
+  # scripts/gh-as-author.sh had resolved and verified. A bare
+  # bootstrap::run would create the repository with that token and then
+  # push with the machine's ambient credential-helper state instead:
+  # failing or prompting on a clean or non-author setup, and — where
+  # another configured account has access — populating this new repo's
+  # main under the wrong identity. The helper keeps the two halves on
+  # one verified credential, which is the whole point of the
+  # author/reviewer separation.
   local push_rc=0
-  bootstrap::run "push bootstrap commit to $full_repo" \
-    git -C "$target" push -u origin HEAD || push_rc=$?
+  bootstrap::run_author_git "push bootstrap commit to $full_repo" \
+    -C "$target" push -u origin HEAD || push_rc=$?
   if [ "$push_rc" -ne 0 ]; then
     bootstrap::err "github-infra: the remote $full_repo EXISTS (created and checkpointed) but the bootstrap commit did not push (rc=$push_rc)"
     bootstrap::err "github-infra: fix the push cause (network / git credentials) and re-run with --resume template-mirror — the checkpoint makes the retry skip the create and repeat only the push"

@@ -9,7 +9,8 @@
 # we assert against the log:
 #
 #   1. `gh repo create` is invoked with the right flags (visibility,
-#      description, source, --push).
+#      description, source — and NOT --push, which is now its own
+#      command under the same verified author credential).
 #   2. All 12 canonical labels are seeded with --force (idempotency).
 #   3. Reviewer invitations land via `gh api -X PUT` to the right
 #      collaborator endpoint for each agent in BOOTSTRAP_INPUT_REVIEWERS.
@@ -1739,6 +1740,223 @@ grep -q "^github-infra\$" "$TARGET14/.bootstrap-state" \
   && pass "resume records github-infra completion" \
   || fail "state file still missing github-infra: $(cat "$TARGET14/.bootstrap-state" 2>/dev/null)"
 rm -f "$SHIM_DIR/op"
+
+# --- assertion 18f: the split push still runs under the VERIFIED author
+# credential (#790 round 4).
+#
+# As one `gh repo create --source --push`, a single bootstrap::run_author_gh
+# call covered both halves: gh created the remote AND pushed under the
+# author token scripts/gh-as-author.sh had resolved and verified.
+# Splitting the commands must not split them off that credential. A bare
+# `git push` takes its credential from the machine's ambient
+# credential-helper state instead — it fails or prompts on a clean or
+# non-author setup, and where some OTHER configured account has access it
+# silently populates the new repo's main under the wrong identity, which
+# is the mis-attribution class this repo's author/reviewer separation
+# exists to make impossible.
+#
+# Driven through a REAL wrapper (BOOTSTRAP_SKIP_AUTHOR_TOKEN=0), so
+# nothing reaches gh or git without passing through
+# scripts/gh-as-author.sh first, and the stand-in wrapper records every
+# command it was handed.
+# ---------------------------------------------------------------------------
+# $1 = fake-root dir holding scripts/gh-as-author.sh, $2 = target dir,
+# $3 = owner/name to create, $4 = file the wrapper appends its argv to.
+run_create_and_push_case() {
+  PATH="$SHIM_PATH" SHIM_LOG="$SHIM_LOG" WRAPPER_LOG="$4" bash -c '
+    ROOT="'"$ROOT"'"
+    . "$ROOT/scripts/bootstrap/_lib.sh"
+    . "$ROOT/scripts/bootstrap/github-infra.sh"
+    BOOTSTRAP_MERGEPATH_ROOT="'"$1"'"
+    BOOTSTRAP_STATE_FILE="'"$2"'/.bootstrap-state"
+    BOOTSTRAP_DRY_RUN=0
+    BOOTSTRAP_SKIP_AUTHOR_TOKEN=0
+    rc=0
+    bootstrap::_create_remote_and_push \
+      "'"$3"'" private "a test repo" "'"$2"'" || rc=$?
+    echo "RC=$rc"
+  ' 2>&1
+}
+
+# A target tree in the state stage B leaves behind: a git repo on main
+# with one commit and no origin (the gh shim adds origin on create).
+mk_push_target() {
+  rm -rf "$1"
+  mkdir -p "$1"
+  git -C "$1" init -q -b main
+  echo seed >"$1/README.md"
+  git -C "$1" add README.md
+  git -C "$1" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+    commit -q -m "Initial commit (bootstrapped from mergepath)"
+}
+
+FAKE_ROOT_AUTHPUSH="$WORKDIR/fake-root-author-push"
+rm -rf "$FAKE_ROOT_AUTHPUSH"
+mkdir -p "$FAKE_ROOT_AUTHPUSH/scripts"
+cat >"$FAKE_ROOT_AUTHPUSH/scripts/gh-as-author.sh" <<'AUTHPUSH_EOF'
+#!/bin/sh
+# Stand-in for scripts/gh-as-author.sh. Records the command it was asked
+# to run — which is what proves a call went through the verified author
+# path at all — and then runs it the way the real wrapper does: the
+# resolved author token in GH_TOKEN, GITHUB_TOKEN cleared.
+printf '%s\n' "$*" >>"${WRAPPER_LOG:?WRAPPER_LOG not set}"
+[ "$1" = "--" ] && shift
+unset GITHUB_TOKEN
+GH_TOKEN="fake-author-token-for-the-push" exec "$@"
+AUTHPUSH_EOF
+chmod +x "$FAKE_ROOT_AUTHPUSH/scripts/gh-as-author.sh"
+
+: >"$SHIM_LOG"
+T18F="$WORKDIR/new-repo-author-push"
+WRAPPER_LOG18F="$WORKDIR/wrapper-author-push.log"
+mk_push_target "$T18F"
+: >"$WRAPPER_LOG18F"
+set +e
+ap_out=$(run_create_and_push_case "$FAKE_ROOT_AUTHPUSH" "$T18F" \
+           "nathanjohnpayne/authpush-repo" "$WRAPPER_LOG18F")
+ap_ec=$?
+set -e
+echo "$ap_out" | grep -q "RC=0" && [ "$ap_ec" -eq 0 ] \
+  && pass "author-credential harness completes step 1 end to end (rc=0)" \
+  || fail "author-credential harness misbehaved; rc=$ap_ec; out: $ap_out"
+# Sanity: the create half was always wrapped, so a wrapper log that
+# recorded nothing would mean the harness never ran, not that the push
+# is unwrapped.
+grep -qF "gh repo create nathanjohnpayne/authpush-repo" "$WRAPPER_LOG18F" \
+  && pass "the create runs through the author wrapper (harness is live)" \
+  || fail "the wrapper recorded no create; log: $(cat "$WRAPPER_LOG18F")"
+# The finding itself.
+# `|| true`: with `set -o pipefail` a no-match grep would abort the whole
+# suite on the assignment, and a regression here has to be REPORTED, not
+# turned into a silent early exit that skips every assertion after it.
+push_line=$(grep -F "push -u origin HEAD" "$WRAPPER_LOG18F" | tail -1 || true)
+[ -n "$push_line" ] \
+  && pass "the bootstrap push runs through the author wrapper too" \
+  || fail "the push never reached the author wrapper (ambient git credentials); log: $(cat "$WRAPPER_LOG18F")"
+# ...and carries the credential wiring, so the wrapper's token is what
+# git authenticates with rather than whatever helper the machine had
+# configured. The reset and the gh helper must be adjacent and in that
+# order: an appended helper without the reset leaves the inherited ones
+# ahead of it in the list.
+printf '%s\n' "$push_line" \
+  | grep -qF -- "-c credential.helper= -c credential.helper=!gh auth git-credential" \
+  && pass "the push clears inherited credential helpers and takes gh's" \
+  || fail "push carries no gh credential wiring: $push_line"
+printf '%s\n' "$push_line" | grep -qF "GIT_TERMINAL_PROMPT=0" \
+  && pass "the push disables git's terminal prompt" \
+  || fail "push can still prompt on the terminal: $push_line"
+printf '%s\n' "$push_line" | grep -qF "GIT_ASKPASS=" \
+  && pass "the push closes the askpass prompt path" \
+  || fail "push can still raise an askpass dialog: $push_line"
+# The credential travels over the helper protocol, so it must not appear
+# in the remote URL or anywhere else git wrote to disk (reflog included).
+git -C "$T18F" remote get-url origin | grep -qF "fake-author-token" \
+  && fail "the token leaked into the remote URL: $(git -C "$T18F" remote get-url origin)" \
+  || pass "the remote URL carries no token"
+grep -rqF "fake-author-token-for-the-push" "$T18F/.git" 2>/dev/null \
+  && fail "the token leaked into the local git dir (config / reflog)" \
+  || pass "the token stays out of the local git dir"
+grep -rqF "fake-author-token-for-the-push" "$WORKDIR/remotes/authpush-repo.git" 2>/dev/null \
+  && fail "the token leaked into the remote repository" \
+  || pass "the token stays out of the remote repository"
+# And it really pushed — the wiring must not have broken the transfer.
+git -C "$WORKDIR/remotes/authpush-repo.git" rev-parse --verify -q refs/heads/main >/dev/null \
+  && pass "the wrapped push still lands the bootstrap commit on the remote" \
+  || fail "remote has no main after the wrapped push"
+
+# --- assertion 18g: the credential wiring the push carries really does
+# resolve the wrapper's token — checked against the REAL git and gh.
+#
+# Asserting the flags are PRESENT only proves the shape. The flags are
+# taken straight from $BOOTSTRAP_GIT_CREDENTIAL_ARGS / the non-interactive
+# env, so this probe cannot drift from what ships, and it runs the real
+# tools: `gh auth git-credential get` answers from $GH_TOKEN with no
+# network call, so a fake token is enough to show which credential git
+# would hand the remote. Nothing here contacts GitHub.
+#
+# The probe output is never echoed. With the wiring broken the fallback
+# is the developer's own credential helper, and that answer can be a
+# REAL token.
+# ---------------------------------------------------------------------------
+if command -v gh >/dev/null 2>&1; then
+  PROBE_TOKEN="probe-token-not-a-real-credential-4f2a"
+  set +e
+  probe_out=$(
+    . "$ROOT/scripts/bootstrap/_lib.sh"
+    printf 'protocol=https\nhost=github.com\n\n' \
+      | env -u GITHUB_TOKEN GH_TOKEN="$PROBE_TOKEN" \
+            "${BOOTSTRAP_GIT_NONINTERACTIVE_ENV[@]}" \
+            git "${BOOTSTRAP_GIT_CREDENTIAL_ARGS[@]}" credential fill 2>&1
+  )
+  set -e
+  probe_pw=$(printf '%s\n' "$probe_out" | sed -n 's/^password=//p')
+  probe_rest=$(printf '%s\n' "$probe_out" | grep -v '^password=' || true)
+  [ "$probe_pw" = "$PROBE_TOKEN" ] \
+    && pass "the shipped credential wiring resolves git's password from the wrapper's GH_TOKEN" \
+    || fail "credential wiring did not yield the wrapper's token (password line redacted); other output: $probe_rest"
+  printf '%s\n' "$probe_rest" | grep -qF "username=x-access-token" \
+    && pass "gh answers the credential request as the token-bearing user" \
+    || fail "unexpected credential username; output: $probe_rest"
+else
+  echo "SKIP: gh not installed — cannot probe the real credential helper" >&2
+fi
+
+# --- assertion 18h: a checkpoint that does not get written fails the
+# stage before the push (#790 round 4).
+#
+# bootstrap::record_checkpoint is called immediately after the one
+# irreversible act in the stage, and its rc was ignored. Stage functions
+# run under `|| stage_rc=$?`, so errexit is disabled through this whole
+# call chain: an append that failed (unwritable sidecar, full disk) did
+# not stop anything. The run carried on to the push, the labels, the
+# invites and the secret — and an abort in any of them left the remote
+# created with nothing recording it, which is the state the checkpoint
+# was added to prevent: the create cannot be repeated and preflight
+# refuses the documented `--resume template-mirror`.
+#
+# The sidecar is made unwritable by putting a DIRECTORY where the append
+# expects a file. That fails for every user including root, unlike a
+# chmod a root test runner would sail straight through.
+# ---------------------------------------------------------------------------
+: >"$SHIM_LOG"
+T18H="$WORKDIR/new-repo-checkpoint-unwritable"
+WRAPPER_LOG18H="$WORKDIR/wrapper-checkpoint-fail.log"
+mk_push_target "$T18H"
+: >"$WRAPPER_LOG18H"
+mkdir -p "$T18H/.bootstrap-state.checkpoints"
+set +e
+cf_out=$(run_create_and_push_case "$FAKE_ROOT_AUTHPUSH" "$T18H" \
+           "nathanjohnpayne/checkpointfail-repo" "$WRAPPER_LOG18H")
+cf_ec=$?
+set -e
+echo "$cf_out" | grep -q "RC=0" \
+  && fail "an unrecorded create was treated as success; out: $cf_out" \
+  || pass "a checkpoint write that does not land fails the stage"
+[ "$cf_ec" -eq 0 ] \
+  && pass "checkpoint-failure harness ran to completion" \
+  || fail "checkpoint-failure harness misbehaved; rc=$cf_ec; out: $cf_out"
+# It must be the POST-create path being tested: the create really ran.
+grep -q "^gh repo create nathanjohnpayne/checkpointfail-repo " "$SHIM_LOG" \
+  && pass "the irreversible create happened before the checkpoint write" \
+  || fail "the run never reached gh repo create; log: $(cat "$SHIM_LOG")"
+# ...and the stage stopped there rather than pushing on.
+grep -qF "push -u origin HEAD" "$WRAPPER_LOG18H" \
+  && fail "the stage pushed past an unrecorded create; log: $(cat "$WRAPPER_LOG18H")" \
+  || pass "the stage does not push past an unrecorded create"
+git -C "$WORKDIR/remotes/checkpointfail-repo.git" rev-parse --verify -q refs/heads/main >/dev/null 2>&1 \
+  && fail "the bootstrap commit was pushed despite the failed checkpoint" \
+  || pass "nothing reached the remote after the failed checkpoint"
+# The operator has to be able to repair it by hand — the remote exists
+# and the create cannot be repeated.
+echo "$cf_out" | grep -qF "resume checkpoint could not be written" \
+  && pass "the failure names the checkpoint write as the cause" \
+  || fail "no checkpoint-write diagnostic; out: $cf_out"
+echo "$cf_out" | grep -qF "github-infra:remote-created:nathanjohnpayne/checkpointfail-repo" \
+  && pass "the failure prints the exact line to add by hand" \
+  || fail "no manual-repair line emitted; out: $cf_out"
+echo "$cf_out" | grep -qF -- "--resume template-mirror" \
+  && pass "the failure points at the documented resume path" \
+  || fail "no resume remediation; out: $cf_out"
 
 # --- assertion 19: a failed temp-dir allocation refuses the secret
 # write instead of misreporting it (#790).

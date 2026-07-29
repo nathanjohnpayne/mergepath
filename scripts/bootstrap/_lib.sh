@@ -16,6 +16,11 @@
 #                                      was actually reached.
 #   bootstrap::run_author_gh <label> [...]  Logged bootstrap::run wrapper around
 #                                      bootstrap::author_gh for gh side-effects.
+#   bootstrap::run_author_git <label> [...] Logged bootstrap::run wrapper for a
+#                                      git command that talks to GitHub: same
+#                                      verified author wrapper, with git's
+#                                      credential bound to that token and all
+#                                      interactive prompting disabled.
 #   bootstrap::append_log_diagnostic <label> <file>
 #                                      Append captured command output to
 #                                      $BOOTSTRAP_LOG_FILE. Returns 0 only if
@@ -32,6 +37,10 @@
 #   bootstrap::record_checkpoint <name> Record that an irreversible sub-stage
 #                                      step succeeded, in
 #                                      "${BOOTSTRAP_STATE_FILE}.checkpoints".
+#                                      Returns 0 only if the record was really
+#                                      persisted — callers standing between an
+#                                      irreversible step and the work after it
+#                                      MUST check it.
 #   bootstrap::has_checkpoint <name>    True iff that checkpoint is recorded.
 #   bootstrap::last_completed_stage    Echo the last recorded stage name,
 #                                      or empty if no state file.
@@ -254,6 +263,109 @@ bootstrap::run_author_gh() {
   bootstrap::run "$label" env GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- gh "$@"
 }
 
+# The git flags that bind a GitHub-talking git command's credential to
+# the token scripts/gh-as-author.sh resolved and verified, instead of to
+# whatever the machine's ambient credential-helper configuration happens
+# to hold.
+#
+# `-c credential.helper=` clears every inherited helper (an empty value
+# RESETS the list, it does not append), and the second `-c` then makes
+# gh the only helper: `gh auth git-credential get` answers
+# `username=x-access-token` + `password=$GH_TOKEN` straight from the
+# environment, with no network call, no keychain and no prompt. `gh` is
+# named bare because git runs the helper through a shell and the
+# wizard's preflight already requires gh on PATH.
+#
+# This covers the HTTPS remote `gh repo create --source` writes by
+# default. If the operator's gh is configured for the ssh protocol the
+# remote is an ssh URL, no credential helper is consulted at all, and
+# the push authenticates by key — exactly as gh's own `--push` did, so
+# the split changes nothing there either.
+#
+# This is not a new mechanism — it is the one `gh` itself was using.
+# `gh repo create --source --push` performed its push through gh's
+# internal AuthenticatedCommand, which prepends these same two flags
+# before running git. Splitting the create from the push (#790) put the
+# credential wiring back where gh had had it.
+#
+# Exposed as a named array rather than typed inline at the call site
+# because tests exercise the REAL mechanism through it: a probe that
+# retyped the flags could keep passing while the shipped ones drifted.
+BOOTSTRAP_GIT_CREDENTIAL_ARGS=(
+  -c credential.helper=
+  -c 'credential.helper=!gh auth git-credential'
+)
+
+# Keep a credential miss non-interactive: an unattended bootstrap must
+# fail with a diagnosable error rather than block on a prompt nobody is
+# there to answer.
+#
+# GIT_ASKPASS is set EMPTY rather than left unset on purpose. git reads
+# core.askPass and then SSH_ASKPASS only when GIT_ASKPASS is absent from
+# the environment, and treats a present-but-empty value as "no askpass
+# program" — so setting it blank closes the GUI-prompt path that
+# GIT_TERMINAL_PROMPT=0 (which only suppresses the terminal prompt)
+# leaves open.
+BOOTSTRAP_GIT_NONINTERACTIVE_ENV=(
+  GIT_TERMINAL_PROMPT=0
+  GIT_ASKPASS=
+)
+
+# Run a git command that talks to GitHub under the same verified author
+# credential path as bootstrap::run_author_gh.
+#
+# A git push does not carry gh's authentication for free. Left to
+# itself, git takes its credential from the machine's ambient helper
+# state, which is not this bootstrap's identity: on a clean or
+# non-author machine the push fails or prompts, and on a machine where
+# some OTHER configured account has access it silently populates the new
+# repo's main under the wrong login. Author/reviewer separation exists
+# to make exactly that impossible, so a GitHub-writing git command gets
+# the same treatment as a GitHub-writing gh command — the wrapper
+# resolves and verifies the author token, and
+# $BOOTSTRAP_GIT_CREDENTIAL_ARGS points git's credential at it.
+#
+# The token stays out of argv, out of the remote URL and out of the
+# reflog: the helper hands it to git over the credential protocol on
+# stdin, and nothing rewrites the remote.
+#
+# Usage:
+#   bootstrap::run_author_git "push bootstrap commit" -C "$dir" push -u origin HEAD
+#
+# `git` itself and its credential flags are owned HERE, not by the
+# caller: `-c` is a top-level git option and must precede the
+# subcommand, which a caller-supplied argv cannot be relied on to
+# arrange. Callers pass everything after `git`, mirroring
+# bootstrap::run_author_gh, where `gh` is likewise implicit.
+bootstrap::run_author_git() {
+  local label=$1
+  shift
+  if [ "$#" -eq 0 ]; then
+    bootstrap::err "bootstrap::run_author_git requires git arguments after the label"
+    return 64
+  fi
+
+  set -- env "${BOOTSTRAP_GIT_NONINTERACTIVE_ENV[@]}" \
+         git "${BOOTSTRAP_GIT_CREDENTIAL_ARGS[@]}" "$@"
+
+  if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ] || [ "${BOOTSTRAP_SKIP_AUTHOR_TOKEN:-0}" = "1" ]; then
+    bootstrap::run "$label" "$@"
+    return $?
+  fi
+
+  local wrapper author_identity
+  wrapper="$(bootstrap::author_wrapper)"
+  author_identity="$(bootstrap::author_identity)"
+  if [ ! -x "$wrapper" ]; then
+    bootstrap::err "author gh wrapper missing or non-executable: $wrapper"
+    bootstrap::err "refusing to run a GitHub write without token verification"
+    return 2
+  fi
+
+  bootstrap::run "$label" \
+    env GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- "$@"
+}
+
 # Append a captured diagnostic to $BOOTSTRAP_LOG_FILE, so the audit
 # trail holds the failing layer's OWN words rather than only the
 # caller's one-line summary of them.
@@ -402,6 +514,20 @@ bootstrap::clear_warning() {
 # diverge from bootstrap::record_stage / bootstrap::record_warning, which
 # both write in dry-run: those record what the wizard SAID, this records
 # what it DID.)
+#
+# Returns 0 ONLY when the checkpoint is recorded — already present, or
+# just appended — or when there is nothing to record because no state
+# file is configured or this is a dry run. A live write that does not
+# land (unwritable sidecar, full disk) returns non-zero, and the caller
+# standing between an irreversible step and everything after it MUST
+# check that. Its stage runs under `|| stage_rc=$?`, which disables
+# errexit for this whole call chain, so an unchecked call simply carries
+# on into the work the record was supposed to protect.
+#
+# The two writes are checked individually rather than left to the
+# function's last-command exit status: `mkdir -p` failing and the append
+# failing are both "the record did not land", and only an explicit
+# return says so for certain.
 bootstrap::record_checkpoint() {
   local name=$1
   if [ -z "${BOOTSTRAP_STATE_FILE:-}" ] || [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
@@ -410,8 +536,8 @@ bootstrap::record_checkpoint() {
   if bootstrap::has_checkpoint "$name"; then
     return 0
   fi
-  mkdir -p "$(dirname "$BOOTSTRAP_STATE_FILE")"
-  printf '%s\n' "$name" >>"${BOOTSTRAP_STATE_FILE}.checkpoints"
+  mkdir -p "$(dirname "$BOOTSTRAP_STATE_FILE")" || return 1
+  printf '%s\n' "$name" >>"${BOOTSTRAP_STATE_FILE}.checkpoints" || return 1
 }
 
 bootstrap::has_checkpoint() {
