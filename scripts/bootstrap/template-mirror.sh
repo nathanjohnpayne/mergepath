@@ -301,7 +301,9 @@ bootstrap::stage_template_mirror() {
 
   # Step 5b: scaffold neutral consumer identity docs (#744/#747). The
   # rsync excluded BRAND.md + docs/agents/repository-overview.md (pure
-  # mergepath identity) and the three hub-only docs; this writes honest
+  # mergepath identity) and every hub-only machinery doc listed in
+  # BOOTSTRAP_MIRROR_EXCLUDES (do not restate that set as a count here
+  # — it grew by one in #780 and will grow again); this writes honest
   # consumer stubs for the former, scrubs the AGENTS.md packaging
   # note (packaging/ is a mergepath-only dir, also excluded), scrubs
   # the README.md hub identity + dead Key-Files rows (#747), and
@@ -426,8 +428,10 @@ bootstrap::_reset_phase_4b_enabled() {
 
 # Scaffold neutral consumer identity docs and scrub mergepath-only
 # identity from shared docs (#744/#747). The rsync excluded BRAND.md +
-# docs/agents/repository-overview.md (pure mergepath identity) and the
-# three hub-only docs; this writes honest consumer stubs for the two
+# docs/agents/repository-overview.md (pure mergepath identity) and every
+# hub-only machinery doc listed in BOOTSTRAP_MIRROR_EXCLUDES (that set
+# is the single source of truth — it is deliberately not restated as a
+# count here); this writes honest consumer stubs for the two
 # excluded identity docs and removes the AGENTS.md "Repository Layout"
 # section that documents the mergepath-only `packaging/` dir. The mixed
 # doc .ai_context.md keeps its shared content — its one false line is

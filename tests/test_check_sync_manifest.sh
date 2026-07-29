@@ -1062,11 +1062,39 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   #       deliberately does not match them, nor `#issuecomment-<id>`.
   #   (b) a reference to hub-only machinery — the propagation manifest,
   #       the sync engine, the wave audit, the bootstrap seeders, the
-  #       weekly sweep, or the three hub-only machinery docs. None of
-  #       these exist in a consumer checkout, so naming them as
-  #       something the reader can run or read is false there.
+  #       weekly sweep, or any hub-only machinery doc. None of these
+  #       exist in a consumer checkout, so naming them as something the
+  #       reader can run or read is false there.
+  #
+  # The machinery-doc half of tell (b) is DERIVED from the live
+  # manifest's `doc_ownership:` block (`class: hub-only`), not restated
+  # here. A hard-coded list silently stops tracking the manifest the
+  # moment the set changes: it was three docs until #780 added
+  # docs/agents/coderabbit-audit.md, and this scanner kept scanning for
+  # the old three. Case 41 pins the derivation in both directions.
   BARE_ISSUE_RE='(^|[^A-Za-z0-9_/-])#[0-9]+'
-  HUB_ONLY_RE='\.mergepath-sync\.yml|sync-to-downstream\.sh|wave-audit\.sh|scripts/bootstrap/|sweep-unresolved-feedback|docs/agents/(bootstrap-runbook|propagation-ordering|templated-propagation)\.md'
+  set +e
+  hub_only_docs=$(yq -r '
+    .doc_ownership[]
+    | select(.class == "hub-only")
+    | .path
+  ' "$LIVE_MANIFEST" | grep -E '^docs/agents/.+\.md$'); hub_rc=$?
+  set -e
+  # Escape the path separators that are regex metacharacters ('.' only —
+  # '/' is literal in ERE) and join into one alternation.
+  hub_only_alt=$(printf '%s\n' "$hub_only_docs" \
+    | sed -E 's/\./\\./g' \
+    | tr '\n' '|' | sed -E 's/\|+$//')
+  HUB_ONLY_MACHINERY_RE='\.mergepath-sync\.yml|sync-to-downstream\.sh|wave-audit\.sh|scripts/bootstrap/|sweep-unresolved-feedback'
+  if [ "$hub_rc" != "0" ] || [ -z "$hub_only_alt" ]; then
+    # Fail closed: an empty derivation would silently narrow tell (b)
+    # to the machinery half and pass every doc that names a hub-only
+    # doc — the exact blind spot this guard exists to prevent.
+    fail "Case 37: could not derive any hub-only docs/agents entry from $LIVE_MANIFEST doc_ownership (rc=$hub_rc) — the tell-(b) doc scan would be blind"
+    HUB_ONLY_RE="$HUB_ONLY_MACHINERY_RE"
+  else
+    HUB_ONLY_RE="$HUB_ONLY_MACHINERY_RE|$hub_only_alt"
+  fi
 
   # Tell (a) scans PROSE ONLY. `#<digits>` is not an issue reference
   # inside a fenced code block (a CSS hex colour `#336699`, a literal in
@@ -1347,8 +1375,43 @@ SPAN_EOF
     pass "Case 40: inline code spans strip by delimiter run length (``#NN`` is code, unmatched run is prose)"
   fi
 
+  # Case 41: tell (b)'s hub-only doc set tracks the live manifest.
+  #
+  # Case 37 only ever exercises the NEGATIVE branch of the doc half of
+  # tell (b) — no canonical agent doc in the live tree names a hub-only
+  # doc — so an alternation that has silently drifted behind the
+  # manifest still passes it. That is not hypothetical: #780 added
+  # docs/agents/coderabbit-audit.md to the hub-only class and the
+  # hard-coded alternation kept scanning for the previous three, so a
+  # canonical doc could have linked it and shipped a 404 to every
+  # consumer unnoticed. This case pins both directions against the
+  # manifest: every declared `class: hub-only` doc must match, and a
+  # canonical sibling in the same directory must not.
+  hub_unmatched=""
+  while IFS= read -r hub_doc; do
+    [ -n "$hub_doc" ] || continue
+    if ! printf 'See `%s` for the details.\n' "$hub_doc" | grep -qE "$HUB_ONLY_RE"; then
+      hub_unmatched="$hub_unmatched $hub_doc"
+    fi
+  done <<< "$hub_only_docs"
+  canon_false_pos=""
+  while IFS= read -r canon_doc; do
+    [ -n "$canon_doc" ] || continue
+    if printf 'See `%s` for the shared rule.\n' "$canon_doc" | grep -qE "$HUB_ONLY_RE"; then
+      canon_false_pos="$canon_false_pos $canon_doc"
+    fi
+  done <<< "$canon_docs"
+  hub_declared=$(printf '%s\n' "$hub_only_docs" | grep -c . || true)
+  if [ -n "$hub_unmatched" ]; then
+    fail "Case 41: HUB_ONLY_RE does not match hub-only doc(s) the manifest declares (the alternation has drifted behind doc_ownership):$hub_unmatched"
+  elif [ -n "$canon_false_pos" ]; then
+    fail "Case 41: HUB_ONLY_RE matches canonical doc path(s) it must not:$canon_false_pos"
+  else
+    pass "Case 41: tell-(b) hub-only alternation covers all $hub_declared manifest-declared hub-only docs and no canonical sibling"
+  fi
+
 else
-  echo "SKIP: Cases 36-40 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-41 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo

@@ -545,21 +545,29 @@ done
   && pass "ai_agent_tooling_standard.md kept in the consumer (Standard, not machinery)" \
   || fail "ai_agent_tooling_standard.md was wrongly excluded from the consumer"
 
-# --- assertion 4b2: the SPEC names every docs/agents/ exclusion ------
-# specs/bootstrap_consumer_identity.md is the ground-truth acceptance
-# criteria for this stage, and its preservation boundary reads
-# "everything not named above flows through the mirror untouched". A
-# docs/agents/ path added to BOOTSTRAP_MIRROR_EXCLUDES without a
-# matching spec bullet therefore makes the spec state the opposite of
-# what the code does — which is exactly what happened when
-# coderabbit-audit.md was added while the spec still said "the three
-# hub-only machinery docs" (#797 review). Read the exclude list from the
-# implementation rather than restating it: a second hard-coded copy is
-# the drift this guard exists to catch.
-SPEC_FILE="$ROOT/specs/bootstrap_consumer_identity.md"
+# --- assertion 4b2: every PROSE statement of the exclusion set is whole -
+# Two live documents enumerate the docs/agents/ mirror exclusions:
+# specs/bootstrap_consumer_identity.md (the ground-truth acceptance
+# criteria, whose preservation boundary reads "everything not named
+# above flows through the mirror untouched") and
+# docs/agents/bootstrap-runbook.md step 5 (the operator runbook read
+# while actually running the wizard). A docs/agents/ path added to
+# BOOTSTRAP_MIRROR_EXCLUDES without a matching entry in BOTH therefore
+# makes a live document state the opposite of what the code does — which
+# is exactly what happened when coderabbit-audit.md was added while both
+# the spec and the runbook still enumerated only the original three
+# machinery docs (#797 review). An operator trusting the runbook writes
+# a consumer-side doc linking a file the mirror never delivered, and the
+# link 404s.
+#
+# Read the exclude list from the implementation rather than restating
+# it: a second hard-coded copy is the drift this guard exists to catch.
 MIRROR_LIB="$ROOT/scripts/bootstrap/template-mirror.sh"
-if [ -f "$SPEC_FILE" ] && [ -f "$MIRROR_LIB" ]; then
-  spec_gap=""
+EXCLUSION_PROSE_SURFACES=(
+  specs/bootstrap_consumer_identity.md
+  docs/agents/bootstrap-runbook.md
+)
+if [ -f "$MIRROR_LIB" ]; then
   excluded_docs=$(awk '
     /^BOOTSTRAP_MIRROR_EXCLUDES=\(/ { inside = 1; next }
     inside && /^\)/                 { inside = 0 }
@@ -570,14 +578,47 @@ if [ -f "$SPEC_FILE" ] && [ -f "$MIRROR_LIB" ]; then
   if [ -z "$excluded_docs" ]; then
     fail "could not read any docs/agents/ entry out of BOOTSTRAP_MIRROR_EXCLUDES — the array shape changed and this guard is now blind"
   else
-    while IFS= read -r excluded; do
-      [ -n "$excluded" ] || continue
-      grep -qF -- "$excluded" "$SPEC_FILE" || spec_gap="$spec_gap $excluded"
-    done <<< "$excluded_docs"
-    [ -z "$spec_gap" ] \
-      && pass "specs/bootstrap_consumer_identity.md names every docs/agents/ mirror exclusion" \
-      || fail "BOOTSTRAP_MIRROR_EXCLUDES drops docs/agents docs the spec does not name (update the spec's acceptance criteria):$spec_gap"
+    for surface in "${EXCLUSION_PROSE_SURFACES[@]}"; do
+      if [ ! -f "$ROOT/$surface" ]; then
+        fail "exclusion-set prose surface missing: $surface"
+        continue
+      fi
+      prose_gap=""
+      while IFS= read -r excluded; do
+        [ -n "$excluded" ] || continue
+        grep -qF -- "$excluded" "$ROOT/$surface" || prose_gap="$prose_gap $excluded"
+      done <<< "$excluded_docs"
+      [ -z "$prose_gap" ] \
+        && pass "$surface names every docs/agents/ mirror exclusion" \
+        || fail "$surface does not name every docs/agents doc BOOTSTRAP_MIRROR_EXCLUDES drops (update its enumeration):$prose_gap"
+    done
   fi
+fi
+
+# --- assertion 4b3: no hard-coded count of the hub-only doc set -------
+# The exclusion set has already grown once (#780 added a fourth
+# machinery doc) and every prose restatement of its SIZE went stale in
+# place: the runbook's step 5, both step-5b comments in
+# template-mirror.sh, and the tell-(b) scanner comment in
+# tests/test_check_sync_manifest.sh all kept asserting the old number
+# after the new doc landed. A count is unmaintainable by construction —
+# assertion 4b2 can mechanically verify an ENUMERATION against the
+# implementation, but nothing can verify a number written in prose. So
+# the convention is simply: never write one. Name the source of truth
+# (BOOTSTRAP_MIRROR_EXCLUDES, or the manifest's `class: hub-only`
+# entries) and let the enumeration guard do the rest. The pattern is
+# assembled from parts at runtime so this guard does not flag its own
+# source line.
+if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  count_words='one|two|three|four|five|six|seven|eight|nine|ten'
+  count_subject='hub-only'
+  set +e
+  count_prose=$(git -C "$ROOT" grep -nIE "the ($count_words) $count_subject" -- .)
+  set -e
+  [ -z "$count_prose" ] \
+    && pass "no tracked file hard-codes a count of the hub-only doc set" \
+    || fail "hard-coded hub-only doc count(s) found — name BOOTSTRAP_MIRROR_EXCLUDES or the manifest's class: hub-only entries instead of a number:
+$count_prose"
 fi
 
 # --- assertion 4c: AGENTS.md packaging/Repository-Layout scrub (#744) ---
