@@ -252,13 +252,73 @@ else
   fail "exemption marker on a continued command: rc=$RC out=$OUT"
 fi
 
+# Case 15: the marker must not bleed across the lines a backslash joins.
+# An exempt write whose line happens to end in `\` swallows the next
+# physical line into its group — but that line is a self-contained
+# unscoped write and nothing exempts it, so it must still be caught.
+run_on_fixture "tests/bleed-first.sh" '#!/usr/bin/env bash
+git config user.email "t@t"  # GIT_IDENTITY_SCOPE_EXEMPT: fixture, container only \
+git config user.email "leak@example.com"
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/bleed-first.sh:3" \
+  && ! printf '%s' "$OUT" | grep -q "tests/bleed-first.sh:2"; then
+  pass "exempt line joined to an unscoped write: only the write is caught"
+else
+  fail "marker bleeding forward across a join: rc=$RC out=$OUT"
+fi
+
+# Case 16: the same in the other order — the marker arriving LATER in the
+# group must not reach back and exempt the write that opened it.
+run_on_fixture "tests/bleed-second.sh" '#!/usr/bin/env bash
+git config user.email "leak@example.com" \
+git config user.email "t@t"  # GIT_IDENTITY_SCOPE_EXEMPT: fixture, container only
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/bleed-second.sh:2" \
+  && ! printf '%s' "$OUT" | grep -q "tests/bleed-second.sh:3"; then
+  pass "unscoped write joined to an exempt line: still caught"
+else
+  fail "marker bleeding backward across a join: rc=$RC out=$OUT"
+fi
+
+# Case 17: Markdown is where an accidental join is easiest to arrange —
+# a trailing `\` is a hard line break there, not a shell continuation, so
+# an exempt example can end in one with a live write on the next line.
+run_on_fixture "docs/bleed.md" '# Doc
+
+    git config user.email "t@t"  # GIT_IDENTITY_SCOPE_EXEMPT: fixture, container only \
+    git config user.email "leak@example.com"
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "docs/bleed.md:4"; then
+  pass "Markdown hard break after an exempt example: next write still caught"
+else
+  fail "marker bleeding across a Markdown hard break: rc=$RC out=$OUT"
+fi
+
+# Case 18: a group holding more than one offending physical line reports
+# EVERY one of them. Listing only the first hands an operator one line to
+# fix, after which the re-run fails on the next.
+run_on_fixture "tests/two-hits.sh" '#!/usr/bin/env bash
+git config user.email "leak1@example.com" \
+git config user.name "leak2"
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/two-hits.sh:2" \
+  && printf '%s' "$OUT" | grep -q "tests/two-hits.sh:3"; then
+  pass "two offending lines in one joined group: both reported"
+else
+  fail "joined group reporting only its first offender: rc=$RC out=$OUT"
+fi
+
 # ── Part A: the live-repo identity assertion ──────────────────────────
 
 IDREPO="$WORKDIR/idrepo"
 git init -q -b main "$IDREPO"
 printf '#!/usr/bin/env bash\n' > "$IDREPO/marker.sh"
 
-# Case 15: a clean fixture repo passes.
+# Case 19: a clean fixture repo passes.
 set +e
 OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$IDREPO" bash "$CHECK" 2>&1)"
 RC=$?
@@ -269,7 +329,7 @@ else
   fail "fixture repo with no local identity: rc=$RC out=$OUT"
 fi
 
-# Case 16: the exact #777 corruption — a repo-local user block plus a
+# Case 20: the exact #777 corruption — a repo-local user block plus a
 # disabled gpgsign — must fail, naming every offending key.
 git -C "$IDREPO" config --local user.name "nathanjohnpayne"
 git -C "$IDREPO" config --local user.email "nathan@nathanjohnpayne.example"
@@ -288,7 +348,7 @@ else
   fail "repo-local identity override: rc=$RC out=$OUT"
 fi
 
-# Case 17: the remediation must clear the offenders it just reported.
+# Case 21: the remediation must clear the offenders it just reported.
 # `user.signingkey` and `tag.gpgsign` are checked keys, and `--worktree`
 # is a checked scope, so a fixed three-command `--local` block would
 # print instructions that clear nothing and leave the next run failing
@@ -326,7 +386,7 @@ else
   fail "remediation did not clear the failure: rc=$RC out=$OUT"
 fi
 
-# Case 18: a key explicitly set to the EMPTY string is an override too.
+# Case 22: a key explicitly set to the EMPTY string is an override too.
 # It is not "unset": it MASKS the machine's global value, after which
 # `git var GIT_AUTHOR_IDENT` fails outright with "empty ident name", so
 # treating an empty captured value as "nothing configured" would wave
@@ -346,7 +406,7 @@ else
   fail "empty-string local identity value: rc=$RC out=$OUT"
 fi
 
-# Case 19: the documented opt-out for a checkout that wants its own
+# Case 23: the documented opt-out for a checkout that wants its own
 # identity on purpose.
 set +e
 OUT="$(MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1 MERGEPATH_GIT_IDENTITY_ROOT="$IDREPO" bash "$CHECK" 2>&1)"
@@ -358,7 +418,7 @@ else
   fail "MERGEPATH_ALLOW_LOCAL_GIT_IDENTITY=1: rc=$RC out=$OUT"
 fi
 
-# Case 20: clearing the override restores a clean result — the guard
+# Case 24: clearing the override restores a clean result — the guard
 # tracks live state rather than latching.
 git -C "$IDREPO" config --local --unset-all user.name
 git -C "$IDREPO" config --local --unset-all user.email
@@ -375,7 +435,7 @@ fi
 
 # ── Part B: the .git/config baseline comparison ────────────────────────
 
-# Case 21: --snapshot records a baseline and a later run confirms the
+# Case 25: --snapshot records a baseline and a later run confirms the
 # config has not moved. This is the assertion that "running the suite
 # leaves .git/config byte-identical" once the snapshot is taken before
 # the suite and the plain run after it.
@@ -399,7 +459,7 @@ else
   fail "unmodified .git/config: rc=$RC out=$OUT"
 fi
 
-# Case 22: any write to .git/config between snapshot and check fails,
+# Case 26: any write to .git/config between snapshot and check fails,
 # including one the identity assertion would not catch on its own.
 git -C "$IDREPO" config --local core.bigFileThreshold 123m
 set +e
@@ -431,7 +491,7 @@ echo "stub suite: ok"
 exit 0
 EOF
 
-# Case 23: a suite that writes a non-identity key is caught by the
+# Case 27: a suite that writes a non-identity key is caught by the
 # post-suite baseline comparison.
 PAGERREPO="$WORKDIR/pagerrepo"
 git init -q -b main "$PAGERREPO"
@@ -449,7 +509,7 @@ else
   fail "post-suite baseline comparison: rc=$RC out=$OUT"
 fi
 
-# Case 24: a suite that writes an identity key is caught by the
+# Case 28: a suite that writes an identity key is caught by the
 # post-suite live-repo assertion, even with no baseline recorded.
 IDENTSTUB="$WORKDIR/stub-suite-identity.sh"
 cat > "$IDENTSTUB" <<'EOF'
@@ -472,7 +532,7 @@ else
   fail "post-suite identity assertion: rc=$RC out=$OUT"
 fi
 
-# Case 25: the post-suite pass must not turn a clean suite red.
+# Case 29: the post-suite pass must not turn a clean suite red.
 CLEANSTUB="$WORKDIR/stub-suite-clean.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$CLEANSTUB"
 CLEANREPO="$WORKDIR/cleanrepo"

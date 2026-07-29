@@ -404,28 +404,42 @@ else
       }
       return n % 2
     }
-    # Both the exemption marker and the suppressors (`-C`, `--global`,
-    # `--unset`, …) are read off the JOINED command, because they belong
-    # to the same invocation wherever in it they appear — and because a
-    # shell command cannot carry a trailing `#` comment on any physical
-    # line but its last, so a multi-line command has nowhere else to put
-    # its GIT_IDENTITY_SCOPE_EXEMPT marker. The per-physical-line hit is
-    # kept as well so a Markdown hard break (a prose line ending in `\`)
-    # cannot mask a self-contained write on the following line.
-    function flush(   rel, hitline, hittext) {
+    function exempt(s) {
+      return (s ~ /GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/)
+    }
+    function emit(ln, txt,   rel) {
+      rel = grpfile
+      sub("^" root, "", rel)
+      print rel ":" ln ":" txt
+      found = 1
+    }
+    # The suppressors (`-C`, `--global`, `--unset`, …) are read off the
+    # JOINED command, because they belong to the same invocation wherever
+    # in it they appear. The GIT_IDENTITY_SCOPE_EXEMPT marker is scoped to
+    # whichever hit it is being tested against instead: off the joined
+    # buffer for a joined-command hit — a shell command cannot carry a
+    # trailing `#` comment on any physical line but its last, so a
+    # multi-line command has nowhere else to put its marker — and off the
+    # PHYSICAL LINE for a physical-line hit. Testing the joined buffer for
+    # both would let one marker exempt every other line joined to it,
+    # including a self-contained write standing on its own, which a
+    # Markdown hard break (a prose line ending in `\`) makes easy to
+    # arrange by accident.
+    #
+    # EVERY offending physical line in a group is reported. Listing only
+    # the first hands an operator one line to fix, after which the re-run
+    # fails on the next one. The joined-command hit is emitted only when
+    # no physical line offended by itself, so an ordinary single-line
+    # write — where the line and the joined buffer are the same text — is
+    # still reported exactly once.
+    function flush(   i) {
       if (nbuf == 0) return
-      if (buf !~ /GIT_IDENTITY_SCOPE_EXEMPT:[[:space:]]*[^[:space:]]/) {
-        hitline = 0
-        if (physline > 0)        { hitline = physline; hittext = phystext }
-        else if (offending(buf)) { hitline = start;    hittext = buf }
-        if (hitline > 0) {
-          rel = grpfile
-          sub("^" root, "", rel)
-          print rel ":" hitline ":" hittext
-          found = 1
-        }
+      if (nphys > 0) {
+        for (i = 1; i <= nphys; i++) emit(physline[i], phystext[i])
+      } else if (offending(buf) && !exempt(buf)) {
+        emit(start, buf)
       }
-      buf = ""; nbuf = 0; physline = 0; phystext = ""
+      buf = ""; nbuf = 0; nphys = 0
     }
     # A group left dangling by a file whose last line ends in `\` must
     # not absorb the first line of the next file.
@@ -433,7 +447,11 @@ else
     {
       if (nbuf == 0) { start = FNR; grpfile = FILENAME }
       nbuf++
-      if (physline == 0 && offending($0)) { physline = FNR; phystext = $0 }
+      if (offending($0) && !exempt($0)) {
+        nphys++
+        physline[nphys] = FNR
+        phystext[nphys] = $0
+      }
       piece = $0
       if (continued($0)) piece = substr(piece, 1, length(piece) - 1)
       buf = (nbuf == 1 ? "" : buf " ") piece
