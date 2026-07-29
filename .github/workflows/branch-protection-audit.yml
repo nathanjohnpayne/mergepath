@@ -1,0 +1,360 @@
+name: Weekly branch-protection audit
+
+# Runs `scripts/audit-branch-protection.sh --fleet` weekly across the hub
+# and every consumer declared in `.mergepath-sync.yml`, so branch-protection
+# drift is surfaced on a schedule instead of only when somebody thinks to
+# run the audit by hand. See #774 for the drift this closes: the audit
+# script existed and was referenced only from documentation, nothing
+# invoked it, and the fleet reached a state where eight of ten repos
+# enforced ZERO of the five canonical gates and three had no protection on
+# `main` at all — with no red check anywhere to say so.
+#
+# Scope — read-only, on purpose:
+#   This workflow only READS branch protection. It never calls a
+#   protection-mutating endpoint. Bringing a repo up to the canonical set
+#   is an owner-authorised settings change (#774 item 1) and is
+#   deliberately out of this workflow's reach; the cron's job is
+#   visibility, not remediation.
+#
+# What it does on drift (`--fleet` exits 3):
+#   1. Writes a GitHub Actions job summary ($GITHUB_STEP_SUMMARY) with the
+#      per-repo verdict table and the full audit output.
+#   2. Opens-or-updates a SINGLE rollup issue labelled
+#      `branch-protection-drift`. One issue for the whole fleet, refreshed
+#      in place — not one issue per repo per run. On a clean audit it
+#      closes any open rollup issue.
+#
+# Auth model — the trap this workflow is most likely to fall into:
+#   `GET /repos/{owner}/{repo}/branches/{branch}/protection` (and the
+#   rulesets fallback) requires the **`Administration:read`** scope. The
+#   reviewer PAT in `secrets.REVIEWER_ASSIGNMENT_TOKEN` — the token
+#   weekly-drift-audit.yml uses for its cross-repo clones — does NOT have
+#   it and 403s on every repo (#177, #285). So this workflow needs its own
+#   secret, `secrets.BRANCH_PROTECTION_AUDIT_TOKEN`, holding an
+#   author/admin PAT with `Administration:read` on every repo in the
+#   manifest.
+#
+#   Because a wrong or absent token produces a *uniform* failure across
+#   every repo, it could easily be mistaken for "nothing to report". Two
+#   guards prevent that:
+#     - the "Run the fleet audit" step fails the job outright when the
+#       secret is empty, naming the secret and the scope it needs;
+#     - `--fleet` exits 2 (infrastructure) rather than 3 (drift) when any
+#       repo could not be read, and this workflow fails loudly on 2
+#       WITHOUT touching the rollup issue. A token that lost its scope can
+#       therefore never present as a clean audit, and can never close an
+#       open rollup issue.
+#
+# Issue-write token:
+#   The rollup issue lives in THIS repository, so the default
+#   `GITHUB_TOKEN` (with `issues: write` below) is sufficient and is the
+#   least-privilege choice — the admin PAT is used only for the reads that
+#   genuinely require it. The known consequence is that a GITHUB_TOKEN-
+#   authored issue or comment creates no workflow runs; that is acceptable
+#   here precisely because the rollup issue is a terminal notification
+#   surface and no workflow keys off it. If anything ever does need to
+#   trigger on this issue, the issue steps must move to a PAT — the
+#   permission block alone will not fix it.
+#
+# `--fleet` exit codes (see scripts/audit-branch-protection.sh header):
+#   0  clean — every audited repo requires all canonical checks
+#   1  usage error / missing prerequisite (yq, manifest, hub repo)
+#   2  at least one repo could not be audited (auth/API) — infrastructure
+#   3  drift — at least one readable repo is missing a canonical check
+# Only 3 touches the rollup issue; only 0 closes it. 1 and 2 fail the job
+# and leave the issue exactly as it was.
+
+on:
+  schedule:
+    # Mondays 08:30 UTC — after weekly-drift-audit.yml (08:00) and before
+    # pr-audit.yml / the feedback sweep (09:00), so all three weekly
+    # reports are already filed when the human's planning window starts.
+    - cron: '30 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    name: Audit fleet branch protection
+    # Reject manual dispatch from a non-default ref (same #550 reasoning as
+    # weekly-drift-audit.yml): on workflow_dispatch GitHub runs the workflow
+    # DEFINITION from the chosen ref, which the checkout pin cannot
+    # constrain — a feature branch could leak BRANCH_PROTECTION_AUDIT_TOKEN,
+    # an admin-scoped PAT, before checkout. Scheduled runs and
+    # default-branch dispatch pass; a feature-branch dispatch is skipped.
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TRACKING_LABEL: branch-protection-drift
+      ISSUE_TITLE: 'Fleet branch protection has drifted from the canonical required checks'
+    steps:
+      - name: Checkout mergepath
+        # Pin to the trusted default branch (#548): this workflow has a
+        # workflow_dispatch trigger and runs scripts/audit-branch-protection.sh
+        # under an admin-scoped PAT, so without an explicit ref a manually
+        # dispatched branch could run a tampered script with that token in
+        # its environment. persist-credentials:false is safe: the audit
+        # reads through `gh api`, not through the workspace git remote.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Install yq (mikefarah/yq v4)
+        # --fleet parses .mergepath-sync.yml with mikefarah/yq. Delegate to
+        # the single-source pinned bootstrap (#616) rather than duplicating
+        # a version pin here.
+        run: |
+          set -euo pipefail
+          bash scripts/lib/ensure-yq.sh
+          yq --version
+
+      - name: Verify gh is present
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "ERROR: gh not installed on runner" >&2
+            exit 1
+          fi
+          gh --version
+
+      - name: Run the fleet audit
+        id: audit
+        env:
+          # Admin-scoped READ path. See the auth-model note in the header:
+          # the reviewer PAT cannot read branch protection, so this is a
+          # distinct secret and its absence must be loud.
+          GH_TOKEN: ${{ secrets.BRANCH_PROTECTION_AUDIT_TOKEN }}
+          HUB_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::BRANCH_PROTECTION_AUDIT_TOKEN secret is empty — the audit cannot read branch protection without a token carrying the 'Administration:read' scope on every repo in .mergepath-sync.yml."
+            echo "        The reviewer PAT (REVIEWER_ASSIGNMENT_TOKEN) is NOT a substitute: it lacks that scope and 403s on every repo (#177, #285)."
+            echo "        Set BRANCH_PROTECTION_AUDIT_TOKEN in repo Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+          chmod +x scripts/audit-branch-protection.sh
+
+          # Capture stdout+stderr for the job summary and the rollup issue
+          # body while still streaming to the run log. The compact per-repo
+          # verdict table is written separately so the issue body can carry
+          # it in full even when the verbose output has to be truncated.
+          set +e
+          scripts/audit-branch-protection.sh --fleet \
+            --hub-repo "$HUB_REPO" \
+            --summary-file fleet-summary.txt 2>&1 | tee audit-output.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=${rc}" >> "$GITHUB_OUTPUT"
+          echo "Fleet audit exited with code ${rc}"
+
+          case "${rc}" in
+            0)
+              echo "result=clean" >> "$GITHUB_OUTPUT"
+              ;;
+            3)
+              echo "result=drift" >> "$GITHUB_OUTPUT"
+              ;;
+            1)
+              echo "::error::audit-branch-protection.sh --fleet exited 1 (usage error / missing prerequisite: yq, manifest, or hub repo). This is NOT drift — failing the workflow without touching the rollup issue."
+              exit 1
+              ;;
+            2)
+              echo "::error::audit-branch-protection.sh --fleet exited 2 (at least one repo could not be read). Almost always a token without 'Administration:read' on that repo. This is an infrastructure failure, NOT drift — failing the workflow without touching the rollup issue, so a scope loss can never present as a clean audit."
+              exit 2
+              ;;
+            *)
+              echo "::error::audit-branch-protection.sh --fleet exited with unexpected code ${rc} (contract drift). Failing the workflow."
+              exit "${rc}"
+              ;;
+          esac
+
+      - name: Write job summary
+        # Runs for both clean and drift. The exit-1/2 paths above already
+        # failed the job and never reach here, so the summary only ever
+        # reflects a real audit verdict.
+        if: steps.audit.outputs.result == 'clean' || steps.audit.outputs.result == 'drift'
+        env:
+          RESULT: ${{ steps.audit.outputs.result }}
+        run: |
+          {
+            echo "# Weekly branch-protection audit"
+            echo
+            if [ "${RESULT}" = "clean" ]; then
+              echo ":white_check_mark: **No drift.** Every repo in \`.mergepath-sync.yml\` (plus the hub) requires all canonical mergepath checks on its default branch."
+            else
+              echo ":warning: **Protection drift.** At least one repo does not require the canonical checks, so the corresponding gate workflows run but their failures are advisory."
+              echo
+              echo "A rollup issue (label \`${TRACKING_LABEL}\`) has been opened or updated. Remediation is an owner-authorised settings change; this cron only reports."
+            fi
+            echo
+            echo "## Per-repo verdicts"
+            echo
+            echo '```'
+            cat fleet-summary.txt
+            echo '```'
+            echo
+            echo "## Full audit output"
+            echo
+            echo '```'
+            cat audit-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ensure tracking label exists
+        if: steps.audit.outputs.result == 'drift'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Idempotent: `gh label create` errors if the label already
+          # exists, so check first. `--limit 500` overrides gh's default
+          # 30-item cap — without it the existence check could miss an
+          # already-present label in a repo with >30 labels, fall into the
+          # create branch, and abort the drift path on "already exists".
+          if gh label list --repo "$REPO" --limit 500 --json name --jq '.[].name' | grep -qx "$TRACKING_LABEL"; then
+            echo "Label '$TRACKING_LABEL' already exists."
+          else
+            echo "Creating label '$TRACKING_LABEL'."
+            gh label create "$TRACKING_LABEL" --repo "$REPO" \
+              --color D93F0B \
+              --description "A repo in the fleet does not require the canonical mergepath status checks (branch-protection-audit.yml)"
+          fi
+
+      - name: Open or update the rollup issue
+        if: steps.audit.outputs.result == 'drift'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          today="$(date -u '+%Y-%m-%d')"
+
+          # GitHub caps an issue body at 65536 characters. The verbose
+          # per-repo output can approach that on a ten-repo fleet, so the
+          # body is assembled findings-first: the compact verdict table
+          # goes in whole and the VERBOSE block is what gets truncated.
+          # Capping the other way around would silently drop repos from
+          # the rollup — a rollup that loses findings to a body cap is the
+          # failure mode this ordering exists to prevent.
+          OUTPUT_BUDGET=40000
+          truncated=0
+          if [ "$(wc -c < audit-output.txt)" -gt "$OUTPUT_BUDGET" ]; then
+            truncated=1
+          fi
+
+          {
+            echo "## Fleet branch-protection drift"
+            echo
+            echo "\`scripts/audit-branch-protection.sh --fleet\` found at least one repo whose"
+            echo "default branch does not require the canonical mergepath status checks. Where a"
+            echo "canonical check is not required, the corresponding workflow still runs and still"
+            echo "goes red — but the PR merges anyway. \`Label Gate\` is the load-bearing one: where"
+            echo "it is not required, the whole \`needs-external-review\` / \`needs-human-review\` /"
+            echo "\`policy-violation\` / \`human-hold\` merge block is advisory (see #161, #774)."
+            echo
+            echo "- **Last audit:** ${today} (UTC)"
+            echo "- **Run:** ${RUN_URL}"
+            echo
+            echo "### Per-repo verdicts"
+            echo
+            echo '```'
+            cat fleet-summary.txt
+            echo '```'
+            echo
+            echo "### Audit output"
+            echo
+            echo '```'
+            head -c "$OUTPUT_BUDGET" audit-output.txt
+            if [ "$truncated" -eq 1 ]; then
+              echo
+              echo "[... truncated at ${OUTPUT_BUDGET} characters to stay under GitHub's issue-body limit."
+              echo " The per-repo verdict table above is complete; the full output is in the run log: ${RUN_URL} ...]"
+            fi
+            echo '```'
+            echo
+            echo "---"
+            echo
+            echo "### Fixing a repo"
+            echo
+            echo "Settings → Branches → branch protection rule for the default branch → Require"
+            echo "status checks to pass before merging → add the missing checks. **Ordering trap:**"
+            echo "GitHub only offers a check name in that dropdown once the workflow has run at"
+            echo "least once on the repo, so a repo with no protection at all needs a PR through"
+            echo "first before its checks can be required."
+            echo
+            echo "The intended posture per repo class is recorded in"
+            echo "[\`docs/architecture/0002-branch-protection-enforcement-posture.md\`](docs/architecture/0002-branch-protection-enforcement-posture.md)."
+            echo
+            echo "This issue is **maintained in place** by"
+            echo "[\`.github/workflows/branch-protection-audit.yml\`](.github/workflows/branch-protection-audit.yml):"
+            echo "each weekly run updates this body rather than opening a new issue, and a clean"
+            echo "audit closes it automatically. The cron is read-only and never changes protection"
+            echo "settings itself."
+            echo
+            echo "cc @nathanjohnpayne"
+          } > issue-body.txt
+
+          # Find an existing OPEN rollup issue. Single source of truth: the
+          # `branch-protection-drift` LABEL. Deliberately not a body-content
+          # match — the body is truncated under a size budget above, so a
+          # dedupe key read out of the body would stop matching exactly when
+          # the fleet is at its most broken. Take the lowest-numbered match
+          # if (unexpectedly) more than one exists. `--limit 500` overrides
+          # gh's default 30-item cap so the lookup can't miss the rollup
+          # issue behind a backlog of >30 open issues.
+          existing="$(gh issue list --repo "$REPO" --state open --limit 500 \
+            --label "$TRACKING_LABEL" --json number --jq 'sort_by(.number) | .[0].number // ""')"
+
+          if [ -n "$existing" ]; then
+            echo "Updating existing rollup issue #${existing}."
+            gh issue edit "$existing" --repo "$REPO" \
+              --title "${ISSUE_TITLE}" \
+              --body-file issue-body.txt
+            gh issue comment "$existing" --repo "$REPO" \
+              --body ":warning: Protection drift still present as of ${today} (UTC). Issue body refreshed — see [latest run](${RUN_URL})."
+            echo "issue=${existing}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No open rollup issue — opening one."
+            gh issue create --repo "$REPO" \
+              --title "${ISSUE_TITLE}" \
+              --label "$TRACKING_LABEL" \
+              --body-file issue-body.txt
+          fi
+
+      - name: Close stale rollup issue on a clean audit
+        if: steps.audit.outputs.result == 'clean'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          today="$(date -u '+%Y-%m-%d')"
+
+          # Close every open rollup issue (normally zero or one). No-op when
+          # none exist — the intended steady state. Reached ONLY on result
+          # == clean, which the exit-1/2 guards above make unreachable under
+          # an auth failure, so a token that lost its scope cannot close a
+          # genuine drift issue.
+          mapfile -t open_issues < <(gh issue list --repo "$REPO" --state open --limit 500 \
+            --label "$TRACKING_LABEL" --json number --jq '.[].number')
+
+          if [ "${#open_issues[@]}" -eq 0 ]; then
+            echo "Audit clean and no open rollup issue — nothing to do."
+            exit 0
+          fi
+
+          for n in "${open_issues[@]}"; do
+            echo "Audit clean — closing rollup issue #${n}."
+            gh issue close "$n" --repo "$REPO" \
+              --comment ":white_check_mark: Audit clean as of ${today} (UTC) — every repo in the fleet requires the canonical mergepath checks. Closing automatically. See [run](${RUN_URL})."
+          done

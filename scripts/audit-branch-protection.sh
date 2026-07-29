@@ -19,12 +19,35 @@
 #   scripts/audit-branch-protection.sh              # audit current repo, branch=main
 #   scripts/audit-branch-protection.sh --repo owner/name
 #   scripts/audit-branch-protection.sh --branch master
+#   scripts/audit-branch-protection.sh --fleet      # audit the whole fleet (#774)
 #
-# Exit codes:
+# Exit codes (single-repo mode):
 #   0 — all canonical checks are required
 #   1 — bad arguments
 #   2 — gh API failure (auth scope, network, missing repo) — see diagnostic
 #   3 — one or more canonical checks NOT required (PR-merge gating gap)
+#
+# Fleet mode (--fleet, #774):
+#   Audits the hub plus every consumer declared in `.mergepath-sync.yml`
+#   (`.consumers[].repo`), re-invoking this same script once per repo, and
+#   prints a compact per-repo verdict table alongside the full per-repo
+#   output. `.github/workflows/branch-protection-audit.yml` is the
+#   scheduled caller; before #774 nothing invoked this script at all, which
+#   is how the fleet drifted to 0-of-5 canonical gates on eight of ten
+#   repos without anything going red.
+#
+#   Exit codes are deliberately the SAME shape as single-repo mode, so a
+#   caller's `case "$rc"` reads identically in both:
+#     0 — every audited repo requires all canonical checks
+#     1 — bad arguments or a missing prerequisite (yq, manifest, hub repo)
+#     2 — at least one repo could NOT be audited (auth/API failure). This
+#         is an INFRASTRUCTURE failure, not drift — most often a token
+#         without `Administration:read`. It takes precedence over 3
+#         because an unreadable repo's protection posture is unknown, and
+#         reporting "drift" for the repos that did answer would imply the
+#         rest were clean.
+#     3 — every repo was audited successfully and at least one is missing
+#         a canonical check (the drift verdict worth rolling up).
 #
 # Auth-scope note (#177, #285):
 #   Reading branch protection requires `Administration:read` on the target
@@ -58,8 +81,16 @@ CANONICAL_REQUIRED_CHECKS=(
   "Merge clearance gate"          # .github/workflows/merge-clearance-gate.yml (#427/#428)
 )
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+
 REPO=""
 BRANCH="main"
+FLEET=0
+MANIFEST=""
+AUDIT_CMD=""
+HUB_REPO=""
+SUMMARY_FILE=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -73,9 +104,37 @@ while [ $# -gt 0 ]; do
         echo "Error: --branch requires a non-empty value" >&2; exit 1
       fi
       BRANCH="$2"; shift 2 ;;
+    --fleet)
+      FLEET=1; shift ;;
+    --manifest)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "Error: --manifest requires a non-empty path" >&2; exit 1
+      fi
+      MANIFEST="$2"; shift 2 ;;
+    --hub-repo)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "Error: --hub-repo requires a non-empty value (owner/name)" >&2; exit 1
+      fi
+      HUB_REPO="$2"; shift 2 ;;
+    --summary-file)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "Error: --summary-file requires a non-empty path" >&2; exit 1
+      fi
+      SUMMARY_FILE="$2"; shift 2 ;;
+    --audit-cmd)
+      # Test seam: the per-repo auditor invoked by --fleet. Defaults to
+      # this script itself, so production never passes it.
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "Error: --audit-cmd requires a non-empty path" >&2; exit 1
+      fi
+      AUDIT_CMD="$2"; shift 2 ;;
     -h|--help)
       cat <<EOF
 Usage: scripts/audit-branch-protection.sh [--repo owner/name] [--branch <name>]
+       scripts/audit-branch-protection.sh --fleet [--branch <name>]
+                                          [--hub-repo owner/name]
+                                          [--manifest <path>]
+                                          [--summary-file <path>]
 
 Verifies branch protection on \$BRANCH (default: main) requires the
 canonical mergepath-shipped status checks:
@@ -83,12 +142,151 @@ canonical mergepath-shipped status checks:
 
 Exit 3 if any canonical check is not required (PR-merge gating gap).
 Exit 2 on gh API auth/scope failures (use an author/admin PAT).
+
+--fleet audits the hub plus every \`.consumers[].repo\` in
+.mergepath-sync.yml and prints a per-repo verdict table. Same exit-code
+shape: 0 all clean, 1 usage/prerequisite, 2 at least one repo unreadable
+(infrastructure, NOT drift), 3 drift on at least one readable repo.
 EOF
       exit 0
       ;;
     *) echo "Unknown arg: $1" >&2; exit 1 ;;
   esac
 done
+
+# ─────────────────────────────────────────────────────────────────────
+# Fleet mode (#774)
+# ─────────────────────────────────────────────────────────────────────
+#
+# Loops the hub + every manifest consumer, re-invoking the single-repo
+# auditor once per repo. Deliberately a thin loop: all protection
+# semantics stay in the single-repo path below, so there is exactly one
+# implementation of "is this check required".
+fleet_audit() {
+  local manifest="${MANIFEST:-$SCRIPT_DIR/../.mergepath-sync.yml}"
+  local audit_cmd="${AUDIT_CMD:-$SELF}"
+
+  if ! command -v yq >/dev/null 2>&1; then
+    echo "Error: --fleet requires mikefarah/yq v4+ to parse $manifest" >&2
+    echo "       brew install yq  (the pure-Python kislyuk/yq is NOT compatible)" >&2
+    return 1
+  fi
+  if ! yq --version 2>&1 | grep -q "mikefarah/yq"; then
+    echo "Error: detected a non-mikefarah yq; --fleet needs the Go binary (brew install yq)" >&2
+    echo "       yq --version: $(yq --version 2>&1)" >&2
+    return 1
+  fi
+  if [ ! -f "$manifest" ]; then
+    echo "Error: propagation manifest not found: $manifest" >&2
+    echo "       Pass --manifest <path> or run from a mergepath checkout." >&2
+    return 1
+  fi
+
+  local consumer_rows
+  if ! consumer_rows=$(yq -r '.consumers[].repo' "$manifest" 2>&1); then
+    echo "Error: could not read .consumers[].repo from $manifest:" >&2
+    printf '%s\n' "$consumer_rows" | sed 's/^/  /' >&2
+    return 1
+  fi
+
+  # The hub is audited too — #774 measured mergepath itself at 2 of 5
+  # canonical gates, so a fleet audit that covered only consumers would
+  # miss the repo the whole system is governed from. It is not in the
+  # manifest's consumer list (the hub is not its own consumer), so it is
+  # resolved separately and prepended.
+  local hub="$HUB_REPO"
+  if [ -z "$hub" ]; then
+    hub=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || hub=""
+  fi
+  if [ -z "$hub" ]; then
+    echo "Error: could not resolve the hub repository. Pass --hub-repo owner/name." >&2
+    return 1
+  fi
+
+  local repos=("$hub")
+  local r
+  while IFS= read -r r; do
+    [ -z "$r" ] && continue
+    [ "$r" = "$hub" ] && continue
+    repos+=("$r")
+  done <<<"$consumer_rows"
+
+  echo "Fleet branch-protection audit — ${#repos[@]} repo(s), branch '$BRANCH'"
+  echo "Manifest: $manifest"
+  echo ""
+
+  local summary=""
+  local n_pass=0 n_drift=0 n_error=0
+  local out rc verdict tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/fleet-bp-audit.XXXXXX")"
+
+  for r in "${repos[@]}"; do
+    rc=0
+    "$audit_cmd" --repo "$r" --branch "$BRANCH" >"$tmp" 2>&1 || rc=$?
+    out="$(cat "$tmp")"
+    case "$rc" in
+      0) verdict="PASS";  n_pass=$((n_pass + 1)) ;;
+      3) verdict="DRIFT"; n_drift=$((n_drift + 1)) ;;
+      # 1 (bad arguments) is impossible from a loop that builds its own
+      # argv, and 2 is the documented auth/API failure. Both — and any
+      # unexpected code — are infrastructure, never drift.
+      *) verdict="ERROR"; n_error=$((n_error + 1)) ;;
+    esac
+    echo "--- $r (rc=$rc, $verdict) ---"
+    printf '%s\n' "$out"
+    echo ""
+    summary="${summary}$(printf '%-6s rc=%-2s %s' "$verdict" "$rc" "$r")
+"
+  done
+  rm -f "$tmp"
+
+  local tally="Audited ${#repos[@]} repo(s): ${n_pass} pass, ${n_drift} drift, ${n_error} error."
+  local summary_block
+  summary_block="=== Fleet summary (branch '$BRANCH') ===
+${summary}${tally}"
+
+  echo "$summary_block"
+
+  if [ -n "$SUMMARY_FILE" ]; then
+    printf '%s\n' "$summary_block" >"$SUMMARY_FILE"
+  fi
+
+  if [ "$n_error" -gt 0 ]; then
+    echo "" >&2
+    echo "ERROR: ${n_error} repo(s) could not be audited. Branch protection is" >&2
+    echo "       read via GET /repos/{owner}/{repo}/branches/{branch}/protection," >&2
+    echo "       which requires the 'Administration:read' scope — reviewer PATs" >&2
+    echo "       commonly lack it. Re-run with an author/admin token. This is an" >&2
+    echo "       infrastructure failure, NOT a drift verdict." >&2
+    return 2
+  fi
+  if [ "$n_drift" -gt 0 ]; then
+    return 3
+  fi
+  return 0
+}
+
+# Reject the flag combinations that would otherwise be silently ignored:
+# a caller who typed `--summary-file x` but forgot `--fleet` would get an
+# empty summary and a clean exit, which is exactly the class of silent
+# no-op #774 is about.
+if [ "$FLEET" -eq 1 ] && [ -n "$REPO" ]; then
+  echo "Error: --fleet and --repo are mutually exclusive" >&2; exit 1
+fi
+if [ "$FLEET" -eq 0 ]; then
+  for _fleet_only in "--manifest:$MANIFEST" "--hub-repo:$HUB_REPO" \
+                     "--summary-file:$SUMMARY_FILE" "--audit-cmd:$AUDIT_CMD"; do
+    if [ -n "${_fleet_only#*:}" ]; then
+      echo "Error: ${_fleet_only%%:*} requires --fleet" >&2; exit 1
+    fi
+  done
+fi
+
+if [ "$FLEET" -eq 1 ]; then
+  FLEET_RC=0
+  fleet_audit || FLEET_RC=$?
+  exit "$FLEET_RC"
+fi
 
 if [ -z "$REPO" ]; then
   REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {

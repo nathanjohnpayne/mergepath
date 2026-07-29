@@ -386,6 +386,248 @@ else
   pass "missing 'Merge clearance gate' required check: exits 3 (canonical gap flagged)"
 fi
 
+# ===========================================================================
+# --fleet mode (#774)
+# ===========================================================================
+#
+# The fleet loop is what .github/workflows/branch-protection-audit.yml
+# runs on a schedule. Its load-bearing property is the exit-code
+# CLASSIFICATION, because the workflow's rollup behaviour hangs off it:
+# only 3 opens/updates the rollup issue, only 0 closes it, and 1/2 fail
+# the job without touching it. A loop that mapped an auth failure to
+# "clean" or to "drift" would recreate the #774 blind spot with a green
+# cron on top of it.
+#
+# The per-repo auditor is stubbed via --audit-cmd so these tests exercise
+# the loop's classification and reporting, not the protection semantics
+# already covered above.
+
+if ! command -v yq >/dev/null 2>&1 || ! yq --version 2>&1 | grep -q "mikefarah/yq"; then
+  # Fail closed rather than skip: --fleet parses the manifest with
+  # mikefarah/yq, and a silent skip here would let the classification
+  # regression this section exists to catch ship unnoticed.
+  echo "FAIL: mikefarah/yq v4+ is required to exercise --fleet (brew install yq)" >&2
+  exit 1
+fi
+
+FLEET_MANIFEST="$WORKDIR/fleet-manifest.yml"
+cat >"$FLEET_MANIFEST" <<'MANIFEST'
+consumers:
+  - name: alpha
+    repo: testowner/alpha
+  - name: beta
+    repo: testowner/beta
+MANIFEST
+
+FLEET_STUB="$WORKDIR/stub-audit.sh"
+cat >"$FLEET_STUB" <<'STUB'
+#!/usr/bin/env bash
+# Stub single-repo auditor for the --fleet loop tests. Exits with a
+# per-repo code chosen by FLEET_SCENARIO, mirroring the real script's
+# contract: 0 pass, 2 auth/API failure, 3 canonical-check gap.
+repo=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) repo="$2"; shift 2 ;;
+    --branch) shift 2 ;;
+    *) shift ;;
+  esac
+done
+echo "stub-audit reached $repo"
+case "${FLEET_SCENARIO:-all_pass}" in
+  all_pass) exit 0 ;;
+  hub_drift)   case "$repo" in */hub)  exit 3 ;; *) exit 0 ;; esac ;;
+  one_drift)   case "$repo" in */beta) exit 3 ;; *) exit 0 ;; esac ;;
+  drift_and_auth_error)
+    case "$repo" in
+      */beta)  exit 3 ;;
+      */alpha) exit 2 ;;
+      *)       exit 0 ;;
+    esac ;;
+esac
+exit 0
+STUB
+chmod +x "$FLEET_STUB"
+
+run_fleet() {
+  local scenario="$1"
+  shift
+  PATH="$STUB_DIR:$PATH" \
+  FLEET_SCENARIO="$scenario" \
+    bash "$SCRIPT" --fleet \
+      --hub-repo testowner/hub \
+      --manifest "$FLEET_MANIFEST" \
+      --audit-cmd "$FLEET_STUB" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Fleet test 1: every repo passes → exit 0, and the HUB is audited even
+#               though it is not in the manifest's consumer list (#774
+#               measured mergepath itself at 2 of 5 canonical gates).
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_fleet all_pass 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "fleet all-pass: exit $rc, expected 0; output: $out"
+elif ! echo "$out" | grep -q "stub-audit reached testowner/hub"; then
+  fail "fleet all-pass: hub repo was not audited; output: $out"
+elif ! echo "$out" | grep -q "stub-audit reached testowner/alpha"; then
+  fail "fleet all-pass: manifest consumer alpha was not audited; output: $out"
+elif ! echo "$out" | grep -q "stub-audit reached testowner/beta"; then
+  fail "fleet all-pass: manifest consumer beta was not audited; output: $out"
+elif ! echo "$out" | grep -q "Audited 3 repo(s): 3 pass, 0 drift, 0 error."; then
+  fail "fleet all-pass: tally line wrong; output: $out"
+else
+  pass "fleet all-pass: exits 0 and audits the hub plus every manifest consumer"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 2: one consumer missing a canonical check → exit 3, with that
+#               repo marked DRIFT in the verdict table.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_fleet one_drift 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "fleet one-drift: exit $rc, expected 3; output: $out"
+elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +testowner/beta$"; then
+  fail "fleet one-drift: beta not marked DRIFT in the verdict table; output: $out"
+elif ! echo "$out" | grep -q "Audited 3 repo(s): 2 pass, 1 drift, 0 error."; then
+  fail "fleet one-drift: tally line wrong; output: $out"
+else
+  pass "fleet one-drift: exits 3 and marks the drifting repo DRIFT"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 3: the HUB drifting is enough to fail the fleet audit.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_fleet hub_drift 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "fleet hub-drift: exit $rc, expected 3; output: $out"
+elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +testowner/hub$"; then
+  fail "fleet hub-drift: hub not marked DRIFT; output: $out"
+else
+  pass "fleet hub-drift: hub drift alone exits 3"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 4 (the load-bearing one): one repo drifts AND another returns
+#               an auth/API failure → exit 2, NOT 3. An unreadable repo's
+#               posture is unknown, so the run must be reported as an
+#               infrastructure failure. The workflow's `case` leaves the
+#               rollup issue untouched on 2, which is what stops an
+#               expired or under-scoped token from either presenting as a
+#               clean audit or half-filling the rollup.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_fleet drift_and_auth_error 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "fleet drift+auth-error: exit $rc, expected 2 (infra beats drift); output: $out"
+elif ! echo "$out" | grep -qE "^ERROR +rc=2 +testowner/alpha$"; then
+  fail "fleet drift+auth-error: alpha not marked ERROR; output: $out"
+elif ! echo "$out" | grep -qE "^DRIFT +rc=3 +testowner/beta$"; then
+  fail "fleet drift+auth-error: beta's drift verdict must still be reported; output: $out"
+elif ! echo "$out" | grep -q "Administration:read"; then
+  fail "fleet drift+auth-error: diagnostic must name the missing scope; output: $out"
+elif ! echo "$out" | grep -q "NOT a drift verdict"; then
+  fail "fleet drift+auth-error: diagnostic must say this is not drift; output: $out"
+else
+  pass "fleet drift+auth-error: exits 2 (infrastructure) rather than 3, and says why"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 5: --summary-file gets the complete per-repo verdict table.
+#               The workflow embeds this file verbatim in the rollup issue
+#               body while truncating the verbose output, so a repo missing
+#               from it is a repo silently missing from the rollup.
+# ---------------------------------------------------------------------------
+SUMMARY_OUT="$WORKDIR/fleet-summary.txt"
+set +e
+run_fleet one_drift --summary-file "$SUMMARY_OUT" >/dev/null 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "fleet --summary-file: exit $rc, expected 3"
+elif [ ! -s "$SUMMARY_OUT" ]; then
+  fail "fleet --summary-file: summary file missing or empty ($SUMMARY_OUT)"
+else
+  summary_body="$(cat "$SUMMARY_OUT")"
+  missing=""
+  for r in testowner/hub testowner/alpha testowner/beta; do
+    echo "$summary_body" | grep -q " $r$" || missing="$missing $r"
+  done
+  if [ -n "$missing" ]; then
+    fail "fleet --summary-file: table missing repo(s):$missing; body: $summary_body"
+  elif ! echo "$summary_body" | grep -q "Audited 3 repo(s):"; then
+    fail "fleet --summary-file: table missing the tally line; body: $summary_body"
+  else
+    pass "fleet --summary-file: writes the complete per-repo verdict table"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 6: a missing manifest is a prerequisite failure (exit 1), not
+#               a clean audit. Fail-closed: an absent manifest must never
+#               read as "zero repos, nothing wrong".
+# ---------------------------------------------------------------------------
+set +e
+out=$(PATH="$STUB_DIR:$PATH" bash "$SCRIPT" --fleet \
+        --hub-repo testowner/hub \
+        --manifest "$WORKDIR/definitely-not-here.yml" \
+        --audit-cmd "$FLEET_STUB" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "fleet missing manifest: exit $rc, expected 1; output: $out"
+elif ! echo "$out" | grep -q "manifest not found"; then
+  fail "fleet missing manifest: diagnostic missing; output: $out"
+else
+  pass "fleet missing manifest: exits 1 (prerequisite), never a clean 0"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 7: --fleet and --repo are mutually exclusive.
+# ---------------------------------------------------------------------------
+set +e
+out=$(bash "$SCRIPT" --fleet --repo testowner/hub 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "fleet+--repo: exit $rc, expected 1; output: $out"
+elif ! echo "$out" | grep -q "mutually exclusive"; then
+  fail "fleet+--repo: diagnostic missing; output: $out"
+else
+  pass "fleet + --repo: rejected with exit 1"
+fi
+
+# ---------------------------------------------------------------------------
+# Fleet test 8: a fleet-only flag without --fleet is rejected rather than
+#               silently ignored — a caller who asked for a summary file
+#               and got a single-repo run with no summary would read the
+#               clean exit as a fleet-wide all-clear.
+# ---------------------------------------------------------------------------
+set +e
+out=$(bash "$SCRIPT" --summary-file "$WORKDIR/ignored.txt" --repo testowner/hub 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 1 ]; then
+  fail "--summary-file without --fleet: exit $rc, expected 1; output: $out"
+elif ! echo "$out" | grep -q -- "--summary-file requires --fleet"; then
+  fail "--summary-file without --fleet: diagnostic missing; output: $out"
+elif [ -e "$WORKDIR/ignored.txt" ]; then
+  fail "--summary-file without --fleet: must not write the summary file"
+else
+  pass "fleet-only flag without --fleet: rejected with exit 1"
+fi
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

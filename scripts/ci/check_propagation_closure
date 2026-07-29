@@ -245,6 +245,16 @@ ALLOW_LIST=(
   # check_onepassword_headless_proof_workflow is not wired on consumers.
   "scripts/onepassword-headless-proof-setup.sh"
 
+  # The fleet branch-protection audit (#774). scripts/audit-branch-protection.sh
+  # reads EVERY consumer's protection from the hub under an admin-scoped
+  # PAT, so it is hub-only by construction — a consumer neither has the
+  # manifest to iterate nor the token to read its siblings.
+  # check_branch_protection_audit ships via the scripts/ci/ kit but SKIPs on
+  # a consumer via the both-absent marker idiom, so neither the script nor
+  # its suites need to travel. The paired tests are already covered by the
+  # "tests/test_audit*" pattern above.
+  "scripts/audit-branch-protection.sh"
+
   # Self-tests of hub-only CI check suites. The check wrappers ship via
   # the scripts/ci/ kit and — now that repo_lint.yml propagates (#601) —
   # run on every consumer, but each one SKIPs (or skips its suite) when
