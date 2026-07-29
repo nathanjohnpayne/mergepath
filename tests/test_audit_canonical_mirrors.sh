@@ -83,6 +83,11 @@
 #      mid-sentence exactly the way the hardcoded range did, and case 17
 #      passed anyway because its expected value truncated identically
 #      (#781 item 5).
+#  20. An INDENTED comment line inside the header is still header. The
+#      blank rule ignored leading whitespace but the marker rule was
+#      anchored at column zero, so `  # note` matched neither and fell
+#      through to the terminator — dropping itself and every comment
+#      after it, silently and with exit 0 (#791 review).
 
 set -euo pipefail
 
@@ -480,11 +485,16 @@ fi
 # comment block, whatever that line happens to be. Derived independently from
 # the script source, so a range that stops short — for any reason, including a
 # future hardcoded one — fails here rather than shipping a truncated --help.
+# Mirrors usage()'s marker rule, INCLUDING its tolerance of leading
+# whitespace (case 20). If this derivation kept `/^#/` while usage() moved on,
+# an indented comment added to the real header later would stop the
+# derivation early while usage() ran past it, failing this case for a header
+# edit that is in fact handled correctly.
 HEADER_LAST="$(awk '
-  NR == 1 { next }
-  /^#/    { line = $0; sub(/^# ?/, "", line); last = line; next }
-            { exit }
-  END     { print last }
+  NR == 1    { next }
+  /^[ \t]*#/ { line = $0; sub(/^[ \t]*# ?/, "", line); last = line; next }
+               { exit }
+  END        { print last }
 ' "$SCRIPT")"
 if [ "$(tail -1 <<<"$HELP")" = "$HEADER_LAST" ]; then
   pass "--help runs to the last header-comment line (no truncation)"
@@ -545,7 +555,11 @@ fi
 printf '#\n\n#   HEADER-SENTINEL-AFTER-BLANK  header text following a stray blank line\n' \
   > "$WORKDIR/extra-blank.txt"
 grow_header "$WORKDIR/blank-in-header.sh" "$WORKDIR/extra-blank.txt"
-BLANK_HELP="$("$WORKDIR/blank-in-header.sh" --help)"
+# Keep the RAW bytes as well as the substitution: `$( … )` strips every
+# trailing newline, so nothing derived from BLANK_HELP can observe a flushed
+# trailing blank (see the last assertion in this block).
+"$WORKDIR/blank-in-header.sh" --help > "$WORKDIR/blank-help.out"
+BLANK_HELP="$(cat "$WORKDIR/blank-help.out")"
 if grep -q 'HEADER-SENTINEL-AFTER-BLANK' <<<"$BLANK_HELP"; then
   pass "--help does not truncate at a blank line inside the header block"
 else
@@ -557,11 +571,40 @@ else
   pass "blank-in-header --help still stops before the script body"
 fi
 # The trailing blank that separates header from code is NOT emitted, so the
-# last line stays real usage text rather than an empty line.
-if [ -n "$(tail -1 <<<"$BLANK_HELP")" ]; then
+# last line stays real usage text rather than an empty line. This reads the
+# last RECORD off the raw capture: `tail -1` of a command substitution could
+# never fail here, because the substitution had already eaten the trailing
+# blank before `tail` ran, so the assertion pinned nothing (#791 review).
+if [ -n "$(awk 'END { print }' "$WORKDIR/blank-help.out")" ]; then
   pass "--help does not emit the blank line separating header from code"
 else
   fail "--help ended with an empty line (trailing blanks flushed)"
+fi
+
+# ── 20. An INDENTED header comment is still header (#791 review) ──────
+# The blank rule tolerates leading whitespace but the marker rule was
+# anchored at column zero, so `  # note` matched neither and fell through to
+# the terminator — silently truncating the block at a line that is plainly
+# still a comment, the same failure mode as the hardcoded range. Both the
+# indented line AND every plain comment after it were lost.
+printf '  #   INDENT-SENTINEL  an indented header comment line\n#   AFTER-INDENT-SENTINEL  a plain comment following the indented one\n' \
+  > "$WORKDIR/extra-indent.txt"
+grow_header "$WORKDIR/indent-in-header.sh" "$WORKDIR/extra-indent.txt"
+INDENT_HELP="$("$WORKDIR/indent-in-header.sh" --help)"
+if grep -q 'INDENT-SENTINEL' <<<"$INDENT_HELP"; then
+  pass "--help emits an indented header comment line"
+else
+  fail "--help dropped an indented header line; tail was: $(tail -3 <<<"$INDENT_HELP")"
+fi
+if grep -q 'AFTER-INDENT-SENTINEL' <<<"$INDENT_HELP"; then
+  pass "--help does not truncate at an indented header comment line"
+else
+  fail "--help truncated at an indented line; tail was: $(tail -3 <<<"$INDENT_HELP")"
+fi
+if grep -q 'set -euo pipefail' <<<"$INDENT_HELP"; then
+  fail "indent-in-header --help leaked script body past the header block"
+else
+  pass "indent-in-header --help still stops before the script body"
 fi
 
 echo

@@ -93,23 +93,27 @@ set -euo pipefail
 # and the entire "Exit codes" section. A literal line number cannot survive
 # edits above it, so it is not used at all here (#762 r3 P2, #781 item 5).
 #
-# Two things are deliberate. Line 1 is the shebang and is skipped, and `# `
-# (or a bare `#`) is stripped from each line — the normalization the old
-# second `sed` did. And a blank line INSIDE the header does not terminate the
-# block: blanks are buffered and flushed only when another comment line
-# follows, so a stray un-prefixed line (an editor stripping trailing
-# whitespace from a `#`-only separator, a paste that drops the marker) costs
-# nothing instead of silently truncating `--help` mid-sentence, the exact
-# failure the hardcoded range produced. Buffered blanks are never flushed at
-# the end, so the blank separating the header from the code is not printed
-# and the script body can never leak into the usage text.
+# Three things are deliberate. Line 1 is the shebang and is skipped, and
+# `# ` (or a bare `#`) is stripped from each line — the normalization the old
+# second `sed` did. Leading whitespace before that marker is tolerated: the
+# blank rule already ignores indentation, so an indented `  # note` matched
+# neither rule and fell straight through to the terminator, truncating the
+# block at a line that is plainly still a comment (#791 review). And a blank
+# line INSIDE the header does not terminate the block: blanks are buffered
+# and flushed only when another comment line follows, so a stray un-prefixed
+# line (an editor stripping trailing whitespace from a `#`-only separator, a
+# paste that drops the marker) costs nothing instead of silently truncating
+# `--help` mid-sentence, the exact failure the hardcoded range produced.
+# Buffered blanks are never flushed at the end, so the blank separating the
+# header from the code is not printed and the script body can never leak
+# into the usage text.
 usage() {
   awk '
     NR == 1        { next }
-    /^#/           {
+    /^[ \t]*#/     {
                      for (i = 0; i < pending_blanks; i++) print ""
                      pending_blanks = 0
-                     sub(/^# ?/, "")
+                     sub(/^[ \t]*# ?/, "")
                      print
                      next
                    }
