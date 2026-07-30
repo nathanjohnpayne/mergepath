@@ -161,6 +161,12 @@ CANONICAL_REQUIRED_CHECKS=(
   "Merge clearance gate"          # .github/workflows/merge-clearance-gate.yml (#427/#428)
 )
 
+# A context name alone does not identify the workflow allowed to satisfy it.
+# Count only checks pinned to mergepath's trusted GitHub Actions producer.
+# The override name matches merge-clearance-gate.sh for GHES installations,
+# where the github-actions app id differs from github.com's 15368.
+MERGE_CLEARANCE_EXPECTED_APP_ID="${MERGE_CLEARANCE_EXPECTED_APP_ID:-15368}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 
@@ -894,7 +900,11 @@ canonical_checks_all_present() {  # <contexts, one per line>
 CLASSIC_CHECKS=""
 CLASSIC_BYPASSABLE=1
 if [ "$HAVE_CLASSIC" -eq 1 ]; then
-  CLASSIC_CHECKS=$(echo "$PROT_BODY" | jq -r '.required_status_checks.contexts[]? // empty')
+  CLASSIC_CHECKS=$(echo "$PROT_BODY" | jq -r --arg app "$MERGE_CLEARANCE_EXPECTED_APP_ID" '
+    .required_status_checks.checks[]?
+    | select((.app_id | tostring) == $app)
+    | .context // empty
+  ')
   # Classic protection lets every repository admin "merge without waiting
   # for requirements" unless `enforce_admins` is on, so that flag IS the
   # classic bypass list: off means every admin bypasses every classic
@@ -949,67 +959,23 @@ BRANCH_REF="refs/heads/$BRANCH"
 # an `exclude` list, disqualified a ruleset that does govern it (a false
 # DRIFT).
 #
-# FNM_PATHNAME semantics are reproduced by splitting BOTH sides on `/`
-# and globbing component-against-component: within a single component
-# there is no `/` left for `*` or `?` to cross, and bash's glob engine
-# handles `[abc]` / `[a-z]` sets natively. `**` gets Ruby's exact
-# treatment, which is subtler than "`**` crosses separators":
-#   - `**` as a whole component FOLLOWED by more pattern (Ruby's `**/`
-#     form) matches ZERO OR MORE whole components, so `refs/heads/**/*`
-#     matches `refs/heads/a` and `refs/heads/a/b/c`;
-#   - `**` at the END of a pattern is NOT the recursive form in Ruby
-#     (dir.c only special-cases the literal three bytes `**/`), so
-#     `refs/heads/**` behaves like `refs/heads/*` and does NOT match
-#     `refs/heads/a/b`. Falling through to the component glob gives
-#     precisely that, because `[[ a == ** ]]` is `[[ a == * ]]`.
-# Two documented GitHub limitations need no special handling: a backslash
-# is not a quoting character, and refs cannot contain one anyway
-# (git check-ref-format rule 10); and Ruby's leading-period rule is
-# unreachable because no ref component may begin with `.` (rule 1).
+# Invoke the reference implementation GitHub documents. A Bash
+# reimplementation matched the common `*`, `?`, range and `**/` cases but
+# interpreted POSIX bracket classes such as `[[:digit:]]`; Ruby treats that
+# spelling differently. That disagreement can credit a ruleset with governing
+# a branch it does not govern, which is a false PASS. Exact semantics are worth
+# the tiny subprocess cost in a weekly protection audit.
 #
-# BEGIN fnmatch — the two functions below are extracted VERBATIM by
+# BEGIN fnmatch — the function below is extracted VERBATIM by
 # tests/test_audit_branch_protection.sh and differentially tested against
 # `File.fnmatch(pat, ref, File::FNM_PATHNAME)` in real Ruby. Keep the
 # markers.
 fnmatch_pathname() {  # <pattern> <ref>
-  local -a fnm_pat fnm_str
-  IFS='/' read -r -a fnm_pat <<<"$1"
-  IFS='/' read -r -a fnm_str <<<"$2"
-  # `read -a` drops a trailing empty field, but File.fnmatch does not:
-  # `release/*/` must stay distinct from `release/*`, on both sides.
-  case "$1" in */) fnm_pat+=("") ;; esac
-  case "$2" in */) fnm_str+=("") ;; esac
-  fnmatch_pathname_from 0 0
-}
-
-fnmatch_pathname_from() {  # <pattern component index> <ref component index>
-  local pi="$1" si="$2" k
-  while :; do
-    if [ "$pi" -ge "${#fnm_pat[@]}" ]; then
-      [ "$si" -ge "${#fnm_str[@]}" ] && return 0
-      return 1
-    fi
-    # Ruby's `**/`: a `**` component with pattern still to come consumes
-    # zero or more whole ref components.
-    if [ "${fnm_pat[pi]}" = '**' ] && [ $((pi + 1)) -lt "${#fnm_pat[@]}" ]; then
-      for (( k = si; k <= ${#fnm_str[@]}; k++ )); do
-        if fnmatch_pathname_from $((pi + 1)) "$k"; then
-          return 0
-        fi
-      done
-      return 1
-    fi
-    [ "$si" -ge "${#fnm_str[@]}" ] && return 1
-    # Component-scoped glob: no `/` inside either side, so `*` and `?`
-    # cannot cross a separator however greedy bash would otherwise be.
-    # shellcheck disable=SC2053
-    if [[ "${fnm_str[si]}" == ${fnm_pat[pi]} ]]; then
-      pi=$((pi + 1))
-      si=$((si + 1))
-      continue
-    fi
-    return 1
-  done
+  if ! command -v ruby >/dev/null 2>&1; then
+    echo "ERROR: ruby is required to evaluate GitHub ruleset ref patterns exactly" >&2
+    exit 2
+  fi
+  ruby -e 'exit(File.fnmatch(ARGV[0], ARGV[1], File::FNM_PATHNAME) ? 0 : 1)' -- "$1" "$2"
 }
 # END fnmatch
 
@@ -1191,11 +1157,12 @@ if [ "$SCAN_RULESETS" -eq 1 ]; then
     DETAIL=$(gh api "repos/$REPO/rulesets/$rid" 2>&1) || {
       echo "Could not fetch ruleset $rid: $DETAIL" >&2; exit 2
     }
-    THIS_CHECKS=$(echo "$DETAIL" | jq -r '
+    THIS_CHECKS=$(echo "$DETAIL" | jq -r --arg app "$MERGE_CLEARANCE_EXPECTED_APP_ID" '
       .rules[]?
       | select(.type == "required_status_checks")
       | .parameters.required_status_checks[]?
-      | .context
+      | select((.integration_id | tostring) == $app)
+      | .context // empty
     ' 2>/dev/null)
 
     # A ruleset gates merges only while its `enforcement` is `active`.

@@ -97,6 +97,38 @@ fi
 # Query strings are gh's business, not the fixture's: match on the route.
 path="${path%%\?*}"
 
+# Most fixtures describe checks by context because producer identity was not
+# relevant to their original assertion. The real APIs also carry the Actions
+# producer, so enrich only MISSING fixture metadata here. Scenarios that set a
+# foreign id explicitly retain it and exercise the fail-closed path.
+fixture_ruleset_json() {
+  jq -c '
+    .rules |= map(
+      if .type == "required_status_checks" then
+        .parameters.required_status_checks |= map(
+          if has("integration_id") then . else . + {integration_id: 15368} end
+        )
+      else . end
+    )
+  ' <<<"$1"
+}
+
+# Per-ruleset fixtures are emitted at many call sites below. Route those JSON
+# bodies through the enricher once at the transport boundary so every existing
+# scenario models the real producer field without duplicating it in each long
+# literal. Explicit foreign ids are preserved.
+printf() {
+  local fmt="$1"
+  shift
+  if [[ "${path:-}" == */rulesets/* ]] \
+    && [ "$fmt" = '%s\n' ] \
+    && [ "$#" = "1" ] \
+    && jq -e '.rules | type == "array"' >/dev/null 2>&1 <<<"$1"; then
+    set -- "$(fixture_ruleset_json "$1")"
+  fi
+  builtin printf "$fmt" "$@"
+}
+
 # Emulate `gh api --jq`: the filter is applied to the response body (and,
 # under --paginate, to EACH page, with the outputs concatenated).
 emit_body() {  # <json body>
@@ -112,6 +144,11 @@ emit_status_and_body() {
   # $2 = body
   local status="$1"
   local body="$2"
+  if [ "$status" = "200" ] \
+    && jq -e '.required_status_checks.contexts | type == "array"' >/dev/null 2>&1 <<<"$body" \
+    && ! jq -e '.required_status_checks.checks | type == "array"' >/dev/null 2>&1 <<<"$body"; then
+    body="$(jq -c '.required_status_checks.checks = [.required_status_checks.contexts[] | {context: ., app_id: 15368}]' <<<"$body")"
+  fi
   if [ "$include_headers" -eq 1 ]; then
     case "$status" in
       200) echo "HTTP/2 200 OK" ;;
@@ -147,6 +184,13 @@ case "$path" in
         # Classic protection present; required_status_checks includes
         # all canonical checks plus an extra one.
         emit_status_and_body 200 '{"required_status_checks":{"contexts":["Label Gate","Self-Review Required","Codex P1 unresolved threads","CodeRabbit unresolved blocking findings","Merge clearance gate","lint"]}}'
+        exit $?
+        ;;
+      classic_untrusted_producer)
+        # Same canonical strings, but only a foreign integration can satisfy
+        # them. Context-name equality is not proof the shipped Actions gates
+        # are enforced.
+        emit_status_and_body 200 '{"required_status_checks":{"contexts":["Label Gate","Self-Review Required","Codex P1 unresolved threads","CodeRabbit unresolved blocking findings","Merge clearance gate"],"checks":[{"context":"Label Gate","app_id":999},{"context":"Self-Review Required","app_id":999},{"context":"Codex P1 unresolved threads","app_id":999},{"context":"CodeRabbit unresolved blocking findings","app_id":999},{"context":"Merge clearance gate","app_id":999}]}}'
         exit $?
         ;;
       classic_admins_bypass)
@@ -213,6 +257,9 @@ case "$path" in
         ;;
       ruleset_all)
         page1='[{"id":101,"target":"branch"}]'
+        ;;
+      ruleset_untrusted_producer)
+        page1='[{"id":1301,"target":"branch"}]'
         ;;
       ruleset_glob)
         page1='[{"id":102,"target":"branch"}]'
@@ -330,6 +377,10 @@ case "$path" in
     # Supplies the ONE canonical check classic protection omits. Active,
     # nobody can bypass it.
     printf '%s\n' '{"id":1101,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"bypass_actors":[],"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Merge clearance gate"}]}}]}'
+    exit 0
+    ;;
+  */rulesets/1301)
+    printf '%s\n' '{"id":1301,"target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},"bypass_actors":[],"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"Label Gate","integration_id":999},{"context":"Self-Review Required","integration_id":999},{"context":"Codex P1 unresolved threads","integration_id":999},{"context":"CodeRabbit unresolved blocking findings","integration_id":999},{"context":"Merge clearance gate","integration_id":999}]}}]}'
     exit 0
     ;;
   */rulesets/1102)
@@ -676,6 +727,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 3b: matching classic context names from a foreign app are not the
+#          shipped Actions gates and therefore do not count as protection.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit classic_untrusted_producer 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "classic foreign producer: exit $rc, expected 3; output: $out"
+elif ! echo "$out" | grep -q "no required status checks configured"; then
+  fail "classic foreign producer: missing canonical-gap diagnostic; output: $out"
+else
+  pass "classic same-named checks from a foreign app do not count"
+fi
+
+# ---------------------------------------------------------------------------
 # Test 4: ruleset with ~ALL targeting main → exit 0 (PASS).
 # ---------------------------------------------------------------------------
 set +e
@@ -688,6 +755,22 @@ elif ! echo "$out" | grep -q "PASS:"; then
   fail "ruleset ~ALL: missing PASS line; output: $out"
 else
   pass "ruleset ~ALL targeting main: exits 0 (canonical checks present)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 4b: a ruleset whose same-named checks are unpinned to the trusted
+#          Actions integration is not proof those workflows gate merges.
+# ---------------------------------------------------------------------------
+set +e
+out=$(run_audit ruleset_untrusted_producer 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "ruleset foreign producer: exit $rc, expected 3; output: $out"
+elif ! echo "$out" | grep -q "no required status checks configured"; then
+  fail "ruleset foreign producer: missing canonical-gap diagnostic; output: $out"
+else
+  pass "ruleset same-named checks from a foreign integration do not count"
 fi
 
 # ---------------------------------------------------------------------------
@@ -2109,6 +2192,7 @@ else
     'refs/heads/qa**/**/*'
     'refs/heads/rel-[0-9]'
     'refs/heads/rel-[0-9]*'
+    'refs/heads/release-[[:digit:]]'
     'refs/heads/re?ease'
     'refs/heads/**/deep'
     'refs/tags/*'
@@ -2126,6 +2210,7 @@ else
     'refs/heads/rel-7'
     'refs/heads/rel-77'
     'refs/heads/relXease'
+    'refs/heads/release-5'
     'refs/heads/a/b/deep'
     'refs/heads/deep'
   )
