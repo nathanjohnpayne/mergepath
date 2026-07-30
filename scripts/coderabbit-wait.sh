@@ -164,7 +164,7 @@
 #       "mode": true,
 #       "observed": "none" | "rate_limit" | "paused" | "in_progress"
 #                   | "status_probe" | "summary-without-head-review"
-#                   | "terminal"
+#                   | "summary-predates-head-review" | "budget" | "terminal"
 #     },
 #     "codex_failover_requested": true | false,
 #     "waited_seconds": N
@@ -1022,18 +1022,27 @@ scan_latest_comment_best_effort() {
 # Factored out of count_potential_issues (#814) so the probe-mode evidence
 # check below reuses this selection rather than adding a second copy of it —
 # scripts/ci/check_workflow_parsers exists to police exactly that.
-latest_head_pinned_review_id() {
+latest_head_pinned_review() {
   local reviews
-  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
-  echo "$reviews" | jq -r --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" --arg head_sha "$HEAD_SHA" '
+  # Explicit propagation, not errexit. fetch_api_array's `die 3` exits only
+  # its own command-substitution subshell; this function would otherwise carry
+  # on with an empty $reviews and return 0 from the jq below, turning a failed
+  # API read into a confident "no review on this head". Whether errexit fires
+  # depends on the caller's context, so it cannot be relied on — check here.
+  reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") || return 3
+  echo "$reviews" | jq -c --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" --arg head_sha "$HEAD_SHA" '
     [ .[]
       | select(.user.login == $bot)
       | select(.submitted_at >= $after)
       | select(.commit_id == $head_sha)
     ]
     | sort_by(.submitted_at) | last
-    | if . == null then "" else (.id | tostring) end
+    | if . == null then empty else {id, submitted_at} end
   '
+}
+
+latest_head_pinned_review_id() {
+  latest_head_pinned_review | jq -r '.id // empty'
 }
 
 count_potential_issues() {
@@ -2165,8 +2174,35 @@ while :; do
       # Probe-mode only: polling behaviour is unchanged, and the StatusContext
       # fast path is untouched because it reads commits/$HEAD_SHA/statuses and
       # is therefore already pinned by construction.
-      if [ "$PROBE_MODE" = "true" ] && [ -z "$(latest_head_pinned_review_id)" ]; then
-        probe_not_yet_from_latest "summary-without-head-review"
+      #
+      # Existence of a HEAD-pinned review is necessary but NOT sufficient
+      # (Phase 4b P1 on #823). CodeRabbit publishes a review object and its
+      # PR-level summary as separate events, so mid-publication a new HEAD
+      # review can exist while the latest summary passing HEAD_ANCHOR is still
+      # the PRIOR head's. The inline count would then read the new review
+      # while summary_body_has_potential_issue_marker reads the old summary,
+      # and a finding carried only in the forthcoming summary clears. Require
+      # the classified summary to be at least as recent as the HEAD review it
+      # is being credited to.
+      if [ "$PROBE_MODE" = "true" ]; then
+        # Status checked explicitly. Inlining this into `[ -z "$(...)" ]`
+        # collapsed a failed reviews fetch to an empty string and reported it
+        # as a clean rc 7 "no review yet" — a confident negative built from an
+        # outage, which is the false-negative class this mode exists to
+        # prevent. latest_head_pinned_review now returns 3 on a failed fetch
+        # rather than leaving it to errexit, which bash suppresses in exactly
+        # the contexts this call site sits in.
+        PROBE_HEAD_REVIEW=$(latest_head_pinned_review) \
+          || die 3 "failed to read HEAD-pinned CodeRabbit review state"
+        if [ -z "$PROBE_HEAD_REVIEW" ]; then
+          probe_not_yet_from_latest "summary-without-head-review"
+        fi
+        PROBE_HEAD_REVIEW_AT=$(printf '%s' "$PROBE_HEAD_REVIEW" | jq -r '.submitted_at // empty')
+        PROBE_LATEST_AT=$(printf '%s' "$LATEST" | jq -r '.fresh_at // .updated_at // .created_at // empty')
+        if [ -z "$PROBE_HEAD_REVIEW_AT" ] || [ -z "$PROBE_LATEST_AT" ] \
+           || [[ "$PROBE_LATEST_AT" < "$PROBE_HEAD_REVIEW_AT" ]]; then
+          probe_not_yet_from_latest "summary-predates-head-review"
+        fi
       fi
       POTENTIAL_ISSUES=$(count_potential_issues)
       REVIEW_JSON=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')

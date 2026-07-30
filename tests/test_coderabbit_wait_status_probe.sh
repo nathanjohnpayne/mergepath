@@ -216,11 +216,25 @@ case "$endpoint" in
         # return the SAME terminal verdict the polling mode does.
         printf '[{"id":9941,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
         ;;
+      probe_reviews_api_failure)
+        # #814 / Phase 4b P2 on #823: the reviews fetch fails while the probe
+        # is deciding. Must surface as rc 3 (infra), never as a clean rc 7.
+        echo "simulated reviews API failure" >&2
+        exit 44
+        ;;
       probe_stale_anchor)
         # #814 / Codex P1 on #823: CodeRabbit reviewed the PREVIOUS head only.
         # The review object is pinned to old-sha, so no HEAD-pinned evidence
         # exists — only the summary issue comment, which carries no SHA.
         printf '[{"id":9951,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"old-sha"}]\n' "$bot" "$head_time"
+        ;;
+      probe_summary_lags_review)
+        # #814 / Phase 4b P1 on #823: mid-publication. A HEAD-pinned review
+        # object EXISTS (submitted at reply_time), but the newest summary
+        # passing HEAD_ANCHOR is the PRIOR head's, posted earlier. Existence
+        # alone would clear; the summary must also be at least as recent as
+        # the review it is credited to.
+        printf '[{"id":9961,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$reply_time"
         ;;
       intermediate_review_head_pin)
         # #535.2: a NEWER review (later submitted_at) references an
@@ -306,6 +320,17 @@ case "$endpoint" in
         # fresh_at >= HEAD_ANCHOR filter because the new head's committer date
         # is older than this comment — the author-controlled-timestamp hole.
         printf '[{"id":7805,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nReviewed the previous head."}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_summary_lags_review)
+        # Prior head's summary at head_time, i.e. BEFORE the HEAD review
+        # object at reply_time. Clean body, so nothing else would block a
+        # clear — only the temporal correlation check does.
+        printf '[{"id":7806,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nPrior head summary."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      probe_reviews_api_failure)
+        # A classifiable summary, so the probe reaches the reviews fetch that
+        # then fails.
+        printf '[{"id":7807,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nSummary."}]\n' "$bot" "$reply_time" "$reply_time"
         ;;
       review_arrives_during_probe)
         count=0
@@ -875,6 +900,48 @@ test_probe_summary_without_head_review_is_not_yet() {
     "a prior-head summary with no HEAD-pinned review must not clear (author-controlled anchor)"
 }
 
+test_probe_summary_lagging_head_review_is_not_yet() {
+  # Phase 4b P1 on #823. Existence of a HEAD-pinned review object is
+  # necessary but not sufficient: CodeRabbit publishes the review object and
+  # its PR-level summary as separate events. Mid-publication, a HEAD review
+  # exists while the newest summary passing HEAD_ANCHOR is still the prior
+  # head's — the inline count then reads the NEW review while the summary
+  # marker check reads the OLD summary, so a finding carried only in the
+  # forthcoming summary clears.
+  #
+  # Fixture: HEAD-pinned review at reply_time, prior-head summary at
+  # head_time (earlier). The summary must be at least as recent as the
+  # review it is credited to.
+  local dir rc
+  dir=$(make_case probe-summary-lag 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" probe_summary_lags_review)
+  assert_probe_not_yet "$dir" "$rc" summary-predates-head-review \
+    "a summary older than the HEAD review it would be credited to must not clear"
+}
+
+test_probe_reviews_api_failure_is_infra_not_clean() {
+  # Phase 4b P2 on #823. fetch_api_array's `die 3` runs in a SUBSHELL when the
+  # call sits inside `[ -z "$(...)" ]`, so an API or jq failure collapsed to an
+  # empty string and was reported as a clean rc 7 "no review yet" — a
+  # transient outage read as a confident negative, which is the false-negative
+  # class the barrier exists to prevent. The result is now captured and its
+  # status checked, so infra failures stay rc 3.
+  local dir rc=0
+  dir=$(make_case probe-reviews-fail 600 true 30 3 2)
+  ( cd "$dir" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_SCENARIO=probe_reviews_api_failure \
+      ./scripts/coderabbit-wait.sh --probe 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
+  if [ "$rc" = "3" ]; then
+    pass "#814 probe: a reviews-API failure exits 3 (infra), not a clean 7"
+  else
+    fail "#814 probe: expected rc 3 on a reviews-API failure; got $rc"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
 test_probe_env_var_equals_flag() {
   local dir rc
   dir=$(make_case probe-envvar 600 true 30 3 2)
@@ -938,6 +1005,8 @@ test_probe_rate_limit_is_not_yet_never_stalled
 test_probe_paused_is_not_yet_never_skipped
 test_probe_state_space_sweep
 test_probe_summary_without_head_review_is_not_yet
+test_probe_summary_lagging_head_review_is_not_yet
+test_probe_reviews_api_failure_is_infra_not_clean
 test_probe_env_var_equals_flag
 test_probe_terminal_review_matches_polling_verdict
 test_probe_field_absent_on_polling_runs
