@@ -83,6 +83,8 @@ EOF
 cat >"$FAKE_MP/AGENTS.md" <<'AGENTSEOF'
 # Agent Instructions
 
+## Sections
+
 1. **[Repository Overview](docs/agents/repository-overview.md)**
 2. **[Shared Agent Operating Rules](docs/agents/shared-operating-rules.md)**
 3. **[Agent Operating Rules](docs/agents/operating-rules.md)**
