@@ -515,7 +515,7 @@ assert_no_local_identity() {
   local entry remedy scopefile scopes via_include=0 via_conditional=0
   local seen_values="" dedupe incfile via_unresolved=0
   local unres unres_key unres_rest unres_raw unres_file
-  local repo_q path_q
+  local repo_q path_q worktree_file scope_label
   repo_q="$(shell_quote "$REPO_ROOT")"
   # `--worktree` is a DISTINCT scope only when extensions.worktreeConfig
   # is enabled; with the extension off git treats it as an alias for
@@ -524,12 +524,24 @@ assert_no_local_identity() {
   # scope only where it is real, and each offender is then named once, in
   # the scope that actually holds it.
   scopes="local"
+  worktree_file="$(canonical_path "$(scope_file worktree)" 2>/dev/null || true)"
   if [ "$(git -C "$REPO_ROOT" config --local --get --type=bool \
             extensions.worktreeConfig 2>/dev/null || true)" = "true" ]; then
     scopes="local worktree"
+  elif [ -f "$worktree_file" ]; then
+    # Turning the extension off does not remove config.worktree. Read the
+    # dormant file directly so re-enabling the extension cannot reactivate an
+    # identity that passed while inactive.
+    scopes="local dormant-worktree"
   fi
   for scope in $scopes; do
-    scopefile="$(canonical_path "$(scope_file "$scope")" 2>/dev/null || true)"
+    if [ "$scope" = "dormant-worktree" ]; then
+      scopefile="$worktree_file"
+      scope_label="dormant worktree"
+    else
+      scopefile="$(canonical_path "$(scope_file "$scope")" 2>/dev/null || true)"
+      scope_label="$scope"
+    fi
     for key in $IDENTITY_KEYS; do
       # `--includes` is load-bearing. It defaults to OFF whenever a
       # specific file is named — which `--local` and `--worktree` both
@@ -565,9 +577,9 @@ assert_no_local_identity() {
         esac
 
         if [ -n "$value" ]; then
-          entry="  $scope: $key = $value"
+          entry="  $scope_label: $key = $value"
         else
-          entry="  $scope: $key = (set to the empty string)"
+          entry="  $scope_label: $key = (set to the empty string)"
         fi
 
         # One unset command per offender that was ACTUALLY found, aimed
@@ -585,7 +597,12 @@ assert_no_local_identity() {
           remedy="    git -C $repo_q config --file $path_q --unset-all $key"
           via_include=1
         else
-          remedy="    git -C $repo_q config --$scope --unset-all $key"
+          if [ "$scope" = "dormant-worktree" ]; then
+            path_q="$(shell_quote "$scopefile")"
+            remedy="    git -C $repo_q config --file $path_q --unset-all $key"
+          else
+            remedy="    git -C $repo_q config --$scope --unset-all $key"
+          fi
         fi
 
         offenders+="$entry"$'\n'
@@ -599,8 +616,15 @@ assert_no_local_identity() {
         # What the conditional-include pass below compares against, so an
         # include whose condition IS active is not reported twice.
         seen_values+="$key"$'\037'"${originfile:-$scopefile}"$'\037'"$value"$'\n'
-      done < <(git -C "$REPO_ROOT" config "--$scope" --includes --show-origin -z \
-                 --get-all "$key" 2>/dev/null)
+      done < <(
+        if [ "$scope" = "dormant-worktree" ]; then
+          git -C "$REPO_ROOT" config --file "$scopefile" --includes \
+            --show-origin -z --get-all "$key" 2>/dev/null
+        else
+          git -C "$REPO_ROOT" config "--$scope" --includes --show-origin -z \
+            --get-all "$key" 2>/dev/null
+        fi
+      )
     done
 
     # Everything the pass above cannot see: the targets of conditional
@@ -620,9 +644,9 @@ assert_no_local_identity() {
           esac
           seen_values+="$dedupe"$'\n'
           if [ -n "$value" ]; then
-            entry="  $scope: $key = $value (via inactive include: $incfile)"
+            entry="  $scope_label: $key = $value (via inactive include: $incfile)"
           else
-            entry="  $scope: $key = (set to the empty string) (via inactive include: $incfile)"
+            entry="  $scope_label: $key = (set to the empty string) (via inactive include: $incfile)"
           fi
           path_q="$(shell_quote "$incfile")"
           remedy="    git -C $repo_q config --file $path_q --unset-all $key"
@@ -647,7 +671,7 @@ assert_no_local_identity() {
       unres_rest="${unres#*$'\037'}"
       unres_raw="${unres_rest%%$'\037'*}"
       unres_file="${unres_rest#*$'\037'}"
-      entry="  $scope: $unres_key = $unres_raw (unresolvable include path, declared in $unres_file)"
+      entry="  $scope_label: $unres_key = $unres_raw (unresolvable include path, declared in $unres_file)"
       path_q="$(shell_quote "$unres_file")"
       remedy="    git -C $repo_q config --file $path_q --unset-all $unres_key"
       via_unresolved=1
@@ -951,9 +975,12 @@ else
     # `/opt/homebrew/bin/git config …` write exactly the file a bare
     # `git` writes, and rejecting a leading slash waved both of them
     # through. The word still has to BE `git` and be followed by
-    # whitespace, so `.git/config`, `github`, and `mygit` do not match.
+    # optional matching shell quote and whitespace, so `.git/config`,
+    # `github`, and `mygit` do not match. Quoted command words (`"git"`
+    # and a quoted path-qualified Git word) are executable invocations too; `\047`
+    # spells a single quote without ending this shell-quoted awk program.
     function is_git_config(s) {
-      return (s ~ /(^|[^-A-Za-z0-9_.])git[[:space:]]+([^[:space:]]+[[:space:]]+)*config([[:space:]]|$)/)
+      return (s ~ /(^|[^-A-Za-z0-9_.])git["\047]?[[:space:]]+([^[:space:]]+[[:space:]]+)*config([[:space:]]|$)/)
     }
     # Where a VALUE is assigned to one of the identity keys, or 0 for no
     # assignment: the key is followed by whitespace and a value token.
@@ -1017,7 +1044,7 @@ else
     function flag_region(s, keypos,   pre, off, last, t) {
       pre = substr(s, 1, keypos - 1)
       last = 0; off = 0; t = pre
-      while (match(t, /(^|[^-A-Za-z0-9_.])git[[:space:]]/)) {
+      while (match(t, /(^|[^-A-Za-z0-9_.])git["\047]?[[:space:]]/)) {
         last = off + RSTART
         off = off + RSTART + RLENGTH - 1
         t = substr(t, RSTART + RLENGTH)
@@ -1033,9 +1060,11 @@ else
     function targeted(s) {
       if (s ~ /(^|[[:space:]])-C([[:space:]]|=)/) return 1
       if (s ~ /(^|[[:space:]])--git-dir([[:space:]]|=)/) return 1
-      if (s ~ /(^|[[:space:]])--global([[:space:]]|$)/) return 1
-      if (s ~ /(^|[[:space:]])--system([[:space:]]|$)/) return 1
-      if (s ~ /(^|[[:space:]])(-f|--file|--blob)([[:space:]]|=)/) return 1
+      # Git accepts unambiguous long-option prefixes. These are the shortest
+      # prefixes verified against the config parser for the three write scopes.
+      if (s ~ /(^|[[:space:]])--glob(a(l)?)?([[:space:]]|$)/) return 1
+      if (s ~ /(^|[[:space:]])--syst(e(m)?)?([[:space:]]|$)/) return 1
+      if (s ~ /(^|[[:space:]])(-f|--fil(e)?|--blob)([[:space:]]|=)/) return 1
       # `-f<path>` is the valid attached-argument form of the short option;
       # a quote may begin that path in shell source (`-f"$cfg"`).
       if (s ~ /(^|[[:space:]])-f[^[:space:]=]/) return 1
@@ -1238,7 +1267,11 @@ else
       }
       piece = $0
       if (continued($0)) piece = substr(piece, 1, length(piece) - 1)
-      buf = (nbuf == 1 ? "" : buf " ") piece
+      # Shell removes a backslash-newline without adding a byte. Any spacing
+      # that separated tokens was already before the backslash and remains in
+      # `piece`; inserting another space breaks continuations inside words
+      # (`gi\` + `t` must become `git`, not `gi t`).
+      buf = (nbuf == 1 ? piece : buf piece)
       if (continued($0)) next
       flush()
     }

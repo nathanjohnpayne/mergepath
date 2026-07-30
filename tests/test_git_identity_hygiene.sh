@@ -224,6 +224,21 @@ else
   fail "continuation between key and value: rc=$RC out=$OUT"
 fi
 
+# Case 12b: backslash-newline deletion happens inside words too. Adding a
+# separator while joining turns this executable `git config` into unrelated
+# `gi t con fig` tokens and makes the static scan pass open.
+run_on_fixture "tests/split-words.sh" '#!/usr/bin/env bash
+gi\
+t con\
+fig user.email "joined@example.com"
+'
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/split-words.sh:2"; then
+  pass "continuation inside command words: adjacency is preserved and write is caught"
+else
+  fail "intra-word continuation hid identity write: rc=$RC out=$OUT"
+fi
+
 # Case 13: joining must not invent hits. A continued command whose scope
 # flag sits on its own physical line is correctly scoped and must pass —
 # the suppressors are read off the whole logical command, not one line.
@@ -440,6 +455,17 @@ else
   fail "real Markdown marker not honoured: rc=$RC out=$OUT"
 fi
 
+# Case 26b: the policy must not ship runnable global writes carrying fixture
+# placeholders. A reader pasting them would replace the machine-wide human
+# author identity, and the local-identity guard intentionally cannot catch it.
+if ! grep -Eq '^[[:space:]]*git config --global user\.(name|email)[[:space:]]+.*(Your Name|you@example\.com)' \
+     "$ROOT/REVIEW_POLICY.md" \
+  && grep -qF 'verified machine setup' "$ROOT/REVIEW_POLICY.md"; then
+  pass "identity policy verifies/provisions the real human identity without runnable placeholders"
+else
+  fail "REVIEW_POLICY.md still publishes executable global placeholder identity writes"
+fi
+
 # ── Part A: the live-repo identity assertion ──────────────────────────
 
 IDREPO="$WORKDIR/idrepo"
@@ -538,6 +564,33 @@ if [ "$RC" = "0" ]; then
   pass "remediation: following the printed commands clears the failure"
 else
   fail "remediation did not clear the failure: rc=$RC out=$OUT"
+fi
+
+# Case 29b: disabling extensions.worktreeConfig does not delete the current
+# worktree's config.worktree. Its identity becomes dormant, then reactivates
+# immediately if the extension is re-enabled, without another identity write.
+DORMANT_WT_REPO="$WORKDIR/dormant-worktree-repo"
+git init -q -b main "$DORMANT_WT_REPO"
+git -C "$DORMANT_WT_REPO" config --local extensions.worktreeConfig true
+git -C "$DORMANT_WT_REPO" config --worktree user.email dormant-worktree@example.com
+git -C "$DORMANT_WT_REPO" config --local extensions.worktreeConfig false
+DORMANT_EFFECTIVE="$(git -C "$DORMANT_WT_REPO" config --local --get user.email 2>/dev/null || true)"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$DORMANT_WT_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+REMEDY="$(printf '%s\n' "$OUT" | grep -E '^[[:space:]]+git .*--unset-all user.email' | head -1 || true)"
+set +e
+eval "$REMEDY" >/dev/null 2>&1
+OUT_AFTER="$(MERGEPATH_GIT_IDENTITY_ROOT="$DORMANT_WT_REPO" bash "$CHECK" 2>&1)"
+RC_AFTER=$?
+set -e
+if [ -z "$DORMANT_EFFECTIVE" ] && [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "dormant worktree" \
+  && [ -n "$REMEDY" ] && [ "$RC_AFTER" = "0" ]; then
+  pass "disabled worktreeConfig: dormant config.worktree identity is caught and removable"
+else
+  fail "dormant worktree identity escaped: effective='$DORMANT_EFFECTIVE' remedy='$REMEDY' rc=$RC after=$RC_AFTER out=$OUT after_out=$OUT_AFTER"
 fi
 
 # Case 30: the remediation must act on the repository that produced the
@@ -1065,6 +1118,9 @@ git --git-dir="$FIX/.git" config user.email "t@t"
 git config --file "$FIX/.git/config" user.email "t@t"
 git config -f "$FIX/.git/config" user.name "t"
 git config -f"$FIX/.git/config" user.signingkey "ABC123"
+git config --glob user.email "you@example.com"
+git config --syst user.name "root"
+git config --fil "$FIX/.git/config" commit.gpgsign false
 git config --system user.email "root@example.com"
 '
 if [ "$RC" = "0" ]; then
@@ -1107,6 +1163,26 @@ if [ "$RC" = "1" ] \
   pass "path-qualified git executables: caught"
 else
   fail "path-qualified git executables: rc=$RC out=$OUT"
+fi
+
+# Case 47b: quoting the command word does not change the executable. Both a
+# quoted PATH lookup and a quoted path-qualified word run Git and write the
+# same current-repository config as their unquoted counterparts.
+run_on_fixture "tests/quoted-git.sh" '#!/usr/bin/env bash
+"git" config user.email quoted@example.com
+'
+quoted_path_out="$OUT"
+quoted_path_rc=$RC
+run_on_fixture "tests/quoted-git-path.sh" "#!/usr/bin/env bash
+'/usr/bin/git' config user.name quoted
+"
+if [ "$quoted_path_rc" = "1" ] \
+  && printf '%s' "$quoted_path_out" | grep -q "tests/quoted-git.sh:2" \
+  && [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/quoted-git-path.sh:2"; then
+  pass "quoted Git executable words: caught in PATH and path-qualified forms"
+else
+  fail "quoted Git executable escaped scan: path_rc=$quoted_path_rc path_out=$quoted_path_out rc=$RC out=$OUT"
 fi
 
 # Case 48: the converse of case 47 — accepting a `/` before `git` must
