@@ -76,6 +76,8 @@ EOF
 cat >"$FAKE_MP/AGENTS.md" <<'AGENTSEOF'
 # Agent Instructions
 
+## Sections
+
 1. **[Repository Overview](docs/agents/repository-overview.md)**
 2. **[Shared Agent Operating Rules](docs/agents/shared-operating-rules.md)**
 3. **[Agent Operating Rules](docs/agents/operating-rules.md)**
@@ -2057,7 +2059,9 @@ mkdir -p "$TARGET16"
   # calling clear_warning bare here would abort on the assignment and
   # prove nothing.
   attempt_clear() { TMPDIR="$WORKDIR/no-such-tmpdir" bootstrap::clear_warning "some-key"; }
+  # The assignment itself reproduces the stage call shape.
   clear_rc=0
+  # shellcheck disable=SC2034
   attempt_clear || clear_rc=$?
 ) >/dev/null 2>&1 || true
 [ -f "$TARGET16/.bootstrap-state.warnings" ] \
