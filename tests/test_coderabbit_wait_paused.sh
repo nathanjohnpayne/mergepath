@@ -219,6 +219,11 @@ case "$endpoint" in
   repos/owner/repo/pulls/999/reviews)
     # Used by count_potential_issues on the clearance path.
     case "$scenario" in
+      probe_skip_with_head_review)
+        # #814: a real HEAD-pinned review exists on a PR whose auto-review
+        # eligibility would otherwise skip (draft / non-base-branch).
+        printf '[{"id":9801,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$review_time"
+        ;;
       paused_then_review)
         if [ "$(resume_count)" -ge 1 ]; then
           printf '[{"id":9501,"user":{"login":"%s"},"submitted_at":"%s"}]\n' "$bot" "$review_time"
@@ -232,7 +237,12 @@ case "$endpoint" in
     esac
     ;;
   repos/owner/repo/pulls/999/comments)
-    printf '[]\n'
+    case "$scenario" in
+      probe_skip_with_head_review)
+        printf '[{"id":9802,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","commit_id":"head-sha","pull_request_review_id":9801,"in_reply_to_id":null,"body":"_⚠️ Potential issue_ | _🟠 Major_\\n\\nReal finding on a draft PR."}]\n' "$bot" "$review_time" "$review_time"
+        ;;
+      *) printf '[]\n' ;;
+    esac
     ;;
   repos/owner/repo/issues/999/comments)
     case "$scenario" in
@@ -533,6 +543,34 @@ test_invalid_base_regex_fails_safe_not_skipped() {
 }
 
 test_paused_resume_then_review_clears
+# #814, Phase 4b P1 on #823. The static draft / non-base-branch skips run
+# unconditionally before the scan. A PR in that state can already carry a real
+# HEAD review — after a manual `@coderabbitai review`, a retarget, or a later
+# conversion to draft — and that review may carry findings. Exiting 6 without
+# looking reports WILL-NOT-REPORT, which the #814 barrier reads as "nothing
+# will ever land here", and it proceeds past real findings. Probe mode must
+# inspect HEAD evidence FIRST and only fall back to the skip when there is
+# none.
+test_probe_inspects_head_evidence_before_skip() {
+  local dir rc issues
+  # draft PR + drafts:false in .coderabbit.yml => the skip would fire.
+  dir=$(make_case probe-skip-head-review 600 2 main true yes)
+  rc=0
+  ( cd "$dir" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_SCENARIO=probe_skip_with_head_review \
+      ./scripts/coderabbit-wait.sh --probe 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
+  issues=$(jq -r '.potential_issue_count' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "2" ] && [ "$issues" = "1" ]; then
+    pass "#814 probe: a draft PR with a real HEAD review reports its findings, not a skip"
+  else
+    fail "#814 probe: expected rc 2 with 1 finding on a draft PR carrying a HEAD review; got rc=$rc count=$issues"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
 test_paused_persists_exhausts_cap_exit6
 test_paused_same_id_timeout_exit6_not_exit4
 test_non_base_branch_skip_exit6
@@ -541,6 +579,7 @@ test_allowed_base_non_draft_not_skipped
 test_base_branches_regex_match_not_skipped
 test_default_branch_always_allowed_not_skipped
 test_invalid_base_regex_fails_safe_not_skipped
+test_probe_inspects_head_evidence_before_skip
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

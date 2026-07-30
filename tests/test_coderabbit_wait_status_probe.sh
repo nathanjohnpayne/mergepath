@@ -222,6 +222,12 @@ case "$endpoint" in
         echo "simulated reviews API failure" >&2
         exit 44
         ;;
+      probe_finding_predates_head)
+        # #814 / #824: a real HEAD-pinned review whose inline finding was
+        # created BEFORE the head committer date — the shape a future-dated
+        # head produces. The review is SHA-pinned, so the finding must count.
+        printf '[{"id":9971,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$reply_time"
+        ;;
       probe_stale_anchor)
         # #814 / Codex P1 on #823: CodeRabbit reviewed the PREVIOUS head only.
         # The review object is pinned to old-sha, so no HEAD-pinned evidence
@@ -250,6 +256,12 @@ case "$endpoint" in
     ;;
   repos/owner/repo/pulls/999/comments)
     case "$scenario" in
+      probe_finding_predates_head)
+        # created_at is BEFORE head_time, i.e. before HEAD_IDENTITY_ANCHOR.
+        # The anchored counter drops it; the probe must not, because commit_id
+        # already pins it to this head.
+        printf '[{"id":9972,"user":{"login":"%s"},"created_at":"2026-06-03T00:00:00Z","updated_at":"2026-06-03T00:00:00Z","commit_id":"head-sha","pull_request_review_id":9971,"in_reply_to_id":null,"body":"_⚠️ Potential issue_ | _🟠 Major_\\n\\nFinding created before the head committer date."}]\n' "$bot"
+        ;;
       review_arrives_during_probe)
         count=0
         if [ -f "$state_dir/probe-count" ]; then
@@ -832,7 +844,37 @@ test_probe_paused_is_not_yet_never_skipped() {
 #   * rc 6 carries skip_reason non-base-branch or draft, NEVER paused,
 #     because the barrier reads rc 6 + skip_reason as WILL-NOT-REPORT and
 #     would clear for a PR CodeRabbit has not reviewed;
-#   * the emitted head_sha is the head the scan actually classified.
+#   * the emitted head_sha is the head the scan actually classified;
+#   * `probe.observed` is the value the contract advertises for that state,
+#     not merely SOME allowed value. The first version of this sweep asserted
+#     only the exit-code set, which is too weak to notice an `observed` the
+#     documented enum lists but no input can produce — a reviewer caught that
+#     on #823 and the enum entry was wrong, not the code.
+#
+# expected_observed <trust> <status> <scenario> — the contract, stated
+# independently of the implementation so a drift in either shows up as a
+# mismatch.
+expected_observed() {
+  local trust=$1 status=$2 scenario=$3
+  # A StatusContext on HEAD is SHA-pinned evidence and terminal regardless of
+  # the comment surface — but ONLY when the policy trusts it for clearance.
+  # With trust_status_context_for_clearance false the probe must not consult
+  # it at all, which is why this branch is gated on both.
+  if [ "$trust" = "true" ] && { [ "$status" = "success" ] || [ "$status" = "failure" ]; }; then
+    printf 'terminal\n'; return
+  fi
+  case "$scenario" in
+    none)                  printf 'none\n' ;;
+    rate_limit)            printf 'rate_limit\n' ;;
+    probe_paused)          printf 'paused\n' ;;
+    probe_in_progress)     printf 'in_progress\n' ;;
+    # Narration is filtered before classification, so it reads as nothing.
+    probe_narration)       printf 'none\n' ;;
+    probe_review_on_head)  printf 'terminal\n' ;;
+    *)                     printf 'UNMAPPED\n' ;;
+  esac
+}
+
 test_probe_state_space_sweep() {
   local trust status scenario dir rc n=0 bad=0
   for trust in false true; do
@@ -855,13 +897,16 @@ test_probe_state_space_sweep() {
             CODEX_STUB_LOG="$dir/state/codex-stub.log" \
             ./scripts/coderabbit-wait.sh --probe 999 owner/repo \
             >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
-        local posts codex skip head
+        local posts codex skip head obs want
         posts=$(probe_count "$dir")
         codex=$(codex_invocations "$dir")
         skip=$(jq -r '.skip_reason | tostring' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
         head=$(jq -r '.head_sha' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+        obs=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+        want=$(expected_observed "$trust" "$status" "$scenario")
         local why=""
         [ "$posts" = "0" ] || why="posted $posts"
+        [ "$obs" = "$want" ] || why="${why:+$why; }observed=$obs want=$want"
         [ "$codex" = "0" ] || why="${why:+$why; }invoked codex-review-request $codex time(s)"
         case "$rc" in 0|2|6|7) ;; *) why="${why:+$why; }rc=$rc not in {0,2,6,7}" ;; esac
         [ "$rc" != "6" ] || [ "$skip" != "paused" ] || why="${why:+$why; }rc 6 with skip_reason=paused"
@@ -942,6 +987,25 @@ test_probe_reviews_api_failure_is_infra_not_clean() {
   fi
 }
 
+test_probe_finding_predating_head_still_counts() {
+  # #824, subsumed here. count_potential_issues_for_sha applies an identity
+  # floor (HEAD_IDENTITY_ANCHOR = the HEAD committer date, which the pusher
+  # controls). A future-dated head pushes that floor past real findings that
+  # are already SHA-pinned to the head, so they stop being counted and the
+  # probe clears. The probe passes an empty anchor: commit_id is GitHub-owned
+  # and sufficient, and the floor can only ever under-count.
+  local dir rc issues
+  dir=$(make_case probe-old-finding 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" probe_finding_predates_head)
+  issues=$(jq -r '.potential_issue_count' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "2" ] && [ "$issues" = "1" ]; then
+    pass "#814/#824: an inline finding predating the head committer date still counts (rc 2)"
+  else
+    fail "#814/#824: expected rc 2 with 1 finding; got rc=$rc count=$issues"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
 test_probe_env_var_equals_flag() {
   local dir rc
   dir=$(make_case probe-envvar 600 true 30 3 2)
@@ -1007,6 +1071,7 @@ test_probe_state_space_sweep
 test_probe_summary_without_head_review_is_not_yet
 test_probe_summary_lagging_head_review_is_not_yet
 test_probe_reviews_api_failure_is_infra_not_clean
+test_probe_finding_predating_head_still_counts
 test_probe_env_var_equals_flag
 test_probe_terminal_review_matches_polling_verdict
 test_probe_field_absent_on_polling_runs
