@@ -1545,6 +1545,67 @@ else
   fail "Case 14s unexpected (rc=$rc): $out"
 fi
 
+# CommonMark does not let indented code interrupt an open list item or
+# paragraph. These four-space lines still render links and must remain visible
+# to the consumer-truthfulness scan.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|- Governance\n    - See [the audit](hub.md)\n
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md'"; then
+  pass "Case 14s1: nested-list links remain rendered prose"
+else
+  fail "Case 14s1 nested-list unexpected (rc=$rc): $out"
+fi
+
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|Governance\n    See [the audit](hub.md)\n
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md'"; then
+  pass "Case 14s1: indented paragraph continuations remain rendered prose"
+else
+  fail "Case 14s1 paragraph-continuation unexpected (rc=$rc): $out"
+fi
+
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|> Governance\n    See [the audit](hub.md)\n
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md'"; then
+  pass "Case 14s1: lazy blockquote continuations remain rendered prose"
+else
+  fail "Case 14s1 blockquote-continuation unexpected (rc=$rc): $out"
+fi
+
+# The same indentation after a heading or blank line really does start an
+# indented code block, so link-shaped examples there must stay ignored.
+for code_body in \
+  '# Governance\n    See [the audit](hub.md)\n' \
+  'Governance\n\n    See [the audit](hub.md)\n' \
+  'Governance\n===\n    See [the audit](hub.md)\n' \
+  '* * *\n    See [the audit](hub.md)\n' \
+  '> # Governance\n    See [the audit](hub.md)\n'
+do
+  set +e
+  out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+    "docs/agents/shared.md|$code_body
+docs/agents/hub.md|# Hub-only machinery")
+  rc=$?
+  set -e
+  if [ "$rc" = "0" ]; then
+    pass "Case 14s1: genuine indented code remains ignored"
+  else
+    fail "Case 14s1 indented-code control unexpected (rc=$rc): $out"
+  fi
+done
+
 # A backtick fence opener whose info string itself contains a backtick is
 # invalid CommonMark. The following link remains rendered prose and must not be
 # hidden until an apparent closing fence.
