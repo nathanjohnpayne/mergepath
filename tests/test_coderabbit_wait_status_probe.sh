@@ -216,6 +216,12 @@ case "$endpoint" in
         # return the SAME terminal verdict the polling mode does.
         printf '[{"id":9941,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
         ;;
+      probe_stale_anchor)
+        # #814 / Codex P1 on #823: CodeRabbit reviewed the PREVIOUS head only.
+        # The review object is pinned to old-sha, so no HEAD-pinned evidence
+        # exists — only the summary issue comment, which carries no SHA.
+        printf '[{"id":9951,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"old-sha"}]\n' "$bot" "$head_time"
+        ;;
       intermediate_review_head_pin)
         # #535.2: a NEWER review (later submitted_at) references an
         # intermediate commit, while the HEAD review is older. The
@@ -294,6 +300,12 @@ case "$endpoint" in
         ;;
       probe_review_on_head)
         printf '[{"id":7803,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nNothing to flag."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      probe_stale_anchor)
+        # The PRIOR head's summary. It classifies as `review` and passes the
+        # fresh_at >= HEAD_ANCHOR filter because the new head's committer date
+        # is older than this comment — the author-controlled-timestamp hole.
+        printf '[{"id":7805,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nReviewed the previous head."}]\n' "$bot" "$reply_time" "$reply_time"
         ;;
       review_arrives_during_probe)
         count=0
@@ -843,6 +855,26 @@ test_probe_state_space_sweep() {
   fi
 }
 
+test_probe_summary_without_head_review_is_not_yet() {
+  # Codex P1 on #823. A PR-level summary comment carries no commit SHA, so the
+  # only thing tying it to this head is fresh_at >= HEAD_ANCHOR — and
+  # HEAD_ANCHOR is the HEAD committer date, which whoever pushed controls. A
+  # new head with an older committer date (cherry-pick, or a rebase preserving
+  # committer dates) lets the PREVIOUS head's summary through, and
+  # count_potential_issues then returns 0 for "no HEAD-pinned review" exactly
+  # as it does for "reviewed, nothing found". Polling calls that advisory;
+  # the barrier would call it REPORTED and approve a head nobody reviewed.
+  #
+  # Fixture: summary comment present and fresh, review object pinned to
+  # old-sha. The probe must refuse on the absence of GitHub-owned HEAD
+  # evidence rather than trust the timestamp.
+  local dir rc
+  dir=$(make_case probe-stale-anchor 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" probe_stale_anchor)
+  assert_probe_not_yet "$dir" "$rc" summary-without-head-review \
+    "a prior-head summary with no HEAD-pinned review must not clear (author-controlled anchor)"
+}
+
 test_probe_env_var_equals_flag() {
   local dir rc
   dir=$(make_case probe-envvar 600 true 30 3 2)
@@ -905,6 +937,7 @@ test_probe_no_comment_is_not_yet
 test_probe_rate_limit_is_not_yet_never_stalled
 test_probe_paused_is_not_yet_never_skipped
 test_probe_state_space_sweep
+test_probe_summary_without_head_review_is_not_yet
 test_probe_env_var_equals_flag
 test_probe_terminal_review_matches_polling_verdict
 test_probe_field_absent_on_polling_runs

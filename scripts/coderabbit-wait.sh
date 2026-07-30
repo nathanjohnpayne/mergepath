@@ -163,7 +163,8 @@
 #     "probe": null | {
 #       "mode": true,
 #       "observed": "none" | "rate_limit" | "paused" | "in_progress"
-#                   | "status_probe" | "terminal"
+#                   | "status_probe" | "summary-without-head-review"
+#                   | "terminal"
 #     },
 #     "codex_failover_requested": true | false,
 #     "waited_seconds": N
@@ -1010,24 +1011,34 @@ scan_latest_comment_best_effort() {
 # finding. Treat that bot-authored marker as authoritative for this
 # helper's advisory gate; ordinary human/agent replies do not clear a
 # finding by themselves.
-count_potential_issues() {
-  local reviews pulls_comments latest_review_id
+# Id of the latest CodeRabbit review object pinned to the current HEAD, or
+# empty. Pin the selection to the current HEAD commit (`commit_id ==
+# HEAD_SHA`), not just freshness (`submitted_at >= HEAD_ANCHOR`). A review
+# submitted after the anchor but referencing an intermediate commit (e.g. a
+# rapid push sequence where CodeRabbit reviewed an earlier SHA) must not be
+# chosen as the HEAD review. Mirror the HEAD-pinning in
+# scripts/codex-review-check.sh (commit_id == $sha).
+#
+# Factored out of count_potential_issues (#814) so the probe-mode evidence
+# check below reuses this selection rather than adding a second copy of it —
+# scripts/ci/check_workflow_parsers exists to police exactly that.
+latest_head_pinned_review_id() {
+  local reviews
   reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
-  # Pin the latest-review selection to the current HEAD commit
-  # (`commit_id == HEAD_SHA`), not just freshness (`submitted_at >=
-  # HEAD_ANCHOR`). A review submitted after the anchor but referencing an
-  # intermediate commit (e.g. a rapid push sequence where CodeRabbit
-  # reviewed an earlier SHA) must not be chosen as the HEAD review. Mirror
-  # the HEAD-pinning in scripts/codex-review-check.sh (commit_id == $sha).
-  latest_review_id=$(echo "$reviews" | jq --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" --arg head_sha "$HEAD_SHA" '
+  echo "$reviews" | jq -r --arg bot "$BOT_LOGIN" --arg after "$HEAD_ANCHOR" --arg head_sha "$HEAD_SHA" '
     [ .[]
       | select(.user.login == $bot)
       | select(.submitted_at >= $after)
       | select(.commit_id == $head_sha)
     ]
     | sort_by(.submitted_at) | last
-    | if . == null then null else .id end
-  ')
+    | if . == null then "" else (.id | tostring) end
+  '
+}
+
+count_potential_issues() {
+  local pulls_comments latest_review_id
+  latest_review_id=$(latest_head_pinned_review_id)
 
   if [ -z "$latest_review_id" ] || [ "$latest_review_id" = "null" ]; then
     echo "0"
@@ -2136,6 +2147,27 @@ while :; do
       continue
       ;;
     review)
+      # #814 (Codex P1 on #823): a probe must not clear on a PR-level summary
+      # alone. Issue comments carry no commit SHA, so the only thing tying one
+      # to this head is `fresh_at >= HEAD_ANCHOR`, and HEAD_ANCHOR is the HEAD
+      # COMMITTER DATE — author-controlled. A new head whose committer date is
+      # older than the previous head's summary (cherry-pick, or a rebase that
+      # preserves committer dates) lets the PRIOR head's summary through the
+      # filter; count_potential_issues then returns 0 for "no HEAD-pinned
+      # review", which is indistinguishable from "reviewed, nothing found",
+      # and the arm below emits `cleared`. For polling that is an advisory
+      # false-clear; for the barrier it is a REPORTED verdict on a head no
+      # provider reviewed — the #794 shape this mode exists to make
+      # unreachable. Require GitHub-owned HEAD evidence instead of a
+      # timestamp the pusher controls. NOT-YET, so the barrier re-probes on
+      # its own bound rather than deadlocking.
+      #
+      # Probe-mode only: polling behaviour is unchanged, and the StatusContext
+      # fast path is untouched because it reads commits/$HEAD_SHA/statuses and
+      # is therefore already pinned by construction.
+      if [ "$PROBE_MODE" = "true" ] && [ -z "$(latest_head_pinned_review_id)" ]; then
+        probe_not_yet_from_latest "summary-without-head-review"
+      fi
       POTENTIAL_ISSUES=$(count_potential_issues)
       REVIEW_JSON=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
       # #535: the inline count scans only pulls/{pr}/comments. Also honor a
