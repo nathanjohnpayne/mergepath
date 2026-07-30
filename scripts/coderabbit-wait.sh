@@ -46,18 +46,31 @@
 # See nathanjohnpayne/mergepath#490.
 #
 # Usage:
-#   scripts/coderabbit-wait.sh <PR_NUMBER> [REPO]
+#   scripts/coderabbit-wait.sh [--probe] <PR_NUMBER> [REPO]
 #
 # Arguments:
 #   PR_NUMBER  Required. The pull request number (integer).
 #   REPO       Optional. Fully-qualified "owner/repo". Defaults to the
 #              current repository detected by `gh repo view`.
 #
+# Options:
+#   --probe    Read-only single-scan mode (#814). ONE classification pass
+#              over the surfaces the poll loop reads, then exit. Never
+#              sleeps, never waits out max_wait_seconds, posts NOTHING: no
+#              retry trigger, no `resume`, no status-probe mention, no Codex
+#              failover. A review already on HEAD still exits 0/2 with the
+#              same JSON; "nothing on this HEAD yet" exits 7. Equivalent to
+#              CODERABBIT_WAIT_PROBE=1. Answers "has CodeRabbit reported on
+#              this head?" without spending a budget or touching the PR.
+#
 # Environment:
 #   GH_TOKEN   Required unless a fresh op-preflight cache is available.
 #              Must resolve to the reviewer identity for retry-trigger
 #              writes. In the template flow this helper auto-sources
 #              $OP_PREFLIGHT_REVIEWER_PAT after preflight.
+#   CODERABBIT_WAIT_PROBE
+#              Set to 1/true/yes to run in --probe mode without changing a
+#              caller's argument list. Reads still need a token.
 #
 # Behavior:
 #   1. Reads coderabbit.max_wait_seconds (default 1245; measured full-fleet max + one poll interval, #623) and
@@ -112,7 +125,7 @@
 #     "head_committer_date": "<iso-8601>",
 #     "bot_login": "coderabbitai[bot]",
 #     "status": "cleared" | "findings" | "timeout" | "rate_limit_stalled"
-#               | "paused" | "skipped",
+#               | "paused" | "skipped" | "no_review_yet",
 #     "skip_reason": null | "paused" | "non-base-branch" | "draft",
 #     "review": null | {
 #       "id": N,
@@ -144,6 +157,15 @@
 #       },
 #       "waited_seconds": N
 #     },
+#     # --probe only (#814); null on every polling run. Distinct from
+#     # status_probe above, which is the timeout-time narration request a
+#     # --probe run never sends.
+#     "probe": null | {
+#       "mode": true,
+#       "observed": "none" | "rate_limit" | "paused" | "in_progress"
+#                   | "status_probe" | "terminal"
+#     },
+#     "codex_failover_requested": true | false,
 #     "waited_seconds": N
 #   }
 #
@@ -166,12 +188,24 @@
 #       caller should raise `auto_pause_after_reviewed_commits`, retarget
 #       the base, mark the PR ready, or escalate — not merely log and
 #       proceed. See nathanjohnpayne/mergepath#490.
+#   7   PROBE_NO_REVIEW — `--probe` only. The single scan found no review
+#       on the current HEAD. NOT a timeout (4), NOT a stalled retry budget
+#       (5), NOT an un-invocable skip (6): a probe posts no retry and no
+#       `resume`, so it can never have exhausted either budget, and 5 or 6
+#       would escalate or excuse a PR CodeRabbit may be about to review.
+#       `probe.observed` names which surface the scan landed on. Callers
+#       using this as an ordering barrier re-probe on a bound of their own.
+#       NOT 1: under `set -euo pipefail` any unguarded failure exits 1 with
+#       no JSON, so a caller could not tell rc 1 from a crashed run.
 #
 # Design notes:
 #   - Read-only except for retry-trigger comments, the auto-pause
 #     `@coderabbitai resume` re-invocation, and timeout status-probe
 #     comments. Does not push commits, does not modify labels, does not
 #     merge.
+#   - `--probe` is read-only with no exceptions. It returns before all
+#     three writers above and before the #489 Codex failover, so a probe
+#     run performs zero mutations on the PR.
 #   - Idempotent across reruns on the same HEAD. A freshly-landed review
 #     is detected on the next poll regardless of how many times the script
 #     has been run.
@@ -217,8 +251,47 @@ fi
 
 # --- argument parsing -------------------------------------------------------
 
+# --probe (#814): read-only, zero-budget, single-scan mode.
+#
+# It is NOT MAX_WAIT_SECONDS=0. With a zero budget the loop's top-of-
+# iteration ceiling check fires BEFORE the first scan and routes into
+# emit_timeout, which POSTS `@coderabbitai, how is the review going?` and
+# returns 4 — so zero-budget-as-max-wait would post on every call and never
+# actually look. That is why this is a mode, not a value.
+PROBE_EXIT_CODE=7
+PROBE_MODE=false
+case "${CODERABBIT_WAIT_PROBE:-}" in
+  1|true|TRUE|True|yes|YES) PROBE_MODE=true ;;
+esac
+
+# Leading-flag scan only: the first non-option argument ends the scan, so
+# "$@" is left holding exactly the positionals the arity check below already
+# validates. Every existing caller passes `<PR_NUMBER> [REPO]` with no flags
+# and breaks immediately on $1, so none regress. No array is built, so there
+# is no bash 3.2 empty-array-under-set-u hazard.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --probe)
+      PROBE_MODE=true
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "ERROR: unknown option '$1'" >&2
+      echo "Usage: $0 [--probe] <PR_NUMBER> [REPO]" >&2
+      exit 3
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  echo "Usage: $0 <PR_NUMBER> [REPO]" >&2
+  echo "Usage: $0 [--probe] <PR_NUMBER> [REPO]" >&2
   exit 3
 fi
 
@@ -1524,6 +1597,14 @@ run_status_probe_once() {
 emit_timeout() {
   local message=$1
   log "$message"
+  # A --probe run has no budget and posts nothing, so it must never reach
+  # run_status_probe_once below. Any path landing here in probe mode has
+  # already completed its single scan without finding a review on HEAD.
+  # This guard is deliberately structural: it forecloses the post no matter
+  # which caller reached emit_timeout.
+  if [ "$PROBE_MODE" = "true" ]; then
+    probe_not_yet "budget" "null"
+  fi
   # Once a pause has been observed, a timeout is a still-paused condition,
   # not an advisory timeout. Exit 6 (skip_reason=paused) so callers that
   # treat exit 4 as advisory (agent-review.yml) cannot merge past a PR that
@@ -1538,6 +1619,27 @@ emit_timeout() {
   run_status_probe_once
   emit_terminal_review_after_probe_if_present
   emit_json_and_exit "timeout" 4 "null" 0
+}
+
+# Emit the read-only probe verdict and exit PROBE_EXIT_CODE. `observed`
+# records WHICH non-terminal surface the scan landed on, so a caller can
+# tell "said nothing at all" from "rate-limited" or "paused" without
+# re-reading the PR. No write, no sleep, no second scan.
+probe_not_yet() {
+  local observed=$1 review_json=$2
+  PROBE_OBSERVED="$observed"
+  log "probe: no CodeRabbit review on $HEAD_SHA yet (observed=$observed) — exiting $PROBE_EXIT_CODE without posting"
+  emit_json_and_exit "no_review_yet" "$PROBE_EXIT_CODE" "$review_json" 0
+}
+
+# Same, surfacing the non-terminal comment the loop just classified, using
+# the same projection the terminal arms use. Falls back to a null review
+# object if the projection fails, so a probe can never abort on decoration.
+probe_not_yet_from_latest() {
+  local observed=$1 review_json
+  review_json=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}') \
+    || review_json=null
+  probe_not_yet "$observed" "$review_json"
 }
 
 # --- poll loop --------------------------------------------------------------
@@ -1559,6 +1661,10 @@ PAUSE_OBSERVED=false
 # rate-limit paths; set to paused / non-base-branch / draft on a #490 skip.
 SKIP_REASON=""
 STATUS_PROBE_RAN=false
+# --probe bookkeeping (#814). PROBE_JSON stays null outside probe mode — the
+# same additive posture blocking_tier_unresolved takes when it does not apply.
+PROBE_OBSERVED=""
+PROBE_JSON=null
 # #489 rate-limit→Codex failover state. CODEX_FAILOVER_FIRED latches after the
 # first attempt so retries within a run don't re-post. CODEX_FAILOVER_REQUESTED
 # records whether Codex was actually engaged (the helper posted, or found an
@@ -1611,6 +1717,13 @@ emit_json_and_exit() {
     esac
   fi
 
+  # --probe (#814): `terminal` covers a probe run that reached a real
+  # verdict (0 / 2 / 6). Null on every polling run.
+  if [ "$PROBE_MODE" = "true" ]; then
+    PROBE_JSON=$(jq -nc --arg observed "${PROBE_OBSERVED:-terminal}" \
+      '{mode: true, observed: $observed}')
+  fi
+
   jq -n \
     --argjson pr_number "$PR_NUMBER" \
     --arg repo "$REPO" \
@@ -1625,6 +1738,7 @@ emit_json_and_exit() {
     --argjson rate_limit_retries "$RATE_LIMIT_RETRIES" \
     --argjson resume_retries "$RESUME_RETRIES" \
     --argjson status_probe "$STATUS_PROBE_JSON" \
+    --argjson probe "$PROBE_JSON" \
     --argjson waited_seconds "$waited" \
     --argjson codex_failover_requested "$CODEX_FAILOVER_REQUESTED" \
     '{
@@ -1641,6 +1755,7 @@ emit_json_and_exit() {
       rate_limit_retries: $rate_limit_retries,
       resume_retries: $resume_retries,
       status_probe: $status_probe,
+      probe: $probe,
       waited_seconds: $waited_seconds,
       codex_failover_requested: $codex_failover_requested
     }'
@@ -1830,7 +1945,11 @@ fi
 while :; do
   NOW_EPOCH=$(date +%s)
   ELAPSED=$((NOW_EPOCH - START_EPOCH))
-  if [ "$ELAPSED" -ge "$MAX_WAIT_SECONDS" ]; then
+  # --probe runs exactly one pass and never sleeps, so the elapsed ceiling
+  # does not apply to it. With a zero budget this check would fire before
+  # the first scan and route into emit_timeout, which posts — which is why
+  # --probe is a mode and not a max_wait_seconds value.
+  if [ "$PROBE_MODE" != "true" ] && [ "$ELAPSED" -ge "$MAX_WAIT_SECONDS" ]; then
     emit_timeout "max_wait_seconds ($MAX_WAIT_SECONDS) exceeded after ${ELAPSED}s — timing out"
   fi
 
@@ -1853,6 +1972,9 @@ while :; do
   LATEST=$(scan_latest_comment)
 
   if [ "$(echo "$LATEST" | jq 'length')" = "0" ]; then
+    if [ "$PROBE_MODE" = "true" ]; then
+      probe_not_yet "none" "null"
+    fi
     log "no CodeRabbit comment yet (elapsed ${ELAPSED}s); sleeping ${POLL_INTERVAL_SECONDS}s"
     sleep_or_timeout "$POLL_INTERVAL_SECONDS"
     continue
@@ -1869,6 +1991,16 @@ while :; do
 
   case "$CLASS" in
     rate_limit)
+      # Probe returns HERE — ahead of the #489 Codex failover below (which
+      # posts `@codex review` under the AUTHOR identity) and ahead of the
+      # retry-budget checks, which exit 5 on the first sighting when a
+      # consumer sets coderabbit.max_rate_limit_retries: 0. A read-only
+      # probe has posted no retry, so it cannot claim the retry budget is
+      # exhausted; the notice means only that CodeRabbit has not reported
+      # on this head yet.
+      if [ "$PROBE_MODE" = "true" ]; then
+        probe_not_yet_from_latest "rate_limit"
+      fi
       if [ "$COMMENT_ID" = "$LAST_RATE_LIMIT_COMMENT_ID" ]; then
         # Same rate-limit comment as last iteration — still sleeping/waiting
         # through our own retry window. Don't double-count retries.
@@ -1944,6 +2076,15 @@ while :; do
       continue
       ;;
     paused)
+      # Probe returns HERE — ahead of post_resume_trigger and ahead of the
+      # resume-budget check, which exits 6 with skip_reason=paused on the
+      # first sighting when a consumer sets coderabbit.max_resume_retries: 0.
+      # A probe posts no `resume`, so it has exhausted nothing; reporting a
+      # skip would tell the caller CodeRabbit will never report, when the
+      # truth is that nobody has asked it to resume yet.
+      if [ "$PROBE_MODE" = "true" ]; then
+        probe_not_yet_from_latest "paused"
+      fi
       # Auto-pause (#490 / #485). Re-invoke with `@coderabbitai resume`
       # (NOT a one-shot `review` — that re-pauses after the next push),
       # bounded by max_resume_retries, then resume polling. Distinct from
@@ -1979,11 +2120,17 @@ while :; do
       continue
       ;;
     in_progress)
+      if [ "$PROBE_MODE" = "true" ]; then
+        probe_not_yet_from_latest "in_progress"
+      fi
       log "CodeRabbit review in progress; sleeping ${POLL_INTERVAL_SECONDS}s"
       sleep_or_timeout "$POLL_INTERVAL_SECONDS"
       continue
       ;;
     status_probe)
+      if [ "$PROBE_MODE" = "true" ]; then
+        probe_not_yet_from_latest "status_probe"
+      fi
       log "CodeRabbit status-probe reply is narration, not clearance; sleeping ${POLL_INTERVAL_SECONDS}s"
       sleep_or_timeout "$POLL_INTERVAL_SECONDS"
       continue

@@ -22,6 +22,11 @@ make_case() {
   local probe_enabled=$3
   local probe_wait=$4
   local max_retries=$5
+  # #814: the --probe cases pin this to 0 to prove the probe returns BEFORE
+  # the resume-budget check, which would otherwise exit 6 with
+  # skip_reason=paused on the first pause sighting. Defaults to the script's
+  # own default so every pre-existing caller is unchanged.
+  local max_resume_retries=${6:-2}
   local dir="$WORKDIR/$name"
 
   mkdir -p "$dir/scripts/lib" "$dir/.github" "$dir/bin" "$dir/state"
@@ -37,6 +42,7 @@ coderabbit:
   status_probe_enabled: $probe_enabled
   status_probe_wait_seconds: $probe_wait
   max_rate_limit_retries: $max_retries
+  max_resume_retries: $max_resume_retries
   wallclock_freshness_window_seconds: 999999999
   trust_status_context_for_clearance: false
 EOF
@@ -192,6 +198,11 @@ case "$endpoint" in
         # PR-level summary body carries a Potential issue marker.
         printf '[{"id":9921,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
         ;;
+      probe_review_on_head)
+        # #814: a genuine CodeRabbit review already on HEAD. --probe must
+        # return the SAME terminal verdict the polling mode does.
+        printf '[{"id":9941,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        ;;
       intermediate_review_head_pin)
         # #535.2: a NEWER review (later submitted_at) references an
         # intermediate commit, while the HEAD review is older. The
@@ -251,6 +262,25 @@ case "$endpoint" in
         ;;
       rate_limit)
         printf '[{"id":7701,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"Rate limit exceeded. Please wait 10 seconds before requesting another review."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      probe_paused)
+        # #814: the #485 auto-pause NOTE, pinned to the stable
+        # `review paused by coderabbit.ai` marker classify_comment keys on.
+        printf '[{"id":7801,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: review paused by coderabbit.ai -->\\n\\n> [!NOTE]\\n> ## Reviews paused\\n\\nUse `@coderabbitai resume` to resume."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      probe_in_progress)
+        printf '[{"id":7802,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"CodeRabbit review in progress; hold tight."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      probe_narration)
+        # #814: a status-probe narration reply strictly AFTER the HEAD
+        # anchor, so it survives the freshness filter and actually reaches
+        # classify_comment. (The existing_status_probe_reply fixture sits ON
+        # the anchor and is filtered out before classification, which is why
+        # it cannot exercise this arm.)
+        printf '[{"id":7804,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- CodeRabbit review command invocation: probe -->\\n`@nathanjohnpayne`: Here is a summary of where things stand.\\n\\n### Open CodeRabbit Threads\\nStill checking."}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_review_on_head)
+        printf '[{"id":7803,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nNothing to flag."}]\n' "$bot" "$head_time" "$head_time"
         ;;
       review_arrives_during_probe)
         count=0
@@ -609,6 +639,170 @@ test_446_newer_comment_suppresses_stale_status() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# #814 — `--probe` read-only single-scan mode.
+#
+# These live in this file because the property they guard is this file's
+# subject: --probe must never reach the status-probe POST emit_timeout
+# performs. Every case asserts probe_count 0 — the same counter the timeout
+# tests above assert is 1.
+#
+# The two dangerous inversions are the rate-limit and paused cases; both
+# fixtures pin the matching retry budget to 0, so a probe falling through to
+# the budget checks would exit 5 or 6. Exit 6 with skip_reason=paused is the
+# worse of the two: the barrier reads it as WILL-NOT-REPORT and would let a
+# Phase 4b review past a PR CodeRabbit has not reviewed.
+# ---------------------------------------------------------------------------
+
+# Same as run_case, but in --probe mode. `mode` selects how probe mode is
+# requested so both documented entry points are covered.
+run_probe_case() {  # <dir> <scenario> [flag|env]
+  local dir=$1 scenario=$2 mode=${3:-flag} rc=0
+
+  (
+    cd "$dir"
+    if [ "$mode" = "env" ]; then
+      PATH="$dir/bin:$PATH" \
+        GH_TOKEN=test-token \
+        CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+        CODERABBIT_TEST_STATE_DIR="$dir/state" \
+        CODERABBIT_TEST_SCENARIO="$scenario" \
+        CODERABBIT_WAIT_PROBE=1 \
+        ./scripts/coderabbit-wait.sh 999 owner/repo \
+        >"$dir/out.json" 2>"$dir/err.log"
+    else
+      PATH="$dir/bin:$PATH" \
+        GH_TOKEN=test-token \
+        CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+        CODERABBIT_TEST_STATE_DIR="$dir/state" \
+        CODERABBIT_TEST_SCENARIO="$scenario" \
+        ./scripts/coderabbit-wait.sh --probe 999 owner/repo \
+        >"$dir/out.json" 2>"$dir/err.log"
+    fi
+  ) || rc=$?
+
+  printf '%s\n' "$rc"
+}
+
+# <dir> <expected_rc> <expected_observed> <label> — the shared assertion:
+# right rc, right observed surface, status=no_review_yet, skip_reason null,
+# and ZERO posts.
+assert_probe_not_yet() {
+  local dir=$1 rc=$2 observed=$3 label=$4
+  local got_status got_observed got_skip got_posts
+  got_status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  got_observed=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  got_skip=$(jq -r '.skip_reason | tostring' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  got_posts=$(probe_count "$dir")
+  if [ "$rc" = "7" ] && [ "$got_status" = "no_review_yet" ] \
+     && [ "$got_observed" = "$observed" ] && [ "$got_skip" = "null" ] \
+     && [ "$got_posts" = "0" ]; then
+    pass "#814 probe: $label → rc 7, observed=$observed, skip_reason null, 0 posts"
+  else
+    fail "#814 probe: $label → rc=$rc status=$got_status observed=$got_observed skip_reason=$got_skip posts=$got_posts"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
+test_probe_no_comment_is_not_yet() {
+  local dir rc
+  dir=$(make_case probe-none 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" none)
+  assert_probe_not_yet "$dir" "$rc" none "no CodeRabbit comment at all"
+}
+
+test_probe_rate_limit_is_not_yet_never_stalled() {
+  local dir rc
+  # max_rate_limit_retries: 0 — the polling mode exits 5 on the FIRST
+  # sighting with this budget. A probe posts no retry, so it cannot have
+  # exhausted the budget and must not escalate a human.
+  dir=$(make_case probe-ratelimit 600 true 30 0 2)
+  rc=$(run_probe_case "$dir" rate_limit)
+  assert_probe_not_yet "$dir" "$rc" rate_limit "rate-limit notice with a 0 retry budget (must be 7, never 5)"
+}
+
+test_probe_paused_is_not_yet_never_skipped() {
+  local dir rc
+  # max_resume_retries: 0 — the polling mode exits 6 with
+  # skip_reason=paused on the FIRST sighting. The barrier reads rc 6 +
+  # skip_reason as WILL-NOT-REPORT, so returning it here would clear the
+  # barrier for a PR CodeRabbit has not reviewed. This is the single most
+  # dangerous mis-implementation of --probe.
+  dir=$(make_case probe-paused 600 true 30 3 0)
+  rc=$(run_probe_case "$dir" probe_paused)
+  assert_probe_not_yet "$dir" "$rc" paused "auto-pause NOTE with a 0 resume budget (must be 7, never 6)"
+}
+
+test_probe_in_progress_is_not_yet() {
+  local dir rc
+  dir=$(make_case probe-inprogress 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" probe_in_progress)
+  assert_probe_not_yet "$dir" "$rc" in_progress "review-in-progress notice"
+}
+
+test_probe_status_probe_narration_is_not_yet() {
+  # latest_comment_from_issue_comments drops narration via
+  # `select(status_probe_reply | not)` BEFORE classify_comment sees it, so
+  # `observed` is `none`, not `status_probe` — asserting the latter would
+  # assert a reachability this surface does not have. The outcome is still
+  # the one the barrier needs: narration never reads as a report. Probe
+  # mode keeps its status_probe arm as defensive symmetry in case the
+  # scanner filter and classify_comment ever diverge.
+  local dir rc
+  dir=$(make_case probe-narration 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" probe_narration)
+  assert_probe_not_yet "$dir" "$rc" none "a status-probe narration reply is filtered out, so HEAD reads as nothing-yet (never clearance)"
+}
+
+test_probe_env_var_equals_flag() {
+  local dir rc
+  dir=$(make_case probe-envvar 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" none env)
+  assert_probe_not_yet "$dir" "$rc" none "CODERABBIT_WAIT_PROBE=1 is equivalent to --probe"
+}
+
+test_probe_terminal_review_matches_polling_verdict() {
+  local dir rc status observed posts
+  dir=$(make_case probe-terminal 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" probe_review_on_head)
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  observed=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  posts=$(probe_count "$dir")
+  if [ "$rc" = "0" ] && [ "$status" = "cleared" ] && [ "$observed" = "terminal" ] && [ "$posts" = "0" ]; then
+    pass "#814 probe: a review already on HEAD still exits 0/cleared with observed=terminal and 0 posts"
+  else
+    fail "#814 probe: terminal review → rc=$rc status=$status observed=$observed posts=$posts"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
+test_probe_field_absent_on_polling_runs() {
+  # The additive `probe` key must be null on every non-probe run, so the
+  # historical JSON shape is unchanged for existing consumers.
+  local dir rc probe_field
+  dir=$(make_case probe-null-on-poll 600 false 30 3 2)
+  rc=$(run_case "$dir" none)
+  probe_field=$(jq -r '.probe | tostring' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "4" ] && [ "$probe_field" = "null" ]; then
+    pass "#814 probe: the probe field is null on a polling run (additive, shape preserved)"
+  else
+    fail "#814 probe: expected rc 4 with probe=null on a polling run; got rc=$rc probe=$probe_field"
+  fi
+}
+
+test_probe_unknown_option_fails_closed() {
+  local dir rc=0
+  dir=$(make_case probe-badopt 600 true 30 3 2)
+  ( cd "$dir" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" CODERABBIT_TEST_SCENARIO=none \
+      ./scripts/coderabbit-wait.sh --bogus 999 owner/repo >/dev/null 2>&1 ) || rc=$?
+  if [ "$rc" = "3" ]; then
+    pass "#814 probe: an unknown leading option exits 3 (usage), not silently ignored"
+  else
+    fail "#814 probe: expected rc 3 for an unknown option; got $rc"
+  fi
+}
+
 test_446_newer_comment_suppresses_stale_status
 test_timeout_probe_posts_once_and_surfaces_reply
 test_existing_status_probe_reply_never_clears
@@ -618,6 +812,15 @@ test_probe_reply_poll_failure_stays_timeout_advisory
 test_review_during_probe_wait_emits_findings
 test_535_1_summary_body_marker_emits_findings
 test_535_2_head_pinned_review_selection_emits_findings
+test_probe_no_comment_is_not_yet
+test_probe_rate_limit_is_not_yet_never_stalled
+test_probe_paused_is_not_yet_never_skipped
+test_probe_in_progress_is_not_yet
+test_probe_status_probe_narration_is_not_yet
+test_probe_env_var_equals_flag
+test_probe_terminal_review_matches_polling_verdict
+test_probe_field_absent_on_polling_runs
+test_probe_unknown_option_fails_closed
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
