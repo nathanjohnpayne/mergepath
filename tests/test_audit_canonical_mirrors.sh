@@ -65,11 +65,29 @@
 #      the target is safe. Test 15 alone passes under either reading;
 #      this fixture pins the intended one (#762 r2 P3).
 #  17. `--help` emits the COMPLETE header comment block. usage() used a
-#      hardcoded `sed -n '2,73p'` range that the header outgrew, so the
+#      hardcoded `sed -n '2,65p'` range that the header outgrew, so the
 #      output stopped mid-sentence and dropped MERGEPATH_ROOT plus the
 #      entire exit-code section. The assertion derives the expected last
 #      line from the script source rather than hardcoding one, so any
 #      future short range fails here too (#762 r3 P2).
+#  18. `--help` survives header GROWTH, proved by perturbation rather
+#      than by re-deriving the bound: a copy of the script with extra
+#      comment lines appended to the end of its header must emit them.
+#      Case 17 computes its expected last line with usage()'s own rule,
+#      so it cannot distinguish a correct bound from a self-consistent
+#      wrong one; this case never reimplements the rule (#781 item 5).
+#  19. A blank (un-prefixed) line INSIDE the header does not terminate
+#      the block. The dynamic bound stops at the first non-comment line,
+#      so one stray line — an editor stripping a `#`-only separator, a
+#      paste that drops the marker — silently truncated `--help`
+#      mid-sentence exactly the way the hardcoded range did, and case 17
+#      passed anyway because its expected value truncated identically
+#      (#781 item 5).
+#  20. An INDENTED comment line inside the header is still header. The
+#      blank rule ignored leading whitespace but the marker rule was
+#      anchored at column zero, so `  # note` matched neither and fell
+#      through to the terminator — dropping itself and every comment
+#      after it, silently and with exit 0 (#791 review).
 
 set -euo pipefail
 
@@ -467,11 +485,16 @@ fi
 # comment block, whatever that line happens to be. Derived independently from
 # the script source, so a range that stops short — for any reason, including a
 # future hardcoded one — fails here rather than shipping a truncated --help.
+# Mirrors usage()'s marker rule, INCLUDING its tolerance of leading
+# whitespace (case 20). If this derivation kept `/^#/` while usage() moved on,
+# an indented comment added to the real header later would stop the
+# derivation early while usage() ran past it, failing this case for a header
+# edit that is in fact handled correctly.
 HEADER_LAST="$(awk '
-  NR == 1 { next }
-  /^#/    { line = $0; sub(/^# ?/, "", line); last = line; next }
-            { exit }
-  END     { print last }
+  NR == 1    { next }
+  /^[ \t]*#/ { line = $0; sub(/^[ \t]*# ?/, "", line); last = line; next }
+               { exit }
+  END        { print last }
 ' "$SCRIPT")"
 if [ "$(tail -1 <<<"$HELP")" = "$HEADER_LAST" ]; then
   pass "--help runs to the last header-comment line (no truncation)"
@@ -484,6 +507,104 @@ if grep -q 'set -euo pipefail' <<<"$HELP"; then
   fail "--help leaked script body past the header comment block"
 else
   pass "--help stops at the header block (no script body leaked)"
+fi
+
+# ── 18/19. `--help` bound proved by PERTURBATION (#781 item 5) ────────
+# Case 17 derives its expected last line with the same rule usage() uses, so
+# it agrees with any self-consistent bound — including a wrong one. These two
+# cases never reimplement the rule: they grow the header of a COPY of the
+# script and assert the new text reaches `--help`. A hardcoded range fails
+# variant A; a bound that stops at the first blank line fails variant B.
+#
+# The injection point is the first line after the shebang that is not a
+# comment, i.e. the end of the header block, located without a line number.
+grow_header() {
+  # $1 = destination script, $2 = file whose lines are spliced in
+  awk -v extra="$2" '
+    NR == 1 { print; next }
+    !injected && $0 !~ /^#/ {
+      while ((getline extra_line < extra) > 0) print extra_line
+      close(extra)
+      injected = 1
+    }
+            { print }
+  ' "$SCRIPT" > "$1"
+  chmod +x "$1"
+}
+
+# Variant A — the header simply grows. Under the historical
+# `sed -n '2,NNp'` form the appended lines fall outside the range and vanish.
+printf '#   HEADER-SENTINEL-GROWTH  an entry appended below the old end line\n#                           and its continuation line\n' \
+  > "$WORKDIR/extra-growth.txt"
+grow_header "$WORKDIR/grown.sh" "$WORKDIR/extra-growth.txt"
+GROWN_HELP="$("$WORKDIR/grown.sh" --help)"
+if grep -q 'HEADER-SENTINEL-GROWTH' <<<"$GROWN_HELP" \
+  && grep -q 'and its continuation line' <<<"$GROWN_HELP"; then
+  pass "--help emits header lines appended after the previous end (no hardcoded range)"
+else
+  fail "--help dropped appended header lines; tail was: $(tail -3 <<<"$GROWN_HELP")"
+fi
+if grep -q 'set -euo pipefail' <<<"$GROWN_HELP"; then
+  fail "grown-header --help leaked script body past the header block"
+else
+  pass "grown-header --help still stops before the script body"
+fi
+
+# Variant B — a stray un-prefixed blank line lands INSIDE the header. The
+# comment lines after it are still header, and must still be emitted.
+printf '#\n\n#   HEADER-SENTINEL-AFTER-BLANK  header text following a stray blank line\n' \
+  > "$WORKDIR/extra-blank.txt"
+grow_header "$WORKDIR/blank-in-header.sh" "$WORKDIR/extra-blank.txt"
+# Keep the RAW bytes as well as the substitution: `$( … )` strips every
+# trailing newline, so nothing derived from BLANK_HELP can observe a flushed
+# trailing blank (see the last assertion in this block).
+"$WORKDIR/blank-in-header.sh" --help > "$WORKDIR/blank-help.out"
+BLANK_HELP="$(cat "$WORKDIR/blank-help.out")"
+if grep -q 'HEADER-SENTINEL-AFTER-BLANK' <<<"$BLANK_HELP"; then
+  pass "--help does not truncate at a blank line inside the header block"
+else
+  fail "--help truncated at an interior blank line; tail was: $(tail -3 <<<"$BLANK_HELP")"
+fi
+if grep -q 'set -euo pipefail' <<<"$BLANK_HELP"; then
+  fail "blank-in-header --help leaked script body past the header block"
+else
+  pass "blank-in-header --help still stops before the script body"
+fi
+# The trailing blank that separates header from code is NOT emitted, so the
+# last line stays real usage text rather than an empty line. This reads the
+# last RECORD off the raw capture: `tail -1` of a command substitution could
+# never fail here, because the substitution had already eaten the trailing
+# blank before `tail` ran, so the assertion pinned nothing (#791 review).
+if [ -n "$(awk 'END { print }' "$WORKDIR/blank-help.out")" ]; then
+  pass "--help does not emit the blank line separating header from code"
+else
+  fail "--help ended with an empty line (trailing blanks flushed)"
+fi
+
+# ── 20. An INDENTED header comment is still header (#791 review) ──────
+# The blank rule tolerates leading whitespace but the marker rule was
+# anchored at column zero, so `  # note` matched neither and fell through to
+# the terminator — silently truncating the block at a line that is plainly
+# still a comment, the same failure mode as the hardcoded range. Both the
+# indented line AND every plain comment after it were lost.
+printf '  #   INDENT-SENTINEL  an indented header comment line\n#   AFTER-INDENT-SENTINEL  a plain comment following the indented one\n' \
+  > "$WORKDIR/extra-indent.txt"
+grow_header "$WORKDIR/indent-in-header.sh" "$WORKDIR/extra-indent.txt"
+INDENT_HELP="$("$WORKDIR/indent-in-header.sh" --help)"
+if grep -q 'INDENT-SENTINEL' <<<"$INDENT_HELP"; then
+  pass "--help emits an indented header comment line"
+else
+  fail "--help dropped an indented header line; tail was: $(tail -3 <<<"$INDENT_HELP")"
+fi
+if grep -q 'AFTER-INDENT-SENTINEL' <<<"$INDENT_HELP"; then
+  pass "--help does not truncate at an indented header comment line"
+else
+  fail "--help truncated at an indented line; tail was: $(tail -3 <<<"$INDENT_HELP")"
+fi
+if grep -q 'set -euo pipefail' <<<"$INDENT_HELP"; then
+  fail "indent-in-header --help leaked script body past the header block"
+else
+  pass "indent-in-header --help still stops before the script body"
 fi
 
 echo
