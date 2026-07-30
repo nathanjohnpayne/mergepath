@@ -1071,7 +1071,7 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   # here. A hard-coded list silently stops tracking the manifest the
   # moment the set changes: it was three docs until #780 added
   # docs/agents/coderabbit-audit.md, and this scanner kept scanning for
-  # the old three. Case 41 pins the derivation in both directions.
+  # the old three. Case 48 pins the derivation in both directions.
   BARE_ISSUE_RE='(^|[^A-Za-z0-9_/-])#[0-9]+'
   set +e
   hub_only_docs=$(yq -r '
