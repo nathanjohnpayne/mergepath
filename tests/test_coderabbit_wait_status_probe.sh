@@ -343,7 +343,33 @@ esac
 EOF
   chmod +x "$dir/bin/gh"
 
+  # #814: the #489 Codex failover is the one forbidden write probe_count
+  # cannot see — it runs codex-review-request.sh as a SEPARATE PROCESS, not
+  # through gh, so no gh-POST counter can observe it, and it posts under the
+  # AUTHOR identity rather than the reviewer's. Record every invocation so
+  # "a probe posts nothing" is actually asserted rather than assumed. Same
+  # stub shape as tests/test_coderabbit_wait_codex_failover.sh.
+  cat >"$dir/bin/codex-request-stub.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'phase4a=%s args=[%s]\n' "${MERGEPATH_PHASE_4A_GATED:-unset}" "$*" >>"${CODEX_STUB_LOG:?}"
+echo '{"trigger_only":true,"trigger_posted":true,"trigger_requested":true}'
+exit 0
+EOF
+  chmod +x "$dir/bin/codex-request-stub.sh"
+
   printf '%s\n' "$dir"
+}
+
+# Count Codex-failover invocations. Any value above 0 in probe mode means the
+# probe reached the failover and posted an author-attributed `@codex review`.
+codex_invocations() {
+  local dir=$1
+  if [ -f "$dir/state/codex-stub.log" ]; then
+    grep -c . "$dir/state/codex-stub.log" 2>/dev/null || printf '0\n'
+  else
+    printf '0\n'
+  fi
 }
 
 run_case() {
@@ -680,6 +706,8 @@ run_probe_case() {  # <dir> <scenario> [flag|env]
         CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
         CODERABBIT_TEST_STATE_DIR="$dir/state" \
         CODERABBIT_TEST_SCENARIO="$scenario" \
+        CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+        CODEX_STUB_LOG="$dir/state/codex-stub.log" \
         CODERABBIT_WAIT_PROBE=1 \
         ./scripts/coderabbit-wait.sh 999 owner/repo \
         >"$dir/out.json" 2>"$dir/err.log"
@@ -689,6 +717,8 @@ run_probe_case() {  # <dir> <scenario> [flag|env]
         CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
         CODERABBIT_TEST_STATE_DIR="$dir/state" \
         CODERABBIT_TEST_SCENARIO="$scenario" \
+        CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+        CODEX_STUB_LOG="$dir/state/codex-stub.log" \
         ./scripts/coderabbit-wait.sh --probe 999 owner/repo \
         >"$dir/out.json" 2>"$dir/err.log"
     fi
@@ -702,17 +732,18 @@ run_probe_case() {  # <dir> <scenario> [flag|env]
 # and ZERO posts.
 assert_probe_not_yet() {
   local dir=$1 rc=$2 observed=$3 label=$4
-  local got_status got_observed got_skip got_posts
+  local got_status got_observed got_skip got_posts got_codex
   got_status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
   got_observed=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
   got_skip=$(jq -r '.skip_reason | tostring' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
   got_posts=$(probe_count "$dir")
+  got_codex=$(codex_invocations "$dir")
   if [ "$rc" = "7" ] && [ "$got_status" = "no_review_yet" ] \
      && [ "$got_observed" = "$observed" ] && [ "$got_skip" = "null" ] \
-     && [ "$got_posts" = "0" ]; then
-    pass "#814 probe: $label → rc 7, observed=$observed, skip_reason null, 0 posts"
+     && [ "$got_posts" = "0" ] && [ "$got_codex" = "0" ]; then
+    pass "#814 probe: $label → rc 7, observed=$observed, skip_reason null, 0 gh posts, 0 codex triggers"
   else
-    fail "#814 probe: $label → rc=$rc status=$got_status observed=$got_observed skip_reason=$got_skip posts=$got_posts"
+    fail "#814 probe: $label → rc=$rc status=$got_status observed=$got_observed skip_reason=$got_skip posts=$got_posts codex=$got_codex"
     sed 's/^/      /' "$dir/err.log" >&2 || true
   fi
 }
@@ -755,7 +786,10 @@ test_probe_paused_is_not_yet_never_skipped() {
 # throughout and so never touch the StatusContext path at all.
 #
 # The asserted property is the barrier's contract, not this file's:
-#   * a probe posts nothing, in every state;
+#   * a probe posts nothing, in every state — counted on BOTH surfaces: gh
+#     POSTs, and invocations of codex-review-request.sh, which the #489
+#     failover runs as a separate process under the AUTHOR identity and no
+#     gh-POST counter can see;
 #   * rc is one of 0 / 2 / 6 / 7 — never 4 (a probe waits out no budget)
 #     and never 5 (a probe escalates no human);
 #   * rc 6 carries skip_reason non-base-branch or draft, NEVER paused,
@@ -780,14 +814,18 @@ test_probe_state_space_sweep() {
             CODERABBIT_TEST_STATE_DIR="$dir/state" \
             CODERABBIT_TEST_SCENARIO="$scenario" \
             CODERABBIT_TEST_STATUS="$status" \
+            CODERABBIT_WAIT_CODEX_REQUEST_CMD="$dir/bin/codex-request-stub.sh" \
+            CODEX_STUB_LOG="$dir/state/codex-stub.log" \
             ./scripts/coderabbit-wait.sh --probe 999 owner/repo \
             >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
-        local posts skip head
+        local posts codex skip head
         posts=$(probe_count "$dir")
+        codex=$(codex_invocations "$dir")
         skip=$(jq -r '.skip_reason | tostring' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
         head=$(jq -r '.head_sha' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
         local why=""
         [ "$posts" = "0" ] || why="posted $posts"
+        [ "$codex" = "0" ] || why="${why:+$why; }invoked codex-review-request $codex time(s)"
         case "$rc" in 0|2|6|7) ;; *) why="${why:+$why; }rc=$rc not in {0,2,6,7}" ;; esac
         [ "$rc" != "6" ] || [ "$skip" != "paused" ] || why="${why:+$why; }rc 6 with skip_reason=paused"
         [ "$head" = "head-sha" ] || why="${why:+$why; }head_sha=$head"
