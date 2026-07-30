@@ -1006,6 +1006,32 @@ else
     || fail "the derived exclude over-matched — canonical/ordinary files missing from the mirror"
 fi
 
+# A target subdirectory may be a symlink even when the target root itself is
+# legitimate. Removing receiver residue through that path would unlink a file
+# outside the bootstrap target before rsync has a chance to replace the link.
+symlink_dst="$(mktemp -d "$WORKDIR/symlink-dst.XXXXXX")"
+symlink_outside="$(mktemp -d "$WORKDIR/symlink-outside.XXXXXX")"
+mkdir -p "$symlink_dst/docs"
+printf 'must survive bootstrap\n' > "$symlink_outside/newly-hub-only.md"
+ln -s "$symlink_outside" "$symlink_dst/docs/agents"
+set +e
+symlink_rsync_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$rsync_src" "$symlink_dst" 2>&1)
+symlink_rsync_rc=$?
+set -e
+if [ "$symlink_rsync_rc" != "0" ] \
+   && [ -f "$symlink_outside/newly-hub-only.md" ] \
+   && printf '%s' "$symlink_rsync_out" | grep -q 'symlink ancestor'; then
+  pass "bootstrap::_rsync_template rejects a symlink ancestor without deleting outside the target"
+else
+  fail "symlinked target ancestry must fail closed and preserve the outside file (rc=$symlink_rsync_rc): $symlink_rsync_out"
+fi
+
 # And the wiring fails closed: an unreadable inventory must abort the
 # rsync rather than mirror everything. Assert the destination stays
 # EMPTY, not merely that the rc is non-zero — "it errored" and "it

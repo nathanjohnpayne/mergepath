@@ -256,7 +256,77 @@ mp_markdown_renderable_text() {
 mp_doc_link_targets() {
   local f="$1"
   {
-    mp_markdown_renderable_text "$f" | grep -oE '\]\([^)]*\)' || true
+    # Inline destinations need a small stateful reader rather than
+    # `grep -o '\]([^)]*)'`: CommonMark bare destinations may contain
+    # balanced parentheses (`hub(1).md`), and angle destinations may
+    # contain parentheses or spaces. The first-closing-paren spelling
+    # truncates those valid links and hides consumer-broken references.
+    mp_markdown_renderable_text "$f" | awk '
+      {
+        line = $0
+        n = length(line)
+        for (i = 1; i < n; i++) {
+          if (substr(line, i, 2) != "](") continue
+          start = i + 2
+
+          # Angle-bracket destination: preserve the wrapper so the
+          # common cleanup below can retain embedded whitespace.
+          if (substr(line, start, 1) == "<") {
+            for (j = start + 1; j <= n; j++) {
+              c = substr(line, j, 1)
+              if (c == "\\" && j < n) { j++; continue }
+              if (c != ">") continue
+              for (k = j + 1; k <= n; k++) {
+                c = substr(line, k, 1)
+                if (c == "\\" && k < n) { k++; continue }
+                if (c == ")") {
+                  print substr(line, start, j - start + 1)
+                  i = k
+                  break
+                }
+              }
+              break
+            }
+            continue
+          }
+
+          # Bare destination: the `)` that closes the link is the first
+          # one encountered at nesting depth zero. Backslash escapes do
+          # not affect balancing and are unescaped for path comparison.
+          depth = 0
+          target = ""
+          destination_done = 0
+          for (j = start; j <= n; j++) {
+            c = substr(line, j, 1)
+            if (c == "\\" && j < n) {
+              if (!destination_done) target = target substr(line, j + 1, 1)
+              j++
+              continue
+            }
+            if (!destination_done && c ~ /[[:space:]]/ && depth == 0) {
+              destination_done = 1
+              continue
+            }
+            if (!destination_done && c == "(") {
+              depth++
+              target = target c
+              continue
+            }
+            if (c == ")") {
+              if (!destination_done && depth > 0) {
+                depth--
+                target = target c
+                continue
+              }
+              print target
+              i = j
+              break
+            }
+            if (!destination_done) target = target c
+          }
+        }
+      }
+    ' || true
     mp_markdown_renderable_text "$f" | grep -oE '^[[:space:]]{0,3}\[[^]]+\]:[[:space:]]*(<[^>]*>|[^[:space:]]+)' || true
     # Wrapped reference definition: a label + colon with NOTHING after it
     # on that line, then the destination as the first token of the next

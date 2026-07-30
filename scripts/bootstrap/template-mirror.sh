@@ -913,6 +913,38 @@ bootstrap::_derive_hub_only_excludes() {
   printf '%s' "$validated"
 }
 
+# Refuse to remove receiver residue through a symlinked directory below the
+# selected target root. The derived paths are already constrained to literal,
+# normalized repo-relative paths; this final check makes sure `$target/$path`
+# still names the target tree rather than an external directory reached through
+# (for example) a resumed target's `docs/agents` symlink.
+bootstrap::_reject_symlink_ancestors() {
+  local target=$1
+  local rel=$2
+  local parent=${rel%/*}
+  local current=$target
+  local component
+
+  [ "$parent" != "$rel" ] || return 0
+  while [ -n "$parent" ]; do
+    case "$parent" in
+      */*)
+        component=${parent%%/*}
+        parent=${parent#*/}
+        ;;
+      *)
+        component=$parent
+        parent=
+        ;;
+    esac
+    current="$current/$component"
+    if [ -L "$current" ]; then
+      bootstrap::err "template-mirror: refusing to remove stale hub-only doc '$rel': symlink ancestor '$current' escapes the selected target tree"
+      return 1
+    fi
+  done
+}
+
 bootstrap::_rsync_template() {
   local source_root=$1
   local target=$2
@@ -948,6 +980,7 @@ bootstrap::_rsync_template() {
   # changed to hub-only, so remove every validated derived path explicitly.
   while IFS= read -r exc; do
     [ -n "$exc" ] || continue
+    bootstrap::_reject_symlink_ancestors "$target" "$exc" || return $?
     bootstrap::run "remove stale hub-only doc $exc" rm -f -- "$target/$exc"
   done <<< "$derived"
 

@@ -1442,6 +1442,36 @@ else
   fail "Case 14s unexpected (rc=$rc): $out"
 fi
 
+# --- Case 14t: balanced parentheses in inline destinations ----------
+# A valid bare Markdown destination may contain balanced parentheses,
+# and an angle-bracket destination may contain them without escaping.
+# Stopping at the first `)` truncates both spellings to `hub(1` and lets
+# a canonical doc ship a consumer-broken link to a hub-only sibling.
+MANIFEST_TRUTH_PAREN="$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+  - path: docs/agents/hub(1).md
+    class: hub-only
+"
+for paren_link in '[the audit](hub(1).md)' '[the audit](<hub(1).md>)'; do
+  set +e
+  out=$(run_with_doc_bodies "$MANIFEST_TRUTH_PAREN" \
+    "docs/agents/shared.md|See $paren_link for details.
+docs/agents/hub(1).md|# Hub-only machinery")
+  rc=$?
+  set -e
+  if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub(1).md' by a relative Markdown link"; then
+    pass "Case 14t: balanced-parenthesis link '$paren_link' fails closed"
+  else
+    fail "Case 14t ('$paren_link') unexpected (rc=$rc): $out"
+  fi
+done
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).
