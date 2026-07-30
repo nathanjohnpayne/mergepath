@@ -956,11 +956,7 @@ git config --show-origin --get user.email
 git config --show-origin --get user.signingkey
 ```
 
-Provisioning the real human author identity belongs to verified machine setup,
-outside every managed checkout. This policy deliberately publishes no
-copy-pastable identity setter with placeholder values: if any verified value
-above is absent or wrong, stop and run the approved machine-setup flow, then
-repeat the read-only checks before committing.
+Provisioning the real human author identity belongs to verified machine setup, outside every managed checkout. This policy deliberately publishes no copy-pastable identity setter with placeholder values: if any verified value above is absent or wrong, stop and run the approved machine-setup flow, then repeat the read-only checks before committing.
 
 **Never run a bare `git config user.name` / `git config user.email` inside a managed checkout.** Without `--global`, `git config` writes the *current repository's* `.git/config`, which every worktree of that repository shares. Such an override is invisible to `git config --global --get user.email`, outlives the session that made it, and silently reattributes — and, when `commit.gpgsign` is set alongside it, unsigns — every later commit from every worktree. That corruption reached `main` twice under an undeliverable `.example` fixture address before anyone noticed ([#777](https://github.com/nathanjohnpayne/mergepath/issues/777)), and an earlier revision of this very section, which instructed a bare repo-local `git config user.email`, is how it got there. `scripts/ci/check_git_identity_hygiene` now fails on both the leftover override and on the instruction shape that produces it.
 
