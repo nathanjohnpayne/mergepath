@@ -200,7 +200,10 @@ mp_markdown_renderable_text() {
       ch = substr(rest, 1, 1)
       if (indent <= 3 && (ch == "`" || ch == "~")) {
         width = run_len(rest, 1, ch)
-        if (width >= 3) {
+        tail = substr(rest, width + 1)
+        # CommonMark forbids a backtick in a backtick fence info string.
+        # Such a line is rendered prose, not a fence opener.
+        if (width >= 3 && !(ch == "`" && index(tail, "`") > 0)) {
           in_fence = 1; fence_char = ch; fence_width = width
           print ""
           next
@@ -364,6 +367,27 @@ mp_doc_link_targets() {
         -e 's/\)$//' \
         -e 's/^[[:space:]]*\[[^]]+\]:[[:space:]]*//' \
     | awk '
+        function hex_value(c, p) {
+          p = index("0123456789ABCDEF", toupper(c))
+          return p ? p - 1 : -1
+        }
+        function percent_decode(s, out, i, c, hi, lo) {
+          out = ""
+          for (i = 1; i <= length(s); i++) {
+            c = substr(s, i, 1)
+            if (c == "%" && i + 2 <= length(s)) {
+              hi = hex_value(substr(s, i + 1, 1))
+              lo = hex_value(substr(s, i + 2, 1))
+              if (hi >= 0 && lo >= 0) {
+                out = out sprintf("%c", hi * 16 + lo)
+                i += 2
+                continue
+              }
+            }
+            out = out c
+          }
+          return out
+        }
         function unescape_punctuation(s, out, i, c, nextc) {
           out = ""
           for (i = 1; i <= length(s); i++) {
@@ -378,20 +402,26 @@ mp_doc_link_targets() {
           }
           return out
         }
+        function normalize_target(s) {
+          s = unescape_punctuation(s)
+          # URL parsing recognizes raw query/fragment delimiters before
+          # percent decoding, so encoded %3F/%23 remain filename bytes.
+          sub(/[?#].*$/, "", s)
+          return percent_decode(s)
+        }
         {
           sub(/^[[:space:]]+/, "")
           if (substr($0, 1, 1) == "<") {
             gt = index($0, ">")
             if (gt > 1) {
-              print unescape_punctuation(substr($0, 2, gt - 2))
+              print normalize_target(substr($0, 2, gt - 2))
               next
             }
           }
           sub(/[[:space:]].*$/, "")
-          print unescape_punctuation($0)
+          print normalize_target($0)
         }
       ' \
-    | sed -E -e 's/[?#].*$//' \
     | grep -v '^[[:space:]]*$' || true
 }
 
@@ -744,7 +774,9 @@ if [ -n "$ownership_rows" ]; then
     [ -z "$ownership_row" ] && continue
     doc_path=$(yq -r '.path // ""' <<< "$ownership_row")
     doc_class=$(yq -r '.class // ""' <<< "$ownership_row")
-    doc_pending=$(yq -r '(.pending_manifest // false) | tostring' <<< "$ownership_row")
+    doc_pending_present=$(yq -r 'has("pending_manifest")' <<< "$ownership_row")
+    doc_pending_tag=$(yq -r '.pending_manifest | tag' <<< "$ownership_row")
+    doc_pending=$(yq -r '.pending_manifest // false' <<< "$ownership_row")
     doc_note=$(yq -r '(.note // "") | tostring' <<< "$ownership_row")
 
     if [ -z "$doc_path" ]; then
@@ -793,6 +825,12 @@ if [ -n "$ownership_rows" ]; then
         ;;
     esac
     declared="${declared}${norm_doc},"
+
+    if [ "$doc_pending_present" = "true" ] && [ "$doc_pending_tag" != "!!bool" ]; then
+      echo "FAIL: '$norm_doc' has pending_manifest with YAML type '$doc_pending_tag' — pending_manifest must be a YAML boolean, not a quoted string or another scalar"
+      FAILED=1
+      continue
+    fi
 
     # A doc ownership entry describes repository content, not an indirection
     # whose target can leave the tree or carry a different Git mode. `-f`
@@ -1020,12 +1058,12 @@ if [ -f "$SIBLING" ]; then
         if (q == SQ) { if (c == SQ) { q = "" } else { keep(c) } ; continue }
 
         if (q == DQ) {
-          # Inside double quotes only \" and \\ escape, and a backslash
+          # Inside double quotes \$, \`, \" and \\ escape, and a backslash
           # before a newline is a continuation Bash deletes; every other
           # backslash is an ordinary character to Bash as far as word
           # splitting is concerned, so it is kept as-is.
           if (c == BS) {
-            if (nx == DQ || nx == BS) { keep(nx); i++ }
+            if (nx == DQ || nx == BS || nx == "$" || nx == BT) { keep(nx); i++ }
             else if (nx == NL) { i++ }
             else { keep(c) }
             continue

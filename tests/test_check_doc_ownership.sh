@@ -328,6 +328,25 @@ else
   fail "Case 7 unexpected (rc=$rc): $out"
 fi
 
+# A quoted scalar is truthy-looking to a string comparison but is not the
+# boolean flag the manifest contract defines. It must not waive propagation.
+MANIFEST_PENDING_STRING="$MIN_HEADER
+paths: []
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+    pending_manifest: \"true\"
+    note: wrong YAML type must not disable propagation
+"
+set +e
+out=$(run_with_fixture "$MANIFEST_PENDING_STRING" "docs/agents/shared.md"); rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "pending_manifest.*YAML boolean"; then
+  pass "Case 7a: pending_manifest accepts only a YAML boolean"
+else
+  fail "Case 7a unexpected (rc=$rc): $out"
+fi
+
 # --- Case 6b: subset propagation cannot back canonical ownership ----
 MANIFEST_SUBSET_CANONICAL="$MIN_HEADER
 paths:
@@ -1096,6 +1115,35 @@ else
   fail "Case 12o unexpected (rc=$rc): $out"
 fi
 
+# Inside Bash double quotes, backslashes before dollar and backtick quote those
+# characters. They are literal filename bytes, not substitutions, and must be
+# unescaped before the inventory comparison.
+MANIFEST_DQ_ESCAPES="$MIN_HEADER"'
+paths: []
+doc_ownership:
+  - path: docs/agents/$policy.md
+    class: canonical
+    pending_manifest: true
+    note: escaped dollar filename
+  - path: docs/agents/`policy`.md
+    class: canonical
+    pending_manifest: true
+    note: escaped backtick filename
+'
+set +e
+out=$(run_with_denylist "$MANIFEST_DQ_ESCAPES" 'docs/agents/$policy.md
+docs/agents/`policy`.md' '  "docs/agents/\$policy.md"
+  "docs/agents/\`policy\`.md"'); rc=$?
+set -e
+if [ "$rc" = "1" ] \
+   && echo "$out" | grep -q "docs/agents/\$policy.md.*IDENTITY_DOCS_DENYLIST" \
+   && echo "$out" | grep -q 'docs/agents/`policy`.md.*IDENTITY_DOCS_DENYLIST' \
+   && ! echo "$out" | grep -q "unexpanded substitution"; then
+  pass "Case 12p: double-quoted dollar/backtick escapes compare as literal denylist paths"
+else
+  fail "Case 12p unexpected (rc=$rc): $out"
+fi
+
 # --- Case 14: canonical doc links a HUB-ONLY doc (check 10) ---------
 # The #780 consumer-truthfulness guardrail: the canonical file is
 # mirrored verbatim into nine repos that will never receive the hub-only
@@ -1452,6 +1500,20 @@ else
   fail "Case 14q unexpected (rc=$rc): $out"
 fi
 
+# URL percent escapes are decoded by the browser after link parsing. Compare
+# the decoded path to the literal inventory filename.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH_SPACE" \
+  'docs/agents/shared.md|See [the audit](hub%20file.md) for details.
+docs/agents/hub file.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub file.md' by a relative Markdown link"; then
+  pass "Case 14q2: percent-encoded link path is decoded before inventory comparison"
+else
+  fail "Case 14q2 unexpected (rc=$rc): $out"
+fi
+
 # --- Case 14r: CONTROL — protocol-relative inline destination -------
 # `//host/path` is portable just like an https URL and is already skipped by
 # the resolved-target pass. The literal mask must treat the inline form the
@@ -1473,11 +1535,7 @@ fi
 # not turn documentation of the prohibited spelling into a real broken link.
 set +e
 out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
-  'docs/agents/shared.md|Inline example: `[audit](hub.md)`.
-
-```markdown
-[audit](hub.md)
-```
+  'docs/agents/shared.md|Inline example: `[audit](hub.md)`.\n\n```markdown\n[audit](hub.md)\n```\n
 docs/agents/hub.md|# Hub-only machinery')
 rc=$?
 set -e
@@ -1485,6 +1543,21 @@ if [ "$rc" = "0" ]; then
   pass "Case 14s: link-shaped inline and fenced code examples are ignored"
 else
   fail "Case 14s unexpected (rc=$rc): $out"
+fi
+
+# A backtick fence opener whose info string itself contains a backtick is
+# invalid CommonMark. The following link remains rendered prose and must not be
+# hidden until an apparent closing fence.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|```js `example`\n[audit](hub.md)\n```\n
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md'"; then
+  pass "Case 14s2: invalid backtick fence opener does not hide a rendered link"
+else
+  fail "Case 14s2 unexpected (rc=$rc): $out"
 fi
 
 # --- Case 14t: balanced parentheses in inline destinations ----------

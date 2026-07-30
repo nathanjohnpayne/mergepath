@@ -1032,6 +1032,32 @@ else
   fail "symlinked target ancestry must fail closed and preserve the outside file (rc=$symlink_rsync_rc): $symlink_rsync_out"
 fi
 
+# The selected target itself can also be a symlink. Check it before appending
+# even the first relative component, or stale-residue deletion escapes through
+# the root link.
+root_symlink_outside="$(mktemp -d "$WORKDIR/root-symlink-outside.XXXXXX")"
+root_symlink_dst="$WORKDIR/root-symlink-target"
+mkdir -p "$root_symlink_outside/docs/agents"
+printf 'must survive root symlink\n' > "$root_symlink_outside/docs/agents/newly-hub-only.md"
+ln -s "$root_symlink_outside" "$root_symlink_dst"
+set +e
+root_symlink_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$rsync_src" "$root_symlink_dst" 2>&1)
+root_symlink_rc=$?
+set -e
+if [ "$root_symlink_rc" != "0" ] \
+   && [ -f "$root_symlink_outside/docs/agents/newly-hub-only.md" ] \
+   && printf '%s' "$root_symlink_out" | grep -q 'target root.*symbolic link'; then
+  pass "bootstrap::_rsync_template rejects a symlinked target root without deleting outside it"
+else
+  fail "symlinked target root must fail closed and preserve the outside file (rc=$root_symlink_rc): $root_symlink_out"
+fi
+
 # An existing directory at a path that has become hub-only cannot be removed
 # with `rm -f`. `_rsync_template` may run in a conditional/`||` context where
 # Bash disables errexit inside the function, so the helper must propagate the
@@ -1151,7 +1177,14 @@ verify_case() {
   : > "$vt/docs/agents/shared-operating-rules.md"
   : > "$vt/docs/agents/worktree-placement.md"
   : > "$vt/docs/agents/operating-rules.md"
-  printf '1. [Shared](docs/agents/shared-operating-rules.md)\n2. [Local](docs/agents/operating-rules.md)\n' > "$vt/AGENTS.md"
+  printf '## Sections\n\n1. [Shared](docs/agents/shared-operating-rules.md)\n2. [Local](docs/agents/operating-rules.md)\n' > "$vt/AGENTS.md"
+  mkdir -p "$source/docs/agents"
+  cp "$vt/docs/agents/decision-records.md" "$source/docs/agents/decision-records.md"
+  cp "$vt/docs/agents/shared-operating-rules.md" "$source/docs/agents/shared-operating-rules.md"
+  cp "$vt/docs/agents/worktree-placement.md" "$source/docs/agents/worktree-placement.md"
+  git -C "$source" init -q
+  git -C "$source" -c user.email=t@t -c user.name=t -c commit.gpgsign=false add -A
+  git -C "$source" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m fixture
   ( cd "$vt" && eval "$mutate" )
   ( cd "$source" && eval "$source_mutate" )
   set +e
@@ -1185,35 +1218,56 @@ else
   fail "verifier should fail on a missing canonical doc; got: $res"
 fi
 
-res=$(verify_case "wrong-order" 'printf "1. [Local](docs/agents/operating-rules.md)\n2. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
+res=$(verify_case "stale-canonical" 'printf "stale receiver copy\n" > docs/agents/shared-operating-rules.md')
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "canonical agent docs differ"; then
+  pass "verifier rejects a stale receiver-side canonical document (#780)"
+else
+  fail "verifier should compare canonical document bytes, not merely existence; got: $res"
+fi
+
+res=$(verify_case "wrong-canonical-mode" 'chmod +x docs/agents/shared-operating-rules.md')
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "canonical agent docs differ"; then
+  pass "verifier rejects a canonical document whose receiver Git mode differs (#780)"
+else
+  fail "verifier should compare canonical document modes, not merely existence; got: $res"
+fi
+
+res=$(verify_case "wrong-order" 'printf "## Sections\n\n1. [Local](docs/agents/operating-rules.md)\n2. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
 if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "BEFORE docs/agents/shared-operating-rules.md"; then
   pass "verifier fails closed when AGENTS.md lists the local overlay first (#780)"
 else
   fail "verifier should fail on a shared-after-local AGENTS.md; got: $res"
 fi
 
-res=$(verify_case "same-line-wrong-order" 'printf "Read [Local](docs/agents/operating-rules.md), then [Shared](docs/agents/shared-operating-rules.md).\n" > AGENTS.md')
+res=$(verify_case "same-line-wrong-order" 'printf "## Sections\n\n1. Read [Local](docs/agents/operating-rules.md), then [Shared](docs/agents/shared-operating-rules.md).\n" > AGENTS.md')
 if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "BEFORE docs/agents/shared-operating-rules.md"; then
   pass "verifier compares columns when both AGENTS.md links share a line (#780)"
 else
   fail "verifier should fail when the local link precedes shared on one line; got: $res"
 fi
 
-res=$(verify_case "same-line-right-order" 'printf "Read [Shared](docs/agents/shared-operating-rules.md), then [Local](docs/agents/operating-rules.md).\n" > AGENTS.md')
+res=$(verify_case "same-line-right-order" 'printf "## Sections\n\n1. Read [Shared](docs/agents/shared-operating-rules.md), then [Local](docs/agents/operating-rules.md).\n" > AGENTS.md')
 if [ "${res%%|*}" = "0" ]; then
   pass "verifier accepts shared-before-local links on the same line (#780)"
 else
   fail "verifier should accept shared-before-local links on one line; got: $res"
 fi
 
-res=$(verify_case "unlinked" 'printf "1. [Local](docs/agents/operating-rules.md)\n" > AGENTS.md')
+res=$(verify_case "raw-occurrence-before-index" 'printf "<!-- docs/agents/shared-operating-rules.md -->\nProse example: docs/agents/shared-operating-rules.md.\n\n## Sections\n\n1. [Local](docs/agents/operating-rules.md)\n2. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "BEFORE docs/agents/shared-operating-rules.md"; then
+  pass "verifier ignores raw comment/prose occurrences and checks the visible reading-order links"
+else
+  fail "raw occurrences must not mask a reversed visible AGENTS.md index; got: $res"
+fi
+
+res=$(verify_case "unlinked" 'printf "## Sections\n\n1. [Local](docs/agents/operating-rules.md)\n" > AGENTS.md')
 if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "does not reference docs/agents/shared-operating-rules.md"; then
   pass "verifier fails closed when AGENTS.md never links the shared rules (#780)"
 else
   fail "verifier should fail on an AGENTS.md with no shared-rules link; got: $res"
 fi
 
-res=$(verify_case "local-unlinked" 'printf "1. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
+res=$(verify_case "local-unlinked" 'printf "## Sections\n\n1. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
 if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "does not reference docs/agents/operating-rules.md"; then
   pass "verifier fails closed when AGENTS.md never links the local overlay (#780)"
 else

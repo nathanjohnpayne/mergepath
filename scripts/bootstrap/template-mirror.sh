@@ -745,6 +745,16 @@ bootstrap::_verify_canonical_agent_docs() {
     return 1
   fi
 
+  local invalid_pending
+  if ! invalid_pending=$(yq -r '.doc_ownership[] | select(has("pending_manifest") and ((.pending_manifest | tag) != "!!bool")) | .path' "$manifest" 2>&1); then
+    bootstrap::err "could not validate pending_manifest types in source .mergepath-sync.yml: $invalid_pending"
+    return 1
+  fi
+  if [ -n "$invalid_pending" ]; then
+    bootstrap::err "source .mergepath-sync.yml uses a non-boolean pending_manifest for:$invalid_pending — refusing to let a truthy-looking string change the canonical agent-doc set"
+    return 1
+  fi
+
   local canonical_docs
   if ! canonical_docs=$(yq -r '.doc_ownership[] | select(.class == "canonical" and ((.pending_manifest // false) != true)) | .path' "$manifest" 2>&1); then
     bootstrap::err "could not derive canonical agent docs from source .mergepath-sync.yml: $canonical_docs"
@@ -765,6 +775,31 @@ bootstrap::_verify_canonical_agent_docs() {
     return 1
   fi
 
+  local mismatched="" source_mode target_mode
+  while IFS= read -r doc; do
+    [ -n "$doc" ] || continue
+    if [ -L "$target/$doc" ]; then
+      mismatched="$mismatched $doc(symlink)"
+      continue
+    fi
+    if [ ! -f "$source_root/$doc" ] || ! cmp -s -- "$source_root/$doc" "$target/$doc"; then
+      mismatched="$mismatched $doc(content)"
+      continue
+    fi
+    source_mode=$(git -C "$source_root" ls-files -s -- "$doc" 2>/dev/null | awk 'NR == 1 { print $1 }')
+    case "$source_mode" in
+      100644|100755) ;;
+      *) mismatched="$mismatched $doc(source-mode:${source_mode:-untracked})"; continue ;;
+    esac
+    target_mode=100644
+    [ -x "$target/$doc" ] && target_mode=100755
+    [ "$source_mode" = "$target_mode" ] || mismatched="$mismatched $doc(mode:$source_mode->$target_mode)"
+  done <<< "$canonical_docs"
+  if [ -n "$mismatched" ]; then
+    bootstrap::err "canonical agent docs differ from the source checkout:$mismatched — an exclusion may have left stale receiver content, or rsync failed to preserve the source Git mode"
+    return 1
+  fi
+
   local agents_md="$target/AGENTS.md"
   if [ ! -f "$agents_md" ]; then
     bootstrap::err "AGENTS.md missing from the mirrored repo; cannot verify the agent-docs reading order"
@@ -772,8 +807,8 @@ bootstrap::_verify_canonical_agent_docs() {
   fi
 
   local shared_pos local_pos shared_line shared_col local_line local_col
-  shared_pos=$(awk -v needle='docs/agents/shared-operating-rules.md' 'index($0, needle) { printf "%d:%d\n", NR, index($0, needle); exit }' "$agents_md" || true)
-  local_pos=$(awk -v needle='docs/agents/operating-rules.md' 'index($0, needle) { printf "%d:%d\n", NR, index($0, needle); exit }' "$agents_md" || true)
+  shared_pos=$(bootstrap::_agents_index_link_position "$agents_md" 'docs/agents/shared-operating-rules.md' || true)
+  local_pos=$(bootstrap::_agents_index_link_position "$agents_md" 'docs/agents/operating-rules.md' || true)
 
   if [ -z "$shared_pos" ]; then
     bootstrap::err "AGENTS.md does not reference docs/agents/shared-operating-rules.md — the new repo would ship the shared rulebook with nothing pointing at it. Add it to the AGENTS.md reading order at the mergepath source."
@@ -794,6 +829,43 @@ bootstrap::_verify_canonical_agent_docs() {
 
   bootstrap::log "canonical agent docs present and AGENTS.md reads the shared operating rules before the local overlay"
   return 0
+}
+
+# Print the line:column of an actual Markdown link in AGENTS.md's visible
+# Sections list. Raw path strings in comments, prose, or examples are not
+# reading-order entries and must not mask a reversed index.
+bootstrap::_agents_index_link_position() {
+  local agents_md=$1 target=$2
+  awk -v target="$target" '
+    function visible_html(s, out, at, end_at) {
+      out = ""
+      while (1) {
+        if (in_comment) {
+          end_at = index(s, "-->")
+          if (!end_at) return out
+          s = substr(s, end_at + 3)
+          in_comment = 0
+        }
+        at = index(s, "<!--")
+        if (!at) return out s
+        out = out substr(s, 1, at - 1)
+        s = substr(s, at + 4)
+        in_comment = 1
+      }
+    }
+    {
+      line = visible_html($0)
+      if (line ~ /^##[[:space:]]+Sections([[:space:]]|$)/) { in_sections = 1; next }
+      if (in_sections && line ~ /^##[[:space:]]+/) exit
+      if (!in_sections || line !~ /^[[:space:]]*([0-9]+\.|[-+*])[[:space:]]+/) next
+      plain = "](" target ")"
+      angled = "](<" target ">)"
+      col = index(line, plain)
+      if (col) { printf "%d:%d\n", NR, col + 2; exit }
+      col = index(line, angled)
+      if (col) { printf "%d:%d\n", NR, col + 3; exit }
+    }
+  ' "$agents_md"
 }
 
 # Emit the mirror exclusions implied by the SOURCE manifest's
@@ -924,6 +996,11 @@ bootstrap::_reject_symlink_ancestors() {
   local parent=${rel%/*}
   local current=$target
   local component
+
+  if [ -L "$target" ]; then
+    bootstrap::err "template-mirror: refusing to remove stale hub-only doc '$rel': target root '$target' is a symbolic link and escapes the selected target tree"
+    return 1
+  fi
 
   [ "$parent" != "$rel" ] || return 0
   while [ -n "$parent" ]; do
