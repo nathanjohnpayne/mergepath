@@ -198,14 +198,15 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   # same-named secret existed, at the absent manifest). Dropping the
   # workflow without its auditor and suites would leave
   # check_branch_protection_audit's ERROR branch reachable on the hub, so
-  # the four travel together. scripts/ci/check_branch_protection_audit is
+  # the workflow, auditor, and paired suites travel together.
+  # scripts/ci/check_branch_protection_audit is
   # deliberately NOT excluded: the mirrored repo_lint.yml wires it as a
   # step, so the wrapper must ship and take its consumer-SKIP path. That
   # SKIP keys on the scripts/sync-to-downstream.sh hub marker ALONE, NOT on
   # the "wrapped test absent + marker absent" idiom check_wave_audit and
   # check_audit_canonical_mirrors use - excluding a path here stops future
   # seeding but does not scrub the repos bootstrapped before the exclusion,
-  # and gaycruisebingo still carries two of these four.
+  # and gaycruisebingo still carries part of this hub-only set.
   '.github/workflows/branch-protection-audit.yml'
   'scripts/audit-branch-protection.sh'
   'tests/test_audit_branch_protection.sh'
