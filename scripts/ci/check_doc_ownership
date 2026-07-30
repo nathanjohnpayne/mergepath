@@ -299,8 +299,13 @@ mp_doc_link_targets() {
           for (j = start; j <= n; j++) {
             c = substr(line, j, 1)
             if (c == "\\" && j < n) {
-              if (!destination_done) target = target substr(line, j + 1, 1)
-              j++
+              nextc = substr(line, j + 1, 1)
+              if (nextc ~ /[[:punct:]]/) {
+                if (!destination_done) target = target nextc
+                j++
+                continue
+              }
+              if (!destination_done) target = target c
               continue
             }
             if (!destination_done && c ~ /[[:space:]]/ && depth == 0) {
@@ -359,14 +364,31 @@ mp_doc_link_targets() {
         -e 's/\)$//' \
         -e 's/^[[:space:]]*\[[^]]+\]:[[:space:]]*//' \
     | awk '
+        function unescape_punctuation(s, out, i, c, nextc) {
+          out = ""
+          for (i = 1; i <= length(s); i++) {
+            c = substr(s, i, 1)
+            nextc = substr(s, i + 1, 1)
+            if (c == "\\" && nextc ~ /[[:punct:]]/) {
+              out = out nextc
+              i++
+            } else {
+              out = out c
+            }
+          }
+          return out
+        }
         {
           sub(/^[[:space:]]+/, "")
           if (substr($0, 1, 1) == "<") {
             gt = index($0, ">")
-            if (gt > 1) { print substr($0, 2, gt - 2); next }
+            if (gt > 1) {
+              print unescape_punctuation(substr($0, 2, gt - 2))
+              next
+            }
           }
           sub(/[[:space:]].*$/, "")
-          print
+          print unescape_punctuation($0)
         }
       ' \
     | sed -E -e 's/[?#].*$//' \
@@ -708,6 +730,10 @@ verbatim_hit() {
 # 2-4, 6-8: per-entry validation.
 # ─────────────────────────────────────────────────────────────────────
 declared=","
+# Symlinks rejected during per-entry validation, so the exhaustive on-disk
+# scan below can avoid printing the same diagnostic twice while still finding
+# undeclared links independently of file type.
+rejected_symlinks=","
 # Newline-separated paths per class, collected only for entries that
 # survive validation above — check 10 must not reason about an entry the
 # loop already rejected.
@@ -768,6 +794,16 @@ if [ -n "$ownership_rows" ]; then
     esac
     declared="${declared}${norm_doc},"
 
+    # A doc ownership entry describes repository content, not an indirection
+    # whose target can leave the tree or carry a different Git mode. `-f`
+    # follows symlinks, so reject them before the ordinary stale-entry test.
+    if [ -L "$REPO_ROOT/$norm_doc" ]; then
+      echo "FAIL: '$norm_doc' is a symbolic link — docs/agents ownership entries must be regular Markdown files so bootstrap and canonical propagation agree on both content and Git mode"
+      rejected_symlinks="${rejected_symlinks}${norm_doc},"
+      FAILED=1
+      continue
+    fi
+
     # 3b: stale entry.
     if [ ! -f "$REPO_ROOT/$norm_doc" ]; then
       echo "FAIL: doc_ownership declares '$norm_doc' but that file does not exist in this repo — remove the stale entry or restore the file"
@@ -825,6 +861,16 @@ if [ -d "$DOCS_DIR" ]; then
   while IFS= read -r f; do
     [ -z "$f" ] && continue
     rel="${f#"$REPO_ROOT"/}"
+    if [ -L "$f" ]; then
+      case "$rejected_symlinks" in
+        *",$rel,"*) ;;
+        *)
+          echo "FAIL: '$rel' is a symbolic link — every docs/agents/*.md path must be a regular Markdown file, not an indirection outside the ownership inventory"
+          FAILED=1
+          ;;
+      esac
+      continue
+    fi
     case "$declared" in
       *",$rel,"*) ;;
       *)
@@ -835,7 +881,7 @@ if [ -d "$DOCS_DIR" ]; then
     # `find -print` + read is intentional over a glob: it tolerates a
     # missing dir and does not silently yield the literal pattern when
     # nothing matches.
-  done < <(find "$DOCS_DIR" -type f -name '*.md' | LC_ALL=C sort)
+  done < <(find "$DOCS_DIR" \( -type f -o -type l \) -name '*.md' | LC_ALL=C sort)
 fi
 
 # ─────────────────────────────────────────────────────────────────────

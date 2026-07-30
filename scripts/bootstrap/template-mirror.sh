@@ -981,7 +981,8 @@ bootstrap::_rsync_template() {
   while IFS= read -r exc; do
     [ -n "$exc" ] || continue
     bootstrap::_reject_symlink_ancestors "$target" "$exc" || return $?
-    bootstrap::run "remove stale hub-only doc $exc" rm -f -- "$target/$exc"
+    bootstrap::run "remove stale hub-only doc $exc" rm -f -- "$target/$exc" \
+      || return $?
   done <<< "$derived"
 
   bootstrap::run "rsync $source_root -> $target" \

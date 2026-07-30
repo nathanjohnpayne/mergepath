@@ -1032,6 +1032,32 @@ else
   fail "symlinked target ancestry must fail closed and preserve the outside file (rc=$symlink_rsync_rc): $symlink_rsync_out"
 fi
 
+# An existing directory at a path that has become hub-only cannot be removed
+# with `rm -f`. `_rsync_template` may run in a conditional/`||` context where
+# Bash disables errexit inside the function, so the helper must propagate the
+# failed removal explicitly instead of continuing to an excluding rsync that
+# returns success and leaves the residue behind.
+remove_fail_dst="$(mktemp -d "$WORKDIR/remove-fail-dst.XXXXXX")"
+mkdir -p "$remove_fail_dst/docs/agents/newly-hub-only.md"
+set +e
+remove_fail_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  stage_rc=0
+  bootstrap::_rsync_template "$2" "$3" || stage_rc=$?
+  exit "$stage_rc"
+' _ "$MIRROR_LIB" "$rsync_src" "$remove_fail_dst" 2>&1)
+remove_fail_rc=$?
+set -e
+if [ "$remove_fail_rc" != "0" ] \
+   && [ -d "$remove_fail_dst/docs/agents/newly-hub-only.md" ]; then
+  pass "bootstrap::_rsync_template propagates a stale-document removal failure"
+else
+  fail "failed stale-document removal must abort before rsync (rc=$remove_fail_rc): $remove_fail_out"
+fi
+
 # And the wiring fails closed: an unreadable inventory must abort the
 # rsync rather than mirror everything. Assert the destination stays
 # EMPTY, not merely that the rc is non-zero — "it errored" and "it

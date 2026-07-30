@@ -198,6 +198,51 @@ else
   fail "Case 2b unexpected (rc=$rc): $out"
 fi
 
+# --- Case 2c: symlink path names are inventory entries, not files to skip ---
+# `find -type f` omits symbolic links, including a tracked `*.md` link that
+# has no ownership entry at all. Inventory completeness must enumerate the
+# Markdown path name and reject the link explicitly.
+SYMLINK_FIX="$(mktemp -d "$WORKDIR/symlink-zero.XXXXXX")"
+printf '%s' "$MANIFEST_ZERO" > "$SYMLINK_FIX/manifest.yml"
+mkdir -p "$SYMLINK_FIX/scripts" "$SYMLINK_FIX/docs/agents"
+: > "$SYMLINK_FIX/scripts/sync-to-downstream.sh"
+: > "$SYMLINK_FIX/docs/agents/local.md"
+: > "$SYMLINK_FIX/outside.md"
+ln -s ../../outside.md "$SYMLINK_FIX/docs/agents/orphan.md"
+set +e
+out=$(MERGEPATH_MANIFEST_PATH="$SYMLINK_FIX/manifest.yml" \
+  MERGEPATH_REPO_ROOT="$SYMLINK_FIX" bash "$CHECK" 2>&1)
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "'docs/agents/orphan.md' is a symbolic link"; then
+  pass "Case 2c: undeclared symlinked Markdown path is enumerated and rejected"
+else
+  fail "Case 2c unexpected (rc=$rc): $out"
+fi
+
+# A declared symlink used to pass the stale-entry test because `-f` follows
+# links. Reject it before its class is admitted to the canonical/hub lists.
+MANIFEST_SYMLINK_DECLARED="$MIN_HEADER
+paths: []
+doc_ownership:
+  - path: docs/agents/local.md
+    class: per-repo-owned
+  - path: docs/agents/linked.md
+    class: hub-only
+"
+printf '%s' "$MANIFEST_SYMLINK_DECLARED" > "$SYMLINK_FIX/manifest.yml"
+ln -sfn ../../outside.md "$SYMLINK_FIX/docs/agents/linked.md"
+set +e
+out=$(MERGEPATH_MANIFEST_PATH="$SYMLINK_FIX/manifest.yml" \
+  MERGEPATH_REPO_ROOT="$SYMLINK_FIX" bash "$CHECK" 2>&1)
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "'docs/agents/linked.md' is a symbolic link"; then
+  pass "Case 2c2: declared symlink is rejected instead of accepted by -f"
+else
+  fail "Case 2c2 unexpected (rc=$rc): $out"
+fi
+
 # --- Case 3b: duplicate with the SAME class still fails -------------
 # Two agreeing entries are an ambiguity waiting to diverge, not a no-op.
 MANIFEST_DUP_SAME="$MIN_HEADER
@@ -1469,6 +1514,26 @@ docs/agents/hub(1).md|# Hub-only machinery")
     pass "Case 14t: balanced-parenthesis link '$paren_link' fails closed"
   else
     fail "Case 14t ('$paren_link') unexpected (rc=$rc): $out"
+  fi
+done
+
+# Reference definitions apply CommonMark backslash unescaping to ASCII
+# punctuation too. Keeping the escapes in the extracted target makes these
+# valid links compare as `hub\(1\).md` instead of the owned `hub(1).md`.
+for escaped_ref in \
+  'See [the audit].\n\n[the audit]: hub\\(1\\).md' \
+  'See [the audit].\n\n[the audit]:\nhub\\(1\\).md'
+do
+  set +e
+  out=$(run_with_doc_bodies "$MANIFEST_TRUTH_PAREN" \
+    "docs/agents/shared.md|$escaped_ref
+docs/agents/hub(1).md|# Hub-only machinery")
+  rc=$?
+  set -e
+  if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub(1).md' by a relative Markdown link"; then
+    pass "Case 14u: backslash-escaped reference destination fails closed"
+  else
+    fail "Case 14u ('$escaped_ref') unexpected (rc=$rc): $out"
   fi
 done
 
