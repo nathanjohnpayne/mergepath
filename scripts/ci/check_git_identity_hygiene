@@ -51,8 +51,8 @@
 #      out on a checkout that genuinely wants a per-repo identity.
 #
 #   B. Baseline comparison (`--snapshot`, then a later plain run).
-#      `--snapshot` copies .git/config to a scratch path inside the git
-#      common dir; a later plain run byte-compares against it. Wiring
+#      `--snapshot` copies .git/config to a scratch path inside this
+#      worktree's git dir; a later plain run byte-compares against it. Wiring
 #      `--snapshot` as an early repo_lint step and the plain run as the
 #      LAST step turns "running the suite leaves .git/config byte-
 #      identical" into an assertion the CI job actually makes, spanning
@@ -264,17 +264,32 @@ newtmp() {
   printf -v "$mp_var" '%s' "$mp_tmp"
 }
 
-# ── Baseline path ─────────────────────────────────────────────────────
-# Lives inside the git common dir (untracked, shared by every worktree,
-# never visible to `git status`).
-baseline_path() {
-  local common
-  common="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null)" || return 1
-  case "$common" in
-    /*) ;;
-    *) common="$REPO_ROOT/$common" ;;
+# Render one shell argument for the copy-paste remediation commands below.
+# Keep ordinary paths readable, but switch to Bash's reversible `%q` form as
+# soon as interpolation or token splitting would otherwise become possible.
+shell_quote() {
+  local value=$1 quoted
+  case "$value" in
+    *[!A-Za-z0-9_./:-]*)
+      printf -v quoted '%q' "$value"
+      printf '%s' "$quoted"
+      ;;
+    *)
+      printf '"%s"' "$value"
+      ;;
   esac
-  printf '%s\n' "$common/mergepath-gitconfig-baseline"
+}
+
+# ── Baseline path ─────────────────────────────────────────────────────
+# Lives inside this worktree's git dir (untracked, isolated from every other
+# worktree's snapshot, and never visible to `git status`). The config being
+# sampled is shared, but the before-image is worktree-specific: a second
+# worktree taking its own snapshot must not overwrite the first one.
+baseline_path() {
+  local gitdir
+  gitdir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" \
+    || return 1
+  printf '%s\n' "$gitdir/mergepath-gitconfig-baseline"
 }
 
 # A snapshot request must remain observable even if the baseline itself is
@@ -282,13 +297,10 @@ baseline_path() {
 # report pass from "compare" to "nothing to check" and silently blesses any
 # config mutation made in between.
 baseline_marker_path() {
-  local common
-  common="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null)" || return 1
-  case "$common" in
-    /*) ;;
-    *) common="$REPO_ROOT/$common" ;;
-  esac
-  printf '%s\n' "$common/mergepath-gitconfig-baseline.requested"
+  local gitdir
+  gitdir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" \
+    || return 1
+  printf '%s\n' "$gitdir/mergepath-gitconfig-baseline.requested"
 }
 
 config_path() {
@@ -362,8 +374,9 @@ user_home() {
 }
 
 # Resolve an include target the way git does: `~/…` and `~` against the
-# operator's home, `~user/…` through the passwd database, a RELATIVE path
-# against the directory of the file that declared the include (not the
+# operator's home, `~user/…` through the passwd database, Git's
+# `%(prefix)/…` runtime prefix through Git's own path converter, a RELATIVE
+# path against the directory of the file that declared the include (not the
 # repo root and not the caller's cwd), an absolute path unchanged.
 #
 # `~user/…` is git-supported and was previously mis-resolved. Falling
@@ -378,7 +391,8 @@ user_home() {
 # hide a live override: git does its own expansion and may well succeed
 # where this lookup did not.
 resolve_include_path() {
-  local raw="$1" parent="$2" user rest home
+  local raw="$1" parent="$2" output_var="$3" user rest home
+  local prefix_config expanded resolved
   # shellcheck disable=SC2088  # the tildes here are PATTERNS matching a
   # literal `~` in config text, not paths for the shell to expand.
   case "$raw" in
@@ -395,11 +409,24 @@ resolve_include_path() {
       home="$(user_home "$user")" || return 1
       raw="$home$rest"
       ;;
+    '%(prefix)/'*)
+      # Let Git expand its install-time/runtime prefix. Reconstructing it
+      # from `git --exec-path` is not equivalent when GIT_EXEC_PATH or a
+      # relocatable installation is in play. The registered temp file keeps
+      # arbitrary config text data rather than shell syntax.
+      newtmp prefix-path prefix_config
+      git config --file "$prefix_config" mergepath.includePath "$raw" \
+        >/dev/null 2>&1 || return 1
+      expanded="$(git config --file "$prefix_config" --path \
+                    --get mergepath.includePath 2>/dev/null)" || return 1
+      raw="$expanded"
+      ;;
   esac
   case "$raw" in
-    /*) printf '%s\n' "$raw" ;;
-    *) printf '%s\n' "$(dirname -- "$parent")/$raw" ;;
+    /*) resolved="$raw" ;;
+    *) resolved="$(dirname -- "$parent")/$raw" ;;
   esac
+  printf -v "$output_var" '%s' "$resolved"
 }
 
 # Every file a config file can pull values in from, following BOTH
@@ -436,7 +463,7 @@ collect_include_targets() {
     key="${rec%%$'\n'*}"
     raw="${rec#*$'\n'}"
     [ -n "$raw" ] || continue
-    if ! target="$(resolve_include_path "$raw" "$file")"; then
+    if ! resolve_include_path "$raw" "$file" target; then
       unres="$key"$'\037'"$raw"$'\037'"$file"
       case $'\n'"$INCLUDE_UNRESOLVED" in
         *$'\n'"$unres"$'\n'*) ;;
@@ -484,10 +511,12 @@ assert_no_local_identity() {
     return 0
   fi
 
-  local offenders="" remedies="" scope key line origin originfile value
+  local offenders="" remedies="" scope key origin originfile value
   local entry remedy scopefile scopes via_include=0 via_conditional=0
   local seen_values="" dedupe incfile via_unresolved=0
   local unres unres_key unres_rest unres_raw unres_file
+  local repo_q path_q
+  repo_q="$(shell_quote "$REPO_ROOT")"
   # `--worktree` is a DISTINCT scope only when extensions.worktreeConfig
   # is enabled; with the extension off git treats it as an alias for
   # `--local`, so probing both would report every local setting twice and
@@ -523,17 +552,13 @@ assert_no_local_identity() {
       # `git var GIT_AUTHOR_IDENT` fails with "empty ident name". Reading
       # values off the command's stdout, rather than testing a captured
       # string for emptiness, keeps that case visible.
-      while IFS= read -r line; do
-        # `--show-origin` prints "<type>:<name><TAB><value>". A line with
-        # no tab means the format moved; keep the whole line as the value
-        # rather than silently splitting it in the wrong place.
-        if [ "$line" = "${line#*$'\t'}" ]; then
-          origin=""
-          value="$line"
-        else
-          origin="${line%%$'\t'*}"
-          value="${line#*$'\t'}"
-        fi
+      # `-z` returns the origin and value as two NUL-terminated fields.
+      # Without it, --show-origin C-quotes a path containing `"` or `\\`;
+      # treating that display spelling as a filename makes the remediation
+      # target a file that does not exist. NUL framing preserves both an
+      # arbitrary origin path and an empty configured value losslessly.
+      while IFS= read -r -d '' origin \
+        && IFS= read -r -d '' value; do
         originfile=""
         case "$origin" in
           file:*) originfile="$(canonical_path "${origin#file:}")" ;;
@@ -556,10 +581,11 @@ assert_no_local_identity() {
         if [ -n "$originfile" ] && [ -n "$scopefile" ] \
           && [ "$originfile" != "$scopefile" ]; then
           entry+=" (via include: ${origin#file:})"
-          remedy="    git -C \"$REPO_ROOT\" config --file \"$originfile\" --unset-all $key"
+          path_q="$(shell_quote "$originfile")"
+          remedy="    git -C $repo_q config --file $path_q --unset-all $key"
           via_include=1
         else
-          remedy="    git -C \"$REPO_ROOT\" config --$scope --unset-all $key"
+          remedy="    git -C $repo_q config --$scope --unset-all $key"
         fi
 
         offenders+="$entry"$'\n'
@@ -573,7 +599,7 @@ assert_no_local_identity() {
         # What the conditional-include pass below compares against, so an
         # include whose condition IS active is not reported twice.
         seen_values+="$key"$'\037'"${originfile:-$scopefile}"$'\037'"$value"$'\n'
-      done < <(git -C "$REPO_ROOT" config "--$scope" --includes --show-origin \
+      done < <(git -C "$REPO_ROOT" config "--$scope" --includes --show-origin -z \
                  --get-all "$key" 2>/dev/null)
     done
 
@@ -598,7 +624,8 @@ assert_no_local_identity() {
           else
             entry="  $scope: $key = (set to the empty string) (via inactive include: $incfile)"
           fi
-          remedy="    git -C \"$REPO_ROOT\" config --file \"$incfile\" --unset-all $key"
+          path_q="$(shell_quote "$incfile")"
+          remedy="    git -C $repo_q config --file $path_q --unset-all $key"
           via_conditional=1
           offenders+="$entry"$'\n'
           case $'\n'"$remedies" in
@@ -621,7 +648,8 @@ assert_no_local_identity() {
       unres_raw="${unres_rest%%$'\037'*}"
       unres_file="${unres_rest#*$'\037'}"
       entry="  $scope: $unres_key = $unres_raw (unresolvable include path, declared in $unres_file)"
-      remedy="    git -C \"$REPO_ROOT\" config --file \"$unres_file\" --unset-all $unres_key"
+      path_q="$(shell_quote "$unres_file")"
+      remedy="    git -C $repo_q config --file $path_q --unset-all $unres_key"
       via_unresolved=1
       offenders+="$entry"$'\n'
       case $'\n'"$remedies" in
@@ -750,7 +778,7 @@ before it started:
 
 $problems
 Each post-suite assertion reads this repository through \`git\` and reads
-the baseline out of the git common dir, so destroying \`.git\` destroys
+the baseline out of this worktree's git dir, so destroying \`.git\` destroys
 the evidence together with the subject and every one of them would
 otherwise report "nothing to check here" — leaving this check printing
 PASS for a suite that deleted the checkout it ran in. A deleted config is
@@ -769,7 +797,7 @@ EOF
 assert_config_unchanged() {
   local phase="$1" base marker cfg culprit
   if [ "$phase" = "post-suite" ] && [ -n "$PRE_SUITE_BASELINE" ]; then
-    # The live baseline lives inside the git common dir, so a suite that
+    # The live baseline lives inside this worktree's git dir, so a suite that
     # deleted `.git` deleted the thing this compares against. The copy
     # taken before the suite ran is outside the repository and survives.
     base="$PRE_SUITE_BASELINE"
@@ -1008,6 +1036,9 @@ else
       if (s ~ /(^|[[:space:]])--global([[:space:]]|$)/) return 1
       if (s ~ /(^|[[:space:]])--system([[:space:]]|$)/) return 1
       if (s ~ /(^|[[:space:]])(-f|--file|--blob)([[:space:]]|=)/) return 1
+      # `-f<path>` is the valid attached-argument form of the short option;
+      # a quote may begin that path in shell source (`-f"$cfg"`).
+      if (s ~ /(^|[[:space:]])-f[^[:space:]=]/) return 1
       return 0
     }
     # Reads and removals are not identity writes. Anchored on token

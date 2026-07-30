@@ -723,6 +723,36 @@ else
   fail "active includeIf double-reported: entries=$N_ENTRIES remedies=$N_REMEDIES rc=$RC out=$OUT"
 fi
 
+# Case 35b: every printed remediation is executable shell, so paths must be
+# shell-quoted rather than interpolated into double quotes. Both the repository
+# root and the included file deliberately contain command-substitution syntax;
+# evaluating the printed command must clear the offender without executing it.
+REMEDY_REPO="$WORKDIR/remedy-\"-\$(touch PWNED)-repo"
+REMEDY_CWD="$WORKDIR/remedy-exec-cwd"
+REMEDY_INCLUDE="$REMEDY_REPO/.git/identity-\"-\$(touch INCLUDE_PWNED)"
+mkdir -p "$REMEDY_CWD"
+git init -q -b main "$REMEDY_REPO"
+printf '[user]\n\temail = quoted-remedy@example.com\n' > "$REMEDY_INCLUDE"
+git -C "$REMEDY_REPO" config --local include.path "$REMEDY_INCLUDE"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$REMEDY_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+REMEDY="$(printf '%s\n' "$OUT" | grep -E '^[[:space:]]+git .*--unset-all' | head -1 || true)"
+set +e
+( cd "$REMEDY_CWD" && eval "$REMEDY" ) >/dev/null 2>&1
+REMEDY_RC=$?
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$REMEDY_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ -n "$REMEDY" ] && [ "$REMEDY_RC" = "0" ] && [ "$RC" = "0" ] \
+  && [ ! -e "$REMEDY_CWD/PWNED" ] \
+  && [ ! -e "$REMEDY_CWD/INCLUDE_PWNED" ]; then
+  pass "remediation paths are shell-quoted: command clears the offender without substitution"
+else
+  fail "unsafe remediation path: remedy='$REMEDY' remedy_rc=$REMEDY_RC rc=$RC out=$OUT"
+fi
+
 # Case 36: the documented opt-out for a checkout that wants its own
 # identity on purpose.
 set +e
@@ -809,6 +839,32 @@ if [ "$RC" = "1" ] \
   pass "mutated .git/config: caught, with the diff"
 else
   fail "mutated .git/config: rc=$RC out=$OUT"
+fi
+
+# Case 39b: linked worktrees share `.git/config` but must not share the
+# snapshot slot. Otherwise worktree B can overwrite worktree A's baseline
+# after a mutation, causing A's later comparison to bless the changed config.
+MULTI_REPO="$WORKDIR/multi-worktree-repo"
+MULTI_B="$WORKDIR/multi-worktree-b"
+git init -q -b main "$MULTI_REPO"
+printf 'seed\n' > "$MULTI_REPO/seed.txt"
+git -C "$MULTI_REPO" add seed.txt
+git -C "$MULTI_REPO" -c user.name=fixture -c user.email=fixture@example.com \
+  commit -q -m seed
+git -C "$MULTI_REPO" worktree add -q -b other "$MULTI_B"
+MERGEPATH_GIT_IDENTITY_ROOT="$MULTI_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+git -C "$MULTI_B" config --local core.pager cat
+MERGEPATH_GIT_IDENTITY_ROOT="$MULTI_B" bash "$CHECK" --snapshot >/dev/null 2>&1
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$MULTI_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "changed since the snapshot" \
+  && printf '%s' "$OUT" | grep -q "pager"; then
+  pass "linked worktrees keep independent snapshot baselines"
+else
+  fail "linked worktree snapshot overwrote another baseline: rc=$RC out=$OUT"
 fi
 
 # ── Post-suite re-assertion ───────────────────────────────────────────
@@ -1008,6 +1064,7 @@ git -C "$FIX" config user.email "t@t"
 git --git-dir="$FIX/.git" config user.email "t@t"
 git config --file "$FIX/.git/config" user.email "t@t"
 git config -f "$FIX/.git/config" user.name "t"
+git config -f"$FIX/.git/config" user.signingkey "ABC123"
 git config --system user.email "root@example.com"
 '
 if [ "$RC" = "0" ]; then
@@ -1300,10 +1357,31 @@ else
   fail "relative fixture root hid include identity: rc=$RC out=$OUT"
 fi
 
+# Case 58c: Git expands `%(prefix)/...` in path-valued config entries. An
+# inactive includeIf using that runtime prefix is still a repository-local
+# dormant identity override and must not disappear from the unconditional walk.
+PREFIX_REPO="$WORKDIR/runtime-prefix-repo"
+PREFIX_IDENTITY="$WORKDIR/runtime-prefix-identity"
+git init -q -b main "$PREFIX_REPO"
+printf '[user]\n\temail = runtime-prefix@example.com\n' > "$PREFIX_IDENTITY"
+git -C "$PREFIX_REPO" config --local includeIf.onbranch:release.path \
+  "%(prefix)/../../../../../../../../../../../../${PREFIX_IDENTITY#/}"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$PREFIX_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "runtime-prefix@example.com" \
+  && printf '%s' "$OUT" | grep -q "inactive include"; then
+  pass "identity behind a %(prefix)/ include path: expanded with Git and caught"
+else
+  fail "runtime-prefix include path hid identity: rc=$RC out=$OUT"
+fi
+
 # ── Fail-closed: a suite that removes the repository metadata ──────────
 
 # Case 59: the post-suite phase reads the repository through `.git` and
-# the baseline out of the git common dir, so a suite whose fixture
+# the baseline out of its worktree git dir, so a suite whose fixture
 # cleanup is aimed one directory too high — `rm -rf "$ROOT/.git"` — takes
 # the evidence with the subject and every post-suite assertion then finds
 # nothing to check. That is the same wrong-target mistake as an unscoped
