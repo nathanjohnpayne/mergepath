@@ -53,6 +53,18 @@
 #      check_sync_manifest's IDENTITY_DOCS_DENYLIST must be classified
 #      per-repo-owned or hub-only here. The two declarations state the
 #      same governance fact and must not disagree.
+#  10. Consumer-truthfulness: a `canonical` doc must not reference a
+#      `hub-only` doc by repo-relative path, in EITHER spelling — the
+#      literal full path anywhere in the text, or a Markdown link whose
+#      target resolves to it from that doc's own directory (the sibling
+#      forms `[x](hub-only.md)` / `[x](./hub-only.md)`, which contain no
+#      `docs/agents/` prefix to grep for). Canonical docs are mirrored
+#      verbatim; hub-only docs never travel. Such a reference is a link
+#      that resolves on the hub and 404s in all nine consumers — the
+#      #780 guardrail that a canonical doc may name only files
+#      guaranteed present downstream, enforced for the one case this
+#      inventory can actually see. An absolute URL is accepted: it
+#      resolves from any repo.
 #
 # This check is read-only and does NOT contact downstream repos.
 
@@ -130,6 +142,483 @@ mp_path_is_unsafe() {
     *,*|*//*|*/.|*/./*) return 0 ;;
   esac
   return 1
+}
+
+# Emit the parts of a Markdown file in which links can render. Fenced,
+# indented, and same-line backtick code spans are blanked before the target
+# extractor runs; link-shaped examples in code are text, not navigation.
+mp_markdown_renderable_text() {
+  local f="$1"
+  awk '
+    function run_len(s, at, ch, n) {
+      n = 0
+      while (substr(s, at + n, 1) == ch) n++
+      return n
+    }
+    function strip_inline_code(s, out, pos, rel, open, width, scan, got, close_width) {
+      out = ""; pos = 1
+      while (pos <= length(s)) {
+        rel = index(substr(s, pos), "`")
+        if (rel == 0) return out substr(s, pos)
+        open = pos + rel - 1
+        width = run_len(s, open, "`")
+        got = 0; scan = open + width
+        while (scan <= length(s)) {
+          if (substr(s, scan, 1) != "`") { scan++; continue }
+          close_width = run_len(s, scan, "`")
+          if (close_width == width) { got = 1; break }
+          scan += close_width
+        }
+        # An unmatched delimiter renders literally; preserve it and the rest.
+        if (!got) return out substr(s, pos)
+        out = out substr(s, pos, open - pos) " "
+        pos = scan + width
+      }
+      return out
+    }
+    {
+      line = $0
+      reference_continuation = 0
+      if (reference_pending) {
+        reference_pending = 0
+        if (line !~ /^[[:space:]]*$/) reference_continuation = 1
+      }
+      indent = match(line, /[^ ]/) - 1
+      if (indent < 0) indent = length(line)
+      rest = substr(line, indent + 1)
+
+      if (in_fence) {
+        if (indent <= 3 && substr(rest, 1, 1) == fence_char) {
+          width = run_len(rest, 1, fence_char)
+          tail = substr(rest, width + 1)
+          if (width >= fence_width && tail ~ /^[[:space:]]*$/) in_fence = 0
+        }
+        print ""
+        next
+      }
+
+      ch = substr(rest, 1, 1)
+      if (indent <= 3 && (ch == "`" || ch == "~")) {
+        width = run_len(rest, 1, ch)
+        tail = substr(rest, width + 1)
+        # CommonMark forbids a backtick in a backtick fence info string.
+        # Such a line is rendered prose, not a fence opener.
+        if (width >= 3 && !(ch == "`" && index(tail, "`") > 0)) {
+          in_fence = 1; fence_char = ch; fence_width = width
+          print ""
+          next
+        }
+      }
+
+      if (!reference_continuation && (line ~ /^\t/ || substr(line, 1, 4) == "    ")) {
+        print ""
+        next
+      }
+      rendered = strip_inline_code(line)
+      print rendered
+      probe = rendered
+      sub(/^[[:space:]]*/, "", probe)
+      if (probe ~ /^\[[^]]+\]:[[:space:]]*$/) reference_pending = 1
+    }
+  ' "$f"
+}
+
+# Emit every rendered Markdown link/image target in a file, one per line, with
+# fragments, angle brackets and link titles stripped. Used by check 10:
+# a link's *target* is what a reader's browser resolves, and a target is
+# written relative to the document that carries it, so a raw grep for
+# the repo-relative path cannot see the sibling spellings that a doc in
+# the same directory naturally uses (`[x](coderabbit-audit.md)`).
+#
+# Covers both Markdown link forms:
+#   * inline        — `[label](target)`, `[label](<target>)`,
+#                     `[label](target "title")`, and the `!` image variant
+#   * reference def — `[label]: target "title"` at the start of a line,
+#                     AND the CommonMark-legal wrapped spelling where the
+#                     destination sits on the FOLLOWING line:
+#
+#                         [the audit]:
+#                         coderabbit-audit.md
+#
+#                     "optional spaces or tabs (including up to one line
+#                     ending)" separate the colon from the destination, so
+#                     this renders as a working link — verified against
+#                     markdown-it-py's commonmark preset, the parser this
+#                     repo's prose-wrap tooling already relies on:
+#                     `<a href="coderabbit-audit.md">the audit</a>`. A
+#                     same-line-only grep emits no target for it, and the
+#                     sibling spelling carries no `docs/agents/` prefix
+#                     for the literal pass to find either — so the link
+#                     ships broken to every consumer with check 10 silent
+#                     (#797 review).
+#
+# Each producer carries its own `|| true`: the brace group is the left
+# side of a pipeline (so it runs in a subshell where `set -e` applies),
+# and a no-match exit 1 from the FIRST grep would otherwise abort the
+# group and silently discard the later producers' output.
+mp_doc_link_targets() {
+  local f="$1"
+  {
+    # Inline destinations need a small stateful reader rather than
+    # `grep -o '\]([^)]*)'`: CommonMark bare destinations may contain
+    # balanced parentheses (`hub(1).md`), and angle destinations may
+    # contain parentheses or spaces. The first-closing-paren spelling
+    # truncates those valid links and hides consumer-broken references.
+    mp_markdown_renderable_text "$f" | awk '
+      {
+        line = $0
+        n = length(line)
+        for (i = 1; i < n; i++) {
+          if (substr(line, i, 2) != "](") continue
+          start = i + 2
+
+          # Angle-bracket destination: preserve the wrapper so the
+          # common cleanup below can retain embedded whitespace.
+          if (substr(line, start, 1) == "<") {
+            for (j = start + 1; j <= n; j++) {
+              c = substr(line, j, 1)
+              if (c == "\\" && j < n) { j++; continue }
+              if (c != ">") continue
+              for (k = j + 1; k <= n; k++) {
+                c = substr(line, k, 1)
+                if (c == "\\" && k < n) { k++; continue }
+                if (c == ")") {
+                  print substr(line, start, j - start + 1)
+                  i = k
+                  break
+                }
+              }
+              break
+            }
+            continue
+          }
+
+          # Bare destination: the `)` that closes the link is the first
+          # one encountered at nesting depth zero. Backslash escapes do
+          # not affect balancing and are unescaped for path comparison.
+          depth = 0
+          target = ""
+          destination_done = 0
+          for (j = start; j <= n; j++) {
+            c = substr(line, j, 1)
+            if (c == "\\" && j < n) {
+              nextc = substr(line, j + 1, 1)
+              if (nextc ~ /[[:punct:]]/) {
+                if (!destination_done) target = target nextc
+                j++
+                continue
+              }
+              if (!destination_done) target = target c
+              continue
+            }
+            if (!destination_done && c ~ /[[:space:]]/ && depth == 0) {
+              destination_done = 1
+              continue
+            }
+            if (!destination_done && c == "(") {
+              depth++
+              target = target c
+              continue
+            }
+            if (c == ")") {
+              if (!destination_done && depth > 0) {
+                depth--
+                target = target c
+                continue
+              }
+              print target
+              i = j
+              break
+            }
+            if (!destination_done) target = target c
+          }
+        }
+      }
+    ' || true
+    mp_markdown_renderable_text "$f" | grep -oE '^[[:space:]]{0,3}\[[^]]+\]:[[:space:]]*(<[^>]*>|[^[:space:]]+)' || true
+    # Wrapped reference definition: a label + colon with NOTHING after it
+    # on that line, then the destination as the first token of the next
+    # non-blank line. Indentation is capped at three spaces the same way
+    # the same-line grep caps it, but measured with `match()` rather than
+    # an `{0,3}` interval, which not every awk implementation supports.
+    # A blank line after the colon ends the definition (CommonMark allows
+    # at most one line ending there), so nothing is emitted for it.
+    mp_markdown_renderable_text "$f" | awk '
+      function print_target(s, gt) {
+        sub(/^[[:space:]]+/, "", s)
+        if (substr(s, 1, 1) == "<") {
+          gt = index(s, ">")
+          if (gt > 1) { print substr(s, 1, gt); return }
+        }
+        sub(/[[:space:]].*$/, "", s)
+        print s
+      }
+      pending {
+        pending = 0
+        if (NF > 0) { print_target($0); next }
+      }
+      /^[[:space:]]*\[[^]]+\]:[[:space:]]*$/ {
+        indent = match($0, /[^[:space:]]/) - 1
+        if (indent >= 0 && indent <= 3) pending = 1
+      }
+    ' || true
+  } | sed -E \
+        -e 's/^\]\(//' \
+        -e 's/\)$//' \
+        -e 's/^[[:space:]]*\[[^]]+\]:[[:space:]]*//' \
+    | awk '
+        function hex_value(c, p) {
+          p = index("0123456789ABCDEF", toupper(c))
+          return p ? p - 1 : -1
+        }
+        function percent_decode(s, out, i, c, hi, lo) {
+          out = ""
+          for (i = 1; i <= length(s); i++) {
+            c = substr(s, i, 1)
+            if (c == "%" && i + 2 <= length(s)) {
+              hi = hex_value(substr(s, i + 1, 1))
+              lo = hex_value(substr(s, i + 2, 1))
+              if (hi >= 0 && lo >= 0) {
+                out = out sprintf("%c", hi * 16 + lo)
+                i += 2
+                continue
+              }
+            }
+            out = out c
+          }
+          return out
+        }
+        function unescape_punctuation(s, out, i, c, nextc) {
+          out = ""
+          for (i = 1; i <= length(s); i++) {
+            c = substr(s, i, 1)
+            nextc = substr(s, i + 1, 1)
+            if (c == "\\" && nextc ~ /[[:punct:]]/) {
+              out = out nextc
+              i++
+            } else {
+              out = out c
+            }
+          }
+          return out
+        }
+        function normalize_target(s) {
+          s = unescape_punctuation(s)
+          # URL parsing recognizes raw query/fragment delimiters before
+          # percent decoding, so encoded %3F/%23 remain filename bytes.
+          sub(/[?#].*$/, "", s)
+          return percent_decode(s)
+        }
+        {
+          sub(/^[[:space:]]+/, "")
+          if (substr($0, 1, 1) == "<") {
+            gt = index($0, ">")
+            if (gt > 1) {
+              print normalize_target(substr($0, 2, gt - 2))
+              next
+            }
+          }
+          sub(/[[:space:]].*$/, "")
+          print normalize_target($0)
+        }
+      ' \
+    | grep -v '^[[:space:]]*$' || true
+}
+
+# Resolve a link target against the directory of the document carrying
+# it, collapsing '.' and '..' lexically, and print the repo-relative
+# result. A leading '/' is read as repo-root-absolute (that is how these
+# docs are written, and it is also what GitHub's blob view does for a
+# root-relative href within one repo). A target that climbs above the
+# repo root keeps its leading '..' segments, so it simply never equals a
+# declared doc path — which is the correct outcome, not a crash.
+mp_resolve_relative() {
+  local base="$1" target="$2" combined out="" seg rest
+  case "$target" in
+    /*) combined="${target#/}" ;;
+    *)
+      case "$base" in
+        ""|".") combined="$target" ;;
+        *)      combined="$base/$target" ;;
+      esac
+      ;;
+  esac
+  rest="$combined"
+  while [ -n "$rest" ]; do
+    seg="${rest%%/*}"
+    if [ "$seg" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+    case "$seg" in
+      ''|'.') continue ;;
+      '..')
+        case "$out" in
+          ''|'..'|*'/..') out="${out:+$out/}.." ;;
+          */*)            out="${out%/*}" ;;
+          *)              out="" ;;
+        esac
+        ;;
+      *) out="${out:+$out/}$seg" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# Blank out every sanctioned absolute reference on stdin, replacing each
+# with a single space. Used by check 10's literal pass.
+#
+# The sanctioned escape hatch from that check is an absolute URL —
+# `https://github.com/<org>/mergepath/blob/main/<path>` resolves from any
+# repo — but such a URL CONTAINS the repo-relative path as a substring,
+# so a literal search has to tell the two apart. Masking the reference
+# and re-testing the remainder does that per OCCURRENCE. The earlier
+# exemption did it per LINE, which is not the same thing: a sentence
+# spelling the path BOTH ways —
+#
+#     Full procedure: `docs/agents/hub.md` ([hub copy](https://github.com/.../docs/agents/hub.md))
+#
+# — was exempted wholesale by its own absolute half, so the bare
+# repo-relative mention beside it went unreported (#797 review). The
+# resolved-target pass does not recover that case, because a path in
+# prose or inline code is not a link and yields no target.
+#
+# TWO substitutions, in this order:
+#
+#   1. A whole inline link whose DESTINATION is absolute. The label is
+#      masked along with the destination, because REVIEW_POLICY.md's
+#      real spelling of the escape hatch puts the repo-relative path in
+#      the LABEL and the hub URL in the destination — a link that clicks
+#      through correctly from any repo. Masking only the destination
+#      would red the very idiom this check tells authors to use.
+#   2. Any remaining bare absolute URL, including a `<...>` autolink and
+#      the destination half of a reference definition.
+#
+# Both key on the SCHEME, not on `github.com`, so an absolute URL is
+# treated here the same way the resolved pass already treats one (it
+# skips `*://*` targets as already-absolute). A bare URL run ends at
+# whitespace or at any delimiter that cannot appear in a bare URL in
+# this prose: the autolink brackets `<`/`>`, the inline-link parens,
+# `[`/`]`, a quote, or a backtick. Replacing with a space rather than
+# nothing keeps the two sides of a mask from fusing into a path that was
+# never written.
+#
+# What is deliberately NOT masked: a link whose destination is relative.
+# Its label may spell the path too, but the destination itself is the
+# defect, and the resolved pass reports it.
+mp_mask_absolute_urls() {
+  sed -E \
+    -e 's,\[[^]]*\]\([[:space:]]*<?([a-zA-Z][a-zA-Z0-9+.-]*://|//)[^)]*\), ,g' \
+    -e 's,[a-zA-Z][a-zA-Z0-9+.-]*://[^][:space:]<>()"'"'"'`]*, ,g' \
+    -e 's,(^|[[:space:]<(])//[^][:space:]<>()"'"'"'`]*,\1 ,g'
+}
+
+# Mask reference-style link USES whose definition has an absolute
+# destination. The literal pass permits the repo-relative path in a
+# link label when the destination is portable (the same rule as an
+# inline `[path](https://...)` link), but a definition can live on a
+# different line:
+#
+#     [docs/agents/hub.md][audit]
+#     [audit]: https://github.com/.../docs/agents/hub.md
+#
+# A URL-only mask removes the definition's destination but leaves the
+# visible label behind as a false repo-relative hit. Read the file twice:
+# first collect absolute reference definitions (same-line or wrapped),
+# then blank only the corresponding full/collapsed/shortcut link uses.
+# Definition labels themselves stay intact; mp_mask_absolute_urls masks
+# their destination in the next stage.
+mp_mask_absolute_reference_links() {
+  local f="$1"
+  awk '
+    function norm_label(s) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+      gsub(/[[:space:]]+/, " ", s)
+      return tolower(s)
+    }
+    function first_target(s, t) {
+      sub(/^[[:space:]]+/, "", s)
+      t = s
+      sub(/[[:space:]].*$/, "", t)
+      sub(/^</, "", t)
+      sub(/>$/, "", t)
+      return t
+    }
+    function is_absolute(t) {
+      return t ~ /^[A-Za-z][A-Za-z0-9+.-]*:\/\// || t ~ /^\/\// || t ~ /^mailto:/
+    }
+    NR == FNR {
+      line = $0
+      if (pending != "") {
+        label = pending
+        pending = ""
+        if (line ~ /^[[:space:]]*$/) next
+        target = first_target(line)
+        if (is_absolute(target)) absolute[norm_label(label)] = 1
+        next
+      }
+
+      indent = match(line, /[^[:space:]]/) - 1
+      if (indent < 0 || indent > 3) next
+      work = line
+      sub(/^[[:space:]]*/, "", work)
+      if (work !~ /^\[[^]]+\]:/) next
+      label = work
+      sub(/^\[/, "", label)
+      sub(/\].*$/, "", label)
+      rest = work
+      sub(/^\[[^]]+\]:[[:space:]]*/, "", rest)
+      if (rest == "") {
+        pending = label
+      } else {
+        target = first_target(rest)
+        if (is_absolute(target)) absolute[norm_label(label)] = 1
+      }
+      next
+    }
+    {
+      line = $0
+      out = ""
+
+      # Full and collapsed references: [visible][id] / [visible][].
+      while (match(line, /\]\[[^]]*\]/)) {
+        before = substr(line, 1, RSTART - 1)
+        token = substr(line, RSTART, RLENGTH)
+        open = 0
+        for (i = length(before); i >= 1; i--) {
+          if (substr(before, i, 1) == "[") { open = i; break }
+        }
+        if (open == 0) {
+          out = out substr(line, 1, RSTART + RLENGTH - 1)
+          line = substr(line, RSTART + RLENGTH)
+          continue
+        }
+        visible = substr(before, open + 1)
+        label = substr(token, 3, length(token) - 3)
+        if (label == "") label = visible
+        consumed = RSTART + RLENGTH - 1
+        if (absolute[norm_label(label)]) {
+          out = out substr(before, 1, open - 1) " "
+        } else {
+          out = out substr(line, 1, consumed)
+        }
+        line = substr(line, consumed + 1)
+      }
+      line = out line
+
+      # Shortcut references: [id]. Do not mask the definition [id]:.
+      out = ""
+      while (match(line, /\[[^]]+\]/)) {
+        token = substr(line, RSTART, RLENGTH)
+        label = substr(token, 2, length(token) - 2)
+        after = substr(line, RSTART + RLENGTH, 1)
+        if (absolute[norm_label(label)] && after != ":") {
+          out = out substr(line, 1, RSTART - 1) " "
+        } else {
+          out = out substr(line, 1, RSTART + RLENGTH - 1)
+        }
+        line = substr(line, RSTART + RLENGTH)
+      }
+      print out line
+    }
+  ' "$f" "$f"
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -271,12 +760,23 @@ verbatim_hit() {
 # 2-4, 6-8: per-entry validation.
 # ─────────────────────────────────────────────────────────────────────
 declared=","
+# Symlinks rejected during per-entry validation, so the exhaustive on-disk
+# scan below can avoid printing the same diagnostic twice while still finding
+# undeclared links independently of file type.
+rejected_symlinks=","
+# Newline-separated paths per class, collected only for entries that
+# survive validation above — check 10 must not reason about an entry the
+# loop already rejected.
+canonical_docs=""
+hub_only_docs=""
 if [ -n "$ownership_rows" ]; then
   while IFS= read -r ownership_row; do
     [ -z "$ownership_row" ] && continue
     doc_path=$(yq -r '.path // ""' <<< "$ownership_row")
     doc_class=$(yq -r '.class // ""' <<< "$ownership_row")
-    doc_pending=$(yq -r '(.pending_manifest // false) | tostring' <<< "$ownership_row")
+    doc_pending_present=$(yq -r 'has("pending_manifest")' <<< "$ownership_row")
+    doc_pending_tag=$(yq -r '.pending_manifest | tag' <<< "$ownership_row")
+    doc_pending=$(yq -r '.pending_manifest // false' <<< "$ownership_row")
     doc_note=$(yq -r '(.note // "") | tostring' <<< "$ownership_row")
 
     if [ -z "$doc_path" ]; then
@@ -326,6 +826,22 @@ if [ -n "$ownership_rows" ]; then
     esac
     declared="${declared}${norm_doc},"
 
+    if [ "$doc_pending_present" = "true" ] && [ "$doc_pending_tag" != "!!bool" ]; then
+      echo "FAIL: '$norm_doc' has pending_manifest with YAML type '$doc_pending_tag' — pending_manifest must be a YAML boolean, not a quoted string or another scalar"
+      FAILED=1
+      continue
+    fi
+
+    # A doc ownership entry describes repository content, not an indirection
+    # whose target can leave the tree or carry a different Git mode. `-f`
+    # follows symlinks, so reject them before the ordinary stale-entry test.
+    if [ -L "$REPO_ROOT/$norm_doc" ]; then
+      echo "FAIL: '$norm_doc' is a symbolic link — docs/agents ownership entries must be regular Markdown files so bootstrap and canonical propagation agree on both content and Git mode"
+      rejected_symlinks="${rejected_symlinks}${norm_doc},"
+      FAILED=1
+      continue
+    fi
+
     # 3b: stale entry.
     if [ ! -f "$REPO_ROOT/$norm_doc" ]; then
       echo "FAIL: doc_ownership declares '$norm_doc' but that file does not exist in this repo — remove the stale entry or restore the file"
@@ -343,6 +859,11 @@ if [ -n "$ownership_rows" ]; then
         FAILED=1
       fi
     fi
+
+    case "$doc_class" in
+      canonical) canonical_docs="${canonical_docs}${norm_doc}"$'\n' ;;
+      hub-only)  hub_only_docs="${hub_only_docs}${norm_doc}"$'\n' ;;
+    esac
 
     # 7 / 8: class ↔ manifest consistency.
     if [ "$doc_class" = "canonical" ]; then
@@ -378,6 +899,16 @@ if [ -d "$DOCS_DIR" ]; then
   while IFS= read -r f; do
     [ -z "$f" ] && continue
     rel="${f#"$REPO_ROOT"/}"
+    if [ -L "$f" ]; then
+      case "$rejected_symlinks" in
+        *",$rel,"*) ;;
+        *)
+          echo "FAIL: '$rel' is a symbolic link — every docs/agents/*.md path must be a regular Markdown file, not an indirection outside the ownership inventory"
+          FAILED=1
+          ;;
+      esac
+      continue
+    fi
     case "$declared" in
       *",$rel,"*) ;;
       *)
@@ -388,7 +919,7 @@ if [ -d "$DOCS_DIR" ]; then
     # `find -print` + read is intentional over a glob: it tolerates a
     # missing dir and does not silently yield the literal pattern when
     # nothing matches.
-  done < <(find "$DOCS_DIR" -type f -name '*.md' | LC_ALL=C sort)
+  done < <(find "$DOCS_DIR" \( -type f -o -type l \) -name '*.md' | LC_ALL=C sort)
 fi
 
 # ─────────────────────────────────────────────────────────────────────
@@ -527,12 +1058,12 @@ if [ -f "$SIBLING" ]; then
         if (q == SQ) { if (c == SQ) { q = "" } else { keep(c) } ; continue }
 
         if (q == DQ) {
-          # Inside double quotes only \" and \\ escape, and a backslash
+          # Inside double quotes \$, \`, \" and \\ escape, and a backslash
           # before a newline is a continuation Bash deletes; every other
           # backslash is an ordinary character to Bash as far as word
           # splitting is concerned, so it is kept as-is.
           if (c == BS) {
-            if (nx == DQ || nx == BS) { keep(nx); i++ }
+            if (nx == DQ || nx == BS || nx == "$" || nx == BT) { keep(nx); i++ }
             else if (nx == NL) { i++ }
             else { keep(c) }
             continue
@@ -644,6 +1175,90 @@ if [ -f "$SIBLING" ]; then
       fi
     done <<< "$denylist"
   fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# 10: consumer-truthfulness — no canonical → hub-only reference.
+# ─────────────────────────────────────────────────────────────────────
+#
+# A canonical doc is mirrored verbatim into every consumer; a hub-only
+# doc never travels. So a repo-relative reference from the former to the
+# latter is a link that works only where it was written and 404s in all
+# nine consumers — and nothing downstream would ever report it, because
+# the consumer has no manifest and no inventory to check against.
+#
+# Scope is deliberately narrow: it compares two classes this inventory
+# already declares, so there is nothing to keep in step and no guessing
+# about which OTHER hub files travel. A same-line absolute URL is the
+# escape hatch — `https://github.com/<org>/mergepath/blob/main/<path>`
+# resolves from any repo, which is exactly how REVIEW_POLICY.md links
+# the hub-only CodeRabbit audit.
+#
+# TWO passes, because one spelling of the same broken link is invisible
+# to the other:
+#
+#   (a) LITERAL — the full repo-relative path appears anywhere in the
+#       text (`see \`docs/agents/coderabbit-audit.md\``), link or prose.
+#       An absolute URL *contains* the path as a substring, so every
+#       absolute URL is MASKED OUT of the matched text first and the
+#       remainder re-tested; the exemption is therefore scoped to the
+#       URL itself, not to the whole line that carries it.
+#   (b) RESOLVED — every Markdown link target is resolved against the
+#       directory of the doc carrying it, then compared as a whole path.
+#       Canonical and hub-only docs are siblings under docs/agents/, so
+#       the natural spelling is `[audit](coderabbit-audit.md)` or
+#       `[audit](./coderabbit-audit.md)` — neither contains the string
+#       pass (a) looks for, so without this pass the broken link ships
+#       to all nine consumers unreported. Pass (b) needs no same-line
+#       URL exemption: it parses targets, and an `https://` target is
+#       skipped as already-absolute.
+#
+# A doc that trips both passes is reported once, naming the spelling
+# that was found first.
+if [ -n "$canonical_docs" ] && [ -n "$hub_only_docs" ]; then
+  while IFS= read -r canon_doc; do
+    [ -n "$canon_doc" ] || continue
+    # Missing files were already reported by check 3b; skip rather than
+    # emit a second, less specific failure for the same cause.
+    [ -f "$REPO_ROOT/$canon_doc" ] || continue
+
+    # Resolve this doc's link targets ONCE, not once per hub-only doc.
+    canon_dir="${canon_doc%/*}"
+    [ "$canon_dir" = "$canon_doc" ] && canon_dir="."
+    resolved_targets=""
+    while IFS= read -r link_target; do
+      case "$link_target" in
+        # Empty, pure fragment, or already absolute (any scheme, plus
+        # protocol-relative `//host/...`) — nothing repo-relative to break.
+        ''|'#'*|*://*|mailto:*|//*) continue ;;
+      esac
+      resolved_targets="${resolved_targets}$(mp_resolve_relative "$canon_dir" "$link_target")"$'\n'
+    done <<< "$(mp_doc_link_targets "$REPO_ROOT/$canon_doc")"
+
+    while IFS= read -r hub_doc; do
+      [ -n "$hub_doc" ] || continue
+      spelling=""
+      # (a) literal path mention. `grep -v` (not -q) reads its input to
+      # completion: with `set -o pipefail`, an early-exiting `grep -q`
+      # could SIGPIPE the producer and turn a real hit into a silent pass.
+      # Mask portable inline/bare URLs and reference-style link uses,
+      # then search the remainder. Reading the full file is necessary:
+      # a reference definition may live far from the label it licenses.
+      bare=$(mp_mask_absolute_reference_links "$REPO_ROOT/$canon_doc" \
+        | mp_mask_absolute_urls \
+        | grep -F -- "$hub_doc" || true)
+      [ -n "$bare" ] && spelling="by repo-relative path"
+      # (b) relative link target that resolves to it. Same `grep -q`
+      # caution as above — match with `-xF` and test the captured output.
+      if [ -z "$spelling" ] && [ -n "$resolved_targets" ]; then
+        resolved_hit=$(printf '%s' "$resolved_targets" | grep -xF -- "$hub_doc" || true)
+        [ -n "$resolved_hit" ] && spelling="by a relative Markdown link that resolves to it"
+      fi
+      [ -n "$spelling" ] || continue
+      echo "FAIL: canonical doc '$canon_doc' references the hub-only doc '$hub_doc' $spelling — a canonical doc is mirrored verbatim to every consumer, a hub-only doc never travels, so that reference resolves on the hub and 404s downstream. Drop the reference, restate the content inline, or link it as an absolute https://github.com/... URL."
+      FAILED=1
+    done <<< "$hub_only_docs"
+  done <<< "$canonical_docs"
 fi
 
 if [ "$FAILED" -ne 0 ]; then

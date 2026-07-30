@@ -47,6 +47,14 @@ Then follow this procedure:
 
 This rule applies only to 1Password CLI sign-in and authentication errors. Other `op` failures (wrong item ID, missing field, network errors, vault permission errors) should be diagnosed and resolved normally.
 
+## Secret handling
+
+These three rules hold in every repository, whatever it deploys and however it deploys it. The repo-specific half — which credential a deploy resolves, which vault item holds it, which command runs the deploy — belongs in that repo's own `docs/agents/deployment-process.md`, not here.
+
+1. **Never move a secret through a human.** Do not ask anyone to paste a raw credential, token, or key into chat, an issue, or a PR comment, and never print a resolved secret value in logs or command output. A credential manager hands the value to the tool that needs it; it does not pass through a transcript.
+2. **No long-lived keys by convenience.** Do not introduce long-lived service-account keys or on-disk deploy keys into repo docs, scripts, or secret stores unless the project explicitly requires them and a human has approved that requirement. Short-lived, manager-resolved credentials are the default form.
+3. **Do not downgrade a repo's auth model unilaterally.** Where a repository's deploy or CI auth is 1Password-backed — the fleet default — switching it back to routine browser login, an interactive CLI login, or an unmanaged on-disk key needs explicit human approval. Reaching for the downgrade because a credential lookup failed is the specific move this rule forbids; see the pause-and-prompt procedure above.
+
 ## Bug fix escalation policy
 
 These rules prevent agents from repeatedly patching symptoms of a structural defect. They are derived from a real failure where one agent made six unsuccessful fix attempts on the same issue because every attempt preserved the same broken architectural assumption.

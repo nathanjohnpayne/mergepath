@@ -1061,12 +1061,19 @@ if [ -f "$LIVE_MANIFEST" ] && [ -f "$LIVE_MARKER" ]; then
   #       full URLs are unambiguous everywhere; the pattern below
   #       deliberately does not match them, nor `#issuecomment-<id>`.
   #   (b) a reference to hub-only machinery — the propagation manifest,
-  #       the sync engine, the wave audit, the bootstrap seeders, the
-  #       weekly sweep, or the three hub-only machinery docs. None of
-  #       these exist in a consumer checkout, so naming them as
-  #       something the reader can run or read is false there.
+  #       the sync engine, the wave audit, the bootstrap seeders, or the
+  #       weekly sweep. None exist in a consumer checkout, so naming one
+  #       as something the reader can run is false there.
+  #
+  # Canonical→hub-only DOC references are deliberately not duplicated
+  # here. scripts/ci/check_doc_ownership check 10 is the authoritative
+  # parser for that inventory relationship: it resolves sibling and
+  # reference-style links and masks portable absolute URLs. Rebuilding
+  # its path set as an ERE here previously disagreed on absolute links
+  # and treated valid path metacharacters as regex syntax. Keep this
+  # guard on the non-document machinery that check 10 does not cover.
   BARE_ISSUE_RE='(^|[^A-Za-z0-9_/-])#[0-9]+'
-  HUB_ONLY_RE='\.mergepath-sync\.yml|sync-to-downstream\.sh|wave-audit\.sh|scripts/bootstrap/|sweep-unresolved-feedback|docs/agents/(bootstrap-runbook|propagation-ordering|templated-propagation)\.md'
+  HUB_ONLY_RE='\.mergepath-sync\.yml|sync-to-downstream\.sh|wave-audit\.sh|scripts/bootstrap/|sweep-unresolved-feedback'
 
   # Tell (a) scans PROSE ONLY. `#<digits>` is not an issue reference
   # inside a fenced code block (a CSS hex colour `#336699`, a literal in

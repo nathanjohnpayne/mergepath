@@ -238,7 +238,7 @@ If any `op` command fails mid-session (rare — only if 1Password locks or the 1
 
 > **Applies only to repos with `coderabbit.enabled: true` in `.github/review-policy.yml`.** Skip this phase for repos where CodeRabbit is not enabled.
 
-> **Config posture & runbook:** the `.coderabbit.yml` posture audit (why we run `profile: chill`, the `base_branches`/`learnings.scope`/`auto_pause_after_reviewed_commits` decisions), the `@coderabbitai rate limit` diagnostic, and the author-seat coverage procedure live in [`docs/agents/coderabbit-audit.md`](docs/agents/coderabbit-audit.md) (#491). Consult it before changing `.coderabbit.yml` or debugging a "CodeRabbit never ran" case.
+> **Config posture & runbook:** the `.coderabbit.yml` posture audit (why we run `profile: chill`, the `base_branches`/`learnings.scope`/`auto_pause_after_reviewed_commits` decisions), the `@coderabbitai rate limit` diagnostic, and the author-seat coverage procedure live in mergepath's [`docs/agents/coderabbit-audit.md`](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/coderabbit-audit.md) (#491). Consult it before changing `.coderabbit.yml` or debugging a "CodeRabbit never ran" case. That audit is hub-only — it records the template repo's own posture and the fleet-wide seat-coverage sweep — so the link is absolute and stays resolvable from a consumer repo, which does not carry the file.
 
 After internal review passes (Phase 2), CodeRabbit provides an independent automated review:
 
@@ -657,7 +657,7 @@ The same tier resolution also drives the **agent-facing surfacing** (advisory, n
 
 > **Rollout note (#574).** Sub-issue #576 shipped the schema above and the shared parser/classifier library. Sub-issue #577 makes the gates **act**: `codex-p1-gate.sh` is generalized beyond P1 and `coderabbit-severity-gate.sh` is added, both honoring the resolved `required` tiers, plus the agent-facing `blocking` surfacing above. `feedback_policy` is therefore now enforced, not just documentary (an absent block still reproduces the prior Codex-P1-only behavior exactly).
 
-> **CodeRabbit profile dependency.** `nitpick: required` only has teeth when `.coderabbit.yml` uses `reviews.profile: assertive`; the shipped `chill` profile suppresses the 🧹 Nitpick category entirely, so the requirement is a no-op there. `coderabbit-severity-gate.sh` emits a non-fatal warning when it sees `nitpick: required` under a chill profile. See [`docs/agents/coderabbit-audit.md`](docs/agents/coderabbit-audit.md).
+> **CodeRabbit profile dependency.** `nitpick: required` only has teeth when `.coderabbit.yml` uses `reviews.profile: assertive`; the shipped `chill` profile suppresses the 🧹 Nitpick category entirely, so the requirement is a no-op there. `coderabbit-severity-gate.sh` emits a non-fatal warning when it sees `nitpick: required` under a chill profile. See mergepath's [`docs/agents/coderabbit-audit.md`](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/coderabbit-audit.md) (hub-only, hence the absolute link).
 
 ## Handoff Message Format
 
@@ -958,11 +958,7 @@ git config --show-origin --get user.email
 git config --show-origin --get user.signingkey
 ```
 
-Provisioning the real human author identity belongs to verified machine setup,
-outside every managed checkout. This policy deliberately publishes no
-copy-pastable identity setter with placeholder values: if any verified value
-above is absent or wrong, stop and run the approved machine-setup flow, then
-repeat the read-only checks before committing.
+Provisioning the real human author identity belongs to verified machine setup, outside every managed checkout. This policy deliberately publishes no copy-pastable identity setter with placeholder values: if any verified value above is absent or wrong, stop and run the approved machine-setup flow, then repeat the read-only checks before committing.
 
 **Never run a bare `git config user.name` / `git config user.email` inside a managed checkout.** Without `--global`, `git config` writes the *current repository's* `.git/config`, which every worktree of that repository shares. Such an override is invisible to `git config --global --get user.email`, outlives the session that made it, and silently reattributes — and, when `commit.gpgsign` is set alongside it, unsigns — every later commit from every worktree. That corruption reached `main` twice under an undeliverable `.example` fixture address before anyone noticed ([#777](https://github.com/nathanjohnpayne/mergepath/issues/777)), and an earlier revision of this very section, which instructed a bare repo-local `git config user.email`, is how it got there. `scripts/ci/check_git_identity_hygiene` now fails on both the leftover override and on the instruction shape that produces it.
 

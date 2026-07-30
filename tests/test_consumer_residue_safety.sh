@@ -1202,7 +1202,7 @@ tests/test_audit_branch_protection_workflow.sh
 SELF_H2="scripts/audit-branch-protection.sh
 tests/test_audit_branch_protection.sh"
 
-# Stage real-content artifacts for those four hub-only refs. The defective
+# Stage real-content artifacts for the hub-only refs above. The defective
 # wrapper never executes them on the diverging subset (it errors in its
 # required-file loop first), but they are real files with real modes, not
 # exit-0 stubs.

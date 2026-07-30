@@ -18,7 +18,7 @@
 # .ai_context.md, SECURITY.md, AGENTS.md, and docs/agents/{repository-
 # overview,testing-requirements,code-modification-rules}.md — and the
 # hub-only docs (ai_agent_tooling_standard.md, docs/agents/{bootstrap-
-# runbook,propagation-ordering,templated-propagation}.md) are
+# runbook,propagation-ordering,templated-propagation,coderabbit-audit}.md) are
 # DELIBERATELY absent from this manifest, and must STAY absent as
 # verbatim `type: canonical`/`type: kit` entries. Every consumer
 # customizes the identity docs (its own brand narrative, system
@@ -990,6 +990,29 @@ paths:
   - path: docs/agents/shared-operating-rules.md
     type: canonical
     consumers: all
+  # The soft-wrap prose convention (#780 step 6), extracted from the
+  # per-repo-owned docs/agents/documentation-rules.md. The RULE is
+  # fleet-wide — a machine's ~/GitHub/CLAUDE.md already named it the
+  # cross-repo canonical convention while it lived in a per-repo file,
+  # the exact #739 authoring gap. The mergepath-local half (the in-scope
+  # path allowlist, scripts/lint-md-prose-wrap.sh, the md-prose-wrap
+  # workflow) deliberately did NOT come along: none of it is propagated,
+  # so a canonical doc naming it would be false downstream. Consumer-truth
+  # checked — the only repo file it names is
+  # docs/agents/documentation-rules.md, which every consumer has.
+  - path: docs/agents/prose-line-wrapping.md
+    type: canonical
+    consumers: all
+  # Thin review-policy pointer (#780 step 6 class audit). Nine lines that
+  # redirect to REVIEW_POLICY.md + .github/review-policy.yml and forbid
+  # adding review rules under docs/agents/ — both targets exist in every
+  # consumer, so the pointer resolves everywhere. Already present and
+  # byte-identical (blob 9c6d1c37) in 8 of 9 consumers as bootstrap
+  # residue, so canonicalizing clobbers no local customization: it is an
+  # ADD in friends-and-family-billing and a content refresh elsewhere.
+  - path: docs/agents/code-review-requirements.md
+    type: canonical
+    consumers: all
 
   # Canonical workflows — review policy + automation surfaces that
   # should be lockstep across all consumers.
@@ -1403,16 +1426,27 @@ doc_ownership:
     class: canonical
   - path: docs/agents/code-review-requirements.md
     class: canonical
-    pending_manifest: true
     note: >-
-      Pure thin pointer to REVIEW_POLICY.md + .github/review-policy.yml,
-      both present in every consumer. Verified byte-identical (blob
-      9c6d1c37, 515 bytes) on the hub and in 8 of 9 consumers;
-      friends-and-family-billing is the only repo missing it, so
-      canonicalizing is an ADD there and a no-op everywhere else. The
-      `paths:` entry is deliberately deferred to the #780 step-6 class
-      audit, which decides canonical-thin-pointer vs remove-if-unused —
-      no consumer AGENTS.md indexes it today.
+      #780 step 6 RESOLVED as canonical-thin-pointer, not remove-if-unused.
+      Evidence: an org-wide code search finds no inbound reference in any
+      of the ten repos except the generated PRD mirror, so "unused" was
+      literally true — but the doc is a live governance tombstone ("do not
+      add review rules here; update REVIEW_POLICY.md instead"), it names
+      only files present in every consumer, and it is already byte-identical
+      (blob 9c6d1c37) in 8 of 9. Removing it would have stranded those 8
+      orphans and a dead PRD row in another repo to buy nothing.
+      Canonicalizing instead closes the friends-and-family-billing gap and
+      makes drift impossible. It is now indexed in the hub AGENTS.md; the
+      consumer AGENTS.md rows land with the steps 4-5 migration wave.
+  - path: docs/agents/prose-line-wrapping.md
+    class: canonical
+    note: >-
+      SPLIT OUT of docs/agents/documentation-rules.md by #780 step 6. The
+      universal half (soft-wrap prose, one physical line per paragraph,
+      never reflow a file this repo does not author) is canonical here;
+      the mergepath-local half (in-scope path allowlist, the
+      md-prose-wrap gate) stays in the per-repo-owned file, which now
+      points here for the rule itself.
 
   # ── per-repo-owned ─────────────────────────────────────────────────
   - path: docs/agents/operating-rules.md
@@ -1428,21 +1462,36 @@ doc_ownership:
   - path: docs/agents/documentation-rules.md
     class: per-repo-owned
     note: >-
-      MIXED. Repo-specific content dominates (each repo names its own
-      docs and generated-mirror paths), so it stays per-repo-owned. The
-      hub's universal rules — prose line-wrapping and canonical-source
-      discipline — should be extracted into focused canonical docs
-      rather than mirroring this file; that extraction is #780 step 6.
+      MIXED, and confirmed so by the fleet: all 9 consumer copies differ
+      from the hub and from each other, and every one of them is a
+      repo-specific list of which of ITS docs to update when. Stays
+      per-repo-owned. #780 step 6 extracted the prose line-wrapping rule
+      into canonical docs/agents/prose-line-wrapping.md and left the
+      allowlist + gate behind. Canonical-source discipline was
+      deliberately NOT extracted: as written it names
+      scripts/audit-canonical-mirrors.sh (hub-only, bootstrap-excluded)
+      and describes mergepath's own authoring workflow, so a verbatim
+      mirror would be false downstream. Extracting it needs a rewrite,
+      not a move — a separate decision, not this audit.
   - path: docs/agents/deployment-process.md
     class: per-repo-owned
     note: >-
       MIXED. Deploy commands, environments, and build steps are
-      repo-specific by construction, so it stays per-repo-owned. Two
-      residual issues for #780 step 6: the universal 1Password deploy-auth
-      policy is worth extracting into a focused canonical doc, and
+      repo-specific by construction, so it stays per-repo-owned. #780
+      step 6 declined to mint a canonical deploy doc and extracted the
+      universal floor into shared-operating-rules.md § Secret handling
+      instead. Evidence for declining: the 9 consumer copies are 925-2814
+      bytes against the hub's 6853 and are already rewritten to each
+      repo's own deploy story; only 2 of 4 sampled carry the
+      no-downgrade invariant, in incompatible wordings ("template-derived
+      repos" vs "this repo"); the surrounding procedure depends on
+      op-firebase-deploy, a PATH command rather than a guaranteed repo
+      file; and the one procedural rule that IS universal (the op
+      sign-in pause-and-prompt) was already canonical. Residual:
       gaycruisebingo's copy is still byte-identical to the hub's
       (un-scrubbed bootstrap residue asserting a hub-only workflow it
-      does not have — the #744/#747 class).
+      does not have — the #744/#747 class), a consumer-side deletion for
+      the steps 4-5 migration wave.
   - path: docs/agents/repository-overview.md
     class: per-repo-owned
   - path: docs/agents/testing-requirements.md
@@ -1460,9 +1509,18 @@ doc_ownership:
   - path: docs/agents/coderabbit-audit.md
     class: hub-only
     note: >-
-      Documents the hub-side CodeRabbit configuration audit. Present in
-      no consumer except gaycruisebingo, where it is un-scrubbed
-      bootstrap residue. Unlike the three hub-only docs above it is NOT
-      yet on check_sync_manifest's IDENTITY_DOCS_DENYLIST nor on
-      bootstrap's mirror-exclude list; adding it to both, and deleting
-      the gaycruisebingo residue, is #780 step 6.
+      Documents the hub-side CodeRabbit configuration audit — it records
+      the TEMPLATE repo's own .coderabbit.yml posture ("our value") and a
+      fleet-wide seat-coverage sweep, so a verbatim consumer copy reads
+      as if the consumer were the hub. #780 step 6 made the class
+      enforceable: it is now on check_sync_manifest's
+      IDENTITY_DOCS_DENYLIST, the bootstrap mirror derives its exclude
+      pattern from this very class entry (see
+      bootstrap::_derive_hub_only_excludes in
+      scripts/bootstrap/template-mirror.sh, so there is no second list
+      to keep in step), and
+      REVIEW_POLICY.md's two links to it were rewritten as absolute
+      hub URLs so excluding it strands no dead relative link in a newly
+      bootstrapped repo. Residual: gaycruisebingo still carries the
+      un-scrubbed bootstrap residue (the only consumer that does);
+      deleting it is a consumer-side change for the steps 4-5 wave.

@@ -85,9 +85,13 @@ doc_ownership:
     class: canonical
   - path: docs/agents/worktree-placement.md
     class: canonical
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
 EOF
 cat >"$FAKE_MP/AGENTS.md" <<'AGENTSEOF'
 # Agent Instructions
+
+## Sections
 
 1. **[Repository Overview](docs/agents/repository-overview.md)**
 2. **[Shared Agent Operating Rules](docs/agents/shared-operating-rules.md)**

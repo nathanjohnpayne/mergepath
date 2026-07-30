@@ -185,6 +185,10 @@ echo "# Shared Agent Operating Rules (canonical core)" >"$FAKE_MP/docs/agents/sh
 echo "# Worktree Placement (canonical convention)" >"$FAKE_MP/docs/agents/worktree-placement.md"
 # The per-repo-owned local overlay it must be read BEFORE.
 echo "# Agent Operating Rules (local overlay)" >"$FAKE_MP/docs/agents/operating-rules.md"
+# Per-repo-owned deployment instructions are copied verbatim. Seed the
+# real document so the fixture proves its banner is truthful in the
+# consumer copy too, rather than testing a synthetic neutral sentence.
+cp "$ROOT/docs/agents/deployment-process.md" "$FAKE_MP/docs/agents/deployment-process.md"
 
 # REVIEW_POLICY.md with the hub-only wave-audit passage the #747
 # reframe must replace in the consumer copy. Deliberately carries NO
@@ -216,6 +220,10 @@ echo "# The AI Agent Tooling Standard" >"$FAKE_MP/ai_agent_tooling_standard.md"
 echo "# Bootstrap runbook (hub-only)" >"$FAKE_MP/docs/agents/bootstrap-runbook.md"
 echo "# Propagation ordering (hub-only)" >"$FAKE_MP/docs/agents/propagation-ordering.md"
 echo "# Templated propagation (hub-only)" >"$FAKE_MP/docs/agents/templated-propagation.md"
+# #780 class audit: the CodeRabbit config audit records the TEMPLATE
+# repo's own posture ("our value") and a fleet-wide seat sweep, so it is
+# hub-only machinery and must not land in a new repo either.
+echo "# CodeRabbit configuration audit (hub-only)" >"$FAKE_MP/docs/agents/coderabbit-audit.md"
 
 # --- excluded paths (must NOT propagate) ---
 echo "playground spec" >"$FAKE_MP/specs/mergepath_playground.md"
@@ -252,6 +260,15 @@ echo "name: branch-protection-audit" >"$FAKE_MP/.github/workflows/branch-protect
 # cron driver) - mergepath-only; the engine + manifest are also the
 # consumer-vs-mergepath markers the propagated scripts/ci/check_* wrappers key
 # off, and weekly-drift-audit.yml is the hub-only cron that runs the engine.
+# The doc_ownership inventory drives two derivations in the stage:
+# bootstrap::_verify_canonical_agent_docs reads `class: canonical`, and
+# bootstrap::_derive_hub_only_excludes reads `class: hub-only` to build
+# the mirror exclusions. The hub-only entries below are therefore NOT
+# decoration — they are what drops the machinery docs created above
+# from the mirror, and assertion 4b1 fails without them. They also keep
+# the fixture faithful to the real manifest, where every docs/agents
+# doc carries exactly one class (check_doc_ownership check 5) and these
+# machinery docs carry hub-only.
 cat >"$FAKE_MP/.mergepath-sync.yml" <<'EOF'
 version: 1
 doc_ownership:
@@ -265,6 +282,20 @@ doc_ownership:
     class: canonical
     pending_manifest: true
     note: deliberately not required until its backing path lands
+  - path: docs/agents/operating-rules.md
+    class: per-repo-owned
+  - path: docs/agents/deployment-process.md
+    class: per-repo-owned
+  - path: docs/agents/repository-overview.md
+    class: per-repo-owned
+  - path: docs/agents/bootstrap-runbook.md
+    class: hub-only
+  - path: docs/agents/propagation-ordering.md
+    class: hub-only
+  - path: docs/agents/templated-propagation.md
+    class: hub-only
+  - path: docs/agents/coderabbit-audit.md
+    class: hub-only
 EOF
 echo "sync engine" >"$FAKE_MP/scripts/sync-to-downstream.sh"
 echo "sync engine test" >"$FAKE_MP/tests/test_sync_to_downstream.sh"
@@ -527,6 +558,13 @@ grep -q "Brand: My-new-repo\|Brand: Mergepath" "$TARGET/BRAND.md" \
 grep -q "downstream \*\*consumer\*\* of the \[mergepath\]" "$TARGET/docs/agents/repository-overview.md" \
   && pass "repository-overview.md scaffolded with neutral consumer framing (#744)" \
   || fail "repository-overview.md not scaffolded; got: $(head -3 "$TARGET/docs/agents/repository-overview.md")"
+if grep -q "mergepath's own" "$TARGET/docs/agents/deployment-process.md"; then
+  fail "deployment-process.md copied mergepath-only ownership prose into the consumer"
+elif grep -q "repository carrying this copy" "$TARGET/docs/agents/deployment-process.md"; then
+  pass "deployment-process.md keeps repo-owned deployment prose consumer-neutral"
+else
+  fail "deployment-process.md lost the repo-owned banner while being mirrored"
+fi
 
 # No residual 'mergepath' in the STILL-SUBSTITUTED name-bearing files.
 # BRAND.md + repository-overview.md are excluded here: their scaffolds
@@ -547,7 +585,8 @@ readme_residual=$(grep -i "mergepath" "$TARGET/README.md" 2>/dev/null \
 # --- assertion 4b: hub-only MACHINERY docs excluded (#744) ---
 hub_leak=""
 for d in docs/agents/bootstrap-runbook.md \
-         docs/agents/propagation-ordering.md docs/agents/templated-propagation.md; do
+         docs/agents/propagation-ordering.md docs/agents/templated-propagation.md \
+         docs/agents/coderabbit-audit.md; do
   [ -e "$TARGET/$d" ] && hub_leak="$hub_leak $d"
 done
 [ -z "$hub_leak" ] \
@@ -559,6 +598,539 @@ done
 [ -f "$TARGET/ai_agent_tooling_standard.md" ] \
   && pass "ai_agent_tooling_standard.md kept in the consumer (Standard, not machinery)" \
   || fail "ai_agent_tooling_standard.md was wrongly excluded from the consumer"
+
+# --- assertion 4b2: every PROSE statement of the exclusion set is whole -
+# Two live documents enumerate the docs/agents/ mirror exclusions:
+# specs/bootstrap_consumer_identity.md (the ground-truth acceptance
+# criteria, whose preservation boundary reads "everything not named
+# above flows through the mirror untouched") and
+# docs/agents/bootstrap-runbook.md step 5 (the operator runbook read
+# while actually running the wizard). A docs/agents/ path added to
+# BOOTSTRAP_MIRROR_EXCLUDES without a matching entry in BOTH therefore
+# makes a live document state the opposite of what the code does — which
+# is exactly what happened when coderabbit-audit.md was added while both
+# the spec and the runbook still enumerated only the original three
+# machinery docs (#797 review). An operator trusting the runbook writes
+# a consumer-side doc linking a file the mirror never delivered, and the
+# link 404s.
+#
+# Read the exclude set from the implementation rather than restating
+# it: a second hard-coded copy is the drift this guard exists to catch.
+#
+# The mirror now drops a docs/agents/ file by one of TWO routes, so the
+# set this compares against prose is the UNION of both. Checking only
+# the array would have quietly narrowed this guard to
+# repository-overview.md the moment the hub-only docs moved out of it:
+#
+#   * BOOTSTRAP_MIRROR_EXCLUDES — what the inventory does not imply
+#     (docs/agents/repository-overview.md, excluded while staying
+#     per-repo-owned).
+#   * doc_ownership's `class: hub-only` entries — derived into
+#     exclusions at rsync time by
+#     bootstrap::_derive_hub_only_excludes.
+#
+# Each side must yield something; an empty derivation means the shape
+# it reads has moved and this guard has gone blind, which fails rather
+# than passes.
+MIRROR_LIB="$ROOT/scripts/bootstrap/template-mirror.sh"
+LIVE_MANIFEST="$ROOT/.mergepath-sync.yml"
+EXCLUSION_PROSE_SURFACES=(
+  specs/bootstrap_consumer_identity.md
+  docs/agents/bootstrap-runbook.md
+)
+if [ -f "$MIRROR_LIB" ]; then
+  array_docs=$(awk '
+    /^BOOTSTRAP_MIRROR_EXCLUDES=\(/ { inside = 1; next }
+    inside && /^\)/                 { inside = 0 }
+    inside                          { print }
+  ' "$MIRROR_LIB" \
+    | sed -E "s/^[[:space:]]+//; s/[[:space:]]+\$//; s/^'//; s/'\$//" \
+    | grep -E '^docs/agents/.+\.md$' || true)
+  hub_only_docs=$(yq -r '.doc_ownership[] | select(.class == "hub-only") | .path' "$LIVE_MANIFEST" 2>/dev/null || true)
+  if [ -z "$array_docs" ]; then
+    fail "could not read any docs/agents/ entry out of BOOTSTRAP_MIRROR_EXCLUDES — the array shape changed and this guard is now blind"
+    excluded_docs=""
+  elif [ -z "$hub_only_docs" ]; then
+    fail "could not derive any 'class: hub-only' doc from $LIVE_MANIFEST — the class name moved and this guard is now blind"
+    excluded_docs=""
+  else
+    excluded_docs=$(printf '%s\n%s\n' "$array_docs" "$hub_only_docs" | grep -v '^$' | LC_ALL=C sort -u)
+  fi
+  if [ -z "$excluded_docs" ]; then
+    :
+  else
+    for surface in "${EXCLUSION_PROSE_SURFACES[@]}"; do
+      if [ ! -f "$ROOT/$surface" ]; then
+        fail "exclusion-set prose surface missing: $surface"
+        continue
+      fi
+      prose_gap=""
+      while IFS= read -r excluded; do
+        [ -n "$excluded" ] || continue
+        grep -qF -- "$excluded" "$ROOT/$surface" || prose_gap="$prose_gap $excluded"
+      done <<< "$excluded_docs"
+      [ -z "$prose_gap" ] \
+        && pass "$surface names every docs/agents/ mirror exclusion" \
+        || fail "$surface does not name every docs/agents doc BOOTSTRAP_MIRROR_EXCLUDES drops (update its enumeration):$prose_gap"
+    done
+  fi
+fi
+
+# --- assertion 4b3: no hard-coded count of the hub-only doc set -------
+# The exclusion set has already grown once (#780 added a fourth
+# machinery doc) and every prose restatement of its SIZE went stale in
+# place: the runbook's step 5, both step-5b comments in
+# template-mirror.sh, and the tell-(b) scanner comment in
+# tests/test_check_sync_manifest.sh all kept asserting the old number
+# after the new doc landed. A count is unmaintainable by construction —
+# assertion 4b2 can mechanically verify an ENUMERATION against the
+# implementation, but nothing can verify a number written in prose. So
+# the convention is simply: never write one. Name the source of truth
+# (BOOTSTRAP_MIRROR_EXCLUDES, or the manifest's `class: hub-only`
+# entries) and let the enumeration guard do the rest.
+#
+# The scan must be WRAP-INSENSITIVE. Shell comments in
+# template-mirror.sh are hard-wrapped near 72 columns by local
+# convention, and the first cut of this guard was a single-line regex.
+# It caught the step-5b dispatch comment, where the stale claim happened
+# to fit on one line, and sailed straight past the identical claim in
+# the bootstrap::_scaffold_consumer_identity header, where the natural
+# wrap fell between "and the" and the count opening the next line — so
+# the guard was vacuous for one of the two comments it was written to
+# protect, and re-wording that header back would have reintroduced the
+# defect with CI fully green. Re-wrapping a comment must never change
+# what a guard sees, so each candidate file is flattened into
+# whitespace-normalised blocks first and the phrases are matched against
+# those.
+#
+# Neither pattern hard-codes the CURRENT size: a count is banned
+# whatever its value, because a stale number (three) has to fail just as
+# loudly as a fresh one (four). What IS derived is the region and the
+# file list — a fifth exclusion needs no edit here.
+#
+# Scope, stated plainly rather than implied: both patterns are
+# determiner-led. A BARE cardinal in front of the token — "two hub-only
+# docs cross-referencing each other" in tests/test_check_doc_ownership.sh
+# — is deliberately allowed, because that sentence counts a synthetic
+# two-doc fixture it defines two lines later, not this set, and banning
+# the shape would only teach the next author to reword around the guard.
+# Nor does either pattern read a count that trails its subject
+# ("the hub-only docs, all four of them"). What they do cover is the
+# shape every stale statement so far has taken: a determiner, a count,
+# and the subject, in that order, at any wrapping.
+
+# Scan $1 for the ERE in $2 over wrap-insensitive blocks. A block is a
+# maximal run of consecutive non-blank lines; each line is stripped of
+# leading whitespace and of a leading comment/list marker, its interior
+# whitespace is collapsed, and the lines are joined with single spaces —
+# so a phrase broken by a hard wrap still reads as one string. Every
+# match prints "<line>: <bounded snippet>", mapping the offset inside
+# the joined block back to the physical line the match starts on, so the
+# report stays as actionable as a plain `grep -n`. $3/$4 optionally
+# restrict the scan to a line range.
+mirror_scan_wrapped() {
+  awk -v pat="$2" -v from="${3:-1}" -v to="${4:-0}" '
+    function flush(   probe, pos, abs, i, ln, s) {
+      if (buf == "") return
+      # Prepend a space so a phrase at offset 1 still has a left
+      # boundary character: the patterns can then require a real
+      # non-word char rather than offering "^" as an alternative, which
+      # would match falsely when rescanning the tail after a hit.
+      probe = " " buf
+      pos = 1
+      while (match(substr(probe, pos), pat)) {
+        abs = pos + RSTART - 1
+        ln = start
+        for (i = 1; i <= n; i++) if (offs[i] <= abs) ln = lns[i]
+        s = abs - 40; if (s < 1) s = 1
+        print ln ": " substr(buf, s, RLENGTH + 80)
+        pos = abs + RLENGTH
+      }
+      buf = ""; n = 0
+    }
+    NR < from { next }
+    to > 0 && NR > to { flush(); exit }
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/^(#+|\/\/|\*|-|>)[[:space:]]*/, "", line)
+      gsub(/[[:space:]]+/, " ", line)
+      sub(/ $/, "", line)
+      if (line == "") { flush(); next }
+      if (buf == "") { start = NR; buf = line; n = 1; offs[1] = 1; lns[1] = NR }
+      else { n++; offs[n] = length(buf) + 2; lns[n] = NR; buf = buf " " line }
+    }
+    END { flush() }
+  ' "$1"
+}
+
+if ! command -v git >/dev/null 2>&1 \
+   || ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # Fail closed, like 4b2's empty-derivation branch and Case 37's empty
+  # alternation. This suite already requires git (assertion 6 asserts
+  # the bootstrapped target's initial commit), so a missing checkout is
+  # a broken environment rather than a supported mode — and a guard that
+  # silently skips is how a stale count gets back in unnoticed.
+  fail "assertion 4b3 cannot enumerate tracked files (git or a git checkout at $ROOT is unavailable), so the hard-coded-count scan would be blind — failing closed instead of skipping"
+elif [ ! -f "$MIRROR_LIB" ]; then
+  fail "assertion 4b3 cannot read $MIRROR_LIB — the array-scoped count scan is blind"
+else
+  # Vocabulary, assembled from parts at runtime so this guard does not
+  # match its own source text.
+  count_alt='one|two|three|four|five|six|seven|eight|nine|ten|10|[1-9]'
+  det_alt='the|these|those|all|its'
+
+  # (a) Repo-wide: a determiner + cardinal in front of the set's name
+  #     ("... and the <count> hub-only docs", "all <count> of the
+  #     hub-only docs"), in any wrapping. `hub-only` is the trailing
+  #     anchor, so `git grep -l` on that literal is a sound superset
+  #     pre-filter for the file list — a match cannot exist in a file
+  #     that never spells the token.
+  count_re="[^[:alnum:]_-](${det_alt})[[:space:]]+(${count_alt})[[:space:]]+(of[[:space:]]+(the[[:space:]]+)?)?hub-only"
+  count_files=$(git -C "$ROOT" grep -lI 'hub-only' -- . || true)
+  if [ -z "$count_files" ]; then
+    fail "assertion 4b3 found no tracked file containing the literal 'hub-only' — the anchor token moved and this scan is now blind"
+  else
+    count_prose=""
+    while IFS= read -r count_file; do
+      [ -n "$count_file" ] || continue
+      count_file_hits=$(mirror_scan_wrapped "$ROOT/$count_file" "$count_re" || true)
+      if [ -n "$count_file_hits" ]; then
+        count_prose="$count_prose
+$(printf '%s\n' "$count_file_hits" | sed -E "s|^|  $count_file:|")"
+      fi
+    done <<< "$count_files"
+    [ -z "$count_prose" ] \
+      && pass "no tracked file hard-codes a count of the hub-only doc set (wrap-insensitive)" \
+      || fail "hard-coded hub-only doc count(s) found — name BOOTSTRAP_MIRROR_EXCLUDES or the manifest's class: hub-only entries instead of a number:$count_prose"
+  fi
+
+  # (b) Array-scoped: inside BOOTSTRAP_MIRROR_EXCLUDES' own commentary a
+  #     demonstrative or definite article + cardinal states the size of
+  #     the array it sits in whatever noun follows, so (a)'s trailing
+  #     anchor never sees it — "the only one of these four whose absence
+  #     ..." named no set at all and shipped one line above the entries
+  #     it miscounted (#797 review). The extent scanned is DERIVED from
+  #     the array header and its closing paren, not a line range, and
+  #     the scan fails closed if either end cannot be located.
+  arr_start=$(awk '/^BOOTSTRAP_MIRROR_EXCLUDES=\(/ { print NR; exit }' "$MIRROR_LIB")
+  arr_end=$(awk -v s="${arr_start:-0}" 's > 0 && NR > s && /^\)/ { print NR; exit }' "$MIRROR_LIB")
+  if [ -z "$arr_start" ] || [ -z "$arr_end" ]; then
+    fail "could not locate the BOOTSTRAP_MIRROR_EXCLUDES body in $MIRROR_LIB (header=${arr_start:-?}, close=${arr_end:-?}) — assertion 4b3's array-scoped count scan is blind"
+  else
+    arr_count_re="[^[:alnum:]_-](the|these|those)[[:space:]]+(${count_alt})([^[:alnum:]_-]|$)"
+    arr_count_prose=$(mirror_scan_wrapped "$MIRROR_LIB" "$arr_count_re" "$arr_start" "$arr_end" \
+      | sed -E "s|^|  ${MIRROR_LIB#"$ROOT/"}:|" || true)
+    [ -z "$arr_count_prose" ] \
+      && pass "BOOTSTRAP_MIRROR_EXCLUDES' own commentary states no count of the set it lists" \
+      || fail "BOOTSTRAP_MIRROR_EXCLUDES' commentary hard-codes the size of the set it lists — refer to the entries below it instead of counting them:
+$arr_count_prose"
+  fi
+fi
+
+# --- assertion 4b4: hub-only exclusions are DERIVED, not restated -----
+# `doc_ownership:` and BOOTSTRAP_MIRROR_EXCLUDES used to be two
+# hand-maintained lists that had to agree, and classifying the next doc
+# hub-only without also editing the array would have rsynced hub-only
+# content into the next new repo (#797 review). The array no longer
+# carries those paths at all: bootstrap::_derive_hub_only_excludes
+# reads `class: hub-only` out of the SOURCE manifest on every run and
+# bootstrap::_rsync_template appends the result to the rsync patterns,
+# so the inventory is the only place the set is written down and the
+# two cannot disagree.
+#
+# That makes the old "do the lists agree?" comparison meaningless — it
+# would be asserting a property of one list against itself. What has to
+# be proven instead is that the derivation actually happens, covers the
+# inventory, and fails CLOSED. A derivation that silently yields
+# nothing is worse than the hand-maintained array it replaced, because
+# rsync with no hub-only excludes copies every one of them.
+#
+# Note this asserts nothing about the REVERSE containment: BRAND.md and
+# docs/agents/repository-overview.md are excluded via the array while
+# staying per-repo-owned, so the excluded set stays a superset of the
+# hub-only set by design.
+
+# Call bootstrap::_derive_hub_only_excludes against a synthetic source
+# root, with the logging helpers stubbed the way verify_case does.
+# Sets DERIVE_RC / DERIVE_OUT / DERIVE_ERR.
+#
+# stdout and stderr are captured SEPARATELY, and the bootstrap::err
+# stub writes to stderr exactly as scripts/bootstrap/_lib.sh does. That
+# fidelity is load-bearing rather than tidiness: the caller consumes
+# this function's stdout as the exclude-pattern list, so a stub that
+# echoed diagnostics to stdout would model a tool that cannot exist and
+# would hide the failure mode where an error message becomes an rsync
+# --exclude argument.
+derive_case() {
+  # $1 = mutation applied inside a copy of the fixture source root
+  local mutate="${1:-:}" source rc
+  source="$(mktemp -d "$WORKDIR/derive-source.XXXXXX")"
+  cp "$FAKE_MP/.mergepath-sync.yml" "$source/.mergepath-sync.yml"
+  ( cd "$source" && eval "$mutate" )
+  set +e
+  bash -c '
+    bootstrap::log() { :; }
+    bootstrap::err() { echo "ERR: $*" >&2; }
+    source "$1"
+    bootstrap::_derive_hub_only_excludes "$2"
+  ' _ "$MIRROR_LIB" "$source" >"$WORKDIR/derive.out" 2>"$WORKDIR/derive.err"
+  rc=$?
+  set -e
+  DERIVE_RC=$rc
+  DERIVE_OUT=$(cat "$WORKDIR/derive.out")
+  DERIVE_ERR=$(cat "$WORKDIR/derive.err")
+}
+
+# Control: the fixture's hub-only entries come back, in full, on stdout
+# and with nothing on stderr.
+derive_case
+expected_derived=$(yq -r '.doc_ownership[] | select(.class == "hub-only") | .path' "$FAKE_MP/.mergepath-sync.yml" | LC_ALL=C sort)
+actual_derived=$(printf '%s\n' "$DERIVE_OUT" | grep -v '^$' | LC_ALL=C sort || true)
+if [ "$DERIVE_RC" = "0" ] && [ -n "$expected_derived" ] && [ "$actual_derived" = "$expected_derived" ] && [ -z "$DERIVE_ERR" ]; then
+  pass "hub-only mirror exclusions are derived from the source manifest's doc_ownership (#797 review)"
+else
+  fail "derivation did not return the manifest's hub-only set (rc=$DERIVE_RC, stderr='$DERIVE_ERR'); expected:
+$expected_derived
+got:
+$actual_derived"
+fi
+
+# check_doc_ownership accepts leading './' spellings after normalizing
+# them to repo-relative paths. The bootstrap derivation consumes the
+# same inventory, so it must accept and emit that same normalized set.
+derive_case 'yq -i '\''(.doc_ownership[] | select(.class == "hub-only") | .path) |= "./" + .'\'' .mergepath-sync.yml'
+normalized_expected=$(printf '%s\n' "$expected_derived" | sed 's#^\./##' | LC_ALL=C sort)
+normalized_actual=$(printf '%s\n' "$DERIVE_OUT" | grep -v '^$' | LC_ALL=C sort || true)
+if [ "$DERIVE_RC" = "0" ] && [ "$normalized_actual" = "$normalized_expected" ] && [ -z "$DERIVE_ERR" ]; then
+  pass "hub-only mirror derivation accepts and normalizes './' ownership paths"
+else
+  fail "derivation disagrees with doc_ownership path normalization (rc=$DERIVE_RC, stderr='$DERIVE_ERR'); expected:
+$normalized_expected
+got:
+$normalized_actual"
+fi
+
+# The finding's exact scenario: classify one more doc hub-only and touch
+# NOTHING else. Under the old hand-maintained array this leaked; the
+# derived set has to pick it up with no code edit at all.
+derive_case 'yq -i '\''.doc_ownership += [{"path":"docs/agents/newly-hub-only.md","class":"hub-only"}]'\'' .mergepath-sync.yml'
+if [ "$DERIVE_RC" = "0" ] && printf '%s\n' "$DERIVE_OUT" | grep -qx 'docs/agents/newly-hub-only.md'; then
+  pass "a newly classified hub-only doc is excluded with no edit to BOOTSTRAP_MIRROR_EXCLUDES (#797 review)"
+else
+  fail "derivation missed a newly classified hub-only doc (rc=$DERIVE_RC): $DERIVE_OUT $DERIVE_ERR"
+fi
+# ... and the array genuinely does not name it, so the line above cannot
+# be passing for the old reason.
+if grep -qF 'docs/agents/newly-hub-only.md' "$MIRROR_LIB"; then
+  fail "BOOTSTRAP_MIRROR_EXCLUDES names the synthetic doc — the assertion above proves nothing"
+else
+  pass "the synthetic hub-only doc appears nowhere in $MIRROR_LIB (derivation, not restatement)"
+fi
+
+# Fail-closed branches. Each must return non-zero AND say why; a
+# derivation that returns 0 with an empty set would mirror hub-only
+# content into the new repo silently, which is the whole hazard.
+derive_case 'rm .mergepath-sync.yml'
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q 'source .mergepath-sync.yml missing'; then
+  pass "derivation fails closed when the source manifest is absent"
+else
+  fail "derivation should fail closed without a source manifest (rc=$DERIVE_RC): $DERIVE_ERR"
+fi
+
+derive_case 'printf "version: 1\n" > .mergepath-sync.yml'
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q 'no valid doc_ownership list'; then
+  pass "derivation fails closed when doc_ownership is absent"
+else
+  fail "derivation should fail closed without a doc_ownership list (rc=$DERIVE_RC): $DERIVE_ERR"
+fi
+
+derive_case 'printf "doc_ownership:\n  - path: docs/agents/x.md\n    class: canonical\n" > .mergepath-sync.yml'
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q 'no .class: hub-only. doc'; then
+  pass "derivation fails closed when the inventory yields no hub-only doc (the class name moved)"
+else
+  fail "derivation should refuse an empty hub-only set (rc=$DERIVE_RC): $DERIVE_ERR"
+fi
+
+# A wildcard would be honored by rsync: `docs/agents/*.md` strips every
+# canonical agent doc from the new repo. Reject it at the source.
+derive_case 'yq -i '\''.doc_ownership += [{"path":"docs/agents/*.md","class":"hub-only"}]'\'' .mergepath-sync.yml'
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q 'wildcard metacharacter'; then
+  pass "derivation rejects a wildcard hub-only path before it reaches rsync"
+else
+  fail "derivation should reject a wildcard hub-only path (rc=$DERIVE_RC): $DERIVE_ERR"
+fi
+# ...and it emits NOTHING on the way out. The rejected entry is appended
+# AFTER the fixture's valid hub-only paths, so a function that streamed
+# each path as it validated it would have already written those valid
+# ones to stdout before reaching the bad one. A caller reading stdout
+# would then mirror with a partial exclusion set. Diagnostics go to
+# stderr and the path list is buffered until the whole inventory checks
+# out, so a failed derivation yields no patterns at all.
+[ -z "$DERIVE_OUT" ] \
+  && pass "a rejected derivation emits no partial exclude list on stdout" \
+  || fail "a rejected derivation left patterns on stdout that a caller could mirror with: $DERIVE_OUT"
+
+derive_case 'yq -i '\''.doc_ownership += [{"path":"scripts/secret.sh","class":"hub-only"}]'\'' .mergepath-sync.yml'
+if [ "$DERIVE_RC" != "0" ] && printf '%s' "$DERIVE_ERR" | grep -q "only for 'docs/agents/\*\.md' paths"; then
+  pass "derivation fails closed on a hub-only path outside the inventory's documented scope"
+else
+  fail "derivation should refuse an out-of-scope hub-only path (rc=$DERIVE_RC): $DERIVE_ERR"
+fi
+
+# --- assertion 4b5: the derivation is actually WIRED into the rsync ---
+# Everything above tests the helper. This drives
+# bootstrap::_rsync_template end to end against a miniature source tree
+# whose manifest classifies a doc hub-only that BOOTSTRAP_MIRROR_EXCLUDES
+# has never heard of, and asserts the file does not land — the property
+# an operator actually depends on. A helper that derives perfectly but
+# is never called would pass every assertion above and still leak.
+rsync_src="$(mktemp -d "$WORKDIR/rsync-src.XXXXXX")"
+rsync_dst="$(mktemp -d "$WORKDIR/rsync-dst.XXXXXX")"
+mkdir -p "$rsync_src/docs/agents" "$rsync_dst/docs/agents"
+printf 'hub only\n'  > "$rsync_src/docs/agents/newly-hub-only.md"
+printf 'canonical\n' > "$rsync_src/docs/agents/decision-records.md"
+printf 'readme\n'    > "$rsync_src/README.md"
+# Reproduce a resumed Stage B after this path changed from mirrored to
+# hub-only: rsync exclusion prevents a fresh copy but does not delete this
+# receiver-side residue on its own.
+printf 'stale copy from interrupted bootstrap\n' > "$rsync_dst/docs/agents/newly-hub-only.md"
+cat >"$rsync_src/.mergepath-sync.yml" <<'YAML'
+version: 1
+doc_ownership:
+  - path: docs/agents/decision-records.md
+    class: canonical
+  - path: docs/agents/newly-hub-only.md
+    class: hub-only
+YAML
+set +e
+rsync_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$rsync_src" "$rsync_dst" 2>&1)
+rsync_rc=$?
+set -e
+if [ "$rsync_rc" != "0" ]; then
+  fail "end-to-end rsync with a derived hub-only exclude failed (rc=$rsync_rc): $rsync_out"
+else
+  if [ -e "$rsync_dst/docs/agents/newly-hub-only.md" ]; then
+    fail "a 'class: hub-only' doc that BOOTSTRAP_MIRROR_EXCLUDES never names was copied into the mirror — the derivation is not wired into bootstrap::_rsync_template"
+  else
+    pass "bootstrap::_rsync_template removes a stale, newly hub-only doc on resume (#797 review)"
+  fi
+  [ -f "$rsync_dst/docs/agents/decision-records.md" ] && [ -f "$rsync_dst/README.md" ] \
+    && pass "the derived exclude is scoped: canonical docs and ordinary files still mirror" \
+    || fail "the derived exclude over-matched — canonical/ordinary files missing from the mirror"
+fi
+
+# A target subdirectory may be a symlink even when the target root itself is
+# legitimate. Removing receiver residue through that path would unlink a file
+# outside the bootstrap target before rsync has a chance to replace the link.
+symlink_dst="$(mktemp -d "$WORKDIR/symlink-dst.XXXXXX")"
+symlink_outside="$(mktemp -d "$WORKDIR/symlink-outside.XXXXXX")"
+mkdir -p "$symlink_dst/docs"
+printf 'must survive bootstrap\n' > "$symlink_outside/newly-hub-only.md"
+ln -s "$symlink_outside" "$symlink_dst/docs/agents"
+set +e
+symlink_rsync_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$rsync_src" "$symlink_dst" 2>&1)
+symlink_rsync_rc=$?
+set -e
+if [ "$symlink_rsync_rc" != "0" ] \
+   && [ -f "$symlink_outside/newly-hub-only.md" ] \
+   && printf '%s' "$symlink_rsync_out" | grep -q 'symlink ancestor'; then
+  pass "bootstrap::_rsync_template rejects a symlink ancestor without deleting outside the target"
+else
+  fail "symlinked target ancestry must fail closed and preserve the outside file (rc=$symlink_rsync_rc): $symlink_rsync_out"
+fi
+
+# The selected target itself can also be a symlink. Check it before appending
+# even the first relative component, or stale-residue deletion escapes through
+# the root link.
+root_symlink_outside="$(mktemp -d "$WORKDIR/root-symlink-outside.XXXXXX")"
+root_symlink_dst="$WORKDIR/root-symlink-target"
+mkdir -p "$root_symlink_outside/docs/agents"
+printf 'must survive root symlink\n' > "$root_symlink_outside/docs/agents/newly-hub-only.md"
+ln -s "$root_symlink_outside" "$root_symlink_dst"
+set +e
+root_symlink_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$rsync_src" "$root_symlink_dst" 2>&1)
+root_symlink_rc=$?
+set -e
+if [ "$root_symlink_rc" != "0" ] \
+   && [ -f "$root_symlink_outside/docs/agents/newly-hub-only.md" ] \
+   && printf '%s' "$root_symlink_out" | grep -q 'target root.*symbolic link'; then
+  pass "bootstrap::_rsync_template rejects a symlinked target root without deleting outside it"
+else
+  fail "symlinked target root must fail closed and preserve the outside file (rc=$root_symlink_rc): $root_symlink_out"
+fi
+
+# An existing directory at a path that has become hub-only cannot be removed
+# with `rm -f`. `_rsync_template` may run in a conditional/`||` context where
+# Bash disables errexit inside the function, so the helper must propagate the
+# failed removal explicitly instead of continuing to an excluding rsync that
+# returns success and leaves the residue behind.
+remove_fail_dst="$(mktemp -d "$WORKDIR/remove-fail-dst.XXXXXX")"
+mkdir -p "$remove_fail_dst/docs/agents/newly-hub-only.md"
+set +e
+remove_fail_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  stage_rc=0
+  bootstrap::_rsync_template "$2" "$3" || stage_rc=$?
+  exit "$stage_rc"
+' _ "$MIRROR_LIB" "$rsync_src" "$remove_fail_dst" 2>&1)
+remove_fail_rc=$?
+set -e
+if [ "$remove_fail_rc" != "0" ] \
+   && [ -d "$remove_fail_dst/docs/agents/newly-hub-only.md" ]; then
+  pass "bootstrap::_rsync_template propagates a stale-document removal failure"
+else
+  fail "failed stale-document removal must abort before rsync (rc=$remove_fail_rc): $remove_fail_out"
+fi
+
+# And the wiring fails closed: an unreadable inventory must abort the
+# rsync rather than mirror everything. Assert the destination stays
+# EMPTY, not merely that the rc is non-zero — "it errored" and "it
+# copied nothing" are different claims, and only the second is the one
+# that keeps hub-only content out of the new repo.
+blind_src="$(mktemp -d "$WORKDIR/blind-src.XXXXXX")"
+blind_dst="$(mktemp -d "$WORKDIR/blind-dst.XXXXXX")"
+mkdir -p "$blind_src/docs/agents"
+printf 'hub only\n' > "$blind_src/docs/agents/some-machinery.md"
+printf 'version: 1\n' > "$blind_src/.mergepath-sync.yml"
+set +e
+blind_rsync_out=$(bash -c '
+  bootstrap::log() { :; }
+  bootstrap::err() { echo "ERR: $*" >&2; }
+  bootstrap::run() { local label=$1; shift; "$@"; }
+  source "$1"
+  bootstrap::_rsync_template "$2" "$3"
+' _ "$MIRROR_LIB" "$blind_src" "$blind_dst" 2>&1)
+blind_rsync_rc=$?
+set -e
+blind_copied=$(find "$blind_dst" -type f | head -1)
+if [ "$blind_rsync_rc" != "0" ] && [ -z "$blind_copied" ] \
+   && printf '%s' "$blind_rsync_out" | grep -q 'refusing to rsync without the hub-only exclusions'; then
+  pass "bootstrap::_rsync_template aborts, copying nothing, when the hub-only exclusions cannot be derived"
+else
+  fail "rsync should abort with an empty destination on an underivable inventory (rc=$blind_rsync_rc, copied='$blind_copied'): $blind_rsync_out"
+fi
 
 # --- assertion 4c: AGENTS.md packaging/Repository-Layout scrub (#744) ---
 if [ -f "$TARGET/AGENTS.md" ]; then
@@ -625,7 +1197,14 @@ verify_case() {
   : > "$vt/docs/agents/shared-operating-rules.md"
   : > "$vt/docs/agents/worktree-placement.md"
   : > "$vt/docs/agents/operating-rules.md"
-  printf '1. [Shared](docs/agents/shared-operating-rules.md)\n2. [Local](docs/agents/operating-rules.md)\n' > "$vt/AGENTS.md"
+  printf '## Sections\n\n1. [Shared](docs/agents/shared-operating-rules.md)\n2. [Local](docs/agents/operating-rules.md)\n' > "$vt/AGENTS.md"
+  mkdir -p "$source/docs/agents"
+  cp "$vt/docs/agents/decision-records.md" "$source/docs/agents/decision-records.md"
+  cp "$vt/docs/agents/shared-operating-rules.md" "$source/docs/agents/shared-operating-rules.md"
+  cp "$vt/docs/agents/worktree-placement.md" "$source/docs/agents/worktree-placement.md"
+  git -C "$source" init -q
+  git -C "$source" -c user.email=t@t -c user.name=t -c commit.gpgsign=false add -A
+  git -C "$source" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m fixture
   ( cd "$vt" && eval "$mutate" )
   ( cd "$source" && eval "$source_mutate" )
   set +e
@@ -659,35 +1238,56 @@ else
   fail "verifier should fail on a missing canonical doc; got: $res"
 fi
 
-res=$(verify_case "wrong-order" 'printf "1. [Local](docs/agents/operating-rules.md)\n2. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
+res=$(verify_case "stale-canonical" 'printf "stale receiver copy\n" > docs/agents/shared-operating-rules.md')
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "canonical agent docs differ"; then
+  pass "verifier rejects a stale receiver-side canonical document (#780)"
+else
+  fail "verifier should compare canonical document bytes, not merely existence; got: $res"
+fi
+
+res=$(verify_case "wrong-canonical-mode" 'chmod +x docs/agents/shared-operating-rules.md')
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "canonical agent docs differ"; then
+  pass "verifier rejects a canonical document whose receiver Git mode differs (#780)"
+else
+  fail "verifier should compare canonical document modes, not merely existence; got: $res"
+fi
+
+res=$(verify_case "wrong-order" 'printf "## Sections\n\n1. [Local](docs/agents/operating-rules.md)\n2. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
 if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "BEFORE docs/agents/shared-operating-rules.md"; then
   pass "verifier fails closed when AGENTS.md lists the local overlay first (#780)"
 else
   fail "verifier should fail on a shared-after-local AGENTS.md; got: $res"
 fi
 
-res=$(verify_case "same-line-wrong-order" 'printf "Read [Local](docs/agents/operating-rules.md), then [Shared](docs/agents/shared-operating-rules.md).\n" > AGENTS.md')
+res=$(verify_case "same-line-wrong-order" 'printf "## Sections\n\n1. Read [Local](docs/agents/operating-rules.md), then [Shared](docs/agents/shared-operating-rules.md).\n" > AGENTS.md')
 if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "BEFORE docs/agents/shared-operating-rules.md"; then
   pass "verifier compares columns when both AGENTS.md links share a line (#780)"
 else
   fail "verifier should fail when the local link precedes shared on one line; got: $res"
 fi
 
-res=$(verify_case "same-line-right-order" 'printf "Read [Shared](docs/agents/shared-operating-rules.md), then [Local](docs/agents/operating-rules.md).\n" > AGENTS.md')
+res=$(verify_case "same-line-right-order" 'printf "## Sections\n\n1. Read [Shared](docs/agents/shared-operating-rules.md), then [Local](docs/agents/operating-rules.md).\n" > AGENTS.md')
 if [ "${res%%|*}" = "0" ]; then
   pass "verifier accepts shared-before-local links on the same line (#780)"
 else
   fail "verifier should accept shared-before-local links on one line; got: $res"
 fi
 
-res=$(verify_case "unlinked" 'printf "1. [Local](docs/agents/operating-rules.md)\n" > AGENTS.md')
+res=$(verify_case "raw-occurrence-before-index" 'printf "<!-- docs/agents/shared-operating-rules.md -->\nProse example: docs/agents/shared-operating-rules.md.\n\n## Sections\n\n1. [Local](docs/agents/operating-rules.md)\n2. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
+if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "BEFORE docs/agents/shared-operating-rules.md"; then
+  pass "verifier ignores raw comment/prose occurrences and checks the visible reading-order links"
+else
+  fail "raw occurrences must not mask a reversed visible AGENTS.md index; got: $res"
+fi
+
+res=$(verify_case "unlinked" 'printf "## Sections\n\n1. [Local](docs/agents/operating-rules.md)\n" > AGENTS.md')
 if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "does not reference docs/agents/shared-operating-rules.md"; then
   pass "verifier fails closed when AGENTS.md never links the shared rules (#780)"
 else
   fail "verifier should fail on an AGENTS.md with no shared-rules link; got: $res"
 fi
 
-res=$(verify_case "local-unlinked" 'printf "1. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
+res=$(verify_case "local-unlinked" 'printf "## Sections\n\n1. [Shared](docs/agents/shared-operating-rules.md)\n" > AGENTS.md')
 if [ "${res%%|*}" != "0" ] && printf '%s' "${res#*|}" | grep -q "does not reference docs/agents/operating-rules.md"; then
   pass "verifier fails closed when AGENTS.md never links the local overlay (#780)"
 else

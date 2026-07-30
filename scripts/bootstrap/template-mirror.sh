@@ -6,9 +6,12 @@
 # comments in bootstrap::stage_template_mirror):
 #   1. rsync mergepath's worktree into the new repo's target dir,
 #      honoring a curated exclude list that drops mergepath-only files
-#      (the playground spec, packaging/, internal screenshots, the
-#      hub-only machinery docs, and the pure-identity BRAND.md /
-#      repository-overview.md, etc.).
+#      (the playground spec, packaging/, internal screenshots, and the
+#      pure-identity BRAND.md / repository-overview.md, etc.), PLUS the
+#      hub-only agent docs, whose exclude patterns are derived from the
+#      source manifest's doc_ownership inventory on every run rather
+#      than restated in the array. A failed derivation aborts the
+#      rsync.
 #   2. Remove post-rsync orphans the exclude list can't catch.
 #   3. Drop mergepath-specific entries from the new repo's
 #      .repo-template.yml (the playground spec_test_map + the
@@ -75,6 +78,14 @@ set -euo pipefail
 # propagated to a new repo lives here. Each entry is an rsync
 # --exclude pattern (path-relative-to-source, no leading slash).
 # See #204 for the rationale on each entry.
+#
+# Every `class: hub-only` entry in .mergepath-sync.yml's doc_ownership
+# inventory is excluded dynamically by bootstrap::_derive_hub_only_excludes;
+# do not duplicate those paths in this hand-maintained array. The class
+# says the doc never travels, and deriving the rsync exclusions from that
+# inventory keeps it the single source of truth. Assertion 4b4 in
+# tests/test_bootstrap_template_mirror.sh verifies the derivation stays
+# complete and fail-closed (#797 review).
 BOOTSTRAP_MIRROR_EXCLUDES=(
   # Repo metadata that should never propagate
   '.git/'
@@ -201,31 +212,41 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   'tests/test_audit_branch_protection_workflow.sh'
 
   # Hub identity docs — do NOT duplicate mergepath's self-referential
-  # hub identity into a consumer (#744). Two groups:
+  # hub identity into a consumer (#744).
   #
-  #   * Hub-only MACHINERY docs describe processes a consumer does not
-  #     run (the propagation wave, the bootstrap wizard, the templated-
-  #     render engine — sync-to-downstream.sh / .mergepath-sync.yml
-  #     aren't even present in a consumer, per the orchestrator excludes
-  #     above). Copied verbatim they'd read as if the consumer were the
-  #     hub. NB: ai_agent_tooling_standard.md is deliberately NOT here —
-  #     it is the methodology-neutral Standard the consumer FOLLOWS (it
-  #     correctly names mergepath as the reference implementation and is
-  #     not name-substituted, so it stays true in a consumer), and
-  #     README.md / .ai_context.md still link to it (Codex #746).
-  #   * BRAND.md + docs/agents/repository-overview.md are 100% mergepath
-  #     identity ("the reference implementation", the Playground/Cockpit/
-  #     Tiebreaker/Checks surfaces). A lexical mergepath→<repo> swap
-  #     leaves the self-referential claims intact and FALSE. These are
-  #     excluded here and replaced by neutral consumer stubs in
-  #     bootstrap::_scaffold_consumer_identity (step 5b below), so they
-  #     are also dropped from BOOTSTRAP_NAME_BEARING_FILES in
-  #     substitute.sh. (The mixed doc .ai_context.md keeps its shared
-  #     content and is fixed at the mergepath source, not here; the
-  #     AGENTS.md packaging note is scrubbed in step 5b.)
-  'docs/agents/bootstrap-runbook.md'
-  'docs/agents/propagation-ordering.md'
-  'docs/agents/templated-propagation.md'
+  # The `class: hub-only` agent docs are NOT listed here. They are
+  # DERIVED from .mergepath-sync.yml's doc_ownership inventory on every
+  # run, by bootstrap::_derive_hub_only_excludes below, and appended to
+  # this array's patterns in bootstrap::_rsync_template. That class
+  # already means "never travels to a consumer"; restating the same
+  # docs here made the array a second source of truth that an author
+  # had to remember to update, and classifying the next doc hub-only
+  # without touching it would have rsynced hub-only content into the
+  # next new repo (#797 review). Deriving removes the duplication
+  # instead of guarding it: there is now one place to edit, and the
+  # inventory is it.
+  #
+  # What stays hand-listed is what the inventory does NOT imply.
+  # BRAND.md and docs/agents/repository-overview.md are excluded while
+  # staying `class: per-repo-owned`: each repo legitimately owns its
+  # own copy, so the class cannot say "never travels" — but mergepath's
+  # copies are 100% hub identity ("the reference implementation", the
+  # Playground/Cockpit/Tiebreaker/Checks surfaces), and a lexical
+  # mergepath→<repo> swap leaves those self-referential claims intact
+  # and FALSE. So they are dropped here and replaced by neutral
+  # consumer stubs in bootstrap::_scaffold_consumer_identity (step 5b
+  # below), which is also why they are absent from
+  # BOOTSTRAP_NAME_BEARING_FILES in substitute.sh. (The mixed doc
+  # .ai_context.md keeps its shared content and is fixed at the
+  # mergepath source, not here; the AGENTS.md packaging note is
+  # scrubbed in step 5b.)
+  #
+  # NB: ai_agent_tooling_standard.md is deliberately NOT excluded by
+  # either route — it is the methodology-neutral Standard the consumer
+  # FOLLOWS (it correctly names mergepath as the reference
+  # implementation and is not name-substituted, so it stays true in a
+  # consumer), and README.md / .ai_context.md still link to it
+  # (Codex #746).
   'BRAND.md'
   'docs/agents/repository-overview.md'
 
@@ -313,7 +334,10 @@ bootstrap::stage_template_mirror() {
 
   # Step 5b: scaffold neutral consumer identity docs (#744/#747). The
   # rsync excluded BRAND.md + docs/agents/repository-overview.md (pure
-  # mergepath identity) and the three hub-only docs; this writes honest
+  # mergepath identity) via BOOTSTRAP_MIRROR_EXCLUDES, and every
+  # `class: hub-only` agent doc via the exclusions derived from
+  # doc_ownership (do not restate that set as a count here — it grows
+  # whenever a doc is classified hub-only); this writes honest
   # consumer stubs for the former, scrubs the AGENTS.md packaging
   # note (packaging/ is a mergepath-only dir, also excluded), scrubs
   # the README.md hub identity + dead Key-Files rows (#747), and
@@ -438,9 +462,12 @@ bootstrap::_reset_phase_4b_enabled() {
 
 # Scaffold neutral consumer identity docs and scrub mergepath-only
 # identity from shared docs (#744/#747). The rsync excluded BRAND.md +
-# docs/agents/repository-overview.md (pure mergepath identity) and the
-# three hub-only docs; this writes honest consumer stubs for the two
-# excluded identity docs and removes the AGENTS.md "Repository Layout"
+# docs/agents/repository-overview.md (pure mergepath identity) via
+# BOOTSTRAP_MIRROR_EXCLUDES, and every `class: hub-only` agent doc via
+# the exclusions derived from doc_ownership (the inventory is the
+# single source of truth for that set — it is deliberately not
+# restated as a count here); this writes honest consumer stubs for the
+# two excluded identity docs and removes the AGENTS.md "Repository Layout"
 # section that documents the mergepath-only `packaging/` dir. The mixed
 # doc .ai_context.md keeps its shared content — its one false line is
 # fixed at the mergepath source, so it flows through substitution
@@ -742,6 +769,16 @@ bootstrap::_verify_canonical_agent_docs() {
     return 1
   fi
 
+  local invalid_pending
+  if ! invalid_pending=$(yq -r '.doc_ownership[] | select(has("pending_manifest") and ((.pending_manifest | tag) != "!!bool")) | .path' "$manifest" 2>&1); then
+    bootstrap::err "could not validate pending_manifest types in source .mergepath-sync.yml: $invalid_pending"
+    return 1
+  fi
+  if [ -n "$invalid_pending" ]; then
+    bootstrap::err "source .mergepath-sync.yml uses a non-boolean pending_manifest for:$invalid_pending — refusing to let a truthy-looking string change the canonical agent-doc set"
+    return 1
+  fi
+
   local canonical_docs
   if ! canonical_docs=$(yq -r '.doc_ownership[] | select(.class == "canonical" and ((.pending_manifest // false) != true)) | .path' "$manifest" 2>&1); then
     bootstrap::err "could not derive canonical agent docs from source .mergepath-sync.yml: $canonical_docs"
@@ -758,7 +795,32 @@ bootstrap::_verify_canonical_agent_docs() {
     [ -f "$target/$doc" ] || missing="$missing $doc"
   done <<< "$canonical_docs"
   if [ -n "$missing" ]; then
-    bootstrap::err "canonical agent docs missing from the mirrored repo:$missing — these are 'class: canonical' in .mergepath-sync.yml's doc_ownership inventory and every new repo must carry them. Check BOOTSTRAP_MIRROR_EXCLUDES for a pattern that swallows them."
+    bootstrap::err "canonical agent docs missing from the mirrored repo:$missing — these are 'class: canonical' in .mergepath-sync.yml's doc_ownership inventory and every new repo must carry them. Check BOOTSTRAP_MIRROR_EXCLUDES for a pattern that swallows them, and check that doc_ownership does not also classify them hub-only (that class is derived into the mirror exclusions)."
+    return 1
+  fi
+
+  local mismatched="" source_mode target_mode
+  while IFS= read -r doc; do
+    [ -n "$doc" ] || continue
+    if [ -L "$target/$doc" ]; then
+      mismatched="$mismatched $doc(symlink)"
+      continue
+    fi
+    if [ ! -f "$source_root/$doc" ] || ! cmp -s -- "$source_root/$doc" "$target/$doc"; then
+      mismatched="$mismatched $doc(content)"
+      continue
+    fi
+    source_mode=$(git -C "$source_root" ls-files -s -- "$doc" 2>/dev/null | awk 'NR == 1 { print $1 }')
+    case "$source_mode" in
+      100644|100755) ;;
+      *) mismatched="$mismatched $doc(source-mode:${source_mode:-untracked})"; continue ;;
+    esac
+    target_mode=100644
+    [ -x "$target/$doc" ] && target_mode=100755
+    [ "$source_mode" = "$target_mode" ] || mismatched="$mismatched $doc(mode:$source_mode->$target_mode)"
+  done <<< "$canonical_docs"
+  if [ -n "$mismatched" ]; then
+    bootstrap::err "canonical agent docs differ from the source checkout:$mismatched — an exclusion may have left stale receiver content, or rsync failed to preserve the source Git mode"
     return 1
   fi
 
@@ -769,8 +831,8 @@ bootstrap::_verify_canonical_agent_docs() {
   fi
 
   local shared_pos local_pos shared_line shared_col local_line local_col
-  shared_pos=$(awk -v needle='docs/agents/shared-operating-rules.md' 'index($0, needle) { printf "%d:%d\n", NR, index($0, needle); exit }' "$agents_md" || true)
-  local_pos=$(awk -v needle='docs/agents/operating-rules.md' 'index($0, needle) { printf "%d:%d\n", NR, index($0, needle); exit }' "$agents_md" || true)
+  shared_pos=$(bootstrap::_agents_index_link_position "$agents_md" 'docs/agents/shared-operating-rules.md' || true)
+  local_pos=$(bootstrap::_agents_index_link_position "$agents_md" 'docs/agents/operating-rules.md' || true)
 
   if [ -z "$shared_pos" ]; then
     bootstrap::err "AGENTS.md does not reference docs/agents/shared-operating-rules.md — the new repo would ship the shared rulebook with nothing pointing at it. Add it to the AGENTS.md reading order at the mergepath source."
@@ -793,6 +855,197 @@ bootstrap::_verify_canonical_agent_docs() {
   return 0
 }
 
+# Print the line:column of an actual Markdown link in AGENTS.md's visible
+# Sections list. Raw path strings in comments, prose, or examples are not
+# reading-order entries and must not mask a reversed index.
+bootstrap::_agents_index_link_position() {
+  local agents_md=$1 target=$2
+  awk -v target="$target" '
+    function visible_html(s, out, at, end_at) {
+      out = ""
+      while (1) {
+        if (in_comment) {
+          end_at = index(s, "-->")
+          if (!end_at) return out
+          s = substr(s, end_at + 3)
+          in_comment = 0
+        }
+        at = index(s, "<!--")
+        if (!at) return out s
+        out = out substr(s, 1, at - 1)
+        s = substr(s, at + 4)
+        in_comment = 1
+      }
+    }
+    {
+      line = visible_html($0)
+      if (line ~ /^##[[:space:]]+Sections([[:space:]]|$)/) { in_sections = 1; next }
+      if (in_sections && line ~ /^##[[:space:]]+/) exit
+      if (!in_sections || line !~ /^[[:space:]]*([0-9]+\.|[-+*])[[:space:]]+/) next
+      plain = "](" target ")"
+      angled = "](<" target ">)"
+      col = index(line, plain)
+      if (col) { printf "%d:%d\n", NR, col + 2; exit }
+      col = index(line, angled)
+      if (col) { printf "%d:%d\n", NR, col + 3; exit }
+    }
+  ' "$agents_md"
+}
+
+# Emit the mirror exclusions implied by the SOURCE manifest's
+# doc_ownership inventory — every `class: hub-only` agent doc, one
+# repo-relative path per line. Diagnostics go to stderr so stdout stays
+# a clean path list.
+#
+# This is the single source of truth for "which agent docs never travel
+# to a consumer". The class already carries that meaning; deriving it
+# here is what makes BOOTSTRAP_MIRROR_EXCLUDES stop being a second copy
+# of the same fact that an author had to keep in step by hand (#797
+# review).
+#
+# The inventory is readable at bootstrap time because the manifest is
+# read from the SOURCE root — mergepath's own worktree, which is what
+# the wizard rsyncs FROM. The consumer's missing manifest is not a
+# constraint here: the target has no manifest precisely because this
+# stage has not populated it yet, and the exclusions are a property of
+# the source. yq is likewise already a hard bootstrap dependency (the
+# wizard's preflight step 1 requires it globally, and both
+# bootstrap::_clean_repo_template_yml and
+# bootstrap::_verify_canonical_agent_docs refuse to proceed without
+# it), so this adds no new tool requirement — it uses the same
+# derive-on-every-run posture _verify_canonical_agent_docs already
+# applies to the canonical set.
+#
+# EVERY failure path returns non-zero, and the caller aborts the stage
+# on it. A derivation that cannot be trusted must never degrade into
+# "exclude nothing": that is the exact leak this replaces, except
+# silent. An EMPTY result is a failure for the same reason — the live
+# inventory always classifies some doc hub-only, so an empty set means
+# the class name moved or the block was gutted, not that the set is
+# genuinely empty.
+#
+# Derived paths are validated before they become rsync patterns. The
+# inventory is scoped to Markdown under docs/agents/ (check 3a in
+# scripts/ci/check_doc_ownership enforces exactly that), so anything
+# else is a signal the scope changed and this derivation needs
+# revisiting rather than a path to quietly hand to rsync. Wildcard
+# metacharacters are rejected outright: rsync would honor them, and a
+# single `docs/agents/*.md` entry would silently strip every canonical
+# agent doc from the new repo.
+bootstrap::_derive_hub_only_excludes() {
+  local source_root=$1
+  local manifest="$source_root/.mergepath-sync.yml"
+
+  if [ ! -f "$manifest" ]; then
+    bootstrap::err "source .mergepath-sync.yml missing at $manifest; cannot derive the hub-only mirror exclusions"
+    return 1
+  fi
+  if ! command -v yq >/dev/null 2>&1; then
+    bootstrap::err "yq is required to derive the hub-only mirror exclusions from .mergepath-sync.yml. Install via 'brew install yq' (mikefarah/yq, v4+)."
+    return 2
+  fi
+  if ! yq -e '.doc_ownership | tag == "!!seq"' "$manifest" >/dev/null 2>&1; then
+    bootstrap::err "source .mergepath-sync.yml has no valid doc_ownership list; cannot derive the hub-only mirror exclusions"
+    return 1
+  fi
+
+  local hub_only
+  if ! hub_only=$(yq -r '.doc_ownership[] | select(.class == "hub-only") | .path' "$manifest" 2>&1); then
+    bootstrap::err "could not derive hub-only docs from source .mergepath-sync.yml: $hub_only"
+    return 1
+  fi
+  if [ -z "$hub_only" ]; then
+    bootstrap::err "source .mergepath-sync.yml declares no 'class: hub-only' doc — refusing to mirror with an empty hub-only exclusion set, because that would copy hub-only content into the new repo. Check the doc_ownership inventory."
+    return 1
+  fi
+
+  # Validate every entry BEFORE emitting any of it. Streaming each path
+  # as it is checked would leave the already-validated prefix on stdout
+  # when a later entry is rejected, and a caller that read stdout
+  # without also testing the exit status would then mirror with a
+  # PARTIAL exclusion set — the same silent-leak shape this function
+  # exists to remove. Buffer, then print once the whole list is known
+  # good.
+  local doc raw_doc stripped validated=""
+  while IFS= read -r doc; do
+    [ -n "$doc" ] || continue
+    raw_doc="$doc"
+
+    # Keep path acceptance aligned with check_doc_ownership: reject
+    # unsafe segments first, then normalize harmless leading './'
+    # spellings and a trailing slash before applying the inventory
+    # scope check or emitting an rsync pattern.
+    stripped="$doc"
+    while [ "${stripped#./}" != "$stripped" ]; do stripped="${stripped#./}"; done
+    case "$doc" in
+      /*|..|../*|*/..|*/../*)
+        bootstrap::err "hub-only doc path '$raw_doc' contains an absolute or '..' segment; refusing to build an rsync exclude pattern from it"
+        return 1
+        ;;
+    esac
+    case "$stripped" in
+      *,*|*//*|*/.|*/./*)
+        bootstrap::err "hub-only doc path '$raw_doc' contains an empty, '.', or comma-delimited segment; refusing to build an rsync exclude pattern from it"
+        return 1
+        ;;
+    esac
+    doc="${stripped%/}"
+    case "$doc" in
+      docs/agents/*.md) ;;
+      *)
+        bootstrap::err "doc_ownership classifies '$raw_doc' hub-only, but the bootstrap mirror derives exclusions only for 'docs/agents/*.md' paths. Widen bootstrap::_derive_hub_only_excludes deliberately if the inventory's scope changed."
+        return 1
+        ;;
+    esac
+    case "$doc" in
+      *'*'*|*'?'*|*'['*)
+        bootstrap::err "hub-only doc path '$raw_doc' contains an rsync wildcard metacharacter; a pattern like 'docs/agents/*.md' would strip every canonical agent doc from the new repo. Spell the path literally in doc_ownership."
+        return 1
+        ;;
+    esac
+    validated="${validated}${doc}"$'\n'
+  done <<< "$hub_only"
+
+  printf '%s' "$validated"
+}
+
+# Refuse to remove receiver residue through a symlinked directory below the
+# selected target root. The derived paths are already constrained to literal,
+# normalized repo-relative paths; this final check makes sure `$target/$path`
+# still names the target tree rather than an external directory reached through
+# (for example) a resumed target's `docs/agents` symlink.
+bootstrap::_reject_symlink_ancestors() {
+  local target=$1
+  local rel=$2
+  local parent=${rel%/*}
+  local current=$target
+  local component
+
+  if [ -L "$target" ]; then
+    bootstrap::err "template-mirror: refusing to remove stale hub-only doc '$rel': target root '$target' is a symbolic link and escapes the selected target tree"
+    return 1
+  fi
+
+  [ "$parent" != "$rel" ] || return 0
+  while [ -n "$parent" ]; do
+    case "$parent" in
+      */*)
+        component=${parent%%/*}
+        parent=${parent#*/}
+        ;;
+      *)
+        component=$parent
+        parent=
+        ;;
+    esac
+    current="$current/$component"
+    if [ -L "$current" ]; then
+      bootstrap::err "template-mirror: refusing to remove stale hub-only doc '$rel': symlink ancestor '$current' escapes the selected target tree"
+      return 1
+    fi
+  done
+}
+
 bootstrap::_rsync_template() {
   local source_root=$1
   local target=$2
@@ -804,7 +1057,34 @@ bootstrap::_rsync_template() {
     rsync_args+=(--exclude="$exc")
   done
 
+  # Append the exclusions derived from the source manifest's ownership
+  # inventory. Assigned in a separate statement from the `local`
+  # declaration so the command substitution's exit status is the one
+  # tested — `local x=$(...)` would return the declaration's status and
+  # swallow a failed derivation, mirroring with no hub-only excludes at
+  # all.
+  local derived derive_rc=0
+  derived=$(bootstrap::_derive_hub_only_excludes "$source_root") || derive_rc=$?
+  if [ "$derive_rc" -ne 0 ]; then
+    bootstrap::err "template-mirror: refusing to rsync without the hub-only exclusions derived from .mergepath-sync.yml (rc=$derive_rc) — proceeding would copy hub-only docs into the new repo"
+    return "$derive_rc"
+  fi
+  while IFS= read -r exc; do
+    [ -n "$exc" ] || continue
+    rsync_args+=(--exclude="$exc")
+  done <<< "$derived"
+
   mkdir -p "$target"
+
+  # Exclusion prevents a new transfer but does not delete receiver residue.
+  # A resumed Stage B may already carry a doc copied before its ownership was
+  # changed to hub-only, so remove every validated derived path explicitly.
+  while IFS= read -r exc; do
+    [ -n "$exc" ] || continue
+    bootstrap::_reject_symlink_ancestors "$target" "$exc" || return $?
+    bootstrap::run "remove stale hub-only doc $exc" rm -f -- "$target/$exc" \
+      || return $?
+  done <<< "$derived"
 
   bootstrap::run "rsync $source_root -> $target" \
     rsync "${rsync_args[@]}" "$source_root/" "$target/"
