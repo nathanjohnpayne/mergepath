@@ -66,19 +66,21 @@ chmod +x "$STUB_DIR/op-firebase-deploy"
 
 # Helper: build a throwaway git repo on a non-main branch with one
 # committed file. Caller sets the working dir's dirty/clean state.
+# Every `git config` write names the fixture repo with `-C` rather than
+# relying on the subshell's cwd. An unscoped `git config` resolves against
+# whatever repository the process is standing in, so one bad `cd` — or one
+# copy of these lines pasted outside the subshell — writes the identity into
+# the real checkout's .git/config, where every worktree inherits it (#777).
 init_fixture_repo() {
   local repo="$1"
   mkdir -p "$repo"
-  (
-    cd "$repo"
-    git init --quiet -b feature/deploy-test
-    git config user.email "test@example.com"
-    git config user.name "Test"
-    git config commit.gpgsign false
-    echo "initial" > README.md
-    git add README.md
-    git commit --quiet -m "initial"
-  )
+  git init --quiet -b feature/deploy-test "$repo"
+  git -C "$repo" config user.email "test@example.com"
+  git -C "$repo" config user.name "Test"
+  git -C "$repo" config commit.gpgsign false
+  echo "initial" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit --quiet -m "initial"
 }
 
 # Run scripts/deploy.sh inside a fixture repo with sensible defaults.
@@ -210,8 +212,13 @@ fi
 # ---------------------------------------------------------------------------
 REPO4="$WORKDIR/case4-empty-args-repo"
 mkdir -p "$REPO4"
-( cd "$REPO4" && git init -q -b main && git config user.email a@b.c && git config user.name a && \
-  echo init >README.md && git add README.md && git commit -q -m init )
+git init -q -b main "$REPO4"
+git -C "$REPO4" config user.email a@b.c
+git -C "$REPO4" config user.name a
+git -C "$REPO4" config commit.gpgsign false
+echo init >"$REPO4/README.md"
+git -C "$REPO4" add README.md
+git -C "$REPO4" commit -q -m init
 
 OUT4="$WORKDIR/case4.out"
 ERR4="$WORKDIR/case4.err"

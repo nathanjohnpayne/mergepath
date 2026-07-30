@@ -127,14 +127,20 @@ WORKDIR=$(cd "$WORKDIR" && pwd -P)
 MAIN="$WORKDIR/main"
 git init -q -b main "$MAIN"
 cd "$MAIN"
-git config user.email "test@example.com"
-git config user.name "Test"
+# Each identity/signing write names "$MAIN" with `-C` even though the cwd is
+# already there. An unscoped `git config` resolves against whichever repository
+# the process is standing in, so if the `cd` above ever fails or moves, these
+# four lines write the fixture identity into the REAL checkout's .git/config —
+# which every worktree of that repo then inherits, silently reattributing and
+# unsigning every later commit (#777).
+git -C "$MAIN" config user.email "test@example.com"
+git -C "$MAIN" config user.name "Test"
 # Disable commit/tag signing in the fixture repo so the test is portable — CI
 # runners (and a machine whose signing key is not currently unlocked) have no
 # signing key, and an inherited global commit.gpgsign=true would otherwise make
 # every fixture `git commit` fail with "failed to write commit object".
-git config commit.gpgsign false
-git config tag.gpgsign false
+git -C "$MAIN" config commit.gpgsign false
+git -C "$MAIN" config tag.gpgsign false
 git remote add origin "$REMOTE"
 echo "hello" > README.md
 # A committed .gitignore so case 17 can exercise the IGNORED-content class.
