@@ -198,6 +198,12 @@ set -euo pipefail
 
 SELF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FIXTURE_ROOT="${MERGEPATH_GIT_IDENTITY_ROOT:-}"
+if [ -n "$FIXTURE_ROOT" ]; then
+  if ! FIXTURE_ROOT="$(cd "$FIXTURE_ROOT" 2>/dev/null && pwd -P)"; then
+    echo "check_git_identity_hygiene: FAIL (fixture root is not an accessible directory: $FIXTURE_ROOT)" >&2
+    exit 1
+  fi
+fi
 REPO_ROOT="${FIXTURE_ROOT:-$SELF_ROOT}"
 
 MODE="report"
@@ -269,6 +275,20 @@ baseline_path() {
     *) common="$REPO_ROOT/$common" ;;
   esac
   printf '%s\n' "$common/mergepath-gitconfig-baseline"
+}
+
+# A snapshot request must remain observable even if the baseline itself is
+# deleted. Without a separate marker, removing the evidence changes the next
+# report pass from "compare" to "nothing to check" and silently blesses any
+# config mutation made in between.
+baseline_marker_path() {
+  local common
+  common="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  case "$common" in
+    /*) ;;
+    *) common="$REPO_ROOT/$common" ;;
+  esac
+  printf '%s\n' "$common/mergepath-gitconfig-baseline.requested"
 }
 
 config_path() {
@@ -441,7 +461,9 @@ if [ "$MODE" = "snapshot" ]; then
     exit 0
   fi
   BASE="$(baseline_path)"
+  BASE_MARKER="$(baseline_marker_path)"
   cp "$CFG" "$BASE"
+  : > "$BASE_MARKER"
   echo "check_git_identity_hygiene: snapshot recorded ($BASE)"
   exit 0
 fi
@@ -745,7 +767,7 @@ EOF
 # ── Part B: .git/config byte-comparison against a recorded baseline ───
 # Same two-phase contract as Part A: $1 is "pre-suite" or "post-suite".
 assert_config_unchanged() {
-  local phase="$1" base cfg culprit
+  local phase="$1" base marker cfg culprit
   if [ "$phase" = "post-suite" ] && [ -n "$PRE_SUITE_BASELINE" ]; then
     # The live baseline lives inside the git common dir, so a suite that
     # deleted `.git` deleted the thing this compares against. The copy
@@ -753,6 +775,18 @@ assert_config_unchanged() {
     base="$PRE_SUITE_BASELINE"
   else
     base="$(baseline_path 2>/dev/null)" || return 0
+  fi
+  marker="$(baseline_marker_path 2>/dev/null)" || return 0
+  if [ -f "$marker" ] && [ ! -f "$base" ]; then
+    cat >&2 <<EOF
+check_git_identity_hygiene: FAIL (the requested snapshot baseline is missing)
+
+A prior --snapshot call requested byte-for-byte .git/config comparison, but
+its baseline file is gone. Missing evidence is not evidence that the config
+stayed unchanged. Run --snapshot again only after confirming the current
+config is the intended clean baseline.
+EOF
+    return 1
   fi
   [ -f "$base" ] || return 0
   # A config that is GONE rather than modified is reported by
@@ -907,29 +941,22 @@ else
     # instruction performs. Lowercasing only ever ADDS matches: no
     # character folds into one of the excluded value characters below.
     #
-    # The token is defined by what it is NOT, because an allow-list of
-    # value-opening characters silently exempts every value that starts
-    # with something the list forgot: `git config user.signingkey
-    # ~/.ssh/id_ed25519.pub` and `git config user.signingkey /tmp/key.pub`
-    # are ordinary repo-local writes of a checked key, and a list of
-    # letters, digits, quotes and `$` recognises neither. So a value is
-    # anything except the five tokens that mean "no value here":
-    #   -    an option, not a value (`--global`, `--get`, `--show-origin`,
-    #        `--type=bool`); the ones that actually suppress are handled
-    #        by targeted() and not_a_write() below;
-    #   #    a shell comment — the command ended at the key, so it was
-    #        a read;
-    #   ` )  a closing command substitution or Markdown code span;
-    #   < >  a redirection, whose target is not a value for the key;
-    #   \    a line continuation — the value is on the NEXT physical line
-    #        and the join below already covers it. Reading the backslash
-    #        as a value would report the FIRST physical line of a
-    #        continued command, which is precisely the line that cannot
-    #        carry the trailing `#` exemption marker.
-    function key_assign_pos(s) {
-      if (match(tolower(s), /(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)[[:space:]]+[^-[:space:]#`)<>\\]/))
-        return RSTART
-      return 0
+    # The post-key token is inspected as a token, not classified by its
+    # first byte. Git accepts ordinary identity values beginning with `-`
+    # or `\`; excluding either byte hid `-leak@example.com` and `\leaky`.
+    # Option POSITION matters: once the key has been consumed, Git accepts
+    # even option-shaped tokens (`--show-origin`, `-z`) as the value to write.
+    # A lone backslash is the physical half of a continued command; the
+    # logical-line join below removes it before this function sees the value.
+    function key_assign_pos(s,   lower, pos, rest) {
+      lower = tolower(s)
+      if (!match(lower, /(user\.(name|email|signingkey)|commit\.gpgsign|tag\.gpgsign)[[:space:]]+/))
+        return 0
+      pos = RSTART
+      rest = substr(s, RSTART + RLENGTH)
+      if (rest == "" || rest ~ /^[#`)<>]/) return 0
+      if (rest ~ /^\\[[:space:]]*$/) return 0
+      return pos
     }
     # The OPTION REGION of the invocation that performs the write: the
     # text from the `git` word that opens the command up to the identity

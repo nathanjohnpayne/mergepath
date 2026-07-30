@@ -366,17 +366,15 @@ fi
 
 # Case 22: the converse of case 21 — widening the value token must not
 # turn reads into hits. What follows the key on each of these lines is
-# an option, a comment, a redirection or a closing substitution, and
-# none of them is a value being written.
+# a comment, a redirection or a closing substitution, not a value.
 run_on_fixture "tests/not-values.sh" '#!/usr/bin/env bash
-git config user.email --show-origin
 git config user.email  # which address is this repo using?
 git config user.email > /tmp/who
 who=$( git config user.email )
 echo "$who"
 '
 if [ "$RC" = "0" ]; then
-  pass "option / comment / redirection after the key: no false hit"
+  pass "comment / redirection / closing substitution after the key: no false hit"
 else
   fail "non-value token after the key: rc=$RC out=$OUT"
 fi
@@ -508,6 +506,7 @@ fi
 # "one per key" or as "one per scope and file" miscounts this very case.
 SIGREPO="$WORKDIR/sigrepo"
 git init -q -b main "$SIGREPO"
+SIGREPO_REAL="$(cd "$SIGREPO" && pwd -P)"
 git -C "$SIGREPO" config --local extensions.worktreeConfig true
 git -C "$SIGREPO" config --local user.signingkey ABC123
 git -C "$SIGREPO" config --local tag.gpgsign false
@@ -518,9 +517,9 @@ RC=$?
 set -e
 REMEDY_COUNT="$(printf '%s\n' "$OUT" | grep -cE '^[[:space:]]+git -C ' || true)"
 if [ "$RC" = "1" ] \
-  && printf '%s' "$OUT" | grep -qF -- "git -C \"$SIGREPO\" config --local --unset-all user.signingkey" \
-  && printf '%s' "$OUT" | grep -qF -- "git -C \"$SIGREPO\" config --local --unset-all tag.gpgsign" \
-  && printf '%s' "$OUT" | grep -qF -- "git -C \"$SIGREPO\" config --worktree --unset-all user.email" \
+  && printf '%s' "$OUT" | grep -qF -- "git -C \"$SIGREPO_REAL\" config --local --unset-all user.signingkey" \
+  && printf '%s' "$OUT" | grep -qF -- "git -C \"$SIGREPO_REAL\" config --local --unset-all tag.gpgsign" \
+  && printf '%s' "$OUT" | grep -qF -- "git -C \"$SIGREPO_REAL\" config --worktree --unset-all user.email" \
   && [ "$REMEDY_COUNT" = "3" ]; then
   pass "remediation: one unset command per offender, in its own scope"
 else
@@ -582,6 +581,7 @@ fi
 # through a checkout that cannot commit at all.
 EMPTYREPO="$WORKDIR/emptyrepo"
 git init -q -b main "$EMPTYREPO"
+EMPTYREPO_REAL="$(cd "$EMPTYREPO" && pwd -P)"
 git -C "$EMPTYREPO" config --local user.email ""
 set +e
 OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$EMPTYREPO" bash "$CHECK" 2>&1)"
@@ -589,7 +589,7 @@ RC=$?
 set -e
 if [ "$RC" = "1" ] \
   && printf '%s' "$OUT" | grep -q "local: user.email = (set to the empty string)" \
-  && printf '%s' "$OUT" | grep -qF -- "git -C \"$EMPTYREPO\" config --local --unset-all user.email"; then
+  && printf '%s' "$OUT" | grep -qF -- "git -C \"$EMPTYREPO_REAL\" config --local --unset-all user.email"; then
   pass "empty-string local identity value: caught as an override"
 else
   fail "empty-string local identity value: rc=$RC out=$OUT"
@@ -776,6 +776,26 @@ else
   fail "unmodified .git/config: rc=$RC out=$OUT"
 fi
 
+# Case 38b: deleting the baseline after requesting a snapshot must fail
+# closed. Otherwise the plain check silently forgets that comparison was
+# requested, and a config write hidden behind the deleted evidence passes.
+BASELINE_REPO="$WORKDIR/missing-baseline-repo"
+git init -q -b main "$BASELINE_REPO"
+MERGEPATH_GIT_IDENTITY_ROOT="$BASELINE_REPO" bash "$CHECK" --snapshot >/dev/null 2>&1
+git -C "$BASELINE_REPO" config --local core.pager cat
+rm -f "$BASELINE_REPO/.git/mergepath-gitconfig-baseline"
+set +e
+OUT="$(MERGEPATH_GIT_IDENTITY_ROOT="$BASELINE_REPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "snapshot baseline is missing" \
+  && ! printf '%s' "$OUT" | grep -q "check_git_identity_hygiene: PASS"; then
+  pass "deleted snapshot baseline: fails closed instead of forgetting the comparison"
+else
+  fail "deleted snapshot baseline forgotten: rc=$RC out=$OUT"
+fi
+
 # Case 39: any write to .git/config between snapshot and check fails,
 # including one the identity assertion would not catch on its own.
 git -C "$IDREPO" config --local core.bigFileThreshold 123m
@@ -922,6 +942,33 @@ if [ "$GETVAL_READBACK" = "author--get@example.com" ] \
   pass "read flag embedded in the value: no longer suppresses the write"
 else
   fail "flag-shaped value suppressing a write: readback='$GETVAL_READBACK' rc=$RC out=$OUT"
+fi
+
+# Case 44b: a value can begin with `-` or `\`. Option-looking text after the
+# key is a value too: Git writes `--show-origin` when it appears there.
+LEADING_REPO="$WORKDIR/leading-value-repo"
+git init -q -b main "$LEADING_REPO"
+git -C "$LEADING_REPO" config user.email '-leak@example.com'
+LEADING_HYPHEN="$(git -C "$LEADING_REPO" config --local --get user.email 2>/dev/null || true)"
+git -C "$LEADING_REPO" config user.email '\leak@example.com'
+LEADING_SLASH="$(git -C "$LEADING_REPO" config --local --get user.email 2>/dev/null || true)"
+git -C "$LEADING_REPO" config user.email --show-origin
+LEADING_OPTION="$(git -C "$LEADING_REPO" config --local --get user.email 2>/dev/null || true)"
+run_on_fixture "tests/leading-value.sh" '#!/usr/bin/env bash
+git config user.email -leak@example.com
+git config user.name \leaky
+git config user.email --show-origin
+'
+if [ "$LEADING_HYPHEN" = "-leak@example.com" ] \
+  && [ "$LEADING_SLASH" = '\leak@example.com' ] \
+  && [ "$LEADING_OPTION" = "--show-origin" ] \
+  && [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "tests/leading-value.sh:2" \
+  && printf '%s' "$OUT" | grep -q "tests/leading-value.sh:3" \
+  && printf '%s' "$OUT" | grep -q "tests/leading-value.sh:4"; then
+  pass "hyphen-, backslash-, and option-shaped identity values: caught by position"
+else
+  fail "leading identity values skipped: hyphen='$LEADING_HYPHEN' slash='$LEADING_SLASH' option='$LEADING_OPTION' rc=$RC out=$OUT"
 fi
 
 # Case 45: a scope flag AFTER the key does not scope the write, so it
@@ -1229,6 +1276,28 @@ if [ "$RC" = "0" ]; then
   pass "include target that resolves but does not exist: not a failure"
 else
   fail "missing include target treated as an offender: rc=$RC out=$OUT"
+fi
+
+# Case 58b: a relative fixture-root override is resolved once against the
+# caller's cwd. Leaving it relative makes later git-dir paths acquire the
+# root twice and hides an inactive includeIf identity from the config walk.
+RELATIVE_REPO="$WORKDIR/relative-root-repo"
+git init -q -b main "$RELATIVE_REPO"
+cat > "$RELATIVE_REPO/.git/dormant-identity" <<'EOF'
+[user]
+  email = dormant-relative@example.com
+EOF
+git -C "$RELATIVE_REPO" config --local includeIf.onbranch:release.path dormant-identity
+set +e
+OUT="$(cd "$WORKDIR" && MERGEPATH_GIT_IDENTITY_ROOT=relative-root-repo bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && printf '%s' "$OUT" | grep -q "dormant-relative@example.com" \
+  && printf '%s' "$OUT" | grep -q "inactive include"; then
+  pass "relative fixture root: inactive include identity is still detected"
+else
+  fail "relative fixture root hid include identity: rc=$RC out=$OUT"
 fi
 
 # ── Fail-closed: a suite that removes the repository metadata ──────────
