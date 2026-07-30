@@ -1572,13 +1572,26 @@ else
   fail "Case 14s1 paragraph-continuation unexpected (rc=$rc): $out"
 fi
 
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|> Governance\n    See [the audit](hub.md)\n
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md'"; then
+  pass "Case 14s1: lazy blockquote continuations remain rendered prose"
+else
+  fail "Case 14s1 blockquote-continuation unexpected (rc=$rc): $out"
+fi
+
 # The same indentation after a heading or blank line really does start an
 # indented code block, so link-shaped examples there must stay ignored.
 for code_body in \
   '# Governance\n    See [the audit](hub.md)\n' \
   'Governance\n\n    See [the audit](hub.md)\n' \
   'Governance\n===\n    See [the audit](hub.md)\n' \
-  '* * *\n    See [the audit](hub.md)\n'
+  '* * *\n    See [the audit](hub.md)\n' \
+  '> # Governance\n    See [the audit](hub.md)\n'
 do
   set +e
   out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
