@@ -349,6 +349,10 @@ MARKER_ONLY_CONSUMER_GATES=(
   # keys hub-detection on the marker precisely because the lib travels).
   # tests/test_template_substitution.sh is delivered too.
   "check_template_substitution"
+  # Gate: scripts/sync-to-downstream.sh (marker) only. The wrapped
+  # tests/test_git_identity_hygiene.sh is manifest-delivered, so it is
+  # never bootstrap residue and correctly contributes no H member.
+  "check_git_identity_hygiene"
 )
 
 is_marker_only_gate() {

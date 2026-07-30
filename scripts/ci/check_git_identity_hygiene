@@ -214,7 +214,7 @@ IDENTITY_KEYS="user.name user.email user.signingkey commit.gpgsign tag.gpgsign"
 
 # Declared here rather than at the call site so the post-suite failure
 # message can name it under `set -u`.
-TEST_SUITE="${MERGEPATH_GIT_IDENTITY_SUITE:-$REPO_ROOT/tests/test_git_identity_hygiene.sh}"
+TEST_SUITE="${MERGEPATH_GIT_IDENTITY_SUITE:-$SELF_ROOT/tests/test_git_identity_hygiene.sh}"
 
 FAILED=0
 
