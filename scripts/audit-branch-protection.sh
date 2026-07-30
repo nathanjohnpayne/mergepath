@@ -975,6 +975,10 @@ fnmatch_pathname() {  # <pattern> <ref>
   local -a fnm_pat fnm_str
   IFS='/' read -r -a fnm_pat <<<"$1"
   IFS='/' read -r -a fnm_str <<<"$2"
+  # `read -a` drops a trailing empty field, but File.fnmatch does not:
+  # `release/*/` must stay distinct from `release/*`, on both sides.
+  case "$1" in */) fnm_pat+=("") ;; esac
+  case "$2" in */) fnm_str+=("") ;; esac
   fnmatch_pathname_from 0 0
 }
 
