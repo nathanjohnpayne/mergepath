@@ -169,7 +169,19 @@ mp_markdown_renderable_text() {
       }
       return 1
     }
+    function is_setext_underline(s, compact, ch, i) {
+      compact = s
+      sub(/[[:space:]]+$/, "", compact)
+      if (length(compact) < 1) return 0
+      ch = substr(compact, 1, 1)
+      if (ch != "=" && ch != "-") return 0
+      for (i = 2; i <= length(compact); i++) {
+        if (substr(compact, i, 1) != ch) return 0
+      }
+      return 1
+    }
     function opens_text_flow(s, hashes) {
+      if (is_thematic_break(s) || is_setext_underline(s)) return 0
       if (is_list_marker(s)) return 1
       if (substr(s, 1, 1) == "#") {
         hashes = run_len(s, 1, "#")
@@ -178,7 +190,6 @@ mp_markdown_renderable_text() {
       if (substr(s, 1, 1) == ">") return 0
       if (s ~ /^\[[^]]+\]:[[:space:]]*/) return 0
       if (s ~ /^<([!?\/]|[[:alpha:]])/) return 0
-      if (is_thematic_break(s)) return 0
       return 1
     }
     function strip_inline_code(s, out, pos, rel, open, width, scan, got, close_width) {

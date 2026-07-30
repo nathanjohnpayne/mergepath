@@ -1576,7 +1576,9 @@ fi
 # indented code block, so link-shaped examples there must stay ignored.
 for code_body in \
   '# Governance\n    See [the audit](hub.md)\n' \
-  'Governance\n\n    See [the audit](hub.md)\n'
+  'Governance\n\n    See [the audit](hub.md)\n' \
+  'Governance\n===\n    See [the audit](hub.md)\n' \
+  '* * *\n    See [the audit](hub.md)\n'
 do
   set +e
   out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
