@@ -1381,6 +1381,67 @@ else
   fail "Case 14p unexpected (rc=$rc): $out"
 fi
 
+# --- Case 14q: angle-bracket destination containing spaces ----------
+# CommonMark permits whitespace inside `<...>` destinations. Splitting the
+# extracted body on whitespace turns this into `<hub` and misses the real file.
+MANIFEST_TRUTH_SPACE="$MIN_HEADER
+paths:
+  - path: docs/agents/shared.md
+    type: canonical
+    consumers: all
+doc_ownership:
+  - path: docs/agents/shared.md
+    class: canonical
+  - path: docs/agents/hub file.md
+    class: hub-only
+"
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH_SPACE" \
+  'docs/agents/shared.md|See [the audit](<hub file.md>) for details.
+docs/agents/hub file.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub file.md' by a relative Markdown link"; then
+  pass "Case 14q: angle-bracket link target preserves embedded whitespace"
+else
+  fail "Case 14q unexpected (rc=$rc): $out"
+fi
+
+# --- Case 14r: CONTROL — protocol-relative inline destination -------
+# `//host/path` is portable just like an https URL and is already skipped by
+# the resolved-target pass. The literal mask must treat the inline form the
+# same way, including its repo-relative visible label.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|Consult [docs/agents/hub.md](//github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/hub.md).
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 14r: protocol-relative absolute inline link passes (control)"
+else
+  fail "Case 14r unexpected (rc=$rc): $out"
+fi
+
+# --- Case 14s: CONTROL — link-shaped examples inside code -----------
+# CommonMark does not render links inside inline or fenced code. Raw grep must
+# not turn documentation of the prohibited spelling into a real broken link.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|Inline example: `[audit](hub.md)`.
+
+```markdown
+[audit](hub.md)
+```
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "0" ]; then
+  pass "Case 14s: link-shaped inline and fenced code examples are ignored"
+else
+  fail "Case 14s unexpected (rc=$rc): $out"
+fi
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).

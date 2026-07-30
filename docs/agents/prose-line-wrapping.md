@@ -2,7 +2,7 @@
 
 > Canonical source: `mergepath/docs/agents/prose-line-wrapping.md`. This file is propagated verbatim to consumer repos via the propagation manifest; edit it at the canonical source, never in a consumer copy. Machine-local vendor files (e.g. a `~/GitHub/CLAUDE.md`, `~/.codex/AGENTS.md`) that mirror this convention must carry a `> Canonical source:` annotation pointing back here.
 >
-> Consumer maintainers: the sync delivers this file but does not announce it. Link it from your repo's own agent-docs index (your `AGENTS.md` reading order, or the documentation-rules sub-file) so agents actually discover it — this file is its own landing page, and nothing else in a consumer repo references it until you add that link.
+> Consumer maintainers: the sync delivers this file. If your repo's own agent-docs index does not already link it (from the `AGENTS.md` reading order or the documentation-rules sub-file), add that link so agents actually discover it.
 
 This convention is deliberately tech-stack-independent: it governs how Markdown prose is written, not what a repository builds, ships, or tests. It applies identically in every repo that receives it.
 

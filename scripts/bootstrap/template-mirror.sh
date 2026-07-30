@@ -943,6 +943,14 @@ bootstrap::_rsync_template() {
 
   mkdir -p "$target"
 
+  # Exclusion prevents a new transfer but does not delete receiver residue.
+  # A resumed Stage B may already carry a doc copied before its ownership was
+  # changed to hub-only, so remove every validated derived path explicitly.
+  while IFS= read -r exc; do
+    [ -n "$exc" ] || continue
+    bootstrap::run "remove stale hub-only doc $exc" rm -f -- "$target/$exc"
+  done <<< "$derived"
+
   bootstrap::run "rsync $source_root -> $target" \
     rsync "${rsync_args[@]}" "$source_root/" "$target/"
 }

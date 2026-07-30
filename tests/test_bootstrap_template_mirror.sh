@@ -967,10 +967,14 @@ fi
 # is never called would pass every assertion above and still leak.
 rsync_src="$(mktemp -d "$WORKDIR/rsync-src.XXXXXX")"
 rsync_dst="$(mktemp -d "$WORKDIR/rsync-dst.XXXXXX")"
-mkdir -p "$rsync_src/docs/agents"
+mkdir -p "$rsync_src/docs/agents" "$rsync_dst/docs/agents"
 printf 'hub only\n'  > "$rsync_src/docs/agents/newly-hub-only.md"
 printf 'canonical\n' > "$rsync_src/docs/agents/decision-records.md"
 printf 'readme\n'    > "$rsync_src/README.md"
+# Reproduce a resumed Stage B after this path changed from mirrored to
+# hub-only: rsync exclusion prevents a fresh copy but does not delete this
+# receiver-side residue on its own.
+printf 'stale copy from interrupted bootstrap\n' > "$rsync_dst/docs/agents/newly-hub-only.md"
 cat >"$rsync_src/.mergepath-sync.yml" <<'YAML'
 version: 1
 doc_ownership:
@@ -995,7 +999,7 @@ else
   if [ -e "$rsync_dst/docs/agents/newly-hub-only.md" ]; then
     fail "a 'class: hub-only' doc that BOOTSTRAP_MIRROR_EXCLUDES never names was copied into the mirror — the derivation is not wired into bootstrap::_rsync_template"
   else
-    pass "bootstrap::_rsync_template drops a hub-only doc named only by doc_ownership (#797 review)"
+    pass "bootstrap::_rsync_template removes a stale, newly hub-only doc on resume (#797 review)"
   fi
   [ -f "$rsync_dst/docs/agents/decision-records.md" ] && [ -f "$rsync_dst/README.md" ] \
     && pass "the derived exclude is scoped: canonical docs and ordinary files still mirror" \

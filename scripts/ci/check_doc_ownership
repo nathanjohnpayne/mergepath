@@ -144,7 +144,83 @@ mp_path_is_unsafe() {
   return 1
 }
 
-# Emit every Markdown link/image target in a file, one per line, with
+# Emit the parts of a Markdown file in which links can render. Fenced,
+# indented, and same-line backtick code spans are blanked before the target
+# extractor runs; link-shaped examples in code are text, not navigation.
+mp_markdown_renderable_text() {
+  local f="$1"
+  awk '
+    function run_len(s, at, ch, n) {
+      n = 0
+      while (substr(s, at + n, 1) == ch) n++
+      return n
+    }
+    function strip_inline_code(s, out, pos, rel, open, width, scan, got, close_width) {
+      out = ""; pos = 1
+      while (pos <= length(s)) {
+        rel = index(substr(s, pos), "`")
+        if (rel == 0) return out substr(s, pos)
+        open = pos + rel - 1
+        width = run_len(s, open, "`")
+        got = 0; scan = open + width
+        while (scan <= length(s)) {
+          if (substr(s, scan, 1) != "`") { scan++; continue }
+          close_width = run_len(s, scan, "`")
+          if (close_width == width) { got = 1; break }
+          scan += close_width
+        }
+        # An unmatched delimiter renders literally; preserve it and the rest.
+        if (!got) return out substr(s, pos)
+        out = out substr(s, pos, open - pos) " "
+        pos = scan + width
+      }
+      return out
+    }
+    {
+      line = $0
+      reference_continuation = 0
+      if (reference_pending) {
+        reference_pending = 0
+        if (line !~ /^[[:space:]]*$/) reference_continuation = 1
+      }
+      indent = match(line, /[^ ]/) - 1
+      if (indent < 0) indent = length(line)
+      rest = substr(line, indent + 1)
+
+      if (in_fence) {
+        if (indent <= 3 && substr(rest, 1, 1) == fence_char) {
+          width = run_len(rest, 1, fence_char)
+          tail = substr(rest, width + 1)
+          if (width >= fence_width && tail ~ /^[[:space:]]*$/) in_fence = 0
+        }
+        print ""
+        next
+      }
+
+      ch = substr(rest, 1, 1)
+      if (indent <= 3 && (ch == "`" || ch == "~")) {
+        width = run_len(rest, 1, ch)
+        if (width >= 3) {
+          in_fence = 1; fence_char = ch; fence_width = width
+          print ""
+          next
+        }
+      }
+
+      if (!reference_continuation && (line ~ /^\t/ || substr(line, 1, 4) == "    ")) {
+        print ""
+        next
+      }
+      rendered = strip_inline_code(line)
+      print rendered
+      probe = rendered
+      sub(/^[[:space:]]*/, "", probe)
+      if (probe ~ /^\[[^]]+\]:[[:space:]]*$/) reference_pending = 1
+    }
+  ' "$f"
+}
+
+# Emit every rendered Markdown link/image target in a file, one per line, with
 # fragments, angle brackets and link titles stripped. Used by check 10:
 # a link's *target* is what a reader's browser resolves, and a target is
 # written relative to the document that carries it, so a raw grep for
@@ -180,8 +256,8 @@ mp_path_is_unsafe() {
 mp_doc_link_targets() {
   local f="$1"
   {
-    grep -oE '\]\([^)]*\)' "$f" || true
-    grep -oE '^[[:space:]]{0,3}\[[^]]+\]:[[:space:]]*[^[:space:]]+' "$f" || true
+    mp_markdown_renderable_text "$f" | grep -oE '\]\([^)]*\)' || true
+    mp_markdown_renderable_text "$f" | grep -oE '^[[:space:]]{0,3}\[[^]]+\]:[[:space:]]*(<[^>]*>|[^[:space:]]+)' || true
     # Wrapped reference definition: a label + colon with NOTHING after it
     # on that line, then the destination as the first token of the next
     # non-blank line. Indentation is capped at three spaces the same way
@@ -189,22 +265,41 @@ mp_doc_link_targets() {
     # an `{0,3}` interval, which not every awk implementation supports.
     # A blank line after the colon ends the definition (CommonMark allows
     # at most one line ending there), so nothing is emitted for it.
-    awk '
+    mp_markdown_renderable_text "$f" | awk '
+      function print_target(s, gt) {
+        sub(/^[[:space:]]+/, "", s)
+        if (substr(s, 1, 1) == "<") {
+          gt = index(s, ">")
+          if (gt > 1) { print substr(s, 1, gt); return }
+        }
+        sub(/[[:space:]].*$/, "", s)
+        print s
+      }
       pending {
         pending = 0
-        if (NF > 0) { print $1; next }
+        if (NF > 0) { print_target($0); next }
       }
       /^[[:space:]]*\[[^]]+\]:[[:space:]]*$/ {
         indent = match($0, /[^[:space:]]/) - 1
         if (indent >= 0 && indent <= 3) pending = 1
       }
-    ' "$f" || true
+    ' || true
   } | sed -E \
         -e 's/^\]\(//' \
         -e 's/\)$//' \
         -e 's/^[[:space:]]*\[[^]]+\]:[[:space:]]*//' \
-    | awk '{ print $1 }' \
-    | sed -E -e 's/^<//' -e 's/>$//' -e 's/[?#].*$//' \
+    | awk '
+        {
+          sub(/^[[:space:]]+/, "")
+          if (substr($0, 1, 1) == "<") {
+            gt = index($0, ">")
+            if (gt > 1) { print substr($0, 2, gt - 2); next }
+          }
+          sub(/[[:space:]].*$/, "")
+          print
+        }
+      ' \
+    | sed -E -e 's/[?#].*$//' \
     | grep -v '^[[:space:]]*$' || true
 }
 
@@ -288,8 +383,9 @@ mp_resolve_relative() {
 # defect, and the resolved pass reports it.
 mp_mask_absolute_urls() {
   sed -E \
-    -e 's,\[[^]]*\]\([[:space:]]*<?[a-zA-Z][a-zA-Z0-9+.-]*://[^)]*\), ,g' \
-    -e 's,[a-zA-Z][a-zA-Z0-9+.-]*://[^][:space:]<>()"'"'"'`]*, ,g'
+    -e 's,\[[^]]*\]\([[:space:]]*<?([a-zA-Z][a-zA-Z0-9+.-]*://|//)[^)]*\), ,g' \
+    -e 's,[a-zA-Z][a-zA-Z0-9+.-]*://[^][:space:]<>()"'"'"'`]*, ,g' \
+    -e 's,(^|[[:space:]<(])//[^][:space:]<>()"'"'"'`]*,\1 ,g'
 }
 
 # Mask reference-style link USES whose definition has an absolute
