@@ -155,6 +155,32 @@ mp_markdown_renderable_text() {
       while (substr(s, at + n, 1) == ch) n++
       return n
     }
+    function is_list_marker(s) {
+      return s ~ /^([-+*]|[0-9]+[.)])[[:space:]]+/
+    }
+    function is_thematic_break(s, compact, ch, i) {
+      compact = s
+      gsub(/[[:space:]]/, "", compact)
+      if (length(compact) < 3) return 0
+      ch = substr(compact, 1, 1)
+      if (ch != "*" && ch != "-" && ch != "_") return 0
+      for (i = 2; i <= length(compact); i++) {
+        if (substr(compact, i, 1) != ch) return 0
+      }
+      return 1
+    }
+    function opens_text_flow(s, hashes) {
+      if (is_list_marker(s)) return 1
+      if (substr(s, 1, 1) == "#") {
+        hashes = run_len(s, 1, "#")
+        if (hashes <= 6 && substr(s, hashes + 1) ~ /^([[:space:]]|$)/) return 0
+      }
+      if (substr(s, 1, 1) == ">") return 0
+      if (s ~ /^\[[^]]+\]:[[:space:]]*/) return 0
+      if (s ~ /^<([!?\/]|[[:alpha:]])/) return 0
+      if (is_thematic_break(s)) return 0
+      return 1
+    }
     function strip_inline_code(s, out, pos, rel, open, width, scan, got, close_width) {
       out = ""; pos = 1
       while (pos <= length(s)) {
@@ -193,6 +219,7 @@ mp_markdown_renderable_text() {
           tail = substr(rest, width + 1)
           if (width >= fence_width && tail ~ /^[[:space:]]*$/) in_fence = 0
         }
+        text_flow_open = 0
         print ""
         next
       }
@@ -205,12 +232,23 @@ mp_markdown_renderable_text() {
         # Such a line is rendered prose, not a fence opener.
         if (width >= 3 && !(ch == "`" && index(tail, "`") > 0)) {
           in_fence = 1; fence_char = ch; fence_width = width
+          text_flow_open = 0
           print ""
           next
         }
       }
 
-      if (!reference_continuation && (line ~ /^\t/ || substr(line, 1, 4) == "    ")) {
+      if (line ~ /^[[:space:]]*$/) {
+        text_flow_open = 0
+        print ""
+        next
+      }
+
+      # Indented code cannot interrupt an open paragraph or list item. Keep an
+      # indented line renderable while that text flow is open; only blank it
+      # when indentation can really start a CommonMark code block.
+      if (!reference_continuation && !text_flow_open \
+          && (line ~ /^\t/ || substr(line, 1, 4) == "    ")) {
         print ""
         next
       }
@@ -218,7 +256,16 @@ mp_markdown_renderable_text() {
       print rendered
       probe = rendered
       sub(/^[[:space:]]*/, "", probe)
-      if (probe ~ /^\[[^]]+\]:[[:space:]]*$/) reference_pending = 1
+      if (probe ~ /^\[[^]]+\]:[[:space:]]*$/) {
+        reference_pending = 1
+        text_flow_open = 0
+      } else if (reference_continuation) {
+        text_flow_open = 0
+      } else {
+        flow_probe = line
+        sub(/^[[:space:]]*/, "", flow_probe)
+        text_flow_open = opens_text_flow(flow_probe)
+      }
     }
   ' "$f"
 }
