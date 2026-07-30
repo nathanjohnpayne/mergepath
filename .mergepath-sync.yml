@@ -498,12 +498,16 @@ paths:
     # {parse_policy_list,match_protected_paths}.sh (#429); without those in
     # the consumer the gate fails-closed on `command not found` for every
     # external-review PR. Same coupling class as codex-p1-gate.yml +
-    # codex-p1-gate.sh.
+    # codex-p1-gate.sh. Since #820 it also hard-sources
+    # scripts/lib/reviewers-helpers.sh at startup and exits 2 when the
+    # helper is absent, so that file must be byte-current on the consumer
+    # before this script may land there.
     type: canonical
     consumers: all
     requires:
       - "scripts/codex-review-check.sh"
       - "scripts/workflow/"
+      - "scripts/lib/reviewers-helpers.sh"   # #817, hard-sourced for the Dependabot reviewer allow-list
   - path: scripts/daily-feedback-rollup.sh
     # Cron workhorse invoked by .github/workflows/daily-feedback-rollup.yml.
     # Sources scripts/lib/daily-feedback-rollup-helpers.sh. The
