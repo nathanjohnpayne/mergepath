@@ -129,8 +129,14 @@ codex_p1_gate_field() {
     in_p1_gate && /^[[:space:]]{0,3}[^[:space:]#]/ { in_p1_gate=0 }
     in_p1_gate && $1 == field":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^"/, "", $0)
-      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      # Strip BOTH single and double quotes (#536, unified here by #817).
+      # This reader was double-quote-only, so `enabled: '"'"'true'"'"'` came back
+      # with its quotes intact, reached P1_GATE_ENABLED below, and tripped
+      # the true|false validator — a required gate deadlocked by a benign
+      # YAML quoting choice. \047 is the octal escape for a single quote
+      # inside the awk character class, matching codex-review-check.sh:253.
+      gsub(/^["\047]/, "", $0)
+      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
       gsub(/[[:space:]]*#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)
       print
@@ -148,8 +154,14 @@ codex_field() {
     in_block && /^[^[:space:]#]/ {in_block=0}
     in_block && $1 == field":" {
       sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
-      gsub(/^"/, "", $0)
-      gsub(/"[[:space:]]*(#.*)?$/, "", $0)
+      # Strip BOTH single and double quotes (#536, unified here by #817).
+      # This reader was double-quote-only, so a single-quoted bot_login came
+      # back with its quotes intact and matched zero comments — the gate then
+      # passed on an empty finding set instead of blocking. That direction is
+      # a soundness defect, not just a nuisance. Same form as
+      # codex-review-check.sh:253.
+      gsub(/^["\047]/, "", $0)
+      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
       gsub(/[[:space:]]*#.*$/, "", $0)
       sub(/[[:space:]]+$/, "", $0)
       print

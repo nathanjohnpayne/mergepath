@@ -766,6 +766,100 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Tests 11a–11c (#817): both scalar readers in this script strip single AND
+# double quotes, matching scripts/codex-review-check.sh codex_field. They used
+# to strip double quotes only, which broke in two opposite directions:
+#
+#   11a  `enabled: 'true'` reached the true|false validator as the 6-character
+#        string with its quotes intact and exited 2 — a required gate
+#        deadlocked by a benign YAML quoting choice.
+#   11b  a single-quoted `bot_login` matched zero comments, so a real
+#        unresolved P1 from the bot went uncounted and the gate passed. That
+#        is the soundness direction: a vacuous pass, not a stall.
+#   11c  `enabled: 'false'` must still resolve to the off-state clean pass
+#        rather than the validator error, so the fix is symmetric.
+#
+# Written against raw config text so the quoting under test is literal.
+# ---------------------------------------------------------------------------
+make_scratch_raw_config() {  # <verbatim review-policy.yml body>
+  local body=$1 dir
+  dir=$(mktemp -d "$WORKDIR/scratch.XXXXXX")
+  mkdir -p "$dir/.github"
+  printf '%s\n' "$body" >"$dir/.github/review-policy.yml"
+  echo "$dir"
+}
+
+echo
+echo "--- Test 11a (#817): single-quoted p1_gate.enabled → parsed, not exit 2"
+SCRATCH=$(make_scratch_raw_config "codex:
+  bot_login: \"chatgpt-codex-connector[bot]\"
+  p1_gate:
+    enabled: 'true'")
+HEAD_SHA="abc123def456"
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "![P1 Badge](url) Stop retrying endlessly.")
+FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [1001]}]')
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1"; then
+  pass "#817: enabled: 'true' enables the gate (was exit 2)"
+else
+  fail "#817: expected rc=1 with 'unresolved: 1'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo
+echo "--- Test 11b (#817): single-quoted bot_login still matches the bot"
+SCRATCH=$(make_scratch_raw_config "codex:
+  bot_login: 'chatgpt-codex-connector[bot]'
+  p1_gate:
+    enabled: true")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_single_comment_fixture "$HEAD_SHA" "![P1 Badge](url) Stop retrying endlessly.")
+FIXTURE_THREADS=$(make_threads_fixture '[{isResolved: false, comment_ids: [1001]}]')
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 1"; then
+  pass "#817: single-quoted bot_login counts the bot's finding (was a vacuous pass)"
+else
+  fail "#817: expected rc=1 with 'unresolved: 1'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo
+echo "--- Test 11c (#817): single-quoted enabled: 'false' → off-state clean pass"
+SCRATCH=$(make_scratch_raw_config "codex:
+  bot_login: \"chatgpt-codex-connector[bot]\"
+  p1_gate:
+    enabled: 'false'")
+: > "$WORKDIR/gh-calls.log"
+set +e
+OUT=$(run_gate "$SCRATCH" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "Codex blocking-tier unresolved: 0" \
+    && ! grep -q "^gh" "$WORKDIR/gh-calls.log"; then
+  pass "#817: enabled: 'false' → off-state clean pass, no API calls"
+else
+  fail "#817: expected rc=0 + 'unresolved: 0' + no gh calls; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Test 12: PR_NUMBER + REPO via env (no positional args). Covers the
 #          scheduled-sweep / workflow_dispatch invocation shape.
 # ---------------------------------------------------------------------------

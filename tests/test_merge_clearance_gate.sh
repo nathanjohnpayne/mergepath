@@ -468,6 +468,92 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 5a–5d (#817): the reviewer allow-list is parsed by the shared
+# scripts/lib/reviewers-helpers.sh reader, so every YAML spelling of a
+# reviewer entry resolves to the same login. The reader this script used to
+# carry was a single sed with a double-quote-only capture; on this same
+# 4-entry fixture it returned two clean logins, one with its single quotes
+# intact, and one whole raw line with its inline comment unparsed. Each
+# mangled entry drops a real reviewer out of the fail-closed allow-list, so
+# the APPROVED review below stops matching and the Dependabot gate BLOCKS a
+# correctly-approved PR.
+# ---------------------------------------------------------------------------
+make_scratch_reviewers() {  # <reviewers_block_body>
+  local reviewers=$1 dir
+  dir=$(mktemp -d "$WORKDIR/scratch.XXXXXX")
+  mkdir -p "$dir/.github"
+  cat >"$dir/.github/review-policy.yml" <<EOF
+author_identity: nathanjohnpayne
+external_review_threshold: 300
+
+available_reviewers:
+$reviewers
+
+codex:
+  bot_login: "chatgpt-codex-connector[bot]"
+  external_review_gate:
+    enabled: false
+
+dependabot:
+  reviewer_gate:
+    enabled: true
+EOF
+  echo "$dir"
+}
+
+# The four shapes from the #817 reproduction: unquoted, single-quoted,
+# trailing inline comment, double-quoted and padded.
+QUOTED_REVIEWERS='  - nathanpayne-claude
+  - '"'"'nathanpayne-cursor'"'"'
+  - nathanpayne-codex   # the codex identity
+  - "nathanpayne-fixture"   '
+
+for _rv in nathanpayne-claude nathanpayne-cursor nathanpayne-codex nathanpayne-fixture; do
+  echo; echo "--- Test 5* (#817): allow-list entry '$_rv' survives its YAML spelling"
+  SCRATCH=$(make_scratch_reviewers "$QUOTED_REVIEWERS")
+  FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+  FIXTURE_REVIEWS=$(make_reviews_fixture "$(jq -n --arg sha "$HEAD_SHA" --arg who "$_rv" '
+    [{ user:{login:$who}, state:"APPROVED", commit_id:$sha, submitted_at:"2026-06-01T10:00:00Z" }]
+  ')")
+  set +e
+  OUT=$(FIXTURE_PR="$FIXTURE_PR" FIXTURE_REVIEWS="$FIXTURE_REVIEWS" run_gate "$SCRATCH" 99 owner/repo 2>&1)
+  RC=$?
+  set -e
+  if [ "$RC" = 0 ] && echo "$OUT" | grep -q "PASS" && echo "$OUT" | grep -q "$_rv"; then
+    pass "#817: quoted/commented/padded allow-list entry '$_rv' still matches its approval"
+  else
+    fail "#817: expected rc=0 PASS naming '$_rv'; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# Test 5e (#817): the helper is a HARD dependency, not a soft one. An
+# unreadable scripts/lib/reviewers-helpers.sh must abort with the config
+# exit code rather than leaving read_available_reviewers undefined — an
+# undefined reader would produce an empty allow-list, which on this path is
+# the difference between "block" and "crash", but on the codex-review-check
+# path is the fail-OPEN direction #453 exists to prevent.
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 5e (#817): missing reviewers-helpers.sh → exit 2"
+SANDBOX_SCRIPTS="$WORKDIR/no-lib/scripts"
+mkdir -p "$SANDBOX_SCRIPTS/lib"
+cp "$SCRIPT" "$SANDBOX_SCRIPTS/merge-clearance-gate.sh"
+chmod +x "$SANDBOX_SCRIPTS/merge-clearance-gate.sh"
+SCRATCH=$(make_scratch true false)
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA" "$DEPENDABOT")
+set +e
+OUT=$(cd "$SCRATCH" && PATH="$STUB_DIR:$PATH" GH_TOKEN="dummy-token" \
+  GH_CALLS_LOG="$WORKDIR/gh-calls.log" FIXTURE_PR="$FIXTURE_PR" \
+  "$SANDBOX_SCRIPTS/merge-clearance-gate.sh" 99 owner/repo 2>&1)
+RC=$?
+set -e
+if [ "$RC" = 2 ] && echo "$OUT" | grep -q "reviewers-helpers missing"; then
+  pass "#817: absent reviewers-helpers.sh → exit 2 with a naming error"
+else
+  fail "#817: expected rc=2 'reviewers-helpers missing'; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Test 6: External-review, gate disabled → exit 0.
 # ---------------------------------------------------------------------------
 echo; echo "--- Test 6: external-review, gate disabled"

@@ -140,6 +140,20 @@ for _tool in gh jq awk; do
   fi
 done
 
+# Shared available_reviewers reader (#453, adopted here by #817). Replaces
+# the local double-quote-only parser this script used to carry, so every
+# consumer of the allow-list normalizes it identically (dash + inline comment
+# + BOTH quote styles + whitespace). Hard-require it the way
+# scripts/codex-review-check.sh does: REVIEWERS on the Dependabot path is a
+# fail-closed gate input (an empty list exits 2), so a missing helper must
+# error rather than silently degrade to an empty allow-list.
+if [ ! -r "$SCRIPT_DIR/lib/reviewers-helpers.sh" ]; then
+  echo "ERROR: reviewers-helpers missing: $SCRIPT_DIR/lib/reviewers-helpers.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/reviewers-helpers.sh
+. "$SCRIPT_DIR/lib/reviewers-helpers.sh"
+
 # --- argument parsing -------------------------------------------------------
 
 # --derive-external-requiredness (#620/#630): QUERY mode. Runs the same
@@ -271,21 +285,6 @@ nested_field() {  # <top_block> <sub_block> <field>
       exit
     }
   ' "$POLICY_CONFIG"
-}
-
-# Read the available_reviewers list (one login per line). Identical parser
-# to scripts/codex-review-check.sh read_available_reviewers.
-read_available_reviewers() {
-  # $POLICY_CONFIG, not $CONFIG (#769): the reviewer allow-list must come from
-  # the SAME policy as the gate-enable switch and the threshold. Reading it
-  # from the default branch while the switch came from the base was the
-  # half-threaded state the #767 review flagged.
-  [ -f "$POLICY_CONFIG" ] || return 0
-  awk '
-    /^available_reviewers:/ {in_block=1; next}
-    in_block && /^[^[:space:]#]/ {in_block=0}
-    in_block && /^ *-/ {print}
-  ' "$POLICY_CONFIG" | sed -E 's/^[[:space:]]*-[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/'
 }
 
 # --- logging helpers --------------------------------------------------------
@@ -972,9 +971,15 @@ if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
 
   log "Dependabot path: requiring a reviewer-identity APPROVED review on HEAD"
 
-  REVIEWERS=$(read_available_reviewers)
+  # $POLICY_CONFIG, not $CONFIG (#769): the reviewer allow-list must come from
+  # the SAME policy as the gate-enable switch and the threshold. Reading it
+  # from the default branch while the switch came from the base was the
+  # half-threaded state the #767 review flagged. Passed explicitly rather than
+  # left to the helper's $CONFIG fallback, which would resolve to the
+  # default-branch path and silently reintroduce that split.
+  REVIEWERS=$(read_available_reviewers "$POLICY_CONFIG")
   if [ -z "$REVIEWERS" ]; then
-    die 2 "no available_reviewers found in $CONFIG"
+    die 2 "no available_reviewers found in $POLICY_CONFIG"
   fi
   REVIEWERS_JSON=$(echo "$REVIEWERS" | jq -R . | jq -s .)
 
