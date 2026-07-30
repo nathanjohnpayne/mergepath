@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# scripts/ci/check_consumer_residue_safety — CI entry point for the
+# residue-invariance net.
+#
+# Wraps tests/test_consumer_residue_safety.sh, which derives a
+# consumer-shaped tree from .mergepath-sync.yml (not from a hand-written
+# strip list) and then, for every scripts/ci/check_* wrapper, toggles the
+# hub-only paths that wrapper references in and out of that tree and
+# asserts its verdict never changes. See the suite's header for the full
+# invariant.
+#
+# H(W) — the set toggled for a wrapper W — is the subset of the paths the
+# derived baseline STRIPS (every manifest-undelivered `git ls-files` path
+# under scripts/, tests/, .github/workflows/) whose literal path or
+# "/<basename>" appears in W's source. Two structural assertions back that
+# text-reading step up, because it is the part that can silently under-
+# report: a wrapper that declares a consumer gate must have a non-empty H
+# (or be recorded in MARKER_ONLY_CONSUMER_GATES), and every SKIP such a
+# wrapper emits must use the canonical "<name>: SKIP" spelling the verdict
+# pair reads.
+#
+# The gap it closes, in one line: tests/test_repo_lint_consumer_safety.sh
+# models a consumer by STRIPPING files, so it can only ever test a check
+# against MISSING files — while bootstrap residue is a hub-only file
+# unexpectedly PRESENT on a consumer. gaycruisebingo carries ~24 such
+# paths today.
+#
+# ─────────────────────────────────────────────────────────────────────
+# Why this wrapper is marker-FIRST, not both-absent
+# ─────────────────────────────────────────────────────────────────────
+#
+# 25 sibling wrappers gate their consumer-SKIP on the PAIR (wrapped test
+# absent AND scripts/sync-to-downstream.sh absent). This one must not:
+# it is itself propagated by the scripts/ci/ kit, so a consumer that
+# carries tests/test_consumer_residue_safety.sh as bootstrap residue
+# would fall straight through the pair gate and run the whole hub-only
+# lattice in consumer CI — i.e. the wrapper would fail the very invariant
+# it enforces. Gating on the marker ALONE is the fixed point.
+#
+# The documented reason for the pair idiom (see
+# scripts/ci/check_repo_lint_consumer_safety and BOOTSTRAP_MIRROR_EXCLUDES
+# in scripts/bootstrap/template-mirror.sh) is that hub marker loss must
+# never silently disable a check. Marker-first preserves that exactly: if
+# the hub loses the wrapped test, the marker is still present, the guard
+# does not skip, and the wrapper hard-errors — the identical outcome. The
+# only case the pair covers and marker-first does not is the marker being
+# deleted while the test survives, and that is already caught loudly and
+# centrally by check_export_consumer_facts ("scripts/sync-to-downstream.sh
+# is missing but .mergepath-sync.yml IS present") in both directions.
+#
+# ─────────────────────────────────────────────────────────────────────
+# Posture
+# ─────────────────────────────────────────────────────────────────────
+#
+# Hermetic and offline: no network, no token, no `gh`. It is safe as a
+# PR-blocking step precisely because it never needs credentials — the
+# live-fleet reconciliation of BOOTSTRAP_MIRROR_EXCLUDES that would need
+# them belongs in a hub-only scheduled audit alongside
+# .github/workflows/weekly-drift-audit.yml, never in a required check.
+#
+# Known residual gaps (recorded, not closed):
+#   - Verdict, not execution. A wrapper that runs hub tooling on a
+#     consumer and still exits 0 under every residue subset is
+#     invariant-clean here; the suite records it as a SKIP-ONLY class
+#     entry rather than failing.
+#   - Only scripts/ci/check_* wrappers. Propagated workflows,
+#     scripts/lib/, scripts/workflow/ and scripts/phase-4b/ are not
+#     probed for residue sensitivity.
+#   - Above the exhaustive cap (|H| > 8) only singletons, pairs and the
+#     full set are enumerated, so a 3-file interaction could slip.
+#   - The marker itself is now a single point of failure by design: if a
+#     future bootstrap ever leaked scripts/sync-to-downstream.sh into a
+#     consumer, every marker-first guard misfires. Empirically excluded
+#     today (absent from all nine live consumers).
+#   - H is still read out of the wrapper's TEXT. A wrapper that composes
+#     a dependency's BASENAME at runtime ("$LIB/${STEM}.py") enrols
+#     nothing, and only the empty-H assertion catches it — which it does
+#     because such a wrapper cannot also hide that it declares a consumer
+#     gate, but a wrapper with SOME visible hub-only ref plus one hidden
+#     one is probed over an incomplete lattice.
+#   - The canonical-SKIP assertion is scoped to wrappers that declare a
+#     consumer gate. A wrapper with no gate may still print
+#     "  SKIP: <reason>" for a per-item or tooling skip (three do), and
+#     those spellings are deliberately left alone.
+#   - The ALLOW_LIST cross-check is a BOOKKEEPING check, not a second
+#     opinion: check_propagation_closure extracts refs with the same
+#     literal-text idea (its own regex is narrower still), so the two can
+#     disagree about declarations but never about a dependency neither
+#     can see.
+#   - The derived baseline models file absence exactly and directory
+#     absence approximately: hub-only directories are pruned once the
+#     strip empties them, and per-probe as residue is removed, but a
+#     directory that also holds a manifest-delivered file legitimately
+#     stays (as it would on a real consumer).
+#   - A grandfathered wrapper's ratchet entry records the WORST divergence
+#     class in its lattice, so a new EXIT divergence cannot hide behind a
+#     recorded SKIP-ONLY one. A SECOND divergence of the SAME recorded
+#     class, on a different subset, is deliberately not reported
+#     separately: the entry already declares that failure mode, one
+#     marker-first fix removes every subset of it at once, and the
+#     stale-entry rule fires the moment it does.
+#   - Probe independence is enforced by restoring the fixture to its
+#     committed baseline before every probe, which covers tracked edits,
+#     untracked files and gitignored output. A side effect a wrapper writes
+#     OUTSIDE the fixture (a real $HOME dotfile, a system temp dir) is
+#     still shared between probes.
+#
+# Runtime is ~3 minutes: about a third of it is one probe that legitimately
+# executes a nested hub suite until the per-probe timeout kills it, and
+# another third is the single |H| = 32 wrapper's 529-subset lattice. Still
+# cheaper than check_repo_lint_consumer_safety, so it sits just ahead of it.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_SCRIPT="$REPO_ROOT/tests/test_consumer_residue_safety.sh"
+
+# Marker-FIRST consumer gate. Consulted before ANY test of this check's
+# own hub-only artifacts, so the SKIP decision is a function of what the
+# manifest delivered and nothing else.
+if [ ! -f "$REPO_ROOT/scripts/sync-to-downstream.sh" ]; then
+  echo "check_consumer_residue_safety: SKIP (consumer checkout: hub marker scripts/sync-to-downstream.sh absent; hub-only residue-invariance net)"
+  exit 0
+fi
+
+if [ ! -f "$TEST_SCRIPT" ]; then
+  echo "check_consumer_residue_safety: ERROR (missing $TEST_SCRIPT)" >&2
+  exit 1
+fi
+
+bash "$TEST_SCRIPT"
