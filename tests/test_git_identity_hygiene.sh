@@ -459,6 +459,23 @@ else
   fail "fixture repo with no local identity: rc=$RC out=$OUT"
 fi
 
+# Case 27b: a repository that Git cannot inspect is NOT a non-repository.
+# `GIT_CONFIG_GLOBAL=/` makes real git fail while opening its config (the
+# root is a directory), without writing or chmodding any operator state.
+# Treating the failed `rev-parse` exactly like a fixture tree with no .git
+# turns an unreadable identity signal into a clean pass.
+set +e
+OUT="$(GIT_CONFIG_GLOBAL=/ MERGEPATH_GIT_IDENTITY_ROOT="$IDREPO" bash "$CHECK" 2>&1)"
+RC=$?
+set -e
+if [ "$RC" = "1" ] \
+  && grep -q "cannot inspect repository metadata or config" <<<"$OUT" \
+  && ! grep -q "check_git_identity_hygiene: PASS" <<<"$OUT"; then
+  pass "git config read failure: fails closed instead of claiming non-repository"
+else
+  fail "git config read failure passed open: rc=$RC out=$OUT"
+fi
+
 # Case 28: the exact #777 corruption — a repo-local user block plus a
 # disabled gpgsign — must fail, naming every offending key.
 git -C "$IDREPO" config --local user.name "nathanjohnpayne"

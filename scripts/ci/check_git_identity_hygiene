@@ -218,6 +218,26 @@ TEST_SUITE="${MERGEPATH_GIT_IDENTITY_SUITE:-$SELF_ROOT/tests/test_git_identity_h
 
 FAILED=0
 
+# A failed Git probe is not evidence that a checkout has no local identity.
+# A plain fixture tree legitimately has no .git and Parts A/B skip it, but a
+# root that DOES carry repository metadata and cannot be inspected is an
+# unknown result: malformed or unreadable config can make every later
+# `git config` producer emit nothing, which used to look exactly like a clean
+# checkout. Probe before --snapshot too, so an unreadable config cannot be
+# copied as the baseline and then blessed on the report pass.
+if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  if [ -e "$REPO_ROOT/.git" ] || [ -L "$REPO_ROOT/.git" ]; then
+    cat >&2 <<EOF
+check_git_identity_hygiene: FAIL (cannot inspect repository metadata or config)
+
+Git failed to inspect the checkout at $REPO_ROOT even though its .git entry
+exists. The identity signal is unreadable, so this check cannot distinguish a
+clean repository from a malformed or inaccessible config and must fail closed.
+EOF
+    exit 1
+  fi
+fi
+
 # ── Scratch files ─────────────────────────────────────────────────────
 # One registry with one EXIT trap, rather than a `trap` per file: a
 # second `trap ... EXIT` REPLACES the first, so a chain of them leaks
