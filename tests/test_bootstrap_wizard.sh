@@ -211,11 +211,19 @@ echo "$resume_out" | grep -q "Starting stage: board-and-summary" \
 
 # ---------------------------------------------------------------------------
 # Test 12: --resume <explicit-stage> overrides the state-file lookup.
-# Pre-seed the state file with nothing; pass --resume github-infra;
-# verify only stages D/E run.
+# The state file records ALL FOUR stages, so a bare --resume would skip
+# everything; naming github-infra explicitly REWINDS to re-run D and E.
+# That rewind is the flag's job, and it is what the explicit form can
+# still do after #790 made it refuse to fast-forward (Test 12b).
 # ---------------------------------------------------------------------------
 explicit_resume_target="$WORKDIR/explicit-resume-target"
 mkdir -p "$explicit_resume_target"
+cat >"$explicit_resume_target/.bootstrap-state" <<'EOF'
+template-mirror
+github-infra
+firebase-and-codereview
+board-and-summary
+EOF
 set +e
 ex_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
          BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
@@ -238,6 +246,139 @@ echo "$ex_out" | grep -q "skip firebase-and-codereview (BOOTSTRAP_SKIP_STAGES)" 
 echo "$ex_out" | grep -q "Starting stage: template-mirror" \
   && fail "explicit-resume should have skipped template-mirror (came before github-infra)" \
   || pass "explicit-resume correctly skipped pre-target stages"
+# The rewind really is a rewind: board-and-summary is recorded as done
+# yet runs again, because the explicit stage overrode the last-line lookup.
+echo "$ex_out" | grep -q "Starting stage: board-and-summary" \
+  && pass "explicit-resume rewinds past recorded later stages" \
+  || fail "explicit-resume did not re-run board-and-summary; got: $ex_out"
+
+# ---------------------------------------------------------------------------
+# Test 12b: --resume <stage> may REWIND but never FAST-FORWARD (#790).
+#
+# `--resume X` skips every stage up to and including X. Naming a stage
+# the state file does not record as completed therefore skips work that
+# never ran, and the remaining stages finish green — exit 0 over a
+# half-bootstrapped repo. That is the silent false-success the
+# unknown-stage guard closes for misspelled names, reached with a name
+# spelled right. It matters because the wizard used to PRINT exactly
+# such a command on a stage failure ("Resume with: ... --resume
+# <failed-stage>"); that hint is fixed at source in Test 12c, and this
+# guard holds the same line for anything a human types instead.
+# ---------------------------------------------------------------------------
+ff_resume_target="$WORKDIR/fastforward-resume-target"
+mkdir -p "$ff_resume_target"
+echo "template-mirror" >"$ff_resume_target/.bootstrap-state"
+set +e
+ff_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+         BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+         "$SCRIPT" my-new-repo \
+         --target-dir "$ff_resume_target" \
+         --description "test repo" --visibility private --firebase none \
+         --codex-app n --project new --dry-run \
+         --resume github-infra 2>&1)
+ff_ec=$?
+set -e
+[ "$ff_ec" -eq 1 ] \
+  && pass "--resume naming an unrecorded stage exits 1" \
+  || fail "fast-forward resume should exit 1; got $ff_ec; out: $ff_out"
+echo "$ff_out" | grep -q "refusing --resume github-infra" \
+  && pass "the refusal names the stage it will not skip" \
+  || fail "no refusal diagnostic; out: $ff_out"
+echo "$ff_out" | grep -q "last completed stage per the state file: 'template-mirror'" \
+  && pass "the refusal points at the resume stage that IS recorded" \
+  || fail "refusal does not name the last completed stage; out: $ff_out"
+echo "$ff_out" | grep -q "Starting stage: firebase-and-codereview" \
+  && fail "the refused resume still ran later stages; out: $ff_out" \
+  || pass "the refused resume ran no stage at all"
+
+# Same guard with no state file whatsoever: nothing completed, so every
+# explicit resume stage is a fast-forward.
+nostate_resume_target="$WORKDIR/nostate-resume-target"
+mkdir -p "$nostate_resume_target"
+set +e
+ns_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+         BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+         "$SCRIPT" my-new-repo \
+         --target-dir "$nostate_resume_target" \
+         --description "test repo" --visibility private --firebase none \
+         --codex-app n --project new --dry-run \
+         --resume template-mirror 2>&1)
+ns_ec=$?
+set -e
+[ "$ns_ec" -eq 1 ] \
+  && pass "--resume with no state file at all exits 1" \
+  || fail "resume with no state file should exit 1; got $ns_ec; out: $ns_out"
+echo "$ns_out" | grep -q "the state file records no completed stage" \
+  && pass "the no-state refusal says so instead of naming a stage" \
+  || fail "expected the no-completed-stage diagnostic; out: $ns_out"
+echo "$ns_out" | grep -q "BOOTSTRAP_SKIP_STAGES=template-mirror" \
+  && pass "the refusal points at the flag that DOES skip a stage" \
+  || fail "refusal does not mention BOOTSTRAP_SKIP_STAGES; out: $ns_out"
+
+# ---------------------------------------------------------------------------
+# Test 12c: a failing stage prints a resume command that RE-ENTERS it.
+#
+# `--resume X` skips up to and including X, so the old message — "Resume
+# with: ... --resume <the stage that just failed>" — told the operator to
+# skip exactly the work that did not happen. The hint must name the last
+# COMPLETED stage before the failure instead (#790).
+#
+# Driven with a stage module whose github-infra fails: stage B completes
+# and is recorded, stage C returns non-zero.
+# ---------------------------------------------------------------------------
+fail_lib="$WORKDIR/failing-stage-lib"
+mkdir -p "$fail_lib"
+cp "$ROOT/scripts/bootstrap/"*.sh "$fail_lib/"
+cat >"$fail_lib/github-infra.sh" <<'FAILSTAGE_EOF'
+#!/usr/bin/env bash
+bootstrap::stage_github_infra() {
+  bootstrap::stage_banner "github-infra"
+  bootstrap::err "stub failure"
+  return 7
+}
+FAILSTAGE_EOF
+resume_hint_target="$WORKDIR/resume-hint-target"
+rm -rf "$resume_hint_target"
+mkdir -p "$resume_hint_target"
+set +e
+rh_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+         BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+         BOOTSTRAP_LIB_DIR="$fail_lib" \
+         "$SCRIPT" my-new-repo \
+         --target-dir "$resume_hint_target" \
+         --description "test repo" --visibility private --firebase none \
+         --codex-app n --project new --dry-run 2>&1)
+rh_ec=$?
+set -e
+[ "$rh_ec" -eq 3 ] \
+  && pass "a failing stage exits 3" \
+  || fail "failing stage should exit 3; got $rh_ec; out: $rh_out"
+echo "$rh_out" | grep -q -- "--resume template-mirror" \
+  && pass "the failure hint names the last completed stage, not the failed one" \
+  || fail "hint does not name template-mirror; out: $rh_out"
+echo "$rh_out" | grep -q -- "--resume github-infra" \
+  && fail "the failure hint still names the FAILED stage (it would skip it); out: $rh_out" \
+  || pass "the failure hint never names the failed stage"
+# And the printed command is one the rewind-only guard accepts: run it.
+set +e
+rh2_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+          BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+          BOOTSTRAP_LIB_DIR="$fail_lib" \
+          "$SCRIPT" my-new-repo \
+          --target-dir "$resume_hint_target" \
+          --description "test repo" --visibility private --firebase none \
+          --codex-app n --project new --dry-run --resume template-mirror 2>&1)
+rh2_ec=$?
+set -e
+echo "$rh2_out" | grep -q "refusing --resume" \
+  && fail "the wizard's own printed resume command was refused by its guard; out: $rh2_out" \
+  || pass "the printed resume command passes the rewind-only guard"
+echo "$rh2_out" | grep -q "Starting stage: github-infra" \
+  && pass "the printed resume command re-enters the stage that failed" \
+  || fail "resume did not re-enter github-infra; out: $rh2_out"
+[ "$rh2_ec" -eq 3 ] \
+  && pass "re-entered github-infra fails again (it was never skipped)" \
+  || fail "resume should have failed in github-infra again; got $rh2_ec"
 
 # ---------------------------------------------------------------------------
 # Test 13: --skip-board suppresses the Project v2 board sub-step but

@@ -10,8 +10,22 @@
 #   bootstrap::run <label> <cmd> [...] Execute (or dry-run echo) a side-effect.
 #   bootstrap::author_gh [...]         Run gh through the verified author wrapper
 #                                      unless dry-run/test bypass is active.
+#   bootstrap::author_gh_traced <marker> [...]
+#                                      bootstrap::author_gh that additionally
+#                                      creates <marker> iff the wrapped `gh`
+#                                      was actually reached.
 #   bootstrap::run_author_gh <label> [...]  Logged bootstrap::run wrapper around
 #                                      bootstrap::author_gh for gh side-effects.
+#   bootstrap::run_author_git <label> [...] Logged bootstrap::run wrapper for a
+#                                      git command that talks to GitHub: same
+#                                      verified author wrapper, with git's
+#                                      credential bound to that token and all
+#                                      interactive prompting disabled.
+#   bootstrap::append_log_diagnostic <label> <file>
+#                                      Append captured command output to
+#                                      $BOOTSTRAP_LOG_FILE. Returns 0 only if
+#                                      it was really persisted, so a caller may
+#                                      point an operator at the log.
 #   bootstrap::record_stage <name>     Append a completed stage name to the
 #                                      state file at $BOOTSTRAP_STATE_FILE.
 #   bootstrap::record_warning [key] <msg>
@@ -20,8 +34,18 @@
 #                                      the end-of-run summary's warnings block.
 #   bootstrap::clear_warning <key>      Resolve keyed recorded warnings after a
 #                                      later retry fixes the underlying issue.
+#   bootstrap::record_checkpoint <name> Record that an irreversible sub-stage
+#                                      step succeeded, in
+#                                      "${BOOTSTRAP_STATE_FILE}.checkpoints".
+#                                      Returns 0 only if the record was really
+#                                      persisted — callers standing between an
+#                                      irreversible step and the work after it
+#                                      MUST check it.
+#   bootstrap::has_checkpoint <name>    True iff that checkpoint is recorded.
 #   bootstrap::last_completed_stage    Echo the last recorded stage name,
 #                                      or empty if no state file.
+#   bootstrap::stage_recorded <name>   True iff <name> appears in the state
+#                                      file, i.e. that stage COMPLETED.
 #
 # Globals (set by the wizard before sourcing this file):
 #   BOOTSTRAP_DRY_RUN     "1" iff --dry-run was passed; otherwise "0".
@@ -153,6 +177,67 @@ bootstrap::author_gh() {
   GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- gh "$@"
 }
 
+# bootstrap::author_gh with positive proof of how far the call got.
+#
+# A non-zero rc from bootstrap::author_gh is ambiguous: it can come from
+# `gh` itself, or from the pre-`gh` half of the write — this file's
+# wrapper-executable check, or scripts/gh-as-author.sh refusing on its
+# byline pin (exit 2) / failing to look up an author token (exit 3),
+# neither of which ever starts `gh`. Those are different failures with
+# different remediations, and a caller that records "the gh call failed"
+# for a token-lookup failure sends the operator to fix the wrong thing.
+# The rc alone cannot separate them (gh exits 1/2/4 for its own reasons),
+# so this variant reports the boundary directly.
+#
+# $1 is a marker path, removed on entry and created by the wrapped
+# command immediately before it exec's gh. After the call: marker present
+# => gh ran (and the rc is gh's); marker absent with a non-zero rc => the
+# write never reached gh. The caller owns the path and its cleanup.
+#
+# The marker is written INSIDE the wrapper's process tree, after every
+# guard the wrapper applies, because scripts/gh-as-author.sh runs
+# whatever follows `--` and this passes it a one-line shim that touches
+# the marker and then `exec`s gh. Nothing about the gh invocation
+# changes: argv is identical, stdin passes straight through (the
+# secret-set path pipes its PAT), and the wrapper's GH_TOKEN is
+# inherited across the exec.
+bootstrap::author_gh_traced() {
+  local reached_marker=$1
+  shift
+
+  rm -f "$reached_marker"
+
+  if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ] || [ "${BOOTSTRAP_SKIP_AUTHOR_TOKEN:-0}" = "1" ]; then
+    # No wrapper in the path, so gh is reached unconditionally.
+    : >"$reached_marker"
+    gh "$@"
+    return $?
+  fi
+
+  local wrapper author_identity
+  wrapper="$(bootstrap::author_wrapper)"
+  author_identity="$(bootstrap::author_identity)"
+  if [ ! -x "$wrapper" ]; then
+    bootstrap::err "author gh wrapper missing or non-executable: $wrapper"
+    bootstrap::err "refusing to run GitHub write without token verification"
+    return 2
+  fi
+
+  # The shim refuses to exec gh if it cannot write the marker, which is
+  # what makes "marker absent" mean "gh did not run" unconditionally
+  # rather than "gh did not run, probably". A caller that could not
+  # record the boundary must not perform an unattributable write.
+  GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- \
+    sh -c '
+      if ! : >"$1"; then
+        echo "bootstrap: cannot write the author-gh trace marker $1 — refusing to run the write unrecorded" >&2
+        exit 70
+      fi
+      shift
+      exec gh "$@"
+    ' bootstrap-author-gh-traced "$reached_marker" "$@"
+}
+
 bootstrap::run_author_gh() {
   local label=$1
   shift
@@ -176,6 +261,151 @@ bootstrap::run_author_gh() {
   fi
 
   bootstrap::run "$label" env GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- gh "$@"
+}
+
+# The git flags that bind a GitHub-talking git command's credential to
+# the token scripts/gh-as-author.sh resolved and verified, instead of to
+# whatever the machine's ambient credential-helper configuration happens
+# to hold.
+#
+# `-c credential.helper=` clears every inherited helper (an empty value
+# RESETS the list, it does not append), and the second `-c` then makes
+# gh the only helper: `gh auth git-credential get` answers
+# `username=x-access-token` + `password=$GH_TOKEN` straight from the
+# environment, with no network call, no keychain and no prompt. `gh` is
+# named bare because git runs the helper through a shell and the
+# wizard's preflight already requires gh on PATH.
+#
+# This covers the HTTPS remote `gh repo create --source` writes by
+# default. If the operator's gh is configured for the ssh protocol the
+# remote is an ssh URL, no credential helper is consulted at all, and
+# the push authenticates by key — exactly as gh's own `--push` did, so
+# the split changes nothing there either.
+#
+# This is not a new mechanism — it is the one `gh` itself was using.
+# `gh repo create --source --push` performed its push through gh's
+# internal AuthenticatedCommand, which prepends these same two flags
+# before running git. Splitting the create from the push (#790) put the
+# credential wiring back where gh had had it.
+#
+# Exposed as a named array rather than typed inline at the call site
+# because tests exercise the REAL mechanism through it: a probe that
+# retyped the flags could keep passing while the shipped ones drifted.
+BOOTSTRAP_GIT_CREDENTIAL_ARGS=(
+  -c credential.helper=
+  -c 'credential.helper=!gh auth git-credential'
+)
+
+# Keep a credential miss non-interactive: an unattended bootstrap must
+# fail with a diagnosable error rather than block on a prompt nobody is
+# there to answer.
+#
+# GIT_ASKPASS is set EMPTY rather than left unset on purpose. git reads
+# core.askPass and then SSH_ASKPASS only when GIT_ASKPASS is absent from
+# the environment, and treats a present-but-empty value as "no askpass
+# program" — so setting it blank closes the GUI-prompt path that
+# GIT_TERMINAL_PROMPT=0 (which only suppresses the terminal prompt)
+# leaves open.
+BOOTSTRAP_GIT_NONINTERACTIVE_ENV=(
+  GIT_TERMINAL_PROMPT=0
+  GIT_ASKPASS=
+)
+
+# Run a git command that talks to GitHub under the same verified author
+# credential path as bootstrap::run_author_gh.
+#
+# A git push does not carry gh's authentication for free. Left to
+# itself, git takes its credential from the machine's ambient helper
+# state, which is not this bootstrap's identity: on a clean or
+# non-author machine the push fails or prompts, and on a machine where
+# some OTHER configured account has access it silently populates the new
+# repo's main under the wrong login. Author/reviewer separation exists
+# to make exactly that impossible, so a GitHub-writing git command gets
+# the same treatment as a GitHub-writing gh command — the wrapper
+# resolves and verifies the author token, and
+# $BOOTSTRAP_GIT_CREDENTIAL_ARGS points git's credential at it.
+#
+# The token stays out of argv, out of the remote URL and out of the
+# reflog: the helper hands it to git over the credential protocol on
+# stdin, and nothing rewrites the remote.
+#
+# Usage:
+#   bootstrap::run_author_git "push bootstrap commit" -C "$dir" push -u origin HEAD
+#
+# `git` itself and its credential flags are owned HERE, not by the
+# caller: `-c` is a top-level git option and must precede the
+# subcommand, which a caller-supplied argv cannot be relied on to
+# arrange. Callers pass everything after `git`, mirroring
+# bootstrap::run_author_gh, where `gh` is likewise implicit.
+bootstrap::run_author_git() {
+  local label=$1
+  shift
+  if [ "$#" -eq 0 ]; then
+    bootstrap::err "bootstrap::run_author_git requires git arguments after the label"
+    return 64
+  fi
+
+  set -- env "${BOOTSTRAP_GIT_NONINTERACTIVE_ENV[@]}" \
+         git "${BOOTSTRAP_GIT_CREDENTIAL_ARGS[@]}" "$@"
+
+  if [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ] || [ "${BOOTSTRAP_SKIP_AUTHOR_TOKEN:-0}" = "1" ]; then
+    bootstrap::run "$label" "$@"
+    return $?
+  fi
+
+  local wrapper author_identity
+  wrapper="$(bootstrap::author_wrapper)"
+  author_identity="$(bootstrap::author_identity)"
+  if [ ! -x "$wrapper" ]; then
+    bootstrap::err "author gh wrapper missing or non-executable: $wrapper"
+    bootstrap::err "refusing to run a GitHub write without token verification"
+    return 2
+  fi
+
+  bootstrap::run "$label" \
+    env GH_AS_AUTHOR_IDENTITY="$author_identity" "$wrapper" -- "$@"
+}
+
+# Append a captured diagnostic to $BOOTSTRAP_LOG_FILE, so the audit
+# trail holds the failing layer's OWN words rather than only the
+# caller's one-line summary of them.
+#
+# bootstrap::run logs the command line of every side-effect but not its
+# output, and the wizard installs no global stderr tee, so a call that
+# captured its stderr to inspect it leaves nothing behind once the
+# terminal scrollback is gone. That matters for the failures whose
+# remediation lives in the diagnostic itself (which token lookup failed,
+# which identity the byline pin expected) and which are read later, from
+# the sidecar, after a resume or during an audit.
+#
+# Usage:
+#   bootstrap::append_log_diagnostic <label> <file>
+#
+# Returns 0 iff the text was actually persisted, and non-zero otherwise
+# (no log file configured, nothing captured, or the append failed).
+# Callers MUST gate on that before telling an operator to look in the
+# log: a warning pointing at an entry that was never written is worse
+# than one that points nowhere, because it ends the search.
+#
+# Callers own what they hand over. This helper does not and cannot
+# redact, so a capture that could contain secret material must not be
+# passed to it — see the secret-set path in
+# scripts/bootstrap/github-infra.sh, which persists only the diagnostic
+# produced BEFORE anything in the pipeline could read the piped PAT.
+bootstrap::append_log_diagnostic() {
+  local label=$1 src=$2
+
+  if [ -z "${BOOTSTRAP_LOG_FILE:-}" ] || [ ! -s "$src" ]; then
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$BOOTSTRAP_LOG_FILE")" || return 1
+  {
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $label: captured output follows"
+    # Indent so the block reads as subordinate to its header and can
+    # never be mistaken for the log's own command lines.
+    sed 's/^/    /' "$src"
+  } >>"$BOOTSTRAP_LOG_FILE" || return 1
 }
 
 # Append a completed-stage name to the resume state file. Idempotent —
@@ -225,7 +455,24 @@ bootstrap::clear_warning() {
 
   local warnings_file="${BOOTSTRAP_STATE_FILE}.warnings"
   local tmp prefix
-  tmp=$(mktemp "${TMPDIR:-/tmp}/bootstrap-warnings.XXXXXX")
+  # An unchecked mktemp here DESTROYS the audit trail. With $TMPDIR
+  # missing, unwritable or full the assignment fails, `tmp` is empty, the
+  # rewrite loop's appends all fail, and `[ -s "" ]` is false — which
+  # lands on the "nothing survived the filter" branch and deletes
+  # $warnings_file outright. Every recorded failure in the run vanishes
+  # because a temp dir was full. Leave the sidecar untouched instead: a
+  # duplicate keyed record is a cosmetic defect in the summary, an erased
+  # one is the #734 silent-ship failure this sidecar exists to prevent.
+  #
+  # Returns 0 on that path on purpose. The two callers
+  # (bootstrap::record_warning, github-infra.sh's resolver) invoke this
+  # bare, so a non-zero return would abort them under `set -e` and lose
+  # the record they were about to write as well.
+  if ! tmp=$(mktemp "${TMPDIR:-/tmp}/bootstrap-warnings.XXXXXX" 2>/dev/null) \
+     || [ -z "$tmp" ]; then
+    bootstrap::warn "could not allocate a temp file under ${TMPDIR:-/tmp} to rewrite $warnings_file — leaving it untouched (records for key '$key' may now appear twice)"
+    return 0
+  fi
   prefix="@${key}	"
 
   while IFS= read -r line || [ -n "$line" ]; do
@@ -242,6 +489,66 @@ bootstrap::clear_warning() {
   fi
 }
 
+# --- resume checkpoints ----------------------------------------------------
+#
+# A stage records completion only when it finishes, which is correct: a
+# stage that aborted must be re-entered from the top by --resume. But a
+# stage can perform an IRREVERSIBLE step long before it finishes, and
+# re-entering then repeats a step that cannot be repeated — `gh repo
+# create` is the canonical case. A checkpoint is the missing record: it
+# says "this specific step already succeeded in this bootstrap", so the
+# re-entry can skip it and the wizard's preflight can tolerate the
+# artifact it left behind (#761 item 3).
+#
+# Checkpoints live in their own "${BOOTSTRAP_STATE_FILE}.checkpoints"
+# sidecar rather than in the state file, because bootstrap::last_completed_stage
+# reads the state file's LAST line — a checkpoint written there would be
+# mistaken for a completed stage and rejected as an unknown resume stage.
+#
+# Recording is idempotent: a repeat for the same name is a no-op, so
+# re-entering a checkpointed step never grows the file.
+#
+# NEVER written under --dry-run. A dry run performs no side effect, so a
+# checkpoint claiming otherwise would make a LATER live run skip a create
+# that never happened. (This is the one place the sidecars deliberately
+# diverge from bootstrap::record_stage / bootstrap::record_warning, which
+# both write in dry-run: those record what the wizard SAID, this records
+# what it DID.)
+#
+# Returns 0 ONLY when the checkpoint is recorded — already present, or
+# just appended — or when there is nothing to record because no state
+# file is configured or this is a dry run. A live write that does not
+# land (unwritable sidecar, full disk) returns non-zero, and the caller
+# standing between an irreversible step and everything after it MUST
+# check that. Its stage runs under `|| stage_rc=$?`, which disables
+# errexit for this whole call chain, so an unchecked call simply carries
+# on into the work the record was supposed to protect.
+#
+# The two writes are checked individually rather than left to the
+# function's last-command exit status: `mkdir -p` failing and the append
+# failing are both "the record did not land", and only an explicit
+# return says so for certain.
+bootstrap::record_checkpoint() {
+  local name=$1
+  if [ -z "${BOOTSTRAP_STATE_FILE:-}" ] || [ "${BOOTSTRAP_DRY_RUN:-0}" = "1" ]; then
+    return 0
+  fi
+  if bootstrap::has_checkpoint "$name"; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$BOOTSTRAP_STATE_FILE")" || return 1
+  printf '%s\n' "$name" >>"${BOOTSTRAP_STATE_FILE}.checkpoints" || return 1
+}
+
+bootstrap::has_checkpoint() {
+  local name=$1
+  if [ -z "${BOOTSTRAP_STATE_FILE:-}" ] \
+     || [ ! -f "${BOOTSTRAP_STATE_FILE}.checkpoints" ]; then
+    return 1
+  fi
+  grep -qxF "$name" "${BOOTSTRAP_STATE_FILE}.checkpoints"
+}
+
 # Echo the last recorded stage name, or empty string if the state
 # file is absent / empty. Used by --resume to skip already-completed
 # stages on a re-run.
@@ -250,4 +557,18 @@ bootstrap::last_completed_stage() {
     return 0
   fi
   tail -n 1 "$BOOTSTRAP_STATE_FILE" 2>/dev/null || true
+}
+
+# True iff <stage> appears in the state file, i.e. that stage ran to
+# completion at some point in this bootstrap. Unlike
+# bootstrap::last_completed_stage this asks about a SPECIFIC stage, which
+# is what `--resume <stage>` needs: the flag skips everything up to and
+# including the stage it names, so a name the state file never recorded
+# would skip work that was never done.
+bootstrap::stage_recorded() {
+  local name=$1
+  if [ -z "${BOOTSTRAP_STATE_FILE:-}" ] || [ ! -f "$BOOTSTRAP_STATE_FILE" ]; then
+    return 1
+  fi
+  grep -qxF "$name" "$BOOTSTRAP_STATE_FILE"
 }

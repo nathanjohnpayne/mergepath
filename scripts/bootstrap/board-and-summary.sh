@@ -440,17 +440,29 @@ bootstrap::_print_summary() {
   # this literal is the shared wire format (see its
   # $BOOTSTRAP_WARNING_RESOLVED_MARKER).
   #
-  # Classification is by POSITIVE match on that marker: only a line whose
-  # message starts with it is downgraded. Everything else — including any
-  # future or unrecognized line shape — stays a RECORDED FAILURE.
+  # Classification is by POSITIVE match on that marker AND on the record
+  # being KEYED: only a line of the exact shape "@<key><TAB>RESOLVED: …"
+  # is downgraded. Everything else — unkeyed records, and any future or
+  # unrecognized line shape — stays a RECORDED FAILURE.
+  #
+  # The keyed half is load-bearing, not decoration. Only
+  # bootstrap::_resolve_recorded_warning stamps the marker, and it always
+  # writes a keyed record (it exists to REPLACE the keyed line it just
+  # read). Testing the message field alone therefore matched something
+  # the producer can never emit: a pre-existing UNKEYED record whose
+  # message merely happens to start with "RESOLVED: " — bootstrap::record_warning
+  # persists an unkeyed message verbatim — was silently downgraded out of
+  # the !! RECORDED FAILURES block, which is the one place the operator is
+  # told a miss must be fixed before the first PR (#781 item 3).
   local warnings_outstanding="" warnings_resolved=""
   if [ -n "$state_file" ] && [ -s "${state_file}.warnings" ]; then
-    # Strip the "@<key><TAB>" prefix first so the marker test sees the
-    # message field for keyed and unkeyed records alike.
-    local warnings_messages
-    warnings_messages=$(sed 's/^@[^	]*	//' "${state_file}.warnings")
-    warnings_outstanding=$(printf '%s\n' "$warnings_messages" | grep -v '^RESOLVED: ' || true)
-    warnings_resolved=$(printf '%s\n' "$warnings_messages" | grep '^RESOLVED: ' || true)
+    # Classify on the RAW line so the "@<key><TAB>" prefix is part of the
+    # test, then strip that prefix for display.
+    local warnings_resolved_re='^@[^	]*	RESOLVED: '
+    warnings_outstanding=$(grep -v "$warnings_resolved_re" "${state_file}.warnings" \
+      | sed 's/^@[^	]*	//' || true)
+    warnings_resolved=$(grep "$warnings_resolved_re" "${state_file}.warnings" \
+      | sed 's/^@[^	]*	//' || true)
   fi
 
   {
