@@ -416,6 +416,23 @@ jobs:
         # via the sync-to-downstream.sh marker idiom.
         run: ./scripts/ci/check_doc_ownership
 
+      - name: check_branch_protection_audit
+        # Hub-only fleet branch-protection audit suite (#774): the
+        # --fleet loop in scripts/audit-branch-protection.sh plus the
+        # scheduled .github/workflows/branch-protection-audit.yml that
+        # calls it. Consumer checkouts SKIP inside the wrapper (script,
+        # workflow and suites are all hub-only). Parses YAML with
+        # mikefarah/yq — placed after install_yq_for_sync_manifest above,
+        # and the wrapper additionally self-bootstraps yq on CI (#616) so
+        # a step reshuffle cannot silently turn the suites into no-ops.
+        # Self-bootstrap guard: on the PR that INTRODUCES this check, the
+        # trusted default-branch tree has no such file yet, so the step
+        # would self-fail; soft-pass exit 0 when the script is absent.
+        # (The `run:` still carries an explicit
+        # `./scripts/ci/check_branch_protection_audit` wire, which is what
+        # check_ci_scripts_wired matches on.)
+        run: ./scripts/ci/check_branch_protection_audit || { rc=$?; if [ ! -f scripts/ci/check_branch_protection_audit ]; then echo "check_branch_protection_audit not on this tree yet — soft pass (self-bootstrap)"; exit 0; fi; exit "$rc"; }
+
       - name: check_project_doc_sync
         # Hub-only project-doc-sync regression suite (#642): PRD/spec
         # mirror drift detection, orphan sweeps, manifest validation, and

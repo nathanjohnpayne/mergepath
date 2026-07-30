@@ -238,6 +238,16 @@ echo "policy sim" >"$FAKE_MP/scripts/policy-sim.sh"
 # in 1c below).
 echo "canonical-mirror audit (hub-only)" >"$FAKE_MP/scripts/audit-canonical-mirrors.sh"
 echo "canonical-mirror audit test (hub-only)" >"$FAKE_MP/tests/test_audit_canonical_mirrors.sh"
+# #774 fleet branch-protection audit - hub-only SET (scheduled workflow +
+# auditor + both suites). Seeded here so the mirror can be asserted to
+# drop all four: the cron reads every sibling repo's protection under an
+# admin-scoped fleet secret a new repo does not have, so a bootstrapped
+# consumer that carried it would fail the run every Monday forever. The
+# scripts/ci wrapper deliberately stays (asserted in 1c below).
+echo "protection audit (hub-only)" >"$FAKE_MP/scripts/audit-branch-protection.sh"
+echo "protection audit test (hub-only)" >"$FAKE_MP/tests/test_audit_branch_protection.sh"
+echo "protection audit workflow test (hub-only)" >"$FAKE_MP/tests/test_audit_branch_protection_workflow.sh"
+echo "name: branch-protection-audit" >"$FAKE_MP/.github/workflows/branch-protection-audit.yml"
 # Sync-to-downstream orchestrator surface (engine + manifest + paired test +
 # cron driver) - mergepath-only; the engine + manifest are also the
 # consumer-vs-mergepath markers the propagated scripts/ci/check_* wrappers key
@@ -317,6 +327,7 @@ cp "$ROOT/scripts/ci/check_sync_manifest"         "$FAKE_MP/scripts/ci/check_syn
 cp "$ROOT/scripts/ci/check_sync_to_downstream"    "$FAKE_MP/scripts/ci/check_sync_to_downstream"
 cp "$ROOT/scripts/ci/check_export_consumer_facts" "$FAKE_MP/scripts/ci/check_export_consumer_facts"
 cp "$ROOT/scripts/ci/check_audit_canonical_mirrors" "$FAKE_MP/scripts/ci/check_audit_canonical_mirrors"
+cp "$ROOT/scripts/ci/check_branch_protection_audit" "$FAKE_MP/scripts/ci/check_branch_protection_audit"
 
 # git init so preflight check 6 (clean mergepath) passes.
 git -C "$FAKE_MP" init -q
@@ -384,6 +395,10 @@ for excluded in \
   'scripts/policy-sim.sh' \
   'scripts/audit-canonical-mirrors.sh' \
   'tests/test_audit_canonical_mirrors.sh' \
+  '.github/workflows/branch-protection-audit.yml' \
+  'scripts/audit-branch-protection.sh' \
+  'tests/test_audit_branch_protection.sh' \
+  'tests/test_audit_branch_protection_workflow.sh' \
   '.mergepath-sync.yml' \
   'scripts/sync-to-downstream.sh' \
   'tests/test_sync_to_downstream.sh' \
@@ -430,7 +445,12 @@ done
 #                                    + engine absent (#739 — the wrapper
 #                                    ships because repo_lint.yml wires it,
 #                                    while its script + test are excluded)
-for chk in check_sync_manifest check_sync_to_downstream check_export_consumer_facts check_audit_canonical_mirrors; do
+#   - check_branch_protection_audit: both suites absent + engine absent
+#                                    (#774 — same shape: the wrapper ships
+#                                    because repo_lint.yml wires it, while
+#                                    the scheduled workflow, the auditor and
+#                                    both suites are excluded)
+for chk in check_sync_manifest check_sync_to_downstream check_export_consumer_facts check_audit_canonical_mirrors check_branch_protection_audit; do
   if [ ! -f "$TARGET/scripts/ci/$chk" ]; then
     fail "$chk wrapper did not propagate into TARGET (scripts/ci/ kit)"
     continue

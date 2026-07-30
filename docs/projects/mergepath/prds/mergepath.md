@@ -3,7 +3,7 @@ generated_by: scripts/project-doc-sync.sh
 do_not_edit: true
 source_repo: nathanjohnpayne/docs
 source_path: projects/mergepath/prds/mergepath.md
-source_ref: 1cee969
+source_ref: a219367
 project: mergepath
 document_class: prd
 document_slug: mergepath
@@ -22,7 +22,7 @@ tags:
 
 **Author:** Nathan Payne
 **Status:** Approved — living document
-**Last Updated:** 2026-06-17
+**Last Updated:** 2026-07-01
 
 ---
 
@@ -34,7 +34,7 @@ This template provides a **deterministic repository standard** that keeps humans
 
 1. **Canonical documentation** that is the single source of truth
 2. **Binding structural constraints** enforced via CI
-3. **Multi-identity code review**, allowing agents to author and self-review under separate GitHub accounts, with a two-phase external-review model (Phase 4a automated via the Codex GitHub App, Phase 4b manual CLI fallback) and a HEAD-pinned merge-clearance gate that re-evaluates clearance on every push so a stale, earlier-HEAD approval can never carry a merge (#427/#428)
+3. **Multi-identity code review**, allowing agents to author and self-review under separate GitHub accounts, with a two-phase external-review model (Phase 4a automated via the Codex GitHub App, Phase 4b local reviewer-CLI handoff with manual fallback) and a HEAD-pinned merge-clearance gate that re-evaluates clearance on every push so a stale, earlier-HEAD approval can never carry a merge (#427/#428)
 4. **Drift prevention architecture** that consolidates instructions and prevents duplication
 5. **1Password-backed deploy and runtime secret handling** using per-project Firebase-vault SA keys for deploys, scoped service-account tokens for approved headless review workflows, and a portable 1Password Environments core with per-client agent adapters
 6. **Machine bootstrap automation** for onboarding new machines without storing secrets in git
@@ -163,7 +163,7 @@ This allows:
 - Agents to perform self-peer review by routing guarded writes through their reviewer identities
 - Internal review (agent → agent) and external review (agent → different agent)
 - Automated external review via CodeRabbit (advisory) and the ChatGPT Codex Connector GitHub App (Phase 4a)
-- A manual CLI fallback (Phase 4b) when the automated Codex path is unavailable or escalates
+- An automated local CLI handoff for Phase 4b that runs reviewer CLIs on individual subscription plans, posts through the verified reviewer wrapper, and falls back to the manual handoff on any doubt
 - Complete audit trails indistinguishable from multi-developer collaboration
 - Human tiebreaking when agents disagree
 
@@ -178,9 +178,83 @@ Review clearance is also enforced as a required, HEAD-pinned status check, not o
 
 Both gates follow the same narrow-start posture as `codex.p1_gate`: enabled in Mergepath first, then propagated to consumers.
 
+#### Automated Phase 4b Review Handoff
+
+Phase 4b no longer has to mean a human manually shuttles a diff between agent
+sessions. Mergepath defines an automated, local-only handoff path that can run
+the same external-agent review through the operator's installed reviewer CLIs:
+
+- A protected-path or above-threshold PR reaches Phase 4b after Phase 4a
+  fallback, escalation, or proactive `phase_4b_default` routing.
+- `scripts/phase-4b-review.sh` selects a reviewer identity that differs from
+  the PR's `Authoring-Agent:` line, invokes the matching local adapter, validates
+  the structured verdict, re-reads the live PR head, and posts the review through
+  `scripts/gh-as-reviewer.sh`.
+- `scripts/phase-4b/adapters/review-via-codex.sh` covers Claude-authored PRs by
+  running `codex exec --sandbox read-only --output-schema ...`; the Claude
+  direction uses `claude -p --permission-mode plan --output-format json`.
+- The adapters scrub pay-per-token API key variables and GitHub token variables
+  before launching the reviewer CLI. Reasoning runs on the operator's individual
+  Codex/ChatGPT or Claude Code plan login, never on metered API credentials, and
+  the reviewer CLI never receives direct GitHub write authority.
+- The orchestrator posts `APPROVED` or `CHANGES_REQUESTED` only after schema and
+  semantic validation. `APPROVED` cannot carry findings whose severity is
+  required by `feedback_policy` (#574): absent policy means P0/P1 block approval;
+  `mode: address-all` means any finding blocks automated approval.
+- Any adapter error, timeout, invalid verdict, unsupported reviewer, stale-head
+  readback, or disabled config exits fail-closed to the manual Phase 4b handoff.
+
+The shipped posture is disabled-by-default. Merging the automation package
+changes no live review behavior until a small follow-up PR flips
+`phase_4b_automation.enabled: true` in `.github/review-policy.yml`.
+
+```mermaid
+flowchart TD
+    A["Threshold or protected-path PR"] --> B["Phase 4a Codex App review"]
+    B -->|clears| C["phase-4b-classifier / phase_4b_default"]
+    B -->|timeout or unavailable| D["Phase 4b required"]
+    C -->|not complex| M["Merge gate + conversation gate"]
+    C -->|complex / always| D
+    D --> E{"phase_4b_automation.enabled?"}
+    E -->|false| H["Manual handoff comment + chat-side handoff"]
+    E -->|true| O["scripts/phase-4b-review.sh"]
+    O --> S["select reviewer != author"]
+    S --> R{"reviewer adapter"}
+    R -->|nathanpayne-codex| X["codex exec, read-only, plan login"]
+    R -->|nathanpayne-claude| Y["claude -p, plan mode, plan login"]
+    X --> V["schema + feedback_policy verdict validation"]
+    Y --> V
+    V -->|valid CHANGES_REQUESTED| CR["post changes requested via gh-as-reviewer"]
+    V -->|valid APPROVED| G["re-read live PR head"]
+    V -->|invalid / timeout / error| H
+    G -->|head changed| H
+    G -->|head matches| AP["post APPROVED via gh-as-reviewer"]
+    AP --> M
+```
+
+Live validation on PR #580 exercised the feature on a large, protected-path PR
+before enabling it. The final current-head pass (`d05ff4d`) produced:
+
+| Path | Outcome | Turnaround | Token metadata |
+|---|---:|---:|---:|
+| Codex adapter, direct | `APPROVED` | 18s | `token_count=55926` |
+| Codex adapter via orchestrator dry-run | `APPROVED`; would post as `nathanpayne-codex` | 65s | `token_count=113918` |
+| Claude adapter, direct | `APPROVED` with advisory follow-ups filed separately | 66s | `total=7360` (`input=1589`, `output=5771`) |
+| Claude reverse-direction orchestrator dry-run | Fail-closed because approval carried findings | 76s | CLI-dependent |
+
+The same exchange also captured the operational turnaround for a real large PR:
+from the first PR automation comment on 2026-07-01 00:20:33 UTC to squash merge
+on 2026-07-01 06:12:52 UTC, PR #580 took about 5h52m wall time. That window
+included CodeRabbit, Claude, and Codex review rounds; real CLI adapter
+validation; branch fixes for P1 and advisory findings; post-review issue filing;
+review-thread cleanup; auto-clearing `needs-external-review`; and merge through
+the author wrapper. The PR evidence comments remain the durable record for the
+raw adapter verdicts, token metadata when exposed by the CLIs, and dry-run
+posting behavior.
+
 ### 4. CI Enforcement of Standards
 
-A large suite of validation checks (45 wired `scripts/ci/check_*` steps — 46 on disk, with `check_op_firebase_deploy_integration` the one intentionally `WIRED-EXEMPT` — plus two inline steps) runs on every commit via `repo_lint.yml`. A meta-check, `check_ci_scripts_wired`, fails the build if any `scripts/ci/check_*` script on disk is not wired into `repo_lint.yml` as an explicit `run:` step (or carries a documented `# WIRED-EXEMPT` comment), so the on-disk list and the executable list cannot silently diverge; it prints the live tally (`46 check_* scripts, all wired or exempt`), the authoritative count this paragraph tracks. The structural core:
+A large suite of validation checks (48 `scripts/ci/check_*` scripts as of v1.5, all wired or intentionally `WIRED-EXEMPT`, plus two inline steps) runs on every commit via `repo_lint.yml`. A meta-check, `check_ci_scripts_wired`, fails the build if any `scripts/ci/check_*` script on disk is not wired into `repo_lint.yml` as an explicit `run:` step (or carries a documented `# WIRED-EXEMPT` comment), so the on-disk list and the executable list cannot silently diverge. The structural core:
 
 - `check_required_root_files` — all canonical docs exist
 - `check_no_tool_folder_instructions` — tool folders contain no duplicated behavioral rules
@@ -191,7 +265,7 @@ A large suite of validation checks (45 wired `scripts/ci/check_*` steps — 46 o
 
 `repo_lint.yml` also includes two inline (non-`scripts/ci`) steps: `check_review_policy_exists`, which verifies `.github/review-policy.yml` and `REVIEW_POLICY.md` both exist, and `check_governance_files`, which verifies `SECURITY.md`, `.github/CODEOWNERS`, and `.github/dependabot.yml` all exist.
 
-Plus the review/automation surface checks: `check_codex_scripts`, `check_codex_p1_gate`, `check_merge_clearance_gate`, `check_gh_as_author`, `check_no_bare_gh_writes`, `check_disagreement_detector`, `check_pr_audit_codex_clearance`, `check_pr_audit_sync_exemption`, `check_resolve_pr_threads`, `check_phase_4b_classifier`, `check_op_preflight_contract`, `check_onepassword_headless_proof_workflow`, `check_daily_feedback_rollup`, `check_workflow_parsers`, `check_auto_clear_workflow`, `check_coderabbit_config` / `check_coderabbit_config_tests` / `check_coderabbit_wait`, `check_eslint_config_present` / `check_eslint_config_policy`, and `check_mktemp_portability`; the sync/propagation checks `check_sync_manifest`, `check_sync_overrides`, `check_verify_propagation_pr`, `check_workflow_verify_propagation_templated`, `check_propagation_lane_audit`, `check_template_substitution`, `check_export_consumer_facts`, and `check_sweep_unresolved_feedback`; the bootstrap suite (`check_bootstrap_sh`, `check_bootstrap_wizard`, `check_bootstrap_template_mirror`, `check_bootstrap_github_infra`, `check_bootstrap_firebase_and_codereview`, `check_bootstrap_board_and_summary`); and regression-pinning checks named for the bug class they preserve (`check_canonical_bugs_*`). `check_op_firebase_deploy_integration` ships on disk but is intentionally `WIRED-EXEMPT` — an opt-in, local-only resolver smoke test gated on `MERGEPATH_RUN_INTEGRATION=1`. Each script-backed `scripts/ci/check_*` wrapper is fail-closed around a `tests/test_*.sh` suite; a missing test script is a hard error, not a silent skip. `.github/workflows/repo_lint.yml` is the executable source of truth for which checks run; `rules/repo_rules.md` § CI Enforcement and `scripts/ci/README.md` summarize them and must be kept in lockstep with it.
+Plus the review/automation surface checks: `check_codex_scripts`, `check_codex_p1_gate`, `check_merge_clearance_gate`, `check_gh_as_author`, `check_no_bare_gh_writes`, `check_disagreement_detector`, `check_pr_audit_codex_clearance`, `check_pr_audit_sync_exemption`, `check_resolve_pr_threads`, `check_phase_4b_classifier`, `check_phase_4b_automation`, `check_op_preflight_contract`, `check_onepassword_headless_proof_workflow`, `check_daily_feedback_rollup`, `check_workflow_parsers`, `check_auto_clear_workflow`, `check_session_finalization`, `check_coderabbit_config` / `check_coderabbit_config_tests` / `check_coderabbit_wait`, `check_eslint_config_present` / `check_eslint_config_policy`, and `check_mktemp_portability`; the sync/propagation checks `check_sync_manifest`, `check_sync_overrides`, `check_sync_to_downstream`, `check_verify_propagation_pr`, `check_workflow_verify_propagation_templated`, `check_propagation_lane_audit`, `check_template_substitution`, `check_export_consumer_facts`, and `check_sweep_unresolved_feedback`; the bootstrap suite (`check_bootstrap_sh`, `check_bootstrap_wizard`, `check_bootstrap_template_mirror`, `check_bootstrap_github_infra`, `check_bootstrap_firebase_and_codereview`, `check_bootstrap_board_and_summary`); and regression-pinning checks named for the bug class they preserve (`check_canonical_bugs_*`). `check_op_firebase_deploy_integration` ships on disk but is intentionally `WIRED-EXEMPT` — an opt-in, local-only resolver smoke test gated on `MERGEPATH_RUN_INTEGRATION=1`. Each script-backed `scripts/ci/check_*` wrapper is fail-closed around a `tests/test_*.sh` suite; a missing test script is a hard error, not a silent skip. `.github/workflows/repo_lint.yml` is the executable source of truth for which checks run; `rules/repo_rules.md` § CI Enforcement and `scripts/ci/README.md` summarize them and must be kept in lockstep with it.
 
 ### Source of Truth and Versioning
 
@@ -235,7 +309,9 @@ companion manifest separate from `.mergepath-sync.yml`. The existing
 `.mergepath-sync.yml` system continues to govern canonical, kit, and templated
 Mergepath propagation to downstream consumers; `.mergepath-project-docs.yml`
 governs cross-repo PRD/spec mirrors between `nathanjohnpayne/docs` and each
-owning repo.
+owning repo. The `scripts/project-doc-sync.sh` engine reads this manifest to
+materialize each generated mirror and stamps it with a `generated_by` /
+`source_repo` / `source_path` / `source_ref` provenance header.
 
 The normalized owning-repo layout is:
 
@@ -593,10 +669,11 @@ Beyond the named helpers above, the review/merge automation surface includes:
 | `codex-p1-gate.sh` | Codex P1 unresolved-thread merge gate body (run by `codex-p1-gate.yml`) |
 | `disagreement-detector.cjs` | Shared decision module for `agent-review.yml`'s `detect-disagreement` job (workflow `require()`s it so live job and tests share one implementation) |
 | `identity-check.sh` | Verifies the effective `gh`/token identity (`--expect-token-identity`); used by the author/reviewer write wrappers |
+| `phase-4b-review.sh` | Automated Phase 4b orchestrator: select external reviewer, run local reviewer CLI adapter, validate verdict, post via reviewer wrapper, or fail closed to manual handoff |
 | `post-phase-4b-handoff.sh` | Posts the Phase 4b external-review handoff comment |
 | `daily-feedback-rollup.sh` | Body of `daily-feedback-rollup.yml` — summarizes unresolved/resolved review feedback |
 | `policy-sim.sh` | Replays the repo's recent merged PRs through the Mergepath Playground for offline policy tuning |
-| `audit-branch-protection.sh` | Audits branch-protection posture across repos |
+| `audit-branch-protection.sh` | Audits branch-protection posture across repos; `--fleet` sweeps the hub plus every manifest consumer on its own default branch, and is run weekly by `branch-protection-audit.yml` (#774) |
 | `audit-propagation-lane.sh` | Offline regression net for the propagation-PR review lane's per-consumer preconditions (#434) |
 | `onepassword-headless-proof-setup.sh` | Provisions the scoped service-account proof path exercised by `onepassword-headless-proof.yml` |
 | `admin-merge-codeowners-blocked.sh` | Break-glass admin merge for CODEOWNERS-blocked PRs |
@@ -633,6 +710,7 @@ GitHub-specific workflows and configuration.
 | `daily-feedback-rollup.yml` | Daily schedule, manual | Summarize unresolved/resolved review feedback | rollup |
 | `pr-audit.yml` | Weekly schedule | Generate audit report of all PRs and reviews from the week | (generates weekly audit summary) |
 | `weekly-drift-audit.yml` | Weekly schedule, manual | Audit downstream consumer drift from Mergepath canonical paths | audit |
+| `branch-protection-audit.yml` | Weekly schedule, `repository_dispatch` | Audit fleet branch protection against the canonical required checks (#774); rolls findings into one labelled issue and closes it on a clean run | audit |
 | `weekly-feedback-sweep.yml` | Weekly schedule, manual | Sweep unresolved review feedback across target repos | sweep, notify-on-failure |
 
 #### `.github/review-policy.yml`
@@ -683,13 +761,26 @@ codex:
 dependabot:
   reviewer_gate:                         # HEAD-pinned reviewer-APPROVED gate for Dependabot PRs (#427)
     enabled: true
+feedback_policy:                         # Review finding disposition policy (#574)
+  mode: by-priority
+  priorities:
+    p0: required
+    p1: required
+    p2: discretionary
+    p3: discretionary
+    nitpick: discretionary
 phase_4b_default: complex-changes
+phase_4b_automation:                    # Automated local CLI handoff (#579)
+  enabled: false                         # disabled until explicitly enabled by follow-up PR
+  mode: local
+  max_review_rounds: 2
+  fail_closed: true
 auto_clear_labels:
   scheduled_sweep_enabled: true
   scheduled_sweep_interval_minutes: 5
 ```
 
-The `codex.external_review_gate` and `dependabot.reviewer_gate` blocks back the `merge-clearance-gate.yml` required check (see § Multi-Identity Code Review System → Merge-Clearance Gate). `codex.ack_wait_seconds` / `max_ack_retries` cover the Codex 👀 eyes-acknowledgment on the `@codex review` trigger comment (#419); `reaction_freshness_window_seconds` bounds how old a Codex 👍 may be and still count as clearance. This block is illustrative — the live `.github/review-policy.yml` carries fuller inline documentation for each knob.
+The `codex.external_review_gate` and `dependabot.reviewer_gate` blocks back the `merge-clearance-gate.yml` required check (see § Multi-Identity Code Review System → Merge-Clearance Gate). `codex.ack_wait_seconds` / `max_ack_retries` cover the Codex 👀 eyes-acknowledgment on the `@codex review` trigger comment (#419); `reaction_freshness_window_seconds` bounds how old a Codex 👍 may be and still count as clearance. `feedback_policy` controls which finding severities must be fixed or rebutted before an automated approval can clear, and `phase_4b_automation` controls whether the local reviewer-CLI handoff is active. This block is illustrative — the live `.github/review-policy.yml` carries fuller inline documentation for each knob.
 
 #### `.github/copilot-instructions.md`
 
@@ -1127,7 +1218,7 @@ test_globs:
 The current repo also enforces helper and workflow behavior that sits above the
 structural core:
 
-- `check_codex_scripts`, `check_codex_p1_gate`, `check_disagreement_detector`, `check_pr_audit_codex_clearance`, `check_resolve_pr_threads`, `check_phase_4b_classifier`, and `check_auto_clear_workflow` keep the Phase 4 review automation and label-clearing path executable and tested.
+- `check_codex_scripts`, `check_codex_p1_gate`, `check_disagreement_detector`, `check_pr_audit_codex_clearance`, `check_resolve_pr_threads`, `check_phase_4b_classifier`, `check_phase_4b_automation`, and `check_auto_clear_workflow` keep the Phase 4 review automation and label-clearing path executable and tested.
 - `check_gh_as_author` verifies the author-write wrapper and PR guard that prevent wrong-identity PR creation.
 - `check_coderabbit_config` and `check_coderabbit_config_tests` keep CodeRabbit YAML valid and, in the Mergepath template repo, enforce `reviews.profile: chill`.
 - `check_eslint_config_present` and `check_eslint_config_policy` enforce the flat-config ESLint rule only for repos with a root `package.json`; Mergepath itself is shell-only at the root and passes via the documented exemption.
@@ -1594,7 +1685,7 @@ All review rounds are captured as GitHub PR comments and commits, creating an au
 
 After internal review passes, CodeRabbit provides an independent automated review:
 
-1. **Wait for CodeRabbit.** CodeRabbit automatically posts a review when the PR is opened or updated. Prefer `scripts/coderabbit-wait.sh <PR#>` over ad-hoc polling. It anchors clearance to the current HEAD, handles CodeRabbit rate-limit retry comments, and returns explicit statuses: `0` cleared, `2` findings, `4` grace-window timeout, `5` rate-limit stalled. Timeout is advisory; rate-limit stalled requires human attention.
+1. **Wait for CodeRabbit.** CodeRabbit automatically posts a review when the PR is opened or updated. Prefer `scripts/coderabbit-wait.sh <PR#>` over ad-hoc polling. It anchors clearance to the current HEAD, handles CodeRabbit rate-limit retry comments, and returns explicit statuses: `0` cleared, `2` findings, `4` grace-window timeout, `5` rate-limit stalled. Timeout is advisory. On a rate-limit stall, when `coderabbit.codex_failover_on_rate_limit: true` (the default) and Codex is enabled, the helper fires a single HEAD-pinned `@codex review` (`scripts/codex-review-request.sh --trigger-only`) so the PR advances via Codex instead of idling on CodeRabbit's hourly allowance, and the `5` status then carries `codex_failover_requested: true` (#489); a stall with the failover off or unavailable still requires human attention.
 2. **Read both API endpoints.** CodeRabbit posts two types of comments that must both be checked:
    - PR-level summary: `gh api repos/{owner}/{repo}/issues/{pr_number}/comments`
    - Inline review comments on the diff: `gh api repos/{owner}/{repo}/pulls/{pr_number}/comments`
@@ -1651,22 +1742,23 @@ Phase 4 splits into an automated path (4a) and a manual fallback (4b). `REVIEW_P
 **Phase 4a — Automated (preferred).** Applies when `codex.enabled: true`, both `scripts/codex-review-request.sh` and `scripts/codex-review-check.sh` exist, and the ChatGPT Codex Connector GitHub App is **review-ready** on the repo (installed + Code Review enabled + a Codex environment configured — "installed" alone is not sufficient).
 
 12a. `scripts/codex-review-request.sh` posts `@codex review` (or relies on the auto-review) and polls for a response from `chatgpt-codex-connector[bot]`.
-13a. The agent addresses each P0/P1 inline finding — fix + push, or post a rebuttal reply. P2/P3 are addressed at the agent's judgment and do not block clearance.
-14a. The loop re-runs until Codex clears (a `COMMENTED` review with no unaddressed P0/P1 on the current HEAD, or a 👍 reaction on the PR issue). Disagreement (repeat-after-rebuttal) or runaway (round counter exceeds `codex.max_review_rounds`) escalates to the human; a response timeout (exit code 4) drops to Phase 4b.
+13a. The agent addresses each finding required by `feedback_policy` (#574) — fix + push, or post a rebuttal reply. With the absent-block default, P0/P1 are required and P2/P3 are discretionary; `mode: address-all` requires a disposition for every finding.
+14a. The loop re-runs until Codex clears (a `COMMENTED` review with no unaddressed policy-required findings on the current HEAD, or a 👍 reaction on the PR issue). Disagreement (repeat-after-rebuttal) or runaway (round counter exceeds `codex.max_review_rounds`) escalates to the human; a response timeout (exit code 4) drops to Phase 4b.
 15a. `scripts/codex-review-check.sh` verifies the merge gate: CI green, gate (b) — a cross-agent internal `APPROVED` *or* the same-agent fallback (Codex 👍 substituting for the no-self-approve case), and gate (c) — Codex cleared on the current HEAD *or* a Phase 4b substitute `APPROVED`. The gate never requires an `APPROVED` review *state* from the Codex bot — the App never emits one.
 16a. The `phase_4b_default` config field (`fallback-only` / `complex-changes` / `always`) drives whether `scripts/phase-4b-classifier.sh` runs as a checkpoint before merge.
 17a. On a clean gate, `nathanjohnpayne` merges via `scripts/gh-as-author.sh -- gh pr merge …`.
 
-**Phase 4b — Manual CLI fallback.** Applies when 4a is unavailable (Codex disabled, a helper script missing, the App not review-ready) or 4a fell back/escalated.
+**Phase 4b — Local reviewer-CLI handoff, with manual fallback.** Applies when 4a is unavailable (Codex disabled, a helper script missing, the App not review-ready), 4a fell back/escalated, or `phase_4b_default` proactively routes a complex PR to external CLI review.
 
-12b. The originating agent posts a handoff message (format below) as a PR comment and alerts the human.
-13b. The human takes the handoff to a different agent CLI session (typically `nathanpayne-codex`), which posts an external review.
-14b. The originating agent, as `nathanjohnpayne`, addresses feedback via fix commits.
-15b. The loop repeats until the external reviewer submits an `APPROVED` review on the current HEAD with no unaddressed P0/P1. That `APPROVED` is the Phase 4b *substitute clearance* the merge gate accepts for gate (c).
-16b. If the external reviewer flags observations or risks, file post-merge GitHub Issues for each (labels: `post-review`, `observation`/`risk`).
-17b. `nathanjohnpayne` merges via `scripts/gh-as-author.sh`.
+12b. If `phase_4b_automation.enabled: true`, `scripts/phase-4b-review.sh` selects a reviewer identity that differs from the authoring agent and invokes the matching adapter (`review-via-codex.sh` or `review-via-claude.sh`). The adapters run read-only against local plan-authenticated reviewer CLIs and emit a schema-valid `{verdict, summary, findings[], usage}` object.
+13b. The orchestrator rejects invalid verdicts, approvals with policy-required findings, missing reviewer adapters, reviewer CLI timeouts, and stale-head conditions. For real posts, it uses the pull-review API through `scripts/gh-as-reviewer.sh` with `commit_id` set to the reviewed head, then verifies the created review response is pinned to the same SHA.
+14b. If the verdict is `CHANGES_REQUESTED`, the originating agent, as `nathanjohnpayne`, addresses feedback via fix commits and reruns the handoff on the new HEAD.
+15b. If the verdict is `APPROVED`, the posted review is the Phase 4b substitute clearance the merge gate accepts for gate (c), provided the pre-merge conversation gate is also clean.
+16b. If automation is disabled or any doubt remains, the system falls back to the old manual handoff: the originating agent posts the handoff message, the human takes it to a different agent CLI session, and the external reviewer posts the review manually.
+17b. If the external reviewer flags observations or risks, file post-merge GitHub Issues for each (labels: `post-review`, `observation`/`risk`).
+18b. `nathanjohnpayne` merges via `scripts/gh-as-author.sh`.
 
-**Supporting tooling.** `scripts/coderabbit-wait.sh` anchors CodeRabbit clearance on the HEAD committer date and handles the platform's non-auto-retrying rate-limit state. `scripts/resolve-pr-threads.sh` clears resolved bot threads (branch protection requires every review thread resolved before merge). `scripts/request-label-removal.sh` is the agent-safe path for clearing the human-action labels (`needs-external-review`, `needs-human-review`, `policy-violation`) the agent is prohibited from removing directly; `human-hold` is stricter — agents may add it to freeze a PR, but only a human may remove it. The `auto-clear-blocking-labels.yml` workflow removes `needs-external-review` automatically once the merge gate clears, and never removes `human-hold`. The `codex-p1-gate.yml` workflow (started narrow in Mergepath only) blocks merge on unresolved Codex P1 findings. The `merge-clearance-gate.yml` workflow (required check `Merge clearance gate`, #427/#428) is the HEAD-pinned merge block for the external-review gate and the Dependabot reviewer gate: it re-checks reviewer-`APPROVED` plus Codex / Phase-4b clearance on the current HEAD and cannot be satisfied by a stale earlier-HEAD approval or a removed label. The `detect-disagreement` job in `agent-review.yml` applies `needs-human-review` only on a *live* disagreement — latest-non-dismissed review per reviewer, scoped to the current HEAD — so a stale round-1 `CHANGES_REQUESTED` superseded by a later `APPROVED` does not false-positive.
+**Supporting tooling.** `scripts/coderabbit-wait.sh` anchors CodeRabbit clearance on the HEAD committer date and handles the platform's non-auto-retrying rate-limit state — including a time-boxed, auto-reverting CodeRabbit→Codex failover (`coderabbit.codex_failover_on_rate_limit`, #489) that requests `@codex review` when CodeRabbit is rate-limited so the PR advances rather than dead-ending on exit 5. `scripts/resolve-pr-threads.sh` clears resolved bot threads (branch protection requires every review thread resolved before merge). `scripts/request-label-removal.sh` is the agent-safe path for clearing the human-action labels (`needs-external-review`, `needs-human-review`, `policy-violation`) the agent is prohibited from removing directly; `human-hold` is stricter — agents may add it to freeze a PR, but only a human may remove it. The `auto-clear-blocking-labels.yml` workflow removes `needs-external-review` automatically once the merge gate clears, and never removes `human-hold`. The `codex-p1-gate.yml` workflow (started narrow in Mergepath only, generalized by #574) blocks merge on unresolved Codex findings in policy-required tiers. The `check_phase_4b_automation` repo-lint check keeps the automated handoff package executable, schema-valid, plan-auth constrained, timeout bounded, token-scrubbed, and fail-closed. The `merge-clearance-gate.yml` workflow (required check `Merge clearance gate`, #427/#428) is the HEAD-pinned merge block for the external-review gate and the Dependabot reviewer gate: it re-checks reviewer-`APPROVED` plus Codex / Phase-4b clearance on the current HEAD and cannot be satisfied by a stale earlier-HEAD approval or a removed label. The `detect-disagreement` job in `agent-review.yml` applies `needs-human-review` only on a *live* disagreement — latest-non-dismissed review per reviewer, scoped to the current HEAD — so a stale round-1 `CHANGES_REQUESTED` superseded by a later `APPROVED` does not false-positive.
 
 ### Handoff Message Format
 
@@ -2254,7 +2346,10 @@ than every editor-specific file in the repository.
 | `scripts/codex-review-request.sh` | Bash | Trigger/poll Codex App review | Phase 4a |
 | `scripts/codex-review-check.sh` | Bash | Verify CI, reviewer, Codex/Phase 4b merge gates | Before label clear/merge |
 | `scripts/phase-4b-classifier.sh` | Bash | Decide whether complex-change PRs need proactive Phase 4b | After Phase 4a clearance |
+| `scripts/phase-4b-review.sh` | Bash | Run automated local Phase 4b handoff, post verified reviewer verdict, or fail closed to manual handoff | Phase 4b |
+| `scripts/phase-4b/adapters/` | Bash | Direction-specific Codex/Claude reviewer CLI adapters and verdict schema | Phase 4b |
 | `scripts/sync-to-downstream.sh` | Bash | Audit or propagate canonical/kit/templated paths to consumers | Manual or scheduled propagation |
+| `scripts/project-doc-sync.sh` | Bash | Materialize central↔repo PRD/spec mirrors with provenance headers | Manual or scheduled project-doc sync |
 | `scripts/op-preflight.sh` | Bash | Front-load 1Password reads / SSH warming; cache reviewer PAT + deploy creds | Session start (review/deploy) |
 | `scripts/gcloud/gcloud` | Bash | Local wrapper for gcloud commands | When developer runs `gcloud` |
 | `scripts/firebase/op-firebase-deploy` | Bash | Deploy Firebase with the canonical SA-key-first credential chain and isolated Firebase CLI configstore | Manual deploy or CI |
@@ -2273,7 +2368,7 @@ than every editor-specific file in the repository.
 | `scripts/daily-feedback-rollup.sh` | Bash | Summarize unresolved/resolved review feedback | `daily-feedback-rollup.yml` |
 | `scripts/sweep-unresolved-feedback/*` | Bash | Enumerate + render the weekly unresolved-feedback sweep | `weekly-feedback-sweep.yml` |
 | `scripts/audit-propagation-lane.sh` | Bash | Regression-audit the propagation-PR review lane preconditions | `weekly-drift-audit.yml` / manual |
-| `scripts/audit-branch-protection.sh` | Bash | Audit branch-protection posture across repos | Manual / periodic |
+| `scripts/audit-branch-protection.sh` | Bash | Audit branch-protection posture across repos (`--fleet` sweeps hub + consumers) | `branch-protection-audit.yml` (weekly) / manual |
 | `scripts/policy-sim.sh` | Bash | Replay recent merged PRs through the Playground | Manual policy tuning |
 | `scripts/worktree-cleanup.sh` | Bash | Prune stale `.claude/worktrees/` worktrees | Manual / periodic |
 | `scripts/bootstrap/*` | Bash | New-repo wizard stage implementations | Inside `bootstrap-new-repo.sh` |
@@ -2293,6 +2388,7 @@ than every editor-specific file in the repository.
 | `pr-audit.yml` | Weekly schedule | Generate audit report |
 | `daily-feedback-rollup.yml` | Daily schedule, manual | Roll up unresolved and resolved review feedback |
 | `weekly-drift-audit.yml` | Weekly schedule, manual | Audit downstream drift from Mergepath |
+| `branch-protection-audit.yml` | Weekly schedule, `repository_dispatch` | Audit fleet branch protection against the canonical required checks (#774) |
 | `weekly-feedback-sweep.yml` | Weekly schedule, manual | Sweep unresolved review feedback |
 
 ---
@@ -2305,10 +2401,43 @@ The template is both a reference implementation (copy it to start a new repo) an
 
 ---
 
-**Document Version:** 1.3
+**Document Version:** 1.5
 **Reference implementation:** `mergepath` (current main)
-**Last Reviewed:** 2026-06-17
+**Last Reviewed:** 2026-07-01
 
+> **Changelog (v1.5, 2026-07-01):** Documented the automated Phase 4b
+> reviewer-CLI handoff (#579): disabled-by-default `phase_4b_automation`,
+> plan-only Codex/Claude CLI adapters, token scrubbing, pinned review API
+> posting, feedback-policy-aware approval semantics (#574), fail-closed manual
+> fallback, the `check_phase_4b_automation` repo-lint guard, and live
+> turnaround evidence from PR #580 on a large protected-path change.
+>
+> ```mermaid
+> sequenceDiagram
+>     participant A as Authoring agent
+>     participant O as phase-4b-review.sh
+>     participant R as Reviewer CLI
+>     participant G as gh-as-reviewer.sh
+>     participant P as GitHub PR
+>     A->>O: PR number, author agent, reviewed head
+>     O->>R: diff on stdin, read-only plan-auth review
+>     R-->>O: schema-valid verdict JSON
+>     O->>O: enforce feedback_policy and head freshness
+>     O->>G: create pull review with commit_id=head
+>     G->>P: APPROVED or CHANGES_REQUESTED under reviewer identity
+>     P-->>O: created review commit_id
+>     O->>O: verify created review is pinned
+> ```
+
+> **Changelog (v1.4, 2026-06-18):** Post-closure sync after the
+> non-propagation backlog cleared (#489 and #513 landed via #512). Refreshed
+> the wired CI-check count to 45 wired / 46 on disk and added
+> `check_session_finalization` and `check_sync_to_downstream` to the inventory;
+> documented the CodeRabbit→Codex rate-limit failover
+> (`coderabbit.codex_failover_on_rate_limit`, #489); and recorded the
+> `scripts/project-doc-sync.sh` project-documentation mirror engine (#509) in
+> the sync contract and the script appendix.
+>
 > **Changelog (v1.3, 2026-06-17):** Synced the PRD with `main` after a
 > drift audit. Added the HEAD-pinned merge-clearance gate (#427/#428),
 > Codex eyes-acknowledgment and reaction-freshness handling (#419),
