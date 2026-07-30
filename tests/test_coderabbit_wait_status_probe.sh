@@ -180,6 +180,19 @@ case "$endpoint" in
   repos/owner/repo/issues/999/timeline)
     printf '[]\n'
     ;;
+  repos/owner/repo/commits/head-sha/statuses)
+    # #814 matrix: the StatusContext surface. CODERABBIT_TEST_STATUS selects
+    # the CodeRabbit context state so the sweep can drive the
+    # trust_status_context_for_clearance path, which the hand-written cases
+    # below never exercise.
+    case "${CODERABBIT_TEST_STATUS:-absent}" in
+      success|failure|pending)
+        printf '[{"context":"CodeRabbit","state":"%s","created_at":"%s","creator":{"login":"%s"}}]\n' \
+          "${CODERABBIT_TEST_STATUS}" "$head_time" "$bot"
+        ;;
+      *) printf '[]\n' ;;
+    esac
+    ;;
   repos/owner/repo/pulls/999/reviews)
     case "$scenario" in
       review_arrives_during_probe)
@@ -733,25 +746,63 @@ test_probe_paused_is_not_yet_never_skipped() {
   assert_probe_not_yet "$dir" "$rc" paused "auto-pause NOTE with a 0 resume budget (must be 7, never 6)"
 }
 
-test_probe_in_progress_is_not_yet() {
-  local dir rc
-  dir=$(make_case probe-inprogress 600 true 30 3 2)
-  rc=$(run_probe_case "$dir" probe_in_progress)
-  assert_probe_not_yet "$dir" "$rc" in_progress "review-in-progress notice"
-}
-
-test_probe_status_probe_narration_is_not_yet() {
-  # latest_comment_from_issue_comments drops narration via
-  # `select(status_probe_reply | not)` BEFORE classify_comment sees it, so
-  # `observed` is `none`, not `status_probe` — asserting the latter would
-  # assert a reachability this surface does not have. The outcome is still
-  # the one the barrier needs: narration never reads as a report. Probe
-  # mode keeps its status_probe arm as defensive symmetry in case the
-  # scanner filter and classify_comment ever diverge.
-  local dir rc
-  dir=$(make_case probe-narration 600 true 30 3 2)
-  rc=$(run_probe_case "$dir" probe_narration)
-  assert_probe_not_yet "$dir" "$rc" none "a status-probe narration reply is filtered out, so HEAD reads as nothing-yet (never clearance)"
+# Sweep the state space CodeRabbit can actually present, rather than the
+# arms this change happens to guard. The dimensions come from the script's
+# own documented surfaces — the StatusContext state, whether the policy
+# trusts it, and every class classify_comment can return — so a probe arm
+# that was never written is a FAILURE here, not a silent gap. The
+# hand-written cases above pin trust_status_context_for_clearance to false
+# throughout and so never touch the StatusContext path at all.
+#
+# The asserted property is the barrier's contract, not this file's:
+#   * a probe posts nothing, in every state;
+#   * rc is one of 0 / 2 / 6 / 7 — never 4 (a probe waits out no budget)
+#     and never 5 (a probe escalates no human);
+#   * rc 6 carries skip_reason non-base-branch or draft, NEVER paused,
+#     because the barrier reads rc 6 + skip_reason as WILL-NOT-REPORT and
+#     would clear for a PR CodeRabbit has not reviewed;
+#   * the emitted head_sha is the head the scan actually classified.
+test_probe_state_space_sweep() {
+  local trust status scenario dir rc n=0 bad=0
+  for trust in false true; do
+    for status in absent success failure; do
+      for scenario in none rate_limit probe_paused probe_in_progress probe_narration probe_review_on_head; do
+        n=$((n + 1))
+        dir=$(make_case "sweep-$trust-$status-$scenario" 600 true 30 0 0)
+        # The sweep drives trust via the policy file the fixture writes.
+        if [ "$trust" = "true" ]; then
+          sed -i.bak 's/^  trust_status_context_for_clearance: false$/  trust_status_context_for_clearance: true/' \
+            "$dir/.github/review-policy.yml" && rm -f "$dir/.github/review-policy.yml.bak"
+        fi
+        rc=0
+        ( cd "$dir" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+            CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+            CODERABBIT_TEST_STATE_DIR="$dir/state" \
+            CODERABBIT_TEST_SCENARIO="$scenario" \
+            CODERABBIT_TEST_STATUS="$status" \
+            ./scripts/coderabbit-wait.sh --probe 999 owner/repo \
+            >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
+        local posts skip head
+        posts=$(probe_count "$dir")
+        skip=$(jq -r '.skip_reason | tostring' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+        head=$(jq -r '.head_sha' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+        local why=""
+        [ "$posts" = "0" ] || why="posted $posts"
+        case "$rc" in 0|2|6|7) ;; *) why="${why:+$why; }rc=$rc not in {0,2,6,7}" ;; esac
+        [ "$rc" != "6" ] || [ "$skip" != "paused" ] || why="${why:+$why; }rc 6 with skip_reason=paused"
+        [ "$head" = "head-sha" ] || why="${why:+$why; }head_sha=$head"
+        if [ -n "$why" ]; then
+          bad=$((bad + 1))
+          echo "  sweep FAIL trust=$trust status=$status comment=$scenario → $why" >&2
+        fi
+      done
+    done
+  done
+  if [ "$bad" = "0" ]; then
+    pass "#814 probe: state-space sweep — $n states, all post nothing, none return 4/5, none return 6-with-paused"
+  else
+    fail "#814 probe: state-space sweep — $bad of $n states violate the barrier contract"
+  fi
 }
 
 test_probe_env_var_equals_flag() {
@@ -815,8 +866,7 @@ test_535_2_head_pinned_review_selection_emits_findings
 test_probe_no_comment_is_not_yet
 test_probe_rate_limit_is_not_yet_never_stalled
 test_probe_paused_is_not_yet_never_skipped
-test_probe_in_progress_is_not_yet
-test_probe_status_probe_narration_is_not_yet
+test_probe_state_space_sweep
 test_probe_env_var_equals_flag
 test_probe_terminal_review_matches_polling_verdict
 test_probe_field_absent_on_polling_runs
