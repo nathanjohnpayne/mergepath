@@ -1329,6 +1329,58 @@ else
   fail "Case 14m unexpected (rc=$rc): $out"
 fi
 
+# --- Case 14n: query-bearing relative target ------------------------
+# A URL query does not change which repository path the browser opens.
+# Leaving it attached during comparison lets a canonical doc link to a
+# hub-only sibling while evading the exact-path check.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|See [the audit](hub.md?plain=1) for details.
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md' by a relative Markdown link"; then
+  pass "Case 14n: query-bearing relative link to a hub-only doc fails closed"
+else
+  fail "Case 14n unexpected (rc=$rc): $out"
+fi
+
+# --- Case 14o: CONTROL — absolute reference-style link --------------
+# The visible label may name the repo-relative path when its reference
+# definition points at an absolute hub URL, just like Case 14j's inline
+# form. The destination is portable, so the label must be masked too.
+for absolute_ref in \
+  'Consult [docs/agents/hub.md][audit].\n\n[audit]: https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/hub.md' \
+  'Consult [docs/agents/hub.md][audit].\n\n[audit]:\n<https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/hub.md>'
+do
+  set +e
+  out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+    "docs/agents/shared.md|$absolute_ref
+docs/agents/hub.md|# Hub-only machinery")
+  rc=$?
+  set -e
+  if [ "$rc" = "0" ]; then
+    pass "Case 14o: repo-relative label with an absolute reference destination passes (control)"
+  else
+    fail "Case 14o unexpected (rc=$rc): $out"
+  fi
+done
+
+# --- Case 14p: relative reference labels remain visible -------------
+# The absolute-reference mask must not hide the same visible label when
+# its definition is relative; that spelling still breaks downstream.
+set +e
+out=$(run_with_doc_bodies "$MANIFEST_TRUTH" \
+  'docs/agents/shared.md|Consult [docs/agents/hub.md][audit].\n\n[audit]: hub.md
+docs/agents/hub.md|# Hub-only machinery')
+rc=$?
+set -e
+if [ "$rc" = "1" ] && echo "$out" | grep -q "references the hub-only doc 'docs/agents/hub.md'"; then
+  pass "Case 14p: repo-relative label with a relative reference destination fails closed"
+else
+  fail "Case 14p unexpected (rc=$rc): $out"
+fi
+
 # --- Case 13: LIVE manifest — the real repo must be consistent ------
 # Guards against the inventory and the live tree drifting apart between
 # fixture-only runs. Skipped when the manifest is absent (consumer).

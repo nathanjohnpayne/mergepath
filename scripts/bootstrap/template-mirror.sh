@@ -870,25 +870,40 @@ bootstrap::_derive_hub_only_excludes() {
   # PARTIAL exclusion set — the same silent-leak shape this function
   # exists to remove. Buffer, then print once the whole list is known
   # good.
-  local doc validated=""
+  local doc raw_doc stripped validated=""
   while IFS= read -r doc; do
     [ -n "$doc" ] || continue
+    raw_doc="$doc"
+
+    # Keep path acceptance aligned with check_doc_ownership: reject
+    # unsafe segments first, then normalize harmless leading './'
+    # spellings and a trailing slash before applying the inventory
+    # scope check or emitting an rsync pattern.
+    stripped="$doc"
+    while [ "${stripped#./}" != "$stripped" ]; do stripped="${stripped#./}"; done
     case "$doc" in
-      docs/agents/*.md) ;;
-      *)
-        bootstrap::err "doc_ownership classifies '$doc' hub-only, but the bootstrap mirror derives exclusions only for 'docs/agents/*.md' paths. Widen bootstrap::_derive_hub_only_excludes deliberately if the inventory's scope changed."
+      /*|..|../*|*/..|*/../*)
+        bootstrap::err "hub-only doc path '$raw_doc' contains an absolute or '..' segment; refusing to build an rsync exclude pattern from it"
         return 1
         ;;
     esac
+    case "$stripped" in
+      *,*|*//*|*/.|*/./*)
+        bootstrap::err "hub-only doc path '$raw_doc' contains an empty, '.', or comma-delimited segment; refusing to build an rsync exclude pattern from it"
+        return 1
+        ;;
+    esac
+    doc="${stripped%/}"
     case "$doc" in
-      */../*|*/..|../*|..)
-        bootstrap::err "hub-only doc path '$doc' contains a '..' segment; refusing to build an rsync exclude pattern from it"
+      docs/agents/*.md) ;;
+      *)
+        bootstrap::err "doc_ownership classifies '$raw_doc' hub-only, but the bootstrap mirror derives exclusions only for 'docs/agents/*.md' paths. Widen bootstrap::_derive_hub_only_excludes deliberately if the inventory's scope changed."
         return 1
         ;;
     esac
     case "$doc" in
       *'*'*|*'?'*|*'['*)
-        bootstrap::err "hub-only doc path '$doc' contains an rsync wildcard metacharacter; a pattern like 'docs/agents/*.md' would strip every canonical agent doc from the new repo. Spell the path literally in doc_ownership."
+        bootstrap::err "hub-only doc path '$raw_doc' contains an rsync wildcard metacharacter; a pattern like 'docs/agents/*.md' would strip every canonical agent doc from the new repo. Spell the path literally in doc_ownership."
         return 1
         ;;
     esac

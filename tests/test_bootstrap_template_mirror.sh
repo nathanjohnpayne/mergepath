@@ -185,6 +185,10 @@ echo "# Shared Agent Operating Rules (canonical core)" >"$FAKE_MP/docs/agents/sh
 echo "# Worktree Placement (canonical convention)" >"$FAKE_MP/docs/agents/worktree-placement.md"
 # The per-repo-owned local overlay it must be read BEFORE.
 echo "# Agent Operating Rules (local overlay)" >"$FAKE_MP/docs/agents/operating-rules.md"
+# Per-repo-owned deployment instructions are copied verbatim. Seed the
+# real document so the fixture proves its banner is truthful in the
+# consumer copy too, rather than testing a synthetic neutral sentence.
+cp "$ROOT/docs/agents/deployment-process.md" "$FAKE_MP/docs/agents/deployment-process.md"
 
 # REVIEW_POLICY.md with the hub-only wave-audit passage the #747
 # reframe must replace in the consumer copy. Deliberately carries NO
@@ -269,6 +273,8 @@ doc_ownership:
     pending_manifest: true
     note: deliberately not required until its backing path lands
   - path: docs/agents/operating-rules.md
+    class: per-repo-owned
+  - path: docs/agents/deployment-process.md
     class: per-repo-owned
   - path: docs/agents/repository-overview.md
     class: per-repo-owned
@@ -532,6 +538,13 @@ grep -q "Brand: My-new-repo\|Brand: Mergepath" "$TARGET/BRAND.md" \
 grep -q "downstream \*\*consumer\*\* of the \[mergepath\]" "$TARGET/docs/agents/repository-overview.md" \
   && pass "repository-overview.md scaffolded with neutral consumer framing (#744)" \
   || fail "repository-overview.md not scaffolded; got: $(head -3 "$TARGET/docs/agents/repository-overview.md")"
+if grep -q "mergepath's own" "$TARGET/docs/agents/deployment-process.md"; then
+  fail "deployment-process.md copied mergepath-only ownership prose into the consumer"
+elif grep -q "repository carrying this copy" "$TARGET/docs/agents/deployment-process.md"; then
+  pass "deployment-process.md keeps repo-owned deployment prose consumer-neutral"
+else
+  fail "deployment-process.md lost the repo-owned banner while being mirrored"
+fi
 
 # No residual 'mergepath' in the STILL-SUBSTITUTED name-bearing files.
 # BRAND.md + repository-overview.md are excluded here: their scaffolds
@@ -861,6 +874,21 @@ else
 $expected_derived
 got:
 $actual_derived"
+fi
+
+# check_doc_ownership accepts leading './' spellings after normalizing
+# them to repo-relative paths. The bootstrap derivation consumes the
+# same inventory, so it must accept and emit that same normalized set.
+derive_case 'yq -i '\''(.doc_ownership[] | select(.class == "hub-only") | .path) |= "./" + .'\'' .mergepath-sync.yml'
+normalized_expected=$(printf '%s\n' "$expected_derived" | sed 's#^\./##' | LC_ALL=C sort)
+normalized_actual=$(printf '%s\n' "$DERIVE_OUT" | grep -v '^$' | LC_ALL=C sort || true)
+if [ "$DERIVE_RC" = "0" ] && [ "$normalized_actual" = "$normalized_expected" ] && [ -z "$DERIVE_ERR" ]; then
+  pass "hub-only mirror derivation accepts and normalizes './' ownership paths"
+else
+  fail "derivation disagrees with doc_ownership path normalization (rc=$DERIVE_RC, stderr='$DERIVE_ERR'); expected:
+$normalized_expected
+got:
+$normalized_actual"
 fi
 
 # The finding's exact scenario: classify one more doc hub-only and touch

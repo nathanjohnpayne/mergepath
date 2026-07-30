@@ -1,6 +1,6 @@
 # Deployment Process
 
-This file is repo-owned: the credentials, commands, and environments below are mergepath's own. The fleet-wide secret-handling floor that constrains all of them — no secrets through a human, no long-lived keys by convenience, no unilateral downgrade of a repo's auth model — lives in [`shared-operating-rules.md`](shared-operating-rules.md) § Secret handling and is not restated here.
+This file is repo-owned: the credentials, commands, and environments below belong to the repository carrying this copy. The fleet-wide secret-handling floor that constrains all of them — no secrets through a human, no long-lived keys by convenience, no unilateral downgrade of a repo's auth model — lives in [`shared-operating-rules.md`](shared-operating-rules.md) § Secret handling and is not restated here.
 
 See `DEPLOYMENT.md` for all build and deployment steps.
 
@@ -24,8 +24,6 @@ As of the 2026-05-21 reconciliation against 1Password Environments and the 1Pass
 - CI/headless: use service-account tokens only when an approved ticket has scoped the token, vault/Environment access, rotation, and log masking. Do not use service-account tokens as a convenience fallback for attended local agents.
 - Mergepath's CI/headless review-auth proof is manual-only: `.github/workflows/onepassword-headless-proof.yml` reads a dedicated canary via `OP_SERVICE_ACCOUNT_TOKEN`, compares a SHA-256 digest without printing the value, and exercises `scripts/op-preflight.sh` token mode against an explicit `OP_PREFLIGHT_REVIEWER_PAT_REF` in a service-account-accessible proof vault. The setup helper also requires a shared-vault negative-scope sentinel (`OP_PREFLIGHT_NEGATIVE_SCOPE_REF` / `--negative-scope-ref`) unless that check is explicitly skipped. Dispatch it after provisioning or rotating the service-account token.
 - Existing Mergepath scripts: shelling out to `op read`, `op run`, or `op inject` remains acceptable. Do not introduce a language-SDK migration unless a separate design decision calls for it.
-
-Every lane above is still bound by `shared-operating-rules.md` § Secret handling: no raw secret ever moves through a human transcript, and no resolved secret value is printed in logs.
 
 ## Credential source debugging
 

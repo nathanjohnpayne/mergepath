@@ -204,7 +204,7 @@ mp_doc_link_targets() {
         -e 's/\)$//' \
         -e 's/^[[:space:]]*\[[^]]+\]:[[:space:]]*//' \
     | awk '{ print $1 }' \
-    | sed -E -e 's/^<//' -e 's/>$//' -e 's/#.*$//' \
+    | sed -E -e 's/^<//' -e 's/>$//' -e 's/[?#].*$//' \
     | grep -v '^[[:space:]]*$' || true
 }
 
@@ -290,6 +290,117 @@ mp_mask_absolute_urls() {
   sed -E \
     -e 's,\[[^]]*\]\([[:space:]]*<?[a-zA-Z][a-zA-Z0-9+.-]*://[^)]*\), ,g' \
     -e 's,[a-zA-Z][a-zA-Z0-9+.-]*://[^][:space:]<>()"'"'"'`]*, ,g'
+}
+
+# Mask reference-style link USES whose definition has an absolute
+# destination. The literal pass permits the repo-relative path in a
+# link label when the destination is portable (the same rule as an
+# inline `[path](https://...)` link), but a definition can live on a
+# different line:
+#
+#     [docs/agents/hub.md][audit]
+#     [audit]: https://github.com/.../docs/agents/hub.md
+#
+# A URL-only mask removes the definition's destination but leaves the
+# visible label behind as a false repo-relative hit. Read the file twice:
+# first collect absolute reference definitions (same-line or wrapped),
+# then blank only the corresponding full/collapsed/shortcut link uses.
+# Definition labels themselves stay intact; mp_mask_absolute_urls masks
+# their destination in the next stage.
+mp_mask_absolute_reference_links() {
+  local f="$1"
+  awk '
+    function norm_label(s) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+      gsub(/[[:space:]]+/, " ", s)
+      return tolower(s)
+    }
+    function first_target(s, t) {
+      sub(/^[[:space:]]+/, "", s)
+      t = s
+      sub(/[[:space:]].*$/, "", t)
+      sub(/^</, "", t)
+      sub(/>$/, "", t)
+      return t
+    }
+    function is_absolute(t) {
+      return t ~ /^[A-Za-z][A-Za-z0-9+.-]*:\/\// || t ~ /^\/\// || t ~ /^mailto:/
+    }
+    NR == FNR {
+      line = $0
+      if (pending != "") {
+        label = pending
+        pending = ""
+        if (line ~ /^[[:space:]]*$/) next
+        target = first_target(line)
+        if (is_absolute(target)) absolute[norm_label(label)] = 1
+        next
+      }
+
+      indent = match(line, /[^[:space:]]/) - 1
+      if (indent < 0 || indent > 3) next
+      work = line
+      sub(/^[[:space:]]*/, "", work)
+      if (work !~ /^\[[^]]+\]:/) next
+      label = work
+      sub(/^\[/, "", label)
+      sub(/\].*$/, "", label)
+      rest = work
+      sub(/^\[[^]]+\]:[[:space:]]*/, "", rest)
+      if (rest == "") {
+        pending = label
+      } else {
+        target = first_target(rest)
+        if (is_absolute(target)) absolute[norm_label(label)] = 1
+      }
+      next
+    }
+    {
+      line = $0
+      out = ""
+
+      # Full and collapsed references: [visible][id] / [visible][].
+      while (match(line, /\]\[[^]]*\]/)) {
+        before = substr(line, 1, RSTART - 1)
+        token = substr(line, RSTART, RLENGTH)
+        open = 0
+        for (i = length(before); i >= 1; i--) {
+          if (substr(before, i, 1) == "[") { open = i; break }
+        }
+        if (open == 0) {
+          out = out substr(line, 1, RSTART + RLENGTH - 1)
+          line = substr(line, RSTART + RLENGTH)
+          continue
+        }
+        visible = substr(before, open + 1)
+        label = substr(token, 3, length(token) - 3)
+        if (label == "") label = visible
+        consumed = RSTART + RLENGTH - 1
+        if (absolute[norm_label(label)]) {
+          out = out substr(before, 1, open - 1) " "
+        } else {
+          out = out substr(line, 1, consumed)
+        }
+        line = substr(line, consumed + 1)
+      }
+      line = out line
+
+      # Shortcut references: [id]. Do not mask the definition [id]:.
+      out = ""
+      while (match(line, /\[[^]]+\]/)) {
+        token = substr(line, RSTART, RLENGTH)
+        label = substr(token, 2, length(token) - 2)
+        after = substr(line, RSTART + RLENGTH, 1)
+        if (absolute[norm_label(label)] && after != ":") {
+          out = out substr(line, 1, RSTART - 1) " "
+        } else {
+          out = out substr(line, 1, RSTART + RLENGTH - 1)
+        }
+        line = substr(line, RSTART + RLENGTH)
+      }
+      print out line
+    }
+  ' "$f" "$f"
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -880,14 +991,13 @@ if [ -n "$canonical_docs" ] && [ -n "$hub_only_docs" ]; then
       # (a) literal path mention. `grep -v` (not -q) reads its input to
       # completion: with `set -o pipefail`, an early-exiting `grep -q`
       # could SIGPIPE the producer and turn a real hit into a silent pass.
-      hits=$(grep -F -- "$hub_doc" "$REPO_ROOT/$canon_doc" || true)
-      if [ -n "$hits" ]; then
-        # Mask the absolute URLs OUT of each hit and re-test what is
-        # left, rather than exempting any line that contains one — see
-        # mp_mask_absolute_urls for why the difference is load-bearing.
-        bare=$(printf '%s\n' "$hits" | mp_mask_absolute_urls | grep -F -- "$hub_doc" || true)
-        [ -n "$bare" ] && spelling="by repo-relative path"
-      fi
+      # Mask portable inline/bare URLs and reference-style link uses,
+      # then search the remainder. Reading the full file is necessary:
+      # a reference definition may live far from the label it licenses.
+      bare=$(mp_mask_absolute_reference_links "$REPO_ROOT/$canon_doc" \
+        | mp_mask_absolute_urls \
+        | grep -F -- "$hub_doc" || true)
+      [ -n "$bare" ] && spelling="by repo-relative path"
       # (b) relative link target that resolves to it. Same `grep -q`
       # caution as above — match with `-xF` and test the captured output.
       if [ -z "$spelling" ] && [ -n "$resolved_targets" ]; then
