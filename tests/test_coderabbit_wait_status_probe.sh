@@ -216,6 +216,11 @@ case "$endpoint" in
         # return the SAME terminal verdict the polling mode does.
         printf '[{"id":9941,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
         ;;
+      probe_notice_after_review)
+        # #814 round 9: HEAD review exists; the only later bot comment is a
+        # rate-limit notice, so publication is NOT complete.
+        printf '[{"id":9981,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        ;;
       probe_reviews_api_failure)
         # #814 / Phase 4b P2 on #823: the reviews fetch fails while the probe
         # is deciding. Must surface as rc 3 (infra), never as a clean rc 7.
@@ -346,6 +351,9 @@ case "$endpoint" in
         # object at reply_time. Clean body, so nothing else would block a
         # clear — only the temporal correlation check does.
         printf '[{"id":7806,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nPrior head summary."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      probe_notice_after_review)
+        printf '[{"id":9982,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n\\n> [!WARNING]\\n> ## Review limit reached"}]\n' "$bot" "$reply_time" "$reply_time"
         ;;
       probe_reviews_api_failure)
         # A classifiable summary, so the probe reaches the reviews fetch that
@@ -1023,6 +1031,38 @@ test_probe_evidence_does_not_expire() {
   fi
 }
 
+test_probe_summary_only_marker_is_findings() {
+  # #814 round 9 / #535. A blocking finding carried SOLELY by the PR-level
+  # summary is dispositioned by NO required gate: coderabbit-severity-gate.sh
+  # reads only pulls/{pr}/comments, the conversation gate covers threads, and
+  # the Phase 4b adapter sees only the diff. Verified, not assumed — the
+  # severity gate's single fetch is at scripts/coderabbit-severity-gate.sh:330.
+  # So this is the one verdict the probe must make. Inline findings are NOT
+  # counted here; the severity gate already owns those.
+  local dir rc status
+  dir=$(make_case probe-summary-marker 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" summary_marker_only)
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "2" ] && [ "$status" = "findings" ]; then
+    pass "#814: a summary-only blocking marker returns findings (rc 2) — no other gate would catch it"
+  else
+    fail "#814: expected rc 2/findings for a summary-only marker; got rc=$rc status=$status"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
+test_probe_notice_after_review_is_not_complete() {
+  # A non-terminal notice landing after the review object must not be mistaken
+  # for the summary. Excluding narration alone was insufficient: a rate-limit,
+  # paused, or in-progress comment updated after the review would otherwise
+  # satisfy the publication check while the real summary is still pending.
+  local dir rc
+  dir=$(make_case probe-notice-after 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" probe_notice_after_review)
+  assert_probe_not_yet "$dir" "$rc" rate_limit \
+    "a rate-limit notice after the review does not complete publication"
+}
+
 test_probe_env_var_equals_flag() {
   local dir rc
   dir=$(make_case probe-envvar 600 true 30 3 2)
@@ -1088,6 +1128,8 @@ test_probe_state_space_sweep
 test_probe_summary_without_head_review_is_not_yet
 test_probe_summary_lagging_head_review_is_not_yet
 test_probe_reviews_api_failure_is_infra_not_clean
+test_probe_summary_only_marker_is_findings
+test_probe_notice_after_review_is_not_complete
 test_probe_evidence_does_not_expire
 test_probe_env_var_equals_flag
 test_probe_terminal_review_matches_polling_verdict
