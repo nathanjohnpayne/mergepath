@@ -329,6 +329,12 @@ case "$endpoint" in
       probe_review_on_head)
         printf '[{"id":7803,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nNothing to flag."}]\n' "$bot" "$head_time" "$head_time"
         ;;
+      probe_finding_predates_head)
+        # Summary landed with the review, both older than the head committer
+        # date, so the case isolates "aged evidence" from "publication
+        # incomplete".
+        printf '[{"id":7808,"user":{"login":"%s"},"created_at":"2026-06-03T00:00:01Z","updated_at":"2026-06-03T00:00:01Z","body":"**Actionable comments posted: 0**\\n\\nAged summary."}]\n' "$bot"
+        ;;
       probe_stale_anchor)
         # The PRIOR head's summary. It classifies as `review` and passes the
         # fresh_at >= HEAD_ANCHOR filter because the new head's committer date
@@ -415,12 +421,14 @@ EOF
 # Count Codex-failover invocations. Any value above 0 in probe mode means the
 # probe reached the failover and posted an author-attributed `@codex review`.
 codex_invocations() {
-  local dir=$1
+  local dir=$1 count=0
+  # `grep -c .` prints 0 AND exits 1 on an empty file, so a bare `|| printf 0`
+  # emits a second zero and the caller compares against "0\n0". Capture, then
+  # print one normalized value.
   if [ -f "$dir/state/codex-stub.log" ]; then
-    grep -c . "$dir/state/codex-stub.log" 2>/dev/null || printf '0\n'
-  else
-    printf '0\n'
+    count=$(grep -c . "$dir/state/codex-stub.log" 2>/dev/null || true)
   fi
+  printf '%s\n' "${count:-0}"
 }
 
 run_case() {
@@ -945,7 +953,7 @@ test_probe_summary_without_head_review_is_not_yet() {
     "a prior-head summary with no HEAD-pinned review must not clear (author-controlled anchor)"
 }
 
-test_probe_summary_lagging_head_review_is_reported() {
+test_probe_summary_lagging_head_review_is_not_yet() {
   # Phase 4b P1 on #823. Existence of a HEAD-pinned review object is
   # necessary but not sufficient: CodeRabbit publishes the review object and
   # its PR-level summary as separate events. Mid-publication, a HEAD review
@@ -957,16 +965,18 @@ test_probe_summary_lagging_head_review_is_reported() {
   # Fixture: HEAD-pinned review at reply_time, prior-head summary at
   # head_time (earlier). The summary must be at least as recent as the
   # review it is credited to.
-  local dir rc status
+  # This expectation has moved twice and the current reason is the durable
+  # one. A review object alone is not "has reported": CodeRabbit publishes the
+  # object and its PR-level summary separately, and a blocking finding can be
+  # carried SOLELY by the summary (#535). Releasing here would let Phase 4b
+  # approve in that interval — and nothing downstream catches it, because
+  # scripts/coderabbit-severity-gate.sh:330 fetches only pulls/{pr}/comments
+  # and never the issue-comment summary. Verified, not assumed.
+  local dir rc
   dir=$(make_case probe-summary-lag 600 true 30 3 2)
   rc=$(run_probe_case "$dir" probe_summary_lags_review)
-  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
-  if [ "$rc" = "0" ] && [ "$status" = "reported" ]; then
-    pass "#814: mid-publication (review present, summary lagging) is REPORTED — ordering is satisfied, the verdict is not this probe's job"
-  else
-    fail "#814: expected rc 0/reported mid-publication; got rc=$rc status=$status"
-    sed 's/^/      /' "$dir/err.log" >&2 || true
-  fi
+  assert_probe_not_yet "$dir" "$rc" awaiting-summary \
+    "a review whose summary has not landed is publication-incomplete, not reported"
 }
 
 test_probe_reviews_api_failure_is_infra_not_clean() {
@@ -1076,7 +1086,7 @@ test_probe_rate_limit_is_not_yet_never_stalled
 test_probe_paused_is_not_yet_never_skipped
 test_probe_state_space_sweep
 test_probe_summary_without_head_review_is_not_yet
-test_probe_summary_lagging_head_review_is_reported
+test_probe_summary_lagging_head_review_is_not_yet
 test_probe_reviews_api_failure_is_infra_not_clean
 test_probe_evidence_does_not_expire
 test_probe_env_var_equals_flag

@@ -58,10 +58,11 @@
 #              over the surfaces the poll loop reads, then exit. Never
 #              sleeps, never waits out max_wait_seconds, posts NOTHING: no
 #              retry trigger, no `resume`, no status-probe mention, no Codex
-#              failover. A review already on HEAD still exits 0/2 with the
-#              same JSON; "nothing on this HEAD yet" exits 7. Equivalent to
-#              CODERABBIT_WAIT_PROBE=1. Answers "has CodeRabbit reported on
-#              this head?" without spending a budget or touching the PR.
+#              failover. Answers ONE question — has CodeRabbit reported on
+#              this head — and never evaluates findings: rc 0 means REPORTED,
+#              NOT clean, and probe mode never returns 2. rc 7 means not yet.
+#              Equivalent to CODERABBIT_WAIT_PROBE=1. Use the polling mode
+#              when you need a verdict.
 #
 # Environment:
 #   GH_TOKEN   Required unless a fresh op-preflight cache is available.
@@ -130,7 +131,9 @@
 #     "review": null | {
 #       "id": N,
 #       "created_at": "<iso-8601>",
-#       "endpoint": "issues" | "pulls",
+#       # "reviews" is emitted only by --probe, whose evidence is a review
+#       # object rather than a comment.
+#       "endpoint": "issues" | "pulls" | "reviews",
 #       "body_excerpt": "<first 200 chars>"
 #     },
 #     "potential_issue_count": N,
@@ -166,8 +169,8 @@
 #       # narration replies before classification, so that value is not
 #       # reachable and advertising it would be a contract nobody can meet.
 #       "observed": "none" | "rate_limit" | "paused" | "in_progress"
-#                   | "summary-without-head-review"
-#                   | "summary-predates-head-review" | "terminal"
+#                   | "summary-without-head-review" | "awaiting-summary"
+#                   | "terminal"
 #     },
 #     "codex_failover_requested": true | false,
 #     "waited_seconds": N
@@ -1914,16 +1917,79 @@ probe_emit_verdict() {
             body_excerpt: ((.body // "")[0:200])} end
   ') || die 3 "failed to select the HEAD-pinned review"
 
+  # Read the comment surface once — needed both to confirm publication is
+  # complete below and to name the not-yet surface further down.
+  LATEST=$(scan_latest_comment) || die 3 "failed to read the latest comment for the probe verdict"
+  local latest_at=""
+  if [ -n "$LATEST" ] && [ "$LATEST" != "{}" ]; then
+    latest_at=$(printf '%s' "$LATEST" | jq -r '.fresh_at // .updated_at // .created_at // empty')
+  fi
+
   if [ -n "$review" ]; then
+    local review_at
+    review_at=$(printf '%s' "$review" | jq -r '.created_at // empty')
+    # A review object alone is not "has reported": CodeRabbit publishes the
+    # object and its PR-level summary as separate events, and a blocking
+    # finding can be carried SOLELY by the summary (#535 exists because inline
+    # scanning misses exactly that). Releasing the barrier in that interval
+    # would let Phase 4b approve and merge before the finding is published.
+    #
+    # An earlier revision justified releasing early on the grounds that
+    # findings are caught downstream. That is wrong for this case and was
+    # corrected here: scripts/coderabbit-severity-gate.sh reads only
+    # repos/{repo}/pulls/{pr}/comments (inline), never the issue-comment
+    # summary, and the conversation-resolution gate covers threads. Neither
+    # sees a summary-only finding.
+    #
+    # This is still an existence test, not a verdict: it asks whether
+    # publication has COMPLETED, never whether the result was clean. No marker
+    # parsing, no StatusContext, no freshness anchors.
+    # Read the summary ANCHOR-FREE. scan_latest_comment filters on
+    # `fresh_at >= HEAD_ANCHOR`, which carries a moving wall-clock floor, so
+    # reusing it here would make a completed publication stop counting once
+    # the head had been sitting long enough — reintroducing the expiry the
+    # review selection above exists to avoid, one level down. The only
+    # question is whether a bot summary landed at or after the review, so
+    # that is all this asks.
+    local issue_comments summary_at
+    issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") \
+      || die 3 "failed to fetch issue comments for the probe verdict"
+    summary_at=$(printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg at "$review_at" '
+      def narration:
+        ((.body // "") | test("CodeRabbit review command invocation|Here.s a summary of where things stand|CodeRabbit is an incremental review system|does not re-review already reviewed commits"; "i"));
+      [ .[]
+        | select(.user.login == $bot)
+        | select(narration | not)
+        | ([.created_at, (.updated_at // .created_at)] | max)
+        | select(. >= $at)
+      ] | sort | last // ""
+    ') || die 3 "failed to select the review summary"
+    if [ -z "$summary_at" ]; then
+      log "probe: review object on $HEAD_SHA but its summary has not landed yet — publication incomplete"
+      probe_not_yet_from_latest "awaiting-summary"
+    fi
     PROBE_OBSERVED="terminal"
     log "probe: CodeRabbit has reported on $HEAD_SHA — findings not evaluated in probe mode"
     emit_json_and_exit "reported" 0 "$review" 0
   fi
 
-  # No HEAD evidence. Only NOW does auto-review eligibility matter: a skip
+  # No review object. Before concluding anything from auto-review eligibility,
+  # check whether a review is actively underway: these PRs CAN be reviewed
+  # after a manual `@coderabbitai review`, and reporting WILL-NOT-REPORT while
+  # one is in flight lets the barrier proceed ahead of it.
+  local class=""
+  if [ -n "$latest_at" ]; then
+    class=$(classify_comment "$(printf '%s' "$LATEST" | jq -r '.body // ""')")
+  fi
+  case "$class" in
+    in_progress|rate_limit|paused)
+      probe_not_yet_from_latest "$class"
+      ;;
+  esac
+
+  # Nothing active. Only NOW does auto-review eligibility settle it: a skip
   # means nothing will ever land on this head, which the barrier reads as
-  # WILL-NOT-REPORT. Asking earlier would report a draft or retargeted PR that
-  # already carries a real review as "will never report".
+  # WILL-NOT-REPORT.
   if [ -n "${PROBE_STATIC_SKIP:-}" ]; then
     SKIP_REASON="$PROBE_STATIC_SKIP"
     PROBE_OBSERVED="terminal"
@@ -1935,12 +2001,9 @@ probe_emit_verdict() {
   # from "asked and throttled" — the discriminator the #814 barrier uses to
   # decide whether to trigger a review, and the reason it can trigger once per
   # head instead of on every retry.
-  LATEST=$(scan_latest_comment) || die 3 "failed to read the latest comment for the probe verdict"
-  if [ -z "$LATEST" ] || [ "$LATEST" = "{}" ]; then
+  if [ -z "$latest_at" ]; then
     probe_not_yet "none" "null"
   fi
-  local class
-  class=$(classify_comment "$(printf '%s' "$LATEST" | jq -r '.body // ""')")
   # `review` here means a summary exists but nothing is SHA-pinned to this
   # head — the shape a prior head's summary takes after a new push. Name it
   # for that, not `review`, which would read as though this head were reviewed.
