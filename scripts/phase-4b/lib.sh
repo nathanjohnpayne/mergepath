@@ -185,9 +185,19 @@ p4b_barrier_class_coderabbit() {
       # 4 = the poll budget elapsed with no review; 7 = --probe found none.
       printf 'not-yet' ;;
     5)
-      # rate_limit_stalled. AGENTS.md routes this to a human unless the #489
-      # Codex failover engaged; the barrier must not silently absorb it.
-      printf 'escalate' ;;
+      # rate_limit_stalled. AGENTS.md step 5 routes this to a human UNLESS the
+      # #489 Codex failover engaged, in which case the stall is a non-blocking
+      # note: the failover has already requested @codex review and the Codex
+      # arm now owns reaching terminality. Escalating regardless would demand a
+      # manual fallback on every rate-limited run where the failover worked —
+      # not rare, since CodeRabbit rate-limited on five consecutive heads
+      # during #823. (Codex P2 on #835, raised twice.)
+      if [ "$(printf '%s' "$json" | jq -r '.codex_failover_requested // false' 2>/dev/null || true)" = "true" ]; then
+        printf 'not-yet'
+      else
+        printf 'escalate'
+      fi
+      ;;
     *)
       # 3 (infra) and anything unmodelled. Fail closed to the human rather
       # than guessing.

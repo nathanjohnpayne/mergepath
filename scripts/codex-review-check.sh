@@ -2097,6 +2097,14 @@ for __sig in "thumbs|$LATEST_THUMBS_UP_TIME" "review|$CODEX_REVIEW_TIME" "verdic
   __k=${__sig%%|*}
   __t=${__sig#*|}
   [ -n "$__t" ] || continue
+  # #814 (Codex P2 on #835 round 3): drop reactions from SELECTION in
+  # diagnostic mode, not just from clearance. Rejecting a selected 👍 left the
+  # gate with no signal even when an anchored review or verdict existed on the
+  # head, so the diagnostic reported "Codex has not spoken" on definitive
+  # current-head evidence and drove a needless bounded wait.
+  if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ] && [ "$__k" = "thumbs" ]; then
+    continue
+  fi
   # Replace on strictly-newer OR on an equal timestamp: iterating thumbs →
   # review → verdict means the last one at the max time wins the tie, giving
   # priority verdict > review > 👍.
@@ -2130,13 +2138,29 @@ case "$LATEST_SIGNAL_KIND" in
     fi
     ;;
   review)
-    if [ "$UNADDRESSED_COUNT" -eq 0 ]; then
+    if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then
+      # #814 (Codex P2 on #835, raised twice): diagnostic mode asks whether
+      # Codex has SPOKEN on this head, not whether its verdict clears. A
+      # current-head review carrying findings is Codex having spoken — the
+      # ordering the barrier protects is satisfied, and the P1 gate plus the
+      # conversation-resolution gate own the verdict. Mapping it to "not
+      # reported" made the barrier exhaust its budget and escalate on a PR
+      # Codex had actively reviewed, and the exit code could not change
+      # without author action, so the wait was guaranteed wasted.
+      CLEARED=true
+      CLEARANCE_REASON="head-anchored COMMENTED review @ $LATEST_SIGNAL_TIME on $HEAD_SHA (presence only; findings not evaluated under --diagnostic-signal-only)"
+    elif [ "$UNADDRESSED_COUNT" -eq 0 ]; then
       CLEARED=true
       CLEARANCE_REASON="latest Codex signal is COMMENTED review @ $LATEST_SIGNAL_TIME on $HEAD_SHA with no unaddressed P0/P1 findings"
     fi
     ;;
   verdict)
-    if [ -n "$CODEX_HEAD_VERDICT_TIME" ] && [ "$UNADDRESSED_COUNT" -eq 0 ]; then
+    if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then
+      # Same as the review arm: a non-affirmative or findings-bearing verdict
+      # on THIS head still means Codex reported on it.
+      CLEARED=true
+      CLEARANCE_REASON="head-anchored verdict comment @ $LATEST_SIGNAL_TIME (presence only; disposition not evaluated under --diagnostic-signal-only)"
+    elif [ -n "$CODEX_HEAD_VERDICT_TIME" ] && [ "$UNADDRESSED_COUNT" -eq 0 ]; then
       CLEARED=true
       CLEARANCE_REASON="latest Codex signal is a HEAD-anchored AFFIRMATIVE verdict comment @ $LATEST_SIGNAL_TIME (Reviewed commit prefixes $HEAD_SHA; no unaddressed P0/P1) (#600)"
     else

@@ -2408,7 +2408,13 @@ bad=""
 [ "$(_cr 6 '{"skip_reason":"unmodelled"}')" = not-yet ]      || bad="$bad rc6-unknown"
 [ "$(_cr 7 '{}')" = not-yet ]                            || bad="$bad rc7"
 [ "$(_cr 4 '{}')" = not-yet ]                            || bad="$bad rc4"
-[ "$(_cr 5 '{}')" = escalate ]                           || bad="$bad rc5"
+# rc 5 is only an escalation when the #489 failover did NOT engage. When it
+# did, AGENTS.md step 5 makes the stall a non-blocking note and the Codex arm
+# owns terminality; escalating anyway forces a manual fallback on every
+# rate-limited run where the failover worked (Codex P2 on #835, raised twice).
+[ "$(_cr 5 '{}')" = escalate ]                                    || bad="$bad rc5"
+[ "$(_cr 5 '{"codex_failover_requested":false}')" = escalate ]    || bad="$bad rc5-nofailover"
+[ "$(_cr 5 '{"codex_failover_requested":true}')" = not-yet ]      || bad="$bad rc5-failover"
 [ "$(_cr 3 '{}')" = escalate ]                           || bad="$bad rc3"
 [ "$(p4b_barrier_class_codex 0)" = reported ]            || bad="$bad codex0"
 [ "$(p4b_barrier_class_codex 1)" = not-yet ]             || bad="$bad codex1"
