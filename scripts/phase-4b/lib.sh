@@ -154,7 +154,7 @@ p4b_top_field() {
 # Maps one scripts/coderabbit-wait.sh result — polling or --probe — to a
 # class. Pure: jq over the passed string only, no I/O, always returns 0.
 p4b_barrier_class_coderabbit() {
-  local head="$1" rc="$2" json="$3" probe_head skip
+  local head="$1" rc="$2" json="$3" probe_head
   case "$rc" in
     0|2)
       # Terminal, but only for the head about to be approved. An rc 0/2
