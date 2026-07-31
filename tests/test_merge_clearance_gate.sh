@@ -1319,6 +1319,193 @@ if echo "$OUT" | grep -q "check_merge_clearance_gate:" \
 else
   fail "expected the check pre-flight to pass on the wired header; got rc=$RC"; echo "$OUT" | sed 's/^/      /' >&2
 fi
+
+# ---------------------------------------------------------------------------
+# Test 23 (#841): the two-phase Checks-API publish in the event-driven job.
+#
+# BEHAVIOURAL, not structural. The real `run:` bodies are extracted from the
+# live workflow and executed against a stub `gh`, so these cases fail if the
+# published shape stops matching what the workflow actually does — a grep for
+# the POST would keep passing while the mapping underneath it rotted.
+#
+# Why the job publishes at all: a job-native completion cannot retire a
+# Checks-API entry, so before #841 a stale synthetic FAILURE outlived ten
+# job-native successes on an unchanged head and blocked the PR indefinitely.
+# The event job now writes the same slot the sweep writes.
+# ---------------------------------------------------------------------------
+WF_841="$ROOT/.github/workflows/merge-clearance-gate.yml"
+if [ -f "$WF_841" ]; then
+  echo; echo "--- Test 23 (#841): two-phase Checks-API publish"
+  # Every case below deliberately runs commands that are EXPECTED to fail
+  # (a stub gh returning 1, a grep that must not match), and several are
+  # written as `cmd && bad=...`, whose status is non-zero when cmd fails.
+  # Under the suite's errexit that exits the whole run, so drop it for the
+  # duration and restore it at the end of the block — the same idiom the
+  # older cases in this file use around run_gate.
+  set +e
+
+  # Extract one step's run: body and dedent it. Body lines sit at 10 spaces;
+  # the first non-blank line shallower than that ends the block.
+  mcg_step_body() {  # <workflow> <step name>
+    awk -v want="$2" '
+      index($0, "- name: " want) { instep = 1; next }
+      instep && !inrun && /^        run: \|/ { inrun = 1; next }
+      inrun {
+        if ($0 ~ /^[[:space:]]*$/) { print ""; next }
+        if ($0 !~ /^          /) exit
+        sub(/^          /, "")
+        print
+      }
+    ' "$1"
+  }
+
+  P1_BODY="$(mcg_step_body "$WF_841" 'Open the required check_run (#841 phase 1)')"
+  P2_BODY="$(mcg_step_body "$WF_841" 'Close the required check_run (#841 phase 2)')"
+  RV_BODY="$(mcg_step_body "$WF_841" 'Report gate verdict')"
+
+  T23="$(mktemp -d "${TMPDIR:-/tmp}/mcg841.XXXXXX")"
+  mkdir -p "$T23/bin"
+  # Stub gh: logs argv, behaviour driven by env.
+  cat > "$T23/bin/gh" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >> "$GH_LOG"
+if [ "$1" = api ]; then
+  case "$*" in
+    *"-X POST"*)
+      [ "${GH_POST_FAIL:-0}" = 1 ] && exit 1
+      printf '%s\n' "${GH_POST_ID:-42}"; exit 0 ;;
+    *"-X PATCH"*)
+      [ "${GH_PATCH_FAIL:-0}" = 1 ] && exit 1
+      exit 0 ;;
+  esac
+  exit 0
+fi
+if [ "$1" = pr ] && [ "$2" = view ]; then
+  [ "${GH_PRVIEW_FAIL:-0}" = 1 ] && exit 1
+  printf '%s\n' "${GH_PRVIEW_SHA:-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef}"; exit 0
+fi
+exit 0
+STUB
+  # No-op sleep: the retry loops would otherwise burn ~2 minutes of real time.
+  printf '#!/bin/sh\nexit 0\n' > "$T23/bin/sleep"
+  chmod +x "$T23/bin/gh" "$T23/bin/sleep"
+
+  SHA1=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+  run23() {  # <body> ; env supplied by caller
+    GH_LOG="$T23/gh.log" PATH="$T23/bin:$PATH" \
+    GITHUB_OUTPUT="$T23/out.txt" RUNNER_TEMP="$T23" \
+      bash -c "$1" 2>&1
+  }
+  reset23() { : > "$T23/gh.log"; : > "$T23/out.txt"; }
+
+  bad=""
+  # -- phase 1 -------------------------------------------------------------
+  reset23
+  OUT=$(REPO=o/r HEAD_SHA="$SHA1" IS_FORK=false CHECK_NAME="Merge clearance gate" \
+        run23 "$P1_BODY"); RC=$?
+  posts=$(grep -c -- "-X POST" "$T23/gh.log" || true)
+  [ "$RC" = 0 ] || bad="$bad p1-ok-rc"
+  [ "$posts" = 1 ] || bad="$bad p1-ok-postcount"
+  grep -q "id=42" "$T23/out.txt" || bad="$bad p1-ok-id"
+  grep -q "status=in_progress" "$T23/gh.log" || bad="$bad p1-ok-inprogress"
+  grep -q "head_sha=$SHA1" "$T23/gh.log" || bad="$bad p1-ok-headsha"
+  grep -q "name=Merge clearance gate" "$T23/gh.log" || bad="$bad p1-ok-name"
+
+  reset23
+  OUT=$(REPO=o/r HEAD_SHA="$SHA1" IS_FORK=true CHECK_NAME=X GH_POST_FAIL=1 \
+        run23 "$P1_BODY"); RC=$?
+  [ "$RC" = 0 ] || bad="$bad p1-fork-rc"
+  printf '%s' "$OUT" | grep -q "::warning::" || bad="$bad p1-fork-warn"
+  grep -q "^id=" "$T23/out.txt" && bad="$bad p1-fork-idleak"
+
+  reset23
+  OUT=$(REPO=o/r HEAD_SHA="$SHA1" IS_FORK=false CHECK_NAME=X GH_POST_FAIL=1 \
+        run23 "$P1_BODY"); RC=$?
+  [ "$RC" = 1 ] || bad="$bad p1-samerepo-rc"
+  printf '%s' "$OUT" | grep -q "::error::" || bad="$bad p1-samerepo-err"
+
+  reset23
+  OUT=$(REPO=o/r HEAD_SHA="" IS_FORK=false CHECK_NAME=X run23 "$P1_BODY"); RC=$?
+  [ "$RC" = 1 ] || bad="$bad p1-nohead-rc"
+  [ -s "$T23/gh.log" ] && bad="$bad p1-nohead-posted"
+
+  if [ -z "$bad" ]; then
+    pass "#841 phase 1: opens an in_progress run on the PR head, tolerates a fork, and refuses to proceed when it cannot publish"
+  else
+    fail "#841 phase 1 wrong:$bad"
+  fi
+
+  # -- phase 2 -------------------------------------------------------------
+  bad=""
+  p2() {  # <rc> <verdict> ; extra env via caller prefix
+    reset23
+    printf 'gate said things\n' > "$T23/mcg-summary.txt"
+    REPO=o/r PR_NUMBER=7 CHECK_ID=42 HEAD_SHA="$SHA1" RC="$1" VERDICT="$2" \
+      run23 "$P2_BODY"
+  }
+  OUT=$(p2 0 pass); RC=$?
+  grep -q -- "-X PATCH" "$T23/gh.log" || bad="$bad p2-pass-nopatch"
+  grep -q "check-runs/42" "$T23/gh.log" || bad="$bad p2-pass-target"
+  grep -q "conclusion=success" "$T23/gh.log" || bad="$bad p2-pass-conclusion"
+
+  OUT=$(p2 1 blocked)
+  grep -q "conclusion=failure" "$T23/gh.log" || bad="$bad p2-blocked"
+  grep -q "infra/config" "$T23/gh.log" && bad="$bad p2-blocked-mislabelled"
+
+  OUT=$(p2 0 absent)
+  grep -q "conclusion=failure" "$T23/gh.log" || bad="$bad p2-absent"
+  grep -q "rc=0 with no PASS verdict" "$T23/gh.log" || bad="$bad p2-absent-title"
+
+  OUT=$(p2 7 absent)
+  grep -q "infra/config error (rc=7)" "$T23/gh.log" || bad="$bad p2-rc7"
+
+  # Head moved, and head unreadable: both must publish a red pinned to the
+  # head we bound to, never a silent skip that leaves a stale green standing.
+  reset23; printf 'x\n' > "$T23/mcg-summary.txt"
+  OUT=$(REPO=o/r PR_NUMBER=7 CHECK_ID=42 HEAD_SHA="$SHA1" RC=0 VERDICT=pass \
+        GH_PRVIEW_SHA=cafebabecafebabecafebabecafebabecafebabe run23 "$P2_BODY")
+  grep -q "conclusion=failure" "$T23/gh.log" || bad="$bad p2-drift-conclusion"
+  grep -q "head moved" "$T23/gh.log" || bad="$bad p2-drift-title"
+  grep -q "check-runs/42" "$T23/gh.log" || bad="$bad p2-drift-target"
+
+  reset23; printf 'x\n' > "$T23/mcg-summary.txt"
+  OUT=$(REPO=o/r PR_NUMBER=7 CHECK_ID=42 HEAD_SHA="$SHA1" RC=0 VERDICT=pass \
+        GH_PRVIEW_FAIL=1 run23 "$P2_BODY")
+  grep -q "conclusion=failure" "$T23/gh.log" || bad="$bad p2-unreadable"
+
+  reset23; printf 'x\n' > "$T23/mcg-summary.txt"
+  OUT=$(REPO=o/r PR_NUMBER=7 CHECK_ID=42 HEAD_SHA="$SHA1" RC=0 VERDICT=pass \
+        GH_PATCH_FAIL=1 run23 "$P2_BODY"); RC=$?
+  patches=$(grep -c -- "-X PATCH" "$T23/gh.log" || true)
+  [ "$RC" = 0 ] || bad="$bad p2-patchfail-rc"
+  [ "$patches" = 3 ] || bad="$bad p2-patchfail-attempts($patches)"
+  printf '%s' "$OUT" | grep -q "::warning::" || bad="$bad p2-patchfail-warn"
+
+  if [ -z "$bad" ]; then
+    pass "#841 phase 2: maps rc/verdict to a conclusion, publishes a red on head drift rather than skipping, and never fails the job"
+  else
+    fail "#841 phase 2 wrong:$bad"
+  fi
+
+  # -- native conclusion mapping is unchanged ------------------------------
+  bad=""
+  rv() { RC="$1" VERDICT="$2" run23 "$RV_BODY" >/dev/null 2>&1; }
+  rv 0 pass   || bad="$bad rv-pass"
+  rv 0 absent && bad="$bad rv-absent-should-fail"
+  rv 1 blocked && bad="$bad rv-blocked-should-fail"
+  rv 2 absent && bad="$bad rv-rc2-should-fail"
+  if [ -z "$bad" ]; then
+    pass "#841: the job's NATIVE conclusion mapping is unchanged apart from the rc-0-without-PASS sentinel"
+  else
+    fail "#841 native mapping changed:$bad"
+  fi
+
+  rm -rf "$T23"
+  set -e
+else
+  echo "SKIP: Test 23 (#841) — merge-clearance-gate.yml absent"
+fi
+
 fi  # end re-entrancy guard (MCG_SKIP_FIX3_SELFTEST)
 
 # ---------------------------------------------------------------------------
