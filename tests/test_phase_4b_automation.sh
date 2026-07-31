@@ -2396,11 +2396,16 @@ bad=""
 # A terminal rc anchored on an OLDER head is a stale clearance — the #794 shape.
 [ "$(_cr 0 '{"head_sha":"old999"}')" = not-yet ]         || bad="$bad rc0-stale"
 [ "$(_cr 0 '{}')" = not-yet ]                            || bad="$bad rc0-nohead"
-[ "$(_cr 6 '{"skip_reason":"draft"}')" = will-not-report ]           || bad="$bad rc6-draft"
-[ "$(_cr 6 '{"skip_reason":"non-base-branch"}')" = will-not-report ] || bad="$bad rc6-nonbase"
-# The dangerous inversion: paused means "refusing until resumed", not "never".
-[ "$(_cr 6 '{"skip_reason":"paused"}')" = not-yet ]      || bad="$bad rc6-paused"
-[ "$(_cr 6 '{"skip_reason":"unmodelled"}')" = not-yet ]  || bad="$bad rc6-unknown"
+# EVERY exit-6 skip is not-yet. draft and non-base-branch are PR-level states
+# that can change WITHOUT the head changing — marking a draft ready or
+# retargeting the base makes CodeRabbit review that same head, possibly after
+# the Phase 4b approval has posted, which is the ordering race this barrier
+# exists to prevent (Codex P1 on #835). paused is the same shape, and an
+# unmodelled reason must never open a barrier.
+[ "$(_cr 6 '{"skip_reason":"draft"}')" = not-yet ]           || bad="$bad rc6-draft"
+[ "$(_cr 6 '{"skip_reason":"non-base-branch"}')" = not-yet ] || bad="$bad rc6-nonbase"
+[ "$(_cr 6 '{"skip_reason":"paused"}')" = not-yet ]          || bad="$bad rc6-paused"
+[ "$(_cr 6 '{"skip_reason":"unmodelled"}')" = not-yet ]      || bad="$bad rc6-unknown"
 [ "$(_cr 7 '{}')" = not-yet ]                            || bad="$bad rc7"
 [ "$(_cr 4 '{}')" = not-yet ]                            || bad="$bad rc4"
 [ "$(_cr 5 '{}')" = escalate ]                           || bad="$bad rc5"
@@ -2409,7 +2414,7 @@ bad=""
 [ "$(p4b_barrier_class_codex 1)" = not-yet ]             || bad="$bad codex1"
 [ "$(p4b_barrier_class_codex 3)" = escalate ]            || bad="$bad codex3"
 if [ -z "$bad" ]; then
-  pass "#814: terminality is three-way + escalate; paused and stale-head both read NOT-YET"
+  pass "#814: no rc opens the barrier except a head-matched report; every exit-6 skip and every stale head reads NOT-YET"
 else
   fail "#814: terminality misclassified:$bad"
 fi

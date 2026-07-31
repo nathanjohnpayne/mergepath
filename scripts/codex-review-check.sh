@@ -2114,8 +2114,20 @@ fi
 
 case "$LATEST_SIGNAL_KIND" in
   thumbs)
-    CLEARED=true
-    CLEARANCE_REASON="latest Codex signal is 👍 reaction @ $LATEST_SIGNAL_TIME (newest of 👍/review/verdict on HEAD; on or after reaction threshold $REACTION_THRESHOLD)"
+    if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then
+      # #814 (Codex P1 on #835): a reaction carries NO commit id. It is
+      # admitted on freshness alone, against a threshold derived from the head
+      # committer date — which the pusher controls. A clean reaction for the
+      # previous head landing just after a new head is pushed would satisfy
+      # this, and a caller asking "did Codex review THIS head" would be told
+      # yes. Diagnostic mode accepts only the two head-anchored forms: a review
+      # object (commit_id == HEAD) or a verdict comment whose Reviewed commit
+      # prefixes HEAD.
+      log "gate (c): 👍 reaction @ $LATEST_SIGNAL_TIME is not head-anchored — rejected under --diagnostic-signal-only"
+    else
+      CLEARED=true
+      CLEARANCE_REASON="latest Codex signal is 👍 reaction @ $LATEST_SIGNAL_TIME (newest of 👍/review/verdict on HEAD; on or after reaction threshold $REACTION_THRESHOLD)"
+    fi
     ;;
   review)
     if [ "$UNADDRESSED_COUNT" -eq 0 ]; then

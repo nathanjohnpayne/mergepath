@@ -161,22 +161,25 @@ p4b_barrier_class_coderabbit() {
       fi
       ;;
     6)
-      skip="$(printf '%s' "$json" | jq -r '.skip_reason // empty' 2>/dev/null || true)"
-      case "$skip" in
-        non-base-branch|draft)
-          # Configuration facts about the PR, not a suspended review. Nothing
-          # will land on THIS head, so there is no later review to race.
-          printf 'will-not-report' ;;
-        paused)
-          # Present and declining until resumed, and the platform never
-          # auto-resumes. Reading this as terminal is the #593 false-clear.
-          printf 'not-yet' ;;
-        *)
-          # An unrecognised skip_reason is a shape we do not model, so it must
-          # never open the barrier. The bounded wait ends at a human, which is
-          # the right destination for an unmodelled provider state.
-          printf 'not-yet' ;;
-      esac
+      # EVERY exit-6 skip is not-yet, including draft and non-base-branch.
+      #
+      # #814 originally specified those two as will-not-report, on the reading
+      # that nothing will ever land on this head. That is wrong (Codex P1 on
+      # #835): both are PR-level states that can change WITHOUT the head
+      # changing. Marking a draft ready, or retargeting the base, makes
+      # CodeRabbit review that same head — potentially after the Phase 4b
+      # approval has posted, which is exactly the ordering race this barrier
+      # exists to prevent. `paused` is the same shape and was already not-yet.
+      #
+      # AGENTS.md step 5 says the same thing about exit 6 generally: resolve
+      # the skip cause rather than treating it as a clean clearance.
+      #
+      # So no rc yields will-not-report. That class is reachable only through
+      # the provider being disabled in policy — coderabbit.enabled: false —
+      # which the barrier checks before it ever calls this classifier, and
+      # which cannot flip mid-flight on a live PR. Deviation from this issue's
+      # change detail recorded on #814.
+      printf 'not-yet'
       ;;
     4|7)
       # 4 = the poll budget elapsed with no review; 7 = --probe found none.
