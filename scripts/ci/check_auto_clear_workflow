@@ -314,17 +314,29 @@ fi
 
 # ── Test 4: scope discipline — only needs-external-review is removed
 # CR Major on PR #202 r3: tighten the positive grep to the actual
-# `gh pr edit ... --remove-label` executable line, not anywhere in
-# the file (header comments/attribution-message would otherwise
-# satisfy the match even if the executable line regressed).
-# #536 hardening: anchor with `^[^#]*` so a `#` appearing before
-# `gh pr edit` disqualifies the line — a COMMENT that merely mentions
-# `gh pr edit --remove-label needs-external-review` can no longer satisfy
-# the positive check (nor can a commented-out forbidden-label removal
-# trip the negatives, which would have caused a spurious FAIL). Indented
-# executable lines inside `run:` blocks still match (no `#` precedes the
-# command).
-if grep -qE '^[^#]*gh pr edit[^#]*--remove-label needs-external-review([[:space:]]|$)' "$WORKFLOW" && \
+# executable removal line, not anywhere in the file (header comments/
+# attribution-message would otherwise satisfy the match even if the
+# executable line regressed).
+# #536 hardening: anchor with `^[^#]*` so a `#` appearing before the
+# command disqualifies the line — a COMMENT that merely mentions the
+# removal can no longer satisfy the positive check (nor can a
+# commented-out forbidden-label removal trip the negatives, which would
+# have caused a spurious FAIL). Indented executable lines inside `run:`
+# blocks still match (no `#` precedes the command).
+#
+# #827: the removal moved from `gh pr edit --remove-label` to a REST
+# DELETE on the issue-labels endpoint, so the positive assertion follows
+# it. `gh pr edit --remove-label` is backed by the idempotent GraphQL
+# removeLabelsFromLabelable mutation and exits 0 even when the label was
+# never present — it cannot tell "this run removed the label" from "the
+# label was already gone", which is the signal the attribution comment is
+# gated on (see the duplicate-comment guard below). Both spellings stay
+# refuted for the three forbidden labels, so a regression to either
+# mechanism on a human-action label still fails this check.
+if grep -qE '^[^#]*issues/\$PR/labels/needs-external-review' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*issues/\$PR/labels/needs-human-review' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*issues/\$PR/labels/policy-violation' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*issues/\$PR/labels/human-hold' "$WORKFLOW" && \
    ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label needs-human-review([[:space:]]|$)' "$WORKFLOW" && \
    ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label policy-violation([[:space:]]|$)' "$WORKFLOW" && \
    ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label human-hold([[:space:]]|$)' "$WORKFLOW"; then
@@ -333,6 +345,43 @@ if grep -qE '^[^#]*gh pr edit[^#]*--remove-label needs-external-review([[:space:
 else
   fail=$((fail + 1))
   echo "  FAIL: workflow either misses the target label or auto-removes a forbidden one" >&2
+fi
+
+# ── Test 4b: duplicate-comment guard (#827)
+# The attribution comment must be gated on THIS run having performed the
+# removal — the DELETE's HTTP status — never on a bare "the label is
+# absent" read. Absence is not attributable: this workflow carries no
+# concurrency group (a per-PR one is not expressible for workflow_run,
+# whose PR is resolved inside a step), so several runs pass the
+# label-presence check, one write wins, and every one of them then reads
+# "absent". On #797 that produced 15 attribution comments for 5 real
+# removals. Both jobs must capture the status and branch on it.
+del_capture_count=$(grep -cE '^[^#]*del_status=\$\(printf' "$WORKFLOW" || true)
+del_branch_count=$(grep -cE '^[^#]*case "\$del_status" in' "$WORKFLOW" || true)
+del_delete_count=$(grep -cE '^[^#]*-X DELETE -i --silent' "$WORKFLOW" || true)
+if [ "$del_capture_count" -ge 2 ] && [ "$del_branch_count" -ge 2 ] && [ "$del_delete_count" -ge 2 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both jobs gate the attribution comment on the DELETE's HTTP status, not on label absence (#827)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: attribution comment must be gated on the removal's HTTP status in BOTH jobs (#827): capture=$del_capture_count branch=$del_branch_count delete=$del_delete_count (expected >=2 each)" >&2
+fi
+
+# ── Test 4c: sweep re-verifies the label authoritatively (#827)
+# The sweep's PR list comes from `gh pr list --label`, which resolves
+# through the GraphQL search() API — an eventually-consistent index, not
+# live label state. A cleared PR keeps appearing there (observed on #797:
+# ~3.5h across 9 consecutive sweeps). Without an authoritative precheck
+# the sweep burns a full codex-review-check.sh evaluation per stale hit
+# and then comments on a label it never removed. Both jobs must carry the
+# HAS_LABEL precheck.
+haslabel_count=$(grep -cE '^[^#]*HAS_LABEL=\$\(with_gh_retry gh pr view' "$WORKFLOW" || true)
+if [ "$haslabel_count" -ge 2 ] && grep -qF 'stale search-index hit' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: both jobs re-verify needs-external-review authoritatively before acting (#827)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: the scheduled sweep must re-verify the label against the authoritative endpoint before acting (#827; found $haslabel_count HAS_LABEL prechecks, expected >=2)" >&2
 fi
 
 # ── Test 4c: bash syntax check on every `run:` block
