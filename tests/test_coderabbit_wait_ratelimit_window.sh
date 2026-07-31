@@ -88,6 +88,8 @@ coderabbit:
   codex_failover_on_rate_limit: false
   wallclock_freshness_window_seconds: 999999999
   trust_status_context_for_clearance: false
+available_reviewers:
+  - nathanpayne-claude
 EOF
 
   cat >"$dir/bin/date" <<'EOF'
@@ -152,15 +154,24 @@ case "$endpoint" in
   repos/owner/repo/issues/999/comments)
     rl_body=$(cat "$state_dir/ratelimit-body.txt")
     seed=$(cat "$state_dir/seed-trigger.txt" 2>/dev/null || printf '0')
-    if [ "$seed" = "1" ]; then
-      # A concurrent run's nudge, already on the PR for this same window.
-      jq -cn --arg bot "$bot" --arg t "$head_time" --arg body "$rl_body" \
-        '[{id:7701,user:{login:$bot},created_at:$t,updated_at:$t,body:$body},
-          {id:7702,user:{login:"nathanpayne-claude"},created_at:$t,updated_at:$t,body:"@coderabbitai, try again."}]'
-    else
-      jq -cn --arg bot "$bot" --arg t "$head_time" --arg body "$rl_body" \
-        '[{id:7701,user:{login:$bot},created_at:$t,updated_at:$t,body:$body}]'
-    fi ;;
+    case "$seed" in
+      1)  # A concurrent run's nudge (TRUSTED reviewer identity, id > notice id).
+        jq -cn --arg bot "$bot" --arg t "$head_time" --arg body "$rl_body" \
+          '[{id:7701,user:{login:$bot},created_at:$t,updated_at:$t,body:$body},
+            {id:7702,user:{login:"nathanpayne-claude"},created_at:$t,updated_at:$t,body:"@coderabbitai, try again."}]' ;;
+      2)  # Same text from an UNTRUSTED participant — must NOT count as a nudge.
+        jq -cn --arg bot "$bot" --arg t "$head_time" --arg body "$rl_body" \
+          '[{id:7701,user:{login:$bot},created_at:$t,updated_at:$t,body:$body},
+            {id:7702,user:{login:"random-drive-by"},created_at:$t,updated_at:$t,body:"@coderabbitai, try again."}]' ;;
+      3)  # Trusted text but posted BEFORE the notice (lower id, same second) —
+          # belongs to a PRIOR window, must NOT suppress this one.
+        jq -cn --arg bot "$bot" --arg t "$head_time" --arg body "$rl_body" \
+          '[{id:7700,user:{login:"nathanpayne-claude"},created_at:$t,updated_at:$t,body:"@coderabbitai, try again."},
+            {id:7701,user:{login:$bot},created_at:$t,updated_at:$t,body:$body}]' ;;
+      *)
+        jq -cn --arg bot "$bot" --arg t "$head_time" --arg body "$rl_body" \
+          '[{id:7701,user:{login:$bot},created_at:$t,updated_at:$t,body:$body}]' ;;
+    esac ;;
   *) echo "unexpected gh api endpoint: $endpoint" >&2; exit 99 ;;
 esac
 EOF
@@ -248,10 +259,49 @@ test_absent_trigger_still_posts() {
   [ "$FAIL" -ne "$before" ] || pass "4: a genuine first nudge still posts ($posts write(s)) — the guard does not stall a rate-limited PR"
 }
 
+# --- Test 5: an UNTRUSTED author's identical text must not suppress ---------
+# Codex P2 on #830: body text alone is forgeable. On a public PR any
+# participant can post the exact trigger string; crediting it as "already
+# nudged" would suppress the real identity-verified POST, and since CodeRabbit
+# ignores commands from unauthorized accounts the window would never be
+# re-invoked — the wait stalls. Only configured available_reviewers count.
+test_untrusted_author_does_not_suppress() {
+  local dir rc before=$FAIL posts
+  dir=$(make_case "untrusted" 60 1000 2)
+  rc=$(run_case "$dir")
+  [ "$rc" = "4" ] || fail "5: expected exit 4 (timeout), got $rc; err=$(tail -4 "$dir/err.log")"
+  ! grep -q 'retry trigger already present' "$dir/err.log" \
+    || fail "5: an untrusted author's trigger text must NOT satisfy the dedupe guard"
+  posts=$(wc -l <"$dir/state/posts.log" | tr -d ' ')
+  [ "$posts" -ge 1 ] \
+    || fail "5: expected the real nudge to still post despite the forged text, got $posts"
+  [ "$FAIL" -ne "$before" ] || pass "5: #830 P2(a) — a forged trigger from an untrusted author does not suppress the real POST"
+}
+
+# --- Test 6: same-second trigger that PREDATES the notice must not suppress --
+# Codex P2 on #830: GitHub created_at has second precision only. A trigger and
+# a newly-posted notice can tie, and a plain `>= since` would credit the OLD
+# trigger to the NEW notice, skip its nudge, and stall that window. The
+# (created_at, id) comparison resolves the tie by true post order.
+test_same_second_earlier_trigger_does_not_suppress() {
+  local dir rc before=$FAIL posts
+  dir=$(make_case "tiebreak" 60 1000 3)
+  rc=$(run_case "$dir")
+  [ "$rc" = "4" ] || fail "6: expected exit 4 (timeout), got $rc; err=$(tail -4 "$dir/err.log")"
+  ! grep -q 'retry trigger already present' "$dir/err.log" \
+    || fail "6: a trigger posted BEFORE the notice (same second, lower id) must not suppress this window"
+  posts=$(wc -l <"$dir/state/posts.log" | tr -d ' ')
+  [ "$posts" -ge 1 ] \
+    || fail "6: expected a nudge for the new notice, got $posts"
+  [ "$FAIL" -ne "$before" ] || pass "6: #830 P2(b) — a same-second trigger predating the notice is ordered by id, not credited to it"
+}
+
 test_elapsed_window_sleeps_zero
 test_fresh_window_sleeps_remaining
 test_existing_trigger_suppresses_duplicate
 test_absent_trigger_still_posts
+test_untrusted_author_does_not_suppress
+test_same_second_earlier_trigger_does_not_suppress
 
 echo "----"
 echo "test_coderabbit_wait_ratelimit_window: $PASS passed, $FAIL failed"

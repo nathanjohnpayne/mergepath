@@ -1355,17 +1355,44 @@ post_reviewer_comment() {
 # narrows rather than closes the race — two processes scanning simultaneously
 # can still both post — but it collapses the common case from N-per-process
 # to ~1. Closing it fully would need a lock GitHub does not offer.
-trigger_already_posted() {  # <since-iso8601> <exact-body>
+# Codex P2 #830 (a): match ONLY comments authored by a configured reviewer
+# identity. Body text alone is forgeable — on a public PR any participant can
+# post the exact trigger string, and treating that as proof the helper already
+# nudged would SUPPRESS the real identity-verified POST. CodeRabbit ignores
+# commands from unauthorized accounts, so the window would never be
+# re-invoked and the process-local latch would block a second attempt: the
+# wait stalls. Fail-closed on the allow-list — an unreadable/empty
+# available_reviewers yields no trusted authors, so nothing matches and we
+# post (the safe direction).
+#
+# Codex P2 #830 (b): GitHub `created_at` has only SECOND precision, so a
+# trigger and a newly-posted notice can tie. A plain `>= since` would credit
+# the OLD trigger to the NEW notice, skip its nudge, and stall that window.
+# Compare by (created_at, id): strictly-later timestamp, or equal timestamp
+# with a higher comment id (ids increase monotonically), so a tie resolves by
+# true post order.
+trigger_already_posted() {  # <since-iso8601> <notice-comment-id> <exact-body>
   local since=$1
-  local body=$2
-  local comments
+  local notice_id=$2
+  local body=$3
+  local comments reviewers_json
   comments=$(fetch_api_array_best_effort "repos/$REPO/issues/$PR_NUMBER/comments" \
     "re-invocation dedupe scan") || return 1
-  printf '%s' "$comments" | jq -e --arg b "$body" --arg since "$since" \
-    'any(.[]?; (.body // "") == $b and (.created_at // "") >= $since)' >/dev/null 2>&1
+  # Trusted-author allow-list as a JSON array. `$l` is bound BEFORE the array
+  # literal so the literal cannot rebind `.` out from under the lookup.
+  reviewers_json=$(read_available_reviewers | jq -R . | jq -sc .) || return 1
+  printf '%s' "$comments" | jq -e \
+    --arg b "$body" --arg since "$since" --argjson nid "${notice_id:-0}" \
+    --argjson revs "$reviewers_json" \
+    'any(.[]?;
+       (.body // "") == $b
+       and ((.user.login // "") as $l | $revs | index($l) != null)
+       and ( (.created_at // "") > $since
+             or ((.created_at // "") == $since and ((.id // 0) > $nid)) ))' \
+    >/dev/null 2>&1
 }
 
-post_retry_trigger() {
+post_retry_trigger() {  # [<notice-fresh-at> <notice-comment-id>]
   # Strip the `[bot]` suffix that GitHub REST uses for App logins —
   # @-mentions address the user-facing handle (`@coderabbitai`), not
   # the API login (`coderabbitai[bot]`). Using the configured
@@ -1374,10 +1401,11 @@ post_retry_trigger() {
   # differently-named review bot) gets consistent polling and
   # triggering identities. See #140 round-3 Codex finding (P2, line 320).
   local since=${1:-}
+  local notice_id=${2:-0}
   local mention="@${BOT_LOGIN%\[bot\]}"
   local body="${mention}, try again."
-  if [ -n "$since" ] && trigger_already_posted "$since" "$body"; then
-    log "retry trigger already present for this rate-limit window (at/after $since) — skipping duplicate POST (#829)"
+  if [ -n "$since" ] && trigger_already_posted "$since" "$notice_id" "$body"; then
+    log "retry trigger already present for this rate-limit window (after notice $notice_id @ $since) — skipping duplicate POST (#829)"
     return 0
   fi
   log "posting retry trigger comment to PR #$PR_NUMBER as $mention"
@@ -1395,10 +1423,11 @@ post_resume_trigger() {
   # latch, so the auto-pause path carries the same cross-run duplication bug.
   # Same shared-state guard, same fail-open posture — see trigger_already_posted.
   local since=${1:-}
+  local notice_id=${2:-0}
   local mention="@${BOT_LOGIN%\[bot\]}"
   local body="${mention} resume"
-  if [ -n "$since" ] && trigger_already_posted "$since" "$body"; then
-    log "resume trigger already present for this pause NOTE (at/after $since) — skipping duplicate POST (#829)"
+  if [ -n "$since" ] && trigger_already_posted "$since" "$notice_id" "$body"; then
+    log "resume trigger already present for this pause NOTE (after notice $notice_id @ $since) — skipping duplicate POST (#829)"
     return 0
   fi
   log "posting auto-pause resume trigger comment to PR #$PR_NUMBER as $mention"
@@ -1982,7 +2011,7 @@ while :; do
       # Pass the notice's freshness anchor so the cross-run dedupe scan only
       # considers triggers posted for THIS rate-limit window (#829). Checked
       # after the sleep, so a concurrent run's nudge during the wait is seen.
-      post_retry_trigger "$COMMENT_FRESH_AT"
+      post_retry_trigger "$COMMENT_FRESH_AT" "$COMMENT_ID"
       RATE_LIMIT_RETRIES=$((RATE_LIMIT_RETRIES + 1))
       continue
       ;;
@@ -2017,7 +2046,7 @@ while :; do
       fi
       log "CodeRabbit auto-review paused; posting @coderabbitai resume (retry $((RESUME_RETRIES + 1))/$MAX_RESUME_RETRIES) and continuing to poll"
       # Anchor the cross-run dedupe scan to this pause NOTE (#829).
-      post_resume_trigger "$COMMENT_FRESH_AT"
+      post_resume_trigger "$COMMENT_FRESH_AT" "$COMMENT_ID"
       RESUME_RETRIES=$((RESUME_RETRIES + 1))
       sleep_or_timeout "$POLL_INTERVAL_SECONDS"
       continue
