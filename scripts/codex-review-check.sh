@@ -379,6 +379,29 @@ if [ "${CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD:-}" = "1" ]; then
   REQUIRE_APPROVAL_ON_HEAD=1
 fi
 
+# CODEX_REVIEW_CHECK_SKIP_REVIEWER_APPROVAL (#814) — per-invocation only.
+# Treat gate (b) as satisfied so the run reports purely on gate (c): does a
+# Codex signal exist on this head?
+#
+# The same-head barrier needs that question answered BEFORE it runs a
+# reviewer, and gate (b) is evaluated first and hard-fails when no non-author
+# APPROVED exists on HEAD — which is precisely the state at the barrier's
+# first evaluation, since no Phase 4b approval has been posted yet. Without
+# this the composite returns 1 for a gate-(b) reason on essentially every
+# first evaluation, the barrier reads permanent NOT-YET, and it can never
+# open. Where it happens to return 0, that is gate (b) branch 2 clearing on a
+# Codex 👍 or carry-forward — mechanics unrelated to the question being asked.
+#
+# Default behaviour is byte-identical: unset, nothing changes. It is opt-in
+# per process and never read from policy, so no consumer inherits it, and the
+# merge-gate invocations in agent-review.yml and merge-clearance-gate.sh do
+# not set it. Deliberately NOT combinable with a merge decision — a caller
+# setting this is asking a diagnostic question, not clearing a merge.
+SKIP_REVIEWER_APPROVAL=0
+if [ "${CODEX_REVIEW_CHECK_SKIP_REVIEWER_APPROVAL:-}" = "1" ]; then
+  SKIP_REVIEWER_APPROVAL=1
+fi
+
 # Honor codex.allow_phase_4b_substitute. When true (default), gate (c)
 # also accepts an APPROVED review on the current HEAD from an
 # available_reviewers identity != the PR author as a Codex-equivalent
@@ -1856,6 +1879,14 @@ if [ -z "$APPROVING_REVIEWER" ]; then
       log "gate (b): same-agent + Codex same-content verdict carry-forward @ $CODEX_CARRYFORWARD_VERDICT_TIME from $CODEX_CARRYFORWARD_COMMIT — branch 2 cleared (#705)"
       APPROVING_REVIEWER="(branch 2: same-agent + Codex same-content verdict)"
     fi
+  fi
+
+  if [ -z "$APPROVING_REVIEWER" ] && [ "$SKIP_REVIEWER_APPROVAL" = "1" ]; then
+    # #814: the caller is asking whether Codex has spoken on this head, not
+    # whether the PR may merge. Gate (b) is skipped for this invocation only;
+    # gate (c) below still has to pass on its own evidence.
+    log "gate (b): SKIPPED (CODEX_REVIEW_CHECK_SKIP_REVIEWER_APPROVAL=1 — diagnostic invocation, not a merge decision)"
+    APPROVING_REVIEWER="(skipped: reviewer-approval check disabled for this invocation)"
   fi
 
   if [ -z "$APPROVING_REVIEWER" ]; then

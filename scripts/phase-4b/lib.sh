@@ -66,12 +66,31 @@ p4b_config() {
 # sub-block readers (p4b_acct_config_field, mirroring codex_p1_gate_field)
 # own those.
 p4b_automation_field() {
-  local field="$1" cfg
+  p4b_policy_block_field phase_4b_automation "$1"
+}
+
+# p4b_policy_block_field <block> <field> — the same reader, generalized over
+# the top-level block name (#814). Needed because the same-head barrier reads
+# `codex.enabled` and `coderabbit.enabled`, and neither has a sourceable
+# reader: the existing per-script `codex_field` / `coderabbit_field` copies
+# live inside scripts whose top level runs work on source, and both are
+# hardcoded to one block.
+#
+# The direct-child scoping is load-bearing for exactly the keys the barrier
+# needs. `coderabbit.severity_gate.enabled`, `codex.p1_gate.enabled` and
+# `codex.external_review_gate.enabled` all exist as NESTED `enabled:` keys, so
+# a flat block scan returns whichever comes first in document order — a
+# consumer that omits the optional top-level `enabled` would read a sub-gate
+# toggle as the master switch and the barrier would guard on the wrong thing.
+p4b_policy_block_field() {
+  local block="$1" field="$2" cfg
   cfg="$(p4b_config)"
   [ -f "$cfg" ] || return 0
-  awk -v field="$field" '
-    /^phase_4b_automation:/ { inblk=1; child_indent=-1; next }
-    inblk && /^[^[:space:]#]/ { inblk=0 }
+  awk -v block="$block" -v field="$field" '
+    /^[^[:space:]#]/ {
+      if ($0 ~ "^" block ":") { inblk=1; child_indent=-1; next }
+      inblk=0
+    }
     inblk {
       if ($0 ~ /^[[:space:]]*(#|$)/) next
       indent = match($0, /[^[:space:]]/) - 1
@@ -105,6 +124,169 @@ p4b_top_field() {
       print; exit
     }
   ' "$cfg"
+}
+
+# --- same-head provider barrier: terminality (#814) -------------------------
+#
+# Each enabled provider arm resolves to exactly one class per probe:
+#
+#   reported          a terminal signal exists on THIS head
+#   will-not-report   the provider will never post on this head
+#   not-yet           it has not posted on this head YET
+#   escalate          a stuck condition only a human can clear
+#
+# Only `reported` and `will-not-report` let the barrier open. `not-yet` is a
+# bounded, self-clearing wait; `escalate` goes to the human immediately.
+#
+# The split exists because treating "any terminal-looking rc" as satisfied
+# makes the barrier a universal pass: rc 4 means "has not reported", and rc 6
+# with skip_reason=paused means "is refusing to report until resumed" — the
+# #593 false-clear precedent. Both must read as not-yet.
+
+# p4b_barrier_class_coderabbit <head> <rc> <json>
+# Maps one scripts/coderabbit-wait.sh result — polling or --probe — to a
+# class. Pure: jq over the passed string only, no I/O, always returns 0.
+p4b_barrier_class_coderabbit() {
+  local head="$1" rc="$2" json="$3" probe_head skip
+  case "$rc" in
+    0|2)
+      # Terminal, but only for the head about to be approved. An rc 0/2
+      # anchored on an older head is a stale clearance, and the #794 ordering
+      # failure begins exactly there.
+      probe_head="$(printf '%s' "$json" | jq -r '.head_sha // empty' 2>/dev/null || true)"
+      if [ -n "$probe_head" ] && [ "$probe_head" = "$head" ]; then
+        printf 'reported'
+      else
+        printf 'not-yet'
+      fi
+      ;;
+    6)
+      skip="$(printf '%s' "$json" | jq -r '.skip_reason // empty' 2>/dev/null || true)"
+      case "$skip" in
+        non-base-branch|draft)
+          # Configuration facts about the PR, not a suspended review. Nothing
+          # will land on THIS head, so there is no later review to race.
+          printf 'will-not-report' ;;
+        paused)
+          # Present and declining until resumed, and the platform never
+          # auto-resumes. Reading this as terminal is the #593 false-clear.
+          printf 'not-yet' ;;
+        *)
+          # An unrecognised skip_reason is a shape we do not model, so it must
+          # never open the barrier. The bounded wait ends at a human, which is
+          # the right destination for an unmodelled provider state.
+          printf 'not-yet' ;;
+      esac
+      ;;
+    4|7)
+      # 4 = the poll budget elapsed with no review; 7 = --probe found none.
+      printf 'not-yet' ;;
+    5)
+      # rate_limit_stalled. AGENTS.md routes this to a human unless the #489
+      # Codex failover engaged; the barrier must not silently absorb it.
+      printf 'escalate' ;;
+    *)
+      # 3 (infra) and anything unmodelled. Fail closed to the human rather
+      # than guessing.
+      printf 'escalate' ;;
+  esac
+}
+
+# p4b_barrier_class_codex <rc>
+# Maps one scripts/codex-review-check.sh result to a class. The caller runs it
+# with CODEX_REVIEW_CHECK_SKIP_CI=1, REQUIRE_APPROVAL_ON_HEAD=1,
+# ALLOW_PHASE_4B_SUBSTITUTE=false and SKIP_REVIEWER_APPROVAL=1, so rc 0 means
+# "Codex itself has spoken on this head" rather than "the merge gate passes".
+# Codex has no will-not-report state: it is either asked or not.
+p4b_barrier_class_codex() {
+  case "$1" in
+    0) printf 'reported' ;;
+    1) printf 'not-yet' ;;
+    *) printf 'escalate' ;;
+  esac
+}
+
+# --- same-head provider barrier: bounded not-yet retry (#814) ---------------
+#
+# phase-4b-review.sh is one-shot, so "retry until a bound" cannot be an
+# in-process sleep without holding the process open for up to the full
+# coderabbit.max_wait_seconds at each of two evaluation points. The bound
+# instead rides a marker keyed to (repo, PR, head), written on the first
+# not-yet for that head and removed on every other outcome.
+#
+# Whose clock: the LOCAL clock of the trusted checkout running the
+# orchestrator — the same one the accounting hooks already use. Deliberately
+# NOT a GitHub timestamp, and deliberately not the head committer date, which
+# the pusher controls.
+#
+# The marker asserts no provider event. It records only "this checkout began
+# waiting at T"; terminality comes solely from the probe rc and its head_sha,
+# so no value of the clock can turn a not-yet provider into a reported one.
+# Both tamper directions fail safe: an artificially OLD marker exhausts the
+# budget early and hands the PR to a human, posting no review; a missing, new,
+# or future-dated marker restarts the budget and the barrier keeps returning
+# pending — also posting no review. The clock decides only WHEN to stop
+# retrying and involve a human, which is conservative either way.
+
+# Wall-clock bound for the pending wait, from coderabbit.max_wait_seconds.
+# A malformed value falls back to the default rather than failing closed: this
+# governs only when a human is called, so a bad parse must not deadlock.
+p4b_barrier_budget_seconds() {
+  local raw
+  raw="$(p4b_policy_block_field coderabbit max_wait_seconds)"
+  case "$raw" in
+    ''|*[!0-9]*) printf '1245' ;;
+    *) printf '%s' "$raw" ;;
+  esac
+}
+
+p4b_barrier_marker_path() {  # <repo> <pr> <head>
+  local repo_slug state
+  repo_slug="$(printf '%s' "${1:-unknown}" | tr '/' '-')"
+  # Honour P4B_ACCT_STATE_DIR directly rather than calling
+  # p4b_acct_state_dir, which lives in accounting.sh. lib.sh must not depend
+  # on that module being loaded: the orchestrator sources it, but a caller
+  # sourcing lib.sh alone would silently fall back to the real repo state dir
+  # and write markers into the working tree. Same env var, same default, so
+  # the two agree wherever both are present.
+  state="${P4B_ACCT_STATE_DIR:-$(p4b_repo_root)/.mergepath}"
+  printf '%s/phase-4b-barrier/%s-pr%s-%s.pending' \
+    "$state" "$repo_slug" "${2:-0}" "${3:-nohead}"
+}
+
+# p4b_barrier_note_pending <repo> <pr> <head>
+# Record the first not-yet for this head and print the seconds elapsed since
+# it. Prints 0 on the first observation. Advisory: if the state dir cannot be
+# written the wait simply never accumulates, so the barrier keeps returning
+# pending rather than escalating early — the safe direction.
+p4b_barrier_note_pending() {
+  local marker started now
+  marker="$(p4b_barrier_marker_path "$1" "$2" "$3")"
+  now="$(date +%s)"
+  if [ -f "$marker" ]; then
+    started="$(cat "$marker" 2>/dev/null || true)"
+  else
+    mkdir -p "$(dirname "$marker")" 2>/dev/null || true
+    printf '%s\n' "$now" >"$marker" 2>/dev/null || true
+    started="$now"
+  fi
+  case "$started" in
+    ''|*[!0-9]*) printf '0'; return 0 ;;
+  esac
+  if [ "$started" -gt "$now" ]; then
+    # Future-dated marker (clock skew or tampering): treat as fresh rather
+    # than producing a negative elapsed, so the budget restarts.
+    printf '0'
+    return 0
+  fi
+  printf '%s' "$(( now - started ))"
+}
+
+# p4b_barrier_clear_pending <repo> <pr> <head>
+# Drop the marker. Called on every non-not-yet outcome so a later not-yet on
+# the same head starts a fresh budget instead of inheriting a stale one.
+p4b_barrier_clear_pending() {
+  rm -f "$(p4b_barrier_marker_path "$1" "$2" "$3")" 2>/dev/null || true
 }
 
 # --- reviewer CLI runtime bounds: timeout + effort (#589) -------------------

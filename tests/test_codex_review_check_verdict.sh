@@ -287,6 +287,50 @@ gc "thumbs-only → YES"                                              yes "2026-
 gc "review-only clean → YES"                                        yes ""                    "2026-07-01T10:00:00Z" ""                    0 0
 gc "no signals at all → NO"                                         no  ""                    ""                    ""                    0 0
 
+# ── #814: CODEX_REVIEW_CHECK_SKIP_REVIEWER_APPROVAL is opt-in per invocation
+#      and cannot change default behaviour.
+#
+# This script is the delegate of a REQUIRED status check in every fleet repo,
+# so the knob's risk is not what it does when set — it is whether it can leak
+# into a run that did not ask for it. These assertions pin that it cannot.
+# Structural, matching this file's documented approach; the behavioural check
+# (knob off → gate (b) evaluated, knob on → skipped, gate (c) evaluated either
+# way) was run live against a real PR and is NOT automated here, because
+# driving the full flow needs a gh stub harness this suite does not have.
+skipknob_ok=1
+# Gated on the literal "1": no truthy-string coercion, so `=false` or an empty
+# value cannot enable it.
+grep -q 'if \[ "${CODEX_REVIEW_CHECK_SKIP_REVIEWER_APPROVAL:-}" = "1" \]; then' "$SCRIPT" || skipknob_ok=0
+# Defaults off.
+grep -q '^SKIP_REVIEWER_APPROVAL=0' "$SCRIPT" || skipknob_ok=0
+# Never sourced from policy — a consumer cannot inherit it via review-policy.yml.
+if grep -qE '(codex_field|policy_field|policy_top_field)[[:space:]]+[a-z_]*skip_reviewer' "$SCRIPT"; then
+  skipknob_ok=0
+fi
+# The skip only applies when NO approving reviewer was found, so it can never
+# override or mask a real APPROVED review.
+grep -q 'if \[ -z "\$APPROVING_REVIEWER" \] && \[ "\$SKIP_REVIEWER_APPROVAL" = "1" \]; then' "$SCRIPT" || skipknob_ok=0
+# The gate (b) hard failure is still reachable when the knob is off.
+grep -q 'fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED' "$SCRIPT" || skipknob_ok=0
+if [ "$skipknob_ok" = 1 ]; then
+  pass "#814: SKIP_REVIEWER_APPROVAL is literal-1 opt-in, defaults off, never policy-sourced, and cannot mask a real approval"
+else
+  fail "#814: SKIP_REVIEWER_APPROVAL knob lost one of its opt-in guarantees"
+fi
+
+# The knob must not touch gate (c): a caller asking "has Codex spoken" still
+# has to get that answer from Codex evidence. Positional rather than a text
+# scan — the header documents gate (c) long before it is evaluated, so any
+# "starts matching at the first mention" filter reports a false leak (it did,
+# on the first version of this assertion).
+knob_last=$(grep -n 'SKIP_REVIEWER_APPROVAL' "$SCRIPT" | tail -1 | cut -d: -f1)
+gatec_at=$(grep -n 'log "gate (c): checking external clearance' "$SCRIPT" | head -1 | cut -d: -f1)
+if [ -n "$knob_last" ] && [ -n "$gatec_at" ] && [ "$knob_last" -lt "$gatec_at" ]; then
+  pass "#814: every knob reference precedes the gate (c) evaluation — it cannot influence external clearance"
+else
+  fail "#814: SKIP_REVIEWER_APPROVAL reference at line ${knob_last:-?} is not before gate (c) at ${gatec_at:-?}"
+fi
+
 echo ""
 echo "test_codex_review_check_verdict: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
