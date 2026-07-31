@@ -408,12 +408,17 @@ p4b_barrier_should_trigger() {
 # marker's whole value is that an identity-verified account authored it.
 p4b_barrier_post_trigger() {
   local repo="$1" pr="$2" head="$3" reviewer="$4"
-  local wrapper body rc=0
-  wrapper="${P4B_GH_AS_REVIEWER:-$(p4b_repo_root)/scripts/gh-as-reviewer.sh}"
-  [ -x "$wrapper" ] || return 1
+  # Uppercase *_AS_REVIEWER deliberately: check_no_bare_gh_writes exempts a
+  # wrapped write only when the wrapper is a literal gh-as-*.sh path or a
+  # variable matching [A-Z_]*AS_(AUTHOR|REVIEWER). A lowercase holder reads as
+  # a bare `gh pr comment` and fails the gate — correctly, since the gate
+  # cannot tell what a lowercase variable points at.
+  local WRAPPER_AS_REVIEWER body rc=0
+  WRAPPER_AS_REVIEWER="${P4B_GH_AS_REVIEWER:-$(p4b_repo_root)/scripts/gh-as-reviewer.sh}"
+  [ -x "$WRAPPER_AS_REVIEWER" ] || return 1
   body="$(printf '@coderabbitai review\n\n%s\n' "$(p4b_barrier_trigger_marker "$head")")"
   env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$reviewer" \
-    "$wrapper" -- gh pr comment "$pr" --repo "$repo" --body "$body" \
+    "$WRAPPER_AS_REVIEWER" -- gh pr comment "$pr" --repo "$repo" --body "$body" \
     >/dev/null 2>&1 || rc=$?
   return "$rc"
 }
