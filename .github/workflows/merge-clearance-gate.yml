@@ -134,6 +134,14 @@ jobs:
           # degradation to warn you.
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          # Dependabot PRs are SAME-REPO, so IS_FORK is false for them, but
+          # their GITHUB_TOKEN is read-only all the same — this repo documents
+          # that at dependabot-auto-merge.yml:5-6, which is why that workflow
+          # uses pull_request_target. Without this the publish fails every
+          # retry, takes the hard-error branch below, and fails the required
+          # check on every Dependabot PR. Dependabot runs weekly here
+          # (.github/dependabot.yml), so that is not a corner case.
+          PR_ACTOR: ${{ github.event.pull_request.user.login }}
           # Same name as the sweep/dispatch CHECK_NAME and as
           # audit-branch-protection.sh's CANONICAL_REQUIRED_CHECKS entry.
           CHECK_NAME: "Merge clearance gate"
@@ -161,13 +169,18 @@ jobs:
             id=""; sleep $((attempt * 5))
           done
           if [ -z "$id" ]; then
-            if [ "$IS_FORK" = "true" ]; then
-              # Fork PR: GITHUB_TOKEN is read-only regardless of the
-              # permissions: block above. Degrade to the pre-#841 shape — this
-              # job's NATIVE check still carries the verdict under the required
-              # name on the PR head, and the */15 sweep still refreshes the
-              # Checks-API entry. Not fixed, but not regressed either.
-              echo "::warning::Fork PR — cannot publish the '$CHECK_NAME' check_run. Native check + sweep remain (#841)."
+            # A restricted GITHUB_TOKEN cannot publish, and that must NOT be
+            # turned into a failed required check. Two contexts have one: fork
+            # PRs, and Dependabot PRs — which are same-repo, so IS_FORK is
+            # false for them. Degrade to the pre-#841 shape in both: this job's
+            # NATIVE check still carries the verdict under the required name on
+            # the PR head, and the */15 sweep still refreshes the Checks-API
+            # entry. Not fixed, but not regressed either.
+            #
+            # `[ = ]` rather than a case pattern: "dependabot[bot]" in a case
+            # arm is a glob character class and would match "dependabott".
+            if [ "$IS_FORK" = "true" ] || [ "$PR_ACTOR" = "dependabot[bot]" ]; then
+              echo "::warning::Restricted token (fork or Dependabot) — cannot publish the '$CHECK_NAME' check_run. Native check + sweep remain (#841)."
               exit 0
             fi
             echo "::error::Could not open the '$CHECK_NAME' check_run on $HEAD_SHA. Refusing to report a verdict we cannot publish (#841)."

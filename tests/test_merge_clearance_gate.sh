@@ -1419,10 +1419,27 @@ STUB
   grep -q "^id=" "$T23/out.txt" && bad="$bad p1-fork-idleak"
 
   reset23
-  OUT=$(REPO=o/r HEAD_SHA="$SHA1" IS_FORK=false CHECK_NAME=X GH_POST_FAIL=1 \
-        run23 "$P1_BODY"); RC=$?
+  OUT=$(REPO=o/r HEAD_SHA="$SHA1" IS_FORK=false PR_ACTOR=someone CHECK_NAME=X \
+        GH_POST_FAIL=1 run23 "$P1_BODY"); RC=$?
   [ "$RC" = 1 ] || bad="$bad p1-samerepo-rc"
   printf '%s' "$OUT" | grep -q "::error::" || bad="$bad p1-samerepo-err"
+
+  # Dependabot PRs are SAME-REPO (IS_FORK=false) but carry a read-only token.
+  # Without this branch the publish fails every retry and fails the required
+  # check on every Dependabot PR, which run weekly here (Codex P1 on #843).
+  reset23
+  OUT=$(REPO=o/r HEAD_SHA="$SHA1" IS_FORK=false PR_ACTOR="dependabot[bot]" \
+        CHECK_NAME=X GH_POST_FAIL=1 run23 "$P1_BODY"); RC=$?
+  [ "$RC" = 0 ] || bad="$bad p1-dependabot-rc"
+  printf '%s' "$OUT" | grep -q "::warning::" || bad="$bad p1-dependabot-warn"
+
+  # "dependabot[bot]" is a glob character class in a case arm, so a case-based
+  # match would also accept "dependabott" and let a spoofable actor name take
+  # the degrade path. Pin that it does not.
+  reset23
+  OUT=$(REPO=o/r HEAD_SHA="$SHA1" IS_FORK=false PR_ACTOR="dependabott" \
+        CHECK_NAME=X GH_POST_FAIL=1 run23 "$P1_BODY"); RC=$?
+  [ "$RC" = 1 ] || bad="$bad p1-dependabot-globtrap"
 
   reset23
   OUT=$(REPO=o/r HEAD_SHA="" IS_FORK=false CHECK_NAME=X run23 "$P1_BODY"); RC=$?
