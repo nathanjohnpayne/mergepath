@@ -193,10 +193,24 @@ p4b_barrier_class_coderabbit() {
 }
 
 # p4b_barrier_class_codex <rc>
-# Maps one scripts/codex-review-check.sh result to a class. The caller runs it
-# with CODEX_REVIEW_CHECK_SKIP_CI=1, REQUIRE_APPROVAL_ON_HEAD=1,
-# ALLOW_PHASE_4B_SUBSTITUTE=false and SKIP_REVIEWER_APPROVAL=1, so rc 0 means
-# "Codex itself has spoken on this head" rather than "the merge gate passes".
+# Maps one scripts/codex-review-check.sh result to a class.
+#
+# The caller MUST invoke the delegate with all five overrides:
+#
+#   CODEX_REVIEW_CHECK_SKIP_CI=1
+#   CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1
+#   CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false
+#   CODEX_REVIEW_CHECK_SKIP_REVIEWER_APPROVAL=1
+#   CODEX_REVIEW_CHECK_REQUIRE_HEAD_SIGNAL=1
+#
+# so that rc 0 means "Codex itself has spoken on THIS head" rather than "the
+# merge gate passes". The last one is not optional and is easy to miss: gate
+# (c) otherwise clears through the #705 same-content carry-forward, which is
+# consulted precisely when the current head has NO Codex signal. Correct for a
+# merge gate, since the reviewed content is identical — and wrong here, where
+# the contract is head identity. Without it the barrier can open before Codex
+# has spoken on the head about to be approved (Codex P1 on #835).
+#
 # Codex has no will-not-report state: it is either asked or not.
 p4b_barrier_class_codex() {
   case "$1" in
@@ -271,11 +285,23 @@ p4b_barrier_note_pending() {
     started="$now"
   fi
   case "$started" in
-    ''|*[!0-9]*) printf '0'; return 0 ;;
+    ''|*[!0-9]*)
+      # A crash or partial write can leave the marker empty or non-numeric.
+      # Returning 0 without repairing it means every later one-shot invocation
+      # reads the same invalid value, reports zero elapsed again, and the
+      # bounded retry never exhausts — so the manual fallback is never reached
+      # and the wait is unbounded in practice. Reinitialize instead.
+      printf '%s\n' "$now" >"$marker" 2>/dev/null || true
+      printf '0'
+      return 0
+      ;;
   esac
   if [ "$started" -gt "$now" ]; then
     # Future-dated marker (clock skew or tampering): treat as fresh rather
-    # than producing a negative elapsed, so the budget restarts.
+    # than producing a negative elapsed, so the budget restarts. Rewrite it,
+    # or every later invocation restarts the budget again and the wait never
+    # exhausts — the same unbounded-retry defect as the invalid-value case.
+    printf '%s\n' "$now" >"$marker" 2>/dev/null || true
     printf '0'
     return 0
   fi

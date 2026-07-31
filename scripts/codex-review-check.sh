@@ -402,6 +402,25 @@ if [ "${CODEX_REVIEW_CHECK_SKIP_REVIEWER_APPROVAL:-}" = "1" ]; then
   SKIP_REVIEWER_APPROVAL=1
 fi
 
+# CODEX_REVIEW_CHECK_REQUIRE_HEAD_SIGNAL (#814) — per-invocation only.
+# Disable the #705 same-content carry-forward so gate (c) can clear ONLY on a
+# Codex signal anchored to this exact head.
+#
+# The carry-forward is consulted precisely when the current head has no Codex
+# signal of its own, so without this a caller asking "has Codex spoken on THIS
+# head?" gets exit 0 for a verdict on an older commit. That is correct for a
+# merge gate — the reviewed content is identical, which is the whole point of
+# #705 and #763 — and wrong for a same-head ordering barrier, whose contract
+# is head identity, not content identity. Conflating the two would let the
+# barrier open before Codex has spoken on the head about to be approved.
+#
+# Default behaviour is byte-identical: unset, the carry-forward runs as
+# before. Opt-in per process, never read from policy.
+REQUIRE_HEAD_SIGNAL=0
+if [ "${CODEX_REVIEW_CHECK_REQUIRE_HEAD_SIGNAL:-}" = "1" ]; then
+  REQUIRE_HEAD_SIGNAL=1
+fi
+
 # Honor codex.allow_phase_4b_substitute. When true (default), gate (c)
 # also accepts an APPROVED review on the current HEAD from an
 # available_reviewers identity != the PR author as a Codex-equivalent
@@ -1727,7 +1746,11 @@ if [ "$CODEX_ENABLED" = "true" ]; then
   # consulted when there is NO current-head Codex signal; the latest-signal-wins
   # block below still lets any current-head review/verdict/reaction override it.
   CARRY_BIN="$__CODEX_CHECK_DIR/workflow/external_review_carryforward.sh"
-  if [ -x "$CARRY_BIN" ]; then
+  if [ "$REQUIRE_HEAD_SIGNAL" = "1" ]; then
+    # #814: the caller is asking whether Codex spoke on THIS head. A
+    # same-content verdict on an older commit is not that answer.
+    log "codex verdict carry-forward: SKIPPED (CODEX_REVIEW_CHECK_REQUIRE_HEAD_SIGNAL=1 — current-head signal required)"
+  elif [ -x "$CARRY_BIN" ]; then
     set +e
     CARRY_JSON=$(bash "$CARRY_BIN" \
       --repo "$REPO" \

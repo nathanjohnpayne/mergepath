@@ -2427,9 +2427,19 @@ printf '%s\n' "$(( $(date +%s) - 600 ))" >"$(_mk)"
 # would otherwise read as a huge elapsed and escalate immediately.
 printf '%s\n' "$(( $(date +%s) + 9000 ))" >"$(_mk)"
 [ "$(p4b_barrier_note_pending owner/repo 99 headsha)" = "0" ] || bad="$bad future"
-# A garbage marker must not crash or produce a non-numeric elapsed.
+# A garbage marker must not crash — and must be REPAIRED, not merely tolerated.
+# Returning 0 without rewriting it means every later one-shot invocation reads
+# the same invalid value and reports zero elapsed again, so the bounded retry
+# never exhausts and the manual fallback is never reached (Codex P2 on #835).
+# The first version of this assertion checked only the return value and so
+# pinned the defect as correct.
 printf 'not-a-number\n' >"$(_mk)"
 [ "$(p4b_barrier_note_pending owner/repo 99 headsha)" = "0" ] || bad="$bad garbage"
+case "$(cat "$(_mk)" 2>/dev/null)" in ''|*[!0-9]*) bad="$bad garbage-not-repaired" ;; esac
+# Same for a future-dated marker: the clock must be restarted ON DISK.
+printf '%s\n' "$(( $(date +%s) + 9000 ))" >"$(_mk)"
+[ "$(p4b_barrier_note_pending owner/repo 99 headsha)" = "0" ] || bad="$bad future2"
+[ "$(cat "$(_mk)" 2>/dev/null)" -le "$(date +%s)" ] || bad="$bad future-not-repaired"
 p4b_barrier_clear_pending owner/repo 99 headsha
 [ ! -f "$(_mk)" ] || bad="$bad clear"
 # A different head gets its own budget rather than inheriting the last one.
