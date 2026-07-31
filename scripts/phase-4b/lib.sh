@@ -197,19 +197,22 @@ p4b_barrier_class_coderabbit() {
 #
 # The caller MUST invoke the delegate with all five overrides:
 #
-#   CODEX_REVIEW_CHECK_SKIP_CI=1
-#   CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1
-#   CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false
-#   CODEX_REVIEW_CHECK_SKIP_REVIEWER_APPROVAL=1
-#   CODEX_REVIEW_CHECK_REQUIRE_HEAD_SIGNAL=1
+#   CODEX_REVIEW_CHECK_SKIP_CI=1                      (env)
+#   CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1     (env)
+#   CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false (env)
+#   --diagnostic-signal-only                          (FLAG, not env)
 #
 # so that rc 0 means "Codex itself has spoken on THIS head" rather than "the
-# merge gate passes". The last one is not optional and is easy to miss: gate
-# (c) otherwise clears through the #705 same-content carry-forward, which is
-# consulted precisely when the current head has NO Codex signal. Correct for a
-# merge gate, since the reviewed content is identical — and wrong here, where
-# the contract is head identity. Without it the barrier can open before Codex
-# has spoken on the head about to be approved (Codex P1 on #835).
+# merge gate passes". The flag skips gate (b) and disables the #705
+# same-content carry-forward, which is consulted precisely when the current
+# head has NO Codex signal — correct for a merge gate, since the reviewed
+# content is identical, and wrong here, where the contract is head identity.
+# Without it the barrier can open before Codex has spoken on the head about to
+# be approved (Codex P1 on #835).
+#
+# It is a flag rather than an env var because it WEAKENS a required gate and
+# environment variables are inherited: as an env var the merge-gate callers
+# would pick it up by accident (CodeRabbit Major on #835).
 #
 # Codex has no will-not-report state: it is either asked or not.
 p4b_barrier_class_codex() {

@@ -167,8 +167,38 @@ fi
 
 # --- argument parsing -------------------------------------------------------
 
+# --diagnostic-signal-only (#814) — a FLAG, deliberately not an environment
+# variable (CodeRabbit Major on #835).
+#
+# It skips gate (b) and disables the #705 carry-forward so the run reports
+# purely on "did Codex speak on THIS head", which is what the same-head
+# barrier needs. That WEAKENS a gate, and this script is the delegate of a
+# REQUIRED status check invoked by scripts/merge-clearance-gate.sh, by
+# .github/workflows/agent-review.yml and by the auto-clear workflow. An
+# environment variable is inherited by every child process, so any of those
+# callers would silently pick it up from a runner env, an exported shell
+# variable, or a workflow-level `env:` block, and the required gate would stop
+# checking for reviewer approval without anyone asking it to.
+#
+# A flag cannot be inherited. Callers that want the diagnostic pass it
+# explicitly; callers that do not, cannot get it by accident.
+#
+# The three pre-existing env knobs are left as-is on purpose: SKIP_CI narrows
+# scope, and REQUIRE_APPROVAL_ON_HEAD=1 / ALLOW_PHASE_4B_SUBSTITUTE=false both
+# make the gate STRICTER. Inheriting those is safe in a way inheriting this
+# one is not.
+DIAGNOSTIC_SIGNAL_ONLY=0
+_crc_positional=()
+for _arg in "$@"; do
+  case "$_arg" in
+    --diagnostic-signal-only) DIAGNOSTIC_SIGNAL_ONLY=1 ;;
+    *) _crc_positional+=("$_arg") ;;
+  esac
+done
+set -- ${_crc_positional[@]+"${_crc_positional[@]}"}
+
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  echo "Usage: $0 <PR_NUMBER> [REPO]" >&2
+  echo "Usage: $0 [--diagnostic-signal-only] <PR_NUMBER> [REPO]" >&2
   exit 3
 fi
 
@@ -379,7 +409,7 @@ if [ "${CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD:-}" = "1" ]; then
   REQUIRE_APPROVAL_ON_HEAD=1
 fi
 
-# CODEX_REVIEW_CHECK_SKIP_REVIEWER_APPROVAL (#814) — per-invocation only.
+# Gate (b) bypass, driven by --diagnostic-signal-only (#814).
 # Treat gate (b) as satisfied so the run reports purely on gate (c): does a
 # Codex signal exist on this head?
 #
@@ -392,17 +422,12 @@ fi
 # open. Where it happens to return 0, that is gate (b) branch 2 clearing on a
 # Codex 👍 or carry-forward — mechanics unrelated to the question being asked.
 #
-# Default behaviour is byte-identical: unset, nothing changes. It is opt-in
-# per process and never read from policy, so no consumer inherits it, and the
-# merge-gate invocations in agent-review.yml and merge-clearance-gate.sh do
-# not set it. Deliberately NOT combinable with a merge decision — a caller
-# setting this is asking a diagnostic question, not clearing a merge.
-SKIP_REVIEWER_APPROVAL=0
-if [ "${CODEX_REVIEW_CHECK_SKIP_REVIEWER_APPROVAL:-}" = "1" ]; then
-  SKIP_REVIEWER_APPROVAL=1
-fi
+# Default behaviour is byte-identical: without the flag, nothing changes.
+# Deliberately NOT combinable with a merge decision — a caller passing it is
+# asking a diagnostic question, not clearing a merge.
+SKIP_REVIEWER_APPROVAL="$DIAGNOSTIC_SIGNAL_ONLY"
 
-# CODEX_REVIEW_CHECK_REQUIRE_HEAD_SIGNAL (#814) — per-invocation only.
+# Carry-forward suppression, driven by the same --diagnostic-signal-only flag.
 # Disable the #705 same-content carry-forward so gate (c) can clear ONLY on a
 # Codex signal anchored to this exact head.
 #
@@ -414,12 +439,10 @@ fi
 # is head identity, not content identity. Conflating the two would let the
 # barrier open before Codex has spoken on the head about to be approved.
 #
-# Default behaviour is byte-identical: unset, the carry-forward runs as
-# before. Opt-in per process, never read from policy.
-REQUIRE_HEAD_SIGNAL=0
-if [ "${CODEX_REVIEW_CHECK_REQUIRE_HEAD_SIGNAL:-}" = "1" ]; then
-  REQUIRE_HEAD_SIGNAL=1
-fi
+# Bound to the same flag rather than a separate one: both express the single
+# question "did Codex speak on this head", and splitting them would let a
+# caller ask half of it.
+REQUIRE_HEAD_SIGNAL="$DIAGNOSTIC_SIGNAL_ONLY"
 
 # Honor codex.allow_phase_4b_substitute. When true (default), gate (c)
 # also accepts an APPROVED review on the current HEAD from an
@@ -1749,7 +1772,7 @@ if [ "$CODEX_ENABLED" = "true" ]; then
   if [ "$REQUIRE_HEAD_SIGNAL" = "1" ]; then
     # #814: the caller is asking whether Codex spoke on THIS head. A
     # same-content verdict on an older commit is not that answer.
-    log "codex verdict carry-forward: SKIPPED (CODEX_REVIEW_CHECK_REQUIRE_HEAD_SIGNAL=1 — current-head signal required)"
+    log "codex verdict carry-forward: SKIPPED (--diagnostic-signal-only — current-head signal required)"
   elif [ -x "$CARRY_BIN" ]; then
     set +e
     CARRY_JSON=$(bash "$CARRY_BIN" \
@@ -1908,7 +1931,7 @@ if [ -z "$APPROVING_REVIEWER" ]; then
     # #814: the caller is asking whether Codex has spoken on this head, not
     # whether the PR may merge. Gate (b) is skipped for this invocation only;
     # gate (c) below still has to pass on its own evidence.
-    log "gate (b): SKIPPED (CODEX_REVIEW_CHECK_SKIP_REVIEWER_APPROVAL=1 — diagnostic invocation, not a merge decision)"
+    log "gate (b): SKIPPED (--diagnostic-signal-only — diagnostic invocation, not a merge decision)"
     APPROVING_REVIEWER="(skipped: reviewer-approval check disabled for this invocation)"
   fi
 
