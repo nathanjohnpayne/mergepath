@@ -287,6 +287,53 @@ gc "thumbs-only → YES"                                              yes "2026-
 gc "review-only clean → YES"                                        yes ""                    "2026-07-01T10:00:00Z" ""                    0 0
 gc "no signals at all → NO"                                         no  ""                    ""                    ""                    0 0
 
+# ── #814: the diagnostic bypass is a FLAG, not an inheritable env var.
+#
+# This script is the delegate of a REQUIRED status check in every fleet repo.
+# --diagnostic-signal-only skips gate (b) and disables the #705 carry-forward,
+# which WEAKENS the gate — so the risk is not what it does when asked for, but
+# whether a caller can get it without asking. An environment variable is
+# inherited by every child process, so merge-clearance-gate.sh, agent-review.yml
+# and the auto-clear workflow would pick it up from a runner env or a
+# workflow-level `env:` block and silently stop checking reviewer approval
+# (CodeRabbit Major on #835). A flag cannot be inherited.
+#
+# Structural, matching this file's documented approach; the behavioural check
+# (env var inert, flag effective) was run live against a real PR and is not
+# automated here, because driving the full flow needs a gh stub harness this
+# suite does not have.
+knob_ok=1
+# The bypass is reachable ONLY through the flag.
+grep -q -- '--diagnostic-signal-only) DIAGNOSTIC_SIGNAL_ONLY=1 ;;' "$SCRIPT" || knob_ok=0
+grep -q '^SKIP_REVIEWER_APPROVAL="\$DIAGNOSTIC_SIGNAL_ONLY"' "$SCRIPT" || knob_ok=0
+grep -q '^REQUIRE_HEAD_SIGNAL="\$DIAGNOSTIC_SIGNAL_ONLY"' "$SCRIPT" || knob_ok=0
+# No environment variable may enable it. This is the assertion that fails if
+# anyone reintroduces the inheritable form.
+if grep -qE 'CODEX_REVIEW_CHECK_(SKIP_REVIEWER_APPROVAL|REQUIRE_HEAD_SIGNAL)' "$SCRIPT"; then
+  knob_ok=0
+fi
+# Defaults off, and the skip cannot mask a real approval.
+grep -q '^DIAGNOSTIC_SIGNAL_ONLY=0' "$SCRIPT" || knob_ok=0
+grep -q 'if \[ -z "\$APPROVING_REVIEWER" \] && \[ "\$SKIP_REVIEWER_APPROVAL" = "1" \]; then' "$SCRIPT" || knob_ok=0
+# The gate (b) hard failure is still reachable without the flag.
+grep -q 'fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED' "$SCRIPT" || knob_ok=0
+if [ "$knob_ok" = 1 ]; then
+  pass "#814: the gate bypass is flag-only, defaults off, has no env-var path, and cannot mask a real approval"
+else
+  fail "#814: the gate bypass lost one of its non-inheritability guarantees"
+fi
+
+# Positional rather than a text scan — the header documents gate (c) long
+# before it is evaluated, so a "starts matching at the first mention" filter
+# reports a false leak (it did, on the first version of this assertion).
+knob_last=$(grep -n 'SKIP_REVIEWER_APPROVAL\|REQUIRE_HEAD_SIGNAL' "$SCRIPT" | tail -1 | cut -d: -f1)
+gatec_at=$(grep -n 'log "gate (c): checking external clearance' "$SCRIPT" | head -1 | cut -d: -f1)
+if [ -n "$knob_last" ] && [ -n "$gatec_at" ] && [ "$knob_last" -lt "$gatec_at" ]; then
+  pass "#814: every bypass reference precedes the gate (c) evaluation — it cannot influence external clearance"
+else
+  fail "#814: bypass reference at line ${knob_last:-?} is not before gate (c) at ${gatec_at:-?}"
+fi
+
 echo ""
 echo "test_codex_review_check_verdict: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

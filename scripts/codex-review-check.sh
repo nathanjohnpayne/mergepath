@@ -167,8 +167,38 @@ fi
 
 # --- argument parsing -------------------------------------------------------
 
+# --diagnostic-signal-only (#814) — a FLAG, deliberately not an environment
+# variable (CodeRabbit Major on #835).
+#
+# It skips gate (b) and disables the #705 carry-forward so the run reports
+# purely on "did Codex speak on THIS head", which is what the same-head
+# barrier needs. That WEAKENS a gate, and this script is the delegate of a
+# REQUIRED status check invoked by scripts/merge-clearance-gate.sh, by
+# .github/workflows/agent-review.yml and by the auto-clear workflow. An
+# environment variable is inherited by every child process, so any of those
+# callers would silently pick it up from a runner env, an exported shell
+# variable, or a workflow-level `env:` block, and the required gate would stop
+# checking for reviewer approval without anyone asking it to.
+#
+# A flag cannot be inherited. Callers that want the diagnostic pass it
+# explicitly; callers that do not, cannot get it by accident.
+#
+# The three pre-existing env knobs are left as-is on purpose: SKIP_CI narrows
+# scope, and REQUIRE_APPROVAL_ON_HEAD=1 / ALLOW_PHASE_4B_SUBSTITUTE=false both
+# make the gate STRICTER. Inheriting those is safe in a way inheriting this
+# one is not.
+DIAGNOSTIC_SIGNAL_ONLY=0
+_crc_positional=()
+for _arg in "$@"; do
+  case "$_arg" in
+    --diagnostic-signal-only) DIAGNOSTIC_SIGNAL_ONLY=1 ;;
+    *) _crc_positional+=("$_arg") ;;
+  esac
+done
+set -- ${_crc_positional[@]+"${_crc_positional[@]}"}
+
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  echo "Usage: $0 <PR_NUMBER> [REPO]" >&2
+  echo "Usage: $0 [--diagnostic-signal-only] <PR_NUMBER> [REPO]" >&2
   exit 3
 fi
 
@@ -378,6 +408,41 @@ REQUIRE_APPROVAL_ON_HEAD=0
 if [ "${CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD:-}" = "1" ]; then
   REQUIRE_APPROVAL_ON_HEAD=1
 fi
+
+# Gate (b) bypass, driven by --diagnostic-signal-only (#814).
+# Treat gate (b) as satisfied so the run reports purely on gate (c): does a
+# Codex signal exist on this head?
+#
+# The same-head barrier needs that question answered BEFORE it runs a
+# reviewer, and gate (b) is evaluated first and hard-fails when no non-author
+# APPROVED exists on HEAD — which is precisely the state at the barrier's
+# first evaluation, since no Phase 4b approval has been posted yet. Without
+# this the composite returns 1 for a gate-(b) reason on essentially every
+# first evaluation, the barrier reads permanent NOT-YET, and it can never
+# open. Where it happens to return 0, that is gate (b) branch 2 clearing on a
+# Codex 👍 or carry-forward — mechanics unrelated to the question being asked.
+#
+# Default behaviour is byte-identical: without the flag, nothing changes.
+# Deliberately NOT combinable with a merge decision — a caller passing it is
+# asking a diagnostic question, not clearing a merge.
+SKIP_REVIEWER_APPROVAL="$DIAGNOSTIC_SIGNAL_ONLY"
+
+# Carry-forward suppression, driven by the same --diagnostic-signal-only flag.
+# Disable the #705 same-content carry-forward so gate (c) can clear ONLY on a
+# Codex signal anchored to this exact head.
+#
+# The carry-forward is consulted precisely when the current head has no Codex
+# signal of its own, so without this a caller asking "has Codex spoken on THIS
+# head?" gets exit 0 for a verdict on an older commit. That is correct for a
+# merge gate — the reviewed content is identical, which is the whole point of
+# #705 and #763 — and wrong for a same-head ordering barrier, whose contract
+# is head identity, not content identity. Conflating the two would let the
+# barrier open before Codex has spoken on the head about to be approved.
+#
+# Bound to the same flag rather than a separate one: both express the single
+# question "did Codex speak on this head", and splitting them would let a
+# caller ask half of it.
+REQUIRE_HEAD_SIGNAL="$DIAGNOSTIC_SIGNAL_ONLY"
 
 # Honor codex.allow_phase_4b_substitute. When true (default), gate (c)
 # also accepts an APPROVED review on the current HEAD from an
@@ -1704,7 +1769,11 @@ if [ "$CODEX_ENABLED" = "true" ]; then
   # consulted when there is NO current-head Codex signal; the latest-signal-wins
   # block below still lets any current-head review/verdict/reaction override it.
   CARRY_BIN="$__CODEX_CHECK_DIR/workflow/external_review_carryforward.sh"
-  if [ -x "$CARRY_BIN" ]; then
+  if [ "$REQUIRE_HEAD_SIGNAL" = "1" ]; then
+    # #814: the caller is asking whether Codex spoke on THIS head. A
+    # same-content verdict on an older commit is not that answer.
+    log "codex verdict carry-forward: SKIPPED (--diagnostic-signal-only — current-head signal required)"
+  elif [ -x "$CARRY_BIN" ]; then
     set +e
     CARRY_JSON=$(bash "$CARRY_BIN" \
       --repo "$REPO" \
@@ -1856,6 +1925,14 @@ if [ -z "$APPROVING_REVIEWER" ]; then
       log "gate (b): same-agent + Codex same-content verdict carry-forward @ $CODEX_CARRYFORWARD_VERDICT_TIME from $CODEX_CARRYFORWARD_COMMIT — branch 2 cleared (#705)"
       APPROVING_REVIEWER="(branch 2: same-agent + Codex same-content verdict)"
     fi
+  fi
+
+  if [ -z "$APPROVING_REVIEWER" ] && [ "$SKIP_REVIEWER_APPROVAL" = "1" ]; then
+    # #814: the caller is asking whether Codex has spoken on this head, not
+    # whether the PR may merge. Gate (b) is skipped for this invocation only;
+    # gate (c) below still has to pass on its own evidence.
+    log "gate (b): SKIPPED (--diagnostic-signal-only — diagnostic invocation, not a merge decision)"
+    APPROVING_REVIEWER="(skipped: reviewer-approval check disabled for this invocation)"
   fi
 
   if [ -z "$APPROVING_REVIEWER" ]; then
@@ -2020,6 +2097,14 @@ for __sig in "thumbs|$LATEST_THUMBS_UP_TIME" "review|$CODEX_REVIEW_TIME" "verdic
   __k=${__sig%%|*}
   __t=${__sig#*|}
   [ -n "$__t" ] || continue
+  # #814 (Codex P2 on #835 round 3): drop reactions from SELECTION in
+  # diagnostic mode, not just from clearance. Rejecting a selected 👍 left the
+  # gate with no signal even when an anchored review or verdict existed on the
+  # head, so the diagnostic reported "Codex has not spoken" on definitive
+  # current-head evidence and drove a needless bounded wait.
+  if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ] && [ "$__k" = "thumbs" ]; then
+    continue
+  fi
   # Replace on strictly-newer OR on an equal timestamp: iterating thumbs →
   # review → verdict means the last one at the max time wins the tie, giving
   # priority verdict > review > 👍.
@@ -2037,17 +2122,45 @@ fi
 
 case "$LATEST_SIGNAL_KIND" in
   thumbs)
-    CLEARED=true
-    CLEARANCE_REASON="latest Codex signal is 👍 reaction @ $LATEST_SIGNAL_TIME (newest of 👍/review/verdict on HEAD; on or after reaction threshold $REACTION_THRESHOLD)"
+    if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then
+      # #814 (Codex P1 on #835): a reaction carries NO commit id. It is
+      # admitted on freshness alone, against a threshold derived from the head
+      # committer date — which the pusher controls. A clean reaction for the
+      # previous head landing just after a new head is pushed would satisfy
+      # this, and a caller asking "did Codex review THIS head" would be told
+      # yes. Diagnostic mode accepts only the two head-anchored forms: a review
+      # object (commit_id == HEAD) or a verdict comment whose Reviewed commit
+      # prefixes HEAD.
+      log "gate (c): 👍 reaction @ $LATEST_SIGNAL_TIME is not head-anchored — rejected under --diagnostic-signal-only"
+    else
+      CLEARED=true
+      CLEARANCE_REASON="latest Codex signal is 👍 reaction @ $LATEST_SIGNAL_TIME (newest of 👍/review/verdict on HEAD; on or after reaction threshold $REACTION_THRESHOLD)"
+    fi
     ;;
   review)
-    if [ "$UNADDRESSED_COUNT" -eq 0 ]; then
+    if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then
+      # #814 (Codex P2 on #835, raised twice): diagnostic mode asks whether
+      # Codex has SPOKEN on this head, not whether its verdict clears. A
+      # current-head review carrying findings is Codex having spoken — the
+      # ordering the barrier protects is satisfied, and the P1 gate plus the
+      # conversation-resolution gate own the verdict. Mapping it to "not
+      # reported" made the barrier exhaust its budget and escalate on a PR
+      # Codex had actively reviewed, and the exit code could not change
+      # without author action, so the wait was guaranteed wasted.
+      CLEARED=true
+      CLEARANCE_REASON="head-anchored COMMENTED review @ $LATEST_SIGNAL_TIME on $HEAD_SHA (presence only; findings not evaluated under --diagnostic-signal-only)"
+    elif [ "$UNADDRESSED_COUNT" -eq 0 ]; then
       CLEARED=true
       CLEARANCE_REASON="latest Codex signal is COMMENTED review @ $LATEST_SIGNAL_TIME on $HEAD_SHA with no unaddressed P0/P1 findings"
     fi
     ;;
   verdict)
-    if [ -n "$CODEX_HEAD_VERDICT_TIME" ] && [ "$UNADDRESSED_COUNT" -eq 0 ]; then
+    if [ "$DIAGNOSTIC_SIGNAL_ONLY" = "1" ]; then
+      # Same as the review arm: a non-affirmative or findings-bearing verdict
+      # on THIS head still means Codex reported on it.
+      CLEARED=true
+      CLEARANCE_REASON="head-anchored verdict comment @ $LATEST_SIGNAL_TIME (presence only; disposition not evaluated under --diagnostic-signal-only)"
+    elif [ -n "$CODEX_HEAD_VERDICT_TIME" ] && [ "$UNADDRESSED_COUNT" -eq 0 ]; then
       CLEARED=true
       CLEARANCE_REASON="latest Codex signal is a HEAD-anchored AFFIRMATIVE verdict comment @ $LATEST_SIGNAL_TIME (Reviewed commit prefixes $HEAD_SHA; no unaddressed P0/P1) (#600)"
     else

@@ -2347,6 +2347,138 @@ if [ "$rc" = 1 ] \
   pass "evidence readiness BLOCKS on an INVALID resolved config"
 else fail "evidence invalid-config blocks readiness (rc=$rc): $out"; fi
 
+# --- #814 same-head provider barrier machinery -----------------------------
+#
+# Additive helpers with no callers yet; the barrier itself lands separately.
+# These pin the properties that decide whether a barrier built on them can be
+# opened wrongly.
+
+# shellcheck source=../scripts/phase-4b/lib.sh
+. "$LIB"
+
+cat >"$WORK/policy-barrier.yml" <<'EOF'
+coderabbit:
+  severity_gate:
+    enabled: true
+  max_wait_seconds: 900
+codex:
+  p1_gate:
+    enabled: true
+  enabled: false
+phase_4b_automation:
+  enabled: true
+EOF
+
+# Direct-child scoping. coderabbit has NO top-level `enabled`, only a nested
+# severity_gate.enabled: a flat scan returns that nested true and the barrier
+# would guard on a sub-gate toggle it was never meant to read. codex has both,
+# and the direct child (false) must win over p1_gate.enabled (true).
+_bp() { MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-barrier.yml" p4b_policy_block_field "$1" "$2"; }
+if [ -z "$(_bp coderabbit enabled)" ] \
+   && [ "$(_bp codex enabled)" = "false" ] \
+   && [ "$(_bp coderabbit max_wait_seconds)" = "900" ]; then
+  pass "#814: block reader matches only DIRECT children — a nested sub-gate enabled never masquerades as the master switch"
+else
+  fail "#814: block reader leaked a nested key (coderabbit.enabled='$(_bp coderabbit enabled)' codex.enabled='$(_bp codex enabled)')"
+fi
+
+if [ "$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-barrier.yml" p4b_automation_field enabled)" = "true" ]; then
+  pass "#814: p4b_automation_field still reads its own block through the generalized reader"
+else
+  fail "#814: p4b_automation_field regressed after generalization"
+fi
+
+# Terminality. Only reported / will-not-report may open a barrier.
+_cr() { p4b_barrier_class_coderabbit abc123 "$1" "$2"; }
+bad=""
+[ "$(_cr 0 '{"head_sha":"abc123"}')" = reported ]        || bad="$bad rc0-match"
+[ "$(_cr 2 '{"head_sha":"abc123"}')" = reported ]        || bad="$bad rc2-match"
+# A terminal rc anchored on an OLDER head is a stale clearance — the #794 shape.
+[ "$(_cr 0 '{"head_sha":"old999"}')" = not-yet ]         || bad="$bad rc0-stale"
+[ "$(_cr 0 '{}')" = not-yet ]                            || bad="$bad rc0-nohead"
+# EVERY exit-6 skip is not-yet. draft and non-base-branch are PR-level states
+# that can change WITHOUT the head changing — marking a draft ready or
+# retargeting the base makes CodeRabbit review that same head, possibly after
+# the Phase 4b approval has posted, which is the ordering race this barrier
+# exists to prevent (Codex P1 on #835). paused is the same shape, and an
+# unmodelled reason must never open a barrier.
+[ "$(_cr 6 '{"skip_reason":"draft"}')" = not-yet ]           || bad="$bad rc6-draft"
+[ "$(_cr 6 '{"skip_reason":"non-base-branch"}')" = not-yet ] || bad="$bad rc6-nonbase"
+[ "$(_cr 6 '{"skip_reason":"paused"}')" = not-yet ]          || bad="$bad rc6-paused"
+[ "$(_cr 6 '{"skip_reason":"unmodelled"}')" = not-yet ]      || bad="$bad rc6-unknown"
+[ "$(_cr 7 '{}')" = not-yet ]                            || bad="$bad rc7"
+[ "$(_cr 4 '{}')" = not-yet ]                            || bad="$bad rc4"
+# rc 5 is only an escalation when the #489 failover did NOT engage. When it
+# did, AGENTS.md step 5 makes the stall a non-blocking note and the Codex arm
+# owns terminality; escalating anyway forces a manual fallback on every
+# rate-limited run where the failover worked (Codex P2 on #835, raised twice).
+[ "$(_cr 5 '{}')" = escalate ]                                    || bad="$bad rc5"
+[ "$(_cr 5 '{"codex_failover_requested":false}')" = escalate ]    || bad="$bad rc5-nofailover"
+# WAIVED, not not-yet: not-yet still blocks until the budget expires and then
+# escalates, which is the manual fallback the failover exists to avoid. The arm
+# has to actually open, with the Codex arm carrying the ordering from there.
+[ "$(_cr 5 '{"codex_failover_requested":true}')" = waived ]       || bad="$bad rc5-failover"
+[ "$(_cr 3 '{}')" = escalate ]                           || bad="$bad rc3"
+[ "$(p4b_barrier_class_codex 0)" = reported ]            || bad="$bad codex0"
+[ "$(p4b_barrier_class_codex 1)" = not-yet ]             || bad="$bad codex1"
+[ "$(p4b_barrier_class_codex 3)" = escalate ]            || bad="$bad codex3"
+if [ -z "$bad" ]; then
+  pass "#814: no rc opens the barrier except a head-matched report; every exit-6 skip and every stale head reads NOT-YET"
+else
+  fail "#814: terminality misclassified:$bad"
+fi
+
+# Bounded not-yet retry. The marker records only "this checkout began waiting
+# at T" — terminality never comes from it — so both tamper directions must
+# fail safe.
+export P4B_ACCT_STATE_DIR="$WORK/barrier-state"
+_mk() { p4b_barrier_marker_path owner/repo 99 headsha; }
+bad=""
+[ "$(p4b_barrier_note_pending owner/repo 99 headsha)" = "0" ] || bad="$bad first"
+printf '%s\n' "$(( $(date +%s) - 600 ))" >"$(_mk)"
+[ "$(p4b_barrier_note_pending owner/repo 99 headsha)" -ge 590 ] || bad="$bad elapsed"
+# A future-dated marker must restart the budget, never go negative — which
+# would otherwise read as a huge elapsed and escalate immediately.
+printf '%s\n' "$(( $(date +%s) + 9000 ))" >"$(_mk)"
+[ "$(p4b_barrier_note_pending owner/repo 99 headsha)" = "0" ] || bad="$bad future"
+# A garbage marker must not crash — and must be REPAIRED, not merely tolerated.
+# Returning 0 without rewriting it means every later one-shot invocation reads
+# the same invalid value and reports zero elapsed again, so the bounded retry
+# never exhausts and the manual fallback is never reached (Codex P2 on #835).
+# The first version of this assertion checked only the return value and so
+# pinned the defect as correct.
+printf 'not-a-number\n' >"$(_mk)"
+[ "$(p4b_barrier_note_pending owner/repo 99 headsha)" = "0" ] || bad="$bad garbage"
+case "$(cat "$(_mk)" 2>/dev/null)" in ''|*[!0-9]*) bad="$bad garbage-not-repaired" ;; esac
+# Same for a future-dated marker: the clock must be restarted ON DISK.
+printf '%s\n' "$(( $(date +%s) + 9000 ))" >"$(_mk)"
+[ "$(p4b_barrier_note_pending owner/repo 99 headsha)" = "0" ] || bad="$bad future2"
+[ "$(cat "$(_mk)" 2>/dev/null)" -le "$(date +%s)" ] || bad="$bad future-not-repaired"
+p4b_barrier_clear_pending owner/repo 99 headsha
+[ ! -f "$(_mk)" ] || bad="$bad clear"
+# A different head gets its own budget rather than inheriting the last one.
+[ "$(p4b_barrier_note_pending owner/repo 99 otherhead)" = "0" ] || bad="$bad perhead"
+if [ -z "$bad" ]; then
+  pass "#814: pending budget is per-head, restarts on a future/garbage marker, and clears"
+else
+  fail "#814: pending budget misbehaved:$bad"
+fi
+
+# The marker must never land in the working tree when the state dir is set —
+# lib.sh must not depend on accounting.sh being loaded for that.
+if [ -d "$WORK/barrier-state/phase-4b-barrier" ] && [ ! -d "$ROOT/.mergepath/phase-4b-barrier" ]; then
+  pass "#814: markers honour P4B_ACCT_STATE_DIR without accounting.sh loaded (no working-tree writes)"
+else
+  fail "#814: marker path ignored the state-dir override"
+fi
+
+if [ "$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-barrier.yml" p4b_barrier_budget_seconds)" = "900" ] \
+   && [ "$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/nonexistent.yml" p4b_barrier_budget_seconds)" = "1245" ]; then
+  pass "#814: budget reads coderabbit.max_wait_seconds and defaults rather than failing closed"
+else
+  fail "#814: budget resolution wrong"
+fi
+
 echo
 echo "Summary: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
