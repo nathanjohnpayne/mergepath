@@ -213,6 +213,18 @@ phase_4b_automation:
       enabled: false
 YAML
 
+# (#814) The orchestrator now consults the external providers before it will
+# review at all, and holds when neither has reported on the head. This suite
+# is about accounting arithmetic and record shape, not about providers, and
+# its cases review two different heads — which a single probe stub cannot
+# satisfy, since --probe resolves the live head itself rather than taking one.
+# Switch both providers off in every fixture so the barrier is a no-op here and
+# each case exercises the accounting path it was written for. The barrier's own
+# behaviour is covered in tests/test_phase_4b_automation.sh.
+for _p in "$WORK"/policy-*.yml; do
+  printf 'coderabbit:\n  enabled: false\ncodex:\n  enabled: false\n' >> "$_p"
+done
+
 # Deterministic test price table (never depend on live prices for math).
 TEST_PRICES="$WORK/prices-test.json"
 cat > "$TEST_PRICES" <<'JSON'
