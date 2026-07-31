@@ -2578,9 +2578,16 @@ out="$(_barrier 1 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
 [ "$rc" = 1 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = pending ] || bad="$bad codex-notyet"
 [ "$(printf '%s' "$out" | jq -r .retry_after)" = 100 ] || bad="$bad retry-after"
 
-# A stale CodeRabbit clearance on an older head must not open the barrier.
+# A probe anchored on a different head must never OPEN the barrier. Since the
+# #842 drift fix that is escalate (2) rather than pending (1): the probe
+# resolves the LIVE head, so a mismatch means a push landed and this run is
+# void. p4b_barrier_class_coderabbit still maps the same shape to not-yet in
+# isolation — asserted separately above — because it is a pure function over
+# one probe result; the drift decision belongs to the composer, which is the
+# only layer that knows which head is being reviewed.
 out="$(_barrier 0 0 '{"head_sha":"stale99"}')" && rc=0 || rc=$?
-[ "$rc" = 1 ] || bad="$bad stale-head-opened"
+[ "$rc" != 0 ] || bad="$bad stale-head-opened"
+[ "$rc" = 2 ] || bad="$bad stale-head-not-drift"
 
 # Infra failure escalates to a human rather than guessing.
 out="$(_barrier 0 3 'null')" && rc=0 || rc=$?
@@ -2596,6 +2603,62 @@ if [ -z "$bad" ]; then
   pass "#814: barrier opens only when every ENABLED provider is terminal on this exact head"
 else
   fail "#814: barrier composition wrong:$bad"
+fi
+
+# Codex round-1 findings on #842, all four in one place.
+bad=""
+# 1. Head drift is detected BEFORE any trigger. The probe resolves the LIVE
+#    head, so a mismatch means a push landed after $HEAD was captured;
+#    triggering would spend the one permitted request on an unrelated head and
+#    then hold until the whole budget expired.
+out="$(_barrier 0 0 '{"head_sha":"pushed99"}')" && rc=0 || rc=$?
+[ "$rc" = 2 ] || bad="$bad drift-not-escalated"
+printf '%s' "$out" | jq -e '.reason | test("head moved")' >/dev/null 2>&1 || bad="$bad drift-reason"
+printf '%s' "$out" | jq -e '.trigger == "skipped"' >/dev/null 2>&1 || bad="$bad drift-triggered"
+
+# 2. The request waits for Codex to be terminal. If Codex is still not-yet it
+#    may yet force a push that discards this head and the request with it.
+out="$(_barrier 1 7 'null')" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad codexnotyet-rc"
+printf '%s' "$out" | jq -e '.trigger == "awaiting-codex"' >/dev/null 2>&1 || bad="$bad codexnotyet-trigger"
+
+# 3. Once Codex IS terminal the arm proceeds to the trigger decision.
+out="$(_barrier 0 7 'null')" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad codexdone-rc"
+printf '%s' "$out" | jq -e '.trigger != "awaiting-codex"' >/dev/null 2>&1 || bad="$bad codexdone-blocked"
+
+if [ -z "$bad" ]; then
+  pass "#842: head drift escalates before any trigger, and the request waits for Codex to be terminal"
+else
+  fail "#842 trigger sequencing wrong:$bad"
+fi
+
+# 4. The mention follows coderabbit.bot_login. coderabbit-wait.sh probes the
+#    configured bot, so a hardcoded @coderabbitai would address an account that
+#    never answers in a consumer that renamed it — the probe keeps seeing
+#    `none` and the barrier burns its whole budget on every PR.
+cat >"$WORK/policy-botlogin.yml" <<'EOF'
+coderabbit:
+  enabled: true
+  bot_login: my-rabbit[bot]
+codex:
+  enabled: true
+EOF
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" >> "%s/trigger-argv.log"\nexit 0\n' "$WORK" \
+  >"$WORK/barrier-bin/fake-reviewer2"
+chmod +x "$WORK/barrier-bin/fake-reviewer2"
+: >"$WORK/trigger-argv.log"
+(
+  export MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-botlogin.yml"
+  export P4B_ACCT_STATE_DIR="$WORK/barrier-state"
+  export P4B_GH_AS_REVIEWER="$WORK/barrier-bin/fake-reviewer2"
+  p4b_barrier_post_trigger o/r 7 abc123 rev-bot
+) >/dev/null 2>&1 || true
+if grep -q '^@my-rabbit review' "$WORK/trigger-argv.log" \
+   && ! grep -q '@coderabbitai' "$WORK/trigger-argv.log"; then
+  pass "#842: the trigger mentions the configured coderabbit.bot_login, with the REST-only [bot] suffix stripped"
+else
+  fail "#842: trigger ignored bot_login: $(tr '\n' ' ' < "$WORK/trigger-argv.log")"
 fi
 
 # The bound is what turns an indefinite wait into a human handoff.

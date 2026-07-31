@@ -413,10 +413,19 @@ p4b_barrier_post_trigger() {
   # variable matching [A-Z_]*AS_(AUTHOR|REVIEWER). A lowercase holder reads as
   # a bare `gh pr comment` and fails the gate — correctly, since the gate
   # cannot tell what a lowercase variable points at.
-  local WRAPPER_AS_REVIEWER body rc=0
+  local WRAPPER_AS_REVIEWER body bot rc=0
   WRAPPER_AS_REVIEWER="${P4B_GH_AS_REVIEWER:-$(p4b_repo_root)/scripts/gh-as-reviewer.sh}"
   [ -x "$WRAPPER_AS_REVIEWER" ] || return 1
-  body="$(printf '@coderabbitai review\n\n%s\n' "$(p4b_barrier_trigger_marker "$head")")"
+  # Mention the CONFIGURED bot, not a hardcoded @coderabbitai (Codex P2 on
+  # #842). coderabbit-wait.sh probes activity from coderabbit.bot_login, so a
+  # consumer that overrides it would have the request addressed to an account
+  # that never answers while the probe keeps observing `none` — the barrier
+  # then burns its whole budget and escalates on every PR in that repo. Strip
+  # the REST-only `[bot]` suffix, as the existing retry and resume paths do.
+  bot="$(p4b_policy_block_field coderabbit bot_login)"
+  bot="${bot:-coderabbitai}"
+  bot="${bot%\[bot\]}"
+  body="$(printf '@%s review\n\n%s\n' "$bot" "$(p4b_barrier_trigger_marker "$head")")"
   env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$reviewer" \
     "$WRAPPER_AS_REVIEWER" -- gh pr comment "$pr" --repo "$repo" --body "$body" \
     >/dev/null 2>&1 || rc=$?
@@ -480,7 +489,7 @@ p4b_barrier_maybe_trigger() {
 # will-not-report, and it cannot flip mid-flight on a live PR.
 p4b_same_head_barrier() {
   local repo="$1" pr="$2" head="$3" reviewer="$4" dry="${5:-false}"
-  local root cr_bin cx_bin rc json
+  local root cr_bin cx_bin rc json probe_head
   local pending=false why="" trigger="skipped" cls_cr="disabled" cls_cx="disabled"
   local elapsed budget remaining=0
   root="$(p4b_repo_root)"
@@ -510,15 +519,39 @@ p4b_same_head_barrier() {
   if [ -z "$why" ] && [ "$(p4b_policy_block_field coderabbit enabled)" != "false" ]; then
     rc=0
     json="$("$cr_bin" --probe "$pr" "$repo" 2>/dev/null)" || rc=$?
-    cls_cr="$(p4b_barrier_class_coderabbit "$head" "$rc" "$json")"
-    case "$cls_cr" in
-      reported|will-not-report|waived) ;;
-      not-yet)
-        pending=true
-        trigger="$(p4b_barrier_maybe_trigger "$repo" "$pr" "$head" "$reviewer" "$json" "$dry")"
-        ;;
-      *) why="coderabbit probe exited $rc" ;;
-    esac
+    # Head drift, detected BEFORE any trigger (Codex P2 on #842). The probe
+    # resolves the LIVE head; when that differs from the head under review a
+    # push landed after "$HEAD" was captured. Classifying that as not-yet and
+    # then triggering asks CodeRabbit to review an unrelated new head, spends
+    # the one permitted request on it, and can never satisfy the old-head
+    # comparison — so the run would hold until the whole budget expired. This
+    # run is void either way: the orchestrator's own live-head recheck refuses
+    # to post on a drifted head, so escalate now for the same reason rather
+    # than burning the budget first.
+    probe_head="$(printf '%s' "$json" | jq -r '.head_sha // empty' 2>/dev/null || true)"
+    if [ -n "$probe_head" ] && [ "$probe_head" != "$head" ]; then
+      why="PR head moved during evaluation (reviewing $head, live $probe_head) — rerun on the new head"
+      cls_cr="drift"
+    else
+      cls_cr="$(p4b_barrier_class_coderabbit "$head" "$rc" "$json")"
+      case "$cls_cr" in
+        reported|will-not-report|waived) ;;
+        not-yet)
+          pending=true
+          # Only spend the request once Codex is terminal. The trigger point is
+          # meant to be the settled head — "after the Codex rounds have
+          # converged" — and if Codex is still not-yet it may yet produce
+          # feedback that forces a push, discarding this head and the request
+          # with it (Codex P2 on #842). Already-present CodeRabbit evidence is
+          # still observed above; only the WRITE waits.
+          case "$cls_cx" in
+            not-yet) trigger="awaiting-codex" ;;
+            *) trigger="$(p4b_barrier_maybe_trigger "$repo" "$pr" "$head" "$reviewer" "$json" "$dry")" ;;
+          esac
+          ;;
+        *) why="coderabbit probe exited $rc" ;;
+      esac
+    fi
   fi
 
   if [ -z "$why" ] && [ "$pending" = true ]; then

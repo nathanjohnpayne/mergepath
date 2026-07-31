@@ -366,9 +366,25 @@ trap _p4b_cleanup_tmp EXIT
 # history present, gate fidelity preserved), and the real state is untouched.
 # Placed BEFORE the first fall_back_to_manual call site so even an early
 # fallback's note_fallback recording lands in the sandbox.
+#
+# The redirect is NOT conditional on accounting being available (Codex P2 on
+# #842). The #814 barrier keys its pending marker off the same state dir, and a
+# missing or unsourceable accounting module is an explicitly supported
+# configuration — so gating this block on P4B_ACCT_AVAILABLE let a dry run
+# write its marker into the REAL .mergepath/phase-4b-barrier, where a later
+# real run inherited time accumulated by the rehearsal and could exhaust the
+# barrier into a manual handoff it had not earned. Every dry run now gets an
+# isolated state dir; only the COPY of prior history needs accounting.
 _P4B_ACCT_DRY_STATE=""
-if [ "$DRY_RUN" = true ] && [ "$P4B_ACCT_AVAILABLE" = true ]; then
-  _p4b_real_state="$(p4b_acct_state_dir)"
+if [ "$DRY_RUN" = true ]; then
+  # An `if`, not `[ ... ] && assign`: as a standalone statement the latter
+  # returns non-zero whenever accounting is unavailable, which under this
+  # script's errexit would abort the run — in exactly the degraded
+  # configuration this change exists to support.
+  _p4b_real_state=""
+  if [ "$P4B_ACCT_AVAILABLE" = true ]; then
+    _p4b_real_state="$(p4b_acct_state_dir)"
+  fi
   if _P4B_ACCT_DRY_STATE="$(mktemp -d "${TMPDIR:-/tmp}/p4b-acct-dry.XXXXXX" 2>/dev/null)"; then
     if [ -d "$_p4b_real_state" ]; then
       cp -Rp "$_p4b_real_state/." "$_P4B_ACCT_DRY_STATE/" 2>/dev/null \
