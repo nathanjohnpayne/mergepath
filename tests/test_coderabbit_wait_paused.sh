@@ -219,6 +219,15 @@ case "$endpoint" in
   repos/owner/repo/pulls/999/reviews)
     # Used by count_potential_issues on the clearance path.
     case "$scenario" in
+      probe_skip_with_head_review)
+        # #814: a real HEAD-pinned review exists on a PR whose auto-review
+        # eligibility would otherwise skip (draft / non-base-branch).
+        printf '[{"id":9801,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$review_time"
+        ;;
+      probe_skip_with_active_review)
+        # #814: no review object yet — a manual trigger is still running.
+        printf '[]\n'
+        ;;
       paused_then_review)
         if [ "$(resume_count)" -ge 1 ]; then
           printf '[{"id":9501,"user":{"login":"%s"},"submitted_at":"%s"}]\n' "$bot" "$review_time"
@@ -232,10 +241,25 @@ case "$endpoint" in
     esac
     ;;
   repos/owner/repo/pulls/999/comments)
-    printf '[]\n'
+    case "$scenario" in
+      probe_skip_with_head_review)
+        printf '[{"id":9802,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","commit_id":"head-sha","pull_request_review_id":9801,"in_reply_to_id":null,"body":"_⚠️ Potential issue_ | _🟠 Major_\\n\\nReal finding on a draft PR."}]\n' "$bot" "$review_time" "$review_time"
+        ;;
+      *) printf '[]\n' ;;
+    esac
     ;;
   repos/owner/repo/issues/999/comments)
     case "$scenario" in
+      probe_skip_with_head_review)
+        # Summary landed with the review, so publication is complete and the
+        # case isolates skip-ordering.
+        printf '[{"id":9811,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 1**\\n\\nSummary."}]\n' "$bot" "$review_time" "$review_time"
+        ;;
+      probe_skip_with_active_review)
+        # A manually triggered review is in progress on an otherwise
+        # skip-eligible PR.
+        printf '[{"id":9812,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"CodeRabbit review in progress; hold tight."}]\n' "$bot" "$review_time" "$review_time"
+        ;;
       paused_then_review)
         # First poll: paused NOTE. After we post resume, a clean review lands.
         if [ "$(resume_count)" -ge 1 ]; then
@@ -342,6 +366,29 @@ test_paused_resume_then_review_clears() {
 # 2. Durable pause: CodeRabbit keeps re-pausing. After max_resume_retries the
 #    helper exits 6 (skipped) with status=paused and skip_reason=paused —
 #    NOT exit 4 (timeout). Bounded resume posts == the cap.
+# #814, Phase 4b P1 round 7. These PRs CAN be reviewed after a manual
+# `@coderabbitai review`. Applying the static skip while such a review is
+# still in flight returns WILL-NOT-REPORT and lets the barrier proceed ahead
+# of the pending review. Active signals must be inspected first.
+test_probe_active_review_beats_static_skip() {
+  local dir rc status
+  dir=$(make_case probe-skip-active 600 2 main true yes)
+  rc=0
+  ( cd "$dir" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_SCENARIO=probe_skip_with_active_review \
+      ./scripts/coderabbit-wait.sh --probe 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
+  status=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "7" ] && [ "$status" = "in_progress" ]; then
+    pass "#814 probe: an in-flight review on a skip-eligible PR is NOT-YET, not WILL-NOT-REPORT"
+  else
+    fail "#814 probe: expected rc 7/in_progress on a draft PR with an active review; got rc=$rc observed=$status"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
 test_paused_persists_exhausts_cap_exit6() {
   local dir rc status skip resumes retries
   dir=$(make_case "paused-persists" 600 2)
@@ -533,6 +580,34 @@ test_invalid_base_regex_fails_safe_not_skipped() {
 }
 
 test_paused_resume_then_review_clears
+# #814, Phase 4b P1 on #823. The static draft / non-base-branch skips run
+# unconditionally before the scan. A PR in that state can already carry a real
+# HEAD review — after a manual `@coderabbitai review`, a retarget, or a later
+# conversion to draft — and that review may carry findings. Exiting 6 without
+# looking reports WILL-NOT-REPORT, which the #814 barrier reads as "nothing
+# will ever land here", and it proceeds past real findings. Probe mode must
+# inspect HEAD evidence FIRST and only fall back to the skip when there is
+# none.
+test_probe_inspects_head_evidence_before_skip() {
+  local dir rc issues
+  # draft PR + drafts:false in .coderabbit.yml => the skip would fire.
+  dir=$(make_case probe-skip-head-review 600 2 main true yes)
+  rc=0
+  ( cd "$dir" && PATH="$dir/bin:$PATH" GH_TOKEN=test-token \
+      CODERABBIT_WAIT_SKIP_IDENTITY_CHECK=1 \
+      CODERABBIT_TEST_STATE_DIR="$dir/state" \
+      CODERABBIT_TEST_SCENARIO=probe_skip_with_head_review \
+      ./scripts/coderabbit-wait.sh --probe 999 owner/repo \
+      >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
+  issues=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "0" ] && [ "$issues" = "reported" ]; then
+    pass "#814 probe: a draft PR carrying a real HEAD review reads as reported, not as a skip"
+  else
+    fail "#814 probe: expected rc 0/reported on a draft PR carrying a HEAD review; got rc=$rc status=$issues"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
 test_paused_persists_exhausts_cap_exit6
 test_paused_same_id_timeout_exit6_not_exit4
 test_non_base_branch_skip_exit6
@@ -541,6 +616,8 @@ test_allowed_base_non_draft_not_skipped
 test_base_branches_regex_match_not_skipped
 test_default_branch_always_allowed_not_skipped
 test_invalid_base_regex_fails_safe_not_skipped
+test_probe_inspects_head_evidence_before_skip
+test_probe_active_review_beats_static_skip
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
