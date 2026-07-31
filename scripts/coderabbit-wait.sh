@@ -125,7 +125,7 @@
 #     "head_committer_date": "<iso-8601>",
 #     "bot_login": "coderabbitai[bot]",
 #     "status": "cleared" | "findings" | "timeout" | "rate_limit_stalled"
-#               | "paused" | "skipped" | "no_review_yet",
+#               | "paused" | "skipped" | "no_review_yet" | "reported",
 #     "skip_reason": null | "paused" | "non-base-branch" | "draft",
 #     "review": null | {
 #       "id": N,
@@ -192,15 +192,20 @@
 #       caller should raise `auto_pause_after_reviewed_commits`, retarget
 #       the base, mark the PR ready, or escalate — not merely log and
 #       proceed. See nathanjohnpayne/mergepath#490.
-#   7   PROBE_NO_REVIEW — `--probe` only. The single scan found no review
-#       on the current HEAD. NOT a timeout (4), NOT a stalled retry budget
-#       (5), NOT an un-invocable skip (6): a probe posts no retry and no
-#       `resume`, so it can never have exhausted either budget, and 5 or 6
+#   7   PROBE_NO_REVIEW — `--probe` only. No CodeRabbit review object is
+#       pinned to the current HEAD. NOT a timeout (4), NOT a stalled retry
+#       budget (5), NOT an un-invocable skip (6): a probe posts no retry and
+#       no `resume`, so it can never have exhausted either budget, and 5 or 6
 #       would escalate or excuse a PR CodeRabbit may be about to review.
 #       `probe.observed` names which surface the scan landed on. Callers
 #       using this as an ordering barrier re-probe on a bound of their own.
 #       NOT 1: under `set -euo pipefail` any unguarded failure exits 1 with
 #       no JSON, so a caller could not tell rc 1 from a crashed run.
+#
+#       In `--probe` mode rc 0 means REPORTED — a review exists on this head —
+#       and NOT "no findings". Probe mode does not evaluate findings and never
+#       returns 2; `potential_issue_count` is 0 on every probe run and carries
+#       no verdict. Use the polling mode for a verdict.
 #
 # Design notes:
 #   - Read-only except for retry-trigger comments, the auto-pause
@@ -1207,22 +1212,14 @@ summary_body_has_potential_issue_marker() {
 # not consulted directly; the explicit bot marker is the narrow signal
 # that a current-head finding has been addressed without relying on
 # GitHub conversation-resolution state.
-# <sha> [anchor] — findings pinned to <sha>. The optional second argument
-# overrides the identity-anchor floor; pass "" to disable it entirely. Probe
-# mode does that (#814): the floor is the HEAD committer date, which the pusher
-# controls, so a future-dated head would filter out real findings that are
-# already SHA-pinned to it. `commit_id == sha` is GitHub-owned and sufficient
-# on its own; the floor only ever adds a way to under-count. Polling keeps the
-# floor by default so its behaviour is unchanged.
 count_potential_issues_for_sha() {
   local sha=$1
-  local anchor=${2-$HEAD_IDENTITY_ANCHOR}
   local pulls_comments
   pulls_comments=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "pulls comments")
   echo "$pulls_comments" | jq \
     --arg bot "$BOT_LOGIN" \
     --arg sha "$sha" \
-    --arg after "$anchor" '
+    --arg after "$HEAD_IDENTITY_ANCHOR" '
     [ .[]
       | select(.user.login == $bot)
       | select(.in_reply_to_id != null)
@@ -1870,109 +1867,63 @@ emit_status_context_verdict() {
 
 # --- probe verdict (#814) ---------------------------------------------------
 #
-# Probe mode computes its own verdict and never enters the poll loop.
+# Probe mode answers ONE question and never enters the poll loop:
 #
-# The first implementation reused the loop's terminal path — classify_comment
-# into the `review)` arm into count_potential_issues and
-# summary_body_has_potential_issue_marker — and guarded each arm. That path was
-# written when a false clear was ADVISORY: CodeRabbit does not block, so a read
-# that degrades to "no findings" costs a warning. A probe answering an ordering
-# barrier makes the same path load-bearing, and every latent errexit
-# suppression in it becomes a way to approve an unreviewed head. Five review
-# rounds on #823 found four such sites, each in a different arm, which is what
-# a non-convergent patch sequence looks like. This function replaces the
-# borrowing.
+#   has CodeRabbit reported on this exact head?
 #
-# Two rules it holds that the loop's path does not:
+# It deliberately does NOT decide whether the review was clean. That is a
+# verdict, and reproducing it correctly is what the polling path below exists
+# to do — it has to reconcile inline findings, summary-only findings (#535),
+# the StatusContext and its spurious-success suppression, addressed-marker
+# replies, and two freshness anchors. Six review rounds on #823 showed that
+# borrowing any of that machinery imports assumptions written for an ADVISORY
+# caller, where a read degrading to "no findings" costs a warning rather than
+# an approval.
 #
-#   * evidence is SHA-pinned and does NOT expire. Selection is `commit_id ==
-#     HEAD_SHA` alone. HEAD_ANCHOR carries a moving wall-clock freshness floor,
-#     so an unchanged reviewed head eventually stops being recognised — a
-#     deadlock for a barrier that re-probes the same head.
-#   * HEAD evidence is asked BEFORE auto-review eligibility. A draft or
-#     retargeted PR can already carry a real HEAD review with findings; exiting
-#     6 without looking reports WILL-NOT-REPORT and the barrier proceeds past
-#     them.
+# The barrier does not need the verdict. It needs ORDERING: do not let Phase 4b
+# approve before the providers have spoken. Whether CodeRabbit found anything
+# is already enforced downstream by scripts/coderabbit-severity-gate.sh and the
+# pre-merge conversation-resolution gate. Answering the narrow question needs
+# one API read and no shared helpers.
+#
+# Evidence is a CodeRabbit review object whose `commit_id` is this head.
+# GitHub-owned, immutable, and it does not expire — no wall-clock floor, so a
+# head that has been sitting for an hour still reads as reported.
+#
+# The StatusContext is deliberately NOT consulted. It is SHA-pinned, but
+# CodeRabbit emits a spurious success shortly after a rate-limit notice (the
+# case status_context_fast_path_blocked_by_comment exists to suppress), so
+# using it as existence evidence would report a head as reviewed when it was
+# not. A silent clean review that posts only a status therefore reads as
+# NOT-YET; the barrier's trigger step then asks for a review explicitly, which
+# always produces a review object, so it self-heals at the cost of one
+# allowance unit rather than by risking a false REPORTED.
 probe_emit_verdict() {
-  local reviews review review_id review_at inline latest latest_at summary_marker
+  local reviews review
 
-  # StatusContext first when the policy trusts it: it is read from
-  # commits/$HEAD_SHA/statuses, so it is SHA-pinned by construction, and it is
-  # the only signal for CodeRabbit's silent-clean-review path (#221) where no
-  # comment is ever posted. emit_status_context_verdict already scans inline
-  # markers via the SHA-scoped counter and exits.
-  if [ "$TRUST_STATUS_CONTEXT" = "true" ]; then
-    local ctx_state
-    ctx_state=$(check_status_context_record | jq -r '.state')
-    case "$ctx_state" in
-      success|failure) emit_status_context_verdict "$ctx_state" ;;
-    esac
-  fi
-
-  # One reviews fetch, status propagated explicitly. Inlining this into a
-  # conditional would let fetch_api_array's `die 3` exit only its own subshell
-  # and hand back an empty result, turning an outage into a confident negative.
+  # One read, status propagated explicitly. Inlining this into a conditional
+  # would let fetch_api_array's `die 3` exit only its own subshell and hand
+  # back an empty result, turning an outage into a confident "not reported".
   reviews=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews") \
     || die 3 "failed to fetch reviews for the probe verdict"
   review=$(printf '%s' "$reviews" | jq -c --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
     [ .[] | select(.user.login == $bot) | select(.commit_id == $sha) ]
     | sort_by(.submitted_at) | last
-    | if . == null then empty else {id, submitted_at} end
+    | if . == null then empty
+      else {id, created_at: .submitted_at, endpoint: "reviews",
+            body_excerpt: ((.body // "")[0:200])} end
   ') || die 3 "failed to select the HEAD-pinned review"
 
   if [ -n "$review" ]; then
-    review_id=$(printf '%s' "$review" | jq -r '.id')
-    review_at=$(printf '%s' "$review" | jq -r '.submitted_at')
-    # SHA-scoped, not anchor-scoped: counts findings whose commit_id is this
-    # head regardless of how long the head has been sitting there.
-    # Empty anchor: SHA match alone. See the note on the function.
-    inline=$(count_potential_issues_for_sha "$HEAD_SHA" "") \
-      || die 3 "failed to count inline findings for the probe verdict"
-    # A summary carries findings too (#535), but only credit one that is at
-    # least as recent as the review it would be attributed to — CodeRabbit
-    # publishes the review object and its summary as separate events, so a
-    # prior head's summary can still be the newest one mid-publication.
-    latest=$(scan_latest_comment) || die 3 "failed to read the latest comment for the probe verdict"
-    summary_marker=absent
-    if [ -n "$latest" ] && [ "$latest" != "{}" ]; then
-      latest_at=$(printf '%s' "$latest" | jq -r '.fresh_at // .updated_at // .created_at // empty')
-      if [ -n "$latest_at" ] && ! [[ "$latest_at" < "$review_at" ]]; then
-        if printf '%s' "$latest" | jq -r '.body // ""' | grep -qiE 'Potential issue|⚠️'; then
-          summary_marker=yes
-        else
-          summary_marker=no
-        fi
-      fi
-    fi
-
     PROBE_OBSERVED="terminal"
-    # Inline findings are conclusive on their own.
-    # Otherwise the review is only half-published: CodeRabbit posts the review
-    # object and its summary separately, and a finding can be carried solely by
-    # the summary (#535). Clearing before the correlated summary lands would
-    # approve a head whose findings have not been published yet, so wait —
-    # NOT-YET is bounded and self-clearing, a false clear is not. The silent
-    # clean review that never posts a comment (#221) is already answered by the
-    # StatusContext branch above, which runs first.
-    if [ "$inline" -eq 0 ] && [ "$summary_marker" = "absent" ]; then
-      log "probe: HEAD review $review_id on $HEAD_SHA has no correlated summary yet — not clearing"
-      probe_not_yet_from_latest "summary-predates-head-review"
-    fi
-    if [ "$inline" -gt 0 ] || [ "$summary_marker" = "yes" ]; then
-      log "probe: CodeRabbit reported on $HEAD_SHA with findings (inline=$inline summary_marker=$summary_marker)"
-      emit_json_and_exit "findings" 2 "$(printf '%s' "$reviews" | jq -c --argjson id "$review_id" '
-        [ .[] | select(.id == $id) ] | last
-        | {id, created_at: .submitted_at, endpoint: "reviews", body_excerpt: ((.body // "")[0:200])}')" "$inline"
-    fi
-    log "probe: CodeRabbit reported on $HEAD_SHA with no high-severity markers — cleared"
-    emit_json_and_exit "cleared" 0 "$(printf '%s' "$reviews" | jq -c --argjson id "$review_id" '
-      [ .[] | select(.id == $id) ] | last
-      | {id, created_at: .submitted_at, endpoint: "reviews", body_excerpt: ((.body // "")[0:200])}')" 0
+    log "probe: CodeRabbit has reported on $HEAD_SHA — findings not evaluated in probe mode"
+    emit_json_and_exit "reported" 0 "$review" 0
   fi
 
   # No HEAD evidence. Only NOW does auto-review eligibility matter: a skip
   # means nothing will ever land on this head, which the barrier reads as
-  # WILL-NOT-REPORT.
+  # WILL-NOT-REPORT. Asking earlier would report a draft or retargeted PR that
+  # already carries a real review as "will never report".
   if [ -n "${PROBE_STATIC_SKIP:-}" ]; then
     SKIP_REASON="$PROBE_STATIC_SKIP"
     PROBE_OBSERVED="terminal"
@@ -1980,20 +1931,19 @@ probe_emit_verdict() {
     emit_json_and_exit "skipped" 6 "null" 0
   fi
 
-  # Nothing yet. Name the surface so the caller can tell "never asked" from
-  # "asked and throttled" without re-reading the PR — the discriminator the
-  # #814 barrier uses to decide whether to trigger a review.
-  latest=$(scan_latest_comment) || die 3 "failed to read the latest comment for the probe verdict"
-  if [ -z "$latest" ] || [ "$latest" = "{}" ]; then
+  # Not reported yet. Name the surface so the caller can tell "never asked"
+  # from "asked and throttled" — the discriminator the #814 barrier uses to
+  # decide whether to trigger a review, and the reason it can trigger once per
+  # head instead of on every retry.
+  LATEST=$(scan_latest_comment) || die 3 "failed to read the latest comment for the probe verdict"
+  if [ -z "$LATEST" ] || [ "$LATEST" = "{}" ]; then
     probe_not_yet "none" "null"
   fi
-  LATEST="$latest"
   local class
-  class=$(classify_comment "$(printf '%s' "$latest" | jq -r '.body // ""')")
+  class=$(classify_comment "$(printf '%s' "$LATEST" | jq -r '.body // ""')")
   # `review` here means a summary exists but nothing is SHA-pinned to this
-  # head — the shape a prior head's summary takes once a new head has been
-  # pushed. Name it for what it is rather than reporting `review`, which would
-  # read as though a review had happened on this head.
+  # head — the shape a prior head's summary takes after a new push. Name it
+  # for that, not `review`, which would read as though this head were reviewed.
   [ "$class" = "review" ] && class="summary-without-head-review"
   probe_not_yet_from_latest "$class"
 }

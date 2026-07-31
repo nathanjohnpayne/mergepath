@@ -223,10 +223,12 @@ case "$endpoint" in
         exit 44
         ;;
       probe_finding_predates_head)
-        # #814 / #824: a real HEAD-pinned review whose inline finding was
-        # created BEFORE the head committer date — the shape a future-dated
-        # head produces. The review is SHA-pinned, so the finding must count.
-        printf '[{"id":9971,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$reply_time"
+        # #814: SHA-pinned evidence that predates the head committer date —
+        # the shape a future-dated or metadata-rewritten head produces, and
+        # also what an unchanged head looks like once a wall-clock freshness
+        # floor has advanced past it. Selection is by commit_id alone, so it
+        # must still read as reported.
+        printf '[{"id":9971,"user":{"login":"%s"},"submitted_at":"2026-06-03T00:00:00Z","commit_id":"head-sha"}]\n' "$bot"
         ;;
       probe_stale_anchor)
         # #814 / Codex P1 on #823: CodeRabbit reviewed the PREVIOUS head only.
@@ -856,13 +858,11 @@ test_probe_paused_is_not_yet_never_skipped() {
 # mismatch.
 expected_observed() {
   local trust=$1 status=$2 scenario=$3
-  # A StatusContext on HEAD is SHA-pinned evidence and terminal regardless of
-  # the comment surface — but ONLY when the policy trusts it for clearance.
-  # With trust_status_context_for_clearance false the probe must not consult
-  # it at all, which is why this branch is gated on both.
-  if [ "$trust" = "true" ] && { [ "$status" = "success" ] || [ "$status" = "failure" ]; }; then
-    printf 'terminal\n'; return
-  fi
+  # The StatusContext is deliberately not consulted, at either trust setting:
+  # CodeRabbit emits a spurious success shortly after a rate-limit notice, so
+  # it is not sound existence evidence. Both dimensions are swept anyway, so
+  # a future change that starts reading it shows up here as a mismatch.
+  : "$trust" "$status"
   case "$scenario" in
     none)                  printf 'none\n' ;;
     rate_limit)            printf 'rate_limit\n' ;;
@@ -945,7 +945,7 @@ test_probe_summary_without_head_review_is_not_yet() {
     "a prior-head summary with no HEAD-pinned review must not clear (author-controlled anchor)"
 }
 
-test_probe_summary_lagging_head_review_is_not_yet() {
+test_probe_summary_lagging_head_review_is_reported() {
   # Phase 4b P1 on #823. Existence of a HEAD-pinned review object is
   # necessary but not sufficient: CodeRabbit publishes the review object and
   # its PR-level summary as separate events. Mid-publication, a HEAD review
@@ -957,11 +957,16 @@ test_probe_summary_lagging_head_review_is_not_yet() {
   # Fixture: HEAD-pinned review at reply_time, prior-head summary at
   # head_time (earlier). The summary must be at least as recent as the
   # review it is credited to.
-  local dir rc
+  local dir rc status
   dir=$(make_case probe-summary-lag 600 true 30 3 2)
   rc=$(run_probe_case "$dir" probe_summary_lags_review)
-  assert_probe_not_yet "$dir" "$rc" summary-predates-head-review \
-    "a summary older than the HEAD review it would be credited to must not clear"
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "0" ] && [ "$status" = "reported" ]; then
+    pass "#814: mid-publication (review present, summary lagging) is REPORTED — ordering is satisfied, the verdict is not this probe's job"
+  else
+    fail "#814: expected rc 0/reported mid-publication; got rc=$rc status=$status"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
 }
 
 test_probe_reviews_api_failure_is_infra_not_clean() {
@@ -987,21 +992,23 @@ test_probe_reviews_api_failure_is_infra_not_clean() {
   fi
 }
 
-test_probe_finding_predating_head_still_counts() {
-  # #824, subsumed here. count_potential_issues_for_sha applies an identity
-  # floor (HEAD_IDENTITY_ANCHOR = the HEAD committer date, which the pusher
-  # controls). A future-dated head pushes that floor past real findings that
-  # are already SHA-pinned to the head, so they stop being counted and the
-  # probe clears. The probe passes an empty anchor: commit_id is GitHub-owned
-  # and sufficient, and the floor can only ever under-count.
-  local dir rc issues
-  dir=$(make_case probe-old-finding 600 true 30 3 2)
+test_probe_evidence_does_not_expire() {
+  # Evidence is SHA-pinned and must not age out. HEAD_ANCHOR carries a moving
+  # wall-clock freshness floor and HEAD_IDENTITY_ANCHOR is the head committer
+  # date, which the pusher controls; either would let a head that has been
+  # sitting there stop reading as reported, deadlocking a barrier that
+  # re-probes the same head. The probe selects on commit_id alone.
+  #
+  # Fixture: the review and its comment both predate the head committer date,
+  # so any anchor-based filter would drop them.
+  local dir rc status
+  dir=$(make_case probe-old-evidence 600 true 30 3 2)
   rc=$(run_probe_case "$dir" probe_finding_predates_head)
-  issues=$(jq -r '.potential_issue_count' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
-  if [ "$rc" = "2" ] && [ "$issues" = "1" ]; then
-    pass "#814/#824: an inline finding predating the head committer date still counts (rc 2)"
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "0" ] && [ "$status" = "reported" ]; then
+    pass "#814: a HEAD-pinned review predating the head committer date still reads as reported"
   else
-    fail "#814/#824: expected rc 2 with 1 finding; got rc=$rc count=$issues"
+    fail "#814: expected rc 0/reported for aged SHA-pinned evidence; got rc=$rc status=$status"
     sed 's/^/      /' "$dir/err.log" >&2 || true
   fi
 }
@@ -1020,10 +1027,10 @@ test_probe_terminal_review_matches_polling_verdict() {
   status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
   observed=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
   posts=$(probe_count "$dir")
-  if [ "$rc" = "0" ] && [ "$status" = "cleared" ] && [ "$observed" = "terminal" ] && [ "$posts" = "0" ]; then
-    pass "#814 probe: a review already on HEAD still exits 0/cleared with observed=terminal and 0 posts"
+  if [ "$rc" = "0" ] && [ "$status" = "reported" ] && [ "$observed" = "terminal" ] && [ "$posts" = "0" ]; then
+    pass "#814 probe: a review on HEAD exits 0/reported with observed=terminal and 0 posts"
   else
-    fail "#814 probe: terminal review → rc=$rc status=$status observed=$observed posts=$posts"
+    fail "#814 probe: reported review → rc=$rc status=$status observed=$observed posts=$posts"
     sed 's/^/      /' "$dir/err.log" >&2 || true
   fi
 }
@@ -1069,9 +1076,9 @@ test_probe_rate_limit_is_not_yet_never_stalled
 test_probe_paused_is_not_yet_never_skipped
 test_probe_state_space_sweep
 test_probe_summary_without_head_review_is_not_yet
-test_probe_summary_lagging_head_review_is_not_yet
+test_probe_summary_lagging_head_review_is_reported
 test_probe_reviews_api_failure_is_infra_not_clean
-test_probe_finding_predating_head_still_counts
+test_probe_evidence_does_not_expire
 test_probe_env_var_equals_flag
 test_probe_terminal_review_matches_polling_verdict
 test_probe_field_absent_on_polling_runs

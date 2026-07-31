@@ -562,11 +562,11 @@ test_probe_inspects_head_evidence_before_skip() {
       CODERABBIT_TEST_SCENARIO=probe_skip_with_head_review \
       ./scripts/coderabbit-wait.sh --probe 999 owner/repo \
       >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
-  issues=$(jq -r '.potential_issue_count' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
-  if [ "$rc" = "2" ] && [ "$issues" = "1" ]; then
-    pass "#814 probe: a draft PR with a real HEAD review reports its findings, not a skip"
+  issues=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "0" ] && [ "$issues" = "reported" ]; then
+    pass "#814 probe: a draft PR carrying a real HEAD review reads as reported, not as a skip"
   else
-    fail "#814 probe: expected rc 2 with 1 finding on a draft PR carrying a HEAD review; got rc=$rc count=$issues"
+    fail "#814 probe: expected rc 0/reported on a draft PR carrying a HEAD review; got rc=$rc status=$issues"
     sed 's/^/      /' "$dir/err.log" >&2 || true
   fi
 }
