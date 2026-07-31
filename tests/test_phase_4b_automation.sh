@@ -2414,7 +2414,10 @@ bad=""
 # rate-limited run where the failover worked (Codex P2 on #835, raised twice).
 [ "$(_cr 5 '{}')" = escalate ]                                    || bad="$bad rc5"
 [ "$(_cr 5 '{"codex_failover_requested":false}')" = escalate ]    || bad="$bad rc5-nofailover"
-[ "$(_cr 5 '{"codex_failover_requested":true}')" = not-yet ]      || bad="$bad rc5-failover"
+# WAIVED, not not-yet: not-yet still blocks until the budget expires and then
+# escalates, which is the manual fallback the failover exists to avoid. The arm
+# has to actually open, with the Codex arm carrying the ordering from there.
+[ "$(_cr 5 '{"codex_failover_requested":true}')" = waived ]       || bad="$bad rc5-failover"
 [ "$(_cr 3 '{}')" = escalate ]                           || bad="$bad rc3"
 [ "$(p4b_barrier_class_codex 0)" = reported ]            || bad="$bad codex0"
 [ "$(p4b_barrier_class_codex 1)" = not-yet ]             || bad="$bad codex1"

@@ -132,11 +132,18 @@ p4b_top_field() {
 #
 #   reported          a terminal signal exists on THIS head
 #   will-not-report   the provider will never post on this head
+#   waived            it will not report in any useful window, and policy
+#                     explicitly permits proceeding without it
 #   not-yet           it has not posted on this head YET
 #   escalate          a stuck condition only a human can clear
 #
-# Only `reported` and `will-not-report` let the barrier open. `not-yet` is a
-# bounded, self-clearing wait; `escalate` goes to the human immediately.
+# `reported`, `will-not-report` and `waived` let the barrier open. `not-yet`
+# is a bounded, self-clearing wait; `escalate` goes to the human immediately.
+#
+# `waived` is deliberately a separate class rather than reuse of `reported`,
+# which would claim a report that never happened, or of `will-not-report`,
+# which would claim permanence a rate limit does not have. It names the actual
+# situation: a policy decision to proceed without this provider on this head.
 #
 # The split exists because treating "any terminal-looking rc" as satisfied
 # makes the barrier a universal pass: rc 4 means "has not reported", and rc 6
@@ -193,7 +200,12 @@ p4b_barrier_class_coderabbit() {
       # not rare, since CodeRabbit rate-limited on five consecutive heads
       # during #823. (Codex P2 on #835, raised twice.)
       if [ "$(printf '%s' "$json" | jq -r '.codex_failover_requested // false' 2>/dev/null || true)" = "true" ]; then
-        printf 'not-yet'
+        # WAIVED, not not-yet (Codex P2 on #835 round 4 — my round-3 fix chose
+        # the wrong class). not-yet still blocks until the retry budget expires
+        # and then escalates, which is the manual fallback the failover exists
+        # to avoid; the arm has to actually open. The Codex arm carries the
+        # ordering from here, which is what AGENTS.md means by non-blocking.
+        printf 'waived'
       else
         printf 'escalate'
       fi
