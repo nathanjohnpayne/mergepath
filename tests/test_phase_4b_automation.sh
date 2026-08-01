@@ -2707,12 +2707,19 @@ fi
 # exists to prevent — and re-filed follow-up issues every retry cycle.
 # Asserted structurally because the two evaluations can only disagree when a
 # provider CLI flaps between them, which no fixture can pin honestly.
+# The ordering must be anchored on the CALL SITE, not on the helper reference
+# inside run_same_head_barrier's definition (CodeRabbit on #842). That
+# definition sits near the top of the file, so its line number is below the
+# loop record no matter where the barrier is actually invoked — an ordering
+# assertion anchored there passes even after someone moves the call after
+# p4b_acct_hook_record_loop, which is precisely the regression this guards.
 n_eval="$(grep -c 'p4b_same_head_barrier ' "$ORCH" || true)"
-if [ "$n_eval" = "1" ] \
-   && [ "$(grep -n 'p4b_same_head_barrier ' "$ORCH" | cut -d: -f1)" -lt "$(grep -n 'p4b_acct_hook_record_loop ' "$ORCH" | head -1 | cut -d: -f1)" ]; then
-  pass "#814: the barrier is evaluated exactly once, before any loop is recorded — a hold cannot leave a phantom posted approval"
+n_call="$(grep -c '^run_same_head_barrier ' "$ORCH" || true)"
+if [ "$n_eval" = "1" ] && [ "$n_call" = "1" ] \
+   && [ "$(grep -n '^run_same_head_barrier ' "$ORCH" | cut -d: -f1)" -lt "$(grep -n 'p4b_acct_hook_record_loop ' "$ORCH" | head -1 | cut -d: -f1)" ]; then
+  pass "#814: the barrier is called exactly once, before any loop is recorded — a hold cannot leave a phantom posted approval"
 else
-  fail "#814: barrier evaluated $n_eval time(s), or not before the loop record"
+  fail "#814: barrier defined $n_eval time(s), called $n_call time(s), or the call is not before the loop record"
 fi
 
 # The trigger dedup must FAIL CLOSED on a comments-read failure. jq -s prints
