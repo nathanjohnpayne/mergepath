@@ -156,8 +156,8 @@ p4b_top_field() {
 p4b_barrier_class_coderabbit() {
   local head="$1" rc="$2" json="$3" probe_head
   case "$rc" in
-    0|2)
-      # Terminal, but only for the head about to be approved. An rc 0/2
+    0)
+      # Terminal, but only for the head about to be approved. An rc 0
       # anchored on an older head is a stale clearance, and the #794 ordering
       # failure begins exactly there.
       probe_head="$(printf '%s' "$json" | jq -r '.head_sha // empty' 2>/dev/null || true)"
@@ -167,6 +167,21 @@ p4b_barrier_class_coderabbit() {
         printf 'not-yet'
       fi
       ;;
+    2)
+      # NOT reported (Codex P1 on #842). In --probe mode rc 2 is the one
+      # verdict the probe makes, and it means something specific: CodeRabbit
+      # published a blocking `Potential issue`/⚠️ marker carried SOLELY by the
+      # PR-level summary. #823 emits it precisely because no required gate
+      # dispositions that class — coderabbit-severity-gate.sh reads only
+      # pulls/{pr}/comments, the conversation gate covers threads, and the
+      # Phase 4b adapter sees only the diff.
+      #
+      # So the barrier is the only thing that ever sees this signal. Folding it
+      # in with rc 0 opened the barrier, ran the adapter, and let an approval
+      # post over a finding nothing else would catch — and on the wave-audit
+      # path that approval advances the watermark and authorises fan-out.
+      # Escalate to a human, who is the only remaining reader.
+      printf 'escalate' ;;
     6)
       # EVERY exit-6 skip is not-yet, including draft and non-base-branch.
       #
@@ -572,7 +587,13 @@ p4b_same_head_barrier() {
             *) trigger="$(p4b_barrier_maybe_trigger "$repo" "$pr" "$head" "$reviewer" "$json" "$dry")" ;;
           esac
           ;;
-        *) why="coderabbit probe exited $rc" ;;
+        *)
+          if [ "$rc" = 2 ]; then
+            why="CodeRabbit published a blocking finding carried only by the PR-level summary on $head — no required gate dispositions that class, so a human must read it"
+          else
+            why="coderabbit probe exited $rc"
+          fi
+          ;;
       esac
     fi
   fi

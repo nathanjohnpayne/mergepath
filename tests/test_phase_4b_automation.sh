@@ -2410,7 +2410,13 @@ fi
 _cr() { p4b_barrier_class_coderabbit abc123 "$1" "$2"; }
 bad=""
 [ "$(_cr 0 '{"head_sha":"abc123"}')" = reported ]        || bad="$bad rc0-match"
-[ "$(_cr 2 '{"head_sha":"abc123"}')" = reported ]        || bad="$bad rc2-match"
+# rc 2 is NOT a report. In --probe mode it is the one verdict the probe makes:
+# a blocking marker carried solely by the PR-level summary, which #823 emits
+# precisely because no required gate dispositions that class. The barrier is
+# the only reader of that signal, so it escalates to a human rather than
+# opening and letting an approval post over it (Codex P1 on #842).
+[ "$(_cr 2 '{"head_sha":"abc123"}')" = escalate ]        || bad="$bad rc2-summary-only"
+[ "$(_cr 2 '{"head_sha":"stale99"}')" = escalate ]       || bad="$bad rc2-stale"
 # A terminal rc anchored on an OLDER head is a stale clearance — the #794 shape.
 [ "$(_cr 0 '{"head_sha":"old999"}')" = not-yet ]         || bad="$bad rc0-stale"
 [ "$(_cr 0 '{}')" = not-yet ]                            || bad="$bad rc0-nohead"

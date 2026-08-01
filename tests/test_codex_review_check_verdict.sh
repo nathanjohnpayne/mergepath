@@ -345,7 +345,12 @@ if [ -n "$exit2_at" ]; then
   # later edit cannot leave the exit reachable from the gate path.
   guard_at=$(sed -n "$((exit2_at - 4)),$((exit2_at - 1))p" "$SCRIPT" \
     | grep -c 'DIAGNOSTIC_SIGNAL_ONLY" = "1"' || true)
-  [ "$guard_at" -ge 1 ] && guard_ok=1
+  # Proximity alone is not containment (CodeRabbit on #842): moving `fi` above
+  # the exit would leave the guard text nearby while the exit sits outside the
+  # block. Require that no `fi` closes between the guard and the exit.
+  fi_between=$(sed -n "$((exit2_at - 4)),$((exit2_at - 1))p" "$SCRIPT" \
+    | grep -cE '^[[:space:]]*fi[[:space:]]*$' || true)
+  [ "$guard_at" -ge 1 ] && [ "$fi_between" -eq 0 ] && guard_ok=1
 fi
 # And it must be the ONLY exit 2 in the script, so the documented 0/1/3
 # contract still holds for every non-diagnostic caller.
