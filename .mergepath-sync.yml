@@ -423,6 +423,16 @@ paths:
       - "scripts/phase-4b/"
       - "scripts/gh-as-reviewer.sh"
       - "scripts/post-phase-4b-handoff.sh"
+      # The #814 same-head barrier invokes both of these directly, by path,
+      # on every non-dry run. A consumer that receives the orchestrator
+      # without them — or with copies predating `--probe` (#823) and the
+      # `--diagnostic-signal-only` flag (#835) — sees exit 127 or an
+      # unrecognised rc, and the barrier escalates or holds instead of
+      # reviewing. That fails closed rather than open, but it disables the
+      # automated leg for that repo until the next wave, so the closure gate
+      # must refuse to ship the caller ahead of its runtime dependencies.
+      - "scripts/coderabbit-wait.sh"
+      - "scripts/codex-review-check.sh"
   # Chat-side Phase 4b handoff block renderer (#281). Read-only,
   # stdout-only: emits the single-PR or batch handoff variant per
   # REVIEW_POLICY.md § Handoff Message Format § Chat-side handoff
