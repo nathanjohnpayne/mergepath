@@ -430,6 +430,21 @@ if [ -f "$WORKFLOW" ]; then
         echo "      variable the job never sets kills it under set -u."
         FAILED=1
       fi
+      # The TRUSTED checkout (Codex P2 on #849, but the property is the
+      # trusted-path rule from #628). Every producer runs
+      # scripts/merge-clearance-gate.sh, and asserting the invocation says
+      # nothing about which revision supplied that script. On a pull_request
+      # event a checkout without an explicit default-branch ref takes the PR's
+      # own copy — so a PR could rewrite the gate to exit 0 and clear itself.
+      # That is forgeability, not merely incorrectness, which is why it is
+      # pinned here rather than deferred with the rest of the round.
+      if ! mcg_has "$mcg_pblock" 'ref: ${{ github.event.repository.default_branch }}'; then
+        echo "FAIL: the '$mcg_producer' job must check out the DEFAULT BRANCH"
+        echo "      (ref: \${{ github.event.repository.default_branch }}) before running"
+        echo "      the gate. Without it a pull_request run evaluates the PR's own copy"
+        echo "      of scripts/merge-clearance-gate.sh, and a PR can clear itself (#628)."
+        FAILED=1
+      fi
       # Auxiliary producers only. The event job maps through the sentinel-
       # guarded form (rc 0 AND verdict=pass), which is asserted separately
       # above; requiring the one-line case arms there would reject the real
