@@ -103,6 +103,29 @@ jobs:
   merge-clearance-gate:
     name: Merge clearance gate
     runs-on: ubuntu-latest
+    # Serialize event-driven publications per (PR, head) (Codex P1 on #843).
+    # Two same-head events — an approval and its dismissal, say — otherwise
+    # each open their own check run, and the OLDER evaluation can PATCH last
+    # and leave its stale conclusion standing: a stale success makes the
+    # context look clear after clearance was revoked, and the reverse falsely
+    # blocks a cleared PR. `POST /check-runs` has no conditional write, so
+    # ordering has to come from not running them concurrently.
+    #
+    # cancel-in-progress: FALSE deliberately. The cancelling form would leave
+    # `cancelled` native check runs on the required context, and `cancelled`
+    # is not one of SUCCESS/SKIPPED/NEUTRAL — a brand-new permanent-blocker
+    # class. Queueing has no such hazard: a run cancelled while still QUEUED
+    # never reached phase 1, so it published nothing at all.
+    #
+    # Job-scoped, NOT workflow-scoped: the sweep walks up to 500 PRs in one
+    # job and must never be serialized behind a single PR's events.
+    #
+    # This closes event-vs-event only. An event still races the */15 sweep and
+    # the dispatch path, which are separate jobs; the native producer carries
+    # the correct verdict for the later run in that case.
+    concurrency:
+      group: merge-clearance-gate-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+      cancel-in-progress: false
     # #841: this job now ALSO publishes its verdict as a Checks-API check_run
     # under the required-check name, so `checks: write` is needed here.
     # Job-level `permissions:` REPLACES the workflow map above wholesale, so
