@@ -79,9 +79,13 @@ on:
     - cron: "*/15 * * * *"
 
 # Least-privilege default for the whole workflow: read-only. `checks: write`
-# is granted ONLY to the jobs that POST check_runs (the scheduled-sweep and
-# the #658 dispatch-recheck job); the event-driven job produces its check
-# natively and needs no write scope (CodeRabbit ⚠️ on PR #429).
+# is granted, job-scoped, to every job that EVALUATES the gate — the
+# scheduled sweep, the #658 dispatch-recheck job, and since #841 the
+# event-driven job too. The event job used to rely on its native check alone
+# ("produces its check natively and needs no write scope", CodeRabbit ⚠️ on
+# PR #429); that is now false by design. It publishes through the Checks API
+# as well, so that no two producers of this required context can carry
+# different verdicts on one head.
 #
 # `issues: read` is required (Codex P2 on PR #429): the gate reads
 # /issues/{pr}/comments for the propagation-lane marker, and the delegated
@@ -99,6 +103,39 @@ jobs:
   merge-clearance-gate:
     name: Merge clearance gate
     runs-on: ubuntu-latest
+    # NO `concurrency:` block here, and that is load-bearing (#843, proven).
+    #
+    # Serializing per (PR, head) would close the clobber race — two same-head
+    # events where the OLDER evaluation PATCHes last and leaves a stale
+    # conclusion standing. `cancel-in-progress: false` looks like the safe form
+    # of it, because a run cancelled while still QUEUED never reaches phase 1
+    # and so publishes nothing through the Checks API.
+    #
+    # That reasoning is WRONG, and it was measured rather than argued. GitHub
+    # concurrency cancels the PENDING member when a third event queues, and
+    # Actions still materialises that run's NATIVE job check — named for this
+    # required context, concluding `cancelled`. `cancelled` is not one of
+    # SUCCESS / SKIPPED / NEUTRAL, so it blocks, and being job-native lineage
+    # it cannot be retired through the Checks-API slot. Adding the block
+    # produced exactly that on this PR's own head: check run 91305386162,
+    # `completed / cancelled`, job-native, on 693aefc3.
+    #
+    # So the block trades a transient wrong-verdict window for a PERMANENT
+    # blocker, on a PR that emits several review events in quick succession.
+    # The clobber race stays open and is recorded as residual risk instead:
+    # the native producer still carries the correct verdict for the later run,
+    # and the */15 sweep re-evaluates. Serialization is only safe once the
+    # required context has a single producer that is not a cancelable job.
+    #
+    # #841: this job now ALSO publishes its verdict as a Checks-API check_run
+    # under the required-check name, so `checks: write` is needed here.
+    # Job-level `permissions:` REPLACES the workflow map above wholesale, so
+    # every scope this job uses has to be listed, not just the new one.
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: write
     # Event-driven path (native check on the PR head). The scheduled sweep
     # and the #658 dispatch-recheck job run the same gate via the Checks API;
     # gating this job to the PR/review events avoids paying for an empty
@@ -109,6 +146,72 @@ jobs:
       github.event_name != 'schedule'
       && github.event_name != 'repository_dispatch'
     steps:
+      - name: Open the required check_run (#841 phase 1)
+        id: open
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # Bind to the PR HEAD. NOT github.sha — on a pull_request event that
+          # is the refs/pull/N/merge commit, which branch protection never
+          # consults. Publishing there would leave the required context ABSENT
+          # on every head: a permanent block, fleet-wide, with no partial
+          # degradation to warn you.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          # Dependabot PRs are SAME-REPO, so IS_FORK is false for them, but
+          # their GITHUB_TOKEN is read-only all the same — this repo documents
+          # that at dependabot-auto-merge.yml:5-6, which is why that workflow
+          # uses pull_request_target. Without this the publish fails every
+          # retry, takes the hard-error branch below, and fails the required
+          # check on every Dependabot PR. Dependabot runs weekly here
+          # (.github/dependabot.yml), so that is not a corner case.
+          PR_ACTOR: ${{ github.event.pull_request.user.login }}
+          # Same name as the sweep/dispatch CHECK_NAME and as
+          # audit-branch-protection.sh's CANONICAL_REQUIRED_CHECKS entry.
+          CHECK_NAME: "Merge clearance gate"
+        run: |
+          set -uo pipefail
+          # Two-phase publish (#841). This in_progress entry immediately
+          # retires whatever the sweep or dispatch last left in the Checks-API
+          # slot, so from here until phase 2 the required context is PENDING
+          # (blocking) rather than a stale verdict. Everything that can go
+          # wrong after this line — checkout, PR resolve, a gate crash, runner
+          # death, a failed phase-2 PATCH, a cancelled run — therefore fails
+          # CLOSED. That is the property #841 lacked: a job-native completion
+          # cannot retire a Checks-API entry, so the event path has to write
+          # the same slot the sweep writes.
+          [ -n "$HEAD_SHA" ] || { echo "::error::No PR head SHA on this event."; exit 1; }
+          id=""
+          for attempt in 1 2 3; do
+            id=$(gh api -X POST "repos/$REPO/check-runs" \
+                   -f name="$CHECK_NAME" \
+                   -f head_sha="$HEAD_SHA" \
+                   -f status="in_progress" \
+                   -f "output[title]=Merge clearance gate (event-driven re-evaluation in progress)" \
+                   -f "output[summary]=Evaluating scripts/merge-clearance-gate.sh on $HEAD_SHA." \
+                   --jq .id 2>/dev/null) && [ -n "$id" ] && break
+            id=""; sleep $((attempt * 5))
+          done
+          if [ -z "$id" ]; then
+            # A restricted GITHUB_TOKEN cannot publish, and that must NOT be
+            # turned into a failed required check. Two contexts have one: fork
+            # PRs, and Dependabot PRs — which are same-repo, so IS_FORK is
+            # false for them. Degrade to the pre-#841 shape in both: this job's
+            # NATIVE check still carries the verdict under the required name on
+            # the PR head, and the */15 sweep still refreshes the Checks-API
+            # entry. Not fixed, but not regressed either.
+            #
+            # `[ = ]` rather than a case pattern: "dependabot[bot]" in a case
+            # arm is a glob character class and would match "dependabott".
+            if [ "$IS_FORK" = "true" ] || [ "$PR_ACTOR" = "dependabot[bot]" ]; then
+              echo "::warning::Restricted token (fork or Dependabot) — cannot publish the '$CHECK_NAME' check_run. Native check + sweep remain (#841)."
+              exit 0
+            fi
+            echo "::error::Could not open the '$CHECK_NAME' check_run on $HEAD_SHA. Refusing to report a verdict we cannot publish (#841)."
+            exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
       - name: Checkout repo (default branch — trusted gate scripts)
         # Pin to the default branch, NOT the PR HEAD. This is a REQUIRED
         # status check: if it ran scripts/merge-clearance-gate.sh (and the
@@ -149,26 +252,126 @@ jobs:
           echo "number=$pr" >> "$GITHUB_OUTPUT"
 
       - name: Run scripts/merge-clearance-gate.sh
+        id: gate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           REPO: ${{ github.repository }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           # The script is the source of truth for what blocks merge.
           # Exit codes:
           #   0 = clearance satisfied (or gate not applicable / disabled)
           #   1 = clearance NOT satisfied on HEAD (gate blocks)
           #   2 = config / usage / infra error (CI failure, not a gate block)
+          #
+          # This step only CAPTURES the verdict now. The job's native check
+          # conclusion is set by "Report gate verdict" below, so that phase 2
+          # can run in between and publish the same verdict to the Checks-API
+          # slot (#841).
           set +e
-          scripts/merge-clearance-gate.sh "$PR_NUMBER" "$REPO"
+          output=$(scripts/merge-clearance-gate.sh "$PR_NUMBER" "$REPO" 2>&1)
           rc=$?
           set -e
-          if [ "$rc" -eq 2 ]; then
+          echo "$output"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # Bash slice, NOT `printf | head -c`: under pipefail a >60KB output
+          # makes head close the pipe early and the substitution aborts (the
+          # same Codex P2 the sweep carries below). Multi-line and
+          # attacker-influenceable, so a FILE, never GITHUB_OUTPUT.
+          printf '%s' "${output:0:60000}" > "$RUNNER_TEMP/mcg-summary.txt"
+          # Verdict sentinel. In gate mode (two positional args, no
+          # MERGE_CLEARANCE_* query flags) rc 0 ALWAYS prints
+          # "Merge clearance: PASS —" via clear_pass(). Every OTHER rc-0 exit
+          # in that script is a query mode gated on DERIVE_ONLY /
+          # RATE_LIMIT_PROTECTION_ONLY and prints only true/false. Requiring
+          # the sentinel means a future call site that lands in a query mode
+          # publishes an infra FAILURE rather than an unearned green.
+          verdict=absent
+          case "$output" in
+            *"Merge clearance: PASS"*)    verdict=pass ;;
+            *"Merge clearance: BLOCKED"*) verdict=blocked ;;
+          esac
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+
+      - name: Close the required check_run (#841 phase 2)
+        # !cancelled(), NOT always(): on cancellation we deliberately leave the
+        # run in_progress, i.e. the required context PENDING = merge blocked.
+        if: ${{ !cancelled() && steps.open.outputs.id != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          CHECK_ID: ${{ steps.open.outputs.id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RC: ${{ steps.gate.outputs.rc }}
+          VERDICT: ${{ steps.gate.outputs.verdict }}
+        run: |
+          set -uo pipefail
+          # ONE request (gh pr view), not `gh pr list --limit 500` (5+
+          # paginated calls, and a PR past position 500 reads as unknown).
+          current=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+                      --json headRefOid --jq .headRefOid 2>/dev/null || true)
+          if [ "$current" != "$HEAD_SHA" ]; then
+            # Head moved, or could not be read. Do NOT publish nothing: a
+            # silent skip leaves whatever verdict is standing on $HEAD_SHA, and
+            # a force-push back to $HEAD_SHA would then merge on it. Close the
+            # run we opened as a FAILURE, pinned to the head we bound to. That
+            # SHA is no longer the PR head so the red blocks nothing current,
+            # and it retires any stale green sitting there.
+            conclusion="failure"
+            title="Merge clearance gate — head moved during evaluation (${HEAD_SHA:0:7} -> ${current:0:7}); awaiting re-evaluation on the new head"
+            summary="$title"
+          else
+            case "$RC" in
+              0)
+                if [ "$VERDICT" = "pass" ]; then
+                  conclusion="success"
+                  title="Merge clearance gate (event-driven re-evaluation)"
+                else
+                  conclusion="failure"
+                  title="Merge clearance gate — infra/config error (rc=0 with no PASS verdict line)"
+                fi
+                ;;
+              1) conclusion="failure"
+                 title="Merge clearance gate (event-driven re-evaluation)" ;;
+              *) conclusion="failure"
+                 title="Merge clearance gate — infra/config error (rc=$RC)" ;;
+            esac
+            summary=$(cat "$RUNNER_TEMP/mcg-summary.txt" 2>/dev/null || echo "(no gate output captured)")
+          fi
+          # A PATCH that never lands leaves the run in_progress = the required
+          # context PENDING = merge blocked. Fail-closed in BOTH verdict
+          # directions, which is why this step needs no asymmetric error
+          # handling and must never fail the job.
+          for attempt in 1 2 3; do
+            gh api -X PATCH "repos/$REPO/check-runs/$CHECK_ID" \
+              -f status="completed" \
+              -f conclusion="$conclusion" \
+              -f "output[title]=$title" \
+              -f "output[summary]=$summary" >/dev/null && exit 0
+            sleep $((attempt * 5))
+          done
+          echo "::warning::Could not close check_run $CHECK_ID; the required context stays PENDING until the */15 sweep supersedes it (#841)."
+          exit 0
+
+      - name: Report gate verdict
+        # The job's NATIVE check conclusion. Mapping is identical to pre-#841
+        # except for the sentinel guard.
+        env:
+          RC: ${{ steps.gate.outputs.rc }}
+          VERDICT: ${{ steps.gate.outputs.verdict }}
+        run: |
+          set -euo pipefail
+          if [ "$RC" -eq 0 ] && [ "$VERDICT" != "pass" ]; then
+            echo "::error::merge-clearance-gate.sh exited 0 without a PASS verdict line (query mode reached?)"
+            exit 1
+          fi
+          if [ "$RC" -eq 2 ]; then
             echo "::error::merge-clearance-gate.sh exited 2 (config/usage/infra error)"
             exit 1
           fi
-          exit "$rc"
+          exit "$RC"
 
   scheduled-sweep:
     name: Merge clearance scheduled sweep
@@ -177,8 +380,14 @@ jobs:
     # reaction, a UI label resolve, a GITHUB_TOKEN-authored relabel —
     # the exact #428 case). This sweep walks every open PR, runs the same
     # gate script, and posts a fresh check_run on each PR's head SHA via
-    # the Checks API. Required-check resolution keys on (head_sha, name),
-    # so the new check supersedes the stale one. Idempotent.
+    # the Checks API. Supersession is reliable only WITHIN the Checks-API
+    # slot: resolution takes the latest run per (name, check_suite) and a
+    # stale entry in any suite can block, Actions creates a new check suite
+    # per workflow run, and every Checks-API POST for one (app, head_sha)
+    # coalesces into the push-time suite — so a job-native completion can
+    # never retire a Checks-API entry (#841). Since #841 the event-driven job
+    # publishes into this same slot, so every producer of this context carries
+    # the same verdict. Idempotent.
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     # Only this job needs checks:write — it POSTs a check_run per open PR.
@@ -241,9 +450,15 @@ jobs:
           REPO: ${{ github.repository }}
           # Check name MUST match the event-driven job name above so
           # branch protection's required-check entry resolves either
-          # source as the same gate. GitHub keys required checks on
-          # (head_sha, name); a fresh check_run with the same name
-          # supersedes the stale one.
+          # source as the same gate. Supersession is reliable only WITHIN
+          # the Checks-API slot: resolution takes the latest run per
+          # (name, check_suite), a stale entry in any suite can block,
+          # Actions creates a new check suite per workflow run, and every
+          # Checks-API POST for one (app, head_sha) coalesces into the
+          # push-time suite — so a job-native completion can never retire
+          # a Checks-API entry (#841). Since #841 the event-driven job
+          # publishes into this same slot, so every producer of this
+          # context carries the same verdict.
           CHECK_NAME: "Merge clearance gate"
         run: |
           set -euo pipefail
@@ -374,9 +589,14 @@ jobs:
           REPO: ${{ github.repository }}
           # Check name MUST match the event-driven job name above AND the
           # sweep CHECK_NAME so branch protection resolves every source as the
-          # same required check (GitHub keys required checks on (head_sha,
-          # name); a fresh check_run with the same name supersedes the stale
-          # one).
+          # same required check. Supersession is reliable only WITHIN the
+          # Checks-API slot: resolution takes the latest run per
+          # (name, check_suite), a stale entry in any suite can block, Actions
+          # creates a new check suite per workflow run, and every Checks-API
+          # POST for one (app, head_sha) coalesces into the push-time suite —
+          # so a job-native completion can never retire a Checks-API entry
+          # (#841). Since #841 the event-driven job publishes into this same
+          # slot, so every producer of this context carries the same verdict.
           CHECK_NAME: "Merge clearance gate"
         run: |
           set -euo pipefail
