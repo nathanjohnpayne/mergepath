@@ -1128,7 +1128,10 @@ jobs:
       - env:
           PR: ${{ github.event.client_payload.pr }}
           CHECK_NAME: "Merge clearance gate"
-        run: gh api -X POST "repos/$REPO/check-runs" -f name="$CHECK_NAME"
+        run: |
+          scripts/merge-clearance-gate.sh "$PR" "$REPO"
+          gh api -X POST "repos/$REPO/check-runs" \
+            -f name="$CHECK_NAME" -f head_sha="$head_sha"
   # Sweep job — present so the >=3-producer CHECK_NAME assertion (#845) is
   # satisfied by a shape-valid header. Deliberately a DIFFERENT job from the
   # event one, which is what Case D below exploits to prove block scoping.
@@ -1142,7 +1145,10 @@ jobs:
     env:
       CHECK_NAME: "Merge clearance gate"
     steps:
-      - run: gh api -X POST "repos/$REPO/check-runs" -f name="$CHECK_NAME"
+      - run: |
+          scripts/merge-clearance-gate.sh "$PR" "$REPO"
+          gh api -X POST "repos/$REPO/check-runs" \
+            -f name="$CHECK_NAME" -f head_sha="$head_sha"
 WF
 }
 
@@ -1161,10 +1167,11 @@ write_wf_gate_job() {
       checks: write
     env:
       CHECK_NAME: "Merge clearance gate"
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
       - name: Open the required check_run
         id: open
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           id=$(gh api -X POST "repos/$REPO/check-runs" \
                  -f name="$CHECK_NAME" \
@@ -1174,6 +1181,7 @@ write_wf_gate_job() {
       - name: Run gate
         id: gate
         run: |
+          output=$(scripts/merge-clearance-gate.sh "$PR_NUMBER" "$REPO")
           case "$output" in
             *"Merge clearance: PASS"*) verdict=pass ;;
           esac
@@ -1642,7 +1650,7 @@ mcg22_case() {  # <name> <perl-program-or-empty> <expect: fail|pass> [expected-F
 }
 
 # A — no POST at all.
-mcg22_case A 's{gh api -X POST "repos/\$REPO/check-runs" \\}{true \\}' fail "must open the required check_run"
+mcg22_case A 's{(.*)gh api -X POST "repos/\$REPO/check-runs" \\}{$1true \\}s' fail "must open the required check_run"
 # B — the POST survives only as a full-line comment.
 mcg22_case B 's{^(\s*)id=\$\(gh api -X POST}{$1# id=\$(gh api -X POST}m' fail "must open the required check_run"
 # C — no job-scoped checks: write.
@@ -1671,7 +1679,7 @@ mcg22_case K 's{HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}}{HEAD_S
 # scope, rather than a count of either half.
 # L — delete a producer's POST but keep its CHECK_NAME env. A name-count
 #     assertion still sees three and passes (Codex P2 on #849).
-mcg22_case L 's{(.*)gh api -X POST "repos/\$REPO/check-runs" -f name="\$CHECK_NAME"}{$1true}s' fail 'must POST a check_run under CHECK_NAME'
+mcg22_case L 's{(.*)gh api -X POST "repos/\$REPO/check-runs"}{$1true #}s' fail 'must POST a check_run under CHECK_NAME'
 # M — keep a POST but publish a DIFFERENT check name. A POST-count assertion
 #     still sees three and passes, while that trigger path has stopped
 #     refreshing this required context (CodeRabbit Major on #849).

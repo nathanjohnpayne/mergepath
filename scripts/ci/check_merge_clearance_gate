@@ -210,6 +210,34 @@ if [ -f "$WORKFLOW" ]; then
     grep -qF -- "$2" <<<"$1"
   }
 
+  # Print the body of a nested mapping (e.g. `permissions:`) from a job block,
+  # stopping at the first line indented no deeper than the key itself. Needed
+  # because an anchored key match still ignores nesting (Codex P2 on #849): a
+  # `checks: write` under `env:` satisfied it while the real permission was
+  # `checks: read`, and the POST then 403s.
+  mcg_submap() {  # <block> <key>
+    awk -v key="$2" '
+      {
+        n = 0
+        while (substr($0, n+1, 1) == " ") n++
+      }
+      inmap && n <= keyindent && $0 !~ /^[[:space:]]*$/ { exit }
+      inmap { print; next }
+      $0 ~ "^[[:space:]]*" key ":[[:space:]]*$" { inmap = 1; keyindent = n }
+    ' <<<"$1"
+  }
+
+  # Print one step block from a job, from its `- name: <label>` to the next
+  # step at the same indent. Per-step scope matters: an assertion over the
+  # whole job passes when phase 2 supplies a value phase 1 has lost.
+  mcg_step() {  # <block> <step-name-substring>
+    awk -v want="$2" '
+      index($0, "- name: " want) { inblk = 1; print; next }
+      inblk && /^[[:space:]]*- name:/ { exit }
+      inblk { print }
+    ' <<<"$1"
+  }
+
   mcg_evt_block="$(mcg_job_block "$WORKFLOW" merge-clearance-gate)"
   mcg_evt="$(mcg_strip "$mcg_evt_block")"
 
@@ -220,7 +248,8 @@ if [ -f "$WORKFLOW" ]; then
     echo "      whole-file grep that the pre-#843 workflow satisfies."
     FAILED=1
   else
-    if ! grep -qE '^[[:space:]]+checks:[[:space:]]*write[[:space:]]*$' <<<"$mcg_evt"; then
+    if ! grep -qE '^[[:space:]]+checks:[[:space:]]*write[[:space:]]*$' \
+         <<<"$(mcg_submap "$mcg_evt" permissions)"; then
       echo "FAIL: the merge-clearance-gate job must grant job-scoped 'checks: write' (#843)."
       echo "      Without it the phase-1 POST 403s on every same-repo PR and the event"
       echo "      path stops publishing into the Checks-API slot entirely."
@@ -287,9 +316,28 @@ if [ -f "$WORKFLOW" ]; then
       # An anchored KEY match, not containment (Codex P2 on #849): a value such
       # as DUMMY: "checks: write" satisfies a substring search while the real
       # permission is checks: read, and the POST then 403s.
-      if ! grep -qE '^[[:space:]]+checks:[[:space:]]*write[[:space:]]*$' <<<"$mcg_pblock"; then
-        echo "FAIL: the '$mcg_producer' job must grant job-scoped 'checks: write';"
-        echo "      without it its POST 403s and that trigger path stops publishing."
+      if ! grep -qE '^[[:space:]]+checks:[[:space:]]*write[[:space:]]*$' \
+           <<<"$(mcg_submap "$mcg_pblock" permissions)"; then
+        echo "FAIL: the '$mcg_producer' job must grant 'checks: write' in its"
+        echo "      job-level permissions map; without it its POST 403s and that"
+        echo "      trigger path stops publishing."
+        FAILED=1
+      fi
+      # A check_run POST without head_sha is rejected by GitHub outright, so a
+      # producer missing it publishes nothing at all (Codex P2 on #849).
+      if ! mcg_has "$mcg_pblock" '-f head_sha='; then
+        echo "FAIL: the '$mcg_producer' job must POST with -f head_sha=; the Checks"
+        echo "      API rejects a create-check-run request without it, so that path"
+        echo "      would publish nothing."
+        FAILED=1
+      fi
+      # And the conclusion has to come from the gate, not a constant. Without
+      # this a producer can keep its POST, its name and its head_sha while
+      # publishing a verdict it never computed (Codex P2 on #849).
+      if ! mcg_has "$mcg_pblock" 'scripts/merge-clearance-gate.sh'; then
+        echo "FAIL: the '$mcg_producer' job must invoke scripts/merge-clearance-gate.sh"
+        echo "      and derive its published conclusion from the result — otherwise it"
+        echo "      publishes a verdict it never evaluated."
         FAILED=1
       fi
     done
@@ -314,6 +362,19 @@ if [ -f "$WORKFLOW" ]; then
     # text and no github.sha, so a containment allowlist accepted it while the
     # publisher submitted an invalid head_sha and its POST failed. Anchoring
     # both ends is what makes an allowlist actually exclusive.
+    # Phase 1 must bind HEAD_SHA itself. Asserting over the whole job passes
+    # when only phase 2 still has one (Codex P2 on #849) — and phase 1 then
+    # expands an unset HEAD_SHA under set -u and exits BEFORE opening the
+    # in-progress run, which is precisely the fail-closed property this fence
+    # exists to protect.
+    if ! grep -qE '^[[:space:]]*HEAD_SHA:' \
+         <<<"$(mcg_step "$mcg_evt" 'Open the required check_run')"; then
+      echo "FAIL: the phase-1 step must bind HEAD_SHA itself (#843). With only"
+      echo "      phase 2 binding it, phase 1 expands an unset variable under set -u"
+      echo "      and exits before opening the in-progress run — so nothing retires"
+      echo "      the previous verdict and the publish stops failing closed."
+      FAILED=1
+    fi
     mcg_bad_headsha="$(grep -E '^[[:space:]]*HEAD_SHA:' <<<"$mcg_evt" \
       | grep -vE '^[[:space:]]*HEAD_SHA:[[:space:]]*\$\{\{[[:space:]]*github\.event\.pull_request\.head\.sha[[:space:]]*\}\}[[:space:]]*$' || true)"
     if [ -n "$mcg_bad_headsha" ]; then
