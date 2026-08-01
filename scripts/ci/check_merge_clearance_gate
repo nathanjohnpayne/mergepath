@@ -236,20 +236,41 @@ if [ -f "$WORKFLOW" ]; then
       echo "      \"Merge clearance gate\" — the required-check context string."
       FAILED=1
     fi
-    # Three producers: event, sweep, dispatch. Counted by actual POST sites,
-    # NOT by CHECK_NAME declarations (Codex P2 on #849) — removing a sweep or
-    # dispatch POST while leaving its env: block intact would keep three names
-    # and pass, while the no-event transitions that sweep exists for (a 👍
-    # reaction, a UI thread resolve, a GITHUB_TOKEN relabel) silently stop
-    # refreshing the required context and a stale verdict persists.
-    mcg_post_count="$(grep -v '^[[:space:]]*#' "$WORKFLOW" | sed 's/[[:space:]]#.*$//' \
-      | grep -cF 'gh api -X POST "repos/$REPO/check-runs"' || true)"
-    if [ "$mcg_post_count" -lt 3 ]; then
-      echo "FAIL: expected >=3 jobs POSTing the required check_run (event, scheduled"
-      echo "      sweep, dispatch-recheck); found $mcg_post_count."
-      echo "      Every trigger path must write the same Checks-API slot (#843)."
-      FAILED=1
-    fi
+    # Three producers: event, sweep, dispatch — each verified IN ITS OWN JOB
+    # SCOPE, and each required to both POST and publish under CHECK_NAME.
+    #
+    # Two weaker versions of this were caught in review and are worth naming,
+    # because they fail in opposite directions. Counting CHECK_NAME
+    # declarations measures naming without publishing: delete a POST, keep the
+    # env: block, still three (Codex P2). Counting POST sites measures
+    # publishing without naming: any unrelated check-run POST preserves the
+    # count after a real producer stops emitting "Merge clearance gate"
+    # (CodeRabbit Major). Only the conjunction, per scope, says what is meant —
+    # that each of the three trigger paths still writes THIS slot.
+    #
+    # Why it matters that all three survive: the sweep and dispatch are the
+    # only refreshers for the no-event transitions (a 👍 reaction, a UI thread
+    # resolve, a GITHUB_TOKEN relabel), and the event job is the only one bound
+    # to the PR head as it moves. Lose any one and a stale verdict persists on
+    # some path.
+    for mcg_producer in merge-clearance-gate scheduled-sweep dispatch-recheck; do
+      mcg_pblock="$(mcg_job_block "$WORKFLOW" "$mcg_producer")"
+      if [ -z "$mcg_pblock" ]; then
+        echo "FAIL: $WORKFLOW is missing the '$mcg_producer' job — all three trigger"
+        echo "      paths (event, scheduled sweep, dispatch-recheck) must publish the"
+        echo "      required check_run (#843)."
+        FAILED=1
+        continue
+      fi
+      if ! mcg_has "$mcg_pblock" 'gh api -X POST "repos/$REPO/check-runs"' \
+         || ! mcg_has "$mcg_pblock" '-f name="$CHECK_NAME"'; then
+        echo "FAIL: the '$mcg_producer' job must POST a check_run under CHECK_NAME."
+        echo "      A POST without the name flag, or a CHECK_NAME declaration without"
+        echo "      a POST, leaves that trigger path no longer refreshing the required"
+        echo "      context — and a stale verdict then persists on it (#843)."
+        FAILED=1
+      fi
+    done
     if ! mcg_has "$mcg_evt_block" 'github.event.pull_request.head.sha'; then
       echo "FAIL: the merge-clearance-gate job must bind its check_run to"
       echo "      github.event.pull_request.head.sha (#843)."

@@ -1660,10 +1660,16 @@ mcg22_case J 's{^(\s*)checks: write}{$1checks: read # checks: write}m' fail 'che
 #     first version of this assertion forbade. Phase 2's unchanged line kept
 #     satisfying the positive grep, so the mutation slipped through (Codex P2).
 mcg22_case K 's{HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}}{HEAD_SHA: \$\{\{ github.sha \}\}}' fail 'must NOT bind to github.sha'
+# L and M are the two halves of the same assertion, and they fail in OPPOSITE
+# directions — which is why the producer check has to be a conjunction, per
+# scope, rather than a count of either half.
 # L — delete a producer's POST but keep its CHECK_NAME env. A name-count
-#     assertion still sees three and passes, while the no-event transitions the
-#     sweep exists for stop refreshing the context (Codex P2).
-mcg22_case L 's{(.*)gh api -X POST "repos/\$REPO/check-runs" -f name="\$CHECK_NAME"}{$1true}s' fail 'jobs POSTing the required check_run'
+#     assertion still sees three and passes (Codex P2 on #849).
+mcg22_case L 's{(.*)gh api -X POST "repos/\$REPO/check-runs" -f name="\$CHECK_NAME"}{$1true}s' fail 'must POST a check_run under CHECK_NAME'
+# M — keep a POST but publish a DIFFERENT check name. A POST-count assertion
+#     still sees three and passes, while that trigger path has stopped
+#     refreshing this required context (CodeRabbit Major on #849).
+mcg22_case M 's{(.*)-f name="\$CHECK_NAME"}{$1-f name="Some Other Check"}s' fail 'must POST a check_run under CHECK_NAME'
 # I — positive control.
 mcg22_case I '' pass
 
