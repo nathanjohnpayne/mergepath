@@ -1124,7 +1124,61 @@ jobs:
     steps:
       - env:
           PR: ${{ github.event.client_payload.pr }}
-        run: echo "recheck $PR"
+          CHECK_NAME: "Merge clearance gate"
+        run: gh api -X POST "repos/$REPO/check-runs" -f name="$CHECK_NAME"
+  # Sweep job — present so the >=3-producer CHECK_NAME assertion (#845) is
+  # satisfied by a shape-valid header. Deliberately a DIFFERENT job from the
+  # event one, which is what Case D below exploits to prove block scoping.
+  scheduled-sweep:
+    name: Merge clearance scheduled sweep
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      CHECK_NAME: "Merge clearance gate"
+    steps:
+      - run: gh api -X POST "repos/$REPO/check-runs" -f name="$CHECK_NAME"
+WF
+}
+
+# A minimal COMPLIANT event-driven job: everything the #845 publish
+# assertions require and nothing else. Positive controls append this so they
+# test what they claim to test — before #845 they appended a trivial job that
+# the new assertions correctly reject, which made them assert "the check
+# fails" while their message said the opposite.
+write_wf_gate_job() {
+  cat <<'WF'
+  merge-clearance-gate:
+    name: Merge clearance gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    env:
+      CHECK_NAME: "Merge clearance gate"
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Open the required check_run
+        id: open
+        run: |
+          id=$(gh api -X POST "repos/$REPO/check-runs" \
+                 -f name="$CHECK_NAME" \
+                 -f head_sha="$HEAD_SHA" \
+                 -f status="in_progress" --jq .id)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+      - name: Run gate
+        id: gate
+        run: |
+          case "$output" in
+            *"Merge clearance: PASS"*) verdict=pass ;;
+          esac
+      - name: Close the required check_run
+        if: ${{ !cancelled() && steps.open.outputs.id != '' }}
+        run: |
+          case "$RC" in
+            0) conclusion="success" ;;
+            *) conclusion="failure" ;;
+          esac
+          gh api -X PATCH "repos/$REPO/check-runs/$CHECK_ID" -f conclusion="$conclusion"
 WF
 }
 
@@ -1293,14 +1347,7 @@ fi
 WF_RD_OK="$WORKDIR/wf-rd-ok.yml"
 {
   write_wf_header
-  cat <<'WF'
-  merge-clearance-gate:
-    name: Merge clearance gate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Run gate
-        run: echo ok
-WF
+  write_wf_gate_job
 } > "$WF_RD_OK"
 set +e
 OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$WF_RD_OK" "$CHECK_BIN" 2>&1)
@@ -1522,6 +1569,90 @@ STUB
 else
   echo "SKIP: Test 23 (#841) — merge-clearance-gate.yml absent"
 fi
+
+
+# ---------------------------------------------------------------------------
+# Test 22 (#845): the two-phase Checks-API publish assertions must actually
+# reject a workflow that lost the property they name.
+#
+# Each case appends a deliberately-broken variant of write_wf_gate_job to a
+# shape-valid header and asserts the check FAILS. Case I is the positive
+# control. Two of these are worth more than the rest:
+#
+#   B proves COMMENT STRIPPING. #843 documents this design in prose right next
+#     to the code, so an unstripped grep matches the explanation after the
+#     implementation is gone.
+#   D proves BLOCK SCOPING. The header's sweep job POSTs under the same
+#     CHECK_NAME, so a whole-file grep passes even with the event job's
+#     publish deleted — which is exactly the pre-#843 workflow.
+#
+# Without B and D the other assertions are decorative: they would pass on the
+# very shape they exist to reject.
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 22 (#845): two-phase publish assertions reject each broken shape"
+
+mcg22_run() {  # <fixture-path> -> echoes rc
+  local out rc
+  set +e
+  out=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$1" "$CHECK_BIN" 2>&1)
+  rc=$?
+  set -e
+  printf '%s' "$out" > "$1.out"
+  echo "$rc"
+}
+
+# The expected-message argument is what makes these cases mean anything. A
+# broken fixture can fail the check for an unrelated reason — a mangled
+# substitution, a tripped older assertion — and a bare rc!=0 assertion would
+# call that a pass while proving nothing about the property under test.
+mcg22_case() {  # <name> <perl-program-or-empty> <expect: fail|pass> [expected-FAIL-substring]
+  local name="$1" prog="$2" expect="$3" want="${4:-}" f rc
+  f="$WORKDIR/wf-22-$name.yml"
+  { write_wf_header; write_wf_gate_job; } > "$f.raw"
+  if [ -n "$prog" ]; then perl -0777 -pe "$prog" "$f.raw" > "$f"; else cp "$f.raw" "$f"; fi
+  # A no-op substitution means the case is testing nothing.
+  if [ -n "$prog" ] && cmp -s "$f.raw" "$f"; then
+    fail "#845 case $name: the mutation changed nothing — anchor drifted"
+    return
+  fi
+  rc=$(mcg22_run "$f")
+  if [ "$expect" = pass ]; then
+    if [ "$rc" -eq 0 ]; then
+      pass "#845 case $name: positive control — a compliant job is accepted"
+    else
+      fail "#845 case $name: expected pass, got rc=$rc"
+      sed 's/^/      /' "$f.out" | head -4 >&2
+    fi
+    return
+  fi
+  if [ "$rc" -eq 0 ]; then
+    fail "#845 case $name: expected the check to reject this shape, got rc=0"
+  elif [ -n "$want" ] && ! grep -qF -- "$want" "$f.out"; then
+    fail "#845 case $name: rejected, but not for its own reason (wanted: $want)"
+    grep '^FAIL' "$f.out" | sed 's/^/      /' | head -3 >&2
+  else
+    pass "#845 case $name: the check rejects it, naming the right cause"
+  fi
+}
+
+# A — no POST at all.
+mcg22_case A 's{gh api -X POST "repos/\$REPO/check-runs" \\}{true \\}' fail "must open the required check_run"
+# B — the POST survives only as a full-line comment.
+mcg22_case B 's{^(\s*)id=\$\(gh api -X POST}{$1# id=\$(gh api -X POST}m' fail "must open the required check_run"
+# C — no job-scoped checks: write.
+mcg22_case C 's{^\s*checks: write\n}{}m' fail "checks: write"
+# D — the event job loses its publish; the header sweep still POSTs.
+mcg22_case D 's{  merge-clearance-gate:}{  merge-clearance-renamed:}' fail 'the #845'
+# E — bound to the merge commit instead of the PR head.
+mcg22_case E 's{HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}}{HEAD_SHA: head_sha="\$\{\{ github.sha \}\}"}' fail "must NOT bind to github.sha"
+# F — opens the run but never closes it.
+mcg22_case F 's{gh api -X PATCH "repos/\$REPO/check-runs/\$CHECK_ID"}{true}' fail "must close the check_run it opened"
+# G — no verdict sentinel, so a query-mode rc 0 could publish green.
+mcg22_case G 's{\*"Merge clearance: PASS"\*\)}{*"nope"*)}' fail "verdict sentinel"
+# H — always() instead of !cancelled(): publishes on a cancelled run.
+mcg22_case H 's{if: \$\{\{ !cancelled\(\) && steps.open.outputs.id != .. \}\}}{if: always()}' fail "guarded by !cancelled()"
+# I — positive control.
+mcg22_case I '' pass
 
 fi  # end re-entrancy guard (MCG_SKIP_FIX3_SELFTEST)
 

@@ -323,8 +323,12 @@ fetch_api_array() {  # <endpoint> <label>
 # The required-status-check CONTEXT this gate reports. Branch protection and
 # rulesets both key on the workflow JOB name, and
 # .github/workflows/merge-clearance-gate.yml names that job `Merge clearance
-# gate` (its scheduled-sweep and dispatch-recheck jobs POST check_runs under the
-# same CHECK_NAME so every source resolves as one context).
+# gate`. Every trigger path POSTs a check_run under that same CHECK_NAME — the
+# scheduled sweep, the #658 dispatch-recheck job, and since #843 the
+# event-driven job too. That last one is not redundancy: supersession is
+# reliable only WITHIN the Checks-API slot, so a job-native completion can
+# never retire a Checks-API entry, and an event path that reported only
+# natively left stale entries blocking cleared PRs (#841).
 # scripts/ci/check_merge_clearance_gate asserts that job name verbatim and
 # scripts/audit-branch-protection.sh carries the same string in
 # CANONICAL_REQUIRED_CHECKS, so this constant cannot drift from the workflow
