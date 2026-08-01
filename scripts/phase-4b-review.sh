@@ -412,7 +412,20 @@ fi
 # (a deviation from #814's change detail, recorded there): a PR with no
 # adapter can never get a Phase 4b review, so probing providers and possibly
 # triggering CodeRabbit for it would be wasted work and wasted allowance.
-run_same_head_barrier "pre-adapter"
+#
+# Skipped entirely on --dry-run (Codex P2 on #842). The barrier guards the
+# review POST, and a dry-run never posts, so there is no ordering hazard for
+# it to prevent — running it would be ceremony. It is not free ceremony
+# either: both provider helpers are gh-backed, so it breaks the offline
+# dry-run recipe in scripts/phase-4b/README.md ("Try it (dry-run, offline,
+# with fake CLIs)"), which exists precisely to validate adapter dispatch and
+# verdict parsing with no network and no credentials. That workflow is also
+# how tests/test_phase_4b_automation.sh exercises the package.
+if [ "$DRY_RUN" = true ]; then
+  p4b_warn "dry-run: skipping the same-head barrier — it guards the review POST, and a dry-run posts nothing (offline dry-runs stay offline)"
+else
+  run_same_head_barrier "pre-adapter"
+fi
 
 # --- run the adapter (reasoning plane; never posts) ------------------------
 ADAPTER_ARGS=( --pr "$PR" )

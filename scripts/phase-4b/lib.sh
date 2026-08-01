@@ -516,9 +516,22 @@ p4b_same_head_barrier() {
     CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
       "$cx_bin" --diagnostic-signal-only "$pr" "$repo" >/dev/null 2>&1 || rc=$?
     cls_cx="$(p4b_barrier_class_codex "$rc")"
+    # Waiving an account-blocked Codex only helps where a Phase 4b APPROVED can
+    # actually clear gate (c). With codex.allow_phase_4b_substitute: false the
+    # merge gate rejects that review by design, so opening the barrier would
+    # let the automated leg post an approval, report success, and leave the PR
+    # still unmergeable with needs-external-review uncleared — a green run that
+    # accomplished nothing (Codex P2 on #842). In that configuration a block is
+    # exactly what it looks like: something a human has to fix.
+    if [ "$cls_cx" = waived ] \
+       && [ "$(p4b_policy_block_field codex allow_phase_4b_substitute)" = "false" ]; then
+      cls_cx="escalate"
+      why="Codex is account-blocked and codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c) — a human must resolve the block"
+    fi
     case "$cls_cx" in
       reported|will-not-report|waived) ;;
       not-yet)  pending=true ;;
+      escalate) [ -n "$why" ] || why="codex signal check exited $rc" ;;
       *)        why="codex signal check exited $rc" ;;
     esac
   fi

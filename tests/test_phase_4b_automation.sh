@@ -2618,6 +2618,21 @@ bad=""
 out="$(_barrier 2 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
 [ "$rc" = 0 ] || bad="$bad blocked-codex-held"
 printf '%s' "$out" | jq -e '.codex == "waived"' >/dev/null 2>&1 || bad="$bad blocked-codex-class"
+# ...but only where a Phase 4b APPROVED can actually clear gate (c). With the
+# substitute disabled, waiving would let the leg post a review the merge gate
+# rejects by design — a green run leaving the PR unmergeable (Codex P2 on #842).
+cat >"$WORK/policy-nosub.yml" <<'EOF'
+coderabbit:
+  enabled: true
+  max_wait_seconds: 100
+codex:
+  enabled: true
+  allow_phase_4b_substitute: false
+EOF
+out="$(_barrier 2 0 '{"head_sha":"abc123"}' "$WORK/policy-nosub.yml")" && rc=0 || rc=$?
+[ "$rc" = 2 ] || bad="$bad nosub-not-escalated"
+printf '%s' "$out" | jq -e '.reason | test("allow_phase_4b_substitute")' >/dev/null 2>&1 \
+  || bad="$bad nosub-reason"
 if [ -z "$bad" ]; then
   pass "#842: an account-blocked Codex waives rather than holding, so the Phase 4b fallback can still run"
 else
@@ -2699,14 +2714,22 @@ fi
 # Codex reports not-yet here; the CodeRabbit stub installed at the top of this
 # file still reports on abc123.
 printf '#!/bin/sh\nexit 1\n' >"$WORK/stub-cx-notyet.sh"
-chmod +x "$WORK/stub-cx-notyet.sh"
+printf '#!/bin/sh\necho "REGRESSION: reviewer wrapper invoked from the hold path" >&2\nexit 9\n' \
+  >"$WORK/stub-rev-guard.sh"
+chmod +x "$WORK/stub-cx-notyet.sh" "$WORK/stub-rev-guard.sh"
 HANDOFF_LOG="$WORK/handoff-barrier.log"
 : >"$HANDOFF_LOG"
+# NOT --dry-run: the barrier is deliberately skipped on dry runs (it guards the
+# POST, and a dry run posts nothing), so a dry run cannot exercise the hold at
+# all. The hold happens before the adapter and before anything is posted, so a
+# real run is safe here; the reviewer wrapper is stubbed to fail loudly if the
+# hold path ever reaches a write.
 set +e
 out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
   P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" \
+  P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
   P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" \
-  bash "$ORCH" 814 --repo o/r --author claude --head abc123 --diff-file "$DIFF" --dry-run 2>/dev/null)"; rc=$?
+  bash "$ORCH" 814 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
 set -e
 if [ "$rc" = 6 ] \
    && [ "$(printf '%s' "$out" | jq -r '.barrier_pending')" = "true" ] \
@@ -2732,10 +2755,12 @@ fi
 # loop record no matter where the barrier is actually invoked — an ordering
 # assertion anchored there passes even after someone moves the call after
 # p4b_acct_hook_record_loop, which is precisely the regression this guards.
+# Matched on the trailing quote, not a line anchor: the call is indented inside
+# the dry-run guard, and `run_same_head_barrier(` is the definition.
 n_eval="$(grep -c 'p4b_same_head_barrier ' "$ORCH" || true)"
-n_call="$(grep -c '^run_same_head_barrier ' "$ORCH" || true)"
+n_call="$(grep -c 'run_same_head_barrier "' "$ORCH" || true)"
 if [ "$n_eval" = "1" ] && [ "$n_call" = "1" ] \
-   && [ "$(grep -n '^run_same_head_barrier ' "$ORCH" | cut -d: -f1)" -lt "$(grep -n 'p4b_acct_hook_record_loop ' "$ORCH" | head -1 | cut -d: -f1)" ]; then
+   && [ "$(grep -n 'run_same_head_barrier "' "$ORCH" | cut -d: -f1)" -lt "$(grep -n 'p4b_acct_hook_record_loop ' "$ORCH" | head -1 | cut -d: -f1)" ]; then
   pass "#814: the barrier is called exactly once, before any loop is recorded — a hold cannot leave a phantom posted approval"
 else
   fail "#814: barrier defined $n_eval time(s), called $n_call time(s), or the call is not before the loop record"
