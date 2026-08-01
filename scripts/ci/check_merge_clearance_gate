@@ -344,8 +344,13 @@ if [ -f "$WORKFLOW" ]; then
       # must not be a workflow-level expression. Matching the exact variable
       # name would be wrong here: the three jobs legitimately differ, and the
       # property is "a per-PR head", not "this spelling".
-      if ! grep -qE -- '-f head_sha="\$[A-Za-z_]' <<<"$mcg_pblock" \
-         || mcg_has "$mcg_pblock" '-f head_sha="${{'; then
+      # An allowlist of the two legitimate spellings, not "any shell variable"
+      # (Codex P2 on #849). Widening it to accept either name also accepted
+      # -f head_sha="$REPO", which posts the repository slug as a commit SHA.
+      # The three jobs genuinely differ — $HEAD_SHA in the event job, the
+      # per-PR $head_sha the sweep and dispatch resolve — so the allowlist has
+      # exactly two members rather than a pattern.
+      if ! grep -qE -- '-f head_sha="\$(HEAD_SHA|head_sha)"' <<<"$mcg_pblock"; then
         echo "FAIL: the '$mcg_producer' job must POST head_sha as the per-PR head it"
         echo "      resolved (a shell variable), not a workflow expression. The Checks"
         echo "      API rejects a create-check-run without head_sha at all, and a"
@@ -369,6 +374,22 @@ if [ -f "$WORKFLOW" ]; then
         echo "      (rc=\$?) and derive its conclusion from it. Calling the gate and"
         echo "      then publishing a constant is worse than not calling it, because"
         echo "      the verdict looks evaluated."
+        FAILED=1
+      fi
+      # Capturing rc is not the same as mapping it correctly (Codex P2 on
+      # #849). Swapping the arms — 0) failure, 1) success — kept the capture
+      # and inverted the verdict, so a blocked gate publishes success and
+      # supersedes the honest one. Pin both arms.
+      # Auxiliary producers only. The event job maps through the sentinel-
+      # guarded form (rc 0 AND verdict=pass), which is asserted separately
+      # above; requiring the one-line case arms there would reject the real
+      # workflow for having the STRONGER mapping.
+      if [ "$mcg_producer" != merge-clearance-gate ] \
+         && { ! grep -qE '^[[:space:]]*0\)[[:space:]]*conclusion="success"' <<<"$mcg_pblock" \
+              || ! grep -qE '^[[:space:]]*1\)[[:space:]]*conclusion="failure"' <<<"$mcg_pblock"; }; then
+        echo "FAIL: the '$mcg_producer' job must map gate rc 0 to conclusion=success"
+        echo "      and rc 1 to conclusion=failure. An inverted or missing mapping lets"
+        echo "      a blocked PR publish a green required check over the honest verdict."
         FAILED=1
       fi
     done

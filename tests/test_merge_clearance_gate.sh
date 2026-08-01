@@ -1131,8 +1131,14 @@ jobs:
         run: |
           scripts/merge-clearance-gate.sh "$PR" "$REPO"
           rc=$?
+          case "$rc" in
+            0) conclusion="success" ;;
+            1) conclusion="failure" ;;
+            *) conclusion="failure" ;;
+          esac
           gh api -X POST "repos/$REPO/check-runs" \
-            -f name="$CHECK_NAME" -f head_sha="$head_sha"
+            -f name="$CHECK_NAME" -f head_sha="$head_sha" \
+            -f conclusion="$conclusion"
   # Sweep job — present so the >=3-producer CHECK_NAME assertion (#845) is
   # satisfied by a shape-valid header. Deliberately a DIFFERENT job from the
   # event one, which is what Case D below exploits to prove block scoping.
@@ -1149,8 +1155,14 @@ jobs:
       - run: |
           scripts/merge-clearance-gate.sh "$PR" "$REPO"
           rc=$?
+          case "$rc" in
+            0) conclusion="success" ;;
+            1) conclusion="failure" ;;
+            *) conclusion="failure" ;;
+          esac
           gh api -X POST "repos/$REPO/check-runs" \
-            -f name="$CHECK_NAME" -f head_sha="$head_sha"
+            -f name="$CHECK_NAME" -f head_sha="$head_sha" \
+            -f conclusion="$conclusion"
 WF
 }
 
