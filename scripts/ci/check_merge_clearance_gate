@@ -380,6 +380,37 @@ if [ -f "$WORKFLOW" ]; then
       # #849). Swapping the arms — 0) failure, 1) success — kept the capture
       # and inverted the verdict, so a blocked gate publishes success and
       # supersedes the honest one. Pin both arms.
+      # The POST must publish the MAPPED value (Codex P2 on #849). Pinning the
+      # case arms proves the mapping exists; it says nothing about what the
+      # POST actually sends, and -f conclusion="success" satisfied both.
+      if ! mcg_has "$mcg_pblock" '-f conclusion="$conclusion"'; then
+        echo "FAIL: the '$mcg_producer' job must POST -f conclusion=\"\$conclusion\" —"
+        echo "      the value it mapped from the gate. A literal publishes a verdict"
+        echo "      the mapping never produced."
+        FAILED=1
+      fi
+      # And its CHECK_NAME must be the required context (Codex P2 on #849).
+      # Verifying the POST passes $CHECK_NAME says nothing about what
+      # CHECK_NAME is bound to in that job.
+      if ! grep -qE '^[[:space:]]*CHECK_NAME:[[:space:]]*"Merge clearance gate"[[:space:]]*$' \
+           <<<"$mcg_pblock"; then
+        echo "FAIL: the '$mcg_producer' job must bind CHECK_NAME to the exact required"
+        echo "      context \"Merge clearance gate\"; another value publishes to a"
+        echo "      different slot and this trigger path stops refreshing it."
+        FAILED=1
+      fi
+      # And it must evaluate the PR it is iterating, not a constant (Codex P2
+      # on #849). `merge-clearance-gate.sh 1 "$REPO"` satisfies a script-name
+      # check while every PR receives PR 1's verdict.
+      # A variable first argument, not a specific name: the event job resolves
+      # $PR_NUMBER while the sweep iterates $PR, and the property is "the PR
+      # being published for", not a spelling. A literal is what this rejects.
+      if ! grep -qE 'merge-clearance-gate\.sh "\$[A-Za-z_]' <<<"$mcg_pblock"; then
+        echo "FAIL: the '$mcg_producer' job must evaluate the PR it is publishing for,"
+        echo "      passing that PR as a variable. A constant argument publishes one"
+        echo "      PR's verdict onto every other PR's head."
+        FAILED=1
+      fi
       # Auxiliary producers only. The event job maps through the sentinel-
       # guarded form (rc 0 AND verdict=pass), which is asserted separately
       # above; requiring the one-line case arms there would reject the real
@@ -461,6 +492,22 @@ if [ -f "$WORKFLOW" ]; then
       echo "FAIL: the merge-clearance-gate job must not use if: always() for the phase-2"
       echo "      publish — on cancellation it would publish a conclusion from an"
       echo "      evaluation that did not finish. Use !cancelled() (#843)."
+      FAILED=1
+    fi
+    # Phase 2 must consume the GATE STEP's outputs (Codex P2 on #849).
+    # Asserting `case "$RC" in` proves a mapping exists over whatever RC holds;
+    # rebinding the step env to RC: 0 / VERDICT: pass satisfies it while the
+    # conclusion stops depending on the evaluation entirely.
+    # Scoped to the phase-2 STEP, not the job. The event job binds RC and
+    # VERDICT twice — once here and once in "Report gate verdict" — so a
+    # job-scoped assertion is satisfied by the other one while this step's
+    # binding is replaced by a constant. Same per-step lesson as HEAD_SHA.
+    mcg_p2="$(mcg_step "$mcg_evt" 'Close the required check_run')"
+    if ! mcg_has "$mcg_p2" 'RC: ${{ steps.gate.outputs.rc }}' \
+       || ! mcg_has "$mcg_p2" 'VERDICT: ${{ steps.gate.outputs.verdict }}'; then
+      echo "FAIL: the phase-2 step must take RC and VERDICT from steps.gate.outputs."
+      echo "      Any other binding decouples the published conclusion from the gate"
+      echo "      evaluation while leaving the mapping visibly intact (#843)."
       FAILED=1
     fi
     if ! mcg_has "$mcg_evt" 'case "$RC" in'; then

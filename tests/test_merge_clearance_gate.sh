@@ -1114,103 +1114,29 @@ on:
 permissions:
   contents: read
 jobs:
-  # #658 dispatch-recheck job — present so this shape-valid header satisfies
-  # the check's repository_dispatch + dispatch-wiring assertions; each Case
-  # appends the job under test after it.
-  dispatch-recheck:
-    name: Merge clearance dispatch re-evaluation
-    if: github.event_name == 'repository_dispatch'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write
-    steps:
-      - env:
-          PR: ${{ github.event.client_payload.pr }}
-          CHECK_NAME: "Merge clearance gate"
-        run: |
-          scripts/merge-clearance-gate.sh "$PR" "$REPO"
-          rc=$?
-          case "$rc" in
-            0) conclusion="success" ;;
-            1) conclusion="failure" ;;
-            *) conclusion="failure" ;;
-          esac
-          gh api -X POST "repos/$REPO/check-runs" \
-            -f name="$CHECK_NAME" -f head_sha="$head_sha" \
-            -f conclusion="$conclusion"
-  # Sweep job — present so the >=3-producer CHECK_NAME assertion (#845) is
-  # satisfied by a shape-valid header. Deliberately a DIFFERENT job from the
-  # event one, which is what Case D below exploits to prove block scoping.
-  scheduled-sweep:
-    name: Merge clearance scheduled sweep
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write
-    env:
-      CHECK_NAME: "Merge clearance gate"
-    steps:
-      - run: |
-          scripts/merge-clearance-gate.sh "$PR" "$REPO"
-          rc=$?
-          case "$rc" in
-            0) conclusion="success" ;;
-            1) conclusion="failure" ;;
-            *) conclusion="failure" ;;
-          esac
-          gh api -X POST "repos/$REPO/check-runs" \
-            -f name="$CHECK_NAME" -f head_sha="$head_sha" \
-            -f conclusion="$conclusion"
 WF
+  # The auxiliary producers come from the REAL workflow, not from a
+  # hand-written stand-in (#849). Hand-maintained positive controls drifted
+  # behind the check on five consecutive review rounds — each new assertion
+  # left them non-compliant — and a control weaker than its subject accepts
+  # workflows the real check rejects, which is a false pass in the direction
+  # that hides regressions. Extracting them means the control cannot lag.
+  mcg_real_job scheduled-sweep
+  mcg_real_job dispatch-recheck
 }
 
-# A minimal COMPLIANT event-driven job: everything the #845 publish
-# assertions require and nothing else. Positive controls append this so they
-# test what they claim to test — before #845 they appended a trivial job that
-# the new assertions correctly reject, which made them assert "the check
-# fails" while their message said the opposite.
+# Print one job block verbatim from the canonical workflow.
+mcg_real_job() {  # <job-key>
+  awk -v key="$1" '
+    $0 ~ "^  " key ":[[:space:]]*$" { inblk = 1; print; next }
+    inblk && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit }
+    inblk { print }
+  ' "$ROOT/.github/workflows/merge-clearance-gate.yml"
+}
+
+# The compliant event job, likewise taken from the canonical workflow.
 write_wf_gate_job() {
-  cat <<'WF'
-  merge-clearance-gate:
-    name: Merge clearance gate
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write
-    env:
-      CHECK_NAME: "Merge clearance gate"
-    steps:
-      - name: Open the required check_run
-        id: open
-        env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          id=$(gh api -X POST "repos/$REPO/check-runs" \
-                 -f name="$CHECK_NAME" \
-                 -f head_sha="$HEAD_SHA" \
-                 -f status="in_progress" --jq .id)
-          echo "id=$id" >> "$GITHUB_OUTPUT"
-      - name: Run gate
-        id: gate
-        run: |
-          output=$(scripts/merge-clearance-gate.sh "$PR_NUMBER" "$REPO")
-          rc=$?
-          case "$output" in
-            *"Merge clearance: PASS"*) verdict=pass ;;
-          esac
-      - name: Close the required check_run
-        if: ${{ !cancelled() && steps.open.outputs.id != '' }}
-        env:
-          CHECK_ID: ${{ steps.open.outputs.id }}
-        run: |
-          case "$RC" in
-            0) conclusion="success" ;;
-            *) conclusion="failure" ;;
-          esac
-          gh api -X PATCH "repos/$REPO/check-runs/$CHECK_ID" -f conclusion="$conclusion"
-WF
+  mcg_real_job merge-clearance-gate
 }
 
 # Case A (negative): the required name appears ONLY as a non-first step key
