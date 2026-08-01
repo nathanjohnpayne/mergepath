@@ -198,11 +198,20 @@ if [ -f "$WORKFLOW" ]; then
   mcg_strip() {  # <block>
     printf '%s\n' "$1" | grep -v '^[[:space:]]*#' | sed 's/[[:space:]]#.*$//'
   }
-  mcg_has() {  # <block> <fixed-string>
-    mcg_strip "$1" | grep -qF -- "$2"
+  # A here-string, NOT a pipe into grep (Codex P2 on #849). This script runs
+  # under `set -o pipefail`, and `grep -qF` exits the instant it matches — so
+  # with a block near the pipe-buffer size the writer can take SIGPIPE and the
+  # pipeline reports failure for a string that IS present. The event job block
+  # is already 14 KB against a 16 KB buffer on macOS, which makes this a
+  # scheduling-dependent false FAIL on the unmodified workflow: a CI check that
+  # flaps red is worse than one that is merely incomplete. Callers pass an
+  # ALREADY-stripped block so the strip runs once rather than per assertion.
+  mcg_has() {  # <stripped-block> <fixed-string>
+    grep -qF -- "$2" <<<"$1"
   }
 
   mcg_evt_block="$(mcg_job_block "$WORKFLOW" merge-clearance-gate)"
+  mcg_evt="$(mcg_strip "$mcg_evt_block")"
 
   if [ -z "$mcg_evt_block" ]; then
     # Guards every assertion below against silently passing on an empty block.
@@ -211,27 +220,27 @@ if [ -f "$WORKFLOW" ]; then
     echo "      whole-file grep that the pre-#843 workflow satisfies."
     FAILED=1
   else
-    if ! mcg_has "$mcg_evt_block" 'checks: write'; then
+    if ! mcg_has "$mcg_evt" 'checks: write'; then
       echo "FAIL: the merge-clearance-gate job must grant job-scoped 'checks: write' (#843)."
       echo "      Without it the phase-1 POST 403s on every same-repo PR and the event"
       echo "      path stops publishing into the Checks-API slot entirely."
       FAILED=1
     fi
-    if ! mcg_has "$mcg_evt_block" '-f status="in_progress"' \
-       || ! mcg_has "$mcg_evt_block" 'gh api -X POST "repos/$REPO/check-runs"'; then
+    if ! mcg_has "$mcg_evt" '-f status="in_progress"' \
+       || ! mcg_has "$mcg_evt" 'gh api -X POST "repos/$REPO/check-runs"'; then
       echo "FAIL: the merge-clearance-gate job must open the required check_run with"
       echo "      status=in_progress BEFORE evaluating (#843 phase 1). That pending entry"
       echo "      is what makes every later failure — checkout, gate crash, runner death,"
       echo "      a failed PATCH — fail CLOSED instead of leaving a stale verdict standing."
       FAILED=1
     fi
-    if ! mcg_has "$mcg_evt_block" 'gh api -X PATCH "repos/$REPO/check-runs/'; then
+    if ! mcg_has "$mcg_evt" 'gh api -X PATCH "repos/$REPO/check-runs/'; then
       echo "FAIL: the merge-clearance-gate job must close the check_run it opened (#843"
       echo "      phase 2). Without the PATCH the required context stays PENDING forever."
       FAILED=1
     fi
-    if ! mcg_has "$mcg_evt_block" 'CHECK_NAME: "Merge clearance gate"' \
-       || ! mcg_has "$mcg_evt_block" '-f name="$CHECK_NAME"'; then
+    if ! mcg_has "$mcg_evt" 'CHECK_NAME: "Merge clearance gate"' \
+       || ! mcg_has "$mcg_evt" '-f name="$CHECK_NAME"'; then
       echo "FAIL: the merge-clearance-gate job must publish under CHECK_NAME"
       echo "      \"Merge clearance gate\" — the required-check context string."
       FAILED=1
@@ -254,8 +263,9 @@ if [ -f "$WORKFLOW" ]; then
     # to the PR head as it moves. Lose any one and a stale verdict persists on
     # some path.
     for mcg_producer in merge-clearance-gate scheduled-sweep dispatch-recheck; do
-      mcg_pblock="$(mcg_job_block "$WORKFLOW" "$mcg_producer")"
-      if [ -z "$mcg_pblock" ]; then
+      mcg_pblock_raw="$(mcg_job_block "$WORKFLOW" "$mcg_producer")"
+      mcg_pblock="$(mcg_strip "$mcg_pblock_raw")"
+      if [ -z "$mcg_pblock_raw" ]; then
         echo "FAIL: $WORKFLOW is missing the '$mcg_producer' job — all three trigger"
         echo "      paths (event, scheduled sweep, dispatch-recheck) must publish the"
         echo "      required check_run (#843)."
@@ -270,46 +280,69 @@ if [ -f "$WORKFLOW" ]; then
         echo "      context — and a stale verdict then persists on it (#843)."
         FAILED=1
       fi
+      # Every producer needs the scope, not just the event job (Codex P2 on
+      # #849). A sweep or dispatch job whose job-level permission drops to
+      # checks: read still passes every string assertion while GitHub 403s the
+      # POST — so that trigger path silently stops refreshing the context.
+      if ! mcg_has "$mcg_pblock" 'checks: write'; then
+        echo "FAIL: the '$mcg_producer' job must grant job-scoped 'checks: write';"
+        echo "      without it its POST 403s and that trigger path stops publishing."
+        FAILED=1
+      fi
     done
-    if ! mcg_has "$mcg_evt_block" 'github.event.pull_request.head.sha'; then
+    if ! mcg_has "$mcg_evt" 'github.event.pull_request.head.sha'; then
       echo "FAIL: the merge-clearance-gate job must bind its check_run to"
       echo "      github.event.pull_request.head.sha (#843)."
       FAILED=1
     fi
-    # Forbid github.sha ANYWHERE in the block, not just one literal spelling
-    # (Codex P2 on #849). The earlier version rejected only
-    # head_sha="${{ github.sha }}", so rebinding the env to
-    # `HEAD_SHA: ${{ github.sha }}` slipped through while phase 2's unchanged
-    # line still satisfied the positive grep. The real workflow mentions
-    # github.sha only inside a comment explaining why not to use it, and
-    # comments are stripped before this runs.
-    if mcg_has "$mcg_evt_block" 'github.sha'; then
+    # EVERY HEAD_SHA assignment must bind to the PR head — an allowlist, not a
+    # denylist. This assertion is on its third shape and the first two failed
+    # the same way: rejecting `head_sha="${{ github.sha }}"` missed
+    # `HEAD_SHA: ${{ github.sha }}` (Codex), and rejecting `github.sha` missed
+    # `github.event.pull_request.base.sha` (Codex again). Both slipped through
+    # because phase 2's unchanged line kept satisfying the positive search.
+    # Enumerating wrong spellings cannot terminate; requiring every binding to
+    # be the right one does.
+    # Anchored to a YAML key at line start: an unanchored 'HEAD_SHA:' also
+    # matches the shell parameter expansion ${HEAD_SHA:0:7} inside a message
+    # string, which is not a binding and made this reject the real workflow.
+    mcg_bad_headsha="$(grep -E '^[[:space:]]*HEAD_SHA:' <<<"$mcg_evt" \
+      | grep -vF 'github.event.pull_request.head.sha' || true)"
+    if [ -n "$mcg_bad_headsha" ]; then
+      echo "FAIL: every HEAD_SHA assignment in the merge-clearance-gate job must bind"
+      echo "      to github.event.pull_request.head.sha. Offending line(s):"
+      printf '%s\n' "$mcg_bad_headsha" | sed 's/^/        /'
+      echo "      A check_run bound to the merge commit (github.sha) or the base"
+      echo "      (base.sha) is absent from the commit branch protection evaluates."
+      FAILED=1
+    fi
+    if mcg_has "$mcg_evt" 'github.sha'; then
       echo "FAIL: the merge-clearance-gate job must NOT bind to github.sha. On a"
       echo "      pull_request event that is the refs/pull/N/merge commit, which branch"
       echo "      protection never consults — the required context would be ABSENT on"
       echo "      every head: a permanent block, fleet-wide, with no partial degradation."
       FAILED=1
     fi
-    if ! mcg_has "$mcg_evt_block" 'Merge clearance: PASS'; then
+    if ! mcg_has "$mcg_evt" 'Merge clearance: PASS'; then
       echo "FAIL: the merge-clearance-gate job must require the 'Merge clearance: PASS'"
       echo "      verdict sentinel before publishing success (#843). Without it a call"
       echo "      site that lands in a query mode publishes an unearned green: those"
       echo "      modes also exit 0 but print only true/false."
       FAILED=1
     fi
-    if ! mcg_has "$mcg_evt_block" '!cancelled()'; then
+    if ! mcg_has "$mcg_evt" '!cancelled()'; then
       echo "FAIL: the merge-clearance-gate phase-2 step must be guarded by !cancelled()"
       echo "      (#843) so a cancelled run leaves the required context PENDING (blocking)"
       echo "      rather than publishing a verdict it never computed."
       FAILED=1
     fi
-    if mcg_has "$mcg_evt_block" 'if: always()'; then
+    if mcg_has "$mcg_evt" 'if: always()'; then
       echo "FAIL: the merge-clearance-gate job must not use if: always() for the phase-2"
       echo "      publish — on cancellation it would publish a conclusion from an"
       echo "      evaluation that did not finish. Use !cancelled() (#843)."
       FAILED=1
     fi
-    if ! mcg_has "$mcg_evt_block" 'case "$RC" in'; then
+    if ! mcg_has "$mcg_evt" 'case "$RC" in'; then
       echo "FAIL: the merge-clearance-gate job must map the gate exit code to a"
       echo "      conclusion through an explicit case (#843), so rc 0-without-PASS and"
       echo "      rc 2 cannot collapse into success."
@@ -320,12 +353,13 @@ if [ -f "$WORKFLOW" ]; then
     # rather than a one-token edit. This does not make tampering impossible —
     # the workflow is PR-authored, which is #845's open restructure — it keeps
     # it loud.
-    mcg_success_assigns="$(printf '%s\n' "$mcg_evt_block" | grep -v '^[[:space:]]*#' \
-      | grep -cF 'conclusion="success"' || true)"
-    if [ "$mcg_success_assigns" -gt 1 ]; then
+    mcg_success_assigns="$(grep -cF 'conclusion="success"' <<<"$mcg_evt" || true)"
+    if [ "$mcg_success_assigns" -ne 1 ]; then
       echo "FAIL: the merge-clearance-gate job assigns conclusion=\"success\""
-      echo "      $mcg_success_assigns times; expected at most 1 (#845). More than one"
-      echo "      green path makes an added bypass indistinguishable from a refactor."
+      echo "      $mcg_success_assigns times; expected exactly 1 (#845). More than one"
+      echo "      green path makes an added bypass indistinguishable from a refactor;"
+      echo "      zero means a passing evaluation can never close the check as success,"
+      echo "      leaving it pending or red until a later sweep supersedes it."
       FAILED=1
     fi
   fi

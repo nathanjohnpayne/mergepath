@@ -1121,6 +1121,9 @@ jobs:
     name: Merge clearance dispatch re-evaluation
     if: github.event_name == 'repository_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
       - env:
           PR: ${{ github.event.client_payload.pr }}
@@ -1133,6 +1136,9 @@ jobs:
     name: Merge clearance scheduled sweep
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     env:
       CHECK_NAME: "Merge clearance gate"
     steps:
