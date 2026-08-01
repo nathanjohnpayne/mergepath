@@ -156,8 +156,8 @@ p4b_top_field() {
 p4b_barrier_class_coderabbit() {
   local head="$1" rc="$2" json="$3" probe_head
   case "$rc" in
-    0|2)
-      # Terminal, but only for the head about to be approved. An rc 0/2
+    0)
+      # Terminal, but only for the head about to be approved. An rc 0
       # anchored on an older head is a stale clearance, and the #794 ordering
       # failure begins exactly there.
       probe_head="$(printf '%s' "$json" | jq -r '.head_sha // empty' 2>/dev/null || true)"
@@ -167,6 +167,21 @@ p4b_barrier_class_coderabbit() {
         printf 'not-yet'
       fi
       ;;
+    2)
+      # NOT reported (Codex P1 on #842). In --probe mode rc 2 is the one
+      # verdict the probe makes, and it means something specific: CodeRabbit
+      # published a blocking `Potential issue`/⚠️ marker carried SOLELY by the
+      # PR-level summary. #823 emits it precisely because no required gate
+      # dispositions that class — coderabbit-severity-gate.sh reads only
+      # pulls/{pr}/comments, the conversation gate covers threads, and the
+      # Phase 4b adapter sees only the diff.
+      #
+      # So the barrier is the only thing that ever sees this signal. Folding it
+      # in with rc 0 opened the barrier, ran the adapter, and let an approval
+      # post over a finding nothing else would catch — and on the wave-audit
+      # path that approval advances the watermark and authorises fan-out.
+      # Escalate to a human, who is the only remaining reader.
+      printf 'escalate' ;;
     6)
       # EVERY exit-6 skip is not-yet, including draft and non-base-branch.
       #
@@ -240,10 +255,20 @@ p4b_barrier_class_coderabbit() {
 # would pick it up by accident (CodeRabbit Major on #835).
 #
 # Codex has no will-not-report state: it is either asked or not.
+# rc 2 is diagnostic-mode-only and means Codex CANNOT report on this head: it
+# answered a trigger with an account-/connection-level block (quota exhausted,
+# App not connected). That is not review latency and waiting cannot fix it, so
+# it must NOT hold the run — Phase 4b is the documented fallback for exactly
+# that state, and codex-review-check.sh's own failure message says to route
+# there. Treating it as not-yet made the barrier wait out its whole budget and
+# then page a human, so the automated leg could never serve its fallback role
+# (Codex P1 on #842). Waived, not reported: Codex has cleared nothing, it is
+# simply no longer something this head can be ordered against.
 p4b_barrier_class_codex() {
   case "$1" in
     0) printf 'reported' ;;
     1) printf 'not-yet' ;;
+    2) printf 'waived' ;;
     *) printf 'escalate' ;;
   esac
 }
@@ -341,6 +366,270 @@ p4b_barrier_note_pending() {
 # the same head starts a fresh budget instead of inheriting a stale one.
 p4b_barrier_clear_pending() {
   rm -f "$(p4b_barrier_marker_path "$1" "$2" "$3")" 2>/dev/null || true
+}
+
+# --- #814 CodeRabbit arm: trigger, do not only wait -------------------------
+#
+# The barrier point is also the right trigger point: it fires only once Codex
+# is terminal on the head, which is exactly the settled head worth spending
+# CodeRabbit's allowance on. A pure waiter is sound ONLY while
+# reviews.auto_review.auto_incremental_review is true. Turn that off (#826
+# step 2) and nothing asks CodeRabbit to look at a Phase 4b head: the probe
+# returns observed=none forever, the bound exhausts, and every Phase 4b
+# escalates to a human — a cost problem converted into a throughput problem.
+# Design change recorded on #814.
+
+# The idempotency anchor is a SHA-bearing marker, deliberately NOT "a trigger
+# comment newer than the head". That would reintroduce the defect fixed on
+# #823 in 0955ac8: the head committer date is set by whoever pushed, so a
+# future-dated head makes every prior trigger look stale and the arm re-posts
+# on every bounded retry — multiplying straight into the allowance this exists
+# to conserve. The probe cannot close it either: between posting and
+# CodeRabbit reacting, observed is still `none`, which is the same sub-minute
+# race that produced two @codex review triggers on #820.
+p4b_barrier_trigger_marker() {
+  printf '<!-- mergepath-coderabbit-trigger:%s -->' "${1:-nohead}"
+}
+
+# p4b_barrier_trigger_posted <head> <reviewer_login> <issue_comments_json>
+# True when this automation already spent the head's one request. The marker
+# must sit on a comment authored by the reviewer identity: an unscoped body
+# search is forgeable and cannot establish that automation posted it.
+p4b_barrier_trigger_posted() {
+  local marker
+  marker="$(p4b_barrier_trigger_marker "$1")"
+  printf '%s' "${3:-[]}" | jq -e --arg m "$marker" --arg who "${2:-}" '
+    any(.[]?; ((.user.login // "") == $who) and ((.body // "") | contains($m)))' \
+    >/dev/null 2>&1
+}
+
+# p4b_barrier_should_trigger <observed>
+# Which probe `observed` values mean "nobody has asked about THIS head, and
+# asking would help".
+#
+# Everything else declines. in_progress / rate_limit / paused are #814's three
+# named cases: someone already asked, or asking again cannot help — re-asking
+# on rate_limit spends allowance the provider has already refused, and on
+# in_progress spends a second review on a head already being read. Both burn
+# the same five-per-hour pool this exists to conserve. `awaiting-summary` is
+# the same shape (a review object IS pinned to this head), and any unmodelled
+# value declines too: a wrong trigger spends allowance, while a missing one
+# only ends in the bounded escalation to a human.
+#
+# `summary-without-head-review` is a deviation from #814's change detail,
+# which named only `none` — recorded on #814. It means the bot spoke about an
+# EARLIER head with nothing pinned to this one, so for this head nobody has
+# asked, which is `none` as far as the barrier is concerned.
+p4b_barrier_should_trigger() {
+  case "${1:-}" in
+    none|summary-without-head-review) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# p4b_barrier_post_trigger <repo> <pr> <head> <reviewer>
+# Post the one permitted request for this head, carrying the marker. Routed
+# through gh-as-reviewer.sh because `gh pr comment` is a guarded write and the
+# marker's whole value is that an identity-verified account authored it.
+p4b_barrier_post_trigger() {
+  local repo="$1" pr="$2" head="$3" reviewer="$4"
+  # Uppercase *_AS_REVIEWER deliberately: check_no_bare_gh_writes exempts a
+  # wrapped write only when the wrapper is a literal gh-as-*.sh path or a
+  # variable matching [A-Z_]*AS_(AUTHOR|REVIEWER). A lowercase holder reads as
+  # a bare `gh pr comment` and fails the gate — correctly, since the gate
+  # cannot tell what a lowercase variable points at.
+  local WRAPPER_AS_REVIEWER body bot rc=0
+  WRAPPER_AS_REVIEWER="${P4B_GH_AS_REVIEWER:-$(p4b_repo_root)/scripts/gh-as-reviewer.sh}"
+  [ -x "$WRAPPER_AS_REVIEWER" ] || return 1
+  # Mention the CONFIGURED bot, not a hardcoded @coderabbitai (Codex P2 on
+  # #842). coderabbit-wait.sh probes activity from coderabbit.bot_login, so a
+  # consumer that overrides it would have the request addressed to an account
+  # that never answers while the probe keeps observing `none` — the barrier
+  # then burns its whole budget and escalates on every PR in that repo. Strip
+  # the REST-only `[bot]` suffix, as the existing retry and resume paths do.
+  bot="$(p4b_policy_block_field coderabbit bot_login)"
+  bot="${bot:-coderabbitai}"
+  bot="${bot%\[bot\]}"
+  body="$(printf '@%s review\n\n%s\n' "$bot" "$(p4b_barrier_trigger_marker "$head")")"
+  env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$reviewer" \
+    "$WRAPPER_AS_REVIEWER" -- gh pr comment "$pr" --repo "$repo" --body "$body" \
+    >/dev/null 2>&1 || rc=$?
+  return "$rc"
+}
+
+# p4b_barrier_maybe_trigger <repo> <pr> <head> <reviewer> <probe_json> <dry_run>
+# probe -> decide -> post at most once. Prints the action taken; never fails
+# the caller, because a trigger that could not be posted still leaves the
+# bounded retry and the human escalation behind it.
+p4b_barrier_maybe_trigger() {
+  local repo="$1" pr="$2" head="$3" reviewer="$4" json="$5" dry="${6:-false}"
+  local observed comments raw
+  observed="$(printf '%s' "$json" | jq -r '.probe.observed // empty' 2>/dev/null || true)"
+  p4b_barrier_should_trigger "$observed" || { printf 'declined'; return 0; }
+  # Re-read the timeline rather than trusting process state: the bounded retry
+  # runs as a fresh one-shot process each time, so "already triggered" has to
+  # be durable in the PR itself.
+  #
+  # A read FAILURE is not an empty timeline. `jq -sc 'add // []'` prints `[]`
+  # and exits 0 on empty stdin, so folding the read and the parse into one
+  # pipeline turns any gh failure — 403, secondary rate limit, a truncated
+  # --paginate — into "no marker found", and the arm re-posts on every bounded
+  # retry. That is a self-amplifying write loop against the same five-per-hour
+  # allowance the marker exists to conserve, on the PAT that is also the CI
+  # token. Same search-ERROR-is-not-search-EMPTY defect already fixed in this
+  # file's caller; declining costs nothing, because `pending` is set before
+  # this runs, so the bound and the human escalation stand either way.
+  raw="$(gh api "repos/$repo/issues/$pr/comments" --paginate 2>/dev/null)" \
+    || { printf 'trigger-read-failed'; return 0; }
+  comments="$(printf '%s' "$raw" | jq -sc 'add // []' 2>/dev/null)" \
+    || { printf 'trigger-read-failed'; return 0; }
+  case "$comments" in
+    '['*) ;;
+    *) printf 'trigger-read-failed'; return 0 ;;
+  esac
+  if p4b_barrier_trigger_posted "$head" "$reviewer" "$comments"; then
+    printf 'already-triggered'; return 0
+  fi
+  if [ "$dry" = true ]; then printf 'would-trigger'; return 0; fi
+  if p4b_barrier_post_trigger "$repo" "$pr" "$head" "$reviewer"; then
+    printf 'triggered'
+  else
+    printf 'trigger-failed'
+  fi
+  return 0
+}
+
+# --- the barrier itself (#814) ----------------------------------------------
+#
+# p4b_same_head_barrier <repo> <pr> <head> <reviewer> [dry_run]
+#
+# Emits one JSON object on stdout and returns:
+#   0  open      — every ENABLED provider is terminal on this exact head
+#   1  pending   — at least one is not yet, still inside the bound
+#   2  escalate  — a provider needs a human, or the bound is exhausted
+#
+# Guarded only on the existing codex.enabled / coderabbit.enabled switches;
+# #814 ships with no new review-policy keys. A provider disabled in policy is
+# simply not consulted — that, and not any rc, is the only route to
+# will-not-report, and it cannot flip mid-flight on a live PR.
+p4b_same_head_barrier() {
+  local repo="$1" pr="$2" head="$3" reviewer="$4" dry="${5:-false}"
+  local root cr_bin cx_bin rc json probe_head
+  local pending=false why="" trigger="skipped" cls_cr="disabled" cls_cx="disabled"
+  local elapsed budget remaining=0
+  root="$(p4b_repo_root)"
+  cr_bin="${P4B_CODERABBIT_WAIT:-$root/scripts/coderabbit-wait.sh}"
+  cx_bin="${P4B_CODEX_REVIEW_CHECK:-$root/scripts/codex-review-check.sh}"
+
+  # Codex arm. The five overrides turn a merge-gate verdict into "has Codex
+  # itself spoken on THIS head" — see p4b_barrier_class_codex for why each is
+  # required, and why the diagnostic switch is a flag rather than an env var.
+  if [ "$(p4b_policy_block_field codex enabled)" != "false" ]; then
+    rc=0
+    CODEX_REVIEW_CHECK_SKIP_CI=1 \
+    CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+    CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE=false \
+      "$cx_bin" --diagnostic-signal-only "$pr" "$repo" >/dev/null 2>&1 || rc=$?
+    cls_cx="$(p4b_barrier_class_codex "$rc")"
+    # Waiving an account-blocked Codex only helps where a Phase 4b APPROVED can
+    # actually clear gate (c). With codex.allow_phase_4b_substitute: false the
+    # merge gate rejects that review by design, so opening the barrier would
+    # let the automated leg post an approval, report success, and leave the PR
+    # still unmergeable with needs-external-review uncleared — a green run that
+    # accomplished nothing (Codex P2 on #842). In that configuration a block is
+    # exactly what it looks like: something a human has to fix.
+    if [ "$cls_cx" = waived ] \
+       && [ "$(p4b_policy_block_field codex allow_phase_4b_substitute)" = "false" ]; then
+      cls_cx="escalate"
+      why="Codex is account-blocked and codex.allow_phase_4b_substitute=false, so no Phase 4b review could clear gate (c) — a human must resolve the block"
+    fi
+    case "$cls_cx" in
+      reported|will-not-report|waived) ;;
+      not-yet)  pending=true ;;
+      escalate) [ -n "$why" ] || why="codex signal check exited $rc" ;;
+      *)        why="codex signal check exited $rc" ;;
+    esac
+  fi
+
+  # CodeRabbit arm: probe (read-only, zero allowance) -> conditional trigger
+  # -> bounded retry. The probe resolves the live head itself, so classifying
+  # against "$head" is also what catches a push landing mid-run.
+  if [ -z "$why" ] && [ "$(p4b_policy_block_field coderabbit enabled)" != "false" ]; then
+    rc=0
+    json="$("$cr_bin" --probe "$pr" "$repo" 2>/dev/null)" || rc=$?
+    # Head drift, detected BEFORE any trigger (Codex P2 on #842). The probe
+    # resolves the LIVE head; when that differs from the head under review a
+    # push landed after "$HEAD" was captured. Classifying that as not-yet and
+    # then triggering asks CodeRabbit to review an unrelated new head, spends
+    # the one permitted request on it, and can never satisfy the old-head
+    # comparison — so the run would hold until the whole budget expired. This
+    # run is void either way: the orchestrator's own live-head recheck refuses
+    # to post on a drifted head, so escalate now for the same reason rather
+    # than burning the budget first.
+    probe_head="$(printf '%s' "$json" | jq -r '.head_sha // empty' 2>/dev/null || true)"
+    if [ -n "$probe_head" ] && [ "$probe_head" != "$head" ]; then
+      why="PR head moved during evaluation (reviewing $head, live $probe_head) — rerun on the new head"
+      cls_cr="drift"
+    else
+      cls_cr="$(p4b_barrier_class_coderabbit "$head" "$rc" "$json")"
+      case "$cls_cr" in
+        reported|will-not-report|waived) ;;
+        not-yet)
+          pending=true
+          # Only spend the request once Codex is terminal. The trigger point is
+          # meant to be the settled head — "after the Codex rounds have
+          # converged" — and if Codex is still not-yet it may yet produce
+          # feedback that forces a push, discarding this head and the request
+          # with it (Codex P2 on #842). Already-present CodeRabbit evidence is
+          # still observed above; only the WRITE waits.
+          case "$cls_cx" in
+            not-yet) trigger="awaiting-codex" ;;
+            *) trigger="$(p4b_barrier_maybe_trigger "$repo" "$pr" "$head" "$reviewer" "$json" "$dry")" ;;
+          esac
+          ;;
+        *)
+          if [ "$rc" = 2 ]; then
+            why="CodeRabbit published a blocking finding carried only by the PR-level summary on $head — no required gate dispositions that class, so a human must read it"
+          else
+            why="coderabbit probe exited $rc"
+          fi
+          ;;
+      esac
+    fi
+  fi
+
+  if [ -z "$why" ] && [ "$pending" = true ]; then
+    # Bounded: the marker records when THIS checkout began waiting on this
+    # head. It asserts no provider event, so no clock value can turn a not-yet
+    # provider into a reported one — it decides only when to involve a human.
+    elapsed="$(p4b_barrier_note_pending "$repo" "$pr" "$head")"
+    budget="$(p4b_barrier_budget_seconds)"
+    if [ "$elapsed" -ge "$budget" ]; then
+      why="external review did not reach the current head within ${budget}s"
+    else
+      remaining=$(( budget - elapsed ))
+    fi
+  fi
+
+  # Any outcome other than pending ends this head's wait, so the next not-yet
+  # on the same head starts a fresh budget rather than inheriting a stale one.
+  if [ -n "$why" ] || [ "$pending" != true ]; then
+    p4b_barrier_clear_pending "$repo" "$pr" "$head"
+  fi
+
+  if [ -n "$why" ]; then
+    jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg t "$trigger" \
+      '{decision:"escalate", reason:$r, coderabbit:$cr, codex:$cx, trigger:$t}'
+    return 2
+  fi
+  if [ "$pending" = true ]; then
+    jq -nc --argjson ra "$remaining" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg t "$trigger" \
+      '{decision:"pending", retry_after:$ra, coderabbit:$cr, codex:$cx, trigger:$t}'
+    return 1
+  fi
+  jq -nc --arg cr "$cls_cr" --arg cx "$cls_cx" \
+    '{decision:"open", coderabbit:$cr, codex:$cx}'
+  return 0
 }
 
 # --- reviewer CLI runtime bounds: timeout + effort (#589) -------------------

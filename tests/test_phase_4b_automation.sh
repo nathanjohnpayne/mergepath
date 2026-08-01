@@ -35,6 +35,24 @@ trap 'rm -rf "$WORK"' EXIT
 # tests/test_phase_4b_accounting.sh.
 export P4B_ACCT_STATE_DIR="$WORK/acct-state"
 
+# (#814) The orchestrator now consults both external providers before it will
+# post an approval. Default every pre-existing case to "both have already
+# reported on this head" so each still exercises the flow it was written for
+# rather than stopping at the barrier; cases that want a different barrier
+# outcome override these two. Every orchestrator case in this file reviews
+# --head abc123.
+cat >"$WORK/stub-barrier-codex.sh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat >"$WORK/stub-barrier-coderabbit.sh" <<'EOF'
+#!/bin/sh
+printf '{"head_sha":"abc123","probe":{"mode":true,"observed":"terminal"}}'
+EOF
+chmod +x "$WORK/stub-barrier-codex.sh" "$WORK/stub-barrier-coderabbit.sh"
+export P4B_CODEX_REVIEW_CHECK="$WORK/stub-barrier-codex.sh"
+export P4B_CODERABBIT_WAIT="$WORK/stub-barrier-coderabbit.sh"
+
 PASS=0; FAIL=0
 pass() { echo "  PASS: $*"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
@@ -2392,7 +2410,13 @@ fi
 _cr() { p4b_barrier_class_coderabbit abc123 "$1" "$2"; }
 bad=""
 [ "$(_cr 0 '{"head_sha":"abc123"}')" = reported ]        || bad="$bad rc0-match"
-[ "$(_cr 2 '{"head_sha":"abc123"}')" = reported ]        || bad="$bad rc2-match"
+# rc 2 is NOT a report. In --probe mode it is the one verdict the probe makes:
+# a blocking marker carried solely by the PR-level summary, which #823 emits
+# precisely because no required gate dispositions that class. The barrier is
+# the only reader of that signal, so it escalates to a human rather than
+# opening and letting an approval post over it (Codex P1 on #842).
+[ "$(_cr 2 '{"head_sha":"abc123"}')" = escalate ]        || bad="$bad rc2-summary-only"
+[ "$(_cr 2 '{"head_sha":"stale99"}')" = escalate ]       || bad="$bad rc2-stale"
 # A terminal rc anchored on an OLDER head is a stale clearance — the #794 shape.
 [ "$(_cr 0 '{"head_sha":"old999"}')" = not-yet ]         || bad="$bad rc0-stale"
 [ "$(_cr 0 '{}')" = not-yet ]                            || bad="$bad rc0-nohead"
@@ -2477,6 +2501,295 @@ if [ "$(MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-barrier.yml" p4b_barrier_budg
   pass "#814: budget reads coderabbit.max_wait_seconds and defaults rather than failing closed"
 else
   fail "#814: budget resolution wrong"
+fi
+
+# --- #814 barrier composition and the CodeRabbit trigger --------------------
+
+# Idempotency is anchored on a SHA-bearing marker AND the reviewer identity.
+# An unscoped body search is forgeable and cannot establish that automation
+# spent the head's one request.
+bad=""
+_m="$(p4b_barrier_trigger_marker deadbee)"
+case "$_m" in *deadbee*) ;; *) bad="$bad marker-lacks-sha" ;; esac
+_mine="[{\"user\":{\"login\":\"rev-bot\"},\"body\":\"@coderabbitai review $_m\"}]"
+_forged="[{\"user\":{\"login\":\"someone-else\"},\"body\":\"@coderabbitai review $_m\"}]"
+_oldhead="[{\"user\":{\"login\":\"rev-bot\"},\"body\":\"$(p4b_barrier_trigger_marker otherhd)\"}]"
+p4b_barrier_trigger_posted deadbee rev-bot "$_mine"     || bad="$bad own-marker-missed"
+! p4b_barrier_trigger_posted deadbee rev-bot "$_forged" || bad="$bad forged-author-accepted"
+! p4b_barrier_trigger_posted deadbee rev-bot "$_oldhead"|| bad="$bad wrong-head-accepted"
+! p4b_barrier_trigger_posted deadbee rev-bot '[]'       || bad="$bad empty-accepted"
+if [ -z "$bad" ]; then
+  pass "#814: trigger idempotency requires this head's marker AND the reviewer identity"
+else
+  fail "#814: trigger idempotency wrong:$bad"
+fi
+
+# Never re-ask a provider that is already working or has already refused:
+# both spend from the same pool the barrier exists to conserve.
+bad=""
+for _o in none summary-without-head-review; do
+  p4b_barrier_should_trigger "$_o" || bad="$bad missing-$_o"
+done
+for _o in in_progress rate_limit paused awaiting-summary terminal "" bogus-future-state; do
+  ! p4b_barrier_should_trigger "$_o" || bad="$bad triggers-on-${_o:-empty}"
+done
+if [ -z "$bad" ]; then
+  pass "#814: trigger fires only where nobody has asked about this head; never on rate_limit/in_progress/paused"
+else
+  fail "#814: trigger decision table wrong:$bad"
+fi
+
+# Composition. Stubs stand in for both provider CLIs; `gh` is stubbed on PATH
+# so nothing reaches the network, and dry=true so no trigger is ever posted.
+mkdir -p "$WORK/barrier-bin" "$WORK/barrier-state"
+printf '#!/bin/sh\necho "[]"\n' >"$WORK/barrier-bin/gh"
+chmod +x "$WORK/barrier-bin/gh"
+
+_barrier() { # <cx_rc> <cr_rc> <cr_json> [policy]
+  printf '#!/bin/sh\nexit %s\n' "$1" >"$WORK/stub-cx.sh"
+  printf "#!/bin/sh\nprintf '%%s' '%s'\nexit %s\n" "$3" "$2" >"$WORK/stub-cr.sh"
+  chmod +x "$WORK/stub-cx.sh" "$WORK/stub-cr.sh"
+  (
+    export MERGEPATH_REVIEW_POLICY_PATH="${4:-$WORK/barrier-both.yml}"
+    export P4B_ACCT_STATE_DIR="$WORK/barrier-state"
+    export P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx.sh"
+    export P4B_CODERABBIT_WAIT="$WORK/stub-cr.sh"
+    export PATH="$WORK/barrier-bin:$PATH"
+    p4b_same_head_barrier owner/repo 7 abc123 rev-bot true
+  )
+}
+
+cat >"$WORK/barrier-both.yml" <<'EOF'
+coderabbit:
+  enabled: true
+  max_wait_seconds: 100
+codex:
+  enabled: true
+EOF
+cat >"$WORK/barrier-off.yml" <<'EOF'
+coderabbit:
+  enabled: false
+codex:
+  enabled: false
+EOF
+
+bad=""
+out="$(_barrier 0 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = open ] || bad="$bad both-reported"
+# The marker must be gone once the barrier opens, so a later not-yet on the
+# same head starts a fresh budget instead of inheriting this wait.
+[ ! -f "$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-abc123.pending" ] || bad="$bad open-left-marker"
+
+out="$(_barrier 1 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
+[ "$rc" = 1 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = pending ] || bad="$bad codex-notyet"
+[ "$(printf '%s' "$out" | jq -r .retry_after)" = 100 ] || bad="$bad retry-after"
+
+# A probe anchored on a different head must never OPEN the barrier. Since the
+# #842 drift fix that is escalate (2) rather than pending (1): the probe
+# resolves the LIVE head, so a mismatch means a push landed and this run is
+# void. p4b_barrier_class_coderabbit still maps the same shape to not-yet in
+# isolation — asserted separately above — because it is a pure function over
+# one probe result; the drift decision belongs to the composer, which is the
+# only layer that knows which head is being reviewed.
+out="$(_barrier 0 0 '{"head_sha":"stale99"}')" && rc=0 || rc=$?
+[ "$rc" != 0 ] || bad="$bad stale-head-opened"
+[ "$rc" = 2 ] || bad="$bad stale-head-not-drift"
+
+# Infra failure escalates to a human rather than guessing.
+out="$(_barrier 0 3 'null')" && rc=0 || rc=$?
+[ "$rc" = 2 ] && [ "$(printf '%s' "$out" | jq -r .decision)" = escalate ] || bad="$bad cr-infra"
+
+# Both providers disabled: neither CLI is consulted at all. The stubs would
+# escalate if they ran, so `open` here also proves they did not.
+out="$(_barrier 3 3 'null' "$WORK/barrier-off.yml")" && rc=0 || rc=$?
+[ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.codex + "/" + .coderabbit')" = disabled/disabled ] \
+  || bad="$bad disabled-consulted"
+
+if [ -z "$bad" ]; then
+  pass "#814: barrier opens only when every ENABLED provider is terminal on this exact head"
+else
+  fail "#814: barrier composition wrong:$bad"
+fi
+
+# An account-blocked Codex must WAIVE, not hold. Phase 4b is the documented
+# fallback for "4a unavailable", so holding the run behind a Codex that cannot
+# report meant the automated leg could never serve that role — it waited out
+# the whole budget and then paged a human (Codex P1 on #842).
+bad=""
+[ "$(p4b_barrier_class_codex 2)" = waived ]   || bad="$bad rc2-not-waived"
+[ "$(p4b_barrier_class_codex 1)" = not-yet ]  || bad="$bad rc1"
+[ "$(p4b_barrier_class_codex 0)" = reported ] || bad="$bad rc0"
+[ "$(p4b_barrier_class_codex 3)" = escalate ] || bad="$bad rc3"
+# End to end: a blocked Codex opens the barrier so the adapter can run.
+out="$(_barrier 2 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
+[ "$rc" = 0 ] || bad="$bad blocked-codex-held"
+printf '%s' "$out" | jq -e '.codex == "waived"' >/dev/null 2>&1 || bad="$bad blocked-codex-class"
+# ...but only where a Phase 4b APPROVED can actually clear gate (c). With the
+# substitute disabled, waiving would let the leg post a review the merge gate
+# rejects by design — a green run leaving the PR unmergeable (Codex P2 on #842).
+cat >"$WORK/policy-nosub.yml" <<'EOF'
+coderabbit:
+  enabled: true
+  max_wait_seconds: 100
+codex:
+  enabled: true
+  allow_phase_4b_substitute: false
+EOF
+out="$(_barrier 2 0 '{"head_sha":"abc123"}' "$WORK/policy-nosub.yml")" && rc=0 || rc=$?
+[ "$rc" = 2 ] || bad="$bad nosub-not-escalated"
+printf '%s' "$out" | jq -e '.reason | test("allow_phase_4b_substitute")' >/dev/null 2>&1 \
+  || bad="$bad nosub-reason"
+if [ -z "$bad" ]; then
+  pass "#842: an account-blocked Codex waives rather than holding, so the Phase 4b fallback can still run"
+else
+  fail "#842: blocked-Codex handling wrong:$bad"
+fi
+
+# Codex round-1 findings on #842, all four in one place.
+bad=""
+# 1. Head drift is detected BEFORE any trigger. The probe resolves the LIVE
+#    head, so a mismatch means a push landed after $HEAD was captured;
+#    triggering would spend the one permitted request on an unrelated head and
+#    then hold until the whole budget expired.
+out="$(_barrier 0 0 '{"head_sha":"pushed99"}')" && rc=0 || rc=$?
+[ "$rc" = 2 ] || bad="$bad drift-not-escalated"
+printf '%s' "$out" | jq -e '.reason | test("head moved")' >/dev/null 2>&1 || bad="$bad drift-reason"
+printf '%s' "$out" | jq -e '.trigger == "skipped"' >/dev/null 2>&1 || bad="$bad drift-triggered"
+
+# 2. The request waits for Codex to be terminal. If Codex is still not-yet it
+#    may yet force a push that discards this head and the request with it.
+out="$(_barrier 1 7 'null')" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad codexnotyet-rc"
+printf '%s' "$out" | jq -e '.trigger == "awaiting-codex"' >/dev/null 2>&1 || bad="$bad codexnotyet-trigger"
+
+# 3. Once Codex IS terminal the arm proceeds to the trigger decision.
+out="$(_barrier 0 7 'null')" && rc=0 || rc=$?
+[ "$rc" = 1 ] || bad="$bad codexdone-rc"
+printf '%s' "$out" | jq -e '.trigger != "awaiting-codex"' >/dev/null 2>&1 || bad="$bad codexdone-blocked"
+
+if [ -z "$bad" ]; then
+  pass "#842: head drift escalates before any trigger, and the request waits for Codex to be terminal"
+else
+  fail "#842 trigger sequencing wrong:$bad"
+fi
+
+# 4. The mention follows coderabbit.bot_login. coderabbit-wait.sh probes the
+#    configured bot, so a hardcoded @coderabbitai would address an account that
+#    never answers in a consumer that renamed it — the probe keeps seeing
+#    `none` and the barrier burns its whole budget on every PR.
+cat >"$WORK/policy-botlogin.yml" <<'EOF'
+coderabbit:
+  enabled: true
+  bot_login: my-rabbit[bot]
+codex:
+  enabled: true
+EOF
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" >> "%s/trigger-argv.log"\nexit 0\n' "$WORK" \
+  >"$WORK/barrier-bin/fake-reviewer2"
+chmod +x "$WORK/barrier-bin/fake-reviewer2"
+: >"$WORK/trigger-argv.log"
+(
+  export MERGEPATH_REVIEW_POLICY_PATH="$WORK/policy-botlogin.yml"
+  export P4B_ACCT_STATE_DIR="$WORK/barrier-state"
+  export P4B_GH_AS_REVIEWER="$WORK/barrier-bin/fake-reviewer2"
+  p4b_barrier_post_trigger o/r 7 abc123 rev-bot
+) >/dev/null 2>&1 || true
+if grep -q '^@my-rabbit review' "$WORK/trigger-argv.log" \
+   && ! grep -q '@coderabbitai' "$WORK/trigger-argv.log"; then
+  pass "#842: the trigger mentions the configured coderabbit.bot_login, with the REST-only [bot] suffix stripped"
+else
+  fail "#842: trigger ignored bot_login: $(tr '\n' ' ' < "$WORK/trigger-argv.log")"
+fi
+
+# The bound is what turns an indefinite wait into a human handoff.
+mkdir -p "$WORK/barrier-state/phase-4b-barrier"
+printf '%s\n' "$(( $(date +%s) - 500 ))" \
+  >"$WORK/barrier-state/phase-4b-barrier/owner-repo-pr7-abc123.pending"
+out="$(_barrier 1 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
+if [ "$rc" = 2 ] && printf '%s' "$out" | jq -e '.reason | test("within 100s")' >/dev/null; then
+  pass "#814: an exhausted bound escalates to a human instead of holding forever"
+else
+  fail "#814: exhausted bound did not escalate (rc=$rc out=$out)"
+fi
+
+# Orchestrator wiring. A not-yet barrier must HOLD on its OWN exit code, and a
+# hold is not a fallback: no chat-side handoff is rendered, and the payload
+# tells the caller to retry rather than to page a human. Exit 6 rather than 4
+# because AGENTS.md, REVIEW_POLICY.md and wave-audit.sh all read 4 as a
+# reviewer that will not answer — and wave-audit proceeds fail-open on it.
+# Codex reports not-yet here; the CodeRabbit stub installed at the top of this
+# file still reports on abc123.
+printf '#!/bin/sh\nexit 1\n' >"$WORK/stub-cx-notyet.sh"
+printf '#!/bin/sh\necho "REGRESSION: reviewer wrapper invoked from the hold path" >&2\nexit 9\n' \
+  >"$WORK/stub-rev-guard.sh"
+chmod +x "$WORK/stub-cx-notyet.sh" "$WORK/stub-rev-guard.sh"
+HANDOFF_LOG="$WORK/handoff-barrier.log"
+: >"$HANDOFF_LOG"
+# NOT --dry-run: the barrier is deliberately skipped on dry runs (it guards the
+# POST, and a dry run posts nothing), so a dry run cannot exercise the hold at
+# all. The hold happens before the adapter and before anything is posted, so a
+# real run is safe here; the reviewer wrapper is stubbed to fail loudly if the
+# hold path ever reaches a write.
+set +e
+out="$(MERGEPATH_REVIEW_POLICY_PATH="$POLICY_ON" \
+  P4B_CODEX_REVIEW_CHECK="$WORK/stub-cx-notyet.sh" \
+  P4B_GH_AS_REVIEWER="$WORK/stub-rev-guard.sh" \
+  P4B_HANDOFF="$BIN/fake-handoff" P4B_HANDOFF_LOG="$HANDOFF_LOG" \
+  bash "$ORCH" 814 --repo o/r --author claude --head abc123 --diff-file "$DIFF" 2>/dev/null)"; rc=$?
+set -e
+if [ "$rc" = 6 ] \
+   && [ "$(printf '%s' "$out" | jq -r '.barrier_pending')" = "true" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.fell_back_to_manual')" = "false" ] \
+   && [ "$(printf '%s' "$out" | jq -r '.retry_after > 0')" = "true" ] \
+   && [ ! -s "$HANDOFF_LOG" ]; then
+  pass "#814: a not-yet barrier holds on exit 6 with retry_after and renders no handoff — a wait is not a fallback"
+else
+  fail "#814: barrier hold path wrong (rc=$rc handoff='$(cat "$HANDOFF_LOG" 2>/dev/null)'): $out"
+fi
+
+# A hold must leave NO accounting trace, and the way that is guaranteed is
+# structural: the barrier is evaluated exactly ONCE, before the loop record and
+# before the step-9 issue filing. A second evaluation inside post_review sits
+# after both, so a hold there left a provisional "posted" loop that the next
+# run published as a real approval — the phantom-posted-approval class #615
+# exists to prevent — and re-filed follow-up issues every retry cycle.
+# Asserted structurally because the two evaluations can only disagree when a
+# provider CLI flaps between them, which no fixture can pin honestly.
+# The ordering must be anchored on the CALL SITE, not on the helper reference
+# inside run_same_head_barrier's definition (CodeRabbit on #842). That
+# definition sits near the top of the file, so its line number is below the
+# loop record no matter where the barrier is actually invoked — an ordering
+# assertion anchored there passes even after someone moves the call after
+# p4b_acct_hook_record_loop, which is precisely the regression this guards.
+# Matched on the trailing quote, not a line anchor: the call is indented inside
+# the dry-run guard, and `run_same_head_barrier(` is the definition.
+n_eval="$(grep -c 'p4b_same_head_barrier ' "$ORCH" || true)"
+n_call="$(grep -c 'run_same_head_barrier "' "$ORCH" || true)"
+if [ "$n_eval" = "1" ] && [ "$n_call" = "1" ] \
+   && [ "$(grep -n 'run_same_head_barrier "' "$ORCH" | cut -d: -f1)" -lt "$(grep -n 'p4b_acct_hook_record_loop ' "$ORCH" | head -1 | cut -d: -f1)" ]; then
+  pass "#814: the barrier is called exactly once, before any loop is recorded — a hold cannot leave a phantom posted approval"
+else
+  fail "#814: barrier defined $n_eval time(s), called $n_call time(s), or the call is not before the loop record"
+fi
+
+# The trigger dedup must FAIL CLOSED on a comments-read failure. jq -s prints
+# [] and exits 0 on empty stdin, so a folded read+parse would turn any gh
+# failure into "no marker" and re-post on every bounded retry — a
+# self-amplifying write loop against the allowance the marker conserves.
+# The reviewer wrapper is stubbed so that a REGRESSION here cannot reach the
+# real gh-as-reviewer.sh and attempt a live write from the test suite.
+printf '#!/bin/sh\necho "boom" >&2\nexit 1\n' >"$WORK/barrier-bin/gh"
+printf '#!/bin/sh\necho "REGRESSION: attempted a live trigger post" >&2\nexit 9\n' \
+  >"$WORK/barrier-bin/fake-reviewer"
+chmod +x "$WORK/barrier-bin/fake-reviewer"
+res="$(P4B_ACCT_STATE_DIR="$WORK/barrier-state" PATH="$WORK/barrier-bin:$PATH" \
+  P4B_GH_AS_REVIEWER="$WORK/barrier-bin/fake-reviewer" \
+  p4b_barrier_maybe_trigger o/r 7 abc123 rev-bot '{"probe":{"observed":"none"}}' false 2>/dev/null)"
+printf '#!/bin/sh\necho "[]"\n' >"$WORK/barrier-bin/gh"
+if [ "$res" = "trigger-read-failed" ]; then
+  pass "#814: a failed comments read declines to trigger rather than reading as 'never triggered'"
+else
+  fail "#814: trigger read failure did not fail closed (got '$res')"
 fi
 
 echo

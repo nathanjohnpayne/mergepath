@@ -460,6 +460,15 @@ case "$orc" in
     emit_json 3 false null
     log "ERROR: orchestrator infrastructure/config failure (exit 3) — no verdict exists; fix the configuration or write path and rerun the audit before fanning out"
     ;;
+  6)
+    # #814 barrier hold: external review has not reached the canary head YET.
+    # This is a transient wait that clears on its own, NOT an unavailable
+    # reviewer, so it must not take the fail-open arm below — a canary is
+    # audited moments after it opens, before either provider has read it, so
+    # that arm would fire on the ordinary path and fan the wave out unaudited.
+    emit_json 6 false null
+    log "external review has not reached ${REPO}#${PR} yet (orchestrator exit 6) — no watermark; do NOT fan out, retry the audit after the retry_after in the orchestrator JSON above"
+    ;;
   *)
     emit_json "$orc" false null
     log "reviewer unavailable (orchestrator exit $orc) — no watermark; the wave may proceed on CI + lane and this range chains into the next audit"

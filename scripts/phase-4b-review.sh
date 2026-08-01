@@ -52,6 +52,15 @@
 #      block from scripts/post-phase-4b-handoff.sh is emitted on stderr.
 #   5  automation disabled or mode != local — caller uses the manual
 #      handoff (today's behavior). Not an error.
+#   6  held: external review has not reached the reviewed head yet (#814).
+#      NOT a fallback and NOT an unavailable reviewer — no handoff block is
+#      emitted and no fail-closed loop is recorded. The JSON carries
+#      barrier_pending:true and retry_after; the caller should retry after
+#      that many seconds. Deliberately distinct from 4 so that every existing
+#      consumer of 4 keeps its meaning: AGENTS.md, REVIEW_POLICY.md and
+#      scripts/wave-audit.sh all treat 4 as a reviewer that will not answer,
+#      and wave-audit proceeds fail-open on it — which would be wrong for a
+#      wait that clears on its own.
 
 set -euo pipefail
 
@@ -290,6 +299,51 @@ fall_back_to_manual() {
   exit 4
 }
 
+# #814: a barrier that has not opened yet is NOT a fallback. It exits 6, its
+# own code, carrying barrier_pending:true and retry_after so the caller retries
+# after that many seconds instead of paging a human.
+#
+# Exit 6 rather than reusing 4 (raised in review). Every existing consumer of 4
+# reads it as "this reviewer will not answer": AGENTS.md and REVIEW_POLICY.md
+# route it to the manual handoff, and scripts/wave-audit.sh proceeds fail-open
+# on CI + lane. Reusing 4 would make those true statements false and would turn
+# the ordinary case — wave-audit dispatching a canary before either provider
+# has read it — into the documented fail-open path.
+#
+# Deliberately does NOT render the chat-side handoff and does NOT write a
+# note_fallback ledger entry: nothing has failed. Recording a fail-closed loop
+# on every bounded retry would flood the accounting history and inflate the
+# #813 series-3 fallback counts with waits that later succeed on their own.
+#
+# Reached only from the pre-adapter evaluation, which runs before any loop is
+# recorded and before any step-9 issue is filed — so a hold leaves no
+# provisional posted record to correct and no follow-up issues to orphan.
+hold_for_external_review() {
+  local payload="$1"
+  p4b_warn "external review has not reached the current head; holding without posting (retry_after=$(printf '%s' "$payload" | jq -r '.retry_after // 0')s)"
+  jq -n --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+        --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+        --arg adapter "$ADAPTER" --argjson b "$payload" '
+    {pr_number:$pr, repo:$repo, head_sha:$head, direction:$direction,
+     reviewer_identity:$reviewer, adapter:$adapter, verdict:null,
+     review_posted:false, fell_back_to_manual:false, barrier_pending:true,
+     retry_after:($b.retry_after // 0), barrier:$b,
+     reason:"external review has not reached the current head"}'
+  exit 6
+}
+
+# Run the same-head barrier and act on it. Escalation routes to the existing
+# manual handoff; only the non-terminal case takes the new hold path.
+run_same_head_barrier() {
+  local where="$1" out rc=0
+  out="$(p4b_same_head_barrier "$REPO" "$PR" "$HEAD" "$REVIEWER" "$DRY_RUN")" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) hold_for_external_review "$out" ;;
+    *) fall_back_to_manual "external review barrier ($where): $(printf '%s' "$out" | jq -r '.reason // "escalated"')" ;;
+  esac
+}
+
 # Temp hygiene: one EXIT trap owns every temp path this run creates (the
 # review body rendered below and the dry-run accounting sandbox, when one
 # exists).
@@ -312,9 +366,25 @@ trap _p4b_cleanup_tmp EXIT
 # history present, gate fidelity preserved), and the real state is untouched.
 # Placed BEFORE the first fall_back_to_manual call site so even an early
 # fallback's note_fallback recording lands in the sandbox.
+#
+# The redirect is NOT conditional on accounting being available (Codex P2 on
+# #842). The #814 barrier keys its pending marker off the same state dir, and a
+# missing or unsourceable accounting module is an explicitly supported
+# configuration — so gating this block on P4B_ACCT_AVAILABLE let a dry run
+# write its marker into the REAL .mergepath/phase-4b-barrier, where a later
+# real run inherited time accumulated by the rehearsal and could exhaust the
+# barrier into a manual handoff it had not earned. Every dry run now gets an
+# isolated state dir; only the COPY of prior history needs accounting.
 _P4B_ACCT_DRY_STATE=""
-if [ "$DRY_RUN" = true ] && [ "$P4B_ACCT_AVAILABLE" = true ]; then
-  _p4b_real_state="$(p4b_acct_state_dir)"
+if [ "$DRY_RUN" = true ]; then
+  # An `if`, not `[ ... ] && assign`: as a standalone statement the latter
+  # returns non-zero whenever accounting is unavailable, which under this
+  # script's errexit would abort the run — in exactly the degraded
+  # configuration this change exists to support.
+  _p4b_real_state=""
+  if [ "$P4B_ACCT_AVAILABLE" = true ]; then
+    _p4b_real_state="$(p4b_acct_state_dir)"
+  fi
   if _P4B_ACCT_DRY_STATE="$(mktemp -d "${TMPDIR:-/tmp}/p4b-acct-dry.XXXXXX" 2>/dev/null)"; then
     if [ -d "$_p4b_real_state" ]; then
       cp -Rp "$_p4b_real_state/." "$_P4B_ACCT_DRY_STATE/" 2>/dev/null \
@@ -333,6 +403,28 @@ fi
 
 if [ ! -x "$ADAPTER_SCRIPT" ]; then
   fall_back_to_manual "no adapter for reviewer '$REVIEWER' (expected $ADAPTER_SCRIPT)"
+fi
+
+# First barrier evaluation (#814), before the adapter run — the expensive part
+# of the loop. If external review has not reached this head there is nothing
+# to order the approval against yet, so the reasoning pass is not worth
+# spending. Placed AFTER the adapter-existence check rather than before it
+# (a deviation from #814's change detail, recorded there): a PR with no
+# adapter can never get a Phase 4b review, so probing providers and possibly
+# triggering CodeRabbit for it would be wasted work and wasted allowance.
+#
+# Skipped entirely on --dry-run (Codex P2 on #842). The barrier guards the
+# review POST, and a dry-run never posts, so there is no ordering hazard for
+# it to prevent — running it would be ceremony. It is not free ceremony
+# either: both provider helpers are gh-backed, so it breaks the offline
+# dry-run recipe in scripts/phase-4b/README.md ("Try it (dry-run, offline,
+# with fake CLIs)"), which exists precisely to validate adapter dispatch and
+# verdict parsing with no network and no credentials. That workflow is also
+# how tests/test_phase_4b_automation.sh exercises the package.
+if [ "$DRY_RUN" = true ]; then
+  p4b_warn "dry-run: skipping the same-head barrier — it guards the review POST, and a dry-run posts nothing (offline dry-runs stay offline)"
+else
+  run_same_head_barrier "pre-adapter"
 fi
 
 # --- run the adapter (reasoning plane; never posts) ------------------------
@@ -829,6 +921,22 @@ post_review() {
     fi
     fall_back_to_manual "PR head changed during review (reviewed $HEAD, live $live_head)"
   fi
+  # No second barrier evaluation here, despite #814's change detail asking for
+  # one at this line — recorded on #814 as superseded.
+  #
+  # It cannot change the answer. A provider's report on head H is permanent
+  # for H: reports do not un-happen, so a barrier that opened before the
+  # adapter is still open now. The one state change that WOULD invalidate it
+  # is a push, and that is caught by the live-head recheck immediately above,
+  # which returns before this point. Meanwhile the pre-adapter barrier holds
+  # the run outright unless it opened, so reaching here already implies it did.
+  #
+  # Re-evaluating could therefore only agree, or spuriously escalate on a
+  # transient provider-CLI failure — converting a valid approval into a manual
+  # handoff. It also cost two defects found in review: this line sits AFTER the
+  # step-9 issue filing and after the provisional posted loop record, so a hold
+  # here left a phantom posted approval in the accounting history and re-filed
+  # follow-up issues on every retry cycle.
   payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
   jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
     '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"
