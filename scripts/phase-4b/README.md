@@ -257,6 +257,12 @@ prints the intended action without posting. Adapter CLIs are injectable via
 `CODEX_BIN` / `CLAUDE_BIN`, which is how `tests/test_phase_4b_automation.sh`
 exercises the package without network or real model calls.
 
+The #814 same-head barrier is **skipped** under `--dry-run`, which is what
+keeps this recipe offline. The barrier guards the review POST and a dry-run
+never posts, so there is no ordering hazard for it to prevent — and both
+provider probes it would otherwise run are `gh`-backed, so running them would
+require network and credentials here. A real run always evaluates it.
+
 ## Exit codes (orchestrator)
 
 | Code | Meaning |
@@ -266,3 +272,4 @@ exercises the package without network or real model calls.
 | 3 | usage / infrastructure error |
 | 4 | fell back to the manual handoff (adapter error, timeout, invalid verdict, head drift, or no adapter) |
 | 5 | automation disabled or `mode != local` — caller uses the manual handoff |
+| 6 | **held** (#814) — an enabled external provider has not reported on the reviewed head. Nothing was posted, no handoff was rendered, no fail-closed loop was recorded. Wait the `retry_after` seconds in the emitted JSON and re-run the same command. Deliberately not `4`: every consumer of `4` reads it as a reviewer that will not answer, and `scripts/wave-audit.sh` proceeds fail-open on it. The wait is bounded by `coderabbit.max_wait_seconds`; once exhausted the orchestrator escalates to `4` so a human is involved. |
