@@ -240,10 +240,20 @@ p4b_barrier_class_coderabbit() {
 # would pick it up by accident (CodeRabbit Major on #835).
 #
 # Codex has no will-not-report state: it is either asked or not.
+# rc 2 is diagnostic-mode-only and means Codex CANNOT report on this head: it
+# answered a trigger with an account-/connection-level block (quota exhausted,
+# App not connected). That is not review latency and waiting cannot fix it, so
+# it must NOT hold the run — Phase 4b is the documented fallback for exactly
+# that state, and codex-review-check.sh's own failure message says to route
+# there. Treating it as not-yet made the barrier wait out its whole budget and
+# then page a human, so the automated leg could never serve its fallback role
+# (Codex P1 on #842). Waived, not reported: Codex has cleared nothing, it is
+# simply no longer something this head can be ordered against.
 p4b_barrier_class_codex() {
   case "$1" in
     0) printf 'reported' ;;
     1) printf 'not-yet' ;;
+    2) printf 'waived' ;;
     *) printf 'escalate' ;;
   esac
 }

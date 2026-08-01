@@ -334,6 +334,28 @@ else
   fail "#814: bypass reference at line ${knob_last:-?} is not before gate (c) at ${gatec_at:-?}"
 fi
 
+# #842: the CANNOT-REPORT exit must be diagnostic-mode-only. The barrier reads
+# exit 2 as "Codex is account-blocked, waive it and let Phase 4b run"; a real
+# merge-gate caller must never reach it, because an account-blocked Codex has
+# cleared nothing and the gate has to keep failing closed on 1.
+exit2_at=$(grep -n '^      exit 2$' "$SCRIPT" | head -1 | cut -d: -f1)
+guard_ok=0
+if [ -n "$exit2_at" ]; then
+  # The guard must be within the few lines immediately above the exit, so a
+  # later edit cannot leave the exit reachable from the gate path.
+  guard_at=$(sed -n "$((exit2_at - 4)),$((exit2_at - 1))p" "$SCRIPT" \
+    | grep -c 'DIAGNOSTIC_SIGNAL_ONLY" = "1"' || true)
+  [ "$guard_at" -ge 1 ] && guard_ok=1
+fi
+# And it must be the ONLY exit 2 in the script, so the documented 0/1/3
+# contract still holds for every non-diagnostic caller.
+n_exit2=$(grep -c '^[[:space:]]*exit 2$' "$SCRIPT" || true)
+if [ "$guard_ok" = 1 ] && [ "$n_exit2" = "1" ]; then
+  pass "#842: the CANNOT-REPORT exit is diagnostic-only and unique — the merge gate's 0/1/3 contract is unchanged"
+else
+  fail "#842: exit 2 is unguarded or duplicated (guard_ok=$guard_ok count=$n_exit2)"
+fi
+
 echo ""
 echo "test_codex_review_check_verdict: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -2605,6 +2605,25 @@ else
   fail "#814: barrier composition wrong:$bad"
 fi
 
+# An account-blocked Codex must WAIVE, not hold. Phase 4b is the documented
+# fallback for "4a unavailable", so holding the run behind a Codex that cannot
+# report meant the automated leg could never serve that role — it waited out
+# the whole budget and then paged a human (Codex P1 on #842).
+bad=""
+[ "$(p4b_barrier_class_codex 2)" = waived ]   || bad="$bad rc2-not-waived"
+[ "$(p4b_barrier_class_codex 1)" = not-yet ]  || bad="$bad rc1"
+[ "$(p4b_barrier_class_codex 0)" = reported ] || bad="$bad rc0"
+[ "$(p4b_barrier_class_codex 3)" = escalate ] || bad="$bad rc3"
+# End to end: a blocked Codex opens the barrier so the adapter can run.
+out="$(_barrier 2 0 '{"head_sha":"abc123"}')" && rc=0 || rc=$?
+[ "$rc" = 0 ] || bad="$bad blocked-codex-held"
+printf '%s' "$out" | jq -e '.codex == "waived"' >/dev/null 2>&1 || bad="$bad blocked-codex-class"
+if [ -z "$bad" ]; then
+  pass "#842: an account-blocked Codex waives rather than holding, so the Phase 4b fallback can still run"
+else
+  fail "#842: blocked-Codex handling wrong:$bad"
+fi
+
 # Codex round-1 findings on #842, all four in one place.
 bad=""
 # 1. Head drift is detected BEFORE any trigger. The probe resolves the LIVE
