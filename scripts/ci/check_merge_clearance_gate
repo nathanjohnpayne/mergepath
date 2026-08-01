@@ -188,9 +188,18 @@ if [ -f "$WORKFLOW" ]; then
     ' "$1"
   }
 
-  # Fixed-string match against a block with full-line comments removed.
+  # Fixed-string match against a block with comments removed — full-line AND
+  # inline. Stripping only full lines is not enough (Codex P2 on #849): the
+  # valid YAML `checks: read # checks: write` disables the permission while
+  # still satisfying a full-line-only strip, and the same trick hides a
+  # deleted POST or PATCH behind the code it replaced. Every string these
+  # assertions match is free of `#`, so removing from the first whitespace-`#`
+  # cannot swallow a legitimate target.
+  mcg_strip() {  # <block>
+    printf '%s\n' "$1" | grep -v '^[[:space:]]*#' | sed 's/[[:space:]]#.*$//'
+  }
   mcg_has() {  # <block> <fixed-string>
-    printf '%s\n' "$1" | grep -v '^[[:space:]]*#' | grep -qF -- "$2"
+    mcg_strip "$1" | grep -qF -- "$2"
   }
 
   mcg_evt_block="$(mcg_job_block "$WORKFLOW" merge-clearance-gate)"
@@ -227,13 +236,17 @@ if [ -f "$WORKFLOW" ]; then
       echo "      \"Merge clearance gate\" — the required-check context string."
       FAILED=1
     fi
-    # One name, three producers: event, sweep, dispatch. If this drops below
-    # three, a trigger path has stopped writing the shared slot.
-    mcg_name_count="$(grep -v '^[[:space:]]*#' "$WORKFLOW" \
-      | grep -cF 'CHECK_NAME: "Merge clearance gate"' || true)"
-    if [ "$mcg_name_count" -lt 3 ]; then
-      echo "FAIL: expected >=3 producers publishing CHECK_NAME \"Merge clearance gate\""
-      echo "      (event, scheduled sweep, dispatch-recheck); found $mcg_name_count."
+    # Three producers: event, sweep, dispatch. Counted by actual POST sites,
+    # NOT by CHECK_NAME declarations (Codex P2 on #849) — removing a sweep or
+    # dispatch POST while leaving its env: block intact would keep three names
+    # and pass, while the no-event transitions that sweep exists for (a 👍
+    # reaction, a UI thread resolve, a GITHUB_TOKEN relabel) silently stop
+    # refreshing the required context and a stale verdict persists.
+    mcg_post_count="$(grep -v '^[[:space:]]*#' "$WORKFLOW" | sed 's/[[:space:]]#.*$//' \
+      | grep -cF 'gh api -X POST "repos/$REPO/check-runs"' || true)"
+    if [ "$mcg_post_count" -lt 3 ]; then
+      echo "FAIL: expected >=3 jobs POSTing the required check_run (event, scheduled"
+      echo "      sweep, dispatch-recheck); found $mcg_post_count."
       echo "      Every trigger path must write the same Checks-API slot (#843)."
       FAILED=1
     fi
@@ -242,7 +255,14 @@ if [ -f "$WORKFLOW" ]; then
       echo "      github.event.pull_request.head.sha (#843)."
       FAILED=1
     fi
-    if mcg_has "$mcg_evt_block" 'head_sha="${{ github.sha }}"'; then
+    # Forbid github.sha ANYWHERE in the block, not just one literal spelling
+    # (Codex P2 on #849). The earlier version rejected only
+    # head_sha="${{ github.sha }}", so rebinding the env to
+    # `HEAD_SHA: ${{ github.sha }}` slipped through while phase 2's unchanged
+    # line still satisfied the positive grep. The real workflow mentions
+    # github.sha only inside a comment explaining why not to use it, and
+    # comments are stripped before this runs.
+    if mcg_has "$mcg_evt_block" 'github.sha'; then
       echo "FAIL: the merge-clearance-gate job must NOT bind to github.sha. On a"
       echo "      pull_request event that is the refs/pull/N/merge commit, which branch"
       echo "      protection never consults — the required context would be ABSENT on"

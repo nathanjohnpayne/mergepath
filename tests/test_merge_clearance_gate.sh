@@ -1651,6 +1651,19 @@ mcg22_case F 's{gh api -X PATCH "repos/\$REPO/check-runs/\$CHECK_ID"}{true}' fai
 mcg22_case G 's{\*"Merge clearance: PASS"\*\)}{*"nope"*)}' fail "verdict sentinel"
 # H — always() instead of !cancelled(): publishes on a cancelled run.
 mcg22_case H 's{if: \$\{\{ !cancelled\(\) && steps.open.outputs.id != .. \}\}}{if: always()}' fail "guarded by !cancelled()"
+# J — valid YAML that DISABLES the permission while an inline comment still
+#     carries the string. Stripping only full-line comments accepts this
+#     (Codex P2 on #849), which would have made every assertion bypassable by
+#     leaving the old code behind a `#`.
+mcg22_case J 's{^(\s*)checks: write}{$1checks: read # checks: write}m' fail 'checks: write'
+# K — rebind phase 1 to the merge commit WITHOUT the one literal spelling the
+#     first version of this assertion forbade. Phase 2's unchanged line kept
+#     satisfying the positive grep, so the mutation slipped through (Codex P2).
+mcg22_case K 's{HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}}{HEAD_SHA: \$\{\{ github.sha \}\}}' fail 'must NOT bind to github.sha'
+# L — delete a producer's POST but keep its CHECK_NAME env. A name-count
+#     assertion still sees three and passes, while the no-event transitions the
+#     sweep exists for stop refreshing the context (Codex P2).
+mcg22_case L 's{(.*)gh api -X POST "repos/\$REPO/check-runs" -f name="\$CHECK_NAME"}{$1true}s' fail 'jobs POSTing the required check_run'
 # I — positive control.
 mcg22_case I '' pass
 
