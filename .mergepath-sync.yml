@@ -834,6 +834,11 @@ paths:
       # an older check does not emit.
       - "scripts/ci/check_merge_clearance_gate"
       - "scripts/merge-clearance-gate.sh"
+      # Test 22's positive controls are EXTRACTED from the workflow (#849), so
+      # the test reads it directly at runtime. Without this edge the closure
+      # gate could ship the test to a consumer whose workflow predates the
+      # two-phase publish, where the extracted "compliant" job is anything but.
+      - ".github/workflows/merge-clearance-gate.yml"
   # Pairs with scripts/disagreement-detector.cjs +
   # scripts/ci/check_disagreement_detector. The check wrapper requires
   # this test file; same #264/#266 coupling class (#273).

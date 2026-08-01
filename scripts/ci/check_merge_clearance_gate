@@ -350,6 +350,17 @@ if [ -f "$WORKFLOW" ]; then
       # The three jobs genuinely differ — $HEAD_SHA in the event job, the
       # per-PR $head_sha the sweep and dispatch resolve — so the allowlist has
       # exactly two members rather than a pattern.
+      # Provenance, not just the name at the POST (Codex P2 on #849). The
+      # auxiliary producers must derive head_sha from PR metadata — the sweep
+      # reads it per-PR from a gh tab-separated stream, the dispatch resolves
+      # it with gh pr list — so reassigning head_sha="$REPO" upstream cannot
+      # satisfy this while the POST still spells $head_sha.
+      if [ "$mcg_producer" != merge-clearance-gate ] \
+         && ! grep -qE 'read -r PR head_sha|head_sha=\$\(gh ' <<<"$mcg_pblock"; then
+        echo "FAIL: the '$mcg_producer' job must derive head_sha from PR metadata"
+        echo "      (a gh read loop or gh pr list), not from an arbitrary assignment."
+        FAILED=1
+      fi
       if ! grep -qE -- '-f head_sha="\$(HEAD_SHA|head_sha)"' <<<"$mcg_pblock"; then
         echo "FAIL: the '$mcg_producer' job must POST head_sha as the per-PR head it"
         echo "      resolved (a shell variable), not a workflow expression. The Checks"
@@ -405,10 +416,18 @@ if [ -f "$WORKFLOW" ]; then
       # A variable first argument, not a specific name: the event job resolves
       # $PR_NUMBER while the sweep iterates $PR, and the property is "the PR
       # being published for", not a spelling. A literal is what this rejects.
-      if ! grep -qE 'merge-clearance-gate\.sh "\$[A-Za-z_]' <<<"$mcg_pblock"; then
+      # The variable each job actually DEFINES (Codex P2 on #849). Accepting
+      # any variable let the sweep pass "$PR_NUMBER", which is unset there —
+      # under set -u the sweep then dies before publishing anything.
+      case "$mcg_producer" in
+        merge-clearance-gate) mcg_pr_var='"$PR_NUMBER"' ;;
+        *)                    mcg_pr_var='"$PR"' ;;
+      esac
+      if ! mcg_has "$mcg_pblock" "merge-clearance-gate.sh $mcg_pr_var"; then
         echo "FAIL: the '$mcg_producer' job must evaluate the PR it is publishing for,"
-        echo "      passing that PR as a variable. A constant argument publishes one"
-        echo "      PR's verdict onto every other PR's head."
+        echo "      passing $mcg_pr_var — the variable that job defines. A constant"
+        echo "      publishes one PR's verdict onto every other PR's head, and a"
+        echo "      variable the job never sets kills it under set -u."
         FAILED=1
       fi
       # Auxiliary producers only. The event job maps through the sentinel-
@@ -480,6 +499,15 @@ if [ -f "$WORKFLOW" ]; then
       echo "      verdict sentinel before publishing success (#843). Without it a call"
       echo "      site that lands in a query mode publishes an unearned green: those"
       echo "      modes also exit 0 but print only true/false."
+      FAILED=1
+    fi
+    # The condition's SENSE, not just its presence (Codex P2 on #849).
+    # Inverting it to == '' skips phase 2 exactly when a run was opened,
+    # leaving the required context pending on every successful evaluation.
+    if ! mcg_has "$mcg_evt" "steps.open.outputs.id != ''"; then
+      echo "FAIL: the phase-2 step must run when phase 1 DID open a run"
+      echo "      (steps.open.outputs.id != ''). Inverting that condition leaves the"
+      echo "      required context pending on every evaluation that succeeded."
       FAILED=1
     fi
     if ! mcg_has "$mcg_evt" '!cancelled()'; then
