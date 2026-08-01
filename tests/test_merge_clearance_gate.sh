@@ -1593,7 +1593,7 @@ mcg22_case() {  # <name> <perl-program-or-empty> <expect: fail|pass> [expected-F
 }
 
 # A — no POST at all.
-mcg22_case A 's{(.*)gh api -X POST "repos/\$REPO/check-runs" \\}{$1true \\}s' fail "must open the required check_run"
+mcg22_case A 's{(  merge-clearance-gate:.*?)gh api -X POST "repos/\$REPO/check-runs" \\}{$1true \\}s' fail "must open the required check_run"
 # B — the POST survives only as a full-line comment.
 mcg22_case B 's{^(\s*)id=\$\(gh api -X POST}{$1# id=\$(gh api -X POST}m' fail "must open the required check_run"
 # C — no job-scoped checks: write.
@@ -1622,7 +1622,7 @@ mcg22_case K 's{HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}}{HEAD_S
 # scope, rather than a count of either half.
 # L — delete a producer's POST but keep its CHECK_NAME env. A name-count
 #     assertion still sees three and passes (Codex P2 on #849).
-mcg22_case L 's{(.*)gh api -X POST "repos/\$REPO/check-runs"}{$1true #}s' fail 'must POST a check_run under CHECK_NAME'
+mcg22_case L 's{(  scheduled-sweep:.*?)gh api -X POST "repos/\$REPO/check-runs"}{$1true #}s' fail 'must POST a check_run under CHECK_NAME'
 # M — keep a POST but publish a DIFFERENT check name. A POST-count assertion
 #     still sees three and passes, while that trigger path has stopped
 #     refreshing this required context (CodeRabbit Major on #849).
