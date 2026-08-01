@@ -1130,6 +1130,7 @@ jobs:
           CHECK_NAME: "Merge clearance gate"
         run: |
           scripts/merge-clearance-gate.sh "$PR" "$REPO"
+          rc=$?
           gh api -X POST "repos/$REPO/check-runs" \
             -f name="$CHECK_NAME" -f head_sha="$head_sha"
   # Sweep job — present so the >=3-producer CHECK_NAME assertion (#845) is
@@ -1147,6 +1148,7 @@ jobs:
     steps:
       - run: |
           scripts/merge-clearance-gate.sh "$PR" "$REPO"
+          rc=$?
           gh api -X POST "repos/$REPO/check-runs" \
             -f name="$CHECK_NAME" -f head_sha="$head_sha"
 WF
@@ -1182,11 +1184,14 @@ write_wf_gate_job() {
         id: gate
         run: |
           output=$(scripts/merge-clearance-gate.sh "$PR_NUMBER" "$REPO")
+          rc=$?
           case "$output" in
             *"Merge clearance: PASS"*) verdict=pass ;;
           esac
       - name: Close the required check_run
         if: ${{ !cancelled() && steps.open.outputs.id != '' }}
+        env:
+          CHECK_ID: ${{ steps.open.outputs.id }}
         run: |
           case "$RC" in
             0) conclusion="success" ;;

@@ -263,6 +263,16 @@ if [ -f "$WORKFLOW" ]; then
       echo "      a failed PATCH — fail CLOSED instead of leaving a stale verdict standing."
       FAILED=1
     fi
+    # The PATCH must target the run phase 1 opened (Codex P2 on #849).
+    # Binding CHECK_ID to something else — github.run_id, say — satisfies an
+    # endpoint-prefix check while the PATCH 404s through its retries and the
+    # required context stays pending until a later sweep supersedes it.
+    if ! mcg_has "$mcg_evt" 'CHECK_ID: ${{ steps.open.outputs.id }}'; then
+      echo "FAIL: the phase-2 step must bind CHECK_ID to \${{ steps.open.outputs.id }},"
+      echo "      the run phase 1 opened. Any other identifier makes the PATCH miss and"
+      echo "      leaves the required context pending (#843)."
+      FAILED=1
+    fi
     if ! mcg_has "$mcg_evt" 'gh api -X PATCH "repos/$REPO/check-runs/'; then
       echo "FAIL: the merge-clearance-gate job must close the check_run it opened (#843"
       echo "      phase 2). Without the PATCH the required context stays PENDING forever."
@@ -325,10 +335,21 @@ if [ -f "$WORKFLOW" ]; then
       fi
       # A check_run POST without head_sha is rejected by GitHub outright, so a
       # producer missing it publishes nothing at all (Codex P2 on #849).
-      if ! mcg_has "$mcg_pblock" '-f head_sha='; then
-        echo "FAIL: the '$mcg_producer' job must POST with -f head_sha=; the Checks"
-        echo "      API rejects a create-check-run request without it, so that path"
-        echo "      would publish nothing."
+      # The VALUE, not just the flag (Codex P2 on #849). -f head_sha="${{
+      # github.sha }}" satisfies a presence check while posting against the
+      # workflow commit rather than the PR head, so the no-event transitions
+      # stop refreshing the context on the commit protection evaluates.
+      # The value must be a RESOLVED shell variable — the event job carries it
+      # as $HEAD_SHA, the sweep and dispatch resolve $head_sha per PR — and
+      # must not be a workflow-level expression. Matching the exact variable
+      # name would be wrong here: the three jobs legitimately differ, and the
+      # property is "a per-PR head", not "this spelling".
+      if ! grep -qE -- '-f head_sha="\$[A-Za-z_]' <<<"$mcg_pblock" \
+         || mcg_has "$mcg_pblock" '-f head_sha="${{'; then
+        echo "FAIL: the '$mcg_producer' job must POST head_sha as the per-PR head it"
+        echo "      resolved (a shell variable), not a workflow expression. The Checks"
+        echo "      API rejects a create-check-run without head_sha at all, and a"
+        echo "      workflow-level SHA publishes to a commit protection never consults."
         FAILED=1
       fi
       # And the conclusion has to come from the gate, not a constant. Without
@@ -338,6 +359,16 @@ if [ -f "$WORKFLOW" ]; then
         echo "FAIL: the '$mcg_producer' job must invoke scripts/merge-clearance-gate.sh"
         echo "      and derive its published conclusion from the result — otherwise it"
         echo "      publishes a verdict it never evaluated."
+        FAILED=1
+      fi
+      # Invoking the gate is not the same as HEEDING it (Codex P2 on #849).
+      # Replacing rc=$? with rc=0 leaves the invocation in place while the
+      # conclusion becomes a constant, so a blocked PR publishes success.
+      if ! mcg_has "$mcg_pblock" 'rc=$?'; then
+        echo "FAIL: the '$mcg_producer' job must capture the gate's exit status"
+        echo "      (rc=\$?) and derive its conclusion from it. Calling the gate and"
+        echo "      then publishing a constant is worse than not calling it, because"
+        echo "      the verdict looks evaluated."
         FAILED=1
       fi
     done
