@@ -103,29 +103,30 @@ jobs:
   merge-clearance-gate:
     name: Merge clearance gate
     runs-on: ubuntu-latest
-    # Serialize event-driven publications per (PR, head) (Codex P1 on #843).
-    # Two same-head events — an approval and its dismissal, say — otherwise
-    # each open their own check run, and the OLDER evaluation can PATCH last
-    # and leave its stale conclusion standing: a stale success makes the
-    # context look clear after clearance was revoked, and the reverse falsely
-    # blocks a cleared PR. `POST /check-runs` has no conditional write, so
-    # ordering has to come from not running them concurrently.
+    # NO `concurrency:` block here, and that is load-bearing (#843, proven).
     #
-    # cancel-in-progress: FALSE deliberately. The cancelling form would leave
-    # `cancelled` native check runs on the required context, and `cancelled`
-    # is not one of SUCCESS/SKIPPED/NEUTRAL — a brand-new permanent-blocker
-    # class. Queueing has no such hazard: a run cancelled while still QUEUED
-    # never reached phase 1, so it published nothing at all.
+    # Serializing per (PR, head) would close the clobber race — two same-head
+    # events where the OLDER evaluation PATCHes last and leaves a stale
+    # conclusion standing. `cancel-in-progress: false` looks like the safe form
+    # of it, because a run cancelled while still QUEUED never reaches phase 1
+    # and so publishes nothing through the Checks API.
     #
-    # Job-scoped, NOT workflow-scoped: the sweep walks up to 500 PRs in one
-    # job and must never be serialized behind a single PR's events.
+    # That reasoning is WRONG, and it was measured rather than argued. GitHub
+    # concurrency cancels the PENDING member when a third event queues, and
+    # Actions still materialises that run's NATIVE job check — named for this
+    # required context, concluding `cancelled`. `cancelled` is not one of
+    # SUCCESS / SKIPPED / NEUTRAL, so it blocks, and being job-native lineage
+    # it cannot be retired through the Checks-API slot. Adding the block
+    # produced exactly that on this PR's own head: check run 91305386162,
+    # `completed / cancelled`, job-native, on 693aefc3.
     #
-    # This closes event-vs-event only. An event still races the */15 sweep and
-    # the dispatch path, which are separate jobs; the native producer carries
-    # the correct verdict for the later run in that case.
-    concurrency:
-      group: merge-clearance-gate-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
-      cancel-in-progress: false
+    # So the block trades a transient wrong-verdict window for a PERMANENT
+    # blocker, on a PR that emits several review events in quick succession.
+    # The clobber race stays open and is recorded as residual risk instead:
+    # the native producer still carries the correct verdict for the later run,
+    # and the */15 sweep re-evaluates. Serialization is only safe once the
+    # required context has a single producer that is not a cancelable job.
+    #
     # #841: this job now ALSO publishes its verdict as a Checks-API check_run
     # under the required-check name, so `checks: write` is needed here.
     # Job-level `permissions:` REPLACES the workflow map above wholesale, so
