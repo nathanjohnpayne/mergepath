@@ -224,6 +224,11 @@ case "$endpoint" in
         # rate-limit notice, so publication is NOT complete.
         printf '[{"id":9981,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
         ;;
+      probe_narration_after_review|probe_narration_over_notice)
+        # #833: HEAD review exists; the later bot comments include a
+        # status-probe narration reply (issues endpoint below).
+        printf '[{"id":9983,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        ;;
       probe_reviews_api_failure)
         # #814 / Phase 4b P2 on #823: the reviews fetch fails while the probe
         # is deciding. Must surface as rc 3 (infra), never as a clean rc 7.
@@ -357,6 +362,20 @@ case "$endpoint" in
         ;;
       probe_notice_after_review)
         printf '[{"id":9982,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n\\n> [!WARNING]\\n> ## Review limit reached"}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_narration_after_review)
+        # #833: the ONLY bot comment after the HEAD review object is a
+        # status-probe narration reply. Pre-fix, the publication scan latched
+        # classify_comment's status_probe class straight into probe.observed —
+        # a value the documented enum deliberately excludes (seen live on
+        # #852 while the summary publication lagged the review object).
+        printf '[{"id":9984,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- CodeRabbit review command invocation: status -->\\n`@nathanjohnpayne`: Here is a summary of where things stand.\\n\\n### Open CodeRabbit Threads\\nStill checking."}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_narration_over_notice)
+        # #833 skip-not-blank: narration is the NEWEST row and a rate-limit
+        # notice sits beneath it, both after the review object. The narration
+        # skip must fall through to the notice, not blank the whole latch.
+        printf '[{"id":9985,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n\\n> [!WARNING]\\n> ## Review limit reached"},{"id":9986,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:08Z","updated_at":"2026-06-04T00:00:08Z","body":"<!-- CodeRabbit review command invocation: status -->\\n`@nathanjohnpayne`: Here is a summary of where things stand.\\n\\n### Open CodeRabbit Threads\\nStill checking."}]\n' "$bot" "$reply_time" "$reply_time" "$bot"
         ;;
       probe_reviews_api_failure)
         # A classifiable summary, so the probe reaches the reviews fetch that
@@ -1141,6 +1160,34 @@ test_probe_notice_after_review_is_not_complete() {
     "a rate-limit notice after the review does not complete publication"
 }
 
+test_probe_narration_after_review_is_awaiting_summary() {
+  # #833. The review-object publication scan classifies every later bot
+  # comment, and classify_comment can return status_probe — so a narration
+  # reply landing after the HEAD review object leaked
+  # `probe.observed: "status_probe"`, a value the documented enum
+  # deliberately excludes (observed live on #852 while the summary
+  # publication lagged). Narration says nothing about publication state;
+  # the contract value for review-present-summary-pending is
+  # awaiting-summary.
+  local dir rc
+  dir=$(make_case probe-narration-after 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" probe_narration_after_review)
+  assert_probe_not_yet "$dir" "$rc" awaiting-summary \
+    "narration after the review object reads awaiting-summary, never status_probe (#833)"
+}
+
+test_probe_narration_over_notice_surfaces_the_notice() {
+  # #833 companion: the narration skip must not blank the whole latch. With
+  # a rate-limit notice BENEATH the newest-row narration (both after the
+  # review object), the observed class is the notice's — the same value the
+  # narration-free probe_notice_after_review case pins.
+  local dir rc
+  dir=$(make_case probe-narration-over-notice 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" probe_narration_over_notice)
+  assert_probe_not_yet "$dir" "$rc" rate_limit \
+    "narration atop a rate-limit notice still surfaces rate_limit (#833)"
+}
+
 test_probe_env_var_equals_flag() {
   local dir rc
   dir=$(make_case probe-envvar 600 true 30 3 2)
@@ -1382,6 +1429,8 @@ test_probe_summary_lagging_head_review_is_not_yet
 test_probe_reviews_api_failure_is_infra_not_clean
 test_probe_summary_only_marker_is_findings
 test_probe_notice_after_review_is_not_complete
+test_probe_narration_after_review_is_awaiting_summary
+test_probe_narration_over_notice_surfaces_the_notice
 test_probe_evidence_does_not_expire
 test_probe_env_var_equals_flag
 test_probe_terminal_review_matches_polling_verdict
