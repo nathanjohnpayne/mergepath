@@ -476,15 +476,26 @@ p4b_barrier_trigger_posted() {
 # scoping keeps round 1's per-pause-note keying: an old episode's bare
 # resume predates the current note's fresh_at and does not suppress a new
 # recovery. Neither timestamp is pusher-controlled.
+#
+# Author scope: the marker arm stays pinned to the SELECTED reviewer — the
+# marker proves this automation spent the key. The bare arm accepts every
+# identity in available_reviewers (plus the selected one), matching
+# coderabbit-wait.sh's own allowlist: its resume may have been posted under
+# a different trusted identity (the authoring session's PAT vs this Phase 4b
+# session's), and a single-identity filter posts a second resume over it
+# (Codex P2, round 3).
 p4b_barrier_write_count() {
-  local m
+  local m trusted
   m="$(p4b_barrier_marker "$1" "$2")"
-  printf '%s' "${4:-[]}" | jq --arg m "$m" --arg who "${3:-}" --arg since "${5:-}" '
-    [.[]? | select((.user.login // "") == $who)
-      | select(((.body // "") | contains($m))
-               or ($since != ""
-                   and ((.created_at // "") >= $since)
-                   and (((.body // "") | split("\n")[0]) | test("^@[A-Za-z0-9_-]+ resume[[:space:]]*$"))))]
+  trusted="$(p4b_available_reviewers 2>/dev/null | jq -R . 2>/dev/null | jq -sc . 2>/dev/null || printf '[]')"
+  case "$trusted" in '['*) ;; *) trusted='[]' ;; esac
+  printf '%s' "${4:-[]}" | jq --arg m "$m" --arg who "${3:-}" --arg since "${5:-}" --argjson revs "$trusted" '
+    [.[]? | select(
+        (((.user.login // "") == $who) and ((.body // "") | contains($m)))
+        or ($since != ""
+            and ((.user.login // "") as $l | (($l == $who) or ($revs | index($l) != null)))
+            and ((.created_at // "") >= $since)
+            and (((.body // "") | split("\n")[0]) | test("^@[A-Za-z0-9_-]+ resume[[:space:]]*$"))))]
     | length' 2>/dev/null || printf '0'
 }
 

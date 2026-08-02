@@ -2991,6 +2991,21 @@ chmod +x "$WORK/wp-bin/gh"
 : >"$WORK/wp-writes.log"
 [ "$(_resume "$(_pj paused 999)")" = "already-resumed" ] || bad="$bad wait-resume-not-recognised"
 [ ! -s "$WORK/wp-writes.log" ] || bad="$bad interop-delivered"
+# ...and one posted under a DIFFERENT trusted identity (the authoring
+# session's PAT vs this Phase 4b session's) counts too, per
+# available_reviewers — while an identity outside the allowlist never does.
+cat >"$WORK/wp-policy.yml" <<'EOF2'
+available_reviewers:
+  - other-rev
+EOF2
+jq -n '[{user:{login:"other-rev"},created_at:"2026-06-04T12:30:00Z",body:"@coderabbitai resume"}]' >"$WORK/wp-comments.json"
+: >"$WORK/wp-writes.log"
+_out="$( ( export MERGEPATH_REVIEW_POLICY_PATH="$WORK/wp-policy.yml"; _resume "$(_pj paused 555)" ) )"
+[ "$_out" = "already-resumed" ] || bad="$bad other-identity-not-recognised"
+jq -n '[{user:{login:"randomer"},created_at:"2026-06-04T12:30:00Z",body:"@coderabbitai resume"}]' >"$WORK/wp-comments.json"
+: >"$WORK/wp-writes.log"
+_out="$( ( export MERGEPATH_REVIEW_POLICY_PATH="$WORK/wp-policy.yml"; _resume "$(_pj paused 556)" ) )"
+[ "$_out" = "resumed" ] || bad="$bad untrusted-identity-counted"
 if [ -z "$bad" ]; then
   pass "#847: resume fires only on an identified pause, dedups on the pause note across heads, never on the trigger marker"
 else
