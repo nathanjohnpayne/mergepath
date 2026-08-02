@@ -655,6 +655,17 @@ def is_falsy_if(value):
     wrapped = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", text)
     if wrapped:
         text = wrapped.group(1)
+        # Inside an expression, GitHub's falsy LITERALS are a closed set:
+        # false, null, the empty string, and numeric zero in any spelling
+        # (-0, 0.0, 0e0). Normalising quotes and numeric value terminates the
+        # set — this is not an enumeration that can drift.
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+            text = text[1:-1]
+        try:
+            if float(text) == 0:
+                return True
+        except ValueError:
+            pass
     return text.lower() in FALSY
 
 failures = []
@@ -691,6 +702,14 @@ class StrictLoader(yaml.SafeLoader):
         seen = set()
         for key_node, _value_node in node.value:
             key = self.construct_object(key_node, deep=deep)
+            if isinstance(key, (dict, list)):
+                # A complex (unhashable) key would TypeError on the set
+                # membership below, which the outer except still catches — but
+                # a named parse error beats an incidental one, and Actions
+                # rejects complex keys in workflows anyway.
+                raise yaml.constructor.ConstructorError(
+                    None, None,
+                    "found unhashable (complex) mapping key", key_node.start_mark)
             if key in seen:
                 raise yaml.constructor.ConstructorError(
                     None, None,

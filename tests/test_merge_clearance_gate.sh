@@ -1704,6 +1704,16 @@ mcg22_case c2 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ 0 \}\
 #      pass a condition nobody can prove eligible.
 mcg22_case c3 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: null}sm' \
   fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# c4 — numeric-zero spellings inside the expression wrapper. GitHub evaluates
+#      -0 falsy; numeric normalisation must catch every zero spelling, not an
+#      enumerated literal list.
+mcg22_case c4 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ -0 \}\}}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# i — a complex (sequence) mapping key. Unhashable in Python; must surface as
+#     a NAMED parse error, not an incidental TypeError, and Actions rejects
+#     complex keys in workflows anyway.
+mcg22_case i 's{^  scheduled-sweep:$}{  ? [scheduled-sweep]\n  :}m' \
+  fail 'does not parse as YAML'
 unset MCG_TAG
 
 # g — positive control on the REAL file. Case I uses a synthesized header; this
