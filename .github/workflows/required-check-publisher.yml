@@ -16,9 +16,14 @@ name: Required Check Publisher
 
 on:
   workflow_run:
-    # Must match the three gate workflows' top-level `name:` fields exactly;
-    # a rename there silently orphans this trigger (fence assertion, PR 2).
-    workflows: ["Merge Clearance Gate", "Codex P1 Gate", "CodeRabbit Severity Gate"]
+    # ONE parent, not three (cross-agent round 2 on #867): the Merge
+    # Clearance Gate trigger set is a measured strict superset of both
+    # siblings' (it adds labeled/unlabeled and repository_dispatch), so a
+    # single delivery per PR event carries every refresh signal and the
+    # per-event fan-in stays at one pass instead of three. Must match that
+    # workflow's top-level `name:` exactly; a rename there silently orphans
+    # this trigger (fence assertion, PR 2).
+    workflows: ["Merge Clearance Gate"]
     # in_progress is the rerun cue: a rerun re-uses the run, so `requested`
     # never re-fires, and without it no pending entry would cover the
     # re-evaluation window (cross-agent P1 on #867). Ordinary runs emit
@@ -57,17 +62,30 @@ jobs:
   # which nothing requires.
   open:
     name: open
-    # One burst per PR event, not three: gate on the broadest-triggered
-    # parent. `requested` fires at parent-run creation, before its jobs
-    # execute, so pending entries land within seconds of the PR event.
+    # `requested` fires at parent-run creation, before its jobs execute, so
+    # pending entries land within seconds of the PR event; `in_progress`
+    # covers reruns. The workflows: list above already narrows the parent.
     if: >-
       github.event_name == 'workflow_run' &&
-      (github.event.action == 'requested' || github.event.action == 'in_progress') &&
-      github.event.workflow.name == 'Merge Clearance Gate'
+      (github.event.action == 'requested' || github.event.action == 'in_progress')
     runs-on: ubuntu-latest
+    # Same queue as publish (cross-agent round 2 on #867): a groupless open
+    # could post its pending AROUND a mid-flight older pass, which would
+    # then retire it with a stale verdict. Queued behind that pass, the
+    # hold lands after the stale write — and if a queued open is itself the
+    # cancelled member, its replacement (the fresh publish pass) is the
+    # next thing the queue runs.
+    concurrency:
+      group: rcp-publish
+      cancel-in-progress: false
     permissions:
       contents: read
       pull-requests: read
+      # actions: read for the parent-status lookup below — without it the
+      # guard 403s into its fail-open branch on restricted-default repos
+      # (cross-agent round 2; same requirement documented in
+      # auto-clear-blocking-labels.yml).
+      actions: read
       checks: write
     steps:
       - name: Open pending entries on the event head
@@ -143,9 +161,9 @@ jobs:
     # Safe on THIS file and not on the gate workflows — the measured
     # difference (#843): when a third member queues, the cancelled PENDING
     # member materialises a native check named `publish`, which nothing
-    # requires; the loss is that trigger's evaluation, whose head stays
-    # pending at most one sweep interval, because the sweep is a member of
-    # this same queue and covers every open PR.
+    # requires. Cancellation is COALESCING here, not loss: every pass
+    # evaluates every open PR, so whichever member survives subsumes the
+    # work of each cancelled one (cross-agent round 2).
     concurrency:
       group: rcp-publish
       cancel-in-progress: false
@@ -196,23 +214,33 @@ jobs:
             esac
           fi
 
+          # Every pass evaluates EVERY open PR (cross-agent round 2 on
+          # #867): the queue holds at most one pending member and cancels
+          # the rest, so a pass that covered only its own head would turn
+          # each cancellation into a lost re-evaluation — under sustained
+          # traffic a displaced head (or the displaced sweep) could stay
+          # pending indefinitely. With full coverage, whichever member
+          # survives subsumes the work of every cancelled one. The event
+          # head goes first so its verdict lands inside the latency budget;
+          # a dispatch narrows to its named PR (the fast manual remedy).
           targets=""
-          if [ -n "$RUN_HEAD" ]; then
-            targets=$(awk -F'\t' -v h="$RUN_HEAD" '$2 == h' <<<"$prs_raw" || true)
-          elif [ -n "$requested_pr" ]; then
+          if [ -n "$requested_pr" ]; then
             targets=$(awk -F'\t' -v n="$requested_pr" '$1 == n' <<<"$prs_raw" || true)
+          elif [ -n "$RUN_HEAD" ]; then
+            targets=$({ awk -F'\t' -v h="$RUN_HEAD" '$2 == h' <<<"$prs_raw"; \
+                        awk -F'\t' -v h="$RUN_HEAD" '$2 != h' <<<"$prs_raw"; } || true)
           else
             targets="$prs_raw"
           fi
 
-          if [ -z "$targets" ]; then
-            if [ -n "$RUN_HEAD" ]; then
+          if [ -n "$RUN_HEAD" ] && \
+              ! grep -qF "$RUN_HEAD" <<<"$prs_raw"; then
               # The event head matches no open PR: the parent ran on main's
               # tip (schedule, phase 1 opened nothing) or the PR's head
               # moved on. Close — never abandon — anything phase 1 DID open
               # on that head: a red pinned to a superseded head is invisible
               # to branch protection; an abandoned in_progress reads as a
-              # hang.
+              # hang. The pass still evaluates every open PR below.
               for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
                 # --paginate: page 1 alone can miss a pending run on a head
                 # with many same-name suites, and a truncated read here is a
@@ -233,9 +261,10 @@ jobs:
                 fi
               done
               echo "Head $RUN_HEAD matches no open PR; closed any pending entries on it."
-            else
-              echo "No matching open PRs; nothing to publish."
-            fi
+          fi
+
+          if [ -z "$targets" ]; then
+            echo "No matching open PRs; nothing to publish."
             exit 0
           fi
 
