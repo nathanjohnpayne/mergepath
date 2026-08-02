@@ -2800,62 +2800,73 @@ fi
 # never satisfy each other's already-spent test.
 
 # Marker distinctness (#847): kind is part of the spelling, trigger spelling
-# is byte-identical to the pre-#847 literal.
+# is byte-identical to the pre-#847 literal, resume keys on the pause note.
 bad=""
 [ "$(p4b_barrier_marker trigger deadbee)" = '<!-- mergepath-coderabbit-trigger:deadbee -->' ] || bad="$bad trigger-spelling"
-[ "$(p4b_barrier_marker resume deadbee)" = '<!-- mergepath-coderabbit-resume:deadbee -->' ]   || bad="$bad resume-spelling"
-_rm="[{\"user\":{\"login\":\"rev-bot\"},\"body\":\"@coderabbitai resume $(p4b_barrier_marker resume deadbee)\"}]"
+[ "$(p4b_barrier_marker resume pause-771)" = '<!-- mergepath-coderabbit-resume:pause-771 -->' ] || bad="$bad resume-spelling"
+_rm="[{\"user\":{\"login\":\"rev-bot\"},\"body\":\"@coderabbitai resume $(p4b_barrier_marker resume pause-771)\"}]"
 _tm="[{\"user\":{\"login\":\"rev-bot\"},\"body\":\"@coderabbitai review $(p4b_barrier_marker trigger deadbee)\"}]"
-p4b_barrier_write_posted resume deadbee rev-bot "$_rm"    || bad="$bad resume-marker-missed"
-! p4b_barrier_write_posted trigger deadbee rev-bot "$_rm" || bad="$bad resume-satisfies-trigger"
-! p4b_barrier_write_posted resume deadbee rev-bot "$_tm"  || bad="$bad trigger-satisfies-resume"
-[ "$(p4b_barrier_write_count resume deadbee rev-bot "[$( printf '%s' "$_rm" | jq -c '.[0]'),$(printf '%s' "$_rm" | jq -c '.[0]')]")" = "2" ] || bad="$bad count"
+p4b_barrier_write_posted resume pause-771 rev-bot "$_rm"   || bad="$bad resume-marker-missed"
+! p4b_barrier_write_posted trigger deadbee rev-bot "$_rm"  || bad="$bad resume-satisfies-trigger"
+! p4b_barrier_write_posted resume pause-771 rev-bot "$_tm" || bad="$bad trigger-satisfies-resume"
+[ "$(p4b_barrier_write_count resume pause-771 rev-bot "[$( printf '%s' "$_rm" | jq -c '.[0]'),$(printf '%s' "$_rm" | jq -c '.[0]')]")" = "2" ] || bad="$bad count"
 if [ -z "$bad" ]; then
   pass "#847: resume and trigger markers are distinct and can never satisfy each other"
 else
   fail "#847: marker distinctness wrong:$bad"
 fi
 
-# Claim primitives (#846): one winner, decline on contention or an unusable
-# state dir, release re-arms, clear_pending drops both kinds.
+# Claim primitives (#846): one winner, ownership is the winner's PID, only
+# the next claimant breaks a dead owner's claim, and clear_pending never
+# touches claims — an open/drift outcome in one invocation must not delete
+# another invocation's LIVE claim mid-region (Codex P2, round 1).
 bad=""
 _cp="$(p4b_barrier_claim_path owner/repo 99 headsha trigger)"
 case "$_cp" in *trigger.claim) ;; *) bad="$bad path-kind" ;; esac
 p4b_barrier_claim "$_cp"     || bad="$bad first-claim"
-p4b_barrier_claim "$_cp"     && bad="$bad double-claim"
+p4b_barrier_claim "$_cp"     && bad="$bad live-owner-stolen"
+p4b_barrier_clear_pending owner/repo 99 headsha
+[ -d "$_cp" ] || bad="$bad clear-removed-live-claim"
 p4b_barrier_release "$_cp"
 p4b_barrier_claim "$_cp"     || bad="$bad reclaim-after-release"
-p4b_barrier_claim "$(p4b_barrier_claim_path owner/repo 99 headsha resume)" || bad="$bad resume-claim-blocked-by-trigger"
-p4b_barrier_clear_pending owner/repo 99 headsha
-[ ! -d "$_cp" ] || bad="$bad clear-left-trigger-claim"
-[ ! -d "$(p4b_barrier_claim_path owner/repo 99 headsha resume)" ] || bad="$bad clear-left-resume-claim"
+p4b_barrier_release "$_cp"
+# A dead owner's claim is broken by the NEXT claimant, and only then.
+mkdir -p "$_cp"; ( : ) & _deadpid=$!; wait "$_deadpid"; printf '%s\n' "$_deadpid" >"$_cp/pid"
+p4b_barrier_claim "$_cp"     || bad="$bad dead-owner-not-broken"
+p4b_barrier_release "$_cp"
+# A claim with no readable owner is treated as live (fail toward declining).
+mkdir -p "$_cp"
+p4b_barrier_claim "$_cp"     && bad="$bad ownerless-stolen"
+p4b_barrier_release "$_cp"
 ( P4B_ACCT_STATE_DIR=/dev/null/nope p4b_barrier_claim "$(P4B_ACCT_STATE_DIR=/dev/null/nope p4b_barrier_claim_path o/r 1 h trigger)" ) \
   && bad="$bad unusable-dir-claimed"
 if [ -z "$bad" ]; then
-  pass "#846: claim is single-winner, kind-scoped, released by clear_pending, declined on an unusable dir"
+  pass "#846: claim is single-winner and PID-owned; only the next claimant breaks a dead owner; clear_pending leaves live claims"
 else
   fail "#846: claim primitives wrong:$bad"
 fi
 
 # The claimed write core, end to end against stubs. The wrapper stub records
-# every delivered write; the gh stub's read delay is what makes the
-# concurrency below deterministic without tight timing.
+# one LINE per delivered write; the gh stub BLOCKS until told to go, which is
+# what makes the concurrency test below deterministic on any runner — no
+# fixed sleeps, every step gated on an observable file (Codex P2, round 1).
 mkdir -p "$WORK/wp-bin" "$WORK/wp-state"
 cat >"$WORK/wp-bin/gh" <<EOF
 #!/bin/sh
-sleep 1
+if [ -e "$WORK/wp-hold" ]; then
+  n=0
+  while [ ! -e "$WORK/wp-go" ] && [ "\$n" -lt 100 ]; do sleep 0.1; n=\$((n+1)); done
+fi
 echo "[]"
 EOF
 cat >"$WORK/wp-wrapper.sh" <<EOF
 #!/bin/sh
-# One LINE per delivered write, newlines in the body flattened — the counter
-# below counts invocations, and a multi-line body must not inflate it.
 printf 'WRITE: %s\\n' "\$(printf '%s' "\$*" | tr '\\n' ' ')" >>"$WORK/wp-writes.log"
 exit 0
 EOF
 chmod +x "$WORK/wp-bin/gh" "$WORK/wp-wrapper.sh"
 
-_write() { # <kind> <head> [dry]
+_write() { # <kind> <key> [dry]
   (
     export P4B_ACCT_STATE_DIR="$WORK/wp-state"
     export P4B_GH_AS_REVIEWER="$WORK/wp-wrapper.sh"
@@ -2864,18 +2875,26 @@ _write() { # <kind> <head> [dry]
   )
 }
 
-# Two concurrent invocations on one head: the 1s read delay holds the winner
-# inside the claimed region while the loser arrives, so exactly one write is
-# delivered and the loser names the claim as its reason. Remove the claim and
-# this test fails with two delivered writes — the #846 race itself.
+# Two concurrent invocations on one head. A takes the claim and blocks inside
+# the claimed region (the gh stub waits for wp-go); the test starts B only
+# once A's claim is OBSERVABLY held, so B always loses; then A is released.
+# Exactly one write is delivered and the loser names the claim.
 bad=""
 : >"$WORK/wp-writes.log"
+rm -f "$WORK/wp-go"; : >"$WORK/wp-hold"
 _write trigger race1 >"$WORK/wp-out-a" &
 _wp_a=$!
-sleep 0.3
+_n=0
+while [ ! -d "$WORK/wp-state/phase-4b-barrier/owner-repo-pr7-race1.trigger.claim" ] && [ "$_n" -lt 100 ]; do
+  sleep 0.1; _n=$((_n+1))
+done
+[ -d "$WORK/wp-state/phase-4b-barrier/owner-repo-pr7-race1.trigger.claim" ] || bad="$bad claim-never-observed"
 _write trigger race1 >"$WORK/wp-out-b" &
 _wp_b=$!
-wait "$_wp_a" "$_wp_b"
+wait "$_wp_b"
+: >"$WORK/wp-go"
+wait "$_wp_a"
+rm -f "$WORK/wp-hold" "$WORK/wp-go"
 _delivered="$(grep -c '^WRITE:' "$WORK/wp-writes.log" 2>/dev/null || true)"
 [ "${_delivered:-0}" = "1" ] || bad="$bad delivered=$_delivered"
 grep -q 'triggered' "$WORK/wp-out-a" || bad="$bad winner-output"
@@ -2916,46 +2935,42 @@ else
   fail "#846: failure directions wrong:$bad"
 fi
 
-# The resume path (#847): fires only on observed=paused, posts `@<bot> resume`
-# through the same wrapper, dedups on its own marker.
+# The resume path (#847): fires only on observed=paused WITH an identified
+# pause note, posts `@<bot> resume` through the same wrapper, dedups on the
+# pause note's id — durable across pushes — never on the head.
 bad=""
 printf '#!/bin/sh\necho "[]"\n' >"$WORK/wp-bin/gh"
 chmod +x "$WORK/wp-bin/gh"
-_resume() { # <probe_json> [dry] [head]
+_resume() { # <probe_json> [dry]
   (
     export P4B_ACCT_STATE_DIR="$WORK/wp-state"
     export P4B_GH_AS_REVIEWER="$WORK/wp-wrapper.sh"
     export PATH="$WORK/wp-bin:$PATH"
-    p4b_barrier_maybe_resume owner/repo 7 "${3:-rhead1}" rev-bot "$1" "${2:-false}"
+    p4b_barrier_maybe_resume owner/repo 7 rhead1 rev-bot "$1" "${2:-false}"
   )
 }
 : >"$WORK/wp-writes.log"
-[ "$(_resume '{"probe":{"observed":"none"}}')" = "skipped" ]        || bad="$bad none-not-skipped"
-[ "$(_resume '{"probe":{"observed":"rate_limit"}}')" = "skipped" ]  || bad="$bad ratelimit-not-skipped"
-[ "$(_resume '{"probe":{"observed":"paused"}}' true)" = "would-resume" ] || bad="$bad dry-not-would"
+[ "$(_resume '{"probe":{"observed":"none"},"review":{"id":771}}')" = "skipped" ]       || bad="$bad none-not-skipped"
+[ "$(_resume '{"probe":{"observed":"rate_limit"},"review":{"id":771}}')" = "skipped" ] || bad="$bad ratelimit-not-skipped"
+[ "$(_resume '{"probe":{"observed":"paused"}}')" = "resume-unidentified" ]             || bad="$bad no-id-not-declined"
+[ "$(_resume '{"probe":{"observed":"paused"},"review":{"id":771}}' true)" = "would-resume" ] || bad="$bad dry-not-would"
 [ ! -s "$WORK/wp-writes.log" ] || bad="$bad gated-cases-delivered"
-[ "$(_resume '{"probe":{"observed":"paused"}}')" = "resumed" ] || bad="$bad paused-not-resumed"
+[ "$(_resume '{"probe":{"observed":"paused"},"review":{"id":771}}')" = "resumed" ] || bad="$bad paused-not-resumed"
 grep -q 'resume' "$WORK/wp-writes.log" || bad="$bad resume-verb-missing"
 grep -q 'review' "$WORK/wp-writes.log" && bad="$bad resume-posted-review"
-# A trigger marker on the timeline must NOT satisfy the resume's dedup, and
-# the resume marker must: the two write classes stay separate end to end.
+# A spent pause note stays spent across a NEW head; a NEW pause note on the
+# same PR is a fresh recovery. The trigger's head marker never interferes.
 cat >"$WORK/wp-bin/gh" <<EOF
 #!/bin/sh
-printf '[{"user":{"login":"rev-bot"},"body":"x $(p4b_barrier_marker trigger rhead2)"}]\n'
+printf '[{"user":{"login":"rev-bot"},"body":"x $(p4b_barrier_marker resume pause-771)"},{"user":{"login":"rev-bot"},"body":"x $(p4b_barrier_marker trigger rhead1)"}]\n'
 EOF
 chmod +x "$WORK/wp-bin/gh"
 : >"$WORK/wp-writes.log"
-[ "$(_resume '{"probe":{"observed":"paused"}}' false rhead2)" = "resumed" ] || bad="$bad trigger-marker-blocked-resume"
-cat >"$WORK/wp-bin/gh" <<EOF
-#!/bin/sh
-printf '[{"user":{"login":"rev-bot"},"body":"x $(p4b_barrier_marker resume rhead3)"}]\n'
-EOF
-chmod +x "$WORK/wp-bin/gh"
-: >"$WORK/wp-writes.log"
-[ "$(_resume '{"probe":{"observed":"paused"}}' false rhead3)" = "already-resumed" ] || bad="$bad resume-not-deduped"
-[ ! -s "$WORK/wp-writes.log" ] || bad="$bad deduped-but-delivered"
+[ "$(_resume '{"probe":{"observed":"paused"},"review":{"id":771}}')" = "already-resumed" ] || bad="$bad pause-not-deduped"
+[ "$(_resume '{"probe":{"observed":"paused"},"review":{"id":888}}')" = "resumed" ] || bad="$bad new-pause-blocked"
+[ ! -s "$WORK/wp-writes.log" ] && bad="$bad new-pause-not-delivered"
 if [ -z "$bad" ]; then
-  pass "#847: resume fires only on paused, posts the resume verb, and dedups on its own marker only"
+  pass "#847: resume fires only on an identified pause, dedups on the pause note across heads, never on the trigger marker"
 else
   fail "#847: resume path wrong:$bad"
 fi
@@ -2963,7 +2978,7 @@ fi
 # Composition: the barrier surfaces the resume outcome and keeps the trigger
 # declined on paused (asking a refusing provider is still forbidden).
 bad=""
-out="$(_barrier 0 7 '{"head_sha":"abc123","probe":{"observed":"paused"}}')" && rc=0 || rc=$?
+out="$(_barrier 0 7 '{"head_sha":"abc123","probe":{"observed":"paused"},"review":{"id":771}}')" && rc=0 || rc=$?
 [ "$rc" = 1 ] || bad="$bad paused-rc"
 printf '%s' "$out" | jq -e '.resume == "would-resume"' >/dev/null 2>&1 || bad="$bad paused-resume-field"
 printf '%s' "$out" | jq -e '.trigger == "declined"' >/dev/null 2>&1 || bad="$bad paused-trigger"

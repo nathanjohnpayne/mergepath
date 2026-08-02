@@ -377,28 +377,40 @@ p4b_barrier_claim_path() {
 # caller DECLINES to write (#846) — pending is already set before any write
 # runs, so the bound and the human escalation stand either way.
 #
-# Deliberately no timestamp and no stale-breaking: every clock-based break
+# Deliberately no timestamp and no clock-based stale-breaking: every such
 # rule either steals a live claim (two writes — the failure this exists to
-# prevent) or strands a second one. An abandoned claim self-heals
-# structurally instead: it keeps the arm declining, the head stays pending,
-# the bound expires, and the escalate path's clear_pending below removes it —
-# so the checkout that handles the escalation can write again on re-run.
+# prevent) or strands a second one. Ownership is the winner's PID instead:
+# claims are per-checkout by construction, so a recorded owner that is no
+# longer alive on this machine proves abandonment, and only the NEXT claimant
+# breaks it — never any concurrent evaluation. A clear_pending that removed
+# claims was the round-1 defect here: an open or drift outcome in one
+# invocation deleted another invocation's LIVE claim mid-region, and a third
+# retry could then re-claim and double-post.
 p4b_barrier_claim() {
   mkdir -p "$(dirname "$1")" 2>/dev/null || return 1
-  mkdir "$1" 2>/dev/null || return 1
+  if ! mkdir "$1" 2>/dev/null; then
+    local owner
+    owner="$(cat "$1/pid" 2>/dev/null || true)"
+    case "$owner" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$owner" 2>/dev/null && return 1
+    rm -rf "$1" 2>/dev/null || true
+    mkdir "$1" 2>/dev/null || return 1
+  fi
+  printf '%s\n' "$$" >"$1/pid" 2>/dev/null || { rm -rf "$1" 2>/dev/null; return 1; }
 }
 
 p4b_barrier_release() { rm -rf "${1:?}" 2>/dev/null || true; }
 
 # p4b_barrier_clear_pending <repo> <pr> <head>
-# Drop the marker and both write claims. Called on every non-not-yet outcome
-# so a later not-yet on the same head starts a fresh budget instead of
-# inheriting a stale one — and so an abandoned claim cannot outlive the wait
-# it was taken under.
+# Drop the marker only. Called on every non-not-yet outcome so a later
+# not-yet on the same head starts a fresh budget instead of inheriting a
+# stale one. Claims are deliberately NOT touched here: only their winner
+# releases them, and abandonment is broken by the next claimant's dead-owner
+# check above.
 p4b_barrier_clear_pending() {
   rm -f "$(p4b_barrier_marker_path "$1" "$2" "$3")" 2>/dev/null || true
-  rm -rf "$(p4b_barrier_claim_path "$1" "$2" "$3" trigger)" 2>/dev/null || true
-  rm -rf "$(p4b_barrier_claim_path "$1" "$2" "$3" resume)" 2>/dev/null || true
 }
 
 # --- #814 CodeRabbit arm: trigger, do not only wait -------------------------
@@ -607,14 +619,20 @@ p4b_barrier_maybe_trigger() {
 
 # p4b_barrier_maybe_resume <repo> <pr> <head> <reviewer> <probe_json> <dry_run>
 # The pause recovery (#847): on observed=paused, post `@<bot> resume` at most
-# once per head, deduplicated by its own timeline marker so a resume and the
-# review trigger can never be confused for one another. The barrier posts the
-# resume itself rather than delegating to coderabbit-wait.sh's polling mode:
-# delegation would need new per-invocation overrides for that script's other
-# writers (its switches are policy fields, not envs) and its retry latch is
-# local to one checkout — weaker than the timeline marker's at-most-once per
-# head. --probe stays read-only structurally: nothing in the probe path can
-# reach this.
+# once per PAUSE EVENT, deduplicated by its own timeline marker so a resume
+# and the review trigger can never be confused for one another. The dedup
+# keys on the pause notice's comment id, not the head (Codex P2, round 1): a
+# pause is PR-level and durable across pushes, so a per-head key would post
+# one resume per Codex-forced push while the same pause note stands. The
+# comment id is CodeRabbit-owned and carried in the probe's evidence; a
+# paused observation without one declines rather than guessing a key.
+#
+# The barrier posts the resume itself rather than delegating to
+# coderabbit-wait.sh's polling mode: delegation would need new
+# per-invocation overrides for that script's other writers (its switches are
+# policy fields, not envs) and its retry latch is local to one checkout —
+# weaker than the timeline marker's at-most-once. --probe stays read-only
+# structurally: nothing in the probe path can reach this.
 #
 # Exhaustion still escalates: a resume does not clear pending, so if the bot
 # stays paused the bound expires and a human is paged exactly as before —
@@ -622,10 +640,17 @@ p4b_barrier_maybe_trigger() {
 # would have made.
 p4b_barrier_maybe_resume() {
   local repo="$1" pr="$2" head="$3" reviewer="$4" json="$5" dry="${6:-false}"
-  local observed out
+  local observed pause_id out
   observed="$(printf '%s' "$json" | jq -r '.probe.observed // empty' 2>/dev/null || true)"
   [ "$observed" = paused ] || { printf 'skipped'; return 0; }
-  out="$(p4b_barrier_maybe_write resume "$repo" "$pr" "$head" "$reviewer" "$dry")"
+  pause_id="$(printf '%s' "$json" | jq -r '.review.id // empty' 2>/dev/null || true)"
+  case "$pause_id" in
+    ''|null|*[!0-9]*) printf 'resume-unidentified'; return 0 ;;
+  esac
+  # The pause key rides the same argument slot the trigger uses for the head:
+  # it keys the claim, the marker, and nothing else, so one write core serves
+  # both classes unchanged.
+  out="$(p4b_barrier_maybe_write resume "$repo" "$pr" "pause-$pause_id" "$reviewer" "$dry")"
   case "$out" in
     already-resume)           printf 'already-resumed' ;;
     already-resume-duplicate) printf 'already-resumed-duplicate' ;;
