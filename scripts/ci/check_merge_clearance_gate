@@ -655,17 +655,19 @@ def is_falsy_if(value):
     wrapped = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", text)
     if wrapped:
         text = wrapped.group(1)
-        # Inside an expression, GitHub's falsy LITERALS are a closed set:
-        # false, null, the empty string, and numeric zero in any spelling
-        # (-0, 0.0, 0e0). Normalising quotes and numeric value terminates the
-        # set — this is not an enumeration that can drift.
-        if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
-            text = text[1:-1]
-        try:
-            if float(text) == 0:
-                return True
-        except ValueError:
-            pass
+    # GitHub's falsy LITERALS are a closed set: false, null, the empty
+    # string, and numeric zero in any spelling (-0, 0.0, 0e0). Normalising
+    # quotes and numeric value terminates the set — this is not an
+    # enumeration that can drift. Applied to bare values too, not only
+    # wrapped ones: YAML hands a bare `if: 0.0` over as the float whose
+    # str() is "0.0", which no literal tuple can enumerate.
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        text = text[1:-1]
+    try:
+        if float(text) == 0:
+            return True
+    except ValueError:
+        pass
     return text.lower() in FALSY
 
 failures = []
@@ -687,7 +689,9 @@ def strip_comments(text):
 
 def step_named(job, want):
     for step in job.get("steps") or []:
-        if want in (step.get("name") or ""):
+        # A steps entry can parse to a bare string; .get on it would raise
+        # and surface as a traceback instead of a named failure.
+        if isinstance(step, dict) and want in (step.get("name") or ""):
             return step
     return None
 
@@ -748,6 +752,9 @@ steps = (event_job or {}).get("steps") or []
 if not steps:
     bad("FAIL: [#850 phase-1 position] the merge-clearance-gate job declares no",
         "      steps, so nothing opens the in-progress check_run.")
+elif not isinstance(steps[0], dict):
+    bad("FAIL: [#850 phase-1 position] the FIRST entry of merge-clearance-gate's",
+        "      steps is not a mapping, so nothing opens the in-progress check_run.")
 else:
     first = steps[0]
     label = first.get("name") or "<unnamed>"
@@ -816,6 +823,8 @@ for key in PRODUCERS:
     if not isinstance(job, dict):
         continue
     for step in job.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
         if not GH_INVOKE.search(step.get("run") or ""):
             continue
         token = (step.get("env") or {}).get("GH_TOKEN")

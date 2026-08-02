@@ -1714,6 +1714,15 @@ mcg22_case c4 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ -0 \}
 #     complex keys in workflows anyway.
 mcg22_case i 's{^  scheduled-sweep:$}{  ? [scheduled-sweep]\n  :}m' \
   fail 'does not parse as YAML'
+# c5 — a BARE numeric-zero condition, no expression wrapper. YAML hands the
+#      float over directly; the normalisation must not live only inside the
+#      wrapped branch.
+mcg22_case c5 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: 0.0}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# j — a steps entry that parses to a bare string. .get on it would raise; the
+#     first-step property must fail with its own named cause instead.
+mcg22_case j 's{(    steps:\n)(      - name: Open the required check_run)}{$1      - just-a-string\n$2}' \
+  fail '[#850 phase-1 position]'
 unset MCG_TAG
 
 # g — positive control on the REAL file. Case I uses a synthesized header; this
