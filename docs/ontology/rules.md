@@ -1068,6 +1068,32 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-280.** The six baseline checks are implemented in the CI-check directory. ● — Standard § CI Enforcement
 
+### Deployment (this repo's per-repo-owned instance)
+
+**G-281.** Firebase and Google Cloud repos prefer the canonical wrapper deploy flow over ad-hoc CLI use. ○ — docs/agents/deployment-process.md
+
+**G-282.** The default deploy credential is the per-project Firebase-vault service-account key, with the shared 1Password ADC as fallback; the precedence order is canonical in DEPLOYMENT.md. ● — docs/agents/deployment-process.md
+
+**G-283.** The 1Password-first deploy-auth model is the deliberate default; swapping it for browser or CLI login because a lookup failed is exactly the forbidden unilateral downgrade (G-191). ○ — docs/agents/deployment-process.md
+
+**G-284.** On-disk deploy keys are never an accepted substitute for the vaulted service-account key. ● — docs/agents/deployment-process.md
+
+**G-285.** A deploy session loads deploy credentials explicitly (deploy-mode preflight); review-mode preflight deliberately does not. ○ — docs/agents/deployment-process.md
+
+**G-286.** When the next operation is broad non-deploy cloud work, use review preflight or unset the exported credential variable so the wrapper resolves its normal chain. ○ — docs/agents/deployment-process.md
+
+**G-287.** A credential sign-in failure during deploy follows the pause-and-prompt procedure (G-192) — no retry or workaround without the human present. ○ — docs/agents/deployment-process.md
+
+**G-288.** Runtime agent secrets use the portable 1Password Environments model; service-account tokens are CI/headless-only under an approved ticket scoping token, vault access, rotation, and log masking — never an attended-agent convenience. ○ — docs/agents/deployment-process.md
+
+**G-289.** The Codex-specific Environments MCP server is not described as a universal agent adapter. ○ — docs/agents/deployment-process.md
+
+**G-290.** The headless review-auth proof is manual-dispatch only, compares digests without printing secret values, and requires the negative-scope sentinel unless explicitly skipped. ● — docs/agents/deployment-process.md
+
+**G-291.** Existing scripts keep shelling out to the 1Password CLI; no language-SDK migration lands without a separate design decision. ○ — docs/agents/deployment-process.md
+
+**G-292.** Service-account key rotation is human-only, never automated by any agent or workflow. ● — docs/agents/deployment-process.md
+
 ---
 
 The OWL companion ([`mergepath-rules.ttl`](mergepath-rules.ttl)) formalizes a core subset of the ● rules as axioms a reasoner can violate-check; each axiom is annotated with the rule IDs it encodes, and [`README.md`](README.md) documents the encoding, the checker, and the honest limits (what open-world OWL can and cannot catch).

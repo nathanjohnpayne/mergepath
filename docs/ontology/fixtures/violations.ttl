@@ -1,6 +1,7 @@
 @prefix mp:   <https://github.com/nathanjohnpayne/mergepath/ontology#> .
 @prefix owl:  <http://www.w3.org/2002/07/owl#> .
 @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 
 ##############################################################################
 # Violation fixtures — every individual carrying mp:seededViolation breaks
@@ -36,11 +37,14 @@ mp:prMergedByReviewer rdf:type mp:MergedPR ;
     mp:seededViolation "R-9" ;
     mp:violationWitness mp:nathanpayneClaude .
 
-### V3 — a commit attributed to a reviewer identity (AX5 + AX1)
+### V3 — a commit attributed to a reviewer identity (AX5 + AX1); uses its own
+### reviewer individual so a regression in AX4 or AX5 cannot be masked by the
+### other fixture's inference on a shared witness.
+mp:nathanpayneCursor rdf:type mp:ReviewerIdentity .
 mp:commitByReviewer rdf:type mp:Commit ;
-    mp:commitAuthoredBy mp:nathanpayneClaude ;
+    mp:commitAuthoredBy mp:nathanpayneCursor ;
     mp:seededViolation "R-27" ;
-    mp:violationWitness mp:nathanpayneClaude .
+    mp:violationWitness mp:nathanpayneCursor .
 
 ### V4 — merged while human-hold present (AX6)
 mp:prMergedWithHold rdf:type mp:MergedPR ;
@@ -115,3 +119,17 @@ mp:entryTwoTypes rdf:type mp:CanonicalEntry , mp:TemplatedEntry ;
 ### V17 — a PR both over and under the threshold (AX18)
 mp:prBothThresholds rdf:type mp:Phase4PR , mp:UnderThresholdPR ;
     mp:seededViolation "R-183" .
+
+### V18 — an unsanctioned workflow removed needs-external-review (AX7c): the
+### performer belongs to a workflow kind declared disjoint from the sanctioned
+### automations, while AX7c entails any such remover IS sanctioned — a clash
+### surfacing on the performer.
+mp:ThirdPartyBotWorkflow rdf:type owl:Class ;
+    rdfs:subClassOf mp:WorkflowActor ;
+    owl:disjointWith mp:SanctionedLabelAutomation .
+mp:rogueWorkflow rdf:type mp:ThirdPartyBotWorkflow .
+mp:rogueRemovesExternalReview rdf:type mp:LabelRemoval ;
+    mp:performedBy mp:rogueWorkflow ;
+    mp:removesLabel mp:needsExternalReview ;
+    mp:seededViolation "R-167" ;
+    mp:violationWitness mp:rogueWorkflow .

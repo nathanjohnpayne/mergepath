@@ -38,16 +38,10 @@ TBOX = REPO_ROOT / "docs" / "ontology" / "mergepath-rules.ttl"
 CONSISTENT = REPO_ROOT / "docs" / "ontology" / "fixtures" / "consistent.ttl"
 VIOLATIONS = REPO_ROOT / "docs" / "ontology" / "fixtures" / "violations.ttl"
 
-try:
-    import rdflib
-    from rdflib import RDF, OWL, Namespace
-    import owlrl
-except ImportError:
-    print("owl-rules-check: SKIP (rdflib/owlrl not installed; pip install rdflib owlrl)")
-    sys.exit(0)
-
-MP = Namespace("https://github.com/nathanjohnpayne/mergepath/ontology#")
-ERR = Namespace("http://www.daml.org/2002/03/agents/agent-ont#")
+# Ratchet: the number of seeded violation individuals the fixture must carry.
+# Bump deliberately when adding an axiom + fixture; a lower live count fails,
+# so deleting seeds (or emptying the fixture) can never buy a silent pass.
+SEEDED_MIN = 18
 
 
 def closure(*paths):
@@ -86,6 +80,8 @@ def report_pass(name, ok, detail=""):
 
 
 def main():
+    # Usage and fixture-presence errors report BEFORE the dependency soft-pass,
+    # so a bad invocation or a gutted checkout can never ride the SKIP to 0.
     mode = sys.argv[1] if len(sys.argv) > 1 else "--check"
     if mode not in ("--check", "--report"):
         print(__doc__)
@@ -94,6 +90,17 @@ def main():
         if not p.is_file():
             print(f"owl-rules-check: missing {p}")
             return 2
+
+    global rdflib, RDF, OWL, MP, ERR, owlrl
+    try:
+        import rdflib
+        from rdflib import RDF, OWL, Namespace
+        import owlrl
+    except ImportError:
+        print("owl-rules-check: SKIP (rdflib/owlrl not installed; pip install rdflib owlrl)")
+        return 0
+    MP = Namespace("https://github.com/nathanjohnpayne/mergepath/ontology#")
+    ERR = Namespace("http://www.daml.org/2002/03/agents/agent-ont#")
 
     ok = True
     print("owl-rules-check: OWL-RL closure over the Mergepath rules ontology")
@@ -119,6 +126,14 @@ def main():
     nothing, messages = catches(g)
     seeded = {s: str(next(g.objects(s, MP.seededViolation))) for s in g.subjects(MP.seededViolation, None)}
     witnesses = {s: set(g.objects(s, MP.violationWitness)) for s in seeded}
+
+    # C0 — the seeded inventory itself is ratcheted: an emptied or trimmed
+    # fixture fails rather than making C1 vacuously true.
+    ok &= report_pass(
+        f"C0: seeded inventory holds at least {SEEDED_MIN} violations",
+        len(seeded) >= SEEDED_MIN,
+        f"found {len(seeded)}",
+    )
 
     def violation_caught(s):
         return caught_in(s, nothing, messages) or any(

@@ -37,7 +37,7 @@ mp:settledThread rdf:type mp:ResolvedThread .
 mp:sanctionedAutoClear rdf:type mp:LabelRemoval ;
     mp:performedBy mp:autoClearWorkflow ;
     mp:removesLabel mp:needsExternalReview .
-mp:autoClearWorkflow rdf:type mp:WorkflowActor .
+mp:autoClearWorkflow rdf:type mp:SanctionedLabelAutomation .
 
 ### A canonical doc propagating to a consumer — normal propagation.
 mp:sharedRulesDoc rdf:type mp:CanonicalDoc ;
