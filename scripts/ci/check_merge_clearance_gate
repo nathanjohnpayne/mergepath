@@ -644,6 +644,13 @@ def is_falsy_if(value):
     disabled while every assertion here passes. Anything non-literal inside
     the wrapper is left alone; evaluating expressions is review's job.
     """
+    # A bare `if:` / `if: null` / `if: ~` parses to Python None, whose str()
+    # is "None" — outside the tuple, so the native-null path would bypass the
+    # wrapper normalization entirely. GitHub's handling of a null condition
+    # is not documented; a condition the check cannot prove eligible fails
+    # closed, forcing an explicit expression or removal of the key.
+    if value is None:
+        return True
     text = str(value).strip()
     wrapped = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", text)
     if wrapped:
@@ -674,9 +681,27 @@ def step_named(job, want):
     return None
 
 
+# Duplicate mapping keys are a parse error here, as they are for Actions'
+# own workflow parser. yaml.safe_load would silently keep the LAST duplicate
+# while the text layer's block extraction reads the FIRST — so under
+# last-wins the two layers would inspect different job definitions and each
+# could pass on properties the other never saw.
+class StrictLoader(yaml.SafeLoader):
+    def construct_mapping(self, node, deep=False):
+        seen = set()
+        for key_node, _value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    None, None,
+                    "found duplicate mapping key %r" % key, key_node.start_mark)
+            seen.add(key)
+        return super().construct_mapping(node, deep)
+
+
 try:
     with open(WORKFLOW, encoding="utf-8") as handle:
-        doc = yaml.safe_load(handle)
+        doc = yaml.load(handle, Loader=StrictLoader)
 except Exception as exc:  # any parse failure carries the same verdict
     print("FAIL: %s does not parse as YAML: %s" % (WORKFLOW, " ".join(str(exc).split())))
     print("      A workflow that cannot be parsed must fail LOUDLY here. Silently")
