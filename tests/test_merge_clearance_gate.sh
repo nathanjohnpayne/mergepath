@@ -1677,6 +1677,23 @@ mcg22_case e 's{(      - name: Find open PRs.*?)^          GH_TOKEN: [^\n]*\n}{$
 #     LOUDLY naming the parse error; a parser that silently matches nothing
 #     turns every assertion above into a no-op.
 mcg22_case f 's{(    - cron: "\*/15).*}{$1}s' fail 'does not parse as YAML'
+# h — the event job parses to a NON-mapping. A duplicate key appended at EOF
+#     wins under PyYAML's last-wins rule while every text assertion still sees
+#     the original block — so only the parse observes the shape. Must fail with
+#     the named not-a-mapping cause, never an unhandled traceback (which prints
+#     no FAIL line at all because failures are buffered until the end).
+mcg22_case h 's{\z}{  merge-clearance-gate: ["not-a-mapping"]\n}' \
+  fail "[#850 producer eligibility] job 'merge-clearance-gate'"
+# a2 — a preliminary first step whose run body merely MENTIONS the phase-1
+#      strings. Substrings alone accept it (the real publisher still satisfies
+#      the text layer later in the job); only the step-identity conjunct sees
+#      that the first step is not the publisher.
+mcg22_case a2 's{(    steps:\n)(      - name: Open the required check_run)}{$1      - name: Preliminary\n        run: echo check-runs in_progress\n$2}' \
+  fail '[#850 phase-1 position]'
+# c2 — the same unreachable sweep spelled as an expression-wrapped literal,
+#      which GitHub evaluates exactly like the bare one.
+mcg22_case c2 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ 0 \}\}}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
 unset MCG_TAG
 
 # g — positive control on the REAL file. Case I uses a synthesized header; this

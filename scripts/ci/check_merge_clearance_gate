@@ -629,10 +629,26 @@ PRODUCERS = ("merge-clearance-gate", "scheduled-sweep", "dispatch-recheck")
 GH_TOKEN_OK = ("${{ secrets.GITHUB_TOKEN }}",)
 HEAD_SHA_OK = ("${{ github.event.pull_request.head.sha }}",)
 # Conservative falsy set. The real jobs carry legitimate truthy expressions
-# (github.event_name == 'schedule'), which MUST pass; this rejects only values
-# GitHub can never evaluate true. `if: false` parses to Python False, whose
-# str() is "false", so the bare bool is covered by the same set.
-FALSY = ("false", "${{ false }}", "0")
+# (github.event_name == 'schedule'), which MUST pass; this rejects only
+# literals GitHub can never evaluate true. `if: false` parses to Python False,
+# whose str() is "false", so the bare bool is covered by the same set.
+FALSY = ("false", "0", "null", "")
+
+
+def is_falsy_if(value):
+    """True when a job-level if: is a literal GitHub can never evaluate true.
+
+    An expression wrapper around a bare literal — `${{ false }}`, `${{ 0 }}`,
+    `${{ null }}` — is unwrapped first: GitHub treats those exactly as the
+    bare literal, so leaving them outside the set would let a producer be
+    disabled while every assertion here passes. Anything non-literal inside
+    the wrapper is left alone; evaluating expressions is review's job.
+    """
+    text = str(value).strip()
+    wrapped = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", text)
+    if wrapped:
+        text = wrapped.group(1)
+    return text.lower() in FALSY
 
 failures = []
 
@@ -676,6 +692,14 @@ if not isinstance(jobs, dict):
 
 # Property 1 — phase 1 is the FIRST step, unconditional, with its own bindings.
 event_job = jobs.get("merge-clearance-gate")
+if event_job is not None and not isinstance(event_job, dict):
+    # A non-mapping value (a YAML list or scalar) is truthy, so `or {}` does
+    # not normalise it and the .get below would raise — turning a malformed
+    # workflow into a traceback with NO named property, unlike every other
+    # malformed-input path here. The producer loop reports the not-a-mapping
+    # cause for this key; normalising lets the phase-1/phase-2 messages fire
+    # with accurate text instead of crashing before any of them print.
+    event_job = None
 steps = (event_job or {}).get("steps") or []
 if not steps:
     bad("FAIL: [#850 phase-1 position] the merge-clearance-gate job declares no",
@@ -684,12 +708,20 @@ else:
     first = steps[0]
     label = first.get("name") or "<unnamed>"
     body = strip_comments(first.get("run") or "")
-    if "check-runs" not in body or "in_progress" not in body:
+    # Identity AND content, on the SAME step. Two unconnected substrings alone
+    # would accept a preliminary step whose run body merely mentions them (an
+    # echo, a comment block) while the real publisher sits later — satisfying
+    # the text layer too, since that greps the whole job. The name is the same
+    # identity the text layer's per-step extraction scopes to, so both layers
+    # pin one step.
+    if ("Open the required check_run" not in (first.get("name") or "")
+            or "check-runs" not in body or "in_progress" not in body):
         bad("FAIL: [#850 phase-1 position] the FIRST step of merge-clearance-gate is",
-            "      %r, which does not POST to check-runs with status=in_progress." % label,
-            "      Every failure after this point — checkout, PR resolve, gate crash,",
-            "      runner death — only fails CLOSED if the pending entry already",
-            "      retired the previous verdict, so phase 1 must come first.")
+            "      %r, which is not the 'Open the required check_run' publisher" % label,
+            "      POSTing to check-runs with status=in_progress. Every failure after",
+            "      this point — checkout, PR resolve, gate crash, runner death — only",
+            "      fails CLOSED if the pending entry already retired the previous",
+            "      verdict, so phase 1 must come first.")
     if "if" in first:
         bad("FAIL: [#850 phase-1 unconditional] the phase-1 step %r carries a" % label,
             "      step-level if: %r. A conditional publisher skips exactly when" % first["if"],
@@ -708,7 +740,7 @@ for key in PRODUCERS:
         bad("FAIL: [#850 producer eligibility] job '%s' is missing or is not a" % key,
             "      mapping; that trigger path publishes nothing.")
         continue
-    if "if" in job and str(job["if"]).strip().lower() in FALSY:
+    if "if" in job and is_falsy_if(job["if"]):
         bad("FAIL: [#850 producer eligibility] job '%s' carries a falsy job-level" % key,
             "      if: %r, so it never runs. Every trigger and every matched" % job["if"],
             "      string survives that edit — only the parse sees it — while that",
