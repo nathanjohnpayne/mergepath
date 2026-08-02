@@ -395,14 +395,26 @@ p4b_barrier_claim() {
       ''|*[!0-9]*) return 1 ;;
     esac
     kill -0 "$owner" 2>/dev/null && return 1
-    # Takeover by RENAME, not remove-and-recreate: two contenders can both
-    # read the dead owner, and with rm+mkdir the second's rm can delete the
-    # first's freshly-won claim — both then enter the region (Codex P2,
-    # round 2). rename(2) of one source succeeds exactly once; the loser
-    # falls through to the ordinary mkdir contention and declines.
-    mv "$1" "$1.reap.$$" 2>/dev/null || return 1
-    rm -rf "$1.reap.$$" 2>/dev/null || true
-    mkdir "$1" 2>/dev/null || return 1
+    # Takeover is SERIALIZED and REVALIDATED. A bare rename is not enough:
+    # the winner recreates the path, so a second reaper that read the same
+    # dead owner earlier can rename the winner's LIVE claim away (Codex P2,
+    # rounds 2 and 5). The reap lock is held for microseconds; a reaper that
+    # crashes inside it strands the lock and every later claim declines —
+    # the bounded-escalation direction, never a double post. Re-reading the
+    # owner under the lock is what closes the both-read-dead window: the
+    # second reaper sees the winner's live PID and declines.
+    mkdir "$1.reaplock" 2>/dev/null || return 1
+    owner="$(cat "$1/pid" 2>/dev/null || true)"
+    if [ -z "$owner" ] || kill -0 "$owner" 2>/dev/null; then
+      rmdir "$1.reaplock" 2>/dev/null || true
+      return 1
+    fi
+    rm -rf "$1" 2>/dev/null || true
+    if ! mkdir "$1" 2>/dev/null; then
+      rmdir "$1.reaplock" 2>/dev/null || true
+      return 1
+    fi
+    rmdir "$1.reaplock" 2>/dev/null || true
   fi
   printf '%s\n' "$$" >"$1/pid" 2>/dev/null || { rm -rf "$1" 2>/dev/null; return 1; }
 }
@@ -475,7 +487,11 @@ p4b_barrier_trigger_posted() {
 # writes double-post against one pause note (Codex P2, round 2). The episode
 # scoping keeps round 1's per-pause-note keying: an old episode's bare
 # resume predates the current note's fresh_at and does not suppress a new
-# recovery. Neither timestamp is pusher-controlled.
+# recovery. Neither timestamp is pusher-controlled. STRICTLY later, not >=:
+# GitHub timestamps carry second precision, so a prior episode's resume can
+# tie the new note's fresh_at — counting it would leave the new pause
+# unrecovered until escalation, while not counting it risks at worst one
+# duplicate resume inside a one-second window (Codex P2, round 5).
 #
 # Author scope: the marker arm stays pinned to the SELECTED reviewer — the
 # marker proves this automation spent the key. The bare arm accepts every
@@ -502,7 +518,7 @@ p4b_barrier_write_count() {
         (((.user.login // "") == $who) and ((.body // "") | contains($m)))
         or ($since != ""
             and ((.user.login // "") as $l | (($l == $who) or ($revs | index($l) != null)))
-            and ((.created_at // "") >= $since)
+            and ((.created_at // "") > $since)
             and ((((.body // "") | split("\n")[0]) | rtrimstr(" ") | rtrimstr("\r")) == $cmd)))]
     | length' 2>/dev/null || printf '0'
 }
