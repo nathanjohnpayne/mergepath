@@ -56,15 +56,15 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **External review threshold**: The lines-changed trigger (with the protected-path list as its second disjunct) at or above which Phase 4 external review is mandatory; generated files and lockfiles are excluded from the count.
 
-**Protected paths**: The glob list that forces external review regardless of line count — auth, payments, secrets, `.github/**`. The `.github/**` entry is exactly why the propagation lane exists.
+**Protected paths**: The glob list that forces external review regardless of line count — auth, payments, secrets, credentials, and `.github/**`. The `.github/**` entry is exactly why the propagation lane exists.
 
-**CodeRabbit**: The advisory automated reviewer that runs on every PR in enabled repos; it informs but never blocks by itself. Its unresolved threads still bind through the conversation gate. _Avoid_: calling it a merge gate.
+**CodeRabbit**: The advisory automated reviewer that runs on every ordinary PR in enabled repos — wave fan-out mirrors are deliberately opened with an ignore marker; it informs but never blocks by itself. Its unresolved threads still bind through the conversation gate. _Avoid_: calling it a merge gate.
 
 **Codex**: The ChatGPT Codex Connector GitHub App — the real blocking external-review signal. It never emits an `APPROVED` review state and must be explicitly invoked with `@codex review` on every round; a push never re-triggers it. _Avoid_: "Codex approval".
 
 **Review round**: One `@codex review` request-and-response cycle; bounded by the max-review-rounds cap.
 
-**Handoff message**: The structured "External Review Required" PR comment posted when a PR needs a cross-agent CLI review — self-contained, so the external reviewer needs no access to the internal thread.
+**Handoff message**: The structured "External Review Required" PR comment the manual Phase 4b fallback posts — self-contained, so the external reviewer needs no access to the internal thread; the automated Phase 4b leg never posts one.
 
 **Chat-side handoff block**: The copy-paste-friendly companion block emitted into chat at the same moment the human is alerted; additive to the PR-side handoff, never a replacement.
 
@@ -84,7 +84,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 ### Clearance and merge gates
 
-**Clearance**: The HEAD-pinned state in which the external reviewer has affirmatively accepted this exact commit; any new push voids it. _Avoid_: treating a label, a stale approval, or reviewer silence as clearance — silence is never implicit approval.
+**Clearance**: The HEAD-pinned state in which the external reviewer has affirmatively accepted this exact commit; a content-changing push voids it, while a base-only update can carry it forward under the same external-review fingerprint. _Avoid_: treating a label, a stale approval, or reviewer silence as clearance — silence is never implicit approval.
 
 **HEAD-pinned**: The property that a signal or gate counts only when bound to the exact current commit. The antonym failure is a stale clearance riding a new HEAD. Also "HEAD-anchored", "same-head".
 
@@ -92,17 +92,17 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Merge gate**: The agent-side pre-merge verification that the three lettered conditions hold — (a) required CI green, (b) a qualifying reviewer approval, (c) external clearance on HEAD. _Avoid_: conflating with the Merge clearance gate, its CI-enforced counterpart.
 
-**Merge clearance gate**: The HEAD-pinned required status check that fails closed when clearance is not satisfied on the merge HEAD — the merge-time teeth behind the agent-side merge gate, with an external-review arm and a Dependabot arm.
+**Merge clearance gate**: The HEAD-pinned canonical check that fails closed when clearance is not satisfied on the merge HEAD, with an external-review arm and a Dependabot arm; it grows merge-time teeth only where branch protection lists it as required.
 
-**Required status check**: The branch-protection designation that makes a check merge-blocking; without it a red check is advisory. The canonical five: Label Gate, Self-Review Required, the two severity gates, and the Merge clearance gate. _Avoid_: "gate" for a check that is not required.
+**Required status check**: The branch-protection designation that makes a check merge-blocking; without it a red check is advisory. The canonical five (Label Gate, Self-Review Required, the two severity gates, the Merge clearance gate) are the set designated for enforcement; whether a repo actually requires them is live branch-protection state, audited weekly and decided in ADR 0002. _Avoid_: assuming a canonical check is enforced anywhere branch protection does not list it.
 
-**Label Gate**: The required check that fails while any of the four blocking labels is present.
+**Label Gate**: The canonical check that fails while any of the four blocking labels is present.
 
 **Blocking labels**: The four human-action labels agents may never remove — `needs-external-review`, `needs-human-review`, `policy-violation`, `human-hold`. `decision-needed` is deliberately not one (issue triage, not a merge stop).
 
 **human-hold**: The human-remove-only hard freeze that supersedes every merge path, including break-glass. Agents may add it, never remove it.
 
-**Severity gate**: A required check that blocks merge on any unresolved bot-review thread whose normalized tier is in the required set on the current HEAD; one Codex instance and one CodeRabbit twin sharing a single tier helper.
+**Severity gate**: A canonical check that fails on any unresolved bot-review thread whose normalized tier is in the required set on the current HEAD; one Codex instance and one CodeRabbit twin sharing a single tier helper.
 
 **Pre-merge review conversation gate**: The mandatory readback of review-thread state immediately before every merge confirming zero unresolved conversations — run unconditionally, never gated on merge-state status.
 
@@ -134,7 +134,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Barrier**: The ordering construct that holds the automated Phase 4b review until every enabled bot provider is terminal on the exact head, so the automated approval never lands ahead of the bots.
 
-**Hold**: A deliberate, self-clearing wait state distinguished from failure — the awaited thing arrives on its own, so nothing is posted and no human is paged. _Avoid_: conflating with `human-hold` (a human-controlled freeze) or with fallback (a reviewer that will not answer).
+**Hold**: A deliberate wait state distinguished from failure — nothing is posted and no human is paged. Most holds self-clear as the awaited signal arrives; some name a cause needing action instead (a draft PR, a wrong base branch), and only patience-shaped holds should be retried. _Avoid_: conflating with `human-hold` (a human-controlled freeze) or with fallback (a reviewer that will not answer).
 
 **Marker**: A stable machine-readable token pinning a fact to a specific SHA or state — the lane's verified-head comment, a resolve-class tag, a pause notice, a pending file. An indeterminate marker read is fail-closed.
 
@@ -170,13 +170,13 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 ### Propagation
 
-**Canonical source**: The one authoritative copy of a convention, script, or doc, living on the hub, from which every other copy is derived. The golden rule: fix at the source, never in a mirror. _Avoid_: calling any consumer copy "the source".
+**Canonical source**: The one authoritative copy from which every other copy is derived — the hub for propagated surfaces, the central docs repo for PRDs (a separate source graph). The golden rule: fix at the source, never in a mirror. _Avoid_: calling any consumer copy "the source".
 
 **Mirror**: A derived, tooling-maintained copy of canonical content. Three flavors with three verifiers: verbatim (byte-for-byte), rendered (templated per consumer), and generated (project-doc materialization). Hand-editing one breaks its verification and is clobbered on the next sync.
 
 **Drift**: Undeclared divergence between a consumer's live state and what the hub declares — of files, branch protection, or mirrored doc sections. Drift audits are read-only by design: visibility, not remediation. _Avoid_: "drift" for documented divergence.
 
-**Intentional divergence**: A deliberate, per-consumer difference recorded with a mandatory reason — in the consumer's sync-overrides file, a manifest exclusion, or a facts entry. Drift without a paper trail is the failure mode the schema exists to prevent.
+**Intentional divergence**: A deliberate, per-consumer difference recorded where it can be audited: a sync override or a manifest exclusion, each carrying a mandatory reason, or a per-consumer facts entry, an observed repo property that carries none. Drift without a paper trail is the failure mode the schema exists to prevent.
 
 **Propagation manifest**: `.mergepath-sync.yml` — the hub-only single source of truth for what propagates, to whom, and how; deliberately never itself propagated. _Avoid_: bare "manifest" when the project-docs manifest is in play.
 
@@ -186,7 +186,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Templated (entry type)**: The manifest path type rendered per consumer through the substitution engine; byte-equal to the re-render, not to the source. The only sanctioned way to share an identity-doc destination.
 
-**Fact**: A per-consumer key/value declared in the manifest that drives templated rendering — the correct home for a genuinely consumer-specific difference in a templated file. _Avoid_: "variable" (the substitution surface), "config".
+**Fact**: A per-consumer key/value declared in the manifest that drives templated rendering — the correct home for a genuinely consumer-specific difference in a templated file. _Avoid_: "variable" (the substitution surface), "config", and attaching a reason field — facts are observed properties, not exceptions.
 
 **Propagation closure**: The invariant that every path a propagated file hard-requires travels with it — declared via `requires:` and checked in both directions (declared→covered, and referenced→declared).
 
@@ -220,7 +220,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Bootstrap residue**: A hub-only or stale file left in a consumer by an old bootstrap — a file unexpectedly present, the inverse of the missing-file failure mode.
 
-**Canonicalization**: Bringing an already-shared or residue file under manifest management so it stops being unmanaged and drift becomes impossible. _Avoid_: "adopting", "importing".
+**Canonicalization**: Bringing an already-shared or residue file under manifest management so it stops being unmanaged: divergence becomes declared, detectable, and overwritten back into conformance on the next sync. _Avoid_: "adopting", "importing".
 
 **Doc ownership class**: The exhaustive classification of every agent-doc file into exactly one of canonical (one hub source, true verbatim everywhere), per-repo-owned (each repo authors its own), or hub-only (never travels; a consumer copy is residue). A mixed document is transitional debt to split, never a fourth class.
 
