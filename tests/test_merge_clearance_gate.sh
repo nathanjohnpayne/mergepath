@@ -1806,6 +1806,13 @@ mcg22_case x 's{^(  merge-clearance-gate:\n)}{$1    concurrency:\n      group: m
 #     red on every pull_request event (App P2 on #852).
 mcg22_case y 's{^    if: github.event_name == \x27repository_dispatch\x27\n}{}m' \
   fail "has no job-level if"
+# x2/x3 — concurrency on the NON-event producers: not the permanent native
+#     block of case x, but a cancelled member silently drops a refresh that
+#     nothing re-fires until the next scheduled pass (CodeRabbit on #852).
+mcg22_case x2 's{^(  scheduled-sweep:\n)}{$1    concurrency:\n      group: mcg-sweep\n      cancel-in-progress: false\n}m' \
+  fail "declares a concurrency"
+mcg22_case x3 's{^(  dispatch-recheck:\n)}{$1    concurrency:\n      group: mcg-dispatch\n      cancel-in-progress: false\n}m' \
+  fail "declares a concurrency"
 unset MCG_TAG
 
 # g — positive control on the REAL file. Case I uses a synthesized header; this
