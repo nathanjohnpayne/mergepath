@@ -1613,11 +1613,16 @@ trigger_already_posted() {  # <since-iso8601> <notice-comment-id> <exact-body>
   # Trusted-author allow-list as a JSON array. `$l` is bound BEFORE the array
   # literal so the literal cannot rebind `.` out from under the lookup.
   reviewers_json=$(read_available_reviewers | jq -R . | jq -sc .) || return 1
+  # Exact body OR the body as a first line: the Phase 4b barrier posts the
+  # same command with a dedup marker appended on later lines (#847), and two
+  # recovery paths that cannot read each other's writes both post against one
+  # pause note. Prefix-with-newline keeps the match anchored to the whole
+  # command line, so "@bot resume" never matches "@bot resumed something".
   printf '%s' "$comments" | jq -e \
     --arg b "$body" --arg since "$since" --argjson nid "${notice_id:-0}" \
     --argjson revs "$reviewers_json" \
     'any(.[]?;
-       (.body // "") == $b
+       ((.body // "") == $b or ((.body // "") | startswith($b + "\n")))
        and ((.user.login // "") as $l | $revs | index($l) != null)
        and ( (.created_at // "") > $since
              or ((.created_at // "") == $since and ((.id // 0) > $nid)) ))' \

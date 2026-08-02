@@ -395,7 +395,13 @@ p4b_barrier_claim() {
       ''|*[!0-9]*) return 1 ;;
     esac
     kill -0 "$owner" 2>/dev/null && return 1
-    rm -rf "$1" 2>/dev/null || true
+    # Takeover by RENAME, not remove-and-recreate: two contenders can both
+    # read the dead owner, and with rm+mkdir the second's rm can delete the
+    # first's freshly-won claim — both then enter the region (Codex P2,
+    # round 2). rename(2) of one source succeeds exactly once; the loser
+    # falls through to the ordinary mkdir contention and declines.
+    mv "$1" "$1.reap.$$" 2>/dev/null || return 1
+    rm -rf "$1.reap.$$" 2>/dev/null || true
     mkdir "$1" 2>/dev/null || return 1
   fi
   printf '%s\n' "$$" >"$1/pid" 2>/dev/null || { rm -rf "$1" 2>/dev/null; return 1; }
@@ -454,18 +460,31 @@ p4b_barrier_trigger_posted() {
   p4b_barrier_write_posted trigger "$1" "$2" "$3"
 }
 
-# p4b_barrier_write_count <kind> <head> <reviewer_login> <issue_comments_json>
-# Prints how many marker-bearing comments of this kind the reviewer identity
-# has on the timeline for this head. Author-scoped for the same reason the
-# boolean was; the count costs nothing extra (same read) and makes a
-# cross-checkout duplicate — the #846 race observed after the fact — visible
-# to the caller as `already-…-duplicate` instead of silently indistinguishable
-# from the normal already-spent case.
+# p4b_barrier_write_count <kind> <key> <reviewer_login> <issue_comments_json> [bare_since]
+# Prints how many spent-marks of this kind the reviewer identity has on the
+# timeline for this key. Author-scoped for the same reason the boolean was;
+# the count costs nothing extra (same read) and makes a cross-checkout
+# duplicate — the #846 race observed after the fact — visible to the caller
+# as `already-…-duplicate` instead of silently indistinguishable from the
+# normal already-spent case.
+#
+# For the resume kind, a BARE `@<bot> resume` first line also counts when it
+# was created at or after <bare_since> (the pause note's CodeRabbit-owned
+# fresh_at): coderabbit-wait.sh's own pause recovery posts exactly that body
+# with no marker, and two dedup vocabularies that cannot read each other's
+# writes double-post against one pause note (Codex P2, round 2). The episode
+# scoping keeps round 1's per-pause-note keying: an old episode's bare
+# resume predates the current note's fresh_at and does not suppress a new
+# recovery. Neither timestamp is pusher-controlled.
 p4b_barrier_write_count() {
   local m
   m="$(p4b_barrier_marker "$1" "$2")"
-  printf '%s' "${4:-[]}" | jq --arg m "$m" --arg who "${3:-}" '
-    [.[]? | select(((.user.login // "") == $who) and ((.body // "") | contains($m)))]
+  printf '%s' "${4:-[]}" | jq --arg m "$m" --arg who "${3:-}" --arg since "${5:-}" '
+    [.[]? | select((.user.login // "") == $who)
+      | select(((.body // "") | contains($m))
+               or ($since != ""
+                   and ((.created_at // "") >= $since)
+                   and (((.body // "") | split("\n")[0]) | test("^@[A-Za-z0-9_-]+ resume[[:space:]]*$"))))]
     | length' 2>/dev/null || printf '0'
 }
 
@@ -537,7 +556,7 @@ p4b_barrier_post_trigger() {
   return "$rc"
 }
 
-# p4b_barrier_maybe_write <kind> <repo> <pr> <head> <reviewer> <dry_run>
+# p4b_barrier_maybe_write <kind> <repo> <pr> <key> <reviewer> <dry_run> [bare_since]
 # claim -> read -> dedup -> post at most once, for either write class. Prints
 # the action taken; never fails the caller, because a write that could not be
 # posted still leaves the bounded retry and the human escalation behind it.
@@ -552,9 +571,9 @@ p4b_barrier_post_trigger() {
 # posted, so over-spend is never traded for starvation: a failed post releases
 # the claim and the next bounded retry re-attempts.
 p4b_barrier_maybe_write() {
-  local kind="$1" repo="$2" pr="$3" head="$4" reviewer="$5" dry="${6:-false}"
+  local kind="$1" repo="$2" pr="$3" key="$4" reviewer="$5" dry="${6:-false}" bare_since="${7:-}"
   local claim comments raw n out
-  claim="$(p4b_barrier_claim_path "$repo" "$pr" "$head" "$kind")"
+  claim="$(p4b_barrier_claim_path "$repo" "$pr" "$key" "$kind")"
   p4b_barrier_claim "$claim" || { printf '%s-claim-declined' "$kind"; return 0; }
   # Re-read the timeline rather than trusting process state: the bounded retry
   # runs as a fresh one-shot process each time, so "already spent" has to be
@@ -576,7 +595,7 @@ p4b_barrier_maybe_write() {
     '['*) ;;
     *) p4b_barrier_release "$claim"; printf '%s-read-failed' "$kind"; return 0 ;;
   esac
-  n="$(p4b_barrier_write_count "$kind" "$head" "$reviewer" "$comments")"
+  n="$(p4b_barrier_write_count "$kind" "$key" "$reviewer" "$comments" "$bare_since")"
   if [ "$n" -gt 1 ]; then
     # Two markers can only mean two checkouts raced before this change, or a
     # write reported failed actually landed and was retried. Surfaced, not
@@ -586,7 +605,7 @@ p4b_barrier_maybe_write() {
     out="already-${kind}"
   elif [ "$dry" = true ]; then
     out="would-${kind}"
-  elif p4b_barrier_post_trigger "$repo" "$pr" "$head" "$reviewer" "$kind"; then
+  elif p4b_barrier_post_trigger "$repo" "$pr" "$key" "$reviewer" "$kind"; then
     case "$kind" in resume) out='resumed' ;; *) out='triggered' ;; esac
   else
     out="${kind}-failed"
@@ -640,7 +659,7 @@ p4b_barrier_maybe_trigger() {
 # would have made.
 p4b_barrier_maybe_resume() {
   local repo="$1" pr="$2" head="$3" reviewer="$4" json="$5" dry="${6:-false}"
-  local observed pause_id out
+  local observed pause_id pause_fresh out
   observed="$(printf '%s' "$json" | jq -r '.probe.observed // empty' 2>/dev/null || true)"
   [ "$observed" = paused ] || { printf 'skipped'; return 0; }
   pause_id="$(printf '%s' "$json" | jq -r '.review.id // empty' 2>/dev/null || true)"
@@ -649,8 +668,10 @@ p4b_barrier_maybe_resume() {
   esac
   # The pause key rides the same argument slot the trigger uses for the head:
   # it keys the claim, the marker, and nothing else, so one write core serves
-  # both classes unchanged.
-  out="$(p4b_barrier_maybe_write resume "$repo" "$pr" "pause-$pause_id" "$reviewer" "$dry")"
+  # both classes unchanged. The note's fresh_at scopes the bare-form interop
+  # dedup to this pause episode — see p4b_barrier_write_count.
+  pause_fresh="$(printf '%s' "$json" | jq -r '.review.fresh_at // .review.updated_at // .review.created_at // empty' 2>/dev/null || true)"
+  out="$(p4b_barrier_maybe_write resume "$repo" "$pr" "pause-$pause_id" "$reviewer" "$dry" "$pause_fresh")"
   case "$out" in
     already-resume)           printf 'already-resumed' ;;
     already-resume-duplicate) printf 'already-resumed-duplicate' ;;
@@ -771,6 +792,13 @@ p4b_same_head_barrier() {
     budget="$(p4b_barrier_budget_seconds)"
     if [ "$elapsed" -ge "$budget" ]; then
       why="external review did not reach the current head within ${budget}s"
+      # The recovery this same run just sent must survive into the manual
+      # fallback, whose renderer carries only the reason — an operator who
+      # cannot see it may post a second resume on top (Codex P2, round 2).
+      case "$resume" in
+        skipped) ;;
+        *) why="$why (pause recovery this run: $resume)" ;;
+      esac
     else
       remaining=$(( budget - elapsed ))
     fi

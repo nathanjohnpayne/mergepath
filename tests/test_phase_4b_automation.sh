@@ -2838,6 +2838,17 @@ p4b_barrier_release "$_cp"
 mkdir -p "$_cp"
 p4b_barrier_claim "$_cp"     && bad="$bad ownerless-stolen"
 p4b_barrier_release "$_cp"
+# Two contenders reaping the SAME dead claim: rename is single-winner, so
+# exactly one may take it over (rm+mkdir let both in — Codex P2, round 2).
+mkdir -p "$_cp"; ( : ) & _deadpid=$!; wait "$_deadpid"; printf '%s\n' "$_deadpid" >"$_cp/pid"
+( p4b_barrier_claim "$_cp" && echo win ) >"$WORK/reap-a" 2>/dev/null &
+_rp_a=$!
+( p4b_barrier_claim "$_cp" && echo win ) >"$WORK/reap-b" 2>/dev/null &
+_rp_b=$!
+wait "$_rp_a" "$_rp_b"
+_wins="$(cat "$WORK/reap-a" "$WORK/reap-b" 2>/dev/null | grep -c win || true)"
+[ "${_wins:-0}" = "1" ] || bad="$bad takeover-wins=$_wins"
+p4b_barrier_release "$_cp"
 ( P4B_ACCT_STATE_DIR=/dev/null/nope p4b_barrier_claim "$(P4B_ACCT_STATE_DIR=/dev/null/nope p4b_barrier_claim_path o/r 1 h trigger)" ) \
   && bad="$bad unusable-dir-claimed"
 if [ -z "$bad" ]; then
@@ -2949,26 +2960,37 @@ _resume() { # <probe_json> [dry]
     p4b_barrier_maybe_resume owner/repo 7 rhead1 rev-bot "$1" "${2:-false}"
   )
 }
+_pj() { printf '{"probe":{"observed":"%s"},"review":{"id":%s,"fresh_at":"2026-06-04T12:00:00Z"}}' "$1" "$2"; }
 : >"$WORK/wp-writes.log"
-[ "$(_resume '{"probe":{"observed":"none"},"review":{"id":771}}')" = "skipped" ]       || bad="$bad none-not-skipped"
-[ "$(_resume '{"probe":{"observed":"rate_limit"},"review":{"id":771}}')" = "skipped" ] || bad="$bad ratelimit-not-skipped"
-[ "$(_resume '{"probe":{"observed":"paused"}}')" = "resume-unidentified" ]             || bad="$bad no-id-not-declined"
-[ "$(_resume '{"probe":{"observed":"paused"},"review":{"id":771}}' true)" = "would-resume" ] || bad="$bad dry-not-would"
+[ "$(_resume "$(_pj none 771)")" = "skipped" ]       || bad="$bad none-not-skipped"
+[ "$(_resume "$(_pj rate_limit 771)")" = "skipped" ] || bad="$bad ratelimit-not-skipped"
+[ "$(_resume '{"probe":{"observed":"paused"}}')" = "resume-unidentified" ]  || bad="$bad no-id-not-declined"
+[ "$(_resume "$(_pj paused 771)" true)" = "would-resume" ] || bad="$bad dry-not-would"
 [ ! -s "$WORK/wp-writes.log" ] || bad="$bad gated-cases-delivered"
-[ "$(_resume '{"probe":{"observed":"paused"},"review":{"id":771}}')" = "resumed" ] || bad="$bad paused-not-resumed"
+[ "$(_resume "$(_pj paused 771)")" = "resumed" ] || bad="$bad paused-not-resumed"
 grep -q 'resume' "$WORK/wp-writes.log" || bad="$bad resume-verb-missing"
 grep -q 'review' "$WORK/wp-writes.log" && bad="$bad resume-posted-review"
-# A spent pause note stays spent across a NEW head; a NEW pause note on the
-# same PR is a fresh recovery. The trigger's head marker never interferes.
-cat >"$WORK/wp-bin/gh" <<EOF
-#!/bin/sh
-printf '[{"user":{"login":"rev-bot"},"body":"x $(p4b_barrier_marker resume pause-771)"},{"user":{"login":"rev-bot"},"body":"x $(p4b_barrier_marker trigger rhead1)"}]\n'
-EOF
+# A spent pause note stays spent; a NEW pause note is a fresh recovery even
+# though the OLD resume's first line is the bare command — its created_at
+# predates the new note's fresh_at, so the episode scoping excludes it. And a
+# bare resume from coderabbit-wait.sh's own recovery INSIDE the episode is
+# recognised (round-2 interop): two paths, one spent test.
+jq -n --arg m "$(p4b_barrier_marker resume pause-771)" --arg t "x $(p4b_barrier_marker trigger rhead1)" \
+  '[{user:{login:"rev-bot"},created_at:"2026-06-04T11:00:00Z",body:("@coderabbitai resume\n\n"+$m)},
+    {user:{login:"rev-bot"},created_at:"2026-06-04T11:00:00Z",body:$t}]' >"$WORK/wp-comments.json"
+printf '#!/bin/sh\ncat "%s"\n' "$WORK/wp-comments.json" >"$WORK/wp-bin/gh"
 chmod +x "$WORK/wp-bin/gh"
 : >"$WORK/wp-writes.log"
-[ "$(_resume '{"probe":{"observed":"paused"},"review":{"id":771}}')" = "already-resumed" ] || bad="$bad pause-not-deduped"
-[ "$(_resume '{"probe":{"observed":"paused"},"review":{"id":888}}')" = "resumed" ] || bad="$bad new-pause-blocked"
+[ "$(_resume "$(_pj paused 771)")" = "already-resumed" ] || bad="$bad pause-not-deduped"
+[ "$(_resume "$(_pj paused 888)")" = "resumed" ] || bad="$bad new-pause-blocked"
 [ ! -s "$WORK/wp-writes.log" ] && bad="$bad new-pause-not-delivered"
+# coderabbit-wait.sh's markerless resume, created after the note's fresh_at.
+jq -n '[{user:{login:"rev-bot"},created_at:"2026-06-04T12:30:00Z",body:"@coderabbitai resume"}]' >"$WORK/wp-comments.json"
+printf '#!/bin/sh\ncat "%s"\n' "$WORK/wp-comments.json" >"$WORK/wp-bin/gh"
+chmod +x "$WORK/wp-bin/gh"
+: >"$WORK/wp-writes.log"
+[ "$(_resume "$(_pj paused 999)")" = "already-resumed" ] || bad="$bad wait-resume-not-recognised"
+[ ! -s "$WORK/wp-writes.log" ] || bad="$bad interop-delivered"
 if [ -z "$bad" ]; then
   pass "#847: resume fires only on an identified pause, dedups on the pause note across heads, never on the trigger marker"
 else
