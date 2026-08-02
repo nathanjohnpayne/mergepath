@@ -781,13 +781,6 @@ else:
         bad("FAIL: [#850 phase-1 unconditional] the phase-1 step %r carries a" % label,
             "      step-level if: %r. A conditional publisher skips exactly when" % first["if"],
             "      the run it guards is the one that needed to retire a stale verdict.")
-    if first.get("continue-on-error", False) is not False:
-        bad("FAIL: [#850 phase-1 unconditional] the phase-1 step %r sets" % label,
-            "      continue-on-error: %r. A tolerated POST failure lets the job" % first["continue-on-error"],
-            "      run on with no pending entry opened: phase 2 skips on its empty",
-            "      open id and the previous synthetic verdict is never retired, so",
-            "      the publisher must be allowed to fail the job. Absence or a",
-            "      literal false only — an expression is not provably disabled.")
     env = first.get("env") or {}
     absent = [name for name in ("HEAD_SHA", "GH_TOKEN") if name not in env]
     if absent:
@@ -869,6 +862,19 @@ for key in PRODUCERS:
         if not isinstance(step, dict):
             continue
         sname = step.get("name") or "<unnamed>"
+        # Key ABSENCE, never value interpretation (two App P2s on #852): a
+        # tolerated failure anywhere in a producer breaks the chain silently
+        # (phase 1 opens nothing and phase 2 skips; a failed sweep find
+        # yields no PR list and the publish step skips) — and any value test
+        # would run on PyYAML 1.1 resolution, where no/off construct to
+        # False while Actions retains them as strings. A gate that never
+        # reads the value cannot diverge from Actions semantics on it.
+        if "continue-on-error" in step:
+            bad("FAIL: [#850 producer eligibility] step %r in job '%s' carries a" % (sname, key),
+                "      continue-on-error key. A tolerated failure silently breaks",
+                "      this producer's publish chain, so the key must be absent on",
+                "      every producer step — its default is already the required",
+                "      behavior.")
         if "if" in step and normalized_if(step["if"]) != STEP_IF_ALLOWED.get((key, sname)):
             bad("FAIL: [#850 producer eligibility] step %r in job '%s' carries a" % (sname, key),
                 "      step-level if: %r that is not ITS pinned condition — the job" % step["if"],

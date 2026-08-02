@@ -1813,6 +1813,12 @@ mcg22_case x2 's{^(  scheduled-sweep:\n)}{$1    concurrency:\n      group: mcg-s
   fail "declares a concurrency"
 mcg22_case x3 's{^(  dispatch-recheck:\n)}{$1    concurrency:\n      group: mcg-dispatch\n      cancel-in-progress: false\n}m' \
   fail "declares a concurrency"
+# z — continue-on-error on a LATER producer step, in YAML 1.1 alias form:
+#     a tolerated find failure yields no PR list and the sweep publish step
+#     skips green; and `no` constructs to False under PyYAML, so any
+#     value-reading acceptance would wave it through (two App P2s on #852).
+mcg22_case z 's{^(      - name: Find open PRs\n)}{$1        continue-on-error: no\n}m' \
+  fail "continue-on-error"
 unset MCG_TAG
 
 # g — positive control on the REAL file. Case I uses a synthesized header; this
