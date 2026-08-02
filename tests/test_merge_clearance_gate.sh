@@ -1569,26 +1569,26 @@ mcg22_case() {  # <name> <perl-program-or-empty> <expect: fail|pass> [expected-F
   if [ -n "$prog" ]; then perl -0777 -pe "$prog" "$f.raw" > "$f"; else cp "$f.raw" "$f"; fi
   # A no-op substitution means the case is testing nothing.
   if [ -n "$prog" ] && cmp -s "$f.raw" "$f"; then
-    fail "#845 case $name: the mutation changed nothing — anchor drifted"
+    fail "${MCG_TAG:-#845} case $name: the mutation changed nothing — anchor drifted"
     return
   fi
   rc=$(mcg22_run "$f")
   if [ "$expect" = pass ]; then
     if [ "$rc" -eq 0 ]; then
-      pass "#845 case $name: positive control — a compliant job is accepted"
+      pass "${MCG_TAG:-#845} case $name: positive control — a compliant job is accepted"
     else
-      fail "#845 case $name: expected pass, got rc=$rc"
+      fail "${MCG_TAG:-#845} case $name: expected pass, got rc=$rc"
       sed 's/^/      /' "$f.out" | head -4 >&2
     fi
     return
   fi
   if [ "$rc" -eq 0 ]; then
-    fail "#845 case $name: expected the check to reject this shape, got rc=0"
+    fail "${MCG_TAG:-#845} case $name: expected the check to reject this shape, got rc=0"
   elif [ -n "$want" ] && ! grep -qF -- "$want" "$f.out"; then
-    fail "#845 case $name: rejected, but not for its own reason (wanted: $want)"
+    fail "${MCG_TAG:-#845} case $name: rejected, but not for its own reason (wanted: $want)"
     grep '^FAIL' "$f.out" | sed 's/^/      /' | head -3 >&2
   else
-    pass "#845 case $name: the check rejects it, naming the right cause"
+    pass "${MCG_TAG:-#845} case $name: the check rejects it, naming the right cause"
   fi
 }
 
@@ -1629,6 +1629,73 @@ mcg22_case L 's{(  scheduled-sweep:.*?)gh api -X POST "repos/\$REPO/check-runs"}
 mcg22_case M 's{(.*)-f name="\$CHECK_NAME"}{$1-f name="Some Other Check"}s' fail 'must POST a check_run under CHECK_NAME'
 # I — positive control.
 mcg22_case I '' pass
+
+# ---------------------------------------------------------------------------
+# Test 24 (#850): the STRUCTURAL layer — assertions over the PARSED document.
+#
+# Position and eligibility have no text reformulation available: they are
+# statements about which step comes FIRST and whether a job's if: can ever be
+# true. Every case below breaks exactly ONE of them in a fixture derived from
+# the canonical workflow (never hand-written — a hand-maintained control drifted
+# behind the check on five consecutive rounds in #849, and a control weaker than
+# its subject is a false pass in the direction that hides regressions) and
+# asserts the check names THAT property rather than merely going red.
+#
+# Reuses the Test 22 harness verbatim, retagged: its no-op guard (a mutation
+# that changed nothing means the anchor drifted) matters more here, because
+# these anchors are step names and indents in a file that keeps being edited.
+#
+# Gated on PyYAML: the check soft-skips the structural layer without it (the
+# scripts/ci/check_workflow_parsers posture), so there is nothing to test.
+# ---------------------------------------------------------------------------
+if python3 -c "import yaml" >/dev/null 2>&1; then
+echo; echo "--- Test 24 (#850): structural assertions over the parsed workflow"
+MCG_TAG='#850'
+
+# a — phase 1 demoted below the checkout. Every string assertion still passes:
+#     the POST and status=in_progress are present, just no longer first, so a
+#     checkout failure now happens before anything retires the stale verdict.
+mcg22_case a 's{(      - name: Open the required check_run.*?)(      - name: Checkout repo.*?)(      - name: Resolve PR number)}{$2$1$3}s' \
+  fail '[#850 phase-1 position]'
+# b — phase 1 made conditional. success() is TRUTHY on purpose: the property is
+#     that phase 1 carries no step-level if: AT ALL, not that its if is falsy.
+mcg22_case b 's{(      - name: Open the required check_run[^\n]*\n)}{$1        if: success()\n}' \
+  fail '[#850 phase-1 unconditional]'
+# c — the sweep can never run. Trigger, CHECK_NAME, POST, permissions all
+#     intact; only the parse sees that the job is unreachable.
+mcg22_case c 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: false}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# d — #849 hole 1: phase 2 loses its own HEAD_SHA. A job-scoped grep for the
+#     binding is satisfied by phase 1's.
+mcg22_case d 's{(      - name: Close the required check_run.*?)^          HEAD_SHA: [^\n]*\n}{$1}sm' \
+  fail '[#850 phase-2 head binding]'
+# e — #849 hole 2: a gh-invoking step loses its token, so gh falls back to
+#     unauthenticated and the sweep cannot list PRs at all.
+mcg22_case e 's{(      - name: Find open PRs.*?)^          GH_TOKEN: [^\n]*\n}{$1}sm' \
+  fail "[#850 gh token binding] step 'Find open PRs' in job 'scheduled-sweep'"
+# f — truncated mid-document, leaving an unterminated quoted scalar. Must fail
+#     LOUDLY naming the parse error; a parser that silently matches nothing
+#     turns every assertion above into a no-op.
+mcg22_case f 's{(    - cron: "\*/15).*}{$1}s' fail 'does not parse as YAML'
+unset MCG_TAG
+
+# g — positive control on the REAL file. Case I uses a synthesized header; this
+#     asserts the canonical workflow passes the whole check unmodified.
+set +e
+OUT=$(MCG_SKIP_FIX3_SELFTEST=1 \
+  MERGE_CLEARANCE_WORKFLOW="$ROOT/.github/workflows/merge-clearance-gate.yml" \
+  "$CHECK_BIN" 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 0 ]; then
+  pass "#850 case g: the unmodified canonical workflow passes the whole check"
+else
+  fail "#850 case g: the canonical workflow must pass the check; got rc=$RC"
+  grep '^FAIL' <<<"$OUT" | sed 's/^/      /' | head -4 >&2
+fi
+else
+  echo; echo "SKIP: Test 24 (#850) — PyYAML unavailable (the check soft-skips it too)"
+fi
 
 fi  # end re-entrancy guard (MCG_SKIP_FIX3_SELFTEST)
 

@@ -574,6 +574,190 @@ if [ -f "$WORKFLOW" ]; then
       FAILED=1
     fi
   fi
+
+  # --- #850: structural assertions over the PARSED document ----------------
+  #
+  # ADDITIVE. Everything above stays: the exact `-f` flags inside a `run:` body
+  # are shell, not YAML, so a parse cannot see them. What a parse can see, and
+  # text matching cannot express at all, is POSITION and REACHABILITY:
+  #
+  #   PHASE-1 POSITION. The assertions above prove the POST and
+  #   status=in_progress occur SOMEWHERE in the job block. Moving that step
+  #   below the checkout, or giving it a step-level `if:`, satisfies every one
+  #   of them — and any earlier failure then happens BEFORE the pending entry
+  #   retires the previous synthetic verdict, which is the only reason phase 1
+  #   exists.
+  #
+  #   PRODUCER ELIGIBILITY. `if: false` on scheduled-sweep leaves the
+  #   top-level `schedule:` trigger and every matched string intact, so the
+  #   producer loop above passes while the no-event transitions (a 👍 reaction,
+  #   a UI thread resolve, a GITHUB_TOKEN relabel) stop refreshing the required
+  #   context.
+  #
+  # The other two properties are #849 holes that a parse closes cheaply: the
+  # phase-2 step's own HEAD_SHA binding (a job-scoped grep is satisfied by
+  # phase 1's), and GH_TOKEN on every gh-invoking step (an unbound token makes
+  # the call fall back to no credentials and the publish 401s).
+  #
+  # Parser posture, and the two cases are NOT the same:
+  #   - PyYAML ABSENT is an environment gap → loud SKIP, exit 0. Same idiom as
+  #     scripts/ci/check_workflow_parsers (its agent-review.yml parse tier) and
+  #     scripts/ci/check_auto_clear_workflow: a YAML parser is never a hard
+  #     dependency of scripts/ci/check_*. GitHub-hosted runners ship PyYAML, so
+  #     enforcement is real in CI.
+  #   - The DOCUMENT failing to parse is a defect → hard FAIL naming the parse
+  #     error. Silently matching nothing would let a broken edit land green and
+  #     surface only when Actions rejects the workflow at schedule time.
+  # The yq tier those precedents try first is deliberately not used here: they
+  # probe validity (one expression), these are assertions over the document,
+  # and a yq spelling would be a second implementation to keep in sync.
+  if ! python3 -c "import yaml" >/dev/null 2>&1; then
+    echo "  SKIP: PyYAML unavailable — the #850 structural assertions did NOT run."
+    echo "        Install PyYAML to enforce phase-1 position + producer eligibility."
+  elif ! python3 - "$WORKFLOW" <<'PY'
+import re
+import sys
+
+import yaml
+
+WORKFLOW = sys.argv[1]
+# The three jobs that publish the required context, same set as the text loop.
+PRODUCERS = ("merge-clearance-gate", "scheduled-sweep", "dispatch-recheck")
+# Exact-match allowlists, never containment (the #849 lesson, third shape): a
+# value that CONTAINS the wanted expression — `literal-${{ ... }}` — satisfies
+# a substring test while the publisher submits something GitHub rejects.
+GH_TOKEN_OK = ("${{ secrets.GITHUB_TOKEN }}",)
+HEAD_SHA_OK = ("${{ github.event.pull_request.head.sha }}",)
+# Conservative falsy set. The real jobs carry legitimate truthy expressions
+# (github.event_name == 'schedule'), which MUST pass; this rejects only values
+# GitHub can never evaluate true. `if: false` parses to Python False, whose
+# str() is "false", so the bare bool is covered by the same set.
+FALSY = ("false", "${{ false }}", "0")
+
+failures = []
+
+
+def bad(*lines):
+    failures.extend(lines)
+
+
+def strip_comments(text):
+    """Full-line AND inline `#` comments removed, same as mcg_strip above.
+
+    #843 documents its design in prose at the call sites, so an unstripped
+    body matches the explanation after the code implementing it is gone.
+    """
+    text = re.sub(r"(?m)^[ \t]*#.*$", "", text)
+    return re.sub(r"(?m)[ \t]#.*$", "", text)
+
+
+def step_named(job, want):
+    for step in job.get("steps") or []:
+        if want in (step.get("name") or ""):
+            return step
+    return None
+
+
+try:
+    with open(WORKFLOW, encoding="utf-8") as handle:
+        doc = yaml.safe_load(handle)
+except Exception as exc:  # any parse failure carries the same verdict
+    print("FAIL: %s does not parse as YAML: %s" % (WORKFLOW, " ".join(str(exc).split())))
+    print("      A workflow that cannot be parsed must fail LOUDLY here. Silently")
+    print("      matching nothing would let a broken edit land green and surface")
+    print("      only when Actions rejects the workflow at schedule time (#850).")
+    sys.exit(1)
+
+jobs = (doc or {}).get("jobs")
+if not isinstance(jobs, dict):
+    print("FAIL: %s parses but has no jobs: mapping — the #850 structural" % WORKFLOW)
+    print("      assertions have nothing to scope to and would pass vacuously.")
+    sys.exit(1)
+
+# Property 1 — phase 1 is the FIRST step, unconditional, with its own bindings.
+event_job = jobs.get("merge-clearance-gate")
+steps = (event_job or {}).get("steps") or []
+if not steps:
+    bad("FAIL: [#850 phase-1 position] the merge-clearance-gate job declares no",
+        "      steps, so nothing opens the in-progress check_run.")
+else:
+    first = steps[0]
+    label = first.get("name") or "<unnamed>"
+    body = strip_comments(first.get("run") or "")
+    if "check-runs" not in body or "in_progress" not in body:
+        bad("FAIL: [#850 phase-1 position] the FIRST step of merge-clearance-gate is",
+            "      %r, which does not POST to check-runs with status=in_progress." % label,
+            "      Every failure after this point — checkout, PR resolve, gate crash,",
+            "      runner death — only fails CLOSED if the pending entry already",
+            "      retired the previous verdict, so phase 1 must come first.")
+    if "if" in first:
+        bad("FAIL: [#850 phase-1 unconditional] the phase-1 step %r carries a" % label,
+            "      step-level if: %r. A conditional publisher skips exactly when" % first["if"],
+            "      the run it guards is the one that needed to retire a stale verdict.")
+    env = first.get("env") or {}
+    absent = [name for name in ("HEAD_SHA", "GH_TOKEN") if name not in env]
+    if absent:
+        bad("FAIL: [#850 phase-1 env] the phase-1 step %r does not bind %s in its" % (label, ", ".join(absent)),
+            "      env. Under set -u an unbound HEAD_SHA exits before the POST, and an",
+            "      unbound GH_TOKEN makes it 401 — either way nothing opens the run.")
+
+# Property 2 — every producer is reachable on its own trigger.
+for key in PRODUCERS:
+    job = jobs.get(key)
+    if not isinstance(job, dict):
+        bad("FAIL: [#850 producer eligibility] job '%s' is missing or is not a" % key,
+            "      mapping; that trigger path publishes nothing.")
+        continue
+    if "if" in job and str(job["if"]).strip().lower() in FALSY:
+        bad("FAIL: [#850 producer eligibility] job '%s' carries a falsy job-level" % key,
+            "      if: %r, so it never runs. Every trigger and every matched" % job["if"],
+            "      string survives that edit — only the parse sees it — while that",
+            "      path stops refreshing the required context.")
+
+# Property 3 — phase 2 binds the PR head itself (#849 hole: a job-scoped grep
+# for HEAD_SHA is satisfied by phase 1's binding while phase 2 has lost its).
+close_step = step_named(event_job or {}, "Close the required check_run")
+if close_step is None:
+    bad("FAIL: [#850 phase-2 head binding] the merge-clearance-gate job has no",
+        "      'Close the required check_run' step, so the run phase 1 opened is",
+        "      never completed and the required context stays PENDING.")
+elif (close_step.get("env") or {}).get("HEAD_SHA") not in HEAD_SHA_OK:
+    bad("FAIL: [#850 phase-2 head binding] the 'Close the required check_run' step",
+        "      binds HEAD_SHA to %r; it must be exactly" % (close_step.get("env") or {}).get("HEAD_SHA"),
+        "      ${{ github.event.pull_request.head.sha }}. Phase 2 compares that value",
+        "      against the live head to decide success vs head-moved, so any other",
+        "      binding either kills the step under set -u or publishes on a commit",
+        "      branch protection never consults.")
+
+# Property 4 — every gh-invoking step binds the token (#849 hole).
+# Detection runs over the UN-stripped body on purpose: prose mentioning `gh`
+# only ever OVER-includes a step (it then has to bind the token it does not
+# use), whereas stripping first would let a `gh` call hidden after a `#` on a
+# live line escape the requirement entirely.
+GH_INVOKE = re.compile(r"(?<![A-Za-z0-9_./-])gh[ \t]")
+for key in PRODUCERS:
+    job = jobs.get(key)
+    if not isinstance(job, dict):
+        continue
+    for step in job.get("steps") or []:
+        if not GH_INVOKE.search(step.get("run") or ""):
+            continue
+        token = (step.get("env") or {}).get("GH_TOKEN")
+        if token not in GH_TOKEN_OK:
+            bad("FAIL: [#850 gh token binding] step %r in job '%s' invokes gh but" % (step.get("name") or "<unnamed>", key),
+                "      binds GH_TOKEN to %r. The only accepted value is" % token,
+                "      ${{ secrets.GITHUB_TOKEN }} — gh with no token falls back to",
+                "      unauthenticated and the check_run publish 401s, leaving that",
+                "      trigger path silently not refreshing the required context.")
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+sys.exit(0)
+PY
+  then
+    FAILED=1
+  fi
 fi
 
 if [ "$FAILED" -ne 0 ]; then
