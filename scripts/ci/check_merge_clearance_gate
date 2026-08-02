@@ -657,12 +657,17 @@ def is_falsy_if(value):
         text = wrapped.group(1)
     # GitHub's falsy LITERALS are a closed set: false, null, the empty
     # string, and numeric zero in any spelling (-0, 0.0, 0e0). Normalising
-    # quotes and numeric value terminates the set — this is not an
-    # enumeration that can drift. Applied to bare values too, not only
-    # wrapped ones: YAML hands a bare `if: 0.0` over as the float whose
-    # str() is "0.0", which no literal tuple can enumerate.
+    # numeric value terminates the set — this is not an enumeration that can
+    # drift. Applied to bare values too, not only wrapped ones: YAML hands a
+    # bare `if: 0.0` over as the float whose str() is "0.0", which no literal
+    # tuple can enumerate.
+    #
+    # A QUOTED expression literal is its own arm: only the EMPTY quoted
+    # string is falsy — GitHub treats every non-empty string literal,
+    # including '0', as truthy, so stripping the quotes and falling into the
+    # numeric check would falsely reject an eligible producer.
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
-        text = text[1:-1]
+        return text[1:-1] == ""
     try:
         if float(text) == 0:
             return True

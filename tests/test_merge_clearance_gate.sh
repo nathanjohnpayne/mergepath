@@ -1723,6 +1723,13 @@ mcg22_case c5 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: 0.0}sm' \
 #     first-step property must fail with its own named cause instead.
 mcg22_case j 's{(    steps:\n)(      - name: Open the required check_run)}{$1      - just-a-string\n$2}' \
   fail '[#850 phase-1 position]'
+# c6 — a QUOTED non-empty expression literal is TRUTHY to GitHub ('0'
+#      included); the eligibility check must not strip the quotes into the
+#      numeric arm and falsely red an eligible producer.
+mcg22_case c6 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ \x270\x27 \}\}}sm' pass
+# c7 — the EMPTY quoted literal is the one falsy quoted form.
+mcg22_case c7 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ \x27\x27 \}\}}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
 unset MCG_TAG
 
 # g — positive control on the REAL file. Case I uses a synthesized header; this
