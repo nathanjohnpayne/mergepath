@@ -1,0 +1,117 @@
+@prefix mp:   <https://github.com/nathanjohnpayne/mergepath/ontology#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+##############################################################################
+# Violation fixtures — every individual carrying mp:seededViolation breaks
+# exactly the named catalog rule; the checker asserts each one is caught by
+# the reasoner. Supporting individuals (agents, identities, commits) carry no
+# seeding annotation and are not themselves violations.
+##############################################################################
+
+### Supporting individuals
+mp:claudeAgent rdf:type mp:Agent .
+mp:nathanjohnpayne rdf:type mp:AuthorIdentity .
+mp:nathanpayneClaude rdf:type mp:ReviewerIdentity .
+mp:claudeActor rdf:type mp:AgentActor .
+mp:autoClearWorkflow rdf:type mp:WorkflowActor .
+mp:gaycruisebingo rdf:type mp:Consumer .
+mp:commitOld rdf:type mp:Commit .
+mp:commitNew rdf:type mp:Commit .
+mp:commitOld owl:differentFrom mp:commitNew .
+mp:redGateRun rdf:type mp:CheckRun .
+mp:openThread rdf:type mp:UnresolvedThread .
+mp:ownerThread rdf:type mp:HumanAuthoredThread .
+mp:brandVerbatimEntry rdf:type mp:CanonicalEntry .
+
+### V1 — same-agent approval on a Phase 4 PR (AX3)
+mp:prSelfApproved rdf:type mp:Phase4PR ;
+    mp:authoredByAgent mp:claudeAgent ;
+    mp:phase4ApprovedByAgent mp:claudeAgent ;
+    mp:seededViolation "R-13" .
+
+### V2 — a reviewer identity merged a PR (AX4 + AX1)
+mp:prMergedByReviewer rdf:type mp:MergedPR ;
+    mp:mergedBy mp:nathanpayneClaude ;
+    mp:seededViolation "R-9" ;
+    mp:violationWitness mp:nathanpayneClaude .
+
+### V3 — a commit attributed to a reviewer identity (AX5 + AX1)
+mp:commitByReviewer rdf:type mp:Commit ;
+    mp:commitAuthoredBy mp:nathanpayneClaude ;
+    mp:seededViolation "R-27" ;
+    mp:violationWitness mp:nathanpayneClaude .
+
+### V4 — merged while human-hold present (AX6)
+mp:prMergedWithHold rdf:type mp:MergedPR ;
+    mp:hasLabel mp:humanHold ;
+    mp:seededViolation "R-164" .
+
+### V5 — an interactive agent removed human-hold (AX7a)
+mp:agentRemovesHold rdf:type mp:LabelRemoval ;
+    mp:performedBy mp:claudeActor ;
+    mp:removesLabel mp:humanHold ;
+    mp:seededViolation "R-163" .
+
+### V6 — a workflow removed a manual-only label (AX7b)
+mp:workflowRemovesPolicyViolation rdf:type mp:LabelRemoval ;
+    mp:performedBy mp:autoClearWorkflow ;
+    mp:removesLabel mp:policyViolation ;
+    mp:seededViolation "R-169" .
+
+### V7 — merged with an unresolved review thread (AX8)
+mp:prMergedUnresolved rdf:type mp:MergedPR ;
+    mp:hasThread mp:openThread ;
+    mp:seededViolation "R-51" .
+
+### V8 — an agent resolved a real human-authored thread (AX9)
+mp:agentResolvesHumanThread rdf:type mp:ThreadResolution ;
+    mp:performedBy mp:claudeActor ;
+    mp:resolvesThread mp:ownerThread ;
+    mp:seededViolation "R-60" .
+
+### V9 — a doc typed with two disjoint ownership classes (AX10)
+mp:docTwoClasses rdf:type mp:CanonicalDoc , mp:HubOnlyDoc ;
+    mp:seededViolation "G-65" .
+
+### V10 — a doc declaring two different ownership-class values (AX11)
+mp:docTwoOwnershipValues rdf:type mp:Doc ;
+    mp:hasOwnershipClass mp:canonicalClass , mp:hubOnlyClass ;
+    mp:seededViolation "G-65" ;
+    mp:violationWitness mp:canonicalClass .
+
+### V11 — a hub-only doc propagated to a consumer (AX12; the #864 class)
+mp:hubGlossaryInConsumer rdf:type mp:HubOnlyDoc ;
+    mp:propagatedTo mp:gaycruisebingo ;
+    mp:seededViolation "G-68" .
+
+### V12 — an identity doc carried by a verbatim canonical entry (AX13)
+mp:brandDocVerbatim rdf:type mp:IdentityDoc ;
+    mp:carriedBy mp:brandVerbatimEntry ;
+    mp:seededViolation "G-76" .
+
+### V13 — a merge clearance anchored to a commit that is not the PR head (AX16)
+mp:prStaleClearance rdf:type mp:PullRequest ;
+    mp:prHead mp:commitNew ;
+    mp:mergeClearedBy mp:staleClearance ;
+    mp:seededViolation "R-89" ;
+    mp:violationWitness mp:commitOld .
+mp:staleClearance rdf:type mp:Clearance ;
+    mp:anchorsCommit mp:commitOld .
+
+### V14 — merged with a failing required check (AX17)
+mp:prMergedRedCheck rdf:type mp:MergedPR ;
+    mp:hasFailingRequiredCheck mp:redGateRun ;
+    mp:seededViolation "R-96" .
+
+### V15 — a repo that is both hub and consumer (AX15)
+mp:confusedRepo rdf:type mp:Hub , mp:Consumer ;
+    mp:seededViolation "G-68-topology" .
+
+### V16 — a manifest entry typed both canonical and templated (AX14)
+mp:entryTwoTypes rdf:type mp:CanonicalEntry , mp:TemplatedEntry ;
+    mp:seededViolation "G-86" .
+
+### V17 — a PR both over and under the threshold (AX18)
+mp:prBothThresholds rdf:type mp:Phase4PR , mp:UnderThresholdPR ;
+    mp:seededViolation "R-183" .

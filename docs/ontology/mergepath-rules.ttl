@@ -1,0 +1,325 @@
+@prefix mp:   <https://github.com/nathanjohnpayne/mergepath/ontology#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+##############################################################################
+# Mergepath rules ontology (TBox)
+#
+# Formalizes a core subset of the configuration (●) rules from
+# docs/ontology/rules.md as OWL axioms whose violation an OWL-RL reasoner
+# detects. Every violation-catching axiom carries mp:encodesRule naming the
+# catalog rule IDs it encodes. Detection channels (see README.md): an
+# individual entailed into owl:Nothing, or a reasoner inconsistency message
+# (disjoint classes / disjoint properties / functional-plus-differentFrom).
+#
+# This is a derived model. On any divergence from REVIEW_POLICY.md,
+# rules/repo_rules.md, or the propagation manifest, the source wins.
+##############################################################################
+
+<https://github.com/nathanjohnpayne/mergepath/ontology>
+    rdf:type owl:Ontology ;
+    rdfs:label "Mergepath rules ontology" ;
+    rdfs:comment "OWL axioms catching violations of Mergepath's configuration rules; companion to docs/ontology/rules.md and CONTEXT.md." .
+
+mp:encodesRule rdf:type owl:AnnotationProperty ;
+    rdfs:comment "Names the docs/ontology/rules.md rule ID(s) an axiom encodes." .
+
+mp:seededViolation rdf:type owl:AnnotationProperty ;
+    rdfs:comment "Fixture-only: marks an individual deliberately violating the named rule; the checker asserts every bearer is caught." .
+
+mp:violationWitness rdf:type owl:AnnotationProperty ;
+    rdfs:comment "Fixture-only: names the individual the reasoner's inconsistency message is expected to surface, when it differs from the seeded subject (e.g. the identity inferred into two disjoint classes)." .
+
+### ─── Identities and actors ────────────────────────────────────────────────
+
+mp:Identity rdf:type owl:Class .
+mp:AuthorIdentity rdf:type owl:Class ; rdfs:subClassOf mp:Identity .
+mp:ReviewerIdentity rdf:type owl:Class ; rdfs:subClassOf mp:Identity .
+
+# AX1 — the author identity and reviewer identities are distinct accounts.
+mp:AuthorIdentity owl:disjointWith mp:ReviewerIdentity ;
+    mp:encodesRule "R-9, R-10, R-11" .
+
+mp:Agent rdf:type owl:Class ;
+    rdfs:comment "A software agent (claude, cursor, codex) — distinct from the GitHub identities it uses." .
+
+mp:Actor rdf:type owl:Class .
+mp:HumanActor rdf:type owl:Class ; rdfs:subClassOf mp:Actor .
+mp:AgentActor rdf:type owl:Class ; rdfs:subClassOf mp:Actor .
+mp:WorkflowActor rdf:type owl:Class ; rdfs:subClassOf mp:Actor .
+
+# AX2 — humans, interactive agents, and workflow automations are disjoint actor kinds.
+[ rdf:type owl:AllDisjointClasses ;
+  owl:members ( mp:HumanActor mp:AgentActor mp:WorkflowActor ) ;
+  mp:encodesRule "R-162, R-167" ] .
+
+### ─── Pull requests, commits, reviews ──────────────────────────────────────
+
+mp:PullRequest rdf:type owl:Class .
+mp:Phase4PR rdf:type owl:Class ; rdfs:subClassOf mp:PullRequest ;
+    rdfs:comment "A PR meeting the external-review threshold or matching a protected path." .
+mp:UnderThresholdPR rdf:type owl:Class ; rdfs:subClassOf mp:PullRequest .
+mp:MergedPR rdf:type owl:Class ; rdfs:subClassOf mp:PullRequest .
+
+# AX18 — a PR is either Phase 4 or under-threshold, never both.
+mp:Phase4PR owl:disjointWith mp:UnderThresholdPR ;
+    mp:encodesRule "R-183" .
+
+mp:Commit rdf:type owl:Class .
+mp:Clearance rdf:type owl:Class ;
+    rdfs:comment "A HEAD-pinned affirmative external-review signal." .
+mp:CheckRun rdf:type owl:Class .
+
+mp:authoredByAgent rdf:type owl:ObjectProperty ;
+    rdfs:domain mp:PullRequest ; rdfs:range mp:Agent ;
+    rdfs:comment "The agent named by the PR's Authoring-Agent line." .
+
+mp:approvedByAgent rdf:type owl:ObjectProperty ;
+    rdfs:domain mp:PullRequest ; rdfs:range mp:Agent ;
+    rdfs:comment "An agent whose reviewer identity approved the PR (any threshold)." .
+
+mp:phase4ApprovedByAgent rdf:type owl:ObjectProperty ;
+    rdfs:subPropertyOf mp:approvedByAgent ;
+    rdfs:comment "An agent whose reviewer identity approved a Phase 4 PR — asserted only for approvals on threshold PRs." .
+
+# AX3 — no-self-approve, correctly scoped: the agent that authored a Phase 4
+# PR can never be the agent whose reviewer identity approves it. Plain
+# approvedByAgent stays legal, so under-threshold self-approval (R-14) is
+# untouched.
+mp:authoredByAgent owl:propertyDisjointWith mp:phase4ApprovedByAgent ;
+    mp:encodesRule "R-8, R-13, R-15" .
+
+mp:mergedBy rdf:type owl:ObjectProperty ;
+    rdfs:domain mp:PullRequest ; rdfs:range mp:Identity .
+
+# AX4 — only the author identity merges: anything a merged PR was merged by
+# is an AuthorIdentity; a reviewer-identity merger contradicts AX1.
+mp:MergedPR rdfs:subClassOf
+    [ rdf:type owl:Restriction ;
+      owl:onProperty mp:mergedBy ;
+      owl:allValuesFrom mp:AuthorIdentity ] ;
+    mp:encodesRule "R-9, R-10, R-104" .
+
+mp:commitAuthoredBy rdf:type owl:ObjectProperty ;
+    rdfs:domain mp:Commit ; rdfs:range mp:Identity .
+
+# AX5 — commits always attribute to the author identity; a reviewer-identity
+# commit byline contradicts AX1.
+mp:Commit rdfs:subClassOf
+    [ rdf:type owl:Restriction ;
+      owl:onProperty mp:commitAuthoredBy ;
+      owl:allValuesFrom mp:AuthorIdentity ] ;
+    mp:encodesRule "R-11, R-27" .
+
+### ─── Clearance HEAD-pinning ───────────────────────────────────────────────
+
+mp:prHead rdf:type owl:ObjectProperty , owl:FunctionalProperty ;
+    rdfs:domain mp:PullRequest ; rdfs:range mp:Commit ;
+    rdfs:comment "The PR's current head commit. Functional: a PR has one head." .
+
+mp:mergeClearedBy rdf:type owl:ObjectProperty ;
+    rdfs:domain mp:PullRequest ; rdfs:range mp:Clearance .
+
+mp:anchorsCommit rdf:type owl:ObjectProperty ;
+    rdfs:domain mp:Clearance ; rdfs:range mp:Commit .
+
+# AX16 — a clearance used for merge is pinned to the PR's head: the chain
+# entails that the anchored commit IS the PR head, so with prHead functional,
+# a clearance anchored to a commit differentFrom the head is a contradiction.
+# This is the stale-clearance / mutable-proxy axiom (#427/#428).
+mp:prHead owl:propertyChainAxiom ( mp:mergeClearedBy mp:anchorsCommit ) ;
+    mp:encodesRule "R-89, R-94, R-99, R-100, R-182" .
+
+# AX17 — a merged PR with a failing required check is a contradiction (gate a).
+[ rdf:type owl:Class ;
+  owl:intersectionOf ( mp:MergedPR
+                       [ rdf:type owl:Restriction ;
+                         owl:onProperty mp:hasFailingRequiredCheck ;
+                         owl:someValuesFrom mp:CheckRun ] ) ;
+  rdfs:subClassOf owl:Nothing ;
+  mp:encodesRule "R-5, R-96, R-174" ] .
+
+mp:hasFailingRequiredCheck rdf:type owl:ObjectProperty ;
+    rdfs:domain mp:PullRequest ; rdfs:range mp:CheckRun .
+
+### ─── Labels ───────────────────────────────────────────────────────────────
+
+mp:Label rdf:type owl:Class .
+mp:BlockingLabel rdf:type owl:Class ; rdfs:subClassOf mp:Label ;
+    rdfs:comment "The four human-action labels the Label Gate blocks on." .
+mp:ManualOnlyLabel rdf:type owl:Class ; rdfs:subClassOf mp:BlockingLabel ;
+    rdfs:comment "The three labels no automation may remove (everything but needs-external-review)." .
+
+mp:humanHold rdf:type mp:ManualOnlyLabel .
+mp:needsHumanReview rdf:type mp:ManualOnlyLabel .
+mp:policyViolation rdf:type mp:ManualOnlyLabel .
+mp:needsExternalReview rdf:type mp:BlockingLabel .
+
+mp:hasLabel rdf:type owl:ObjectProperty ;
+    rdfs:domain mp:PullRequest ; rdfs:range mp:Label .
+
+# AX6 — merging with any blocking label present is a contradiction
+# (Label Gate; human-hold supersedes every merge path).
+[ rdf:type owl:Class ;
+  owl:intersectionOf ( mp:MergedPR
+                       [ rdf:type owl:Restriction ;
+                         owl:onProperty mp:hasLabel ;
+                         owl:someValuesFrom mp:BlockingLabel ] ) ;
+  rdfs:subClassOf owl:Nothing ;
+  mp:encodesRule "R-164, R-171" ] .
+
+mp:LabelRemoval rdf:type owl:Class .
+mp:removesLabel rdf:type owl:ObjectProperty ;
+    rdfs:domain mp:LabelRemoval ; rdfs:range mp:Label .
+mp:performedBy rdf:type owl:ObjectProperty ;
+    rdfs:range mp:Actor .
+
+# AX7a — an interactive agent never removes any blocking label.
+[ rdf:type owl:Class ;
+  owl:intersectionOf ( mp:LabelRemoval
+                       [ rdf:type owl:Restriction ;
+                         owl:onProperty mp:performedBy ;
+                         owl:someValuesFrom mp:AgentActor ]
+                       [ rdf:type owl:Restriction ;
+                         owl:onProperty mp:removesLabel ;
+                         owl:someValuesFrom mp:BlockingLabel ] ) ;
+  rdfs:subClassOf owl:Nothing ;
+  mp:encodesRule "R-162, R-163, R-168" ] .
+
+# AX7b — even the sanctioned workflow automations never remove a manual-only
+# label; their carve-out covers needs-external-review alone.
+[ rdf:type owl:Class ;
+  owl:intersectionOf ( mp:LabelRemoval
+                       [ rdf:type owl:Restriction ;
+                         owl:onProperty mp:performedBy ;
+                         owl:someValuesFrom mp:WorkflowActor ]
+                       [ rdf:type owl:Restriction ;
+                         owl:onProperty mp:removesLabel ;
+                         owl:someValuesFrom mp:ManualOnlyLabel ] ) ;
+  rdfs:subClassOf owl:Nothing ;
+  mp:encodesRule "R-167, R-169" ] .
+
+### ─── Review threads ───────────────────────────────────────────────────────
+
+mp:Thread rdf:type owl:Class .
+mp:ResolvedThread rdf:type owl:Class ; rdfs:subClassOf mp:Thread .
+mp:UnresolvedThread rdf:type owl:Class ; rdfs:subClassOf mp:Thread .
+mp:HumanAuthoredThread rdf:type owl:Class ; rdfs:subClassOf mp:Thread ;
+    rdfs:comment "A review thread whose root comment was authored by a real human, not a bot or registered agent reviewer." .
+
+mp:ResolvedThread owl:disjointWith mp:UnresolvedThread .
+
+mp:hasThread rdf:type owl:ObjectProperty ;
+    rdfs:domain mp:PullRequest ; rdfs:range mp:Thread .
+
+# AX8 — the pre-merge conversation gate: a merged PR with an unresolved
+# review thread is a contradiction.
+[ rdf:type owl:Class ;
+  owl:intersectionOf ( mp:MergedPR
+                       [ rdf:type owl:Restriction ;
+                         owl:onProperty mp:hasThread ;
+                         owl:someValuesFrom mp:UnresolvedThread ] ) ;
+  rdfs:subClassOf owl:Nothing ;
+  mp:encodesRule "R-51, R-64" ] .
+
+mp:ThreadResolution rdf:type owl:Class .
+mp:resolvesThread rdf:type owl:ObjectProperty ;
+    rdfs:domain mp:ThreadResolution ; rdfs:range mp:Thread .
+
+# AX9 — an agent never resolves a real human-authored thread.
+[ rdf:type owl:Class ;
+  owl:intersectionOf ( mp:ThreadResolution
+                       [ rdf:type owl:Restriction ;
+                         owl:onProperty mp:performedBy ;
+                         owl:someValuesFrom mp:AgentActor ]
+                       [ rdf:type owl:Restriction ;
+                         owl:onProperty mp:resolvesThread ;
+                         owl:someValuesFrom mp:HumanAuthoredThread ] ) ;
+  rdfs:subClassOf owl:Nothing ;
+  mp:encodesRule "R-60" ] .
+
+### ─── Fleet topology, docs, ownership, manifest ────────────────────────────
+
+mp:Repo rdf:type owl:Class .
+mp:Hub rdf:type owl:Class ; rdfs:subClassOf mp:Repo .
+mp:Consumer rdf:type owl:Class ; rdfs:subClassOf mp:Repo .
+
+# AX15 — the hub is never a consumer.
+mp:Hub owl:disjointWith mp:Consumer ;
+    mp:encodesRule "G-68 (topology premise)" .
+
+mp:Doc rdf:type owl:Class .
+mp:CanonicalDoc rdf:type owl:Class ; rdfs:subClassOf mp:Doc .
+mp:PerRepoOwnedDoc rdf:type owl:Class ; rdfs:subClassOf mp:Doc .
+mp:HubOnlyDoc rdf:type owl:Class ; rdfs:subClassOf mp:Doc .
+mp:IdentityDoc rdf:type owl:Class ; rdfs:subClassOf mp:PerRepoOwnedDoc ;
+    rdfs:comment "The per-repo identity subset (README, BRAND, repository-overview, …)." .
+
+# AX10 — the three ownership classes are pairwise disjoint.
+[ rdf:type owl:AllDisjointClasses ;
+  owl:members ( mp:CanonicalDoc mp:PerRepoOwnedDoc mp:HubOnlyDoc ) ;
+  mp:encodesRule "G-65" ] .
+
+mp:OwnershipClass rdf:type owl:Class .
+mp:canonicalClass rdf:type mp:OwnershipClass .
+mp:perRepoOwnedClass rdf:type mp:OwnershipClass .
+mp:hubOnlyClass rdf:type mp:OwnershipClass .
+
+# AX11 — a doc declares exactly one ownership class value: the property is
+# functional and the three class values are mutually distinct, so two
+# different declared values entail a contradiction.
+mp:hasOwnershipClass rdf:type owl:ObjectProperty , owl:FunctionalProperty ;
+    rdfs:domain mp:Doc ; rdfs:range mp:OwnershipClass ;
+    mp:encodesRule "G-65" .
+
+# Pairwise distinctness of the ownership-class values (asserted explicitly:
+# with hasOwnershipClass functional, two different declared values force a
+# sameAs that clashes with differentFrom).
+mp:canonicalClass owl:differentFrom mp:perRepoOwnedClass , mp:hubOnlyClass ;
+    mp:encodesRule "G-65" .
+mp:perRepoOwnedClass owl:differentFrom mp:hubOnlyClass .
+
+mp:propagatedTo rdf:type owl:ObjectProperty ;
+    rdfs:domain mp:Doc ; rdfs:range mp:Repo .
+
+# AX12 — a hub-only doc propagated to a consumer is a contradiction (a
+# consumer copy is bootstrap residue, never content to sync — the #864 class
+# of error).
+[ rdf:type owl:Class ;
+  owl:intersectionOf ( mp:HubOnlyDoc
+                       [ rdf:type owl:Restriction ;
+                         owl:onProperty mp:propagatedTo ;
+                         owl:someValuesFrom mp:Consumer ] ) ;
+  rdfs:subClassOf owl:Nothing ;
+  mp:encodesRule "G-68, G-77" ] .
+
+mp:ManifestEntry rdf:type owl:Class .
+mp:CanonicalEntry rdf:type owl:Class ; rdfs:subClassOf mp:ManifestEntry .
+mp:KitEntry rdf:type owl:Class ; rdfs:subClassOf mp:ManifestEntry .
+mp:TemplatedEntry rdf:type owl:Class ; rdfs:subClassOf mp:ManifestEntry .
+mp:VerbatimEntry rdf:type owl:Class ; rdfs:subClassOf mp:ManifestEntry ;
+    rdfs:comment "A byte-for-byte propagation entry: canonical or kit." .
+mp:CanonicalEntry rdfs:subClassOf mp:VerbatimEntry .
+mp:KitEntry rdfs:subClassOf mp:VerbatimEntry .
+
+# AX14 — the three entry types are pairwise disjoint (and templated is never
+# verbatim).
+[ rdf:type owl:AllDisjointClasses ;
+  owl:members ( mp:CanonicalEntry mp:KitEntry mp:TemplatedEntry ) ;
+  mp:encodesRule "G-86, G-87" ] .
+mp:TemplatedEntry owl:disjointWith mp:VerbatimEntry .
+
+mp:carriedBy rdf:type owl:ObjectProperty ;
+    rdfs:domain mp:Doc ; rdfs:range mp:ManifestEntry .
+
+# AX13 — a per-repo-owned doc (identity docs included, via subclass) carried
+# by a verbatim entry is a contradiction: the clobber invariant / identity-
+# docs denylist. A templated carrier stays legal — the sanctioned escape.
+[ rdf:type owl:Class ;
+  owl:intersectionOf ( mp:PerRepoOwnedDoc
+                       [ rdf:type owl:Restriction ;
+                         owl:onProperty mp:carriedBy ;
+                         owl:someValuesFrom mp:VerbatimEntry ] ) ;
+  rdfs:subClassOf owl:Nothing ;
+  mp:encodesRule "G-67, G-76, G-78, G-79" ] .
