@@ -132,9 +132,9 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Status probe**: A narration request posted to a slow reviewer purely to surface why a review is stalled; its reply is never a review or clearance signal.
 
-**Barrier**: The ordering construct that holds the automated Phase 4b review until every enabled bot provider is terminal on the exact head, so the automated approval never lands ahead of the bots.
+**Barrier**: The ordering construct that holds the automated Phase 4b review until every enabled bot provider is reported, disabled, or explicitly waived on the exact head, so the automated approval never lands ahead of the bots.
 
-**Hold**: A deliberate wait state distinguished from failure — nothing is posted and no human is paged. Most holds self-clear as the awaited signal arrives; some name a cause needing action instead (a draft PR, a wrong base branch), and only patience-shaped holds should be retried. _Avoid_: conflating with `human-hold` (a human-controlled freeze) or with fallback (a reviewer that will not answer).
+**Hold**: A deliberate wait state distinguished from failure — no verdict or handoff is posted and no human is paged, though a hold may carry a recovery write (a resume, a re-trigger) that callers must read before duplicating it. Most holds self-clear as the awaited signal arrives; some name a cause needing action instead (a draft PR, a wrong base branch), and only patience-shaped holds should be retried. _Avoid_: conflating with `human-hold` (a human-controlled freeze) or with fallback (a reviewer that will not answer).
 
 **Marker**: A stable machine-readable token pinning a fact to a specific SHA or state — the lane's verified-head comment, a resolve-class tag, a pause notice, a pending file. An indeterminate marker read is fail-closed.
 
@@ -150,7 +150,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Required tier / discretionary tier**: A tier whose findings must be dispositioned before merge (blocking) versus one addressed at the agent's judgment — non-blocking as a tier, though an open thread still binds the pre-merge conversation gate until resolved by fix, rebuttal, or explicit deferral with rationale; a third setting, ignore, surfaces nothing.
 
-**Disposition**: What actually happened to a piece of review feedback — a fix, or a rebuttal — followed by resolving the thread. A code commit alone is not a disposition. _Avoid_: "addressed" without the thread resolution.
+**Disposition**: What actually happened to a piece of review feedback — a fix, a rebuttal, or an explicit deferral with rationale — followed by resolving the thread. A code commit alone is not a disposition. _Avoid_: "addressed" without the thread resolution.
 
 **Rebuttal**: A reasoned reply on the finding thread explaining why the finding does not apply — the legitimate alternative to a fix, and the precondition for the repeat-after-rebuttal signal.
 
@@ -262,7 +262,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 ### Testing and enforcement vocabulary
 
-**CI enforcement check**: An executable under `scripts/ci/` validating one invariant on every commit, wired into the repo-lint workflow. _Avoid_: "test" — many checks wrap tests but are not tests; also distinguish from required status checks and the reserved Checks surface.
+**CI enforcement check**: A validation of one invariant on every commit via the repo-lint workflow — usually an executable under `scripts/ci/`, occasionally a deliberately inline workflow step. _Avoid_: "test" — many checks wrap tests but are not tests; also distinguish from required status checks and the reserved Checks surface.
 
 **Repo lint**: The propagated workflow that runs the CI-check kit; its never-propagated annex holds a consumer's local steps so the canonical overwrite cannot clobber them.
 
