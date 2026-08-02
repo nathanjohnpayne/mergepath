@@ -633,6 +633,24 @@ HEAD_SHA_OK = ("${{ github.event.pull_request.head.sha }}",)
 # literals GitHub can never evaluate true. `if: false` parses to Python False,
 # whose str() is "false", so the bare bool is covered by the same set.
 FALSY = ("false", "0", "null", "")
+# Exact job-level conditions per producer (cross-agent P1 on #852). A
+# NON-literal always-false condition — `github.event_name == 'push'` on the
+# schedule-only sweep — defeats any falsy-literal test, and proving a general
+# expression unreachable is expression semantics, not structure. The three
+# conditions are load-bearing eligibility, so they are pinned exactly: a
+# legitimate change to one must update this allowlist in the same diff, which
+# is precisely the loud coupling a fence wants.
+JOB_IF_ALLOWED = {
+    "merge-clearance-gate": (
+        "github.event_name != 'schedule' && github.event_name != 'repository_dispatch'",
+    ),
+    "scheduled-sweep": ("github.event_name == 'schedule'",),
+    "dispatch-recheck": ("github.event_name == 'repository_dispatch'",),
+}
+
+
+def normalized_if(value):
+    return " ".join(str(value).split())
 
 
 def is_falsy_if(value):
@@ -700,10 +718,12 @@ def strip_comments(text):
 
 
 def step_named(job, want):
-    for step in job.get("steps") or []:
+    """Exact-name selection (cross-agent P1 on #852: substring matching had
+    the same decoy ambiguity as the phase-1 identity check)."""
+    for step in (job.get("steps") or []) if isinstance(job, dict) else []:
         # A steps entry can parse to a bare string; .get on it would raise
         # and surface as a traceback instead of a named failure.
-        if isinstance(step, dict) and want in (step.get("name") or ""):
+        if isinstance(step, dict) and (step.get("name") or "") == want:
             return step
     return None
 
@@ -744,6 +764,10 @@ except Exception as exc:  # any parse failure carries the same verdict
     print("      only when Actions rejects the workflow at schedule time (#850).")
     sys.exit(1)
 
+if doc is not None and not isinstance(doc, dict):
+    print("FAIL: %s parses to a non-mapping root (%s) — not a workflow" % (WORKFLOW, type(doc).__name__))
+    print("      document; the structural assertions have nothing to scope to.")
+    sys.exit(1)
 jobs = (doc or {}).get("jobs")
 if not isinstance(jobs, dict):
     print("FAIL: %s parses but has no jobs: mapping — the #850 structural" % WORKFLOW)
@@ -771,13 +795,11 @@ else:
     first = steps[0]
     label = first.get("name") or "<unnamed>"
     body = strip_comments(first.get("run") or "")
-    # Identity AND content, on the SAME step. Two unconnected substrings alone
-    # would accept a preliminary step whose run body merely mentions them (an
-    # echo, a comment block) while the real publisher sits later — satisfying
-    # the text layer too, since that greps the whole job. The name is the same
-    # identity the text layer's per-step extraction scopes to, so both layers
-    # pin one step.
-    if ("Open the required check_run" not in (first.get("name") or "")
+    # EXACT identity AND content, on the SAME step (cross-agent P1 on #852:
+    # containment admitted a decoy named `Dry-run Open the required
+    # check_run`). The canonical name is pinned whole; a rename must update
+    # this check in the same diff.
+    if (first.get("name") != "Open the required check_run (#841 phase 1)"
             or "check-runs" not in body or "in_progress" not in body):
         bad("FAIL: [#850 phase-1 position] the FIRST step of merge-clearance-gate is",
             "      %r, which is not the 'Open the required check_run' publisher" % label,
@@ -795,6 +817,18 @@ else:
         bad("FAIL: [#850 phase-1 env] the phase-1 step %r does not bind %s in its" % (label, ", ".join(absent)),
             "      env. Under set -u an unbound HEAD_SHA exits before the POST, and an",
             "      unbound GH_TOKEN makes it 401 — either way nothing opens the run.")
+    # Values, not just keys (cross-agent P1 on #852). The text layer's
+    # allowlist is universal over HEAD_SHA lines and the gh-token loop below
+    # value-checks GH_TOKEN, but the structural tier mirrors both so this
+    # step's bindings are provably right without cross-layer reasoning.
+    if "HEAD_SHA" in env and env["HEAD_SHA"] not in HEAD_SHA_OK:
+        bad("FAIL: [#850 phase-1 env] the phase-1 step binds HEAD_SHA to %r;" % env["HEAD_SHA"],
+            "      it must be exactly ${{ github.event.pull_request.head.sha }} or",
+            "      the pending entry opens on a commit branch protection never",
+            "      consults.")
+    if "GH_TOKEN" in env and env["GH_TOKEN"] not in GH_TOKEN_OK:
+        bad("FAIL: [#850 phase-1 env] the phase-1 step binds GH_TOKEN to %r;" % env["GH_TOKEN"],
+            "      the only accepted value is ${{ secrets.GITHUB_TOKEN }}.")
 
 # Property 2 — every producer is reachable on its own trigger.
 for key in PRODUCERS:
@@ -803,11 +837,12 @@ for key in PRODUCERS:
         bad("FAIL: [#850 producer eligibility] job '%s' is missing or is not a" % key,
             "      mapping; that trigger path publishes nothing.")
         continue
-    if "if" in job and is_falsy_if(job["if"]):
-        bad("FAIL: [#850 producer eligibility] job '%s' carries a falsy job-level" % key,
-            "      if: %r, so it never runs. Every trigger and every matched" % job["if"],
-            "      string survives that edit — only the parse sees it — while that",
-            "      path stops refreshing the required context.")
+    if "if" in job and normalized_if(job["if"]) not in JOB_IF_ALLOWED.get(key, ()):
+        bad("FAIL: [#850 producer eligibility] job '%s' carries a job-level if: %r" % (key, job["if"]),
+            "      outside its pinned allowlist. A falsy literal or an always-false",
+            "      expression both leave every trigger and matched string intact",
+            "      while that path stops refreshing the required context; only an",
+            "      exact condition can be proven eligible structurally.")
 
 # Property 2b — no producer STEP may be disabled either (cross-agent P1 on
 # #852). An `if: false` on the publishing step — or an essential predecessor
@@ -830,7 +865,7 @@ for key in PRODUCERS:
 
 # Property 3 — phase 2 binds the PR head itself (#849 hole: a job-scoped grep
 # for HEAD_SHA is satisfied by phase 1's binding while phase 2 has lost its).
-close_step = step_named(event_job or {}, "Close the required check_run")
+close_step = step_named(event_job or {}, "Close the required check_run (#841 phase 2)")
 if close_step is None:
     bad("FAIL: [#850 phase-2 head binding] the merge-clearance-gate job has no",
         "      'Close the required check_run' step, so the run phase 1 opened is",

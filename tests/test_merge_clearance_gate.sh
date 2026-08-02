@@ -1724,9 +1724,11 @@ mcg22_case c5 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: 0.0}sm' \
 mcg22_case j 's{(    steps:\n)(      - name: Open the required check_run)}{$1      - just-a-string\n$2}' \
   fail '[#850 phase-1 position]'
 # c6 — a QUOTED non-empty expression literal is TRUTHY to GitHub ('0'
-#      included); the eligibility check must not strip the quotes into the
-#      numeric arm and falsely red an eligible producer.
-mcg22_case c6 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ \x270\x27 \}\}}sm' pass
+#      included). Job-level conditions are exact-pinned now, so the truthy
+#      semantics are exercised where the falsy test still rules: a producer
+#      STEP. Stripping the quotes into the numeric arm would falsely red an
+#      eligible step.
+mcg22_case c6 's{(      - name: Re-evaluate gate per PR and post check_run\n)(        if: )steps.find.outputs.prs[^\n]*}{$1$2\$\{\{ \x270\x27 \}\}}sm' pass
 # c7 — the EMPTY quoted literal is the one falsy quoted form.
 mcg22_case c7 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ \x27\x27 \}\}}sm' \
   fail "[#850 producer eligibility] job 'scheduled-sweep'"
@@ -1738,6 +1740,11 @@ mcg22_case c8 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ 0x0 \
 #     every string survives, but the publishing path is dead.
 mcg22_case k 's{(      - name: Re-evaluate gate per PR and post check_run\n)(        if: )steps.find.outputs.prs[^\n]*}{$1$2\x27\x27}sm' \
   fail "[#850 producer eligibility] step"
+# m — an always-false NON-literal condition: never true on the sweep's only
+#     trigger, invisible to any falsy test, caught only by the exact
+#     per-producer condition allowlist.
+mcg22_case m 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: github.event_name == \x27push\x27}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
 # l — a path-qualified gh invocation must still demand its token binding.
 mcg22_case l 's{(      - name: Open the required check_run.*?\n        run: \|\n)}{$1          /usr/bin/gh api /rate_limit >/dev/null\n}s && s{^          GH_TOKEN: [^\n]*\n(          REPO: \$\{\{ github.repository \}\}\n          # Bind to the PR HEAD)}{$1}m' \
   fail "[#850 gh token binding]"
