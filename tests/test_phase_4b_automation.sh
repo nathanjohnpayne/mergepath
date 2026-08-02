@@ -2845,7 +2845,8 @@ mkdir -p "$_cp"; ( : ) & _deadpid=$!; wait "$_deadpid"; printf '%s\n' "$_deadpid
 _rp_a=$!
 ( p4b_barrier_claim "$_cp" && echo win ) >"$WORK/reap-b" 2>/dev/null &
 _rp_b=$!
-wait "$_rp_a" "$_rp_b"
+wait "$_rp_a" || true
+wait "$_rp_b" || true
 _wins="$(cat "$WORK/reap-a" "$WORK/reap-b" 2>/dev/null | grep -c win || true)"
 [ "${_wins:-0}" = "1" ] || bad="$bad takeover-wins=$_wins"
 p4b_barrier_release "$_cp"
@@ -2902,9 +2903,9 @@ done
 [ -d "$WORK/wp-state/phase-4b-barrier/owner-repo-pr7-race1.trigger.claim" ] || bad="$bad claim-never-observed"
 _write trigger race1 >"$WORK/wp-out-b" &
 _wp_b=$!
-wait "$_wp_b"
+wait "$_wp_b" || true
 : >"$WORK/wp-go"
-wait "$_wp_a"
+wait "$_wp_a" || true
 rm -f "$WORK/wp-hold" "$WORK/wp-go"
 _delivered="$(grep -c '^WRITE:' "$WORK/wp-writes.log" 2>/dev/null || true)"
 [ "${_delivered:-0}" = "1" ] || bad="$bad delivered=$_delivered"
@@ -3006,6 +3007,11 @@ jq -n '[{user:{login:"randomer"},created_at:"2026-06-04T12:30:00Z",body:"@codera
 : >"$WORK/wp-writes.log"
 _out="$( ( export MERGEPATH_REVIEW_POLICY_PATH="$WORK/wp-policy.yml"; _resume "$(_pj paused 556)" ) )"
 [ "$_out" = "resumed" ] || bad="$bad untrusted-identity-counted"
+# A trusted reviewer resuming a DIFFERENT bot is not the CodeRabbit recovery.
+jq -n '[{user:{login:"other-rev"},created_at:"2026-06-04T12:30:00Z",body:"@renovate resume"}]' >"$WORK/wp-comments.json"
+: >"$WORK/wp-writes.log"
+_out="$( ( export MERGEPATH_REVIEW_POLICY_PATH="$WORK/wp-policy.yml"; _resume "$(_pj paused 557)" ) )"
+[ "$_out" = "resumed" ] || bad="$bad other-bot-counted"
 if [ -z "$bad" ]; then
   pass "#847: resume fires only on an identified pause, dedups on the pause note across heads, never on the trigger marker"
 else

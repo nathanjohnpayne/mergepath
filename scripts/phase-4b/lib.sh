@@ -485,17 +485,25 @@ p4b_barrier_trigger_posted() {
 # session's), and a single-identity filter posts a second resume over it
 # (Codex P2, round 3).
 p4b_barrier_write_count() {
-  local m trusted
+  local m trusted bot
   m="$(p4b_barrier_marker "$1" "$2")"
   trusted="$(p4b_available_reviewers 2>/dev/null | jq -R . 2>/dev/null | jq -sc . 2>/dev/null || printf '[]')"
   case "$trusted" in '['*) ;; *) trusted='[]' ;; esac
-  printf '%s' "${4:-[]}" | jq --arg m "$m" --arg who "${3:-}" --arg since "${5:-}" --argjson revs "$trusted" '
+  # The bare form is the CONFIGURED bot's exact command, compared as a string
+  # — a wildcard mention pattern counted any trusted reviewer's `@renovate
+  # resume` as the CodeRabbit recovery and suppressed the real one (Codex P2,
+  # round 4). Same login source and [bot]-strip as the poster.
+  bot="$(p4b_policy_block_field coderabbit bot_login)"
+  bot="${bot:-coderabbitai}"
+  bot="${bot%\[bot\]}"
+  printf '%s' "${4:-[]}" | jq --arg m "$m" --arg who "${3:-}" --arg since "${5:-}" \
+    --arg cmd "@${bot} resume" --argjson revs "$trusted" '
     [.[]? | select(
         (((.user.login // "") == $who) and ((.body // "") | contains($m)))
         or ($since != ""
             and ((.user.login // "") as $l | (($l == $who) or ($revs | index($l) != null)))
             and ((.created_at // "") >= $since)
-            and (((.body // "") | split("\n")[0]) | test("^@[A-Za-z0-9_-]+ resume[[:space:]]*$"))))]
+            and ((((.body // "") | split("\n")[0]) | rtrimstr(" ") | rtrimstr("\r")) == $cmd)))]
     | length' 2>/dev/null || printf '0'
 }
 
