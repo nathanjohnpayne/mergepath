@@ -1114,18 +1114,29 @@ on:
 permissions:
   contents: read
 jobs:
-  # #658 dispatch-recheck job — present so this shape-valid header satisfies
-  # the check's repository_dispatch + dispatch-wiring assertions; each Case
-  # appends the job under test after it.
-  dispatch-recheck:
-    name: Merge clearance dispatch re-evaluation
-    if: github.event_name == 'repository_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - env:
-          PR: ${{ github.event.client_payload.pr }}
-        run: echo "recheck $PR"
 WF
+  # The auxiliary producers come from the REAL workflow, not from a
+  # hand-written stand-in (#849). Hand-maintained positive controls drifted
+  # behind the check on five consecutive review rounds — each new assertion
+  # left them non-compliant — and a control weaker than its subject accepts
+  # workflows the real check rejects, which is a false pass in the direction
+  # that hides regressions. Extracting them means the control cannot lag.
+  mcg_real_job scheduled-sweep
+  mcg_real_job dispatch-recheck
+}
+
+# Print one job block verbatim from the canonical workflow.
+mcg_real_job() {  # <job-key>
+  awk -v key="$1" '
+    $0 ~ "^  " key ":[[:space:]]*$" { inblk = 1; print; next }
+    inblk && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit }
+    inblk { print }
+  ' "$ROOT/.github/workflows/merge-clearance-gate.yml"
+}
+
+# The compliant event job, likewise taken from the canonical workflow.
+write_wf_gate_job() {
+  mcg_real_job merge-clearance-gate
 }
 
 # Case A (negative): the required name appears ONLY as a non-first step key
@@ -1293,14 +1304,7 @@ fi
 WF_RD_OK="$WORKDIR/wf-rd-ok.yml"
 {
   write_wf_header
-  cat <<'WF'
-  merge-clearance-gate:
-    name: Merge clearance gate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Run gate
-        run: echo ok
-WF
+  write_wf_gate_job
 } > "$WF_RD_OK"
 set +e
 OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$WF_RD_OK" "$CHECK_BIN" 2>&1)
@@ -1522,6 +1526,109 @@ STUB
 else
   echo "SKIP: Test 23 (#841) — merge-clearance-gate.yml absent"
 fi
+
+
+# ---------------------------------------------------------------------------
+# Test 22 (#845): the two-phase Checks-API publish assertions must actually
+# reject a workflow that lost the property they name.
+#
+# Each case appends a deliberately-broken variant of write_wf_gate_job to a
+# shape-valid header and asserts the check FAILS. Case I is the positive
+# control. Two of these are worth more than the rest:
+#
+#   B proves COMMENT STRIPPING. #843 documents this design in prose right next
+#     to the code, so an unstripped grep matches the explanation after the
+#     implementation is gone.
+#   D proves BLOCK SCOPING. The header's sweep job POSTs under the same
+#     CHECK_NAME, so a whole-file grep passes even with the event job's
+#     publish deleted — which is exactly the pre-#843 workflow.
+#
+# Without B and D the other assertions are decorative: they would pass on the
+# very shape they exist to reject.
+# ---------------------------------------------------------------------------
+echo; echo "--- Test 22 (#845): two-phase publish assertions reject each broken shape"
+
+mcg22_run() {  # <fixture-path> -> echoes rc
+  local out rc
+  set +e
+  out=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$1" "$CHECK_BIN" 2>&1)
+  rc=$?
+  set -e
+  printf '%s' "$out" > "$1.out"
+  echo "$rc"
+}
+
+# The expected-message argument is what makes these cases mean anything. A
+# broken fixture can fail the check for an unrelated reason — a mangled
+# substitution, a tripped older assertion — and a bare rc!=0 assertion would
+# call that a pass while proving nothing about the property under test.
+mcg22_case() {  # <name> <perl-program-or-empty> <expect: fail|pass> [expected-FAIL-substring]
+  local name="$1" prog="$2" expect="$3" want="${4:-}" f rc
+  f="$WORKDIR/wf-22-$name.yml"
+  { write_wf_header; write_wf_gate_job; } > "$f.raw"
+  if [ -n "$prog" ]; then perl -0777 -pe "$prog" "$f.raw" > "$f"; else cp "$f.raw" "$f"; fi
+  # A no-op substitution means the case is testing nothing.
+  if [ -n "$prog" ] && cmp -s "$f.raw" "$f"; then
+    fail "#845 case $name: the mutation changed nothing — anchor drifted"
+    return
+  fi
+  rc=$(mcg22_run "$f")
+  if [ "$expect" = pass ]; then
+    if [ "$rc" -eq 0 ]; then
+      pass "#845 case $name: positive control — a compliant job is accepted"
+    else
+      fail "#845 case $name: expected pass, got rc=$rc"
+      sed 's/^/      /' "$f.out" | head -4 >&2
+    fi
+    return
+  fi
+  if [ "$rc" -eq 0 ]; then
+    fail "#845 case $name: expected the check to reject this shape, got rc=0"
+  elif [ -n "$want" ] && ! grep -qF -- "$want" "$f.out"; then
+    fail "#845 case $name: rejected, but not for its own reason (wanted: $want)"
+    grep '^FAIL' "$f.out" | sed 's/^/      /' | head -3 >&2
+  else
+    pass "#845 case $name: the check rejects it, naming the right cause"
+  fi
+}
+
+# A — no POST at all.
+mcg22_case A 's{(  merge-clearance-gate:.*?)gh api -X POST "repos/\$REPO/check-runs" \\}{$1true \\}s' fail "must open the required check_run"
+# B — the POST survives only as a full-line comment.
+mcg22_case B 's{^(\s*)id=\$\(gh api -X POST}{$1# id=\$(gh api -X POST}m' fail "must open the required check_run"
+# C — no job-scoped checks: write.
+mcg22_case C 's{^\s*checks: write\n}{}m' fail "checks: write"
+# D — the event job loses its publish; the header sweep still POSTs.
+mcg22_case D 's{  merge-clearance-gate:}{  merge-clearance-renamed:}' fail 'the #845'
+# E — bound to the merge commit instead of the PR head.
+mcg22_case E 's{HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}}{HEAD_SHA: head_sha="\$\{\{ github.sha \}\}"}' fail "must NOT bind to github.sha"
+# F — opens the run but never closes it.
+mcg22_case F 's{gh api -X PATCH "repos/\$REPO/check-runs/\$CHECK_ID"}{true}' fail "must close the check_run it opened"
+# G — no verdict sentinel, so a query-mode rc 0 could publish green.
+mcg22_case G 's{\*"Merge clearance: PASS"\*\)}{*"nope"*)}' fail "verdict sentinel"
+# H — always() instead of !cancelled(): publishes on a cancelled run.
+mcg22_case H 's{if: \$\{\{ !cancelled\(\) && steps.open.outputs.id != .. \}\}}{if: always()}' fail "guarded by !cancelled()"
+# J — valid YAML that DISABLES the permission while an inline comment still
+#     carries the string. Stripping only full-line comments accepts this
+#     (Codex P2 on #849), which would have made every assertion bypassable by
+#     leaving the old code behind a `#`.
+mcg22_case J 's{^(\s*)checks: write}{$1checks: read # checks: write}m' fail 'checks: write'
+# K — rebind phase 1 to the merge commit WITHOUT the one literal spelling the
+#     first version of this assertion forbade. Phase 2's unchanged line kept
+#     satisfying the positive grep, so the mutation slipped through (Codex P2).
+mcg22_case K 's{HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}}{HEAD_SHA: \$\{\{ github.sha \}\}}' fail 'must NOT bind to github.sha'
+# L and M are the two halves of the same assertion, and they fail in OPPOSITE
+# directions — which is why the producer check has to be a conjunction, per
+# scope, rather than a count of either half.
+# L — delete a producer's POST but keep its CHECK_NAME env. A name-count
+#     assertion still sees three and passes (Codex P2 on #849).
+mcg22_case L 's{(  scheduled-sweep:.*?)gh api -X POST "repos/\$REPO/check-runs"}{$1true #}s' fail 'must POST a check_run under CHECK_NAME'
+# M — keep a POST but publish a DIFFERENT check name. A POST-count assertion
+#     still sees three and passes, while that trigger path has stopped
+#     refreshing this required context (CodeRabbit Major on #849).
+mcg22_case M 's{(.*)-f name="\$CHECK_NAME"}{$1-f name="Some Other Check"}s' fail 'must POST a check_run under CHECK_NAME'
+# I — positive control.
+mcg22_case I '' pass
 
 fi  # end re-entrancy guard (MCG_SKIP_FIX3_SELFTEST)
 

@@ -826,6 +826,19 @@ paths:
   - path: tests/test_merge_clearance_gate.sh
     type: canonical
     consumers: all
+    requires:
+      # Test 22 (#845) drives scripts/ci/check_merge_clearance_gate against
+      # deliberately-broken workflow fixtures, so it asserts nothing unless the
+      # check ships with it. Shipping the test first would also turn `lint` red
+      # in the six repos where it is required: the new cases expect FAIL lines
+      # an older check does not emit.
+      - "scripts/ci/check_merge_clearance_gate"
+      - "scripts/merge-clearance-gate.sh"
+      # Test 22's positive controls are EXTRACTED from the workflow (#849), so
+      # the test reads it directly at runtime. Without this edge the closure
+      # gate could ship the test to a consumer whose workflow predates the
+      # two-phase publish, where the extracted "compliant" job is anything but.
+      - ".github/workflows/merge-clearance-gate.yml"
   # Pairs with scripts/disagreement-detector.cjs +
   # scripts/ci/check_disagreement_detector. The check wrapper requires
   # this test file; same #264/#266 coupling class (#273).
