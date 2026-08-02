@@ -135,7 +135,12 @@
 #       "created_at": "<iso-8601>",
 #       # "reviews" is emitted only by --probe, whose primary evidence is a
 #       # HEAD-pinned review object. A probe can instead report on "issues"
-#       # evidence: the head-pinned completed summarize comment (#851).
+#       # evidence: the head-pinned completed summarize comment (#851). That
+#       # form also carries updated_at and fresh_at, and its created_at is the
+#       # comment's ORIGINAL creation time — CodeRabbit edits one summary in
+#       # place, so created_at can predate the head it attests by a day or
+#       # more. fresh_at carries the edit time; consumers needing head
+#       # identity read head_sha, never a timestamp.
 #       "endpoint": "issues" | "pulls" | "reviews",
 #       "body_excerpt": "<first 200 chars>"
 #     },
@@ -631,10 +636,11 @@ SUMMARY_MARKER='<!-- This is an auto-generated comment: summarize by coderabbit.
 # INCLUDING runs that produced no review: `rate limited`, `failure` (#790
 # names its head exactly while saying "Review failed"), `review in progress`.
 # The summary counts as a completed report only when the ONLY stanzas present
-# are its identity marker and the release-notes wrapper. ALLOW-list, not
-# deny-list: a KIND CodeRabbit has not shipped yet must read as not-yet, never
-# clean — also the independent defence against IN_PROGRESS_MARKER drift.
-CR_SUMMARY_STANZA_RE='auto-generated comment: [^<>]* by coderabbit\.ai'
+# are its identity marker and the release-notes wrapper — the TOTAL is counted
+# from the bare wrapper prefix in summary_stanzas_all_benign, so any KIND
+# registers whatever characters it uses. ALLOW-list, not deny-list: a KIND
+# CodeRabbit has not shipped yet must read as not-yet, never clean — also the
+# independent defence against IN_PROGRESS_MARKER drift.
 CR_SUMMARY_BENIGN_STANZA_RE='auto-generated comment: (summarize|release notes) by coderabbit\.ai'
 
 # CodeRabbit's pre-merge check table grades PR hygiene and renders a
@@ -1018,8 +1024,12 @@ classify_comment() {
 # tests/test_audit_branch_protection.sh already uses.
 
 # True when the body carries at least one outcome stanza AND every stanza is
-# benign. Counting occurrences rather than parsing KIND strings means a KIND
-# using any character set still registers and still fails the equality.
+# benign. TOTAL counts occurrences of the bare wrapper prefix, not a KIND
+# pattern: a KIND containing angle brackets (`failure <head-changed>`) escapes
+# any [^<>]-class match, and leftmost-longest matching can swallow two stanzas
+# on one line into one count — either way an equality over the narrower
+# pattern reads a refusing body as benign (adversarial verification on this
+# change). The prefix registers every wrapper whatever its KIND spells.
 # `grep -o | wc -l` counts OCCURRENCES; `grep -oc` counts LINES and is wrong
 # here. The `-gt 0` guard is load-bearing, not defensive: a CodeRabbit chat
 # reply carries ZERO stanzas, and without the guard the equality passes
@@ -1027,25 +1037,36 @@ classify_comment() {
 # SHA while being no report at all.
 summary_stanzas_all_benign() {
   local total benign
-  total=$(printf '%s' "$1" | grep -oiE "$CR_SUMMARY_STANZA_RE" | wc -l | tr -d ' ')
+  total=$(printf '%s' "$1" | grep -oiE 'auto-generated comment: ' | wc -l | tr -d ' ')
   benign=$(printf '%s' "$1" | grep -oiE "$CR_SUMMARY_BENIGN_STANZA_RE" | wc -l | tr -d ' ')
   [ "$total" -gt 0 ] && [ "$total" = "$benign" ]
 }
 
-# True when the full head SHA appears as a token not adjacent to other hex, so
-# a longer digest that merely CONTAINS the head does not satisfy it.
+# True when the head is the RANGE END of the summary's commits line —
+# `between <prev> and <head>` — not merely a 40-hex token anywhere. Position
+# matters twice over (adversarial verification on this change): the range
+# START is the PREVIOUSLY-reviewed head, so a force-push back to it would
+# read a later round's summary as this head's; and a "Review failed" body
+# names the abandoned NEW head in refusal prose ("changed during the review
+# from X to Y"), which a position-blind token match accepts. The boundary
+# class keeps a longer digest containing the head from matching.
 summary_names_head() {
-  printf '%s' "$1" | grep -qE "(^|[^0-9a-fA-F])$2([^0-9a-fA-F]|\$)"
+  printf '%s' "$1" | grep -qiE "between [0-9a-f]{40} and $2([^0-9a-fA-F]|\$)"
 }
 
 # True when the body carries a `Potential issue` / ⚠️ blocking marker OUTSIDE
 # the pre-merge check table. awk with fixed-string index() rather than a sed
-# range so the delimiters carry zero regex exposure. Single definition, used
-# by BOTH probe verdict sites so the heuristic cannot drift between them.
+# range so the delimiters carry zero regex exposure. The strip runs only when
+# the START delimiter precedes the END: with only presence checked, an END
+# rendered before a START would latch the suppressor at START and quietly
+# drop everything to EOF — including a real marker. Single definition, used
+# by both probe verdict sites AND the polling summary-marker gate so the
+# heuristic cannot drift between them.
 summary_blocking_marker_present() {
-  local body=$1 scan=$1
-  if printf '%s' "$body" | grep -Fq "$CR_PRE_MERGE_BLOCK_START" \
-     && printf '%s' "$body" | grep -Fq "$CR_PRE_MERGE_BLOCK_END"; then
+  local body=$1 scan=$1 s_line e_line
+  s_line=$(printf '%s\n' "$body" | grep -nF "$CR_PRE_MERGE_BLOCK_START" | head -1 | cut -d: -f1)
+  e_line=$(printf '%s\n' "$body" | grep -nF "$CR_PRE_MERGE_BLOCK_END" | head -1 | cut -d: -f1)
+  if [ -n "$s_line" ] && [ -n "$e_line" ] && [ "$s_line" -lt "$e_line" ]; then
     scan=$(printf '%s' "$body" | awk \
       -v s="$CR_PRE_MERGE_BLOCK_START" -v e="$CR_PRE_MERGE_BLOCK_END" \
       'index($0,s){k=1} !k; index($0,e){k=0}')
@@ -1282,7 +1303,12 @@ summary_body_has_potential_issue_marker() {
     | last
     | (.body // "")
   ')
-  printf '%s' "$latest_body" | grep -qiE 'Potential issue|⚠️'
+  # Through the shared helper, not a raw grep: the pre-merge check table's
+  # hygiene `⚠️ Warning` rows are not findings, and the probe already reads
+  # them that way — a raw grep here made the SAME body a `findings` verdict in
+  # polling and a `reported` one in probe, so agent-review and the Phase 4b
+  # barrier disagreed about one head (adversarial verification on #851).
+  summary_blocking_marker_present "$latest_body"
 }
 
 # SHA-scoped variant of count_potential_issues, used by the StatusContext
@@ -2065,6 +2091,16 @@ emit_status_context_verdict() {
 # clean incremental re-review (which posts no review object at all) reads as
 # not-yet forever.
 #
+# What the admission rests on, stated plainly: for the three pending states
+# (rate-limited, paused, mid-review) the class check and the stanza allow-list
+# both key on the same `auto-generated comment:` wrapper family, and every
+# prose fallback behind them is dead against CodeRabbit's current wording. The
+# wrapper is present in every observed comment and edit version (3,116 live
+# comments, 512 reconstructed versions), and its loss would also break the
+# pre-existing PAUSED_MARKER / RATE_LIMIT_MARKER keys — but it is one
+# convention, not two independent signals. A reader weakening either conjunct
+# should know there is no third.
+#
 # The StatusContext is deliberately NOT consulted. It is SHA-pinned, but
 # CodeRabbit emits a spurious success shortly after a rate-limit notice (the
 # case status_context_fast_path_blocked_by_comment exists to suppress), so
@@ -2188,12 +2224,16 @@ probe_emit_verdict() {
   # this, every previously-reviewed PR reads not-yet forever and the barrier
   # burns its whole budget.
   #
-  # Selected BY the summarize marker, not as "the newest candidate": every
-  # rate-limit/pause/in-progress notice is written INTO that one comment, so
-  # the state that would mask this evidence is carried by the very body being
-  # classified — and a chat reply (which classifies `review` and can quote the
-  # head SHA, #794) is structurally ineligible regardless of the narration
-  # filter.
+  # Selected BY the summarize marker AT THE START of the body, not as "the
+  # newest candidate": every rate-limit/pause/in-progress notice is written
+  # INTO that one comment, so the state that would mask this evidence is
+  # carried by the very body being classified. startswith, not containment
+  # (adversarial verification on this change): CodeRabbit pastes `rg`/`git
+  # diff` output into chat replies, and this repository itself carries the
+  # marker literal in source and tests — a reply QUOTING it mid-body would
+  # satisfy containment, be the freshest carrier, and either supply false
+  # evidence or out-select the real summary. Every live summarize comment
+  # (40/40 sampled) begins with the marker at byte 0; no reply does.
   #
   # ANCHOR-FREE on purpose: the SHA conjunct IS head identity, strictly
   # stronger than the wall-clock proxy, and an anchored read would spend a
@@ -2203,7 +2243,7 @@ probe_emit_verdict() {
   # decline the trigger and deadlock differently.
   local summary sbody sjson
   summary=$(printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg m "$SUMMARY_MARKER" '
-    [ .[] | select(.user.login == $bot) | select((.body // "") | contains($m))
+    [ .[] | select(.user.login == $bot) | select((.body // "") | startswith($m))
       | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)} ]
     | sort_by(.fresh_at) | last
     | if . == null then empty
