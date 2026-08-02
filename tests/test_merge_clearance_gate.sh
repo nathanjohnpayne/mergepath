@@ -1735,9 +1735,12 @@ mcg22_case c8 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ 0x0 \
 mcg22_case k 's{(      - name: Re-evaluate gate per PR and post check_run\n)(        if: )steps.find.outputs.prs[^\n]*}{$1$2\x27\x27}sm' \
   fail "[#850 producer eligibility] step"
 # n — POSITIVE control for YAML key semantics: job ids `on` and `true` are
-#     distinct strings to Actions, but PyYAML 1.1 resolution coerces both to
-#     the boolean True — raw-scalar comparison must not report a duplicate.
-mcg22_case n 's{\z}{  on:\n    name: on-shaped job id\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  "true":\n    name: true-shaped job id\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n}' pass
+#     distinct strings to Actions, but PyYAML 1.1 resolution coerces BOTH
+#     unquoted keys to the boolean True. A duplicate detector comparing
+#     constructed values would report a collision here and reject a workflow
+#     Actions accepts; raw-scalar-text comparison must pass it (cross-agent
+#     P2, round 4: a quoted "true" constructed the string and proved nothing).
+mcg22_case n 's{\z}{  on:\n    name: on-shaped job id\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  true:\n    name: true-shaped job id\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n}' pass
 # o — the close step's condition extended with a falsy conjunct: both required
 #     substrings survive, the step never runs, phase 1's pending entry is
 #     never closed.
@@ -1767,6 +1770,36 @@ mcg22_case r 's{(        if: )\$\{\{ !cancelled\(\) && steps.open.outputs.id != 
 #     steps may legally share a name, so first-match selection is forgeable.
 mcg22_case s 's{(      - name: Close the required check_run \(#841 phase 2\)\n)}{      - name: Close the required check_run (#841 phase 2)\n        env:\n          HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}\n        run: echo decoy\n$1}s' \
   fail '[#850 phase-2 head binding]'
+# t — a needs: dependency on a producer job: GitHub skips the producer when
+#     the dependency fails or is skipped, BEFORE its own condition is even
+#     evaluated — trigger, condition pins and every string stay intact while
+#     that path stops refreshing the required context (cross-agent P1, r4).
+mcg22_case t 's{^(  merge-clearance-gate:\n)}{$1    needs: preflight\n}m' \
+  fail "declares needs"
+# u — continue-on-error on the phase-1 publisher: its failed POST is
+#     tolerated, the job runs on with no pending entry, phase 2 skips on its
+#     empty open id, and the previous synthetic verdict is never retired
+#     (cross-agent P1, round 4).
+mcg22_case u 's{^(      - name: Open the required check_run \(#841 phase 1\)\n)}{$1        continue-on-error: true\n}m' \
+  fail "continue-on-error"
+# u2 — an EXPRESSION continue-on-error is not provably disabled either.
+mcg22_case u2 's{^(      - name: Open the required check_run \(#841 phase 1\)\n)}{$1        continue-on-error: \$\{\{ always() \}\}\n}m' \
+  fail "continue-on-error"
+# v — the phase-1 POST drops head_sha: GitHub rejects a check-run create
+#     without it, so nothing pending opens; the command must carry head_sha
+#     on the SAME step the position assertion pins (App P2 on #852).
+mcg22_case v 's{(id: open\n.*?)[ ]*-f head_sha="\$HEAD_SHA" \\\n}{$1}s' \
+  fail "[#850 phase-1 position]"
+# w — the close step's CHECK_ID rebound to another output: set -u no longer
+#     saves it (the value exists) and the PATCH hits a different run id,
+#     leaving the entry phase 1 opened PENDING (App P2 on #852).
+mcg22_case w 's{^(          CHECK_ID: )\$\{\{ steps.open.outputs.id \}\}$}{$1\$\{\{ steps.gate.outputs.rc \}\}}m' \
+  fail "binds CHECK_ID"
+# x — a concurrency group on the event producer: a queued second member
+#     cancels the pending one and the cancelled NATIVE run of this required
+#     lineage blocks the PR permanently (measured on #843; App P2 on #852).
+mcg22_case x 's{^(  merge-clearance-gate:\n)}{$1    concurrency:\n      group: mcg-gate\n      cancel-in-progress: false\n}m' \
+  fail "concurrency"
 unset MCG_TAG
 
 # g — positive control on the REAL file. Case I uses a synthesized header; this

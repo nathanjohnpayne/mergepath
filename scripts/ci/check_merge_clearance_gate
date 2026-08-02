@@ -758,7 +758,15 @@ else:
     # containment admitted a decoy named `Dry-run Open the required
     # check_run`). The canonical name is pinned whole; a rename must update
     # this check in the same diff.
+    # SCOPE (cross-agent round 4): this tier proves placement, identity,
+    # bindings and conditions — YAML-decidable properties that catch
+    # accidental drift. It does not prove the commands EXECUTE: shell
+    # reachability inside run: (an early exit, an if-false guard) is not
+    # decidable from workflow structure, and chasing it with string
+    # assertions does not terminate (#849). Workflow edits are themselves
+    # Phase-4-reviewed; a parse-the-shell rung is filed on #854.
     PHASE1_CMDS = ('gh api -X POST "repos/$REPO/check-runs"',
+                   '-f head_sha="$HEAD_SHA"',
                    '-f status="in_progress"', '-f name="$CHECK_NAME"')
     if (first.get("name") != "Open the required check_run (#841 phase 1)"
             or any(cmd not in body for cmd in PHASE1_CMDS)):
@@ -773,6 +781,13 @@ else:
         bad("FAIL: [#850 phase-1 unconditional] the phase-1 step %r carries a" % label,
             "      step-level if: %r. A conditional publisher skips exactly when" % first["if"],
             "      the run it guards is the one that needed to retire a stale verdict.")
+    if first.get("continue-on-error", False) is not False:
+        bad("FAIL: [#850 phase-1 unconditional] the phase-1 step %r sets" % label,
+            "      continue-on-error: %r. A tolerated POST failure lets the job" % first["continue-on-error"],
+            "      run on with no pending entry opened: phase 2 skips on its empty",
+            "      open id and the previous synthetic verdict is never retired, so",
+            "      the publisher must be allowed to fail the job. Absence or a",
+            "      literal false only — an expression is not provably disabled.")
     env = first.get("env") or {}
     absent = [name for name in ("HEAD_SHA", "GH_TOKEN") if name not in env]
     if absent:
@@ -799,6 +814,18 @@ for key in PRODUCERS:
         bad("FAIL: [#850 producer eligibility] job '%s' is missing or is not a" % key,
             "      mapping; that trigger path publishes nothing.")
         continue
+    if key == "merge-clearance-gate" and "concurrency" in job:
+        bad("FAIL: [#850 producer eligibility] job '%s' declares a concurrency" % key,
+            "      group. Queueing a second member cancels the pending one and the",
+            "      cancelled NATIVE run of this required-check lineage blocks the PR",
+            "      permanently — the Checks API cannot retire it, and",
+            "      cancel-in-progress: false does not prevent it (measured, #843).")
+    if "needs" in job:
+        bad("FAIL: [#850 producer eligibility] job '%s' declares needs: %r." % (key, job["needs"]),
+            "      A dependency that fails or is skipped skips this producer before",
+            "      its own condition is even evaluated, leaving the trigger and every",
+            "      pinned condition intact while that path stops refreshing the",
+            "      required context. No producer may gate on another job.")
     if "if" in job and normalized_if(job["if"]) not in JOB_IF_ALLOWED.get(key, ()):
         bad("FAIL: [#850 producer eligibility] job '%s' carries a job-level if: %r" % (key, job["if"]),
             "      outside its pinned allowlist. A falsy literal or an always-false",
@@ -854,6 +881,12 @@ elif 'gh api -X PATCH "repos/$REPO/check-runs/' not in strip_comments(close_step
     bad("FAIL: [#850 phase-2 head binding] the close step does not itself PATCH",
         "      the opened check_run — its bindings prove nothing if the publish",
         "      body lives elsewhere.")
+elif (close_step.get("env") or {}).get("CHECK_ID") != "${{ steps.open.outputs.id }}":
+    bad("FAIL: [#850 phase-2 head binding] the 'Close the required check_run' step",
+        "      binds CHECK_ID to %r; it must be exactly" % (close_step.get("env") or {}).get("CHECK_ID"),
+        "      ${{ steps.open.outputs.id }}. Under set -u an absent CHECK_ID exits",
+        "      before the PATCH and a wrong one PATCHes a different run — either",
+        "      way the entry phase 1 opened stays PENDING until a later sweep.")
 elif (close_step.get("env") or {}).get("HEAD_SHA") not in HEAD_SHA_OK:
     bad("FAIL: [#850 phase-2 head binding] the 'Close the required check_run' step",
         "      binds HEAD_SHA to %r; it must be exactly" % (close_step.get("env") or {}).get("HEAD_SHA"),
