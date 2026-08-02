@@ -1730,6 +1730,17 @@ mcg22_case c6 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ \x270
 # c7 — the EMPTY quoted literal is the one falsy quoted form.
 mcg22_case c7 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ \x27\x27 \}\}}sm' \
   fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# c8 — hexadecimal zero: GitHub's expression numerics accept 0x0 and it
+#      evaluates falsy; float() alone never sees it.
+mcg22_case c8 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ 0x0 \}\}}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# k — a falsy if: on a producer STEP: the job-level condition stays truthy and
+#     every string survives, but the publishing path is dead.
+mcg22_case k 's{(      - name: Re-evaluate gate per PR and post check_run\n)(        if: )steps.find.outputs.prs[^\n]*}{$1$2\x27\x27}sm' \
+  fail "[#850 producer eligibility] step"
+# l — a path-qualified gh invocation must still demand its token binding.
+mcg22_case l 's{(      - name: Open the required check_run.*?\n        run: \|\n)}{$1          /usr/bin/gh api /rate_limit >/dev/null\n}s && s{^          GH_TOKEN: [^\n]*\n(          REPO: \$\{\{ github.repository \}\}\n          # Bind to the PR HEAD)}{$1}m' \
+  fail "[#850 gh token binding]"
 unset MCG_TAG
 
 # g — positive control on the REAL file. Case I uses a synthesized header; this

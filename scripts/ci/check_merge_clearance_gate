@@ -668,11 +668,18 @@ def is_falsy_if(value):
     # numeric check would falsely reject an eligible producer.
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
         return text[1:-1] == ""
+    # int(text, 0) reads hex/octal/binary spellings (0x0, 0o0, 0b0) that
+    # float() does not; GitHub's expression numerics accept them and they
+    # evaluate falsy at zero.
     try:
-        if float(text) == 0:
+        if int(text, 0) == 0:
             return True
     except ValueError:
-        pass
+        try:
+            if float(text) == 0:
+                return True
+        except ValueError:
+            pass
     return text.lower() in FALSY
 
 failures = []
@@ -802,6 +809,25 @@ for key in PRODUCERS:
             "      string survives that edit — only the parse sees it — while that",
             "      path stops refreshing the required context.")
 
+# Property 2b — no producer STEP may be disabled either (cross-agent P1 on
+# #852). An `if: false` on the publishing step — or an essential predecessor
+# like the sweep's PR enumeration — preserves the job-level condition and
+# every matched string while that trigger path stops refreshing the required
+# context. Legitimate conditionals here are truthy expressions
+# (`steps.find.outputs.prs != ''`) and pass the same falsy test.
+for key in PRODUCERS:
+    job = jobs.get(key)
+    if not isinstance(job, dict):
+        continue
+    for step in job.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        if "if" in step and is_falsy_if(step["if"]):
+            bad("FAIL: [#850 producer eligibility] step %r in job '%s' carries a" % (step.get("name") or "<unnamed>", key),
+                "      falsy step-level if: %r — the job still runs but this step" % step["if"],
+                "      never does, so that trigger path publishes nothing while every",
+                "      string assertion stays satisfied.")
+
 # Property 3 — phase 2 binds the PR head itself (#849 hole: a job-scoped grep
 # for HEAD_SHA is satisfied by phase 1's binding while phase 2 has lost its).
 close_step = step_named(event_job or {}, "Close the required check_run")
@@ -822,7 +848,11 @@ elif (close_step.get("env") or {}).get("HEAD_SHA") not in HEAD_SHA_OK:
 # only ever OVER-includes a step (it then has to bind the token it does not
 # use), whereas stripping first would let a `gh` call hidden after a `#` on a
 # live line escape the requirement entirely.
-GH_INVOKE = re.compile(r"(?<![A-Za-z0-9_./-])gh[ \t]")
+# Matches bare `gh `, path-qualified `/usr/bin/gh `, and quoted `"gh" `
+# invocations (cross-agent P1 on #852). Over-inclusion (prose mentioning gh)
+# only forces a token binding on a step that may not need one — the
+# fail-closed direction; under-inclusion exempts a real unauthenticated call.
+GH_INVOKE = re.compile(r"(?<![A-Za-z0-9_-])[\"']?gh[\"']?[ \t]")
 for key in PRODUCERS:
     job = jobs.get(key)
     if not isinstance(job, dict):
