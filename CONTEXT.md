@@ -78,7 +78,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Cycle-time budget**: The doctrine that Phase 4b's added latency is acceptable for high-risk change shapes and corrosive for trivial ones, keeping the proactive-trigger taxonomy narrow.
 
-**Phase 4b substitute**: An `APPROVED` review on the current HEAD from a non-author registered reviewer identity, accepted by the merge gate in place of Codex clearance. The only external-clearance path when Codex is disabled.
+**Phase 4b substitute**: An `APPROVED` review on the current HEAD from a non-author registered reviewer identity, accepted by the merge gate in place of Codex clearance where the substitute knob permits it (the default). When permitted it is the only external-clearance path with Codex disabled; when the knob is off, the policy requires Codex-only clearance.
 
 **Trusted-path rule**: The requirement that review orchestration executes from a trusted main-ref checkout, never from the PR-under-review's own checkout, so a PR cannot shape its own verdict.
 
@@ -180,7 +180,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Propagation manifest**: `.mergepath-sync.yml` — the hub-only single source of truth for what propagates, to whom, and how; deliberately never itself propagated. _Avoid_: bare "manifest" when the project-docs manifest is in play.
 
-**Canonical (entry type)**: The manifest path type for a byte-for-byte single-file mirror; any difference is drift. _Avoid_: conflating with the doc-ownership class of the same name.
+**Canonical (entry type)**: The manifest path type for a byte-for-byte single-file mirror; any undeclared difference is drift (a reasoned sync override makes it intentional divergence instead). _Avoid_: conflating with the doc-ownership class of the same name.
 
 **Kit**: The manifest path type for a whole-directory mirror with allow-extras semantics — every hub file must match byte-identically, while consumer-only additions alongside are legitimate and preserved.
 
@@ -200,11 +200,11 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Wave audit**: The once-per-wave scoped external review, run against the canary over the canonical range not yet audited, replacing per-consumer review of N verbatim mirrors.
 
-**Watermark**: The tag marking the newest canonical range that has passed a wave audit; it advances only on a posted approval, so an un-audited range chains automatically into the next wave.
+**Watermark**: The tag marking the newest canonical range that has passed a wave audit; it advances on a posted approval or a scope-empty range (nothing auditable changed), so an un-audited range chains automatically into the next wave.
 
 **Re-cut**: The remediation for a failed wave audit — land the fix at the source, recreate the wave PRs, re-audit the fresh canary. _Avoid_: patching the mirror.
 
-**Propagation lane**: The Phase 3.5 exemption by which a provably byte-verbatim sync PR skips cross-agent external review, its content having been reviewed upstream. Only that requirement is removed — CI, advisory review, and an internal approval still apply. _Avoid_: "review bypass", "auto-approve".
+**Propagation lane**: The Phase 3.5 exemption by which a provably byte-verbatim sync PR skips cross-agent external review, its content having been reviewed upstream. Only that requirement is removed — CI and an internal approval still apply, with advisory review carried by the wave canary rather than each fan-out mirror. _Avoid_: "review bypass", "auto-approve".
 
 **Faithful-mirror verification**: The lane's load-bearing teeth — every changed file byte-compared (mode and type included) against immutable public Mergepath content at the declared commit, from a trusted checkout. Path confinement alone is deliberately insufficient.
 
@@ -266,7 +266,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Repo lint**: The propagated workflow that runs the CI-check kit; its never-propagated annex holds a consumer's local steps so the canonical overwrite cannot clobber them.
 
-**Consumer-safe check**: A kit check that behaves correctly in a consumer checkout where hub-only artifacts are absent — skipping with the canonical marker-first idiom rather than failing.
+**Consumer-safe check**: A kit check that behaves correctly in a consumer checkout — running normally when everything it needs propagates with it, and skipping with the canonical marker-first idiom only when it depends on hub-only artifacts.
 
 **Ratchet**: A grandfathered-violation list that fails equally on a new violator, a stale entry, and an escalated class — so it can neither grow to buy silence nor outlive its bugs.
 
@@ -292,6 +292,6 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Sweep** is two senses: the weekly unresolved-feedback backstop, and a gate workflow's scheduled re-posting cron.
 
-**Hold** is two entries: the self-clearing wait state, and `human-hold`, the human-controlled freeze.
+**Hold** is two entries: the wait state (self-clearing or action-needing), and `human-hold`, the human-controlled freeze.
 
-**Gate** is two senses: a required status check with branch-protection teeth, and an agent-side decision helper that is advisory to the agent's own control flow.
+**Gate** is two senses: a canonical check (merge-blocking only where branch protection lists it as required), and an agent-side decision helper that is advisory to the agent's own control flow.
