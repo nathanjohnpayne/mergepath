@@ -361,11 +361,44 @@ p4b_barrier_note_pending() {
   printf '%s' "$(( now - started ))"
 }
 
+# p4b_barrier_claim_path <repo> <pr> <head> <kind>
+# Sibling of the pending marker, one path per write class so a resume claim
+# and a trigger claim can never be read for one another (#846, #847).
+p4b_barrier_claim_path() {
+  local base
+  base="$(p4b_barrier_marker_path "$1" "$2" "$3")"
+  printf '%s.%s.claim' "${base%.pending}" "${4:-trigger}"
+}
+
+# p4b_barrier_claim <path>
+# mkdir(2) is create-or-fail with no window between test and set: exactly one
+# caller creates the directory, every concurrent other gets EEXIST. Returns 0
+# only to the winner; an unusable state dir also returns non-zero, and the
+# caller DECLINES to write (#846) — pending is already set before any write
+# runs, so the bound and the human escalation stand either way.
+#
+# Deliberately no timestamp and no stale-breaking: every clock-based break
+# rule either steals a live claim (two writes — the failure this exists to
+# prevent) or strands a second one. An abandoned claim self-heals
+# structurally instead: it keeps the arm declining, the head stays pending,
+# the bound expires, and the escalate path's clear_pending below removes it —
+# so the checkout that handles the escalation can write again on re-run.
+p4b_barrier_claim() {
+  mkdir -p "$(dirname "$1")" 2>/dev/null || return 1
+  mkdir "$1" 2>/dev/null || return 1
+}
+
+p4b_barrier_release() { rm -rf "${1:?}" 2>/dev/null || true; }
+
 # p4b_barrier_clear_pending <repo> <pr> <head>
-# Drop the marker. Called on every non-not-yet outcome so a later not-yet on
-# the same head starts a fresh budget instead of inheriting a stale one.
+# Drop the marker and both write claims. Called on every non-not-yet outcome
+# so a later not-yet on the same head starts a fresh budget instead of
+# inheriting a stale one — and so an abandoned claim cannot outlive the wait
+# it was taken under.
 p4b_barrier_clear_pending() {
   rm -f "$(p4b_barrier_marker_path "$1" "$2" "$3")" 2>/dev/null || true
+  rm -rf "$(p4b_barrier_claim_path "$1" "$2" "$3" trigger)" 2>/dev/null || true
+  rm -rf "$(p4b_barrier_claim_path "$1" "$2" "$3" resume)" 2>/dev/null || true
 }
 
 # --- #814 CodeRabbit arm: trigger, do not only wait -------------------------
@@ -387,8 +420,18 @@ p4b_barrier_clear_pending() {
 # to conserve. The probe cannot close it either: between posting and
 # CodeRabbit reacting, observed is still `none`, which is the same sub-minute
 # race that produced two @codex review triggers on #820.
+# p4b_barrier_marker <kind> <head>   kind ∈ trigger | resume
+# Two write classes, two markers (#847). A resume satisfying the trigger's
+# "already spent" test would suppress the review request for this head
+# forever; a trigger satisfying the resume's would leave a paused bot paused.
+# The trigger spelling is kept byte-identical to the pre-#847 literal — live
+# PRs already carry it.
+p4b_barrier_marker() {
+  printf '<!-- mergepath-coderabbit-%s:%s -->' "${1:-trigger}" "${2:-nohead}"
+}
+
 p4b_barrier_trigger_marker() {
-  printf '<!-- mergepath-coderabbit-trigger:%s -->' "${1:-nohead}"
+  p4b_barrier_marker trigger "${1:-nohead}"
 }
 
 # p4b_barrier_trigger_posted <head> <reviewer_login> <issue_comments_json>
@@ -396,11 +439,26 @@ p4b_barrier_trigger_marker() {
 # must sit on a comment authored by the reviewer identity: an unscoped body
 # search is forgeable and cannot establish that automation posted it.
 p4b_barrier_trigger_posted() {
-  local marker
-  marker="$(p4b_barrier_trigger_marker "$1")"
-  printf '%s' "${3:-[]}" | jq -e --arg m "$marker" --arg who "${2:-}" '
-    any(.[]?; ((.user.login // "") == $who) and ((.body // "") | contains($m)))' \
-    >/dev/null 2>&1
+  p4b_barrier_write_posted trigger "$1" "$2" "$3"
+}
+
+# p4b_barrier_write_count <kind> <head> <reviewer_login> <issue_comments_json>
+# Prints how many marker-bearing comments of this kind the reviewer identity
+# has on the timeline for this head. Author-scoped for the same reason the
+# boolean was; the count costs nothing extra (same read) and makes a
+# cross-checkout duplicate — the #846 race observed after the fact — visible
+# to the caller as `already-…-duplicate` instead of silently indistinguishable
+# from the normal already-spent case.
+p4b_barrier_write_count() {
+  local m
+  m="$(p4b_barrier_marker "$1" "$2")"
+  printf '%s' "${4:-[]}" | jq --arg m "$m" --arg who "${3:-}" '
+    [.[]? | select(((.user.login // "") == $who) and ((.body // "") | contains($m)))]
+    | length' 2>/dev/null || printf '0'
+}
+
+p4b_barrier_write_posted() {
+  [ "$(p4b_barrier_write_count "$1" "$2" "$3" "$4")" -gt 0 ]
 }
 
 # p4b_barrier_should_trigger <observed>
@@ -427,12 +485,22 @@ p4b_barrier_should_trigger() {
   esac
 }
 
-# p4b_barrier_post_trigger <repo> <pr> <head> <reviewer>
-# Post the one permitted request for this head, carrying the marker. Routed
-# through gh-as-reviewer.sh because `gh pr comment` is a guarded write and the
-# marker's whole value is that an identity-verified account authored it.
+# p4b_barrier_post_trigger <repo> <pr> <head> <reviewer> [kind]
+# Post the one permitted write of this kind for this head, carrying its
+# marker. Routed through gh-as-reviewer.sh because `gh pr comment` is a
+# guarded write and the marker's whole value is that an identity-verified
+# account authored it. This is deliberately the ONLY gh-write call site the
+# barrier has — both kinds share it, so the lint surface and the identity
+# discipline stay in one place.
 p4b_barrier_post_trigger() {
-  local repo="$1" pr="$2" head="$3" reviewer="$4"
+  local repo="$1" pr="$2" head="$3" reviewer="$4" kind="${5:-trigger}" verb
+  case "$kind" in
+    # `resume`, never `review`, for the paused recovery (#847): the auto-pause
+    # note is durable and only the resume command lifts it — a review request
+    # to a paused bot is refused outright.
+    resume) verb=resume ;;
+    *)      verb=review; kind=trigger ;;
+  esac
   # Uppercase *_AS_REVIEWER deliberately: check_no_bare_gh_writes exempts a
   # wrapped write only when the wrapper is a literal gh-as-*.sh path or a
   # variable matching [A-Z_]*AS_(AUTHOR|REVIEWER). A lowercase holder reads as
@@ -450,25 +518,35 @@ p4b_barrier_post_trigger() {
   bot="$(p4b_policy_block_field coderabbit bot_login)"
   bot="${bot:-coderabbitai}"
   bot="${bot%\[bot\]}"
-  body="$(printf '@%s review\n\n%s\n' "$bot" "$(p4b_barrier_trigger_marker "$head")")"
+  body="$(printf '@%s %s\n\n%s\n' "$bot" "$verb" "$(p4b_barrier_marker "$kind" "$head")")"
   env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$reviewer" \
     "$WRAPPER_AS_REVIEWER" -- gh pr comment "$pr" --repo "$repo" --body "$body" \
     >/dev/null 2>&1 || rc=$?
   return "$rc"
 }
 
-# p4b_barrier_maybe_trigger <repo> <pr> <head> <reviewer> <probe_json> <dry_run>
-# probe -> decide -> post at most once. Prints the action taken; never fails
-# the caller, because a trigger that could not be posted still leaves the
-# bounded retry and the human escalation behind it.
-p4b_barrier_maybe_trigger() {
-  local repo="$1" pr="$2" head="$3" reviewer="$4" json="$5" dry="${6:-false}"
-  local observed comments raw
-  observed="$(printf '%s' "$json" | jq -r '.probe.observed // empty' 2>/dev/null || true)"
-  p4b_barrier_should_trigger "$observed" || { printf 'declined'; return 0; }
+# p4b_barrier_maybe_write <kind> <repo> <pr> <head> <reviewer> <dry_run>
+# claim -> read -> dedup -> post at most once, for either write class. Prints
+# the action taken; never fails the caller, because a write that could not be
+# posted still leaves the bounded retry and the human escalation behind it.
+#
+# The claim wraps the WHOLE read-and-post region (#846): the read and the post
+# were not atomic, so two overlapping invocations for the same head could both
+# read no-marker and both post — double-spending the five-per-hour allowance
+# the marker conserves. mkdir gives one winner with no window; the loser (and
+# any invocation that cannot take a claim at all, including on an unusable
+# state dir) declines without posting. The claim records nothing and is read
+# by nothing — the timeline marker stays the only durable account of what was
+# posted, so over-spend is never traded for starvation: a failed post releases
+# the claim and the next bounded retry re-attempts.
+p4b_barrier_maybe_write() {
+  local kind="$1" repo="$2" pr="$3" head="$4" reviewer="$5" dry="${6:-false}"
+  local claim comments raw n out
+  claim="$(p4b_barrier_claim_path "$repo" "$pr" "$head" "$kind")"
+  p4b_barrier_claim "$claim" || { printf '%s-claim-declined' "$kind"; return 0; }
   # Re-read the timeline rather than trusting process state: the bounded retry
-  # runs as a fresh one-shot process each time, so "already triggered" has to
-  # be durable in the PR itself.
+  # runs as a fresh one-shot process each time, so "already spent" has to be
+  # durable in the PR itself.
   #
   # A read FAILURE is not an empty timeline. `jq -sc 'add // []'` prints `[]`
   # and exits 0 on empty stdin, so folding the read and the parse into one
@@ -476,26 +554,83 @@ p4b_barrier_maybe_trigger() {
   # --paginate — into "no marker found", and the arm re-posts on every bounded
   # retry. That is a self-amplifying write loop against the same five-per-hour
   # allowance the marker exists to conserve, on the PAT that is also the CI
-  # token. Same search-ERROR-is-not-search-EMPTY defect already fixed in this
-  # file's caller; declining costs nothing, because `pending` is set before
-  # this runs, so the bound and the human escalation stand either way.
+  # token. Declining costs nothing, because `pending` is set before this runs,
+  # so the bound and the human escalation stand either way.
   raw="$(gh api "repos/$repo/issues/$pr/comments" --paginate 2>/dev/null)" \
-    || { printf 'trigger-read-failed'; return 0; }
+    || { p4b_barrier_release "$claim"; printf '%s-read-failed' "$kind"; return 0; }
   comments="$(printf '%s' "$raw" | jq -sc 'add // []' 2>/dev/null)" \
-    || { printf 'trigger-read-failed'; return 0; }
+    || { p4b_barrier_release "$claim"; printf '%s-read-failed' "$kind"; return 0; }
   case "$comments" in
     '['*) ;;
-    *) printf 'trigger-read-failed'; return 0 ;;
+    *) p4b_barrier_release "$claim"; printf '%s-read-failed' "$kind"; return 0 ;;
   esac
-  if p4b_barrier_trigger_posted "$head" "$reviewer" "$comments"; then
-    printf 'already-triggered'; return 0
-  fi
-  if [ "$dry" = true ]; then printf 'would-trigger'; return 0; fi
-  if p4b_barrier_post_trigger "$repo" "$pr" "$head" "$reviewer"; then
-    printf 'triggered'
+  n="$(p4b_barrier_write_count "$kind" "$head" "$reviewer" "$comments")"
+  if [ "$n" -gt 1 ]; then
+    # Two markers can only mean two checkouts raced before this change, or a
+    # write reported failed actually landed and was retried. Surfaced, not
+    # hidden: the caller's ledger shows the duplicate was at least observed.
+    out="already-${kind}-duplicate"
+  elif [ "$n" -gt 0 ]; then
+    out="already-${kind}"
+  elif [ "$dry" = true ]; then
+    out="would-${kind}"
+  elif p4b_barrier_post_trigger "$repo" "$pr" "$head" "$reviewer" "$kind"; then
+    case "$kind" in resume) out='resumed' ;; *) out='triggered' ;; esac
   else
-    printf 'trigger-failed'
+    out="${kind}-failed"
   fi
+  p4b_barrier_release "$claim"
+  printf '%s' "$out"
+  return 0
+}
+
+# p4b_barrier_maybe_trigger <repo> <pr> <head> <reviewer> <probe_json> <dry_run>
+# The review-request write: observed-gate, then the claimed write core. The
+# claim is taken only after the decline check, so a state that will never
+# post takes no claim. Existing signature and action vocabulary preserved,
+# with `already-triggered` spelled `already-trigger` only in the core's
+# generic arms — mapped back here so callers and tests keep the historical
+# strings.
+p4b_barrier_maybe_trigger() {
+  local repo="$1" pr="$2" head="$3" reviewer="$4" json="$5" dry="${6:-false}"
+  local observed out
+  observed="$(printf '%s' "$json" | jq -r '.probe.observed // empty' 2>/dev/null || true)"
+  p4b_barrier_should_trigger "$observed" || { printf 'declined'; return 0; }
+  out="$(p4b_barrier_maybe_write trigger "$repo" "$pr" "$head" "$reviewer" "$dry")"
+  case "$out" in
+    already-trigger)           printf 'already-triggered' ;;
+    already-trigger-duplicate) printf 'already-triggered-duplicate' ;;
+    *)                         printf '%s' "$out" ;;
+  esac
+  return 0
+}
+
+# p4b_barrier_maybe_resume <repo> <pr> <head> <reviewer> <probe_json> <dry_run>
+# The pause recovery (#847): on observed=paused, post `@<bot> resume` at most
+# once per head, deduplicated by its own timeline marker so a resume and the
+# review trigger can never be confused for one another. The barrier posts the
+# resume itself rather than delegating to coderabbit-wait.sh's polling mode:
+# delegation would need new per-invocation overrides for that script's other
+# writers (its switches are policy fields, not envs) and its retry latch is
+# local to one checkout — weaker than the timeline marker's at-most-once per
+# head. --probe stays read-only structurally: nothing in the probe path can
+# reach this.
+#
+# Exhaustion still escalates: a resume does not clear pending, so if the bot
+# stays paused the bound expires and a human is paged exactly as before —
+# after, rather than instead of, the one recovery attempt the polling mode
+# would have made.
+p4b_barrier_maybe_resume() {
+  local repo="$1" pr="$2" head="$3" reviewer="$4" json="$5" dry="${6:-false}"
+  local observed out
+  observed="$(printf '%s' "$json" | jq -r '.probe.observed // empty' 2>/dev/null || true)"
+  [ "$observed" = paused ] || { printf 'skipped'; return 0; }
+  out="$(p4b_barrier_maybe_write resume "$repo" "$pr" "$head" "$reviewer" "$dry")"
+  case "$out" in
+    already-resume)           printf 'already-resumed' ;;
+    already-resume-duplicate) printf 'already-resumed-duplicate' ;;
+    *)                        printf '%s' "$out" ;;
+  esac
   return 0
 }
 
@@ -515,7 +650,7 @@ p4b_barrier_maybe_trigger() {
 p4b_same_head_barrier() {
   local repo="$1" pr="$2" head="$3" reviewer="$4" dry="${5:-false}"
   local root cr_bin cx_bin rc json probe_head
-  local pending=false why="" trigger="skipped" cls_cr="disabled" cls_cx="disabled"
+  local pending=false why="" trigger="skipped" resume="skipped" cls_cr="disabled" cls_cx="disabled"
   local elapsed budget remaining=0
   root="$(p4b_repo_root)"
   cr_bin="${P4B_CODERABBIT_WAIT:-$root/scripts/coderabbit-wait.sh}"
@@ -576,6 +711,11 @@ p4b_same_head_barrier() {
         reported|will-not-report|waived) ;;
         not-yet)
           pending=true
+          # The pause recovery is NOT gated on Codex terminality, unlike the
+          # trigger below: a pause is PR-level, a paused CodeRabbit cannot
+          # report on ANY head, and the resume is not discarded by a
+          # Codex-forced push — waiting would only burn the bound (#847).
+          resume="$(p4b_barrier_maybe_resume "$repo" "$pr" "$head" "$reviewer" "$json" "$dry")"
           # Only spend the request once Codex is terminal. The trigger point is
           # meant to be the settled head — "after the Codex rounds have
           # converged" — and if Codex is still not-yet it may yet produce
@@ -618,13 +758,13 @@ p4b_same_head_barrier() {
   fi
 
   if [ -n "$why" ]; then
-    jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg t "$trigger" \
-      '{decision:"escalate", reason:$r, coderabbit:$cr, codex:$cx, trigger:$t}'
+    jq -nc --arg r "$why" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg t "$trigger" --arg rs "$resume" \
+      '{decision:"escalate", reason:$r, coderabbit:$cr, codex:$cx, trigger:$t, resume:$rs}'
     return 2
   fi
   if [ "$pending" = true ]; then
-    jq -nc --argjson ra "$remaining" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg t "$trigger" \
-      '{decision:"pending", retry_after:$ra, coderabbit:$cr, codex:$cx, trigger:$t}'
+    jq -nc --argjson ra "$remaining" --arg cr "$cls_cr" --arg cx "$cls_cx" --arg t "$trigger" --arg rs "$resume" \
+      '{decision:"pending", retry_after:$ra, coderabbit:$cr, codex:$cx, trigger:$t, resume:$rs}'
     return 1
   fi
   jq -nc --arg cr "$cls_cr" --arg cx "$cls_cx" \
