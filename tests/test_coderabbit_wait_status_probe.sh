@@ -384,6 +384,64 @@ case "$endpoint" in
         # count (which finds the finding on the HEAD review).
         printf '[{"id":8831,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 1**\\n\\nSee inline findings on the latest HEAD review."}]\n' "$bot" "$head_time" "$head_time"
         ;;
+      probe_clean_incremental)
+        # #851 fixtures: no review object (reviews endpoint falls to its []
+        # default); the summarize comment is the only head evidence. Prior-head
+        # tokens are `base-sha`, never `old-head-sha` — `-` is not hex, so the
+        # boundary regex would accept `head-sha` inside `old-head-sha`, a
+        # property real 40-hex SHAs do not have.
+        printf '[{"id":7901,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\nNo actionable comments were generated in the recent review.\\n\\nReviewing files that changed from the base of the PR and between base-sha and head-sha.\\n\\n<!-- This is an auto-generated comment: release notes by coderabbit.ai -->\\n## Summary by CodeRabbit\\n- Fixes\\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->"}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_summary_clean_prior_head)
+        # Range names ONLY prior heads: the SHA conjunct is the sole tie.
+        printf '[{"id":7911,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\nNo actionable comments were generated in the recent review.\\n\\nReviewing files that changed from the base of the PR and between base-sha and prior-sha.\\n\\n<!-- This is an auto-generated comment: release notes by coderabbit.ai -->\\n## Summary by CodeRabbit\\n- Fixes\\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->"}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_summary_review_failed)
+        # The live #790 shape: a failure stanza naming the CURRENT head.
+        printf '[{"id":7912,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n<!-- This is an auto-generated comment: failure by coderabbit.ai -->\\n> [!CAUTION]\\n> Review failed. Between base-sha and head-sha.\\n<!-- end of auto-generated comment: failure by coderabbit.ai -->"}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_summary_skip_review)
+        # The live #797 shape: an explicit skip naming the head.
+        printf '[{"id":7913,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n<!-- This is an auto-generated comment: skip review by coderabbit.ai -->\\n> Review skipped between base-sha and head-sha.\\n<!-- end of auto-generated comment: skip review by coderabbit.ai -->"}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_summary_unknown_stanza)
+        # A stanza KIND CodeRabbit has not shipped yet (anti-#593 posture).
+        printf '[{"id":7914,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n<!-- This is an auto-generated comment: quota exhausted by coderabbit.ai -->\\n> Something new. Between base-sha and head-sha.\\n<!-- end of auto-generated comment: quota exhausted by coderabbit.ai -->"}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_summary_legacy_ratelimit_prose)
+        # Markerless legacy rate-limit prose in an AGED summary the anchored
+        # triage never sees: the class conjunct is the sole rejection.
+        printf '[{"id":7915,"user":{"login":"%s"},"created_at":"2026-06-03T00:00:00Z","updated_at":"2026-06-03T00:00:00Z","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\nRate limit exceeded. Please wait 10 minutes.\\n\\nReviewing files that changed from the base of the PR and between base-sha and head-sha."}]\n' "$bot"
+        ;;
+      probe_summary_midreview)
+        # The recovered #849 mid-review state: already names the new head.
+        printf '[{"id":7916,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->\\n> Currently processing new changes in this PR. This may take a few minutes, please wait...\\n\\nReviewing files that changed from the base of the PR and between base-sha and head-sha.\\n<!-- end of auto-generated comment: review in progress by coderabbit.ai -->"}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_summary_plus_chat_reply)
+        # The live #794 shape: a NEWER chat reply embeds the head SHA. Marker
+        # selection must credit 7917, never the newest candidate 7918.
+        printf '[{"id":7917,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\nNo actionable comments were generated in the recent review.\\n\\nReviewing files that changed from the base of the PR and between base-sha and head-sha."},{"id":7918,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:08Z","updated_at":"2026-06-04T00:00:08Z","body":"🧩 Analysis chain\\n\\nhead-sha is the current head per gh pr view --json headRefOid.\\n\\nDone."}]\n' "$bot" "$reply_time" "$reply_time" "$bot"
+        ;;
+      probe_summary_chat_reply_only)
+        # Same reply, prior-head summary: the reply alone is never evidence.
+        printf '[{"id":7919,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\nNo actionable comments were generated in the recent review.\\n\\nReviewing files that changed from the base of the PR and between base-sha and prior-sha."},{"id":7920,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:08Z","updated_at":"2026-06-04T00:00:08Z","body":"🧩 Analysis chain\\n\\nhead-sha is the current head per gh pr view --json headRefOid.\\n\\nDone."}]\n' "$bot" "$reply_time" "$reply_time" "$bot"
+        ;;
+      probe_summary_premerge_warning)
+        # The only ⚠️ is a pre-merge hygiene row (3 of 5 live summaries).
+        printf '[{"id":7921,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\nNo actionable comments were generated in the recent review.\\n\\nReviewing files that changed from the base of the PR and between base-sha and head-sha.\\n\\n<!-- pre_merge_checks_walkthrough_start -->\\n| Docstring Coverage | ⚠️ Warning | 38.89%% |\\n<!-- pre_merge_checks_walkthrough_end -->"}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_summary_marker_outside_premerge)
+        # A real blocking marker OUTSIDE the block; the strip must keep it.
+        printf '[{"id":7922,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n_⚠️ Potential issue_ carried only by this summary.\\n\\nReviewing files that changed from the base of the PR and between base-sha and head-sha.\\n\\n<!-- pre_merge_checks_walkthrough_start -->\\n| Docstring Coverage | ⚠️ Warning | 38.89%% |\\n<!-- pre_merge_checks_walkthrough_end -->"}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_summary_premerge_truncated)
+        # Start delimiter without end: nothing stripped, fails toward rc 2.
+        printf '[{"id":7923,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\nReviewing files that changed from the base of the PR and between base-sha and head-sha.\\n\\n<!-- pre_merge_checks_walkthrough_start -->\\n_⚠️ Potential issue_ after a truncated block."}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_summary_aged_clean)
+        # Clean head-pinned summary predating the anchor (liveness case).
+        printf '[{"id":7924,"user":{"login":"%s"},"created_at":"2026-06-03T00:00:00Z","updated_at":"2026-06-03T00:00:00Z","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\nNo actionable comments were generated in the recent review.\\n\\nReviewing files that changed from the base of the PR and between base-sha and head-sha."}]\n' "$bot"
+        ;;
       reply_poll_failure)
         count=0
         if [ -f "$state_dir/probe-count" ]; then
@@ -887,6 +945,12 @@ expected_observed() {
     # Narration is filtered before classification, so it reads as nothing.
     probe_narration)       printf 'none\n' ;;
     probe_review_on_head)  printf 'terminal\n' ;;
+    # #851: the head-pinned completed summary is terminal evidence; the
+    # mid-review summary already naming the head is in_progress. Both at every
+    # trust × StatusContext combination — the probe never consults the
+    # StatusContext for either.
+    probe_clean_incremental) printf 'terminal\n' ;;
+    probe_summary_midreview) printf 'in_progress\n' ;;
     *)                     printf 'UNMAPPED\n' ;;
   esac
 }
@@ -895,7 +959,7 @@ test_probe_state_space_sweep() {
   local trust status scenario dir rc n=0 bad=0
   for trust in false true; do
     for status in absent success failure; do
-      for scenario in none rate_limit probe_paused probe_in_progress probe_narration probe_review_on_head; do
+      for scenario in none rate_limit probe_paused probe_in_progress probe_narration probe_review_on_head probe_clean_incremental probe_summary_midreview; do
         n=$((n + 1))
         dir=$(make_case "sweep-$trust-$status-$scenario" 600 true 30 0 0)
         # The sweep drives trust via the policy file the fixture writes.
@@ -1112,6 +1176,129 @@ test_probe_unknown_option_fails_closed() {
   fi
 }
 
+# <dir> <rc> <expected_review_id> <label> — the #851 clean-summary terminal:
+# rc 0, status reported, observed terminal, evidence on the ISSUES endpoint
+# carrying the summarize comment's id (never a newer chat reply's), head_sha
+# the head the scan classified, and ZERO writes on both counted surfaces.
+assert_probe_reported_via_summary() {
+  local dir=$1 rc=$2 want_id=$3 label=$4
+  local got_status got_observed got_ep got_id got_head got_posts got_codex
+  got_status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  got_observed=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  got_ep=$(jq -r '.review.endpoint // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  got_id=$(jq -r '.review.id // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  got_head=$(jq -r '.head_sha' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  got_posts=$(probe_count "$dir")
+  got_codex=$(codex_invocations "$dir")
+  if [ "$rc" = "0" ] && [ "$got_status" = "reported" ] \
+     && [ "$got_observed" = "terminal" ] && [ "$got_ep" = "issues" ] \
+     && [ "$got_id" = "$want_id" ] && [ "$got_head" = "head-sha" ] \
+     && [ "$got_posts" = "0" ] && [ "$got_codex" = "0" ]; then
+    pass "#851 probe: $label → rc 0 reported via summary $want_id, 0 writes"
+  else
+    fail "#851 probe: $label → rc=$rc status=$got_status observed=$got_observed endpoint=$got_ep id=$got_id head=$got_head posts=$got_posts codex=$got_codex"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
+# The #851 scenario family, table-driven. Column 2 is the assertion:
+#   reported:<id>      rc 0 via assert_probe_reported_via_summary, evidence id pinned
+#   notyet:<observed>  rc 7 via assert_probe_not_yet
+#   findings           rc 2 + status=findings (#535 parity on the new path)
+# Each row is load-bearing for a specific mutation of the probe: the SHA
+# conjunct (prior-head rows), the stanza allow-list (failed/skip/unknown), the
+# class conjunct (legacy prose, aged past the anchor so only the anchor-free
+# selection sees it), marker selection (the #794 chat-reply pair, with the
+# evidence id proving WHICH comment was credited), anchor-free selection (the
+# aged clean row), and the pre-merge strip (warning/outside/truncated rows).
+test_851_summary_evidence_matrix() {
+  local scenario expect label dir rc status
+  while IFS='|' read -r scenario expect label; do
+    [ -n "$scenario" ] || continue
+    dir=$(make_case "probe-851-$scenario" 600 true 30 3 2)
+    rc=$(run_probe_case "$dir" "$scenario")
+    case "$expect" in
+      reported:*)
+        assert_probe_reported_via_summary "$dir" "$rc" "${expect#reported:}" "$label" ;;
+      notyet:*)
+        assert_probe_not_yet "$dir" "$rc" "${expect#notyet:}" "$label" ;;
+      findings)
+        status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+        if [ "$rc" = "2" ] && [ "$status" = "findings" ]; then
+          pass "#851 probe: $label"
+        else
+          fail "#851 probe: $label -> rc=$rc status=$status"
+          sed 's/^/      /' "$dir/err.log" >&2 || true
+        fi ;;
+    esac
+  done <<'ROWS'
+probe_clean_incremental|reported:7901|head-pinned completed summary with no review object is reported (the #849 defect)
+probe_summary_aged_clean|reported:7924|clean summary older than the anchor still reads reported (anchor-free liveness)
+probe_summary_premerge_warning|reported:7921|a pre-merge hygiene warning row is not a blocking finding
+probe_summary_plus_chat_reply|reported:7917|with a newer SHA-quoting chat reply present, evidence is still the summary (#794)
+probe_summary_clean_prior_head|notyet:summary-without-head-review|a clean summary naming only prior heads must not clear this one
+probe_summary_review_failed|notyet:summary-without-head-review|a Review-failed stanza naming the head is an attempt, not a report (#790)
+probe_summary_skip_review|notyet:summary-without-head-review|an explicit skip-review stanza naming the head is not a report (#797)
+probe_summary_unknown_stanza|notyet:summary-without-head-review|a stanza KIND CodeRabbit has not shipped reads not-yet, never clean
+probe_summary_legacy_ratelimit_prose|notyet:none|an aged summary with legacy rate-limit prose is rejected by class alone
+probe_summary_midreview|notyet:in_progress|a mid-review summary that already names the head stays in_progress
+probe_summary_chat_reply_only|notyet:summary-without-head-review|a SHA-quoting chat reply with a prior-head summary must not clear (#794)
+probe_summary_marker_outside_premerge|findings|a blocking marker outside the pre-merge table escalates immediately as rc 2
+probe_summary_premerge_truncated|findings|a truncated pre-merge block strips nothing and fails toward rc 2
+ROWS
+}
+
+test_851_summary_helpers_unit() {
+  # The three predicates are pure; extract the sentinel block and source it so
+  # the 40-hex token boundary and the zero-stanza vacuity guard are assertable
+  # directly — the shared stub's head is the literal `head-sha`, which cannot
+  # exercise either. Same extract-and-source pattern as
+  # tests/test_audit_branch_protection.sh.
+  local snip="$WORKDIR/summary-helpers.sh" h40 h64 bad=""
+  local clean_body chat_body failure_body inside_body outside_body trunc_body
+  eval "$(grep -E '^(CR_SUMMARY_STANZA_RE|CR_SUMMARY_BENIGN_STANZA_RE|CR_PRE_MERGE_BLOCK_START|CR_PRE_MERGE_BLOCK_END)=' \
+    "$ROOT/scripts/coderabbit-wait.sh")"
+  awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
+    "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+  # shellcheck disable=SC1090
+  . "$snip"
+  h40='0123456789abcdef0123456789abcdef01234567'
+  h64="deadbeef${h40}deadbeefdeadbeef"
+  clean_body='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+No actionable comments.'
+  chat_body='🧩 Analysis chain
+
+head-sha is the current head per gh pr view.'
+  failure_body="$clean_body
+<!-- This is an auto-generated comment: failure by coderabbit.ai -->
+Review failed.
+<!-- end of auto-generated comment: failure by coderabbit.ai -->"
+  inside_body="$CR_PRE_MERGE_BLOCK_START
+| Docstring Coverage | ⚠️ Warning | 38% |
+$CR_PRE_MERGE_BLOCK_END"
+  outside_body="_⚠️ Potential issue_
+$inside_body"
+  trunc_body="$CR_PRE_MERGE_BLOCK_START
+_⚠️ Potential issue_ after truncation"
+  summary_stanzas_all_benign "$clean_body" || bad="$bad benign-clean"
+  summary_stanzas_all_benign "$failure_body" && bad="$bad failure-passed"
+  # The vacuity guard: zero stanzas must be FALSE, or the two live chat
+  # replies (#794, #518) that embed a head SHA read as completed summaries.
+  summary_stanzas_all_benign "$chat_body" && bad="$bad vacuity"
+  summary_names_head "between base and $h40 today" "$h40" || bad="$bad sha-token"
+  summary_names_head "$h40 leads" "$h40" || bad="$bad sha-at-start"
+  # A longer digest CONTAINING the head is not the head.
+  summary_names_head "digest $h64 here" "$h40" && bad="$bad sha-superstring"
+  summary_blocking_marker_present "$inside_body" && bad="$bad premerge-stripped"
+  summary_blocking_marker_present "$outside_body" || bad="$bad real-marker"
+  summary_blocking_marker_present "$trunc_body" || bad="$bad truncated"
+  if [ -z "$bad" ]; then
+    pass "#851 helpers: stanza vacuity guard, 40-hex token boundary, pre-merge strip"
+  else
+    fail "#851 helpers:$bad"
+  fi
+}
+
 test_446_newer_comment_suppresses_stale_status
 test_timeout_probe_posts_once_and_surfaces_reply
 test_existing_status_probe_reply_never_clears
@@ -1135,6 +1322,8 @@ test_probe_env_var_equals_flag
 test_probe_terminal_review_matches_polling_verdict
 test_probe_field_absent_on_polling_runs
 test_probe_unknown_option_fails_closed
+test_851_summary_evidence_matrix
+test_851_summary_helpers_unit
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
