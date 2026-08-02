@@ -173,9 +173,13 @@
 #     # --probe run never sends.
 #     "probe": null | {
 #       "mode": true,
-#       # `status_probe` is deliberately absent: scan_latest_comment drops
-#       # narration replies before classification, so that value is not
-#       # reachable and advertising it would be a contract nobody can meet.
+#       # `status_probe` is deliberately absent: both probe scans keep
+#       # narration replies out of the observed class — the no-review-object
+#       # triage drops them pre-classification, and the review-object
+#       # publication scan skips their latch (#833: narration landing after
+#       # the review object reads as awaiting-summary, or as the pending
+#       # notice beneath it) — so the value is not reachable and advertising
+#       # it would be a contract nobody can meet.
 #       "observed": "none" | "rate_limit" | "paused" | "in_progress"
 #                   | "summary-without-head-review" | "awaiting-summary"
 #                   | "terminal"
@@ -2178,6 +2182,15 @@ probe_emit_verdict() {
       [ -z "$row" ] && continue
       body=$(printf '%s' "$row" | base64 --decode | jq -r '.body // ""')
       class=$(classify_comment "$body")
+      # Narration replies carry no publication state, and the probe.observed
+      # enum deliberately omits status_probe — the no-review-object triage
+      # drops narration in its jq filter, but this scan classifies every row,
+      # so without this skip a narration reply landing after the review
+      # object leaks `observed: "status_probe"` (#833, seen live on #852).
+      # Skipped, not latched as blank: a pending notice BENEATH the narration
+      # still names the observed state, and no narration hides a published
+      # summary deeper in the scan.
+      [ "$class" = "status_probe" ] && continue
       [ -n "$newest_class" ] || newest_class="$class"
       if [ "$class" = "review" ]; then summary_body="$body"; break; fi
     done <<< "$cand"
