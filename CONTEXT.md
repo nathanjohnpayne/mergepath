@@ -60,7 +60,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **CodeRabbit**: The advisory automated reviewer that runs on every ordinary PR in enabled repos — wave fan-out mirrors are deliberately opened with an ignore marker; it informs but never blocks by itself. Its unresolved threads still bind through the conversation gate. _Avoid_: calling it a merge gate.
 
-**Codex**: The ChatGPT Codex Connector GitHub App — the real blocking external-review signal. It never emits an `APPROVED` review state and must be explicitly invoked with `@codex review` on every round; a push never re-triggers it. _Avoid_: "Codex approval".
+**Codex**: The ChatGPT Codex Connector GitHub App — the blocking external-review signal for PRs that enter Phase 4; on under-threshold PRs its requested review is advisory. It never emits an `APPROVED` review state and must be explicitly invoked with `@codex review` on every round; a push never re-triggers it. _Avoid_: "Codex approval".
 
 **Review round**: One `@codex review` request-and-response cycle; bounded by the max-review-rounds cap.
 
@@ -90,7 +90,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Mutable proxy**: The named anti-pattern of letting a removable label or dismissable review stand in for clearance; replaced by HEAD-pinned required checks.
 
-**Merge gate**: The agent-side pre-merge verification that the three lettered conditions hold — (a) required CI green, (b) a qualifying reviewer approval, (c) external clearance on HEAD. _Avoid_: conflating with the Merge clearance gate, its CI-enforced counterpart.
+**Merge gate**: The agent-side pre-merge verification that the three lettered conditions hold — (a) required CI green, (b) a qualifying reviewer approval or, on a same-agent PR where self-approval is forbidden, a fresh Codex affirmative signal, (c) external clearance on HEAD. _Avoid_: conflating with the Merge clearance gate, its CI-enforced counterpart.
 
 **Merge clearance gate**: The HEAD-pinned canonical check that fails closed when clearance is not satisfied on the merge HEAD, with an external-review arm and a Dependabot arm; it grows merge-time teeth only where branch protection lists it as required.
 
@@ -122,7 +122,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Narrow-start**: The rollout convention that a new gate ships disabled everywhere except Mergepath, so it can join required checks fleet-wide as a clean no-op before being switched on per repo.
 
-**Fail closed / fail open**: The disposition vocabulary for uncertainty — an ambiguous or unreadable state resolves to blocking (fail closed) or to proceed-and-record (fail open, e.g. an unavailable reviewer). _Avoid_: "safe default" without naming the direction.
+**Fail closed / fail open**: The disposition vocabulary for uncertainty — an ambiguous or unreadable state resolves to blocking (fail closed) or to proceed-and-record (fail open — e.g. a wave audit whose reviewer is unavailable proceeds, and the watermark simply does not advance; an ordinary Phase 4 PR instead falls back to the manual handoff and waits). _Avoid_: "safe default" without naming the direction.
 
 **Advisory**: A signal that informs but never blocks the merge — CodeRabbit's review, the under-threshold Codex trigger, a status-probe reply, the accounting block.
 
@@ -148,7 +148,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Severity ladder**: The single normalized tier scale — p0, p1, p2, p3, nitpick — onto which both bot reviewers' native markers map, so one policy covers them. _Avoid_: "priority" alone.
 
-**Required tier / discretionary tier**: A tier whose findings must be dispositioned before merge (blocking) versus one addressed at the agent's judgment (surfaced, never blocking); a third setting, ignore, surfaces nothing.
+**Required tier / discretionary tier**: A tier whose findings must be dispositioned before merge (blocking) versus one addressed at the agent's judgment — non-blocking as a tier, though an open thread still binds the pre-merge conversation gate until resolved by fix, rebuttal, or explicit deferral with rationale; a third setting, ignore, surfaces nothing.
 
 **Disposition**: What actually happened to a piece of review feedback — a fix, or a rebuttal — followed by resolving the thread. A code commit alone is not a disposition. _Avoid_: "addressed" without the thread resolution.
 
@@ -166,7 +166,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Weekly sweep**: The longer-horizon backstop enumerating threads still unresolved on recently closed PRs. _Avoid_: conflating with a gate workflow's scheduled sweep, the cron that re-posts required-check runs for events GitHub does not fire.
 
-**Post-merge issue**: The issue filed per item an external reviewer flags while approving, labeled as an observation (a noted characteristic) or a risk (a hazard needing attention); acknowledged debt, never a merge blocker.
+**Post-merge issue**: The issue filed per item an external reviewer flags while approving, labeled as an observation (a noted characteristic) or a risk (a hazard needing attention); acknowledged debt rather than a merge gate, though filing them is a required step before the merge.
 
 ### Propagation
 
@@ -226,7 +226,7 @@ Mergepath is the reference implementation of the AI Agent Tooling Standard and t
 
 **Generated mirror**: A project-doc file materialized with machine-readable do-not-edit and sync-direction markers. PRDs flow central→repo; specs flow repo→central. _Avoid_: editing one in place.
 
-**Repo-owned doc**: A docs file carrying no generated-mirror marker and listed in no manifest — edit it directly, in place.
+**Repo-owned doc**: A docs file carrying no generated-mirror marker and backed by no propagated path entry — edit it directly, in place; a per-repo-owned ownership class in the manifest declares ownership, not mirroring.
 
 **Canonical-source discipline**: The rule that a cross-repo convention is authored in Mergepath first and only then mirrored outward, every mirror carrying a canonical-source annotation (optionally pinned with a content-hash prefix so drift is detectable). _Avoid_: downstream-first authoring.
 
