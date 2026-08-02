@@ -648,9 +648,6 @@ def normalized_if(value):
     return " ".join(str(value).split())
 
 
-def normalized_if(value):
-    return " ".join(str(value).split())
-
 
 failures = []
 
@@ -670,14 +667,19 @@ def strip_comments(text):
 
 
 def step_named(job, want):
-    """Exact-name selection (cross-agent P1 on #852: substring matching had
-    the same decoy ambiguity as the phase-1 identity check)."""
+    """Exact-name selection, and the name must be UNIQUE in the job: two
+    steps may legally share a name in Actions, so a first-match rule lets a
+    decoy shadow the real publisher (cross-agent P1, round 3). Ambiguity
+    returns the string "ambiguous" so the caller fails loudly."""
+    found = None
     for step in (job.get("steps") or []) if isinstance(job, dict) else []:
         # A steps entry can parse to a bare string; .get on it would raise
         # and surface as a traceback instead of a named failure.
         if isinstance(step, dict) and (step.get("name") or "") == want:
-            return step
-    return None
+            if found is not None:
+                return "ambiguous"
+            found = step
+    return found
 
 
 # Duplicate mapping keys are a parse error here, as they are for Actions'
@@ -756,14 +758,17 @@ else:
     # containment admitted a decoy named `Dry-run Open the required
     # check_run`). The canonical name is pinned whole; a rename must update
     # this check in the same diff.
+    PHASE1_CMDS = ('gh api -X POST "repos/$REPO/check-runs"',
+                   '-f status="in_progress"', '-f name="$CHECK_NAME"')
     if (first.get("name") != "Open the required check_run (#841 phase 1)"
-            or "check-runs" not in body or "in_progress" not in body):
+            or any(cmd not in body for cmd in PHASE1_CMDS)):
         bad("FAIL: [#850 phase-1 position] the FIRST step of merge-clearance-gate is",
-            "      %r, which is not the 'Open the required check_run' publisher" % label,
-            "      POSTing to check-runs with status=in_progress. Every failure after",
-            "      this point — checkout, PR resolve, gate crash, runner death — only",
-            "      fails CLOSED if the pending entry already retired the previous",
-            "      verdict, so phase 1 must come first.")
+            "      %r, which is not the phase-1 publisher: it must carry the exact" % label,
+            "      POST command set (gh api -X POST to check-runs, status=in_progress,",
+            "      name=$CHECK_NAME) in its own run body. Every failure after this",
+            "      point fails CLOSED only if the pending entry already retired the",
+            "      previous verdict, so phase 1 must come first and must actually",
+            "      publish.")
     if "if" in first:
         bad("FAIL: [#850 phase-1 unconditional] the phase-1 step %r carries a" % label,
             "      step-level if: %r. A conditional publisher skips exactly when" % first["if"],
@@ -809,10 +814,16 @@ for key in PRODUCERS:
 # expressions, so every step-level `if:` in a producer job must match a
 # PINNED expression exactly — the same posture as the job-level allowlist: a
 # legitimate condition change updates the pin in the same diff.
-STEP_IF_ALLOWED = (
-    "steps.find.outputs.prs != ''",
-    "${{ !cancelled() && steps.open.outputs.id != '' }}",
-)
+# Keyed by (job, step name), not a global set (cross-agent P1, round 3): the
+# close step carrying the sweep's find-guard would pass a global allowlist
+# while that expression is false in a job with no `find` step — every pinned
+# condition is valid only where its referenced outputs exist.
+STEP_IF_ALLOWED = {
+    ("scheduled-sweep", "Re-evaluate gate per PR and post check_run"):
+        "steps.find.outputs.prs != ''",
+    ("merge-clearance-gate", "Close the required check_run (#841 phase 2)"):
+        "${{ !cancelled() && steps.open.outputs.id != '' }}",
+}
 for key in PRODUCERS:
     job = jobs.get(key)
     if not isinstance(job, dict):
@@ -820,19 +831,29 @@ for key in PRODUCERS:
     for step in job.get("steps") or []:
         if not isinstance(step, dict):
             continue
-        if "if" in step and normalized_if(step["if"]) not in STEP_IF_ALLOWED:
-            bad("FAIL: [#850 producer eligibility] step %r in job '%s' carries a" % (step.get("name") or "<unnamed>", key),
-                "      step-level if: %r outside the pinned set — the job still" % step["if"],
-                "      runs but this step may never, so that trigger path can stop",
-                "      publishing while every string assertion stays satisfied.")
+        sname = step.get("name") or "<unnamed>"
+        if "if" in step and normalized_if(step["if"]) != STEP_IF_ALLOWED.get((key, sname)):
+            bad("FAIL: [#850 producer eligibility] step %r in job '%s' carries a" % (sname, key),
+                "      step-level if: %r that is not ITS pinned condition — the job" % step["if"],
+                "      still runs but this step may never, so that trigger path can",
+                "      stop publishing while every string assertion stays satisfied.")
 
 # Property 3 — phase 2 binds the PR head itself (#849 hole: a job-scoped grep
 # for HEAD_SHA is satisfied by phase 1's binding while phase 2 has lost its).
 close_step = step_named(event_job or {}, "Close the required check_run (#841 phase 2)")
+if close_step == "ambiguous":
+    bad("FAIL: [#850 phase-2 head binding] more than one step in",
+        "      merge-clearance-gate carries the exact close-step name; a decoy",
+        "      sharing the name can shadow the real publisher's bindings.")
+    close_step = None
 if close_step is None:
     bad("FAIL: [#850 phase-2 head binding] the merge-clearance-gate job has no",
         "      'Close the required check_run' step, so the run phase 1 opened is",
         "      never completed and the required context stays PENDING.")
+elif 'gh api -X PATCH "repos/$REPO/check-runs/' not in strip_comments(close_step.get("run") or ""):
+    bad("FAIL: [#850 phase-2 head binding] the close step does not itself PATCH",
+        "      the opened check_run — its bindings prove nothing if the publish",
+        "      body lives elsewhere.")
 elif (close_step.get("env") or {}).get("HEAD_SHA") not in HEAD_SHA_OK:
     bad("FAIL: [#850 phase-2 head binding] the 'Close the required check_run' step",
         "      binds HEAD_SHA to %r; it must be exactly" % (close_step.get("env") or {}).get("HEAD_SHA"),

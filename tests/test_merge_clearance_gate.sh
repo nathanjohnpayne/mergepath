@@ -1754,6 +1754,19 @@ mcg22_case m 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: github.event_
 # l — a path-qualified gh invocation must still demand its token binding.
 mcg22_case l 's{(      - name: Open the required check_run.*?\n        run: \|\n)}{$1          /usr/bin/gh api /rate_limit >/dev/null\n}s && s{^          GH_TOKEN: [^\n]*\n(          REPO: \$\{\{ github.repository \}\}\n          # Bind to the PR HEAD)}{$1}m' \
   fail "[#850 gh token binding]"
+# q — a first step with the canonical NAME and env whose body merely echoes
+#     the strings: the exact POST command set is what distinguishes a
+#     publisher from a decoy that satisfies name, env and substrings.
+mcg22_case q 's{(id: open\n(?:(?!gh api -X POST).)*?)gh api -X POST "repos/\$REPO/check-runs"}{$1echo posted-nothing}s' \
+  fail '[#850 phase-1 position]'
+# r — the close step wearing the SWEEP's guard: valid in the allowlist
+#     globally, falsy in a job with no find step — pins are per (job, step).
+mcg22_case r 's{(        if: )\$\{\{ !cancelled\(\) && steps.open.outputs.id != \x27\x27 \}\}}{$1steps.find.outputs.prs != \x27\x27}' \
+  fail "[#850 producer eligibility] step"
+# s — a DECOY sharing the exact close-step name ahead of the real one: two
+#     steps may legally share a name, so first-match selection is forgeable.
+mcg22_case s 's{(      - name: Close the required check_run \(#841 phase 2\)\n)}{      - name: Close the required check_run (#841 phase 2)\n        env:\n          HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}\n        run: echo decoy\n$1}s' \
+  fail '[#850 phase-2 head binding]'
 unset MCG_TAG
 
 # g — positive control on the REAL file. Case I uses a synthesized header; this
