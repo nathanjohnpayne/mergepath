@@ -19,7 +19,12 @@ on:
     # Must match the three gate workflows' top-level `name:` fields exactly;
     # a rename there silently orphans this trigger (fence assertion, PR 2).
     workflows: ["Merge Clearance Gate", "Codex P1 Gate", "CodeRabbit Severity Gate"]
-    types: [requested, completed]
+    # in_progress is the rerun cue: a rerun re-uses the run, so `requested`
+    # never re-fires, and without it no pending entry would cover the
+    # re-evaluation window (cross-agent P1 on #867). Ordinary runs emit
+    # both; the duplicate pending is idempotent and the same completed
+    # pass retires it.
+    types: [requested, in_progress, completed]
   repository_dispatch:
     # merge-clearance-recheck kept verbatim (#658 lane reaches this file
     # unchanged); required-check-republish covers all three on a named PR.
@@ -27,12 +32,11 @@ on:
   schedule:
     # One sweep for all three; coexists with the per-gate sweeps until PR 4.
     - cron: "*/15 * * * *"
-  workflow_dispatch:
-    inputs:
-      pr:
-        description: "PR number to republish (all open PRs when empty)"
-        required: false
-        default: ""
+  # NO workflow_dispatch: a manual dispatch executes the SELECTED ref's copy
+  # of this file, so a PR branch could be run with checks: write — the P1a
+  # hole this file exists to close (cross-agent P1 on #867). The operator
+  # break-glass is repository_dispatch required-check-republish, which is
+  # PAT-gated and always runs the default-branch definition.
 
 permissions:
   contents: read
@@ -58,7 +62,7 @@ jobs:
     # execute, so pending entries land within seconds of the PR event.
     if: >-
       github.event_name == 'workflow_run' &&
-      github.event.action == 'requested' &&
+      (github.event.action == 'requested' || github.event.action == 'in_progress') &&
       github.event.workflow.name == 'Merge Clearance Gate'
     runs-on: ubuntu-latest
     permissions:
@@ -74,11 +78,24 @@ jobs:
           # branch's last commit, and binding to it would put every context
           # on a commit branch protection never consults (#845 risks).
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          PARENT_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
           if [ -z "$HEAD_SHA" ]; then
             echo "::error::workflow_run.head_sha is empty; cannot open pending entries."
             exit 1
+          fi
+          # If the parent has ALREADY completed, its completed delivery owns
+          # the slot and a fresh pending here would have no future event to
+          # retire it — stuck until the sweep (cross-agent P1 on #867). On a
+          # failed read, open anyway: pending is the fail-closed direction.
+          if parent_status=$(gh api "repos/$REPO/actions/runs/$PARENT_RUN_ID" --jq .status); then
+            if [ "$parent_status" = "completed" ]; then
+              echo "Parent run $PARENT_RUN_ID already completed; the completed pass owns this head. Not opening."
+              exit 0
+            fi
+          else
+            echo "::warning::could not read parent run status; opening anyway (fail closed)."
           fi
           # Open only on open-PR heads: the parent also fires on schedule,
           # where head_sha is main's tip. Resolution comes from the open-PR
@@ -118,14 +135,19 @@ jobs:
     # upstream — the verdict must not depend on how the parent finished).
     if: github.event_name != 'workflow_run' || github.event.action == 'completed'
     runs-on: ubuntu-latest
+    # ONE global queue for every publish pass, not a per-head group
+    # (cross-agent P1 on #867): a sweep or dispatch run outside the head's
+    # group could read state before a transition and POST after a newer
+    # evaluation, restoring a stale verdict. A single fixed group makes
+    # writes land in arrival order across event, sweep and dispatch paths.
     # Safe on THIS file and not on the gate workflows — the measured
-    # difference (#843): a cancelled pending member materialises a native
-    # check, and here it is named `publish`, which nothing requires.
-    # Grouping by head serializes same-head evaluations so an older run
-    # cannot land its verdict after a newer one; sweep and dispatch runs
-    # fall through to run_id (idempotent re-evaluations).
+    # difference (#843): when a third member queues, the cancelled PENDING
+    # member materialises a native check named `publish`, which nothing
+    # requires; the loss is that trigger's evaluation, whose head stays
+    # pending at most one sweep interval, because the sweep is a member of
+    # this same queue and covers every open PR.
     concurrency:
-      group: rcp-${{ github.event.workflow_run.head_sha || github.event.client_payload.pr || inputs.pr || github.run_id }}
+      group: rcp-publish
       cancel-in-progress: false
     permissions:
       contents: read
@@ -150,7 +172,6 @@ jobs:
           # client_payload cannot inject shell (same posture as
           # merge-clearance-gate.yml's dispatch-recheck job).
           DISPATCH_PR: ${{ github.event.client_payload.pr }}
-          INPUT_PR: ${{ inputs.pr }}
         run: |
           set -euo pipefail
           # Head-to-PR mapping from the open-PR list ONLY — never
@@ -165,8 +186,8 @@ jobs:
           fi
 
           requested_pr=""
-          if [ -n "$DISPATCH_PR" ] || [ -n "$INPUT_PR" ]; then
-            requested_pr="${DISPATCH_PR:-$INPUT_PR}"
+          if [ -n "$DISPATCH_PR" ]; then
+            requested_pr="$DISPATCH_PR"
             case "$requested_pr" in
               ''|*[!0-9]*|0*)
                 echo "::error::PR selector is not a positive integer: '$requested_pr'"
@@ -193,10 +214,14 @@ jobs:
               # to branch protection; an abandoned in_progress reads as a
               # hang.
               for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
-                pending=$(gh api -X GET "repos/$REPO/commits/$RUN_HEAD/check-runs" \
-                  -f check_name="$name" -f filter=latest \
-                  --jq '[.check_runs[] | select(.status != "completed")] | length')
-                if [ "$pending" != "0" ]; then
+                # --paginate: page 1 alone can miss a pending run on a head
+                # with many same-name suites, and a truncated read here is a
+                # false all-clear (cross-agent P1 on #867). IDs land in a
+                # variable — no early-close pipe under pipefail.
+                pending_ids=$(gh api --paginate -X GET "repos/$REPO/commits/$RUN_HEAD/check-runs" \
+                  -f check_name="$name" -f filter=latest -f per_page=100 \
+                  --jq '.check_runs[] | select(.status != "completed") | .id')
+                if [ -n "$pending_ids" ]; then
                   gh api -X POST "repos/$REPO/check-runs" \
                     -f name="$name" \
                     -f head_sha="$RUN_HEAD" \
