@@ -1,0 +1,285 @@
+name: Required Check Publisher
+
+# Single writer of the Checks-API slot for the three script-backed required
+# contexts (#845, Stage A). This file always executes from the DEFAULT
+# branch — workflow_run, schedule, and repository_dispatch all read the
+# default-branch definition — so a PR cannot edit the publisher that
+# evaluates it (the P1a closure). The natively-named gate jobs in the three
+# gate workflows are untouched and keep producing the truth on their own
+# lineage; this workflow writes only the synthetic (Checks-API) slot.
+#
+# SHADOW STAGE: the published names carry a "(shadow)" suffix and are not in
+# branch protection, so nothing here can affect a merge. PR 3 flips the
+# three env values to the live strings after the #845 canary passes; until
+# then the trigger shape, head binding, PR resolution and rc mapping are
+# rehearsed against production traffic at zero risk.
+
+on:
+  workflow_run:
+    # Must match the three gate workflows' top-level `name:` fields exactly;
+    # a rename there silently orphans this trigger (fence assertion, PR 2).
+    workflows: ["Merge Clearance Gate", "Codex P1 Gate", "CodeRabbit Severity Gate"]
+    types: [requested, completed]
+  repository_dispatch:
+    # merge-clearance-recheck kept verbatim (#658 lane reaches this file
+    # unchanged); required-check-republish covers all three on a named PR.
+    types: [merge-clearance-recheck, required-check-republish]
+  schedule:
+    # One sweep for all three; coexists with the per-gate sweeps until PR 4.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to republish (all open PRs when empty)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  # The single flip point for PR 3: change these three values to the live
+  # context strings and nothing else.
+  MCG_CONTEXT: "Merge clearance gate (shadow)"
+  CODEX_P1_CONTEXT: "Codex P1 unresolved threads (shadow)"
+  CODERABBIT_CONTEXT: "CodeRabbit unresolved blocking findings (shadow)"
+
+jobs:
+  # Phase 1. NOT named for any required context, and OUTSIDE the publish
+  # job's concurrency group: a queued third event cancels a group's pending
+  # member and materialises that run's native check (#843, measured), so
+  # keeping this job groupless means a phase-1 retirement is never the
+  # member that gets cancelled — and its native check is named `open`,
+  # which nothing requires.
+  open:
+    name: open
+    # One burst per PR event, not three: gate on the broadest-triggered
+    # parent. `requested` fires at parent-run creation, before its jobs
+    # execute, so pending entries land within seconds of the PR event.
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.action == 'requested' &&
+      github.event.workflow.name == 'Merge Clearance Gate'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    steps:
+      - name: Open pending entries on the event head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # NEVER github.sha: on a workflow_run run it is the DEFAULT
+          # branch's last commit, and binding to it would put every context
+          # on a commit branch protection never consults (#845 risks).
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::error::workflow_run.head_sha is empty; cannot open pending entries."
+            exit 1
+          fi
+          # Open only on open-PR heads: the parent also fires on schedule,
+          # where head_sha is main's tip. Resolution comes from the open-PR
+          # list — never workflow_run.pull_requests, empty for fork PRs. If
+          # the list READ fails, open anyway: pending is the fail-closed
+          # direction, and a spurious pending on a non-PR head is invisible
+          # to branch protection and retired by the next publish pass.
+          if heads=$(gh pr list --repo "$REPO" --state open --limit 500 \
+              --json headRefOid --jq '.[].headRefOid'); then
+            if ! grep -qxF "$HEAD_SHA" <<<"$heads"; then
+              echo "Head $HEAD_SHA is not an open PR head; nothing to open."
+              exit 0
+            fi
+          else
+            echo "::warning::open-PR list read failed; opening pending entries anyway (fail closed)."
+          fi
+          for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+            gh api -X POST "repos/$REPO/check-runs" \
+              -f name="$name" \
+              -f head_sha="$HEAD_SHA" \
+              -f status="in_progress" \
+              -f "output[title]=$name (re-evaluation in progress)" \
+              -f "output[summary]=Publisher phase 1: evaluation queued for $HEAD_SHA." \
+              >/dev/null
+          done
+          echo "Opened pending entries for all three contexts on $HEAD_SHA."
+
+  # Phase 2. POSTs a fresh completed run per context rather than PATCHing
+  # phase 1's: the phases are separate workflow runs, and every Checks-API
+  # POST for one head coalesces into one shared suite where the newest run
+  # wins (measured, #845 facts F1) — no identifier crosses the run boundary.
+  publish:
+    name: publish
+    # Everything except workflow_run `requested`, which is phase 1's cue.
+    # Re-evaluates from scratch on every path; never reads
+    # workflow_run.conclusion (deliveries drop and conclusion can be null
+    # upstream — the verdict must not depend on how the parent finished).
+    if: github.event_name != 'workflow_run' || github.event.action == 'completed'
+    runs-on: ubuntu-latest
+    # Safe on THIS file and not on the gate workflows — the measured
+    # difference (#843): a cancelled pending member materialises a native
+    # check, and here it is named `publish`, which nothing requires.
+    # Grouping by head serializes same-head evaluations so an older run
+    # cannot land its verdict after a newer one; sweep and dispatch runs
+    # fall through to run_id (idempotent re-evaluations).
+    concurrency:
+      group: rcp-${{ github.event.workflow_run.head_sha || github.event.client_payload.pr || inputs.pr || github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: write
+    steps:
+      - name: Checkout repo (default branch — trusted scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve targets, evaluate gates, publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
+          # Validated as a positive integer below, so an arbitrary
+          # client_payload cannot inject shell (same posture as
+          # merge-clearance-gate.yml's dispatch-recheck job).
+          DISPATCH_PR: ${{ github.event.client_payload.pr }}
+          INPUT_PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          # Head-to-PR mapping from the open-PR list ONLY — never
+          # workflow_run.pull_requests, empty for fork PRs (#845 risks).
+          # One query carries number AND head so no per-PR resolve call can
+          # fail independently (#465).
+          if ! prs_raw=$(gh pr list --repo "$REPO" --state open --limit 500 \
+              --json number,headRefOid \
+              --jq '.[] | "\(.number)\t\(.headRefOid)"'); then
+            echo "::error::Failed to list open PRs on $REPO; leaving any pending entries standing (fail closed)."
+            exit 1
+          fi
+
+          requested_pr=""
+          if [ -n "$DISPATCH_PR" ] || [ -n "$INPUT_PR" ]; then
+            requested_pr="${DISPATCH_PR:-$INPUT_PR}"
+            case "$requested_pr" in
+              ''|*[!0-9]*|0*)
+                echo "::error::PR selector is not a positive integer: '$requested_pr'"
+                exit 1
+                ;;
+            esac
+          fi
+
+          targets=""
+          if [ -n "$RUN_HEAD" ]; then
+            targets=$(awk -F'\t' -v h="$RUN_HEAD" '$2 == h' <<<"$prs_raw" || true)
+          elif [ -n "$requested_pr" ]; then
+            targets=$(awk -F'\t' -v n="$requested_pr" '$1 == n' <<<"$prs_raw" || true)
+          else
+            targets="$prs_raw"
+          fi
+
+          if [ -z "$targets" ]; then
+            if [ -n "$RUN_HEAD" ]; then
+              # The event head matches no open PR: the parent ran on main's
+              # tip (schedule, phase 1 opened nothing) or the PR's head
+              # moved on. Close — never abandon — anything phase 1 DID open
+              # on that head: a red pinned to a superseded head is invisible
+              # to branch protection; an abandoned in_progress reads as a
+              # hang.
+              for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+                pending=$(gh api -X GET "repos/$REPO/commits/$RUN_HEAD/check-runs" \
+                  -f check_name="$name" -f filter=latest \
+                  --jq '[.check_runs[] | select(.status != "completed")] | length')
+                if [ "$pending" != "0" ]; then
+                  gh api -X POST "repos/$REPO/check-runs" \
+                    -f name="$name" \
+                    -f head_sha="$RUN_HEAD" \
+                    -f status="completed" \
+                    -f conclusion="failure" \
+                    -f "output[title]=$name — head superseded before evaluation" \
+                    -f "output[summary]=No open PR carries $RUN_HEAD; the pending entry is closed red on the bound head. The current head gets its own evaluation from its own events." \
+                    >/dev/null
+                fi
+              done
+              echo "Head $RUN_HEAD matches no open PR; closed any pending entries on it."
+            else
+              echo "No matching open PRs; nothing to publish."
+            fi
+            exit 0
+          fi
+
+          had_infra_error=0
+          # gate <script> <context> <sentinel-or-empty>: evaluate one gate
+          # for one PR and POST the completed verdict on its head.
+          gate() {
+            local script="$1" context="$2" sentinel="$3" pr="$4" head="$5"
+            local output rc conclusion title
+            set +e
+            output=$("$script" "$pr" "$REPO" 2>&1)
+            rc=$?
+            set -e
+            printf '%s\n' "$output"
+            title="$context (publisher re-evaluation)"
+            case "$rc" in
+              0) conclusion="success" ;;
+              1) conclusion="failure" ;;
+              *)
+                # Config/usage/infra exits publish a RED, not a skip:
+                # skipping would leave the PREVIOUS verdict standing on the
+                # refresh path this publisher owns (#429 sweep posture).
+                echo "::error::$script rc=$rc on PR #$pr (config/usage/infra error)"
+                had_infra_error=1
+                conclusion="failure"
+                title="$context — infra/config error (rc=$rc)"
+                ;;
+            esac
+            if [ "$rc" -eq 0 ] && [ -n "$sentinel" ] && \
+                ! grep -qF "$sentinel" <<<"$output"; then
+              # rc 0 without the script's own PASS line means the success
+              # did not come from the verdict path (a stubbed or truncated
+              # script); publish red and flag it.
+              echo "::error::$script exited 0 without '$sentinel' on PR #$pr"
+              had_infra_error=1
+              conclusion="failure"
+              title="$context — rc 0 without verdict sentinel"
+            fi
+            # Bash slice, not head -c: pipefail-safe under large outputs,
+            # correct for the 65535-char API limit (b10671e wave).
+            local summary="${output:0:60000}"
+            if ! gh api -X POST "repos/$REPO/check-runs" \
+              -f name="$context" \
+              -f head_sha="$head" \
+              -f status="completed" \
+              -f conclusion="$conclusion" \
+              -f "output[title]=$title" \
+              -f "output[summary]=$summary" \
+              >/dev/null; then
+              echo "::error::Failed to post $context for PR #$pr — its slot was not refreshed."
+              had_infra_error=1
+            fi
+          }
+
+          while IFS=$'\t' read -r PR head_sha; do
+            [ -z "$PR" ] && continue
+            if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
+              echo "::error::No head SHA for PR #$PR from the open-PR list; cannot refresh its contexts."
+              had_infra_error=1
+              continue
+            fi
+            echo "::group::Publish PR #$PR @ $head_sha"
+            gate scripts/merge-clearance-gate.sh   "$MCG_CONTEXT"        "Merge clearance: PASS" "$PR" "$head_sha"
+            gate scripts/codex-p1-gate.sh          "$CODEX_P1_CONTEXT"   ""                      "$PR" "$head_sha"
+            gate scripts/coderabbit-severity-gate.sh "$CODERABBIT_CONTEXT" ""                    "$PR" "$head_sha"
+            echo "::endgroup::"
+          done <<<"$targets"
+
+          if [ "$had_infra_error" -ne 0 ]; then
+            echo "::error::Publisher finished with one or more infra errors"
+            exit 1
+          fi
