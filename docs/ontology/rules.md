@@ -782,7 +782,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-148.** The author-wrapper and guard test suites exist and pass. ● — rules/repo_rules.md § check_gh_as_author
 
-**G-149.** A present CodeRabbit config parses, and the template repo pins the chill profile. ● — rules/repo_rules.md § check_coderabbit_config
+**G-149.** A present CodeRabbit config parses; the template repo pins the chill profile; and fleet-wide, auto-review must not be explicitly disabled and the request-changes workflow must not be enabled, keeping CodeRabbit advisory. ● — rules/repo_rules.md § check_coderabbit_config
 
 **G-150.** The CodeRabbit wait posts at most one status probe, surfaces its reply without changing timeout semantics, and never counts a status reply as clearance. ● — rules/repo_rules.md § check_coderabbit_wait
 

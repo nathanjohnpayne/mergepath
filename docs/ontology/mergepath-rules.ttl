@@ -37,6 +37,16 @@ mp:Identity rdf:type owl:Class .
 mp:AuthorIdentity rdf:type owl:Class ; rdfs:subClassOf mp:Identity .
 mp:ReviewerIdentity rdf:type owl:Class ; rdfs:subClassOf mp:Identity .
 
+# The author identity is one specific account. The enumeration makes AX4/AX5
+# complete under full OWL DL: an unclassified individual merging or committing
+# is forced sameAs nathanjohnpayne and refuted when differentFrom it. Under
+# the OWL-RL profile (this repo's checker) enumerations do not classify new
+# individuals, so the RL-catchable arm is a merger/committer provably typed
+# into a disjoint class (e.g. a ReviewerIdentity) — the profile boundary is
+# documented in README.md.
+mp:nathanjohnpayne rdf:type mp:AuthorIdentity .
+mp:AuthorIdentity owl:equivalentClass [ rdf:type owl:Class ; owl:oneOf ( mp:nathanjohnpayne ) ] .
+
 # AX1 — the author identity and reviewer identities are distinct accounts.
 # Binary axioms carry their mp:encodesRule via owl:Axiom annotation so the
 # annotation attaches to the axiom, not the subject entity; multi-triple
@@ -216,7 +226,11 @@ mp:performedBy rdf:type owl:ObjectProperty ;
 
 mp:SanctionedLabelAutomation rdf:type owl:Class ;
     rdfs:subClassOf mp:WorkflowActor ;
-    rdfs:comment "The exactly-two workflow automations sanctioned to remove needs-external-review (auto-clear-blocking-labels and the propagation lane's External Review Check)." .
+    rdfs:comment "The exactly-two workflow automations sanctioned to remove needs-external-review. Enumerated for DL-completeness; under OWL-RL the catchable case is a performer provably distinct from both (a disjoint workflow class or differentFrom assertions) — see README.md on the profile boundary." .
+mp:autoClearBlockingLabelsWorkflow rdf:type mp:SanctionedLabelAutomation .
+mp:laneExternalReviewCheck rdf:type mp:SanctionedLabelAutomation .
+mp:SanctionedLabelAutomation owl:equivalentClass
+    [ rdf:type owl:Class ; owl:oneOf ( mp:autoClearBlockingLabelsWorkflow mp:laneExternalReviewCheck ) ] .
 
 # AX7c — removing needs-external-review is reserved for the sanctioned
 # automations: any performer of such a removal is entailed to be one, so a
@@ -361,6 +375,11 @@ mp:KitEntry rdfs:subClassOf mp:VerbatimEntry .
   owl:members ( mp:CanonicalEntry mp:KitEntry mp:TemplatedEntry ) ;
   mp:encodesRule "G-86, G-87 (entry-type partition premise only)" ] .
 mp:TemplatedEntry owl:disjointWith mp:VerbatimEntry .
+[] rdf:type owl:Axiom ;
+   owl:annotatedSource mp:TemplatedEntry ;
+   owl:annotatedProperty owl:disjointWith ;
+   owl:annotatedTarget mp:VerbatimEntry ;
+   mp:encodesRule "G-78, G-86" .
 
 mp:carriedBy rdf:type owl:ObjectProperty ;
     rdfs:domain mp:Doc ; rdfs:range mp:ManifestEntry .
@@ -375,3 +394,14 @@ mp:carriedBy rdf:type owl:ObjectProperty ;
                          owl:someValuesFrom mp:VerbatimEntry ] ) ;
   rdfs:subClassOf owl:Nothing ;
   mp:encodesRule "G-67, G-76, G-78, G-79" ] .
+
+# AX13b — a hub-only doc carried by a verbatim entry is equally a
+# contradiction: hub-only content never travels, whether or not a consumer
+# destination is asserted alongside.
+[ rdf:type owl:Class ;
+  owl:intersectionOf ( mp:HubOnlyDoc
+                       [ rdf:type owl:Restriction ;
+                         owl:onProperty mp:carriedBy ;
+                         owl:someValuesFrom mp:VerbatimEntry ] ) ;
+  rdfs:subClassOf owl:Nothing ;
+  mp:encodesRule "G-68, G-77, G-79" ] .

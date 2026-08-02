@@ -133,3 +133,10 @@ mp:rogueRemovesExternalReview rdf:type mp:LabelRemoval ;
     mp:removesLabel mp:needsExternalReview ;
     mp:seededViolation "R-167" ;
     mp:violationWitness mp:rogueWorkflow .
+
+### V19 — a hub-only doc carried by a verbatim canonical entry (AX13b): no
+### consumer destination needs to be asserted for this to be a contradiction.
+mp:runbookVerbatimEntry rdf:type mp:CanonicalEntry .
+mp:runbookDocVerbatim rdf:type mp:HubOnlyDoc ;
+    mp:carriedBy mp:runbookVerbatimEntry ;
+    mp:seededViolation "G-77" .

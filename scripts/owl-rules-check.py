@@ -41,7 +41,7 @@ VIOLATIONS = REPO_ROOT / "docs" / "ontology" / "fixtures" / "violations.ttl"
 # Ratchet: the number of seeded violation individuals the fixture must carry.
 # Bump deliberately when adding an axiom + fixture; a lower live count fails,
 # so deleting seeds (or emptying the fixture) can never buy a silent pass.
-SEEDED_MIN = 18
+SEEDED_MIN = 19
 
 
 def closure(*paths):
