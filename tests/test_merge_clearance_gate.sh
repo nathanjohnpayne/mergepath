@@ -1800,6 +1800,12 @@ mcg22_case w 's{^(          CHECK_ID: )\$\{\{ steps.open.outputs.id \}\}$}{$1\$\
 #     lineage blocks the PR permanently (measured on #843; App P2 on #852).
 mcg22_case x 's{^(  merge-clearance-gate:\n)}{$1    concurrency:\n      group: mcg-gate\n      cancel-in-progress: false\n}m' \
   fail "concurrency"
+# y — a producer's pinned condition DELETED outright: validating the
+#     allowlist only when the key is supplied lets the strongest mutation —
+#     removing the condition — pass untested, and dispatch-recheck then runs
+#     red on every pull_request event (App P2 on #852).
+mcg22_case y 's{^    if: github.event_name == \x27repository_dispatch\x27\n}{}m' \
+  fail "has no job-level if"
 unset MCG_TAG
 
 # g — positive control on the REAL file. Case I uses a synthesized header; this

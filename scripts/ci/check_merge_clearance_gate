@@ -826,7 +826,15 @@ for key in PRODUCERS:
             "      its own condition is even evaluated, leaving the trigger and every",
             "      pinned condition intact while that path stops refreshing the",
             "      required context. No producer may gate on another job.")
-    if "if" in job and normalized_if(job["if"]) not in JOB_IF_ALLOWED.get(key, ()):
+    allowed = JOB_IF_ALLOWED.get(key, ())
+    if allowed and "if" not in job:
+        bad("FAIL: [#850 producer eligibility] job '%s' has no job-level if: at all," % key,
+            "      but its pinned allowlist expects one. The condition scopes each",
+            "      producer to its own trigger; without it dispatch-recheck (for",
+            "      example) runs on every pull_request event with an empty client",
+            "      payload and exits red — and an exactness claim that is only",
+            "      checked when the key is supplied is not exact (App P2 on #852).")
+    elif "if" in job and normalized_if(job["if"]) not in allowed:
         bad("FAIL: [#850 producer eligibility] job '%s' carries a job-level if: %r" % (key, job["if"]),
             "      outside its pinned allowlist. A falsy literal or an always-false",
             "      expression both leave every trigger and matched string intact",
