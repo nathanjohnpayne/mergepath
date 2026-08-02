@@ -108,10 +108,6 @@ mp:prMergedRedCheck rdf:type mp:MergedPR ;
     mp:hasFailingRequiredCheck mp:redGateRun ;
     mp:seededViolation "R-96" .
 
-### V15 — a repo that is both hub and consumer (AX15)
-mp:confusedRepo rdf:type mp:Hub , mp:Consumer ;
-    mp:seededViolation "G-68-topology" .
-
 ### V16 — a manifest entry typed both canonical and templated (AX14)
 mp:entryTwoTypes rdf:type mp:CanonicalEntry , mp:TemplatedEntry ;
     mp:seededViolation "G-86" .
@@ -140,3 +136,12 @@ mp:runbookVerbatimEntry rdf:type mp:CanonicalEntry .
 mp:runbookDocVerbatim rdf:type mp:HubOnlyDoc ;
     mp:carriedBy mp:runbookVerbatimEntry ;
     mp:seededViolation "G-77" .
+
+### V20 — a doc declaring only the ownership VALUE (no class typing) carried
+### by a verbatim entry: the hasValue equivalence classifies it as
+### PerRepoOwnedDoc, so AX13 catches the clobber violation from the value
+### alone.
+mp:valueOnlyVerbatimEntry rdf:type mp:KitEntry .
+mp:valueOnlyPerRepoDoc mp:hasOwnershipClass mp:perRepoOwnedClass ;
+    mp:carriedBy mp:valueOnlyVerbatimEntry ;
+    mp:seededViolation "G-67" .

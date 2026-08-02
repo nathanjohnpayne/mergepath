@@ -269,6 +269,11 @@ mp:HumanAuthoredThread rdf:type owl:Class ; rdfs:subClassOf mp:Thread ;
     rdfs:comment "A review thread whose root comment was authored by a real human, not a bot or registered agent reviewer." .
 
 mp:ResolvedThread owl:disjointWith mp:UnresolvedThread .
+[] rdf:type owl:Axiom ;
+   owl:annotatedSource mp:ResolvedThread ;
+   owl:annotatedProperty owl:disjointWith ;
+   owl:annotatedTarget mp:UnresolvedThread ;
+   mp:encodesRule "R-51 (thread-state partition premise)" .
 
 mp:hasThread rdf:type owl:ObjectProperty ;
     rdfs:domain mp:PullRequest ; rdfs:range mp:Thread .
@@ -305,13 +310,9 @@ mp:Repo rdf:type owl:Class .
 mp:Hub rdf:type owl:Class ; rdfs:subClassOf mp:Repo .
 mp:Consumer rdf:type owl:Class ; rdfs:subClassOf mp:Repo .
 
-# AX15 — the hub is never a consumer.
-mp:Hub owl:disjointWith mp:Consumer .
-[] rdf:type owl:Axiom ;
-   owl:annotatedSource mp:Hub ;
-   owl:annotatedProperty owl:disjointWith ;
-   owl:annotatedTarget mp:Consumer ;
-   mp:encodesRule "G-68 (topology premise)" .
+# No Hub/Consumer disjointness is asserted: no catalog rule prohibits a
+# repository from holding both topology roles, and a derived model must not
+# invent prohibitions its sources do not state.
 
 mp:Doc rdf:type owl:Class .
 mp:CanonicalDoc rdf:type owl:Class ; rdfs:subClassOf mp:Doc .
@@ -329,6 +330,18 @@ mp:OwnershipClass rdf:type owl:Class .
 mp:canonicalClass rdf:type mp:OwnershipClass .
 mp:perRepoOwnedClass rdf:type mp:OwnershipClass .
 mp:hubOnlyClass rdf:type mp:OwnershipClass .
+
+# The declared ownership VALUE and the document CLASS are two views of one
+# fact; the hasValue equivalences bridge them so a doc declaring only the
+# value is still classified — and therefore still subject to AX12/AX13/AX13b.
+# A missing declaration stays a closed-world check (functional means at most
+# one value, not exactly one).
+mp:CanonicalDoc owl:equivalentClass
+    [ rdf:type owl:Restriction ; owl:onProperty mp:hasOwnershipClass ; owl:hasValue mp:canonicalClass ] .
+mp:PerRepoOwnedDoc owl:equivalentClass
+    [ rdf:type owl:Restriction ; owl:onProperty mp:hasOwnershipClass ; owl:hasValue mp:perRepoOwnedClass ] .
+mp:HubOnlyDoc owl:equivalentClass
+    [ rdf:type owl:Restriction ; owl:onProperty mp:hasOwnershipClass ; owl:hasValue mp:hubOnlyClass ] .
 
 # AX11 — a doc declares exactly one ownership class value: the property is
 # functional and the three class values are mutually distinct, so two

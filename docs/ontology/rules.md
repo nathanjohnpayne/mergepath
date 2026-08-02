@@ -1094,6 +1094,26 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **G-292.** Service-account key rotation is human-only, never automated by any agent or workflow. ● — docs/agents/deployment-process.md
 
+### CodeRabbit configuration posture (hub-only audit runbook)
+
+**G-293.** `.coderabbit.yml` is deliberately unpropagated: each consumer ships and owns its own copy, and only the universal safety floor is enforced fleet-wide. ● — docs/agents/coderabbit-audit.md
+
+**G-294.** Config drift against the vendor docs resolves as exactly one of four dispositions: a commented config change, a tooling note, a follow-up issue, or a documented no-action on the audit page. ○ — docs/agents/coderabbit-audit.md
+
+**G-295.** Incremental auto-review stays explicitly pinned on — the fix-up-commit loop and HEAD-anchored clearance depend on it, and an accidental off would silently strand every post-open push unreviewed. ● — docs/agents/coderabbit-audit.md
+
+**G-296.** The auto-pause threshold stays unset here; the key is owned by its own tracked issue and is never pinned blind. ○ — docs/agents/coderabbit-audit.md
+
+**G-297.** A PR against a non-default base is not auto-reviewed; a workflow targeting one must add that base to the base-branches list in that repo's own config. ● — docs/agents/coderabbit-audit.md
+
+**G-298.** Learnings scope stays `auto` (resolving local for the all-public fleet); org-wide sharing would require an explicit global override, never an accident of visibility. ● — docs/agents/coderabbit-audit.md
+
+**G-299.** Path instructions are targeted supplements added on an observed miss, never speculative additions. ○ — docs/agents/coderabbit-audit.md
+
+**G-300.** The rate-limit allowance is checked with the read-only rate-limit command — an authoring write routed through the author wrapper — rather than by spending a review. ○ — docs/agents/coderabbit-audit.md
+
+**G-301.** The PR author must hold an active CodeRabbit seat covering the repo; a missing seat silently disables review, and coverage is confirmed on the dashboard plus the observational cross-check, there being no API surface for it. ● — docs/agents/coderabbit-audit.md
+
 ---
 
 The OWL companion ([`mergepath-rules.ttl`](mergepath-rules.ttl)) formalizes a core subset of the ● rules as axioms a reasoner can violate-check; each axiom is annotated with the rule IDs it encodes, and [`README.md`](README.md) documents the encoding, the checker, and the honest limits (what open-world OWL can and cannot catch).
