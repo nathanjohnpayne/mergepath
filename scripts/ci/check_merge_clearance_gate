@@ -628,11 +628,6 @@ PRODUCERS = ("merge-clearance-gate", "scheduled-sweep", "dispatch-recheck")
 # a substring test while the publisher submits something GitHub rejects.
 GH_TOKEN_OK = ("${{ secrets.GITHUB_TOKEN }}",)
 HEAD_SHA_OK = ("${{ github.event.pull_request.head.sha }}",)
-# Conservative falsy set. The real jobs carry legitimate truthy expressions
-# (github.event_name == 'schedule'), which MUST pass; this rejects only
-# literals GitHub can never evaluate true. `if: false` parses to Python False,
-# whose str() is "false", so the bare bool is covered by the same set.
-FALSY = ("false", "0", "null", "")
 # Exact job-level conditions per producer (cross-agent P1 on #852). A
 # NON-literal always-false condition — `github.event_name == 'push'` on the
 # schedule-only sweep — defeats any falsy-literal test, and proving a general
@@ -653,52 +648,9 @@ def normalized_if(value):
     return " ".join(str(value).split())
 
 
-def is_falsy_if(value):
-    """True when a job-level if: is a literal GitHub can never evaluate true.
+def normalized_if(value):
+    return " ".join(str(value).split())
 
-    An expression wrapper around a bare literal — `${{ false }}`, `${{ 0 }}`,
-    `${{ null }}` — is unwrapped first: GitHub treats those exactly as the
-    bare literal, so leaving them outside the set would let a producer be
-    disabled while every assertion here passes. Anything non-literal inside
-    the wrapper is left alone; evaluating expressions is review's job.
-    """
-    # A bare `if:` / `if: null` / `if: ~` parses to Python None, whose str()
-    # is "None" — outside the tuple, so the native-null path would bypass the
-    # wrapper normalization entirely. GitHub's handling of a null condition
-    # is not documented; a condition the check cannot prove eligible fails
-    # closed, forcing an explicit expression or removal of the key.
-    if value is None:
-        return True
-    text = str(value).strip()
-    wrapped = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", text)
-    if wrapped:
-        text = wrapped.group(1)
-    # GitHub's falsy LITERALS are a closed set: false, null, the empty
-    # string, and numeric zero in any spelling (-0, 0.0, 0e0). Normalising
-    # numeric value terminates the set — this is not an enumeration that can
-    # drift. Applied to bare values too, not only wrapped ones: YAML hands a
-    # bare `if: 0.0` over as the float whose str() is "0.0", which no literal
-    # tuple can enumerate.
-    #
-    # A QUOTED expression literal is its own arm: only the EMPTY quoted
-    # string is falsy — GitHub treats every non-empty string literal,
-    # including '0', as truthy, so stripping the quotes and falling into the
-    # numeric check would falsely reject an eligible producer.
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
-        return text[1:-1] == ""
-    # int(text, 0) reads hex/octal/binary spellings (0x0, 0o0, 0b0) that
-    # float() does not; GitHub's expression numerics accept them and they
-    # evaluate falsy at zero.
-    try:
-        if int(text, 0) == 0:
-            return True
-    except ValueError:
-        try:
-            if float(text) == 0:
-                return True
-        except ValueError:
-            pass
-    return text.lower() in FALSY
 
 failures = []
 
@@ -735,17 +687,22 @@ def step_named(job, want):
 # could pass on properties the other never saw.
 class StrictLoader(yaml.SafeLoader):
     def construct_mapping(self, node, deep=False):
+        # Duplicates are detected on the RAW scalar text, not the resolved
+        # value: PyYAML's 1.1 resolution coerces `on` and `true` both to the
+        # boolean True, so value-level comparison reports a duplicate for two
+        # keys Actions keeps distinct — a false red on a valid workflow.
+        # Actions treats keys as strings; comparing the source text matches
+        # its semantics.
         seen = set()
         for key_node, _value_node in node.value:
-            key = self.construct_object(key_node, deep=deep)
-            if isinstance(key, (dict, list)):
-                # A complex (unhashable) key would TypeError on the set
-                # membership below, which the outer except still catches — but
-                # a named parse error beats an incidental one, and Actions
-                # rejects complex keys in workflows anyway.
+            if not isinstance(key_node, yaml.ScalarNode):
+                # Actions rejects complex keys in workflows; a named parse
+                # error beats the incidental TypeError the set membership
+                # would raise.
                 raise yaml.constructor.ConstructorError(
                     None, None,
                     "found unhashable (complex) mapping key", key_node.start_mark)
+            key = key_node.value
             if key in seen:
                 raise yaml.constructor.ConstructorError(
                     None, None,
@@ -844,12 +801,18 @@ for key in PRODUCERS:
             "      while that path stops refreshing the required context; only an",
             "      exact condition can be proven eligible structurally.")
 
-# Property 2b — no producer STEP may be disabled either (cross-agent P1 on
-# #852). An `if: false` on the publishing step — or an essential predecessor
-# like the sweep's PR enumeration — preserves the job-level condition and
-# every matched string while that trigger path stops refreshing the required
-# context. Legitimate conditionals here are truthy expressions
-# (`steps.find.outputs.prs != ''`) and pass the same falsy test.
+# Property 2b — no producer STEP may be disabled either (cross-agent P1 and
+# two App P2s on #852). A falsy literal, an extended conjunction ending in
+# `&& false`, or a non-literal condition that is false on the job's only
+# trigger all leave the job-level condition and every matched string intact
+# while the step never runs. Literal-falsy detection cannot terminate over
+# expressions, so every step-level `if:` in a producer job must match a
+# PINNED expression exactly — the same posture as the job-level allowlist: a
+# legitimate condition change updates the pin in the same diff.
+STEP_IF_ALLOWED = (
+    "steps.find.outputs.prs != ''",
+    "${{ !cancelled() && steps.open.outputs.id != '' }}",
+)
 for key in PRODUCERS:
     job = jobs.get(key)
     if not isinstance(job, dict):
@@ -857,11 +820,11 @@ for key in PRODUCERS:
     for step in job.get("steps") or []:
         if not isinstance(step, dict):
             continue
-        if "if" in step and is_falsy_if(step["if"]):
+        if "if" in step and normalized_if(step["if"]) not in STEP_IF_ALLOWED:
             bad("FAIL: [#850 producer eligibility] step %r in job '%s' carries a" % (step.get("name") or "<unnamed>", key),
-                "      falsy step-level if: %r — the job still runs but this step" % step["if"],
-                "      never does, so that trigger path publishes nothing while every",
-                "      string assertion stays satisfied.")
+                "      step-level if: %r outside the pinned set — the job still" % step["if"],
+                "      runs but this step may never, so that trigger path can stop",
+                "      publishing while every string assertion stays satisfied.")
 
 # Property 3 — phase 2 binds the PR head itself (#849 hole: a job-scoped grep
 # for HEAD_SHA is satisfied by phase 1's binding while phase 2 has lost its).
@@ -920,7 +883,13 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
-# Run the fixture-driven test suite.
+# Run the fixture-driven test suite — unless the caller is the suite itself
+# driving a positive control, which would recurse into several extra minutes
+# of already-covered fixtures on every repo_lint run.
+if [ "${MCG_PREFLIGHT_ONLY:-}" = "1" ]; then
+  echo "check_merge_clearance_gate: PASS (preflight only)"
+  exit 0
+fi
 if ! bash "$TEST"; then
   echo "check_merge_clearance_gate: FAIL (test suite)"
   exit 1

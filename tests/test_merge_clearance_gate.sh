@@ -1206,7 +1206,7 @@ WF_OK="$WORKDIR/wf-ok.yml"
 WF
 } > "$WF_OK"
 set +e
-OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$WF_OK" "$CHECK_BIN" 2>&1)
+OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MCG_PREFLIGHT_ONLY=1 MERGE_CLEARANCE_WORKFLOW="$WF_OK" "$CHECK_BIN" 2>&1)
 RC=$?
 set -e
 if ! echo "$OUT" | grep -q "must define a JOB named" \
@@ -1307,7 +1307,7 @@ WF_RD_OK="$WORKDIR/wf-rd-ok.yml"
   write_wf_gate_job
 } > "$WF_RD_OK"
 set +e
-OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$WF_RD_OK" "$CHECK_BIN" 2>&1)
+OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MCG_PREFLIGHT_ONLY=1 MERGE_CLEARANCE_WORKFLOW="$WF_RD_OK" "$CHECK_BIN" 2>&1)
 RC=$?
 set -e
 # Assert the check RAN to completion AND its pre-flight PASSED. A pre-flight
@@ -1551,7 +1551,7 @@ echo; echo "--- Test 22 (#845): two-phase publish assertions reject each broken 
 mcg22_run() {  # <fixture-path> -> echoes rc
   local out rc
   set +e
-  out=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$1" "$CHECK_BIN" 2>&1)
+  out=$(MCG_SKIP_FIX3_SELFTEST=1 MCG_PREFLIGHT_ONLY=1 MERGE_CLEARANCE_WORKFLOW="$1" "$CHECK_BIN" 2>&1)
   rc=$?
   set -e
   printf '%s' "$out" > "$1.out"
@@ -1723,12 +1723,6 @@ mcg22_case c5 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: 0.0}sm' \
 #     first-step property must fail with its own named cause instead.
 mcg22_case j 's{(    steps:\n)(      - name: Open the required check_run)}{$1      - just-a-string\n$2}' \
   fail '[#850 phase-1 position]'
-# c6 — a QUOTED non-empty expression literal is TRUTHY to GitHub ('0'
-#      included). Job-level conditions are exact-pinned now, so the truthy
-#      semantics are exercised where the falsy test still rules: a producer
-#      STEP. Stripping the quotes into the numeric arm would falsely red an
-#      eligible step.
-mcg22_case c6 's{(      - name: Re-evaluate gate per PR and post check_run\n)(        if: )steps.find.outputs.prs[^\n]*}{$1$2\$\{\{ \x270\x27 \}\}}sm' pass
 # c7 — the EMPTY quoted literal is the one falsy quoted form.
 mcg22_case c7 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ \x27\x27 \}\}}sm' \
   fail "[#850 producer eligibility] job 'scheduled-sweep'"
@@ -1739,6 +1733,18 @@ mcg22_case c8 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ 0x0 \
 # k — a falsy if: on a producer STEP: the job-level condition stays truthy and
 #     every string survives, but the publishing path is dead.
 mcg22_case k 's{(      - name: Re-evaluate gate per PR and post check_run\n)(        if: )steps.find.outputs.prs[^\n]*}{$1$2\x27\x27}sm' \
+  fail "[#850 producer eligibility] step"
+# n — POSITIVE control for YAML key semantics: job ids `on` and `true` are
+#     distinct strings to Actions, but PyYAML 1.1 resolution coerces both to
+#     the boolean True — raw-scalar comparison must not report a duplicate.
+mcg22_case n 's{\z}{  on:\n    name: on-shaped job id\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  "true":\n    name: true-shaped job id\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n}' pass
+# o — the close step's condition extended with a falsy conjunct: both required
+#     substrings survive, the step never runs, phase 1's pending entry is
+#     never closed.
+mcg22_case o 's{(        if: )\$\{\{ !cancelled\(\) && steps.open.outputs.id != \x27\x27 \}\}}{$1\$\{\{ !cancelled\(\) && steps.open.outputs.id != \x27\x27 && false \}\}}' \
+  fail "[#850 producer eligibility] step"
+# p — the sweep's publish step on a NON-literal condition false on schedule.
+mcg22_case p 's{(      - name: Re-evaluate gate per PR and post check_run\n)(        if: )steps.find.outputs.prs[^\n]*}{$1$2github.event_name == \x27push\x27}sm' \
   fail "[#850 producer eligibility] step"
 # m — an always-false NON-literal condition: never true on the sweep's only
 #     trigger, invisible to any falsy test, caught only by the exact
