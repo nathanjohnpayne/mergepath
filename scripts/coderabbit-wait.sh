@@ -1603,16 +1603,21 @@ post_reviewer_comment() {
 # Compare by (created_at, id): strictly-later timestamp, or equal timestamp
 # with a higher comment id (ids increase monotonically), so a tie resolves by
 # true post order.
+# rc 0 = a matching trigger exists; rc 1 = confirmed absent; rc 2 = the scan
+# itself FAILED. The distinction is load-bearing: a transient read failure
+# collapsed into "absent" made both callers post, so one GitHub hiccup could
+# produce a duplicate retry or resume — the same read-error-is-not-empty class
+# the Phase 4b barrier already fixed (#842). Callers decline on rc 2.
 trigger_already_posted() {  # <since-iso8601> <notice-comment-id> <exact-body>
   local since=$1
   local notice_id=$2
   local body=$3
   local comments reviewers_json
   comments=$(fetch_api_array_best_effort "repos/$REPO/issues/$PR_NUMBER/comments" \
-    "re-invocation dedupe scan") || return 1
+    "re-invocation dedupe scan") || return 2
   # Trusted-author allow-list as a JSON array. `$l` is bound BEFORE the array
   # literal so the literal cannot rebind `.` out from under the lookup.
-  reviewers_json=$(read_available_reviewers | jq -R . | jq -sc .) || return 1
+  reviewers_json=$(read_available_reviewers | jq -R . | jq -sc .) || return 2
   # Exact body OR the body as a first line: the Phase 4b barrier posts the
   # same command with a dedup marker appended on later lines (#847), and two
   # recovery paths that cannot read each other's writes both post against one
@@ -1641,8 +1646,14 @@ post_retry_trigger() {  # [<notice-fresh-at> <notice-comment-id>]
   local notice_id=${2:-0}
   local mention="@${BOT_LOGIN%\[bot\]}"
   local body="${mention}, try again."
-  if [ -n "$since" ] && trigger_already_posted "$since" "$notice_id" "$body"; then
+  local dedupe_rc=0
+  [ -n "$since" ] && { trigger_already_posted "$since" "$notice_id" "$body" || dedupe_rc=$?; }
+  if [ -n "$since" ] && [ "$dedupe_rc" = 0 ]; then
     log "retry trigger already present for this rate-limit window (after notice $notice_id @ $since) — skipping duplicate POST (#829)"
+    return 0
+  fi
+  if [ "$dedupe_rc" = 2 ]; then
+    log "dedupe scan failed — declining to post the retry trigger rather than risking a duplicate; the poll loop retries"
     return 0
   fi
   log "posting retry trigger comment to PR #$PR_NUMBER as $mention"
@@ -1663,8 +1674,14 @@ post_resume_trigger() {
   local notice_id=${2:-0}
   local mention="@${BOT_LOGIN%\[bot\]}"
   local body="${mention} resume"
-  if [ -n "$since" ] && trigger_already_posted "$since" "$notice_id" "$body"; then
+  local dedupe_rc=0
+  [ -n "$since" ] && { trigger_already_posted "$since" "$notice_id" "$body" || dedupe_rc=$?; }
+  if [ -n "$since" ] && [ "$dedupe_rc" = 0 ]; then
     log "resume trigger already present for this pause NOTE (after notice $notice_id @ $since) — skipping duplicate POST (#829)"
+    return 0
+  fi
+  if [ "$dedupe_rc" = 2 ]; then
+    log "dedupe scan failed — declining to post the resume rather than risking a duplicate; the poll loop retries"
     return 0
   fi
   log "posting auto-pause resume trigger comment to PR #$PR_NUMBER as $mention"
