@@ -283,13 +283,23 @@ jobs:
           # head goes first so its verdict lands inside the latency budget;
           # a dispatch narrows to its named PR (the fast manual remedy).
           targets=""
+          dispatch_matched=""
           if [ -n "$requested_pr" ]; then
             # Full coverage here too (cross-agent round 3): a dispatch that
             # evaluated only its named PR could cancel a queued full pass
             # and strand the displaced head's pendings, contradicting the
             # subsume-all property. Named PR first keeps the remedy fast.
-            targets=$({ awk -F'\t' -v n="$requested_pr" '$1 == n' <<<"$prs_raw"; \
-                        awk -F'\t' -v n="$requested_pr" '$1 != n' <<<"$prs_raw"; } || true)
+            # The selector must MATCH a row (round 9): a named PR that
+            # closed before enumeration must not fall through to an
+            # unrelated first row — degrade to a plain full pass instead.
+            dispatch_matched=$(awk -F'\t' -v n="$requested_pr" '$1 == n' <<<"$prs_raw" || true)
+            if [ -n "$dispatch_matched" ]; then
+              targets=$({ printf '%s\n' "$dispatch_matched"; \
+                          awk -F'\t' -v n="$requested_pr" '$1 != n' <<<"$prs_raw"; } || true)
+            else
+              echo "::warning::Dispatch named PR #$requested_pr, which is not an open PR; running a plain full pass."
+              targets="$prs_raw"
+            fi
           elif [ -n "$RUN_HEAD" ]; then
             targets=$({ awk -F'\t' -v h="$RUN_HEAD" '$2 == h' <<<"$prs_raw"; \
                         awk -F'\t' -v h="$RUN_HEAD" '$2 != h' <<<"$prs_raw"; } || true)
@@ -341,17 +351,27 @@ jobs:
           # strand. The sweep stays pending-free by design: a background
           # refresher that pended every open PR each interval would flap
           # every checks display in the repo.
-          if [ -n "$requested_pr" ] && [ -n "$targets" ]; then
-            dispatch_head=$(awk -F'\t' 'NR==1{print $2}' <<<"$targets")
+          # Their created ids are captured: this pass's OWN pendings would
+          # otherwise trip its own freshness guard, since run_started_at
+          # necessarily predates any POST this run makes (round 9 — the
+          # round-8 form self-deadlocked the manual recheck path). The
+          # guard excludes exactly these ids and nothing else.
+          OWN_PENDING_IDS=""
+          if [ -n "$dispatch_matched" ]; then
+            dispatch_head=$(awk -F'\t' 'NR==1{print $2}' <<<"$dispatch_matched")
             if [ -n "$dispatch_head" ]; then
               for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
-                gh api -X POST "repos/$REPO/check-runs" \
+                if own_id=$(gh api -X POST "repos/$REPO/check-runs" \
                   -f name="$name" \
                   -f head_sha="$dispatch_head" \
                   -f status="in_progress" \
                   -f "output[title]=$name (re-evaluation in progress)" \
                   -f "output[summary]=Dispatch-requested re-evaluation for $dispatch_head." \
-                  >/dev/null || echo "::warning::Could not open pending $name on $dispatch_head; its verdict follows from this pass regardless."
+                  --jq .id); then
+                  OWN_PENDING_IDS="$OWN_PENDING_IDS $own_id"
+                else
+                  echo "::warning::Could not open pending $name on $dispatch_head; its verdict follows from this pass regardless."
+                fi
               done
             fi
           fi
@@ -420,6 +440,20 @@ jobs:
               echo "::error::Freshness lookup failed for $context on $head; withholding this verdict (fail closed)."
               had_infra_error=1
               return 0
+            fi
+            # Subtract this pass's own dispatch-opened pendings (round 9):
+            # identity distinguishes self from newer where a timestamp
+            # cannot.
+            if [ -n "$newer" ] && [ -n "$OWN_PENDING_IDS" ]; then
+              local filtered="" nid
+              while read -r nid; do
+                [ -z "$nid" ] && continue
+                case " $OWN_PENDING_IDS " in
+                  *" $nid "*) ;;
+                  *) filtered="$filtered$nid "
+                esac
+              done <<<"$newer"
+              newer="${filtered% }"
             fi
             if [ -n "$newer" ]; then
               echo "Newer pending for $context on $head (started after $PASS_START); withholding this verdict."
