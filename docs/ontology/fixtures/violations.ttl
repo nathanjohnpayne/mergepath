@@ -78,11 +78,13 @@ mp:agentResolvesHumanThread rdf:type mp:ThreadResolution ;
 mp:docTwoClasses rdf:type mp:CanonicalDoc , mp:HubOnlyDoc ;
     mp:seededViolation "G-65" .
 
-### V10 — a doc declaring two different ownership-class values (AX11)
+### V10 — a doc declaring two different ownership-class values (AX11); uses
+### the perRepoOwned/hubOnly pair so its clash is distinct from the
+### canonical/hubOnly pair V9 forces through the class equivalences.
 mp:docTwoOwnershipValues rdf:type mp:Doc ;
-    mp:hasOwnershipClass mp:canonicalClass , mp:hubOnlyClass ;
+    mp:hasOwnershipClass mp:perRepoOwnedClass , mp:hubOnlyClass ;
     mp:seededViolation "G-65" ;
-    mp:violationWitness mp:canonicalClass .
+    mp:violationWitness mp:perRepoOwnedClass .
 
 ### V11 — a hub-only doc propagated to a consumer (AX12; the #864 class)
 mp:hubGlossaryInConsumer rdf:type mp:HubOnlyDoc ;
