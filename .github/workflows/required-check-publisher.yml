@@ -118,7 +118,7 @@ jobs:
           # the list READ fails, open anyway: pending is the fail-closed
           # direction, and a spurious pending on a non-PR head is invisible
           # to branch protection and retired by the next publish pass.
-          if heads=$(gh api --paginate "repos/$REPO/pulls" -f state=open \
+          if heads=$(gh api --paginate -X GET "repos/$REPO/pulls" -f state=open \
               -f per_page=100 --jq '.[].head.sha'); then
             if ! grep -qxF "$HEAD_SHA" <<<"$heads"; then
               echo "Head $HEAD_SHA is not an open PR head; nothing to open."
@@ -200,7 +200,7 @@ jobs:
           # exempts every head beyond it from both phases (cross-agent
           # round 3). One query carries number AND head so no per-PR
           # resolve call can fail independently (#465).
-          if ! prs_raw=$(gh api --paginate "repos/$REPO/pulls" -f state=open \
+          if ! prs_raw=$(gh api --paginate -X GET "repos/$REPO/pulls" -f state=open \
               -f per_page=100 \
               --jq '.[] | "\(.number)\t\(.head.sha)"'); then
             echo "::error::Failed to list open PRs on $REPO; leaving any pending entries standing (fail closed)."
@@ -329,10 +329,17 @@ jobs:
             # the server, not by any actor this check would need to trust.
             # The residual window is the gap between this read and the POST
             # below — the floor without conditional writes.
+            # A FAILED lookup withholds too (cross-agent round 4): unknown
+            # freshness is possibly-stale, and defaulting to "no newer
+            # pending" would let this pass overwrite a hold it never saw.
             local newer
-            newer=$(gh api --paginate -X GET "repos/$REPO/commits/$head/check-runs" \
+            if ! newer=$(gh api --paginate -X GET "repos/$REPO/commits/$head/check-runs" \
               -f check_name="$context" -f filter=latest -f per_page=100 \
-              --jq ".check_runs[] | select(.status != \"completed\") | select(.started_at > \"$PASS_START\") | .id") || newer=""
+              --jq ".check_runs[] | select(.status != \"completed\") | select(.started_at > \"$PASS_START\") | .id"); then
+              echo "::error::Freshness lookup failed for $context on $head; withholding this verdict (fail closed)."
+              had_infra_error=1
+              return 0
+            fi
             if [ -n "$newer" ]; then
               echo "Newer pending for $context on $head (started after $PASS_START); withholding this verdict."
               return 0
