@@ -787,9 +787,15 @@ report_verdict() {
     echo "$unresolved" | jq -r '
       .[] | "  - [\(.tier | ascii_upcase)] \(.path):\(.line) (comment id \(.id))\n      \(.body_snippet)"
     '
-    echo ""
-    echo "Resolve each inline thread via the GitHub UI (or the GraphQL"
-    echo "resolveReviewThread mutation) once the finding is addressed."
+    # Guarded on the INLINE count (CodeRabbit, #886): on a summary-only
+    # failure there is no thread to resolve, and printing an instruction the
+    # reader cannot follow on the findings in front of them is worse than
+    # printing nothing — the summary block below is the applicable one.
+    if [ "$BLOCKING_COUNT" -gt 0 ]; then
+      echo ""
+      echo "Resolve each inline thread via the GitHub UI (or the GraphQL"
+      echo "resolveReviewThread mutation) once the finding is addressed."
+    fi
     if [ "$SUMMARY_BLOCKING_COUNT" -gt 0 ]; then
       echo ""
       echo "Findings listed against \"(PR-level summary comment)\" have no review"

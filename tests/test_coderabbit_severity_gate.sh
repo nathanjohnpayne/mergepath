@@ -69,6 +69,22 @@
 #   32. a valid token mentioned mid-line ("lgtm <token>") → not an ack.
 #   33. an ack posted BEFORE the summary it would clear → still gates.
 #
+# Codex round 1 on #886 (two false clears the ack fix above left open):
+#   34. a same-head re-review swapping finding A for B under a byte-identical
+#       `⚠️ Potential issue` header → A's ack must not clear B; 34b acking the
+#       token printed for B still clears it (no deadlock).
+#   35. a summary that QUOTES a stanza marker inside a fence is still a
+#       completed report — PR-controlled text must not suppress it; 35b a
+#       GENUINE column-0 stanza still does suppress it (the narrowing did not
+#       fail open); 35c benign stanzas with `end of` closers still classify.
+#
+# Codex round 2 on #886:
+#   36. a CodeRabbit chat reply QUOTING the summarize marker does not displace
+#       the real summary (selection is `startswith`, not `contains`).
+#   37. tightening the resolved required-tier set invalidates an earlier ack
+#       (the fingerprint is salted with that set).
+#   38. a bare ack token with no rationale under it is not an ack.
+#
 # Bash 3.2 portable.
 
 set -euo pipefail
@@ -1065,10 +1081,15 @@ RC=$?
 set -e
 if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
     && echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)" \
-    && echo "$OUT" | grep -q "mergepath-summary-ack: $HEAD_SHA"; then
-  pass "summary-only blocking finding → exit 1, listed + ack token printed"
+    && echo "$OUT" | grep -q "mergepath-summary-ack: $HEAD_SHA" \
+    && ! echo "$OUT" | grep -q "Resolve each inline thread"; then
+  # The negative conjunct is the CodeRabbit finding on #886: with no inline
+  # finding there is no thread to resolve, and printing an instruction the
+  # reader cannot act on is worse than printing nothing. Test 29 covers the
+  # other direction — with an inline finding present, it must still print.
+  pass "summary-only blocking finding → exit 1, listed + ack token, no inline instruction"
 else
-  fail "expected rc=1 with 'unresolved: 1' + summary path + ack token; got rc=$RC"
+  fail "expected rc=1 with 'unresolved: 1' + summary path + ack token + no inline instruction; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
