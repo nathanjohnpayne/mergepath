@@ -1,0 +1,552 @@
+name: Required Check Publisher
+
+# Single writer of the Checks-API slot for the three script-backed required
+# contexts (#845, Stage A). This file always executes from the DEFAULT
+# branch — workflow_run, schedule, and repository_dispatch all read the
+# default-branch definition — so a PR cannot edit the publisher that
+# evaluates it (the P1a closure). The natively-named gate jobs in the three
+# gate workflows are untouched and keep producing the truth on their own
+# lineage; this workflow writes only the synthetic (Checks-API) slot.
+#
+# SHADOW STAGE: the published names carry a "(shadow)" suffix and are not in
+# branch protection, so nothing here can affect a merge. PR 3 flips the
+# three env values to the live strings after the #845 canary passes; until
+# then the trigger shape, head binding, PR resolution and rc mapping are
+# rehearsed against production traffic at zero risk.
+
+on:
+  workflow_run:
+    # ONE parent, not three (cross-agent round 2 on #867): the Merge
+    # Clearance Gate trigger set is a measured strict superset of both
+    # siblings' (it adds labeled/unlabeled and repository_dispatch), so a
+    # single delivery per PR event carries every refresh signal and the
+    # per-event fan-in stays at one pass instead of three. Must match that
+    # workflow's top-level `name:` exactly; a rename there silently orphans
+    # this trigger (fence assertion, PR 2).
+    workflows: ["Merge Clearance Gate"]
+    # in_progress is the rerun cue: a rerun re-uses the run, so `requested`
+    # never re-fires, and without it no pending entry would cover the
+    # re-evaluation window (cross-agent P1 on #867). Ordinary runs emit
+    # both; the duplicate pending is idempotent and the same completed
+    # pass retires it.
+    types: [requested, in_progress, completed]
+  repository_dispatch:
+    # merge-clearance-recheck kept verbatim (#658 lane reaches this file
+    # unchanged); required-check-republish covers all three on a named PR.
+    types: [merge-clearance-recheck, required-check-republish]
+  # NO schedule of its own until PR 4 (cross-agent round 11): the Merge
+  # Clearance Gate's */15 cron already reaches this file through the
+  # workflow_run chain — a schedule-parent delivery whose head matches no
+  # open PR degrades to a full-coverage pass below — so an own cron would
+  # run a SECOND full pass every interval. PR 4 re-adds it in the same
+  # diff that deletes the gate workflows' schedules.
+  # NO workflow_dispatch: a manual dispatch executes the SELECTED ref's copy
+  # of this file, so a PR branch could be run with checks: write — the P1a
+  # hole this file exists to close (cross-agent P1 on #867). The operator
+  # break-glass is repository_dispatch required-check-republish, which is
+  # PAT-gated and always runs the default-branch definition.
+
+permissions:
+  contents: read
+
+env:
+  # The single flip point for PR 3: change these three values to the live
+  # context strings and nothing else.
+  MCG_CONTEXT: "Merge clearance gate (shadow)"
+  CODEX_P1_CONTEXT: "Codex P1 unresolved threads (shadow)"
+  CODERABBIT_CONTEXT: "CodeRabbit unresolved blocking findings (shadow)"
+
+jobs:
+  # Phase 1. NOT named for any required context, and OUTSIDE the publish
+  # job's concurrency group: a queued third event cancels a group's pending
+  # member and materialises that run's native check (#843, measured), so
+  # keeping this job groupless means a phase-1 retirement is never the
+  # member that gets cancelled — and its native check is named `open`,
+  # which nothing requires.
+  open:
+    name: open
+    # `requested` fires at parent-run creation, before its jobs execute, so
+    # pending entries land within seconds of the PR event; `in_progress`
+    # covers reruns. The workflows: list above already narrows the parent.
+    if: >-
+      github.event_name == 'workflow_run' &&
+      (github.event.action == 'requested' || github.event.action == 'in_progress')
+    runs-on: ubuntu-latest
+    # GROUPLESS, on purpose (cross-agent round 3 on #867, superseding the
+    # round-2 queue-join): the pending must become visible BEFORE a
+    # mid-flight stale pass can finish, so it cannot wait behind that pass.
+    # The stale-write hazard the queue-join addressed is closed on the
+    # writer's side instead — publish withholds any POST when a newer
+    # pending exists (see the freshness check below).
+    permissions:
+      contents: read
+      pull-requests: read
+      # actions: read for the parent-status lookup below — without it the
+      # guard 403s into its fail-open branch on restricted-default repos
+      # (cross-agent round 2; same requirement documented in
+      # auto-clear-blocking-labels.yml).
+      actions: read
+      checks: write
+    steps:
+      - name: Open pending entries on the event head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # NEVER github.sha: on a workflow_run run it is the DEFAULT
+          # branch's last commit, and binding to it would put every context
+          # on a commit branch protection never consults (#845 risks).
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          PARENT_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::error::workflow_run.head_sha is empty; cannot open pending entries."
+            exit 1
+          fi
+          # If the parent has ALREADY completed, its completed delivery owns
+          # the slot and a fresh pending here would have no future event to
+          # retire it — stuck until the sweep (cross-agent P1 on #867). On a
+          # failed read, open anyway: pending is the fail-closed direction.
+          if parent_status=$(gh api "repos/$REPO/actions/runs/$PARENT_RUN_ID" --jq .status); then
+            if [ "$parent_status" = "completed" ]; then
+              echo "Parent run $PARENT_RUN_ID already completed; the completed pass owns this head. Not opening."
+              exit 0
+            fi
+          else
+            echo "::warning::could not read parent run status; opening anyway (fail closed)."
+          fi
+          # Open only on open-PR heads: the parent also fires on schedule,
+          # where head_sha is main's tip. Resolution comes from the open-PR
+          # list — never workflow_run.pull_requests, empty for fork PRs. If
+          # the list READ fails, open anyway: pending is the fail-closed
+          # direction, and a spurious pending on a non-PR head is invisible
+          # to branch protection and retired by the next publish pass.
+          if heads=$(gh api --paginate -X GET "repos/$REPO/pulls" -f state=open \
+              -f per_page=100 --jq '.[].head.sha'); then
+            if ! grep -qxF "$HEAD_SHA" <<<"$heads"; then
+              echo "Head $HEAD_SHA is not an open PR head; nothing to open."
+              exit 0
+            fi
+          else
+            echo "::warning::open-PR list read failed; opening pending entries anyway (fail closed)."
+          fi
+          # Second status check IMMEDIATELY before the burst (round 7):
+          # the enumeration above took seconds, and a parent that completed
+          # during them means the completed pass owns this head — opening
+          # after that point is the strand-maker. Residual: a completion
+          # inside the sub-second burst itself, sweep-bounded below.
+          if parent_status=$(gh api "repos/$REPO/actions/runs/$PARENT_RUN_ID" --jq .status) \
+              && [ "$parent_status" = "completed" ]; then
+            echo "Parent run completed during enumeration; the completed pass owns this head. Not opening."
+            exit 0
+          fi
+          # Retried per context, loop continues past a failure so later
+          # contexts still open, red exit after (cross-agent round 7): a
+          # transiently failed pending write must not silently leave the
+          # previous green usable AND must not block the sibling contexts.
+          # No fail-closed write exists through a failing write path — the
+          # completed pass and the sweep recover; the red run is the alarm.
+          post_pending() {
+            local name="$1" attempt
+            for attempt in 1 2 3; do
+              if gh api -X POST "repos/$REPO/check-runs" \
+                -f name="$name" \
+                -f head_sha="$HEAD_SHA" \
+                -f status="in_progress" \
+                -f "output[title]=$name (re-evaluation in progress)" \
+                -f "output[summary]=Publisher phase 1: evaluation queued for $HEAD_SHA." \
+                >/dev/null; then
+                return 0
+              fi
+              sleep "$attempt"
+            done
+            return 1
+          }
+          open_failed=0
+          for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+            if ! post_pending "$name"; then
+              echo "::error::Failed to open pending $name on $HEAD_SHA after 3 attempts."
+              open_failed=1
+            fi
+          done
+          echo "Opened pending entries for all three contexts on $HEAD_SHA."
+          # Post-POST re-read (cross-agent round 5): if the parent flipped
+          # to completed inside this step's few-second window, the
+          # completed delivery's pass STARTS after these holds exist — the
+          # delivery post-dates parent completion, which post-dates the
+          # in_progress read above — so its freshness guard reads them as
+          # pre-pass phase-1 holds and its verdicts supersede them. A
+          # strand would need an entire pass (checkout plus three gate
+          # scripts) to fit inside this step's gap, which the duration
+          # floor excludes; the pathological remainder is retired by the
+          # sweep within one interval.
+          if parent_status=$(gh api "repos/$REPO/actions/runs/$PARENT_RUN_ID" --jq .status) \
+              && [ "$parent_status" = "completed" ]; then
+            echo "::warning::Parent completed during the POST burst. If its pass finished before these holds landed, they stay pending until the next publisher pass (sweep at worst); a pass that starts after them retires them via its freshness read."
+          fi
+          [ "$open_failed" -eq 0 ] || exit 1
+
+  # Phase 2. POSTs a fresh completed run per context rather than PATCHing
+  # phase 1's: the phases are separate workflow runs, and every Checks-API
+  # POST for one head coalesces into one shared suite where the newest run
+  # wins (measured, #845 facts F1) — no identifier crosses the run boundary.
+  publish:
+    name: publish
+    # Everything except workflow_run `requested`, which is phase 1's cue.
+    # Re-evaluates from scratch on every path; never reads
+    # workflow_run.conclusion (deliveries drop and conclusion can be null
+    # upstream — the verdict must not depend on how the parent finished).
+    if: github.event_name != 'workflow_run' || github.event.action == 'completed'
+    runs-on: ubuntu-latest
+    # ONE global queue for every publish pass, not a per-head group
+    # (cross-agent P1 on #867): a sweep or dispatch run outside the head's
+    # group could read state before a transition and POST after a newer
+    # evaluation, restoring a stale verdict. A single fixed group makes
+    # writes land in arrival order across event, sweep and dispatch paths.
+    # Safe on THIS file and not on the gate workflows — the measured
+    # difference (#843): when a third member queues, the cancelled PENDING
+    # member materialises a native check named `publish`, which nothing
+    # requires. Cancellation is COALESCING here, not loss: every pass
+    # evaluates every open PR, so whichever member survives subsumes the
+    # work of each cancelled one (cross-agent round 2).
+    concurrency:
+      group: rcp-publish
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      # actions: read for the server-issued pass-start stamp (round 6).
+      actions: read
+      checks: write
+    steps:
+      - name: Checkout repo (default branch — trusted scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve targets, evaluate gates, publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
+          # Validated as a positive integer below, so an arbitrary
+          # client_payload cannot inject shell (same posture as
+          # merge-clearance-gate.yml's dispatch-recheck job).
+          DISPATCH_PR: ${{ github.event.client_payload.pr }}
+        run: |
+          set -euo pipefail
+          # Stamp for the pre-POST freshness check below: an in_progress
+          # entry whose started_at postdates this pass's start belongs to
+          # a NEWER evaluation, and this pass must not write over its hold
+          # (cross-agent round 3 on #867). SERVER-issued, not runner-local
+          # date (round 6): both sides of the comparison must come from
+          # the same clock authority, or runner skew can hide a newer
+          # hold. run_started_at slightly precedes this step's own reads,
+          # which errs toward withholding — the fail-closed direction.
+          if ! PASS_START=$(gh api "repos/$REPO/actions/runs/$GITHUB_RUN_ID" \
+              --jq .run_started_at) || [ -z "$PASS_START" ]; then
+            echo "::error::Could not read this run's server-issued start time; aborting the pass (fail closed)."
+            exit 1
+          fi
+          # Head-to-PR mapping from the open-PR list ONLY — never
+          # workflow_run.pull_requests, empty for fork PRs (#845 risks).
+          # Exhaustive pagination, not a fixed cap: a capped list silently
+          # exempts every head beyond it from both phases (cross-agent
+          # round 3). One query carries number AND head so no per-PR
+          # resolve call can fail independently (#465).
+          if ! prs_raw=$(gh api --paginate -X GET "repos/$REPO/pulls" -f state=open \
+              -f per_page=100 \
+              --jq '.[] | "\(.number)\t\(.head.sha)"'); then
+            echo "::error::Failed to list open PRs on $REPO; leaving any pending entries standing (fail closed)."
+            exit 1
+          fi
+
+          requested_pr=""
+          if [ -n "$DISPATCH_PR" ]; then
+            requested_pr="$DISPATCH_PR"
+            case "$requested_pr" in
+              ''|*[!0-9]*|0*)
+                echo "::error::PR selector is not a positive integer: '$requested_pr'"
+                exit 1
+                ;;
+            esac
+          fi
+
+          # Every pass evaluates EVERY open PR (cross-agent round 2 on
+          # #867): the queue holds at most one pending member and cancels
+          # the rest, so a pass that covered only its own head would turn
+          # each cancellation into a lost re-evaluation — under sustained
+          # traffic a displaced head (or the displaced sweep) could stay
+          # pending indefinitely. With full coverage, whichever member
+          # survives subsumes the work of every cancelled one. The event
+          # head goes first so its verdict lands inside the latency budget;
+          # a dispatch narrows to its named PR (the fast manual remedy).
+          targets=""
+          dispatch_matched=""
+          if [ -n "$requested_pr" ]; then
+            # Full coverage here too (cross-agent round 3): a dispatch that
+            # evaluated only its named PR could cancel a queued full pass
+            # and strand the displaced head's pendings, contradicting the
+            # subsume-all property. Named PR first keeps the remedy fast.
+            # The selector must MATCH a row (round 9): a named PR that
+            # closed before enumeration must not fall through to an
+            # unrelated first row — degrade to a plain full pass instead.
+            dispatch_matched=$(awk -F'\t' -v n="$requested_pr" '$1 == n' <<<"$prs_raw" || true)
+            if [ -n "$dispatch_matched" ]; then
+              targets=$({ printf '%s\n' "$dispatch_matched"; \
+                          awk -F'\t' -v n="$requested_pr" '$1 != n' <<<"$prs_raw"; } || true)
+            else
+              echo "::warning::Dispatch named PR #$requested_pr, which is not an open PR; running a plain full pass."
+              targets="$prs_raw"
+            fi
+          elif [ -n "$RUN_HEAD" ]; then
+            targets=$({ awk -F'\t' -v h="$RUN_HEAD" '$2 == h' <<<"$prs_raw"; \
+                        awk -F'\t' -v h="$RUN_HEAD" '$2 != h' <<<"$prs_raw"; } || true)
+          else
+            targets="$prs_raw"
+          fi
+
+          if [ -n "$RUN_HEAD" ] && \
+              ! grep -qF "$RUN_HEAD" <<<"$prs_raw"; then
+              # The event head matches no open PR: the parent ran on main's
+              # tip (schedule, phase 1 opened nothing) or the PR's head
+              # moved on. Close — never abandon — anything phase 1 DID open
+              # on that head: a red pinned to a superseded head is invisible
+              # to branch protection; an abandoned in_progress reads as a
+              # hang. The pass still evaluates every open PR below.
+              for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+                # --paginate: page 1 alone can miss a pending run on a head
+                # with many same-name suites, and a truncated read here is a
+                # false all-clear (cross-agent P1 on #867). IDs land in a
+                # variable — no early-close pipe under pipefail.
+                pending_ids=$(gh api --paginate -X GET "repos/$REPO/commits/$RUN_HEAD/check-runs" \
+                  -f check_name="$name" -f filter=latest -f per_page=100 \
+                  --jq '.check_runs[] | select(.status != "completed") | .id')
+                if [ -n "$pending_ids" ]; then
+                  gh api -X POST "repos/$REPO/check-runs" \
+                    -f name="$name" \
+                    -f head_sha="$RUN_HEAD" \
+                    -f status="completed" \
+                    -f conclusion="failure" \
+                    -f "output[title]=$name — head superseded before evaluation" \
+                    -f "output[summary]=No open PR carries $RUN_HEAD; the pending entry is closed red on the bound head. The current head gets its own evaluation from its own events." \
+                    >/dev/null
+                fi
+              done
+              echo "Head $RUN_HEAD matches no open PR; closed any pending entries on it."
+          fi
+
+          if [ -z "$targets" ]; then
+            echo "No matching open PRs; nothing to publish."
+            exit 0
+          fi
+
+          had_infra_error=0
+          # A dispatch-narrowed pass opens pendings on the named head FIRST
+          # (cross-agent round 8): without them the previous green stays
+          # usable for the whole re-evaluation it was asked to refresh.
+          # Unretried — the completed verdicts follow from THIS run moments
+          # later, so a failed pending costs seconds of old-window, not a
+          # strand. The sweep stays pending-free by design: a background
+          # refresher that pended every open PR each interval would flap
+          # every checks display in the repo.
+          # One hold machinery for every path that must claim a head
+          # before evaluating it (rounds 8-10): retried like the open job,
+          # ids captured because this pass's OWN holds would otherwise trip
+          # its own freshness guard (run_started_at predates any POST this
+          # run makes — round 9), infra-flagged on final failure so the
+          # pass exits red as the alarm (round 10).
+          OWN_PENDING_IDS=""
+          open_holds() {
+            local hd="$1" name attempt oid ok
+            for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+              ok=0
+              for attempt in 1 2 3; do
+                if oid=$(gh api -X POST "repos/$REPO/check-runs" \
+                  -f name="$name" \
+                  -f head_sha="$hd" \
+                  -f status="in_progress" \
+                  -f "output[title]=$name (re-evaluation in progress)" \
+                  -f "output[summary]=Publisher hold: evaluation in progress for $hd." \
+                  --jq .id); then
+                  OWN_PENDING_IDS="$OWN_PENDING_IDS $oid"
+                  ok=1
+                  break
+                fi
+                sleep "$attempt"
+              done
+              if [ "$ok" -eq 0 ]; then
+                echo "::error::Failed to open hold $name on $hd after 3 attempts."
+                had_infra_error=1
+              fi
+            done
+          }
+          if [ -n "$dispatch_matched" ]; then
+            dispatch_head=$(awk -F'\t' 'NR==1{print $2}' <<<"$dispatch_matched")
+            [ -n "$dispatch_head" ] && open_holds "$dispatch_head"
+          fi
+          # The completed event path claims ITS head too (round 10): when
+          # the open job was delayed past parent completion, its guard
+          # skips without a replacement, and old greens would stay usable
+          # for the whole evaluation. A brief double-hold in the common
+          # case is harmless — the newest run counts, and this pass's
+          # completed verdicts supersede both.
+          if [ -n "$RUN_HEAD" ] && [ -n "$targets" ] \
+              && [ "$(awk -F'\t' 'NR==1{print $2}' <<<"$targets")" = "$RUN_HEAD" ]; then
+            open_holds "$RUN_HEAD"
+          fi
+          # Heads carried by MORE than one open PR fail closed (cross-agent
+          # round 3): the per-commit slot holds one verdict while the
+          # per-PR policy state (base, labels, reviews, threads) differs,
+          # so red-until-disambiguated is the only verdict that cannot be
+          # wrong for either PR. Detected once, posted once per head.
+          dup_heads=$(cut -f2 <<<"$prs_raw" | sort | uniq -d)
+          handled_dups=""
+          # gate <script> <context> <sentinel-or-empty>: evaluate one gate
+          # for one PR and POST the completed verdict on its head.
+          gate() {
+            local script="$1" context="$2" sentinel="$3" pr="$4" head="$5"
+            local output rc conclusion title
+            set +e
+            output=$("$script" "$pr" "$REPO" 2>&1)
+            rc=$?
+            set -e
+            printf '%s\n' "$output"
+            title="$context (publisher re-evaluation)"
+            case "$rc" in
+              0) conclusion="success" ;;
+              1) conclusion="failure" ;;
+              *)
+                # Config/usage/infra exits publish a RED, not a skip:
+                # skipping would leave the PREVIOUS verdict standing on the
+                # refresh path this publisher owns (#429 sweep posture).
+                echo "::error::$script rc=$rc on PR #$pr (config/usage/infra error)"
+                had_infra_error=1
+                conclusion="failure"
+                title="$context — infra/config error (rc=$rc)"
+                ;;
+            esac
+            if [ "$rc" -eq 0 ] && [ -n "$sentinel" ] && \
+                ! grep -qF "$sentinel" <<<"$output"; then
+              # rc 0 without the script's own PASS line means the success
+              # did not come from the verdict path (a stubbed or truncated
+              # script); publish red and flag it.
+              echo "::error::$script exited 0 without '$sentinel' on PR #$pr"
+              had_infra_error=1
+              conclusion="failure"
+              title="$context — rc 0 without verdict sentinel"
+            fi
+            # Bash slice, not head -c: pipefail-safe under large outputs,
+            # correct for the 65535-char API limit (b10671e wave).
+            local summary="${output:0:60000}"
+            # Freshness check (cross-agent round 3 on #867): a pending
+            # entry started AT or AFTER this pass began means a newer
+            # evaluation owns this slot — withhold the now-stale verdict
+            # and leave the hold for the newer pass to retire. >= so a
+            # same-second tie withholds (round 5): a genuinely newer hold
+            # in the boundary second must win, and the tie cannot be this
+            # pass's own phase-1 hold, which predates the pass by the
+            # parent's own runtime. started_at is assigned by the server,
+            # not by any actor this check would need to trust.
+            # The residual window is the gap between this read and the POST
+            # below — the floor without conditional writes.
+            # A FAILED lookup withholds too (cross-agent round 4): unknown
+            # freshness is possibly-stale, and defaulting to "no newer
+            # pending" would let this pass overwrite a hold it never saw.
+            local newer
+            if ! newer=$(gh api --paginate -X GET "repos/$REPO/commits/$head/check-runs" \
+              -f check_name="$context" -f filter=latest -f per_page=100 \
+              --jq ".check_runs[] | select(.status != \"completed\") | select(.started_at >= \"$PASS_START\") | .id"); then
+              echo "::error::Freshness lookup failed for $context on $head; withholding this verdict (fail closed)."
+              had_infra_error=1
+              return 0
+            fi
+            # Subtract this pass's own dispatch-opened pendings (round 9):
+            # identity distinguishes self from newer where a timestamp
+            # cannot.
+            if [ -n "$newer" ] && [ -n "$OWN_PENDING_IDS" ]; then
+              local filtered="" nid
+              while read -r nid; do
+                [ -z "$nid" ] && continue
+                case " $OWN_PENDING_IDS " in
+                  *" $nid "*) ;;
+                  *) filtered="$filtered$nid "
+                esac
+              done <<<"$newer"
+              newer="${filtered% }"
+            fi
+            if [ -n "$newer" ]; then
+              echo "Newer pending for $context on $head (started after $PASS_START); withholding this verdict."
+              return 0
+            fi
+            # Current-head revalidation (cross-agent round 5): the gate
+            # scripts evaluate LIVE PR state, so a force-push between
+            # enumeration and here would attach a fresh-state verdict to
+            # the captured SHA — reusable if the branch ever returns to
+            # it. On drift, red pinned to the bound head (the event
+            # publisher's posture); the push's own synchronize event owns
+            # the new head. A failed read is unknown drift: fail closed.
+            local live_head
+            if ! live_head=$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha); then
+              echo "::error::Could not revalidate PR #$pr head before posting $context; withholding (fail closed)."
+              had_infra_error=1
+              return 0
+            fi
+            if [ "$live_head" != "$head" ]; then
+              conclusion="failure"
+              title="$context — head moved during evaluation"
+              summary="PR #$pr moved from $head to $live_head while this pass evaluated; this verdict is pinned red to the superseded head. The new head gets its own evaluation from its own events."
+            fi
+            if ! gh api -X POST "repos/$REPO/check-runs" \
+              -f name="$context" \
+              -f head_sha="$head" \
+              -f status="completed" \
+              -f conclusion="$conclusion" \
+              -f "output[title]=$title" \
+              -f "output[summary]=$summary" \
+              >/dev/null; then
+              echo "::error::Failed to post $context for PR #$pr — its slot was not refreshed."
+              had_infra_error=1
+            fi
+          }
+
+          while IFS=$'\t' read -r PR head_sha; do
+            [ -z "$PR" ] && continue
+            if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
+              echo "::error::No head SHA for PR #$PR from the open-PR list; cannot refresh its contexts."
+              had_infra_error=1
+              continue
+            fi
+            if grep -qxF "$head_sha" <<<"$dup_heads"; then
+              if ! grep -qF "$head_sha" <<<"$handled_dups"; then
+                handled_dups="$handled_dups $head_sha"
+                echo "::error::Head $head_sha is carried by more than one open PR; publishing red on all three contexts."
+                had_infra_error=1
+                for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+                  gh api -X POST "repos/$REPO/check-runs" \
+                    -f name="$name" \
+                    -f head_sha="$head_sha" \
+                    -f status="completed" \
+                    -f conclusion="failure" \
+                    -f "output[title]=$name — ambiguous head" \
+                    -f "output[summary]=More than one open PR carries $head_sha; one commit slot cannot honestly carry both PRs verdicts. Close or rebase one of them." \
+                    >/dev/null || echo "::error::Failed to post ambiguity red for $name on $head_sha."
+                done
+              fi
+              continue
+            fi
+            echo "::group::Publish PR #$PR @ $head_sha"
+            gate scripts/merge-clearance-gate.sh   "$MCG_CONTEXT"        "Merge clearance: PASS" "$PR" "$head_sha"
+            gate scripts/codex-p1-gate.sh          "$CODEX_P1_CONTEXT"   ""                      "$PR" "$head_sha"
+            gate scripts/coderabbit-severity-gate.sh "$CODERABBIT_CONTEXT" ""                    "$PR" "$head_sha"
+            echo "::endgroup::"
+          done <<<"$targets"
+
+          if [ "$had_infra_error" -ne 0 ]; then
+            echo "::error::Publisher finished with one or more infra errors"
+            exit 1
+          fi

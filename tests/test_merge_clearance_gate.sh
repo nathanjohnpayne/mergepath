@@ -1206,7 +1206,7 @@ WF_OK="$WORKDIR/wf-ok.yml"
 WF
 } > "$WF_OK"
 set +e
-OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$WF_OK" "$CHECK_BIN" 2>&1)
+OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MCG_PREFLIGHT_ONLY=1 MERGE_CLEARANCE_WORKFLOW="$WF_OK" "$CHECK_BIN" 2>&1)
 RC=$?
 set -e
 if ! echo "$OUT" | grep -q "must define a JOB named" \
@@ -1307,7 +1307,7 @@ WF_RD_OK="$WORKDIR/wf-rd-ok.yml"
   write_wf_gate_job
 } > "$WF_RD_OK"
 set +e
-OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$WF_RD_OK" "$CHECK_BIN" 2>&1)
+OUT=$(MCG_SKIP_FIX3_SELFTEST=1 MCG_PREFLIGHT_ONLY=1 MERGE_CLEARANCE_WORKFLOW="$WF_RD_OK" "$CHECK_BIN" 2>&1)
 RC=$?
 set -e
 # Assert the check RAN to completion AND its pre-flight PASSED. A pre-flight
@@ -1551,7 +1551,7 @@ echo; echo "--- Test 22 (#845): two-phase publish assertions reject each broken 
 mcg22_run() {  # <fixture-path> -> echoes rc
   local out rc
   set +e
-  out=$(MCG_SKIP_FIX3_SELFTEST=1 MERGE_CLEARANCE_WORKFLOW="$1" "$CHECK_BIN" 2>&1)
+  out=$(MCG_SKIP_FIX3_SELFTEST=1 MCG_PREFLIGHT_ONLY=1 MERGE_CLEARANCE_WORKFLOW="$1" "$CHECK_BIN" 2>&1)
   rc=$?
   set -e
   printf '%s' "$out" > "$1.out"
@@ -1569,26 +1569,26 @@ mcg22_case() {  # <name> <perl-program-or-empty> <expect: fail|pass> [expected-F
   if [ -n "$prog" ]; then perl -0777 -pe "$prog" "$f.raw" > "$f"; else cp "$f.raw" "$f"; fi
   # A no-op substitution means the case is testing nothing.
   if [ -n "$prog" ] && cmp -s "$f.raw" "$f"; then
-    fail "#845 case $name: the mutation changed nothing — anchor drifted"
+    fail "${MCG_TAG:-#845} case $name: the mutation changed nothing — anchor drifted"
     return
   fi
   rc=$(mcg22_run "$f")
   if [ "$expect" = pass ]; then
     if [ "$rc" -eq 0 ]; then
-      pass "#845 case $name: positive control — a compliant job is accepted"
+      pass "${MCG_TAG:-#845} case $name: positive control — a compliant job is accepted"
     else
-      fail "#845 case $name: expected pass, got rc=$rc"
+      fail "${MCG_TAG:-#845} case $name: expected pass, got rc=$rc"
       sed 's/^/      /' "$f.out" | head -4 >&2
     fi
     return
   fi
   if [ "$rc" -eq 0 ]; then
-    fail "#845 case $name: expected the check to reject this shape, got rc=0"
+    fail "${MCG_TAG:-#845} case $name: expected the check to reject this shape, got rc=0"
   elif [ -n "$want" ] && ! grep -qF -- "$want" "$f.out"; then
-    fail "#845 case $name: rejected, but not for its own reason (wanted: $want)"
+    fail "${MCG_TAG:-#845} case $name: rejected, but not for its own reason (wanted: $want)"
     grep '^FAIL' "$f.out" | sed 's/^/      /' | head -3 >&2
   else
-    pass "#845 case $name: the check rejects it, naming the right cause"
+    pass "${MCG_TAG:-#845} case $name: the check rejects it, naming the right cause"
   fi
 }
 
@@ -1629,6 +1629,215 @@ mcg22_case L 's{(  scheduled-sweep:.*?)gh api -X POST "repos/\$REPO/check-runs"}
 mcg22_case M 's{(.*)-f name="\$CHECK_NAME"}{$1-f name="Some Other Check"}s' fail 'must POST a check_run under CHECK_NAME'
 # I — positive control.
 mcg22_case I '' pass
+
+# ---------------------------------------------------------------------------
+# Test 24 (#850): the STRUCTURAL layer — assertions over the PARSED document.
+#
+# Position and eligibility have no text reformulation available: they are
+# statements about which step comes FIRST and whether a job's if: can ever be
+# true. Every case below breaks exactly ONE of them in a fixture derived from
+# the canonical workflow (never hand-written — a hand-maintained control drifted
+# behind the check on five consecutive rounds in #849, and a control weaker than
+# its subject is a false pass in the direction that hides regressions) and
+# asserts the check names THAT property rather than merely going red.
+#
+# Reuses the Test 22 harness verbatim, retagged: its no-op guard (a mutation
+# that changed nothing means the anchor drifted) matters more here, because
+# these anchors are step names and indents in a file that keeps being edited.
+#
+# Gated on PyYAML: the check soft-skips the structural layer without it (the
+# scripts/ci/check_workflow_parsers posture), so there is nothing to test.
+# ---------------------------------------------------------------------------
+if python3 -c "import yaml" >/dev/null 2>&1; then
+echo; echo "--- Test 24 (#850): structural assertions over the parsed workflow"
+MCG_TAG='#850'
+
+# a — phase 1 demoted below the checkout. Every string assertion still passes:
+#     the POST and status=in_progress are present, just no longer first, so a
+#     checkout failure now happens before anything retires the stale verdict.
+mcg22_case a 's{(      - name: Open the required check_run.*?)(      - name: Checkout repo.*?)(      - name: Resolve PR number)}{$2$1$3}s' \
+  fail '[#850 phase-1 position]'
+# b — phase 1 made conditional. success() is TRUTHY on purpose: the property is
+#     that phase 1 carries no step-level if: AT ALL, not that its if is falsy.
+mcg22_case b 's{(      - name: Open the required check_run[^\n]*\n)}{$1        if: success()\n}' \
+  fail '[#850 phase-1 unconditional]'
+# c — the sweep can never run. Trigger, CHECK_NAME, POST, permissions all
+#     intact; only the parse sees that the job is unreachable.
+mcg22_case c 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: false}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# d — #849 hole 1: phase 2 loses its own HEAD_SHA. A job-scoped grep for the
+#     binding is satisfied by phase 1's.
+mcg22_case d 's{(      - name: Close the required check_run.*?)^          HEAD_SHA: [^\n]*\n}{$1}sm' \
+  fail '[#850 phase-2 head binding]'
+# e — #849 hole 2: a gh-invoking step loses its token, so gh falls back to
+#     unauthenticated and the sweep cannot list PRs at all.
+mcg22_case e 's{(      - name: Find open PRs.*?)^          GH_TOKEN: [^\n]*\n}{$1}sm' \
+  fail "[#850 gh token binding] step 'Find open PRs' in job 'scheduled-sweep'"
+# f — truncated mid-document, leaving an unterminated quoted scalar. Must fail
+#     LOUDLY naming the parse error; a parser that silently matches nothing
+#     turns every assertion above into a no-op.
+mcg22_case f 's{(    - cron: "\*/15).*}{$1}s' fail 'does not parse as YAML'
+# h — a DUPLICATE job key. yaml.safe_load would keep the last while the text
+#     layer reads the first, so the two layers would inspect different
+#     definitions; the strict loader makes it a parse error, exactly as
+#     Actions' own workflow parser treats it.
+mcg22_case h 's{\z}{  merge-clearance-gate: ["not-a-mapping"]\n}' \
+  fail 'duplicate mapping key'
+# h2 — the event job parses to a NON-mapping (its body re-homed under another
+#      key, no duplicate). Must fail with the named not-a-mapping cause, never
+#      an unhandled traceback (which prints no FAIL line at all because
+#      failures are buffered until the end).
+mcg22_case h2 's{^  merge-clearance-gate:\n}{  merge-clearance-gate: ["not-a-mapping"]\n  relocated-original:\n}m' \
+  fail "[#850 producer eligibility] job 'merge-clearance-gate'"
+# a2 — a preliminary first step whose run body merely MENTIONS the phase-1
+#      strings. Substrings alone accept it (the real publisher still satisfies
+#      the text layer later in the job); only the step-identity conjunct sees
+#      that the first step is not the publisher.
+mcg22_case a2 's{(    steps:\n)(      - name: Open the required check_run)}{$1      - name: Preliminary\n        run: echo check-runs in_progress\n$2}' \
+  fail '[#850 phase-1 position]'
+# c2 — the same unreachable sweep spelled as an expression-wrapped literal,
+#      which GitHub evaluates exactly like the bare one.
+mcg22_case c2 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ 0 \}\}}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# c3 — a bare null condition. PyYAML yields None, whose str() is outside the
+#      literal tuple; the explicit None arm must fail it closed rather than
+#      pass a condition nobody can prove eligible.
+mcg22_case c3 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: null}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# c4 — numeric-zero spellings inside the expression wrapper. GitHub evaluates
+#      -0 falsy; numeric normalisation must catch every zero spelling, not an
+#      enumerated literal list.
+mcg22_case c4 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ -0 \}\}}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# i — a complex (sequence) mapping key. Unhashable in Python; must surface as
+#     a NAMED parse error, not an incidental TypeError, and Actions rejects
+#     complex keys in workflows anyway.
+mcg22_case i 's{^  scheduled-sweep:$}{  ? [scheduled-sweep]\n  :}m' \
+  fail 'does not parse as YAML'
+# c5 — a BARE numeric-zero condition, no expression wrapper. YAML hands the
+#      float over directly; the normalisation must not live only inside the
+#      wrapped branch.
+mcg22_case c5 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: 0.0}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# j — a steps entry that parses to a bare string. .get on it would raise; the
+#     first-step property must fail with its own named cause instead.
+mcg22_case j 's{(    steps:\n)(      - name: Open the required check_run)}{$1      - just-a-string\n$2}' \
+  fail '[#850 phase-1 position]'
+# c7 — the EMPTY quoted literal is the one falsy quoted form.
+mcg22_case c7 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ \x27\x27 \}\}}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# c8 — hexadecimal zero: GitHub's expression numerics accept 0x0 and it
+#      evaluates falsy; float() alone never sees it.
+mcg22_case c8 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: \$\{\{ 0x0 \}\}}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# k — a falsy if: on a producer STEP: the job-level condition stays truthy and
+#     every string survives, but the publishing path is dead.
+mcg22_case k 's{(      - name: Re-evaluate gate per PR and post check_run\n)(        if: )steps.find.outputs.prs[^\n]*}{$1$2\x27\x27}sm' \
+  fail "[#850 producer eligibility] step"
+# n — POSITIVE control for YAML key semantics: job ids `on` and `true` are
+#     distinct strings to Actions, but PyYAML 1.1 resolution coerces BOTH
+#     unquoted keys to the boolean True. A duplicate detector comparing
+#     constructed values would report a collision here and reject a workflow
+#     Actions accepts; raw-scalar-text comparison must pass it (cross-agent
+#     P2, round 4: a quoted "true" constructed the string and proved nothing).
+mcg22_case n 's{\z}{  on:\n    name: on-shaped job id\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  true:\n    name: true-shaped job id\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n}' pass
+# o — the close step's condition extended with a falsy conjunct: both required
+#     substrings survive, the step never runs, phase 1's pending entry is
+#     never closed.
+mcg22_case o 's{(        if: )\$\{\{ !cancelled\(\) && steps.open.outputs.id != \x27\x27 \}\}}{$1\$\{\{ !cancelled\(\) && steps.open.outputs.id != \x27\x27 && false \}\}}' \
+  fail "[#850 producer eligibility] step"
+# p — the sweep's publish step on a NON-literal condition false on schedule.
+mcg22_case p 's{(      - name: Re-evaluate gate per PR and post check_run\n)(        if: )steps.find.outputs.prs[^\n]*}{$1$2github.event_name == \x27push\x27}sm' \
+  fail "[#850 producer eligibility] step"
+# m — an always-false NON-literal condition: never true on the sweep's only
+#     trigger, invisible to any falsy test, caught only by the exact
+#     per-producer condition allowlist.
+mcg22_case m 's{(  scheduled-sweep:.*?)^    if: [^\n]*$}{$1    if: github.event_name == \x27push\x27}sm' \
+  fail "[#850 producer eligibility] job 'scheduled-sweep'"
+# l — a path-qualified gh invocation must still demand its token binding.
+mcg22_case l 's{(      - name: Open the required check_run.*?\n        run: \|\n)}{$1          /usr/bin/gh api /rate_limit >/dev/null\n}s && s{^          GH_TOKEN: [^\n]*\n(          REPO: \$\{\{ github.repository \}\}\n          # Bind to the PR HEAD)}{$1}m' \
+  fail "[#850 gh token binding]"
+# q — a first step with the canonical NAME and env whose body merely echoes
+#     the strings: the exact POST command set is what distinguishes a
+#     publisher from a decoy that satisfies name, env and substrings.
+mcg22_case q 's{(id: open\n(?:(?!gh api -X POST).)*?)gh api -X POST "repos/\$REPO/check-runs"}{$1echo posted-nothing}s' \
+  fail '[#850 phase-1 position]'
+# r — the close step wearing the SWEEP's guard: valid in the allowlist
+#     globally, falsy in a job with no find step — pins are per (job, step).
+mcg22_case r 's{(        if: )\$\{\{ !cancelled\(\) && steps.open.outputs.id != \x27\x27 \}\}}{$1steps.find.outputs.prs != \x27\x27}' \
+  fail "[#850 producer eligibility] step"
+# s — a DECOY sharing the exact close-step name ahead of the real one: two
+#     steps may legally share a name, so first-match selection is forgeable.
+mcg22_case s 's{(      - name: Close the required check_run \(#841 phase 2\)\n)}{      - name: Close the required check_run (#841 phase 2)\n        env:\n          HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}\n        run: echo decoy\n$1}s' \
+  fail '[#850 phase-2 head binding]'
+# t — a needs: dependency on a producer job: GitHub skips the producer when
+#     the dependency fails or is skipped, BEFORE its own condition is even
+#     evaluated — trigger, condition pins and every string stay intact while
+#     that path stops refreshing the required context (cross-agent P1, r4).
+mcg22_case t 's{^(  merge-clearance-gate:\n)}{$1    needs: preflight\n}m' \
+  fail "declares needs"
+# u — continue-on-error on the phase-1 publisher: its failed POST is
+#     tolerated, the job runs on with no pending entry, phase 2 skips on its
+#     empty open id, and the previous synthetic verdict is never retired
+#     (cross-agent P1, round 4).
+mcg22_case u 's{^(      - name: Open the required check_run \(#841 phase 1\)\n)}{$1        continue-on-error: true\n}m' \
+  fail "continue-on-error"
+# u2 — an EXPRESSION continue-on-error is not provably disabled either.
+mcg22_case u2 's{^(      - name: Open the required check_run \(#841 phase 1\)\n)}{$1        continue-on-error: \$\{\{ always() \}\}\n}m' \
+  fail "continue-on-error"
+# v — the phase-1 POST drops head_sha: GitHub rejects a check-run create
+#     without it, so nothing pending opens; the command must carry head_sha
+#     on the SAME step the position assertion pins (App P2 on #852).
+mcg22_case v 's{(id: open\n.*?)[ ]*-f head_sha="\$HEAD_SHA" \\\n}{$1}s' \
+  fail "[#850 phase-1 position]"
+# w — the close step's CHECK_ID rebound to another output: set -u no longer
+#     saves it (the value exists) and the PATCH hits a different run id,
+#     leaving the entry phase 1 opened PENDING (App P2 on #852).
+mcg22_case w 's{^(          CHECK_ID: )\$\{\{ steps.open.outputs.id \}\}$}{$1\$\{\{ steps.gate.outputs.rc \}\}}m' \
+  fail "binds CHECK_ID"
+# x — a concurrency group on the event producer: a queued second member
+#     cancels the pending one and the cancelled NATIVE run of this required
+#     lineage blocks the PR permanently (measured on #843; App P2 on #852).
+mcg22_case x 's{^(  merge-clearance-gate:\n)}{$1    concurrency:\n      group: mcg-gate\n      cancel-in-progress: false\n}m' \
+  fail "concurrency"
+# y — a producer's pinned condition DELETED outright: validating the
+#     allowlist only when the key is supplied lets the strongest mutation —
+#     removing the condition — pass untested, and dispatch-recheck then runs
+#     red on every pull_request event (App P2 on #852).
+mcg22_case y 's{^    if: github.event_name == \x27repository_dispatch\x27\n}{}m' \
+  fail "has no job-level if"
+# x2/x3 — concurrency on the NON-event producers: not the permanent native
+#     block of case x, but a cancelled member silently drops a refresh that
+#     nothing re-fires until the next scheduled pass (CodeRabbit on #852).
+mcg22_case x2 's{^(  scheduled-sweep:\n)}{$1    concurrency:\n      group: mcg-sweep\n      cancel-in-progress: false\n}m' \
+  fail "declares a concurrency"
+mcg22_case x3 's{^(  dispatch-recheck:\n)}{$1    concurrency:\n      group: mcg-dispatch\n      cancel-in-progress: false\n}m' \
+  fail "declares a concurrency"
+# z — continue-on-error on a LATER producer step, in YAML 1.1 alias form:
+#     a tolerated find failure yields no PR list and the sweep publish step
+#     skips green; and `no` constructs to False under PyYAML, so any
+#     value-reading acceptance would wave it through (two App P2s on #852).
+mcg22_case z 's{^(      - name: Find open PRs\n)}{$1        continue-on-error: no\n}m' \
+  fail "continue-on-error"
+unset MCG_TAG
+
+# g — positive control on the REAL file. Case I uses a synthesized header; this
+#     asserts the canonical workflow passes the whole check unmodified.
+set +e
+OUT=$(MCG_SKIP_FIX3_SELFTEST=1 \
+  MERGE_CLEARANCE_WORKFLOW="$ROOT/.github/workflows/merge-clearance-gate.yml" \
+  "$CHECK_BIN" 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 0 ]; then
+  pass "#850 case g: the unmodified canonical workflow passes the whole check"
+else
+  fail "#850 case g: the canonical workflow must pass the check; got rc=$RC"
+  grep '^FAIL' <<<"$OUT" | sed 's/^/      /' | head -4 >&2
+fi
+else
+  echo; echo "SKIP: Test 24 (#850) — PyYAML unavailable (the check soft-skips it too)"
+fi
 
 fi  # end re-entrancy guard (MCG_SKIP_FIX3_SELFTEST)
 
