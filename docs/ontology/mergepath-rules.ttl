@@ -336,12 +336,32 @@ mp:hubOnlyClass rdf:type mp:OwnershipClass .
 # value is still classified — and therefore still subject to AX12/AX13/AX13b.
 # A missing declaration stays a closed-world check (functional means at most
 # one value, not exactly one).
-mp:CanonicalDoc owl:equivalentClass
-    [ rdf:type owl:Restriction ; owl:onProperty mp:hasOwnershipClass ; owl:hasValue mp:canonicalClass ] .
-mp:PerRepoOwnedDoc owl:equivalentClass
-    [ rdf:type owl:Restriction ; owl:onProperty mp:hasOwnershipClass ; owl:hasValue mp:perRepoOwnedClass ] .
-mp:HubOnlyDoc owl:equivalentClass
-    [ rdf:type owl:Restriction ; owl:onProperty mp:hasOwnershipClass ; owl:hasValue mp:hubOnlyClass ] .
+mp:CanonicalDoc owl:equivalentClass _:ownershipValueCanonical .
+_:ownershipValueCanonical rdf:type owl:Restriction ;
+    owl:onProperty mp:hasOwnershipClass ; owl:hasValue mp:canonicalClass .
+[] rdf:type owl:Axiom ;
+   owl:annotatedSource mp:CanonicalDoc ;
+   owl:annotatedProperty owl:equivalentClass ;
+   owl:annotatedTarget _:ownershipValueCanonical ;
+   mp:encodesRule "G-65 (ownership value-to-class bridge)" .
+
+mp:PerRepoOwnedDoc owl:equivalentClass _:ownershipValuePerRepo .
+_:ownershipValuePerRepo rdf:type owl:Restriction ;
+    owl:onProperty mp:hasOwnershipClass ; owl:hasValue mp:perRepoOwnedClass .
+[] rdf:type owl:Axiom ;
+   owl:annotatedSource mp:PerRepoOwnedDoc ;
+   owl:annotatedProperty owl:equivalentClass ;
+   owl:annotatedTarget _:ownershipValuePerRepo ;
+   mp:encodesRule "G-65, G-67 (ownership value-to-class bridge feeding AX13)" .
+
+mp:HubOnlyDoc owl:equivalentClass _:ownershipValueHubOnly .
+_:ownershipValueHubOnly rdf:type owl:Restriction ;
+    owl:onProperty mp:hasOwnershipClass ; owl:hasValue mp:hubOnlyClass .
+[] rdf:type owl:Axiom ;
+   owl:annotatedSource mp:HubOnlyDoc ;
+   owl:annotatedProperty owl:equivalentClass ;
+   owl:annotatedTarget _:ownershipValueHubOnly ;
+   mp:encodesRule "G-65, G-68, G-77 (ownership value-to-class bridge feeding AX12/AX13b)" .
 
 # AX11 — a doc declares exactly one ownership class value: the property is
 # functional and the three class values are mutually distinct, so two

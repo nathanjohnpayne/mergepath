@@ -24,7 +24,12 @@ jobs:
   owl-rules-check:
     runs-on: ubuntu-latest
     steps:
+      # persist-credentials off: nothing after checkout needs the token, and
+      # the pip-install step runs third-party package code that must not share
+      # a workspace with a credentialed .git/config.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - name: Install rdflib and owlrl (pinned)
         run: |
