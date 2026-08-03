@@ -1070,9 +1070,43 @@ parse_rate_limit_window() {
 # detection (the #714/#489 paths) is untouched; and "Full review triggered."
 # — the pre-completion wording of the same block — states no completion and
 # still defers to an appended notice.
+#
+# Matched as a STANZA, not as two body-wide phrase greps (#875 round 7, Codex
+# P1). Two independent greps ask "does this body mention both phrases
+# anywhere", which any body DISCUSSING the mechanism satisfies — a CodeRabbit
+# walkthrough of a diff that contains `grep -qiE 'actions performed'` and the
+# prose "the actions-performed block states the review finished" is the live
+# example, and this very file is that diff. Labelling a genuine summary an
+# attestation is not a harmless misread: the probe's publication scan SKIPS
+# attestations by content class, so the real summary is stepped over, and a
+# correlated per-SHA success then opens the Phase 4b barrier without the
+# summary-only blocker (#535) ever being inspected.
+#
+# The generated stanza has a shape those incidental mentions do not: a
+# standalone heading line whose entire content is the words "Actions
+# performed" plus non-alphanumeric decoration (`✅`, `**`, `##`), with the
+# completion statement inside the SAME stanza — before the next wrapper
+# comment, blockquote, heading, rule, or fence. Requiring the heading to own
+# its line is what rejects a quoted `'actions performed'` inside code or a
+# hyphenated mention inside prose; requiring containment is what keeps a
+# "review finished" sentence far below the stanza from counting.
 comment_states_review_finished() {
-  printf '%s' "$1" | grep -qiE 'actions performed' \
-    && printf '%s' "$1" | grep -qiE 'review finished'
+  printf '%s\n' "$1" | awk '
+    BEGIN { in_stanza = 0; found = 0 }
+    {
+      line = tolower($0)
+      if (in_stanza == 0) {
+        if (line ~ /^[^a-z0-9]*actions performed[^a-z0-9]*$/) { in_stanza = 1 }
+        next
+      }
+      if ($0 ~ /^[[:space:]]*(<!--|>|#|```|---[[:space:]]*$|___[[:space:]]*$)/) {
+        in_stanza = 0
+        next
+      }
+      if (line ~ /review finished/) { found = 1; exit }
+    }
+    END { exit (found ? 0 : 1) }
+  '
 }
 
 # Strict at-or-after for the corroboration ordering below (#875 round 2):
@@ -1625,21 +1659,50 @@ summary_body_has_potential_issue_marker() {
 # mode's ordinary freshness floor. Every lookup failure fails closed to
 # empty (no verdict material; the caller keeps polling or stays on the
 # advisory timeout), never to a stale selection.
+#
+# Round 7 (Codex P1): marker identity and the ordering floor establish WHICH
+# comment, never that it is a VERDICT. CodeRabbit keeps one summarize comment
+# per PR and edits it in place, so the same marker rides the mid-review body
+# (IN_PROGRESS_MARKER), a paused or rate-limited state appended to it, and a
+# refusal stanza — each of which is a summary comment refreshed after the head
+# review object while carrying no findings BECAUSE the review has not finished.
+# Selecting one of those as the verdict body clears rc 0 ahead of the real
+# summary, which is the failure this helper exists to prevent, merely reached
+# by a different door. So each candidate is classified the way the probe's
+# publication scan classifies its rows — only `review` is verdict material —
+# and a finished attestation is excluded for the round-5 shadowing reason even
+# though it, too, classifies `review`.
 polling_head_summary_body() {
-  local object_at floor issue_comments
+  local object_at floor issue_comments rows row body fresh class
   object_at=$(newest_head_pinned_review_submitted_at) || return 1
   floor=${object_at:-$HEAD_ANCHOR}
   issue_comments=$(fetch_api_array_best_effort "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (head summary selection)") || return 1
-  printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg floor "$floor" --arg m "$SUMMARY_MARKER" '
+  rows=$(printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg floor "$floor" --arg m "$SUMMARY_MARKER" '
     [ .[]
       | select(.user.login == $bot)
       | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
       | select(.fresh_at >= $floor)
       | select((.body // "") | startswith($m)) ]
     | sort_by(.fresh_at)
-    | last
-    | (.body // "")
-  ' 2>/dev/null || return 1
+    | reverse
+    | .[]
+    | @base64
+  ' 2>/dev/null) || return 1
+  while IFS= read -r row; do
+    [ -z "$row" ] && continue
+    body=$(printf '%s' "$row" | base64 --decode | jq -r '.body // ""') || continue
+    fresh=$(printf '%s' "$row" | base64 --decode | jq -r '.fresh_at // empty') || continue
+    class=$(classify_comment "$body" "$fresh")
+    [ "$class" = "review" ] || continue
+    if comment_states_review_finished "$body"; then
+      continue
+    fi
+    printf '%s' "$body"
+    return 0
+  done <<EOF
+$rows
+EOF
+  return 0
 }
 
 # SHA-scoped variant of count_potential_issues, used by the StatusContext
@@ -1839,6 +1902,29 @@ status_context_fast_path_blocked_by_comment() {
         return 0
       fi
       log "StatusContext success remains authoritative because latest CodeRabbit comment id=$comment_id class=$class does not reference current HEAD $HEAD_SHA and was created=$comment_created_at before status_created=$status_created_at"
+      return 1
+      ;;
+    review)
+      # #875 round 7 (Codex P1): the StatusContext fast path is a THIRD route
+      # to rc 0, and #869 opened it. A corroborated finished attestation now
+      # classifies `review`, so it stopped suppressing this path — and
+      # emit_status_context_verdict scans INLINE findings only, never the
+      # PR-level summary. On a repo with trust_status_context_for_clearance
+      # enabled (mergepath's own setting) an attestation plus a per-SHA
+      # success would therefore clear before the summary that can carry the
+      # only blocking marker (#535) publishes, which is exactly what the poll
+      # arm and the probe-wait boundary were taught to wait for in round 6.
+      # Same rule here: an attestation with no genuine head-anchored summary
+      # BLOCKS the fast path and the loop keeps polling on its ordinary
+      # budget. A summary that HAS published leaves the pre-#869 behaviour
+      # untouched.
+      comment_body=$(echo "$latest" | jq -r '.body')
+      if comment_states_review_finished "$comment_body"; then
+        if [ -z "$(polling_head_summary_body || true)" ]; then
+          log "StatusContext success suppressed: the newest CodeRabbit comment is a corroborated finished attestation and no genuine head-anchored summary has published — this fast path scans inline findings only, so clearing here could miss a summary-only blocker (#535); keep polling"
+          return 0
+        fi
+      fi
       return 1
       ;;
   esac

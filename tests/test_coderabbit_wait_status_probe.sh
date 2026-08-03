@@ -271,6 +271,11 @@ case "$endpoint" in
         # BEFORE it — a PRIOR head summary inside the wallclock window.
         printf '[{"id":10003,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","state":"COMMENTED"}]\n' "$bot" "$reply_time"
         ;;
+      poll_finished_nonterminal_summary|poll_finished_no_summary_status_success|probe_summary_quotes_finished_phrases)
+        # #875 round 7: a head-pinned review object at reply_time for all
+        # three P1 cases — the corroboration anchor each one needs.
+        printf '[{"id":10005,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","state":"COMMENTED"}]\n' "$bot" "$reply_time"
+        ;;
       finished_note_reviews_lookup_fails)
         # #875 round 3 P1-ii: the reviews lookup 5xxes while a finished
         # reply is being classified. The corroboration helper must deny
@@ -527,6 +532,37 @@ case "$endpoint" in
         # published; post-fix nothing qualifies and the poll runs out its
         # budget (advisory rc 4).
         printf '[{"id":8003,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:05Z","updated_at":"2026-06-04T00:00:09Z","body":"✅ Actions performed\\n\\nFull review finished.\\n\\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n\\n> [!WARNING]\\n> ## Review limit reached"},{"id":8004,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:03Z","updated_at":"2026-06-04T00:00:03Z","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n**Actionable comments posted: 0**\\n\\nPrior head, nothing to flag."}]\n' "$bot" "$bot"
+        ;;
+      poll_finished_nonterminal_summary)
+        # #875 round 7 (Codex P1-b): the ONLY summarize-marker comment was
+        # refreshed at 00:00:07 — AFTER the head review object at reply_time,
+        # so marker identity plus the ordering floor both accept it — but it
+        # carries the MID-REVIEW stanza, i.e. it is the same in-place comment
+        # in a state that is not a verdict. A finished attestation edited at
+        # 00:00:09 is the newest bot comment and drives the polling `review`
+        # arm. Pre-fix the selector returned this body, found no blocking
+        # marker, and cleared rc 0 before the real summary published.
+        printf '[{"id":8007,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:07Z","updated_at":"2026-06-04T00:00:07Z","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->\\n\\n**Currently reviewing this pull request.**"},{"id":8008,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:05Z","updated_at":"2026-06-04T00:00:09Z","body":"✅ Actions performed\\n\\nFull review finished.\\n\\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n\\n> [!WARNING]\\n> ## Review limit reached"}]\n' "$bot" "$bot"
+        ;;
+      poll_finished_no_summary_status_success)
+        # #875 round 7 (Codex P1-a): a corroborated finished attestation is
+        # the ONLY bot comment — no summarize-marker comment exists at all —
+        # while the per-SHA StatusContext reads success and the repo trusts
+        # it. Pre-fix the attestation classified `review`, so it did not
+        # suppress the StatusContext fast path, and emit_status_context_
+        # verdict cleared rc 0 off an inline-only scan before any summary
+        # published.
+        printf '[{"id":8009,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:05Z","updated_at":"2026-06-04T00:00:09Z","body":"✅ Actions performed\\n\\nFull review finished.\\n\\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n\\n> [!WARNING]\\n> ## Review limit reached"}]\n' "$bot"
+        ;;
+      probe_summary_quotes_finished_phrases)
+        # #875 round 7 (Codex P1-c): a GENUINE summarize-marker summary that
+        # happens to discuss the finished-attestation mechanism — a fenced
+        # quote of the matcher plus prose naming both phrases, which is
+        # exactly what CodeRabbit writes when it walks a diff that touches
+        # this code. Pre-fix the two body-wide greps labelled it an
+        # attestation, the probe skipped it at the exclusion branch, and the
+        # blocking marker it carries alone (#535) was never inspected.
+        printf '[{"id":8011,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:07Z","updated_at":"2026-06-04T00:00:07Z","body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n**Actionable comments posted: 1**\\n\\n_⚠️ Potential issue_\\n\\nThe helper decides whether the actions-performed block states the review finished:\\n\\n```bash\\ngrep -qiE actions performed\\ngrep -qiE review finished\\n```\\n\\nCarried only by this summary."}]\n' "$bot"
         ;;
       probe_summary_lands_during_probe_clean|probe_summary_lands_during_probe_marker)
         # #875 round 4 TOCTOU, served by fetch count: the FIRST snapshot
@@ -1777,6 +1813,74 @@ test_875c_poll_reviews_lookup_failure_denies_corroboration() {
   fi
 }
 
+test_875h_poll_nonterminal_summary_is_not_verdict_material() {
+  # #875 round 7 (Codex P1-b): the summarize marker names the ONE comment
+  # CodeRabbit edits in place — it does not certify that the body currently
+  # in it is a verdict. Here that comment was refreshed AFTER the head review
+  # object (so marker identity and the ordering floor both accept it) while
+  # carrying the mid-review stanza, and a finished attestation drives the
+  # polling `review` arm. Selecting the mid-review body found no blocking
+  # marker and cleared rc 0 ahead of the real summary — the same failure the
+  # round-6 gate closed, reached through the selector instead. Validating the
+  # candidate's CLASS leaves nothing selectable, so the poll runs out its
+  # budget to the advisory timeout.
+  local dir rc status
+  dir=$(make_case poll-875h-nonterminal 40 false 0 3 2)
+  rc=$(run_case "$dir" poll_finished_nonterminal_summary)
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "4" ] && [ "$status" = "timeout" ]; then
+    pass "#875 polling: a summarize-marker comment in a MID-REVIEW state is not verdict material — the poll times out advisory (rc 4), never clears"
+  else
+    fail "#875 polling: nonterminal summary → rc=$rc status=$status (expected 4/timeout)"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
+test_875h_poll_attestation_blocks_status_fast_path() {
+  # #875 round 7 (Codex P1-a): with trust_status_context_for_clearance on —
+  # mergepath's own setting — the StatusContext fast path is a THIRD route to
+  # rc 0, and #869 opened it by making a corroborated finished attestation
+  # classify `review` instead of rate_limit. emit_status_context_verdict
+  # scans INLINE findings only, so pre-fix this shape cleared rc 0 before any
+  # summary existed to inspect, bypassing the round-6 gate on the poll arm
+  # entirely. The fast path must be suppressed until a genuine head-anchored
+  # summary publishes; with none ever published here, the poll times out.
+  local dir rc status
+  dir=$(make_case poll-875h-fastpath 40 false 0 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:08Z \
+    run_case "$dir" poll_finished_no_summary_status_success)
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "4" ] && [ "$status" = "timeout" ]; then
+    pass "#875 polling: a finished attestation with no published summary suppresses the StatusContext fast path (rc 4), never an inline-only rc 0"
+  else
+    fail "#875 polling: attestation + status success → rc=$rc status=$status (expected 4/timeout)"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
+test_875h_probe_summary_quoting_the_phrases_is_not_an_attestation() {
+  # #875 round 7 (Codex P1-c): the finished claim was matched by two
+  # body-wide phrase greps, so any bot body DISCUSSING the mechanism matched
+  # — including CodeRabbit's own walkthrough of a diff that touches this
+  # code, which is the shape this very PR produces. Mislabelled, the genuine
+  # summary is skipped at the probe's attestation-exclusion branch and the
+  # blocking marker it carries alone (#535) is never inspected; a correlated
+  # per-SHA success would then open the Phase 4b barrier over it. Matching
+  # the generated stanza instead means this summary is read as a summary:
+  # rc 2, the one verdict the probe makes.
+  local dir rc obs
+  dir=$(make_case probe-875h-quotes 600 false 0 0 0)
+  rc=$(run_probe_case "$dir" probe_summary_quotes_finished_phrases)
+  obs=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "2" ]; then
+    pass "#875 probe: a genuine summary that QUOTES the finished phrases is a summary, not an attestation — its summary-only blocker surfaces as rc 2"
+  else
+    fail "#875 probe: summary quoting the phrases → rc=$rc observed=$obs (expected 2)"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
 test_875g_poll_blank_reviews_body_denies_corroboration() {
   # #875 round 7: the silent twin of the lookup-failure case above. gh
   # exits 0 and writes NOTHING — the shape `jq -s 'add // []'` normalizes
@@ -2130,6 +2234,9 @@ test_875b_probe_prior_head_finished_with_new_object_awaits_summary
 test_875b_probe_status_postdating_finished_comment_uncorroborated
 test_875c_poll_reviews_lookup_failure_denies_corroboration
 test_875g_poll_blank_reviews_body_denies_corroboration
+test_875h_poll_nonterminal_summary_is_not_verdict_material
+test_875h_poll_attestation_blocks_status_fast_path
+test_875h_probe_summary_quoting_the_phrases_is_not_an_attestation
 test_875d_probe_summary_landing_mid_probe_is_scanned
 test_875e_finished_reply_cannot_shadow_the_real_summary
 test_875f_poll_late_summary_with_marker_yields_findings
