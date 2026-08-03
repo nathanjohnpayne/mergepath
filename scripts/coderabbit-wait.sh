@@ -762,11 +762,33 @@ die() {
   exit "$code"
 }
 
+# An exit-0 `gh api` invocation that writes NOTHING is not an empty array —
+# it is an unreadable payload, and the two helpers below must not launder it
+# into one. `jq -s 'add // []'` maps empty input to `[]`, and a downstream
+# `type == "array"` guard cannot tell that `[]` apart from a real one, so
+# every caller that distinguishes "the lookup CONFIRMED zero rows" from "the
+# lookup failed" would read the outage as a confident negative — the exact
+# collapse the three-outcome rule at newest_head_pinned_review_submitted_at
+# exists to prevent (a blank read there would fall through to the
+# StatusContext leg the failed-lookup case denies outright). A REST array
+# endpoint always writes at least `[]`, so blank stdout is only ever a
+# failure. Whitespace-only is the same case: command substitution already
+# strips trailing newlines, and any remaining blank run is still no JSON.
+raw_body_is_blank() {
+  case $1 in
+    *[![:space:]]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 fetch_api_array() {
   local endpoint=$1
   local label=$2
   local raw
   raw=$(gh api --paginate "$endpoint" 2>&1) || die 3 "failed to fetch $label: $raw"
+  if raw_body_is_blank "$raw"; then
+    die 3 "empty response body fetching $label (not an empty array)"
+  fi
   echo "$raw" | jq -s 'add // []' 2>/dev/null \
     || die 3 "failed to flatten $label pagination output"
 }
@@ -779,6 +801,10 @@ fetch_api_array_best_effort() {
     log "best-effort fetch failed for $label: $raw"
     return 1
   }
+  if raw_body_is_blank "$raw"; then
+    log "best-effort fetch returned an empty response body for $label (not an empty array) — treating as a failed read"
+    return 1
+  fi
   echo "$raw" | jq -s 'add // []' 2>/dev/null || {
     log "best-effort fetch failed to flatten $label pagination output"
     return 1

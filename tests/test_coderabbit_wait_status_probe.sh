@@ -279,6 +279,15 @@ case "$endpoint" in
         echo "simulated reviews API failure (corroboration lookup)" >&2
         exit 44
         ;;
+      finished_note_reviews_body_blank)
+        # #875 round 7: the SILENT half of the same failure class — gh
+        # exits 0 but writes nothing at all. A real array endpoint always
+        # writes at least `[]`, so a blank body is an unreadable payload,
+        # not a confirmed-empty array; normalizing it to `[]` would turn an
+        # outage into outcome (b) and hand the claim to the satisfiable
+        # StatusContext leg that outcome (a) denies. No output, exit 0.
+        exit 0
+        ;;
       probe_reviews_api_failure)
         # #814 / Phase 4b P2 on #823: the reviews fetch fails while the probe
         # is deciding. Must surface as rc 3 (infra), never as a clean rc 7.
@@ -461,6 +470,14 @@ case "$endpoint" in
         # WOULD accept (comment 00:00:06 at-or-after status 00:00:00) if
         # the failed lookup were wrongly read as zero objects.
         printf '[{"id":9997,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"✅ Actions performed\\n\\nFull review finished.\\n\\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n\\n> [!WARNING]\\n> ## Review limit reached\\n\\nYour included review limit is currently reached under our Fair Usage Limits. Next review available in: 45 minutes."}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      finished_note_reviews_body_blank)
+        # #875 round 7: the same finished+limit body at reply_time, paired
+        # with a reviews endpoint that exits 0 writing NOTHING. Same
+        # satisfiable status leg as the 5xx twin above, so a blank body
+        # read as an empty array corroborates and classifies review;
+        # read as a failed lookup it denies and stalls rc 5.
+        printf '[{"id":9993,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"✅ Actions performed\\n\\nFull review finished.\\n\\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n\\n> [!WARNING]\\n> ## Review limit reached\\n\\nYour included review limit is currently reached under our Fair Usage Limits. Next review available in: 45 minutes."}]\n' "$bot" "$reply_time" "$reply_time"
         ;;
       finished_reply_shadows_marker_summary)
         # #875 round 5 (a): the REAL summarize-marker summary at 00:00:07
@@ -1760,6 +1777,32 @@ test_875c_poll_reviews_lookup_failure_denies_corroboration() {
   fi
 }
 
+test_875g_poll_blank_reviews_body_denies_corroboration() {
+  # #875 round 7: the silent twin of the lookup-failure case above. gh
+  # exits 0 and writes NOTHING — the shape `jq -s 'add // []'` normalizes
+  # to `[]`, which no downstream `type == "array"` check can tell from a
+  # genuinely empty page. Read that way, the outage becomes outcome (b)
+  # ("confirmed zero head objects") and the deliberately satisfiable
+  # StatusContext leg corroborates the finished claim, classifying review.
+  # Read correctly — a blank body is a failed read, because a REST array
+  # endpoint always writes at least `[]` — corroboration is denied,
+  # the body keeps its rate_limit class, and the 0 retry budget stalls
+  # rc 5 immediately. Identical fixtures to the 5xx twin except HOW the
+  # fetch fails, so rc 5 here is evidence about the blankness guard alone.
+  local dir rc status review_id
+  dir=$(make_case poll-875g-blankbody 30 true 6 0 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=success run_case "$dir" finished_note_reviews_body_blank)
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  review_id=$(jq -r '.review.id // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "5" ] && [ "$status" = "rate_limit_stalled" ] && [ "$review_id" = "9993" ]; then
+    pass "#875 polling: an exit-0 EMPTY reviews body is a failed read, not an empty array — corroboration denied (rc 5 stall)"
+  else
+    fail "#875 polling: blank reviews body → rc=$rc status=$status review.id=$review_id (expected 5/rate_limit_stalled/9993)"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
 test_875d_probe_summary_landing_mid_probe_is_scanned() {
   # #875 round 4 TOCTOU: the probe's issue-comments snapshot predates its
   # status read, so the PR-level summary can land in the gap. Pre-fix the
@@ -2086,6 +2129,7 @@ test_875b_poll_prior_head_finished_not_corroborated_by_new_object
 test_875b_probe_prior_head_finished_with_new_object_awaits_summary
 test_875b_probe_status_postdating_finished_comment_uncorroborated
 test_875c_poll_reviews_lookup_failure_denies_corroboration
+test_875g_poll_blank_reviews_body_denies_corroboration
 test_875d_probe_summary_landing_mid_probe_is_scanned
 test_875e_finished_reply_cannot_shadow_the_real_summary
 test_875f_poll_late_summary_with_marker_yields_findings

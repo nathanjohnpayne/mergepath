@@ -2471,41 +2471,51 @@ bad=""
 # returns rc 7 observed=awaiting-summary for that state on purpose. Missing
 # context_state — including the trust-opted-out null — and every
 # non-success state stay not-yet.
+#
+# Every payload from here down that carries a `probe` block names `observed`
+# explicitly, and that is load-bearing rather than decoration: the
+# missing-observed conjunct pinned just above already forces not-yet on its
+# own, so a payload that omitted the field would be satisfied BEFORE the
+# conjunct its label names was ever reached, and a regression dropping the
+# status-ordering or the endpoint conjunct would leave every one of them
+# green. Naming it leaves exactly one conjunct failing per case. The bare
+# object at the top of this group is the deliberate exception — it has no
+# `probe` block at all, which is the shape under test there.
 [ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-bare"
 [ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":null,"context_updated_at":null}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-nullctx"
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"missing","context_updated_at":null}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"missing","context_updated_at":null}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-missingctx"
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"pending","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"pending","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-pendingctx"
 # The same-SHA rerun shape (#875 round 2): a success whose refresh time
 # PREDATES the review object belongs to the PREVIOUS run against this sha —
 # the new object's summary and status refresh are still pending, so the
 # stale success must not open the barrier past them.
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:00Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"success","context_updated_at":"2026-06-04T00:00:00Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-stalectx"
 # Either half of the correlation missing, or unparseable, fails closed —
 # an old probe emission (no submitted_at / no context_updated_at) keeps
 # the pre-#869 bounded wait.
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews"},"probe":{"observed":"awaiting-summary","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-nosubmitted"
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"success"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-noctxat"
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"not-a-date"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"not-a-date"},"probe":{"observed":"awaiting-summary","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-badts"
 # Stale-head evidence must not clear even fully corroborated — the same
 # #794 posture as rc 0.
-[ "$(_cr 7 '{"head_sha":"old999","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"old999","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-review-object-stale"
 # "issues" evidence on rc 7 is a pending notice or a prior-head summary,
 # never head-anchored terminality — a correlated context success cannot
 # upgrade it.
-[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9982,"endpoint":"issues","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 7 '{"head_sha":"abc123","review":{"id":9982,"endpoint":"issues","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc7-issues-evidence"
 # The channel is probe-only: a polling timeout (rc 4) never carries
 # review-object evidence, and unmodelled shapes must not open the barrier.
-[ "$(_cr 4 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
+[ "$(_cr 4 '{"head_sha":"abc123","review":{"id":9988,"endpoint":"reviews","submitted_at":"2026-06-04T00:00:06Z"},"probe":{"observed":"awaiting-summary","context_state":"success","context_updated_at":"2026-06-04T00:00:07Z"}}')" = not-yet ] \
                                                          || bad="$bad rc4-no-channel"
 # rc 5 is only an escalation when the #489 failover did NOT engage. When it
 # did, AGENTS.md step 5 makes the stall a non-blocking note and the Codex arm
