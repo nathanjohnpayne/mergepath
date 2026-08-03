@@ -3273,45 +3273,66 @@ FOPEN_EOF
   # Cases 60-62 pin the rule against a single-level list, whose content
   # indent happens to land exactly on the four-column allowance the bug
   # they fixed used to hard-code. That leaves the relative measure
-  # unpinned at the second level: a two-deep list puts its innermost
-  # content indent at eight columns, and an implementation that measures
-  # the delimiter from an absolute margin — or from only the OUTER
-  # container instead of the one the line is actually inside — mishandles
-  # it the same way case 60 describes, just one level down. `- a` /
-  # `  - b` puts item b's content indent at four; a ```sh opener there is
-  # AT that container's own boundary, the same "just inside" edge case 60
-  # exercises, but now reached through two stack frames instead of one.
+  # unpinned deeper in: an implementation that measures the delimiter
+  # from an absolute margin, or from only the OUTERMOST container instead
+  # of the one the line is actually inside, mishandles it the same way
+  # case 60 describes, just further down.
   #
-  # The second half pins the other boundary one level deeper still: `- c`
-  # / `  - d` also puts item d's content indent at four, but a delimiter
-  # eight columns in — four columns past THAT container — is indented
-  # code, not a fence, the same over-indented edge case 60's second half
-  # exercises. A blank line separates the marker from it, exactly as in
-  # case 60's own fixture, so the marker's own paragraph is closed and the
-  # indented-code branch (which cannot interrupt an open paragraph) is the
-  # one under test rather than plain lazy continuation.
+  # A TWO-deep list does not separate those two wrong measures: `- a` /
+  # `  - b` puts the outermost container's allowance at 2+4=6 and item
+  # b's own allowance at 4+4=8, but a fence opener probed at column 4
+  # (item b's content indent) sits under BOTH allowances, and the
+  # over-indented probe at column 8 sits over both too — the outer-vs-
+  # current distinction never has a chance to fire. THREE levels deep
+  # separates them: `- a` / `  - b` / `    - c` puts item c's own content
+  # indent at six but the outermost container's (item a's) allowance is
+  # still only 2+4=6, so a ```sh opener probed AT column six — item c's
+  # own boundary, the same "just inside" edge case 60 exercises — is
+  # inside the CURRENT container's allowance (6 < 6+4) but outside the
+  # OUTERMOST container's (6 is not < 2+4). An implementation that
+  # measures from the outermost container instead of the current one
+  # never opens the fence there, so line 7's `#111` is left as prose
+  # inside what CommonMark renders as fenced code — a false positive on
+  # a required check.
   #
-  # Both hits are chosen to expose a REGRESSION to the absolute `ind < 4`
-  # this issue's anchor describes: reverting the delimiter check to that
-  # form stops recognising the ```sh opener on line 5 (its content indent,
-  # four, is not less than four), so line 6's `#111` is emitted as prose
-  # instead of fenced code and a THIRD hit appears before line 8 — this
+  # The second half pins the other boundary the same three levels deep:
+  # `- d` / `  - e` / `    - f` also puts item f's content indent at six,
+  # but a delimiter ten columns in — four columns past THAT container —
+  # is indented code, not a fence, the same over-indented edge case 60's
+  # second half exercises. A blank line separates the marker from it,
+  # exactly as in case 60's own fixture, so the marker's own paragraph is
+  # closed and the indented-code branch (which cannot interrupt an open
+  # paragraph) is the one under test rather than plain lazy continuation.
+  #
+  # The first hit is chosen to expose a REGRESSION to measuring the
+  # delimiter from the OUTERMOST container instead of the one the line is
+  # actually inside: that mutation still recognises fences at one and two
+  # levels deep (cases 60-62 are unmoved, and it does not change
+  # `container_base` itself, only which base the delimiter test reads),
+  # but at three levels it never opens the line 6 ```sh fence, so line
+  # 7's `#111` surfaces as an extra hit before line 9's real `#222` — this
   # case fails the moment that regression lands, not only in principle.
+  # It also exposes a REGRESSION to the absolute `ind < 4` this issue's
+  # anchor describes, the same way cases 60-62 do: that mutation stops
+  # recognising the line 6 opener too (six is not less than four), with
+  # the same extra hit before line 9 as the result.
   FNEST_DOC="$WORKDIR/consumer-truth-fence-nested.md"
   cat > "$FNEST_DOC" <<'FNEST_EOF'
 # Doc
 
 - a
   - b
-    ```sh
-    echo "closes #111"
-    ```
-    A bare #222 in item b, after the fence.
-- c
-  - d
+    - c
+      ```sh
+      echo "closes #111"
+      ```
+      A bare #222 in item c, after the fence.
+- d
+  - e
+    - f
 
-        ```
-        #333 sits in indented code, not a fence
+          ```
+          #333 sits in indented code, not a fence
 
 A bare #444 in prose is real.
 FNEST_EOF
@@ -3320,12 +3341,12 @@ FNEST_EOF
   fnest_lines=$(md_prose_only "$FNEST_DOC" | wc -l | tr -d ' ')
   fnest_raw=$(wc -l < "$FNEST_DOC" | tr -d ' ')
   set -e
-  if [ "$fnest_hits" != "8,15," ]; then
-    fail "Case 63: expected lines 8,15 flagged (a nested item's own fence opens and closes at its own container's boundary, not the document's), got '$fnest_hits'"
+  if [ "$fnest_hits" != "9,17," ]; then
+    fail "Case 63: expected lines 9,17 flagged (a nested item's own fence opens and closes at its own container's boundary, not the document's), got '$fnest_hits'"
   elif [ "$fnest_lines" != "$fnest_raw" ]; then
     fail "Case 63: md_prose_only must emit one line per input line, got $fnest_lines for $fnest_raw"
   else
-    pass "Case 63: the fence-delimiter allowance stays relative to the CURRENT container two levels into a nested list, not just the outer one (#802)"
+    pass "Case 63: the fence-delimiter allowance stays relative to the CURRENT container three levels into a nested list, not just the outermost one (#802)"
   fi
 
 else
