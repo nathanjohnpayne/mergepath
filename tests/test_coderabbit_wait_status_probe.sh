@@ -184,11 +184,15 @@ case "$endpoint" in
     # #814 matrix: the StatusContext surface. CODERABBIT_TEST_STATUS selects
     # the CodeRabbit context state so the sweep can drive the
     # trust_status_context_for_clearance path, which the hand-written cases
-    # below never exercise.
+    # below never exercise. CODERABBIT_TEST_STATUS_TIME (#869) positions
+    # the status in time — the barrier's temporal conjunct orders it
+    # against the head review object; it defaults to head_time, which
+    # PREDATES reply_time-stamped evidence, so tests exercising the
+    # correlated direction must set it explicitly.
     case "${CODERABBIT_TEST_STATUS:-absent}" in
       success|failure|pending)
-        printf '[{"context":"CodeRabbit","state":"%s","created_at":"%s","creator":{"login":"%s"}}]\n' \
-          "${CODERABBIT_TEST_STATUS}" "$head_time" "$bot"
+        printf '[{"context":"CodeRabbit","state":"%s","created_at":"%s","updated_at":"%s","creator":{"login":"%s"}}]\n' \
+          "${CODERABBIT_TEST_STATUS}" "${CODERABBIT_TEST_STATUS_TIME:-$head_time}" "${CODERABBIT_TEST_STATUS_TIME:-$head_time}" "$bot"
         ;;
       *) printf '[]\n' ;;
     esac
@@ -228,6 +232,13 @@ case "$endpoint" in
         # #833: HEAD review exists; the later bot comments include a
         # status-probe narration reply (issues endpoint below).
         printf '[{"id":9983,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        ;;
+      probe_summary_lands_during_probe_clean|probe_summary_lands_during_probe_marker)
+        # #869 TOCTOU: a head-pinned review object; the PR-level summary
+        # lands BETWEEN the probe's first issue-comments snapshot and its
+        # status read (the issues endpoint below serves the two snapshots
+        # by fetch count).
+        printf '[{"id":9998,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha","state":"COMMENTED"}]\n' "$bot" "$reply_time"
         ;;
       probe_reviews_api_failure)
         # #814 / Phase 4b P2 on #823: the reviews fetch fails while the probe
@@ -362,6 +373,31 @@ case "$endpoint" in
         ;;
       probe_notice_after_review)
         printf '[{"id":9982,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\\n\\n> [!WARNING]\\n> ## Review limit reached"}]\n' "$bot" "$reply_time" "$reply_time"
+        ;;
+      probe_summary_lands_during_probe_clean|probe_summary_lands_during_probe_marker)
+        # #869 TOCTOU, served by fetch count: the FIRST snapshot predates
+        # the summary (only the prior-head summary from before the review
+        # object exists), the SECOND — the post-success re-fetch — carries
+        # the just-published summary for this head at 00:00:08, after the
+        # review object at reply_time. The marker variant's summary carries
+        # the #535 summary-only blocking marker; pre-fix both variants
+        # emitted the rc-7 success payload off the stale first snapshot and
+        # the barrier opened past the unscanned summary.
+        count=0
+        if [ -f "$state_dir/issues-fetch-count" ]; then
+          count=$(cat "$state_dir/issues-fetch-count")
+        fi
+        count=$((count + 1))
+        printf '%s\n' "$count" >"$state_dir/issues-fetch-count"
+        if [ "$count" -ge 2 ]; then
+          if [ "$scenario" = "probe_summary_lands_during_probe_marker" ]; then
+            printf '[{"id":7931,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:08Z","updated_at":"2026-06-04T00:00:08Z","body":"**Actionable comments posted: 1**\\n\\n_⚠️ Potential issue_\\n\\nCarried only by this just-landed summary."}]\n' "$bot"
+          else
+            printf '[{"id":7930,"user":{"login":"%s"},"created_at":"2026-06-04T00:00:08Z","updated_at":"2026-06-04T00:00:08Z","body":"**Actionable comments posted: 0**\\n\\nJust-landed summary for this head."}]\n' "$bot"
+          fi
+        else
+          printf '[{"id":7929,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 0**\\n\\nPrior head summary."}]\n' "$bot" "$head_time" "$head_time"
+        fi
         ;;
       probe_narration_after_review)
         # #833: the ONLY bot comment after the HEAD review object is a
@@ -965,10 +1001,15 @@ test_probe_paused_is_not_yet_never_skipped() {
 # mismatch.
 expected_observed() {
   local trust=$1 status=$2 scenario=$3
-  # The StatusContext is deliberately not consulted, at either trust setting:
-  # CodeRabbit emits a spurious success shortly after a rate-limit notice, so
-  # it is not sound existence evidence. Both dimensions are swept anyway, so
-  # a future change that starts reading it shows up here as a mismatch.
+  # The StatusContext is deliberately not consulted as EXISTENCE evidence,
+  # at either trust setting: CodeRabbit emits a spurious success shortly
+  # after a rate-limit notice, so it is not sound on its own. Its only
+  # probe-mode role is CONJUNCTIVE (#869): riding the rc-7 review-object
+  # JSON as probe.context_state / context_updated_at — and no swept
+  # scenario carries a head-pinned review object, so `observed` stays
+  # status-independent here. Both dimensions are swept anyway, so a future
+  # change that starts reading it elsewhere shows up as a mismatch; the
+  # ride-along path is pinned by the dedicated #869 cases below.
   : "$trust" "$status"
   case "$scenario" in
     none)                  printf 'none\n' ;;
@@ -1077,11 +1118,148 @@ test_probe_summary_lagging_head_review_is_not_yet() {
   # approve in that interval — and nothing downstream catches it, because
   # scripts/coderabbit-severity-gate.sh:330 fetches only pulls/{pr}/comments
   # and never the issue-comment summary. Verified, not assumed.
-  local dir rc
+  # #869 barrier-corroboration reconciliation: the barrier's rc-7
+  # review-object channel does NOT reopen this hole. It requires
+  # probe.context_state == "success" (refreshed at-or-after the object)
+  # alongside the review object, and this fixture pins
+  # trust_status_context_for_clearance: false, so the probe leaves
+  # context_state null — asserted below — and the barrier stays not-yet on
+  # exactly this JSON. The trust-enabled sampling directions live in
+  # test_869_probe_awaiting_summary_context_state.
+  local dir rc ctx
   dir=$(make_case probe-summary-lag 600 true 30 3 2)
   rc=$(run_probe_case "$dir" probe_summary_lags_review)
   assert_probe_not_yet "$dir" "$rc" awaiting-summary \
     "a review whose summary has not landed is publication-incomplete, not reported"
+  ctx=$(jq -r '.probe.context_state | tostring' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$ctx" = "null" ]; then
+    pass "#869 probe: with trust_status_context_for_clearance=false the awaiting-summary JSON carries context_state=null (barrier stays closed)"
+  else
+    fail "#869 probe: expected context_state=null under trust=false; got $ctx"
+  fi
+}
+
+# Flip the fixture policy to trust_status_context_for_clearance: true — the
+# same sed the state-space sweep uses. The #869 StatusContext sampling is
+# trust-gated, and make_case pins trust false by default.
+enable_trust_status_context() {
+  sed -i.bak 's/^  trust_status_context_for_clearance: false$/  trust_status_context_for_clearance: true/' \
+    "$1/.github/review-policy.yml" && rm -f "$1/.github/review-policy.yml.bak"
+}
+
+test_869_probe_awaiting_summary_context_state() {
+  # #869: the awaiting-summary rc-7 JSON is the ONE state whose evidence is
+  # a HEAD-pinned review object, and the barrier requires
+  # probe.context_state == "success" WITH probe.context_updated_at
+  # at-or-after review.submitted_at alongside it. Direction 1: a head
+  # StatusContext success refreshed AFTER the object (the
+  # wedged-but-complete #866 discriminator) — the probe emits state, its
+  # refresh time, and the object's submitted_at, and the barrier may open.
+  # This direction also exercises the still-absent arm of the TOCTOU
+  # re-scan: the success triggers the one bounded re-fetch, the summary is
+  # still absent on the second snapshot, and the rc-7 payload is kept.
+  # Direction 2: with no status on the head the probe emits the sampled
+  # "missing" — a bare just-posted review object whose summary (which can
+  # carry the ONLY blocking marker, e.g. the auto-pause note) is still in
+  # flight must NOT open the barrier. Direction 3: a success whose refresh
+  # time PREDATES the object is the PREVIOUS same-SHA run's — the probe
+  # reports it faithfully, and the emitted timestamps are exactly what
+  # makes the barrier refuse it.
+  local dir rc obs ep ctx ctxat subat
+  dir=$(make_case probe-869-ctx-success 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:07Z \
+    run_probe_case "$dir" probe_summary_lags_review)
+  obs=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ep=$(jq -r '.review.endpoint // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ctx=$(jq -r '.probe.context_state // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ctxat=$(jq -r '.probe.context_updated_at // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  subat=$(jq -r '.review.submitted_at // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "7" ] && [ "$obs" = "awaiting-summary" ] && [ "$ep" = "reviews" ] \
+     && [ "$ctx" = "success" ] && [ "$ctxat" = "2026-06-04T00:00:07Z" ] \
+     && [ "$subat" = "2026-06-04T00:00:06Z" ] && [ "$(probe_count "$dir")" = "0" ]; then
+    pass "#869 probe: awaiting-summary with a post-object StatusContext success emits correlated context_state/context_updated_at/submitted_at (barrier may open)"
+  else
+    fail "#869 probe: success direction → rc=$rc observed=$obs endpoint=$ep context_state=$ctx context_updated_at=$ctxat submitted_at=$subat"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+
+  local dir2 rc2 obs2 ep2 ctx2 ctxat2
+  dir2=$(make_case probe-869-ctx-absent 600 true 30 3 2)
+  enable_trust_status_context "$dir2"
+  rc2=$(run_probe_case "$dir2" probe_summary_lags_review)
+  obs2=$(jq -r '.probe.observed // "MISSING"' "$dir2/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ep2=$(jq -r '.review.endpoint // "MISSING"' "$dir2/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ctx2=$(jq -r '.probe.context_state // "MISSING"' "$dir2/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ctxat2=$(jq -r '.probe.context_updated_at | tostring' "$dir2/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc2" = "7" ] && [ "$obs2" = "awaiting-summary" ] && [ "$ep2" = "reviews" ] \
+     && [ "$ctx2" = "missing" ] && [ "$ctxat2" = "null" ]; then
+    pass "#869 probe: awaiting-summary with NO head status emits context_state=missing (a bare review object keeps the barrier closed)"
+  else
+    fail "#869 probe: absent direction → rc=$rc2 observed=$obs2 endpoint=$ep2 context_state=$ctx2 context_updated_at=$ctxat2"
+    sed 's/^/      /' "$dir2/err.log" >&2 || true
+  fi
+
+  local dir3 rc3 ctx3 ctxat3 subat3
+  dir3=$(make_case probe-869-ctx-stale 600 true 30 3 2)
+  enable_trust_status_context "$dir3"
+  # Default status time is head_time (00:00:00), which PREDATES the review
+  # object at reply_time (00:00:06) — the same-SHA-rerun stale success.
+  rc3=$(CODERABBIT_TEST_STATUS=success run_probe_case "$dir3" probe_summary_lags_review)
+  ctx3=$(jq -r '.probe.context_state // "MISSING"' "$dir3/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ctxat3=$(jq -r '.probe.context_updated_at // "MISSING"' "$dir3/out.json" 2>/dev/null || echo PARSE_ERROR)
+  subat3=$(jq -r '.review.submitted_at // "MISSING"' "$dir3/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc3" = "7" ] && [ "$ctx3" = "success" ] \
+     && [ "$ctxat3" = "2026-06-04T00:00:00Z" ] && [ "$subat3" = "2026-06-04T00:00:06Z" ]; then
+    pass "#869 probe: a pre-object (previous-run) success is emitted with its stale refresh time — the barrier's ordering conjunct refuses it"
+  else
+    fail "#869 probe: stale-success direction → rc=$rc3 context_state=$ctx3 context_updated_at=$ctxat3 submitted_at=$subat3"
+    sed 's/^/      /' "$dir3/err.log" >&2 || true
+  fi
+}
+
+test_869_probe_summary_landing_mid_probe_is_scanned() {
+  # #869 TOCTOU (P1 on the lean PR): the probe's issue-comments snapshot
+  # predates its status read, so the PR-level summary can land in the gap.
+  # Pre-fix the probe emitted the rc-7 awaiting-summary payload with the
+  # fresh success off the STALE snapshot, and the barrier opened past a
+  # just-published summary it never scanned — including one carrying the
+  # #535 summary-only blocking marker. Post-fix: after observing per-SHA
+  # success with the summary unseen, the probe re-fetches the comments
+  # exactly once; a summary found on the re-scan takes the normal
+  # rc-0/rc-2 verdict, with the rc-7-only context fields cleared to null.
+  local dir rc status observed id ctx fetches
+  dir=$(make_case probe-869-toctou-clean 600 true 30 3 2)
+  enable_trust_status_context "$dir"
+  rc=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:07Z \
+    run_probe_case "$dir" probe_summary_lands_during_probe_clean)
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  observed=$(jq -r '.probe.observed // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  id=$(jq -r '.review.id // "MISSING"' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  ctx=$(jq -r '.probe.context_state | tostring' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  fetches=$(cat "$dir/state/issues-fetch-count" 2>/dev/null || echo 0)
+  if [ "$rc" = "0" ] && [ "$status" = "reported" ] && [ "$observed" = "terminal" ] \
+     && [ "$id" = "9998" ] && [ "$ctx" = "null" ] && [ "$fetches" = "2" ] \
+     && [ "$(probe_count "$dir")" = "0" ]; then
+    pass "#869 probe: a clean summary landing mid-probe is re-scanned and reported rc 0 (one bounded re-fetch, context fields null)"
+  else
+    fail "#869 probe: mid-probe clean summary → rc=$rc status=$status observed=$observed id=$id context_state=$ctx fetches=$fetches"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+
+  local dir2 rc2 status2 fetches2
+  dir2=$(make_case probe-869-toctou-marker 600 true 30 3 2)
+  enable_trust_status_context "$dir2"
+  rc2=$(CODERABBIT_TEST_STATUS=success CODERABBIT_TEST_STATUS_TIME=2026-06-04T00:00:07Z \
+    run_probe_case "$dir2" probe_summary_lands_during_probe_marker)
+  status2=$(jq -r '.status' "$dir2/out.json" 2>/dev/null || echo PARSE_ERROR)
+  fetches2=$(cat "$dir2/state/issues-fetch-count" 2>/dev/null || echo 0)
+  if [ "$rc2" = "2" ] && [ "$status2" = "findings" ] && [ "$fetches2" = "2" ]; then
+    pass "#869 probe: a mid-probe summary carrying the #535 blocking marker escalates rc 2 instead of opening the barrier unscanned"
+  else
+    fail "#869 probe: mid-probe marker summary → rc=$rc2 status=$status2 fetches=$fetches2 (expected 2/findings/2)"
+    sed 's/^/      /' "$dir2/err.log" >&2 || true
+  fi
 }
 
 test_probe_reviews_api_failure_is_infra_not_clean() {
@@ -1426,6 +1604,8 @@ test_probe_paused_is_not_yet_never_skipped
 test_probe_state_space_sweep
 test_probe_summary_without_head_review_is_not_yet
 test_probe_summary_lagging_head_review_is_not_yet
+test_869_probe_awaiting_summary_context_state
+test_869_probe_summary_landing_mid_probe_is_scanned
 test_probe_reviews_api_failure_is_infra_not_clean
 test_probe_summary_only_marker_is_findings
 test_probe_notice_after_review_is_not_complete

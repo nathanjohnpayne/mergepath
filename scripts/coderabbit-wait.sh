@@ -142,6 +142,12 @@
 #       # more. fresh_at carries the edit time; consumers needing head
 #       # identity read head_sha, never a timestamp.
 #       "endpoint": "issues" | "pulls" | "reviews",
+#       # "reviews" evidence only (#869, additive): the object's own
+#       # submitted_at — the same instant created_at carries on that
+#       # endpoint, named explicitly so the Phase 4b barrier's temporal
+#       # conjunct (probe.context_updated_at at-or-after this) reads a
+#       # field whose meaning cannot drift with the endpoint.
+#       "submitted_at": "<iso-8601>",
 #       "body_excerpt": "<first 200 chars>"
 #     },
 #     "potential_issue_count": N,
@@ -182,7 +188,28 @@
 #       # it would be a contract nobody can meet.
 #       "observed": "none" | "rate_limit" | "paused" | "in_progress"
 #                   | "summary-without-head-review" | "awaiting-summary"
-#                   | "terminal"
+#                   | "terminal",
+#       # The per-SHA CodeRabbit StatusContext state on the HEAD
+#       # (success|failure|pending|error|missing), sampled ONLY when the
+#       # rc-7 verdict carries a HEAD-pinned review object (endpoint
+#       # "reviews") and trust_status_context_for_clearance is true; null
+#       # otherwise (#869). The Phase 4b barrier requires "success" here
+#       # before counting rc-7 review-object evidence as reported: a bare
+#       # just-posted review object can precede a PR-level summary that
+#       # carries the ONLY blocking marker (#535), and the per-SHA success
+#       # is what discriminates the wedged-but-complete #866 state from
+#       # that mid-publication one.
+#       "context_state": null | "success" | "failure" | "pending"
+#                        | "error" | "missing",
+#       # The refresh time of that same status, sampled and nulled
+#       # together with context_state. The barrier additionally requires
+#       # this to be at-or-after the evidence object's submitted_at
+#       # (emitted as review.submitted_at on the rc-7 reviews-endpoint
+#       # evidence): on a same-SHA rerun the statuses endpoint still
+#       # exposes the PREVIOUS run's success while the new object's
+#       # summary and status refresh are pending, and a success predating
+#       # the object belongs to a different run.
+#       "context_updated_at": null | "<iso-8601>"
 #     },
 #     "codex_failover_requested": true | false,
 #     "waited_seconds": N
@@ -769,9 +796,17 @@ check_status_context_record() {
   # page if non-CodeRabbit statuses crowd it out. `--paginate` plus
   # `jq -s 'add // []'` flattens all pages into a single array before
   # the context+creator filter runs.
+  # `updated_at` (#869 barrier corroboration, additive): the newest status'
+  # refresh time, sampled by the probe's rc-7 review-object branch into
+  # probe.context_updated_at so the Phase 4b barrier can require the
+  # success to be at-or-after the review object it corroborates. The REST
+  # API cannot update a commit status in place — each run POSTs a new
+  # status object — so updated_at and created_at coincide in practice; the
+  # `// .created_at` fallback keeps the field meaningful if a proxy strips
+  # one of them.
   resp=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/statuses" 2>/dev/null \
     | jq -s 'add // []' 2>/dev/null) || {
-    jq -nc '{state: "missing", created_at: ""}'
+    jq -nc '{state: "missing", created_at: "", updated_at: ""}'
     return
   }
   echo "$resp" | jq -c --arg bot "$BOT_LOGIN" '
@@ -782,9 +817,10 @@ check_status_context_record() {
     | sort_by(.created_at)
     | last
     | if . == null then
-        {state: "missing", created_at: ""}
+        {state: "missing", created_at: "", updated_at: ""}
       else
-        {state: (.state // "missing"), created_at: (.created_at // "")}
+        {state: (.state // "missing"), created_at: (.created_at // ""),
+         updated_at: (.updated_at // .created_at // "")}
       end
   '
 }
@@ -1901,6 +1937,14 @@ STATUS_PROBE_RAN=false
 # same additive posture blocking_tier_unresolved takes when it does not apply.
 PROBE_OBSERVED=""
 PROBE_JSON=null
+# Per-SHA StatusContext state and refresh time sampled by the probe's rc-7
+# review-object branch (#869); empty (→ null in the JSON) everywhere else,
+# including every polling run and every trust-opted-out policy. The
+# timestamp exists so the Phase 4b barrier can require the success to be
+# at-or-after the review object it corroborates — a same-SHA rerun exposes
+# the previous run's success while the new summary is pending.
+PROBE_CONTEXT_STATE=""
+PROBE_CONTEXT_UPDATED_AT=""
 # #489 rate-limit→Codex failover state. CODEX_FAILOVER_FIRED latches after the
 # first attempt so retries within a run don't re-post. CODEX_FAILOVER_REQUESTED
 # records whether Codex was actually engaged (the helper posted, or found an
@@ -1954,10 +1998,17 @@ emit_json_and_exit() {
   fi
 
   # --probe (#814): `terminal` covers a probe run that reached a real
-  # verdict (0 / 2 / 6). Null on every polling run.
+  # verdict (0 / 2 / 6). Null on every polling run. context_state and
+  # context_updated_at carry the per-SHA StatusContext (state + refresh
+  # time) sampled by the rc-7 review-object branch (#869) and are null on
+  # every other path.
   if [ "$PROBE_MODE" = "true" ]; then
     PROBE_JSON=$(jq -nc --arg observed "${PROBE_OBSERVED:-terminal}" \
-      '{mode: true, observed: $observed}')
+      --arg ctx "${PROBE_CONTEXT_STATE:-}" \
+      --arg ctxat "${PROBE_CONTEXT_UPDATED_AT:-}" \
+      '{mode: true, observed: $observed,
+        context_state: (if $ctx == "" then null else $ctx end),
+        context_updated_at: (if $ctxat == "" then null else $ctxat end)}')
   fi
 
   jq -n \
@@ -2127,17 +2178,25 @@ emit_status_context_verdict() {
 # convention, not two independent signals. A reader weakening either conjunct
 # should know there is no third.
 #
-# The StatusContext is deliberately NOT consulted. It is SHA-pinned, but
-# CodeRabbit emits a spurious success shortly after a rate-limit notice (the
-# case status_context_fast_path_blocked_by_comment exists to suppress), so
-# using it as existence evidence would report a head as reviewed when it was
-# not. A silent clean review that posts only a status therefore reads as
-# NOT-YET; the barrier's trigger step then asks for a review explicitly, which
-# always produces a review object, so it self-heals at the cost of one
-# allowance unit rather than by risking a false REPORTED.
+# The StatusContext is deliberately NOT consulted as EXISTENCE evidence. It
+# is SHA-pinned, but CodeRabbit emits a spurious success shortly after a
+# rate-limit notice (the case status_context_fast_path_blocked_by_comment
+# exists to suppress), so using it alone would report a head as reviewed
+# when it was not. A silent clean review that posts only a status therefore
+# reads as NOT-YET; the barrier's trigger step then asks for a review
+# explicitly, which always produces a review object, so it self-heals at the
+# cost of one allowance unit rather than by risking a false REPORTED. One
+# narrower, CONJUNCTIVE role is admitted (#869), trust-gated by
+# trust_status_context_for_clearance: the status rides along in the rc-7
+# JSON as probe.context_state / probe.context_updated_at when the evidence
+# is a HEAD-pinned review object, so the Phase 4b barrier can require
+# per-SHA completion — refreshed at-or-after that object — before opening
+# on an object whose PR-level summary is still in flight. The status
+# upgrades nothing on its own; it seconds a claim the review object already
+# made.
 probe_emit_verdict() {
-  local reviews review review_at issue_comments cand row body class
-  local summary_body="" newest_class=""
+  local reviews review review_at issue_comments cand row body class ctx_record
+  local summary_body="" newest_class="" rescan_done=false
 
   # Both reads are made DIRECTLY here, never through a helper. fetch_api_array
   # signals failure with `die 3`, which inside a command substitution exits
@@ -2154,11 +2213,16 @@ probe_emit_verdict() {
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") \
     || die 3 "failed to fetch issue comments for the probe verdict"
 
+  # `submitted_at` is additive (#869 barrier corroboration): the same
+  # instant created_at already carries on this endpoint, but named
+  # explicitly so the Phase 4b barrier's temporal conjunct
+  # (probe.context_updated_at at-or-after the object) reads a field whose
+  # meaning cannot drift with the endpoint.
   review=$(printf '%s' "$reviews" | jq -c --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
     [ .[] | select(.user.login == $bot) | select(.commit_id == $sha) ]
     | sort_by(.submitted_at) | last
     | if . == null then empty
-      else {id, created_at: .submitted_at, endpoint: "reviews",
+      else {id, created_at: .submitted_at, submitted_at, endpoint: "reviews",
             body_excerpt: ((.body // "")[0:200])} end
   ') || die 3 "failed to select the HEAD-pinned review"
 
@@ -2172,34 +2236,89 @@ probe_emit_verdict() {
     # already-published summary. Anchor-free on purpose — HEAD_ANCHOR carries a
     # moving wall-clock floor that would make a completed publication stop
     # counting once the head had sat long enough.
-    cand=$(printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg at "$review_at" '
-      [ .[] | select(.user.login == $bot)
-        | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
-        | select(.fresh_at >= $at) ]
-      | sort_by(.fresh_at) | reverse | .[] | @base64
-    ') || die 3 "failed to select the review summary"
-    while IFS= read -r row; do
-      [ -z "$row" ] && continue
-      body=$(printf '%s' "$row" | base64 --decode | jq -r '.body // ""')
-      class=$(classify_comment "$body")
-      # Narration replies carry no publication state, and the probe.observed
-      # enum deliberately omits status_probe — the no-review-object triage
-      # drops narration in its jq filter, but this scan classifies every row,
-      # so without this skip a narration reply landing after the review
-      # object leaks `observed: "status_probe"` (#833, seen live on #852).
-      # Skipped, not latched as blank: a pending notice BENEATH the narration
-      # still names the observed state, and no narration hides a published
-      # summary deeper in the scan.
-      [ "$class" = "status_probe" ] && continue
-      [ -n "$newest_class" ] || newest_class="$class"
-      if [ "$class" = "review" ]; then summary_body="$body"; break; fi
-    done <<< "$cand"
+    #
+    # The scan runs in a loop bounded to ONE re-fetch (#869 TOCTOU): the
+    # issue-comments snapshot predates the status read below, so the
+    # summary can land in the gap — emitting the rc-7 success payload from
+    # the stale snapshot would let the barrier open past a just-published
+    # summary that was never scanned (and that can carry the only blocking
+    # marker). After a per-SHA success is observed with the summary still
+    # unseen, the comments are re-fetched once and re-scanned; only a
+    # still-absent summary emits the rc-7 payload.
+    while :; do
+      summary_body=""
+      newest_class=""
+      cand=$(printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg at "$review_at" '
+        [ .[] | select(.user.login == $bot)
+          | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
+          | select(.fresh_at >= $at) ]
+        | sort_by(.fresh_at) | reverse | .[] | @base64
+      ') || die 3 "failed to select the review summary"
+      while IFS= read -r row; do
+        [ -z "$row" ] && continue
+        body=$(printf '%s' "$row" | base64 --decode | jq -r '.body // ""')
+        class=$(classify_comment "$body")
+        # Narration replies carry no publication state, and the probe.observed
+        # enum deliberately omits status_probe — the no-review-object triage
+        # drops narration in its jq filter, but this scan classifies every row,
+        # so without this skip a narration reply landing after the review
+        # object leaks `observed: "status_probe"` (#833, seen live on #852).
+        # Skipped, not latched as blank: a pending notice BENEATH the narration
+        # still names the observed state, and no narration hides a published
+        # summary deeper in the scan.
+        [ "$class" = "status_probe" ] && continue
+        [ -n "$newest_class" ] || newest_class="$class"
+        if [ "$class" = "review" ]; then summary_body="$body"; break; fi
+      done <<< "$cand"
 
-    if [ -z "$summary_body" ]; then
+      [ -n "$summary_body" ] && break
+
       PROBE_OBSERVED="${newest_class:-awaiting-summary}"
-      log "probe: review object on $HEAD_SHA but no terminal summary yet (newest=${newest_class:-none})"
+      # #869: this is the ONE probe state whose rc-7 JSON carries
+      # review-object evidence, and the barrier must not open on that
+      # object alone — the PR-level summary still in flight can carry the
+      # ONLY blocking marker (the #535 summary-only class, e.g. the
+      # auto-pause note). Sample the per-SHA StatusContext — state AND
+      # refresh time — into probe.context_state / probe.context_updated_at
+      # so the barrier can require `success` that is at-or-after this
+      # review object's submitted_at: on a same-SHA rerun the statuses
+      # endpoint still exposes the PREVIOUS run's success while the new
+      # object's summary and status refresh are pending, and a success
+      # that PREDATES the object it would corroborate belongs to a
+      # different run. Trust-gated by the same policy switch as every
+      # other status read; both fields left null when the policy opts out,
+      # which fails closed at the barrier (not-yet). Sampled once — the
+      # re-scan pass reuses the first sample rather than reading a surface
+      # that postdates it.
+      if [ "$TRUST_STATUS_CONTEXT" = "true" ] && [ -z "$PROBE_CONTEXT_STATE" ]; then
+        ctx_record=$(check_status_context_record)
+        PROBE_CONTEXT_STATE=$(printf '%s' "$ctx_record" | jq -r '.state // "missing"')
+        PROBE_CONTEXT_UPDATED_AT=$(printf '%s' "$ctx_record" | jq -r '.updated_at // ""')
+      fi
+      # #869 TOCTOU: the success just observed post-dates the comments
+      # snapshot, so the summary may already be up. One re-fetch, one
+      # re-scan; a summary found on the second pass takes the normal
+      # rc-0/rc-2 verdict below instead of the rc-7 evidence. The re-fetch
+      # failing is an infra rc 3 like every other probe read — emitting
+      # the rc-7 success payload after a failed re-fetch would be exactly
+      # the unscanned-summary hazard this loop exists to close.
+      if [ "$PROBE_CONTEXT_STATE" = "success" ] && [ "$rescan_done" != true ]; then
+        rescan_done=true
+        log "probe: per-SHA success observed while the summary is unseen — re-fetching issue comments once (#869 TOCTOU)"
+        issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (post-success re-scan)") \
+          || die 3 "failed to re-fetch issue comments for the post-success re-scan"
+        continue
+      fi
+      log "probe: review object on $HEAD_SHA but no terminal summary yet (newest=${newest_class:-none}, context_state=${PROBE_CONTEXT_STATE:-unsampled}, context_updated_at=${PROBE_CONTEXT_UPDATED_AT:-unsampled})"
       probe_not_yet "$PROBE_OBSERVED" "$review"
-    fi
+    done
+
+    # A published summary is the verdict source, not the rc-7 payload —
+    # clear the rc-7-only status fields (possibly sampled on a first pass
+    # of the loop above) so the documented contract holds: context_state /
+    # context_updated_at are null on every non-rc-7 path.
+    PROBE_CONTEXT_STATE=""
+    PROBE_CONTEXT_UPDATED_AT=""
 
     # The one verdict this mode does make, and only because nothing else can.
     # A blocking finding carried SOLELY by the PR-level summary (#535) is
