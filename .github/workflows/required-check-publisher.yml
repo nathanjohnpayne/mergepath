@@ -69,15 +69,12 @@ jobs:
       github.event_name == 'workflow_run' &&
       (github.event.action == 'requested' || github.event.action == 'in_progress')
     runs-on: ubuntu-latest
-    # Same queue as publish (cross-agent round 2 on #867): a groupless open
-    # could post its pending AROUND a mid-flight older pass, which would
-    # then retire it with a stale verdict. Queued behind that pass, the
-    # hold lands after the stale write — and if a queued open is itself the
-    # cancelled member, its replacement (the fresh publish pass) is the
-    # next thing the queue runs.
-    concurrency:
-      group: rcp-publish
-      cancel-in-progress: false
+    # GROUPLESS, on purpose (cross-agent round 3 on #867, superseding the
+    # round-2 queue-join): the pending must become visible BEFORE a
+    # mid-flight stale pass can finish, so it cannot wait behind that pass.
+    # The stale-write hazard the queue-join addressed is closed on the
+    # writer's side instead — publish withholds any POST when a newer
+    # pending exists (see the freshness check below).
     permissions:
       contents: read
       pull-requests: read
@@ -121,8 +118,8 @@ jobs:
           # the list READ fails, open anyway: pending is the fail-closed
           # direction, and a spurious pending on a non-PR head is invisible
           # to branch protection and retired by the next publish pass.
-          if heads=$(gh pr list --repo "$REPO" --state open --limit 500 \
-              --json headRefOid --jq '.[].headRefOid'); then
+          if heads=$(gh api --paginate "repos/$REPO/pulls" -f state=open \
+              -f per_page=100 --jq '.[].head.sha'); then
             if ! grep -qxF "$HEAD_SHA" <<<"$heads"; then
               echo "Head $HEAD_SHA is not an open PR head; nothing to open."
               exit 0
@@ -192,13 +189,20 @@ jobs:
           DISPATCH_PR: ${{ github.event.client_payload.pr }}
         run: |
           set -euo pipefail
+          # Server-comparable stamp for the pre-POST freshness check below:
+          # an in_progress entry whose started_at postdates this moment
+          # belongs to a NEWER evaluation, and this pass must not write
+          # over its hold (cross-agent round 3 on #867).
+          PASS_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           # Head-to-PR mapping from the open-PR list ONLY — never
           # workflow_run.pull_requests, empty for fork PRs (#845 risks).
-          # One query carries number AND head so no per-PR resolve call can
-          # fail independently (#465).
-          if ! prs_raw=$(gh pr list --repo "$REPO" --state open --limit 500 \
-              --json number,headRefOid \
-              --jq '.[] | "\(.number)\t\(.headRefOid)"'); then
+          # Exhaustive pagination, not a fixed cap: a capped list silently
+          # exempts every head beyond it from both phases (cross-agent
+          # round 3). One query carries number AND head so no per-PR
+          # resolve call can fail independently (#465).
+          if ! prs_raw=$(gh api --paginate "repos/$REPO/pulls" -f state=open \
+              -f per_page=100 \
+              --jq '.[] | "\(.number)\t\(.head.sha)"'); then
             echo "::error::Failed to list open PRs on $REPO; leaving any pending entries standing (fail closed)."
             exit 1
           fi
@@ -225,7 +229,12 @@ jobs:
           # a dispatch narrows to its named PR (the fast manual remedy).
           targets=""
           if [ -n "$requested_pr" ]; then
-            targets=$(awk -F'\t' -v n="$requested_pr" '$1 == n' <<<"$prs_raw" || true)
+            # Full coverage here too (cross-agent round 3): a dispatch that
+            # evaluated only its named PR could cancel a queued full pass
+            # and strand the displaced head's pendings, contradicting the
+            # subsume-all property. Named PR first keeps the remedy fast.
+            targets=$({ awk -F'\t' -v n="$requested_pr" '$1 == n' <<<"$prs_raw"; \
+                        awk -F'\t' -v n="$requested_pr" '$1 != n' <<<"$prs_raw"; } || true)
           elif [ -n "$RUN_HEAD" ]; then
             targets=$({ awk -F'\t' -v h="$RUN_HEAD" '$2 == h' <<<"$prs_raw"; \
                         awk -F'\t' -v h="$RUN_HEAD" '$2 != h' <<<"$prs_raw"; } || true)
@@ -269,6 +278,13 @@ jobs:
           fi
 
           had_infra_error=0
+          # Heads carried by MORE than one open PR fail closed (cross-agent
+          # round 3): the per-commit slot holds one verdict while the
+          # per-PR policy state (base, labels, reviews, threads) differs,
+          # so red-until-disambiguated is the only verdict that cannot be
+          # wrong for either PR. Detected once, posted once per head.
+          dup_heads=$(cut -f2 <<<"$prs_raw" | sort | uniq -d)
+          handled_dups=""
           # gate <script> <context> <sentinel-or-empty>: evaluate one gate
           # for one PR and POST the completed verdict on its head.
           gate() {
@@ -306,6 +322,21 @@ jobs:
             # Bash slice, not head -c: pipefail-safe under large outputs,
             # correct for the 65535-char API limit (b10671e wave).
             local summary="${output:0:60000}"
+            # Freshness check (cross-agent round 3 on #867): a pending
+            # entry started AFTER this pass began means a newer evaluation
+            # owns this slot — withhold the now-stale verdict and leave the
+            # hold for the newer pass to retire. started_at is assigned by
+            # the server, not by any actor this check would need to trust.
+            # The residual window is the gap between this read and the POST
+            # below — the floor without conditional writes.
+            local newer
+            newer=$(gh api --paginate -X GET "repos/$REPO/commits/$head/check-runs" \
+              -f check_name="$context" -f filter=latest -f per_page=100 \
+              --jq ".check_runs[] | select(.status != \"completed\") | select(.started_at > \"$PASS_START\") | .id") || newer=""
+            if [ -n "$newer" ]; then
+              echo "Newer pending for $context on $head (started after $PASS_START); withholding this verdict."
+              return 0
+            fi
             if ! gh api -X POST "repos/$REPO/check-runs" \
               -f name="$context" \
               -f head_sha="$head" \
@@ -324,6 +355,24 @@ jobs:
             if [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
               echo "::error::No head SHA for PR #$PR from the open-PR list; cannot refresh its contexts."
               had_infra_error=1
+              continue
+            fi
+            if grep -qxF "$head_sha" <<<"$dup_heads"; then
+              if ! grep -qF "$head_sha" <<<"$handled_dups"; then
+                handled_dups="$handled_dups $head_sha"
+                echo "::error::Head $head_sha is carried by more than one open PR; publishing red on all three contexts."
+                had_infra_error=1
+                for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+                  gh api -X POST "repos/$REPO/check-runs" \
+                    -f name="$name" \
+                    -f head_sha="$head_sha" \
+                    -f status="completed" \
+                    -f conclusion="failure" \
+                    -f "output[title]=$name — ambiguous head" \
+                    -f "output[summary]=More than one open PR carries $head_sha; one commit slot cannot honestly carry both PRs verdicts. Close or rebase one of them." \
+                    >/dev/null || echo "::error::Failed to post ambiguity red for $name on $head_sha."
+                done
+              fi
               continue
             fi
             echo "::group::Publish PR #$PR @ $head_sha"

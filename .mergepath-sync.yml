@@ -1135,6 +1135,11 @@ paths:
     # scripts directly — same coupling class as the gate-workflow
     # entries above; missing scripts fail-closed on missing-file.
     requires:
+      # The parent workflow is the trigger source: workflow_run fires only
+      # on its exact top-level name, so a consumer missing (or renaming)
+      # it gets no event-driven publishes at all (cross-agent round 3 on
+      # #867). Forward edge of the same coupling PR 4 adds in reverse.
+      - ".github/workflows/merge-clearance-gate.yml"
       - "scripts/merge-clearance-gate.sh"
       - "scripts/codex-p1-gate.sh"
       - "scripts/coderabbit-severity-gate.sh"
