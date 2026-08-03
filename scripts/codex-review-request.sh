@@ -81,9 +81,9 @@
 #      review` when Codex has already responded can cause double-processing
 #      or rate-limit pushback. Under --trigger-only, an AUTOMATIC caller
 #      (MERGEPATH_CODEX_AUTO_TRIGGER) additionally skips when
-#      scripts/workflow/codex_auto_trigger_gate.sh shows this head's
-#      external-review fingerprint already reviewed on an earlier commit —
-#      the content-free `update-branch` head of #798.
+#      scripts/workflow/codex_auto_trigger_gate.sh shows a prior Codex verdict
+#      carrying forward to this head on an unchanged external-review
+#      fingerprint — the content-free `update-branch` head of #798.
 #   4. Otherwise posts `@codex review` as a PR comment, waits a short
 #      bounded window for Codex's documented `eyes` acknowledgment on
 #      that trigger comment, and re-posts the trigger up to
@@ -966,7 +966,11 @@ existing_codex_trigger_on_head() {
 # mode that cannot express "no trigger, no wait" simply does not opt in.
 #
 # The decision itself lives in scripts/workflow/codex_auto_trigger_gate.sh so
-# it is directly testable; this is the call site, not the policy. Fail-open on
+# it is directly testable; this is the call site, not the policy. That gate in
+# turn delegates to external_review_carryforward.sh and suppresses only on
+# `carried: true`, so a suppressed head is by construction one whose Codex
+# clearance already carries forward — never one left with no clearance and no
+# caller to re-request it (#798 review). Fail-open on
 # every uncertainty — a missing helper (a consumer mid-sync, or the PR that
 # introduces it), a nonzero exit, unparseable output, or an explicit
 # `trigger:true` all return non-zero here so the trigger is posted.

@@ -175,6 +175,9 @@ test_reviewer_trigger_does_not_count() {
 
 GATE_SRC="$ROOT/scripts/workflow/codex_auto_trigger_gate.sh"
 FP_SRC="$ROOT/scripts/workflow/external_review_fingerprint.sh"
+# The gate delegates its whole decision to the carry-forward helper, so these
+# cases run the REAL one — a stub would make them assert the stub.
+CF_SRC="$ROOT/scripts/workflow/external_review_carryforward.sh"
 
 # Distinct 40-hex commit SHAs. HEAD_UNCHANGED is the update-branch head:
 # different SHA, identical tree entries for the PR's changed path at both the
@@ -187,7 +190,7 @@ make_gate_case() {
   local name=$1
   local dir="$WORKDIR/$name"
   mkdir -p "$dir/scripts/workflow" "$dir/.github" "$dir/bin"
-  cp "$GATE_SRC" "$FP_SRC" \
+  cp "$GATE_SRC" "$FP_SRC" "$CF_SRC" \
      "$ROOT/scripts/workflow/parse_policy_list.sh" \
      "$ROOT/scripts/workflow/match_protected_paths.sh" \
      "$dir/scripts/workflow/"
@@ -266,9 +269,11 @@ esac
 EOF
   chmod +x "$dir/bin/gh"
 
-  # Only the `Reviewed commit:` anchor is load-bearing here: the gate asks
-  # whether Codex LOOKED at a commit, not what it concluded.
-  printf '[{"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-07-29T10:00:00Z","body":"Codex Review: summary. Reviewed commit: %s"}]\n' \
+  # BOTH halves are load-bearing: the `Reviewed commit:` anchor AND the
+  # affirmative verdict wording. The gate asks whether a prior verdict CARRIES
+  # to this head, which is strictly narrower than "Codex looked at a commit" —
+  # see case L for the difference and why it matters.
+  printf '[{"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-07-29T10:00:00Z","body":"Codex Review: Didn'"'"'t find any major issues. :+1:\\n\\n**Reviewed commit:** %s"}]\n' \
     "$SHA_REVIEWED" >"$dir/comments.json"
   printf '[]\n' >"$dir/reviews.json"
   printf '%s\n' "$dir"
@@ -342,6 +347,46 @@ test_gate_fails_open_on_api_error() {
   [ "$(gatef "$dir" '.trigger')" = "true" ] \
     || fail "G: trigger=$(gatef "$dir" '.trigger'), expected true — an unreadable API must not suppress a review"
   [ "$FAIL" -ne "$before" ] || pass "G: API read failure fails open (posts the trigger)"
+}
+
+# L: the ONLY prior Codex signal is a COMMENTED review object — a findings
+# round, not a verdict. The head is content-free in exactly the way case D is,
+# so a gate that asked "did Codex LOOK at this content" would suppress here.
+# It must not: external_review_carryforward.sh scores every review object
+# non-affirmative, so nothing would carry to the new head. Suppressing would
+# leave the head with no head-anchored signal, no carry-forward clearance, and
+# no automatic caller left to re-request the review — the merge-clearance gate
+# would wait forever. (Codex P1 on the #798 PR.)
+test_gate_triggers_when_only_signal_is_a_review_object() {
+  local dir rc before=$FAIL
+  dir=$(make_gate_case "gate-reviewobj")
+  printf '[]\n' >"$dir/comments.json"
+  printf '[{"user":{"login":"chatgpt-codex-connector[bot]"},"state":"COMMENTED","submitted_at":"2026-07-29T10:00:00Z","commit_id":"%s"}]\n' \
+    "$SHA_REVIEWED" >"$dir/reviews.json"
+  rc=$(run_gate "$dir" "$SHA_UNCHANGED")
+  [ "$rc" = "0" ] || fail "L: expected exit 0, got $rc; err=$(cat "$dir/gate.err")"
+  [ "$(gatef "$dir" '.trigger')" = "true" ] \
+    || fail "L: trigger=$(gatef "$dir" '.trigger'), expected true — a findings round carries no clearance, so suppressing would strand the head; reason=$(gatef "$dir" '.reason')"
+  [ "$(gatef "$dir" '.reviewed_commit')" = "" ] \
+    || fail "L: reviewed_commit=$(gatef "$dir" '.reviewed_commit'), expected empty on a trigger verdict"
+  [ "$FAIL" -ne "$before" ] || pass "L: a COMMENTED review object alone does not suppress (it carries no clearance)"
+}
+
+# M: an affirmative verdict on the reviewed commit that a LATER findings round
+# on that same commit supersedes. Carry-forward revokes it; the gate must
+# inherit that revocation rather than matching the stale verdict. Pins that the
+# delegation is real — a gate that only copied the "affirmative verdict"
+# predicate would still suppress here.
+test_gate_triggers_when_verdict_is_superseded() {
+  local dir rc before=$FAIL
+  dir=$(make_gate_case "gate-superseded")
+  printf '[{"user":{"login":"chatgpt-codex-connector[bot]"},"state":"COMMENTED","submitted_at":"2026-07-29T12:00:00Z","commit_id":"%s"}]\n' \
+    "$SHA_REVIEWED" >"$dir/reviews.json"
+  rc=$(run_gate "$dir" "$SHA_UNCHANGED")
+  [ "$rc" = "0" ] || fail "M: expected exit 0, got $rc; err=$(cat "$dir/gate.err")"
+  [ "$(gatef "$dir" '.trigger')" = "true" ] \
+    || fail "M: trigger=$(gatef "$dir" '.trigger'), expected true — a superseded verdict must not suppress; reason=$(gatef "$dir" '.reason')"
+  [ "$FAIL" -ne "$before" ] || pass "M: a verdict superseded by a later findings round does not suppress"
 }
 
 # --- call-site wiring in codex-review-request.sh ----------------------------
@@ -439,6 +484,8 @@ test_gate_skips_content_free_head
 test_gate_triggers_on_real_content_change
 test_gate_triggers_without_prior_review
 test_gate_fails_open_on_api_error
+test_gate_triggers_when_only_signal_is_a_review_object
+test_gate_triggers_when_verdict_is_superseded
 test_wiring_auto_caller_honors_skip
 test_wiring_manual_caller_ignores_gate
 test_wiring_missing_gate_fails_open

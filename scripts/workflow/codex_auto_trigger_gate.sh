@@ -14,31 +14,44 @@ set -euo pipefail
 # gate, so a batch of N concurrent PRs costs O(N²) review rounds none of which
 # respond to an actual code change.
 #
-# The decision reuses the EXISTING `external-review:v2` fingerprint — the same
-# one scripts/workflow/external_review_fingerprint.sh computes and
-# external_review_carryforward.sh already uses to carry a prior Codex verdict
-# across an update-branch (#705). There is deliberately no second notion of
-# "unchanged": if two heads share a fingerprint, Codex has already reviewed
-# byte-identical tree entries for every path this PR changes, at both the head
-# and the merge base, so a re-review can only re-derive what it already said.
-# The sufficiency argument for a fingerprint match is recorded in
-# external_review_carryforward.sh (#763) and is not restated here.
+# The decision is DELEGATED to scripts/workflow/external_review_carryforward.sh
+# — the #705 helper that decides whether a prior Codex verdict carries across an
+# `update-branch`, over the EXISTING `external-review:v2` fingerprint. This gate
+# suppresses if and only if that helper reports `carried: true`.
+#
+# Delegating rather than re-deriving the question is the whole design, and it is
+# a correction (Codex P1 on the PR for #798). An earlier revision ran its own
+# scan and accepted ANY Codex signal on a commit — including a `COMMENTED`
+# review object, i.e. a findings round. Carry-forward accepts strictly less: an
+# AFFIRMATIVE issue-comment verdict, and only when no newer non-affirmative
+# signal supersedes it. Suppressing on evidence carry-forward would reject
+# stranded the head: no head-anchored Codex signal, no carry-forward clearance,
+# and — because the failover still reports `codex_failover_requested: true` —
+# nothing left that would ever re-request the review. The merge-clearance gate
+# then waits forever for a review nobody asked for.
+#
+# So the suppression condition is now, by construction, the condition under
+# which codex-review-check.sh's gate (c) clears this head: both ask the same
+# helper the same question. A copied predicate could drift; a delegated one
+# cannot. It also inherits carry-forward's newer-signal revocation, its
+# `codex.enabled: false` short-circuit, and its fail-closed handling of an
+# unresolvable newer signal.
 #
 # The decision is deliberately NOT symmetric:
 #
-#   - Suppressing needs POSITIVE evidence: a fingerprint that equals the
-#     fingerprint of a commit Codex has demonstrably reviewed.
-#   - Everything else — no fingerprint, an unreadable API, a helper failure, an
-#     unresolvable commit — returns `trigger:true`. Over-triggering costs one
-#     redundant review; under-triggering silently drops the explicit-invocation
-#     requirement (#631/#648) that a fix push must re-arm HEAD-anchored Codex
-#     clearance. So every uncertainty resolves toward posting.
+#   - Suppressing needs POSITIVE evidence: `carried: true` from the helper.
+#   - Everything else — a missing or non-executable helper, a nonzero exit,
+#     unparseable output, any `carried: false` — returns `trigger:true`.
+#     Over-triggering costs one redundant review; under-triggering silently
+#     drops the explicit-invocation requirement (#631/#648) that a fix push must
+#     re-arm HEAD-anchored Codex clearance. So every uncertainty resolves toward
+#     posting.
 #
-# Timestamps are never consulted as evidence of "nothing changed" — only as an
-# ordering key among Codex's own signals. A rebase can move an actor-controlled
-# commit date at will (that is why no gate in this repo keys freshness off one),
-# and the fingerprint is content-derived, so a spoofed date cannot manufacture
-# a match.
+# Timestamps are never consulted as evidence of "nothing changed" — carry-forward
+# uses them only to order Codex's own signals. A rebase can move an
+# actor-controlled commit date at will (that is why no gate in this repo keys
+# freshness off one), and the fingerprint is content-derived, so a spoofed date
+# cannot manufacture a match.
 #
 # Inputs:
 #   --repo owner/repo
@@ -46,7 +59,8 @@ set -euo pipefail
 #   --head <sha>             the head the automatic trigger would review
 #   --config <path>          default: .github/review-policy.yml
 #   --files-json <path>      optional PR files JSON cache (as the callers in
-#                            agent-review.yml already build for the labelers)
+#                            agent-review.yml already build for the labelers),
+#                            passed straight through to the carry-forward helper
 #   --bot-login <login>      default: chatgpt-codex-connector[bot]
 #
 # Output (stdout, always valid JSON; exit 0 unless the invocation itself is
@@ -70,14 +84,6 @@ PR_NUMBER=""
 HEAD_SHA=""
 FILES_JSON_PATH=""
 BOT_LOGIN="chatgpt-codex-connector[bot]"
-
-# Bounds the API cost of the scan below: each candidate can cost a commit
-# lookup plus a fingerprint (which itself fetches two trees). A match is
-# normally found on the first candidate — the head Codex reviewed immediately
-# before the update-branch — so this cap only bites on a long-lived PR with
-# many superseded rounds, where the older heads are the least likely to match
-# anyway.
-MAX_CANDIDATES=10
 
 usage() {
   cat >&2 <<'EOF'
@@ -120,7 +126,7 @@ done
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "codex_auto_trigger_gate.sh: --pr must be an integer" >&2; exit 2; }
 command -v jq >/dev/null 2>&1 || { echo "codex_auto_trigger_gate.sh: jq is required" >&2; exit 2; }
 
-FINGERPRINT_BIN="$SCRIPT_DIR/external_review_fingerprint.sh"
+CARRYFORWARD_BIN="$SCRIPT_DIR/external_review_carryforward.sh"
 
 # Emit the decision and stop. `trigger` is a JSON boolean so callers can read it
 # with `jq -r '.trigger'` without string/boolean ambiguity.
@@ -136,164 +142,42 @@ emit() {
   exit 0
 }
 
-# Keep stdout and stderr separate on a successful gh call so a warning/notice
-# cannot leak into text the caller parses as JSON, and preserve the real exit
-# code on failure. Same helper, same rationale as
-# external_review_fingerprint.sh (#715) and external_review_carryforward.sh
-# (#716); duplicated rather than shared because these run as separate
-# processes.
-gh_api_capture() {
-  local err_file rc=0 out
-  err_file=$(mktemp "${TMPDIR:-/tmp}/codex-auto-trigger-gh-err.XXXXXX") || {
-    "$@" 2>&1
-    return $?
-  }
-  out=$("$@" 2>"$err_file") || rc=$?
-  if [ "$rc" -ne 0 ]; then
-    out="$out
-$(cat "$err_file" 2>/dev/null)"
-  fi
-  rm -f "$err_file"
-  printf '%s' "$out"
-  return "$rc"
-}
-
-TMP_FILES=""
-cleanup() {
-  [ -z "$TMP_FILES" ] || rm -f "$TMP_FILES"
-}
-trap cleanup EXIT
-
-if [ ! -x "$FINGERPRINT_BIN" ] && [ ! -f "$FINGERPRINT_BIN" ]; then
-  emit true "external_review_fingerprint.sh is unavailable; cannot prove the head is content-free"
+if [ ! -f "$CARRYFORWARD_BIN" ]; then
+  emit true "external_review_carryforward.sh is unavailable; cannot prove this head carries a prior Codex verdict"
 fi
 
 if [ ! -f "$CONFIG" ]; then
-  emit true "review policy not found at $CONFIG; cannot compute an external-review fingerprint"
+  emit true "review policy not found at $CONFIG; cannot evaluate carry-forward"
 fi
 
-# One PR files list serves every ref, exactly as external_review_carryforward.sh
-# does it: the changed-path set is a property of the PR, and comparing two refs
-# over DIFFERENT path sets would compare two different questions.
-if [ -z "$FILES_JSON_PATH" ]; then
-  TMP_FILES=$(mktemp "${TMPDIR:-/tmp}/codex-auto-trigger-files.XXXXXX") || \
-    emit true "could not create a temp file for the PR files list"
-  if ! RAW_FILES=$(gh_api_capture gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files"); then
-    echo "codex_auto_trigger_gate.sh: failed to fetch PR files: $RAW_FILES" >&2
-    emit true "PR files list unreadable; cannot prove the head is content-free"
-  fi
-  if ! printf '%s\n' "$RAW_FILES" | jq -s 'add // []' > "$TMP_FILES"; then
-    emit true "PR files list did not parse; cannot prove the head is content-free"
-  fi
-  FILES_JSON_PATH="$TMP_FILES"
+CARRY_ARGS=(--repo "$REPO" --pr "$PR_NUMBER" --head "$HEAD_SHA" --config "$CONFIG" --bot-login "$BOT_LOGIN")
+# The changed-path set is a property of the PR, so a caller that already built
+# the files list (agent-review.yml's triage job does) can hand it over and save
+# the fetch. Omitted, the helper fetches its own.
+[ -z "$FILES_JSON_PATH" ] || CARRY_ARGS+=(--files-json "$FILES_JSON_PATH")
+
+# stderr is inherited so the helper's diagnostics land in the caller's log;
+# only stdout is parsed.
+CARRY_RC=0
+CARRY_JSON=$(bash "$CARRYFORWARD_BIN" "${CARRY_ARGS[@]}") || CARRY_RC=$?
+if [ "$CARRY_RC" -ne 0 ]; then
+  emit true "external_review_carryforward.sh exited $CARRY_RC; cannot prove this head carries a prior Codex verdict"
 fi
 
-fingerprint_at() {
-  local ref=$1 out rc=0
-  out=$(bash "$FINGERPRINT_BIN" \
-    --repo "$REPO" --pr "$PR_NUMBER" --ref "$ref" \
-    --config "$CONFIG" --files-json "$FILES_JSON_PATH" 2>/dev/null) || rc=$?
-  [ "$rc" -eq 0 ] || return 1
-  printf '%s' "$out" | jq -r '.fingerprint // ""' 2>/dev/null || return 1
-}
+CARRIED=$(printf '%s' "$CARRY_JSON" | jq -r '.carried | tostring' 2>/dev/null) || CARRIED="parse-error"
+CARRY_FINGERPRINT=$(printf '%s' "$CARRY_JSON" | jq -r '.fingerprint // ""' 2>/dev/null || printf '')
 
-CURRENT_FINGERPRINT=$(fingerprint_at "$HEAD_SHA") || \
-  emit true "could not fingerprint the current head $HEAD_SHA; cannot prove it is content-free"
-
-if [ -z "$CURRENT_FINGERPRINT" ]; then
-  # An empty fingerprint means the PR does not require external review, or the
-  # files API capped the diff. Either way there is nothing to compare, so the
-  # automatic trigger keeps its pre-#798 behavior.
-  emit true "no external-review fingerprint for this head; nothing to compare"
+if [ "$CARRIED" != "true" ]; then
+  if [ "$CARRIED" = "parse-error" ]; then
+    emit true "external_review_carryforward.sh output did not parse; cannot prove this head carries a prior Codex verdict"
+  fi
+  CARRY_REASON=$(printf '%s' "$CARRY_JSON" | jq -r '.reason // "no prior Codex verdict carries to this head"' 2>/dev/null || printf 'no prior Codex verdict carries to this head')
+  emit true "$CARRY_REASON" "$CARRY_FINGERPRINT"
 fi
 
-COMMENTS_JSON=$(gh_api_capture gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments") || {
-  echo "codex_auto_trigger_gate.sh: failed to fetch issue comments: $COMMENTS_JSON" >&2
-  emit true "issue comments unreadable; cannot identify a previously reviewed head" "$CURRENT_FINGERPRINT"
-}
-COMMENTS_JSON=$(printf '%s\n' "$COMMENTS_JSON" | jq -s 'add // []') || \
-  emit true "issue comments did not parse; cannot identify a previously reviewed head" "$CURRENT_FINGERPRINT"
+SOURCE_COMMIT=$(printf '%s' "$CARRY_JSON" | jq -r '.source_commit // ""' 2>/dev/null || printf '')
+SOURCE_TIME=$(printf '%s' "$CARRY_JSON" | jq -r '.source_time // ""' 2>/dev/null || printf '')
 
-REVIEWS_JSON=$(gh_api_capture gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews") || {
-  echo "codex_auto_trigger_gate.sh: failed to fetch reviews: $REVIEWS_JSON" >&2
-  emit true "reviews unreadable; cannot identify a previously reviewed head" "$CURRENT_FINGERPRINT"
-}
-REVIEWS_JSON=$(printf '%s\n' "$REVIEWS_JSON" | jq -s 'add // []') || \
-  emit true "reviews did not parse; cannot identify a previously reviewed head" "$CURRENT_FINGERPRINT"
-
-# Codex reports through BOTH endpoints and neither alone is sufficient — a
-# findings round arrives ONLY as a COMMENTED review object (anchored by
-# `commit_id`), a clean verdict ONLY as an issue comment (anchored by a
-# `Reviewed commit: <sha>` line). Both are evidence that Codex looked at that
-# commit, which is the only thing this gate needs; the DISPOSITION is
-# irrelevant here. A findings round that is still open stays open — suppressing
-# a redundant re-review of identical content does not clear it, and the fix
-# push that resolves it changes the fingerprint and re-triggers.
-CANDIDATES=$(jq -n -r \
-  --arg bot "$BOT_LOGIN" \
-  --argjson comments "$COMMENTS_JSON" \
-  --argjson reviews "$REVIEWS_JSON" '
-  def verdict_shas($body):
-    [ $body
-      | ascii_downcase
-      | scan("reviewed commit[^0-9a-f]{0,6}([0-9a-f]{7,40})")
-      | .[0]
-    ];
-  ([
-    $comments[]
-    | select(.user.login == $bot)
-    | . as $c
-    | verdict_shas($c.body // "")[] as $sha
-    | {time: ($c.created_at // ""), sha: $sha}
-  ] + [
-    $reviews[]
-    | select(.user.login == $bot)
-    | {time: (.submitted_at // ""), sha: ((.commit_id // "") | ascii_downcase)}
-  ])
-  | map(select(.time != "" and .sha != ""))
-  | sort_by(.time)
-  | reverse
-  | unique_by(.sha)
-  | sort_by(.time)
-  | reverse
-  | .[]
-  | [.time, .sha]
-  | @tsv
-')
-
-if [ -z "$CANDIDATES" ]; then
-  emit true "no Codex-reviewed commit on this PR to compare against" "$CURRENT_FINGERPRINT"
-fi
-
-HEAD_LC=$(printf '%s' "$HEAD_SHA" | tr '[:upper:]' '[:lower:]')
-examined=0
-while IFS=$'\t' read -r candidate_time candidate_sha; do
-  [ -n "$candidate_sha" ] || continue
-  [ "$examined" -lt "$MAX_CANDIDATES" ] || break
-  examined=$((examined + 1))
-
-  # Anchors are scanned out of comment prose and are frequently abbreviated, so
-  # resolve each to a full SHA. Skipping an unresolvable candidate is the
-  # conservative direction: it can only lose a chance to suppress, never
-  # suppress on evidence that was not verified.
-  resolved_sha=""
-  candidate_lc=$(printf '%s' "$candidate_sha" | tr '[:upper:]' '[:lower:]')
-  case "$HEAD_LC" in
-    "$candidate_lc"*) resolved_sha="$HEAD_SHA" ;;
-  esac
-  if [ -z "$resolved_sha" ]; then
-    resolved_sha=$(gh api "repos/$REPO/commits/$candidate_sha" --jq .sha 2>/dev/null || true)
-  fi
-  [ -n "$resolved_sha" ] || continue
-
-  candidate_fingerprint=$(fingerprint_at "$resolved_sha") || continue
-  [ -n "$candidate_fingerprint" ] || continue
-
-  if [ "$candidate_fingerprint" = "$CURRENT_FINGERPRINT" ]; then
-    emit false \
-      "Codex already reviewed this external-review fingerprint on $resolved_sha; the new head changes no reviewable content (#798)" \
-      "$CURRENT_FINGERPRINT" "$resolved_sha" "$candidate_time"
-  fi
-done <<<"$CANDIDATES"
-
-emit true "no Codex-reviewed commit matched the current external-review fingerprint" "$CURRENT_FINGERPRINT"
+emit false \
+  "a prior Codex verdict on $SOURCE_COMMIT carries to this head on the unchanged external-review fingerprint; the new head changes no reviewable content (#798)" \
+  "$CARRY_FINGERPRINT" "$SOURCE_COMMIT" "$SOURCE_TIME"
