@@ -93,6 +93,32 @@
 #                        auto-generated marker (the #485 auto-pause NOTE)
 #        - in_progress — body matches /review in progress|currently reviewing/i
 #        - review      — anything else authored by coderabbitai[bot]
+#      Precedence (#869): a body whose "Actions performed" block states the
+#      review FINISHED is a completed review signal even when the fair-use
+#      limit note (which carries the rate-limit marker) is appended to the
+#      same comment — completion evidence beats an appended limit notice,
+#      but ONLY when head-anchored corroboration exists that the claim
+#      temporally FOLLOWS (P1s on #875): a CodeRabbit review object whose
+#      commit_id is the current HEAD, or — when
+#      trust_status_context_for_clearance is true — the per-SHA CodeRabbit
+#      StatusContext reading success on the HEAD, in either case with the
+#      finished comment's fresh_at at-or-after the evidence (a completion
+#      statement always follows its own review, so evidence that postdates
+#      the claim cannot be what the claim reported on). The comment body
+#      itself carries no head identity, so with a cherry-picked /
+#      old-committer-date new head the wallclock freshness floor admits the
+#      PRIOR head's finished comment into the scan — and a review object
+#      CodeRabbit just posted for the NEW head is co-present with that
+#      stale claim without corroborating it. Uncorroborated, the body falls
+#      through to the classification it would have had without this rule
+#      (rate_limit when the limit marker is present), preserving the
+#      #714/#489 rate-limit semantics. A comment that is ONLY a limit
+#      notice still classifies rate_limit. Even corroborated, the finished
+#      reply is TERMINALITY evidence only — verdicts (rc 0 vs rc 2, the
+#      #535 summary-marker check) are decided on the genuine summary,
+#      never on the actions reply, so a reply that is newer than (or
+#      edited after) the real summary cannot shadow a blocking marker the
+#      summary alone carries.
 #   4. On rate_limit: parse "X minutes and Y seconds" (or "X seconds") into a
 #      window, sleep the portion of it that REMAINS after subtracting the time
 #      already elapsed since the notice was posted (#727 — the window runs from
@@ -142,6 +168,12 @@
 #       # more. fresh_at carries the edit time; consumers needing head
 #       # identity read head_sha, never a timestamp.
 #       "endpoint": "issues" | "pulls" | "reviews",
+#       # "reviews" evidence only (#875 round 2, additive): the object's
+#       # own submitted_at — the same instant created_at carries on that
+#       # endpoint, named explicitly so the Phase 4b barrier's temporal
+#       # conjunct (probe.context_updated_at at-or-after this) reads a
+#       # field whose meaning cannot drift with the endpoint.
+#       "submitted_at": "<iso-8601>",
 #       "body_excerpt": "<first 200 chars>"
 #     },
 #     "potential_issue_count": N,
@@ -182,7 +214,28 @@
 #       # it would be a contract nobody can meet.
 #       "observed": "none" | "rate_limit" | "paused" | "in_progress"
 #                   | "summary-without-head-review" | "awaiting-summary"
-#                   | "terminal"
+#                   | "terminal",
+#       # The per-SHA CodeRabbit StatusContext state on the HEAD
+#       # (success|failure|pending|error|missing), sampled ONLY when the
+#       # rc-7 verdict carries a HEAD-pinned review object (endpoint
+#       # "reviews") and trust_status_context_for_clearance is true; null
+#       # otherwise (#869 / P1 on #875). The Phase 4b barrier requires
+#       # "success" here before counting rc-7 review-object evidence as
+#       # reported: a bare just-posted review object can precede a PR-level
+#       # summary that carries the ONLY blocking marker (#535), and the
+#       # per-SHA success is what discriminates the wedged-but-complete
+#       # #866 state from that mid-publication one.
+#       "context_state": null | "success" | "failure" | "pending"
+#                        | "error" | "missing",
+#       # The refresh time of that same status (#875 round 2), sampled and
+#       # nulled together with context_state. The barrier additionally
+#       # requires this to be at-or-after the evidence object's
+#       # submitted_at (emitted as review.submitted_at on the rc-7
+#       # reviews-endpoint evidence): on a same-SHA rerun the statuses
+#       # endpoint still exposes the PREVIOUS run's success while the new
+#       # object's summary and status refresh are pending, and a success
+#       # predating the object belongs to a different run.
+#       "context_updated_at": null | "<iso-8601>"
 #     },
 #     "codex_failover_requested": true | false,
 #     "waited_seconds": N
@@ -769,9 +822,16 @@ check_status_context_record() {
   # page if non-CodeRabbit statuses crowd it out. `--paginate` plus
   # `jq -s 'add // []'` flattens all pages into a single array before
   # the context+creator filter runs.
+  #
+  # `updated_at` (#875 round 2, additive): the newest status' refresh time,
+  # used by the temporal-correlation checks (head_completion_corroborated
+  # and probe.context_updated_at). The REST API cannot update a commit
+  # status in place — each run POSTs a new status object — so updated_at
+  # and created_at coincide in practice; the `// .created_at` fallback
+  # keeps the field meaningful if a proxy strips one of them.
   resp=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/statuses" 2>/dev/null \
     | jq -s 'add // []' 2>/dev/null) || {
-    jq -nc '{state: "missing", created_at: ""}'
+    jq -nc '{state: "missing", created_at: "", updated_at: ""}'
     return
   }
   echo "$resp" | jq -c --arg bot "$BOT_LOGIN" '
@@ -782,9 +842,10 @@ check_status_context_record() {
     | sort_by(.created_at)
     | last
     | if . == null then
-        {state: "missing", created_at: ""}
+        {state: "missing", created_at: "", updated_at: ""}
       else
-        {state: (.state // "missing"), created_at: (.created_at // "")}
+        {state: (.state // "missing"), created_at: (.created_at // ""),
+         updated_at: (.updated_at // .created_at // "")}
       end
   '
 }
@@ -967,22 +1028,206 @@ parse_rate_limit_window() {
   return 1
 }
 
+# #869: completion evidence in an actions-performed reply. CodeRabbit edits
+# its reply to a review command in place: the "Actions performed" block flips
+# to "Full review finished." when the triggered review completes, and when
+# that review consumed the last allowance unit the fair-use limit note —
+# carrying RATE_LIMIT_MARKER — is appended to the SAME comment ("Your
+# included review limit is currently reached under our Fair Usage Limits...",
+# observed live on #866). The limit note describes the NEXT review's
+# availability, not this review's outcome, so a body stating its review
+# FINISHED is a completed/terminal review signal — PROVIDED head-anchored
+# corroboration exists (head_completion_corroborated below; P1 on #875) —
+# never rate_limit.
+# Conjunctive on purpose: a comment that is ONLY a limit notice carries no
+# actions-performed block and no "finished" claim, so genuine rate-limit
+# detection (the #714/#489 paths) is untouched; and "Full review triggered."
+# — the pre-completion wording of the same block — states no completion and
+# still defers to an appended notice.
+comment_states_review_finished() {
+  printf '%s' "$1" | grep -qiE 'actions performed' \
+    && printf '%s' "$1" | grep -qiE 'review finished'
+}
+
+# Strict at-or-after for the corroboration ordering below (#875 round 2):
+# returns 0 iff `a >= b`. Unlike iso_on_or_after / iso_within_seconds_after
+# — which fail OPEN because they guard suppressions — this one FAILS CLOSED
+# on empty or unparseable input: corroboration must never be granted on a
+# timestamp that cannot be read.
+iso_on_or_after_strict() {
+  local a=$1 b=$2
+  [ -n "$a" ] && [ -n "$b" ] || return 1
+  jq -en --arg a "$a" --arg b "$b" \
+    '($a | fromdateiso8601) >= ($b | fromdateiso8601)' >/dev/null 2>&1
+}
+
+# #875 P1-b guard: the finished-review claim lives in a comment BODY, and a
+# body carries no head identity. With a cherry-picked / old-committer-date
+# new head the wallclock freshness floor (HEAD_ANCHOR layer 2) admits the
+# PRIOR head's finished comment into every scan, so an unanchored
+# completion-beats-notice rule would read that stale completion as terminal
+# for a head CodeRabbit never reviewed — masking a GENUINE current rate
+# limit. The completion claim therefore takes effect only when corroborated
+# by head-anchored evidence that the claim TEMPORALLY FOLLOWS (#875 round
+# 2): co-presence is not correlation — CodeRabbit can post the NEW head's
+# review object while the PRIOR head's finished reply is still inside the
+# freshness floor, and evidence that postdates a claim cannot be what the
+# claim was reporting on. A completion statement always follows its own
+# review, so the ordering conjunct is `claim at-or-after evidence`:
+#
+#   1. a CodeRabbit review object whose commit_id equals the current HEAD —
+#      GitHub-owned and immutable, the same head-identity claim the probe's
+#      primary evidence makes (anchor-free on purpose: commit_id IS head
+#      identity, strictly stronger than any wallclock proxy) — AND the
+#      claim's fresh_at is at-or-after the NEWEST such object's
+#      submitted_at. The NEWEST, not any: on a same-head re-review round
+#      the round-1 finished reply predates the round-2 object, and its
+#      claim must not ride round 1's object past round 2's pending
+#      publication. When an object exists its ordering is AUTHORITATIVE —
+#      leg 2 is not consulted as a second chance, or a stale success from
+#      the earlier run would resurrect exactly the claim leg 1 just
+#      rejected. Or, only when no head-pinned object exists:
+#   2. the per-SHA CodeRabbit StatusContext reading `success` on the HEAD —
+#      consulted only when trust_status_context_for_clearance is true, the
+#      same policy switch that governs every other status-driven clearance
+#      in this script — AND the claim's fresh_at is at-or-after that
+#      status' updated_at. This leg covers the #851 shape where a clean
+#      incremental re-review posts no review object at all.
+#
+# The claim timestamp is the comment's fresh_at (max of created_at /
+# updated_at), NOT created_at: CodeRabbit CREATES the actions reply when it
+# acknowledges the command — before the review runs — and EDITS it to
+# "finished" after the review completes (the #866 mechanics), so the
+# genuine completed shape has created_at BEFORE its own review object and
+# only the edit time carries when the completion was actually stated. A
+# created_at ordering would reject the exact live shape #869 fixed.
+#
+# Uncorroborated — including a claim that PREDATES the head evidence, and a
+# call with no readable claim timestamp — classify_comment falls through to
+# whatever class the body would have had before #869 (rate_limit when the
+# limit marker is present), keeping the #714/#489 rate-limit machinery
+# intact for the prior-head shape.
+#
+# Residual exposure, stated plainly: CodeRabbit can flip a SPURIOUS per-SHA
+# success ~1s after declining a request as rate-limited (#595/#596). For leg
+# 2 to false-corroborate, that spurious flip would have to land on the NEW
+# head BEFORE the stale finished reply's last edit while that reply is still
+# the NEWEST bot comment in the scan — but the notice that accompanies the
+# spurious flip is itself a newer bot comment carrying no finished claim, so
+# it out-selects the stale comment in the newest-first scans and classifies
+# rate_limit; and if CodeRabbit instead appends that notice to the stale
+# reply itself, the edit that bumps fresh_at past the status also puts the
+# fresh limit note in the body. Named here so a reader weakening any
+# conjunct knows what stands behind it.
+#
+# Callers run inside command substitutions, so memoization cannot persist
+# across calls — the probe instead pre-seeds CR_HEAD_REVIEW_OBJECT_PRESENT
+# and CR_HEAD_REVIEW_OBJECT_SUBMITTED_AT from the head-pinned selection it
+# has already made (true → only the ordering check runs, no extra read;
+# false → a SUCCESSFUL probe lookup already proved zero head objects, so
+# only leg 2 is consulted — the probe dies rc 3 before seeding on a failed
+# fetch, so the hint never launders an outage into that proof).
+#
+# The reviews lookup has THREE outcomes, and they are deliberately not
+# collapsed (P1 round 3 on #875): (a) lookup FAILED — corroboration is
+# denied outright and leg 2 is NOT consulted, because "no object" was
+# never established and on a same-SHA rerun the statuses endpoint still
+# exposes the PREVIOUS run's success, which would corroborate exactly the
+# stale claim the unavailable object ordering exists to reject; (b) lookup
+# succeeded with NO head object — leg 2 may be consulted under its own
+# ordering rule; (c) lookup succeeded with an object — the object ordering
+# is authoritative. Every failure direction degrades to the pre-#869
+# classification, never to a clear.
+# Shared lookup for the #875 machinery: the submitted_at of the NEWEST
+# CodeRabbit review object pinned to the current HEAD by commit_id.
+# Returns 0 with the timestamp on stdout, 0 with EMPTY stdout when the
+# lookup succeeded and confirmed no head object, and non-zero when the
+# lookup itself failed (fetch error or unreadable payload) — callers must
+# keep those last two apart (the three-outcome rule below).
+newest_head_pinned_review_submitted_at() {
+  local reviews out
+  reviews=$(fetch_api_array_best_effort "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews (head completion evidence)") || return 1
+  out=$(printf '%s' "$reviews" | jq -r --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
+    [ .[] | select(.user.login == $bot) | select(.commit_id == $sha)
+      | (.submitted_at // empty) ] | max // empty' 2>/dev/null) || return 1
+  printf '%s' "$out"
+}
+
+head_completion_corroborated() {
+  local comment_at=${1:-} newest ctx_record ctx_state ctx_at
+  # No claim timestamp means no ordering is checkable — fail closed.
+  [ -n "$comment_at" ] || return 1
+  case "${CR_HEAD_REVIEW_OBJECT_PRESENT:-}" in
+    true)
+      iso_on_or_after_strict "$comment_at" "${CR_HEAD_REVIEW_OBJECT_SUBMITTED_AT:-}"
+      return
+      ;;
+    false) : ;;  # outcome (b) via the probe's own successful lookup
+    *)
+      # Outcome (a): a failed fetch or an unreadable payload means the
+      # object question is UNANSWERED — deny, and do not let leg 2 stand
+      # in for the ordering that could not be evaluated.
+      newest=$(newest_head_pinned_review_submitted_at) || return 1
+      if [ -n "$newest" ]; then
+        # Outcome (c): a head-pinned object exists — its ordering is
+        # authoritative.
+        iso_on_or_after_strict "$comment_at" "$newest"
+        return
+      fi
+      # Outcome (b): confirmed zero head objects — fall through to leg 2.
+      ;;
+  esac
+  [ "$TRUST_STATUS_CONTEXT" = "true" ] || return 1
+  ctx_record=$(check_status_context_record)
+  ctx_state=$(printf '%s' "$ctx_record" | jq -r '.state // "missing"' 2>/dev/null) || return 1
+  ctx_at=$(printf '%s' "$ctx_record" | jq -r '.updated_at // ""' 2>/dev/null) || return 1
+  [ "$ctx_state" = "success" ] || return 1
+  iso_on_or_after_strict "$comment_at" "$ctx_at"
+}
+
 # Classify a CodeRabbit comment body. Emits one of:
 #   rate_limit | paused | in_progress | status_probe | review
+#
+# The optional second argument is the comment's fresh_at (max of
+# created_at / updated_at) — the time the body's content was last stated.
+# It feeds ONLY the #869/#875 finished-review corroboration ordering below;
+# every other classification is timestamp-free, and callers that cannot
+# supply it simply forgo the finished-review precedence (fail closed).
 classify_comment() {
-  local body=$1
+  local body=$1 comment_fresh_at=${2:-} review_finished=false
+  # #869 precedence: completion evidence beats an appended limit notice, so
+  # the two rate-limit checks below are bypassed for a finished-review body —
+  # but only a CORROBORATED one (P1 on #875): the body carries no head
+  # identity, so the completion claim counts only alongside head-anchored
+  # evidence the claim temporally FOLLOWS (a review object pinned to the
+  # current HEAD, or the per-SHA StatusContext success, each ordered
+  # against the claim's fresh_at — see head_completion_corroborated).
+  # Scoped narrowly — the paused / in-progress MARKER checks keep their
+  # precedence (a durable pause or a mid-review state on the same body must
+  # still win, fail-closed), and a corroborated finished body that matches
+  # nothing stronger classifies `review` explicitly before the
+  # narration/prose fallbacks so an appended note's wording cannot demote
+  # it. An UNCORROBORATED finished body — no head evidence, or evidence the
+  # claim predates — takes the class it would have had before #869 —
+  # rate_limit when the limit marker is present — keeping the #714/#489
+  # rate-limit machinery intact for the prior-head shape.
+  if comment_states_review_finished "$body" && head_completion_corroborated "$comment_fresh_at"; then
+    review_finished=true
+  fi
   # #593: key on the stable auto-generated marker FIRST, before any prose
   # match, so a rate-limit notice is recognized regardless of CodeRabbit's
   # user-facing wording ("Rate limit exceeded" vs "Review limit reached" /
   # "Fair Usage Limits"). Fixed-string grep (-F) so the literal dots in
   # "coderabbit.ai" are not treated as regex wildcards, mirroring PAUSED_MARKER.
-  if printf '%s' "$body" | grep -Fqi "$RATE_LIMIT_MARKER"; then
+  if [ "$review_finished" != true ] \
+     && printf '%s' "$body" | grep -Fqi "$RATE_LIMIT_MARKER"; then
     echo "rate_limit"
     return
   fi
   # Legacy prose fallback: the original notice text, retained so a notice that
   # somehow lacks the marker (or an older cached body) still classifies.
-  if echo "$body" | grep -qiE 'rate[- ]limit exceeded'; then
+  if [ "$review_finished" != true ] \
+     && echo "$body" | grep -qiE 'rate[- ]limit exceeded'; then
     echo "rate_limit"
     return
   fi
@@ -1004,6 +1249,15 @@ classify_comment() {
   # and narration second, and no observed body carries both.
   if printf '%s' "$body" | grep -Fqi "$IN_PROGRESS_MARKER"; then
     echo "in_progress"
+    return
+  fi
+  # #869: a corroborated finished-review body that carries neither a pause
+  # nor a mid-review marker is terminal NOW, before the narration and prose
+  # fallbacks — the appended limit note (or any future wording CodeRabbit
+  # bolts onto the same reply) must not be able to demote a stated
+  # completion to narration or in_progress.
+  if [ "$review_finished" = true ]; then
+    echo "review"
     return
   fi
   # CodeRabbit's free-form command replies, including
@@ -1307,12 +1561,59 @@ summary_body_has_potential_issue_marker() {
     | last
     | (.body // "")
   ')
+  # #875 rounds 5–6: a finished ACTIONS reply can be the newest bot comment
+  # — posted after, or edited after, the real summary — and it structurally
+  # carries no findings, so inspecting IT would clear past a blocking
+  # marker carried solely by the genuine summary. The reply attests
+  # terminality, never marker material: when the newest body is a finished
+  # attestation, re-select through polling_head_summary_body — by MARKER
+  # IDENTITY with the head-anchored at-or-after floor — never by
+  # newest-first position or by the wallclock anchor alone (round 6: the
+  # bare-anchor re-selection could pick a PRIOR head summary that slipped
+  # inside the freshness window). An empty selection means there is no
+  # summary-level material to inspect; both live callers pre-gate that
+  # state (the poll loop keeps polling, the probe-wait boundary stays an
+  # advisory timeout), so this branch decides only the one-poll-cycle race
+  # where a fresh attestation lands between the caller's scan and this
+  # fetch. The inline count (this helper's OR-sibling) still owns inline
+  # findings.
+  if comment_states_review_finished "$latest_body"; then
+    latest_body=$(polling_head_summary_body || true)
+  fi
   # Through the shared helper, not a raw grep: the pre-merge check table's
   # hygiene `⚠️ Warning` rows are not findings, and the probe already reads
   # them that way — a raw grep here made the SAME body a `findings` verdict in
   # polling and a `reported` one in probe, so agent-review and the Phase 4b
   # barrier disagreed about one head (adversarial verification on #851).
   summary_blocking_marker_present "$latest_body"
+}
+
+# #875 round 6: the genuine head-anchored summarize-marker summary body for
+# POLLING verdicts, or empty when none qualifies. Selection is by marker
+# identity (the summarize marker at byte 0 — CodeRabbit keeps exactly one
+# such comment per PR and edits it in place) AND by a head-anchored
+# at-or-after ordering floor: the NEWEST head-pinned review object's
+# submitted_at when one exists — a summary last refreshed BEFORE that
+# object was written for a PRIOR head or run, however recently the
+# wallclock freshness window admitted it — else HEAD_ANCHOR, the polling
+# mode's ordinary freshness floor. Every lookup failure fails closed to
+# empty (no verdict material; the caller keeps polling or stays on the
+# advisory timeout), never to a stale selection.
+polling_head_summary_body() {
+  local object_at floor issue_comments
+  object_at=$(newest_head_pinned_review_submitted_at) || return 1
+  floor=${object_at:-$HEAD_ANCHOR}
+  issue_comments=$(fetch_api_array_best_effort "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (head summary selection)") || return 1
+  printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg floor "$floor" --arg m "$SUMMARY_MARKER" '
+    [ .[]
+      | select(.user.login == $bot)
+      | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
+      | select(.fresh_at >= $floor)
+      | select((.body // "") | startswith($m)) ]
+    | sort_by(.fresh_at)
+    | last
+    | (.body // "")
+  ' 2>/dev/null || return 1
 }
 
 # SHA-scoped variant of count_potential_issues, used by the StatusContext
@@ -1444,7 +1745,10 @@ status_context_fast_path_blocked_by_comment() {
     return 1
   fi
 
-  class=$(classify_comment "$(echo "$latest" | jq -r '.body')")
+  # fresh_at rides along for the #869/#875 finished-review corroboration
+  # ordering; the rate_limit/paused/in_progress arms below are unaffected.
+  class=$(classify_comment "$(echo "$latest" | jq -r '.body')" \
+    "$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at // empty')")
   case "$class" in
     rate_limit|paused|in_progress)
       # #490: `paused` joins rate_limit/in_progress here. An auto-pause NOTE
@@ -1713,24 +2017,38 @@ find_status_probe_reply() {
 }
 
 emit_terminal_review_after_probe_if_present() {
-  local latest class potential_issues review_json
+  local latest class potential_issues review_json vbody=""
   latest=$(scan_latest_comment_best_effort)
   if [ "$(echo "$latest" | jq 'length')" = "0" ]; then
     return 0
   fi
 
-  class=$(classify_comment "$(echo "$latest" | jq -r '.body')")
+  class=$(classify_comment "$(echo "$latest" | jq -r '.body')" \
+    "$(echo "$latest" | jq -r '.fresh_at // .updated_at // .created_at // empty')")
   case "$class" in
     review)
+      # #875 round 6: the same attestation rule as the poll loop. At the
+      # probe-wait boundary a finished attestation without the genuine
+      # head-anchored summary keeps the ADVISORY timeout (rc 4) instead of
+      # clearing on a verdict body that has not published.
+      if comment_states_review_finished "$(echo "$latest" | jq -r '.body')"; then
+        vbody=$(polling_head_summary_body || true)
+        if [ -z "$vbody" ]; then
+          log "finished attestation without a genuine head-anchored summary at the probe-wait boundary — continuing to advisory timeout"
+          return 0
+        fi
+      fi
       potential_issues=$(count_potential_issues)
       review_json=$(echo "$latest" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
       # #535: also honor a PR-level summary-body marker (the inline count
       # scans only pulls/{pr}/comments) so the probe-wait clearance path
-      # cannot false-clear over a summary-only finding either.
+      # cannot false-clear over a summary-only finding either. On the
+      # attestation path the marker is read from the SELECTED summary.
       if [ "$potential_issues" -gt 0 ]; then
         log "CodeRabbit review landed during status-probe wait with $potential_issues Potential issue/⚠️ marker(s) — emitting findings (exit 2)"
         emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
-      elif summary_body_has_potential_issue_marker; then
+      elif { [ -n "$vbody" ] && summary_blocking_marker_present "$vbody"; } \
+        || { [ -z "$vbody" ] && summary_body_has_potential_issue_marker; }; then
         log "CodeRabbit review landed during status-probe wait with 0 inline markers but a Potential issue/⚠️ marker in the PR-level summary body — emitting findings (exit 2)"
         emit_json_and_exit "findings" 2 "$review_json" "$potential_issues"
       fi
@@ -1901,6 +2219,21 @@ STATUS_PROBE_RAN=false
 # same additive posture blocking_tier_unresolved takes when it does not apply.
 PROBE_OBSERVED=""
 PROBE_JSON=null
+# Per-SHA StatusContext state and refresh time sampled by the probe's rc-7
+# review-object branch (#869 / P1 on #875); empty (→ null in the JSON)
+# everywhere else, including every polling run and every trust-opted-out
+# policy. The timestamp exists so the barrier can require the success to be
+# at-or-after the review object it corroborates (#875 round 2 — a same-SHA
+# rerun exposes the previous run's success while the new summary is
+# pending).
+PROBE_CONTEXT_STATE=""
+PROBE_CONTEXT_UPDATED_AT=""
+# #875 corroboration hints for head_completion_corroborated: empty PRESENT
+# means unknown (the helper fetches for itself); the probe sets true/false
+# plus the newest head-pinned object's submitted_at from the selection it
+# has already made.
+CR_HEAD_REVIEW_OBJECT_PRESENT=""
+CR_HEAD_REVIEW_OBJECT_SUBMITTED_AT=""
 # #489 rate-limit→Codex failover state. CODEX_FAILOVER_FIRED latches after the
 # first attempt so retries within a run don't re-post. CODEX_FAILOVER_REQUESTED
 # records whether Codex was actually engaged (the helper posted, or found an
@@ -1954,10 +2287,17 @@ emit_json_and_exit() {
   fi
 
   # --probe (#814): `terminal` covers a probe run that reached a real
-  # verdict (0 / 2 / 6). Null on every polling run.
+  # verdict (0 / 2 / 6). Null on every polling run. context_state and
+  # context_updated_at carry the per-SHA StatusContext (state + refresh
+  # time) sampled by the rc-7 review-object branch (#869 / #875) and are
+  # null on every other path.
   if [ "$PROBE_MODE" = "true" ]; then
     PROBE_JSON=$(jq -nc --arg observed "${PROBE_OBSERVED:-terminal}" \
-      '{mode: true, observed: $observed}')
+      --arg ctx "${PROBE_CONTEXT_STATE:-}" \
+      --arg ctxat "${PROBE_CONTEXT_UPDATED_AT:-}" \
+      '{mode: true, observed: $observed,
+        context_state: (if $ctx == "" then null else $ctx end),
+        context_updated_at: (if $ctxat == "" then null else $ctxat end)}')
   fi
 
   jq -n \
@@ -2127,17 +2467,26 @@ emit_status_context_verdict() {
 # convention, not two independent signals. A reader weakening either conjunct
 # should know there is no third.
 #
-# The StatusContext is deliberately NOT consulted. It is SHA-pinned, but
-# CodeRabbit emits a spurious success shortly after a rate-limit notice (the
-# case status_context_fast_path_blocked_by_comment exists to suppress), so
-# using it as existence evidence would report a head as reviewed when it was
-# not. A silent clean review that posts only a status therefore reads as
-# NOT-YET; the barrier's trigger step then asks for a review explicitly, which
-# always produces a review object, so it self-heals at the cost of one
-# allowance unit rather than by risking a false REPORTED.
+# The StatusContext is deliberately NOT consulted as EXISTENCE evidence. It
+# is SHA-pinned, but CodeRabbit emits a spurious success shortly after a
+# rate-limit notice (the case status_context_fast_path_blocked_by_comment
+# exists to suppress), so using it alone would report a head as reviewed when
+# it was not. A silent clean review that posts only a status therefore reads
+# as NOT-YET; the barrier's trigger step then asks for a review explicitly,
+# which always produces a review object, so it self-heals at the cost of one
+# allowance unit rather than by risking a false REPORTED. Two narrower,
+# CONJUNCTIVE roles are admitted (#869 / P1 on #875), both trust-gated by
+# trust_status_context_for_clearance: corroborating an explicit
+# finished-review claim in a comment body (head_completion_corroborated —
+# the claim exists independently; the status only anchors it to this head),
+# and riding along in the rc-7 JSON as probe.context_state when the evidence
+# is a HEAD-pinned review object, so the Phase 4b barrier can require
+# per-SHA completion before opening on an object whose PR-level summary is
+# still in flight. In both, the status upgrades nothing on its own — it
+# seconds a claim another surface already made.
 probe_emit_verdict() {
-  local reviews review review_at issue_comments cand row body class
-  local summary_body="" newest_class=""
+  local reviews review review_at issue_comments cand row body class ctx_record
+  local summary_body="" newest_class="" rescan_done=false finished_attestation=false
 
   # Both reads are made DIRECTLY here, never through a helper. fetch_api_array
   # signals failure with `die 3`, which inside a command substitution exits
@@ -2154,13 +2503,31 @@ probe_emit_verdict() {
   issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments") \
     || die 3 "failed to fetch issue comments for the probe verdict"
 
+  # `submitted_at` is additive (#875 round 2): the same instant created_at
+  # already carries on this endpoint, but named explicitly so the Phase 4b
+  # barrier's temporal conjunct (context_updated_at at-or-after the object)
+  # reads a field whose meaning cannot drift with the endpoint.
   review=$(printf '%s' "$reviews" | jq -c --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
     [ .[] | select(.user.login == $bot) | select(.commit_id == $sha) ]
     | sort_by(.submitted_at) | last
     | if . == null then empty
-      else {id, created_at: .submitted_at, endpoint: "reviews",
+      else {id, created_at: .submitted_at, submitted_at, endpoint: "reviews",
             body_excerpt: ((.body // "")[0:200])} end
   ') || die 3 "failed to select the HEAD-pinned review"
+
+  # Pre-seed the #875 corroboration hints for every classify_comment call in
+  # this scan: the selection above IS the newest head-pinned review-object
+  # check, so a positive result leaves only the claim-ordering comparison
+  # (no extra read), and a negative one lets head_completion_corroborated
+  # skip the redundant refetch (only the trust-gated StatusContext leg
+  # remains).
+  if [ -n "$review" ]; then
+    CR_HEAD_REVIEW_OBJECT_PRESENT=true
+    CR_HEAD_REVIEW_OBJECT_SUBMITTED_AT=$(printf '%s' "$review" | jq -r '.submitted_at // empty')
+  else
+    CR_HEAD_REVIEW_OBJECT_PRESENT=false
+    CR_HEAD_REVIEW_OBJECT_SUBMITTED_AT=""
+  fi
 
   if [ -n "$review" ]; then
     review_at=$(printf '%s' "$review" | jq -r '.created_at // empty')
@@ -2172,34 +2539,110 @@ probe_emit_verdict() {
     # already-published summary. Anchor-free on purpose — HEAD_ANCHOR carries a
     # moving wall-clock floor that would make a completed publication stop
     # counting once the head had sat long enough.
-    cand=$(printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg at "$review_at" '
-      [ .[] | select(.user.login == $bot)
-        | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
-        | select(.fresh_at >= $at) ]
-      | sort_by(.fresh_at) | reverse | .[] | @base64
-    ') || die 3 "failed to select the review summary"
-    while IFS= read -r row; do
-      [ -z "$row" ] && continue
-      body=$(printf '%s' "$row" | base64 --decode | jq -r '.body // ""')
-      class=$(classify_comment "$body")
-      # Narration replies carry no publication state, and the probe.observed
-      # enum deliberately omits status_probe — the no-review-object triage
-      # drops narration in its jq filter, but this scan classifies every row,
-      # so without this skip a narration reply landing after the review
-      # object leaks `observed: "status_probe"` (#833, seen live on #852).
-      # Skipped, not latched as blank: a pending notice BENEATH the narration
-      # still names the observed state, and no narration hides a published
-      # summary deeper in the scan.
-      [ "$class" = "status_probe" ] && continue
-      [ -n "$newest_class" ] || newest_class="$class"
-      if [ "$class" = "review" ]; then summary_body="$body"; break; fi
-    done <<< "$cand"
+    #
+    # The scan runs in a loop bounded to ONE re-fetch (#875 round 4): the
+    # issue-comments snapshot predates the status read below, so the
+    # summary can land in the gap — emitting the rc-7 success payload from
+    # the stale snapshot would let the barrier open past a just-published
+    # summary that was never scanned (and that can carry the only blocking
+    # marker). After a per-SHA success is observed with the summary still
+    # unseen, the comments are re-fetched once and re-scanned; only a
+    # still-absent summary emits the rc-7 payload.
+    while :; do
+      summary_body=""
+      newest_class=""
+      cand=$(printf '%s' "$issue_comments" | jq -r --arg bot "$BOT_LOGIN" --arg at "$review_at" '
+        [ .[] | select(.user.login == $bot)
+          | . + {fresh_at: ([.created_at, (.updated_at // .created_at)] | max)}
+          | select(.fresh_at >= $at) ]
+        | sort_by(.fresh_at) | reverse | .[] | @base64
+      ') || die 3 "failed to select the review summary"
+      while IFS= read -r row; do
+        [ -z "$row" ] && continue
+        body=$(printf '%s' "$row" | base64 --decode | jq -r '.body // ""')
+        class=$(classify_comment "$body" \
+          "$(printf '%s' "$row" | base64 --decode | jq -r '.fresh_at // empty')")
+        # Narration replies carry no publication state, and the probe.observed
+        # enum deliberately omits status_probe — the no-review-object triage
+        # drops narration in its jq filter, but this scan classifies every row,
+        # so without this skip a narration reply landing after the review
+        # object leaks `observed: "status_probe"` (#833, seen live on #852).
+        # Skipped, not latched as blank: a pending notice BENEATH the narration
+        # still names the observed state, and no narration hides a published
+        # summary deeper in the scan.
+        [ "$class" = "status_probe" ] && continue
+        # #875 round 5: a CORROBORATED finished actions reply classifies
+        # `review`, but it attests TERMINALITY only — it is never
+        # marker-inspection material. Storing it as summary_body would hand
+        # the #535 blocking-marker check a body that structurally carries no
+        # findings, shadowing the REAL summary whenever the reply is newer
+        # (posted after, or edited after) — the newest-first scan would stop
+        # on it and a blocking marker carried solely by the genuine summary
+        # would clear. Skip it WITHOUT latching newest_class (like
+        # narration): the attestation asserts no pending adverse state, and
+        # the scan continues to the real summary, selected by its content
+        # class with attestations excluded — so the reply's position or
+        # edit time cannot out-select the summary it postdates. When no
+        # real summary exists the loop falls through to the
+        # awaiting-summary / rc-7 path (with the round-4 bounded re-fetch),
+        # where the attestation's terminality is carried by the corroborated
+        # status conjuncts the barrier requires, not by a verdict here.
+        if [ "$class" = "review" ] && comment_states_review_finished "$body"; then
+          finished_attestation=true
+          continue
+        fi
+        [ -n "$newest_class" ] || newest_class="$class"
+        if [ "$class" = "review" ]; then summary_body="$body"; break; fi
+      done <<< "$cand"
 
-    if [ -z "$summary_body" ]; then
+      [ -n "$summary_body" ] && break
+
       PROBE_OBSERVED="${newest_class:-awaiting-summary}"
-      log "probe: review object on $HEAD_SHA but no terminal summary yet (newest=${newest_class:-none})"
+      # #869 / P1 on #875: this is the ONE probe state whose rc-7 JSON
+      # carries review-object evidence, and the barrier must not open on
+      # that object alone — the PR-level summary still in flight can carry
+      # the ONLY blocking marker (the #535 summary-only class, e.g. the
+      # auto-pause note). Sample the per-SHA StatusContext — state AND
+      # refresh time — into probe.context_state / probe.context_updated_at
+      # so the barrier can require `success` that is at-or-after this
+      # review object's submitted_at (#875 round 2): on a same-SHA rerun
+      # the statuses endpoint still exposes the PREVIOUS run's success
+      # while the new object's summary and status refresh are pending, and
+      # a success that PREDATES the object it would corroborate belongs to
+      # a different run. Trust-gated by the same policy switch as every
+      # other status read; both fields left null when the policy opts out,
+      # which fails closed at the barrier (not-yet). Sampled once — the
+      # re-scan pass reuses the first sample rather than reading a surface
+      # that postdates it.
+      if [ "$TRUST_STATUS_CONTEXT" = "true" ] && [ -z "$PROBE_CONTEXT_STATE" ]; then
+        ctx_record=$(check_status_context_record)
+        PROBE_CONTEXT_STATE=$(printf '%s' "$ctx_record" | jq -r '.state // "missing"')
+        PROBE_CONTEXT_UPDATED_AT=$(printf '%s' "$ctx_record" | jq -r '.updated_at // ""')
+      fi
+      # #875 round 4 TOCTOU: the success just observed post-dates the
+      # comments snapshot, so the summary may already be up. One re-fetch,
+      # one re-scan; a summary found on the second pass takes the normal
+      # rc-0/rc-2 verdict below instead of the rc-7 evidence. The re-fetch
+      # failing is an infra rc 3 like every other probe read — emitting
+      # the rc-7 success payload after a failed re-fetch would be exactly
+      # the unscanned-summary hazard this loop exists to close.
+      if [ "$PROBE_CONTEXT_STATE" = "success" ] && [ "$rescan_done" != true ]; then
+        rescan_done=true
+        log "probe: per-SHA success observed while the summary is unseen — re-fetching issue comments once (#875 round 4)"
+        issue_comments=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "issue comments (post-success re-scan)") \
+          || die 3 "failed to re-fetch issue comments for the post-success re-scan"
+        continue
+      fi
+      log "probe: review object on $HEAD_SHA but no terminal summary yet (newest=${newest_class:-none}, finished_attestation=$finished_attestation, context_state=${PROBE_CONTEXT_STATE:-unsampled}, context_updated_at=${PROBE_CONTEXT_UPDATED_AT:-unsampled})"
       probe_not_yet "$PROBE_OBSERVED" "$review"
-    fi
+    done
+
+    # A published summary is the verdict source, not the rc-7 payload —
+    # clear the rc-7-only status fields (possibly sampled on a first pass
+    # of the loop above) so the documented contract holds: context_state /
+    # context_updated_at are null on every non-rc-7 path.
+    PROBE_CONTEXT_STATE=""
+    PROBE_CONTEXT_UPDATED_AT=""
 
     # The one verdict this mode does make, and only because nothing else can.
     # A blocking finding carried SOLELY by the PR-level summary (#535) is
@@ -2244,7 +2687,8 @@ probe_emit_verdict() {
   if [ -n "$cand" ]; then
     body=$(printf '%s' "$cand" | base64 --decode | jq -r '.body')
     latest_json=$(printf '%s' "$cand" | base64 --decode | jq -r '.json')
-    newest_class=$(classify_comment "$body")
+    newest_class=$(classify_comment "$body" \
+      "$(printf '%s' "$latest_json" | jq -r '.fresh_at // empty')")
     case "$newest_class" in
       in_progress|rate_limit|paused)
         probe_not_yet "$newest_class" "$latest_json"
@@ -2296,7 +2740,7 @@ probe_emit_verdict() {
     #                         ships next. Fail-closed by construction.
     #   head SHA present      a prior head's summary (#789), however recently
     #                         a Finishing-Touches checkbox edit bumped it.
-    if [ "$(classify_comment "$sbody")" = "review" ] \
+    if [ "$(classify_comment "$sbody" "$(printf '%s' "$summary" | base64 --decode | jq -r '(.json | fromjson).fresh_at // empty')")" = "review" ] \
        && summary_stanzas_all_benign "$sbody" \
        && summary_names_head "$sbody" "$HEAD_SHA"; then
       sjson=$(printf '%s' "$summary" | base64 --decode | jq -r '.json')
@@ -2486,7 +2930,7 @@ while :; do
   COMMENT_CREATED=$(echo "$LATEST" | jq -r '.created_at')
   COMMENT_FRESH_AT=$(echo "$LATEST" | jq -r '.fresh_at // .updated_at // .created_at')
 
-  CLASS=$(classify_comment "$COMMENT_BODY")
+  CLASS=$(classify_comment "$COMMENT_BODY" "$COMMENT_FRESH_AT")
   log "latest CodeRabbit comment id=$COMMENT_ID endpoint=$COMMENT_ENDPOINT class=$CLASS created=$COMMENT_CREATED fresh_at=$COMMENT_FRESH_AT"
 
   case "$CLASS" in
@@ -2615,15 +3059,38 @@ while :; do
       continue
       ;;
     review)
+      # #875 round 6: a corroborated finished ACTIONS reply is terminality
+      # evidence, never a verdict body — the round-5 rule applied to the
+      # polling arm. When the newest comment is a finished attestation the
+      # rc-0/rc-2 verdict must be decided on the genuine head-anchored
+      # summarize-marker summary: with NONE published yet the poll
+      # CONTINUES (clearing here would emit rc 0 before a summary that can
+      # carry the sole blocking marker, #535, publishes), bounded by the
+      # existing max_wait_seconds timeout semantics; and a summary whose
+      # ordering places it with a PRIOR head — refreshed before the newest
+      # head-pinned review object — is never selected, however recently
+      # the wallclock freshness window admitted it.
+      VERDICT_SUMMARY_BODY=""
+      if comment_states_review_finished "$COMMENT_BODY"; then
+        VERDICT_SUMMARY_BODY=$(polling_head_summary_body || true)
+        if [ -z "$VERDICT_SUMMARY_BODY" ]; then
+          log "finished attestation is the newest comment but no genuine head-anchored summary has published — verdict body missing; sleeping ${POLL_INTERVAL_SECONDS}s"
+          sleep_or_timeout "$POLL_INTERVAL_SECONDS"
+          continue
+        fi
+      fi
       POTENTIAL_ISSUES=$(count_potential_issues)
       REVIEW_JSON=$(echo "$LATEST" | jq '{id, created_at, endpoint, body_excerpt: (.body[0:200])}')
       # #535: the inline count scans only pulls/{pr}/comments. Also honor a
       # PR-level summary-body marker so a finding surfaced solely in the
-      # summary body still yields findings instead of false-clearing.
+      # summary body still yields findings instead of false-clearing. On
+      # the attestation path the marker is read from the SELECTED summary;
+      # otherwise from the newest-body helper as before.
       if [ "$POTENTIAL_ISSUES" -gt 0 ]; then
         log "CodeRabbit review posted with $POTENTIAL_ISSUES Potential issue/⚠️ markers"
         emit_json_and_exit "findings" 2 "$REVIEW_JSON" "$POTENTIAL_ISSUES"
-      elif summary_body_has_potential_issue_marker; then
+      elif { [ -n "$VERDICT_SUMMARY_BODY" ] && summary_blocking_marker_present "$VERDICT_SUMMARY_BODY"; } \
+        || { [ -z "$VERDICT_SUMMARY_BODY" ] && summary_body_has_potential_issue_marker; }; then
         log "CodeRabbit review posted with 0 inline markers but a Potential issue/⚠️ marker in the PR-level summary body — findings"
         emit_json_and_exit "findings" 2 "$REVIEW_JSON" "$POTENTIAL_ISSUES"
       else
