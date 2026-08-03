@@ -34,9 +34,12 @@ on:
     # merge-clearance-recheck kept verbatim (#658 lane reaches this file
     # unchanged); required-check-republish covers all three on a named PR.
     types: [merge-clearance-recheck, required-check-republish]
-  schedule:
-    # One sweep for all three; coexists with the per-gate sweeps until PR 4.
-    - cron: "*/15 * * * *"
+  # NO schedule of its own until PR 4 (cross-agent round 11): the Merge
+  # Clearance Gate's */15 cron already reaches this file through the
+  # workflow_run chain — a schedule-parent delivery whose head matches no
+  # open PR degrades to a full-coverage pass below — so an own cron would
+  # run a SECOND full pass every interval. PR 4 re-adds it in the same
+  # diff that deletes the gate workflows' schedules.
   # NO workflow_dispatch: a manual dispatch executes the SELECTED ref's copy
   # of this file, so a PR branch could be run with checks: write — the P1a
   # hole this file exists to close (cross-agent P1 on #867). The operator
