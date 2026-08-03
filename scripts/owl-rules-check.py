@@ -48,7 +48,14 @@ def closure(*paths):
     """Parse the given Turtle files into one graph and expand its OWL-RL closure."""
     g = rdflib.Graph()
     for p in paths:
-        g.parse(p, format="turtle")
+        try:
+            g.parse(p, format="turtle")
+        except (BadSyntax, ParserError) as e:
+            # Parse errors only: file I/O and unexpected exceptions propagate.
+            # BadSyntax embeds multi-line source excerpts; normalize to one line.
+            detail = " ".join(str(e).split())[:300]
+            print(f"owl-rules-check: failed to parse {p}: {detail}")
+            sys.exit(2)
     owlrl.DeductiveClosure(owlrl.OWLRL_Semantics).expand(g)
     return g
 
@@ -82,6 +89,9 @@ def report_pass(name, ok, detail=""):
 def main():
     # Usage and fixture-presence errors report BEFORE the dependency soft-pass,
     # so a bad invocation or a gutted checkout can never ride the SKIP to 0.
+    if len(sys.argv) > 2:
+        print(__doc__)
+        return 2
     mode = sys.argv[1] if len(sys.argv) > 1 else "--check"
     if mode not in ("--check", "--report"):
         print(__doc__)
@@ -91,10 +101,12 @@ def main():
             print(f"owl-rules-check: missing {p}")
             return 2
 
-    global rdflib, RDF, OWL, MP, ERR, owlrl
+    global rdflib, RDF, OWL, MP, ERR, owlrl, BadSyntax, ParserError
     try:
         import rdflib
         from rdflib import RDF, OWL, Namespace
+        from rdflib.exceptions import ParserError
+        from rdflib.plugins.parsers.notation3 import BadSyntax
         import owlrl
     except ImportError:
         print("owl-rules-check: SKIP (rdflib/owlrl not installed; pip install rdflib owlrl)")

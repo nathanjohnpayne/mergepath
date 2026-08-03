@@ -36,6 +36,9 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/owlvenv"
           "$RUNNER_TEMP/owlvenv/bin/pip" install --quiet 'rdflib==7.6.0' 'owlrl==7.6.2'
 
+      - name: CLI-contract tests (usage, load-error, soft-pass exits)
+        run: OWL_CHECK_PYTHON="$RUNNER_TEMP/owlvenv/bin/python" ./tests/test_owl_rules_check_cli.sh
+
       - name: Run the OWL rules checker
         # Enforcing: fails CI when the TBox is inconsistent, the control world
         # is flagged, any seeded violation goes uncaught, or the seeded
