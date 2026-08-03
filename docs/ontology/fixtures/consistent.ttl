@@ -1,0 +1,59 @@
+@prefix mp:   <https://github.com/nathanjohnpayne/mergepath/ontology#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+##############################################################################
+# Consistent control — a correct world modeled on a real merged PR
+# (mergepath#863). Includes the deliberately-legal edge cases the axioms must
+# NOT flag: under-threshold self-approval, a same-head clearance, a canonical
+# doc propagating to a consumer, and an identity doc carried by a TEMPLATED
+# entry. The checker asserts the reasoner finds nothing here.
+##############################################################################
+
+mp:claudeAgent rdf:type mp:Agent .
+mp:nathanjohnpayne rdf:type mp:AuthorIdentity .
+mp:nathanpayneClaude rdf:type mp:ReviewerIdentity .
+mp:swipewatch rdf:type mp:Consumer .
+mp:mergepathHub rdf:type mp:Hub .
+mp:commitFinal rdf:type mp:Commit .
+
+### An under-threshold PR: same-agent approval is the intended path (R-14),
+### merged by the author identity, clearance anchored to its actual head,
+### every thread resolved, no failing required checks asserted.
+mp:pr863 rdf:type mp:UnderThresholdPR , mp:MergedPR ;
+    mp:authoredByAgent mp:claudeAgent ;
+    mp:approvedByAgent mp:claudeAgent ;
+    mp:mergedBy mp:nathanjohnpayne ;
+    mp:prHead mp:commitFinal ;
+    mp:mergeClearedBy mp:clearance863 ;
+    mp:hasThread mp:settledThread .
+
+mp:clearance863 rdf:type mp:Clearance ;
+    mp:anchorsCommit mp:commitFinal .
+
+mp:settledThread rdf:type mp:ResolvedThread .
+
+### A workflow removing needs-external-review — the sanctioned carve-out,
+### performed by one of the two enumerated sanctioned automations.
+mp:sanctionedAutoClear rdf:type mp:LabelRemoval ;
+    mp:performedBy mp:autoClearBlockingLabelsWorkflow ;
+    mp:removesLabel mp:needsExternalReview .
+
+### A canonical doc propagating to a consumer — normal propagation.
+mp:sharedRulesDoc rdf:type mp:CanonicalDoc ;
+    mp:hasOwnershipClass mp:canonicalClass ;
+    mp:propagatedTo mp:swipewatch ;
+    mp:carriedBy mp:sharedRulesEntry .
+mp:sharedRulesEntry rdf:type mp:CanonicalEntry .
+
+### An identity doc carried by a TEMPLATED entry — the sanctioned escape (G-78).
+mp:eslintIdentityDoc rdf:type mp:IdentityDoc ;
+    mp:carriedBy mp:eslintTemplateEntry .
+mp:eslintTemplateEntry rdf:type mp:TemplatedEntry .
+
+### A human resolving a human-authored thread — allowed.
+mp:humanResolution rdf:type mp:ThreadResolution ;
+    mp:performedBy mp:ownerHuman ;
+    mp:resolvesThread mp:ownerQuestion .
+mp:ownerHuman rdf:type mp:HumanActor .
+mp:ownerQuestion rdf:type mp:HumanAuthoredThread .
