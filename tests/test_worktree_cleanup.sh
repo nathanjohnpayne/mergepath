@@ -671,6 +671,35 @@ if git branch -vv | grep -F -- "$STALE_UNPRUNED_BRANCH" | grep -q ': gone\]'; th
   fail "fixture setup: expected $STALE_UNPRUNED_BRANCH to NOT be marked gone yet"
 fi
 
+# ── Case 22 (#892): WORKTREE attached to a branch with an unpruned ref ──
+# PR #892's own regression: the branch-attached WORKTREE classification
+# (not the bare-local-branch sweep exercised by case 21) checked
+# is_gone_branch() alone, so a worktree whose branch's remote-tracking ref
+# is genuinely stale-but-unpruned never appeared in --dry-run at all — while
+# --apply's leading `git fetch --prune origin` made the SAME branch `gone`
+# and removed the worktree. Reproduces the PR's own demonstration fixture:
+# a worktree whose only content is gitignored (so removal is provably safe)
+# checked out on a stale-unpruned branch. Same "no fetch --prune afterward"
+# constraint as case 21 — must stay the deleted-server-side-only shape.
+STALE_WT_BRANCH="stale-unpruned-worktree-branch"
+git branch "$STALE_WT_BRANCH"
+git push -q -u origin "$STALE_WT_BRANCH"
+STALE_WT="$WORKDIR/stale-unpruned-wt"
+git worktree add -q "$STALE_WT" "$STALE_WT_BRANCH"
+STALE_WT_CANARY="$STALE_WT/.env"
+echo "SECRET=nowhere-else" > "$STALE_WT_CANARY"
+git --git-dir="$REMOTE" branch -D "$STALE_WT_BRANCH"
+# Deliberately NO `git fetch --prune` here — that omission is the bug.
+if git branch -vv | grep -F -- "$STALE_WT_BRANCH" | grep -q ': gone\]'; then
+  fail "fixture setup: expected $STALE_WT_BRANCH to NOT be marked gone yet"
+fi
+# Sanity-check the ignored-content premise (mirrors case 17): plain
+# --porcelain must be silent, otherwise the fixture proves nothing about
+# gitignored content surviving a provably-safe removal.
+if [ -n "$(git -C "$STALE_WT" status --porcelain)" ]; then
+  fail "fixture setup: expected plain --porcelain to be EMPTY for the ignored-only stale-unpruned worktree"
+fi
+
 # ── gh stub on PATH ───────────────────────────────────────────────────
 STUB_DIR="$WORKDIR/stub-bin"
 mkdir -p "$STUB_DIR"
@@ -1192,6 +1221,42 @@ else
   fail "#822 dry-run mutated refs: stale remote-tracking ref for $STALE_UNPRUNED_BRANCH is gone"
 fi
 
+# Case 22 (#892): the WORKTREE on a stale-unpruned branch must be surfaced in
+# --dry-run — the actual regression fixed here was that it was silently
+# omitted (no record at all) despite --apply going on to remove it.
+if echo "$OUT" | grep -q -- "$STALE_WT"; then
+  pass "#892 stale-unpruned worktree is reported in dry-run (never silently omitted)"
+else
+  fail "#892 stale-unpruned worktree missing from dry-run output entirely (silent-omission regression)"
+  show_out_on_fail
+fi
+if echo "$OUT" | grep -q "STALE gone-upstream" \
+   && echo "$OUT" | grep -q -- "$STALE_WT"; then
+  pass "#892 stale-unpruned worktree classified as STALE gone-upstream"
+else
+  fail "#892 stale-unpruned worktree not classified as STALE gone-upstream"
+  show_out_on_fail
+fi
+if echo "$OUT" | grep -q -- "$STALE_WT_BRANCH" \
+   && echo "$OUT" | grep -q "remote-tracking ref is stale"; then
+  pass "#892 dry-run explains the stale-remote-tracking-ref reason for the worktree"
+else
+  fail "#892 no stale-remote-tracking-ref reason line found for the worktree"
+  show_out_on_fail
+fi
+# Read-only contract: dry-run must perform NO ref mutation for this branch
+# either, and the gitignored canary must still exist untouched.
+if git rev-parse --verify -q "refs/remotes/origin/$STALE_WT_BRANCH" >/dev/null; then
+  pass "#892 dry-run performed no ref mutation for the worktree's branch"
+else
+  fail "#892 dry-run mutated refs: stale remote-tracking ref for $STALE_WT_BRANCH is gone"
+fi
+if [ -f "$STALE_WT_CANARY" ]; then
+  pass "#892 dry-run left the gitignored canary untouched"
+else
+  fail "#892 dry-run destroyed the gitignored canary (should never mutate anything)"
+fi
+
 # Summary counts: at least 1 in each of gone/detached/locked/orphan.
 if echo "$OUT" | grep -qE "gone-upstream: +[1-9]"; then
   pass "summary shows ≥1 gone-upstream"
@@ -1272,6 +1337,22 @@ if git rev-parse --verify -q "refs/heads/$STALE_UNPRUNED_BRANCH" >/dev/null 2>&1
   echo "$OUT2" >&2
 else
   pass "#822 stale-unpruned merged branch deleted by --apply (fetch --prune fixed the gone detection)"
+fi
+
+# Case 22 (#892): --apply's leading `git fetch --prune origin` makes the
+# worktree's branch genuinely `gone`, so the worktree is removed exactly as
+# a plain gone-upstream worktree would be (case 2) — dry-run and --apply
+# must agree on this, which is the whole point of the fix.
+if echo "$OUT3" | grep -q -- "$STALE_WT"; then
+  fail "#892 stale-unpruned worktree still present after --apply"
+  echo "$OUT3" >&2
+else
+  pass "#892 stale-unpruned worktree removed by --apply (dry-run/--apply now agree)"
+fi
+if [ -d "$STALE_WT" ]; then
+  fail "#892 stale-unpruned worktree directory still exists after --apply"
+else
+  pass "#892 stale-unpruned worktree directory removed by --apply"
 fi
 if echo "$OUT3" | grep -q -- "$PR_WT"; then
   fail "detached closed-PR worktree still present after --apply"

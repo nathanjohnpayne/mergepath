@@ -604,6 +604,27 @@ is_gone_branch() {
   grep -Fxq -- "$b" "$GONE_FILE"
 }
 
+# #892: the authoritative "would --apply treat this branch as gone" test.
+# is_gone_branch() alone answers only "has `git branch -vv` already marked
+# this gone" — true after a `fetch --prune` (i.e. always true under --apply,
+# since --apply prunes before computing GONE_FILE) but false under --dry-run
+# whenever the local remote-tracking ref simply hasn't been pruned yet, even
+# though the remote branch is provably deleted (stale_unpruned_branches()).
+# Every consumer that decides whether a WORKTREE (not just a plain local
+# branch) is stale MUST use this union, not is_gone_branch() alone — using
+# is_gone_branch() alone made --dry-run silently omit a worktree that
+# --apply went on to remove, because dry-run's STALE_UNPRUNED_FILE only fed
+# the separate merged-branch sweep further down, never the worktree
+# classification here (#892). STALE_UNPRUNED_FILE is empty under --apply
+# (never populated there — see the dry-run-only guard below), so this union
+# is a no-op under --apply and changes nothing there.
+is_effectively_gone() {
+  local b="$1"
+  [ -z "$b" ] && return 1
+  is_gone_branch "$b" && return 0
+  grep -Fxq -- "$b" "$STALE_UNPRUNED_FILE"
+}
+
 # Dry-run only (#822): under --apply the `fetch --prune` above already
 # converted every truly-gone branch into a `git branch -vv` gone marker, so
 # GONE_FILE is already authoritative there and this probe would only spend
@@ -790,7 +811,19 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
   fi
 
   # Branch-attached worktree.
-  if is_gone_branch "$WT_BRANCH"; then
+  #
+  # #892: uses is_effectively_gone(), not is_gone_branch() alone, so a
+  # worktree whose branch has an unpruned-but-provably-deleted remote ref is
+  # classified identically to how --apply (which prunes first) will treat
+  # it. Without this, --dry-run silently omitted worktrees in exactly this
+  # state — the WORKTREE never reached the gone-upstream branch at all,
+  # while --apply's `fetch --prune` made the same branch `gone` and removed
+  # the worktree. The two modes must agree on what counts as gone.
+  if is_effectively_gone "$WT_BRANCH"; then
+    WT_STALE_NOTE=""
+    if ! is_gone_branch "$WT_BRANCH"; then
+      WT_STALE_NOTE=" (remote-tracking ref is stale, not yet gone per \`git branch -vv\` — run \`git fetch --prune\` or re-run with --apply)"
+    fi
     # A PR-slug worktree must clear the comprehensive content gate before ANY
     # removal, including this gone-upstream fast path. Without this the
     # invariant is only half-real: rule 1 runs FIRST and `continue`s, so a
@@ -808,9 +841,9 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
         print_record "[PR #${pr_num} gone-upstream but working tree is ${wt_state} — review manually, keeping]" "$C_YELLOW" \
           "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[gone]" "" "$WT_LOCK_REASON"
         if [ "$wt_state" = "ignored" ]; then
-          echo "    reason:   gitignored content only (e.g. .env, *.key, node_modules/) — \`git worktree remove\` deletes it with or without --force, and it exists nowhere else; move or delete it by hand first"
+          echo "    reason:   gitignored content only (e.g. .env, *.key, node_modules/) — \`git worktree remove\` deletes it with or without --force, and it exists nowhere else; move or delete it by hand first${WT_STALE_NOTE}"
         else
-          echo "    reason:   uncommitted or untracked content (or an unreadable status) — removing the worktree would destroy work that exists nowhere else; commit, stash, or discard it by hand first"
+          echo "    reason:   uncommitted or untracked content (or an unreadable status) — removing the worktree would destroy work that exists nowhere else; commit, stash, or discard it by hand first${WT_STALE_NOTE}"
         fi
         SUMMARY_UNCLEAN_KEPT+=("$WT_PATH ($WT_BRANCH [gone], $wt_state)")
         continue
@@ -820,6 +853,10 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
       print_record "[LOCKED gone-upstream]" "$C_YELLOW" \
         "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[gone]" "" "$WT_LOCK_REASON"
       SUMMARY_LOCKED+=("$WT_PATH ($WT_BRANCH [gone])")
+      if [ -n "$WT_STALE_NOTE" ]; then
+        echo "    reason:   locked worktree on a gone-upstream branch${WT_STALE_NOTE}"
+        SUMMARY_STALE_UNPRUNED+=("$WT_BRANCH")
+      fi
       if [ "$MODE" = "apply" ] && [ "$FORCE_LOCKED" = "1" ]; then
         echo "    -> removing (forced)"
         try_remove "$WT_PATH" "1"
@@ -830,6 +867,10 @@ while IFS='|' read -r WT_PATH WT_BRANCH WT_DETACHED WT_HEAD WT_LOCKED WT_LOCK_RE
     else
       print_record "[STALE gone-upstream]" "$C_RED" \
         "$WT_PATH" "$WT_BRANCH" "$WT_HEAD" "[gone]" "" ""
+      if [ -n "$WT_STALE_NOTE" ]; then
+        echo "    reason:   gone-upstream branch${WT_STALE_NOTE}"
+        SUMMARY_STALE_UNPRUNED+=("$WT_BRANCH")
+      fi
       SUMMARY_GONE+=("$WT_PATH ($WT_BRANCH)")
       if [ "$MODE" = "apply" ]; then
         echo "    -> removing"
@@ -1043,6 +1084,12 @@ while IFS='|' read -r LOCAL_BRANCH SWEEP_SRC; do
   if branch_checked_out "$LOCAL_BRANCH"; then
     print_record "[MERGED local branch checked out — keeping]" "$C_YELLOW" \
       "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)" "[gone]" "MERGED" ""
+    # #892: this path never appended STALE_NOTE, so a checked-out branch
+    # with an unpruned remote-tracking ref printed no hint that --apply's
+    # `fetch --prune` would reclassify it (this branch also drives the
+    # worktree itself via the is_effectively_gone() rule above — the two
+    # must read consistently rather than one going silent).
+    echo "    reason:   PR for this head name merged and the local tip is an exact match, but the branch is checked out in a worktree${STALE_NOTE}"
     SUMMARY_LOCAL_BRANCH+=("$LOCAL_BRANCH (checked out)")
     if [ "$MODE" = "apply" ]; then
       echo "    -> skipped (branch is checked out in a worktree)"
