@@ -361,9 +361,14 @@ paths:
     type: canonical
     consumers: all
     # Hard-sources scripts/lib/reviewers-helpers.sh (#453) for the
-    # token-derived expected-reviewer allow-list; exits 3 if absent.
+    # token-derived expected-reviewer allow-list; exits 3 if absent. Since
+    # #837 it also hard-sources scripts/lib/feedback-policy-helpers.sh: the
+    # potential-issue count grades findings with the shared coderabbit_tier_of
+    # rather than a private marker grep, so a consumer missing that lib must
+    # error rather than silently count zero blocking findings.
     requires:
       - "scripts/lib/reviewers-helpers.sh"
+      - "scripts/lib/feedback-policy-helpers.sh"
   # #489 CodeRabbit-rate-limit auto-merge disposition gate. agent-review.yml's
   # exit-5 (rate-limited) branch calls this script to decide whether the
   # Codex-failover path may auto-merge. Absent on a consumer it exits 127 and

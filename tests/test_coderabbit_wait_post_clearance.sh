@@ -41,6 +41,9 @@ make_case() {
   cp "$ROOT/scripts/coderabbit-wait.sh" "$dir/scripts/coderabbit-wait.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
+  # Hard-required by coderabbit-wait.sh since #837: the potential-issue count
+  # grades findings with the shared coderabbit_tier_of.
+  cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   chmod +x "$dir/scripts/coderabbit-wait.sh"
 
   printf '%s\n' "$HEAD_EPOCH" >"$dir/state/fake-time"

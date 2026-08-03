@@ -33,6 +33,9 @@ make_case() {
   cp "$ROOT/scripts/coderabbit-wait.sh" "$dir/scripts/coderabbit-wait.sh"
   cp "$ROOT/scripts/lib/gh-token-resolver.sh" "$dir/scripts/lib/gh-token-resolver.sh"
   cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$dir/scripts/lib/reviewers-helpers.sh"
+  # Hard-required by coderabbit-wait.sh since #837: the potential-issue count
+  # grades findings with the shared coderabbit_tier_of.
+  cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$dir/scripts/lib/feedback-policy-helpers.sh"
   chmod +x "$dir/scripts/coderabbit-wait.sh"
 
   cat >"$dir/.github/review-policy.yml" <<EOF
@@ -220,6 +223,24 @@ case "$endpoint" in
         # return the SAME terminal verdict the polling mode does.
         printf '[{"id":9941,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
         ;;
+      badge_only_inline_finding)
+        # #837: an ordinary review on HEAD. The interesting part is the FORMAT
+        # of its inline finding (pulls endpoint below).
+        printf '[{"id":9711,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        ;;
+      badge_only_summary_finding)
+        # #837 acceptance 2: the same format carried SOLELY by the PR-level
+        # summary, which is the one verdict --probe makes.
+        printf '[{"id":9721,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
+        ;;
+      future_dated_head_review)
+        # #824: the review is pinned to THIS head (commit_id head-sha) but was
+        # submitted BEFORE the head committer date — the shape a future-dated
+        # or metadata-rewritten commit produces, since the committer date is
+        # whatever the pusher wrote. Pre-fix the `submitted_at >= HEAD_ANCHOR`
+        # conjunct discarded it and the finding below went uncounted.
+        printf '[{"id":9731,"user":{"login":"%s"},"submitted_at":"2026-06-03T00:00:00Z","commit_id":"head-sha"}]\n' "$bot"
+        ;;
       probe_review_object_premerge_warning)
         printf '[{"id":9991,"user":{"login":"%s"},"submitted_at":"%s","commit_id":"head-sha"}]\n' "$bot" "$head_time"
         ;;
@@ -303,6 +324,20 @@ case "$endpoint" in
         # #535.1: no inline findings at all — the marker lives only in the
         # PR-level summary body (issues endpoint below).
         printf '[]\n'
+        ;;
+      badge_only_inline_finding)
+        # #837, verbatim from the live #835 finding (comment 3687972302): the
+        # severity-badge prefix CodeRabbit emits today, plus the machine tag.
+        # There is NO literal "Potential issue" and NO ⚠️ anywhere in the body,
+        # so the retired `grep -iE 'Potential issue|⚠️'` counted zero and the
+        # helper reported `cleared` on a Major security finding.
+        printf '[{"id":9712,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","commit_id":"head-sha","pull_request_review_id":9711,"in_reply_to_id":null,"body":"_🔒 Security \\u0026 Privacy_ | _🟠 Major_ | _⚡ Quick win_\\n\\n**Reject the diagnostic bypass in merge-gate callers.**\\n\\nThe caller accepts a bypass flag that skips the gate.\\n\\n<!-- cr-indicator-types:potential_issue -->"}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      future_dated_head_review)
+        # #824: an ordinary blocking finding on the SHA-matched review. Its
+        # own timestamps predate the head committer date too, so nothing but
+        # the commit_id ties it to this head.
+        printf '[{"id":9732,"user":{"login":"%s"},"created_at":"2026-06-03T00:00:00Z","updated_at":"2026-06-03T00:00:00Z","commit_id":"head-sha","pull_request_review_id":9731,"in_reply_to_id":null,"body":"_⚠️ Potential issue_\\n\\nFinding on the SHA-matched review."}]\n' "$bot"
         ;;
       intermediate_review_head_pin)
         # #535.2: the ⚠️ inline finding is tied to the HEAD review (9931).
@@ -441,6 +476,18 @@ case "$endpoint" in
         # marker, so clearance is decided purely by the HEAD-pinned inline
         # count (which finds the finding on the HEAD review).
         printf '[{"id":8831,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 1**\\n\\nSee inline findings on the latest HEAD review."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      badge_only_inline_finding|future_dated_head_review)
+        # A marker-free summary, so the verdict can only come from the inline
+        # count — the surface each of these two cases is actually about.
+        printf '[{"id":8711,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 1**\\n\\nSee inline findings on the HEAD review."}]\n' "$bot" "$head_time" "$head_time"
+        ;;
+      badge_only_summary_finding)
+        # #837 acceptance 2: the modern badge format carried ONLY by the
+        # PR-level summary. No inline comment exists, so this is the #535
+        # class — the finding no required gate dispositions — in the format
+        # the retired grep could not see.
+        printf '[{"id":8721,"user":{"login":"%s"},"created_at":"%s","updated_at":"%s","body":"**Actionable comments posted: 1**\\n\\n<details>\\n<summary>scripts/foo.sh (1)</summary>\\n\\n_🔒 Security \\u0026 Privacy_ | _🟠 Major_ | _⚡ Quick win_\\n\\n**Reject the diagnostic bypass in merge-gate callers.**\\n\\n<!-- cr-indicator-types:potential_issue -->"}]\n' "$bot" "$head_time" "$head_time"
         ;;
       probe_clean_incremental)
         # #851 fixtures: no review object (reviews endpoint falls to its []
@@ -1519,6 +1566,61 @@ test_851_review_object_premerge_shares_strip() {
   fi
 }
 
+test_837_badge_only_inline_finding_is_counted() {
+  # #837, the live #835 false clearance. A 🟠 Major security finding whose body
+  # carries NO literal "Potential issue" and NO ⚠️ must still be counted, so the
+  # run reports findings instead of `cleared`. The PR-level summary is
+  # deliberately marker-free: only the inline count can produce this verdict, so
+  # a regression cannot be masked by the #535 summary path.
+  local dir rc status potential
+  dir=$(make_case badge-only-inline 600 false 0 2)
+  rc=$(run_case "$dir" badge_only_inline_finding)
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  potential=$(jq -r '.potential_issue_count' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "2" ] && [ "$status" = "findings" ] && [ "$potential" = "1" ]; then
+    pass "#837: a 🟠 Major finding with no Potential issue/⚠️ text is counted (rc 2, count 1)"
+  else
+    fail "#837: expected rc 2/findings/count 1 for the badge-only finding; got rc=$rc status=$status count=$potential"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
+test_837_badge_only_summary_finding_probe_is_findings() {
+  # #837 acceptance 2. --probe makes exactly one verdict — a blocking marker
+  # carried solely by the PR-level summary (#535) — and it must recognize that
+  # marker in CodeRabbit's current badge format, not just the retired literals.
+  local dir rc status
+  dir=$(make_case badge-only-summary 600 true 30 3 2)
+  rc=$(run_probe_case "$dir" badge_only_summary_finding)
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "2" ] && [ "$status" = "findings" ]; then
+    pass "#837: --probe returns findings for a summary-only finding in the badge format"
+  else
+    fail "#837 probe: expected rc 2/findings for the badge-only summary; got rc=$rc status=$status"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
+test_824_sha_matched_review_is_honored_regardless_of_timestamp() {
+  # #824. The HEAD committer date is pusher-controlled; when it is dated ahead
+  # of GitHub's clock, a review OF THIS EXACT SHA has submitted_at < the anchor.
+  # Requiring both the SHA match and the timestamp let the weaker, spoofable
+  # condition veto the stronger one, dropping the review — and with it every
+  # finding scoped to it — until wall-clock caught up. commit_id alone selects
+  # it now, so the finding is counted immediately.
+  local dir rc status potential
+  dir=$(make_case future-dated-head 600 false 0 2)
+  rc=$(run_case "$dir" future_dated_head_review)
+  status=$(jq -r '.status' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  potential=$(jq -r '.potential_issue_count' "$dir/out.json" 2>/dev/null || echo PARSE_ERROR)
+  if [ "$rc" = "2" ] && [ "$status" = "findings" ] && [ "$potential" = "1" ]; then
+    pass "#824: a SHA-matched review is honored though it predates the head committer date (rc 2, count 1)"
+  else
+    fail "#824: expected rc 2/findings/count 1 for the SHA-matched aged review; got rc=$rc status=$status count=$potential"
+    sed 's/^/      /' "$dir/err.log" >&2 || true
+  fi
+}
+
 test_851_summary_helpers_unit() {
   # The three predicates are pure; extract the sentinel block and source it so
   # the 40-hex token boundary and the zero-stanza vacuity guard are assertable
@@ -1531,6 +1633,12 @@ test_851_summary_helpers_unit() {
     "$ROOT/scripts/coderabbit-wait.sh")"
   awk '/^# BEGIN coderabbit_summary_helpers$/{f=1;next} /^# END coderabbit_summary_helpers$/{f=0} f' \
     "$ROOT/scripts/coderabbit-wait.sh" >"$snip"
+  # The block's one external dependency (#837): the shared classifier the
+  # blocking-marker predicate grades each line with. Sourced from the same
+  # canonical lib the script hard-requires, so the unit assertions below run
+  # against the real classifier rather than a test-local stand-in.
+  # shellcheck source=../scripts/lib/feedback-policy-helpers.sh
+  . "$ROOT/scripts/lib/feedback-policy-helpers.sh"
   # shellcheck disable=SC1090
   . "$snip"
   h40='0123456789abcdef0123456789abcdef01234567'
@@ -1619,6 +1727,9 @@ test_probe_unknown_option_fails_closed
 test_851_summary_evidence_matrix
 test_851_review_object_premerge_shares_strip
 test_851_summary_helpers_unit
+test_837_badge_only_inline_finding_is_counted
+test_837_badge_only_summary_finding_probe_is_findings
+test_824_sha_matched_review_is_honored_regardless_of_timestamp
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
