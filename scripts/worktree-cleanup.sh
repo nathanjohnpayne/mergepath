@@ -107,6 +107,25 @@
 #      pass so a branch whose worktree was removed earlier in the same
 #      --apply run becomes eligible for deletion in that run (#605).
 #
+#      "gone" per `git branch -vv` requires `git fetch --prune` to have
+#      already removed the stale `refs/remotes/origin/<branch>` — nothing
+#      before this rule ran `fetch --prune`, so a branch whose remote was
+#      deleted on merge (the normal `gh pr merge --delete-branch` shape)
+#      kept a live-looking upstream, was never classified `gone`, and was
+#      retained indefinitely with no trace in the summary (#822). Under
+#      --apply (already destructive) this rule now runs `git fetch
+#      --prune origin` FIRST so gone-upstream detection reflects current
+#      remote state before classification. Under dry-run (read-only by
+#      contract) it instead probes each non-gone branch's upstream against
+#      the remote with `git ls-remote` — a network READ, not a ref
+#      mutation — and reports any branch whose remote-tracking ref is
+#      stale explicitly, tagged and counted separately, rather than
+#      omitting it. NOTE this is a DIFFERENT hazard from the squash-merge
+#      one two paragraphs below: an unpruned ref is a detection gap on the
+#      "gone" SIGNAL; ancestry-vs-squash is a detection gap on the "merged"
+#      SIGNAL. Fixing one does not touch the other, and both must hold for
+#      a branch to be provably safe to delete.
+#
 # Locked detection. `git worktree list --porcelain` emits a `locked`
 # line (possibly with a reason) for locked entries. We classify locked
 # worktrees separately so --apply doesn't disrupt active sessions.
@@ -184,6 +203,28 @@ GIT_COMMON_DIR=$(git rev-parse --git-common-dir)
 # may itself be one of the candidates we want to clean up). The main
 # worktree's gitdir is GIT_COMMON_DIR's parent.
 MAIN_WORKTREE=$(cd "$GIT_COMMON_DIR/.." && pwd)
+
+# ── Prune stale remote-tracking refs (--apply only) ────────────────────
+# `git branch -vv`'s `[origin/<branch>: gone]` marker — the sole input to
+# gone_branches() below — only appears once `git fetch --prune` has removed
+# the stale `refs/remotes/origin/<branch>` for a branch whose remote was
+# deleted (e.g. `gh pr merge --delete-branch`). Nothing else in this script
+# ever pruned remote-tracking refs, so a merged branch could sit with a
+# live-looking upstream indefinitely and never reach the merged-PR check
+# (#822). --apply already performs destructive ref operations (`git branch
+# -D`, `git worktree remove`), so running a `fetch --prune` here adds no new
+# side-effect category — it is fetch-and-prune of REMOTE-TRACKING refs only,
+# never a local branch. Dry-run must NOT do this (read-only-by-default
+# contract); it instead reports the condition without mutating anything —
+# see stale_unpruned_branches() below. Best-effort: a missing `origin`
+# remote or a network failure here must not abort the whole run.
+if [ "$MODE" = "apply" ]; then
+  if git -C "$MAIN_WORKTREE" remote get-url origin >/dev/null 2>&1; then
+    if ! git -C "$MAIN_WORKTREE" fetch --prune origin >/dev/null 2>&1; then
+      echo "worktree-cleanup.sh: warning: \`git fetch --prune origin\` failed; gone-upstream detection may miss recently-merged branches this run" >&2
+    fi
+  fi
+fi
 
 # ── Helpers ───────────────────────────────────────────────────────────
 gh_pr_state() {
@@ -468,6 +509,47 @@ gone_branches() {
   '
 }
 
+# Detect local branches whose upstream tracks `origin/<name>` but which
+# `git branch -vv` does NOT (yet) mark `gone` — because the remote-tracking
+# ref refs/remotes/origin/<name> is stale, not because the remote branch
+# still exists (#822). This is the dry-run counterpart to the `fetch
+# --prune` above: a pure network READ (`git ls-remote`), never a local ref
+# write, so it preserves the read-only-by-default contract while still
+# surfacing the condition instead of silently omitting the branch.
+#
+# Requires $GONE_FILE (is_gone_branch()) to already be populated, so callers
+# must invoke this AFTER `gone_branches >"$GONE_FILE"`.
+#
+# For each candidate, `git ls-remote --exit-code --heads origin
+# refs/heads/<remote-name>` is queried directly:
+#   exit 0  → the branch still exists on the remote. Not our case; skip.
+#   exit 2  → the query SUCCEEDED and found no matching ref — the remote
+#             branch is gone, confirming the local tracking ref is simply
+#             unpruned. Report it.
+#   other   → the query FAILED (no network, auth failure, no route to the
+#             remote). This is a verification failure, not evidence the
+#             branch was deleted — fail closed and do not report, mirroring
+#             gh_branch_merged_pr_status()'s unknown/none distinction.
+stale_unpruned_branches() {
+  cd "$MAIN_WORKTREE" || return 0
+  local branch upstream remote_name rc
+  git for-each-ref --format='%(refname:short)|%(upstream:short)' refs/heads/ 2>/dev/null |
+  while IFS='|' read -r branch upstream; do
+    [ -n "$branch" ] || continue
+    case "$upstream" in
+      origin/*) ;;
+      *) continue ;;
+    esac
+    is_gone_branch "$branch" && continue
+    remote_name="${upstream#origin/}"
+    rc=0
+    git ls-remote --exit-code --heads origin "refs/heads/$remote_name" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 2 ]; then
+      echo "$branch"
+    fi
+  done
+}
+
 # Parse `git worktree list --porcelain` into pipe-delimited records:
 #   PATH|BRANCH_OR_DETACHED|HEAD|LOCKED(0/1)|LOCK_REASON
 # BRANCH is the short ref name (without refs/heads/) or empty for detached;
@@ -510,7 +592,8 @@ worktree_records() {
 # bad form before #286's check was wired into CI).
 GONE_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-gone.XXXXXX")
 REC_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-rec.XXXXXX")
-trap 'rm -f "$GONE_FILE" "$REC_FILE"' EXIT
+STALE_UNPRUNED_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-staleunpruned.XXXXXX")
+trap 'rm -f "$GONE_FILE" "$REC_FILE" "$STALE_UNPRUNED_FILE"' EXIT
 
 gone_branches >"$GONE_FILE"
 worktree_records >"$REC_FILE"
@@ -520,6 +603,16 @@ is_gone_branch() {
   [ -z "$b" ] && return 1
   grep -Fxq -- "$b" "$GONE_FILE"
 }
+
+# Dry-run only (#822): under --apply the `fetch --prune` above already
+# converted every truly-gone branch into a `git branch -vv` gone marker, so
+# GONE_FILE is already authoritative there and this probe would only spend
+# network calls to rediscover nothing. Under dry-run, GONE_FILE reflects
+# whatever was pruned before this invocation (possibly never), so probe the
+# remote directly for anything it might be missing.
+if [ "$MODE" = "dry-run" ]; then
+  stale_unpruned_branches >"$STALE_UNPRUNED_FILE"
+fi
 
 branch_checked_out() {
   local b="$1"
@@ -566,6 +659,13 @@ SUMMARY_DIVERGED_KEPT=()
 # unauthenticated / API error) — NOT evaluated, distinct from both "examined,
 # not merged" and the deletion candidates (Codex P2 on #610).
 SUMMARY_LOOKUP_UNKNOWN=()
+# Branches detected by stale_unpruned_branches() (#822): a `gone`-marker
+# false-negative because the local refs/remotes/origin/<branch> ref hasn't
+# been pruned yet, dry-run only. These ALSO land in whichever of the buckets
+# above their merged-PR status resolves to; this counter exists purely so
+# the class itself — "retained only because of an unpruned ref" — is never
+# invisible in the summary, per #822's acceptance criteria.
+SUMMARY_STALE_UNPRUNED=()
 
 print_record() {
   local label="$1" color="$2" path="$3" branch="$4" head="$5" upstream="$6" pr_state="$7" lock_reason="$8"
@@ -868,8 +968,28 @@ fi
 # remain as a standalone local ref after the remote branch is deleted. Verify
 # the PR's merged state before listing/deleting so ordinary unpublished work is
 # not swept up just because its upstream is gone.
-while IFS= read -r LOCAL_BRANCH; do
+#
+# The sweep set is GONE_FILE (branches `git branch -vv` already marks gone)
+# UNION STALE_UNPRUNED_FILE (dry-run only: branches whose remote-tracking ref
+# is stale but not yet pruned, per stale_unpruned_branches() — #822). Tagging
+# each branch by source lets the stale-unpruned case get its own summary
+# counter and an explicit reason note, without a second copy of this loop.
+# STALE_UNPRUNED_FILE is empty under --apply (that mode already ran `fetch
+# --prune` before GONE_FILE was computed, so the branch is already tagged
+# `gone` there), so this union changes nothing under --apply.
+MERGE_SWEEP_FILE=$(mktemp "${TMPDIR:-/tmp}/wcleanup-mergesweep.XXXXXX")
+{
+  awk '{ print $0 "|gone" }' "$GONE_FILE"
+  awk '{ print $0 "|stale-unpruned" }' "$STALE_UNPRUNED_FILE"
+} >"$MERGE_SWEEP_FILE"
+
+while IFS='|' read -r LOCAL_BRANCH SWEEP_SRC; do
   [ -n "$LOCAL_BRANCH" ] || continue
+  STALE_NOTE=""
+  if [ "$SWEEP_SRC" = "stale-unpruned" ]; then
+    STALE_NOTE=" (remote-tracking ref is stale, not yet gone per \`git branch -vv\` — run \`git fetch --prune\` or re-run with --apply)"
+    SUMMARY_STALE_UNPRUNED+=("$LOCAL_BRANCH")
+  fi
   # `|| true`: the helper returns 1 for the "none" verdict, and under
   # `set -e` a `VAR=$(func)` assignment inherits that non-zero status and
   # would abort the script. The verdict string is already on stdout, so we
@@ -882,7 +1002,7 @@ while IFS= read -r LOCAL_BRANCH; do
     LOCAL_BRANCH_TIP=$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)
     print_record "[gone-upstream local branch — merged-PR lookup FAILED, keeping]" "$C_YELLOW" \
       "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$LOCAL_BRANCH_TIP" "[gone]" "" ""
-    echo "    reason:   could not verify merged state (gh missing, unauthenticated, or API error) — branch NOT evaluated"
+    echo "    reason:   could not verify merged state (gh missing, unauthenticated, or API error) — branch NOT evaluated${STALE_NOTE}"
     SUMMARY_LOOKUP_UNKNOWN+=("$LOCAL_BRANCH")
     continue
   fi
@@ -894,7 +1014,7 @@ while IFS= read -r LOCAL_BRANCH; do
     LOCAL_BRANCH_TIP=$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)
     print_record "[gone-upstream local branch — no merged PR, keeping]" "$C_DIM" \
       "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$LOCAL_BRANCH_TIP" "[gone]" "" ""
-    echo "    reason:   no merged PR found for head name (unpublished or unmerged work)"
+    echo "    reason:   no merged PR found for head name (unpublished or unmerged work)${STALE_NOTE}"
     SUMMARY_EXAMINED_NOT_MERGED+=("$LOCAL_BRANCH")
     continue
   fi
@@ -914,7 +1034,7 @@ while IFS= read -r LOCAL_BRANCH; do
     DIVERGED_TIP=$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)
     print_record "[MERGED PR, local tip has unmerged commit(s) on top — review manually, keeping]" "$C_YELLOW" \
       "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$DIVERGED_TIP" "[gone]" "MERGED+extra" ""
-    echo "    reason:   PR for this head name merged, but the local tip carries commit(s) beyond the merged head; not auto-deleted (may be unmerged follow-up work — delete by hand after review)"
+    echo "    reason:   PR for this head name merged, but the local tip carries commit(s) beyond the merged head; not auto-deleted (may be unmerged follow-up work — delete by hand after review)${STALE_NOTE}"
     SUMMARY_DIVERGED_KEPT+=("$LOCAL_BRANCH")
     continue
   fi
@@ -933,6 +1053,9 @@ while IFS= read -r LOCAL_BRANCH; do
 
   print_record "[MERGED local branch]" "$C_RED" \
     "$MAIN_WORKTREE" "$LOCAL_BRANCH" "$(git -C "$MAIN_WORKTREE" rev-parse "$LOCAL_BRANCH" 2>/dev/null || true)" "[gone]" "MERGED" ""
+  if [ -n "$STALE_NOTE" ]; then
+    echo "    reason:   PR for this head name merged and the local tip is an exact match${STALE_NOTE}"
+  fi
   SUMMARY_LOCAL_BRANCH+=("$LOCAL_BRANCH")
   if [ "$MODE" = "apply" ]; then
     echo "    -> deleting local branch"
@@ -942,7 +1065,8 @@ while IFS= read -r LOCAL_BRANCH; do
       SUMMARY_FAILED+=("$LOCAL_BRANCH (local branch)")
     fi
   fi
-done <"$GONE_FILE"
+done <"$MERGE_SWEEP_FILE"
+rm -f "$MERGE_SWEEP_FILE"
 
 # ── Orphan scan ───────────────────────────────────────────────────────
 ORPHAN_ROOT="$MAIN_WORKTREE/.claude/worktrees"
@@ -1048,6 +1172,14 @@ printf "  merged+extra (review): %d\n" "${#SUMMARY_DIVERGED_KEPT[@]}"
 # Branches whose merged-PR lookup FAILED — not evaluated (gh missing /
 # unauthenticated / API error). Distinct from "gone kept (unmerged)".
 printf "  gone unverified (lookup failed): %d\n" "${#SUMMARY_LOOKUP_UNKNOWN[@]}"
+# Branches whose remote-tracking ref is stale rather than genuinely gone —
+# a `git branch -vv` false-negative this run would otherwise retain silently
+# (#822). Dry-run only; --apply prunes before classification so this is
+# always 0 there. Each of these ALSO appears in exactly one bucket above
+# (merged branches / gone kept / merged+extra / gone unverified) by its
+# actual merged-PR status — this counter exists so the unpruned-ref CLASS
+# itself is never invisible, even though it is not a distinct disposition.
+printf "  gone (stale remote ref, unpruned): %d\n" "${#SUMMARY_STALE_UNPRUNED[@]}"
 printf "  open-PR retained: %d\n" "${#SUMMARY_OPEN_PR[@]}"
 printf "  orphan dirs:      %d\n" "${#SUMMARY_ORPHAN[@]}"
 

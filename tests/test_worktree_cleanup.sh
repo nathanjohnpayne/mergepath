@@ -640,6 +640,37 @@ git push -q -u origin "$UNKNOWN_BRANCH"
 git push -q origin --delete "$UNKNOWN_BRANCH"
 git fetch -q --prune
 
+# ── Case 21 (#822): merged branch, remote deleted, ref NOT pruned ─────
+# The actual bug: a squash-merged branch whose remote was deleted (the
+# `gh pr merge --delete-branch` shape) but whose LOCAL refs/remotes/
+# origin/<branch> tracking ref was never pruned. `git branch -vv` does not
+# mark it `gone` (nothing ran `git fetch --prune` for it — deliberately, no
+# such call follows below), so the pre-fix gone_branches() sweep skipped it
+# entirely and it was retained silently forever. This fixture MUST be the
+# last branch created before the `gh` stub, and no `git fetch --prune`
+# may run afterward in this script, or it would launder the very
+# condition being tested.
+STALE_UNPRUNED_BRANCH="merged-local-stale-unpruned-ref"
+git branch "$STALE_UNPRUNED_BRANCH"
+git push -q -u origin "$STALE_UNPRUNED_BRANCH"
+STALE_UNPRUNED_TIP=$(git rev-parse "$STALE_UNPRUNED_BRANCH")
+# Delete the branch directly in the bare "remote" repo, bypassing this
+# clone's own `git push --delete`. Since Git 1.8.5, a delete-push
+# auto-removes the LOCAL refs/remotes/origin/<branch> tracking ref as a
+# push side effect — which would launder the very condition under test.
+# Deleting server-side instead (mirroring `gh pr merge --delete-branch` via
+# the API, exactly the #822 scenario) leaves this clone's tracking ref
+# genuinely stale: it still exists locally, but the bare repo no longer has
+# the branch.
+git --git-dir="$REMOTE" branch -D "$STALE_UNPRUNED_BRANCH"
+# Deliberately NO `git fetch --prune` here — that omission is the bug.
+# Sanity-check the fixture's own premise: `git branch -vv` must NOT report
+# this branch as gone, or the fixture proves nothing about the unpruned-ref
+# case.
+if git branch -vv | grep -F -- "$STALE_UNPRUNED_BRANCH" | grep -q ': gone\]'; then
+  fail "fixture setup: expected $STALE_UNPRUNED_BRANCH to NOT be marked gone yet"
+fi
+
 # ── gh stub on PATH ───────────────────────────────────────────────────
 STUB_DIR="$WORKDIR/stub-bin"
 mkdir -p "$STUB_DIR"
@@ -736,6 +767,10 @@ if [ "\$1" = "pr" ] && [ "\$2" = "list" ]; then
   fi
   if [ "\$head" = "$SAMERUN_BRANCH" ]; then
     echo "$SAMERUN_MERGED_TIP"
+    exit 0
+  fi
+  if [ "\$head" = "$STALE_UNPRUNED_BRANCH" ]; then
+    echo "$STALE_UNPRUNED_TIP"
     exit 0
   fi
   if [ "\$head" = "$UNKNOWN_BRANCH" ]; then
@@ -1115,6 +1150,48 @@ else
   show_out_on_fail
 fi
 
+# Case 21 (#822): the merged branch whose remote-tracking ref is stale
+# (remote deleted, but no `fetch --prune` has run for it) must be surfaced
+# explicitly in dry-run — never silently retained — and its own summary
+# counter must be non-zero.
+STALE_LABEL=$(echo "$OUT" | awk -v b="$STALE_UNPRUNED_BRANCH" '
+  /^  \[/            { label = $0 }
+  $1 == "branch:" && $2 == b { print label; exit }
+')
+if [ -n "$STALE_LABEL" ]; then
+  pass "#822 stale-unpruned merged branch is reported in dry-run (never silently retained)"
+else
+  fail "#822 stale-unpruned merged branch missing from dry-run output entirely (silent retention regression)"
+  show_out_on_fail
+fi
+if echo "$STALE_LABEL" | grep -q "MERGED local branch"; then
+  pass "#822 stale-unpruned merged branch classified as a MERGED local branch"
+else
+  fail "#822 stale-unpruned merged branch misclassified (label=$STALE_LABEL)"
+  show_out_on_fail
+fi
+if echo "$OUT" | grep -q -- "$STALE_UNPRUNED_BRANCH" \
+   && echo "$OUT" | grep -q "remote-tracking ref is stale"; then
+  pass "#822 dry-run explains the stale-remote-tracking-ref reason"
+else
+  fail "#822 no stale-remote-tracking-ref reason line found"
+  show_out_on_fail
+fi
+if echo "$OUT" | grep -qE "gone \(stale remote ref, unpruned\): +[1-9]"; then
+  pass "#822 summary shows ≥1 stale-unpruned gone branch"
+else
+  fail "#822 summary stale-unpruned count missing/zero"
+  show_out_on_fail
+fi
+# Read-only contract: dry-run must perform NO ref mutation. The remote-
+# tracking ref for this branch must still be present after the dry-run
+# above (an actual `git fetch --prune` would have removed it).
+if git rev-parse --verify -q "refs/remotes/origin/$STALE_UNPRUNED_BRANCH" >/dev/null; then
+  pass "#822 dry-run performed no ref mutation (stale remote-tracking ref still present)"
+else
+  fail "#822 dry-run mutated refs: stale remote-tracking ref for $STALE_UNPRUNED_BRANCH is gone"
+fi
+
 # Summary counts: at least 1 in each of gone/detached/locked/orphan.
 if echo "$OUT" | grep -qE "gone-upstream: +[1-9]"; then
   pass "summary shows ≥1 gone-upstream"
@@ -1184,6 +1261,17 @@ if echo "$OUT3" | grep -q -- "$GONE_WT"; then
   echo "$OUT3" >&2
 else
   pass "gone-upstream worktree removed by --apply"
+fi
+
+# Case 21 (#822): --apply runs `git fetch --prune origin` FIRST, so the
+# stale-unpruned merged branch is now correctly recognized as `gone`, then
+# deleted by the normal exact-tip-match merged-branch sweep — same as any
+# other merged branch, just no longer silently retained.
+if git rev-parse --verify -q "refs/heads/$STALE_UNPRUNED_BRANCH" >/dev/null 2>&1; then
+  fail "#822 stale-unpruned merged branch survived --apply (should be deleted once pruned)"
+  echo "$OUT2" >&2
+else
+  pass "#822 stale-unpruned merged branch deleted by --apply (fetch --prune fixed the gone detection)"
 fi
 if echo "$OUT3" | grep -q -- "$PR_WT"; then
   fail "detached closed-PR worktree still present after --apply"
