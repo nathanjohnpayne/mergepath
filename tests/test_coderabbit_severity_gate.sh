@@ -42,12 +42,23 @@
 #   16. nitpick required + reviews.profile: assertive → no warning.
 #   17. nitpick discretionary (default) + chill → no warning (claim not made).
 #
-# Pagination cases (#592 — reviewThreads + nested comments cursor loop):
-#   18. finding RESOLVED on threads page 2 → collected + honored → exit 0.
-#   19. blocking id on nested comments page 2, thread resolved → exit 0.
-#   20. nested comments page-2 GraphQL error → fail closed exit 2.
-#   21. reviewThreads page-2 GraphQL error → fail closed exit 2.
-#   22. hasNextPage=true but endCursor=null → fail closed exit 2.
+# PR-level SUMMARY surface (#832 — `issues/{pr}/comments`, no review thread):
+#   18. blocking finding carried ONLY by the head-pinned summary → exit 1.
+#   19. summary-only 🧹 Nitpick under a discretionary policy → exit 0;
+#       19b flips nitpick to required and the same summary gates.
+#   20. summary whose commits-range END is a stale sha → out of scope, exit 0;
+#       20b the head as the range START (force-push shape) → exit 0.
+#   21. head-pinned summary carrying a rate-limit stanza → not a completed
+#       report → exit 0.
+#   22. ⚠️ present only inside the pre-merge check table → stripped → exit 0.
+#   23. summary-shaped comment authored by a human → ignored → exit 0.
+#   24. collaborator ack naming THIS head → exit 0.
+#   25. ack naming a different sha → still gates → exit 1.
+#   26. ack from a non-collaborator → still gates → exit 1.
+#   27. ack from a `[bot]` account → still gates → exit 1.
+#   28. unreadable `issues/{pr}/comments` → FAIL CLOSED → exit 2.
+#   29. inline + summary findings both counted; 29b resolving the inline
+#       thread leaves exactly the summary one (inline behavior unchanged).
 #
 # Bash 3.2 portable.
 
@@ -127,6 +138,16 @@ if [ "$1" = "api" ]; then
       ;;
     repos/*/pulls/*/comments)
       cat "${FIXTURE_COMMENTS:-/dev/null}"
+      exit 0
+      ;;
+    repos/*/issues/*/comments)
+      # #832: the PR-level summary surface. FIXTURE_ISSUE_COMMENTS_FAIL
+      # simulates an unreadable endpoint so the fail-closed path is testable.
+      if [ -n "${FIXTURE_ISSUE_COMMENTS_FAIL:-}" ]; then
+        echo "gh: HTTP 502 Bad Gateway (issues/comments)" >&2
+        exit 1
+      fi
+      cat "${FIXTURE_ISSUE_COMMENTS:-/dev/null}"
       exit 0
       ;;
     repos/*/pulls/*)
@@ -930,6 +951,495 @@ if [ "$RC" = 0 ] && ! echo "$OUT" | grep -qi "chill profile suppresses"; then
   pass "nitpick discretionary + chill → no warning (claim not made)"
 else
   fail "expected rc=0 with NO nitpick/chill warning; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ===========================================================================
+# PR-level SUMMARY surface (#832). CodeRabbit can carry a blocking finding
+# solely in its PR-level summary comment (`issues/{pr}/comments`), which has no
+# inline anchor and therefore no review thread. Before #832 this required gate
+# read only `pulls/{pr}/comments`, so such a finding never gated.
+#
+# Every case below drives the gate through the SAME shared coderabbit_tier_of
+# the inline path uses — there is no second classifier to test.
+# ===========================================================================
+
+SUMMARY_MARKER_LINE='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
+RATE_LIMIT_STANZA='<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
+PREV_SHA='0000111122223333444455556666777788889999'
+
+# Compose a CodeRabbit PR-level summary body.
+#   $1 = sha to name as the commits-range END (the head the summary reports on)
+#   $2 = findings text spliced into the walkthrough
+#   $3 = extra stanza marker to prepend (optional — makes the body non-benign)
+make_summary_body() {
+  local head=$1 findings=$2 extra=${3:-}
+  {
+    [ -n "$extra" ] && printf '%s\n\n' "$extra"
+    printf '%s\n\n' "$SUMMARY_MARKER_LINE"
+    printf '%s\n\n' '## Walkthrough'
+    printf '%s\n\n' 'Refactors the widget loader and its retry path.'
+    printf '%s\n\n' "$findings"
+    printf '%s\n' '<details>'
+    printf '%s\n\n' '<summary>📥 Commits</summary>'
+    printf 'Reviewing files that changed from the base of the PR and between %s and %s\n' \
+      "$PREV_SHA" "$head"
+    printf '%s\n' '</details>'
+  }
+}
+
+SUMMARY_BLOCKING_FINDING='_⚠️ Potential issue_ | _🟠 Major_: the retry loop never terminates on a 5xx.'
+SUMMARY_NITPICK_FINDING='_🧹 Nitpick_: rename the temp variable to something less generic.'
+
+make_issue_comments_fixture() {
+  local content=$1
+  local file="$WORKDIR/issuecomments.$$.$RANDOM.json"
+  echo "$content" > "$file"
+  echo "$file"
+}
+
+# One CodeRabbit summary comment (id 7001), optionally followed by an ack
+# comment (id 7002).
+#   $1 = summary body
+#   $2 = summary author login (default: the bot)
+#   $3 = ack body (optional)
+#   $4 = ack author login
+#   $5 = ack author_association
+make_summary_issue_comments() {
+  local body=$1 login=${2:-coderabbitai[bot]}
+  local ack_body=${3:-} ack_login=${4:-} ack_assoc=${5:-}
+  make_issue_comments_fixture "$(jq -n \
+    --arg body "$body" --arg login "$login" \
+    --arg ab "$ack_body" --arg al "$ack_login" --arg aa "$ack_assoc" '
+    [ { id: 7001, user: { login: $login }, author_association: "NONE", body: $body } ]
+    + (if $ab == "" then []
+       else [ { id: 7002, user: { login: $al }, author_association: $aa, body: $ab } ]
+       end)
+  ')"
+}
+
+# ---------------------------------------------------------------------------
+# Test 18 (#832): a blocking-tier finding carried ONLY by the head-pinned
+# PR-level summary — zero inline comments — gates. This is the bug the issue
+# filed: before the fix the gate exited 0 here.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 18 (#832): summary-only blocking finding → exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_THREADS=$(make_threads_fixture '[]')
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING")")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)" \
+    && echo "$OUT" | grep -q "mergepath-summary-ack: $HEAD_SHA"; then
+  pass "summary-only blocking finding → exit 1, listed + ack token printed"
+else
+  fail "expected rc=1 with 'unresolved: 1' + summary path + ack token; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 19 (#832): a summary-only NON-blocking finding (🧹 Nitpick, discretionary
+# under the default policy) does NOT gate. The blocking set is the resolved
+# tier set, not "any marker" — the same rule the inline path follows.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 19 (#832): summary-only nitpick (discretionary) → exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_THREADS=$(make_threads_fixture '[]')
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_NITPICK_FINDING")")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0"; then
+  pass "summary-only nitpick under a discretionary policy → exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# Control for test 19: flip nitpick to required and the SAME summary gates —
+# proving the non-gating above is the tier decision, not a dead summary path.
+echo "--- Test 19b (control): same summary + nitpick required → exit 1"
+SCRATCH=$(make_scratch_with_policy "$NITPICK_REQUIRED_POLICY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "\[NITPICK\] (PR-level summary comment)"; then
+  pass "control: nitpick required → the same summary finding gates → exit 1"
+else
+  fail "control: expected rc=1 + [NITPICK] summary listing; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 20 (#832): the summary reports on a DIFFERENT head — its commits-range
+# end is a stale sha. Head-pinned selection drops it. Note what is NOT used to
+# decide this: no timestamp, no freshness floor. The comment is the newest thing
+# on the PR and still out of scope, because scope is the sha CodeRabbit wrote.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 20 (#832): summary names a stale head → out of scope, exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_THREADS=$(make_threads_fixture '[]')
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "deadbeef1234" "$SUMMARY_BLOCKING_FINDING")")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && echo "$OUT" | grep -q "does not name $HEAD_SHA"; then
+  pass "summary pinned to another head → out of scope, exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0' + a head-pin log line; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# Test 20b: the head appears in the summary, but as the range START (the
+# PREVIOUSLY-reviewed head — the shape a force-push back to an old head
+# produces). Position matters: a token-anywhere match would gate here.
+echo "--- Test 20b (#832): head is the range START, not the END → exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+STALE_START_SUMMARY="$(printf '%s\n\n%s\n\n%s\n' \
+  "$SUMMARY_MARKER_LINE" "$SUMMARY_BLOCKING_FINDING" \
+  "Reviewing files that changed from the base of the PR and between $HEAD_SHA and deadbeef1234")"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$STALE_START_SUMMARY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0"; then
+  pass "head as range START (not END) → out of scope, exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0' (range END is the anchor); got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 21 (#832): the summary names this head AND carries a blocking marker,
+# but also carries a non-benign outcome stanza (rate limited). The commits
+# range describes whatever run last touched the comment, including runs that
+# produced no review — so this is not a completed report and its walkthrough
+# text is the PREVIOUS round's. Allow-list of benign stanzas, not a deny-list.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 21 (#832): head-pinned summary with a rate-limit stanza → not a report, exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING" "$RATE_LIMIT_STANZA")")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && echo "$OUT" | grep -qi "non-benign outcome stanza"; then
+  pass "non-benign stanza → not a completed report, exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0' + a non-benign-stanza log line; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 22 (#832): the ONLY ⚠️ in the summary is a pre-merge check-table warning
+# row (a docstring-coverage grade, not a code finding). It must be stripped
+# before classification, or every PR with a low docstring score gates.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 22 (#832): ⚠️ only inside the pre-merge check table → exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+PRE_MERGE_ONLY="$(printf '%s\n%s\n%s\n' \
+  '<!-- pre_merge_checks_walkthrough_start -->' \
+  '| Docstring coverage | ⚠️ Warning | 12.00% is below the 80.00% threshold |' \
+  '<!-- pre_merge_checks_walkthrough_end -->')"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$PRE_MERGE_ONLY")")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0"; then
+  pass "pre-merge check-table ⚠️ stripped → exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0' (check-table row is not a finding); got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 23 (#832): a summary comment carrying the marker but authored by a
+# HUMAN is not CodeRabbit's summary — quoting the bot must not gate.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 23 (#832): summary-shaped comment from a human → ignored, exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING")" "nathanjohnpayne")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0"; then
+  pass "human-authored summary-shaped comment → ignored, exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0' (must be bot-authored); got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ===========================================================================
+# The acknowledgement channel — the resolution path a summary-only finding
+# has instead of "Resolve conversation" (#832 acceptance criterion 3).
+# ===========================================================================
+GATING_SUMMARY_BODY="$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING")"
+
+# ---------------------------------------------------------------------------
+# Test 24 (#832): a collaborator ack naming THIS head clears the finding.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 24 (#832): collaborator ack for this head → exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY" \
+  "coderabbitai[bot]" \
+  "Rebutted: the retry loop is bounded by the caller. [mergepath-summary-ack: $HEAD_SHA]" \
+  "nathanjohnpayne" "OWNER")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && echo "$OUT" | grep -qi "acknowledged for $HEAD_SHA"; then
+  pass "collaborator ack pinned to this head → exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0' + an ack log line; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 25 (#832): an ack naming a DIFFERENT sha does not clear this head. This
+# is what makes the ack per-head rather than per-PR: a push invalidates it.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 25 (#832): ack naming another sha → still gates, exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY" \
+  "coderabbitai[bot]" \
+  "Rebutted on the previous head. [mergepath-summary-ack: deadbeef1234]" \
+  "nathanjohnpayne" "OWNER")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "ack for a different sha → still gates, exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1' (ack is head-pinned); got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 26 (#832): an ack from a non-collaborator does not clear the gate.
+# `author_association` is GitHub-computed, so a drive-by commenter on a public
+# PR cannot self-serve a required check.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 26 (#832): ack from a non-collaborator → still gates, exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY" \
+  "coderabbitai[bot]" \
+  "lgtm [mergepath-summary-ack: $HEAD_SHA]" \
+  "some-drive-by" "NONE")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "ack from a non-collaborator → still gates, exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1' (association must be OWNER/MEMBER/COLLABORATOR); got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 27 (#832): an ack from a `[bot]` account with a collaborator
+# association does not clear the gate either — a workflow must not be able to
+# auto-ack its own PR past a required check.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 27 (#832): ack from a bot account → still gates, exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY" \
+  "coderabbitai[bot]" \
+  "auto-ack [mergepath-summary-ack: $HEAD_SHA]" \
+  "github-actions[bot]" "COLLABORATOR")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "ack from a [bot] account → still gates, exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1' (bot accounts cannot ack); got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 28 (#832): the issues endpoint is unreadable → FAIL CLOSED (exit 2).
+# A required gate must never read an API failure as "no findings". Asserted on
+# a PR whose inline surface is clean, so the only thing that can produce a
+# nonzero exit is the failed read itself.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 28 (#832): unreadable issues endpoint → fail closed, exit 2"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS_FAIL=1 \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 2 ] && echo "$OUT" | grep -qi "failed to fetch PR-level issue comments"; then
+  pass "unreadable issues endpoint → exit 2 (fail closed)"
+else
+  fail "expected rc=2 + a fetch-failure message; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 29 (#832): the inline path is unchanged when a summary is also present.
+# An inline blocking finding on an UNRESOLVED thread plus a summary-only
+# blocking finding count as TWO, and resolving the inline thread leaves exactly
+# the summary one. Guards against the summary read displacing (or being
+# displaced by) the inline read.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 29 (#832): inline + summary findings both counted"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_COMMENTS_INLINE=$(make_single_comment_fixture "$HEAD_SHA" "$MAJOR_BODY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS_INLINE" \
+  FIXTURE_THREADS="$(make_threads_fixture '[{isResolved: false, comment_ids: [2001]}]')" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 2" \
+    && echo "$OUT" | grep -q "\[P1\] src/foo.ts:42" \
+    && echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)"; then
+  pass "inline unresolved + summary-only → 2 findings, both listed"
+else
+  fail "expected rc=1 with 'unresolved: 2' + both listings; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo "--- Test 29b (#832): inline thread RESOLVED leaves only the summary finding"
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS_INLINE" \
+  FIXTURE_THREADS="$(make_threads_fixture '[{isResolved: true, comment_ids: [2001]}]')" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "\[P1\] (PR-level summary comment)" \
+    && ! echo "$OUT" | grep -q "src/foo.ts:42"; then
+  pass "resolved inline thread drops out; the summary finding remains → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1' + summary listing only; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 

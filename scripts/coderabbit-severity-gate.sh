@@ -62,6 +62,13 @@
 #   5. SHA scope: a finding only gates if its comment was attached to the
 #      PR's current HEAD. A finding from an earlier SHA that is now either
 #      resolved OR no longer on HEAD does not count.
+#   5b. Also fetch the PR-LEVEL SUMMARY surface via
+#      `repos/{repo}/issues/{pr}/comments` (#832) and classify it with the
+#      SAME coderabbit_tier_of — CodeRabbit can carry a blocking finding
+#      solely in its summary, with no inline anchor and therefore no review
+#      thread. See the "PR-level summary surface" section below for the
+#      identity / scope / completeness rules, and for the acknowledgement
+#      channel that stands in for "Resolve conversation" on that surface.
 #   6. Print one line per unresolved blocking-tier finding to stdout for
 #      CI visibility, then the summary "CodeRabbit blocking-tier
 #      unresolved: N".
@@ -83,12 +90,18 @@
 #     GraphQL" — the same mechanism the author or any collaborator already
 #     uses to clear any review thread. Resolving a finding that
 #     legitimately does not apply (rebutted with rationale, moot, deferred
-#     to a follow-up issue) clears the gate.
+#     to a follow-up issue) clears the gate. A summary-only finding has no
+#     thread; its override path is the head-pinned collaborator ack comment
+#     documented in the "PR-level summary surface" section (#832).
 #
 # References:
 #   - nathanjohnpayne/mergepath#574 — the symmetric feedback policy
 #   - nathanjohnpayne/mergepath#577 — this script + the generalized Codex gate
+#   - nathanjohnpayne/mergepath#535 — CodeRabbit can carry a finding in the
+#     PR-level summary alone; taught the advisory waiter to look
+#   - nathanjohnpayne/mergepath#832 — teaching THIS (required) gate the same
 #   - scripts/codex-p1-gate.sh — the Codex twin this mirrors
+#   - scripts/coderabbit-wait.sh — canonical source of the summary predicates
 #   - REVIEW_POLICY.md § Feedback Disposition Policy — the normalized ladder
 
 set -euo pipefail
@@ -382,11 +395,264 @@ while [ "$i" -lt "$CAND_COUNT" ]; do
 done
 
 BLOCKING_COUNT=$(echo "$BLOCKING_COMMENTS" | jq 'length')
-log "found $BLOCKING_COUNT blocking-tier comment(s) on HEAD"
+log "found $BLOCKING_COUNT blocking-tier inline comment(s) on HEAD"
 
-if [ "$BLOCKING_COUNT" -eq 0 ]; then
+# --- fetch CodeRabbit blocking-tier PR-level SUMMARY findings (#832) --------
+#
+# `pulls/{pr}/comments` above returns inline review comments only. CodeRabbit
+# also publishes a PR-level summary on `issues/{pr}/comments`, and it can carry
+# a blocking finding that has NO inline anchor at all (#535 established this is
+# real, and taught the ADVISORY waiter to look; the REQUIRED gate was never
+# taught the same thing — the inversion #832 filed).
+#
+# Three properties this surface needs and the inline surface gets for free:
+#
+#   IDENTITY. Select the summary BY its auto-generated marker, never as "the
+#   newest CodeRabbit comment". CodeRabbit keeps exactly one marker-carrying
+#   comment per PR and edits it in place; a CodeRabbit CHAT REPLY is a
+#   different comment that carries no marker, and two live replies (#794,
+#   #518) embed a full 40-hex head SHA lifted from a pasted `gh pr view`
+#   snippet — marker selection makes those structurally unable to supply
+#   evidence here.
+#
+#   SCOPE. An inline comment carries `commit_id`; a summary comment carries no
+#   commit field at all. The honest anchor is the one CODERABBIT itself writes
+#   into the body: the `📥 Commits` line's range END (`between <prev> and
+#   <head>`). It is bot-authored content naming a SHA, exactly like the
+#   `Reviewed commit:` line the Codex path anchors on. It is deliberately NOT
+#   a timestamp: no wall-clock floor is consulted anywhere below, so a finding
+#   can never age out of view, and no pusher-controlled clock can move the
+#   boundary (per REVIEW_POLICY.md's no-spoofable-timestamp rule and the #535
+#   HEAD_ANCHOR caveat the issue calls out).
+#
+#   COMPLETENESS. The commits range describes whatever run last touched the
+#   comment, INCLUDING runs that produced no review (`rate limited`,
+#   `failure`, `review in progress` — #790 names the head exactly while saying
+#   "Review failed"). So the summary counts as a report only when every
+#   outcome stanza present is benign. ALLOW-list, not deny-list: a stanza KIND
+#   CodeRabbit has not shipped yet reads as not-a-report, never as clean.
+#
+# The four constants and the two predicates below are the canonical ones from
+# scripts/coderabbit-wait.sh (SUMMARY_MARKER, CR_SUMMARY_BENIGN_STANZA_RE,
+# CR_PRE_MERGE_BLOCK_*, summary_stanzas_all_benign, summary_names_head). They
+# are duplicated here rather than sourced: this required gate must not take a
+# runtime dependency on the advisory waiter, and the shared lib
+# (scripts/lib/feedback-policy-helpers.sh) is contractually a pure
+# tier-classifier. Keep the two copies in lockstep — the same posture the
+# GraphQL pagination block below carries with scripts/codex-p1-gate.sh.
+CR_SUMMARY_MARKER='<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
+CR_SUMMARY_BENIGN_STANZA_RE='auto-generated comment: (summarize|release notes) by coderabbit\.ai'
+CR_PRE_MERGE_BLOCK_START='<!-- pre_merge_checks_walkthrough_start -->'
+CR_PRE_MERGE_BLOCK_END='<!-- pre_merge_checks_walkthrough_end -->'
+
+# True when the body carries at least one outcome stanza AND every stanza is
+# benign. TOTAL counts occurrences of the bare wrapper prefix, not a KIND
+# pattern: a KIND containing angle brackets (`failure <head-changed>`) escapes
+# any [^<>]-class match. The `-gt 0` guard is load-bearing, not defensive — a
+# body with zero stanzas is no report at all and must not pass vacuously.
+summary_stanzas_all_benign() {
+  local total benign
+  # `|| true` on both: grep exits 1 on no match, which `set -o pipefail` would
+  # promote to a failed assignment. `wc -l` still prints 0, which is the answer
+  # we want — a zero-stanza body then fails the `-gt 0` guard below.
+  total=$(printf '%s' "$1" | grep -oiE 'auto-generated comment: ' | wc -l | tr -d ' ' || true)
+  benign=$(printf '%s' "$1" | grep -oiE "$CR_SUMMARY_BENIGN_STANZA_RE" | wc -l | tr -d ' ' || true)
+  [ "${total:-0}" -gt 0 ] && [ "$total" = "$benign" ]
+}
+
+# True when $2 (the PR HEAD sha) is the RANGE END of a `between <prev> and
+# <head>` commits line in $1. Position matters twice over: the range START is
+# the PREVIOUSLY-reviewed head, so a force-push back to it would read a later
+# round's summary as this head's; and a "Review failed" body names the
+# abandoned NEW head in refusal prose ("changed during the review from X to
+# Y"), which a position-blind token match accepts.
+#
+# The range is EXTRACTED and then compared as a string rather than
+# interpolating the head into the pattern: the extraction's `[0-9a-f]` class
+# already bounds both tokens (so a longer digest merely CONTAINING the head
+# cannot match), and keeping the head out of the regex means no caller-supplied
+# value is ever evaluated as a pattern.
+summary_names_head() {
+  local ranges end want r
+  ranges=$(printf '%s' "$1" | grep -oiE 'between [0-9a-f]{7,40} and [0-9a-f]{7,40}' || true)
+  [ -n "$ranges" ] || return 1
+  # Hex is case-insensitive; GitHub renders shas lowercase but the comparison
+  # must not depend on that, or an uppercase range would silently drop this
+  # head's summary out of scope.
+  want=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    end=$(printf '%s' "$r" | awk '{print $4}' | tr '[:upper:]' '[:lower:]')
+    [ "$end" = "$want" ] && return 0
+  done <<EOF
+$ranges
+EOF
+  return 1
+}
+
+# Drop CodeRabbit's pre-merge check table from the body before classifying.
+# That table grades PR hygiene and renders a `⚠️ Warning` row for a
+# below-threshold docstring score — not a code finding (3 of 5 sampled
+# summaries carry one). awk with fixed-string index() rather than a sed range
+# so the delimiters carry zero regex exposure. The strip runs only when the
+# START delimiter precedes the END: with only presence checked, an END
+# rendered before a START would latch the suppressor at START and quietly drop
+# everything to EOF — including a real finding.
+summary_strip_pre_merge_block() {
+  local body=$1 s_line e_line
+  s_line=$(printf '%s\n' "$body" | grep -nF "$CR_PRE_MERGE_BLOCK_START" | head -1 | cut -d: -f1 || true)
+  e_line=$(printf '%s\n' "$body" | grep -nF "$CR_PRE_MERGE_BLOCK_END" | head -1 | cut -d: -f1 || true)
+  if [ -n "$s_line" ] && [ -n "$e_line" ] && [ "$s_line" -lt "$e_line" ]; then
+    printf '%s' "$body" | awk \
+      -v s="$CR_PRE_MERGE_BLOCK_START" -v e="$CR_PRE_MERGE_BLOCK_END" \
+      'index($0,s){k=1} !k; index($0,e){k=0}'
+    return 0
+  fi
+  printf '%s' "$body"
+}
+
+# The issues endpoint is a REQUIRED read: an unreadable one is a scan that
+# cannot be trusted complete, so fetch_api_array's die 2 (fail closed) is the
+# correct outcome — never an empty result silently treated as "no findings".
+ISSUE_COMMENTS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level issue comments")
+
+SUMMARY_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
+  --arg bot "$BOT_LOGIN" --arg m "$CR_SUMMARY_MARKER" '
+  [ .[]
+    | select(.user.login == $bot)
+    | select((.body // "") | contains($m))
+  ]
+  | sort_by(.id)
+  | last
+  | { id: (.id // 0), body: (.body // "") }
+')
+SUMMARY_ID=$(echo "$SUMMARY_JSON" | jq -r '.id')
+SUMMARY_BODY=$(echo "$SUMMARY_JSON" | jq -r '.body')
+
+# Classify the summary with the SAME shared coderabbit_tier_of the inline path
+# uses — there is deliberately no second classifier. It is applied PER LINE
+# rather than to the whole body because the classifier truncates its input to
+# the first 600 chars (a deliberate anti-drift choice for a single finding
+# body, and wrong for a multi-kilobyte summary): line-wise application is
+# exactly a whole-body scan with the truncation removed, and it yields a
+# reportable location and snippet per finding for free.
+SUMMARY_BLOCKING='[]'
+if [ -z "$SUMMARY_BODY" ]; then
+  log "no CodeRabbit PR-level summary comment found — no summary findings in scope"
+elif ! summary_stanzas_all_benign "$SUMMARY_BODY"; then
+  log "PR-level summary (comment id $SUMMARY_ID) carries a non-benign outcome stanza (rate limit / failure / in progress) — not a completed report, no summary findings in scope"
+elif ! summary_names_head "$SUMMARY_BODY" "$HEAD_SHA"; then
+  log "PR-level summary (comment id $SUMMARY_ID) does not name $HEAD_SHA as its commits-range end — not this head's report, no summary findings in scope"
+else
+  SUMMARY_SCAN=$(summary_strip_pre_merge_block "$SUMMARY_BODY")
+  cr_line_no=0
+  while IFS= read -r cr_line; do
+    cr_line_no=$((cr_line_no + 1))
+    [ -n "$cr_line" ] || continue
+    cr_tier=$(coderabbit_tier_of "$cr_line")
+    if tier_is_required "$cr_tier"; then
+      SUMMARY_BLOCKING=$(echo "$SUMMARY_BLOCKING" | jq -c \
+        --argjson id "$SUMMARY_ID" --argjson line "$cr_line_no" \
+        --arg tier "$cr_tier" --arg body "$cr_line" '
+        . + [ {
+          id: $id,
+          path: "(PR-level summary comment)",
+          line: $line,
+          tier: $tier,
+          body_snippet: ($body | .[0:120])
+        } ]
+      ')
+    fi
+  done <<EOF
+$SUMMARY_SCAN
+EOF
+fi
+
+SUMMARY_BLOCKING_COUNT=$(echo "$SUMMARY_BLOCKING" | jq 'length')
+log "found $SUMMARY_BLOCKING_COUNT blocking-tier summary finding(s) on HEAD"
+
+# Resolution channel for a summary-only finding (#832 acceptance criterion 3).
+# A summary finding has no review thread, so "Resolve conversation" — the
+# inline path's escape hatch — does not exist for it. A FIXED finding clears
+# itself: the next push produces a new summary for the new head without the
+# marker. A REBUTTED or DEFERRED one has no such path, and with
+# `enforce_admins: true` there is no break-glass either, so the gate would
+# deadlock the PR permanently without an explicit acknowledgement channel.
+#
+# The channel: a PR comment containing the exact token
+#   [mergepath-summary-ack: <HEAD sha>]
+# written by a human collaborator (author_association OWNER / MEMBER /
+# COLLABORATOR — a GitHub-computed field, not something the commenter sets)
+# and, per the same reasoning that keeps bots out of the reviewer set, not by
+# a `[bot]` account.
+#
+# Head-pinned by construction, not by clock: the token names the current head
+# sha, so an ack cannot be written before the commit it clears exists, and a
+# subsequent push invalidates every prior ack. That is the same anchor the
+# summary selection above uses, and again involves no timestamp.
+SUMMARY_ACK_TOKEN="[mergepath-summary-ack: $HEAD_SHA]"
+if [ "$SUMMARY_BLOCKING_COUNT" -gt 0 ]; then
+  if echo "$ISSUE_COMMENTS_JSON" | jq -e --arg tok "$SUMMARY_ACK_TOKEN" '
+    any(.[];
+      ((.user.login // "") | endswith("[bot]") | not)
+      and ((.author_association // "") as $aa
+           | (["OWNER", "MEMBER", "COLLABORATOR"] | index($aa)) != null)
+      and ((.body // "") | contains($tok))
+    )
+  ' >/dev/null 2>&1; then
+    log "summary findings acknowledged for $HEAD_SHA by a collaborator ack comment — not gating"
+    SUMMARY_BLOCKING='[]'
+    SUMMARY_BLOCKING_COUNT=0
+  fi
+fi
+
+if [ "$BLOCKING_COUNT" -eq 0 ] && [ "$SUMMARY_BLOCKING_COUNT" -eq 0 ]; then
   echo "CodeRabbit blocking-tier unresolved: 0"
   exit 0
+fi
+
+# --- verdict reporting ------------------------------------------------------
+#
+# A function because the two paths below reach it from different depths: when
+# the inline surface produced no candidates, the only findings left are summary
+# ones, which carry no review thread — so the reviewThreads scan has nothing to
+# look up and is skipped entirely rather than run for its side effects.
+report_verdict() {
+  local unresolved=$1 count
+  count=$(echo "$unresolved" | jq 'length')
+
+  if [ "$count" -gt 0 ]; then
+    echo ""
+    echo "Unresolved CodeRabbit blocking-tier findings on current HEAD ($HEAD_SHA):"
+    echo "$unresolved" | jq -r '
+      .[] | "  - [\(.tier | ascii_upcase)] \(.path):\(.line) (comment id \(.id))\n      \(.body_snippet)"
+    '
+    echo ""
+    echo "Resolve each inline thread via the GitHub UI (or the GraphQL"
+    echo "resolveReviewThread mutation) once the finding is addressed."
+    if [ "$SUMMARY_BLOCKING_COUNT" -gt 0 ]; then
+      echo ""
+      echo "Findings listed against \"(PR-level summary comment)\" have no review"
+      echo "thread to resolve. Fixing one clears it on its own: the next push"
+      echo "produces a summary for the new head without the finding. To record a"
+      echo "rebuttal or a deferral instead, post a PR comment containing:"
+      echo "    $SUMMARY_ACK_TOKEN"
+      echo "The ack must come from a collaborator, and it is pinned to this head"
+      echo "— any subsequent push invalidates it."
+    fi
+    echo ""
+  fi
+
+  echo "CodeRabbit blocking-tier unresolved: $count"
+
+  if [ "$count" -gt 0 ]; then
+    exit 1
+  fi
+  exit 0
+}
+
+if [ "$BLOCKING_COUNT" -eq 0 ]; then
+  report_verdict "$SUMMARY_BLOCKING"
 fi
 
 # --- fetch review-thread resolution state via GraphQL ----------------------
@@ -552,25 +818,12 @@ UNRESOLVED_BLOCKING=$(echo "$BLOCKING_COMMENTS" | jq \
   ]
 ')
 
-UNRESOLVED_COUNT=$(echo "$UNRESOLVED_BLOCKING" | jq 'length')
-
 # --- report ----------------------------------------------------------------
 
-if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
-  echo ""
-  echo "Unresolved CodeRabbit blocking-tier findings on current HEAD ($HEAD_SHA):"
-  echo "$UNRESOLVED_BLOCKING" | jq -r '
-    .[] | "  - [\(.tier | ascii_upcase)] \(.path):\(.line) (comment id \(.id))\n      \(.body_snippet)"
-  '
-  echo ""
-  echo "Resolve each thread via the GitHub UI (or GraphQL"
-  echo "resolveReviewThread mutation) once the finding is addressed."
-  echo ""
-fi
-
-echo "CodeRabbit blocking-tier unresolved: $UNRESOLVED_COUNT"
-
-if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
-  exit 1
-fi
-exit 0
+# Summary findings are appended AFTER the thread-classified inline ones: they
+# carry no thread, so the resolution map above says nothing about them, and any
+# ack that would clear them was already applied when SUMMARY_BLOCKING was built.
+report_verdict "$(jq -c -n \
+  --argjson inline "$UNRESOLVED_BLOCKING" \
+  --argjson summary "$SUMMARY_BLOCKING" \
+  '$inline + $summary')"
