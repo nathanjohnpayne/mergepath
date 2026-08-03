@@ -182,6 +182,8 @@ jobs:
       contents: read
       pull-requests: read
       issues: read
+      # actions: read for the server-issued pass-start stamp (round 6).
+      actions: read
       checks: write
     steps:
       - name: Checkout repo (default branch — trusted scripts)
@@ -203,11 +205,19 @@ jobs:
           DISPATCH_PR: ${{ github.event.client_payload.pr }}
         run: |
           set -euo pipefail
-          # Server-comparable stamp for the pre-POST freshness check below:
-          # an in_progress entry whose started_at postdates this moment
-          # belongs to a NEWER evaluation, and this pass must not write
-          # over its hold (cross-agent round 3 on #867).
-          PASS_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # Stamp for the pre-POST freshness check below: an in_progress
+          # entry whose started_at postdates this pass's start belongs to
+          # a NEWER evaluation, and this pass must not write over its hold
+          # (cross-agent round 3 on #867). SERVER-issued, not runner-local
+          # date (round 6): both sides of the comparison must come from
+          # the same clock authority, or runner skew can hide a newer
+          # hold. run_started_at slightly precedes this step's own reads,
+          # which errs toward withholding — the fail-closed direction.
+          if ! PASS_START=$(gh api "repos/$REPO/actions/runs/$GITHUB_RUN_ID" \
+              --jq .run_started_at) || [ -z "$PASS_START" ]; then
+            echo "::error::Could not read this run's server-issued start time; aborting the pass (fail closed)."
+            exit 1
+          fi
           # Head-to-PR mapping from the open-PR list ONLY — never
           # workflow_run.pull_requests, empty for fork PRs (#845 risks).
           # Exhaustive pagination, not a fixed cap: a capped list silently
