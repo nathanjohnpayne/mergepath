@@ -27,6 +27,14 @@
 #                              the threshold-gated PR still get a trigger
 #                              under the pre-#486 behavior. Unset/false ⇒ the
 #                              PR is treated as under-threshold.
+#   MERGEPATH_CODEX_AUTO_TRIGGER
+#                              Optional. Set to true/1 by an AUTOMATIC caller
+#                              (CI), never by an agent invoking this script by
+#                              hand. Marks the trigger as machine-initiated,
+#                              which makes it eligible to be skipped when the
+#                              head introduces no reviewable content change —
+#                              see auto_trigger_content_free() and #798. Only
+#                              honored together with --trigger-only.
 #
 # IMPORTANT: a plain push (`synchronize`) never re-triggers a Codex review —
 # the Codex GitHub App reviews only on PR-open, ready-for-review, or an
@@ -71,7 +79,11 @@
 #      already present on the current HEAD. If found, skips the trigger
 #      comment and goes straight to emitting JSON — re-posting `@codex
 #      review` when Codex has already responded can cause double-processing
-#      or rate-limit pushback.
+#      or rate-limit pushback. Under --trigger-only, an AUTOMATIC caller
+#      (MERGEPATH_CODEX_AUTO_TRIGGER) additionally skips when
+#      scripts/workflow/codex_auto_trigger_gate.sh shows this head's
+#      external-review fingerprint already reviewed on an earlier commit —
+#      the content-free `update-branch` head of #798.
 #   4. Otherwise posts `@codex review` as a PR comment, waits a short
 #      bounded window for Codex's documented `eyes` acknowledgment on
 #      that trigger comment, and re-posts the trigger up to
@@ -930,6 +942,70 @@ existing_codex_trigger_on_head() {
   ' >/dev/null 2>&1
 }
 
+# #798: content-fingerprint idempotency for AUTOMATIC callers, alongside the
+# per-HEAD idempotency above. `existing_codex_trigger_on_head` answers "was a
+# trigger already posted for this SHA"; this answers "has Codex already
+# reviewed this CONTENT", which is the question an `update-branch` head raises.
+# `gh pr update-branch` mints a new SHA that changes no file in the PR's own
+# diff, and with `required_status_checks.strict: true` every merge forces one
+# on every other open PR — so a batch of N PRs drew O(N²) review rounds that
+# responded to no code change (#798).
+#
+# OPT-IN, and deliberately so. It applies only when the caller sets
+# MERGEPATH_CODEX_AUTO_TRIGGER=true (or 1) — today that is
+# agent-review.yml's auto-merge job, whose CodeRabbit-wait step reaches this
+# script through coderabbit-wait.sh's #489 rate-limit failover. An agent's own
+# `codex-review-request.sh <PR#> --trigger-only` never sets it and therefore
+# ALWAYS posts, which is what keeps the explicit-invocation requirement
+# (#631/#648) intact: a fix push must re-arm HEAD-anchored clearance, and only
+# a machine-initiated trigger on content nobody changed is suppressible.
+#
+# Honored only under --trigger-only, the shape every automatic caller uses.
+# In full (polling) mode a suppressed trigger would leave the poll loop
+# waiting out `review_timeout_seconds` for a review nobody requested, so the
+# mode that cannot express "no trigger, no wait" simply does not opt in.
+#
+# The decision itself lives in scripts/workflow/codex_auto_trigger_gate.sh so
+# it is directly testable; this is the call site, not the policy. Fail-open on
+# every uncertainty — a missing helper (a consumer mid-sync, or the PR that
+# introduces it), a nonzero exit, unparseable output, or an explicit
+# `trigger:true` all return non-zero here so the trigger is posted.
+AUTO_TRIGGER_SKIP_REASON=""
+auto_trigger_content_free() {
+  case "${MERGEPATH_CODEX_AUTO_TRIGGER:-}" in
+    true|True|TRUE|1) ;;
+    *) return 1 ;;
+  esac
+
+  local gate
+  gate="${MERGEPATH_CODEX_AUTO_TRIGGER_GATE_CMD:-$__CODEX_REQUEST_DIR/workflow/codex_auto_trigger_gate.sh}"
+  if [ ! -f "$gate" ]; then
+    log "auto-trigger gate helper not present at $gate — posting the trigger (fail open)"
+    return 1
+  fi
+
+  local json rc=0
+  # stderr is inherited so the gate's diagnostics stream into this run's log;
+  # only stdout is parsed.
+  json=$(bash "$gate" \
+    --repo "$REPO" \
+    --pr "$PR_NUMBER" \
+    --head "$HEAD_SHA" \
+    --config "$CONFIG" \
+    --bot-login "$BOT_LOGIN") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "auto-trigger gate exited $rc — posting the trigger (fail open)"
+    return 1
+  fi
+
+  local decision
+  decision=$(printf '%s' "$json" | jq -r 'if .trigger == false then "skip" else "post" end' 2>/dev/null) || decision="post"
+  [ "$decision" = "skip" ] || return 1
+
+  AUTO_TRIGGER_SKIP_REASON=$(printf '%s' "$json" | jq -r '.reason // "reviewable content is unchanged"' 2>/dev/null || printf 'reviewable content is unchanged')
+  return 0
+}
+
 reset_review_wait_clock() {
   START_TS=$(date +%s)
   DEADLINE=$((START_TS + TIMEOUT_SECONDS))
@@ -1167,6 +1243,8 @@ if has_cleared_signal "$INITIAL_SCAN"; then
   log "Codex has already cleared on HEAD (reaction, no-blocking-tier review, or affirmative verdict comment) — skipping trigger comment"
 elif [ "$TRIGGER_ONLY" = "true" ] && existing_codex_trigger_on_head; then
   log "trigger-only: @codex review already requested on HEAD — skipping duplicate trigger (idempotent, #489)"
+elif [ "$TRIGGER_ONLY" = "true" ] && auto_trigger_content_free; then
+  log "auto-trigger: $AUTO_TRIGGER_SKIP_REASON — skipping the automatic @codex review (#798)"
 else
   post_codex_trigger
 fi

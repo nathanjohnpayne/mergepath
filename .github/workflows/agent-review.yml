@@ -1029,6 +1029,33 @@ jobs:
           OP_PREFLIGHT_AUTHOR_PAT: ${{ secrets.AUTHOR_MERGE_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          # #798: mark every `@codex review` that originates from THIS step as
+          # machine-initiated. It is the only automatic trigger path in the
+          # repo — this step runs on `synchronize`, and `gh pr update-branch`
+          # makes `synchronize` fire on a head that changes no file in the PR's
+          # own diff, so coderabbit-wait.sh's #489 rate-limit failover
+          # re-requested a full Codex review for content Codex had already
+          # read. With `required_status_checks.strict: true` forcing an
+          # update-branch on every open PR after every merge, and `Codex P1
+          # unresolved threads` required, a batch of N concurrent PRs cost
+          # O(N²) rounds that answered no code change.
+          #
+          # The flag is INERT on its own: it makes codex-review-request.sh
+          # consult scripts/workflow/codex_auto_trigger_gate.sh, which suppresses
+          # the trigger ONLY when this head's `external-review:v2` fingerprint —
+          # the same #705 fingerprint that carries a Codex verdict across an
+          # update-branch — already matches a commit Codex reviewed. A push that
+          # changes PR content changes the fingerprint and still triggers, and an
+          # agent's own `codex-review-request.sh --trigger-only` never sets this
+          # variable, so the #631/#648 explicit-invocation requirement holds.
+          #
+          # It travels as an env var rather than an argument because this step
+          # does not call codex-review-request.sh directly — coderabbit-wait.sh
+          # does, as its failover child, and a child process inherits the
+          # environment. The token that posts the trigger is unchanged
+          # (OP_PREFLIGHT_AUTHOR_PAT above → gh-as-author.sh), so the trigger
+          # keeps its author attribution and its workflow-triggering effect.
+          MERGEPATH_CODEX_AUTO_TRIGGER: 'true'
         run: |
           # Delegate to scripts/coderabbit-wait.sh so auto-merge honors the
           # same semantics the agent-driven flow uses: HEAD-anchored

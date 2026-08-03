@@ -380,8 +380,16 @@ paths:
     # poll loop can short-circuit on a usage-limit / not-connected marker
     # instead of running out the full review timeout (#722). Soft-degrades to
     # the pre-#722 behavior if the lib is absent mid-skew.
+    #
+    # Shells out to scripts/workflow/codex_auto_trigger_gate.sh (also
+    # existence-guarded) to decide whether an AUTOMATIC trigger may be skipped
+    # on a content-free update-branch head (#798). Absent, the call site fails
+    # OPEN and posts the trigger — the pre-#798 behavior — so the coupling is
+    # soft; it is declared so the closure invariant records it and the gate
+    # travels with its only caller.
     requires:
       - "scripts/lib/codex-failure-markers.sh"
+      - "scripts/workflow/codex_auto_trigger_gate.sh"   # #798, content-free auto-trigger gate
   - path: scripts/codex-review-check.sh
     type: canonical
     consumers: all
