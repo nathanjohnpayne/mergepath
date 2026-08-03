@@ -381,6 +381,84 @@ echo "$rh2_out" | grep -q "Starting stage: github-infra" \
   || fail "resume should have failed in github-infra again; got $rh2_ec"
 
 # ---------------------------------------------------------------------------
+# Test 12d: the printed resume hint shell-escapes its arguments (#801).
+#
+# A --target-dir containing a space and a shell metacharacter must come
+# back out of the hint quoted so it can be pasted back into a shell
+# verbatim. Before the fix, the raw value was interpolated unescaped,
+# so the printed command split on the space and could not be re-run as
+# printed. Reuse the failing-stage lib from Test 12c so stage
+# github-infra fails and template-mirror is the last completed stage.
+# ---------------------------------------------------------------------------
+space_target="$WORKDIR/resume hint target's"
+rm -rf "$space_target"
+mkdir -p "$space_target"
+set +e
+sq_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+         BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+         BOOTSTRAP_LIB_DIR="$fail_lib" \
+         "$SCRIPT" my-new-repo \
+         --target-dir "$space_target" \
+         --description "test repo" --visibility private --firebase none \
+         --codex-app n --project new --dry-run 2>&1)
+sq_ec=$?
+set -e
+[ "$sq_ec" -eq 3 ] \
+  && pass "a failing stage with a spacey target-dir still exits 3" \
+  || fail "expected exit 3; got $sq_ec; out: $sq_out"
+printf -v _expect_q_target '%q' "$space_target"
+echo "$sq_out" | grep -qF -- "--target-dir $_expect_q_target" \
+  && pass "the resume hint shell-escapes a target-dir with a space/quote" \
+  || fail "resume hint did not escape the target-dir; out: $sq_out"
+# The escaped command must be one bash can actually re-split back into
+# the original single argument — not just visually quoted.
+_resume_line=$(echo "$sq_out" | grep -- "--resume template-mirror" | tail -n1)
+eval "_reparsed_args=($(echo "$_resume_line" | sed -n 's/.*Resume with: //p'))"
+found_target=""
+for i in "${!_reparsed_args[@]}"; do
+  if [ "${_reparsed_args[$i]}" = "--target-dir" ]; then
+    found_target="${_reparsed_args[$((i + 1))]}"
+    break
+  fi
+done
+[ "$found_target" = "$space_target" ] \
+  && pass "the escaped hint re-parses back to the exact original target-dir" \
+  || fail "re-parsed target-dir mismatch: got '$found_target', want '$space_target'"
+
+# The command word is the other half of a pasteable hint: escaping every
+# argument but leaving `$0` raw still splits the invocation when the
+# wizard lives under a path with a space. Invoke a copy from a spacey
+# directory (with the mergepath root pinned, since the copy's parent is
+# no longer the repo) and require the emitted command word to re-parse
+# back to that exact path.
+space_cmd_dir="$WORKDIR/space cmd dir"
+rm -rf "$space_cmd_dir"
+mkdir -p "$space_cmd_dir"
+cp "$SCRIPT" "$space_cmd_dir/bootstrap-new-repo.sh"
+chmod +x "$space_cmd_dir/bootstrap-new-repo.sh"
+sc_target="$WORKDIR/space-cmd-target"
+rm -rf "$sc_target"
+mkdir -p "$sc_target"
+set +e
+sc_out=$(BOOTSTRAP_SKIP_TOOL_CHECK=1 BOOTSTRAP_SKIP_MERGEPATH_GUARD=1 \
+         BOOTSTRAP_AUTO_CONFIRM=1 BOOTSTRAP_AUTO_PROMPT=skip \
+         BOOTSTRAP_LIB_DIR="$fail_lib" BOOTSTRAP_MERGEPATH_ROOT="$ROOT" \
+         "$space_cmd_dir/bootstrap-new-repo.sh" my-new-repo \
+         --target-dir "$sc_target" \
+         --description "test repo" --visibility private --firebase none \
+         --codex-app n --project new --dry-run 2>&1)
+sc_ec=$?
+set -e
+[ "$sc_ec" -eq 3 ] \
+  && pass "a failing stage invoked from a spacey command path still exits 3" \
+  || fail "expected exit 3; got $sc_ec; out: $sc_out"
+_sc_line=$(echo "$sc_out" | grep -- "--resume template-mirror" | tail -n1)
+eval "_sc_args=($(echo "$_sc_line" | sed -n 's/.*Resume with: //p'))"
+[ "${_sc_args[0]}" = "$space_cmd_dir/bootstrap-new-repo.sh" ] \
+  && pass "the escaped hint re-parses back to the exact command path" \
+  || fail "re-parsed command path mismatch: got '${_sc_args[0]}', want '$space_cmd_dir/bootstrap-new-repo.sh'"
+
+# ---------------------------------------------------------------------------
 # Test 13: --skip-board suppresses the Project v2 board sub-step but
 # the stage still runs (summary + PRD/spec/plan scaffolds are too
 # valuable to gate on whether the operator wanted a board). The

@@ -790,7 +790,12 @@ dispatch() {
         fi
       done
       if [ -n "$_resume_hint" ]; then
-        bootstrap::wizard_err "stage '$stage' failed (rc=$stage_rc). Resume with: $0 ${BOOTSTRAP_INPUT_REPO_NAME} --target-dir $TARGET_DIR --resume $_resume_hint"
+        local _q_cmd _q_repo _q_target _q_hint
+        printf -v _q_cmd '%q' "$0"
+        printf -v _q_repo '%q' "$BOOTSTRAP_INPUT_REPO_NAME"
+        printf -v _q_target '%q' "$TARGET_DIR"
+        printf -v _q_hint '%q' "$_resume_hint"
+        bootstrap::wizard_err "stage '$stage' failed (rc=$stage_rc). Resume with: $_q_cmd $_q_repo --target-dir $_q_target --resume $_q_hint"
         bootstrap::wizard_err "(--resume skips up to AND INCLUDING the stage it names, so '$_resume_hint' is what re-enters the failed '$stage'.)"
       else
         bootstrap::wizard_err "stage '$stage' failed (rc=$stage_rc). No earlier stage completed, so there is nothing to resume past — fix the cause and re-run the same command WITHOUT --resume."
