@@ -137,6 +137,20 @@ jobs:
               >/dev/null
           done
           echo "Opened pending entries for all three contexts on $HEAD_SHA."
+          # Post-POST re-read (cross-agent round 5): if the parent flipped
+          # to completed inside this step's few-second window, the
+          # completed delivery's pass STARTS after these holds exist — the
+          # delivery post-dates parent completion, which post-dates the
+          # in_progress read above — so its freshness guard reads them as
+          # pre-pass phase-1 holds and its verdicts supersede them. A
+          # strand would need an entire pass (checkout plus three gate
+          # scripts) to fit inside this step's gap, which the duration
+          # floor excludes; the pathological remainder is retired by the
+          # sweep within one interval.
+          if parent_status=$(gh api "repos/$REPO/actions/runs/$PARENT_RUN_ID" --jq .status) \
+              && [ "$parent_status" = "completed" ]; then
+            echo "Parent completed during this step; its completed pass starts after these holds and retires them."
+          fi
 
   # Phase 2. POSTs a fresh completed run per context rather than PATCHing
   # phase 1's: the phases are separate workflow runs, and every Checks-API
@@ -323,10 +337,14 @@ jobs:
             # correct for the 65535-char API limit (b10671e wave).
             local summary="${output:0:60000}"
             # Freshness check (cross-agent round 3 on #867): a pending
-            # entry started AFTER this pass began means a newer evaluation
-            # owns this slot — withhold the now-stale verdict and leave the
-            # hold for the newer pass to retire. started_at is assigned by
-            # the server, not by any actor this check would need to trust.
+            # entry started AT or AFTER this pass began means a newer
+            # evaluation owns this slot — withhold the now-stale verdict
+            # and leave the hold for the newer pass to retire. >= so a
+            # same-second tie withholds (round 5): a genuinely newer hold
+            # in the boundary second must win, and the tie cannot be this
+            # pass's own phase-1 hold, which predates the pass by the
+            # parent's own runtime. started_at is assigned by the server,
+            # not by any actor this check would need to trust.
             # The residual window is the gap between this read and the POST
             # below — the floor without conditional writes.
             # A FAILED lookup withholds too (cross-agent round 4): unknown
@@ -335,7 +353,7 @@ jobs:
             local newer
             if ! newer=$(gh api --paginate -X GET "repos/$REPO/commits/$head/check-runs" \
               -f check_name="$context" -f filter=latest -f per_page=100 \
-              --jq ".check_runs[] | select(.status != \"completed\") | select(.started_at > \"$PASS_START\") | .id"); then
+              --jq ".check_runs[] | select(.status != \"completed\") | select(.started_at >= \"$PASS_START\") | .id"); then
               echo "::error::Freshness lookup failed for $context on $head; withholding this verdict (fail closed)."
               had_infra_error=1
               return 0
@@ -343,6 +361,24 @@ jobs:
             if [ -n "$newer" ]; then
               echo "Newer pending for $context on $head (started after $PASS_START); withholding this verdict."
               return 0
+            fi
+            # Current-head revalidation (cross-agent round 5): the gate
+            # scripts evaluate LIVE PR state, so a force-push between
+            # enumeration and here would attach a fresh-state verdict to
+            # the captured SHA — reusable if the branch ever returns to
+            # it. On drift, red pinned to the bound head (the event
+            # publisher's posture); the push's own synchronize event owns
+            # the new head. A failed read is unknown drift: fail closed.
+            local live_head
+            if ! live_head=$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha); then
+              echo "::error::Could not revalidate PR #$pr head before posting $context; withholding (fail closed)."
+              had_infra_error=1
+              return 0
+            fi
+            if [ "$live_head" != "$head" ]; then
+              conclusion="failure"
+              title="$context — head moved during evaluation"
+              summary="PR #$pr moved from $head to $live_head while this pass evaluated; this verdict is pinned red to the superseded head. The new head gets its own evaluation from its own events."
             fi
             if ! gh api -X POST "repos/$REPO/check-runs" \
               -f name="$context" \
