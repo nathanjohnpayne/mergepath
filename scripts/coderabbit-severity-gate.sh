@@ -445,18 +445,66 @@ CR_SUMMARY_BENIGN_STANZA_RE='auto-generated comment: (summarize|release notes) b
 CR_PRE_MERGE_BLOCK_START='<!-- pre_merge_checks_walkthrough_start -->'
 CR_PRE_MERGE_BLOCK_END='<!-- pre_merge_checks_walkthrough_end -->'
 
+# Emit one normalized line per STRUCTURAL stanza OPENER in the body.
+#
+# "Structural" is the whole point (Codex P1 round 1 on #886). Counting the bare
+# `auto-generated comment: ` substring anywhere in the body lets PR-CONTROLLED
+# text decide whether this summary is a completed report: CodeRabbit quotes
+# changed code in its walkthrough and in summary findings, so a PR that merely
+# CONTAINS the rate-limit marker as source text — this very PR's test fixtures
+# do — inflates the non-benign count and makes an otherwise-complete summary
+# read as "not a report". That path exits 0 with any real blocking finding in
+# that summary ungated: a false clear of a required gate, produced by content
+# the PR author writes. Precisely the failure class #832 exists to close.
+#
+# So a stanza counts only in the shape CodeRabbit actually writes it: a whole
+# line, at column 0, wrapping a KIND — and only OUTSIDE a fenced code block,
+# because a fence is how a quoted marker reaches the rendered body at column 0.
+# Both narrowings move the same way: they can only shrink the non-benign count,
+# never grow it. That direction is deliberate. Over-counting non-benign skips
+# the summary and clears the gate (fails OPEN); under-counting classifies a
+# body that produced no review, which finds no `⚠️`/`P1` lines in a rate-limit
+# notice and, in the #790 stale-text case, gates on findings rather than
+# clearing (fails CLOSED). Only one of those two errors can pass a blocking
+# finding through, and this shape cannot make it.
+#
+# `end of auto-generated comment:` CLOSERS are deliberately not openers, so a
+# stanza contributes exactly once whether or not CodeRabbit closes it. Real
+# bodies carry both forms (mergepath#874's summary has three openers and two
+# closers), and counting closers made the total depend on which stanza kinds
+# happen to be wrapped.
+summary_stanza_opener_lines() {
+  printf '%s\n' "$1" | awk '
+    /^```/ { fence = !fence; next }
+    fence { next }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      sub(/[ \t]+$/, "", line)
+      if (line ~ /^<!-- This is an auto-generated comment: .* by coderabbit\.ai -->$/) {
+        print line
+      }
+    }
+  '
+}
+
 # True when the body carries at least one outcome stanza AND every stanza is
-# benign. TOTAL counts occurrences of the bare wrapper prefix, not a KIND
-# pattern: a KIND containing angle brackets (`failure <head-changed>`) escapes
-# any [^<>]-class match. The `-gt 0` guard is load-bearing, not defensive — a
-# body with zero stanzas is no report at all and must not pass vacuously.
+# benign. The KIND allow-list ($CR_SUMMARY_BENIGN_STANZA_RE) is unchanged and
+# stays in lockstep with scripts/coderabbit-wait.sh; only WHERE it is applied
+# narrowed, to the structural openers above. The `-gt 0` guard is load-bearing,
+# not defensive — a body with zero stanzas is no report at all and must not
+# pass vacuously. ALLOW-list, not deny-list: a KIND CodeRabbit has not shipped
+# yet reads as not-a-report, never as clean, including one containing angle
+# brackets (`failure <head-changed>`), which the `.*` KIND span still matches.
 summary_stanzas_all_benign() {
-  local total benign
+  local openers total benign
+  openers=$(summary_stanza_opener_lines "$1")
+  [ -n "$openers" ] || return 1
   # `|| true` on both: grep exits 1 on no match, which `set -o pipefail` would
-  # promote to a failed assignment. `wc -l` still prints 0, which is the answer
-  # we want — a zero-stanza body then fails the `-gt 0` guard below.
-  total=$(printf '%s' "$1" | grep -oiE 'auto-generated comment: ' | wc -l | tr -d ' ' || true)
-  benign=$(printf '%s' "$1" | grep -oiE "$CR_SUMMARY_BENIGN_STANZA_RE" | wc -l | tr -d ' ' || true)
+  # promote to a failed assignment. `grep -c` still prints 0, which is the
+  # answer we want.
+  total=$(printf '%s\n' "$openers" | grep -c . || true)
+  benign=$(printf '%s\n' "$openers" | grep -ciE "$CR_SUMMARY_BENIGN_STANZA_RE" || true)
   [ "${total:-0}" -gt 0 ] && [ "$total" = "$benign" ]
 }
 
@@ -557,11 +605,27 @@ SUMMARY_BODY=$(echo "$SUMMARY_JSON" | jq -r '.body')
 # exactly a whole-body scan with the truncation removed, and it yields a
 # reportable location and snippet per finding for free.
 #
-# Alongside the reportable list, the loop accumulates the CLASSIFIED lines
-# verbatim into SUMMARY_FINDINGS_FINGERPRINT_INPUT. That text — not the
-# truncated 120-char snippet the report prints — is what the acknowledgement
-# token below is fingerprinted from, so two findings sharing a long prefix
-# still produce different fingerprints.
+# The acknowledgement token below is fingerprinted from the WHOLE classified
+# body (SUMMARY_FINDINGS_FINGERPRINT_INPUT), not from the classified lines
+# alone. Fingerprinting only the marker-bearing lines was the round-2 shape and
+# it was very nearly a no-op (Codex P1 round 1 on #886): CodeRabbit writes a
+# finding as a marker line — `_⚠️ Potential issue_` — on its own, with the
+# actual finding on the lines BELOW it, so a same-head re-review that replaces
+# finding A with finding B keeps that marker line byte-identical and produced
+# an identical fingerprint. A's ack then cleared B, which is exactly the false
+# clear the fingerprint was introduced to prevent.
+#
+# Hashing the whole classified body is deliberately blunter than hashing
+# per-finding blocks. A block-scoped fingerprint would have to decide where a
+# finding ends, and the boundary is not ours to define — CodeRabbit owns that
+# layout, and a wrong boundary silently reopens this same hole (a finding whose
+# file header sits ABOVE its marker moves between files without the hash
+# moving). Whole-body errs toward invalidating an ack that a cosmetic edit
+# would have survived, and that error is free: the gate stays red and prints
+# the fresh token, so recovery is one line. The opposite error passes an
+# undispositioned blocking finding through a required gate. The pre-merge check
+# table — the one part of the body that churns without a re-review — is already
+# stripped before this point, so ordinary noise does not reach the hash.
 SUMMARY_BLOCKING='[]'
 SUMMARY_FINDINGS_FINGERPRINT_INPUT=''
 if [ -z "$SUMMARY_BODY" ]; then
@@ -589,12 +653,17 @@ else
           body_snippet: ($body | .[0:120])
         } ]
       ')
-      SUMMARY_FINDINGS_FINGERPRINT_INPUT="${SUMMARY_FINDINGS_FINGERPRINT_INPUT}${cr_tier}	${cr_line}
-"
     fi
   done <<EOF
 $SUMMARY_SCAN
 EOF
+  # Only bind a fingerprint when there is something to acknowledge. With no
+  # blocking finding the token is never printed and never consulted, and
+  # hashing the body anyway would make the (unused) token churn on every
+  # walkthrough edit.
+  if [ "$(echo "$SUMMARY_BLOCKING" | jq 'length')" -gt 0 ]; then
+    SUMMARY_FINDINGS_FINGERPRINT_INPUT="$SUMMARY_SCAN"
+  fi
 fi
 
 SUMMARY_BLOCKING_COUNT=$(echo "$SUMMARY_BLOCKING" | jq 'length')

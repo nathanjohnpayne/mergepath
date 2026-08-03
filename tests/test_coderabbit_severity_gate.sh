@@ -1690,6 +1690,216 @@ else
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
+# ===========================================================================
+# Codex P1 round 1 on #886. Two holes the round-2 ack fix left open, each a
+# false CLEAR of this required gate. Both fixtures deliberately use CodeRabbit's
+# REAL body shapes rather than the single-line convenience shapes above — that
+# difference is the whole finding in the first case.
+# ===========================================================================
+
+# CodeRabbit writes a summary finding as a marker line ON ITS OWN, with the
+# finding text on the lines BELOW it (see the split header/body fixtures in
+# tests/test_coderabbit_wait_status_probe.sh). Only the marker line classifies,
+# so fingerprinting the classified lines alone hashed a constant: A and B below
+# share a byte-identical first line and differ only underneath it.
+SUMMARY_SPLIT_FINDING_A='_⚠️ Potential issue_
+
+**Unbounded retry loop**
+
+The retry loop never terminates on a 5xx response.'
+SUMMARY_SPLIT_FINDING_B='_⚠️ Potential issue_
+
+**Credential written to the log**
+
+The failure branch logs the bearer token in full.'
+
+SPLIT_SUMMARY_A="$(make_summary_body "$HEAD_SHA" "$SUMMARY_SPLIT_FINDING_A")"
+SPLIT_SUMMARY_B="$(make_summary_body "$HEAD_SHA" "$SUMMARY_SPLIT_FINDING_B")"
+
+# The token a collaborator would have copied while finding A was on screen.
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$SPLIT_SUMMARY_A")
+set +e
+SPLIT_PROBE_OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+set -e
+SPLIT_ACK_TOKEN_A=$(extract_ack_token "$SPLIT_PROBE_OUT")
+
+# ---------------------------------------------------------------------------
+# Test 34 (#886, Codex P1): a same-head re-review that REPLACES finding A with
+# a different finding B, keeping the `_⚠️ Potential issue_` header byte-
+# identical, must invalidate A's ack. Pre-fix the fingerprint covered only the
+# header line, so both summaries produced the same token and A's ack cleared B
+# — an undispositioned blocking finding passing a required gate.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 34 (#886): ack for finding A vs same-header finding B → still gates, exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$SPLIT_SUMMARY_B" \
+  "coderabbitai[bot]" \
+  "$SPLIT_ACK_TOKEN_A
+
+Rebutted: the retry loop is bounded by the caller." \
+  "nathanjohnpayne" "OWNER")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+SPLIT_ACK_TOKEN_B=$(extract_ack_token "$OUT")
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && [ -n "$SPLIT_ACK_TOKEN_A" ] && [ "$SPLIT_ACK_TOKEN_A" != "$SPLIT_ACK_TOKEN_B" ]; then
+  pass "same-header finding swap changes the token; A's ack does not clear B → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1' and A/B tokens differing; got rc=$RC A='$SPLIT_ACK_TOKEN_A' B='$SPLIT_ACK_TOKEN_B'"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 34b (#886, Codex P1): the escape hatch survives the tightening — acking
+# the token printed for B clears B. Finding-pinning must not trade a false
+# clear for a permanent deadlock, since `enforce_admins: true` leaves no
+# break-glass.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 34b (#886): ack regenerated for finding B → exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$SPLIT_SUMMARY_B" \
+  "coderabbitai[bot]" \
+  "$SPLIT_ACK_TOKEN_B
+
+Deferred to a follow-up issue." \
+  "nathanjohnpayne" "OWNER")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0"; then
+  pass "ack regenerated for the replacement finding clears it → exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 35 (#886, Codex P1): PR-CONTROLLED text must not decide whether a
+# summary is a completed report. CodeRabbit quotes changed code, and this very
+# PR's fixtures contain the rate-limit stanza as source text. Pre-fix the
+# whole-body substring count read that echo as a non-benign outcome stanza,
+# discarded an otherwise-complete current-head summary, and exited 0 with a
+# real blocking finding in it.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 35 (#886): echoed rate-limit stanza inside a fence → still a report, exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+ECHOED_STANZA_SUMMARY="$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING
+
+The diff adds this fixture line:
+
+\`\`\`
+<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->
+\`\`\`
+")"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$ECHOED_STANZA_SUMMARY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "author-controlled echo of a stanza marker does not suppress the summary → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 35b (#886, Codex P1): the narrowing above must not fail open. A GENUINE
+# rate-limit stanza — CodeRabbit's own, at column 0 and outside any fence — is
+# still a non-benign outcome, so the body is not a completed report and its
+# text does not gate.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 35b (#886): genuine column-0 rate-limit stanza → not a report, exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING" \
+     '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->')")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && echo "$OUT" | grep -q "non-benign outcome stanza"; then
+  pass "a real rate-limit stanza still suppresses the summary → exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0' and the non-benign log line; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 35c (#886, Codex P1): `end of auto-generated comment:` CLOSERS are not
+# openers. Real bodies carry both forms (mergepath#874's summary has three
+# openers and two closers), and a benign body that closes its stanzas must
+# still read as a completed report. A guard on the counting shape rather than a
+# pre-fix failure.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 35c (#886): closed benign stanzas still read as a report → exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+CLOSED_STANZA_SUMMARY="$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING
+
+<!-- This is an auto-generated comment: release notes by coderabbit.ai -->
+
+Release notes body.
+
+<!-- end of auto-generated comment: release notes by coderabbit.ai -->
+")"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$CLOSED_STANZA_SUMMARY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "benign stanzas with closers still classify as a report → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
 # ---------------------------------------------------------------------------
 echo
 echo "============================================"
