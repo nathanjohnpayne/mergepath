@@ -111,7 +111,7 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 
 **R-42.** Every CodeRabbit `Potential issue` / `⚠️` finding must be explicitly fixed or dismissed with reasoning. ● — REVIEW_POLICY.md § Phase 2.5
 
-**R-43.** CodeRabbit review is advisory: it must not block merge via CI and never submits a changes-requested state. ● — REVIEW_POLICY.md § Phase 2.5
+**R-43.** CodeRabbit review is advisory: it must not block merge via CI and never submits a changes-requested state — where a repo opts in, the severity gate enforcing the shared resolved required-tier set (R-143) as a required check is what makes required-tier findings merge-blocking, while the fleet safety floor (G-149) is what keeps the review itself advisory. ● — REVIEW_POLICY.md § Phase 2.5
 
 **R-44.** Advisory status never overrides the conversation-resolution gate: an unresolved CodeRabbit thread still blocks merge until fixed-or-rebutted and resolved. ● — REVIEW_POLICY.md § Phase 2.5
 
