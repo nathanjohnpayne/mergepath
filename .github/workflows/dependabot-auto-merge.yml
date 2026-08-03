@@ -100,17 +100,77 @@ jobs:
           echo "::notice::Merge will be performed as $MERGE_AS."
 
 
+          # Resolve the latest check run named "$1" on commit "$2", or
+          # empty if that check is absent.
+          #
+          # The `check_name` query parameter filters SERVER-side. That is
+          # load-bearing, not a micro-optimization: the previous
+          # implementation fetched the unfiltered
+          # `check-runs?per_page=100` first page and filtered in jq, which
+          # silently truncated at 100 results because it never paginated.
+          # Repos with many bot/gate workflows blow past that easily —
+          # each re-dispatches on every PR event.
+          #
+          # Concrete failure: nathanjohnpayne/gaycruisebingo PR #524, head
+          # fa6ccdbb724ae2ba77d917371eb6ab243e0a68a0, accumulated 143
+          # check-runs (128 when first diagnosed). The `lint` run this
+          # function waits for had ALREADY succeeded, but sorted onto page
+          # 2 and so was invisible to the single-page call. The function
+          # took the "check absent" branch on every poll, spun the full
+          # 1200s deadline, then hard-failed with a false "did not
+          # complete successfully within 1200s" — blocking a perfectly
+          # mergeable Dependabot PR. With `check_name=lint` the same
+          # commit returns total_count=2, so there is no page 2 to miss
+          # and the truncation is fixed at the source rather than papered
+          # over with --paginate.
+          #
+          # Passed via `-X GET -f` so gh URL-encodes the value. Check
+          # names legitimately contain spaces (e.g. "Label Gate", "Merge
+          # clearance gate"); interpolating one straight into the query
+          # string produces a malformed request that hangs rather than
+          # erroring.
+          #
+          # The redundant-looking jq `select(.name == $check)` is kept
+          # deliberately: it preserves exact-match semantics locally if
+          # the server-side filter ever loosens, and costs nothing on a
+          # handful of rows. `sort_by(...) | last` is unchanged — latest
+          # run of that check still wins.
+          latest_check_run() {
+            gh api -X GET "repos/${GITHUB_REPOSITORY}/commits/$2/check-runs" \
+              -f check_name="$1" -F per_page=100 \
+              | jq -c --arg check "$1" '[.check_runs[] | select(.name == $check)] | sort_by(.started_at // .created_at) | last // empty'
+          }
+
+          # NOTE (unfixed here, deliberately): the `lint` default is a
+          # proxy signal, not the actual merge gate. It is only ever "a
+          # check we expect to be green on HEAD" — it is NOT read from
+          # branch protection's required contexts. In gaycruisebingo, for
+          # instance, the five genuinely-required contexts are CodeRabbit
+          # unresolved blocking findings / Codex P1 unresolved threads /
+          # Label Gate / Merge clearance gate / Self-Review Required, and
+          # `lint` is not among them — so this wait watches something
+          # unrelated to what actually blocks the merge. That is mostly
+          # benign because `--auto` (the primary path) defers to real
+          # branch protection anyway, and this wait is a belt-and-braces
+          # pre-check; it matters most on the no-branch-protection
+          # fallback squash below, which is exactly where a proxy signal
+          # is weakest. The default is intentionally NOT changed here:
+          # other repos may legitimately depend on `lint`, and deriving
+          # the list from branch protection is a behavior change that
+          # belongs in its own reviewed PR, not in a pagination fix.
+          # Repos can already override via REQUIRED_HEAD_CHECK_NAME.
           require_current_head_check_success() {
-            local sha runs conclusion status wait_seconds poll_seconds deadline required_check_name
+            local sha runs conclusion status wait_seconds poll_seconds deadline required_check_name ever_seen
             required_check_name=${REQUIRED_HEAD_CHECK_NAME:-lint}
             wait_seconds=${TEST_CHECK_WAIT_SECONDS:-1200}
             poll_seconds=${TEST_CHECK_POLL_SECONDS:-15}
             deadline=$((SECONDS + wait_seconds))
+            ever_seen=0
             sha=$(gh pr view "$PR_URL" --json headRefOid --jq .headRefOid)
             while :; do
-              runs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$sha/check-runs?per_page=100" \
-                | jq -c --arg check "$required_check_name" '[.check_runs[] | select(.name == $check)] | sort_by(.started_at // .created_at) | last // empty')
+              runs=$(latest_check_run "$required_check_name" "$sha")
               if [ -n "$runs" ]; then
+                ever_seen=1
                 status=$(printf '%s' "$runs" | jq -r '.status')
                 conclusion=$(printf '%s' "$runs" | jq -r '.conclusion // ""')
                 if [ "$status" = "completed" ]; then
@@ -127,7 +187,20 @@ jobs:
                 echo "::notice::Required check run '$required_check_name' is absent on current HEAD $sha; waiting for it to start."
               fi
               if [ "$SECONDS" -ge "$deadline" ]; then
-                echo "::error::Required check run '$required_check_name' did not complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
+                # Deliberately still the full deadline, and still a hard
+                # refusal: a check that genuinely never ran is a real
+                # reason not to auto-merge, and shortening the wait would
+                # break repos whose CI is slow to schedule. Only the
+                # diagnostics split. The old message claimed the check
+                # "did not complete successfully" even when it had never
+                # appeared at all, which is what made the #524 truncation
+                # bug read as a CI failure and cost an hour of digging.
+                if [ "$ever_seen" -eq 0 ]; then
+                  echo "::error::Required check run '$required_check_name' never appeared on current HEAD $sha within ${wait_seconds}s; refusing auto-merge."
+                  echo "::error::The check never started, or REQUIRED_HEAD_CHECK_NAME does not match any check name in this repo. Compare against: gh api -X GET repos/${GITHUB_REPOSITORY}/commits/$sha/check-runs --paginate --jq '.check_runs[].name' | sort -u"
+                else
+                  echo "::error::Required check run '$required_check_name' did not complete successfully within ${wait_seconds}s on current HEAD $sha; refusing auto-merge."
+                fi
                 exit 1
               fi
               sleep "$poll_seconds"
