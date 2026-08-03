@@ -351,29 +351,50 @@ jobs:
           # strand. The sweep stays pending-free by design: a background
           # refresher that pended every open PR each interval would flap
           # every checks display in the repo.
-          # Their created ids are captured: this pass's OWN pendings would
-          # otherwise trip its own freshness guard, since run_started_at
-          # necessarily predates any POST this run makes (round 9 — the
-          # round-8 form self-deadlocked the manual recheck path). The
-          # guard excludes exactly these ids and nothing else.
+          # One hold machinery for every path that must claim a head
+          # before evaluating it (rounds 8-10): retried like the open job,
+          # ids captured because this pass's OWN holds would otherwise trip
+          # its own freshness guard (run_started_at predates any POST this
+          # run makes — round 9), infra-flagged on final failure so the
+          # pass exits red as the alarm (round 10).
           OWN_PENDING_IDS=""
-          if [ -n "$dispatch_matched" ]; then
-            dispatch_head=$(awk -F'\t' 'NR==1{print $2}' <<<"$dispatch_matched")
-            if [ -n "$dispatch_head" ]; then
-              for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
-                if own_id=$(gh api -X POST "repos/$REPO/check-runs" \
+          open_holds() {
+            local hd="$1" name attempt oid ok
+            for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+              ok=0
+              for attempt in 1 2 3; do
+                if oid=$(gh api -X POST "repos/$REPO/check-runs" \
                   -f name="$name" \
-                  -f head_sha="$dispatch_head" \
+                  -f head_sha="$hd" \
                   -f status="in_progress" \
                   -f "output[title]=$name (re-evaluation in progress)" \
-                  -f "output[summary]=Dispatch-requested re-evaluation for $dispatch_head." \
+                  -f "output[summary]=Publisher hold: evaluation in progress for $hd." \
                   --jq .id); then
-                  OWN_PENDING_IDS="$OWN_PENDING_IDS $own_id"
-                else
-                  echo "::warning::Could not open pending $name on $dispatch_head; its verdict follows from this pass regardless."
+                  OWN_PENDING_IDS="$OWN_PENDING_IDS $oid"
+                  ok=1
+                  break
                 fi
+                sleep "$attempt"
               done
-            fi
+              if [ "$ok" -eq 0 ]; then
+                echo "::error::Failed to open hold $name on $hd after 3 attempts."
+                had_infra_error=1
+              fi
+            done
+          }
+          if [ -n "$dispatch_matched" ]; then
+            dispatch_head=$(awk -F'\t' 'NR==1{print $2}' <<<"$dispatch_matched")
+            [ -n "$dispatch_head" ] && open_holds "$dispatch_head"
+          fi
+          # The completed event path claims ITS head too (round 10): when
+          # the open job was delayed past parent completion, its guard
+          # skips without a replacement, and old greens would stay usable
+          # for the whole evaluation. A brief double-hold in the common
+          # case is harmless — the newest run counts, and this pass's
+          # completed verdicts supersede both.
+          if [ -n "$RUN_HEAD" ] && [ -n "$targets" ] \
+              && [ "$(awk -F'\t' 'NR==1{print $2}' <<<"$targets")" = "$RUN_HEAD" ]; then
+            open_holds "$RUN_HEAD"
           fi
           # Heads carried by MORE than one open PR fail closed (cross-agent
           # round 3): the per-commit slot holds one verdict while the
