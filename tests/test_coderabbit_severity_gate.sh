@@ -52,6 +52,7 @@
 #       report → exit 0.
 #   22. ⚠️ present only inside the pre-merge check table → stripped → exit 0.
 #   23. summary-shaped comment authored by a human → ignored → exit 0.
+#   24a. the printed ack token carries the head AND a finding-set fingerprint;
 #   24. collaborator ack naming THIS head → exit 0.
 #   25. ack naming a different sha → still gates → exit 1.
 #   26. ack from a non-collaborator → still gates → exit 1.
@@ -59,6 +60,14 @@
 #   28. unreadable `issues/{pr}/comments` → FAIL CLOSED → exit 2.
 #   29. inline + summary findings both counted; 29b resolving the inline
 #       thread leaves exactly the summary one (inline behavior unchanged).
+#
+# Ack scoping (#886 — an ack clears the findings it acknowledged, nothing else):
+#   30. ack for finding set {A} vs a same-head re-review that rewrote the
+#       summary to {A, B} → still gates; 30b acking the NEW token clears it.
+#   31. a collaborator quoting the gate's own failure output → not an ack;
+#       31b the invariant behind it — the token is never printed at column 0.
+#   32. a valid token mentioned mid-line ("lgtm <token>") → not an ack.
+#   33. an ack posted BEFORE the summary it would clear → still gates.
 #
 # Bash 3.2 portable.
 
@@ -1252,15 +1261,54 @@ fi
 # ===========================================================================
 GATING_SUMMARY_BODY="$(make_summary_body "$HEAD_SHA" "$SUMMARY_BLOCKING_FINDING")"
 
+# The token is pinned to the finding SET as well as the head, so the tests
+# derive it the way a collaborator does — by reading it out of the gate's own
+# failure output — rather than recomputing the fingerprint independently. That
+# also makes the printed token's usability part of the assertion: if the gate
+# ever printed a token its own matcher rejects, the ack channel would be a
+# permanent deadlock and test 24 would fail.
+# `|| true`: under `set -e` a no-match grep inside a command substitution kills
+# the whole suite mid-run, which reports a regression as a truncated log rather
+# than as the assertion that failed. An empty token fails its assertion loudly.
+extract_ack_token() {
+  printf '%s\n' "$1" | grep -o '\[mergepath-summary-ack: [^]]*\]' | head -1 || true
+}
+
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY")
+set +e
+ACK_PROBE_OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+set -e
+ACK_TOKEN=$(extract_ack_token "$ACK_PROBE_OUT")
+ACK_FINGERPRINT=$(printf '%s' "$ACK_TOKEN" | awk '{print $3}' | tr -d ']')
+
+echo
+echo "--- Test 24a (#886): the gate prints a head + finding-set pinned token"
+if printf '%s' "$ACK_TOKEN" | grep -q "^\[mergepath-summary-ack: $HEAD_SHA [0-9a-f]\{12\}\]$"; then
+  pass "printed ack token carries the head AND a finding-set fingerprint"
+else
+  fail "expected '[mergepath-summary-ack: $HEAD_SHA <12 hex>]'; got '$ACK_TOKEN'"
+  echo "$ACK_PROBE_OUT" | sed 's/^/      /' >&2
+fi
+
 # ---------------------------------------------------------------------------
-# Test 24 (#832): a collaborator ack naming THIS head clears the finding.
+# Test 24 (#832): a collaborator ack naming THIS head clears the finding. The
+# token leads the comment; the rationale sits underneath it (#886).
 # ---------------------------------------------------------------------------
 echo
 echo "--- Test 24 (#832): collaborator ack for this head → exit 0"
 SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
 FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY" \
   "coderabbitai[bot]" \
-  "Rebutted: the retry loop is bounded by the caller. [mergepath-summary-ack: $HEAD_SHA]" \
+  "$ACK_TOKEN
+
+Rebutted: the retry loop is bounded by the caller." \
   "nathanjohnpayne" "OWNER")
 set +e
 OUT=$(
@@ -1289,7 +1337,9 @@ echo "--- Test 25 (#832): ack naming another sha → still gates, exit 1"
 SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
 FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY" \
   "coderabbitai[bot]" \
-  "Rebutted on the previous head. [mergepath-summary-ack: deadbeef1234]" \
+  "[mergepath-summary-ack: deadbeef1234 $ACK_FINGERPRINT]
+
+Rebutted on the previous head." \
   "nathanjohnpayne" "OWNER")
 set +e
 OUT=$(
@@ -1318,7 +1368,9 @@ echo "--- Test 26 (#832): ack from a non-collaborator → still gates, exit 1"
 SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
 FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY" \
   "coderabbitai[bot]" \
-  "lgtm [mergepath-summary-ack: $HEAD_SHA]" \
+  "$ACK_TOKEN
+
+lgtm" \
   "some-drive-by" "NONE")
 set +e
 OUT=$(
@@ -1347,7 +1399,9 @@ echo "--- Test 27 (#832): ack from a bot account → still gates, exit 1"
 SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
 FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY" \
   "coderabbitai[bot]" \
-  "auto-ack [mergepath-summary-ack: $HEAD_SHA]" \
+  "$ACK_TOKEN
+
+auto-ack" \
   "github-actions[bot]" "COLLABORATOR")
 set +e
 OUT=$(
@@ -1440,6 +1494,199 @@ if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 
   pass "resolved inline thread drops out; the summary finding remains → exit 1"
 else
   fail "expected rc=1 with 'unresolved: 1' + summary listing only; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ===========================================================================
+# Ack scoping (#886). Two ways a head-pinned substring ack cleared findings it
+# never acknowledged. Both are demonstrated against the SAME gating summary the
+# tests above use, so a regression shows up as a false CLEAR, not a false block.
+# ===========================================================================
+
+# A second blocking finding, as a same-head re-review would add it. The summary
+# comment keeps id 7001: `@coderabbitai review` / `resume` / the rate-limit
+# `try again` retry rewrite the summary for the UNCHANGED head, so neither the
+# head sha nor the comment id moves — only the content does.
+SUMMARY_SECOND_FINDING='_⚠️ Potential issue_ | _🟠 Major_: the credential is logged in the failure branch.'
+REREVIEWED_SUMMARY_BODY="$(make_summary_body "$HEAD_SHA" \
+  "$SUMMARY_BLOCKING_FINDING
+$SUMMARY_SECOND_FINDING")"
+
+# ---------------------------------------------------------------------------
+# Test 30 (#886): an ack written against finding set {A} does NOT clear a
+# summary that has since been rewritten, on the same head, to {A, B}. Before
+# the fix the ack cleared every summary finding on the head unconditionally —
+# including one published after it — and the gate exited 0 here.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 30 (#886): ack for set {A} vs re-review adding B → still gates, exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$REREVIEWED_SUMMARY_BODY" \
+  "coderabbitai[bot]" \
+  "$ACK_TOKEN
+
+Rebutted: the retry loop is bounded by the caller." \
+  "nathanjohnpayne" "OWNER")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 2" \
+    && echo "$OUT" | grep -q "credential is logged"; then
+  pass "stale-finding-set ack does not clear a rewritten summary → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 2' + the new finding listed; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 30b (#886): the escape hatch still exists — acking the token the gate
+# prints for the NEW finding set clears it. Without this, finding-pinning would
+# have traded a false clear for a permanent deadlock (`enforce_admins: true`
+# leaves no break-glass), which is the reason the ack channel exists at all.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 30b (#886): ack for the NEW finding set → exit 0"
+NEW_ACK_TOKEN=$(extract_ack_token "$OUT")
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$REREVIEWED_SUMMARY_BODY" \
+  "coderabbitai[bot]" \
+  "$NEW_ACK_TOKEN
+
+Both rebutted." \
+  "nathanjohnpayne" "OWNER")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0" \
+    && [ "$NEW_ACK_TOKEN" != "$ACK_TOKEN" ]; then
+  pass "ack regenerated for the new finding set clears it → exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0' and a token distinct from the {A} one; got rc=$RC token='$NEW_ACK_TOKEN'"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 31 (#886): a collaborator who pastes the gate's own failure output into
+# a PR comment while triaging the red check does not thereby clear it. The gate
+# prints the token verbatim, so a substring match made routine triage behaviour
+# into a silent bypass of a required check.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 31 (#886): collaborator quoting the gate's failure output → still gates, exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY" \
+  "coderabbitai[bot]" \
+  "The severity gate is red on this PR — what is it asking for?
+
+$ACK_PROBE_OUT
+
+Can someone take a look?" \
+  "nathanjohnpayne" "OWNER")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "quoted failure output does not ack → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1' (a quote is not an ack); got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 31b (#886): the invariant test 31 rests on — the gate never renders the
+# token at column 0. That is what makes "a verbatim paste of ANY contiguous
+# region of this output cannot ack" true rather than merely likely: unindent
+# the token in the report and a paste starting at that line would ack.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 31b (#886): the printed token is never at column 0"
+if printf '%s\n' "$ACK_PROBE_OUT" | grep -q "mergepath-summary-ack" \
+    && ! printf '%s\n' "$ACK_PROBE_OUT" | grep -q "^\[mergepath-summary-ack:"; then
+  pass "gate output renders the ack token indented, never leading a line"
+else
+  fail "the gate must print the ack token, and must never print it at column 0"
+  echo "$ACK_PROBE_OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 32 (#886): a valid token that does not LEAD the comment is not an ack.
+# The one-line "lgtm [token]" shape is what a substring matcher accepted; it is
+# also the shape any incidental mention takes.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 32 (#886): token mentioned mid-line → not an ack, exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY" \
+  "coderabbitai[bot]" \
+  "lgtm $ACK_TOKEN" \
+  "nathanjohnpayne" "OWNER")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "token not leading the comment → not an ack, exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1' (the token must lead the comment); got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 33 (#886): an ack that PRECEDES the summary it would clear (lower
+# comment id) is still rejected once the finding set differs — the demonstrated
+# shape, where the ack was written before the finding even existed.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 33 (#886): ack posted BEFORE the summary it would clear → exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_issue_comments_fixture "$(jq -n \
+  --arg body "$REREVIEWED_SUMMARY_BODY" --arg tok "$ACK_TOKEN" '
+  [ { id: 6999, user: { login: "nathanjohnpayne" }, author_association: "OWNER",
+      body: ($tok + "\n\nPre-emptively acked.") },
+    { id: 7001, user: { login: "coderabbitai[bot]" }, author_association: "NONE",
+      body: $body } ]
+')")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 2"; then
+  pass "ack predating the finding set it would clear → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 2'; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 

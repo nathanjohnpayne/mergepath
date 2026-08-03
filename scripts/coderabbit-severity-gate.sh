@@ -91,8 +91,8 @@
 #     uses to clear any review thread. Resolving a finding that
 #     legitimately does not apply (rebutted with rationale, moot, deferred
 #     to a follow-up issue) clears the gate. A summary-only finding has no
-#     thread; its override path is the head-pinned collaborator ack comment
-#     documented in the "PR-level summary surface" section (#832).
+#     thread; its override path is the head-and-finding-set-pinned collaborator
+#     ack comment documented in the "PR-level summary surface" section (#832).
 #
 # References:
 #   - nathanjohnpayne/mergepath#574 — the symmetric feedback policy
@@ -511,6 +511,26 @@ summary_strip_pre_merge_block() {
   printf '%s' "$body"
 }
 
+# Fingerprint the classified blocking summary lines, for the ack token below.
+# Portable SHA-256 (sha256sum on Linux/CI, shasum -a 256 on macOS), truncated
+# to 12 hex chars — this is a change detector, not a security boundary: the
+# collaborator copies whatever the gate prints, so the only property that
+# matters is that a different finding set yields a different token. With
+# neither hasher on PATH the gate cannot bind an ack to a finding set at all,
+# which is a config error (die 2), never a silent fall back to head-only
+# pinning.
+summary_findings_fingerprint() {
+  local out
+  if command -v sha256sum >/dev/null 2>&1; then
+    out=$(printf '%s' "$1" | sha256sum)
+  elif command -v shasum >/dev/null 2>&1; then
+    out=$(printf '%s' "$1" | shasum -a 256)
+  else
+    die 2 "neither sha256sum nor shasum found on PATH — cannot fingerprint the summary finding set for the acknowledgement token"
+  fi
+  printf '%s' "$out" | awk '{print substr($1, 1, 12)}'
+}
+
 # The issues endpoint is a REQUIRED read: an unreadable one is a scan that
 # cannot be trusted complete, so fetch_api_array's die 2 (fail closed) is the
 # correct outcome — never an empty result silently treated as "no findings".
@@ -536,7 +556,14 @@ SUMMARY_BODY=$(echo "$SUMMARY_JSON" | jq -r '.body')
 # body, and wrong for a multi-kilobyte summary): line-wise application is
 # exactly a whole-body scan with the truncation removed, and it yields a
 # reportable location and snippet per finding for free.
+#
+# Alongside the reportable list, the loop accumulates the CLASSIFIED lines
+# verbatim into SUMMARY_FINDINGS_FINGERPRINT_INPUT. That text — not the
+# truncated 120-char snippet the report prints — is what the acknowledgement
+# token below is fingerprinted from, so two findings sharing a long prefix
+# still produce different fingerprints.
 SUMMARY_BLOCKING='[]'
+SUMMARY_FINDINGS_FINGERPRINT_INPUT=''
 if [ -z "$SUMMARY_BODY" ]; then
   log "no CodeRabbit PR-level summary comment found — no summary findings in scope"
 elif ! summary_stanzas_all_benign "$SUMMARY_BODY"; then
@@ -562,6 +589,8 @@ else
           body_snippet: ($body | .[0:120])
         } ]
       ')
+      SUMMARY_FINDINGS_FINGERPRINT_INPUT="${SUMMARY_FINDINGS_FINGERPRINT_INPUT}${cr_tier}	${cr_line}
+"
     fi
   done <<EOF
 $SUMMARY_SCAN
@@ -579,28 +608,63 @@ log "found $SUMMARY_BLOCKING_COUNT blocking-tier summary finding(s) on HEAD"
 # `enforce_admins: true` there is no break-glass either, so the gate would
 # deadlock the PR permanently without an explicit acknowledgement channel.
 #
-# The channel: a PR comment containing the exact token
-#   [mergepath-summary-ack: <HEAD sha>]
+# The channel: a PR comment whose FIRST LINE is exactly the token
+#   [mergepath-summary-ack: <HEAD sha> <finding-set fingerprint>]
 # written by a human collaborator (author_association OWNER / MEMBER /
 # COLLABORATOR — a GitHub-computed field, not something the commenter sets)
 # and, per the same reasoning that keeps bots out of the reviewer set, not by
-# a `[bot]` account.
+# a `[bot]` account. Rationale for the rebuttal or deferral goes on the lines
+# BELOW the token.
 #
 # Head-pinned by construction, not by clock: the token names the current head
 # sha, so an ack cannot be written before the commit it clears exists, and a
 # subsequent push invalidates every prior ack. That is the same anchor the
 # summary selection above uses, and again involves no timestamp.
-SUMMARY_ACK_TOKEN="[mergepath-summary-ack: $HEAD_SHA]"
+#
+# FINDING-PINNED as well as head-pinned. Head-pinning alone binds the ack to a
+# COMMIT, not to the finding set that was on screen when it was written, and
+# the summary surface can change WITHOUT the head changing: a same-head
+# re-review (`@coderabbitai review`, `@coderabbitai resume`, or the rate-limit
+# `try again` retry that scripts/coderabbit-wait.sh posts itself) rewrites the
+# summary — in place, or as a later comment this script then selects — with a
+# finding the acking collaborator never saw. A head-only ack would clear that
+# new finding retroactively, and a required gate would pass with an
+# undispositioned blocking finding on it. So the token also carries a
+# fingerprint of the classified blocking lines: change the finding set and
+# every prior ack stops matching, exactly as a push does. Fingerprinting the
+# CONTENT (rather than ordering acks against the summary's comment id) is what
+# survives an in-place edit, which leaves the comment id untouched.
+#
+# ANCHORED, not substring-matched. This script PRINTS the token verbatim in its
+# own failure output below, and pasting a failing check's output into a PR
+# comment while triaging it is routine agent behaviour in this repo. A bare
+# "body contains the token" test would let that paste clear the gate silently.
+# Requiring the token to BE the comment's first line (no leading whitespace —
+# the failure block renders it indented, and inside surrounding prose) means a
+# quote of this script's output can never satisfy it, while a deliberate ack is
+# a one-line copy. The two halves of that argument have to be kept in step: the
+# report below renders the token INDENTED and never at column 0, which is what
+# makes "a verbatim paste of any contiguous region of this output cannot ack"
+# true rather than merely likely. tests/test_coderabbit_severity_gate.sh
+# asserts that rendering directly, so unindenting it there fails the suite.
+SUMMARY_FINDINGS_FINGERPRINT=$(
+  summary_findings_fingerprint "$SUMMARY_FINDINGS_FINGERPRINT_INPUT"
+)
+SUMMARY_ACK_TOKEN="[mergepath-summary-ack: $HEAD_SHA $SUMMARY_FINDINGS_FINGERPRINT]"
 if [ "$SUMMARY_BLOCKING_COUNT" -gt 0 ]; then
   if echo "$ISSUE_COMMENTS_JSON" | jq -e --arg tok "$SUMMARY_ACK_TOKEN" '
     any(.[];
       ((.user.login // "") | endswith("[bot]") | not)
       and ((.author_association // "") as $aa
            | (["OWNER", "MEMBER", "COLLABORATOR"] | index($aa)) != null)
-      and ((.body // "") | contains($tok))
+      and (((.body // "")
+            | gsub("\r"; "")
+            | split("\n")
+            | (.[0] // "")
+            | sub("[ \t]+$"; "")) == $tok)
     )
   ' >/dev/null 2>&1; then
-    log "summary findings acknowledged for $HEAD_SHA by a collaborator ack comment — not gating"
+    log "summary findings acknowledged for $HEAD_SHA (finding set $SUMMARY_FINDINGS_FINGERPRINT) by a collaborator ack comment — not gating"
     SUMMARY_BLOCKING='[]'
     SUMMARY_BLOCKING_COUNT=0
   fi
@@ -635,10 +699,14 @@ report_verdict() {
       echo "Findings listed against \"(PR-level summary comment)\" have no review"
       echo "thread to resolve. Fixing one clears it on its own: the next push"
       echo "produces a summary for the new head without the finding. To record a"
-      echo "rebuttal or a deferral instead, post a PR comment containing:"
+      echo "rebuttal or a deferral instead, post a PR comment whose FIRST LINE is"
+      echo "the token below, unindented, with the rationale on the lines under it:"
       echo "    $SUMMARY_ACK_TOKEN"
-      echo "The ack must come from a collaborator, and it is pinned to this head"
-      echo "— any subsequent push invalidates it."
+      echo "The ack must come from a collaborator. It is pinned both to this head"
+      echo "and to the finding set above, so a later push OR a re-review that"
+      echo "changes the summary invalidates it. Quoting this output back into a"
+      echo "comment does NOT ack anything: the token is printed indented here and"
+      echo "on its own it acks nothing unless it leads the comment."
     fi
     echo ""
   fi
