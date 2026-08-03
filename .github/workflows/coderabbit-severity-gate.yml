@@ -103,9 +103,20 @@ jobs:
     name: CodeRabbit unresolved blocking findings
     runs-on: ubuntu-latest
     # Event-driven path. The scheduled sweep below runs the same gate but
-    # on every open PR via the Checks API; gating this job to non-schedule
-    # events avoids paying for an empty no-op run.
-    if: github.event_name != 'schedule'
+    # on every open PR via the Checks API; gating this job away from the
+    # sweep's events avoids paying for an empty no-op run.
+    #
+    # `issue_comment` is excluded as well as `schedule` (Codex P2 round 3 on
+    # #886). It has to be an explicit exclusion, not an inherited one: this
+    # job's PR resolver only understands `pull_request*` payloads, so leaving
+    # the condition as `!= 'schedule'` started this job on every PR and issue
+    # comment in the repo and failed it at "Unsupported event" — a red job on
+    # ordinary conversation, and under the name of the REQUIRED check. Adding
+    # a trigger to `on:` obliges every job in the file to say whether it
+    # handles it.
+    if: >-
+      github.event_name != 'schedule'
+      && github.event_name != 'issue_comment'
     steps:
       - name: Checkout repo (default branch — trusted gate script)
         # Pin to the default branch, NOT the PR HEAD. The gate is a
