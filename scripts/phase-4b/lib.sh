@@ -154,7 +154,7 @@ p4b_top_field() {
 # Maps one scripts/coderabbit-wait.sh result — polling or --probe — to a
 # class. Pure: jq over the passed string only, no I/O, always returns 0.
 p4b_barrier_class_coderabbit() {
-  local head="$1" rc="$2" json="$3" probe_head
+  local head="$1" rc="$2" json="$3" probe_head probe_observed
   case "$rc" in
     0)
       # Terminal, but only for the head about to be approved. An rc 0
@@ -203,9 +203,87 @@ p4b_barrier_class_coderabbit() {
       # change detail recorded on #814.
       printf 'not-yet'
       ;;
-    4|7)
-      # 4 = the poll budget elapsed with no review; 7 = --probe found none.
+    4)
+      # The poll budget elapsed with no review.
       printf 'not-yet' ;;
+    7)
+      # --probe found no terminal signal — but its rc-7 JSON can still CARRY
+      # head-anchored terminal evidence (#869): the probe embeds the newest
+      # HEAD-pinned review OBJECT (endpoint "reviews", selected by
+      # .commit_id == head from the bot's own login) whenever one exists
+      # while the summary publication is masked. On #866 the fair-use limit
+      # note appended to the finished-review reply read the whole
+      # publication as rate_limited while coderabbitai[bot] had two
+      # COMMENTED review objects on the exact head (and a per-SHA
+      # StatusContext success) — and the barrier held not-yet until its
+      # budget escalated.
+      #
+      # The object alone is NOT enough (P1 on #875): CodeRabbit publishes
+      # the review object and the PR-level summary as separate events, the
+      # summary can carry the ONLY blocking marker (the #535 summary-only
+      # class — e.g. the auto-pause note), and the probe deliberately
+      # returns rc 7 observed=awaiting-summary for exactly that
+      # mid-publication state. What discriminates the wedged-but-complete
+      # #866 state from a just-posted object is the per-SHA CodeRabbit
+      # StatusContext reading success on this head, which the probe samples
+      # into probe.context_state on this one path (null when unsampled, or
+      # when trust_status_context_for_clearance is false — both fail closed
+      # here to not-yet).
+      #
+      # And the success must be TEMPORALLY CORRELATED with the object it
+      # corroborates (#875 round 2): on a repeated CodeRabbit run against
+      # the SAME sha the statuses endpoint still exposes the PREVIOUS
+      # run's success while the new object's summary and status refresh
+      # are pending — co-present, but from different runs. So the third
+      # conjunct requires probe.context_updated_at (the status' refresh
+      # time, sampled alongside the state) at-or-after review.submitted_at
+      # (the evidence object's own timestamp, emitted for exactly this
+      # comparison). Either field missing, or either timestamp
+      # unparseable, fails closed to not-yet — old probe JSON simply keeps
+      # the barrier on its pre-#869 bounded wait.
+      #
+      # And an ACTIVE adverse state named by the probe takes precedence
+      # over the evidence pair (P1 round 3 on #875): probe.observed on
+      # this branch is the class of the newest pending notice beneath the
+      # review object, and rate_limit / paused / in_progress each assert
+      # that CodeRabbit is NOT done here — a durable pause or a fresh
+      # limit notice can be exactly what is holding the summary that
+      # carries the only blocking marker, and a postdating spurious
+      # success (#595) must not outrank the notice that names the real
+      # state. Only the completion family opens: awaiting-summary (the
+      # value this branch emits when nothing adverse is pending) or
+      # terminal. A missing or unmodelled observed fails closed to
+      # not-yet.
+      #
+      # With all conjuncts the claim matches what the Codex arm accepts
+      # (#684): CodeRabbit has reviewed AND completed the head about to be
+      # approved. Inline findings stay owned by
+      # coderabbit-severity-gate.sh, so counting the set as reported skips
+      # no disposition; the disclosed residual is a spurious success
+      # (#595) landing on this exact head AND postdating the head's own
+      # review object while its summary is still in flight WITH no adverse
+      # notice pending, which would skip the #535 summary-only escalation.
+      # endpoint must be "reviews": the probe's "issues" evidence on rc 7
+      # is a pending notice or a prior-head summary, never head-anchored
+      # terminality. The head equality is belt-and-braces on top of the
+      # barrier's own drift check.
+      probe_head="$(printf '%s' "$json" | jq -r '.head_sha // empty' 2>/dev/null || true)"
+      probe_observed="$(printf '%s' "$json" | jq -r '.probe.observed // empty' 2>/dev/null || true)"
+      if [ -n "$probe_head" ] && [ "$probe_head" = "$head" ] \
+         && { [ "$probe_observed" = "awaiting-summary" ] || [ "$probe_observed" = "terminal" ]; } \
+         && [ "$(printf '%s' "$json" | jq -r '.review.endpoint // empty' 2>/dev/null || true)" = "reviews" ] \
+         && [ "$(printf '%s' "$json" | jq -r '.probe.context_state // empty' 2>/dev/null || true)" = "success" ] \
+         && [ "$(printf '%s' "$json" | jq -r '
+                  (.review.submitted_at // "") as $r
+                  | (.probe.context_updated_at // "") as $c
+                  | if $r == "" or $c == "" then false
+                    else (try (($c | fromdateiso8601) >= ($r | fromdateiso8601)) catch false)
+                    end' 2>/dev/null || true)" = "true" ]; then
+        printf 'reported'
+      else
+        printf 'not-yet'
+      fi
+      ;;
     5)
       # rate_limit_stalled. AGENTS.md step 5 routes this to a human UNLESS the
       # #489 Codex failover engaged, in which case the stall is a non-blocking
