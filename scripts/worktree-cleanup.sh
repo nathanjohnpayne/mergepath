@@ -121,14 +121,35 @@
 #      mutation — and reports any branch whose remote-tracking ref is
 #      stale explicitly, tagged and counted separately, rather than
 #      omitting it. NOTE this is a DIFFERENT hazard from the squash-merge
-#      one two paragraphs below: an unpruned ref is a detection gap on the
-#      "gone" SIGNAL; ancestry-vs-squash is a detection gap on the "merged"
-#      SIGNAL. Fixing one does not touch the other, and both must hold for
-#      a branch to be provably safe to delete.
+#      one under "Merged-state detection" below: an unpruned ref is a
+#      detection gap on the "gone" SIGNAL; ancestry-vs-squash is a
+#      detection gap on the "merged" SIGNAL. Fixing one does not touch the
+#      other, and both must hold for a branch to be provably safe to
+#      delete.
 #
 # Locked detection. `git worktree list --porcelain` emits a `locked`
 # line (possibly with a reason) for locked entries. We classify locked
 # worktrees separately so --apply doesn't disrupt active sessions.
+#
+# Merged-state detection: a squash-merged branch is NOT an ancestor of
+# main, so ancestry is not a merge test (#822). This repo squash-merges,
+# which means a merged branch's own commits never enter main's history and
+# `git rev-list --count origin/main..<branch>` stays permanently non-zero
+# long after its PR demonstrably merged — observed at "3 commits not in
+# main" for a branch whose PR was merged and whose remote branch had
+# already been deleted. Every "is this merged?" decision in this script
+# therefore comes from PR state via gh_branch_merged_pr_status() (`gh pr
+# list --head <branch> --state merged`, comparing the merged PR's recorded
+# headRefOid against the local tip), never from ancestry against main. An
+# ancestry-against-main test is the natural thing to reach for and it is
+# wrong here: it reads as a confident "unmerged, do not touch" and would
+# retain every squash-merged branch forever. The ancestry check that DOES
+# exist in gh_branch_merged_pr_status() is a different comparison — local
+# tip vs the MERGED PR's head, not vs main — and it only distinguishes
+# `exact` from `diverged` once PR state has already established that a
+# merged PR exists. The same hazard, stated for anyone writing separate
+# cleanup tooling, is in docs/agents/worktree-placement.md § Relocating
+# and removing.
 #
 # Exit codes:
 #   0  success (audit clean OR all requested removals succeeded)
