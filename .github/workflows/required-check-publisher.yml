@@ -333,6 +333,28 @@ jobs:
           fi
 
           had_infra_error=0
+          # A dispatch-narrowed pass opens pendings on the named head FIRST
+          # (cross-agent round 8): without them the previous green stays
+          # usable for the whole re-evaluation it was asked to refresh.
+          # Unretried — the completed verdicts follow from THIS run moments
+          # later, so a failed pending costs seconds of old-window, not a
+          # strand. The sweep stays pending-free by design: a background
+          # refresher that pended every open PR each interval would flap
+          # every checks display in the repo.
+          if [ -n "$requested_pr" ] && [ -n "$targets" ]; then
+            dispatch_head=$(awk -F'\t' 'NR==1{print $2}' <<<"$targets")
+            if [ -n "$dispatch_head" ]; then
+              for name in "$MCG_CONTEXT" "$CODEX_P1_CONTEXT" "$CODERABBIT_CONTEXT"; do
+                gh api -X POST "repos/$REPO/check-runs" \
+                  -f name="$name" \
+                  -f head_sha="$dispatch_head" \
+                  -f status="in_progress" \
+                  -f "output[title]=$name (re-evaluation in progress)" \
+                  -f "output[summary]=Dispatch-requested re-evaluation for $dispatch_head." \
+                  >/dev/null || echo "::warning::Could not open pending $name on $dispatch_head; its verdict follows from this pass regardless."
+              done
+            fi
+          fi
           # Heads carried by MORE than one open PR fail closed (cross-agent
           # round 3): the per-commit slot holds one verdict while the
           # per-PR policy state (base, labels, reviews, threads) differs,
