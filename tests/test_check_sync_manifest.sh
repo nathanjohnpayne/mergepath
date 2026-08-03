@@ -3267,8 +3267,69 @@ FOPEN_EOF
     pass "Case 62: a fence opener closes the containers it outdents out of, so its closer is measured from the container it really opened in"
   fi
 
+  # Case 63: the fence-delimiter allowance is relative all the way down a
+  # NESTED list, not just one level in (#802).
+  #
+  # Cases 60-62 pin the rule against a single-level list, whose content
+  # indent happens to land exactly on the four-column allowance the bug
+  # they fixed used to hard-code. That leaves the relative measure
+  # unpinned at the second level: a two-deep list puts its innermost
+  # content indent at eight columns, and an implementation that measures
+  # the delimiter from an absolute margin — or from only the OUTER
+  # container instead of the one the line is actually inside — mishandles
+  # it the same way case 60 describes, just one level down. `- a` /
+  # `  - b` puts item b's content indent at four; a ```sh opener there is
+  # AT that container's own boundary, the same "just inside" edge case 60
+  # exercises, but now reached through two stack frames instead of one.
+  #
+  # The second half pins the other boundary one level deeper still: `- c`
+  # / `  - d` also puts item d's content indent at four, but a delimiter
+  # eight columns in — four columns past THAT container — is indented
+  # code, not a fence, the same over-indented edge case 60's second half
+  # exercises. A blank line separates the marker from it, exactly as in
+  # case 60's own fixture, so the marker's own paragraph is closed and the
+  # indented-code branch (which cannot interrupt an open paragraph) is the
+  # one under test rather than plain lazy continuation.
+  #
+  # Both hits are chosen to expose a REGRESSION to the absolute `ind < 4`
+  # this issue's anchor describes: reverting the delimiter check to that
+  # form stops recognising the ```sh opener on line 5 (its content indent,
+  # four, is not less than four), so line 6's `#111` is emitted as prose
+  # instead of fenced code and a THIRD hit appears before line 8 — this
+  # case fails the moment that regression lands, not only in principle.
+  FNEST_DOC="$WORKDIR/consumer-truth-fence-nested.md"
+  cat > "$FNEST_DOC" <<'FNEST_EOF'
+# Doc
+
+- a
+  - b
+    ```sh
+    echo "closes #111"
+    ```
+    A bare #222 in item b, after the fence.
+- c
+  - d
+
+        ```
+        #333 sits in indented code, not a fence
+
+A bare #444 in prose is real.
+FNEST_EOF
+  set +e
+  fnest_hits=$(md_prose_only "$FNEST_DOC" | grep -nE "$BARE_ISSUE_RE" | cut -d: -f1 | tr '\n' ',')
+  fnest_lines=$(md_prose_only "$FNEST_DOC" | wc -l | tr -d ' ')
+  fnest_raw=$(wc -l < "$FNEST_DOC" | tr -d ' ')
+  set -e
+  if [ "$fnest_hits" != "8,15," ]; then
+    fail "Case 63: expected lines 8,15 flagged (a nested item's own fence opens and closes at its own container's boundary, not the document's), got '$fnest_hits'"
+  elif [ "$fnest_lines" != "$fnest_raw" ]; then
+    fail "Case 63: md_prose_only must emit one line per input line, got $fnest_lines for $fnest_raw"
+  else
+    pass "Case 63: the fence-delimiter allowance stays relative to the CURRENT container two levels into a nested list, not just the outer one (#802)"
+  fi
+
 else
-  echo "SKIP: Cases 36-62 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
+  echo "SKIP: Cases 36-63 need a mergepath checkout (live manifest + sync-to-downstream.sh)"
 fi
 
 echo
