@@ -584,11 +584,20 @@ summary_findings_fingerprint() {
 # correct outcome — never an empty result silently treated as "no findings".
 ISSUE_COMMENTS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "PR-level issue comments")
 
+# `startswith`, not `contains` — the same predicate scripts/coderabbit-wait.sh
+# uses at its own selection site, and for the same reason (Codex P1 round 2 on
+# #886). The marker opens the real summary at byte zero; a CodeRabbit CHAT
+# REPLY can QUOTE it further down. Containment lets such a reply — which always
+# has the higher comment id, so `last` picks it — stand in for the summary. It
+# carries no structural stanza, so it is then rejected as "not a completed
+# report" and the real current-head summary is never examined: a false CLEAR of
+# this required gate. The shape is a live one, fixture 7917/7918 in
+# tests/test_coderabbit_wait_status_probe.sh (#794).
 SUMMARY_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
   --arg bot "$BOT_LOGIN" --arg m "$CR_SUMMARY_MARKER" '
   [ .[]
     | select(.user.login == $bot)
-    | select((.body // "") | contains($m))
+    | select((.body // "") | startswith($m))
   ]
   | sort_by(.id)
   | last
@@ -661,8 +670,18 @@ EOF
   # blocking finding the token is never printed and never consulted, and
   # hashing the body anyway would make the (unused) token churn on every
   # walkthrough edit.
+  #
+  # SALTED WITH THE ACTIVE BLOCKING TIER SET (Codex P1 round 2 on #886). The
+  # summary body alone does not determine what is blocking about it — the
+  # resolved `required` tier set does, and that set comes from the TRUSTED
+  # DEFAULT-BRANCH policy, so it can tighten while this PR is open. A summary
+  # carrying both P1 and P2 text under a `{p1}` policy hashes identically under
+  # `{p1,p2}`, so an ack written when only the P1 was blocking would clear a P2
+  # the collaborator was never shown as blocking. Salting means a policy change
+  # invalidates prior acks exactly as a push or a re-review does.
   if [ "$(echo "$SUMMARY_BLOCKING" | jq 'length')" -gt 0 ]; then
-    SUMMARY_FINDINGS_FINGERPRINT_INPUT="$SUMMARY_SCAN"
+    SUMMARY_FINDINGS_FINGERPRINT_INPUT="required-tiers: $(echo "$REQUIRED_TIERS" | tr '\n' ' ')
+$SUMMARY_SCAN"
   fi
 fi
 
@@ -726,11 +745,19 @@ if [ "$SUMMARY_BLOCKING_COUNT" -gt 0 ]; then
       ((.user.login // "") | endswith("[bot]") | not)
       and ((.author_association // "") as $aa
            | (["OWNER", "MEMBER", "COLLABORATOR"] | index($aa)) != null)
-      and (((.body // "")
-            | gsub("\r"; "")
-            | split("\n")
-            | (.[0] // "")
-            | sub("[ \t]+$"; "")) == $tok)
+      and (((.body // "") | gsub("\r"; "") | split("\n")) as $lines
+           | (($lines[0] // "") | sub("[ \t]+$"; "")) == $tok
+             # A RATIONALE IS PART OF THE ACK (Codex P2 round 2 on #886). The
+             # spec and REVIEW_POLICY both say the reason goes on the lines
+             # below the token; without this the bare token cleared a required
+             # gate with no recorded disposition at all, so the documented
+             # contract and the enforced one disagreed. The test is mechanical
+             # — at least one non-blank line after the token — deliberately not
+             # a "substantive text" heuristic, which would be unpredictable to
+             # satisfy and is not the kind of judgement a merge gate should be
+             # making.
+             and (($lines[1:] | map(sub("^[ \t]+"; "") | sub("[ \t]+$"; ""))
+                   | map(select(. != "")) | length) > 0))
     )
   ' >/dev/null 2>&1; then
     log "summary findings acknowledged for $HEAD_SHA (finding set $SUMMARY_FINDINGS_FINGERPRINT) by a collaborator ack comment — not gating"
@@ -769,7 +796,8 @@ report_verdict() {
       echo "thread to resolve. Fixing one clears it on its own: the next push"
       echo "produces a summary for the new head without the finding. To record a"
       echo "rebuttal or a deferral instead, post a PR comment whose FIRST LINE is"
-      echo "the token below, unindented, with the rationale on the lines under it:"
+      echo "the token below, unindented, with the rationale on the lines under it"
+      echo "(at least one non-blank line of rationale is required):"
       echo "    $SUMMARY_ACK_TOKEN"
       echo "The ack must come from a collaborator. It is pinned both to this head"
       echo "and to the finding set above, so a later push OR a re-review that"

@@ -980,12 +980,25 @@ PREV_SHA='0000111122223333444455556666777788889999'
 # Compose a CodeRabbit PR-level summary body.
 #   $1 = sha to name as the commits-range END (the head the summary reports on)
 #   $2 = findings text spliced into the walkthrough
-#   $3 = extra stanza marker to prepend (optional — makes the body non-benign)
+#   $3 = extra stanza marker (optional — makes the body non-benign)
+#
+# The summarize marker leads the body and the extra stanza follows it, which is
+# how CodeRabbit actually writes one: on a rate-limited PR the first two lines
+# are the summarize marker and then the rate-limit marker (verified against a
+# live mergepath body). The fixture used to PREPEND the extra stanza, which no
+# real body does, and the gate's `contains` selection could not tell the
+# difference. Once selection moved to `startswith` (Codex P1 round 2 on #886)
+# the unrealistic ordering stopped being selected at all — so this ordering is
+# load-bearing for tests 21 and 35b, not cosmetic.
 make_summary_body() {
   local head=$1 findings=$2 extra=${3:-}
   {
-    [ -n "$extra" ] && printf '%s\n\n' "$extra"
-    printf '%s\n\n' "$SUMMARY_MARKER_LINE"
+    printf '%s\n' "$SUMMARY_MARKER_LINE"
+    if [ -n "$extra" ]; then
+      printf '%s\n\n' "$extra"
+    else
+      printf '\n'
+    fi
     printf '%s\n\n' '## Walkthrough'
     printf '%s\n\n' 'Refactors the widget loader and its retry path.'
     printf '%s\n\n' "$findings"
@@ -1895,6 +1908,146 @@ RC=$?
 set -e
 if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
   pass "benign stanzas with closers still classify as a report → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ===========================================================================
+# Codex P1/P2 round 2 on #886.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Test 36 (#886, Codex P1): a CodeRabbit CHAT REPLY that QUOTES the summarize
+# marker must not displace the real summary. The reply always has the higher
+# comment id, so a `contains` selection picked it, found no structural stanza
+# in it, rejected it as "not a completed report", and never looked at the real
+# current-head summary — clearing the gate with a blocking finding in it. Live
+# shape: fixture 7917/7918 in tests/test_coderabbit_wait_status_probe.sh
+# (#794). The waiter has always used `startswith` here; the gate had not.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 36 (#886): marker-quoting chat reply does not displace the summary → exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_issue_comments_fixture "$(jq -n \
+  --arg body "$GATING_SUMMARY_BODY" --arg m "$SUMMARY_MARKER_LINE" '
+  [ { id: 7001, user: { login: "coderabbitai[bot]" }, author_association: "NONE",
+      body: $body },
+    { id: 7002, user: { login: "coderabbitai[bot]" }, author_association: "NONE",
+      body: ("🧩 Analysis chain\n\n" + $m + "\n\nQuoted from the summary above while answering a question.") } ]
+')")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "a newer marker-quoting reply does not shadow the real summary → exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 37 (#886, Codex P1): the ack is bound to the ACTIVE blocking tier set,
+# not only to the head and the body. The tier set comes from the trusted
+# default-branch policy and can tighten while a PR is open, so an ack written
+# when only P1 was blocking must not silently clear a P2 that a later policy
+# made blocking — the body, and therefore an unsalted fingerprint, is identical
+# across the two policies.
+# ---------------------------------------------------------------------------
+P2_REQUIRED_POLICY="$(cat <<'EOF'
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p0: required
+    p1: required
+    p2: required
+    p3: discretionary
+    nitpick: discretionary
+EOF
+)"
+SUMMARY_P2_FINDING='_🛠️ Refactor suggestion_ | _🟡 Minor_: fold the duplicated parse into one helper.'
+MIXED_TIER_SUMMARY="$(make_summary_body "$HEAD_SHA" \
+  "$SUMMARY_BLOCKING_FINDING
+$SUMMARY_P2_FINDING")"
+
+# The token as printed under the {p0,p1} policy, where only the P1 blocks.
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$MIXED_TIER_SUMMARY")
+set +e
+MIXED_PROBE_OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+set -e
+MIXED_ACK_P1_ONLY=$(extract_ack_token "$MIXED_PROBE_OUT")
+
+echo
+echo "--- Test 37 (#886): ack predating a policy tightening does not clear the newly-blocking tier"
+SCRATCH=$(make_scratch_with_policy "$P2_REQUIRED_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$MIXED_TIER_SUMMARY" \
+  "coderabbitai[bot]" \
+  "$MIXED_ACK_P1_ONLY
+
+Rebutted under the policy in force when this was written." \
+  "nathanjohnpayne" "OWNER")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+MIXED_ACK_P2_TOO=$(extract_ack_token "$OUT")
+if [ "$RC" = 1 ] && [ -n "$MIXED_ACK_P1_ONLY" ] \
+    && [ "$MIXED_ACK_P1_ONLY" != "$MIXED_ACK_P2_TOO" ]; then
+  pass "tightening the required tiers invalidates the earlier ack → exit 1"
+else
+  fail "expected rc=1 and differing tokens; got rc=$RC p1only='$MIXED_ACK_P1_ONLY' p2too='$MIXED_ACK_P2_TOO'"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 38 (#886, Codex P2): the token alone is not an acknowledgement. The spec
+# and REVIEW_POLICY both say the rationale goes on the lines below it, so
+# accepting a bare token let a required check go green with no recorded
+# disposition — the documented contract and the enforced one disagreeing. The
+# test is mechanical (at least one non-blank line follows), deliberately not a
+# judgement about what counts as substantive.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 38 (#886): bare ack token with no rationale → still gates, exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$GATING_SUMMARY_BODY" \
+  "coderabbitai[bot]" \
+  "$ACK_TOKEN
+
+   " \
+  "nathanjohnpayne" "OWNER")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "token with only blank lines under it is not an ack → exit 1"
 else
   fail "expected rc=1 with 'unresolved: 1'; got rc=$RC"
   echo "$OUT" | sed 's/^/      /' >&2

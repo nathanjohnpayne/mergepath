@@ -52,6 +52,23 @@ on:
   # review-submission event.
   pull_request_review_comment:
     types: [created, edited, deleted]
+  # issue_comment is the PR-LEVEL comment surface (#832, Codex P1 round 2 on
+  # #886). Since the gate started classifying CodeRabbit's PR-level summary, a
+  # blocking finding can appear, change, or disappear with no pull_request*
+  # event firing at all — and so can the acknowledgement token that clears one.
+  # Without this trigger a previously-green required check stays green for up
+  # to 15 minutes after CodeRabbit publishes a summary-only finding, and the
+  # PR is mergeable through that window; symmetrically, an ack cannot turn a
+  # red check green promptly.
+  #
+  # Routed to the SWEEP job, not the event-driven one, and that is not an
+  # arbitrary choice: Actions only attaches a check to a PR's head SHA for
+  # pull_request* events, so an issue_comment-triggered run of the event-driven
+  # job would produce a workflow run that never updates the required check.
+  # The sweep already posts a check_run on the head SHA via the Checks API for
+  # exactly this reason, so the fix is to reuse it, scoped to the one PR.
+  issue_comment:
+    types: [created, edited, deleted]
   # Periodic sweep — catches the "human clicks Resolve conversation on a
   # CodeRabbit blocking-tier thread" case. The thread-resolution webhook
   # fires but does NOT trigger Actions workflows (no Actions event for it
@@ -182,7 +199,18 @@ jobs:
     # Required-check resolution keys on (head_sha, name), so the new check
     # supersedes the stale red one. Idempotent: no-op when the gate result
     # is unchanged (and a clean pass everywhere the gate is disabled).
-    if: github.event_name == 'schedule'
+    #
+    # Also serves `issue_comment` on a PR (#832 / Codex P1 round 2 on #886) —
+    # a summary finding or its acknowledgement lands on that surface and fires
+    # no pull_request* event, and only this job can refresh the required check
+    # on the head SHA. The job NAME is deliberately left reading "scheduled"
+    # despite now serving two triggers: check names are load-bearing in this
+    # repo's branch protection, and renaming one to gain descriptive accuracy
+    # is not worth the class of breakage that causes.
+    if: >-
+      github.event_name == 'schedule'
+      || (github.event_name == 'issue_comment'
+          && github.event.issue.pull_request != null)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo (default branch — trusted scripts)
@@ -197,8 +225,25 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_PR: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
+          # issue_comment path (#832): re-evaluate ONLY the PR that received
+          # the comment. Sweeping all open PRs on every PR comment would turn
+          # ordinary conversation into a repo-wide gate re-run.
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            if [ -z "$COMMENT_PR" ] || [ "$COMMENT_PR" = "null" ]; then
+              echo "::error::issue_comment event carried no issue number"
+              exit 1
+            fi
+            {
+              echo 'prs<<EOF'
+              printf '%s\n' "$COMMENT_PR"
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # List ALL open PRs. The gate script itself short-circuits when
           # coderabbit.severity_gate.enabled=false, so we don't filter by
           # label here. `--limit 500` mirrors codex-p1-gate.yml's bound.
