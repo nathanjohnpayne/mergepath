@@ -1,6 +1,6 @@
 # The Mergepath ontology layer
 
-Three artifacts model Mergepath's domain, complementing the root [`CONTEXT.md`](../../CONTEXT.md) glossary (the ubiquitous language):
+Three artifacts model Mergepath's domain, complementing the root [`CONTEXT.md`](https://github.com/nathanjohnpayne/mergepath/blob/main/CONTEXT.md) glossary (the ubiquitous language):
 
 - [`rules.md`](rules.md) — every normative rule of Mergepath documented in English with a stable ID (R-1…R-203 for the review pipeline, G-1…G-377 for structure, governance, the CodeRabbit configuration posture, and deployment — the `docs/agents` tree, the Standard, the manifest, and the canonical root `DEPLOYMENT.md`), each citing its canonical source. **●** marks configuration rules (machine-checkable arrangements of entities), **○** procedural ones.
 - [`mergepath-rules.ttl`](mergepath-rules.ttl) — an OWL ontology formalizing a core subset of the ● rules as axioms whose violation a reasoner detects. Every violation-catching axiom carries an `mp:encodesRule` annotation naming the catalog IDs it encodes.
