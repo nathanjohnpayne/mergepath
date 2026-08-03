@@ -949,7 +949,7 @@ log "anchor = $HEAD_ANCHOR (source: $ANCHOR_SOURCE)"
 # The real blocking bot-review signal is already in, so cap the CodeRabbit poll
 # budget to post_clearance_max_wait_seconds (default 240) instead of the full
 # max_wait_seconds — CodeRabbit still gets that window to land a clear (exit 0)
-# or a Potential issue / ⚠️ finding (exit 2), both handled exactly as before; a
+# or a blocking p0/p1 finding (exit 2), both handled exactly as before; a
 # still-pending CodeRabbit after the cap falls through to the same advisory
 # exit-4 timeout. Only ever SHORTENS the ceiling (min of the two), never
 # lengthens it. Placed AFTER head resolution so it can head-pin the clearance.
@@ -1404,7 +1404,8 @@ count_blocking_tier_issues() {
 }
 
 # Returns 0 (true) if the latest PR-level CodeRabbit SUMMARY comment body
-# carries a `Potential issue` / ⚠️ marker, else 1.
+# carries a line the shared `coderabbit_tier_of` classifier grades blocking
+# (p0/p1 — 🟠 Major, Potential issue, ⚠️; #837), else 1.
 #
 # count_potential_issues() scans only INLINE `pulls/{pr}/comments`. When
 # CodeRabbit surfaces a finding solely in its PR-level summary body
@@ -1446,16 +1447,24 @@ summary_body_has_potential_issue_marker() {
 # commits) equals the given SHA and whose creation time is not older than
 # HEAD_IDENTITY_ANCHOR.
 #
-# Why this is needed (codex CHANGES_REQUESTED on PR #224 round 2 +
-# CodeRabbit ⚠️ Major @ line 581): the freshness-anchored count_potential_
-# issues filters reviews with `submitted_at >= HEAD_ANCHOR`. Once the same
-# unchanged HEAD sits longer than `coderabbit.wallclock_freshness_window_
-# seconds` (default 1800s / 30 min), HEAD_ANCHOR advances past the prior
-# CodeRabbit review's submitted_at, latest_review_id becomes null, and the
-# helper returns 0 — false-clearing the fast-path even while the same SHA
-# still has unresolved Potential issue/⚠️ inline findings. The fast-path is
-# the only caller that has authoritative per-SHA scope (from the StatusContext
-# check) and should leverage it.
+# Why this was INTRODUCED (codex CHANGES_REQUESTED on PR #224 round 2 +
+# CodeRabbit ⚠️ Major @ line 581): count_potential_issues was freshness-anchored
+# then — it filtered reviews with `submitted_at >= HEAD_ANCHOR`, so once the
+# same unchanged HEAD sat longer than `coderabbit.wallclock_freshness_window_
+# seconds` (default 1800s / 30 min), HEAD_ANCHOR advanced past the prior
+# CodeRabbit review's submitted_at, latest_review_id became null, and the
+# helper returned 0 — false-clearing the fast-path even while the same SHA
+# still had unresolved blocking inline findings.
+#
+# That #224 cause is GONE since #824: latest_head_pinned_review now selects on
+# `commit_id == HEAD_SHA` alone, so count_potential_issues can no longer lose a
+# SHA-matched review to the wall-clock floor. Do not read the paragraph above
+# as current behaviour of the sibling. This variant is kept because its SCOPE
+# is still the right one for the fast-path caller, not because the sibling is
+# broken: the fast-path is the only caller holding authoritative per-SHA
+# evidence (from the StatusContext check), and this helper scopes by each
+# inline comment's own `commit_id` — which survives GitHub's rebase remapping —
+# rather than by the review object the comment belongs to.
 #
 # Why still keep a non-wallclock freshness floor: GitHub can preserve or
 # remap inline review comments across a rebase/force-push so an old comment
@@ -2177,19 +2186,20 @@ emit_status_context_verdict() {
   # whenever the review finishes, even if Potential issue / ⚠️
   # comments were posted. Codex (chatgpt-codex-connector[bot]) caught
   # this on PR #224 round 1 (P1 finding, line 546). The fix: scan
-  # inline `Potential issue` / `⚠️` markers anchored on HEAD before
-  # declaring clearance.
+  # inline findings anchored on HEAD and count the ones the shared
+  # classifier grades blocking (#837) before declaring clearance.
   #
   # Round 2 sharpening (codex CHANGES_REQUESTED + CodeRabbit ⚠️ Major
   # @ line 581 on the round 1 fix): use `count_potential_issues_for_sha
-  # "$HEAD_SHA"` rather than `count_potential_issues`. The latter is
-  # filtered by HEAD_ANCHOR (wallclock freshness floor); after 30 min
-  # on the same unchanged HEAD, anchor advances past prior reviews and
-  # the count drops to 0 — false-clearing the fast-path. The
-  # SHA-scoped variant ignores the wallclock anchor entirely and counts
-  # findings whose `commit_id == HEAD_SHA`, which is the right scope
-  # given the fast-path already has authoritative SHA-level evidence
-  # from the StatusContext check.
+  # "$HEAD_SHA"` rather than `count_potential_issues`. The latter WAS
+  # then filtered by HEAD_ANCHOR (wallclock freshness floor), so after
+  # 30 min on the same unchanged HEAD the anchor advanced past prior
+  # reviews and the count dropped to 0 — false-clearing the fast-path.
+  # #824 removed that timestamp conjunct, so the sibling no longer
+  # false-clears that way; the SHA-scoped variant stays because it
+  # counts findings by each comment's own `commit_id == HEAD_SHA`,
+  # which is the right scope given the fast-path already has
+  # authoritative SHA-level evidence from the StatusContext check.
   local potential_issues synthetic
   potential_issues=$(count_potential_issues_for_sha "$HEAD_SHA")
   # Keep the synthetic review object compatible with the documented
