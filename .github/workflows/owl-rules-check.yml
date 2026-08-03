@@ -1,0 +1,38 @@
+name: OWL rules check
+
+# Mergepath-LOCAL gate: the docs/ontology rules ontology must keep catching
+# its seeded violations. Installs the pinned OWL-RL reasoner stack (the repo
+# ships no package.json / requirements.txt; two Python packages are pinned for
+# this gate only) and runs scripts/owl-rules-check.py --check, which verifies
+# four passes: the TBox alone is consistent, the consistent control world
+# produces no findings, every seeded violation in the fixtures is caught, and
+# the seeded inventory holds its ratcheted floor. Locally the checker
+# soft-passes when the libraries are absent; CI installs them so enforcement
+# is real here — the same posture as md-prose-wrap.yml.
+#
+# Deliberately standalone and NOT in .mergepath-sync.yml: it is not a
+# scripts/ci/check_* (those propagate to every consumer via the scripts/ci/
+# kit) and is not wired into the propagated repo_lint.yml. So it runs ONLY in
+# mergepath and touches no consumer CI. See docs/ontology/README.md.
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  owl-rules-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install rdflib and owlrl (pinned)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/owlvenv"
+          "$RUNNER_TEMP/owlvenv/bin/pip" install --quiet 'rdflib==7.6.0' 'owlrl==7.6.2'
+
+      - name: Run the OWL rules checker
+        # Enforcing: fails CI when the TBox is inconsistent, the control world
+        # is flagged, any seeded violation goes uncaught, or the seeded
+        # inventory drops below its floor.
+        run: '"$RUNNER_TEMP/owlvenv/bin/python" ./scripts/owl-rules-check.py --check'

@@ -11,6 +11,9 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 - **Post-review issue timing** — AGENTS.md step 9 mandates creating post-review issues "before merging", while `REVIEW_POLICY.md` § Post-Merge Issue Creation permits "before or immediately after merging" (its Phase 4b step ordering sides with AGENTS.md). See R-152.
 - **SSH signing-key paths** — `REVIEW_POLICY.md` § SSH Signing Keys names `~/.ssh/keys/github_<bot>.pub`, while § 1Password SSH agent setup and § Adding a New Agent use `~/.ssh/id_nathanpayne_{agent}.pub` — two path conventions for the same artifact.
 - **Operating-rules duplication** — `docs/agents/operating-rules.md` restates several shared-core rules verbatim; the file itself and the manifest's `doc_ownership` note record this as transitional debt to split (G-62), so it is a known, tracked exception to G-27.
+- **Deploy-auth retry instruction** — DEPLOYMENT.md § Rotating a Firebase deploy SA key instructs "Run `op signin` and re-try" on a stale session, contradicting the fleet stop-and-prompt rule (G-192: on a sign-in failure, stop immediately — no retries, no workarounds); § Auth Maintenance carries the same self-remediation framing in weaker form.
+- **On-disk headless deploy keys** — DEPLOYMENT.md § CI/CD & Headless Deploy instructs writing the deployer SA key JSON to persistent on-disk paths, contradicting both the same file's § Secrets Management ("not stored on disk except as a tempfile during a single deploy invocation") and G-284.
+- **Branch-protection posture** — DEPLOYMENT.md § Machine User Setup (G-346/G-347: one approving review, two required checks, admin bypass left available) predates and contradicts REVIEW_POLICY.md § Required status checks and ADR 0002 (the canonical five checks, hub admin enforcement); the ADR posture governs.
 
 ## Part R — Review pipeline rules
 
@@ -1113,6 +1116,180 @@ The catalog has two parts mirroring the corpus: **Part R** (the review pipeline:
 **G-300.** The rate-limit allowance is checked with the read-only rate-limit command — an authoring write routed through the author wrapper — rather than by spending a review. ○ — docs/agents/coderabbit-audit.md
 
 **G-301.** The PR author must hold an active CodeRabbit seat covering the repo; a missing seat silently disables review, and coverage is confirmed on the dashboard plus the observational cross-check, there being no API surface for it. ● — docs/agents/coderabbit-audit.md
+
+### Deploy guards and entry point (DEPLOYMENT.md, canonical root)
+
+**G-302.** A deploy runs from the main branch. ● — DEPLOYMENT.md § Deployment Steps
+
+**G-303.** Local main must not be behind origin; the deploy refuses when fetch shows unpulled commits. ● — DEPLOYMENT.md § Deployment Steps
+
+**G-304.** The working tree must be clean — no modified, staged, or untracked paths — or the deploy refuses. ● — DEPLOYMENT.md § Deployment Steps
+
+**G-305.** Force and allow-dirty overrides are break-glass only, never routine. ○ — DEPLOYMENT.md § Deployment Steps
+
+**G-306.** The dirty-tree guard is bypassable only by its dedicated env var, never subsumed by the force flag, so the override stays deliberate and audit-greppable. ● — DEPLOYMENT.md § Deployment Steps
+
+**G-307.** An allow-dirty deploy logs the dirty paths to stderr under a warning banner so the deviation appears in the transcript. ● — DEPLOYMENT.md § Deployment Steps
+
+**G-308.** The deploy script is the only sanctioned routine entry point; invoking the underlying deploy tools directly skips the guards and the cache purge. ○ — DEPLOYMENT.md § Deployment Steps
+
+**G-309.** Direct underlying-tool invocation is reserved for debugging and known one-off flows. ○ — DEPLOYMENT.md § Deployment Steps
+
+**G-310.** Deploys stay manual; CI workflows are limited to linting and review-policy enforcement, never deployment. ● — DEPLOYMENT.md § CI/CD Integration
+
+### Deploy credential mechanics
+
+**G-311.** An exported credential path counts as a genuine human override only when no preflight tempfile marker matches the same path. ● — DEPLOYMENT.md § Deploy credential precedence
+
+**G-312.** The deploy precedence applies to deploy flows only; the general cloud wrapper uses its narrower chain and never consults the project deploy key. ● — DEPLOYMENT.md § Deploy credential precedence
+
+**G-313.** The deploy tool logs its selected source credential so deploy auth is never opaque. ● — DEPLOYMENT.md § Deploy credential precedence
+
+**G-314.** The deploy runs non-interactive with an isolated CLI configstore so stale user login tokens cannot override the selected credential. ● — DEPLOYMENT.md § Deployment Steps
+
+**G-315.** Temporary credential files and the isolated configstore are cleaned up on exit. ● — DEPLOYMENT.md § Deployment Steps
+
+**G-316.** Broad non-deploy cloud work uses review preflight or unsets the exported credential so the deploy-scoped key does not leak into general commands. ○ — DEPLOYMENT.md § Deployment Steps
+
+**G-317.** Cloud quota attribution resolves from explicit billing-project, then explicit project, then the nearest repo config, then the active CLI config — never from the deploy script's pin. ● — DEPLOYMENT.md § Deploy credential precedence
+
+**G-318.** The shared human credential is unsuitable for unattended use; headless environments use the project deploy key as primary. ● — DEPLOYMENT.md § Auth Maintenance
+
+**G-319.** Preflight validates a materialized credential against the token endpoint before exporting it, and skips the export with an actionable warning when it is stale. ● — DEPLOYMENT.md § ADC refresh-token expiry
+
+**G-320.** The permanent fix for recurring deploy-auth failures is provisioning or rotating the project key, not deeper dependence on the shared human credential. ○ — DEPLOYMENT.md § ADC refresh-token expiry
+
+### Cache purge
+
+**G-321.** The CDN purge runs only when both its token and zone are set, and no-ops with a clear log line when either is missing — fail-visible, never fail-silent. ● — DEPLOYMENT.md § Deployment Steps
+
+**G-322.** The zone id is set per consumer repo; the token is sourced by deploy preflight, never by an ad-hoc read in the shell. ● — DEPLOYMENT.md § Deployment Steps
+
+### Secrets management (deployment scope)
+
+**G-323.** Resolved secret output, service-account JSON, and application-default credentials are never committed. ● — DEPLOYMENT.md § Secrets Management
+
+**G-324.** Resolved secret values are never printed in logs, PR bodies, or review comments. ● — DEPLOYMENT.md § Secrets Management
+
+**G-325.** Generated env files are never the source of truth: value changes go to the referenced vault item fields, shape changes to the committed template. ○ — DEPLOYMENT.md § Conflict resolution
+
+**G-326.** Template-plus-inject is used only when a tool genuinely requires a materialized file; runtime variable sets use the managed environments model. ○ — DEPLOYMENT.md § Secrets Management
+
+**G-327.** Whole-file secure-note bootstrap is retired and never used. ● — DEPLOYMENT.md § Runtime secrets guardrails
+
+**G-328.** A scoped service account or pre-materialized CI secret is used only after a ticket explicitly approves the scope. ○ — DEPLOYMENT.md § Runtime secrets
+
+**G-329.** Service-account tokens are headless-only and explicit opt-in for every agent client. ● — DEPLOYMENT.md § Runtime secrets
+
+**G-330.** Beta secret-management surfaces are gated on the audit workstream; only the GA portable-core primitives are the safe baseline. ○ — DEPLOYMENT.md § Runtime secrets
+
+### Headless preflight proof lane
+
+**G-331.** Headless token mode writes only the reviewer PAT, marks the cache as token-mode, and skips SSH warming and keyring repair. ● — DEPLOYMENT.md § Headless proof workflow
+
+**G-332.** The proof service account is scoped to the approved PAT items plus the dedicated canary only, with the token stored as an encrypted Actions secret. ● — DEPLOYMENT.md § Headless proof workflow
+
+**G-333.** Token mode is never pointed at a built-in private vault, which service accounts cannot access. ● — DEPLOYMENT.md § Headless proof workflow
+
+**G-334.** The negative-scope sentinel points at a shared vault outside the approved scope, never a private vault. ● — DEPLOYMENT.md § Headless proof workflow
+
+**G-335.** The proof setup confirms both sides: the local account CAN read the sentinel and the service account CANNOT. ● — DEPLOYMENT.md § Headless proof workflow
+
+**G-336.** The canary is verified by digest comparison only, never by exposing the raw value. ● — DEPLOYMENT.md § Headless proof workflow
+
+**G-337.** The proof workflow stays dispatch-only unless its secrets are intentionally available to a broader event class. ● — DEPLOYMENT.md § Headless proof workflow
+
+**G-338.** The proof runs after provisioning or rotating the service-account token. ○ — DEPLOYMENT.md § Headless proof workflow
+
+### Repo CI secrets and reviewer PATs (deployment doc)
+
+**G-339.** The reviewer-assignment secret is a reviewer-identity PAT, never the author identity; the workflow hard-fails when it resolves to the author or to an unregistered login. ● — DEPLOYMENT.md § Machine User Setup
+
+**G-340.** It is the only reviewer PAT permitted as a repo CI secret; the others are read per-session from the vault. ● — DEPLOYMENT.md § Machine User Setup
+
+**G-341.** Model-provider API keys and per-agent PATs are never repo secrets; the CI-side headless reviewer flow was removed. ● — DEPLOYMENT.md § Machine User Setup
+
+**G-342.** Reviewer PATs live in the designated vault under the exact token field name with the classic-token prefix. ● — DEPLOYMENT.md § Token type
+
+**G-343.** Collaborator invitations are accepted via browser or a classic scoped PAT; fine-grained PATs cannot accept them. ○ — DEPLOYMENT.md § Machine User Setup
+
+**G-344.** PAT rotation follows mint, update vault, revoke old, verify — in that order. ○ — DEPLOYMENT.md § Token rotation
+
+**G-345.** Rotating an item backing a repo secret is followed by a secret-set on every repo carrying it. ○ — DEPLOYMENT.md § Token rotation
+
+### Provisioning posture (deployment doc; see the inconsistencies note)
+
+**G-346.** The documented setup requires one approving review with stale-approval dismissal and the two policy checks required strict. ● — DEPLOYMENT.md § Machine User Setup
+
+**G-347.** The documented setup leaves admin bypass available so a human can force-merge in emergencies. ● — DEPLOYMENT.md § Machine User Setup
+
+**G-348.** The four workflow labels exist in every repo. ● — DEPLOYMENT.md § Machine User Setup
+
+**G-349.** All three machine users are collaborators with Write access. ● — DEPLOYMENT.md § Machine User Setup
+
+**G-350.** Setup is verified by the six listed checks before the repo counts as provisioned. ○ — DEPLOYMENT.md § Machine User Setup
+
+### Firebase project setup
+
+**G-351.** The Firebase config pair is committed after initialization. ● — DEPLOYMENT.md § New Project Setup
+
+**G-352.** Automatic builds and file overwrites are declined during initialization. ○ — DEPLOYMENT.md § New Project Setup
+
+**G-353.** Firestore starts in production mode; functions require the billing plan. ● — DEPLOYMENT.md § New Project Setup
+
+**G-354.** Hosting is always required; other services are conditional on app needs. ● — DEPLOYMENT.md § New Project Setup
+
+**G-355.** The deployer service account uses the canonical name and holds exactly the six listed roles, with the operator granted token-creator on it. ● — DEPLOYMENT.md § op-firebase-setup
+
+**G-356.** Minting a deployer key requires the key-admin role (or owner) on the project. ● — DEPLOYMENT.md § Provisioning
+
+### Deploy-key provisioning and rotation
+
+**G-357.** The key is stored in the Firebase vault under the exact canonical item title the materializer reads literally. ● — DEPLOYMENT.md § Provisioning
+
+**G-358.** The local key file is wiped immediately after upload; the key lives only in the vault plus per-run tempfiles. ● — DEPLOYMENT.md § Provisioning
+
+**G-359.** Provisioning refuses to overwrite an existing canonical item, routing to rotation instead. ● — DEPLOYMENT.md § Provisioning
+
+**G-360.** Provisioning short-circuits with a clear error when the vault CLI is absent. ● — DEPLOYMENT.md § Provisioning
+
+**G-361.** Key provisioning stays opt-in, preserving the impersonation-only contract for callers who do not request it. ● — DEPLOYMENT.md § Provisioning
+
+**G-362.** During rotation the old key id is captured before the item is replaced, so it can be revoked cleanly. ○ — DEPLOYMENT.md § Rotation
+
+**G-363.** Rotation reuses the same canonical item title so lookup keeps working without a script edit. ● — DEPLOYMENT.md § Rotation
+
+**G-364.** The rotation date is recorded in the item's notes field — the primary rotation record. ● — DEPLOYMENT.md § Rotation
+
+**G-365.** Rotation is verified by a low-risk deploy whose source-credential log line still names the project key; falling through to another source forbids rolling forward. ● — DEPLOYMENT.md § Rotation
+
+**G-366.** The old key is revoked only after successful verification, so the project is never left without a valid key. ○ — DEPLOYMENT.md § Rotation
+
+**G-367.** The key rotates on a 90-day cadence, immediately on any compromise indicator with a downstream audit, and on custody or membership changes. ○ — DEPLOYMENT.md § Rotation
+
+**G-368.** Multi-project rotation runs one project at a time; batching or automating it is out of bounds. ○ — DEPLOYMENT.md § Rotation
+
+**G-369.** Recoverable rollback requires retaining the old key material before replacement; without it the only recovery is roll-forward. ○ — DEPLOYMENT.md § Rotation
+
+### Machine bootstrap and script custody
+
+**G-370.** The bootstrap repo list resolves via an explicit path before changing directories; a bare filename argument silently expands to nothing. ● — DEPLOYMENT.md § New Machine Setup
+
+**G-371.** Presence in the bootstrap loop is never sync-consumer enrollment; propagation requires separate manifest enrollment. ● — DEPLOYMENT.md § New Machine Setup
+
+**G-372.** The mergepath copies of the helper scripts are canonical; edits to installed machine copies sync back to the repo. ○ — DEPLOYMENT.md § Script Installation
+
+**G-373.** The helper scripts install to the local bin, marked executable, with that bin on the path. ● — DEPLOYMENT.md § Script Installation
+
+**G-374.** New runtime application secrets prefer the managed environments model; template-inject is retained only where a generated file is genuinely needed. ○ — DEPLOYMENT.md § New Machine Setup
+
+**G-375.** Template-structure divergence between machines is resolved as source code, never by syncing generated local files. ○ — DEPLOYMENT.md § Conflict resolution
+
+### Post-deploy
+
+**G-376.** Every deploy is followed by the verification checklist: live URL in a fresh session, core functionality, console errors. ○ — DEPLOYMENT.md § Post-Deployment Verification
+
+**G-377.** Rollback goes through the hosting release-history mechanism, never a re-deploy of older source. ○ — DEPLOYMENT.md § Rollback Procedure
 
 ---
 

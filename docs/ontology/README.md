@@ -2,7 +2,7 @@
 
 Three artifacts model Mergepath's domain, complementing the root [`CONTEXT.md`](../../CONTEXT.md) glossary (the ubiquitous language):
 
-- [`rules.md`](rules.md) — every normative rule of Mergepath documented in English with a stable ID (R-1…R-203 for the review pipeline, G-1…G-301 for structure, governance, deployment, and the CodeRabbit configuration posture), each citing its canonical source. **●** marks configuration rules (machine-checkable arrangements of entities), **○** procedural ones.
+- [`rules.md`](rules.md) — every normative rule of Mergepath documented in English with a stable ID (R-1…R-203 for the review pipeline, G-1…G-377 for structure, governance, the CodeRabbit configuration posture, and deployment — the `docs/agents` tree, the Standard, the manifest, and the canonical root `DEPLOYMENT.md`), each citing its canonical source. **●** marks configuration rules (machine-checkable arrangements of entities), **○** procedural ones.
 - [`mergepath-rules.ttl`](mergepath-rules.ttl) — an OWL ontology formalizing a core subset of the ● rules as axioms whose violation a reasoner detects. Every violation-catching axiom carries an `mp:encodesRule` annotation naming the catalog IDs it encodes.
 - [`fixtures/`](fixtures/) — `violations.ttl`, nineteen individuals each deliberately breaking one encoded rule (annotated `mp:seededViolation`; the checker's C0 ratchet pins the floor), and `consistent.ttl`, a correct world modeled on a real merged PR that also exercises the deliberately-legal edge cases (under-threshold self-approval, a same-head clearance, canonical propagation, an identity doc on a templated entry) which the axioms must not flag.
 
@@ -31,4 +31,4 @@ OWL reasoning is **open-world**: it detects *contradictions* — a forbidden con
 
 ## Maintenance
 
-When a rule changes at its source: update the catalog entry in `rules.md` first; if the rule is encoded, update the axiom and keep its `mp:encodesRule` annotation accurate; seed or adjust a violation fixture for any new axiom (with a `mp:violationWitness` when the reasoner surfaces a different individual); run the checker. The checker is deliberately not wired into `repo_lint.yml` yet — wiring it (with its soft-pass guard, hub-only) is a candidate follow-up once the layer has settled.
+When a rule changes at its source: update the catalog entry in `rules.md` first; if the rule is encoded, update the axiom and keep its `mp:encodesRule` annotation accurate; seed or adjust a violation fixture for any new axiom (with a `mp:violationWitness` when the reasoner surfaces a different individual); run the checker. The checker is enforced in CI by the mergepath-local workflow `.github/workflows/owl-rules-check.yml`, which installs the pinned reasoner stack and runs `--check` on every push and PR — the same standalone, deliberately-unpropagated posture as the md-prose-wrap gate. It is not wired into the propagated `repo_lint.yml`, so consumer CI is untouched.
