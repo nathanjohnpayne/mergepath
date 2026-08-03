@@ -125,6 +125,15 @@ cat >"$FAKE_MP/BRAND.md" <<'EOF'
 mergepath, Mergepath, and MERGEPATH all appear here.
 EOF
 
+# Hub glossary (#864) — root-level hub-identity doc, excluded outright
+# (no consumer stub). Its identity claims are false in a consumer and
+# it points at the propagation manifest the mirror strips.
+cat >"$FAKE_MP/CONTEXT.md" <<'EOF'
+# Mergepath
+Mergepath is the reference implementation of the Standard and the hub
+of the fleet. See the propagation manifest (.mergepath-sync.yml).
+EOF
+
 cat >"$FAKE_MP/.ai_context.md" <<'EOF'
 Plain agent context with no template-name string (this file is in
 the name-bearing list only so we can test the no-match path).
@@ -438,6 +447,7 @@ for excluded in \
   'docs/projects' \
   'scripts/project-doc-sync.sh' \
   'tests/test_project_doc_sync.sh' \
+  'CONTEXT.md' \
   'bugs/screenshots' \
   '.github/screenshots' ; do
   # Skip .git — the stage init step creates a fresh .git/ in the target.
@@ -2008,6 +2018,68 @@ orphans=$(find "$ANCHOR_TMPDIR" -name 'bootstrap-loop.*' | wc -l | tr -d ' ')
 [ "$orphans" -eq 0 ] \
   && pass "failure path cleaned up its tmpfile (no orphans, #233 guarantee kept)" \
   || fail "$orphans orphan tmpfile(s) left after failure path"
+
+# --- resumed-mirror stale-glossary removal (#864) -------------------------
+# --exclude only skips the transfer; a receiver populated by an earlier or
+# interrupted Stage B keeps its stale hub-glossary copy unless the
+# post-mirror removal also names CONTEXT.md. Assert the helper directly,
+# since wizard preflight (correctly) refuses populated targets.
+RESUME_DIR="$WORKDIR/resumed-target"
+mkdir -p "$RESUME_DIR/tests"
+printf 'stale hub glossary\n' >"$RESUME_DIR/CONTEXT.md"
+printf 'stale orphan\n' >"$RESUME_DIR/tests/test_mergepath_playground.sh"
+
+# The helper runs in a subshell so lib state cannot leak, but source and
+# helper failures REACH the harness: the subshell rc is captured and
+# asserted, never discarded. Only the bootstrap::run fallback (plain
+# execution when the lib lacks it) is tolerated.
+run_remove_orphans() { # run_remove_orphans <dir> — echoes the subshell rc
+  local rc=0
+  (
+    set -e
+    source "$MIRROR_LIB"
+    if ! declare -F bootstrap::run >/dev/null 2>&1; then
+      bootstrap::run() { shift; "$@"; }
+    fi
+    if ! declare -F bootstrap::err >/dev/null 2>&1; then
+      bootstrap::err() { echo "ERR: $*" >&2; }
+    fi
+    bootstrap::_remove_orphans "$1"
+  ) >&2 || rc=$?
+  # The lib logs to stdout; route it to stderr above so the echoed rc is the
+  # ONLY stdout of this helper and command substitution stays clean.
+  echo "$rc"
+}
+
+rc="$(run_remove_orphans "$RESUME_DIR")"
+[ "$rc" -eq 0 ] \
+  && pass "resumed-mirror cleanup exits 0 on success" \
+  || fail "resumed-mirror cleanup returned rc=$rc on the happy path"
+[ ! -e "$RESUME_DIR/CONTEXT.md" ] \
+  && pass "resumed mirror removes stale CONTEXT.md (#864)" \
+  || fail "stale CONTEXT.md survives a resumed mirror"
+[ ! -e "$RESUME_DIR/tests/test_mergepath_playground.sh" ] \
+  && pass "resumed mirror still removes the playground orphan" \
+  || fail "playground orphan survives a resumed mirror"
+
+# Dangling symlink: -e is false for these, so the removal must test -L too.
+ln -s /nonexistent-target "$RESUME_DIR/CONTEXT.md"
+rc="$(run_remove_orphans "$RESUME_DIR")"
+{ [ "$rc" -eq 0 ] && [ ! -L "$RESUME_DIR/CONTEXT.md" ]; } \
+  && pass "resumed mirror removes a dangling CONTEXT.md symlink" \
+  || fail "dangling CONTEXT.md symlink survives (rc=$rc)"
+
+# Failure propagation: an unremovable stale glossary must fail the helper so
+# Stage B aborts instead of continuing with hub-only content in the target.
+LOCKED_DIR="$WORKDIR/resumed-locked"
+mkdir -p "$LOCKED_DIR"
+printf 'stale hub glossary\n' >"$LOCKED_DIR/CONTEXT.md"
+chmod 555 "$LOCKED_DIR"
+rc="$(run_remove_orphans "$LOCKED_DIR")"
+chmod 755 "$LOCKED_DIR"
+[ "$rc" -ne 0 ] \
+  && pass "unremovable stale CONTEXT.md fails the cleanup (rc=$rc)" \
+  || fail "cleanup swallowed the removal failure"
 
 # --- summary --------------------------------------------------------------
 echo

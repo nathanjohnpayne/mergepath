@@ -251,6 +251,17 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
   'BRAND.md'
   'docs/agents/repository-overview.md'
 
+  # CONTEXT.md is the hub glossary (#864): its opening line states hub
+  # identity ("the reference implementation ... hub of the fleet") that
+  # is FALSE in a consumer, and its definitions point at the propagation
+  # manifest this stage deliberately strips. It is a root file outside
+  # docs/agents/, so the doc_ownership derivation cannot carry it — it
+  # is hand-listed here. Unlike BRAND.md above it gets NO consumer stub:
+  # a glossary is wholly hub-authored voice, and there is no neutral
+  # consumer stub worth generating. Consumers author their own glossary
+  # if they want one.
+  'CONTEXT.md'
+
   # Screenshots — internal evidence, not template content
   'bugs/screenshots/'
   '.github/screenshots/'
@@ -265,6 +276,11 @@ BOOTSTRAP_MIRROR_EXCLUDES=(
 # pattern but shouldn't ship to a new repo. Post-mirror cleanup.
 BOOTSTRAP_POST_MIRROR_REMOVE=(
   tests/test_mergepath_playground.sh
+  # CONTEXT.md is also excluded from the rsync above; listing it here too
+  # closes the resumed-mirror gap (#864): --exclude only skips the transfer,
+  # so a receiver populated by an earlier or interrupted Stage B would keep
+  # its stale hub-glossary copy without this removal.
+  CONTEXT.md
 )
 
 # Directories to remove ONLY if they end up empty after the
@@ -1093,11 +1109,20 @@ bootstrap::_rsync_template() {
 
 bootstrap::_remove_orphans() {
   local target=$1
+  local rc=0
 
   local orphan
   for orphan in "${BOOTSTRAP_POST_MIRROR_REMOVE[@]}"; do
-    if [ -e "$target/$orphan" ]; then
-      bootstrap::run "rm orphan $orphan" rm -f "$target/$orphan"
+    # -L catches a dangling symlink (-e is false for those), so a stale
+    # symlinked CONTEXT.md on a resumed target is still removed.
+    if [ -e "$target/$orphan" ] || [ -L "$target/$orphan" ]; then
+      bootstrap::run "rm orphan $orphan" rm -f "$target/$orphan" || rc=$?
+      # A survivor is a failure even if rm exited 0 (e.g. permission-masked):
+      # Stage B must not continue with hub-only content still in the target.
+      if [ -e "$target/$orphan" ] || [ -L "$target/$orphan" ]; then
+        bootstrap::err "post-mirror removal left $orphan in the target"
+        rc=1
+      fi
     fi
   done
 
@@ -1105,9 +1130,11 @@ bootstrap::_remove_orphans() {
   for empty_dir in "${BOOTSTRAP_POST_MIRROR_RMDIR_IF_EMPTY[@]}"; do
     local dir_path="$target/$empty_dir"
     if [ -d "$dir_path" ] && [ -z "$(ls -A "$dir_path" 2>/dev/null)" ]; then
-      bootstrap::run "rmdir empty $empty_dir" rmdir "$dir_path"
+      bootstrap::run "rmdir empty $empty_dir" rmdir "$dir_path" || rc=$?
     fi
   done
+
+  return "$rc"
 }
 
 bootstrap::_clean_repo_template_yml() {

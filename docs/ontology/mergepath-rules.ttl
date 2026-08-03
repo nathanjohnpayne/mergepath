@@ -20,7 +20,7 @@
 <https://github.com/nathanjohnpayne/mergepath/ontology>
     rdf:type owl:Ontology ;
     rdfs:label "Mergepath rules ontology" ;
-    rdfs:comment "OWL axioms catching violations of Mergepath's configuration rules; companion to docs/ontology/rules.md and CONTEXT.md." .
+    rdfs:comment "OWL axioms catching violations of Mergepath's configuration rules; companion to docs/ontology/rules.md and the hub root CONTEXT.md (github.com/nathanjohnpayne/mergepath)." .
 
 mp:encodesRule rdf:type owl:AnnotationProperty ;
     rdfs:comment "Names the docs/ontology/rules.md rule ID(s) an axiom encodes." .
