@@ -389,6 +389,42 @@ test_gate_triggers_when_verdict_is_superseded() {
   [ "$FAIL" -ne "$before" ] || pass "M: a verdict superseded by a later findings round does not suppress"
 }
 
+# N: carry-forward reports a NON-BOOLEAN `carried`. `.carried | tostring` would
+# coerce the string "true" into consent, and a JSON string is what a truncated
+# or doubly-encoded payload most plausibly degrades into. `carried` is the one
+# field that suppresses a review, so a wrong-typed value must read as no answer,
+# not as yes. (CodeRabbit Major on #880.) The carry-forward helper is stubbed
+# here on purpose: this asserts the GATE's handling of a malformed contract,
+# which the real helper cannot produce.
+test_gate_requires_boolean_carried() {
+  local dir rc before=$FAIL payload
+  for payload in '{"carried":"true"}' '{"carried":1}' '{"carried":null}' '{}'; do
+    dir=$(make_gate_case "gate-carriedtype-$(printf '%s' "$payload" | tr -cd '[:alnum:]')")
+    cat >"$dir/scripts/workflow/external_review_carryforward.sh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' '$payload'
+EOF
+    chmod +x "$dir/scripts/workflow/external_review_carryforward.sh"
+    rc=$(run_gate "$dir" "$SHA_UNCHANGED")
+    [ "$rc" = "0" ] || fail "N: expected exit 0 for $payload, got $rc; err=$(cat "$dir/gate.err")"
+    [ "$(gatef "$dir" '.trigger')" = "true" ] \
+      || fail "N: trigger=$(gatef "$dir" '.trigger') for carried=$payload, expected true — a non-boolean carried is not consent; reason=$(gatef "$dir" '.reason')"
+  done
+  # Control: the same stub with a real boolean DOES suppress, so N is asserting
+  # the type check and not merely that a stubbed helper is ignored.
+  dir=$(make_gate_case "gate-carriedtype-control")
+  cat >"$dir/scripts/workflow/external_review_carryforward.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '{"carried":true,"source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_time":"2026-07-29T10:00:00Z","fingerprint":"external-review:v2:deadbeef"}'
+EOF
+  chmod +x "$dir/scripts/workflow/external_review_carryforward.sh"
+  rc=$(run_gate "$dir" "$SHA_UNCHANGED")
+  [ "$rc" = "0" ] || fail "N: control expected exit 0, got $rc; err=$(cat "$dir/gate.err")"
+  [ "$(gatef "$dir" '.trigger')" = "false" ] \
+    || fail "N: control trigger=$(gatef "$dir" '.trigger'), expected false — a boolean true must still suppress"
+  [ "$FAIL" -ne "$before" ] || pass "N: a non-boolean 'carried' is not consent (boolean true still suppresses)"
+}
+
 # --- call-site wiring in codex-review-request.sh ----------------------------
 
 # Writes a gate stub with a fixed verdict, so H/I isolate the env flag.
@@ -486,6 +522,7 @@ test_gate_triggers_without_prior_review
 test_gate_fails_open_on_api_error
 test_gate_triggers_when_only_signal_is_a_review_object
 test_gate_triggers_when_verdict_is_superseded
+test_gate_requires_boolean_carried
 test_wiring_auto_caller_honors_skip
 test_wiring_manual_caller_ignores_gate
 test_wiring_missing_gate_fails_open

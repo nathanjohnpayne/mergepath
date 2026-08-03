@@ -164,12 +164,19 @@ if [ "$CARRY_RC" -ne 0 ]; then
   emit true "external_review_carryforward.sh exited $CARRY_RC; cannot prove this head carries a prior Codex verdict"
 fi
 
-CARRIED=$(printf '%s' "$CARRY_JSON" | jq -r '.carried | tostring' 2>/dev/null) || CARRIED="parse-error"
+# `.carried` must be a JSON BOOLEAN, not merely stringify to "true". `tostring`
+# would coerce the string "true" — and a JSON string is what a truncated,
+# doubly-encoded, or half-written payload most plausibly degrades into. This is
+# the single field that suppresses a review, so a value whose type is wrong is
+# treated as no answer at all rather than as consent (CodeRabbit Major on #880).
+CARRIED=$(printf '%s' "$CARRY_JSON" \
+  | jq -r 'if (.carried | type) == "boolean" then (.carried | tostring) else "parse-error" end' 2>/dev/null) \
+  || CARRIED="parse-error"
 CARRY_FINGERPRINT=$(printf '%s' "$CARRY_JSON" | jq -r '.fingerprint // ""' 2>/dev/null || printf '')
 
 if [ "$CARRIED" != "true" ]; then
   if [ "$CARRIED" = "parse-error" ]; then
-    emit true "external_review_carryforward.sh output did not parse; cannot prove this head carries a prior Codex verdict"
+    emit true "external_review_carryforward.sh output did not parse, or reported a non-boolean 'carried'; cannot prove this head carries a prior Codex verdict"
   fi
   CARRY_REASON=$(printf '%s' "$CARRY_JSON" | jq -r '.reason // "no prior Codex verdict carries to this head"' 2>/dev/null || printf 'no prior Codex verdict carries to this head')
   emit true "$CARRY_REASON" "$CARRY_FINGERPRINT"
