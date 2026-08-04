@@ -617,10 +617,27 @@ summary_names_head() {
   # must not depend on that, or an uppercase range would silently drop this
   # head's summary out of scope.
   want=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+  # PREFIX comparison, not equality (Phase 4b P1 on #886). The extraction above
+  # deliberately accepts a 7-to-40 character range end, and every real body
+  # sampled in this repo writes the full 40 — but equality against the
+  # API-provided 40-character head made the tolerated abbreviation unmatchable,
+  # so the two halves of this function contradicted each other. That is not a
+  # harmless inconsistency: if CodeRabbit ever abbreviates, which is exactly the
+  # kind of presentation change this function is written not to depend on, EVERY
+  # summary silently falls out of scope and its findings go ungated.
+  #
+  # A prefix match is safe in the other direction too. The extraction's
+  # `[0-9a-f]` class bounds the token, so a longer digest merely CONTAINING the
+  # head cannot reach here; and the abbreviation is authored by CodeRabbit, not
+  # by the pusher, so there is no input to steer. The `-gt 0` length guard keeps
+  # an empty extraction from prefix-matching everything.
   while IFS= read -r r; do
     [ -n "$r" ] || continue
     end=$(printf '%s' "$r" | awk '{print $4}' | tr '[:upper:]' '[:lower:]')
-    [ "$end" = "$want" ] && return 0
+    [ -n "$end" ] || continue
+    case "$want" in
+      "$end"*) return 0 ;;
+    esac
   done <<EOF
 $ranges
 EOF
@@ -752,9 +769,27 @@ elif ! summary_names_head "$SUMMARY_BODY" "$HEAD_SHA"; then
   log "PR-level summary (comment id $SUMMARY_ID) does not name $HEAD_SHA as its commits-range end — not this head's report, no summary findings in scope"
 else
   SUMMARY_SCAN=$(summary_strip_pre_merge_block "$SUMMARY_BODY")
-  cr_line_no=0
-  while IFS= read -r cr_line; do
-    cr_line_no=$((cr_line_no + 1))
+  # Classify UNFENCED lines only (Phase 4b P2 on #886, and Codex's earlier P2 —
+  # both reviewers landed on this). The three structural scans had already been
+  # taught to ignore fenced quotes; the finding loop had not, so a PR whose diff
+  # contains `_⚠️ Potential issue_`, `P1`, or any other classifier marker as
+  # SOURCE TEXT could manufacture a blocking summary finding against itself when
+  # CodeRabbit quoted it back. This repo's own test fixtures contain exactly
+  # such strings.
+  #
+  # I deferred this once (#893) on the argument that skipping fenced content in
+  # the CLASSIFIER inverts the fail direction — and that argument was wrong on
+  # the facts. CodeRabbit's finding markers are markdown emphasis rendered as
+  # PROSE; a finding's code snippet sits inside a fence but the marker line that
+  # classifies never does. So no genuine finding is lost, and the change is a
+  # pure precision gain rather than a fail-open trade. #893 is closed by this.
+  #
+  # Line numbers stay those of SUMMARY_SCAN, not of the filtered stream, so a
+  # reported location still points at the real line in the summary.
+  while IFS= read -r cr_numbered; do
+    [ -n "$cr_numbered" ] || continue
+    cr_line_no=${cr_numbered%%	*}
+    cr_line=${cr_numbered#*	}
     [ -n "$cr_line" ] || continue
     cr_tier=$(coderabbit_tier_of "$cr_line")
     if tier_is_required "$cr_tier"; then
@@ -771,7 +806,7 @@ else
       ')
     fi
   done <<EOF
-$SUMMARY_SCAN
+$(summary_unfenced_numbered "$SUMMARY_SCAN")
 EOF
   # Only bind a fingerprint when there is something to acknowledge. With no
   # blocking finding the token is never printed and never consulted, and

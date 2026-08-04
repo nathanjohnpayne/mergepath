@@ -310,11 +310,46 @@ jobs:
               continue
             fi
 
+            # STALE-SNAPSHOT GUARD (Codex round 4 + Phase 4b P1 on #886).
+            # Two comment events close together produce two concurrent sweeps,
+            # and because same-name check runs supersede one another, an OLDER
+            # run finishing last can republish a stale SUCCESS over a newer,
+            # correct FAILURE — leaving the required check green on a summary
+            # whose acknowledgement was just edited or deleted.
+            #
+            # Fixed by compare-and-swap on the surface the verdict is computed
+            # from, NOT by a `concurrency:` block. mergepath#843 established
+            # that adding `concurrency` to a job publishing a required check
+            # cancels the PENDING member even with `cancel-in-progress: false`,
+            # leaving a `cancelled` native check that blocks merge permanently
+            # and cannot be retired by a rerun. On a gate with
+            # `enforce_admins: true` that trades a transient stale-green window
+            # for an unfixable deadlock.
+            #
+            # So: fingerprint the PR-comment surface before the gate runs, and
+            # again after. If it moved, another event has superseded this
+            # snapshot — skip the publish and let that run's (newer) verdict
+            # stand. Nothing is cancelled, so no run ever owes a check_run it
+            # cannot deliver, and the scheduled sweep remains the backstop.
+            pre_fp=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+              --jq '[.[] | "\(.id):\(.updated_at)"] | sort | join(",")' 2>/dev/null || echo "__unreadable__")
+
             set +e
             output=$(scripts/coderabbit-severity-gate.sh "$PR" "$REPO" 2>&1)
             rc=$?
             set -e
             echo "$output"
+
+            post_fp=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+              --jq '[.[] | "\(.id):\(.updated_at)"] | sort | join(",")' 2>/dev/null || echo "__unreadable__")
+            if [ "$pre_fp" != "$post_fp" ]; then
+              # Deliberately a NOTICE, not a warning or error: a superseded
+              # snapshot is the guard working, not a failure. The run that
+              # caused the change publishes the current verdict.
+              echo "::notice::PR #$PR comment surface changed while the gate ran; skipping this publication so the newer run's verdict stands"
+              echo "::endgroup::"
+              continue
+            fi
 
             case "$rc" in
               0) conclusion="success" ;;

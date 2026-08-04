@@ -2435,6 +2435,147 @@ else
   echo "$OUT" | sed 's/^/      /' >&2
 fi
 
+# ===========================================================================
+# Phase 4b automated review on #886 (reviewer nathanpayne-codex).
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Test 45 (#886, Phase 4b P1): the commits-range extraction accepts a 7-to-40
+# character range end, so the comparison must be a PREFIX match against the
+# 40-character API head. Requiring equality made the tolerated abbreviation
+# unmatchable — the two halves of the function contradicted each other, and if
+# CodeRabbit ever abbreviates, every summary silently falls out of scope and
+# its findings go ungated. (Every real body sampled in this repo writes the
+# full 40; the inconsistency is the defect, not the observed data.)
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 45 (#886): an ABBREVIATED commits-range end still names this head → exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+SHORT_HEAD=$(printf '%s' "$HEAD_SHA" | cut -c1-10)
+ABBREV_RANGE_SUMMARY="$(make_summary_body "$SHORT_HEAD" "$SUMMARY_BLOCKING_FINDING")"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$ABBREV_RANGE_SUMMARY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1"; then
+  pass "an abbreviated range end prefix-matches the full head → in scope, exit 1"
+else
+  fail "expected rc=1 with 'unresolved: 1'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 45b (#886): prefix matching must not become "any prefix of anything". A
+# range end that is NOT a prefix of this head still puts the summary out of
+# scope — test 20 covers the plain stale case; this pins that the loosening did
+# not swallow it.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 45b (#886): an abbreviation of a DIFFERENT sha is still out of scope → exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments \
+  "$(make_summary_body "fedcba9876" "$SUMMARY_BLOCKING_FINDING")")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "does not name $HEAD_SHA as its commits-range end"; then
+  pass "an abbreviation of another sha stays out of scope → exit 0"
+else
+  fail "expected rc=0 with the out-of-scope log line; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 46 (#886, Phase 4b P2): the finding loop classifies UNFENCED lines only.
+# The structural scans already ignored fenced quotes; the classifier did not,
+# so a PR whose diff contains a classifier marker as SOURCE TEXT could
+# manufacture a blocking summary finding against itself when CodeRabbit quoted
+# it back — this repo's own fixtures contain such strings. Closes #893.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 46 (#886): a quoted finding marker inside a fence is not a finding → exit 0"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+QUOTED_MARKER_SUMMARY="$(make_summary_body "$HEAD_SHA" "No actionable comments.
+
+The diff adds this fixture line:
+
+\`\`\`
+_⚠️ Potential issue_ | _🟠 Major_: the retry loop never terminates on a 5xx.
+\`\`\`
+")"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$QUOTED_MARKER_SUMMARY")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 0"; then
+  pass "a fenced quote of a finding marker does not manufacture a finding → exit 0"
+else
+  fail "expected rc=0 with 'unresolved: 0'; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 46b (#886): the narrowing must not lose a genuine finding — an unfenced
+# marker still gates, and its reported line number still points at the real
+# line in the summary rather than at a position in the filtered stream.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 46b (#886): an unfenced marker below a fence still gates, with a true line number"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FENCE_THEN_FINDING="$(make_summary_body "$HEAD_SHA" "Quoted fixture:
+
+\`\`\`
+some quoted source line
+another quoted source line
+\`\`\`
+
+$SUMMARY_BLOCKING_FINDING
+")"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$FENCE_THEN_FINDING")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+# The finding sits on line 14 of the composed body. The filtered stream drops
+# the fence delimiters and their contents, which would put it at 10. Asserting
+# the NUMBER, not just the count, is what pins that original line numbers
+# survive the filter — a count-only assertion passes either way.
+REPORTED_LINE=$(echo "$OUT" | sed -n 's/.*(PR-level summary comment):\([0-9]*\).*/\1/p' | head -1)
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && [ "${REPORTED_LINE:-0}" -eq 14 ]; then
+  pass "an unfenced finding below a fence gates, reported at its true line $REPORTED_LINE"
+else
+  fail "expected rc=1, 'unresolved: 1' and reported line 14; got rc=$RC line='$REPORTED_LINE'"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
 # ---------------------------------------------------------------------------
 echo
 echo "============================================"
