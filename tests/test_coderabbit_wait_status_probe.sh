@@ -1774,11 +1774,19 @@ test_884_clearance_reviews_api_failure_fails_closed() {
       CODERABBIT_TEST_SCENARIO=probe_reviews_api_failure \
       ./scripts/coderabbit-wait.sh 999 owner/repo \
       >"$dir/out.json" 2>"$dir/err.log" ) || rc=$?
-  status=$(jq -r '.status // "none"' "$dir/out.json" 2>/dev/null || echo "none")
-  if [ "$rc" != "0" ] && [ "$status" != "cleared" ]; then
-    pass "#884: a reviews-API failure on the clearance path fails closed (rc=$rc status=$status), never cleared"
+  if [ -s "$dir/out.json" ]; then
+    status=$(jq -er '.status' "$dir/out.json" 2>/dev/null) || {
+      fail "#884: reviews-API failure emitted malformed JSON instead of the expected infra exit"
+      sed 's/^/      /' "$dir/err.log" >&2 || true
+      return
+    }
   else
-    fail "#884: a failed reviews read produced rc=$rc status=$status — a false clear"
+    status="no-json (expected for infra exit)"
+  fi
+  if [ "$rc" = "3" ] && grep -q "simulated reviews API failure" "$dir/err.log"; then
+    pass "#884: a reviews-API failure on the clearance path exits 3 (rc=$rc status=$status)"
+  else
+    fail "#884: a failed reviews read produced rc=$rc status=$status — expected the reviews-API infra failure"
     sed 's/^/      /' "$dir/err.log" >&2 || true
   fi
 }
