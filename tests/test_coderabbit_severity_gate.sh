@@ -60,6 +60,8 @@
 #   28. unreadable `issues/{pr}/comments` → FAIL CLOSED → exit 2.
 #   29. inline + summary findings both counted; 29b resolving the inline
 #       thread leaves exactly the summary one (inline behavior unchanged).
+#   30. markerless full-review summary with an exact-head CodeRabbit review
+#       object gates; without that object it remains out of scope.
 #
 # Ack scoping (#886 — an ack clears the findings it acknowledged, nothing else):
 #   30. ack for finding set {A} vs a same-head re-review that rewrote the
@@ -163,6 +165,10 @@ if [ "$1" = "api" ]; then
       ;;
     repos/*/pulls/*/comments)
       cat "${FIXTURE_COMMENTS:-/dev/null}"
+      exit 0
+      ;;
+    repos/*/pulls/*/reviews)
+      cat "${FIXTURE_REVIEWS:-/dev/null}"
       exit 0
       ;;
     repos/*/issues/*/comments)
@@ -1033,6 +1039,22 @@ make_issue_comments_fixture() {
   local content=$1
   local file="$WORKDIR/issuecomments.$$.$RANDOM.json"
   echo "$content" > "$file"
+  echo "$file"
+}
+
+# Review-object fixture for CodeRabbit's markerless full-review format. Its
+# exact `commit_id` is the scope anchor that an ordinary summary body lacks.
+make_reviews_fixture() {
+  local sha=$1 state=${2:-COMMENTED}
+  local file="$WORKDIR/reviews.$$.$RANDOM.json"
+  jq -n --arg sha "$sha" --arg state "$state" '
+    [{
+      id: 8001,
+      user: { login: "coderabbitai[bot]" },
+      commit_id: $sha,
+      state: $state
+    }]
+  ' > "$file"
   echo "$file"
 }
 
@@ -2570,6 +2592,88 @@ if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 
 else
   fail "expected rc=1, 'unresolved: 1' and reported line 14; got rc=$RC line='$REPORTED_LINE'"
   echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 47 (#886, Codex P1): CodeRabbit's markerless full-review body has no
+# auto-generated summary marker or commits-range line. Its exact-head review
+# object is therefore the only legitimate scope anchor. The P1 finding must
+# gate when both surfaces agree, but a look-alike body alone must not.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 47 (#886): markerless full-review summary + head review object → exit 1"
+SCRATCH=$(make_scratch_with_policy "$DEFAULT_POLICY")
+FIXTURE_PR=$(make_pr_fixture "$HEAD_SHA")
+FIXTURE_COMMENTS=$(make_comments_fixture '[]')
+FIXTURE_THREADS=$(make_threads_fixture '[]')
+MARKERLESS_FULL_REVIEW="**Actionable comments posted: 1**
+
+$SUMMARY_BLOCKING_FINDING"
+FIXTURE_ISSUE_COMMENTS=$(make_summary_issue_comments "$MARKERLESS_FULL_REVIEW")
+FIXTURE_REVIEWS=$(make_reviews_fixture "$HEAD_SHA")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 1 ] && echo "$OUT" | grep -q "CodeRabbit blocking-tier unresolved: 1" \
+    && echo "$OUT" | grep -q "markerless full-review summary"; then
+  pass "markerless full-review finding is gated when a CodeRabbit review object anchors HEAD"
+else
+  fail "expected rc=1 with a markerless exact-head review-object anchor; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+echo "--- Test 47b (#886): markerless body without a head review object → exit 0"
+FIXTURE_REVIEWS=$(make_reviews_fixture "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+set +e
+OUT=$(
+  FIXTURE_PR="$FIXTURE_PR" \
+  FIXTURE_COMMENTS="$FIXTURE_COMMENTS" \
+  FIXTURE_THREADS="$FIXTURE_THREADS" \
+  FIXTURE_ISSUE_COMMENTS="$FIXTURE_ISSUE_COMMENTS" \
+  FIXTURE_REVIEWS="$FIXTURE_REVIEWS" \
+    run_gate "$SCRATCH" 99 owner/repo 2>&1
+)
+RC=$?
+set -e
+if [ "$RC" = 0 ] && echo "$OUT" | grep -q "has no completed CodeRabbit review object"; then
+  pass "markerless body without a current-head review object remains out of scope"
+else
+  fail "expected rc=0 with markerless summary rejected without head review; got rc=$RC"
+  echo "$OUT" | sed 's/^/      /' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Test 48 (#886, Codex P2): the scheduled workflow's stale-snapshot guard
+# must preserve read status separately. Serializing failed reads as a random
+# fingerprint only probabilistically skips a publish; a read failure has no
+# trustworthy snapshot and must unconditionally continue to the next sweep.
+# This is intentionally structural because the guarded code runs in Actions,
+# while this suite's `gh` shim exercises the gate script itself.
+# ---------------------------------------------------------------------------
+echo
+echo "--- Test 48 (#886): workflow skips publication when either comment fingerprint read fails"
+WORKFLOW="$ROOT/.github/workflows/coderabbit-severity-gate.yml"
+if ! grep -Fq '__unreadable__' "$WORKFLOW" \
+    && grep -Fq 'pre_fp_rc=$?' "$WORKFLOW" \
+    && grep -Fq 'post_fp_rc=$?' "$WORKFLOW" \
+    && grep -Fq 'if [ "$pre_fp_rc" -ne 0 ] || [ "$post_fp_rc" -ne 0 ]; then' "$WORKFLOW" \
+    && awk '
+      /if \[ "\$pre_fp_rc" -ne 0 \] \|\| \[ "\$post_fp_rc" -ne 0 \]; then/ { guarding=1; next }
+      guarding && /continue/ { found=1; exit }
+      guarding && /^            fi/ { exit }
+      END { exit(found ? 0 : 1) }
+    ' "$WORKFLOW"; then
+  pass "unreadable fingerprint snapshots skip publication without a random sentinel"
+else
+  fail "workflow must retain fingerprint read status and continue on either read failure"
 fi
 
 # ---------------------------------------------------------------------------

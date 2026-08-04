@@ -355,15 +355,19 @@ jobs:
             # cannot occur in a comment body, while the file stays printable.
             cr_surface_fp() {
               gh api "repos/$REPO/issues/$1/comments" --paginate \
-                --jq '[.[] | "\(.id):\(.updated_at):\(.body // "")"] | sort | join("\u001e")' \
-                2>/dev/null || printf '__unreadable__%s' "$RANDOM"
+                --jq '[.[] | "\(.id):\(.updated_at):\(.body // "")"] | sort | join("\u001e")'
             }
 
-            # A failed read yields a UNIQUE sentinel, so an unreadable surface
-            # can never compare equal to anything — including another failed
-            # read. That keeps the guard fail-CLOSED: it skips the publication
-            # rather than assuming nothing moved while it could not look.
+            # A read failure is NOT serialized into a sentinel: $RANDOM is not
+            # a collision-proof identity, and the guard's contract is to
+            # publish only after observing one stable comment surface. Keep the
+            # read status separately and skip publication whenever either
+            # snapshot is unreadable. The next issue-comment event or scheduled
+            # sweep retries from a fresh snapshot.
+            set +e
             pre_fp=$(cr_surface_fp "$PR")
+            pre_fp_rc=$?
+            set -e
 
             set +e
             output=$(scripts/coderabbit-severity-gate.sh "$PR" "$REPO" 2>&1)
@@ -371,7 +375,15 @@ jobs:
             set -e
             echo "$output"
 
+            set +e
             post_fp=$(cr_surface_fp "$PR")
+            post_fp_rc=$?
+            set -e
+            if [ "$pre_fp_rc" -ne 0 ] || [ "$post_fp_rc" -ne 0 ]; then
+              echo "::warning::PR #$PR comment surface could not be fingerprinted before and after the gate; skipping this publication for a fresh retry"
+              echo "::endgroup::"
+              continue
+            fi
             if [ "$pre_fp" != "$post_fp" ]; then
               # Deliberately a NOTICE, not a warning or error: a superseded
               # snapshot is the guard working, not a failure. The run that

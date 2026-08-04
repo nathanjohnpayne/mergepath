@@ -451,6 +451,11 @@ CR_SUMMARY_MARKER='<!-- This is an auto-generated comment: summarize by coderabb
 CR_SUMMARY_BENIGN_STANZA_RE='auto-generated comment: (summarize|release notes) by coderabbit\.ai'
 CR_PRE_MERGE_BLOCK_START='<!-- pre_merge_checks_walkthrough_start -->'
 CR_PRE_MERGE_BLOCK_END='<!-- pre_merge_checks_walkthrough_end -->'
+# CodeRabbit's current full-review format can omit CR_SUMMARY_MARKER entirely
+# and lead with this machine-shaped result line. It is intentionally narrow:
+# prose such as a chat reply must not become a summary merely because a review
+# object exists on the same head.
+CR_MARKERLESS_FULL_REVIEW_RE='^\*\*Actionable comments posted: [0-9]+\*\*(\r?\n|$)'
 
 # --- shared fence-aware line filter ----------------------------------------
 #
@@ -704,6 +709,14 @@ ISSUE_COMMENTS_JSON=$(fetch_api_array "repos/$REPO/issues/$PR_NUMBER/comments" "
 # report" and the real current-head summary is never examined: a false CLEAR of
 # this required gate. The shape is a live one, fixture 7917/7918 in
 # tests/test_coderabbit_wait_status_probe.sh (#794).
+#
+# CodeRabbit also has a markerless full-review format whose first line is
+# `**Actionable comments posted: N**` (#886, Codex P1). That exact first-line
+# shape is not enough on its own: unlike the marker format it carries no
+# commits-range anchor, so accept it only when a CodeRabbit review object is
+# anchored to this exact PR head. The review object supplies the scope that the
+# body does not. Fetch it only when such a candidate exists; a failed required
+# verification fails closed instead of treating the candidate as clean.
 SUMMARY_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
   --arg bot "$BOT_LOGIN" --arg m "$CR_SUMMARY_MARKER" '
   [ .[]
@@ -716,6 +729,38 @@ SUMMARY_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
 ')
 SUMMARY_ID=$(echo "$SUMMARY_JSON" | jq -r '.id')
 SUMMARY_BODY=$(echo "$SUMMARY_JSON" | jq -r '.body')
+SUMMARY_SCOPE='commits-range'
+
+if [ "$SUMMARY_ID" = "0" ]; then
+  MARKERLESS_SUMMARY_JSON=$(echo "$ISSUE_COMMENTS_JSON" | jq -c \
+    --arg bot "$BOT_LOGIN" --arg re "$CR_MARKERLESS_FULL_REVIEW_RE" '
+    [ .[]
+      | select(.user.login == $bot)
+      | select((.body // "") | test($re))
+    ]
+    | sort_by(.id)
+    | last
+    | { id: (.id // 0), body: (.body // "") }
+  ')
+  MARKERLESS_SUMMARY_ID=$(echo "$MARKERLESS_SUMMARY_JSON" | jq -r '.id')
+  if [ "$MARKERLESS_SUMMARY_ID" != "0" ]; then
+    REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "CodeRabbit reviews for markerless summary")
+    if echo "$REVIEWS_JSON" | jq -e --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
+      any(.[];
+        (.user.login == $bot)
+        and (.commit_id == $sha)
+        and (.state == "COMMENTED" or .state == "APPROVED" or .state == "CHANGES_REQUESTED")
+      )
+    ' >/dev/null; then
+      SUMMARY_JSON=$MARKERLESS_SUMMARY_JSON
+      SUMMARY_ID=$MARKERLESS_SUMMARY_ID
+      SUMMARY_BODY=$(echo "$MARKERLESS_SUMMARY_JSON" | jq -r '.body')
+      SUMMARY_SCOPE='review-object'
+    else
+      log "markerless CodeRabbit full-review candidate (comment id $MARKERLESS_SUMMARY_ID) has no completed CodeRabbit review object on $HEAD_SHA — no summary findings in scope"
+    fi
+  fi
+fi
 
 # Classify the summary with the SAME shared coderabbit_tier_of the inline path
 # uses — there is deliberately no second classifier. It is applied PER LINE
@@ -750,12 +795,22 @@ SUMMARY_BLOCKING='[]'
 SUMMARY_FINDINGS_FINGERPRINT_INPUT=''
 if [ -z "$SUMMARY_BODY" ]; then
   log "no CodeRabbit PR-level summary comment found — no summary findings in scope"
+elif [ "$SUMMARY_SCOPE" = 'review-object' ]; then
+  # The strict markerless result line identifies the known full-review format,
+  # and the exact-head review object above supplies the scope / completion
+  # anchor that this format omits. Do not apply the marker-format stanza or
+  # commits-range predicates: neither exists in this legitimate shape.
+  SUMMARY_SCAN=$(summary_strip_pre_merge_block "$SUMMARY_BODY")
+  log "PR-level markerless full-review summary (comment id $SUMMARY_ID) is anchored by a completed CodeRabbit review object on $HEAD_SHA"
 elif ! summary_stanzas_all_benign "$SUMMARY_BODY"; then
   log "PR-level summary (comment id $SUMMARY_ID) carries a non-benign outcome stanza (rate limit / failure / in progress) — not a completed report, no summary findings in scope"
 elif ! summary_names_head "$SUMMARY_BODY" "$HEAD_SHA"; then
   log "PR-level summary (comment id $SUMMARY_ID) does not name $HEAD_SHA as its commits-range end — not this head's report, no summary findings in scope"
 else
   SUMMARY_SCAN=$(summary_strip_pre_merge_block "$SUMMARY_BODY")
+fi
+
+if [ -n "${SUMMARY_SCAN:-}" ]; then
   # Classify UNFENCED lines only (Phase 4b P2 on #886, and Codex's earlier P2 —
   # both reviewers landed on this). The three structural scans had already been
   # taught to ignore fenced quotes; the finding loop had not, so a PR whose diff
